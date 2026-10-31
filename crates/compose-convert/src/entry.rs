@@ -8,9 +8,11 @@
 //!
 //! # 引数
 //!
-//! `fandhe-container-compose-convert [--] <input_dir>`。`-h` / `--help` は usage を出して終了コード 0。
-//! `--downgrade[=...]` は TASK-182（#627）で実装するまで `UNIMPLEMENTED`（8）で拒否し、黙って受け入れない（REPAIR-3）。
-//! 位置引数が 1 個でない・未知のフラグは `INVALID_ARGUMENT`（2）。引数の値は出力に入れない。
+//! `fandhe-container-compose-convert [--downgrade=<key>[,...]] [--] <input_dir>`。`-h` / `--help` は usage を出して終了コード 0。
+//! `--downgrade=` の値は [`crate::downgrade::parse_downgrade_value`] で解析し、`error-unsupported-yet` 以外のキー・
+//! 空の要素・上限超過は、ディレクトリへ触れる前に `INVALID_ARGUMENT`（2）で止める（TASK-182.1・#627・STACK-3）。
+//! `=` のない `--downgrade`・繰り返し・UTF-8 でない値も 2。位置引数が 1 個でない・未知のフラグも 2。
+//! 引数の値は出力に入れない（拒否の詳細は分類名・表の固定のキーパス・番号だけ）。
 //!
 //! # 終了コード
 //!
@@ -21,7 +23,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! TOML の書き出し（stdout は空けたまま。集計行に `toml_output:"unimplemented"`）、`--downgrade`。
+//! TOML の書き出し（stdout は空けたまま。集計行に `toml_output:"unimplemented"`）。
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -29,13 +31,15 @@ use std::path::{Path, PathBuf};
 
 use crate::compose_convert::parse_compose_yaml;
 use crate::convert::{ValueDrops, convert_top_level};
+use crate::downgrade::{DowngradeArgError, DowngradeSet, parse_downgrade_value};
 use crate::input_scan::load_input_dir;
 use crate::key_scan::collect_key_occurrences;
 use crate::report::FileConversionReport;
 use crate::report_json::{error_line, file_line, summary_line};
 
 /// 引数の誤りの usage（値は含めない）。
-const USAGE: &str = "usage: fandhe-container-compose-convert [--] <input_dir>";
+const USAGE: &str =
+    "usage: fandhe-container-compose-convert [--downgrade=<key>[,...]] [--] <input_dir>";
 
 /// 未実装の終了コード（ERR-2 の慣行で 8）。
 pub const UNIMPLEMENTED_EXIT_CODE: u8 = 8;
@@ -53,12 +57,16 @@ pub struct Outcome {
 enum Parsed {
     Help,
     Invalid,
-    Downgrade,
-    Run(PathBuf),
+    DowngradeRejected(DowngradeArgError),
+    Run {
+        dir: PathBuf,
+        downgrade: Option<DowngradeSet>,
+    },
 }
 
 fn parse_args(args: &[OsString]) -> Parsed {
-    let (mut help, mut unknown, mut downgrade, mut after_dd) = (false, false, false, false);
+    let (mut help, mut unknown, mut after_dd) = (false, false, false);
+    let mut downgrade_value: Option<&str> = None;
     let mut positional: Vec<&OsString> = Vec::new();
     for arg in args {
         let bytes = arg.as_encoded_bytes();
@@ -68,8 +76,12 @@ fn parse_args(args: &[OsString]) -> Parsed {
             after_dd = true;
         } else if bytes == b"-h" || bytes == b"--help" {
             help = true;
-        } else if bytes == b"--downgrade" || bytes.starts_with(b"--downgrade=") {
-            downgrade = true;
+        } else if let Some(v) = bytes.strip_prefix(b"--downgrade=") {
+            // 値は UTF-8 のみ。繰り返しは後勝ちにせず拒否する（fail-closed）。
+            match std::str::from_utf8(v) {
+                Ok(v) if downgrade_value.is_none() => downgrade_value = Some(v),
+                _ => unknown = true,
+            }
         } else {
             unknown = true;
         }
@@ -80,11 +92,16 @@ fn parse_args(args: &[OsString]) -> Parsed {
     if unknown || positional.len() != 1 {
         return Parsed::Invalid;
     }
-    if downgrade {
-        return Parsed::Downgrade;
-    }
+    let downgrade = match downgrade_value.map(parse_downgrade_value) {
+        Some(Ok(set)) => Some(set),
+        Some(Err(e)) => return Parsed::DowngradeRejected(e),
+        None => None,
+    };
     match positional.first() {
-        Some(p) => Parsed::Run(PathBuf::from(p)),
+        Some(p) => Parsed::Run {
+            dir: PathBuf::from(p),
+            downgrade,
+        },
         None => Parsed::Invalid,
     }
 }
@@ -108,15 +125,36 @@ pub fn run_args(args: &[OsString]) -> Outcome {
             exit_code: 2,
             stderr: error_line("INVALID_ARGUMENT", USAGE, &[]),
         },
-        Parsed::Downgrade => Outcome {
-            exit_code: UNIMPLEMENTED_EXIT_CODE,
-            stderr: error_line("UNIMPLEMENTED", "--downgrade is not implemented yet", &[]),
-        },
-        Parsed::Run(dir) => run_dir(&dir),
+        Parsed::DowngradeRejected(e) => {
+            let index = match e {
+                DowngradeArgError::EmptyItem { index }
+                | DowngradeArgError::KeyTooLong { index }
+                | DowngradeArgError::NotDowngradable { index, .. } => Some(index.to_string()),
+                _ => None,
+            };
+            let mut extra: Vec<(&str, &str)> = Vec::new();
+            if let DowngradeArgError::NotDowngradable {
+                class, key_path, ..
+            } = &e
+            {
+                extra.push(("class", class.as_str()));
+                if let Some(p) = key_path {
+                    extra.push(("key_path", p));
+                }
+            }
+            if let Some(i) = index.as_deref() {
+                extra.push(("index", i));
+            }
+            Outcome {
+                exit_code: 2,
+                stderr: error_line(e.code(), e.message(), &extra),
+            }
+        }
+        Parsed::Run { dir, downgrade } => run_dir(&dir, downgrade.as_ref()),
     }
 }
 
-fn run_dir(dir: &Path) -> Outcome {
+fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
     let inputs = match load_input_dir(dir) {
         Ok(v) => v,
         Err(e) => {
@@ -147,7 +185,8 @@ fn run_dir(dir: &Path) -> Outcome {
     }
 
     let mut out = String::new();
-    let (mut error_free_files, mut parse_failed_files) = (0u64, 0u64);
+    let (mut error_free_files, mut parse_failed_files, mut downgrade_free_files) =
+        (0u64, 0u64, 0u64);
     for (input, id) in inputs.iter().zip(&ids) {
         let report = match parse_compose_yaml(input.text()) {
             Err(e) => FileConversionReport::parse_failed(e.code),
@@ -166,11 +205,26 @@ fn run_dir(dir: &Path) -> Outcome {
         if verdict.is_error_free() {
             error_free_files += 1;
         }
-        out.push_str(&file_line(id, &report, &verdict));
+        let dg = downgrade.map(|set| {
+            (
+                report.downgraded(set),
+                report.error_free_with_downgrade(set),
+            )
+        });
+        if dg.as_ref().is_some_and(|(_, v)| v.is_error_free()) {
+            downgrade_free_files += 1;
+        }
+        out.push_str(&file_line(
+            id,
+            &report,
+            &verdict,
+            dg.as_ref().map(|(d, v)| (d.as_slice(), v)),
+        ));
     }
     out.push_str(&summary_line(
         inputs.len() as u64,
         error_free_files,
+        downgrade.map(|_| downgrade_free_files),
         parse_failed_files,
     ));
     Outcome {
@@ -187,6 +241,13 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    fn run_plain(dir: &str) -> Parsed {
+        Parsed::Run {
+            dir: PathBuf::from(dir),
+            downgrade: None,
+        }
+    }
+
     /// STACK-3・REPAIR-12: 引数解析の各分岐。
     #[test]
     fn parse_args_branches() {
@@ -196,19 +257,47 @@ mod tests {
         assert_eq!(parse_args(&os(&["-"])), Parsed::Invalid);
         assert_eq!(parse_args(&os(&["--help"])), Parsed::Help);
         assert_eq!(parse_args(&os(&["-h", "--bogus"])), Parsed::Help);
-        assert_eq!(
-            parse_args(&os(&["--", "-h"])),
-            Parsed::Run(PathBuf::from("-h"))
-        );
-        assert_eq!(parse_args(&os(&["d"])), Parsed::Run(PathBuf::from("d")));
-        assert_eq!(
-            parse_args(&os(&["--", "d"])),
-            Parsed::Run(PathBuf::from("d"))
-        );
-        assert_eq!(parse_args(&os(&["--downgrade", "d"])), Parsed::Downgrade);
-        assert_eq!(parse_args(&os(&["--downgrade=x", "d"])), Parsed::Downgrade);
+        assert_eq!(parse_args(&os(&["--", "-h"])), run_plain("-h"));
+        assert_eq!(parse_args(&os(&["d"])), run_plain("d"));
+        assert_eq!(parse_args(&os(&["--", "d"])), run_plain("d"));
         assert_eq!(parse_args(&os(&["--downgrade"])), Parsed::Invalid);
+        assert_eq!(parse_args(&os(&["--downgrade", "d"])), Parsed::Invalid);
         assert_eq!(parse_args(&os(&["--downgradex", "d"])), Parsed::Invalid);
+    }
+
+    /// STACK-3・TASK-182.1: --downgrade の受理・拒否・繰り返しの拒否。
+    #[test]
+    fn parse_args_downgrade() {
+        match parse_args(&os(&["--downgrade=services.*.tty, services.*.user", "d"])) {
+            Parsed::Run { dir, downgrade } => {
+                assert_eq!(dir, PathBuf::from("d"));
+                let set = downgrade.expect("set");
+                assert_eq!(
+                    set.iter().collect::<Vec<_>>(),
+                    vec!["services.*.tty", "services.*.user"]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&os(&["--downgrade=services.*.privileged", "d"])),
+            Parsed::DowngradeRejected(DowngradeArgError::NotDowngradable { .. })
+        ));
+        assert_eq!(
+            parse_args(&os(&["--downgrade=", "d"])),
+            Parsed::DowngradeRejected(DowngradeArgError::Empty)
+        );
+        let twice = [
+            "--downgrade=services.*.tty",
+            "--downgrade=services.*.user",
+            "d",
+        ];
+        assert_eq!(parse_args(&os(&twice)), Parsed::Invalid);
+        // 位置引数の誤りは downgrade の解析より先に Invalid。
+        assert_eq!(
+            parse_args(&os(&["--downgrade=services.*.privileged"])),
+            Parsed::Invalid
+        );
     }
 
     /// STACK-3: 誤り時の出力に引数の値を入れない。
@@ -223,15 +312,23 @@ mod tests {
         );
     }
 
-    /// STACK-3・REPAIR-3: --downgrade は未実装として 8 で拒否する。
+    /// STACK-3・TASK-182.1: 不可のキーは 2 で止め、詳細は分類名・表のキーパス・番号だけ。
     #[test]
-    fn downgrade_is_unimplemented() {
-        let o = run_args(&os(&["--downgrade=services.*.tty", "d"]));
-        assert_eq!(o.exit_code, 8);
+    fn downgrade_rejection_output() {
+        let o = run_args(&os(&[
+            "--downgrade=services.*.tty,services.*.privileged",
+            "/nonexistent-dir-secret-marker",
+        ]));
+        assert_eq!(o.exit_code, 2);
         assert_eq!(
             o.stderr,
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"--downgrade is not implemented yet\"}\n"
+            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"--downgrade key is not error-unsupported-yet\",\"class\":\"error-incompatible\",\"key_path\":\"services.*.privileged\",\"index\":\"1\"}\n"
         );
+        let o = run_args(&os(&["--downgrade=secret-marker", "d"]));
+        assert_eq!(o.exit_code, 2);
+        assert!(!o.stderr.contains("secret-marker"));
+        assert!(o.stderr.contains("\"class\":\"unrecognized\""));
+        assert!(!o.stderr.contains("key_path"));
     }
 
     /// STACK-3: file_id の導出とフォールバック。

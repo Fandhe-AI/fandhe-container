@@ -105,7 +105,7 @@ fn report_lines_for_mixed_directory() {
     );
     assert_eq!(
         lines[2],
-        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}"
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}"
     );
     for marker in ["value-marker-9c1d", "SECRET", "web"] {
         assert!(!err.contains(marker), "{marker} leaked: {err}");
@@ -123,7 +123,9 @@ fn clean_file_is_error_free() {
     assert_eq!(out, "");
     let first = err.lines().next().expect("file line");
     assert!(
-        first.contains("\"error_free\":true,\"error_free_blockers\":[]}"),
+        first.contains(
+            "\"error_free\":true,\"error_free_blockers\":[],\"error_free_with_downgrade\":null"
+        ),
         "{first}"
     );
     assert!(first.contains("\"value_drops\":{},\"value_drops_total\":0,\"downgraded\":{}"));
@@ -142,17 +144,53 @@ fn invalid_arguments_exit_2() {
     assert!(!err.contains("secret-marker"));
 }
 
-/// REPAIR-3: --downgrade は未実装として 8 で拒否し、何も変換しない。
+/// STACK-3・TASK-182.1: 不可のキーの指定は変換せず 2。ディレクトリが存在しなくても 2（走査の 3 にならない）。
 #[test]
-fn downgrade_is_rejected_without_conversion() {
+fn downgrade_of_non_unsupported_key_is_rejected() {
     let s = Scratch::new();
     s.write("a.yaml", "services: {}\n");
     let dir = s.path().to_string_lossy().into_owned();
-    let (code, out, err) = run_strs(&["--downgrade=services.*.tty", &dir]);
-    assert_eq!(code, Some(8));
+    let (code, out, err) = run_strs(&["--downgrade=services.*.privileged", &dir]);
+    assert_eq!(code, Some(2));
     assert_eq!(out, "");
-    assert!(err.contains("\"code\":\"UNIMPLEMENTED\""));
+    assert!(err.contains("\"code\":\"INVALID_ARGUMENT\""));
+    assert!(err.contains("\"class\":\"error-incompatible\""));
     assert!(!err.contains("\"kind\":\"file\""));
+    let (code, _, err) = run_strs(&["--downgrade=services.*.privileged", "/nonexistent-dir-9c1d"]);
+    assert_eq!(code, Some(2), "{err}");
+}
+
+/// STACK-3・TASK-182.1: 指定したキーが unsupported-yet のファイルは格下げされ、既定の error_free とは別に集計される。
+#[test]
+fn downgrade_of_unsupported_key_is_reported() {
+    let s = Scratch::new();
+    s.write(
+        "a.yaml",
+        "services:\n  web:\n    image: busybox\n    container_name: c\n",
+    );
+    s.write(
+        "b.yaml",
+        "services:\n  web:\n    image: busybox\n    container_name: c\n    privileged: true\n",
+    );
+    let dir = s.path().to_string_lossy().into_owned();
+    let (code, out, err) = run_strs(&["--downgrade=services.*.container_name", &dir]);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(lines[0].contains("\"downgraded\":{\"services.*.container_name\":1}"));
+    assert!(lines[0].contains("\"error_free\":false"));
+    assert!(
+        lines[0].contains(
+            "\"error_free_with_downgrade\":true,\"error_free_with_downgrade_blockers\":[]}"
+        )
+    );
+    assert!(lines[1].contains("\"error_free_with_downgrade\":false"));
+    assert!(lines[1].contains("\"downgraded\":{\"services.*.container_name\":1}"));
+    assert_eq!(
+        lines[2],
+        "{\"kind\":\"summary\",\"files\":2,\"error_free_files\":0,\"error_free_with_downgrade_files\":1,\"parse_failed_files\":0,\"toml_output\":\"unimplemented\"}"
+    );
 }
 
 /// STACK-3: 存在しないディレクトリは 3 と NOT_FOUND。

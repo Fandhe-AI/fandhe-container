@@ -68,11 +68,13 @@ pub fn error_line(code: &str, message: &str, extra: &[(&str, &str)]) -> String {
 
 /// ファイル 1 件のレポート行（末尾改行つき）。
 ///
-/// `downgraded` は常に空のオブジェクト。`--downgrade` の格下げ集計は TASK-182（#627）で埋める（REPAIR-3）。
+/// `downgrade` は `--downgrade` 指定時の `(格下げしたキーと件数, 格下げ後の判定)`（TASK-182.1・#627）。
+/// `None`（フラグなし）なら `downgraded` は空のオブジェクト、`error_free_with_downgrade` は `null`。
 pub fn file_line(
     file_id: &str,
     report: &FileConversionReport,
     verdict: &ErrorFreeVerdict,
+    downgrade: Option<(&[(String, u64)], &ErrorFreeVerdict)>,
 ) -> String {
     let mut s = String::new();
     let _ = write!(s, "{{\"kind\":\"file\",\"file_id\":{}", quoted(file_id));
@@ -126,10 +128,42 @@ pub fn file_line(
     }
     let _ = write!(
         s,
-        "}},\"value_drops_total\":{},\"downgraded\":{{}},\"error_free\":{},\"error_free_blockers\":[",
-        report.value_drops.total(),
+        "}},\"value_drops_total\":{},\"downgraded\":{{",
+        report.value_drops.total()
+    );
+    for (i, (path, n)) in downgrade.map(|(d, _)| d).unwrap_or(&[]).iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{}:{n}", quoted(path));
+    }
+    let _ = write!(
+        s,
+        "}},\"error_free\":{},\"error_free_blockers\":[",
         verdict.is_error_free()
     );
+    write_blockers(&mut s, verdict);
+    s.push(']');
+    match downgrade {
+        Some((_, v)) => {
+            let _ = write!(
+                s,
+                ",\"error_free_with_downgrade\":{},\"error_free_with_downgrade_blockers\":[",
+                v.is_error_free()
+            );
+            write_blockers(&mut s, v);
+            s.push(']');
+        }
+        None => s.push_str(
+            ",\"error_free_with_downgrade\":null,\"error_free_with_downgrade_blockers\":[]",
+        ),
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// blocker の配列の中身（前後の括弧なし）を書く。
+fn write_blockers(s: &mut String, verdict: &ErrorFreeVerdict) {
     for (i, b) in verdict.blockers().iter().enumerate() {
         if i > 0 {
             s.push(',');
@@ -162,14 +196,19 @@ pub fn file_line(
             }
         }
     }
-    s.push_str("]}\n");
-    s
 }
 
 /// 最後の集計行（末尾改行つき）。`toml_output` は TOML の書き出しが未実装であることの明示（REPAIR-3）。
-pub fn summary_line(files: u64, error_free_files: u64, parse_failed_files: u64) -> String {
+/// `error_free_with_downgrade_files` は `--downgrade` 指定時のみ `Some`（別集計。なければ `null`）。
+pub fn summary_line(
+    files: u64,
+    error_free_files: u64,
+    error_free_with_downgrade_files: Option<u64>,
+    parse_failed_files: u64,
+) -> String {
+    let dg = error_free_with_downgrade_files.map_or("null".to_string(), |n| n.to_string());
     format!(
-        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"unimplemented\"}}\n"
+        "{{\"kind\":\"summary\",\"files\":{files},\"error_free_files\":{error_free_files},\"error_free_with_downgrade_files\":{dg},\"parse_failed_files\":{parse_failed_files},\"toml_output\":\"unimplemented\"}}\n"
     )
 }
 
@@ -209,10 +248,10 @@ mod tests {
     fn parse_failed_line_exact() {
         let r = FileConversionReport::parse_failed(ComposeParseErrorCode::InvalidArgument);
         let v = r.error_free();
-        let l = file_line("b", &r, &v);
+        let l = file_line("b", &r, &v, None);
         assert_eq!(
             l,
-            "{\"kind\":\"file\",\"file_id\":\"b\",\"parse_error\":\"INVALID_ARGUMENT\",\"counts\":{\"convert\":{\"keys\":0,\"occurrences\":0},\"warning\":{\"keys\":0,\"occurrences\":0},\"error-incompatible\":{\"keys\":0,\"occurrences\":0},\"error-unsupported-yet\":{\"keys\":0,\"occurrences\":0},\"unrecognized\":{\"keys\":0,\"occurrences\":0}},\"key_occurrences\":[],\"key_occurrences_overflowed\":false,\"value_drops\":{},\"value_drops_total\":0,\"downgraded\":{},\"error_free\":false,\"error_free_blockers\":[{\"kind\":\"parse-failed\",\"code\":\"INVALID_ARGUMENT\"}]}\n"
+            "{\"kind\":\"file\",\"file_id\":\"b\",\"parse_error\":\"INVALID_ARGUMENT\",\"counts\":{\"convert\":{\"keys\":0,\"occurrences\":0},\"warning\":{\"keys\":0,\"occurrences\":0},\"error-incompatible\":{\"keys\":0,\"occurrences\":0},\"error-unsupported-yet\":{\"keys\":0,\"occurrences\":0},\"unrecognized\":{\"keys\":0,\"occurrences\":0}},\"key_occurrences\":[],\"key_occurrences_overflowed\":false,\"value_drops\":{},\"value_drops_total\":0,\"downgraded\":{},\"error_free\":false,\"error_free_blockers\":[{\"kind\":\"parse-failed\",\"code\":\"INVALID_ARGUMENT\"}],\"error_free_with_downgrade\":null,\"error_free_with_downgrade_blockers\":[]}\n"
         );
     }
 
@@ -227,10 +266,10 @@ mod tests {
         drops.note("services.*.ports");
         let r = FileConversionReport::from_parsed(occ, drops);
         let v = r.error_free();
-        let l = file_line("a\"", &r, &v);
+        let l = file_line("a\"", &r, &v, None);
         assert_eq!(
             l,
-            "{\"kind\":\"file\",\"file_id\":\"a\\\"\",\"parse_error\":null,\"counts\":{\"convert\":{\"keys\":1,\"occurrences\":2},\"warning\":{\"keys\":0,\"occurrences\":0},\"error-incompatible\":{\"keys\":1,\"occurrences\":1},\"error-unsupported-yet\":{\"keys\":0,\"occurrences\":0},\"unrecognized\":{\"keys\":0,\"occurrences\":0}},\"key_occurrences\":[{\"key_path\":\"services.*.image\",\"class\":\"convert\",\"occurrences\":2},{\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1}],\"key_occurrences_overflowed\":false,\"value_drops\":{\"services.*.ports\":1},\"value_drops_total\":1,\"downgraded\":{},\"error_free\":false,\"error_free_blockers\":[{\"kind\":\"error-class-key\",\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1},{\"kind\":\"value-drops\",\"total\":1}]}\n"
+            "{\"kind\":\"file\",\"file_id\":\"a\\\"\",\"parse_error\":null,\"counts\":{\"convert\":{\"keys\":1,\"occurrences\":2},\"warning\":{\"keys\":0,\"occurrences\":0},\"error-incompatible\":{\"keys\":1,\"occurrences\":1},\"error-unsupported-yet\":{\"keys\":0,\"occurrences\":0},\"unrecognized\":{\"keys\":0,\"occurrences\":0}},\"key_occurrences\":[{\"key_path\":\"services.*.image\",\"class\":\"convert\",\"occurrences\":2},{\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1}],\"key_occurrences_overflowed\":false,\"value_drops\":{\"services.*.ports\":1},\"value_drops_total\":1,\"downgraded\":{},\"error_free\":false,\"error_free_blockers\":[{\"kind\":\"error-class-key\",\"key_path\":\"services.*.privileged\",\"class\":\"error-incompatible\",\"occurrences\":1},{\"kind\":\"value-drops\",\"total\":1}],\"error_free_with_downgrade\":null,\"error_free_with_downgrade_blockers\":[]}\n"
         );
     }
 
@@ -238,8 +277,12 @@ mod tests {
     #[test]
     fn summary_line_exact() {
         assert_eq!(
-            summary_line(3, 1, 1),
-            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}\n"
+            summary_line(3, 1, None, 1),
+            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":null,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}\n"
+        );
+        assert_eq!(
+            summary_line(3, 1, Some(2), 1),
+            "{\"kind\":\"summary\",\"files\":3,\"error_free_files\":1,\"error_free_with_downgrade_files\":2,\"parse_failed_files\":1,\"toml_output\":\"unimplemented\"}\n"
         );
     }
 }

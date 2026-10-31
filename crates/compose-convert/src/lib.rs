@@ -11,7 +11,8 @@
 //! 引数解析とレポート出力（`entry`・`report_json`）、bin の結線は TASK-151.7（#602・STACK-3）で実装済み。
 //! bin は入力ディレクトリを受け取り、キー単位の変換レポート（4 分類・unrecognized の件数・`value_drops`・`downgraded`）を
 //! stderr へ 1 行 JSON で出す。stdout は将来 TOML を出す経路として空けてあり、TOML の書き出しは未実装（REPAIR-3）。
-//! `--downgrade` は TASK-182（#627）で実装するまで `UNIMPLEMENTED` で拒否する。
+//! `--downgrade=<key>[,...]` の解析と格下げ許可の判定は `downgrade`（TASK-182.1・#627・STACK-3）で実装済み。
+//! 不可のキーの指定は変換せず `INVALID_ARGUMENT`（2）で止める。
 //! depends_on・ulimits・healthcheck・deploy の変換は未実装（`ServiceConversion::unhandled` に載る。REPAIR-3）。
 //! `fandhe-container-stack` への一方向の path 依存は配線済み。YAML パーサーの依存は本 crate に限り、
 //! `fandhe-container-cli`・`fandhe-container-stack` の依存木には現れない（TASK-155 の経路へリンクしない）。
@@ -21,6 +22,7 @@
 pub mod classify;
 pub mod compose_convert;
 pub mod convert;
+pub mod downgrade;
 pub mod entry;
 pub mod gpu_reservation;
 pub mod input_scan;

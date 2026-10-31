@@ -304,6 +304,8 @@ name = "fandhe-container-compose-convert"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-stack",
+ "serde",
+ "serde-saphyr",
 ]
 
 [[package]]

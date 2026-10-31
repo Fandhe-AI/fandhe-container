@@ -1,10 +1,13 @@
 //! fandhe-container-compose-convert: `compose.yaml` → TOML の片方向変換ツール。
 //!
-//! 変換器の本体は未実装（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
+//! YAML の読み込みとアンカー / マージキーの展開は [`compose_convert`] で実装済み（TASK-151.1・#595）。
+//! 分類以降の変換器の本体は未実装（TASK-1.3・REPAIR-1。スタブの明示は REPAIR-3）。
 //! bin は未実装を構造化して返す雛形（TASK-151.0・#1070・STACK-3）。
 //! `fandhe-container-stack` への一方向の path 依存は配線済みで、型の利用は TASK-151.7（#602）以降。
 //! 本体は G11（TASK-151 が変換器本体、TASK-152・153・154・156・182）で実装する。
 //! plugin ではない独立ツールで、PLUG-1 区分の対象外（crate-naming.md 決定 5）。
+
+pub mod compose_convert;
 
 use std::io::Write;
 use std::process::ExitCode;

@@ -903,34 +903,39 @@ mod imp {
         let _ = std::fs::remove_file(&notice);
     }
 
-    /// 自プロセスに子プロセスが残っているか（`pgrep -P <自 pid>`。終了コード 0 が有り、1 が無し）。期限つきで待つ。
-    /// `pgrep` 自身は対象から除かれる。
+    /// 自プロセスに子プロセスが残っているか（`pgrep -P <自 pid>` の標準出力に pid が出るか）。期限つきで待つ。
+    /// `SIGCHLD` が `SIG_IGN` のとき `pgrep` 自身も自動回収されて `wait` / `try_wait` が `ECHILD` になるため、
+    /// 終了コードには頼らず、標準出力の EOF（`pgrep` の終了）までを読み取って判定する。`pgrep` 自身は対象から除かれる。
     #[cfg(target_os = "macos")]
     fn has_child_process() -> bool {
+        use std::io::Read;
         use std::process::{Command, Stdio};
         let mut child = Command::new("pgrep")
             .arg("-P")
             .arg(std::process::id().to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn pgrep");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.try_wait().expect("try_wait") {
-                return match status.code() {
-                    Some(0) => true,
-                    Some(1) => false,
-                    other => panic!("unexpected pgrep status: {other:?}"),
-                };
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
+        let mut stdout = child.stdout.take().expect("pgrep stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out);
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(out) => {
+                let _ = reader.join();
+                // ECHILD（自動回収済み）は無視する。判定は出力だけで行う。
                 let _ = child.wait();
+                !out.trim().is_empty()
+            }
+            Err(_) => {
+                let _ = child.kill();
                 panic!("pgrep timed out");
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

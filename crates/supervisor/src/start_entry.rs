@@ -627,8 +627,9 @@ pub const START_OP: &str = "supervisor.start";
 ///   後始末を確かめられれば `Timeout`、確かめられない・作業スレッドを放棄したときは `Internal`。
 ///
 /// 計測行（`start_metrics`）の区間は手順 3〜8 の 1 回の呼び出しに限る。手順 3 より前の入口の失敗（0a〜2c。
-/// 2b・2c の期限超過を含む）は本関数を通らず、計測行を出さない。入口全体の件数が REPAIR-4 で要るなら
-/// `START_OP` に混ぜず別の操作名を足す（#3557）。
+/// 2b・2c の期限超過を含む）は本関数を通らず、計測行を出さない。入口全体の件数は呼び出し側の計測（CLI の
+/// `start`・CRI の `cri.start_container`）と報告行のコードが担い、別の操作名は足さない（#3572。理由は
+/// `docs/design/rootless-network.md`）。
 ///
 /// 起動の成否とレイテンシは `recorder` の [`START_OP`] に記録し（準備と手順 8 を合わせた時間）、本関数の最後に
 /// 構造化ログ 1 行（[`start_metrics_line`]）で出す。
@@ -3357,7 +3358,7 @@ mod linux {
             // (2b の期限超過と同じ形。未回収の作業スレッドを残したまま回復の launcher を組まない。
             // 手順 3 の中断起動の回復は次の start が行う。計測行は 2b と揃えて出さない: `start_metrics` の区間は
             // 手順 3〜8 で、手順 3 より前の失敗は混ぜない。2c の期限超過の記録は `pasta_verify`(timeout)の構造化ログと
-            // 報告行が担う。入口全体の件数が要るなら別の操作名を足す。SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
+            // 報告行が担う。入口全体の件数は呼び出し側の計測が担い、別の操作名は足さない（#3572）。SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
             let err = op_err(TraitError::new(
                 ErrorCode::Timeout,
                 OPTIONS_PREPARE_TIMEOUT_MESSAGE,

@@ -3,7 +3,7 @@
 //! 役割: compose の `ports`・`volumes`・`secrets`・`configs`・`tmpfs`・`devices` の配列要素がマッピング
 //! （long syntax）のとき、`fandhe-container-stack` の `Service`（どれも short syntax の `Vec<String>`）へ
 //! 載せられる文字列へ正規化する純粋関数を提供する。呼び出し元は #864 / #598 の変換器の結線と、drop を
-//! `value_drops` に加算する #599 を想定する（本モジュールは結線しない。`compose_convert.rs` は #864 と
+//! `value_drops` に加算する #599 を想定する（結線は `convert::string_items`。#599 で完了。`compose_convert.rs` は #864 と
 //! 衝突しうるため触らない。`gpu_reservation` と同じ独立モジュール方式）。`Sequence` の振り分け
 //! （文字列・数値は #864、マッピングは本モジュール、それ以外は drop）も結線側の責務である。
 //!

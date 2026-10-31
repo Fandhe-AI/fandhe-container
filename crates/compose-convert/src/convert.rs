@@ -5,9 +5,9 @@
 //! 表せない属性は黙って捨てず、[`ValueDrops`] へ分類表のキーパスで件数を記録する（fail-closed）。
 //! 記録には値・環境変数名・サービス名を載せない（`environment` に資格情報が入りうるため）。
 //!
-//! スタブの範囲（REPAIR-3）: long syntax のマッピング要素（ports・volumes・secrets・configs・tmpfs・devices）は
-//! #865（TASK-151.3.2）が各 `convert_*` 関数の中身を差し替えて変換する。それまではマッピング要素を drop として
-//! 記録する。`depends_on`・`ulimits`・`healthcheck`・`deploy` は本 issue で変換せず、
+//! long syntax のマッピング要素（ports・volumes・secrets・configs・tmpfs・devices）は
+//! [`crate::long_syntax`]（#865）の変換へ回し、表せない要素は要素ごと drop として記録する（結線は #599）。
+//! スタブの範囲（REPAIR-3）: `depends_on`・`ulimits`・`healthcheck`・`deploy` は本 issue で変換せず、
 //! [`ServiceConversion::unhandled`] に分類表のパスで載せる（呼び出し側が黙って通さないため。担当は後続）。
 //! `Float` は元の書き方を復元できないため文字列へ直さず drop する。
 
@@ -18,6 +18,7 @@ use fandhe_container_stack::schema::{
 };
 
 use crate::compose_convert::{ComposeDocument, ComposeMapping, ComposeNumber, ComposeValue};
+use crate::long_syntax::{LongSyntaxKey, convert_long_syntax_element};
 use crate::shell_split::{ShellSplitError, split_command};
 
 /// リスト・マッピングの要素数の上限。確保の前に確かめる（DoS 対策）。
@@ -90,7 +91,7 @@ pub const DROP_KEY_PATHS: &[&str] = &[
 
 /// 変換できずに捨てた値の件数（分類表のキーパス別）。値・名前は載せない。
 ///
-/// レポートの形・`error_free` の判定は #599 が決める。GPU 予約の drop（`gpu_reservation`）も
+/// レポートの形・`error_free` の判定は [`crate::report`]（#599）。GPU 予約の drop（`gpu_reservation`）も
 /// 同じ記録先へ足される前提。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValueDrops {
@@ -107,6 +108,18 @@ impl ValueDrops {
     pub fn note(&mut self, key_path: &'static str) {
         let c = self.counts.entry(key_path).or_insert(0);
         *c = c.saturating_add(1);
+    }
+
+    /// `key_path` の drop を `n` 件まとめて足す（加算は飽和。`n == 0` は記録を作らない）。
+    ///
+    /// GPU 予約の `GpuReservationConversion::drop_count()` を `gpu_reservation::DEVICES_KEY_PATH` へ
+    /// 足す統合点（STACK-3・STACK-9）。`deploy` の変換と GPU 予約の実加算の結線は未実装（REPAIR-3）。
+    pub fn note_many(&mut self, key_path: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let c = self.counts.entry(key_path).or_insert(0);
+        *c = c.saturating_add(n);
     }
 
     /// `key_path` の件数。
@@ -239,6 +252,7 @@ fn string_items(
     path: &'static str,
     allow_scalar: bool,
     allow_int: bool,
+    long: Option<LongSyntaxKey>,
     drops: &mut ValueDrops,
 ) -> Vec<String> {
     let one = |item: &ComposeValue| -> Option<String> {
@@ -259,6 +273,15 @@ fn string_items(
         ComposeValue::Sequence(items) if items.len() <= MAX_LIST_ITEMS => {
             let mut out = Vec::new();
             for item in items {
+                // long syntax のマッピング要素は #865 の変換へ回す。drop はここで 1 回だけ数える
+                // （下の `one` も Mapping に None を返すため、先に分岐して二重計上を防ぐ）。
+                if let (Some(k), ComposeValue::Mapping(m)) = (long, item) {
+                    match convert_long_syntax_element(k, m) {
+                        Ok(c) => out.push(c.short_syntax),
+                        Err(d) => drops.note(d.key_path()),
+                    }
+                    continue;
+                }
                 match one(item) {
                     Some(s) => out.push(s),
                     None => drops.note(path),
@@ -275,49 +298,77 @@ fn string_items(
     }
 }
 
-/// `env_file`。文字列・文字列のリスト。マッピング要素（long syntax）は表せないため drop。
+/// `env_file`。文字列・文字列のリスト。マッピング要素（long syntax）は表せないため drop（long syntax の変換は回さない）。
 pub fn convert_env_file(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_ENV_FILE, true, false, drops)
+    string_items(v, P_ENV_FILE, true, false, None, drops)
 }
 
-/// `ports` の short syntax。マッピング要素は #865（TASK-151.3.2）で変換する（現状は drop）。
+/// `ports` の short syntax。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_ports(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_PORTS, false, true, drops)
+    string_items(v, P_PORTS, false, true, Some(LongSyntaxKey::Ports), drops)
 }
 
-/// `volumes` の short syntax。マッピング要素は #865 で変換する（現状は drop）。
+/// `volumes` の short syntax。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_volumes(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_VOLUMES, false, false, drops)
+    string_items(
+        v,
+        P_VOLUMES,
+        false,
+        false,
+        Some(LongSyntaxKey::Volumes),
+        drops,
+    )
 }
 
-/// `secrets` の short syntax。マッピング要素は #865 で変換する（現状は drop）。
+/// `secrets` の short syntax。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_secrets(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_SECRETS, false, false, drops)
+    string_items(
+        v,
+        P_SECRETS,
+        false,
+        false,
+        Some(LongSyntaxKey::Secrets),
+        drops,
+    )
 }
 
-/// `configs` の short syntax。マッピング要素は #865 で変換する（現状は drop）。
+/// `configs` の short syntax。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_configs(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_CONFIGS, false, false, drops)
+    string_items(
+        v,
+        P_CONFIGS,
+        false,
+        false,
+        Some(LongSyntaxKey::Configs),
+        drops,
+    )
 }
 
-/// `tmpfs` の short syntax（単独の文字列も 1 要素）。マッピング要素は #865 で変換する（現状は drop）。
+/// `tmpfs` の short syntax（単独の文字列も 1 要素）。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_tmpfs(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_TMPFS, true, false, drops)
+    string_items(v, P_TMPFS, true, false, Some(LongSyntaxKey::Tmpfs), drops)
 }
 
 /// `devices` の short syntax。`Service.devices` は CDI 完全修飾名専用のため、ホストパス形
-/// （`/dev/dri:/dev/dri` 等）は出力せず drop に記録する。マッピング要素は #865 で変換する（現状は drop）。
+/// （`/dev/dri:/dev/dri` 等）は出力せず drop に記録する。マッピング要素は long syntax の変換へ回す（表せなければ drop）。
 pub fn convert_devices(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_DEVICES, false, false, drops)
-        .into_iter()
-        .filter(|s| {
-            let ok = is_cdi_qualified_name(s);
-            if !ok {
-                drops.note(P_DEVICES);
-            }
-            ok
-        })
-        .collect()
+    string_items(
+        v,
+        P_DEVICES,
+        false,
+        false,
+        Some(LongSyntaxKey::Devices),
+        drops,
+    )
+    .into_iter()
+    .filter(|s| {
+        let ok = is_cdi_qualified_name(s);
+        if !ok {
+            drops.note(P_DEVICES);
+        }
+        ok
+    })
+    .collect()
 }
 
 /// CDI 完全修飾名 `vendor/class=name` か。ホストパス形（`/dev/x:/dev/x`）を区別するための判定。
@@ -340,7 +391,7 @@ fn is_cdi_qualified_name(s: &str) -> bool {
 
 /// `profiles`。文字列のリスト（単独の文字列も 1 要素）。
 pub fn convert_profiles(v: &ComposeValue, drops: &mut ValueDrops) -> Vec<String> {
-    string_items(v, P_PROFILES, true, false, drops)
+    string_items(v, P_PROFILES, true, false, None, drops)
 }
 
 /// サービスの `networks`。リスト形は名前、マッピング形はキーが名前。属性つきは名前だけ残して記録する。
@@ -365,7 +416,7 @@ pub fn convert_service_networks(v: &ComposeValue, drops: &mut ValueDrops) -> Vec
             }
             out
         }
-        _ => string_items(v, P_NETWORKS, false, false, drops),
+        _ => string_items(v, P_NETWORKS, false, false, None, drops),
     }
 }
 
@@ -781,7 +832,7 @@ mod tests {
         assert_eq!(d.get(P_NETWORKS), 1);
     }
 
-    /// STACK-3: short syntax の 6 キーと、マッピング要素の記録（#865 が差し替える）。
+    /// STACK-3: short syntax の 6 キーと、マッピング要素の記録（long syntax は #599 で結線済み）。
     #[test]
     fn stack3_short_syntax_lists() {
         let (s, d, _) = svc(
@@ -797,9 +848,63 @@ mod tests {
         let (s, d, _) = svc(
             "    ports:\n      - '1:1'\n      - {target: 80}\n    volumes:\n      - {type: bind}\n",
         );
-        assert_eq!(s.ports, strs(&["1:1"]));
+        // {target: 80} は short syntax と等価なので変換される（#865）。{type: bind} は必須項目が無く drop。
+        assert_eq!(s.ports, strs(&["1:1", "80"]));
+        assert_eq!(d.get(P_PORTS), 0);
+        assert_eq!(d.get(P_VOLUMES), 1);
+    }
+
+    /// STACK-3: long syntax のマッピング要素は変換器へ結線され、表せない要素だけ drop に 1 件ずつ数える。
+    #[test]
+    fn stack3_long_syntax_mapping_elements_are_wired() {
+        let (s, d, _) = svc(
+            "    ports:\n      - {target: 80, published: 8080, protocol: tcp}\n      - {target: 81, mode: host}\n    volumes:\n      - {type: tmpfs, target: /t}\n    secrets:\n      - {source: api_key}\n    tmpfs:\n      - {target: /x}\n    devices:\n      - {source: a}\n",
+        );
+        assert_eq!(s.ports, strs(&["8080:80/tcp"]));
+        assert_eq!(s.secrets, strs(&["api_key"]));
+        assert!(s.volumes.is_empty() && s.tmpfs.is_empty() && s.devices.is_empty());
         assert_eq!(d.get(P_PORTS), 1);
         assert_eq!(d.get(P_VOLUMES), 1);
+        assert_eq!(d.get(P_TMPFS), 1);
+        assert_eq!(d.get(P_DEVICES), 1);
+        assert_eq!(d.get(P_SECRETS), 0);
+        assert_eq!(d.total(), 4);
+    }
+
+    /// STACK-3: long syntax を回さないキー（env_file）のマッピング要素は従来どおり drop 1 件。
+    #[test]
+    fn stack3_env_file_mapping_still_dropped() {
+        let (s, d, _) = svc("    env_file:\n      - {path: a.env}\n");
+        assert!(s.env_files.is_empty());
+        assert_eq!(d.get(P_ENV_FILE), 1);
+        assert_eq!(d.total(), 1);
+    }
+
+    /// STACK-3: long syntax の key_path は convert の drop キーパス表に含まれる。
+    #[test]
+    fn stack3_long_syntax_paths_match_convert_paths() {
+        for k in [
+            LongSyntaxKey::Ports,
+            LongSyntaxKey::Volumes,
+            LongSyntaxKey::Secrets,
+            LongSyntaxKey::Configs,
+            LongSyntaxKey::Tmpfs,
+            LongSyntaxKey::Devices,
+        ] {
+            assert!(DROP_KEY_PATHS.contains(&k.key_path()), "{}", k.key_path());
+        }
+    }
+
+    /// STACK-3: note_many は 0 件で記録を作らず、飽和加算する。
+    #[test]
+    fn stack3_value_drops_note_many() {
+        let mut d = ValueDrops::new();
+        d.note_many(P_PORTS, 0);
+        assert!(d.is_empty());
+        d.note_many(P_PORTS, 3);
+        assert_eq!(d.get(P_PORTS), 3);
+        d.note_many(P_PORTS, u64::MAX);
+        assert_eq!(d.get(P_PORTS), u64::MAX);
     }
 
     /// STACK-3: Float は文字列へ直さず記録する。

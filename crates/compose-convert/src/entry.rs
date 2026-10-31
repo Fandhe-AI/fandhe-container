@@ -28,6 +28,11 @@
 //! 定めていないため、この判断を試験で固定する。入力の走査エラーは [`crate::input_scan::ComposeInputErrorCode::exit_code`]、
 //! 同じ `file_id`（`compose.yml` と `compose.yaml` の共存）は変換せず 2。
 //!
+//! # 変換可率（TASK-152.2・#606・STACK-4）
+//!
+//! `summary` 行の `conversion_rate` は出現数ベースの変換可率の計測で、算出は [`crate::conversion_rate`]。
+//! 80% 未満・判定不能でも終了コードは 0（レポートするだけでゲートにしない。判定は #607）。
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! TOML の書き出し（stdout は空けたまま。集計行に `toml_output:"unimplemented"`）。
@@ -37,6 +42,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::compose_convert::parse_compose_yaml;
+use crate::conversion_rate::ConversionRateTally;
 use crate::convert::{ValueDrops, convert_top_level};
 use crate::downgrade::{DowngradeArgError, DowngradeSet, parse_downgrade_value};
 use crate::input_scan::load_input_dir;
@@ -192,6 +198,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
     }
 
     let mut out = String::new();
+    let mut tally = ConversionRateTally::new();
     let (mut error_free_files, mut parse_failed_files, mut downgrade_free_files) =
         (0u64, 0u64, 0u64);
     for (input, id) in inputs.iter().zip(&ids) {
@@ -205,6 +212,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
                 FileConversionReport::from_parsed(occ, drops)
             }
         };
+        tally.add(&report);
         let verdict = report.error_free();
         if report.parse_error.is_some() {
             parse_failed_files += 1;
@@ -233,6 +241,7 @@ fn run_dir(dir: &Path, downgrade: Option<&DowngradeSet>) -> Outcome {
         error_free_files,
         downgrade.map(|_| downgrade_free_files),
         parse_failed_files,
+        &tally.finish(),
     ));
     Outcome {
         exit_code: 0,

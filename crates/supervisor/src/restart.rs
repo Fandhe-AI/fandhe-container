@@ -11,7 +11,8 @@
 //! `restart_count` は「実施済み再起動の回数」で、再 launch に成功し `Running` を記録できた 1 回の書き込みでだけ
 //! 1 進む（再 launch 失敗・記録失敗は数えない）。この書き込みは、再 launch したハンドルの
 //! `LaunchedProcess::launch_isolation`（launch 時の分離の記録）も `state.json` へ置き換える（SUP-6・#2007）。
-//! ハンドルが記録を持たない場合（偽の launcher のみ）は前の記録を引き継ぐ（トレイト契約 12）。
+//! ハンドルが記録を持たない場合（偽の launcher のみ）は前の記録を消す（トレイト契約 12・CORE-2・#2238。古い記録を
+//! 残すと実際の分離と食い違うため。消去後の exec は記録が無く拒否される）。
 //!
 //! # 未実装の将来仕様（REPAIR-3）
 //! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で、
@@ -2262,8 +2263,8 @@ mod tests {
                 .unwrap()
                 .with_supervision(sup)
                 .with_explicit_stop(explicit);
-                // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
-                let next = match req.launch_isolation().or(g.launch_isolation()) {
+                // 契約 12: Replace は置き換え、Clear は消し、Inherit は既存の値を引き継ぐ。
+                let next = match req.launch_isolation_update().apply(g.launch_isolation()) {
                     Some(l) => next.with_launch_isolation(l.clone()),
                     None => next,
                 };
@@ -2554,9 +2555,9 @@ mod tests {
         assert_eq!(g.restart_count(), 1);
     }
 
-    /// SUP-6(#2007): 記録を持たない再 launch のハンドルでは、前の記録(`/` が (1, 2))を引き継ぐ(契約 12)。
+    /// SUP-6・CORE-2(#2238): 記録を持たない再 launch のハンドルでは、前の記録(`/` が (1, 2))を消す(契約 12)。
     #[test]
-    fn sup6_restart_without_launch_isolation_keeps_the_previous_record() {
+    fn sup6_core2_restart_without_launch_isolation_clears_the_previous_record() {
         let st = store(0, 42);
         {
             let mut g = st.rec.lock().unwrap();
@@ -2573,7 +2574,7 @@ mod tests {
             &Events::default(),
         );
         let g = st.rec.lock().unwrap();
-        assert!(g.launch_isolation() == Some(&iso(1, 2)));
+        assert_eq!(g.launch_isolation(), None);
         assert_eq!(g.restart_count(), 1);
     }
 

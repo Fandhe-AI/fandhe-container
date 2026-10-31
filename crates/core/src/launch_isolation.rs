@@ -31,7 +31,7 @@
 //! - 本番 launcher は `StagePipeline::with_landlock` へ渡す ruleset そのものと、pin 済みの rootfs fd の fstat から
 //!   記録を作り、`LaunchedProcess::launch_isolation` で返す。start が Running の更新と同じ 1 回の `update` で書き、
 //!   supervisor の restart が Running(新 pid) の更新で置き換える（#2007）。作れなければ fork 前に launch が失敗する
-//! - 再 launch したハンドルが記録を持たない（偽の launcher のみ）場合は、契約 12 に従い前の記録を引き継ぐ
+//! - 再 launch したハンドルが記録を持たない（偽の launcher のみ）場合は、契約 12 に従い前の記録を消す（#2238。以後の exec は記録が無く拒否される）
 //! - 本番 launcher による restart の再 launch は、supervisor が単一スレッドにしてから行う（#2043）
 
 use std::fmt;

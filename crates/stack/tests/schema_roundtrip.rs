@@ -1,4 +1,4 @@
-//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・TASK-149.4.2・#863・REPAIR-12）。
+//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・TASK-149.4.1・#862・TASK-149.4.2・#863・REPAIR-12）。
 //!
 //! 6 テーブル（project・services・networks・volumes・secrets・configs）の読み込みと、
 //! 書き出し・再読み込みの往復を具体値で照合する。parse / serialize の公開入口は
@@ -123,6 +123,32 @@ fn stack_1_public_api_empty_document() {
 fn stack_1_public_api_rejects_unknown_keys() {
     assert!(toml::from_str::<ComposeToml>("profiles = [\"dev\"]").is_err());
     assert!(toml::from_str::<ComposeToml>("[secrets.k]\nfiel = \"x\"\n").is_err());
+}
+
+/// STACK-1・STACK-10・GPU-1・TASK-149.4.1: 拡張フィールドを公開パスで読み、往復できる。
+#[test]
+fn stack_1_public_api_service_extended_fields() {
+    let doc = r#"
+[services.gpu]
+restart = "always"
+devices = ["nvidia.com/gpu=all"]
+profiles = ["gpu"]
+
+[services.gpu.ulimits]
+nofile = "1024:2048"
+"#;
+    let parsed: ComposeToml = toml::from_str(doc).expect("valid");
+    let svc = &parsed.services["gpu"];
+    assert_eq!(svc.restart.as_deref(), Some("always"));
+    assert_eq!(svc.devices, vec!["nvidia.com/gpu=all".to_string()]);
+    assert_eq!(svc.profiles, vec!["gpu".to_string()]);
+    assert_eq!(
+        svc.ulimits.get("nofile").map(String::as_str),
+        Some("1024:2048")
+    );
+    let text = toml::to_string(&parsed).expect("serialize");
+    let again: ComposeToml = toml::from_str(&text).expect("reparse");
+    assert_eq!(again, parsed);
 }
 
 /// STACK-1・TASK-149.4.2(#863): 公開パスから healthcheck と入れ子の deploy.resources を読み、往復が一致する。

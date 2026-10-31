@@ -55,10 +55,10 @@ pub struct Project {
 
 /// `[services.<name>]` テーブル（STACK-1・TASK-149.3・#585）。
 ///
-/// 基本フィールド 10 個に加え、`healthcheck` と `deploy.resources`（TASK-149.4.2・#863）を持つ。
-/// 残りの拡張フィールド（restart・devices・profiles 等）は TASK-149.4（#862）で足す。
-/// `deny_unknown_fields` のため、未定義のキー（未追加の拡張フィールドと typo）は今も拒否する
-/// （fail-closed）。
+/// 基本フィールド 10 個（TASK-149.3・#585）、拡張フィールド 8 個（restart・secrets・configs・
+/// ulimits・shm_size・tmpfs・devices・profiles。TASK-149.4.1・#862）、`healthcheck` と
+/// `deploy.resources`（TASK-149.4.2・#863）を持つ。`deny_unknown_fields` のため、
+/// 未定義のキー（typo を含む）は今も拒否する（fail-closed）。
 ///
 /// 値は検証しない。`env_files`・`volumes` のホスト側パス（`..`・symlink を含む範囲外参照）、
 /// `ports`、`image` の参照形式の検証と、`command` / `entrypoint` をシェルへ連結せず配列のまま
@@ -105,6 +105,49 @@ pub struct Service {
     /// ラベル。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// 再起動ポリシーの文字列(`no`・`always`・`unless-stopped`・`on-failure[:N]`。SUP-3・STACK-1)。
+    ///
+    /// supervisor の `RestartPolicy::from_str` が受ける形のまま持つ。引数つきの語彙で、パーサが別 crate に
+    /// あるため、stack では二重のパーサを作らず文字列にする(untagged enum も解釈が曖昧になるため採らない)。
+    /// 検証は `up`(TASK-155)が supervisor のパーサへ渡す時点で行う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
+    /// 参照する `[secrets.<name>]` の名前(short syntax のみ。compose の long syntax は変換器が正規化する)。
+    ///
+    /// 値(資格情報)は持たない。参照先の存在とファイルパスの範囲の照合は読み込み側の責務である。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// 参照する `[configs.<name>]` の名前。扱いは `secrets` と同じ。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configs: Vec<String>,
+    /// rlimit の指定(キーは Docker の名前。例: `nofile`。値は `"<soft>[:<hard>]"`。例: `"65536:65536"`・`"-1"`)。
+    ///
+    /// `up` が `--ulimit <name>=<value>` に組み、検証(名前の許可リスト・soft <= hard・件数)は supervisor の
+    /// `Ulimit::parse` と CLI の create が行う。compose の整数形・`{soft, hard}` 形は変換器(TASK-151)が
+    /// この文字列へ正規化する。整数で書いた TOML は型エラーで拒否する(fail-closed)。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ulimits: BTreeMap<String, String>,
+    /// `/dev/shm` のサイズ(CLI の `--shm-size <size>` と同じ文字列。例: `"64m"`。未検証)。
+    ///
+    /// compose の整数のバイト数は変換器が文字列へ正規化する。検証は CLI の create が行う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// tmpfs マウント(CLI の `--tmpfs <dest>[:<opts>]` と同じ文字列。例: `"/run:size=64m"`。未検証)。
+    ///
+    /// dest の絶対パス・トラバーサル・オプションの検証は CLI / core が行う。シェル文字列へ連結しない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+    /// CDI の完全修飾デバイス名(`<vendor>/<class>=<name>`。例: `nvidia.com/gpu=all`。GPU-1・STACK-1)。
+    ///
+    /// compose のホストパス形(`/dev/x:/dev/x`)は表さず変換器が扱う。非 GPU への一般化は GPU-9(検討中)で
+    /// 確定扱いしない。名前の解析と spec の解決は gpu crate が `up`(TASK-155・TASK-156)の時点で行う。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+    /// このサービスが属するプロファイル名(STACK-10・TASK-187 の絞り込みが参照する)。
+    ///
+    /// 空は「常に対象」を意味する。トップレベルの `profiles` は置かない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
     /// ヘルスチェック定義（STACK-1・TASK-149.4.2・#863）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
@@ -199,7 +242,8 @@ impl Service {
     /// キー昇順)、`--label <KEY=VALUE>`(`labels`。キー昇順)の列で、`up`(TASK-155)が CLI の `create` を呼ぶ想定に
     /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
     /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
-    /// `ulimit`・`tmpfs` はスキーマに無い(#586・#862)ため含めない。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// `ulimits`・`tmpfs`・`shm_size` はスキーマにあるが(#862)、`--ulimit`・`--tmpfs`・`--shm-size` への写しは
+    /// 未実装で含めない。`up` からの結線は TASK-155 の後続(REPAIR-3)。
     ///
     /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
     /// パスは検証しない(読むのは CLI が利用者の権限で行う。範囲外参照の扱いは `up` の責務)。
@@ -379,8 +423,7 @@ file = "./app.conf"
             volumes: vec!["models:/models:ro".into()],
             depends_on: BTreeMap::from([("db".into(), DependsOnCondition::Healthy)]),
             labels: BTreeMap::from([("tier".into(), "front".into())]),
-            healthcheck: None,
-            deploy: None,
+            ..Service::default()
         }
     }
 
@@ -657,5 +700,107 @@ devices = ["nvidia.com/gpu=0", "nvidia.com/gpu=all"]
     fn stack_1_service_empty_collections_are_omitted() {
         let text = toml::to_string(&Service::default()).expect("serialize");
         assert_eq!(text, "");
+    }
+
+    const EXTENDED: &str = r#"
+[services.s]
+restart = "on-failure:3"
+secrets = ["api_key"]
+configs = ["app"]
+shm_size = "64m"
+tmpfs = ["/run:size=64m"]
+devices = ["nvidia.com/gpu=all", "nvidia.com/gpu=0"]
+profiles = ["dev", "gpu"]
+
+[services.s.ulimits]
+nofile = "65536:65536"
+nproc = "-1"
+"#;
+
+    fn extended_service() -> Service {
+        Service {
+            restart: Some("on-failure:3".into()),
+            secrets: vec!["api_key".into()],
+            configs: vec!["app".into()],
+            ulimits: BTreeMap::from([
+                ("nofile".into(), "65536:65536".into()),
+                ("nproc".into(), "-1".into()),
+            ]),
+            shm_size: Some("64m".into()),
+            tmpfs: vec!["/run:size=64m".into()],
+            devices: vec!["nvidia.com/gpu=all".into(), "nvidia.com/gpu=0".into()],
+            profiles: vec!["dev".into(), "gpu".into()],
+            ..Service::default()
+        }
+    }
+
+    /// STACK-1・TASK-149.4.1: 拡張 8 フィールドが具体値で読める。
+    #[test]
+    fn stack_1_service_extended_fields_parse() {
+        let parsed: ComposeToml = toml::from_str(EXTENDED).expect("valid");
+        assert_eq!(parsed.services["s"], extended_service());
+    }
+
+    /// STACK-1・TASK-149.4.1: 拡張フィールドは書き出して読み直すと一致し、書き出しは安定する。
+    #[test]
+    fn stack_1_service_extended_fields_roundtrip() {
+        let parsed: ComposeToml = toml::from_str(EXTENDED).expect("valid");
+        let text = toml::to_string(&parsed).expect("serialize");
+        assert!(text.contains("restart = \"on-failure:3\""), "{text}");
+        assert!(text.contains("nofile = \"65536:65536\""), "{text}");
+        let again: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(again, parsed);
+        assert_eq!(toml::to_string(&again).expect("serialize"), text);
+    }
+
+    /// STACK-1・GPU-1・TASK-149.4.1: `devices` は CDI 完全修飾名の文字列配列で、文字列・テーブルは拒否する。
+    #[test]
+    fn stack_1_devices_are_cdi_name_strings() {
+        let ok: ComposeToml =
+            toml::from_str("[services.s]\ndevices = [\"nvidia.com/gpu=all\"]\n").expect("valid");
+        assert_eq!(
+            ok.services["s"].devices,
+            vec!["nvidia.com/gpu=all".to_string()]
+        );
+        for bad in [
+            "[services.s]\ndevices = \"nvidia.com/gpu=all\"\n",
+            "[services.s]\ndevices = [{ name = \"x\" }]\n",
+        ] {
+            assert!(
+                toml::from_str::<ComposeToml>(bad).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    /// STACK-1・STACK-10・TASK-149.4.1: `profiles` は文字列配列で、無ければ空・書き出しに出ない。
+    #[test]
+    fn stack_10_profiles_are_string_list() {
+        let ok: ComposeToml =
+            toml::from_str("[services.s]\nprofiles = [\"dev\"]\n").expect("valid");
+        assert_eq!(ok.services["s"].profiles, vec!["dev".to_string()]);
+        assert!(toml::from_str::<ComposeToml>("[services.s]\nprofiles = \"dev\"\n").is_err());
+        let none: ComposeToml = toml::from_str("[services.s]\n").expect("valid");
+        assert!(none.services["s"].profiles.is_empty());
+        let text = toml::to_string(&none).expect("serialize");
+        assert!(!text.contains("profiles"), "{text}");
+    }
+
+    /// STACK-1・TASK-149.4.1: typo と誤った型は拒否する(fail-closed)。
+    #[test]
+    fn stack_1_extended_fields_reject_typo_and_wrong_type() {
+        for bad in [
+            "[services.s]\nprofile = [\"dev\"]\n",
+            "[services.s]\nrestart_policy = \"always\"\n",
+            "[services.s.ulimit]\nnofile = \"1\"\n",
+            "[services.s.ulimits]\nnofile = 1024\n",
+            "[services.s]\nshm_size = 67108864\n",
+            "[services.s]\nrestart = { policy = \"always\" }\n",
+        ] {
+            assert!(
+                toml::from_str::<ComposeToml>(bad).is_err(),
+                "accepted: {bad}"
+            );
+        }
     }
 }

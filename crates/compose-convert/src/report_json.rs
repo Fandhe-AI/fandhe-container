@@ -294,10 +294,10 @@ mod tests {
         let r = FileConversionReport::from_parsed(occ, ValueDrops::new());
         let l = file_line("a", &r, &r.error_free(), None);
         let want = format!(
-            "\"error_free_blockers\":[{{\"kind\":\"error-class-key\",\"key_path\":\"services.*.build\",\"class\":\"error-incompatible\",\"occurrences\":1,\"guidance\":{{\"code\":\"external-build\",\"message\":\"{}\"}}}}]}}\n",
+            "\"error_free_blockers\":[{{\"kind\":\"error-class-key\",\"key_path\":\"services.*.build\",\"class\":\"error-incompatible\",\"occurrences\":1,\"guidance\":{{\"code\":\"external-build\",\"message\":\"{}\"}}}}]",
             crate::classify::IncompatibleGuidance::ExternalBuild.message()
         );
-        assert!(l.contains(&want[..want.len() - 2]), "{l}");
+        assert!(l.contains(&want), "{l}");
         assert!(l.is_ascii() && l.matches('\n').count() == 1);
         assert_eq!(l.matches("guidance").count(), 1);
     }

@@ -182,6 +182,91 @@ fn downgrade_of_non_unsupported_key_is_rejected() {
     assert_eq!(code, Some(2), "{err}");
 }
 
+const REJECT_HEAD: &str =
+    "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"--downgrade key is not error-unsupported-yet\"";
+
+/// STACK-3・TASK-182.2: 拒否 4 分類（convert・warning〔表と `x-*`〕・error-incompatible・unrecognized）は
+/// 変換せず 2。stdout は空、stderr はエラー 1 行だけで、走査より前（存在しないディレクトリでも 3 にならない）に止まる。
+#[test]
+fn downgrade_rejected_classes_exit_2_without_conversion() {
+    let cases: [(&str, &str); 5] = [
+        (
+            "services.*.image",
+            ",\"class\":\"convert\",\"key_path\":\"services.*.image\",\"index\":\"0\"}\n",
+        ),
+        (
+            "version",
+            ",\"class\":\"warning\",\"key_path\":\"version\",\"index\":\"0\"}\n",
+        ),
+        ("x-common", ",\"class\":\"warning\",\"index\":\"0\"}\n"),
+        (
+            "services.*.privileged",
+            ",\"class\":\"error-incompatible\",\"key_path\":\"services.*.privileged\",\"index\":\"0\"}\n",
+        ),
+        (
+            "services.*.secret-marker-628",
+            ",\"class\":\"unrecognized\",\"index\":\"0\"}\n",
+        ),
+    ];
+    let s = Scratch::new();
+    s.write("a.yaml", "services:\n  web:\n    image: busybox\n");
+    let dir = s.path().to_string_lossy().into_owned();
+    let absent = s.path().join("absent").to_string_lossy().into_owned();
+    for (key, tail) in cases {
+        let expected = format!("{REJECT_HEAD}{tail}");
+        for d in [&dir, &absent] {
+            let (code, out, err) = run_strs(&[&format!("--downgrade={key}"), d]);
+            assert_eq!(code, Some(2), "{key}: {err}");
+            assert_eq!(out, "", "{key}");
+            assert_eq!(err, expected, "{key}");
+            assert!(!err.contains("\"kind\":\"file\""));
+            assert!(!err.contains("\"kind\":\"summary\""));
+        }
+    }
+}
+
+/// STACK-3・TASK-182.2: 受理されるキーが混ざっていても拒否が 1 つでもあれば 2。最初の拒否だけを出し、入力は出さない。
+#[test]
+fn downgrade_mixed_accepted_and_rejected_exit_2() {
+    let s = Scratch::new();
+    s.write("a.yaml", "services:\n  web:\n    image: busybox\n");
+    let dir = s.path().to_string_lossy().into_owned();
+    let image_tail = ",\"class\":\"convert\",\"key_path\":\"services.*.image\"";
+    let (code, out, err) = run_strs(&["--downgrade=services.*.tty,services.*.image", &dir]);
+    assert_eq!(code, Some(2), "{err}");
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        format!("{REJECT_HEAD}{image_tail},\"index\":\"1\"}}\n")
+    );
+    let (code, _, err) = run_strs(&["--downgrade=services.*.image,services.*.tty", &dir]);
+    assert_eq!(code, Some(2));
+    assert_eq!(
+        err,
+        format!("{REJECT_HEAD}{image_tail},\"index\":\"0\"}}\n")
+    );
+    // 拒否が複数: 最初のものだけ。
+    let (code, _, err) = run_strs(&[
+        "--downgrade=services.*.tty,services.*.image,services.*.privileged",
+        &dir,
+    ]);
+    assert_eq!(code, Some(2));
+    assert_eq!(
+        err,
+        format!("{REJECT_HEAD}{image_tail},\"index\":\"1\"}}\n")
+    );
+    assert!(!err.contains("privileged"));
+    // unrecognized が混ざっても入力の目印は出ない。
+    let (code, _, err) = run_strs(&[
+        "--downgrade=services.*.tty,services.*.secret-marker-628",
+        &dir,
+    ]);
+    assert_eq!(code, Some(2));
+    assert!(err.contains("\"class\":\"unrecognized\""));
+    assert!(err.contains("\"index\":\"1\""));
+    assert!(!err.contains("secret-marker-628"));
+}
+
 /// STACK-3・TASK-182.1: 指定したキーが unsupported-yet のファイルは格下げされ、既定の error_free とは別に集計される。
 #[test]
 fn downgrade_of_unsupported_key_is_reported() {

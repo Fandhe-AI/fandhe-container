@@ -74,7 +74,8 @@
 ## 8. タイムアウトの層と cancel（REPAIR-5）
 
 - `probe(T)` の絶対期限 `T` に対し、helper の exec の期限は `T - min(T/5, 2s)`（30s → 28s、5s → 4s、1s → 800ms）。通常は core が期限切れのコマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる
-- `T` を過ぎても終わらなければ helper を SIGKILL し、1 秒以内に `try_wait` で回収して `Timeout` を返す。worker とコマンドは core の親死亡シグナルの連鎖で止まる。回収できなければ zombie として残し `helper_reaped = false` で報告する（回収前の `Child` でだけ kill するため pid 再利用を避けられる）
+- `T` を過ぎても終わらなければ helper を SIGKILL し、1 秒以内に `try_wait` で回収して `Timeout` を返す。回収できなければ zombie として残し `helper_reaped = false` で報告する（回収前の `Child` でだけ kill するため pid 再利用を避けられる）
+- worker とコマンドの停止は親死亡シグナルに頼らない（コマンドは `PR_SET_PDEATHSIG` を解除でき、fork した子孫には継承されないため）。helper は exec 子 cgroup の排他作成（同名は `EEXIST` で失敗）に成功した直後、worker の fork 前に、名前を作成通知（`FCHC1 <名前>`）として fd 2 へ 1 回だけ書く。supervisor は、この通知で今回の作成を確認できた cgroup（名前が `exec-<helper pid>-` で始まるもの）だけを `cgroup.kill` して削除する。pid から名前を推定しない。通知が無いときは何も止めない（以前の exec が残した同名の cgroup を誤って止めないため。SUP-6・#2441）
 - `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、kill と回収を自分で行う
 - helper の終了後、出力と結果の EOF を 100ms だけ待つ（コマンドの子孫が書き込み端を持ち続けても待ち続けない）
 - 結果ストリームは 32 KiB で打ち切る（超過は異常として `Internal`）。診断行は JSON 形（`{"` で始まり 1 KiB 以下）のものを最大 16 本だけ stderr sink へ転送し、残りは捨てて件数を数える
@@ -82,7 +83,8 @@
 
 ### 残余
 
-- helper を SIGKILL したときに残る `exec-*` の子 cgroup は、次の exec 開始時の掃除と delete 前の掃除に任せる（既存の割り切りを踏襲）
+- 作成通知を受け取れないまま helper を SIGKILL した場合（cgroup の作成完了から通知の書き込みまでの間）は、supervisor 側から止められない。その `exec-*` の子 cgroup とコマンドの子孫は残りうる。次の exec 開始時の掃除が回収するのは空の cgroup だけで、populated な cgroup は止めずに残す。populated なものは delete 前の掃除（`cgroup.kill` を含む）が回収する
+- 作成通知を受けた cgroup の停止に失敗した場合（`cgroup_stop_failed = true`）も、同じく delete 前の掃除が回収する
 - supervisor が異常終了した場合、helper は `PR_SET_PDEATHSIG` を持たない（生成元が一時スレッドで、PDEATHSIG はそのスレッドに束縛されるため）。helper 自身の exec 期限と後始末で終わる
 
 ## 9. ambient capability（SEC-1）

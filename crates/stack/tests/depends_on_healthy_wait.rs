@@ -91,3 +91,80 @@ fn stack_2_unhealthy_blocks_start() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+/// 観測のたびに時計を進める source（観測処理が長引いた場合の模擬）。
+struct SlowHealthy<'a> {
+    clock: &'a std::cell::Cell<Duration>,
+    cost: Duration,
+    calls: usize,
+}
+impl HealthSource for SlowHealthy<'_> {
+    fn observe(&mut self, _s: &str) -> Result<Option<ObservedHealth>, HealthSourceError> {
+        self.calls += 1;
+        self.clock.set(self.clock.get() + self.cost);
+        Ok(Some(ObservedHealth::Healthy))
+    }
+}
+struct CellClock<'a>(&'a std::cell::Cell<Duration>, Duration);
+impl PollClock for CellClock<'_> {
+    fn now(&self) -> Duration {
+        self.0.get()
+    }
+    fn sleep(&mut self, d: Duration) {
+        // スケジューリング遅延で要求より長く眠る
+        self.0.set(self.0.get() + d + self.1);
+    }
+}
+
+/// STACK-2・REPAIR-5: 観測中に期限(1s)を超えて healthy を返しても許可しない。
+#[test]
+fn stack_2_healthy_observed_after_deadline_is_blocked() {
+    let t = std::cell::Cell::new(Duration::ZERO);
+    let mut src = SlowHealthy {
+        clock: &t,
+        cost: Duration::from_millis(1500),
+        calls: 0,
+    };
+    let mut clock = CellClock(&t, Duration::ZERO);
+    let gate = gate_healthy_dependencies(&web_step(), &mut src, &mut clock, &policy()).unwrap();
+    assert_eq!(
+        gate,
+        HealthyGate::Blocked(HealthyWaitOutcome::DeadlineReached {
+            service: "worker".into(),
+            last_observed: Some(ObservedHealth::Healthy),
+            polls: 1
+        })
+    );
+    assert_eq!(src.calls, 1);
+}
+
+/// 1 回目は starting、2 回目以降は healthy を返す source。
+struct Late(usize);
+impl HealthSource for Late {
+    fn observe(&mut self, _s: &str) -> Result<Option<ObservedHealth>, HealthSourceError> {
+        self.0 += 1;
+        Ok(Some(if self.0 == 1 {
+            ObservedHealth::Starting
+        } else {
+            ObservedHealth::Healthy
+        }))
+    }
+}
+
+/// STACK-2・REPAIR-5: sleep が期限を超えた後は healthy を観測せず許可しない。
+#[test]
+fn stack_2_sleep_overshoot_blocks_without_further_observation() {
+    let t = std::cell::Cell::new(Duration::ZERO);
+    let mut src = Late(0);
+    let mut clock = CellClock(&t, Duration::from_secs(5));
+    let gate = gate_healthy_dependencies(&web_step(), &mut src, &mut clock, &policy()).unwrap();
+    assert_eq!(
+        gate,
+        HealthyGate::Blocked(HealthyWaitOutcome::DeadlineReached {
+            service: "worker".into(),
+            last_observed: Some(ObservedHealth::Starting),
+            polls: 1
+        })
+    );
+    assert_eq!(src.0, 1);
+}

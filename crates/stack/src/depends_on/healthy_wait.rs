@@ -289,7 +289,16 @@ pub fn wait_until_healthy(
 ) -> Result<HealthyWaitOutcome, HealthyWaitError> {
     let start = clock.now();
     let mut polls: u64 = 0;
+    let mut last_observed: Option<ObservedHealth> = None;
     loop {
+        // 観測前の期限確認（先の依存先が期限を使い切った場合に後続の観測へ進まない。REPAIR-5）。
+        if clock.now() >= deadline {
+            return Ok(HealthyWaitOutcome::DeadlineReached {
+                service: service.to_string(),
+                last_observed,
+                polls,
+            });
+        }
         polls = polls.saturating_add(1);
         let observed = source
             .observe(service)
@@ -297,22 +306,24 @@ pub fn wait_until_healthy(
                 service: service.to_string(),
                 error,
             })?;
+        last_observed = observed;
+        let now = clock.now();
+        // 観測後の期限確認（観測中・sleep の遅れで期限を超えたら healthy でも許可しない）。
+        if now >= deadline {
+            return Ok(HealthyWaitOutcome::DeadlineReached {
+                service: service.to_string(),
+                last_observed,
+                polls,
+            });
+        }
         if observed == Some(ObservedHealth::Healthy) {
             return Ok(HealthyWaitOutcome::Healthy {
                 service: service.to_string(),
                 polls,
-                elapsed: clock.now().saturating_sub(start),
+                elapsed: now.saturating_sub(start),
             });
         }
-        let remaining = deadline.saturating_sub(clock.now());
-        if remaining.is_zero() {
-            return Ok(HealthyWaitOutcome::DeadlineReached {
-                service: service.to_string(),
-                last_observed: observed,
-                polls,
-            });
-        }
-        clock.sleep(policy.poll_interval.min(remaining));
+        clock.sleep(policy.poll_interval.min(deadline.saturating_sub(now)));
     }
 }
 
@@ -478,7 +489,7 @@ mod tests {
             HealthyWaitOutcome::DeadlineReached {
                 service: "db".into(),
                 last_observed: Some(Unhealthy),
-                polls: 11
+                polls: 10
             }
         );
         assert_eq!(c.sleeps.iter().sum::<Duration>(), ms(1000));
@@ -493,7 +504,7 @@ mod tests {
         assert!(matches!(
             r,
             HealthyWaitOutcome::DeadlineReached {
-                polls: 5,
+                polls: 4,
                 last_observed: Some(Starting),
                 ..
             }
@@ -510,7 +521,7 @@ mod tests {
             HealthyWaitOutcome::DeadlineReached {
                 service: "db".into(),
                 last_observed: None,
-                polls: 3
+                polls: 2
             }
         );
     }
@@ -659,8 +670,8 @@ image = "x"
         let g = gate_healthy_dependencies(&step, &mut s, &mut c, &pol(100, 1000)).unwrap();
         assert!(matches!(g, HealthyGate::Blocked(_)));
         assert_eq!(c.sleeps.iter().sum::<Duration>(), ms(1000));
-        // b に使えたのは残り 300ms のみ（初回 + 3 回の待ちの後で計 4 回）
+        // b に使えたのは残り 300ms のみ（700・800・900ms の 3 回。1000ms は期限で観測しない）
         let b_polls = s.1.iter().filter(|n| *n == "b").count();
-        assert_eq!(b_polls, 4);
+        assert_eq!(b_polls, 3);
     }
 }

@@ -530,7 +530,7 @@ mod tests {
     fn cri5_delete_both_versions() {
         for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
             let (s, f) = svc(v, Fake::default());
-            s.handle("Create", &create_req("c1", "/b")).unwrap();
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
             stopped(&f, "c1", Some(137));
             let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
             let r = DeleteResponse::decode(&out[..]).unwrap();
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn cri5_delete_created_never_started() {
         let (s, _) = svc(TaskApiVersion::V2, Fake::default());
-        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
         let r = DeleteResponse::decode(&out[..]).unwrap();
         assert_eq!((r.pid, r.exit_status), (0, 0));
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn cri5_delete_running_is_failed_precondition() {
         let (s, _) = svc(TaskApiVersion::V2, Fake::default());
-        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         s.handle("Start", &start_req("c1")).unwrap();
         assert_eq!(
             err_code(s.handle("Delete", &delete_req("c1", ""))).0,

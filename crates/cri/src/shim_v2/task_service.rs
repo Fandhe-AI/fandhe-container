@@ -24,7 +24,7 @@
 //! Wait（TASK-62.3.2）の検査の順序: 復号 → exec_id（空以外は `UNIMPLEMENTED`）→ id（アダプタの state）。
 //! `state` を [`WaitConfig`] の間隔で照会し `Stopped` で終了コードを返す。期限を超えたら `DEADLINE_EXCEEDED`（4）。
 //! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
-//! 既知の制約: サーバーは接続ごとに直列処理のため、待ちの間は同じ接続の他の RPC が止まる（REPAIR-3）。
+//! サーバーは要求を接続内で並行 dispatch するため待ちは他の RPC を止めず、停止・切断の通知を受けた Wait は期限前に取り消される。
 //!
 //! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
 //! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。

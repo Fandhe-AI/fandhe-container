@@ -21,8 +21,8 @@
 //! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669）。メッセージ型は手書きでサービス名だけで版を分ける
 //! - State / Kill / Shutdown（#873）。`Unimplemented`
 //! - Wait の `exec_id`・`exited_at`（常に未設定）・`timeout_nano`（期限は shim 側の [`wait::WaitConfig`] だけで決める）。
-//!   サーバーは接続ごとに要求を直列に処理するため、Wait の待ちの間は同じ接続の他の RPC が止まる（接続内の並行 dispatch は未実装）。
-//!   ハンドラはサーバーの停止フラグを見ないので、待ちは取り消せず期限で終わる
+//!   サーバーは接続内で要求ごとに並行 dispatch し（同時処理数に上限あり）、Wait の待ちは他の RPC を止めない。
+//!   サーバーの停止・接続の切断・応答の書き込み失敗は処理中のハンドラへ通知され、Wait は期限前に取り消される
 //! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Delete の `exited_at`（core が終了時刻を持たず常に未設定）。黙って捨てず `UNIMPLEMENTED`
 //! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #675・#803）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
 //!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec` と `Start(exec_id)` を `UNIMPLEMENTED` で拒否する

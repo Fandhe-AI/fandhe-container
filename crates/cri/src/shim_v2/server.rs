@@ -473,18 +473,28 @@ fn resp_code(resp: &TtrpcResponse) -> Code {
 const MAX_INFLIGHT_PER_CONN: usize = 16;
 
 /// 応答の書き込みを接続内で直列化して送る。失敗は計測して `false`。
+///
+/// 書き込みの失敗（フレームの途中のタイムアウトを含む）では応答の境界が壊れるため、接続を
+/// shutdown して `done` を立てる（読み取りループと他のハンドラが終了する）。失敗状態の確認は
+/// ロック内で行い、失敗後に別の書き手が書き始めて未完の本文へ連結するのを防ぐ。
 fn send_response(
     ctx: &Ctx,
     writer: &Mutex<UnixStream>,
+    done: &AtomicBool,
     sid: u32,
     resp: &TtrpcResponse,
     started: Instant,
 ) -> bool {
     let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+    if done.load(Ordering::SeqCst) {
+        return false;
+    }
     match write_response(&mut w, sid, resp, ctx) {
         Ok(()) => true,
         Err(e) => {
             record_write_failure(ctx, &e, started);
+            done.store(true, Ordering::SeqCst);
+            let _ = w.shutdown(std::net::Shutdown::Both);
             false
         }
     }
@@ -562,7 +572,7 @@ fn conn_loop<'scope, 'env>(
                 };
                 let resp = status_response(code, msg);
                 record_op(ctx, CriOpKind::ShimV2Frame, resp_code(&resp), started);
-                send_response(ctx, writer, raw_stream_id, &resp, started);
+                send_response(ctx, writer, done, raw_stream_id, &resp, started);
                 drain_then_close(&mut stream, ctx);
                 return;
             }
@@ -634,7 +644,7 @@ fn conn_loop<'scope, 'env>(
                                                 resp_code(&resp),
                                                 started,
                                             );
-                                            send_response(ctx, writer, sid, &resp, started);
+                                            send_response(ctx, writer, done, sid, &resp, started);
                                         });
                                     match spawned {
                                         Ok(_) => continue,
@@ -663,7 +673,7 @@ fn conn_loop<'scope, 'env>(
         };
         let resp = bound_response(resp);
         record_op(ctx, kind, resp_code(&resp), started);
-        if !send_response(ctx, writer, sid, &resp, started) {
+        if !send_response(ctx, writer, done, sid, &resp, started) {
             return;
         }
     }

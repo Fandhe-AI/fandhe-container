@@ -31,7 +31,7 @@ pub const WIRE_TAG: &str = "FCHX1";
 /// 停止する（pid から名前を推定しない。SUP-4・SUP-6・REPAIR-5・#2441）。
 pub const CGROUP_TAG: &str = "FCHC1";
 
-/// 作成通知行を組む（`FCHC1 <name>\n`。名前は検証済みの [`ExecCgroupName`]）。
+/// 作成通知行を組む（`FCHC1 <name>\n`。名前は検証済みの `fandhe_container_core::exec::ExecCgroupName`）。
 pub fn encode_cgroup_created(name: &fandhe_container_core::exec::ExecCgroupName) -> Vec<u8> {
     format!("{CGROUP_TAG} {}\n", name.as_str()).into_bytes()
 }

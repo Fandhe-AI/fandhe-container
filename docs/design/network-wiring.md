@@ -398,7 +398,7 @@ pasta 構成の期限（`--version` 2 秒・holder の READY 2 秒・準備完�
 | 状態ルートをまたぐ受け口の衝突 | `crates/net/src/network/listener_dump.rs`・`publish.rs` | なし | #3063（公開前の DNAT の dump と照合は実装済み。共有ロックと投入後の事後確認は未実装で、#3191 で追跡する） |
 | plugin-cri の netsetup の永続化 | `crates/plugin-cri/src/netsetup.rs` | なし | #3075 |
 | rootless のユーザー定義名（pasta） | net・supervisor | #349 条件 1（rootless）。条件 2 は NET-9 で約束しないため対象外 | #1936〜#1940 |
-| stack の `[networks]` の up / down | stack・cli | なし | #617（D10 の定義ストアを使う） |
+| stack の `[networks]` の up / down | stack・cli | なし | #617（D10 の定義ストアを使う）。stack 側の検証（`plan_networks`）・用意のポート（`NetworkProvisioner`）・launcher への接続指示（`LaunchRequest`）は #619 で実装済み。本番アダプタは #3639、down は #620 |
 
 ### #349・#319 の条件ごとの対応
 

@@ -401,3 +401,103 @@ fn cri5_invalid_header_write_failure_is_recorded() {
         "write failure on invalid-header path must be recorded"
     );
 }
+
+/// "Slow" は取り消しまで待ち、"Fast" は即座に返す試験用サービス。
+struct BlockingSvc {
+    cancelled_seen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TtrpcService for BlockingSvc {
+    fn name(&self) -> &str {
+        "test.Blocking"
+    }
+    fn handle(&self, method: &str, _payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        assert_eq!(method, "Fast");
+        Ok(Vec::new())
+    }
+    fn handle_cancellable(
+        &self,
+        method: &str,
+        payload: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        if method != "Slow" {
+            return self.handle(method, payload);
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < end {
+            if cancelled() {
+                self.cancelled_seen
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(RpcStatus::from_code(CriErrorCode::Unavailable, "cancelled"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(Vec::new())
+    }
+}
+
+fn start_blocking(
+    tag: &str,
+) -> (
+    test_root::TestRoot,
+    std::path::PathBuf,
+    ServerHandle,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let root = test_root::test_root("ttrpc", tag);
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reg = ServiceRegistry::new();
+    reg.register(Arc::new(BlockingSvc {
+        cancelled_seen: Arc::clone(&seen),
+    }))
+    .unwrap();
+    let h = TtrpcServer::new(reg, ServerConfig::default())
+        .serve(listener)
+        .unwrap();
+    (root, path, h, seen)
+}
+
+/// 同じ接続で待ち中の要求が後続の要求を塞がない（CRI-5・TASK-62.3.2 の Create -> Wait -> Start）。
+#[test]
+fn cri5_pending_request_does_not_block_later_requests_on_same_connection() {
+    let (_root, path, h, _seen) = start_blocking("conc");
+    let mut c = connect(&path);
+    send_req(&mut c, 1, "test.Blocking", "Slow");
+    send_req(&mut c, 3, "test.Blocking", "Fast");
+    let (sid, r) = read_resp(&mut c).unwrap();
+    assert_eq!((sid, r.status.is_none()), (3, true));
+    // Slow は停止要求で取り消される。
+    h.shutdown().unwrap();
+}
+
+/// 待ち中のハンドラへ停止要求が届き、shutdown が期限内に終わる（REPAIR-5）。
+#[test]
+fn cri5_shutdown_cancels_pending_handler() {
+    let (_root, path, h, seen) = start_blocking("cancel");
+    let mut c = connect(&path);
+    send_req(&mut c, 1, "test.Blocking", "Slow");
+    std::thread::sleep(Duration::from_millis(100));
+    let t = std::time::Instant::now();
+    h.shutdown().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(3));
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// 接続が閉じたら待ち中のハンドラも取り消される。
+#[test]
+fn cri5_disconnect_cancels_pending_handler() {
+    let (_root, path, h, seen) = start_blocking("disc");
+    let mut c = connect(&path);
+    send_req(&mut c, 1, "test.Blocking", "Slow");
+    std::thread::sleep(Duration::from_millis(100));
+    drop(c);
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !seen.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    h.shutdown().unwrap();
+}

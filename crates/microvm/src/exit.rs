@@ -288,6 +288,50 @@ pub(crate) fn complete_mmio_read(
         .map_err(|()| completion_mismatch("mmio data"))
 }
 
+/// 渡された `exit` が `kvm_run` 領域の現在の exit と一致することを検証する（TASK-74.4.2・MVM-1）。
+///
+/// アドレス / ポート・幅・回数・向きに加え、ゲストの書き込みデータ（MMIO write・ポート OUT）も照合する。
+/// MMIO read の `data` は応答の置き場で意味を持たないため比較しない。`Io` / `Mmio` 以外、または食い違いは
+/// `Internal` で、デバイスにも領域にも触れる前に拒否するために `handle_exit` が dispatch 前に呼ぶ。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn ensure_exit_matches_area(
+    area: &impl RunArea,
+    exit: &VcpuExit,
+) -> Result<(), MicrovmError> {
+    let current = decode_exit(area)?;
+    let same = match (&current, exit) {
+        (
+            VcpuExit::Mmio {
+                phys_addr: a1,
+                data: d1,
+                len: l1,
+                is_write: w1,
+            },
+            VcpuExit::Mmio {
+                phys_addr: a2,
+                data: d2,
+                len: l2,
+                is_write: w2,
+            },
+        ) => {
+            a1 == a2
+                && l1 == l2
+                && w1 == w2
+                && (!*w1 || {
+                    let n = usize::try_from(*l1).unwrap_or(0);
+                    d1.get(..n).is_some() && d1.get(..n) == d2.get(..n)
+                })
+        }
+        (VcpuExit::Io { .. }, VcpuExit::Io { .. }) => current == *exit,
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(completion_mismatch("exit differs from kvm_run"))
+    }
+}
+
 /// 試験用の `Vec<u8>` 実装（`dispatch` の試験からも使う）。
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -536,5 +580,64 @@ mod tests {
             msg(complete_mmio_read(&mut v, &[1, 2]).unwrap_err()),
             "KVM exit completion mismatch (mmio length)"
         );
+    }
+    fn mmio_area(addr: u64, data: [u8; 8], len: u32, w: u8) -> Vec<u8> {
+        let mut v = area(KVM_EXIT_MMIO);
+        put(&mut v, RUN_UNION, &addr.to_ne_bytes());
+        put(&mut v, RUN_UNION + 8, &data);
+        put(&mut v, RUN_UNION + 16, &len.to_ne_bytes());
+        v[RUN_UNION + 20] = w;
+        v
+    }
+
+    /// MVM-1: dispatch 前の照合。アドレス違い（read）・データ違い（write）・ポート違いは `Internal` で拒否する。
+    #[test]
+    fn ensure_exit_matches_area_rejects_mismatch() {
+        let mmio = |addr, data, len, is_write| VcpuExit::Mmio {
+            phys_addr: addr,
+            data,
+            len,
+            is_write,
+        };
+        // read: 一致（data は比較しない）・アドレス違い・幅違い。
+        let v = mmio_area(0xd000_0000, [9; 8], 4, 0);
+        ensure_exit_matches_area(&v, &mmio(0xd000_0000, [0; 8], 4, false)).unwrap();
+        for bad in [
+            mmio(0xd000_0004, [0; 8], 4, false),
+            mmio(0xd000_0000, [0; 8], 2, false),
+            mmio(0xd000_0000, [0; 8], 4, true),
+        ] {
+            assert!(
+                ensure_exit_matches_area(&v, &bad)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exit differs from kvm_run")
+            );
+        }
+        // write: データ一致 / 不一致。
+        let w = mmio_area(0xd000_0000, [1, 2, 3, 4, 0, 0, 0, 0], 4, 1);
+        ensure_exit_matches_area(&w, &mmio(0xd000_0000, [1, 2, 3, 4, 7, 7, 7, 7], 4, true))
+            .unwrap();
+        ensure_exit_matches_area(&w, &mmio(0xd000_0000, [1, 2, 3, 5, 0, 0, 0, 0], 4, true))
+            .unwrap_err();
+        // PIO: ポート違い・OUT データ違い・種別違い。
+        let mut io = io_area(1, 1, 0x10, 1, 4096);
+        io[4096] = 0x42;
+        let io_out = |port, data| VcpuExit::Io {
+            direction: IoDirection::Out,
+            port,
+            size: 1,
+            count: 1,
+            data,
+        };
+        let same = io_out(0x10, vec![0x42]);
+        ensure_exit_matches_area(&io, &same).unwrap();
+        for bad in [
+            io_out(0x11, vec![0x42]),
+            io_out(0x10, vec![0x43]),
+            VcpuExit::Hlt,
+        ] {
+            ensure_exit_matches_area(&io, &bad).unwrap_err();
+        }
     }
 }

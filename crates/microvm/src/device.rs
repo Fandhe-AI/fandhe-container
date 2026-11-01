@@ -297,13 +297,14 @@ impl VcpuFd {
     ///
     /// 読み出しは書き戻さないと次の `KVM_RUN` で命令が完了しないため、ループは
     /// `run_once` → `handle_exit` → `run_once` の順で組む。`exit` は直前の `run_once` の戻り値でなければならず、
-    /// 領域の内容と食い違えば書かずに `Internal`（fail-closed）。`Io` / `Mmio` 以外の exit は `InvalidArgument`。
+    /// dispatch の前に領域の現在の exit（アドレス / ポート・幅・回数・向き・書き込みデータ）と照合し、食い違えばデバイスにも領域にも触れず `Internal`（fail-closed）。`Io` / `Mmio` 以外の exit は `InvalidArgument`。
     /// どのデバイスにも当たらないアクセスはエラーにせず `DispatchOutcome::Unhandled`（読み出しは 0xFF 埋め）で返す。
     pub fn handle_exit(
         &mut self,
         exit: &VcpuExit,
         dispatcher: &mut ExitDispatcher,
     ) -> Result<DispatchOutcome, MicrovmError> {
+        exit::ensure_exit_matches_area(&self.run, exit)?;
         let outcome = dispatcher.dispatch(exit)?;
         if let Some(response) = outcome.read_response() {
             match exit {

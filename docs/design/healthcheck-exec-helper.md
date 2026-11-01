@@ -74,7 +74,7 @@
 ## 8. タイムアウトの層と cancel（REPAIR-5）
 
 - `probe(T)` の絶対期限 `T` に対し、helper の exec の期限は `T - min(T/5, 2s)`（30s → 28s、5s → 4s、1s → 800ms）。通常は core が期限切れのコマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる
-- `T` を過ぎても終わらなければ helper を SIGKILL し、1 秒以内に `try_wait` で回収して `Timeout` を返す。回収できなければ zombie として残し `helper_reaped = false` で報告する（回収前の `Child` でだけ kill するため pid 再利用を避けられる）
+- `T` を過ぎても終わらなければ helper を SIGKILL し、1 秒以内に `try_wait` で回収して `Timeout` を返す。回収できなければ `helper_reaped = false` で報告し、未回収の `Child` を `ExecHealthProbe` に最大 1 個保持する（回収前の `Child` でだけ kill するため pid 再利用を避けられる）。保持している間は、次の probe の開始時に `try_wait`（と SIGKILL の再送）を行い、回収できるまで新しい helper を作らず `Unavailable`（`a previous healthcheck exec helper has not been reaped`）を即座に返す。`cancel()` と drop も待たずに回収を試みる。これで未回収 helper が probe ごとに積み上がらない（SUP-4・REPAIR-5）
 - worker とコマンドの停止は親死亡シグナルに頼らない（コマンドは `PR_SET_PDEATHSIG` を解除でき、fork した子孫には継承されないため）。helper は exec 子 cgroup の排他作成（同名は `EEXIST` で失敗）に成功した直後、worker の fork 前に、名前を作成通知（`FCHC1 <名前>`）として fd 2 へ 1 回だけ書く。supervisor は、この通知で今回の作成を確認できた cgroup（名前が `exec-<helper pid>-` で始まるもの）だけを `cgroup.kill` して削除する。pid から名前を推定しない。通知が無いときは何も止めない（以前の exec が残した同名の cgroup を誤って止めないため。SUP-6・#2441）
 - `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、kill と回収を自分で行う
 - helper の終了後、出力と結果の EOF を 100ms だけ待つ（コマンドの子孫が書き込み端を持ち続けても待ち続けない）

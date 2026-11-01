@@ -532,6 +532,10 @@ pub struct ExecHealthProbe {
     /// 配置取得スレッド（`hc-resolve`）が生きている間 true。状態ストアの I/O が止まったときに切り離した
     /// スレッドと複製した pidfd が probe ごとに積み上がらないよう、同時に 1 本までに抑える（REPAIR-5）。
     resolver_busy: Arc<AtomicBool>,
+    /// SIGKILL 後も `REAP_TIMEOUT` 内に回収できなかった helper の `Child`（最大 1 個）。次の probe の開始時・
+    /// `cancel`・drop で `try_wait` し、回収できるまで新しい helper を作らない（未回収 helper の蓄積を防ぐ。
+    /// SUP-4・REPAIR-5）。
+    unreaped: Mutex<Option<Child>>,
 }
 
 impl std::fmt::Debug for ExecHealthProbe {
@@ -586,6 +590,7 @@ impl ExecHealthProbe {
             current: Mutex::new(ProbeCancel::new()),
             busy: AtomicBool::new(false),
             resolver_busy: Arc::new(AtomicBool::new(false)),
+            unreaped: Mutex::new(None),
         })
     }
 
@@ -868,6 +873,7 @@ impl ExecHealthProbe {
             }
         };
 
+        let helper_pid = child.id();
         let mut output = OutputSink::default();
         let mut results = ResultSink::default();
         let mut out_eof = false;
@@ -940,7 +946,7 @@ impl ExecHealthProbe {
                 &mut out_parent,
                 &mut res_parent,
             );
-            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
             if owned.is_some() {
                 stopped = true;
             }
@@ -962,7 +968,7 @@ impl ExecHealthProbe {
                 &mut out_parent,
                 &mut res_parent,
             );
-            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
             if owned.is_some() {
                 stopped = true;
             }
@@ -976,6 +982,14 @@ impl ExecHealthProbe {
                     break;
                 }
                 std::thread::sleep(POLL_STEP);
+            }
+            if !reaped {
+                // 回収できなかった `Child` は手放さず保持する。後続の probe の開始時・cancel・drop が `try_wait` し、
+                // 回収できるまで新しい helper を作らない（未回収の蓄積を防ぐ。REPAIR-5）。
+                *self
+                    .unreaped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
             }
         }
         // helper が終わった後、出力と結果の EOF を短い猶予だけ待つ（孤児の子孫が端を持ち続けても待たない）。
@@ -998,7 +1012,7 @@ impl ExecHealthProbe {
         // helper の終了後に届いた作成通知（作成の直後に期限切れで殺され、通知が読み取りに間に合わなかった場合）も、
         // ソケットに残った分を読んだ結果で拾って止める（SUP-6・REPAIR-5）。
         if !stopped && !matches!(ended, Ended::Exited(true)) {
-            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
             if !self.kill_exec_cgroup(&record, owned.as_ref()) {
                 cgroup_stop_failed = true;
             }
@@ -1079,6 +1093,32 @@ impl ExecHealthProbe {
 }
 
 impl ExecHealthProbe {
+    /// 保持している未回収の helper を `try_wait` する（待たない）。まだ残っていれば `true`。
+    ///
+    /// 残っていれば SIGKILL を再送する（回収前の `Child` に対してだけ送るため pid の再利用の影響を受けない）。
+    /// ロックは待たず、取れなければ「残っている」とみなす（SUP-4・REPAIR-5）。
+    fn reap_unreaped(&self) -> bool {
+        let mut slot = match self.unreaped.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        let Some(child) = slot.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => {
+                let _ = child.kill();
+                true
+            }
+            // 回収できた、または待ちが失敗した（もう回収の見込みが無い）なら手放す。
+            Ok(Some(_)) | Err(_) => {
+                *slot = None;
+                false
+            }
+        }
+    }
+
     /// 排他を取って `cancel`（この試行の旗）で 1 回実行する。
     fn probe_with(
         &self,
@@ -1092,6 +1132,13 @@ impl ExecHealthProbe {
             ));
         }
         let _guard = BusyGuard { busy: &self.busy };
+        // 前回の未回収の helper が残っていれば、回収できるまで新しい helper を作らない（決定的に `Unavailable`）。
+        if self.reap_unreaped() {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "a previous healthcheck exec helper has not been reaped",
+            ));
+        }
         // 排他を取れた試行だけが `cancel` の宛先を登録する。拒否された試行は `current` に触れないので、
         // 実行中の試行への `cancel()` が失われない。区間を抜けても消さない（次の試行が排他の中で置き換える。
         // 終わった試行の旗が立っても無害。SUP-4・REPAIR-5）。
@@ -1125,6 +1172,15 @@ impl HealthProbe for ExecHealthProbe {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancel();
+        // 未回収の helper が居れば、待たずに回収を試みる。
+        let _ = self.reap_unreaped();
+    }
+}
+
+impl Drop for ExecHealthProbe {
+    fn drop(&mut self) {
+        // 未回収の helper を最後に一度だけ kill して回収を試みる（待たない）。
+        let _ = self.reap_unreaped();
     }
 }
 
@@ -1541,6 +1597,39 @@ mod tests {
         let parsed = parse_result_stream(&sink);
         assert_eq!(parsed.result, Ok(HealthExecLine::Stale));
         assert_eq!(parsed.dropped, 0);
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: 回収できない helper が残っている間は、次の probe は helper を作らずに
+    /// `Unavailable` で戻り、回収された後は先へ進む。
+    #[test]
+    fn repair5_2441_unreaped_helper_blocks_new_probe_until_reaped() {
+        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        // 回収できない helper の代役: 終わらない子（SIGKILL は reap_unreaped が再送する）。
+        let stuck = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        *probe.unreaped.lock().unwrap() = Some(stuck);
+        // 保持されている間の probe は、helper を作らずに（レポートを残さず）`Unavailable`。
+        // ただし 1 回目の呼び出しが SIGKILL を再送するので、回収されるまで有界に繰り返して確かめる。
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut blocked = 0u32;
+        loop {
+            match probe.probe(Duration::from_secs(1)) {
+                Err(e)
+                    if e.code() == ErrorCode::Unavailable
+                        && e.message()
+                            == "a previous healthcheck exec helper has not been reaped" =>
+                {
+                    assert!(probe.last_report().is_none());
+                    blocked += 1;
+                }
+                _ => break,
+            }
+            assert!(Instant::now() < until, "the stuck helper was never reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 最初の呼び出しは必ず拒否される（回収はその時点では未了）。
+        assert!(blocked >= 1);
+        assert!(probe.unreaped.lock().unwrap().is_none());
+        assert!(!probe.busy.load(Ordering::SeqCst));
     }
 
     /// REPAIR-5（#2441）: 前回の `hc-resolve` が未終了なら新しい取得スレッドを作らず `Unavailable`（in-flight は 1 本）。

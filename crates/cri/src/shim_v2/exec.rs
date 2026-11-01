@@ -268,23 +268,49 @@ enum ExecState {
 struct ExecEntry {
     spec: ExecProcessSpec,
     state: ExecState,
+    /// この登録に固有のトークン。`begin_start` が発行し、`finish_start` が照合する
+    /// （削除・再作成で同じ ID の別登録に旧 launch の結果を書かないため）。
+    token: u64,
 }
+
+/// `Start(exec_id)` の起動開始時に得る、検証済み仕様と登録固有のトークン。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartTicket {
+    /// 起動する exec の仕様。
+    pub spec: ExecProcessSpec,
+    token: u64,
+}
+
+/// コンテナ単位の排他に使うロックの本数（コンテナ ID のハッシュで選ぶ。増え続けない）。
+const GATE_STRIPES: usize = 64;
 
 /// 登録済みの exec の一覧（コンテナ ID と exec ID の組で引く）。
 ///
-/// 起動中はロックを保持しない: [`Self::begin_start`] が `Starting` にして解放し、
+/// 起動中は内部ロックを保持しない: [`Self::begin_start`] が `Starting` にして解放し、
 /// 起動役の結果を [`Self::finish_start`] で反映する。
-#[derive(Debug, Default)]
+///
+/// 同じコンテナの「削除（remove から purge まで）」「状態確認から登録・起動開始まで」は、
+/// [`Self::lock_container`] のゲートで互いに排他する（CRI-5）。
+#[derive(Debug)]
 pub struct ExecRegistry {
     inner: Mutex<RegistryInner>,
+    gates: Vec<Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
 struct RegistryInner {
     map: BTreeMap<(String, String), ExecEntry>,
-    /// コンテナ削除（[`ExecRegistry::purge_container`]）のたびに進める世代。
-    /// Exec / Start が削除と交差して旧コンテナの登録を使い回さないための照合に使う。
-    generation: u64,
+    /// 登録ごとのトークンの採番。
+    next_token: u64,
+}
+
+impl Default for ExecRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            gates: (0..GATE_STRIPES).map(|_| Mutex::new(())).collect(),
+        }
+    }
 }
 
 fn poisoned() -> CriError {
@@ -301,62 +327,67 @@ impl ExecRegistry {
         Self::default()
     }
 
-    /// 現在の世代。状態確認の前に取り、`register` / `begin_start` へ渡して削除との交差を検出する。
-    pub fn generation(&self) -> Result<u64, CriError> {
-        Ok(self.inner.lock().map_err(|_| poisoned())?.generation)
+    /// コンテナ単位のゲートを取る。Delete（remove から purge まで）と、Exec / Start の
+    /// 「状態確認から登録・起動開始まで」はこのゲートを保持して互いに排他する。
+    /// 起動役の呼び出し中は保持しない。同じ呼び出しで 2 つ以上取らない（デッドロック防止）。
+    pub fn lock_container(
+        &self,
+        container: &ContainerId,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, CriError> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        container.as_str().hash(&mut h);
+        let idx = (h.finish() % GATE_STRIPES as u64) as usize;
+        self.gates
+            .get(idx)
+            .ok_or_else(poisoned)?
+            .lock()
+            .map_err(|_| poisoned())
     }
 
-    /// コンテナの exec 登録をすべて除去し世代を進める（Delete 成功後に呼ぶ。CRI-5）。
+    /// コンテナの exec 登録をすべて除去する（Delete 成功後、ゲート保持中に呼ぶ。CRI-5）。
     pub fn purge_container(&self, container: &ContainerId) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        inner.generation = inner.generation.wrapping_add(1);
         inner.map.retain(|(c, _), _| c != container.as_str());
         Ok(())
     }
 
-    /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`、
-    /// 世代が `generation` と異なれば（削除と交差した）`FAILED_PRECONDITION`。
+    /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`。
     pub fn register(
         &self,
-        generation: u64,
         container: &ContainerId,
         exec_id: &ExecId,
         spec: ExecProcessSpec,
     ) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        if inner.generation != generation {
-            return Err(CriError::failed_precondition("container was deleted"));
-        }
-        let map = &mut inner.map;
         let k = key(container, exec_id);
-        if map.contains_key(&k) {
+        if inner.map.contains_key(&k) {
             return Err(CriError::already_exists("exec already exists"));
         }
-        let per_container = map.keys().filter(|(c, _)| *c == k.0).count();
-        if per_container >= MAX_EXECS_PER_CONTAINER || map.len() >= MAX_EXECS_TOTAL {
+        let per_container = inner.map.keys().filter(|(c, _)| *c == k.0).count();
+        if per_container >= MAX_EXECS_PER_CONTAINER || inner.map.len() >= MAX_EXECS_TOTAL {
             return Err(CriError::resource_exhausted("too many execs"));
         }
-        map.insert(
+        inner.next_token = inner.next_token.wrapping_add(1);
+        let token = inner.next_token;
+        inner.map.insert(
             k,
             ExecEntry {
                 spec,
                 state: ExecState::Created,
+                token,
             },
         );
         Ok(())
     }
 
-    /// `Created` を `Starting` にして仕様の複製を返す。未登録は `NOT_FOUND`、起動済み・起動中は `FAILED_PRECONDITION`。
+    /// `Created` を `Starting` にして仕様の複製とトークンを返す。未登録は `NOT_FOUND`、起動済み・起動中は `FAILED_PRECONDITION`。
     pub fn begin_start(
         &self,
-        generation: u64,
         container: &ContainerId,
         exec_id: &ExecId,
-    ) -> Result<ExecProcessSpec, CriError> {
+    ) -> Result<StartTicket, CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        if inner.generation != generation {
-            return Err(CriError::failed_precondition("container was deleted"));
-        }
         let entry = inner
             .map
             .get_mut(&key(container, exec_id))
@@ -364,7 +395,10 @@ impl ExecRegistry {
         match entry.state {
             ExecState::Created => {
                 entry.state = ExecState::Starting;
-                Ok(entry.spec.clone())
+                Ok(StartTicket {
+                    spec: entry.spec.clone(),
+                    token: entry.token,
+                })
             }
             ExecState::Starting | ExecState::Started => {
                 Err(CriError::failed_precondition("exec already started"))
@@ -373,14 +407,18 @@ impl ExecRegistry {
     }
 
     /// 起動の結果を反映する。成功は `Started`、失敗は `Created` へ戻して再試行できるようにする。
+    /// トークンが現在の登録と一致しなければ（削除・再作成で別の登録になった）何も書かない。
     pub fn finish_start(
         &self,
         container: &ContainerId,
         exec_id: &ExecId,
+        ticket: &StartTicket,
         ok: bool,
     ) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
-        if let Some(entry) = inner.map.get_mut(&key(container, exec_id)) {
+        if let Some(entry) = inner.map.get_mut(&key(container, exec_id))
+            && entry.token == ticket.token
+        {
             entry.state = if ok {
                 ExecState::Started
             } else {
@@ -390,7 +428,6 @@ impl ExecRegistry {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,41 +572,42 @@ mod tests {
         let e = ExecId::new("e1").unwrap();
         let spec = parse_process_spec(&any(OK)).unwrap();
         assert_eq!(
-            r.begin_start(0, &c, &e).unwrap_err().message(),
+            r.begin_start(&c, &e).unwrap_err().message(),
             "exec not found"
         );
-        r.register(0, &c, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone()).unwrap();
         assert_eq!(
-            r.register(0, &c, &e, spec.clone()).unwrap_err().code(),
+            r.register(&c, &e, spec.clone()).unwrap_err().code(),
             CriErrorCode::AlreadyExists
         );
-        assert_eq!(r.begin_start(0, &c, &e).unwrap(), spec);
+        let t = r.begin_start(&c, &e).unwrap();
+        assert_eq!(t.spec, spec);
         assert_eq!(
-            r.begin_start(0, &c, &e).unwrap_err().code(),
+            r.begin_start(&c, &e).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
-        r.finish_start(&c, &e, false).unwrap();
-        r.begin_start(0, &c, &e).unwrap();
-        r.finish_start(&c, &e, true).unwrap();
-        assert!(r.begin_start(0, &c, &e).is_err());
+        r.finish_start(&c, &e, &t, false).unwrap();
+        let t = r.begin_start(&c, &e).unwrap();
+        r.finish_start(&c, &e, &t, true).unwrap();
+        assert!(r.begin_start(&c, &e).is_err());
         for i in 1..MAX_EXECS_PER_CONTAINER {
-            r.register(0, &c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
+            r.register(&c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
                 .unwrap();
         }
         assert_eq!(
-            r.register(0, &c, &ExecId::new("over").unwrap(), spec.clone())
+            r.register(&c, &ExecId::new("over").unwrap(), spec.clone())
                 .unwrap_err()
                 .code(),
             CriErrorCode::ResourceExhausted
         );
         // 別コンテナは per-container 上限の影響を受けない。
         let c2 = ContainerId::new("c2").unwrap();
-        r.register(0, &c2, &e, spec).unwrap();
+        r.register(&c2, &e, spec).unwrap();
     }
 
-    /// CRI-5: purge は当該コンテナの登録だけを除去して世代を進め、古い世代での登録・起動を拒否する。
+    /// CRI-5: purge は当該コンテナの登録だけを除去し、旧登録の launch 結果は再登録に反映されない。
     #[test]
-    fn cri5_registry_purge_and_generation() {
+    fn cri5_registry_purge_and_stale_finish() {
         let r = ExecRegistry::new();
         let (c, c2) = (
             ContainerId::new("c1").unwrap(),
@@ -577,25 +615,35 @@ mod tests {
         );
         let e = ExecId::new("e1").unwrap();
         let spec = parse_process_spec(&any(OK)).unwrap();
-        let g0 = r.generation().unwrap();
-        r.register(g0, &c, &e, spec.clone()).unwrap();
-        r.register(g0, &c2, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(&c2, &e, spec.clone()).unwrap();
+        let old = r.begin_start(&c, &e).unwrap();
         r.purge_container(&c).unwrap();
-        let g1 = r.generation().unwrap();
-        assert_eq!(g1, g0 + 1);
         assert_eq!(
-            r.register(g0, &c, &e, spec.clone()).unwrap_err().code(),
-            CriErrorCode::FailedPrecondition
-        );
-        assert_eq!(
-            r.begin_start(g0, &c2, &e).unwrap_err().code(),
-            CriErrorCode::FailedPrecondition
-        );
-        assert_eq!(
-            r.begin_start(g1, &c, &e).unwrap_err().code(),
+            r.begin_start(&c, &e).unwrap_err().code(),
             CriErrorCode::NotFound
         );
-        r.register(g1, &c, &e, spec.clone()).unwrap();
-        assert_eq!(r.begin_start(g1, &c2, &e).unwrap(), spec);
+        // 同じ ID で再登録した新しい登録へ、旧 launch の結果（成功・失敗とも）は書かれない。
+        r.register(&c, &e, spec.clone()).unwrap();
+        r.finish_start(&c, &e, &old, true).unwrap();
+        let fresh = r.begin_start(&c, &e).unwrap();
+        r.finish_start(&c, &e, &old, false).unwrap();
+        assert_eq!(
+            r.begin_start(&c, &e).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition,
+            "stale failure must not reset Starting"
+        );
+        r.finish_start(&c, &e, &fresh, true).unwrap();
+        // 別コンテナの登録は purge の影響を受けない。
+        assert_eq!(r.begin_start(&c2, &e).unwrap().spec, spec);
+    }
+
+    /// CRI-5: コンテナのゲートは解放後に再取得できる。
+    #[test]
+    fn cri5_registry_container_gate() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        drop(r.lock_container(&c).unwrap());
+        drop(r.lock_container(&c).unwrap());
     }
 }

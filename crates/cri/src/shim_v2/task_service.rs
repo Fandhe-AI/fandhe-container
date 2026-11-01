@@ -92,7 +92,6 @@ impl TaskService {
         let req = ExecProcessRequest::decode(payload).map_err(|_| decode_failure())?;
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
-        let generation = self.execs.generation().map_err(|e| to_status(&e))?;
         if req.terminal {
             return Err(unsupported("terminal is not supported"));
         }
@@ -103,6 +102,11 @@ impl TaskService {
             RpcStatus::from_code(CriErrorCode::InvalidArgument, "exec spec is required")
         })?;
         let spec = parse_process_spec(any).map_err(|e| to_status(&e))?;
+        // 状態確認から登録までを Delete と排他する（削除途中の旧コンテナへ登録しない・purge に消されない）。
+        let _gate = self
+            .execs
+            .lock_container(&container)
+            .map_err(|e| to_status(&e))?;
         let status = self
             .adapter
             .state(container.as_str())
@@ -113,7 +117,7 @@ impl TaskService {
             )));
         }
         self.execs
-            .register(generation, &container, &exec_id, spec)
+            .register(&container, &exec_id, spec)
             .map_err(|e| to_status(&e))?;
         Ok(Vec::new())
     }
@@ -125,24 +129,29 @@ impl TaskService {
         };
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
-        let generation = self.execs.generation().map_err(|e| to_status(&e))?;
         // Exec 後に停止したコンテナへ起動役を呼ばないよう、起動の直前にも Running を再確認する。
-        let status = self
-            .adapter
-            .state(container.as_str())
-            .map_err(|e| to_status(&e))?;
-        if status.lifecycle != RuntimeLifecycle::Running {
-            return Err(to_status(&CriError::failed_precondition(
-                "container is not running",
-            )));
-        }
-        let spec = self
-            .execs
-            .begin_start(generation, &container, &exec_id)
-            .map_err(|e| to_status(&e))?;
-        let result = launcher.launch(&container, &exec_id, &spec);
+        // 確認から begin_start までは Delete と排他する（ゲートは起動役の呼び出し中は保持しない）。
+        let ticket = {
+            let _gate = self
+                .execs
+                .lock_container(&container)
+                .map_err(|e| to_status(&e))?;
+            let status = self
+                .adapter
+                .state(container.as_str())
+                .map_err(|e| to_status(&e))?;
+            if status.lifecycle != RuntimeLifecycle::Running {
+                return Err(to_status(&CriError::failed_precondition(
+                    "container is not running",
+                )));
+            }
+            self.execs
+                .begin_start(&container, &exec_id)
+                .map_err(|e| to_status(&e))?
+        };
+        let result = launcher.launch(&container, &exec_id, &ticket.spec);
         self.execs
-            .finish_start(&container, &exec_id, result.is_ok())
+            .finish_start(&container, &exec_id, &ticket, result.is_ok())
             .map_err(|e| to_status(&e))?;
         let pid = result.map_err(|e| to_status(&e))?;
         Ok(StartResponse {
@@ -191,15 +200,21 @@ impl TaskService {
         if !req.exec_id.is_empty() {
             return Err(unsupported("exec_id is not supported"));
         }
+        // remove から purge までを同じコンテナの Exec / Start と排他する（CRI-5）。
+        let container = ContainerId::new(&req.id).ok();
+        let _gate = match &container {
+            Some(c) => Some(self.execs.lock_container(c).map_err(|e| to_status(&e))?),
+            None => None,
+        };
         // 状態を採れなければ削除しない（fail-closed。NotFound はそのまま 5）。
         let before = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         self.adapter
             .remove(&req.id, false)
             .map_err(|e| to_status(&e))?;
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
-        if let Ok(container) = ContainerId::new(&req.id) {
+        if let Some(container) = &container {
             self.execs
-                .purge_container(&container)
+                .purge_container(container)
                 .map_err(|e| to_status(&e))?;
         }
         Ok(DeleteResponse {

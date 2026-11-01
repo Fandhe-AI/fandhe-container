@@ -506,9 +506,8 @@ impl std::fmt::Debug for ExecHealthProbe {
 
 /// probe の終了時に `cancelled` を戻してから `busy` を下ろす（この順序が契約）。
 ///
-/// cancel は開始前（作業スレッドの起動前に期限超過した場合を含む）にも届きうるため、開始時には消さない。
-/// 消すのは自分の probe の終了時だけで、`busy` を下ろす前に行うので、次の probe の開始前に届いた cancel を
-/// 巻き込まない（REPAIR-5）。
+/// 終了時にも戻すのは、`busy` を下ろす前に消して取り残しを減らすため。開始時にも戻す（`probe`）ので、
+/// 前回の probe の終了後に遅れて届いた cancel は次の probe を汚染しない（REPAIR-5）。
 struct BusyGuard<'a> {
     busy: &'a AtomicBool,
     cancelled: &'a AtomicBool,
@@ -1014,8 +1013,10 @@ impl HealthProbe for ExecHealthProbe {
             busy: &self.busy,
             cancelled: &self.cancelled,
         };
-        // 開始時に cancelled を戻さない。開始と競合した cancel（開始前に期限超過した場合を含む）を消すと、
-        // キャンセル済みの probe が helper を起動してしまう。`run` は helper 起動の直前にも cancelled を確かめる。
+        // 開始時に cancelled を戻す。`ProbeRunner` は cancel スレッドも未終了として計数し、その間は次の probe を
+        // 始めないので、前回の probe に向けた遅延 cancel は必ずこの時点より前に着地している。ここで捨てないと
+        // 次の interval の probe が healthcheck を実行せず `Cancelled` になる（遅延 cancel の汚染。REPAIR-5）。
+        self.cancelled.store(false, Ordering::SeqCst);
         self.run(timeout)
     }
 
@@ -1324,19 +1325,15 @@ mod tests {
         assert!(probe.cancelled.load(Ordering::SeqCst));
     }
 
-    /// REPAIR-5（#2441）: 開始前に届いた cancel は消えず、probe は helper を起動せず `Cancelled` で戻り、
-    /// 終了後は cancel が戻って次の probe は影響を受けない。
+    /// REPAIR-5（#2441）: 前回の probe の終了後に遅れて届いた cancel は、次の probe を `Cancelled` にしない。
     #[test]
-    fn repair5_2441_cancel_before_probe_start_is_honored_and_cleared_after() {
+    fn repair5_2441_late_cancel_does_not_poison_the_next_probe() {
         let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
         probe.cancel();
         assert!(probe.cancelled.load(Ordering::SeqCst));
-        let r = probe.probe(Duration::from_secs(5));
-        assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
-        assert_eq!(
-            probe.last_report().unwrap().outcome,
-            HealthExecOutcome::Cancelled
-        );
+        let _ = probe.probe(Duration::from_secs(5));
+        let outcome = probe.last_report().map(|r| r.outcome);
+        assert_ne!(outcome, Some(HealthExecOutcome::Cancelled));
         assert!(!probe.cancelled.load(Ordering::SeqCst));
         assert!(!probe.busy.load(Ordering::SeqCst));
     }

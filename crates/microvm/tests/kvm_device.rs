@@ -103,3 +103,65 @@ fn kvm_device_run_guest_code() {
         MicrovmErrorCode::Unimplemented
     );
 }
+
+/// REPAIR-5・REPAIR-4・MVM-1・TASK-74.4.1: 無限ループのゲストは期限で中断され `DeadlineExceeded` になり、
+/// 統計と記録器に残る。中断後も同じ vCPU で再実行できる。診断は呼び出しスレッドが `SIGUSR2` を
+/// ブロックした状態で走り、それでも中断が届く（実行中だけ解除して復元する）。x86_64 のみ。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_run_deadline_interrupts_spinning_guest() {
+    use fandhe_container_microvm::device::RunOutcome;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let probe = dev.probe_deadline_interrupt(Duration::from_millis(200), 2);
+        let _ = tx.send((probe, start.elapsed()));
+    });
+    let (probe, elapsed) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("probe_deadline_interrupt did not finish within 30s");
+    let probe = probe.unwrap();
+    assert!(elapsed < Duration::from_secs(5));
+    assert!(probe.kick_mask_restored, "SIGUSR2 mask must be restored");
+    assert_eq!(
+        (
+            probe.stats.runs,
+            probe.stats.deadline_exceeded,
+            probe.stats.exits
+        ),
+        (2, 2, 0)
+    );
+    assert!(probe.stats.total_elapsed >= Duration::from_millis(400));
+    assert_eq!(probe.records.len(), 2);
+    assert_eq!(probe.records[0].outcome, RunOutcome::DeadlineExceeded);
+    assert_eq!(probe.records[0].vcpu_id, 0);
+}
+
+/// aarch64 では未実装であること。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_run_deadline_interrupts_spinning_guest() {
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    assert_eq!(
+        dev.probe_deadline_interrupt(std::time::Duration::from_millis(200), 2)
+            .unwrap_err()
+            .code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}

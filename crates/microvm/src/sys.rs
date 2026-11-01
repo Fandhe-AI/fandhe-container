@@ -194,8 +194,9 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
     -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
-    // `signal`（glibc・musl 共通）。`sighandler_t` は関数ポインタ幅の整数として扱い、SIG_DFL は 0。
-    fn signal(signum: i32, handler: usize) -> usize;
+    // `sigaction` / `pthread_sigmask`（glibc・musl 共通）。第 2・3 引数は NULL 可。
+    fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     // `pthread_self` / `pthread_kill`（`pthread_t` は LP64 Linux で unsigned long）。`pthread_kill` は errno を戻り値で返す。
     fn pthread_self() -> u64;
     fn pthread_kill(thread: u64, sig: i32) -> i32;
@@ -205,6 +206,24 @@ unsafe extern "C" {
 const SIG_VCPU_KICK: i32 = 12;
 /// `SIG_DFL`。
 const SIG_DFL: usize = 0;
+/// `pthread_sigmask` の how（Linux 共通: SIG_UNBLOCK = 1、SIG_SETMASK = 2）。
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
+/// Linux の `sigset_t`（glibc・musl とも 1024 bit = 128 バイト。`SIGUSR2` は第 0 語の bit 11）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigSet([u64; 16]);
+
+/// Linux の `struct sigaction` の共通レイアウト（handler・mask・flags・restorer の順。x86_64・aarch64 の glibc・musl）。
+#[repr(C)]
+struct SigAction {
+    handler: usize,
+    mask: SigSet,
+    flags: i32,
+    restorer: usize,
+}
 
 extern "C" fn kick_handler(_sig: i32) {}
 
@@ -228,26 +247,108 @@ impl ThreadId {
     }
 }
 
-/// vCPU 中断シグナルの何もしない handler を入れる（プロセス内で 1 回。以降は冪等）。
+/// 呼び出しスレッドで vCPU 中断シグナルのブロックを解除し、drop で元のマスクへ戻す guard。
 ///
-/// handler を入れないと既定動作でプロセスが終了するため、`KVM_RUN` を中断する前に必ず呼ぶ。
-/// 既に別の handler（本 crate のもの以外）が入っていれば元に戻して `Err`（他の用途を壊さない）。
+/// スレッドが `SIGUSR2` をブロックしていると `pthread_kill` が配送されず `KVM_RUN` の期限（REPAIR-5）を
+/// 保証できないため、実行中だけ解除する。guard を作ったスレッドで drop すること（`!Send`）。
+pub(crate) struct KickUnblocked {
+    old: SigSet,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl KickUnblocked {
+    pub(crate) fn new() -> Result<KickUnblocked, SysError> {
+        Self::change(SIG_UNBLOCK)
+    }
+
+    /// 自己診断用: `SIGUSR2` をブロックし、drop で元へ戻す（期限の中断がブロック下でも届くことの確認用）。
+    pub(crate) fn blocked_for_probe() -> Result<KickUnblocked, SysError> {
+        Self::change(SIG_BLOCK)
+    }
+
+    /// 呼び出しスレッドで `SIGUSR2` がブロックされているか。
+    pub(crate) fn kick_is_blocked() -> Result<bool, SysError> {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        let mut cur = SigSet([0; 16]);
+        // SAFETY: set は NULL（マスクは変えない）、old は有効な書き込み可能なローカルの `sigset_t` 互換。
+        let r = unsafe { pthread_sigmask(SIG_BLOCK, std::ptr::null(), &mut cur) };
+        if r != 0 {
+            return Err(SysError::Os(r));
+        }
+        Ok(cur.0[0] & (1u64 << (SIG_VCPU_KICK - 1)) != 0)
+    }
+
+    fn change(how: i32) -> Result<KickUnblocked, SysError> {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        let mut set = SigSet([0; 16]);
+        set.0[0] = 1u64 << (SIG_VCPU_KICK - 1);
+        let mut old = SigSet([0; 16]);
+        // SAFETY: `set` と `old` は 128 バイトの有効な `sigset_t` 互換のローカル変数で、呼び出しの間だけ借りる。
+        // how は SIG_BLOCK か SIG_UNBLOCK で呼び出しスレッドのマスクだけを変え、`old` に直前のマスクを書く。戻り値は errno そのもの。
+        let r = unsafe { pthread_sigmask(how, &set, &mut old) };
+        if r != 0 {
+            return Err(SysError::Os(r));
+        }
+        Ok(KickUnblocked {
+            old,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for KickUnblocked {
+    fn drop(&mut self) {
+        // SAFETY: `self.old` は `new` が `pthread_sigmask` から受け取った有効なマスク。同じスレッドで元へ戻す
+        // （`!Send`）。`old` 出力は NULL（不要）。
+        let _ = unsafe { pthread_sigmask(SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+}
+
+/// `install_kick_handler` の同期用。照会から導入までを 1 つの臨界区間にして並行呼び出しの競合を防ぐ。
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// vCPU 中断シグナルの何もしない handler を入れる（冪等）。
+///
+/// `sigaction` で現在の設定を **書き換えずに照会** し、未設定（SIG_DFL）か本 crate の handler のときだけ導入する。
+/// 別の handler・SIG_IGN があれば何も変更せず `Err`（他の用途を壊さない）。SA_RESTART は付けない。
 pub(crate) fn install_kick_handler() -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let ours = kick_handler as extern "C" fn(i32) as usize;
-    // SAFETY: handler は引数 1 つの `extern "C"` 関数で、本体は何もしない（async-signal-safe）。`signal` は
-    // 固定のシグナル番号と関数アドレスだけを受け取る。KVM_RUN は中断時に EINTR を返し再実行されないため
-    // `signal` の SA_RESTART 付きでも中断できる。
-    let old = unsafe { signal(SIG_VCPU_KICK, ours) };
-    if old == usize::MAX {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cur = SigAction {
+        handler: 0,
+        mask: SigSet([0; 16]),
+        flags: 0,
+        restorer: 0,
+    };
+    // SAFETY: act は NULL（設定は変えない）、old は有効な書き込み可能なローカルの `struct sigaction` 互換。
+    let r = unsafe { sigaction(SIG_VCPU_KICK, std::ptr::null(), &mut cur) };
+    if r != 0 {
         return Err(last_error());
     }
-    if old != SIG_DFL && old != ours {
-        // SAFETY: 直前に取得した元の handler をそのまま戻す。
-        let _ = unsafe { signal(SIG_VCPU_KICK, old) };
+    if cur.handler == ours {
+        return Ok(());
+    }
+    if cur.handler != SIG_DFL {
         return Err(SysError::Os(16));
+    }
+    let new = SigAction {
+        handler: ours,
+        mask: SigSet([0; 16]),
+        flags: 0,
+        restorer: 0,
+    };
+    // SAFETY: `new` は有効な `struct sigaction` 互換で handler は引数 1 つの `extern "C"` 関数（本体は空で
+    // async-signal-safe）。old は NULL。固定のシグナル番号。
+    let r = unsafe { sigaction(SIG_VCPU_KICK, &new, std::ptr::null_mut()) };
+    if r != 0 {
+        return Err(last_error());
     }
     Ok(())
 }

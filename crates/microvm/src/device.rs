@@ -152,6 +152,28 @@ pub struct GuestExecutionProbe {
     pub interrupted: u32,
 }
 
+/// [`KvmDevice::probe_deadline_interrupt`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadlineProbe {
+    /// vCPU の累積統計。
+    pub stats: RunStats,
+    /// 各 `run_once` の記録（起きた順）。
+    pub records: Vec<RunRecord>,
+    /// 診断中は呼び出しスレッドで `SIGUSR2` をブロックしており、戻った後にブロック状態が復元されていたか。
+    pub kick_mask_restored: bool,
+}
+
+#[derive(Debug, Default)]
+struct CollectingObserver(std::sync::Mutex<Vec<RunRecord>>);
+
+impl RunObserver for CollectingObserver {
+    fn record(&self, record: &RunRecord) {
+        if let Ok(mut v) = self.0.lock() {
+            v.push(*record);
+        }
+    }
+}
+
 /// 自己診断の `KVM_RUN` の最大発行回数（`Interrupted` の再実行を含む）。
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const PROBE_MAX_RUNS: usize = 8;
@@ -220,7 +242,7 @@ impl VcpuFd {
     /// `KVM_RUN` を 1 回発行し、戻った理由（VM exit）を返す。ループは呼び出し側が組む。
     ///
     /// `timeout` を超えてもゲストが exit しないときは、別スレッドが `kvm_run.immediate_exit` を立てて
-    /// 呼び出しスレッドへ `SIGUSR2` を送り（何もしない handler を `signal` で入れる。既存の別 handler があれば
+    /// 呼び出しスレッドへ `SIGUSR2` を送り（何もしない handler を `sigaction` で入れる。既存の別 handler があれば
     /// 失敗にする）、`KVM_RUN` を中断して `DeadlineExceeded` を返す（REPAIR-5）。監視スレッドは戻る前に
     /// 必ず join し、`immediate_exit` は下ろす。`timeout` は 0 より大きく [`RUN_DEADLINE_MAX`] 以下。
     /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへのディスパッチと
@@ -270,6 +292,17 @@ impl VcpuFd {
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::FailedPrecondition,
                 format!("cannot install vCPU kick handler (os error {n})"),
+            ),
+        })?;
+        // 呼び出しスレッドが SIGUSR2 をブロックしていても中断が届くよう、実行中だけ解除する（drop で復元）。
+        let _unblocked = sys::KickUnblocked::new().map_err(|e| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            SysError::Os(n) => MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                format!("cannot unblock vCPU kick signal (os error {n})"),
             ),
         })?;
         let target = sys::ThreadId::current();
@@ -539,6 +572,101 @@ impl KvmDevice {
         }
     }
 
+    /// 無限ループ（`jmp $`）のゲストを `runs` 回 `deadline` で中断させ、統計と記録を返す（REPAIR-5・REPAIR-4・MVM-1。
+    /// x86_64 のみ。他 arch は `Unimplemented`）。呼び出しスレッドの `SIGUSR2` を診断中ブロックして最悪条件で確かめる。各回は必ず `DeadlineExceeded` で戻ることを期待し、
+    /// 想定外の結果は `Internal` で失敗にする。`runs` は 1〜8、`deadline` は `run_once` と同じ範囲。
+    pub fn probe_deadline_interrupt(
+        &self,
+        deadline: Duration,
+        runs: u32,
+    ) -> Result<DeadlineProbe, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.probe_deadline_interrupt_x86_64(deadline, runs)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (deadline, runs);
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "deadline probe is only implemented for x86_64",
+            ))
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn probe_deadline_interrupt_x86_64(
+        &self,
+        deadline: Duration,
+        runs: u32,
+    ) -> Result<DeadlineProbe, MicrovmError> {
+        const GPA: u64 = 0xFFFF_F000;
+        if runs == 0 || runs > 8 {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "probe run count out of range",
+            ));
+        }
+        let internal = |what: &str, e: SysError| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            SysError::Os(n) => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (os error {n})"),
+            ),
+        };
+        // 最も厳しい条件（SIGUSR2 をブロックしたスレッド）で期限が効くことを確かめる。
+        let blocked = sys::KickUnblocked::blocked_for_probe()
+            .map_err(|e| internal("signal mask change", e))?;
+        let vm = self.create_vm()?;
+        let mut page = sys::GuestPage::new().map_err(|e| internal("guest page allocation", e))?;
+        // jmp $
+        page.write_at(0xFF0, &[0xEB, 0xFE]).map_err(|()| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "guest code does not fit the page",
+            )
+        })?;
+        let registered = sys::register_single_page(vm.fd.as_fd(), 0, GPA, page)
+            .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
+        let mut vcpu = vm.create_vcpu(0)?;
+        let obs = Arc::new(CollectingObserver::default());
+        vcpu.set_observer(obs.clone());
+        let mut result = Ok(());
+        for _ in 0..runs {
+            match vcpu.run_once(deadline) {
+                Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => {}
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+                Ok(_) => {
+                    result = Err(MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "spinning guest exited before the deadline",
+                    ));
+                    break;
+                }
+            }
+        }
+        let stats = vcpu.stats();
+        drop(vcpu);
+        drop(registered);
+        drop(vm);
+        let restored =
+            sys::KickUnblocked::kick_is_blocked().map_err(|e| internal("signal mask query", e))?;
+        drop(blocked);
+        result?;
+        let records = obs.0.lock().map(|v| v.clone()).unwrap_or_default();
+        Ok(DeadlineProbe {
+            stats,
+            records,
+            kick_mask_restored: restored,
+        })
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn probe_guest_execution_x86_64(&self) -> Result<GuestExecutionProbe, MicrovmError> {
         const CODE: [u8; 5] = [0xB0, 0x42, 0xE6, 0x10, 0xF4];
@@ -771,53 +899,5 @@ mod tests {
         assert_eq!(m.message(), "KVM_ARM_VCPU_INIT failed (os error 5)");
         let m = c(VcpuStage::Create, SysError::Os(5));
         assert_eq!(m.message(), "KVM_CREATE_VCPU failed (os error 5)");
-    }
-
-    /// REPAIR-5・REPAIR-4・MVM-1: 無限ループのゲストは期限で中断され `DeadlineExceeded` になり、統計と記録器に残る。
-    /// 中断後も同じ vCPU で再実行でき（`immediate_exit` が下りている）、再度期限で戻る。実機の `/dev/kvm` が前提。
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
-    fn run_once_deadline_interrupts_spinning_guest() {
-        use std::sync::Mutex;
-        #[derive(Debug, Default)]
-        struct Rec(Mutex<Vec<RunRecord>>);
-        impl RunObserver for Rec {
-            fn record(&self, r: &RunRecord) {
-                self.0.lock().unwrap().push(*r);
-            }
-        }
-        const GPA: u64 = 0xFFFF_F000;
-        let dev = KvmDevice::open().unwrap();
-        let vm = dev.create_vm().unwrap();
-        let mut page = sys::GuestPage::new().unwrap();
-        // jmp $
-        page.write_at(0xFF0, &[0xEB, 0xFE]).unwrap();
-        let registered = sys::register_single_page(vm.fd.as_fd(), 0, GPA, page)
-            .map_err(|(e, _)| e)
-            .unwrap();
-        let mut vcpu = vm.create_vcpu(0).unwrap();
-        let rec = Arc::new(Rec::default());
-        vcpu.set_observer(rec.clone());
-        for _ in 0..2 {
-            let start = Instant::now();
-            let e = vcpu.run_once(Duration::from_millis(200)).unwrap_err();
-            assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
-            assert_eq!(e.message(), "KVM_RUN deadline exceeded");
-            assert!(start.elapsed() < Duration::from_secs(5));
-        }
-        let st = vcpu.stats();
-        assert_eq!((st.runs, st.deadline_exceeded, st.exits), (2, 2, 0));
-        assert!(st.total_elapsed >= Duration::from_millis(400));
-        let recs = rec.0.lock().unwrap();
-        assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0].outcome, RunOutcome::DeadlineExceeded);
-        assert_eq!(recs[0].vcpu_id, 0);
-        drop(recs);
-        let e = vcpu.run_once(Duration::ZERO).unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
-        drop(vcpu);
-        drop(registered);
-        drop(vm);
     }
 }

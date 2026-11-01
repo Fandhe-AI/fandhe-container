@@ -271,6 +271,9 @@ pub enum MmioWriteOutcome {
     Ignored(IgnoredAccess),
     /// 指定キューが kick された。
     QueueNotify(u16),
+    /// ready だったキューが QueueReady=0 で停止された（動作開始後も受理する。呼び出し元はデバイス側の
+    /// キュー処理をこの通知と同期して止める）。
+    QueueStopped(u16),
     /// FEATURES_OK が立った（negotiation 成功）。
     FeaturesAccepted,
     /// negotiation 失敗。FEATURES_OK は立てていない。
@@ -624,7 +627,10 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
     }
 
     fn write_queue_ready(&mut self, value: u32) -> Result<MmioWriteOutcome, IgnoredAccess> {
-        if !self.queue_config_writable() {
+        // 1（開始）は設定可能な状態のみ。0（停止）は設定変更ではなく停止操作のため、DRIVER_OK 後や
+        // 異常状態でも FEATURES_OK 済みなら受理する（ドライバが動作中のキューを止められるようにする）。
+        let may_start = self.queue_config_writable();
+        if !may_start && !self.status.contains(DeviceStatus::FEATURES_OK) {
             return Err(IgnoredAccess::WrongDeviceState);
         }
         let idx = self
@@ -635,8 +641,18 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             .get_mut(idx)
             .ok_or(IgnoredAccess::InvalidSelector)?;
         match value {
-            0 => q.ready = false,
+            0 => {
+                let was_ready = q.ready;
+                q.ready = false;
+                if was_ready {
+                    let index = u16::try_from(idx).map_err(|_| IgnoredAccess::InvalidSelector)?;
+                    return Ok(MmioWriteOutcome::QueueStopped(index));
+                }
+            }
             1 => {
+                if !may_start {
+                    return Err(IgnoredAccess::WrongDeviceState);
+                }
                 // split virtqueue の整列要件（仕様 2.7: descriptor table 16・avail 2・used 4）。
                 if q.size == 0
                     || !q.desc_table.is_multiple_of(16)
@@ -707,9 +723,8 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
 
     /// FEATURES_OK を立てる書き込みの処理（仕様 3.1.1 の手順 6〜7）。fail-closed。
     fn negotiate(&mut self, new: DeviceStatus) -> MmioWriteOutcome {
-        let driver = FeatureBits::from_bits(
-            u64::from(self.driver_features[0]) | (u64::from(self.driver_features[1]) << 32),
-        );
+        let [low, high] = self.driver_features;
+        let driver = FeatureBits::from_bits(u64::from(low) | (u64::from(high) << 32));
         if driver.is_subset_of(self.offered_features()) && driver.contains(FeatureBits::VERSION_1) {
             self.negotiated = Some(driver);
             self.status = new;
@@ -1066,6 +1081,32 @@ mod tests {
             ign(IgnoredAccess::QueueAlreadyReady)
         );
         assert_eq!(t.queue(0).unwrap().size(), 16);
+    }
+
+    #[test]
+    fn mvm1_queue_ready_zero_accepted_after_driver_ok() {
+        let mut t = net();
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        wr(&mut t, reg::STATUS, 15);
+        wr(&mut t, reg::QUEUE_SEL, 0);
+        assert_eq!(rd(&t, reg::QUEUE_READY), 1);
+        // 動作開始後でも 0 は受理し、読み戻しが 0 になる。
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_READY, 0),
+            MmioWriteOutcome::QueueStopped(0)
+        );
+        assert_eq!(rd(&t, reg::QUEUE_READY), 0);
+        assert!(!t.queue(0).unwrap().ready());
+        // 停止後の通知は配送しない。1 の再設定は動作開始後は拒否する。
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 0),
+            ign(IgnoredAccess::WrongDeviceState)
+        );
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_READY, 1),
+            ign(IgnoredAccess::WrongDeviceState)
+        );
     }
 
     #[test]

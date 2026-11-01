@@ -410,6 +410,11 @@ mod unix_impl {
             }
             Err(_) => return Err(internal("cannot create socket dir")),
         }
+        check_socket_dir(dir)
+    }
+
+    /// 既存のディレクトリが symlink でない・ディレクトリ・グループ/その他の権限なしであることを確かめる。
+    fn check_socket_dir(dir: &Path) -> Result<(), CriError> {
         let meta = fs::symlink_metadata(dir).map_err(|_| internal("cannot stat socket dir"))?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(failed("socket dir is not a plain directory"));
@@ -484,13 +489,17 @@ mod unix_impl {
             }
             Existing::None => {}
         }
-        let listener = UnixListener::bind(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                CriError::already_exists("socket already exists")
-            } else {
-                internal("cannot bind socket")
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // 同一 id の start が同時に走った場合は、先発が生きていれば冪等に同じ address を返す。
+                return match inspect_existing(&path)? {
+                    Existing::Live => Ok(address),
+                    _ => Err(CriError::already_exists("socket already exists")),
+                };
             }
-        })?;
+            Err(_) => return Err(internal("cannot bind socket")),
+        };
         match spawn_daemon(inv, &path, listener) {
             Ok(()) => Ok(address),
             Err(e) => {
@@ -563,6 +572,14 @@ mod unix_impl {
 
     /// delete の本体。`DeleteResponse` のバイト列を返す。冪等。
     pub fn run_delete(inv: &ShimInvocation, dir: &Path) -> Result<Vec<u8>, CriError> {
+        // start と対称にディレクトリを検査する（作成はしない。無ければ消すものも無い）。
+        match fs::symlink_metadata(dir) {
+            Ok(_) => check_socket_dir(dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(encode_delete_response());
+            }
+            Err(_) => return Err(internal("cannot stat socket dir")),
+        }
         let path = socket_path(dir, inv)?;
         match fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_socket() => {
@@ -592,7 +609,12 @@ mod unix_impl {
         if addr.as_pathname() != Some(expected.as_path()) {
             return Err(failed("stdin socket does not match the expected path"));
         }
-        let ident = |p: &Path| fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        // inode の再利用（delete 直後の再 start）を見分けるため、mtime（bind 時刻）も併用する。
+        let ident = |p: &Path| {
+            fs::symlink_metadata(p)
+                .ok()
+                .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
+        };
         let first = ident(&expected).ok_or_else(|| failed("socket path is missing"))?;
         let registry = make_registry()?;
         let handle = TtrpcServer::new(registry, ServerConfig::default())

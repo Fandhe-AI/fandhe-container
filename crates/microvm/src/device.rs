@@ -3,9 +3,12 @@
 //! 将来の起動フロー（TASK-75）・`fandhe-container-plugin-microvm`（TASK-117）から呼ばれる入口。
 //! [`KvmDevice`] が `/dev/kvm` を `O_RDWR | O_CLOEXEC` で開き、API 版数 12 を確認してから
 //! [`KvmDevice::create_vm`] で [`VmFd`] を返し、[`VmFd::create_vcpu`] で [`VcpuFd`] を返す（TASK-74.1.2）。
+//! TASK-74.4.1 で [`VcpuFd::run_once`]（`KVM_RUN` を 1 回発行して VM exit を [`VcpuExit`] で返す）と、
+//! 実機で実行を示す自己診断 [`KvmDevice::probe_guest_execution`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! レジスタ設定・virtio・実行ループ（`KVM_RUN`）は未実装で、後続の TASK-74・TASK-75 が
-//! [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
+//! レジスタ設定・virtio・exit のデバイスへのディスパッチ（#883）・vCPU の停止（`immediate_exit` とシグナル。
+//! #883 / TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
+//! `run_once` は期限を持たない（REPAIR-5 の期限は停止の仕組みと合わせて #883 / TASK-75 で入れる）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
@@ -25,6 +28,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
+use crate::exit::{self, VcpuExit};
 use crate::sys::{self, SysError};
 
 /// 本番で開くデバイスパス（固定リテラル。外部入力は届かない）。
@@ -34,6 +38,9 @@ const KVM_PATH: &str = "/dev/kvm";
 const EPERM: i32 = 1;
 const ENOMEM: i32 = 12;
 const EEXIST: i32 = 17;
+const ENOEXEC: i32 = 8;
+const EAGAIN: i32 = 11;
+const EINTR: i32 = 4;
 const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
 const ENFILE: i32 = 23;
@@ -50,19 +57,89 @@ pub struct KvmDevice {
 #[derive(Debug)]
 pub struct VmFd {
     fd: OwnedFd,
+    /// `KVM_GET_VCPU_MMAP_SIZE` の検証済みの値（`create_vcpu` の `kvm_run` の mmap に使う）。
+    vcpu_mmap_size: usize,
 }
 
-/// `KVM_CREATE_VCPU` で得た vCPU fd。drop で close される。`KVM_RUN`（TASK-74.4.1）が `AsFd` で借用する。
+/// `KVM_CREATE_VCPU` で得た vCPU fd と、その `kvm_run` 領域の mmap。drop で munmap・close される。
 #[derive(Debug)]
 pub struct VcpuFd {
+    // フィールドの宣言順 = drop 順。mmap（run）を fd より先に解く。
+    run: sys::KvmRunMap,
     fd: OwnedFd,
     id: u32,
+}
+
+/// [`KvmDevice::probe_guest_execution`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestExecutionProbe {
+    /// 観測した VM exit（`Interrupted` を除く、起きた順）。期待は `[Io{Out, 0x10, 1, 1, [0x42]}, Hlt]`。
+    pub exits: Vec<VcpuExit>,
+    /// `KVM_RUN` が中断（EINTR / EAGAIN）で戻って再実行した回数。
+    pub interrupted: u32,
+}
+
+/// 自己診断の `KVM_RUN` の最大発行回数（`Interrupted` の再実行を含む）。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const PROBE_MAX_RUNS: usize = 8;
+
+/// `KVM_GET_VCPU_MMAP_SIZE` の上限（外部入力として検証する。実機は 12 KiB 程度）。
+const VCPU_MMAP_MAX: usize = 1 << 20;
+
+fn validate_mmap_size(n: usize) -> Result<usize, MicrovmError> {
+    if !(exit::RUN_MIN_LEN..=VCPU_MMAP_MAX).contains(&n) || !n.is_multiple_of(sys::GUEST_PAGE_SIZE)
+    {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            format!("unexpected KVM vCPU mmap size {n}"),
+        ));
+    }
+    Ok(n)
+}
+
+/// `KVM_RUN` の errno の分類。EINTR / EAGAIN は正常系の [`VcpuExit::Interrupted`]。
+fn classify_run_error(e: SysError) -> Result<VcpuExit, MicrovmError> {
+    match e {
+        SysError::Unsupported => Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "KVM is not supported on this architecture",
+        )),
+        SysError::Os(EINTR) | SysError::Os(EAGAIN) => Ok(VcpuExit::Interrupted),
+        SysError::Os(ENOTTY) => Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "not a KVM vCPU fd",
+        )),
+        SysError::Os(ENOEXEC) => Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "vCPU not initialized",
+        )),
+        SysError::Os(ENOMEM) => Err(MicrovmError::new(
+            MicrovmErrorCode::ResourceExhausted,
+            "resource exhausted running vCPU",
+        )),
+        SysError::Os(n) => Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("KVM_RUN failed (os error {n})"),
+        )),
+    }
 }
 
 impl VcpuFd {
     /// 作成時に指定した vCPU id。
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// `KVM_RUN` を 1 回発行し、戻った理由（VM exit）を返す。ループは呼び出し側が組む。
+    ///
+    /// ゲストが exit しない限り戻らず、期限を持たない（停止の仕組みは #883 / TASK-75。REPAIR-5・REPAIR-3）。
+    /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへのディスパッチと
+    /// IN・MMIO 読み出しの応答の書き戻しは #883（TASK-74.4.2）の担当。
+    pub fn run_once(&mut self) -> Result<VcpuExit, MicrovmError> {
+        match sys::kvm_run(self.fd.as_fd()) {
+            Ok(()) => exit::decode_exit(&self.run),
+            Err(e) => classify_run_error(e),
+        }
     }
 }
 
@@ -79,6 +156,7 @@ enum VcpuStage {
     Create,
     PreferredTarget,
     VcpuInit,
+    Mmap,
 }
 
 fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
@@ -86,6 +164,7 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::Create => "KVM_CREATE_VCPU",
         VcpuStage::PreferredTarget => "KVM_ARM_PREFERRED_TARGET",
         VcpuStage::VcpuInit => "KVM_ARM_VCPU_INIT",
+        VcpuStage::Mmap => "mmap of kvm_run",
     };
     match e {
         SysError::Unsupported => MicrovmError::new(
@@ -130,7 +209,9 @@ impl VmFd {
             sys::kvm_arm_vcpu_init(fd.as_fd(), &init)
                 .map_err(|e| classify_vcpu_error(VcpuStage::VcpuInit, e))?;
         }
-        Ok(VcpuFd { fd, id })
+        let run = sys::KvmRunMap::map(fd.as_fd(), self.vcpu_mmap_size)
+            .map_err(|e| classify_vcpu_error(VcpuStage::Mmap, e))?;
+        Ok(VcpuFd { run, fd, id })
     }
 }
 
@@ -227,8 +308,97 @@ impl KvmDevice {
     /// `KVM_CREATE_VM`（machine type 0）で VM fd を作る。
     pub fn create_vm(&self) -> Result<VmFd, MicrovmError> {
         sys::kvm_create_vm(self.fd.as_fd(), 0)
-            .map(|fd| VmFd { fd })
             .map_err(classify_create_vm_error)
+            .and_then(|fd| {
+                let n = sys::kvm_get_vcpu_mmap_size(self.fd.as_fd()).map_err(|e| match e {
+                    SysError::Unsupported => MicrovmError::new(
+                        MicrovmErrorCode::Unimplemented,
+                        "KVM is not supported on this architecture",
+                    ),
+                    SysError::Os(n) => MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        format!("KVM_GET_VCPU_MMAP_SIZE failed (os error {n})"),
+                    ),
+                })?;
+                Ok(VmFd {
+                    fd,
+                    vcpu_mmap_size: validate_mmap_size(n)?,
+                })
+            })
+    }
+
+    /// 自己診断: 固定の 5 バイトのゲストコード（`mov al,0x42; out 0x10,al; hlt`）を 1 ページに置いて
+    /// 実際に `KVM_RUN` し、観測した VM exit を返す（TASK-74.4.1・MVM-1。x86_64 のみ）。
+    ///
+    /// x86_64 のリセット状態（CS:IP = F000:FFF0、線形 0xFFFFFFF0）のまま GPA `0xFFFFF000` に置いた 1 ページから
+    /// 実行され、レジスタ設定は不要。ゲストのコードは固定のリテラルで外部入力は届かない。VM・ページ・vCPU の
+    /// 寿命はこの関数の中で完結する（戻る前に vCPU、登録ページ、VM の順に解放する）。
+    /// 将来 `fandhe-container-plugin-microvm`（TASK-117）の利用可否の確認にも使える。汎用のゲストメモリは
+    /// #696（TASK-75.1）の担当でこれは別物。ゲストが想定どおり終わらないときの停止は #883 / TASK-75 の担当
+    /// （最大 8 回で打ち切る）。他 arch は `Unimplemented`。
+    pub fn probe_guest_execution(&self) -> Result<GuestExecutionProbe, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.probe_guest_execution_x86_64()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "guest execution probe is only implemented for x86_64",
+            ))
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn probe_guest_execution_x86_64(&self) -> Result<GuestExecutionProbe, MicrovmError> {
+        const CODE: [u8; 5] = [0xB0, 0x42, 0xE6, 0x10, 0xF4];
+        const GPA: u64 = 0xFFFF_F000;
+        const CODE_OFFSET: usize = 0xFF0;
+        let internal = |what: &str, e: SysError| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            SysError::Os(n) => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (os error {n})"),
+            ),
+        };
+        // 宣言順の逆が drop 順: vcpu → registered → vm。明示 drop で順序を固定する。
+        let vm = self.create_vm()?;
+        let mut page = sys::GuestPage::new().map_err(|e| internal("guest page allocation", e))?;
+        page.write_at(CODE_OFFSET, &CODE).map_err(|()| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "guest code does not fit the page",
+            )
+        })?;
+        let registered = sys::register_single_page(vm.fd.as_fd(), 0, GPA, page)
+            .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
+        let mut vcpu = vm.create_vcpu(0)?;
+        let mut exits = Vec::new();
+        let mut interrupted = 0u32;
+        let mut result = Ok(());
+        for _ in 0..PROBE_MAX_RUNS {
+            match vcpu.run_once() {
+                Ok(VcpuExit::Interrupted) => interrupted += 1,
+                Ok(VcpuExit::Hlt) => {
+                    exits.push(VcpuExit::Hlt);
+                    break;
+                }
+                Ok(other) => exits.push(other),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        drop(vcpu);
+        drop(registered);
+        drop(vm);
+        result?;
+        Ok(GuestExecutionProbe { exits, interrupted })
     }
 }
 
@@ -321,10 +491,65 @@ mod tests {
             .unwrap();
         let vm = VmFd {
             fd: OwnedFd::from(f),
+            vcpu_mmap_size: 4096 * 3,
         };
         let e = vm.create_vcpu(0).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
         assert_eq!(e.message(), "not a KVM VM fd");
+    }
+
+    #[test]
+    fn validate_mmap_size_table() {
+        assert_eq!(validate_mmap_size(12288).unwrap(), 12288);
+        for n in [0, 4095, 4097, 2 << 20, 12289] {
+            let e = validate_mmap_size(n).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), format!("unexpected KVM vCPU mmap size {n}"));
+        }
+    }
+
+    #[test]
+    fn classify_run_error_table() {
+        assert_eq!(
+            classify_run_error(SysError::Os(EINTR)).unwrap(),
+            VcpuExit::Interrupted
+        );
+        assert_eq!(
+            classify_run_error(SysError::Os(EAGAIN)).unwrap(),
+            VcpuExit::Interrupted
+        );
+        let cases = [
+            (
+                SysError::Os(ENOTTY),
+                MicrovmErrorCode::FailedPrecondition,
+                "not a KVM vCPU fd",
+            ),
+            (
+                SysError::Os(ENOEXEC),
+                MicrovmErrorCode::FailedPrecondition,
+                "vCPU not initialized",
+            ),
+            (
+                SysError::Os(ENOMEM),
+                MicrovmErrorCode::ResourceExhausted,
+                "resource exhausted running vCPU",
+            ),
+            (
+                SysError::Os(14),
+                MicrovmErrorCode::Internal,
+                "KVM_RUN failed (os error 14)",
+            ),
+            (
+                SysError::Unsupported,
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+        ];
+        for (e, code, msg) in cases {
+            let err = classify_run_error(e).unwrap_err();
+            assert_eq!(err.code(), code);
+            assert_eq!(err.message(), msg);
+        }
     }
 
     #[test]

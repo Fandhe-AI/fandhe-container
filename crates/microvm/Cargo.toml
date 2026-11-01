@@ -4,6 +4,7 @@
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 # TASK-74.1.1 で error・device・sys を追加（依存は増やさない）。unsafe は src/sys.rs に限る。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
+# TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

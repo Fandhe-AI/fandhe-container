@@ -92,6 +92,7 @@ impl TaskService {
         let req = ExecProcessRequest::decode(payload).map_err(|_| decode_failure())?;
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        let generation = self.execs.generation().map_err(|e| to_status(&e))?;
         if req.terminal {
             return Err(unsupported("terminal is not supported"));
         }
@@ -112,7 +113,7 @@ impl TaskService {
             )));
         }
         self.execs
-            .register(&container, &exec_id, spec)
+            .register(generation, &container, &exec_id, spec)
             .map_err(|e| to_status(&e))?;
         Ok(Vec::new())
     }
@@ -124,6 +125,7 @@ impl TaskService {
         };
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        let generation = self.execs.generation().map_err(|e| to_status(&e))?;
         // Exec 後に停止したコンテナへ起動役を呼ばないよう、起動の直前にも Running を再確認する。
         let status = self
             .adapter
@@ -136,7 +138,7 @@ impl TaskService {
         }
         let spec = self
             .execs
-            .begin_start(&container, &exec_id)
+            .begin_start(generation, &container, &exec_id)
             .map_err(|e| to_status(&e))?;
         let result = launcher.launch(&container, &exec_id, &spec);
         self.execs
@@ -194,6 +196,12 @@ impl TaskService {
         self.adapter
             .remove(&req.id, false)
             .map_err(|e| to_status(&e))?;
+        // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
+        if let Ok(container) = ContainerId::new(&req.id) {
+            self.execs
+                .purge_container(&container)
+                .map_err(|e| to_status(&e))?;
+        }
         Ok(DeleteResponse {
             pid: before.pid.unwrap_or(0),
             exit_status: exit_status_of(&before),
@@ -633,6 +641,35 @@ mod tests {
             err_code(s.handle("Exec", &exec_req("c1", "over", SPEC))).0,
             RESOURCE_EXHAUSTED
         );
+    }
+
+    /// CRI-5: Delete 成功で exec 登録が消え、同じ ID の再作成で同じ exec_id を再登録でき、
+    /// 旧登録での Start は NOT_FOUND、登録数（上限）も回復する。
+    #[test]
+    fn cri5_delete_purges_exec_registrations() {
+        let (s, f, l) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        for i in 0..super::super::exec::MAX_EXECS_PER_CONTAINER {
+            s.handle("Exec", &exec_req("c1", &format!("e{i}"), SPEC))
+                .unwrap();
+        }
+        stopped(&f, "c1", Some(0));
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        f.preset.lock().unwrap().remove("c1");
+        running_container(&s, "c1");
+        // 旧登録では起動できない。
+        assert_eq!(
+            err_code(s.handle("Start", &start_exec_req("c1", "e0"))).0,
+            NOT_FOUND
+        );
+        assert!(l.launched.lock().unwrap().is_empty());
+        // 同じ exec_id を再登録でき、上限も回復している。
+        for i in 0..super::super::exec::MAX_EXECS_PER_CONTAINER {
+            s.handle("Exec", &exec_req("c1", &format!("e{i}"), SPEC))
+                .unwrap();
+        }
+        s.handle("Start", &start_exec_req("c1", "e0")).unwrap();
+        assert_eq!(l.launched.lock().unwrap().len(), 1);
     }
 
     fn svc(version: TaskApiVersion, fake: Fake) -> (TaskService, Arc<Fake>) {

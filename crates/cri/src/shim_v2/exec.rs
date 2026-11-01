@@ -276,7 +276,15 @@ struct ExecEntry {
 /// 起動役の結果を [`Self::finish_start`] で反映する。
 #[derive(Debug, Default)]
 pub struct ExecRegistry {
-    inner: Mutex<BTreeMap<(String, String), ExecEntry>>,
+    inner: Mutex<RegistryInner>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryInner {
+    map: BTreeMap<(String, String), ExecEntry>,
+    /// コンテナ削除（[`ExecRegistry::purge_container`]）のたびに進める世代。
+    /// Exec / Start が削除と交差して旧コンテナの登録を使い回さないための照合に使う。
+    generation: u64,
 }
 
 fn poisoned() -> CriError {
@@ -293,14 +301,33 @@ impl ExecRegistry {
         Self::default()
     }
 
-    /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`。
+    /// 現在の世代。状態確認の前に取り、`register` / `begin_start` へ渡して削除との交差を検出する。
+    pub fn generation(&self) -> Result<u64, CriError> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.generation)
+    }
+
+    /// コンテナの exec 登録をすべて除去し世代を進める（Delete 成功後に呼ぶ。CRI-5）。
+    pub fn purge_container(&self, container: &ContainerId) -> Result<(), CriError> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        inner.generation = inner.generation.wrapping_add(1);
+        inner.map.retain(|(c, _), _| c != container.as_str());
+        Ok(())
+    }
+
+    /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`、
+    /// 世代が `generation` と異なれば（削除と交差した）`FAILED_PRECONDITION`。
     pub fn register(
         &self,
+        generation: u64,
         container: &ContainerId,
         exec_id: &ExecId,
         spec: ExecProcessSpec,
     ) -> Result<(), CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if inner.generation != generation {
+            return Err(CriError::failed_precondition("container was deleted"));
+        }
+        let map = &mut inner.map;
         let k = key(container, exec_id);
         if map.contains_key(&k) {
             return Err(CriError::already_exists("exec already exists"));
@@ -322,11 +349,16 @@ impl ExecRegistry {
     /// `Created` を `Starting` にして仕様の複製を返す。未登録は `NOT_FOUND`、起動済み・起動中は `FAILED_PRECONDITION`。
     pub fn begin_start(
         &self,
+        generation: u64,
         container: &ContainerId,
         exec_id: &ExecId,
     ) -> Result<ExecProcessSpec, CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        let entry = map
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if inner.generation != generation {
+            return Err(CriError::failed_precondition("container was deleted"));
+        }
+        let entry = inner
+            .map
             .get_mut(&key(container, exec_id))
             .ok_or_else(|| CriError::not_found("exec not found"))?;
         match entry.state {
@@ -347,8 +379,8 @@ impl ExecRegistry {
         exec_id: &ExecId,
         ok: bool,
     ) -> Result<(), CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        if let Some(entry) = map.get_mut(&key(container, exec_id)) {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if let Some(entry) = inner.map.get_mut(&key(container, exec_id)) {
             entry.state = if ok {
                 ExecState::Started
             } else {
@@ -503,35 +535,67 @@ mod tests {
         let e = ExecId::new("e1").unwrap();
         let spec = parse_process_spec(&any(OK)).unwrap();
         assert_eq!(
-            r.begin_start(&c, &e).unwrap_err().message(),
+            r.begin_start(0, &c, &e).unwrap_err().message(),
             "exec not found"
         );
-        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(0, &c, &e, spec.clone()).unwrap();
         assert_eq!(
-            r.register(&c, &e, spec.clone()).unwrap_err().code(),
+            r.register(0, &c, &e, spec.clone()).unwrap_err().code(),
             CriErrorCode::AlreadyExists
         );
-        assert_eq!(r.begin_start(&c, &e).unwrap(), spec);
+        assert_eq!(r.begin_start(0, &c, &e).unwrap(), spec);
         assert_eq!(
-            r.begin_start(&c, &e).unwrap_err().code(),
+            r.begin_start(0, &c, &e).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
         r.finish_start(&c, &e, false).unwrap();
-        r.begin_start(&c, &e).unwrap();
+        r.begin_start(0, &c, &e).unwrap();
         r.finish_start(&c, &e, true).unwrap();
-        assert!(r.begin_start(&c, &e).is_err());
+        assert!(r.begin_start(0, &c, &e).is_err());
         for i in 1..MAX_EXECS_PER_CONTAINER {
-            r.register(&c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
+            r.register(0, &c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
                 .unwrap();
         }
         assert_eq!(
-            r.register(&c, &ExecId::new("over").unwrap(), spec.clone())
+            r.register(0, &c, &ExecId::new("over").unwrap(), spec.clone())
                 .unwrap_err()
                 .code(),
             CriErrorCode::ResourceExhausted
         );
         // 別コンテナは per-container 上限の影響を受けない。
         let c2 = ContainerId::new("c2").unwrap();
-        r.register(&c2, &e, spec).unwrap();
+        r.register(0, &c2, &e, spec).unwrap();
+    }
+
+    /// CRI-5: purge は当該コンテナの登録だけを除去して世代を進め、古い世代での登録・起動を拒否する。
+    #[test]
+    fn cri5_registry_purge_and_generation() {
+        let r = ExecRegistry::new();
+        let (c, c2) = (
+            ContainerId::new("c1").unwrap(),
+            ContainerId::new("c2").unwrap(),
+        );
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        let g0 = r.generation().unwrap();
+        r.register(g0, &c, &e, spec.clone()).unwrap();
+        r.register(g0, &c2, &e, spec.clone()).unwrap();
+        r.purge_container(&c).unwrap();
+        let g1 = r.generation().unwrap();
+        assert_eq!(g1, g0 + 1);
+        assert_eq!(
+            r.register(g0, &c, &e, spec.clone()).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            r.begin_start(g0, &c2, &e).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            r.begin_start(g1, &c, &e).unwrap_err().code(),
+            CriErrorCode::NotFound
+        );
+        r.register(g1, &c, &e, spec.clone()).unwrap();
+        assert_eq!(r.begin_start(g1, &c2, &e).unwrap(), spec);
     }
 }

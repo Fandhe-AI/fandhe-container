@@ -7,6 +7,11 @@
 //! 既定のテスト集合で動く）。実コンテナでの通しは別（#2953 の結線と実機前提の試験）。
 //! 成功行は `healthcheck_exec_probe: <シナリオ> ok`。
 
+// 排他作成した 0700 の親（共有 flock つき）を状態ルートの置き場にする共有補助。
+#[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::OsString;
@@ -20,7 +25,11 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::ExecChildStep;
-    use fandhe_container_core::traits::{ContainerId, ErrorCode, HealthStatus};
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::traits::{
+        CgroupScope, ContainerId, ContainerStatus, CreateStateRequest, ErrorCode, HealthStatus,
+        StateStore as _,
+    };
     use fandhe_container_supervisor::health::HealthProbe;
     use fandhe_container_supervisor::healthcheck::exec_helper::{
         HealthExecArgs, is_health_exec_invocation,
@@ -33,10 +42,43 @@ mod linux {
 
     const COMMAND: [&str; 2] = ["/bin/echo", "hi"];
 
-    /// 利用者所有の一時状態ルート（テストプロセスの pid で一意。偽 helper は親 pid から同じパスを導く）。
-    /// 記録は置かない: アダプタは記録を読めなくても probe を続行する（best-effort。cgroup 後始末だけが残余扱い）。
-    fn state_root_for(pid: u32) -> PathBuf {
-        std::env::temp_dir().join(format!("fandhe-hc-exec-probe-{pid}"))
+    /// 排他作成した親の名前の接頭辞。偽 helper は親 pid からこの接頭辞を導いて root を照合する。
+    const SCRATCH_PREFIX: &str = "fc-hc-exec-probe";
+
+    /// 状態ルート（排他作成した 0700 の親 `scratch_root` の子）。`scratch_root` は作成プロセスの pid を含む。
+    fn state_root() -> PathBuf {
+        crate::scratch_root::scratch_root(SCRATCH_PREFIX, Duration::from_secs(10)).join("state")
+    }
+
+    /// 偽 helper 側の照合: root は `<tmp>/fc-hc-exec-probe-<親 pid>-*/state`。
+    fn is_expected_root(root: &std::path::Path, parent: u32) -> bool {
+        let prefix = format!("{SCRATCH_PREFIX}-{parent}-");
+        root.file_name().is_some_and(|n| n == "state")
+            && root
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+    }
+
+    /// 配置つきの記録を状態ストアへ作る（アダプタは起動前に cgroup の配置を要求する。fail-closed）。
+    fn create_record(id: &str) {
+        let root = state_root();
+        std::fs::create_dir_all(&root).expect("create state root");
+        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod state root");
+        let store = FileStateStore::open(StateRoot::from_override(root.clone()).expect("root"))
+            .expect("open store");
+        let status = ContainerStatus::created(ContainerId::new(id).expect("id"), None);
+        store
+            .create(
+                &CreateStateRequest::new(status, root.join("bundle"))
+                    .expect("request")
+                    .with_cgroup_scope(
+                        CgroupScope::new("/sys/fs/cgroup/user/fandhe").expect("scope"),
+                    ),
+            )
+            .expect("create record");
     }
 
     /// 偽の helper の本体。結果行は fd 2、コマンド出力は fd 1 へ書く。
@@ -54,7 +96,7 @@ mod linux {
         };
         // 契約の照合: 外れたら invalid。
         let devnull = std::fs::File::open("/proc/self/fd/0").and_then(|f| f.metadata());
-        let contract_ok = args.root() == state_root_for(std::os::unix::process::parent_id())
+        let contract_ok = is_expected_root(args.root(), std::os::unix::process::parent_id())
             && args.expect_pid().get() == 4242
             && args.command() == COMMAND
             && std::env::vars_os().next().is_none()
@@ -214,9 +256,14 @@ mod linux {
     }
 
     fn probe_for(id: &str) -> ExecHealthProbe {
+        create_record(id);
+        probe_without_record(id)
+    }
+
+    fn probe_without_record(id: &str) -> ExecHealthProbe {
         let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
         let target = HealthExecTarget::new(
-            state_root_for(std::process::id()),
+            state_root(),
             ContainerId::new(id).expect("id"),
             NonZeroU32::new(4242).expect("pid"),
             OwnedFd::from(devnull),
@@ -257,8 +304,7 @@ mod linux {
             fake_helper(args.collect());
         }
         let secs = Duration::from_secs;
-        let root = state_root_for(std::process::id());
-        std::fs::create_dir_all(&root).expect("create state root");
+        let _cleanup = crate::scratch_root::ScratchRootCleanup;
 
         let (r, rep, _) = run("hc-healthy", secs(10));
         assert_eq!(r, Ok(HealthStatus::Healthy));
@@ -384,7 +430,12 @@ mod linux {
         assert_eq!(r, Ok(HealthStatus::Healthy));
         assert!(elapsed < Duration::from_millis(1_500), "{elapsed:?}");
         ok("hc-orphan");
-        let _ = std::fs::remove_dir_all(&root);
+
+        // 配置を得られない（記録なし）ときは helper を起動せず Unavailable（fail-closed。cancel 契約を守れないため）。
+        let probe = probe_without_record("hc-no-record");
+        let err = probe.probe(secs(10)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        ok("hc-no-record");
     }
 }
 

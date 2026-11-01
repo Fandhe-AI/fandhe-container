@@ -13,8 +13,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_stack::cli::{
-    LaunchError, LaunchedService, ServiceLauncher, ServiceStopper, StopError, StopOutcome,
-    UpPolicy, down, up,
+    LaunchError, LaunchRequest, LaunchedService, NetworkProvisionError, NetworkProvisioner,
+    NetworkRequest, ProvisionOutcome, ProvisionedNetwork, ServiceLauncher, ServiceStopper,
+    StopError, StopOutcome, UpPolicy, UpProject, down, up,
 };
 use fandhe_container_stack::depends_on::wait::{
     DependencyObservation, DependencyObserver, ObserveError, WaitClock,
@@ -240,9 +241,18 @@ struct World {
     stops: Rc<RefCell<Vec<String>>>,
 }
 impl ServiceLauncher for World {
-    fn launch(&mut self, service: &str, _spec: &Service) -> Result<LaunchedService, LaunchError> {
+    fn launch(&mut self, req: &LaunchRequest<'_>) -> Result<LaunchedService, LaunchError> {
+        let service = req.service();
         self.running.borrow_mut().insert(service.to_string());
         Ok(LaunchedService::new(service, format!("id-{service}")))
+    }
+}
+impl NetworkProvisioner for World {
+    fn ensure(
+        &mut self,
+        req: &NetworkRequest<'_>,
+    ) -> Result<ProvisionedNetwork, NetworkProvisionError> {
+        Ok(ProvisionedNetwork::new(req.name, ProvisionOutcome::Created))
     }
 }
 impl ServiceStopper for World {
@@ -305,8 +315,13 @@ fn stack8_down_all_services_stopped_after_up() {
         t: Rc::new(Cell::new(Duration::ZERO)),
         base: Instant::now(),
     };
+    let networks = BTreeMap::new();
     let up_report = up(
-        &services,
+        &UpProject {
+            services: &services,
+            networks: &networks,
+        },
+        &mut world.clone(),
         &mut world.clone(),
         &mut world.clone(),
         &mut world.clone(),

@@ -5,9 +5,11 @@
 //! [`KvmDevice::create_vm`] で [`VmFd`] を返し、[`VmFd::create_vcpu`] で [`VcpuFd`] を返す（TASK-74.1.2）。
 //! TASK-74.4.1 で [`VcpuFd::run_once`]（`KVM_RUN` を 1 回発行して VM exit を [`VcpuExit`] で返す）と、
 //! 実機で実行を示す自己診断 [`KvmDevice::probe_guest_execution`] を足した。
+//! TASK-74.4.2（#883）で exit のデバイスへの振り分けと IN・MMIO read の応答の書き戻し（[`VcpuFd::handle_exit`]。
+//! 振り分け先は `crate::dispatch`）と、実機で確かめる自己診断 [`KvmDevice::probe_exit_dispatch`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! レジスタ設定・exit のデバイスへのディスパッチ（#883。virtio-mmio のトランスポートは `crate::virtio_mmio` にあり、MMIO exit との接続は TASK-74.4.2）・vCPU の外部からの停止要求（一時停止・
-//! 終了通知。#883 / TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
+//! レジスタ設定・vCPU の外部からの停止要求（一時停止・
+//! 終了通知。TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
@@ -32,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, VcpuExit};
 use crate::sys::{self, SysError};
@@ -152,6 +155,16 @@ pub struct GuestExecutionProbe {
     pub interrupted: u32,
 }
 
+/// [`KvmDevice::probe_exit_dispatch`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitDispatchProbe {
+    /// 観測した VM exit（`Interrupted` を除く、起きた順）。
+    pub exits: Vec<VcpuExit>,
+    /// 記録用ポートデバイス（ポート 0x11 から）へ書かれた `(基底からのオフセット, 値)`。IN・MMIO read の
+    /// 応答がゲストへ届いた証拠（ゲストが受け取った値をそのまま OUT する）。
+    pub port_writes: Vec<(u16, u8)>,
+}
+
 /// [`KvmDevice::probe_deadline_interrupt`] の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadlineProbe {
@@ -247,8 +260,8 @@ impl VcpuFd {
     /// 呼び出しスレッドへ `SIGUSR2` を送り（何もしない handler を `sigaction` で入れる。既存の別 handler があれば
     /// 失敗にする）、`KVM_RUN` を中断して `DeadlineExceeded` を返す（REPAIR-5）。監視スレッドは戻る前に
     /// 必ず join し、`immediate_exit` は下ろす。`timeout` は 0 より大きく [`RUN_DEADLINE_MAX`] 以下。
-    /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへのディスパッチと
-    /// IN・MMIO 読み出しの応答の書き戻しは #883（TASK-74.4.2）の担当。結果と所要時間は統計と記録器へ残す（REPAIR-4）。
+    /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへの振り分けと
+    /// IN・MMIO 読み出しの応答の書き戻しは [`VcpuFd::handle_exit`] が担う（次の `run_once` の前に呼ぶ）。結果と所要時間は統計と記録器へ残す（REPAIR-4）。
     pub fn run_once(&mut self, timeout: Duration) -> Result<VcpuExit, MicrovmError> {
         let start = Instant::now();
         let result = self.run_bounded(timeout);
@@ -277,6 +290,30 @@ impl VcpuFd {
             });
         }
         result
+    }
+
+    /// `run_once` が返した `exit`（`Io` / `Mmio`）を `dispatcher` の該当デバイスへ振り分け、ゲストの読み出し
+    /// （IN・MMIO read）の応答があれば `kvm_run` 領域へ書き戻す（TASK-74.4.2・MVM-1）。
+    ///
+    /// 読み出しは書き戻さないと次の `KVM_RUN` で命令が完了しないため、ループは
+    /// `run_once` → `handle_exit` → `run_once` の順で組む。`exit` は直前の `run_once` の戻り値でなければならず、
+    /// dispatch の前に領域の現在の exit（アドレス / ポート・幅・回数・向き・書き込みデータ）と照合し、食い違えばデバイスにも領域にも触れず `Internal`（fail-closed）。`Io` / `Mmio` 以外の exit は `InvalidArgument`。
+    /// どのデバイスにも当たらないアクセスはエラーにせず `DispatchOutcome::Unhandled`（読み出しは 0xFF 埋め）で返す。
+    pub fn handle_exit(
+        &mut self,
+        exit: &VcpuExit,
+        dispatcher: &mut ExitDispatcher,
+    ) -> Result<DispatchOutcome, MicrovmError> {
+        exit::ensure_exit_matches_area(&self.run, exit)?;
+        let outcome = dispatcher.dispatch(exit)?;
+        if let Some(response) = outcome.read_response() {
+            match exit {
+                VcpuExit::Io { .. } => exit::complete_io_in(&mut self.run, response)?,
+                VcpuExit::Mmio { .. } => exit::complete_mmio_read(&mut self.run, response)?,
+                _ => {}
+            }
+        }
+        Ok(outcome)
     }
 
     fn run_bounded(&mut self, timeout: Duration) -> Result<VcpuExit, MicrovmError> {
@@ -574,6 +611,25 @@ impl KvmDevice {
         }
     }
 
+    /// 自己診断: ゲストコード（`in al,0x10; out 0x11,al; mov al,[0x2000]; out 0x12,al; hlt`）を実際に `KVM_RUN` し、
+    /// PIO の IN と MMIO read の応答が `handle_exit` でゲストへ書き戻されることを確かめる（TASK-74.4.2・MVM-1。
+    /// x86_64 のみ）。ポート 0x10 は固定値 `0x5A`、GPA `0x2000` の MMIO は固定値 `0xA5` を返し、ポート 0x11・0x12
+    /// への OUT が記録される。ページ・vCPU の扱いと期限は [`KvmDevice::probe_guest_execution`] と同じ。
+    /// 他 arch は `Unimplemented`。
+    pub fn probe_exit_dispatch(&self) -> Result<ExitDispatchProbe, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.probe_exit_dispatch_x86_64()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "exit dispatch probe is only implemented for x86_64",
+            ))
+        }
+    }
+
     /// 無限ループ（`jmp $`）のゲストを `runs` 回 `deadline` で中断させ、統計と記録を返す（REPAIR-5・REPAIR-4・MVM-1。
     /// x86_64 のみ。他 arch は `Unimplemented`）。呼び出しスレッドの `SIGUSR2` を診断中ブロックして最悪条件で確かめる。各回は必ず `DeadlineExceeded` で戻ることを期待し、
     /// 想定外の結果は `Internal` で失敗にする。`runs` は 1〜8、`deadline` は `run_once` と同じ範囲。
@@ -667,6 +723,98 @@ impl KvmDevice {
             records,
             kick_mask_restored: restored,
         })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn probe_exit_dispatch_x86_64(&self) -> Result<ExitDispatchProbe, MicrovmError> {
+        use crate::dispatch::{MmioDevice, PortIoDevice, PortIoOutcome};
+        use crate::virtio_mmio::{MmioReadOutcome, MmioWriteOutcome};
+        use std::sync::Mutex;
+
+        // in al,0x10 / out 0x11,al / mov al,[0x2000] (16 ビット moffs) / out 0x12,al / hlt
+        const CODE: [u8; 10] = [0xE4, 0x10, 0xE6, 0x11, 0xA0, 0x00, 0x20, 0xE6, 0x12, 0xF4];
+        const GPA: u64 = 0xFFFF_F000;
+        const CODE_OFFSET: usize = 0xFF0;
+        const IN_VALUE: u8 = 0x5A;
+        const MMIO_VALUE: u8 = 0xA5;
+
+        /// 読み出しで固定値を返すポートデバイス。
+        struct ConstPort(u8);
+        impl PortIoDevice for ConstPort {
+            fn read(&mut self, _offset: u16, data: &mut [u8]) -> PortIoOutcome {
+                data.fill(self.0);
+                PortIoOutcome::Handled
+            }
+            fn write(&mut self, _offset: u16, _data: &[u8]) -> PortIoOutcome {
+                PortIoOutcome::Ignored
+            }
+        }
+        /// 書き込みを記録するポートデバイス。
+        struct RecordPort(Arc<Mutex<Vec<(u16, u8)>>>);
+        impl PortIoDevice for RecordPort {
+            fn read(&mut self, _offset: u16, data: &mut [u8]) -> PortIoOutcome {
+                data.fill(0);
+                PortIoOutcome::Ignored
+            }
+            fn write(&mut self, offset: u16, data: &[u8]) -> PortIoOutcome {
+                if let (Ok(mut log), Some(b)) = (self.0.lock(), data.first()) {
+                    log.push((offset, *b));
+                }
+                PortIoOutcome::Handled
+            }
+        }
+        /// 読み出しで固定値を返す MMIO デバイス。
+        struct ConstMmio(u8);
+        impl MmioDevice for ConstMmio {
+            fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+                data.fill(self.0);
+                MmioReadOutcome::Handled
+            }
+            fn write(&mut self, _offset: u64, _data: &[u8]) -> MmioWriteOutcome {
+                MmioWriteOutcome::Handled
+            }
+        }
+
+        let internal = |what: &str, e: SysError| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            SysError::Os(n) => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (os error {n})"),
+            ),
+        };
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = ExitDispatcher::new();
+        dispatcher.register_pio(0x10, 1, Box::new(ConstPort(IN_VALUE)))?;
+        dispatcher.register_pio(0x11, 2, Box::new(RecordPort(Arc::clone(&writes))))?;
+        dispatcher.register_mmio(0x2000, 0x10, Box::new(ConstMmio(MMIO_VALUE)))?;
+        // 宣言順の逆が drop 順: vcpu → registered → vm。明示 drop で順序を固定する。
+        let vm = self.create_vm()?;
+        let mut page = sys::GuestPage::new().map_err(|e| internal("guest page allocation", e))?;
+        page.write_at(CODE_OFFSET, &CODE).map_err(|()| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "guest code does not fit the page",
+            )
+        })?;
+        let registered = sys::register_single_page(vm.fd.as_fd(), 0, GPA, page)
+            .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
+        let mut vcpu = vm.create_vcpu(0)?;
+        let outcome = run_probe_loop(|| {
+            let exit = vcpu.run_once(PROBE_RUN_DEADLINE)?;
+            if matches!(exit, VcpuExit::Io { .. } | VcpuExit::Mmio { .. }) {
+                vcpu.handle_exit(&exit, &mut dispatcher)?;
+            }
+            Ok(exit)
+        });
+        drop(vcpu);
+        drop(registered);
+        drop(vm);
+        let (exits, _interrupted) = outcome?;
+        let port_writes = writes.lock().map(|v| v.clone()).unwrap_or_default();
+        Ok(ExitDispatchProbe { exits, port_writes })
     }
 
     #[cfg(target_arch = "x86_64")]

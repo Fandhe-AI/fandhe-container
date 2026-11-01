@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -162,6 +162,79 @@ fn kvm_device_run_deadline_interrupts_spinning_guest() {
         dev.probe_deadline_interrupt(std::time::Duration::from_millis(200), 2)
             .unwrap_err()
             .code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+/// MVM-1・TASK-74.4.2: 実機の VM exit が登録デバイスへ振り分けられ、IN（ポート 0x10 → 0x5A）と
+/// MMIO read（GPA 0x2000 → 0xA5）の応答がゲストへ書き戻されること（ゲストが受けた値を OUT し直して観測する。x86_64）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_exit_dispatch() {
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(dev.probe_exit_dispatch());
+    });
+    let probe = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("probe_exit_dispatch did not finish within 30s")
+        .unwrap();
+    let io = |direction, port, data: Vec<u8>| VcpuExit::Io {
+        direction,
+        port,
+        size: 1,
+        count: 1,
+        data,
+    };
+    // MMIO read exit の `data` はカーネルの領域に残っていた値で意味を持たないため、照合から外す。
+    let mut exits = probe.exits.clone();
+    assert!(matches!(
+        exits.get(2),
+        Some(VcpuExit::Mmio {
+            phys_addr: 0x2000,
+            len: 1,
+            is_write: false,
+            ..
+        })
+    ));
+    exits.remove(2);
+    assert_eq!(
+        exits,
+        vec![
+            io(IoDirection::In, 0x10, vec![]),
+            io(IoDirection::Out, 0x11, vec![0x5A]),
+            io(IoDirection::Out, 0x12, vec![0xA5]),
+            VcpuExit::Hlt,
+        ]
+    );
+    assert_eq!(probe.port_writes, vec![(0, 0x5A), (1, 0xA5)]);
+}
+
+/// 他 arch では自己診断が未実装であること（型検査と fail-closed の確認）。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_exit_dispatch() {
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    assert_eq!(
+        dev.probe_exit_dispatch().unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
     );
 }

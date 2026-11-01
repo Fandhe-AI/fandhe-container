@@ -2,7 +2,7 @@
 //!
 //! virtio-block（TASK-74.2.2）と virtio-net（TASK-74.3.1）が共有するレジスタ状態・デバイス状態の遷移・
 //! feature negotiation・キュー設定レジスタを 1 か所に置く。各デバイスは [`VirtioDevice`] を実装し、
-//! [`VirtioMmioTransport`] に包んで使う。`KVM_RUN` の MMIO exit からは TASK-74.4.2 が
+//! [`VirtioMmioTransport`] に包んで使う。`KVM_RUN` の MMIO exit からは `crate::dispatch`（TASK-74.4.2）が
 //! [`VirtioMmioTransport::read`] / [`VirtioMmioTransport::write`] を呼び、結果の
 //! [`MmioWriteOutcome::QueueNotify`] 等で virtqueue 処理へ振り分ける。割り込みの実配送は TASK-74.2.3・74.3.2。
 //!

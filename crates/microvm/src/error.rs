@@ -31,11 +31,13 @@ pub enum MicrovmErrorCode {
     AlreadyExists,
     /// 上記以外の内部エラー。
     Internal,
+    /// 期限内に完了しなかった（`KVM_RUN` の期限超過。REPAIR-5）。
+    DeadlineExceeded,
 }
 
 impl MicrovmErrorCode {
     /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所。
-    pub const ALL: [MicrovmErrorCode; 8] = [
+    pub const ALL: [MicrovmErrorCode; 9] = [
         MicrovmErrorCode::NotFound,
         MicrovmErrorCode::PermissionDenied,
         MicrovmErrorCode::FailedPrecondition,
@@ -44,6 +46,7 @@ impl MicrovmErrorCode {
         MicrovmErrorCode::InvalidArgument,
         MicrovmErrorCode::AlreadyExists,
         MicrovmErrorCode::Internal,
+        MicrovmErrorCode::DeadlineExceeded,
     ];
 
     /// ワイヤー・ログ用の文字列表現（`PluginErrorCode::as_str` と同じ表記）。
@@ -57,6 +60,7 @@ impl MicrovmErrorCode {
             MicrovmErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             MicrovmErrorCode::AlreadyExists => "ALREADY_EXISTS",
             MicrovmErrorCode::Internal => "INTERNAL",
+            MicrovmErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
         }
     }
 
@@ -116,12 +120,13 @@ mod tests {
             MicrovmErrorCode::InvalidArgument => 5,
             MicrovmErrorCode::AlreadyExists => 6,
             MicrovmErrorCode::Internal => 7,
+            MicrovmErrorCode::DeadlineExceeded => 8,
         }
     }
 
     #[test]
     fn all_covers_every_variant_in_order() {
-        assert_eq!(MicrovmErrorCode::ALL.len(), 8);
+        assert_eq!(MicrovmErrorCode::ALL.len(), 9);
         for (i, c) in MicrovmErrorCode::ALL.iter().enumerate() {
             assert_eq!(ordinal(*c), i);
         }
@@ -149,6 +154,10 @@ mod tests {
         );
         assert_eq!(MicrovmErrorCode::AlreadyExists.as_str(), "ALREADY_EXISTS");
         assert_eq!(MicrovmErrorCode::Internal.as_str(), "INTERNAL");
+        assert_eq!(
+            MicrovmErrorCode::DeadlineExceeded.as_str(),
+            "DEADLINE_EXCEEDED"
+        );
         for c in MicrovmErrorCode::ALL {
             assert_eq!(MicrovmErrorCode::from_name(c.as_str()), Some(c));
         }

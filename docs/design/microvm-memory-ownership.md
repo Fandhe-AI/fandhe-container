@@ -41,6 +41,15 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 - テスト分離: アクセス型と virtqueue のパースを既定のテスト集合で検証でき、実機前提に回すのは KVM ioctl の試験だけになる
 - MVM-4: `vm-memory`（rust-vmm）を使わず自作する根拠にもなる
 
+## #882 の例外（TASK-74.4.1）
+
+`KVM_RUN` でゲストコードを実機で実行して示すには、ゲストメモリの登録が最低 1 ページ要る。そこで #882 では次だけを `sys.rs` に持つ（MVM-1）。
+
+- `GuestPage`（`alloc_zeroed` した 4 KiB）と `RegisteredPage<'vm>`（`KVM_SET_USER_MEMORY_REGION` で登録済みの 1 ページ。VM fd を借用し、drop で slot を削除してから解放する。削除に失敗したページは解放せず漏らす）
+- 公開 API には出さず、自己診断の入口 `KvmDevice::probe_guest_execution()`（x86_64 のみ。VM・ページ・vCPU の寿命がこの関数の中で完結する）だけが使う
+
+汎用の backing（匿名 mmap・複数領域・アクセス型との接続）は上記のとおり引き続き #696 の担当で、#696 は #882 の型を流用せず置き換えてよい。
+
 ## 却下案
 
 | 案 | 却下理由 |
@@ -63,7 +72,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 
 ## /dev/kvm を要する試験の分離
 
-`crates/microvm/tests/kvm_device.rs` の 2 試験は `#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]` で既定のテスト集合から分離済みで、実行コマンド・必要環境・恒常ルールは AGENTS.md「実機前提テスト」の `kvm_device` の項に置く。KVM を使わない論理（アクセス型・virtqueue のパース）は heap の backing で既定のテスト集合に置き、実機前提へ移さない（ci.md「実機前提テスト」）。
+`crates/microvm/tests/kvm_device.rs` の実機前提の試験（各アーキテクチャで計 4 件）は `#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]` で既定のテスト集合から分離済みで、実行コマンド・必要環境・恒常ルールは AGENTS.md「実機前提テスト」の `kvm_device` の項に置く。KVM を使わない論理（アクセス型・virtqueue のパース）は heap の backing で既定のテスト集合に置き、実機前提へ移さない（ci.md「実機前提テスト」）。
 
 ## 再評価条件
 

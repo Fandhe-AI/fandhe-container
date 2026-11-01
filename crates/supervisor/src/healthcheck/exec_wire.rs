@@ -36,6 +36,61 @@ pub fn encode_cgroup_created(name: &fandhe_container_core::exec::ExecCgroupName)
     format!("{CGROUP_TAG} {}\n", name.as_str()).into_bytes()
 }
 
+/// worker の同一性の通知行の識別子（`FCHW1 <pid> <starttime>\n`）。helper が worker を fork した直後に fd 2 へ
+/// 1 回だけ書く。supervisor は helper の SIGKILL 後に再親付けされた worker を、pid と開始時刻の照合つきで
+/// その 1 個だけ回収する（`waitpid(-1)` は使わない。SUP-4・REPAIR-5・#2441）。
+pub const WORKER_TAG: &str = "FCHW1";
+
+/// 通知された worker の同一性（pid と `/proc/<pid>/stat` の starttime。pid の再利用の取り違えを防ぐ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerIdentity {
+    /// worker の pid（2 以上）。
+    pub pid: u32,
+    /// `/proc/<pid>/stat` の 22 番目の値（開始時刻。clock tick 単位）。
+    pub start_time: u64,
+}
+
+impl WorkerIdentity {
+    /// 通知行を組む（`FCHW1 <pid> <starttime>\n`）。
+    pub fn encode(self) -> Vec<u8> {
+        format!("{WORKER_TAG} {} {}\n", self.pid, self.start_time).into_bytes()
+    }
+
+    /// 現在の `/proc/<pid>/stat` から同一性を読む（プロセスが無い・読めない・解釈できなければ `None`）。
+    pub fn read(pid: u32) -> Option<Self> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(Self {
+            pid,
+            start_time: parse_stat_start_time(&stat)?,
+        })
+    }
+
+    /// 結果ストリームから最初の通知行を取り出す（改行で終わらない末尾・不正な値・pid 1 以下は採らない）。
+    pub fn find(bytes: &[u8]) -> Option<Self> {
+        let prefix = format!("{WORKER_TAG} ");
+        let complete = bytes.iter().filter(|&&b| b == b'\n').count();
+        bytes
+            .split(|&b| b == b'\n')
+            .take(complete)
+            .find_map(|line| {
+                let rest = std::str::from_utf8(line)
+                    .ok()?
+                    .strip_prefix(prefix.as_str())?;
+                let mut words = rest.split(' ');
+                let pid: u32 = words.next()?.parse().ok()?;
+                let start_time: u64 = words.next()?.parse().ok()?;
+                (words.next().is_none() && pid > 1).then_some(Self { pid, start_time })
+            })
+    }
+}
+
+/// `/proc/<pid>/stat` の starttime（22 番目）。`comm` は括弧内に空白や `)` を含み得るため、最後の `)` の後ろから数える。
+pub fn parse_stat_start_time(stat: &str) -> Option<u64> {
+    let after = stat.get(stat.rfind(')')? + 1..)?;
+    // `)` の直後の語が 3 番目（state）。starttime は 22 番目 = 残りの 20 番目（0 始まりで 19）。
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// 結果行の最大バイト数（改行を含まない）。
 pub const LINE_MAX: usize = 256;
 

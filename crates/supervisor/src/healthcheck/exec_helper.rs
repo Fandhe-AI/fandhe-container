@@ -348,6 +348,13 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
             .write_all(&super::exec_wire::encode_cgroup_created(name))
             .and_then(|()| err.flush());
     };
+    // worker の fork 直後に pid と開始時刻を通知する（helper が殺されても supervisor が回収できるようにする）。
+    let notify_worker = |pid: u32| {
+        if let Some(identity) = super::exec_wire::WorkerIdentity::read(pid) {
+            let mut err = std::io::stderr();
+            let _ = err.write_all(&identity.encode()).and_then(|()| err.flush());
+        }
+    };
     let result = crate::exec::run_command_with_pidfd_output_notify(
         &record,
         stdin.as_fd(),
@@ -357,6 +364,7 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
         &launch_env,
         stdout.as_fd(),
         Some(&notify),
+        Some(&notify_worker),
     );
     line_from_result(result)
 }

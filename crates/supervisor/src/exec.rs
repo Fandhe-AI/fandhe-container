@@ -1070,7 +1070,7 @@ pub fn run_command_with_pidfd_env(
     launch_env: &[String],
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     run_command_with_pidfd_inner(
-        record, pidfd, request, timeout, audit, launch_env, None, None,
+        record, pidfd, request, timeout, audit, launch_env, None, None, None,
     )
 }
 
@@ -1093,7 +1093,7 @@ pub fn run_command_with_pidfd_output(
     output: BorrowedFd<'_>,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     run_command_with_pidfd_output_notify(
-        record, pidfd, request, timeout, audit, launch_env, output, None,
+        record, pidfd, request, timeout, audit, launch_env, output, None, None,
     )
 }
 
@@ -1103,7 +1103,8 @@ pub fn run_command_with_pidfd_output(
 /// `on_created` は `mkdirat` の排他作成（既存の同名は `EEXIST` で失敗し採用しない）に成功した直後、worker を fork する
 /// 前に 1 回だけ呼ばれる。呼び出しプロセスの外側（supervisor）は、この通知を受けた cgroup だけを「今回の作成物」として
 /// 停止してよい。pid から名前を推定すると、再利用された pid の以前の exec の同名 cgroup を誤停止し得るため。
-/// 作成に失敗した・記録に cgroup 配置が無い場合は呼ばれない。他の契約は [`run_command_with_pidfd_output`] と同じ。
+/// 作成に失敗した・記録に cgroup 配置が無い場合は呼ばれない。`on_worker` は worker の fork 直後にその pid で呼ばれる
+/// （helper が殺されたあと再親付けされた worker を、supervisor が回収するための同一性の通知。SUP-4・REPAIR-5）。他の契約は [`run_command_with_pidfd_output`] と同じ。
 #[allow(clippy::too_many_arguments)]
 pub fn run_command_with_pidfd_output_notify(
     record: &StateRecord,
@@ -1114,6 +1115,7 @@ pub fn run_command_with_pidfd_output_notify(
     launch_env: &[String],
     output: BorrowedFd<'_>,
     on_created: Option<&dyn Fn(&ExecCgroupName)>,
+    on_worker: Option<&dyn Fn(u32)>,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     run_command_with_pidfd_inner(
         record,
@@ -1124,6 +1126,7 @@ pub fn run_command_with_pidfd_output_notify(
         launch_env,
         Some(output),
         on_created,
+        on_worker,
     )
 }
 
@@ -1139,12 +1142,13 @@ fn run_command_with_pidfd_inner(
     launch_env: &[String],
     output: Option<BorrowedFd<'_>>,
     on_created: Option<&dyn Fn(&ExecCgroupName)>,
+    on_worker: Option<&dyn Fn(u32)>,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let sweep = sweep_before_create(record);
     let name = ExecCgroupName::unique();
-    let result = run_owning_child_cgroup(
+    let result = run_owning_child_cgroup_notify(
         deadline,
         exec_responder(record, audit),
         || {
@@ -1156,6 +1160,7 @@ fn run_command_with_pidfd_inner(
             Ok(created)
         },
         || cleanup_child_cgroup(record, &name),
+        on_worker,
         |proof, child, sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?
                 .with_launch_env(launch_env.to_vec());
@@ -1377,11 +1382,25 @@ impl ListenerPolicy<'_> {
 /// listener の送信口を受け取り、親は worker の終了を待つ **前** に listener を期限つきで受信・検証して ACK を返す
 /// （`work` が ACK を待つため、先に終了を待つと相互待ちになる）。受け渡しの結果ごとの扱いは
 /// [`reject_unacknowledged_exit`]・[`listener_failure`]。
+#[cfg(any(test, feature = "exec-test-support"))]
 fn run_in_worker_with(
     deadline: Deadline,
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     listener: ListenerPolicy<'_>,
+    work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, WorkerError>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    run_in_worker_notify(deadline, grace, cleanup, listener, None, work)
+}
+
+/// [`run_in_worker_with`] に、worker の fork 直後の通知 `on_worker`（worker の pid）を足した本体
+/// （healthcheck の exec 専用 helper が worker の同一性を supervisor へ知らせる。SUP-4・REPAIR-5・#2441）。
+fn run_in_worker_notify(
+    deadline: Deadline,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    listener: ListenerPolicy<'_>,
+    on_worker: Option<&dyn Fn(u32)>,
     work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
@@ -1423,6 +1442,11 @@ fn run_in_worker_with(
             .map_err(from_exec_error)?;
         (child, Some(receiver))
     };
+    // fork 直後に worker の pid を通知する（helper が殺されたあと、再親付けされた worker を supervisor が
+    // pid と開始時刻の照合つきで回収するため）。
+    if let Some(notify) = on_worker {
+        notify(child.pid());
+    }
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
     // worker を fork した後は、結果の取得がどう終わっても（正常・期限切れ・異常終了・結果行の不正）worker の
@@ -1651,6 +1675,7 @@ fn collect_worker_result(
 /// 後始末は呼ばない（他者・残骸の同名 cgroup を止めない）。作成後は、worker を fork できた場合は
 /// [`run_in_worker_with`] が worker 回収後に、fork 前に失敗した場合はここで `remove` を呼ぶ。`create` が
 /// `Ok(None)` を返すのは cgroup 配置の記録が無い場合で、`work` が対象特定で拒否する（作成物なし）。
+#[cfg(any(test, feature = "exec-test-support"))]
 fn run_owning_child_cgroup(
     deadline: Deadline,
     responder: ExecResponder<'_>,
@@ -1662,10 +1687,26 @@ fn run_owning_child_cgroup(
         ExecListenerSender,
     ) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
+    run_owning_child_cgroup_notify(deadline, responder, create, remove, None, work)
+}
+
+/// [`run_owning_child_cgroup`] に worker の pid の通知 `on_worker` を足した本体（[`run_in_worker_notify`]）。
+fn run_owning_child_cgroup_notify(
+    deadline: Deadline,
+    responder: ExecResponder<'_>,
+    create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
+    remove: impl Fn() -> Result<(), TraitError>,
+    on_worker: Option<&dyn Fn(u32)>,
+    work: impl FnOnce(
+        &ExecWorkerProof,
+        Option<&ExecChildCgroup>,
+        ExecListenerSender,
+    ) -> Result<ExecOutcome, WorkerError>,
+) -> Result<ExecOutcome, WorkerFailure> {
     let child = create()?;
     let owned = child.is_some();
     let cleanup_ran = std::cell::Cell::new(false);
-    let result = run_in_worker_with(
+    let result = run_in_worker_notify(
         deadline,
         WORKER_GRACE,
         || {
@@ -1673,6 +1714,7 @@ fn run_owning_child_cgroup(
             if owned { remove() } else { Ok(()) }
         },
         ListenerPolicy::Respond(responder),
+        on_worker,
         |proof, sender| match sender {
             Some(sender) => work(proof, child.as_ref(), sender),
             // `Respond` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。

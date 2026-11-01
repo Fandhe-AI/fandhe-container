@@ -41,7 +41,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::exec::{ExecCgroupName, remove_exec_child_cgroup};
+use fandhe_container_core::exec::{
+    ChildSubreaper, ContainerChild, ExecCgroupName, remove_exec_child_cgroup,
+};
 use fandhe_container_core::oci_runtime::LaunchedProcess;
 use fandhe_container_core::traits::{
     ContainerId, ErrorCode, GetStateRequest, HealthStatus, StateRecord, TraitError,
@@ -49,7 +51,7 @@ use fandhe_container_core::traits::{
 
 use super::HealthcheckDefinition;
 use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
-use super::exec_wire::{HealthExecLine, LINE_MAX};
+use super::exec_wire::{HealthExecLine, LINE_MAX, WorkerIdentity};
 use crate::health::{HealthProbe, ProbeCancel};
 use crate::run::MAX_POLL_INTERVAL;
 
@@ -451,6 +453,10 @@ fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
             dropped = dropped.saturating_add(1);
             continue;
         }
+        if line.starts_with(super::exec_wire::WORKER_TAG.as_bytes()) {
+            // worker の同一性の通知行は `WorkerIdentity::find` が読む。結果行でも診断行でもないので数えない。
+            continue;
+        }
         if line.starts_with(super::exec_wire::CGROUP_TAG.as_bytes()) {
             // 作成通知行は `owned_exec_cgroup` が読む。結果行でも診断行でもないので数えない。
             continue;
@@ -506,6 +512,37 @@ fn owned_exec_cgroup(bytes: &[u8], helper_pid: u32) -> Option<ExecCgroupName> {
         })
 }
 
+/// 通知された worker `id` を、同一性を照合してから pid 指定で 1 回だけ回収する。まだ残っていれば `true`。
+///
+/// 照合: `/proc/<pid>/stat` の starttime が通知と一致しなければ、既に回収済みで pid が再利用された（または消えた）
+/// ので待たない。回収は subreaper として再親付けされた自分の子だけを対象にした
+/// `waitpid(<pid>, WNOHANG)`（core の `ContainerChild::wait_for_exit`）で、`waitpid(-1)` は使わない。自分の子で
+/// なければ（`ECHILD`。init へ再親付けされた等）回収の対象外として手放す（REPAIR-5）。
+fn reap_reparented_worker(id: WorkerIdentity) -> bool {
+    reap_worker_with(id, WorkerIdentity::read, |pid| {
+        let proof = ChildSubreaper::enable().ok()?;
+        let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid)?, &proof);
+        match child.wait_for_exit(Duration::ZERO) {
+            Ok(Some(_)) => Some(false),
+            Ok(None) => Some(true),
+            Err(_) => Some(false),
+        }
+    })
+}
+
+/// [`reap_reparented_worker`] の本体。現在の同一性の読み取りと回収を注入して単体で照合する。`wait` は
+/// `Some(まだ残っている)`、回収を試せなければ `None`（手放す）。
+fn reap_worker_with(
+    id: WorkerIdentity,
+    read: impl FnOnce(u32) -> Option<WorkerIdentity>,
+    wait: impl FnOnce(u32) -> Option<bool>,
+) -> bool {
+    match read(id.pid) {
+        Some(current) if current == id => wait(id.pid).unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// 所有を確定した cgroup `owned` があるときだけ `stop` で止める。無ければ何もせず `true`（止める対象が無い）。
 fn stop_if_owned(
     owned: Option<&ExecCgroupName>,
@@ -536,6 +573,10 @@ pub struct ExecHealthProbe {
     /// `cancel`・drop で `try_wait` し、回収できるまで新しい helper を作らない（未回収 helper の蓄積を防ぐ。
     /// SUP-4・REPAIR-5）。
     unreaped: Mutex<Option<Child>>,
+    /// helper の SIGKILL 後に再親付けされ得る worker の同一性（最大 1 個）。helper を回収できた後に、pid と開始時刻を
+    /// 照合してからその 1 個だけを `waitpid(<pid>, WNOHANG)` で回収する（subreaper の supervisor 配下にゾンビを
+    /// 残さない。`waitpid(-1)` は使わない。SUP-4・REPAIR-5）。
+    worker: Mutex<Option<WorkerIdentity>>,
 }
 
 impl std::fmt::Debug for ExecHealthProbe {
@@ -591,6 +632,7 @@ impl ExecHealthProbe {
             busy: AtomicBool::new(false),
             resolver_busy: Arc::new(AtomicBool::new(false)),
             unreaped: Mutex::new(None),
+            worker: Mutex::new(None),
         })
     }
 
@@ -1017,6 +1059,23 @@ impl ExecHealthProbe {
                 cgroup_stop_failed = true;
             }
         }
+        // helper が正常終了でなければ、worker は親死亡シグナルで終わっても subreaper の supervisor へ再親付けされて
+        // ゾンビで残り得る。通知された同一性を保持し、helper を回収できていれば有界に回収する（待てなければ保持して
+        // 次の probe の開始時・cancel・drop が回収する。REPAIR-5）。
+        if !matches!(ended, Ended::Exited(true))
+            && let Some(id) = WorkerIdentity::find(&results.bytes)
+        {
+            *self
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+            if reaped {
+                let until = Instant::now() + REAP_TIMEOUT;
+                while self.reap_unreaped() && Instant::now() < until {
+                    std::thread::sleep(POLL_STEP);
+                }
+            }
+        }
         report.helper_reaped = reaped;
         report.cgroup_stop_failed = cgroup_stop_failed;
         report.output = output.kept;
@@ -1103,19 +1162,37 @@ impl ExecHealthProbe {
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return true,
         };
-        let Some(child) = slot.as_mut() else {
+        if let Some(child) = slot.as_mut() {
+            match child.try_wait() {
+                Ok(None) => {
+                    let _ = child.kill();
+                    return true;
+                }
+                // 回収できた、または待ちが失敗した（もう回収の見込みが無い）なら手放す。
+                Ok(Some(_)) | Err(_) => *slot = None,
+            }
+        }
+        drop(slot);
+        // helper が居なくなった後に限り、再親付けされた worker を回収する（helper が生きている間は worker は
+        // helper の子で、ここからは待てない）。
+        self.reap_worker(&reap_reparented_worker)
+    }
+
+    /// 保持している worker の同一性を、`wait` で 1 回だけ回収する。まだ残っていれば `true`。
+    fn reap_worker(&self, wait: &dyn Fn(WorkerIdentity) -> bool) -> bool {
+        let mut slot = match self.worker.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        let Some(id) = *slot else {
             return false;
         };
-        match child.try_wait() {
-            Ok(None) => {
-                let _ = child.kill();
-                true
-            }
-            // 回収できた、または待ちが失敗した（もう回収の見込みが無い）なら手放す。
-            Ok(Some(_)) | Err(_) => {
-                *slot = None;
-                false
-            }
+        if wait(id) {
+            true
+        } else {
+            *slot = None;
+            false
         }
     }
 
@@ -1597,6 +1674,113 @@ mod tests {
         let parsed = parse_result_stream(&sink);
         assert_eq!(parsed.result, Ok(HealthExecLine::Stale));
         assert_eq!(parsed.dropped, 0);
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: worker の通知行を解析する。不正・pid 1 以下・途中で切れた行は採らない。
+    #[test]
+    fn sup4_2441_worker_identity_notice_is_parsed_strictly() {
+        let id = WorkerIdentity::find(b"FCHC1 exec-9-0\nFCHW1 4321 987654\nFCHX1 stale\n").unwrap();
+        assert_eq!(
+            id,
+            WorkerIdentity {
+                pid: 4321,
+                start_time: 987_654
+            }
+        );
+        assert_eq!(WorkerIdentity::find(&id.encode()), Some(id));
+        assert_eq!(WorkerIdentity::find(b"FCHW1 1 5\n"), None);
+        assert_eq!(WorkerIdentity::find(b"FCHW1 4321\n"), None);
+        assert_eq!(WorkerIdentity::find(b"FCHW1 4321 5 6\n"), None);
+        assert_eq!(WorkerIdentity::find(b"FCHW1 x 5\n"), None);
+        assert_eq!(WorkerIdentity::find(b"FCHW1 4321 5"), None);
+        // 通知行は結果行の解析を妨げない。
+        let sink = ResultSink {
+            bytes: b"FCHW1 4321 5\nFCHX1 stale\n".to_vec(),
+            overflow: false,
+        };
+        let parsed = parse_result_stream(&sink);
+        assert_eq!(parsed.result, Ok(HealthExecLine::Stale));
+        assert_eq!(parsed.dropped, 0);
+    }
+
+    /// SUP-4（#2441）: `/proc/<pid>/stat` の starttime は、`comm` に空白や `)` を含んでも最後の `)` から数える。
+    #[test]
+    fn sup4_2441_stat_start_time_parses_tricky_comm() {
+        use super::super::exec_wire::parse_stat_start_time;
+        let fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
+        let stat = format!("12 (a b) c) S {}", fields[1..].join(" "));
+        // 22 番目 = fields[(22 - 3)] だが先頭の state を除いているため、値は 22。
+        assert_eq!(parse_stat_start_time(&stat), Some(22));
+        assert_eq!(parse_stat_start_time("garbage"), None);
+        assert_eq!(parse_stat_start_time("1 (x) S 1 2"), None);
+        // 実プロセス（自分自身）は読める。
+        assert!(WorkerIdentity::read(std::process::id()).is_some());
+    }
+
+    /// REPAIR-5・SUP-4（#2441）: worker は starttime が一致するときだけ待つ。不一致（pid の再利用）や消失では待たず、
+    /// 待ちが未了なら残りとして返す。
+    #[test]
+    fn repair5_2441_worker_is_waited_only_when_identity_matches() {
+        let id = WorkerIdentity {
+            pid: 4321,
+            start_time: 100,
+        };
+        let reused = WorkerIdentity {
+            pid: 4321,
+            start_time: 200,
+        };
+        let waited = std::cell::Cell::new(0u32);
+        // pid が再利用された（starttime 不一致）: 待たない。
+        assert!(!reap_worker_with(
+            id,
+            |_| Some(reused),
+            |_| {
+                waited.set(waited.get() + 1);
+                Some(true)
+            }
+        ));
+        // 消えた: 待たない。
+        assert!(!reap_worker_with(
+            id,
+            |_| None,
+            |_| {
+                waited.set(waited.get() + 1);
+                Some(true)
+            }
+        ));
+        assert_eq!(waited.get(), 0);
+        // 一致: その pid だけを待つ。未了なら残り、回収できれば残らない。
+        let target = std::cell::Cell::new(0u32);
+        assert!(reap_worker_with(
+            id,
+            |_| Some(id),
+            |pid| {
+                target.set(pid);
+                Some(true)
+            }
+        ));
+        assert_eq!(target.get(), 4321);
+        assert!(!reap_worker_with(id, |_| Some(id), |_| Some(false)));
+        // 回収を試せない（自分の子でない等）: 手放す。
+        assert!(!reap_worker_with(id, |_| Some(id), |_| None));
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: 保持した worker は `reap_worker` が 1 回だけ待ち、回収できれば手放す。
+    #[test]
+    fn repair5_2441_pending_worker_is_released_once_reaped() {
+        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        let id = WorkerIdentity {
+            pid: 4321,
+            start_time: 1,
+        };
+        *probe.worker.lock().unwrap() = Some(id);
+        assert!(probe.reap_worker(&|got| {
+            assert_eq!(got, id);
+            true
+        }));
+        assert_eq!(*probe.worker.lock().unwrap(), Some(id));
+        assert!(!probe.reap_worker(&|_| false));
+        assert_eq!(*probe.worker.lock().unwrap(), None);
     }
 
     /// SUP-4・REPAIR-5（#2441）: 回収できない helper が残っている間は、次の probe は helper を作らずに

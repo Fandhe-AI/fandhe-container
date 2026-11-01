@@ -33,6 +33,12 @@ mod linux {
 
     const COMMAND: [&str; 2] = ["/bin/echo", "hi"];
 
+    /// 利用者所有の一時状態ルート（テストプロセスの pid で一意。偽 helper は親 pid から同じパスを導く）。
+    /// 記録は置かない: アダプタは記録を読めなくても probe を続行する（best-effort。cgroup 後始末だけが残余扱い）。
+    fn state_root_for(pid: u32) -> PathBuf {
+        std::env::temp_dir().join(format!("fandhe-hc-exec-probe-{pid}"))
+    }
+
     /// 偽の helper の本体。結果行は fd 2、コマンド出力は fd 1 へ書く。
     fn fake_helper(args: Vec<OsString>) -> ! {
         let parsed = HealthExecArgs::parse(args);
@@ -48,7 +54,7 @@ mod linux {
         };
         // 契約の照合: 外れたら invalid。
         let devnull = std::fs::File::open("/proc/self/fd/0").and_then(|f| f.metadata());
-        let contract_ok = args.root() == std::path::Path::new("/run/fandhe-test")
+        let contract_ok = args.root() == state_root_for(std::os::unix::process::parent_id())
             && args.expect_pid().get() == 4242
             && args.command() == COMMAND
             && std::env::vars_os().next().is_none()
@@ -156,6 +162,20 @@ mod linux {
                 let _ = err.write_all(b"hello\n");
             }
             "hc-silent" => {}
+            "hc-crash-after-line" => {
+                // 結果行を書いた後に異常終了する helper。行は採用されない。
+                write_line(
+                    &mut err,
+                    HealthExecLine::Exited {
+                        code: 0,
+                        healthy: true,
+                        audit: na,
+                        exit_audit: na,
+                    },
+                );
+                let _ = err.flush();
+                finish(1)
+            }
             "hc-two-lines" => {
                 let line = HealthExecLine::Exited {
                     code: 0,
@@ -196,7 +216,7 @@ mod linux {
     fn probe_for(id: &str) -> ExecHealthProbe {
         let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
         let target = HealthExecTarget::new(
-            PathBuf::from("/run/fandhe-test"),
+            state_root_for(std::process::id()),
             ContainerId::new(id).expect("id"),
             NonZeroU32::new(4242).expect("pid"),
             OwnedFd::from(devnull),
@@ -237,6 +257,8 @@ mod linux {
             fake_helper(args.collect());
         }
         let secs = Duration::from_secs;
+        let root = state_root_for(std::process::id());
+        std::fs::create_dir_all(&root).expect("create state root");
 
         let (r, rep, _) = run("hc-healthy", secs(10));
         assert_eq!(r, Ok(HealthStatus::Healthy));
@@ -348,6 +370,7 @@ mod linux {
         for id in [
             "hc-garbage",
             "hc-silent",
+            "hc-crash-after-line",
             "hc-two-lines",
             "hc-contradiction",
         ] {
@@ -361,6 +384,7 @@ mod linux {
         assert_eq!(r, Ok(HealthStatus::Healthy));
         assert!(elapsed < Duration::from_millis(1_500), "{elapsed:?}");
         ok("hc-orphan");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

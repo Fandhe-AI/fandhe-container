@@ -504,6 +504,12 @@ impl std::fmt::Debug for ExecHealthProbe {
 /// `busy` を必ず下ろす。
 struct BusyGuard<'a>(&'a AtomicBool);
 
+/// spawn 前に打ち切る理由。
+enum PreSpawn {
+    Timeout,
+    Cancelled,
+}
+
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
@@ -573,30 +579,69 @@ impl ExecHealthProbe {
 
     /// 起動前に記録からコンテナ cgroup の配置を取り出して保持する（強制停止で状態ストアを再取得しないため。
     /// ロック競合で停止が省かれたり 1 秒の後始末上限を超えたりしない。SUP-6・REPAIR-5）。
-    fn resolve_record(&self) -> Result<StateRecord, TraitError> {
+    fn resolve_record(target: &HealthExecTarget) -> Result<StateRecord, TraitError> {
         let unavailable = || {
             TraitError::new(
                 ErrorCode::Unavailable,
                 "failed to resolve the container cgroup for the healthcheck",
             )
         };
-        let store = crate::state::open_default_store(Some(self.target.state_root.clone()))
+        let store = crate::state::open_default_store(Some(target.state_root.clone()))
             .map_err(|_| unavailable())?;
-        let record = store
-            .get(&GetStateRequest::new(self.target.id.clone()))
-            .map_err(|_| unavailable())?;
-        Ok(record)
+        store
+            .get(&GetStateRequest::new(target.id.clone()))
+            .map_err(|_| unavailable())
+    }
+
+    /// [`Self::resolve_record`] を別スレッドで走らせ、`deadline` と cancel を確かめながら待つ。読めなかった
+    /// ときは `Ok(None)`（probe は続行し、後始末は残余扱い）。期限切れ・cancel は `Err`（helper を起動しない）。
+    fn resolve_record_bounded(&self, deadline: Instant) -> Result<Option<StateRecord>, PreSpawn> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = HealthExecTarget {
+            state_root: self.target.state_root.clone(),
+            id: self.target.id.clone(),
+            pid: self.target.pid,
+            pidfd: match self.target.pidfd.try_clone() {
+                Ok(fd) => fd,
+                Err(_) => return Ok(None),
+            },
+        };
+        if std::thread::Builder::new()
+            .name("hc-resolve".into())
+            .spawn(move || {
+                let _ = tx.send(Self::resolve_record(&target));
+            })
+            .is_err()
+        {
+            return Ok(None);
+        }
+        loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(PreSpawn::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(PreSpawn::Timeout);
+            }
+            match rx.recv_timeout(POLL_STEP.min(deadline - now)) {
+                Ok(Ok(record)) => return Ok(Some(record)),
+                Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(None);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     /// helper が作った exec 子 cgroup（`exec-<helper pid>-0`。fresh な単一プロセスの最初の
     /// `ExecCgroupName::unique()`）を、起動前に保持した配置の直下で `cgroup.kill` して削除する。
     /// 状態ストアは読まない。失敗は `false` で返す（残った cgroup は次回の掃除と delete 前の掃除が回収する）。
     /// 待機は `CGROUP_KILL_TIMEOUT` まで。
-    fn kill_exec_cgroup(&self, record: &StateRecord, helper_pid: u32) -> bool {
+    fn kill_exec_cgroup(&self, record: Option<&StateRecord>, helper_pid: u32) -> bool {
         let Ok(name) = ExecCgroupName::new(&format!("exec-{helper_pid}-0")) else {
             return false;
         };
-        let Some(placement) = record.cgroup() else {
+        let Some(placement) = record.and_then(StateRecord::cgroup) else {
             return false;
         };
         remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT).is_ok()
@@ -664,9 +709,31 @@ impl ExecHealthProbe {
                 )),
             );
         }
-        let record = match self.resolve_record() {
-            Ok(r) => r,
-            Err(e) => return finish(report, Err(e)),
+        // 配置の取得は後段の best-effort な cgroup 後始末にしか要らないため、読めなくても probe は続ける
+        // （後始末が要るときは `cgroup_stop_failed` として残余扱い）。取得は別スレッドで残り予算内に限り待ち、
+        // 待つ間も cancel と期限を確かめる。期限切れ・cancel の後は helper を起動しない（REPAIR-5）。
+        let record = match self.resolve_record_bounded(deadline) {
+            Ok(record) => record,
+            Err(PreSpawn::Timeout) => {
+                report.outcome = HealthExecOutcome::Timeout;
+                return finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "healthcheck probe timed out",
+                    )),
+                );
+            }
+            Err(PreSpawn::Cancelled) => {
+                report.outcome = HealthExecOutcome::Cancelled;
+                return finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "healthcheck probe was cancelled",
+                    )),
+                );
+            }
         };
         let pidfd = match self.target.pidfd.try_clone() {
             Ok(fd) => fd,
@@ -680,6 +747,26 @@ impl ExecHealthProbe {
                 );
             }
         };
+        if self.cancelled.load(Ordering::SeqCst) {
+            report.outcome = HealthExecOutcome::Cancelled;
+            return finish(
+                report,
+                Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "healthcheck probe was cancelled",
+                )),
+            );
+        }
+        if Instant::now() >= deadline {
+            report.outcome = HealthExecOutcome::Timeout;
+            return finish(
+                report,
+                Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "healthcheck probe timed out",
+                )),
+            );
+        }
         let mut child = match self.spawn_helper(
             &helper_args,
             pidfd,
@@ -764,7 +851,9 @@ impl ExecHealthProbe {
         let mut reaped = matches!(ended, Ended::Exited(_));
         // helper が SIGKILL・OOM 等で異常終了したときは結果行を残せず、exec 子 cgroup の後始末が走っていない
         // 可能性があるため、正常終了以外は所有を確認した cgroup を止める（SUP-4・SUP-6）。
-        if matches!(ended, Ended::Exited(false)) && !self.kill_exec_cgroup(&record, child.id()) {
+        if matches!(ended, Ended::Exited(false))
+            && !self.kill_exec_cgroup(record.as_ref(), child.id())
+        {
             cgroup_stop_failed = true;
         }
         if !reaped {
@@ -773,7 +862,7 @@ impl ExecHealthProbe {
             // helper だけの SIGKILL では worker とコマンドの子孫が残り得る（親死亡シグナルはコマンドが解除でき、
             // fork した子孫へ継承されない）ため、supervisor 側から exec 子 cgroup を `cgroup.kill` する
             // （SUP-4・SUP-6・REPAIR-5）。名前は helper の pid から導く。回収前の `Child` を持つ間は pid が再利用されない。
-            if !self.kill_exec_cgroup(&record, child.id()) {
+            if !self.kill_exec_cgroup(record.as_ref(), child.id()) {
                 cgroup_stop_failed = true;
             }
             let reap_deadline = Instant::now() + REAP_TIMEOUT;
@@ -839,7 +928,18 @@ impl ExecHealthProbe {
                     )),
                 )
             }
-            Ended::Exited(_) => {
+            Ended::Exited(false) => {
+                // 結果行が残っていても、helper が異常終了したなら採用しない。
+                report.outcome = HealthExecOutcome::HelperError;
+                finish(
+                    report,
+                    Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "the healthcheck exec helper exited abnormally",
+                    )),
+                )
+            }
+            Ended::Exited(true) => {
                 let parsed = parse_result_stream(&results);
                 report.diag_forwarded = parsed.forwarded;
                 report.diag_dropped = parsed.dropped;

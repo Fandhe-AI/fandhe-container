@@ -1,6 +1,6 @@
 //! `healthy` 条件の state.json ポーリング待機（STACK-2・TASK-150.3・#591）。
 //!
-//! 呼び出し元は `up`（TASK-155）の予定で、[`StartupStep`] の `healthy` 条件の依存先を
+//! 呼び出し元は `cli::up`（TASK-155.1・#618）で、[`StartupStep`] の `healthy` 条件の依存先を
 //! 期限つきで待ち、すべて healthy になったときだけ依存元の起動を許可する。supervisor
 //! （SUP-4・TASK-161）が state.json の `health` へ書く値（`starting` / `healthy` /
 //! `unhealthy`。core の `HealthStatus::as_str`）を [`HealthSource`] 越しに観測する。
@@ -174,11 +174,21 @@ impl fmt::Display for HealthyWaitPolicyError {
 
 impl std::error::Error for HealthyWaitPolicyError {}
 
-/// ポーリング間隔と全体の期限（既定の期限は持たない。決めるのは `up`（TASK-155））。
+/// ポーリング間隔と全体の期限（`Default` は `cli::up` 用の暫定値。spec は数値を固定していない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthyWaitPolicy {
     poll_interval: Duration,
     timeout: Duration,
+}
+
+impl Default for HealthyWaitPolicy {
+    /// 暫定値（間隔 500ms・期限 15s。`WaitPolicy` の既定の期限に合わせる）。
+    fn default() -> Self {
+        Self {
+            poll_interval: Self::DEFAULT_POLL_INTERVAL,
+            timeout: Duration::from_secs(15),
+        }
+    }
 }
 
 impl HealthyWaitPolicy {
@@ -362,7 +372,7 @@ impl HealthyGate {
 
 /// [`gate_healthy_dependencies`] の結果をエラー化して返す（STACK-2・TASK-150.4・#592）。
 ///
-/// 呼び出し元は `up`（TASK-155）。`Err` が返ったら依存元を起動せず、
+/// 呼び出し元は `cli::up`（TASK-155.1・#618）。`Err` が返ったら依存元を起動せず、
 /// [`DependencyWaitError::exit_code`] の非ゼロ終了コードで止める（期限切れは 7、観測失敗は 1）。
 /// source の失敗は `DependencyWaitError::Observe` に写す（読めない状態を healthy とみなさない）。
 /// 待ちの有界性は `policy`（ステップ共通の期限）が保証する（REPAIR-5）。

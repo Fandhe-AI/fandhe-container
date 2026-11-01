@@ -1,16 +1,17 @@
 //! `depends_on` のトポロジカルソートと循環検出（STACK-2・TASK-150.1・#589）。
 //!
 //! サービス定義の map から起動順の計画（[`StartupPlan`]）を作る純関数だけを持つ。
-//! 呼び出し元は `up`（TASK-155）の予定で、profiles で絞った map（STACK-10・TASK-187）も渡せるよう
+//! 呼び出し元は `cli::up`（TASK-155.1・#618）で、profiles で絞った map（STACK-10・TASK-187）も渡せるよう
 //! `ComposeToml` ではなく `BTreeMap<String, Service>` を受ける。循環と未定義の依存先は
 //! 計画を返さずエラーにする（起動前に止める。fail-closed）。
 //!
 //! 本モジュールは各依存先の条件を [`DependencyWait`] として計画に残すだけで、待たない。
 //! `started` の待機は `wait` サブモジュール（#590）、`healthy` のポーリング待機は
-//! `healthy_wait`（#591）にあり、state.json の読み取りは `up`（TASK-155）が `HealthSource` で注入する。
+//! `healthy_wait`（#591）にあり、state.json の読み取りは `cli::up`（TASK-155）が `HealthSource` で注入する。
 //! healthy 未達のタイムアウトは `require_healthy_dependencies`（#592）が `wait` の
 //! `WaitTimeout`（非ゼロ終了コードつき）へ写す。
-//! 未実装（実装済みを装わない。REPAIR-3）: `completed` の待機、`wait_for_step` への healthy の統合。
+//! `wait_for_step` への healthy の統合は `cli::up` が条件ごとに絞って呼ぶ形で済み（#618）。
+//! 未実装（実装済みを装わない。REPAIR-3）: `completed` の待機（`up` が起動前に未対応として止める）。
 //!
 //! 決定性: `BTreeMap` のキー順で DFS を始め、依存先もキー順にたどる。結果は「依存先が先、
 //! 互いに独立なものは名前順の DFS 後行順」で、同じ入力なら常に同じ出力になる。
@@ -68,6 +69,22 @@ impl StartupStep {
     /// 起動前の待ち条件（依存先名の昇順）。
     pub fn waits(&self) -> &[DependencyWait] {
         &self.waits
+    }
+
+    /// `condition` の待ちだけを残した複製（依存先名の昇順は保つ）。
+    ///
+    /// `up`（`cli::up`・TASK-155.1）が healthy と started の混在ステップを、条件ごとの待機関数へ
+    /// 渡すために使う（`wait_for_step` は started 以外を未対応として拒否するため）。
+    pub fn retain_condition(&self, condition: DependsOnCondition) -> StartupStep {
+        StartupStep {
+            service: self.service.clone(),
+            waits: self
+                .waits
+                .iter()
+                .filter(|w| w.condition == condition)
+                .cloned()
+                .collect(),
+        }
     }
 }
 
@@ -240,6 +257,26 @@ mod tests {
 
     fn names(plan: &StartupPlan) -> Vec<&str> {
         plan.service_names().collect()
+    }
+
+    /// STACK-8・TASK-155.1: retain_condition は指定条件だけを昇順のまま残す。
+    #[test]
+    fn stack_8_retain_condition_keeps_only_that_condition() {
+        let m = svcs(&[
+            ("a", &[]),
+            ("b", &[]),
+            ("c", &[]),
+            ("app", &[("c", Started), ("a", Healthy), ("b", Started)]),
+        ]);
+        let plan = plan_startup(&m).unwrap();
+        let step = plan.steps().last().unwrap();
+        let started = step.retain_condition(Started);
+        let deps: Vec<&str> = started.waits().iter().map(|w| w.service()).collect();
+        assert_eq!(deps, vec!["b", "c"]);
+        assert_eq!(started.service(), "app");
+        let healthy = step.retain_condition(Healthy);
+        assert_eq!(healthy.waits().len(), 1);
+        assert!(step.retain_condition(Completed).waits().is_empty());
     }
 
     /// STACK-2・TASK-150.1: 空の map は空の計画。

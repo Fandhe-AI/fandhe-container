@@ -38,7 +38,9 @@ use std::time::Duration;
 
 use fandhe_container_core::audit_log::AuditedRejection;
 use fandhe_container_core::exec::ExecExit;
-use fandhe_container_core::traits::{ContainerId, ContainerState, GetStateRequest, TraitError};
+use fandhe_container_core::traits::{
+    ContainerId, ContainerState, ErrorCode, GetStateRequest, TraitError,
+};
 
 use super::exec_wire::{AuditToken, HealthExecLine};
 use crate::exec::{AuditedOutcome, ExecRequest};
@@ -278,11 +280,17 @@ where
 {
     // 継承 fd の整理が最初。fd 0〜2 は supervisor の `Command` が置いたものだけを使う。
     let _ = crate::sys::close_fds_from(3);
-    // 失敗しても続けるが、コンテナ側から見える窓を減らすため dumpable は落とす（`run_main` と同じ）。
-    let _ = crate::sys::set_dumpable(false);
-    let line = match HealthExecArgs::parse(args) {
-        Ok(args) => execute(&args),
-        Err(_) => HealthExecLine::Invalid,
+    // dumpable を落とせないまま特権操作へ進まない（fail-closed。`start_entry::run_main_inner` と同じ。SEC-1）。
+    let line = if crate::sys::set_dumpable(false).is_err() {
+        HealthExecLine::Failed {
+            code: ErrorCode::Internal,
+            audit: AuditToken::Na,
+        }
+    } else {
+        match HealthExecArgs::parse(args) {
+            Ok(args) => execute(&args),
+            Err(_) => HealthExecLine::Invalid,
+        }
     };
     let mut err = std::io::stderr();
     match err.write_all(&line.encode()).and_then(|()| err.flush()) {

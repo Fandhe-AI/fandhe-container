@@ -12,7 +12,7 @@
 //! # 結線の範囲（REPAIR-3）
 //! 本モジュールは判定の実装まで。monitor / supervisor 入口への `run_periodic` の結線、restart の quiesce の参加者への
 //! 登録、restart での付け替え（アダプタは 1 起動世代につき 1 つ作り、restart で作り直す前提）は #2953 が担う。
-//! argv[0] の PATH 解決と timeout 上限の見直しは #2439（オーナー判断待ち）で、それまでは argv[0] を絶対パスに限り、
+//! `argv[0]` の PATH 解決と timeout 上限の見直しは #2439（オーナー判断待ち）で、それまでは `argv[0]` を絶対パスに限り、
 //! 60 秒超の timeout は既存の拒否のまま。
 //!
 //! # 出力の扱い（stdout / stderr）
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::exec::{ExecCgroupName, remove_exec_child_cgroup};
 use fandhe_container_core::oci_runtime::LaunchedProcess;
 use fandhe_container_core::traits::{
-    ContainerId, ErrorCode, GetStateRequest, HealthStatus, TraitError,
+    ContainerId, ErrorCode, GetStateRequest, HealthStatus, StateRecord, TraitError,
 };
 
 use super::HealthcheckDefinition;
@@ -175,6 +175,8 @@ pub struct HealthExecReport {
     pub elapsed: Duration,
     /// helper を回収できたか（`false` は zombie が残っている）。
     pub helper_reaped: bool,
+    /// 強制停止が必要だった exec 子 cgroup の停止に失敗したか（`true` は子孫が残り得る。次回の掃除が回収する）。
+    pub cgroup_stop_failed: bool,
     /// stderr sink へ転送した helper の診断行数。
     pub diag_forwarded: u32,
     /// 捨てた診断行・不正な行の数。
@@ -266,11 +268,12 @@ pub fn log_line(container: &ContainerId, report: &HealthExecReport) -> String {
         Some(HealthExecLine::Stale) | Some(HealthExecLine::Invalid) | None => {}
     }
     line.push_str(&format!(
-        ",\"output_bytes\":{},\"output_truncated\":{},\"elapsed_ms\":{},\"helper_reaped\":{},\"diag_forwarded\":{},\"diag_dropped\":{}}}\n",
+        ",\"output_bytes\":{},\"output_truncated\":{},\"elapsed_ms\":{},\"helper_reaped\":{},\"cgroup_stop_failed\":{},\"diag_forwarded\":{},\"diag_dropped\":{}}}\n",
         report.output_total_bytes,
         report.output_truncated,
         report.elapsed.as_millis(),
         report.helper_reaped,
+        report.cgroup_stop_failed,
         report.diag_forwarded,
         report.diag_dropped
     ));
@@ -508,7 +511,7 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl ExecHealthProbe {
-    /// 検証済みの定義と対象から作る。argv[0] が絶対パスでなければ `InvalidArgument`（PATH 探索はしない。#2439 の
+    /// 検証済みの定義と対象から作る。`argv[0]` が絶対パスでなければ `InvalidArgument`（PATH 探索はしない。#2439 の
     /// 判断まで現行の拒否を保つ）。メッセージは固定で、コマンドの中身を出さない。
     pub fn new(
         definition: &HealthcheckDefinition,
@@ -568,24 +571,35 @@ impl ExecHealthProbe {
         command.spawn()
     }
 
-    /// 強制終了した helper が作った exec 子 cgroup（`exec-<helper pid>-0`。fresh な単一プロセスの最初の
-    /// `ExecCgroupName::unique()`）を、記録から導いたコンテナ cgroup 直下で `cgroup.kill` して削除する。
-    /// 失敗は無視する（残った cgroup は次回の掃除と delete 前の掃除が回収する）。待機は `CGROUP_KILL_TIMEOUT` まで。
-    fn kill_exec_cgroup(&self, helper_pid: u32) {
+    /// 起動前に記録からコンテナ cgroup の配置を取り出して保持する（強制停止で状態ストアを再取得しないため。
+    /// ロック競合で停止が省かれたり 1 秒の後始末上限を超えたりしない。SUP-6・REPAIR-5）。
+    fn resolve_record(&self) -> Result<StateRecord, TraitError> {
+        let unavailable = || {
+            TraitError::new(
+                ErrorCode::Unavailable,
+                "failed to resolve the container cgroup for the healthcheck",
+            )
+        };
+        let store = crate::state::open_default_store(Some(self.target.state_root.clone()))
+            .map_err(|_| unavailable())?;
+        let record = store
+            .get(&GetStateRequest::new(self.target.id.clone()))
+            .map_err(|_| unavailable())?;
+        Ok(record)
+    }
+
+    /// helper が作った exec 子 cgroup（`exec-<helper pid>-0`。fresh な単一プロセスの最初の
+    /// `ExecCgroupName::unique()`）を、起動前に保持した配置の直下で `cgroup.kill` して削除する。
+    /// 状態ストアは読まない。失敗は `false` で返す（残った cgroup は次回の掃除と delete 前の掃除が回収する）。
+    /// 待機は `CGROUP_KILL_TIMEOUT` まで。
+    fn kill_exec_cgroup(&self, record: &StateRecord, helper_pid: u32) -> bool {
         let Ok(name) = ExecCgroupName::new(&format!("exec-{helper_pid}-0")) else {
-            return;
-        };
-        let Ok(store) = crate::state::open_default_store(Some(self.target.state_root.clone()))
-        else {
-            return;
-        };
-        let Ok(record) = store.get(&GetStateRequest::new(self.target.id.clone())) else {
-            return;
+            return false;
         };
         let Some(placement) = record.cgroup() else {
-            return;
+            return false;
         };
-        let _ = remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT);
+        remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT).is_ok()
     }
 
     fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
@@ -599,6 +613,7 @@ impl ExecHealthProbe {
             output_truncated: false,
             elapsed: Duration::ZERO,
             helper_reaped: true,
+            cgroup_stop_failed: false,
             diag_forwarded: 0,
             diag_dropped: 0,
         };
@@ -649,6 +664,10 @@ impl ExecHealthProbe {
                 )),
             );
         }
+        let record = match self.resolve_record() {
+            Ok(r) => r,
+            Err(e) => return finish(report, Err(e)),
+        };
         let pidfd = match self.target.pidfd.try_clone() {
             Ok(fd) => fd,
             Err(_) => {
@@ -712,7 +731,8 @@ impl ExecHealthProbe {
         };
 
         enum Ended {
-            Exited,
+            /// 値は helper の終了が正常（終了コード 0）だったか。
+            Exited(bool),
             Timeout,
             Cancelled,
             WaitFailed,
@@ -727,7 +747,7 @@ impl ExecHealthProbe {
                 &mut res_parent,
             );
             match child.try_wait() {
-                Ok(Some(_)) => break Ended::Exited,
+                Ok(Some(status)) => break Ended::Exited(status.success()),
                 Ok(None) => {}
                 Err(_) => break Ended::WaitFailed,
             }
@@ -740,14 +760,22 @@ impl ExecHealthProbe {
             std::thread::sleep(POLL_STEP);
         };
 
-        let mut reaped = matches!(ended, Ended::Exited);
+        let mut cgroup_stop_failed = false;
+        let mut reaped = matches!(ended, Ended::Exited(_));
+        // helper が SIGKILL・OOM 等で異常終了したときは結果行を残せず、exec 子 cgroup の後始末が走っていない
+        // 可能性があるため、正常終了以外は所有を確認した cgroup を止める（SUP-4・SUP-6）。
+        if matches!(ended, Ended::Exited(false)) && !self.kill_exec_cgroup(&record, child.id()) {
+            cgroup_stop_failed = true;
+        }
         if !reaped {
             // 回収前の `Child` でだけ kill する（pid 再利用を避ける）。
             let _ = child.kill();
             // helper だけの SIGKILL では worker とコマンドの子孫が残り得る（親死亡シグナルはコマンドが解除でき、
             // fork した子孫へ継承されない）ため、supervisor 側から exec 子 cgroup を `cgroup.kill` する
             // （SUP-4・SUP-6・REPAIR-5）。名前は helper の pid から導く。回収前の `Child` を持つ間は pid が再利用されない。
-            self.kill_exec_cgroup(child.id());
+            if !self.kill_exec_cgroup(&record, child.id()) {
+                cgroup_stop_failed = true;
+            }
             let reap_deadline = Instant::now() + REAP_TIMEOUT;
             while Instant::now() < reap_deadline {
                 if matches!(child.try_wait(), Ok(Some(_))) {
@@ -775,6 +803,7 @@ impl ExecHealthProbe {
         }
 
         report.helper_reaped = reaped;
+        report.cgroup_stop_failed = cgroup_stop_failed;
         report.output = output.kept;
         report.output_total_bytes = output.total;
         report.output_truncated = output.truncated;
@@ -810,7 +839,7 @@ impl ExecHealthProbe {
                     )),
                 )
             }
-            Ended::Exited => {
+            Ended::Exited(_) => {
                 let parsed = parse_result_stream(&results);
                 report.diag_forwarded = parsed.forwarded;
                 report.diag_dropped = parsed.dropped;
@@ -1031,6 +1060,7 @@ mod tests {
             output_truncated: true,
             elapsed: Duration::from_millis(42),
             helper_reaped: true,
+            cgroup_stop_failed: false,
             diag_forwarded: 1,
             diag_dropped: 2,
         }
@@ -1044,7 +1074,7 @@ mod tests {
         let line = log_line(&id, &report(secret));
         assert_eq!(
             line,
-            "{\"component\":\"supervisor.healthcheck\",\"operation\":\"healthcheck_exec\",\"container\":\"web1\",\"result\":\"healthy\",\"exit_code\":0,\"audit\":\"na\",\"exit_audit\":\"na\",\"output_bytes\":12345,\"output_truncated\":true,\"elapsed_ms\":42,\"helper_reaped\":true,\"diag_forwarded\":1,\"diag_dropped\":2}\n"
+            "{\"component\":\"supervisor.healthcheck\",\"operation\":\"healthcheck_exec\",\"container\":\"web1\",\"result\":\"healthy\",\"exit_code\":0,\"audit\":\"na\",\"exit_audit\":\"na\",\"output_bytes\":12345,\"output_truncated\":true,\"elapsed_ms\":42,\"helper_reaped\":true,\"cgroup_stop_failed\":false,\"diag_forwarded\":1,\"diag_dropped\":2}\n"
         );
         assert!(!line.contains("SECRET"));
     }

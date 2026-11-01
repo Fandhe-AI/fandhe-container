@@ -13,9 +13,10 @@
 //!   リーダー数は予算が上限管理する）。新しい捕捉を先にするのは、restart のレイテンシに drain の待ちを載せないため。
 //! - 読み取りスレッドを作るのは `oci_runtime::start` の完了後に限る（start は単一スレッド前提で、入口スレッドが手順 8 を
 //!   直接行う。start_entry 参照）。再起動の launch の直前には [`CaptureHub::quiesce`] で直前の捕捉を畳み、捕捉スレッドを
-//!   0 にしてから launch する（core の fork 経路が `Threads: 1` を要求するため）。ただし `relaunch_bounded` の実行
-//!   スレッドや `stderr_sink` の常駐スレッドが別途存在するため、quiesce だけでは本番 launcher の要求を満たせず、
-//!   再 launch は拒否される（fail-closed）。再 launch を呼び出しスレッドで直接行う再構成は #2043（SUP-3・CORE-1）。
+//!   0 にしてから launch する（core の fork 経路が `Threads: 1` を要求するため）。本番 launcher
+//!   （`SelfBounded`）の再 launch は `fandhe-relaunch` スレッドを作らず監視ループのスレッドで直接行い、`stderr_sink` の専用
+//!   スレッドと制御チャネルの accept スレッドも別途止める（`LauncherRelauncher::with_single_thread_launch`・
+//!   `ControlledRelauncher::with_pause`。#2043・SUP-3・CORE-1）。
 //! - 捕捉を開始できなかったときは `Err` を返す。読み取り側を破棄するとコンテナは次の `write` で SIGPIPE を受けるため、
 //!   呼び出し側は fail-closed（起動・再起動を失敗として扱いプロセスを回収する）にする。ログ喪失を黙って許さない（REPAIR-4）。
 //! - 出力は非信頼バイト列として不透明に扱い、supervisor 自身のログへ行内容を出さない。
@@ -116,6 +117,12 @@ impl CaptureHub {
     /// 捕捉スレッドが生きたまま launch すると `MultiThreaded` で拒否される。旧プロセスは回収済みで EOF が即座に届くはず。
     /// 期限切れの場合は `drain` が自動で取り消す（孫がパイプを保持している場合のスレッド残存は予算が上限管理する）。
     pub fn quiesce(&self) {
+        self.quiesce_within(PREVIOUS_DRAIN_TIMEOUT);
+    }
+
+    /// [`Self::quiesce`] の待ちを `limit`（と `PREVIOUS_DRAIN_TIMEOUT` の小さい方）に切り詰める版。
+    /// 再 launch の全体期限の残りを渡すために使う（`limit` が 0 なら EOF を待たず即座に取り消す。REPAIR-5・SUP-3）。
+    pub fn quiesce_within(&self, limit: Duration) {
         let previous = self
             .live
             .lock()
@@ -124,7 +131,7 @@ impl CaptureHub {
         if let Some(previous) = previous {
             report_drain(
                 "log_capture_previous_drain_failed",
-                &previous.drain(PREVIOUS_DRAIN_TIMEOUT),
+                &previous.drain(limit.min(PREVIOUS_DRAIN_TIMEOUT)),
             );
         }
     }

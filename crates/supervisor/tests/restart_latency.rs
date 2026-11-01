@@ -292,4 +292,84 @@ mod linux {
             "restart latency median {median:?} exceeds {TARGET_MEDIAN:?}"
         );
     }
+
+    /// CORE-2・SUP-3・SUP-6(#2238): 記録を持たない再 launch(`Respawn` は `launch_isolation` が既定の `None`)の
+    /// restart は、実 `state.json` から前回の launch 時の分離の記録を消す(契約 12 の `Clear`)。
+    /// 続く `Stopped` の記録(Inherit)でも復活しない。
+    #[test]
+    fn core2_sup6_2238_restart_without_record_clears_launch_isolation_in_state_json() {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let tmp = TmpRoot::new("clear-iso");
+        let root = tmp.0.clone();
+        let id = ContainerId::new("c1").unwrap();
+        let landlock =
+            RecordedLandlock::new(0x3f, vec![RecordedRule::new(RecordedTarget::Root, 0x0f)])
+                .unwrap();
+        let before = LaunchIsolationRecord::from_parts(RootIdentity::new(5, 77), landlock);
+
+        let store: Arc<dyn StateStore> = open_default_store(Some(root.clone())).unwrap();
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            std::env::temp_dir().join("fandhe-sup-clear-iso-bundle"),
+        )
+        .unwrap()
+        .with_launch_isolation(before.clone());
+        store.create(&req).unwrap();
+
+        let first = spawn_failing_container().unwrap();
+        let first_pid = first.pid();
+        let mut state = SupervisedState::attach(store, id.clone()).unwrap();
+        state
+            .write(
+                ContainerStatus::running(id.clone(), Some(first_pid)),
+                SupervisionState::new(None, None, 0),
+            )
+            .unwrap();
+        assert_eq!(state.record().launch_isolation(), Some(&before));
+
+        let restart_cfg = RestartConfig::new("on-failure:1".parse().unwrap())
+            .with_backoff(Duration::ZERO)
+            .unwrap();
+        let monitor_cfg = MonitorConfig::new(Duration::from_millis(20)).unwrap();
+        let probe = Probe {
+            root: root.clone(),
+            id: id.clone(),
+            seen: Mutex::new(Vec::new()),
+            latencies: Mutex::new(Vec::new()),
+            failures: Mutex::new(Vec::new()),
+        };
+        let stop = StopToken::new();
+        let outcome = supervise_with_restart(
+            &mut state,
+            Box::new(first),
+            &(Arc::new(Respawn) as Arc<dyn Relauncher>),
+            &monitor_cfg,
+            &restart_cfg,
+            &stop,
+            &probe,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            SuperviseOutcome::Finished {
+                reason: NoRestartReason::RetriesExhausted,
+                restarts: 1,
+                ..
+            }
+        ));
+
+        let store = open_default_store(Some(root.clone())).unwrap();
+        let fin = SupervisedState::attach(store, id).unwrap();
+        let rec = fin.record();
+        assert_eq!(rec.restart_count(), 1);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(rec.launch_isolation(), None);
+        let json = fs::read_to_string(root.join("c1").join("state.json")).unwrap();
+        assert!(
+            !json.contains("\"launchIsolation\":{"),
+            "state.json still has the record: {json}"
+        );
+    }
 }

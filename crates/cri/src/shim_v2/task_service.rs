@@ -346,6 +346,16 @@ mod tests {
         (s.code, s.message)
     }
 
+    /// 試験用の絶対パス。`Path::is_absolute` は Windows では `/b` を偽とするため、
+    /// Windows では `C:` を前置して区切りを `\` にし、3 OS で絶対パスにする（CRI-5）。
+    fn abs(unix_style: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix_style.replace('/', "\\"))
+        } else {
+            unix_style.to_string()
+        }
+    }
+
     const INVALID: i32 = 3;
     const NOT_FOUND: i32 = 5;
     const EXISTS: i32 = 6;
@@ -364,13 +374,18 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let out = s.handle("Create", &create_req("c1", "/run/b1")).unwrap();
+            let out = s
+                .handle("Create", &create_req("c1", &abs("/run/b1")))
+                .unwrap();
             assert_eq!(CreateTaskResponse::decode(&out[..]).unwrap().pid, 100);
             let out = s.handle("Start", &start_req("c1")).unwrap();
             assert_eq!(StartResponse::decode(&out[..]).unwrap().pid, 4242);
             assert_eq!(
                 *f.calls.lock().unwrap(),
-                vec!["create c1 /run/b1".to_string(), "start c1".to_string()]
+                vec![
+                    format!("create c1 {}", abs("/run/b1")),
+                    "start c1".to_string()
+                ]
             );
         }
     }
@@ -379,7 +394,7 @@ mod tests {
     #[test]
     fn cri5_create_pid_none_is_zero() {
         let (s, _) = svc(TaskApiVersion::V2, Fake::default());
-        let out = s.handle("Create", &create_req("c1", "/b")).unwrap();
+        let out = s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         assert_eq!(CreateTaskResponse::decode(&out[..]).unwrap().pid, 0);
     }
 
@@ -387,9 +402,9 @@ mod tests {
     #[test]
     fn cri5_runtime_errors_map_to_err3() {
         let (s, _) = svc(TaskApiVersion::V2, Fake::default());
-        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         assert_eq!(
-            err_code(s.handle("Create", &create_req("c1", "/b"))).0,
+            err_code(s.handle("Create", &create_req("c1", &abs("/b")))).0,
             EXISTS
         );
         assert_eq!(err_code(s.handle("Start", &start_req("nope"))).0, NOT_FOUND);
@@ -401,13 +416,14 @@ mod tests {
     #[test]
     fn cri5_invalid_inputs() {
         let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        let (b, dotdot, nul) = (abs("/b"), abs("/a/../b"), abs("/a\0b"));
         for (id, b) in [
-            ("", "/b"),
-            ("bad id!", "/b"),
+            ("", b.as_str()),
+            ("bad id!", b.as_str()),
             ("c1", ""),
             ("c1", "relative/path"),
-            ("c1", "/a/../b"),
-            ("c1", "/a\0b"),
+            ("c1", dotdot.as_str()),
+            ("c1", nul.as_str()),
         ] {
             assert_eq!(
                 err_code(s.handle("Create", &create_req(id, b))).0,
@@ -415,7 +431,7 @@ mod tests {
                 "{id:?} {b:?}"
             );
         }
-        let long = format!("/{}", "a".repeat(BUNDLE_MAX_LEN));
+        let long = abs(&format!("/{}", "a".repeat(BUNDLE_MAX_LEN)));
         assert_eq!(
             err_code(s.handle("Create", &create_req("c1", &long))).0,
             INVALID
@@ -432,7 +448,7 @@ mod tests {
         let (s, f) = svc(TaskApiVersion::V2, Fake::default());
         let base = || CreateTaskRequest {
             id: "c1".into(),
-            bundle: "/b".into(),
+            bundle: abs("/b"),
             ..Default::default()
         };
         let mut cases: Vec<(CreateTaskRequest, &str)> = Vec::new();
@@ -462,7 +478,7 @@ mod tests {
             assert_eq!((code, msg.as_str()), (UNIMPL, m));
         }
         // options（番号 10）は型に持たないので手で組む。
-        let mut raw = create_req("c1", "/b");
+        let mut raw = create_req("c1", &abs("/b"));
         raw.extend_from_slice(&[0x52, 0x00]);
         let (code, msg) = err_code(s.handle("Create", &raw));
         assert_eq!((code, msg.as_str()), (UNIMPL, "options are not supported"));
@@ -495,7 +511,7 @@ mod tests {
             },
         );
         assert_eq!(
-            err_code(s.handle("Create", &create_req("c1", "/b"))).0,
+            err_code(s.handle("Create", &create_req("c1", &abs("/b")))).0,
             INTERNAL
         );
     }

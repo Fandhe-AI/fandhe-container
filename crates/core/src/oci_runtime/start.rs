@@ -120,7 +120,7 @@
 //! pid で Running へ遷移するところまでが本関数の責務である。本番の [`ProcessLauncher`]
 //! （`ProductionLauncher`。Linux。#1816）は実装済みで、制限ステージ（TASK-37〜39）を通した実プロセスの
 //! 起動は `tests/production_launcher.rs`（#1818。実機前提）で通している。supervisor の start 経路は呼び出しスレッドでの
-//! 直接 launch へ再構成済み（#1819）。restart の再 launch は未対応（#2043。REPAIR-3）。
+//! 直接 launch へ再構成済み（#1819）。restart の再 launch は supervisor が呼び出しスレッドで直接行う（#2043）。
 //!
 //! エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や OS 依存の I/O エラー
 //! 文字列を含めない。
@@ -686,8 +686,9 @@ fn launch_inner(
 
     let running = ContainerStatus::running(id.clone(), Some(process.pid()));
     // launch が確定した分離の記録は Running の記録と同じ 1 回の update で書く(exec の根拠。SUP-6・CORE-5・#2007)。
-    // 記録を持たない launcher(偽の実装・Linux 以外)では付けず、前の値が引き継がれる(契約 12)。本番 launcher は
-    // 記録を作れなければ launch 自体が失敗するため、ここへ記録なしの Running は届かない。
+    // 記録を持たない launcher(偽の実装・Linux 以外)では付けず Inherit のままにする(契約 12)。start は Created からの
+    // 初回 launch で引き継ぐ前の値は常に None のため、消去と等価。restart の再 launch は Clear を使う(#2238)。
+    // 本番 launcher は記録を作れなければ launch 自体が失敗するため、ここへ記録なしの Running は届かない。
     let mut running_update = UpdateStateRequest::new(running, claimed.revision());
     if let Some(isolation) = process.launch_isolation() {
         running_update = running_update.with_launch_isolation(isolation.clone());
@@ -1502,8 +1503,8 @@ mod tests {
                 cur.bundle().to_path_buf(),
                 cur.revision().next()?,
             )?;
-            // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
-            if let Some(l) = req.launch_isolation().or(cur.launch_isolation()) {
+            // 契約 12: Replace は置き換え、Clear は消し、Inherit は既存の値を引き継ぐ。
+            if let Some(l) = req.launch_isolation_update().apply(cur.launch_isolation()) {
                 next = next.with_launch_isolation(l.clone());
             }
             if let Some(r) = req.rlimits().or(cur.rlimits()) {

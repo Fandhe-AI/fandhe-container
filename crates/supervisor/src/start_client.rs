@@ -86,7 +86,7 @@
 //!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告は supervisor のログへ残る。#2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
-//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は fail-closed（#2043）。実機での通し確認
+//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は #2043 で成立（常駐スレッドを止めて監視スレッドで直接 launch）。実機での通し確認
 //!   （委譲 cgroup の準備で拒否されないか）は未実施（#2062。`tests/supervisor_bin_real.rs` は実機前提）。
 //! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
 //!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。

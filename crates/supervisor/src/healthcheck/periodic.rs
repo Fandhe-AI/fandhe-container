@@ -1,16 +1,17 @@
 //! healthcheck の周期実行エンジン（TASK-161.2・#495・SUP-4・MS-9。関連: SUP-1・SUP-6・REPAIR-3・REPAIR-4・REPAIR-5）。
 //!
 //! 役割: [`super::HealthcheckDefinition`] の interval ごとに、1 回分の判定と記録 [`crate::health::probe_and_record`]
-//! を繰り返し呼ぶ。呼び出し元は専用スレッドで [`run_periodic`] を回す supervisor の入口（監視ループ
-//! `crate::run::monitor` の手順 3 への組み込みは未実装）。呼び出し先は `health` モジュール（判定・記録・降格）。
+//! を繰り返し呼ぶ。呼び出し元は専用スレッドで [`run_periodic`] を回す監視ループ
+//! （`crate::run::monitor_with_health` が `super::wiring` 経由で起動し、戻る前に止めて回収する。#2953）。呼び出し先は `health` モジュール（判定・記録・降格）。
 //!
 //! # 実装範囲の線引き（REPAIR-3）
 //! - 提供するもの: スケジュールの検証 [`HealthcheckSchedule`]、時計の注入口 [`HealthcheckClock`]、
 //!   ループ [`run_periodic`]、Linux 限定の exec 終了状態の写像 `health_from_exec_exit`。
-//! - **未実装**: exec（`exec::run_command_with_pidfd`、SUP-6）を呼ぶ [`crate::health::HealthProbe`] の実装。
-//!   理由は、(1) exec は fork 直前に単一スレッドを要求し、スレッドを持つ supervisor 本体からは必ず拒否される、
-//!   (2) argv[0] の絶対パス要求と PATH 解決の方針が未決、(3) 監査の記録先の配線が別 issue、(4) 出力の受け渡しが未実装。
-//!   実行基盤が未結線の間は [`crate::health::UnimplementedHealthProbe`] が `Unimplemented` を返し `Healthy` を装わない。
+//! - 本番の [`crate::health::HealthProbe`]（#2441）: `super::ExecHealthProbe`（Linux）。exec は fork 直前に単一スレッドを
+//!   要求するため、probe のたびに単一スレッドの exec 専用 helper プロセスを起動して実行する（判断記録は
+//!   `docs/design/healthcheck-exec-helper.md`）。argv[0] は絶対パスに限る（PATH 解決は #2439 の判断待ち）。
+//!   本ループと `ExecHealthProbe` の monitor / supervisor 入口への結線は #2953 で実装済み（`ExecHealthProbeFactory`）。
+//!   定義が無い経路・probe を作れない経路では `Healthy` を装わない（後者は `FailingProbe`）。
 //! - 提供するもの（TASK-161.3・#496）: retries 回連続失敗での unhealthy 遷移・start_period・開始時の `Starting` を、
 //!   [`super::HealthAggregator`] と `crate::health::probe_aggregate_and_record` で `state.json` の `health` へ反映する。
 //!   集約は probe の結果と記録の間（`ProbeRunner` の排他区間の内側）で行い、1 回の失敗が `Unhealthy` として

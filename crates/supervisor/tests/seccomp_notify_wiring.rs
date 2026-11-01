@@ -4,7 +4,7 @@
 //! `user_notif_probe_for_test`）を、起動と再起動の両方で `run_start` → `run_supervised` が受け取って応答ハブへ渡すこと、
 //! listener が届かないときは起動したプロセスを回収して非 0 で終わること（fail-closed）を具体値で照合する。
 //! launcher はテスト用のフェイク（本番 launcher が PID 1 から listener を渡す部分は core の `tests/production_launcher.rs`
-//! が照合する。再 launch が本番で成り立つかは #2043）。root 不要。Linux 限定。
+//! が照合する。再 launch の本番での成立は #2043 で、`supervisor_bin_real` のシナリオ C が照合する）。root 不要。Linux 限定。
 
 #![cfg(target_os = "linux")]
 

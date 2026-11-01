@@ -87,8 +87,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
-//!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
+//! - 標準入出力の受け渡しのうち、CLI の exec と stdin。healthcheck の出力取得は実装済み
+//!   （[`spawn_exec_command_with_stdio`]。stdout・stderr を呼び出し側が渡した 1 本の fd へ付け替える。#2441）。
+//!   [`spawn_exec_command`] の既定は launch と同じく `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ
+//!   渡さない。fail-closed）
 //! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定（launch の `process.cwd` は pivot 直後に適用済みだが、exec 経路は未対応 = REPAIR-3）。環境変数は
 //!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
 //!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
@@ -107,8 +109,8 @@ use super::seccomp_listener::{
     ExecListenerReceiver, ExecListenerSender, exec_listener_pair, exec_sender_from,
 };
 use super::{
-    ChildExit, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
-    IsolationStage,
+    ChildExit, ChildStdio, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit,
+    ExecReady, IsolationStage,
 };
 
 /// [`spawn_exec_command`] が fork した、稼働中コンテナ内のコマンドの子（SUP-6・TASK-163 追補・#1460）。
@@ -210,6 +212,22 @@ pub fn spawn_exec_command(
     command: &ExecCommand,
     cgroup: &ExecChildCgroup,
 ) -> Result<ExecChild, ExecError> {
+    spawn_exec_command_with_stdio(ready, command, cgroup, ChildStdio::none())
+}
+
+/// [`spawn_exec_command`] に、コマンドの stdout / stderr の付け替え先（[`ChildStdio`]）を足した入口
+/// （healthcheck の出力取得。SUP-4・SUP-6・#2441）。
+///
+/// `stdio` が [`ChildStdio::none`] なら [`spawn_exec_command`] と同じ（3 本とも `/dev/null`）。[`ChildStdio::from_output`]
+/// で作った指定なら、子は `close_range` の前に fd 1・2 を出力用 fd へ付け替え、fd 0 だけを `/dev/null` へ置換し、
+/// `SIGPIPE` を `SIG_IGN` にして exec する（読み手が閉じても `EPIPE` で済み、`SIGPIPE` では落ちない）。親（呼び出し側）が
+/// 持つ `stdio` の複製は fork 後にこの関数が閉じる。付け替えの失敗は段 `prepare_fds` の `SetupFailed` で報告する。
+pub fn spawn_exec_command_with_stdio(
+    ready: ExecReady,
+    command: &ExecCommand,
+    cgroup: &ExecChildCgroup,
+    stdio: ChildStdio,
+) -> Result<ExecChild, ExecError> {
     let entry = command.entrypoint();
     let ExecReadyParts {
         root,
@@ -249,7 +267,7 @@ pub fn spawn_exec_command(
                     report_exec_child_failure(&status_write, ExecChildStep::CgroupJoin, error_code);
                     code
                 }
-                Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy),
+                Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy, stdio),
             },
         },
         EXIT_SETUP_FAILED,

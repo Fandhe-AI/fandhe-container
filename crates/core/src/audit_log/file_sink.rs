@@ -39,9 +39,11 @@
 //!   （代替経路はストレージに触れず、ACK は [`KERNEL_AUDIT_ACK_TIMEOUT`] が上限）。D 状態で SIGKILL が
 //!   効かない子は PID を追跡して後続の呼び出しで回収し、未回収が上限に達したら fork せず代替経路へ進む
 //!   （スレッドではないので親の `Threads` は増えない）。未回収の子の追跡の `Mutex` が poison すると、以後
-//!   プロセスが終わるまで上限到達扱いになり、主経路・通知の子を fork しない（fail-closed）。非 Linux は隔離を
-//!   提供せず常に代替経路へ進む（CLI-1）
-//! - 子は `close_range(2)`（Linux 5.11 以降。exec の子と同じ前提）で fd 3 以上を閉じてから処理する（D 状態で
+//!   プロセスが終わるまで上限到達扱いになり、主経路・通知の子を fork しない（fail-closed）。Windows は隔離を
+//!   提供せず常に代替経路へ進む（CLI-1）。macOS は pidfd が無く、SIGCHLD が自動回収のプロセスでは主経路を試さず
+//!   代替経路へ進む（#2429。pid 再利用の窓を閉じるため）
+//! - 子は `close_range(2)`（Linux 5.11 以降。exec の子と同じ前提。macOS は `proc_pidinfo` で fd を列挙して閉じ、
+//!   再列挙で残りが無いことを確かめる）で fd 3 以上を閉じてから処理する（D 状態で
 //!   残った子が呼び出し側の `flock`・pipe の書き込み端を持ち続けない）。閉じられないカーネルでは処理せずに
 //!   終わり、主経路は `isolation_fds_not_closed` で代替経路へ、通知はスレッドでの出し直しへ進む。**限界
 //!   （REPAIR-3）**: Linux 5.11 未満では主経路は常に使われない（代替経路が成功すると通知も出ないため、ファイルは
@@ -88,20 +90,24 @@
 //! `/run` は tmpfs のため再起動を越える保持は保証しない。永続的な置き場所（`/var/log` 等）・ローテーション・
 //! 常時の二重記録（tee）は未実装。
 //!
-//! 非 Linux の記録先（#2247 の後も未達。SEC-4）: macOS は `FileStateStore::open` が通る（#2247）ため構築入口
-//! （`open_in_state_root`）は成功するが、記録は `SinkFailed` のままである。塞がっているのは主経路の隔離
-//! （`run_isolated` が非 Linux で常に失敗し `IsolationUnavailable` になる。fork を使う）・
-//! `file_writer.rs` の `open_checked`（非 Linux は `Unsupported`。macOS の fd 相対 open は #1864）・
-//! `kernel_audit.rs` の代替経路（非 Linux は `UnsupportedTransport`）の 3 か所。Windows は
-//! `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、
-//! 構築入口も fail-closed になる。
+//! 非 Linux の記録先（SEC-4）: macOS は #2247 で `FileStateStore::open` が通り、#2429 で主経路（`file_writer.rs` の
+//! `open_checked` の fd 相対 open と拡張 ACL の拒否、および本ファイルの `run_isolated` の macOS 版）が実装済みで、
+//! 主経路が成功すれば `AuditDelivery::Recorded` になる。macOS の `run_isolated` は pidfd・`close_range` が無いため、
+//! fork の前に SIGCHLD の自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）を拒否し（pid の再利用で別プロセスへ `kill` を送らない。
+//! 拒否時は `IsolationUnavailable` で代替経路へ進む）、子は継承 fd を `proc_pidinfo` の列挙で閉じて再列挙で確かめ、
+//! スレッド数も `proc_pidinfo` で数える（複数スレッドなら fork せず `MultiThreaded`）。macOS の代替経路
+//! （`kernel_audit.rs` は `UnsupportedTransport`）は未実装のため、主経路が失敗すれば記録は `SinkFailed` のままである
+//! （拒否の判定は覆らない。代替経路の方式は #2430 の案 N-L で未決定）。Windows は `FileStateStore::open` が
+//! `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、構築入口も fail-closed になる。
 //! Windows の主経路の隔離と非 Linux の代替経路の選択肢は `docs/design/audit-non-linux.md`（#2430・オーナー承認待ち）
 //! の判断資料にあり、方式は未決定である。
 //!
-//! `@audit.log` にはサイズ上限もローテーションも無い。entrypoint 層の理由（`stdio_null_not_null_device` 等）は
-//! コンテナの中身で引き起こせるため、定期 exec（healthcheck。TASK-161）を配線すると、コンテナ起点で tmpfs の
-//! `/run` が単調に増え得る。配線の前に、サイズ上限（超えたら代替経路へ回して件数を数える）か同じ理由の連続の
-//! 抑制を入れる（SEC-4・CORE-7・REPAIR-5）。
+//! `@audit.log` のサイズ上限（[`AUDIT_LOG_MAX_BYTES`]。16 MiB）は #2953 で入れた。entrypoint 層の理由
+//! （`stdio_null_not_null_device` 等）はコンテナの中身で引き起こせるため、定期 exec（healthcheck。TASK-161）を配線すると、
+//! コンテナ起点で tmpfs の `/run` が単調に増え得る。追記の直前に長さを見て、超えるなら書かずに `size_limit_exceeded`
+//! （主経路の失敗種別）で代替経路へ回す。超過は記録の失敗として通知されるため 1 件ずつ見える（SEC-4・CORE-7・REPAIR-5）。
+//! 同じ理由の連続の抑制とローテーションは未実装（REPAIR-3。helper が probe ごとの別プロセスで連続を判定できないため、
+//! 上限を採った）。
 
 use std::fmt;
 use std::io::Write;
@@ -111,7 +117,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::state_store::{FileStateStore, StateRoot};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::sys;
 use crate::traits::TraitError;
 
@@ -134,7 +140,7 @@ pub const NOTIFY_WAIT: Duration = Duration::from_millis(200);
 /// kill 後に子の回収を待つ上限。SIGKILL が効かない子（D 状態）は PID を [`pending`] に保持して諦める。
 const KILL_REAP_WAIT: Duration = Duration::from_secs(1);
 /// 子の終了を確認するポーリング間隔。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// 同時に未完了でいられる通知の出し直しスレッド数の上限（子で出せたと確認できなかったときの出し直し。
@@ -151,8 +157,8 @@ const NOTIFY_THREAD_EXIT_WAIT: Duration = Duration::from_millis(50);
 ///
 /// 内訳は、主経路（`PRIMARY_WRITE_TIMEOUT` の 8 秒＋kill 後の回収待ち 1 秒）＋代替経路の ACK
 /// （[`KERNEL_AUDIT_ACK_TIMEOUT`]）＋失敗通知（子の `NOTIFY_WAIT` の 200 ms＋kill 後の回収待ち 1 秒＋出し直し
-/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#2441）へ配線する
-/// ときは、`run_command` の `timeout` とは別にこの値が積み上がる。
+/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#2441・#2953 で
+/// 配線済み）では、`run_command` の `timeout` とは別にこの値が積み上がる。
 pub const RECORD_WAIT_LIMIT: Duration = PRIMARY_WRITE_TIMEOUT
     .saturating_add(KILL_REAP_WAIT)
     .saturating_add(KERNEL_AUDIT_ACK_TIMEOUT)
@@ -170,12 +176,12 @@ type PrimaryStep = Arc<dyn Fn(&Path, &AuditRecord) -> Result<(), AuditWriteError
 type NotifyOut = Arc<dyn Fn() -> Box<dyn Write> + Send + Sync>;
 
 /// 未回収の子（SIGKILL 後も回収できなかった D 状態等）を保持する上限。到達したら新規 fork を避ける。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const MAX_UNREAPED: usize = 4;
 
 /// 隔離した子プロセスの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 enum IsolatedOutcome {
     /// 子が終了コード付きで終了した。
     Exited(i32),
@@ -194,7 +200,7 @@ enum IsolatedOutcome {
 
 /// 隔離した子の 1 回分の実行結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct Isolated {
     outcome: IsolatedOutcome,
     /// 子が結果 pipe へ「開始」の印（[`START_TAG`]）を書いた。通知の子は出力先へ書き込む直前に書くため、
@@ -204,7 +210,7 @@ struct Isolated {
 
 impl Isolated {
     /// 子を作らなかった（fork しなかった・できなかった）結果。
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     fn not_run(outcome: IsolatedOutcome) -> Self {
         Self {
             outcome,
@@ -214,20 +220,20 @@ impl Isolated {
 }
 
 /// 結果 pipe の印: 子が「開始」を知らせた（通知の子では出力先へ書き込む直前。続く印は [`RESULT_TAG`]）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const START_TAG: u8 = b'S';
 /// 結果 pipe の印: 続く 1 バイトが子の終了コード（`_exit` の直前に 2 バイトを 1 回の write で書く）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const RESULT_TAG: u8 = b'R';
 /// 結果 pipe から読む上限（開始 1 バイト＋結果 2 バイト）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const RESULT_PIPE_MAX: usize = 3;
 
 /// 結果 pipe から読んだバイト列を解釈する。戻り値は `(開始の印があった, 終了コード)`。
 ///
 /// 子の書く順は「[`START_TAG`]（任意）→ [`RESULT_TAG`]＋コード」。未知の値が現れたらそこで読むのをやめ、それ以降の
 /// 結果は無いものとする（壊れた値から結果を作らない。終了 status へ退避する）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn decode_result_bytes(bytes: &[u8]) -> (bool, Option<i32>) {
     let mut started = false;
     let mut iter = bytes.iter();
@@ -247,20 +253,21 @@ fn decode_result_bytes(bytes: &[u8]) -> (bool, Option<i32>) {
 /// （`BundleLock`・状態ストアの `@lock` の `flock`、pipe の書き込み端等）を持ったまま I/O しない（fail-closed）。
 /// 0（成功）・2（panic）・10 以上（主経路の失敗種別）と重ならない。[`run_isolated`] が
 /// [`IsolatedOutcome::FdsNotClosed`] へ写す。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const CLOSE_FDS_FAILED_EXIT: i32 = 3;
 
 /// 回収できなかった子の追跡（Linux のみ）。後続の呼び出しで回収を再試行する。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod pending {
-    use super::{MAX_UNREAPED, sys};
-    use std::os::fd::{AsFd, OwnedFd};
+    use super::{ChildHandle, MAX_UNREAPED, sys};
     use std::sync::Mutex;
 
-    /// 未回収の子 1 件。`pidfd` は fork 直後に開いたもの（開けなければ `None`）。
+    /// 未回収の子 1 件。`handle` は fork 直後に開いたもの（Linux は pidfd。開けなければ `None`。macOS は無し）。
     struct Unreaped {
         pid: u32,
-        pidfd: Option<OwnedFd>,
+        // macOS では空の型で読む箇所が無い。
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        handle: ChildHandle,
     }
 
     static UNREAPED: Mutex<Vec<Unreaped>> = Mutex::new(Vec::new());
@@ -279,25 +286,68 @@ mod pending {
 
     /// 子がまだ回収されていなければ `true`。
     ///
-    /// pidfd があれば、それが読み取り可能（＝指すプロセスが終了済み）になるまで `waitpid` を呼ばない。終了前の
+    /// Linux: pidfd があれば、それが読み取り可能（＝指すプロセスが終了済み）になるまで `waitpid` を呼ばない。終了前の
     /// 子は pid が再利用されないため、終了を確認してからの `waitpid` は自分の子だけを対象にする。`SIGCHLD` が
     /// `SIG_IGN` で自動回収されていれば `ECHILD` になり、回収済みとして外す。pidfd が無い（開けなかった）子は
-    /// `waitpid(WNOHANG)` だけで判定する（`ECHILD` 等の失敗は回収済みとみなす）。
+    /// `waitpid(WNOHANG)` だけで判定する（`ECHILD` 等の失敗は回収済みとみなす）。macOS: pidfd が無く、`waitpid(WNOHANG)`
+    /// だけで判定する（fork の前に SIGCHLD の自動回収を拒否済みのため、未回収の子は回収されるまで pid を保持する）。
     fn still_unreaped(u: &Unreaped) -> bool {
-        if let Some(fd) = &u.pidfd
-            && matches!(sys::poll_readable(fd.as_fd(), 0), Ok(false))
+        #[cfg(target_os = "linux")]
         {
-            return true;
+            use std::os::fd::AsFd;
+            if let Some(fd) = &u.handle
+                && matches!(sys::poll_readable(fd.as_fd(), 0), Ok(false))
+            {
+                return true;
+            }
         }
         matches!(sys::wait_pid_nohang(u.pid), Ok(None))
     }
 
     /// 回収できなかった子を追跡に加える（poison 時は加えない。上の `reap_and_count` が上限到達扱いにする）。
-    pub(super) fn track(pid: u32, pidfd: Option<OwnedFd>) {
+    pub(super) fn track(pid: u32, handle: ChildHandle) {
         if let Ok(mut list) = UNREAPED.lock() {
-            list.push(Unreaped { pid, pidfd });
+            list.push(Unreaped { pid, handle });
         }
     }
+}
+
+/// fork した子を指す OS 固有の保持物（Linux は fork 直後に開いた pidfd。開けなければ `None`。macOS は pidfd が
+/// 無いため空）。回収後に pid が再利用されても元の子を指し続ける用途で、`run_isolated_until` と [`pending`] が持つ。
+#[cfg(target_os = "linux")]
+type ChildHandle = Option<std::os::fd::OwnedFd>;
+/// macOS には pidfd が無い。pid の再利用は fork の前の `child_signal_auto_reaps` 検査で閉じる（`run_isolated_until`）。
+#[cfg(target_os = "macos")]
+struct ChildHandle;
+
+/// fork 直後（回収前）に子の保持物を開く。
+#[cfg(target_os = "linux")]
+fn open_child_handle(pid: u32) -> ChildHandle {
+    sys::pidfd_open(pid).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn open_child_handle(_pid: u32) -> ChildHandle {
+    ChildHandle
+}
+
+/// 保持物経由で子へ SIGKILL を送れたら `true`（Linux の pidfd。`pidfd_send_signal`）。送れない（保持物が無い・
+/// macOS）なら `false` で、呼び出し側は未回収であることを `waitpid(WNOHANG)` で確かめてから `kill(2)` する。
+#[cfg(target_os = "linux")]
+fn kill_via_handle(handle: &ChildHandle) -> bool {
+    use std::os::fd::AsFd;
+    match handle {
+        Some(fd) => {
+            let _ = sys::pidfd_send_signal(fd.as_fd(), sys::Signal::Kill);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kill_via_handle(_handle: &ChildHandle) -> bool {
+    false
 }
 
 /// 子が結果（終了コード 1 バイト）を返す pipe を作る。戻り値は `(読み取り側, 書き込み側)`（両端とも
@@ -305,7 +355,7 @@ mod pending {
 ///
 /// 3 以上へ置く理由: 呼び出しプロセスの fd 0〜2 が閉じていると pipe がその番号を取り、子の
 /// `close_range(3, ..)` で残る上に、通知の子が書く stderr（fd 2）と衝突する（`exec::exec_status_pipe` と同じ扱い）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn result_pipe() -> Option<(std::fs::File, std::fs::File)> {
     use std::os::fd::{AsFd, OwnedFd};
     let (reader, writer) = std::io::pipe().ok()?;
@@ -317,7 +367,7 @@ fn result_pipe() -> Option<(std::fs::File, std::fs::File)> {
 /// 結果 pipe が今すぐ読めるか（待たない）。シグナルによる中断（`EINTR`）は 1 回だけ再試行する（中断を
 /// 「結果なし」と取り違えると、`SIGCHLD` を無視するプロセスで主経路の成功を失敗とみなし代替経路へ二重に
 /// 記録するため。SEC-4）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn readable_now(rx: &std::fs::File) -> bool {
     use std::os::fd::AsFd;
     match sys::poll_readable(rx.as_fd(), 0) {
@@ -333,7 +383,7 @@ fn readable_now(rx: &std::fs::File) -> bool {
 ///
 /// 読む前に毎回 [`readable_now`] を確かめるため、D 状態の子が書き込み側を持ったまま残っていても止まらない。
 /// `read` の `EINTR` も 1 回だけ再試行する。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_result(rx: &std::fs::File) -> (bool, Option<i32>) {
     use std::io::Read as _;
     let mut buf = [0u8; RESULT_PIPE_MAX];
@@ -358,7 +408,7 @@ fn read_result(rx: &std::fs::File) -> (bool, Option<i32>) {
 /// 子の結果を確定する。結果 pipe に子が残したコードがあれば最優先する（`child` の処理を終えた後にだけ書くため、
 /// 例えば主経路の `sync_data` まで完了している）。無ければ `otherwise`（`waitpid` の status 等）を使う。
 /// [`CLOSE_FDS_FAILED_EXIT`] は [`IsolatedOutcome::FdsNotClosed`] へ写す。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn settle(rx: &std::fs::File, otherwise: IsolatedOutcome) -> Isolated {
     let (started, code) = read_result(rx);
     let outcome = match code.map_or(otherwise, IsolatedOutcome::Exited) {
@@ -395,7 +445,7 @@ fn settle(rx: &std::fs::File, otherwise: IsolatedOutcome) -> Isolated {
 ///   送るためこの pidfd へは送らないが、想定外の `waitpid` の失敗で追跡に載ると、そのプロセスが終わるまで
 ///   未回収の 1 件として数える（fail-closed の向き）。いずれも pid の一巡が要る。根本対策は
 ///   `clone3(CLONE_PIDFD)` で fork と同時に pidfd を得ること（未実装）
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isolated {
     run_isolated_until(timeout, None, child)
 }
@@ -405,7 +455,7 @@ fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isol
 /// 待ちの期限は `timeout` と `hard` の早い方、kill 後の回収待ちも `hard` を超えない。`hard` までに回収できない
 /// 子は待たずに [`pending`] へ追跡して戻る（未回収の 1 件として数え、後続の呼び出しで回収する。ゾンビは
 /// [`MAX_UNREAPED`] で頭打ちのため無制限には増えない。fail-closed の向き）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_isolated_until(
     timeout: Duration,
     hard: Option<Instant>,
@@ -415,6 +465,14 @@ fn run_isolated_until(
     use std::os::fd::AsFd;
     if pending::reap_and_count() >= MAX_UNREAPED {
         return Isolated::not_run(IsolatedOutcome::TooManyUnreaped);
+    }
+    // macOS には pidfd が無い。SIGCHLD が自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）か独自ハンドラ（`waitpid` で回収し得る）だと子が終了と同時に回収されて pid が
+    // 再利用され得るため、fork の前に拒否して主経路を試さない（代替経路へ進む）。自動回収が無ければ子は回収されるまで
+    // ゾンビとして pid を保持し、「`Ok(None)` を確かめてから `kill`」に窓が無い。検査から fork までに disposition を
+    // 変えられるのは fork が通る（単一スレッドの）呼び出しスレッドだけ（CORE-1）。
+    #[cfg(target_os = "macos")]
+    if !matches!(sys::child_signal_auto_reaps(), Ok(false)) {
+        return Isolated::not_run(IsolatedOutcome::Failed);
     }
     let Some((rx, tx)) = result_pipe() else {
         return Isolated::not_run(IsolatedOutcome::Failed);
@@ -447,7 +505,7 @@ fn run_isolated_until(
         Err(_) => return Isolated::not_run(IsolatedOutcome::Failed),
     };
     // 回収前に開くので、以後 pid が回収・再利用されても元の子を指す。開けなければ `None`（kill(2) へ退避）。
-    let pidfd = sys::pidfd_open(pid).ok();
+    let handle = open_child_handle(pid);
     let clamp = |t: Instant| hard.map_or(t, |h| t.min(h));
     let deadline = clamp(Instant::now() + timeout);
     loop {
@@ -462,7 +520,7 @@ fn run_isolated_until(
                 // 想定外の失敗（`WNOHANG` では `EINTR` にならず、実際には到達しない）。`Ok(None)` を確かめる前は
                 // pidfd が自分の子を指すとは限らない（fork から `pidfd_open` までに自動回収・pid 再利用が起き得る）
                 // ため、pidfd へも生の pid へも送らず、追跡して後続の呼び出しで回収する。
-                pending::track(pid, pidfd);
+                pending::track(pid, handle);
                 return settle(&rx, IsolatedOutcome::Failed);
             }
         }
@@ -472,18 +530,15 @@ fn run_isolated_until(
         let left = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(POLL_INTERVAL.min(left));
     }
-    // 期限超過。pidfd 経由で送る。無ければ未回収の自分の子であることを確かめてから kill(2) する。
-    match &pidfd {
-        Some(fd) => {
-            let _ = sys::pidfd_send_signal(fd.as_fd(), sys::Signal::Kill);
-        }
-        None => match sys::wait_pid_nohang(pid) {
+    // 期限超過。保持物（Linux の pidfd）経由で送る。送れなければ未回収の自分の子であることを確かめてから kill(2) する。
+    if !kill_via_handle(&handle) {
+        match sys::wait_pid_nohang(pid) {
             Ok(None) => {
                 let _ = sys::kill_pid(pid, sys::Signal::Kill);
             }
             Ok(Some(status)) => return settle(&rx, decode_status(status)),
             Err(_) => return settle(&rx, IsolatedOutcome::TimedOut),
-        },
+        }
     }
     let reap_deadline = clamp(Instant::now() + KILL_REAP_WAIT);
     while Instant::now() < reap_deadline {
@@ -494,19 +549,19 @@ fn run_isolated_until(
         std::thread::sleep(POLL_INTERVAL.min(left));
     }
     // SIGKILL でも回収できない子（D 状態等）。追跡して後続の呼び出しで回収する。
-    pending::track(pid, pidfd);
+    pending::track(pid, handle);
     settle(&rx, IsolatedOutcome::TimedOut)
 }
 
-/// 非 Linux では子プロセス隔離を提供しない（`crate::sys` が Linux 専用。CLI-1）。常に `Failed` を返し、
+/// Windows では子プロセス隔離を提供しない（`crate::sys` は Linux・macOS 専用。CLI-1）。常に `Failed` を返し、
 /// 呼び出し側は主経路を `IsolationUnavailable` として代替経路へ進む。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_isolated(_timeout: Duration, _child: impl FnOnce(&dyn Fn()) -> i32) -> Isolated {
     Isolated::not_run(IsolatedOutcome::Failed)
 }
 
-/// 非 Linux では [`run_isolated`] と同じく常に `Failed`。
-#[cfg(not(target_os = "linux"))]
+/// Windows では [`run_isolated`] と同じく常に `Failed`。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_isolated_until(
     _timeout: Duration,
     _hard: Option<Instant>,
@@ -516,7 +571,7 @@ fn run_isolated_until(
 }
 
 /// `waitpid` の status を解釈する。正常終了以外（シグナル死）は `Failed`。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn decode_status(status: i32) -> IsolatedOutcome {
     if status & 0x7f == 0 {
         IsolatedOutcome::Exited((status >> 8) & 0xff)
@@ -526,7 +581,7 @@ fn decode_status(status: i32) -> IsolatedOutcome {
 }
 
 /// 子が終了コードで返せる主経路の失敗種別（コード = 添字 + [`KIND_EXIT_BASE`]）。範囲外は `Write` として扱う。
-const PRIMARY_KINDS: [AuditWriteErrorKind; 11] = [
+const PRIMARY_KINDS: [AuditWriteErrorKind; 12] = [
     AuditWriteErrorKind::RelativePath,
     AuditWriteErrorKind::Unsupported,
     AuditWriteErrorKind::NotRegularFile,
@@ -538,6 +593,7 @@ const PRIMARY_KINDS: [AuditWriteErrorKind; 11] = [
     AuditWriteErrorKind::Lock,
     AuditWriteErrorKind::LockFailed,
     AuditWriteErrorKind::Sync,
+    AuditWriteErrorKind::SizeLimit,
 ];
 /// 失敗種別の終了コードの起点（0 は成功、2 は子の panic に使うため 10 から）。
 const KIND_EXIT_BASE: i32 = 10;
@@ -689,13 +745,13 @@ impl Write for StderrLine {
 /// 符号化済みの通知（1 行分のバイト列）を出す関数。
 type LineEmitter = Arc<dyn Fn(Vec<u8>, Option<Instant>) + Send + Sync>;
 
-/// 呼び出しプロセスの現在のスレッド数（Linux 以外は数えない）。
+/// 呼び出しプロセスの現在のスレッド数（Linux は `/proc/self/status`、macOS は `proc_pidinfo`。Windows は数えない）。
 fn current_threads() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         sys::current_thread_count()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
@@ -822,8 +878,8 @@ impl FileAuditSink {
     /// 呼び出し元: supervisor の `exec::default_audit_sink`（委譲）と、CLI の plugin バックエンド（plugin 信頼検証の
     /// 拒否の記録先）。`root_override` が `None` なら [`StateRoot::resolve`] の既定規則に従う。ストアを開く順序は
     /// [`Self::in_state_store`] の型による固定と同じ。Windows では `FileStateStore::open` が `Unimplemented` を
-    /// 返す（作成の前に拒否するため副作用は無い）。macOS はストアを開けるが、記録は主経路・代替経路が
-    /// 未実装のため `SinkFailed` になる（REPAIR-3・#2247。上の「未実装」節）。
+    /// 返す（作成の前に拒否するため副作用は無い）。macOS はストアを開け、主経路が成功すれば記録できる（#2429）。
+    /// 主経路が失敗すると代替経路が未実装のため `SinkFailed` になる（REPAIR-3・#2247。上の「未実装」節）。
     pub fn open_in_state_root(root_override: Option<PathBuf>) -> Result<Self, TraitError> {
         let root = StateRoot::resolve(root_override)?;
         let store = FileStateStore::open(root)?;
@@ -859,7 +915,10 @@ impl FileAuditSink {
     /// 戻り値（子の入力 pipe の書き込み側）を drop すると子は EOF で終了し、後続の呼び出しで回収される。
     /// 作れなかった場合は `None`（作った分は追跡に残り、戻り値が無いため終了しない子は無い: 子は pipe を
     /// 閉じられなければ直ちに終了する）。
-    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "exec-test-support"
+    ))]
     #[doc(hidden)]
     pub fn hold_unreaped_children_for_test() -> Option<std::fs::File> {
         use std::io::Read as _;
@@ -879,13 +938,16 @@ impl FileAuditSink {
                 2,
             )
             .ok()?;
-            pending::track(pid, sys::pidfd_open(pid).ok());
+            pending::track(pid, open_child_handle(pid));
         }
         Some(tx)
     }
 
     /// 結合試験専用: 追跡中の未回収の子を回収し、残っている件数を返す。
-    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "exec-test-support"
+    ))]
     #[doc(hidden)]
     pub fn unreaped_children_for_test() -> usize {
         pending::reap_and_count()
@@ -893,10 +955,21 @@ impl FileAuditSink {
 
     /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする
     /// （子が自動回収されるプロセスでの照合用）。成功なら `true`。
-    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        feature = "exec-test-support"
+    ))]
     #[doc(hidden)]
     pub fn set_child_signal_ignored_for_test(ignored: bool) -> bool {
         sys::set_child_signal_ignored_for_test(ignored).is_ok()
+    }
+
+    /// 結合試験専用: 自プロセスのスレッド数（macOS の `tests/audit_sink_isolation.rs` が `/proc` の代わりに使う。
+    /// `proc_pidinfo` の `pti_threadnum`）。数えられなければ `None`。
+    #[cfg(all(target_os = "macos", feature = "exec-test-support"))]
+    #[doc(hidden)]
+    pub fn current_thread_count_for_test() -> Option<u64> {
+        sys::current_thread_count()
     }
 
     /// テスト用: 主経路パス・代替経路・通知先を差し込む（呼び出しスレッドで直接実行）。
@@ -1130,7 +1203,7 @@ mod tests {
     }
 
     fn primary_kind() -> AuditWriteErrorKind {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             AuditWriteErrorKind::Open
         } else {
             AuditWriteErrorKind::Unsupported
@@ -1156,7 +1229,7 @@ mod tests {
             e.message(),
             "audit record could not be persisted by primary or fallback path"
         );
-        let (p, pc) = if cfg!(target_os = "linux") {
+        let (p, pc) = if cfg!(any(target_os = "linux", target_os = "macos")) {
             ("open", "INTERNAL")
         } else {
             ("unsupported", "UNIMPLEMENTED")

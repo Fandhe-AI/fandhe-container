@@ -290,3 +290,19 @@ harness = false
 name = "netns_holder_launch_userns"
 path = "tests/netns_holder_launch_userns.rs"
 harness = false
+
+# healthcheck の本番アダプタ `ExecHealthProbe` の結合試験（SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441）。
+# 同じ実行ファイルが helper の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
+# root・namespace 不要で既定のテスト集合で実行する（実コンテナへの exec は行わない。依存は不変）。
+[[test]]
+name = "healthcheck_exec_probe"
+path = "tests/healthcheck_exec_probe.rs"
+harness = false
+
+# 本物の helper（reaper → `run_health_exec_main` → `run_command_with_pidfd_output_notify`）から、rootless コンテナの中で実コマンドを
+# 走らせて stdout / stderr・終了コード・期限切れの停止を照合する実機前提の結合試験（SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441。依存は不変）。
+# reaper・helper を試験バイナリ自身の再実行で起動するため独自 main（harness = false）で振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "healthcheck_exec_real"
+path = "tests/healthcheck_exec_real.rs"
+harness = false

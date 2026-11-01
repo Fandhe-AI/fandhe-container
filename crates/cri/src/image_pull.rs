@@ -144,8 +144,8 @@ use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    BlobReuse, ImageStore, ManifestComposition, PullPublishRequest, PullSession, StagedBlobWriter,
-    TagKey,
+    BlobReuse, IMAGE_STORE_BLOB_DIR, ImageStore, ManifestComposition, PullPublishRequest,
+    PullSession, StagedBlobWriter, TagKey,
 };
 use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
@@ -630,7 +630,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
 
     /// `blobs/sha256` を作る（Unix では 0700）。
     fn blobs_dir(&self) -> Result<TrustedDir, PullError> {
-        prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
+        prepare_private_dir(&self.config.cache_dir, &IMAGE_STORE_BLOB_DIR)
     }
 
     /// 展開済み rootfs の公開先（`<cache_dir>/rootfs/sha256/<hex>/rootfs`。キーはイメージ ID = config digest）。

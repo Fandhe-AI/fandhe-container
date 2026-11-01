@@ -253,8 +253,9 @@ jobs:
   # deny ジョブ（REPAIR-7 ステージ 5: セキュリティチェック・依存監査。TASK-86.4・#38）は
   # 次の 4 種を `make deny` と同一集合で実行する。
   #   - advisories: RUSTSEC アドバイザリ（脆弱・unmaintained・unsound・yanked。REPAIR-9）
-  #   - bans: wildcards 等の禁止設定（rust-vmm 系クレートの禁止リストは MVM-4・
-  #     TASK-73 で deny.toml の [bans] へ追記予定。本 PR では追記しない）
+  #   - bans: wildcards・ring/cc/aws-lc-rs（#1779）に加え、rust-vmm 系の禁止 10 種（MVM-4・TASK-73.2）を
+  #     deny.toml の [bans] で検出する。一覧の正は check-microvm-deps.sh --list で、一致と検出力は
+  #     platform-ci の bans fail-closed 自己テストが照合する
   #   - licenses: 許可ライセンス外の依存を検出（OSS-4・OSS-5）
   #   - sources: crates.io 以外のレジストリ / git 依存を拒否
   # 「禁止 API リント」（REPAIR-7 ステージ 5 のもう一方の観点）は対応する TASK が
@@ -746,6 +747,14 @@ jobs:
         shell: bash
         timeout-minutes: 5
         run: make deny-license-fail-closed-selftest
+
+      # bans の判定も OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
+      # 既存ジョブへのステップ追加のため check-run 名は増えない。
+      - name: deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（MVM-4・REPAIR-9・TASK-73.2。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 5
+        run: make deny-bans-fail-closed-selftest
 
       # サードパーティのライセンス表記の生成（TASK-103.2・OSS-5）。about.toml が 5 ターゲットを固定する
       # ため生成結果は実行 OS に依らず、cargo-about の導入ビルドを 3 回払わないよう ubuntu のみで実行する。
@@ -1923,6 +1932,37 @@ jobs:
             --select '^capabilities: SEC-1 ' --subst-pos false --min 2 \
             --forbid 'root=true' --forbid 'capabilities: ignored' --forbid 'not applicable' --summary
 
+      # escape_suite（`crates/core/tests/escape_suite.rs`。SEC-2・SEC-4・SEC-5・CORE-5・TASK-43 追補・#2016）: ESC-01〜10 の
+      # 攻撃ケース（制御・否定対照を含む 18 件）を制限ステージ通過後のコンテナプロセスで実行し、拒否を判定する実機前提テスト
+      # （harness = false）。前提の AppArmor の緩和と「範囲写像と委譲 cgroup の前提確認」（非 root と Landlock ABI 6 以上を
+      # fail-closed で確認）は上のステップを再利用する。非 root の 1 回だけ実行し、root の分岐（ESC-09 が対象外になる）は
+      # CI では回さない（#1621・#206）。カーネル監査の opt-in の段は CI 外（#2483）のため、ESC-01・07・10 は監査未検証として
+      # 一覧をちょうどこの 3 件に固定する（合格に数えない。SEC-4）。件数（15 / 18）は具体値で固定しており、ケースを足すと
+      # 照合が落ちる。件数を上げるときは AGENTS.md「実機前提テスト」も同じ PR で直す。
+      # `--forbid 'not applicable'` は成功行の `not applicable []` に当たるため使わず、`verdict=not-applicable` と
+      # `not applicable on this`（非 Linux・非対応アーキテクチャの行）で禁じる。sudo・permissions・check-run は追加しない。
+      - name: escape_suite のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test escape_suite --no-run
+
+      - name: escape_suite の実行（実機前提テスト・--ignored。SEC-2・SEC-4・SEC-5・CORE-5・#2016）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/escape_suite.log"
+          scripts/run-with-deadline.sh --name escape_suite --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test escape_suite -- --ignored
+          scripts/check-success-lines.sh --name escape_suite \
+            --src crates/core/tests/escape_suite.rs --log "${log}" \
+            --select '^escape_suite: SEC-2 harness verified ' \
+            --subst verified=15 --subst-pos 18 --subst-pos '[]' \
+            --subst-pos '["esc-10-landlock-outside", "esc-01-host-fs-write", "esc-07-runtime-binary-landlock"]' \
+            --subst-pos false --subst-pos false \
+            --forbid 'verdict=fail' --forbid 'verdict=not-applicable' --forbid 'escape_suite: ignored' \
+            --forbid 'not applicable on this' --forbid 'root=true' --forbid 'kernel_audit=true' --summary
+
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -2235,6 +2275,42 @@ jobs:
           check --select '^rootless_uid_mapping: hung entrypoint' --subst-pos 75 \
             --subst-re euid='[0-9]+' --subst-re egid='[0-9]+'
 
+      # healthcheck_exec_real（`crates/supervisor/tests/healthcheck_exec_real.rs`。SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441）:
+      # healthcheck の本番の経路（supervisor → reaper → helper → 実コマンド）を rootless の稼働中コンテナで通す。
+      # 試験自身が `systemd-run --user --scope` で `--scenario` を起動するため、試験バイナリは外側を包まず scope を作らない補助で
+      # 期限だけ持つ。reaper・helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
+      # 新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: healthcheck_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/her-build.json"
+          cargo test -p fandhe-container-supervisor --test healthcheck_exec_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "healthcheck_exec_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::healthcheck_exec_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "HER_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: healthcheck_exec_real の実行（実機前提テスト・--ignored。SUP-4・SUP-6・REPAIR-5・#2441）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/healthcheck_exec_real.log"
+          USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name healthcheck_exec_real --deadline 540 --log "${log}" -- \
+            "${HER_BIN}" --ignored
+          scripts/check-success-lines.sh --name healthcheck_exec_real \
+            --src crates/supervisor/tests/healthcheck_exec_real.rs --log "${log}" \
+            --select '^healthcheck_exec_real: (scenario=|real helper ran)' --min 2 \
+            --forbid 'healthcheck_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
+
       # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
       # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
       - name: supervisor_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
@@ -2274,7 +2350,8 @@ jobs:
           sel+='|SIGTERM delivered)'
           check --select "${sel}" \
             --subst PROBE_EXIT=7 --subst TERM_HANDLER_EXIT=43 --subst label=mount \
-            --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst-re pid='[1-9][0-9]*' --subst-re first_pid='[1-9][0-9]*' \
+            --subst-re relaunched_pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
             --subst-pos-re '[A-Z_]+' --min 9 --summary
           # model は subordinate に固定する（FANDHE_CONTAINER_TEST_ID_HELPER=1。single は期待行にも forbid にも掛かって失敗する）
           check --select '^supervisor_bin_real: id mapping verified ' \

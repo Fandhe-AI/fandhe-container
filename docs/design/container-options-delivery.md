@@ -42,7 +42,7 @@ FCOPT1\n
 <kind> <len>\n<len バイトの UTF-8>\n     （繰り返し）
 ```
 
-- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
+- `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進（先頭 0 と `+` は不可、7 桁まで）
 - 値の改行を許すため行区切りではなく長さ接頭辞にする
 - 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ（`Ulimit::parse` 等）へ通し直す（未信頼の入力として検証）
 - 上限は確保の前に検証する: 全体 `ENV_MAX_TOTAL_BYTES + 256 KiB`、件数（ulimit 16・env `ENV_MAX_ENTRIES`・tmpfs
@@ -61,9 +61,10 @@ FCOPT1\n
 | `--read-only` | 文書の `read-only` kind（本体は固定値 `true` だけ。`false`・空・重複は固定文言で拒否）→ `LaunchOptions::with_root_readonly(true)` → launcher が config の `root.readonly` と **OR** で実効値を 1 回だけ計算し、pivot 後の mount の `MOUNT_ATTR_RDONLY`・Landlock の root 規則・分離の記録（`launchIsolation.root_readonly`。inspect の `rootReadonly`）へ**同じ値**を渡す。指定が無ければ外部 bundle の値に従う。狭める方向のみで、`readonly:true` の bundle を書き込み可能に戻す経路は無い（`--read-only=false` は使い方エラー）。CLI は外部 bundle の `config.json` を書き換えない（CLI-1・SUP-12・CORE-5・SEC-1・#2828） |
 | `-p` / `--publish` | 文書の `publish` kind（1 件 64 バイト以下・`MAX_PORT_PUBLISHES` 件以下。`[<ipv4>:]<host>:<container>[/tcp\|udp]` の生の文字列）→ 復号のたびに net の `PastaPortForwards::parse_all` で再検証。ユーザー定義名の `network` と組でない文書は拒否する。検証済みの型で保持するだけで、pasta への反映は #1940 で実装済み（`pasta_attach` が引数へ連結）。CLI が文書へ書く処理は #3329 で実装済み（NET-9・NET-3・SUP-12・#3200） |
 | `--network` / `--add-host` / `--dns` | 文書の `network`（1 レコード・64 バイト以下）・`add-host`（256 件以下・1 件 299 バイト以下）・`dns`（32 件以下・1 件 45 バイト以下）kind → 復号のたびに net のパーサ（`NetworkName::new`・`parse_add_hosts`・`parse_ip_addr`・`ResolvConfPlan::for_mode`）で再検証 → `network` は core の `LaunchNetworkMode`（`none` は `Loopback`、`host` は `Host`、`network` kind が無ければ `FromConfig`）へ写して `LaunchOptions::with_network` に渡す。`network` が無いのに `add-host` / `dns` がある文書は拒否する。`container:` は `Unimplemented`。ユーザー定義名は rootless の pasta 構成が #1940 で結線済み（rootful の参加指定は #3069・#3074）で、start の手順 2c が定義ストアの定義の存在と pasta 構成を照合し直す（#3329）。`add-host` / `dns` は start の手順 4b で hosts / resolv.conf へ書き（D9）、`launch_options` が `with_etc_files` で bind 対象にする（#1873）。Linux の CLI の `create` は `--network` を省略しても必ず `network none` を文書へ書く（既定の `none`。D4。したがって Linux の create は常に文書と作成世代の注釈を残し、`state` の `annotations` に世代が出る）。非 Linux は network 系の指定を `UNIMPLEMENTED` で拒否して書かない（NET-6・NET-12・SUP-12・network-wiring.md D4・D5・#3065） |
+| healthcheck の定義（`--health-cmd` 等。**CLI の書き手は未実装**） | 文書の `health-cmd`（argv を 1 要素ずつ。`MAX_COMMAND_ARGS` 件以下・合計 `MAX_COMMAND_BYTES` 以下）・`health-interval`・`health-timeout`・`health-start-period`（64 バイト以下の時間文字列）・`health-retries`（20 バイト以下の整数文字列）kind（各 1 件まで。`health-cmd` が無く他だけの文書は拒否）→ 復号のたびに `HealthcheckDefinition::parse` と `HealthcheckSchedule::from_definition`（timeout 60 秒以下）で再検証 → `ContainerOptions::healthcheck` → start の入口が `HealthWiring`（Linux の本番は `ExecHealthProbeFactory`）を組み、monitor が世代ごとに周期実行する。定義が無ければ何も起動せず `health` も書かない。見出し行の上限は 32 バイトに上げた（`health-start-period` + 7 桁が 27 バイトのため）（SUP-4・TASK-161・healthcheck-exec-helper.md 12 章・#2953） |
 | `--pasta-path <絶対パス>` / `--pasta-path-search`（グローバル） | 文書の `pasta`（1 レコード・4096 バイト以下・重複は拒否）。作成時に net の `verify_pasta_binary` / `search_pasta_in_path` で解決・検証した実体の正規パス・識別（dev・ino・size・mtime・ctime・uid・mode）・版の日付を net の `PastaRecord` の本文で書く → 復号は本文の形だけを検証し（副作用なし）、起動の直前に `reverify_recorded_pasta` がバイナリを辿り直して記録と照合する（不一致は `FailedPrecondition`）。`network` がユーザー定義名のときだけ置ける（違えば `InvalidArgument`）。CLI が書く処理は rootless のユーザー定義名の解除（#3329）で有効、start 経路への結線は #1940、SEC-4 の監査の記録は #3330（NET-9・CLI-1・PLUG-11・SUP-12・rootless-network.md 12.4・#3199） |
 
-`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`publish`・`pasta` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
+`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`publish`・`pasta`・`health-*` の追加では版（`FCOPT1`）を上げない。CLI と supervisor は同じディレクトリから配布され、未知の kind は旧 supervisor が拒否する（fail-closed）ため、版を上げる利点が無い（#2775）。
 
 core は supervisor の検証を信用せず `LaunchOptions::with_env` で件数・長さ・形式を再検証する。
 

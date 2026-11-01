@@ -8,7 +8,7 @@
 # SUP-3 の目標は「バックオフ 0 の再起動レイテンシ中央値 100ms 以下」（PoC-17 own 実測: 中央値 1.79ms・p95 2.29ms）。
 # 本スクリプトは合否を出さない（目標値との比較・レポート化は #491 の担当）。
 # 実装済みを装わない（REPAIR-3）: 製品バイナリ（CLI・supervisor の bin。#1717・#1819）は提供済みだが、restart の
-# 再 launch は本番 launcher で拒否される（#2043）。#2043 が入るまで試行は再起動未観測（終了コード 1）になり数値は出ない。
+# 再 launch は #2043 で本番 launcher でも成立する（常駐スレッドを止めて監視スレッドで直接 launch）。実測は #491（人間担当）。
 # CI で動かすのはスタブの自己テスト scripts/measure-restart-latency-selftest.sh のみ。
 #
 # 呼び出し元: Makefile の `restart-latency`（操作者が明示実行。make ci には含めない）。sudo は呼ばない

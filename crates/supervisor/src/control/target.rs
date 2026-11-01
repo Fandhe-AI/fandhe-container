@@ -42,10 +42,13 @@ use std::sync::mpsc::{
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::oci_runtime::{ContainerOutput, LaunchedProcess, ProcessExit};
+use fandhe_container_core::oci_runtime::{
+    ContainerOutput, LaunchMode, LaunchedProcess, ProcessExit,
+};
 use fandhe_container_core::traits::{ErrorCode, Signal, TraitError};
 
 use super::protocol::{ControlReason, RequestKind};
+
 use crate::restart::{LateOrphan, Relauncher};
 use crate::run::{ExplicitStopRecord, StopToken};
 
@@ -397,27 +400,98 @@ impl Drop for ControlledProcess {
     }
 }
 
+/// 再 launch の間だけ制御チャネルの accept スレッドを止める口（本番は `server::PausableServer`。試験は偽を渡す）。
+pub trait RelaunchPause: Send + Sync {
+    /// 止める。`timeout` 内に止まらなければ `Err`（呼び出し側は launch しない）。止まっていれば何もしない。
+    fn pause(&self, timeout: Duration) -> Result<(), TraitError>;
+    /// 止めたものを作り直す。動いていれば何もしない。
+    fn resume(&self) -> Result<(), TraitError>;
+}
+
 /// restart の再 launch で得た新しいハンドルを、新しい世代の [`ControlledProcess`] として登録する。
+///
+/// [`Self::with_pause`] で制御チャネルのサーバを渡すと、再 launch の間だけ accept スレッドを止める（core の本番 launcher は
+/// 単一スレッドを要求するため。#2043・SUP-3・CORE-1）。止められなければ内側を呼ばずに `Err`（fail-closed）。
 pub struct ControlledRelauncher {
     inner: Arc<dyn Relauncher>,
     slot: SignalSlot,
+    pause: Option<Arc<dyn RelaunchPause>>,
+    /// 再開に失敗し terminate もできなかった新プロセス（[`Relauncher::take_stranded`] が引き渡す）。
+    stranded: Mutex<Vec<LateOrphan>>,
 }
+
+/// accept スレッドの停止を待つ上限（接続の読み取り期限 1 秒 + 余裕。REPAIR-5）。
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl ControlledRelauncher {
     /// `inner` の再 launch の結果を `slot` に登録して返す relauncher を作る。
     pub fn new(inner: Arc<dyn Relauncher>, slot: SignalSlot) -> Self {
-        Self { inner, slot }
+        Self {
+            inner,
+            slot,
+            pause: None,
+            stranded: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 再 launch の間 `server` の accept スレッドを止める。
+    #[must_use]
+    pub fn with_pause(mut self, server: Arc<dyn RelaunchPause>) -> Self {
+        self.pause = Some(server);
+        self
     }
 }
 
 impl Relauncher for ControlledRelauncher {
+    /// 内側の relauncher の時間上限の守り方を転送する（転送しないと `SelfBounded` が `CallerBounded` へ降格し、
+    /// 単一スレッドを要求する本番 launcher が拒否される。#1816・#2043）。
+    fn launch_mode(&self) -> LaunchMode {
+        self.inner.launch_mode()
+    }
+
     fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        let process = self.inner.relaunch(timeout)?;
-        Ok(Box::new(ControlledProcess::new(process, self.slot.clone())))
+        let started = Instant::now();
+        let Some(server) = &self.pause else {
+            let process = self.inner.relaunch(timeout)?;
+            return Ok(Box::new(ControlledProcess::new(process, self.slot.clone())));
+        };
+        server.pause(PAUSE_TIMEOUT.min(timeout))?;
+        // 停止に使った時間を差し引いた残りを内側へ渡す。残りが無ければ launch しない。
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let result = if remaining.is_zero() {
+            Err(TraitError::new(ErrorCode::Timeout, "relaunch timed out"))
+        } else {
+            self.inner.relaunch(remaining)
+        };
+        // launch の成否に関わらず再開する。再開できないときは新プロセスを動かしたままにせず失敗にする
+        // （制御チャネルの無い稼働は stop できない。fail-closed。回収できなければ stranded へ積む）。
+        let resumed = server.resume();
+        match (result, resumed) {
+            (Ok(process), Ok(())) => {
+                Ok(Box::new(ControlledProcess::new(process, self.slot.clone())))
+            }
+            // terminate にも単一の期限の残りだけを渡す（一時停止 + launch + terminate で timeout を超えない）。
+            (Ok(process), Err(e)) => {
+                match process.terminate(timeout.saturating_sub(started.elapsed())) {
+                    Ok(()) => Err(e),
+                    Err(t) => {
+                        self.stranded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((process, t.clone()));
+                        Err(t)
+                    }
+                }
+            }
+            (Err(e), _) => Err(e),
+        }
     }
 
     fn take_stranded(&self) -> Vec<LateOrphan> {
-        self.inner.take_stranded()
+        let mut own =
+            std::mem::take(&mut *self.stranded.lock().unwrap_or_else(PoisonError::into_inner));
+        own.extend(self.inner.take_stranded());
+        own
     }
 }
 
@@ -914,5 +988,154 @@ mod tests {
         cp.drain(Some(ControlReason::ContainerExited));
         assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
         assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+    }
+
+    /// 呼ばれた順を記録する、`pause` / `resume` と内側の relaunch の偽。
+    struct OrderFake {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        pause_fails: bool,
+        relaunch_fails: bool,
+        mode: LaunchMode,
+        timeouts: Mutex<Vec<Duration>>,
+        resume_fails: bool,
+        /// 内側が返したプロセスの `terminate` に渡された時間上限。
+        terminated: Arc<Mutex<Vec<Duration>>>,
+        /// `relaunch` が返る前に待つ時間（launch の所要時間の模擬）。
+        launch_delay: Duration,
+    }
+
+    /// `terminate` に渡された上限を記録するプロセスの偽。
+    struct TermProbe(Arc<Mutex<Vec<Duration>>>);
+
+    impl LaunchedProcess for TermProbe {
+        fn pid(&self) -> NonZeroU32 {
+            NonZeroU32::new(778).unwrap()
+        }
+        fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
+            self.0.lock().unwrap().push(timeout);
+            Ok(())
+        }
+        fn signal(&self, _signal: Signal, _deadline: Instant) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    impl RelaunchPause for OrderFake {
+        fn pause(&self, _timeout: Duration) -> Result<(), TraitError> {
+            self.events.lock().unwrap().push("pause");
+            if self.pause_fails {
+                return Err(TraitError::new(ErrorCode::Timeout, "pause failed"));
+            }
+            Ok(())
+        }
+        fn resume(&self) -> Result<(), TraitError> {
+            self.events.lock().unwrap().push("resume");
+            if self.resume_fails {
+                return Err(TraitError::new(ErrorCode::Unavailable, "resume failed"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Relauncher for OrderFake {
+        fn launch_mode(&self) -> LaunchMode {
+            self.mode
+        }
+        fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.events.lock().unwrap().push("relaunch");
+            self.timeouts.lock().unwrap().push(timeout);
+            std::thread::sleep(self.launch_delay);
+            if self.relaunch_fails {
+                return Err(TraitError::new(ErrorCode::Internal, "relaunch failed"));
+            }
+            if self.resume_fails {
+                return Ok(Box::new(TermProbe(self.terminated.clone())));
+            }
+            Ok(Box::new(Fake::new(777).0))
+        }
+    }
+
+    fn order_fake(pause_fails: bool, relaunch_fails: bool) -> Arc<OrderFake> {
+        Arc::new(OrderFake {
+            events: Arc::new(Mutex::new(Vec::new())),
+            pause_fails,
+            relaunch_fails,
+            mode: LaunchMode::SelfBounded,
+            timeouts: Mutex::new(Vec::new()),
+            resume_fails: false,
+            terminated: Arc::new(Mutex::new(Vec::new())),
+            launch_delay: Duration::ZERO,
+        })
+    }
+
+    /// SUP-3・CORE-1・#2043: 再 launch は「止める → 内側の relaunch → 再開」の順で、`launch_mode` を内側から転送し、
+    /// 止めるのに使った時間を差し引いた残りだけを内側へ渡す(0 を超え、元の上限以下)。
+    #[test]
+    fn sup3_2043_controlled_relauncher_pauses_around_relaunch_and_forwards_mode() {
+        let fake = order_fake(false, false);
+        let r = ControlledRelauncher::new(fake.clone(), SignalSlot::new())
+            .with_pause(fake.clone() as Arc<dyn RelaunchPause>);
+        assert_eq!(r.launch_mode(), LaunchMode::SelfBounded);
+        let process = r.relaunch(Duration::from_secs(5)).expect("relaunched");
+        assert_eq!(process.pid().get(), 777);
+        assert_eq!(
+            *fake.events.lock().unwrap(),
+            vec!["pause", "relaunch", "resume"]
+        );
+        let passed = fake.timeouts.lock().unwrap()[0];
+        assert!(passed > Duration::ZERO && passed <= Duration::from_secs(5));
+    }
+
+    /// SUP-3・REPAIR-5・#2043: 止められなければ内側を呼ばずに失敗する(fail-closed。再開もしない)。
+    #[test]
+    fn sup3_2043_pause_failure_does_not_relaunch() {
+        let fake = order_fake(true, false);
+        let r = ControlledRelauncher::new(fake.clone(), SignalSlot::new())
+            .with_pause(fake.clone() as Arc<dyn RelaunchPause>);
+        let err = r.relaunch(Duration::from_secs(5)).err().expect("fails");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(*fake.events.lock().unwrap(), vec!["pause"]);
+    }
+
+    /// SUP-3・#2043: 内側の relaunch が失敗しても制御チャネルを再開する。
+    #[test]
+    fn sup3_2043_relaunch_failure_still_resumes() {
+        let fake = order_fake(false, true);
+        let r = ControlledRelauncher::new(fake.clone(), SignalSlot::new())
+            .with_pause(fake.clone() as Arc<dyn RelaunchPause>);
+        let err = r.relaunch(Duration::from_secs(5)).err().expect("fails");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            *fake.events.lock().unwrap(),
+            vec!["pause", "relaunch", "resume"]
+        );
+    }
+
+    /// REPAIR-5・SUP-3・#2043: 再開に失敗して新プロセスを terminate するときも、残りの時間だけを渡し、
+    /// 一時停止 + launch + terminate の全体が元の `timeout` を超えない。
+    #[test]
+    fn repair5_2043_terminate_after_resume_failure_gets_remaining_time_only() {
+        let fake = Arc::new(OrderFake {
+            events: Arc::new(Mutex::new(Vec::new())),
+            pause_fails: false,
+            relaunch_fails: false,
+            mode: LaunchMode::SelfBounded,
+            timeouts: Mutex::new(Vec::new()),
+            resume_fails: true,
+            terminated: Arc::new(Mutex::new(Vec::new())),
+            launch_delay: Duration::from_millis(300),
+        });
+        let r = ControlledRelauncher::new(fake.clone(), SignalSlot::new())
+            .with_pause(fake.clone() as Arc<dyn RelaunchPause>);
+        let total = Duration::from_secs(5);
+        let err = r.relaunch(total).err().expect("fails");
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        let term = fake.terminated.lock().unwrap()[0];
+        // launch に使った 300ms 以上が差し引かれている。
+        assert!(term <= total - Duration::from_millis(300), "{term:?}");
+        assert!(term > Duration::ZERO);
     }
 }

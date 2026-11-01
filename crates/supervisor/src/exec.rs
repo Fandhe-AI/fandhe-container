@@ -213,7 +213,7 @@
 //! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
 //!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
 //!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
-//!   場合の exec は現状拒否される（fail-closed）。この場合の方式の判断記録は `docs/design/exec-without-supervisor.md`（#2688・REPAIR-3。オーナー承認待ち。推奨は re-adopt で起動時の同一性の証跡と照合して pidfd を取り直し、それまでは拒否）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
+//!   場合の exec は現状拒否される（fail-closed）。この場合の方式の判断記録は `docs/design/exec-without-supervisor.md`（#2688・REPAIR-3。オーナー承認待ち。推奨は re-adopt で起動時の同一性の証跡と照合して pidfd を取り直し、それまでは拒否）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441。`healthcheck::ExecHealthProbe` が exec 専用 helper 経由で呼ぶ）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
@@ -224,8 +224,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目（execve 越しの継承、または外部 CLI への
-//!   `SCM_RIGHTS`）。supervisor のバイナリ入口・制御ソケットが無く、`SCM_RIGHTS` は UDS の所有者・peer credential
+//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目のうち、外部 CLI への `SCM_RIGHTS`。healthcheck は
+//!   execve 越しの継承（helper の stdin へ pidfd の複製を渡す）で実装済み（#2441）。supervisor のバイナリ入口・制御ソケットが無く、`SCM_RIGHTS` は UDS の所有者・peer credential
 //!   検証と core `sys` の cmsg ラッパーの設計を要する。fork 継承（[`run_command_with_pidfd`]）は pidfd を保持する
 //!   単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ supervisor 本体は直接呼べない
 //!   （`setns` が拒否する）
@@ -234,8 +234,8 @@
 //!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
 //!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（#1621）で
 //!   行う（記録が済むまで rootless での通しは未確認）
-//! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
-//!   同じく `/dev/null` へ固定し、cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
+//! - コマンドの標準入出力の受け渡しのうち CLI の exec と stdin。healthcheck の出力取得は実装済み（[`run_command_with_pidfd_output`]。
+//!   stdout / stderr を結合した 1 本の fd へ付け替える。#2441）。それ以外は launch と同じく `/dev/null` へ固定し、cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
 //!   `process.user`（非 root と `additionalGids` を含む）を対象の写像と照合して受ける（#2770）。exec 要求ごとの
 //!   ユーザーの上書き（CLI の `--user`・CRI の Exec。#2712・#680）は未対応
 //! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
@@ -247,7 +247,7 @@
 //!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
 //!   （`docs/design/audit-delivery.md` 9.1）
 //! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492）から
-//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441、CLI の exec は #2626）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（healthcheck は #2441 で実装済み〔exec 専用 helper が `FileAuditSink` を直接使う〕、CLI の exec は未実装で #2626）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。launch 経路（本番 launcher の子）で
@@ -272,7 +272,7 @@
 //! - launch 時の分離の記録の書き込みは、本番 launcher が `StagePipeline::with_landlock` へ渡す ruleset そのものから作り
 //!   （`LaunchedProcess::launch_isolation`）、start の Running 更新と restart の Running(新 pid) 更新で書く結線済み
 //!   （#2007）。記録を持たない launcher（偽の実装）では exec が記録なしで拒否する。本番 launcher による restart の
-//!   再 launch は #2043 まで拒否される。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
+//!   再 launch は #2043 で成立する。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
@@ -286,17 +286,17 @@ use fandhe_container_core::audit_log::{
     record_exit_signal_until,
 };
 use fandhe_container_core::exec::{
-    ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
-    ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
-    ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecChildStep,
-    ExecCommand, ExecError, ExecExit, ExecListenerSender, ExecReady, ExecRestrictionReport,
-    ExecRestrictions, ExecWorkerProof, IsolationStage, ListenerReceipt, NamespaceJoinReport,
-    Pid1Target, SealedCopyUnavailable, SupplementaryGroups, ViolationReason,
-    emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
+    ChildExit, ChildStdio, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS,
+    ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES,
+    EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep,
+    ExecChildCgroup, ExecChildStep, ExecCommand, ExecError, ExecExit, ExecListenerSender,
+    ExecReady, ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, IsolationStage,
+    ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable, SupplementaryGroups,
+    ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
     prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection_at,
-    record_exec_worker_rejection_at, remove_exec_child_cgroup, spawn_exec_command,
+    record_exec_worker_rejection_at, remove_exec_child_cgroup, spawn_exec_command_with_stdio,
     spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
 };
 // `None` の入口（試験専用）だけが使う。無効の単独ビルドの unused_imports を避ける（#2640）。
@@ -587,7 +587,7 @@ pub fn prepare_restrictions(
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
 /// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
-/// 配線済み（#1717・#2481）。healthcheck（#2441）と CLI の exec（#2626）からは未配線。
+/// 配線済み（#1717・#2481）。healthcheck の exec 専用 helper からは配線済み（#2441）。CLI の exec（#2626）からは未配線。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
@@ -918,7 +918,7 @@ pub fn run_command(
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
             let target = identify_pid1_staged(record)?;
-            run_with_target(proof, &target, request, deadline, child, sender)
+            run_with_target(proof, &target, request, deadline, child, sender, None)
         },
     );
     audit_worker_result(
@@ -1013,7 +1013,7 @@ fn audit_worker_result(
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
 /// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（担当は #2688。#514 は re-adopt・終了ポリシーのみ）と
-/// 本番の呼び出し元（healthcheck #2441・CLI の exec #2626）の配線は未実装（モジュール doc）。
+/// 本番の呼び出し元のうち healthcheck は #2441 で実装済み（exec 専用 helper が [`run_command_with_pidfd_output`] を呼ぶ）、CLI の exec #2626 の配線は未実装（モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
 /// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
@@ -1060,7 +1060,7 @@ pub fn run_command_with_pidfd(
 /// `config.json` の `process.env` の上に `launch_env` を重ね、その上に `request` の明示の指定を重ねる。launch の
 /// Entrypoint が使う env と exec(healthcheck を含む)の env を揃えるため。`launch_env` は信頼済みの保存文書
 /// (`container_options::store::read_launch_env`)から取り出した値だけを渡すこと(呼び出し側が任意に足す口ではない)。
-/// 空なら [`run_command_with_pidfd`] と同じ。呼び出し元の配線(healthcheck #2441・CLI の exec #2626)は未実装。
+/// 空なら [`run_command_with_pidfd`] と同じ。呼び出し元は healthcheck の exec 専用 helper（[`run_command_with_pidfd_output`] 経由。#2441）で、CLI の exec #2626 の配線は未実装。
 pub fn run_command_with_pidfd_env(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
@@ -1069,6 +1069,95 @@ pub fn run_command_with_pidfd_env(
     audit: &dyn AuditSink,
     launch_env: &[String],
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_inner(
+        record,
+        pidfd,
+        request,
+        timeout,
+        audit,
+        ExecLaunchIo {
+            launch_env,
+            output: None,
+            on_created: None,
+        },
+    )
+}
+
+/// [`run_command_with_pidfd_env`] に、コマンドの stdout / stderr の取得先 `output` を足した入口
+/// （healthcheck の出力取得。SUP-4・SUP-6・SEC-4・#2441）。
+///
+/// `output` は呼び出しプロセスが持つ書き込み可能な fd（ソケットの子側等）で、コマンドの fd 1・2 の両方へ付け替わる
+/// （結合した 1 本。fd 0 は `/dev/null`）。worker が fork で継承した fd を複製して core の
+/// `spawn_exec_command_with_stdio` へ渡し、コマンドの子が `close_range` の前に付け替える。コマンドへ渡る host の
+/// fd はこの 1 本だけで、読み手（呼び出しプロセスの外側）は読み取りしかしない前提。コマンドが `SIGPIPE` を無視して
+/// 起動するため、読み手が閉じても `EPIPE` で済む。他の契約（順序・単一スレッド・`timeout`・`audit`）は
+/// [`run_command_with_pidfd`] と同じ。
+pub fn run_command_with_pidfd_output(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    launch_env: &[String],
+    output: BorrowedFd<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_output_notify(
+        record,
+        pidfd,
+        request,
+        timeout,
+        audit,
+        ExecLaunchIo {
+            launch_env,
+            output: Some(output),
+            on_created: None,
+        },
+    )
+}
+
+/// exec の入出力・env・作成通知の束（引数の数を抑えるための要求型。SUP-4・SUP-6・#2441）。
+pub struct ExecLaunchIo<'a> {
+    /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
+    pub launch_env: &'a [String],
+    /// コマンドの stdout / stderr の取得先。`None` なら標準入出力は 3 本とも `/dev/null`。
+    pub output: Option<BorrowedFd<'a>>,
+    /// exec 子 cgroup の排他作成に成功した直後に 1 回呼ばれる通知（healthcheck の exec 専用 helper 用）。
+    pub on_created: Option<&'a dyn Fn(&ExecCgroupName)>,
+}
+
+/// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
+/// （healthcheck の exec 専用 helper 用。SUP-4・SUP-6・REPAIR-5・#2441）。
+///
+/// `on_created` は `mkdirat` の排他作成（既存の同名は `EEXIST` で失敗し採用しない）に成功した直後、worker を fork する
+/// 前に 1 回だけ呼ばれる。呼び出しプロセスの外側（supervisor）は、この通知を受けた cgroup だけを「今回の作成物」として
+/// 停止してよい。pid から名前を推定すると、再利用された pid の以前の exec の同名 cgroup を誤停止し得るため。
+/// 作成に失敗した・記録に cgroup 配置が無い場合は呼ばれない。他の契約は [`run_command_with_pidfd_output`] と同じ。
+pub fn run_command_with_pidfd_output_notify(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    io: ExecLaunchIo<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_inner(record, pidfd, request, timeout, audit, io)
+}
+
+/// [`run_command_with_pidfd_env`] と [`run_command_with_pidfd_output`] の共通本体。`io.output` が `None` なら
+/// コマンドの標準入出力は 3 本とも `/dev/null`。
+fn run_command_with_pidfd_inner(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    io: ExecLaunchIo<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    let ExecLaunchIo {
+        launch_env,
+        output,
+        on_created,
+    } = io;
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let sweep = sweep_before_create(record);
@@ -1076,12 +1165,19 @@ pub fn run_command_with_pidfd_env(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
-        || create_child_cgroup(record, &name),
+        || {
+            let created = create_child_cgroup(record, &name)?;
+            // 排他作成に成功した（所有を確定した）直後にだけ通知する。
+            if let (Some(_), Some(notify)) = (&created, on_created) {
+                notify(&name);
+            }
+            Ok(created)
+        },
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?
                 .with_launch_env(launch_env.to_vec());
-            run_with_target(proof, &target, request, deadline, child, sender)
+            run_with_target(proof, &target, request, deadline, child, sender, output)
         },
     );
     audit_worker_result(
@@ -1127,7 +1223,7 @@ pub fn run_command_in(
         },
         |proof, child, sender| {
             let target = identify_pid1_in_staged(record, expected_cgroup_path)?;
-            run_with_target(proof, &target, request, deadline, child, sender)
+            run_with_target(proof, &target, request, deadline, child, sender, None)
         },
     );
     audit_worker_result(
@@ -2174,6 +2270,7 @@ fn run_with_target(
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
     listener: ExecListenerSender,
+    output: Option<BorrowedFd<'_>>,
 ) -> Result<ExecOutcome, WorkerError> {
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
@@ -2183,15 +2280,14 @@ fn run_with_target(
             "exec stage CgroupJoin: the exec child cgroup was not created",
         )
     })?;
-    let cgroup = prepare_cgroup_join_staged(target)?;
     let result = run_in_child_cgroup(
         proof,
         target,
         request,
         deadline,
-        cgroup,
         child_cgroup,
         listener,
+        output,
     );
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
@@ -2205,10 +2301,12 @@ fn run_in_child_cgroup(
     target: &ExecTarget,
     request: &ExecRequest,
     deadline: Deadline,
-    cgroup: ExecCgroupJoin,
     child_cgroup: &ExecChildCgroup,
     listener: ExecListenerSender,
+    output: Option<BorrowedFd<'_>>,
 ) -> Result<ExecOutcome, WorkerError> {
+    // 参加する cgroup の準備（参加の前に済ませる。失敗しても呼び出し側が子 cgroup の後始末を行う）。
+    let cgroup = prepare_cgroup_join_staged(target)?;
     // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
@@ -2261,8 +2359,21 @@ fn run_in_child_cgroup(
     })?;
     let ready = require_exec_ready_staged(report)?;
     deadline.remaining("starting the command")?;
-    let child =
-        spawn_exec_command(ready, &command, child_cgroup).map_err(from_exec_error_staged)?;
+    // 出力の取得先があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdout / stderr にする。
+    let stdio = match output {
+        Some(fd) => {
+            let owned = fd.try_clone_to_owned().map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "exec stage Spawn: failed to duplicate the exec output",
+                )
+            })?;
+            ChildStdio::from_output(owned).map_err(from_exec_error_staged)?
+        }
+        None => ChildStdio::none(),
+    };
+    let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
+        .map_err(from_exec_error_staged)?;
     // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。
     let spawned_pid = NonZeroU32::new(child.pid());
     let exit = wait_or_stop(
@@ -2292,6 +2403,22 @@ fn run_in_child_cgroup(
         seccomp_listener: ExecListenerHandover::NotApplicable,
         seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
     })
+}
+
+/// 試験専用: 指定の `exit` を持つ成功側の結果を作る（`healthcheck::exec_helper` の写像の試験が使う。#2441）。
+/// 他のフィールドは worker の結果行の復号結果の既定的な値。
+#[cfg(test)]
+pub(crate) fn audited_outcome_for_test(exit: ExecExit, audit: AuditDelivery) -> AuditedOutcome {
+    let mut outcome = decode_worker_result(
+        b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+    )
+    .expect("decode");
+    outcome.exit = exit;
+    AuditedOutcome {
+        outcome,
+        audit,
+        exit_audit: AuditDelivery::NotApplicable,
+    }
 }
 
 /// エントリポイントの実行方式の構造化ログ 1 行（JSON。値は固定語彙のみ。REPAIR-4・#1531）。

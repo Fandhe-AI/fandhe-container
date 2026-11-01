@@ -115,7 +115,8 @@ helper の子孫（exec の worker、`FileAuditSink` が主経路のファイル
 - 作成通知を受ける前（cgroup の作成より前、または作成の完了から通知の書き込みまでの間）に期限切れ・cancel になると、supervisor は cgroup を止められない。ただし reaper が helper を SIGKILL するので、worker は親死亡シグナルで終わる。コマンドが worker の死亡シグナルを解除していた場合の子孫は、populated な `exec-*` の子 cgroup として残り得て、delete 前の掃除（`cgroup.kill` を含む）が回収する。次の exec 開始時の掃除が回収するのは空の cgroup だけである
 - 作成通知を受けた cgroup の停止に失敗した場合（`cgroup_stop_failed = true`）も、同じく delete 前の掃除が回収する
 - reaper 自体が OOM 等で異常終了した場合（`Exited(false)`）、helper は init へ再親付けされる。この経路は reaper の責務の外（reaper はファイル I/O をせず固まらないが、強制終了は防げない）
-- 実コンテナでの通し（本物の helper が実コマンドを走らせる）は実機前提の結合試験 `healthcheck_exec_real` が担う（CI への組み込みは別）
+- reaper の終了判定（`has_any_child` の `waitid`）が `ECHILD` 以外で失敗し続ける環境（seccomp で `waitid` が塞がれている等）では、子の有無を確かめられないので待ち続ける側へ倒し、reaper は helper の回収後も終わらない。生き残った孤児も reaper は殺さない（孤児を止めるのは supervisor の cgroup の停止で、停止に失敗した場合〔`cgroup_stop_failed = true`〕も同じく reaper が残る）。いずれも上の代償と同じく保持の上限（`MAX_HELD_HELPERS`）で数が抑えられ、その間の probe は `Unavailable` になる（無制限には増えない）
+- 実コンテナでの通し（本物の helper が実コマンドを走らせる）は実機前提の結合試験 `healthcheck_exec_real` が担う（platform-ci の ubuntu の実機前提ステップで実行する）
 
 ## 9. ambient capability（SEC-1）
 

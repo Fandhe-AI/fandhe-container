@@ -6,7 +6,7 @@
 //! TASK-74.4.1 で [`VcpuFd::run_once`]（`KVM_RUN` を 1 回発行して VM exit を [`VcpuExit`] で返す）と、
 //! 実機で実行を示す自己診断 [`KvmDevice::probe_guest_execution`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! レジスタ設定・virtio・exit のデバイスへのディスパッチ（#883）・vCPU の外部からの停止要求（一時停止・
+//! レジスタ設定・exit のデバイスへのディスパッチ（#883。virtio-mmio のトランスポートは `crate::virtio_mmio` にあり、MMIO exit との接続は TASK-74.4.2）・vCPU の外部からの停止要求（一時停止・
 //! 終了通知。#883 / TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。

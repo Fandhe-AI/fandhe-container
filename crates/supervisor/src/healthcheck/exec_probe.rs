@@ -24,11 +24,13 @@
 //!
 //! # タイムアウトの層（REPAIR-5）
 //! `probe(T)` に対し helper へ渡す exec の期限は `T - min(T/5, 2s)`（[`exec_budget`]）。通常は core が期限切れの
-//! コマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる。`T` を過ぎても helper が終わらなければ
-//! SIGKILL し、supervisor 側から exec 子 cgroup（`exec-<helper pid>-0`）を `cgroup.kill` して子孫ごと止めてから
-//! [`REAP_TIMEOUT`] 以内に回収し `Timeout` を返す（cancel も同じ）。1 回の読み取りは [`PUMP_BYTES_MAX`] で打ち切り、
-//! 大量出力でも期限・cancel の確認へ戻る。残った `exec-*` の子 cgroup は次の exec 開始時の掃除と delete 前の掃除で消える（残余）。回収できなければ zombie
-//! として残し `helper_reaped = false` で報告する。`cancel` はフラグを立てるだけで、probe のループが自分で止める。
+//! コマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる。`T` を過ぎても helper が終わらなければ、
+//! helper の作成通知（`FCHC1`）で確認できた exec 子 cgroup だけを supervisor が `cgroup.kill` して削除し、
+//! helper が自分で終わるのを [`REAP_TIMEOUT`] だけ待って `Timeout` を返す（cancel も同じ）。**helper へシグナルは
+//! 送らない**（再親付けされる子孫を作らないため）。終わらない helper の `Child` は保持し、終わるまで次の probe を
+//! `Unavailable` にする。1 回の読み取りは [`PUMP_BYTES_MAX`] で打ち切り、
+//! 大量出力でも期限・cancel の確認へ戻る。残った `exec-*` の子 cgroup は次の exec 開始時の掃除と delete 前の掃除で消える（残余）。終わらなければ
+//! `helper_reaped = false` で報告する。`cancel` はフラグを立てるだけで、probe のループが自分で止める。
 
 use std::io::Read as _;
 use std::num::NonZeroU32;
@@ -41,9 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::exec::{
-    ChildSubreaper, ContainerChild, ExecCgroupName, remove_exec_child_cgroup,
-};
+use fandhe_container_core::exec::{ExecCgroupName, remove_exec_child_cgroup};
 use fandhe_container_core::oci_runtime::LaunchedProcess;
 use fandhe_container_core::traits::{
     ContainerId, ErrorCode, GetStateRequest, HealthStatus, StateRecord, TraitError,
@@ -51,7 +51,7 @@ use fandhe_container_core::traits::{
 
 use super::HealthcheckDefinition;
 use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
-use super::exec_wire::{HealthExecLine, LINE_MAX, WorkerIdentity};
+use super::exec_wire::{HealthExecLine, LINE_MAX};
 use crate::health::{HealthProbe, ProbeCancel};
 use crate::run::MAX_POLL_INTERVAL;
 
@@ -65,7 +65,7 @@ pub const DIAG_LINE_MAX: usize = 1024;
 pub const DIAG_LINES_MAX: u32 = 16;
 /// helper の終了後に出力・結果の EOF を待つ猶予（子孫が書き込み端を持ち続けても待ち続けない）。
 pub const DRAIN_GRACE: Duration = Duration::from_millis(100);
-/// SIGKILL した helper の回収を待つ上限。
+/// 期限切れ・cancel の後、exec 子 cgroup を止めてから helper が自分で終わるのを待つ上限。
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 /// 強制終了した helper の exec 子 cgroup を `cgroup.kill` して空になるまで待つ上限。
 const CGROUP_KILL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -453,10 +453,6 @@ fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
             dropped = dropped.saturating_add(1);
             continue;
         }
-        if line.starts_with(super::exec_wire::WORKER_TAG.as_bytes()) {
-            // worker の同一性の通知行は `WorkerIdentity::find` が読む。結果行でも診断行でもないので数えない。
-            continue;
-        }
         if line.starts_with(super::exec_wire::CGROUP_TAG.as_bytes()) {
             // 作成通知行は `owned_exec_cgroup` が読む。結果行でも診断行でもないので数えない。
             continue;
@@ -512,34 +508,28 @@ fn owned_exec_cgroup(bytes: &[u8], helper_pid: u32) -> Option<ExecCgroupName> {
         })
 }
 
-/// 通知された worker `id` を、同一性を照合してから pid 指定で 1 回だけ回収する。まだ残っていれば `true`。
+/// 期限切れ・cancel 後の止め方: 所有を確定した exec 子 cgroup だけを `stop`（`cgroup.kill` と削除）で止め、
+/// helper が自分で終わるのを `wait` まで待つ。戻り値は `(stop の成否, helper が終わったか)`。
 ///
-/// 照合: `/proc/<pid>/stat` の starttime が通知と一致しなければ、既に回収済みで pid が再利用された（または消えた）
-/// ので待たない。回収は subreaper として再親付けされた自分の子だけを対象にした
-/// `waitpid(<pid>, WNOHANG)`（core の `ContainerChild::wait_for_exit`）で、`waitpid(-1)` は使わない。自分の子で
-/// なければ（`ECHILD`。init へ再親付けされた等）回収の対象外として手放す（REPAIR-5）。
-fn reap_reparented_worker(id: WorkerIdentity) -> bool {
-    reap_worker_with(id, WorkerIdentity::read, |pid| {
-        let proof = ChildSubreaper::enable().ok()?;
-        let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid)?, &proof);
-        match child.wait_for_exit(Duration::ZERO) {
-            Ok(Some(_)) => Some(false),
-            Ok(None) => Some(true),
-            Err(_) => Some(false),
+/// **helper へはシグナルを送らない**。SIGKILL すると helper の子孫（`FileAuditSink` が fork した子、worker）が
+/// subreaper の supervisor へ再親付けされ、回収の責任と特定の手段が増え続けるため。cgroup を止めれば worker が
+/// 結果を返して helper が終わる。待ちきれなければ呼び出し側が `Child` を保持する（REPAIR-5）。
+fn stop_cgroup_then_wait(
+    child: &mut Child,
+    owned: Option<&ExecCgroupName>,
+    stop: impl FnOnce(&ExecCgroupName) -> bool,
+    wait: Duration,
+) -> (bool, bool) {
+    let stop_ok = stop_if_owned(owned, stop);
+    let until = Instant::now() + wait;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return (stop_ok, true);
         }
-    })
-}
-
-/// [`reap_reparented_worker`] の本体。現在の同一性の読み取りと回収を注入して単体で照合する。`wait` は
-/// `Some(まだ残っている)`、回収を試せなければ `None`（手放す）。
-fn reap_worker_with(
-    id: WorkerIdentity,
-    read: impl FnOnce(u32) -> Option<WorkerIdentity>,
-    wait: impl FnOnce(u32) -> Option<bool>,
-) -> bool {
-    match read(id.pid) {
-        Some(current) if current == id => wait(id.pid).unwrap_or(false),
-        _ => false,
+        if Instant::now() >= until {
+            return (stop_ok, false);
+        }
+        std::thread::sleep(POLL_STEP);
     }
 }
 
@@ -569,14 +559,10 @@ pub struct ExecHealthProbe {
     /// 配置取得スレッド（`hc-resolve`）が生きている間 true。状態ストアの I/O が止まったときに切り離した
     /// スレッドと複製した pidfd が probe ごとに積み上がらないよう、同時に 1 本までに抑える（REPAIR-5）。
     resolver_busy: Arc<AtomicBool>,
-    /// SIGKILL 後も `REAP_TIMEOUT` 内に回収できなかった helper の `Child`（最大 1 個）。次の probe の開始時・
+    /// 期限切れ・cancel の後、`REAP_TIMEOUT` 内に自分で終わらなかった helper の `Child`（最大 1 個）。次の probe の開始時・
     /// `cancel`・drop で `try_wait` し、回収できるまで新しい helper を作らない（未回収 helper の蓄積を防ぐ。
     /// SUP-4・REPAIR-5）。
     unreaped: Mutex<Option<Child>>,
-    /// helper の SIGKILL 後に再親付けされ得る worker の同一性（最大 1 個）。helper を回収できた後に、pid と開始時刻を
-    /// 照合してからその 1 個だけを `waitpid(<pid>, WNOHANG)` で回収する（subreaper の supervisor 配下にゾンビを
-    /// 残さない。`waitpid(-1)` は使わない。SUP-4・REPAIR-5）。
-    worker: Mutex<Option<WorkerIdentity>>,
 }
 
 impl std::fmt::Debug for ExecHealthProbe {
@@ -632,7 +618,6 @@ impl ExecHealthProbe {
             busy: AtomicBool::new(false),
             resolver_busy: Arc::new(AtomicBool::new(false)),
             unreaped: Mutex::new(None),
-            worker: Mutex::new(None),
         })
     }
 
@@ -997,11 +982,10 @@ impl ExecHealthProbe {
             }
         }
         if !reaped {
-            // 回収前の `Child` でだけ kill する（pid 再利用を避ける）。
-            let _ = child.kill();
-            // helper だけの SIGKILL では worker とコマンドの子孫が残り得る（親死亡シグナルはコマンドが解除でき、
-            // fork した子孫へ継承されない）ため、supervisor 側から exec 子 cgroup を `cgroup.kill` する
-            // （SUP-4・SUP-6・REPAIR-5）。名前は helper の pid から導く。回収前の `Child` を持つ間は pid が再利用されない。
+            // 期限切れ・cancel でも helper へシグナルは送らない（SIGKILL も SIGTERM も）。止めるのは、作成通知で
+            // 今回の作成を確認できた exec 子 cgroup の `cgroup.kill` だけで、worker は結果を返して helper が
+            // 自分で終わる。helper が SIGKILL されないので、helper の子孫（監査 sink の fork した子を含む）は
+            // 親の helper が自分で回収し、supervisor へ再親付けされない（SUP-4・SUP-6・REPAIR-5）。
             read_all(
                 &mut out_eof,
                 &mut res_eof,
@@ -1014,20 +998,19 @@ impl ExecHealthProbe {
             if owned.is_some() {
                 stopped = true;
             }
-            if !self.kill_exec_cgroup(&record, owned.as_ref()) {
+            let (stop_ok, exited) = stop_cgroup_then_wait(
+                &mut child,
+                owned.as_ref(),
+                |name| self.kill_exec_cgroup(&record, Some(name)),
+                REAP_TIMEOUT,
+            );
+            if !stop_ok {
                 cgroup_stop_failed = true;
             }
-            let reap_deadline = Instant::now() + REAP_TIMEOUT;
-            while Instant::now() < reap_deadline {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    reaped = true;
-                    break;
-                }
-                std::thread::sleep(POLL_STEP);
-            }
+            reaped = exited;
             if !reaped {
-                // 回収できなかった `Child` は手放さず保持する。後続の probe の開始時・cancel・drop が `try_wait` し、
-                // 回収できるまで新しい helper を作らない（未回収の蓄積を防ぐ。REPAIR-5）。
+                // 終わらない helper（同期 I/O で固まった等）の `Child` は手放さず保持する。後続の probe の開始時・
+                // cancel・drop が `try_wait` し、終わるまで新しい helper を作らない（保持は 1 個まで。REPAIR-5）。
                 *self
                     .unreaped
                     .lock()
@@ -1057,23 +1040,6 @@ impl ExecHealthProbe {
             let owned = owned_exec_cgroup(&results.bytes, helper_pid);
             if !self.kill_exec_cgroup(&record, owned.as_ref()) {
                 cgroup_stop_failed = true;
-            }
-        }
-        // helper が正常終了でなければ、worker は親死亡シグナルで終わっても subreaper の supervisor へ再親付けされて
-        // ゾンビで残り得る。通知された同一性を保持し、helper を回収できていれば有界に回収する（待てなければ保持して
-        // 次の probe の開始時・cancel・drop が回収する。REPAIR-5）。
-        if !matches!(ended, Ended::Exited(true))
-            && let Some(id) = WorkerIdentity::find(&results.bytes)
-        {
-            *self
-                .worker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
-            if reaped {
-                let until = Instant::now() + REAP_TIMEOUT;
-                while self.reap_unreaped() && Instant::now() < until {
-                    std::thread::sleep(POLL_STEP);
-                }
             }
         }
         report.helper_reaped = reaped;
@@ -1154,45 +1120,23 @@ impl ExecHealthProbe {
 impl ExecHealthProbe {
     /// 保持している未回収の helper を `try_wait` する（待たない）。まだ残っていれば `true`。
     ///
-    /// 残っていれば SIGKILL を再送する（回収前の `Child` に対してだけ送るため pid の再利用の影響を受けない）。
-    /// ロックは待たず、取れなければ「残っている」とみなす（SUP-4・REPAIR-5）。
+    /// シグナルは送らない（helper は自分で終わるのを待つ）。ロックは待たず、取れなければ「残っている」とみなす（SUP-4・REPAIR-5）。
     fn reap_unreaped(&self) -> bool {
         let mut slot = match self.unreaped.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return true,
         };
-        if let Some(child) = slot.as_mut() {
-            match child.try_wait() {
-                Ok(None) => {
-                    let _ = child.kill();
-                    return true;
-                }
-                // 回収できた、または待ちが失敗した（もう回収の見込みが無い）なら手放す。
-                Ok(Some(_)) | Err(_) => *slot = None,
-            }
-        }
-        drop(slot);
-        // helper が居なくなった後に限り、再親付けされた worker を回収する（helper が生きている間は worker は
-        // helper の子で、ここからは待てない）。
-        self.reap_worker(&reap_reparented_worker)
-    }
-
-    /// 保持している worker の同一性を、`wait` で 1 回だけ回収する。まだ残っていれば `true`。
-    fn reap_worker(&self, wait: &dyn Fn(WorkerIdentity) -> bool) -> bool {
-        let mut slot = match self.worker.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return true,
-        };
-        let Some(id) = *slot else {
+        let Some(child) = slot.as_mut() else {
             return false;
         };
-        if wait(id) {
-            true
-        } else {
-            *slot = None;
-            false
+        match child.try_wait() {
+            Ok(None) => true,
+            // 回収できた、または待ちが失敗した（もう回収の見込みが無い）なら手放す。
+            Ok(Some(_)) | Err(_) => {
+                *slot = None;
+                false
+            }
         }
     }
 
@@ -1676,142 +1620,102 @@ mod tests {
         assert_eq!(parsed.dropped, 0);
     }
 
-    /// SUP-4・REPAIR-5（#2441）: worker の通知行を解析する。不正・pid 1 以下・途中で切れた行は採らない。
+    /// SUP-4・REPAIR-5（#2441）: 期限切れでは作成通知を受けた exec 子 cgroup だけを止め、helper へシグナルは送らない。
+    /// helper（の代役）は cgroup が止まったことを見て自分で終わり、シグナルによる終了ではない。
     #[test]
-    fn sup4_2441_worker_identity_notice_is_parsed_strictly() {
-        let id = WorkerIdentity::find(b"FCHC1 exec-9-0\nFCHW1 4321 987654\nFCHX1 stale\n").unwrap();
-        assert_eq!(
-            id,
-            WorkerIdentity {
-                pid: 4321,
-                start_time: 987_654
-            }
+    fn sup4_2441_expiry_stops_only_the_owned_cgroup_and_never_signals_the_helper() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let flag = std::env::temp_dir().join(format!("fandhe-hc-flag-{}", std::process::id()));
+        std::fs::write(&flag, b"1").unwrap();
+        // helper の代役: フラグ（= exec 子 cgroup の中身の代役）が消えるまで動き、消えたら自分で終わる。
+        let mut helper = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "while [ -e '{}' ]; do sleep 0.02; done",
+                flag.display()
+            ))
+            .spawn()
+            .unwrap();
+        let name = ExecCgroupName::new("exec-4242-0").unwrap();
+        let stopped = std::cell::RefCell::new(Vec::new());
+        let (stop_ok, exited) = stop_cgroup_then_wait(
+            &mut helper,
+            Some(&name),
+            |n| {
+                stopped.borrow_mut().push(n.as_str().to_owned());
+                std::fs::remove_file(&flag).is_ok()
+            },
+            Duration::from_secs(10),
         );
-        assert_eq!(WorkerIdentity::find(&id.encode()), Some(id));
-        assert_eq!(WorkerIdentity::find(b"FCHW1 1 5\n"), None);
-        assert_eq!(WorkerIdentity::find(b"FCHW1 4321\n"), None);
-        assert_eq!(WorkerIdentity::find(b"FCHW1 4321 5 6\n"), None);
-        assert_eq!(WorkerIdentity::find(b"FCHW1 x 5\n"), None);
-        assert_eq!(WorkerIdentity::find(b"FCHW1 4321 5"), None);
-        // 通知行は結果行の解析を妨げない。
-        let sink = ResultSink {
-            bytes: b"FCHW1 4321 5\nFCHX1 stale\n".to_vec(),
-            overflow: false,
-        };
-        let parsed = parse_result_stream(&sink);
-        assert_eq!(parsed.result, Ok(HealthExecLine::Stale));
-        assert_eq!(parsed.dropped, 0);
+        assert!(stop_ok);
+        assert!(exited);
+        assert_eq!(*stopped.borrow(), vec!["exec-4242-0".to_owned()]);
+        // 自分で終わった: 終了コード 0 で、シグナルによる終了ではない。
+        let status = helper.wait().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(status.signal(), None);
     }
 
-    /// SUP-4（#2441）: `/proc/<pid>/stat` の starttime は、`comm` に空白や `)` を含んでも最後の `)` から数える。
+    /// SUP-4・REPAIR-5（#2441）: 作成通知が無ければ何も止めず、終わらない helper は待ちきった後も生きたまま
+    /// （シグナルを送らない）で、`exited = false` を返す。
     #[test]
-    fn sup4_2441_stat_start_time_parses_tricky_comm() {
-        use super::super::exec_wire::parse_stat_start_time;
-        let fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
-        let stat = format!("12 (a b) c) S {}", fields[1..].join(" "));
-        // 22 番目 = fields[(22 - 3)] だが先頭の state を除いているため、値は 22。
-        assert_eq!(parse_stat_start_time(&stat), Some(22));
-        assert_eq!(parse_stat_start_time("garbage"), None);
-        assert_eq!(parse_stat_start_time("1 (x) S 1 2"), None);
-        // 実プロセス（自分自身）は読める。
-        assert!(WorkerIdentity::read(std::process::id()).is_some());
+    fn sup4_2441_expiry_without_notice_stops_nothing_and_leaves_helper_alive() {
+        let mut helper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let (stop_ok, exited) = stop_cgroup_then_wait(
+            &mut helper,
+            None,
+            |_| panic!("nothing owned must not be stopped"),
+            Duration::from_millis(100),
+        );
+        assert!(stop_ok);
+        assert!(!exited);
+        assert!(matches!(helper.try_wait(), Ok(None)));
+        helper.kill().unwrap();
+        helper.wait().unwrap();
     }
 
-    /// REPAIR-5・SUP-4（#2441）: worker は starttime が一致するときだけ待つ。不一致（pid の再利用）や消失では待たず、
-    /// 待ちが未了なら残りとして返す。
+    /// SUP-4・REPAIR-5（#2441）: 終わらない helper が残っている間は、次の probe は helper を作らずに `Unavailable` で
+    /// 戻り（シグナルも送らない）、終わった後は先へ進む。
     #[test]
-    fn repair5_2441_worker_is_waited_only_when_identity_matches() {
-        let id = WorkerIdentity {
-            pid: 4321,
-            start_time: 100,
-        };
-        let reused = WorkerIdentity {
-            pid: 4321,
-            start_time: 200,
-        };
-        let waited = std::cell::Cell::new(0u32);
-        // pid が再利用された（starttime 不一致）: 待たない。
-        assert!(!reap_worker_with(
-            id,
-            |_| Some(reused),
-            |_| {
-                waited.set(waited.get() + 1);
-                Some(true)
-            }
-        ));
-        // 消えた: 待たない。
-        assert!(!reap_worker_with(
-            id,
-            |_| None,
-            |_| {
-                waited.set(waited.get() + 1);
-                Some(true)
-            }
-        ));
-        assert_eq!(waited.get(), 0);
-        // 一致: その pid だけを待つ。未了なら残り、回収できれば残らない。
-        let target = std::cell::Cell::new(0u32);
-        assert!(reap_worker_with(
-            id,
-            |_| Some(id),
-            |pid| {
-                target.set(pid);
-                Some(true)
-            }
-        ));
-        assert_eq!(target.get(), 4321);
-        assert!(!reap_worker_with(id, |_| Some(id), |_| Some(false)));
-        // 回収を試せない（自分の子でない等）: 手放す。
-        assert!(!reap_worker_with(id, |_| Some(id), |_| None));
-    }
-
-    /// SUP-4・REPAIR-5（#2441）: 保持した worker は `reap_worker` が 1 回だけ待ち、回収できれば手放す。
-    #[test]
-    fn repair5_2441_pending_worker_is_released_once_reaped() {
+    fn repair5_2441_unreaped_helper_blocks_new_probe_until_it_exits() {
         let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
-        let id = WorkerIdentity {
-            pid: 4321,
-            start_time: 1,
-        };
-        *probe.worker.lock().unwrap() = Some(id);
-        assert!(probe.reap_worker(&|got| {
-            assert_eq!(got, id);
-            true
-        }));
-        assert_eq!(*probe.worker.lock().unwrap(), Some(id));
-        assert!(!probe.reap_worker(&|_| false));
-        assert_eq!(*probe.worker.lock().unwrap(), None);
-    }
-
-    /// SUP-4・REPAIR-5（#2441）: 回収できない helper が残っている間は、次の probe は helper を作らずに
-    /// `Unavailable` で戻り、回収された後は先へ進む。
-    #[test]
-    fn repair5_2441_unreaped_helper_blocks_new_probe_until_reaped() {
-        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
-        // 回収できない helper の代役: 終わらない子（SIGKILL は reap_unreaped が再送する）。
         let stuck = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         *probe.unreaped.lock().unwrap() = Some(stuck);
-        // 保持されている間の probe は、helper を作らずに（レポートを残さず）`Unavailable`。
-        // ただし 1 回目の呼び出しが SIGKILL を再送するので、回収されるまで有界に繰り返して確かめる。
+        for _ in 0..5 {
+            let err = probe.probe(Duration::from_secs(1)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                "a previous healthcheck exec helper has not been reaped"
+            );
+            assert!(probe.last_report().is_none());
+            // シグナルを送っていないので、まだ生きている。
+            assert!(matches!(
+                probe.unreaped.lock().unwrap().as_mut().unwrap().try_wait(),
+                Ok(None)
+            ));
+        }
+        // helper が終わる（ここでは試験が終わらせる）。有界に待って、先へ進むことを確かめる。
+        probe
+            .unreaped
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .kill()
+            .unwrap();
         let until = Instant::now() + Duration::from_secs(10);
-        let mut blocked = 0u32;
         loop {
-            match probe.probe(Duration::from_secs(1)) {
-                Err(e)
-                    if e.code() == ErrorCode::Unavailable
-                        && e.message()
-                            == "a previous healthcheck exec helper has not been reaped" =>
-                {
-                    assert!(probe.last_report().is_none());
-                    blocked += 1;
-                }
-                _ => break,
+            let blocked = matches!(
+                probe.probe(Duration::from_secs(1)),
+                Err(e) if e.message() == "a previous healthcheck exec helper has not been reaped"
+            );
+            if !blocked {
+                break;
             }
-            assert!(Instant::now() < until, "the stuck helper was never reaped");
+            assert!(Instant::now() < until, "the exited helper was never reaped");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // 最初の呼び出しは必ず拒否される（回収はその時点では未了）。
-        assert!(blocked >= 1);
         assert!(probe.unreaped.lock().unwrap().is_none());
         assert!(!probe.busy.load(Ordering::SeqCst));
     }

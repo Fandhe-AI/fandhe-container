@@ -37,7 +37,7 @@
 1. `close_fds_from(3)`、`set_dumpable(false)`
 2. 引数の検証（`--root`・`--id`・`--expect-pid`・`--timeout-ms`・`--` 以降のコマンド。各オプションはちょうど 1 回、argv[0] は絶対パス、timeout は 1ms 以上 60 秒以下）。失敗は `invalid`
 3. 状態を読み、記録が `Running`・pid が `expect-pid`・`supervisor_pid` が親（起動した supervisor）と一致することを確かめる。不一致は `stale` で、exec も監査もしない（restart 後の古いアダプタが違反を毎回監査させない。SUP-1）
-4. launch 時の env 上書きを読む（`container_options::store::launch_env_for`。期限つきの作業スレッドで包まない: helper は単一スレッドを保つため。helper 全体の期限は supervisor 側の SIGKILL が縛る）
+4. launch 時の env 上書きを読む（`container_options::store::launch_env_for`。期限つきの作業スレッドで包まない: helper は単一スレッドを保つため。helper 全体の期限は exec の期限と supervisor 側の exec 子 cgroup の停止が縛る。固まった helper は保持して次の probe を `Unavailable` にする）
 5. `exec::default_audit_sink` で `FileAuditSink` を作る（SEC-4。単一スレッドのため `ControlAuditRelay` を通さず、段が落ちない）
 6. `run_command_with_pidfd_output`（core の `spawn_exec_command_with_stdio` を使い、コマンドの fd 1・2 を出力 fd へ付け替える）
 7. 結果を 1 行（`FCHX1 ...`）にして fd 2 へ書く
@@ -74,19 +74,18 @@
 ## 8. タイムアウトの層と cancel（REPAIR-5）
 
 - `probe(T)` の絶対期限 `T` に対し、helper の exec の期限は `T - min(T/5, 2s)`（30s → 28s、5s → 4s、1s → 800ms）。通常は core が期限切れのコマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる
-- `T` を過ぎても終わらなければ helper を SIGKILL し、1 秒以内に `try_wait` で回収して `Timeout` を返す。回収できなければ `helper_reaped = false` で報告し、未回収の `Child` を `ExecHealthProbe` に最大 1 個保持する（回収前の `Child` でだけ kill するため pid 再利用を避けられる）。保持している間は、次の probe の開始時に `try_wait`（と SIGKILL の再送）を行い、回収できるまで新しい helper を作らず `Unavailable`（`a previous healthcheck exec helper has not been reaped`）を即座に返す。`cancel()` と drop も待たずに回収を試みる。これで未回収 helper が probe ごとに積み上がらない（SUP-4・REPAIR-5）
+- `T` を過ぎても終わらない、または cancel されたときは、**helper へシグナルを送らない**（SIGKILL も SIGTERM も）。supervisor がやるのは、作成通知（`FCHC1`）で今回の作成を確認できた exec 子 cgroup の `cgroup.kill` と削除だけで、これで worker 配下のコマンドが止まり、worker が結果を返して helper が自分で終わる。supervisor は helper の終了を最大 1 秒（`REAP_TIMEOUT`）だけ待ち、`probe()` の呼び出し元へは従来どおり `Timeout` / `Cancelled` を返す。待ちきれなかった helper（同期ファイル I/O で固まった等）は `helper_reaped = false` で報告し、`Child` を `ExecHealthProbe` に最大 1 個保持する。保持している間は、次の probe の開始時に `try_wait` を行い（シグナルは送らない）、終わるまで新しい helper を作らず `Unavailable`（`a previous healthcheck exec helper has not been reaped`）を即座に返す。`cancel()` と drop も待たずに回収を試みる。保持は 1 個までなので、未回収 helper は積み上がらない（SUP-4・REPAIR-5）
+- helper を SIGKILL しない理由: SIGKILL すると helper の子孫が、child subreaper である本番の supervisor へ再親付けされる。子孫は種類が増える（exec の worker、`FileAuditSink` が主経路のファイル I/O のために fork する使い捨ての子〔`crates/core/src/audit_log/file_sink.rs` のモジュール doc。時間切れの子は helper 自身が SIGKILL し、D 状態の子は helper が追跡して後続の呼び出しで回収する〕など）ため、特定して回収する通知を種類ごとに足す方式では収束しない。helper が生きて自分で終われば、自分の子孫は親の helper が回収し、再親付けが起きない。この前提により supervisor 側に worker などの回収経路は持たない
 - worker とコマンドの停止は親死亡シグナルに頼らない（コマンドは `PR_SET_PDEATHSIG` を解除でき、fork した子孫には継承されないため）。helper は exec 子 cgroup の排他作成（同名は `EEXIST` で失敗）に成功した直後、worker の fork 前に、名前を作成通知（`FCHC1 <名前>`）として fd 2 へ 1 回だけ書く。supervisor は、この通知で今回の作成を確認できた cgroup（名前が `exec-<helper pid>-` で始まるもの）だけを `cgroup.kill` して削除する。pid から名前を推定しない。通知が無いときは何も止めない（以前の exec が残した同名の cgroup を誤って止めないため。SUP-6・#2441）
-- worker の回収: 本番の supervisor は child subreaper のため、helper を SIGKILL すると親死亡シグナルで終わった worker が supervisor へ再親付けされ、回収しないとゾンビで残る。これを避けるため、helper は worker の fork 直後に同一性（pid と `/proc/<pid>/stat` の starttime）を `FCHW1 <pid> <starttime>` として fd 2 へ 1 回書く。supervisor は helper が正常終了でないとき、helper を回収できた後に、starttime を再確認してから（pid の再利用で他人を待たない）core の `ContainerChild::wait_for_exit(0)`（`waitpid(<その pid>, WNOHANG)`）でその 1 個だけを回収する。`waitpid(-1)` は使わない。待てなければ同一性を最大 1 個保持し、次の probe の開始時・`cancel()`・drop が再試行する。自分の子でない（init へ再親付けされた等）場合は対象外として手放す。コンテナ本体の子は奪わない（SUP-4・REPAIR-5）
-- `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、kill と回収を自分で行う
+- `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、cgroup の停止と helper の終了待ちを自分で行う
 - helper の終了後、出力と結果の EOF を 100ms だけ待つ（コマンドの子孫が書き込み端を持ち続けても待ち続けない）
 - 結果ストリームは 32 KiB で打ち切る（超過は異常として `Internal`）。診断行は JSON 形（`{"` で始まり 1 KiB 以下）のものを最大 16 本だけ stderr sink へ転送し、残りは捨てて件数を数える
 - 極端に短い timeout（1ms 等）は常に `Timeout` になる。上限・下限は #2439 の判断待ちのため変えない
 
 ### 残余
 
-- worker の同一性の通知を書く前（fork から通知の書き込みまでの間）に helper が殺されると、その worker は supervisor からは特定できず、再親付けされたゾンビが残りうる。worker の starttime を読めなかった場合も通知は出ない
-- worker が D 状態などで終わらない間は、同一性の保持が残り、helper の保持と同様に次の probe の開始時に再試行される（この間は helper の保持と違い新規 probe は止めない）
-- 作成通知を受け取れないまま helper を SIGKILL した場合（cgroup の作成完了から通知の書き込みまでの間）は、supervisor 側から止められない。その `exec-*` の子 cgroup とコマンドの子孫は残りうる。次の exec 開始時の掃除が回収するのは空の cgroup だけで、populated な cgroup は止めずに残す。populated なものは delete 前の掃除（`cgroup.kill` を含む）が回収する
+- **代償**: 同期 I/O などで固まった helper が居る間は、そのコンテナの healthcheck の probe は `Unavailable` のままになる（保持は 1 個までで、ゾンビは溜まらない。helper が終われば次の probe から進む）。helper を殺して即座に先へ進む方式より可用性は下がるが、再親付けされる子孫を無くすことを優先した（SUP-4・REPAIR-5）
+- 作成通知を受ける前（cgroup の作成より前、または作成の完了から通知の書き込みまでの間）に期限切れ・cancel になった場合、supervisor は止められない（helper へもシグナルを送らない）。helper は自分の exec の期限（`T` より短い）まで動き、その間コマンドが起動し得る。helper が終わるまで次の probe は `Unavailable` で、populated な `exec-*` の子 cgroup が残れば delete 前の掃除（`cgroup.kill` を含む）が回収する。次の exec 開始時の掃除が回収するのは空の cgroup だけである
 - 作成通知を受けた cgroup の停止に失敗した場合（`cgroup_stop_failed = true`）も、同じく delete 前の掃除が回収する
 - supervisor が異常終了した場合、helper は `PR_SET_PDEATHSIG` を持たない（生成元が一時スレッドで、PDEATHSIG はそのスレッドに束縛されるため）。helper 自身の exec 期限と後始末で終わる
 

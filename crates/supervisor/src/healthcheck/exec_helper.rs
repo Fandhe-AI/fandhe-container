@@ -26,7 +26,8 @@
 //! # 未実装・残余（REPAIR-3）
 //! - launch 時 env の読み込み（`container_options::store::launch_env_for`）は、本来 I/O が止まり得るため期限つきの
 //!   作業スレッドで包むべきだが、helper は単一スレッドを保つ必要があるため包まない。helper 全体の期限は
-//!   supervisor 側の SIGKILL（アダプタの `T`）で縛る。
+//!   exec の期限（アダプタの `T` より短い）と、supervisor 側の exec 子 cgroup の `cgroup.kill` で縛る（helper へ
+//!   シグナルは送らない。固まった helper は supervisor が `Child` を保持して次の probe を `Unavailable` にする）。
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
@@ -348,23 +349,17 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
             .write_all(&super::exec_wire::encode_cgroup_created(name))
             .and_then(|()| err.flush());
     };
-    // worker の fork 直後に pid と開始時刻を通知する（helper が殺されても supervisor が回収できるようにする）。
-    let notify_worker = |pid: u32| {
-        if let Some(identity) = super::exec_wire::WorkerIdentity::read(pid) {
-            let mut err = std::io::stderr();
-            let _ = err.write_all(&identity.encode()).and_then(|()| err.flush());
-        }
-    };
     let result = crate::exec::run_command_with_pidfd_output_notify(
         &record,
         stdin.as_fd(),
         &request,
         args.timeout(),
         &sink,
-        &launch_env,
-        stdout.as_fd(),
-        Some(&notify),
-        Some(&notify_worker),
+        crate::exec::ExecLaunchIo {
+            launch_env: &launch_env,
+            output: Some(stdout.as_fd()),
+            on_created: Some(&notify),
+        },
     );
     line_from_result(result)
 }

@@ -4,7 +4,7 @@
 //! [`PROFILES_ENV`] を読んで [`resolve_active_profiles`] へ渡す。本モジュールは `std::env` も argv も
 //! 読まない純関数で、アクティブなプロファイル集合 [`ActiveProfiles`] だけを返す。
 //! サービスの有効判定と `up <service>` の明示指定による追加は [`select_enabled_services`]（#632・TASK-187.2）、
-//! `depends_on` による無効サービス参照の拒否は #633（TASK-187.3）が担う。
+//! `depends_on` による無効サービス参照の拒否（有効 → 無効の辺はエラー）は同関数の末尾で行う（#633・TASK-187.3）。
 //! `up <service>` で起動対象を明示対象とその依存の閉包へ狭める処理は本モジュールの範囲外（#3639 の結線側）で、
 //! 本モジュールは `targets()` で明示対象を渡すところまでを担う（REPAIR-3）。
 //!
@@ -24,6 +24,14 @@
 //! - `profiles` を持つサービスは、実効集合のどれか 1 つと一致すれば有効。
 //! - 明示対象（`up <service>`）の `profiles` は実効集合に加わる（同じ profile を持つ他サービスも有効になる）。
 //! - 存在しない明示対象・不正な対象の profile 名は fail-closed で拒否する。
+//!
+//! 無効サービス参照の拒否（#633・TASK-187.3。STACK-10・compose-spec `15-profiles.md` に合わせる）:
+//! - 有効なサービスが `depends_on` で無効なサービス（定義はあるが有効集合に無い）を参照したら、
+//!   依存先を自動では有効にせず [`ServiceSelectError::DisabledDependency`] で拒否する（起動前・1 つも起動しない）。
+//! - 無効なサービス自身の `depends_on` は見ない（起動しないため）。有効 → 有効の辺は拒否しない。
+//! - `services` に無い名前への参照は本検査の対象外で、絞り込み後の `plan_startup` の `UNKNOWN_DEPENDENCY` が担う。
+//! - 明示対象（`up <service>`）が無効なサービスに依存する場合も拒否する。依存先も明示対象に含めれば通る。
+//! - 複数の違反があるときは、サービス名・依存先名の昇順で最初の 1 件を返す（決定的）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -309,6 +317,14 @@ pub enum ServiceSelectError {
         /// 超過した上限。
         limit: SelectLimit,
     },
+    /// 有効なサービスが、profile で無効なサービスを `depends_on` で参照している（STACK-10・#633）。
+    /// 名前は untrusted のため `Display` には出さない（結線側が無害化して表示する）。
+    DisabledDependency {
+        /// 参照元（有効）のサービス名。
+        service: String,
+        /// 参照先（無効）のサービス名。
+        dependency: String,
+    },
 }
 
 impl ServiceSelectError {
@@ -318,6 +334,7 @@ impl ServiceSelectError {
             Self::UnknownService { .. } => "UNKNOWN_SERVICE",
             Self::InvalidServiceProfile { .. } => "INVALID_SERVICE_PROFILE",
             Self::LimitExceeded { .. } => "SERVICE_SELECT_LIMIT_EXCEEDED",
+            Self::DisabledDependency { .. } => "DEPENDS_ON_DISABLED_SERVICE",
         }
     }
 
@@ -327,6 +344,9 @@ impl ServiceSelectError {
             Self::UnknownService { .. } => "no such service",
             Self::InvalidServiceProfile { .. } => "invalid profile name in service",
             Self::LimitExceeded { .. } => "service selection limit exceeded",
+            Self::DisabledDependency { .. } => {
+                "depends_on references a service disabled by profiles"
+            }
         }
     }
 
@@ -351,6 +371,7 @@ impl fmt::Display for ServiceSelectError {
                 };
                 write!(f, "{}: {what}", self.message())
             }
+            Self::DisabledDependency { .. } => f.write_str(self.message()),
         }
     }
 }
@@ -363,7 +384,7 @@ pub fn is_service_enabled(service: &Service, active: &ActiveProfiles) -> bool {
 }
 
 /// 有効サービスの判定結果（STACK-10・TASK-187.2）。CLI の `up` 結線（#3639）が [`Self::select`] で
-/// `UpProject.services` を作り、#633 が `depends_on` の検査に使う。
+/// `UpProject.services` を作る。`depends_on` の検査（#633）は [`select_enabled_services`] が済ませている。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnabledServices {
     effective: ActiveProfiles,
@@ -417,6 +438,8 @@ impl EnabledServices {
 /// 明示対象の `profiles` は実効集合に加わり、明示対象自身は常に有効になる。`targets` は
 /// サービス名の完全一致で引く `&str` で、argv の非 UTF-8 の扱いは結線側（#3639）が行う。
 /// 存在しない対象・不正な profile 名・上限超過は fail-closed でエラーにする。
+/// 有効 → 無効の `depends_on` も `DisabledDependency` で拒否する（#633。検査の呼び忘れを
+/// 防ぐため本関数に組み込み、`EnabledServices` は検査を通った構成だけが得る）。
 pub fn select_enabled_services<'a, I>(
     services: &BTreeMap<String, Service>,
     active: &ActiveProfiles,
@@ -463,18 +486,43 @@ where
         target_set.insert(name.to_owned());
     }
     let effective = ActiveProfiles(effective);
-    let enabled = services
+    let enabled: BTreeSet<String> = services
         .iter()
         .filter(|(name, svc)| {
             target_set.contains(name.as_str()) || is_service_enabled(svc, &effective)
         })
         .map(|(name, _)| name.clone())
         .collect();
+    if let Some((service, dependency)) = find_disabled_dependency(services, &enabled) {
+        return Err(ServiceSelectError::DisabledDependency {
+            service,
+            dependency,
+        });
+    }
     Ok(EnabledServices {
         effective,
         enabled,
         targets: target_set,
     })
+}
+
+/// 有効なサービスの `depends_on` に、定義はあるが無効なサービスがあれば最初の 1 組
+/// （参照元, 参照先）を返す。未定義の参照先は `plan_startup` に任せるため見ない。
+fn find_disabled_dependency(
+    services: &BTreeMap<String, Service>,
+    enabled: &BTreeSet<String>,
+) -> Option<(String, String)> {
+    for name in enabled {
+        let Some(svc) = services.get(name) else {
+            continue;
+        };
+        for dep in svc.depends_on.keys() {
+            if services.contains_key(dep) && !enabled.contains(dep) {
+                return Some((name.clone(), dep.clone()));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -825,5 +873,101 @@ mod tests {
             err.to_string(),
             "invalid profile name: FANDHE_CONTAINER_PROFILES item #1"
         );
+    }
+
+    fn dep_svc(profiles: &[&str], deps: &[&str]) -> Service {
+        let mut s = svc(profiles);
+        for d in deps {
+            s.depends_on
+                .insert((*d).to_owned(), crate::schema::DependsOnCondition::Started);
+        }
+        s
+    }
+
+    fn dep_map(entries: &[(&str, &[&str], &[&str])]) -> BTreeMap<String, Service> {
+        entries
+            .iter()
+            .map(|(n, p, d)| ((*n).to_owned(), dep_svc(p, d)))
+            .collect()
+    }
+
+    fn disabled(service: &str, dependency: &str) -> ServiceSelectError {
+        ServiceSelectError::DisabledDependency {
+            service: service.to_owned(),
+            dependency: dependency.to_owned(),
+        }
+    }
+
+    /// STACK-10・#633: 有効 → 無効の depends_on は拒否される。
+    #[test]
+    fn stack_10_enabled_depends_on_disabled_rejected() {
+        let m = dep_map(&[("web", &[], &["debug"]), ("debug", &["dbg"], &[])]);
+        let err = select_enabled_services(&m, &active(&[]), []).unwrap_err();
+        assert_eq!(err, disabled("web", "debug"));
+        assert_eq!(err.code(), "DEPENDS_ON_DISABLED_SERVICE");
+        assert_eq!(err.exit_code().get(), 2);
+        assert_eq!(
+            err.to_string(),
+            "depends_on references a service disabled by profiles"
+        );
+    }
+
+    #[test]
+    fn stack_10_disabled_dependency_display_hides_names() {
+        let err = disabled("we\u{1b}[31mb", "de\u{202e}bug");
+        assert_eq!(err.to_string(), err.message());
+    }
+
+    #[test]
+    fn stack_10_dependency_enabled_by_profile_ok() {
+        let m = dep_map(&[("web", &[], &["debug"]), ("debug", &["dbg"], &[])]);
+        let e = select_enabled_services(&m, &active(&["dbg"]), []).unwrap();
+        assert_eq!(names(&e), ["debug", "web"]);
+    }
+
+    #[test]
+    fn stack_10_explicit_target_with_disabled_dependency_rejected() {
+        let m = dep_map(&[("admin", &["adm"], &["db"]), ("db", &["dbg"], &[])]);
+        let err = select_enabled_services(&m, &active(&[]), ["admin"]).unwrap_err();
+        assert_eq!(err, disabled("admin", "db"));
+    }
+
+    #[test]
+    fn stack_10_dependency_as_explicit_target_ok() {
+        let m = dep_map(&[("admin", &["adm"], &["db"]), ("db", &["dbg"], &[])]);
+        let e = select_enabled_services(&m, &active(&[]), ["admin", "db"]).unwrap();
+        assert_eq!(names(&e), ["admin", "db"]);
+    }
+
+    #[test]
+    fn stack_10_disabled_service_dependencies_not_checked() {
+        let m = dep_map(&[
+            ("a", &["p1"], &["b"]),
+            ("b", &["p2"], &[]),
+            ("c", &["p3"], &["web"]),
+            ("web", &[], &[]),
+        ]);
+        let e = select_enabled_services(&m, &active(&[]), []).unwrap();
+        assert_eq!(names(&e), ["web"]);
+    }
+
+    #[test]
+    fn stack_10_undefined_dependency_left_to_plan_startup() {
+        let m = dep_map(&[("web", &[], &["ghost"])]);
+        let e = select_enabled_services(&m, &active(&[]), []).unwrap();
+        assert_eq!(names(&e), ["web"]);
+    }
+
+    #[test]
+    fn stack_10_first_violation_is_deterministic() {
+        let m = dep_map(&[
+            ("b", &[], &["y"]),
+            ("a", &[], &["z", "x"]),
+            ("x", &["p"], &[]),
+            ("y", &["p"], &[]),
+            ("z", &["p"], &[]),
+        ]);
+        let err = select_enabled_services(&m, &active(&[]), []).unwrap_err();
+        assert_eq!(err, disabled("a", "x"));
     }
 }

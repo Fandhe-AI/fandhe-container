@@ -504,8 +504,15 @@ impl std::fmt::Debug for ExecHealthProbe {
     }
 }
 
-/// `busy` を必ず下ろす。
-struct BusyGuard<'a>(&'a AtomicBool);
+/// probe の終了時に `cancelled` を戻してから `busy` を下ろす（この順序が契約）。
+///
+/// cancel は開始前（作業スレッドの起動前に期限超過した場合を含む）にも届きうるため、開始時には消さない。
+/// 消すのは自分の probe の終了時だけで、`busy` を下ろす前に行うので、次の probe の開始前に届いた cancel を
+/// 巻き込まない（REPAIR-5）。
+struct BusyGuard<'a> {
+    busy: &'a AtomicBool,
+    cancelled: &'a AtomicBool,
+}
 
 /// spawn 前に打ち切る理由。
 enum PreSpawn {
@@ -517,7 +524,8 @@ enum PreSpawn {
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.busy.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1002,9 +1010,12 @@ impl HealthProbe for ExecHealthProbe {
                 "a healthcheck probe is already running",
             ));
         }
-        let _guard = BusyGuard(&self.busy);
-        // 前回の cancel の残りで即座に打ち切らない。
-        self.cancelled.store(false, Ordering::SeqCst);
+        let _guard = BusyGuard {
+            busy: &self.busy,
+            cancelled: &self.cancelled,
+        };
+        // 開始時に cancelled を戻さない。開始と競合した cancel（開始前に期限超過した場合を含む）を消すと、
+        // キャンセル済みの probe が helper を起動してしまう。`run` は helper 起動の直前にも cancelled を確かめる。
         self.run(timeout)
     }
 
@@ -1311,6 +1322,23 @@ mod tests {
         probe.busy.store(false, Ordering::SeqCst);
         probe.cancel();
         assert!(probe.cancelled.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5（#2441）: 開始前に届いた cancel は消えず、probe は helper を起動せず `Cancelled` で戻り、
+    /// 終了後は cancel が戻って次の probe は影響を受けない。
+    #[test]
+    fn repair5_2441_cancel_before_probe_start_is_honored_and_cleared_after() {
+        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        probe.cancel();
+        assert!(probe.cancelled.load(Ordering::SeqCst));
+        let r = probe.probe(Duration::from_secs(5));
+        assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
+        assert_eq!(
+            probe.last_report().unwrap().outcome,
+            HealthExecOutcome::Cancelled
+        );
+        assert!(!probe.cancelled.load(Ordering::SeqCst));
+        assert!(!probe.busy.load(Ordering::SeqCst));
     }
 
     /// REPAIR-5（#2441）: 前回の `hc-resolve` が未終了なら新しい取得スレッドを作らず `Unavailable`（in-flight は 1 本）。

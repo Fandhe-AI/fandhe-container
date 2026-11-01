@@ -38,7 +38,7 @@ pub const MMIO_VERSION: u32 = 2;
 pub const VENDOR_ID: u32 = 0;
 
 /// レジスタオフセット（仕様 4.2.2 の表）。
-mod reg {
+pub mod reg {
     pub const MAGIC: u64 = 0x000;
     pub const VERSION: u64 = 0x004;
     pub const DEVICE_ID: u64 = 0x008;

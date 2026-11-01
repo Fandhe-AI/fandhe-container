@@ -5,11 +5,14 @@
 //! （SUP-4・TASK-161）が state.json の `health` へ書く値（`starting` / `healthy` /
 //! `unhealthy`。core の `HealthStatus::as_str`）を [`HealthSource`] 越しに観測する。
 //!
+//! 期限到達のエラー化（#592）: [`require_healthy_dependencies`] が `Blocked` を
+//! [`DependencyWaitError::WaitTimeout`]（code `DEPENDENCY_WAIT_TIMEOUT`・終了コード 7）へ写す。
+//! `Err` なら呼び出し元は依存元を起動しない。
+//!
 //! 未実装（実装済みを装わない。REPAIR-3）:
 //! - 本番の [`HealthSource`]（core の `StateStore` で state.json を読む実装とサービス名から
 //!   コンテナ ID への対応づけ）は `up`（TASK-155）の配線で作る。stack は core に依存しないため、
 //!   ここでは I/O を持たない抽象だけを置く（`stack -> core` の依存追加は承認事項）。
-//! - 期限到達のエラー化（`code`・非ゼロ終了コード）は #592。ここでは結果の enum で返す。
 //! - `started`（#590）・`completed` の待機。本ゲートは `healthy` 条件だけを判定するので、
 //!   ステップ全体の起動可否は `up` が他の条件の結果と合わせて決める。
 //!
@@ -22,6 +25,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::depends_on::StartupStep;
+use crate::depends_on::wait::{DependencyWaitError, ObserveError};
 use crate::schema::DependsOnCondition;
 
 /// state.json の `health` に対応する観測値（core の `HealthStatus` の文字列と 1 対 1）。
@@ -170,7 +174,7 @@ impl fmt::Display for HealthyWaitPolicyError {
 
 impl std::error::Error for HealthyWaitPolicyError {}
 
-/// ポーリング間隔と全体の期限（既定の期限は持たない。決めるのは `up` か #592）。
+/// ポーリング間隔と全体の期限（既定の期限は持たない。決めるのは `up`（TASK-155））。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthyWaitPolicy {
     poll_interval: Duration,
@@ -220,7 +224,7 @@ pub enum HealthyWaitOutcome {
         polls: u64,
         elapsed: Duration,
     },
-    /// 期限までに healthy にならなかった（#592 がエラーへ写像する）。
+    /// 期限までに healthy にならなかった（[`require_healthy_dependencies`] がエラーへ写像する）。
     DeadlineReached {
         service: String,
         last_observed: Option<ObservedHealth>,
@@ -333,9 +337,50 @@ pub fn wait_until_healthy(
 pub enum HealthyGate {
     /// healthy 条件の依存先がすべて healthy（0 件を含む）。依存元の起動を許可する。
     Permitted { waited: Vec<HealthyWaitOutcome> },
-    /// 期限内に healthy にならなかった依存先がある。起動を許可しない（#592 がエラー化する）。
+    /// 期限内に healthy にならなかった依存先がある。起動を許可しない（[`HealthyGate::into_result`] がエラー化する）。
     /// 中身は `DeadlineReached`。
     Blocked(HealthyWaitOutcome),
+}
+
+impl HealthyGate {
+    /// 結果をエラーへ写す（STACK-2）。`Blocked` は `service`（依存元）から見た
+    /// [`DependencyWaitError::WaitTimeout`]（condition は healthy）にする。
+    pub fn into_result(
+        self,
+        service: &str,
+    ) -> Result<Vec<HealthyWaitOutcome>, DependencyWaitError> {
+        match self {
+            Self::Permitted { waited } => Ok(waited),
+            Self::Blocked(outcome) => Err(DependencyWaitError::WaitTimeout {
+                service: service.to_string(),
+                dependency: outcome.service().to_string(),
+                condition: DependsOnCondition::Healthy,
+            }),
+        }
+    }
+}
+
+/// [`gate_healthy_dependencies`] の結果をエラー化して返す（STACK-2・TASK-150.4・#592）。
+///
+/// 呼び出し元は `up`（TASK-155）。`Err` が返ったら依存元を起動せず、
+/// [`DependencyWaitError::exit_code`] の非ゼロ終了コードで止める（期限切れは 7、観測失敗は 1）。
+/// source の失敗は `DependencyWaitError::Observe` に写す（読めない状態を healthy とみなさない）。
+/// 待ちの有界性は `policy`（ステップ共通の期限）が保証する（REPAIR-5）。
+pub fn require_healthy_dependencies(
+    step: &StartupStep,
+    source: &mut dyn HealthSource,
+    clock: &mut dyn PollClock,
+    policy: &HealthyWaitPolicy,
+) -> Result<Vec<HealthyWaitOutcome>, DependencyWaitError> {
+    gate_healthy_dependencies(step, source, clock, policy)
+        .map_err(|e| match e {
+            HealthyWaitError::Source { service, error } => DependencyWaitError::Observe {
+                service: step.service().to_string(),
+                dependency: service,
+                source: ObserveError::new(error.code(), error.message()),
+            },
+        })?
+        .into_result(step.service())
 }
 
 /// ステップの `healthy` 条件の依存先だけを依存先名の昇順に待つ。
@@ -673,5 +718,106 @@ image = "x"
         // b に使えたのは残り 300ms のみ（700・800・900ms の 3 回。1000ms は期限で観測しない）
         let b_polls = s.1.iter().filter(|n| *n == "b").count();
         assert_eq!(b_polls, 3);
+    }
+
+    #[test]
+    fn stack_2_healthy_timeout_is_wait_timeout_error() {
+        for v in [Unhealthy, Starting] {
+            let step = step_of(TWO, "app");
+            let mut s = PerService(
+                vec![
+                    ("a", Script::new(vec![Some(v)])),
+                    ("b", Script::new(vec![Some(Healthy)])),
+                ],
+                vec![],
+            );
+            let mut c = FakeClock::new();
+            let e =
+                require_healthy_dependencies(&step, &mut s, &mut c, &pol(100, 1000)).unwrap_err();
+            assert_eq!(
+                e,
+                DependencyWaitError::WaitTimeout {
+                    service: "app".into(),
+                    dependency: "a".into(),
+                    condition: DependsOnCondition::Healthy,
+                }
+            );
+            assert_eq!(e.code(), "DEPENDENCY_WAIT_TIMEOUT");
+            assert_eq!(e.exit_code().get(), 7);
+            assert_eq!(
+                e.to_string(),
+                "timed out waiting for a dependency condition: app -> a (healthy)"
+            );
+            assert!(!s.1.iter().any(|n| n == "b"));
+        }
+        // 記録なしのままでも同じ。
+        let step = step_of(TWO, "app");
+        let mut s = PerService(vec![], vec![]);
+        let mut c = FakeClock::new();
+        let e = require_healthy_dependencies(&step, &mut s, &mut c, &pol(100, 500)).unwrap_err();
+        assert_eq!(e.exit_code().get(), 7);
+    }
+
+    #[test]
+    fn stack_2_require_healthy_permitted_returns_outcomes() {
+        let step = step_of(TWO, "app");
+        let mut s = PerService(
+            vec![
+                ("a", Script::new(vec![Some(Healthy)])),
+                ("b", Script::new(vec![Some(Healthy)])),
+            ],
+            vec![],
+        );
+        let mut c = FakeClock::new();
+        let r = require_healthy_dependencies(&step, &mut s, &mut c, &pol(100, 1000)).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].service(), "a");
+        assert_eq!(r[1].service(), "b");
+        // healthy 条件が無いステップは観測せず Ok(空)。
+        let step = step_of(TWO, "a");
+        let mut s = PerService(vec![], vec![]);
+        let r = require_healthy_dependencies(&step, &mut s, &mut c, &pol(100, 1000)).unwrap();
+        assert!(r.is_empty());
+        assert!(s.1.is_empty());
+    }
+
+    #[test]
+    fn stack_2_require_healthy_source_error_maps_to_observe() {
+        struct Failing;
+        impl HealthSource for Failing {
+            fn observe(&mut self, _: &str) -> Obs {
+                Err(HealthSourceError::new("STATE_CORRUPT", "bad state"))
+            }
+        }
+        let step = step_of(TWO, "app");
+        let mut c = FakeClock::new();
+        let e =
+            require_healthy_dependencies(&step, &mut Failing, &mut c, &pol(100, 1000)).unwrap_err();
+        match &e {
+            DependencyWaitError::Observe {
+                service,
+                dependency,
+                source,
+            } => {
+                assert_eq!(service, "app");
+                assert_eq!(dependency, "a");
+                assert_eq!(source.code(), "STATE_CORRUPT");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(e.code(), "DEPENDENCY_OBSERVE_FAILED");
+        assert_eq!(e.exit_code().get(), 1);
+    }
+
+    #[test]
+    fn stack_2_into_result_maps_gate() {
+        let p = HealthyGate::Permitted { waited: vec![] };
+        assert_eq!(p.into_result("app").unwrap(), vec![]);
+        let b = HealthyGate::Blocked(HealthyWaitOutcome::DeadlineReached {
+            service: "a".into(),
+            last_observed: None,
+            polls: 3,
+        });
+        assert_eq!(b.into_result("app").unwrap_err().exit_code().get(), 7);
     }
 }

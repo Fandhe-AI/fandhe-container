@@ -8,8 +8,9 @@ use std::time::Duration;
 use fandhe_container_stack::depends_on::{
     HealthSource, HealthSourceError, HealthyGate, HealthyWaitOutcome, HealthyWaitPolicy,
     ObservedHealth, PollClock, StartupStep, gate_healthy_dependencies, plan_startup,
+    require_healthy_dependencies, wait::DependencyWaitError,
 };
-use fandhe_container_stack::schema::ComposeToml;
+use fandhe_container_stack::schema::{ComposeToml, DependsOnCondition};
 
 const ACYCLIC: &str = include_str!("../testdata/depends_on_acyclic.toml");
 
@@ -167,4 +168,28 @@ fn stack_2_sleep_overshoot_blocks_without_further_observation() {
         })
     );
     assert_eq!(src.0, 1);
+}
+
+/// STACK-2: worker が healthy にならなければ WaitTimeout と非ゼロ終了コードになり、api は観測しない。
+#[test]
+fn stack_2_healthy_timeout_exits_non_zero() {
+    let step = web_step();
+    let mut src = WorkerScript {
+        values: vec![ObservedHealth::Unhealthy],
+        calls: vec![],
+    };
+    let mut clock = FakeClock(Duration::ZERO);
+    let policy =
+        HealthyWaitPolicy::new(Duration::from_millis(100), Duration::from_millis(1000)).unwrap();
+    let e = require_healthy_dependencies(&step, &mut src, &mut clock, &policy).unwrap_err();
+    assert_eq!(
+        e,
+        DependencyWaitError::WaitTimeout {
+            service: "web".into(),
+            dependency: "worker".into(),
+            condition: DependsOnCondition::Healthy,
+        }
+    );
+    assert_eq!(e.exit_code().get(), 7);
+    assert!(src.calls.iter().all(|n| n == "worker"));
 }

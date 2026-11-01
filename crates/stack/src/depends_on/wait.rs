@@ -15,14 +15,18 @@
 //! 本モジュールにアダプタは無い（実装済みを装わない。REPAIR-3）。core の `HealthStatus` を直接使うかは
 //! #591（healthy）か TASK-155 で再検討し、そのとき [`DependencyObservation`] を拡張する。
 //!
-//! 未実装: `healthy`（state.json ポーリング。#591）、healthy 未達のタイムアウト（#592。本モジュールの
-//! [`DependencyWaitError::WaitTimeout`] と [`WaitPolicy`] を再利用し、別 variant を足さない）、
-//! `completed`。これらの条件は黙って満たしたことにせず [`DependencyWaitError::UnsupportedCondition`] で止める。
+//! `healthy` は `healthy_wait`（#591）が待ち、その期限切れは `require_healthy_dependencies`（#592）が
+//! 本モジュールの [`DependencyWaitError::WaitTimeout`] へ写す（別 variant は足さない。方針の型は
+//! `HealthyWaitPolicy` のまま）。終了コードは [`DependencyWaitError::exit_code`]（STACK-2）。
+//!
+//! 未実装: `completed`、および `wait_for_step` への `healthy` の統合（TASK-155 の配線）。これらの条件は
+//! 黙って満たしたことにせず [`DependencyWaitError::UnsupportedCondition`] で止める。
 //!
 //! エラーにはサービス名と条件だけを入れ、`Service`（`env` に資格情報を含みうる）の内容は出さない。
 //! 待ちには必ず期限がある（REPAIR-5）。
 
 use std::fmt;
+use std::num::NonZeroU8;
 use std::time::{Duration, Instant};
 
 use super::{DependencyWait, StartupStep};
@@ -172,13 +176,13 @@ impl Default for WaitPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DependencyWaitError {
-    /// 期限内に条件を満たさなかった。#592 は healthy でも本 variant を再利用する。
+    /// 期限内に条件を満たさなかった。healthy の期限切れも本 variant（`require_healthy_dependencies`・#592）。
     WaitTimeout {
         service: String,
         dependency: String,
         condition: DependsOnCondition,
     },
-    /// 未対応の条件（healthy は #591、completed は未実装）。黙って満たしたことにしない。
+    /// 未対応の条件（`wait_for_step` では healthy も対象外で `healthy_wait` を通す。completed は未実装）。黙って満たしたことにしない。
     UnsupportedCondition {
         service: String,
         dependency: String,
@@ -203,6 +207,21 @@ impl DependencyWaitError {
             Self::Observe { .. } => "DEPENDENCY_OBSERVE_FAILED",
             Self::InvalidPolicy => "INVALID_ARGUMENT",
         }
+    }
+
+    /// プロセスの非ゼロ終了コード（STACK-2・ERR-2）。
+    ///
+    /// stack は core に依存しないため、core の ERR-2 表（`TIMEOUT`=7・`UNIMPLEMENTED`=8・
+    /// `INTERNAL`=1・`INVALID_ARGUMENT`=2）と同じ値をここに持つ（`compose-convert` と同じ扱い）。
+    /// `NonZeroU8` なので「終了コード 0 の失敗」は表せない。呼び出し元の `up`（TASK-155）が使う。
+    pub fn exit_code(&self) -> NonZeroU8 {
+        let n = match self {
+            Self::WaitTimeout { .. } => 7,
+            Self::UnsupportedCondition { .. } => 8,
+            Self::Observe { .. } => 1,
+            Self::InvalidPolicy => 2,
+        };
+        NonZeroU8::new(n).unwrap_or(NonZeroU8::MIN)
     }
 
     /// 固定の英語メッセージ（名前は含めない）。
@@ -377,6 +396,29 @@ fn wait_started(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_2_wait_error_exit_codes() {
+        let t = DependencyWaitError::WaitTimeout {
+            service: "a".into(),
+            dependency: "b".into(),
+            condition: DependsOnCondition::Healthy,
+        };
+        let u = DependencyWaitError::UnsupportedCondition {
+            service: "a".into(),
+            dependency: "b".into(),
+            condition: DependsOnCondition::Completed,
+        };
+        let o = DependencyWaitError::Observe {
+            service: "a".into(),
+            dependency: "b".into(),
+            source: ObserveError::new("X", "y"),
+        };
+        assert_eq!(t.exit_code().get(), 7);
+        assert_eq!(u.exit_code().get(), 8);
+        assert_eq!(o.exit_code().get(), 1);
+        assert_eq!(DependencyWaitError::InvalidPolicy.exit_code().get(), 2);
+    }
     use crate::depends_on::plan_startup;
     use crate::schema::ComposeToml;
     use std::collections::{BTreeMap, VecDeque};

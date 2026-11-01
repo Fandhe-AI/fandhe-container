@@ -72,6 +72,14 @@ impl SupervisedState {
         Ok(Self { store, id, last })
     }
 
+    /// 同じストア・同じコンテナへ attach し直した別のハンドルを作る(最新のレコードを読む)。
+    ///
+    /// 周期実行(`healthcheck::run_periodic`)の専用スレッドが、監視ループとは別のハンドルで `health` を書くために使う
+    /// (SUP-4・#2953)。2 つのハンドルは revision の楽観的排他で競合し、不一致は呼び出し側の有限リトライが吸収する。
+    pub(crate) fn attach_sibling(&self) -> Result<Self, TraitError> {
+        Self::attach(Arc::clone(&self.store), self.id.clone())
+    }
+
     /// 対象コンテナの ID。
     pub fn id(&self) -> &ContainerId {
         &self.id

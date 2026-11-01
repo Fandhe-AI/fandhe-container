@@ -4,7 +4,7 @@
 //! `healthcheck-exec` のときは偽の helper として振る舞う（`--id` でシナリオを選ぶ）。本物の `HealthExecArgs::parse` で
 //! argv の契約（root・id・pid・timeout・command）を照合し、fd 0 が渡した pidfd 代わりの `/dev/null`、環境変数が空、
 //! cwd が `/` であることを確かめる（外れたら `invalid` を返す）。実コンテナへの exec は行わない（root・namespace 不要で
-//! 既定のテスト集合で動く）。実コンテナでの通しは別（#2953 の結線と実機前提の試験）。
+//! 既定のテスト集合で動く）。配線は `healthcheck_monitor_wiring.rs`（#2953）。実コンテナでの通しは別（実機前提の試験。CLI の書き手の後）。
 //! 成功行は `healthcheck_exec_probe: <シナリオ> ok`。
 
 // 排他作成した 0700 の親（共有 flock つき）を状態ルートの置き場にする共有補助。

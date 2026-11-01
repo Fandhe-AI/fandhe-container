@@ -1,7 +1,7 @@
 # healthcheck の exec 専用 helper（HealthProbe の本番アダプタ）
 
 > **位置づけ**: 採用した設計の判断記録（#2441・SUP-4・SUP-6・SEC-1・SEC-4・REPAIR-5・TASK-161 追補）。実装は `crates/supervisor/src/healthcheck/exec_{wire,helper,reaper,probe}.rs`。
-> 結線（monitor / supervisor 入口への `run_periodic` と `ExecHealthProbe` の組み込み・restart の quiesce の参加者・restart での付け替え）は #2953 が担う。argv[0] の PATH 解決と timeout 上限は #2439（オーナー判断待ち）が担い、本書では現行の拒否を保つ。
+> 結線（monitor / supervisor 入口への `run_periodic` と `ExecHealthProbe` の組み込み・restart での付け替え）は #2953 で実装済み（本書 12 章）。argv[0] の PATH 解決と timeout 上限は #2439（オーナー判断待ち）が担い、本書では現行の拒否を保つ。
 
 ## 1. 目的と範囲
 
@@ -70,7 +70,7 @@
 - 先頭 4096 バイト（`OUTPUT_CAP`。Docker の Output 上限に倣った本実装の判断）だけを `HealthExecReport::output` に保持し、超えた分は読み捨てて合計バイト数と `truncated` を数える
 - `state.json` には書かない（`health` は列挙のまま。要約の追加は core の `StateRecord` のスキーマ変更が要るため範囲外）
 - 構造化ログ `healthcheck_exec` はバイト数と `truncated` だけを載せ、**本文は載せない**（秘密情報・ログ注入・command の中身を出さない方針）
-- 本文は `ExecHealthProbe::last_report()` で読める（後続の inspect や #2953 が使う口）。表示するときは `output_escaped()`（制御文字・非 ASCII をエスケープ）を使う。`TraitError` のメッセージには本文を入れない
+- 本文は `ExecHealthProbe::last_report()` で読める（後続の inspect が使う口（未実装））。表示するときは `output_escaped()`（制御文字・非 ASCII をエスケープ）を使う。`TraitError` のメッセージには本文を入れない
 
 ## 8. タイムアウトの層・cancel・子孫の回収（REPAIR-5）
 
@@ -131,3 +131,27 @@ rootful の supervisor は特権ランチャー由来の ambient capability で 
 - #2439 が決まり、PATH 解決や 60 秒超の timeout を許すとき
 - core が `StateRecord` に healthcheck の出力要約を持てるようになったとき（`state.json` への要約の追加）
 - helper の起動コスト（interval が短い構成）が問題になったとき
+
+## 12. monitor・restart・supervisor 入口への結線（#2953・SUP-4・SUP-3・REPAIR-5）
+
+- **定義の受け渡し**: 起動オプション文書（`FCOPT1`、`container-options-delivery.md`）の kind `health-cmd`（argv を 1 要素ずつ）・
+  `health-interval`・`health-timeout`・`health-start-period`・`health-retries`。復号のたびに `HealthcheckDefinition::parse` と
+  `HealthcheckSchedule::from_definition`（timeout 60 秒以下）に通し直し、不正なら start の手順 2c から手順 4 で fail-closed に止める。
+  **CLI の `create` が文書へ書く処理（`--health-cmd` 等）は未実装**で、書き手ができるまで本番の経路は動かない（定義の無いコンテナと同じ挙動）。
+- **寿命**: 周期実行は monitor の 1 回の呼び出し（`monitor_with_health`）の間だけ専用スレッド `healthcheck-periodic` で回る。監視権の取得と
+  `after_claim` の成功の後に起動し、終了検知・停止要求・wait の失敗の全経路で、記録の書き込みより前に止めて join する。
+  `restart` は世代ごとに monitor を呼ぶので、周期実行は再 launch のたびに新しいプロセスへ付け替わる（probe は世代ごとに工場が作る。
+  pidfd の複製は monitor のスレッド上で起動ハンドルから取る。SEC-1）。
+- **停止**: worker 専用の停止トークンを立て、`WakeableClock`（Condvar）を起こし、`ProbeRunner::cancel_in_flight` で実行中の試行の
+  `ProbeCancel` を立てる（`HealthProbe::cancel` は呼ばない）。完了を `HEALTH_STOP_LIMIT`（3 秒。cgroup.kill 1 秒 + 回収 1 秒 + 余裕。
+  本実装の判断）まで待ち、cancel は待ちの間も再送する。超えたらスレッドを切り離して `health_stop` を `Timeout` で通知する。
+  切り離したスレッドの書き込みは revision の CAS と「Running かつ起動 pid」「自 supervisor の所有」の検査で止まる。
+- **取り残しの防止**: 監視権の取得の書き込みで `health` を `Starting` にする（前の世代の `Healthy` を残さない）。probe を作れない
+  （pidfd が無い等）ときは常に失敗する probe で回し、start_period と retries の後に `Unhealthy` になる（`Healthy` にならない）。
+  スレッドを作れないときは `Unhealthy` を 1 回記録して監視を続ける。
+- **残余**: relaunch の `Running` 再記録から次の監視権取得までの数 ms は前の世代の `health` が見え得る。pid が再利用された場合の
+  切り離しスレッドの極小の窓。停止の cancel で中断された判定が 1 回の失敗として数えられ得る。`monitor_with_capture` への組み込みは
+  しない（本番は `supervise_with_restart_health`）。`last_report` の inspect への表示と #2439 は未実装。実機の通し（`supervisor_bin_real`
+  への healthcheck シナリオ）は CLI の書き手の後。
+- **`@audit.log` の上限**: 定期 exec の拒否の記録でコンテナ起点に tmpfs が増えないよう、core が 16 MiB（`AUDIT_LOG_MAX_BYTES`）を超える追記を
+  `size_limit_exceeded` として代替経路へ回す（`audit-delivery.md`）。

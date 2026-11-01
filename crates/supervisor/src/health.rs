@@ -9,10 +9,10 @@
 //! - 周期実行は [`probe_aggregate_and_record`]（retries・start_period の集約を通して書く。TASK-161.3・#496）と
 //!   [`record_starting`]（開始時の `Starting`）を使う。[`probe_and_record`] は 1 回分の素の判定と記録で、
 //!   Err で即降格・同じ値でも毎回書く従来の挙動を保つ。集約の経路は Err でも `Healthy` を retries まで保つ。
-//! - **未実装**: `monitor` ループからの呼び出し（#2953）。周期実行は `crate::healthcheck::run_periodic`（#495）、コマンドの実行の本番アダプタ
-//!   `crate::healthcheck::ExecHealthProbe`（#2441。Linux）で実装済み。
-//!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
-//!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
+//! - `monitor` ループからの呼び出しは #2953 で実装済み（`crate::run::monitor_with_health`。周期実行は monitor の 1 回の呼び出しの
+//!   間だけ専用スレッドで回り、`crate::healthcheck::HealthWiring` が配線する）。周期実行は `crate::healthcheck::run_periodic`（#495）、
+//!   コマンドの実行の本番アダプタ `crate::healthcheck::ExecHealthProbe`（#2441。Linux）。
+//!   周期実行の停止は [`ProbeRunner::cancel_in_flight`] で実行中の試行の旗を立てて止める。
 //!   healthcheck 定義の検証・シェル連結の禁止は [`crate::healthcheck`]（TASK-161.1）で決定済み。
 //!   コマンド出力のログ出力の扱いは TASK-161 の後続で決める。
 //! - スタブは `Healthy` を返さない。未検査のコンテナを healthy と公開すると `depends_on` の待ち合わせを
@@ -279,6 +279,8 @@ pub struct ProbeRunner {
     in_flight: Arc<InFlight>,
     /// [`probe_and_record`] の 1 呼び出しが判定〜記録の区間を保持している間 `true`。
     busy: Arc<AtomicBool>,
+    /// 実行中の試行の [`ProbeCancel`](試行の間だけ `Some`。[`Self::cancel_in_flight`] が外から立てる。#2953)。
+    current: Arc<std::sync::Mutex<Option<ProbeCancel>>>,
 }
 
 /// [`ProbeRunner`] の排他区間を保持する RAII ガード（判定・記録・降格の間ずっと保持する。panic でも解放される）。
@@ -301,7 +303,30 @@ impl ProbeRunner {
             probe,
             in_flight: Arc::new(InFlight::default()),
             busy: Arc::new(AtomicBool::new(false)),
+            current: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 実行中の試行があれば、その [`ProbeCancel`] の旗を立てる(待たない。[`HealthProbe::cancel`] は呼ばない)。
+    ///
+    /// 周期実行の停止要求(monitor の終了検知・stop・restart。SUP-4・REPAIR-5・#2953)が、`timeout`(最大 60 秒)の
+    /// 満了を待たずに実行中の probe を止めるための口。旗を見る実装(`ExecHealthProbe` 等)は子プロセスを回収して戻る。
+    /// 試行が無ければ何もしない。旗は試行ごとに新しいため、後続の試行を汚さない。
+    pub fn cancel_in_flight(&self) {
+        let guard = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancel) = guard.as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    fn set_current(&self, attempt: Option<ProbeCancel>) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = attempt;
     }
 
     /// 排他区間を待たずに取得する。別の呼び出しが保持中なら `None`（確認と取得は不可分。REPAIR-5）。
@@ -362,7 +387,8 @@ impl ProbeSession<'_> {
         let worker = Arc::clone(&runner.probe);
         let attempt = ProbeCancel::new();
         let worker_attempt = attempt.clone();
-        std::thread::Builder::new()
+        runner.set_current(Some(attempt.clone()));
+        let spawned = std::thread::Builder::new()
             .name("healthcheck-probe".to_owned())
             .spawn(move || {
                 // ローカル変数は宣言の逆順に破棄される。panic 時も計数の解放が送信側の切断より先になるよう、
@@ -376,10 +402,12 @@ impl ProbeSession<'_> {
                 // 受信側が打ち切り済みなら送信失敗になるが、結果は不要なので無視する。
                 let _ = tx.send(result);
             })
-            .map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe")
-            })?;
-        match rx.recv_timeout(timeout) {
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe"));
+        if let Err(e) = spawned {
+            runner.set_current(None);
+            return Err(e);
+        }
+        let result = match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
                 runner.cancel_bounded(timeout, &attempt);
@@ -394,7 +422,10 @@ impl ProbeSession<'_> {
                 ErrorCode::Internal,
                 "healthcheck probe terminated abnormally",
             )),
-        }
+        };
+        // 試行の終了後は外からの cancel の対象にしない(旗は試行ごとの使い捨て)。
+        runner.set_current(None);
+        result
     }
 }
 

@@ -102,10 +102,12 @@
 //! Windows の主経路の隔離と非 Linux の代替経路の選択肢は `docs/design/audit-non-linux.md`（#2430・オーナー承認待ち）
 //! の判断資料にあり、方式は未決定である。
 //!
-//! `@audit.log` にはサイズ上限もローテーションも無い。entrypoint 層の理由（`stdio_null_not_null_device` 等）は
-//! コンテナの中身で引き起こせるため、定期 exec（healthcheck。TASK-161）を配線すると、コンテナ起点で tmpfs の
-//! `/run` が単調に増え得る。配線の前に、サイズ上限（超えたら代替経路へ回して件数を数える）か同じ理由の連続の
-//! 抑制を入れる（SEC-4・CORE-7・REPAIR-5）。
+//! `@audit.log` のサイズ上限（[`AUDIT_LOG_MAX_BYTES`]。16 MiB）は #2953 で入れた。entrypoint 層の理由
+//! （`stdio_null_not_null_device` 等）はコンテナの中身で引き起こせるため、定期 exec（healthcheck。TASK-161）を配線すると、
+//! コンテナ起点で tmpfs の `/run` が単調に増え得る。追記の直前に長さを見て、超えるなら書かずに `size_limit_exceeded`
+//! （主経路の失敗種別）で代替経路へ回す。超過は記録の失敗として通知されるため 1 件ずつ見える（SEC-4・CORE-7・REPAIR-5）。
+//! 同じ理由の連続の抑制とローテーションは未実装（REPAIR-3。helper が probe ごとの別プロセスで連続を判定できないため、
+//! 上限を採った）。
 
 use std::fmt;
 use std::io::Write;
@@ -155,8 +157,8 @@ const NOTIFY_THREAD_EXIT_WAIT: Duration = Duration::from_millis(50);
 ///
 /// 内訳は、主経路（`PRIMARY_WRITE_TIMEOUT` の 8 秒＋kill 後の回収待ち 1 秒）＋代替経路の ACK
 /// （[`KERNEL_AUDIT_ACK_TIMEOUT`]）＋失敗通知（子の `NOTIFY_WAIT` の 200 ms＋kill 後の回収待ち 1 秒＋出し直し
-/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#2441）へ配線する
-/// ときは、`run_command` の `timeout` とは別にこの値が積み上がる。
+/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#2441・#2953 で
+/// 配線済み）では、`run_command` の `timeout` とは別にこの値が積み上がる。
 pub const RECORD_WAIT_LIMIT: Duration = PRIMARY_WRITE_TIMEOUT
     .saturating_add(KILL_REAP_WAIT)
     .saturating_add(KERNEL_AUDIT_ACK_TIMEOUT)
@@ -579,7 +581,7 @@ fn decode_status(status: i32) -> IsolatedOutcome {
 }
 
 /// 子が終了コードで返せる主経路の失敗種別（コード = 添字 + [`KIND_EXIT_BASE`]）。範囲外は `Write` として扱う。
-const PRIMARY_KINDS: [AuditWriteErrorKind; 11] = [
+const PRIMARY_KINDS: [AuditWriteErrorKind; 12] = [
     AuditWriteErrorKind::RelativePath,
     AuditWriteErrorKind::Unsupported,
     AuditWriteErrorKind::NotRegularFile,
@@ -591,6 +593,7 @@ const PRIMARY_KINDS: [AuditWriteErrorKind; 11] = [
     AuditWriteErrorKind::Lock,
     AuditWriteErrorKind::LockFailed,
     AuditWriteErrorKind::Sync,
+    AuditWriteErrorKind::SizeLimit,
 ];
 /// 失敗種別の終了コードの起点（0 は成功、2 は子の panic に使うため 10 から）。
 const KIND_EXIT_BASE: i32 = 10;

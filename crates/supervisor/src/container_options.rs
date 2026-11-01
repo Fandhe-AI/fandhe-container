@@ -19,6 +19,8 @@
 //!
 //! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は start の手順 4b で生成し `with_etc_files` で bind） | core の `LaunchOptions::with_network` |
 //!
+//! | #2953（SUP-4・TASK-161） | healthcheck の定義（[`ContainerOptions::with_healthcheck`]。文書の kind `health-*`。CLI の書き手は後続） | supervisor の入口が `HealthWiring` を組み、monitor が周期実行を起動 |
+//!
 //! | #2828（CLI-1・SUP-12） | `--read-only`（[`ContainerOptions::with_read_only`]。config の `root.readonly` と OR で効き、狭める方向のみ） | core の `LaunchOptions::with_root_readonly`（mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値） |
 //!
 //! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
@@ -75,6 +77,7 @@ pub use network::{NetworkOptions, NetworkSelection};
 pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
+use crate::healthcheck::HealthcheckDefinition;
 use fandhe_container_core::capabilities::CapabilitySet;
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::injected_files::InjectedFileSet;
@@ -143,6 +146,8 @@ pub struct ContainerOptions {
     network: NetworkOptions,
     /// 起動時の再検証を通した pasta のバイナリ(`pasta` の記録があるときだけ。exec に使えるのはこれだけ。NET-9・#1940)。
     pasta: Option<PastaBinary>,
+    /// healthcheck の定義(検証済み。無ければ周期実行を起動しない。SUP-4・TASK-161・#2953)。
+    healthcheck: Option<HealthcheckDefinition>,
 }
 
 impl ContainerOptions {
@@ -195,6 +200,18 @@ impl ContainerOptions {
     /// 再検証済みの pasta のバイナリ(記録が無ければ `None`)。
     pub fn pasta_binary(&self) -> Option<&PastaBinary> {
         self.pasta.as_ref()
+    }
+
+    /// healthcheck の定義を持たせる(SUP-4・TASK-161・#2953)。supervisor の入口が周期実行の配線に使う。
+    #[must_use]
+    pub fn with_healthcheck(mut self, definition: HealthcheckDefinition) -> Self {
+        self.healthcheck = Some(definition);
+        self
+    }
+
+    /// healthcheck の定義(無ければ `None`。周期実行は起動せず `health` も書かない)。
+    pub fn healthcheck(&self) -> Option<&HealthcheckDefinition> {
+        self.healthcheck.as_ref()
     }
 
     /// `--read-only` が指定されたか。

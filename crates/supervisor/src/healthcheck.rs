@@ -12,7 +12,10 @@
 //!   `aggregate` サブモジュールの doc）。
 //! - 判定の本番アダプタ `ExecHealthProbe`（Linux。exec 専用 helper で healthcheck コマンドを実行する。#2441・SUP-4・SUP-6。
 //!   方式と残余は `docs/design/healthcheck-exec-helper.md`）。
-//! - **未実装**: `monitor` / supervisor 入口への組み込み（#2953。親は #492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
+//! - 周期実行の `monitor` / supervisor 入口への組み込みは #2953 で実装済み（`wiring` サブモジュール。[`HealthWiring`]・
+//!   `crate::run::monitor_with_health`・`crate::start_entry::run_supervised_with_health`）。起動オプション文書の
+//!   `health-*` kind が定義を運ぶ（CLI の書き手は未実装。書き手が無い間は本番の経路は動かない）。
+//! - **未実装**: TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
 //!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。
 //! - 既知の食い違い: 定義の timeout 上限（[`MAX_TIMEOUT`] 1 時間）は `probe_and_record` の上限（60 秒）より大きく、
 //!   [`HealthcheckSchedule::from_definition`] が 60 秒超を拒否する。解消は別 issue。
@@ -35,6 +38,7 @@ pub mod exec_reaper;
 #[cfg(target_os = "linux")]
 pub mod exec_wire;
 mod periodic;
+mod wiring;
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -51,6 +55,13 @@ pub use periodic::health_from_exec_exit;
 pub use periodic::{
     HealthcheckClock, HealthcheckLoopOutcome, HealthcheckSchedule, HealthcheckTick, SystemClock,
     run_periodic,
+};
+#[cfg(target_os = "linux")]
+pub use wiring::ExecHealthProbeFactory;
+pub(crate) use wiring::HealthWorker;
+pub use wiring::{
+    FailingProbe, HEALTH_STOP_LIMIT, HealthProbeFactory, HealthStopReport, HealthWiring,
+    WakeableClock,
 };
 
 /// argv の最大要素数。

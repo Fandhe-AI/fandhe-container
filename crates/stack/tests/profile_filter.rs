@@ -146,6 +146,47 @@ profiles = ["dev"]
         assert_eq!(names(&[], &["debug"]).unwrap(), ["debug", "trace", "web"]);
     }
 
+    const DEP_TOML: &str = r#"
+[services.web]
+image = "web:1"
+
+[services.web.depends_on]
+debug = "started"
+
+[services.debug]
+image = "dbg:1"
+profiles = ["dbg"]
+"#;
+
+    fn dep_names(flags: &[&str], targets: &[&str]) -> Result<Vec<String>, ServiceSelectError> {
+        let p: ComposeToml = toml::from_str(DEP_TOML).unwrap();
+        let active = resolve_active_profiles(flags.iter().map(OsStr::new), None).unwrap();
+        let e = select_enabled_services(&p.services, &active, targets.iter().copied())?;
+        Ok(e.select(&p.services).into_keys().collect())
+    }
+
+    /// STACK-10・#633: 有効サービスが無効サービスへ depends_on すると起動前に拒否される。
+    #[test]
+    fn stack_10_depends_on_disabled_service_rejected() {
+        let err = dep_names(&[], &[]).unwrap_err();
+        assert_eq!(
+            err,
+            ServiceSelectError::DisabledDependency {
+                service: "web".to_owned(),
+                dependency: "debug".to_owned()
+            }
+        );
+        assert_eq!(err.code(), "DEPENDS_ON_DISABLED_SERVICE");
+        assert_eq!(err.exit_code().get(), 2);
+    }
+
+    /// 依存先が profile または明示指定で有効なら成功する。
+    #[test]
+    fn stack_10_depends_on_enabled_by_profile_or_target_accepted() {
+        assert_eq!(dep_names(&["dbg"], &[]).unwrap(), ["debug", "web"]);
+        assert_eq!(dep_names(&[], &["debug"]).unwrap(), ["debug", "web"]);
+    }
+
     #[test]
     fn stack_10_unknown_target_is_structured_error() {
         let err = names(&[], &["nope"]).unwrap_err();

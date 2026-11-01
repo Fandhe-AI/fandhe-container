@@ -390,6 +390,11 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
     /// 使用済みバッファ等の割り込み要因を立てる（実配送は TASK-74.2.3・74.3.2）。
     pub fn raise_interrupt(&mut self, reason: InterruptReason) {
         self.interrupt_status |= reason.bit();
+        // VIRTIO 1.2 4.2.2: ConfigGeneration はデバイス側が設定を変えたときだけ進める
+        // （ドライバの書き込みでは進めない）。
+        if matches!(reason, InterruptReason::ConfigChange) {
+            self.config_generation = self.config_generation.wrapping_add(1);
+        }
     }
 
     fn offered_features(&self) -> FeatureBits {
@@ -463,7 +468,6 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             return match self.config_range(offset, data.len()) {
                 Ok(rel) => {
                     self.device.write_config(rel, data);
-                    self.config_generation = self.config_generation.wrapping_add(1);
                     MmioWriteOutcome::Handled
                 }
                 Err(why) => MmioWriteOutcome::Ignored(why),
@@ -1100,8 +1104,11 @@ mod tests {
         assert_eq!(t.write(0x0a8, &[0; 4]), ign(IgnoredAccess::UnknownRegister));
         // 設定空間。
         assert_eq!(t.write(0x100, &[1, 2, 3, 4]), MmioWriteOutcome::Handled);
-        assert_eq!(rd(&t, reg::CONFIG_GENERATION), 1);
+        // ドライバの書き込みでは ConfigGeneration は進まない。
+        assert_eq!(rd(&t, reg::CONFIG_GENERATION), 0);
         assert_eq!(rd(&t, 0x100), 0x0403_0201);
+        t.raise_interrupt(InterruptReason::ConfigChange);
+        assert_eq!(rd(&t, reg::CONFIG_GENERATION), 1);
         assert_eq!(
             t.write(0x1fc, &[0; 8]),
             ign(IgnoredAccess::ConfigOutOfRange)

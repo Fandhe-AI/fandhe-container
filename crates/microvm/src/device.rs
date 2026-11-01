@@ -852,6 +852,7 @@ mod tests {
         assert_eq!(e.message(), "not a KVM VM fd");
     }
 
+    /// MVM-1: vCPU mmap サイズの検証表。
     #[test]
     fn validate_mmap_size_table() {
         assert_eq!(validate_mmap_size(12288).unwrap(), 12288);
@@ -862,6 +863,7 @@ mod tests {
         }
     }
 
+    /// MVM-1: KVM_RUN のエラー分類表。
     #[test]
     fn classify_run_error_table() {
         assert_eq!(

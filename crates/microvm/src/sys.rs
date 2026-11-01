@@ -725,8 +725,6 @@ mod tests {
         assert_eq!(consts::KVM_CREATE_VCPU, 0xAE41);
     }
 
-    /// MVM-1: `KVM_RUN` 系の ioctl 番号と構造体サイズの具体値（`linux/kvm.h`）。
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// REPAIR-5: handler 導入後は自スレッドへ中断シグナルを送ってもプロセスが終了しない（冪等な再導入も可）。
     #[test]
     fn kick_self_after_handler_install_survives() {
@@ -735,6 +733,7 @@ mod tests {
         ThreadId::current().kick().unwrap();
     }
 
+    /// MVM-1: `KVM_RUN` 系の ioctl 番号と構造体サイズの具体値（`linux/kvm.h`）。
     #[test]
     fn run_constants_match_kernel_abi() {
         assert_eq!(consts::KVM_GET_VCPU_MMAP_SIZE, 0xAE04);
@@ -752,7 +751,7 @@ mod tests {
             .unwrap()
     }
 
-    /// KVM でない fd への ioctl は ENOTTY（unsafe 経路を KVM 無しで通す）。
+    /// MVM-1: KVM でない fd への ioctl は ENOTTY（unsafe 経路を KVM 無しで通す）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn run_ioctls_on_non_kvm_fd_are_enotty() {
@@ -765,7 +764,7 @@ mod tests {
         assert_eq!(e, SysError::Os(25));
     }
 
-    /// `/dev/null` は mmap できない（ENODEV）。
+    /// MVM-1: `/dev/null` は mmap できない（ENODEV）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn map_non_mappable_fd_is_enodev() {
@@ -777,6 +776,7 @@ mod tests {
         );
     }
 
+    /// MVM-1: ゲストページへの書き込みの境界検査。
     #[test]
     fn guest_page_write_bounds() {
         let mut p = GuestPage::new().unwrap();
@@ -787,6 +787,7 @@ mod tests {
         assert!(p.write_at(4096, &[]).is_ok());
     }
 
+    /// MVM-1: aarch64 の vCPU 初期化 ioctl 番号。
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn arm_vcpu_constants_match_kernel_abi() {

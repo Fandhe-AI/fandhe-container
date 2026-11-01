@@ -255,6 +255,7 @@ mod tests {
         );
     }
 
+    /// MVM-1: データ無しの IN exit を復号する。
     #[test]
     fn decodes_io_in_without_data() {
         let v = io_area(0, 4, 0x3f8, 2, 4096);
@@ -270,6 +271,7 @@ mod tests {
         );
     }
 
+    /// MVM-1: HLT・SHUTDOWN・未知の exit reason を復号する。
     #[test]
     fn decodes_hlt_shutdown_and_unknown() {
         assert_eq!(decode_exit(&area(KVM_EXIT_HLT)).unwrap(), VcpuExit::Hlt);
@@ -283,6 +285,7 @@ mod tests {
         );
     }
 
+    /// MVM-1: MMIO の read / write exit を復号する。
     #[test]
     fn decodes_mmio_write_and_read() {
         let mut v = area(KVM_EXIT_MMIO);
@@ -306,6 +309,7 @@ mod tests {
         }
     }
 
+    /// MVM-1: FAIL_ENTRY・INTERNAL_ERROR の exit を復号する。
     #[test]
     fn decodes_fail_entry_and_internal_error() {
         let mut v = area(KVM_EXIT_FAIL_ENTRY);
@@ -326,6 +330,7 @@ mod tests {
         );
     }
 
+    /// MVM-1 / REPAIR-2: 不正な IO exit を拒否する。
     #[test]
     fn rejects_malformed_io() {
         let bad = [
@@ -343,6 +348,7 @@ mod tests {
         }
     }
 
+    /// MVM-1 / REPAIR-2: 不正な MMIO 長を拒否する。
     #[test]
     fn rejects_malformed_mmio_len() {
         for len in [0u32, 9] {
@@ -353,6 +359,7 @@ mod tests {
         }
     }
 
+    /// MVM-1 / REPAIR-2: 短すぎる kvm_run 領域を拒否する。
     #[test]
     fn rejects_too_short_area() {
         let e = decode_exit(&vec![0u8; 4]).unwrap_err();

@@ -72,7 +72,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 
 ## /dev/kvm を要する試験の分離
 
-`crates/microvm/tests/kvm_device.rs` の実機前提の試験（3 件）は `#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]` で既定のテスト集合から分離済みで、実行コマンド・必要環境・恒常ルールは AGENTS.md「実機前提テスト」の `kvm_device` の項に置く。KVM を使わない論理（アクセス型・virtqueue のパース）は heap の backing で既定のテスト集合に置き、実機前提へ移さない（ci.md「実機前提テスト」）。
+`crates/microvm/tests/kvm_device.rs` の実機前提の試験（各アーキテクチャで計 4 件）は `#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]` で既定のテスト集合から分離済みで、実行コマンド・必要環境・恒常ルールは AGENTS.md「実機前提テスト」の `kvm_device` の項に置く。KVM を使わない論理（アクセス型・virtqueue のパース）は heap の backing で既定のテスト集合に置き、実機前提へ移さない（ci.md「実機前提テスト」）。
 
 ## 再評価条件
 

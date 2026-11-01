@@ -246,12 +246,12 @@ impl TaskService {
     /// exec のゲート（`execs.lock_container`）は意図して取らない。取ると待っている間ずっと同じコンテナの
     /// Delete / Exec / Start(exec_id) が止まる。期限は shim 側の [`WaitConfig`] だけで決める
     /// （REPAIR-5。`timeout_nano` はハンドラに届かない）。`exited_at` は core が終了時刻を持たないため未設定。
-    fn wait(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+    fn wait(&self, payload: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Vec<u8>, RpcStatus> {
         let req = WaitRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
             return Err(unsupported("exec_id is not supported"));
         }
-        let st = wait_until_stopped(&self.wait_config, || self.adapter.state(&req.id))
+        let st = wait_until_stopped(&self.wait_config, cancelled, || self.adapter.state(&req.id))
             .map_err(|e| to_status(&e))?;
         Ok(WaitResponse {
             exit_status: stopped_exit_status(&st),
@@ -289,8 +289,21 @@ impl TtrpcService for TaskService {
             "Start" => self.start(payload),
             "Delete" => self.delete(payload),
             "Exec" => self.exec(payload),
-            "Wait" => self.wait(payload),
+            "Wait" => self.wait(payload, &|| false),
             _ => Err(unimplemented_status("method", method)),
+        }
+    }
+
+    /// Wait だけ取り消しを伝える。他のメソッドは短時間で終わるため `handle` と同じ。
+    fn handle_cancellable(
+        &self,
+        method: &str,
+        payload: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        match method {
+            "Wait" => self.wait(payload, cancelled),
+            _ => self.handle(method, payload),
         }
     }
 }

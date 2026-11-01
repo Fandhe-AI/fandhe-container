@@ -39,6 +39,16 @@ pub trait TtrpcService: Send + Sync {
     fn name(&self) -> &str;
     /// メソッドを処理する。失敗は [`RpcStatus`] で返す。
     fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcStatus>;
+    /// 長く待つメソッド（Wait 等）向け。`cancelled` が真になったら（サーバー停止・接続切断）待ちを
+    /// 打ち切る契約（REPAIR-5）。既定は取り消しを見ない `handle`。
+    fn handle_cancellable(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        self.handle(method, payload)
+    }
 }
 
 /// 空の Task サービス。全メソッドに `Unimplemented` を返す。
@@ -109,10 +119,19 @@ impl ServiceRegistry {
 
     /// 要求を処理して応答を作る。
     pub fn dispatch(&self, req: &TtrpcRequest) -> TtrpcResponse {
+        self.dispatch_cancellable(req, &|| false)
+    }
+
+    /// 取り消し通知つきで要求を処理する（サーバーの接続ごとの並行 dispatch が使う）。
+    pub fn dispatch_cancellable(
+        &self,
+        req: &TtrpcRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TtrpcResponse {
         let Some(svc) = self.services.get(&req.service) else {
             return status_response(unimplemented_status("service", &req.service));
         };
-        match svc.handle(&req.method, &req.payload) {
+        match svc.handle_cancellable(&req.method, &req.payload, cancelled) {
             Ok(payload) => TtrpcResponse {
                 status: None,
                 payload,

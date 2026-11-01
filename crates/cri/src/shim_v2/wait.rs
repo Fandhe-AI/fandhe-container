@@ -60,16 +60,24 @@ impl Default for WaitConfig {
     }
 }
 
+/// 取り消し確認の刻み。sleep をこの単位に分け、停止要求・接続切断に素早く反応する（REPAIR-5）。
+const CANCEL_SLICE: Duration = Duration::from_millis(10);
+
 /// `probe` を照会して `Stopped` になるまで待つ。照会の失敗は再試行せずそのまま返す。
+/// `cancelled` が真になったら（サーバー停止・接続切断）待ちを打ち切り `Unavailable` で戻る（REPAIR-5）。
 /// 期限の時刻にも必ず 1 回照会してから期限切れと判定する。未起動の `Created` や `Unknown` は終了扱いにしない。
 pub(crate) fn wait_until_stopped(
     cfg: &WaitConfig,
+    cancelled: &dyn Fn() -> bool,
     mut probe: impl FnMut() -> Result<RuntimeContainerStatus, CriError>,
 ) -> Result<RuntimeContainerStatus, CriError> {
     let deadline = Instant::now()
         .checked_add(cfg.timeout)
         .ok_or_else(|| CriError::internal("wait deadline overflow"))?;
     loop {
+        if cancelled() {
+            return Err(CriError::unavailable("wait cancelled"));
+        }
         let st = probe()?;
         if st.lifecycle == RuntimeLifecycle::Stopped {
             return Ok(st);
@@ -78,7 +86,17 @@ pub(crate) fn wait_until_stopped(
         if now >= deadline {
             return Err(CriError::timeout("wait exceeded its deadline"));
         }
-        thread::sleep(cfg.poll_interval.min(deadline - now));
+        let sleep_end = now + cfg.poll_interval.min(deadline - now);
+        loop {
+            if cancelled() {
+                return Err(CriError::unavailable("wait cancelled"));
+            }
+            let now = Instant::now();
+            if now >= sleep_end {
+                break;
+            }
+            thread::sleep(CANCEL_SLICE.min(sleep_end - now));
+        }
     }
 }
 

@@ -274,22 +274,33 @@ fn check_limits(services: &BTreeMap<String, Service>) -> Result<(), PsError> {
     if services.len() > MAX_PS_SERVICES {
         return Err(exceeded(PsLimit::Services));
     }
-    let mut max_width = HEADERS[0].len();
+    // 表示幅（パディング用）とエスケープ後のバイト長を分けて集計する。
+    let mut max_width = display_width(HEADERS[0]);
+    let mut names: Vec<(usize, usize)> = Vec::with_capacity(services.len());
     for name in services.keys() {
         if name.len() > MAX_PS_NAME_BYTES {
             return Err(exceeded(PsLimit::NameBytes));
         }
-        max_width = max_width.max(display_width(&sanitize(name)));
+        let escaped = sanitize(name);
+        let width = display_width(&escaped);
+        max_width = max_width.max(width);
+        names.push((escaped.len(), width));
     }
-    // 1 行 = 名前列（最大幅 + 2）+ 状態列（最大 8 + 2）+ health（最大 9）+ LF。ヘッダー分を足す。
-    let line = max_width
-        .checked_add(2 + 8 + 2 + 9 + 1)
-        .ok_or_else(|| exceeded(PsLimit::OutputBytes))?;
-    let total = line
-        .checked_mul(services.len().saturating_add(1))
-        .ok_or_else(|| exceeded(PsLimit::OutputBytes))?;
-    if total > MAX_PS_OUTPUT_BYTES {
-        return Err(exceeded(PsLimit::OutputBytes));
+    // 1 行 = 名前（バイト長）+ パディング（最大幅 - 表示幅 + 2）+ 状態列（最大 8 + 2）+ health（最大 9）+ LF。
+    let fixed = 2 + 8 + 2 + 9 + 1;
+    let header = (HEADERS[0].len(), display_width(HEADERS[0]));
+    let mut total: usize = 0;
+    for (bytes, width) in std::iter::once(header).chain(names) {
+        let line = bytes
+            .checked_add(max_width - width)
+            .and_then(|v| v.checked_add(fixed))
+            .ok_or_else(|| exceeded(PsLimit::OutputBytes))?;
+        total = total
+            .checked_add(line)
+            .ok_or_else(|| exceeded(PsLimit::OutputBytes))?;
+        if total > MAX_PS_OUTPUT_BYTES {
+            return Err(exceeded(PsLimit::OutputBytes));
+        }
     }
     Ok(())
 }
@@ -490,6 +501,30 @@ mod tests {
         for i in 0..1000 {
             svcs.insert(format!("s{i:04}"), tmpl.clone());
         }
+        let mut f = Fake {
+            map: HashMap::new(),
+            calls: vec![],
+        };
+        let e = ps(&svcs, &mut f).unwrap_err();
+        assert_eq!(
+            e,
+            PsError::LimitExceeded {
+                limit: PsLimit::OutputBytes
+            }
+        );
+        assert!(f.calls.is_empty());
+    }
+
+    #[test]
+    fn stack_8_ps_rejects_utf8_wide_names_by_byte_length() {
+        // 「日」83 文字 + 連番 4 桁 = 253 バイト・表示幅 170。1024 件で実表は 272572 バイト。
+        let tmpl = services(&["z"]).remove("z").unwrap();
+        let mut svcs = BTreeMap::new();
+        for i in 0..MAX_PS_SERVICES {
+            svcs.insert(format!("{}{i:04}", "日".repeat(83)), tmpl.clone());
+        }
+        assert_eq!(svcs.len(), 1024);
+        assert!(svcs.keys().all(|k| k.len() == 253));
         let mut f = Fake {
             map: HashMap::new(),
             calls: vec![],

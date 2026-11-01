@@ -9,7 +9,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -21,31 +20,26 @@ use prost::Message;
 
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 const UNIMPL: i32 = 12;
-static N: AtomicUsize = AtomicUsize::new(0);
 
-/// 試験用ディレクトリ（sun_path の制約のため短い /tmp 直下）。Drop で消す。
+#[path = "support/bounded.rs"]
+mod bounded;
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+/// 試験用ディレクトリ（sun_path の制約のため短い /tmp 直下に 0700 で排他作成する）。Drop で消す。
 struct Scratch {
+    guard: test_root::TestRoot,
     root: PathBuf,
 }
 
 impl Scratch {
     fn new() -> Self {
-        let root = PathBuf::from(format!(
-            "/tmp/fcs-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        Self { root }
+        let guard = test_root::test_root("fcs", "b");
+        let root = guard.to_path_buf();
+        Self { guard, root }
     }
     fn sock_dir(&self) -> PathBuf {
-        self.root.join("s")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        self.guard.join("s")
     }
 }
 
@@ -66,22 +60,8 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> Output {
     .arg(action)
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
     .current_dir(&sc.root)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-    let child = cmd.spawn().unwrap();
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(out) => out.unwrap(),
-        Err(_) => {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-            panic!("shim binary did not exit within 30s");
-        }
-    }
+    .stdin(Stdio::null());
+    bounded::output_within(cmd, Duration::from_secs(30))
 }
 
 fn start_ok(sc: &Scratch, id: &str) -> String {
@@ -249,11 +229,10 @@ fn cri5_872_start_rejects_unsafe_paths() {
 #[test]
 fn cri5_872_invalid_arguments_fail_closed() {
     let sc = Scratch::new();
-    let out = Command::new(BIN)
-        .args(["-namespace", "default", "-address", "/a.sock", "start"])
-        .current_dir(&sc.root)
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["-namespace", "default", "-address", "/a.sock", "start"])
+        .current_dir(&sc.root);
+    let out = bounded::output_within(cmd, bounded::LIMIT);
     assert_failed(&out, "INVALID_ARGUMENT");
     let out = run(&sc, "i", "start", &["-bogus"]);
     assert_failed(&out, "INVALID_ARGUMENT");
@@ -263,12 +242,11 @@ fn cri5_872_invalid_arguments_fail_closed() {
 #[test]
 fn cri5_872_serve_rejects_non_socket_stdin() {
     let sc = Scratch::new();
-    let out = Command::new(BIN)
-        .args(["-namespace", "default", "-address", "/a.sock", "-id", "s"])
+    let mut cmd = Command::new(BIN);
+    cmd.args(["-namespace", "default", "-address", "/a.sock", "-id", "s"])
         .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
         .current_dir(&sc.root)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .stdin(Stdio::null());
+    let out = bounded::output_within(cmd, bounded::LIMIT);
     assert_failed(&out, "FAILED_PRECONDITION");
 }

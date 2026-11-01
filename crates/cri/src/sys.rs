@@ -11,10 +11,17 @@
 //! - 宣言は x86_64 / aarch64 の Linux と macOS で共通の値（`SOL_SOCKET = 1`・`SO_PEERCRED = 17` は Linux 側）
 //!
 //! # `libc` 照合について
-//! 本 crate には `libc` の dev-dependency が無く（#1837 の子の issue で導入する）、機械照合は未導入。
-//! 導入されるまで、定数と構造体の値は Linux uapi（`include/uapi/asm-generic/socket.h`・`struct ucred`）で確認した。
+//! `libc` は dev-dependencies のみで、末尾の `libc_abi` が定数・構造体・関数型をコンパイル時に照合する
+//! （方式は `docs/design/ffi-libc-check.md`。#1837・#1318・REPAIR-12）。Linux の `peer_uid` は LP64 の
+//! x86_64 / aarch64 に限り、それ以外は `Err`（fail-closed）にする。
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+))]
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
@@ -23,7 +30,10 @@ unsafe extern "C" {
     safe fn geteuid() -> u32;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 unsafe extern "C" {
     fn getsockopt(
         fd: i32,
@@ -45,7 +55,10 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 /// `struct ucred`（12 バイト）。`SO_PEERCRED` の結果。
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[repr(C)]
 struct Ucred {
     pid: i32,
@@ -54,7 +67,10 @@ struct Ucred {
 }
 
 /// 接続元の実効 uid（Linux は `SO_PEERCRED`）。
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ()> {
     const SOL_SOCKET: i32 = 1;
     const SO_PEERCRED: i32 = 17;
@@ -91,7 +107,70 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ()> {
 }
 
 /// 対応外の unix では取得できない（呼び出し側は fail-closed にする）。
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+)))]
 pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, ()> {
     Err(())
+}
+
+/// 自前宣言と `libc` のコンパイル時照合（方式は `docs/design/ffi-libc-check.md`）。
+#[cfg(test)]
+mod libc_abi {
+    use super::*;
+
+    const _: unsafe extern "C" fn() -> libc::uid_t = geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod linux {
+        use super::super::*;
+        use std::mem::{align_of, offset_of, size_of};
+
+        const _: () = assert!(1 == libc::SOL_SOCKET);
+        const _: () = assert!(17 == libc::SO_PEERCRED);
+        const _: () = assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        const _: () = assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        const _: () = assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        const _: () = assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        const _: () = assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+        const _: () = assert!(size_of::<u32>() == size_of::<libc::socklen_t>());
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = getsockopt;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = libc::getsockopt;
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::super::*;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = getpeereid;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = libc::getpeereid;
+    }
 }

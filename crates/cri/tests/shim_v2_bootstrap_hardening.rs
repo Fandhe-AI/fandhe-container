@@ -4,60 +4,54 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
-static N: AtomicUsize = AtomicUsize::new(0);
 
-/// 試験用ディレクトリ（sun_path の制約のため短い /tmp 直下）。Drop で消す。
+#[path = "support/bounded.rs"]
+mod bounded;
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+/// 試験用ディレクトリ（sun_path の制約のため短い /tmp 直下に 0700 で排他作成する）。Drop で消す。
 struct Scratch {
+    guard: test_root::TestRoot,
     root: PathBuf,
 }
 
 impl Scratch {
     fn new() -> Self {
-        let root = PathBuf::from(format!(
-            "/tmp/fch-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        Self { root }
+        let guard = test_root::test_root("fch", "h");
+        let root = guard.to_path_buf();
+        Self { guard, root }
     }
     fn sock_dir(&self) -> PathBuf {
-        self.root.join("s")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        self.guard.join("s")
     }
 }
 
 fn run(sc: &Scratch, id: &str, action: &str) -> Output {
-    Command::new(BIN)
-        .args([
-            "-namespace",
-            "default",
-            "-address",
-            "/run/containerd/containerd.sock",
-            "-publish-binary",
-            "/usr/bin/containerd",
-            "-id",
-            id,
-        ])
-        .args(if action == "delete" {
-            vec!["-bundle", "/tmp/b"]
-        } else {
-            vec![]
-        })
-        .arg(action)
-        .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
-        .current_dir(&sc.root)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "-namespace",
+        "default",
+        "-address",
+        "/run/containerd/containerd.sock",
+        "-publish-binary",
+        "/usr/bin/containerd",
+        "-id",
+        id,
+    ])
+    .args(if action == "delete" {
+        vec!["-bundle", "/tmp/b"]
+    } else {
+        vec![]
+    })
+    .arg(action)
+    .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
+    .current_dir(&sc.root)
+    .stdin(Stdio::null());
+    bounded::output_within(cmd, Duration::from_secs(30))
 }
 
 fn start_ok(sc: &Scratch, id: &str) -> String {
@@ -115,4 +109,16 @@ fn plug12_872_owned_socket_dir_is_accepted() {
         std::fs::metadata(&sock).unwrap().uid()
     );
     assert!(run(&sc, "own", "delete").status.success());
+}
+
+/// PLUG-12・REPAIR-4・#872: socket dir が symlink のとき start / delete は失敗し、symlink の先へ ops.log を書かない。
+#[test]
+fn plug12_872_symlinked_socket_dir_gets_no_ops_log() {
+    let sc = Scratch::new();
+    let target = sc.root.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, sc.sock_dir()).unwrap();
+    assert!(!run(&sc, "sl", "start").status.success());
+    assert!(!run(&sc, "sl", "delete").status.success());
+    assert!(!target.join("ops.log").exists());
 }

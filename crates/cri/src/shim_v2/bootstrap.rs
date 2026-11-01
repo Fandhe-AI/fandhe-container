@@ -159,7 +159,7 @@ fn abs_path(s: &str, max: usize) -> Result<PathBuf, CriError> {
 
 /// Go の `flag` 互換で引数を解釈する（`-x v`・`-x=v`・`--x`・`--` を受ける。未知のフラグは拒否）。
 ///
-/// `args` は argv[0] を除いたもの。
+/// `args` は `argv[0]` を除いたもの。
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<ShimInvocation, CriError> {
     let mut list = Vec::new();
     for a in args {
@@ -516,6 +516,10 @@ mod unix_impl {
         }
 
         fn append(&self, line: &str) -> std::io::Result<()> {
+            // 置き場所が検証に通らない（symlink・他人の所有・広い権限）ときは、そのパスへ書かない（PLUG-12）。
+            if let Some(dir) = self.path.parent() {
+                check_socket_dir(dir).map_err(|_| std::io::Error::other("unsafe ops log dir"))?;
+            }
             if let Ok(m) = fs::symlink_metadata(&self.path) {
                 if !m.file_type().is_file() || m.uid() != crate::sys::effective_uid() {
                     return Err(std::io::Error::other("unsafe ops log"));

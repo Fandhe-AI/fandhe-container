@@ -1,0 +1,5 @@
+extends:
+  service: refmarker
+services:
+  web:
+    image: x

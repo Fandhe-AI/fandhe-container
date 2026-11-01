@@ -19,7 +19,7 @@
 //! - 本番の [`NetworkProvisioner`]（`network create` と存在確認）、実 netns への接続の実機確認
 //! - 本番の `DependencyObserver` / `HealthSource`（core の state.json 読み取り）
 //! - CLI 結線（`cli -> stack` の依存辺はユーザー承認事項）、TOML parse の入口と入力サイズの上限検証
-//! - `completed` 条件の待機（未対応として止める）、`down` / `ps` / `logs`（#620〜#622）
+//! - `completed` 条件の待機（未対応として止める）、`ps` / `logs`（#621・#622）
 //! - 1 サービスの複数ネットワーク（CLI の `--network` が 1 回までのため拒否）、rootful（D13 待ち）
 //!
 //! 外部入力の扱い: サービス名と `Service` は TOML 由来。本モジュールはシェルもパスも組み立てず

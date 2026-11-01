@@ -9,6 +9,9 @@
 //! 結果のエラーを `CriError`（ERR-3）へ写す。core の型は公開 API へ漏らさず、
 //! [`RuntimeContainerStatus`] へ写して返す。
 //!
+//! 呼び出し元は `runtime_service` の RPC ハンドラと、shim v2 の `shim_v2::TaskService`（TASK-62.5）。
+//! 同じ [`RuntimeAdapter`] を clone して両方へ渡せる。
+//!
 //! **同期 API**: `ContainerRuntime` は同期トレイトで、plugin 越しの実装は REPAIR-5 のタイムアウトを持つ
 //! RPC になり得る。async ハンドラからは `tokio::task::spawn_blocking` 上で呼ぶこと（`image_pull` の前例）。
 //!
@@ -526,7 +529,8 @@ pub trait BundleProvider: Send + Sync {
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。
 ///
 /// トレイトオブジェクト（[`RuntimeAdapter::new`]）とジェネリクス（[`RuntimeAdapter::from_runtime`]）の
-/// 両方で受けられ、core の具象実装に依存しない。`Clone` は `Arc` の複製で安価。
+/// 両方で受けられ、core の具象実装に依存しない。`Clone` は `Arc` の複製で安価で、複製は同じ実装を指す
+/// （RuntimeService と shim v2 の `TaskService` が共有する。TASK-62.5・CRI-7）。
 #[derive(Clone)]
 pub struct RuntimeAdapter {
     runtime: Arc<dyn ContainerRuntime>,

@@ -14,6 +14,12 @@
 //! - [`exec`]: Exec の検証済み型・登録簿・起動役のトレイト（TASK-62.4）
 //! - `server`（unix のみ）: UDS 上のサーバー
 //!
+//! ContainerRuntime の別アダプタ（TASK-62.5・CRI-5・CRI-7）:
+//! [`TaskService`] は `crate::adapter::RuntimeAdapter`（core の `traits` の `ContainerRuntime`）だけを通して実行層を呼び、
+//! 実行層の具象型・supervisor・RuntimeService の具象には依存しない。`CriRuntimeService::with_runtime` と同じ
+//! adapter を clone して渡せば同一の実装を共有する。照合は `tests/shim_v2_runtime_boundary.rs`（依存の静的照合）と
+//! `tests/shim_v2_shared_runtime.rs`（共有の結合試験）。
+//!
 //! 出典: containerd/ttrpc の `PROTOCOL.md`・`request.proto`・`channel.go`・`server.go`・`services.go`
 //! （commit `232612d3cc492aa0c5c83aedac5d13a31a90b0cd`）。
 //!
@@ -24,7 +30,7 @@
 //!   サーバーは接続内で要求ごとに並行 dispatch し（同時処理数に上限あり）、Wait の待ちは他の RPC を止めない。
 //!   サーバーの停止・接続の切断・応答の書き込み失敗は処理中のハンドラへ通知され、Wait は期限前に取り消される
 //! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Delete の `exited_at`（core が終了時刻を持たず常に未設定）。黙って捨てず `UNIMPLEMENTED`
-//! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #675・#803）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
+//! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #803。cri は supervisor に依存せず `ContainerRuntime` に exec も無い）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
 //!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec` と `Start(exec_id)` を `UNIMPLEMENTED` で拒否する
 //! - UDS の置き場所・権限・peer UID の照合（SO_PEERCRED）。呼び出し元が bind 済みの listener を渡す。#803（TASK-62.7）で扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata`・`timeout_nano` は復号するだけで使わない

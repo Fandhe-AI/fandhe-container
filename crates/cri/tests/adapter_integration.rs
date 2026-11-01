@@ -527,6 +527,11 @@ fn task_59_4_cri_layer_never_spawns_host_processes() {
     rust_files(&src, &mut files);
     assert!(!files.is_empty());
     for file in files {
+        // 唯一の例外: shim v2 の起動バイナリの bootstrap（#872・CRI-5）。自分自身（current_exe）を
+        // デーモンとして再実行するだけで、コンテナのプロセスは起動しない。他のファイルへ広げない。
+        if file.ends_with("shim_v2/bootstrap.rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&file).expect("read source");
         for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
             assert!(

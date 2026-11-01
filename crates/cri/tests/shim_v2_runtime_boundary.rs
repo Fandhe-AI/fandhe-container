@@ -7,8 +7,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EXPECTED: [&str; 9] = [
+const EXPECTED: [&str; 10] = [
     "shim_v2.rs",
+    "bootstrap.rs",
     "exec.rs",
     "frame.rs",
     "message.rs",
@@ -17,6 +18,14 @@ const EXPECTED: [&str; 9] = [
     "task_api.rs",
     "task_service.rs",
     "wait.rs",
+];
+
+/// 起動バイナリの bootstrap（#872・CRI-5）だけが追加で参照してよい workspace 内の項目。
+/// Task サービスの実装ではなくプロセス起動の層で、socket 名の sha256（oci の `Digest`）と
+/// 既定の置き場所の導出（core の `StateRoot`）にだけ使う。他のファイルへ広げない。
+const BOOTSTRAP_ONLY_ALLOWED: [&str; 2] = [
+    "fandhe_container_oci::reference::Digest",
+    "fandhe_container_core::state_store::StateRoot",
 ];
 
 const FORBIDDEN_CRATE_PATHS: [&str; 3] = [
@@ -66,8 +75,10 @@ fn cri7_shim_v2_depends_only_on_core_traits() {
             let mut rest = line;
             while let Some(i) = rest.find("fandhe_container_") {
                 let tail = &rest[i..];
+                let bootstrap_ok = path.ends_with("shim_v2/bootstrap.rs")
+                    && BOOTSTRAP_ONLY_ALLOWED.iter().any(|a| tail.starts_with(a));
                 assert!(
-                    tail.starts_with("fandhe_container_core::traits"),
+                    tail.starts_with("fandhe_container_core::traits") || bootstrap_ok,
                     "{}: forbidden workspace reference: {line}",
                     path.display()
                 );

@@ -1,6 +1,6 @@
 //! UDS 上の ttrpc サーバー（unix のみ。CRI-5・TASK-62.1・MS-7）。
 //!
-//! 呼び出し元（将来は shim の起動経路。#803）が bind 済みの `UnixListener` を渡し、
+//! 呼び出し元（shim の起動経路 `bootstrap`。#872）が bind 済みの `UnixListener` を渡し、
 //! [`TtrpcServer::serve`] が accept スレッドを起こして [`ServerHandle`] を返す。
 //! 接続ごとに 1 スレッドで要求を読み、dispatch は要求ごとのスレッド（接続あたり上限つき）で並行に行う。
 //! 応答の書き込みは接続内で直列化する。待ち中の Wait が後続の RPC を塞がず、サーバー停止・接続切断は
@@ -15,7 +15,7 @@
 //! 計測（REPAIR-4）: [`TtrpcServer::with_recorder`] で渡した [`CriOpRecorder`] へ、要求ごとに固定の
 //! 操作種別・結果コード・所要時間だけを渡す（要求の中身・文言は渡さない）。
 //!
-//! peer UID の照合・socket の配置と権限は扱わない（#803。REPAIR-3）。
+//! peer UID の照合は扱わない（未対応で後続。REPAIR-3）。socket の配置と権限は `bootstrap` が扱う。
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

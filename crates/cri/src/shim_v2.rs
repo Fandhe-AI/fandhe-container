@@ -10,6 +10,7 @@
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
 //! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4）
+//! - [`bootstrap`]: 起動バイナリの start / delete / serve と引数解釈（TASK-62.7.1・#872）
 //! - [`wait`]: Wait の期限と照会間隔の設定・ポーリング本体（TASK-62.3.2）
 //! - [`exec`]: Exec の検証済み型・登録簿・起動役のトレイト（TASK-62.4）
 //! - `server`（unix のみ）: UDS 上のサーバー
@@ -32,11 +33,12 @@
 //! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Delete の `exited_at`（core が終了時刻を持たず常に未設定）。黙って捨てず `UNIMPLEMENTED`
 //! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #803。cri は supervisor に依存せず `ContainerRuntime` に exec も無い）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
 //!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec` と `Start(exec_id)` を `UNIMPLEMENTED` で拒否する
-//! - UDS の置き場所・権限・peer UID の照合（SO_PEERCRED）。呼び出し元が bind 済みの listener を渡す。#803（TASK-62.7）で扱う
+//! - peer UID の照合（SO_PEERCRED）。UDS の置き場所と権限は [`bootstrap`] が扱う（#872）が、接続元の照合は未対応で後続
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata`・`timeout_nano` は復号するだけで使わない
 //! - Windows（named pipe）。listener と転送は unix のみ。ヘッダと封筒の型は全 OS で使える
 //! - 上限超過のペイロードは Go 実装と異なり読み捨てず、`ResourceExhausted` を返して接続を閉じる
 
+pub mod bootstrap;
 pub mod exec;
 pub mod frame;
 pub mod message;

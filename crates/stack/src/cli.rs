@@ -8,7 +8,10 @@
 pub mod logs;
 pub mod up;
 
-pub use logs::{LogSourceError, LogsError, LogsReport, ServiceLogSource, logs};
+pub use logs::{
+    LogSourceError, LogsClock, LogsError, LogsEvent, LogsObserver, LogsOutcome, LogsReport,
+    NoopLogsObserver, ServiceLogSource, SystemLogsClock, logs, logs_observed,
+};
 pub use up::{
     LaunchError, LaunchedService, ServiceLauncher, UpClock, UpError, UpFailure, UpPolicy, UpReport,
     UpStepReport, up,

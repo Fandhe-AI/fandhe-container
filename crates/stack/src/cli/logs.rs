@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::num::NonZeroU8;
+use std::time::{Duration, Instant};
 
 use crate::schema::Service;
 
@@ -200,6 +201,69 @@ fn is_valid_service_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// `logs` 1 回の結果の分類（REPAIR-4）。失敗は `code` だけを持ち、サービスの中身を運ばない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogsOutcome {
+    /// 成功。
+    Success {
+        /// 出力先へ書いたバイト数。
+        bytes_written: u64,
+    },
+    /// 名前の検証失敗（`INVALID_ARGUMENT`）。
+    InvalidServiceName,
+    /// 定義に無いサービス（`NOT_FOUND`）。
+    UnknownService,
+    /// 読み出し元の失敗。`code` はソースの値。
+    SourceFailed {
+        /// ソースの code。
+        code: &'static str,
+    },
+    /// 出力先への書き込み失敗（`INTERNAL`）。
+    OutputFailed,
+}
+
+/// `logs` 1 回の観測記録。結果の種別と所要時間だけを持つ（ログ本文・env は含めない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsEvent {
+    /// 結果の分類。
+    pub outcome: LogsOutcome,
+    /// 呼び出しの開始から結果確定までの所要時間。
+    pub elapsed: Duration,
+}
+
+/// `logs` の結果と所要時間を受けるポート（REPAIR-4）。
+///
+/// 本番では構造化ログ / メトリクスへ流すアダプタを #3639 の結線で注入する。
+/// 実装は `logs` の戻り値を変えず、ブロックしてはならない。
+pub trait LogsObserver {
+    /// 1 回の `logs` の終了ごとに 1 度だけ呼ばれる（成功・失敗を問わない）。
+    fn record(&mut self, event: &LogsEvent);
+}
+
+/// 何も記録しない観測ポート。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopLogsObserver;
+
+impl LogsObserver for NoopLogsObserver {
+    fn record(&mut self, _event: &LogsEvent) {}
+}
+
+/// 時刻の取得元。試験で決定的な時刻を注入するために分ける。
+pub trait LogsClock {
+    /// 現在時刻。
+    fn now(&mut self) -> Instant;
+}
+
+/// 実時刻（[`Instant::now`]）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemLogsClock;
+
+impl LogsClock for SystemLogsClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// 書いたバイト数を数え、書き込み失敗を記録する出力先ラッパー。
 struct CountingWriter<'a, W: Write> {
     inner: &'a mut W,
@@ -242,11 +306,61 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
-/// `service` のログを `out` へ流す（STACK-8）。
+/// `service` のログを `out` へ流す（STACK-8）。観測は行わない（[`logs_observed`] の薄い包み）。
+pub fn logs<S: ServiceLogSource, W: Write>(
+    services: &BTreeMap<String, Service>,
+    service: &str,
+    source: &mut S,
+    out: &mut W,
+) -> Result<LogsReport, LogsError> {
+    logs_observed(
+        services,
+        service,
+        source,
+        out,
+        &mut NoopLogsObserver,
+        &mut SystemLogsClock,
+    )
+}
+
+/// `service` のログを `out` へ流し、結果と所要時間を `observer` へ 1 件記録する（STACK-8・REPAIR-4）。
 ///
 /// 名前の検証と定義への存在照合を通ったときだけ `source` を呼ぶ。`services` は profiles で
 /// 絞り込み済みの map を受ける（`up` と同じ前提。絞られて消えたサービスも `NOT_FOUND`）。
-pub fn logs<S: ServiceLogSource, W: Write>(
+/// 検証失敗・読み出し失敗・出力失敗・成功のいずれでも `observer` は 1 度だけ呼ばれる。
+pub fn logs_observed<S, W, O, C>(
+    services: &BTreeMap<String, Service>,
+    service: &str,
+    source: &mut S,
+    out: &mut W,
+    observer: &mut O,
+    clock: &mut C,
+) -> Result<LogsReport, LogsError>
+where
+    S: ServiceLogSource,
+    W: Write,
+    O: LogsObserver,
+    C: LogsClock,
+{
+    let start = clock.now();
+    let result = run_logs(services, service, source, out);
+    let outcome = match &result {
+        Ok(r) => LogsOutcome::Success {
+            bytes_written: r.bytes_written,
+        },
+        Err(LogsError::InvalidServiceName) => LogsOutcome::InvalidServiceName,
+        Err(LogsError::UnknownService { .. }) => LogsOutcome::UnknownService,
+        Err(LogsError::Source { source, .. }) => LogsOutcome::SourceFailed {
+            code: source.code(),
+        },
+        Err(LogsError::Output) => LogsOutcome::OutputFailed,
+    };
+    let elapsed = clock.now().saturating_duration_since(start);
+    observer.record(&LogsEvent { outcome, elapsed });
+    result
+}
+
+fn run_logs<S: ServiceLogSource, W: Write>(
     services: &BTreeMap<String, Service>,
     service: &str,
     source: &mut S,
@@ -330,5 +444,107 @@ mod tests {
             assert_eq!(e.exit_code().get(), exit);
         }
         assert_eq!(LogSourceError::new("X", "y", 0).exit_code().get(), 1);
+    }
+
+    struct FakeClock {
+        base: Instant,
+        calls: u32,
+    }
+
+    impl LogsClock for FakeClock {
+        fn now(&mut self) -> Instant {
+            self.calls += 1;
+            self.base + Duration::from_millis(u64::from(self.calls - 1) * 250)
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder(Vec<LogsEvent>);
+
+    impl LogsObserver for Recorder {
+        fn record(&mut self, event: &LogsEvent) {
+            self.0.push(event.clone());
+        }
+    }
+
+    struct FakeSource(Result<&'static [u8], LogSourceError>);
+
+    impl ServiceLogSource for FakeSource {
+        fn write_logs(
+            &mut self,
+            _service: &str,
+            _spec: &Service,
+            out: &mut dyn Write,
+        ) -> Result<(), LogSourceError> {
+            match &self.0 {
+                Ok(b) => out
+                    .write_all(b)
+                    .map_err(|_| LogSourceError::new("INTERNAL", "w", 1)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+    }
+
+    struct FailWriter;
+
+    impl Write for FailWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("x"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn observe<W: Write>(
+        services: &BTreeMap<String, Service>,
+        name: &str,
+        mut src: FakeSource,
+        out: &mut W,
+    ) -> (bool, Vec<LogsEvent>) {
+        let mut rec = Recorder::default();
+        let mut clock = FakeClock {
+            base: Instant::now(),
+            calls: 0,
+        };
+        let ok = logs_observed(services, name, &mut src, out, &mut rec, &mut clock).is_ok();
+        (ok, rec.0)
+    }
+
+    /// REPAIR-4・STACK-8: 成功と各失敗で結果と所要時間が 1 件ずつ記録される。
+    #[test]
+    fn repair_4_logs_observer_records_each_outcome() {
+        let mut services = BTreeMap::new();
+        services.insert("web".to_string(), Service::default());
+        let ms = Duration::from_millis(250);
+        let one = |outcome| {
+            vec![LogsEvent {
+                outcome,
+                elapsed: ms,
+            }]
+        };
+
+        let (ok, ev) = observe(&services, "web", FakeSource(Ok(b"hello")), &mut Vec::new());
+        assert!(ok);
+        assert_eq!(ev, one(LogsOutcome::Success { bytes_written: 5 }));
+
+        let (ok, ev) = observe(&services, "a/b", FakeSource(Ok(b"")), &mut Vec::new());
+        assert!(!ok);
+        assert_eq!(ev, one(LogsOutcome::InvalidServiceName));
+
+        let (_, ev) = observe(&services, "db", FakeSource(Ok(b"")), &mut Vec::new());
+        assert_eq!(ev, one(LogsOutcome::UnknownService));
+
+        let err = LogSourceError::new("UNAVAILABLE", "x", 9);
+        let (_, ev) = observe(&services, "web", FakeSource(Err(err)), &mut Vec::new());
+        assert_eq!(
+            ev,
+            one(LogsOutcome::SourceFailed {
+                code: "UNAVAILABLE"
+            })
+        );
+
+        let (_, ev) = observe(&services, "web", FakeSource(Ok(b"x")), &mut FailWriter);
+        assert_eq!(ev, one(LogsOutcome::OutputFailed));
     }
 }

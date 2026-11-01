@@ -451,6 +451,10 @@ fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
             dropped = dropped.saturating_add(1);
             continue;
         }
+        if line.starts_with(super::exec_wire::CGROUP_TAG.as_bytes()) {
+            // 作成通知行は `owned_exec_cgroup` が読む。結果行でも診断行でもないので数えない。
+            continue;
+        }
         if line.starts_with(super::exec_wire::WIRE_TAG.as_bytes()) {
             results.push(line);
         } else if line.starts_with(b"{\"") && line.len() <= DIAG_LINE_MAX {
@@ -476,6 +480,40 @@ fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
         result,
         forwarded,
         dropped,
+    }
+}
+
+/// 結果ストリームから、helper が排他作成に成功したと通知した exec 子 cgroup の名前を取り出す。
+///
+/// 通知（`FCHC1 <name>\n`。[`super::exec_wire::CGROUP_TAG`]）が無い・名前が不正・名前の pid が `helper_pid` と
+/// 食い違う場合は `None`（所有を確定できないので止めない）。helper の pid から名前を推定しない理由: 再利用された
+/// pid の以前の exec が残した populated な同名 cgroup を誤停止し得るため（SUP-6・REPAIR-5）。
+fn owned_exec_cgroup(bytes: &[u8], helper_pid: u32) -> Option<ExecCgroupName> {
+    let prefix = format!("{} ", super::exec_wire::CGROUP_TAG);
+    let owner = format!("exec-{helper_pid}-");
+    bytes
+        .split(|&b| b == b'\n')
+        // 改行で終わらない末尾（途中で切れた行）は採らない。
+        .take(bytes.iter().filter(|&&b| b == b'\n').count())
+        .filter_map(|line| {
+            std::str::from_utf8(line)
+                .ok()?
+                .strip_prefix(prefix.as_str())
+        })
+        .find_map(|name| {
+            let name = ExecCgroupName::new(name).ok()?;
+            name.as_str().starts_with(&owner).then_some(name)
+        })
+}
+
+/// 所有を確定した cgroup `owned` があるときだけ `stop` で止める。無ければ何もせず `true`（止める対象が無い）。
+fn stop_if_owned(
+    owned: Option<&ExecCgroupName>,
+    stop: impl FnOnce(&ExecCgroupName) -> bool,
+) -> bool {
+    match owned {
+        Some(name) => stop(name),
+        None => true,
     }
 }
 
@@ -662,18 +700,21 @@ impl ExecHealthProbe {
         }
     }
 
-    /// helper が作った exec 子 cgroup（`exec-<helper pid>-0`。fresh な単一プロセスの最初の
-    /// `ExecCgroupName::unique()`）を、起動前に保持した配置の直下で `cgroup.kill` して削除する。
-    /// 状態ストアは読まない。失敗は `false` で返す（残った cgroup は次回の掃除と delete 前の掃除が回収する）。
-    /// 待機は `CGROUP_KILL_TIMEOUT` まで。
-    fn kill_exec_cgroup(&self, record: &StateRecord, helper_pid: u32) -> bool {
-        let Ok(name) = ExecCgroupName::new(&format!("exec-{helper_pid}-0")) else {
-            return false;
-        };
-        let Some(placement) = record.cgroup() else {
-            return false;
-        };
-        remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT).is_ok()
+    /// helper が **排他作成に成功したと通知した** exec 子 cgroup `owned`（[`owned_exec_cgroup`]）を、起動前に保持した
+    /// 配置の直下で `cgroup.kill` して削除する。通知が無ければ何も止めない。
+    ///
+    /// 方式の選択: helper の pid から `exec-<pid>-0` を推定すると、再利用された pid の以前の exec が残した populated な
+    /// 同名 cgroup を誤停止し得る（作成前に期限切れになった場合）。そのため core の既存の排他作成（同名は `EEXIST` で
+    /// 失敗）の成功を helper が通知し、受けた名前だけを止める。残る窓: 作成の完了から通知の書き込み・読み取りまでの間に
+    /// helper が殺されると名前を知れず止められない（空でなければ次回の exec 開始時の掃除・delete 前の掃除に任せる。
+    /// 空の cgroup は掃除が回収する）。状態ストアは読まない。失敗は `false`。待機は `CGROUP_KILL_TIMEOUT` まで。
+    fn kill_exec_cgroup(&self, record: &StateRecord, owned: Option<&ExecCgroupName>) -> bool {
+        stop_if_owned(owned, |name| {
+            let Some(placement) = record.cgroup() else {
+                return false;
+            };
+            remove_exec_child_cgroup(&self.target.id, placement, name, CGROUP_KILL_TIMEOUT).is_ok()
+        })
     }
 
     fn run(&self, timeout: Duration, cancel: &ProbeCancel) -> Result<HealthStatus, TraitError> {
@@ -888,8 +929,24 @@ impl ExecHealthProbe {
         let mut reaped = matches!(ended, Ended::Exited(_));
         // helper が SIGKILL・OOM 等で異常終了したときは結果行を残せず、exec 子 cgroup の後始末が走っていない
         // 可能性があるため、正常終了以外は所有を確認した cgroup を止める（SUP-4・SUP-6）。
-        if matches!(ended, Ended::Exited(false)) && !self.kill_exec_cgroup(&record, child.id()) {
-            cgroup_stop_failed = true;
+        // 止める対象は、helper の作成通知を受けた cgroup だけ（読み取り直後に確認する）。
+        let mut stopped = false;
+        if matches!(ended, Ended::Exited(false)) {
+            read_all(
+                &mut out_eof,
+                &mut res_eof,
+                &mut output,
+                &mut results,
+                &mut out_parent,
+                &mut res_parent,
+            );
+            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            if owned.is_some() {
+                stopped = true;
+            }
+            if !self.kill_exec_cgroup(&record, owned.as_ref()) {
+                cgroup_stop_failed = true;
+            }
         }
         if !reaped {
             // 回収前の `Child` でだけ kill する（pid 再利用を避ける）。
@@ -897,7 +954,19 @@ impl ExecHealthProbe {
             // helper だけの SIGKILL では worker とコマンドの子孫が残り得る（親死亡シグナルはコマンドが解除でき、
             // fork した子孫へ継承されない）ため、supervisor 側から exec 子 cgroup を `cgroup.kill` する
             // （SUP-4・SUP-6・REPAIR-5）。名前は helper の pid から導く。回収前の `Child` を持つ間は pid が再利用されない。
-            if !self.kill_exec_cgroup(&record, child.id()) {
+            read_all(
+                &mut out_eof,
+                &mut res_eof,
+                &mut output,
+                &mut results,
+                &mut out_parent,
+                &mut res_parent,
+            );
+            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            if owned.is_some() {
+                stopped = true;
+            }
+            if !self.kill_exec_cgroup(&record, owned.as_ref()) {
                 cgroup_stop_failed = true;
             }
             let reap_deadline = Instant::now() + REAP_TIMEOUT;
@@ -926,6 +995,14 @@ impl ExecHealthProbe {
             std::thread::sleep(POLL_STEP);
         }
 
+        // helper の終了後に届いた作成通知（作成の直後に期限切れで殺され、通知が読み取りに間に合わなかった場合）も、
+        // ソケットに残った分を読んだ結果で拾って止める（SUP-6・REPAIR-5）。
+        if !stopped && !matches!(ended, Ended::Exited(true)) {
+            let owned = owned_exec_cgroup(&results.bytes, child.id());
+            if !self.kill_exec_cgroup(&record, owned.as_ref()) {
+                cgroup_stop_failed = true;
+            }
+        }
         report.helper_reaped = reaped;
         report.cgroup_stop_failed = cgroup_stop_failed;
         report.output = output.kept;
@@ -1400,6 +1477,70 @@ mod tests {
         );
         assert!(attempt.is_cancelled());
         assert!(!probe.busy.load(Ordering::SeqCst));
+    }
+
+    /// SUP-6・REPAIR-5（#2441）: 作成通知が無ければ所有を確定できず何も止めない。同名の populated な cgroup が
+    /// 既にあっても（pid の再利用）停止も削除もしない。
+    #[test]
+    fn sup6_2441_stale_same_name_cgroup_is_not_stopped_without_creation_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "fandhe-hc-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let helper_pid = 4242u32;
+        let stale = root.join(format!("exec-{helper_pid}-0"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("cgroup.procs"), b"777\n").unwrap();
+
+        // 結果行と診断行だけで、作成通知が無い。
+        let stream = b"{\"diag\":1}\nFCHX1 stale\n";
+        let owned = owned_exec_cgroup(stream, helper_pid);
+        assert_eq!(owned, None);
+        let mut called = false;
+        assert!(stop_if_owned(owned.as_ref(), |_| {
+            called = true;
+            true
+        }));
+        assert!(!called);
+        assert_eq!(
+            std::fs::read(stale.join("cgroup.procs")).unwrap(),
+            b"777\n".to_vec()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// SUP-6（#2441）: 作成通知を受けた名前だけを止める。pid の食い違い・不正な名前・途中で切れた行は採らない。
+    #[test]
+    fn sup6_2441_only_the_notified_cgroup_of_this_helper_is_owned() {
+        let ok = owned_exec_cgroup(b"FCHC1 exec-4242-0\nFCHX1 stale\n", 4242).unwrap();
+        assert_eq!(ok.as_str(), "exec-4242-0");
+        let mut stopped = Vec::new();
+        assert!(stop_if_owned(Some(&ok), |n| {
+            stopped.push(n.as_str().to_owned());
+            true
+        }));
+        assert_eq!(stopped, vec!["exec-4242-0".to_owned()]);
+        // 別 pid の名前（偽造・古い通知）。
+        assert_eq!(owned_exec_cgroup(b"FCHC1 exec-1-0\n", 4242), None);
+        // 不正な名前。
+        assert_eq!(owned_exec_cgroup(b"FCHC1 ../exec-4242-0\n", 4242), None);
+        // 改行で終わらない途中の行。
+        assert_eq!(owned_exec_cgroup(b"FCHC1 exec-4242-0", 4242), None);
+        // 停止の失敗は false で返る。
+        assert!(!stop_if_owned(Some(&ok), |_| false));
+    }
+
+    /// SUP-4（#2441）: 作成通知行は結果行の数にも診断行の破棄数にも入らない。
+    #[test]
+    fn sup4_2441_cgroup_notice_line_does_not_disturb_result_parsing() {
+        let sink = ResultSink {
+            bytes: b"FCHC1 exec-4242-0\nFCHX1 stale\n".to_vec(),
+            overflow: false,
+        };
+        let parsed = parse_result_stream(&sink);
+        assert_eq!(parsed.result, Ok(HealthExecLine::Stale));
+        assert_eq!(parsed.dropped, 0);
     }
 
     /// REPAIR-5（#2441）: 前回の `hc-resolve` が未終了なら新しい取得スレッドを作らず `Unavailable`（in-flight は 1 本）。

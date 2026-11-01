@@ -340,7 +340,15 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
         Err(_) => return HealthExecLine::Invalid,
     };
     let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
-    let result = crate::exec::run_command_with_pidfd_output(
+    // 排他作成に成功した exec 子 cgroup の名前を、結果行より先に fd 2 へ通知する（supervisor はこれを受けた
+    // cgroup だけを停止する。pid からの推定はしない）。
+    let notify = |name: &fandhe_container_core::exec::ExecCgroupName| {
+        let mut err = std::io::stderr();
+        let _ = err
+            .write_all(&super::exec_wire::encode_cgroup_created(name))
+            .and_then(|()| err.flush());
+    };
+    let result = crate::exec::run_command_with_pidfd_output_notify(
         &record,
         stdin.as_fd(),
         &request,
@@ -348,6 +356,7 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
         &sink,
         &launch_env,
         stdout.as_fd(),
+        Some(&notify),
     );
     line_from_result(result)
 }

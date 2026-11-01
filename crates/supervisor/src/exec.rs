@@ -1069,7 +1069,9 @@ pub fn run_command_with_pidfd_env(
     audit: &dyn AuditSink,
     launch_env: &[String],
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
-    run_command_with_pidfd_inner(record, pidfd, request, timeout, audit, launch_env, None)
+    run_command_with_pidfd_inner(
+        record, pidfd, request, timeout, audit, launch_env, None, None,
+    )
 }
 
 /// [`run_command_with_pidfd_env`] に、コマンドの stdout / stderr の取得先 `output` を足した入口
@@ -1090,6 +1092,29 @@ pub fn run_command_with_pidfd_output(
     launch_env: &[String],
     output: BorrowedFd<'_>,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_output_notify(
+        record, pidfd, request, timeout, audit, launch_env, output, None,
+    )
+}
+
+/// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
+/// （healthcheck の exec 専用 helper 用。SUP-4・SUP-6・REPAIR-5・#2441）。
+///
+/// `on_created` は `mkdirat` の排他作成（既存の同名は `EEXIST` で失敗し採用しない）に成功した直後、worker を fork する
+/// 前に 1 回だけ呼ばれる。呼び出しプロセスの外側（supervisor）は、この通知を受けた cgroup だけを「今回の作成物」として
+/// 停止してよい。pid から名前を推定すると、再利用された pid の以前の exec の同名 cgroup を誤停止し得るため。
+/// 作成に失敗した・記録に cgroup 配置が無い場合は呼ばれない。他の契約は [`run_command_with_pidfd_output`] と同じ。
+#[allow(clippy::too_many_arguments)]
+pub fn run_command_with_pidfd_output_notify(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    launch_env: &[String],
+    output: BorrowedFd<'_>,
+    on_created: Option<&dyn Fn(&ExecCgroupName)>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     run_command_with_pidfd_inner(
         record,
         pidfd,
@@ -1098,11 +1123,13 @@ pub fn run_command_with_pidfd_output(
         audit,
         launch_env,
         Some(output),
+        on_created,
     )
 }
 
 /// [`run_command_with_pidfd_env`] と [`run_command_with_pidfd_output`] の共通本体。`output` が `None` なら
 /// コマンドの標準入出力は 3 本とも `/dev/null`。
+#[allow(clippy::too_many_arguments)]
 fn run_command_with_pidfd_inner(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
@@ -1111,6 +1138,7 @@ fn run_command_with_pidfd_inner(
     audit: &dyn AuditSink,
     launch_env: &[String],
     output: Option<BorrowedFd<'_>>,
+    on_created: Option<&dyn Fn(&ExecCgroupName)>,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
@@ -1119,7 +1147,14 @@ fn run_command_with_pidfd_inner(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
-        || create_child_cgroup(record, &name),
+        || {
+            let created = create_child_cgroup(record, &name)?;
+            // 排他作成に成功した（所有を確定した）直後にだけ通知する。
+            if let (Some(_), Some(notify)) = (&created, on_created) {
+                notify(&name);
+            }
+            Ok(created)
+        },
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?

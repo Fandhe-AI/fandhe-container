@@ -26,6 +26,16 @@ use fandhe_container_core::traits::ErrorCode;
 /// 結果行の識別子（版つき）。
 pub const WIRE_TAG: &str = "FCHX1";
 
+/// exec 子 cgroup の作成通知行の識別子（`FCHC1 <exec 子 cgroup 名>\n`）。結果行（[`WIRE_TAG`]）とは別で、
+/// helper が排他作成に成功した直後に fd 2 へ 1 回だけ書く。supervisor はこの通知を受けた cgroup だけを
+/// 停止する（pid から名前を推定しない。SUP-4・SUP-6・REPAIR-5・#2441）。
+pub const CGROUP_TAG: &str = "FCHC1";
+
+/// 作成通知行を組む（`FCHC1 <name>\n`。名前は検証済みの [`ExecCgroupName`]）。
+pub fn encode_cgroup_created(name: &fandhe_container_core::exec::ExecCgroupName) -> Vec<u8> {
+    format!("{CGROUP_TAG} {}\n", name.as_str()).into_bytes()
+}
+
 /// 結果行の最大バイト数（改行を含まない）。
 pub const LINE_MAX: usize = 256;
 

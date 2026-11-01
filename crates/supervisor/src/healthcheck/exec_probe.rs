@@ -1015,6 +1015,13 @@ impl ExecHealthProbe {
             ));
         }
         let _guard = BusyGuard { busy: &self.busy };
+        // 排他を取れた試行だけが `cancel` の宛先を登録する。拒否された試行は `current` に触れないので、
+        // 実行中の試行への `cancel()` が失われない。区間を抜けても消さない（次の試行が排他の中で置き換える。
+        // 終わった試行の旗が立っても無害。SUP-4・REPAIR-5）。
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cancel.clone();
         // 旗は試行ごとに別なので、開始時に消さない。遅れた前の回の cancel は前の回の旗にだけ立ち、
         // 今回の旗に先に立った cancel も失われない（SUP-4・REPAIR-5）。
         self.run(timeout, cancel)
@@ -1023,13 +1030,8 @@ impl ExecHealthProbe {
 
 impl HealthProbe for ExecHealthProbe {
     fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
-        // 直接呼び出しでは新しい旗を作って `cancel` の宛先にする（`ProbeRunner` は `probe_cancellable` を使う）。
-        let attempt = ProbeCancel::new();
-        *self
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = attempt.clone();
-        self.probe_with(timeout, &attempt)
+        // 直接呼び出しでは新しい旗を作る。`cancel` の宛先への登録は排他を取れた後に `probe_with` が行う。
+        self.probe_with(timeout, &ProbeCancel::new())
     }
 
     fn probe_cancellable(
@@ -1340,14 +1342,29 @@ mod tests {
     #[test]
     fn sup4_2441_second_concurrent_probe_is_unavailable_and_cancel_returns() {
         let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        // 試行 A が排他を保持して実行中の状態（A の旗を登録済み）。
+        let running = ProbeCancel::new();
+        *probe.current.lock().unwrap() = running.clone();
         probe.busy.store(true, Ordering::SeqCst);
+        // 拒否された B は `current` に触れない。
         let err = probe.probe(Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Unavailable);
-        probe.busy.store(false, Ordering::SeqCst);
-        let attempt = ProbeCancel::new();
-        *probe.current.lock().unwrap() = attempt.clone();
+        let err = probe
+            .probe_cancellable(Duration::from_secs(1), &ProbeCancel::new())
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert!(!running.is_cancelled());
+        // その後の `cancel()` は実行中の A の旗を立てる。
         probe.cancel();
-        assert!(attempt.is_cancelled());
+        assert!(running.is_cancelled());
+        probe.busy.store(false, Ordering::SeqCst);
+        // A が打ち切られるのを実経路でも確認する: 排他を取った試行は自分の旗を登録し、cancel で Cancelled になる。
+        let real = ProbeCancel::new();
+        real.cancel();
+        let err = probe
+            .probe_cancellable(Duration::from_secs(5), &real)
+            .unwrap_err();
+        assert_eq!(err.message(), "healthcheck probe was cancelled");
     }
 
     /// REPAIR-5・SUP-4（#2441）: 前の回の試行の旗に遅れて届いた cancel は、次の回の旗を汚さず `Cancelled` にしない。

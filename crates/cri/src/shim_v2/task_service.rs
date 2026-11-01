@@ -1,4 +1,4 @@
-//! containerd Task API の Create / Start / Delete / Exec / Wait を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.4・MS-7）。
+//! containerd Task API の Create / Start / Delete / Exec / Wait を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・MS-7）。
 //!
 //! [`ServiceRegistry::dispatch`](super::service::ServiceRegistry::dispatch) から呼ばれる同期ハンドラで、
 //! 接続ごとのスレッド上で動く。コンテナの作成・起動は [`RuntimeAdapter`] 経由で行い、core の具象型には

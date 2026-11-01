@@ -1,4 +1,4 @@
-//! containerd Task API の Create / Start / Delete / Exec を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.4・MS-7）。
+//! containerd Task API の Create / Start / Delete / Exec / Wait を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.4・MS-7）。
 //!
 //! [`ServiceRegistry::dispatch`](super::service::ServiceRegistry::dispatch) から呼ばれる同期ハンドラで、
 //! 接続ごとのスレッド上で動く。コンテナの作成・起動は [`RuntimeAdapter`] 経由で行い、core の具象型には
@@ -17,9 +17,14 @@
 //! Delete の検査の順序: 復号（repeated / `Any` の欄が無いので走査は不要）→ exec_id → id（アダプタ）。
 //! 手順は state（削除前の pid・終了コードを採る）→ `remove(force=false)`。containerd の Delete に force は
 //! 無く、実行中のコンテナは core の `FailedPrecondition`（9）で拒否される。応答の `exit_status` は
-//! 終了コード（不明は 255）、`exited_at` は core が終了時刻を持たないため常に未設定（REPAIR-3。Wait は #871）。
+//! 終了コード（不明は 255）、`exited_at` は core が終了時刻を持たないため常に未設定（REPAIR-3）。
 //! 既知の制約: state と remove の間に状態が変わりうる（その場合の `exit_status` は不正確）。pid のある
 //! `Created` は core の契約で force=false では削除できない。plugin 越しでは最悪 2 回分の待ちになる。
+//!
+//! Wait（TASK-62.3.2）の検査の順序: 復号 → exec_id（空以外は `UNIMPLEMENTED`）→ id（アダプタの state）。
+//! `state` を [`WaitConfig`] の間隔で照会し `Stopped` で終了コードを返す。期限を超えたら `DEADLINE_EXCEEDED`（4）。
+//! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
+//! 既知の制約: サーバーは接続ごとに直列処理のため、待ちの間は同じ接続の他の RPC が止まる（REPAIR-3）。
 //!
 //! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
 //! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
@@ -35,8 +40,9 @@ use super::message::{RpcStatus, count_top_level_field};
 use super::service::{TaskApiVersion, TtrpcService, unimplemented_status};
 use super::task_api::{
     CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    StartRequest, StartResponse,
+    StartRequest, StartResponse, WaitRequest, WaitResponse,
 };
+use super::wait::{WaitConfig, wait_until_stopped};
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::ContainerId;
@@ -57,6 +63,7 @@ pub struct TaskService {
     adapter: RuntimeAdapter,
     exec_launcher: Option<Arc<dyn TaskExecLauncher>>,
     execs: ExecRegistry,
+    wait_config: WaitConfig,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -75,7 +82,14 @@ impl TaskService {
             adapter,
             exec_launcher: None,
             execs: ExecRegistry::new(),
+            wait_config: WaitConfig::default(),
         }
+    }
+
+    /// Wait の期限と照会間隔を差し替える（既定は 60 秒・100 ミリ秒。REPAIR-5）。
+    pub fn with_wait_config(mut self, cfg: WaitConfig) -> Self {
+        self.wait_config = cfg;
+        self
     }
 
     /// exec プロセスの起動役を差し込む。無ければ `Exec` と `Start(exec_id)` は `UNIMPLEMENTED`（TASK-62.4）。
@@ -226,12 +240,39 @@ impl TaskService {
         }
         .encode_to_vec())
     }
+
+    /// `Wait`: コンテナが `Stopped` になるまで state を照会して待ち、終了コードを返す（TASK-62.3.2）。
+    ///
+    /// exec のゲート（`execs.lock_container`）は意図して取らない。取ると待っている間ずっと同じコンテナの
+    /// Delete / Exec / Start(exec_id) が止まる。期限は shim 側の [`WaitConfig`] だけで決める
+    /// （REPAIR-5。`timeout_nano` はハンドラに届かない）。`exited_at` は core が終了時刻を持たないため未設定。
+    fn wait(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let req = WaitRequest::decode(payload).map_err(|_| decode_failure())?;
+        if !req.exec_id.is_empty() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        let st = wait_until_stopped(&self.wait_config, || self.adapter.state(&req.id))
+            .map_err(|e| to_status(&e))?;
+        Ok(WaitResponse {
+            exit_status: stopped_exit_status(&st),
+            exited_at: None,
+        }
+        .encode_to_vec())
+    }
+}
+
+/// 停止済みの状態から `exit_status` を決める。終了コード不明・負値は 255。
+fn stopped_exit_status(status: &RuntimeContainerStatus) -> u32 {
+    status
+        .exit_code
+        .and_then(|c| u32::try_from(c).ok())
+        .unwrap_or(UNKNOWN_EXIT_STATUS)
 }
 
 /// 削除前の状態から `exit_status` を決める。未起動の Created は 0、終了コード不明・負値は 255。
 fn exit_status_of(status: &RuntimeContainerStatus) -> u32 {
     match (status.lifecycle, status.exit_code) {
-        (RuntimeLifecycle::Stopped, Some(c)) => u32::try_from(c).unwrap_or(UNKNOWN_EXIT_STATUS),
+        (RuntimeLifecycle::Stopped, _) => stopped_exit_status(status),
         (RuntimeLifecycle::Created, _) if status.pid.is_none() => 0,
         _ => UNKNOWN_EXIT_STATUS,
     }
@@ -248,6 +289,7 @@ impl TtrpcService for TaskService {
             "Start" => self.start(payload),
             "Delete" => self.delete(payload),
             "Exec" => self.exec(payload),
+            "Wait" => self.wait(payload),
             _ => Err(unimplemented_status("method", method)),
         }
     }
@@ -961,8 +1003,8 @@ mod tests {
     fn cri5_other_methods_unimplemented() {
         let (s, _) = svc(TaskApiVersion::V3, Fake::default());
         assert_eq!(s.name(), "containerd.task.v3.Task");
-        let (code, msg) = err_code(s.handle("Wait", &[]));
-        assert_eq!((code, msg.as_str()), (UNIMPL, "method Wait"));
+        let (code, msg) = err_code(s.handle("Pause", &[]));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "method Pause"));
     }
 
     /// CRI-5: V2 / V3 で Delete が通り、pid・exit_status が具体値で返る。再度の Delete は NOT_FOUND。
@@ -1035,6 +1077,155 @@ mod tests {
         let (code, msg) = err_code(s.handle("Delete", &delete_req("c1", "e")));
         assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
         assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    const DEADLINE: i32 = 4;
+
+    fn wait_req(id: &str, exec_id: &str) -> Vec<u8> {
+        WaitRequest {
+            id: id.into(),
+            exec_id: exec_id.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn fast_wait(s: TaskService, timeout_ms: u64) -> TaskService {
+        s.with_wait_config(
+            WaitConfig::new(
+                std::time::Duration::from_millis(timeout_ms),
+                std::time::Duration::from_millis(10),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// CRI-5: 停止済みなら V2 / V3 とも即座に exit_status が返り、exited_at は未設定。
+    #[test]
+    fn cri5_wait_returns_exit_status_when_stopped() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f) = svc(v, Fake::default());
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            stopped(&f, "c1", Some(137));
+            let out = s.handle("Wait", &wait_req("c1", "")).unwrap();
+            let r = WaitResponse::decode(&out[..]).unwrap();
+            assert_eq!((r.exit_status, r.exited_at), (137, None));
+        }
+    }
+
+    /// 終了コードが不明・負値なら 255。
+    #[test]
+    fn cri5_wait_unknown_exit_code_is_255() {
+        for code in [None, Some(-1)] {
+            let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            stopped(&f, "c1", code);
+            let out = s.handle("Wait", &wait_req("c1", "")).unwrap();
+            assert_eq!(WaitResponse::decode(&out[..]).unwrap().exit_status, 255);
+        }
+    }
+
+    /// REPAIR-5・CRI-5: 実行中は終了まで返らず、停止後に終了コードが返る。
+    #[test]
+    fn cri5_wait_blocks_until_exit() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        let s = fast_wait(s, 5000);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stopped(&f, "c1", Some(7));
+            });
+            s.handle("Wait", &wait_req("c1", ""))
+        })
+        .unwrap();
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(100));
+        assert_eq!(WaitResponse::decode(&out[..]).unwrap().exit_status, 7);
+    }
+
+    /// REPAIR-5: 終わらなければ DEADLINE_EXCEEDED（4）。期限を過ぎてから返り、無期限には待たない。
+    #[test]
+    fn cri5_wait_timeout_deadline_exceeded() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s = fast_wait(s, 50);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let t0 = std::time::Instant::now();
+        let (code, msg) = err_code(s.handle("Wait", &wait_req("c1", "")));
+        let el = t0.elapsed();
+        assert_eq!(
+            (code, msg.as_str()),
+            (DEADLINE, "wait exceeded its deadline")
+        );
+        assert!(el >= std::time::Duration::from_millis(50), "{el:?}");
+        assert!(el < std::time::Duration::from_secs(2), "{el:?}");
+    }
+
+    /// 未起動の Created は終了扱いにせず（0 を返さず）、期限切れになる。
+    #[test]
+    fn cri5_wait_created_not_started_times_out() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s = fast_wait(s, 50);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert_eq!(err_code(s.handle("Wait", &wait_req("c1", ""))).0, DEADLINE);
+    }
+
+    /// ERR-3: 存在しない ID は NOT_FOUND。待ちの途中で削除されても NOT_FOUND。
+    #[test]
+    fn cri5_wait_not_found_and_deleted_during_wait() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        let s = fast_wait(s, 5000);
+        assert_eq!(
+            err_code(s.handle("Wait", &wait_req("nope", ""))).0,
+            NOT_FOUND
+        );
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let r = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                f.states.lock().unwrap().remove("c1");
+            });
+            s.handle("Wait", &wait_req("c1", ""))
+        });
+        assert_eq!(err_code(r).0, NOT_FOUND);
+    }
+
+    /// 不正な入力はランタイムを呼ばずに拒否する。
+    #[test]
+    fn cri5_wait_invalid_inputs() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        assert_eq!(
+            err_code(s.handle("Wait", &wait_req("bad id!", ""))).0,
+            INVALID
+        );
+        let (code, msg) = err_code(s.handle("Wait", &[0x0a, 5, 1]));
+        assert_eq!((code, msg.as_str()), (INVALID, "malformed request payload"));
+        let (code, msg) = err_code(s.handle("Wait", &wait_req("c1", "e")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+
+    /// Wait の待ち中も同じコンテナの exec ゲートは取れる（Delete 等を止めない）。
+    #[test]
+    fn cri5_wait_does_not_hold_exec_gate() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        let s = fast_wait(s, 5000);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let id = ContainerId::new("c1").unwrap();
+        let out = std::thread::scope(|sc| {
+            let w = sc.spawn(|| s.handle("Wait", &wait_req("c1", "")));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let t0 = std::time::Instant::now();
+            drop(s.execs.lock_container(&id).unwrap());
+            assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+            stopped(&f, "c1", Some(0));
+            w.join().unwrap()
+        })
+        .unwrap();
+        assert_eq!(WaitResponse::decode(&out[..]).unwrap().exit_status, 0);
     }
 
     /// exit_status の写像。

@@ -10,7 +10,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use fandhe_container_cri::shim_v2::{
     DeleteResponse, FrameHeader, HEADER_LEN, MessageType, TtrpcRequest, TtrpcResponse,
@@ -113,7 +115,8 @@ fn call(path: &Path, service: &str) -> TtrpcResponse {
     TtrpcResponse::decode(&b[..]).unwrap()
 }
 
-/// `/proc/*/cmdline` に id を含むデーモンが残っているか。
+/// `/proc/*/cmdline` に id を含むデーモンが残っているか（Linux のみ）。
+#[cfg(target_os = "linux")]
 fn daemon_alive(id: &str) -> bool {
     let needle = format!("-id\0{id}\0");
     let Ok(rd) = std::fs::read_dir("/proc") else {
@@ -213,7 +216,13 @@ fn assert_failed(out: &Output, code: &str) {
     assert!(!out.status.success());
     assert_eq!(out.stdout, b"");
     let err = String::from_utf8(out.stderr.clone()).unwrap();
-    assert!(err.starts_with(&format!("error: {code}: ")), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+    assert_eq!(v["code"], code, "{err}");
+    assert!(
+        v["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{err}"
+    );
 }
 
 /// CRI-5・#872: socket パスに通常ファイルがあれば拒否し、内容を変えない。権限の緩いディレクトリも拒否する。

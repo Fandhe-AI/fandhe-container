@@ -4,7 +4,7 @@
 //! `fandhe_container_cri::shim_v2::bootstrap` にあり、ここでは結果の出力と終了コードだけを扱う。
 //! 登録するサービスは中身の無い Task サービス（v2・v3）だけで、本番の `ContainerRuntime` の結線は
 //! 後続（cri は plugin-cri へ依存できないため。bootstrap の doc を参照。REPAIR-3）。
-//! 失敗時は stdout へ何も書かず、stderr へ `error: {CODE}: {message}` を 1 行出して終了コード 1 にする。
+//! 失敗時は stdout へ何も書かず、stderr へ `{"code":"<CODE>","message":"<message>"}` の 1 行（JSON）を出して終了コード 1 にする（ERR 系）。
 //! start の成功経路では stderr へ何も書かない（containerd が stdout と stderr をまとめて読むため）。
 
 use std::io::Write;
@@ -35,7 +35,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            let line = serde_json::json!({
+                "code": e.code().as_str(),
+                "message": e.message(),
+            });
+            eprintln!("{line}");
             ExitCode::FAILURE
         }
     }

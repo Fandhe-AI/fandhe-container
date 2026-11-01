@@ -22,10 +22,19 @@
 //! socket の置き場所と権限: `FANDHE_CONTAINER_SHIM_SOCKET_DIR`（containerd から継承する環境変数で、containerd と
 //! 同じ信頼度。主に試験用）か、既定の状態ルートの兄弟 `fandhe-container-shim`（rootful は `/run/fandhe-container-shim`）。
 //! 状態ルートの中には置かない（`FileStateStore::open` は `@revision` 以外のエントリがあると新規ではないと判定するため）。
-//! ディレクトリは 0700、socket は 0600。symlink・通常ファイル・緩い権限は fail-closed で拒否する。
+//! ディレクトリは 0700、socket は 0600。symlink・通常ファイル・緩い権限・実効 uid と異なる所有者は fail-closed で拒否する
+//! （bind・再利用・delete のいずれの前にも検査する。PLUG-12）。
+//!
+//! 排他（REPAIR-5）: 同一 id の `start` / `delete` は `<socket 名>.lock` への `flock`（期限つきの `try_lock` 再試行）で
+//! 直列化し、stale 判定・削除・bind・READY 確認をプロセス間で排他する。失敗時に消すのは自分が bind した socket だけ。
+//!
+//! peer UID（PLUG-12）: デーモンは accept 直後に `SO_PEERCRED` / `getpeereid` で接続元を照合し、
+//! 実効 uid と root（0）以外を切断する。
+//!
+//! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
+//! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）:
-//! - peer UID の照合（SO_PEERCRED）。同じ uid と root からの接続は受ける
 //! - State / Kill / Shutdown（#873）。デーモンの寿命は暫定で socket の `(dev, ino)` の生存確認（1 秒間隔）に結びつけ、
 //!   #873 で Shutdown RPC に置き換えるか併用する
 //! - delete での実行層のコンテナの後始末（本番の runtime の結線後）
@@ -328,11 +337,11 @@ where
         ShimAction::Info => Err(CriError::unimplemented("info is not supported")),
         ShimAction::Start => {
             let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
-            unix_impl::run_start(&inv, &dir).map(String::into_bytes)
+            unix_impl::start_recorded(&inv, &dir).map(String::into_bytes)
         }
         ShimAction::Delete => {
             let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
-            unix_impl::run_delete(&inv, &dir)
+            unix_impl::delete_recorded(&inv, &dir)
         }
         ShimAction::Serve => {
             let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
@@ -360,15 +369,17 @@ pub use unix_impl::{prepare_socket_dir, socket_path};
 
 #[cfg(unix)]
 mod unix_impl {
-    use std::fs::{self, DirBuilder};
+    use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::{AsFd, OwnedFd};
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{
+        DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+    };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -376,6 +387,7 @@ mod unix_impl {
         READY_LINE, START_READY_TIMEOUT, ShimInvocation, encode_delete_response, socket_file_name,
     };
     use crate::error::{CriError, CriErrorCode};
+    use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
     use crate::shim_v2::server::{ServerConfig, TtrpcServer};
     use crate::shim_v2::service::ServiceRegistry;
 
@@ -391,6 +403,14 @@ mod unix_impl {
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     /// デーモンが socket の生存を確かめる間隔。
     const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+    /// 同一 id の排他ロックを待つ上限（REPAIR-5）。
+    const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+    /// ロックの再試行間隔。
+    const LOCK_RETRY: Duration = Duration::from_millis(20);
+    /// 計測ログの回転サイズ。
+    const OPS_LOG_MAX_BYTES: u64 = 1024 * 1024;
+    /// 計測ログのファイル名。
+    const OPS_LOG_NAME: &str = "ops.log";
 
     fn failed(msg: &'static str) -> CriError {
         CriError::failed_precondition(msg)
@@ -419,10 +439,143 @@ mod unix_impl {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(failed("socket dir is not a plain directory"));
         }
+        if meta.uid() != crate::sys::effective_uid() {
+            return Err(failed("socket dir is not owned by the current user"));
+        }
         if meta.mode() & 0o077 != 0 {
             return Err(failed("socket dir permissions are too open"));
         }
         Ok(())
+    }
+
+    /// 同一 id の排他ロック。Drop で解放する。
+    struct IdLock {
+        _file: File,
+        path: PathBuf,
+    }
+
+    /// `<socket 名>.lock` を `flock` で取る。期限（`LOCK_TIMEOUT`）内に取れなければ `TIMEOUT`。
+    /// 取得後にパスの `(dev, ino)` が開いた fd と一致することを確かめ、delete が消した lock を掴んだ場合は取り直す。
+    fn acquire_lock(dir: &Path, inv: &ShimInvocation) -> Result<IdLock, CriError> {
+        let name =
+            socket_file_name(inv).ok_or_else(|| CriError::invalid_argument("missing identity"))?;
+        let path = dir.join(format!("{name}.lock"));
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|_| internal("cannot open lock file"))?;
+            let meta = file
+                .metadata()
+                .map_err(|_| internal("cannot stat lock file"))?;
+            if !meta.is_file() || meta.uid() != crate::sys::effective_uid() {
+                return Err(failed(
+                    "lock file is not a regular file owned by the current user",
+                ));
+            }
+            match file.try_lock() {
+                Ok(()) => {
+                    let same = fs::symlink_metadata(&path)
+                        .is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
+                    if same {
+                        return Ok(IdLock { _file: file, path });
+                    }
+                }
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(_)) => return Err(internal("cannot lock the shim id")),
+            }
+            if Instant::now() >= deadline {
+                return Err(CriError::timeout("timed out waiting for the shim lock"));
+            }
+            thread::sleep(LOCK_RETRY);
+        }
+    }
+
+    /// `(dev, ino)`。自分が作ったパスの同一性確認に使う。
+    fn ident_of(p: &Path) -> Option<(u64, u64)> {
+        fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
+    }
+
+    /// 計測の記録先（`ops.log` への JSON Lines 追記。REPAIR-4）。失敗は握りつぶし、本来の操作結果を変えない。
+    /// 行の語彙は固定で、パス・id・要求の中身は書かない。
+    pub struct OpLogRecorder {
+        path: PathBuf,
+    }
+
+    impl OpLogRecorder {
+        /// 置き場所のディレクトリを指定して作る（ファイルは記録時に開く）。
+        pub fn new(dir: &Path) -> Self {
+            Self {
+                path: dir.join(OPS_LOG_NAME),
+            }
+        }
+
+        fn append(&self, line: &str) -> std::io::Result<()> {
+            if let Ok(m) = fs::symlink_metadata(&self.path) {
+                if !m.file_type().is_file() || m.uid() != crate::sys::effective_uid() {
+                    return Err(std::io::Error::other("unsafe ops log"));
+                }
+                if m.len() >= OPS_LOG_MAX_BYTES {
+                    let mut rotated = self.path.clone().into_os_string();
+                    rotated.push(".1");
+                    fs::rename(&self.path, rotated)?;
+                }
+            }
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.path)?;
+            f.write_all(line.as_bytes())
+        }
+    }
+
+    impl CriOpRecorder for OpLogRecorder {
+        fn record_cri_op(&self, sample: &CriOpSample) {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let line = format!(
+                "{{\"ts\":{at},\"op\":\"{}\",\"outcome\":\"{}\",\"code\":\"{:?}\",\"latency_us\":{}}}\n",
+                sample.kind().as_str(),
+                sample.outcome().as_str(),
+                sample.code(),
+                sample.latency().as_micros()
+            );
+            let _ = self.append(&line);
+        }
+    }
+
+    /// 操作の結果と所要時間を記録する。
+    fn record<T>(dir: &Path, kind: CriOpKind, r: &Result<T, CriError>, started: Instant) {
+        let code = match r {
+            Ok(_) => tonic::Code::Ok,
+            Err(e) => e.code().grpc_code(),
+        };
+        let sample = CriOpSample::new(kind, code, started.elapsed());
+        OpLogRecorder::new(dir).record_cri_op(&sample);
+    }
+
+    /// `start` を計測つきで実行する。
+    pub fn start_recorded(inv: &ShimInvocation, dir: &Path) -> Result<String, CriError> {
+        let started = Instant::now();
+        let r = run_start(inv, dir);
+        record(dir, CriOpKind::ShimV2Start, &r, started);
+        r
+    }
+
+    /// `delete` を計測つきで実行する。
+    pub fn delete_recorded(inv: &ShimInvocation, dir: &Path) -> Result<Vec<u8>, CriError> {
+        let started = Instant::now();
+        let r = run_delete(inv, dir);
+        record(dir, CriOpKind::ShimV2Delete, &r, started);
+        r
     }
 
     /// socket のパスを計算し、sun_path の長さを検査する。
@@ -453,13 +606,22 @@ mod unix_impl {
         if !meta.file_type().is_socket() {
             return Err(failed("socket path exists and is not a socket"));
         }
+        if meta.uid() != crate::sys::effective_uid() {
+            return Err(failed("socket is not owned by the current user"));
+        }
         let (tx, rx) = mpsc::channel();
         let p = path.to_path_buf();
         thread::spawn(move || {
             let _ = tx.send(UnixStream::connect(p).map(drop));
         });
         match rx.recv_timeout(PROBE_TIMEOUT) {
-            Ok(Ok(())) => Ok(Existing::Live),
+            Ok(Ok(())) => {
+                // 再利用する socket は 0600 であること（残骸の置き換えは権限を問わない）。
+                if meta.mode() & 0o077 != 0 {
+                    return Err(failed("live socket permissions are too open"));
+                }
+                Ok(Existing::Live)
+            }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(Existing::Stale),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Existing::None),
             _ => Err(CriError::unavailable("cannot probe existing socket")),
@@ -482,6 +644,7 @@ mod unix_impl {
         prepare_socket_dir(dir)?;
         let path = socket_path(dir, inv)?;
         let address = format!("unix://{}", path.display());
+        let _lock = acquire_lock(dir, inv)?;
         match inspect_existing(&path)? {
             Existing::Live => return Ok(address),
             Existing::Stale => {
@@ -500,10 +663,14 @@ mod unix_impl {
             }
             Err(_) => return Err(internal("cannot bind socket")),
         };
+        let mine = ident_of(&path);
         match spawn_daemon(inv, &path, listener) {
             Ok(()) => Ok(address),
             Err(e) => {
-                let _ = fs::remove_file(&path);
+                // 自分が bind した socket だけを消す（別の実体に置き換わっていたら触らない）。
+                if mine.is_some() && ident_of(&path) == mine {
+                    let _ = fs::remove_file(&path);
+                }
                 Err(e)
             }
         }
@@ -524,7 +691,7 @@ mod unix_impl {
             .parent()
             .and_then(|d| fs::symlink_metadata(d).ok())
             .map(|m| m.uid());
-        if dir_uid != Some(sock_uid) {
+        if dir_uid != Some(sock_uid) || sock_uid != crate::sys::effective_uid() {
             return Err(failed("socket owner differs from socket dir owner"));
         }
         let exe = std::env::current_exe().map_err(|_| internal("cannot resolve own executable"))?;
@@ -581,14 +748,20 @@ mod unix_impl {
             Err(_) => return Err(internal("cannot stat socket dir")),
         }
         let path = socket_path(dir, inv)?;
+        let lock = acquire_lock(dir, inv)?;
         match fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_socket() => {
+                if m.uid() != crate::sys::effective_uid() {
+                    return Err(failed("socket is not owned by the current user"));
+                }
                 fs::remove_file(&path).map_err(|_| internal("cannot remove socket"))?;
             }
             Ok(_) => return Err(failed("socket path exists and is not a socket")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(internal("cannot stat socket path")),
         }
+        // ロックを持ったまま消す（取得側が inode を照合して取り直す）。
+        let _ = fs::remove_file(&lock.path);
         Ok(encode_delete_response())
     }
 
@@ -617,7 +790,14 @@ mod unix_impl {
         };
         let first = ident(&expected).ok_or_else(|| failed("socket path is missing"))?;
         let registry = make_registry()?;
-        let handle = TtrpcServer::new(registry, ServerConfig::default())
+        let euid = crate::sys::effective_uid();
+        let config = ServerConfig {
+            // 同じ uid と root だけを受ける（PLUG-12）。
+            allowed_peer_uids: Some(if euid == 0 { vec![0] } else { vec![euid, 0] }),
+            ..ServerConfig::default()
+        };
+        let recorder: Arc<dyn CriOpRecorder> = Arc::new(OpLogRecorder::new(dir));
+        let handle = TtrpcServer::with_recorder(registry, config, recorder)
             .serve(listener)
             .map_err(|_| internal("cannot start ttrpc server"))?;
         {

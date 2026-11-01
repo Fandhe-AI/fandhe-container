@@ -15,7 +15,7 @@
 //! 計測（REPAIR-4）: [`TtrpcServer::with_recorder`] で渡した [`CriOpRecorder`] へ、要求ごとに固定の
 //! 操作種別・結果コード・所要時間だけを渡す（要求の中身・文言は渡さない）。
 //!
-//! peer UID の照合は扱わない（未対応で後続。REPAIR-3）。socket の配置と権限は `bootstrap` が扱う。
+//! peer UID の照合は accept 直後に行う（`ServerConfig::allowed_peer_uids`・PLUG-12）。socket の配置と権限は `bootstrap` が扱う。
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -47,6 +47,9 @@ pub struct ServerConfig {
     pub shutdown_timeout: Duration,
     /// 停止フラグを確かめる間隔。
     pub poll_interval: Duration,
+    /// 接続を受け入れる peer の実効 uid（PLUG-12）。accept 直後、要求を読む前に照合し、
+    /// 一覧に無い uid・取得できない接続は切断する。`None` は照合しない（試験用。既定は実効 uid のみ）。
+    pub allowed_peer_uids: Option<Vec<u32>>,
 }
 
 /// 期限系の設定値の上限（1 日）。`Instant` への加算・`poll_interval` の乗算を安全に保つ。
@@ -88,6 +91,7 @@ impl Default for ServerConfig {
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
             poll_interval: Duration::from_millis(50),
+            allowed_peer_uids: Some(vec![crate::sys::effective_uid()]),
         }
     }
 }
@@ -221,6 +225,10 @@ fn accept_loop(listener: UnixListener, ctx: Arc<Ctx>) {
     while !ctx.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if !peer_allowed(&stream, &ctx) {
+                    drop(stream);
+                    continue;
+                }
                 if ctx.active.fetch_add(1, Ordering::SeqCst) >= ctx.config.max_connections {
                     ctx.active.fetch_sub(1, Ordering::SeqCst);
                     drop(stream);
@@ -252,6 +260,20 @@ fn accept_loop(listener: UnixListener, ctx: Arc<Ctx>) {
     for h in conns {
         let _ = h.join();
     }
+}
+
+/// 接続元の uid が許可一覧にあるか（PLUG-12）。取得できない場合も拒否する（fail-closed）。
+/// 拒否は `PermissionDenied` として計測する（REPAIR-4）。
+fn peer_allowed(stream: &UnixStream, ctx: &Ctx) -> bool {
+    let Some(allowed) = &ctx.config.allowed_peer_uids else {
+        return true;
+    };
+    let started = Instant::now();
+    if crate::sys::peer_uid(stream).is_ok_and(|uid| allowed.contains(&uid)) {
+        return true;
+    }
+    record_op(ctx, CriOpKind::ShimV2Io, Code::PermissionDenied, started);
+    false
 }
 
 /// 読み取りの結果。

@@ -33,7 +33,7 @@
 //! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Delete の `exited_at`（core が終了時刻を持たず常に未設定）。黙って捨てず `UNIMPLEMENTED`
 //! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #803。cri は supervisor に依存せず `ContainerRuntime` に exec も無い）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
 //!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec` と `Start(exec_id)` を `UNIMPLEMENTED` で拒否する
-//! - peer UID の照合（SO_PEERCRED）。UDS の置き場所と権限は [`bootstrap`] が扱う（#872）が、接続元の照合は未対応で後続
+//! - peer UID の照合は `server::ServerConfig::allowed_peer_uids`（SO_PEERCRED / getpeereid。PLUG-12・#872）、UDS の置き場所と権限は [`bootstrap`] が扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata`・`timeout_nano` は復号するだけで使わない
 //! - Windows（named pipe）。listener と転送は unix のみ。ヘッダと封筒の型は全 OS で使える
 //! - 上限超過のペイロードは Go 実装と異なり読み捨てず、`ResourceExhausted` を返して接続を閉じる

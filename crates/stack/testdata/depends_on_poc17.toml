@@ -1,0 +1,20 @@
+# 合成フィクスチャ（STACK-2・TASK-150.5・#593）。PoC-17 の db / app / gateway の形。
+# app は db を healthy で、gateway は app を started で待つ（各サービスの待ち条件は単一種類）。
+# healthcheck の値は PoC 形の再現用で、試験は解釈しない（待機ポリシーは試験内で直接作る）。
+[project]
+name = "poc17-demo"
+
+[services.db]
+image = "example/db:1"
+
+[services.app]
+image = "example/app:1"
+
+[services.app.depends_on]
+db = "healthy"
+
+[services.gateway]
+image = "example/gateway:1"
+
+[services.gateway.depends_on]
+app = "started"

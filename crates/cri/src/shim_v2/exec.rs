@@ -289,7 +289,7 @@ const GATE_STRIPES: usize = 64;
 /// 起動中は内部ロックを保持しない: [`Self::begin_start`] が `Starting` にして解放し、
 /// 起動役の結果を [`Self::finish_start`] で反映する。
 ///
-/// 同じコンテナの「削除（remove から purge まで）」「状態確認から登録・起動開始まで」は、
+/// 同じコンテナの「削除（remove から purge まで）」「状態確認から登録・起動の完了まで」は、
 /// [`Self::lock_container`] のゲートで互いに排他する（CRI-5）。
 #[derive(Debug)]
 pub struct ExecRegistry {
@@ -328,8 +328,8 @@ impl ExecRegistry {
     }
 
     /// コンテナ単位のゲートを取る。Delete（remove から purge まで）と、Exec / Start の
-    /// 「状態確認から登録・起動開始まで」はこのゲートを保持して互いに排他する。
-    /// 起動役の呼び出し中は保持しない。同じ呼び出しで 2 つ以上取らない（デッドロック防止）。
+    /// 「状態確認から登録・起動の完了まで」はこのゲートを保持して互いに排他する。
+    /// Start(exec_id) は起動役の完了までこのゲートを保持する。同じ呼び出しで 2 つ以上取らない（デッドロック防止）。
     pub fn lock_container(
         &self,
         container: &ContainerId,

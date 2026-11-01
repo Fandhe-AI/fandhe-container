@@ -122,33 +122,35 @@ impl TaskService {
         Ok(Vec::new())
     }
 
-    /// `Start(exec_id)`: 登録済みの exec を起動役で起動する。ロックは起動中に保持しない。
+    /// `Start(exec_id)`: 登録済みの exec を起動役で起動する。
+    ///
+    /// 状態確認から起動役の完了・結果の反映までコンテナ単位のゲートを保持し、Delete と排他する
+    /// （起動中に Delete と同じ ID の再作成が割り込み、旧登録の spec が新コンテナへ起動されるのを防ぐ。CRI-5）。
+    /// 起動役は期限を自前で持つ契約（REPAIR-5）で、ゲートを保持したまま shim のサービスへ再入しない。
     fn start_exec(&self, req: &StartRequest) -> Result<Vec<u8>, RpcStatus> {
         let Some(launcher) = self.exec_launcher.as_ref() else {
             return Err(unsupported("exec_id is not supported"));
         };
         let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        let _gate = self
+            .execs
+            .lock_container(&container)
+            .map_err(|e| to_status(&e))?;
         // Exec 後に停止したコンテナへ起動役を呼ばないよう、起動の直前にも Running を再確認する。
-        // 確認から begin_start までは Delete と排他する（ゲートは起動役の呼び出し中は保持しない）。
-        let ticket = {
-            let _gate = self
-                .execs
-                .lock_container(&container)
-                .map_err(|e| to_status(&e))?;
-            let status = self
-                .adapter
-                .state(container.as_str())
-                .map_err(|e| to_status(&e))?;
-            if status.lifecycle != RuntimeLifecycle::Running {
-                return Err(to_status(&CriError::failed_precondition(
-                    "container is not running",
-                )));
-            }
-            self.execs
-                .begin_start(&container, &exec_id)
-                .map_err(|e| to_status(&e))?
-        };
+        let status = self
+            .adapter
+            .state(container.as_str())
+            .map_err(|e| to_status(&e))?;
+        if status.lifecycle != RuntimeLifecycle::Running {
+            return Err(to_status(&CriError::failed_precondition(
+                "container is not running",
+            )));
+        }
+        let ticket = self
+            .execs
+            .begin_start(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
         let result = launcher.launch(&container, &exec_id, &ticket.spec);
         self.execs
             .finish_start(&container, &exec_id, &ticket, result.is_ok())
@@ -685,6 +687,54 @@ mod tests {
         }
         s.handle("Start", &start_exec_req("c1", "e0")).unwrap();
         assert_eq!(l.launched.lock().unwrap().len(), 1);
+    }
+
+    /// CRI-5: Start(exec_id) の起動中は Delete が待たされ、起動の完了後にだけ進む
+    /// （起動中の Delete と同じ ID の再作成で旧 spec が新コンテナへ起動されない）。
+    #[test]
+    fn cri5_delete_waits_for_exec_launch() {
+        struct SlowLauncher {
+            fake: Arc<Fake>,
+            events: Arc<Mutex<Vec<&'static str>>>,
+            entered: Mutex<std::sync::mpsc::Sender<()>>,
+        }
+        impl TaskExecLauncher for SlowLauncher {
+            fn launch(
+                &self,
+                _c: &ContainerId,
+                _e: &ExecId,
+                _s: &ExecProcessSpec,
+            ) -> Result<Option<NonZeroU32>, CriError> {
+                // 起動中に init が停止した場面を作ってから Delete を走らせる。
+                stopped(&self.fake, "c1", Some(0));
+                self.entered.lock().unwrap().send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                self.events.lock().unwrap().push("launch-end");
+                Ok(NonZeroU32::new(5151))
+            }
+        }
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = s.with_exec_launcher(Arc::new(SlowLauncher {
+            fake: f.clone(),
+            events: events.clone(),
+            entered: Mutex::new(tx),
+        }));
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        std::thread::scope(|sc| {
+            let start = sc.spawn(|| s.handle("Start", &start_exec_req("c1", "e1")));
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            let del = sc.spawn(|| {
+                let r = s.handle("Delete", &delete_req("c1", ""));
+                events.lock().unwrap().push("delete-done");
+                r
+            });
+            assert!(start.join().unwrap().is_ok());
+            assert!(del.join().unwrap().is_ok());
+        });
+        assert_eq!(*events.lock().unwrap(), vec!["launch-end", "delete-done"]);
     }
 
     fn svc(version: TaskApiVersion, fake: Fake) -> (TaskService, Arc<Fake>) {

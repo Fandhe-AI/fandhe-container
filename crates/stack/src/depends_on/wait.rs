@@ -316,6 +316,14 @@ pub fn wait_for_step(
     Ok(report)
 }
 
+fn timeout_error(service: &str, wait: &DependencyWait) -> DependencyWaitError {
+    DependencyWaitError::WaitTimeout {
+        service: service.to_string(),
+        dependency: wait.service().to_string(),
+        condition: wait.condition(),
+    }
+}
+
 fn wait_started(
     service: &str,
     wait: &DependencyWait,
@@ -329,6 +337,10 @@ fn wait_started(
         .ok_or(DependencyWaitError::InvalidPolicy)?;
     let mut polls: u32 = 0;
     loop {
+        // 観測開始前に期限を過ぎていれば観測せず失敗にする（REPAIR-5）。
+        if clock.now() > deadline {
+            return Err(timeout_error(service, wait));
+        }
         let observed =
             observer
                 .observe(wait.service())
@@ -339,6 +351,10 @@ fn wait_started(
                 })?;
         polls = polls.saturating_add(1);
         let now = clock.now();
+        // 観測が期限をまたいだ結果は成功と見なさない（REPAIR-5）。
+        if now > deadline {
+            return Err(timeout_error(service, wait));
+        }
         if observed.satisfies_started() {
             return Ok(WaitOutcome {
                 dependency: wait.service().to_string(),
@@ -349,11 +365,7 @@ fn wait_started(
             });
         }
         if now >= deadline {
-            return Err(DependencyWaitError::WaitTimeout {
-                service: service.to_string(),
-                dependency: wait.service().to_string(),
-                condition: wait.condition(),
-            });
+            return Err(timeout_error(service, wait));
         }
         let next = now
             .checked_add(policy.poll_interval())
@@ -514,6 +526,61 @@ mod tests {
             ]
         );
         assert_eq!(obs.calls.len(), 5);
+    }
+
+    /// 呼ばれるたびに台本の時刻を返す時計（期限境界の再現用）。
+    struct ScriptedClock {
+        times: std::cell::RefCell<VecDeque<Instant>>,
+    }
+
+    impl WaitClock for ScriptedClock {
+        fn now(&self) -> Instant {
+            let mut q = self.times.borrow_mut();
+            if q.len() > 1 {
+                q.pop_front().expect("non-empty")
+            } else {
+                *q.front().expect("non-empty")
+            }
+        }
+        fn sleep_until(&mut self, _deadline: Instant) {}
+    }
+
+    /// 期限をまたいで返った Running は成功にせず WaitTimeout になる（REPAIR-5）。
+    #[test]
+    fn stack_2_running_observed_after_deadline_is_timeout() {
+        let s = step(&[("db", "started")]);
+        let mut obs = FakeObserver::default().script("db", &[O::Running]);
+        let t0 = Instant::now();
+        // start, 観測前, 観測後（15.1 秒）
+        let mut clock = ScriptedClock {
+            times: std::cell::RefCell::new(VecDeque::from([
+                t0,
+                t0,
+                t0 + Duration::from_millis(15_100),
+            ])),
+        };
+        let policy = WaitPolicy::new(Duration::from_millis(300), Duration::from_secs(15)).unwrap();
+        let err = wait_for_step(&s, &mut obs, &mut clock, &policy).unwrap_err();
+        assert_eq!(err.code(), "DEPENDENCY_WAIT_TIMEOUT");
+        assert_eq!(obs.calls.len(), 1);
+    }
+
+    /// sleep 復帰が遅れて観測前に期限を過ぎたら観測せず WaitTimeout になる。
+    #[test]
+    fn stack_2_deadline_passed_before_observe_is_timeout_without_poll() {
+        let s = step(&[("db", "started")]);
+        let mut obs = FakeObserver::default().script("db", &[O::Running]);
+        let t0 = Instant::now();
+        let mut clock = ScriptedClock {
+            times: std::cell::RefCell::new(VecDeque::from([
+                t0,
+                t0 + Duration::from_millis(15_100),
+            ])),
+        };
+        let policy = WaitPolicy::new(Duration::from_millis(300), Duration::from_secs(15)).unwrap();
+        let err = wait_for_step(&s, &mut obs, &mut clock, &policy).unwrap_err();
+        assert_eq!(err.code(), "DEPENDENCY_WAIT_TIMEOUT");
+        assert!(obs.calls.is_empty());
     }
 
     #[test]

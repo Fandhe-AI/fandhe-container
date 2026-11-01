@@ -75,6 +75,7 @@ fandhe-container/
 │   │   ├── io-protocol.md         # I/O 共有層のワイヤーフレーム・チェックサム（TASK-11・IO-1・REPAIR-2）
 │   │   ├── license-deny-fail-closed-report.md  # 非許可ライセンス検出の fail-closed 確認記録（TASK-90.2・OSS-4・OSS-5・REPAIR-9）
 │   │   ├── microvm-dependencies.md  # rust-vmm 禁止クレートの判定結果の記録と TASK-74/75 後の再実行手順（TASK-73.3・MVM-4）
+│   │   ├── microvm-memory-ownership.md  # ゲスト物理メモリアクセス型の所有先（アクセス型は TASK-74.1 側・mmap と KVM 登録は TASK-75.1 側）と /dev/kvm 試験の分離の判断記録（Agent の記録した判断。TASK-74.1.3・#876・MVM-1・MVM-4）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）
 │   │   ├── small-files-bench.md   # 小ファイル多数の files/s 計測ハーネスの計測定義（TASK-189・IO-6・IO-7・REPAIR-8。2 経路 wire〔UDS〕/ server-api・ゲートは wire〔#2074〕。metrics.json・BENCH_NAMES 登録済み・baseline 未登録）

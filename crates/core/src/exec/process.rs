@@ -1650,19 +1650,27 @@ fn run_exec_child(
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
+    stdio: ChildStdio,
     terminal: impl FnOnce(&Entrypoint, &ExecutableFd) -> Result<i32, ExecError>,
 ) -> i32 {
-    let result = prepare_exec_child(
-        entry,
-        Some(status.as_fd()),
-        EntrypointSource::Switchable(seal_policy),
-        deferred_fsize,
-        StdioNulling::ALL,
-    )
-    .and_then(|exe| {
-        write_exec_status(status, EXEC_STATUS_READY).map_err(at(ExecChildStep::ReportReady))?;
-        terminal(entry, &exe).map_err(at(ExecChildStep::Execveat))
-    });
+    // 出力の付け替えは `close_range` を含む `prepare_exec_child` より前に行う（付け替えた 1・2 を閉じないため。
+    // launch の `child_main` と同じ位置）。指定なし（`ChildStdio::none`）なら何もせず、3 本とも `/dev/null` へ置換する。
+    let result = stdio
+        .install()
+        .map_err(at(ExecChildStep::PrepareFds))
+        .and_then(|nulling| {
+            prepare_exec_child(
+                entry,
+                Some(status.as_fd()),
+                EntrypointSource::Switchable(seal_policy),
+                deferred_fsize,
+                nulling,
+            )
+        })
+        .and_then(|exe| {
+            write_exec_status(status, EXEC_STATUS_READY).map_err(at(ExecChildStep::ReportReady))?;
+            terminal(entry, &exe).map_err(at(ExecChildStep::Execveat))
+        });
     match result {
         Ok(code) => code,
         Err(ExecChildFailure { step, error }) => {
@@ -1739,10 +1747,16 @@ pub(super) fn exec_child_main(
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
+    stdio: ChildStdio,
 ) -> i32 {
-    run_exec_child(entry, status, deferred_fsize, seal_policy, |entry, exe| {
-        Err(execve_checked(entry, exe))
-    })
+    run_exec_child(
+        entry,
+        status,
+        deferred_fsize,
+        seal_policy,
+        stdio,
+        |entry, exe| Err(execve_checked(entry, exe)),
+    )
 }
 
 /// 終了した子が pipe（`status` = 読み取り側）へ残した状態から、コマンドが起動したかどうかを判定する
@@ -2060,6 +2074,7 @@ fn observe_exec_child_setup_policy(
                 &status_write,
                 deferred_fsize,
                 policy,
+                ChildStdio::none(),
                 |entry, exe| {
                     after_prepare();
                     write_setup_report(entry, report, exe.file()).map(|()| 0)
@@ -2358,6 +2373,22 @@ impl ChildStdio {
             out_r,
             err_r,
         ))
+    }
+
+    /// 稼働中コンテナへの exec の子（healthcheck の出力取得。SUP-4・SUP-6・#2441）が、stdout と stderr の両方を
+    /// 同じ 1 本の出力用 fd（呼び出し側が作った `UnixStream` の子側等）へ付け替えるための指定。
+    ///
+    /// stdout には `output` をそのまま、stderr には close-on-exec の複製を割り当てる（Docker の Output と同じく
+    /// 結合した 1 本。ストリーム名の区別は付けない）。複製の失敗は `ExecError`（段 `Spawn`）。fd 0（stdin）は付け替えず、
+    /// 子の側で常に `/dev/null` へ置換する。
+    pub fn from_output(output: OwnedFd) -> Result<Self, ExecError> {
+        let dup = output.try_clone().map_err(|e| {
+            ExecError::from_io(&e, IsolationStage::Spawn, "dup(exec output for stderr)")
+        })?;
+        Ok(Self {
+            stdout: Some(output),
+            stderr: Some(dup),
+        })
     }
 
     /// パイプ指定なし（stdout / stderr とも従来どおり `/dev/null`）。
@@ -4845,6 +4876,61 @@ mod tests {
             stderr: true,
         };
         assert_eq!(only_out_piped.targets(), vec![0, 2]);
+    }
+
+    /// SUP-4・SUP-6（#2441）: `from_output` は 1 本の出力 fd から stdout と stderr の両方を作り、子へ付け替えた後は
+    /// どちらへ書いても同じ読み取り側に届く。親が複製を閉じれば読み取り側は EOF になる。
+    #[test]
+    fn sup4_sup6_2441_from_output_feeds_both_streams_to_one_reader() {
+        use std::io::Read as _;
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stdio = ChildStdio::from_output(OwnedFd::from(theirs)).unwrap();
+        assert!(stdio.stdout.is_some() && stdio.stderr.is_some());
+        let (a, b) = (
+            stdio.stdout.as_ref().unwrap(),
+            stdio.stderr.as_ref().unwrap(),
+        );
+        {
+            use std::os::fd::AsRawFd as _;
+            assert_ne!(a.as_raw_fd(), b.as_raw_fd());
+        }
+        let mut out = std::fs::File::from(a.try_clone().unwrap());
+        let mut err = std::fs::File::from(b.try_clone().unwrap());
+        out.write_all(b"OUT;").unwrap();
+        err.write_all(b"ERR;").unwrap();
+        drop((out, err, stdio));
+        let mut text = String::new();
+        (&mine).read_to_string(&mut text).unwrap();
+        assert_eq!(text, "OUT;ERR;");
+    }
+
+    /// SUP-4・SUP-6（#2441）: 出力を付け替えた exec の子は、`/dev/null` への置換が fd 0 だけになり、`SIGPIPE` を無視する。
+    /// 指定なしは従来どおり 3 本とも置換して `SIG_DFL` のまま。
+    #[test]
+    fn sup4_sup6_2441_piped_exec_nulls_only_stdin_and_ignores_sigpipe() {
+        let dir = TempDir::create("exec-2441");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
+        let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let piped = StdioNulling {
+            stdout: false,
+            stderr: false,
+        };
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, piped);
+        let piped_calls = take_calls();
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, StdioNulling::ALL);
+        let default_calls = take_calls();
+        drop(dir);
+        assert!(piped_calls.contains(&"signal(SIGPIPE,SIG_IGN)".to_string()));
+        assert!(piped_calls.contains(&"stdio[0]->/dev/null".to_string()));
+        assert!(!piped_calls.iter().any(|c| c.contains("stdio->/dev/null")));
+        assert!(default_calls.contains(&"signal(SIGPIPE,SIG_DFL)".to_string()));
+        assert!(default_calls.contains(&"stdio->/dev/null".to_string()));
     }
 
     /// SUP-7・SUP-1（#1471）: 親が書き込み側（`ChildStdio`）を閉じると、読み取り側は EOF になる

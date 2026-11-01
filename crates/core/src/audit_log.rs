@@ -66,7 +66,7 @@
 //!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
 //!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持は **未実装**（REPAIR-3: 実装済みを装わない。追跡先は #3417 のコメントで諮る）。
 //!   launch 経路（launcher）への配線は supervisor の start 経路から結線済み（#1819。`default_audit_sink` の sink を本番 launcher へ渡す）で、
-//!   healthcheck への配線は #2441、CLI の exec への配線は #2626 が追う（いずれも未実装）。plugin 信頼検証は
+//!   healthcheck は単一スレッドの exec 専用 helper（supervisor の `healthcheck-exec`）が `FileAuditSink` を直接使う（#2441。結線は #2953）。CLI の exec への配線は #2626 が追う（未実装）。plugin 信頼検証は
 //!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
 //!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、macOS では主経路（`file_writer` の fd 相対 open と
 //!   拡張 ACL の拒否、`file_sink` の `run_isolated` の macOS 版。#2429）が成功すれば `Recorded` になる（代替経路は
@@ -105,8 +105,8 @@
 //! - **制御チャネルの中継**（`ControlAuditRelay`）: 枠が段を運ばず、段つきの記録を通すと段は落ちる（拒否せず記録は
 //!   残す。試験で固定）。現行の配線では段つきの記録（単一スレッドの launch と pre-pivot）は `FileAuditSink` へ直接
 //!   書かれ中継を通らず、exec の親も中継ではなく `FileAuditSink` を使うため、段を運ぶ必要が生じていない。拡張が
-//!   要るのは、複数スレッドの文脈（例: supervisor 内の healthcheck。#2441）から中継経由で段つきの層を記録する
-//!   経路を足すとき。そのときは段だけでなく Entrypoint・ExecTarget などの層ごと運べるようにする
+//!   要るのは、複数スレッドの文脈から中継経由で段つきの層を記録する経路を足すとき（healthcheck は
+//!   単一スレッドの helper が `FileAuditSink` を直接使うため該当しない。#2441）。そのときは段だけでなく Entrypoint・ExecTarget などの層ごと運べるようにする
 
 #[cfg(target_os = "linux")]
 mod control_relay;

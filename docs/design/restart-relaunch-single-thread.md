@@ -34,7 +34,7 @@ core の本番 launcher（`ProductionLauncher`、`LaunchMode::SelfBounded`）は
   | `seccomp-notify`・`seccomp-audit-rec` | 既存の `SeccompNotifyHub::quiesce` |
   | `supervisor-stderr` | `StderrSink::quiesce` / `resume`。止めている間の行は上限つき（`QUEUE_CAPACITY`）のバッファへ溜め、再開後に順に書く |
   | `fandhe-terminate`（`LateOrphans`） | 失敗・停止経路だけ。変更なし |
-  | `healthcheck-*` | 本番未結線（#2441・#2953）。結線時に同じ口へ参加者として足す |
+  | `healthcheck-*` | 本番未結線（担当は #2953）。probe の一時スレッド `healthcheck-probe` は `ExecHealthProbe`（#2441）が使い、setns を伴う exec 自体は別プロセスの exec 専用 helper で実行する（`healthcheck-exec-helper.md`）。結線時に同じ口へ参加者として足す |
 
 - 順序: 制御チャネルの停止（外側の `ControlledRelauncher`）→ 捕捉・seccomp の quiesce → stderr の quiesce（最後。上の quiesce の報告が
   stderr へ出るため）→ スレッド数が 1 に落ち着くまでの有界の待ち（`thread_settle`、上限 1 秒）→ `launcher.launch(残り時間)` →

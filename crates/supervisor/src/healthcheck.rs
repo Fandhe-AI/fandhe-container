@@ -10,7 +10,9 @@
 //!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）・
 //!   retries / start_period の集約 [`HealthAggregator`] と `health` の反映（TASK-161.3・#496。遷移の規則は
 //!   `aggregate` サブモジュールの doc）。
-//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#2441。親は #492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
+//! - 判定の本番アダプタ `ExecHealthProbe`（Linux。exec 専用 helper で healthcheck コマンドを実行する。#2441・SUP-4・SUP-6。
+//!   方式と残余は `docs/design/healthcheck-exec-helper.md`）。
+//! - **未実装**: `monitor` / supervisor 入口への組み込み（#2953。親は #492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
 //!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。
 //! - 既知の食い違い: 定義の timeout 上限（[`MAX_TIMEOUT`] 1 時間）は `probe_and_record` の上限（60 秒）より大きく、
 //!   [`HealthcheckSchedule::from_definition`] が 60 秒超を拒否する。解消は別 issue。
@@ -24,6 +26,14 @@
 //! - エラーメッセージには不正だった項目名と理由のみを入れ、command の中身は出さない（秘密情報の漏えい防止）。
 
 mod aggregate;
+#[cfg(target_os = "linux")]
+pub mod exec_helper;
+#[cfg(target_os = "linux")]
+pub mod exec_probe;
+#[cfg(target_os = "linux")]
+pub mod exec_reaper;
+#[cfg(target_os = "linux")]
+pub mod exec_wire;
 mod periodic;
 
 use std::num::NonZeroU32;
@@ -32,6 +42,10 @@ use std::time::Duration;
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 pub use aggregate::HealthAggregator;
+#[cfg(target_os = "linux")]
+pub use exec_probe::{
+    ExecHealthProbe, HealthExecObserver, HealthExecOutcome, HealthExecReport, HealthExecTarget,
+};
 #[cfg(target_os = "linux")]
 pub use periodic::health_from_exec_exit;
 pub use periodic::{

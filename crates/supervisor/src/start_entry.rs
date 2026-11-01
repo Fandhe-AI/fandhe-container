@@ -69,7 +69,7 @@
 //!   制御チャネルの accept スレッド（`PausableServer::pause`）・捕捉と seccomp 通知のスレッド・`stderr_sink` の専用スレッドを
 //!   止め、スレッド数が 1 に落ち着くのを有界に待ってから launch し、成否に関わらず再開する。止められなければ launch せず
 //!   `RelaunchFailed`（fail-closed。core の `Threads: 1` の検査は弱めない）。
-//!   残余: healthcheck の定期実行スレッドは本番未結線のため参加者に含めない（結線時に同じ口へ足す。#2441・#2953）。
+//!   残余: healthcheck の定期実行スレッド（probe の一時スレッド）は本番未結線のため参加者に含めない（結線時に同じ口へ足す。担当は #2953。判定の本番アダプタは #2441 で実装済み）。
 //!   pasta・netns holder 構成での restart の確認は #341・#3331。`legacy_tiocsti` の警告は supervisor からは再出力しない
 //!   （core が launch のたびに出す）。設計記録は `docs/design/restart-relaunch-single-thread.md`。
 //! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線も済み（#1902。

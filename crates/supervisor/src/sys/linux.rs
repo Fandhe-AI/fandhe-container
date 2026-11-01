@@ -45,6 +45,8 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(125);
     pub(super) const SYS_CAPSET: Option<i64> = Some(126);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(322);
+    // waitid(2)（arch/x86/entry/syscalls/syscall_64.tbl の 247）。
+    pub(super) const SYS_WAITID: Option<i64> = Some(247);
     // 制御チャネル（#2058）。open(2) の O_DIRECTORY / O_NOFOLLOW は arch ごとに値が違う
     // （arch/x86/include/uapi/asm/fcntl.h は asm-generic の既定値のまま: 0o200000 / 0o400000）。
     pub(super) const O_DIRECTORY: Option<i32> = Some(0o200000);
@@ -59,6 +61,8 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(90);
     pub(super) const SYS_CAPSET: Option<i64> = Some(91);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(281);
+    // waitid(2)（include/uapi/asm-generic/unistd.h の 95）。
+    pub(super) const SYS_WAITID: Option<i64> = Some(95);
     // 制御チャネル（#2058）。aarch64 の O_DIRECTORY / O_NOFOLLOW は
     // arch/arm64/include/uapi/asm/fcntl.h の値（0o40000 / 0o100000）。
     pub(super) const O_DIRECTORY: Option<i32> = Some(0o40000);
@@ -247,6 +251,15 @@ mod syscall_ffi {
     pub(super) const SYS_CLOSE_RANGE: i64 = 436;
     /// execveat に渡す argv / envp の要素数の上限（無制限確保の防止）。
     pub(super) const MAX_EXEC_VECTOR: usize = 4096;
+    /// `waitid(2)` の引数（include/uapi/linux/wait.h・asm-generic/errno*.h。arch 共通）。
+    pub(super) const P_ALL: i64 = 0;
+    pub(super) const WNOHANG: i64 = 1;
+    pub(super) const WEXITED: i64 = 4;
+    pub(super) const WNOWAIT: i64 = 0x0100_0000;
+    pub(super) const EINTR: i32 = 4;
+    pub(super) const ECHILD: i32 = 10;
+    /// `siginfo_t` を受ける領域の大きさ（カーネル ABI で 128 バイト固定。中身は読まない）。
+    pub(super) const SIGINFO_BYTES: usize = 128;
     /// include/uapi/linux/prctl.h の値。prctl は可変長部を `unsigned long` で渡すため LP64 限定（#3202）。
     pub(super) const PR_SET_DUMPABLE: i32 = 4;
     pub(super) const PR_GET_KEEPCAPS: i32 = 7;
@@ -438,6 +451,41 @@ mod syscall_ffi {
         check(rc).map(|_| ())
     }
 
+    /// 呼び出しプロセスに子（生存中・ゾンビを問わない）が 1 つでも残っているかを返す（SUP-4・SUP-6・REPAIR-5・#2441）。
+    ///
+    /// `waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT)` を使う。`WNOWAIT` なので子は回収しない。
+    /// 子が無ければ `ECHILD`（`Ok(false)`）、あれば成功（`Ok(true)`。ゾンビ・生存中のどちらでも）。`EINTR` は再試行する。
+    /// `/proc/<pid>/task/<tid>/children` はタスクが凍結されていないと不正確になり得るため、reaper の終了判定はこちらで行う。
+    pub(crate) fn has_any_child() -> io::Result<bool> {
+        let nr = arch::SYS_WAITID.ok_or_else(unsupported)?;
+        loop {
+            // 内容は読まないのでレイアウトに依存しない大きさだけの領域（u64 で 8 バイト境界にそろえる）。
+            let mut info = [0u64; SIGINFO_BYTES / 8];
+            // SAFETY: `info` は呼び出しの間有効で、カーネルが書く `siginfo_t`（128 バイト）以上の大きさ・8 バイト境界。
+            // 第 5 引数の rusage は NULL（カーネルは書かない）。`WNOWAIT` により子の状態は変わらず、メモリ安全性・
+            // 他のプロセスの状態に影響しない。引数はすべて整数と `info` へのポインタ。
+            let rc = unsafe {
+                syscall(
+                    nr,
+                    P_ALL,
+                    0i64,
+                    info.as_mut_ptr(),
+                    WEXITED | WNOHANG | WNOWAIT,
+                    std::ptr::null_mut::<std::ffi::c_void>(),
+                )
+            };
+            if rc == 0 {
+                return Ok(true);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(ECHILD) => return Ok(false),
+                Some(EINTR) => {}
+                _ => return Err(err),
+            }
+        }
+    }
+
     /// `first` 以降の fd をすべて閉じる（`close_range(first, !0, 0)`。Linux 5.9 以降）。`ENOSYS` のときは
     /// `/proc/self/fd` を列挙して閉じる。継承 fd を supervisor へ渡さないために exec の前に呼ぶ。
     pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
@@ -499,6 +547,10 @@ mod syscall_ffi {
     pub(crate) fn close_fds_from(first: u32) -> io::Result<()> {
         close_fds_from_proc(first)
     }
+
+    pub(crate) fn has_any_child() -> io::Result<bool> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(any(
@@ -512,7 +564,7 @@ mod syscall_ffi {
 use syscall_ffi::*;
 pub(crate) use syscall_ffi::{
     cap_ambient_clear_all, cap_ambient_raise, cap_bounding_drop, cap_set_thread, close_fds_from,
-    execveat_fd, get_keep_caps, set_dumpable, set_keep_caps,
+    execveat_fd, get_keep_caps, has_any_child, set_dumpable, set_keep_caps,
 };
 
 /// `close_range` が無いカーネル向けの代替。`/proc/self/fd` の列挙を先に集めてから閉じる（列挙中の fd を閉じない）。
@@ -908,6 +960,7 @@ mod libc_abi {
         assert!(opt_i64_eq(arch::SYS_CAPGET, libc::SYS_capget));
         assert!(opt_i64_eq(arch::SYS_CAPSET, libc::SYS_capset));
         assert!(opt_i64_eq(arch::SYS_EXECVEAT, libc::SYS_execveat));
+        assert!(opt_i64_eq(arch::SYS_WAITID, libc::SYS_waitid));
         assert!(opt_i32_eq(arch::O_DIRECTORY, libc::O_DIRECTORY));
         assert!(opt_i32_eq(arch::O_NOFOLLOW, libc::O_NOFOLLOW));
         assert!(opt_i32_eq(arch::SOL_SOCKET, libc::SOL_SOCKET));
@@ -928,6 +981,16 @@ mod libc_abi {
         // そのほか。
         assert!(AT_EMPTY_PATH == widen_i64(libc::AT_EMPTY_PATH));
         assert!(SYS_CLOSE_RANGE == libc::SYS_close_range);
+        // waitid（has_any_child）。P_ALL は列挙型（c_uint）なので i64 へ広げて比べる。
+        assert!(P_ALL == libc::P_ALL as i64);
+        assert!(WNOHANG == widen_i64(libc::WNOHANG));
+        assert!(WEXITED == widen_i64(libc::WEXITED));
+        assert!(WNOWAIT == widen_i64(libc::WNOWAIT));
+        assert!(EINTR == libc::EINTR);
+        assert!(ECHILD == libc::ECHILD);
+        // has_any_child の受け領域は libc の `siginfo_t` 以上の大きさ・アラインメントを持つ（`[u64; 16]`）。
+        assert!(size_of::<libc::siginfo_t>() <= SIGINFO_BYTES);
+        assert!(align_of::<libc::siginfo_t>() <= align_of::<u64>());
         assert!(F_GETFD == libc::F_GETFD);
         // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
         assert!(libc::SIGKILL == 9); // kill_process_group
@@ -1228,6 +1291,66 @@ mod tests {
     fn sup14_task171_1_3_syscall_numbers_aarch64() {
         assert_eq!(arch::SYS_CAPGET, Some(90));
         assert_eq!(arch::SYS_CAPSET, Some(91));
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: waitid の定数と syscall 番号の具体値。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup4_2441_waitid_constants() {
+        assert_eq!((P_ALL, WNOHANG, WEXITED, WNOWAIT), (0, 1, 4, 0x0100_0000));
+        assert_eq!((EINTR, ECHILD), (4, 10));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(arch::SYS_WAITID, Some(247));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(arch::SYS_WAITID, Some(95));
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: `has_any_child` は子が無ければ false、生存中・終了後の未回収（ゾンビ）は true、
+    /// 回収後は false。waitid はプロセス全体の子を見るため、他の試験の子が混ざらないよう試験バイナリを 1 試験だけで
+    /// 子プロセスとして再実行して照合する。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup4_2441_has_any_child_tracks_live_zombie_and_reaped() {
+        const GATE: &str = "FANDHE_CONTAINER_TEST_HAS_ANY_CHILD_INNER";
+        if std::env::var_os(GATE).is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "sys::linux::tests::sup4_2441_has_any_child_tracks_live_zombie_and_reaped",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(GATE, "1")
+                .output()
+                .expect("rerun");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "{text} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        assert!(!has_any_child().expect("no child"));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        assert!(has_any_child().expect("live child"));
+        child.kill().expect("kill");
+        // 終了済み・未回収（ゾンビ）の間も true（WNOWAIT なので回収しない）。
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(has_any_child().expect("zombie child"));
+        assert!(has_any_child().expect("zombie child again"));
+        child.wait().expect("wait");
+        assert!(!has_any_child().expect("reaped"));
     }
 
     #[cfg(any(

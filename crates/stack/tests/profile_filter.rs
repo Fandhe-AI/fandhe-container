@@ -1,7 +1,7 @@
 //! `--profile` 引数・環境変数解析の結合試験（STACK-10・TASK-187.1・#631・REPAIR-12）。
 //!
 //! 公開 API だけで、引数による環境変数の上書き・返却集合の照合・不正入力の構造化エラー
-//! （code / message / exit_code）を具体値で確認する。サービスの判定（#632）は末尾の試験。範囲外: CLI 結線（#3639）・無効参照の拒否（#633）。
+//! （code / message / exit_code）を具体値で確認する。サービスの判定（#632）は末尾の試験。範囲外: CLI 結線（#3639）。
 
 use std::ffi::OsStr;
 
@@ -144,6 +144,47 @@ profiles = ["dev"]
     #[test]
     fn stack_10_target_profiles_join_active_set() {
         assert_eq!(names(&[], &["debug"]).unwrap(), ["debug", "trace", "web"]);
+    }
+
+    const DEP_TOML: &str = r#"
+[services.web]
+image = "web:1"
+
+[services.web.depends_on]
+debug = "started"
+
+[services.debug]
+image = "dbg:1"
+profiles = ["dbg"]
+"#;
+
+    fn dep_names(flags: &[&str], targets: &[&str]) -> Result<Vec<String>, ServiceSelectError> {
+        let p: ComposeToml = toml::from_str(DEP_TOML).unwrap();
+        let active = resolve_active_profiles(flags.iter().map(OsStr::new), None).unwrap();
+        let e = select_enabled_services(&p.services, &active, targets.iter().copied())?;
+        Ok(e.select(&p.services).into_keys().collect())
+    }
+
+    /// STACK-10・#633: 有効サービスが無効サービスへ depends_on すると起動前に拒否される。
+    #[test]
+    fn stack_10_depends_on_disabled_service_rejected() {
+        let err = dep_names(&[], &[]).unwrap_err();
+        assert_eq!(
+            err,
+            ServiceSelectError::DisabledDependency {
+                service: "web".to_owned(),
+                dependency: "debug".to_owned()
+            }
+        );
+        assert_eq!(err.code(), "DEPENDS_ON_DISABLED_SERVICE");
+        assert_eq!(err.exit_code().get(), 2);
+    }
+
+    /// 依存先が profile または明示指定で有効なら成功する。
+    #[test]
+    fn stack_10_depends_on_enabled_by_profile_or_target_accepted() {
+        assert_eq!(dep_names(&["dbg"], &[]).unwrap(), ["debug", "web"]);
+        assert_eq!(dep_names(&[], &["debug"]).unwrap(), ["debug", "web"]);
     }
 
     #[test]

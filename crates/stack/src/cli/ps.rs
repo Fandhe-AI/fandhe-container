@@ -101,11 +101,20 @@ fn state_str(s: DependencyObservation) -> &'static str {
     }
 }
 
+/// Cc 以外で表示を乱す文字（Zl / Zp と書式文字 Cf の主要範囲。bidi 制御・ゼロ幅・BOM 等）か。
+/// 依存を足さず範囲で判定する（依存は承認制）。
+fn is_display_hazard(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x2028 | 0x2029 | 0x202A..=0x202E | 0x2060..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
+}
+
 /// 端末へ出す前に制御文字をエスケープする（ANSI 列や改行による表示の乗っ取りを防ぐ）。
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() {
+        if c.is_control() || is_display_hazard(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -449,6 +458,25 @@ mod tests {
         assert!(!t.contains('\u{1b}'));
         assert_eq!(t.lines().count(), 2);
         assert!(t.contains("x\\u{1b}[31m\\ny"));
+    }
+
+    #[test]
+    fn stack_8_ps_format_and_separator_chars_escaped() {
+        let name = "a\u{2028}b\u{2029}c\u{202e}d\u{200f}e\u{feff}";
+        let mut svcs = BTreeMap::new();
+        svcs.insert(name.to_string(), services(&["z"]).remove("z").unwrap());
+        let mut f = Fake {
+            map: HashMap::from([(name.to_string(), st(DependencyObservation::Running, None))]),
+            calls: vec![],
+        };
+        let r = ps(&svcs, &mut f).unwrap();
+        let t = r.render_table();
+        for c in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{200f}', '\u{feff}'] {
+            assert!(!t.contains(c), "raw {c:?} remained");
+        }
+        assert_eq!(t.lines().count(), 2);
+        assert!(t.contains("a\\u{2028}b\\u{2029}c\\u{202e}d\\u{200f}e\\u{feff}"));
+        assert_eq!(sanitize("\u{2066}"), "\\u{2066}");
     }
 
     #[test]

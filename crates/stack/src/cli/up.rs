@@ -14,7 +14,7 @@
 //!   TASK-157・SUP-1）
 //! - 本番の `DependencyObserver` / `HealthSource`（core の state.json 読み取り）
 //! - CLI 結線（`cli -> stack` の依存辺はユーザー承認事項）、TOML parse の入口と入力サイズの上限検証
-//! - ネットワーク接続（#619）、`completed` 条件の待機（未対応として止める）、`down` / `ps` / `logs`（#620〜#622）
+//! - ネットワーク接続（#619）、`completed` 条件の待機（未対応として止める）、`ps` / `logs`（#621・#622）
 //!
 //! 外部入力の扱い: サービス名と `Service` は TOML 由来。本モジュールはシェルもパスも組み立てず
 //! ポートへ渡すだけで、検証は実装側の責務（契約は [`ServiceLauncher`]）。エラーと報告には

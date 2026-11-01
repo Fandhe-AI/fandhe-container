@@ -6,7 +6,7 @@
 //!
 //! 起動役 [`TaskExecLauncher`] は本モジュールで定義するだけで、本番の実装は無い（REPAIR-3）。`ContainerRuntime`
 //! （core）に exec は無く、本番の入口は supervisor の `run_command_with_pidfd` にあるが cri は依存しない
-//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は #675（TASK-62.5）・#803（TASK-62.7）で扱う。
+//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は #803（TASK-62.7）で扱う（TASK-62.5 の #675 は ContainerRuntime 境界の接続までで、exec の起動役は含まない）。
 //! 差し込まれない既定の `TaskService` は `Exec` / `Start(exec_id)` を `UNIMPLEMENTED` で拒否する（fail-closed）。
 //!
 //! 外部入力（`Any` の JSON）は untrusted として検証する。受け付けない欄は黙って捨てず `UNIMPLEMENTED`、
@@ -107,11 +107,11 @@ impl ExecProcessSpec {
 /// - `spec.user()` が `None` のときはコンテナの init と同じユーザーで動かす。
 /// - 戻り値は PID（不明なら `None`）。
 /// - shim は `Start` の直前にコンテナが Running かを再確認するが、確認から起動までの間に停止しうる。
-///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`。#675・#803）。
+///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`。#803）。
 /// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残る（除去は #870 で `Delete(exec_id)`
 ///   とあわせて扱う。コンテナ削除・exec 終了時の登録の除去も #870 の必須事項）。
 ///
-/// 本番の実装は無い（REPAIR-3。#675・#803）。
+/// 本番の実装は無い（REPAIR-3。#803）。
 pub trait TaskExecLauncher: Send + Sync {
     /// exec プロセスを起動する。
     fn launch(

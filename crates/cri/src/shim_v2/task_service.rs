@@ -57,7 +57,11 @@ const FIELD_OPTIONS: u64 = 10;
 /// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
 const UNKNOWN_EXIT_STATUS: u32 = 255;
 
-/// Create / Start / Delete / Exec を処理する Task サービス。他のメソッドは `Unimplemented`。
+/// Create / Start / Delete / Exec / Wait を処理する Task サービス。他のメソッドは `Unimplemented`。
+///
+/// `ContainerRuntime` 境界の RuntimeService とは別のアダプタで、[`RuntimeAdapter`] だけを通して実行層を呼ぶ
+/// （TASK-62.5・CRI-5・CRI-7）。`CriRuntimeService::with_runtime` に渡すものと同じ `RuntimeAdapter` を
+/// clone して [`TaskService::new`] に渡せば、同じ実装（同一の `Arc<dyn ContainerRuntime>`）を共有する。
 pub struct TaskService {
     version: TaskApiVersion,
     adapter: RuntimeAdapter,
@@ -75,7 +79,7 @@ impl std::fmt::Debug for TaskService {
 }
 
 impl TaskService {
-    /// 版とランタイムのアダプタから作る。
+    /// 版とランタイムのアダプタから作る。`adapter` は RuntimeService と clone して共有してよい（CRI-7）。
     pub fn new(version: TaskApiVersion, adapter: RuntimeAdapter) -> Self {
         Self {
             version,

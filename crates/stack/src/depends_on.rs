@@ -6,9 +6,10 @@
 //! 計画を返さずエラーにする（起動前に止める。fail-closed）。
 //!
 //! 本モジュールは各依存先の条件を [`DependencyWait`] として計画に残すだけで、待たない。
-//! `started` の待機は `wait` サブモジュール（#590）。
-//! 未実装（実装済みを装わない。REPAIR-3）: `healthy` の state.json ポーリング（#591）、
-//! healthy 未達のタイムアウト（#592。`wait` の `WaitTimeout` を再利用する）、`completed` の待機。
+//! `started` の待機は `wait` サブモジュール（#590）、`healthy` のポーリング待機は
+//! `healthy_wait`（#591）にあり、state.json の読み取りは `up`（TASK-155）が `HealthSource` で注入する。
+//! 未実装（実装済みを装わない。REPAIR-3）: healthy 未達のタイムアウトのエラー化（#592。`wait` の
+//! `WaitTimeout` を再利用する）、`completed` の待機。
 //!
 //! 決定性: `BTreeMap` のキー順で DFS を始め、依存先もキー順にたどる。結果は「依存先が先、
 //! 互いに独立なものは名前順の DFS 後行順」で、同じ入力なら常に同じ出力になる。
@@ -23,6 +24,13 @@ use std::fmt;
 use crate::schema::{DependsOnCondition, Service};
 
 pub mod wait;
+
+mod healthy_wait;
+pub use healthy_wait::{
+    HealthSource, HealthSourceError, HealthyGate, HealthyWaitError, HealthyWaitOutcome,
+    HealthyWaitPolicy, HealthyWaitPolicyError, MonotonicClock, ObservedHealth, PollClock,
+    gate_healthy_dependencies, wait_until_healthy,
+};
 
 /// 依存先ひとつ分の待ち条件（`DependsOnCondition` を依存先名と組にしたもの）。
 #[derive(Debug, Clone, PartialEq, Eq)]

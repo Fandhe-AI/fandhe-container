@@ -9,7 +9,7 @@
 //! - [`frame`]: 10 バイトのヘッダ（壊れた値を表現できない型。REPAIR-2）
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
-//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Exec のメッセージ型と実装（TASK-62.2・TASK-62.4）
+//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.4）
 //! - [`exec`]: Exec の検証済み型・登録簿・起動役のトレイト（TASK-62.4）
 //! - `server`（unix のみ）: UDS 上のサーバー
 //!
@@ -18,9 +18,9 @@
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）:
 //! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669）。メッセージ型は手書きでサービス名だけで版を分ける
-//! - Delete / Wait（#673・#870・#871）、State / Kill / Shutdown（#873）。`Unimplemented`
-//! - Create の rootfs mount・stdio・terminal・`options`・checkpoint。黙って捨てず `UNIMPLEMENTED`
-//! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #675・#803）、`Delete(exec_id)` での登録の除去（#870）、
+//! - Wait（#673・#871）、State / Kill / Shutdown（#873）。`Unimplemented`
+//! - Create の rootfs mount・stdio・terminal・`options`・checkpoint、Delete の `exited_at`（core が終了時刻を持たず常に未設定）。黙って捨てず `UNIMPLEMENTED`
+//! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は #675・#803）、`Delete(exec_id)`（登録の除去を含め未対応で `UNIMPLEMENTED`。#674）、
 //!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec` と `Start(exec_id)` を `UNIMPLEMENTED` で拒否する
 //! - UDS の置き場所・権限・peer UID の照合（SO_PEERCRED）。呼び出し元が bind 済みの listener を渡す。#803（TASK-62.7）で扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata`・`timeout_nano` は復号するだけで使わない
@@ -43,7 +43,7 @@ pub use message::{KeyValue, RpcStatus, TtrpcRequest, TtrpcResponse};
 pub use server::{ServerConfig, ServerHandle, ShimV2Error, TtrpcServer};
 pub use service::{EmptyTaskService, ServiceRegistry, TaskApiVersion, TtrpcService};
 pub use task_api::{
-    Any, CreateTaskRequest, CreateTaskResponse, ExecProcessRequest, Mount, StartRequest,
-    StartResponse,
+    Any, CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
+    Mount, StartRequest, StartResponse, Timestamp,
 };
 pub use task_service::TaskService;

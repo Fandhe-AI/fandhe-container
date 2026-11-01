@@ -2,7 +2,9 @@
 //!
 //! # 役割と呼び出し文脈
 //! 周期実行エンジン [`run_periodic`](super::run_periodic) の `HealthProbe::probe` として、probe のたびに
-//! `/proc/self/exe healthcheck-exec ...`（本体は [`super::exec_helper`]）を単一スレッドの別プロセスとして起動する。
+//! `/proc/self/exe healthcheck-reaper ...`（中間 subreaper。本体は [`super::exec_reaper`]）を起動し、reaper が
+//! `healthcheck-exec ...`（本体は [`super::exec_helper`]）を単一スレッドの別プロセスとして起動する（supervisor → reaper →
+//! helper の 3 段。helper の子孫の再親付けの受け皿を reaper だけにする。判断記録は設計文書の 8 章）。
 //! helper は exec 共通関数（`exec::run_command_with_pidfd_output`。TASK-163・SUP-6）で healthcheck コマンドを
 //! 稼働中コンテナの中で実行し、結果を 1 行（[`super::exec_wire`]）で返す。本アダプタは結果を `Healthy` / `Unhealthy` に
 //! 写す（`health_from_exec_exit`）。`probe` は `ProbeRunner` が作る一時スレッドの上で呼ばれるため、supervisor 本体は
@@ -36,9 +38,10 @@ use std::io::Read as _;
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,7 +53,8 @@ use fandhe_container_core::traits::{
 };
 
 use super::HealthcheckDefinition;
-use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
+use super::exec_helper::{HealthExecArgs, self_exe_command};
+use super::exec_reaper::HEALTH_REAPER_SUBCOMMAND;
 use super::exec_wire::{HealthExecLine, LINE_MAX};
 use crate::health::{HealthProbe, ProbeCancel};
 use crate::run::MAX_POLL_INTERVAL;
@@ -487,12 +491,13 @@ fn parse_result_stream(sink: &ResultSink) -> ParsedStream {
 
 /// 結果ストリームから、helper が排他作成に成功したと通知した exec 子 cgroup の名前を取り出す。
 ///
-/// 通知（`FCHC1 <name>\n`。[`super::exec_wire::CGROUP_TAG`]）が無い・名前が不正・名前の pid が `helper_pid` と
-/// 食い違う場合は `None`（所有を確定できないので止めない）。helper の pid から名前を推定しない理由: 再利用された
-/// pid の以前の exec が残した populated な同名 cgroup を誤停止し得るため（SUP-6・REPAIR-5）。
-fn owned_exec_cgroup(bytes: &[u8], helper_pid: u32) -> Option<ExecCgroupName> {
+/// 通知（`FCHC1 <name>\n`。[`super::exec_wire::CGROUP_TAG`]）が無い・名前が不正な場合は `None`（所有を確定できない
+/// ので止めない）。pid から名前を推定しない理由: 再利用された pid の以前の exec が残した populated な同名 cgroup を
+/// 誤停止し得るため（SUP-6・REPAIR-5）。結果ストリームは helper（と reaper）の fd 2 で、コマンドの出力は別の
+/// チャネルなので、コマンドが通知を偽造することはできない。helper の pid は reaper の子で supervisor からは分からない
+/// ため、名前の pid 部分の照合はしない（名前の書式は `ExecCgroupName::new` が検証する）。
+fn owned_exec_cgroup(bytes: &[u8]) -> Option<ExecCgroupName> {
     let prefix = format!("{} ", super::exec_wire::CGROUP_TAG);
-    let owner = format!("exec-{helper_pid}-");
     bytes
         .split(|&b| b == b'\n')
         // 改行で終わらない末尾（途中で切れた行）は採らない。
@@ -502,25 +507,25 @@ fn owned_exec_cgroup(bytes: &[u8], helper_pid: u32) -> Option<ExecCgroupName> {
                 .ok()?
                 .strip_prefix(prefix.as_str())
         })
-        .find_map(|name| {
-            let name = ExecCgroupName::new(name).ok()?;
-            name.as_str().starts_with(&owner).then_some(name)
-        })
+        .find_map(|name| ExecCgroupName::new(name).ok())
 }
 
-/// 期限切れ・cancel 後の止め方: 所有を確定した exec 子 cgroup だけを `stop`（`cgroup.kill` と削除）で止め、
-/// helper が自分で終わるのを `wait` まで待つ。戻り値は `(stop の成否, helper が終わったか)`。
+/// 期限切れ・cancel 後の止め方: 所有を確定した exec 子 cgroup だけを `stop`（`cgroup.kill` と削除）で止め、次に
+/// reaper へ止める合図（`request_stop`。結果チャネルへ 1 バイト）を送り、reaper が終わるのを `wait` まで待つ。
+/// 戻り値は `(stop の成否, reaper が終わったか)`。
 ///
-/// **helper へはシグナルを送らない**。SIGKILL すると helper の子孫（`FileAuditSink` が fork した子、worker）が
-/// subreaper の supervisor へ再親付けされ、回収の責任と特定の手段が増え続けるため。cgroup を止めれば worker が
-/// 結果を返して helper が終わる。待ちきれなければ呼び出し側が `Child` を保持する（REPAIR-5）。
+/// 順序の理由: 先にコマンドを止めて worker に結果を返させ、そのうえで reaper が helper を SIGKILL する。helper の
+/// 子孫（worker、`FileAuditSink` の子など）は reaper が受けて回収するので、supervisor へ再親付けされない。supervisor は
+/// reaper の終了を有界に待ち、待ちきれなければ呼び出し側が `Child`（reaper）を保持する（REPAIR-5）。
 fn stop_cgroup_then_wait(
     child: &mut Child,
     owned: Option<&ExecCgroupName>,
     stop: impl FnOnce(&ExecCgroupName) -> bool,
+    request_stop: impl FnOnce(),
     wait: Duration,
 ) -> (bool, bool) {
     let stop_ok = stop_if_owned(owned, stop);
+    request_stop();
     let until = Instant::now() + wait;
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
@@ -600,7 +605,7 @@ pub struct ExecHealthProbe {
     /// 配置取得スレッド（`hc-resolve`）が生きている間 true。状態ストアの I/O が止まったときに切り離した
     /// スレッドと複製した pidfd が probe ごとに積み上がらないよう、同時に 1 本までに抑える（REPAIR-5）。
     resolver_busy: Arc<AtomicBool>,
-    /// 期限切れ・cancel の後、`REAP_TIMEOUT` 内に自分で終わらなかった helper の `Child`（最大 1 個）。次の probe の開始時・
+    /// 期限切れ・cancel の後、`REAP_TIMEOUT` 内に終わらなかった reaper の `Child`（最大 1 個。孤児が回収できない等）。次の probe の開始時・
     /// `cancel`・drop で `try_wait` し、回収できるまで新しい helper を作らない（未回収 helper の蓄積を防ぐ。
     /// SUP-4・REPAIR-5）。
     unreaped: Mutex<Option<Child>>,
@@ -679,20 +684,17 @@ impl ExecHealthProbe {
             .clone()
     }
 
-    fn spawn_helper(
+    /// reaper（`healthcheck-reaper`。helper の親になる中間 subreaper）を起動する。reaper が helper を起動し、
+    /// fd 0〜2 をそのまま helper へ継承させる。
+    fn spawn_reaper(
         &self,
         args: &HealthExecArgs,
         stdin: OwnedFd,
         stdout: OwnedFd,
         stderr: OwnedFd,
     ) -> std::io::Result<Child> {
-        let mut command = Command::new("/proc/self/exe");
+        let mut command = self_exe_command(HEALTH_REAPER_SUBCOMMAND, &args.to_args());
         command
-            .arg0(HEALTH_EXEC_ARG0)
-            .arg(HEALTH_EXEC_SUBCOMMAND)
-            .args(args.to_args())
-            .env_clear()
-            .current_dir("/")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -921,7 +923,7 @@ impl ExecHealthProbe {
                 )),
             );
         }
-        let mut child = match self.spawn_helper(
+        let mut child = match self.spawn_reaper(
             &helper_args,
             pidfd,
             OwnedFd::from(out_child),
@@ -944,7 +946,6 @@ impl ExecHealthProbe {
             }
         };
 
-        let helper_pid = child.id();
         let mut output = OutputSink::default();
         let mut results = ResultSink::default();
         let mut out_eof = false;
@@ -1017,7 +1018,7 @@ impl ExecHealthProbe {
                 &mut out_parent,
                 &mut res_parent,
             );
-            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
+            let owned = owned_exec_cgroup(&results.bytes);
             if owned.is_some() {
                 stopped = true;
             }
@@ -1026,10 +1027,10 @@ impl ExecHealthProbe {
             }
         }
         if !reaped {
-            // 期限切れ・cancel でも helper へシグナルは送らない（SIGKILL も SIGTERM も）。止めるのは、作成通知で
-            // 今回の作成を確認できた exec 子 cgroup の `cgroup.kill` だけで、worker は結果を返して helper が
-            // 自分で終わる。helper が SIGKILL されないので、helper の子孫（監査 sink の fork した子を含む）は
-            // 親の helper が自分で回収し、supervisor へ再親付けされない（SUP-4・SUP-6・REPAIR-5）。
+            // 期限切れ・cancel: ① 作成通知で今回の作成を確認できた exec 子 cgroup を `cgroup.kill` して削除し、
+            // ② reaper へ止める合図（結果チャネルへ 1 バイト）を送る。reaper が helper を SIGKILL し、再親付けされた
+            // 子孫（worker、監査 sink の子など）もすべて回収してから終わる。supervisor は helper へ直接シグナルを送らず、
+            // 子孫は supervisor へ再親付けされない（reaper が受け皿。SUP-4・SUP-6・REPAIR-5）。
             read_all(
                 &mut out_eof,
                 &mut res_eof,
@@ -1038,7 +1039,7 @@ impl ExecHealthProbe {
                 &mut out_parent,
                 &mut res_parent,
             );
-            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
+            let owned = owned_exec_cgroup(&results.bytes);
             if owned.is_some() {
                 stopped = true;
             }
@@ -1046,6 +1047,11 @@ impl ExecHealthProbe {
                 &mut child,
                 owned.as_ref(),
                 |name| self.kill_exec_cgroup(&record, Some(name)),
+                || {
+                    use std::io::Write as _;
+                    // 書けなくても（reaper が既に終わった等）続行する。supervisor の死亡時は端の EOF が合図になる。
+                    let _ = res_parent.write_all(b"S");
+                },
                 REAP_TIMEOUT,
             );
             if !stop_ok {
@@ -1053,8 +1059,8 @@ impl ExecHealthProbe {
             }
             reaped = exited;
             if !reaped {
-                // 終わらない helper（同期 I/O で固まった等）の `Child` は手放さず保持する。後続の probe の開始時・
-                // cancel・drop が `try_wait` し、終わるまで新しい helper を作らない（保持は 1 個まで。REPAIR-5）。
+                // 終わらない reaper（孤児が D 状態で回収できない等）の `Child` は手放さず保持する。後続の probe の
+                // 開始時・cancel・drop が `try_wait` し、終わるまで新しい helper を作らない（保持は 1 個まで。REPAIR-5）。
                 *self
                     .unreaped
                     .lock()
@@ -1081,7 +1087,7 @@ impl ExecHealthProbe {
         // helper の終了後に届いた作成通知（作成の直後に期限切れで殺され、通知が読み取りに間に合わなかった場合）も、
         // ソケットに残った分を読んだ結果で拾って止める（SUP-6・REPAIR-5）。
         if !stopped && !matches!(ended, Ended::Exited(true)) {
-            let owned = owned_exec_cgroup(&results.bytes, helper_pid);
+            let owned = owned_exec_cgroup(&results.bytes);
             if !self.kill_exec_cgroup(&record, owned.as_ref()) {
                 cgroup_stop_failed = true;
             }
@@ -1626,14 +1632,13 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let helper_pid = 4242u32;
-        let stale = root.join(format!("exec-{helper_pid}-0"));
+        let stale = root.join("exec-4242-0");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("cgroup.procs"), b"777\n").unwrap();
 
         // 結果行と診断行だけで、作成通知が無い。
         let stream = b"{\"diag\":1}\nFCHX1 stale\n";
-        let owned = owned_exec_cgroup(stream, helper_pid);
+        let owned = owned_exec_cgroup(stream);
         assert_eq!(owned, None);
         let mut called = false;
         assert!(stop_if_owned(owned.as_ref(), |_| {
@@ -1648,10 +1653,10 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// SUP-6（#2441）: 作成通知を受けた名前だけを止める。pid の食い違い・不正な名前・途中で切れた行は採らない。
+    /// SUP-6（#2441）: 作成通知を受けた名前だけを止める。不正な名前・途中で切れた行は採らない。
     #[test]
-    fn sup6_2441_only_the_notified_cgroup_of_this_helper_is_owned() {
-        let ok = owned_exec_cgroup(b"FCHC1 exec-4242-0\nFCHX1 stale\n", 4242).unwrap();
+    fn sup6_2441_only_the_notified_cgroup_is_owned() {
+        let ok = owned_exec_cgroup(b"FCHC1 exec-4242-0\nFCHX1 stale\n").unwrap();
         assert_eq!(ok.as_str(), "exec-4242-0");
         let mut stopped = Vec::new();
         assert!(stop_if_owned(Some(&ok), |n| {
@@ -1659,12 +1664,11 @@ mod tests {
             true
         }));
         assert_eq!(stopped, vec!["exec-4242-0".to_owned()]);
-        // 別 pid の名前（偽造・古い通知）。
-        assert_eq!(owned_exec_cgroup(b"FCHC1 exec-1-0\n", 4242), None);
         // 不正な名前。
-        assert_eq!(owned_exec_cgroup(b"FCHC1 ../exec-4242-0\n", 4242), None);
+        assert_eq!(owned_exec_cgroup(b"FCHC1 ../exec-4242-0\n"), None);
+        assert_eq!(owned_exec_cgroup(b"FCHC1 other-1-0\n"), None);
         // 改行で終わらない途中の行。
-        assert_eq!(owned_exec_cgroup(b"FCHC1 exec-4242-0", 4242), None);
+        assert_eq!(owned_exec_cgroup(b"FCHC1 exec-4242-0"), None);
         // 停止の失敗は false で返る。
         assert!(!stop_if_owned(Some(&ok), |_| false));
     }
@@ -1681,15 +1685,15 @@ mod tests {
         assert_eq!(parsed.dropped, 0);
     }
 
-    /// SUP-4・REPAIR-5（#2441）: 期限切れでは作成通知を受けた exec 子 cgroup だけを止め、helper へシグナルは送らない。
-    /// helper（の代役）は cgroup が止まったことを見て自分で終わり、シグナルによる終了ではない。
+    /// SUP-4・REPAIR-5（#2441）: 期限切れでは、作成通知を受けた exec 子 cgroup の停止、reaper への合図、reaper の終了待ち
+    /// の順に進む。supervisor は reaper（の代役）に直接シグナルを送らず、代役は合図（フラグの消滅で代用）で自分で終わる。
     #[test]
-    fn sup4_2441_expiry_stops_only_the_owned_cgroup_and_never_signals_the_helper() {
+    fn sup4_2441_expiry_stops_the_owned_cgroup_then_signals_the_reaper() {
         use std::os::unix::process::ExitStatusExt as _;
         let flag = std::env::temp_dir().join(format!("fandhe-hc-flag-{}", std::process::id()));
         std::fs::write(&flag, b"1").unwrap();
-        // helper の代役: フラグ（= exec 子 cgroup の中身の代役）が消えるまで動き、消えたら自分で終わる。
-        let mut helper = Command::new("/bin/sh")
+        // reaper の代役: 合図（フラグの消滅）を見て自分で終わる。
+        let mut reaper = Command::new("/bin/sh")
             .arg("-c")
             .arg(format!(
                 "while [ -e '{}' ]; do sleep 0.02; done",
@@ -1698,44 +1702,53 @@ mod tests {
             .spawn()
             .unwrap();
         let name = ExecCgroupName::new("exec-4242-0").unwrap();
-        let stopped = std::cell::RefCell::new(Vec::new());
+        let order = std::cell::RefCell::new(Vec::new());
         let (stop_ok, exited) = stop_cgroup_then_wait(
-            &mut helper,
+            &mut reaper,
             Some(&name),
             |n| {
-                stopped.borrow_mut().push(n.as_str().to_owned());
-                std::fs::remove_file(&flag).is_ok()
+                order.borrow_mut().push(format!("stop {}", n.as_str()));
+                true
+            },
+            || {
+                order.borrow_mut().push("signal".to_owned());
+                let _ = std::fs::remove_file(&flag);
             },
             Duration::from_secs(10),
         );
         assert!(stop_ok);
         assert!(exited);
-        assert_eq!(*stopped.borrow(), vec!["exec-4242-0".to_owned()]);
-        // 自分で終わった: 終了コード 0 で、シグナルによる終了ではない。
-        let status = helper.wait().unwrap();
+        assert_eq!(
+            *order.borrow(),
+            vec!["stop exec-4242-0".to_owned(), "signal".to_owned()]
+        );
+        let status = reaper.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         assert_eq!(status.signal(), None);
     }
 
-    /// SUP-4・REPAIR-5（#2441）: 作成通知が無ければ何も止めず、終わらない helper は待ちきった後も生きたまま
-    /// （シグナルを送らない）で、`exited = false` を返す。
+    /// SUP-4・REPAIR-5（#2441）: 作成通知が無ければ cgroup は止めないが、reaper への合図は送る。終わらない reaper は
+    /// 待ちきった後も生きたままで、`exited = false` を返す（呼び出し側が `Child` を保持する）。
     #[test]
-    fn sup4_2441_expiry_without_notice_stops_nothing_and_leaves_helper_alive() {
-        let mut helper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    fn sup4_2441_expiry_without_notice_still_signals_but_stops_no_cgroup() {
+        let mut reaper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let signaled = std::cell::Cell::new(0u32);
         let (stop_ok, exited) = stop_cgroup_then_wait(
-            &mut helper,
+            &mut reaper,
             None,
             |_| panic!("nothing owned must not be stopped"),
+            || signaled.set(signaled.get() + 1),
             Duration::from_millis(100),
         );
         assert!(stop_ok);
         assert!(!exited);
-        assert!(matches!(helper.try_wait(), Ok(None)));
-        helper.kill().unwrap();
-        helper.wait().unwrap();
+        assert_eq!(signaled.get(), 1);
+        assert!(matches!(reaper.try_wait(), Ok(None)));
+        reaper.kill().unwrap();
+        reaper.wait().unwrap();
     }
 
-    /// SUP-4・REPAIR-5（#2441）: 終わらない helper が残っている間は、次の probe は helper を作らずに `Unavailable` で
+    /// SUP-4・REPAIR-5（#2441）: 終わらない reaper が残っている間は、次の probe は helper を作らずに `Unavailable` で
     /// 戻り（シグナルも送らない）、終わった後は先へ進む。
     #[test]
     fn repair5_2441_unreaped_helper_blocks_new_probe_until_it_exits() {

@@ -1,17 +1,18 @@
 # healthcheck の exec 専用 helper（HealthProbe の本番アダプタ）
 
-> **位置づけ**: 採用した設計の判断記録（#2441・SUP-4・SUP-6・SEC-1・SEC-4・REPAIR-5・TASK-161 追補）。実装は `crates/supervisor/src/healthcheck/exec_{wire,helper,probe}.rs`。
+> **位置づけ**: 採用した設計の判断記録（#2441・SUP-4・SUP-6・SEC-1・SEC-4・REPAIR-5・TASK-161 追補）。実装は `crates/supervisor/src/healthcheck/exec_{wire,helper,reaper,probe}.rs`。
 > 結線（monitor / supervisor 入口への `run_periodic` と `ExecHealthProbe` の組み込み・restart の quiesce の参加者・restart での付け替え）は #2953 が担う。argv[0] の PATH 解決と timeout 上限は #2439（オーナー判断待ち）が担い、本書では現行の拒否を保つ。
 
 ## 1. 目的と範囲
 
 周期実行エンジン `run_periodic`（#495）と集約（#496）は実装済みだが、`HealthProbe` の本番実装が無く、コマンドは実行されなかった。本書は `HealthProbe` の本番アダプタ `ExecHealthProbe` が、exec 共通関数（`exec::run_command_with_pidfd` 系。TASK-163・SUP-6）で healthcheck コマンドを実行する方式を定める。
 
-## 2. 方式: `/proc/self/exe healthcheck-exec`（単一スレッドの別プロセス）
+## 2. 方式: supervisor → reaper → helper の 3 段（`/proc/self/exe healthcheck-reaper` / `healthcheck-exec`）
 
 - exec 共通関数は fork の直前に `Threads: 1` を強制する（`setns` が不可逆なため）。supervisor 本体は logs 捕捉スレッド等を持ち、probe は `ProbeRunner` が作る一時スレッド `healthcheck-probe` の上で呼ばれるため、本体から直接は呼べない
-- probe のたびに `/proc/self/exe` を第 1 引数 `healthcheck-exec` で exec し直した helper を起動する。前例は `netns-holder`。`main.rs` では `run_main` より前に振り分ける（`run_main` の `close_fds_from`・結果チャネルの検証は helper の契約と合わないため。特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にならない）
+- probe のたびに `/proc/self/exe` を第 1 引数 `healthcheck-reaper` で exec し直した reaper を起動し、reaper が第 1 引数 `healthcheck-exec` で exec し直した helper を起動する（3 段。理由は 8 章）。前例は `netns-holder`。argv の決め方（`argv[0]` 固定・環境は空・cwd `/`）は `exec_helper::self_exe_command` で両者に共通。`main.rs` では `run_main` より前に振り分ける（`run_main` の `close_fds_from`・結果チャネルの検証は helper の契約と合わないため。特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にならない）
 - 新しい `unsafe` は追加しない（`pre_exec`・`SCM_RIGHTS`・`PR_SET_PDEATHSIG` を使わない）
+- reaper は fd 0〜2 を触らず、そのまま helper へ継承させる。fd 2（結果チャネルの子側）は reaper が「止める合図」の受け口としても読む（8 章）
 
 ### 却下案
 
@@ -36,7 +37,7 @@
 
 1. `close_fds_from(3)`、`set_dumpable(false)`
 2. 引数の検証（`--root`・`--id`・`--expect-pid`・`--timeout-ms`・`--` 以降のコマンド。各オプションはちょうど 1 回、argv[0] は絶対パス、timeout は 1ms 以上 60 秒以下）。失敗は `invalid`
-3. 状態を読み、記録が `Running`・pid が `expect-pid`・`supervisor_pid` が親（起動した supervisor）と一致することを確かめる。不一致は `stale` で、exec も監査もしない（restart 後の古いアダプタが違反を毎回監査させない。SUP-1）
+3. 状態を読み、記録が `Running`・pid が `expect-pid`・`supervisor_pid` が起動した supervisor（helper の親は reaper で、その親。`/proc/<reaper>/stat` の ppid。読めなければ `stale`）と一致することを確かめる。不一致は `stale` で、exec も監査もしない（restart 後の古いアダプタが違反を毎回監査させない。SUP-1）
 4. launch 時の env 上書きを読む（`container_options::store::launch_env_for`。期限つきの作業スレッドで包まない: helper は単一スレッドを保つため。helper 全体の期限は exec の期限と supervisor 側の exec 子 cgroup の停止が縛る。固まった helper は保持して次の probe を `Unavailable` にする）
 5. `exec::default_audit_sink` で `FileAuditSink` を作る（SEC-4。単一スレッドのため `ControlAuditRelay` を通さず、段が落ちない）
 6. `run_command_with_pidfd_output`（core の `spawn_exec_command_with_stdio` を使い、コマンドの fd 1・2 を出力 fd へ付け替える）
@@ -71,25 +72,50 @@
 - 構造化ログ `healthcheck_exec` はバイト数と `truncated` だけを載せ、**本文は載せない**（秘密情報・ログ注入・command の中身を出さない方針）
 - 本文は `ExecHealthProbe::last_report()` で読める（後続の inspect や #2953 が使う口）。表示するときは `output_escaped()`（制御文字・非 ASCII をエスケープ）を使う。`TraitError` のメッセージには本文を入れない
 
-## 8. タイムアウトの層と cancel（REPAIR-5）
+## 8. タイムアウトの層・cancel・子孫の回収（REPAIR-5）
+
+### 3 段にする理由
+
+helper の子孫（exec の worker、`FileAuditSink` が主経路のファイル I/O のために fork する使い捨ての子〔`crates/core/src/audit_log/file_sink.rs`。D 状態で回収できない子は helper が追跡する〕など）は、helper が先に終わる・殺されると再親付けされる。本番の supervisor は child subreaper（コンテナの PID 1 などを直下に持つ）で、そこへ再親付けされると回収の責任と特定の手段が子孫の種類ごとに増える。子孫ごとに通知を足す方式では収束しないため、再親付けの受け皿を専用の **reaper** だけにする。
+
+### reaper（`exec_reaper`）
+
+- やることは 3 つだけ: ① `PR_SET_CHILD_SUBREAPER`（core の `ChildSubreaper::enable`。立てられなければ helper を起動せず失敗）を立てて helper を起動する、② 自分の子（helper と再親付けされた孤児）を pid 指定の `waitpid(WNOHANG)` で、子が無くなる（`ECHILD` 相当）まで回収する、③ 止める合図で helper に SIGKILL を送る
+- ファイル I/O・監査・状態ストアには一切触れない（固まらない）。reaper の子は helper と再親付けされた孤児だけで、コンテナの PID 1 は supervisor の直下にあり reaper の子ではないので、他人の子を奪わない。`waitpid(-1)` は使わず（`unsafe` を足さないため）、`/proc/<reaper>/task/<tid>/children`（無ければ `/proc` の走査）で子を列挙し、1 件ずつ pid 指定で回収する。pidfd は回収前に開くので pid が再利用されても元の子を指す
+- 終了コード: helper が成功で終わり孤児もすべて回収できれば 0、それ以外は 1（結果は helper が fd 2 に書いた行が正）
+
+### 通常の終了
 
 - `probe(T)` の絶対期限 `T` に対し、helper の exec の期限は `T - min(T/5, 2s)`（30s → 28s、5s → 4s、1s → 800ms）。通常は core が期限切れのコマンドを `cgroup.kill` して `Timeout` を返し、`T` より前に終わる
-- `T` を過ぎても終わらない、または cancel されたときは、**helper へシグナルを送らない**（SIGKILL も SIGTERM も）。supervisor がやるのは、作成通知（`FCHC1`）で今回の作成を確認できた exec 子 cgroup の `cgroup.kill` と削除だけで、これで worker 配下のコマンドが止まり、worker が結果を返して helper が自分で終わる。supervisor は helper の終了を最大 1 秒（`REAP_TIMEOUT`）だけ待ち、`probe()` の呼び出し元へは従来どおり `Timeout` / `Cancelled` を返す。待ちきれなかった helper（同期ファイル I/O で固まった等）は `helper_reaped = false` で報告し、`Child` を `ExecHealthProbe` に最大 1 個保持する。保持している間は、次の probe の開始時に `try_wait` を行い（シグナルは送らない）、終わるまで新しい helper を作らず `Unavailable`（`a previous healthcheck exec helper has not been reaped`）を即座に返す。`cancel()` と drop も待たずに回収を試みる。adapter 単位の保持は 1 個までである。adapter を作り直す（restart）ときは、drop した adapter が持っていた生きている helper を、プロセス全体で 1 つの保持先（`GLOBAL_HELD`。`std::process::Child` の drop は終了を待たず、後で終わっても回収する経路が無いため）へ移す。保持先は probe の開始時に `try_wait` で掃除し、件数が上限 `MAX_HELD_HELPERS`（4。固まる原因はストレージの停止など共通で、複数世代で重なれば新しい helper を作っても同じ所で固まるだけのため、小さな定数にした）に達している間は、どの adapter の probe も helper を作らず `Unavailable`（`too many unreaped healthcheck exec helpers`）を返す。保持先の件数は「上限 + 同時に走る adapter 数」を超えない（SUP-4・REPAIR-5）
-- helper は結果行を返した後、監査 sink（`FileAuditSink`）が fork した子のうち、D 状態などで回収できず追跡中のもの（`fandhe_container_core::audit_log::reap_pending_children` が数える）が 0 になるまで終了しない（50ms 刻み）。終了すると、その子が child subreaper の supervisor へ再親付けされて回収経路が無いため。待ちに上限は設けない: supervisor 側が helper の終了を有界に待ち、終わらなければ上の保持（adapter の 1 個、drop 後は保持先）へ移して新規生成を塞ぐ
-- helper を SIGKILL しない理由: SIGKILL すると helper の子孫が、child subreaper である本番の supervisor へ再親付けされる。子孫は種類が増える（exec の worker、`FileAuditSink` が主経路のファイル I/O のために fork する使い捨ての子〔`crates/core/src/audit_log/file_sink.rs` のモジュール doc。時間切れの子は helper 自身が SIGKILL し、D 状態の子は helper が追跡して後続の呼び出しで回収する〕など）ため、特定して回収する通知を種類ごとに足す方式では収束しない。helper が生きて自分で終われば、自分の子孫は親の helper が回収し、再親付けが起きない。この前提により supervisor 側に worker などの回収経路は持たない
-- worker とコマンドの停止は親死亡シグナルに頼らない（コマンドは `PR_SET_PDEATHSIG` を解除でき、fork した子孫には継承されないため）。helper は exec 子 cgroup の排他作成（同名は `EEXIST` で失敗）に成功した直後、worker の fork 前に、名前を作成通知（`FCHC1 <名前>`）として fd 2 へ 1 回だけ書く。supervisor は、この通知で今回の作成を確認できた cgroup（名前が `exec-<helper pid>-` で始まるもの）だけを `cgroup.kill` して削除する。pid から名前を推定しない。通知が無いときは何も止めない（以前の exec が残した同名の cgroup を誤って止めないため。SUP-6・#2441）
-- `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、cgroup の停止と helper の終了待ちを自分で行う
-- helper の終了後、出力と結果の EOF を 100ms だけ待つ（コマンドの子孫が書き込み端を持ち続けても待ち続けない）
+- supervisor は reaper の終了を待つ。reaper は helper が終わり、孤児も回収し切ってから終わる。孤児が回収できない（D 状態等）間は reaper が終わらず、結果の行を受け取っていても `T` までは `Exited` にならない（`T` を過ぎれば下の期限切れの経路）
+
+### 期限切れ・cancel
+
+1. 作成通知（`FCHC1`）で今回の作成を確認できた exec 子 cgroup を `cgroup.kill` して削除する（これでコマンドが止まり、worker が結果を返す）。通知が無ければ cgroup は止めない
+2. reaper へ止める合図を送る。合図は結果チャネル（fd 2 の socketpair）へ **supervisor が書く 1 バイト**。専用の pipe やシグナルではなくこれにする理由: 追加の fd を渡すと `pre_exec`（`unsafe`）が要る、pid ではなく自分のチャネルへ書くので pid 再利用の影響が無い、書けなくても次の EOF の経路があるため
+3. reaper は helper を SIGKILL し、すべての子孫を回収してから終わる。supervisor は reaper の終了を最大 1 秒（`REAP_TIMEOUT`）だけ待ち、`probe()` の呼び出し元へは従来どおり `Timeout` / `Cancelled` を返す
+4. 待ちきれなかった reaper（孤児が D 状態で回収できない等）は `helper_reaped = false` で報告し、`Child` を `ExecHealthProbe` に最大 1 個保持する。保持している間は、次の probe の開始時に `try_wait` を行い、終わるまで新しい helper を作らず `Unavailable`（`a previous healthcheck exec helper has not been reaped`）を即座に返す。`cancel()` と drop も待たずに回収を試みる
+5. adapter を作り直す（restart）ときは、drop した adapter が持っていた生きている reaper を、プロセス全体で 1 つの保持先（`GLOBAL_HELD`。`std::process::Child` の drop は終了を待たず、後で終わっても回収する経路が無いため）へ移す。保持先は probe の開始時に `try_wait` で掃除し、件数が上限 `MAX_HELD_HELPERS`（4。固まる原因はストレージの停止など共通で、複数世代で重なれば新しい helper を作っても同じ所で固まるだけのため、小さな定数にした）に達している間は、どの adapter の probe も helper を作らず `Unavailable`（`too many unreaped healthcheck exec helpers`）を返す。保持先の件数は「上限 + 同時に走る adapter 数」を超えない（SUP-4・REPAIR-5）
+
+### supervisor が死んだ場合
+
+`PR_SET_PDEATHSIG` は生成元のスレッドに束縛される（probe は一時スレッドから起動される）ため使わない。代わりに、止める合図の受け口が結果チャネルの socketpair なので、supervisor が死んで **supervisor 側の端が閉じる（EOF）と、reaper は合図と同じく helper を SIGKILL し、孤児を回収して終わる**。supervisor が fork した子が端を持ち続けて EOF が来ない場合に備え、reaper 自身にも期限がある（helper の exec 期限 + `REAPER_HARD_MARGIN` 10 秒。超えたら合図なしで helper を SIGKILL する）。reaper が孤児の回収で終われない場合（D 状態）は、reaper 自身が init へ再親付けされた後も、その孤児が終わるまで生き続ける（init が reaper を回収する）。
+
+### その他
+
+- worker とコマンドの停止は親死亡シグナルに頼らない（コマンドは `PR_SET_PDEATHSIG` を解除でき、fork した子孫には継承されないため）。helper は exec 子 cgroup の排他作成（同名は `EEXIST` で失敗）に成功した直後、worker の fork 前に、名前を作成通知（`FCHC1 <名前>`）として fd 2 へ 1 回だけ書く。supervisor は、この通知で今回の作成を確認できた cgroup だけを `cgroup.kill` して削除する。pid から名前を推定しない（以前の exec が残した同名の cgroup を誤って止めないため。SUP-6・#2441）。helper の pid は reaper の子で supervisor からは分からないため、名前の pid 部分の照合はしない（結果チャネルは helper と reaper だけが書き、コマンドの出力は別のチャネルなので偽造できない）
+- `cancel()` はフラグを立てるだけですぐ戻る。probe のループが 5ms 刻みで見て、cgroup の停止と reaper の終了待ちを自分で行う
+- reaper の終了後、出力と結果の EOF を 100ms だけ待つ（コマンドの子孫が書き込み端を持ち続けても待ち続けない）
 - 結果ストリームは 32 KiB で打ち切る（超過は異常として `Internal`）。診断行は JSON 形（`{"` で始まり 1 KiB 以下）のものを最大 16 本だけ stderr sink へ転送し、残りは捨てて件数を数える
 - 極端に短い timeout（1ms 等）は常に `Timeout` になる。上限・下限は #2439 の判断待ちのため変えない
 
 ### 残余
 
-- 保持先が上限の間と、固まった helper が居る間は、その probe は `Unavailable` のままになる。固まった helper が終わる（または supervisor が終了する）まで解消しない
-- **代償**: 同期 I/O などで固まった helper が居る間は、そのコンテナの healthcheck の probe は `Unavailable` のままになる（保持は 1 個までで、ゾンビは溜まらない。helper が終われば次の probe から進む）。helper を殺して即座に先へ進む方式より可用性は下がるが、再親付けされる子孫を無くすことを優先した（SUP-4・REPAIR-5）
-- 作成通知を受ける前（cgroup の作成より前、または作成の完了から通知の書き込みまでの間）に期限切れ・cancel になった場合、supervisor は止められない（helper へもシグナルを送らない）。helper は自分の exec の期限（`T` より短い）まで動き、その間コマンドが起動し得る。helper が終わるまで次の probe は `Unavailable` で、populated な `exec-*` の子 cgroup が残れば delete 前の掃除（`cgroup.kill` を含む）が回収する。次の exec 開始時の掃除が回収するのは空の cgroup だけである
+- **代償**: 回収できない孤児（同期 I/O で D 状態になった監査 sink の子など）が居る間は reaper が終わらず、そのコンテナの healthcheck の probe は `Unavailable` のままになる（保持は adapter で 1 個・全体で上限つき。ゾンビは溜まらない）。子孫が終われば次の probe から進む。可用性より、再親付けされる子孫を無くすことを優先した（SUP-4・REPAIR-5）
+- 作成通知を受ける前（cgroup の作成より前、または作成の完了から通知の書き込みまでの間）に期限切れ・cancel になると、supervisor は cgroup を止められない。ただし reaper が helper を SIGKILL するので、worker は親死亡シグナルで終わる。コマンドが worker の死亡シグナルを解除していた場合の子孫は、populated な `exec-*` の子 cgroup として残り得て、delete 前の掃除（`cgroup.kill` を含む）が回収する。次の exec 開始時の掃除が回収するのは空の cgroup だけである
 - 作成通知を受けた cgroup の停止に失敗した場合（`cgroup_stop_failed = true`）も、同じく delete 前の掃除が回収する
-- supervisor が異常終了した場合、helper は `PR_SET_PDEATHSIG` を持たない（生成元が一時スレッドで、PDEATHSIG はそのスレッドに束縛されるため）。helper 自身の exec 期限と後始末で終わる
+- reaper 自体が OOM 等で異常終了した場合（`Exited(false)`）、helper は init へ再親付けされる。この経路は reaper の責務の外（reaper はファイル I/O をせず固まらないが、強制終了は防げない）
+- 実コンテナでの通し（本物の helper が実コマンドを走らせる）は実機前提の結合試験 `healthcheck_exec_real` が担う（CI への組み込みは別）
 
 ## 9. ambient capability（SEC-1）
 

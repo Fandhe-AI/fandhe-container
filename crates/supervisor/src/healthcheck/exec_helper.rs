@@ -53,6 +53,35 @@ pub const HEALTH_EXEC_SUBCOMMAND: &str = "healthcheck-exec";
 /// helper の `argv[0]`（固定。`/proc/self/exe` のパス文字列を使わない）。
 pub const HEALTH_EXEC_ARG0: &str = "fandhe-container-supervisor";
 
+/// 自分自身（`/proc/self/exe`）を `subcommand` で起動する `Command`（`argv[0]` は固定・環境は空・cwd は `/`）。
+/// stdio は呼び出し側が設定する。reaper が helper を、supervisor が reaper を起動するときに同じ決め方を使う。
+pub fn self_exe_command(subcommand: &str, args: &[OsString]) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new("/proc/self/exe");
+    command
+        .arg0(HEALTH_EXEC_ARG0)
+        .arg(subcommand)
+        .args(args)
+        .env_clear()
+        .current_dir("/");
+    command
+}
+
+/// `/proc/<pid>/stat` の ppid（4 番目）。`comm` は括弧内に空白や `)` を含み得るため、最後の `)` の後ろから数える。
+pub fn parse_stat_ppid(stat: &str) -> Option<u32> {
+    let after = stat.get(stat.rfind(')')? + 1..)?;
+    // `)` の直後の語が 3 番目（state）、次が ppid。
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// この helper を起動した supervisor の pid。helper の親は reaper で、その親が supervisor（3 段。`exec_reaper`）。
+/// 親の stat を読めない・親が終わって再親付けされた場合は `None`（fail-closed。呼び出し側は `Stale` にする）。
+pub fn calling_supervisor_pid() -> Option<NonZeroU32> {
+    let reaper = std::os::unix::process::parent_id();
+    let stat = std::fs::read_to_string(format!("/proc/{reaper}/stat")).ok()?;
+    NonZeroU32::new(parse_stat_ppid(&stat)?)
+}
+
 /// bin の main が helper へ振り分ける呼び出しか（第 1 引数が `healthcheck-exec`）。`run_main` より前に判定する。
 pub fn is_health_exec_invocation(first: Option<&OsStr>) -> bool {
     first == Some(OsStr::new(HEALTH_EXEC_SUBCOMMAND))
@@ -294,16 +323,7 @@ where
         }
     };
     let mut err = std::io::stderr();
-    let written = err.write_all(&line.encode()).and_then(|()| err.flush());
-    // 結果の行を先に返したうえで、監査 sink が fork した子のうち回収できずに追跡中のもの（D 状態等）が
-    // 残っているあいだは終了しない。終了すると、それらが child subreaper の supervisor へ再親付けされ、
-    // 回収経路が無い。待ちの上限はここでは設けない: supervisor 側が結果を受けた後に helper の終了を有界に待ち、
-    // 終わらなければ `Child` を保持して次の probe を `Unavailable` にする（保持先の上限で新規生成を塞ぐ）。
-    // 刻みは 50ms（子の終了の確認だけで軽い。SUP-4・SUP-6・REPAIR-5・SEC-4）。
-    while fandhe_container_core::audit_log::reap_pending_children() > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    match written {
+    match err.write_all(&line.encode()).and_then(|()| err.flush()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
@@ -323,9 +343,9 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
         Ok(record) => record,
         Err(e) => return failed(e),
     };
-    // 起動した supervisor 自身（この helper の親）が、記録上の所有者であること。restart 後の古いアダプタからの
-    // 呼び出しは、exec へ進むと pidfd の不一致が違反として毎回監査されてしまうため、ここで弾く（SUP-1）。
-    let parent = NonZeroU32::new(std::os::unix::process::parent_id());
+    // 起動した supervisor 自身（reaper の親。helper の親は reaper）が、記録上の所有者であること。restart 後の古い
+    // アダプタからの呼び出しは、exec へ進むと pidfd の不一致が違反として毎回監査されてしまうため、ここで弾く（SUP-1）。
+    let parent = calling_supervisor_pid();
     let status = record.status();
     if status.state() != ContainerState::Running
         || status.pid() != Some(args.expect_pid())
@@ -458,6 +478,13 @@ mod tests {
     }
 
     /// SUP-4（#2441）: 起動の判定は第 1 引数が `healthcheck-exec` のときだけ。
+    #[test]
+    fn sup4_2441_stat_ppid_parses_tricky_comm() {
+        assert_eq!(parse_stat_ppid("12 (a b) c) S 345 6 7"), Some(345));
+        assert_eq!(parse_stat_ppid("12 (x) S"), None);
+        assert_eq!(parse_stat_ppid("garbage"), None);
+    }
+
     #[test]
     fn sup4_2441_invocation_detection() {
         assert!(is_health_exec_invocation(Some(OsStr::new(

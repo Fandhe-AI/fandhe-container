@@ -31,6 +31,8 @@ pub mod exec_helper;
 #[cfg(target_os = "linux")]
 pub mod exec_probe;
 #[cfg(target_os = "linux")]
+pub mod exec_reaper;
+#[cfg(target_os = "linux")]
 pub mod exec_wire;
 mod periodic;
 

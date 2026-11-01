@@ -68,7 +68,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 
 ## 実装の担い手
 
-アクセス型を実装する issue はまだ無い（TASK-74.1 の既存 sub-issue はすべて closed）。#689（TASK-74.1）配下の後続 sub-issue として起票するのが妥当で、#877・#880 は #689 に依存しているので依存順も保たれる。**未起票**（起票後に番号を追記する）。
+アクセス型を担当する issue が無かったため、TASK-74.2.2（#878）で最小限を実装した（`crates/microvm/src/guest_memory.rs`。単一領域・heap backing・コピー API・unsafe なし）。mmap backing と KVM への登録は引き続き #696（TASK-75.1）。複数領域は再評価条件に従う。
 
 ## /dev/kvm を要する試験の分離
 

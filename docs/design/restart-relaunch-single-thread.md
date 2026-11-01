@@ -34,7 +34,7 @@ core の本番 launcher（`ProductionLauncher`、`LaunchMode::SelfBounded`）は
   | `seccomp-notify`・`seccomp-audit-rec` | 既存の `SeccompNotifyHub::quiesce` |
   | `supervisor-stderr` | `StderrSink::quiesce` / `resume`。止めている間の行は上限つき（`QUEUE_CAPACITY`）のバッファへ溜め、再開後に順に書く |
   | `fandhe-terminate`（`LateOrphans`） | 失敗・停止経路だけ。変更なし |
-  | `healthcheck-*` | 本番未結線（担当は #2953）。probe の一時スレッド `healthcheck-probe` は `ExecHealthProbe`（#2441）が使い、setns を伴う exec 自体は別プロセスの exec 専用 helper で実行する（`healthcheck-exec-helper.md`）。結線時に同じ口へ参加者として足す |
+  | `healthcheck-*` | 参加者に足さない（#2953 で結線済み）。周期実行のスレッド `healthcheck-periodic`（と probe の一時スレッド `healthcheck-probe`）は monitor の 1 回の呼び出しの間だけ回り、monitor が戻る前に期限（3 秒）つきで止めて join する。再 launch は monitor が戻った後なので居ない。期限内に止まらず残ったスレッドは `thread_settle` が検出して `RelaunchFailed`（fail-closed）。setns を伴う exec 自体は別プロセスの exec 専用 helper（`healthcheck-exec-helper.md`） |
 
 - 順序: 制御チャネルの停止（外側の `ControlledRelauncher`）→ 捕捉・seccomp の quiesce → stderr の quiesce（最後。上の quiesce の報告が
   stderr へ出るため）→ スレッド数が 1 に落ち着くまでの有界の待ち（`thread_settle`、上限 1 秒）→ `launcher.launch(残り時間)` →
@@ -64,5 +64,5 @@ supervisor 側は初回 start の要約 1 回だけにし、再 launch ごとの
 - `on-failure`・`always` の再起動ストーム抑制（指数バックオフ）は既存の残余のまま。
 - 実機（Linux 6.12 以上）での確認は `crates/supervisor/tests/supervisor_bin_real.rs` のシナリオ C（`--restart on-failure:1`）。
   本記録の作成時点のローカル環境には user manager が無く未実行で、CI の `platform-ci`（ubuntu）で確認する。
-- 再評価: poll 間隔が #491 の実測で問題になったとき、healthcheck の定期実行が本番へ結線されたとき、core が launch の単一スレッド要求を
+- 再評価: poll 間隔が #491 の実測で問題になったとき、healthcheck の定期実行の停止が期限内に終わらず再 launch が止まる事象が実測で出たとき（#2953 で結線済み）、core が launch の単一スレッド要求を
   変更したとき。

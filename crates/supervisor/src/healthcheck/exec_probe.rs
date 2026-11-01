@@ -544,6 +544,47 @@ fn stop_if_owned(
     }
 }
 
+/// 保持先が抱える未回収 helper の上限。到達している間は、どの adapter の probe も helper を作らずに `Unavailable`。
+///
+/// 根拠: 1 件は「同期 I/O で固まった helper」1 プロセス分で、supervisor はコンテナごと（restart の世代ごとに
+/// adapter を作り直す）なので同時に多くは要らない。固まる原因（ストレージの停止）は共通で、複数世代で重なれば
+/// 新しい helper を作っても同じ所で固まるだけなので、小さな定数（4。`FileAuditSink` の `MAX_UNREAPED` と同じ桁）で
+/// 塞ぐ。adapter 自身が保持する 1 件（`unreaped`）は別枠で、保持先の件数は「上限 + 同時に走る adapter 数」を超えない
+/// （上限到達中は誰も新しい helper を作らないため。SUP-4・REPAIR-5）。
+pub const MAX_HELD_HELPERS: usize = 4;
+
+/// drop された adapter から引き継いだ未回収 helper の保持先（プロセス全体で 1 つ。supervisor の寿命）。
+///
+/// `std::process::Child` の drop は終了を待たず、後で終わっても回収する経路が無い。restart で adapter を作り直しても
+/// 回収の責任を失わないよう、drop 時に生きている helper をここへ移し、probe の開始時に `try_wait` で掃除する。
+pub struct HeldHelpers(Mutex<Vec<Child>>);
+
+impl HeldHelpers {
+    const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    /// 終わった helper を回収して外し、まだ残っている件数を返す（待たない）。
+    fn sweep(&self) -> usize {
+        let mut list = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        list.len()
+    }
+
+    /// 生きている helper を引き継ぐ。
+    fn hold(&self, child: Child) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(child);
+    }
+}
+
+static GLOBAL_HELD: HeldHelpers = HeldHelpers::new();
+
 /// healthcheck コマンドを exec 専用 helper で実行する `HealthProbe` の本番アダプタ。
 ///
 /// 1 起動世代につき 1 つ作り、restart で作り直す（pidfd・記録 pid が世代に紐づく）。同時に走る probe は 1 本で、
@@ -563,6 +604,8 @@ pub struct ExecHealthProbe {
     /// `cancel`・drop で `try_wait` し、回収できるまで新しい helper を作らない（未回収 helper の蓄積を防ぐ。
     /// SUP-4・REPAIR-5）。
     unreaped: Mutex<Option<Child>>,
+    /// adapter の drop で手放された未回収 helper の、プロセス全体で 1 つの保持先（通常は [`GLOBAL_HELD`]）。
+    held: &'static HeldHelpers,
 }
 
 impl std::fmt::Debug for ExecHealthProbe {
@@ -618,6 +661,7 @@ impl ExecHealthProbe {
             busy: AtomicBool::new(false),
             resolver_busy: Arc::new(AtomicBool::new(false)),
             unreaped: Mutex::new(None),
+            held: &GLOBAL_HELD,
         })
     }
 
@@ -1160,6 +1204,13 @@ impl ExecHealthProbe {
                 "a previous healthcheck exec helper has not been reaped",
             ));
         }
+        // 手放された helper の保持先が上限なら、どの adapter も新しい helper を作らない。
+        if self.held.sweep() >= MAX_HELD_HELPERS {
+            return Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "too many unreaped healthcheck exec helpers",
+            ));
+        }
         // 排他を取れた試行だけが `cancel` の宛先を登録する。拒否された試行は `current` に触れないので、
         // 実行中の試行への `cancel()` が失われない。区間を抜けても消さない（次の試行が排他の中で置き換える。
         // 終わった試行の旗が立っても無害。SUP-4・REPAIR-5）。
@@ -1200,8 +1251,18 @@ impl HealthProbe for ExecHealthProbe {
 
 impl Drop for ExecHealthProbe {
     fn drop(&mut self) {
-        // 未回収の helper を最後に一度だけ kill して回収を試みる（待たない）。
-        let _ = self.reap_unreaped();
+        // 未回収の helper が生きていれば、プロセス全体の保持先へ移す（`Child` を drop しても回収されないため）。
+        // シグナルは送らない。
+        let child = self
+            .unreaped
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child
+            && matches!(child.try_wait(), Ok(None))
+        {
+            self.held.hold(child);
+        }
     }
 }
 
@@ -1718,6 +1779,45 @@ mod tests {
         }
         assert!(probe.unreaped.lock().unwrap().is_none());
         assert!(!probe.busy.load(Ordering::SeqCst));
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: adapter を drop すると、生きている未回収 helper は保持先へ移り（シグナルは送らない）、
+    /// 保持先が上限の間はどの adapter の probe も `Unavailable`、helper が終わって掃除された後は進む。
+    #[test]
+    fn repair5_2441_dropped_adapter_hands_unreaped_helper_to_the_process_wide_holder() {
+        let held: &'static HeldHelpers = Box::leak(Box::new(HeldHelpers::new()));
+        let mut probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        probe.held = held;
+        let stuck = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        *probe.unreaped.lock().unwrap() = Some(stuck);
+        drop(probe);
+        // 引き継がれ、まだ生きている（シグナルを送っていない）。
+        assert_eq!(held.sweep(), 1);
+        // 上限まで埋める。
+        for _ in 1..MAX_HELD_HELPERS {
+            held.hold(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        }
+        assert_eq!(held.sweep(), MAX_HELD_HELPERS);
+        // 別の adapter でも、上限の間は helper を作らず Unavailable。
+        let mut other = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        other.held = held;
+        let err = other.probe(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(err.message(), "too many unreaped healthcheck exec helpers");
+        assert!(other.last_report().is_none());
+        // helper が終わる（試験が終わらせる）と掃除されて進む。有界に待つ。
+        for child in held.0.lock().unwrap().iter_mut() {
+            child.kill().unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        while held.sweep() > 0 {
+            assert!(Instant::now() < until, "held helpers were never reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = other.probe(Duration::from_secs(1));
+        assert!(
+            !matches!(&after, Err(e) if e.message() == "too many unreaped healthcheck exec helpers")
+        );
     }
 
     /// REPAIR-5（#2441）: 前回の `hc-resolve` が未終了なら新しい取得スレッドを作らず `Unavailable`（in-flight は 1 本）。

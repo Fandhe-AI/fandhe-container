@@ -50,6 +50,11 @@ mod linux {
         crate::scratch_root::scratch_root(SCRATCH_PREFIX, Duration::from_secs(10)).join("state")
     }
 
+    /// 偽 helper を終わらせる解放用ファイル（状態ルートの親の直下。供給側と偽 helper 側で同じ式）。
+    fn release_file(root: &std::path::Path, id: &str) -> PathBuf {
+        root.parent().unwrap_or(root).join(format!("release-{id}"))
+    }
+
     /// 偽 helper 側の照合: root は `<tmp>/fc-hc-exec-probe-<親 pid>-*/state`。
     fn is_expected_root(root: &std::path::Path, parent: u32) -> bool {
         let prefix = format!("{SCRATCH_PREFIX}-{parent}-");
@@ -169,7 +174,25 @@ mod linux {
                     },
                 );
             }
-            "hc-timeout" | "hc-cancel" => std::thread::sleep(Duration::from_secs(30)),
+            "hc-timeout" | "hc-cancel" => {
+                // 終わらない helper の代役: 解放用のファイルが現れるまで動き（上限 30 秒）、現れたら自分で終わる。
+                // supervisor は期限切れ・cancel でもシグナルを送らないので、解放されるまで生きている。解放後に
+                // 起動された helper は、結果行（healthy）を書いてすぐ終わる。
+                let release = release_file(args.root(), args.id().as_str());
+                let until = Instant::now() + Duration::from_secs(30);
+                while !release.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                write_line(
+                    &mut err,
+                    HealthExecLine::Exited {
+                        code: 0,
+                        healthy: true,
+                        audit: na,
+                        exit_audit: na,
+                    },
+                );
+            }
             "hc-big-output" => {
                 let chunk = [b'x'; 1000];
                 for _ in 0..100 {
@@ -373,12 +396,47 @@ mod linux {
         assert_eq!(rep.output, b"8000".to_vec());
         ok("hc-budget");
 
-        let (r, rep, elapsed) = run("hc-timeout", Duration::from_millis(500));
-        assert_eq!(r.unwrap_err().0, ErrorCode::Timeout);
+        // 期限切れ: `Timeout` を返す。helper へはシグナルを送らない（偽 helper は自分では終わらないので、
+        // 回収できずに `helper_reaped = false` で、`Child` が保持される）。作成通知が無いので止める cgroup も無い。
+        let probe = probe_for("hc-timeout");
+        let start = Instant::now();
+        let r = probe.probe(Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
+        let rep = probe.last_report().expect("report");
         assert_eq!(rep.outcome, HealthExecOutcome::Timeout);
-        assert!(rep.helper_reaped, "helper must be reaped after SIGKILL");
+        assert!(!rep.helper_reaped, "the helper must not be signaled");
+        assert!(!rep.cgroup_stop_failed);
+        // 期限 500ms + helper の終了待ち 1s（REAP_TIMEOUT）。
         assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
-        assert!(elapsed < Duration::from_millis(2_000), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(3_000), "{elapsed:?}");
+        // 終わらない helper が居る間、次の probe は helper を作らずに `Unavailable`（報告も増えない）。
+        for _ in 0..3 {
+            let err = probe.probe(secs(10)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Unavailable);
+            assert_eq!(
+                err.message(),
+                "a previous healthcheck exec helper has not been reaped"
+            );
+            assert_eq!(
+                probe.last_report().expect("report").outcome,
+                HealthExecOutcome::Timeout
+            );
+        }
+        // helper が自分で終わる（解放する）と、有界の待ちの後に次の probe が進み、新しい helper の結果を返す。
+        std::fs::write(release_file(&state_root(), "hc-timeout"), b"1").expect("release");
+        let until = Instant::now() + secs(10);
+        let r = loop {
+            match probe.probe(secs(10)) {
+                Err(e) if e.code() == ErrorCode::Unavailable => {
+                    assert!(Instant::now() < until, "the exited helper was never reaped");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(r, Ok(HealthStatus::Healthy));
+        assert!(probe.last_report().expect("report").helper_reaped);
         ok("hc-timeout");
 
         let probe = Arc::new(probe_for("hc-cancel"));
@@ -394,10 +452,13 @@ mod linux {
         probe.cancel();
         let (r, elapsed) = runner.join().expect("join");
         assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
-        assert!(elapsed < secs(2), "{elapsed:?}");
+        // cancel(200ms 後) + helper の終了待ち 1s。
+        assert!(elapsed < secs(3), "{elapsed:?}");
         let rep = probe.last_report().expect("report");
         assert_eq!(rep.outcome, HealthExecOutcome::Cancelled);
-        assert!(rep.helper_reaped);
+        assert!(!rep.helper_reaped, "the helper must not be signaled");
+        // 解放して終わらせる（後始末。保持している `Child` は次の probe か drop が扱う）。
+        std::fs::write(release_file(&state_root(), "hc-cancel"), b"1").expect("release");
         ok("hc-cancel");
 
         let (r, rep, _) = run("hc-big-output", secs(10));

@@ -294,7 +294,16 @@ where
         }
     };
     let mut err = std::io::stderr();
-    match err.write_all(&line.encode()).and_then(|()| err.flush()) {
+    let written = err.write_all(&line.encode()).and_then(|()| err.flush());
+    // 結果の行を先に返したうえで、監査 sink が fork した子のうち回収できずに追跡中のもの（D 状態等）が
+    // 残っているあいだは終了しない。終了すると、それらが child subreaper の supervisor へ再親付けされ、
+    // 回収経路が無い。待ちの上限はここでは設けない: supervisor 側が結果を受けた後に helper の終了を有界に待ち、
+    // 終わらなければ `Child` を保持して次の probe を `Unavailable` にする（保持先の上限で新規生成を塞ぐ）。
+    // 刻みは 50ms（子の終了の確認だけで軽い。SUP-4・SUP-6・REPAIR-5・SEC-4）。
+    while fandhe_container_core::audit_log::reap_pending_children() > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    match written {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }

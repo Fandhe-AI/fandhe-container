@@ -13,7 +13,10 @@ pub use down::{
     DownError, DownFailure, DownReport, DownStepReport, ServiceStopper, StopError, StopOutcome,
     down,
 };
-pub use ps::{PsError, PsReport, PsRow, ServiceStatus, ServiceStatusSource, ps};
+pub use ps::{
+    MAX_PS_NAME_BYTES, MAX_PS_OUTPUT_BYTES, MAX_PS_SERVICES, PsError, PsLimit, PsReport, PsRow,
+    ServiceStatus, ServiceStatusSource, ps,
+};
 
 pub use up::{
     LaunchError, LaunchedService, ServiceLauncher, UpClock, UpError, UpFailure, UpPolicy, UpReport,

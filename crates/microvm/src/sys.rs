@@ -10,7 +10,7 @@
 //! `KVM_ARM_VCPU_INIT` も発行する。TASK-74.4.1 で vCPU fd の `kvm_run` 領域の mmap（`KvmRunMap`）・
 //! `KVM_RUN`・`KVM_SET_USER_MEMORY_REGION`（自己診断用の 1 ページ。`GuestPage`・`RegisteredPage`）を足した。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
-//! （停止の仕組みは #883 / TASK-75。ここでは期限を持たない。REPAIR-5・REPAIR-3）。
+//! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `ThreadId::kick`（`SIGUSR2`）で中断する。REPAIR-5）。
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない
@@ -194,6 +194,62 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
     -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
+    // `signal`（glibc・musl 共通）。`sighandler_t` は関数ポインタ幅の整数として扱い、SIG_DFL は 0。
+    fn signal(signum: i32, handler: usize) -> usize;
+    // `pthread_self` / `pthread_kill`（`pthread_t` は LP64 Linux で unsigned long）。`pthread_kill` は errno を戻り値で返す。
+    fn pthread_self() -> u64;
+    fn pthread_kill(thread: u64, sig: i32) -> i32;
+}
+
+/// vCPU 中断用のシグナル（`SIGUSR2`。x86_64・aarch64 Linux とも 12）。
+const SIG_VCPU_KICK: i32 = 12;
+/// `SIG_DFL`。
+const SIG_DFL: usize = 0;
+
+extern "C" fn kick_handler(_sig: i32) {}
+
+/// 呼び出しスレッドの識別子（`pthread_kill` の宛先）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThreadId(u64);
+
+impl ThreadId {
+    /// 呼び出しスレッド自身の識別子。
+    pub(crate) fn current() -> ThreadId {
+        // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
+        ThreadId(unsafe { pthread_self() })
+    }
+
+    /// このスレッドへ vCPU 中断シグナルを送る。スレッドが生存している間だけ呼ぶこと。
+    pub(crate) fn kick(self) -> Result<(), SysError> {
+        // SAFETY: `self.0` は `pthread_self` が返した値で、呼び出し側が対象スレッドの終了前（`thread::scope` 内）に
+        // だけ呼ぶ。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。戻り値は errno そのもの。
+        let r = unsafe { pthread_kill(self.0, SIG_VCPU_KICK) };
+        if r == 0 { Ok(()) } else { Err(SysError::Os(r)) }
+    }
+}
+
+/// vCPU 中断シグナルの何もしない handler を入れる（プロセス内で 1 回。以降は冪等）。
+///
+/// handler を入れないと既定動作でプロセスが終了するため、`KVM_RUN` を中断する前に必ず呼ぶ。
+/// 既に別の handler（本 crate のもの以外）が入っていれば元に戻して `Err`（他の用途を壊さない）。
+pub(crate) fn install_kick_handler() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let ours = kick_handler as extern "C" fn(i32) as usize;
+    // SAFETY: handler は引数 1 つの `extern "C"` 関数で、本体は何もしない（async-signal-safe）。`signal` は
+    // 固定のシグナル番号と関数アドレスだけを受け取る。KVM_RUN は中断時に EINTR を返し再実行されないため
+    // `signal` の SA_RESTART 付きでも中断できる。
+    let old = unsafe { signal(SIG_VCPU_KICK, ours) };
+    if old == usize::MAX {
+        return Err(last_error());
+    }
+    if old != SIG_DFL && old != ours {
+        // SAFETY: 直前に取得した元の handler をそのまま戻す。
+        let _ = unsafe { signal(SIG_VCPU_KICK, old) };
+        return Err(SysError::Os(16));
+    }
+    Ok(())
 }
 
 fn last_error() -> SysError {
@@ -286,7 +342,8 @@ pub(crate) struct KvmRunMap {
 // 発行されないため、`&self` からの読み取りと重ならない。ポインタはマッピングの生存中（drop まで）有効で、
 // スレッドに固有ではない。
 unsafe impl Send for KvmRunMap {}
-// SAFETY: 上と同じ。共有参照からは volatile の読み取りだけを行い、書き込み口を持たない。
+// SAFETY: 上と同じ。共有参照からは volatile の読み取りと `immediate_exit` の 1 バイト書き込みだけを行い、
+// 後者は別スレッドから同時に書かれてもカーネルが 1 バイトの読み取りとして扱う ABI である。
 unsafe impl Sync for KvmRunMap {}
 
 impl KvmRunMap {
@@ -327,6 +384,25 @@ impl KvmRunMap {
             // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
             // マッピングは `self` の生存中有効。カーネルが並行して書き換えうるため参照を作らず volatile で 1 バイト読む。
             *b = unsafe { self.ptr.as_ptr().add(off + i).read_volatile() };
+        }
+        Ok(())
+    }
+
+    /// `kvm_run.immediate_exit`（オフセット 1 の u8）を立てる / 下ろす。立てると次の（または実行中の）
+    /// `KVM_RUN` がゲストを実行せず EINTR で戻る。別スレッドの期限監視が呼ぶ。
+    pub(crate) fn set_immediate_exit(&self, on: bool) -> Result<(), ()> {
+        const IMMEDIATE_EXIT_OFFSET: usize = 1;
+        if self.len <= IMMEDIATE_EXIT_OFFSET {
+            return Err(());
+        }
+        // SAFETY: `IMMEDIATE_EXIT_OFFSET < len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
+        // マッピングは `self` の生存中有効。このバイトは KVM がユーザー空間の書き込みを前提に読む ABI で、
+        // 参照を作らず volatile で 1 バイトだけ書く。
+        unsafe {
+            self.ptr
+                .as_ptr()
+                .add(IMMEDIATE_EXIT_OFFSET)
+                .write_volatile(u8::from(on));
         }
         Ok(())
     }
@@ -547,6 +623,14 @@ mod tests {
 
     /// MVM-1: `KVM_RUN` 系の ioctl 番号と構造体サイズの具体値（`linux/kvm.h`）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    /// REPAIR-5: handler 導入後は自スレッドへ中断シグナルを送ってもプロセスが終了しない（冪等な再導入も可）。
+    #[test]
+    fn kick_self_after_handler_install_survives() {
+        install_kick_handler().unwrap();
+        install_kick_handler().unwrap();
+        ThreadId::current().kick().unwrap();
+    }
+
     #[test]
     fn run_constants_match_kernel_abi() {
         assert_eq!(consts::KVM_GET_VCPU_MMAP_SIZE, 0xAE04);

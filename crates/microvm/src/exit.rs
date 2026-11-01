@@ -98,7 +98,7 @@ fn read_u8(a: &impl RunArea, off: usize) -> Result<u8, MicrovmError> {
     let mut b = [0u8; 1];
     a.copy_out(off, &mut b)
         .map_err(|()| malformed("out of range"))?;
-    Ok(b[0])
+    Ok(u8::from_ne_bytes(b))
 }
 
 fn read_u16(a: &impl RunArea, off: usize) -> Result<u16, MicrovmError> {

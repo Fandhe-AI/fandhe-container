@@ -59,6 +59,15 @@ use crate::traits::ErrorCode;
 /// プロセス内の順番待ち（`TurnQueue`）と `flock` のポーリングを合わせた 1 本の期限として掛かる
 /// （2 段それぞれに 5 秒ずつ許して最大 10 秒待つことはしない）。
 const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// `@audit.log` の長さの上限(16 MiB。SEC-4・CORE-7・REPAIR-5・#2953)。
+///
+/// 追記の直前(排他 `flock` の下)に現在の長さを見て、`長さ + 追記する行 > 上限` なら書かずに
+/// [`AuditWriteErrorKind::SizeLimit`] を返す(呼び出し側は代替経路へ回す。拒否の判定は覆らない)。
+/// 値は本実装の判断で、spec の確定値ではない。監査 1 行は最大 [`AUDIT_LINE_MAX_BYTES`] のため約 16 Ki 件以上の
+/// 余裕があり、通常の運用では到達しない。entrypoint 層の理由はコンテナの中身で引き起こせる(定期 exec の
+/// healthcheck を配線すると同じ理由の行が周期的に増える)ため、tmpfs の `/run` が単調に増える経路を塞ぐ防御として置く。
+/// ローテーションは未実装(REPAIR-3)。上限に達したログは運用者が退避・削除するまで主経路で書けない。
+pub const AUDIT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// ロック取得のリトライ間隔。
 const AUDIT_LOCK_RETRY: Duration = Duration::from_millis(5);
 
@@ -205,6 +214,8 @@ pub enum AuditWriteErrorKind {
     /// 未満のカーネル等）。子は I/O せずに終わり、代替経路へ進む（fail-closed。`FileAuditSink`。fork 不能の
     /// `IsolationUnavailable` と運用で見分けるための別種別）。
     IsolationFdsNotClosed,
+    /// ログの長さが [`AUDIT_LOG_MAX_BYTES`] を超えるため追記しなかった(代替経路へ進む。SEC-4・#2953)。
+    SizeLimit,
 }
 
 impl AuditWriteErrorKind {
@@ -231,6 +242,7 @@ impl AuditWriteErrorKind {
             Self::IsolationTimeout => "isolation_timeout",
             Self::IsolationUnavailable => "isolation_unavailable",
             Self::IsolationFdsNotClosed => "isolation_fds_not_closed",
+            Self::SizeLimit => "size_limit_exceeded",
         }
     }
 }
@@ -316,6 +328,7 @@ impl AuditWriteError {
             AuditWriteErrorKind::IsolationFdsNotClosed => {
                 "isolated audit log writer could not close inherited file descriptors"
             }
+            AuditWriteErrorKind::SizeLimit => "audit log reached its size limit",
         }
     }
 }
@@ -576,6 +589,24 @@ impl AuditFileWriter {
     }
 
     fn write_locked(&mut self, line: &[u8]) -> Result<(), AuditWriteError> {
+        self.write_locked_with_limit(line, AUDIT_LOG_MAX_BYTES)
+    }
+
+    /// [`Self::write_locked`] の本体(上限を差し替えられる。単体試験が 16 MiB を書かずに境界を確かめるため)。
+    fn write_locked_with_limit(&mut self, line: &[u8], limit: u64) -> Result<(), AuditWriteError> {
+        // 長さはロック下で読む(他の書き手の追記と競合しない)。読めなければ書かない(fail-closed)。
+        let len = self
+            .file
+            .metadata()
+            .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Write))?
+            .len();
+        // 先頭の LF を足す場合も含め、最大 1 行 + 1 バイトで判定する。
+        let add = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if len.saturating_add(add) > limit {
+            return Err(AuditWriteError::new(AuditWriteErrorKind::SizeLimit));
+        }
         let mut buf = Vec::with_capacity(line.len() + 1);
         // 行頭 LF の要否は、ロック下で確認した実際の末尾バイトだけで決める（自身の直前の失敗・他 writer・
         // 前回プロセスの部分行を区別せず扱う。sync 失敗後など末尾が既に LF なら空行を作らない）。
@@ -1215,6 +1246,37 @@ mod tests {
         assert_eq!(names, vec!["audit.log".to_string()]);
     }
 
+    /// SEC-4・CORE-7・REPAIR-5・#2953: 長さ + 追記する行(先頭 LF 分の 1 バイトを含む)が上限ちょうどなら書け、
+    /// 1 バイト超えると書かずに `SizeLimit` を返す(ログの長さは変わらない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2953_size_limit_boundary_is_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-size-limit", "d");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("audit.log");
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        let r = rec(
+            9,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        let line = encode_json_line(&r).unwrap();
+        let line_len = line.len() as u64;
+        // 空のログ + 行 + 1 バイトちょうどが上限なら書ける。
+        w.write_locked_with_limit(&line, line_len + 1).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        // 2 行目は (line_len) + (line_len + 1) = 2 * line_len + 1 が必要。上限が 1 足りないと拒否される。
+        let e = w.write_locked_with_limit(&line, 2 * line_len).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::SizeLimit);
+        assert_eq!(e.kind().as_str(), "size_limit_exceeded");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.write_locked_with_limit(&line, 2 * line_len + 1).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * line_len);
+    }
+
     use super::*;
     use crate::audit_log::{AuditPath, AuditPid, AuditSyscallArch, AuditSyscallNr, AuditTimestamp};
     use std::time::Duration;
@@ -1660,8 +1722,11 @@ mod tests {
     }
 
     fn failing_writer() -> AuditFileWriter {
-        // 読み取り専用で開いた File への write は必ず失敗する。
-        AuditFileWriter::from_file_unchecked(File::open(std::env::current_exe().unwrap()).unwrap())
+        // 読み取り専用で開いた File への write は必ず失敗する。サイズ上限(`AUDIT_LOG_MAX_BYTES`)に達しない
+        // 小さなファイルを使う(巨大な試験バイナリだと `SizeLimit` が先に出て、`Write` の経路を試せない。#2953)。
+        AuditFileWriter::from_file_unchecked(
+            File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+        )
     }
 
     fn sample() -> AuditRecord {

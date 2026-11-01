@@ -5,9 +5,10 @@
 //! `ComposeToml` ではなく `BTreeMap<String, Service>` を受ける。循環と未定義の依存先は
 //! 計画を返さずエラーにする（起動前に止める。fail-closed）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: `started` の起動確認（#590）、`healthy` の
-//! state.json ポーリング（#591）、healthy 未達のタイムアウト（#592）、`completed` の待機。
 //! 本モジュールは各依存先の条件を [`DependencyWait`] として計画に残すだけで、待たない。
+//! `started` の待機は `wait` サブモジュール（#590）。
+//! 未実装（実装済みを装わない。REPAIR-3）: `healthy` の state.json ポーリング（#591）、
+//! healthy 未達のタイムアウト（#592。`wait` の `WaitTimeout` を再利用する）、`completed` の待機。
 //!
 //! 決定性: `BTreeMap` のキー順で DFS を始め、依存先もキー順にたどる。結果は「依存先が先、
 //! 互いに独立なものは名前順の DFS 後行順」で、同じ入力なら常に同じ出力になる。
@@ -20,6 +21,8 @@ use std::collections::btree_map;
 use std::fmt;
 
 use crate::schema::{DependsOnCondition, Service};
+
+pub mod wait;
 
 /// 依存先ひとつ分の待ち条件（`DependsOnCondition` を依存先名と組にしたもの）。
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 //! `--profile` 引数・環境変数解析の結合試験（STACK-10・TASK-187.1・#631・REPAIR-12）。
 //!
 //! 公開 API だけで、引数による環境変数の上書き・返却集合の照合・不正入力の構造化エラー
-//! （code / message / exit_code）を具体値で確認する。範囲外: サービスの判定（#632）・CLI 結線（#3639）。
+//! （code / message / exit_code）を具体値で確認する。サービスの判定（#632）は末尾の試験。範囲外: CLI 結線（#3639）・無効参照の拒否（#633）。
 
 use std::ffi::OsStr;
 
@@ -94,4 +94,62 @@ fn stack_10_non_utf8_is_structured_error() {
     );
     assert_eq!(err.code(), "PROFILE_NOT_UTF8");
     assert_eq!(err.message(), "profile value is not valid UTF-8");
+}
+mod enabled_services {
+    use std::ffi::OsStr;
+
+    use fandhe_container_stack::profile_filter::{
+        ServiceSelectError, resolve_active_profiles, select_enabled_services,
+    };
+    use fandhe_container_stack::schema::ComposeToml;
+
+    const TOML: &str = r#"
+[services.web]
+image = "web:1"
+
+[services.debug]
+image = "dbg:1"
+profiles = ["dbg"]
+
+[services.trace]
+image = "trace:1"
+profiles = ["dbg"]
+
+[services.dev]
+image = "dev:1"
+profiles = ["dev"]
+"#;
+
+    fn project() -> ComposeToml {
+        toml::from_str(TOML).unwrap()
+    }
+
+    fn names(flags: &[&str], targets: &[&str]) -> Result<Vec<String>, ServiceSelectError> {
+        let p = project();
+        let active = resolve_active_profiles(flags.iter().map(OsStr::new), None).unwrap();
+        let e = select_enabled_services(&p.services, &active, targets.iter().copied())?;
+        Ok(e.select(&p.services).into_keys().collect())
+    }
+
+    #[test]
+    fn stack_10_no_flags_no_targets_only_profileless() {
+        assert_eq!(names(&[], &[]).unwrap(), ["web"]);
+    }
+
+    #[test]
+    fn stack_10_profile_flag_enables_matching() {
+        assert_eq!(names(&["dev"], &[]).unwrap(), ["dev", "web"]);
+    }
+
+    #[test]
+    fn stack_10_target_profiles_join_active_set() {
+        assert_eq!(names(&[], &["debug"]).unwrap(), ["debug", "trace", "web"]);
+    }
+
+    #[test]
+    fn stack_10_unknown_target_is_structured_error() {
+        let err = names(&[], &["nope"]).unwrap_err();
+        assert_eq!(err.code(), "UNKNOWN_SERVICE");
+        assert_eq!(err.exit_code().get(), 2);
+    }
 }

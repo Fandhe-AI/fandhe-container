@@ -289,7 +289,10 @@ pub fn resolve_socket_dir(override_dir: Option<OsString>) -> Result<PathBuf, Cri
             if !ok {
                 return Err(invalid("socket dir override must be a clean absolute path"));
             }
-            Ok(p)
+            // 要素から組み直して末尾・重複した区切り文字を取り除く。`link/` のような末尾の区切り文字があると
+            // `lstat` は最終要素の symlink を辿り、`check_socket_dir` の symlink 検査をすり抜けるため
+            // （PLUG-12。core の `StateRoot::from_override` と同じ対処）。
+            Ok(p.components().collect())
         }
         None => {
             let root = fandhe_container_core::state_store::StateRoot::resolve(None)
@@ -409,6 +412,8 @@ mod unix_impl {
     const LOCK_RETRY: Duration = Duration::from_millis(20);
     /// 計測ログの回転サイズ。
     const OPS_LOG_MAX_BYTES: u64 = 1024 * 1024;
+    /// 計測ログのロックを待つ上限（REPAIR-5）。
+    const OPS_LOG_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
     /// 計測ログのファイル名。
     const OPS_LOG_NAME: &str = "ops.log";
 
@@ -520,6 +525,8 @@ mod unix_impl {
             if let Some(dir) = self.path.parent() {
                 check_socket_dir(dir).map_err(|_| std::io::Error::other("unsafe ops log dir"))?;
             }
+            // 回転判定から追記までをプロセス間で直列化する（共有ログの上書きによる記録の欠落を防ぐ。REPAIR-4）。
+            let _guard = self.lock()?;
             if let Ok(m) = fs::symlink_metadata(&self.path) {
                 if !m.file_type().is_file() || m.uid() != crate::sys::effective_uid() {
                     return Err(std::io::Error::other("unsafe ops log"));
@@ -536,6 +543,35 @@ mod unix_impl {
                 .mode(0o600)
                 .open(&self.path)?;
             f.write_all(line.as_bytes())
+        }
+
+        /// `ops.log.lock` への `flock`（期限つきの `try_lock` 再試行。REPAIR-5）。取れなければ記録を諦める。
+        fn lock(&self) -> std::io::Result<File> {
+            let mut name = self.path.clone().into_os_string();
+            name.push(".lock");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(PathBuf::from(name))?;
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.uid() != crate::sys::effective_uid() {
+                return Err(std::io::Error::other("unsafe ops log lock"));
+            }
+            let deadline = Instant::now() + OPS_LOG_LOCK_TIMEOUT;
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(file),
+                    Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::Error(e)) => return Err(e),
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::other("ops log lock timed out"));
+                }
+                thread::sleep(LOCK_RETRY);
+            }
         }
     }
 
@@ -986,6 +1022,18 @@ mod tests {
     }
 
     /// CRI-5・#872: 置き場所の解決（上書きの検証と既定の兄弟配置）。
+    #[test]
+    fn plug12_872_socket_dir_trailing_separator_is_normalized() {
+        assert_eq!(
+            resolve_socket_dir(Some("/tmp/link/".into())).unwrap(),
+            PathBuf::from("/tmp/link")
+        );
+        assert_eq!(
+            resolve_socket_dir(Some("/tmp//link//".into())).unwrap(),
+            PathBuf::from("/tmp/link")
+        );
+    }
+
     #[test]
     fn cri5_872_socket_dir_resolution() {
         assert_eq!(

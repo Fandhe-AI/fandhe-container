@@ -6,10 +6,13 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+/// 子の実行の期限（REPAIR-5）。
+#[allow(dead_code)]
+const LIMIT: Duration = Duration::from_secs(30);
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 
-#[path = "support/bounded.rs"]
-mod bounded;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 
@@ -21,7 +24,12 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let guard = test_root::test_root("fch", "h");
+        // sun_path（macOS は 103 バイト）の制約のため、`temp_dir()`（macOS では長い /var/folders/...）ではなく
+        // 短い /tmp 直下に作る（socket 名 64 桁 hex を足しても収まる）。
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let guard =
+            test_root::test_root_at(PathBuf::from(format!("/tmp/fch{}-{n}", std::process::id())));
         let root = guard.to_path_buf();
         Self { guard, root }
     }
@@ -51,7 +59,8 @@ fn run(sc: &Scratch, id: &str, action: &str) -> Output {
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
     .current_dir(&sc.root)
     .stdin(Stdio::null());
-    bounded::output_within(cmd, Duration::from_secs(30))
+    reap::output_within(&mut cmd, Duration::from_secs(30))
+        .expect("shim child must exit within the limit")
 }
 
 fn start_ok(sc: &Scratch, id: &str) -> String {
@@ -121,4 +130,67 @@ fn plug12_872_symlinked_socket_dir_gets_no_ops_log() {
     assert!(!run(&sc, "sl", "start").status.success());
     assert!(!run(&sc, "sl", "delete").status.success());
     assert!(!target.join("ops.log").exists());
+}
+
+/// PLUG-12・#872: 上書き値が symlink への末尾スラッシュ付きでも拒否し、参照先へ socket・ログを作らない。
+#[test]
+fn plug12_872_trailing_slash_symlink_override_is_rejected() {
+    use std::os::unix::fs::DirBuilderExt;
+    let sc = Scratch::new();
+    let target = sc.root.join("real");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&target)
+        .unwrap();
+    let link = sc.root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut dir = link.into_os_string();
+    dir.push("/");
+    for action in ["start", "delete"] {
+        let mut cmd = Command::new(BIN);
+        cmd.args([
+            "-namespace",
+            "default",
+            "-address",
+            "/run/containerd/containerd.sock",
+            "-id",
+            "tl",
+        ])
+        .args(if action == "delete" {
+            vec!["-bundle", "/tmp/b"]
+        } else {
+            vec![]
+        })
+        .arg(action)
+        .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", &dir)
+        .current_dir(&sc.root)
+        .stdin(Stdio::null());
+        let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit");
+        assert!(!out.status.success(), "{action}: {out:?}");
+    }
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
+
+/// REPAIR-4・#872: 並行する start / delete が共有の ops.log を壊さず、全操作の行が残る。
+#[test]
+fn repair4_872_concurrent_ops_log_keeps_every_line() {
+    let sc = Scratch::new();
+    let scr = &sc;
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4)
+            .map(|i| {
+                s.spawn(move || {
+                    let id = format!("log{i}");
+                    start_ok(scr, &id);
+                    assert!(run(scr, &id, "delete").status.success());
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+    });
+    let log = std::fs::read_to_string(sc.sock_dir().join("ops.log")).unwrap();
+    assert_eq!(log.lines().count(), 8, "{log}");
+    assert!(log.lines().all(|l| l.starts_with('{') && l.ends_with('}')));
 }

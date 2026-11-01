@@ -18,11 +18,14 @@ use fandhe_container_cri::shim_v2::{
 };
 use prost::Message;
 
+/// 子の実行の期限（REPAIR-5）。
+#[allow(dead_code)]
+const LIMIT: Duration = Duration::from_secs(30);
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 const UNIMPL: i32 = 12;
 
-#[path = "support/bounded.rs"]
-mod bounded;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 
@@ -34,7 +37,12 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let guard = test_root::test_root("fcs", "b");
+        // sun_path（macOS は 103 バイト）の制約のため、`temp_dir()`（macOS では長い /var/folders/...）ではなく
+        // 短い /tmp 直下に作る（socket 名 64 桁 hex を足しても収まる）。
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let guard =
+            test_root::test_root_at(PathBuf::from(format!("/tmp/fcs{}-{n}", std::process::id())));
         let root = guard.to_path_buf();
         Self { guard, root }
     }
@@ -61,7 +69,8 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> Output {
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
     .current_dir(&sc.root)
     .stdin(Stdio::null());
-    bounded::output_within(cmd, Duration::from_secs(30))
+    reap::output_within(&mut cmd, Duration::from_secs(30))
+        .expect("shim child must exit within the limit")
 }
 
 fn start_ok(sc: &Scratch, id: &str) -> String {
@@ -232,7 +241,7 @@ fn cri5_872_invalid_arguments_fail_closed() {
     let mut cmd = Command::new(BIN);
     cmd.args(["-namespace", "default", "-address", "/a.sock", "start"])
         .current_dir(&sc.root);
-    let out = bounded::output_within(cmd, bounded::LIMIT);
+    let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit within the limit");
     assert_failed(&out, "INVALID_ARGUMENT");
     let out = run(&sc, "i", "start", &["-bogus"]);
     assert_failed(&out, "INVALID_ARGUMENT");
@@ -247,6 +256,6 @@ fn cri5_872_serve_rejects_non_socket_stdin() {
         .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
         .current_dir(&sc.root)
         .stdin(Stdio::null());
-    let out = bounded::output_within(cmd, bounded::LIMIT);
+    let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit within the limit");
     assert_failed(&out, "FAILED_PRECONDITION");
 }

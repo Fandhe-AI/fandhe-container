@@ -9,6 +9,7 @@
 //! VM fd に対する `KVM_CREATE_VCPU`（TASK-74.1.2）と、aarch64 のみ `KVM_ARM_PREFERRED_TARGET` /
 //! `KVM_ARM_VCPU_INIT` も発行する。TASK-74.4.1 で vCPU fd の `kvm_run` 領域の mmap（`KvmRunMap`）・
 //! `KVM_RUN`・`KVM_SET_USER_MEMORY_REGION`（自己診断用の 1 ページ。`GuestPage`・`RegisteredPage`）を足した。
+//! TASK-74.4.2 で `kvm_run` 領域への応答の書き戻し（`KvmRunMap::write_from`。`device::VcpuFd::handle_exit` が呼ぶ）を足した。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
 //! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `ThreadId::kick`（`SIGUSR2`）で中断する。REPAIR-5）。
 //!
@@ -34,7 +35,7 @@ use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::ptr::NonNull;
 
-use crate::exit::RunArea;
+use crate::exit::{RunArea, RunAreaMut};
 
 /// ioctl 失敗の分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +493,23 @@ impl KvmRunMap {
         Ok(())
     }
 
+    /// `buf` を `off..off+buf.len()` へ volatile でコピーする（IN・MMIO read の応答の書き戻し。TASK-74.4.2）。
+    /// 範囲外・桁あふれは `Err`。`&mut self` を要求するのは、`KVM_RUN` が `&mut VcpuFd` 経由でしか発行されず、
+    /// 書き戻しとカーネルの `kvm_run` への書き込みが重ならないことを型で保つため。
+    pub(crate) fn write_from(&mut self, off: usize, buf: &[u8]) -> Result<(), ()> {
+        let end = off.checked_add(buf.len()).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        for (i, b) in buf.iter().enumerate() {
+            // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
+            // マッピングは `self` の生存中有効で、PROT_WRITE で mmap 済み。`&mut self` のため `KVM_RUN` の実行中
+            // （カーネルが領域を書く間）には呼ばれず、参照を作らず volatile で 1 バイトだけ書く。
+            unsafe { self.ptr.as_ptr().add(off + i).write_volatile(*b) };
+        }
+        Ok(())
+    }
+
     /// `kvm_run.immediate_exit`（オフセット 1 の u8）を立てる / 下ろす。立てると次の（または実行中の）
     /// `KVM_RUN` がゲストを実行せず EINTR で戻る。別スレッドの期限監視が呼ぶ。
     pub(crate) fn set_immediate_exit(&self, on: bool) -> Result<(), ()> {
@@ -518,6 +536,12 @@ impl RunArea for KvmRunMap {
     }
     fn copy_out(&self, off: usize, buf: &mut [u8]) -> Result<(), ()> {
         self.read_into(off, buf)
+    }
+}
+
+impl RunAreaMut for KvmRunMap {
+    fn copy_in(&mut self, off: usize, buf: &[u8]) -> Result<(), ()> {
+        self.write_from(off, buf)
     }
 }
 

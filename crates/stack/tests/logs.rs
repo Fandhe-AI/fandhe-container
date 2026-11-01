@@ -192,3 +192,60 @@ fn stack_8_logs_swallowed_write_failure_is_output_error() {
     assert!(matches!(e, LogsError::Output));
     assert_eq!((e.code(), e.exit_code().get()), ("INTERNAL", 1));
 }
+
+/// 最初の書き込みと flush が `Interrupted` で失敗し、その後は成功する出力先。
+struct InterruptOnce {
+    write_interrupted: bool,
+    flush_interrupted: bool,
+    buf: Vec<u8>,
+}
+impl Write for InterruptOnce {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.write_interrupted {
+            self.write_interrupted = true;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.flush_interrupted {
+            self.flush_interrupted = true;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        Ok(())
+    }
+}
+
+/// STACK-8: Interrupted は再試行で成功すれば出力失敗にしない。
+#[test]
+fn stack_8_logs_interrupted_write_is_retried() {
+    let mut w = InterruptOnce {
+        write_interrupted: false,
+        flush_interrupted: false,
+        buf: Vec::new(),
+    };
+    let r = logs(&services(), "db", &mut fake(), &mut w).unwrap();
+    assert_eq!(r.bytes_written(), 8);
+    assert_eq!(w.buf, b"db line\n");
+}
+
+/// 非空バッファに `Ok(0)` を返す出力先。
+struct ZeroWriter;
+impl Write for ZeroWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// STACK-8: `Ok(0)`（WriteZero）は Source ではなく Output。握りつぶすソースでも成功にしない。
+#[test]
+fn stack_8_logs_write_zero_is_output_error() {
+    let e = logs(&services(), "web", &mut fake(), &mut ZeroWriter).unwrap_err();
+    assert!(matches!(e, LogsError::Output));
+    let e = logs(&services(), "web", &mut Swallow, &mut ZeroWriter).unwrap_err();
+    assert!(matches!(e, LogsError::Output));
+}

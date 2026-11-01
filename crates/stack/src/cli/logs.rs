@@ -210,10 +210,17 @@ struct CountingWriter<'a, W: Write> {
 impl<W: Write> Write for CountingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.inner.write(buf) {
+            Ok(0) if !buf.is_empty() => {
+                // write_all は WriteZero を返す。出力側の失敗として記録する。
+                self.failed = true;
+                Ok(0)
+            }
             Ok(n) => {
                 self.written = self.written.saturating_add(n as u64);
                 Ok(n)
             }
+            // Interrupted は write_all が再試行するため永続失敗にしない。
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
             Err(e) => {
                 self.failed = true;
                 Err(e)
@@ -222,7 +229,16 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush().inspect_err(|_| self.failed = true)
+        loop {
+            match self.inner.flush() {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.failed = true;
+                    return Err(e);
+                }
+                Ok(()) => return Ok(()),
+            }
+        }
     }
 }
 

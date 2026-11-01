@@ -315,7 +315,7 @@ mod pending {
 /// 主経路のファイル I/O は fork した使い捨ての子で行い、D 状態などで回収できなかった子はこのプロセスが追跡して後続の
 /// 記録呼び出しで回収する。短命なプロセス（healthcheck の exec 専用 helper）が、追跡中の子を残したまま終了して
 /// 親の subreaper へ再親付けしないよう、終了前に 0 になるまで呼ぶために公開する。`unsafe` は使わない。
-/// 追跡の `Mutex` が poison していれば上限到達扱いの件数（[`MAX_UNREAPED`]）を返し続ける（fail-closed）。
+/// 追跡の `Mutex` が poison していれば上限到達扱いの件数（`MAX_UNREAPED`）を返し続ける（fail-closed）。
 /// 非対応 OS は子を作らないため常に 0。
 pub fn reap_pending_children() -> usize {
     #[cfg(any(target_os = "linux", target_os = "macos"))]

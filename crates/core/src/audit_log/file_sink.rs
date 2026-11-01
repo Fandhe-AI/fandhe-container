@@ -310,24 +310,6 @@ mod pending {
     }
 }
 
-/// 追跡中の（回収できていない）主経路・通知の子を回収し、まだ残っている件数を返す（SUP-4・REPAIR-5・SEC-4）。
-///
-/// 主経路のファイル I/O は fork した使い捨ての子で行い、D 状態などで回収できなかった子はこのプロセスが追跡して後続の
-/// 記録呼び出しで回収する。短命なプロセス（healthcheck の exec 専用 helper）が、追跡中の子を残したまま終了して
-/// 親の subreaper へ再親付けしないよう、終了前に 0 になるまで呼ぶために公開する。`unsafe` は使わない。
-/// 追跡の `Mutex` が poison していれば上限到達扱いの件数（`MAX_UNREAPED`）を返し続ける（fail-closed）。
-/// 非対応 OS は子を作らないため常に 0。
-pub fn reap_pending_children() -> usize {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        pending::reap_and_count()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        0
-    }
-}
-
 /// fork した子を指す OS 固有の保持物（Linux は fork 直後に開いた pidfd。開けなければ `None`。macOS は pidfd が
 /// 無いため空）。回収後に pid が再利用されても元の子を指し続ける用途で、`run_isolated_until` と [`pending`] が持つ。
 #[cfg(target_os = "linux")]

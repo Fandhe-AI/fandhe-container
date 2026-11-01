@@ -123,7 +123,7 @@ pub use coverage::{
     AuditCoveragePolicy, CoverageLayer, DegradeReason, KernelAuditLayerStatus, KernelAuditProbe,
     assess,
 };
-pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
+pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT, reap_pending_children};
 pub use file_writer::{
     AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
     AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,

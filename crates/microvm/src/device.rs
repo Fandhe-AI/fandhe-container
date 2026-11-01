@@ -4,7 +4,8 @@
 //! [`KvmDevice`] が `/dev/kvm` を `O_RDWR | O_CLOEXEC` で開き、API 版数 12 を確認してから
 //! [`KvmDevice::create_vm`] で [`VmFd`] を返し、[`VmFd::create_vcpu`] で [`VcpuFd`] を返す（TASK-74.1.2）。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! レジスタ設定・virtio・実行ループ（`KVM_RUN`）は未実装で、後続の TASK-74・TASK-75 が
+//! レジスタ設定・実行ループ（`KVM_RUN`）は未実装で（virtio-mmio のトランスポートは `crate::virtio_mmio` にあり、
+//! MMIO exit との接続は TASK-74.4.2 で足す）、後続の TASK-74・TASK-75 が
 //! [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!

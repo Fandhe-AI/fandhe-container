@@ -8,6 +8,7 @@
 //! `logs` は `cli::logs`（STACK-8・TASK-155.5・#622。本番アダプタと CLI 結線は未実装）。
 //! `down` の依存逆順停止は `cli::down`（STACK-8・TASK-155.3・#620。本番アダプタと CLI 結線は未実装）。
 //! `ps` の状態一覧は `cli::ps`（STACK-8・TASK-155.4・#621。本番アダプタと CLI 結線は未実装）。
+//! `profiles` の `--profile` 引数・環境変数の解析は `profile_filter`（STACK-10・TASK-187.1・#631。サービスの判定は #632、無効サービス参照の拒否は #633、CLI 結線は #3639）。
 //! parse / serialize の入口はまだ無い（STACK-1・CLI-4。未実装の明示は REPAIR-3）。
 //! 本体は G11（TASK-149、TASK-150・187〜188）で実装する。crate 名は crate-naming.md で確定済み。
 //! `fandhe-container-compose-convert` から一方向に依存される（決定 5）。PLUG-1 区分は
@@ -15,4 +16,5 @@
 
 pub mod cli;
 pub mod depends_on;
+pub mod profile_filter;
 pub mod schema;

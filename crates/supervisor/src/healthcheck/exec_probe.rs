@@ -50,7 +50,7 @@ use fandhe_container_core::traits::{
 use super::HealthcheckDefinition;
 use super::exec_helper::{HEALTH_EXEC_ARG0, HEALTH_EXEC_SUBCOMMAND, HealthExecArgs};
 use super::exec_wire::{HealthExecLine, LINE_MAX};
-use crate::health::HealthProbe;
+use crate::health::{HealthProbe, ProbeCancel};
 use crate::run::MAX_POLL_INTERVAL;
 
 /// 保持するコマンド出力の上限（Docker の Output の上限に倣った本実装の判断）。
@@ -488,7 +488,8 @@ pub struct ExecHealthProbe {
     command: Vec<String>,
     observer: Arc<dyn HealthExecObserver>,
     last: Mutex<Option<HealthExecReport>>,
-    cancelled: AtomicBool,
+    /// 直接 `probe` を呼んだ試行の旗（`cancel` の宛先）。`ProbeRunner` 経由の試行は試行ごとの旗を使う。
+    current: Mutex<ProbeCancel>,
     busy: AtomicBool,
     /// 配置取得スレッド（`hc-resolve`）が生きている間 true。状態ストアの I/O が止まったときに切り離した
     /// スレッドと複製した pidfd が probe ごとに積み上がらないよう、同時に 1 本までに抑える（REPAIR-5）。
@@ -504,13 +505,9 @@ impl std::fmt::Debug for ExecHealthProbe {
     }
 }
 
-/// probe の終了時に `cancelled` を戻してから `busy` を下ろす（この順序が契約）。
-///
-/// 終了時にも戻すのは、`busy` を下ろす前に消して取り残しを減らすため。開始時にも戻す（`probe`）ので、
-/// 前回の probe の終了後に遅れて届いた cancel は次の probe を汚染しない（REPAIR-5）。
+/// probe の終了時に `busy` を下ろす。cancel の旗は試行ごとに別のため、ここでは戻さない（SUP-4・REPAIR-5）。
 struct BusyGuard<'a> {
     busy: &'a AtomicBool,
-    cancelled: &'a AtomicBool,
 }
 
 /// spawn 前に打ち切る理由。
@@ -523,7 +520,6 @@ enum PreSpawn {
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.cancelled.store(false, Ordering::SeqCst);
         self.busy.store(false, Ordering::SeqCst);
     }
 }
@@ -549,7 +545,7 @@ impl ExecHealthProbe {
             command,
             observer: Arc::new(StderrHealthExecObserver),
             last: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
+            current: Mutex::new(ProbeCancel::new()),
             busy: AtomicBool::new(false),
             resolver_busy: Arc::new(AtomicBool::new(false)),
         })
@@ -612,7 +608,11 @@ impl ExecHealthProbe {
     /// したときに親死亡シグナルを解除したコマンドと子孫を止める手段が無いまま起動しないため（SUP-4・SUP-6・
     /// REPAIR-5）。前回の取得スレッドが未終了のときも新しく作らず `Unavailable`（in-flight は最大 1 本）。
     /// 期限切れ・cancel は `Err`（helper を起動しない）。
-    fn resolve_record_bounded(&self, deadline: Instant) -> Result<StateRecord, PreSpawn> {
+    fn resolve_record_bounded(
+        &self,
+        deadline: Instant,
+        cancel: &ProbeCancel,
+    ) -> Result<StateRecord, PreSpawn> {
         /// スレッドの終了時（panic を含む）に `resolver_busy` を下ろす。
         struct ResolverGuard(Arc<AtomicBool>);
         impl Drop for ResolverGuard {
@@ -645,7 +645,7 @@ impl ExecHealthProbe {
             })
             .map_err(|_| PreSpawn::Unavailable)?;
         loop {
-            if self.cancelled.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() {
                 return Err(PreSpawn::Cancelled);
             }
             let now = Instant::now();
@@ -676,7 +676,7 @@ impl ExecHealthProbe {
         remove_exec_child_cgroup(&self.target.id, placement, &name, CGROUP_KILL_TIMEOUT).is_ok()
     }
 
-    fn run(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+    fn run(&self, timeout: Duration, cancel: &ProbeCancel) -> Result<HealthStatus, TraitError> {
         let start = Instant::now();
         let deadline = start + timeout;
         let mut report = HealthExecReport {
@@ -740,7 +740,7 @@ impl ExecHealthProbe {
         }
         // 強制停止に使う cgroup の配置を起動前に取得する。得られなければ起動しない（fail-closed）。取得は別スレッドで
         // 残り予算内に限り待ち、待つ間も cancel と期限を確かめる。期限切れ・cancel の後も起動しない（REPAIR-5）。
-        let record = match self.resolve_record_bounded(deadline) {
+        let record = match self.resolve_record_bounded(deadline, cancel) {
             Ok(record) => record,
             Err(PreSpawn::Timeout) => {
                 report.outcome = HealthExecOutcome::Timeout;
@@ -784,7 +784,7 @@ impl ExecHealthProbe {
                 );
             }
         };
-        if self.cancelled.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             report.outcome = HealthExecOutcome::Cancelled;
             return finish(
                 report,
@@ -875,7 +875,7 @@ impl ExecHealthProbe {
                 Ok(None) => {}
                 Err(_) => break Ended::WaitFailed,
             }
-            if self.cancelled.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() {
                 break Ended::Cancelled;
             }
             if Instant::now() >= deadline {
@@ -1001,28 +1001,51 @@ impl ExecHealthProbe {
     }
 }
 
-impl HealthProbe for ExecHealthProbe {
-    fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+impl ExecHealthProbe {
+    /// 排他を取って `cancel`（この試行の旗）で 1 回実行する。
+    fn probe_with(
+        &self,
+        timeout: Duration,
+        cancel: &ProbeCancel,
+    ) -> Result<HealthStatus, TraitError> {
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(TraitError::new(
                 ErrorCode::Unavailable,
                 "a healthcheck probe is already running",
             ));
         }
-        let _guard = BusyGuard {
-            busy: &self.busy,
-            cancelled: &self.cancelled,
-        };
-        // 開始時に cancelled を戻す。`ProbeRunner` は cancel スレッドも未終了として計数し、その間は次の probe を
-        // 始めないので、前回の probe に向けた遅延 cancel は必ずこの時点より前に着地している。ここで捨てないと
-        // 次の interval の probe が healthcheck を実行せず `Cancelled` になる（遅延 cancel の汚染。REPAIR-5）。
-        self.cancelled.store(false, Ordering::SeqCst);
-        self.run(timeout)
+        let _guard = BusyGuard { busy: &self.busy };
+        // 旗は試行ごとに別なので、開始時に消さない。遅れた前の回の cancel は前の回の旗にだけ立ち、
+        // 今回の旗に先に立った cancel も失われない（SUP-4・REPAIR-5）。
+        self.run(timeout, cancel)
+    }
+}
+
+impl HealthProbe for ExecHealthProbe {
+    fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError> {
+        // 直接呼び出しでは新しい旗を作って `cancel` の宛先にする（`ProbeRunner` は `probe_cancellable` を使う）。
+        let attempt = ProbeCancel::new();
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = attempt.clone();
+        self.probe_with(timeout, &attempt)
+    }
+
+    fn probe_cancellable(
+        &self,
+        timeout: Duration,
+        cancel: &ProbeCancel,
+    ) -> Result<HealthStatus, TraitError> {
+        self.probe_with(timeout, cancel)
     }
 
     fn cancel(&self) {
-        // フラグを立てるだけ（すぐ戻る）。kill と回収は probe のループが自分で行う。
-        self.cancelled.store(true, Ordering::SeqCst);
+        // 旗を立てるだけ（すぐ戻る）。kill と回収は probe のループが自分で行う。
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
     }
 }
 
@@ -1313,7 +1336,7 @@ mod tests {
         assert!(ExecHealthProbe::new(&definition(&["/bin/true"]), target()).is_ok());
     }
 
-    /// REPAIR-5（#2441）: 同時実行の 2 本目は `Unavailable`、`cancel` は即座に戻る。
+    /// REPAIR-5（#2441）: 同時実行の 2 本目は `Unavailable`、`cancel` は即座に戻り直近の試行の旗を立てる。
     #[test]
     fn sup4_2441_second_concurrent_probe_is_unavailable_and_cancel_returns() {
         let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
@@ -1321,20 +1344,44 @@ mod tests {
         let err = probe.probe(Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Unavailable);
         probe.busy.store(false, Ordering::SeqCst);
+        let attempt = ProbeCancel::new();
+        *probe.current.lock().unwrap() = attempt.clone();
         probe.cancel();
-        assert!(probe.cancelled.load(Ordering::SeqCst));
+        assert!(attempt.is_cancelled());
     }
 
-    /// REPAIR-5（#2441）: 前回の probe の終了後に遅れて届いた cancel は、次の probe を `Cancelled` にしない。
+    /// REPAIR-5・SUP-4（#2441）: 前の回の試行の旗に遅れて届いた cancel は、次の回の旗を汚さず `Cancelled` にしない。
     #[test]
-    fn repair5_2441_late_cancel_does_not_poison_the_next_probe() {
+    fn repair5_2441_late_cancel_of_previous_attempt_does_not_poison_the_next_probe() {
         let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
-        probe.cancel();
-        assert!(probe.cancelled.load(Ordering::SeqCst));
-        let _ = probe.probe(Duration::from_secs(5));
+        let previous = ProbeCancel::new();
+        let next = ProbeCancel::new();
+        // 次の回が始まった後に、前の回の cancel が着地する（開始後の遅延）。
+        let _ = probe.probe_cancellable(Duration::from_secs(5), &next);
+        previous.cancel();
+        assert!(previous.is_cancelled());
+        assert!(!next.is_cancelled());
         let outcome = probe.last_report().map(|r| r.outcome);
         assert_ne!(outcome, Some(HealthExecOutcome::Cancelled));
-        assert!(!probe.cancelled.load(Ordering::SeqCst));
+        assert!(!probe.busy.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5・SUP-4（#2441）: 今回の試行に開始前に出た cancel は開始時に消えず、`Cancelled` で打ち切る。
+    #[test]
+    fn repair5_2441_cancel_issued_before_start_is_not_cleared() {
+        let probe = ExecHealthProbe::new(&definition(&["/bin/true"]), target()).unwrap();
+        let attempt = ProbeCancel::new();
+        attempt.cancel();
+        let err = probe
+            .probe_cancellable(Duration::from_secs(5), &attempt)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(err.message(), "healthcheck probe was cancelled");
+        assert_eq!(
+            probe.last_report().map(|r| r.outcome),
+            Some(HealthExecOutcome::Cancelled)
+        );
+        assert!(attempt.is_cancelled());
         assert!(!probe.busy.load(Ordering::SeqCst));
     }
 

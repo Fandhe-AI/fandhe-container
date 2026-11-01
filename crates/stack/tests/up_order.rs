@@ -13,7 +13,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fandhe_container_stack::cli::{
-    LaunchError, LaunchedService, ServiceLauncher, UpError, UpPolicy, up,
+    LaunchError, LaunchRequest, LaunchedService, NetworkProvisionError, NetworkProvisioner,
+    NetworkRequest, ProvisionedNetwork, ServiceLauncher, UpError, UpPolicy, UpProject, up,
 };
 use fandhe_container_stack::depends_on::wait::{
     DependencyObservation, DependencyObserver, ObserveError, WaitClock, WaitPolicy,
@@ -218,7 +219,8 @@ impl World {
     }
 }
 impl ServiceLauncher for World {
-    fn launch(&mut self, service: &str, spec: &Service) -> Result<LaunchedService, LaunchError> {
+    fn launch(&mut self, req: &LaunchRequest<'_>) -> Result<LaunchedService, LaunchError> {
+        let (service, spec) = (req.service(), req.spec());
         if self.fail_on == Some(service) {
             return Err(LaunchError::new("TEST_LAUNCH", "test launch failure"));
         }
@@ -263,6 +265,17 @@ impl DependencyObserver for World {
     }
 }
 
+/// このファイルの試験は `[networks]` を使わない。呼ばれたら失敗にする。
+struct NoNetworks;
+impl NetworkProvisioner for NoNetworks {
+    fn ensure(
+        &mut self,
+        _: &NetworkRequest<'_>,
+    ) -> Result<ProvisionedNetwork, NetworkProvisionError> {
+        panic!("no network expected in up_order tests");
+    }
+}
+
 fn policy(timeout: Duration) -> UpPolicy {
     UpPolicy {
         started: WaitPolicy::new(ms(100), timeout).unwrap(),
@@ -275,13 +288,13 @@ fn run(
     w: &mut World,
     clk: &mut Clk,
     p: &UpPolicy,
-) -> Result<fandhe_container_stack::cli::UpReport, fandhe_container_stack::cli::UpFailure> {
+) -> Result<fandhe_container_stack::cli::UpReport, Box<fandhe_container_stack::cli::UpFailure>> {
     // World は 3 つのポートを兼ねるため、同じ可変参照を複数渡せない。共有セル越しの薄い委譲を挟む。
     let cell = std::cell::RefCell::new(w);
     struct Shared<'a, 'b>(&'a std::cell::RefCell<&'b mut World>);
     impl ServiceLauncher for Shared<'_, '_> {
-        fn launch(&mut self, s: &str, sp: &Service) -> Result<LaunchedService, LaunchError> {
-            ServiceLauncher::launch(&mut **self.0.borrow_mut(), s, sp)
+        fn launch(&mut self, r: &LaunchRequest<'_>) -> Result<LaunchedService, LaunchError> {
+            ServiceLauncher::launch(&mut **self.0.borrow_mut(), r)
         }
     }
     impl DependencyObserver for Shared<'_, '_> {
@@ -294,9 +307,14 @@ fn run(
             HealthSource::observe(&mut **self.0.borrow_mut(), s)
         }
     }
+    let networks = BTreeMap::new();
     up(
-        services,
+        &UpProject {
+            services,
+            networks: &networks,
+        },
         &mut Shared(&cell),
+        &mut NoNetworks,
         &mut Shared(&cell),
         &mut Shared(&cell),
         clk,

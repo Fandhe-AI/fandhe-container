@@ -259,7 +259,7 @@ mod syscall_ffi {
     pub(super) const EINTR: i32 = 4;
     pub(super) const ECHILD: i32 = 10;
     /// `siginfo_t` を受ける領域の大きさ（カーネル ABI で 128 バイト固定。中身は読まない）。
-    const SIGINFO_BYTES: usize = 128;
+    pub(super) const SIGINFO_BYTES: usize = 128;
     /// include/uapi/linux/prctl.h の値。prctl は可変長部を `unsigned long` で渡すため LP64 限定（#3202）。
     pub(super) const PR_SET_DUMPABLE: i32 = 4;
     pub(super) const PR_GET_KEEPCAPS: i32 = 7;
@@ -988,6 +988,9 @@ mod libc_abi {
         assert!(WNOWAIT == widen_i64(libc::WNOWAIT));
         assert!(EINTR == libc::EINTR);
         assert!(ECHILD == libc::ECHILD);
+        // has_any_child の受け領域は libc の `siginfo_t` 以上の大きさ・アラインメントを持つ（`[u64; 16]`）。
+        assert!(size_of::<libc::siginfo_t>() <= SIGINFO_BYTES);
+        assert!(align_of::<libc::siginfo_t>() <= align_of::<u64>());
         assert!(F_GETFD == libc::F_GETFD);
         // 関数内のローカル定数・リテラルの errno / シグナル（項目として参照できないため libc の値を固定する）。
         assert!(libc::SIGKILL == 9); // kill_process_group

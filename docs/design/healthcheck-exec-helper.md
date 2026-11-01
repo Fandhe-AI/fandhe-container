@@ -99,7 +99,7 @@ helper の子孫（exec の worker、`FileAuditSink` が主経路のファイル
 
 ### supervisor が死んだ場合
 
-`PR_SET_PDEATHSIG` は生成元のスレッドに束縛される（probe は一時スレッドから起動される）ため使わない。代わりに、止める合図の受け口が結果チャネルの socketpair なので、supervisor が死んで **supervisor 側の端が閉じる（EOF）と、reaper は合図と同じく helper を SIGKILL し、孤児を回収して終わる**。supervisor が fork した子が端を持ち続けて EOF が来ない場合に備え、reaper 自身にも期限がある（helper の exec 期限 + `REAPER_HARD_MARGIN` 10 秒。超えたら合図なしで helper を SIGKILL する）。reaper が孤児の回収で終われない場合（D 状態）は、reaper 自身が init へ再親付けされた後も、その孤児が終わるまで生き続ける（init が reaper を回収する）。
+`PR_SET_PDEATHSIG` は生成元のスレッドに束縛される（probe は一時スレッドから起動される）ため使わない。代わりに、止める合図の受け口が結果チャネルの socketpair（fd 2 の複製を reaper 内の専用スレッドが **ブロッキングで** 読み、1 バイト・EOF・読み取りエラーのどれでもフラグを立てる。`O_NONBLOCK` はファイル記述に付き、同じ fd 2 を継承する helper の blocking `write_all` が `WouldBlock` を返し得るため、reaper は fd 2 を non-blocking にしない。試験は `/proc/self/fdinfo` の flags で照合）なので、supervisor が死んで **supervisor 側の端が閉じる（EOF）と、reaper は合図と同じく helper を SIGKILL し、孤児を回収して終わる**。supervisor が fork した子が端を持ち続けて EOF が来ない場合に備え、reaper 自身にも期限がある（helper の exec 期限 + `REAPER_HARD_MARGIN` 10 秒。超えたら合図なしで helper を SIGKILL する）。reaper が孤児の回収で終われない場合（D 状態）は、reaper 自身が init へ再親付けされた後も、その孤児が終わるまで生き続ける（init が reaper を回収する）。
 
 ### その他
 

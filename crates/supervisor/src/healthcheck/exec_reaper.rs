@@ -16,7 +16,9 @@
 //!
 //! # 止める合図と親の死亡
 //! 合図は fd 2（結果チャネルの socketpair の子側。helper へはそのまま継承させる）に **supervisor が書く 1 バイト**、
-//! または **supervisor 側の端が閉じたこと（EOF）**。EOF なので、supervisor が異常終了しても reaper は helper を
+//! または **supervisor 側の端が閉じたこと（EOF）**。受け口は reaper 内の専用スレッドが fd 2 の複製を **ブロッキングで**
+//! 読み、合図・EOF・読み取りエラーのどれでも `AtomicBool` を立てる（`O_NONBLOCK` はファイル記述に付き helper の fd 2 と
+//! 共有されるため、non-blocking にはしない。helper の blocking `write_all` が `WouldBlock` を返さないように）。EOF なので、supervisor が異常終了しても reaper は helper を
 //! SIGKILL して終わる（`PR_SET_PDEATHSIG` は生成元のスレッドに束縛されるため使わない）。端を別プロセス（supervisor が
 //! fork した子）が持ち続けて EOF が来ない場合に備え、reaper 自身にも期限がある: helper の exec 期限 +
 //! [`REAPER_HARD_MARGIN`]。超えたら合図なしで helper を SIGKILL する。reaper が終わるまでの待ちは supervisor が
@@ -31,6 +33,8 @@ use std::io::Read as _;
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{ChildSubreaper, ContainerChild};
@@ -101,7 +105,8 @@ struct RealOps {
     helper: Child,
     helper_pid: u32,
     helper_done: bool,
-    stop: UnixStream,
+    /// 止める合図の監視スレッド（[`spawn_stop_watcher`]）が立てるフラグ。
+    stop_flag: Arc<AtomicBool>,
     stopped: bool,
     hard_deadline: Instant,
     proof: ChildSubreaper,
@@ -116,23 +121,10 @@ impl ReaperOps for RealOps {
             self.stopped = true;
             return true;
         }
-        let mut buf = [0u8; 16];
-        loop {
-            match self.stop.read(&mut buf) {
-                // 1 バイト以上の合図、または相手の端が閉じた（EOF）。どちらも止める。
-                Ok(_) => {
-                    self.stopped = true;
-                    return true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
-                // 読み取りの失敗（接続の切断を含む）も、制御を失ったので止める側へ倒す。
-                Err(_) => {
-                    self.stopped = true;
-                    return true;
-                }
-            }
+        if self.stop_flag.load(Ordering::Acquire) {
+            self.stopped = true;
         }
+        self.stopped
     }
 
     fn kill_helper(&mut self) {
@@ -177,6 +169,28 @@ impl ReaperOps for RealOps {
     fn pause(&mut self) {
         std::thread::sleep(REAPER_STEP);
     }
+}
+
+/// 止める合図の監視スレッドを起こす。`stop` を **ブロッキングのまま** 読み、1 バイト以上・EOF・読み取りエラー
+/// （制御を失ったので止める側へ倒す）のいずれでも戻り値のフラグを立てて終わる。`stop` は fd 2 の複製で、同じファイル
+/// 記述を helper も継承しているため、ここでフラグ（`O_NONBLOCK`）を変えない（SUP-4・REPAIR-5・#2441）。スレッドは
+/// join せず、reaper のプロセス終了で消える。
+fn spawn_stop_watcher(mut stop: UnixStream) -> std::io::Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let setter = Arc::clone(&flag);
+    std::thread::Builder::new()
+        .name("reaper-stop".to_owned())
+        .spawn(move || {
+            let mut buf = [0u8; 16];
+            loop {
+                match stop.read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
+            }
+            setter.store(true, Ordering::Release);
+        })?;
+    Ok(flag)
 }
 
 /// `pid` の現在の子の pid 一覧。`/proc/<pid>/task/<tid>/children`（`CONFIG_PROC_CHILDREN`）が無ければ `/proc` を走査する。
@@ -235,9 +249,11 @@ where
     else {
         return ExitCode::FAILURE;
     };
-    if stop.set_nonblocking(true).is_err() {
+    // 監視スレッドは helper の起動前に起こす（起こせなければ helper を作らず失敗にする）。早く合図が立てば、
+    // 最初のループで helper を SIGKILL するだけで、起動後に立てた場合と同じ。
+    let Ok(stop_flag) = spawn_stop_watcher(stop) else {
         return ExitCode::FAILURE;
-    }
+    };
     let mut command = self_exe_command(super::exec_helper::HEALTH_EXEC_SUBCOMMAND, &helper_args);
     command
         .stdin(Stdio::inherit())
@@ -251,7 +267,7 @@ where
         helper,
         helper_pid,
         helper_done: false,
-        stop,
+        stop_flag,
         stopped: false,
         hard_deadline: Instant::now() + parsed.timeout() + REAPER_HARD_MARGIN,
         proof,
@@ -395,6 +411,49 @@ mod tests {
         assert!(reap_loop(&mut f));
         assert_eq!(f.killed, 0);
         assert!(f.reaped.is_empty());
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: 監視スレッドは fd の記述に `O_NONBLOCK` を立てない（helper と共有されるため）。
+    /// 合図の 1 バイトでも、相手の端が閉じる（EOF）でも、フラグが立つ。
+    #[test]
+    fn repair5_2441_stop_watcher_keeps_description_blocking_and_flags_on_byte_or_eof() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        const O_NONBLOCK: u32 = 0o4000;
+        let wait_for = |flag: &Arc<AtomicBool>| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !flag.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            flag.load(Ordering::Acquire)
+        };
+        let flags_of = |fd: i32| -> u32 {
+            let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).expect("fdinfo");
+            let line = text
+                .lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .expect("flags line");
+            u32::from_str_radix(line.trim(), 8).expect("octal flags")
+        };
+        // 1 バイトの合図。
+        let (mut sup, child_side) = UnixStream::pair().expect("pair");
+        let raw = child_side.as_raw_fd();
+        let flag = spawn_stop_watcher(child_side.try_clone().expect("clone")).expect("spawn");
+        assert_eq!(
+            flags_of(raw) & O_NONBLOCK,
+            0,
+            "O_NONBLOCK leaked to the shared description"
+        );
+        assert!(!flag.load(Ordering::Acquire));
+        sup.write_all(b"x").expect("write");
+        assert!(wait_for(&flag));
+        // 端が閉じる（EOF）。
+        let (sup2, child_side2) = UnixStream::pair().expect("pair");
+        let flag2 = spawn_stop_watcher(child_side2.try_clone().expect("clone")).expect("spawn");
+        assert_eq!(flags_of(child_side2.as_raw_fd()) & O_NONBLOCK, 0);
+        assert!(!flag2.load(Ordering::Acquire));
+        drop(sup2);
+        assert!(wait_for(&flag2));
     }
 
     #[test]

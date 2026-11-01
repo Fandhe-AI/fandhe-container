@@ -25,18 +25,24 @@ pub enum MicrovmErrorCode {
     ResourceExhausted,
     /// 対応外の OS / アーキテクチャ（fail-closed）。
     Unimplemented,
+    /// 引数が不正（vCPU id が範囲外。EINVAL）。
+    InvalidArgument,
+    /// 既に存在する（vCPU id の重複。EEXIST）。
+    AlreadyExists,
     /// 上記以外の内部エラー。
     Internal,
 }
 
 impl MicrovmErrorCode {
     /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所。
-    pub const ALL: [MicrovmErrorCode; 6] = [
+    pub const ALL: [MicrovmErrorCode; 8] = [
         MicrovmErrorCode::NotFound,
         MicrovmErrorCode::PermissionDenied,
         MicrovmErrorCode::FailedPrecondition,
         MicrovmErrorCode::ResourceExhausted,
         MicrovmErrorCode::Unimplemented,
+        MicrovmErrorCode::InvalidArgument,
+        MicrovmErrorCode::AlreadyExists,
         MicrovmErrorCode::Internal,
     ];
 
@@ -48,6 +54,8 @@ impl MicrovmErrorCode {
             MicrovmErrorCode::FailedPrecondition => "FAILED_PRECONDITION",
             MicrovmErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
             MicrovmErrorCode::Unimplemented => "UNIMPLEMENTED",
+            MicrovmErrorCode::InvalidArgument => "INVALID_ARGUMENT",
+            MicrovmErrorCode::AlreadyExists => "ALREADY_EXISTS",
             MicrovmErrorCode::Internal => "INTERNAL",
         }
     }
@@ -105,13 +113,15 @@ mod tests {
             MicrovmErrorCode::FailedPrecondition => 2,
             MicrovmErrorCode::ResourceExhausted => 3,
             MicrovmErrorCode::Unimplemented => 4,
-            MicrovmErrorCode::Internal => 5,
+            MicrovmErrorCode::InvalidArgument => 5,
+            MicrovmErrorCode::AlreadyExists => 6,
+            MicrovmErrorCode::Internal => 7,
         }
     }
 
     #[test]
     fn all_covers_every_variant_in_order() {
-        assert_eq!(MicrovmErrorCode::ALL.len(), 6);
+        assert_eq!(MicrovmErrorCode::ALL.len(), 8);
         for (i, c) in MicrovmErrorCode::ALL.iter().enumerate() {
             assert_eq!(ordinal(*c), i);
         }
@@ -133,6 +143,11 @@ mod tests {
             "RESOURCE_EXHAUSTED"
         );
         assert_eq!(MicrovmErrorCode::Unimplemented.as_str(), "UNIMPLEMENTED");
+        assert_eq!(
+            MicrovmErrorCode::InvalidArgument.as_str(),
+            "INVALID_ARGUMENT"
+        );
+        assert_eq!(MicrovmErrorCode::AlreadyExists.as_str(), "ALREADY_EXISTS");
         assert_eq!(MicrovmErrorCode::Internal.as_str(), "INTERNAL");
         for c in MicrovmErrorCode::ALL {
             assert_eq!(MicrovmErrorCode::from_name(c.as_str()), Some(c));

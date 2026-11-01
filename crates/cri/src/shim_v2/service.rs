@@ -3,7 +3,7 @@
 //! `server` が復号した [`TtrpcRequest`] を [`ServiceRegistry::dispatch`] へ渡し、
 //! サービス名で [`TtrpcService`] を引いて呼ぶ。未知のサービス・メソッドは `Unimplemented`。
 //! [`EmptyTaskService`] はどのメソッドにも `Unimplemented` を返す空の Task サービスで、ランタイム未注入の起動経路用。
-//! Create / Start を持つ実装は `task_service::TaskService`（TASK-62.2）。Delete 等は後続 issue（REPAIR-3）。
+//! Create / Start / Delete を持つ実装は `task_service::TaskService`（TASK-62.2・TASK-62.3.1）。Wait 等は後続 issue（REPAIR-3）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

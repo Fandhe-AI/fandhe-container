@@ -268,15 +268,49 @@ enum ExecState {
 struct ExecEntry {
     spec: ExecProcessSpec,
     state: ExecState,
+    /// この登録に固有のトークン。`begin_start` が発行し、`finish_start` が照合する
+    /// （削除・再作成で同じ ID の別登録に旧 launch の結果を書かないため）。
+    token: u64,
 }
+
+/// `Start(exec_id)` の起動開始時に得る、検証済み仕様と登録固有のトークン。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartTicket {
+    /// 起動する exec の仕様。
+    pub spec: ExecProcessSpec,
+    token: u64,
+}
+
+/// コンテナ単位の排他に使うロックの本数（コンテナ ID のハッシュで選ぶ。増え続けない）。
+const GATE_STRIPES: usize = 64;
 
 /// 登録済みの exec の一覧（コンテナ ID と exec ID の組で引く）。
 ///
-/// 起動中はロックを保持しない: [`Self::begin_start`] が `Starting` にして解放し、
+/// 起動中は内部ロックを保持しない: [`Self::begin_start`] が `Starting` にして解放し、
 /// 起動役の結果を [`Self::finish_start`] で反映する。
-#[derive(Debug, Default)]
+///
+/// 同じコンテナの「削除（remove から purge まで）」「状態確認から登録・起動の完了まで」は、
+/// [`Self::lock_container`] のゲートで互いに排他する（CRI-5）。
+#[derive(Debug)]
 pub struct ExecRegistry {
-    inner: Mutex<BTreeMap<(String, String), ExecEntry>>,
+    inner: Mutex<RegistryInner>,
+    gates: Vec<Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct RegistryInner {
+    map: BTreeMap<(String, String), ExecEntry>,
+    /// 登録ごとのトークンの採番。
+    next_token: u64,
+}
+
+impl Default for ExecRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            gates: (0..GATE_STRIPES).map(|_| Mutex::new(())).collect(),
+        }
+    }
 }
 
 fn poisoned() -> CriError {
@@ -293,6 +327,31 @@ impl ExecRegistry {
         Self::default()
     }
 
+    /// コンテナ単位のゲートを取る。Delete（remove から purge まで）と、Exec / Start の
+    /// 「状態確認から登録・起動の完了まで」はこのゲートを保持して互いに排他する。
+    /// Start(exec_id) は起動役の完了までこのゲートを保持する。同じ呼び出しで 2 つ以上取らない（デッドロック防止）。
+    pub fn lock_container(
+        &self,
+        container: &ContainerId,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, CriError> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        container.as_str().hash(&mut h);
+        let idx = (h.finish() % GATE_STRIPES as u64) as usize;
+        self.gates
+            .get(idx)
+            .ok_or_else(poisoned)?
+            .lock()
+            .map_err(|_| poisoned())
+    }
+
+    /// コンテナの exec 登録をすべて除去する（Delete 成功後、ゲート保持中に呼ぶ。CRI-5）。
+    pub fn purge_container(&self, container: &ContainerId) -> Result<(), CriError> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        inner.map.retain(|(c, _), _| c != container.as_str());
+        Ok(())
+    }
+
     /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`。
     pub fn register(
         &self,
@@ -300,39 +359,46 @@ impl ExecRegistry {
         exec_id: &ExecId,
         spec: ExecProcessSpec,
     ) -> Result<(), CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let k = key(container, exec_id);
-        if map.contains_key(&k) {
+        if inner.map.contains_key(&k) {
             return Err(CriError::already_exists("exec already exists"));
         }
-        let per_container = map.keys().filter(|(c, _)| *c == k.0).count();
-        if per_container >= MAX_EXECS_PER_CONTAINER || map.len() >= MAX_EXECS_TOTAL {
+        let per_container = inner.map.keys().filter(|(c, _)| *c == k.0).count();
+        if per_container >= MAX_EXECS_PER_CONTAINER || inner.map.len() >= MAX_EXECS_TOTAL {
             return Err(CriError::resource_exhausted("too many execs"));
         }
-        map.insert(
+        inner.next_token = inner.next_token.wrapping_add(1);
+        let token = inner.next_token;
+        inner.map.insert(
             k,
             ExecEntry {
                 spec,
                 state: ExecState::Created,
+                token,
             },
         );
         Ok(())
     }
 
-    /// `Created` を `Starting` にして仕様の複製を返す。未登録は `NOT_FOUND`、起動済み・起動中は `FAILED_PRECONDITION`。
+    /// `Created` を `Starting` にして仕様の複製とトークンを返す。未登録は `NOT_FOUND`、起動済み・起動中は `FAILED_PRECONDITION`。
     pub fn begin_start(
         &self,
         container: &ContainerId,
         exec_id: &ExecId,
-    ) -> Result<ExecProcessSpec, CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        let entry = map
+    ) -> Result<StartTicket, CriError> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let entry = inner
+            .map
             .get_mut(&key(container, exec_id))
             .ok_or_else(|| CriError::not_found("exec not found"))?;
         match entry.state {
             ExecState::Created => {
                 entry.state = ExecState::Starting;
-                Ok(entry.spec.clone())
+                Ok(StartTicket {
+                    spec: entry.spec.clone(),
+                    token: entry.token,
+                })
             }
             ExecState::Starting | ExecState::Started => {
                 Err(CriError::failed_precondition("exec already started"))
@@ -341,14 +407,18 @@ impl ExecRegistry {
     }
 
     /// 起動の結果を反映する。成功は `Started`、失敗は `Created` へ戻して再試行できるようにする。
+    /// トークンが現在の登録と一致しなければ（削除・再作成で別の登録になった）何も書かない。
     pub fn finish_start(
         &self,
         container: &ContainerId,
         exec_id: &ExecId,
+        ticket: &StartTicket,
         ok: bool,
     ) -> Result<(), CriError> {
-        let mut map = self.inner.lock().map_err(|_| poisoned())?;
-        if let Some(entry) = map.get_mut(&key(container, exec_id)) {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if let Some(entry) = inner.map.get_mut(&key(container, exec_id))
+            && entry.token == ticket.token
+        {
             entry.state = if ok {
                 ExecState::Started
             } else {
@@ -358,7 +428,6 @@ impl ExecRegistry {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,14 +580,15 @@ mod tests {
             r.register(&c, &e, spec.clone()).unwrap_err().code(),
             CriErrorCode::AlreadyExists
         );
-        assert_eq!(r.begin_start(&c, &e).unwrap(), spec);
+        let t = r.begin_start(&c, &e).unwrap();
+        assert_eq!(t.spec, spec);
         assert_eq!(
             r.begin_start(&c, &e).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
-        r.finish_start(&c, &e, false).unwrap();
-        r.begin_start(&c, &e).unwrap();
-        r.finish_start(&c, &e, true).unwrap();
+        r.finish_start(&c, &e, &t, false).unwrap();
+        let t = r.begin_start(&c, &e).unwrap();
+        r.finish_start(&c, &e, &t, true).unwrap();
         assert!(r.begin_start(&c, &e).is_err());
         for i in 1..MAX_EXECS_PER_CONTAINER {
             r.register(&c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
@@ -533,5 +603,47 @@ mod tests {
         // 別コンテナは per-container 上限の影響を受けない。
         let c2 = ContainerId::new("c2").unwrap();
         r.register(&c2, &e, spec).unwrap();
+    }
+
+    /// CRI-5: purge は当該コンテナの登録だけを除去し、旧登録の launch 結果は再登録に反映されない。
+    #[test]
+    fn cri5_registry_purge_and_stale_finish() {
+        let r = ExecRegistry::new();
+        let (c, c2) = (
+            ContainerId::new("c1").unwrap(),
+            ContainerId::new("c2").unwrap(),
+        );
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(&c2, &e, spec.clone()).unwrap();
+        let old = r.begin_start(&c, &e).unwrap();
+        r.purge_container(&c).unwrap();
+        assert_eq!(
+            r.begin_start(&c, &e).unwrap_err().code(),
+            CriErrorCode::NotFound
+        );
+        // 同じ ID で再登録した新しい登録へ、旧 launch の結果（成功・失敗とも）は書かれない。
+        r.register(&c, &e, spec.clone()).unwrap();
+        r.finish_start(&c, &e, &old, true).unwrap();
+        let fresh = r.begin_start(&c, &e).unwrap();
+        r.finish_start(&c, &e, &old, false).unwrap();
+        assert_eq!(
+            r.begin_start(&c, &e).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition,
+            "stale failure must not reset Starting"
+        );
+        r.finish_start(&c, &e, &fresh, true).unwrap();
+        // 別コンテナの登録は purge の影響を受けない。
+        assert_eq!(r.begin_start(&c2, &e).unwrap().spec, spec);
+    }
+
+    /// CRI-5: コンテナのゲートは解放後に再取得できる。
+    #[test]
+    fn cri5_registry_container_gate() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        drop(r.lock_container(&c).unwrap());
+        drop(r.lock_container(&c).unwrap());
     }
 }

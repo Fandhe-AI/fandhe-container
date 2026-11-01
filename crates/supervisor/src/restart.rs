@@ -57,10 +57,12 @@ use fandhe_container_core::traits::{
     TraitError,
 };
 
+use crate::healthcheck::HealthWiring;
 use crate::log_pipeline::CaptureHub;
 use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
-    ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
+    ensure_owner, is_running_with_pid, monitor_with_observer_health, precondition,
+    write_with_retry_when,
 };
 use crate::seccomp_notify::SeccompNotifyHub;
 use crate::state::SupervisedState;
@@ -1006,12 +1008,52 @@ pub fn supervise_with_restart(
     stop: &StopToken,
     obs: &dyn MonitorObserver,
 ) -> Result<SuperviseOutcome, TraitError> {
+    supervise_with_restart_health(
+        state,
+        process,
+        relauncher,
+        monitor_config,
+        restart_config,
+        stop,
+        obs,
+        None,
+    )
+}
+
+/// [`supervise_with_restart`] に healthcheck の周期実行（#2953・SUP-4）を加える。
+///
+/// 世代（起動したプロセス）ごとに `monitor_with_health` を呼ぶため、周期実行は世代の間だけ回り、monitor が戻る前に
+/// 止めて回収される。再 launch の後の次の monitor が新しいプロセスの probe を `health` の工場から作り直すので、
+/// 古いプロセス宛ての probe は残らない（pidfd の複製は世代ごと。SEC-1）。`LauncherRelauncher` の単一スレッドの要求
+/// （SUP-3・CORE-1）は、monitor が戻った時点で周期実行のスレッドが居ないことで満たす。期限内に止まらなかった
+/// スレッドが残れば、既存の `thread_settle` が再 launch を `RelaunchFailed` で止める（fail-closed）。
+/// `health` が `None` なら [`supervise_with_restart`] と同じ。
+// 理由: 状態・起動ハンドル・relauncher・各設定・停止トークン・観測器・healthcheck 配線は、それぞれ別の所有・借用と
+// 差し替え点（試験で偽物に替える）を表すため、束ねる型を作らず引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
+pub fn supervise_with_restart_health(
+    state: &mut SupervisedState,
+    process: Box<dyn LaunchedProcess>,
+    relauncher: &Arc<dyn Relauncher>,
+    monitor_config: &MonitorConfig,
+    restart_config: &RestartConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
+    health: Option<&HealthWiring>,
+) -> Result<SuperviseOutcome, TraitError> {
     let mut process = process;
     let mut restarts: u32 = 0;
     // 後始末の terminate が失敗・超過したハンドルの受け皿。`Stopped` / `RestartUnrecorded` で呼び出し側へ渡す。
     let cleanup_late = LateOrphans::default();
     loop {
-        let last = match monitor_with_observer(state, process.as_ref(), monitor_config, stop, obs) {
+        let last = match monitor_with_observer_health(
+            state,
+            process.as_ref(),
+            monitor_config,
+            stop,
+            obs,
+            health,
+        ) {
             Ok(last) => last,
             Err(error) => {
                 return Ok(SuperviseOutcome::MonitorError {

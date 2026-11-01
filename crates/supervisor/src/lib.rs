@@ -17,7 +17,7 @@
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシーと加算は #487〜#489 で実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
 //! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み） |
-//! | #495 | TASK-161.2 | healthcheck 周期実行エンジン（[`healthcheck::run_periodic`]。実装済み。exec を呼ぶ判定の本番アダプタ `healthcheck::ExecHealthProbe` は #2441 で実装済み。`monitor` ループへの組み込みは未実装で #2953 が担う。REPAIR-3） |
+//! | #495 | TASK-161.2 | healthcheck 周期実行エンジン（[`healthcheck::run_periodic`]。実装済み。exec を呼ぶ判定の本番アダプタ `healthcheck::ExecHealthProbe` は #2441 で実装済み。`monitor` ループ・restart・supervisor 入口への組み込みは #2953 で実装済み（`healthcheck::HealthWiring`・`run::monitor_with_health`。定義を運ぶ起動オプション文書の `health-*` kind は実装済みで、CLI の書き手は未実装のため本番の経路は書き手ができるまで動かない。REPAIR-3）） |
 //! | #496 | TASK-161.3 | `health` の state.json 反映（[`healthcheck::HealthAggregator`]・[`health::probe_aggregate_and_record`]。retries・start_period・`Starting`。実装済み。SUP-4） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
 //! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |

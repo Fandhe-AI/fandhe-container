@@ -12,8 +12,10 @@
 //! `docs/design/healthcheck-exec-helper.md`）。
 //!
 //! # 結線の範囲（REPAIR-3）
-//! 本モジュールは判定の実装まで。monitor / supervisor 入口への `run_periodic` の結線、restart の quiesce の参加者への
-//! 登録、restart での付け替え（アダプタは 1 起動世代につき 1 つ作り、restart で作り直す前提）は #2953 が担う。
+//! 本モジュールは判定の実装まで。monitor / supervisor 入口への `run_periodic` の結線と restart での付け替え
+//! （アダプタは 1 起動世代につき 1 つ作り、restart で作り直す）は #2953 で実装済み（`super::wiring` の
+//! `ExecHealthProbeFactory`・`crate::run::monitor_with_health`）。周期実行のスレッドは monitor が戻る前に止めて回収するため、
+//! restart の quiesce の参加者への登録は要らない（再 launch の時点で居ない）。
 //! `argv[0]` の PATH 解決と timeout 上限の見直しは #2439（オーナー判断待ち）で、それまでは `argv[0]` を絶対パスに限り、
 //! 60 秒超の timeout は既存の拒否のまま。
 //!
@@ -21,7 +23,7 @@
 //! コマンドの stdout / stderr は結合した 1 本で、先頭 [`OUTPUT_CAP`] バイトだけを [`HealthExecReport::output`] に保持し、
 //! 超えた分は読み捨てて合計バイト数と `truncated` を数える。`state.json`（`health` は列挙のまま）にも構造化ログ
 //! （`healthcheck_exec`）にも **本文は載せない**（秘密情報・ログ注入・command の中身を出さない方針）。ログに出すのは
-//! バイト数と `truncated` だけ。本文は [`ExecHealthProbe::last_report`] 経由で後続（inspect・#2953）が読み、
+//! バイト数と `truncated` だけ。本文は [`ExecHealthProbe::last_report`] 経由で後続（inspect。未実装）が読み、
 //! 表示する場合は [`HealthExecReport::output_escaped`] を使う。`TraitError` のメッセージには本文を入れない。
 //!
 //! # タイムアウトの層（REPAIR-5）

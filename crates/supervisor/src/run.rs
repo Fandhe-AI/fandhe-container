@@ -16,8 +16,11 @@
 //!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは `RotatingFileSink`（SUP-7・TASK-164.2）で
 //!   提供済み。本番の出力パイプは core の launcher が `take_output` で返す読み取り側を `crate::log_pipeline::CaptureHub` が
 //!   捕捉する（#1471・#1819）。`monitor_with_capture` は出力ストリームを注入で受ける土台のまま。
-//!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。周期実行は [`crate::healthcheck::run_periodic`] で提供済み（#495）、retries・start_period の集約と `health` 反映も提供済み（#496）。healthcheck コマンドの実行（exec probe）は #2441 で実装済み（`healthcheck::ExecHealthProbe`）。monitor への組み込みは未実装（TASK-161・#2953）で、
-//!   ループ内の統合点は手順 3 の生存確認の周回（本 issue ではループ本体へ組み込まない）。
+//!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。周期実行は [`crate::healthcheck::run_periodic`] で提供済み（#495）、retries・start_period の集約と `health` 反映も提供済み（#496）。healthcheck コマンドの実行（exec probe）は #2441 で実装済み（`healthcheck::ExecHealthProbe`）。
+//!   monitor への組み込みは #2953（TASK-161・SUP-4）で実装済み: [`monitor_with_health`] が、監視権の取得（手順 2）と `after_claim` の成功の後に
+//!   周期実行の専用スレッドを起動し、戻る前の全経路（終了検知・停止要求・wait の失敗）で期限つきに止めて回収する
+//!   （`crate::healthcheck::HealthWiring`。終了検知では終了記録の前に止める）。healthcheck 定義が無ければ従来どおり何も起動せず `health` も書かない。
+//!   `monitor_with_capture` への組み込みは行わない（本番は [`crate::restart::supervise_with_restart_health`] の経路を使うため。REPAIR-3）。
 //!   終了検知後の分岐（再起動するか Stopped に落とすか）は、[`monitor`] の手順 4 が拡張点になる。
 //!
 //! # 処理順（[`monitor`]）
@@ -80,9 +83,11 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{
-    ContainerState, ContainerStatus, ErrorCode, StateRecord, SupervisionState, TraitError,
+    ContainerState, ContainerStatus, ErrorCode, HealthStatus, StateRecord, SupervisionState,
+    TraitError,
 };
 
+use crate::healthcheck::{HEALTH_STOP_LIMIT, HealthStopReport, HealthWiring, HealthWorker};
 use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, StreamSummary};
 use crate::restart::exit_code_of;
 use crate::state::SupervisedState;
@@ -341,6 +346,10 @@ pub enum MonitorOperation {
     CaptureDrain,
     /// 明示 stop の state.json への記録（`Stopped` の記録へ「明示 stop 済み」を足す。#2440・SUP-9・SUP-3）。
     RecordExplicitStop,
+    /// healthcheck の周期実行の起動（`crate::healthcheck::HealthWiring`。失敗は `Unhealthy` の記録で補う。#2953・SUP-4）。
+    HealthStart,
+    /// healthcheck の周期実行の停止と回収（期限超過は `Timeout`。スレッドは切り離す。#2953・SUP-4・REPAIR-5）。
+    HealthStop,
 }
 
 impl MonitorOperation {
@@ -358,6 +367,8 @@ impl MonitorOperation {
             Self::CaptureStart => "capture_start",
             Self::CaptureDrain => "capture_drain",
             Self::RecordExplicitStop => "record_explicit_stop",
+            Self::HealthStart => "health_start",
+            Self::HealthStop => "health_stop",
         }
     }
 }
@@ -445,19 +456,73 @@ pub fn monitor_with_observer(
     stop: &StopToken,
     obs: &dyn MonitorObserver,
 ) -> Result<MonitorOutcome, TraitError> {
-    monitor_after_claim(state, process, config, stop, obs, &mut || Ok(()))
+    monitor_after_claim(state, process, config, stop, obs, None, &mut || Ok(()))
+}
+
+/// [`monitor_with_observer`] に healthcheck の周期実行（#2953・SUP-4）を加える。
+///
+/// 監視権の取得の後、`health` の周期実行を専用スレッドで起動し（`health` を `Starting` に戻す書き込みは監視権の取得と同じ
+/// 1 回で行い、前の世代の `Healthy` を残さない）、戻る前に必ず止めて回収する（期限は
+/// [`crate::healthcheck::HEALTH_STOP_LIMIT`]。超過したらスレッドを切り離して通知する）。終了検知では終了記録の前に止める。
+pub fn monitor_with_health(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    config: &MonitorConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
+    health: &HealthWiring,
+) -> Result<MonitorOutcome, TraitError> {
+    monitor_after_claim(state, process, config, stop, obs, Some(health), &mut || {
+        Ok(())
+    })
+}
+
+/// [`monitor_with_health`] の `Option` 版（[`crate::restart`] が世代ごとに呼ぶ。`None` なら従来どおり）。
+pub(crate) fn monitor_with_observer_health(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    config: &MonitorConfig,
+    stop: &StopToken,
+    obs: &dyn MonitorObserver,
+    health: Option<&HealthWiring>,
+) -> Result<MonitorOutcome, TraitError> {
+    monitor_after_claim(state, process, config, stop, obs, health, &mut || Ok(()))
+}
+
+/// 周期実行を止めて回収する（失敗・期限超過は通知のみ。監視は続ける。REPAIR-5）。
+fn stop_health(worker: &mut Option<HealthWorker>, obs: &dyn MonitorObserver) {
+    let Some(mut w) = worker.take() else {
+        return;
+    };
+    let _ = observed(obs, MonitorOperation::HealthStop, || {
+        match w.stop_and_join(HEALTH_STOP_LIMIT) {
+            HealthStopReport::Joined => Ok(()),
+            _ => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "healthcheck worker did not stop within the limit",
+            )),
+        }
+    });
+    w.drain_events(obs);
 }
 
 /// [`monitor_with_observer`] の本体。監視権の取得（`supervisor_pid` 記録）に成功した直後、待機ループへ入る前に
 /// `after_claim` を一度だけ呼ぶ。`after_claim` が `Err` なら記録済みの自 pid を戻して `Err` を返す。
 /// ログ捕捉（#241）を「監視権を得られた場合のみ」開始するための拡張点で、権限を得られなかった supervisor が
 /// 出力ストリームを消費しない（ログの欠落・重複を防ぐ）ことを保証する。
+///
+/// `health` が `Some` のとき、監視権の取得と同じ書き込みで `health` を `Starting` にし、`after_claim` の成功の後に
+/// 周期実行を起動する（#2953）。
+// 理由: 状態・起動ハンドル・設定・停止トークン・観測器・healthcheck 配線・準備の拡張点は、それぞれ別の差し替え点
+// （試験で偽物に替える）で、束ねる型を作ると呼び出し側の見通しが悪くなるため引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
 fn monitor_after_claim(
     state: &mut SupervisedState,
     process: &dyn LaunchedProcess,
     config: &MonitorConfig,
     stop: &StopToken,
     obs: &dyn MonitorObserver,
+    health: Option<&HealthWiring>,
     after_claim: &mut dyn FnMut() -> Result<(), TraitError>,
 ) -> Result<MonitorOutcome, TraitError> {
     let pid = process.pid();
@@ -478,9 +543,16 @@ fn monitor_after_claim(
             if rec.supervision().supervisor_pid().is_some() {
                 return Err(precondition("monitoring is already owned by a supervisor"));
             }
+            // healthcheck を回す世代は、監視権の取得と同じ書き込みで `Starting` に戻す（前の世代の `Healthy` が
+            // `depends_on` の待ちを誤って通す窓を作らない。SUP-4・#2953）。
+            let health_value = if health.is_some() {
+                Some(HealthStatus::Starting)
+            } else {
+                rec.health()
+            };
             Ok((
                 rec.status().clone(),
-                SupervisionState::new(Some(self_pid), rec.health(), rec.restart_count()),
+                SupervisionState::new(Some(self_pid), health_value, rec.restart_count()),
             ))
         })
     })?;
@@ -498,8 +570,26 @@ fn monitor_after_claim(
         };
     }
 
+    // 周期実行の起動。起動できなくても監視は続け、`Unhealthy` を記録して補う（healthcheck の不調でコンテナを止めない。
+    // `Healthy` を装わない fail-closed）。
+    let mut worker: Option<HealthWorker> = None;
+    if let Some(wiring) = health {
+        match observed(obs, MonitorOperation::HealthStart, || {
+            wiring.start_worker(state, process)
+        }) {
+            Ok(w) => worker = Some(w),
+            Err(_) => {
+                let _ = crate::health::record_health(state, process, HealthStatus::Unhealthy, obs);
+            }
+        }
+    }
+
     loop {
+        if let Some(w) = &worker {
+            w.drain_events(obs);
+        }
         if stop.is_stop_requested() {
+            stop_health(&mut worker, obs);
             let record = observed(obs, MonitorOperation::Stop, || {
                 release_supervisor_pid(state, pid, self_pid)
             })?;
@@ -511,6 +601,9 @@ fn monitor_after_claim(
             Ok(None) => continue,
             Ok(Some(exit)) => {
                 let detected_at = Instant::now();
+                // 終了記録より前に周期実行を止めて回収する（その後に `health` の書き込みが割り込まず、restart の
+                // 「終了記録の後に別の書き込みがあれば未記録」の判定が成り立つ。SUP-3・SUP-4）。
+                stop_health(&mut worker, obs);
                 let code = exit_code_of(exit);
                 let id = state.id().clone();
                 // 回収後は再 wait できないため、書き込み失敗でも終了状態を返す。
@@ -535,6 +628,7 @@ fn monitor_after_claim(
                 });
             }
             Err(wait_error) => {
+                stop_health(&mut worker, obs);
                 // 監視をやめるので、記録済みの自 pid を残さない。
                 return match observed(obs, MonitorOperation::ReleaseAfterWaitError, || {
                     release_supervisor_pid(state, pid, self_pid)
@@ -660,7 +754,7 @@ pub fn monitor_with_capture(
     // 監視権の取得後に捕捉を開始する。権限を得られない場合・開始失敗の場合に出力ストリームを消費しない。
     // `streams` は可変参照で受け、監視権の取得に成功した場合のみ中身を取り出す。取得失敗時は呼び出し側の手元に残る。
     let mut capture: Option<LogCapture> = None;
-    let monitored = monitor_after_claim(state, process, config, stop, obs, &mut || {
+    let monitored = monitor_after_claim(state, process, config, stop, obs, None, &mut || {
         capture = Some(observed(obs, MonitorOperation::CaptureStart, || {
             // 開始失敗時は streams が呼び出し側へ戻るため、捕捉を再試行できる。
             LogCapture::start_from(streams, Arc::clone(&sink))
@@ -1305,6 +1399,7 @@ mod tests {
             &MonitorConfig::default(),
             &StopToken::new(),
             &StderrLogObserver,
+            None,
             &mut || {
                 *store.conflicts.lock().unwrap() = 100;
                 Err(TraitError::new(ErrorCode::Internal, "fake start failure"))

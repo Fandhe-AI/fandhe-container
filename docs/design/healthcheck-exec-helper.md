@@ -80,8 +80,8 @@ helper の子孫（exec の worker、`FileAuditSink` が主経路のファイル
 
 ### reaper（`exec_reaper`）
 
-- やることは 3 つだけ: ① `PR_SET_CHILD_SUBREAPER`（core の `ChildSubreaper::enable`。立てられなければ helper を起動せず失敗）を立てて helper を起動する、② 自分の子（helper と再親付けされた孤児）を pid 指定の `waitpid(WNOHANG)` で、子が無くなる（`ECHILD` 相当）まで回収する、③ 止める合図で helper に SIGKILL を送る
-- ファイル I/O・監査・状態ストアには一切触れない（固まらない）。reaper の子は helper と再親付けされた孤児だけで、コンテナの PID 1 は supervisor の直下にあり reaper の子ではないので、他人の子を奪わない。`waitpid(-1)` は使わず（`unsafe` を足さないため）、`/proc/<reaper>/task/<tid>/children`（無ければ `/proc` の走査）で子を列挙し、1 件ずつ pid 指定で回収する。pidfd は回収前に開くので pid が再利用されても元の子を指す
+- やることは 3 つだけ: ① `PR_SET_CHILD_SUBREAPER`（core の `ChildSubreaper::enable`。立てられなければ helper を起動せず失敗）を立てて helper を起動する、② 自分の子（helper と再親付けされた孤児）を pid 指定の `waitpid(WNOHANG)` で回収し、helper を回収済みで、かつ `waitid(P_ALL, 0, .., WEXITED | WNOHANG | WNOWAIT)` が `ECHILD`（子が 1 つも無い。回収しない確認。`sys::has_any_child`）になるまで終わらない、③ 止める合図で helper に SIGKILL を送る
+- ファイル I/O・監査・状態ストアには一切触れない（固まらない）。reaper の子は helper と再親付けされた孤児だけで、コンテナの PID 1 は supervisor の直下にあり reaper の子ではないので、他人の子を奪わない。`waitpid(-1)` は使わず、`/proc/<reaper>/task/<tid>/children`（無ければ `/proc` の走査）で子を列挙し、1 件ずつ pid 指定で回収する。children ファイルは凍結されていないタスクでは不正確になり得る（カーネル文書）ため、列挙の空は終了の根拠にしない。終了判定は `waitid` の `ECHILD` で行い（確かめられない・失敗は待ち続ける側）、helper の回収後に children ファイルが空のときは `/proc` の ppid 走査との和集合で孤児を拾う。回収するのは pid 指定だけで、`waitid` は `WNOWAIT` なので何も回収しない（新しい `unsafe` は `sys` の `has_any_child` に閉じる）。pidfd は回収前に開くので pid が再利用されても元の子を指す
 - 終了コード: helper が成功で終わり孤児もすべて回収できれば 0、それ以外は 1（結果は helper が fd 2 に書いた行が正）
 
 ### 通常の終了

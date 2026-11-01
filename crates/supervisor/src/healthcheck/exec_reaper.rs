@@ -8,8 +8,9 @@
 //!
 //! # reaper がやること（これだけ。ファイル I/O・監査・状態ストアには触れない = 固まらない）
 //! 1. `PR_SET_CHILD_SUBREAPER` を立てて（core の `ChildSubreaper::enable`）helper を fork/exec する。
-//! 2. 自分の子（helper と再親付けされた孤児）を、pid 指定の `waitpid(WNOHANG)` で、子が無くなる（`ECHILD` 相当）まで
-//!    回収する。`waitpid(-1)` で他人の子を奪うことはない: reaper の子は helper と、その子孫の孤児だけで、コンテナの
+//! 2. 自分の子（helper と再親付けされた孤児）を、pid 指定の `waitpid(WNOHANG)` で回収する。終了は「helper を回収済み、
+//!    かつ `waitid(P_ALL, WNOHANG | WNOWAIT)` が `ECHILD`（子が 1 つも無い）」のときだけ。列挙（`/proc` の children
+//!    ファイル、無ければ ppid 走査）は不正確になり得るので終了判定には使わない。`waitpid(-1)` で他人の子を奪うことはない: reaper の子は helper と、その子孫の孤児だけで、コンテナの
 //!    PID 1 は supervisor の直下にあり、reaper の子ではない。
 //! 3. 止める合図を受けたら helper に SIGKILL を送る（自分の子で、回収前の `Child` に対してだけ送るので pid の再利用で
 //!    他人へ送らない）。その後も、孤児をすべて回収するまで終わらない。
@@ -68,6 +69,9 @@ trait ReaperOps {
     fn poll_helper(&mut self) -> Option<bool>;
     /// helper 以外の現在の子（再親付けされた孤児）の pid。
     fn orphans(&mut self) -> Vec<u32>;
+    /// 子（生存中・ゾンビを問わない。helper を含む）が 1 つでも残っているか。終了判定の正（`waitid` の `ECHILD`）。
+    /// 確かめられないときは `true`（待ち続ける側）へ倒す。
+    fn has_children(&mut self) -> bool;
     /// 孤児 `pid` を 1 回だけ回収する（待たない）。
     fn reap(&mut self, pid: u32);
     /// 刻みの待ち。
@@ -90,9 +94,11 @@ fn reap_loop(ops: &mut dyn ReaperOps) -> bool {
         for pid in &orphans {
             ops.reap(*pid);
         }
-        // 子が残っていなければ（`ECHILD` 相当）終わる。回収した直後の再確認で、同じ刻みの間に再親付けされた孤児も拾う。
+        // 終了は「helper を回収済み、かつ子が 1 つも無い（`waitid` が `ECHILD`）」のときだけ。列挙（`/proc` の
+        // children ファイル）はタスクが凍結されていないと不正確になり得るので、空の読みでは終わらない。
+        // 回収した直後の確認なので、同じ刻みの間に再親付けされた孤児も `has_children` が拾う。
         if let Some(success) = helper
-            && ops.orphans().is_empty()
+            && !ops.has_children()
         {
             return success;
         }
@@ -147,9 +153,19 @@ impl ReaperOps for RealOps {
         }
     }
 
+    fn has_children(&mut self) -> bool {
+        // 失敗（対応外 arch を含む）は待ち続ける側へ倒す。孤児を取りこぼして終わると回収経路が無いため。
+        crate::sys::has_any_child().unwrap_or(true)
+    }
+
     fn orphans(&mut self) -> Vec<u32> {
         let me = std::process::id();
         let mut pids = list_children(me);
+        // helper の回収後に children ファイルが空でも、子が残っていることは `has_children` が判定する。
+        // 取りこぼしを早く拾うため、このときだけ `/proc` の ppid 走査との和集合を取る。
+        if pids.is_empty() && self.helper_done {
+            pids = scan_proc_children(me);
+        }
         // helper 自身は `poll_helper` が回収する。
         if !self.helper_done {
             pids.retain(|p| *p != self.helper_pid);
@@ -201,6 +217,11 @@ fn list_children(pid: u32) -> Vec<u32> {
             .filter_map(|t| t.parse().ok())
             .collect();
     }
+    scan_proc_children(pid)
+}
+
+/// `/proc` を走査して ppid が `pid` のプロセスを集める（children ファイルが不正確・無いときの手段）。
+fn scan_proc_children(pid: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return out;
@@ -295,6 +316,9 @@ mod tests {
         helper_status: Option<bool>,
         orphan_script: VecDeque<Vec<u32>>,
         reaped: Vec<u32>,
+        last_orphans: Vec<u32>,
+        /// 列挙に現れなくても、この刻みになるまでは `has_children` が真（children ファイルの取りこぼしの模擬）。
+        hidden_children_until_tick: u32,
     }
 
     impl Fake {
@@ -309,6 +333,8 @@ mod tests {
                 helper_status: None,
                 orphan_script: VecDeque::new(),
                 reaped: Vec::new(),
+                last_orphans: Vec::new(),
+                hidden_children_until_tick: 0,
             }
         }
     }
@@ -332,7 +358,11 @@ mod tests {
             self.helper_status
         }
         fn orphans(&mut self) -> Vec<u32> {
-            self.orphan_script.pop_front().unwrap_or_default()
+            self.last_orphans = self.orphan_script.pop_front().unwrap_or_default();
+            self.last_orphans.clone()
+        }
+        fn has_children(&mut self) -> bool {
+            !self.last_orphans.is_empty() || self.ticks < self.hidden_children_until_tick
         }
         fn reap(&mut self, pid: u32) {
             self.reaped.push(pid);
@@ -348,17 +378,8 @@ mod tests {
     fn repair5_2441_reaper_reaps_reparented_orphans_before_exiting() {
         let mut f = Fake::new();
         f.helper_exit_at_tick = Some((1, true));
-        // 毎ループ 2 回呼ばれる `orphans()`（回収用・終了確認用）の戻り。孤児 77 が数刻み残ってから消える。
-        f.orphan_script = VecDeque::from(vec![
-            vec![],
-            vec![],
-            vec![77],
-            vec![77],
-            vec![77, 78],
-            vec![78],
-            vec![],
-            vec![],
-        ]);
+        // 毎ループ 1 回呼ばれる `orphans()` の戻り。孤児 77 が数刻み残ってから消える。
+        f.orphan_script = VecDeque::from(vec![vec![], vec![77], vec![77, 78], vec![78], vec![]]);
         assert!(reap_loop(&mut f));
         assert_eq!(f.killed, 0);
         assert!(f.reaped.contains(&77), "{:?}", f.reaped);
@@ -372,18 +393,7 @@ mod tests {
         let mut f = Fake::new();
         f.stop_after_ticks = Some(2);
         f.kill_makes_helper_exit = true;
-        f.orphan_script = VecDeque::from(vec![
-            vec![5],
-            vec![5],
-            vec![5],
-            vec![5],
-            vec![5, 6],
-            vec![5, 6],
-            vec![6],
-            vec![6],
-            vec![],
-            vec![],
-        ]);
+        f.orphan_script = VecDeque::from(vec![vec![5], vec![5], vec![5, 6], vec![6], vec![]]);
         assert!(!reap_loop(&mut f));
         assert_eq!(f.killed, 1);
         assert!(
@@ -401,6 +411,18 @@ mod tests {
         f.kill_makes_helper_exit = true;
         assert!(!reap_loop(&mut f));
         assert_eq!(f.killed, 1);
+    }
+
+    /// SUP-4・REPAIR-5（#2441）: 列挙が空でも `has_children` が真の間は終わらない。偽になった刻みで初めて終わる
+    /// （children ファイルの取りこぼしで、生存中の孤児を残したまま終わらない）。
+    #[test]
+    fn repair5_2441_reaper_does_not_exit_while_has_children_despite_empty_listing() {
+        let mut f = Fake::new();
+        f.helper_exit_at_tick = Some((0, true));
+        f.hidden_children_until_tick = 5;
+        assert!(reap_loop(&mut f));
+        assert_eq!(f.ticks, 5);
+        assert!(f.reaped.is_empty());
     }
 
     /// 孤児が無く helper が成功で終われば、そのまま `true`。

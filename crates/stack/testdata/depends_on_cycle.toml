@@ -1,0 +1,24 @@
+# 循環依存を含む合成フィクスチャ（STACK-2・TASK-150.1）。web -> api -> db -> web が閉路、cache は独立。
+[project]
+name = "cycle-demo"
+
+[services.web]
+image = "example/web:1"
+
+[services.web.depends_on]
+api = "started"
+
+[services.api]
+image = "example/api:1"
+
+[services.api.depends_on]
+db = "healthy"
+
+[services.db]
+image = "example/db:1"
+
+[services.db.depends_on]
+web = "started"
+
+[services.cache]
+image = "example/cache:1"

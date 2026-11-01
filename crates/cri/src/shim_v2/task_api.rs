@@ -1,4 +1,4 @@
-//! containerd Task API のメッセージ型（Create / Start / Delete / Exec 分。CRI-5・TASK-62.2・TASK-62.3.1・TASK-62.4・MS-7）。
+//! containerd Task API のメッセージ型（Create / Start / Delete / Exec / Wait 分。CRI-5・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・MS-7）。
 //!
 //! containerd の `api/runtime/task/v2/shim.proto`（commit `aefce4e7cdbf9a8ce754cd4edb1de5d44f0c704d`）と
 //! `api/types/mount.proto` のフィールド番号を prost の derive で手書きする。`.proto` は持ち込まない
@@ -121,6 +121,28 @@ pub struct DeleteResponse {
     pub exited_at: Option<Timestamp>,
 }
 
+/// `WaitRequest`（Wait RPC。TASK-62.3.2）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WaitRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// exec の ID。空でなければ exec の待ち（未対応）。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+}
+
+/// `WaitResponse`。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WaitResponse {
+    /// 終了コード。
+    #[prost(uint32, tag = "1")]
+    pub exit_status: u32,
+    /// 終了時刻。core が持たないため現状は常に未設定（REPAIR-3）。
+    #[prost(message, optional, tag = "2")]
+    pub exited_at: Option<Timestamp>,
+}
+
 /// `google.protobuf.Any`（`type_url` と `value` のみ。`Exec` の `spec` の運搬用）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Any {
@@ -231,6 +253,29 @@ mod tests {
         let bytes = d.encode_to_vec();
         assert_eq!(bytes, [0x08, 7, 0x10, 3, 0x1a, 4, 0x08, 1, 0x10, 2]);
         assert_eq!(DeleteResponse::decode(&bytes[..]).unwrap(), d);
+    }
+
+    /// CRI-5: Wait の固定バイト列と往復。
+    #[test]
+    fn cri5_wait_wire_bytes() {
+        let r = WaitRequest {
+            id: "a".into(),
+            exec_id: "e".into(),
+        };
+        assert_eq!(r.encode_to_vec(), [0x0a, 1, b'a', 0x12, 1, b'e']);
+        assert_eq!(WaitRequest::decode(&r.encode_to_vec()[..]).unwrap(), r);
+        let mut w = WaitResponse {
+            exit_status: 3,
+            exited_at: None,
+        };
+        assert_eq!(w.encode_to_vec(), [0x08, 3]);
+        w.exited_at = Some(Timestamp {
+            seconds: 1,
+            nanos: 2,
+        });
+        let bytes = w.encode_to_vec();
+        assert_eq!(bytes, [0x08, 3, 0x12, 4, 0x08, 1, 0x10, 2]);
+        assert_eq!(WaitResponse::decode(&bytes[..]).unwrap(), w);
     }
 
     /// CRI-5: ExecProcessRequest と Any の番号。

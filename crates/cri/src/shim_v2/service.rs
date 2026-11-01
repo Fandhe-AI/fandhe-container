@@ -3,7 +3,7 @@
 //! `server` が復号した [`TtrpcRequest`] を [`ServiceRegistry::dispatch`] へ渡し、
 //! サービス名で [`TtrpcService`] を引いて呼ぶ。未知のサービス・メソッドは `Unimplemented`。
 //! [`EmptyTaskService`] はどのメソッドにも `Unimplemented` を返す空の Task サービスで、ランタイム未注入の起動経路用。
-//! Create / Start / Delete を持つ実装は `task_service::TaskService`（TASK-62.2・TASK-62.3.1）。Wait 等は後続 issue（REPAIR-3）。
+//! Create / Start / Delete を持つ実装は `task_service::TaskService`（TASK-62.2・TASK-62.3.1）。Wait は TASK-62.3.2、State / Kill 等は後続 issue（REPAIR-3）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,6 +39,16 @@ pub trait TtrpcService: Send + Sync {
     fn name(&self) -> &str;
     /// メソッドを処理する。失敗は [`RpcStatus`] で返す。
     fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcStatus>;
+    /// 長く待つメソッド（Wait 等）向け。`cancelled` が真になったら（サーバー停止・接続切断）待ちを
+    /// 打ち切る契約（REPAIR-5）。既定は取り消しを見ない `handle`。
+    fn handle_cancellable(
+        &self,
+        method: &str,
+        payload: &[u8],
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        self.handle(method, payload)
+    }
 }
 
 /// 空の Task サービス。全メソッドに `Unimplemented` を返す。
@@ -109,10 +119,19 @@ impl ServiceRegistry {
 
     /// 要求を処理して応答を作る。
     pub fn dispatch(&self, req: &TtrpcRequest) -> TtrpcResponse {
+        self.dispatch_cancellable(req, &|| false)
+    }
+
+    /// 取り消し通知つきで要求を処理する（サーバーの接続ごとの並行 dispatch が使う）。
+    pub fn dispatch_cancellable(
+        &self,
+        req: &TtrpcRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> TtrpcResponse {
         let Some(svc) = self.services.get(&req.service) else {
             return status_response(unimplemented_status("service", &req.service));
         };
-        match svc.handle(&req.method, &req.payload) {
+        match svc.handle_cancellable(&req.method, &req.payload, cancelled) {
             Ok(payload) => TtrpcResponse {
                 status: None,
                 payload,

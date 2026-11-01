@@ -2,7 +2,9 @@
 //!
 //! 呼び出し元（将来は shim の起動経路。#803）が bind 済みの `UnixListener` を渡し、
 //! [`TtrpcServer::serve`] が accept スレッドを起こして [`ServerHandle`] を返す。
-//! 接続ごとに 1 スレッドで要求を順に処理する（unary のみなので多重化しない）。
+//! 接続ごとに 1 スレッドで要求を読み、dispatch は要求ごとのスレッド（接続あたり上限つき）で並行に行う。
+//! 応答の書き込みは接続内で直列化する。待ち中の Wait が後続の RPC を塞がず、サーバー停止・接続切断は
+//! ハンドラへ取り消しとして伝わる（TASK-62.3.2・REPAIR-5）。
 //! tokio の `net` は使わず std とスレッドで作る（依存・feature を足さない。#670）。
 //!
 //! 無期限の待ちを作らない（REPAIR-5）:
@@ -17,8 +19,8 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -467,11 +469,74 @@ fn resp_code(resp: &TtrpcResponse) -> Code {
         .map_or(Code::Ok, |st| Code::from(st.code))
 }
 
-fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
+/// 1 接続で同時に処理中にできる要求数の上限（REPAIR-5。超えた要求は `ResourceExhausted`）。
+const MAX_INFLIGHT_PER_CONN: usize = 16;
+
+/// 応答の書き込みを接続内で直列化して送る。失敗は計測して `false`。
+///
+/// 書き込みの失敗（フレームの途中のタイムアウトを含む）では応答の境界が壊れるため、接続を
+/// shutdown して `done` を立てる（読み取りループと他のハンドラが終了する）。失敗状態の確認は
+/// ロック内で行い、失敗後に別の書き手が書き始めて未完の本文へ連結するのを防ぐ。
+fn send_response(
+    ctx: &Ctx,
+    writer: &Mutex<UnixStream>,
+    done: &AtomicBool,
+    sid: u32,
+    resp: &TtrpcResponse,
+    started: Instant,
+) -> bool {
+    let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+    if done.load(Ordering::SeqCst) {
+        return false;
+    }
+    match write_response(&mut w, sid, resp, ctx) {
+        Ok(()) => true,
+        Err(e) => {
+            record_write_failure(ctx, &e, started);
+            done.store(true, Ordering::SeqCst);
+            let _ = w.shutdown(std::net::Shutdown::Both);
+            false
+        }
+    }
+}
+
+/// 処理中の要求数を戻す。
+struct InflightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 接続を処理する。要求は接続内で並行に dispatch し（Wait が後続の RPC を塞がないように。CRI-5・
+/// TASK-62.3.2）、応答の書き込みは `Mutex` で直列化する。接続が閉じる・サーバーが止まると
+/// 処理中のハンドラへ取り消しを伝え、スコープの終了で全スレッドの終了を待つ（REPAIR-5）。
+fn handle_conn(stream: UnixStream, ctx: &Ctx) {
     // 継承された non-blocking を解く（BSD 系の accept は listener の設定を引き継ぐ）。
     if stream.set_nonblocking(false).is_err() {
         return;
     }
+    let Ok(w) = stream.try_clone() else {
+        return;
+    };
+    let writer = Mutex::new(w);
+    let done = AtomicBool::new(false);
+    let inflight = AtomicUsize::new(0);
+    thread::scope(|s| {
+        conn_loop(stream, ctx, &writer, &done, &inflight, s);
+        done.store(true, Ordering::SeqCst);
+    });
+}
+
+fn conn_loop<'scope, 'env>(
+    mut stream: UnixStream,
+    ctx: &'env Ctx,
+    writer: &'env Mutex<UnixStream>,
+    done: &'env AtomicBool,
+    inflight: &'env AtomicUsize,
+    scope: &'scope thread::Scope<'scope, 'env>,
+) {
     let mut last_stream_id: u32 = 0;
     loop {
         let Some(first) = wait_first_byte(&mut stream, ctx) else {
@@ -507,9 +572,7 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                 };
                 let resp = status_response(code, msg);
                 record_op(ctx, CriOpKind::ShimV2Frame, resp_code(&resp), started);
-                if let Err(e) = write_response(&mut stream, raw_stream_id, &resp, ctx) {
-                    record_write_failure(ctx, &e, started);
-                }
+                send_response(ctx, writer, done, raw_stream_id, &resp, started);
                 drain_then_close(&mut stream, ctx);
                 return;
             }
@@ -552,7 +615,53 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
                             None
                         };
                         match decoded {
-                            Some(req) => (CriOpKind::ShimV2Dispatch, ctx.registry.dispatch(&req)),
+                            Some(req) => {
+                                if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT_PER_CONN
+                                {
+                                    inflight.fetch_sub(1, Ordering::SeqCst);
+                                    (
+                                        CriOpKind::ShimV2Dispatch,
+                                        status_response(
+                                            CriErrorCode::ResourceExhausted,
+                                            "too many in-flight requests",
+                                        ),
+                                    )
+                                } else {
+                                    let spawned = thread::Builder::new()
+                                        .name("ttrpc-req".into())
+                                        .spawn_scoped(scope, move || {
+                                            let _g = InflightGuard(inflight);
+                                            let cancelled = || {
+                                                ctx.stop.load(Ordering::SeqCst)
+                                                    || done.load(Ordering::SeqCst)
+                                            };
+                                            let resp = bound_response(
+                                                ctx.registry.dispatch_cancellable(&req, &cancelled),
+                                            );
+                                            record_op(
+                                                ctx,
+                                                CriOpKind::ShimV2Dispatch,
+                                                resp_code(&resp),
+                                                started,
+                                            );
+                                            send_response(ctx, writer, done, sid, &resp, started);
+                                        });
+                                    match spawned {
+                                        Ok(_) => continue,
+                                        // spawn 失敗時は closure ごと破棄され guard が戻らないため手で戻す。
+                                        Err(_) => {
+                                            inflight.fetch_sub(1, Ordering::SeqCst);
+                                            (
+                                                CriOpKind::ShimV2Dispatch,
+                                                status_response(
+                                                    CriErrorCode::Unavailable,
+                                                    "cannot start request handler",
+                                                ),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                             None => (
                                 CriOpKind::ShimV2Frame,
                                 status_response(CriErrorCode::InvalidArgument, "malformed request"),
@@ -564,8 +673,7 @@ fn handle_conn(mut stream: UnixStream, ctx: &Ctx) {
         };
         let resp = bound_response(resp);
         record_op(ctx, kind, resp_code(&resp), started);
-        if let Err(e) = write_response(&mut stream, sid, &resp, ctx) {
-            record_write_failure(ctx, &e, started);
+        if !send_response(ctx, writer, done, sid, &resp, started) {
             return;
         }
     }

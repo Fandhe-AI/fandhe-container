@@ -285,9 +285,147 @@ impl ControlServer {
     }
 }
 
+impl ControlServer {
+    /// 停止を要求し、`timeout` 内にスレッドが終わったことを確かめて join する（[`Self::shutdown`] と違い、
+    /// 止まらなければ `false` を返して切り離さない。呼び出し側は再 launch をしない。#2043・REPAIR-5）。
+    fn stop_confirmed(&mut self, timeout: Duration) -> bool {
+        self.stop.store(true, Ordering::SeqCst);
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        match self.done.recv_timeout(timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.handle = Some(handle);
+                false
+            }
+        }
+    }
+}
+
 impl Drop for ControlServer {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// 再 launch の間だけ accept ループを止められる制御チャネルのサーバ（#2043・SUP-3・CORE-1・SUP-1）。
+///
+/// restart の再 launch は core の本番 launcher が単一スレッド（`Threads: 1`）を要求するため、`control-channel` スレッドを
+/// [`Self::pause`] で止めて launch し、[`Self::resume`] で作り直す。listener は pause の間も bind したまま保持し、
+/// close・unlink・rebind をしない（パスの差し替えの窓を作らない）。pause の間に届いた接続は backlog に積まれ、resume の
+/// 後に同じ検証（`SO_PEERCRED`・期限・固定長 frame）で処理される。pause 中に届いた CancelRestartRequest は resume の後に
+/// 処理されるため、`Active` の状態で `ContainerRunning` になり得る（CLI は記録の読み直しとして扱う。`stop_delete` 参照）。
+pub struct PausableServer {
+    inner: std::sync::Mutex<PausableInner>,
+}
+
+struct PausableInner {
+    server: Option<ControlServer>,
+    listener: UnixListener,
+    slot: SignalSlot,
+    expected_uid: u32,
+    config: ServeConfig,
+    observer: Arc<ControlObserver>,
+}
+
+impl PausableServer {
+    /// accept ループのスレッドを起動する。`listener` は non-blocking にされる。
+    pub fn spawn(
+        listener: UnixListener,
+        slot: SignalSlot,
+        expected_uid: u32,
+        config: ServeConfig,
+        observer: Arc<ControlObserver>,
+    ) -> io::Result<Self> {
+        let keep = listener.try_clone()?;
+        let server = ControlServer::spawn(
+            listener,
+            slot.clone(),
+            expected_uid,
+            config,
+            Arc::clone(&observer),
+        )?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(PausableInner {
+                server: Some(server),
+                listener: keep,
+                slot,
+                expected_uid,
+                config,
+                observer,
+            }),
+        })
+    }
+
+    /// accept ループを止める（`timeout` 内に止まらなければ `Err`）。止まっていれば何もしない。
+    pub fn pause(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        use fandhe_container_core::traits::{ErrorCode, TraitError};
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(server) = inner.server.as_mut() else {
+            return Ok(());
+        };
+        if server.stop_confirmed(timeout) {
+            inner.server = None;
+            Ok(())
+        } else {
+            Err(TraitError::new(
+                ErrorCode::Timeout,
+                "control channel thread did not stop in time",
+            ))
+        }
+    }
+
+    /// [`Self::pause`] で止めた accept ループを、保持していた listener で作り直す。動いていれば何もしない。
+    pub fn resume(&self) -> Result<(), fandhe_container_core::traits::TraitError> {
+        use fandhe_container_core::traits::{ErrorCode, TraitError};
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.server.is_some() {
+            return Ok(());
+        }
+        let spawned = inner.listener.try_clone().and_then(|l| {
+            ControlServer::spawn(
+                l,
+                inner.slot.clone(),
+                inner.expected_uid,
+                inner.config,
+                Arc::clone(&inner.observer),
+            )
+        });
+        match spawned {
+            Ok(server) => {
+                inner.server = Some(server);
+                Ok(())
+            }
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Unavailable,
+                "failed to resume the control channel server",
+            )),
+        }
+    }
+
+    /// accept ループを止めて取り除く（後始末用。以後は [`Self::resume`] で作り直せる）。止まらなければ切り離す。
+    pub fn shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut server) = inner.server.take() {
+            server.shutdown();
+        }
+    }
+}
+
+impl super::target::RelaunchPause for PausableServer {
+    fn pause(&self, timeout: Duration) -> Result<(), fandhe_container_core::traits::TraitError> {
+        PausableServer::pause(self, timeout)
+    }
+
+    fn resume(&self) -> Result<(), fandhe_container_core::traits::TraitError> {
+        PausableServer::resume(self)
     }
 }
 

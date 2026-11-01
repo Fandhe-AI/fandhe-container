@@ -22,7 +22,7 @@
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
 //!    7. launcher の構築と [`SpecCapturingLauncher`] での包み／8. `oci_runtime::start`（**入口スレッドが直接行う**）／
-//!    9. `FCSUP1 OK <pid>` の報告／10. `SupervisedState::attach` → [`supervise_with_restart`]。
+//!    9. `FCSUP1 OK <pid>` の報告／10. `SupervisedState::attach` → [`supervise_with_restart_health`]。
 //!
 //! 手順 3・4 は cgroup の連鎖（手順 5）より前に置く。スコープの追記は 1 回限りで取り消す API が無いため、
 //! launcher が使えない場合や状態が Created でない場合に、スコープを残さずに止める。
@@ -64,11 +64,16 @@
 //!   （`delete` と再作成を促す）を報告する。回復に失敗したらそのエラーを報告し、予約は残る（再試行できる）。
 //!
 //! # 未実装・残余（REPAIR-3）
-//! - **restart の再 launch**: 本番 launcher の結線は済んでいる（start と同じ launcher と `LaunchSpec` を使う）が、
-//!   再 launch は `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれるため、本番 launcher が
-//!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
-//!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
-//!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
+//! - **restart の再 launch**（#2043・SUP-3・CORE-1）: start と同じ launcher と `LaunchSpec` を使い、`SelfBounded` の launcher は
+//!   監視ループのスレッド（入口スレッド）で直接呼ぶ（`fandhe-relaunch` スレッドを作らない）。再 launch の直前に、
+//!   制御チャネルの accept スレッド（`PausableServer::pause`）・捕捉と seccomp 通知のスレッド・`stderr_sink` の専用スレッドを
+//!   止め、スレッド数が 1 に落ち着くのを有界に待ってから launch し、成否に関わらず再開する。止められなければ launch せず
+//!   `RelaunchFailed`（fail-closed。core の `Threads: 1` の検査は弱めない）。
+//!   healthcheck の定期実行スレッドは monitor の 1 回の呼び出しの間だけ回り、monitor が戻る前に止めて回収する（#2953。
+//!   `run_supervised_with_health`）ため、再 launch の時点では居ない。期限内に止まらず残ったスレッドは `thread_settle` が
+//!   検出して再 launch を止める（fail-closed）。判定の本番アダプタは #2441。
+//!   pasta・netns holder 構成での restart の確認は #341・#3331。`legacy_tiocsti` の警告は supervisor からは再出力しない
+//!   （core が launch のたびに出す）。設計記録は `docs/design/restart-relaunch-single-thread.md`。
 //! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線も済み（#1902。
 //!   意図は立てない）。明示的な stop の意図の伝達（SUP-9）は実装済み
 //!   （#2162・#2440。制御チャネルの StopRequest が意図を立て、restart ループは再起動を取りやめて `Stopped` と「明示 stop 済み」を記録する）。
@@ -98,11 +103,12 @@ use fandhe_container_core::traits::{
 };
 
 use crate::deadline_store::{DeadlineStore, LateWrites};
+use crate::healthcheck::HealthWiring;
 use crate::log_pipeline::CaptureHub;
 use crate::logs::LogSink;
 use crate::restart::{
     LateOrphans, LauncherRelauncher, Relauncher, RestartConfig, RestartPolicy,
-    SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart,
+    SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart_health,
 };
 use crate::run::{MonitorConfig, StderrLogObserver, StopToken};
 use crate::seccomp_notify::SeccompNotifyHub;
@@ -172,6 +178,14 @@ pub trait StartDeps {
     /// 構築し、入口が起動・再起動のたびに listener を受け取ってハブへ渡す。既定は `None`（従来の ERRNO 版。通知なし）。
     fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
         None
+    }
+
+    /// restart の再 launch を単一スレッドで成り立たせるか（本番 launcher の `Threads: 1` の要求のため。#2043・SUP-3・CORE-1）。
+    ///
+    /// `true` を返す実装（本番）は、再 launch の直前に共有の stderr の専用スレッドを止め、スレッド数が 1 に落ち着くのを
+    /// 待ってから launch する。既定は `false`（フェイクの [`StartDeps`] は共有の出口を止めない）。
+    fn single_thread_relaunch(&self) -> bool {
+        false
     }
 
     /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
@@ -986,6 +1000,8 @@ struct Prepared {
     logs: Option<Arc<CaptureHub>>,
     /// seccomp の通知への応答ハブ。
     seccomp: Option<Arc<SeccompNotifyHub>>,
+    /// 再 launch を単一スレッドで成り立たせる（本番のみ。#2043）。
+    single_thread_relaunch: bool,
     /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
     claimed: Box<ClaimedStart>,
 }
@@ -1404,6 +1420,7 @@ fn prepare_start(
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     let seccomp = deps.seccomp_hub();
+    let single_thread_relaunch = deps.single_thread_relaunch();
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -1461,6 +1478,7 @@ fn prepare_start(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     })
 }
@@ -1479,6 +1497,7 @@ fn launch_prepared(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     } = prepared;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
@@ -1506,6 +1525,9 @@ fn launch_prepared(
                     }
                     if let Some(hub) = &seccomp {
                         relauncher = relauncher.with_seccomp(Arc::clone(hub));
+                    }
+                    if single_thread_relaunch {
+                        relauncher = relauncher.with_single_thread_launch();
                     }
                     Arc::new(relauncher)
                 }
@@ -1929,6 +1951,23 @@ pub fn run_supervised(
     timeouts: &StartTimeouts,
     stop: &StopToken,
 ) -> u8 {
+    run_supervised_with_health(store, id, running, restart, timeouts, stop, None)
+}
+
+/// [`run_supervised`] に healthcheck の周期実行（#2953・SUP-4・TASK-161）を加える。
+///
+/// `health` は起動オプション文書の healthcheck 定義から入口が組む配線（本番の probe は Linux の
+/// `ExecHealthProbeFactory`）。`None`（定義が無い）のときは従来どおり周期実行を起動せず、`health` も書かない。
+/// 周期実行は世代ごとに monitor が起動・停止する（`crate::restart::supervise_with_restart_health`）。
+pub fn run_supervised_with_health(
+    store: Arc<dyn StateStore>,
+    id: ContainerId,
+    running: Running,
+    restart: RestartPolicy,
+    timeouts: &StartTimeouts,
+    stop: &StopToken,
+    health: Option<HealthWiring>,
+) -> u8 {
     let Running {
         process,
         relauncher,
@@ -1977,7 +2016,15 @@ pub fn run_supervised(
         }
     }
     let code = supervise_running(
-        store, id, process, relauncher, instance, restart, timeouts, stop,
+        store,
+        id,
+        process,
+        relauncher,
+        instance,
+        restart,
+        timeouts,
+        stop,
+        health.as_ref(),
     );
     // コンテナの回収の後に畳む（利用者が消えて listener が Closed になり、スレッドが終わる）。
     if let Some(hub) = seccomp {
@@ -2003,6 +2050,7 @@ fn supervise_running(
     restart: RestartPolicy,
     timeouts: &StartTimeouts,
     stop: &StopToken,
+    health: Option<&HealthWiring>,
 ) -> u8 {
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
@@ -2037,7 +2085,7 @@ fn supervise_running(
             );
         }
     };
-    let outcome = supervise_with_restart(
+    let outcome = supervise_with_restart_health(
         &mut state,
         process,
         &relauncher,
@@ -2045,6 +2093,7 @@ fn supervise_running(
         &restart_config,
         stop,
         &StderrLogObserver,
+        health,
     );
     match outcome {
         Err(e) => {
@@ -2617,6 +2666,11 @@ mod linux {
     impl StartDeps for ProductionStartDeps {
         fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
             self.seccomp.clone()
+        }
+
+        /// 本番の core launcher は `Threads: 1` を要求するため、再 launch の直前に stderr の専用スレッドを止める（#2043）。
+        fn single_thread_relaunch(&self) -> bool {
+            true
         }
 
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を
@@ -3583,12 +3637,24 @@ mod linux {
             deadline,
             &pasta_logs,
         );
+        // healthcheck の定義があるときだけ周期実行の配線を組む(無ければ `None`: 何も起動せず `health` も書かない。
+        // SUP-4・#2953)。組めないとき(文書の検証済みの定義では通常起きない)は、オプション文書の読み込み失敗と同じく
+        // 手順 4 で起動前に止める(fail-closed)。
+        let mut health_wiring: Option<HealthWiring> = None;
         let deps = match options_result {
             // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
-            Ok((Some(options), recorded)) => Box::new(
-                deps.with_container_options(options)
-                    .with_options_generation(recorded),
-            ),
+            Ok((Some(options), recorded)) => {
+                match build_health_wiring(&options, &args.root, &args.id) {
+                    Ok(wiring) => {
+                        health_wiring = wiring;
+                        Box::new(
+                            deps.with_container_options(options)
+                                .with_options_generation(recorded),
+                        )
+                    }
+                    Err(e) => Box::new(deps.with_container_options_error(e)),
+                }
+            }
             Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
             Err(e) => Box::new(deps.with_container_options_error(e)),
         };
@@ -3617,12 +3683,40 @@ mod linux {
         // 記録先が無い構成は手順 4 で拒否済み(起動していない)ので、ここへ届くときは `Some`。
         let (running, control) =
             crate::control::install(&args.root, &args.id, running, &stop, audit);
-        let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
+        let code = run_supervised_with_health(
+            store,
+            args.id,
+            running,
+            args.restart,
+            &timeouts,
+            &stop,
+            health_wiring,
+        );
         // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
         let code = control.exit_code(code);
         // サーバスレッドを止めてからソケットを消す（RAII）。
         drop(control);
         ExitCode::from(code)
+    }
+
+    /// 起動オプションの healthcheck 定義から周期実行の配線を組む(定義が無ければ `None`。SUP-4・TASK-161・#2953)。
+    ///
+    /// 本番の probe は exec 専用 helper で実行する `ExecHealthProbeFactory`(#2441)。`root` は helper が状態を開く場所で、
+    /// supervisor の引数の状態ルートをそのまま使う(記録された pid を宛先に使わない: pidfd は起動ハンドルから複製する。SEC-1)。
+    fn build_health_wiring(
+        options: &ContainerOptions,
+        root: &Path,
+        id: &ContainerId,
+    ) -> Result<Option<HealthWiring>, TraitError> {
+        let Some(definition) = options.healthcheck() else {
+            return Ok(None);
+        };
+        let factory = Arc::new(crate::healthcheck::ExecHealthProbeFactory::new(
+            definition.clone(),
+            root.to_path_buf(),
+            id.clone(),
+        ));
+        HealthWiring::new(definition, factory).map(Some)
     }
 
     /// pasta 構成の準備段階(状態ルートの open と `@pasta/<id>/` の作成)の予算。

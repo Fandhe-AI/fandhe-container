@@ -12,6 +12,7 @@ healthcheck コマンドの `argv[0]` をどう解決するかと、timeout の�
 | `crates/supervisor/src/healthcheck/periodic.rs` | `HealthcheckSchedule::from_definition` が `timeout > MAX_POLL_INTERVAL` を `InvalidArgument` で拒否する。試験 `sup4_periodic_timeout_limit` が 60 秒受理・61 秒拒否を照合する |
 | `crates/supervisor/src/health.rs` | `probe_and_record`・`probe_aggregate_and_record` が同じ上限（`MAX_POLL_INTERVAL`）で拒否する。判定は `ProbeRunner` の排他区間で同時に最大 1 本 |
 | `crates/supervisor/src/run.rs` | `MAX_POLL_INTERVAL`（60 秒）は本来 monitor の `poll_interval` の上限で、probe の timeout 上限へ流用されている |
+| `crates/supervisor/src/healthcheck/exec_probe.rs` | 本番アダプタ `ExecHealthProbe::new` は argv[0] が絶対パスでなければ `InvalidArgument`（固定文言）で拒否する（PATH 探索なしの現行を保つ）。60 秒超の timeout は上の拒否のまま。helper の `--timeout-ms` も 60 秒が上限（#2441。`healthcheck-exec-helper.md`） |
 | `crates/supervisor/src/exec.rs` | `ExecRequest::new` の `path` はコンテナ内の絶対パスで、PATH 探索はしない。SUP-4 は healthcheck を exec（SUP-6）と同じ関数で実行することを求める |
 | `crates/core`（PR #2331・#2314） | `process.args[0]` が `/` を含まない名前なら `process.env` の `PATH` で pivot 後の rootfs 内だけを探索する。稼働中コンテナへの exec は絶対パスのみのままで、追跡 issue は見当たらない |
 

@@ -229,8 +229,7 @@ mod imp {
     pub(super) const RESOLVE: u64 =
         RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
 
-    /// blob 置き場の相対パス。
-    const BLOB_DIR: [&str; 2] = ["blobs", "sha256"];
+    use crate::image_management::IMAGE_STORE_BLOB_DIR as BLOB_DIR;
 
     /// blob 置き場の検査で使う文言（`usage::checked_dir` と同じ code・文言を保つ）。
     pub(super) fn blob_dir_not_plain() -> OciError {
@@ -466,13 +465,13 @@ mod imp {
             }
             let create_failed =
                 || OciError::new(OciErrorCode::Internal, "failed to create blob directory");
-            match at::mkdirat_name(self.inner.as_fd(), OsStr::new("blobs"), 0o700) {
+            match at::mkdirat_name(self.inner.as_fd(), OsStr::new(BLOB_DIR[0]), 0o700) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(_) => return Err(create_failed()),
             }
             let blobs = self.open_blobs_parent()?;
-            match at::mkdirat_name(blobs.as_fd(), OsStr::new("sha256"), 0o700) {
+            match at::mkdirat_name(blobs.as_fd(), OsStr::new(BLOB_DIR[1]), 0o700) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(_) => return Err(create_failed()),
@@ -487,8 +486,8 @@ mod imp {
 
         /// `blobs` を開く（symlink・非ディレクトリは `FailedPrecondition`）。
         fn open_blobs_parent(&self) -> Result<OwnedFd, OciError> {
-            let rel =
-                at::component_cstring(OsStr::new("blobs")).map_err(|_| blob_dir_stat_failed())?;
+            let rel = at::component_cstring(OsStr::new(BLOB_DIR[0]))
+                .map_err(|_| blob_dir_stat_failed())?;
             self.open_at(&rel, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0)
                 .map_err(|e| match errno(&e) {
                     Some(ELOOP | ENOTDIR) => blob_dir_not_plain(),
@@ -740,6 +739,7 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     use super::{OciError, OciErrorCode, PullDir, RootHandle, SubDirError, root_inaccessible};
+    use crate::image_management::IMAGE_STORE_BLOB_DIR;
     use crate::image_management::usage::{blob_dir, check_blob_dirs};
 
     fn opts_mode(opts: &mut OpenOptions) {
@@ -882,8 +882,10 @@ mod imp {
                 return Ok(b);
             }
             for dir in [
-                self.path.join("blobs"),
-                self.path.join("blobs").join("sha256"),
+                self.path.join(IMAGE_STORE_BLOB_DIR[0]),
+                self.path
+                    .join(IMAGE_STORE_BLOB_DIR[0])
+                    .join(IMAGE_STORE_BLOB_DIR[1]),
             ] {
                 #[cfg_attr(not(unix), allow(unused_mut))]
                 let mut b = fs::DirBuilder::new();
@@ -915,7 +917,7 @@ mod imp {
         pub(crate) fn sync_blobs_parent(&self) -> Result<(), OciError> {
             #[cfg(unix)]
             {
-                File::open(self.path.join("blobs"))
+                File::open(self.path.join(IMAGE_STORE_BLOB_DIR[0]))
                     .and_then(|d| d.sync_all())
                     .map_err(|_| {
                         OciError::new(

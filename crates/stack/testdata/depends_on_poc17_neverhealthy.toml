@@ -1,0 +1,12 @@
+# 合成フィクスチャ（STACK-2・TASK-150.5・#593）。PoC-17 の「healthy にならない依存先」の形。
+[project]
+name = "poc17-never-healthy"
+
+[services.neverdb]
+image = "example/db:1"
+
+[services.neverapp]
+image = "example/app:1"
+
+[services.neverapp.depends_on]
+neverdb = "healthy"

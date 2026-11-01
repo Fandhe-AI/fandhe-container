@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+use fandhe_container_core::traits::LaunchIsolationUpdate;
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, ExplicitStop, GetStateRequest,
     StateRecord, StateStore, SupervisionState, TraitError, UpdateStateRequest,
@@ -71,6 +72,14 @@ impl SupervisedState {
         Ok(Self { store, id, last })
     }
 
+    /// 同じストア・同じコンテナへ attach し直した別のハンドルを作る(最新のレコードを読む)。
+    ///
+    /// 周期実行(`healthcheck::run_periodic`)の専用スレッドが、監視ループとは別のハンドルで `health` を書くために使う
+    /// (SUP-4・#2953)。2 つのハンドルは revision の楽観的排他で競合し、不一致は呼び出し側の有限リトライが吸収する。
+    pub(crate) fn attach_sibling(&self) -> Result<Self, TraitError> {
+        Self::attach(Arc::clone(&self.store), self.id.clone())
+    }
+
     /// 対象コンテナの ID。
     pub fn id(&self) -> &ContainerId {
         &self.id
@@ -95,12 +104,12 @@ impl SupervisedState {
         status: ContainerStatus,
         supervision: SupervisionState,
     ) -> Result<&StateRecord, TraitError> {
-        self.write_with_isolation(status, supervision, None, None)
+        self.write_with_isolation(status, supervision, LaunchIsolationUpdate::Inherit, None)
     }
 
     /// restart の再 launch の記録用。`write` に加えて、再 launch が確定した分離の記録を渡されれば置き換える
-    /// （再 launch で mount namespace が作り直されるため。`None` は前の記録を引き継ぐ。トレイト契約 12。
-    /// SUP-6・SUP-3・#2007）。`rlimits` も同様に、再 launch が適用した全 16 種を渡されれば置き換える
+    /// （再 launch で mount namespace が作り直されるため。`None`（記録を持たない再 launch）は前の記録を消す。
+    /// 古い記録を残すと実際の分離と食い違うため。トレイト契約 12。SUP-6・SUP-3・CORE-2・#2007・#2238）。`rlimits` も同様に、再 launch が適用した全 16 種を渡されれば置き換える
     /// （`None` は前の記録を引き継ぐ。SUP-12・#2713）。
     pub fn write_relaunched(
         &mut self,
@@ -109,14 +118,18 @@ impl SupervisedState {
         launch_isolation: Option<LaunchIsolationRecord>,
         rlimits: Option<fandhe_container_core::rlimits::Rlimits>,
     ) -> Result<&StateRecord, TraitError> {
-        self.write_with_isolation(status, supervision, launch_isolation, rlimits)
+        let isolation = match launch_isolation {
+            Some(record) => LaunchIsolationUpdate::Replace(record),
+            None => LaunchIsolationUpdate::Clear,
+        };
+        self.write_with_isolation(status, supervision, isolation, rlimits)
     }
 
     fn write_with_isolation(
         &mut self,
         status: ContainerStatus,
         supervision: SupervisionState,
-        launch_isolation: Option<LaunchIsolationRecord>,
+        launch_isolation: LaunchIsolationUpdate,
         rlimits: Option<fandhe_container_core::rlimits::Rlimits>,
     ) -> Result<&StateRecord, TraitError> {
         if status.id() != &self.id {
@@ -127,8 +140,10 @@ impl SupervisedState {
         }
         let mut req =
             UpdateStateRequest::new(status, self.last.revision()).with_supervision(supervision);
-        if let Some(record) = launch_isolation {
-            req = req.with_launch_isolation(record);
+        match launch_isolation {
+            LaunchIsolationUpdate::Inherit => {}
+            LaunchIsolationUpdate::Replace(record) => req = req.with_launch_isolation(record),
+            LaunchIsolationUpdate::Clear => req = req.clear_launch_isolation(),
         }
         if let Some(set) = rlimits {
             req = req.with_rlimits(set);

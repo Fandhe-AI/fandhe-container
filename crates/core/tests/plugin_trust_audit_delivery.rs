@@ -6,20 +6,22 @@
 //! ファイルの JSON Lines まで具体値で照合する。root は使わない（既定のテスト集合で動く）。
 //!
 //! `FileAuditSink` は主経路のファイル I/O を fork した子プロセスで行うため、単一スレッドの `main`
-//! （`harness = false`）で動かす。待ちは `RECORD_WAIT_LIMIT` が上限（REPAIR-5）。Linux 以外は適用外。
+//! （`harness = false`）で動かす。待ちは `RECORD_WAIT_LIMIT` が上限（REPAIR-5）。Linux と macOS（#2429。主経路の macOS 版）で実行し、Windows は適用外。
+//! macOS の一時ディレクトリは `/var` が symlink のため、`canonicalize` した実体パスの下に作る（symlink の祖先は
+//! 信頼検査が拒否し、期待する理由 `group_or_other_writable` に届かない）。
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
-    println!("plugin_trust_audit_delivery: Linux only, not applicable on this OS");
+    println!("plugin_trust_audit_delivery: Linux and macOS only, not applicable on this OS");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
-    linux::run();
+    imp::run();
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod imp {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -42,8 +44,10 @@ mod linux {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
+            // macOS の `/var` は symlink。実体パスの下に作る（上の冒頭コメント）。
+            let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
             for attempt in 0..16u32 {
-                let path = std::env::temp_dir().join(format!(
+                let path = base.join(format!(
                     "fc-ptad-{tag}-{}-{nanos}-{attempt}",
                     std::process::id()
                 ));

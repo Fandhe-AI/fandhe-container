@@ -18,7 +18,7 @@
 //! <kind> <len>\n<len バイトの UTF-8>\n     (繰り返し)
 //! ```
 //!
-//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
+//! `kind` は閉じた語彙 `ulimit`・`env`・`ipc`・`shm-size`・`tmpfs`・`cap-drop`・`read-only`・`network`・`add-host`・`dns`・`pasta`・`publish`・`health-cmd`・`health-interval`・`health-timeout`・`health-start-period`・`health-retries`(+ 作成世代の `gen`)。`len` は 10 進(先頭 0 と `+` は不可)。
 //! 中身は Docker 構文の生の文字列で、復号のたびに既存のパーサ([`Ulimit::parse`] 等)へ通し直す(未信頼の入力として
 //! 検証する。値の改行を許すため、行区切りではなく長さ接頭辞にする)。符号化と復号を同じ型に置き、壊れた文書を
 //! 作れないようにする(REPAIR-2)。
@@ -43,6 +43,13 @@
 //! net の `PastaPortForwards::parse_all` で検証し直す。ユーザー定義名の `network` と組でなければ拒否する
 //! (rootless の pasta のみ。rootful は CLI が `UNIMPLEMENTED` にする。D13)。
 //!
+//! `health-*` は #2953(SUP-4・TASK-161)で足した kind で、版は上げない(同じ理由)。healthcheck の定義を持たせる:
+//! `health-cmd` は argv の 1 要素ずつの繰り返し(`MAX_COMMAND_ARGS` 件以下・合計 `MAX_COMMAND_BYTES` 以下)、
+//! `health-interval`・`health-timeout`・`health-start-period` は Docker 構文の時間文字列、`health-retries` は 10 進の整数文字列で、
+//! それぞれ 1 件まで。復号のたびに [`RawHealthcheck`] を組んで [`HealthcheckDefinition::parse`] と
+//! `HealthcheckSchedule::from_definition` に通し直す(timeout が 60 秒を超える定義はここで拒否する)。`health-cmd` が無く他の
+//! `health-*` だけがある文書は拒否する。CLI の `create` が書く処理は後続(未実装。書き手が無い間は本番の経路は動かない。REPAIR-3)。
+//!
 //! # 外部入力の扱い
 //!
 //! ファイル全体・レコード数・1 レコードの長さを、確保の前に上限と照合する。エラーは固定の英語文言で、値を含めない。
@@ -51,6 +58,11 @@
 use fandhe_container_core::capabilities::{MAX_DROP_NAME_BYTES, MAX_DROP_NAMES, parse_drop_list};
 use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+
+use crate::healthcheck::{
+    HealthcheckDefinition, HealthcheckSchedule, MAX_COMMAND_ARGS, MAX_COMMAND_BYTES,
+    MAX_DURATION_TEXT_BYTES, RawHealthcheck,
+};
 
 use super::env::{ENV_MAX_ENTRIES, ENV_MAX_ENTRY_BYTES, ENV_MAX_TOTAL_BYTES, EnvSet, EnvVar};
 use super::mounts::{MountOptions, ShmSize, TmpfsOption};
@@ -66,7 +78,7 @@ use fandhe_container_net::pasta::record::{PASTA_RECORD_MAX_BYTES, PastaRecord};
 pub const OPTIONS_DOC_MAGIC: &[u8] = b"FCOPT1\n";
 
 /// 文書全体の最大バイト数(env の合計上限に、ulimit・tmpfs・見出し行の余裕を足した値)。
-pub const OPTIONS_DOC_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES + 256 * 1024;
+pub const OPTIONS_DOC_MAX_BYTES: usize = ENV_MAX_TOTAL_BYTES + 256 * 1024 + HEALTH_DOC_RESERVE;
 
 /// `--ulimit` の最大件数(rlimit の種別は 16 種で、重複は拒否される)。
 pub const OPTIONS_MAX_ULIMITS: usize = 16;
@@ -93,7 +105,11 @@ const PASTA_RECORD_MAX: usize = PASTA_RECORD_MAX_BYTES;
 /// `publish` 1 件の最大バイト数(net の `MAX_PORT_FORWARD_SPEC_LEN`。#3200)。
 const PUBLISH_RECORD_MAX: usize = MAX_PORT_FORWARD_SPEC_LEN;
 /// 見出し行(`<kind> <len>`)の最大バイト数(最長の kind `shm-size` と 10 進 7 桁に十分な余裕)。
-const HEADER_LINE_MAX: usize = 24;
+const HEADER_LINE_MAX: usize = 32;
+/// healthcheck の kind 群が文書に足す上限の余裕(argv 合計 + 1 要素ごとの見出し + 他の 4 kind)。#2953。
+const HEALTH_DOC_RESERVE: usize = MAX_COMMAND_BYTES + 16 * 1024;
+/// `health-retries` の本文の最大バイト数(i64 の 10 進桁数に収まる)。
+const HEALTH_RETRIES_RECORD_MAX: usize = 20;
 /// `len` の最大桁数(`OPTIONS_DOC_MAX_BYTES` は 7 桁に収まる)。
 const LEN_DIGITS_MAX: usize = 7;
 
@@ -123,6 +139,16 @@ pub struct ContainerOptionsDocument {
     pasta: Option<String>,
     /// `--publish` の生の文字列(検証済み。NET-9・#3200)。
     publish: Vec<String>,
+    /// healthcheck の argv(1 要素ずつ。検証済み。SUP-4・#2953)。command の中身は `Debug` に出さない。
+    health_cmd: Vec<String>,
+    /// healthcheck の interval(生の時間文字列。検証済み)。
+    health_interval: Option<String>,
+    /// healthcheck の timeout(生の時間文字列。検証済み)。
+    health_timeout: Option<String>,
+    /// healthcheck の start_period(生の時間文字列。検証済み)。
+    health_start_period: Option<String>,
+    /// healthcheck の retries(10 進の整数文字列。検証済み)。
+    health_retries: Option<String>,
     /// 作成世代の識別子(状態記録の annotations と照合する。別の世代の残骸を適用しないため。#2713)。
     generation: Option<String>,
 }
@@ -148,6 +174,11 @@ impl std::fmt::Debug for ContainerOptionsDocument {
             .field("dns", &self.dns)
             .field("pasta", &self.pasta)
             .field("publish", &self.publish)
+            .field("health_cmd_args", &self.health_cmd.len())
+            .field("health_interval", &self.health_interval)
+            .field("health_timeout", &self.health_timeout)
+            .field("health_start_period", &self.health_start_period)
+            .field("health_retries", &self.health_retries)
             .field("generation", &self.generation)
             .finish()
     }
@@ -185,6 +216,11 @@ impl ContainerOptionsDocument {
             dns: Vec::new(),
             pasta: None,
             publish: Vec::new(),
+            health_cmd: Vec::new(),
+            health_interval: None,
+            health_timeout: None,
+            health_start_period: None,
+            health_retries: None,
             generation: None,
         };
         doc.check_record_lengths()?;
@@ -321,6 +357,38 @@ impl ContainerOptionsDocument {
         Ok(self)
     }
 
+    /// healthcheck の定義を持たせる(SUP-4・TASK-161・#2953)。`raw` の各項目は Docker 構文の生の文字列で、
+    /// [`HealthcheckDefinition::parse`] と `HealthcheckSchedule::from_definition` で検証する(復号でも同じ関門を通る)。
+    /// 文書全体の上限も再検査する。
+    pub fn with_healthcheck(self, raw: &RawHealthcheck) -> Result<Self, TraitError> {
+        self.with_health_records(HealthRecords::from_raw(raw)?)
+    }
+
+    fn with_health_records(mut self, record: HealthRecords) -> Result<Self, TraitError> {
+        record.validate()?;
+        self.health_cmd = record.cmd;
+        self.health_interval = record.interval;
+        self.health_timeout = record.timeout;
+        self.health_start_period = record.start_period;
+        self.health_retries = record.retries;
+        if self.encode().len() + GENERATION_RECORD_RESERVE > OPTIONS_DOC_MAX_BYTES {
+            return Err(invalid("options document is too large"));
+        }
+        Ok(self)
+    }
+
+    /// 検証済みの healthcheck の定義(`health-cmd` が無ければ `None`)。
+    pub fn healthcheck(&self) -> Result<Option<HealthcheckDefinition>, TraitError> {
+        HealthRecords {
+            cmd: self.health_cmd.clone(),
+            interval: self.health_interval.clone(),
+            timeout: self.health_timeout.clone(),
+            start_period: self.health_start_period.clone(),
+            retries: self.health_retries.clone(),
+        }
+        .validate()
+    }
+
     /// `pasta` があるなら `network` はユーザー定義名でなければならない(それ以外では pasta を使わない)。
     fn check_pasta_network(&self) -> Result<(), TraitError> {
         if self.pasta.is_none() {
@@ -411,6 +479,11 @@ impl ContainerOptionsDocument {
             && self.dns.is_empty()
             && self.pasta.is_none()
             && self.publish.is_empty()
+            && self.health_cmd.is_empty()
+            && self.health_interval.is_none()
+            && self.health_timeout.is_none()
+            && self.health_start_period.is_none()
+            && self.health_retries.is_none()
     }
 
     /// 検証済みの [`ContainerOptions`] へ変換する(label・secrets・configs は含まない)。
@@ -455,6 +528,9 @@ impl ContainerOptionsDocument {
             .with_read_only(self.read_only)
             .with_network(network);
         self.check_pasta_network()?;
+        if let Some(def) = self.healthcheck()? {
+            options = options.with_healthcheck(def);
+        }
         // 矛盾する指定(ファイルを読まない検査)をここで拒否する。
         options.tmpfs_set()?;
         Ok(options)
@@ -517,6 +593,21 @@ impl ContainerOptionsDocument {
         for s in &self.publish {
             put("publish", s);
         }
+        for s in &self.health_cmd {
+            put("health-cmd", s);
+        }
+        if let Some(s) = &self.health_interval {
+            put("health-interval", s);
+        }
+        if let Some(s) = &self.health_timeout {
+            put("health-timeout", s);
+        }
+        if let Some(s) = &self.health_start_period {
+            put("health-start-period", s);
+        }
+        if let Some(s) = &self.health_retries {
+            put("health-retries", s);
+        }
         if let Some(s) = &self.generation {
             put("gen", s);
         }
@@ -541,6 +632,8 @@ impl ContainerOptionsDocument {
         let (mut ipc, mut shm_size): (Option<String>, Option<String>) = (None, None);
         let mut pasta: Option<String> = None;
         let mut generation: Option<String> = None;
+        let mut health = HealthRecords::default();
+        let mut health_cmd_bytes: usize = 0;
         // 全体の上限があるため、レコード数は `new` の件数検査と合わせて有限。
         while !rest.is_empty() {
             let line_end = rest
@@ -578,6 +671,11 @@ impl ContainerOptionsDocument {
                 "dns" => DNS_RECORD_MAX,
                 "pasta" => PASTA_RECORD_MAX,
                 "publish" => PUBLISH_RECORD_MAX,
+                "health-cmd" => MAX_COMMAND_BYTES,
+                "health-interval" | "health-timeout" | "health-start-period" => {
+                    MAX_DURATION_TEXT_BYTES
+                }
+                "health-retries" => HEALTH_RETRIES_RECORD_MAX,
                 "gen" => GENERATION_MAX,
                 _ => return Err(invalid("options record has an unknown kind")),
             };
@@ -613,6 +711,24 @@ impl ContainerOptionsDocument {
                         return Err(invalid("an options record is duplicated"));
                     }
                 }
+                "health-cmd" => {
+                    health_cmd_bytes = health_cmd_bytes.saturating_add(text.len());
+                    if health_cmd_bytes > MAX_COMMAND_BYTES {
+                        return Err(invalid("an options record is too long"));
+                    }
+                    health.cmd.push(text);
+                }
+                "health-interval" | "health-timeout" | "health-start-period" | "health-retries" => {
+                    let slot = match kind {
+                        "health-interval" => &mut health.interval,
+                        "health-timeout" => &mut health.timeout,
+                        "health-start-period" => &mut health.start_period,
+                        _ => &mut health.retries,
+                    };
+                    if slot.replace(text).is_some() {
+                        return Err(invalid("an options record is duplicated"));
+                    }
+                }
                 "gen" => {
                     if generation.replace(text).is_some() {
                         return Err(invalid("an options record is duplicated"));
@@ -638,6 +754,7 @@ impl ContainerOptionsDocument {
                 || add_hosts.len() > MAX_ADD_HOST_ENTRIES
                 || dns.len() > MAX_DNS_SERVERS
                 || publish.len() > MAX_PORT_PUBLISHES
+                || health.cmd.len() > MAX_COMMAND_ARGS
             {
                 return Err(invalid("too many options records"));
             }
@@ -650,11 +767,77 @@ impl ContainerOptionsDocument {
             .with_read_only(read_only)?
             .with_network(network, add_hosts, dns)?
             .with_pasta(pasta)?
-            .with_publish(publish)?;
+            .with_publish(publish)?
+            .with_health_records(health)?;
         match generation {
             Some(g) => doc.with_generation(g),
             None => Ok(doc),
         }
+    }
+}
+
+/// 文書が持つ healthcheck の生のレコード群(検証は [`HealthRecords::validate`])。
+#[derive(Default)]
+struct HealthRecords {
+    cmd: Vec<String>,
+    interval: Option<String>,
+    timeout: Option<String>,
+    start_period: Option<String>,
+    retries: Option<String>,
+}
+
+impl HealthRecords {
+    fn from_raw(raw: &RawHealthcheck) -> Result<Self, TraitError> {
+        if raw.command.len() > MAX_COMMAND_ARGS
+            || raw.command.iter().map(String::len).sum::<usize>() > MAX_COMMAND_BYTES
+        {
+            return Err(invalid("an options record is too long"));
+        }
+        if [&raw.interval, &raw.timeout, &raw.start_period]
+            .into_iter()
+            .flatten()
+            .any(|s| s.len() > MAX_DURATION_TEXT_BYTES)
+        {
+            return Err(invalid("an options record is too long"));
+        }
+        Ok(Self {
+            cmd: raw.command.clone(),
+            interval: raw.interval.clone(),
+            timeout: raw.timeout.clone(),
+            start_period: raw.start_period.clone(),
+            retries: raw.retries.map(|n| n.to_string()),
+        })
+    }
+
+    /// 検証する。`health-cmd` が無く他の項目だけがあるなら拒否。何も無ければ `None`。
+    /// timeout が周期実行の上限(60 秒)を超える定義も拒否する(start の手順 2c で fail-closed に止める)。
+    fn validate(&self) -> Result<Option<HealthcheckDefinition>, TraitError> {
+        if self.cmd.is_empty() {
+            if self.interval.is_some()
+                || self.timeout.is_some()
+                || self.start_period.is_some()
+                || self.retries.is_some()
+            {
+                return Err(invalid("health options require a health-cmd record"));
+            }
+            return Ok(None);
+        }
+        let retries = match &self.retries {
+            Some(text) => Some(
+                text.parse::<i64>()
+                    .map_err(|_| invalid("a health-retries record is invalid"))?,
+            ),
+            None => None,
+        };
+        let def = HealthcheckDefinition::parse(&RawHealthcheck {
+            command: self.cmd.clone(),
+            interval: self.interval.clone(),
+            timeout: self.timeout.clone(),
+            start_period: self.start_period.clone(),
+            retries,
+        })?;
+        HealthcheckSchedule::from_definition(&def)?;
+        Ok(Some(def))
     }
 }
 
@@ -1385,5 +1568,103 @@ tmpfs 14\n/run:rw,noexec\n";
             e.message(),
             "publish records require a user-defined network"
         );
+    }
+
+    fn health_raw() -> RawHealthcheck {
+        RawHealthcheck {
+            command: vec!["/bin/true".into(), "-x".into()],
+            interval: Some("20ms".into()),
+            timeout: Some("1s".into()),
+            start_period: Some("0s".into()),
+            retries: Some(2),
+        }
+    }
+
+    /// SUP-4(#2953): `health-*` は符号化の具体値・往復・変換後の定義が一致し、旧文書(health 無し)も読める。
+    #[test]
+    fn sup4_2953_health_records_encode_exact_round_trip_and_convert() {
+        let d = ContainerOptionsDocument::default()
+            .with_healthcheck(&health_raw())
+            .expect("health");
+        assert_eq!(
+            d.encode(),
+            b"FCOPT1\nhealth-cmd 9\n/bin/true\nhealth-cmd 2\n-x\nhealth-interval 4\n20ms\nhealth-timeout 2\n1s\nhealth-start-period 2\n0s\nhealth-retries 1\n2\n".to_vec()
+        );
+        assert_eq!(
+            ContainerOptionsDocument::decode(&d.encode()).expect("decode"),
+            d
+        );
+        let def = d
+            .to_container_options()
+            .expect("options")
+            .healthcheck()
+            .cloned()
+            .expect("definition");
+        assert_eq!(def.command(), ["/bin/true", "-x"]);
+        assert_eq!(def.retries().get(), 2);
+        assert_eq!(def.interval(), std::time::Duration::from_millis(20));
+        assert!(
+            doc()
+                .to_container_options()
+                .unwrap()
+                .healthcheck()
+                .is_none()
+        );
+        assert!(!d.is_empty());
+    }
+
+    /// SUP-4(#2953): `health-cmd` 無しの他 kind・重複・timeout 61s・不正な retries は拒否する。
+    #[test]
+    fn sup4_2953_health_records_rejections() {
+        for raw in [
+            &b"FCOPT1\nhealth-retries 1\n2\n"[..],
+            b"FCOPT1\nhealth-cmd 1\n/\nhealth-retries 1\n2\nhealth-retries 1\n3\n",
+            b"FCOPT1\nhealth-cmd 1\n/\nhealth-interval 2\n1s\nhealth-interval 2\n2s\n",
+            b"FCOPT1\nhealth-cmd 1\n/\nhealth-timeout 3\n61s\n",
+            b"FCOPT1\nhealth-cmd 1\n/\nhealth-retries 2\n-1\n",
+            b"FCOPT1\nhealth-cmd 1\n/\nhealth-retries 1\nx\n",
+            b"FCOPT1\nhealth-cmd 3\nCMD\n",
+        ] {
+            let e = decode_err(raw);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{raw:?}");
+        }
+    }
+
+    /// SUP-4(#2953): 最長の見出し(`health-start-period` + 7 桁)を受理し、argv の件数上限 +1 は拒否する。
+    #[test]
+    fn sup4_2953_health_header_limit_and_arg_limit() {
+        assert_eq!("health-start-period 9999999".len(), 27);
+        let mut raw = RawHealthcheck {
+            command: vec!["a".into(); MAX_COMMAND_ARGS],
+            ..RawHealthcheck::default()
+        };
+        let d = ContainerOptionsDocument::default()
+            .with_healthcheck(&raw)
+            .expect("max args");
+        assert_eq!(
+            ContainerOptionsDocument::decode(&d.encode()).expect("decode"),
+            d
+        );
+        raw.command.push("a".into());
+        let e = ContainerOptionsDocument::default()
+            .with_healthcheck(&raw)
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let mut enc = d.encode();
+        enc.extend_from_slice(b"health-cmd 1\na\n");
+        assert_eq!(decode_err(&enc).code(), ErrorCode::InvalidArgument);
+    }
+
+    /// SUP-4(#2953): `Debug` に command の中身を出さない。
+    #[test]
+    fn sup4_2953_health_debug_redacts_command() {
+        let raw = RawHealthcheck {
+            command: vec!["/bin/secret-token-xyz".into()],
+            ..RawHealthcheck::default()
+        };
+        let d = ContainerOptionsDocument::default()
+            .with_healthcheck(&raw)
+            .expect("health");
+        assert!(!format!("{d:?}").contains("secret-token-xyz"));
     }
 }

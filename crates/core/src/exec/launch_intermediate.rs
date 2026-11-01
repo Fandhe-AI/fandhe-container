@@ -584,7 +584,7 @@ pub(crate) struct IntermediateSpec<'a> {
 /// 後、C の側で 1 回だけ、host の値が `1` のときに固定の 1 行を C の stderr へ出す(従来経路
 /// `spawn_container_with_stages` と同じ契約。観測のみで起動の可否は変えない)。fork 前の拒否(複数スレッド・pipe・
 /// fork の失敗)では出さない。出力は待たず(AF_UNIX の socket 以外へは書かない)、報告を読む期限を食わない。
-/// restart の再 launch(#2043)が本入口を通れば launch のたびに 1 行出る(host のグローバルな値の観測のため)。
+/// restart の再 launch(#2043)も本入口を通るため launch のたびに 1 行出る(supervisor は再出力しない)(host のグローバルな値の観測のため)。
 /// stderr が AF_UNIX の socket でない構成(CLI の `start` は null)では捨てられるため、supervisor が start の成功後に
 /// 同じ観測を自分のログ(`@supervisor-logs`)へも残す。
 pub(crate) fn spawn_container_via_intermediate(

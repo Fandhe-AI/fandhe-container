@@ -9,9 +9,10 @@
 //! - 周期実行は [`probe_aggregate_and_record`]（retries・start_period の集約を通して書く。TASK-161.3・#496）と
 //!   [`record_starting`]（開始時の `Starting`）を使う。[`probe_and_record`] は 1 回分の素の判定と記録で、
 //!   Err で即降格・同じ値でも毎回書く従来の挙動を保つ。集約の経路は Err でも `Healthy` を retries まで保つ。
-//! - **未実装**: healthcheck コマンドの実行、`monitor` ループからの呼び出し（周期実行は `crate::healthcheck::run_periodic`・#495 で実装済み。コマンドの実行は #2441）。
-//!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
-//!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
+//! - `monitor` ループからの呼び出しは #2953 で実装済み（`crate::run::monitor_with_health`。周期実行は monitor の 1 回の呼び出しの
+//!   間だけ専用スレッドで回り、`crate::healthcheck::HealthWiring` が配線する）。周期実行は `crate::healthcheck::run_periodic`（#495）、
+//!   コマンドの実行の本番アダプタ `crate::healthcheck::ExecHealthProbe`（#2441。Linux）。
+//!   周期実行の停止は [`ProbeRunner::cancel_in_flight`] で実行中の試行の旗を立てて止める。
 //!   healthcheck 定義の検証・シェル連結の禁止は [`crate::healthcheck`]（TASK-161.1）で決定済み。
 //!   コマンド出力のログ出力の扱いは TASK-161 の後続で決める。
 //! - スタブは `Healthy` を返さない。未検査のコンテナを healthy と公開すると `depends_on` の待ち合わせを
@@ -105,9 +106,47 @@ pub trait HealthProbe: Send + Sync {
     /// REPAIR-5）。ただし実装が守らなくても、呼び出し側は `timeout` で待ちを打ち切る（[`probe_and_record`]）。
     fn probe(&self, timeout: Duration) -> Result<HealthStatus, TraitError>;
 
+    /// [`Self::probe`] と同じ判定を、試行ごとの [`ProbeCancel`] つきで行う。[`ProbeRunner`] はこちらを呼ぶ。
+    ///
+    /// 実装は `cancel` が立ったら待ちを打ち切って子プロセスを回収する。`cancel` は試行ごとに新しく作られ、
+    /// 遅れて届いた前の回の cancel が次の回を汚さず、今回の cancel を開始時に消すこともない（SUP-4・REPAIR-5）。
+    /// 既定は `cancel` を無視して [`Self::probe`] を呼ぶ（[`Self::cancel`] だけで止める従来の実装向け）。
+    fn probe_cancellable(
+        &self,
+        timeout: Duration,
+        cancel: &ProbeCancel,
+    ) -> Result<HealthStatus, TraitError> {
+        let _ = cancel;
+        self.probe(timeout)
+    }
+
     /// 期限超過で呼び出し側が待ちを打ち切ったときに呼ばれる。実装は実行中の子プロセスを kill して回収する
     /// （孤児・ゾンビを残さない。REPAIR-5）。既定は何もしない（子プロセスを持たない実装向け）。
     fn cancel(&self) {}
+}
+
+/// 1 回の probe 試行に紐づく cancel の旗（試行ごとに新しく作る。`clone` は同じ旗を共有する）。
+///
+/// [`ProbeRunner`] が試行の開始時に作ってワーカーへ渡し、期限超過時に同じ旗を立てる。旗は試行をまたいで
+/// 使い回さないため、遅れた cancel と開始時のクリアの競合が起きない（SUP-4・REPAIR-5）。
+#[derive(Debug, Clone, Default)]
+pub struct ProbeCancel(Arc<AtomicBool>);
+
+impl ProbeCancel {
+    /// 立っていない旗を新しく作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// この試行の cancel を立てる（すぐ戻る）。
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// この試行に cancel が出ているか。
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// コマンド実行が未実装であることを示すスタブ。常に `Unimplemented` を返す（`Healthy` を装わない。REPAIR-3）。
@@ -240,6 +279,8 @@ pub struct ProbeRunner {
     in_flight: Arc<InFlight>,
     /// [`probe_and_record`] の 1 呼び出しが判定〜記録の区間を保持している間 `true`。
     busy: Arc<AtomicBool>,
+    /// 実行中の試行の [`ProbeCancel`](試行の間だけ `Some`。[`Self::cancel_in_flight`] が外から立てる。#2953)。
+    current: Arc<std::sync::Mutex<Option<ProbeCancel>>>,
 }
 
 /// [`ProbeRunner`] の排他区間を保持する RAII ガード（判定・記録・降格の間ずっと保持する。panic でも解放される）。
@@ -262,7 +303,30 @@ impl ProbeRunner {
             probe,
             in_flight: Arc::new(InFlight::default()),
             busy: Arc::new(AtomicBool::new(false)),
+            current: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 実行中の試行があれば、その [`ProbeCancel`] の旗を立てる(待たない。[`HealthProbe::cancel`] は呼ばない)。
+    ///
+    /// 周期実行の停止要求(monitor の終了検知・stop・restart。SUP-4・REPAIR-5・#2953)が、`timeout`(最大 60 秒)の
+    /// 満了を待たずに実行中の probe を止めるための口。旗を見る実装(`ExecHealthProbe` 等)は子プロセスを回収して戻る。
+    /// 試行が無ければ何もしない。旗は試行ごとに新しいため、後続の試行を汚さない。
+    pub fn cancel_in_flight(&self) {
+        let guard = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancel) = guard.as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    fn set_current(&self, attempt: Option<ProbeCancel>) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = attempt;
     }
 
     /// 排他区間を待たずに取得する。別の呼び出しが保持中なら `None`（確認と取得は不可分。REPAIR-5）。
@@ -279,7 +343,9 @@ impl ProbeRunner {
     }
 
     /// `cancel` を別スレッドで呼び、`timeout` までしか待たない。戻らない cancel も未終了として計数する。
-    fn cancel_bounded(&self, timeout: Duration) {
+    fn cancel_bounded(&self, timeout: Duration, attempt: &ProbeCancel) {
+        // この試行の旗は同期的に立てる（以降の試行には影響しない）。実装の `cancel` は従来どおり別スレッドで呼ぶ。
+        attempt.cancel();
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&self.probe);
         let guard = InFlightGuard::acquire(&self.in_flight);
@@ -319,27 +385,32 @@ impl ProbeSession<'_> {
         };
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&runner.probe);
-        std::thread::Builder::new()
+        let attempt = ProbeCancel::new();
+        let worker_attempt = attempt.clone();
+        runner.set_current(Some(attempt.clone()));
+        let spawned = std::thread::Builder::new()
             .name("healthcheck-probe".to_owned())
             .spawn(move || {
                 // ローカル変数は宣言の逆順に破棄される。panic 時も計数の解放が送信側の切断より先になるよう、
                 // `tx` を先に束縛する。
                 let tx = tx;
                 let guard = guard;
-                let result = worker.probe(timeout);
+                let result = worker.probe_cancellable(timeout, &worker_attempt);
                 // 結果を渡す前に計数を戻す。受信した呼び出し側が戻った直後の次の判定を、終了処理中の
                 // このスレッドが誤って `Unavailable` にしないため（次の判定は排他区間の解放後にしか始まらない）。
                 drop(guard);
                 // 受信側が打ち切り済みなら送信失敗になるが、結果は不要なので無視する。
                 let _ = tx.send(result);
             })
-            .map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe")
-            })?;
-        match rx.recv_timeout(timeout) {
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to spawn healthcheck probe"));
+        if let Err(e) = spawned {
+            runner.set_current(None);
+            return Err(e);
+        }
+        let result = match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
-                runner.cancel_bounded(timeout);
+                runner.cancel_bounded(timeout, &attempt);
                 // 回収の確認: cancel の効果で probe が戻れば結果は破棄してスレッドを手放す。
                 let _ = rx.recv_timeout(timeout);
                 Err(TraitError::new(
@@ -351,7 +422,10 @@ impl ProbeSession<'_> {
                 ErrorCode::Internal,
                 "healthcheck probe terminated abnormally",
             )),
-        }
+        };
+        // 試行の終了後は外からの cancel の対象にしない(旗は試行ごとの使い捨て)。
+        runner.set_current(None);
+        result
     }
 }
 
@@ -997,6 +1071,64 @@ mod tests {
         assert_eq!(e.error().code(), ErrorCode::Timeout);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
         assert_eq!(s.record().health(), Some(HealthStatus::Unhealthy));
+    }
+
+    /// 試行ごとの旗を記録する probe。1 回目は旗が立つまで待ち（上限 5 秒）、2 回目以降は開始時の旗を記録して戻る。
+    struct AttemptProbe {
+        calls: AtomicU32,
+        seen_cancelled_at_start: Mutex<Vec<bool>>,
+    }
+
+    impl HealthProbe for AttemptProbe {
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            Ok(HealthStatus::Healthy)
+        }
+        fn probe_cancellable(
+            &self,
+            _: Duration,
+            cancel: &ProbeCancel,
+        ) -> Result<HealthStatus, TraitError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen_cancelled_at_start
+                .lock()
+                .unwrap()
+                .push(cancel.is_cancelled());
+            if n == 0 {
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Ok(HealthStatus::Healthy)
+        }
+    }
+
+    /// SUP-4・REPAIR-5: 試行ごとに新しい旗を渡すので、前の回の cancel は次の回に届かない。
+    #[test]
+    fn repair5_attempt_cancel_is_not_shared_between_attempts() {
+        let probe = Arc::new(AttemptProbe {
+            calls: AtomicU32::new(0),
+            seen_cancelled_at_start: Mutex::new(Vec::new()),
+        });
+        let runner = ProbeRunner::new(probe.clone());
+        let session = runner.try_begin().unwrap();
+        let first = session.run(Duration::from_millis(100));
+        assert_eq!(first.unwrap_err().code(), ErrorCode::Timeout);
+        // 1 回目のワーカーは旗が立って戻る。終了を待ってから 2 回目を始める（有界）。
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while runner.unfinished() != 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runner.unfinished(), 0);
+        assert_eq!(
+            session.run(Duration::from_secs(5)),
+            Ok(HealthStatus::Healthy)
+        );
+        assert_eq!(
+            *probe.seen_cancelled_at_start.lock().unwrap(),
+            vec![false, false]
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
     }
 
     /// SUP-1: 所有権がなければ probe を実行しない。

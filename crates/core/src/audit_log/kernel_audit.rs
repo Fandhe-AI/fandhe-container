@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     fn failing_primary() -> AuditFileWriter {
-        let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let f = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
         AuditFileWriter::from_file_unchecked(f)
     }
 

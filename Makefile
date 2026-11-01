@@ -31,7 +31,7 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
@@ -199,6 +199,9 @@ third-party-licenses-selftest: ## ライセンス表記生成スクリプトの�
 
 deny-license-fail-closed-selftest: ## deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）
 	@scripts/targets/deny-license-fail-closed-selftest.sh
+
+deny-bans-fail-closed-selftest: ## deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（TASK-73.2・MVM-4・REPAIR-9）
+	@scripts/targets/deny-bans-fail-closed-selftest.sh
 
 bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 	@scripts/with-tools.sh jq scripts/check-bench-regression-selftest.sh

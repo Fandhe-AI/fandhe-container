@@ -17,7 +17,7 @@
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシーと加算は #487〜#489 で実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
 //! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み） |
-//! | #495 | TASK-161.2 | healthcheck 周期実行エンジン（[`healthcheck::run_periodic`]。実装済み。exec を呼ぶ判定の実装・`monitor` ループへの組み込みは未実装で #2441 が担う。REPAIR-3） |
+//! | #495 | TASK-161.2 | healthcheck 周期実行エンジン（[`healthcheck::run_periodic`]。実装済み。exec を呼ぶ判定の本番アダプタ `healthcheck::ExecHealthProbe` は #2441 で実装済み。`monitor` ループ・restart・supervisor 入口への組み込みは #2953 で実装済み（`healthcheck::HealthWiring`・`run::monitor_with_health`。定義を運ぶ起動オプション文書の `health-*` kind は実装済みで、CLI の書き手は未実装のため本番の経路は書き手ができるまで動かない。REPAIR-3）） |
 //! | #496 | TASK-161.3 | `health` の state.json 反映（[`healthcheck::HealthAggregator`]・[`health::probe_aggregate_and_record`]。retries・start_period・`Starting`。実装済み。SUP-4） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
 //! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |
@@ -38,16 +38,16 @@
 //! | #488 | TASK-159.2 | restart ポリシー評価（実装済み） |
 //! | #858 | TASK-171.1.2 | 権限昇格の必要最小集合と検証ロジック（[`privilege`]。実装済み） |
 //! | #1717 | TASK-157 追補 | bin の入口（`src/main.rs`・[`start_entry`]）と CLI との起動の契約（[`start_contract`]）。|
-//! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は単一スレッドの要求を満たせず fail-closed（#2043）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
+//! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は #2043 で監視スレッドでの直接 launch に再構成（常駐スレッドを止めて launch。止められなければ fail-closed）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で実装） |
-//! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・ambient の子での解除〔healthcheck exec。#2441〕・実機検証〔#538・#539〕は未実装。REPAIR-3） |
+//! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・実機検証〔#538・#539〕は未実装。REPAIR-3） |
 //! | #1543 | TASK-79 追補 | `logs` でコンテナログの内容を読み出す（[`logs::reader`]。ディレクトリは `<root>/@container-logs`。CLI-1・SUP-7） |
 //! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
 //! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |
 //! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線も済み〔#1902。意図は立てない〕、stop の意図の伝達〔SUP-9〕も済み〔#2162・#2440。StopRequest が `StopToken::mark_explicit_stop` で意図を立て、書き先は `SignalSlot::with_stop_intent`〕。REPAIR-3） |
-//! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch の成立は #2043） |
+//! | #489 | TASK-159.3 | restart_count 管理・state.json 反映・結合テスト（実装済み。本番 launcher での再 launch は #2043 で成立。実機確認は `supervisor_bin_real` のシナリオ C） |
 //! | #523 | TASK-168.1 | state.json 読み取り・inspect 出力フォーマット（実装済み） |
 //! | #524 | TASK-168.2 | inspect 出力のパース検証結合テスト（`tests/inspect_output.rs`。#523 で先行追加し、#524 でキー順・型・値域・列挙値の照合を追加。実装済み） |
 //!
@@ -102,6 +102,7 @@ pub mod supervisor_log;
 mod sys;
 #[cfg(target_os = "linux")]
 pub mod systemd_run;
+mod thread_settle;
 pub mod user_db;
 #[cfg(target_os = "linux")]
 pub mod user_scope;

@@ -1,4 +1,4 @@
-//! virtio-mmio（modern・Version = 2）の共通トランスポート（TASK-74.2.1・MVM-1・MVM-4。OS 非依存）。
+//! virtio-mmio（modern・Version = 2）の共通トランスポート（TASK-74.2.1・MVM-1・MVM-4・MS-7。OS 非依存）。
 //!
 //! virtio-block（TASK-74.2.2）と virtio-net（TASK-74.3.1）が共有するレジスタ状態・デバイス状態の遷移・
 //! feature negotiation・キュー設定レジスタを 1 か所に置く。各デバイスは [`VirtioDevice`] を実装し、
@@ -575,7 +575,11 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             reg::QUEUE_DEVICE_LOW => self.write_addr(value, |q| &mut q.device_area, false),
             reg::QUEUE_DEVICE_HIGH => self.write_addr(value, |q| &mut q.device_area, true),
             reg::QUEUE_NOTIFY => {
-                if !self.status.contains(DeviceStatus::DRIVER_OK) {
+                // 異常状態（FAILED / DEVICE_NEEDS_RESET）では DRIVER_OK が残っていても通知を配送しない。
+                if !self.status.contains(DeviceStatus::DRIVER_OK)
+                    || self.status.contains(DeviceStatus::FAILED)
+                    || self.status.contains(DeviceStatus::DEVICE_NEEDS_RESET)
+                {
                     return Err(IgnoredAccess::WrongDeviceState);
                 }
                 let idx = usize::try_from(value).map_err(|_| IgnoredAccess::InvalidSelector)?;
@@ -993,6 +997,30 @@ mod tests {
             MmioWriteOutcome::ActivationFailed(_)
         ));
         assert_eq!(rd(&t, reg::STATUS), 15 | 64);
+        // DRIVER_OK と DEVICE_NEEDS_RESET が併存する間、ready なキューへの通知も配送しない。
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 0),
+            ign(IgnoredAccess::WrongDeviceState)
+        );
+    }
+
+    #[test]
+    fn mvm1_notify_rejected_after_failed() {
+        let mut t = net();
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        wr(&mut t, reg::STATUS, 15);
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 0),
+            MmioWriteOutcome::QueueNotify(0)
+        );
+        // 動作中にドライバが FAILED を宣言した後は通知を拒否する。
+        wr(&mut t, reg::STATUS, 15 | 128);
+        assert_eq!(rd(&t, reg::STATUS) & 128, 128);
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_NOTIFY, 0),
+            ign(IgnoredAccess::WrongDeviceState)
+        );
     }
 
     #[test]

@@ -259,7 +259,8 @@ pub fn logs<S: ServiceLogSource, W: Write>(
             }
         });
     }
-    if counting.flush().is_err() {
+    // ソースが書き込み失敗を握りつぶして Ok を返しても、ログ欠落を成功にしない。
+    if counting.flush().is_err() || counting.failed {
         return Err(LogsError::Output);
     }
     Ok(LogsReport {

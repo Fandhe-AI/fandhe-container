@@ -170,3 +170,25 @@ fn stack_8_logs_errors_do_not_leak_env() {
         assert!(!format!("{e} {e:?}").contains("dummy-secret-value"));
     }
 }
+
+/// 書き込み失敗を握りつぶして `Ok` を返す偽ソース。
+struct Swallow;
+impl ServiceLogSource for Swallow {
+    fn write_logs(
+        &mut self,
+        _service: &str,
+        _spec: &Service,
+        out: &mut dyn Write,
+    ) -> Result<(), LogSourceError> {
+        let _ = out.write_all(b"lost");
+        Ok(())
+    }
+}
+
+#[test]
+fn stack_8_logs_swallowed_write_failure_is_output_error() {
+    let mut w = FailWriter { fail_write: true };
+    let e = logs(&services(), "web", &mut Swallow, &mut w).unwrap_err();
+    assert!(matches!(e, LogsError::Output));
+    assert_eq!((e.code(), e.exit_code().get()), ("INTERNAL", 1));
+}

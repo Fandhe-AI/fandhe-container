@@ -1,4 +1,4 @@
-//! containerd Task API の Create / Start を `ContainerRuntime` へつなぐサービス（CRI-5・TASK-62.2・MS-7）。
+//! containerd Task API の Create / Start / Exec を `ContainerRuntime` へつなぐサービス（CRI-5・TASK-62.2・MS-7）。
 //!
 //! [`ServiceRegistry::dispatch`](super::service::ServiceRegistry::dispatch) から呼ばれる同期ハンドラで、
 //! 接続ごとのスレッド上で動く。コンテナの作成・起動は [`RuntimeAdapter`] 経由で行い、core の具象型には
@@ -6,23 +6,32 @@
 //! ttrpc の `Response.status` に載せる。
 //!
 //! 未対応の欄は黙って無視せず `UNIMPLEMENTED` で拒否する（fail-closed。REPAIR-3）:
-//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`・`exec_id`。
+//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`。
+//! `Exec` と `Start(exec_id)` は [`TaskExecLauncher`] が差し込まれたときだけ動き、無ければ `UNIMPLEMENTED`（TASK-62.4）。
 //! `rootfs` と `options`（型に持たない）は repeated / 入れ子の確保を避けるため、復号前に走査して拒否する。
 //!
-//! 検査の順序: 復号前の走査（rootfs → options）→ 復号 → id → bundle → terminal → stdio → checkpoint。
+//! 検査の順序（Create）: 復号前の走査（rootfs → options）→ 復号 → id → bundle → terminal → stdio → checkpoint。
+//! 検査の順序（Exec）: 起動役の有無 → 復号 → id → exec_id → terminal / stdio → spec（type URL・上限・JSON・各欄）
+//! → コンテナが Running か → 登録（重複・上限）。起動は `Start(exec_id)` が行う（containerd の意味論）。
 //!
 //! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
 //! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
+use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use prost::Message;
 
+use super::exec::{ExecId, ExecRegistry, TaskExecLauncher, parse_process_spec};
 use super::message::{RpcStatus, count_top_level_field};
 use super::service::{TaskApiVersion, TtrpcService, unimplemented_status};
-use super::task_api::{CreateTaskRequest, CreateTaskResponse, StartRequest, StartResponse};
-use crate::adapter::RuntimeAdapter;
+use super::task_api::{
+    CreateTaskRequest, CreateTaskResponse, ExecProcessRequest, StartRequest, StartResponse,
+};
+use crate::adapter::{RuntimeAdapter, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
+use fandhe_container_core::traits::ContainerId;
 
 /// `bundle` の最大バイト数（PATH_MAX 相当）。
 const BUNDLE_MAX_LEN: usize = 4096;
@@ -31,10 +40,12 @@ const FIELD_ROOTFS: u64 = 3;
 /// `CreateTaskRequest.options`（`Any`）のフィールド番号。型には持たない。
 const FIELD_OPTIONS: u64 = 10;
 
-/// Create / Start を処理する Task サービス。他のメソッドは `Unimplemented`。
+/// Create / Start / Exec を処理する Task サービス。他のメソッドは `Unimplemented`。
 pub struct TaskService {
     version: TaskApiVersion,
     adapter: RuntimeAdapter,
+    exec_launcher: Option<Arc<dyn TaskExecLauncher>>,
+    execs: ExecRegistry,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -48,7 +59,83 @@ impl std::fmt::Debug for TaskService {
 impl TaskService {
     /// 版とランタイムのアダプタから作る。
     pub fn new(version: TaskApiVersion, adapter: RuntimeAdapter) -> Self {
-        Self { version, adapter }
+        Self {
+            version,
+            adapter,
+            exec_launcher: None,
+            execs: ExecRegistry::new(),
+        }
+    }
+
+    /// exec プロセスの起動役を差し込む。無ければ `Exec` と `Start(exec_id)` は `UNIMPLEMENTED`（TASK-62.4）。
+    pub fn with_exec_launcher(mut self, launcher: Arc<dyn TaskExecLauncher>) -> Self {
+        self.exec_launcher = Some(launcher);
+        self
+    }
+
+    /// `Exec`: exec プロセスを登録するだけで起動はしない（起動は `Start(exec_id)`）。
+    fn exec(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        if self.exec_launcher.is_none() {
+            return Err(unsupported("exec is not supported"));
+        }
+        let req = ExecProcessRequest::decode(payload).map_err(|_| decode_failure())?;
+        let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
+        let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        if req.terminal {
+            return Err(unsupported("terminal is not supported"));
+        }
+        if !req.stdin.is_empty() || !req.stdout.is_empty() || !req.stderr.is_empty() {
+            return Err(unsupported("stdio is not supported"));
+        }
+        let any = req.spec.as_ref().ok_or_else(|| {
+            RpcStatus::from_code(CriErrorCode::InvalidArgument, "exec spec is required")
+        })?;
+        let spec = parse_process_spec(any).map_err(|e| to_status(&e))?;
+        let status = self
+            .adapter
+            .state(container.as_str())
+            .map_err(|e| to_status(&e))?;
+        if status.lifecycle != RuntimeLifecycle::Running {
+            return Err(to_status(&CriError::failed_precondition(
+                "container is not running",
+            )));
+        }
+        self.execs
+            .register(&container, &exec_id, spec)
+            .map_err(|e| to_status(&e))?;
+        Ok(Vec::new())
+    }
+
+    /// `Start(exec_id)`: 登録済みの exec を起動役で起動する。ロックは起動中に保持しない。
+    fn start_exec(&self, req: &StartRequest) -> Result<Vec<u8>, RpcStatus> {
+        let Some(launcher) = self.exec_launcher.as_ref() else {
+            return Err(unsupported("exec_id is not supported"));
+        };
+        let container = ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
+        let exec_id = ExecId::new(&req.exec_id).map_err(|e| to_status(&e))?;
+        // Exec 後に停止したコンテナへ起動役を呼ばないよう、起動の直前にも Running を再確認する。
+        let status = self
+            .adapter
+            .state(container.as_str())
+            .map_err(|e| to_status(&e))?;
+        if status.lifecycle != RuntimeLifecycle::Running {
+            return Err(to_status(&CriError::failed_precondition(
+                "container is not running",
+            )));
+        }
+        let spec = self
+            .execs
+            .begin_start(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        let result = launcher.launch(&container, &exec_id, &spec);
+        self.execs
+            .finish_start(&container, &exec_id, result.is_ok())
+            .map_err(|e| to_status(&e))?;
+        let pid = result.map_err(|e| to_status(&e))?;
+        Ok(StartResponse {
+            pid: pid.map_or(0, NonZeroU32::get),
+        }
+        .encode_to_vec())
     }
 
     fn create(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -77,7 +164,7 @@ impl TaskService {
     fn start(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
         let req = StartRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
-            return Err(unsupported("exec_id is not supported"));
+            return self.start_exec(&req);
         }
         let status = self.adapter.start(&req.id).map_err(|e| to_status(&e))?;
         Ok(StartResponse {
@@ -96,6 +183,7 @@ impl TtrpcService for TaskService {
         match method {
             "Create" => self.create(payload),
             "Start" => self.start(payload),
+            "Exec" => self.exec(payload),
             _ => Err(unimplemented_status("method", method)),
         }
     }
@@ -161,7 +249,8 @@ mod tests {
         TraitError,
     };
 
-    use super::super::task_api::Mount;
+    use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL};
+    use super::super::task_api::{Any, Mount};
     use super::*;
 
     /// 呼び出しと状態を記録する偽のランタイム。
@@ -223,9 +312,267 @@ mod tests {
         fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
-        fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            let id = r.id().as_str().to_owned();
+            self.0.calls.lock().unwrap().push(format!("state {id}"));
+            match self.0.states.lock().unwrap().get(&id) {
+                None => Err(TraitError::new(ErrorCode::NotFound, "none")),
+                Some(ContainerState::Running) => Ok(ContainerStatus::running(
+                    r.id().clone(),
+                    NonZeroU32::new(4242),
+                )),
+                Some(_) => Ok(ContainerStatus::created(r.id().clone(), None)),
+            }
         }
+    }
+
+    /// 引数を記録する偽の起動役。
+    #[derive(Default)]
+    struct FakeLauncher {
+        launched: Mutex<Vec<(String, String, ExecProcessSpec)>>,
+        fail: Mutex<bool>,
+    }
+
+    impl TaskExecLauncher for FakeLauncher {
+        fn launch(
+            &self,
+            c: &ContainerId,
+            e: &ExecId,
+            s: &ExecProcessSpec,
+        ) -> Result<Option<NonZeroU32>, CriError> {
+            if *self.fail.lock().unwrap() {
+                return Err(CriError::unavailable("launch failed"));
+            }
+            self.launched
+                .lock()
+                .unwrap()
+                .push((c.as_str().into(), e.as_str().into(), s.clone()));
+            Ok(NonZeroU32::new(5151))
+        }
+    }
+
+    fn svc_exec(version: TaskApiVersion) -> (TaskService, Arc<Fake>, Arc<FakeLauncher>) {
+        let (s, f) = svc(version, Fake::default());
+        let l = Arc::new(FakeLauncher::default());
+        (s.with_exec_launcher(l.clone()), f, l)
+    }
+
+    const SPEC: &str = r#"{"cwd":"/","args":["/bin/sh","-c","id"],"env":["A=b"],"user":{"uid":1000,"gid":1001,"additionalGids":[2000,3000]}}"#;
+
+    fn exec_req(id: &str, eid: &str, json: &str) -> Vec<u8> {
+        ExecProcessRequest {
+            id: id.into(),
+            exec_id: eid.into(),
+            spec: Some(Any {
+                type_url: PROCESS_TYPE_URL.into(),
+                value: json.as_bytes().to_vec(),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn start_exec_req(id: &str, eid: &str) -> Vec<u8> {
+        StartRequest {
+            id: id.into(),
+            exec_id: eid.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn running_container(s: &TaskService, id: &str) {
+        s.handle("Create", &create_req(id, "/b")).unwrap();
+        s.handle("Start", &start_req(id)).unwrap();
+    }
+
+    /// CRI-5: V2 / V3 の両方で Create → Start → Exec → Start(exec_id) が通り、起動役へ具体値が渡る。
+    #[test]
+    fn cri5_exec_then_start_launches_process() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, _, l) = svc_exec(v);
+            running_container(&s, "c1");
+            let out = s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+            assert!(out.is_empty());
+            assert!(l.launched.lock().unwrap().is_empty());
+            let out = s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+            assert_eq!(StartResponse::decode(&out[..]).unwrap().pid, 5151);
+            let launched = l.launched.lock().unwrap();
+            assert_eq!(launched.len(), 1);
+            let (c, e, spec) = &launched[0];
+            assert_eq!((c.as_str(), e.as_str()), ("c1", "e1"));
+            assert_eq!(spec.args(), ["/bin/sh", "-c", "id"]);
+            assert_eq!(spec.env(), ["A=b"]);
+            assert_eq!(spec.cwd(), "/");
+            let u = spec.user().unwrap();
+            assert_eq!((u.uid, u.gid), (1000, 1001));
+            assert_eq!(u.additional_gids, vec![2000, 3000]);
+        }
+    }
+
+    /// CRI-5: 起動役が無ければ Exec も Start(exec_id) も UNIMPLEMENTED。
+    #[test]
+    fn cri5_exec_without_launcher_unimplemented() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        running_container(&s, "c1");
+        let (code, msg) = err_code(s.handle("Exec", &exec_req("c1", "e1", SPEC)));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec is not supported"));
+        let (code, msg) = err_code(s.handle("Start", &start_exec_req("c1", "e1")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
+    }
+
+    /// CRI-5: 不正な入力は INVALID_ARGUMENT で、起動役は呼ばれず登録もされない。
+    #[test]
+    fn cri5_exec_invalid_inputs() {
+        let (s, f, l) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        let before = f.calls.lock().unwrap().len();
+        let long = "a".repeat(256);
+        for (id, eid) in [
+            ("", "e"),
+            ("..", "e"),
+            ("bad id!", "e"),
+            ("c1", ""),
+            ("c1", ".."),
+            ("c1", "bad id!"),
+            ("c1", long.as_str()),
+        ] {
+            assert_eq!(
+                err_code(s.handle("Exec", &exec_req(id, eid, SPEC))).0,
+                INVALID,
+                "{id:?} {eid:?}"
+            );
+        }
+        for j in [
+            "",
+            "not json",
+            r#"{"cwd":"/"}"#,
+            r#"{"cwd":"/","args":[""]}"#,
+            r#"{"cwd":"rel","args":["a"]}"#,
+            r#"{"cwd":"/","args":["a"],"env":["NOEQ"]}"#,
+            r#"{"cwd":"/","args":["a"],"bogus":1}"#,
+        ] {
+            assert_eq!(
+                err_code(s.handle("Exec", &exec_req("c1", "e1", j))).0,
+                INVALID,
+                "{j}"
+            );
+        }
+        let no_spec = ExecProcessRequest {
+            id: "c1".into(),
+            exec_id: "e1".into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(err_code(s.handle("Exec", &no_spec)).0, INVALID);
+        let bad_url = ExecProcessRequest {
+            id: "c1".into(),
+            exec_id: "e1".into(),
+            spec: Some(Any {
+                type_url: "x".into(),
+                value: SPEC.as_bytes().to_vec(),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(err_code(s.handle("Exec", &bad_url)).0, INVALID);
+        assert_eq!(err_code(s.handle("Exec", &[0x0a, 5, 1])).0, INVALID);
+        assert_eq!(f.calls.lock().unwrap().len(), before);
+        assert!(l.launched.lock().unwrap().is_empty());
+        assert_eq!(
+            err_code(s.handle("Start", &start_exec_req("c1", "e1"))).0,
+            NOT_FOUND
+        );
+    }
+
+    /// CRI-5・SEC-1: 未対応の欄は UNIMPLEMENTED で、ランタイムは呼ばれない。
+    #[test]
+    fn cri5_exec_unsupported_fields() {
+        let (s, f, _) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        let before = f.calls.lock().unwrap().len();
+        let base = || ExecProcessRequest {
+            id: "c1".into(),
+            exec_id: "e1".into(),
+            spec: Some(Any {
+                type_url: PROCESS_TYPE_URL.into(),
+                value: SPEC.as_bytes().to_vec(),
+            }),
+            ..Default::default()
+        };
+        let mut r = base();
+        r.terminal = true;
+        let (code, msg) = err_code(s.handle("Exec", &r.encode_to_vec()));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "terminal is not supported"));
+        for which in 0..3 {
+            let mut r = base();
+            match which {
+                0 => r.stdin = "/f".into(),
+                1 => r.stdout = "/f".into(),
+                _ => r.stderr = "/f".into(),
+            }
+            let (code, msg) = err_code(s.handle("Exec", &r.encode_to_vec()));
+            assert_eq!((code, msg.as_str()), (UNIMPL, "stdio is not supported"));
+        }
+        let caps = r#"{"cwd":"/","args":["a"],"capabilities":{"bounding":["CAP_SYS_ADMIN"]}}"#;
+        let (code, msg) = err_code(s.handle("Exec", &exec_req("c1", "e1", caps)));
+        assert_eq!(
+            (code, msg.as_str()),
+            (UNIMPL, "capabilities is not supported")
+        );
+        assert_eq!(f.calls.lock().unwrap().len(), before);
+    }
+
+    /// ERR-3・CRI-5: 状態に関する失敗と再試行。
+    #[test]
+    fn cri5_exec_lifecycle_errors() {
+        let (s, _, l) = svc_exec(TaskApiVersion::V2);
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("nope", "e1", SPEC))).0,
+            NOT_FOUND
+        );
+        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("c1", "e1", SPEC))).0,
+            PRECOND
+        );
+        s.handle("Start", &start_req("c1")).unwrap();
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("c1", "e1", SPEC))).0,
+            EXISTS
+        );
+        // launch の失敗は ERR-3 のコードで返り、再試行できる。
+        *l.fail.lock().unwrap() = true;
+        assert_eq!(
+            err_code(s.handle("Start", &start_exec_req("c1", "e1"))).0,
+            UNAVAILABLE
+        );
+        *l.fail.lock().unwrap() = false;
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        assert_eq!(
+            err_code(s.handle("Start", &start_exec_req("c1", "e1"))).0,
+            PRECOND
+        );
+        assert_eq!(
+            err_code(s.handle("Start", &start_exec_req("c1", "zz"))).0,
+            NOT_FOUND
+        );
+        assert_eq!(l.launched.lock().unwrap().len(), 1);
+    }
+
+    /// CRI-5: 1 コンテナあたりの登録上限は RESOURCE_EXHAUSTED。
+    #[test]
+    fn cri5_exec_registry_limit() {
+        let (s, _, _) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        for i in 0..super::super::exec::MAX_EXECS_PER_CONTAINER {
+            s.handle("Exec", &exec_req("c1", &format!("e{i}"), SPEC))
+                .unwrap();
+        }
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("c1", "over", SPEC))).0,
+            RESOURCE_EXHAUSTED
+        );
     }
 
     fn svc(version: TaskApiVersion, fake: Fake) -> (TaskService, Arc<Fake>) {
@@ -272,6 +619,8 @@ mod tests {
     const UNIMPL: i32 = 12;
     const PRECOND: i32 = 9;
     const INTERNAL: i32 = 13;
+    const RESOURCE_EXHAUSTED: i32 = 8;
+    const UNAVAILABLE: i32 = 14;
 
     /// CRI-5・CRI-7: V2 / V3 の両方で Create → Start が通り、pid と ID・bundle が具体値で一致する。
     #[test]

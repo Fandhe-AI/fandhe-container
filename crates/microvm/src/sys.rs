@@ -207,6 +207,7 @@ const SIG_VCPU_KICK: i32 = 12;
 /// `SIG_DFL`。
 const SIG_DFL: usize = 0;
 /// `pthread_sigmask` の how（Linux 共通: SIG_UNBLOCK = 1、SIG_SETMASK = 2）。
+#[cfg(target_arch = "x86_64")]
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
@@ -262,11 +263,13 @@ impl KickUnblocked {
     }
 
     /// 自己診断用: `SIGUSR2` をブロックし、drop で元へ戻す（期限の中断がブロック下でも届くことの確認用）。
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn blocked_for_probe() -> Result<KickUnblocked, SysError> {
         Self::change(SIG_BLOCK)
     }
 
     /// 呼び出しスレッドで `SIGUSR2` がブロックされているか。
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn kick_is_blocked() -> Result<bool, SysError> {
         if !consts::SUPPORTED {
             return Err(SysError::Unsupported);

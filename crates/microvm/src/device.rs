@@ -163,9 +163,11 @@ pub struct DeadlineProbe {
     pub kick_mask_restored: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Default)]
 struct CollectingObserver(std::sync::Mutex<Vec<RunRecord>>);
 
+#[cfg(target_arch = "x86_64")]
 impl RunObserver for CollectingObserver {
     fn record(&self, record: &RunRecord) {
         if let Ok(mut v) = self.0.lock() {
@@ -694,34 +696,69 @@ impl KvmDevice {
         let registered = sys::register_single_page(vm.fd.as_fd(), 0, GPA, page)
             .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
         let mut vcpu = vm.create_vcpu(0)?;
-        let mut exits = Vec::new();
-        let mut interrupted = 0u32;
-        let mut result = Ok(());
-        for _ in 0..PROBE_MAX_RUNS {
-            match vcpu.run_once(PROBE_RUN_DEADLINE) {
-                Ok(VcpuExit::Interrupted) => interrupted += 1,
-                Ok(VcpuExit::Hlt) => {
-                    exits.push(VcpuExit::Hlt);
-                    break;
-                }
-                Ok(other) => exits.push(other),
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
+        let outcome = run_probe_loop(|| vcpu.run_once(PROBE_RUN_DEADLINE));
         drop(vcpu);
         drop(registered);
         drop(vm);
-        result?;
+        let (exits, interrupted) = outcome?;
         Ok(GuestExecutionProbe { exits, interrupted })
     }
+}
+
+/// 自己診断のループ本体。`Hlt` で完了したときだけ `Ok`、回数上限（[`PROBE_MAX_RUNS`]）に達しても
+/// `Hlt` に至らなければ `Internal` で失敗にする（fail-closed。TASK-74.4.1・MVM-1・REPAIR-5）。
+#[cfg(target_arch = "x86_64")]
+fn run_probe_loop(
+    mut run: impl FnMut() -> Result<VcpuExit, MicrovmError>,
+) -> Result<(Vec<VcpuExit>, u32), MicrovmError> {
+    let mut exits = Vec::new();
+    let mut interrupted = 0u32;
+    for _ in 0..PROBE_MAX_RUNS {
+        match run()? {
+            VcpuExit::Interrupted => interrupted += 1,
+            VcpuExit::Hlt => {
+                exits.push(VcpuExit::Hlt);
+                return Ok((exits, interrupted));
+            }
+            other => exits.push(other),
+        }
+    }
+    Err(MicrovmError::new(
+        MicrovmErrorCode::Internal,
+        "guest did not halt within the probe run limit",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MVM-1: 上限まで `Interrupted` だけ、または `Hlt` 以外だけなら完了扱いにせず `Internal` で失敗する。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn probe_loop_fails_when_run_limit_reached_without_hlt() {
+        let mut calls = 0usize;
+        let e = run_probe_loop(|| {
+            calls += 1;
+            Ok(VcpuExit::Interrupted)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(e.message(), "guest did not halt within the probe run limit");
+        assert_eq!(calls, 8);
+        let e = run_probe_loop(|| Ok(VcpuExit::Shutdown)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+    }
+
+    /// MVM-1: `Interrupted` を挟んでも `Hlt` で完了すれば `Ok`。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn probe_loop_completes_on_hlt_after_interrupts() {
+        let mut seq = vec![VcpuExit::Hlt, VcpuExit::Interrupted, VcpuExit::Interrupted];
+        let (exits, interrupted) = run_probe_loop(|| Ok(seq.pop().unwrap())).unwrap();
+        assert_eq!(exits, vec![VcpuExit::Hlt]);
+        assert_eq!(interrupted, 2);
+    }
 
     #[test]
     fn open_missing_path_is_not_found() {

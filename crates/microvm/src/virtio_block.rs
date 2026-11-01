@@ -10,6 +10,9 @@
 //! `device_mut().process_queue(&mem)` を呼び、[`BlockQueueStats::completed`] が 1 以上なら
 //! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（割り込みの実配送は TASK-74.2.3）。
 //! `QueueStopped(0)` では [`VirtioBlock::stop_queue`] を呼ぶ。リングの破損は `process_queue` が `Err` で返し、
+//! `Err` でも途中までの要求は used へ書かれ `used.idx` が進んでいることがある。その内訳は
+//! [`VirtioBlock::stats_before_error`] で取り、`completed` が 1 以上なら `Err` でも `UsedBuffer` を上げる。
+//! 壊れたチェーンは `last_avail` を進めないため、以後の呼び出しも同じ `Err` になる（呼び出し元が停止・リセットする）。
 //! 停止・リセット要求の判断は呼び出し元が行う（デバイスからトランスポートへ DEVICE_NEEDS_RESET は立てない）。
 //!
 //! # 範囲外（REPAIR-3。将来仕様）
@@ -168,6 +171,10 @@ pub struct VirtioBlock<B: BlockBackend> {
     queue_cfg: Option<QueueConfig>,
     queue: Option<SplitQueue>,
     bounce: Vec<u8>,
+    /// ネゴシエート済み feature（activate 前は空）。
+    negotiated: FeatureBits,
+    /// 直近の `process_queue` が `Err` で終わったときの、それまでの処理内訳。
+    aborted: BlockQueueStats,
 }
 
 impl<B: BlockBackend> VirtioBlock<B> {
@@ -178,6 +185,8 @@ impl<B: BlockBackend> VirtioBlock<B> {
             queue_cfg: None,
             queue: None,
             bounce: vec![0; BOUNCE_LEN],
+            negotiated: FeatureBits::EMPTY,
+            aborted: BlockQueueStats::default(),
         }
     }
 
@@ -186,10 +195,18 @@ impl<B: BlockBackend> VirtioBlock<B> {
         &self.backend
     }
 
+    /// 直近の `process_queue` が `Err` を返した時点までに used へ返した要求の内訳。
+    ///
+    /// `completed` が 1 以上なら、`Err` でもゲストへ `UsedBuffer` 割り込みを上げる。成功時は空。
+    pub fn stats_before_error(&self) -> BlockQueueStats {
+        self.aborted
+    }
+
     /// requestq の処理を止める（トランスポートの `QueueStopped(0)` で呼ぶ）。
     pub fn stop_queue(&mut self) {
         self.queue_cfg = None;
         self.queue = None;
+        self.negotiated = FeatureBits::EMPTY;
     }
 
     /// avail に積まれた要求を処理して used へ返す（1 回に最大キュー長の本数）。
@@ -208,13 +225,20 @@ impl<B: BlockBackend> VirtioBlock<B> {
             })?;
             self.queue = Some(SplitQueue::new(&cfg, mem)?);
         }
+        self.aborted = BlockQueueStats::default();
         let mut stats = BlockQueueStats::default();
         let Some(mut queue) = self.queue.take() else {
             return Ok(stats);
         };
         let result = self.drain(&mut queue, mem, &mut stats);
         self.queue = Some(queue);
-        result.map(|()| stats)
+        match result {
+            Ok(()) => Ok(stats),
+            Err(e) => {
+                self.aborted = stats;
+                Err(e)
+            }
+        }
     }
 
     fn drain<M: GuestMemoryBacking>(
@@ -288,6 +312,13 @@ impl<B: BlockBackend> VirtioBlock<B> {
         match ty {
             VIRTIO_BLK_T_IN => self.transfer(data, sector, mem, true),
             VIRTIO_BLK_T_OUT => self.transfer(data, sector, mem, false),
+            VIRTIO_BLK_T_FLUSH
+                if !self
+                    .negotiated
+                    .contains(FeatureBits::from_bits(VIRTIO_BLK_F_FLUSH)) =>
+            {
+                (Some(VIRTIO_BLK_S_UNSUPP), 0)
+            }
             VIRTIO_BLK_T_FLUSH => match self.backend.flush() {
                 Ok(()) => (Some(VIRTIO_BLK_S_OK), 0),
                 Err(_) => (Some(VIRTIO_BLK_S_IOERR), 0),
@@ -392,13 +423,14 @@ impl<B: BlockBackend> VirtioDevice for VirtioBlock<B> {
 
     fn activate(
         &mut self,
-        _features: FeatureBits,
+        features: FeatureBits,
         queues: &[QueueConfig],
     ) -> Result<(), MicrovmError> {
         match queues.first() {
             Some(q) if q.ready() => {
                 self.queue_cfg = Some(*q);
                 self.queue = None;
+                self.negotiated = features;
                 Ok(())
             }
             _ => Err(MicrovmError::new(
@@ -425,8 +457,11 @@ mod tests {
 
     fn block(ro: bool) -> VirtioBlock<MemoryBlockBackend> {
         let mut b = VirtioBlock::new(MemoryBlockBackend::new(8192, ro).unwrap());
-        b.activate(FeatureBits::EMPTY, &[queue_cfg(DESC, AVAIL, USED)])
-            .unwrap();
+        b.activate(
+            FeatureBits::from_bits(VIRTIO_BLK_F_FLUSH),
+            &[queue_cfg(DESC, AVAIL, USED)],
+        )
+        .unwrap();
         b
     }
 
@@ -538,6 +573,35 @@ mod tests {
         request(&mut m, VIRTIO_BLK_T_FLUSH, 0, 0, 0);
         assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
         assert_eq!(status(&m), 0);
+    }
+
+    /// MVM-1: FLUSH 未ネゴシエートのドライバの T_FLUSH は UNSUPP を返す。
+    #[test]
+    fn mvm1_flush_without_negotiation_is_unsupp() {
+        let mut m = new_mem();
+        let mut b = VirtioBlock::new(MemoryBlockBackend::new(8192, false).unwrap());
+        b.activate(FeatureBits::EMPTY, &[queue_cfg(DESC, AVAIL, USED)])
+            .unwrap();
+        request(&mut m, VIRTIO_BLK_T_FLUSH, 0, 0, 0);
+        assert_eq!(b.process_queue(&mut m).unwrap().unsupp, 1);
+        assert_eq!(status(&m), VIRTIO_BLK_S_UNSUPP);
+    }
+
+    /// MVM-1: 途中で壊れたチェーンに当たっても、先に完了した要求の内訳を取れる。
+    #[test]
+    fn mvm1_partial_stats_survive_ring_error() {
+        let mut m = new_mem();
+        let mut b = block(false);
+        request(&mut m, VIRTIO_BLK_T_FLUSH, 0, 0, 0);
+        m.write_u16_le(GuestAddress::new(AVAIL + 2), 2).unwrap();
+        m.write_u16_le(GuestAddress::new(AVAIL + 6), 0xfff).unwrap();
+        assert!(b.process_queue(&mut m).is_err());
+        let s = b.stats_before_error();
+        assert_eq!((s.completed, s.ok), (1, 1));
+        assert_eq!(m.read_u16_le(GuestAddress::new(USED + 2)).unwrap(), 1);
+        // 同じ壊れたチェーンで以後も Err、内訳は空に戻る。
+        assert!(b.process_queue(&mut m).is_err());
+        assert_eq!(b.stats_before_error().completed, 0);
     }
 
     /// MVM-1: status 記述子が無い要求は status を書かず used len 0 で消費する。

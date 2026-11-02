@@ -53,7 +53,7 @@ pub enum VirtqueueErrorCode {
     ChainLoop,
     /// 記述子数が上限を超えた。
     ChainTooLong,
-    /// 合計バイト数が上限を超えた。
+    /// 合計バイト数が上限を超えた（現行の `pop` は `Err` にせず `oversized` で伝える。語彙は互換のため残す）。
     ChainTooLarge,
     /// INDIRECT が立っている（非対応）。
     IndirectUnsupported,
@@ -142,6 +142,7 @@ pub struct DescriptorChain {
     descriptors: Vec<Descriptor>,
     readable_len: u64,
     writable_len: u64,
+    oversized: bool,
 }
 
 impl DescriptorChain {
@@ -160,6 +161,12 @@ impl DescriptorChain {
     /// 書き込み可能バッファの合計バイト数。
     pub fn writable_len(&self) -> u64 {
         self.writable_len
+    }
+    /// readable / writable いずれかの合計が [`MAX_CHAIN_BYTES`] を超えたか。
+    ///
+    /// 構造は検査済みで消費できるチェーンだが、デバイスは処理せずエラー status で完了させる（MVM-1）。
+    pub fn oversized(&self) -> bool {
+        self.oversized
     }
 }
 
@@ -248,6 +255,7 @@ impl SplitQueue {
         let mut visited: Vec<u16> = Vec::new();
         let mut descriptors = Vec::new();
         let (mut readable_len, mut writable_len) = (0u64, 0u64);
+        let mut oversized = false;
         loop {
             if index >= self.size {
                 return Err(VirtqueueError::new(VirtqueueErrorCode::DescIndexOutOfRange));
@@ -287,10 +295,13 @@ impl SplitQueue {
             } else {
                 &mut readable_len
             };
-            *total = total
-                .checked_add(u64::from(len))
-                .filter(|t| *t <= MAX_CHAIN_BYTES)
-                .ok_or(VirtqueueError::new(VirtqueueErrorCode::ChainTooLarge))?;
+            // 合計の超過はリング破損ではない（仕様準拠のドライバも広告値の範囲で起こしうる）ため
+            // `Err` にせず `oversized` を立てて最後まで辿る。`Err` だと `last_avail` が進まず、
+            // 以後の pop が同じ要求で失敗し続けてデバイスが恒久的に止まる（MVM-1）。
+            *total = total.saturating_add(u64::from(len));
+            if *total > MAX_CHAIN_BYTES {
+                oversized = true;
+            }
             descriptors.push(Descriptor {
                 addr: GuestAddress::new(addr),
                 len,
@@ -306,6 +317,7 @@ impl SplitQueue {
             descriptors,
             readable_len,
             writable_len,
+            oversized,
         })
     }
 
@@ -548,18 +560,28 @@ mod tests {
         put_desc(&mut m, 0, (4 << 20) - 4, 8, 0, 0);
         publish(&mut m, 0, 0, 1);
         expect_err(&m, VirtqueueErrorCode::GuestMemory);
-        // 合計バイト数の超過。
+        // 未処理数がキュー長を超える。
+        let mut m = new_mem();
+        publish(&mut m, 0, 0, 17);
+        expect_err(&m, VirtqueueErrorCode::InvalidAvailIdx);
+    }
+
+    /// MVM-1: 合計バイト数の超過は Err にせず oversized で消費でき、キューが進む。
+    #[test]
+    fn mvm1_oversized_chain_is_consumed() {
+        let n = VRING_DESC_F_NEXT;
         let mut m = new_mem();
         put_desc(&mut m, 0, 0, 2 << 20, n, 1);
         for i in 1..16u16 {
             put_desc(&mut m, i, 0, 2 << 20, if i == 15 { 0 } else { n }, i + 1);
         }
         publish(&mut m, 0, 0, 1);
-        expect_err(&m, VirtqueueErrorCode::ChainTooLarge);
-        // 未処理数がキュー長を超える。
-        let mut m = new_mem();
-        publish(&mut m, 0, 0, 17);
-        expect_err(&m, VirtqueueErrorCode::InvalidAvailIdx);
+        let mut q = queue(&m);
+        let chain = q.pop(&m).unwrap().unwrap();
+        assert!(chain.oversized());
+        assert_eq!(chain.readable_len(), 32 << 20);
+        assert_eq!(q.last_avail, 1);
+        assert!(q.pop(&m).unwrap().is_none());
     }
 
     /// MVM-1: ring がメモリの外にあるキューと ready でないキューは作れない。

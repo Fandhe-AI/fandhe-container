@@ -30,7 +30,7 @@
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestMemory, GuestMemoryBacking};
 use crate::virtio_mmio::{FeatureBits, QueueConfig, VirtioDevice, VirtioDeviceType};
-use crate::virtqueue::{Descriptor, DescriptorChain, MAX_CHAIN_LEN, SplitQueue};
+use crate::virtqueue::{Descriptor, DescriptorChain, MAX_CHAIN_BYTES, MAX_CHAIN_LEN, SplitQueue};
 
 /// セクタ長。
 pub const SECTOR_SIZE: u64 = 512;
@@ -54,10 +54,14 @@ pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 /// status: 非対応の要求。
 pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
-/// 設定空間で広告する `size_max`。
-pub const SIZE_MAX: u32 = 1 << 20;
+/// 設定空間で広告する `size_max`。`SEG_MAX * SIZE_MAX <= MAX_CHAIN_BYTES` を保つ（下の const 照合）。
+pub const SIZE_MAX: u32 = 1 << 16;
 /// 設定空間で広告する `seg_max`（ヘッダと status を除いたデータ記述子の最大数）。
 pub const SEG_MAX: u32 = (MAX_CHAIN_LEN - 2) as u32;
+// 広告値（seg_max × size_max）が virtqueue のチェーン上限に収まる。仕様準拠のドライバが
+// 上限超過のチェーンを送らないことの根拠（MVM-1）。
+const _: () = assert!((SEG_MAX as u64) * (SIZE_MAX as u64) <= MAX_CHAIN_BYTES);
+
 /// requestq の最大キュー長。
 pub const QUEUE_MAX_SIZE: u16 = 256;
 /// [`MemoryBlockBackend`] の容量上限。
@@ -293,6 +297,11 @@ impl<B: BlockBackend> VirtioBlock<B> {
         };
         if descs.len() < 2 || !last.writable || last.len == 0 {
             return (None, 0);
+        }
+        // 合計バイト数が上限超過のチェーン（広告値を守らないドライバ）は、その要求だけ IOERR で
+        // 完了させてキューを進める。status を書けない（上の検査）場合は malformed として消費する（MVM-1）。
+        if chain.oversized() {
+            return (Some(VIRTIO_BLK_S_IOERR), 0);
         }
         if first.writable || first.len < HEADER_LEN {
             return (Some(VIRTIO_BLK_S_IOERR), 0);
@@ -623,6 +632,56 @@ mod tests {
             }
         );
         assert_eq!(m.read_u32_le(GuestAddress::new(USED + 8)).unwrap(), 0);
+        assert_eq!(m.read_u16_le(GuestAddress::new(USED + 2)).unwrap(), 1);
+    }
+
+    /// MVM-1: 広告値は virtqueue のチェーン上限と整合する。
+    #[test]
+    fn mvm1_advertised_limits_fit_chain_limit() {
+        assert_eq!(u64::from(SEG_MAX) * u64::from(SIZE_MAX), 126 * 65536);
+        assert!(u64::from(SEG_MAX) * u64::from(SIZE_MAX) <= MAX_CHAIN_BYTES);
+    }
+
+    /// MVM-1: 上限超過のチェーンは IOERR で完了し、キューが進む。
+    #[test]
+    fn mvm1_oversized_chain_completes_with_ioerr() {
+        let mut m = new_mem();
+        let mut b = block(false);
+        header(&mut m, BUF, VIRTIO_BLK_T_OUT, 0);
+        put_desc(&mut m, 0, BUF, 16, N, 1);
+        // 2MiB × 9 = 18MiB > 16MiB。
+        for i in 1..=9u16 {
+            put_desc(&mut m, i, 0, 2 << 20, N, i + 1);
+        }
+        put_desc(&mut m, 10, BUF + 0x2000, 1, W, 0);
+        publish(&mut m, 0, 0, 1);
+        let s = b.process_queue(&mut m).unwrap();
+        assert_eq!(
+            s,
+            BlockQueueStats {
+                completed: 1,
+                ioerr: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(status(&m), VIRTIO_BLK_S_IOERR);
+        assert_eq!(m.read_u16_le(GuestAddress::new(USED + 2)).unwrap(), 1);
+        assert_eq!(b.process_queue(&mut m).unwrap().completed, 0);
+    }
+
+    /// MVM-1: status を書けない上限超過チェーンは malformed として消費する。
+    #[test]
+    fn mvm1_oversized_chain_without_status_is_malformed() {
+        let mut m = new_mem();
+        let mut b = block(false);
+        header(&mut m, BUF, VIRTIO_BLK_T_OUT, 0);
+        put_desc(&mut m, 0, BUF, 16, N, 1);
+        for i in 1..=9u16 {
+            put_desc(&mut m, i, 0, 2 << 20, if i == 9 { 0 } else { N }, i + 1);
+        }
+        publish(&mut m, 0, 0, 1);
+        let s = b.process_queue(&mut m).unwrap();
+        assert_eq!((s.completed, s.malformed), (1, 1));
         assert_eq!(m.read_u16_le(GuestAddress::new(USED + 2)).unwrap(), 1);
     }
 

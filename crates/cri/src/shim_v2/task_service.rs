@@ -39,14 +39,16 @@
 //! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
 //! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use prost::Message;
 
 use super::exec::{ExecId, ExecRegistry, TaskExecLauncher, parse_process_spec};
 use super::message::{RpcStatus, count_top_level_field};
+use super::service::shutdown_gate_failure;
 use super::service::{TaskApiVersion, TtrpcService, unimplemented_status};
 use super::shutdown::ShutdownSignal;
 use super::task_api::{
@@ -81,6 +83,9 @@ pub struct TaskService {
     execs: ExecRegistry,
     wait_config: WaitConfig,
     shutdown: Option<ShutdownSignal>,
+    /// この shim の Create で作ったコンテナ ID。Shutdown が「残っているか」を全 ID で判定し、
+    /// Create と Shutdown の判定を排他する（ロックは Create / 判定の間だけ持つ）。
+    created: Mutex<BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -101,6 +106,7 @@ impl TaskService {
             execs: ExecRegistry::new(),
             wait_config: WaitConfig::default(),
             shutdown: None,
+            created: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -180,14 +186,28 @@ impl TaskService {
         };
         let req = ShutdownRequest::decode(payload).map_err(|_| decode_failure())?;
         if req.now {
-            signal.request();
+            signal.request().map_err(|_| shutdown_gate_failure())?;
             return Ok(Vec::new());
         }
-        match self.adapter.state(&req.id) {
-            Err(e) if e.code() == CriErrorCode::NotFound => signal.request(),
-            Err(e) => return Err(to_status(&e)),
-            Ok(_) => {}
+        // 要求された ID だけでなく、この shim が作った全コンテナを確認する（別 ID の Shutdown で
+        // 実行中のコンテナの接続を失わない）。Create とは `created` のロックで排他する。
+        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<String> = created.iter().cloned().collect();
+        if !created.contains(&req.id) {
+            ids.push(req.id.clone());
         }
+        for id in ids {
+            match self.adapter.state(&id) {
+                Err(e) if e.code() == CriErrorCode::NotFound => {
+                    created.remove(&id);
+                }
+                Err(e) => return Err(to_status(&e)),
+                // 残っているコンテナがあれば終了を要求しない。
+                Ok(_) => return Ok(Vec::new()),
+            }
+        }
+        // 判定の完了まで `created` を持ったまま要求を立てる（以後の Create は拒否される）。
+        signal.request().map_err(|_| shutdown_gate_failure())?;
         Ok(Vec::new())
     }
 
@@ -282,10 +302,23 @@ impl TaskService {
         if !req.checkpoint.is_empty() || !req.parent_checkpoint.is_empty() {
             return Err(unsupported("checkpoint is not supported"));
         }
+        // Shutdown の判定と排他する。終了要求後の Create は受けない（接続が失われるため）。
+        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(ShutdownSignal::is_requested)
+        {
+            return Err(RpcStatus::from_code(
+                CriErrorCode::Unavailable,
+                "shim is shutting down",
+            ));
+        }
         let status = self
             .adapter
             .create(&req.id, bundle)
             .map_err(|e| to_status(&e))?;
+        created.insert(req.id.clone());
         Ok(CreateTaskResponse {
             pid: status.pid.unwrap_or(0),
         }
@@ -1127,12 +1160,25 @@ mod tests {
         // 2 回目も成功する（冪等）。
         assert!(s.handle("Shutdown", &req("c1", false)).unwrap().is_empty());
 
+        // 別 ID（存在しない c9）の Shutdown は、実行中の c1 が残っていれば要求しない。
+        let sig3 = ShutdownSignal::new();
+        let (s3, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s3 = s3.with_shutdown(sig3.clone());
+        s3.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert!(s3.handle("Shutdown", &req("c9", false)).unwrap().is_empty());
+        assert!(!sig3.is_requested());
+
         let sig2 = ShutdownSignal::new();
         let (s2, _) = svc(TaskApiVersion::V2, Fake::default());
         let s2 = s2.with_shutdown(sig2.clone());
         s2.handle("Create", &create_req("c2", &abs("/b"))).unwrap();
         s2.handle("Shutdown", &req("c2", true)).unwrap();
         assert!(sig2.is_requested());
+        // 終了要求後の Create は受けない。
+        assert_eq!(
+            err_code(s2.handle("Create", &create_req("c3", &abs("/b")))).0,
+            UNAVAILABLE
+        );
     }
 
     /// CRI-5・TASK-62.7.2: シグナル未注入の Shutdown は UNIMPLEMENTED。

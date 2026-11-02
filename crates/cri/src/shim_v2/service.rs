@@ -90,12 +90,17 @@ impl TtrpcService for EmptyTaskService {
                 ShutdownRequest::decode(payload).map_err(|_| {
                     RpcStatus::from_code(CriErrorCode::InvalidArgument, "malformed request payload")
                 })?;
-                signal.request();
+                signal.request().map_err(|_| shutdown_gate_failure())?;
                 Ok(Vec::new())
             }
             _ => Err(unimplemented_status("method", method)),
         }
     }
+}
+
+/// 終了要求の排他（同一 id の start との排他）を取れなかったときの応答（固定語彙。PLUG-12・REPAIR-5）。
+pub(super) fn shutdown_gate_failure() -> RpcStatus {
+    RpcStatus::from_code(CriErrorCode::Unavailable, "cannot acquire the shim lock")
 }
 
 pub(super) fn unimplemented_status(kind: &str, name: &str) -> RpcStatus {

@@ -1233,29 +1233,53 @@ mod unix_impl {
             .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
     }
 
-    /// Shutdown で抜けたあとの片付け。ロック保持下で、自分が bind した実体（`first` と一致）だけを消す。
+    /// 片付けの失敗を 1 行の JSON（固定語彙の `code` / `message`）で stderr（`daemon.log`）へ出す（ERR 系・REPAIR-4）。
+    fn report_cleanup_failure(code: CriErrorCode, message: &'static str) {
+        eprintln!(r#"{{"code":"{}","message":"{message}"}}"#, code.as_str());
+    }
+
+    /// Shutdown で抜けたあとの片付け。`held`（終了要求の時点から保持してきた ID ロック）の下で、
+    /// 自分が bind した実体（`first` と一致）だけを消す。
     ///
-    /// ロックが取れない・別の実体に置き換わっているときは消さず、固定語彙を 1 行 stderr（`daemon.log`）へ出す
-    /// （並行 `start` が返した生きたアドレスを消さない。残った stale は次の `start` が回収する。PLUG-12・REPAIR-5）。
+    /// 終了要求から本関数の終わりまで ID ロックを持ち続けるので、並行する `start` は要求後に「生きている」と
+    /// 判定して消える socket のアドレスを返さない（PLUG-12・REPAIR-5）。`held` が無いときだけロックを取り直す。
+    /// ロックが取れない・別の実体に置き換わっているときは消さず、固定語彙の JSON を 1 行出す
+    /// （並行 `start` が返した生きたアドレスを消さない。残った stale は次の `start` が回収する）。
     fn cleanup_after_shutdown(
         inv: &ShimInvocation,
         dir: &Path,
         expected: &Path,
         first: (u64, u64, i64, i64),
+        held: Option<IdLock>,
     ) {
-        let Ok(lock) = acquire_lock(dir, inv) else {
-            eprintln!("shim: socket left in place after shutdown (lock unavailable)");
-            return;
+        let lock = match held {
+            Some(l) => l,
+            None => match acquire_lock(dir, inv) {
+                Ok(l) => l,
+                Err(_) => {
+                    report_cleanup_failure(
+                        CriErrorCode::Unavailable,
+                        "socket left in place after shutdown (lock unavailable)",
+                    );
+                    return;
+                }
+            },
         };
         match sock_ident(expected) {
             Some(now) if now == first => {
                 if fs::remove_file(expected).is_err() {
-                    eprintln!("shim: socket left in place after shutdown (remove failed)");
+                    report_cleanup_failure(
+                        CriErrorCode::Internal,
+                        "socket left in place after shutdown (remove failed)",
+                    );
                     return;
                 }
             }
             Some(_) => {
-                eprintln!("shim: socket left in place after shutdown (replaced)");
+                report_cleanup_failure(
+                    CriErrorCode::FailedPrecondition,
+                    "socket left in place after shutdown (replaced)",
+                );
                 return;
             }
             None => {}
@@ -1277,7 +1301,13 @@ mod unix_impl {
         F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
     {
         let first = sock_ident(expected).ok_or_else(|| failed("socket path is missing"))?;
-        let signal = ShutdownSignal::new();
+        // Shutdown RPC は要求を立てる前に ID ロックを取り、片付けの終わりまで持つ（並行 start の締め出し）。
+        let (gate_dir, gate_inv) = (dir.to_path_buf(), inv.clone());
+        let signal = ShutdownSignal::with_gate(Arc::new(move || {
+            acquire_lock(&gate_dir, &gate_inv)
+                .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>)
+                .map_err(|_| ())
+        }));
         let registry = make_registry(signal.clone())?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
@@ -1307,6 +1337,14 @@ mod unix_impl {
                 break;
             }
         }
+        let held = if shutdown_requested {
+            signal
+                .take_held()
+                .and_then(|b| b.downcast::<IdLock>().ok())
+                .map(|b| *b)
+        } else {
+            None
+        };
         if shutdown_requested {
             // 停止フラグは応答の書き込みを打ち切るため、先に Shutdown 自身の応答を流し切る（有界）。
             let _ = handle.wait_idle(SHUTDOWN_RESPONSE_GRACE);
@@ -1315,7 +1353,7 @@ mod unix_impl {
             .shutdown()
             .map_err(|_| CriError::new(CriErrorCode::Timeout, "server shutdown timed out"));
         if shutdown_requested {
-            cleanup_after_shutdown(inv, dir, expected, first);
+            cleanup_after_shutdown(inv, dir, expected, first, held);
         }
         result
     }

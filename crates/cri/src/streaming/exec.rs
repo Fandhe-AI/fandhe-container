@@ -802,6 +802,21 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 }
                 r
             }
+            Frame::Data { stream_id, .. }
+                if streams.stdin == Some(stream_id) && early.reset.contains(&stream_id) =>
+            {
+                // リセット済みのストリームの DATA は捨てる。
+                Ok(())
+            }
+            Frame::Data { stream_id, .. } if streams.stdin == Some(stream_id) && early.fin => {
+                // FIN 済みの送信方向への後続 DATA は拒否する（Attach と同じ。CRI-6）。
+                early.buf.clear();
+                early.reset.push(stream_id);
+                conn.queue(&Frame::RstStream {
+                    stream_id,
+                    status: rst_status::STREAM_ALREADY_CLOSED,
+                })
+            }
             Frame::Data {
                 stream_id,
                 fin,
@@ -812,6 +827,11 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 }
                 early.buf.extend_from_slice(&data);
                 early.fin |= fin;
+                Ok(())
+            }
+            Frame::Data { stream_id, .. }
+                if streams.resize == Some(stream_id) && early.reset.contains(&stream_id) =>
+            {
                 Ok(())
             }
             Frame::Data {
@@ -861,6 +881,8 @@ fn accept_stream<T: AsyncRead + AsyncWrite + Unpin>(
     if id.get().is_multiple_of(2) || id.get() <= streams.last_id {
         return reject(conn, rst_status::PROTOCOL_ERROR);
     }
+    // ID は受理・拒否の判定より前に消費する（拒否した ID の再利用を許さない。SPDY/3 §2.3.2）。
+    streams.last_id = id.get();
     let Some(kind) = headers.get(HEADER_STREAM_TYPE).and_then(StreamType::parse) else {
         return reject(conn, rst_status::PROTOCOL_ERROR);
     };
@@ -868,7 +890,6 @@ fn accept_stream<T: AsyncRead + AsyncWrite + Unpin>(
         return reject(conn, rst_status::REFUSED_STREAM);
     }
     *streams.slot(kind) = Some(id);
-    streams.last_id = id.get();
     conn.queue(&Frame::SynReply {
         stream_id: id,
         fin: false,
@@ -999,6 +1020,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 if self.is_reset(stream_id) {
                     // リセット済みのストリームの DATA は捨てる。
                 } else if Some(stream_id) == self.streams.stdin {
+                    if self.stdin_fin {
+                        // FIN 済みの送信方向への後続 DATA は拒否する（Attach と同じ。CRI-6）。
+                        self.stdin_buf.clear();
+                        self.stdin_pos = 0;
+                        self.conn
+                            .queue(&Frame::RstStream {
+                                stream_id,
+                                status: rst_status::STREAM_ALREADY_CLOSED,
+                            })
+                            .map_err(|_| RelayEnd::Protocol)?;
+                        self.on_reset(stream_id);
+                        return Ok(());
+                    }
                     if self.stdin.is_some() {
                         self.stdin_buf.extend_from_slice(&data);
                     }

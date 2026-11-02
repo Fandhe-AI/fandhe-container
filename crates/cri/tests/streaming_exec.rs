@@ -1498,3 +1498,117 @@ async fn cri6_exec_records_stdin_shutdown_failure() {
         "{got:?}"
     );
 }
+
+/// 上限（16 KiB）を超える制御フレームを送ってセッションを `ProtocolError` で閉じる。
+fn finish_with_oversized_frame(client: &mut Client) -> Collected {
+    client.send_raw(&[0x80, 0x03, 0x00, 0x06, 0x00, 0xff, 0xff, 0xff]);
+    client.collect()
+}
+
+/// CRI-6: 拒否した SYN_STREAM の ID も消費され、同じ ID の後続は PROTOCOL_ERROR になる（SPDY/3 §2.3.2。Attach と同じ）。
+#[tokio::test]
+async fn cri6_exec_rejected_stream_id_cannot_be_reused() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["hang"], false, false, true, false);
+    let addr = fx.addr();
+    let (c, replies) = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin"); // stdin なしの要求なので REFUSED_STREAM
+        client.syn(3, "stdout"); // 拒否済みの ID の再利用
+        client.syn(5, "stdout");
+        let mut replies = Vec::new();
+        let mut rst = Vec::new();
+        while replies.len() < 2 || rst.len() < 2 {
+            match client.recv().expect("frame") {
+                Frame::SynReply { stream_id, .. } => replies.push(stream_id.get()),
+                Frame::RstStream { stream_id, status } => rst.push((stream_id.get(), status)),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let mut c = finish_with_oversized_frame(&mut client);
+        c.rst = rst;
+        (c, replies)
+    })
+    .await
+    .expect("join");
+    assert_eq!(replies, vec![1, 5]);
+    assert_eq!(
+        c.rst,
+        vec![
+            (3, rst_status::REFUSED_STREAM),
+            (3, rst_status::PROTOCOL_ERROR)
+        ]
+    );
+}
+
+/// CRI-6: stdin の FIN 後の DATA は STREAM_ALREADY_CLOSED の RST_STREAM で拒否する（Attach と同じ）。
+#[tokio::test]
+async fn cri6_exec_data_after_stdin_fin_is_rejected() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["hang"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"a", true);
+        client.data(3, b"b", false);
+        finish_with_oversized_frame(&mut client)
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.rst, vec![(3, rst_status::STREAM_ALREADY_CLOSED)]);
+    assert_eq!(c.goaway, Some(goaway_status::PROTOCOL_ERROR));
+}
+
+/// CRI-6: 組が揃う前（SYN_STREAM と同時に届く場合を含む）の FIN 後の DATA も同じく拒否する。
+#[tokio::test]
+async fn cri6_exec_data_after_stdin_fin_is_rejected_when_sent_with_syn() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["hang"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.data(3, b"a", true);
+        client.data(3, b"b", false);
+        client.syn(5, "stdout");
+        finish_with_oversized_frame(&mut client)
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.rst, vec![(3, rst_status::STREAM_ALREADY_CLOSED)]);
+}
+
+/// CRI-6: RST_STREAM 済みの stdin への DATA は無視し、追加の RST_STREAM を返さない。
+#[tokio::test]
+async fn cri6_exec_data_after_stdin_reset_is_ignored() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["hang"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.send(&Frame::RstStream {
+            stream_id: sid(3),
+            status: rst_status::CANCEL,
+        });
+        client.data(3, b"x", false);
+        finish_with_oversized_frame(&mut client)
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.rst, Vec::<(u32, u32)>::new());
+    assert_eq!(c.goaway, Some(goaway_status::PROTOCOL_ERROR));
+}

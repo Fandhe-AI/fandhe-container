@@ -11,13 +11,13 @@
 //! `KVM_RUN`・`KVM_SET_USER_MEMORY_REGION`（自己診断用の 1 ページ。`GuestPage`・`RegisteredPage`）を足した。
 //! TASK-74.4.2 で `kvm_run` 領域への応答の書き戻し（`KvmRunMap::write_from`。`device::VcpuFd::handle_exit` が呼ぶ）を足した。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
-//! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `ThreadId::kick`（`SIGUSR2`）で中断する。REPAIR-5）。
+//! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `KickTarget::kick`（`SIGUSR2`。`with_current_thread` の中だけで使える）で中断する。REPAIR-5）。
 //!
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で理由と維持すべき不変条件を明記する
 //! - 定数は `cfg(target_arch = ...)` ごとに個別に定義し（値が同じでも流用しない）、対応外では
-//!   [`SysError::Unsupported`] を返す（fail-closed）。対応 arch は LP64 の x86_64・aarch64 だけ
+//!   [`SysError::Unsupported`] を返す（fail-closed）。対応は glibc（`target_env = "gnu"`）の LP64 の x86_64・aarch64 だけ。musl は `ioctl` の `request` の型が異なるため対象外
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` との機械照合について
@@ -34,6 +34,7 @@ use std::ffi::c_void;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::exit::{RunArea, RunAreaMut};
 
@@ -44,6 +45,8 @@ pub(crate) enum SysError {
     Unsupported,
     /// カーネルが返した errno。
     Os(i32),
+    /// `mmap` が NULL を返した（マッピングは `munmap` 済み。原因の errno は無い）。
+    NullMapping,
 }
 
 /// `_IO(type, nr)` の符号化（方向・サイズが 0 のため `(type << 8) | nr`）。
@@ -83,7 +86,8 @@ const KVMIO: u64 = 0xAE;
 /// 定数（x86_64）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 pub(crate) mod consts {
-    pub const SUPPORTED: bool = true;
+    /// glibc の LP64 のみ対応（musl は `ioctl` の `request` が `int` で宣言が合わないため fail-closed）。
+    pub const SUPPORTED: bool = cfg!(target_env = "gnu");
     pub const KVM_API_VERSION: i32 = 12;
     pub const KVM_GET_API_VERSION: u64 = super::io(super::KVMIO, 0x00);
     pub const KVM_CREATE_VM: u64 = super::io(super::KVMIO, 0x01);
@@ -100,7 +104,8 @@ pub(crate) mod consts {
 /// 定数（aarch64）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) mod consts {
-    pub const SUPPORTED: bool = true;
+    /// glibc の LP64 のみ対応（musl は `ioctl` の `request` が `int` で宣言が合わないため fail-closed）。
+    pub const SUPPORTED: bool = cfg!(target_env = "gnu");
     pub const KVM_API_VERSION: i32 = 12;
     pub const KVM_GET_API_VERSION: u64 = super::io(super::KVMIO, 0x00);
     pub const KVM_CREATE_VM: u64 = super::io(super::KVMIO, 0x01);
@@ -180,38 +185,11 @@ const _: () = {
     assert!(consts::KVM_RUN == 0xAE80);
 };
 
+/// `kvm_run.immediate_exit` のオフセット（`linux/kvm.h`）。
+const IMMEDIATE_EXIT_OFFSET: usize = 1;
+
 /// ゲストページ 1 枚の大きさとアライン（KVM の memslot は 4 KiB 単位）。
 pub(crate) const GUEST_PAGE_SIZE: usize = 4096;
-
-// SAFETY: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は `request` が `int` で対象外）。
-// 可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
-// LP64 で `unsigned long` は u64。可変長部は `KVM_CREATE_VM` の machine type（`unsigned long`）のみで、
-// 呼び出し側は u64 で渡す。
-//
-// `mmap` / `munmap`（glibc・musl 共通）。LP64 で `size_t` は usize、`off_t` は i64（x86_64・aarch64 Linux）。
-// 可変長ではない。対応 arch は LP64 の 2 つに限る（`consts::SUPPORTED` で他は呼ぶ前に弾く）。
-unsafe extern "C" {
-    fn ioctl(fd: i32, request: u64, ...) -> i32;
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
-    -> *mut c_void;
-    fn munmap(addr: *mut c_void, len: usize) -> i32;
-    // `sigaction` / `pthread_sigmask`（glibc・musl 共通）。第 2・3 引数は NULL 可。
-    fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
-    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
-    // `pthread_self` / `pthread_kill`（`pthread_t` は LP64 Linux で unsigned long）。`pthread_kill` は errno を戻り値で返す。
-    fn pthread_self() -> u64;
-    fn pthread_kill(thread: u64, sig: i32) -> i32;
-}
-
-/// vCPU 中断用のシグナル（`SIGUSR2`。x86_64・aarch64 Linux とも 12）。
-const SIG_VCPU_KICK: i32 = 12;
-/// `SIG_DFL`。
-const SIG_DFL: usize = 0;
-/// `pthread_sigmask` の how（Linux 共通: SIG_UNBLOCK = 1、SIG_SETMASK = 2）。
-#[cfg(target_arch = "x86_64")]
-const SIG_BLOCK: i32 = 0;
-const SIG_UNBLOCK: i32 = 1;
-const SIG_SETMASK: i32 = 2;
 
 /// Linux の `sigset_t`（glibc・musl とも 1024 bit = 128 バイト。`SIGUSR2` は第 0 語の bit 11）。
 #[repr(C)]
@@ -227,24 +205,95 @@ struct SigAction {
     restorer: usize,
 }
 
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const _: () = {
+    assert!(std::mem::size_of::<SigSet>() == 128);
+    assert!(std::mem::size_of::<SigAction>() == 152);
+    assert!(std::mem::align_of::<SigAction>() == 8);
+    assert!(std::mem::offset_of!(SigAction, mask) == 8);
+    assert!(std::mem::offset_of!(SigAction, flags) == 136);
+    assert!(std::mem::offset_of!(SigAction, restorer) == 144);
+};
+
+// SAFETY: 宣言の根拠をここに集約する（対応は glibc の LP64 の x86_64・aarch64 だけで、`consts::SUPPORTED` が
+// それ以外では各ラッパーの冒頭で弾くため、型の合わない宣言は呼ばれない。宣言しただけでは未定義動作にならない）。
+// - `ioctl`: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は `request` が `int`）。可変長引数として
+//   宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。LP64 で
+//   `unsigned long` は u64。可変長部は呼び出し側が u64 かポインタで渡す。
+// - `mmap` / `munmap`: LP64 で `size_t` は usize、`off_t` は i64。可変長ではない。
+// - `sigaction`: `SigAction` は上の const assert（152 バイト・mask がオフセット 8・flags が 136・restorer が 144）で
+//   固定した x86_64・aarch64 の `struct sigaction` のレイアウト。第 2・3 引数は NULL 可。
+// - `pthread_sigmask`: `SigSet` は 128 バイトの `sigset_t`（上の const assert）。第 2・3 引数は NULL 可。
+// - `pthread_self` / `pthread_kill`: `pthread_t` は glibc の LP64 で `unsigned long` = u64。`pthread_kill` は
+//   errno を戻り値で返す（errno 変数は触らない）。
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+    -> *mut c_void;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+    fn pthread_self() -> u64;
+    fn pthread_kill(thread: u64, sig: i32) -> i32;
+}
+
+/// `EBUSY`（x86_64・aarch64 Linux とも 16）。
+const EBUSY: i32 = 16;
+/// vCPU 中断用のシグナル（`SIGUSR2`。x86_64・aarch64 Linux とも 12）。
+const SIG_VCPU_KICK: i32 = 12;
+/// `SIG_DFL`。
+const SIG_DFL: usize = 0;
+/// `pthread_sigmask` の how（Linux 共通: SIG_UNBLOCK = 1、SIG_SETMASK = 2）。
+#[cfg(target_arch = "x86_64")]
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
 extern "C" fn kick_handler(_sig: i32) {}
 
-/// 呼び出しスレッドの識別子（`pthread_kill` の宛先）。
+/// `pthread_kill` の宛先スレッド。生存中のスレッドを指すことを型で保証する（`with_current_thread` が唯一の入口）。
+///
+/// # 健全性（終了したスレッドへの `pthread_kill` は glibc で未定義動作になりうる）
+/// `'a` は [`with_current_thread`] の高階クロージャが決めるため、呼び出し側は次のどれもできない:
+/// 戻り値への混入・外側の変数への保存・`'static` を要求する `std::thread::spawn` への受け渡し・クロージャより
+/// 外側の scope への `spawn`。渡せるのはクロージャの中で作る `thread::scope` の scoped thread だけで、それは
+/// scope が戻る前（panic の巻き戻しを含む）に必ず join される。クロージャは対象スレッド自身の上で同期実行される
+/// ため、`KickTarget` が使われうる間、対象スレッドは終了も join もしておらず、`pthread_t` も再利用されない。
+///
+/// 退けた案: `!Send` の guard 借用で生存を表す案は `Box::leak` で `'static` にでき、`&Scope` 由来のライフタイム案は
+/// scoped thread が自分を途中で join できるため、どちらも健全にならない。外へ持ち出せないことの compile-fail
+/// 試験は置かない（trybuild は依存の追加で、doctest は private な `sys` に届かない）。
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ThreadId(u64);
+pub(crate) struct KickTarget<'a> {
+    thread: u64,
+    _alive: std::marker::PhantomData<&'a ()>,
+}
 
-impl ThreadId {
-    /// 呼び出しスレッド自身の識別子。
-    pub(crate) fn current() -> ThreadId {
-        // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
-        ThreadId(unsafe { pthread_self() })
-    }
+/// 呼び出しスレッドを宛先とする [`KickTarget`] を作って `f` を同期実行する。`f` が戻るまで対象スレッドは生存する。
+///
+/// `crate::device` の `run_bounded` が、vCPU スレッド上で期限監視の scoped thread へ `KickTarget` を渡すために使う。
+pub(crate) fn with_current_thread<R>(f: impl for<'a> FnOnce(KickTarget<'a>) -> R) -> R {
+    // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
+    let thread = unsafe { pthread_self() };
+    f(KickTarget {
+        thread,
+        _alive: std::marker::PhantomData,
+    })
+}
 
-    /// このスレッドへ vCPU 中断シグナルを送る。スレッドが生存している間だけ呼ぶこと。
+impl KickTarget<'_> {
+    /// このスレッドへ vCPU 中断シグナルを送る。
     pub(crate) fn kick(self) -> Result<(), SysError> {
-        // SAFETY: `self.0` は `pthread_self` が返した値で、呼び出し側が対象スレッドの終了前（`thread::scope` 内）に
-        // だけ呼ぶ。シグナル番号は固定の SIGUSR2。ポインタ引数は無い。戻り値は errno そのもの。
-        let r = unsafe { pthread_kill(self.0, SIG_VCPU_KICK) };
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        // SAFETY: `self.thread` は `with_current_thread` の中で `pthread_self` が返した値で、`'a` が高階のため
+        // `with_current_thread` が戻る前（対象スレッドが生存中）にしか使えない。シグナル番号は固定の SIGUSR2。
+        // ポインタ引数は無い。戻り値は errno そのもの。
+        let r = unsafe { pthread_kill(self.thread, SIG_VCPU_KICK) };
         if r == 0 { Ok(()) } else { Err(SysError::Os(r)) }
     }
 }
@@ -319,6 +368,10 @@ static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// `sigaction` で現在の設定を **書き換えずに照会** し、未設定（SIG_DFL）か本 crate の handler のときだけ導入する。
 /// 別の handler・SIG_IGN があれば何も変更せず `Err`（他の用途を壊さない）。SA_RESTART は付けない。
+///
+/// # プロセス全体への影響
+/// `SIGUSR2` の handler はプロセス全体の設定で、導入後に元へ戻さない。本 crate を組み込むプロセスは `SIGUSR2` を
+/// 他の用途に使わないこと。既に別の handler・SIG_IGN があるときは上書きせず `SysError::Os(EBUSY)` で失敗する。
 pub(crate) fn install_kick_handler() -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -340,7 +393,7 @@ pub(crate) fn install_kick_handler() -> Result<(), SysError> {
         return Ok(());
     }
     if cur.handler != SIG_DFL {
-        return Err(SysError::Os(16));
+        return Err(SysError::Os(EBUSY));
     }
     let new = SigAction {
         handler: ours,
@@ -358,6 +411,7 @@ pub(crate) fn install_kick_handler() -> Result<(), SysError> {
 }
 
 fn last_error() -> SysError {
+    // `last_os_error` は常に OS 由来で `raw_os_error` は `Some` を返すため、`unwrap_or(0)` へは到達しない。
     SysError::Os(io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
@@ -415,6 +469,7 @@ pub(crate) fn kvm_get_vcpu_mmap_size(kvm: BorrowedFd<'_>) -> Result<usize, SysEr
     if r < 0 {
         return Err(last_error());
     }
+    // `r >= 0` の i32 は LP64 の usize に必ず収まるため、`Os(0)` の分岐へは到達しない。
     usize::try_from(r).map_err(|_| SysError::Os(0))
 }
 
@@ -447,8 +502,9 @@ pub(crate) struct KvmRunMap {
 // 発行されないため、`&self` からの読み取りと重ならない。ポインタはマッピングの生存中（drop まで）有効で、
 // スレッドに固有ではない。
 unsafe impl Send for KvmRunMap {}
-// SAFETY: 上と同じ。共有参照からは volatile の読み取りと `immediate_exit` の 1 バイト書き込みだけを行い、
-// 後者は別スレッドから同時に書かれてもカーネルが 1 バイトの読み取りとして扱う ABI である。
+// SAFETY: 上と同じ。共有参照から行うのは volatile の読み取りと、`immediate_exit`（オフセット 1）の
+// `AtomicU8` による読み書きだけで、後者は期限監視スレッドと同時でもデータ競合にならない。カーネルによる書き込みは
+// `&mut VcpuFd` 経由の `KVM_RUN` の間だけ。`write_from` は `&mut self` で排他的。
 unsafe impl Sync for KvmRunMap {}
 
 impl KvmRunMap {
@@ -475,7 +531,11 @@ impl KvmRunMap {
         }
         match NonNull::new(p.cast::<u8>()) {
             Some(ptr) => Ok(KvmRunMap { ptr, len }),
-            None => Err(SysError::Os(0)),
+            None => {
+                // SAFETY: 直前の mmap が返した長さ `len` の領域そのもので、他に所有者がいない。
+                let _ = unsafe { munmap(p, len) };
+                Err(SysError::NullMapping)
+            }
         }
     }
 
@@ -488,7 +548,16 @@ impl KvmRunMap {
         for (i, b) in buf.iter_mut().enumerate() {
             // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
             // マッピングは `self` の生存中有効。カーネルが並行して書き換えうるため参照を作らず volatile で 1 バイト読む。
-            *b = unsafe { self.ptr.as_ptr().add(off + i).read_volatile() };
+            // `immediate_exit` のバイトだけは期限監視スレッドが `AtomicU8` で書くため、atomic load で読む
+            // （atomic と非 atomic のアクセスを混ぜない。u8 のためアラインは自明）。
+            *b = unsafe {
+                let p = self.ptr.as_ptr().add(off + i);
+                if off + i == IMMEDIATE_EXIT_OFFSET {
+                    AtomicU8::from_ptr(p).load(Ordering::SeqCst)
+                } else {
+                    p.read_volatile()
+                }
+            };
         }
         Ok(())
     }
@@ -513,18 +582,18 @@ impl KvmRunMap {
     /// `kvm_run.immediate_exit`（オフセット 1 の u8）を立てる / 下ろす。立てると次の（または実行中の）
     /// `KVM_RUN` がゲストを実行せず EINTR で戻る。別スレッドの期限監視が呼ぶ。
     pub(crate) fn set_immediate_exit(&self, on: bool) -> Result<(), ()> {
-        const IMMEDIATE_EXIT_OFFSET: usize = 1;
         if self.len <= IMMEDIATE_EXIT_OFFSET {
             return Err(());
         }
         // SAFETY: `IMMEDIATE_EXIT_OFFSET < len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
-        // マッピングは `self` の生存中有効。このバイトは KVM がユーザー空間の書き込みを前提に読む ABI で、
-        // 参照を作らず volatile で 1 バイトだけ書く。
+        // マッピングは `self` の生存中有効で、u8 のためアラインは自明。このバイトは KVM がユーザー空間の書き込みを
+        // 前提に読む ABI。Rust 側でこのバイトに触るのは、この atomic store と `read_into` の atomic load と、
+        // `&mut self` で排他的な `write_from` だけ（`&self` のこの関数とは重ならない）。SeqCst は呼び出し側の
+        // `timed_out` の store と順序を揃え、その後の `KickTarget::kick` より前に見えることを保証する。
+        // カーネル側の読み取り（READ_ONCE）は Rust のメモリモデルの外にある。
         unsafe {
-            self.ptr
-                .as_ptr()
-                .add(IMMEDIATE_EXIT_OFFSET)
-                .write_volatile(u8::from(on));
+            AtomicU8::from_ptr(self.ptr.as_ptr().add(IMMEDIATE_EXIT_OFFSET))
+                .store(u8::from(on), Ordering::SeqCst);
         }
         Ok(())
     }
@@ -690,6 +759,9 @@ impl Drop for RegisteredPage<'_> {
 /// `KVM_ARM_PREFERRED_TARGET`（VM fd）で推奨 target を得る（aarch64 のみ）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_arm_preferred_target(vm: BorrowedFd<'_>) -> Result<KvmVcpuInit, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
     let mut init = KvmVcpuInit::default();
     // SAFETY: `vm` は借用中の生存 fd。`init` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号の
     // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 32 バイトだけを
@@ -707,6 +779,9 @@ pub(crate) fn kvm_arm_preferred_target(vm: BorrowedFd<'_>) -> Result<KvmVcpuInit
 /// `KVM_ARM_VCPU_INIT`（vCPU fd）で vCPU を初期化する（aarch64 のみ。未実施だと `KVM_RUN` は ENOEXEC）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_arm_vcpu_init(vcpu: BorrowedFd<'_>, init: &KvmVcpuInit) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
     // SAFETY: `vcpu` は借用中の生存 fd。`init` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号の
     // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 32 バイトを読むだけで書かず、
     // 呼び出しは同期で完了して戻り後にポインタを保持しない。
@@ -754,7 +829,36 @@ mod tests {
     fn kick_self_after_handler_install_survives() {
         install_kick_handler().unwrap();
         install_kick_handler().unwrap();
-        ThreadId::current().kick().unwrap();
+        with_current_thread(|t| t.kick()).unwrap();
+    }
+
+    /// REPAIR-5・MVM-1: scoped thread から `KickTarget` で所有スレッドへ送れ、戻り値がそのまま返る。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn kick_from_scoped_thread_reaches_owner() {
+        install_kick_handler().unwrap();
+        let v = with_current_thread(|t| {
+            std::thread::scope(|s| {
+                s.spawn(move || t.kick()).join().unwrap().unwrap();
+            });
+            42
+        });
+        assert_eq!(v, 42);
+    }
+
+    /// MVM-1: sigaction / sigset_t のレイアウトの具体値。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn signal_struct_layout_matches_kernel_abi() {
+        assert_eq!(std::mem::size_of::<SigSet>(), 128);
+        assert_eq!(std::mem::size_of::<SigAction>(), 152);
+        assert_eq!(std::mem::offset_of!(SigAction, flags), 136);
     }
 
     /// MVM-1: `KVM_RUN` 系の ioctl 番号と構造体サイズの具体値（`linux/kvm.h`）。

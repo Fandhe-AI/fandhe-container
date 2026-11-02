@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -627,4 +627,228 @@ fn kvm_device_guest_writes_registered_memory() {
         .expect("guest memory test did not finish within 30s")
         .unwrap();
     assert_eq!(byte, 0x5A);
+}
+
+/// MVM-1・TASK-75.2: デバイス・vCPU・メモリを 1 つの VM 構成体に組み立て、一貫した経路で触れること。
+/// 破棄後に同じ `KvmDevice` で再度組み立てられる（資源が解放されている）ことも確かめる（x86_64）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assemble_microvm() {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::interrupt::InterruptDelivery;
+    use fandhe_container_microvm::microvm::{
+        DeviceSlot, MicroVm, MicroVmConfig, NetDeviceConfig, QueueNotifyReport, VirtioDeviceKind,
+    };
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_mmio::{MAGIC_VALUE, reg};
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config = || MicroVmConfig {
+        vcpu_count: 2,
+        mem_size: 2 << 20,
+        block: vec![MemoryBlockBackend::new(16 * 512, false).unwrap()],
+        net: vec![NetDeviceConfig {
+            backend: MemoryNetBackend::new(),
+            mac: [0x02, 0, 0, 0, 0, 1],
+        }],
+    };
+    for _ in 0..2 {
+        let mut vm: MicroVm<_, _> = MicroVm::assemble(&dev, config()).unwrap();
+        let ids: Vec<u32> = vm.vcpus().iter().map(|v| v.id()).collect();
+        assert_eq!(ids, vec![0, 1]);
+        assert_eq!(vm.memory().base(), GuestAddress::new(0));
+        assert_eq!(vm.memory().len(), 2 << 20);
+        vm.memory_mut()
+            .write_at(GuestAddress::new(0x1000), &[0xDE, 0xAD, 0xBE, 0xEF])
+            .unwrap();
+        assert_eq!(
+            vm.memory().read_u32_le(GuestAddress::new(0x1000)).unwrap(),
+            0xEFBE_ADDE
+        );
+        let infos = vm.devices();
+        assert_eq!(
+            infos.iter().map(|i| i.slot).collect::<Vec<_>>(),
+            vec![
+                DeviceSlot {
+                    kind: VirtioDeviceKind::Block,
+                    index: 0,
+                    mmio_base: 0xd000_0000,
+                    mmio_len: 0x1000,
+                    gsi: 5,
+                },
+                DeviceSlot {
+                    kind: VirtioDeviceKind::Net,
+                    index: 0,
+                    mmio_base: 0xd000_1000,
+                    mmio_len: 0x1000,
+                    gsi: 6,
+                },
+            ]
+        );
+        let mut buf = [0u8; 4];
+        vm.with_block(0, |t| t.read(reg::MAGIC, &mut buf)).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), MAGIC_VALUE);
+        vm.with_net(0, |t| t.read(reg::DEVICE_ID, &mut buf))
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 1);
+        match vm.complete_queue_notify(infos[0].id, 0).unwrap() {
+            QueueNotifyReport::Block(r) => assert_eq!(r.delivery, InterruptDelivery::NotNeeded),
+            other => panic!("unexpected report: {other:?}"),
+        }
+        assert_eq!(
+            vm.with_block(1, |_| ()).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        let exit = fandhe_container_microvm::exit::VcpuExit::Hlt;
+        assert_eq!(
+            vm.handle_exit(2, &exit).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+}
+
+/// MVM-1・TASK-75.2: x86_64 以外では組み立てが最初の ioctl より前に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assemble_microvm() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+/// MVM-1・TASK-75.3.1: 組み立て済みの VM へ合成 bzImage と initrd をロードし、zero page・cmdline・payload・initrd を
+/// ゲストメモリから読み戻して照合する（x86_64）。実カーネルの起動は #885・#886 の範囲。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_load_kernel_into_assembled_microvm() {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let mut vm = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![MemoryBlockBackend::new(16 * 512, false).unwrap()],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [0x02, 0, 0, 0, 0, 1],
+            }],
+        },
+    )
+    .unwrap();
+
+    // 合成 bzImage: setup_sects=4・version 2.15・LOADED_HIGH・XLF_KERNEL_64・relocatable・pref 0x100_0000。
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+    put(0x1F1, &[4]);
+    put(0x1FE, &0xAA55u16.to_le_bytes());
+    put(0x201, &[0x62]);
+    put(0x202, b"HdrS");
+    put(0x206, &0x020Fu16.to_le_bytes());
+    put(0x211, &[1]);
+    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+    put(0x230, &0x20_0000u32.to_le_bytes());
+    put(0x234, &[1]);
+    put(0x236, &1u16.to_le_bytes());
+    put(0x238, &2047u32.to_le_bytes());
+    put(0x258, &0x100_0000u64.to_le_bytes());
+    put(0x260, &0x40_0000u32.to_le_bytes());
+    for (i, b) in img[5 * 512..].iter_mut().enumerate() {
+        *b = (i % 251) as u8 | 1;
+    }
+    let initrd: Vec<u8> = (0..0x2000u32).map(|i| (i % 241) as u8).collect();
+
+    let l = vm
+        .load_kernel(&img, Some(&initrd), "console=ttyS0")
+        .unwrap();
+    assert_eq!(l.entry, GuestAddress::new(0x100_0200));
+    assert_eq!(l.boot_params, GuestAddress::new(0x7000));
+    assert_eq!(l.initrd, Some((GuestAddress::new(0x3FF_E000), 0x2000)));
+
+    let read = |addr: u64, n: usize| {
+        let mut b = vec![0u8; n];
+        vm.memory()
+            .read_at(GuestAddress::new(addr), &mut b)
+            .unwrap();
+        b
+    };
+    assert_eq!(read(0x100_0000, 0x1000), img[5 * 512..].to_vec());
+    assert_eq!(read(0x3FF_E000, 0x2000), initrd);
+    assert_eq!(read(0x7000 + 0x202, 4), b"HdrS".to_vec());
+    assert_eq!(
+        vm.memory()
+            .read_u32_le(GuestAddress::new(0x7000 + 0x218))
+            .unwrap(),
+        0x3FF_E000
+    );
+    assert_eq!(
+        vm.memory()
+            .read_u32_le(GuestAddress::new(0x7000 + 0x21C))
+            .unwrap(),
+        0x2000
+    );
+    let want = "console=ttyS0 virtio_mmio.device=0x1000@0xd0000000:5 virtio_mmio.device=0x1000@0xd0001000:6\0";
+    assert_eq!(read(0x2_0000, want.len()), want.as_bytes().to_vec());
+}
+
+/// MVM-1・TASK-75.3.1: x86_64 以外ではカーネルのロードが `Unimplemented`（組み立てが先に `Unimplemented` で失敗する）。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_load_kernel_into_assembled_microvm() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
 }

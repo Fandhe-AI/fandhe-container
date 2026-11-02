@@ -111,7 +111,7 @@ hyper-util = { version = "=0.1.21", default-features = false }
 hyper = { version = "=1.12.0", default-features = false }
 
 # OCI レイヤー blob の gzip 展開（OCI-1・TASK-52.2）。承認: Issue #406・TASK-52.hdep2（オーナー判断 2026-10-10）。
-# 配置は crates/oci に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。
+# 配置は crates/oci と crates/cri（SPDY/3.1 ヘッダの zlib 辞書。#678・#680）に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。
 # 純 Rust・MIT OR Apache-2.0（zlib-rs は Zlib）。default-features を無効化する。
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 # OCI レイヤー tar の解析（OCI-1・TASK-52.3）。承認: Issue #408（オーナー判断 2026-10-10）。配置は crates/oci に限る。

@@ -1,6 +1,6 @@
 # rust-vmm 禁止クレートの判定結果の記録
 
-MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めない）の機械判定を、`crates/microvm` 本体の実装前（雛形のみ）のワークスペースで実行した結果と、TASK-74・TASK-75 の後に同じ判定を再実行する手順を記録する（TASK-73.3・#687・MS-7。関連: REPAIR-9・REPAIR-12・OSS-3・OSS-5）。判定の仕組みは TASK-73.1（#685）と TASK-73.2（#686）で導入済み。
+MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めない）の機械判定を、`crates/microvm` 本体の実装前（雛形のみ）のワークスペースで実行した結果と、TASK-74・TASK-75 の後に同じ判定を再実行する手順を記録する。TASK-74 完了後の再実行結果（TASK-74.6・#694）も追記した（TASK-73.3・#687・MS-7。関連: REPAIR-9・REPAIR-12・OSS-3・OSS-5）。判定の仕組みは TASK-73.1（#685）と TASK-73.2（#686）で導入済み。
 
 この記録は判定の代わりではない。PR ごとの継続的な検出は CI（`platform-ci` の `make check-microvm-deps`、rust-ci の `cargo deny`、`make deny-bans-fail-closed-selftest`）が担う。
 
@@ -19,6 +19,7 @@ MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めな
 - 検査したマニフェスト: ルート workspace の `Cargo.toml`（500 packages）・`poc/venus-decoder/jig/Cargo.toml`（41 packages）
 - workspace メンバー（21 件）: `fandhe-container-` に続く `benches`・`cli`・`compose-convert`・`core`・`cri`・`gpu`・`guest-init`・`io`・`microvm`・`net`・`oci`・`platform-macos`・`platform-windows`・`plugin`・`plugin-cri`・`plugin-macos`・`plugin-mcp`・`plugin-microvm`・`plugin-windows`・`stack`・`supervisor`
 - `crates/microvm`・`crates/plugin-microvm` は TASK-1.3 の雛形で `[dependencies]` を持たない。`cargo tree -p <名前> -e normal,build,dev --target all --all-features --locked` は自分自身の 1 行だけを返した
+- TASK-74 完了後（TASK-74.6・#694）: ルート workspace は 502 packages・治具は 41 packages、workspace メンバーは 21 件のまま。`crates/microvm` は TASK-74.1〜74.5 の本体実装後も `[dependencies]`・`[dev-dependencies]`・`[build-dependencies]` を持たず、`cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked` は自分自身の 1 行だけを返した。`crates/plugin-microvm` は雛形のまま
 
 ## 実行結果
 
@@ -28,6 +29,11 @@ MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めな
 | 同上 | `1c918a76` | 同上 | 同上 | `cargo deny --locked check bans licenses`（ルート）と、治具に対する `--manifest-path poc/venus-decoder/jig/Cargo.toml --config deny.toml` 付きの同検査 | 両方 `bans ok, licenses ok`（`unmatched license allowance` は警告で、判定に影響しない） |
 | 同上 | `1c918a76` | 同上 | 同上 | `make deny-bans-fail-closed-selftest` | 全ケース合格（禁止クレートは終了コード 2 で拒否、対照は 0） |
 | 同上 | `1c918a76` | 同上 | 同上 | `make check-microvm-deps-selftest` | 17 passed, 0 failed |
+| 2026-11-02 09:46 UTC | `1ca2767a` | TASK-74 完了（TASK-74.6・#694） | Linux x86_64・cargo 1.99.0・cargo-deny 0.20.2 | `make check-microvm-deps` | 終了コード 0。ルート 502 packages・治具 41 packages ともに `OK: no rust-vmm crate` |
+| 同上 | `1ca2767a` | 同上 | 同上 | `cargo deny --locked check bans licenses`（ルート）と、治具に対する `--manifest-path poc/venus-decoder/jig/Cargo.toml --config deny.toml` 付きの同検査 | 両方 `bans ok, licenses ok` |
+| 同上 | `1ca2767a` | 同上 | 同上 | `cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked` | 自分自身の 1 行のみ（依存なし） |
+| 同上 | `1ca2767a` | 同上 | 同上 | `make deny-bans-fail-closed-selftest` | 全ケース合格（禁止クレートは終了コード 2 で拒否、対照は 0） |
+| 同上 | `1ca2767a` | 同上 | 同上 | `make check-microvm-deps-selftest` | 17 passed, 0 failed |
 
 advisories は外部 DB に依存して時点で変わるため、この記録の対象外とし、CI の `make deny` が担う。
 

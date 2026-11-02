@@ -1266,13 +1266,55 @@ mod tests {
         );
     }
 
-    /// 試験用の一意な作業ディレクトリ。
+    /// 排他作成した試験用の作業ディレクトリ。Drop で自分が作ったパスだけを消す(PLUG-12・SEC-1・#872)。
     #[cfg(unix)]
-    fn scratch(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("fc-872-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    struct Scratch(PathBuf);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `temp_dir()` 直下に、ランダムな名前で非再帰に排他作成する(mode 0700)。予測できる名前を消して作り直す
+    /// 方式は、その隙に別ユーザーが symlink を置けるうえ、他の実行の残骸にも触れるため採らない。
+    /// 既存の名前(symlink を含む)は辿らず消さず、`AlreadyExists` なら別の名前で再試行する(上限 16 回)。
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> Scratch {
+        use std::hash::{BuildHasher, Hasher};
+        use std::os::unix::fs::DirBuilderExt;
+        for _ in 0..16 {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos()),
+            );
+            let p = std::env::temp_dir().join(format!(
+                "fc-872-{tag}-{}-{:016x}",
+                std::process::id(),
+                h.finish()
+            ));
+            match std::fs::DirBuilder::new()
+                .recursive(false)
+                .mode(0o700)
+                .create(&p)
+            {
+                Ok(()) => return Scratch(p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => panic!("mkdir scratch {}: {e}", p.display()),
+            }
+        }
+        panic!("no free scratch name for {tag}");
     }
 
     /// PLUG-12・SEC-1・#872: 元の経路の祖先が他者に書き込み可（非スティッキー）なら拒否する（P0-2）。
@@ -1286,7 +1328,6 @@ mod tests {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = prepare_socket_dir(&open.join("sock")).unwrap_err();
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// PLUG-12・SEC-1・#872: 現在のユーザー所有の symlink は祖先に置けない（P0-2。元の経路の検査）。
@@ -1299,7 +1340,6 @@ mod tests {
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         let err = prepare_socket_dir(&base.join("link").join("sock")).unwrap_err();
         assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// PLUG-12・SEC-1・#872: 拡張 ACL が付いた最終ディレクトリ・祖先は mode 0700 でも拒否する（P0-1。macOS のみ）。
@@ -1324,6 +1364,5 @@ mod tests {
             prepare_socket_dir(&anc.join("sock")).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

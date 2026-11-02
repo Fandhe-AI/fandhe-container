@@ -489,12 +489,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
     /// クライアントが読まない間に PING・SYN_STREAM 等への応答で送信キューが膨らまないよう、
     /// 送信キューが上限を超えている間は読み取りも止める（REPAIR-5。止まったままなら idle で終わる）。
+    /// 対ごとの受信滞留では止めない（1 対の滞留で他の対の DATA と RST_STREAM が読めなくなるため）。
+    /// 対ごとの上限は `on_frame` で、超えた対だけを RST_STREAM でリセットして守る。
     fn can_read(&self) -> bool {
         self.outbox.pending() <= self.config.max_pending_bytes
-            && self
-                .pairs
-                .values()
-                .all(|p| p.pending() <= self.config.max_pending_bytes)
     }
 
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<PortForwardEnd> {
@@ -620,9 +618,28 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                     // error ストリームの空 FIN はクライアントの半閉じ。サーバー側の送信は保持する。
                     return;
                 }
-                if let Some((key, Kind::Data)) = self.streams.get(&stream.get())
-                    && let Some(pair) = self.pairs.get_mut(key)
-                {
+                if let Some((key, Kind::Data)) = self.streams.get(&stream.get()).cloned() {
+                    let Some(pair) = self.pairs.get_mut(&key) else {
+                        return;
+                    };
+                    if pair.peer_fin {
+                        // 半閉じ後の DATA は不正。TCP へ転送せず、このストリームをリセットする。
+                        self.outbox.send(&Frame::RstStream {
+                            stream,
+                            status: RST_PROTOCOL_ERROR,
+                        });
+                        self.abort_pair(&key, Some(stream));
+                        return;
+                    }
+                    if pair.pending().saturating_add(data.len()) > self.config.max_pending_bytes {
+                        // 転送先が読まない対だけをリセットする（他の対の読み取りは止めない。REPAIR-5）。
+                        self.outbox.send(&Frame::RstStream {
+                            stream,
+                            status: RST_CANCEL,
+                        });
+                        self.abort_pair(&key, Some(stream));
+                        return;
+                    }
                     pair.to_tcp.extend_from_slice(&data);
                     if fin {
                         pair.peer_fin = true;

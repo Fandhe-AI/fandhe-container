@@ -332,6 +332,7 @@ fn encode_header_block(headers: &Headers) -> Result<Vec<u8>, SpdyError> {
     if headers.len() > MAX_HEADER_COUNT {
         return Err(SpdyError::LimitExceeded("too many headers"));
     }
+    let mut total: usize = 4;
     let mut raw = Vec::new();
     put_u32(
         &mut raw,
@@ -344,6 +345,13 @@ fn encode_header_block(headers: &Headers) -> Result<Vec<u8>, SpdyError> {
         {
             return Err(SpdyError::LimitExceeded("header field is too large"));
         }
+        // 復号側の生ブロック上限（長さ接頭辞を含む）を、確保・圧縮の前に検査する。
+        total = total
+            .checked_add(8)
+            .and_then(|t| t.checked_add(name.len()))
+            .and_then(|t| t.checked_add(value.len()))
+            .filter(|t| *t <= MAX_HEADER_BLOCK_BYTES)
+            .ok_or(SpdyError::LimitExceeded("header block is too large"))?;
         put_u32(&mut raw, name.len() as u32);
         raw.extend_from_slice(name.as_bytes());
         put_u32(&mut raw, value.len() as u32);
@@ -833,6 +841,25 @@ mod tests {
         assert_eq!(
             big.encode(&mut comp),
             Err(SpdyError::LimitExceeded("header field is too large"))
+        );
+    }
+
+    /// CRI-6: 件数・各長が上限内でも、長さ接頭辞を含む合計が復号側の上限を超える符号化は拒否する。
+    #[test]
+    fn cri6_header_block_total_limit_enforced_on_encode() {
+        let mut comp = HeaderCompressor::new().expect("comp");
+        // 名前 1 バイト・値 8192 バイトの 8 件 = 4 + 8 * (8 + 1 + 8192) = 65612 バイト（> 65536）。
+        let headers: Headers = (0..8)
+            .map(|i| (format!("{i}"), "a".repeat(MAX_HEADER_FIELD_BYTES)))
+            .collect();
+        let frame = Frame::SynReply {
+            stream: sid(1),
+            fin: false,
+            headers,
+        };
+        assert_eq!(
+            frame.encode(&mut comp),
+            Err(SpdyError::LimitExceeded("header block is too large"))
         );
     }
 

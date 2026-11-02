@@ -185,7 +185,8 @@ fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool 
         .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .any(|v| v.to_ascii_lowercase().contains(token))
+        .flat_map(|v| v.split(','))
+        .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
 /// クライアントの要求ヘッダからサブプロトコルを選ぶ（kubelet の `Handshake` → `UpgradeResponse` の順に合わせる）。
@@ -480,6 +481,24 @@ mod tests {
                 "v2.channel.k8s.io"
             ]
         );
+    }
+
+    #[test]
+    fn cri6_remotecommand_header_tokens_match_whole_token() {
+        for (conn, upg) in [("notupgrade", "SPDY/3.1"), ("Upgrade", "notspdy/3.1")] {
+            let h = headers(&[
+                ("connection", conn),
+                ("upgrade", upg),
+                ("x-stream-protocol-version", "v4.channel.k8s.io"),
+            ]);
+            assert_eq!(negotiate(&h), Err(HandshakeError::MissingUpgradeHeaders));
+        }
+        let h = headers(&[
+            ("connection", "keep-alive, Upgrade"),
+            ("upgrade", "spdy/3.1"),
+            ("x-stream-protocol-version", "v4.channel.k8s.io"),
+        ]);
+        assert!(negotiate(&h).is_ok());
     }
 
     #[test]

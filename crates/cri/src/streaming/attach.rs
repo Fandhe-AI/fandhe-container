@@ -771,6 +771,11 @@ where
         }
         match self.opened.kind_of(stream_id) {
             Some(StreamType::Stdin) => {
+                // FIN 済みの送信方向への後続 DATA は拒否する（FIN フレーム自身のペイロードは下で転送する）。
+                if self.stdin_fin {
+                    self.stdin_pending.clear();
+                    return self.reset_stream(stream_id, rst_status::STREAM_ALREADY_CLOSED);
+                }
                 // writer が無い（backend が stdin を渡さない・終了後）間は捨てる。接続前は溜める（上限で背圧）。
                 let discard = self.phase == Phase::Draining
                     || (self.phase == Phase::Running && self.stdin_writer.is_none());

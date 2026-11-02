@@ -29,7 +29,7 @@ pub use container_runtime::{
     CONTAINER_LOG_PATH_MAX_BYTES, CleanupOutcome, CleanupTarget, ContainerLogPath,
     ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
     DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
-    TerminationReason,
+    TerminationReason, WaitExitRequest,
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,

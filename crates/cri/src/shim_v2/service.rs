@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 
@@ -44,15 +45,83 @@ pub trait TtrpcService: Send + Sync {
     fn name(&self) -> &str;
     /// メソッドを処理する。失敗は [`RpcStatus`] で返す。
     fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcStatus>;
-    /// 長く待つメソッド（Wait 等）向け。`cancelled` が真になったら（サーバー停止・接続切断）待ちを
-    /// 打ち切る契約（REPAIR-5）。既定は取り消しを見ない `handle`。
-    fn handle_cancellable(
+    /// 長く待つメソッド（Wait 等）向け。`ctx` で取り消し（サーバー停止・接続切断）とクライアントの
+    /// 期限（ttrpc の `timeout_nano`）を受け取る契約（REPAIR-5）。既定は `ctx` を見ない `handle`。
+    fn handle_with_context(
         &self,
         method: &str,
         payload: &[u8],
-        _cancelled: &dyn Fn() -> bool,
+        _ctx: &CallContext<'_>,
     ) -> Result<Vec<u8>, RpcStatus> {
         self.handle(method, payload)
+    }
+}
+
+/// ttrpc の要求に付いたクライアントの期限（`Request.timeout_nano`。CRI-1・REPAIR-5）。
+///
+/// containerd/ttrpc の `getRequestContext` に倣い、0 は期限なし、正は相対の期限、負は期限切れ済みとして扱う。
+/// 壊れた値を表現できない形にし、巨大値による `Instant` のオーバーフローは「期限なし」に倒す
+/// （上限は常に呼び出し側の設定が持つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDeadline {
+    /// クライアントの期限なし。
+    None,
+    /// この時刻が期限。
+    At(Instant),
+    /// 受け取った時点で期限切れ。
+    Expired,
+}
+
+impl RequestDeadline {
+    /// 要求の読み取り開始時刻 `started` と `timeout_nano` から作る。
+    pub fn from_timeout_nano(started: Instant, timeout_nano: i64) -> Self {
+        match timeout_nano {
+            0 => Self::None,
+            n if n < 0 => Self::Expired,
+            n => started
+                .checked_add(Duration::from_nanos(n.unsigned_abs()))
+                .map_or(Self::None, Self::At),
+        }
+    }
+
+    /// `now` 時点で使える待ち時間を `cap`（呼び出し側の設定の上限）で切って返す。
+    /// 期限切れ（残りが 0 以下を含む）は `None`。
+    pub fn limit_from(&self, now: Instant, cap: Duration) -> Option<Duration> {
+        match self {
+            Self::None => Some(cap),
+            Self::Expired => None,
+            Self::At(t) => {
+                let left = t.checked_duration_since(now).filter(|d| !d.is_zero())?;
+                Some(left.min(cap))
+            }
+        }
+    }
+}
+
+/// 長く待つメソッドへ渡す呼び出しの文脈。`server` が接続ごとの dispatch で組み立てる。
+#[derive(Clone, Copy)]
+pub struct CallContext<'a> {
+    /// 真になったら待ちを打ち切る（サーバー停止・接続切断）。
+    pub cancelled: &'a (dyn Fn() -> bool + 'a),
+    /// クライアントの期限。使うのは Wait だけ（他のメソッドは短く、`ContainerRuntime` の契約で有界）。
+    pub deadline: RequestDeadline,
+}
+
+impl<'a> CallContext<'a> {
+    /// 文脈を組む。
+    pub fn new(cancelled: &'a (dyn Fn() -> bool + 'a), deadline: RequestDeadline) -> Self {
+        Self {
+            cancelled,
+            deadline,
+        }
+    }
+
+    /// 取り消しも期限もない文脈（`dispatch` 用）。
+    pub fn none() -> CallContext<'static> {
+        CallContext {
+            cancelled: &|| false,
+            deadline: RequestDeadline::None,
+        }
     }
 }
 
@@ -148,19 +217,19 @@ impl ServiceRegistry {
 
     /// 要求を処理して応答を作る。
     pub fn dispatch(&self, req: &TtrpcRequest) -> TtrpcResponse {
-        self.dispatch_cancellable(req, &|| false)
+        self.dispatch_with_context(req, &CallContext::none())
     }
 
-    /// 取り消し通知つきで要求を処理する（サーバーの接続ごとの並行 dispatch が使う）。
-    pub fn dispatch_cancellable(
+    /// 取り消し通知とクライアントの期限つきで要求を処理する（サーバーの接続ごとの並行 dispatch が使う）。
+    pub fn dispatch_with_context(
         &self,
         req: &TtrpcRequest,
-        cancelled: &dyn Fn() -> bool,
+        ctx: &CallContext<'_>,
     ) -> TtrpcResponse {
         let Some(svc) = self.services.get(&req.service) else {
             return status_response(unimplemented_status("service", &req.service));
         };
-        match svc.handle_cancellable(&req.method, &req.payload, cancelled) {
+        match svc.handle_with_context(&req.method, &req.payload, ctx) {
             Ok(payload) => TtrpcResponse {
                 status: None,
                 payload,
@@ -246,5 +315,51 @@ mod tests {
         let st = reg.dispatch(&req("nope.Svc", "M")).status.unwrap();
         assert_eq!(st.code, 12);
         assert_eq!(st.message, "service nope.Svc");
+    }
+
+    /// CRI-1・REPAIR-5: `timeout_nano` の境界。0 は期限なし、負は期限切れ、正は起点からの相対、巨大値は cap で切れる。
+    #[test]
+    fn cri1_request_deadline_from_timeout_nano() {
+        let t0 = Instant::now();
+        assert_eq!(
+            RequestDeadline::from_timeout_nano(t0, 0),
+            RequestDeadline::None
+        );
+        assert_eq!(
+            RequestDeadline::from_timeout_nano(t0, -1),
+            RequestDeadline::Expired
+        );
+        assert_eq!(
+            RequestDeadline::from_timeout_nano(t0, i64::MIN),
+            RequestDeadline::Expired
+        );
+        assert_eq!(
+            RequestDeadline::from_timeout_nano(t0, 1),
+            RequestDeadline::At(t0 + Duration::from_nanos(1))
+        );
+        let big = RequestDeadline::from_timeout_nano(t0, i64::MAX);
+        assert_eq!(
+            big.limit_from(t0, Duration::from_secs(60)),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    /// CRI-1・REPAIR-5: 実効の待ち時間は `min(残り, cap)`。期限切れと残り 0 は `None`。
+    #[test]
+    fn cri1_request_deadline_limit() {
+        let t0 = Instant::now();
+        let cap = Duration::from_secs(10);
+        assert_eq!(RequestDeadline::None.limit_from(t0, cap), Some(cap));
+        assert_eq!(RequestDeadline::Expired.limit_from(t0, cap), None);
+        let at = RequestDeadline::At(t0 + Duration::from_millis(100));
+        assert_eq!(at.limit_from(t0, cap), Some(Duration::from_millis(100)));
+        assert_eq!(
+            at.limit_from(t0 + Duration::from_millis(40), cap),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(at.limit_from(t0 + Duration::from_millis(100), cap), None);
+        assert_eq!(at.limit_from(t0 + Duration::from_secs(1), cap), None);
+        let far = RequestDeadline::At(t0 + Duration::from_secs(100));
+        assert_eq!(far.limit_from(t0, cap), Some(cap));
     }
 }

@@ -1,17 +1,15 @@
-//! Wait RPC の待ちの設定とポーリング本体（CRI-5・REPAIR-5・TASK-62.3.2・MS-7）。
+//! Wait RPC の待ちの設定（CRI-5・CRI-1・REPAIR-5・TASK-62.3.2・MS-7）。
 //!
-//! [`super::task_service::TaskService`] の `Wait` から呼ばれる。core の `ContainerRuntime` には
-//! 終了待ちのメソッドが無いため、`state` を一定間隔で照会して `Stopped` を待つ。待ちには必ず期限を付け
-//! （REPAIR-5）、超えたら `Timeout`（gRPC の `DeadlineExceeded`）で失敗する。
-//! plugin 越しでは照会 1 回が RPC 1 回で、その RPC も自前の期限を持つため、1 回の Wait の最悪の所要時間は
-//! 「timeout + 照会 1 回分の期限」になる。
+//! [`super::task_service::TaskService`] の `Wait` が読む。待ち本体は core の
+//! `ContainerRuntime::wait_exit`（`RuntimeAdapter::wait_exit` 経由）が持ち、ここは期限の上限と
+//! 既定実装（状態の照会）の間隔のヒントだけを持つ。ttrpc の `timeout_nano` は
+//! [`super::service::RequestDeadline`] で受け、実効の期限は `min(timeout_nano, WaitConfig::timeout)` になる。
+//! 待ちには必ず期限を付け（REPAIR-5）、超えたら `Timeout`（gRPC の `DeadlineExceeded`）で失敗する。
+//! plugin 越しでは待ち 1 回が RPC 1 回で、その RPC も自前の期限を持つ。
 
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::adapter::{RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::CriError;
-
 /// 設定に許す最大の時間（1 日。`server` の期限系の上限と同じ）。
 const MAX_WAIT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -38,12 +36,12 @@ impl WaitConfig {
         })
     }
 
-    /// 待ちの期限。
+    /// 待ちの期限の上限（クライアントの `timeout_nano` はこれを超えられない）。
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    /// 状態の照会間隔。
+    /// 既定実装の状態の照会間隔（イベント駆動の実装は使わない）。
     pub fn poll_interval(&self) -> Duration {
         self.poll_interval
     }
@@ -56,46 +54,6 @@ impl Default for WaitConfig {
         Self {
             timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(100),
-        }
-    }
-}
-
-/// 取り消し確認の刻み。sleep をこの単位に分け、停止要求・接続切断に素早く反応する（REPAIR-5）。
-const CANCEL_SLICE: Duration = Duration::from_millis(10);
-
-/// `probe` を照会して `Stopped` になるまで待つ。照会の失敗は再試行せずそのまま返す。
-/// `cancelled` が真になったら（サーバー停止・接続切断）待ちを打ち切り `Unavailable` で戻る（REPAIR-5）。
-/// 期限の時刻にも必ず 1 回照会してから期限切れと判定する。未起動の `Created` や `Unknown` は終了扱いにしない。
-pub(crate) fn wait_until_stopped(
-    cfg: &WaitConfig,
-    cancelled: &dyn Fn() -> bool,
-    mut probe: impl FnMut() -> Result<RuntimeContainerStatus, CriError>,
-) -> Result<RuntimeContainerStatus, CriError> {
-    let deadline = Instant::now()
-        .checked_add(cfg.timeout)
-        .ok_or_else(|| CriError::internal("wait deadline overflow"))?;
-    loop {
-        if cancelled() {
-            return Err(CriError::unavailable("wait cancelled"));
-        }
-        let st = probe()?;
-        if st.lifecycle == RuntimeLifecycle::Stopped {
-            return Ok(st);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(CriError::timeout("wait exceeded its deadline"));
-        }
-        let sleep_end = now + cfg.poll_interval.min(deadline - now);
-        loop {
-            if cancelled() {
-                return Err(CriError::unavailable("wait cancelled"));
-            }
-            let now = Instant::now();
-            if now >= sleep_end {
-                break;
-            }
-            thread::sleep(CANCEL_SLICE.min(sleep_end - now));
         }
     }
 }

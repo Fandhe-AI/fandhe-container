@@ -22,6 +22,8 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
+//! - `wait_exit` は上書きせず、core の既定（状態ストアの照会による待ち）を使う。supervisor の終了通知を使った
+//!   イベント駆動の上書きは後続（CRI-1・SUP-1。shim v2 の Wait が呼ぶ。#3666）
 //! - `start`・`kill`・`stop` は Linux で supervisor 経由の本番経路へ結線済み（`crate::supervised`。#2434）。契約・期限・
 //!   子プロセスの回収・前提（supervisor を plugin の実体と同じディレクトリに置く・`XDG_RUNTIME_DIR` が環境にある・rootful は
 //!   `UNIMPLEMENTED`）は同 module の doc に従う。実機での通し（委譲 scope 内）は未実施（#850・#2062）。非 Linux では

@@ -10,6 +10,9 @@
 //! `KVM_ARM_VCPU_INIT` も発行する。TASK-74.4.1 で vCPU fd の `kvm_run` 領域の mmap（`KvmRunMap`）・
 //! `KVM_RUN`・`KVM_SET_USER_MEMORY_REGION`（自己診断用の 1 ページ。`GuestPage`・`RegisteredPage`）を足した。
 //! TASK-74.4.2 で `kvm_run` 領域への応答の書き戻し（`KvmRunMap::write_from`。`device::VcpuFd::handle_exit` が呼ぶ）を足した。
+//! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
+//! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
+//! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
 //! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `KickTarget::kick`（`SIGUSR2`。`with_current_thread` の中だけで使える）で中断する。REPAIR-5）。
 //!
@@ -24,6 +27,8 @@
 //! 本 crate は dev-dependency に `libc` を持たず照合は未導入（追加は crate ごとの承認事項。
 //! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
+//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
+//! 対応物が無く、サイズ・オフセットを const assert で固定する。
 //! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
 //! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
 
@@ -99,6 +104,25 @@ pub(crate) mod consts {
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
+    /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
+    pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
+    /// `_IO(KVMIO, 0x60)`（x86_64 のみ定義。vCPU を作る前に発行する）。
+    pub const KVM_CREATE_IRQCHIP: u64 = super::io(super::KVMIO, 0x60);
+    /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
+    pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
+    /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
+    pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);
+    pub const KVM_CAP_IRQCHIP: u64 = 0;
+    pub const KVM_CAP_IRQFD: u64 = 32;
+    pub const KVM_CAP_IOEVENTFD: u64 = 36;
+    pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
+    pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
+    pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
+    pub const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
+    /// glibc の `EFD_CLOEXEC`（`O_CLOEXEC` = 0o2000000）。
+    pub const EFD_CLOEXEC: i32 = 0o2000000;
+    /// glibc の `EFD_NONBLOCK`（`O_NONBLOCK` = 0o4000）。
+    pub const EFD_NONBLOCK: i32 = 0o4000;
 }
 
 /// 定数（aarch64）。
@@ -121,6 +145,22 @@ pub(crate) mod consts {
     pub const KVM_ARM_VCPU_INIT: u64 = super::iow(super::KVMIO, 0xAE, 32);
     /// `_IOR(KVMIO, 0xaf, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_PREFERRED_TARGET: u64 = super::ior(super::KVMIO, 0xAF, 32);
+    /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
+    pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
+    /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
+    pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
+    /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
+    pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);
+    pub const KVM_CAP_IRQFD: u64 = 32;
+    pub const KVM_CAP_IOEVENTFD: u64 = 36;
+    pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
+    pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
+    pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
+    pub const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
+    /// glibc の `EFD_CLOEXEC`（`O_CLOEXEC` = 0o2000000）。
+    pub const EFD_CLOEXEC: i32 = 0o2000000;
+    /// glibc の `EFD_NONBLOCK`（`O_NONBLOCK` = 0o4000）。
+    pub const EFD_NONBLOCK: i32 = 0o4000;
 }
 
 /// 対応外アーキテクチャ。値は使われない（各ラッパーが `Unsupported` を返す）。
@@ -140,6 +180,17 @@ pub(crate) mod consts {
     pub const PROT_READ: i32 = 0;
     pub const PROT_WRITE: i32 = 0;
     pub const MAP_SHARED: i32 = 0;
+    pub const KVM_CHECK_EXTENSION: u64 = 0;
+    pub const KVM_IRQFD: u64 = 0;
+    pub const KVM_IOEVENTFD: u64 = 0;
+    pub const KVM_CAP_IRQFD: u64 = 0;
+    pub const KVM_CAP_IOEVENTFD: u64 = 0;
+    pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 0;
+    pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 0;
+    pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 0;
+    pub const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 0;
+    pub const EFD_CLOEXEC: i32 = 0;
+    pub const EFD_NONBLOCK: i32 = 0;
 }
 
 /// aarch64 の `struct kvm_vcpu_init`（`asm/kvm.h`。`target` と features ビットマップ 7 語の 32 バイト）。
@@ -175,6 +226,42 @@ const _: () = {
     assert!(std::mem::align_of::<KvmUserspaceMemoryRegion>() == 8);
 };
 
+/// `struct kvm_irqfd`（`linux/kvm.h`。32 バイト。TASK-74.2.3・MVM-1）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KvmIrqfd {
+    fd: u32,
+    gsi: u32,
+    flags: u32,
+    resamplefd: u32,
+    pad: [u8; 16],
+}
+
+/// `struct kvm_ioeventfd`（`linux/kvm.h`。64 バイト。TASK-74.2.3・MVM-1）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KvmIoeventfd {
+    datamatch: u64,
+    addr: u64,
+    len: u32,
+    fd: i32,
+    flags: u32,
+    pad: [u8; 36],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<KvmIrqfd>() == 32);
+    assert!(std::mem::align_of::<KvmIrqfd>() == 4);
+    assert!(std::mem::offset_of!(KvmIrqfd, gsi) == 4);
+    assert!(std::mem::offset_of!(KvmIrqfd, flags) == 8);
+    assert!(std::mem::size_of::<KvmIoeventfd>() == 64);
+    assert!(std::mem::align_of::<KvmIoeventfd>() == 8);
+    assert!(std::mem::offset_of!(KvmIoeventfd, addr) == 8);
+    assert!(std::mem::offset_of!(KvmIoeventfd, len) == 16);
+    assert!(std::mem::offset_of!(KvmIoeventfd, fd) == 20);
+    assert!(std::mem::offset_of!(KvmIoeventfd, flags) == 24);
+};
+
 #[cfg(all(
     target_pointer_width = "64",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -183,7 +270,13 @@ const _: () = {
     assert!(consts::KVM_SET_USER_MEMORY_REGION == 0x4020_AE46);
     assert!(consts::KVM_GET_VCPU_MMAP_SIZE == 0xAE04);
     assert!(consts::KVM_RUN == 0xAE80);
+    assert!(consts::KVM_CHECK_EXTENSION == 0xAE03);
+    assert!(consts::KVM_IRQFD == 0x4020_AE76);
+    assert!(consts::KVM_IOEVENTFD == 0x4040_AE79);
 };
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = assert!(consts::KVM_CREATE_IRQCHIP == 0xAE60);
 
 /// `kvm_run.immediate_exit` のオフセット（`linux/kvm.h`）。
 const IMMEDIATE_EXIT_OFFSET: usize = 1;
@@ -227,6 +320,7 @@ const _: () = {
 // - `sigaction`: `SigAction` は上の const assert（152 バイト・mask がオフセット 8・flags が 136・restorer が 144）で
 //   固定した x86_64・aarch64 の `struct sigaction` のレイアウト。第 2・3 引数は NULL 可。
 // - `pthread_sigmask`: `SigSet` は 128 バイトの `sigset_t`（上の const assert）。第 2・3 引数は NULL 可。
+// - `eventfd`: `int eventfd(unsigned int initval, int flags)`（glibc。TASK-74.2.3）。値渡しだけでポインタを取らない。
 // - `pthread_self` / `pthread_kill`: `pthread_t` は glibc の LP64 で `unsigned long` = u64。`pthread_kill` は
 //   errno を戻り値で返す（errno 変数は触らない）。
 unsafe extern "C" {
@@ -238,6 +332,7 @@ unsafe extern "C" {
     fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn pthread_self() -> u64;
     fn pthread_kill(thread: u64, sig: i32) -> i32;
+    fn eventfd(initval: u32, flags: i32) -> i32;
 }
 
 /// `EBUSY`（x86_64・aarch64 Linux とも 16）。
@@ -485,6 +580,126 @@ pub(crate) fn kvm_run(vcpu: BorrowedFd<'_>) -> Result<(), SysError> {
     // `kvm_run` 領域と登録済みの memslot にだけ書く。両者の寿命は呼び出し元の所有型（`KvmRunMap`・
     // `RegisteredPage`）が呼び出し中に維持する。呼び出しはブロックしうるが同期で完了し、戻り後にポインタを保持しない。
     let r = unsafe { ioctl(vcpu.as_raw_fd(), consts::KVM_RUN, 0u64) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 非ブロック・close-on-exec・初期値 0 の eventfd を作る（ioeventfd / irqfd の通知先。TASK-74.2.3・MVM-1）。
+pub(crate) fn eventfd_new() -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 値渡しの 2 引数だけでポインタを取らず、ユーザー空間のメモリを読み書きしない。
+    // 戻り値が負なら失敗（errno は直後に確保する）。
+    let r = unsafe { eventfd(0, consts::EFD_CLOEXEC | consts::EFD_NONBLOCK) };
+    if r < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `r` は直前の `eventfd` が返した非負の新規 fd で、他に所有者がおらず `OwnedFd` が唯一の所有者になる。
+    Ok(unsafe { OwnedFd::from_raw_fd(r) })
+}
+
+/// `KVM_CHECK_EXTENSION`（KVM デバイス fd または VM fd）。戻り値は拡張の対応状況（0 は非対応）。
+pub(crate) fn kvm_check_extension(fd: BorrowedFd<'_>, cap: u64) -> Result<i32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は借用中の生存 fd。`cap` は値渡しの `unsigned long` でポインタを含まず、
+    // カーネルはユーザー空間のメモリを読み書きしない（戻り値が結果）。
+    let r = unsafe { ioctl(fd.as_raw_fd(), consts::KVM_CHECK_EXTENSION, cap) };
+    if r < 0 { Err(last_error()) } else { Ok(r) }
+}
+
+/// `KVM_CREATE_IRQCHIP`（VM fd。x86_64 のみ。vCPU を作る前に発行する）。他 arch は `Unsupported`
+/// （aarch64 の vGIC は `KVM_CREATE_DEVICE` で別方式。TASK-75）。
+pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        // SAFETY: `vm` は借用中の生存 fd。引数は値渡しの 0 でポインタを含まず、カーネルは
+        // ユーザー空間のメモリを読み書きしない。
+        let r = unsafe { ioctl(vm.as_raw_fd(), consts::KVM_CREATE_IRQCHIP, 0u64) };
+        if r < 0 { Err(last_error()) } else { Ok(()) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    {
+        let _ = vm;
+        Err(SysError::Unsupported)
+    }
+}
+
+/// `KVM_IRQFD`（VM fd）。`event` への書き込みで GSI `gsi` の割り込みを注入する。`deassign` で登録を解く
+/// （解除は登録時と同じ `event` と `gsi` で行う）。
+pub(crate) fn kvm_irqfd(
+    vm: BorrowedFd<'_>,
+    event: BorrowedFd<'_>,
+    gsi: u32,
+    deassign: bool,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let arg = KvmIrqfd {
+        fd: u32::try_from(event.as_raw_fd()).map_err(|_| SysError::Os(9))?,
+        gsi,
+        flags: if deassign {
+            consts::KVM_IRQFD_FLAG_DEASSIGN
+        } else {
+            0
+        },
+        resamplefd: 0,
+        pad: [0; 16],
+    };
+    // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号のサイズ符号と一致）の
+    // ローカルの借用で、カーネルはこの 32 バイトを読むだけで書かず、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    // `arg.fd` は借用中の生存 fd の番号。
+    let r = unsafe { ioctl(vm.as_raw_fd(), consts::KVM_IRQFD, &arg as *const KvmIrqfd) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_IOEVENTFD`（VM fd）。ゲストが `addr`（`pio` ならポート）へ `len` バイト書くと `event` が発火し、VM exit は起きない。
+/// `datamatch` が `Some` のときは書かれた値が一致したときだけ発火する。引数の組み合わせの検証は上位の型で済ませる。
+pub(crate) fn kvm_ioeventfd(
+    vm: BorrowedFd<'_>,
+    event: BorrowedFd<'_>,
+    addr: u64,
+    len: u32,
+    datamatch: Option<u64>,
+    pio: bool,
+    deassign: bool,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut flags = 0;
+    if datamatch.is_some() {
+        flags |= consts::KVM_IOEVENTFD_FLAG_DATAMATCH;
+    }
+    if pio {
+        flags |= consts::KVM_IOEVENTFD_FLAG_PIO;
+    }
+    if deassign {
+        flags |= consts::KVM_IOEVENTFD_FLAG_DEASSIGN;
+    }
+    let arg = KvmIoeventfd {
+        datamatch: datamatch.unwrap_or(0),
+        addr,
+        len,
+        fd: event.as_raw_fd(),
+        flags,
+        pad: [0; 36],
+    };
+    // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 64 バイト（const assert 済み・ioctl 番号のサイズ符号と一致）の
+    // ローカルの借用で、カーネルはこの 64 バイトを読むだけで書かず、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    // `arg.fd` は借用中の生存 fd の番号。
+    let r = unsafe {
+        ioctl(
+            vm.as_raw_fd(),
+            consts::KVM_IOEVENTFD,
+            &arg as *const KvmIoeventfd,
+        )
+    };
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -913,6 +1128,79 @@ mod tests {
         assert!(p.write_at(4093, &[0; 4]).is_err());
         assert!(p.write_at(usize::MAX, &[0; 4]).is_err());
         assert!(p.write_at(4096, &[]).is_ok());
+    }
+
+    /// MVM-1・TASK-74.2.3: 割り込み通知系の ioctl 番号と構造体レイアウトの具体値（`linux/kvm.h`）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn irq_constants_match_kernel_abi() {
+        assert_eq!(consts::KVM_CHECK_EXTENSION, 0xAE03);
+        assert_eq!(consts::KVM_IRQFD, 0x4020_AE76);
+        assert_eq!(consts::KVM_IOEVENTFD, 0x4040_AE79);
+        assert_eq!(std::mem::size_of::<KvmIrqfd>(), 32);
+        assert_eq!(std::mem::size_of::<KvmIoeventfd>(), 64);
+        assert_eq!(std::mem::offset_of!(KvmIoeventfd, len), 16);
+        assert_eq!(consts::KVM_CAP_IRQFD, 32);
+        assert_eq!(consts::KVM_CAP_IOEVENTFD, 36);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn create_irqchip_constant_matches_kernel_abi() {
+        assert_eq!(consts::KVM_CREATE_IRQCHIP, 0xAE60);
+    }
+
+    /// MVM-1・TASK-74.2.3: KVM でない fd への ioctl は ENOTTY（unsafe 経路を KVM 無しで通す）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn irq_ioctls_on_non_kvm_fd_are_enotty() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        let ev = eventfd_new().unwrap();
+        assert_eq!(
+            kvm_check_extension(f.as_fd(), consts::KVM_CAP_IRQFD),
+            Err(SysError::Os(25))
+        );
+        assert_eq!(
+            kvm_irqfd(f.as_fd(), ev.as_fd(), 5, false),
+            Err(SysError::Os(25))
+        );
+        assert_eq!(
+            kvm_ioeventfd(f.as_fd(), ev.as_fd(), 0x2050, 4, Some(0), false, false),
+            Err(SysError::Os(25))
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Os(25)));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Unsupported));
+    }
+
+    /// MVM-1・TASK-74.2.3: eventfd は非ブロック・close-on-exec で、書いた値の合計を 1 回で読み出す。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn eventfd_roundtrip_and_flags() {
+        use std::io::{Read as _, Write as _};
+        let fd = eventfd_new().unwrap();
+        let raw = fd.as_raw_fd();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{raw}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .map(str::trim)
+            .and_then(|v| u32::from_str_radix(v, 8).ok())
+            .unwrap();
+        assert_eq!(flags & 0o2000000, 0o2000000, "O_CLOEXEC");
+        assert_eq!(flags & 0o4000, 0o4000, "O_NONBLOCK");
+        let mut f = std::fs::File::from(fd);
+        f.write_all(&1u64.to_ne_bytes()).unwrap();
+        f.write_all(&1u64.to_ne_bytes()).unwrap();
+        let mut b = [0u8; 8];
+        f.read_exact(&mut b).unwrap();
+        assert_eq!(u64::from_ne_bytes(b), 2);
+        assert_eq!(
+            f.read(&mut b).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     /// MVM-1: aarch64 の vCPU 初期化 ioctl 番号。

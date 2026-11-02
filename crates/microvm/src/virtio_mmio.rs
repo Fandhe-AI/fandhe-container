@@ -4,7 +4,7 @@
 //! feature negotiation・キュー設定レジスタを 1 か所に置く。各デバイスは [`VirtioDevice`] を実装し、
 //! [`VirtioMmioTransport`] に包んで使う。`KVM_RUN` の MMIO exit からは `crate::dispatch`（TASK-74.4.2）が
 //! [`VirtioMmioTransport::read`] / [`VirtioMmioTransport::write`] を呼び、結果の
-//! [`MmioWriteOutcome::QueueNotify`] 等で virtqueue 処理へ振り分ける。割り込みの実配送は TASK-74.2.3・74.3.2。
+//! [`MmioWriteOutcome::QueueNotify`] 等で virtqueue 処理へ振り分ける。割り込みの実配送は `crate::interrupt::complete_block_notify`（TASK-74.2.3）と `crate::irq`（Linux）、virtio-net は TASK-74.3.2。
 //!
 //! # 範囲外（REPAIR-3）
 //! - ゲストメモリへのアクセス: キューのアドレスはドライバが書いた値を組み立てた素の `u64` で持つだけ。
@@ -397,7 +397,7 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
         &mut self.device
     }
 
-    /// 使用済みバッファ等の割り込み要因を立てる（実配送は TASK-74.2.3・74.3.2）。
+    /// 使用済みバッファ等の割り込み要因を立てる（実配送は `crate::interrupt` の `InterruptLine`。TASK-74.2.3、virtio-net は 74.3.2）。
     pub fn raise_interrupt(&mut self, reason: InterruptReason) {
         self.interrupt_status |= reason.bit();
         // VIRTIO 1.2 4.2.2: ConfigGeneration はデバイス側が設定を変えたときだけ進める

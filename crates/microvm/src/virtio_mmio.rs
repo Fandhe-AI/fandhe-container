@@ -7,8 +7,9 @@
 //! [`MmioWriteOutcome::QueueNotify`] 等で virtqueue 処理へ振り分ける。割り込みの実配送は TASK-74.2.3・74.3.2。
 //!
 //! # 範囲外（REPAIR-3）
-//! - ゲストメモリへのアクセスと `GuestAddress` 型: キューのアドレスはドライバが書いた値を組み立てた素の `u64` で
-//!   持つだけで、アドレスとしての検証は担当の sub-issue に残す（docs/design/microvm-memory-ownership.md）
+//! - ゲストメモリへのアクセス: キューのアドレスはドライバが書いた値を組み立てた素の `u64` で持つだけ。
+//!   アドレスとしての検証と descriptor の走査は `crate::guest_memory`・`crate::virtqueue` が担う
+//!   （docs/design/microvm-memory-ownership.md）
 //! - legacy（Version = 1）・packed virtqueue・共有メモリ領域レジスタは非対応（未知のレジスタとして無視する）
 //!
 //! # 準拠先

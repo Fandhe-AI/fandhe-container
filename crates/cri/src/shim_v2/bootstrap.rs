@@ -277,6 +277,13 @@ pub fn default_socket_dir(state_root: &std::path::Path) -> PathBuf {
     state_root.with_file_name(SOCKET_DIR_NAME)
 }
 
+/// 字面で要素を分ける区切り文字。Windows は `\\` も区切りのため、`C:\\tmp\\..\\x` を見逃さない（PLUG-12・#872）。
+#[cfg(windows)]
+const SEPARATORS: [char; 2] = ['/', '\\'];
+/// Unix では `\\` はファイル名の一部なので `/` のみで分ける。
+#[cfg(not(windows))]
+const SEPARATORS: [char; 1] = ['/'];
+
 /// 置き場所を解決する。上書き値は絶対パスで `.`・`..` の要素を含まないこと。
 pub fn resolve_socket_dir(override_dir: Option<OsString>) -> Result<PathBuf, CriError> {
     match override_dir.filter(|v| !v.is_empty()) {
@@ -285,7 +292,7 @@ pub fn resolve_socket_dir(override_dir: Option<OsString>) -> Result<PathBuf, Cri
             // `Path::components` は途中の `.` を畳むため、字面で `.`・`..` の要素を拒否する。
             let ok = p.is_absolute()
                 && p.to_str()
-                    .is_some_and(|s| s.split('/').all(|e| e != "." && e != ".."));
+                    .is_some_and(|s| s.split(SEPARATORS).all(|e| e != "." && e != ".."));
             if !ok {
                 return Err(invalid("socket dir override must be a clean absolute path"));
             }
@@ -969,6 +976,20 @@ mod tests {
     use super::*;
     use crate::error::CriErrorCode;
 
+    /// 3 OS で絶対パスになる文字列にする。Windows では `C:` を前置し区切りを `\\` にする
+    /// （task_service.rs の試験の `abs()` と同じ。CRI-5・PLUG-12・#872）。
+    fn abs(unix_style: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix_style.replace('/', "\\"))
+        } else {
+            unix_style.to_string()
+        }
+    }
+
+    fn pb(unix_style: &str) -> PathBuf {
+        PathBuf::from(abs(unix_style))
+    }
+
     fn args(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
     }
@@ -984,9 +1005,9 @@ mod tests {
             "-namespace",
             "k8s.io",
             "-address",
-            "/run/containerd/containerd.sock",
+            &abs("/run/containerd/containerd.sock"),
             "-publish-binary",
-            "/usr/bin/containerd",
+            &abs("/usr/bin/containerd"),
             "-id",
             "abc123",
             "-debug",
@@ -996,10 +1017,7 @@ mod tests {
         assert_eq!(inv.action, ShimAction::Start);
         assert_eq!(inv.namespace.unwrap().as_str(), "k8s.io");
         assert_eq!(inv.id.unwrap().as_str(), "abc123");
-        assert_eq!(
-            inv.address.unwrap(),
-            PathBuf::from("/run/containerd/containerd.sock")
-        );
+        assert_eq!(inv.address.unwrap(), pb("/run/containerd/containerd.sock"));
         assert!(inv.debug);
     }
 
@@ -1010,18 +1028,18 @@ mod tests {
             "-namespace",
             "default",
             "-address",
-            "/a.sock",
+            &abs("/a.sock"),
             "-publish-binary",
-            "/p",
+            &abs("/p"),
             "-id",
             "c1",
             "-bundle",
-            "/b",
+            &abs("/b"),
             "delete",
         ]))
         .unwrap();
         assert_eq!(inv.action, ShimAction::Delete);
-        assert_eq!(inv.bundle.unwrap(), PathBuf::from("/b"));
+        assert_eq!(inv.bundle.unwrap(), pb("/b"));
     }
 
     /// CRI-5・#872: Go の flag の書き方（`=`・`--`・bool の値・`--` 終端）。
@@ -1031,7 +1049,7 @@ mod tests {
             "--namespace=ns",
             "-id=x",
             "--address",
-            "/s",
+            &abs("/s"),
             "-debug=false",
             "--",
             "start",
@@ -1114,7 +1132,7 @@ mod tests {
             "-id",
             id,
             "-address",
-            "/s",
+            &abs("/s"),
             "start",
         ]))
         .unwrap()
@@ -1134,31 +1152,39 @@ mod tests {
     #[test]
     fn plug12_872_socket_dir_trailing_separator_is_normalized() {
         assert_eq!(
-            resolve_socket_dir(Some("/tmp/link/".into())).unwrap(),
-            PathBuf::from("/tmp/link")
+            resolve_socket_dir(Some(abs("/tmp/link/").into())).unwrap(),
+            pb("/tmp/link")
         );
         assert_eq!(
-            resolve_socket_dir(Some("/tmp//link//".into())).unwrap(),
-            PathBuf::from("/tmp/link")
+            resolve_socket_dir(Some(abs("/tmp//link//").into())).unwrap(),
+            pb("/tmp/link")
+        );
+        // Windows の区切りでも末尾・重複が畳まれる（`\` は Windows のみ区切り）。
+        #[cfg(windows)]
+        assert_eq!(
+            resolve_socket_dir(Some("C:\\tmp\\\\link\\".into())).unwrap(),
+            PathBuf::from("C:\\tmp\\link")
         );
     }
 
     #[test]
     fn cri5_872_socket_dir_resolution() {
         assert_eq!(
-            resolve_socket_dir(Some("/tmp/x".into())).unwrap(),
-            PathBuf::from("/tmp/x")
+            resolve_socket_dir(Some(abs("/tmp/x").into())).unwrap(),
+            pb("/tmp/x")
         );
-        for bad in ["rel/x", "/tmp/../x", "/tmp/./x"] {
+        for bad in ["rel/x".to_string(), abs("/tmp/../x"), abs("/tmp/./x")] {
             assert_eq!(
-                resolve_socket_dir(Some(bad.into())).unwrap_err().code(),
+                resolve_socket_dir(Some(bad.as_str().into()))
+                    .unwrap_err()
+                    .code(),
                 CriErrorCode::InvalidArgument,
                 "{bad}"
             );
         }
         assert_eq!(
-            default_socket_dir(std::path::Path::new("/run/fandhe-container")),
-            PathBuf::from("/run/fandhe-container-shim")
+            default_socket_dir(std::path::Path::new(&abs("/run/fandhe-container"))),
+            pb("/run/fandhe-container-shim")
         );
     }
 

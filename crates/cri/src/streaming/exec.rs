@@ -1190,7 +1190,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             }
 
             // クライアントのフレームを処理する。stdin の書き込み待ちが残る間は読まない（背圧）。
-            while self.stdin_buf.is_empty() && self.conn.pending_write() < MAX_SEND_QUEUE_BYTES {
+            // flush 待ちも同じ背圧にする（受理だけして flush しない writer への入力で期限が延びない。REPAIR-5）。
+            while self.stdin_buf.is_empty()
+                && !self.stdin_flush_pending
+                && self.conn.pending_write() < MAX_SEND_QUEUE_BYTES
+            {
                 match self.conn.try_next_frame() {
                     Ok(Some(frame)) => {
                         progress = true;
@@ -1202,7 +1206,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     Err(_) => return Poll::Ready(RelayEnd::Protocol),
                 }
             }
-            if self.stdin_buf.is_empty() && self.conn.pending_write() < MAX_SEND_QUEUE_BYTES {
+            if self.stdin_buf.is_empty()
+                && !self.stdin_flush_pending
+                && self.conn.pending_write() < MAX_SEND_QUEUE_BYTES
+            {
                 match self.conn.poll_read_more(cx) {
                     Poll::Ready(Ok(0)) | Poll::Ready(Err(ReadStop::Io)) => {
                         return Poll::Ready(RelayEnd::PeerClosed);

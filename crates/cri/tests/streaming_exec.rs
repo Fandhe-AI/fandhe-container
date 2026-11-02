@@ -1612,3 +1612,60 @@ async fn cri6_exec_data_after_stdin_reset_is_ignored() {
     assert_eq!(c.rst, Vec::<(u32, u32)>::new());
     assert_eq!(c.goaway, Some(goaway_status::PROTOCOL_ERROR));
 }
+
+/// REPAIR-5・CRI-6: flush が完了しない stdin へ stdin_stall_timeout より短い間隔で DATA を送り続けても、
+/// 期限（300ms）の規定時間内に打ち切られる（flush 待ちの間は追加の stdin を読まず、期限もリセットされない）。
+#[tokio::test]
+async fn cri6_exec_stuck_flush_not_extended_by_continuous_stdin() {
+    let mut config = fast_config();
+    config.stdin_stall_timeout = Duration::from_millis(300);
+    let fx = Fixture::new(config, 8).await;
+    let path = fx.exec_path(&["stuck-flush"], false, true, true, false);
+    let addr = fx.addr();
+    let started = Instant::now();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        // 100ms 間隔で最大 3 秒送る。サーバーが閉じたら書き込みが失敗して止まる。
+        let mut tcp = client.tcp.try_clone().expect("clone");
+        let sender = std::thread::spawn(move || {
+            let mut enc = FrameEncoder::new();
+            for _ in 0..30 {
+                let mut out = Vec::new();
+                enc.encode(
+                    &Frame::Data {
+                        stream_id: sid(3),
+                        fin: false,
+                        data: b"x".to_vec(),
+                    },
+                    &mut out,
+                )
+                .expect("encode");
+                if tcp.write_all(&out).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let c = client.collect();
+        let _ = sender.join();
+        c
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::IdleTimeout]
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(2000),
+        "elapsed {:?}",
+        started.elapsed()
+    );
+}

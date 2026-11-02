@@ -47,7 +47,7 @@
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::boot_x86::LoadedKernel;
@@ -1076,18 +1076,22 @@ impl RunningMicroVm {
                 "stop deadline out of range",
             ));
         }
+        let limit = Instant::now() + deadline;
         self.stop.store(true, Ordering::SeqCst);
         match self.done_rx.recv_timeout(deadline) {
             Ok(report) => {
-                if let Some(h) = self.handle.take()
-                    && h.join().is_err()
-                {
-                    return Err(MicrovmError::new(
+                // 報告後もスレッドローカルの destructor が未完了でありうるため、join にも同じ期限を適用する。
+                match self.handle.take().map(|h| join_by(h, limit)) {
+                    None | Some(JoinOutcome::Joined(Ok(()))) => Ok(report),
+                    Some(JoinOutcome::Joined(Err(_))) => Err(MicrovmError::new(
                         MicrovmErrorCode::Internal,
                         "vCPU thread terminated abnormally",
-                    ));
+                    )),
+                    Some(JoinOutcome::TimedOut) => Err(MicrovmError::new(
+                        MicrovmErrorCode::DeadlineExceeded,
+                        "vCPU thread did not finish within deadline",
+                    )),
                 }
-                Ok(report)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // 期限の無い join はしない（REPAIR-5）。detach し、スレッドは停止フラグで自力で終わる。
@@ -1098,9 +1102,17 @@ impl RunningMicroVm {
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // 報告を送る前にスレッドが終わった（panic）。unwind で MicroVm は drop 済み。
-                if let Some(h) = self.handle.take() {
-                    drop(h.join());
+                // 報告を送る前にチャネルが切れた（panic の unwind）。切断はスレッド終了を保証しない
+                // （引数の drop 順で done が先に落ち、残りの Drop が続く）ため、join には期限を適用する。
+                let timed_out = self
+                    .handle
+                    .take()
+                    .is_some_and(|h| matches!(join_by(h, limit), JoinOutcome::TimedOut));
+                if timed_out {
+                    return Err(MicrovmError::new(
+                        MicrovmErrorCode::DeadlineExceeded,
+                        "vCPU thread did not finish within deadline",
+                    ));
                 }
                 Err(MicrovmError::new(
                     MicrovmErrorCode::Internal,
@@ -1122,13 +1134,40 @@ impl Drop for RunningMicroVm {
             return;
         };
         self.stop.store(true, Ordering::SeqCst);
-        match self.done_rx.recv_timeout(DROP_STOP_WAIT) {
-            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => drop(handle.join()),
-            Err(mpsc::RecvTimeoutError::Timeout) => log_line(format_args!(
+        let limit = Instant::now() + DROP_STOP_WAIT;
+        let expired = match self.done_rx.recv_timeout(DROP_STOP_WAIT) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                matches!(join_by(handle, limit), JoinOutcome::TimedOut)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+        };
+        if expired {
+            log_line(format_args!(
                 "level=error op=microvm.drop_running outcome=error code={}",
                 MicrovmErrorCode::DeadlineExceeded.as_str()
-            )),
+            ));
         }
+    }
+}
+
+/// 期限つき join の結果（REPAIR-5）。
+enum JoinOutcome {
+    Joined(thread::Result<()>),
+    TimedOut,
+}
+
+/// `limit` まで `is_finished` を短い間隔で確認し、終わっていれば join する。期限切れなら join せず detach する
+/// （無期限の join をしない。REPAIR-5）。
+fn join_by(handle: JoinHandle<()>, limit: Instant) -> JoinOutcome {
+    loop {
+        if handle.is_finished() {
+            return JoinOutcome::Joined(handle.join());
+        }
+        let now = Instant::now();
+        if now >= limit {
+            return JoinOutcome::TimedOut;
+        }
+        thread::sleep((limit - now).min(Duration::from_millis(1)));
     }
 }
 
@@ -1234,6 +1273,23 @@ mod lifecycle_tests {
                 ..RunStats::default()
             }
         }
+    }
+
+    /// MVM-1・REPAIR-5: join は期限を超えて待たない。終わらないスレッドは `TimedOut`、終わるスレッドは `Joined`。
+    #[test]
+    fn mvm1_join_by_respects_deadline() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let t = Instant::now();
+        let out = join_by(h, Instant::now() + Duration::from_millis(50));
+        assert!(matches!(out, JoinOutcome::TimedOut));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        drop(tx);
+        let h2 = std::thread::spawn(|| {});
+        let out = join_by(h2, Instant::now() + Duration::from_secs(5));
+        assert!(matches!(out, JoinOutcome::Joined(Ok(()))));
     }
 
     fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {

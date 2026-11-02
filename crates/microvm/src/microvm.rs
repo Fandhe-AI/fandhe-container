@@ -1136,7 +1136,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// カーネルのエントリへ vCPU 0 を初期化し（[`MicroVm::setup_boot_vcpu`]）、専用スレッドで実行ループを始める（TASK-75.4.1・MVM-1）。
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU が 2 台以上の構成は
-    /// AP の INIT/SIPI が未実装のため `Unimplemented`（fail-closed）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// AP の INIT/SIPI が未実装のため `Unimplemented`（fail-closed）。virtio-net を含む構成も、ゲストの kick なしで受信を処理する経路が
+    /// 未実装のため `Unimplemented`（将来仕様: 期限ごとの `process_rx` または backend 到着通知。MVM-1・TASK-117）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -1163,6 +1164,14 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             return Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
                 "starting more than one vCPU is not implemented",
+            ));
+        }
+        // virtio-net の受信はゲストの kick が無くても backend のフレームを取り出す経路（期限ごとのポーリングか
+        // 到着通知）が要るが未実装のため、受信が止まる構成を黙って許さず拒否する（fail-closed。REPAIR-3・MVM-1。TASK-117）。
+        if !self.devices.net.is_empty() {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "starting with a virtio-net device is not implemented (rx polling is missing)",
             ));
         }
         self.setup_boot_vcpu(loaded)?;

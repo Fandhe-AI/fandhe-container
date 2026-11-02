@@ -1266,10 +1266,10 @@ mod tests {
         assert!(DialSlot::acquire(&handler.dial_inflight, limit).is_some());
     }
 
-    /// 転送先が応答を書いて閉じ、その後クライアントの書き込みが失敗しても、残りの応答を DATA として届けて
-    /// FIN で閉じる（RST_STREAM 相当の `Aborted` にしない）。CRI-6・TASK-63.4。
-    #[tokio::test]
-    async fn cri6_write_failure_still_drains_target_tail() {
+    /// 転送先が応答を書いて閉じた後の対を 1 回進める。`rst` が真なら、転送先が未読の受信データを残して
+    /// 閉じるので RST が返る（書き込み失敗を実際の RST で起こす）。偽なら、書き込み失敗を
+    /// `write_broken` の直接設定で作り、RST を使わない。
+    async fn drain_case(rst: bool) -> (PairStep, Vec<u8>) {
         use tokio::io::AsyncWriteExt;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -1279,11 +1279,13 @@ mod tests {
             let (mut c, _) = listener.accept().expect("accept");
             c.write_all(b"tail-bytes").expect("write tail");
             rx.recv().expect("signal");
-            // 未読の受信データを残して閉じるので、相手には RST が返る。
+            // rst の場合は未読の受信データが残るため、close で相手へ RST が返る。
             drop(c);
         });
         let mut tcp = TcpStream::connect(addr).await.expect("connect");
-        tcp.write_all(b"x").await.expect("first write");
+        if rst {
+            tcp.write_all(b"x").await.expect("first write");
+        }
         tx.send(()).expect("signal");
         target.join().expect("target");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1301,9 +1303,10 @@ mod tests {
             last_write: Instant::now(),
             phase: Phase::Connected(Connected {
                 tcp,
-                write_shut: false,
+                // 製品の書き込み失敗経路と同じく、失敗時は write_shut も立てる。
+                write_shut: !rst,
                 tcp_eof: false,
-                write_broken: None,
+                write_broken: (!rst).then(Instant::now),
             }),
         };
         let mut outbox = Outbox {
@@ -1326,13 +1329,14 @@ mod tests {
             ))
         })
         .await;
-        match step {
-            PairStep::Finished => {}
-            PairStep::Aborted => panic!("aborted: remaining target data was dropped"),
-            PairStep::Continue { .. } => panic!("expected the pair to finish"),
-        }
+        (step, outbox.buf)
+    }
+
+    /// 送出済みフレームから、データストリーム 3 の DATA の連結と FIN を受けたストリーム ID の列を取り出す。
+    fn decode_data(buf: &[u8]) -> (Vec<u8>, Vec<u32>) {
+        let data_id = StreamId::new(3).expect("sid");
         let mut dec = FrameDecoder::new();
-        dec.extend(&outbox.buf);
+        dec.extend(buf);
         let mut got = Vec::new();
         let mut fins = Vec::new();
         while let Some(f) = dec.next_frame().expect("decode") {
@@ -1350,7 +1354,43 @@ mod tests {
                 }
             }
         }
+        (got, fins)
+    }
+
+    /// 転送先が応答を書いて閉じ、その後クライアントの書き込みが失敗しても、残りの応答を DATA として届けて
+    /// FIN で閉じる（RST_STREAM 相当の `Aborted` にしない）。CRI-6・TASK-63.4。
+    /// 書き込み失敗は `write_broken` の直接設定で作る。RST に頼ると受信バッファの扱いが OS で異なる
+    /// （下の `cri6_rst_discards_tail_per_platform`）ため、どの OS でも同じ結果になる形にしている。
+    #[tokio::test]
+    async fn cri6_write_failure_still_drains_target_tail() {
+        let (step, buf) = drain_case(false).await;
+        match step {
+            PairStep::Finished => {}
+            PairStep::Aborted => panic!("aborted: remaining target data was dropped"),
+            PairStep::Continue { .. } => panic!("expected the pair to finish"),
+        }
+        let (got, fins) = decode_data(&buf);
         assert_eq!(got, b"tail-bytes");
         assert_eq!(fins, vec![3, 1]);
+    }
+
+    /// 転送先が未読データを残して close し RST を返した場合の挙動は OS で異なる。Linux は RST の前に受信済みの
+    /// データを読ませるので残りを届けて閉じる。macOS（BSD）と Windows は RST を受けた時点で受信バッファを
+    /// 捨てて `ECONNRESET` を返すため、製品は取り戻せないデータを `Aborted`（RST_STREAM）で扱う。
+    /// どちらも製品として正しい挙動で、OS ごとの期待を明示して固定する。CRI-6・TASK-63.4。
+    #[tokio::test]
+    async fn cri6_rst_discards_tail_per_platform() {
+        let (step, buf) = drain_case(true).await;
+        if cfg!(target_os = "linux") {
+            assert!(matches!(step, PairStep::Finished), "linux drains the tail");
+            let (got, fins) = decode_data(&buf);
+            assert_eq!(got, b"tail-bytes");
+            assert_eq!(fins, vec![3, 1]);
+        } else {
+            assert!(
+                matches!(step, PairStep::Aborted),
+                "the receive buffer is discarded on RST outside linux"
+            );
+        }
     }
 }

@@ -426,8 +426,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
     }
 
     fn queue(&mut self, frame: &Frame) -> Result<(), ProtocolError> {
+        // 送信済み領域を追記前に取り除く。取り除かないと、書き込みが Pending のまま
+        // 少量ずつ部分送信が進む場合に wbuf が累積送信量で増え、送信キューの上限
+        // （MAX_SEND_QUEUE_BYTES）が未送信量しか数えないため無制限に伸びる。
         if self.wpos >= self.wbuf.len() {
             self.wbuf.clear();
+            self.wpos = 0;
+        } else if self.wpos > 0 {
+            self.wbuf.drain(..self.wpos);
             self.wpos = 0;
         }
         self.enc.encode(frame, &mut self.wbuf)
@@ -1104,6 +1110,65 @@ fn session_matches(session: &ExecSession, need: Need) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1 回の `poll_write` で 1 バイトだけ受け、次は Pending を返す書き込み先。
+    struct TrickleIo {
+        accepted_last: bool,
+    }
+
+    impl AsyncRead for TrickleIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for TrickleIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.accepted_last {
+                self.accepted_last = false;
+                Poll::Pending
+            } else {
+                self.accepted_last = true;
+                Poll::Ready(Ok(1))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// CRI-6: 部分送信と Pending が続いても、送信バッファの実長に送信済み領域が残らない。
+    #[test]
+    fn cri6_send_queue_does_not_retain_sent_bytes() {
+        let mut conn = Conn::new(TrickleIo {
+            accepted_last: false,
+        })
+        .expect("conn");
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..200 {
+            conn.queue(&Frame::Data {
+                stream_id: StreamId::new(1).expect("stream id"),
+                fin: false,
+                payload: vec![b'x'; 16],
+            })
+            .expect("queue");
+            // 追記直後は送信済み領域が残らない（wbuf の実長 = 未送信量）。
+            assert_eq!(conn.wpos, 0);
+            assert_eq!(conn.wbuf.len(), conn.pending_write());
+            let _ = conn.poll_flush(&mut cx);
+        }
+    }
 
     fn headers_with(values: &[&str]) -> HeaderMap {
         let mut map = HeaderMap::new();

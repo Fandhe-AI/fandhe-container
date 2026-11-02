@@ -1,4 +1,4 @@
-//! containerd Task API の Create / Start / Delete / Exec / Wait を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・MS-7）。
+//! containerd Task API の Create / Start / Delete / Exec / Wait / State / Kill / Shutdown を `ContainerRuntime` へつなぐサービス（CRI-5・ERR-3・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2・MS-7）。
 //!
 //! [`ServiceRegistry::dispatch`](super::service::ServiceRegistry::dispatch) から呼ばれる同期ハンドラで、
 //! 接続ごとのスレッド上で動く。コンテナの作成・起動は [`RuntimeAdapter`] 経由で行い、core の具象型には
@@ -27,22 +27,36 @@
 //! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
 //! サーバーは要求を接続内で並行 dispatch するため待ちは他の RPC を止めず、停止・切断の通知を受けた Wait は期限前に取り消される。
 //!
+//! State / Kill / Shutdown（TASK-62.7.2）:
+//! - State: `exec_id` 非空は `UNIMPLEMENTED`。状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
+//!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`bundle`・stdio・`terminal`・`exited_at` は
+//!   shim / core が持たないため空・未設定（REPAIR-3）。
+//! - Kill: `exec_id` 非空と `all = true` は `UNIMPLEMENTED`（core の kill は init プロセスにしか送れず、cgroup 全体へ送る経路が
+//!   無い。containerd の猶予切れ SIGKILL〔`WithKillAll`〕は未結線）。`signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。
+//!   停止済みは runc shim と同じく `NOT_FOUND`（"process already finished"）。state と kill の間の競合は core の応答をそのまま返す。
+//! - Shutdown: [`ShutdownSignal`] が差し込まれているときだけ動く。`now = true` かコンテナが残っていない（state が `NOT_FOUND`）とき
+//!   終了を要求し、コンテナが残っていれば何もせず成功を返す（runc shim と同じ）。state の他のエラーは終了せずに返す（fail-closed）。冪等。
+//!
 //! 期限（REPAIR-5）: Wait は上記の期限を持つ。他のメソッドは `ContainerRuntime` の契約で実装側が期限を持ち、
 //! shim は追加の期限を設けない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use prost::Message;
 
 use super::exec::{ExecId, ExecRegistry, TaskExecLauncher, parse_process_spec};
 use super::message::{RpcStatus, count_top_level_field};
+use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
+use super::shutdown::ShutdownSignal;
 use super::task_api::{
     CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    StartRequest, StartResponse, WaitRequest, WaitResponse,
+    KillRequest, ShutdownRequest, StartRequest, StartResponse, StateRequest, StateResponse,
+    TaskStatus, WaitRequest, WaitResponse,
 };
 use super::wait::WaitConfig;
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
@@ -58,6 +72,8 @@ const FIELD_OPTIONS: u64 = 10;
 
 /// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
 const UNKNOWN_EXIT_STATUS: u32 = 255;
+/// 記録しておく作成済み ID の上限。Delete で除去するが、除去されない経路でも無制限に増やさない（REPAIR-5）。
+const CREATED_MAX: usize = 1024;
 
 /// Create / Start / Delete / Exec / Wait を処理する Task サービス。他のメソッドは `Unimplemented`。
 ///
@@ -70,6 +86,12 @@ pub struct TaskService {
     exec_launcher: Option<Arc<dyn TaskExecLauncher>>,
     execs: ExecRegistry,
     wait_config: WaitConfig,
+    shutdown: Option<ShutdownSignal>,
+    /// この shim の Create で作ったコンテナ ID。Shutdown が「残っているか」を全 ID で判定し、
+    /// Create と Shutdown の判定を排他する（ロックは Create / 判定の間だけ持つ）。
+    ///
+    /// v2 と v3 を同じ shim に登録するときは [`TaskService::with_shared_created`] で共有する。
+    created: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -89,7 +111,22 @@ impl TaskService {
             exec_launcher: None,
             execs: ExecRegistry::new(),
             wait_config: WaitConfig::default(),
+            shutdown: None,
+            created: Arc::new(Mutex::new(BTreeSet::new())),
         }
+    }
+
+    /// Shutdown RPC の終了要求の送り先を差し込む。無ければ `Shutdown` は `UNIMPLEMENTED`（TASK-62.7.2）。
+    pub fn with_shutdown(mut self, signal: ShutdownSignal) -> Self {
+        self.shutdown = Some(signal);
+        self
+    }
+
+    /// 作成済み ID の記録と判定用ロックを `other` と共有する。同じ shim に v2・v3 を登録するとき、
+    /// Create と Shutdown の判定をサービスをまたいで揃えるために使う（TASK-62.7.2）。
+    pub fn with_shared_created(mut self, other: &TaskService) -> Self {
+        self.created = Arc::clone(&other.created);
+        self
     }
 
     /// Wait の期限と照会間隔を差し替える（既定は 60 秒・100 ミリ秒。REPAIR-5）。
@@ -102,6 +139,95 @@ impl TaskService {
     pub fn with_exec_launcher(mut self, launcher: Arc<dyn TaskExecLauncher>) -> Self {
         self.exec_launcher = Some(launcher);
         self
+    }
+
+    /// `State`: コンテナの現在状態を返す（TASK-62.7.2）。
+    fn state(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let req = StateRequest::decode(payload).map_err(|_| decode_failure())?;
+        if !req.exec_id.is_empty() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
+        let (status, exit_status) = match st.lifecycle {
+            RuntimeLifecycle::Creating | RuntimeLifecycle::Created => (TaskStatus::Created, 0),
+            RuntimeLifecycle::Running => (TaskStatus::Running, 0),
+            RuntimeLifecycle::Stopped => (TaskStatus::Stopped, stopped_exit_status(&st)),
+            _ => (TaskStatus::Unknown, 0),
+        };
+        Ok(StateResponse {
+            id: req.id,
+            pid: st.pid.unwrap_or(0),
+            status: status as i32,
+            exit_status,
+            ..Default::default()
+        }
+        .encode_to_vec())
+    }
+
+    /// `Kill`: init プロセスへシグナルを送る（TASK-62.7.2）。
+    fn kill(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let req = KillRequest::decode(payload).map_err(|_| decode_failure())?;
+        if !req.exec_id.is_empty() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        if req.all {
+            return Err(unsupported("kill all is not supported"));
+        }
+        // 状態の照会より前に検証する（停止済み・不在の ID でも範囲外は INVALID_ARGUMENT）。
+        let signal = u8::try_from(req.signal)
+            .ok()
+            .filter(|n| (1..=64).contains(n))
+            .ok_or_else(|| {
+                RpcStatus::from_code(
+                    CriErrorCode::InvalidArgument,
+                    "signal number must be in 1..=64",
+                )
+            })?;
+        let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
+        if st.lifecycle == RuntimeLifecycle::Stopped {
+            return Err(RpcStatus::from_code(
+                CriErrorCode::NotFound,
+                "process already finished",
+            ));
+        }
+        self.adapter
+            .kill(&req.id, signal)
+            .map_err(|e| to_status(&e))?;
+        Ok(Vec::new())
+    }
+
+    /// `Shutdown`: デーモンの終了を要求する（TASK-62.7.2）。コンテナが残っていれば何もしない。
+    fn shutdown(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let Some(signal) = self.shutdown.as_ref() else {
+            return Err(unsupported("shutdown is not supported"));
+        };
+        let req = ShutdownRequest::decode(payload).map_err(|_| decode_failure())?;
+        if req.now {
+            // 並行する Create と排他するため、要求を立てる間も `created` を持つ。
+            let _created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+            signal.request().map_err(|_| shutdown_gate_failure())?;
+            return Ok(Vec::new());
+        }
+        // 要求された ID だけでなく、この shim が作った全コンテナを確認する（別 ID の Shutdown で
+        // 実行中のコンテナの接続を失わない）。Create とは `created` のロックで排他する。
+        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<String> = created.iter().cloned().collect();
+        if !created.contains(&req.id) {
+            ids.push(req.id.clone());
+        }
+        for id in ids {
+            match self.adapter.state(&id) {
+                Err(e) if e.code() == CriErrorCode::NotFound => {
+                    created.remove(&id);
+                }
+                Err(e) => return Err(to_status(&e)),
+                // 残っているコンテナがあれば終了を要求しない。
+                Ok(_) => return Ok(Vec::new()),
+            }
+        }
+        // 判定の完了まで `created` を持ったまま要求を立てる（以後の Create は拒否される）。
+        signal.request().map_err(|_| shutdown_gate_failure())?;
+        Ok(Vec::new())
     }
 
     /// `Exec`: exec プロセスを登録するだけで起動はしない（起動は `Start(exec_id)`）。
@@ -195,10 +321,29 @@ impl TaskService {
         if !req.checkpoint.is_empty() || !req.parent_checkpoint.is_empty() {
             return Err(unsupported("checkpoint is not supported"));
         }
+        // Shutdown の判定と排他する。終了要求後の Create は受けない（接続が失われるため）。
+        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(ShutdownSignal::is_requested)
+        {
+            return Err(RpcStatus::from_code(
+                CriErrorCode::Unavailable,
+                "shim is shutting down",
+            ));
+        }
+        if created.len() >= CREATED_MAX && !created.contains(&req.id) {
+            return Err(RpcStatus::from_code(
+                CriErrorCode::ResourceExhausted,
+                "too many containers created in this shim",
+            ));
+        }
         let status = self
             .adapter
             .create(&req.id, bundle)
             .map_err(|e| to_status(&e))?;
+        created.insert(req.id.clone());
         Ok(CreateTaskResponse {
             pid: status.pid.unwrap_or(0),
         }
@@ -228,11 +373,17 @@ impl TaskService {
             Some(c) => Some(self.execs.lock_container(c).map_err(|e| to_status(&e))?),
             None => None,
         };
+        // 実行層の削除から `created` の登録除去までを、Create・Shutdown と同じロックで排他する。
+        // 放すと並行する Create が同じ ID を再作成して登録した後に、その新しい登録を消してしまい、
+        // Shutdown(now=false) が生存コンテナを見落として終了を要求する（CRI-5・TASK-62.7.2）。
+        let mut created = self.created.lock().unwrap_or_else(|p| p.into_inner());
         // 状態を採れなければ削除しない（fail-closed。NotFound はそのまま 5）。
         let before = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         self.adapter
             .remove(&req.id, false)
             .map_err(|e| to_status(&e))?;
+        created.remove(&req.id);
+        drop(created);
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -314,6 +465,9 @@ impl TtrpcService for TaskService {
             "Delete" => self.delete(payload),
             "Exec" => self.exec(payload),
             "Wait" => self.wait(payload, &CallContext::none()),
+            "State" => self.state(payload),
+            "Kill" => self.kill(payload),
+            "Shutdown" => self.shutdown(payload),
             _ => Err(unimplemented_status("method", method)),
         }
     }
@@ -394,7 +548,7 @@ mod tests {
 
     use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL};
     use super::super::service::RequestDeadline;
-    use super::super::task_api::{Any, Mount};
+    use super::super::task_api::{Any, KillRequest as WireKill, Mount, StateRequest as WireState};
     use super::*;
 
     /// 呼び出しと状態を記録する偽のランタイム。
@@ -449,8 +603,17 @@ mod tests {
                 Some(_) => Err(TraitError::new(ErrorCode::FailedPrecondition, "state")),
             }
         }
-        fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            let id = r.id().as_str().to_owned();
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("kill {id} {}", r.signal().as_u8()));
+            Ok(ContainerStatus::running(
+                r.id().clone(),
+                NonZeroU32::new(4242),
+            ))
         }
         fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
@@ -882,6 +1045,279 @@ mod tests {
     const INTERNAL: i32 = 13;
     const RESOURCE_EXHAUSTED: i32 = 8;
     const UNAVAILABLE: i32 = 14;
+
+    fn state_of(s: &TaskService, id: &str) -> StateResponse {
+        let req = WireState {
+            id: id.into(),
+            exec_id: String::new(),
+        };
+        let out = s.handle("State", &req.encode_to_vec()).unwrap();
+        StateResponse::decode(&out[..]).unwrap()
+    }
+
+    fn kill_req(id: &str, signal: u32, all: bool, eid: &str) -> Vec<u8> {
+        WireKill {
+            id: id.into(),
+            exec_id: eid.into(),
+            signal,
+            all,
+        }
+        .encode_to_vec()
+    }
+
+    /// CRI-5・TASK-62.7.2: State が Created / Running / Stopped を具体値で返す。
+    #[test]
+    fn cri5_873_state_reports_each_lifecycle() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f) = svc(v, Fake::default());
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            let r = state_of(&s, "c1");
+            assert_eq!(
+                (r.id.as_str(), r.pid, r.status, r.exit_status),
+                ("c1", 0, TaskStatus::Created as i32, 0)
+            );
+            assert!(r.bundle.is_empty() && r.exited_at.is_none() && !r.terminal);
+            s.handle("Start", &start_req("c1")).unwrap();
+            let r = state_of(&s, "c1");
+            assert_eq!(
+                (r.pid, r.status, r.exit_status),
+                (4242, TaskStatus::Running as i32, 0)
+            );
+            let id = RtId::new("c1").unwrap();
+            f.preset
+                .lock()
+                .unwrap()
+                .insert("c1".into(), ContainerStatus::stopped(id.clone(), Some(3)));
+            let r = state_of(&s, "c1");
+            assert_eq!((r.status, r.exit_status), (TaskStatus::Stopped as i32, 3));
+            f.preset
+                .lock()
+                .unwrap()
+                .insert("c1".into(), ContainerStatus::stopped(id, None));
+            assert_eq!(state_of(&s, "c1").exit_status, 255);
+        }
+    }
+
+    /// CRI-5・TASK-62.7.2: State の NOT_FOUND・exec_id 拒否・不正 payload。
+    #[test]
+    fn cri5_873_state_errors() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let req = WireState {
+            id: "nope".into(),
+            exec_id: String::new(),
+        };
+        assert_eq!(
+            err_code(s.handle("State", &req.encode_to_vec())).0,
+            NOT_FOUND
+        );
+        let req = WireState {
+            id: "c1".into(),
+            exec_id: "e".into(),
+        };
+        let (code, msg) = err_code(s.handle("State", &req.encode_to_vec()));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
+        assert_eq!(err_code(s.handle("State", &[0xff, 0xff])).0, INVALID);
+    }
+
+    /// CRI-5・TASK-62.7.2: Kill は 1 と 64 を adapter へ渡し、範囲外・all・exec_id を拒否する。
+    #[test]
+    fn cri5_873_kill_boundaries() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        running_container(&s, "c1");
+        for sig in [1u32, 15, 64] {
+            let out = s.handle("Kill", &kill_req("c1", sig, false, "")).unwrap();
+            assert!(out.is_empty());
+        }
+        let calls = f.calls.lock().unwrap().clone();
+        let kills: Vec<&str> = calls
+            .iter()
+            .filter(|c| c.starts_with("kill"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(kills, ["kill c1 1", "kill c1 15", "kill c1 64"]);
+        for sig in [0u32, 65, 256, u32::MAX] {
+            assert_eq!(
+                err_code(s.handle("Kill", &kill_req("c1", sig, false, ""))).0,
+                INVALID,
+                "{sig}"
+            );
+        }
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "kill all is not supported"));
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
+        assert_eq!(
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("kill"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 9, false, ""))).0,
+            NOT_FOUND
+        );
+    }
+
+    /// CRI-5・TASK-62.7.2: 停止済みへの Kill は NOT_FOUND で、シグナルを送らない。
+    #[test]
+    fn cri5_873_kill_stopped_is_not_found() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        running_container(&s, "c1");
+        f.preset.lock().unwrap().insert(
+            "c1".into(),
+            ContainerStatus::stopped(RtId::new("c1").unwrap(), Some(0)),
+        );
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "")));
+        assert_eq!(
+            (code, msg.as_str()),
+            (NOT_FOUND, "process already finished")
+        );
+        assert!(
+            !f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("kill"))
+        );
+    }
+
+    /// CRI-5・TASK-62.7.2: Shutdown はコンテナが残っていれば要求せず、無い・now なら要求する。
+    #[test]
+    fn cri5_873_shutdown_semantics() {
+        let sig = ShutdownSignal::new();
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s = s.with_shutdown(sig.clone());
+        let req = |id: &str, now: bool| ShutdownRequest { id: id.into(), now }.encode_to_vec();
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert!(s.handle("Shutdown", &req("c1", false)).unwrap().is_empty());
+        assert!(!sig.is_requested());
+        assert_eq!(err_code(s.handle("Shutdown", &[0xff, 0xff])).0, INVALID);
+        assert!(!sig.is_requested());
+        s.handle(
+            "Delete",
+            &DeleteRequest {
+                id: "c1".into(),
+                exec_id: String::new(),
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+        assert!(s.handle("Shutdown", &req("c1", false)).unwrap().is_empty());
+        assert!(sig.is_requested());
+        // 2 回目も成功する（冪等）。
+        assert!(s.handle("Shutdown", &req("c1", false)).unwrap().is_empty());
+
+        // 別 ID（存在しない c9）の Shutdown は、実行中の c1 が残っていれば要求しない。
+        let sig3 = ShutdownSignal::new();
+        let (s3, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s3 = s3.with_shutdown(sig3.clone());
+        s3.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        assert!(s3.handle("Shutdown", &req("c9", false)).unwrap().is_empty());
+        assert!(!sig3.is_requested());
+
+        let sig2 = ShutdownSignal::new();
+        let (s2, _) = svc(TaskApiVersion::V2, Fake::default());
+        let s2 = s2.with_shutdown(sig2.clone());
+        s2.handle("Create", &create_req("c2", &abs("/b"))).unwrap();
+        s2.handle("Shutdown", &req("c2", true)).unwrap();
+        assert!(sig2.is_requested());
+        // 終了要求後の Create は受けない。
+        assert_eq!(
+            err_code(s2.handle("Create", &create_req("c3", &abs("/b")))).0,
+            UNAVAILABLE
+        );
+    }
+
+    /// CRI-5・TASK-62.7.2・REPAIR-5: 作成済み ID は Delete で除去され、上限を超える Create は拒否する。
+    #[test]
+    fn cri5_873_created_ids_bounded_and_purged() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        for i in 0..CREATED_MAX {
+            s.handle("Create", &create_req(&format!("c{i}"), &abs("/b")))
+                .unwrap();
+        }
+        assert_eq!(
+            err_code(s.handle("Create", &create_req("over", &abs("/b")))).0,
+            RESOURCE_EXHAUSTED
+        );
+        s.handle("Delete", &delete_req("c0", "")).unwrap();
+        assert_eq!(s.created.lock().unwrap().len(), CREATED_MAX - 1);
+        s.handle("Create", &create_req("over", &abs("/b"))).unwrap();
+    }
+
+    /// CRI-5・TASK-62.7.2: Delete は実行層の削除から登録除去まで `created` を持ち、並行する Create・Shutdown と排他する。
+    /// 他者が `created` を持つ間は実行層を呼ばず、放した後に完了して登録を除去する。
+    #[test]
+    fn cri5_873_delete_excludes_create_via_created_lock() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        let calls_before = f.calls.lock().unwrap().len();
+        let guard = s.created.lock().unwrap();
+        std::thread::scope(|sc| {
+            let del = sc.spawn(|| s.handle("Delete", &delete_req("c1", "")));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // ロックを持つ間は state・delete のどちらも実行層へ届かない。
+            assert_eq!(f.calls.lock().unwrap().len(), calls_before);
+            drop(guard);
+            assert!(del.join().unwrap().is_ok());
+        });
+        assert!(!s.created.lock().unwrap().contains("c1"));
+        assert!(
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "delete c1 force=false")
+        );
+    }
+
+    /// CRI-5・TASK-62.7.2: v2 と v3 で作成済み ID を共有すると、別サービスの Create も Shutdown の判定に効く。
+    #[test]
+    fn cri5_873_shutdown_sees_other_version_creates() {
+        let sig = ShutdownSignal::new();
+        let (v2, f) = svc(TaskApiVersion::V2, Fake::default());
+        let v3 = TaskService::new(
+            TaskApiVersion::V3,
+            RuntimeAdapter::from_runtime(Shared(f.clone())),
+        )
+        .with_shared_created(&v2)
+        .with_shutdown(sig.clone());
+        v2.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        let req = ShutdownRequest {
+            id: "c9".into(),
+            now: false,
+        }
+        .encode_to_vec();
+        assert!(v3.handle("Shutdown", &req).unwrap().is_empty());
+        assert!(!sig.is_requested());
+    }
+
+    /// CRI-5・TASK-62.7.2: 範囲外シグナルは状態の照会より前に INVALID_ARGUMENT になる。
+    #[test]
+    fn cri5_873_kill_signal_checked_before_state() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        for sig in [0u32, 65] {
+            assert_eq!(
+                err_code(s.handle("Kill", &kill_req("nope", sig, false, ""))).0,
+                INVALID
+            );
+        }
+    }
+
+    /// CRI-5・TASK-62.7.2: シグナル未注入の Shutdown は UNIMPLEMENTED。
+    #[test]
+    fn cri5_873_shutdown_without_signal_unimplemented() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let req = ShutdownRequest {
+            id: "c1".into(),
+            now: true,
+        }
+        .encode_to_vec();
+        assert_eq!(err_code(s.handle("Shutdown", &req)).0, UNIMPL);
+    }
 
     /// CRI-5・CRI-7: V2 / V3 の両方で Create → Start が通り、pid と ID・bundle が具体値で一致する。
     #[test]

@@ -105,6 +105,10 @@ tokio = { version = "=1.53.3", default-features = false }
 # 「UDS の接続（#454）に hyper-util」と明記）、追加は #454。tonic の推移依存として Cargo.lock に既存（新規パッケージなし）。
 # crates/plugin の feature `grpc` のみで使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で列挙する。
 hyper-util = { version = "=0.1.21", default-features = false }
+# CRI ストリーミングサーバーの HTTP/1.1 サーバー（Exec/Attach/PortForward の URL 発行と Upgrade。CRI-6・TASK-63.1）。
+# 承認: Issue #678 のオーナー判断（2026-10-10）、追加は #679。tonic の推移依存として Cargo.lock に既存（新規パッケージなし）。
+# crates/cri のみで使い、core には入れない（PLUG-1・CORE-1）。features はメンバー側で列挙する。
+hyper = { version = "=1.12.0", default-features = false }
 
 # OCI レイヤー blob の gzip 展開（OCI-1・TASK-52.2）。承認: Issue #406・TASK-52.hdep2（オーナー判断 2026-10-10）。
 # 配置は crates/oci に限る。backend は純 Rust の zlib-rs（libz-sys / cc を引かない）。展開後サイズの上限は呼び出し側で検証する。

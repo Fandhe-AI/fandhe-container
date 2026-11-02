@@ -140,6 +140,10 @@ use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
     runtime_service_server::RuntimeService,
 };
+use crate::streaming::{
+    StreamRequest, StreamingUrlIssuer, validate_attach_request, validate_exec_request,
+    validate_port_forward_request,
+};
 use config_limits::BoundedConfig;
 use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
@@ -332,6 +336,8 @@ pub struct CriRuntimeService {
     pod_cidrs: Mutex<Option<PodCidrs>>,
     /// sandbox 記録の書き込み先（#2933・CRI-1・CRI-2）。`None` のときは何も書かない（従来どおり）。
     record_store: Option<Arc<dyn RecordStore>>,
+    /// ストリーミング URL の発行口（TASK-63.1・#679・CRI-6）。`None` のとき `Exec`・`Attach`・`PortForward` は `UNIMPLEMENTED`。
+    streaming: Option<Arc<StreamingUrlIssuer>>,
 }
 
 /// kubelet の `kubeRuntimeAPIVersion`。`Version` の応答の `version` はこれと完全一致が必須
@@ -1718,6 +1724,7 @@ impl CriRuntimeService {
             pod_network: None,
             pod_cidrs: Mutex::new(None),
             record_store: None,
+            streaming: None,
         }
     }
 
@@ -1737,6 +1744,17 @@ impl CriRuntimeService {
     /// （`docs/design/cri-config-acceptance.md` の順 13）。core の対応まで本番では差さない。
     pub fn with_pod_network(mut self, provider: Arc<dyn PodNetworkProvider>) -> Self {
         self.pod_network = Some(provider);
+        self
+    }
+
+    /// `Exec`・`Attach`・`PortForward` が返すストリーミング URL の発行口を差す注入点（TASK-63.1・#679・CRI-6）。
+    ///
+    /// 呼ばなければ従来どおり 3 RPC は `UNIMPLEMENTED`。差すと入力検証と存在照合を通った要求ごとに新しい URL を返す。
+    /// URL の先のサーバー（`crate::streaming::StreamingServer`）は呼び出し側が起動して `issuer()` を渡す。
+    /// **未実装（REPAIR-3）**: URL の先は現状 501 を返すだけで、プロトコル本体は #680〜#682。
+    /// plugin-cri からの起動と注入は後続の issue。
+    pub fn with_streaming(mut self, issuer: Arc<StreamingUrlIssuer>) -> Self {
+        self.streaming = Some(issuer);
         self
     }
 
@@ -3688,6 +3706,65 @@ impl CriRuntimeService {
         })
     }
 
+    /// `Exec` の本体。検証 → 存在照合 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
+    fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
+        let issuer = self.streaming_issuer("exec")?;
+        validate_exec_request(&req)?;
+        self.require_container(&req.container_id)?;
+        let url = issuer.issue(StreamRequest::Exec(req))?;
+        Ok(v1::ExecResponse { url })
+    }
+
+    /// `Attach` の本体（CRI-6・TASK-63.1）。
+    fn attach_impl(&self, req: v1::AttachRequest) -> Result<v1::AttachResponse, CriError> {
+        let issuer = self.streaming_issuer("attach")?;
+        validate_attach_request(&req)?;
+        self.require_container(&req.container_id)?;
+        let url = issuer.issue(StreamRequest::Attach(req))?;
+        Ok(v1::AttachResponse { url })
+    }
+
+    /// `PortForward` の本体（CRI-6・TASK-63.1）。
+    fn port_forward_impl(
+        &self,
+        req: v1::PortForwardRequest,
+    ) -> Result<v1::PortForwardResponse, CriError> {
+        let issuer = self.streaming_issuer("port_forward")?;
+        validate_port_forward_request(&req)?;
+        let exists = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
+            .records
+            .contains_key(&req.pod_sandbox_id);
+        if !exists {
+            return Err(CriError::not_found("pod sandbox not found"));
+        }
+        let url = issuer.issue(StreamRequest::PortForward(req))?;
+        Ok(v1::PortForwardResponse { url })
+    }
+
+    fn streaming_issuer(&self, rpc: &'static str) -> Result<Arc<StreamingUrlIssuer>, CriError> {
+        self.streaming
+            .clone()
+            .ok_or_else(|| CriError::unimplemented(rpc))
+    }
+
+    /// コンテナの存在を照合する。レジストリのロックは返す前に放す（発行とロックを入れ子にしない）。
+    fn require_container(&self, container_id: &str) -> Result<(), CriError> {
+        let exists = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
+            .containers
+            .contains_key(container_id);
+        if exists {
+            Ok(())
+        } else {
+            Err(CriError::not_found("container not found"))
+        }
+    }
+
     /// `ListContainers` の本体。フィルタは AND、並びは `(created_at, id)` の昇順（CRI-1・TASK-58.3・#435）。
     ///
     /// 一致なし・未知 ID・`CONTAINER_UNKNOWN` は空の一覧。未知の state 値と過大な `label_selector` は
@@ -4170,23 +4247,37 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::ExecSyncResponse>, Status> {
         Err(CriError::unimplemented("exec_sync").into())
     }
+    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
     async fn exec(
         &self,
-        _request: Request<v1::ExecRequest>,
+        request: Request<v1::ExecRequest>,
     ) -> Result<Response<v1::ExecResponse>, Status> {
-        Err(CriError::unimplemented("exec").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::Exec);
+        let result = self.exec_impl(request.into_inner()).map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
     async fn attach(
         &self,
-        _request: Request<v1::AttachRequest>,
+        request: Request<v1::AttachRequest>,
     ) -> Result<Response<v1::AttachResponse>, Status> {
-        Err(CriError::unimplemented("attach").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::Attach);
+        let result = self.attach_impl(request.into_inner()).map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
+    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
     async fn port_forward(
         &self,
-        _request: Request<v1::PortForwardRequest>,
+        request: Request<v1::PortForwardRequest>,
     ) -> Result<Response<v1::PortForwardResponse>, Status> {
-        Err(CriError::unimplemented("port_forward").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::PortForward);
+        let result = self
+            .port_forward_impl(request.into_inner())
+            .map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn container_stats(
         &self,

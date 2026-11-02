@@ -11,9 +11,10 @@
 //! - 宣言は x86_64 / aarch64 の Linux と macOS で共通の値（`SOL_SOCKET = 1`・`SO_PEERCRED = 17` は Linux 側）
 //!
 //! # `libc` 照合について
-//! `libc` は dev-dependencies のみで、末尾の `libc_abi` が定数・構造体・関数型をコンパイル時に照合する
-//! （方式は `docs/design/ffi-libc-check.md`。#1837・#1318・REPAIR-12）。Linux の `peer_uid` は LP64 の
-//! x86_64 / aarch64 に限り、それ以外は `Err`（fail-closed）にする。
+//! crates/cri には `libc` の dev-dependency が無く、自前宣言の機械照合は未導入である（crates/cri への
+//! `libc` の追加はオーナー承認待ち。追跡は #3669・判断は #3290。方式は `docs/design/ffi-libc-check.md`）。
+//! 承認後に同じ PR 方針で照合を足す。Linux の `peer_uid` は LP64 の x86_64 / aarch64 に限り、
+//! それ以外は `Err`（fail-closed）にする。
 
 #[cfg(any(
     all(
@@ -201,61 +202,4 @@ pub(crate) fn set_everyone_acl_for_test(path: &std::path::Path) -> Result<(), ()
 )))]
 pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, ()> {
     Err(())
-}
-
-/// 自前宣言と `libc` のコンパイル時照合（方式は `docs/design/ffi-libc-check.md`）。
-#[cfg(test)]
-mod libc_abi {
-    use super::*;
-
-    const _: unsafe extern "C" fn() -> libc::uid_t = geteuid;
-    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
-
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    mod linux {
-        use super::super::*;
-        use std::mem::{align_of, offset_of, size_of};
-
-        const _: () = assert!(1 == libc::SOL_SOCKET);
-        const _: () = assert!(17 == libc::SO_PEERCRED);
-        const _: () = assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
-        const _: () = assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
-        const _: () = assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
-        const _: () = assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
-        const _: () = assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
-        const _: () = assert!(size_of::<u32>() == size_of::<libc::socklen_t>());
-
-        const _: unsafe extern "C" fn(
-            libc::c_int,
-            libc::c_int,
-            libc::c_int,
-            *mut libc::c_void,
-            *mut libc::socklen_t,
-        ) -> libc::c_int = getsockopt;
-        const _: unsafe extern "C" fn(
-            libc::c_int,
-            libc::c_int,
-            libc::c_int,
-            *mut libc::c_void,
-            *mut libc::socklen_t,
-        ) -> libc::c_int = libc::getsockopt;
-    }
-
-    #[cfg(target_os = "macos")]
-    mod macos {
-        use super::super::*;
-        const _: unsafe extern "C" fn(
-            libc::c_int,
-            *mut libc::uid_t,
-            *mut libc::gid_t,
-        ) -> libc::c_int = getpeereid;
-        const _: unsafe extern "C" fn(
-            libc::c_int,
-            *mut libc::uid_t,
-            *mut libc::gid_t,
-        ) -> libc::c_int = libc::getpeereid;
-    }
 }

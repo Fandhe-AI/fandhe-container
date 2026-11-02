@@ -416,6 +416,63 @@ async fn cri6_port_forward_ping_is_echoed() {
     drop(fx);
 }
 
+/// CRI-6: 未知のストリームへの DATA は PROTOCOL_ERROR の RST_STREAM で返る。
+#[tokio::test]
+async fn cri6_port_forward_data_for_unknown_stream_is_reset() {
+    let fx = fixture(
+        PortForwardConfig::default(),
+        StreamingConfig::default(),
+        vec![],
+        None,
+    )
+    .await;
+    let addr = fx.server.local_addr();
+    let path = fx.path.clone();
+    blocking(move || {
+        let mut c = Client::connect(addr, &path);
+        c.send(&data(7, false, b"x"));
+        assert_eq!(
+            c.recv(),
+            Some(Frame::RstStream {
+                stream: sid(7),
+                status: 1
+            })
+        );
+    })
+    .await;
+    drop(fx);
+}
+
+/// CRI-6: 使用済みの（または減少する）クライアント起点ストリーム ID は PROTOCOL_ERROR で切断する。
+#[tokio::test]
+async fn cri6_port_forward_non_monotonic_stream_id_closes_session() {
+    let fx = fixture(
+        PortForwardConfig::default(),
+        StreamingConfig::default(),
+        vec![],
+        None,
+    )
+    .await;
+    let addr = fx.server.local_addr();
+    let path = fx.path.clone();
+    blocking(move || {
+        let mut c = Client::connect(addr, &path);
+        c.syn(5, "data", "8080", "0");
+        c.expect_reply(5);
+        c.syn(3, "error", "8080", "0");
+        assert_eq!(
+            c.recv(),
+            Some(Frame::GoAway {
+                last_good: 0,
+                status: GOAWAY_PROTOCOL_ERROR
+            })
+        );
+        assert_eq!(c.recv(), None);
+    })
+    .await;
+    drop(fx);
+}
+
 /// CRI-6: Upgrade 後に送受信が無いまま idle の期限が来ると、GOAWAY を送って切断する。
 #[tokio::test]
 async fn cri6_port_forward_idle_timeout_closes_session() {

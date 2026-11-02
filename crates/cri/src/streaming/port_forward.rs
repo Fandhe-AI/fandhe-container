@@ -37,7 +37,7 @@ use tokio::time::Sleep;
 
 use super::spdy::{
     Frame, FrameDecoder, GOAWAY_OK, GOAWAY_PROTOCOL_ERROR, HeaderCompressor, RST_CANCEL,
-    RST_REFUSED_STREAM, SpdyError, StreamId,
+    RST_PROTOCOL_ERROR, RST_REFUSED_STREAM, SpdyError, StreamId,
 };
 use super::{
     ConnectionPermit, NotImplementedHandler, StreamBody, StreamHandler, StreamRequest,
@@ -403,6 +403,8 @@ struct Session<IO> {
     decoder: FrameDecoder,
     outbox: Outbox,
     streams: HashMap<u32, (String, Kind)>,
+    /// これまでに受けたクライアント起点の最大ストリーム ID（SPDY は単調増加で再利用しない）。
+    last_syn_id: u32,
     pairs: HashMap<String, Pair>,
     dialer: Arc<dyn PortForwardDialer>,
     sandbox: String,
@@ -436,6 +438,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 comp,
             },
             streams: HashMap::new(),
+            last_syn_id: 0,
             pairs: HashMap::new(),
             dialer,
             sandbox,
@@ -478,10 +481,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
         }
     }
 
+    /// クライアントが読まない間に PING・SYN_STREAM 等への応答で送信キューが膨らまないよう、
+    /// 送信キューが上限を超えている間は読み取りも止める（REPAIR-5。止まったままなら idle で終わる）。
     fn can_read(&self) -> bool {
-        self.pairs
-            .values()
-            .all(|p| p.pending() <= self.config.max_pending_bytes)
+        self.outbox.pending() <= self.config.max_pending_bytes
+            && self
+                .pairs
+                .values()
+                .all(|p| p.pending() <= self.config.max_pending_bytes)
     }
 
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<PortForwardEnd> {
@@ -602,6 +609,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                     if fin {
                         pair.peer_fin = true;
                     }
+                } else {
+                    // 未知のストリーム、または error ストリームへの DATA。
+                    self.outbox.send(&Frame::RstStream {
+                        stream,
+                        status: RST_PROTOCOL_ERROR,
+                    });
                 }
             }
             Frame::RstStream { stream, .. } => {
@@ -617,10 +630,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
     fn on_syn_stream(&mut self, stream: StreamId, headers: &[(String, String)], fin: bool) {
         // クライアント起点のストリーム ID は奇数で、重複しない。
-        if stream.get().is_multiple_of(2) || self.streams.contains_key(&stream.get()) {
+        if stream.get().is_multiple_of(2)
+            || stream.get() <= self.last_syn_id
+            || self.streams.contains_key(&stream.get())
+        {
             self.finish(PortForwardEnd::ProtocolError);
             return;
         }
+        self.last_syn_id = stream.get();
         let find = |name: &str| {
             headers
                 .iter()

@@ -78,3 +78,51 @@ below until the repository owner decides whether it may be omitted:
     See also http://www.apache.org/dev/crypto.html and/or seek legal counsel.
 
 The full text is in the NOTICE file at the commit above.
+
+--------------------------------------------------------------------
+Third-party attribution: moby/spdystream (Apache License 2.0; spdy/
+derived from the Go project, BSD 3-Clause License)
+--------------------------------------------------------------------
+
+Source:  https://github.com/moby/spdystream
+File:    spdy/dictionary.go
+Commit:  c59e5d73daa301bde452ea77545bdf51e32554a2
+
+What was derived: only the 1423 bytes of the SPDY/3 header compression
+dictionary (defined by the SPDY/3 draft, section 2.6.10.1). No logic was
+copied. The Adler-32 of the data is checked against the draft's
+dictionary id (0xe3c6a7c2) by a unit test. The corresponding definition
+file in this repository is crates/cri/src/streaming/spdy_dictionary.rs
+(issue #681, TASK-63.3).
+
+The attribution lines of the file at that commit:
+
+    Copyright 2009-2013 The Go Authors. All rights reserved.
+    Modifications Copyright 2014-2021 Docker Inc.
+    Use of this source code is governed by a BSD-style license that can
+    be found in the LICENSE file of the Go project (BSD 3-Clause).
+
+The attribution lines of the spdystream NOTICE file at that commit:
+
+    SpdyStream
+    Copyright 2014-2021 Docker Inc.
+
+    This product includes software developed at Docker Inc.
+    (https://www.docker.com/).
+
+    SPDY implementation (spdy/)
+
+    The spdy directory contains code derived from the Go project
+    (golang.org/x/net).
+
+    Copyright 2009-2013 The Go Authors.
+    Licensed under the BSD 3-Clause License.
+
+    Modifications Copyright 2014-2021 Docker Inc.
+
+    The BSD license text and Go patent grant are included in
+    spdy/LICENSE and spdy/PATENTS.
+
+The repository owner has not yet decided whether the BSD 3-Clause
+license text itself must also be reproduced here; the full text is in
+spdy/LICENSE at the commit above.

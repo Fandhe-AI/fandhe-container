@@ -57,6 +57,8 @@ const MAX_REQUEST_ID_BYTES: usize = 64;
 const DATA_CHUNK: usize = 32 * 1024;
 /// SPDY 接続から 1 回に読むバイト数。
 const READ_CHUNK: usize = 16 * 1024;
+/// 書き込み済みの接頭辞をバッファから詰める閾値（消費済み領域の蓄積を防ぐ）。
+const COMPACT_THRESHOLD: usize = 4 * 1024;
 /// `poll` 1 回で回す最大ラウンド数（他のタスクを飢えさせない）。
 const MAX_ROUNDS: usize = 64;
 
@@ -385,6 +387,10 @@ impl Outbox {
         if self.pos >= self.buf.len() {
             self.buf.clear();
             self.pos = 0;
+        } else if self.pos >= COMPACT_THRESHOLD {
+            // 未送信分が残り続けても消費済みの接頭辞が蓄積しないよう詰める。
+            self.buf.drain(..self.pos);
+            self.pos = 0;
         }
         Ok(progress)
     }
@@ -550,7 +556,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     /// SPDY 接続から読んでフレームを処理する。進捗があれば true。
     fn poll_read_io(&mut self, cx: &mut Context<'_>) -> bool {
         let mut chunk = [0u8; READ_CHUNK];
-        let mut buf = ReadBuf::new(&mut chunk);
+        // 復号器の残り容量までしか読まない（TCP のまとめ方で正常入力を拒否しない）。
+        let limit = self.decoder.free_capacity().min(READ_CHUNK);
+        if limit == 0 {
+            self.finish_for(SpdyError::LimitExceeded("receive buffer is full"));
+            return true;
+        }
+        let mut buf = ReadBuf::new(&mut chunk[..limit]);
         match Pin::new(&mut self.io).poll_read(cx, &mut buf) {
             Poll::Pending => false,
             Poll::Ready(Err(_)) => {
@@ -602,6 +614,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 ..
             } => self.on_syn_stream(stream, &headers, fin),
             Frame::Data { stream, fin, data } => {
+                if data.is_empty()
+                    && matches!(self.streams.get(&stream.get()), Some((_, Kind::Error)))
+                {
+                    // error ストリームの空 FIN はクライアントの半閉じ。サーバー側の送信は保持する。
+                    return;
+                }
                 if let Some((key, Kind::Data)) = self.streams.get(&stream.get())
                     && let Some(pair) = self.pairs.get_mut(key)
                 {
@@ -839,6 +857,11 @@ fn step_pair(
             }
             Poll::Pending => break,
         }
+    }
+    if *to_tcp_pos < to_tcp.len() && *to_tcp_pos >= COMPACT_THRESHOLD {
+        // 未送信分が残り続けても消費済みの接頭辞が蓄積しないよう詰める。
+        to_tcp.drain(..*to_tcp_pos);
+        *to_tcp_pos = 0;
     }
     if *to_tcp_pos >= to_tcp.len() {
         to_tcp.clear();

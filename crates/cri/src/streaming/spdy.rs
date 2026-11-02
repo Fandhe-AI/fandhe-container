@@ -497,6 +497,14 @@ impl FrameDecoder {
         self.buf.len()
     }
 
+    /// `push` で受け付けられる残りのバイト数。
+    pub fn free_capacity(&self) -> usize {
+        self.max_frame
+            .saturating_add(FRAME_HEADER_LEN)
+            .saturating_mul(2)
+            .saturating_sub(self.buf.len())
+    }
+
     /// 受信バイトを追加する。バッファが「1 フレーム + ヘッダ」を大きく超えるなら拒否する。
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), SpdyError> {
         let cap = self
@@ -512,13 +520,17 @@ impl FrameDecoder {
 
     /// 完全に揃ったフレームがあれば 1 つ取り出す。
     pub fn next_frame(&mut self) -> Result<Option<Frame>, SpdyError> {
-        let Some(head) = self.buf.get(..FRAME_HEADER_LEN) else {
+        let Some(head) = self
+            .buf
+            .get(..FRAME_HEADER_LEN)
+            .and_then(|h| <[u8; FRAME_HEADER_LEN]>::try_from(h).ok())
+        else {
             return Ok(None);
         };
-        let word0 = u16::from_be_bytes([head[0], head[1]]);
-        let word1 = u16::from_be_bytes([head[2], head[3]]);
-        let flags = head[4];
-        let len = (usize::from(head[5]) << 16) | (usize::from(head[6]) << 8) | usize::from(head[7]);
+        let [w0a, w0b, w1a, w1b, flags, l0, l1, l2] = head;
+        let word0 = u16::from_be_bytes([w0a, w0b]);
+        let word1 = u16::from_be_bytes([w1a, w1b]);
+        let len = (usize::from(l0) << 16) | (usize::from(l1) << 8) | usize::from(l2);
         let control = word0 & 0x8000 != 0;
         if control && word0 & 0x7fff != SPDY_VERSION {
             return Err(SpdyError::Malformed("unsupported spdy version"));

@@ -173,7 +173,7 @@ impl Client {
         });
     }
 
-    /// 次のフレームを読む。EOF（またはタイムアウト）は None。
+    /// 次のフレームを読む。EOF と接続リセット・切断は None。読み取りタイムアウトは切断漏れなので panic する。
     fn recv(&mut self) -> Option<Frame> {
         loop {
             if let Some(frame) = self.dec.next_frame().expect("decode") {
@@ -181,7 +181,19 @@ impl Client {
             }
             let mut buf = [0u8; 4096];
             match self.tcp.read(&mut buf) {
-                Ok(0) | Err(_) => return None,
+                Ok(0) => return None,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return None;
+                }
+                Err(e) => panic!("read failed (disconnect not observed): {e}"),
                 Ok(n) => self.dec.push(&buf[..n]).expect("push"),
             }
         }

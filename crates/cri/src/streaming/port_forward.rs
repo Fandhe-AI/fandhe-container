@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -91,7 +92,8 @@ pub struct PortForwardConfig {
     pub max_streams: usize,
     /// 受け取るフレーム本体の最大バイト数。既定 1 MiB。
     pub max_frame_bytes: usize,
-    /// 1 対あたりの書き込み滞留量と送信キューの上限（超えると読み取りを止める）。既定 256 KiB。
+    /// 転送先への書き込み滞留量（全対の合計）と送信キューの上限。超えている間は SPDY 接続の読み取りを止める
+    /// （バックプレッシャー。1 フレームが上限を超えても、`max_frame_bytes` 以内なら受け取って TCP へ排出する）。既定 256 KiB。
     pub max_pending_bytes: usize,
 }
 
@@ -330,6 +332,27 @@ enum Phase {
     Connected(Connected),
 }
 
+/// 実行中の `spawn_blocking` の dial 1 件ぶんの枠。blocking 処理が終わる（クロージャが drop される）まで
+/// 返らない。対がキャンセルされても dial は止まらないため、実行中・待機中の総数をこの枠で抑える（REPAIR-5）。
+struct DialSlot(Arc<AtomicUsize>);
+
+impl DialSlot {
+    fn acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        counter
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for DialSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Pair {
     port: u16,
     error: Option<StreamId>,
@@ -420,6 +443,8 @@ struct Session<IO> {
     last_activity: Instant,
     /// 対の処理を始める位置。毎回進めて、送信キューの空きを先頭の対が独占しないようにする。
     pair_cursor: usize,
+    /// blocking の dial の実行中・待機中の件数（`DialSlot` が増減する）。
+    dial_inflight: Arc<AtomicUsize>,
     tick: Pin<Box<Sleep>>,
     tick_every: Duration,
     end: Option<PortForwardEnd>,
@@ -454,6 +479,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             scratch: vec![0u8; DATA_CHUNK],
             last_activity: Instant::now(),
             pair_cursor: 0,
+            dial_inflight: Arc::new(AtomicUsize::new(0)),
             tick: Box::pin(tokio::time::sleep(tick_every)),
             tick_every,
             end: None,
@@ -492,10 +518,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
     /// クライアントが読まない間に PING・SYN_STREAM 等への応答で送信キューが膨らまないよう、
     /// 送信キューが上限を超えている間は読み取りも止める（REPAIR-5。止まったままなら idle で終わる）。
-    /// 対ごとの受信滞留では止めない（1 対の滞留で他の対の DATA と RST_STREAM が読めなくなるため）。
-    /// 対ごとの上限は `on_frame` で、超えた対だけを RST_STREAM でリセットして守る。
+    /// 転送先へ未書き込みの滞留が全対の合計で上限に達している間も読み取りを止める（バックプレッシャー）。
+    /// 受け取った DATA は分割して TCP へ排出し、フレーム単位では拒否しない。滞留の上限は
+    /// 「上限 + 復号器の容量」で有界になり、排出が進まないまま続けば idle で終わる。
     fn can_read(&self) -> bool {
         self.outbox.pending() <= self.config.max_pending_bytes
+            && self
+                .pairs
+                .values()
+                .fold(0usize, |a, p| a.saturating_add(p.pending()))
+                < self.config.max_pending_bytes
     }
 
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<PortForwardEnd> {
@@ -569,7 +601,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             self.finish_for(SpdyError::LimitExceeded("receive buffer is full"));
             return true;
         }
-        let mut buf = ReadBuf::new(&mut chunk[..limit]);
+        let Some(window) = chunk.get_mut(..limit) else {
+            self.finish_for(SpdyError::LimitExceeded("receive window out of range"));
+            return true;
+        };
+        let mut buf = ReadBuf::new(window);
         match Pin::new(&mut self.io).poll_read(cx, &mut buf) {
             Poll::Pending => false,
             Poll::Ready(Err(_)) => {
@@ -636,15 +672,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                         self.outbox.send(&Frame::RstStream {
                             stream,
                             status: RST_PROTOCOL_ERROR,
-                        });
-                        self.abort_pair(&key, Some(stream));
-                        return;
-                    }
-                    if pair.pending().saturating_add(data.len()) > self.config.max_pending_bytes {
-                        // 転送先が読まない対だけをリセットする（他の対の読み取りは止めない。REPAIR-5）。
-                        self.outbox.send(&Frame::RstStream {
-                            stream,
-                            status: RST_CANCEL,
                         });
                         self.abort_pair(&key, Some(stream));
                         return;
@@ -748,11 +775,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             && pair.data.is_some()
             && matches!(pair.phase, Phase::Waiting)
         {
+            // 対のキャンセル後も blocking の dial は残るため、総数に上限を設ける。取れなければ接続失敗として扱う。
+            let slot = DialSlot::acquire(&self.dial_inflight, (self.config.max_streams / 2).max(1));
             pair.phase = Phase::Dialing(make_dial(
                 Arc::clone(&self.dialer),
                 self.sandbox.clone(),
                 pair.port,
                 self.config.dial_timeout,
+                slot,
             ));
         }
     }
@@ -818,9 +848,17 @@ fn make_dial(
     sandbox: String,
     port: u16,
     timeout: Duration,
+    slot: Option<DialSlot>,
 ) -> DialFuture {
     Box::pin(async move {
-        let join = tokio::task::spawn_blocking(move || dialer.dial(&sandbox, port, timeout));
+        let Some(slot) = slot else {
+            return Err(());
+        };
+        let join = tokio::task::spawn_blocking(move || {
+            // 枠は blocking 処理が終わるまで保持する（future の drop では返さない）。
+            let _slot = slot;
+            dialer.dial(&sandbox, port, timeout)
+        });
         match tokio::time::timeout(timeout, join).await {
             Ok(Ok(Ok(std_tcp))) => {
                 std_tcp.set_nonblocking(true).map_err(|_| ())?;

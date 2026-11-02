@@ -17,9 +17,17 @@
 //! ヘッダブロックの zlib 辞書は SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00, 2012-02）§2.6.10.1 の
 //! `SPDY_dictionary_txt`（1423 バイト）を、IETF 掲載のテキストから機械的に起こしたものである。
 //! 長さと Adler-32（0xe3c6a7c2）は試験で照合する。
-//! 定義元は IETF Internet-Draft（draft-mbelshe-httpbis-spdy-00。プロトコルの相互運用に必須の固定バイト列）で、
-//! 文書の著作権表示は IETF Trust の規定に従う。ライセンス判断は Agent が行わず、オーナー判断事項として PR 本文・
-//! `docs/design/cri-streaming-server.md` に報告している（licensing.md）。NOTICE への追記要否も同判断に従う。
+//! 一次情報の確認結果（2026-11-02 に取得して確認）:
+//!
+//! - 出典: <https://www.ietf.org/archive/id/draft-mbelshe-httpbis-spdy-00.txt>（draft-mbelshe-httpbis-spdy-00）
+//! - 文書の Copyright Notice は「Copyright (c) 2012 IETF Trust and the persons identified as the document authors」で、
+//!   IETF Trust の Legal Provisions（BCP 78）に従う。同文書は「Code Components extracted from this document must
+//!   include Simplified BSD License text as described in Section 4.e of the Trust Legal Provisions and are provided
+//!   without warranty as described in the Simplified BSD License」と述べる。
+//! - 文書に NOTICE ファイルに当たるものは無い。ルート `NOTICE` は変更していない。
+//! - 辞書が上記の Code Components に当たるか、Simplified BSD のライセンス文の同梱をどう行うかは、
+//!   Agent が決めずオーナー判断事項として PR 本文・`docs/design/cri-streaming-server.md` に報告している
+//!   （licensing.md）。判断が出るまで承認済みとは扱わない。
 
 use std::fmt;
 

@@ -74,6 +74,8 @@ const MAX_POLL_ROUNDS: usize = 32;
 const MAX_RESIZE_LINE_BYTES: usize = 1024;
 /// ストリームが揃う前に届いた stdin の DATA を保持する上限（バイト）。超えたら ProtocolError。
 const MAX_EARLY_STDIN_BYTES: usize = 256 * 1024;
+/// ストリームが揃う前に保持する resize の DATA の上限（バイト）。
+const MAX_EARLY_RESIZE_BYTES: usize = 16 * 1024;
 /// `X-Stream-Protocol-Version` などの複数値ヘッダで見る値の個数の上限。
 const MAX_HEADER_VALUES: usize = 16;
 /// 1 つのヘッダ値から見るカンマ区切りの要素数の上限と、各要素の長さの上限。
@@ -543,6 +545,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
 struct EarlyStdin {
     buf: Vec<u8>,
     fin: bool,
+    /// ストリームが揃う前に届いた resize の DATA（上限つき。Relay 起動後に端末サイズとして適用する。CRI-6）。
+    resize: Vec<u8>,
 }
 
 /// 受け付けたストリームの ID。
@@ -600,7 +604,7 @@ enum StreamWait {
 }
 
 /// ストリームが揃うまで SYN_STREAM を受け付ける（期限は呼び出し側が付ける）。
-/// 揃う前に届いた stdin の DATA と FIN は上限つきで `early` に保持する（stdin 以外の DATA は読み捨てる）。
+/// 揃う前に届いた stdin の DATA と FIN は上限つきで `early` に保持する（resize の DATA も上限つきで保持し、それ以外の DATA は読み捨てる）。
 async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
     need: Need,
@@ -636,6 +640,15 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 }
                 early.buf.extend_from_slice(&payload);
                 early.fin |= fin;
+                Ok(())
+            }
+            Frame::Data {
+                stream_id, payload, ..
+            } if streams.resize == Some(stream_id) => {
+                if early.resize.len().saturating_add(payload.len()) > MAX_EARLY_RESIZE_BYTES {
+                    return StreamWait::Protocol;
+                }
+                early.resize.extend_from_slice(&payload);
                 Ok(())
             }
             Frame::RstStream { stream_id, .. } if streams.stdin == Some(stream_id) => {
@@ -1225,6 +1238,8 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         idle: Box::pin(tokio::time::sleep(config.idle_timeout)),
         idle_timeout: config.idle_timeout,
     };
+    // 確立前に届いた resize を適用する（初期サイズを落とさない。CRI-6）。
+    relay.feed_resize(&early.resize);
     let end = poll_fn(|cx| relay.poll_run(cx)).await;
     // relay を drop すると ExecSession 由来の資源が解放され、プロセスが止まる（契約）。
     relay.finalize(end).await

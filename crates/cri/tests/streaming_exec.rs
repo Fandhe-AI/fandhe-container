@@ -747,6 +747,33 @@ async fn cri6_exec_tty_resize() {
     assert!(launch.tty && !launch.stderr);
 }
 
+/// CRI-6: error → resize → resize の初期サイズ DATA → stdout の順で張っても、確立前の resize が落ちない。
+#[tokio::test]
+async fn cri6_exec_tty_resize_data_before_all_streams_is_kept() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["tty-resize"], true, false, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "resize");
+        client.data(3, b"{\"Width\":120,\"Height\":40}\n", false);
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"{\"Width\":90,\"Height\":25}\n", false);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert_eq!(
+        *fx.launcher.resizes.lock().expect("lock"),
+        vec![(120, 40), (90, 25)]
+    );
+}
+
 /// CRI-6・REPAIR-5: 想定外の streamType と重複は RST_STREAM、上限を超える長さのフレームは `ProtocolError` で閉じる。
 #[tokio::test]
 async fn cri6_exec_rejects_unexpected_streams_and_oversized_frames() {

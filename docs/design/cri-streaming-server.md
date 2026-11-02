@@ -88,7 +88,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 ### zlib 辞書の出典
 
-SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00）§2.6.10.1 の `SPDY_dictionary_txt`（1423 バイト）を IETF 掲載のテキストから機械的に起こした。長さと Adler-32（0xe3c6a7c2）は試験で照合する。定義元は IETF Internet-Draft（プロトコルの相互運用に必須の固定バイト列）で、出典は `crates/cri/src/streaming/spdy.rs` の先頭 doc に記載した。Internet-Draft の著作権表示（IETF Trust）に基づくライセンス・帰属表示（NOTICE 追記）の要否は Agent が決めず、オーナー判断待ちとして PR 本文で報告する（licensing.md）。判断が出るまで NOTICE は変更しない。
+SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00）§2.6.10.1 の `SPDY_dictionary_txt`（1423 バイト）を IETF 掲載のテキストから機械的に起こした。長さと Adler-32（0xe3c6a7c2）は試験で照合する。定義元は IETF Internet-Draft（プロトコルの相互運用に必須の固定バイト列）で、出典は `crates/cri/src/streaming/spdy.rs` の先頭 doc に記載した。一次情報（<https://www.ietf.org/archive/id/draft-mbelshe-httpbis-spdy-00.txt>、2026-11-02 に取得）の確認結果: Copyright Notice は「Copyright (c) 2012 IETF Trust and the persons identified as the document authors」で IETF Trust の Legal Provisions（BCP 78）に従い、「Code Components extracted from this document must include Simplified BSD License text as described in Section 4.e of the Trust Legal Provisions」と記す。文書に NOTICE に当たるものは無く、ルート `NOTICE` は変更していない。辞書が Code Components に当たるか・Simplified BSD のライセンス文の同梱方法は Agent が決めず、オーナー判断が必要な事項として PR 本文で報告する（licensing.md）。判断が出るまで承認済みとは扱わない。
 
 ### 未確認
 

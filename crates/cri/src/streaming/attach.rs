@@ -359,6 +359,14 @@ where
     end
 }
 
+/// 現在から `after` 後の期限。検証済みの値では溢れないが、溢れても panic せず十分先の時刻にする。
+fn deadline_after(after: std::time::Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(after)
+        .or_else(|| now.checked_add(std::time::Duration::from_secs(86_400 * 365)))
+        .unwrap_or(now)
+}
+
 impl<IO> Session<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send,
@@ -452,7 +460,7 @@ where
     }
 
     fn touch(&mut self) {
-        let deadline = Instant::now() + self.limits.stream_idle_timeout;
+        let deadline = deadline_after(self.limits.stream_idle_timeout);
         self.idle.as_mut().reset(deadline);
     }
 
@@ -613,9 +621,9 @@ where
                 self.stdin_writer = None;
                 self.stdin_pending.clear();
                 self.stdin_pos = 0;
-                self.drain = Some(Box::pin(tokio::time::sleep_until(
-                    Instant::now() + self.limits.drain_timeout,
-                )));
+                self.drain = Some(Box::pin(tokio::time::sleep_until(deadline_after(
+                    self.limits.drain_timeout,
+                ))));
                 progress = true;
             }
             if self.phase == Phase::Draining
@@ -669,9 +677,19 @@ where
                     self.reset_ids.push(stream_id);
                 }
                 match self.opened.kind_of(stream_id) {
-                    Some(StreamType::Stdin) => self.stdin_fin = true,
+                    Some(StreamType::Stdin) => {
+                        // 未転送の入力と書き口を解放する。
+                        self.stdin_fin = true;
+                        self.stdin_pending.clear();
+                        self.stdin_pos = 0;
+                        self.stdin_writer = None;
+                    }
                     Some(StreamType::Stdout) => self.stdout_reader = None,
                     Some(StreamType::Stderr) => self.stderr_reader = None,
+                    Some(StreamType::Resize) => {
+                        self.resize_fn = None;
+                        self.pending_resize = None;
+                    }
                     _ => {}
                 }
                 None
@@ -747,6 +765,10 @@ where
     }
 
     fn client_data(&mut self, stream_id: StreamId, fin: bool, data: &[u8]) -> Option<SessionEnd> {
+        // RST_STREAM 済みのストリームの DATA は backend へ渡さない。
+        if self.is_reset(stream_id) {
+            return None;
+        }
         match self.opened.kind_of(stream_id) {
             Some(StreamType::Stdin) => {
                 // writer が無い（backend が stdin を渡さない・終了後）間は捨てる。接続前は溜める（上限で背圧）。

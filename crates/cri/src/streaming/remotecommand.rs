@@ -43,6 +43,9 @@ pub const MAX_STREAM_CREATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// `stream_idle_timeout` の上限。
 pub const MAX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// `backend_timeout`・`drain_timeout`・`close_timeout` の上限。`Instant` への加算のオーバーフローも防ぐ。
+pub const MAX_SESSION_STEP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Upgrade 後のセッションの期限（REPAIR-5）。`StreamingConfig` が既定値と検証を持ち、ハンドラへ渡す。
 ///
 /// Attach は長時間 idle になり得る（シェルを開いたまま放置する）ため、idle の既定は kubelet と同じ 4 時間とする。
@@ -91,9 +94,12 @@ impl SessionLimits {
         if self.backend_timeout.is_zero()
             || self.drain_timeout.is_zero()
             || self.close_timeout.is_zero()
+            || self.backend_timeout > MAX_SESSION_STEP_TIMEOUT
+            || self.drain_timeout > MAX_SESSION_STEP_TIMEOUT
+            || self.close_timeout > MAX_SESSION_STEP_TIMEOUT
         {
             return Err(CriError::invalid_argument(
-                "streaming session timeouts must be positive",
+                "streaming backend, drain and close timeouts must be between 1ns and 600s",
             ));
         }
         Ok(())
@@ -611,5 +617,34 @@ mod tests {
         );
         let mut p = ResizeParser::new();
         assert_eq!(p.push(&vec![b' '; MAX_RESIZE_BUFFER + 1]), Err(ResizeError));
+    }
+
+    /// CRI-6: backend・drain・close の期限は上限を超えると拒否する（`Duration::MAX` での加算 panic を防ぐ）。
+    #[test]
+    fn cri6_session_limits_reject_oversized_step_timeouts() {
+        let base = SessionLimits::default();
+        base.validate().expect("default");
+        for limits in [
+            SessionLimits {
+                backend_timeout: Duration::MAX,
+                ..base
+            },
+            SessionLimits {
+                drain_timeout: Duration::MAX,
+                ..base
+            },
+            SessionLimits {
+                close_timeout: MAX_SESSION_STEP_TIMEOUT + Duration::from_nanos(1),
+                ..base
+            },
+        ] {
+            assert!(limits.validate().is_err());
+        }
+        SessionLimits {
+            drain_timeout: MAX_SESSION_STEP_TIMEOUT,
+            ..base
+        }
+        .validate()
+        .expect("boundary");
     }
 }

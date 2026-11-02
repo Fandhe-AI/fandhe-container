@@ -729,3 +729,38 @@ async fn cri6_attach_ping_rst_and_protocol_error() {
     .await
     .expect("join");
 }
+/// CRI-6: RST_STREAM 済みの stdin・resize への DATA は backend へ渡らず、stdin の書き口は閉じる。
+#[tokio::test]
+async fn cri6_attach_data_after_rst_is_ignored() {
+    let backend = FakeBackend::new();
+    let (server, service, container) =
+        setup(StreamingConfig::default(), Some(backend.clone())).await;
+    let path = attach_path(&service, &container, true, true, false, true).await;
+    let addr = server.local_addr();
+    let b = backend.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(addr, &path);
+        c.open("error");
+        let stdin = c.open("stdin");
+        c.open("stdout");
+        let resize = c.open("resize");
+        c.pump_until(|c| c.replies.len() == 4);
+        let mut ends = b.take_ends();
+        for id in [stdin, resize] {
+            c.send(&Frame::RstStream {
+                stream_id: id,
+                status: rst_status::CANCEL,
+            });
+        }
+        c.send_data(stdin, b"late\n", false);
+        c.send_data(resize, br#"{"Width":1,"Height":2}"#, false);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(b.resizes.lock().expect("lock").is_empty());
+        // 書き口が閉じるので、コンテナ側は何も受け取らず EOF を読む。
+        let mut buf = Vec::new();
+        ends.stdin.read_to_end(&mut buf).expect("eof");
+        assert!(buf.is_empty());
+    })
+    .await
+    .expect("join");
+}

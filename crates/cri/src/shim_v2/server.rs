@@ -152,6 +152,23 @@ const AUDIT_QUEUE_CAPACITY: usize = 64;
 /// 次の 1 件の分(2 倍)で打ち切る。超えた分は失われうる旨を stderr へ残す。
 pub const AUDIT_DRAIN_LIMIT: Duration = RECORD_WAIT_LIMIT.saturating_mul(2);
 
+/// sink が記録に失敗したときの stderr の行(固定語彙のみ)。
+const AUDIT_UNAVAILABLE_LINE: &str = "{\"code\":\"audit_unavailable\",\"event\":\"shim_peer_audit_unavailable\",\"outcome\":\"error\"}";
+
+/// 1 プロセスが stderr へ出す通知の行数の上限。本番の daemon は stderr を `daemon.log`(追記のみ)へ向けるため、
+/// 別 UID の連続接続などで通知が際限なく増えてファイルを肥大させないよう打ち切る(超過分は黙って捨てる)。
+/// 1 行 約 100 バイトで、上限でも約 25 KB(REPAIR-5・SEC-4)。
+const STDERR_NOTICE_LIMIT: usize = 256;
+
+/// 監査の失敗通知を stderr へ 1 行出す(上限つき。書けなくても panic しない)。
+fn stderr_notice(line: &str) {
+    use std::io::Write;
+    static EMITTED: AtomicUsize = AtomicUsize::new(0);
+    if EMITTED.fetch_add(1, Ordering::Relaxed) < STDERR_NOTICE_LIMIT {
+        let _ = writeln!(io::stderr(), "{line}");
+    }
+}
+
 /// 期限切れで排出を待ち切れなかったときの stderr の行(固定語彙のみ)。
 const AUDIT_DRAIN_TIMEOUT_LINE: &str = "{\"code\":\"audit_drain_timeout\",\"event\":\"shim_peer_audit_may_be_lost\",\"outcome\":\"error\"}";
 
@@ -259,7 +276,7 @@ impl ServerHandle {
         if let Some(done) = self.audit_done.take() {
             // 通知が来る・送信側が落ちる(スレッドの panic)・期限切れのいずれでも戻る。後二者は失われうる。
             if !matches!(done.recv_timeout(self.audit_drain_timeout), Ok(())) {
-                eprintln!("{AUDIT_DRAIN_TIMEOUT_LINE}");
+                stderr_notice(AUDIT_DRAIN_TIMEOUT_LINE);
             }
         }
         Ok(())
@@ -365,17 +382,18 @@ fn submit_audit(ctx: &Ctx, rejection: PluginPeerRejection) {
         return;
     };
     let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
-        eprintln!("{AUDIT_DROPPED_LINE}");
+        stderr_notice(AUDIT_DROPPED_LINE);
         return;
     };
     let record = AuditRecord::new(ts, pid, rejection.audit_event(&ctx.socket_path));
     if tx.try_send(record).is_err() {
-        eprintln!("{AUDIT_DROPPED_LINE}");
+        stderr_notice(AUDIT_DROPPED_LINE);
     }
 }
 
 /// 監査レコードを積めなかったときの stderr の行(固定語彙のみ)。
-const AUDIT_DROPPED_LINE: &str = "{\"event\":\"shim_peer_audit_dropped\",\"outcome\":\"error\"}";
+const AUDIT_DROPPED_LINE: &str =
+    "{\"code\":\"audit_dropped\",\"event\":\"shim_peer_audit_dropped\",\"outcome\":\"error\"}";
 
 /// 監査の書き込みスレッドの送信口と終了通知。
 struct AuditWriter {
@@ -398,9 +416,7 @@ fn spawn_audit_writer(sink: Arc<dyn AuditSink>) -> Result<AuditWriter, ShimV2Err
         .spawn(move || {
             while let Ok(record) = rx.recv() {
                 if sink.record(&record).is_err() {
-                    eprintln!(
-                        "{{\"event\":\"shim_peer_audit_unavailable\",\"outcome\":\"error\"}}"
-                    );
+                    stderr_notice(AUDIT_UNAVAILABLE_LINE);
                 }
             }
             let _ = done_tx.send(());

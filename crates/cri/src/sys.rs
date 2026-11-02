@@ -29,6 +29,8 @@ use std::os::unix::net::UnixStream;
 unsafe extern "C" {
     /// 実効 uid（失敗しない）。
     safe fn geteuid() -> u32;
+    /// `int dup2(int oldfd, int newfd)`。`newfd` を `oldfd` の複製に置き換える（POSIX。Linux・macOS 共通）。
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
 }
 
 #[cfg(all(
@@ -80,6 +82,33 @@ const ENOENT: i32 = 2;
 /// `EINVAL`（`sys/errno.h`。`acl_get_entry` が「エントリ無し」で返す）。
 #[cfg(target_os = "macos")]
 const EINVAL: i32 = 22;
+
+/// 標準入出力のうち差し替えを許す番号（stdin・stderr）。任意の fd 番号を渡せないようにする。
+#[derive(Clone, Copy)]
+pub(crate) enum StdSlot {
+    Stdin = 0,
+    Stderr = 2,
+}
+
+/// 標準入力または標準エラーを `src` の複製に置き換える（`dup2`。shim v2 のデーモンが listen socket を fork する
+/// 子に持たせない・stderr を検証済みのログへ向けるために使う。SEC-4・PLUG-12・#3663）。
+/// 置き換え後の fd は close-on-exec ではない。`EINTR` は数回やり直し、失敗は `Err`。
+pub(crate) fn replace_std(slot: StdSlot, src: std::os::fd::BorrowedFd<'_>) -> Result<(), ()> {
+    use std::os::fd::AsRawFd;
+    for _ in 0..8 {
+        // SAFETY: `src` は呼び出しの間生きている有効な fd で、`slot` は 0 か 2 に限られる。ポインタを渡さず、
+        // 戻り値を検査する。`dup2` はプロセス全体の fd 表を書き換えるため、呼び出し元は fd 0/2 を別スレッドが使って
+        // いない単一スレッドの起動段で呼ぶ（維持すべき不変条件）。
+        let r = unsafe { dup2(src.as_raw_fd(), slot as i32) };
+        if r >= 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(());
+        }
+    }
+    Err(())
+}
 
 /// 呼び出しプロセスの実効 uid。
 pub(crate) fn effective_uid() -> u32 {

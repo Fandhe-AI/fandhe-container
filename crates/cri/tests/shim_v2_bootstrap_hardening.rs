@@ -57,6 +57,7 @@ fn run(sc: &Scratch, id: &str, action: &str) -> Output {
     })
     .arg(action)
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
+    .env("XDG_RUNTIME_DIR", &sc.root)
     .current_dir(&sc.root)
     .stdin(Stdio::null());
     reap::output_within(&mut cmd, Duration::from_secs(30))
@@ -163,6 +164,7 @@ fn plug12_872_trailing_slash_symlink_override_is_rejected() {
         })
         .arg(action)
         .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", &dir)
+        .env("XDG_RUNTIME_DIR", &sc.root)
         .current_dir(&sc.root)
         .stdin(Stdio::null());
         let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit");
@@ -213,6 +215,7 @@ fn run_in(sc: &Scratch, dir: &std::path::Path, id: &str, action: &str) -> Output
     })
     .arg(action)
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", dir)
+    .env("XDG_RUNTIME_DIR", &sc.root)
     .current_dir(&sc.root)
     .stdin(Stdio::null());
     reap::output_within(&mut cmd, LIMIT).expect("shim child must exit")

@@ -67,6 +67,7 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> Output {
     .args(extra)
     .arg(action)
     .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
+    .env("XDG_RUNTIME_DIR", &sc.root)
     .current_dir(&sc.root)
     .stdin(Stdio::null());
     reap::output_within(&mut cmd, Duration::from_secs(30))
@@ -254,8 +255,128 @@ fn cri5_872_serve_rejects_non_socket_stdin() {
     let mut cmd = Command::new(BIN);
     cmd.args(["-namespace", "default", "-address", "/a.sock", "-id", "s"])
         .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
+        .env("XDG_RUNTIME_DIR", &sc.root)
         .current_dir(&sc.root)
         .stdin(Stdio::null());
     let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit within the limit");
     assert_failed(&out, "FAILED_PRECONDITION");
+}
+
+/// `/proc/<pid>/stat` の親 PID（Linux）。コマンド名に `)` が入っても末尾の `)` から読む。
+#[cfg(target_os = "linux")]
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `/proc/*/cmdline` に id を含むデーモン（と fork した子）の PID 一覧（Linux）。
+#[cfg(target_os = "linux")]
+fn daemon_pids(id: &str) -> Vec<u32> {
+    let needle = format!("-id\0{id}\0");
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let c = std::fs::read(e.path().join("cmdline")).ok()?;
+            let s = String::from_utf8_lossy(&c).into_owned();
+            (s.contains(BIN) && s.contains(&needle)).then_some(pid)
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/fd` が指す `socket:[inode]` の一覧（Linux）。
+#[cfg(target_os = "linux")]
+fn socket_inodes(pid: u32) -> Vec<u64> {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let t = std::fs::read_link(e.path()).ok()?;
+            let t = t.to_str()?;
+            t.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+        })
+        .collect()
+}
+
+/// `/proc/net/unix` から、パスが `sock` の socket の inode を探す（Linux）。
+#[cfg(target_os = "linux")]
+fn inode_of_socket_path(sock: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/net/unix").ok()?;
+    text.lines().find_map(|l| {
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        (cols.len() >= 8 && cols.last() == Some(&sock.to_str()?))
+            .then(|| cols[6].parse().ok())
+            .flatten()
+    })
+}
+
+/// SEC-4・PLUG-12・#3663: 監査 relay の helper は listen socket を持たない（デーモンが死んでも LISTEN を保たず、
+/// `start` が死んだアドレスを生きていると判定し続けない）。デーモンの stdin は /dev/null になっている。
+#[cfg(target_os = "linux")]
+#[test]
+fn plug12_3663_audit_helper_does_not_hold_listener() {
+    let sc = Scratch::new();
+    let id = format!("h{}", std::process::id());
+    let addr = start_ok(&sc, &id);
+    let sock = sock_of(&addr);
+    let ino = inode_of_socket_path(&sock).expect("listener inode must be listed in /proc/net/unix");
+    let pids = daemon_pids(&id);
+    assert_eq!(pids.len(), 2, "daemon and its audit helper: {pids:?}");
+    let daemon = *pids
+        .iter()
+        .find(|p| ppid_of(**p).is_some_and(|pp| !pids.contains(&pp)))
+        .expect("daemon (parent outside the pair) must exist");
+    let helper = *pids.iter().find(|p| **p != daemon).unwrap();
+    assert_eq!(ppid_of(helper), Some(daemon));
+    assert!(
+        socket_inodes(daemon).contains(&ino),
+        "the daemon must hold the listener"
+    );
+    assert!(
+        !socket_inodes(helper).contains(&ino),
+        "the audit helper must not hold the listener"
+    );
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{daemon}/fd/0")).unwrap(),
+        Path::new("/dev/null")
+    );
+    let del = run(&sc, &id, "delete", &["-bundle", "/tmp/b"]);
+    assert!(del.status.success(), "{del:?}");
+}
+
+/// SEC-4・#3663: 監査の記録先を確保できないデーモンは起動に失敗し（置き場所の上書きでも縮退しない）、
+/// その理由はデーモンの stderr の記録先 `daemon.log`（0600）に残る。
+#[test]
+fn sec4_3663_audit_open_failure_is_fatal_and_logged() {
+    let sc = Scratch::new();
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "-namespace",
+        "default",
+        "-address",
+        "/run/containerd/containerd.sock",
+        "-publish-binary",
+        "/usr/bin/containerd",
+        "-id",
+        "noaudit",
+        "start",
+    ])
+    .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", sc.sock_dir())
+    // 相対パスの XDG_RUNTIME_DIR は状態ルートとして拒否される（root では既定の /run/fandhe-container が使われるため対象外）。
+    .env("XDG_RUNTIME_DIR", "relative-runtime-dir")
+    .current_dir(&sc.root)
+    .stdin(Stdio::null());
+    let out = reap::output_within(&mut cmd, LIMIT).expect("shim child must exit within the limit");
+    let log = sc.sock_dir().join("daemon.log");
+    if std::fs::metadata(&sc.root).unwrap().uid() == 0 {
+        return;
+    }
+    assert!(!out.status.success(), "{out:?}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("cannot open audit log"), "{text}");
+    assert_eq!(std::fs::metadata(&log).unwrap().mode() & 0o777, 0o600);
 }

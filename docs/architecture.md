@@ -3,10 +3,10 @@
 crate 境界・依存方向・実装コードを持たない確定済み設計判断への索引となる文書（REPAIR-3）。個々の crate の責務・PLUG-1 区分の確定一覧は [crate-naming.md](design/crate-naming.md) を正とし、本書ではそれを層構造・依存方向の観点で要約する。
 
 - 作成日: 2026-09-27
-- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）
+- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）・#707（TASK-78.2）
 - ステータス: #24（TASK-6.h1）で内容レビュー承認待ち
 - 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6・MVM-5
-- 対象マイルストーン: MS-0
+- 対象マイルストーン: MS-0（「microVM の 3 OS 展開方針（MVM-5）」節は MS-7・TASK-78）
 
 spec（`docs/spec/04-behavior/`）と本書の記述が食い違う場合は spec を正とする（[spec-reference](../.claude/rules/spec-reference.md)）。
 
@@ -252,22 +252,22 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 
 | 優先順位 | OS | バックエンド | 位置づけ | 現状 |
 | -------- | -- | ------------ | -------- | ---- |
-| 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75 で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc） |
-| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装（コードなし） |
-| 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2〔WIN-1〕）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装・計画なし |
+| 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75（#688・#695）で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc） |
+| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装（コードなし）。spec の `05-tasks.md` にこのバックエンドの実装 TASK はなく、TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
+| 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装・計画なし |
 
 実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進める。Windows（WHP）は優先順位の外に置く。
 
 本書で断定しない事項:
 
-- macOS の microVM オプションと macOS バックエンド（MAC-1 の Virtualization.framework、TASK-64 の `Vm`）との関係、MAC-4 の「1 コンテナ = 1 VM」オプションの実現経路は、[macos-vm-strategy.md](design/macos-vm-strategy.md) が未定としているのに合わせて決めない
-- GPU-6・MAC-5 の VMM 統合先は TASK-172 の 3 段目の判定で分岐し、不可の場合に限り Hypervisor.framework 上の自前 VMM（MVM-5 の macOS 展開と共通化）へ切り替える。本節はその判定を先取りしない
+- macOS の microVM オプションと macOS バックエンド（MAC-1 の Virtualization.framework、TASK-64 の `Vm`）との関係、TASK-65（MAC-1）の virtiofs 共有と I/O 共有プロトコルを microVM の I/O パスが再利用するか、MAC-4 の「1 コンテナ = 1 VM」オプションの実現経路は、[macos-vm-strategy.md](design/macos-vm-strategy.md) が未定としているのに合わせて決めない
+- GPU-6・MAC-5 の VMM 統合先は TASK-172 の 3 段目の判定（#1057。TASK-172.h5）で分岐し、統合は TASK-180 が担い、不可の場合に限り Hypervisor.framework 上の自前 VMM（MVM-5 の macOS 展開と共通化）へ切り替える。本節はその判定を先取りしない
 - Hypervisor.framework・WHP の FFI の置き場所と依存は未決。新しい依存が要る場合はユーザー承認を経る（[dependency-policy](../.claude/rules/dependency-policy.md)）
 - WHP 方式を実装する場合の crate 配置は未決（[crate-naming.md](design/crate-naming.md) に明示判定がない）。実装の計画時にオーナーが判断する
 
 根拠は PoC-6（microvm-isolation-cost）と PoC-4（windows-support-path）の机上検証であり、実機計測ではない。PoC-6 の「Linux は rust-vmm 活用」の記述は MVM-1・MVM-4（rust-vmm 不使用）とフルスクラッチ方針で上書きされている。
 
-出典: `docs/spec/04-behavior/api-microvm.md`（submodule リビジョン `fe33bef`）の `MVM-5`、`docs/spec/05-tasks.md` の TASK-78。
+出典: `docs/spec/04-behavior/api-microvm.md`（submodule リビジョン `fe33bef`）の `MVM-5`、`docs/spec/05-tasks.md` の TASK-78（整合確認の参照: TASK-64・TASK-65・TASK-67・TASK-180）、`docs/spec/06-roadmap.md` の MS-7。
 
 ## 確定済み設計判断（実装コードを持たないもの）
 
@@ -278,7 +278,7 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-shared-vm.md](design/macos-shared-vm.md)（TASK-191 の未決事項の設計案。承認待ち #1906）・[macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。#370〔TASK-66.h1〕で確認済み・2026-10-12。既定方式の実装は TASK-191〔#1905・#1906〕） |
 | REPAIR-1・REPAIR-4・MAC-1 のログ回転の共通化 | supervisor の `RotatingFileSink` と platform-macos のコンソールログ回転は共通化せず 2 か所に置く（オーナー決定ではなく現状維持の判断。再評価条件あり） | REPAIR 系・MAC-1・SUP-7 の各ビヘイビア | [rotating-log-sharing.md](design/rotating-log-sharing.md)（#2172） |
 | MVM-1・MVM-4 のゲスト物理メモリアクセス型の所有先 | アクセス型は TASK-74.1 側（OS 非依存・コピー API・heap backing で試験）、mmap と KVM 登録は TASK-75.1 側（オーナー決定ではなく Agent の記録した判断。再評価条件あり） | MVM-1・MVM-4 | [microvm-memory-ownership.md](design/microvm-memory-ownership.md)（#876） |
-| MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書「microVM の 3 OS 展開方針（MVM-5）」節を参照（TASK-78・#705・#706） |
+| MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書「microVM の 3 OS 展開方針（MVM-5）」節を参照（TASK-78・#705・#706・#707） |
 | NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340。起動点・同期・入口・版の固定は 12 章・#1935） |
 | NET-5 | DNS ヘルパーを D-14 の原則の例外として認める | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6128207567)（2026-10-12 オーナー決定） |
 | NET-5・NET-9 の配置 | pasta は core 側（コンテナごとの supervisor が起動・監視・回収）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止）、`crates/net` は core 側のライブラリ（プロセスの寿命を持つ側に置く） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)（2026-10-12 オーナー決定） |
@@ -324,4 +324,4 @@ core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows
 
 ## 見直し
 
-REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。`api-microvm.md` の `MVM-5` が更新されたら「microVM の 3 OS 展開方針（MVM-5）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。採否未決の設計ドラフトを追加したら「設計ドラフト」の小節を設け、方式が決まったら確定済み設計判断の表へ移す。
+REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。`api-microvm.md` の `MVM-5` が更新されたら「microVM の 3 OS 展開方針（MVM-5）」節も追従する。TASK-64・TASK-65・TASK-67 の方針や TASK-172 の 3 段目の判定（#1057）が変わったときも同節を見直す。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。採否未決の設計ドラフトを追加したら「設計ドラフト」の小節を設け、方式が決まったら確定済み設計判断の表へ移す。

@@ -16,6 +16,12 @@
 //! 操作種別・結果コード・所要時間だけを渡す（要求の中身・文言は渡さない）。
 //!
 //! peer UID の照合は accept 直後に行う（`ServerConfig::allowed_peer_uids`・PLUG-12）。socket の配置と権限は `bootstrap` が扱う。
+//!
+//! 監査（SEC-4・PLUG-12）: [`TtrpcServer::with_audit_sink`] で core の `AuditSink` を渡すと、peer UID の拒否
+//! （許可外 uid・uid を取得できない接続）を層 `plugin_peer` の `AuditRecord` として 1 件ずつ記録する。
+//! 理由は core の `PluginPeerRejection`（`PeerUidMismatch`・`PeerUidUnavailable`）で区別する。accept スレッドを
+//! 塞がないため、記録は有界キュー（`try_send`）経由の専用スレッドが `AuditSink::record` で行う。あふれた記録と
+//! sink の失敗は stderr へ固定語彙の 1 行で残し、接続の拒否は記録の成否に影響されない（fail-closed）。
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::audit_log::{
+    AuditRecord, AuditSink, AuditTimestamp, PluginPeerRejection, current_pid,
+};
 use prost::Message;
 use tonic::Code;
 
@@ -124,7 +133,11 @@ pub struct TtrpcServer {
     registry: Arc<ServiceRegistry>,
     config: ServerConfig,
     recorder: Arc<dyn CriOpRecorder>,
+    audit: Option<Arc<dyn AuditSink>>,
 }
+
+/// 監査レコードの書き込み待ちの上限(REPAIR-5。あふれた分は捨てて stderr へ残す)。
+const AUDIT_QUEUE_CAPACITY: usize = 64;
 
 impl TtrpcServer {
     /// 登録簿と設定から作る（計測しない）。
@@ -142,7 +155,16 @@ impl TtrpcServer {
             registry: Arc::new(registry),
             config,
             recorder,
+            audit: None,
         }
+    }
+
+    /// peer UID の拒否を記録する監査の記録先を付ける(SEC-4・PLUG-12)。本番の bootstrap は状態ルートの
+    /// `@audit.log` を主経路とする `FileAuditSink` を渡す。
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
     }
 
     /// bind 済みの listener で accept スレッドを起動する。
@@ -151,10 +173,21 @@ impl TtrpcServer {
         listener
             .set_nonblocking(true)
             .map_err(|e| ShimV2Error::Listener(e.kind()))?;
+        let socket_path = listener
+            .local_addr()
+            .ok()
+            .and_then(|a| a.as_pathname().map(std::path::Path::to_path_buf))
+            .unwrap_or_default();
+        let audit = match &self.audit {
+            Some(sink) => Some(spawn_audit_writer(Arc::clone(sink))?),
+            None => None,
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(Ctx {
             registry: Arc::clone(&self.registry),
             recorder: Arc::clone(&self.recorder),
+            audit,
+            socket_path,
             config: self.config.clone(),
             stop: Arc::clone(&stop),
             active: AtomicUsize::new(0),
@@ -206,6 +239,10 @@ impl Drop for ServerHandle {
 struct Ctx {
     registry: Arc<ServiceRegistry>,
     recorder: Arc<dyn CriOpRecorder>,
+    /// 監査レコードの送り先(未設定なら監査しない)。
+    audit: Option<std::sync::mpsc::SyncSender<AuditRecord>>,
+    /// bind 済み socket のパス(監査レコードの `path`)。取れなければ空。
+    socket_path: std::path::PathBuf,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     active: AtomicUsize,
@@ -268,12 +305,61 @@ fn peer_allowed(stream: &UnixStream, ctx: &Ctx) -> bool {
     let Some(allowed) = &ctx.config.allowed_peer_uids else {
         return true;
     };
+    judge_peer(ctx, allowed, crate::sys::peer_uid(stream))
+}
+
+/// peer uid の取得結果から許否を決める。拒否は計測と監査の両方へ渡す(PLUG-12・SEC-4)。
+/// 取得の失敗(`Err`)は `PeerUidUnavailable`、許可外の uid は `PeerUidMismatch` として区別する。
+fn judge_peer(ctx: &Ctx, allowed: &[u32], uid: Result<u32, ()>) -> bool {
     let started = Instant::now();
-    if crate::sys::peer_uid(stream).is_ok_and(|uid| allowed.contains(&uid)) {
-        return true;
-    }
+    let rejection = match uid {
+        Ok(uid) if allowed.contains(&uid) => return true,
+        Ok(_) => PluginPeerRejection::PeerUidMismatch,
+        Err(()) => PluginPeerRejection::PeerUidUnavailable,
+    };
     record_op(ctx, CriOpKind::ShimV2Io, Code::PermissionDenied, started);
+    submit_audit(ctx, rejection);
     false
+}
+
+/// 拒否 1 件を型つきの監査レコードにして書き込みキューへ積む。ブロックしない(SEC-4・PLUG-12・REPAIR-5)。
+/// 組み立てられない・積めない場合は stderr へ固定語彙の 1 行を残す(接続の拒否は変えない)。
+fn submit_audit(ctx: &Ctx, rejection: PluginPeerRejection) {
+    let Some(tx) = &ctx.audit else {
+        return;
+    };
+    let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
+        eprintln!("{AUDIT_DROPPED_LINE}");
+        return;
+    };
+    let record = AuditRecord::new(ts, pid, rejection.audit_event(&ctx.socket_path));
+    if tx.try_send(record).is_err() {
+        eprintln!("{AUDIT_DROPPED_LINE}");
+    }
+}
+
+/// 監査レコードを積めなかったときの stderr の行(固定語彙のみ)。
+const AUDIT_DROPPED_LINE: &str = "{\"event\":\"shim_peer_audit_dropped\",\"outcome\":\"error\"}";
+
+/// 監査レコードを `sink` へ書く専用スレッドを起こす。全送信側が落ちるとスレッドは終わる(join しない)。
+/// スレッドを作れなければ `Err`(記録経路なしで受け付けない。SEC-4)。
+fn spawn_audit_writer(
+    sink: Arc<dyn AuditSink>,
+) -> Result<std::sync::mpsc::SyncSender<AuditRecord>, ShimV2Error> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AuditRecord>(AUDIT_QUEUE_CAPACITY);
+    thread::Builder::new()
+        .name("ttrpc-audit".into())
+        .spawn(move || {
+            while let Ok(record) = rx.recv() {
+                if sink.record(&record).is_err() {
+                    eprintln!(
+                        "{{\"event\":\"shim_peer_audit_unavailable\",\"outcome\":\"error\"}}"
+                    );
+                }
+            }
+        })
+        .map_err(|e| ShimV2Error::Listener(e.kind()))?;
+    Ok(tx)
 }
 
 /// 読み取りの結果。
@@ -698,5 +784,70 @@ fn conn_loop<'scope, 'env>(
         if !send_response(ctx, writer, done, sid, &resp, started) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fandhe_container_core::audit_log::AuditLayer;
+    use fandhe_container_core::traits::TraitError;
+
+    /// 記録を溜めるだけの sink。
+    struct Collect(Mutex<Vec<AuditRecord>>);
+
+    impl AuditSink for Collect {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    fn ctx_with(tx: std::sync::mpsc::SyncSender<AuditRecord>) -> Ctx {
+        Ctx {
+            registry: Arc::new(ServiceRegistry::new()),
+            recorder: Arc::new(NoopCriOpRecorder),
+            audit: Some(tx),
+            socket_path: std::path::PathBuf::from("/run/x/s.sock"),
+            config: ServerConfig::default(),
+            stop: Arc::new(AtomicBool::new(false)),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn drain(sink: &Collect, want: usize) -> Vec<AuditRecord> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.0.lock().unwrap().len() < want && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        sink.0.lock().unwrap().clone()
+    }
+
+    /// SEC-4・PLUG-12: 許可外 uid と uid 取得失敗は、理由を区別した監査レコードが 1 件ずつ記録される。
+    /// 許可された uid は記録しない。
+    #[test]
+    fn sec4_872_peer_rejections_are_audited_with_distinct_reasons() {
+        let sink = Arc::new(Collect(Mutex::new(Vec::new())));
+        let tx = spawn_audit_writer(Arc::clone(&sink) as Arc<dyn AuditSink>).unwrap();
+        let ctx = ctx_with(tx);
+        assert!(judge_peer(&ctx, &[1000], Ok(1000)));
+        assert!(!judge_peer(&ctx, &[1000], Ok(1001)));
+        assert!(!judge_peer(&ctx, &[1000], Err(())));
+        let got = drain(&sink, 2);
+        assert_eq!(got.len(), 2);
+        let reasons: Vec<String> = got
+            .iter()
+            .map(|r| {
+                r.reason()
+                    .expect("reason must be present")
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            ["plugin_peer_uid_mismatch", "plugin_peer_uid_unavailable"]
+        );
+        assert!(got.iter().all(|r| r.layer() == AuditLayer::PluginPeer));
     }
 }

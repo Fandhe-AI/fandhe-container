@@ -29,7 +29,9 @@
 //! 直列化し、stale 判定・削除・bind・READY 確認をプロセス間で排他する。失敗時に消すのは自分が bind した socket だけ。
 //!
 //! peer UID（PLUG-12）: デーモンは accept 直後に `SO_PEERCRED` / `getpeereid` で接続元を照合し、
-//! 実効 uid と root（0）以外を切断する。
+//! 実効 uid と root（0）以外を切断する。拒否は理由（許可外 uid・uid 取得失敗）を区別して、状態ルート直下の
+//! `@audit.log`（core の `FileAuditSink`）へ監査レコードとして届ける（SEC-4）。置き場所の上書き（試験用）が
+//! あるときだけ、記録先を開けなくても起動する。
 //!
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
@@ -354,8 +356,11 @@ where
             unix_impl::delete_recorded(&inv, &dir)
         }
         ShimAction::Serve => {
-            let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
-            unix_impl::run_serve(&inv, &dir, make_registry).map(|()| Vec::new())
+            let over = std::env::var_os(SOCKET_DIR_ENV);
+            let overridden = over.as_ref().is_some_and(|v| !v.is_empty());
+            let dir = resolve_socket_dir(over)?;
+            let audit = unix_impl::open_audit_sink(overridden)?;
+            unix_impl::run_serve(&inv, &dir, audit, make_registry).map(|()| Vec::new())
         }
     }
 }
@@ -400,6 +405,7 @@ mod unix_impl {
     use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
     use crate::shim_v2::server::{ServerConfig, TtrpcServer};
     use crate::shim_v2::service::ServiceRegistry;
+    use fandhe_container_core::audit_log::{AuditSink, FileAuditSink};
 
     /// sun_path の上限（NUL を除く）。
     #[cfg(target_os = "linux")]
@@ -921,8 +927,26 @@ mod unix_impl {
         Ok(encode_delete_response())
     }
 
+    /// 本番の監査の記録先を開く(状態ルート直下の `@audit.log` を主経路とする `FileAuditSink`。SEC-4・PLUG-12)。
+    ///
+    /// peer UID の拒否の記録先なので、開けなければ起動しない(fail-closed)。ただし置き場所を環境変数で
+    /// 上書きしている(`overridden`。主に試験用)ときは既定の状態ルートが無い環境でも動かせるよう、
+    /// 記録先なし(`None`)で続ける。
+    pub fn open_audit_sink(overridden: bool) -> Result<Option<Arc<dyn AuditSink>>, CriError> {
+        match FileAuditSink::open_in_state_root(None) {
+            Ok(sink) => Ok(Some(Arc::new(sink))),
+            Err(_) if overridden => Ok(None),
+            Err(_) => Err(internal("cannot open audit log")),
+        }
+    }
+
     /// デーモン本体。stdin の listener を検証して serve し、socket が消えたら終わる。
-    pub fn run_serve<F>(inv: &ShimInvocation, dir: &Path, make_registry: F) -> Result<(), CriError>
+    pub fn run_serve<F>(
+        inv: &ShimInvocation,
+        dir: &Path,
+        audit: Option<Arc<dyn AuditSink>>,
+        make_registry: F,
+    ) -> Result<(), CriError>
     where
         F: FnOnce() -> Result<ServiceRegistry, CriError>,
     {
@@ -953,7 +977,11 @@ mod unix_impl {
             ..ServerConfig::default()
         };
         let recorder: Arc<dyn CriOpRecorder> = Arc::new(OpLogRecorder::new(dir));
-        let handle = TtrpcServer::with_recorder(registry, config, recorder)
+        let mut server = TtrpcServer::with_recorder(registry, config, recorder);
+        if let Some(sink) = audit {
+            server = server.with_audit_sink(sink);
+        }
+        let handle = server
             .serve(listener)
             .map_err(|_| internal("cannot start ttrpc server"))?;
         {

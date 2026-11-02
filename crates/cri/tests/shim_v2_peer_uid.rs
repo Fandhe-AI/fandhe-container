@@ -84,3 +84,53 @@ fn plug12_default_accepts_same_uid() {
     assert_eq!(state_request(&mut s).unwrap(), HEADER_LEN);
     h.shutdown().unwrap();
 }
+
+/// 記録を溜めるだけの監査 sink。
+struct CollectSink(std::sync::Mutex<Vec<fandhe_container_core::audit_log::AuditRecord>>);
+
+impl fandhe_container_core::audit_log::AuditSink for CollectSink {
+    fn record(
+        &self,
+        record: &fandhe_container_core::audit_log::AuditRecord,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        self.0.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
+
+/// SEC-4・PLUG-12: 許可外 uid の実接続が、層 `plugin_peer`・理由 `plugin_peer_uid_mismatch` の監査レコード 1 件になる。
+/// 許可された接続は記録されない。
+#[test]
+fn sec4_872_denied_connection_is_audited_once() {
+    use fandhe_container_core::audit_log::AuditLayer;
+    let probe = test_root::test_root("peeruid", "auditprobe");
+    let euid = std::fs::metadata(&probe).unwrap().uid();
+    let root = test_root::test_root("peeruid", "audit");
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut reg = ServiceRegistry::new();
+    reg.register(Arc::new(EmptyTaskService::new(TaskApiVersion::V2)))
+        .unwrap();
+    let sink = Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+    let cfg = ServerConfig {
+        allowed_peer_uids: Some(vec![euid.wrapping_add(1)]),
+        ..ServerConfig::default()
+    };
+    let h = TtrpcServer::new(reg, cfg)
+        .with_audit_sink(sink.clone())
+        .serve(listener)
+        .unwrap();
+    let _s = UnixStream::connect(&path).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sink.0.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.shutdown().unwrap();
+    let got = sink.0.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].layer(), AuditLayer::PluginPeer);
+    assert_eq!(
+        got[0].reason().unwrap().as_str(),
+        "plugin_peer_uid_mismatch"
+    );
+}

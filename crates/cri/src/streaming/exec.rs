@@ -68,6 +68,9 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// 受信バッファの上限（最大の DATA フレーム + ヘッダ + 1 回の読み取り分）。
 const MAX_RECV_BUF_BYTES: usize = MAX_DATA_FRAME_BYTES + 8 + READ_CHUNK_BYTES;
 /// resize ストリームの 1 行の上限（バイト）。
+/// 1 回の `poll_run` で進展が続いても回す周回数の上限。超えたら wake して譲る。
+const MAX_POLL_ROUNDS: usize = 32;
+
 const MAX_RESIZE_LINE_BYTES: usize = 1024;
 /// ストリームが揃う前に届いた stdin の DATA を保持する上限（バイト）。超えたら ProtocolError。
 const MAX_EARLY_STDIN_BYTES: usize = 256 * 1024;
@@ -816,7 +819,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
     }
 
     /// 全入力を同時に見て進められるだけ進める。
+    ///
+    /// 出力が続く間も 1 回の poll で回す周回数は `MAX_POLL_ROUNDS` までとし、
+    /// 超えたら自身を wake して `Pending` で executor へ譲る（runtime スレッドの占有防止。REPAIR-5）。
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<RelayEnd> {
+        let mut rounds = 0usize;
         loop {
             let mut progress = false;
 
@@ -961,6 +968,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 return Poll::Ready(RelayEnd::Idle);
             }
             if !progress {
+                return Poll::Pending;
+            }
+            rounds = rounds.saturating_add(1);
+            if rounds >= MAX_POLL_ROUNDS {
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
         }

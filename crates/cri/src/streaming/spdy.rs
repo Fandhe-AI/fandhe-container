@@ -373,6 +373,11 @@ pub enum Frame {
         /// 増分。
         delta: u32,
     },
+    /// 接続レベルの WINDOW_UPDATE（stream id 0。SPDY/3.1）。受信しても無視する（送信側の流量制御は行わない）。
+    ConnectionWindowUpdate {
+        /// 増分。
+        delta: u32,
+    },
     /// DATA。
     Data {
         /// 対象ストリーム。
@@ -659,9 +664,15 @@ pub fn decode_frame(
                 return Err(short());
             }
             let id = read_u32(payload, 0).ok_or_else(short)?;
-            Frame::WindowUpdate {
-                stream_id: stream_id_of(id)?,
-                delta: read_u32(payload, 4).ok_or_else(short)? & 0x7fff_ffff,
+            let delta = read_u32(payload, 4).ok_or_else(short)? & 0x7fff_ffff;
+            if id & 0x7fff_ffff == 0 {
+                // SPDY/3.1 の接続ウィンドウ。他のフレームの stream id 0 は従来どおり拒否する。
+                Frame::ConnectionWindowUpdate { delta }
+            } else {
+                Frame::WindowUpdate {
+                    stream_id: stream_id_of(id)?,
+                    delta,
+                }
             }
         }
         _ => return Err(ProtocolError::new("unknown control frame type")),
@@ -835,6 +846,12 @@ impl FrameEncoder {
                 push_u32(&mut p, *delta & 0x7fff_ffff);
                 Self::control(out, TYPE_WINDOW_UPDATE, 0, &p)
             }
+            Frame::ConnectionWindowUpdate { delta } => {
+                let mut p = Vec::new();
+                push_u32(&mut p, 0);
+                push_u32(&mut p, *delta & 0x7fff_ffff);
+                Self::control(out, TYPE_WINDOW_UPDATE, 0, &p)
+            }
             Frame::Data {
                 stream_id,
                 fin,
@@ -968,6 +985,14 @@ mod tests {
                 stream_id: sid(2),
                 delta: 256
             }
+        );
+        let cwu = [
+            0x80, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 2, 0,
+        ];
+        let (frame, used) = decode_frame(&cwu, &mut dec).expect("ok").expect("some");
+        assert_eq!(
+            (frame, used),
+            (Frame::ConnectionWindowUpdate { delta: 512 }, 16)
         );
         let data = [0, 0, 0, 1, 0x01, 0, 0, 3, b'a', b'b', b'c', 0xff];
         let (frame, used) = decode_frame(&data, &mut dec).expect("ok").expect("some");

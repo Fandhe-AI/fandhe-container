@@ -688,9 +688,13 @@ mod unix_impl {
         }
         let (tx, rx) = mpsc::channel();
         let p = path.to_path_buf();
-        thread::spawn(move || {
-            let _ = tx.send(UnixStream::connect(p).map(drop));
-        });
+        // スレッドを作れない資源不足は panic させず、呼び出し側へエラーで返す。
+        thread::Builder::new()
+            .name("shim-probe".into())
+            .spawn(move || {
+                let _ = tx.send(UnixStream::connect(p).map(drop));
+            })
+            .map_err(|_| internal("cannot spawn socket probe thread"))?;
         match rx.recv_timeout(PROBE_TIMEOUT) {
             Ok(Ok(())) => {
                 // 再利用する socket は 0600 であること（残骸の置き換えは権限を問わない）。
@@ -796,11 +800,19 @@ mod unix_impl {
             return Err(internal("daemon stdout is unavailable"));
         };
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut line = Vec::new();
-            let r = BufReader::new(stdout.take(64)).read_until(b'\n', &mut line);
-            let _ = tx.send(r.map(|_| line));
-        });
+        // 起動済みのデーモンがあるので、スレッドを作れなければ回収してからエラーで返す
+        // （panic で reap と socket の後始末を迂回しない）。
+        let spawned = thread::Builder::new()
+            .name("shim-ready".into())
+            .spawn(move || {
+                let mut line = Vec::new();
+                let r = BufReader::new(stdout.take(64)).read_until(b'\n', &mut line);
+                let _ = tx.send(r.map(|_| line));
+            });
+        if spawned.is_err() {
+            reap(&mut child);
+            return Err(internal("cannot spawn daemon ready reader thread"));
+        }
         match rx.recv_timeout(START_READY_TIMEOUT) {
             Ok(Ok(line)) if line == READY_LINE.as_bytes() => Ok(()),
             Err(_) => {

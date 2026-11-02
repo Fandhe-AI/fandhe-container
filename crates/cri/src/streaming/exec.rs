@@ -905,6 +905,8 @@ struct Relay<T> {
     stdin_buf: Vec<u8>,
     stdin_pos: usize,
     stdin_fin: bool,
+    /// 書いた内容の flush が未完了か（BufWriter 等の背後の溜めへ対処する）。
+    stdin_flush_pending: bool,
     /// 溜めた stdin が進展しない時間の計測（バッファが空なら `None`）。
     stdin_stall: Option<Pin<Box<Sleep>>>,
     stdin_stall_timeout: Duration,
@@ -1069,6 +1071,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                         Poll::Ready(Ok(n)) if n > 0 => {
                             self.stdin_pos = self.stdin_pos.saturating_add(n);
                             self.stats.stream_write_ok = true;
+                            self.stdin_flush_pending = true;
                             progress = true;
                             stdin_progressed = true;
                         }
@@ -1083,13 +1086,43 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     // プロセス側が閉じた。以後の stdin は捨てる（失敗は計装に残す。REPAIR-4）。
                     self.stats.stream_write_failed = true;
                     self.stdin = None;
+                    self.stdin_flush_pending = false;
                     self.stdin_buf.clear();
                     self.stdin_pos = 0;
                     progress = true;
                 } else if self.stdin_pos >= self.stdin_buf.len() {
                     self.stdin_buf.clear();
                     self.stdin_pos = 0;
-                    if self.stdin_fin && Pin::new(&mut *writer).poll_shutdown(cx).is_ready() {
+                    // 書き終えた後も flush の完了まで駆動する。BufWriter 等は poll_write が
+                    // 全量を受理しても内部に溜めるだけで、flush まで相手へ届かない（CRI-6）。
+                    let mut closed = false;
+                    if self.stdin_flush_pending {
+                        match Pin::new(&mut *writer).poll_flush(cx) {
+                            Poll::Ready(Ok(())) => {
+                                self.stdin_flush_pending = false;
+                                stdin_progressed = true;
+                                progress = true;
+                            }
+                            Poll::Ready(Err(_)) => {
+                                self.stats.stream_write_failed = true;
+                                self.stdin_flush_pending = false;
+                                closed = true;
+                            }
+                            Poll::Pending => {}
+                        }
+                    }
+                    if !closed && !self.stdin_flush_pending && self.stdin_fin {
+                        // shutdown の成否を分ける。Err は失敗として記録する（REPAIR-4）。
+                        match Pin::new(&mut *writer).poll_shutdown(cx) {
+                            Poll::Ready(Ok(())) => closed = true,
+                            Poll::Ready(Err(_)) => {
+                                self.stats.stream_write_failed = true;
+                                closed = true;
+                            }
+                            Poll::Pending => {}
+                        }
+                    }
+                    if closed {
                         self.stdin = None;
                         progress = true;
                     }
@@ -1100,7 +1133,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             }
 
             // 溜めた stdin が進展しない間はソケットを読めず切断を検知できないため、期限で打ち切る。
-            if self.stdin_buf.is_empty() {
+            // flush・shutdown の完了待ちにも同じ期限を適用する（REPAIR-5）。
+            let stdin_busy = !self.stdin_buf.is_empty()
+                || (self.stdin.is_some() && (self.stdin_flush_pending || self.stdin_fin));
+            if !stdin_busy {
                 self.stdin_stall = None;
             } else {
                 let deadline = tokio::time::Instant::now() + self.stdin_stall_timeout;
@@ -1477,6 +1513,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         stdin_buf: early.buf,
         stdin_pos: 0,
         stdin_fin: early.fin,
+        stdin_flush_pending: false,
         stdin_stall: None,
         stdin_stall_timeout: config.stdin_stall_timeout,
         stdout: output(stdout, streams.stdout),

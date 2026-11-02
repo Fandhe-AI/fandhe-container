@@ -129,6 +129,78 @@ impl AsyncWrite for BrokenWriter {
     }
 }
 
+/// poll_write は全量を受理して内部に溜め、flush まで相手へ届けない stdin（BufWriter 相当。CRI-6）。
+struct BufferedWriter {
+    pipe: Pipe,
+    held: Vec<u8>,
+}
+
+impl AsyncWrite for BufferedWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.held.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let held = std::mem::take(&mut self.held);
+        if !held.is_empty() {
+            self.pipe.send(&held);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.pipe.close();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// shutdown だけが失敗する stdin（REPAIR-4）。
+struct ShutdownErrWriter;
+
+impl AsyncWrite for ShutdownErrWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+}
+
+/// flush が完了しない stdin（REPAIR-5）。
+struct StuckFlushWriter;
+
+impl AsyncWrite for StuckFlushWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 struct PipeWriter(Pipe);
 
 impl AsyncWrite for PipeWriter {
@@ -266,7 +338,18 @@ impl ExecStreamLauncher for FakeLauncher {
                         cell.set(code);
                     });
                 }
-                "broken-stdin" => {
+                "echo-once" => {
+                    // 最初の 1 塊を stdout へ返して 0 で終わる（BufWriter の flush 試験）。
+                    let (stdin_p, stdout_p, cell) =
+                        (stdin_p.clone(), stdout_p.clone(), cell.clone());
+                    tokio::spawn(async move {
+                        let chunk = stdin_p.recv().await;
+                        stdout_p.send(&chunk);
+                        stdout_p.close();
+                        cell.set(0);
+                    });
+                }
+                "broken-stdin" | "shutdown-err" => {
                     // stdin の書き込みは失敗するが、プロセスは少し後に 0 で終わる。
                     let (stdout_p, cell) = (stdout_p.clone(), cell.clone());
                     tokio::spawn(async move {
@@ -302,6 +385,15 @@ impl ExecStreamLauncher for FakeLauncher {
                 stdin: req.stdin.then(|| {
                     if program == "broken-stdin" {
                         Box::new(BrokenWriter) as Box<dyn AsyncWrite + Send + Unpin>
+                    } else if program == "shutdown-err" {
+                        Box::new(ShutdownErrWriter) as Box<dyn AsyncWrite + Send + Unpin>
+                    } else if program == "stuck-flush" {
+                        Box::new(StuckFlushWriter) as Box<dyn AsyncWrite + Send + Unpin>
+                    } else if program == "echo-once" {
+                        Box::new(BufferedWriter {
+                            pipe: stdin_p,
+                            held: Vec::new(),
+                        }) as Box<dyn AsyncWrite + Send + Unpin>
                     } else {
                         Box::new(PipeWriter(stdin_p)) as Box<dyn AsyncWrite + Send + Unpin>
                     }
@@ -1307,6 +1399,96 @@ async fn cri6_exec_records_stdin_write_failure_even_when_exited() {
     );
     let got = fx.recorded();
     assert!(got.contains(&(CriOpKind::ExecSession, Code::Ok)), "{got:?}");
+    assert!(
+        got.contains(&(CriOpKind::ExecStreamWrite, Code::Unavailable)),
+        "{got:?}"
+    );
+    assert!(
+        !got.contains(&(CriOpKind::ExecStreamWrite, Code::Ok)),
+        "{got:?}"
+    );
+}
+
+/// CRI-6: poll_write が全量を受理しても flush まで届かない stdin（BufWriter 相当）へ、FIN なしの短い入力が届く。
+#[tokio::test]
+async fn cri6_exec_stdin_is_flushed_without_fin() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-once"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"short\n", false);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.text(5), "short\n");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 0 }]
+    );
+}
+
+/// CRI-6・REPAIR-5: flush が完了しない stdin は stdin_stall_timeout で打ち切られる。
+#[tokio::test]
+async fn cri6_exec_stuck_flush_hits_stdin_stall_timeout() {
+    let mut config = fast_config();
+    config.stdin_stall_timeout = Duration::from_millis(300);
+    let fx = Fixture::new(config, 8).await;
+    let path = fx.exec_path(&["stuck-flush"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"x", false);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::IdleTimeout]
+    );
+}
+
+/// REPAIR-4・CRI-6: stdin の shutdown が Err を返したら ExecStreamWrite を失敗として記録する。
+#[tokio::test]
+async fn cri6_exec_records_stdin_shutdown_failure() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["shutdown-err"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"x", true);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 0 }]
+    );
+    let got = fx.recorded();
     assert!(
         got.contains(&(CriOpKind::ExecStreamWrite, Code::Unavailable)),
         "{got:?}"

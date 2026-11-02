@@ -317,20 +317,34 @@ pub fn plan_boot(
     let pref = header.pref_address;
     let pref_usable =
         pref >= HIMEM_START && (!header.relocatable || (align_ok && pref.is_multiple_of(align)));
-    let load_addr = if pref_usable {
-        pref
+    let range_end = |load_addr: u64| -> Result<u64, MicrovmError> {
+        load_addr
+            .checked_add(payload_len)
+            .zip(load_addr.checked_add(u64::from(header.init_size)))
+            .map(|(a, b)| a.max(b))
+            .ok_or_else(|| invalid("kernel load range overflows"))
+    };
+    let relocated = || -> Result<u64, MicrovmError> {
+        align_up(HIMEM_START, align).ok_or_else(|| invalid("kernel load address overflows"))
+    };
+    // relocatable で pref_address 配置が RAM に収まらないときは再配置先（1 MiB を alignment で切り上げた位置）へ
+    // フォールバックする。非 relocatable は pref_address 固定のため収まらなければ下で拒否する。
+    let (load_addr, kernel_end) = if pref_usable {
+        let end = range_end(pref)?;
+        if header.relocatable && align_ok && end > mem_len {
+            let alt = relocated()?;
+            (alt, range_end(alt)?)
+        } else {
+            (pref, end)
+        }
     } else if header.relocatable && align_ok {
-        align_up(HIMEM_START, align).ok_or_else(|| invalid("kernel load address overflows"))?
+        let alt = relocated()?;
+        (alt, range_end(alt)?)
     } else {
         return Err(invalid(
             "kernel cannot be placed (alignment or preferred address)",
         ));
     };
-    let end_of = |len: u64| load_addr.checked_add(len);
-    let kernel_end = end_of(payload_len)
-        .zip(end_of(u64::from(header.init_size)))
-        .map(|(a, b)| a.max(b))
-        .ok_or_else(|| invalid("kernel load range overflows"))?;
     if kernel_end > mem_len {
         return Err(err(
             MicrovmErrorCode::ResourceExhausted,
@@ -777,6 +791,29 @@ mod tests {
         );
     }
 
+    /// MVM-1・TASK-75.3.1: relocatable は pref_address 配置が RAM に収まらなければ再配置先（2 MiB）へ、非 relocatable は拒否する。
+    #[test]
+    fn mvm1_884_relocatable_falls_back_when_pref_does_not_fit() {
+        let img = Img {
+            pref: 0x100_0000,
+            ..Img::default()
+        }
+        .build();
+        let mut m = mem(8 * MIB);
+        let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
+        let img = Img {
+            relocatable: 0,
+            pref: 0x100_0000,
+            ..Img::default()
+        }
+        .build();
+        assert_eq!(
+            load_linux(&mut m, &img, None, &cmd("")).unwrap_err().code(),
+            MicrovmErrorCode::ResourceExhausted
+        );
+    }
+
     /// MVM-1・TASK-75.3.1: 不正・非対応のイメージは書き込みの前に具体的な code と message で拒否される。
     #[test]
     fn mvm1_884_rejects_invalid_images() {
@@ -884,8 +921,14 @@ mod tests {
     #[test]
     fn mvm1_884_rejects_memory_misfit() {
         let img = Img::default().build();
+        // 非 relocatable は pref_address 固定のため、収まらなければ拒否される（relocatable は再配置先へ落ちる）。
+        let fixed = Img {
+            relocatable: 0,
+            ..Img::default()
+        }
+        .build();
         expect_err(
-            load_linux(&mut mem(16 * MIB), &img, None, &cmd("")),
+            load_linux(&mut mem(16 * MIB), &fixed, None, &cmd("")),
             MicrovmErrorCode::ResourceExhausted,
             "kernel does not fit in guest memory",
         );

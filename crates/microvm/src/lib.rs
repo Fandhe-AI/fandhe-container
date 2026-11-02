@@ -10,7 +10,8 @@
 //! TASK-74.2.1・MVM-1: virtio-mmio の共通トランスポート（`virtio_mmio`。OS 非依存・unsafe なし）。
 //! TASK-74.2.2・MVM-1: ゲストメモリのアクセス型（`guest_memory`。単一領域・heap backing）・split virtqueue（`virtqueue`）・
 //! virtio-block（`virtio_block`。read/write/flush。いずれも OS 非依存・unsafe なし）。
-//! 未実装: virtio-net の virtqueue 処理（TASK-74.3.1）・割り込み配送（TASK-74.2.3・74.3.2）・ゲストメモリの mmap backing と KVM 登録（TASK-75.1。docs/design/microvm-memory-ownership.md）・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! TASK-74.3.1・MVM-1: virtio-net の receiveq / transmitq の処理とパケット送受信（`virtio_net`。OS 非依存・unsafe なし）。
+//! 未実装: 割り込み配送（TASK-74.2.3・74.3.2）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・ゲストメモリの mmap backing と KVM 登録（TASK-75.1。docs/design/microvm-memory-ownership.md）・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）
@@ -32,4 +33,5 @@ pub mod guest_memory;
 mod sys;
 pub mod virtio_block;
 pub mod virtio_mmio;
+pub mod virtio_net;
 pub mod virtqueue;

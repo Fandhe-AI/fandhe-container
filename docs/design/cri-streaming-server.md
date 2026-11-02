@@ -119,8 +119,10 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 | 同時ストリーム数 | 128 | `max_streams` |
 | 受ける DATA の 1 フレームの最大長 | 256 KiB（共通 codec の `MAX_INCOMING_PAYLOAD`。1024..=この値） | `max_frame_bytes` |
 | 1 対の書き込み滞留・送信キューの上限 | 256 KiB（超えると読み取りを止める） | `max_pending_bytes` |
+| 転送先への書き込みが進まないまま滞留してよい時間（対ごと） | 30 秒 | `write_stall_timeout` |
 | blocking の dial の同時件数（ハンドラ全体） | 32（1..=256。取れなければ接続失敗） | `max_inflight_dials` |
 
+- 転送先が TCP を読まない対は、滞留が上限に達すると SPDY 接続全体の読み取りが止まり、別の対の DATA・RST_STREAM も処理できなくなる。`write_stall_timeout` の間書き込みが 1 バイトも進まなければ、その対を RST_STREAM(CANCEL) で閉じて滞留分を捨て、受信を再開する（書き込みが進む遅い転送先は打ち切らない。REPAIR-5）。試験は `cri6_stalled_target_does_not_block_other_pairs_or_rst_stream`
 - blocking の dial の枠は `PortForwardHandler` が持ち、全セッションで共有する。枠は `spawn_blocking` の処理が終わるまで返らないため、future の破棄・期限切れ・セッションの張り直しで上限を超えて積めない。残余: 起動済み・待機中の blocking 処理そのものは取り消せない（dialer の `timeout` に委ねる）
 
 - ヘッダブロックの上限と SPDY/3 の zlib 辞書（出典と帰属表示）は共通 codec（`spdy`・`spdy_dictionary`）の記述に従う。超えたら GOAWAY(PROTOCOL_ERROR) で切断する

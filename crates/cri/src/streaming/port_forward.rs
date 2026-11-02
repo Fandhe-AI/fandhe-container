@@ -92,6 +92,12 @@ pub struct PortForwardConfig {
     /// 転送先への書き込み滞留量（全対の合計）と送信キューの上限。超えている間は SPDY 接続の読み取りを止める
     /// （バックプレッシャー。1 フレームが上限を超えても、`max_frame_bytes` 以内なら受け取って TCP へ排出する）。既定 256 KiB。
     pub max_pending_bytes: usize,
+    /// 転送先への書き込みが 1 バイトも進まないまま滞留が続いてよい時間（REPAIR-5）。既定 30 秒。
+    ///
+    /// 転送先が TCP を読まないと、滞留が上限に達して SPDY 接続全体の読み取りが止まり、同じ接続の別の対の
+    /// DATA・新規 SYN_STREAM・RST_STREAM も処理できなくなる。この期間を超えた対は RST_STREAM(CANCEL) で閉じて
+    /// 滞留分を捨て、受信を再開する。書き込みが進んでいる間（遅いが読んでいる転送先）は打ち切らない。
+    pub write_stall_timeout: Duration,
     /// ハンドラ全体（全セッション合計）で同時に持てる blocking の dial の件数（実行中と待機中の合計）。既定 32。
     ///
     /// future を捨てても blocking 処理は止まらないため、セッションを張り直しても枠は返らない（REPAIR-5）。
@@ -107,6 +113,7 @@ impl Default for PortForwardConfig {
             max_streams: 128,
             max_frame_bytes: MAX_INCOMING_PAYLOAD,
             max_pending_bytes: 256 * 1024,
+            write_stall_timeout: Duration::from_secs(30),
             max_inflight_dials: 32,
         }
     }
@@ -115,7 +122,10 @@ impl Default for PortForwardConfig {
 impl PortForwardConfig {
     /// 設定を検証する（fail-closed）。
     pub fn validate(&self) -> Result<(), CriError> {
-        if self.dial_timeout.is_zero() || self.pair_timeout.is_zero() || self.idle_timeout.is_zero()
+        if self.dial_timeout.is_zero()
+            || self.pair_timeout.is_zero()
+            || self.idle_timeout.is_zero()
+            || self.write_stall_timeout.is_zero()
         {
             return Err(CriError::invalid_argument(
                 "port forward timeouts must be positive",
@@ -377,6 +387,8 @@ struct Pair {
     to_tcp: Vec<u8>,
     to_tcp_pos: usize,
     peer_fin: bool,
+    /// 転送先への書き込みが最後に進んだ時刻（滞留が 0 から増えた時刻でも更新する）。滞留の打ち切りに使う。
+    last_write: Instant,
     phase: Phase,
 }
 
@@ -477,8 +489,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
         config: PortForwardConfig,
         dial_inflight: Arc<AtomicUsize>,
     ) -> Option<Self> {
-        let tick_every = (config.pair_timeout.min(config.idle_timeout) / 4)
-            .clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let tick_every = (config
+            .pair_timeout
+            .min(config.idle_timeout)
+            .min(config.write_stall_timeout)
+            / 4)
+        .clamp(Duration::from_millis(10), Duration::from_secs(1));
         Some(Self {
             io,
             decoder: FrameDecoder::new(),
@@ -539,6 +555,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     /// クライアントが読まない間に PING・SYN_STREAM 等への応答で送信キューが膨らまないよう、
     /// 送信キューが上限を超えている間は読み取りも止める（REPAIR-5。止まったままなら idle で終わる）。
     /// 転送先へ未書き込みの滞留が全対の合計で上限に達している間も読み取りを止める（バックプレッシャー）。
+    /// 止まったままにならないよう、書き込みが [`PortForwardConfig::write_stall_timeout`] の間進まない対は
+    /// `housekeeping` が閉じて滞留を捨てる（転送先が読まない対が接続全体を塞がない）。
     /// 受け取った DATA は分割して TCP へ排出し、フレーム単位では拒否しない。滞留の上限は
     /// 「上限 + 復号器の容量」で有界になり、排出が進まないまま続けば idle で終わる。
     fn can_read(&self) -> bool {
@@ -608,6 +626,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             .map(|(k, _)| k.clone())
             .collect();
         for key in expired {
+            self.abort_pair(&key, None);
+        }
+        // 転送先が読まない対の滞留を打ち切る。放置すると `can_read` が false のまま続き、同じ接続の別の対の
+        // DATA・RST_STREAM も処理できなくなる（CRI-6・REPAIR-5・TASK-63.4）。
+        let stalled: Vec<String> = self
+            .pairs
+            .iter()
+            .filter(|(_, p)| {
+                matches!(p.phase, Phase::Connected(_))
+                    && p.pending() > 0
+                    && now.duration_since(p.last_write) >= self.config.write_stall_timeout
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stalled {
             self.abort_pair(&key, None);
         }
     }
@@ -693,6 +726,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                         self.abort_pair(&key, Some(stream));
                         return;
                     }
+                    if pair.pending() == 0 {
+                        pair.last_write = Instant::now();
+                    }
                     pair.to_tcp.extend_from_slice(&data);
                     if fin {
                         pair.peer_fin = true;
@@ -765,6 +801,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 to_tcp: Vec::new(),
                 to_tcp_pos: 0,
                 peer_fin: false,
+                last_write: Instant::now(),
                 phase: Phase::Waiting,
             });
         let slot = match kind {
@@ -905,6 +942,7 @@ fn step_pair(
         to_tcp,
         to_tcp_pos,
         peer_fin,
+        last_write,
         phase,
         ..
     } = pair;
@@ -913,6 +951,7 @@ fn step_pair(
         match fut.as_mut().poll(cx) {
             Poll::Pending => return PairStep::Continue { progress: false },
             Poll::Ready(Ok(tcp)) => {
+                *last_write = Instant::now();
                 *phase = Phase::Connected(Connected {
                     tcp,
                     write_shut: false,
@@ -945,6 +984,7 @@ fn step_pair(
             Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return PairStep::Aborted,
             Poll::Ready(Ok(n)) => {
                 *to_tcp_pos += n;
+                *last_write = Instant::now();
                 progress = true;
                 *last_activity = Instant::now();
             }

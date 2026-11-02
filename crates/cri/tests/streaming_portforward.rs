@@ -86,6 +86,15 @@ async fn fixture(
     if let Some(echo) = echo {
         map.insert(8080u16, echo);
     }
+    fixture_with_map(pf, streaming, ports, map).await
+}
+
+async fn fixture_with_map(
+    pf: PortForwardConfig,
+    streaming: StreamingConfig,
+    ports: Vec<i32>,
+    map: HashMap<u16, SocketAddr>,
+) -> Fixture {
     let handler = PortForwardHandler::new(Arc::new(MapDialer(map)), pf).expect("handler");
     let dispatcher = StreamDispatcher::new().with_port_forward(Arc::new(handler));
     let server = StreamingServer::bind_with_handler(streaming, Arc::new(dispatcher))
@@ -697,6 +706,128 @@ async fn cri6_port_forward_session_holds_connection_permit() {
         c.send(&Frame::Ping { id: 1 });
         assert_eq!(c.recv(), Some(Frame::Ping { id: 1 }));
         drop(c);
+    })
+    .await;
+    drop(fx);
+}
+
+/// 受け付けるだけで一切読まない転送先（接続は保持して閉じない）。
+fn spawn_sink() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind sink");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming().flatten() {
+            held.push(conn);
+        }
+    });
+    addr
+}
+
+/// CRI-6・REPAIR-5・TASK-63.4: 片方の転送先が TCP を読まず滞留が上限に達しても、有限時間でその対が
+/// RST_STREAM(CANCEL) で閉じられて受信が再開し、同じ接続の別の対の DATA とクライアントの RST_STREAM が処理される。
+#[tokio::test]
+async fn cri6_stalled_target_does_not_block_other_pairs_or_rst_stream() {
+    let echo = spawn_echo();
+    let sink = spawn_sink();
+    let fx = fixture_with_map(
+        PortForwardConfig {
+            write_stall_timeout: Duration::from_millis(500),
+            ..Default::default()
+        },
+        StreamingConfig::default(),
+        vec![],
+        HashMap::from([(8080u16, echo), (8081u16, sink)]),
+    )
+    .await;
+    let addr = fx.server.local_addr();
+    let path = fx.path.clone();
+    blocking(move || {
+        let mut c = Client::connect(addr, &path);
+        // 対 B（echo）と対 A（読まない sink）を張る。
+        c.syn(1, "error", "8080", "b");
+        c.expect_reply(1);
+        c.syn(3, "data", "8080", "b");
+        c.expect_reply(3);
+        c.syn(5, "error", "8081", "a");
+        c.expect_reply(5);
+        c.syn(7, "data", "8081", "a");
+        c.expect_reply(7);
+        // 対 A の data へ大量に送る。sink が読まないため、いずれサーバーは滞留の上限で受信を止める。
+        let mut flood = Vec::new();
+        let mut enc = FrameEncoder::new();
+        for _ in 0..2048 {
+            enc.encode(&data(7, false, &[0xAB; 16 * 1024]), &mut flood)
+                .expect("encode flood");
+        }
+        let mut writer = c.tcp.try_clone().expect("clone");
+        writer
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .expect("write timeout");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let flooder = std::thread::spawn(move || {
+            // フレームの境界で止める（途中で止めると後続のフレームが壊れる）。
+            for chunk in flood.chunks(8 + 16 * 1024) {
+                if stop_w.load(std::sync::atomic::Ordering::Acquire)
+                    || writer.write_all(chunk).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // 打ち切りの CANCEL が有限時間（読み取り期限 5 秒）で両ストリームに届く。
+        let started = std::time::Instant::now();
+        let mut cancelled = Vec::new();
+        while cancelled.len() < 2 {
+            match c.recv().expect("frame before eof") {
+                Frame::RstStream { stream_id, status }
+                    if status == rst_status::CANCEL && [5, 7].contains(&stream_id.get()) =>
+                {
+                    cancelled.push(stream_id.get());
+                }
+                _ => {}
+            }
+        }
+        cancelled.sort_unstable();
+        assert_eq!(cancelled, vec![5, 7]);
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "aborted before the stall timeout: {:?}",
+            started.elapsed()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        flooder.join().expect("flooder");
+
+        // 対 B の DATA は echo される（A の打ち切り後の DATA に対する RST_STREAM は読み飛ばす）。
+        let write_b = |c: &mut Client| c.send(&data(3, false, b"still-alive"));
+        write_b(&mut c);
+        let mut echoed = Vec::new();
+        while echoed.len() < b"still-alive".len() {
+            match c.recv().expect("frame before eof") {
+                Frame::Data {
+                    stream_id, data, ..
+                } if stream_id.get() == 3 => echoed.extend(data),
+                _ => {}
+            }
+        }
+        assert_eq!(echoed, b"still-alive");
+
+        // クライアントの RST_STREAM が処理される: 対 B の相手側ストリーム 3 が CANCEL で閉じられる。
+        c.send(&Frame::RstStream {
+            stream_id: sid(1),
+            status: rst_status::CANCEL,
+        });
+        loop {
+            match c.recv().expect("frame before eof") {
+                Frame::RstStream { stream_id, status }
+                    if stream_id.get() == 3 && status == rst_status::CANCEL =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
     })
     .await;
     drop(fx);

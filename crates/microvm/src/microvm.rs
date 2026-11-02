@@ -252,9 +252,11 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn unregistered_ram_roundtrips_through_guest_memory() {
-        let ram = GuestRam::new(8192).unwrap();
+        // 16 / 64 KiB ページのホストでは整列単位の倍数にする（8192 は整列検査で拒否される）。
+        let size = ram_align().unwrap().max(8192);
+        let ram = GuestRam::new(size).unwrap();
         let mut mem = GuestMemory::new(GuestAddress::new(0x10000), ram).unwrap();
-        assert_eq!(mem.len(), 8192);
+        assert_eq!(mem.len(), size);
         mem.write_at(GuestAddress::new(0x10FFE), &[0x78, 0x56, 0x34, 0x12])
             .unwrap();
         assert_eq!(
@@ -263,7 +265,10 @@ mod tests {
         );
         assert_eq!(mem.read_u16_le(GuestAddress::new(0x11000)).unwrap(), 0x1234);
         assert_eq!(mem.read_u32_le(GuestAddress::new(0x10000)).unwrap(), 0);
-        assert!(mem.read_u32_le(GuestAddress::new(0x11FFE)).is_err());
+        assert!(
+            mem.read_u32_le(GuestAddress::new(0x10000 + size - 2))
+                .is_err()
+        );
     }
 
     /// MVM-1・TASK-75.1: size の検証は mmap の前に `InvalidArgument` で弾く。
@@ -274,12 +279,13 @@ mod tests {
             GuestRam::new(4097),
             "guest memory size must be a multiple of the host page size (at least 4096)",
         );
+        let align = ram_align().unwrap();
         assert_invalid(
-            GuestRam::new(MAX_GUEST_RAM_BYTES + 4096),
+            GuestRam::new(MAX_GUEST_RAM_BYTES + align),
             "guest memory size too large",
         );
         assert_invalid(
-            GuestRam::new(u64::MAX - 4095),
+            GuestRam::new(u64::MAX - (align - 1)),
             "guest memory size too large",
         );
         assert_eq!(MAX_GUEST_RAM_BYTES, 17_179_869_184);

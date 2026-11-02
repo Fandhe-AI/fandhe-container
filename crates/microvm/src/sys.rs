@@ -368,7 +368,12 @@ const SC_PAGESIZE: i32 = 30;
 /// （16 KiB / 64 KiB ページの aarch64 Linux では 4096 より大きい。MVM-1・TASK-75.1）。
 /// 取得に失敗した・2 の冪でない値は fail-closed に `SysError::Os(22)`（EINVAL）で返す。
 pub(crate) fn host_page_size() -> Result<u64, SysError> {
-    // SAFETY: `sysconf` は整数 1 つを取り値を返すだけで、ポインタもメモリも触らない。
+    // 非対応環境（32 bit・非 glibc 等）では FFI 宣言（LP64 の `long` = i64）が成り立たないため呼ばずに拒否する。
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `sysconf` は整数 1 つを取り値を返すだけで、ポインタもメモリも触らない。`consts::SUPPORTED` で
+    // LP64 の glibc に限っているため、戻り値の `long` は宣言の i64 と一致する。
     let n = unsafe { sysconf(SC_PAGESIZE) };
     match u64::try_from(n) {
         Ok(v) if v.is_power_of_two() => Ok(v),

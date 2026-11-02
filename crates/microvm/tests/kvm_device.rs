@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -969,6 +969,152 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+/// MVM-1・TASK-75.4.1・#886: `MicroVm::start` / `RunningMicroVm::stop`。(a) 自己ループするゲストを停止要求で止め、
+/// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台は拒否される。
+/// 資源の解放は、観測器 `Arc` の参照数が 1 に戻ること（`VcpuFd`、つまり `MicroVm` 全体が drop 済み）で決定的に確かめる
+/// （`/proc/self/fd` の件数は他の試験の並列スレッドで揺れるため使わない）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_stop_microvm() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Count(AtomicU64);
+    impl RunObserver for Count {
+        fn record(&self, _record: &RunRecord) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let image = |entry_code: &[u8]| {
+        let mut img = vec![0u8; 5 * 512 + 0x1000];
+        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+        put(0x1F1, &[4]);
+        put(0x1FE, &0xAA55u16.to_le_bytes());
+        put(0x201, &[0x62]);
+        put(0x202, b"HdrS");
+        put(0x206, &0x020Fu16.to_le_bytes());
+        put(0x211, &[1]);
+        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+        put(0x230, &0x20_0000u32.to_le_bytes());
+        put(0x234, &[1]);
+        put(0x236, &1u16.to_le_bytes());
+        put(0x238, &2047u32.to_le_bytes());
+        put(0x258, &0x100_0000u64.to_le_bytes());
+        put(0x260, &0x40_0000u32.to_le_bytes());
+        let payload = 5 * 512;
+        for (i, b) in img[payload..].iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
+        }
+        if !entry_code.is_empty() {
+            img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
+        }
+        img
+    };
+    let assemble = |vcpu_count: u32| -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
+        MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap()
+    };
+    let wait = |limit: Duration, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    };
+
+    // (a) jmp $ のゲスト: 実行中に停止要求で止まる。
+    let img = image(&[0xEB, 0xFE]);
+    let mut vm = assemble(1);
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    let obs = Arc::new(Count::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| obs.0.load(Ordering::SeqCst) >= 1)
+    ));
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+    assert!(report.stats.runs >= 1);
+    assert_eq!(report.stats.errors, 0);
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (b) エントリが ud2 のゲスト: ゲスト起因で終わり、stop がその理由を返す。
+    let img = image(&[]);
+    let mut vm = assemble(1);
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    let obs = Arc::new(Count::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| running.is_finished())
+    ));
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (c) vCPU 2 台は未実装として拒否される。
+    let mut vm = assemble(2);
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    assert_eq!(
+        vm.start(&loaded).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_stop_microvm() {
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;

@@ -8,8 +8,8 @@
 //! TASK-74.4.2（#883）で exit のデバイスへの振り分けと IN・MMIO read の応答の書き戻し（[`VcpuFd::handle_exit`]。
 //! 振り分け先は `crate::dispatch`）と、実機で確かめる自己診断 [`KvmDevice::probe_exit_dispatch`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! vCPU の外部からの停止要求（一時停止・
-//! 終了通知。TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
+//! 停止は `microvm::RunningMicroVm::stop` が期限つき `run_once` のポーリングで行う（TASK-75.4.1・#886）。
+//! 他スレッドからの即時の kick・一時停止は未実装で、後続が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
 //! TASK-74.2.3（#879）で割り込み通知を足した: [`VmFd::create_irqchip`]（x86_64。vCPU より前に作る）・

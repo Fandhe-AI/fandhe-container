@@ -6,13 +6,18 @@
 //! [`VIRTIO_MMIO_BASE`] から [`VIRTIO_MMIO_WINDOW`] 刻みで block → net の順、GSI は [`VIRTIO_GSI_BASE`] から連番。
 //! カーネルのロードと `virtio_mmio.device=<size>@<base>:<irq>` の cmdline 生成は [`MicroVm::load_kernel`]
 //! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。vCPU 0 のレジスタ初期化（long mode・エントリへの RIP）は [`MicroVm::setup_boot_vcpu`]（TASK-75.3.2・#885）。
-//! 呼び出し元は #886（TASK-75.4.1。start / stop と実行ループ）と、
-//! `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
+//! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・start / stop（#886）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
+//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・他スレッドからの即時停止（kick。新規 unsafe が要る）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
+//!
+//! # 起動と停止（TASK-75.4.1・#886）
+//! [`MicroVm::start`] が vCPU 0 を初期化して専用スレッドで実行ループを始め、[`RunningMicroVm`] を返す。停止は
+//! [`RunningMicroVm::stop`]（期限つき。`Ok` で戻った時点でスレッド join 済み・fd・mmap・irqfd 解放済み）で、
+//! 呼び忘れても drop が回収する。ゲスト起因の終了（シャットダウン・失敗）も [`StopReason`] で報告し、同じ後始末を通る。
+//! 停止要求は `run_once`（[`VCPU_POLL_INTERVAL`]）の合間のポーリングで見る。起動途中の失敗の網羅的な解放は #887。
 //!
 //! drop の順序は宣言順で固定する: vCPU → デバイス（dispatcher・irqfd の解除）→ メモリ（memslot の削除と munmap）→ VM fd。
 //! [`IrqFd`] と [`RegisteredGuestRam`] は VM fd の dup を持つので、順序に依らず解除が効く。
@@ -40,15 +45,18 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{
     BootCpuState, KernelCmdline, VirtioMmioParam, load_linux, write_boot_tables,
 };
-use crate::device::{KvmDevice, VcpuFd, VmFd};
-use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioDevice};
+use crate::device::{KvmDevice, RunStats, VcpuFd, VmFd};
+use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
@@ -452,6 +460,16 @@ pub enum QueueNotifyReport {
     Net(NetNotifyReport),
 }
 
+impl QueueNotifyReport {
+    /// virtqueue 処理の失敗（リング破損など、ゲスト起因）。無ければ `None`。
+    pub fn queue_error(&self) -> Option<&MicrovmError> {
+        match self {
+            QueueNotifyReport::Block(r) => r.queue_error.as_ref(),
+            QueueNotifyReport::Net(r) => r.queue_error.as_ref(),
+        }
+    }
+}
+
 /// MMIO dispatcher と block / net デバイス群。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
 struct DeviceBus<B: BlockBackend, N: NetBackend, L> {
     dispatcher: ExitDispatcher,
@@ -711,7 +729,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state`。最初の `VcpuFd::run_once` より前に、
     /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つ状態のため触らない。
-    /// 呼び出し元は #886（TASK-75.4.1。start / stop と実行ループ）。失敗時の網羅的な後始末は #887、CPUID・MSR・FPU・LAPIC の設定は
+    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の網羅的な後始末は #887、CPUID・MSR・FPU・LAPIC の設定は
     /// 未実装（REPAIR-3）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
     pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         let started = std::time::Instant::now();
@@ -817,6 +835,650 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     }
 }
 
+// ---- 起動と停止（TASK-75.4.1・#886・MVM-1） ----
+
+/// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求を見る間隔の上限でもある。
+/// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
+pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// [`RunningMicroVm::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。
+pub const STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
+/// [`RunningMicroVm`] が `stop` を経ずに drop されたときに、vCPU スレッドの終了を待つ上限。
+const DROP_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// vCPU ループが終わった理由（真偽値・文字列で返さない。拡張できる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StopReason {
+    /// [`RunningMicroVm::stop`] または drop による停止要求。
+    Requested,
+    /// ゲストのシャットダウン（トリプルフォールト等。`VcpuExit::Shutdown`）。
+    GuestShutdown,
+    /// ユーザー空間へ出た `HLT`（in-kernel irqchip のある現構成では起きない想定。busy loop を避けるため終了として扱う）。
+    GuestHalted,
+    /// 実行・exit の処理・通知の完了が失敗した（fail-closed で VM を止める）。
+    Failed(MicrovmErrorCode),
+}
+
+impl StopReason {
+    /// 構造化ログ用の固定名。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Requested => "requested",
+            StopReason::GuestShutdown => "guest_shutdown",
+            StopReason::GuestHalted => "guest_halted",
+            StopReason::Failed(_) => "failed",
+        }
+    }
+}
+
+/// vCPU ループの終了報告。`MicroVm`（fd・mmap・irqfd）を解放し終えた後に送られる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StopReport {
+    /// 終了理由。
+    pub reason: StopReason,
+    /// vCPU 0 の累積の実行統計。
+    pub stats: RunStats,
+    /// `start` からループ終了までの時間。
+    pub elapsed: Duration,
+}
+
+/// 1 回の `run_once` の結果の分類（純粋関数 [`classify_run`] の戻り値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunClass {
+    /// 続けて次の `run_once` へ。
+    Continue,
+    /// `Io` / `Mmio`。dispatcher へ渡す。
+    Dispatch,
+    /// ループを終える。
+    Finish(StopReason),
+}
+
+/// `run_once` の結果をループの次の動作に分類する。期限切れ・中断は正常系。ゲスト由来の異常は fail-closed で終える。
+fn classify_run(r: &Result<VcpuExit, MicrovmError>) -> RunClass {
+    match r {
+        Ok(VcpuExit::Interrupted) => RunClass::Continue,
+        Ok(VcpuExit::Io { .. } | VcpuExit::Mmio { .. }) => RunClass::Dispatch,
+        Ok(VcpuExit::Shutdown) => RunClass::Finish(StopReason::GuestShutdown),
+        Ok(VcpuExit::Hlt) => RunClass::Finish(StopReason::GuestHalted),
+        Ok(VcpuExit::FailEntry { .. } | VcpuExit::InternalError { .. }) => {
+            RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Internal))
+        }
+        Ok(VcpuExit::Other { .. }) => {
+            RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Unimplemented))
+        }
+        Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => RunClass::Continue,
+        Err(e) => RunClass::Finish(StopReason::Failed(e.code())),
+    }
+}
+
+/// dispatcher の結果が virtqueue の通知なら `(デバイス, キュー)` を返す（呼び出し元が `complete_queue_notify` へつなぐ）。
+fn queue_notify_of(outcome: &DispatchOutcome) -> Option<(DeviceId, u16)> {
+    match outcome {
+        DispatchOutcome::Mmio {
+            device,
+            access: MmioAccess::Write(MmioWriteOutcome::QueueNotify(q)),
+        } => Some((*device, *q)),
+        _ => None,
+    }
+}
+
+/// vCPU ループの 1 歩の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopStep {
+    Continue,
+    Finish(StopReason),
+}
+
+/// vCPU スレッドが駆動する対象。実体は [`MicroVm`]。KVM なしでループの契約（停止・後始末の順序）を試験するための継ぎ目。
+trait VcpuLoopBody: Send + 'static {
+    /// 最大 `slice` だけ実行し、exit を処理して次の動作を返す。
+    fn step(&mut self, slice: Duration) -> LoopStep;
+    /// vCPU 0 の累積統計。
+    fn stats(&self) -> RunStats;
+}
+
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> VcpuLoopBody
+    for MicroVm<B, N>
+{
+    fn step(&mut self, slice: Duration) -> LoopStep {
+        let Some(vcpu) = self.vcpus.first_mut() else {
+            return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::FailedPrecondition));
+        };
+        let result = vcpu.run_once(slice);
+        match classify_run(&result) {
+            RunClass::Continue => LoopStep::Continue,
+            RunClass::Finish(reason) => LoopStep::Finish(reason),
+            RunClass::Dispatch => {
+                let Ok(exit) = result else {
+                    return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::Internal));
+                };
+                let outcome = match self.handle_exit(0, &exit) {
+                    Ok(o) => o,
+                    Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
+                };
+                // 通知の完了に失敗したまま続けると、通知の届かないゲストがハングするため止める（fail-closed）。
+                // リング破損などは外側の `Err` ではなく report.queue_error に入り last_avail も進まないため、
+                // 続行するとゲストが完了しない要求を待ち続ける。呼び出し元（ここ）が停止を判断する。
+                if let Some((id, queue)) = queue_notify_of(&outcome) {
+                    match self.complete_queue_notify(id, queue) {
+                        Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
+                        Ok(report) => {
+                            if let Some(e) = report.queue_error() {
+                                return LoopStep::Finish(StopReason::Failed(e.code()));
+                            }
+                        }
+                    }
+                }
+                LoopStep::Continue
+            }
+        }
+    }
+
+    fn stats(&self) -> RunStats {
+        self.vcpus.first().map(VcpuFd::stats).unwrap_or_default()
+    }
+}
+
+/// 構造化ログを 1 行 stderr へ出す（書き込みの失敗は捨てる。REPAIR-4）。
+fn log_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    drop(writeln!(std::io::stderr(), "{args}"));
+}
+
+/// vCPU スレッドの本体。停止要求・ゲスト起因の終了のどちらでも、`body`（`MicroVm`）を drop して fd・mmap・irqfd を
+/// 解放してから報告を送る。この順序が「`stop` が `Ok` で戻った時点で解放済み」という契約の根拠。
+fn vcpu_loop<T: VcpuLoopBody>(
+    mut body: T,
+    stop: Arc<AtomicBool>,
+    done: mpsc::Sender<StopReport>,
+    started: Instant,
+) {
+    let reason = loop {
+        if stop.load(Ordering::SeqCst) {
+            break StopReason::Requested;
+        }
+        match body.step(VCPU_POLL_INTERVAL) {
+            LoopStep::Continue => {}
+            LoopStep::Finish(r) => break r,
+        }
+    };
+    let mut stats = body.stats();
+    // dispatch・通知完了・割り込み配送の失敗は vCPU の統計に載らないため、失敗終了なら最低 1 件を計上する。
+    if matches!(reason, StopReason::Failed(_)) && stats.errors == 0 {
+        stats.errors = 1;
+    }
+    // 後始末（vCPU → デバイス → メモリ → VM fd の順）を、報告より先に済ませる。
+    drop(body);
+    let elapsed = started.elapsed();
+    let (level, outcome, code) = match reason {
+        StopReason::Failed(c) => ("error", "error", format!(" code={}", c.as_str())),
+        _ => ("info", "ok", String::new()),
+    };
+    log_line(format_args!(
+        "level={level} op=microvm.vcpu_loop outcome={outcome} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
+        reason.as_str(),
+        stats.runs,
+        stats.exits,
+        stats.deadline_exceeded,
+        stats.errors,
+        elapsed.as_micros()
+    ));
+    // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
+    let _ = done.send(StopReport {
+        reason,
+        stats,
+        elapsed,
+    });
+}
+
+/// `body` を専用スレッドで駆動して [`RunningMicroVm`] を返す。
+fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicroVm, MicrovmError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let flag = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("microvm-vcpu-0".into())
+        .spawn(move || vcpu_loop(body, flag, tx, started))
+        .map_err(|_| {
+            MicrovmError::new(
+                MicrovmErrorCode::ResourceExhausted,
+                "cannot spawn vCPU thread",
+            )
+        })?;
+    Ok(RunningMicroVm {
+        stop,
+        done_rx: rx,
+        handle: Some(handle),
+    })
+}
+
+/// 起動中の microVM（vCPU 0 のスレッドを持つ）。[`MicroVm::start`] が返す。
+///
+/// 停止は [`RunningMicroVm::stop`]。呼び忘れても drop が期限つきで停止を要求して回収する（fd のリークを防ぐ）。
+/// 停止要求は vCPU スレッドが `run_once` の合間にポーリングするため、停止の遅延の上限は
+/// 「[`VCPU_POLL_INTERVAL`] + exit 処理 1 回分」。
+///
+/// 範囲外（REPAIR-3）: 他スレッドからの `immediate_exit` と kick による即時停止（`sys` の拡張、つまり新規 unsafe が要る）。
+#[derive(Debug)]
+pub struct RunningMicroVm {
+    stop: Arc<AtomicBool>,
+    done_rx: mpsc::Receiver<StopReport>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RunningMicroVm {
+    /// 停止を要求し、`deadline` 以内に vCPU スレッドが終わって資源（VM fd・vCPU fd・memslot・mmap・irqfd）が解放されるのを待つ。
+    ///
+    /// `Ok` で戻った時点で、スレッドは join 済みで `MicroVm` は drop 済み。ゲスト起因で既に終わっていた場合は
+    /// その理由（[`StopReason::GuestShutdown`] 等）を返す。`deadline` が 0 または [`STOP_DEADLINE_MAX`] 超なら `InvalidArgument`
+    /// （この場合も drop が回収する）。期限切れは `DeadlineExceeded`（停止フラグは立ったままで、スレッドは後で自力で終わる）。
+    pub fn stop(mut self, deadline: Duration) -> Result<StopReport, MicrovmError> {
+        let started = Instant::now();
+        let result = self.stop_inner(deadline);
+        let elapsed_us = started.elapsed().as_micros();
+        match &result {
+            Ok(r) => log_line(format_args!(
+                "level=info op=microvm.stop outcome=ok reason={} elapsed_us={elapsed_us}",
+                r.reason.as_str()
+            )),
+            Err(e) => log_line(format_args!(
+                "level=error op=microvm.stop outcome=error code={} elapsed_us={elapsed_us}",
+                e.code().as_str()
+            )),
+        }
+        result
+    }
+
+    fn stop_inner(&mut self, deadline: Duration) -> Result<StopReport, MicrovmError> {
+        if deadline.is_zero() || deadline > STOP_DEADLINE_MAX {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "stop deadline out of range",
+            ));
+        }
+        let limit = Instant::now() + deadline;
+        self.stop.store(true, Ordering::SeqCst);
+        match self.done_rx.recv_timeout(deadline) {
+            Ok(report) => {
+                // 報告後もスレッドローカルの destructor が未完了でありうるため、join にも同じ期限を適用する。
+                match self.handle.take().map(|h| join_by(h, limit)) {
+                    None | Some(JoinOutcome::Joined(Ok(()))) => Ok(report),
+                    Some(JoinOutcome::Joined(Err(_))) => Err(MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "vCPU thread terminated abnormally",
+                    )),
+                    Some(JoinOutcome::TimedOut) => Err(MicrovmError::new(
+                        MicrovmErrorCode::DeadlineExceeded,
+                        "vCPU thread did not finish within deadline",
+                    )),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 期限の無い join はしない（REPAIR-5）。detach し、スレッドは停止フラグで自力で終わる。
+                self.handle.take();
+                Err(MicrovmError::new(
+                    MicrovmErrorCode::DeadlineExceeded,
+                    "vCPU thread did not stop within deadline",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // 報告を送る前にチャネルが切れた（panic の unwind）。切断はスレッド終了を保証しない
+                // （引数の drop 順で done が先に落ち、残りの Drop が続く）ため、join には期限を適用する。
+                let timed_out = self
+                    .handle
+                    .take()
+                    .is_some_and(|h| matches!(join_by(h, limit), JoinOutcome::TimedOut));
+                if timed_out {
+                    return Err(MicrovmError::new(
+                        MicrovmErrorCode::DeadlineExceeded,
+                        "vCPU thread did not finish within deadline",
+                    ));
+                }
+                Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "vCPU thread terminated abnormally",
+                ))
+            }
+        }
+    }
+
+    /// vCPU ループが既に終わったか（ゲスト起因の終了の観測用）。終わっていても資源の確定は [`RunningMicroVm::stop`] で報告を受ける。
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
+impl Drop for RunningMicroVm {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::SeqCst);
+        let limit = Instant::now() + DROP_STOP_WAIT;
+        let expired = match self.done_rx.recv_timeout(DROP_STOP_WAIT) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                matches!(join_by(handle, limit), JoinOutcome::TimedOut)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+        };
+        if expired {
+            log_line(format_args!(
+                "level=error op=microvm.drop_running outcome=error code={}",
+                MicrovmErrorCode::DeadlineExceeded.as_str()
+            ));
+        }
+    }
+}
+
+/// 期限つき join の結果（REPAIR-5）。
+enum JoinOutcome {
+    Joined(thread::Result<()>),
+    TimedOut,
+}
+
+/// `limit` まで `is_finished` を短い間隔で確認し、終わっていれば join する。期限切れなら join せず detach する
+/// （無期限の join をしない。REPAIR-5）。
+fn join_by(handle: JoinHandle<()>, limit: Instant) -> JoinOutcome {
+    loop {
+        if handle.is_finished() {
+            return JoinOutcome::Joined(handle.join());
+        }
+        let now = Instant::now();
+        if now >= limit {
+            return JoinOutcome::TimedOut;
+        }
+        thread::sleep((limit - now).min(Duration::from_millis(1)));
+    }
+}
+
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B, N> {
+    /// カーネルのエントリへ vCPU 0 を初期化し（[`MicroVm::setup_boot_vcpu`]）、専用スレッドで実行ループを始める（TASK-75.4.1・MVM-1）。
+    ///
+    /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU が 2 台以上の構成は
+    /// AP の INIT/SIPI が未実装のため `Unimplemented`（fail-closed）。virtio-net を含む構成も、ゲストの kick なしで受信を処理する経路が
+    /// 未実装のため `Unimplemented`（将来仕様: 期限ごとの `process_rx` または backend 到着通知。MVM-1・TASK-117）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
+    pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
+        let started = Instant::now();
+        let result = self.start_inner(loaded, started);
+        let elapsed_us = started.elapsed().as_micros();
+        match &result {
+            Ok(_) => log_line(format_args!(
+                "level=info op=microvm.start outcome=ok elapsed_us={elapsed_us}"
+            )),
+            Err(e) => log_line(format_args!(
+                "level=error op=microvm.start outcome=error code={} elapsed_us={elapsed_us}",
+                e.code().as_str()
+            )),
+        }
+        result
+    }
+
+    fn start_inner(
+        mut self,
+        loaded: &LoadedKernel,
+        started: Instant,
+    ) -> Result<RunningMicroVm, MicrovmError> {
+        if self.vcpus.len() != 1 {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "starting more than one vCPU is not implemented",
+            ));
+        }
+        // virtio-net の受信はゲストの kick が無くても backend のフレームを取り出す経路（期限ごとのポーリングか
+        // 到着通知）が要るが未実装のため、受信が止まる構成を黙って許さず拒否する（fail-closed。REPAIR-3・MVM-1。TASK-117）。
+        if !self.devices.net.is_empty() {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "starting with a virtio-net device is not implemented (rx polling is missing)",
+            ));
+        }
+        self.setup_boot_vcpu(loaded)?;
+        spawn_loop(self, started)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// 偽の body。step ごとに短く眠り、`finish_after` 回目で `Finish(GuestShutdown)` を返す。drop で `dropped` を立てる。
+    struct FakeBody {
+        dropped: Arc<AtomicBool>,
+        steps: u32,
+        finish_after: Option<u32>,
+        gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+        entered: Arc<AtomicBool>,
+    }
+
+    impl FakeBody {
+        fn new(dropped: &Arc<AtomicBool>) -> Self {
+            FakeBody {
+                dropped: Arc::clone(dropped),
+                steps: 0,
+                finish_after: None,
+                gate: None,
+                entered: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Drop for FakeBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl VcpuLoopBody for FakeBody {
+        fn step(&mut self, _slice: Duration) -> LoopStep {
+            self.entered.store(true, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let (m, cv) = &**gate;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            self.steps += 1;
+            match self.finish_after {
+                Some(n) if self.steps >= n => LoopStep::Finish(StopReason::GuestShutdown),
+                _ => LoopStep::Continue,
+            }
+        }
+
+        fn stats(&self) -> RunStats {
+            RunStats {
+                runs: u64::from(self.steps),
+                ..RunStats::default()
+            }
+        }
+    }
+
+    /// MVM-1・REPAIR-5: join は期限を超えて待たない。終わらないスレッドは `TimedOut`、終わるスレッドは `Joined`。
+    #[test]
+    fn mvm1_join_by_respects_deadline() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let t = Instant::now();
+        let out = join_by(h, Instant::now() + Duration::from_millis(50));
+        assert!(matches!(out, JoinOutcome::TimedOut));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        drop(tx);
+        let h2 = std::thread::spawn(|| {});
+        let out = join_by(h2, Instant::now() + Duration::from_secs(5));
+        assert!(matches!(out, JoinOutcome::Joined(Ok(()))));
+    }
+
+    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// MVM-1・REPAIR-3: `run_once` の結果の分類。
+    #[test]
+    fn mvm1_886_classify_run_table() {
+        let io = VcpuExit::Io {
+            direction: crate::exit::IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: vec![0],
+        };
+        let mmio = VcpuExit::Mmio {
+            phys_addr: 0,
+            data: [0; 8],
+            len: 1,
+            is_write: true,
+        };
+        let err = |c| Err(MicrovmError::new(c, "x"));
+        assert_eq!(classify_run(&Ok(VcpuExit::Interrupted)), RunClass::Continue);
+        assert_eq!(
+            classify_run(&err(MicrovmErrorCode::DeadlineExceeded)),
+            RunClass::Continue
+        );
+        assert_eq!(classify_run(&Ok(io)), RunClass::Dispatch);
+        assert_eq!(classify_run(&Ok(mmio)), RunClass::Dispatch);
+        assert_eq!(
+            classify_run(&Ok(VcpuExit::Shutdown)),
+            RunClass::Finish(StopReason::GuestShutdown)
+        );
+        assert_eq!(
+            classify_run(&Ok(VcpuExit::Hlt)),
+            RunClass::Finish(StopReason::GuestHalted)
+        );
+        let internal = RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Internal));
+        assert_eq!(
+            classify_run(&Ok(VcpuExit::FailEntry {
+                hardware_entry_failure_reason: 1,
+                cpu: 0
+            })),
+            internal
+        );
+        assert_eq!(
+            classify_run(&Ok(VcpuExit::InternalError { suberror: 1 })),
+            internal
+        );
+        assert_eq!(
+            classify_run(&Ok(VcpuExit::Other { exit_reason: 999 })),
+            RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Unimplemented))
+        );
+        assert_eq!(
+            classify_run(&err(MicrovmErrorCode::PermissionDenied)),
+            RunClass::Finish(StopReason::Failed(MicrovmErrorCode::PermissionDenied))
+        );
+    }
+
+    /// MVM-1: QueueNotify の MMIO 書き込みだけが通知として取り出される。
+    #[test]
+    fn mvm1_886_queue_notify_of() {
+        struct Nop;
+        impl MmioDevice for Nop {
+            fn read(&self, _offset: u64, _data: &mut [u8]) -> crate::virtio_mmio::MmioReadOutcome {
+                crate::virtio_mmio::MmioReadOutcome::Handled
+            }
+            fn write(&mut self, _offset: u64, _data: &[u8]) -> MmioWriteOutcome {
+                MmioWriteOutcome::Handled
+            }
+        }
+        let id = ExitDispatcher::new()
+            .register_mmio(0x1000, 0x100, Box::new(Nop))
+            .unwrap();
+        let notify = DispatchOutcome::Mmio {
+            device: id,
+            access: MmioAccess::Write(MmioWriteOutcome::QueueNotify(1)),
+        };
+        assert_eq!(queue_notify_of(&notify), Some((id, 1)));
+        let other_write = DispatchOutcome::Mmio {
+            device: id,
+            access: MmioAccess::Write(MmioWriteOutcome::Handled),
+        };
+        assert_eq!(queue_notify_of(&other_write), None);
+    }
+
+    /// MVM-1・TASK-75.4.1: 停止要求で body が drop されてから報告が届く。
+    #[test]
+    fn mvm1_886_stop_requested_drops_body_before_return() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert!(report.stats.runs >= 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// MVM-1: ゲスト起因の終了は stop より前に観測でき、stop がその理由を返す。
+    #[test]
+    fn mvm1_886_guest_finish_reported_before_stop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut body = FakeBody::new(&dropped);
+        body.finish_after = Some(3);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || running.is_finished()));
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::GuestShutdown);
+        assert_eq!(report.stats.runs, 3);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5: stop の期限は 0 と上限超を拒否し、拒否時も drop が回収する。
+    #[test]
+    fn mvm1_886_stop_deadline_validated() {
+        for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+            let e = running.stop(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "stop deadline out of range");
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    /// REPAIR-5: body が止まっていても stop は期限で戻る。解放後はスレッドが自力で終わる。
+    #[test]
+    fn mvm1_886_stop_times_out_when_body_blocks() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut body = FakeBody::new(&dropped);
+        body.gate = Some(Arc::clone(&gate));
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        // body が step の中（gate 待ち）に入ってから停止を要求する。
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let e = running.stop(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert!(!dropped.load(Ordering::SeqCst));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(wait_until(Duration::from_secs(5), || dropped.load(Ordering::SeqCst)));
+    }
+
+    /// MVM-1: stop を呼ばずに drop しても回収される。
+    #[test]
+    fn mvm1_886_drop_without_stop_joins() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        drop(running);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// MVM-1: 起動中ハンドルはスレッド間で移動できる。
+    #[test]
+    fn mvm1_886_running_microvm_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RunningMicroVm>();
+    }
+}
 #[cfg(test)]
 mod assemble_tests {
     use std::cell::Cell;

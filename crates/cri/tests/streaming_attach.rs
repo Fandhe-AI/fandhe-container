@@ -202,13 +202,17 @@ impl Client {
 
     /// `v4.channel.k8s.io` で Upgrade し、101 を確認して返す。
     fn connect(addr: SocketAddr, path: &str) -> Self {
-        let (sock, head) =
-            Self::connect_raw(addr, &upgrade_request(path, Some("v4.channel.k8s.io")));
+        Self::connect_with_version(addr, path, "v4.channel.k8s.io")
+    }
+
+    /// 指定の版で Upgrade し、101 と選ばれた版を確認して返す。
+    fn connect_with_version(addr: SocketAddr, path: &str, version: &str) -> Self {
+        let (sock, head) = Self::connect_raw(addr, &upgrade_request(path, Some(version)));
         assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
         let lower = head.to_ascii_lowercase();
         assert!(lower.contains("upgrade: spdy/3.1"), "{head}");
         assert!(
-            lower.contains("x-stream-protocol-version: v4.channel.k8s.io"),
+            lower.contains(&format!("x-stream-protocol-version: {version}")),
             "{head}"
         );
         Self {
@@ -636,6 +640,42 @@ async fn cri6_attach_idle_timeout_releases_backend() {
     })
     .await
     .expect("join");
+}
+
+const STATUS_TIMEOUT_V4: &str = r#"{"metadata":{},"status":"Failure","message":"attach session timed out","reason":"Timeout","code":504}"#;
+const STATUS_TIMEOUT_TEXT: &str = "attach session timed out";
+
+/// CRI-6・REPAIR-5: idle の打ち切りでも error ストリームへ Failure の Status を送り、出力の FIN・GOAWAY(OK) で閉じる。
+/// v4 は JSON、v3・v2 はテキスト。
+#[tokio::test]
+async fn cri6_attach_idle_timeout_notifies_failure_status() {
+    for (version, expected) in [
+        ("v4.channel.k8s.io", STATUS_TIMEOUT_V4),
+        ("v3.channel.k8s.io", STATUS_TIMEOUT_TEXT),
+        ("v2.channel.k8s.io", STATUS_TIMEOUT_TEXT),
+    ] {
+        let backend = FakeBackend::new();
+        let config =
+            StreamingConfig::default().with_stream_idle_timeout(Duration::from_millis(300));
+        let (server, service, container) = setup(config, Some(backend.clone())).await;
+        let path = attach_path(&service, &container, false, true, false, false).await;
+        let addr = server.local_addr();
+        let b = backend.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c = Client::connect_with_version(addr, &path, version);
+            let err = c.open("error");
+            let stdout = c.open("stdout");
+            c.pump_until(|c| c.replies.len() == 2);
+            let _ends = b.take_ends();
+            c.pump_until(|c| c.eof);
+            assert_eq!(c.data_of(err), expected.as_bytes(), "{version}");
+            assert!(c.fin.contains(&err.get()), "{version}");
+            assert!(c.fin.contains(&stdout.get()), "{version}");
+            assert_eq!(c.goaway, Some(goaway_status::OK), "{version}");
+        })
+        .await
+        .expect("join");
+    }
 }
 
 /// CRI-6: Attach の backend を注入しない構成では従来どおり 501（実装済みを装わない）。

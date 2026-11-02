@@ -78,12 +78,8 @@ impl FakeBackend {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(ends) = self.ends.lock().expect("lock").take() {
-                for sock in [&ends.stdin, &ends.stdout, &ends.stderr] {
-                    sock.set_read_timeout(Some(Duration::from_secs(5)))
-                        .expect("read timeout");
-                    sock.set_write_timeout(Some(Duration::from_secs(5)))
-                        .expect("write timeout");
-                }
+                // 期限は `attach` の `pair` で端を作った時点に設定済み（閉じた端への
+                // setsockopt は macOS で EINVAL になるため、ここでは設定しない。#3700）。
                 return ends;
             }
             assert!(
@@ -117,6 +113,14 @@ impl AttachBackend for FakeBackend {
             let pair = || {
                 let (session, container) = StdUnixStream::pair().expect("pair");
                 session.set_nonblocking(true).expect("nonblocking");
+                // ハンドラへ渡す前に期限を設定する。ハンドラが先に端を閉じた後の setsockopt は
+                // macOS（XNU）で EINVAL になる（CRI-6・REPAIR-5・#3700）。
+                container
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                container
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("write timeout");
                 (
                     tokio::net::UnixStream::from_std(session).expect("from_std"),
                     container,

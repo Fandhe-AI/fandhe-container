@@ -350,6 +350,9 @@ struct Connected {
     tcp: TcpStream,
     write_shut: bool,
     tcp_eof: bool,
+    /// 転送先への書き込みが失敗（EPIPE・ECONNRESET・0 バイト）した時刻。以後は書き込みを諦めて、転送先から
+    /// 受信済みの残りを読み切ってから閉じる。読み切りは `write_stall_timeout` で打ち切る（CRI-6・TASK-63.4）。
+    write_broken: Option<Instant>,
 }
 
 enum Phase {
@@ -634,9 +637,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             .pairs
             .iter()
             .filter(|(_, p)| {
-                matches!(p.phase, Phase::Connected(_))
-                    && p.pending() > 0
-                    && now.duration_since(p.last_write) >= self.config.write_stall_timeout
+                match &p.phase {
+                    Phase::Connected(c) => {
+                        (p.pending() > 0
+                            && now.duration_since(p.last_write) >= self.config.write_stall_timeout)
+                            // 書き込み失敗後の読み切りも同じ期限で打ち切る（読み手が止まった場合の歯止め）。
+                            || c.write_broken.is_some_and(|t| {
+                                now.duration_since(t) >= self.config.write_stall_timeout
+                            })
+                    }
+                    _ => false,
+                }
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -956,6 +967,7 @@ fn step_pair(
                     tcp,
                     write_shut: false,
                     tcp_eof: false,
+                    write_broken: None,
                 });
                 progress = true;
             }
@@ -978,10 +990,23 @@ fn step_pair(
     let Phase::Connected(conn) = phase else {
         return PairStep::Continue { progress };
     };
-    // クライアント → TCP。
-    while let Some(rest) = to_tcp.get(*to_tcp_pos..).filter(|r| !r.is_empty()) {
+    // クライアント → TCP。書き込みが失敗しても即 Aborted にせず、転送先が閉じる前に書いた応答の残りを
+    // 後段の読み取りで読み切ってから閉じる（RST_STREAM でなくデータと FIN を届ける。CRI-6・TASK-63.4）。
+    if conn.write_broken.is_some() {
+        to_tcp.clear();
+        *to_tcp_pos = 0;
+    }
+    while conn.write_broken.is_none()
+        && let Some(rest) = to_tcp.get(*to_tcp_pos..).filter(|r| !r.is_empty())
+    {
         match Pin::new(&mut conn.tcp).poll_write(cx, rest) {
-            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return PairStep::Aborted,
+            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => {
+                conn.write_broken = Some(Instant::now());
+                conn.write_shut = true;
+                to_tcp.clear();
+                *to_tcp_pos = 0;
+                progress = true;
+            }
             Poll::Ready(Ok(n)) => {
                 *to_tcp_pos += n;
                 *last_write = Instant::now();
@@ -1239,5 +1264,93 @@ mod tests {
         }
         assert_eq!(handler.dial_inflight.load(Ordering::Acquire), 0);
         assert!(DialSlot::acquire(&handler.dial_inflight, limit).is_some());
+    }
+
+    /// 転送先が応答を書いて閉じ、その後クライアントの書き込みが失敗しても、残りの応答を DATA として届けて
+    /// FIN で閉じる（RST_STREAM 相当の `Aborted` にしない）。CRI-6・TASK-63.4。
+    #[tokio::test]
+    async fn cri6_write_failure_still_drains_target_tail() {
+        use tokio::io::AsyncWriteExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let target = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut c, _) = listener.accept().expect("accept");
+            c.write_all(b"tail-bytes").expect("write tail");
+            rx.recv().expect("signal");
+            // 未読の受信データを残して閉じるので、相手には RST が返る。
+            drop(c);
+        });
+        let mut tcp = TcpStream::connect(addr).await.expect("connect");
+        tcp.write_all(b"x").await.expect("first write");
+        tx.send(()).expect("signal");
+        target.join().expect("target");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let error_id = StreamId::new(1).expect("sid");
+        let data_id = StreamId::new(3).expect("sid");
+        let mut pair = Pair {
+            port: 8080,
+            error: Some(error_id),
+            data: Some(data_id),
+            created: Instant::now(),
+            to_tcp: b"y".to_vec(),
+            to_tcp_pos: 0,
+            peer_fin: false,
+            last_write: Instant::now(),
+            phase: Phase::Connected(Connected {
+                tcp,
+                write_shut: false,
+                tcp_eof: false,
+                write_broken: None,
+            }),
+        };
+        let mut outbox = Outbox {
+            buf: Vec::new(),
+            pos: 0,
+            enc: FrameEncoder::new(),
+            failed: false,
+        };
+        let mut scratch = vec![0u8; 4096];
+        let config = PortForwardConfig::default();
+        let mut last_activity = Instant::now();
+        let step = std::future::poll_fn(|cx| {
+            Poll::Ready(step_pair(
+                &mut pair,
+                &mut outbox,
+                cx,
+                &mut scratch,
+                &config,
+                &mut last_activity,
+            ))
+        })
+        .await;
+        match step {
+            PairStep::Finished => {}
+            PairStep::Aborted => panic!("aborted: remaining target data was dropped"),
+            PairStep::Continue { .. } => panic!("expected the pair to finish"),
+        }
+        let mut dec = FrameDecoder::new();
+        dec.extend(&outbox.buf);
+        let mut got = Vec::new();
+        let mut fins = Vec::new();
+        while let Some(f) = dec.next_frame().expect("decode") {
+            if let Frame::Data {
+                stream_id,
+                fin,
+                data,
+            } = f
+            {
+                if stream_id == data_id {
+                    got.extend(data);
+                }
+                if fin {
+                    fins.push(stream_id.get());
+                }
+            }
+        }
+        assert_eq!(got, b"tail-bytes");
+        assert_eq!(fins, vec![3, 1]);
     }
 }

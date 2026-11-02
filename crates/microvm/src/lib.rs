@@ -10,6 +10,14 @@
 //! TASK-74.2.1・MVM-1: virtio-mmio の共通トランスポート（`virtio_mmio`。OS 非依存・unsafe なし）。
 //! 未実装: virtqueue の処理（TASK-74.2.2・74.3.1）・割り込み配送（TASK-74.2.3・74.3.2）・ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
+//!
+//! # 組み込む側への注意（REPAIR-5・MVM-4）
+//! - 対応は glibc（`target_env = "gnu"`）の LP64 の x86_64・aarch64 だけ。musl などは `ioctl` の `request` の型が
+//!   異なるため `Unsupported` で fail-closed する。
+//! - `device::VcpuFd::run_once` は初回に `SIGUSR2` へ何もしない handler を入れ、プロセス全体の設定として元へ戻さない
+//!   （`KVM_RUN` の期限切れで vCPU スレッドを中断するため）。組み込むプロセスは `SIGUSR2` を他の用途に使わないこと。
+//!   既に別の handler や SIG_IGN があるときは上書きせず `FailedPrecondition`（EBUSY）で失敗する。
+//!
 //! `unsafe` は `src/sys.rs` に限る。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 #[cfg(target_os = "linux")]

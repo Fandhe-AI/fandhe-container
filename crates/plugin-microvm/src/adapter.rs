@@ -65,11 +65,18 @@ pub const MAX_VMS: usize = 4;
 pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
 /// 1 台の停止の期限。RPC 期限から `RESPONSE_MARGIN` を引いた値（8 秒）未満かつ microvm の停止期限上限以下。
 pub const STOP_DEADLINE: Duration = Duration::from_secs(5);
+/// イメージ 1 件の読み取りの期限（kernel と initrd の 2 件で RPC 期限 - 余裕に収める。REPAIR-5）。
+pub const IMAGE_READ_DEADLINE: Duration = Duration::from_secs(3);
 /// 終了時の一括停止の合計予算。
 pub const STOP_ALL_BUDGET: Duration = Duration::from_secs(4);
 
 const _: () = assert!(
     STOP_DEADLINE.as_secs() + RESPONSE_MARGIN.as_secs() < UDS_RPC_TIMEOUT_DEFAULT.as_secs()
+);
+
+const _: () = assert!(
+    2 * IMAGE_READ_DEADLINE.as_secs() + RESPONSE_MARGIN.as_secs()
+        <= UDS_RPC_TIMEOUT_DEFAULT.as_secs()
 );
 
 const ID_MAX_BYTES: usize = 255;
@@ -279,7 +286,33 @@ enum ImageKind {
 /// イメージを読む。symlink・非通常ファイルを拒否し、上限は読む前（metadata）と読み込み中（`take`）で二重に判定する。
 ///
 /// lstat と open の間の差し替えは unix で dev / ino の照合により検出する。祖先ディレクトリの symlink は検査しない（残余）。
+///
+/// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
+/// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
 fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = path.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("microvm-read-image".into())
+        .spawn(move || {
+            let _ = tx.send(read_image_blocking(&owned, cap, kind));
+        });
+    if spawned.is_err() {
+        return Err(perr(PluginErrorCode::Internal, MSG_READ_FAILED));
+    }
+    match rx.recv_timeout(IMAGE_READ_DEADLINE) {
+        Ok(r) => r,
+        Err(_) => Err(perr(PluginErrorCode::Timeout, "image read timed out")),
+    }
+}
+
+/// `open` が FIFO 等で止まらないよう付ける `O_NONBLOCK`（Linux 0o4000・macOS 0x4）。通常ファイルの読み取りには影響しない。
+#[cfg(target_os = "linux")]
+const OPEN_NONBLOCK: i32 = 0o4000;
+#[cfg(all(unix, not(target_os = "linux")))]
+const OPEN_NONBLOCK: i32 = 0x4;
+
+fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
     let map_io = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::NotFound => match kind {
             ImageKind::Kernel => perr(PluginErrorCode::NotFound, "kernel image not found"),
@@ -298,7 +331,14 @@ fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginE
     if lmeta.len() > cap {
         return Err(invalid(MSG_TOO_LARGE));
     }
-    let file = std::fs::File::open(path).map_err(map_io)?;
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(OPEN_NONBLOCK);
+    }
+    let file = oo.open(path).map_err(map_io)?;
     let fmeta = file.metadata().map_err(map_io)?;
     if !fmeta.file_type().is_file() {
         return Err(invalid(MSG_NOT_REGULAR));
@@ -357,7 +397,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         self.vms.is_empty()
     }
 
-    /// 全 VM を `budget` 内で登録順に止める。各 VM の期限は `min(STOP_DEADLINE, 残り予算)`。
+    /// 全 VM を `budget` 内で登録順に止める。予算切れ以降の VM は 1ms の期限で停止要求だけ出して切り離す。各 VM の期限は `min(STOP_DEADLINE, 残り予算)`。
     pub fn stop_all(&mut self, budget: Duration) -> StopAllReport {
         let started = Instant::now();
         let mut report = StopAllReport {
@@ -368,13 +408,15 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         let ids: Vec<String> = self.vms.keys().cloned().collect();
         for id in ids {
             let left = budget.saturating_sub(started.elapsed());
-            if left.is_zero() {
-                report.remaining += 1;
-                continue;
-            }
             let Some(vm) = self.vms.remove(&id) else {
                 continue;
             };
+            if left.is_zero() {
+                // 予算切れ: Drop に任せると 1 台ごとに最大 5 秒待つため、停止要求だけ出して切り離す（1ms で打ち切る。REPAIR-5）。
+                let _ = self.backend.stop(vm, Duration::from_millis(1));
+                report.remaining += 1;
+                continue;
+            }
             match self.backend.stop(vm, left.min(STOP_DEADLINE)) {
                 Ok(_) => report.stopped += 1,
                 Err(_) => report.failed += 1,
@@ -785,17 +827,17 @@ mod tests {
                 remaining: 2
             }
         );
-        assert_eq!(a.len(), 2);
+        // 予算切れの VM も登録簿から外して停止要求を出す（Drop の待ちを残さない）。
+        assert!(a.is_empty());
         let r = a.stop_all(STOP_ALL_BUDGET);
         assert_eq!(
             r,
             StopAllReport {
-                stopped: 2,
+                stopped: 0,
                 failed: 0,
                 remaining: 0
             }
         );
-        assert!(a.is_empty());
     }
 
     /// 非 Linux: start は UNIMPLEMENTED。

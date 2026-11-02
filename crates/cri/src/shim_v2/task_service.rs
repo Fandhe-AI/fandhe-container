@@ -525,7 +525,7 @@ mod tests {
     }
 
     fn running_container(s: &TaskService, id: &str) {
-        s.handle("Create", &create_req(id, "/b")).unwrap();
+        s.handle("Create", &create_req(id, &abs("/b"))).unwrap();
         s.handle("Start", &start_req(id)).unwrap();
     }
 
@@ -674,7 +674,7 @@ mod tests {
             err_code(s.handle("Exec", &exec_req("nope", "e1", SPEC))).0,
             NOT_FOUND
         );
-        s.handle("Create", &create_req("c1", "/b")).unwrap();
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         assert_eq!(
             err_code(s.handle("Exec", &exec_req("c1", "e1", SPEC))).0,
             PRECOND

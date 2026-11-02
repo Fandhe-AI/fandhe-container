@@ -1963,7 +1963,16 @@ mod imp {
         }
 
         /// 空振り（ヒントを使えず先頭から走査した回）の上限。原因の分からない余分な回は失敗にする（#3148）。
-        const MAX_FALLBACKS: usize = 8;
+        ///
+        /// 空振りの原因は並行する試験の子が fork から exec までの間に継承したロック（`Held`）で、継続は
+        /// 回数ではなく時間で決まる。空振りの回は 1 回が数十 µs で終わるため、無待ちで回すと負荷の高い
+        /// ランナーで 1 つの継承期間に 9 回以上当たる（#3701）。そこで空振りのたびに
+        /// [`FALLBACK_BACKOFF`] 待ち、上限は継承期間が十分に明ける回数（約 4 秒分）にする。
+        /// 理由の照合（`NoHandle` 以外は失敗）と、読み取り・ヒント不変の照合は変えない。
+        const MAX_FALLBACKS: usize = 200;
+
+        /// 空振りの回の後の待ち（継承したロックが exec で閉じられるのを待つ。#3701）。
+        const FALLBACK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
         /// 掃除を 1 回行い、その回のヒントの使われ方を返す（空振りは理由つきで観測する）。
         fn sweep_pass(
@@ -1978,12 +1987,14 @@ mod imp {
         }
 
         /// 空振りとして許す理由（並行する子が継承したロックによる `Held`）。それ以外は失敗にする。
+        /// 許す理由だった場合は、継承が明けるまで [`FALLBACK_BACKOFF`] 待つ（#3701）。
         fn assert_expected_fallback(hint: sweep_trace_test_hook::HintUse) {
             assert_eq!(
                 hint,
                 sweep_trace_test_hook::HintUse::NoHandle,
                 "unexpected reason for not using the hint"
             );
+            std::thread::sleep(FALLBACK_BACKOFF);
         }
 
         /// 走査位置ヒントの現在値を読む（無ければ `None`）。

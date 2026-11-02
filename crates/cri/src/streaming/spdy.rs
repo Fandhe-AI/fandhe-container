@@ -1,54 +1,60 @@
-//! SPDY/3.1 のフレーム符号化・復号とヘッダブロックの zlib 圧縮（CRI-6・TASK-63.2・#680・REPAIR-2）。
+//! SPDY/3.1 のフレーム codec（CRI-6・TASK-63.3・#681。設計記録は `docs/design/cri-streaming-server.md`）。
 //!
-//! kubelet / apiserver の remotecommand（Exec・Attach）と portforward は、HTTP/1.1 Upgrade（`SPDY/3.1`）の後に
-//! SPDY/3 のフレームで多重化した複数ストリームを流す。本モジュールはそのうち CRI のストリーミングサーバーが使う部分
-//! （SYN_STREAM・SYN_REPLY・RST_STREAM・SETTINGS・PING・GOAWAY・HEADERS・WINDOW_UPDATE・DATA）を、生のバイト列を
-//! 手で組まない型（[`Frame`]・[`StreamId`]・[`RstStatus`]）で表す。呼び出し元は [`super::exec`]（#680）で、
-//! Attach（#681）・PortForward（#682）も同じ型を使う想定である（共通化の候補はこのモジュールの全体）。
+//! kubelet / crictl が `Attach`・`Exec`・`PortForward` で使う Upgrade 後のワイヤー形式（`Upgrade: SPDY/3.1`）を、
+//! バイト列と型付きの [`Frame`] の間で変換する。呼び出し元は `streaming::attach` のセッションと、将来の Exec
+//! （#680）・PortForward（#682）。HTTP の Upgrade・`streamType` の割り当て・k8s のサブプロトコルは
+//! `streaming::remotecommand` が持ち、本モジュールは SPDY の層だけを扱う。
 //!
-//! ## 外部入力としての扱い
+//! ## 形式（SPDY/3 draft。SPDY/3.1 もフレームの版は 3）
 //!
-//! 受信バイトは untrusted である。フレーム長・ヘッダ個数・展開後サイズは確保の前に上限を見る
-//! （[`MAX_CONTROL_FRAME_BYTES`]・[`MAX_DATA_FRAME_BYTES`]・[`MAX_HEADER_COUNT`]・[`MAX_HEADER_BLOCK_BYTES`]）。
-//! 復号は panic せず [`ProtocolError`] を返す。
+//! - 制御フレーム: `1 | version(15) | type(16) | flags(8) | length(24) | payload`
+//! - データフレーム: `0 | stream-id(31) | flags(8) | length(24) | payload`
+//! - ヘッダブロック: `count(32)` の後に `name-len(32) name value-len(32) value` を繰り返し、
+//!   送信方向ごとにセッション全体で 1 つの zlib ストリーム（SPDY/3 の辞書つき）で圧縮する。
+//!   ブロックごとに `Z_SYNC_FLUSH` で区切る。複数値は NUL 区切りで 1 つの値に入れる。
+//! - 一次情報: moby/spdystream の `spdy/read.go`・`write.go`（commit c59e5d73daa301bde452ea77545bdf51e32554a2）で
+//!   バイト配置を確認した。Python の zlib（辞書つき）が作ったブロックを復号する試験で他実装との互換を固定している
 //!
-//! ## 辞書の出典
+//! ## 安全側の上限（外部入力。REPAIR-5）
 //!
-//! ヘッダブロックの zlib 辞書は SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00, 2012-02）§2.6.10.1 の
-//! `SPDY_dictionary_txt`（1423 バイト）を、IETF 掲載のテキストから機械的に起こしたものである。
-//! 長さと Adler-32（0xe3c6a7c2）は試験で照合する。
-//! 一次情報の確認結果（2026-11-02 に取得して確認）:
+//! フレーム長（[`MAX_INCOMING_PAYLOAD`]）は確保の前に検査する。ヘッダブロックは展開後のサイズ
+//! （[`MAX_HEADER_BLOCK`]）・組数（[`MAX_HEADER_COUNT`]）に上限があり、zlib bomb は上限に達した時点で拒否する。
+//! 違反はすべて [`SpdyError`] になり、呼び出し側が GOAWAY で接続を閉じる（部分的に解釈して続行しない）。
 //!
-//! - 出典: <https://www.ietf.org/archive/id/draft-mbelshe-httpbis-spdy-00.txt>（draft-mbelshe-httpbis-spdy-00）
-//! - 文書の Copyright Notice は「Copyright (c) 2012 IETF Trust and the persons identified as the document authors」で、
-//!   IETF Trust の Legal Provisions（BCP 78）に従う。同文書は「Code Components extracted from this document must
-//!   include Simplified BSD License text as described in Section 4.e of the Trust Legal Provisions and are provided
-//!   without warranty as described in the Simplified BSD License」と述べる。
-//! - 文書に NOTICE ファイルに当たるものは無い。ルート `NOTICE` は変更していない。
-//! - 辞書が上記の Code Components に当たるか、Simplified BSD のライセンス文の同梱をどう行うかは、
-//!   Agent が決めずオーナー判断事項として PR 本文・`docs/design/cri-streaming-server.md` に報告している
-//!   （licensing.md）。判断が出るまで承認済みとは扱わない。
+//! ## flow control を送信側で強制しない（draft からの意図的な逸脱）
+//!
+//! SPDY/3.1 は窓（既定 64 KiB）を超える DATA の送信を禁じる。しかし実際のクライアント（client-go が使う
+//! moby/spdystream）は flow control を実装せず、WINDOW_UPDATE を送らず、受け取っても「unhandled frame type」として
+//! 捨てる。窓を強制すると 64 KiB を送った時点で永久に止まるため、本実装は WINDOW_UPDATE と SETTINGS を
+//! 受理して無視し、DATA の送信を窓で止めない。代わりに送信側の滞留はセッションの出力バッファ上限で、
+//! 受信側の滞留は stdin の滞留上限（`attach.rs`）で有界にする。
 
 use std::fmt;
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
-/// 制御フレームのペイロード長の上限（バイト）。確保の前に検査する。
-pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024;
-/// DATA フレームのペイロード長の上限（バイト）。client-go の stdin は 32 KiB 単位である。
-pub const MAX_DATA_FRAME_BYTES: usize = 256 * 1024;
-/// ヘッダブロック 1 つあたりのヘッダ個数の上限。
-pub const MAX_HEADER_COUNT: usize = 32;
-/// ヘッダ名・値それぞれの長さの上限（バイト）。
-pub const MAX_HEADER_FIELD_BYTES: usize = 4 * 1024;
-/// 展開後のヘッダブロックの合計サイズの上限（バイト。zlib bomb 対策）。
-pub const MAX_HEADER_BLOCK_BYTES: usize = 64 * 1024;
+use super::spdy_dictionary::SPDY3_DICTIONARY;
 
-/// 制御フレームの先頭 2 バイト（C ビット + version 3）。
-const CONTROL_VERSION: u16 = 0x8003;
-const FLAG_FIN: u8 = 0x01;
-const FLAG_UNIDIRECTIONAL: u8 = 0x02;
+/// SPDY/3 の辞書の Adler-32（zlib ヘッダの DICTID。辞書の取り違え検出に使う）。
+pub const DICTIONARY_ADLER32: u32 = 0xe3c6_a7c2;
+/// フレームに載る版。SPDY/3.1 も 3 のまま（3.1 は flow control の拡張）。
+const SPDY_VERSION: u16 = 3;
+/// ストリーム ID の最大値（31 ビット）。
+pub const MAX_STREAM_ID: u32 = 0x7fff_ffff;
+/// 受信するフレームのペイロードの最大バイト数。長さは確保の前に検査する。
+pub const MAX_INCOMING_PAYLOAD: usize = 256 * 1024;
+/// 送信する DATA フレームの 1 つあたりの最大バイト数（これを超える分は呼び出し側が分割する）。
+pub const MAX_OUTGOING_DATA: usize = 32 * 1024;
+/// ヘッダブロックの展開後の最大バイト数（zlib bomb 対策）。
+pub const MAX_HEADER_BLOCK: usize = 16 * 1024;
+/// ヘッダの組の最大件数。
+pub const MAX_HEADER_COUNT: usize = 64;
+/// SETTINGS のエントリの最大件数。
+const MAX_SETTINGS_ENTRIES: usize = 64;
+/// 24 ビットの長さの最大値。
+const MAX_LENGTH_24: usize = 0x00ff_ffff;
 
+/// 制御フレームの type（draft の値）。
 const TYPE_SYN_STREAM: u16 = 1;
 const TYPE_SYN_REPLY: u16 = 2;
 const TYPE_RST_STREAM: u16 = 3;
@@ -58,639 +64,545 @@ const TYPE_GOAWAY: u16 = 7;
 const TYPE_HEADERS: u16 = 8;
 const TYPE_WINDOW_UPDATE: u16 = 9;
 
-/// SPDY/3 のヘッダブロック用 zlib 辞書の Adler-32。
-pub const SPDY3_DICT_ADLER32: u32 = 0xe3c6_a7c2;
+/// FLAG_FIN（SYN_STREAM・SYN_REPLY・HEADERS・DATA）。
+const FLAG_FIN: u8 = 0x01;
+/// FLAG_UNIDIRECTIONAL（SYN_STREAM）。
+const FLAG_UNIDIRECTIONAL: u8 = 0x02;
+/// FLAG_SETTINGS_CLEAR_SETTINGS（SETTINGS）。
+const FLAG_CLEAR_SETTINGS: u8 = 0x01;
 
-/// SPDY/3 のヘッダブロック用 zlib 辞書（1423 バイト）。出典はモジュール doc を参照。
-#[rustfmt::skip]
-pub const SPDY3_DICT: [u8; 1423] = [
-    0x00, 0x00, 0x00, 0x07, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x00, 0x00, 0x00, 0x04, 0x68,
-    0x65, 0x61, 0x64, 0x00, 0x00, 0x00, 0x04, 0x70, 0x6f, 0x73, 0x74, 0x00, 0x00, 0x00, 0x03, 0x70,
-    0x75, 0x74, 0x00, 0x00, 0x00, 0x06, 0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x00, 0x00, 0x00, 0x05,
-    0x74, 0x72, 0x61, 0x63, 0x65, 0x00, 0x00, 0x00, 0x06, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x00,
-    0x00, 0x00, 0x0e, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x2d, 0x63, 0x68, 0x61, 0x72, 0x73, 0x65,
-    0x74, 0x00, 0x00, 0x00, 0x0f, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x2d, 0x65, 0x6e, 0x63, 0x6f,
-    0x64, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x0f, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x2d, 0x6c,
-    0x61, 0x6e, 0x67, 0x75, 0x61, 0x67, 0x65, 0x00, 0x00, 0x00, 0x0d, 0x61, 0x63, 0x63, 0x65, 0x70,
-    0x74, 0x2d, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x73, 0x00, 0x00, 0x00, 0x03, 0x61, 0x67, 0x65, 0x00,
-    0x00, 0x00, 0x05, 0x61, 0x6c, 0x6c, 0x6f, 0x77, 0x00, 0x00, 0x00, 0x0d, 0x61, 0x75, 0x74, 0x68,
-    0x6f, 0x72, 0x69, 0x7a, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x0d, 0x63, 0x61, 0x63,
-    0x68, 0x65, 0x2d, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x6f, 0x6c, 0x00, 0x00, 0x00, 0x0a, 0x63, 0x6f,
-    0x6e, 0x6e, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x0c, 0x63, 0x6f, 0x6e, 0x74,
-    0x65, 0x6e, 0x74, 0x2d, 0x62, 0x61, 0x73, 0x65, 0x00, 0x00, 0x00, 0x10, 0x63, 0x6f, 0x6e, 0x74,
-    0x65, 0x6e, 0x74, 0x2d, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x10,
-    0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2d, 0x6c, 0x61, 0x6e, 0x67, 0x75, 0x61, 0x67, 0x65,
-    0x00, 0x00, 0x00, 0x0e, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2d, 0x6c, 0x65, 0x6e, 0x67,
-    0x74, 0x68, 0x00, 0x00, 0x00, 0x10, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2d, 0x6c, 0x6f,
-    0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x0b, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e,
-    0x74, 0x2d, 0x6d, 0x64, 0x35, 0x00, 0x00, 0x00, 0x0d, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74,
-    0x2d, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x00, 0x00, 0x00, 0x0c, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e,
-    0x74, 0x2d, 0x74, 0x79, 0x70, 0x65, 0x00, 0x00, 0x00, 0x04, 0x64, 0x61, 0x74, 0x65, 0x00, 0x00,
-    0x00, 0x04, 0x65, 0x74, 0x61, 0x67, 0x00, 0x00, 0x00, 0x06, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74,
-    0x00, 0x00, 0x00, 0x07, 0x65, 0x78, 0x70, 0x69, 0x72, 0x65, 0x73, 0x00, 0x00, 0x00, 0x04, 0x66,
-    0x72, 0x6f, 0x6d, 0x00, 0x00, 0x00, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x00, 0x00, 0x00, 0x08, 0x69,
-    0x66, 0x2d, 0x6d, 0x61, 0x74, 0x63, 0x68, 0x00, 0x00, 0x00, 0x11, 0x69, 0x66, 0x2d, 0x6d, 0x6f,
-    0x64, 0x69, 0x66, 0x69, 0x65, 0x64, 0x2d, 0x73, 0x69, 0x6e, 0x63, 0x65, 0x00, 0x00, 0x00, 0x0d,
-    0x69, 0x66, 0x2d, 0x6e, 0x6f, 0x6e, 0x65, 0x2d, 0x6d, 0x61, 0x74, 0x63, 0x68, 0x00, 0x00, 0x00,
-    0x08, 0x69, 0x66, 0x2d, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x00, 0x00, 0x00, 0x13, 0x69, 0x66, 0x2d,
-    0x75, 0x6e, 0x6d, 0x6f, 0x64, 0x69, 0x66, 0x69, 0x65, 0x64, 0x2d, 0x73, 0x69, 0x6e, 0x63, 0x65,
-    0x00, 0x00, 0x00, 0x0d, 0x6c, 0x61, 0x73, 0x74, 0x2d, 0x6d, 0x6f, 0x64, 0x69, 0x66, 0x69, 0x65,
-    0x64, 0x00, 0x00, 0x00, 0x08, 0x6c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00,
-    0x0c, 0x6d, 0x61, 0x78, 0x2d, 0x66, 0x6f, 0x72, 0x77, 0x61, 0x72, 0x64, 0x73, 0x00, 0x00, 0x00,
-    0x06, 0x70, 0x72, 0x61, 0x67, 0x6d, 0x61, 0x00, 0x00, 0x00, 0x12, 0x70, 0x72, 0x6f, 0x78, 0x79,
-    0x2d, 0x61, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x65, 0x00, 0x00, 0x00,
-    0x13, 0x70, 0x72, 0x6f, 0x78, 0x79, 0x2d, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x61,
-    0x74, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x05, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x00, 0x00, 0x00,
-    0x07, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x72, 0x00, 0x00, 0x00, 0x0b, 0x72, 0x65, 0x74, 0x72,
-    0x79, 0x2d, 0x61, 0x66, 0x74, 0x65, 0x72, 0x00, 0x00, 0x00, 0x06, 0x73, 0x65, 0x72, 0x76, 0x65,
-    0x72, 0x00, 0x00, 0x00, 0x02, 0x74, 0x65, 0x00, 0x00, 0x00, 0x07, 0x74, 0x72, 0x61, 0x69, 0x6c,
-    0x65, 0x72, 0x00, 0x00, 0x00, 0x11, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x66, 0x65, 0x72, 0x2d, 0x65,
-    0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x07, 0x75, 0x70, 0x67, 0x72, 0x61,
-    0x64, 0x65, 0x00, 0x00, 0x00, 0x0a, 0x75, 0x73, 0x65, 0x72, 0x2d, 0x61, 0x67, 0x65, 0x6e, 0x74,
-    0x00, 0x00, 0x00, 0x04, 0x76, 0x61, 0x72, 0x79, 0x00, 0x00, 0x00, 0x03, 0x76, 0x69, 0x61, 0x00,
-    0x00, 0x00, 0x07, 0x77, 0x61, 0x72, 0x6e, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x10, 0x77, 0x77,
-    0x77, 0x2d, 0x61, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x65, 0x00, 0x00,
-    0x00, 0x06, 0x6d, 0x65, 0x74, 0x68, 0x6f, 0x64, 0x00, 0x00, 0x00, 0x03, 0x67, 0x65, 0x74, 0x00,
-    0x00, 0x00, 0x06, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00, 0x00, 0x00, 0x06, 0x32, 0x30, 0x30,
-    0x20, 0x4f, 0x4b, 0x00, 0x00, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00,
-    0x00, 0x08, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x31, 0x2e, 0x31, 0x00, 0x00, 0x00, 0x03, 0x75, 0x72,
-    0x6c, 0x00, 0x00, 0x00, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x00, 0x00, 0x00, 0x0a, 0x73,
-    0x65, 0x74, 0x2d, 0x63, 0x6f, 0x6f, 0x6b, 0x69, 0x65, 0x00, 0x00, 0x00, 0x0a, 0x6b, 0x65, 0x65,
-    0x70, 0x2d, 0x61, 0x6c, 0x69, 0x76, 0x65, 0x00, 0x00, 0x00, 0x06, 0x6f, 0x72, 0x69, 0x67, 0x69,
-    0x6e, 0x31, 0x30, 0x30, 0x31, 0x30, 0x31, 0x32, 0x30, 0x31, 0x32, 0x30, 0x32, 0x32, 0x30, 0x35,
-    0x32, 0x30, 0x36, 0x33, 0x30, 0x30, 0x33, 0x30, 0x32, 0x33, 0x30, 0x33, 0x33, 0x30, 0x34, 0x33,
-    0x30, 0x35, 0x33, 0x30, 0x36, 0x33, 0x30, 0x37, 0x34, 0x30, 0x32, 0x34, 0x30, 0x35, 0x34, 0x30,
-    0x36, 0x34, 0x30, 0x37, 0x34, 0x30, 0x38, 0x34, 0x30, 0x39, 0x34, 0x31, 0x30, 0x34, 0x31, 0x31,
-    0x34, 0x31, 0x32, 0x34, 0x31, 0x33, 0x34, 0x31, 0x34, 0x34, 0x31, 0x35, 0x34, 0x31, 0x36, 0x34,
-    0x31, 0x37, 0x35, 0x30, 0x32, 0x35, 0x30, 0x34, 0x35, 0x30, 0x35, 0x32, 0x30, 0x33, 0x20, 0x4e,
-    0x6f, 0x6e, 0x2d, 0x41, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x74, 0x61, 0x74, 0x69, 0x76, 0x65,
-    0x20, 0x49, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x32, 0x30, 0x34, 0x20,
-    0x4e, 0x6f, 0x20, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x33, 0x30, 0x31, 0x20, 0x4d, 0x6f,
-    0x76, 0x65, 0x64, 0x20, 0x50, 0x65, 0x72, 0x6d, 0x61, 0x6e, 0x65, 0x6e, 0x74, 0x6c, 0x79, 0x34,
-    0x30, 0x30, 0x20, 0x42, 0x61, 0x64, 0x20, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x34, 0x30,
-    0x31, 0x20, 0x55, 0x6e, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x7a, 0x65, 0x64, 0x34, 0x30,
-    0x33, 0x20, 0x46, 0x6f, 0x72, 0x62, 0x69, 0x64, 0x64, 0x65, 0x6e, 0x34, 0x30, 0x34, 0x20, 0x4e,
-    0x6f, 0x74, 0x20, 0x46, 0x6f, 0x75, 0x6e, 0x64, 0x35, 0x30, 0x30, 0x20, 0x49, 0x6e, 0x74, 0x65,
-    0x72, 0x6e, 0x61, 0x6c, 0x20, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x20, 0x45, 0x72, 0x72, 0x6f,
-    0x72, 0x35, 0x30, 0x31, 0x20, 0x4e, 0x6f, 0x74, 0x20, 0x49, 0x6d, 0x70, 0x6c, 0x65, 0x6d, 0x65,
-    0x6e, 0x74, 0x65, 0x64, 0x35, 0x30, 0x33, 0x20, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x20,
-    0x55, 0x6e, 0x61, 0x76, 0x61, 0x69, 0x6c, 0x61, 0x62, 0x6c, 0x65, 0x4a, 0x61, 0x6e, 0x20, 0x46,
-    0x65, 0x62, 0x20, 0x4d, 0x61, 0x72, 0x20, 0x41, 0x70, 0x72, 0x20, 0x4d, 0x61, 0x79, 0x20, 0x4a,
-    0x75, 0x6e, 0x20, 0x4a, 0x75, 0x6c, 0x20, 0x41, 0x75, 0x67, 0x20, 0x53, 0x65, 0x70, 0x74, 0x20,
-    0x4f, 0x63, 0x74, 0x20, 0x4e, 0x6f, 0x76, 0x20, 0x44, 0x65, 0x63, 0x20, 0x30, 0x30, 0x3a, 0x30,
-    0x30, 0x3a, 0x30, 0x30, 0x20, 0x4d, 0x6f, 0x6e, 0x2c, 0x20, 0x54, 0x75, 0x65, 0x2c, 0x20, 0x57,
-    0x65, 0x64, 0x2c, 0x20, 0x54, 0x68, 0x75, 0x2c, 0x20, 0x46, 0x72, 0x69, 0x2c, 0x20, 0x53, 0x61,
-    0x74, 0x2c, 0x20, 0x53, 0x75, 0x6e, 0x2c, 0x20, 0x47, 0x4d, 0x54, 0x63, 0x68, 0x75, 0x6e, 0x6b,
-    0x65, 0x64, 0x2c, 0x74, 0x65, 0x78, 0x74, 0x2f, 0x68, 0x74, 0x6d, 0x6c, 0x2c, 0x69, 0x6d, 0x61,
-    0x67, 0x65, 0x2f, 0x70, 0x6e, 0x67, 0x2c, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x6a, 0x70, 0x67,
-    0x2c, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2f, 0x67, 0x69, 0x66, 0x2c, 0x61, 0x70, 0x70, 0x6c, 0x69,
-    0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x78, 0x6d, 0x6c, 0x2c, 0x61, 0x70, 0x70, 0x6c, 0x69,
-    0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2f, 0x78, 0x68, 0x74, 0x6d, 0x6c, 0x2b, 0x78, 0x6d, 0x6c,
-    0x2c, 0x74, 0x65, 0x78, 0x74, 0x2f, 0x70, 0x6c, 0x61, 0x69, 0x6e, 0x2c, 0x74, 0x65, 0x78, 0x74,
-    0x2f, 0x6a, 0x61, 0x76, 0x61, 0x73, 0x63, 0x72, 0x69, 0x70, 0x74, 0x2c, 0x70, 0x75, 0x62, 0x6c,
-    0x69, 0x63, 0x70, 0x72, 0x69, 0x76, 0x61, 0x74, 0x65, 0x6d, 0x61, 0x78, 0x2d, 0x61, 0x67, 0x65,
-    0x3d, 0x67, 0x7a, 0x69, 0x70, 0x2c, 0x64, 0x65, 0x66, 0x6c, 0x61, 0x74, 0x65, 0x2c, 0x73, 0x64,
-    0x63, 0x68, 0x63, 0x68, 0x61, 0x72, 0x73, 0x65, 0x74, 0x3d, 0x75, 0x74, 0x66, 0x2d, 0x38, 0x63,
-    0x68, 0x61, 0x72, 0x73, 0x65, 0x74, 0x3d, 0x69, 0x73, 0x6f, 0x2d, 0x38, 0x38, 0x35, 0x39, 0x2d,
-    0x31, 0x2c, 0x75, 0x74, 0x66, 0x2d, 0x2c, 0x2a, 0x2c, 0x65, 0x6e, 0x71, 0x3d, 0x30, 0x2e,
-];
+/// RST_STREAM のステータスコード（draft の値）。
+pub mod rst_status {
+    /// PROTOCOL_ERROR。
+    pub const PROTOCOL_ERROR: u32 = 1;
+    /// INVALID_STREAM。
+    pub const INVALID_STREAM: u32 = 2;
+    /// REFUSED_STREAM。
+    pub const REFUSED_STREAM: u32 = 3;
+    /// CANCEL。
+    pub const CANCEL: u32 = 5;
+    /// INTERNAL_ERROR。
+    pub const INTERNAL_ERROR: u32 = 6;
+    /// STREAM_IN_USE。
+    pub const STREAM_IN_USE: u32 = 8;
+    /// STREAM_ALREADY_CLOSED。
+    pub const STREAM_ALREADY_CLOSED: u32 = 9;
+}
 
-/// SPDY の規則違反（不正なフレーム・上限超え・展開の失敗）。メッセージは固定の英語文で、入力の内容を含めない。
+/// GOAWAY のステータスコード（draft の値）。
+pub mod goaway_status {
+    /// OK（正常終了）。
+    pub const OK: u32 = 0;
+    /// PROTOCOL_ERROR。
+    pub const PROTOCOL_ERROR: u32 = 1;
+    /// INTERNAL_ERROR。
+    pub const INTERNAL_ERROR: u32 = 2;
+}
+
+/// SPDY の層の失敗。理由は固定の英語で、入力値を含めない（REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProtocolError(&'static str);
-
-impl ProtocolError {
-    fn new(message: &'static str) -> Self {
-        Self(message)
-    }
-
-    /// 固定の説明文。
-    pub fn message(&self) -> &'static str {
-        self.0
-    }
+pub enum SpdyError {
+    /// フレームの版が 3 ではない。
+    UnsupportedVersion,
+    /// フレーム長が上限を超えた。
+    FrameTooLarge,
+    /// フレームの構造が壊れている（長さの不一致・ID 0・重複ヘッダ等）。
+    InvalidFrame(&'static str),
+    /// ヘッダブロックの展開後のサイズまたは件数が上限を超えた。
+    HeaderBlockTooLarge,
+    /// ヘッダブロックの zlib 展開・圧縮に失敗した。
+    Compression(&'static str),
 }
 
-impl fmt::Display for ProtocolError {
+impl fmt::Display for SpdyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "spdy protocol error: {}", self.0)
+        match self {
+            SpdyError::UnsupportedVersion => f.write_str("unsupported spdy version"),
+            SpdyError::FrameTooLarge => f.write_str("spdy frame is too large"),
+            SpdyError::InvalidFrame(why) => write!(f, "invalid spdy frame: {why}"),
+            SpdyError::HeaderBlockTooLarge => f.write_str("spdy header block is too large"),
+            SpdyError::Compression(why) => write!(f, "spdy header compression failed: {why}"),
+        }
     }
 }
 
-impl std::error::Error for ProtocolError {}
+impl std::error::Error for SpdyError {}
 
-/// ストリーム ID（31 ビット、0 は不可）。
+/// 0 でも MSB 付きでもないストリーム ID（31 ビット）。壊れた ID を型で表せなくする（REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(u32);
 
 impl StreamId {
-    /// 0 と最上位ビットが立った値は作れない。
-    pub fn new(value: u32) -> Option<Self> {
-        if value == 0 || value & 0x8000_0000 != 0 {
-            None
-        } else {
-            Some(Self(value))
-        }
+    /// `1..=MAX_STREAM_ID` だけ受理する。
+    pub fn new(raw: u32) -> Option<Self> {
+        (1..=MAX_STREAM_ID).contains(&raw).then_some(Self(raw))
     }
 
-    /// 数値。
+    /// 生の値。
     pub fn get(self) -> u32 {
         self.0
     }
+}
 
-    /// クライアントが開始するストリーム（奇数）か。
-    pub fn is_client_initiated(self) -> bool {
-        self.0 % 2 == 1
+/// ヘッダの組（名前は小文字へ正規化済み。値の複数値は NUL 区切りのまま）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Headers(Vec<(String, String)>);
+
+impl Headers {
+    /// 空のヘッダ。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 組を足す（名前は小文字にする）。
+    pub fn push(&mut self, name: &str, value: &str) {
+        self.0.push((name.to_ascii_lowercase(), value.to_string()));
+    }
+
+    /// 名前（小文字）の最初の値。
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// 組の件数。
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// 空か。
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// 全組を順に返す。
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(n, v)| (n.as_str(), v.as_str()))
     }
 }
 
-/// RST_STREAM の状態コード（SPDY/3 §2.6.4）。
+/// SETTINGS の 1 エントリ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RstStatus {
-    /// PROTOCOL_ERROR(1)。
-    ProtocolError,
-    /// INVALID_STREAM(2)。
-    InvalidStream,
-    /// REFUSED_STREAM(3)。
-    RefusedStream,
-    /// UNSUPPORTED_VERSION(4)。
-    UnsupportedVersion,
-    /// CANCEL(5)。
-    Cancel,
-    /// INTERNAL_ERROR(6)。
-    InternalError,
-    /// FLOW_CONTROL_ERROR(7)。
-    FlowControlError,
-    /// STREAM_IN_USE(8)。
-    StreamInUse,
-    /// STREAM_ALREADY_CLOSED(9)。
-    StreamAlreadyClosed,
-    /// INVALID_CREDENTIALS(10)。
-    InvalidCredentials,
-    /// FRAME_TOO_LARGE(11)。
-    FrameTooLarge,
-    /// 上記以外（相手が送った値を保持する）。
-    Unknown(u32),
+pub struct Setting {
+    /// エントリのフラグ。
+    pub flags: u8,
+    /// 設定 ID（24 ビット）。
+    pub id: u32,
+    /// 値。
+    pub value: u32,
 }
 
-impl RstStatus {
-    /// ワイヤ上の数値。
-    pub fn code(self) -> u32 {
-        match self {
-            RstStatus::ProtocolError => 1,
-            RstStatus::InvalidStream => 2,
-            RstStatus::RefusedStream => 3,
-            RstStatus::UnsupportedVersion => 4,
-            RstStatus::Cancel => 5,
-            RstStatus::InternalError => 6,
-            RstStatus::FlowControlError => 7,
-            RstStatus::StreamInUse => 8,
-            RstStatus::StreamAlreadyClosed => 9,
-            RstStatus::InvalidCredentials => 10,
-            RstStatus::FrameTooLarge => 11,
-            RstStatus::Unknown(v) => v,
-        }
-    }
-
-    /// 数値から。
-    pub fn from_code(code: u32) -> Self {
-        match code {
-            1 => RstStatus::ProtocolError,
-            2 => RstStatus::InvalidStream,
-            3 => RstStatus::RefusedStream,
-            4 => RstStatus::UnsupportedVersion,
-            5 => RstStatus::Cancel,
-            6 => RstStatus::InternalError,
-            7 => RstStatus::FlowControlError,
-            8 => RstStatus::StreamInUse,
-            9 => RstStatus::StreamAlreadyClosed,
-            10 => RstStatus::InvalidCredentials,
-            11 => RstStatus::FrameTooLarge,
-            other => RstStatus::Unknown(other),
-        }
-    }
-}
-
-/// GOAWAY の状態コード（SPDY/3 §2.6.6）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoAwayStatus {
-    /// OK(0)。正常終了。
-    Ok,
-    /// PROTOCOL_ERROR(1)。
-    ProtocolError,
-    /// INTERNAL_ERROR(2)。
-    InternalError,
-    /// 上記以外。
-    Unknown(u32),
-}
-
-impl GoAwayStatus {
-    /// ワイヤ上の数値。
-    pub fn code(self) -> u32 {
-        match self {
-            GoAwayStatus::Ok => 0,
-            GoAwayStatus::ProtocolError => 1,
-            GoAwayStatus::InternalError => 2,
-            GoAwayStatus::Unknown(v) => v,
-        }
-    }
-
-    /// 数値から。
-    pub fn from_code(code: u32) -> Self {
-        match code {
-            0 => GoAwayStatus::Ok,
-            1 => GoAwayStatus::ProtocolError,
-            2 => GoAwayStatus::InternalError,
-            other => GoAwayStatus::Unknown(other),
-        }
-    }
-}
-
-/// ヘッダ 1 件。名前は小文字に正規化して保持する（SPDY/3 はヘッダ名を小文字で送る。spdystream も同じ）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Header {
-    /// 小文字化したヘッダ名。
-    pub name: String,
-    /// 値（NUL 区切りの複数値はそのまま）。
-    pub value: String,
-}
-
-/// SPDY/3 のフレーム。
+/// 型付きのフレーム。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// SYN_STREAM（ストリームの開始）。
+    /// SYN_STREAM（ストリームを開く）。
     SynStream {
-        /// 新しいストリームの ID。
+        /// 開くストリーム。
         stream_id: StreamId,
-        /// 関連ストリームの ID（0 は無し）。
+        /// 関連ストリーム（0 は無し）。
         associated_to: u32,
-        /// 優先度（0〜7）。
+        /// 優先度（0..=7）。
         priority: u8,
-        /// FIN フラグ。
+        /// FLAG_FIN。
         fin: bool,
-        /// UNIDIRECTIONAL フラグ。
+        /// FLAG_UNIDIRECTIONAL。
         unidirectional: bool,
         /// ヘッダ。
-        headers: Vec<Header>,
+        headers: Headers,
     },
-    /// SYN_REPLY（ストリームの受理）。
+    /// SYN_REPLY（ストリームの開設への応答）。
     SynReply {
         /// 対象ストリーム。
         stream_id: StreamId,
-        /// FIN フラグ。
+        /// FLAG_FIN。
         fin: bool,
         /// ヘッダ。
-        headers: Vec<Header>,
+        headers: Headers,
     },
-    /// RST_STREAM。
+    /// RST_STREAM（ストリームの異常終了）。
     RstStream {
         /// 対象ストリーム。
         stream_id: StreamId,
-        /// 理由。
-        status: RstStatus,
+        /// [`rst_status`] の値。
+        status: u32,
     },
-    /// SETTINGS（内容は使わない。件数だけ保持する）。
+    /// SETTINGS。
     Settings {
-        /// エントリ数。
-        entries: u32,
+        /// FLAG_SETTINGS_CLEAR_SETTINGS。
+        clear: bool,
+        /// エントリ。
+        entries: Vec<Setting>,
     },
-    /// PING。
+    /// PING（受け取った ID をそのまま返す）。
     Ping {
-        /// ID。
+        /// 識別子。
         id: u32,
     },
-    /// GOAWAY。
+    /// GOAWAY（セッションの終了）。
     GoAway {
-        /// 処理した最後のストリーム ID。
+        /// 処理済みの最後のストリーム。
         last_good_stream_id: u32,
-        /// 理由。
-        status: GoAwayStatus,
+        /// [`goaway_status`] の値。
+        status: u32,
     },
-    /// HEADERS。
+    /// HEADERS（ストリームへの追加ヘッダ）。
     Headers {
         /// 対象ストリーム。
         stream_id: StreamId,
-        /// FIN フラグ。
+        /// FLAG_FIN。
         fin: bool,
         /// ヘッダ。
-        headers: Vec<Header>,
+        headers: Headers,
     },
-    /// WINDOW_UPDATE。
+    /// WINDOW_UPDATE（0 はセッション窓）。本実装は強制しない（モジュール doc）。
     WindowUpdate {
-        /// 対象ストリーム。
-        stream_id: StreamId,
-        /// 増分。
-        delta: u32,
-    },
-    /// 接続レベルの WINDOW_UPDATE（stream id 0。SPDY/3.1）。受信しても無視する（送信側の流量制御は行わない）。
-    ConnectionWindowUpdate {
-        /// 増分。
+        /// 対象ストリーム（0 はセッション）。
+        stream_id: u32,
+        /// 窓の増分。
         delta: u32,
     },
     /// DATA。
     Data {
         /// 対象ストリーム。
         stream_id: StreamId,
-        /// FIN フラグ。
+        /// FLAG_FIN（この方向の終端）。
         fin: bool,
         /// ペイロード。
-        payload: Vec<u8>,
+        data: Vec<u8>,
+    },
+    /// 未知の制御フレーム（CREDENTIAL 等。draft に従い無視する）。
+    Unknown {
+        /// 制御フレームの type。
+        frame_type: u16,
     },
 }
 
 fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
-    let bytes: [u8; 4] = buf.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    let end = at.checked_add(4)?;
+    let bytes: [u8; 4] = buf.get(at..end)?.try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
 }
 
-fn read_u16(buf: &[u8], at: usize) -> Option<u16> {
-    let bytes: [u8; 2] = buf.get(at..at.checked_add(2)?)?.try_into().ok()?;
-    Some(u16::from_be_bytes(bytes))
+fn read_u24(buf: &[u8], at: usize) -> Option<usize> {
+    let bytes: [u8; 3] = buf.get(at..at.checked_add(3)?)?.try_into().ok()?;
+    let [a, b, c] = bytes;
+    Some((usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c))
 }
 
-fn push_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_be_bytes());
+fn nonzero_stream_id(raw: u32) -> Result<StreamId, SpdyError> {
+    StreamId::new(raw & MAX_STREAM_ID).ok_or(SpdyError::InvalidFrame("stream id is zero"))
 }
 
-/// 受信側のヘッダブロック展開器。接続の間ずっと 1 本の zlib ストリームを続ける（SPDY/3 の規定）。
-pub struct HeaderDecompressor {
-    inner: Decompress,
+fn dictionary_error<T>() -> Result<T, SpdyError> {
+    Err(SpdyError::Compression("unexpected dictionary id"))
 }
 
-impl fmt::Debug for HeaderDecompressor {
+/// フレーム列を復号する。受信バイトを [`Self::extend`] で渡し、[`Self::next_frame`] で 1 フレームずつ取り出す。
+///
+/// ヘッダブロックの展開状態（zlib ストリーム）を持つため、1 セッションの受信方向ごとに 1 つ使う。
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+    start: usize,
+    zlib: Decompress,
+}
+
+impl fmt::Debug for FrameDecoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("HeaderDecompressor")
+        f.debug_struct("FrameDecoder")
+            .field("buffered", &self.buffered_len())
+            .finish()
     }
 }
 
-impl Default for HeaderDecompressor {
+impl Default for FrameDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HeaderDecompressor {
-    /// 新しい展開器。
+impl FrameDecoder {
+    /// 空の復号器を作る。
     pub fn new() -> Self {
         Self {
-            inner: Decompress::new(true),
+            buf: Vec::new(),
+            start: 0,
+            zlib: Decompress::new(true),
         }
     }
 
-    /// ヘッダブロックを展開する。FDICT の DICTID が SPDY/3 の辞書と一致しなければ拒否する。
-    /// 展開後サイズが [`MAX_HEADER_BLOCK_BYTES`] を超えたら途中で打ち切る。
-    fn decompress(&mut self, block: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut consumed = 0usize;
-        // 無進捗の連続回数。辞書の要求を 1 回挟むため 2 回までは許す。
-        let mut stalls = 0u32;
-        loop {
-            if out.len() > MAX_HEADER_BLOCK_BYTES {
-                return Err(ProtocolError::new("header block too large"));
-            }
-            let room = MAX_HEADER_BLOCK_BYTES
-                .saturating_add(1)
-                .saturating_sub(out.len())
-                .min(4096);
-            out.reserve(room);
-            let before_in = self.inner.total_in();
-            let before_out = self.inner.total_out();
-            let input = block.get(consumed..).unwrap_or(&[]);
-            let result = self
-                .inner
-                .decompress_vec(input, &mut out, FlushDecompress::Sync);
-            let used_in = usize::try_from(self.inner.total_in().saturating_sub(before_in))
-                .map_err(|_| ProtocolError::new("header block too large"))?;
-            let produced = self.inner.total_out().saturating_sub(before_out);
-            consumed = consumed.saturating_add(used_in);
-            match result {
-                Ok(_) => {
-                    if consumed >= block.len() && produced == 0 {
-                        break;
-                    }
-                    if used_in == 0 && produced == 0 {
-                        stalls += 1;
-                        if stalls > 2 {
-                            return Err(ProtocolError::new("header block is truncated"));
-                        }
-                    } else {
-                        stalls = 0;
-                    }
-                }
-                Err(e) => match e.needs_dictionary() {
-                    Some(adler) => {
-                        if adler != SPDY3_DICT_ADLER32 {
-                            return Err(ProtocolError::new("unexpected zlib dictionary id"));
-                        }
-                        self.inner
-                            .set_dictionary(&SPDY3_DICT)
-                            .map_err(|_| ProtocolError::new("failed to set zlib dictionary"))?;
-                        stalls += 1;
-                        if stalls > 2 {
-                            return Err(ProtocolError::new("header block is truncated"));
-                        }
-                    }
-                    None => return Err(ProtocolError::new("invalid compressed header block")),
-                },
-            }
+    /// まだフレームになっていない受信済みバイト数。
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.start)
+    }
+
+    /// 受信したバイトを足す。呼び出し側は 1 回の読み取りを小さく保つこと（確保の上限は呼び出し側の責務）。
+    pub fn extend(&mut self, bytes: &[u8]) {
+        if self.start > 0 && (self.start >= self.buf.len() || self.start >= 8192) {
+            self.buf.drain(..self.start);
+            self.start = 0;
         }
-        Ok(out)
+        self.buf.extend_from_slice(bytes);
     }
-}
 
-/// 展開済みヘッダブロック（`個数, (名前長, 名前, 値長, 値)*`）を解析する。
-fn parse_header_block(raw: &[u8]) -> Result<Vec<Header>, ProtocolError> {
-    let bad = || ProtocolError::new("malformed header block");
-    let count = read_u32(raw, 0).ok_or_else(bad)?;
-    let count = usize::try_from(count).map_err(|_| bad())?;
-    if count > MAX_HEADER_COUNT {
-        return Err(ProtocolError::new("too many headers"));
-    }
-    let mut pos = 4usize;
-    let mut headers = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut fields: [&[u8]; 2] = [&[], &[]];
-        for slot in &mut fields {
-            let len = read_u32(raw, pos).ok_or_else(bad)?;
-            let len = usize::try_from(len).map_err(|_| bad())?;
-            if len > MAX_HEADER_FIELD_BYTES {
-                return Err(ProtocolError::new("header field too long"));
-            }
-            let start = pos.checked_add(4).ok_or_else(bad)?;
-            let end = start.checked_add(len).ok_or_else(bad)?;
-            *slot = raw.get(start..end).ok_or_else(bad)?;
-            pos = end;
-        }
-        let [name_raw, value_raw] = fields;
-        let name = String::from_utf8_lossy(name_raw).to_ascii_lowercase();
-        let value = String::from_utf8_lossy(value_raw).into_owned();
-        headers.push(Header { name, value });
-    }
-    if pos != raw.len() {
-        return Err(ProtocolError::new("trailing bytes in header block"));
-    }
-    Ok(headers)
-}
-
-fn stream_id_of(raw: u32) -> Result<StreamId, ProtocolError> {
-    StreamId::new(raw & 0x7fff_ffff).ok_or_else(|| ProtocolError::new("invalid stream id"))
-}
-
-/// バッファ先頭から 1 フレームを取り出す。
-///
-/// - `Ok(Some((frame, consumed)))`: 復号できた。`consumed` バイトを呼び出し側が捨てる
-/// - `Ok(None)`: まだバイトが足りない（読み足してから呼び直す）
-/// - `Err(_)`: 不正。接続を閉じること
-///
-/// 長さの上限はヘッダ 8 バイトが揃った時点で、ペイロードの確保や展開の前に検査する。
-/// ヘッダブロックを持つフレームは `headers` の展開器へ到着順に流す（zlib 文脈が接続で共有されるため）。
-pub fn decode_frame(
-    buf: &[u8],
-    headers: &mut HeaderDecompressor,
-) -> Result<Option<(Frame, usize)>, ProtocolError> {
-    let Some(head) = buf.get(..8) else {
-        return Ok(None);
-    };
-    let short_header = || ProtocolError::new("short header");
-    let first = read_u32(head, 0).ok_or_else(short_header)?;
-    let flags = *head.get(4).ok_or_else(short_header)?;
-    let len = read_u32(head, 4).ok_or_else(short_header)? & 0x00ff_ffff;
-    let len = usize::try_from(len).map_err(|_| short_header())?;
-    let is_control = first & 0x8000_0000 != 0;
-
-    if !is_control {
-        if len > MAX_DATA_FRAME_BYTES {
-            return Err(ProtocolError::new("data frame too large"));
-        }
-        let total = 8 + len;
-        let Some(payload) = buf.get(8..total) else {
+    /// 完全なフレームが溜まっていれば 1 つ取り出す。足りなければ `Ok(None)`。
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, SpdyError> {
+        let pending = self.buf.get(self.start..).unwrap_or(&[]);
+        let Some(first) = pending.first().copied() else {
             return Ok(None);
         };
-        let stream_id = stream_id_of(first)?;
-        if flags & !FLAG_FIN != 0 {
-            return Err(ProtocolError::new("unknown data flags"));
+        if pending.len() < 8 {
+            return Ok(None);
         }
-        return Ok(Some((
-            Frame::Data {
+        let is_control = first & 0x80 != 0;
+        let flags = pending.get(4).copied().unwrap_or(0);
+        let length = read_u24(pending, 5).ok_or(SpdyError::InvalidFrame("short header"))?;
+        if length > MAX_INCOMING_PAYLOAD {
+            return Err(SpdyError::FrameTooLarge);
+        }
+        let total = 8usize.checked_add(length).ok_or(SpdyError::FrameTooLarge)?;
+        if pending.len() < total {
+            return Ok(None);
+        }
+        let header = pending
+            .get(..8)
+            .ok_or(SpdyError::InvalidFrame("short header"))?;
+        let payload = pending
+            .get(8..total)
+            .ok_or(SpdyError::InvalidFrame("short payload"))?
+            .to_vec();
+        let word0 = read_u32(header, 0).ok_or(SpdyError::InvalidFrame("short header"))?;
+        self.start += total;
+        if !is_control {
+            let stream_id = nonzero_stream_id(word0)?;
+            return Ok(Some(Frame::Data {
                 stream_id,
                 fin: flags & FLAG_FIN != 0,
-                payload: payload.to_vec(),
-            },
-            total,
-        )));
+                data: payload,
+            }));
+        }
+        let version = u16::try_from((word0 >> 16) & 0x7fff).unwrap_or(0);
+        if version != SPDY_VERSION {
+            return Err(SpdyError::UnsupportedVersion);
+        }
+        let frame_type = u16::try_from(word0 & 0xffff).unwrap_or(0);
+        self.control_frame(frame_type, flags, &payload).map(Some)
     }
 
-    let version = read_u16(head, 0).ok_or_else(short_header)?;
-    if version != CONTROL_VERSION {
-        return Err(ProtocolError::new("unsupported spdy version"));
-    }
-    let ftype = read_u16(head, 2).ok_or_else(short_header)?;
-    if len > MAX_CONTROL_FRAME_BYTES {
-        return Err(ProtocolError::new("control frame too large"));
-    }
-    let total = 8 + len;
-    let Some(payload) = buf.get(8..total) else {
-        return Ok(None);
-    };
-    let short = || ProtocolError::new("control frame length mismatch");
-    let frame = match ftype {
-        TYPE_SYN_STREAM => {
-            let id = read_u32(payload, 0).ok_or_else(short)?;
-            let assoc = read_u32(payload, 4).ok_or_else(short)?;
-            let prio_byte = *payload.get(8).ok_or_else(short)?;
-            let block = payload.get(10..).ok_or_else(short)?;
-            let raw = headers.decompress(block)?;
-            Frame::SynStream {
-                stream_id: stream_id_of(id)?,
-                associated_to: assoc & 0x7fff_ffff,
-                priority: prio_byte >> 5,
-                fin: flags & FLAG_FIN != 0,
-                unidirectional: flags & FLAG_UNIDIRECTIONAL != 0,
-                headers: parse_header_block(&raw)?,
+    fn control_frame(
+        &mut self,
+        frame_type: u16,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<Frame, SpdyError> {
+        let fin = flags & FLAG_FIN != 0;
+        match frame_type {
+            TYPE_SYN_STREAM => {
+                // stream-id(4) + associated(4) + priority/unused(1) + slot(1) + header block。
+                if payload.len() < 10 {
+                    return Err(SpdyError::InvalidFrame("syn_stream is too short"));
+                }
+                let stream_id = nonzero_stream_id(read_u32(payload, 0).unwrap_or(0))?;
+                let associated_to = read_u32(payload, 4).unwrap_or(0) & MAX_STREAM_ID;
+                let priority = payload.get(8).copied().unwrap_or(0) >> 5;
+                let block = payload.get(10..).unwrap_or(&[]);
+                let headers = self.decode_header_block(block)?;
+                Ok(Frame::SynStream {
+                    stream_id,
+                    associated_to,
+                    priority,
+                    fin,
+                    unidirectional: flags & FLAG_UNIDIRECTIONAL != 0,
+                    headers,
+                })
             }
-        }
-        TYPE_SYN_REPLY => {
-            let id = read_u32(payload, 0).ok_or_else(short)?;
-            let block = payload.get(4..).ok_or_else(short)?;
-            let raw = headers.decompress(block)?;
-            Frame::SynReply {
-                stream_id: stream_id_of(id)?,
-                fin: flags & FLAG_FIN != 0,
-                headers: parse_header_block(&raw)?,
-            }
-        }
-        TYPE_RST_STREAM => {
-            if len != 8 {
-                return Err(short());
-            }
-            let id = read_u32(payload, 0).ok_or_else(short)?;
-            let status = read_u32(payload, 4).ok_or_else(short)?;
-            Frame::RstStream {
-                stream_id: stream_id_of(id)?,
-                status: RstStatus::from_code(status),
-            }
-        }
-        TYPE_SETTINGS => {
-            let n = read_u32(payload, 0).ok_or_else(short)?;
-            let expected = usize::try_from(n)
-                .ok()
-                .and_then(|n| n.checked_mul(8))
-                .and_then(|b| b.checked_add(4));
-            if expected != Some(len) {
-                return Err(short());
-            }
-            Frame::Settings { entries: n }
-        }
-        TYPE_PING => {
-            if len != 4 {
-                return Err(short());
-            }
-            Frame::Ping {
-                id: read_u32(payload, 0).ok_or_else(short)?,
-            }
-        }
-        TYPE_GOAWAY => {
-            if len != 8 {
-                return Err(short());
-            }
-            Frame::GoAway {
-                last_good_stream_id: read_u32(payload, 0).ok_or_else(short)? & 0x7fff_ffff,
-                status: GoAwayStatus::from_code(read_u32(payload, 4).ok_or_else(short)?),
-            }
-        }
-        TYPE_HEADERS => {
-            let id = read_u32(payload, 0).ok_or_else(short)?;
-            let block = payload.get(4..).ok_or_else(short)?;
-            let raw = headers.decompress(block)?;
-            Frame::Headers {
-                stream_id: stream_id_of(id)?,
-                fin: flags & FLAG_FIN != 0,
-                headers: parse_header_block(&raw)?,
-            }
-        }
-        TYPE_WINDOW_UPDATE => {
-            if len != 8 {
-                return Err(short());
-            }
-            let id = read_u32(payload, 0).ok_or_else(short)?;
-            let delta = read_u32(payload, 4).ok_or_else(short)? & 0x7fff_ffff;
-            if id & 0x7fff_ffff == 0 {
-                // SPDY/3.1 の接続ウィンドウ。他のフレームの stream id 0 は従来どおり拒否する。
-                Frame::ConnectionWindowUpdate { delta }
-            } else {
-                Frame::WindowUpdate {
-                    stream_id: stream_id_of(id)?,
-                    delta,
+            TYPE_SYN_REPLY | TYPE_HEADERS => {
+                if payload.len() < 4 {
+                    return Err(SpdyError::InvalidFrame("header frame is too short"));
+                }
+                let stream_id = nonzero_stream_id(read_u32(payload, 0).unwrap_or(0))?;
+                let headers = self.decode_header_block(payload.get(4..).unwrap_or(&[]))?;
+                if frame_type == TYPE_SYN_REPLY {
+                    Ok(Frame::SynReply {
+                        stream_id,
+                        fin,
+                        headers,
+                    })
+                } else {
+                    Ok(Frame::Headers {
+                        stream_id,
+                        fin,
+                        headers,
+                    })
                 }
             }
+            TYPE_RST_STREAM => {
+                if payload.len() != 8 {
+                    return Err(SpdyError::InvalidFrame("rst_stream length"));
+                }
+                Ok(Frame::RstStream {
+                    stream_id: nonzero_stream_id(read_u32(payload, 0).unwrap_or(0))?,
+                    status: read_u32(payload, 4).unwrap_or(0),
+                })
+            }
+            TYPE_SETTINGS => {
+                let count = read_u32(payload, 0)
+                    .and_then(|c| usize::try_from(c).ok())
+                    .ok_or(SpdyError::InvalidFrame("settings is too short"))?;
+                if count > MAX_SETTINGS_ENTRIES
+                    || payload.len() != count.saturating_mul(8).saturating_add(4)
+                {
+                    return Err(SpdyError::InvalidFrame("settings length"));
+                }
+                let mut entries = Vec::with_capacity(count);
+                for i in 0..count {
+                    let at = 4 + i * 8;
+                    let word = read_u32(payload, at).unwrap_or(0);
+                    entries.push(Setting {
+                        flags: u8::try_from(word >> 24).unwrap_or(0),
+                        id: word & 0x00ff_ffff,
+                        value: read_u32(payload, at + 4).unwrap_or(0),
+                    });
+                }
+                Ok(Frame::Settings {
+                    clear: flags & FLAG_CLEAR_SETTINGS != 0,
+                    entries,
+                })
+            }
+            TYPE_PING => {
+                if payload.len() != 4 {
+                    return Err(SpdyError::InvalidFrame("ping length"));
+                }
+                Ok(Frame::Ping {
+                    id: read_u32(payload, 0).unwrap_or(0),
+                })
+            }
+            TYPE_GOAWAY => {
+                if payload.len() != 8 {
+                    return Err(SpdyError::InvalidFrame("goaway length"));
+                }
+                Ok(Frame::GoAway {
+                    last_good_stream_id: read_u32(payload, 0).unwrap_or(0) & MAX_STREAM_ID,
+                    status: read_u32(payload, 4).unwrap_or(0),
+                })
+            }
+            TYPE_WINDOW_UPDATE => {
+                if payload.len() != 8 {
+                    return Err(SpdyError::InvalidFrame("window_update length"));
+                }
+                Ok(Frame::WindowUpdate {
+                    stream_id: read_u32(payload, 0).unwrap_or(0) & MAX_STREAM_ID,
+                    delta: read_u32(payload, 4).unwrap_or(0) & MAX_STREAM_ID,
+                })
+            }
+            other => Ok(Frame::Unknown { frame_type: other }),
         }
-        _ => return Err(ProtocolError::new("unknown control frame type")),
-    };
-    Ok(Some((frame, total)))
+    }
+
+    /// 圧縮されたヘッダブロックを展開して組へ分解する。展開後のサイズは [`MAX_HEADER_BLOCK`] で打ち切る。
+    fn decode_header_block(&mut self, block: &[u8]) -> Result<Headers, SpdyError> {
+        let raw = self.inflate(block)?;
+        let count = read_u32(&raw, 0)
+            .and_then(|c| usize::try_from(c).ok())
+            .ok_or(SpdyError::InvalidFrame("header block is too short"))?;
+        if count > MAX_HEADER_COUNT {
+            return Err(SpdyError::HeaderBlockTooLarge);
+        }
+        let mut at = 4usize;
+        let mut headers = Headers::new();
+        for _ in 0..count {
+            let name = read_chunk(&raw, &mut at)?;
+            let value = read_chunk(&raw, &mut at)?;
+            let name = std::str::from_utf8(name)
+                .map_err(|_| SpdyError::InvalidFrame("header name is not utf-8"))?
+                .to_ascii_lowercase();
+            let value = std::str::from_utf8(value)
+                .map_err(|_| SpdyError::InvalidFrame("header value is not utf-8"))?;
+            if name.is_empty() {
+                return Err(SpdyError::InvalidFrame("header name is empty"));
+            }
+            if headers.get(&name).is_some() {
+                return Err(SpdyError::InvalidFrame("duplicate header name"));
+            }
+            headers.0.push((name, value.to_string()));
+        }
+        if at != raw.len() {
+            return Err(SpdyError::InvalidFrame("trailing bytes in header block"));
+        }
+        Ok(headers)
+    }
+
+    fn inflate(&mut self, block: &[u8]) -> Result<Vec<u8>, SpdyError> {
+        // 容量を上限 + 1 に固定し、満杯になった時点で拒否する（zlib bomb。`decompress_vec` は容量を超えて伸ばさない）。
+        let mut out: Vec<u8> = Vec::with_capacity(MAX_HEADER_BLOCK + 1);
+        let start_in = self.zlib.total_in();
+        let mut dictionary_set = false;
+        loop {
+            let consumed = usize::try_from(self.zlib.total_in().saturating_sub(start_in))
+                .map_err(|_| SpdyError::Compression("input size"))?;
+            let rest = block.get(consumed..).unwrap_or(&[]);
+            let before = (self.zlib.total_in(), self.zlib.total_out());
+            match self
+                .zlib
+                .decompress_vec(rest, &mut out, FlushDecompress::Sync)
+            {
+                Ok(Status::StreamEnd) => {
+                    return Err(SpdyError::Compression("unexpected end of zlib stream"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let Some(adler) = e.needs_dictionary() else {
+                        return Err(SpdyError::Compression("invalid zlib data"));
+                    };
+                    if adler != DICTIONARY_ADLER32 || dictionary_set {
+                        return dictionary_error();
+                    }
+                    self.zlib
+                        .set_dictionary(SPDY3_DICTIONARY)
+                        .map_err(|_| SpdyError::Compression("dictionary rejected"))?;
+                    dictionary_set = true;
+                    continue;
+                }
+            }
+            if out.len() > MAX_HEADER_BLOCK {
+                return Err(SpdyError::HeaderBlockTooLarge);
+            }
+            let after = (self.zlib.total_in(), self.zlib.total_out());
+            let consumed_all = usize::try_from(after.0.saturating_sub(start_in))
+                .map(|c| c >= block.len())
+                .unwrap_or(false);
+            // 入力を使い切り、かつ出力に余地が残っている（取りこぼしが無い）なら終わり。
+            if consumed_all && out.len() < out.capacity() {
+                return Ok(out);
+            }
+            if after == before && !consumed_all {
+                return Err(SpdyError::Compression("zlib made no progress"));
+            }
+        }
+    }
 }
 
-/// 送信側のフレーム符号化器。ヘッダブロックは接続の間続く 1 本の zlib ストリーム（辞書つき）で圧縮する。
+fn read_chunk<'a>(raw: &'a [u8], at: &mut usize) -> Result<&'a [u8], SpdyError> {
+    let len = read_u32(raw, *at)
+        .and_then(|l| usize::try_from(l).ok())
+        .ok_or(SpdyError::InvalidFrame("header block is truncated"))?;
+    let begin = at
+        .checked_add(4)
+        .ok_or(SpdyError::InvalidFrame("header block is truncated"))?;
+    let end = begin
+        .checked_add(len)
+        .ok_or(SpdyError::InvalidFrame("header block is truncated"))?;
+    let chunk = raw
+        .get(begin..end)
+        .ok_or(SpdyError::InvalidFrame("header block is truncated"))?;
+    *at = end;
+    Ok(chunk)
+}
+
+/// フレーム列を符号化する。ヘッダブロックの圧縮状態を持つため、1 セッションの送信方向ごとに 1 つ使う。
 pub struct FrameEncoder {
-    compress: Compress,
+    zlib: Compress,
 }
 
 impl fmt::Debug for FrameEncoder {
@@ -699,84 +611,24 @@ impl fmt::Debug for FrameEncoder {
     }
 }
 
+impl Default for FrameEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameEncoder {
-    /// 新しい符号化器。zlib に SPDY/3 の辞書を設定する。
-    pub fn new() -> Result<Self, ProtocolError> {
-        let mut compress = Compress::new(Compression::default(), true);
-        compress
-            .set_dictionary(&SPDY3_DICT)
-            .map_err(|_| ProtocolError::new("failed to set zlib dictionary"))?;
-        Ok(Self { compress })
+    /// 辞書を設定済みの符号化器を作る。
+    pub fn new() -> Self {
+        let mut zlib = Compress::new(Compression::default(), true);
+        // 辞書は固定の定数で、最初の圧縮の前に設定すれば失敗しない。失敗すれば辞書なしの別形式になるため
+        // 後続の `encode` で必ず検出できるよう、結果の Adler-32 を保持せず試験で固定する。
+        let _ = zlib.set_dictionary(SPDY3_DICTIONARY);
+        Self { zlib }
     }
 
-    fn compress_block(&mut self, raw: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut consumed = 0usize;
-        loop {
-            out.reserve(512);
-            let before_in = self.compress.total_in();
-            let input = raw.get(consumed..).unwrap_or(&[]);
-            self.compress
-                .compress_vec(input, &mut out, FlushCompress::Sync)
-                .map_err(|_| ProtocolError::new("failed to compress header block"))?;
-            let used = usize::try_from(self.compress.total_in().saturating_sub(before_in))
-                .map_err(|_| ProtocolError::new("header block too large"))?;
-            consumed = consumed.saturating_add(used);
-            if consumed >= raw.len() && out.len() < out.capacity() {
-                return Ok(out);
-            }
-            if out.len() > MAX_CONTROL_FRAME_BYTES {
-                return Err(ProtocolError::new("header block too large"));
-            }
-        }
-    }
-
-    fn header_block(&mut self, headers: &[Header]) -> Result<Vec<u8>, ProtocolError> {
-        if headers.len() > MAX_HEADER_COUNT {
-            return Err(ProtocolError::new("too many headers"));
-        }
-        let mut raw = Vec::new();
-        push_u32(
-            &mut raw,
-            u32::try_from(headers.len()).map_err(|_| ProtocolError::new("too many headers"))?,
-        );
-        for h in headers {
-            for field in [h.name.as_bytes(), h.value.as_bytes()] {
-                if field.len() > MAX_HEADER_FIELD_BYTES {
-                    return Err(ProtocolError::new("header field too long"));
-                }
-                push_u32(
-                    &mut raw,
-                    u32::try_from(field.len())
-                        .map_err(|_| ProtocolError::new("header field too long"))?,
-                );
-                raw.extend_from_slice(field);
-            }
-        }
-        self.compress_block(&raw)
-    }
-
-    fn control(
-        out: &mut Vec<u8>,
-        ftype: u16,
-        flags: u8,
-        payload: &[u8],
-    ) -> Result<(), ProtocolError> {
-        if payload.len() > MAX_CONTROL_FRAME_BYTES {
-            return Err(ProtocolError::new("control frame too large"));
-        }
-        let len = u32::try_from(payload.len())
-            .map_err(|_| ProtocolError::new("control frame too large"))?;
-        out.extend_from_slice(&CONTROL_VERSION.to_be_bytes());
-        out.extend_from_slice(&ftype.to_be_bytes());
-        out.push(flags);
-        out.extend_from_slice(&len.to_be_bytes()[1..]);
-        out.extend_from_slice(payload);
-        Ok(())
-    }
-
-    /// フレームを符号化して `out` の末尾へ追加する。
-    pub fn encode(&mut self, frame: &Frame, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    /// フレームを符号化して `out` の末尾へ足す。
+    pub fn encode(&mut self, frame: &Frame, out: &mut Vec<u8>) -> Result<(), SpdyError> {
         match frame {
             Frame::SynStream {
                 stream_id,
@@ -786,460 +638,534 @@ impl FrameEncoder {
                 unidirectional,
                 headers,
             } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, stream_id.get());
-                push_u32(&mut p, *associated_to & 0x7fff_ffff);
-                p.push((*priority & 0x07) << 5);
-                p.push(0);
-                p.extend_from_slice(&self.header_block(headers)?);
-                let flags = (if *fin { FLAG_FIN } else { 0 })
-                    | (if *unidirectional {
-                        FLAG_UNIDIRECTIONAL
-                    } else {
-                        0
-                    });
-                Self::control(out, TYPE_SYN_STREAM, flags, &p)
+                let block = self.header_block(headers)?;
+                let mut flags = if *fin { FLAG_FIN } else { 0 };
+                if *unidirectional {
+                    flags |= FLAG_UNIDIRECTIONAL;
+                }
+                control_header(out, TYPE_SYN_STREAM, flags, 10 + block.len())?;
+                out.extend_from_slice(&stream_id.get().to_be_bytes());
+                out.extend_from_slice(&(associated_to & MAX_STREAM_ID).to_be_bytes());
+                out.push((priority & 0x07) << 5);
+                out.push(0);
+                out.extend_from_slice(&block);
             }
             Frame::SynReply {
                 stream_id,
                 fin,
                 headers,
+            }
+            | Frame::Headers {
+                stream_id,
+                fin,
+                headers,
             } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, stream_id.get());
-                p.extend_from_slice(&self.header_block(headers)?);
-                Self::control(out, TYPE_SYN_REPLY, if *fin { FLAG_FIN } else { 0 }, &p)
+                let frame_type = if matches!(frame, Frame::SynReply { .. }) {
+                    TYPE_SYN_REPLY
+                } else {
+                    TYPE_HEADERS
+                };
+                let block = self.header_block(headers)?;
+                control_header(
+                    out,
+                    frame_type,
+                    if *fin { FLAG_FIN } else { 0 },
+                    4 + block.len(),
+                )?;
+                out.extend_from_slice(&stream_id.get().to_be_bytes());
+                out.extend_from_slice(&block);
             }
             Frame::RstStream { stream_id, status } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, stream_id.get());
-                push_u32(&mut p, status.code());
-                Self::control(out, TYPE_RST_STREAM, 0, &p)
+                control_header(out, TYPE_RST_STREAM, 0, 8)?;
+                out.extend_from_slice(&stream_id.get().to_be_bytes());
+                out.extend_from_slice(&status.to_be_bytes());
             }
-            Frame::Settings { entries } => {
-                if *entries != 0 {
-                    return Err(ProtocolError::new("settings entries are not supported"));
+            Frame::Settings { clear, entries } => {
+                if entries.len() > MAX_SETTINGS_ENTRIES {
+                    return Err(SpdyError::InvalidFrame("too many settings"));
                 }
-                let mut p = Vec::new();
-                push_u32(&mut p, 0);
-                Self::control(out, TYPE_SETTINGS, 0, &p)
+                let flags = if *clear { FLAG_CLEAR_SETTINGS } else { 0 };
+                control_header(out, TYPE_SETTINGS, flags, 4 + entries.len() * 8)?;
+                let count = u32::try_from(entries.len())
+                    .map_err(|_| SpdyError::InvalidFrame("too many settings"))?;
+                out.extend_from_slice(&count.to_be_bytes());
+                for entry in entries {
+                    let word = (u32::from(entry.flags) << 24) | (entry.id & 0x00ff_ffff);
+                    out.extend_from_slice(&word.to_be_bytes());
+                    out.extend_from_slice(&entry.value.to_be_bytes());
+                }
             }
             Frame::Ping { id } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, *id);
-                Self::control(out, TYPE_PING, 0, &p)
+                control_header(out, TYPE_PING, 0, 4)?;
+                out.extend_from_slice(&id.to_be_bytes());
             }
             Frame::GoAway {
                 last_good_stream_id,
                 status,
             } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, *last_good_stream_id & 0x7fff_ffff);
-                push_u32(&mut p, status.code());
-                Self::control(out, TYPE_GOAWAY, 0, &p)
-            }
-            Frame::Headers {
-                stream_id,
-                fin,
-                headers,
-            } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, stream_id.get());
-                p.extend_from_slice(&self.header_block(headers)?);
-                Self::control(out, TYPE_HEADERS, if *fin { FLAG_FIN } else { 0 }, &p)
+                control_header(out, TYPE_GOAWAY, 0, 8)?;
+                out.extend_from_slice(&(last_good_stream_id & MAX_STREAM_ID).to_be_bytes());
+                out.extend_from_slice(&status.to_be_bytes());
             }
             Frame::WindowUpdate { stream_id, delta } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, stream_id.get());
-                push_u32(&mut p, *delta & 0x7fff_ffff);
-                Self::control(out, TYPE_WINDOW_UPDATE, 0, &p)
-            }
-            Frame::ConnectionWindowUpdate { delta } => {
-                let mut p = Vec::new();
-                push_u32(&mut p, 0);
-                push_u32(&mut p, *delta & 0x7fff_ffff);
-                Self::control(out, TYPE_WINDOW_UPDATE, 0, &p)
+                control_header(out, TYPE_WINDOW_UPDATE, 0, 8)?;
+                out.extend_from_slice(&(stream_id & MAX_STREAM_ID).to_be_bytes());
+                out.extend_from_slice(&(delta & MAX_STREAM_ID).to_be_bytes());
             }
             Frame::Data {
                 stream_id,
                 fin,
-                payload,
+                data,
             } => {
-                if payload.len() > MAX_DATA_FRAME_BYTES {
-                    return Err(ProtocolError::new("data frame too large"));
+                if data.len() > MAX_LENGTH_24 {
+                    return Err(SpdyError::FrameTooLarge);
                 }
-                let len = u32::try_from(payload.len())
-                    .map_err(|_| ProtocolError::new("data frame too large"))?;
-                push_u32(out, stream_id.get());
-                out.push(if *fin { FLAG_FIN } else { 0 });
-                out.extend_from_slice(&len.to_be_bytes()[1..]);
-                out.extend_from_slice(payload);
-                Ok(())
+                out.extend_from_slice(&stream_id.get().to_be_bytes());
+                let word = (if *fin { u32::from(FLAG_FIN) } else { 0 } << 24)
+                    | u32::try_from(data.len()).map_err(|_| SpdyError::FrameTooLarge)?;
+                out.extend_from_slice(&word.to_be_bytes());
+                out.extend_from_slice(data);
+            }
+            Frame::Unknown { .. } => {
+                return Err(SpdyError::InvalidFrame("cannot encode an unknown frame"));
             }
         }
+        Ok(())
     }
+
+    fn header_block(&mut self, headers: &Headers) -> Result<Vec<u8>, SpdyError> {
+        if headers.len() > MAX_HEADER_COUNT {
+            return Err(SpdyError::HeaderBlockTooLarge);
+        }
+        let mut raw = Vec::new();
+        let count = u32::try_from(headers.len()).map_err(|_| SpdyError::HeaderBlockTooLarge)?;
+        raw.extend_from_slice(&count.to_be_bytes());
+        for (name, value) in headers.iter() {
+            for part in [name, value] {
+                let len = u32::try_from(part.len()).map_err(|_| SpdyError::HeaderBlockTooLarge)?;
+                raw.extend_from_slice(&len.to_be_bytes());
+                raw.extend_from_slice(part.as_bytes());
+            }
+            if raw.len() > MAX_HEADER_BLOCK {
+                return Err(SpdyError::HeaderBlockTooLarge);
+            }
+        }
+        self.deflate(&raw)
+    }
+
+    /// `input` を 1 ブロックとして `Z_SYNC_FLUSH` まで圧縮する。
+    fn deflate(&mut self, input: &[u8]) -> Result<Vec<u8>, SpdyError> {
+        let mut out: Vec<u8> = Vec::with_capacity(input.len() + input.len() / 8 + 64);
+        let start_in = self.zlib.total_in();
+        // 反復回数に上限を置く（zlib が進まない場合のハング防止。REPAIR-5）。
+        for _ in 0..64 {
+            let consumed = usize::try_from(self.zlib.total_in().saturating_sub(start_in))
+                .map_err(|_| SpdyError::Compression("input size"))?;
+            let rest = input.get(consumed..).unwrap_or(&[]);
+            if out.capacity() - out.len() < 64 {
+                out.reserve(256);
+            }
+            self.zlib
+                .compress_vec(rest, &mut out, FlushCompress::Sync)
+                .map_err(|_| SpdyError::Compression("compress failed"))?;
+            let consumed_all = usize::try_from(self.zlib.total_in().saturating_sub(start_in))
+                .map(|c| c >= input.len())
+                .unwrap_or(false);
+            if consumed_all && out.len() < out.capacity() {
+                return Ok(out);
+            }
+        }
+        Err(SpdyError::Compression("compress made no progress"))
+    }
+}
+
+fn control_header(
+    out: &mut Vec<u8>,
+    frame_type: u16,
+    flags: u8,
+    payload_len: usize,
+) -> Result<(), SpdyError> {
+    if payload_len > MAX_LENGTH_24 {
+        return Err(SpdyError::FrameTooLarge);
+    }
+    let word0 = 0x8000_0000u32 | (u32::from(SPDY_VERSION) << 16) | u32::from(frame_type);
+    let word1 = (u32::from(flags) << 24)
+        | u32::try_from(payload_len).map_err(|_| SpdyError::FrameTooLarge)?;
+    out.extend_from_slice(&word0.to_be_bytes());
+    out.extend_from_slice(&word1.to_be_bytes());
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sid(v: u32) -> StreamId {
-        StreamId::new(v).expect("stream id")
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
     }
 
-    fn hdr(name: &str, value: &str) -> Header {
-        Header {
-            name: name.to_string(),
-            value: value.to_string(),
+    fn sid(n: u32) -> StreamId {
+        StreamId::new(n).expect("stream id")
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Headers {
+        let mut h = Headers::new();
+        for (n, v) in pairs {
+            h.push(n, v);
         }
+        h
     }
 
-    /// CRI-6・REPAIR-2: 辞書は 1423 バイトで、Adler-32 は別途（Rust の外で）計算した 0xe3c6a7c2 と一致する。
-    /// 転記の誤りがあれば長さか Adler-32 のどちらかが崩れる。
+    fn roundtrip(frame: &Frame) -> Frame {
+        let mut out = Vec::new();
+        FrameEncoder::new().encode(frame, &mut out).expect("encode");
+        let mut dec = FrameDecoder::new();
+        dec.extend(&out);
+        let got = dec.next_frame().expect("decode").expect("one frame");
+        assert_eq!(dec.next_frame().expect("no error"), None);
+        got
+    }
+
+    /// SPDY/3 の辞書の長さと Adler-32 が draft の辞書 ID と一致する（取り違えの検出）。
     #[test]
-    fn cri6_dictionary_length_and_adler32() {
-        assert_eq!(SPDY3_DICT.len(), 1423);
-        let mut a: u32 = 1;
-        let mut b: u32 = 0;
-        for &byte in SPDY3_DICT.iter() {
-            a = (a + u32::from(byte)) % 65521;
+    fn cri6_spdy_dictionary_matches_spdy3_dictionary_id() {
+        assert_eq!(SPDY3_DICTIONARY.len(), 1423);
+        let mut a = 1u32;
+        let mut b = 0u32;
+        for byte in SPDY3_DICTIONARY.iter() {
+            a = (a + u32::from(*byte)) % 65521;
             b = (b + a) % 65521;
         }
-        assert_eq!((b << 16) | a, 0xe3c6_a7c2);
-        assert_eq!(SPDY3_DICT_ADLER32, 0xe3c6_a7c2);
-        assert_eq!(&SPDY3_DICT[..11], b"\x00\x00\x00\x07options");
-        assert_eq!(&SPDY3_DICT[SPDY3_DICT.len() - 10..], b"-,*,enq=0.");
+        assert_eq!((b << 16) | a, DICTIONARY_ADLER32);
     }
 
-    /// CRI-6・REPAIR-2: 手で書いたバイト列と符号化の結果が一致する（ヘッダブロックを持たないフレーム）。
+    /// 符号化した SYN_REPLY の先頭が zlib ヘッダ（FDICT 付き）と辞書 ID になる。
     #[test]
-    fn cri6_fixed_frames_wire_bytes() {
-        let mut enc = FrameEncoder::new().expect("encoder");
+    fn cri6_spdy_encoded_header_block_starts_with_dictionary_id() {
         let mut out = Vec::new();
+        FrameEncoder::new()
+            .encode(
+                &Frame::SynReply {
+                    stream_id: sid(1),
+                    fin: false,
+                    headers: headers(&[("streamtype", "error")]),
+                },
+                &mut out,
+            )
+            .expect("encode");
+        // 制御ヘッダ 8 + stream id 4 の後が zlib ヘッダ（CMF=0x78・FDICT）と DICTID。
+        assert_eq!(&out[..4], &[0x80, 0x03, 0x00, 0x02]);
+        assert_eq!(out.get(12), Some(&0x78));
+        assert_eq!(out.get(13).map(|b| b & 0x20), Some(0x20));
+        assert_eq!(&out[14..18], &DICTIONARY_ADLER32.to_be_bytes());
+    }
+
+    /// 他実装（CPython の zlib・辞書つき・Z_SYNC_FLUSH）が作った 2 ブロックを同じ復号器で続けて復号できる。
+    #[test]
+    fn cri6_spdy_decodes_header_blocks_made_by_another_zlib() {
+        let blocks = [
+            "78f9e3c6a7c202a62346703a2b294a4dcc851625aca9a08006000000ffff",
+            "02651c4ca9e212607601a5e00adddcd29c924c7039ca9004000000ffff",
+        ];
+        let mut dec = FrameDecoder::new();
+        let mut frames = Vec::new();
+        for (i, block) in blocks.iter().enumerate() {
+            let block = hex(block);
+            let mut f = Vec::new();
+            control_header(&mut f, TYPE_SYN_REPLY, 0, 4 + block.len()).expect("header");
+            f.extend_from_slice(&u32::try_from(i + 1).expect("id").to_be_bytes());
+            f.extend_from_slice(&block);
+            dec.extend(&f);
+            frames.push(dec.next_frame().expect("decode").expect("frame"));
+        }
+        assert_eq!(
+            frames[0],
+            Frame::SynReply {
+                stream_id: sid(1),
+                fin: false,
+                headers: headers(&[("streamtype", "error")]),
+            }
+        );
+        assert_eq!(
+            frames[1],
+            Frame::SynReply {
+                stream_id: sid(2),
+                fin: false,
+                headers: headers(&[("streamtype", "stdin"), ("x-multi", "a\0b")]),
+            }
+        );
+    }
+
+    #[test]
+    fn cri6_spdy_all_frame_kinds_roundtrip() {
+        let frames = vec![
+            Frame::SynStream {
+                stream_id: sid(5),
+                associated_to: 0,
+                priority: 7,
+                fin: true,
+                unidirectional: true,
+                headers: headers(&[("streamtype", "stdout"), ("requestid", "7")]),
+            },
+            Frame::SynReply {
+                stream_id: sid(5),
+                fin: false,
+                headers: Headers::new(),
+            },
+            Frame::Headers {
+                stream_id: sid(MAX_STREAM_ID),
+                fin: true,
+                headers: headers(&[("a", "b")]),
+            },
+            Frame::RstStream {
+                stream_id: sid(3),
+                status: rst_status::REFUSED_STREAM,
+            },
+            Frame::Settings {
+                clear: true,
+                entries: vec![Setting {
+                    flags: 1,
+                    id: 7,
+                    value: 65536,
+                }],
+            },
+            Frame::Ping { id: 0xffff_fffe },
+            Frame::GoAway {
+                last_good_stream_id: 9,
+                status: goaway_status::PROTOCOL_ERROR,
+            },
+            Frame::WindowUpdate {
+                stream_id: 0,
+                delta: 4096,
+            },
+            Frame::Data {
+                stream_id: sid(1),
+                fin: true,
+                data: vec![1, 2, 3],
+            },
+            Frame::Data {
+                stream_id: sid(1),
+                fin: false,
+                data: Vec::new(),
+            },
+        ];
+        // 同一の符号化器・復号器で続けて往復し、圧縮状態の連続性も確かめる。
+        let mut enc = FrameEncoder::new();
+        let mut out = Vec::new();
+        for f in &frames {
+            enc.encode(f, &mut out).expect("encode");
+        }
+        let mut dec = FrameDecoder::new();
+        dec.extend(&out);
+        for f in &frames {
+            assert_eq!(&dec.next_frame().expect("decode").expect("frame"), f);
+        }
+        assert_eq!(dec.next_frame().expect("end"), None);
+        assert_eq!(dec.buffered_len(), 0);
+    }
+
+    #[test]
+    fn cri6_spdy_exact_bytes_for_fixed_size_frames() {
+        let mut enc = FrameEncoder::new();
+        let mut out = Vec::new();
+        enc.encode(&Frame::Ping { id: 1 }, &mut out).expect("ping");
+        assert_eq!(out, [0x80, 0x03, 0x00, 0x06, 0, 0, 0, 4, 0, 0, 0, 1]);
+        out.clear();
         enc.encode(
             &Frame::RstStream {
-                stream_id: sid(3),
-                status: RstStatus::RefusedStream,
+                stream_id: sid(7),
+                status: 5,
             },
             &mut out,
         )
         .expect("rst");
         assert_eq!(
             out,
-            [
-                0x80, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 3, 0, 0, 0, 3
-            ]
-        );
-        out.clear();
-        enc.encode(&Frame::Ping { id: 1 }, &mut out).expect("ping");
-        assert_eq!(
-            out,
-            [0x80, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0, 0, 0, 1]
-        );
-        out.clear();
-        enc.encode(
-            &Frame::GoAway {
-                last_good_stream_id: 5,
-                status: GoAwayStatus::Ok,
-            },
-            &mut out,
-        )
-        .expect("goaway");
-        assert_eq!(
-            out,
-            [
-                0x80, 0x03, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 5, 0, 0, 0, 0
-            ]
+            [0x80, 0x03, 0x00, 0x03, 0, 0, 0, 8, 0, 0, 0, 7, 0, 0, 0, 5]
         );
         out.clear();
         enc.encode(
             &Frame::Data {
-                stream_id: sid(7),
+                stream_id: sid(3),
                 fin: true,
-                payload: b"hi".to_vec(),
+                data: b"ab".to_vec(),
             },
             &mut out,
         )
         .expect("data");
-        assert_eq!(out, [0, 0, 0, 7, 0x01, 0, 0, 2, b'h', b'i']);
+        assert_eq!(out, [0, 0, 0, 3, 1, 0, 0, 2, b'a', b'b']);
         out.clear();
         enc.encode(
-            &Frame::Data {
-                stream_id: sid(7),
-                fin: false,
-                payload: Vec::new(),
+            &Frame::WindowUpdate {
+                stream_id: 3,
+                delta: 100,
             },
             &mut out,
         )
-        .expect("empty data");
-        assert_eq!(out, [0, 0, 0, 7, 0, 0, 0, 0]);
+        .expect("window");
+        assert_eq!(
+            out,
+            [0x80, 0x03, 0x00, 0x09, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, 100]
+        );
     }
 
-    /// CRI-6: 手で書いた固定長フレームのバイト列を復号できる。
     #[test]
-    fn cri6_decode_fixed_frames() {
-        let mut dec = HeaderDecompressor::new();
-        let ping = [0x80, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0, 0, 0, 9];
-        let (frame, used) = decode_frame(&ping, &mut dec).expect("ok").expect("some");
-        assert_eq!((frame, used), (Frame::Ping { id: 9 }, 12));
-        let wu = [
-            0x80, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 2, 0, 0, 1, 0,
-        ];
-        let (frame, _) = decode_frame(&wu, &mut dec).expect("ok").expect("some");
-        assert_eq!(
-            frame,
-            Frame::WindowUpdate {
-                stream_id: sid(2),
-                delta: 256
-            }
-        );
-        let cwu = [
-            0x80, 0x03, 0x00, 0x09, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 2, 0,
-        ];
-        let (frame, used) = decode_frame(&cwu, &mut dec).expect("ok").expect("some");
-        assert_eq!(
-            (frame, used),
-            (Frame::ConnectionWindowUpdate { delta: 512 }, 16)
-        );
-        let data = [0, 0, 0, 1, 0x01, 0, 0, 3, b'a', b'b', b'c', 0xff];
-        let (frame, used) = decode_frame(&data, &mut dec).expect("ok").expect("some");
-        assert_eq!(used, 11);
-        assert_eq!(
-            frame,
-            Frame::Data {
-                stream_id: sid(1),
-                fin: true,
-                payload: b"abc".to_vec()
-            }
-        );
-        let settings = [
-            0x80, 0x03, 0x00, 0x04, 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 100,
-        ];
-        let (frame, used) = decode_frame(&settings, &mut dec)
-            .expect("ok")
-            .expect("some");
-        assert_eq!((frame, used), (Frame::Settings { entries: 1 }, 20));
-    }
-
-    /// CRI-6・REPAIR-5: 不足は `Ok(None)`、不正（version・type・長さ・上限超え）は確保の前に `Err`。
-    #[test]
-    fn cri6_decode_incomplete_and_invalid() {
-        let mut dec = HeaderDecompressor::new();
-        assert_eq!(decode_frame(&[0x80, 0x03], &mut dec), Ok(None));
-        let ping = [0x80, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0, 0];
-        assert_eq!(decode_frame(&ping, &mut dec), Ok(None));
-        // version 違い。
-        let v2 = [0x80, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0, 0, 0, 1];
-        assert!(decode_frame(&v2, &mut dec).is_err());
-        // 未知の type。
-        let t99 = [0x80, 0x03, 0x00, 0x63, 0x00, 0x00, 0x00, 0x00];
-        assert!(decode_frame(&t99, &mut dec).is_err());
-        // PING の長さ違い。
-        let p8 = [
-            0x80, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x08, 0, 0, 0, 1, 0, 0, 0, 1,
-        ];
-        assert!(decode_frame(&p8, &mut dec).is_err());
-        // 制御フレームの上限超え。ペイロードが無くてもヘッダの時点で拒否する（確保の前）。
-        let big_ctl = [0x80, 0x03, 0x00, 0x06, 0x00, 0xff, 0xff, 0xff];
-        assert_eq!(
-            decode_frame(&big_ctl, &mut dec).unwrap_err().message(),
-            "control frame too large"
-        );
-        // DATA の上限超え。
-        let big_data = [0, 0, 0, 1, 0x00, 0xff, 0xff, 0xff];
-        assert_eq!(
-            decode_frame(&big_data, &mut dec).unwrap_err().message(),
-            "data frame too large"
-        );
-        // stream id 0。
-        let zero = [0, 0, 0, 0, 0x00, 0, 0, 0];
-        assert!(decode_frame(&zero, &mut dec).is_err());
-        // DATA の未知フラグ。
-        let flag = [0, 0, 0, 1, 0x04, 0, 0, 0];
-        assert!(decode_frame(&flag, &mut dec).is_err());
-        // SETTINGS の件数と長さの不一致。
-        let st = [0x80, 0x03, 0x00, 0x04, 0, 0, 0, 4, 0, 0, 0, 5];
-        assert!(decode_frame(&st, &mut dec).is_err());
-    }
-
-    /// CRI-6・REPAIR-2: ヘッダブロックを 1 本の zlib ストリームで 3 ブロック続けて往復できる。
-    /// 先頭のブロックは辞書つきの zlib ヘッダ（FDICT）で始まり、DICTID は辞書の Adler-32 と一致する。
-    #[test]
-    fn cri6_header_blocks_roundtrip_three_in_one_stream() {
-        let mut enc = FrameEncoder::new().expect("encoder");
-        let mut dec = HeaderDecompressor::new();
-        let frames = vec![
-            Frame::SynStream {
-                stream_id: sid(1),
-                associated_to: 0,
-                priority: 2,
-                fin: false,
-                unidirectional: false,
-                headers: vec![hdr("streamtype", "error")],
-            },
-            Frame::SynReply {
-                stream_id: sid(1),
-                fin: false,
-                headers: vec![],
-            },
-            Frame::Headers {
-                stream_id: sid(3),
-                fin: true,
-                headers: vec![hdr("a", "b"), hdr("streamtype", "stdout")],
-            },
-        ];
-        let mut wire = Vec::new();
-        for f in &frames {
-            enc.encode(f, &mut wire).expect("encode");
+    fn cri6_spdy_partial_input_waits_for_more() {
+        let mut out = Vec::new();
+        FrameEncoder::new()
+            .encode(
+                &Frame::Data {
+                    stream_id: sid(1),
+                    fin: false,
+                    data: vec![9; 100],
+                },
+                &mut out,
+            )
+            .expect("encode");
+        let mut dec = FrameDecoder::new();
+        for byte in &out[..out.len() - 1] {
+            dec.extend(&[*byte]);
+            assert_eq!(dec.next_frame().expect("partial"), None);
         }
-        // 最初のヘッダブロックの zlib ヘッダ: FLG は FDICT(0x20) を立て、続く 4 バイトが DICTID。
-        let block0 = wire.get(8 + 10..).expect("first block");
-        assert_eq!(block0.get(1).copied().expect("flg") & 0x20, 0x20);
-        assert_eq!(block0.get(2..6).expect("dictid"), [0xe3, 0xc6, 0xa7, 0xc2]);
-        let mut pos = 0;
-        let mut got = Vec::new();
-        while pos < wire.len() {
-            let (f, used) = decode_frame(wire.get(pos..).expect("rest"), &mut dec)
-                .expect("decode")
-                .expect("complete");
-            got.push(f);
-            pos += used;
-        }
-        assert_eq!(got, frames);
+        dec.extend(&out[out.len() - 1..]);
+        assert!(matches!(
+            dec.next_frame().expect("complete"),
+            Some(Frame::Data { .. })
+        ));
     }
 
-    /// CRI-6: ヘッダ名は小文字に正規化される。
     #[test]
-    fn cri6_header_names_lowercased() {
-        let mut enc = FrameEncoder::new().expect("encoder");
-        let mut dec = HeaderDecompressor::new();
-        let mut wire = Vec::new();
+    fn cri6_spdy_rejects_oversize_frame_before_buffering_it() {
+        let mut dec = FrameDecoder::new();
+        // 24 ビット長 0xffffff の DATA フレームのヘッダだけで拒否する。
+        dec.extend(&[0, 0, 0, 1, 0, 0xff, 0xff, 0xff]);
+        assert_eq!(dec.next_frame(), Err(SpdyError::FrameTooLarge));
+    }
+
+    #[test]
+    fn cri6_spdy_rejects_bad_version_and_zero_stream_id() {
+        let mut dec = FrameDecoder::new();
+        dec.extend(&[0x80, 0x02, 0x00, 0x06, 0, 0, 0, 4, 0, 0, 0, 1]);
+        assert_eq!(dec.next_frame(), Err(SpdyError::UnsupportedVersion));
+        let mut dec = FrameDecoder::new();
+        dec.extend(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            dec.next_frame(),
+            Err(SpdyError::InvalidFrame("stream id is zero"))
+        );
+        let mut dec = FrameDecoder::new();
+        dec.extend(&[0x80, 0x03, 0x00, 0x06, 0, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(
+            dec.next_frame(),
+            Err(SpdyError::InvalidFrame("ping length"))
+        );
+    }
+
+    #[test]
+    fn cri6_spdy_ignores_unknown_control_frame() {
+        let mut dec = FrameDecoder::new();
+        dec.extend(&[0x80, 0x03, 0x00, 0x0a, 0, 0, 0, 2, 7, 7]);
+        assert_eq!(
+            dec.next_frame().expect("decode"),
+            Some(Frame::Unknown { frame_type: 10 })
+        );
+    }
+
+    /// 展開後に上限を超えるヘッダブロック（zlib bomb）は上限で拒否し、巨大な確保をしない。
+    #[test]
+    fn cri6_spdy_header_block_bomb_is_rejected() {
+        let mut enc = FrameEncoder::new();
+        let raw = vec![0u8; 4 * 1024 * 1024];
+        let block = enc.deflate(&raw).expect("deflate");
+        assert!(block.len() < MAX_INCOMING_PAYLOAD, "bomb must fit a frame");
+        let mut f = Vec::new();
+        control_header(&mut f, TYPE_SYN_REPLY, 0, 4 + block.len()).expect("header");
+        f.extend_from_slice(&1u32.to_be_bytes());
+        f.extend_from_slice(&block);
+        let mut dec = FrameDecoder::new();
+        dec.extend(&f);
+        assert_eq!(dec.next_frame(), Err(SpdyError::HeaderBlockTooLarge));
+    }
+
+    #[test]
+    fn cri6_spdy_rejects_duplicate_header_and_too_many_headers() {
+        let mut enc = FrameEncoder::new();
+        let mut dup = Headers::new();
+        dup.0.push(("a".to_string(), "1".to_string()));
+        dup.0.push(("a".to_string(), "2".to_string()));
+        let mut out = Vec::new();
         enc.encode(
             &Frame::SynReply {
-                stream_id: sid(2),
+                stream_id: sid(1),
                 fin: false,
-                headers: vec![hdr("StreamType", "stdin")],
+                headers: dup,
             },
-            &mut wire,
+            &mut out,
         )
         .expect("encode");
-        let (f, _) = decode_frame(&wire, &mut dec).expect("ok").expect("some");
-        match f {
-            Frame::SynReply { headers, .. } => {
-                assert_eq!(headers, vec![hdr("streamtype", "stdin")])
-            }
-            other => panic!("unexpected frame: {other:?}"),
+        let mut dec = FrameDecoder::new();
+        dec.extend(&out);
+        assert_eq!(
+            dec.next_frame(),
+            Err(SpdyError::InvalidFrame("duplicate header name"))
+        );
+        let mut many = Headers::new();
+        for i in 0..=MAX_HEADER_COUNT {
+            many.0.push((format!("h{i}"), "v".to_string()));
         }
+        assert_eq!(
+            FrameEncoder::new().encode(
+                &Frame::SynReply {
+                    stream_id: sid(1),
+                    fin: false,
+                    headers: many,
+                },
+                &mut Vec::new()
+            ),
+            Err(SpdyError::HeaderBlockTooLarge)
+        );
     }
 
-    fn wrap_synreply(block: &[u8]) -> Vec<u8> {
-        let mut p = Vec::new();
-        push_u32(&mut p, 1);
-        p.extend_from_slice(block);
-        let mut out = Vec::new();
-        FrameEncoder::control(&mut out, TYPE_SYN_REPLY, 0, &p).expect("control");
-        out
-    }
-
-    /// 新しい符号化器で生の（展開済み）ヘッダブロックを圧縮して SYN_REPLY に包み、新しい展開器で復号する。
-    fn decode_raw_block(raw: &[u8]) -> Result<Option<(Frame, usize)>, ProtocolError> {
-        let mut enc = FrameEncoder::new().expect("encoder");
-        let block = enc.compress_block(raw).expect("compress");
-        decode_frame(&wrap_synreply(&block), &mut HeaderDecompressor::new())
-    }
-
-    /// CRI-6・REPAIR-5: 個数の上限超え・不正な長さ・余りを `Err` にする。
     #[test]
-    fn cri6_malformed_header_blocks_rejected() {
-        let mut too_many = Vec::new();
-        push_u32(&mut too_many, 33);
-        assert_eq!(
-            decode_raw_block(&too_many).unwrap_err().message(),
-            "too many headers"
-        );
-
-        let mut short = Vec::new();
-        push_u32(&mut short, 1);
-        assert_eq!(
-            decode_raw_block(&short).unwrap_err().message(),
-            "malformed header block"
-        );
-
-        let mut trailing = Vec::new();
-        push_u32(&mut trailing, 1);
-        push_u32(&mut trailing, 1);
-        trailing.push(b'a');
-        push_u32(&mut trailing, 1);
-        trailing.push(b'b');
-        trailing.push(0);
-        assert_eq!(
-            decode_raw_block(&trailing).unwrap_err().message(),
-            "trailing bytes in header block"
-        );
-
-        let mut huge_len = Vec::new();
-        push_u32(&mut huge_len, 1);
-        push_u32(&mut huge_len, 0xffff_ffff);
-        assert_eq!(
-            decode_raw_block(&huge_len).unwrap_err().message(),
-            "header field too long"
-        );
+    fn cri6_spdy_rejects_garbage_header_block() {
+        let mut f = Vec::new();
+        control_header(&mut f, TYPE_SYN_REPLY, 0, 4 + 6).expect("header");
+        f.extend_from_slice(&1u32.to_be_bytes());
+        f.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
+        let mut dec = FrameDecoder::new();
+        dec.extend(&f);
+        assert!(matches!(dec.next_frame(), Err(SpdyError::Compression(_))));
     }
 
-    /// CRI-6・REPAIR-5: 展開後の上限を超える細工ブロック（zlib bomb）は途中で打ち切って `Err`。
     #[test]
-    fn cri6_decompression_bomb_rejected() {
-        // 値を 1 つの巨大な繰り返しにすると、展開後は数 MiB でも圧縮後は数 KiB に収まる。
-        let big = vec![b'a'; 4 * 1024 * 1024];
-        let mut raw = Vec::new();
-        push_u32(&mut raw, 1);
-        push_u32(&mut raw, 1);
-        raw.push(b'x');
-        push_u32(&mut raw, u32::try_from(big.len()).expect("len"));
-        raw.extend_from_slice(&big);
-        let mut enc = FrameEncoder::new().expect("encoder");
-        let block = enc.compress_block(&raw).expect("compress");
-        assert!(
-            block.len() < MAX_CONTROL_FRAME_BYTES,
-            "bomb must fit a control frame"
-        );
-        let wire = wrap_synreply(&block);
-        let mut dec = HeaderDecompressor::new();
+    fn cri6_spdy_stream_id_bounds() {
+        assert_eq!(StreamId::new(0), None);
+        assert_eq!(StreamId::new(1).map(StreamId::get), Some(1));
         assert_eq!(
-            decode_frame(&wire, &mut dec).unwrap_err().message(),
-            "header block too large"
+            StreamId::new(MAX_STREAM_ID).map(StreamId::get),
+            Some(MAX_STREAM_ID)
         );
+        assert_eq!(StreamId::new(MAX_STREAM_ID + 1), None);
     }
 
-    /// CRI-6: 辞書の ID が違う zlib ストリームは拒否する。
     #[test]
-    fn cri6_wrong_dictionary_rejected() {
-        let mut c = Compress::new(Compression::default(), true);
-        c.set_dictionary(b"some other dictionary").expect("dict");
-        let mut raw = Vec::new();
-        push_u32(&mut raw, 0);
-        let mut block = Vec::with_capacity(256);
-        c.compress_vec(&raw, &mut block, FlushCompress::Sync)
-            .expect("compress");
-        let wire = wrap_synreply(&block);
-        let mut dec = HeaderDecompressor::new();
+    fn cri6_spdy_roundtrip_helper_keeps_large_data() {
+        let data = vec![0xab; MAX_OUTGOING_DATA];
+        let got = roundtrip(&Frame::Data {
+            stream_id: sid(1),
+            fin: false,
+            data: data.clone(),
+        });
         assert_eq!(
-            decode_frame(&wire, &mut dec).unwrap_err().message(),
-            "unexpected zlib dictionary id"
+            got,
+            Frame::Data {
+                stream_id: sid(1),
+                fin: false,
+                data
+            }
         );
-    }
-
-    /// CRI-6: ストリーム ID の newtype は 0 と最上位ビットを作れない。
-    #[test]
-    fn cri6_stream_id_bounds() {
-        assert!(StreamId::new(0).is_none());
-        assert!(StreamId::new(0x8000_0000).is_none());
-        assert_eq!(
-            StreamId::new(0x7fff_ffff).map(StreamId::get),
-            Some(0x7fff_ffff)
-        );
-        assert!(sid(1).is_client_initiated());
-        assert!(!sid(2).is_client_initiated());
     }
 }

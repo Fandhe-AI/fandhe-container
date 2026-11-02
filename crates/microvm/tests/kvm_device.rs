@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -527,4 +527,104 @@ fn kvm_device_block_queue_interrupt() {
             .code(),
         MicrovmErrorCode::Unimplemented
     );
+}
+
+/// MVM-1・TASK-75.1: mmap したゲスト RAM を memslot に登録でき、読み書きが往復し、範囲の重なる登録は拒否される。
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_register_guest_memory() {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::GuestRam;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let vm = dev.create_vm().unwrap();
+    let mut mem = GuestRam::new(2 << 20)
+        .unwrap()
+        .register(&vm, 0, GuestAddress::new(0))
+        .unwrap();
+    assert_eq!(mem.len(), 2 << 20);
+    mem.write_at(GuestAddress::new(0x1FFFFC), &[1, 2, 3, 4])
+        .unwrap();
+    assert_eq!(
+        mem.read_u32_le(GuestAddress::new(0x1FFFFC)).unwrap(),
+        0x0403_0201
+    );
+    assert!(mem.write_at(GuestAddress::new(0x1FFFFD), &[0; 4]).is_err());
+    // 範囲が重なる別 slot の登録は AlreadyExists。
+    let err = GuestRam::new(1 << 20)
+        .unwrap()
+        .register(&vm, 1, GuestAddress::new(0x100000))
+        .unwrap_err();
+    assert_eq!(err.code(), MicrovmErrorCode::AlreadyExists);
+    // 重ならない別 slot は登録できる。
+    let other = GuestRam::new(1 << 20)
+        .unwrap()
+        .register(&vm, 1, GuestAddress::new(0x4000_0000))
+        .unwrap();
+    // 登録順の逆で drop しても、VM fd より先に drop しても panic しない。
+    drop(vm);
+    drop(other);
+    drop(mem);
+}
+
+/// MVM-1・TASK-75.1: ゲストが登録済みのメモリを実際に書き、ホストから観測できる（x86_64）。
+/// リセットベクタのゲストコード `mov byte cs:[0x0100], 0x5A; hlt` が `0xFFFF_0100` へ書く。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_guest_writes_registered_memory() {
+    use fandhe_container_microvm::exit::VcpuExit;
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::GuestRam;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let run = || -> Result<u8, String> {
+            let vm = dev.create_vm().map_err(|e| e.to_string())?;
+            let mut mem = GuestRam::new(64 << 10)
+                .and_then(|r| r.register(&vm, 0, GuestAddress::new(0xFFFF_0000)))
+                .map_err(|e| e.to_string())?;
+            let code = [0x2E, 0xC6, 0x06, 0x00, 0x01, 0x5A, 0xF4];
+            mem.write_at(GuestAddress::new(0xFFFF_FFF0), &code)
+                .map_err(|e| e.to_string())?;
+            let mut vcpu = vm.create_vcpu(0).map_err(|e| e.to_string())?;
+            for _ in 0..8 {
+                match vcpu
+                    .run_once(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?
+                {
+                    VcpuExit::Interrupted => continue,
+                    VcpuExit::Hlt => {
+                        let mut b = [0u8; 1];
+                        mem.read_at(GuestAddress::new(0xFFFF_0100), &mut b)
+                            .map_err(|e| e.to_string())?;
+                        drop(vcpu);
+                        return Ok(b[0]);
+                    }
+                    other => return Err(format!("unexpected exit: {other:?}")),
+                }
+            }
+            Err("too many interrupted runs".to_string())
+        };
+        let _ = tx.send(run());
+    });
+    let byte = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("guest memory test did not finish within 30s")
+        .unwrap();
+    assert_eq!(byte, 0x5A);
 }

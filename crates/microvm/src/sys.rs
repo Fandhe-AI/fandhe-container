@@ -24,6 +24,8 @@
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` との機械照合について
+//! TASK-75.1 で匿名 mmap のゲスト RAM（`GuestRamMap`）・`madvise(MADV_DONTFORK)`・登録 / 削除のラッパーを足した
+//! （`crate::microvm` の `GuestRam`・`RegisteredGuestRam` が呼ぶ。`madvise` も `libc` 導入後は照合の対象）。
 //! 本 crate は dev-dependency に `libc` を持たず照合は未導入（追加は crate ごとの承認事項。
 //! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
@@ -104,6 +106,14 @@ pub(crate) mod consts {
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
+    /// `MAP_PRIVATE`（`asm-generic/mman-common.h`）。
+    pub const MAP_PRIVATE: i32 = 0x02;
+    /// `MAP_ANONYMOUS`（`asm-generic/mman.h`）。
+    pub const MAP_ANONYMOUS: i32 = 0x20;
+    /// `MAP_NORESERVE`（`asm-generic/mman.h`）。
+    pub const MAP_NORESERVE: i32 = 0x4000;
+    /// `MADV_DONTFORK`（`asm-generic/mman-common.h`）。
+    pub const MADV_DONTFORK: i32 = 10;
     /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IO(KVMIO, 0x60)`（x86_64 のみ定義。vCPU を作る前に発行する）。
@@ -141,6 +151,14 @@ pub(crate) mod consts {
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
+    /// `MAP_PRIVATE`（`asm-generic/mman-common.h`）。
+    pub const MAP_PRIVATE: i32 = 0x02;
+    /// `MAP_ANONYMOUS`（`asm-generic/mman.h`）。
+    pub const MAP_ANONYMOUS: i32 = 0x20;
+    /// `MAP_NORESERVE`（`asm-generic/mman.h`）。
+    pub const MAP_NORESERVE: i32 = 0x4000;
+    /// `MADV_DONTFORK`（`asm-generic/mman-common.h`）。
+    pub const MADV_DONTFORK: i32 = 10;
     /// `_IOW(KVMIO, 0xae, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_VCPU_INIT: u64 = super::iow(super::KVMIO, 0xAE, 32);
     /// `_IOR(KVMIO, 0xaf, struct kvm_vcpu_init)`（32 バイト）。
@@ -180,6 +198,10 @@ pub(crate) mod consts {
     pub const PROT_READ: i32 = 0;
     pub const PROT_WRITE: i32 = 0;
     pub const MAP_SHARED: i32 = 0;
+    pub const MAP_PRIVATE: i32 = 0;
+    pub const MAP_ANONYMOUS: i32 = 0;
+    pub const MAP_NORESERVE: i32 = 0;
+    pub const MADV_DONTFORK: i32 = 0;
     pub const KVM_CHECK_EXTENSION: u64 = 0;
     pub const KVM_IRQFD: u64 = 0;
     pub const KVM_IOEVENTFD: u64 = 0;
@@ -317,6 +339,8 @@ const _: () = {
 //   宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。LP64 で
 //   `unsigned long` は u64。可変長部は呼び出し側が u64 かポインタで渡す。
 // - `mmap` / `munmap`: LP64 で `size_t` は usize、`off_t` は i64。可変長ではない。
+// - `madvise`: `int madvise(void *addr, size_t length, int advice)`（TASK-75.1）。LP64 で `size_t` は usize。可変長ではない。
+// - `sysconf`: `long sysconf(int name)`（LP64 で `long` は i64。可変長ではない。副作用なし）。
 // - `sigaction`: `SigAction` は上の const assert（152 バイト・mask がオフセット 8・flags が 136・restorer が 144）で
 //   固定した x86_64・aarch64 の `struct sigaction` のレイアウト。第 2・3 引数は NULL 可。
 // - `pthread_sigmask`: `SigSet` は 128 バイトの `sigset_t`（上の const assert）。第 2・3 引数は NULL 可。
@@ -328,11 +352,33 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
     -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    fn sysconf(name: i32) -> i64;
     fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
     fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn pthread_self() -> u64;
     fn pthread_kill(thread: u64, sig: i32) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
+}
+
+/// `_SC_PAGESIZE`（x86_64・aarch64 Linux とも 30）。
+const SC_PAGESIZE: i32 = 30;
+
+/// ホストのページサイズ（バイト）を返す。`KVM_SET_USER_MEMORY_REGION` はサイズと GPA にこれの倍数を要求する
+/// （16 KiB / 64 KiB ページの aarch64 Linux では 4096 より大きい。MVM-1・TASK-75.1）。
+/// 取得に失敗した・2 の冪でない値は fail-closed に `SysError::Os(22)`（EINVAL）で返す。
+pub(crate) fn host_page_size() -> Result<u64, SysError> {
+    // 非対応環境（32 bit・非 glibc 等）では FFI 宣言（LP64 の `long` = i64）が成り立たないため呼ばずに拒否する。
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `sysconf` は整数 1 つを取り値を返すだけで、ポインタもメモリも触らない。`consts::SUPPORTED` で
+    // LP64 の glibc に限っているため、戻り値の `long` は宣言の i64 と一致する。
+    let n = unsafe { sysconf(SC_PAGESIZE) };
+    match u64::try_from(n) {
+        Ok(v) if v.is_power_of_two() => Ok(v),
+        _ => Err(SysError::Os(22)),
+    }
 }
 
 /// `EBUSY`（x86_64・aarch64 Linux とも 16）。
@@ -971,6 +1017,132 @@ impl Drop for RegisteredPage<'_> {
     }
 }
 
+/// 匿名 mmap で確保したゲスト RAM の所有型（TASK-75.1・MVM-1）。drop で munmap する。
+///
+/// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` のゼロ埋め私有メモリで、`MADV_DONTFORK` により fork 先へ
+/// 引き継がない（ゲストメモリの内容を子プロセスへ漏らさない）。KVM へ登録した後はゲスト（vCPU）がいつでも
+/// 書き換えるため、`&[u8]` / `&mut [u8]` は作らず、範囲検査つきのバイト単位の volatile 読み書きだけで触る。
+#[derive(Debug)]
+pub(crate) struct GuestRamMap {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: ポインタはマッピングの生存中（drop まで）有効で、スレッドに固有ではない。Rust 側は参照を一切作らず
+// すべて volatile で触り、書き込みは `&mut self` で排他的。ゲスト / カーネルによる書き込みは Rust のメモリモデルの
+// 外にあり、Rust 側の参照のエイリアシングを生まない（`KvmRunMap` とは異なり、KVM_RUN の外でもゲストが書きうる）。
+unsafe impl Send for GuestRamMap {}
+// SAFETY: 上と同じ。共有参照から行うのは volatile の読み取りだけで、Rust 側の書き込みは `&mut self` に限る。
+unsafe impl Sync for GuestRamMap {}
+
+impl GuestRamMap {
+    /// `len` バイトのゼロ埋めの私有メモリを確保する。`len` は呼び出し側が検証済み（非 0・ページ倍数・上限内）。
+    pub(crate) fn map(len: usize) -> Result<GuestRamMap, SysError> {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        if len == 0 {
+            // mmap は長さ 0 を EINVAL で拒否する。呼ばずに同じ errno を返す。
+            return Err(SysError::Os(22));
+        }
+        // SAFETY: addr に NULL を渡すためカーネルが配置を選び、既存のマッピングを上書きしない。fd は -1 / オフセット 0 で
+        // 匿名マッピングの規約どおり。戻り値は `MAP_FAILED` を比較してから使う。
+        let p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                consts::PROT_READ | consts::PROT_WRITE,
+                consts::MAP_PRIVATE | consts::MAP_ANONYMOUS | consts::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if p as usize == usize::MAX {
+            return Err(last_error());
+        }
+        let Some(ptr) = NonNull::new(p.cast::<u8>()) else {
+            // SAFETY: 直前の mmap が返した長さ `len` の領域そのもので、他に所有者がいない。
+            let _ = unsafe { munmap(p, len) };
+            return Err(SysError::NullMapping);
+        };
+        // SAFETY: `ptr` / `len` は直前の mmap が返した領域そのもの。`MADV_DONTFORK` は領域を変更せず、fork 先に
+        // マッピングを作らない指示だけを行う。
+        let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, consts::MADV_DONTFORK) };
+        if r < 0 {
+            let e = last_error();
+            // SAFETY: 上の mmap が返した領域そのもので、まだ誰にも渡しておらず他に所有者がいない。
+            let _ = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), len) };
+            return Err(e);
+        }
+        Ok(GuestRamMap { ptr, len })
+    }
+
+    /// マッピングのバイト数。
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `off..off+buf.len()` を `buf` へ volatile でコピーする。範囲外・桁あふれは `Err`。
+    pub(crate) fn read_into(&self, off: usize, buf: &mut [u8]) -> Result<(), ()> {
+        let end = off.checked_add(buf.len()).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        for (i, b) in buf.iter_mut().enumerate() {
+            // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。マッピングは
+            // `self` の生存中有効。ゲストが並行して書き換えうるため、参照を作らず volatile で 1 バイトだけ読む。
+            *b = unsafe { self.ptr.as_ptr().add(off + i).read_volatile() };
+        }
+        Ok(())
+    }
+
+    /// `data` を `off..off+data.len()` へ volatile でコピーする。範囲外・桁あふれは `Err`。
+    pub(crate) fn write_from(&mut self, off: usize, data: &[u8]) -> Result<(), ()> {
+        let end = off.checked_add(data.len()).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        for (i, b) in data.iter().enumerate() {
+            // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。マッピングは
+            // `self` の生存中有効で PROT_WRITE。ゲストが並行して読み書きしうるため、参照を作らず volatile で 1 バイトだけ書く。
+            unsafe { self.ptr.as_ptr().add(off + i).write_volatile(*b) };
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GuestRamMap {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` / `len` は `map` が成功した mmap の戻り値と長さそのもので、drop は 1 度だけ呼ばれる。
+        // KVM への登録中は `RegisteredGuestRam` が所有し、slot の削除に成功した後にだけここへ来る（失敗時は
+        // `forget` で漏らす）。失敗しても何もできず、drop で panic しないため戻り値は無視する。
+        let _ = unsafe { munmap(self.ptr.as_ptr().cast::<c_void>(), self.len) };
+    }
+}
+
+/// `ram` を `slot` / `gpa` の memslot として VM に登録する（`KVM_SET_USER_MEMORY_REGION`。flags は 0）。
+///
+/// 呼び出し側（`crate::microvm`）は、登録が成功している間 `ram` を drop せず、slot を削除してから解放する。
+pub(crate) fn register_guest_ram(
+    vm: BorrowedFd<'_>,
+    slot: u32,
+    gpa: u64,
+    ram: &GuestRamMap,
+) -> Result<(), SysError> {
+    set_user_memory_region(
+        vm,
+        slot,
+        gpa,
+        ram.len as u64,
+        ram.ptr.as_ptr() as usize as u64,
+    )
+}
+
+/// `slot` の memslot を削除する（`memory_size = 0` の再登録）。
+pub(crate) fn unregister_guest_ram(vm: BorrowedFd<'_>, slot: u32) -> Result<(), SysError> {
+    set_user_memory_region(vm, slot, 0, 0, 0)
+}
+
 /// `KVM_ARM_PREFERRED_TARGET`（VM fd）で推奨 target を得る（aarch64 のみ）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_arm_preferred_target(vm: BorrowedFd<'_>) -> Result<KvmVcpuInit, SysError> {
@@ -1201,6 +1373,67 @@ mod tests {
             f.read(&mut b).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    /// MVM-1・TASK-75.1: ゲスト RAM の mmap フラグ・madvise の定数の具体値（`asm-generic/mman*.h`）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn guest_ram_constants_match_kernel_abi() {
+        assert_eq!(consts::MAP_PRIVATE, 0x02);
+        assert_eq!(consts::MAP_ANONYMOUS, 0x20);
+        assert_eq!(consts::MAP_NORESERVE, 0x4000);
+        assert_eq!(consts::MADV_DONTFORK, 10);
+    }
+
+    /// MVM-1・TASK-75.1: ゲスト RAM はゼロ埋めで、読み書きが往復し、範囲外・桁あふれは拒否される。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn guest_ram_map_roundtrip_and_bounds() {
+        let mut m = GuestRamMap::map(8192).unwrap();
+        assert_eq!(m.len(), 8192);
+        let mut b = [0xFFu8; 8];
+        m.read_into(8184, &mut b).unwrap();
+        assert_eq!(b, [0; 8]);
+        m.write_from(4094, &[1, 2, 3, 4]).unwrap();
+        let mut r = [0u8; 4];
+        m.read_into(4094, &mut r).unwrap();
+        assert_eq!(r, [1, 2, 3, 4]);
+        assert!(m.write_from(8189, &[0; 4]).is_err());
+        assert!(m.read_into(usize::MAX, &mut [0; 4]).is_err());
+        assert!(m.write_from(8192, &[]).is_ok());
+        assert_eq!(GuestRamMap::map(0).unwrap_err(), SysError::Os(22));
+    }
+
+    /// MVM-1・TASK-75.1: drop で munmap され、`/proc/self/maps` から範囲が消える。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn guest_ram_map_is_unmapped_on_drop() {
+        let m = GuestRamMap::map(1 << 20).unwrap();
+        let start = m.ptr.as_ptr() as usize;
+        let needle = format!("{start:x}-");
+        let present = |needle: &str| {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with(needle))
+        };
+        assert!(present(&needle));
+        drop(m);
+        assert!(!present(&needle));
+    }
+
+    /// MVM-1・TASK-75.1: KVM でない fd への登録は ENOTTY で、mapping は呼び出し側に残る。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn register_guest_ram_on_non_kvm_fd_is_enotty() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        let m = GuestRamMap::map(4096).unwrap();
+        assert_eq!(
+            register_guest_ram(f.as_fd(), 0, 0, &m),
+            Err(SysError::Os(25))
+        );
+        assert_eq!(unregister_guest_ram(f.as_fd(), 0), Err(SysError::Os(25)));
     }
 
     /// MVM-1: aarch64 の vCPU 初期化 ioctl 番号。

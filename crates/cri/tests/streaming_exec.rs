@@ -22,13 +22,15 @@ use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1;
 use fandhe_container_cri::streaming::exec::{
     ExecLaunch, ExecObserver, ExecSession, ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
-    ExecStreamOutcome, TerminalResizer, TerminalSize,
+    ExecStreamOutcome, TerminalResizer,
 };
+use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_cri::streaming::spdy::{
-    Frame, FrameEncoder, GoAwayStatus, Header, HeaderDecompressor, RstStatus, StreamId,
-    decode_frame,
+    Frame, FrameDecoder, FrameEncoder, Headers, StreamId, goaway_status, rst_status,
 };
-use fandhe_container_cri::streaming::{StreamRequest, StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{
+    StreamDispatcher, StreamRequest, StreamingConfig, StreamingServer,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const STATUS_SUCCESS: &str = r#"{"metadata":{},"status":"Success"}"#;
@@ -314,9 +316,11 @@ impl Fixture {
             ExecStreamHandler::new(Arc::clone(&launcher) as Arc<dyn ExecStreamLauncher>, config)
                 .expect("handler")
                 .with_observer(Arc::clone(&obs) as Arc<dyn ExecObserver>);
+        // 共通の振り分け（StreamDispatcher）に Exec を登録する。Attach は未登録で 501 になる。
+        let dispatcher = StreamDispatcher::new().with_exec(Arc::new(handler));
         let server = StreamingServer::bind_with_handler(
             StreamingConfig::default().with_max_connections(max_connections),
-            Arc::new(handler),
+            Arc::new(dispatcher),
         )
         .await
         .expect("bind");
@@ -383,13 +387,15 @@ impl Fixture {
 }
 
 fn fast_config() -> ExecStreamConfig {
-    ExecStreamConfig {
-        stream_creation_timeout: Duration::from_secs(5),
-        idle_timeout: Duration::from_secs(30),
+    let mut config = ExecStreamConfig {
         launch_timeout: Duration::from_secs(5),
-        drain_timeout: Duration::from_secs(2),
         stdin_stall_timeout: Duration::from_secs(5),
-    }
+        ..ExecStreamConfig::default()
+    };
+    config.limits.stream_creation_timeout = Duration::from_secs(5);
+    config.limits.stream_idle_timeout = Duration::from_secs(30);
+    config.limits.drain_timeout = Duration::from_secs(2);
+    config
 }
 
 fn sid(v: u32) -> StreamId {
@@ -398,8 +404,7 @@ fn sid(v: u32) -> StreamId {
 
 struct Client {
     tcp: TcpStream,
-    rbuf: Vec<u8>,
-    dec: HeaderDecompressor,
+    dec: FrameDecoder,
     enc: FrameEncoder,
 }
 
@@ -426,15 +431,29 @@ impl Client {
             return (None, String::from_utf8_lossy(&buf).into_owned());
         };
         let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-        let rbuf = buf[end..].to_vec();
+        let mut dec = FrameDecoder::new();
+        dec.extend(&buf[end..]);
         let ok = head.starts_with("HTTP/1.1 101");
         let client = ok.then(|| Self {
             tcp,
-            rbuf,
-            dec: HeaderDecompressor::new(),
-            enc: FrameEncoder::new().expect("encoder"),
+            dec,
+            enc: FrameEncoder::new(),
         });
         (client, head)
+    }
+
+    /// 指定のサブプロトコルだけを提示して Upgrade し、応答で選ばれた版を返す。
+    fn upgrade_with_version(addr: SocketAddr, path: &str, version: &str) -> Self {
+        let extra = format!(
+            "Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: {version}\r\n"
+        );
+        let (client, head) = Self::connect_raw(addr, path, &extra);
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("x-stream-protocol-version: {version}")),
+            "head: {head}"
+        );
+        client.expect("101 switching protocols")
     }
 
     fn upgrade(addr: SocketAddr, path: &str) -> Self {
@@ -472,10 +491,11 @@ impl Client {
             priority: 0,
             fin: false,
             unidirectional: false,
-            headers: vec![Header {
-                name: "streamtype".to_string(),
-                value: streamtype.to_string(),
-            }],
+            headers: {
+                let mut h = Headers::new();
+                h.push("streamtype", streamtype);
+                h
+            },
         });
     }
 
@@ -483,21 +503,20 @@ impl Client {
         self.send(&Frame::Data {
             stream_id: sid(id),
             fin,
-            payload: payload.to_vec(),
+            data: payload.to_vec(),
         });
     }
 
     /// 次のフレーム。`None` は EOF / 切断。読み取り期限切れは失敗にする。
     fn recv(&mut self) -> Option<Frame> {
         loop {
-            if let Some((frame, used)) = decode_frame(&self.rbuf, &mut self.dec).expect("decode") {
-                self.rbuf.drain(..used);
+            if let Some(frame) = self.dec.next_frame().expect("decode") {
                 return Some(frame);
             }
             let mut tmp = [0u8; 16 * 1024];
             match self.tcp.read(&mut tmp) {
                 Ok(0) => return None,
-                Ok(n) => self.rbuf.extend_from_slice(&tmp[..n]),
+                Ok(n) => self.dec.extend(&tmp[..n]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
@@ -524,12 +543,12 @@ impl Client {
                 Frame::Data {
                     stream_id,
                     fin,
-                    payload,
+                    data,
                 } => {
                     c.data
                         .entry(stream_id.get())
                         .or_default()
-                        .extend_from_slice(&payload);
+                        .extend_from_slice(&data);
                     if fin {
                         c.fins.insert(stream_id.get());
                     }
@@ -550,8 +569,8 @@ impl Client {
 struct Collected {
     data: HashMap<u32, Vec<u8>>,
     fins: HashSet<u32>,
-    rst: Vec<(u32, RstStatus)>,
-    goaway: Option<GoAwayStatus>,
+    rst: Vec<(u32, u32)>,
+    goaway: Option<u32>,
 }
 
 impl Collected {
@@ -590,7 +609,7 @@ async fn cri6_exec_bidirectional_stdio_and_success_status() {
     for id in [1, 5, 7] {
         assert!(c.fins.contains(&id), "FIN on stream {id}");
     }
-    assert_eq!(c.goaway, Some(GoAwayStatus::Ok));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
     assert_eq!(fx.launcher.launches.load(Ordering::SeqCst), 1);
     let launch = fx
         .launcher
@@ -634,6 +653,32 @@ async fn cri6_exec_non_zero_exit_status() {
     );
 }
 
+/// CRI-6: v3 では成功時に error ストリームへ何も書かず FIN だけ、非 0 は終了コードの文になる（kubelet と同じ）。
+#[tokio::test]
+async fn cri6_exec_v3_status_is_text() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let ok_path = fx.exec_path(&["echo-exit", "0"], false, false, true, false);
+    let ng_path = fx.exec_path(&["echo-exit", "7"], false, false, true, false);
+    let addr = fx.addr();
+    let (ok, ng) = tokio::task::spawn_blocking(move || {
+        let run = |path: &str| {
+            let mut client = Client::upgrade_with_version(addr, path, "v3.channel.k8s.io");
+            client.syn(1, "error");
+            client.syn(3, "stdout");
+            client.expect_reply(1);
+            client.expect_reply(3);
+            client.collect()
+        };
+        (run(&ok_path), run(&ng_path))
+    })
+    .await
+    .expect("join");
+    assert_eq!(ok.text(1), "");
+    assert!(ok.fins.contains(&1));
+    assert_eq!(ng.text(1), "command terminated with exit code 7");
+    assert_eq!(ng.goaway, Some(goaway_status::OK));
+}
+
 /// CRI-6・REPAIR-2: 64 KiB（SPDY の初期窓）を超える 256 KiB の stdin が欠けず往復する（窓に従わない判断の回帰）。
 #[tokio::test]
 async fn cri6_exec_large_stdin_roundtrip_beyond_window() {
@@ -653,7 +698,7 @@ async fn cri6_exec_large_stdin_roundtrip_beyond_window() {
         // 受信を止めないよう、送信は別スレッド（DATA はヘッダ圧縮を使わないので別の符号化器でよい）。
         let mut writer = client.tcp.try_clone().expect("clone");
         let sender = std::thread::spawn(move || {
-            let mut enc = FrameEncoder::new().expect("encoder");
+            let mut enc = FrameEncoder::new();
             let chunks: Vec<&[u8]> = payload.chunks(32 * 1024).collect();
             let last = chunks.len() - 1;
             for (i, chunk) in chunks.iter().enumerate() {
@@ -662,7 +707,7 @@ async fn cri6_exec_large_stdin_roundtrip_beyond_window() {
                     &Frame::Data {
                         stream_id: sid(3),
                         fin: i == last,
-                        payload: chunk.to_vec(),
+                        data: chunk.to_vec(),
                     },
                     &mut out,
                 )
@@ -684,10 +729,8 @@ async fn cri6_exec_large_stdin_roundtrip_beyond_window() {
 /// CRI-6・REPAIR-5: ストリームを作らずに待つと閉じられ、launcher は呼ばれず、`StreamCreationTimeout` になる。
 #[tokio::test]
 async fn cri6_exec_stream_creation_timeout() {
-    let config = ExecStreamConfig {
-        stream_creation_timeout: Duration::from_millis(200),
-        ..fast_config()
-    };
+    let mut config = fast_config();
+    config.limits.stream_creation_timeout = Duration::from_millis(200);
     let fx = Fixture::new(config, 8).await;
     let path = fx.exec_path(&["hang"], false, false, true, false);
     let addr = fx.addr();
@@ -700,7 +743,7 @@ async fn cri6_exec_stream_creation_timeout() {
     })
     .await
     .expect("join");
-    assert_eq!(c.goaway, Some(GoAwayStatus::Ok));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
     assert_eq!(fx.launcher.launches.load(Ordering::SeqCst), 0);
     assert_eq!(
         fx.wait_outcomes(1).await,
@@ -806,9 +849,12 @@ async fn cri6_exec_rejects_unexpected_streams_and_oversized_frames() {
     assert_eq!(replies, vec![1, 5]);
     assert_eq!(
         c.rst,
-        vec![(3, RstStatus::ProtocolError), (7, RstStatus::RefusedStream)]
+        vec![
+            (3, rst_status::PROTOCOL_ERROR),
+            (7, rst_status::REFUSED_STREAM)
+        ]
     );
-    assert_eq!(c.goaway, Some(GoAwayStatus::ProtocolError));
+    assert_eq!(c.goaway, Some(goaway_status::PROTOCOL_ERROR));
     assert_eq!(
         fx.wait_outcomes(1).await,
         vec![ExecStreamOutcome::ProtocolError]
@@ -848,10 +894,8 @@ async fn cri6_exec_peer_close_drops_session() {
 /// CRI-6・REPAIR-5: 入出力が途絶えると idle の期限で閉じ、`IdleTimeout` になる。
 #[tokio::test]
 async fn cri6_exec_idle_timeout() {
-    let config = ExecStreamConfig {
-        idle_timeout: Duration::from_millis(300),
-        ..fast_config()
-    };
+    let mut config = fast_config();
+    config.limits.stream_idle_timeout = Duration::from_millis(300);
     let fx = Fixture::new(config, 8).await;
     let path = fx.exec_path(&["hang"], false, false, true, false);
     let addr = fx.addr();
@@ -865,7 +909,7 @@ async fn cri6_exec_idle_timeout() {
     })
     .await
     .expect("join");
-    assert_eq!(c.goaway, Some(GoAwayStatus::Ok));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
     assert_eq!(
         fx.wait_outcomes(1).await,
         vec![ExecStreamOutcome::IdleTimeout]
@@ -933,20 +977,20 @@ async fn cri6_exec_launch_failure_hides_details() {
     );
     assert!(!status.contains("secret-path"), "status: {status}");
     assert!(!status.contains("/var/lib"), "status: {status}");
-    assert_eq!(c.goaway, Some(GoAwayStatus::Ok));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
     assert_eq!(
         fx.wait_outcomes(1).await,
         vec![ExecStreamOutcome::LaunchFailed]
     );
 }
 
-/// CRI-6: 握手の失敗（Upgrade ヘッダ無しは 400、対応しないサブプロトコルは 403）と、Exec 以外の種別は 501 になる。
+/// CRI-6: 握手の失敗（版ヘッダ無しは 400、対応しないサブプロトコルは 403）と、未登録の種別（Attach）は 501 になる。
 #[tokio::test]
 async fn cri6_exec_handshake_errors_and_fallback() {
     let fx = Fixture::new(fast_config(), 8).await;
     let addr = fx.addr();
     let no_upgrade = fx.exec_path(&["hang"], false, false, true, false);
-    let v3_only = fx.exec_path(&["hang"], false, false, true, false);
+    let v1_only = fx.exec_path(&["hang"], false, false, true, false);
     let attach_url = fx
         .server
         .issuer()
@@ -963,8 +1007,8 @@ async fn cri6_exec_handshake_errors_and_fallback() {
         let (_, a) = Client::connect_raw(addr, &no_upgrade, "Connection: close\r\n");
         let (_, b) = Client::connect_raw(
             addr,
-            &v3_only,
-            "Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v3.channel.k8s.io\r\n",
+            &v1_only,
+            "Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v1.channel.k8s.io\r\n",
         );
         let (_, c) = Client::connect_raw(
             addr,
@@ -1004,10 +1048,8 @@ async fn cri6_exec_stdin_data_before_all_streams_is_kept() {
 /// CRI-6・REPAIR-5: 終了コード 0 でも drain の期限までに出力が閉じなければ成功にせず、失敗 Status と `OutputTruncated` にする。
 #[tokio::test]
 async fn cri6_exec_drain_expiry_is_not_success() {
-    let config = ExecStreamConfig {
-        drain_timeout: Duration::from_millis(200),
-        ..fast_config()
-    };
+    let mut config = fast_config();
+    config.limits.drain_timeout = Duration::from_millis(200);
     let fx = Fixture::new(config, 8).await;
     let path = fx.exec_path(&["exit-no-close"], false, false, true, false);
     let addr = fx.addr();

@@ -2,7 +2,7 @@
 
 CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流さず「ストリーミングサーバーの URL」を返す。kubelet / apiserver はその URL へ HTTP（SPDY/3.1 の Upgrade）で接続して入出力をやり取りする。本書は、その土台（HTTP サーバーの起動・URL 発行・トークンの失効）の設計記録である（CRI-6・TASK-63.1・#679。依存の承認は #678）。
 
-実装は `crates/cri/src/streaming.rs`（Exec は `streaming/exec.rs`、SPDY/3.1 のコーデックは `streaming/spdy.rs`）。結合試験は `crates/cri/tests/streaming_server.rs`・`crates/cri/tests/streaming_exec.rs`。
+実装は `crates/cri/src/streaming.rs`（SPDY は `streaming/spdy.rs`・`streaming/remotecommand.rs`、Attach は `streaming/attach.rs`、Exec は `streaming/exec.rs`）。結合試験は `crates/cri/tests/streaming_server.rs`・`streaming_attach.rs`・`streaming_exec.rs`。
 
 ## スコープ
 
@@ -11,8 +11,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | HTTP/1.1 サーバーの起動・ルーティング・接続の上限と期限 | 実装済み | #679 |
 | URL の発行（一意・単回使用・TTL つき） | 実装済み | #679 |
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
-| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。起動役の本番の実装は未実装） | #680（TASK-63.2） |
-| Attach | 未実装 | #681（TASK-63.3） |
+| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装で、注入が無ければ 501） | #680（TASK-63.2） |
+| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続（注入が無ければ 501） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | 後続の issue |
 
@@ -46,7 +46,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | 読み取りバッファ | 16 KiB |
 | パスの長さ | 256 バイト |
 
-Upgrade 後の idle の期限は #680〜#682 が決める。接続は 1 要求ごとに閉じる（keep-alive 無し）。
+Upgrade 後の期限（`StreamingConfig::stream_creation_timeout` 既定 30 秒・`stream_idle_timeout` 既定 4 時間。いずれも kubelet の既定。上限は 5 分・24 時間、0 は拒否）は下の「Attach」に記す。接続は 1 要求ごとに閉じる（keep-alive 無し）。
 
 ## ルーティング
 
@@ -55,54 +55,74 @@ Upgrade 後の idle の期限は #680〜#682 が決める。接続は 1 要求�
 - 未知・失効・使用済み・種別違いはすべて同じ 404 にする（区別すると探索の手がかりになる）
 - 有効なトークンの要求は `StreamHandler` に渡す。既定の `NotImplementedHandler` は 501
 
+## Attach（TASK-63.3・#681）
+
+### 構成
+
+| ファイル | 役割 |
+| -------- | ---- |
+| `streaming/spdy.rs` | SPDY/3.1 のフレーム codec。型付きの `Frame`・31 ビットの `StreamId`・辞書つき zlib のヘッダブロック。Exec（`exec.rs`）・PortForward も再利用する |
+| `streaming/spdy_dictionary.rs` | SPDY/3 の辞書 1423 バイト。出典は `NOTICE`（moby/spdystream）。Adler-32 を draft の辞書 ID（`0xe3c6a7c2`）と照合する試験がある |
+| `streaming/remotecommand.rs` | `*.channel.k8s.io` の交渉（v4・v3・v2）・`streamtype` の割り当て・`metav1.Status` の JSON・resize の JSON・`SessionLimits` |
+| `streaming/attach.rs` | `AttachHandler`（`StreamHandler`）・`AttachBackend`（注入点）・1 接続 1 タスクのセッション |
+| `streaming.rs` の `StreamDispatcher` | 種別ごとのハンドラの振り分け。未設定の種別は 501。#680・#682 は同じ型へ足す |
+
+### 交渉と流れ
+
+1. トークン照合の後、`X-Stream-Protocol-Version`（無ければ 400）から、クライアントの提示順で最初に対応する版を選ぶ（合う版が無ければ 403 と `X-Accepted-Stream-Protocol-Versions`）。次に `Connection: Upgrade` と `Upgrade: SPDY/3.1` を確認する（無ければ 400）。kubelet の `Handshake` → `UpgradeResponse` の順
+2. 101 でエコーして Upgrade。IO を受けたタスクが `ConnectionPermit` を寿命まで持つ（接続数の上限を守る）
+3. クライアントが SYN_STREAM で error・stdin・stdout・stderr（tty では resize）を `streamtype` つきで開く。サーバーは開いたものから SYN_REPLY を返す。重複は RST_STREAM(STREAM_IN_USE)、未知の種別・要求していない種別・ストリーム数超過は RST_STREAM(REFUSED_STREAM)、偶数または減少する ID は RST_STREAM(PROTOCOL_ERROR)
+4. 要求した種別が揃ったら `AttachBackend::attach`（期限 10 秒）を呼ぶ。失敗は error ストリームの Failure Status
+5. 中継。backend の stdout / stderr → DATA、DATA(stdin) → backend の stdin、FIN(stdin) → backend の stdin を shutdown、resize の JSON → backend の resize
+6. コンテナの終了で残りの出力を最大 5 秒流し、error ストリームへ Status（v4 は JSON の Success。v3・v2 は成功時に何も書かない）、未送の FIN、GOAWAY を送る（最大 5 秒）。どの終了でも backend の stdio・終了通知を drop して資源を解放する
+
+### 意図的な逸脱: flow control を強制しない
+
+SPDY/3.1 は窓（既定 64 KiB）を超える DATA の送信を禁じる。しかし client-go が使う moby/spdystream は flow control を実装せず（`WINDOW_UPDATE` を送らず、受けても "unhandled frame type" として捨てる。commit c59e5d73 の `connection.go` で確認）、窓を強制すると 64 KiB を送った時点で永久に止まる。そのため WINDOW_UPDATE・SETTINGS は受理して無視し、送信を窓で止めない。滞留はセッションの出力バッファ（128 KiB で backend の読み取りを止める）と stdin の滞留（128 KiB でクライアントの読み取りを止める）で有界にする。試験 `cri6_attach_flow_control_large_output` が 256 KiB の出力が WINDOW_UPDATE 無しで届くことを固定している。flow control を守る SPDY/3.1 クライアントは対象外（kubelet / crictl / kubectl は対象）。
+
+### 上限（外部入力）
+
+| 項目 | 値 |
+| ---- | -- |
+| 受信フレームのペイロード | 256 KiB（確保の前に検査） |
+| ヘッダブロックの展開後 | 16 KiB（zlib bomb は上限で拒否）。ヘッダ 64 組まで |
+| ストリーム | 5 本まで。同一種別は 1 本 |
+| 送信 DATA 1 フレーム | 32 KiB |
+| resize の JSON の滞留 | 4 KiB |
+| 期限 | ストリーム作成 30 秒・backend 接続 10 秒・idle 4 時間・終了後の流し切り 5 秒・最後の送出 5 秒 |
+
+違反は GOAWAY(PROTOCOL_ERROR) で閉じ、部分的に解釈して続行しない。Status の message はコード別の固定の英語で、コンテナ ID・内部のパスを含めない。
+
+### tty と stderr
+
+CRI の定義は tty のとき stderr を false に固定する。RPC（`validate_attach_request`）は守らない要求を `INVALID_ARGUMENT` にする。接続時のハンドラは kubelet の `NewOptions` に合わせ、tty の stderr を要求していないものとして扱う。RPC はさらに running でないコンテナを `FAILED_PRECONDITION`、未知を `NOT_FOUND` にする。接続時にも backend が再確認する。
+
+### Attach の本番 backend（未実装・REPAIR-3）
+
+実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立てもこれと同じ後続の issue。
+
 ## Exec（#680・TASK-63.2・CRI-6）
 
-`ExecStreamHandler`（`StreamHandler` の実装）を `StreamingServer::bind_with_handler` に渡す。`Exec` 以外の種別は `fallback`（既定 501）へ渡すので、#681・#682 は handler を連ねるだけで済む。
+`ExecStreamHandler`（`StreamHandler` の実装）を `StreamDispatcher::with_exec` で登録する（単独なら `bind_with_handler` に直接渡してもよい。Exec 以外の種別は 501）。SPDY の codec・交渉・status・resize の解析・期限（`SessionLimits`）は Attach と共通の `spdy.rs`・`remotecommand.rs` を使い、`exec.rs` に残るのは Exec 固有の部分（起動役 `ExecStreamLauncher`・プロセスの終了コードから Status への変換・stdin の stall 期限）だけである。
 
-### プロトコル（kubernetes v1.34 の kubelet / apimachinery と moby/spdystream で確認。v1.37.1 での再確認は PR 本文）
-
-- 交渉: `X-Stream-Protocol-Version` をクライアントの並び順に見て最初に `v4.channel.k8s.io` に一致した時点で採用し、応答ヘッダで返す。一致しなければ 403、`Connection: Upgrade` / `Upgrade: SPDY/3.1` が無ければ 400。サーバー側の SPDY に v5 は無い（v5 は WebSocket 用）。v1〜v3 は受けない
-- ストリーム: SYN_STREAM のヘッダ `streamtype`（小文字で比較）で `error`・`stdin`・`stdout`・`stderr`・`resize` を見分ける。受け付ける組は発行時に保存した `ExecRequest` から決める（error ＋ 要求された stdio ＋ tty なら resize）。想定外・重複・偶数 ID・単調増加でない ID は RST_STREAM で拒否し、接続は閉じない
-- 終了の通知: error ストリームへ `metav1.Status` の JSON を書く。成功は `{"metadata":{},"status":"Success"}`、非 0 は `reason: NonZeroExitCode` と `details.causes: [{"reason":"ExitCode","message":"<code>"}]`。起動失敗・待ち失敗は `reason: InternalError`・`code: 500` の固定文で、内部のパス・エラー文は載せない。続けて未 FIN の出力に FIN、GOAWAY を送り閉じる
-- resize: `{"Width":u16,"Height":u16}` を改行区切りで解析する。1 行 1 KiB まで、不正・0・範囲外は捨てる
-
-### フロー制御を採らない判断
-
-moby/spdystream は WINDOW_UPDATE を送らず、受けても無視する（未処理のフレームは debug ログだけ）。窓に従うと Go のクライアントと 64 KiB で詰まるため、こちらも送信窓には従わない。代わりに送信キューの上限（1 MiB）と、stdin をプロセスへ書き終えるまで次のフレームを読まないことで背圧を TCP に任せる。受信した WINDOW_UPDATE・SETTINGS・HEADERS は読み捨てる。試験 `cri6_exec_large_stdin_roundtrip_beyond_window` が 256 KiB の往復で回帰を見る。
-
-### 期限と上限（REPAIR-5）
-
-| 項目 | 既定 | 備考 |
-| ---- | ---- | ---- |
-| `stream_creation_timeout` | 30 秒 | 揃わなければ launcher を呼ばずに GOAWAY で閉じる |
-| `launch_timeout` | 30 秒 | |
-| `idle_timeout` | 4 時間 | 上限 24 時間。DATA の送受信で延びる（PING では延びない） |
-| `drain_timeout` | 10 秒 | 終了後に stdout / stderr を EOF まで送り切る期限 |
-| 制御フレームの長さ | 16 KiB | 確保の前に検査 |
-| DATA の長さ | 256 KiB | 同上 |
-| ヘッダ | 32 個・名前と値は各 4 KiB・展開後 64 KiB | zlib bomb 対策。展開は途中で打ち切る |
+- 交渉・ストリーム割り当ては Attach と同じ（v4・v3・v2。resize は v3 以降）。受け付ける組は発行時に保存した `ExecRequest` から決める（`StreamOptions::expected`）
+- 終了の通知: v4 は error ストリームに `metav1.Status` の JSON。成功は `{"metadata":{},"status":"Success"}`、非 0 は `reason: NonZeroExitCode` と `details.causes: [{"reason":"ExitCode","message":"<code>"}]`。v3・v2 は成功時に何も書かず、非 0 は `command terminated with exit code <code>` のテキスト（kubelet と同じ）。起動失敗・待ち失敗は `InternalError` の固定文で、内部のパス・エラー文は載せない。続けて未 FIN の出力に FIN、GOAWAY を送り閉じる
+- フロー制御は Attach と同じく強制しない（「意図的な逸脱」）。送信キュー 1 MiB の上限と、stdin をプロセスへ書き終えるまで次のフレームを読まないことで背圧を TCP に任せる。試験 `cri6_exec_large_stdin_roundtrip_beyond_window` が 256 KiB の往復を固定する
+- 期限（REPAIR-5）: `SessionLimits`（作成 30 秒・idle 4 時間・流し切り 5 秒・最後の送出 5 秒）に加え、Exec 固有の `launch_timeout`（既定 30 秒）と `stdin_stall_timeout`（既定 60 秒。溜めた stdin をプロセスが読まないとき、ソケットを読めず切断を検知できない時間の上限）
+- 受信バッファが上限を超えた場合は EOF と区別して `ProtocolError`（GOAWAY）で閉じる
 
 ### 注入トレイト `ExecStreamLauncher`
 
 core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は無い（REPAIR-3）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しは後続の issue。
 
-### zlib 辞書の出典
+## #682 ほかに残るもの
 
-SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00）§2.6.10.1 の `SPDY_dictionary_txt`（1423 バイト）を IETF 掲載のテキストから機械的に起こした。長さと Adler-32（0xe3c6a7c2）は試験で照合する。定義元は IETF Internet-Draft（プロトコルの相互運用に必須の固定バイト列）で、出典は `crates/cri/src/streaming/spdy.rs` の先頭 doc に記載した。一次情報（<https://www.ietf.org/archive/id/draft-mbelshe-httpbis-spdy-00.txt>、2026-11-02 に取得）の確認結果: Copyright Notice は「Copyright (c) 2012 IETF Trust and the persons identified as the document authors」で IETF Trust の Legal Provisions（BCP 78）に従い、「Code Components extracted from this document must include Simplified BSD License text as described in Section 4.e of the Trust Legal Provisions」と記す。文書に NOTICE に当たるものは無く、ルート `NOTICE` は変更していない。辞書が Code Components に当たるか・Simplified BSD のライセンス文の同梱方法は Agent が決めず、オーナー判断が必要な事項として PR 本文で報告する（licensing.md）。判断が出るまで承認済みとは扱わない。
-
-### 未確認
-
-- WebSocket（`v5.channel.k8s.io`）: apiserver が WebSocket を SPDY に変換して CRI のストリーミングサーバーへ流すかは未確認。本 issue では実装しない
-- 辞書のバイト列が実クライアント（kubectl / crictl）で通ることの最終確認は #683（TASK-63.5）
-
-## #681・#682 に残るもの
-
-- Attach（#681）: 握手・status JSON・resize の解析・ストリーム待ちを `exec.rs` から共通化する。`validate_attach_request` への tty と stderr の併用拒否もここ
-- PortForward（#682）
-- `container` が running か、ポートの到達性など深い意味検証
+- PortForward のハンドラ本体（SPDY の codec・`StreamDispatcher` は再利用する）
 - `ExecStreamLauncher` の本番の実装と plugin-cri からの `StreamingServer` の起動・注入
+- ポートの到達性など深い意味検証
+- WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
+- kubelet / crictl の実クライアントでの照合（#683 の実機前提試験）
 
 ## 依存
 
-`flate2 =1.1.10`（`zlib-rs`。SPDY/3.1 ヘッダの zlib 辞書。承認 #678・#406。#680 で crates/cri に追加。新しいパッケージは増えない）。
-`hyper =1.12.0`（`server`/`http1`）・`hyper-util =0.1.21`（`tokio`）・`tokio` の `net`/`time` を crates/cri に追加した（承認 #678）。いずれも `Cargo.lock` に既存で、新しいパッケージは増えない。`http-body-util`・`bytes`・`http` は直接依存にせず、`hyper` の再 export と自前の小さな本体型（`StreamBody`）で足りる範囲に留めた。
+`flate2`（zlib-rs backend。SPDY のヘッダブロックの辞書つき zlib。#681 で crates/cri の直接依存にした。承認は #678 のオーナー判断で、新しいパッケージは増えない）。`hyper =1.12.0`（`server`/`http1`）・`hyper-util =0.1.21`（`tokio`）・`tokio` の `net`/`time` を crates/cri に追加した（承認 #678）。いずれも `Cargo.lock` に既存で、新しいパッケージは増えない。`http-body-util`・`bytes`・`http` は直接依存にせず、`hyper` の再 export と自前の小さな本体型（`StreamBody`）で足りる範囲に留めた。

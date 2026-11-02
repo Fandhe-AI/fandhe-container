@@ -108,6 +108,16 @@ async fn create_container(service: &CriRuntimeService, sandbox_id: &str) -> Stri
         .container_id
 }
 
+#[cfg(unix)]
+async fn start_container(service: &CriRuntimeService, container_id: &str) {
+    service
+        .start_container(Request::new(v1::StartContainerRequest {
+            container_id: container_id.to_string(),
+        }))
+        .await
+        .expect("start container");
+}
+
 fn exec_request(container_id: &str) -> v1::ExecRequest {
     v1::ExecRequest {
         container_id: container_id.to_string(),
@@ -272,6 +282,8 @@ async fn cri6_rpcs_return_unique_urls_when_injected() {
     let service = CriRuntimeService::new().with_streaming(server.issuer());
     let sandbox = run_sandbox(&service).await;
     let container = create_container(&service, &sandbox).await;
+    // Attach は running のコンテナだけに URL を発行する（TASK-63.3）。
+    start_container(&service, &container).await;
 
     let a = service
         .exec(Request::new(exec_request(&container)))
@@ -358,6 +370,38 @@ async fn cri6_rpc_validation_errors() {
         .await
         .expect_err("not found");
     assert_eq!(unknown_pod.code(), Code::NotFound);
+
+    // Attach（TASK-63.3）: running でないコンテナは FAILED_PRECONDITION、tty と stderr の併用は INVALID_ARGUMENT。
+    let not_running = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.clone(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("not running");
+    assert_eq!(not_running.code(), Code::FailedPrecondition);
+    start_container(&service, &container).await;
+    let tty_stderr = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.clone(),
+            tty: true,
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("tty with stderr");
+    assert_eq!(tty_stderr.code(), Code::InvalidArgument);
+    let unknown_attach = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: "no-such-container".into(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("not found");
+    assert_eq!(unknown_attach.code(), Code::NotFound);
 }
 
 /// CRI-6: 乱数源の無い OS では URL を発行せず `Unavailable` を返す（弱い代替を作らない）。

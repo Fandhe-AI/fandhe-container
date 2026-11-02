@@ -1,11 +1,13 @@
-//! Exec のストリーミング本体（SPDY/3.1 上の Kubernetes remotecommand `v4.channel.k8s.io`。
+//! Exec のストリーミング本体（SPDY/3.1 上の Kubernetes remotecommand v4・v3・v2。
 //! CRI-6・TASK-63.2・#680・REPAIR-2・REPAIR-5・REPAIR-4。設計記録は `docs/design/cri-streaming-server.md`）。
 //!
-//! [`ExecStreamHandler`] は [`super::StreamHandler`] の実装で、`StreamingServer::bind_with_handler` に渡す。
-//! トークンの照合に成功した `Exec` の要求を受け、HTTP/1.1 Upgrade（`SPDY/3.1`）で 101 を返したあと、
-//! error・stdin・stdout・stderr（tty なら resize）の各ストリームを受け付け、注入された [`ExecStreamLauncher`] が
-//! 返す stdio とクライアントの間で双方向に中継する。`Exec` 以外の種別は `fallback`（既定 501）へ渡す
-//! （Attach・PortForward は #681・#682 が同じ形で連ねる）。
+//! [`ExecStreamHandler`] は [`super::StreamHandler`] の実装で、[`super::StreamDispatcher::with_exec`] で登録する
+//! （単独で `StreamingServer::bind_with_handler` に渡してもよい）。トークンの照合に成功した `Exec` の要求を受け、
+//! HTTP/1.1 Upgrade（`SPDY/3.1`）で 101 を返したあと、error・stdin・stdout・stderr（tty なら resize）の各ストリームを
+//! 受け付け、注入された [`ExecStreamLauncher`] が返す stdio とクライアントの間で双方向に中継する。
+//! SPDY のフレーム codec（[`super::spdy`]）・握手と版の選択・`streamtype` の割り当て・Status・resize の解析・
+//! 期限（[`super::remotecommand`]）は Attach（#681）と共通で、本モジュールは Exec 固有の起動・終了コードの
+//! 通知・stdin の滞留の扱いだけを持つ。
 //!
 //! ## 未実装（REPAIR-3）
 //!
@@ -16,18 +18,14 @@
 //!
 //! ## プロトコルの要点（kubernetes v1.34 の kubelet / apimachinery と moby/spdystream で確認）
 //!
-//! - 交渉: 要求ヘッダ `X-Stream-Protocol-Version` をクライアントの並び順に見て、最初に `v4.channel.k8s.io` に
-//!   一致した時点で採用する。一致しなければ 403、`Upgrade` ヘッダが無ければ 400。v1〜v3 は受けない
-//! - ストリーム: ヘッダ `streamtype`（`error`・`stdin`・`stdout`・`stderr`・`resize`）で種別を決める。
-//!   保存済みの `ExecRequest` が求める組だけを受け付け、想定外・重複は RST_STREAM で拒否する
-//! - 終了の通知: error ストリームへ `metav1.Status` の JSON を書く（成功は `Success`、非 0 は
-//!   `NonZeroExitCode` と `ExitCode` の cause）
+//! - 交渉: [`super::remotecommand::negotiate`]（v4・v3・v2。クライアントの提示順で最初に対応する版）
+//! - ストリーム: ヘッダ `streamtype` で種別を決める。保存済みの `ExecRequest` が求める組
+//!   （[`StreamOptions::expected`]）だけを受け付け、想定外・重複は RST_STREAM で拒否する
+//! - 終了の通知: error ストリームへ書く。v4 は `metav1.Status` の JSON（成功は `Success`、非 0 は
+//!   `NonZeroExitCode` と `ExitCode` の cause）。v3・v2 は成功時に何も書かず、非 0 は終了コードの文
 //! - フロー制御: moby/spdystream は WINDOW_UPDATE を送らず、受けても無視する。したがってこちらも送信窓に従わず、
 //!   受信した WINDOW_UPDATE・SETTINGS・HEADERS は読み捨てる（従うと Go のクライアントと 64 KiB で詰まる）。
 //!   代わりに送信キューの上限（[`MAX_SEND_QUEUE_BYTES`]）と stdin の書き込み待ちで背圧を TCP に任せる
-//!
-//! 共通化の候補（#681 Attach）: 握手（`negotiate_protocol`・Upgrade の確認）・status JSON・resize の解析・
-//! ストリーム待ちの組み立て。本 issue では抽象化せず `pub(crate)` に留める。
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -38,69 +36,55 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use hyper::body::Incoming;
-use hyper::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue, UPGRADE};
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 
+use super::remotecommand::{
+    HEADER_STREAM_TYPE, MAX_SESSION_STEP_TIMEOUT, Protocol, ResizeParser, SessionLimits,
+    StreamOptions, StreamType, TerminalSize, negotiate, status_success, upgrade_response,
+};
 use super::spdy::{
-    Frame, FrameEncoder, GoAwayStatus, Header, HeaderDecompressor, MAX_DATA_FRAME_BYTES,
-    ProtocolError, RstStatus, StreamId, decode_frame,
+    Frame, FrameDecoder, FrameEncoder, Headers, MAX_INCOMING_PAYLOAD, MAX_OUTGOING_DATA, SpdyError,
+    StreamId, goaway_status, rst_status,
 };
-use super::{
-    ConnectionPermit, NotImplementedHandler, StreamBody, StreamHandler, StreamRequest,
-    plain_response,
-};
+use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
 use crate::error::CriError;
 use crate::runtime::v1;
 
-/// 採用する唯一のサブプロトコル（remotecommand v4。error ストリームに JSON の Status を書く）。
-pub const EXEC_PROTOCOL_V4: &str = "v4.channel.k8s.io";
 /// 送信キュー（未送信バイト）の上限。超えそうなときは stdout / stderr を読まない（背圧）。
 pub const MAX_SEND_QUEUE_BYTES: usize = 1024 * 1024;
-/// stdout / stderr を 1 DATA フレームにする最大バイト数。
-const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 /// `pump_output` が 1 回の呼び出しで読む回数の上限（stdout / stderr の公平化。1 周回 128 KiB まで）。
 const MAX_OUTPUT_READS_PER_ROUND: usize = 4;
 /// 受信バッファの 1 回の読み取りサイズ。
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// 受信バッファの上限（最大の DATA フレーム + ヘッダ + 1 回の読み取り分）。
-const MAX_RECV_BUF_BYTES: usize = MAX_DATA_FRAME_BYTES + 8 + READ_CHUNK_BYTES;
-/// resize ストリームの 1 行の上限（バイト）。
+const MAX_RECV_BUF_BYTES: usize = MAX_INCOMING_PAYLOAD + 8 + READ_CHUNK_BYTES;
 /// 1 回の `poll_run` で進展が続いても回す周回数の上限。超えたら wake して譲る。
 const MAX_POLL_ROUNDS: usize = 32;
-
-const MAX_RESIZE_LINE_BYTES: usize = 1024;
 /// ストリームが揃う前に届いた stdin の DATA を保持する上限（バイト）。超えたら ProtocolError。
 const MAX_EARLY_STDIN_BYTES: usize = 256 * 1024;
 /// ストリームが揃う前に保持する resize の DATA の上限（バイト）。
 const MAX_EARLY_RESIZE_BYTES: usize = 16 * 1024;
-/// `X-Stream-Protocol-Version` などの複数値ヘッダで見る値の個数の上限。
-const MAX_HEADER_VALUES: usize = 16;
-/// 1 つのヘッダ値から見るカンマ区切りの要素数の上限と、各要素の長さの上限。
-const MAX_TOKENS_PER_HEADER: usize = 16;
-const MAX_TOKEN_BYTES: usize = 64;
-/// 終了時の GOAWAY・状態の書き出しとシャットダウンの待ちの上限（REPAIR-5）。
-const FINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-/// `idle_timeout` の上限（kubelet の既定 4 時間を大きく超えない範囲）。
-pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// 保持した resize を [`ResizeParser`] へ渡す 1 回の大きさ（パーサーの滞留上限 4 KiB を超えないようにする）。
+const EARLY_RESIZE_REPLAY_CHUNK: usize = 1024;
 
 type BoxedRead = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin>;
 type ExitFuture = Pin<Box<dyn Future<Output = Result<i32, CriError>> + Send>>;
 
 /// Exec セッションの設定。既定値は安全側（kubelet の既定に合わせた期限）。
+///
+/// ストリーム作成・idle・流し切り・最後の送出の期限は Attach と共通の [`SessionLimits`]
+/// （`StreamingConfig::session_limits()` の値を渡す）で、Exec 固有のものだけを足す。
+/// `limits.backend_timeout` は Attach 用で、Exec は [`Self::launch_timeout`] を使う。
 #[derive(Debug, Clone)]
 pub struct ExecStreamConfig {
-    /// Upgrade 後、必要なストリームが揃うまでの期限。既定 30 秒（kubelet の `DefaultStreamCreationTimeout`）。
-    pub stream_creation_timeout: Duration,
-    /// 入出力が途絶えてから閉じるまでの期限。既定 4 時間（kubelet の `StreamIdleTimeout`）。上限は [`MAX_IDLE_TIMEOUT`]。
-    pub idle_timeout: Duration,
+    /// Attach と共通の期限。
+    pub limits: SessionLimits,
     /// [`ExecStreamLauncher::launch`] の期限。既定 30 秒。
     pub launch_timeout: Duration,
-    /// プロセス終了後に stdout / stderr を EOF まで読み切る期限。既定 10 秒。
-    pub drain_timeout: Duration,
     /// 溜めた stdin をプロセスが読まないまま進展しない場合に閉じるまでの期限。既定 60 秒。
     /// 書き込み待ちの間はソケットを読まない（背圧）ため、クライアントの切断を検知できない時間の上限になる。
     pub stdin_stall_timeout: Duration,
@@ -109,10 +93,8 @@ pub struct ExecStreamConfig {
 impl Default for ExecStreamConfig {
     fn default() -> Self {
         Self {
-            stream_creation_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(4 * 60 * 60),
+            limits: SessionLimits::default(),
             launch_timeout: Duration::from_secs(30),
-            drain_timeout: Duration::from_secs(10),
             stdin_stall_timeout: Duration::from_secs(60),
         }
     }
@@ -121,23 +103,16 @@ impl Default for ExecStreamConfig {
 impl ExecStreamConfig {
     /// 0 の期限と上限超えを拒否する（fail-closed）。
     pub fn validate(&self) -> Result<(), CriError> {
+        self.limits.validate()?;
         for (name, d) in [
-            ("stream_creation_timeout", self.stream_creation_timeout),
-            ("idle_timeout", self.idle_timeout),
             ("launch_timeout", self.launch_timeout),
-            ("drain_timeout", self.drain_timeout),
             ("stdin_stall_timeout", self.stdin_stall_timeout),
         ] {
-            if d.is_zero() {
+            if d.is_zero() || d > MAX_SESSION_STEP_TIMEOUT {
                 return Err(CriError::invalid_argument(format!(
-                    "{name} must be greater than zero"
+                    "{name} must be between 1ns and 600s"
                 )));
             }
-        }
-        if self.idle_timeout > MAX_IDLE_TIMEOUT {
-            return Err(CriError::invalid_argument(
-                "idle_timeout exceeds the maximum",
-            ));
         }
         Ok(())
     }
@@ -158,15 +133,6 @@ pub struct ExecLaunch {
     pub stdout: bool,
     /// stderr を接続するか（tty のときは false）。
     pub stderr: bool,
-}
-
-/// 端末のサイズ（resize ストリームで届く）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TerminalSize {
-    /// 桁数。
-    pub width: u16,
-    /// 行数。
-    pub height: u16,
 }
 
 /// pty のサイズ変更の受け口。
@@ -264,7 +230,6 @@ pub struct ExecStreamHandler {
     launcher: Arc<dyn ExecStreamLauncher>,
     config: ExecStreamConfig,
     observer: Arc<dyn ExecObserver>,
-    fallback: Arc<dyn StreamHandler>,
 }
 
 impl fmt::Debug for ExecStreamHandler {
@@ -276,7 +241,7 @@ impl fmt::Debug for ExecStreamHandler {
 }
 
 impl ExecStreamHandler {
-    /// 設定を検証して作る。`Exec` 以外は 501 を返す既定の fallback へ渡す。
+    /// 設定を検証して作る。
     pub fn new(
         launcher: Arc<dyn ExecStreamLauncher>,
         config: ExecStreamConfig,
@@ -286,7 +251,6 @@ impl ExecStreamHandler {
             launcher,
             config,
             observer: Arc::new(NoopExecObserver),
-            fallback: Arc::new(NotImplementedHandler),
         })
     }
 
@@ -296,35 +260,17 @@ impl ExecStreamHandler {
         self
     }
 
-    /// `Exec` 以外の種別の処理口を差し替える（Attach・PortForward の handler を連ねる）。
-    pub fn with_fallback(mut self, fallback: Arc<dyn StreamHandler>) -> Self {
-        self.fallback = fallback;
-        self
-    }
-
     fn handle_exec(
         &self,
         req: v1::ExecRequest,
         http: Request<Incoming>,
         permit: ConnectionPermit,
     ) -> Response<StreamBody> {
-        let headers = http.headers();
-        if !header_has_token(headers, &CONNECTION, "upgrade")
-            || !header_has_token(headers, &UPGRADE, "spdy/3.1")
-        {
-            return plain_response(
-                StatusCode::BAD_REQUEST,
-                "unable to upgrade: missing upgrade headers in request",
-            );
-        }
-        let protocol_header = HeaderName::from_static("x-stream-protocol-version");
-        let Some(protocol) = negotiate_protocol(headers, &protocol_header) else {
-            return plain_response(
-                StatusCode::FORBIDDEN,
-                "unable to upgrade: unsupported stream protocol, supported: v4.channel.k8s.io",
-            );
+        let protocol = match negotiate(http.headers()) {
+            Ok(protocol) => protocol,
+            Err(e) => return e.into_response(),
         };
-
+        let options = StreamOptions::new(req.stdin, req.stdout, req.stderr, req.tty);
         let on_upgrade = hyper::upgrade::on(http);
         let launcher = Arc::clone(&self.launcher);
         let observer = Arc::clone(&self.observer);
@@ -333,7 +279,15 @@ impl ExecStreamHandler {
             let started = Instant::now();
             let outcome = match on_upgrade.await {
                 Ok(upgraded) => {
-                    run_exec_session(TokioIo::new(upgraded), &req, launcher.as_ref(), &config).await
+                    run_exec_session(
+                        TokioIo::new(upgraded),
+                        protocol,
+                        options,
+                        &req,
+                        launcher.as_ref(),
+                        &config,
+                    )
+                    .await
                 }
                 Err(_) => ExecStreamOutcome::PeerClosed,
             };
@@ -341,14 +295,7 @@ impl ExecStreamHandler {
             // 枠は IO の寿命まで保持する（#679 の契約。落とすと同時接続数の上限が破れる）。
             drop(permit);
         });
-
-        let mut response = Response::new(StreamBody::empty());
-        *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-        let h = response.headers_mut();
-        h.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-        h.insert(UPGRADE, HeaderValue::from_static("SPDY/3.1"));
-        h.insert(protocol_header, HeaderValue::from_static(protocol));
-        response
+        upgrade_response(protocol)
     }
 }
 
@@ -359,91 +306,80 @@ impl StreamHandler for ExecStreamHandler {
         http: Request<Incoming>,
         permit: ConnectionPermit,
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
-        match request {
-            StreamRequest::Exec(req) => {
-                Box::pin(async move { self.handle_exec(req, http, permit) })
+        Box::pin(async move {
+            match request {
+                StreamRequest::Exec(req) => self.handle_exec(req, http, permit),
+                // 振り分けの誤り。到達しないが、別種別の要求を処理せず固定の応答にする。
+                _ => plain_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
             }
-            other => self.fallback.handle(other, http, permit),
-        }
+        })
     }
 }
 
-/// 複数値・カンマ区切りのヘッダに `token` が（大文字小文字を区別せず）含まれるか。個数・長さに上限を付けて見る。
-fn header_has_token(headers: &HeaderMap, name: &HeaderName, token: &str) -> bool {
-    headers
-        .get_all(name)
-        .iter()
-        .take(MAX_HEADER_VALUES)
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(',').take(MAX_TOKENS_PER_HEADER))
-        .any(|t| t.trim().eq_ignore_ascii_case(token))
-}
+/// 内部エラーの Status（v4 は JSON）。詳細（パス・内部のエラー文）は載せない。
+const STATUS_INTERNAL_ERROR_V4: &str = r#"{"metadata":{},"status":"Failure","message":"Internal error occurred: error executing command in container","reason":"InternalError","details":{"causes":[{"message":"error executing command in container"}]},"code":500}"#;
+/// 内部エラーの Status（v3・v2 は error ストリームにメッセージのテキストを書く）。
+const STATUS_INTERNAL_ERROR_TEXT: &str = "error executing command in container";
 
-/// `X-Stream-Protocol-Version` をクライアントの並び順に見て、対応するものがあれば返す（無ければ `None`）。
-pub(crate) fn negotiate_protocol(headers: &HeaderMap, name: &HeaderName) -> Option<&'static str> {
-    headers
-        .get_all(name)
-        .iter()
-        .take(MAX_HEADER_VALUES)
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(',').take(MAX_TOKENS_PER_HEADER))
-        .map(str::trim)
-        .filter(|t| t.len() <= MAX_TOKEN_BYTES)
-        .find(|t| *t == EXEC_PROTOCOL_V4)
-        .map(|_| EXEC_PROTOCOL_V4)
-}
-
-/// 成功の Status（kubelet の `metav1.Status{Status: Success}` の JSON）。
-pub(crate) const STATUS_SUCCESS: &str = r#"{"metadata":{},"status":"Success"}"#;
-
-/// 内部エラーの Status。詳細（パス・内部のエラー文）は載せない。
-pub(crate) const STATUS_INTERNAL_ERROR: &str = r#"{"metadata":{},"status":"Failure","message":"Internal error occurred: error executing command in container","reason":"InternalError","details":{"causes":[{"message":"error executing command in container"}]},"code":500}"#;
-
-/// 非 0 終了の Status（kubelet の `NonZeroExitCode`・`ExitCode` の cause。client-go が終了コードを読む）。
-pub(crate) fn status_non_zero_exit(code: i32) -> String {
-    format!(
-        r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with non-zero exit code: command terminated with exit code {code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{code}"}}]}}}}"#
-    )
-}
-
-/// resize ストリームの 1 行（`{"Width":80,"Height":24}`）を解析する。不正・範囲外・0 は `None`。
-pub(crate) fn parse_resize_line(line: &[u8]) -> Option<TerminalSize> {
-    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
-    let width = u16::try_from(value.get("Width")?.as_u64()?).ok()?;
-    let height = u16::try_from(value.get("Height")?.as_u64()?).ok()?;
-    if width == 0 || height == 0 {
-        return None;
+/// 内部エラーの Status。
+fn status_internal_error(protocol: Protocol) -> Vec<u8> {
+    match protocol {
+        Protocol::V4 => STATUS_INTERNAL_ERROR_V4.as_bytes().to_vec(),
+        Protocol::V3 | Protocol::V2 => STATUS_INTERNAL_ERROR_TEXT.as_bytes().to_vec(),
     }
-    Some(TerminalSize { width, height })
+}
+
+/// プロセスの終了コードを error ストリームへ書く内容にする。`None` は何も書かない（v3・v2 の成功）。
+///
+/// 非 0 の v4 は kubelet の `NonZeroExitCode`・`ExitCode` の cause（client-go が終了コードを読む）、
+/// v3・v2 は kubelet の `ExitError` と同じ `command terminated with exit code N` のテキスト。
+fn status_exit(protocol: Protocol, code: i32) -> Option<Vec<u8>> {
+    if code == 0 {
+        return status_success(protocol);
+    }
+    Some(match protocol {
+        Protocol::V4 => format!(
+            r#"{{"metadata":{{}},"status":"Failure","message":"command terminated with non-zero exit code: command terminated with exit code {code}","reason":"NonZeroExitCode","details":{{"causes":[{{"reason":"ExitCode","message":"{code}"}}]}}}}"#
+        )
+        .into_bytes(),
+        Protocol::V3 | Protocol::V2 => format!("command terminated with exit code {code}").into_bytes(),
+    })
+}
+
+/// 読み取りの停止理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadStop {
+    /// 受信バッファが上限に達した（EOF と区別して ProtocolError にする）。
+    Overflow,
+    /// 下位 IO の読み取りエラー（切断として扱う）。
+    Io,
 }
 
 /// 接続の入出力（SPDY のフレームの組み立て・送信キュー・受信バッファ）。
 struct Conn<T> {
     io: T,
-    rbuf: Vec<u8>,
     wbuf: Vec<u8>,
     wpos: usize,
-    dec: HeaderDecompressor,
+    dec: FrameDecoder,
     enc: FrameEncoder,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
-    fn new(io: T) -> Result<Self, ProtocolError> {
-        Ok(Self {
+    fn new(io: T) -> Self {
+        Self {
             io,
-            rbuf: Vec::new(),
             wbuf: Vec::new(),
             wpos: 0,
-            dec: HeaderDecompressor::new(),
-            enc: FrameEncoder::new()?,
-        })
+            dec: FrameDecoder::new(),
+            enc: FrameEncoder::new(),
+        }
     }
 
     fn pending_write(&self) -> usize {
         self.wbuf.len().saturating_sub(self.wpos)
     }
 
-    fn queue(&mut self, frame: &Frame) -> Result<(), ProtocolError> {
+    fn queue(&mut self, frame: &Frame) -> Result<(), SpdyError> {
         // 送信済み領域を追記前に取り除く。取り除かないと、書き込みが Pending のまま
         // 少量ずつ部分送信が進む場合に wbuf が累積送信量で増え、送信キューの上限
         // （MAX_SEND_QUEUE_BYTES）が未送信量しか数えないため無制限に伸びる。
@@ -475,36 +411,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
     }
 
     /// 受信バッファから 1 フレームを取り出す。
-    fn try_next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
-        match decode_frame(&self.rbuf, &mut self.dec)? {
-            Some((frame, used)) => {
-                self.rbuf.drain(..used);
-                Ok(Some(frame))
-            }
-            None => Ok(None),
-        }
+    fn try_next_frame(&mut self) -> Result<Option<Frame>, SpdyError> {
+        self.dec.next_frame()
     }
 
     /// ソケットから読み足す。`Ready(Ok(0))` は EOF。
-    fn poll_read_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        if self.rbuf.len() >= MAX_RECV_BUF_BYTES {
-            return Poll::Ready(Err(io::Error::from(io::ErrorKind::InvalidData)));
+    fn poll_read_more(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, ReadStop>> {
+        if self.dec.buffered_len() >= MAX_RECV_BUF_BYTES {
+            return Poll::Ready(Err(ReadStop::Overflow));
         }
         let mut tmp = [0u8; READ_CHUNK_BYTES];
         let mut buf = ReadBuf::new(&mut tmp);
         match Pin::new(&mut self.io).poll_read(cx, &mut buf) {
             Poll::Ready(Ok(())) => {
                 let filled = buf.filled();
-                self.rbuf.extend_from_slice(filled);
+                self.dec.extend(filled);
                 Poll::Ready(Ok(filled.len()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(ReadStop::Io)),
             Poll::Pending => Poll::Pending,
         }
     }
 
     /// 次のフレームを待つ。`Ok(None)` は EOF または読み取りエラー（切断）。
-    async fn next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
+    async fn next_frame(&mut self) -> Result<Option<Frame>, SpdyError> {
         poll_fn(|cx| {
             loop {
                 match self.try_next_frame() {
@@ -514,7 +444,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
                 }
                 match self.poll_read_more(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return Poll::Ready(Ok(None)),
+                    Poll::Ready(Ok(0)) | Poll::Ready(Err(ReadStop::Io)) => {
+                        return Poll::Ready(Ok(None));
+                    }
+                    Poll::Ready(Err(ReadStop::Overflow)) => {
+                        return Poll::Ready(Err(SpdyError::FrameTooLarge));
+                    }
                     Poll::Ready(Ok(_)) => {}
                 }
             }
@@ -527,12 +462,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
     }
 
     /// GOAWAY を送って期限つきで書き出し、シャットダウンする（失敗は無視。後始末の最善努力）。
-    async fn goodbye(&mut self, last_good: u32, status: GoAwayStatus) {
+    async fn goodbye(&mut self, last_good: u32, status: u32, timeout: Duration) {
         let _ = self.queue(&Frame::GoAway {
             last_good_stream_id: last_good,
             status,
         });
-        let _ = tokio::time::timeout(FINAL_FLUSH_TIMEOUT, async {
+        let _ = tokio::time::timeout(timeout, async {
             let _ = self.flush().await;
             let _ = poll_fn(|cx| Pin::new(&mut self.io).poll_shutdown(cx)).await;
         })
@@ -561,40 +496,30 @@ struct Streams {
     last_id: u32,
 }
 
-/// 求められるストリームの組（保存済みの要求から決める。通信路の内容は使わない）。
-#[derive(Debug, Clone, Copy)]
-struct Need {
-    stdin: bool,
-    stdout: bool,
-    stderr: bool,
-    resize: bool,
-}
-
-impl Need {
-    fn from_request(req: &v1::ExecRequest) -> Self {
-        Self {
-            stdin: req.stdin,
-            stdout: req.stdout,
-            // tty では stderr ストリームを作らない（kubelet と同じ。tty と stderr の併用は発行時に拒否済み）。
-            stderr: req.stderr && !req.tty,
-            resize: req.tty,
+impl Streams {
+    fn slot(&mut self, kind: StreamType) -> &mut Option<StreamId> {
+        match kind {
+            StreamType::Error => &mut self.error,
+            StreamType::Stdin => &mut self.stdin,
+            StreamType::Stdout => &mut self.stdout,
+            StreamType::Stderr => &mut self.stderr,
+            StreamType::Resize => &mut self.resize,
         }
     }
 
-    fn complete(&self, s: &Streams) -> bool {
-        s.error.is_some()
-            && (!self.stdin || s.stdin.is_some())
-            && (!self.stdout || s.stdout.is_some())
-            && (!self.stderr || s.stderr.is_some())
-            && (!self.resize || s.resize.is_some())
+    fn get(&self, kind: StreamType) -> Option<StreamId> {
+        match kind {
+            StreamType::Error => self.error,
+            StreamType::Stdin => self.stdin,
+            StreamType::Stdout => self.stdout,
+            StreamType::Stderr => self.stderr,
+            StreamType::Resize => self.resize,
+        }
     }
-}
 
-fn header_value<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name == name)
-        .map(|h| h.value.as_str())
+    fn complete(&self, expected: &[StreamType]) -> bool {
+        expected.iter().all(|k| self.get(*k).is_some())
+    }
 }
 
 enum StreamWait {
@@ -607,11 +532,11 @@ enum StreamWait {
 /// 揃う前に届いた stdin の DATA と FIN は上限つきで `early` に保持する（resize の DATA も上限つきで保持し、それ以外の DATA は読み捨てる）。
 async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
-    need: Need,
+    expected: &[StreamType],
     streams: &mut Streams,
     early: &mut EarlyStdin,
 ) -> StreamWait {
-    while !need.complete(streams) {
+    while !streams.complete(expected) {
         let frame = match conn.next_frame().await {
             Ok(Some(f)) => f,
             Ok(None) => return StreamWait::Closed,
@@ -624,7 +549,7 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 fin,
                 ..
             } => {
-                let r = accept_stream(conn, need, streams, stream_id, &headers);
+                let r = accept_stream(conn, expected, streams, stream_id, &headers);
                 if fin && streams.stdin == Some(stream_id) {
                     early.fin = true;
                 }
@@ -633,22 +558,22 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
             Frame::Data {
                 stream_id,
                 fin,
-                payload,
+                data,
             } if streams.stdin == Some(stream_id) => {
-                if early.buf.len().saturating_add(payload.len()) > MAX_EARLY_STDIN_BYTES {
+                if early.buf.len().saturating_add(data.len()) > MAX_EARLY_STDIN_BYTES {
                     return StreamWait::Protocol;
                 }
-                early.buf.extend_from_slice(&payload);
+                early.buf.extend_from_slice(&data);
                 early.fin |= fin;
                 Ok(())
             }
             Frame::Data {
-                stream_id, payload, ..
+                stream_id, data, ..
             } if streams.resize == Some(stream_id) => {
-                if early.resize.len().saturating_add(payload.len()) > MAX_EARLY_RESIZE_BYTES {
+                if early.resize.len().saturating_add(data.len()) > MAX_EARLY_RESIZE_BYTES {
                     return StreamWait::Protocol;
                 }
-                early.resize.extend_from_slice(&payload);
+                early.resize.extend_from_slice(&data);
                 Ok(())
             }
             Frame::RstStream { stream_id, .. } if streams.stdin == Some(stream_id) => {
@@ -669,41 +594,33 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
 /// 1 本の SYN_STREAM を受け付けるか拒否する（拒否は RST_STREAM。接続は閉じない）。
 fn accept_stream<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
-    need: Need,
+    expected: &[StreamType],
     streams: &mut Streams,
     id: StreamId,
-    headers: &[Header],
-) -> Result<(), ProtocolError> {
-    let reject = |conn: &mut Conn<T>, status: RstStatus| {
+    headers: &Headers,
+) -> Result<(), SpdyError> {
+    let reject = |conn: &mut Conn<T>, status: u32| {
         conn.queue(&Frame::RstStream {
             stream_id: id,
             status,
         })
     };
     // クライアント側の ID は奇数で単調増加（SPDY/3 §2.3.2）。
-    if !id.is_client_initiated() || id.get() <= streams.last_id {
-        return reject(conn, RstStatus::ProtocolError);
+    if id.get().is_multiple_of(2) || id.get() <= streams.last_id {
+        return reject(conn, rst_status::PROTOCOL_ERROR);
     }
-    let slot = match header_value(headers, "streamtype") {
-        Some("error") => Some((&mut streams.error, true)),
-        Some("stdin") => Some((&mut streams.stdin, need.stdin)),
-        Some("stdout") => Some((&mut streams.stdout, need.stdout)),
-        Some("stderr") => Some((&mut streams.stderr, need.stderr)),
-        Some("resize") => Some((&mut streams.resize, need.resize)),
-        _ => None,
+    let Some(kind) = headers.get(HEADER_STREAM_TYPE).and_then(StreamType::parse) else {
+        return reject(conn, rst_status::PROTOCOL_ERROR);
     };
-    let Some((slot, wanted)) = slot else {
-        return reject(conn, RstStatus::ProtocolError);
-    };
-    if !wanted || slot.is_some() {
-        return reject(conn, RstStatus::RefusedStream);
+    if !expected.contains(&kind) || streams.get(kind).is_some() {
+        return reject(conn, rst_status::REFUSED_STREAM);
     }
-    *slot = Some(id);
+    *streams.slot(kind) = Some(id);
     streams.last_id = id.get();
     conn.queue(&Frame::SynReply {
         stream_id: id,
         fin: false,
-        headers: Vec::new(),
+        headers: Headers::new(),
     })
 }
 
@@ -742,8 +659,9 @@ struct Relay<T> {
     /// 出力の処理順を周回ごとに入れ替える印（stdout / stderr の公平化）。
     stderr_first: bool,
     resizer: Option<Box<dyn TerminalResizer>>,
-    resize_line: Vec<u8>,
-    resize_discard: bool,
+    resize_parser: ResizeParser,
+    protocol: Protocol,
+    close_timeout: Duration,
     exit: Option<ExitFuture>,
     exit_result: Option<Result<i32, CriError>>,
     drain: Option<Pin<Box<Sleep>>>,
@@ -765,18 +683,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             Frame::Data {
                 stream_id,
                 fin,
-                payload,
+                data,
             } => {
                 self.touch();
                 if Some(stream_id) == self.streams.stdin {
                     if self.stdin.is_some() {
-                        self.stdin_buf.extend_from_slice(&payload);
+                        self.stdin_buf.extend_from_slice(&data);
                     }
                     if fin {
                         self.stdin_fin = true;
                     }
                 } else if Some(stream_id) == self.streams.resize {
-                    self.feed_resize(&payload);
+                    self.feed_resize(&data);
                 }
             }
             Frame::RstStream { stream_id, .. } => {
@@ -795,7 +713,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 self.conn
                     .queue(&Frame::RstStream {
                         stream_id,
-                        status: RstStatus::RefusedStream,
+                        status: rst_status::REFUSED_STREAM,
                     })
                     .map_err(|_| RelayEnd::Protocol)?;
             }
@@ -805,28 +723,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
         Ok(())
     }
 
-    /// resize ストリームの DATA を改行区切りで解析する。1 行が上限を超えたら次の改行まで捨てる。
-    fn feed_resize(&mut self, payload: &[u8]) {
-        for &b in payload {
-            if self.resize_discard {
-                if b == b'\n' {
-                    self.resize_discard = false;
-                }
-                continue;
-            }
-            if b == b'\n' {
-                if let (Some(size), Some(resizer)) =
-                    (parse_resize_line(&self.resize_line), self.resizer.as_mut())
-                {
-                    let _ = resizer.resize(size);
-                }
-                self.resize_line.clear();
-            } else {
-                self.resize_line.push(b);
-                if self.resize_line.len() > MAX_RESIZE_LINE_BYTES {
-                    self.resize_line.clear();
-                    self.resize_discard = true;
-                }
+    /// resize ストリームの DATA を [`ResizeParser`] で解析して端末へ反映する。
+    /// 不正な値は捨てる（パーサーが滞留を消す）。フレーム境界をまたぐ JSON も読める。
+    fn feed_resize(&mut self, data: &[u8]) {
+        if let Ok(sizes) = self.resize_parser.push(data)
+            && let Some(resizer) = self.resizer.as_mut()
+        {
+            for size in sizes {
+                let _ = resizer.resize(size);
             }
         }
     }
@@ -922,8 +826,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             }
             if self.stdin_buf.is_empty() && self.conn.pending_write() < MAX_SEND_QUEUE_BYTES {
                 match self.conn.poll_read_more(cx) {
-                    Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => {
+                    Poll::Ready(Ok(0)) | Poll::Ready(Err(ReadStop::Io)) => {
                         return Poll::Ready(RelayEnd::PeerClosed);
+                    }
+                    // 受信バッファの超過は切断ではなく規則違反として閉じる（EOF と区別する）。
+                    Poll::Ready(Err(ReadStop::Overflow)) => {
+                        return Poll::Ready(RelayEnd::Protocol);
                     }
                     Poll::Ready(Ok(_)) => progress = true,
                     Poll::Pending => {}
@@ -997,11 +905,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
         match end {
             RelayEnd::PeerClosed => ExecStreamOutcome::PeerClosed,
             RelayEnd::Idle => {
-                self.conn.goodbye(last, GoAwayStatus::Ok).await;
+                self.conn
+                    .goodbye(last, goaway_status::OK, self.close_timeout)
+                    .await;
                 ExecStreamOutcome::IdleTimeout
             }
             RelayEnd::Protocol => {
-                self.conn.goodbye(last, GoAwayStatus::ProtocolError).await;
+                self.conn
+                    .goodbye(last, goaway_status::PROTOCOL_ERROR, self.close_timeout)
+                    .await;
                 ExecStreamOutcome::ProtocolError
             }
             RelayEnd::DrainExpired => {
@@ -1017,16 +929,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     return self.finish_failed(ExecStreamOutcome::OutputFailed).await;
                 }
                 let (status, outcome) = match self.exit_result.take() {
-                    Some(Ok(0)) => (
-                        STATUS_SUCCESS.to_string(),
-                        ExecStreamOutcome::Exited { code: 0 },
-                    ),
                     Some(Ok(code)) => (
-                        status_non_zero_exit(code),
+                        status_exit(self.protocol, code),
                         ExecStreamOutcome::Exited { code },
                     ),
                     _ => (
-                        STATUS_INTERNAL_ERROR.to_string(),
+                        Some(status_internal_error(self.protocol)),
                         ExecStreamOutcome::ExecFailed,
                     ),
                 };
@@ -1040,7 +948,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                         fins.push(out.id);
                     }
                 }
-                self.close_with_status(&status, &fins).await;
+                self.close_with_status(status.as_deref(), &fins).await;
                 outcome
             }
         }
@@ -1054,11 +962,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             .filter(|o| !o.eof)
             .map(|o| o.id)
             .collect();
-        self.close_with_status(STATUS_INTERNAL_ERROR, &fins).await;
+        let status = status_internal_error(self.protocol);
+        self.close_with_status(Some(&status), &fins).await;
         outcome
     }
 
-    async fn close_with_status(&mut self, status: &str, extra_fins: &[StreamId]) {
+    async fn close_with_status(&mut self, status: Option<&[u8]>, extra_fins: &[StreamId]) {
         if let Some(error_id) = self.streams.error {
             send_status(
                 &mut self.conn,
@@ -1066,6 +975,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 status,
                 extra_fins,
                 self.streams.last_id,
+                self.close_timeout,
             )
             .await;
         }
@@ -1077,7 +987,7 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
     out: &mut Output,
     cx: &mut Context<'_>,
-) -> Result<bool, ProtocolError> {
+) -> Result<bool, SpdyError> {
     let mut progressed = false;
     let mut reads = 0usize;
     // 1 周回あたりの読み取り回数に上限を付け、他方の出力にも送信キューを残す。
@@ -1086,7 +996,7 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
         && conn.pending_write() < MAX_SEND_QUEUE_BYTES
     {
         reads += 1;
-        let mut tmp = [0u8; OUTPUT_CHUNK_BYTES];
+        let mut tmp = [0u8; MAX_OUTGOING_DATA];
         let mut buf = ReadBuf::new(&mut tmp);
         match Pin::new(&mut out.reader).poll_read(cx, &mut buf) {
             Poll::Pending => break,
@@ -1094,7 +1004,7 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
                 conn.queue(&Frame::Data {
                     stream_id: out.id,
                     fin: false,
-                    payload: buf.filled().to_vec(),
+                    data: buf.filled().to_vec(),
                 })?;
                 progressed = true;
             }
@@ -1104,7 +1014,7 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
                 conn.queue(&Frame::Data {
                     stream_id: out.id,
                     fin: true,
-                    payload: Vec::new(),
+                    data: Vec::new(),
                 })?;
                 progressed = true;
             }
@@ -1114,26 +1024,29 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// error ストリームに Status を書いて閉じ、`extra_fins` に FIN を付けて GOAWAY・シャットダウンする。
+/// `status` が `None`（v3・v2 の成功）なら error ストリームには何も書かず FIN だけを送る。
 async fn send_status<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
     error_id: StreamId,
-    status: &str,
+    status: Option<&[u8]>,
     extra_fins: &[StreamId],
     last_good: u32,
+    close_timeout: Duration,
 ) {
     let _ = conn.queue(&Frame::Data {
         stream_id: error_id,
         fin: true,
-        payload: status.as_bytes().to_vec(),
+        data: status.map(<[u8]>::to_vec).unwrap_or_default(),
     });
     for id in extra_fins {
         let _ = conn.queue(&Frame::Data {
             stream_id: *id,
             fin: true,
-            payload: Vec::new(),
+            data: Vec::new(),
         });
     }
-    conn.goodbye(last_good, GoAwayStatus::Ok).await;
+    conn.goodbye(last_good, goaway_status::OK, close_timeout)
+        .await;
 }
 
 /// Upgrade 後の IO 1 本分の Exec セッションを最後まで駆動する。
@@ -1141,32 +1054,38 @@ async fn send_status<T: AsyncRead + AsyncWrite + Unpin>(
 /// `req` は発行時に保存した要求（通信路の内容から組み立てない）。`launcher` はストリームが揃った後にだけ呼ぶ。
 pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     io: T,
+    protocol: Protocol,
+    options: StreamOptions,
     req: &v1::ExecRequest,
     launcher: &dyn ExecStreamLauncher,
     config: &ExecStreamConfig,
 ) -> ExecStreamOutcome {
-    let Ok(mut conn) = Conn::new(io) else {
-        return ExecStreamOutcome::ProtocolError;
-    };
-    let need = Need::from_request(req);
+    let mut conn = Conn::new(io);
+    let expected = options.expected(protocol);
+    let close_timeout = config.limits.close_timeout;
     let mut streams = Streams::default();
     let mut early = EarlyStdin::default();
 
     // 1. 必要なストリームが揃うまで待つ（期限つき）。
     let waited = tokio::time::timeout(
-        config.stream_creation_timeout,
-        await_streams(&mut conn, need, &mut streams, &mut early),
+        config.limits.stream_creation_timeout,
+        await_streams(&mut conn, &expected, &mut streams, &mut early),
     )
     .await;
     match waited {
         Err(_) => {
-            conn.goodbye(streams.last_id, GoAwayStatus::Ok).await;
+            conn.goodbye(streams.last_id, goaway_status::OK, close_timeout)
+                .await;
             return ExecStreamOutcome::StreamCreationTimeout;
         }
         Ok(StreamWait::Closed) => return ExecStreamOutcome::PeerClosed,
         Ok(StreamWait::Protocol) => {
-            conn.goodbye(streams.last_id, GoAwayStatus::ProtocolError)
-                .await;
+            conn.goodbye(
+                streams.last_id,
+                goaway_status::PROTOCOL_ERROR,
+                close_timeout,
+            )
+            .await;
             return ExecStreamOutcome::ProtocolError;
         }
         Ok(StreamWait::Ready) => {}
@@ -1179,20 +1098,22 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     let launch = ExecLaunch {
         container_id: req.container_id.clone(),
         cmd: req.cmd.clone(),
-        tty: req.tty,
-        stdin: need.stdin,
-        stdout: need.stdout,
-        stderr: need.stderr,
+        tty: options.tty,
+        stdin: options.stdin,
+        stdout: options.stdout,
+        stderr: options.stderr,
     };
     let session = match tokio::time::timeout(config.launch_timeout, launcher.launch(launch)).await {
-        Ok(Ok(session)) if session_matches(&session, need) => session,
+        Ok(Ok(session)) if session_matches(&session, options) => session,
         _ => {
+            let status = status_internal_error(protocol);
             send_status(
                 &mut conn,
                 error_id,
-                STATUS_INTERNAL_ERROR,
+                Some(&status),
                 &[],
                 streams.last_id,
+                close_timeout,
             )
             .await;
             return ExecStreamOutcome::LaunchFailed;
@@ -1229,27 +1150,30 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         stderr: output(stderr, streams.stderr),
         stderr_first: false,
         resizer: resize,
-        resize_line: Vec::new(),
-        resize_discard: false,
+        resize_parser: ResizeParser::new(),
+        protocol,
+        close_timeout,
         exit: Some(exit),
         exit_result: None,
         drain: None,
-        drain_timeout: config.drain_timeout,
-        idle: Box::pin(tokio::time::sleep(config.idle_timeout)),
-        idle_timeout: config.idle_timeout,
+        drain_timeout: config.limits.drain_timeout,
+        idle: Box::pin(tokio::time::sleep(config.limits.stream_idle_timeout)),
+        idle_timeout: config.limits.stream_idle_timeout,
     };
     // 確立前に届いた resize を適用する（初期サイズを落とさない。CRI-6）。
-    relay.feed_resize(&early.resize);
+    for chunk in early.resize.chunks(EARLY_RESIZE_REPLAY_CHUNK) {
+        relay.feed_resize(chunk);
+    }
     let end = poll_fn(|cx| relay.poll_run(cx)).await;
     // relay を drop すると ExecSession 由来の資源が解放され、プロセスが止まる（契約）。
     relay.finalize(end).await
 }
 
 /// launcher が要求どおりの stdio を返したか。
-fn session_matches(session: &ExecSession, need: Need) -> bool {
-    session.stdin.is_some() == need.stdin
-        && session.stdout.is_some() == need.stdout
-        && session.stderr.is_some() == need.stderr
+fn session_matches(session: &ExecSession, options: StreamOptions) -> bool {
+    session.stdin.is_some() == options.stdin
+        && session.stdout.is_some() == options.stdout
+        && session.stderr.is_some() == options.stderr
 }
 
 #[cfg(test)]
@@ -1298,14 +1222,13 @@ mod tests {
     fn cri6_send_queue_does_not_retain_sent_bytes() {
         let mut conn = Conn::new(TrickleIo {
             accepted_last: false,
-        })
-        .expect("conn");
+        });
         let mut cx = Context::from_waker(std::task::Waker::noop());
         for _ in 0..200 {
             conn.queue(&Frame::Data {
                 stream_id: StreamId::new(1).expect("stream id"),
                 fin: false,
-                payload: vec![b'x'; 16],
+                data: vec![b'x'; 16],
             })
             .expect("queue");
             // 追記直後は送信済み領域が残らない（wbuf の実長 = 未送信量）。
@@ -1350,8 +1273,7 @@ mod tests {
     fn cri6_pump_output_is_bounded_and_stderr_not_starved() {
         let mut conn = Conn::new(TrickleIo {
             accepted_last: true,
-        })
-        .expect("conn");
+        });
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut stdout = Output {
             reader: Box::new(Endless),
@@ -1375,92 +1297,41 @@ mod tests {
         assert!(stderr.eof);
     }
 
-    fn headers_with(values: &[&str]) -> HeaderMap {
-        let mut map = HeaderMap::new();
-        for v in values {
-            map.append(
-                HeaderName::from_static("x-stream-protocol-version"),
-                HeaderValue::from_str(v).expect("header value"),
-            );
-        }
-        map
-    }
-
-    fn negotiate(values: &[&str]) -> Option<&'static str> {
-        negotiate_protocol(
-            &headers_with(values),
-            &HeaderName::from_static("x-stream-protocol-version"),
-        )
-    }
-
-    /// CRI-6: v4 を含めば採用する。並びやカンマ区切り、複数ヘッダでも同じ。
+    /// CRI-6: 非 0 の終了コードは v4 では kubelet と同じ JSON、v3・v2 では終了コードの文になる。成功は v4 のみ JSON。
     #[test]
-    fn cri6_negotiate_prefers_v4() {
-        assert_eq!(negotiate(&["v4.channel.k8s.io"]), Some(EXEC_PROTOCOL_V4));
+    fn cri6_status_exit_per_protocol() {
         assert_eq!(
-            negotiate(&["v5.channel.k8s.io, v4.channel.k8s.io"]),
-            Some(EXEC_PROTOCOL_V4)
+            status_exit(Protocol::V4, 0).as_deref(),
+            Some(br#"{"metadata":{},"status":"Success"}"#.as_slice())
+        );
+        assert_eq!(status_exit(Protocol::V3, 0), None);
+        assert_eq!(status_exit(Protocol::V2, 0), None);
+        assert_eq!(
+            status_exit(Protocol::V4, 3).as_deref(),
+            Some(
+                br#"{"metadata":{},"status":"Failure","message":"command terminated with non-zero exit code: command terminated with exit code 3","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"3"}]}}"#.as_slice()
+            )
         );
         assert_eq!(
-            negotiate(&["v3.channel.k8s.io", "v4.channel.k8s.io"]),
-            Some(EXEC_PROTOCOL_V4)
+            status_exit(Protocol::V3, 3).as_deref(),
+            Some(b"command terminated with exit code 3".as_slice())
         );
-        assert_eq!(negotiate(&[" v4.channel.k8s.io "]), Some(EXEC_PROTOCOL_V4));
+        let v: serde_json::Value =
+            serde_json::from_slice(&status_exit(Protocol::V4, -1).expect("status")).expect("json");
+        assert_eq!(v["reason"], "NonZeroExitCode");
     }
 
-    /// CRI-6: v4 が無ければ `None`（v1〜v3・v5・無関係な値・ヘッダ無し）。
+    /// CRI-6: 内部エラーの Status は固定文（v4 は JSON の InternalError・500）。
     #[test]
-    fn cri6_negotiate_rejects_without_v4() {
-        assert_eq!(negotiate(&[]), None);
-        assert_eq!(negotiate(&["v3.channel.k8s.io"]), None);
-        assert_eq!(negotiate(&["v1.channel.k8s.io, channel.k8s.io"]), None);
-        assert_eq!(negotiate(&["v5.channel.k8s.io"]), None);
-        assert_eq!(negotiate(&["V4.CHANNEL.K8S.IO"]), None);
-    }
-
-    /// CRI-6・REPAIR-5: 要素数の上限を超えた先にある v4 は見ない。
-    #[test]
-    fn cri6_negotiate_bounds_token_count() {
-        let many = format!("{}v4.channel.k8s.io", "x,".repeat(MAX_TOKENS_PER_HEADER));
-        assert_eq!(negotiate(&[&many]), None);
-    }
-
-    /// CRI-6: Status の JSON は kubelet と同じ文字列になる。
-    #[test]
-    fn cri6_status_json_exact() {
-        assert_eq!(STATUS_SUCCESS, r#"{"metadata":{},"status":"Success"}"#);
-        assert_eq!(
-            status_non_zero_exit(3),
-            r#"{"metadata":{},"status":"Failure","message":"command terminated with non-zero exit code: command terminated with exit code 3","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"3"}]}}"#
-        );
-        for json in [
-            STATUS_SUCCESS,
-            STATUS_INTERNAL_ERROR,
-            &status_non_zero_exit(-1),
-        ] {
-            let v: serde_json::Value = serde_json::from_str(json).expect("valid json");
-            assert!(v.get("status").is_some());
-        }
-        let v: serde_json::Value = serde_json::from_str(STATUS_INTERNAL_ERROR).expect("json");
+    fn cri6_status_internal_error_fixed() {
+        let v: serde_json::Value =
+            serde_json::from_slice(&status_internal_error(Protocol::V4)).expect("json");
         assert_eq!(v["reason"], "InternalError");
         assert_eq!(v["code"], 500);
-    }
-
-    /// CRI-6: resize の行の解析（正常・不正な JSON・範囲外・0・欠落）。
-    #[test]
-    fn cri6_parse_resize_line() {
         assert_eq!(
-            parse_resize_line(br#"{"Width":80,"Height":24}"#),
-            Some(TerminalSize {
-                width: 80,
-                height: 24
-            })
+            status_internal_error(Protocol::V2),
+            b"error executing command in container".to_vec()
         );
-        assert_eq!(parse_resize_line(b"not json"), None);
-        assert_eq!(parse_resize_line(br#"{"Width":70000,"Height":24}"#), None);
-        assert_eq!(parse_resize_line(br#"{"Width":0,"Height":24}"#), None);
-        assert_eq!(parse_resize_line(br#"{"Width":80}"#), None);
-        assert_eq!(parse_resize_line(br#"{"Width":-1,"Height":2}"#), None);
     }
 
     /// CRI-6・REPAIR-5: 設定の検証（0 と上限超えを拒否）。
@@ -1469,61 +1340,72 @@ mod tests {
         let base = ExecStreamConfig::default();
         assert!(base.validate().is_ok());
         let zero = Duration::ZERO;
-        assert!(
-            ExecStreamConfig {
-                stream_creation_timeout: zero,
-                ..base.clone()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            ExecStreamConfig {
-                idle_timeout: MAX_IDLE_TIMEOUT,
-                ..base.clone()
-            }
-            .validate()
-            .is_ok()
-        );
-        assert!(
-            ExecStreamConfig {
-                idle_timeout: MAX_IDLE_TIMEOUT + Duration::from_secs(1),
-                ..base.clone()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            ExecStreamConfig {
-                drain_timeout: zero,
-                ..base.clone()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            ExecStreamConfig {
-                launch_timeout: zero,
-                ..base
-            }
-            .validate()
-            .is_err()
-        );
+        let mut c = base.clone();
+        c.limits.stream_creation_timeout = zero;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.limits.stream_idle_timeout = Duration::from_secs(24 * 60 * 60 + 1);
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.limits.drain_timeout = zero;
+        assert!(c.validate().is_err());
+        let c = ExecStreamConfig {
+            launch_timeout: zero,
+            ..base.clone()
+        };
+        assert!(c.validate().is_err());
+        let c = ExecStreamConfig {
+            stdin_stall_timeout: MAX_SESSION_STEP_TIMEOUT + Duration::from_secs(1),
+            ..base
+        };
+        assert!(c.validate().is_err());
     }
 
-    /// CRI-6: tty のとき stderr ストリームは求めず、resize を求める。
+    /// CRI-6: tty のとき stderr ストリームは求めず、v4・v3 では resize を求める（v2 は resize なし）。
     #[test]
-    fn cri6_need_from_request() {
-        let req = v1::ExecRequest {
-            container_id: "c".into(),
-            cmd: vec!["sh".into()],
-            tty: true,
-            stdin: true,
-            stdout: true,
-            stderr: true,
-        };
-        let need = Need::from_request(&req);
-        assert!(need.stdin && need.stdout && need.resize);
-        assert!(!need.stderr);
+    fn cri6_expected_streams_from_request() {
+        let options = StreamOptions::new(true, true, true, true);
+        assert!(!options.stderr);
+        let v4 = options.expected(Protocol::V4);
+        assert!(v4.contains(&StreamType::Stdin) && v4.contains(&StreamType::Resize));
+        assert!(!v4.contains(&StreamType::Stderr));
+        assert!(!options.expected(Protocol::V2).contains(&StreamType::Resize));
+    }
+
+    /// CRI-6・REPAIR-5: 受信バッファの超過は EOF（切断）ではなく規則違反として区別される。
+    #[test]
+    fn cri6_recv_overflow_is_not_eof() {
+        struct NoIo;
+        impl AsyncRead for NoIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for NoIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                data: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(data.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut conn = Conn::new(NoIo);
+        conn.dec.extend(&vec![0u8; MAX_RECV_BUF_BYTES]);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            conn.poll_read_more(&mut cx),
+            Poll::Ready(Err(ReadStop::Overflow))
+        ));
     }
 }

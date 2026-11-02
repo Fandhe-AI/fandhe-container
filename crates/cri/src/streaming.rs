@@ -9,10 +9,12 @@
 //!
 //! ## 未実装（REPAIR-3）
 //!
-//! 既定の [`NotImplementedHandler`] は有効なトークンへの要求に `501 Not Implemented` を返すだけである。
-//! Exec のプロトコル本体（SPDY/3.1 と remotecommand v4）は [`exec::ExecStreamHandler`]（#680・TASK-63.2）が実装済みだが、
-//! stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、plugin-cri からの起動・注入も後続である。
-//! Attach は #681（TASK-63.3）、PortForward は #682（TASK-63.4）が [`StreamHandler`] を連ねて実装する。
+//! 有効なトークンへの要求は、種別ごとのハンドラが無ければ [`NotImplementedHandler`] が `501 Not Implemented` を返す。
+//! Attach は #681（TASK-63.3）が SPDY/3.1 の codec（[`spdy`]）・remotecommand の交渉（[`remotecommand`]）・
+//! セッション（[`attach`]）を実装済みだが、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は未接続で、
+//! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
+//! 交渉を使って実装済みだが、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、
+//! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が [`StreamDispatcher`] へ足して実装する。
 //!
 //! ## 安全側の既定
 //!
@@ -45,8 +47,11 @@ use tokio::task::JoinHandle;
 use crate::error::CriError;
 use crate::runtime::v1;
 
+pub mod attach;
 pub mod exec;
+pub mod remotecommand;
 pub mod spdy;
+mod spdy_dictionary;
 
 /// トークン（小文字 hex）の長さ。32 バイトの乱数を 2 桁ずつ展開する。
 const TOKEN_HEX_LEN: usize = 64;
@@ -139,6 +144,11 @@ pub struct StreamingConfig {
     pub header_read_timeout: Duration,
     /// 同時に受け付ける接続数の上限。既定は 64。超えた接続は即座に閉じる。
     pub max_connections: usize,
+    /// Upgrade 後に必要なストリームが揃うまでの期限。既定は 30 秒（kubelet の既定。TASK-63.3・REPAIR-5）。
+    pub stream_creation_timeout: Duration,
+    /// Upgrade 後にどちら向きにもフレームが流れない期間の上限。既定は 4 時間（kubelet の既定。
+    /// Attach はシェルを開いたまま長時間放置され得るため長い。TASK-63.3・REPAIR-5）。
+    pub stream_idle_timeout: Duration,
 }
 
 impl Default for StreamingConfig {
@@ -151,6 +161,8 @@ impl Default for StreamingConfig {
             max_in_flight: 1000,
             header_read_timeout: Duration::from_secs(10),
             max_connections: 64,
+            stream_creation_timeout: Duration::from_secs(30),
+            stream_idle_timeout: Duration::from_secs(4 * 60 * 60),
         }
     }
 }
@@ -198,6 +210,27 @@ impl StreamingConfig {
         self
     }
 
+    /// ストリーム作成の期限を指定する。
+    pub fn with_stream_creation_timeout(mut self, stream_creation_timeout: Duration) -> Self {
+        self.stream_creation_timeout = stream_creation_timeout;
+        self
+    }
+
+    /// Upgrade 後の idle の期限を指定する。
+    pub fn with_stream_idle_timeout(mut self, stream_idle_timeout: Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    /// Upgrade 後のセッションの期限（ハンドラ構築用。作成・idle 以外は既定値）。
+    pub fn session_limits(&self) -> remotecommand::SessionLimits {
+        remotecommand::SessionLimits {
+            stream_creation_timeout: self.stream_creation_timeout,
+            stream_idle_timeout: self.stream_idle_timeout,
+            ..remotecommand::SessionLimits::default()
+        }
+    }
+
     /// 設定を検証する（fail-closed）。外部アドレス（`0.0.0.0`・`::` を含む）は `allow_external` が無ければ拒否する。
     pub fn validate(&self) -> Result<(), CriError> {
         if !self.bind.ip().is_loopback() && !self.allow_external {
@@ -237,6 +270,7 @@ impl StreamingConfig {
                 "streaming header_read_timeout must be positive",
             ));
         }
+        self.session_limits().validate()?;
         Ok(())
     }
 }
@@ -462,8 +496,8 @@ fn plain_response(status: StatusCode, message: &'static str) -> Response<StreamB
 
 /// トークンの照合に成功した要求の処理口（拡張点）。
 ///
-/// Exec は [`exec::ExecStreamHandler`]（#680）が実装済み。#681（Attach）・#682（PortForward）が同じ形で実装し、
-/// `Upgrade` 後の SPDY/3.1 を扱う。
+/// Exec（[`exec::ExecStreamHandler`]・#680）・Attach（[`attach::AttachHandler`]・#681）が実装済みで、
+/// #682（PortForward）が同じ形で実装し、`Upgrade` 後の SPDY/3.1 を扱う。
 /// Upgrade 後の idle の期限もそちらが決める。本モジュールの接続全体の期限（`header_read_timeout * 3`）は
 /// Upgrade しない要求のためのもので、101 応答で `Upgraded` へ IO を渡した接続には及ばない
 /// （接続の future が Upgrade の引き渡しで完了するため。#679）。
@@ -498,6 +532,72 @@ impl StreamHandler for NotImplementedHandler {
                 "streaming protocol is not implemented",
             )
         })
+    }
+}
+
+/// 種別ごとに [`StreamHandler`] を振り分けるハンドラ（CRI-6・TASK-63.3）。
+///
+/// `StreamingServer::bind_with_handler` は 1 つのハンドラしか受けないため、Attach（#681）・Exec（#680）・
+/// PortForward（#682）が同じサーバーに同居するための合流点になる。設定していない種別は
+/// [`NotImplementedHandler`] と同じ `501` を返す（実装済みを装わない。REPAIR-3）。
+#[derive(Default)]
+pub struct StreamDispatcher {
+    attach: Option<Arc<dyn StreamHandler>>,
+    exec: Option<Arc<dyn StreamHandler>>,
+    port_forward: Option<Arc<dyn StreamHandler>>,
+}
+
+impl fmt::Debug for StreamDispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamDispatcher")
+            .field("attach", &self.attach.is_some())
+            .field("exec", &self.exec.is_some())
+            .field("port_forward", &self.port_forward.is_some())
+            .finish()
+    }
+}
+
+impl StreamDispatcher {
+    /// どの種別も未設定（全て 501）で作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach のハンドラを設定する。
+    pub fn with_attach(mut self, handler: Arc<dyn StreamHandler>) -> Self {
+        self.attach = Some(handler);
+        self
+    }
+
+    /// Exec のハンドラを設定する（#680 が使う）。
+    pub fn with_exec(mut self, handler: Arc<dyn StreamHandler>) -> Self {
+        self.exec = Some(handler);
+        self
+    }
+
+    /// PortForward のハンドラを設定する（#682 が使う）。
+    pub fn with_port_forward(mut self, handler: Arc<dyn StreamHandler>) -> Self {
+        self.port_forward = Some(handler);
+        self
+    }
+}
+
+impl StreamHandler for StreamDispatcher {
+    fn handle(
+        &self,
+        request: StreamRequest,
+        http: Request<Incoming>,
+        permit: ConnectionPermit,
+    ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
+        let handler = match request.kind() {
+            StreamKind::Attach => self.attach.as_ref(),
+            StreamKind::Exec => self.exec.as_ref(),
+            StreamKind::PortForward => self.port_forward.as_ref(),
+        };
+        match handler {
+            Some(handler) => handler.handle(request, http, permit),
+            None => NotImplementedHandler.handle(request, http, permit),
+        }
     }
 }
 
@@ -801,8 +901,24 @@ fn check_id(value: &str, what: &'static str) -> Result<(), CriError> {
     Ok(())
 }
 
-/// `ExecRequest` の入力検証（存在照合の前）。`tty` と `stderr` の同時指定も拒否する（#680）。
-/// Attach の同じ規則は #681 の範囲（[`validate_attach_request`] は未対応）。
+/// stdio と tty の組の検証（Exec・Attach 共通。kubelet の `NewOptions` / `ValidateExecRequest` と同じ規則）。
+///
+/// どれも false の要求と、tty と stderr の同時指定は拒否する（tty では stderr が stdout に合流するため。CRI-6）。
+fn check_stdio_options(stdin: bool, stdout: bool, stderr: bool, tty: bool) -> Result<(), CriError> {
+    if !(stdin || stdout || stderr) {
+        return Err(CriError::invalid_argument(
+            "one of stdin, stdout, or stderr must be set",
+        ));
+    }
+    if tty && stderr {
+        return Err(CriError::invalid_argument(
+            "stderr must be false when tty is set",
+        ));
+    }
+    Ok(())
+}
+
+/// `ExecRequest` の入力検証（存在照合の前。CRI-6・TASK-63.2・#680）。
 pub fn validate_exec_request(req: &v1::ExecRequest) -> Result<(), CriError> {
     check_id(&req.container_id, "container_id")?;
     if req.cmd.is_empty() {
@@ -818,29 +934,16 @@ pub fn validate_exec_request(req: &v1::ExecRequest) -> Result<(), CriError> {
     if total > MAX_EXEC_CMD_BYTES {
         return Err(CriError::invalid_argument("cmd is too large"));
     }
-    if !(req.stdin || req.stdout || req.stderr) {
-        return Err(CriError::invalid_argument(
-            "one of stdin, stdout, or stderr must be set",
-        ));
-    }
-    // tty では stderr が stdout に混ざるため、kubelet は同時指定を不正とする（CRI-6・#680）。
-    if req.tty && req.stderr {
-        return Err(CriError::invalid_argument(
-            "tty and stderr cannot both be true",
-        ));
-    }
-    Ok(())
+    check_stdio_options(req.stdin, req.stdout, req.stderr, req.tty)
 }
 
-/// `AttachRequest` の入力検証（存在照合の前。深い意味検証は #681）。
+/// `AttachRequest` の入力検証（存在照合の前。CRI-6・TASK-63.3・#681）。
+///
+/// CRI の定義（`AttachRequest.stderr`）は tty のとき stderr を false に固定している（stdout と合流するため）。
+/// 守らない要求は `INVALID_ARGUMENT`。接続時のハンドラは kubelet に合わせて、tty の stderr を無視する。
 pub fn validate_attach_request(req: &v1::AttachRequest) -> Result<(), CriError> {
     check_id(&req.container_id, "container_id")?;
-    if !(req.stdin || req.stdout || req.stderr) {
-        return Err(CriError::invalid_argument(
-            "one of stdin, stdout, or stderr must be set",
-        ));
-    }
-    Ok(())
+    check_stdio_options(req.stdin, req.stdout, req.stderr, req.tty)
 }
 
 /// `PortForwardRequest` の入力検証（存在照合の前。到達性の検証は #682）。
@@ -1173,7 +1276,7 @@ mod tests {
         tty_stderr.tty = true;
         tty_stderr.stderr = true;
         let err = validate_exec_request(&tty_stderr).expect_err("tty and stderr");
-        assert_eq!(err.message(), "tty and stderr cannot both be true");
+        assert_eq!(err.message(), "stderr must be false when tty is set");
         let mut tty_only = ok.clone();
         tty_only.tty = true;
         validate_exec_request(&tty_only).expect("tty only");

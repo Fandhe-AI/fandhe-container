@@ -465,6 +465,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-plugin-microvm"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-plugin",
+]
 
 [[package]]
 name = "fandhe-container-plugin-windows"

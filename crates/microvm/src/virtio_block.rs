@@ -718,6 +718,40 @@ mod tests {
         assert!(u64::from(SEG_MAX) * u64::from(SIZE_MAX) <= MAX_CHAIN_BYTES);
     }
 
+    /// MVM-1: ヘッダを 2 分割し SEG_MAX(126) のデータ + status を続けた計 129 記述子の要求を処理する。
+    #[test]
+    fn mvm1_split_header_with_seg_max_data_is_served() {
+        let mut m = new_mem();
+        let cfg = queue_cfg_sized(DESC, AVAIL, USED, 256);
+        let mut b = VirtioBlock::new(MemoryBlockBackend::new(1 << 20, false).unwrap());
+        b.activate(
+            FeatureBits::from_bits(REQUIRED | VIRTIO_BLK_F_FLUSH),
+            &[cfg],
+        )
+        .unwrap();
+        header(&mut m, BUF, VIRTIO_BLK_T_IN, 0);
+        put_desc(&mut m, 0, BUF, 8, N, 1);
+        put_desc(&mut m, 1, BUF + 8, 8, N, 2);
+        for i in 0..SEG_MAX as u16 {
+            put_desc(
+                &mut m,
+                2 + i,
+                BUF + 0x10000 + u64::from(i) * 512,
+                512,
+                N | W,
+                3 + i,
+            );
+        }
+        let st = BUF + 0x8000;
+        put_desc(&mut m, 2 + SEG_MAX as u16, st, 1, W, 0);
+        publish(&mut m, 0, 0, 1);
+        let s = b.process_queue(&mut m).unwrap();
+        assert_eq!((s.completed, s.ok), (1, 1));
+        let mut sb = [0xffu8; 1];
+        m.read_at(GuestAddress::new(st), &mut sb).unwrap();
+        assert_eq!(sb[0], 0);
+    }
+
     /// MVM-1: 上限超過のチェーンは IOERR で完了し、キューが進む。
     #[test]
     fn mvm1_oversized_chain_completes_with_ioerr() {

@@ -30,7 +30,9 @@ pub const VRING_DESC_F_WRITE: u16 = 2;
 /// 記述子の `flags`: 間接記述子テーブル（非対応）。
 pub const VRING_DESC_F_INDIRECT: u16 = 4;
 
-/// 1 チェーンに含められる記述子数の上限（キュー長でも頭打ちにする）。
+/// virtio-block が広告するセグメント数（`SEG_MAX`）の導出元となる記述子数。
+/// チェーンの走査上限ではない（走査はキュー長で頭打ち。ヘッダの分割など記述子境界に
+/// 依存せず、広告値内の要求を `ChainTooLong` にしないため。MVM-1）。
 pub const MAX_CHAIN_LEN: usize = 128;
 /// 1 チェーンの合計バイト数の上限（readable / writable それぞれ）。
 pub const MAX_CHAIN_BYTES: u64 = 16 << 20;
@@ -250,7 +252,7 @@ impl SplitQueue {
         mem: &GuestMemory<B>,
         head: u16,
     ) -> Result<DescriptorChain, VirtqueueError> {
-        let limit = MAX_CHAIN_LEN.min(usize::from(self.size));
+        let limit = usize::from(self.size);
         let mut index = head;
         let mut visited: Vec<u16> = Vec::new();
         let mut descriptors = Vec::new();
@@ -394,7 +396,7 @@ pub(crate) mod test_support {
     }
 
     /// 最小のデバイス（QueueConfig を作るためだけ）。
-    struct Nop;
+    struct Nop([u16; 1]);
     impl VirtioDevice for Nop {
         fn device_type(&self) -> VirtioDeviceType {
             VirtioDeviceType::Block
@@ -403,7 +405,7 @@ pub(crate) mod test_support {
             FeatureBits::EMPTY
         }
         fn queue_max_sizes(&self) -> &[u16] {
-            &[16]
+            &self.0
         }
         fn read_config(&self, _: u64, _: &mut [u8]) {}
         fn write_config(&mut self, _: u64, _: &[u8]) {}
@@ -415,7 +417,12 @@ pub(crate) mod test_support {
 
     /// トランスポート経由で ready なサイズ 16 のキュー設定を得る。
     pub fn queue_cfg(desc: u64, avail: u64, used: u64) -> QueueConfig {
-        let mut t = VirtioMmioTransport::new(Nop).unwrap();
+        queue_cfg_sized(desc, avail, used, 16)
+    }
+
+    /// キュー長 `size` の ready なキュー設定を得る。
+    pub fn queue_cfg_sized(desc: u64, avail: u64, used: u64, size: u16) -> QueueConfig {
+        let mut t = VirtioMmioTransport::new(Nop([size])).unwrap();
         let w = |t: &mut VirtioMmioTransport<Nop>, off: u64, v: u32| {
             t.write(off, &v.to_le_bytes());
         };
@@ -425,7 +432,7 @@ pub(crate) mod test_support {
         w(&mut t, reg::DRIVER_FEATURES, 1);
         w(&mut t, reg::STATUS, 11);
         w(&mut t, reg::QUEUE_SEL, 0);
-        w(&mut t, reg::QUEUE_NUM, 16);
+        w(&mut t, reg::QUEUE_NUM, u32::from(size));
         w(&mut t, reg::QUEUE_DESC_LOW, desc as u32);
         w(&mut t, reg::QUEUE_DESC_HIGH, (desc >> 32) as u32);
         w(&mut t, reg::QUEUE_DRIVER_LOW, avail as u32);
@@ -582,6 +589,35 @@ mod tests {
         assert_eq!(chain.readable_len(), 32 << 20);
         assert_eq!(q.last_avail, 1);
         assert!(q.pop(&m).unwrap().is_none());
+    }
+
+    /// MVM-1: キュー長 256 では 129 記述子のチェーンを走査でき、キュー長を超えるチェーンは拒否する。
+    #[test]
+    fn mvm1_chain_walk_limit_is_queue_size() {
+        let n = VRING_DESC_F_NEXT;
+        let q256 = |m: &Mem| SplitQueue::new(&queue_cfg_sized(DESC, AVAIL, USED, 256), m).unwrap();
+        let mut m = new_mem();
+        for i in 0..129u16 {
+            put_desc(&mut m, i, BUF, 8, if i == 128 { 0 } else { n }, i + 1);
+        }
+        publish(&mut m, 0, 0, 1);
+        let mut q = q256(&m);
+        assert_eq!(q.pop(&m).unwrap().unwrap().descriptors().len(), 129);
+        assert_eq!(q.last_avail, 1);
+        // 256 記述子ちょうどは通る。
+        let mut m = new_mem();
+        for i in 0..256u16 {
+            put_desc(&mut m, i, BUF, 8, if i == 255 { 0 } else { n }, i + 1);
+        }
+        publish(&mut m, 0, 0, 1);
+        assert_eq!(q256(&m).pop(&m).unwrap().unwrap().descriptors().len(), 256);
+        // キュー長を超えて続く連鎖は添字が一周してループとして拒否される（last_avail は進まない）。
+        let mut m = new_mem();
+        for i in 0..16u16 {
+            put_desc(&mut m, i, BUF, 8, n, (i + 1) % 16);
+        }
+        publish(&mut m, 0, 0, 1);
+        expect_err(&m, VirtqueueErrorCode::ChainLoop);
     }
 
     /// MVM-1: ring がメモリの外にあるキューと ready でないキューは作れない。

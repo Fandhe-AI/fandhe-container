@@ -756,25 +756,42 @@ pub struct DescriptorTable {
 /// x86_64 の汎用レジスタ（`kvm_regs` と同じ 18 本）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-#[allow(missing_docs)]
 pub struct X86Regs {
+    /// RAX レジスタ。
     pub rax: u64,
+    /// RBX レジスタ。
     pub rbx: u64,
+    /// RCX レジスタ。
     pub rcx: u64,
+    /// RDX レジスタ。
     pub rdx: u64,
+    /// RSI レジスタ。
     pub rsi: u64,
+    /// RDI レジスタ。
     pub rdi: u64,
+    /// RSP レジスタ。
     pub rsp: u64,
+    /// RBP レジスタ。
     pub rbp: u64,
+    /// R8 レジスタ。
     pub r8: u64,
+    /// R9 レジスタ。
     pub r9: u64,
+    /// R10 レジスタ。
     pub r10: u64,
+    /// R11 レジスタ。
     pub r11: u64,
+    /// R12 レジスタ。
     pub r12: u64,
+    /// R13 レジスタ。
     pub r13: u64,
+    /// R14 レジスタ。
     pub r14: u64,
+    /// R15 レジスタ。
     pub r15: u64,
+    /// RIP レジスタ。
     pub rip: u64,
+    /// RFLAGS レジスタ。
     pub rflags: u64,
 }
 

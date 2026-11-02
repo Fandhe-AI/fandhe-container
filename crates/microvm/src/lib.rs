@@ -16,8 +16,10 @@
 //! x86_64 は `device::KvmDevice::probe_queue_interrupt` で実機確認できる）。
 //! TASK-74.3.1・MVM-1: virtio-net の receiveq / transmitq の処理とパケット送受信（`virtio_net`。OS 非依存・unsafe なし）。
 //! TASK-74.3.2・MVM-1: virtio-net の割り込み通知（`interrupt::complete_net_notify`。キュー番号で rx / tx を振り分ける）。
+//! TASK-75.1・MVM-1: ゲストメモリの初期化（`microvm`。匿名 mmap の backing と `KVM_SET_USER_MEMORY_REGION` による登録。Linux のみ。
+//! docs/design/microvm-memory-ownership.md）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! eventfd を待つ常駐のイベントループ（TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・ゲストメモリの mmap backing と KVM 登録（TASK-75.1。docs/design/microvm-memory-ownership.md）・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! eventfd を待つ常駐のイベントループ（TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）
@@ -41,6 +43,8 @@ pub mod guest_memory;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
+#[cfg(target_os = "linux")]
+pub mod microvm;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod sys;

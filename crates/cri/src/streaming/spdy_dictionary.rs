@@ -1,10 +1,11 @@
 //! SPDY/3 のヘッダブロック用 zlib 辞書（1423 バイト。CRI-6・TASK-63.3・#681）。
 //!
 //! 辞書の内容は SPDY/3 draft（<http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3>、
-//! 「2.6.10.1 Compression」）が定める固定のバイト列で、zlib の `Z_FINISH` 以外の実装すべてが同じ値を使う。
+//! 「2.6.10.1 Compression」）が定める固定のバイト列で、SPDY/3 の実装はすべて同じ値を使う。
 //! 本ファイルの値は moby/spdystream の `spdy/dictionary.go`（commit c59e5d73daa301bde452ea77545bdf51e32554a2。
-//! Copyright 2009-2013 The Go Authors, BSD-3-Clause。Modifications Copyright 2014-2021 Docker Inc.）から写した。
-//! 帰属はルートの `NOTICE` に置く（licensing.md「非 Cargo 資産」）。
+//! ファイルの表示は「Copyright 2013 The Go Authors. All rights reserved.」で、BSD-3-Clause）から写した。
+//! 帰属表示と BSD-3-Clause の全文はルートの `NOTICE` に置く（licensing.md「非 Cargo 資産」）。
+//! この出典と帰属表示の形は、2026-11-02 のオーナー判断（PR #3692）で決めた。
 //!
 //! 取り違えを防ぐため、`spdy.rs` の試験が Adler-32 が SPDY/3 の辞書 ID（`0xe3c6a7c2`）に一致することを照合する。
 

@@ -95,12 +95,14 @@ dictionary id (0xe3c6a7c2) by a unit test. The corresponding definition
 file in this repository is crates/cri/src/streaming/spdy_dictionary.rs
 (issue #681, TASK-63.3).
 
-The attribution lines of the file at that commit:
+The attribution lines of the file at that commit (verbatim):
 
-    Copyright 2009-2013 The Go Authors. All rights reserved.
-    Modifications Copyright 2014-2021 Docker Inc.
-    Use of this source code is governed by a BSD-style license that can
-    be found in the LICENSE file of the Go project (BSD 3-Clause).
+    Copyright 2013 The Go Authors. All rights reserved.
+    Use of this source code is governed by a BSD-style
+    license that can be found in the LICENSE file.
+
+The LICENSE file referred to above is spdy/LICENSE of moby/spdystream at
+that commit (the Go project's BSD 3-Clause License, reproduced below).
 
 The attribution lines of the spdystream NOTICE file at that commit:
 

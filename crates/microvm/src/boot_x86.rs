@@ -12,8 +12,9 @@
 //!   loader が書くフィールド（`type_of_loader`・`ramdisk_image` / `ramdisk_size`・`cmd_line_ptr`）と e820 を埋める。
 //! - protected-mode 部（イメージのオフセット `(setup_sects + 1) * 512` から末尾）を `load_addr` へ置く。
 //!   64-bit のエントリは `load_addr + 0x200`（`XLF_KERNEL_64`）。
-//! - 実行時の開始は relocatable なら `align_up(load_addr, kernel_alignment)`、でなければ `pref_address`。
-//!   `[runtime_start, runtime_start + init_size)` を確保する（`init_size`）。
+//! - 実行時の展開先の開始は relocatable なら `max(align_up(load_addr, kernel_alignment), pref_address)`、
+//!   でなければ `pref_address`（`arch/x86/boot/compressed/head_64.S` が `LOAD_PHYSICAL_ADDR` と比べて大きい方を使う）。
+//!   `[runtime_start, runtime_start + init_size)` が RAM に収まらない配置は拒否する（`init_size`）。
 //! - initrd は `initrd_addr_max` 以下かつカーネルの確保域より上、4 KiB 境界の先頭に置く。
 //!
 //! # 低位メモリの配置
@@ -386,10 +387,20 @@ pub fn plan_boot(
     let pref = header.pref_address;
     let pref_usable =
         pref >= HIMEM_START && (!header.relocatable || (align_ok && pref.is_multiple_of(align)));
+    // 実際の展開先の開始。relocatable は head_64.S と同じく max(align_up(load_addr, kernel_alignment), pref_address)
+    // （pref_address は LOAD_PHYSICAL_ADDR 相当）、非 relocatable は pref_address 固定。
+    // 確保域は protected-mode 部の置き場所と、展開先の `[run_start, run_start + init_size)` の和の終端まで。
     let range_end = |load_addr: u64| -> Result<u64, MicrovmError> {
+        let run_start = if header.relocatable {
+            align_up(load_addr, align)
+                .ok_or_else(|| invalid("kernel load range overflows"))?
+                .max(pref)
+        } else {
+            pref
+        };
         load_addr
             .checked_add(payload_len)
-            .zip(load_addr.checked_add(u64::from(header.init_size)))
+            .zip(run_start.checked_add(u64::from(header.init_size)))
             .map(|(a, b)| a.max(b))
             .ok_or_else(|| invalid("kernel load range overflows"))
     };
@@ -420,14 +431,7 @@ pub fn plan_boot(
                 "kernel does not fit in guest memory",
             ));
         }
-        // 再配置したときも実 bzImage は pref_address の窓へ展開しうるため、窓が RAM に収まるなら
-        // initrd はそこにも重ねない（展開中の上書き防止）。
-        let floor = match pref.checked_add(u64::from(header.init_size)) {
-            Some(window_end) if pref_usable && load_addr != pref && window_end <= mem_len => {
-                kernel_end.max(window_end)
-            }
-            _ => kernel_end,
-        };
+        let floor = kernel_end;
         let initrd = match initrd_len {
             None => None,
             Some(0) => return Err(invalid("initrd must not be empty")),
@@ -958,16 +962,34 @@ mod tests {
         );
     }
 
-    /// MVM-1・TASK-75.3.1: relocatable は pref_address 配置が RAM に収まらなければ再配置先（2 MiB）へ、非 relocatable は拒否する。
+    /// MVM-1・TASK-75.3.1: relocatable でも展開先 max(align_up(load, alignment), pref_address) から init_size が RAM に収まらなければ拒否する
+    /// （pref=16 MiB・init_size=4 MiB・RAM=8 MiB で 2 MiB へ再配置しても展開先 16〜20 MiB は RAM 外。Codex 指摘の再現）。
     #[test]
-    fn mvm1_884_relocatable_falls_back_when_pref_does_not_fit() {
+    fn mvm1_884_relocatable_rejects_when_decompress_window_outside_ram() {
         let img = Img {
-            pref: 0x100_0000,
+            pref: 16 * MIB,
+            init_size: 4 * MIB as u32,
             ..Img::default()
         }
         .build();
         let mut m = mem(8 * MIB);
+        expect_err(
+            load_linux(&mut m, &img, None, &cmd("")),
+            MicrovmErrorCode::ResourceExhausted,
+            "kernel does not fit in guest memory",
+        );
+        // 窓がちょうど収まる RAM（20 MiB）では、再配置先の 2 MiB を使わず pref_address に置かれる。
+        let mut m = mem(20 * MIB);
         let l = load_linux(&mut m, &img, None, &cmd("")).unwrap();
+        assert_eq!(l.kernel_addr, GuestAddress::new(16 * MIB));
+        // pref_address が無い relocatable は従来どおり 2 MiB。
+        let img = Img {
+            pref: 0,
+            init_size: 4 * MIB as u32,
+            ..Img::default()
+        }
+        .build();
+        let l = load_linux(&mut mem(8 * MIB), &img, None, &cmd("")).unwrap();
         assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
         let img = Img {
             relocatable: 0,
@@ -976,7 +998,9 @@ mod tests {
         }
         .build();
         assert_eq!(
-            load_linux(&mut m, &img, None, &cmd("")).unwrap_err().code(),
+            load_linux(&mut mem(8 * MIB), &img, None, &cmd(""))
+                .unwrap_err()
+                .code(),
             MicrovmErrorCode::ResourceExhausted
         );
     }

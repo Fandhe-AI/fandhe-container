@@ -25,6 +25,8 @@ pub mod port_mapping;
 pub mod runtime_service;
 pub mod shim_v2;
 pub mod stop_signal;
+#[cfg(unix)]
+mod sys;
 
 /// cri-api の proto package `runtime` に対応するモジュール階層（CRI-3・TASK-56.4）。
 pub mod runtime {

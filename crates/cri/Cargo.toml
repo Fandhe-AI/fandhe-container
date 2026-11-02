@@ -11,6 +11,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+# src/bin/shim_v2_main.rs を shim_v2_main として二重に自動検出させない（下の [[bin]] で名前を明示。#872・CRI-5）。
+autobins = false
+
+# containerd が exec する shim v2 の起動バイナリ（TASK-62.7.1・#872・CRI-5）。依存は足さない。
+[[bin]]
+name = "containerd-shim-fandhe-container-v2"
+path = "src/bin/shim_v2_main.rs"
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

@@ -1,6 +1,6 @@
 //! UDS 上の ttrpc サーバー（unix のみ。CRI-5・TASK-62.1・MS-7）。
 //!
-//! 呼び出し元（将来は shim の起動経路。#803）が bind 済みの `UnixListener` を渡し、
+//! 呼び出し元（shim の起動経路 `bootstrap`。#872）が bind 済みの `UnixListener` を渡し、
 //! [`TtrpcServer::serve`] が accept スレッドを起こして [`ServerHandle`] を返す。
 //! 接続ごとに 1 スレッドで要求を読み、dispatch は要求ごとのスレッド（接続あたり上限つき）で並行に行う。
 //! 応答の書き込みは接続内で直列化する。待ち中の Wait が後続の RPC を塞がず、サーバー停止・接続切断は
@@ -15,7 +15,13 @@
 //! 計測（REPAIR-4）: [`TtrpcServer::with_recorder`] で渡した [`CriOpRecorder`] へ、要求ごとに固定の
 //! 操作種別・結果コード・所要時間だけを渡す（要求の中身・文言は渡さない）。
 //!
-//! peer UID の照合・socket の配置と権限は扱わない（#803。REPAIR-3）。
+//! peer UID の照合は accept 直後に行う（`ServerConfig::allowed_peer_uids`・PLUG-12）。socket の配置と権限は `bootstrap` が扱う。
+//!
+//! 監査（SEC-4・PLUG-12）: [`TtrpcServer::with_audit_sink`] で core の `AuditSink` を渡すと、peer UID の拒否
+//! （許可外 uid・uid を取得できない接続）を層 `plugin_peer` の `AuditRecord` として 1 件ずつ記録する。
+//! 理由は core の `PluginPeerRejection`（`PeerUidMismatch`・`PeerUidUnavailable`）で区別する。accept スレッドを
+//! 塞がないため、記録は有界キュー（`try_send`）経由の専用スレッドが `AuditSink::record` で行う。あふれた記録と
+//! sink の失敗は stderr へ固定語彙の 1 行で残し、接続の拒否は記録の成否に影響されない（fail-closed）。
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::audit_log::{
+    AuditRecord, AuditSink, AuditTimestamp, PluginPeerRejection, RECORD_WAIT_LIMIT, current_pid,
+};
 use prost::Message;
 use tonic::Code;
 
@@ -45,8 +54,14 @@ pub struct ServerConfig {
     pub write_timeout: Duration,
     /// 停止時に各スレッドの終了を待つ期限。
     pub shutdown_timeout: Duration,
+    /// 停止時に監査の書き込みキューの排出を待つ期限(SEC-4・REPAIR-5)。既定は [`AUDIT_DRAIN_LIMIT`]。
+    /// 期限が切れたら未書き込みの拒否レコードが失われうる旨を stderr へ出して停止を続ける(永久に待たない)。
+    pub audit_drain_timeout: Duration,
     /// 停止フラグを確かめる間隔。
     pub poll_interval: Duration,
+    /// 接続を受け入れる peer の実効 uid（PLUG-12）。accept 直後、要求を読む前に照合し、
+    /// 一覧に無い uid・取得できない接続は切断する。`None` は照合しない（試験用。既定は実効 uid のみ）。
+    pub allowed_peer_uids: Option<Vec<u32>>,
 }
 
 /// 期限系の設定値の上限（1 日）。`Instant` への加算・`poll_interval` の乗算を安全に保つ。
@@ -59,6 +74,7 @@ impl ServerConfig {
             ("frame_read_timeout", self.frame_read_timeout),
             ("write_timeout", self.write_timeout),
             ("shutdown_timeout", self.shutdown_timeout),
+            ("audit_drain_timeout", self.audit_drain_timeout),
             ("poll_interval", self.poll_interval),
         ];
         for (name, d) in checks {
@@ -87,7 +103,9 @@ impl Default for ServerConfig {
             frame_read_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
+            audit_drain_timeout: AUDIT_DRAIN_LIMIT,
             poll_interval: Duration::from_millis(50),
+            allowed_peer_uids: Some(vec![crate::sys::effective_uid()]),
         }
     }
 }
@@ -120,7 +138,39 @@ pub struct TtrpcServer {
     registry: Arc<ServiceRegistry>,
     config: ServerConfig,
     recorder: Arc<dyn CriOpRecorder>,
+    audit: Option<Arc<dyn AuditSink>>,
 }
+
+/// 監査レコードの書き込み待ちの上限(REPAIR-5。あふれた分は捨てて stderr へ残す)。
+const AUDIT_QUEUE_CAPACITY: usize = 64;
+
+/// 停止時に監査キューの排出を待つ既定の期限(REPAIR-5)。
+///
+/// 根拠: `sink.record` 1 回の待ちは [`RECORD_WAIT_LIMIT`](約 11.45 秒)で打ち切られる。健全な sink なら 1 件は
+/// ミリ秒で済み、`AUDIT_QUEUE_CAPACITY`(64)件でも期限に遠く収まる。sink が壊れていると 1 件ごとに
+/// `RECORD_WAIT_LIMIT` を使い、全件(64 倍 = 約 12 分)を待つのは停止を事実上止めるだけなので、書き込み中の 1 件と
+/// 次の 1 件の分(2 倍)で打ち切る。超えた分は失われうる旨を stderr へ残す。
+pub const AUDIT_DRAIN_LIMIT: Duration = RECORD_WAIT_LIMIT.saturating_mul(2);
+
+/// sink が記録に失敗したときの stderr の行(固定語彙のみ)。
+const AUDIT_UNAVAILABLE_LINE: &str = "{\"code\":\"audit_unavailable\",\"event\":\"shim_peer_audit_unavailable\",\"outcome\":\"error\"}";
+
+/// 1 プロセスが stderr へ出す通知の行数の上限。本番の daemon は stderr を `daemon.log`(追記のみ)へ向けるため、
+/// 別 UID の連続接続などで通知が際限なく増えてファイルを肥大させないよう打ち切る(超過分は黙って捨てる)。
+/// 1 行 約 100 バイトで、上限でも約 25 KB(REPAIR-5・SEC-4)。
+const STDERR_NOTICE_LIMIT: usize = 256;
+
+/// 監査の失敗通知を stderr へ 1 行出す(上限つき。書けなくても panic しない)。
+fn stderr_notice(line: &str) {
+    use std::io::Write;
+    static EMITTED: AtomicUsize = AtomicUsize::new(0);
+    if EMITTED.fetch_add(1, Ordering::Relaxed) < STDERR_NOTICE_LIMIT {
+        let _ = writeln!(io::stderr(), "{line}");
+    }
+}
+
+/// 期限切れで排出を待ち切れなかったときの stderr の行(固定語彙のみ)。
+const AUDIT_DRAIN_TIMEOUT_LINE: &str = "{\"code\":\"audit_drain_timeout\",\"event\":\"shim_peer_audit_may_be_lost\",\"outcome\":\"error\"}";
 
 impl TtrpcServer {
     /// 登録簿と設定から作る（計測しない）。
@@ -138,7 +188,16 @@ impl TtrpcServer {
             registry: Arc::new(registry),
             config,
             recorder,
+            audit: None,
         }
+    }
+
+    /// peer UID の拒否を記録する監査の記録先を付ける(SEC-4・PLUG-12)。本番の bootstrap は状態ルートの
+    /// `@audit.log` へ書く `ControlAuditRelay`(Linux。単一スレッドの間に作った helper 経由)を渡す。
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
     }
 
     /// bind 済みの listener で accept スレッドを起動する。
@@ -147,10 +206,24 @@ impl TtrpcServer {
         listener
             .set_nonblocking(true)
             .map_err(|e| ShimV2Error::Listener(e.kind()))?;
+        let socket_path = listener
+            .local_addr()
+            .ok()
+            .and_then(|a| a.as_pathname().map(std::path::Path::to_path_buf))
+            .unwrap_or_default();
+        let (audit, audit_done) = match &self.audit {
+            Some(sink) => {
+                let w = spawn_audit_writer(Arc::clone(sink))?;
+                (Some(w.tx), Some(w.done))
+            }
+            None => (None, None),
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(Ctx {
             registry: Arc::clone(&self.registry),
             recorder: Arc::clone(&self.recorder),
+            audit,
+            socket_path,
             config: self.config.clone(),
             stop: Arc::clone(&stop),
             active: AtomicUsize::new(0),
@@ -162,7 +235,9 @@ impl TtrpcServer {
         Ok(ServerHandle {
             stop,
             accept: Some(accept),
+            audit_done,
             shutdown_timeout: self.config.shutdown_timeout,
+            audit_drain_timeout: self.config.audit_drain_timeout,
         })
     }
 }
@@ -171,11 +246,19 @@ impl TtrpcServer {
 pub struct ServerHandle {
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    /// 監査の書き込みスレッドの終了通知(監査なしなら `None`)。送信側は `Ctx` だけが持つため、accept スレッドと
+    /// 接続スレッドが終わって `Ctx` が落ちると、スレッドは残りを書いて終わり通知を送る。
+    audit_done: Option<std::sync::mpsc::Receiver<()>>,
     shutdown_timeout: Duration,
+    audit_drain_timeout: Duration,
 }
 
 impl ServerHandle {
-    /// 停止して、期限内にスレッドの終了を待つ。
+    /// 停止して、期限内にスレッドの終了と監査キューの排出を待つ(SEC-4・REPAIR-5)。
+    ///
+    /// accept・接続スレッドの終了後に `Ctx`(監査の送信側)が落ち、監査スレッドが残りを書き終えて通知する。これを
+    /// `audit_drain_timeout` まで待つ。期限切れは失われうる旨を stderr へ出して `Ok` で進む。
+    /// `Drop` だけでは待たない(停止フラグを立てるのみ)。
     pub fn shutdown(mut self) -> Result<(), ShimV2Error> {
         self.stop.store(true, Ordering::SeqCst);
         let Some(h) = self.accept.take() else {
@@ -189,7 +272,14 @@ impl ServerHandle {
             thread::sleep(Duration::from_millis(5));
         }
         // 終了済みなので join は即座に戻る。panic は停止の失敗として扱う。
-        h.join().map_err(|_| ShimV2Error::ShutdownTimeout)
+        h.join().map_err(|_| ShimV2Error::ShutdownTimeout)?;
+        if let Some(done) = self.audit_done.take() {
+            // 通知が来る・送信側が落ちる(スレッドの panic)・期限切れのいずれでも戻る。後二者は失われうる。
+            if !matches!(done.recv_timeout(self.audit_drain_timeout), Ok(())) {
+                stderr_notice(AUDIT_DRAIN_TIMEOUT_LINE);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -202,6 +292,10 @@ impl Drop for ServerHandle {
 struct Ctx {
     registry: Arc<ServiceRegistry>,
     recorder: Arc<dyn CriOpRecorder>,
+    /// 監査レコードの送り先(未設定なら監査しない)。
+    audit: Option<std::sync::mpsc::SyncSender<AuditRecord>>,
+    /// bind 済み socket のパス(監査レコードの `path`)。取れなければ空。
+    socket_path: std::path::PathBuf,
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     active: AtomicUsize,
@@ -221,6 +315,10 @@ fn accept_loop(listener: UnixListener, ctx: Arc<Ctx>) {
     while !ctx.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if !peer_allowed(&stream, &ctx) {
+                    drop(stream);
+                    continue;
+                }
                 if ctx.active.fetch_add(1, Ordering::SeqCst) >= ctx.config.max_connections {
                     ctx.active.fetch_sub(1, Ordering::SeqCst);
                     drop(stream);
@@ -252,6 +350,81 @@ fn accept_loop(listener: UnixListener, ctx: Arc<Ctx>) {
     for h in conns {
         let _ = h.join();
     }
+}
+
+/// 接続元の uid が許可一覧にあるか（PLUG-12）。取得できない場合も拒否する（fail-closed）。
+/// 拒否は `PermissionDenied` として計測する（REPAIR-4）。
+fn peer_allowed(stream: &UnixStream, ctx: &Ctx) -> bool {
+    let Some(allowed) = &ctx.config.allowed_peer_uids else {
+        return true;
+    };
+    judge_peer(ctx, allowed, crate::sys::peer_uid(stream))
+}
+
+/// peer uid の取得結果から許否を決める。拒否は計測と監査の両方へ渡す(PLUG-12・SEC-4)。
+/// 取得の失敗(`Err`)は `PeerUidUnavailable`、許可外の uid は `PeerUidMismatch` として区別する。
+fn judge_peer(ctx: &Ctx, allowed: &[u32], uid: Result<u32, ()>) -> bool {
+    let started = Instant::now();
+    let rejection = match uid {
+        Ok(uid) if allowed.contains(&uid) => return true,
+        Ok(_) => PluginPeerRejection::PeerUidMismatch,
+        Err(()) => PluginPeerRejection::PeerUidUnavailable,
+    };
+    record_op(ctx, CriOpKind::ShimV2Io, Code::PermissionDenied, started);
+    submit_audit(ctx, rejection);
+    false
+}
+
+/// 拒否 1 件を型つきの監査レコードにして書き込みキューへ積む。ブロックしない(SEC-4・PLUG-12・REPAIR-5)。
+/// 組み立てられない・積めない場合は stderr へ固定語彙の 1 行を残す(接続の拒否は変えない)。
+fn submit_audit(ctx: &Ctx, rejection: PluginPeerRejection) {
+    let Some(tx) = &ctx.audit else {
+        // 記録先が無い(非 Linux。#2430)。拒否は変えず、記録できなかったことを固定語彙で残す(SEC-4)。
+        stderr_notice(AUDIT_UNAVAILABLE_LINE);
+        return;
+    };
+    let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
+        stderr_notice(AUDIT_DROPPED_LINE);
+        return;
+    };
+    let record = AuditRecord::new(ts, pid, rejection.audit_event(&ctx.socket_path));
+    if tx.try_send(record).is_err() {
+        stderr_notice(AUDIT_DROPPED_LINE);
+    }
+}
+
+/// 監査レコードを積めなかったときの stderr の行(固定語彙のみ)。
+const AUDIT_DROPPED_LINE: &str =
+    "{\"code\":\"audit_dropped\",\"event\":\"shim_peer_audit_dropped\",\"outcome\":\"error\"}";
+
+/// 監査の書き込みスレッドの送信口と終了通知。
+struct AuditWriter {
+    tx: std::sync::mpsc::SyncSender<AuditRecord>,
+    /// スレッドがキューを排出して終わると `()` が届く(`ServerHandle::shutdown` が期限つきで待つ)。
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// 監査レコードを `sink` へ書く専用スレッドを起こす。全送信側が落ちると、キューに残った分を書き終えてから
+/// 終了通知を送って終わる(`ServerHandle::shutdown` が `done` を期限つきで待つ)。
+/// スレッドを作れなければ `Err`(記録経路なしで受け付けない。SEC-4)。
+///
+/// 専用スレッド+キューにしているのは、accept スレッドで同期記録すると sink が遅いときに別 UID の連続接続で
+/// accept が止まる(DoS)ため。
+fn spawn_audit_writer(sink: Arc<dyn AuditSink>) -> Result<AuditWriter, ShimV2Error> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AuditRecord>(AUDIT_QUEUE_CAPACITY);
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("ttrpc-audit".into())
+        .spawn(move || {
+            while let Ok(record) = rx.recv() {
+                if sink.record(&record).is_err() {
+                    stderr_notice(AUDIT_UNAVAILABLE_LINE);
+                }
+            }
+            let _ = done_tx.send(());
+        })
+        .map_err(|e| ShimV2Error::Listener(e.kind()))?;
+    Ok(AuditWriter { tx, done })
 }
 
 /// 読み取りの結果。
@@ -676,5 +849,70 @@ fn conn_loop<'scope, 'env>(
         if !send_response(ctx, writer, done, sid, &resp, started) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fandhe_container_core::audit_log::AuditLayer;
+    use fandhe_container_core::traits::TraitError;
+
+    /// 記録を溜めるだけの sink。
+    struct Collect(Mutex<Vec<AuditRecord>>);
+
+    impl AuditSink for Collect {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    fn ctx_with(tx: std::sync::mpsc::SyncSender<AuditRecord>) -> Ctx {
+        Ctx {
+            registry: Arc::new(ServiceRegistry::new()),
+            recorder: Arc::new(NoopCriOpRecorder),
+            audit: Some(tx),
+            socket_path: std::path::PathBuf::from("/run/x/s.sock"),
+            config: ServerConfig::default(),
+            stop: Arc::new(AtomicBool::new(false)),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn drain(sink: &Collect, want: usize) -> Vec<AuditRecord> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.0.lock().unwrap().len() < want && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        sink.0.lock().unwrap().clone()
+    }
+
+    /// SEC-4・PLUG-12: 許可外 uid と uid 取得失敗は、理由を区別した監査レコードが 1 件ずつ記録される。
+    /// 許可された uid は記録しない。
+    #[test]
+    fn sec4_872_peer_rejections_are_audited_with_distinct_reasons() {
+        let sink = Arc::new(Collect(Mutex::new(Vec::new())));
+        let w = spawn_audit_writer(Arc::clone(&sink) as Arc<dyn AuditSink>).unwrap();
+        let ctx = ctx_with(w.tx.clone());
+        assert!(judge_peer(&ctx, &[1000], Ok(1000)));
+        assert!(!judge_peer(&ctx, &[1000], Ok(1001)));
+        assert!(!judge_peer(&ctx, &[1000], Err(())));
+        let got = drain(&sink, 2);
+        assert_eq!(got.len(), 2);
+        let reasons: Vec<String> = got
+            .iter()
+            .map(|r| {
+                r.reason()
+                    .expect("reason must be present")
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            ["plugin_peer_uid_mismatch", "plugin_peer_uid_unavailable"]
+        );
+        assert!(got.iter().all(|r| r.layer() == AuditLayer::PluginPeer));
     }
 }

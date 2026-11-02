@@ -81,3 +81,13 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 - TASK-117 で plugin 境界をまたいでゲストメモリを渡す要求が出たとき
 
 関連: MVM-1・MVM-4・TASK-74・TASK-75・REPAIR-1・REPAIR-2・REPAIR-3・ERR-1。
+
+## TASK-75.1（#696）での実装記録
+
+backing（匿名 mmap・`KVM_SET_USER_MEMORY_REGION` 登録・munmap と Drop の後始末）を `crates/microvm/src/microvm.rs`（安全な API）と `sys.rs`（`GuestRamMap`・登録 / 削除のラッパー）に実装した。アクセス型（`guest_memory.rs`）の API は変えていない（MVM-1）。
+
+- mmap のフラグ: `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`（疎に使われるゲスト RAM が swap を予約しない。上限 `MAX_GUEST_RAM_BYTES` = 16 GiB で抑える）と `madvise(MADV_DONTFORK)`（fork 先へゲストメモリの内容を引き継がない）
+- 寿命: `RegisteredGuestRam` は VM fd を dup して持つ（`'vm` の借用を持たない。後続の VM 構成体 #697 が自己参照にならないため）。drop は slot を削除してから munmap し、削除に失敗したら mapping を漏らす（fail-closed）
+- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。性能（ブロック I/O のバッチ化）は後続の課題
+- 置き換えなかったもの: #882 の自己診断用 `GuestPage` / `RegisteredPage` と `probe_*` は残している（置き換えは任意の後続作業）
+- 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会・hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`

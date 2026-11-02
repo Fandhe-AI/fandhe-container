@@ -70,6 +70,8 @@ const FIELD_OPTIONS: u64 = 10;
 
 /// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
 const UNKNOWN_EXIT_STATUS: u32 = 255;
+/// 記録しておく作成済み ID の上限。Delete で除去するが、除去されない経路でも無制限に増やさない（REPAIR-5）。
+const CREATED_MAX: usize = 1024;
 
 /// Create / Start / Delete / Exec / Wait を処理する Task サービス。他のメソッドは `Unimplemented`。
 ///
@@ -85,7 +87,9 @@ pub struct TaskService {
     shutdown: Option<ShutdownSignal>,
     /// この shim の Create で作ったコンテナ ID。Shutdown が「残っているか」を全 ID で判定し、
     /// Create と Shutdown の判定を排他する（ロックは Create / 判定の間だけ持つ）。
-    created: Mutex<BTreeSet<String>>,
+    ///
+    /// v2 と v3 を同じ shim に登録するときは [`TaskService::with_shared_created`] で共有する。
+    created: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -106,13 +110,20 @@ impl TaskService {
             execs: ExecRegistry::new(),
             wait_config: WaitConfig::default(),
             shutdown: None,
-            created: Mutex::new(BTreeSet::new()),
+            created: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
     /// Shutdown RPC の終了要求の送り先を差し込む。無ければ `Shutdown` は `UNIMPLEMENTED`（TASK-62.7.2）。
     pub fn with_shutdown(mut self, signal: ShutdownSignal) -> Self {
         self.shutdown = Some(signal);
+        self
+    }
+
+    /// 作成済み ID の記録と判定用ロックを `other` と共有する。同じ shim に v2・v3 を登録するとき、
+    /// Create と Shutdown の判定をサービスをまたいで揃えるために使う（TASK-62.7.2）。
+    pub fn with_shared_created(mut self, other: &TaskService) -> Self {
+        self.created = Arc::clone(&other.created);
         self
     }
 
@@ -160,12 +171,16 @@ impl TaskService {
         if req.all {
             return Err(unsupported("kill all is not supported"));
         }
-        let signal = u8::try_from(req.signal).map_err(|_| {
-            RpcStatus::from_code(
-                CriErrorCode::InvalidArgument,
-                "signal number must be in 1..=64",
-            )
-        })?;
+        // 状態の照会より前に検証する（停止済み・不在の ID でも範囲外は INVALID_ARGUMENT）。
+        let signal = u8::try_from(req.signal)
+            .ok()
+            .filter(|n| (1..=64).contains(n))
+            .ok_or_else(|| {
+                RpcStatus::from_code(
+                    CriErrorCode::InvalidArgument,
+                    "signal number must be in 1..=64",
+                )
+            })?;
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         if st.lifecycle == RuntimeLifecycle::Stopped {
             return Err(RpcStatus::from_code(
@@ -186,6 +201,8 @@ impl TaskService {
         };
         let req = ShutdownRequest::decode(payload).map_err(|_| decode_failure())?;
         if req.now {
+            // 並行する Create と排他するため、要求を立てる間も `created` を持つ。
+            let _created = self.created.lock().unwrap_or_else(|p| p.into_inner());
             signal.request().map_err(|_| shutdown_gate_failure())?;
             return Ok(Vec::new());
         }
@@ -314,6 +331,12 @@ impl TaskService {
                 "shim is shutting down",
             ));
         }
+        if created.len() >= CREATED_MAX && !created.contains(&req.id) {
+            return Err(RpcStatus::from_code(
+                CriErrorCode::ResourceExhausted,
+                "too many containers created in this shim",
+            ));
+        }
         let status = self
             .adapter
             .create(&req.id, bundle)
@@ -353,6 +376,10 @@ impl TaskService {
         self.adapter
             .remove(&req.id, false)
             .map_err(|e| to_status(&e))?;
+        self.created
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&req.id);
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -1179,6 +1206,56 @@ mod tests {
             err_code(s2.handle("Create", &create_req("c3", &abs("/b")))).0,
             UNAVAILABLE
         );
+    }
+
+    /// CRI-5・TASK-62.7.2・REPAIR-5: 作成済み ID は Delete で除去され、上限を超える Create は拒否する。
+    #[test]
+    fn cri5_873_created_ids_bounded_and_purged() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        for i in 0..CREATED_MAX {
+            s.handle("Create", &create_req(&format!("c{i}"), &abs("/b")))
+                .unwrap();
+        }
+        assert_eq!(
+            err_code(s.handle("Create", &create_req("over", &abs("/b")))).0,
+            RESOURCE_EXHAUSTED
+        );
+        s.handle("Delete", &delete_req("c0", "")).unwrap();
+        assert_eq!(s.created.lock().unwrap().len(), CREATED_MAX - 1);
+        s.handle("Create", &create_req("over", &abs("/b"))).unwrap();
+    }
+
+    /// CRI-5・TASK-62.7.2: v2 と v3 で作成済み ID を共有すると、別サービスの Create も Shutdown の判定に効く。
+    #[test]
+    fn cri5_873_shutdown_sees_other_version_creates() {
+        let sig = ShutdownSignal::new();
+        let (v2, f) = svc(TaskApiVersion::V2, Fake::default());
+        let v3 = TaskService::new(
+            TaskApiVersion::V3,
+            RuntimeAdapter::from_runtime(Shared(f.clone())),
+        )
+        .with_shared_created(&v2)
+        .with_shutdown(sig.clone());
+        v2.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        let req = ShutdownRequest {
+            id: "c9".into(),
+            now: false,
+        }
+        .encode_to_vec();
+        assert!(v3.handle("Shutdown", &req).unwrap().is_empty());
+        assert!(!sig.is_requested());
+    }
+
+    /// CRI-5・TASK-62.7.2: 範囲外シグナルは状態の照会より前に INVALID_ARGUMENT になる。
+    #[test]
+    fn cri5_873_kill_signal_checked_before_state() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        for sig in [0u32, 65] {
+            assert_eq!(
+                err_code(s.handle("Kill", &kill_req("nope", sig, false, ""))).0,
+                INVALID
+            );
+        }
     }
 
     /// CRI-5・TASK-62.7.2: シグナル未注入の Shutdown は UNIMPLEMENTED。

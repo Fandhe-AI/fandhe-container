@@ -31,6 +31,7 @@
 //!   受信した WINDOW_UPDATE・SETTINGS・HEADERS は読み捨てる（従うと Go のクライアントと 64 KiB で詰まる）。
 //!   代わりに送信キューの上限（[`MAX_SEND_QUEUE_BYTES`]）と stdin の書き込み待ちで背圧を TCP に任せる
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -215,6 +216,18 @@ pub enum ExecStreamOutcome {
     ProtocolError,
     /// クライアントが先に切断した。
     PeerClosed,
+    /// プロセスは終了したが、出力・Status を通信路へ送り切れなかった（書き込み失敗。REPAIR-4）。
+    /// `code` は取得できた終了コード（取得できなければ `None`）。
+    DeliveryFailed {
+        /// 終了コード。
+        code: Option<i32>,
+    },
+    /// プロセスは終了したが、出力・Status の送出が `close_timeout` までに終わらなかった
+    /// （クライアントが受信を止めた場合。REPAIR-5）。
+    DeliveryTimedOut {
+        /// 終了コード。
+        code: Option<i32>,
+    },
 }
 
 /// [`ExecStreamOutcome`] の受け口。同期・短時間で返すこと。
@@ -359,10 +372,12 @@ fn outcome_code(outcome: ExecStreamOutcome) -> Code {
     match outcome {
         ExecStreamOutcome::Exited { .. } => Code::Ok,
         ExecStreamOutcome::ExecFailed | ExecStreamOutcome::OutputFailed => Code::Internal,
-        ExecStreamOutcome::OutputTruncated | ExecStreamOutcome::LaunchFailed => Code::Unavailable,
-        ExecStreamOutcome::StreamCreationTimeout | ExecStreamOutcome::IdleTimeout => {
-            Code::DeadlineExceeded
-        }
+        ExecStreamOutcome::OutputTruncated
+        | ExecStreamOutcome::LaunchFailed
+        | ExecStreamOutcome::DeliveryFailed { .. } => Code::Unavailable,
+        ExecStreamOutcome::StreamCreationTimeout
+        | ExecStreamOutcome::IdleTimeout
+        | ExecStreamOutcome::DeliveryTimedOut { .. } => Code::DeadlineExceeded,
         ExecStreamOutcome::ProtocolError => Code::InvalidArgument,
         ExecStreamOutcome::PeerClosed => Code::Cancelled,
     }
@@ -451,11 +466,35 @@ enum ReadStop {
     Io,
 }
 
+/// 送信キュー上の 1 フレームの境界。リセットしたストリームの未送信フレームを取り除くために持つ。
+#[derive(Debug, Clone, Copy)]
+struct FrameMark {
+    /// DATA フレームのストリーム ID（それ以外は `None`。除去の対象にならない）。
+    stream_id: Option<StreamId>,
+    /// このフレームの未送信の残りバイト数。
+    len: usize,
+}
+
+/// [`Conn::goodbye`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Goodbye {
+    /// 溜めた出力・Status を送り切った（GOAWAY とシャットダウンは最善努力）。
+    Delivered,
+    /// 溜めた出力・Status の書き込みが失敗した。
+    Failed,
+    /// 溜めた出力・Status を `timeout` までに送り切れなかった。
+    TimedOut,
+}
+
 /// 接続の入出力（SPDY のフレームの組み立て・送信キュー・受信バッファ）。
 struct Conn<T> {
     io: T,
     wbuf: Vec<u8>,
     wpos: usize,
+    /// 未送信のバイトのフレーム境界（`len` は未送信の残りバイト数）。`wbuf[wpos..]` の並びと一致する。
+    marks: VecDeque<FrameMark>,
+    /// 先頭フレームを途中まで送った（途中で切れないよう送り切る必要がある）。
+    front_partial: bool,
     dec: FrameDecoder,
     enc: FrameEncoder,
     /// 通信路の読み書きの成否（REPAIR-4）。
@@ -468,6 +507,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
             io,
             wbuf: Vec::new(),
             wpos: 0,
+            marks: VecDeque::new(),
+            front_partial: false,
             dec: FrameDecoder::new(),
             enc: FrameEncoder::new(),
             stats: IoStats::default(),
@@ -482,14 +523,75 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         // 送信済み領域を追記前に取り除く。取り除かないと、書き込みが Pending のまま
         // 少量ずつ部分送信が進む場合に wbuf が累積送信量で増え、送信キューの上限
         // （MAX_SEND_QUEUE_BYTES）が未送信量しか数えないため無制限に伸びる。
+        self.compact();
+        let before = self.wbuf.len();
+        if let Err(e) = self.enc.encode(frame, &mut self.wbuf) {
+            self.wbuf.truncate(before);
+            return Err(e);
+        }
+        let stream_id = match frame {
+            Frame::Data { stream_id, .. } => Some(*stream_id),
+            _ => None,
+        };
+        let len = self.wbuf.len().saturating_sub(before);
+        self.marks.push_back(FrameMark { stream_id, len });
+        Ok(())
+    }
+
+    /// 送信済み領域を取り除く（追記・除去の前に呼ぶ。以後 `wbuf` は未送信分だけを持つ）。
+    fn compact(&mut self) {
         if self.wpos >= self.wbuf.len() {
             self.wbuf.clear();
-            self.wpos = 0;
-        } else if self.wpos > 0 {
+            self.marks.clear();
+            self.front_partial = false;
+        } else {
             self.wbuf.drain(..self.wpos);
-            self.wpos = 0;
         }
-        self.enc.encode(frame, &mut self.wbuf)
+        self.wpos = 0;
+    }
+
+    /// `n` バイト送れた分だけ先頭から境界を進める。
+    fn advance_marks(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(front) = self.marks.front_mut() else {
+                break;
+            };
+            let take = n.min(front.len);
+            front.len -= take;
+            n -= take;
+            if front.len == 0 {
+                self.marks.pop_front();
+                self.front_partial = false;
+            } else {
+                self.front_partial = true;
+            }
+        }
+    }
+
+    /// リセットされたストリームの未送信フレームを取り除く（SPDY/3 §2.3.7。CRI-6・TASK-63.2）。
+    ///
+    /// すでに一部を送ったフレームは途中で切れないよう、そのフレームだけ送り切るために残す。
+    fn purge_stream(&mut self, id: StreamId) {
+        if !self.marks.iter().any(|m| m.stream_id == Some(id)) {
+            return;
+        }
+        self.compact();
+        let mut kept = Vec::with_capacity(self.wbuf.len());
+        let mut kept_marks = VecDeque::with_capacity(self.marks.len());
+        let mut offset = 0usize;
+        for (index, mark) in self.marks.iter().enumerate() {
+            let end = offset.saturating_add(mark.len).min(self.wbuf.len());
+            let partially_sent = index == 0 && self.front_partial;
+            if (partially_sent || mark.stream_id != Some(id))
+                && let Some(bytes) = self.wbuf.get(offset..end)
+            {
+                kept.extend_from_slice(bytes);
+                kept_marks.push_back(*mark);
+            }
+            offset = end;
+        }
+        self.wbuf = kept;
+        self.marks = kept_marks;
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -503,6 +605,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
                 Poll::Ready(Ok(n)) => {
                     self.stats.conn_write_ok = true;
                     self.wpos = self.wpos.saturating_add(n);
+                    self.advance_marks(n);
                 }
                 Poll::Ready(Err(e)) => {
                     self.stats.conn_write_failed = true;
@@ -513,6 +616,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         }
         self.wbuf.clear();
         self.wpos = 0;
+        self.marks.clear();
+        self.front_partial = false;
         Pin::new(&mut self.io).poll_flush(cx)
     }
 
@@ -573,17 +678,33 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         poll_fn(|cx| self.poll_flush(cx)).await
     }
 
-    /// GOAWAY を送って期限つきで書き出し、シャットダウンする（失敗は無視。後始末の最善努力）。
-    async fn goodbye(&mut self, last_good: u32, status: u32, timeout: Duration) {
-        let _ = self.queue(&Frame::GoAway {
-            last_good_stream_id: last_good,
-            status,
-        });
-        let _ = tokio::time::timeout(timeout, async {
-            let _ = self.flush().await;
-            let _ = poll_fn(|cx| Pin::new(&mut self.io).poll_shutdown(cx)).await;
-        })
-        .await;
+    /// 溜めた送信キューを書き出してから GOAWAY を送り、シャットダウンする。
+    ///
+    /// 全体を `timeout` で区切る。溜めた出力・Status の書き込み失敗と期限切れは結果で返し、
+    /// 通信路の計装（`conn_write_failed`）にも残す。GOAWAY 以降の失敗は後始末の最善努力として無視する。
+    async fn goodbye(&mut self, last_good: u32, status: u32, timeout: Duration) -> Goodbye {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = match tokio::time::timeout_at(deadline, self.flush()).await {
+            Err(_) => Goodbye::TimedOut,
+            Ok(Err(_)) => Goodbye::Failed,
+            Ok(Ok(())) => {
+                // 溜めた分は送れた。以降は最善努力（同じ期限で打ち切り、失敗は無視する）。
+                let _ = self.queue(&Frame::GoAway {
+                    last_good_stream_id: last_good,
+                    status,
+                });
+                let _ = tokio::time::timeout_at(deadline, async {
+                    let _ = self.flush().await;
+                    let _ = poll_fn(|cx| Pin::new(&mut self.io).poll_shutdown(cx)).await;
+                })
+                .await;
+                Goodbye::Delivered
+            }
+        };
+        if result != Goodbye::Delivered {
+            self.stats.conn_write_failed = true;
+        }
+        result
     }
 }
 
@@ -854,6 +975,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             self.resizer = None;
         }
         self.retire_output(stream_id);
+        // 背圧で送信キューに残っているこのストリームの DATA・FIN も送らない（§2.3.7）。
+        self.conn.purge_stream(stream_id);
     }
 
     fn touch(&mut self) {
@@ -1133,8 +1256,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                         fins.push(out.id);
                     }
                 }
-                self.close_with_status(status.as_deref(), &fins).await;
-                outcome
+                let delivered = self.close_with_status(status.as_deref(), &fins).await;
+                // 出力・Status を送り切れなかった結末は、成功にせず送出失敗として返す（REPAIR-4・REPAIR-5）。
+                let code = match outcome {
+                    ExecStreamOutcome::Exited { code } => Some(code),
+                    _ => None,
+                };
+                match delivered {
+                    Goodbye::Delivered => outcome,
+                    Goodbye::Failed => ExecStreamOutcome::DeliveryFailed { code },
+                    Goodbye::TimedOut => ExecStreamOutcome::DeliveryTimedOut { code },
+                }
             }
         }
     }
@@ -1148,11 +1280,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             .map(|o| o.id)
             .collect();
         let status = status_internal_error(self.protocol);
-        self.close_with_status(Some(&status), &fins).await;
+        // 失敗の結末はすでに非成功。送出失敗は通信路の計装（conn_write_failed）に残る。
+        let _ = self.close_with_status(Some(&status), &fins).await;
         outcome
     }
 
-    async fn close_with_status(&mut self, status: Option<&[u8]>, extra_fins: &[StreamId]) {
+    async fn close_with_status(
+        &mut self,
+        status: Option<&[u8]>,
+        extra_fins: &[StreamId],
+    ) -> Goodbye {
         if let Some(error_id) = self.streams.error {
             send_status(
                 &mut self.conn,
@@ -1163,7 +1300,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 self.streams.last_id,
                 self.close_timeout,
             )
-            .await;
+            .await
+        } else {
+            Goodbye::Delivered
         }
     }
 }
@@ -1220,7 +1359,7 @@ async fn send_status<T: AsyncRead + AsyncWrite + Unpin>(
     reset: &[StreamId],
     last_good: u32,
     close_timeout: Duration,
-) {
+) -> Goodbye {
     // クライアントがリセットしたストリームへは何も送らない（SPDY/3 §2.3.7）。
     if !reset.contains(&error_id) {
         let _ = conn.queue(&Frame::Data {
@@ -1237,7 +1376,7 @@ async fn send_status<T: AsyncRead + AsyncWrite + Unpin>(
         });
     }
     conn.goodbye(last_good, goaway_status::OK, close_timeout)
-        .await;
+        .await
 }
 
 /// Upgrade 後の IO 1 本分の Exec セッションを最後まで駆動する。
@@ -1606,5 +1745,234 @@ mod tests {
             conn.poll_read_more(&mut cx),
             Poll::Ready(Err(ReadStop::Overflow))
         ));
+    }
+
+    /// 受け入れる総量に上限がある書き込み先（上限に達したら Pending。読み側は何も届かない）。
+    struct LimitedIo {
+        budget: usize,
+        out: Vec<u8>,
+        /// 読み取り側へ先に届けておく入力。
+        input: Vec<u8>,
+        fail_flush: bool,
+    }
+
+    impl LimitedIo {
+        fn new(budget: usize) -> Self {
+            Self {
+                budget,
+                out: Vec::new(),
+                input: Vec::new(),
+                fail_flush: false,
+            }
+        }
+    }
+
+    impl AsyncRead for LimitedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.input.is_empty() {
+                return Poll::Pending;
+            }
+            let n = self.input.len().min(buf.remaining());
+            let chunk: Vec<u8> = self.input.drain(..n).collect();
+            buf.put_slice(&chunk);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for LimitedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_flush {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+            }
+            let n = self.budget.min(data.len());
+            if n == 0 {
+                return Poll::Pending;
+            }
+            self.budget -= n;
+            if let Some(head) = data.get(..n) {
+                self.out.extend_from_slice(head);
+            }
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn data_frame(id: u32, fin: bool, data: &[u8]) -> Frame {
+        Frame::Data {
+            stream_id: StreamId::new(id).expect("stream id"),
+            fin,
+            data: data.to_vec(),
+        }
+    }
+
+    fn decode_all(bytes: &[u8]) -> Vec<Frame> {
+        let mut dec = FrameDecoder::new();
+        dec.extend(bytes);
+        let mut frames = Vec::new();
+        while let Some(f) = dec.next_frame().expect("decode") {
+            frames.push(f);
+        }
+        frames
+    }
+
+    /// CRI-6・TASK-63.2: 背圧で送信キューに残ったリセット済みストリームの DATA・FIN は送らない。
+    /// ただし部分送信を始めたフレームは境界を保って送り切る（他ストリームのフレームは残る）。
+    #[test]
+    fn cri6_purge_drops_unsent_frames_of_reset_stream_but_finishes_partial_one() {
+        let mut conn = Conn::new(LimitedIo::new(5));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        conn.queue(&data_frame(1, false, b"aaaa")).expect("queue a");
+        conn.queue(&data_frame(3, false, b"bbbb")).expect("queue b");
+        conn.queue(&data_frame(1, true, b"")).expect("queue c");
+        conn.queue(&data_frame(1, false, b"dddd")).expect("queue d");
+        // 先頭フレームの途中（5 バイト）まで送った状態で ID 1 がリセットされる。
+        assert!(conn.poll_flush(&mut cx).is_pending());
+        conn.purge_stream(StreamId::new(1).expect("stream id"));
+        conn.io.budget = 10_000;
+        assert!(conn.poll_flush(&mut cx).is_ready());
+        let frames = decode_all(&conn.io.out);
+        assert_eq!(
+            frames,
+            vec![data_frame(1, false, b"aaaa"), data_frame(3, false, b"bbbb")]
+        );
+    }
+
+    /// CRI-6・TASK-63.2: 何も送っていないフレームはリセット済みストリームの分をすべて取り除く。
+    #[test]
+    fn cri6_purge_removes_all_frames_when_nothing_was_sent() {
+        let mut conn = Conn::new(LimitedIo::new(0));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        conn.queue(&data_frame(1, false, b"aaaa")).expect("queue a");
+        conn.queue(&data_frame(3, true, b"")).expect("queue b");
+        conn.queue(&data_frame(1, true, b"")).expect("queue c");
+        conn.purge_stream(StreamId::new(1).expect("stream id"));
+        conn.io.budget = 10_000;
+        assert!(conn.poll_flush(&mut cx).is_ready());
+        assert_eq!(decode_all(&conn.io.out), vec![data_frame(3, true, b"")]);
+        assert_eq!(conn.pending_write(), 0);
+    }
+
+    /// REPAIR-4・REPAIR-5: 溜めた出力を期限までに送れなければ `TimedOut` を返し、通信路の書き込み失敗を残す。
+    #[tokio::test]
+    async fn cri6_goodbye_reports_timeout_when_peer_stops_receiving() {
+        let mut conn = Conn::new(LimitedIo::new(3));
+        conn.queue(&data_frame(1, false, b"aaaa")).expect("queue");
+        let r = conn
+            .goodbye(0, goaway_status::OK, Duration::from_millis(50))
+            .await;
+        assert_eq!(r, Goodbye::TimedOut);
+        assert!(conn.stats.conn_write_failed);
+    }
+
+    /// REPAIR-4: 溜めた出力の書き込みエラーは `Failed` で返る。送り切れれば `Delivered`。
+    #[tokio::test]
+    async fn cri6_goodbye_reports_failure_and_delivery() {
+        let mut conn = Conn::new(LimitedIo::new(10_000));
+        conn.io.fail_flush = true;
+        conn.queue(&data_frame(1, false, b"aaaa")).expect("queue");
+        let r = conn
+            .goodbye(0, goaway_status::OK, Duration::from_secs(1))
+            .await;
+        assert_eq!(r, Goodbye::Failed);
+        assert!(conn.stats.conn_write_failed);
+
+        let mut ok = Conn::new(LimitedIo::new(10_000));
+        ok.queue(&data_frame(1, false, b"aaaa")).expect("queue");
+        let r = ok
+            .goodbye(0, goaway_status::OK, Duration::from_secs(1))
+            .await;
+        assert_eq!(r, Goodbye::Delivered);
+        assert!(!ok.stats.conn_write_failed);
+    }
+
+    /// 指定バイト数の `x` を返して EOF になる stdout。
+    struct FixedOutput(usize);
+    impl AsyncRead for FixedOutput {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = self.0.min(buf.remaining());
+            buf.put_slice(&vec![b'x'; n]);
+            self.0 -= n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct OutputLauncher(usize);
+    impl ExecStreamLauncher for OutputLauncher {
+        fn launch(
+            &self,
+            _req: ExecLaunch,
+        ) -> Pin<Box<dyn Future<Output = Result<ExecSession, CriError>> + Send + '_>> {
+            let size = self.0;
+            Box::pin(async move {
+                Ok(ExecSession {
+                    stdin: None,
+                    stdout: Some(Box::new(FixedOutput(size))),
+                    stderr: None,
+                    exit: Box::pin(async { Ok(0) }),
+                    resize: None,
+                })
+            })
+        }
+    }
+
+    /// CRI-6・REPAIR-4・REPAIR-5: クライアントが受信を止めて出力・Status を送り切れないとき、
+    /// セッションは成功（Exited）にならず `DeliveryTimedOut`（終了コードは保持）と通信路の書き込み失敗になる。
+    #[tokio::test]
+    async fn cri6_session_is_not_success_when_client_stops_receiving() {
+        let mut enc = FrameEncoder::new();
+        let mut input = Vec::new();
+        for (id, kind) in [(1u32, "error"), (3, "stdout")] {
+            let mut headers = Headers::new();
+            headers.push("streamtype", kind);
+            enc.encode(
+                &Frame::SynStream {
+                    stream_id: StreamId::new(id).expect("stream id"),
+                    associated_to: 0,
+                    priority: 0,
+                    fin: false,
+                    unidirectional: false,
+                    headers,
+                },
+                &mut input,
+            )
+            .expect("encode syn");
+        }
+        // SYN_REPLY 2 本分は受けられるが、その後は一切受け取らない。
+        let mut io = LimitedIo::new(4096);
+        io.input = input;
+        let mut config = ExecStreamConfig::default();
+        config.limits.close_timeout = Duration::from_millis(100);
+        let (outcome, stats) = run_exec_session(
+            io,
+            Protocol::V4,
+            StreamOptions::new(false, true, false, false),
+            &v1::ExecRequest::default(),
+            &OutputLauncher(20_000),
+            &config,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ExecStreamOutcome::DeliveryTimedOut { code: Some(0) }
+        );
+        assert!(stats.conn_write_failed);
+        assert_eq!(outcome_code(outcome), Code::DeadlineExceeded);
     }
 }

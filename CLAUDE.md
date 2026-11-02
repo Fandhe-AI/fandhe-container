@@ -40,7 +40,7 @@ fandhe-container/
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless。testdata/ は net・gpu の試験も読む共有 fixture。tests/support/ の reap.rs〔期限つき回収の正本〕・scratch_root.rs 等は他 crate の試験も `#[path]` で共有する。#3410）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
 │   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
-│   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
+│   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI（cri の bin: containerd-shim-fandhe-container-v2。shim v2 の start / delete 起動。#872・CRI-5）
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network

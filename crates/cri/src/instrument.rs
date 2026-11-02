@@ -78,6 +78,10 @@ pub enum CriOpKind {
     ShimV2Frame,
     /// shim v2 の ttrpc の読み書き失敗・期限切れ 1 回（CRI-5・TASK-62.1・MS-7・REPAIR-4・REPAIR-5）。
     ShimV2Io,
+    /// shim v2 起動バイナリの `start` 1 回（socket の用意からデーモンの準備完了まで。CRI-5・TASK-62.7.1・REPAIR-4）。
+    ShimV2Start,
+    /// shim v2 起動バイナリの `delete` 1 回（socket の片付け。CRI-5・TASK-62.7.1・REPAIR-4）。
+    ShimV2Delete,
 }
 
 impl CriOpKind {
@@ -105,6 +109,8 @@ impl CriOpKind {
             CriOpKind::ShimV2Dispatch => "cri.shim_v2.dispatch",
             CriOpKind::ShimV2Frame => "cri.shim_v2.frame",
             CriOpKind::ShimV2Io => "cri.shim_v2.io",
+            CriOpKind::ShimV2Start => "cri.shim_v2.start",
+            CriOpKind::ShimV2Delete => "cri.shim_v2.delete",
         }
     }
 }
@@ -413,7 +419,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 18] = [
+    const ALL_KINDS: [CriOpKind; 20] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -432,6 +438,8 @@ mod tests {
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
         CriOpKind::RecordStoreLoad,
+        CriOpKind::ShimV2Start,
+        CriOpKind::ShimV2Delete,
     ];
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

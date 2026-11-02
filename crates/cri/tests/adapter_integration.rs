@@ -527,8 +527,18 @@ fn task_59_4_cri_layer_never_spawns_host_processes() {
     rust_files(&src, &mut files);
     assert!(!files.is_empty());
     for file in files {
+        // 唯一の例外: shim v2 の起動バイナリの bootstrap（#872・CRI-5）。自分自身（current_exe）を
+        // デーモンとして再実行するだけで、コンテナのプロセスは起動しない。他のファイルへ広げない。
+        // 許すのは `Command::new(exe)`（exe は current_exe）と `CommandExt` の import だけで、ファイル単位では除外しない。
+        let is_bootstrap = file.ends_with("shim_v2/bootstrap.rs");
         let text = std::fs::read_to_string(&file).expect("read source");
         for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            if is_bootstrap
+                && (line.contains("Command::new(exe)")
+                    || line.trim() == "use std::os::unix::process::CommandExt;")
+            {
+                continue;
+            }
             assert!(
                 !line.contains("Command::new") && !line.contains("process::Command"),
                 "CRI layer must not spawn processes: {}: {line}",

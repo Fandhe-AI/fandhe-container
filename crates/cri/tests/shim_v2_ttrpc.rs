@@ -415,12 +415,13 @@ impl TtrpcService for BlockingSvc {
         assert_eq!(method, "Fast");
         Ok(Vec::new())
     }
-    fn handle_cancellable(
+    fn handle_with_context(
         &self,
         method: &str,
         payload: &[u8],
-        cancelled: &dyn Fn() -> bool,
+        ctx: &fandhe_container_cri::shim_v2::CallContext<'_>,
     ) -> Result<Vec<u8>, RpcStatus> {
+        let cancelled = ctx.cancelled;
         if method != "Slow" {
             return self.handle(method, payload);
         }
@@ -484,6 +485,11 @@ fn cri5_shutdown_cancels_pending_handler() {
     h.shutdown().unwrap();
     assert!(t.elapsed() < Duration::from_secs(3));
     assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    // 停止で取り消されたハンドラの UNAVAILABLE（14）が、生きているクライアントへ届く（CRI-1・REPAIR-5）。
+    let (sid, r) = read_resp(&mut c).expect("cancelled response must reach the client");
+    assert_eq!(sid, 1);
+    let st = r.status.expect("status");
+    assert_eq!((st.code, st.message.as_str()), (14, "cancelled"));
 }
 
 /// 接続が閉じたら待ち中のハンドラも取り消される。

@@ -38,7 +38,7 @@ use tonic::Code;
 
 use super::frame::{FrameError, FrameHeader, HEADER_LEN, MAX_PAYLOAD_LEN, MessageType};
 use super::message::{RpcStatus, TtrpcRequest, TtrpcResponse, metadata_within_limit};
-use super::service::ServiceRegistry;
+use super::service::{CallContext, RequestDeadline, ServiceRegistry};
 use crate::error::CriErrorCode;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 
@@ -576,7 +576,7 @@ fn bound_response(resp: TtrpcResponse) -> TtrpcResponse {
 }
 
 /// 応答を書く。符号化の前に `encoded_len()` で上限を検証する（巨大な応答の追加確保を避ける）。
-/// 書き込み全体に絶対期限を持ち、`poll_interval` ごとに停止要求を確かめる（REPAIR-5）。
+/// 書き込み全体に絶対期限を持ち、停止要求を見たら残りを `poll_interval` までに縮める（REPAIR-5）。
 fn write_response(
     stream: &mut UnixStream,
     stream_id: u32,
@@ -594,15 +594,25 @@ fn write_response(
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&header.to_bytes());
     out.extend_from_slice(&body);
-    let deadline = deadline_after(Instant::now(), ctx.config.write_timeout);
+    let mut deadline = deadline_after(Instant::now(), ctx.config.write_timeout);
+    // 停止を初めて見た時刻から 1 刻み（poll_interval）だけは書き込みを試す。停止で取り消された Wait の
+    // `UNAVAILABLE` を生きているクライアントへ届けるため（CRI-1・REPAIR-5）。止まった相手に払う代償は
+    // この 1 刻みだけで、超えたら停止由来として `Interrupted`（計測しない）で戻る。
+    let mut stop_deadline: Option<Instant> = None;
     let mut off = 0;
     while off < out.len() {
-        if ctx.stop.load(Ordering::SeqCst) {
-            return Err(io::ErrorKind::Interrupted.into());
+        if stop_deadline.is_none() && ctx.stop.load(Ordering::SeqCst) {
+            let d = deadline_after(Instant::now(), ctx.config.poll_interval);
+            stop_deadline = Some(d);
+            deadline = deadline.min(d);
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
+            return Err(if stop_deadline.is_some_and(|d| now >= d) {
+                io::ErrorKind::Interrupted.into()
+            } else {
+                io::ErrorKind::TimedOut.into()
+            });
         }
         let slice = (deadline - now).min(ctx.config.poll_interval);
         set_write_slice(stream, slice)?;
@@ -698,7 +708,12 @@ fn handle_conn(stream: UnixStream, ctx: &Ctx) {
     let inflight = AtomicUsize::new(0);
     thread::scope(|s| {
         conn_loop(stream, ctx, &writer, &done, &inflight, s);
-        done.store(true, Ordering::SeqCst);
+        // 停止で抜けたときは `done` を立てない。取り消しは `ctx.stop` で伝わり、`done` を立てると
+        // `send_response` が書き込みを止めて、取り消された Wait の応答が届かなくなる（CRI-1）。
+        // 相手の切断・読み取り失敗のときは従来どおり立てる（書き込み先がもう無い）。
+        if !ctx.stop.load(Ordering::SeqCst) {
+            done.store(true, Ordering::SeqCst);
+        }
     });
 }
 
@@ -808,8 +823,15 @@ fn conn_loop<'scope, 'env>(
                                                 ctx.stop.load(Ordering::SeqCst)
                                                     || done.load(Ordering::SeqCst)
                                             };
+                                            let call = CallContext::new(
+                                                &cancelled,
+                                                RequestDeadline::from_timeout_nano(
+                                                    started,
+                                                    req.timeout_nano,
+                                                ),
+                                            );
                                             let resp = bound_response(
-                                                ctx.registry.dispatch_cancellable(&req, &cancelled),
+                                                ctx.registry.dispatch_with_context(&req, &call),
                                             );
                                             record_op(
                                                 ctx,

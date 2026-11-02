@@ -14,7 +14,7 @@
 //! （登録の誤り・MMIO / IO 以外の exit を渡す）は [`MicrovmError`]。
 //!
 //! # 未実装（REPAIR-3）
-//! virtqueue の処理（TASK-74.2.2・74.3.1）・割り込み配送（virtio-block は `crate::interrupt`・TASK-74.2.3、virtio-net は 74.3.2）は、
+//! virtqueue の処理（TASK-74.2.2・74.3.1）・割り込み配送（virtio-block は `crate::interrupt`・TASK-74.2.3、virtio-net は `crate::interrupt::complete_net_notify`・TASK-74.3.2）は、
 //! [`MmioAccess::Write`] の `QueueNotify` 等を受けた呼び出し元が後続 TASK で行う。PIO の具体デバイス
 //! （シリアル等）も未実装。
 

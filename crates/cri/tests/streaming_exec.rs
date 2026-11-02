@@ -1669,3 +1669,76 @@ async fn cri6_exec_stuck_flush_not_extended_by_continuous_stdin() {
         started.elapsed()
     );
 }
+
+const STATUS_TIMEOUT_V4: &str = r#"{"metadata":{},"status":"Failure","message":"command execution timed out","reason":"Timeout","code":504}"#;
+const STATUS_TIMEOUT_TEXT: &str = "command execution timed out";
+
+/// CRI-6・REPAIR-5: idle の期限切れでも error ストリームへ Failure の Status を送ってから FIN・GOAWAY で閉じる。
+/// 結末は `IdleTimeout` のまま。v4 は JSON、v3 はテキスト。
+#[tokio::test]
+async fn cri6_exec_idle_timeout_notifies_failure_status() {
+    for (version, expected) in [
+        ("v4.channel.k8s.io", STATUS_TIMEOUT_V4),
+        ("v3.channel.k8s.io", STATUS_TIMEOUT_TEXT),
+    ] {
+        let mut config = fast_config();
+        config.limits.stream_idle_timeout = Duration::from_millis(300);
+        let fx = Fixture::new(config, 8).await;
+        let path = fx.exec_path(&["hang"], false, false, true, false);
+        let addr = fx.addr();
+        let c = tokio::task::spawn_blocking(move || {
+            let mut client = Client::upgrade_with_version(addr, &path, version);
+            client.syn(1, "error");
+            client.syn(3, "stdout");
+            client.expect_reply(1);
+            client.expect_reply(3);
+            client.collect()
+        })
+        .await
+        .expect("join");
+        assert_eq!(c.text(1), expected, "{version}");
+        assert!(c.fins.contains(&1) && c.fins.contains(&3), "{version}");
+        assert_eq!(c.goaway, Some(goaway_status::OK), "{version}");
+        assert_eq!(
+            fx.wait_outcomes(1).await,
+            vec![ExecStreamOutcome::IdleTimeout],
+            "{version}"
+        );
+    }
+}
+
+/// CRI-6・REPAIR-5: stdin_stall_timeout での打ち切りでも error ストリームへ Failure の Status を送ってから閉じる。
+#[tokio::test]
+async fn cri6_exec_stdin_stall_timeout_notifies_failure_status() {
+    for (version, expected) in [
+        ("v4.channel.k8s.io", STATUS_TIMEOUT_V4),
+        ("v2.channel.k8s.io", STATUS_TIMEOUT_TEXT),
+    ] {
+        let mut config = fast_config();
+        config.stdin_stall_timeout = Duration::from_millis(300);
+        let fx = Fixture::new(config, 8).await;
+        let path = fx.exec_path(&["stuck-flush"], false, true, true, false);
+        let addr = fx.addr();
+        let c = tokio::task::spawn_blocking(move || {
+            let mut client = Client::upgrade_with_version(addr, &path, version);
+            client.syn(1, "error");
+            client.syn(3, "stdin");
+            client.syn(5, "stdout");
+            for id in [1, 3, 5] {
+                client.expect_reply(id);
+            }
+            client.data(3, b"x", false);
+            client.collect()
+        })
+        .await
+        .expect("join");
+        assert_eq!(c.text(1), expected, "{version}");
+        assert!(c.fins.contains(&1) && c.fins.contains(&5), "{version}");
+        assert_eq!(c.goaway, Some(goaway_status::OK), "{version}");
+        assert_eq!(
+            fx.wait_outcomes(1).await,
+            vec![ExecStreamOutcome::IdleTimeout],
+            "{version}"
+        );
+    }
+}

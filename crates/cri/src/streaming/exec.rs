@@ -440,6 +440,19 @@ fn status_internal_error(protocol: Protocol) -> Vec<u8> {
     }
 }
 
+/// 期限切れ（idle・stdin の停滞）で打ち切る実行の Status（v4 は `reason: Timeout` の Failure。非 0 終了ではない一般エラー）。
+const STATUS_TIMEOUT_V4: &str = r#"{"metadata":{},"status":"Failure","message":"command execution timed out","reason":"Timeout","code":504}"#;
+/// 期限切れの Status（v3・v2 はメッセージのテキスト）。
+const STATUS_TIMEOUT_TEXT: &str = "command execution timed out";
+
+/// 期限切れで打ち切る実行の Status。error ストリームが空のまま閉じると client-go は成功とみなすため、必ず書く（CRI-6）。
+fn status_timeout(protocol: Protocol) -> Vec<u8> {
+    match protocol {
+        Protocol::V4 => STATUS_TIMEOUT_V4.as_bytes().to_vec(),
+        Protocol::V3 | Protocol::V2 => STATUS_TIMEOUT_TEXT.as_bytes().to_vec(),
+    }
+}
+
 /// プロセスの終了コードを error ストリームへ書く内容にする。`None` は何も書かない（v3・v2 の成功）。
 ///
 /// 非 0 の v4 は kubelet の `NonZeroExitCode`・`ExitCode` の cause（client-go が終了コードを読む）、
@@ -1290,10 +1303,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
         match end {
             RelayEnd::PeerClosed => ExecStreamOutcome::PeerClosed,
             RelayEnd::Idle => {
-                self.conn
-                    .goodbye(last, goaway_status::OK, self.close_timeout)
-                    .await;
-                ExecStreamOutcome::IdleTimeout
+                // 終了コードが無いまま打ち切るため、失敗の Status を最善努力で届ける（期限は close_timeout）。
+                // 送れなかった場合も結末は IdleTimeout のまま（送出失敗は通信路の計装に残る）。
+                let status = status_timeout(self.protocol);
+                self.finish_with(Some(&status), ExecStreamOutcome::IdleTimeout)
+                    .await
             }
             RelayEnd::Protocol => {
                 self.conn
@@ -1350,15 +1364,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
 
     /// 内部エラーの Status（詳細なし）を通知し、読み切れなかった出力にも FIN を付けて閉じる。
     async fn finish_failed(&mut self, outcome: ExecStreamOutcome) -> ExecStreamOutcome {
+        let status = status_internal_error(self.protocol);
+        self.finish_with(Some(&status), outcome).await
+    }
+
+    /// `status` を error ストリームへ通知し、読み切れなかった出力にも FIN を付けて閉じる。結末は変えない。
+    async fn finish_with(
+        &mut self,
+        status: Option<&[u8]>,
+        outcome: ExecStreamOutcome,
+    ) -> ExecStreamOutcome {
         let fins: Vec<StreamId> = [self.stdout.as_ref(), self.stderr.as_ref()]
             .into_iter()
             .flatten()
             .filter(|o| !o.eof)
             .map(|o| o.id)
             .collect();
-        let status = status_internal_error(self.protocol);
         // 失敗の結末はすでに非成功。送出失敗は通信路の計装（conn_write_failed）に残る。
-        let _ = self.close_with_status(Some(&status), &fins).await;
+        let _ = self.close_with_status(status, &fins).await;
         outcome
     }
 

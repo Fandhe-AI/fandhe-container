@@ -340,6 +340,7 @@ const _: () = {
 //   `unsigned long` は u64。可変長部は呼び出し側が u64 かポインタで渡す。
 // - `mmap` / `munmap`: LP64 で `size_t` は usize、`off_t` は i64。可変長ではない。
 // - `madvise`: `int madvise(void *addr, size_t length, int advice)`（TASK-75.1）。LP64 で `size_t` は usize。可変長ではない。
+// - `sysconf`: `long sysconf(int name)`（LP64 で `long` は i64。可変長ではない。副作用なし）。
 // - `sigaction`: `SigAction` は上の const assert（152 バイト・mask がオフセット 8・flags が 136・restorer が 144）で
 //   固定した x86_64・aarch64 の `struct sigaction` のレイアウト。第 2・3 引数は NULL 可。
 // - `pthread_sigmask`: `SigSet` は 128 バイトの `sigset_t`（上の const assert）。第 2・3 引数は NULL 可。
@@ -352,11 +353,27 @@ unsafe extern "C" {
     -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    fn sysconf(name: i32) -> i64;
     fn sigaction(signum: i32, act: *const SigAction, old: *mut SigAction) -> i32;
     fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn pthread_self() -> u64;
     fn pthread_kill(thread: u64, sig: i32) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
+}
+
+/// `_SC_PAGESIZE`（x86_64・aarch64 Linux とも 30）。
+const SC_PAGESIZE: i32 = 30;
+
+/// ホストのページサイズ（バイト）を返す。`KVM_SET_USER_MEMORY_REGION` はサイズと GPA にこれの倍数を要求する
+/// （16 KiB / 64 KiB ページの aarch64 Linux では 4096 より大きい。MVM-1・TASK-75.1）。
+/// 取得に失敗した・2 の冪でない値は fail-closed に `SysError::Os(22)`（EINVAL）で返す。
+pub(crate) fn host_page_size() -> Result<u64, SysError> {
+    // SAFETY: `sysconf` は整数 1 つを取り値を返すだけで、ポインタもメモリも触らない。
+    let n = unsafe { sysconf(SC_PAGESIZE) };
+    match u64::try_from(n) {
+        Ok(v) if v.is_power_of_two() => Ok(v),
+        _ => Err(SysError::Os(22)),
+    }
 }
 
 /// `EBUSY`（x86_64・aarch64 Linux とも 16）。

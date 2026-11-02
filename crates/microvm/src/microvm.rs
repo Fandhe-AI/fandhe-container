@@ -31,7 +31,8 @@ use crate::sys::{self, GuestRamMap, SysError};
 /// ゲスト RAM の確保上限（16 GiB。無制限確保による DoS を防ぐ。`MAP_NORESERVE` でも上限で抑える）。
 pub const MAX_GUEST_RAM_BYTES: u64 = 1 << 34;
 
-/// ゲスト RAM のサイズ・GPA の整列単位（KVM の memslot は 4 KiB 単位）。
+/// ゲスト RAM のサイズ・GPA の整列単位の下限（4 KiB）。実際の単位は `max(これ, ホストのページサイズ)`
+/// （KVM の memslot はホストの `PAGE_SIZE` の倍数を要求する。16 / 64 KiB ページの aarch64 Linux 対応）。
 pub const GUEST_RAM_ALIGN: u64 = sys::GUEST_PAGE_SIZE as u64;
 
 const EPERM: i32 = 1;
@@ -42,6 +43,12 @@ const EINVAL: i32 = 22;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOTTY: i32 = 25;
+
+/// RAM の整列単位 `max(GUEST_RAM_ALIGN, ホストのページサイズ)`。取得失敗は分類して返す。
+fn ram_align() -> Result<u64, MicrovmError> {
+    let host = sys::host_page_size().map_err(|e| classify_ram_error(RamStage::Mmap, e))?;
+    Ok(host.max(GUEST_RAM_ALIGN))
+}
 
 fn invalid(message: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, message)
@@ -121,13 +128,21 @@ pub struct GuestRam {
 impl GuestRam {
     /// `size` バイトのゼロ埋めのゲスト RAM を確保する。
     ///
-    /// `size` は 0 でなく、4 KiB の倍数で、[`MAX_GUEST_RAM_BYTES`] 以下であること（違反は `InvalidArgument`）。
+    /// `size` は 0 でなく、`max(4096, ホストのページサイズ)` の倍数で、[`MAX_GUEST_RAM_BYTES`] 以下であること（違反は `InvalidArgument`）。
     pub fn new(size: u64) -> Result<GuestRam, MicrovmError> {
+        let align = ram_align()?;
+        Self::new_aligned(size, align)
+    }
+
+    /// 整列単位 `align`（`max(4096, ホストのページサイズ)`）を指定して確保する（試験で 16 / 64 KiB を再現するため分離）。
+    fn new_aligned(size: u64, align: u64) -> Result<GuestRam, MicrovmError> {
         if size == 0 {
             return Err(invalid("guest memory size must not be zero"));
         }
-        if !size.is_multiple_of(GUEST_RAM_ALIGN) {
-            return Err(invalid("guest memory size must be a multiple of 4096"));
+        if !size.is_multiple_of(align) {
+            return Err(invalid(
+                "guest memory size must be a multiple of the host page size (at least 4096)",
+            ));
         }
         if size > MAX_GUEST_RAM_BYTES {
             return Err(invalid("guest memory size too large"));
@@ -139,7 +154,7 @@ impl GuestRam {
 
     /// `vm` の memslot `slot` に、ゲスト物理アドレス `base` から登録する。
     ///
-    /// `base` は 4 KiB 境界で、`base + size` が桁あふれしないこと。登録に失敗したときは mapping を解放して返す
+    /// `base` は `max(4096, ホストのページサイズ)` 境界で、`base + size` が桁あふれしないこと。登録に失敗したときは mapping を解放して返す
     /// （未登録なので解放してよい）。範囲が重なる既存の slot があれば `AlreadyExists`。
     pub fn register(
         self,
@@ -147,8 +162,10 @@ impl GuestRam {
         slot: u16,
         base: GuestAddress,
     ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
-        if !base.raw().is_multiple_of(GUEST_RAM_ALIGN) {
-            return Err(invalid("guest address must be a multiple of 4096"));
+        if !base.raw().is_multiple_of(ram_align()?) {
+            return Err(invalid(
+                "guest address must be a multiple of the host page size (at least 4096)",
+            ));
         }
         let size = self.map.len() as u64;
         base.checked_add(size)
@@ -255,7 +272,7 @@ mod tests {
         assert_invalid(GuestRam::new(0), "guest memory size must not be zero");
         assert_invalid(
             GuestRam::new(4097),
-            "guest memory size must be a multiple of 4096",
+            "guest memory size must be a multiple of the host page size (at least 4096)",
         );
         assert_invalid(
             GuestRam::new(MAX_GUEST_RAM_BYTES + 4096),
@@ -266,6 +283,28 @@ mod tests {
             "guest memory size too large",
         );
         assert_eq!(MAX_GUEST_RAM_BYTES, 17_179_869_184);
+    }
+
+    /// MVM-1・TASK-75.1: ホストのページサイズが 4096 を超える場合、4096 だけのサイズは確保前に拒否し、倍数は通す。
+    #[test]
+    fn guest_ram_size_follows_host_page_size() {
+        let msg = "guest memory size must be a multiple of the host page size (at least 4096)";
+        assert_invalid(GuestRam::new_aligned(4096, 16384), msg);
+        assert_invalid(GuestRam::new_aligned(16384 + 4096, 16384), msg);
+        assert_invalid(GuestRam::new_aligned(32768, 65536), msg);
+        assert!(GuestRam::new_aligned(16384, 16384).is_ok());
+        assert!(GuestRam::new_aligned(65536, 65536).is_ok());
+        assert!(GuestRam::new_aligned(4096, 4096).is_ok());
+    }
+
+    /// MVM-1・TASK-75.1: ホストのページサイズは 2 の冪で 4096 以上（x86_64 は 4096 の具体値）。
+    #[test]
+    fn host_page_size_is_sane() {
+        let p = sys::host_page_size().unwrap();
+        assert!(p.is_power_of_two() && p >= 4096);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(p, 4096);
+        assert_eq!(ram_align().unwrap(), p.max(GUEST_RAM_ALIGN));
     }
 
     /// MVM-1・TASK-75.1: errno の分類の具体値。

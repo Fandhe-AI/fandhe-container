@@ -49,6 +49,7 @@ use crate::runtime::v1;
 
 pub mod attach;
 pub mod exec;
+pub mod port_forward;
 pub mod remotecommand;
 pub mod spdy;
 mod spdy_dictionary;

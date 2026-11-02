@@ -1941,12 +1941,15 @@ mod tests {
     }
 
     /// PLUG-12・#3663: 祖先として辿る要素が通常ファイルなら、理由を正確に「ディレクトリでない」として拒否する。
+    ///
+    /// symlink の所有者の判定は本番と同じ root のみにする。macOS の `/tmp` は root 所有の symlink
+    /// （実体は `/private/tmp`）で、何も信頼しない判定では目的の要素に届く前にそこで拒否されるため。
     #[cfg(unix)]
     #[test]
     fn plug12_3663_non_directory_ancestor_is_rejected() {
         let t = Tmp::new("file");
         std::fs::write(t.0.join("f"), b"").unwrap();
-        let e = unix_impl::check_ancestors_with(&t.0.join("f").join("sock"), true, |_| false)
+        let e = unix_impl::check_ancestors_with(&t.0.join("f").join("sock"), true, |u| u == 0)
             .unwrap_err();
         assert!(e.message().contains("not a directory"), "{}", e.message());
     }

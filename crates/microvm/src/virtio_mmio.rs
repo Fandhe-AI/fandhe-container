@@ -7,8 +7,9 @@
 //! [`MmioWriteOutcome::QueueNotify`] 等で virtqueue 処理へ振り分ける。割り込みの実配送は TASK-74.2.3・74.3.2。
 //!
 //! # 範囲外（REPAIR-3）
-//! - ゲストメモリへのアクセスと `GuestAddress` 型: キューのアドレスはドライバが書いた値を組み立てた素の `u64` で
-//!   持つだけで、アドレスとしての検証は担当の sub-issue に残す（docs/design/microvm-memory-ownership.md）
+//! - ゲストメモリへのアクセス: キューのアドレスはドライバが書いた値を組み立てた素の `u64` で持つだけ。
+//!   アドレスとしての検証と descriptor の走査は `crate::guest_memory`・`crate::virtqueue` が担う
+//!   （docs/design/microvm-memory-ownership.md）
 //! - legacy（Version = 1）・packed virtqueue・共有メモリ領域レジスタは非対応（未知のレジスタとして無視する）
 //!
 //! # 準拠先
@@ -303,6 +304,12 @@ pub trait VirtioDevice {
     fn read_config(&self, offset: u64, data: &mut [u8]);
     /// 設定空間の書き込み（同上）。
     fn write_config(&mut self, offset: u64, data: &[u8]);
+    /// ドライバが選んだ feature をデバイス固有の必須条件で検証する。`false` なら FEATURES_OK を
+    /// 立てずに交渉を拒否する（VIRTIO 1.2 3.1.1。DRIVER_OK 時の DEVICE_NEEDS_RESET に頼らない）。
+    /// 既定は常に受理。
+    fn accepts_features(&self, _features: FeatureBits) -> bool {
+        true
+    }
     /// DRIVER_OK に達したとき 1 回呼ばれる。失敗は DEVICE_NEEDS_RESET になる。
     fn activate(
         &mut self,
@@ -725,7 +732,10 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
     fn negotiate(&mut self, new: DeviceStatus) -> MmioWriteOutcome {
         let [low, high] = self.driver_features;
         let driver = FeatureBits::from_bits(u64::from(low) | (u64::from(high) << 32));
-        if driver.is_subset_of(self.offered_features()) && driver.contains(FeatureBits::VERSION_1) {
+        if driver.is_subset_of(self.offered_features())
+            && driver.contains(FeatureBits::VERSION_1)
+            && self.device.accepts_features(driver)
+        {
             self.negotiated = Some(driver);
             self.status = new;
             MmioWriteOutcome::FeaturesAccepted

@@ -7,6 +7,7 @@
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # TASK-74.2.1 で virtio_mmio（OS 非依存の共通トランスポート）を追加（依存は増やさない。unsafe なし）。
 # TASK-74.4.2 で dispatch（VM exit の振り分け・OS 非依存・unsafe なし）と kvm_run への応答の書き戻しを追加（依存は増やさない）。
+# TASK-74.2.2 で guest_memory・virtqueue・virtio_block を追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

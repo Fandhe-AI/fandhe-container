@@ -324,7 +324,7 @@ mod e2e {
     ///
     /// 順序は Create → Connect（Create 直後の PID 取得）→ Wait（別接続・Start より前）→ Start → Connect → Wait の完了
     /// → State → Delete → Shutdown（containerd v2.1.4 の `shimTask` の呼び出し順。TASK-62.6）。返り値は Connect が返した shim の pid。
-    fn drive(sock: &Path, svc: &str, id: &str) -> u32 {
+    fn drive(sock: &Path, svc: &str, id: &str, trace: &Path) -> u32 {
         let mut c = Client::connect(sock);
         let bundle = std::env::temp_dir().join("shim-v2-e2e-bundle");
         let _: fandhe_container_cri::shim_v2::CreateTaskResponse = c.ok(
@@ -354,6 +354,13 @@ mod e2e {
             );
             r.exit_status
         });
+        // Wait がサーバーへ届いたこと（記録の `Wait begin`）を期限つきで確かめてから Start を送る。
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                std::fs::read_to_string(trace).is_ok_and(|t| t.lines().any(|l| l == "Wait begin"))
+            }),
+            "Wait must reach the server before Start"
+        );
         let started: StartResponse = c.ok(
             svc,
             "Start",
@@ -425,6 +432,35 @@ mod e2e {
 
     /// 子プロセスの pid。watchdog が期限切れで止める対象（REPAIR-5）。
     static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    /// 今回の試験プロセスが shim として起動した ID（pid を含み一意）。watchdog とガードが停止対象を絞る根拠。
+    static SHIM_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// shim デーモンの追跡ガード。panic で巻き戻っても期限つきで停止し、消滅を確認する。
+    struct DaemonGuard(String);
+
+    impl DaemonGuard {
+        fn new(id: &str) -> Self {
+            if let Ok(mut g) = SHIM_IDS.lock() {
+                g.push(id.to_owned());
+            }
+            Self(id.to_owned())
+        }
+    }
+
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            #[cfg(target_os = "linux")]
+            {
+                let pids = leftover_shims(&self.0);
+                for pid in &pids {
+                    kill_pid("KILL", *pid);
+                }
+                let _ = wait_until(Duration::from_secs(10), || {
+                    pids.iter().all(|p| !pid_alive(*p))
+                });
+            }
+        }
+    }
 
     fn kill_pid(sig: &str, pid: u32) {
         let mut cmd = Command::new("kill");
@@ -440,9 +476,12 @@ mod e2e {
                 for pid in CHILDREN.lock().map(|g| g.clone()).unwrap_or_default() {
                     kill_pid("KILL", pid);
                 }
+                // 今回の試験が起動した ID の shim だけを止める（並行実行中の別の試験は巻き込まない）。
                 #[cfg(target_os = "linux")]
-                for pid in leftover_shims(None) {
-                    kill_pid("KILL", pid);
+                for id in SHIM_IDS.lock().map(|g| g.clone()).unwrap_or_default() {
+                    for pid in leftover_shims(&id) {
+                        kill_pid("KILL", pid);
+                    }
                 }
                 eprintln!("shim_v2: WATCHDOG EXPIRED after {}s", WATCHDOG.as_secs());
                 std::process::exit(124);
@@ -485,9 +524,9 @@ mod e2e {
         }
     }
 
-    /// 自分の試験バイナリで動いている shim デーモンの pid（cmdline が `-id <id>` を含むもの。`id` が None なら全部）。
+    /// 自分の試験バイナリで動いている shim デーモンの pid（cmdline が `-id <id>` を含むもの）。
     #[cfg(target_os = "linux")]
-    fn leftover_shims(id: Option<&str>) -> Vec<u32> {
+    fn leftover_shims(id: &str) -> Vec<u32> {
         let Ok(me) = std::env::current_exe() else {
             return Vec::new();
         };
@@ -495,15 +534,14 @@ mod e2e {
             return Vec::new();
         };
         let own = std::process::id();
-        let needle = id.map(|i| format!("-id\0{i}\0"));
+        let needle = format!("-id\0{id}\0");
         rd.flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
             .filter(|&pid| pid != own)
             .filter(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == me))
-            .filter(|pid| match &needle {
-                None => true,
-                Some(n) => std::fs::read(format!("/proc/{pid}/cmdline"))
-                    .is_ok_and(|c| String::from_utf8_lossy(&c).contains(n.as_str())),
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| String::from_utf8_lossy(&c).contains(needle.as_str()))
             })
             .collect()
     }
@@ -522,14 +560,16 @@ mod e2e {
             let signal = ShutdownSignal::new();
             let mut reg = ServiceRegistry::new();
             let adapter = RuntimeAdapter::from_runtime(Shared(Arc::new(Fake::default())));
-            reg.register(Arc::new(
-                TaskService::new(version, adapter).with_shutdown(signal.clone()),
-            ))
+            let trace = root.join("trace");
+            reg.register(Arc::new(Traced {
+                inner: TaskService::new(version, adapter).with_shutdown(signal.clone()),
+                trace: Some(trace.clone()),
+            }))
             .unwrap();
             let handle = TtrpcServer::new(reg, ServerConfig::default())
                 .serve(listener)
                 .unwrap();
-            let shim_pid = drive(&path, svc, "c1");
+            let shim_pid = drive(&path, svc, "c1", &trace);
             assert_eq!(shim_pid, std::process::id());
             assert!(signal.is_requested(), "Shutdown must request daemon exit");
             assert!(handle.wait_idle(Duration::from_secs(5)));
@@ -543,6 +583,7 @@ mod e2e {
         let root = scratch("bs");
         let id = format!("e2e{}", std::process::id());
         let trace = root.join("trace");
+        let _guard = DaemonGuard::new(&id);
         let me = std::env::current_exe().expect("own executable");
         let mut cmd = Command::new(&me);
         cmd.args(["-namespace", "fandhe-e2e", "-address"])
@@ -562,7 +603,7 @@ mod e2e {
         assert_eq!(out.stderr, b"", "start must not write to stderr");
         let addr = String::from_utf8(out.stdout).unwrap();
         let sock = PathBuf::from(addr.strip_prefix("unix://").expect("unix:// address"));
-        let shim_pid = drive(&sock, SVC_V2, "c1");
+        let shim_pid = drive(&sock, SVC_V2, "c1", &trace);
         assert_ne!(shim_pid, std::process::id(), "daemon is a separate process");
         assert!(
             wait_until(Duration::from_secs(10), || !sock.exists()
@@ -664,13 +705,23 @@ mod e2e {
                 "{name} is not installed (set {env} to an absolute path)"
             ));
         };
-        let m = std::fs::metadata(&p).unwrap_or_else(|_| precondition_failed("cannot stat tool"));
-        if m.uid() != 0 || m.mode() & 0o022 != 0 {
-            precondition_failed(&format!(
-                "{name} must be owned by root and not group/other writable"
-            ));
+        // symlink を解決した実体を検査し、その実体のパスを実行まで使う。
+        // 実体と全祖先が root 所有で group/other 書き込み不可であれば、検査後に差し替えられない。
+        let real = std::fs::canonicalize(&p)
+            .unwrap_or_else(|_| precondition_failed("cannot resolve tool path"));
+        for a in real.ancestors() {
+            let m = std::fs::metadata(a)
+                .unwrap_or_else(|_| precondition_failed("cannot stat tool or its ancestor"));
+            if m.uid() != 0 || m.mode() & 0o022 != 0 {
+                precondition_failed(&format!(
+                    "{name} and all its ancestor directories must be owned by root and not group/other writable"
+                ));
+            }
         }
-        p
+        if !real.is_file() {
+            precondition_failed("tool is not a regular file");
+        }
+        real
     }
 
     /// 作業ディレクトリ配下に mount が残っていないか（root で消すため、残っていれば削除しない）。
@@ -710,6 +761,7 @@ mod e2e {
         let work = scratch("ct");
         let dir: PathBuf = (*work).to_path_buf();
         let id = format!("e2e{}", std::process::id());
+        let _guard = DaemonGuard::new(&id);
         let me = std::env::current_exe().expect("own executable");
         let cfg_path = dir.join("config.toml");
         std::fs::write(&cfg_path, containerd_config(&dir)).unwrap();
@@ -782,15 +834,20 @@ mod e2e {
             if !(pos("Create") < pos("Start") && pos("Start") < pos("Delete")) {
                 return Err(format!("unexpected order:\n{log}"));
             }
-            if !wait_until(Duration::from_secs(10), || {
-                leftover_shims(Some(&id)).is_empty()
-            }) {
+            if !wait_until(Duration::from_secs(10), || leftover_shims(&id).is_empty()) {
                 return Err("shim daemon still alive after the run".into());
             }
             for what in ["tasks", "containers"] {
                 let o =
                     reap::output_within(&mut ctr_cmd(&[what, "ls", "-q"]), Duration::from_secs(10))
                         .map_err(|e| format!("ctr {what} ls: {e}"))?;
+                if !o.status.success() {
+                    return Err(format!(
+                        "ctr {what} ls failed: {:?}; stderr: {}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr)
+                    ));
+                }
                 if !o.stdout.is_empty() {
                     return Err(format!(
                         "{what} remain: {}",
@@ -798,9 +855,18 @@ mod e2e {
                     ));
                 }
             }
-            let socks = std::fs::read_dir(dir.join("s"))
-                .map(|rd| rd.flatten().count())
-                .unwrap_or(0);
+            let socks = match std::fs::read_dir(dir.join("s")) {
+                Ok(rd) => {
+                    let mut n = 0usize;
+                    for e in rd {
+                        e.map_err(|e| format!("read socket dir entry: {e}"))?;
+                        n += 1;
+                    }
+                    n
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(format!("read socket dir: {e}")),
+            };
             if socks != 0 {
                 return Err(format!("{socks} shim socket(s) remain"));
             }
@@ -826,7 +892,7 @@ mod e2e {
         }) {
             let _ = reap::reap(&mut daemon, Duration::from_secs(10));
         }
-        for pid in leftover_shims(Some(&id)) {
+        for pid in leftover_shims(&id) {
             kill_pid("KILL", pid);
         }
         match outcome {

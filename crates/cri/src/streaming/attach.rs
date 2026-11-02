@@ -997,10 +997,12 @@ where
                 last_good_stream_id: last_good,
                 status: goaway_status::PROTOCOL_ERROR,
             }),
-            SessionEnd::IdleTimeout => self.queue(&Frame::GoAway {
-                last_good_stream_id: last_good,
-                status: goaway_status::OK,
-            }),
+            // idle の打ち切りは終了コードの無い失敗。error ストリームが空のまま閉じると client-go が成功とみなすため
+            // Failure の Status を送る（CRI-6・REPAIR-5）。送出は close_timeout 内の最善努力で、結末は変えない。
+            SessionEnd::IdleTimeout => {
+                let status = status_timeout(self.protocol);
+                self.queue_final(Some(status), last_good)
+            }
         };
         if !queued {
             return;
@@ -1043,5 +1045,20 @@ where
             last_good_stream_id: last_good,
             status: goaway_status::OK,
         })
+    }
+}
+
+/// idle で打ち切る attach の Status（v4 は `reason: Timeout` の Failure）。
+///
+/// Exec の期限切れ（PR #3690）と同じ形・同系統の文言。Exec と共通化するのは、両者が main に揃ってから検討する。
+const STATUS_TIMEOUT_V4: &str = r#"{"metadata":{},"status":"Failure","message":"attach session timed out","reason":"Timeout","code":504}"#;
+/// idle で打ち切る attach の Status（v3・v2 はメッセージのテキスト）。
+const STATUS_TIMEOUT_TEXT: &str = "attach session timed out";
+
+/// idle の打ち切りで error ストリームへ書く Status。空のまま閉じると client-go が成功と誤認するため必ず書く（CRI-6）。
+fn status_timeout(protocol: Protocol) -> Vec<u8> {
+    match protocol {
+        Protocol::V4 => STATUS_TIMEOUT_V4.as_bytes().to_vec(),
+        Protocol::V3 | Protocol::V2 => STATUS_TIMEOUT_TEXT.as_bytes().to_vec(),
     }
 }

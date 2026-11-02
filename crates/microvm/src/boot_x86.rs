@@ -1,7 +1,8 @@
 //! x86_64 の Linux カーネル（bzImage）・initrd・cmdline のゲストメモリへのロード（TASK-75.3.1・MVM-1・MS-7。OS 非依存・unsafe なし）。
 //!
 //! 呼び出し元は `MicroVm::load_kernel`（Linux のみ）と、将来の plugin-microvm（TASK-117）。
-//! 戻り値の [`LoadedKernel`] を #885（TASK-75.3.2。vCPU のレジスタ初期化）が受け取り、`entry` を RIP、`boot_params` を RSI に設定する。
+//! 戻り値の [`LoadedKernel`] を #885（TASK-75.3.2）の [`BootCpuState::for_kernel`] が受け取り、`entry` を RIP、`boot_params` を RSI に設定する。
+//! `MicroVm::setup_boot_vcpu` が [`write_boot_tables`] で GDT・IDT・ページテーブルを書き、vCPU 0 へ [`BootCpuState`] を設定する。
 //!
 //! # 準拠するブートプロトコル（一次情報）
 //! kernel.org の v6.12 の `Documentation/arch/x86/boot.rst`（setup header・64-bit Boot Protocol）と
@@ -18,12 +19,18 @@
 //! - initrd は `initrd_addr_max` 以下かつカーネルの確保域より上、4 KiB 境界の先頭に置く。
 //!
 //! # 低位メモリの配置
-//! [`ZERO_PAGE_ADDR`]・[`CMDLINE_ADDR`] と、#885 が GDT・ページテーブル・スタックに使う [`BOOT_SCRATCH_START`]..[`BOOT_SCRATCH_END`]
+//! [`ZERO_PAGE_ADDR`]・[`CMDLINE_ADDR`] と、#885 が使う GDT（[`BOOT_GDT_START`]）・IDT（[`BOOT_IDT_START`]）・起動スタック
+//! （[`BOOT_STACK_TOP`]）・ページテーブル（[`BOOT_PML4_ADDR`]..[`BOOT_TABLES_END`]。`[BOOT_SCRATCH_START, BOOT_SCRATCH_END)` の内側）
 //! を 1 か所で定義し、重ならないことを `const` の assert で担保する。
+//!
+//! # vCPU の初期状態（TASK-75.3.2）
+//! 64-bit Boot Protocol（boot.rst）の条件に従う: long mode（CR0.PE|PG・CR4.PAE・EFER.LME|LMA）・`__BOOT_CS`（0x10）/ `__BOOT_DS`（0x18）・
+//! RSI = boot_params・割り込み禁止（IF=0）・GPA 0..4 GiB の 2 MiB ページによる恒等写像（カーネルの確保域・zero page・cmdline を覆う）。
+//! GDT のバイト列と `kvm_segment` の値は同じ記述子から導き、食い違いを型と試験で防ぐ（REPAIR-2）。
 //!
 //! # 範囲外（REPAIR-3）
 //! ELF vmlinux・PVH エントリ・aarch64 の FDT / Image・`setup_data`・ACPI / MP テーブル・EFI・4 GiB 超への配置（`ext_*`）・
-//! 複数の RAM 領域・`min_alignment`・レジスタ / GDT / ページテーブル（#885）・start / stop（#886）・
+//! 複数の RAM 領域・`min_alignment`・CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・start / stop（#886）・
 //! 失敗時の網羅的な後始末（#887）・ファイルからの読み込み（呼び出し元が上限つきで読んで渡す）は未実装。
 //!
 //! # 外部入力の扱い
@@ -42,11 +49,25 @@ pub const MAX_INITRD_BYTES: u64 = 1 << 30;
 pub const ZERO_PAGE_ADDR: u64 = 0x7000;
 /// zero page の大きさ。
 pub const ZERO_PAGE_SIZE: usize = 4096;
-/// #885 が GDT・IDT に使う領域の先頭（本 issue では使わない）。
+/// 起動用 GDT（4 エントリ・32 バイト）の GPA（TASK-75.3.2）。
 pub const BOOT_GDT_START: u64 = 0x500;
-/// #885 が起動スタック・ページテーブルに使う領域の先頭（本 issue では使わない）。
+/// 起動用 IDT（空の 8 バイト）の GPA。GDT の直後（TASK-75.3.2）。
+pub const BOOT_IDT_START: u64 = 0x520;
+/// 起動スタックと起動用ページテーブルに使う領域の先頭。
 pub const BOOT_SCRATCH_START: u64 = 0x8000;
-/// 同領域の終端（排他）。
+/// 起動スタックの初期 RSP（16 バイト整列。`BOOT_SCRATCH_START` へ向けて下へ伸びる 4 KiB 弱）。
+pub const BOOT_STACK_TOP: u64 = 0x8FF0;
+/// PML4 の GPA（CR3）。
+pub const BOOT_PML4_ADDR: u64 = 0x9000;
+/// PDPT の GPA。
+pub const BOOT_PDPT_ADDR: u64 = 0xA000;
+/// PD（4 ページ = 4 GiB 分）の先頭の GPA。
+pub const BOOT_PD_ADDR: u64 = 0xB000;
+/// 起動用ページテーブルの終端（排他）。
+pub const BOOT_TABLES_END: u64 = 0xF000;
+/// 恒等写像する GPA の上限（排他。4 GiB）。
+pub const IDENTITY_MAP_LIMIT: u64 = 4 << 30;
+/// 同領域の終端（排他）。起動用ページテーブルは [`BOOT_TABLES_END`] までで、以降は将来の拡張用。
 pub const BOOT_SCRATCH_END: u64 = 0x2_0000;
 /// cmdline の GPA。
 pub const CMDLINE_ADDR: u64 = 0x2_0000;
@@ -57,12 +78,23 @@ pub const LOW_RAM_END: u64 = 0x9_FC00;
 /// カーネルのロード先の下限（1 MiB）。
 pub const HIMEM_START: u64 = 0x10_0000;
 
-const _: () = assert!(BOOT_GDT_START < ZERO_PAGE_ADDR);
+const _: () = assert!(BOOT_GDT_START + BOOT_GDT_BYTES as u64 <= BOOT_IDT_START);
+const _: () = assert!(BOOT_IDT_START + BOOT_IDT_BYTES as u64 <= ZERO_PAGE_ADDR);
+const _: () = assert!(BOOT_SCRATCH_START < BOOT_STACK_TOP);
+const _: () = assert!(BOOT_STACK_TOP.is_multiple_of(16));
+const _: () = assert!(BOOT_STACK_TOP < BOOT_PML4_ADDR);
+const _: () = assert!(BOOT_PML4_ADDR + 0x1000 <= BOOT_PDPT_ADDR);
+const _: () = assert!(BOOT_PDPT_ADDR + 0x1000 <= BOOT_PD_ADDR);
+const _: () = assert!(BOOT_PD_ADDR + (IDENTITY_MAP_LIMIT >> 30) * 0x1000 == BOOT_TABLES_END);
+const _: () = assert!(BOOT_TABLES_END <= BOOT_SCRATCH_END);
 const _: () = assert!(ZERO_PAGE_ADDR + ZERO_PAGE_SIZE as u64 <= BOOT_SCRATCH_START);
 const _: () = assert!(BOOT_SCRATCH_START < BOOT_SCRATCH_END);
 const _: () = assert!(BOOT_SCRATCH_END <= CMDLINE_ADDR);
 const _: () = assert!(CMDLINE_ADDR + CMDLINE_CAPACITY <= LOW_RAM_END);
 const _: () = assert!(LOW_RAM_END <= HIMEM_START);
+
+const BOOT_GDT_BYTES: usize = 32;
+const BOOT_IDT_BYTES: usize = 8;
 
 // --- setup header のオフセット（boot.rst の表と 1 対 1） ---
 const OFF_SETUP_SECTS: usize = 0x1F1;
@@ -532,7 +564,7 @@ impl ZeroPage {
     }
 }
 
-/// ロード結果（#885 がレジスタ初期化に使う）。
+/// ロード結果（[`BootCpuState::for_kernel`] がレジスタ初期化に使う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LoadedKernel {
@@ -544,7 +576,7 @@ pub struct LoadedKernel {
     pub kernel_addr: GuestAddress,
     /// protected-mode 部の長さ。
     pub kernel_len: u64,
-    /// カーネルが確保する範囲の終端（排他。#885 の恒等写像の対象）。
+    /// カーネルが確保する範囲の終端（排他。[`write_boot_tables`] の恒等写像（4 GiB まで）の対象）。
     pub runtime_end: u64,
     /// cmdline の GPA。
     pub cmdline: GuestAddress,
@@ -628,6 +660,248 @@ pub fn load_linux<B: GuestMemoryBacking>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// vCPU の初期状態（TASK-75.3.2・MVM-1。64-bit Boot Protocol）
+// ---------------------------------------------------------------------------
+
+/// `__BOOT_CS`（GDT の 2 番目の有効エントリ。boot.rst の 64-bit Boot Protocol）。
+pub const BOOT_CS_SELECTOR: u16 = 0x10;
+/// `__BOOT_DS`。
+pub const BOOT_DS_SELECTOR: u16 = 0x18;
+/// 64-bit コードセグメント（P=1・DPL=0・S=1・type=0xB・G=1・L=1・D=0・limit 0xFFFFF）。Intel SDM Vol.3 の記述子形式。
+const GDT_CODE64: u64 = 0x00AF_9B00_0000_FFFF;
+/// データセグメント（P=1・DPL=0・S=1・type=3・G=1・D=1・limit 0xFFFFF）。
+const GDT_DATA: u64 = 0x00CF_9300_0000_FFFF;
+/// GDT の内容。0・1 番はヌル（`__BOOT_CS` = 0x10 を 2 番に合わせるため 1 番も空ける）。
+const GDT_ENTRIES: [u64; 4] = [0, 0, GDT_CODE64, GDT_DATA];
+const _: () = assert!(GDT_ENTRIES.len() * 8 == BOOT_GDT_BYTES);
+
+const CR0_PE: u64 = 1 << 0;
+const CR0_ET: u64 = 1 << 4;
+const CR0_PG: u64 = 1 << 31;
+const CR4_PAE: u64 = 1 << 5;
+const EFER_LME: u64 = 1 << 8;
+const EFER_LMA: u64 = 1 << 10;
+/// RFLAGS の予約ビット 1（常に 1。IF=0 で割り込み禁止）。
+const RFLAGS_RESERVED: u64 = 0x2;
+const PTE_PRESENT_RW: u64 = 0x3;
+const PTE_PAGE_SIZE: u64 = 1 << 7;
+const PAGE_2MIB: u64 = 2 << 20;
+const TABLE_PAGE: usize = 0x1000;
+
+/// KVM に設定するセグメントレジスタの値（`kvm_segment` と同じ内容。OS 非依存）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SegmentDescriptor {
+    /// セグメントの基底。
+    pub base: u64,
+    /// 実効的な limit（G=1 なら 4 KiB 単位へ展開済み）。
+    pub limit: u32,
+    /// セレクタ。
+    pub selector: u16,
+    /// type（4 bit）。
+    pub type_: u8,
+    /// P。
+    pub present: bool,
+    /// DPL（2 bit）。
+    pub dpl: u8,
+    /// D/B。
+    pub db: bool,
+    /// S（コード / データ）。
+    pub s: bool,
+    /// L（64-bit コード）。
+    pub l: bool,
+    /// G（limit の単位）。
+    pub g: bool,
+    /// AVL。
+    pub avl: bool,
+}
+
+impl SegmentDescriptor {
+    /// GDT のエントリ（8 バイト）と selector から、KVM に渡す値を導く。GDT に書くバイト列と同じ値から作るため食い違わない。
+    pub const fn from_gdt_entry(selector: u16, entry: u64) -> SegmentDescriptor {
+        let limit_raw = (entry & 0xFFFF) | (((entry >> 48) & 0xF) << 16);
+        let base = ((entry >> 16) & 0xFF_FFFF) | (((entry >> 56) & 0xFF) << 24);
+        let g = (entry >> 55) & 1 == 1;
+        let limit = if g {
+            ((limit_raw << 12) | 0xFFF) as u32
+        } else {
+            limit_raw as u32
+        };
+        SegmentDescriptor {
+            base,
+            limit,
+            selector,
+            type_: ((entry >> 40) & 0xF) as u8,
+            present: (entry >> 47) & 1 == 1,
+            dpl: ((entry >> 45) & 3) as u8,
+            db: (entry >> 54) & 1 == 1,
+            s: (entry >> 44) & 1 == 1,
+            l: (entry >> 53) & 1 == 1,
+            g,
+            avl: (entry >> 52) & 1 == 1,
+        }
+    }
+}
+
+/// GDT / IDT レジスタの値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTable {
+    /// 先頭の GPA（恒等写像のため線形アドレスと同じ）。
+    pub base: u64,
+    /// limit（バイト数 - 1）。
+    pub limit: u16,
+}
+
+/// x86_64 の汎用レジスタ（`kvm_regs` と同じ 18 本）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub struct X86Regs {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+/// ロード済みカーネルのエントリへ入るための BSP の初期状態（TASK-75.3.2・MVM-1）。
+///
+/// [`BootCpuState::for_kernel`] が純粋な計算で作り、`device::VcpuFd::set_boot_state` が KVM へ設定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BootCpuState {
+    /// 汎用レジスタ（RIP = entry・RSI = boot_params・RSP = RBP = [`BOOT_STACK_TOP`]・RFLAGS = 0x2）。
+    pub regs: X86Regs,
+    /// CS（`__BOOT_CS`。64-bit コード）。
+    pub code_segment: SegmentDescriptor,
+    /// DS / ES / FS / GS / SS（`__BOOT_DS`）。
+    pub data_segment: SegmentDescriptor,
+    /// GDTR。
+    pub gdt: DescriptorTable,
+    /// IDTR。
+    pub idt: DescriptorTable,
+    /// CR0（PE|ET|PG）。
+    pub cr0: u64,
+    /// CR3（PML4 の GPA）。
+    pub cr3: u64,
+    /// CR4（PAE）。
+    pub cr4: u64,
+    /// EFER（LME|LMA）。
+    pub efer: u64,
+}
+
+impl BootCpuState {
+    /// `loaded` のエントリへ入る初期状態を作る。`entry`・`boot_params`・`cmdline` が恒等写像の範囲（4 GiB 未満）に無い、
+    /// または `runtime_end` が範囲を超える入力は `InvalidArgument`（別 VM の値の取り違え・不正な値の拒否）。
+    pub fn for_kernel(loaded: &LoadedKernel) -> Result<BootCpuState, MicrovmError> {
+        let inside = |a: GuestAddress| a.raw() < IDENTITY_MAP_LIMIT;
+        if !inside(loaded.entry) || !inside(loaded.boot_params) || !inside(loaded.cmdline) {
+            return Err(invalid("boot address is outside the identity mapping"));
+        }
+        if loaded.runtime_end > IDENTITY_MAP_LIMIT {
+            return Err(invalid("kernel range exceeds the 4 GiB identity mapping"));
+        }
+        let regs = X86Regs {
+            rsi: loaded.boot_params.raw(),
+            rsp: BOOT_STACK_TOP,
+            rbp: BOOT_STACK_TOP,
+            rip: loaded.entry.raw(),
+            rflags: RFLAGS_RESERVED,
+            ..X86Regs::default()
+        };
+        Ok(BootCpuState {
+            regs,
+            code_segment: SegmentDescriptor::from_gdt_entry(BOOT_CS_SELECTOR, GDT_CODE64),
+            data_segment: SegmentDescriptor::from_gdt_entry(BOOT_DS_SELECTOR, GDT_DATA),
+            gdt: DescriptorTable {
+                base: BOOT_GDT_START,
+                limit: (BOOT_GDT_BYTES - 1) as u16,
+            },
+            idt: DescriptorTable {
+                base: BOOT_IDT_START,
+                limit: (BOOT_IDT_BYTES - 1) as u16,
+            },
+            cr0: CR0_PE | CR0_ET | CR0_PG,
+            cr3: BOOT_PML4_ADDR,
+            cr4: CR4_PAE,
+            efer: EFER_LME | EFER_LMA,
+        })
+    }
+}
+
+/// 起動用の GDT・IDT・ページテーブル（GPA 0..4 GiB の 2 MiB ページによる恒等写像）をゲストメモリへ書く（TASK-75.3.2）。
+///
+/// 書く範囲は固定の低位領域 `[BOOT_GDT_START, BOOT_TABLES_END)` の内側だけで、zero page・cmdline とは重ならない（const assert）。
+/// 領域が GPA 0 から始まらない、または [`BOOT_TABLES_END`] に届かないときは書く前に `InvalidArgument`。
+/// 恒等写像は 4 GiB 全域を覆い、RAM の外（MMIO 窓）へのアクセスは従来どおり VM exit になる。
+pub fn write_boot_tables<B: GuestMemoryBacking>(
+    mem: &mut GuestMemory<B>,
+) -> Result<(), MicrovmError> {
+    if mem.base() != GuestAddress::new(0) {
+        return Err(invalid("guest memory must start at GPA 0"));
+    }
+    if mem.len() < BOOT_TABLES_END {
+        return Err(invalid("guest memory is too small for the boot tables"));
+    }
+    let overflow = || invalid("page table size overflows");
+    let mut gdt = Vec::with_capacity(BOOT_GDT_BYTES);
+    for e in GDT_ENTRIES {
+        gdt.extend_from_slice(&e.to_le_bytes());
+    }
+    let idt = [0u8; BOOT_IDT_BYTES];
+
+    let mut pml4 = vec![0u8; TABLE_PAGE];
+    put_u64(&mut pml4, 0, BOOT_PDPT_ADDR | PTE_PRESENT_RW)?;
+    let mut pdpt = vec![0u8; TABLE_PAGE];
+    let pd_pages = IDENTITY_MAP_LIMIT >> 30;
+    let pd_len = usize::try_from(pd_pages)
+        .ok()
+        .and_then(|n| n.checked_mul(TABLE_PAGE))
+        .ok_or_else(overflow)?;
+    let mut pd = vec![0u8; pd_len];
+    for gb in 0..pd_pages {
+        let off = usize::try_from(gb * 8).map_err(|_| overflow())?;
+        put_u64(
+            &mut pdpt,
+            off,
+            (BOOT_PD_ADDR + gb * 0x1000) | PTE_PRESENT_RW,
+        )?;
+    }
+    for i in 0..(pd_pages * 512) {
+        let phys = i.checked_mul(PAGE_2MIB).ok_or_else(overflow)?;
+        let off = usize::try_from(i * 8).map_err(|_| overflow())?;
+        put_u64(&mut pd, off, phys | PTE_PRESENT_RW | PTE_PAGE_SIZE)?;
+    }
+
+    mem.write_at(GuestAddress::new(BOOT_GDT_START), &gdt)?;
+    mem.write_at(GuestAddress::new(BOOT_IDT_START), &idt)?;
+    mem.write_at(GuestAddress::new(BOOT_PML4_ADDR), &pml4)?;
+    mem.write_at(GuestAddress::new(BOOT_PDPT_ADDR), &pdpt)?;
+    mem.write_at(GuestAddress::new(BOOT_PD_ADDR), &pd)?;
+    Ok(())
+}
+
+fn put_u64(buf: &mut [u8], off: usize, v: u64) -> Result<(), MicrovmError> {
+    off.checked_add(8)
+        .and_then(|end| buf.get_mut(off..end))
+        .ok_or_else(|| invalid("page table entry out of range"))?
+        .copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,11 +1506,162 @@ mod tests {
     /// MVM-1・TASK-75.3.1: 低位メモリの配置の具体値（const assert と同じ関係を値で固定する）。
     #[test]
     fn mvm1_884_layout_constants() {
+        assert_eq!(BOOT_GDT_START, 0x500);
+        assert_eq!(BOOT_IDT_START, 0x520);
+        assert_eq!(BOOT_STACK_TOP, 0x8FF0);
+        assert_eq!(BOOT_TABLES_END, 0xF000);
         assert_eq!(ZERO_PAGE_ADDR, 0x7000);
         assert_eq!(CMDLINE_ADDR, 0x2_0000);
         assert_eq!(BOOT_SCRATCH_START, 0x8000);
         assert_eq!(BOOT_SCRATCH_END, 0x2_0000);
         assert_eq!(LOW_RAM_END, 0x9_FC00);
         assert_eq!(HIMEM_START, 0x10_0000);
+    }
+
+    fn heap_mem(len: u64) -> GuestMemory<HeapBacking> {
+        GuestMemory::new(GuestAddress::new(0), HeapBacking::new(len).unwrap()).unwrap()
+    }
+
+    fn loaded(entry: u64, boot_params: u64, runtime_end: u64) -> LoadedKernel {
+        LoadedKernel {
+            entry: GuestAddress::new(entry),
+            boot_params: GuestAddress::new(boot_params),
+            kernel_addr: GuestAddress::new(0x100_0000),
+            kernel_len: 0x1000,
+            runtime_end,
+            cmdline: GuestAddress::new(CMDLINE_ADDR),
+            cmdline_len: 0,
+            initrd: None,
+            protocol_version: 0x020F,
+        }
+    }
+
+    /// MVM-1・TASK-75.3.2: GDT のエントリと、そこから導いたセグメント値の具体値。
+    #[test]
+    fn mvm1_885_gdt_entries_concrete() {
+        assert_eq!(GDT_CODE64, 0x00AF_9B00_0000_FFFF);
+        assert_eq!(GDT_DATA, 0x00CF_9300_0000_FFFF);
+        let c = SegmentDescriptor::from_gdt_entry(BOOT_CS_SELECTOR, GDT_CODE64);
+        assert_eq!(
+            (c.base, c.limit, c.selector, c.type_, c.dpl),
+            (0, 0xFFFF_FFFF, 0x10, 0xB, 0)
+        );
+        assert!(c.present && c.s && c.l && c.g && !c.db && !c.avl);
+        let d = SegmentDescriptor::from_gdt_entry(BOOT_DS_SELECTOR, GDT_DATA);
+        assert_eq!(
+            (d.base, d.limit, d.selector, d.type_, d.dpl),
+            (0, 0xFFFF_FFFF, 0x18, 0x3, 0)
+        );
+        assert!(d.present && d.s && d.db && d.g && !d.l && !d.avl);
+        // 非 G の limit・base の復号（別の記述子）。
+        let x = SegmentDescriptor::from_gdt_entry(0x8, 0x0040_8912_3456_00FF);
+        assert_eq!(
+            (x.base, x.limit, x.type_, x.g, x.db, x.s),
+            (0x12_3456, 0xFF, 0x9, false, true, false)
+        );
+        // バイト列側: selector 0x10 / 0x18 の位置に同じ記述子がある。
+        let mut mem = heap_mem(0x1_0000);
+        write_boot_tables(&mut mem).unwrap();
+        let q = |a: u64| mem.read_u64_le(GuestAddress::new(a)).unwrap();
+        assert_eq!(q(BOOT_GDT_START), 0);
+        assert_eq!(q(BOOT_GDT_START + 0x8), 0);
+        assert_eq!(q(BOOT_GDT_START + 0x10), 0x00AF_9B00_0000_FFFF);
+        assert_eq!(q(BOOT_GDT_START + 0x18), 0x00CF_9300_0000_FFFF);
+    }
+
+    /// MVM-1・TASK-75.3.2: 4 GiB の恒等写像（2 MiB ページ）を具体値で照合し、終端より先へ書かない。
+    #[test]
+    fn mvm1_885_page_tables_identity_map_4gib() {
+        let mut mem = heap_mem(0x2_0000);
+        write_boot_tables(&mut mem).unwrap();
+        let q = |a: u64| mem.read_u64_le(GuestAddress::new(a)).unwrap();
+        assert_eq!(q(0x9000), 0xA003);
+        assert_eq!(q(0x9008), 0);
+        assert_eq!(q(0xA000), 0xB003);
+        assert_eq!(q(0xA008), 0xC003);
+        assert_eq!(q(0xA010), 0xD003);
+        assert_eq!(q(0xA018), 0xE003);
+        assert_eq!(q(0xA020), 0);
+        assert_eq!(q(0xB000), 0x83);
+        assert_eq!(q(0xB008), 0x20_0083);
+        assert_eq!(q(0xB000 + 511 * 8), 0x3FE0_0083);
+        assert_eq!(q(0xE000 + 511 * 8), 0xFFE0_0083);
+        // 終端以降・IDT・zero page は書き込まれない。
+        assert_eq!(q(0xF000), 0);
+        assert_eq!(q(BOOT_IDT_START), 0);
+        assert_eq!(q(ZERO_PAGE_ADDR), 0);
+    }
+
+    /// MVM-1・TASK-75.3.2: ロード結果から BSP の初期状態を具体値で導く。
+    #[test]
+    fn mvm1_885_boot_cpu_state_for_kernel() {
+        let s = BootCpuState::for_kernel(&loaded(0x100_0200, 0x7000, 0x500_0000)).unwrap();
+        assert_eq!(s.regs.rip, 0x100_0200);
+        assert_eq!(s.regs.rsi, 0x7000);
+        assert_eq!(s.regs.rsp, 0x8FF0);
+        assert_eq!(s.regs.rbp, 0x8FF0);
+        assert_eq!(s.regs.rflags, 0x2);
+        assert_eq!(
+            (s.regs.rax, s.regs.rbx, s.regs.rdi, s.regs.r15),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(s.cr0, 0x8000_0011);
+        assert_eq!(s.cr3, 0x9000);
+        assert_eq!(s.cr4, 0x20);
+        assert_eq!(s.efer, 0x500);
+        assert_eq!(
+            s.gdt,
+            DescriptorTable {
+                base: 0x500,
+                limit: 31
+            }
+        );
+        assert_eq!(
+            s.idt,
+            DescriptorTable {
+                base: 0x520,
+                limit: 7
+            }
+        );
+        assert_eq!(s.code_segment.selector, 0x10);
+        assert_eq!(s.data_segment.selector, 0x18);
+        // 4 GiB ちょうどまでは受理する。
+        BootCpuState::for_kernel(&loaded(0x100_0200, 0x7000, IDENTITY_MAP_LIMIT)).unwrap();
+    }
+
+    /// MVM-1・TASK-75.3.2: 恒等写像の外・メモリ不足・GPA 0 以外の入力を書く前に拒否する。
+    #[test]
+    fn mvm1_885_rejects_out_of_range() {
+        let e = BootCpuState::for_kernel(&loaded(0x100_0200, 0x7000, IDENTITY_MAP_LIMIT + 1))
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "kernel range exceeds the 4 GiB identity mapping"
+        );
+        let e =
+            BootCpuState::for_kernel(&loaded(IDENTITY_MAP_LIMIT, 0x7000, 0x100_0000)).unwrap_err();
+        assert_eq!(e.message(), "boot address is outside the identity mapping");
+        let e = BootCpuState::for_kernel(&loaded(0x100_0200, u64::MAX, 0x100_0000)).unwrap_err();
+        assert_eq!(e.message(), "boot address is outside the identity mapping");
+
+        let mut small = heap_mem(0xE000);
+        let e = write_boot_tables(&mut small).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "guest memory is too small for the boot tables");
+        // 小さい領域には 1 バイトも書かない。
+        assert_eq!(
+            small
+                .read_u64_le(GuestAddress::new(BOOT_GDT_START + 0x10))
+                .unwrap(),
+            0
+        );
+        let mut shifted = GuestMemory::new(
+            GuestAddress::new(0x1000),
+            HeapBacking::new(0x2_0000).unwrap(),
+        )
+        .unwrap();
+        let e = write_boot_tables(&mut shifted).unwrap_err();
+        assert_eq!(e.message(), "guest memory must start at GPA 0");
     }
 }

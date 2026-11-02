@@ -10,6 +10,8 @@
 //! `KVM_ARM_VCPU_INIT` も発行する。TASK-74.4.1 で vCPU fd の `kvm_run` 領域の mmap（`KvmRunMap`）・
 //! `KVM_RUN`・`KVM_SET_USER_MEMORY_REGION`（自己診断用の 1 ページ。`GuestPage`・`RegisteredPage`）を足した。
 //! TASK-74.4.2 で `kvm_run` 領域への応答の書き戻し（`KvmRunMap::write_from`。`device::VcpuFd::handle_exit` が呼ぶ）を足した。
+//! TASK-75.3.2 で vCPU のレジスタ初期化用に `KVM_GET_REGS` / `KVM_SET_REGS` / `KVM_GET_SREGS` / `KVM_SET_SREGS`
+//! （x86_64 のみ。`KvmRegs`・`KvmSregs` ほか。`device::VcpuFd::set_boot_state` / `regs` が呼ぶ）を足した。
 //! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
 //! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
@@ -31,6 +33,7 @@
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
 //! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
 //! 対応物が無く、サイズ・オフセットを const assert で固定する。
+//! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
 //! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
 //! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
 
@@ -122,6 +125,14 @@ pub(crate) mod consts {
     pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
     /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
     pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);
+    /// `_IOR(KVMIO, 0x81, struct kvm_regs)`（144 バイト。TASK-75.3.2）。
+    pub const KVM_GET_REGS: u64 = super::ior(super::KVMIO, 0x81, 144);
+    /// `_IOW(KVMIO, 0x82, struct kvm_regs)`（144 バイト）。
+    pub const KVM_SET_REGS: u64 = super::iow(super::KVMIO, 0x82, 144);
+    /// `_IOR(KVMIO, 0x83, struct kvm_sregs)`（312 バイト）。
+    pub const KVM_GET_SREGS: u64 = super::ior(super::KVMIO, 0x83, 312);
+    /// `_IOW(KVMIO, 0x84, struct kvm_sregs)`（312 バイト）。
+    pub const KVM_SET_SREGS: u64 = super::iow(super::KVMIO, 0x84, 312);
     pub const KVM_CAP_IRQCHIP: u64 = 0;
     pub const KVM_CAP_IRQFD: u64 = 32;
     pub const KVM_CAP_IOEVENTFD: u64 = 36;
@@ -230,6 +241,124 @@ const _: () = {
     assert!(std::mem::align_of::<KvmVcpuInit>() == 4);
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
+};
+
+/// x86_64 の `struct kvm_regs`（`asm/kvm.h`。汎用レジスタ 16 本・rip・rflags の 144 バイト。TASK-75.3.2）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KvmRegs {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+/// x86_64 の `struct kvm_segment`（`asm/kvm.h`。24 バイト）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KvmSegment {
+    pub base: u64,
+    pub limit: u32,
+    pub selector: u16,
+    pub type_: u8,
+    pub present: u8,
+    pub dpl: u8,
+    pub db: u8,
+    pub s: u8,
+    pub l: u8,
+    pub g: u8,
+    pub avl: u8,
+    pub unusable: u8,
+    pub padding: u8,
+}
+
+/// x86_64 の `struct kvm_dtable`（`asm/kvm.h`。GDT / IDT の base・limit の 16 バイト）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KvmDtable {
+    pub base: u64,
+    pub limit: u16,
+    pub padding: [u16; 3],
+}
+
+/// x86_64 の `struct kvm_sregs`（`asm/kvm.h`。312 バイト。`interrupt_bitmap` は `KVM_NR_INTERRUPTS` = 256 bit）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KvmSregs {
+    pub cs: KvmSegment,
+    pub ds: KvmSegment,
+    pub es: KvmSegment,
+    pub fs: KvmSegment,
+    pub gs: KvmSegment,
+    pub ss: KvmSegment,
+    pub tr: KvmSegment,
+    pub ldt: KvmSegment,
+    pub gdt: KvmDtable,
+    pub idt: KvmDtable,
+    pub cr0: u64,
+    pub cr2: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub cr8: u64,
+    pub efer: u64,
+    pub apic_base: u64,
+    pub interrupt_bitmap: [u64; 4],
+}
+
+// `asm/kvm.h` のレイアウトと ioctl 番号のサイズ符号を固定する。`libc` に対応物の無いカーネル ABI の構造体（照合の追跡は #3664）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<KvmRegs>() == 144);
+    assert!(align_of::<KvmRegs>() == 8);
+    assert!(offset_of!(KvmRegs, rsi) == 32);
+    assert!(offset_of!(KvmRegs, rsp) == 48);
+    assert!(offset_of!(KvmRegs, r8) == 64);
+    assert!(offset_of!(KvmRegs, rip) == 128);
+    assert!(offset_of!(KvmRegs, rflags) == 136);
+    assert!(size_of::<KvmSegment>() == 24);
+    assert!(align_of::<KvmSegment>() == 8);
+    assert!(offset_of!(KvmSegment, limit) == 8);
+    assert!(offset_of!(KvmSegment, selector) == 12);
+    assert!(offset_of!(KvmSegment, type_) == 14);
+    assert!(offset_of!(KvmSegment, present) == 15);
+    assert!(offset_of!(KvmSegment, avl) == 21);
+    assert!(offset_of!(KvmSegment, unusable) == 22);
+    assert!(size_of::<KvmDtable>() == 16);
+    assert!(offset_of!(KvmDtable, limit) == 8);
+    assert!(size_of::<KvmSregs>() == 312);
+    assert!(align_of::<KvmSregs>() == 8);
+    assert!(offset_of!(KvmSregs, tr) == 144);
+    assert!(offset_of!(KvmSregs, gdt) == 192);
+    assert!(offset_of!(KvmSregs, idt) == 208);
+    assert!(offset_of!(KvmSregs, cr0) == 224);
+    assert!(offset_of!(KvmSregs, cr3) == 240);
+    assert!(offset_of!(KvmSregs, cr4) == 248);
+    assert!(offset_of!(KvmSregs, efer) == 264);
+    assert!(offset_of!(KvmSregs, apic_base) == 272);
+    assert!(offset_of!(KvmSregs, interrupt_bitmap) == 280);
+    assert!(consts::KVM_GET_REGS == 0x8090_AE81);
+    assert!(consts::KVM_SET_REGS == 0x4090_AE82);
+    assert!(consts::KVM_GET_SREGS == 0x8138_AE83);
+    assert!(consts::KVM_SET_SREGS == 0x4138_AE84);
 };
 
 /// `struct kvm_userspace_memory_region`（`linux/kvm.h`。32 バイト）。対応外 arch では使われない。
@@ -1182,6 +1311,84 @@ pub(crate) fn kvm_arm_vcpu_init(vcpu: BorrowedFd<'_>, init: &KvmVcpuInit) -> Res
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `KVM_GET_REGS`（vCPU fd）で汎用レジスタを読む（x86_64 のみ。TASK-75.3.2）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_get_regs(vcpu: BorrowedFd<'_>) -> Result<KvmRegs, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut regs = KvmRegs::default();
+    // SAFETY: `vcpu` は借用中の生存 fd。`regs` は `repr(C)` で 144 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 144 バイトだけを
+    // 書き、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_REGS,
+            &mut regs as *mut KvmRegs,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(regs) }
+}
+
+/// `KVM_SET_REGS`（vCPU fd）で汎用レジスタを書く（x86_64 のみ。TASK-75.3.2）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_set_regs(vcpu: BorrowedFd<'_>, regs: &KvmRegs) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vcpu` は借用中の生存 fd。`regs` は `repr(C)` で 144 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 144 バイトを読むだけで書かず、
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_SET_REGS,
+            regs as *const KvmRegs,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_SREGS`（vCPU fd）でセグメント・制御レジスタを読む（x86_64 のみ。TASK-75.3.2）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_get_sregs(vcpu: BorrowedFd<'_>) -> Result<KvmSregs, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut sregs = KvmSregs::default();
+    // SAFETY: `vcpu` は借用中の生存 fd。`sregs` は `repr(C)` で 312 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 312 バイトだけを
+    // 書き、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_SREGS,
+            &mut sregs as *mut KvmSregs,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(sregs) }
+}
+
+/// `KVM_SET_SREGS`（vCPU fd）でセグメント・制御レジスタを書く（x86_64 のみ。TASK-75.3.2）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_set_sregs(vcpu: BorrowedFd<'_>, sregs: &KvmSregs) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vcpu` は借用中の生存 fd。`sregs` は `repr(C)` で 312 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 312 バイトを読むだけで書かず、
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_SET_SREGS,
+            sregs as *const KvmSregs,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,6 +1484,24 @@ mod tests {
         let page = GuestPage::new().unwrap();
         let (e, _page) = register_single_page(f.as_fd(), 0, 0x1000, page).unwrap_err();
         assert_eq!(e, SysError::Os(25));
+    }
+
+    /// MVM-1・TASK-75.3.2: レジスタ ioctl は KVM でない fd に対して ENOTTY（x86_64）。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn regs_ioctls_on_non_kvm_fd_are_enotty() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        assert_eq!(kvm_get_regs(f.as_fd()), Err(SysError::Os(25)));
+        assert_eq!(
+            kvm_set_regs(f.as_fd(), &KvmRegs::default()),
+            Err(SysError::Os(25))
+        );
+        assert_eq!(kvm_get_sregs(f.as_fd()), Err(SysError::Os(25)));
+        assert_eq!(
+            kvm_set_sregs(f.as_fd(), &KvmSregs::default()),
+            Err(SysError::Os(25))
+        );
     }
 
     /// MVM-1: `/dev/null` は mmap できない（ENODEV）。

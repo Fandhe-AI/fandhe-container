@@ -5,11 +5,12 @@
 //! virtio デバイス群（MMIO の窓と GSI 割り込み線つき）・vCPU 群を 1 つの [`MicroVm`] に束ねる。配置は
 //! [`VIRTIO_MMIO_BASE`] から [`VIRTIO_MMIO_WINDOW`] 刻みで block → net の順、GSI は [`VIRTIO_GSI_BASE`] から連番。
 //! カーネルのロードと `virtio_mmio.device=<size>@<base>:<irq>` の cmdline 生成は [`MicroVm::load_kernel`]
-//! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。呼び出し元は #885（TASK-75.3.2。vCPU のレジスタ）・#886（TASK-75.4.1。start / stop と実行ループ）と、
+//! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。vCPU 0 のレジスタ初期化（long mode・エントリへの RIP）は [`MicroVm::setup_boot_vcpu`]（TASK-75.3.2・#885）。
+//! 呼び出し元は #886（TASK-75.4.1。start / stop と実行ループ）と、
 //! `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! レジスタ設定（#885）・start / stop（#886）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
+//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・start / stop（#886）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
 //!
@@ -43,7 +44,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
-use crate::boot_x86::{KernelCmdline, VirtioMmioParam, load_linux};
+use crate::boot_x86::{
+    BootCpuState, KernelCmdline, VirtioMmioParam, load_linux, write_boot_tables,
+};
 use crate::device::{KvmDevice, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioDevice};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -637,7 +640,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// bzImage・initrd・cmdline をゲストメモリへロードする（TASK-75.3.1・MVM-1。x86_64 のみ、他 arch は `Unimplemented`）。
     ///
     /// cmdline は `user_cmdline` の後ろに、組み立て済みの各デバイスの `virtio_mmio.device=<size>@<base>:<irq>` を
-    /// block → net の順で足す。戻り値の [`LoadedKernel`] を #885（vCPU のレジスタ初期化）が使う。
+    /// block → net の順で足す。戻り値の [`LoadedKernel`] を [`MicroVm::setup_boot_vcpu`]（#885）に渡す。
     /// 検証と配置の詳細は `crate::boot_x86`。
     pub fn load_kernel(
         &mut self,
@@ -698,6 +701,59 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
                 "kernel loading is only implemented for x86_64 (aarch64 FDT is not implemented)",
+            ))
+        }
+    }
+
+    /// vCPU 0（BSP）を、ロード済みカーネルのエントリから long mode で実行を始める状態に初期化する（TASK-75.3.2・MVM-1。
+    /// x86_64 のみ、他 arch は `Unimplemented`）。
+    ///
+    /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
+    /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state`。最初の `VcpuFd::run_once` より前に、
+    /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つ状態のため触らない。
+    /// 呼び出し元は #886（TASK-75.4.1。start / stop と実行ループ）。失敗時の網羅的な後始末は #887、CPUID・MSR・FPU・LAPIC の設定は
+    /// 未実装（REPAIR-3）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
+    pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
+        let started = std::time::Instant::now();
+        let result = self.setup_boot_vcpu_inner(loaded);
+        let elapsed_us = started.elapsed().as_micros();
+        // ログ出力の失敗でセットアップの結果を失わないよう、書き込みエラーは捨てる。
+        use std::io::Write as _;
+        match &result {
+            Ok(()) => drop(writeln!(
+                std::io::stderr(),
+                "level=info op=microvm.setup_boot_vcpu outcome=ok elapsed_us={elapsed_us}"
+            )),
+            Err(e) => drop(writeln!(
+                std::io::stderr(),
+                "level=error op=microvm.setup_boot_vcpu outcome=error code={} elapsed_us={elapsed_us}",
+                e.code().as_str()
+            )),
+        }
+        result
+    }
+
+    /// [`MicroVm::setup_boot_vcpu`] の本体（計装を含まない）。
+    fn setup_boot_vcpu_inner(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            check_loaded_within(loaded, self.memory.len())?;
+            let state = BootCpuState::for_kernel(loaded)?;
+            let vcpu = self.vcpus.first_mut().ok_or_else(|| {
+                MicrovmError::new(
+                    MicrovmErrorCode::FailedPrecondition,
+                    "microVM has no boot vCPU",
+                )
+            })?;
+            write_boot_tables(&mut self.memory)?;
+            vcpu.set_boot_state(&state)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = loaded;
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "boot register setup is only implemented for x86_64",
             ))
         }
     }
@@ -961,6 +1017,21 @@ mod assemble_tests {
     }
 }
 
+/// `loaded` のアドレスがゲストメモリ（GPA 0 から `mem_len` バイト）に収まるか確かめる。別の VM（より小さい RAM）で
+/// 作られた [`LoadedKernel`] の取り違えや、改変された値を、レジスタへ設定する前に拒否する（SEC-1。値は message に載せない）。
+#[cfg(target_arch = "x86_64")]
+fn check_loaded_within(loaded: &LoadedKernel, mem_len: u64) -> Result<(), MicrovmError> {
+    let inside = |a: GuestAddress| a.raw() < mem_len;
+    if !(inside(loaded.entry) && inside(loaded.boot_params) && inside(loaded.cmdline))
+        || loaded.runtime_end > mem_len
+    {
+        return Err(invalid(
+            "loaded kernel does not fit in this microVM's memory",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,5 +1142,37 @@ mod tests {
         let e = classify_ram_error(RamStage::Mmap, SysError::Os(99));
         assert_eq!(e.code(), MicrovmErrorCode::Internal);
         assert_eq!(e.message(), "mmap of guest memory failed (os error 99)");
+    }
+
+    /// MVM-1・TASK-75.3.2: 別 VM 由来・改変された `LoadedKernel` をメモリ長で拒否する。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_885_check_loaded_within_memory() {
+        let mk = |entry: u64, bp: u64, cmd: u64, end: u64| LoadedKernel {
+            entry: GuestAddress::new(entry),
+            boot_params: GuestAddress::new(bp),
+            kernel_addr: GuestAddress::new(0x100_0000),
+            kernel_len: 0x1000,
+            runtime_end: end,
+            cmdline: GuestAddress::new(cmd),
+            cmdline_len: 0,
+            initrd: None,
+            protocol_version: 0x020F,
+        };
+        let mem = 64 << 20;
+        check_loaded_within(&mk(0x100_0200, 0x7000, 0x2_0000, 0x300_0000), mem).unwrap();
+        for bad in [
+            mk(mem, 0x7000, 0x2_0000, 0x300_0000),
+            mk(0x100_0200, mem, 0x2_0000, 0x300_0000),
+            mk(0x100_0200, 0x7000, mem, 0x300_0000),
+            mk(0x100_0200, 0x7000, 0x2_0000, mem + 1),
+        ] {
+            let e = check_loaded_within(&bad, mem).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "loaded kernel does not fit in this microVM's memory"
+            );
+        }
     }
 }

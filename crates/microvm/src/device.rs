@@ -8,7 +8,7 @@
 //! TASK-74.4.2（#883）で exit のデバイスへの振り分けと IN・MMIO read の応答の書き戻し（[`VcpuFd::handle_exit`]。
 //! 振り分け先は `crate::dispatch`）と、実機で確かめる自己診断 [`KvmDevice::probe_exit_dispatch`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! レジスタ設定・vCPU の外部からの停止要求（一時停止・
+//! vCPU の外部からの停止要求（一時停止・
 //! 終了通知。TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
@@ -18,10 +18,12 @@
 //! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
+//! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
+//! 観測用の [`VcpuFd::regs`] を足した（CPUID・MSR・FPU・LAPIC の設定は未実装。REPAIR-3）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
-//! - x86_64: `KVM_CREATE_VCPU` だけで vCPU fd が使える。レジスタ設定は TASK-74.4 / TASK-75
+//! - x86_64: `KVM_CREATE_VCPU` だけで vCPU fd が使える。レジスタ設定は TASK-75.3.2 の `VcpuFd::set_boot_state`
 //! - aarch64: `KVM_CREATE_VCPU` の後に VM fd へ `KVM_ARM_PREFERRED_TARGET`、vCPU fd へ `KVM_ARM_VCPU_INIT`
 //!   （features はすべて 0）を発行して初期化済みの vCPU を返す。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。
 //!   features（PSCI 等）の選択は TASK-75 で再検討する。aarch64 はネイティブ CI が無く型検査のみで実行は未検証
@@ -40,6 +42,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use crate::boot_x86::BootCpuState;
+#[cfg(target_arch = "x86_64")]
+use crate::boot_x86::{SegmentDescriptor, X86Regs};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, VcpuExit};
@@ -271,6 +276,117 @@ impl VcpuFd {
         self.id
     }
 
+    /// ロード済みカーネルのエントリへ入る初期状態を設定する（TASK-75.3.2・MVM-1。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// `KVM_GET_SREGS` で現在値を読み、セグメント（CS = `__BOOT_CS`・DS/ES/FS/GS/SS = `__BOOT_DS`）・GDT・IDT・CR0/CR3/CR4/EFER
+    /// だけを `state` で上書きして `KVM_SET_SREGS`、続けて `KVM_SET_REGS` で汎用レジスタを設定する。`tr`・`ldt`・`cr2`・`cr8`・
+    /// `apic_base`・`interrupt_bitmap` は読んだ値のまま保つ。最初の [`VcpuFd::run_once`] より前に、BSP（vCPU 0）にだけ呼ぶ。
+    /// GDT・ページテーブルなど `state` が指すゲストメモリの内容は呼び出し側が先に書く（`boot_x86::write_boot_tables`）。
+    /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID・MSR・FPU の設定は範囲外（REPAIR-3）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_boot_state(&mut self, state: &BootCpuState) -> Result<(), MicrovmError> {
+        let fd = self.fd.as_fd();
+        let mut sregs =
+            sys::kvm_get_sregs(fd).map_err(|e| classify_vcpu_error(VcpuStage::GetSregs, e))?;
+        let seg = |d: &SegmentDescriptor| sys::KvmSegment {
+            base: d.base,
+            limit: d.limit,
+            selector: d.selector,
+            type_: d.type_,
+            present: u8::from(d.present),
+            dpl: d.dpl,
+            db: u8::from(d.db),
+            s: u8::from(d.s),
+            l: u8::from(d.l),
+            g: u8::from(d.g),
+            avl: u8::from(d.avl),
+            unusable: 0,
+            padding: 0,
+        };
+        sregs.cs = seg(&state.code_segment);
+        sregs.ds = seg(&state.data_segment);
+        sregs.es = seg(&state.data_segment);
+        sregs.fs = seg(&state.data_segment);
+        sregs.gs = seg(&state.data_segment);
+        sregs.ss = seg(&state.data_segment);
+        sregs.gdt = sys::KvmDtable {
+            base: state.gdt.base,
+            limit: state.gdt.limit,
+            padding: [0; 3],
+        };
+        sregs.idt = sys::KvmDtable {
+            base: state.idt.base,
+            limit: state.idt.limit,
+            padding: [0; 3],
+        };
+        sregs.cr0 = state.cr0;
+        sregs.cr3 = state.cr3;
+        sregs.cr4 = state.cr4;
+        sregs.efer = state.efer;
+        sys::kvm_set_sregs(fd, &sregs).map_err(|e| classify_vcpu_error(VcpuStage::SetSregs, e))?;
+        let r = &state.regs;
+        let regs = sys::KvmRegs {
+            rax: r.rax,
+            rbx: r.rbx,
+            rcx: r.rcx,
+            rdx: r.rdx,
+            rsi: r.rsi,
+            rdi: r.rdi,
+            rsp: r.rsp,
+            rbp: r.rbp,
+            r8: r.r8,
+            r9: r.r9,
+            r10: r.r10,
+            r11: r.r11,
+            r12: r.r12,
+            r13: r.r13,
+            r14: r.r14,
+            r15: r.r15,
+            rip: r.rip,
+            rflags: r.rflags,
+        };
+        sys::kvm_set_regs(fd, &regs).map_err(|e| classify_vcpu_error(VcpuStage::SetRegs, e))
+    }
+
+    /// x86_64 以外では起動時のレジスタ初期化は未実装（aarch64 は FDT・PSTATE・X0 が要る。REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn set_boot_state(&mut self, _state: &BootCpuState) -> Result<(), MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "boot register setup is only implemented for x86_64",
+        ))
+    }
+
+    /// 汎用レジスタの現在値を読む（観測用。TASK-75.3.2。x86_64 のみ）。
+    ///
+    /// `KVM_RUN` の実行中には呼べない: 実行は `&mut self` の [`VcpuFd::run_once`] だけが行い、本メソッドは `&self` のため
+    /// 借用規則で排他される。VM exit の直後の値を読む用途（試験・診断）を想定する。
+    #[cfg(target_arch = "x86_64")]
+    pub fn regs(&self) -> Result<X86Regs, MicrovmError> {
+        let r = sys::kvm_get_regs(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetRegs, e))?;
+        Ok(X86Regs {
+            rax: r.rax,
+            rbx: r.rbx,
+            rcx: r.rcx,
+            rdx: r.rdx,
+            rsi: r.rsi,
+            rdi: r.rdi,
+            rsp: r.rsp,
+            rbp: r.rbp,
+            r8: r.r8,
+            r9: r.r9,
+            r10: r.r10,
+            r11: r.r11,
+            r12: r.r12,
+            r13: r.r13,
+            r14: r.r14,
+            r15: r.r15,
+            rip: r.rip,
+            rflags: r.rflags,
+        })
+    }
+
     /// 累積の実行統計。
     pub fn stats(&self) -> RunStats {
         self.stats
@@ -451,6 +567,14 @@ impl AsFd for VcpuFd {
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 enum VcpuStage {
     Create,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetRegs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetRegs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetSregs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetSregs,
     PreferredTarget,
     VcpuInit,
     Mmap,
@@ -462,7 +586,15 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::PreferredTarget => "KVM_ARM_PREFERRED_TARGET",
         VcpuStage::VcpuInit => "KVM_ARM_VCPU_INIT",
         VcpuStage::Mmap => "mmap of kvm_run",
+        VcpuStage::GetRegs => "KVM_GET_REGS",
+        VcpuStage::SetRegs => "KVM_SET_REGS",
+        VcpuStage::GetSregs => "KVM_GET_SREGS",
+        VcpuStage::SetSregs => "KVM_SET_SREGS",
     };
+    let registers = matches!(
+        stage,
+        VcpuStage::GetRegs | VcpuStage::SetRegs | VcpuStage::GetSregs | VcpuStage::SetSregs
+    );
     match e {
         SysError::Unsupported => MicrovmError::new(
             MicrovmErrorCode::Unimplemented,
@@ -471,6 +603,11 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         SysError::Os(EINVAL) if stage == VcpuStage::Create => {
             MicrovmError::new(MicrovmErrorCode::InvalidArgument, "invalid vCPU id")
         }
+        // レジスタ値の拒否。値・アドレスは message に載せない（ERR-1）。
+        SysError::Os(EINVAL) if registers => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM rejected the vCPU registers",
+        ),
         SysError::Os(EEXIST) => {
             MicrovmError::new(MicrovmErrorCode::AlreadyExists, "vCPU id already exists")
         }
@@ -1540,6 +1677,35 @@ mod tests {
             vm.register_ioeventfd(spec).unwrap_err().code(),
             MicrovmErrorCode::FailedPrecondition
         );
+    }
+
+    /// MVM-1・TASK-75.3.2: レジスタ ioctl の errno 分類（値を message に載せない）。
+    #[test]
+    fn mvm1_885_classify_regs_error_table() {
+        let c = classify_vcpu_error;
+        for st in [
+            VcpuStage::GetRegs,
+            VcpuStage::SetRegs,
+            VcpuStage::GetSregs,
+            VcpuStage::SetSregs,
+        ] {
+            let m = c(st, SysError::Os(EINVAL));
+            assert_eq!(m.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(m.message(), "KVM rejected the vCPU registers");
+            assert_eq!(
+                c(st, SysError::Os(ENOTTY)).code(),
+                MicrovmErrorCode::FailedPrecondition
+            );
+            assert_eq!(
+                c(st, SysError::Unsupported).code(),
+                MicrovmErrorCode::Unimplemented
+            );
+        }
+        let m = c(VcpuStage::SetSregs, SysError::Os(5));
+        assert_eq!(m.code(), MicrovmErrorCode::Internal);
+        assert_eq!(m.message(), "KVM_SET_SREGS failed (os error 5)");
+        let m = c(VcpuStage::GetRegs, SysError::Os(5));
+        assert_eq!(m.message(), "KVM_GET_REGS failed (os error 5)");
     }
 
     #[test]

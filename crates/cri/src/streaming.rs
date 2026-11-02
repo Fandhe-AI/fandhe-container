@@ -9,9 +9,11 @@
 //!
 //! ## 未実装（REPAIR-3）
 //!
-//! 有効なトークンへの要求は [`NotImplementedHandler`] が `501 Not Implemented` を返すだけで、SPDY/3.1 のフレーム処理・
-//! HTTP Upgrade 後のストリーム・zlib 辞書は持たない。Exec は #680（TASK-63.2）、Attach は #681（TASK-63.3）、
-//! PortForward は #682（TASK-63.4）が [`StreamHandler`] を差し替えて実装する。
+//! 既定の [`NotImplementedHandler`] は有効なトークンへの要求に `501 Not Implemented` を返すだけである。
+//! PortForward は [`port_forward::PortForwardHandler`]（#682・TASK-63.4。SPDY/3.1 の共通層は [`spdy`]）を
+//! `bind_with_handler` に渡すと有効になる。ただし転送先への接続（[`port_forward::PortForwardDialer`]）の本番実装と
+//! plugin-cri へのハンドラ注入は未実装（後続の issue）。Exec は #680（TASK-63.2）、Attach は #681（TASK-63.3）が
+//! [`StreamHandler`] を実装し、`PortForwardHandler::with_fallback` で連ねられる。
 //!
 //! ## 安全側の既定
 //!
@@ -20,6 +22,9 @@
 //! - URL のトークンは OS の乱数から 256 ビット。単回使用で、TTL（既定 60 秒）で失効し、同時に保持できる件数に上限がある
 //! - 照合に失敗した要求（未知・失効・使用済み・種別違い）はすべて同じ `404` にする（探索の手がかりを与えない）
 //! - ヘッダ読み取り・接続全体・同時接続数に上限を設ける（REPAIR-5）
+
+pub mod port_forward;
+pub mod spdy;
 
 use std::collections::HashMap;
 use std::convert::Infallible;

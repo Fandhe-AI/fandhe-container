@@ -336,10 +336,12 @@ impl ResizeParser {
     /// バイトを足し、完成した値を順に返す。未完の末尾は次回へ持ち越す。
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<TerminalSize>, ResizeError> {
         if self.buf.len().saturating_add(data.len()) > MAX_RESIZE_BUFFER {
+            self.buf.clear();
             return Err(ResizeError);
         }
         self.buf.extend_from_slice(data);
         let mut sizes = Vec::new();
+        let mut failed = false;
         let consumed = {
             let mut stream =
                 serde_json::Deserializer::from_slice(&self.buf).into_iter::<TerminalSize>();
@@ -348,12 +350,20 @@ impl ResizeParser {
                     Some(Ok(size)) => sizes.push(size),
                     // 未完の末尾。次の push で続きを読む。
                     Some(Err(e)) if e.is_eof() => break,
-                    Some(Err(_)) => return Err(ResizeError),
+                    Some(Err(_)) => {
+                        failed = true;
+                        break;
+                    }
                     None => break,
                 }
             }
             stream.byte_offset()
         };
+        if failed {
+            // 不正な値のバイトを残さない（再オープン後の resize に連結させない）。
+            self.buf.clear();
+            return Err(ResizeError);
+        }
         self.buf.drain(..consumed.min(self.buf.len()));
         Ok(sizes)
     }
@@ -636,6 +646,20 @@ mod tests {
         );
         let mut p = ResizeParser::new();
         assert_eq!(p.push(&vec![b' '; MAX_RESIZE_BUFFER + 1]), Err(ResizeError));
+    }
+
+    /// CRI-6: 不正な値のあとでも読み取り器は空に戻り、次の正しい値を受理する。
+    #[test]
+    fn cri6_remotecommand_resize_parser_recovers_after_error() {
+        let mut p = ResizeParser::new();
+        assert_eq!(p.push(b"{\"Width\":80,\"Height\":24}x"), Err(ResizeError));
+        assert_eq!(
+            p.push(br#"{"Width":10,"Height":5}"#),
+            Ok(vec![TerminalSize {
+                width: 10,
+                height: 5
+            }])
+        );
     }
 
     /// CRI-6: backend・drain・close の期限は上限を超えると拒否する（`Duration::MAX` での加算 panic を防ぐ）。

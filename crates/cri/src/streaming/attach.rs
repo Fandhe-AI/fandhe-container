@@ -801,6 +801,7 @@ where
                     // 不正な resize はそのストリームだけ閉じる（セッションは続ける）。
                     Err(_) => {
                         self.opened.resize = None;
+                        self.resize_parser = ResizeParser::new();
                         self.reset_stream(stream_id, rst_status::PROTOCOL_ERROR)
                     }
                 }

@@ -197,6 +197,11 @@ impl<B: GuestMemoryBacking> GuestMemory<B> {
     pub fn write_u32_le(&mut self, addr: GuestAddress, v: u32) -> Result<(), MicrovmError> {
         self.write_at(addr, &v.to_le_bytes())
     }
+
+    /// リトルエンディアンの u64 を書く。
+    pub fn write_u64_le(&mut self, addr: GuestAddress, v: u64) -> Result<(), MicrovmError> {
+        self.write_at(addr, &v.to_le_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +234,22 @@ mod tests {
         );
         m.write_u16_le(GuestAddress::new(0x10fe), 0xabcd).unwrap();
         assert_eq!(m.read_u16_le(GuestAddress::new(0x10fe)).unwrap(), 0xabcd);
+    }
+
+    /// MVM-1・TASK-75.3.1: u64 の書き込みがバイト列と `read_u64_le` の両方で往復する。
+    #[test]
+    fn mvm1_write_u64_le_roundtrip() {
+        let mut m = mem(0x1000, 0x100);
+        m.write_u64_le(GuestAddress::new(0x1008), 0x0102_0304_0506_0708)
+            .unwrap();
+        let mut b = [0u8; 8];
+        m.read_at(GuestAddress::new(0x1008), &mut b).unwrap();
+        assert_eq!(b, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(
+            m.read_u64_le(GuestAddress::new(0x1008)).unwrap(),
+            0x0102_0304_0506_0708
+        );
+        assert!(m.write_u64_le(GuestAddress::new(0x10f9), 1).is_err());
     }
 
     /// MVM-1: 領域の外・桁あふれ・base より下はすべて InvalidArgument。

@@ -253,8 +253,19 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
         if c == Some(b'"') {
             in_quote = !in_quote;
         } else if !in_quote && (c.is_none() || c == Some(b' ')) {
-            if split.is_none() && bytes.get(start..i) == Some(b"--".as_slice()) {
-                split = Some(start);
+            if split.is_none()
+                && let Some(tok) = bytes.get(start..i)
+            {
+                if tok == b"--".as_slice() {
+                    split = Some(start);
+                } else if tok.contains(&b'"') && tok.iter().filter(|&&b| b != b'"').eq(b"--".iter())
+                {
+                    // Linux は引用符を除去してからトークン化するため、`"--"` も init 引数の区切りになる。
+                    // 区切り位置を誤ると後ろに足す virtio_mmio.device が init の引数になるため拒否する。
+                    return Err(invalid(
+                        "quoted \"--\" in kernel command line is not supported",
+                    ));
+                }
             }
             start = i + 1;
         }
@@ -834,6 +845,8 @@ mod tests {
             "foo=\"x -- y\" virtio_mmio.device=0x1000@0xd0000000:5"
         );
         assert!(KernelCmdline::new("foo=\"x -- y", &d).is_err());
+        assert!(KernelCmdline::new("a \"--\" b", &d).is_err());
+        assert!(KernelCmdline::new("a -\"-\" b", &d).is_err());
         assert_eq!(KernelCmdline::new("-- a", &[]).unwrap().as_str(), "-- a");
         let long = format!("--{}", "a".repeat(CMDLINE_CAPACITY as usize - 3));
         assert_eq!(KernelCmdline::new(&long, &[]).unwrap().as_str(), long);

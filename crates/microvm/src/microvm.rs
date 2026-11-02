@@ -645,6 +645,34 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         initrd: Option<&[u8]>,
         user_cmdline: &str,
     ) -> Result<LoadedKernel, MicrovmError> {
+        // REPAIR-4: 成功・失敗と所要時間を固定の操作名とエラーコードだけで 1 行出す。
+        // 非信頼の cmdline・イメージ内容・エラー文言は記録しない（サイズは長さのみ）。
+        let started = std::time::Instant::now();
+        let result = self.load_kernel_inner(kernel, initrd, user_cmdline);
+        let elapsed_us = started.elapsed().as_micros();
+        match &result {
+            Ok(_) => eprintln!(
+                "level=info op=microvm.load_kernel outcome=ok elapsed_us={elapsed_us} kernel_len={} initrd_len={}",
+                kernel.len(),
+                initrd.map_or(0, <[u8]>::len)
+            ),
+            Err(e) => eprintln!(
+                "level=error op=microvm.load_kernel outcome=error code={} elapsed_us={elapsed_us} kernel_len={} initrd_len={}",
+                e.code().as_str(),
+                kernel.len(),
+                initrd.map_or(0, <[u8]>::len)
+            ),
+        }
+        result
+    }
+
+    /// [`MicroVm::load_kernel`] の本体（計装を含まない）。
+    fn load_kernel_inner(
+        &mut self,
+        kernel: &[u8],
+        initrd: Option<&[u8]>,
+        user_cmdline: &str,
+    ) -> Result<LoadedKernel, MicrovmError> {
         #[cfg(target_arch = "x86_64")]
         {
             let params: Vec<VirtioMmioParam> = self

@@ -67,6 +67,8 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_RECV_BUF_BYTES: usize = MAX_DATA_FRAME_BYTES + 8 + READ_CHUNK_BYTES;
 /// resize ストリームの 1 行の上限（バイト）。
 const MAX_RESIZE_LINE_BYTES: usize = 1024;
+/// ストリームが揃う前に届いた stdin の DATA を保持する上限（バイト）。超えたら ProtocolError。
+const MAX_EARLY_STDIN_BYTES: usize = 256 * 1024;
 /// `X-Stream-Protocol-Version` などの複数値ヘッダで見る値の個数の上限。
 const MAX_HEADER_VALUES: usize = 16;
 /// 1 つのヘッダ値から見るカンマ区切りの要素数の上限と、各要素の長さの上限。
@@ -92,6 +94,9 @@ pub struct ExecStreamConfig {
     pub launch_timeout: Duration,
     /// プロセス終了後に stdout / stderr を EOF まで読み切る期限。既定 10 秒。
     pub drain_timeout: Duration,
+    /// 溜めた stdin をプロセスが読まないまま進展しない場合に閉じるまでの期限。既定 60 秒。
+    /// 書き込み待ちの間はソケットを読まない（背圧）ため、クライアントの切断を検知できない時間の上限になる。
+    pub stdin_stall_timeout: Duration,
 }
 
 impl Default for ExecStreamConfig {
@@ -101,6 +106,7 @@ impl Default for ExecStreamConfig {
             idle_timeout: Duration::from_secs(4 * 60 * 60),
             launch_timeout: Duration::from_secs(30),
             drain_timeout: Duration::from_secs(10),
+            stdin_stall_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -113,6 +119,7 @@ impl ExecStreamConfig {
             ("idle_timeout", self.idle_timeout),
             ("launch_timeout", self.launch_timeout),
             ("drain_timeout", self.drain_timeout),
+            ("stdin_stall_timeout", self.stdin_stall_timeout),
         ] {
             if d.is_zero() {
                 return Err(CriError::invalid_argument(format!(
@@ -215,6 +222,10 @@ pub enum ExecStreamOutcome {
     },
     /// 終了待ちが失敗した（内部エラーの Status を通知した）。
     ExecFailed,
+    /// stdout / stderr の読み取りが失敗した（内部エラーの Status を通知した）。
+    OutputFailed,
+    /// プロセス終了後の drain の期限までに出力を送り切れなかった（内部エラーの Status を通知した）。
+    OutputTruncated,
     /// 起動に失敗した、または期限切れ・stdio の食い違い（内部エラーの Status を通知した）。
     LaunchFailed,
     /// 必要なストリームが期限内に揃わなかった（起動していない）。
@@ -522,6 +533,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
     }
 }
 
+/// ストリームが揃う前に届いた stdin の入力（上限つき）と FIN 状態。Relay へ引き継ぐ。
+#[derive(Debug, Default)]
+struct EarlyStdin {
+    buf: Vec<u8>,
+    fin: bool,
+}
+
 /// 受け付けたストリームの ID。
 #[derive(Debug, Default, Clone, Copy)]
 struct Streams {
@@ -577,11 +595,12 @@ enum StreamWait {
 }
 
 /// ストリームが揃うまで SYN_STREAM を受け付ける（期限は呼び出し側が付ける）。
-/// 揃う前に届いた DATA は読み捨てる（client-go は全ストリームの作成後にデータを流す）。
+/// 揃う前に届いた stdin の DATA と FIN は上限つきで `early` に保持する（stdin 以外の DATA は読み捨てる）。
 async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
     need: Need,
     streams: &mut Streams,
+    early: &mut EarlyStdin,
 ) -> StreamWait {
     while !need.complete(streams) {
         let frame = match conn.next_frame().await {
@@ -591,8 +610,33 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
         };
         let queued = match frame {
             Frame::SynStream {
-                stream_id, headers, ..
-            } => accept_stream(conn, need, streams, stream_id, &headers),
+                stream_id,
+                headers,
+                fin,
+                ..
+            } => {
+                let r = accept_stream(conn, need, streams, stream_id, &headers);
+                if fin && streams.stdin == Some(stream_id) {
+                    early.fin = true;
+                }
+                r
+            }
+            Frame::Data {
+                stream_id,
+                fin,
+                payload,
+            } if streams.stdin == Some(stream_id) => {
+                if early.buf.len().saturating_add(payload.len()) > MAX_EARLY_STDIN_BYTES {
+                    return StreamWait::Protocol;
+                }
+                early.buf.extend_from_slice(&payload);
+                early.fin |= fin;
+                Ok(())
+            }
+            Frame::RstStream { stream_id, .. } if streams.stdin == Some(stream_id) => {
+                early.fin = true;
+                Ok(())
+            }
             Frame::Ping { id } if id % 2 == 1 => conn.queue(&Frame::Ping { id }),
             Frame::GoAway { .. } => return StreamWait::Closed,
             _ => Ok(()),
@@ -650,11 +694,15 @@ struct Output {
     reader: BoxedRead,
     id: StreamId,
     eof: bool,
+    /// 読み取りがエラーで終わった（正常 EOF と区別する）。
+    failed: bool,
 }
 
 /// 中継の終わり方。
 enum RelayEnd {
     Finished,
+    /// drain の期限までに出力を送り切れなかった。
+    DrainExpired,
     PeerClosed,
     Idle,
     Protocol,
@@ -668,6 +716,9 @@ struct Relay<T> {
     stdin_buf: Vec<u8>,
     stdin_pos: usize,
     stdin_fin: bool,
+    /// 溜めた stdin が進展しない時間の計測（バッファが空なら `None`）。
+    stdin_stall: Option<Pin<Box<Sleep>>>,
+    stdin_stall_timeout: Duration,
     stdout: Option<Output>,
     stderr: Option<Output>,
     resizer: Option<Box<dyn TerminalResizer>>,
@@ -775,6 +826,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             }
 
             // 溜めた stdin をプロセスへ書く。
+            let mut stdin_progressed = false;
             if let Some(writer) = self.stdin.as_mut() {
                 let mut broken = false;
                 while self.stdin_pos < self.stdin_buf.len() {
@@ -783,6 +835,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                         Poll::Ready(Ok(n)) if n > 0 => {
                             self.stdin_pos = self.stdin_pos.saturating_add(n);
                             progress = true;
+                            stdin_progressed = true;
                         }
                         Poll::Ready(_) => {
                             broken = true;
@@ -808,6 +861,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             } else if !self.stdin_buf.is_empty() {
                 self.stdin_buf.clear();
                 self.stdin_pos = 0;
+            }
+
+            // 溜めた stdin が進展しない間はソケットを読めず切断を検知できないため、期限で打ち切る。
+            if self.stdin_buf.is_empty() {
+                self.stdin_stall = None;
+            } else {
+                let deadline = tokio::time::Instant::now() + self.stdin_stall_timeout;
+                match self.stdin_stall.as_mut() {
+                    Some(sleep) if !stdin_progressed => {
+                        if sleep.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(RelayEnd::Idle);
+                        }
+                    }
+                    Some(sleep) => sleep.as_mut().reset(deadline),
+                    None => {
+                        let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
+                        let _ = sleep.as_mut().poll(cx);
+                        self.stdin_stall = Some(sleep);
+                    }
+                }
             }
 
             // クライアントのフレームを処理する。stdin の書き込み待ちが残る間は読まない（背圧）。
@@ -869,8 +942,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     .drain
                     .as_mut()
                     .is_some_and(|s| s.as_mut().poll(cx).is_ready());
-                if outputs_done || drain_expired {
+                if outputs_done {
                     return Poll::Ready(RelayEnd::Finished);
+                }
+                if drain_expired {
+                    return Poll::Ready(RelayEnd::DrainExpired);
                 }
             }
 
@@ -896,7 +972,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 self.conn.goodbye(last, GoAwayStatus::ProtocolError).await;
                 ExecStreamOutcome::ProtocolError
             }
+            RelayEnd::DrainExpired => {
+                // 出力を送り切れていない。終了コードによらず失敗として通知する。
+                self.finish_failed(ExecStreamOutcome::OutputTruncated).await
+            }
             RelayEnd::Finished => {
+                let output_failed = [self.stdout.as_ref(), self.stderr.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|o| o.failed);
+                if output_failed {
+                    return self.finish_failed(ExecStreamOutcome::OutputFailed).await;
+                }
                 let (status, outcome) = match self.exit_result.take() {
                     Some(Ok(0)) => (
                         STATUS_SUCCESS.to_string(),
@@ -927,6 +1014,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
         }
     }
 
+    /// 内部エラーの Status（詳細なし）を通知し、読み切れなかった出力にも FIN を付けて閉じる。
+    async fn finish_failed(&mut self, outcome: ExecStreamOutcome) -> ExecStreamOutcome {
+        let fins: Vec<StreamId> = [self.stdout.as_ref(), self.stderr.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|o| !o.eof)
+            .map(|o| o.id)
+            .collect();
+        self.close_with_status(STATUS_INTERNAL_ERROR, &fins).await;
+        outcome
+    }
+
     async fn close_with_status(&mut self, status: &str, extra_fins: &[StreamId]) {
         if let Some(error_id) = self.streams.error {
             send_status(
@@ -941,7 +1040,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
     }
 }
 
-/// 出力 1 本を読めるだけクライアントへ送る。進展があれば `true`。EOF（と読み取りエラー）で FIN を送る。
+/// 出力 1 本を読めるだけクライアントへ送る。進展があれば `true`。EOF で FIN を送る。読み取りエラーも FIN を送るが `failed` を立てる。
 fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut Conn<T>,
     out: &mut Output,
@@ -961,8 +1060,9 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
                 })?;
                 progressed = true;
             }
-            Poll::Ready(_) => {
+            Poll::Ready(result) => {
                 out.eof = true;
+                out.failed = result.is_err();
                 conn.queue(&Frame::Data {
                     stream_id: out.id,
                     fin: true,
@@ -1012,11 +1112,12 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     };
     let need = Need::from_request(req);
     let mut streams = Streams::default();
+    let mut early = EarlyStdin::default();
 
     // 1. 必要なストリームが揃うまで待つ（期限つき）。
     let waited = tokio::time::timeout(
         config.stream_creation_timeout,
-        await_streams(&mut conn, need, &mut streams),
+        await_streams(&mut conn, need, &mut streams, &mut early),
     )
     .await;
     match waited {
@@ -1073,6 +1174,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
             reader,
             id,
             eof: false,
+            failed: false,
         }),
         _ => None,
     };
@@ -1080,9 +1182,11 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         conn,
         streams,
         stdin,
-        stdin_buf: Vec::new(),
+        stdin_buf: early.buf,
         stdin_pos: 0,
-        stdin_fin: false,
+        stdin_fin: early.fin,
+        stdin_stall: None,
+        stdin_stall_timeout: config.stdin_stall_timeout,
         stdout: output(stdout, streams.stdout),
         stderr: output(stderr, streams.stderr),
         resizer: resize,

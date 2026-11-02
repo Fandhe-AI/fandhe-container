@@ -241,6 +241,11 @@ impl ExecStreamLauncher for FakeLauncher {
                         cell.set(code);
                     });
                 }
+                "exit-no-close" => {
+                    // 終了コード 0 で終わるが stdout を閉じない（drain の期限切れの再現）。
+                    stdout_p.send(b"partial\n");
+                    cell.set(0);
+                }
                 "tty-resize" => {
                     let (stdout_p, cell, resizes) =
                         (stdout_p.clone(), cell.clone(), Arc::clone(&self.resizes));
@@ -383,6 +388,7 @@ fn fast_config() -> ExecStreamConfig {
         idle_timeout: Duration::from_secs(30),
         launch_timeout: Duration::from_secs(5),
         drain_timeout: Duration::from_secs(2),
+        stdin_stall_timeout: Duration::from_secs(5),
     }
 }
 
@@ -946,4 +952,53 @@ async fn cri6_exec_handshake_errors_and_fallback() {
     assert!(b.starts_with("HTTP/1.1 403"), "b: {b}");
     assert!(c.starts_with("HTTP/1.1 501"), "c: {c}");
     assert_eq!(fx.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+/// CRI-6: stdout より前に stdin の DATA と FIN を送っても欠けずに届く（ストリーム確立前の入力の保持）。
+#[tokio::test]
+async fn cri6_exec_stdin_data_before_all_streams_is_kept() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-exit"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.data(3, b"early\n", true);
+        client.syn(5, "stdout");
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.text(5), "early\n");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+}
+
+/// CRI-6・REPAIR-5: 終了コード 0 でも drain の期限までに出力が閉じなければ成功にせず、失敗 Status と `OutputTruncated` にする。
+#[tokio::test]
+async fn cri6_exec_drain_expiry_is_not_success() {
+    let config = ExecStreamConfig {
+        drain_timeout: Duration::from_millis(200),
+        ..fast_config()
+    };
+    let fx = Fixture::new(config, 8).await;
+    let path = fx.exec_path(&["exit-no-close"], false, false, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdout");
+        client.expect_reply(1);
+        client.expect_reply(3);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_ne!(c.text(1), STATUS_SUCCESS);
+    assert!(c.text(1).contains("InternalError"), "{}", c.text(1));
+    assert!(c.fins.contains(&3));
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::OutputTruncated]
+    );
 }

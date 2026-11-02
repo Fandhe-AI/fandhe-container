@@ -27,7 +27,10 @@
 //!   （`KVM_RUN` の期限切れで vCPU スレッドを中断するため）。組み込むプロセスは `SIGUSR2` を他の用途に使わないこと。
 //!   既に別の handler や SIG_IGN があるときは上書きせず `FailedPrecondition`（EBUSY）で失敗する。
 //!
-//! `unsafe` は `src/sys.rs` に限る。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
+//! `unsafe` は `src/sys.rs` に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
+//! 機械的に担保する（REPAIR-9・TASK-74.5）。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
+
+#![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 pub mod device;
@@ -39,6 +42,7 @@ pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 mod sys;
 pub mod virtio_block;
 pub mod virtio_mmio;

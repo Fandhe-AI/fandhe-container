@@ -95,6 +95,22 @@ fn ram_align() -> Result<u64, MicrovmError> {
     Ok(host.max(GUEST_RAM_ALIGN))
 }
 
+/// RAM サイズの検証（副作用なし）。`GuestRam::new` と `MicroVm::assemble` の ioctl 前検証が共有する。
+fn validate_ram_size(size: u64, align: u64) -> Result<(), MicrovmError> {
+    if size == 0 {
+        return Err(invalid("guest memory size must not be zero"));
+    }
+    if !size.is_multiple_of(align) {
+        return Err(invalid(
+            "guest memory size must be a multiple of the host page size (at least 4096)",
+        ));
+    }
+    if size > MAX_GUEST_RAM_BYTES {
+        return Err(invalid("guest memory size too large"));
+    }
+    Ok(())
+}
+
 fn invalid(message: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, message)
 }
@@ -181,17 +197,7 @@ impl GuestRam {
 
     /// 整列単位 `align`（`max(4096, ホストのページサイズ)`）を指定して確保する（試験で 16 / 64 KiB を再現するため分離）。
     fn new_aligned(size: u64, align: u64) -> Result<GuestRam, MicrovmError> {
-        if size == 0 {
-            return Err(invalid("guest memory size must not be zero"));
-        }
-        if !size.is_multiple_of(align) {
-            return Err(invalid(
-                "guest memory size must be a multiple of the host page size (at least 4096)",
-            ));
-        }
-        if size > MAX_GUEST_RAM_BYTES {
-            return Err(invalid("guest memory size too large"));
-        }
+        validate_ram_size(size, align)?;
         let len = usize::try_from(size).map_err(|_| invalid("guest memory size too large"))?;
         let map = GuestRamMap::map(len).map_err(|e| classify_ram_error(RamStage::Mmap, e))?;
         Ok(GuestRam { map })
@@ -355,9 +361,15 @@ fn plan_layout(
     if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
         return Err(invalid("vcpu count out of range"));
     }
+    validate_ram_size(mem_size, ram_align()?)?;
     if mem_size > VIRTIO_MMIO_BASE {
         return Err(invalid("guest memory overlaps the virtio-mmio window"));
     }
+    layout_slots(block_count, net_count)
+}
+
+/// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
+fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>, MicrovmError> {
     let total = block_count
         .checked_add(net_count)
         .filter(|n| *n <= MAX_VIRTIO_DEVICES)
@@ -701,6 +713,7 @@ mod assemble_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn slot(kind: VirtioDeviceKind, index: usize, base: u64, gsi: u32) -> DeviceSlot {
         DeviceSlot {
             kind,
@@ -711,6 +724,7 @@ mod assemble_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn assert_plan_err(r: Result<Vec<DeviceSlot>, MicrovmError>, msg: &str) {
         let e = r.unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
@@ -718,7 +732,7 @@ mod assemble_tests {
     }
 
     fn bus(block: usize, net: usize) -> (Bus, Mem) {
-        let slots = plan_layout(1, 1 << 20, block, net).unwrap();
+        let slots = layout_slots(block, net).unwrap();
         let blocks = (0..block)
             .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
             .collect();
@@ -780,6 +794,14 @@ mod assemble_tests {
         assert!(plan_layout(32, VIRTIO_MMIO_BASE, 8, 0).is_ok());
         assert_eq!(plan_layout(1, 4096, 4, 4).unwrap().len(), 8);
         assert!(plan_layout(1, 4096, 0, 0).unwrap().is_empty());
+        assert_plan_err(
+            plan_layout(1, 0, 0, 0),
+            "guest memory size must not be zero",
+        );
+        assert_plan_err(
+            plan_layout(1, 4096 + 1, 0, 0),
+            "guest memory size must be a multiple of the host page size (at least 4096)",
+        );
     }
 
     /// MVM-1・TASK-75.2: x86_64 以外は最初の ioctl の前に `Unimplemented`。

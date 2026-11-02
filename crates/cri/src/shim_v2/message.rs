@@ -3,7 +3,7 @@
 //! containerd/ttrpc の `request.proto` のフィールド番号を prost の derive で手書きする
 //! （`.proto` は持ち込まない。#670）。`google.rpc.Status.details` は定義せず、受信時は
 //! prost が未知フィールドとして読み飛ばし、送信では出さない。
-//! `timeout_nano`・`metadata` は復号するだけで使わない（REPAIR-3。使うのは #672 以降）。
+//! `metadata` は復号するだけで使わない（REPAIR-3。使うのは #672 以降）。`timeout_nano` は Wait の期限に使う（`service::RequestDeadline`）。
 
 use crate::error::CriErrorCode;
 

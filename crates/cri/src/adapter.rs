@@ -29,7 +29,7 @@ use std::time::Duration;
 use fandhe_container_core::traits::{
     CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
     ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
-    StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
+    StartRequest, StateRequest, StopRequest, TerminationReason, TraitError, WaitExitRequest,
 };
 use tonic::Status;
 
@@ -628,6 +628,31 @@ impl RuntimeAdapter {
     pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
         let req = StateRequest::new(Self::id(id)?);
         Self::finish(id, self.runtime.state(&req))
+    }
+
+    /// コンテナが `Stopped` になるまで `timeout` を上限に待つ（`ContainerRuntime::wait_exit`。CRI-1・REPAIR-5）。
+    ///
+    /// shim v2 の `Wait` が呼ぶ。`poll_interval` は既定実装（状態の照会）の間隔のヒントで、
+    /// イベント駆動の実装は無視してよい。`cancelled` が真になれば `UNAVAILABLE` で戻る。
+    /// 実行層が `Stopped` 以外の状態を返したら、plugin の不正な応答として `INTERNAL` で拒否する。
+    pub fn wait_exit(
+        &self,
+        id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let req = WaitExitRequest::new(Self::id(id)?, timeout)
+            .and_then(|r| r.with_poll_interval(poll_interval))
+            .map_err(|e| CriError::from(&e))?
+            .with_cancel(cancelled);
+        let st = Self::finish(id, self.runtime.wait_exit(&req))?;
+        if st.lifecycle != RuntimeLifecycle::Stopped {
+            return Err(CriError::internal(
+                "runtime returned a non-stopped status from wait",
+            ));
+        }
+        Ok(st)
     }
 
     /// 実行層の応答を CRI の語彙へ写す。応答の ID が要求の ID と異なれば plugin の不正な応答として

@@ -22,27 +22,29 @@
 //! `Created` は core の契約で force=false では削除できない。plugin 越しでは最悪 2 回分の待ちになる。
 //!
 //! Wait（TASK-62.3.2）の検査の順序: 復号 → exec_id（空以外は `UNIMPLEMENTED`）→ id（アダプタの state）。
-//! `state` を [`WaitConfig`] の間隔で照会し `Stopped` で終了コードを返す。期限を超えたら `DEADLINE_EXCEEDED`（4）。
+//! `RuntimeAdapter::wait_exit`（core の `ContainerRuntime::wait_exit`）で `Stopped` を待ち、終了コードを返す。期限は
+//! `min(timeout_nano, WaitConfig::timeout)`（`timeout_nano` が 0 なら `WaitConfig` だけ）で、超えたら `DEADLINE_EXCEEDED`（4）。負の `timeout_nano` は runtime を呼ばずに 4。
 //! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
 //! サーバーは要求を接続内で並行 dispatch するため待ちは他の RPC を止めず、停止・切断の通知を受けた Wait は期限前に取り消される。
 //!
-//! 期限（REPAIR-5）: `ContainerRuntime` の契約で実装側が期限を持つ。shim は追加の期限を設けず、
-//! `timeout_nano` も使わない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
+//! 期限（REPAIR-5）: Wait は上記の期限を持つ。他のメソッドは `ContainerRuntime` の契約で実装側が期限を持ち、
+//! shim は追加の期限を設けない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
 
 use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use prost::Message;
 
 use super::exec::{ExecId, ExecRegistry, TaskExecLauncher, parse_process_spec};
 use super::message::{RpcStatus, count_top_level_field};
-use super::service::{TaskApiVersion, TtrpcService, unimplemented_status};
+use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
 use super::task_api::{
     CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
     StartRequest, StartResponse, WaitRequest, WaitResponse,
 };
-use super::wait::{WaitConfig, wait_until_stopped};
+use super::wait::WaitConfig;
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::ContainerId;
@@ -245,17 +247,35 @@ impl TaskService {
         .encode_to_vec())
     }
 
-    /// `Wait`: コンテナが `Stopped` になるまで state を照会して待ち、終了コードを返す（TASK-62.3.2）。
+    /// `Wait`: コンテナが `Stopped` になるまで `RuntimeAdapter::wait_exit` で待ち、終了コードを返す
+    /// （TASK-62.3.2・CRI-1）。
     ///
     /// exec のゲート（`execs.lock_container`）は意図して取らない。取ると待っている間ずっと同じコンテナの
-    /// Delete / Exec / Start(exec_id) が止まる。期限は shim 側の [`WaitConfig`] だけで決める
-    /// （REPAIR-5。`timeout_nano` はハンドラに届かない）。`exited_at` は core が終了時刻を持たないため未設定。
-    fn wait(&self, payload: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Vec<u8>, RpcStatus> {
+    /// Delete / Exec / Start(exec_id) が止まる。期限は `min(timeout_nano, WaitConfig::timeout)`
+    /// （`timeout_nano` が 0 なら `WaitConfig` だけ。REPAIR-5）で、負値と残り 0 は runtime を呼ばずに
+    /// `DEADLINE_EXCEEDED`。検査の順序は 復号 → exec_id → id → 期限。Wait だけが期限を使う
+    /// （他のメソッドは短く、`ContainerRuntime` の契約で有界）。`exited_at` は core が終了時刻を
+    /// 持たないため未設定。
+    fn wait(&self, payload: &[u8], ctx: &CallContext<'_>) -> Result<Vec<u8>, RpcStatus> {
         let req = WaitRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
             return Err(unsupported("exec_id is not supported"));
         }
-        let st = wait_until_stopped(&self.wait_config, cancelled, || self.adapter.state(&req.id))
+        ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
+        let Some(timeout) = ctx
+            .deadline
+            .limit_from(Instant::now(), self.wait_config.timeout())
+        else {
+            return Err(to_status(&CriError::timeout("wait exceeded its deadline")));
+        };
+        let st = self
+            .adapter
+            .wait_exit(
+                &req.id,
+                timeout,
+                self.wait_config.poll_interval(),
+                ctx.cancelled,
+            )
             .map_err(|e| to_status(&e))?;
         Ok(WaitResponse {
             exit_status: stopped_exit_status(&st),
@@ -293,20 +313,20 @@ impl TtrpcService for TaskService {
             "Start" => self.start(payload),
             "Delete" => self.delete(payload),
             "Exec" => self.exec(payload),
-            "Wait" => self.wait(payload, &|| false),
+            "Wait" => self.wait(payload, &CallContext::none()),
             _ => Err(unimplemented_status("method", method)),
         }
     }
 
-    /// Wait だけ取り消しを伝える。他のメソッドは短時間で終わるため `handle` と同じ。
-    fn handle_cancellable(
+    /// Wait だけ取り消しとクライアントの期限を伝える。他のメソッドは短時間で終わるため `handle` と同じ。
+    fn handle_with_context(
         &self,
         method: &str,
         payload: &[u8],
-        cancelled: &dyn Fn() -> bool,
+        ctx: &CallContext<'_>,
     ) -> Result<Vec<u8>, RpcStatus> {
         match method {
-            "Wait" => self.wait(payload, cancelled),
+            "Wait" => self.wait(payload, ctx),
             _ => self.handle(method, payload),
         }
     }
@@ -373,6 +393,7 @@ mod tests {
     };
 
     use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL};
+    use super::super::service::RequestDeadline;
     use super::super::task_api::{Any, Mount};
     use super::*;
 
@@ -1255,5 +1276,212 @@ mod tests {
         assert_eq!(m(ContainerStatus::stopped(id(), None)), 255);
         assert_eq!(m(ContainerStatus::stopped(id(), Some(-1))), 255);
         assert_eq!(m(ContainerStatus::created(id(), None)), 0);
+    }
+
+    type WaitFn = Option<
+        fn(
+            &fandhe_container_core::traits::WaitExitRequest<'_>,
+        ) -> Result<ContainerStatus, TraitError>,
+    >;
+
+    /// `state` の回数を数え、`wait_exit` を上書きできる偽ランタイム（Wait の期限と上書きの照合用）。
+    struct Probe {
+        inner: Shared,
+        state_calls: Arc<std::sync::atomic::AtomicUsize>,
+        wait_override: WaitFn,
+    }
+
+    impl ContainerRuntime for Probe {
+        fn create(&self, r: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            self.inner.create(r)
+        }
+        fn start(&self, r: &RtStart) -> Result<ContainerStatus, TraitError> {
+            self.inner.start(r)
+        }
+        fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            self.inner.kill(r)
+        }
+        fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            self.inner.stop(r)
+        }
+        fn delete(&self, r: &RtDelete) -> Result<RtDeleteResponse, TraitError> {
+            self.inner.delete(r)
+        }
+        fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            self.state_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.state(r)
+        }
+        fn wait_exit(
+            &self,
+            req: &fandhe_container_core::traits::WaitExitRequest<'_>,
+        ) -> Result<ContainerStatus, TraitError> {
+            match self.wait_override {
+                Some(f) => f(req),
+                None => {
+                    // 既定の本体と同じ契約で、このモジュールの Probe 経由の state を使う。
+                    let end = std::time::Instant::now() + req.timeout();
+                    loop {
+                        if req.is_cancelled() {
+                            return Err(TraitError::new(ErrorCode::Unavailable, "wait cancelled"));
+                        }
+                        let st = self.state(&StateRequest::new(req.id().clone()))?;
+                        if st.state() == ContainerState::Stopped {
+                            return Ok(st);
+                        }
+                        if std::time::Instant::now() >= end {
+                            return Err(TraitError::new(
+                                ErrorCode::Timeout,
+                                "wait exceeded its deadline",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+    }
+
+    fn probe_svc(
+        timeout_ms: u64,
+        poll_ms: u64,
+        wait_override: WaitFn,
+    ) -> (TaskService, Arc<Fake>, Arc<std::sync::atomic::AtomicUsize>) {
+        let f = Arc::new(Fake::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Probe {
+            inner: Shared(f.clone()),
+            state_calls: calls.clone(),
+            wait_override,
+        };
+        let s = TaskService::new(TaskApiVersion::V2, RuntimeAdapter::from_runtime(rt))
+            .with_wait_config(
+                WaitConfig::new(
+                    std::time::Duration::from_millis(timeout_ms),
+                    std::time::Duration::from_millis(poll_ms),
+                )
+                .unwrap(),
+            );
+        (s, f, calls)
+    }
+
+    fn wait_with(
+        s: &TaskService,
+        deadline: RequestDeadline,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        s.handle_with_context(
+            "Wait",
+            &wait_req("c1", ""),
+            &CallContext::new(cancelled, deadline),
+        )
+    }
+
+    /// CRI-1: `timeout_nano` が WaitConfig より短ければその期限（100ms）で 4。
+    #[test]
+    fn cri1_wait_timeout_nano_shorter_than_config() {
+        let (s, _f, _c) = probe_svc(10_000, 10, None);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let t0 = std::time::Instant::now();
+        let d = RequestDeadline::from_timeout_nano(t0, 100_000_000);
+        let (code, msg) = err_code(wait_with(&s, d, &|| false));
+        let el = t0.elapsed();
+        assert_eq!(
+            (code, msg.as_str()),
+            (DEADLINE, "wait exceeded its deadline")
+        );
+        assert!(el >= std::time::Duration::from_millis(100), "{el:?}");
+        assert!(el < std::time::Duration::from_secs(1), "{el:?}");
+    }
+
+    /// REPAIR-5: `timeout_nano` が WaitConfig（100ms）より長くても WaitConfig で切れる。0 も同じ。
+    #[test]
+    fn repair5_wait_timeout_nano_capped_by_config() {
+        for nano in [10_000_000_000i64, 0] {
+            let (s, _f, _c) = probe_svc(100, 10, None);
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            s.handle("Start", &start_req("c1")).unwrap();
+            let t0 = std::time::Instant::now();
+            let d = RequestDeadline::from_timeout_nano(t0, nano);
+            assert_eq!(err_code(wait_with(&s, d, &|| false)).0, DEADLINE);
+            let el = t0.elapsed();
+            assert!(el >= std::time::Duration::from_millis(100), "{el:?}");
+            assert!(el < std::time::Duration::from_secs(2), "{el:?}");
+        }
+    }
+
+    /// CRI-1: 負の `timeout_nano` は runtime（state）を呼ばずに 4。ただし id の検査は先に行う。
+    #[test]
+    fn cri1_wait_negative_timeout_nano_skips_runtime() {
+        let (s, _f, calls) = probe_svc(10_000, 10, None);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let d = RequestDeadline::from_timeout_nano(std::time::Instant::now(), -5);
+        let (code, msg) = err_code(wait_with(&s, d, &|| false));
+        assert_eq!(
+            (code, msg.as_str()),
+            (DEADLINE, "wait exceeded its deadline")
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let bad = s.handle_with_context(
+            "Wait",
+            &wait_req("bad id!", ""),
+            &CallContext::new(&|| false, RequestDeadline::Expired),
+        );
+        assert_eq!(err_code(bad).0, INVALID);
+    }
+
+    /// REPAIR-5: 取り消しは UNAVAILABLE（14）の "wait cancelled"。
+    #[test]
+    fn repair5_wait_cancelled_is_unavailable() {
+        let (s, _f, _c) = probe_svc(10_000, 10, None);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let cancelled = || flag.load(std::sync::atomic::Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        let r = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            wait_with(&s, RequestDeadline::None, &cancelled)
+        });
+        let (code, msg) = err_code(r);
+        assert_eq!((code, msg.as_str()), (14, "wait cancelled"));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// CRI-1: 上書きされた `wait_exit` が使われる（照会間隔 10 秒でも即座に返り、state は呼ばれない）。
+    #[test]
+    fn cri1_wait_uses_overridden_wait_exit() {
+        let (s, _f, calls) = probe_svc(
+            10_000,
+            10_000,
+            Some(|req| Ok(ContainerStatus::stopped(req.id().clone(), Some(33)))),
+        );
+        let t0 = std::time::Instant::now();
+        let out = wait_with(&s, RequestDeadline::None, &|| false).unwrap();
+        assert_eq!(WaitResponse::decode(&out[..]).unwrap().exit_status, 33);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// PLUG-1: 上書きが `Stopped` 以外を返したら plugin の不正な応答として INTERNAL（13）。
+    #[test]
+    fn plug1_wait_rejects_non_stopped_override() {
+        let (s, _f, _c) = probe_svc(
+            10_000,
+            10,
+            Some(|req| {
+                Ok(ContainerStatus::running(
+                    req.id().clone(),
+                    NonZeroU32::new(1),
+                ))
+            }),
+        );
+        let (code, _msg) = err_code(wait_with(&s, RequestDeadline::None, &|| false));
+        assert_eq!(code, 13);
     }
 }

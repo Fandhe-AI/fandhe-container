@@ -16,7 +16,10 @@
 //!
 //! ヘッダブロックの zlib 辞書は SPDY Protocol Draft 3（draft-mbelshe-httpbis-spdy-00, 2012-02）§2.6.10.1 の
 //! `SPDY_dictionary_txt`（1423 バイト）を、IETF 掲載のテキストから機械的に起こしたものである。
-//! 長さと Adler-32（0xe3c6a7c2）は試験で照合する。ライセンス・帰属表示の要否は PR 本文で報告する（licensing.md）。
+//! 長さと Adler-32（0xe3c6a7c2）は試験で照合する。
+//! 定義元は IETF Internet-Draft（draft-mbelshe-httpbis-spdy-00。プロトコルの相互運用に必須の固定バイト列）で、
+//! 文書の著作権表示は IETF Trust の規定に従う。ライセンス判断は Agent が行わず、オーナー判断事項として PR 本文・
+//! `docs/design/cri-streaming-server.md` に報告している（licensing.md）。NOTICE への追記要否も同判断に従う。
 
 use std::fmt;
 
@@ -504,8 +507,9 @@ fn parse_header_block(raw: &[u8]) -> Result<Vec<Header>, ProtocolError> {
             *slot = raw.get(start..end).ok_or_else(bad)?;
             pos = end;
         }
-        let name = String::from_utf8_lossy(fields[0]).to_ascii_lowercase();
-        let value = String::from_utf8_lossy(fields[1]).into_owned();
+        let [name_raw, value_raw] = fields;
+        let name = String::from_utf8_lossy(name_raw).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(value_raw).into_owned();
         headers.push(Header { name, value });
     }
     if pos != raw.len() {

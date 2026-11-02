@@ -61,6 +61,8 @@ pub const EXEC_PROTOCOL_V4: &str = "v4.channel.k8s.io";
 pub const MAX_SEND_QUEUE_BYTES: usize = 1024 * 1024;
 /// stdout / stderr を 1 DATA フレームにする最大バイト数。
 const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
+/// `pump_output` が 1 回の呼び出しで読む回数の上限（stdout / stderr の公平化。1 周回 128 KiB まで）。
+const MAX_OUTPUT_READS_PER_ROUND: usize = 4;
 /// 受信バッファの 1 回の読み取りサイズ。
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// 受信バッファの上限（最大の DATA フレーム + ヘッダ + 1 回の読み取り分）。
@@ -721,6 +723,8 @@ struct Relay<T> {
     stdin_stall_timeout: Duration,
     stdout: Option<Output>,
     stderr: Option<Output>,
+    /// 出力の処理順を周回ごとに入れ替える印（stdout / stderr の公平化）。
+    stderr_first: bool,
     resizer: Option<Box<dyn TerminalResizer>>,
     resize_line: Vec<u8>,
     resize_discard: bool,
@@ -907,7 +911,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
             }
 
             // stdout / stderr をクライアントへ送る。
-            for which in 0..2 {
+            // 先頭を毎周回入れ替え、片方が共有キューを使い切って他方が飢えるのを避ける。
+            self.stderr_first = !self.stderr_first;
+            for turn in 0..2 {
+                let which = if self.stderr_first { 1 - turn } else { turn };
                 let out = if which == 0 {
                     self.stdout.as_mut()
                 } else {
@@ -1047,7 +1054,13 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
     cx: &mut Context<'_>,
 ) -> Result<bool, ProtocolError> {
     let mut progressed = false;
-    while !out.eof && conn.pending_write() < MAX_SEND_QUEUE_BYTES {
+    let mut reads = 0usize;
+    // 1 周回あたりの読み取り回数に上限を付け、他方の出力にも送信キューを残す。
+    while !out.eof
+        && reads < MAX_OUTPUT_READS_PER_ROUND
+        && conn.pending_write() < MAX_SEND_QUEUE_BYTES
+    {
+        reads += 1;
         let mut tmp = [0u8; OUTPUT_CHUNK_BYTES];
         let mut buf = ReadBuf::new(&mut tmp);
         match Pin::new(&mut out.reader).poll_read(cx, &mut buf) {
@@ -1189,6 +1202,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         stdin_stall_timeout: config.stdin_stall_timeout,
         stdout: output(stdout, streams.stdout),
         stderr: output(stderr, streams.stderr),
+        stderr_first: false,
         resizer: resize,
         resize_line: Vec::new(),
         resize_discard: false,
@@ -1272,6 +1286,66 @@ mod tests {
             assert_eq!(conn.wbuf.len(), conn.pending_write());
             let _ = conn.poll_flush(&mut cx);
         }
+    }
+
+    /// 常に読める無限の stdout。
+    struct Endless;
+    impl AsyncRead for Endless {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = buf.remaining();
+            buf.put_slice(&vec![b'o'; n]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 1 バイトだけ返して EOF になる stderr。
+    struct OneShot(bool);
+    impl AsyncRead for OneShot {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.0 {
+                self.0 = true;
+                buf.put_slice(b"e");
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// CRI-6・REPAIR-5: 常に読める stdout が 1 回の呼び出しで読む量は 128 KiB までで、続く stderr も送信キューに積まれる。
+    #[test]
+    fn cri6_pump_output_is_bounded_and_stderr_not_starved() {
+        let mut conn = Conn::new(TrickleIo {
+            accepted_last: true,
+        })
+        .expect("conn");
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut stdout = Output {
+            reader: Box::new(Endless),
+            id: StreamId::new(3).expect("id"),
+            eof: false,
+            failed: false,
+        };
+        let mut stderr = Output {
+            reader: Box::new(OneShot(false)),
+            id: StreamId::new(5).expect("id"),
+            eof: false,
+            failed: false,
+        };
+        assert!(pump_output(&mut conn, &mut stdout, &mut cx).expect("stdout"));
+        let after_stdout = conn.pending_write();
+        // 4 回 x 32 KiB のペイロードに DATA ヘッダ 8 バイト x 4 を足した量。
+        assert_eq!(after_stdout, 4 * (32 * 1024 + 8));
+        assert!(pump_output(&mut conn, &mut stderr, &mut cx).expect("stderr"));
+        // stderr は 1 バイトのデータ + FIN の 2 フレーム（ヘッダ 8 バイト x 2 + 1）。
+        assert_eq!(conn.pending_write(), after_stdout + 8 + 1 + 8);
+        assert!(stderr.eof);
     }
 
     fn headers_with(values: &[&str]) -> HeaderMap {

@@ -10,6 +10,7 @@
 # TASK-74.2.2 で guest_memory・virtqueue・virtio_block を追加（依存は増やさない。unsafe なし）。
 # TASK-74.2.3 で interrupt・irq と KVM_IRQFD / KVM_IOEVENTFD / KVM_CREATE_IRQCHIP / eventfd を追加（依存は増やさない。unsafe は sys.rs のみ）。
 # TASK-74.3.1 で virtio_net を追加（依存は増やさない。unsafe なし）。
+# TASK-74.3.2 で interrupt に virtio-net の割り込み通知を追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

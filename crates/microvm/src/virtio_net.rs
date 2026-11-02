@@ -9,7 +9,7 @@
 //! `KVM_RUN` の MMIO exit を振り分ける側（TASK-74.4.2 の `dispatch`）は、`QueueNotify(0)` で
 //! [`VirtioNet::process_rx`]、`QueueNotify(1)` で [`VirtioNet::process_tx`]、`QueueStopped(i)` で
 //! [`VirtioNet::stop_queue`] を呼ぶ。処理結果の `completed` が 1 以上なら
-//! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（割り込みの実配送は TASK-74.3.2・#881）。
+//! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（割り込みの実配送は `crate::interrupt::complete_net_notify`。TASK-74.3.2・#881）。
 //! リング破損は `Err` で返り、`Err` でも途中までの要求は used へ書かれ `used.idx` が進んでいることがある。
 //! その内訳は [`VirtioNet::rx_stats_before_error`] / [`VirtioNet::tx_stats_before_error`] で取り、
 //! `completed` が 1 以上なら `Err` でも `UsedBuffer` を上げる。壊れたチェーンは `last_avail` を進めないため、
@@ -17,7 +17,7 @@
 //!
 //! backend にフレームが届いたことを知らせるホスト側のイベントループ（ポーリング・eventfd）はまだ無い。
 //! 呼び出し元は、ゲストの kick が無くても backend にフレームがあるときに `process_rx` を呼ぶ必要がある
-//! （REPAIR-3。TASK-75 / TASK-117 / #881 で決める）。
+//! （REPAIR-3。TASK-75 / TASK-117 で決める）。
 //!
 //! # 受信の保持と取りこぼし
 //! 受信用のゲストバッファが無いとき、取り出したフレームは device が固定長の staging buffer に 1 フレームだけ保持し
@@ -28,7 +28,7 @@
 //! ctrl vq・マルチキュー・チェックサム / TSO / UFO オフロード・`MRG_RXBUF`・`STATUS`・`MTU`・`EVENT_IDX`・
 //! `INDIRECT`・packed。TAP などの実 backend は起動フローの TASK-75 / TASK-117 で決める
 //! （TAP の `TUNSETIFF` は `sys` の unsafe が要るため本モジュールでは扱わない）。
-//! 割り込みの実配送（`KVM_IRQFD` / `ioeventfd`）は TASK-74.3.2・#881。
+//! 割り込みの実配送（`KVM_IRQFD` / `ioeventfd`）は `crate::interrupt::complete_net_notify`（TASK-74.3.2・#881。実装済み）。
 //!
 //! # 準拠先
 //! OASIS "Virtual I/O Device (VIRTIO) Version 1.2" の 5.1（Network Device。5.1.3 feature bits・

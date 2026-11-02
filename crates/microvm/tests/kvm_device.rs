@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -367,6 +367,147 @@ fn kvm_device_block_queue_interrupt() {
     assert_eq!(report.queue_error, None);
     assert_eq!(status, 1);
     assert_eq!(written, payload);
+}
+
+/// MVM-1・MVM-4・TASK-74.3.2: virtio-net の receiveq の QueueNotify(0) が ioeventfd で数えられ、
+/// `complete_net_notify` の後の irqfd の割り込みがゲストの ISR に届く。ゲストが書くのは `QueueNotify(0)` だけで、
+/// virtqueue の中身はホストの heap にある（KVM への登録は TASK-75.1）。送信（キュー 1）は heap の試験で確かめる。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_queue_interrupt() {
+    use fandhe_container_microvm::device::QueueInterruptProbe;
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
+    use fandhe_container_microvm::interrupt::{
+        InterruptDelivery, NetQueueStats, complete_net_notify,
+    };
+    use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+    use fandhe_container_microvm::virtio_net::{MemoryNetBackend, NetRxStats, VirtioNet};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+    const BUF: u64 = 0x11000;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        type T = VirtioMmioTransport<VirtioNet<MemoryNetBackend>>;
+        let mut t = VirtioMmioTransport::new(VirtioNet::new(
+            MemoryNetBackend::new(),
+            [0x02, 0, 0, 0, 0, 0x01],
+        ))
+        .unwrap();
+        let wr = |t: &mut T, off, v: u32| t.write(off, &v.to_le_bytes());
+        wr(&mut t, reg::STATUS, 1);
+        wr(&mut t, reg::STATUS, 3);
+        let mut b = [0u8; 4];
+        wr(&mut t, reg::DEVICE_FEATURES_SEL, 0);
+        t.read(reg::DEVICE_FEATURES, &mut b);
+        wr(&mut t, reg::DRIVER_FEATURES_SEL, 0);
+        wr(&mut t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
+        wr(&mut t, reg::DRIVER_FEATURES_SEL, 1);
+        wr(&mut t, reg::DRIVER_FEATURES, 1);
+        assert_eq!(
+            wr(&mut t, reg::STATUS, 11),
+            MmioWriteOutcome::FeaturesAccepted
+        );
+        for (q, d, a, u) in [(0, DESC, AVAIL, USED), (1, 0x4000, 0x5000, 0x6000)] {
+            wr(&mut t, reg::QUEUE_SEL, q);
+            wr(&mut t, reg::QUEUE_NUM, 16);
+            wr(&mut t, reg::QUEUE_DESC_LOW, d as u32);
+            wr(&mut t, reg::QUEUE_DRIVER_LOW, a as u32);
+            wr(&mut t, reg::QUEUE_DEVICE_LOW, u as u32);
+            wr(&mut t, reg::QUEUE_READY, 1);
+        }
+        assert_eq!(
+            wr(&mut t, reg::STATUS, 15),
+            MmioWriteOutcome::DeviceActivated
+        );
+
+        let mut mem =
+            GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
+        let inbound: Vec<u8> = (0..100u32).map(|i| (i % 241) as u8).collect();
+        t.device_mut().backend_mut().push_inbound(&inbound).unwrap();
+        // receiveq: 2048 バイトの device-writable バッファ 1 つ。
+        mem.write_at(GuestAddress::new(DESC), &BUF.to_le_bytes())
+            .unwrap();
+        mem.write_u32_le(GuestAddress::new(DESC + 8), 2048).unwrap();
+        mem.write_u16_le(GuestAddress::new(DESC + 12), 2).unwrap();
+        mem.write_u16_le(GuestAddress::new(DESC + 14), 0).unwrap();
+        mem.write_u16_le(GuestAddress::new(AVAIL + 4), 0).unwrap();
+        mem.write_u16_le(GuestAddress::new(AVAIL + 2), 1).unwrap();
+
+        let mut report = None;
+        let probe = dev.probe_queue_interrupt(&mut |line| {
+            report = Some(complete_net_notify(&mut t, &mut mem, 0, line)?);
+            Ok(())
+        });
+        let mut got = vec![0u8; 112];
+        mem.read_at(GuestAddress::new(BUF), &mut got).unwrap();
+        let _ = tx.send((probe, report, t.interrupt_status(), got, inbound));
+    });
+    let (probe, report, status, got, inbound) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("probe_queue_interrupt did not finish within 30s");
+    let probe = probe.unwrap();
+    let report = report.expect("on_notify must be called");
+    let out = |port, byte| VcpuExit::Io {
+        direction: IoDirection::Out,
+        port,
+        size: 1,
+        count: 1,
+        data: vec![byte],
+    };
+    assert_eq!(
+        probe,
+        QueueInterruptProbe {
+            ready_exit: out(0x10, 0x42),
+            notify_count: 1,
+            idle_outcome: MicrovmErrorCode::DeadlineExceeded,
+            interrupt_exit: out(0x13, 0xA5),
+        }
+    );
+    assert_eq!(
+        report.stats,
+        NetQueueStats::Rx(NetRxStats {
+            completed: 1,
+            delivered: 1,
+            ..NetRxStats::default()
+        })
+    );
+    assert_eq!(report.delivery, InterruptDelivery::Triggered);
+    assert_eq!(report.queue_error, None);
+    assert_eq!(status, 1);
+    assert_eq!(&got[..12], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(&got[12..], &inbound[..]);
+}
+
+/// 他 arch では virtio-net の割り込み通知の自己診断も未実装であること（型検査と fail-closed の確認）。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_queue_interrupt() {
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    assert_eq!(
+        dev.probe_queue_interrupt(&mut |_| Ok(()))
+            .unwrap_err()
+            .code(),
+        MicrovmErrorCode::Unimplemented
+    );
 }
 
 /// 他 arch では割り込み通知の自己診断が未実装であること（型検査と fail-closed の確認）。

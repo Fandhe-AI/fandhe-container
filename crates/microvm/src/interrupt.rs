@@ -1,10 +1,10 @@
 //! virtio デバイスの割り込み通知の OS 非依存部分（TASK-74.2.3・MVM-1。`unsafe` なし・全 OS でビルドする）。
 //!
 //! 呼び出し文脈: ゲストの `QueueNotify` を受けた側（Linux では `crate::irq` の ioeventfd、それ以外では
-//! `crate::dispatch` の MMIO exit）が [`complete_block_notify`] を呼び、virtqueue の処理結果に応じて
+//! `crate::dispatch` の MMIO exit）が [`complete_block_notify`]（virtio-net は [`complete_net_notify`]）を呼び、virtqueue の処理結果に応じて
 //! [`InterruptLine::trigger`] でゲストへ割り込みを 1 回注入する。Linux の [`InterruptLine`] 実装は
-//! `crate::irq::IrqFd`（`KVM_IRQFD`）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2）も
-//! [`InterruptLine`] と [`IoEventSpec`] を使い回す。
+//! `crate::irq::IrqFd`（`KVM_IRQFD`）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
+//! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
 //! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みは edge 扱いで、
 //! resamplefd による level の再注入は未実装（TASK-75 で再検討。REPAIR-3）。
@@ -13,6 +13,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestMemory, GuestMemoryBacking};
 use crate::virtio_block::{BlockBackend, BlockQueueStats, VirtioBlock};
 use crate::virtio_mmio::{InterruptReason, VirtioMmioTransport, reg};
+use crate::virtio_net::{NetBackend, NetRxStats, NetTxStats, VirtioNet};
 
 /// ゲストへの割り込み 1 回分の注入口。
 pub trait InterruptLine {
@@ -153,6 +154,98 @@ pub fn complete_block_notify<B: BlockBackend, M: GuestMemoryBacking>(
         InterruptDelivery::NotNeeded
     };
     Ok(BlockNotifyReport {
+        stats,
+        delivery,
+        queue_error,
+    })
+}
+
+/// virtio-net の 1 キュー分の処理内訳（キュー番号で受信 / 送信を区別する。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetQueueStats {
+    /// receiveq（キュー 0）の `process_rx` の内訳。
+    Rx(NetRxStats),
+    /// transmitq（キュー 1）の `process_tx` の内訳。
+    Tx(NetTxStats),
+    /// 範囲外のキュー番号（ゲストの入力）。何も処理していない。
+    Unknown {
+        /// ゲストが指定したキュー番号。
+        queue: u16,
+    },
+}
+
+impl NetQueueStats {
+    /// used へ返した数（`Unknown` は 0）。
+    pub fn completed(&self) -> u32 {
+        match self {
+            Self::Rx(s) => s.completed,
+            Self::Tx(s) => s.completed,
+            Self::Unknown { .. } => 0,
+        }
+    }
+}
+
+/// [`complete_net_notify`] の結果（REPAIR-4: 真偽値にしない。意味は [`BlockNotifyReport`] と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetNotifyReport {
+    /// 今回の処理内訳（エラー終了でもそれまでの分）。
+    pub stats: NetQueueStats,
+    /// 割り込みを注入したか。
+    pub delivery: InterruptDelivery,
+    /// リング破損・範囲外のキュー番号など（ゲスト起因）。割り込み線の失敗は外側の `Err` で返す。
+    pub queue_error: Option<MicrovmError>,
+}
+
+/// virtio-net で `QueueNotify(queue)` を受けた後の処理（TASK-74.3.2・#881・MVM-1）。
+///
+/// 呼び出し文脈: ioeventfd か MMIO exit が返す `MmioWriteOutcome::QueueNotify(i)` の `i` を `queue` に渡す。
+/// backend にフレームが届いたとき（ゲストの kick なし）は呼び出し元が `queue = 0` で呼ぶ。
+/// 0 は `process_rx`、1 は `process_tx`、それ以外はゲストの入力として `queue_error`（`InvalidArgument`）で返し、
+/// トランスポートにも割り込み線にも触れない。完了が 1 件以上なら `UsedBuffer` を立てて割り込みを 1 回注入する。
+/// virtio-mmio の割り込み線はデバイスに 1 本で、2 つのキューは同じ `line`（同じ GSI）を共有する。
+///
+/// `process_*` が `Err` でも、それまでに used へ返した分（`*_stats_before_error`）があれば割り込みを上げる。
+/// 停止・リセットの判断は呼び出し元に残す。外側の `Err` は割り込み線の失敗だけ。待ちは持たない（REPAIR-5 不要）。
+///
+/// 残余（[`complete_block_notify`] と同じ。REPAIR-3）: `trigger` が失敗すると外側の `Err` だけを返し、
+/// 処理済みの `stats` は呼び出し元へ渡らない。`interrupt_status` の `UsedBuffer` は立ったまま残る。
+pub fn complete_net_notify<B: NetBackend, M: GuestMemoryBacking>(
+    transport: &mut VirtioMmioTransport<VirtioNet<B>>,
+    mem: &mut GuestMemory<M>,
+    queue: u16,
+    line: &dyn InterruptLine,
+) -> Result<NetNotifyReport, MicrovmError> {
+    let (stats, queue_error) = match queue {
+        0 => match transport.device_mut().process_rx(mem) {
+            Ok(s) => (NetQueueStats::Rx(s), None),
+            Err(e) => (
+                NetQueueStats::Rx(transport.device().rx_stats_before_error()),
+                Some(e),
+            ),
+        },
+        1 => match transport.device_mut().process_tx(mem) {
+            Ok(s) => (NetQueueStats::Tx(s), None),
+            Err(e) => (
+                NetQueueStats::Tx(transport.device().tx_stats_before_error()),
+                Some(e),
+            ),
+        },
+        other => (
+            NetQueueStats::Unknown { queue: other },
+            Some(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "net queue index out of range",
+            )),
+        ),
+    };
+    let delivery = if stats.completed() >= 1 {
+        transport.raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger()?;
+        InterruptDelivery::Triggered
+    } else {
+        InterruptDelivery::NotNeeded
+    };
+    Ok(NetNotifyReport {
         stats,
         delivery,
         queue_error,

@@ -51,6 +51,9 @@ fn spawn_echo() -> SocketAddr {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
             std::thread::spawn(move || {
+                // 相手が止まっても待ち続けない（REPAIR-5）。期限切れは read / write のエラーで抜ける。
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = conn.read(&mut buf) {
                     if n == 0 {
@@ -111,6 +114,8 @@ fn raw_connect(addr: SocketAddr) -> TcpStream {
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
     tcp.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("write timeout");
     tcp
 }
 
@@ -642,8 +647,18 @@ async fn cri6_port_forward_session_holds_connection_permit() {
         // 枠が 1 つだけなので 2 本目は応答なしで閉じられる。
         let mut second = raw_connect(addr);
         let mut buf = [0u8; 16];
-        let n = second.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "second connection must be closed");
+        // EOF か接続リセットだけを切断とみなし、TimedOut / WouldBlock は失敗にする（REPAIR-12）。
+        match second.read(&mut buf) {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("second connection must be closed, got {other:?}"),
+        }
         c.send(&Frame::Ping(1));
         assert_eq!(c.recv(), Some(Frame::Ping(1)));
         drop(c);

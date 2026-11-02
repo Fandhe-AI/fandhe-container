@@ -418,6 +418,8 @@ struct Session<IO> {
     config: PortForwardConfig,
     scratch: Vec<u8>,
     last_activity: Instant,
+    /// 対の処理を始める位置。毎回進めて、送信キューの空きを先頭の対が独占しないようにする。
+    pair_cursor: usize,
     tick: Pin<Box<Sleep>>,
     tick_every: Duration,
     end: Option<PortForwardEnd>,
@@ -451,6 +453,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             allowed,
             scratch: vec![0u8; DATA_CHUNK],
             last_activity: Instant::now(),
+            pair_cursor: 0,
             tick: Box::pin(tokio::time::sleep(tick_every)),
             tick_every,
             end: None,
@@ -513,7 +516,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 return Poll::Ready(reason);
             }
             match self.outbox.poll_flush(&mut self.io, cx) {
-                Ok(p) => progress |= p,
+                Ok(p) => {
+                    if p {
+                        // 送信が進んでいる間は遅い受信側でも idle とみなさない。
+                        self.last_activity = Instant::now();
+                    }
+                    progress |= p;
+                }
                 Err(()) => return Poll::Ready(PortForwardEnd::ProtocolError),
             }
             if self.can_read() {
@@ -766,7 +775,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     fn step_pairs(&mut self, cx: &mut Context<'_>) -> bool {
         let mut progress = false;
         let mut done: Vec<(String, bool)> = Vec::new();
-        for (key, pair) in &mut self.pairs {
+        let mut keys: Vec<String> = self.pairs.keys().cloned().collect();
+        keys.sort();
+        if !keys.is_empty() {
+            let start = self.pair_cursor % keys.len();
+            keys.rotate_left(start);
+            self.pair_cursor = self.pair_cursor.wrapping_add(1);
+        }
+        for key in keys {
+            let Some(pair) = self.pairs.get_mut(&key) else {
+                continue;
+            };
             match step_pair(
                 pair,
                 &mut self.outbox,
@@ -776,8 +795,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 &mut self.last_activity,
             ) {
                 PairStep::Continue { progress: p } => progress |= p,
-                PairStep::Finished => done.push((key.clone(), false)),
-                PairStep::Aborted => done.push((key.clone(), true)),
+                PairStep::Finished => done.push((key, false)),
+                PairStep::Aborted => done.push((key, true)),
             }
         }
         for (key, aborted) in done {

@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -235,6 +235,155 @@ fn kvm_device_exit_dispatch() {
     };
     assert_eq!(
         dev.probe_exit_dispatch().unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+/// MVM-1・MVM-4・TASK-74.2.3: virtio-block の `QueueNotify` が ioeventfd で VM exit なしに数えられ、処理後の
+/// 割り込み（irqfd）がゲストの ISR に届くこと（x86_64）。
+///
+/// ゲストが実際に書くのは `QueueNotify` だけで、virtqueue の中身はホストの heap 上にある（ゲストメモリを
+/// KVM に登録するのは TASK-75.1）。割り込みが入る前は HLT のまま `DeadlineExceeded` になる（陰性対照）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_block_queue_interrupt() {
+    use fandhe_container_microvm::device::QueueInterruptProbe;
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
+    use fandhe_container_microvm::interrupt::{InterruptDelivery, complete_block_notify};
+    use fandhe_container_microvm::virtio_block::{
+        BlockQueueStats, MemoryBlockBackend, VirtioBlock,
+    };
+    use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+    const HDR: u64 = 0x10000;
+    const DATA: u64 = 0x11000;
+    const STATUS: u64 = 0x12000;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        type T = VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>>;
+        let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let wr = |t: &mut T, off, v: u32| t.write(off, &v.to_le_bytes());
+        wr(&mut t, reg::STATUS, 1);
+        wr(&mut t, reg::STATUS, 3);
+        let mut b = [0u8; 4];
+        wr(&mut t, reg::DEVICE_FEATURES_SEL, 0);
+        t.read(reg::DEVICE_FEATURES, &mut b);
+        wr(&mut t, reg::DRIVER_FEATURES_SEL, 0);
+        wr(&mut t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
+        wr(&mut t, reg::DRIVER_FEATURES_SEL, 1);
+        wr(&mut t, reg::DRIVER_FEATURES, 1);
+        assert_eq!(
+            wr(&mut t, reg::STATUS, 11),
+            MmioWriteOutcome::FeaturesAccepted
+        );
+        wr(&mut t, reg::QUEUE_SEL, 0);
+        wr(&mut t, reg::QUEUE_NUM, 16);
+        wr(&mut t, reg::QUEUE_DESC_LOW, DESC as u32);
+        wr(&mut t, reg::QUEUE_DRIVER_LOW, AVAIL as u32);
+        wr(&mut t, reg::QUEUE_DEVICE_LOW, USED as u32);
+        wr(&mut t, reg::QUEUE_READY, 1);
+        assert_eq!(
+            wr(&mut t, reg::STATUS, 15),
+            MmioWriteOutcome::DeviceActivated
+        );
+
+        let mut mem =
+            GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        mem.write_at(GuestAddress::new(DATA), &payload).unwrap();
+        mem.write_u32_le(GuestAddress::new(HDR), 1).unwrap(); // VIRTIO_BLK_T_OUT
+        mem.write_at(GuestAddress::new(HDR + 8), &3u64.to_le_bytes())
+            .unwrap();
+        for (i, addr, len, flags, next) in [
+            (0u64, HDR, 16u32, 1u16, 1u16),
+            (1, DATA, 512, 1, 2),
+            (2, STATUS, 1, 2, 0),
+        ] {
+            let at = DESC + i * 16;
+            mem.write_at(GuestAddress::new(at), &addr.to_le_bytes())
+                .unwrap();
+            mem.write_u32_le(GuestAddress::new(at + 8), len).unwrap();
+            mem.write_u16_le(GuestAddress::new(at + 12), flags).unwrap();
+            mem.write_u16_le(GuestAddress::new(at + 14), next).unwrap();
+        }
+        mem.write_at(GuestAddress::new(STATUS), &[0xff]).unwrap();
+        mem.write_u16_le(GuestAddress::new(AVAIL + 4), 0).unwrap();
+        mem.write_u16_le(GuestAddress::new(AVAIL + 2), 1).unwrap();
+
+        let mut report = None;
+        let probe = dev.probe_queue_interrupt(&mut |line| {
+            report = Some(complete_block_notify(&mut t, &mut mem, line)?);
+            Ok(())
+        });
+        let written = t.device().backend().contents()[3 * 512..4 * 512].to_vec();
+        let _ = tx.send((probe, report, t.interrupt_status(), written, payload));
+    });
+    let (probe, report, status, written, payload) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("probe_queue_interrupt did not finish within 30s");
+    let probe = probe.unwrap();
+    let report = report.expect("on_notify must be called");
+    let out = |port, byte| VcpuExit::Io {
+        direction: IoDirection::Out,
+        port,
+        size: 1,
+        count: 1,
+        data: vec![byte],
+    };
+    assert_eq!(
+        probe,
+        QueueInterruptProbe {
+            ready_exit: out(0x10, 0x42),
+            notify_count: 1,
+            idle_outcome: MicrovmErrorCode::DeadlineExceeded,
+            interrupt_exit: out(0x13, 0xA5),
+        }
+    );
+    assert_eq!(
+        report.stats,
+        BlockQueueStats {
+            completed: 1,
+            ok: 1,
+            ..BlockQueueStats::default()
+        }
+    );
+    assert_eq!(report.delivery, InterruptDelivery::Triggered);
+    assert_eq!(report.queue_error, None);
+    assert_eq!(status, 1);
+    assert_eq!(written, payload);
+}
+
+/// 他 arch では割り込み通知の自己診断が未実装であること（型検査と fail-closed の確認）。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_block_queue_interrupt() {
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    assert_eq!(
+        dev.probe_queue_interrupt(&mut |_| Ok(()))
+            .unwrap_err()
+            .code(),
         MicrovmErrorCode::Unimplemented
     );
 }

@@ -8,7 +8,7 @@
 //! # 呼び出し契約
 //! `KVM_RUN` の MMIO exit を振り分ける側（TASK-74.4.2）が `QueueNotify(0)` を受けたら
 //! `device_mut().process_queue(&mem)` を呼び、[`BlockQueueStats::completed`] が 1 以上なら
-//! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（割り込みの実配送は TASK-74.2.3）。
+//! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（実配送は `crate::interrupt::complete_block_notify`。TASK-74.2.3）。
 //! `QueueStopped(0)` では [`VirtioBlock::stop_queue`] を呼ぶ。リングの破損は `process_queue` が `Err` で返し、
 //! `Err` でも途中までの要求は used へ書かれ `used.idx` が進んでいることがある。その内訳は
 //! [`VirtioBlock::stats_before_error`] で取り、`completed` が 1 以上なら `Err` でも `UsedBuffer` を上げる。

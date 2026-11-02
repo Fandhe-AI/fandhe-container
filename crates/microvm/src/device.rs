@@ -12,6 +12,12 @@
 //! 終了通知。TASK-75）は未実装で、後続の TASK-74・TASK-75 が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
+//! TASK-74.2.3（#879）で割り込み通知を足した: [`VmFd::create_irqchip`]（x86_64。vCPU より前に作る）・
+//! [`VmFd::register_irqfd`]（`KVM_IRQFD`。eventfd への書き込みで GSI の割り込みを注入）・
+//! [`VmFd::register_ioeventfd`]（`KVM_IOEVENTFD`。ゲストの `QueueNotify` を VM exit なしで eventfd へ）と、
+//! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
+//! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
+//! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
@@ -37,6 +43,8 @@ use std::time::{Duration, Instant};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, VcpuExit};
+use crate::interrupt::{InterruptLine, IoEventSpec};
+use crate::irq::{self, EventFd, IoEventFd, IrqFd};
 use crate::sys::{self, SysError};
 
 /// 本番で開くデバイスパス（固定リテラル。外部入力は届かない）。
@@ -54,6 +62,8 @@ const EACCES: i32 = 13;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOTTY: i32 = 25;
+const EBUSY: i32 = 16;
+const ENOSPC: i32 = 28;
 
 /// 開いた `/dev/kvm`。
 #[derive(Debug)]
@@ -163,6 +173,19 @@ pub struct ExitDispatchProbe {
     /// 記録用ポートデバイス（ポート 0x11 から）へ書かれた `(基底からのオフセット, 値)`。IN・MMIO read の
     /// 応答がゲストへ届いた証拠（ゲストが受け取った値をそのまま OUT する）。
     pub port_writes: Vec<(u16, u8)>,
+}
+
+/// [`KvmDevice::probe_queue_interrupt`] の結果（TASK-74.2.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueInterruptProbe {
+    /// ゲストが準備完了を知らせた exit。期待は `Io{Out, 0x10, [0x42]}`（`QueueNotify` の書き込みは exit にならない）。
+    pub ready_exit: VcpuExit,
+    /// ioeventfd が数えた `QueueNotify` の回数。期待は 1。
+    pub notify_count: u64,
+    /// 割り込みを入れる前に `run_once` した結果（ゲストは HLT で待つため期待は `DeadlineExceeded`）。
+    pub idle_outcome: MicrovmErrorCode,
+    /// 割り込みを入れた後にゲストの ISR が知らせた exit。期待は `Io{Out, 0x13, [0xA5]}`。
+    pub interrupt_exit: VcpuExit,
 }
 
 /// [`KvmDevice::probe_deadline_interrupt`] の結果。
@@ -474,7 +497,125 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
     }
 }
 
+/// 割り込み通知の設定の段（errno 分類のメッセージ切り替え用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrqStage {
+    CheckExtension,
+    CreateIrqchip,
+    Irqfd,
+    Ioeventfd,
+}
+
+fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
+    let name = match stage {
+        IrqStage::CheckExtension => "KVM_CHECK_EXTENSION",
+        IrqStage::CreateIrqchip => "KVM_CREATE_IRQCHIP",
+        IrqStage::Irqfd => "KVM_IRQFD",
+        IrqStage::Ioeventfd => "KVM_IOEVENTFD",
+    };
+    match e {
+        SysError::Unsupported => MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "KVM is not supported on this architecture",
+        ),
+        SysError::Os(ENOTTY) => {
+            MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM VM fd")
+        }
+        SysError::Os(EEXIST) | SysError::Os(EBUSY) => MicrovmError::new(
+            MicrovmErrorCode::AlreadyExists,
+            format!("{name}: already registered"),
+        ),
+        // irqchip の作成は vCPU より前でなければならず、irqfd は irqchip が無いと EINVAL になる。
+        SysError::Os(EINVAL) if stage == IrqStage::CreateIrqchip => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_CREATE_IRQCHIP must run before any vCPU is created",
+        ),
+        SysError::Os(EINVAL) if stage == IrqStage::Irqfd => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_IRQFD rejected (no irqchip or invalid GSI)",
+        ),
+        SysError::Os(EINVAL) if stage == IrqStage::Ioeventfd => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM_IOEVENTFD rejected the address, length or datamatch",
+        ),
+        SysError::Os(n) if n == EACCES || n == EPERM => MicrovmError::new(
+            MicrovmErrorCode::PermissionDenied,
+            format!("permission denied ({name})"),
+        ),
+        SysError::Os(n) if n == ENOSPC || n == ENOMEM || n == EMFILE || n == ENFILE => {
+            MicrovmError::new(
+                MicrovmErrorCode::ResourceExhausted,
+                format!("resource exhausted ({name}, os error {n})"),
+            )
+        }
+        SysError::NullMapping => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("{name} failed (unexpected null mapping)"),
+        ),
+        SysError::Os(n) => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("{name} failed (os error {n})"),
+        ),
+    }
+}
+
 impl VmFd {
+    /// 拡張 `cap` に対応しているかを確かめ、非対応なら `FailedPrecondition`。
+    fn require_extension(&self, cap: u64, what: &'static str) -> Result<(), MicrovmError> {
+        let n = sys::kvm_check_extension(self.fd.as_fd(), cap)
+            .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))?;
+        if n == 0 {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                format!("{what} is not supported by this kernel"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// in-kernel irqchip（PIC・IOAPIC・LAPIC）を作る（TASK-74.2.3・MVM-1。x86_64 のみ）。
+    ///
+    /// vCPU を作る前に呼ぶ（作った後はカーネルが EINVAL を返し `FailedPrecondition`）。二重作成は `AlreadyExists`。
+    /// aarch64 は vGIC が別方式（`KVM_CREATE_DEVICE`）のため `Unimplemented`（TASK-75。REPAIR-3）。
+    pub fn create_irqchip(&self) -> Result<(), MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
+        sys::kvm_create_irqchip(self.fd.as_fd())
+            .map_err(|e| classify_irq_error(IrqStage::CreateIrqchip, e))
+    }
+
+    /// eventfd を GSI `gsi` に結ぶ（`KVM_IRQFD`）。返った [`IrqFd`] の `trigger` でゲストへ割り込みが入る。
+    ///
+    /// irqchip を先に作ること（無いと `FailedPrecondition`）。GSI の範囲はカーネルの検証に任せる。
+    /// 同じ組の二重登録は `AlreadyExists`。割り込みは edge 扱い（level の再注入は未実装）。
+    pub fn register_irqfd(&self, gsi: u32) -> Result<IrqFd<'_>, MicrovmError> {
+        self.require_extension(sys::consts::KVM_CAP_IRQFD, "KVM_CAP_IRQFD")?;
+        let event = EventFd::new()?;
+        sys::kvm_irqfd(self.fd.as_fd(), event.as_fd(), gsi, false)
+            .map_err(|e| classify_irq_error(IrqStage::Irqfd, e))?;
+        Ok(IrqFd::registered(self.fd.as_fd(), event, gsi))
+    }
+
+    /// ゲストの `spec` への書き込みを VM exit なしで eventfd へ通す（`KVM_IOEVENTFD`）。
+    ///
+    /// 条件に合わない書き込みは従来どおり MMIO / PIO exit で `dispatch` に届く。同じ組の二重登録は `AlreadyExists`。
+    pub fn register_ioeventfd(&self, spec: IoEventSpec) -> Result<IoEventFd<'_>, MicrovmError> {
+        self.require_extension(sys::consts::KVM_CAP_IOEVENTFD, "KVM_CAP_IOEVENTFD")?;
+        let event = EventFd::new()?;
+        let (addr, pio) = irq::ioevent_args(&spec);
+        sys::kvm_ioeventfd(
+            self.fd.as_fd(),
+            event.as_fd(),
+            addr,
+            spec.len(),
+            spec.datamatch(),
+            pio,
+            false,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::Ioeventfd, e))?;
+        Ok(IoEventFd::registered(self.fd.as_fd(), event, spec))
+    }
+
     /// `KVM_CREATE_VCPU` で vCPU を作る（aarch64 は続けて初期化する。モジュール doc 参照）。
     /// id の上限は検証せずカーネルの EINVAL（`InvalidArgument`）に任せる。重複は `AlreadyExists`。
     /// 初期化に失敗したときは作成済みの fd を drop で close する。
@@ -662,6 +803,38 @@ impl KvmDevice {
         }
     }
 
+    /// 自己診断: virtio-mmio の `QueueNotify` の ioeventfd と、irqfd による割り込み注入を実機で確かめる
+    /// （TASK-74.2.3・MVM-1・MVM-4。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// VM に in-kernel irqchip を作り、virtio-mmio（基底 GPA `0x2000`）の `QueueNotify`（キュー 0）を ioeventfd、
+    /// GSI 5 を irqfd に結んだうえで、real mode のゲストを走らせる。ゲストは 8259 を初期化して IRQ5 だけを許可し、
+    /// `QueueNotify` へキュー 0 を書き（exit にならない）、準備完了を OUT `0x10` で知らせ、`sti; hlt` で待つ。
+    /// ホストは ioeventfd の発火 1 回を確かめ、割り込みが無い間は `DeadlineExceeded`（HLT のまま）になることを確かめてから
+    /// `on_notify` に [`InterruptLine`] を渡す（呼び出し側がここで virtqueue を処理して `trigger` する）。
+    /// ゲストの ISR は OUT `0x13` で到着を知らせる。到着しなければ無限に待たず `Internal` で失敗する（REPAIR-5）。
+    ///
+    /// 前提: `KVM_X86_QUIRK_LINT0_REENABLED`（既定で有効）により BSP の LAPIC LINT0 が ExtINT になり、PIC の出力が
+    /// vCPU 0 へ届く。満たされない環境では割り込みが届かず `Internal` で fail-closed する。ゲストコードは固定の
+    /// リテラルで外部入力は届かない。ゲストが使うのは QueueNotify への書き込みだけで、virtqueue の中身はホストの
+    /// heap 上にある（ゲストメモリの KVM 登録は TASK-75.1）。
+    pub fn probe_queue_interrupt(
+        &self,
+        on_notify: &mut dyn FnMut(&dyn InterruptLine) -> Result<(), MicrovmError>,
+    ) -> Result<QueueInterruptProbe, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.probe_queue_interrupt_x86_64(on_notify)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = on_notify;
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "queue interrupt probe is only implemented for x86_64",
+            ))
+        }
+    }
+
     /// 無限ループ（`jmp $`）のゲストを `runs` 回 `deadline` で中断させ、統計と記録を返す（REPAIR-5・REPAIR-4・MVM-1。
     /// x86_64 のみ。他 arch は `Unimplemented`）。呼び出しスレッドの `SIGUSR2` を診断中ブロックして最悪条件で確かめる。各回は必ず `DeadlineExceeded` で戻ることを期待し、
     /// 想定外の結果は `Internal` で失敗にする。`runs` は 1〜8、`deadline` は `run_once` と同じ範囲。
@@ -682,6 +855,136 @@ impl KvmDevice {
                 "deadline probe is only implemented for x86_64",
             ))
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn probe_queue_interrupt_x86_64(
+        &self,
+        on_notify: &mut dyn FnMut(&dyn InterruptLine) -> Result<(), MicrovmError>,
+    ) -> Result<QueueInterruptProbe, MicrovmError> {
+        use crate::exit::IoDirection;
+
+        const VIRTIO_BASE: u64 = 0x2000;
+        const IRQ_GSI: u32 = 5;
+        // slot 0（GPA 0）: IVT・ISR・本体。slot 1（GPA 0xFFFFF000）: リセットベクタ。
+        const LOW_GPA: u64 = 0;
+        const RESET_GPA: u64 = 0xFFFF_F000;
+        // リセットベクタ: jmp far 0000:0600
+        const RESET_CODE: &[u8] = &[0xEA, 0x00, 0x06, 0x00, 0x00];
+        // IVT のベクタ 0x25（8259 の IRQ5）: 0000:0500
+        const IVT_OFFSET: usize = 0x25 * 4;
+        const IVT_ENTRY: &[u8] = &[0x00, 0x05, 0x00, 0x00];
+        // ISR（0000:0500）: mov al,0xA5; out 0x13,al; mov al,0x20; out 0x20,al (EOI); hlt; jmp hlt
+        const ISR_OFFSET: usize = 0x500;
+        const ISR_CODE: &[u8] = &[
+            0xB0, 0xA5, 0xE6, 0x13, 0xB0, 0x20, 0xE6, 0x20, 0xF4, 0xEB, 0xFD,
+        ];
+        // 本体（0000:0600）: cli; ss/ds/sp 設定; 8259 を初期化（ICW1〜4・IRQ5 だけ許可）;
+        // mov dword [0x2050],0 (QueueNotify); mov al,0x42; out 0x10,al; sti; hlt; jmp hlt
+        const BODY_OFFSET: usize = 0x600;
+        const BODY_CODE: &[u8] = &[
+            // cli; xor ax,ax; mov ss,ax; mov sp,0xF00; mov ds,ax
+            0xFA, 0x31, 0xC0, 0x8E, 0xD0, 0xBC, 0x00, 0x0F, 0x8E, 0xD8, //
+            0xB0, 0x11, 0xE6, 0x20, // ICW1
+            0xB0, 0x20, 0xE6, 0x21, // ICW2: ベクタ base 0x20
+            0xB0, 0x04, 0xE6, 0x21, // ICW3
+            0xB0, 0x01, 0xE6, 0x21, // ICW4
+            0xB0, 0xDF, 0xE6, 0x21, // OCW1: IRQ5 だけ許可
+            0x66, 0xC7, 0x06, 0x50, 0x20, 0x00, 0x00, 0x00, 0x00, // mov dword [0x2050],0
+            0xB0, 0x42, 0xE6, 0x10, // mov al,0x42; out 0x10,al
+            0xFB, 0xF4, 0xEB, 0xFD, // sti; hlt; jmp hlt
+        ];
+        const IDLE_DEADLINE: Duration = Duration::from_millis(200);
+
+        let internal = |what: &str, e: SysError| match e {
+            SysError::Unsupported => MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "KVM is not supported on this architecture",
+            ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (unexpected null mapping)"),
+            ),
+            SysError::Os(n) => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (os error {n})"),
+            ),
+        };
+        let too_big = |()| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "guest code does not fit the page",
+            )
+        };
+        let io_out = |port: u16, byte: u8| VcpuExit::Io {
+            direction: IoDirection::Out,
+            port,
+            size: 1,
+            count: 1,
+            data: vec![byte],
+        };
+
+        // 最後に明示 drop して順序を固定する: vcpu → ioevent → irqfd → 登録ページ 2 枚 → vm。
+        let vm = self.create_vm()?;
+        vm.create_irqchip()?;
+        let mut low = sys::GuestPage::new().map_err(|e| internal("guest page allocation", e))?;
+        low.write_at(IVT_OFFSET, IVT_ENTRY).map_err(too_big)?;
+        low.write_at(ISR_OFFSET, ISR_CODE).map_err(too_big)?;
+        low.write_at(BODY_OFFSET, BODY_CODE).map_err(too_big)?;
+        let mut reset = sys::GuestPage::new().map_err(|e| internal("guest page allocation", e))?;
+        reset.write_at(0xFF0, RESET_CODE).map_err(too_big)?;
+        let reg_low = sys::register_single_page(vm.fd.as_fd(), 0, LOW_GPA, low)
+            .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
+        let reg_reset = sys::register_single_page(vm.fd.as_fd(), 1, RESET_GPA, reset)
+            .map_err(|(e, _page)| internal("KVM_SET_USER_MEMORY_REGION", e))?;
+        let ioevent =
+            vm.register_ioeventfd(IoEventSpec::virtio_mmio_queue_notify(VIRTIO_BASE, 0)?)?;
+        let irqfd = vm.register_irqfd(IRQ_GSI)?;
+        let mut vcpu = vm.create_vcpu(0)?;
+
+        let result = (|| {
+            let ready_exit = vcpu.run_once(PROBE_RUN_DEADLINE)?;
+            if ready_exit != io_out(0x10, 0x42) {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "guest did not reach the ready point (QueueNotify must not exit)",
+                ));
+            }
+            let notify_count = ioevent.consume()?;
+            let idle_outcome = match vcpu.run_once(IDLE_DEADLINE) {
+                Err(e) => e.code(),
+                Ok(_) => {
+                    return Err(MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "guest left HLT without an interrupt",
+                    ));
+                }
+            };
+            on_notify(&irqfd)?;
+            let interrupt_exit = vcpu.run_once(PROBE_RUN_DEADLINE).map_err(|e| {
+                if e.code() == MicrovmErrorCode::DeadlineExceeded {
+                    MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "interrupt did not reach the guest",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            Ok(QueueInterruptProbe {
+                ready_exit,
+                notify_count,
+                idle_outcome,
+                interrupt_exit,
+            })
+        })();
+        drop(vcpu);
+        drop(ioevent);
+        drop(irqfd);
+        drop(reg_reset);
+        drop(reg_low);
+        drop(vm);
+        result
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1101,6 +1404,84 @@ mod tests {
             assert_eq!(err.code(), code);
             assert_eq!(err.message(), msg);
         }
+    }
+
+    /// MVM-1・TASK-74.2.3: 割り込み通知の ioctl のエラー分類表。
+    #[test]
+    fn mvm1_879_classify_irq_error_table() {
+        use MicrovmErrorCode as C;
+        let cases = [
+            (
+                IrqStage::CreateIrqchip,
+                SysError::Os(EEXIST),
+                C::AlreadyExists,
+            ),
+            (IrqStage::Irqfd, SysError::Os(EBUSY), C::AlreadyExists),
+            (IrqStage::Ioeventfd, SysError::Os(EEXIST), C::AlreadyExists),
+            (
+                IrqStage::CreateIrqchip,
+                SysError::Os(EINVAL),
+                C::FailedPrecondition,
+            ),
+            (IrqStage::Irqfd, SysError::Os(EINVAL), C::FailedPrecondition),
+            (
+                IrqStage::Ioeventfd,
+                SysError::Os(EINVAL),
+                C::InvalidArgument,
+            ),
+            (IrqStage::CheckExtension, SysError::Os(EINVAL), C::Internal),
+            (
+                IrqStage::Ioeventfd,
+                SysError::Os(ENOSPC),
+                C::ResourceExhausted,
+            ),
+            (IrqStage::Irqfd, SysError::Os(ENOMEM), C::ResourceExhausted),
+            (IrqStage::Irqfd, SysError::Os(EMFILE), C::ResourceExhausted),
+            (IrqStage::Irqfd, SysError::Os(ENOTTY), C::FailedPrecondition),
+            (IrqStage::Irqfd, SysError::Os(EACCES), C::PermissionDenied),
+            (IrqStage::Irqfd, SysError::Os(5), C::Internal),
+            (IrqStage::Irqfd, SysError::NullMapping, C::Internal),
+            (IrqStage::Irqfd, SysError::Unsupported, C::Unimplemented),
+        ];
+        for (stage, e, code) in cases {
+            assert_eq!(classify_irq_error(stage, e).code(), code, "{stage:?} {e:?}");
+        }
+        let m = classify_irq_error(IrqStage::Irqfd, SysError::Os(5));
+        assert_eq!(m.message(), "KVM_IRQFD failed (os error 5)");
+    }
+
+    /// MVM-1・TASK-74.2.3: KVM の VM fd でない fd への登録は FailedPrecondition（KVM 無しで unsafe 経路を通す）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_879_irq_registration_on_non_vm_fd_is_failed_precondition() {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let vm = VmFd {
+            fd: OwnedFd::from(f),
+            vcpu_mmap_size: 4096 * 3,
+        };
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            vm.create_irqchip().unwrap_err().code(),
+            MicrovmErrorCode::FailedPrecondition
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            vm.create_irqchip().unwrap_err().code(),
+            MicrovmErrorCode::Unimplemented
+        );
+        assert_eq!(
+            vm.register_irqfd(5).unwrap_err().code(),
+            MicrovmErrorCode::FailedPrecondition
+        );
+        let spec = IoEventSpec::virtio_mmio_queue_notify(0x2000, 0).unwrap();
+        assert_eq!(
+            vm.register_ioeventfd(spec).unwrap_err().code(),
+            MicrovmErrorCode::FailedPrecondition
+        );
     }
 
     #[test]

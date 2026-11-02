@@ -4,7 +4,11 @@
 //! write / read 要求の処理、status・used リングの書き戻しまでを具体値で照合する。
 //! KVM は不要で、既定のテスト集合で走る。
 
+use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
+use fandhe_container_microvm::interrupt::{
+    InterruptDelivery, InterruptLine, complete_block_notify,
+};
 use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
 use fandhe_container_microvm::virtio_mmio::{
     InterruptReason, MmioReadOutcome, MmioWriteOutcome, VirtioMmioTransport, reg,
@@ -126,4 +130,132 @@ fn mvm1_878_block_queue_write_then_read() {
     );
     t.device_mut().stop_queue();
     assert!(t.device_mut().process_queue(&mut mem).is_err());
+}
+/// 割り込みを数える偽の割り込み線。
+struct CountLine {
+    count: std::cell::Cell<u32>,
+    fail: bool,
+}
+
+impl CountLine {
+    fn new(fail: bool) -> Self {
+        Self {
+            count: std::cell::Cell::new(0),
+            fail,
+        }
+    }
+}
+
+impl InterruptLine for CountLine {
+    fn trigger(&self) -> Result<(), MicrovmError> {
+        if self.fail {
+            return Err(MicrovmError::new(MicrovmErrorCode::Internal, "line down"));
+        }
+        self.count.set(self.count.get() + 1);
+        Ok(())
+    }
+}
+
+fn fresh() -> (T, Mem) {
+    let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+        MemoryBlockBackend::new(16 * 512, false).unwrap(),
+    ))
+    .unwrap();
+    init(&mut t);
+    let mem = GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
+    (t, mem)
+}
+
+/// 受け入れ条件（TASK-74.2.3）: 完了があれば InterruptStatus を立てて割り込みを 1 回注入する。
+#[test]
+fn mvm1_879_notify_with_one_request_triggers_once() {
+    let (mut t, mut mem) = fresh();
+    submit(&mut mem, 0, 1, 2, 512, 0);
+    let line = CountLine::new(false);
+    let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
+    assert_eq!((r.stats.completed, r.stats.ok), (1, 1));
+    assert_eq!(r.delivery, InterruptDelivery::Triggered);
+    assert_eq!(r.queue_error, None);
+    assert_eq!(line.count.get(), 1);
+    assert_eq!(t.interrupt_status(), 1);
+}
+
+/// 空のキューでは割り込みを入れない。
+#[test]
+fn mvm1_879_notify_with_empty_queue_does_not_trigger() {
+    let (mut t, mut mem) = fresh();
+    let line = CountLine::new(false);
+    let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
+    assert_eq!(r.stats.completed, 0);
+    assert_eq!(r.delivery, InterruptDelivery::NotNeeded);
+    assert_eq!(line.count.get(), 0);
+    assert_eq!(t.interrupt_status(), 0);
+}
+
+/// リング破損でも、それまでに返した分があれば割り込みを入れ、破損は `queue_error` で返す。
+#[test]
+fn mvm1_879_notify_after_partial_progress_still_triggers() {
+    let (mut t, mut mem) = fresh();
+    submit(&mut mem, 0, 1, 2, 512, 0);
+    // 2 件目の avail が範囲外の head を指す。
+    mem.write_u16_le(GuestAddress::new(AVAIL + 4 + 2), 99)
+        .unwrap();
+    mem.write_u16_le(GuestAddress::new(AVAIL + 2), 2).unwrap();
+    let line = CountLine::new(false);
+    let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
+    assert_eq!(r.stats.completed, 1);
+    assert_eq!(r.delivery, InterruptDelivery::Triggered);
+    assert_eq!(
+        r.queue_error.map(|e| e.code()),
+        Some(MicrovmErrorCode::InvalidArgument)
+    );
+    assert_eq!(line.count.get(), 1);
+    assert_eq!(t.interrupt_status(), 1);
+}
+
+/// 1 件目から壊れていれば割り込みを入れない。
+#[test]
+fn mvm1_879_notify_with_broken_first_request_does_not_trigger() {
+    let (mut t, mut mem) = fresh();
+    mem.write_u16_le(GuestAddress::new(AVAIL + 4), 99).unwrap();
+    mem.write_u16_le(GuestAddress::new(AVAIL + 2), 1).unwrap();
+    let line = CountLine::new(false);
+    let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
+    assert_eq!(r.stats.completed, 0);
+    assert_eq!(r.delivery, InterruptDelivery::NotNeeded);
+    assert_eq!(
+        r.queue_error.map(|e| e.code()),
+        Some(MicrovmErrorCode::InvalidArgument)
+    );
+    assert_eq!(line.count.get(), 0);
+    assert_eq!(t.interrupt_status(), 0);
+}
+
+/// 割り込み線の失敗はホスト側の失敗として外側の `Err` で返る。
+#[test]
+fn mvm1_879_notify_line_failure_is_outer_error() {
+    let (mut t, mut mem) = fresh();
+    submit(&mut mem, 0, 1, 2, 512, 0);
+    let line = CountLine::new(true);
+    let e = complete_block_notify(&mut t, &mut mem, &line).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::Internal);
+}
+
+/// activate 前は `FailedPrecondition` を `queue_error` で返し、割り込みを入れない。
+#[test]
+fn mvm1_879_notify_before_activation_reports_queue_error() {
+    let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+        MemoryBlockBackend::new(16 * 512, false).unwrap(),
+    ))
+    .unwrap();
+    let mut mem =
+        GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
+    let line = CountLine::new(false);
+    let r = complete_block_notify(&mut t, &mut mem, &line).unwrap();
+    assert_eq!(r.delivery, InterruptDelivery::NotNeeded);
+    assert_eq!(
+        r.queue_error.map(|e| e.code()),
+        Some(MicrovmErrorCode::FailedPrecondition)
+    );
+    assert_eq!(line.count.get(), 0);
 }

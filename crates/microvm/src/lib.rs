@@ -19,14 +19,16 @@
 //! TASK-75.1・MVM-1: ゲストメモリの初期化（`microvm`。匿名 mmap の backing と `KVM_SET_USER_MEMORY_REGION` による登録。Linux のみ。
 //! docs/design/microvm-memory-ownership.md）。
 //! TASK-75.2・MVM-1: VM 構成体の組み立て（`microvm::MicroVm::assemble`。VM・irqchip・ゲストメモリ・virtio デバイス群の MMIO 窓と
-//! GSI・vCPU 群を 1 つに束ねる。x86_64 のみ。ioeventfd の結線・start / stop は後続）。
+//! GSI・vCPU 群を 1 つに束ねる。x86_64 のみ。ioeventfd の結線は後続）。
 //! TASK-75.3.1・MVM-1: x86_64 のカーネル・initrd・cmdline のゲストメモリへのロード（`boot_x86`。OS 非依存・unsafe なし。
 //! Linux x86 Boot Protocol の bzImage と boot_params・e820。`microvm::MicroVm::load_kernel` が入口）。
 //! TASK-75.3.2・MVM-1: vCPU 0 のレジスタ初期化とカーネルのエントリからの実行開始（`boot_x86::BootCpuState`・`write_boot_tables`・
 //! `device::VcpuFd::set_boot_state` / `regs`・`microvm::MicroVm::setup_boot_vcpu`。x86_64 のみ。long mode・GPA 0..4 GiB の恒等写像・
 //! RSI = boot_params。`unsafe` は `sys` の `KVM_{GET,SET}_{REGS,SREGS}` のみ）。
+//! TASK-75.4.1・MVM-1: `microvm::MicroVm::start` / `RunningMicroVm::stop`（vCPU 0 の実行ループ・停止要求のポーリング・
+//! 停止時の fd・mmap・irqfd の後始末。ゲスト起因の終了は `microvm::StopReason` で報告。`unsafe` なし）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! eventfd を待つ常駐のイベントループ（TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・CPUID / MSR / FPU / LAPIC の設定と AP の起動（REPAIR-3。実カーネルの起動完走に必要）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・CPUID / MSR / FPU / LAPIC の設定と AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）

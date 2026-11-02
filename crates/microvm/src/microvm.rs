@@ -460,6 +460,16 @@ pub enum QueueNotifyReport {
     Net(NetNotifyReport),
 }
 
+impl QueueNotifyReport {
+    /// virtqueue 処理の失敗（リング破損など、ゲスト起因）。無ければ `None`。
+    pub fn queue_error(&self) -> Option<&MicrovmError> {
+        match self {
+            QueueNotifyReport::Block(r) => r.queue_error.as_ref(),
+            QueueNotifyReport::Net(r) => r.queue_error.as_ref(),
+        }
+    }
+}
+
 /// MMIO dispatcher と block / net デバイス群。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
 struct DeviceBus<B: BlockBackend, N: NetBackend, L> {
     dispatcher: ExitDispatcher,
@@ -948,10 +958,17 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> VcpuLoopB
                     Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
                 };
                 // 通知の完了に失敗したまま続けると、通知の届かないゲストがハングするため止める（fail-closed）。
-                if let Some((id, queue)) = queue_notify_of(&outcome)
-                    && let Err(e) = self.complete_queue_notify(id, queue)
-                {
-                    return LoopStep::Finish(StopReason::Failed(e.code()));
+                // リング破損などは外側の `Err` ではなく report.queue_error に入り last_avail も進まないため、
+                // 続行するとゲストが完了しない要求を待ち続ける。呼び出し元（ここ）が停止を判断する。
+                if let Some((id, queue)) = queue_notify_of(&outcome) {
+                    match self.complete_queue_notify(id, queue) {
+                        Err(e) => return LoopStep::Finish(StopReason::Failed(e.code())),
+                        Ok(report) => {
+                            if let Some(e) = report.queue_error() {
+                                return LoopStep::Finish(StopReason::Failed(e.code()));
+                            }
+                        }
+                    }
                 }
                 LoopStep::Continue
             }
@@ -986,16 +1003,20 @@ fn vcpu_loop<T: VcpuLoopBody>(
             LoopStep::Finish(r) => break r,
         }
     };
-    let stats = body.stats();
+    let mut stats = body.stats();
+    // dispatch・通知完了・割り込み配送の失敗は vCPU の統計に載らないため、失敗終了なら最低 1 件を計上する。
+    if matches!(reason, StopReason::Failed(_)) && stats.errors == 0 {
+        stats.errors = 1;
+    }
     // 後始末（vCPU → デバイス → メモリ → VM fd の順）を、報告より先に済ませる。
     drop(body);
     let elapsed = started.elapsed();
-    let (level, code) = match reason {
-        StopReason::Failed(c) => ("error", format!(" code={}", c.as_str())),
-        _ => ("info", String::new()),
+    let (level, outcome, code) = match reason {
+        StopReason::Failed(c) => ("error", "error", format!(" code={}", c.as_str())),
+        _ => ("info", "ok", String::new()),
     };
     log_line(format_args!(
-        "level={level} op=microvm.vcpu_loop outcome=ok reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
+        "level={level} op=microvm.vcpu_loop outcome={outcome} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
         reason.as_str(),
         stats.runs,
         stats.exits,

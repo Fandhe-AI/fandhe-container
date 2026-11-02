@@ -420,6 +420,14 @@ pub fn plan_boot(
                 "kernel does not fit in guest memory",
             ));
         }
+        // 再配置したときも実 bzImage は pref_address の窓へ展開しうるため、窓が RAM に収まるなら
+        // initrd はそこにも重ねない（展開中の上書き防止）。
+        let floor = match pref.checked_add(u64::from(header.init_size)) {
+            Some(window_end) if pref_usable && load_addr != pref && window_end <= mem_len => {
+                kernel_end.max(window_end)
+            }
+            _ => kernel_end,
+        };
         let initrd = match initrd_len {
             None => None,
             Some(0) => return Err(invalid("initrd must not be empty")),
@@ -428,7 +436,7 @@ pub fn plan_boot(
                 let start = top
                     .checked_sub(len)
                     .map(|s| s & !(INITRD_ALIGN - 1))
-                    .filter(|s| *s >= kernel_end)
+                    .filter(|s| *s >= floor)
                     .ok_or_else(|| {
                         err(
                             MicrovmErrorCode::ResourceExhausted,
@@ -974,19 +982,27 @@ mod tests {
     }
 
     /// MVM-1・TASK-75.3.1: 不正・非対応のイメージは書き込みの前に具体的な code と message で拒否される。
-    /// MVM-1・TASK-75.3.1: initrd が優先配置に収まらないだけでも、relocatable は再配置先で initrd ごと置く。
+    /// MVM-1・TASK-75.3.1: initrd が優先配置に収まらず再配置しても、pref_address の展開窓 [16 MiB, 20 MiB) と重ならない位置にだけ置く。
     #[test]
-    fn mvm1_884_relocates_when_only_initrd_does_not_fit() {
+    fn mvm1_884_initrd_avoids_pref_address_window_after_relocation() {
         let img = Img {
             pref: 16 * MIB,
             ..Img::default()
         }
         .build();
+        // 窓の上（20 MiB 以降）に収まらない 48 MiB の initrd は、再配置しても拒否される。
         let initrd = vec![0xAB; (48 * MIB) as usize];
         let mut m = mem(64 * MIB);
+        assert_eq!(
+            load_linux(&mut m, &img, Some(&initrd), &cmd(""))
+                .unwrap_err()
+                .code(),
+            MicrovmErrorCode::ResourceExhausted
+        );
+        // 窓の上に収まる 40 MiB の initrd は 24 MiB に置かれ、窓と重ならない。
+        let initrd = vec![0xAB; (40 * MIB) as usize];
         let l = load_linux(&mut m, &img, Some(&initrd), &cmd("")).unwrap();
-        assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
-        assert_eq!(l.initrd.unwrap().0, GuestAddress::new(16 * MIB));
+        assert_eq!(l.initrd.unwrap().0, GuestAddress::new(24 * MIB));
     }
 
     /// MVM-1・TASK-75.3.1: 64-bit エントリ位置を含まない payload は書き込み前に InvalidArgument で拒否する。

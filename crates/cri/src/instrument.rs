@@ -82,6 +82,12 @@ pub enum CriOpKind {
     ShimV2Start,
     /// shim v2 起動バイナリの `delete` 1 回（socket の片付け。CRI-5・TASK-62.7.1・REPAIR-4）。
     ShimV2Delete,
+    /// `RuntimeService.Exec` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    Exec,
+    /// `RuntimeService.Attach` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    Attach,
+    /// `RuntimeService.PortForward` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    PortForward,
 }
 
 impl CriOpKind {
@@ -111,6 +117,9 @@ impl CriOpKind {
             CriOpKind::ShimV2Io => "cri.shim_v2.io",
             CriOpKind::ShimV2Start => "cri.shim_v2.start",
             CriOpKind::ShimV2Delete => "cri.shim_v2.delete",
+            CriOpKind::Exec => "cri.exec",
+            CriOpKind::Attach => "cri.attach",
+            CriOpKind::PortForward => "cri.port_forward",
         }
     }
 }
@@ -419,7 +428,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 20] = [
+    const ALL_KINDS: [CriOpKind; 23] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -440,6 +449,9 @@ mod tests {
         CriOpKind::RecordStoreLoad,
         CriOpKind::ShimV2Start,
         CriOpKind::ShimV2Delete,
+        CriOpKind::Exec,
+        CriOpKind::Attach,
+        CriOpKind::PortForward,
     ];
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

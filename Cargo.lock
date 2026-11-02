@@ -327,6 +327,8 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-oci",
+ "hyper",
+ "hyper-util",
  "prost",
  "protox",
  "serde",

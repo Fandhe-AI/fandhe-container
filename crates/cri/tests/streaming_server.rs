@@ -1,0 +1,369 @@
+//! CRI ストリーミングサーバー基盤と URL 発行の結合試験（CRI-6・TASK-63.1・#679）。
+//!
+//! loopback の TCP だけで完結し、root も外部ネットワークも要らない。クライアントは std の `TcpStream` で生の
+//! HTTP/1.1 を送る（ブロッキングなので `spawn_blocking` で別スレッドに逃がし、サーバー側のタスクを塞がない）。
+//! トークンの乱数源は unix の `/dev/urandom` のみで、非 unix では発行が `Unavailable` になることだけを照合する。
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
+
+use fandhe_container_cri::error::CriErrorCode;
+use fandhe_container_cri::runtime::v1::{
+    self, ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
+    runtime_service_server::RuntimeService,
+};
+use fandhe_container_cri::runtime_service::CriRuntimeService;
+use fandhe_container_cri::streaming::{StreamingConfig, StreamingServer};
+use tonic::{Code, Request};
+
+/// 生の HTTP/1.1 要求を送り、EOF まで（5 秒の読み取り期限つきで）応答を読む。
+async fn http_raw(addr: SocketAddr, raw: String) -> String {
+    tokio::task::spawn_blocking(move || {
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        stream.write_all(raw.as_bytes()).expect("write");
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    })
+    .await
+    .expect("join")
+}
+
+async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
+    http_raw(
+        addr,
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    )
+    .await
+}
+
+fn status_line(response: &str) -> &str {
+    response.lines().next().unwrap_or("")
+}
+
+fn path_of(url: &str) -> String {
+    let rest = url.strip_prefix("http://").expect("http url");
+    let idx = rest.find('/').expect("path");
+    rest[idx..].to_string()
+}
+
+fn pod_config() -> PodSandboxConfig {
+    PodSandboxConfig {
+        metadata: Some(PodSandboxMetadata {
+            name: "pod".into(),
+            uid: "uid-1".into(),
+            namespace: "ns".into(),
+            attempt: 0,
+        }),
+        ..Default::default()
+    }
+}
+
+async fn run_sandbox(service: &CriRuntimeService) -> String {
+    service
+        .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
+            config: Some(pod_config()),
+            runtime_handler: String::new(),
+        }))
+        .await
+        .expect("run sandbox")
+        .into_inner()
+        .pod_sandbox_id
+}
+
+async fn create_container(service: &CriRuntimeService, sandbox_id: &str) -> String {
+    service
+        .create_container(Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox_id.to_string(),
+            config: Some(ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "c".into(),
+                    attempt: 0,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:1.36".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            sandbox_config: Some(pod_config()),
+        }))
+        .await
+        .expect("create container")
+        .into_inner()
+        .container_id
+}
+
+fn exec_request(container_id: &str) -> v1::ExecRequest {
+    v1::ExecRequest {
+        container_id: container_id.to_string(),
+        cmd: vec!["sh".into()],
+        tty: false,
+        stdin: false,
+        stdout: true,
+        stderr: false,
+    }
+}
+
+/// CRI-6: 既定は loopback で待ち受け、URL は `http://127.0.0.1:` で始まる。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_default_binds_loopback_and_url_prefix() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    assert!(server.local_addr().ip().is_loopback());
+    let url = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    assert!(url.starts_with("http://127.0.0.1:"), "url={url}");
+}
+
+/// CRI-6: 外部アドレスは opt-in が無ければ起動しない（fail-closed）。
+#[tokio::test]
+async fn cri6_bind_rejects_external_without_opt_in() {
+    let err = StreamingServer::bind(
+        StreamingConfig::default().with_bind("0.0.0.0:0".parse().expect("addr")),
+    )
+    .await
+    .expect_err("must reject");
+    assert_eq!(err.code(), CriErrorCode::InvalidArgument);
+}
+
+/// CRI-6: 有効なトークンは 501（プロトコル本体は #680〜#682）、2 回目は 404。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_valid_token_501_then_single_use_404() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    let url = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    let path = path_of(&url);
+    let first = request(server.local_addr(), "GET", &path).await;
+    assert_eq!(
+        status_line(&first),
+        "HTTP/1.1 501 Not Implemented",
+        "{first}"
+    );
+    let second = request(server.local_addr(), "GET", &path).await;
+    assert_eq!(status_line(&second), "HTTP/1.1 404 Not Found", "{second}");
+}
+
+/// CRI-6: 未知のトークン・種別違い・TTL 切れ・許可しないメソッド。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_unknown_mismatch_expired_and_method() {
+    let server = StreamingServer::bind(
+        StreamingConfig::default().with_token_ttl(Duration::from_millis(100)),
+    )
+    .await
+    .expect("bind");
+    let addr = server.local_addr();
+    let issuer = server.issuer();
+    let unknown = format!("/exec/{}", "0".repeat(64));
+    assert_eq!(
+        status_line(&request(addr, "GET", &unknown).await),
+        "HTTP/1.1 404 Not Found"
+    );
+
+    let url = issuer
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    let token = path_of(&url).trim_start_matches("/exec/").to_string();
+    let wrong_kind = request(addr, "GET", &format!("/attach/{token}")).await;
+    assert_eq!(status_line(&wrong_kind), "HTTP/1.1 404 Not Found");
+    // 種別違いでも消費されるため、正しい種別でも通らない。
+    let after = request(addr, "GET", &format!("/exec/{token}")).await;
+    assert_eq!(status_line(&after), "HTTP/1.1 404 Not Found");
+
+    let expired_url = issuer
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let expired = request(addr, "GET", &path_of(&expired_url)).await;
+    assert_eq!(status_line(&expired), "HTTP/1.1 404 Not Found");
+
+    let method = request(addr, "DELETE", &unknown).await;
+    assert_eq!(status_line(&method), "HTTP/1.1 405 Method Not Allowed");
+}
+
+/// CRI-6・REPAIR-5: ヘッダを送らない接続は期限の後に閉じられる（応答が 200/501 になることはない）。
+#[tokio::test]
+async fn cri6_header_read_timeout_closes_idle_connection() {
+    let server = StreamingServer::bind(
+        StreamingConfig::default().with_header_read_timeout(Duration::from_millis(200)),
+    )
+    .await
+    .expect("bind");
+    let addr = server.local_addr();
+    let started = std::time::Instant::now();
+    let response = http_raw(addr, String::new()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "connection must be closed by the server before the client read timeout"
+    );
+    assert!(
+        !response.contains(" 200 ") && !response.contains(" 501 "),
+        "{response}"
+    );
+}
+
+/// CRI-6: 注入が無ければ 3 RPC は `Unimplemented` のまま。
+#[tokio::test]
+async fn cri6_rpcs_unimplemented_without_streaming() {
+    let service = CriRuntimeService::new();
+    let exec = service
+        .exec(Request::new(exec_request("c1")))
+        .await
+        .expect_err("unimplemented");
+    assert_eq!(exec.code(), Code::Unimplemented);
+    let attach = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: "c1".into(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("unimplemented");
+    assert_eq!(attach.code(), Code::Unimplemented);
+    let pf = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: "p".into(),
+            port: vec![80],
+        }))
+        .await
+        .expect_err("unimplemented");
+    assert_eq!(pf.code(), Code::Unimplemented);
+}
+
+/// CRI-6: 注入すると、既存コンテナへの Exec・Attach と既存 sandbox への PortForward が URL を返し、毎回異なる。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_rpcs_return_unique_urls_when_injected() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    let service = CriRuntimeService::new().with_streaming(server.issuer());
+    let sandbox = run_sandbox(&service).await;
+    let container = create_container(&service, &sandbox).await;
+
+    let a = service
+        .exec(Request::new(exec_request(&container)))
+        .await
+        .expect("exec a")
+        .into_inner()
+        .url;
+    let b = service
+        .exec(Request::new(exec_request(&container)))
+        .await
+        .expect("exec b")
+        .into_inner()
+        .url;
+    assert_ne!(a, b);
+    assert!(a.contains("/exec/") && b.contains("/exec/"));
+
+    let attach = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.clone(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("attach")
+        .into_inner()
+        .url;
+    assert!(attach.contains("/attach/"), "{attach}");
+
+    let pf = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: sandbox.clone(),
+            port: vec![8080],
+        }))
+        .await
+        .expect("port forward")
+        .into_inner()
+        .url;
+    assert!(pf.contains("/portforward/"), "{pf}");
+
+    // 発行した URL は実際に有効なトークンとしてサーバーに照合される（501）。
+    let resp = request(server.local_addr(), "GET", &path_of(&a)).await;
+    assert_eq!(status_line(&resp), "HTTP/1.1 501 Not Implemented", "{resp}");
+}
+
+/// CRI-6: 入力検証と存在照合のエラーコード。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_rpc_validation_errors() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    let service = CriRuntimeService::new().with_streaming(Arc::clone(&server.issuer()));
+    let sandbox = run_sandbox(&service).await;
+    let container = create_container(&service, &sandbox).await;
+
+    let unknown = service
+        .exec(Request::new(exec_request("no-such-container")))
+        .await
+        .expect_err("not found");
+    assert_eq!(unknown.code(), Code::NotFound);
+
+    let mut no_stream = exec_request(&container);
+    no_stream.stdout = false;
+    let invalid = service
+        .exec(Request::new(no_stream))
+        .await
+        .expect_err("invalid");
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+
+    let bad_port = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: sandbox.clone(),
+            port: vec![80, 0],
+        }))
+        .await
+        .expect_err("invalid port");
+    assert_eq!(bad_port.code(), Code::InvalidArgument);
+
+    let unknown_pod = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: "no-such-pod".into(),
+            port: vec![80],
+        }))
+        .await
+        .expect_err("not found");
+    assert_eq!(unknown_pod.code(), Code::NotFound);
+}
+
+/// CRI-6: 乱数源の無い OS では URL を発行せず `Unavailable` を返す（弱い代替を作らない）。
+#[cfg(not(unix))]
+#[tokio::test]
+async fn cri6_issue_unavailable_on_non_unix() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    let err = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect_err("unavailable");
+    assert_eq!(err.code(), CriErrorCode::Unavailable);
+}

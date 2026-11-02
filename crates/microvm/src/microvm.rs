@@ -4,11 +4,11 @@
 //! [`MicroVm::assemble`] が検証済みの [`MicroVmConfig`] から、VM fd・in-kernel irqchip・登録済みゲストメモリ・
 //! virtio デバイス群（MMIO の窓と GSI 割り込み線つき）・vCPU 群を 1 つの [`MicroVm`] に束ねる。配置は
 //! [`VIRTIO_MMIO_BASE`] から [`VIRTIO_MMIO_WINDOW`] 刻みで block → net の順、GSI は [`VIRTIO_GSI_BASE`] から連番。
-//! 呼び出し元は #884（TASK-75.3.1。カーネルのロードと `virtio_mmio.device=<size>@<base>:<irq>` の cmdline 生成）・
-//! #885（TASK-75.3.2。vCPU のレジスタ）・#886（TASK-75.4.1。start / stop と実行ループ）と、
+//! カーネルのロードと `virtio_mmio.device=<size>@<base>:<irq>` の cmdline 生成は [`MicroVm::load_kernel`]
+//! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。呼び出し元は #885（TASK-75.3.2。vCPU のレジスタ）・#886（TASK-75.4.1。start / stop と実行ループ）と、
 //! `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
-//! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・カーネルのロード（#884）・
+//! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! レジスタ設定（#885）・start / stop（#886）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
@@ -41,6 +41,9 @@
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 
+use crate::boot_x86::LoadedKernel;
+#[cfg(target_arch = "x86_64")]
+use crate::boot_x86::{KernelCmdline, VirtioMmioParam, load_linux};
 use crate::device::{KvmDevice, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioDevice};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -59,7 +62,7 @@ use crate::virtio_mmio::{
 use crate::virtio_net::{NetBackend, VirtioNet};
 
 /// virtio-mmio の窓の先頭（GPA）。ゲスト RAM（GPA 0 からの単一領域）はこれより下に収まる。
-/// cmdline の `virtio_mmio.device=<size>@<base>:<irq>`（#884）が使う。
+/// cmdline の `virtio_mmio.device=<size>@<base>:<irq>`（[`MicroVm::load_kernel`]。#884）が使う。
 pub const VIRTIO_MMIO_BASE: u64 = 0xd000_0000;
 /// 1 デバイスの MMIO 窓の大きさ（ページ境界。レジスタ 0x100 と設定空間 [`CONFIG_SPACE_SIZE`] の和以上）。
 pub const VIRTIO_MMIO_WINDOW: u64 = 0x1000;
@@ -626,9 +629,77 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         &self.memory
     }
 
-    /// 登録済みゲストメモリ（カーネルの書き込み用。#884）。
+    /// 登録済みゲストメモリ（書き込み用。カーネルのロードは [`MicroVm::load_kernel`]）。
     pub fn memory_mut(&mut self) -> &mut GuestMemory<RegisteredGuestRam> {
         &mut self.memory
+    }
+
+    /// bzImage・initrd・cmdline をゲストメモリへロードする（TASK-75.3.1・MVM-1。x86_64 のみ、他 arch は `Unimplemented`）。
+    ///
+    /// cmdline は `user_cmdline` の後ろに、組み立て済みの各デバイスの `virtio_mmio.device=<size>@<base>:<irq>` を
+    /// block → net の順で足す。戻り値の [`LoadedKernel`] を #885（vCPU のレジスタ初期化）が使う。
+    /// 検証と配置の詳細は `crate::boot_x86`。
+    pub fn load_kernel(
+        &mut self,
+        kernel: &[u8],
+        initrd: Option<&[u8]>,
+        user_cmdline: &str,
+    ) -> Result<LoadedKernel, MicrovmError> {
+        // REPAIR-4: 成功・失敗と所要時間を固定の操作名とエラーコードだけで 1 行出す。
+        // 非信頼の cmdline・イメージ内容・エラー文言は記録しない（サイズは長さのみ）。
+        let started = std::time::Instant::now();
+        let result = self.load_kernel_inner(kernel, initrd, user_cmdline);
+        let elapsed_us = started.elapsed().as_micros();
+        // ログ出力の失敗（stderr が閉じている等）でロードの結果を失わないよう、書き込みエラーは捨てる。
+        use std::io::Write as _;
+        match &result {
+            Ok(_) => drop(writeln!(
+                std::io::stderr(),
+                "level=info op=microvm.load_kernel outcome=ok elapsed_us={elapsed_us} kernel_len={} initrd_len={}",
+                kernel.len(),
+                initrd.map_or(0, <[u8]>::len)
+            )),
+            Err(e) => drop(writeln!(
+                std::io::stderr(),
+                "level=error op=microvm.load_kernel outcome=error code={} elapsed_us={elapsed_us} kernel_len={} initrd_len={}",
+                e.code().as_str(),
+                kernel.len(),
+                initrd.map_or(0, <[u8]>::len)
+            )),
+        }
+        result
+    }
+
+    /// [`MicroVm::load_kernel`] の本体（計装を含まない）。
+    fn load_kernel_inner(
+        &mut self,
+        kernel: &[u8],
+        initrd: Option<&[u8]>,
+        user_cmdline: &str,
+    ) -> Result<LoadedKernel, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let params: Vec<VirtioMmioParam> = self
+                .devices
+                .infos()
+                .iter()
+                .map(|i| VirtioMmioParam {
+                    base: i.slot.mmio_base,
+                    len: i.slot.mmio_len,
+                    gsi: i.slot.gsi,
+                })
+                .collect();
+            let cmdline = KernelCmdline::new(user_cmdline, &params)?;
+            load_linux(&mut self.memory, kernel, initrd, &cmdline)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (kernel, initrd, user_cmdline);
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "kernel loading is only implemented for x86_64 (aarch64 FDT is not implemented)",
+            ))
+        }
     }
 
     /// デバイスの配置と識別子（block → net の順）。

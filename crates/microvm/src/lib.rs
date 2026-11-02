@@ -19,7 +19,9 @@
 //! TASK-75.1・MVM-1: ゲストメモリの初期化（`microvm`。匿名 mmap の backing と `KVM_SET_USER_MEMORY_REGION` による登録。Linux のみ。
 //! docs/design/microvm-memory-ownership.md）。
 //! TASK-75.2・MVM-1: VM 構成体の組み立て（`microvm::MicroVm::assemble`。VM・irqchip・ゲストメモリ・virtio デバイス群の MMIO 窓と
-//! GSI・vCPU 群を 1 つに束ねる。x86_64 のみ。ioeventfd の結線・カーネルのロード・start / stop は後続）。
+//! GSI・vCPU 群を 1 つに束ねる。x86_64 のみ。ioeventfd の結線・start / stop は後続）。
+//! TASK-75.3.1・MVM-1: x86_64 のカーネル・initrd・cmdline のゲストメモリへのロード（`boot_x86`。OS 非依存・unsafe なし。
+//! Linux x86 Boot Protocol の bzImage と boot_params・e820。`microvm::MicroVm::load_kernel` が入口）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
 //! eventfd を待つ常駐のイベントループ（TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
@@ -36,6 +38,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod boot_x86;
 #[cfg(target_os = "linux")]
 pub mod device;
 pub mod dispatch;

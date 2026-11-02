@@ -9,7 +9,7 @@
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・他スレッドからの即時停止（kick。新規 unsafe が要る）・起動失敗の網羅的な後始末（#887。ここでは RAII の drop 順の固定まで）・
+//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・他スレッドからの即時停止（kick。新規 unsafe が要る）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
 //!
@@ -17,7 +17,15 @@
 //! [`MicroVm::start`] が vCPU 0 を初期化して専用スレッドで実行ループを始め、[`RunningMicroVm`] を返す。停止は
 //! [`RunningMicroVm::stop`]（期限つき。`Ok` で戻った時点でスレッド join 済み・fd・mmap・irqfd 解放済み）で、
 //! 呼び忘れても drop が回収する。ゲスト起因の終了（シャットダウン・失敗）も [`StopReason`] で報告し、同じ後始末を通る。
-//! 停止要求は `run_once`（[`VCPU_POLL_INTERVAL`]）の合間のポーリングで見る。起動途中の失敗の網羅的な解放は #887。
+//! 停止要求は `run_once`（[`VCPU_POLL_INTERVAL`]）の合間のポーリングで見る。
+//!
+//! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
+//! 失敗はすべて `Result` の [`MicrovmError`]（機械可読な `code` と英語の `message`）で返し、panic しない。
+//! 解放は RAII で成り立つ: `assemble` の `Err` は戻る前に VM fd・irqchip・memslot と mmap・irqfd・vCPU fd と
+//! kvm_run の mmap をすべて解放する。`start` の `Err` は `self` を消費して解放する（やり直しは `assemble` から）。
+//! `load_kernel` / `setup_boot_vcpu` の `Err` では `MicroVm` が残り、drop すれば同じ順序で解放される。
+//! スレッドの生成に失敗しても `body`（`MicroVm`）はクロージャごと drop される。段ごとの確認は
+//! `mvm1_887_*`（KVM 不要）と `tests/kvm_device.rs` の `kvm_device_start_failure_releases_resources`（実機前提）。
 //!
 //! drop の順序は宣言順で固定する: vCPU → デバイス（dispatcher・irqfd の解除）→ メモリ（memslot の削除と munmap）→ VM fd。
 //! [`IrqFd`] と [`RegisteredGuestRam`] は VM fd の dup を持つので、順序に依らず解除が効く。
@@ -95,6 +103,7 @@ pub const MAX_GUEST_RAM_BYTES: u64 = 1 << 34;
 pub const GUEST_RAM_ALIGN: u64 = sys::GUEST_PAGE_SIZE as u64;
 
 const EPERM: i32 = 1;
+const EAGAIN: i32 = 11;
 const ENOMEM: i32 = 12;
 const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
@@ -297,6 +306,10 @@ impl Drop for RegisteredGuestRam {
                 drop(map);
             } else {
                 // 削除に失敗した領域は解放しない（ゲストがまだ書けるメモリを別の用途に再利用させない fail-closed）。
+                log_line(format_args!(
+                    "level=error op=microvm.guest_ram_unregister outcome=error code=INTERNAL leaked_bytes={}",
+                    map.len()
+                ));
                 std::mem::forget(map);
             }
         }
@@ -601,8 +614,29 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 構成を検証し、VM → irqchip → ゲストメモリ → デバイス → vCPU の順に組み立てる。
     ///
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
-    /// （網羅的な失敗経路の検証は #887）。aarch64 は最初の ioctl より前に `Unimplemented`。
+    /// （段ごとの確認は `mvm1_887_*`・#887）。aarch64 は最初の ioctl より前に `Unimplemented`。
+    ///
+    /// `Err` のとき、それまでに取った fd・mmap・irqfd はすべて戻る前に解放済み。構成値・パスはログに載せない（REPAIR-4）。
     pub fn assemble(
+        kvm: &KvmDevice,
+        config: MicroVmConfig<B, N>,
+    ) -> Result<MicroVm<B, N>, MicrovmError> {
+        let started = Instant::now();
+        let result = Self::assemble_inner(kvm, config);
+        let elapsed_us = started.elapsed().as_micros();
+        match &result {
+            Ok(_) => log_line(format_args!(
+                "level=info op=microvm.assemble outcome=ok elapsed_us={elapsed_us}"
+            )),
+            Err(e) => log_line(format_args!(
+                "level=error op=microvm.assemble outcome=error code={} elapsed_us={elapsed_us}",
+                e.code().as_str()
+            )),
+        }
+        result
+    }
+
+    fn assemble_inner(
         kvm: &KvmDevice,
         config: MicroVmConfig<B, N>,
     ) -> Result<MicroVm<B, N>, MicrovmError> {
@@ -729,7 +763,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state`。最初の `VcpuFd::run_once` より前に、
     /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つ状態のため触らない。
-    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の網羅的な後始末は #887、CPUID・MSR・FPU・LAPIC の設定は
+    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、CPUID・MSR・FPU・LAPIC の設定は
     /// 未実装（REPAIR-3）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
     pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         let started = std::time::Instant::now();
@@ -1032,6 +1066,23 @@ fn vcpu_loop<T: VcpuLoopBody>(
     });
 }
 
+/// スレッド生成の失敗を分類する（EAGAIN・ENOMEM は資源枯渇、それ以外は内部エラー。メッセージは固定文言と errno だけ）。
+///
+/// 生成に失敗したとき `body`（`MicroVm`）は std がクロージャごと drop するので、fd・mmap は解放される（#887）。
+fn classify_spawn_error(e: &std::io::Error) -> MicrovmError {
+    match e.raw_os_error() {
+        Some(errno @ (EAGAIN | ENOMEM)) => MicrovmError::new(
+            MicrovmErrorCode::ResourceExhausted,
+            format!("cannot spawn vCPU thread (errno {errno})"),
+        ),
+        Some(errno) => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("cannot spawn vCPU thread (errno {errno})"),
+        ),
+        None => MicrovmError::new(MicrovmErrorCode::Internal, "cannot spawn vCPU thread"),
+    }
+}
+
 /// `body` を専用スレッドで駆動して [`RunningMicroVm`] を返す。
 fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicroVm, MicrovmError> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -1040,12 +1091,7 @@ fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicro
     let handle = std::thread::Builder::new()
         .name("microvm-vcpu-0".into())
         .spawn(move || vcpu_loop(body, flag, tx, started))
-        .map_err(|_| {
-            MicrovmError::new(
-                MicrovmErrorCode::ResourceExhausted,
-                "cannot spawn vCPU thread",
-            )
-        })?;
+        .map_err(|e| classify_spawn_error(&e))?;
     Ok(RunningMicroVm {
         stop,
         done_rx: rx,
@@ -1836,5 +1882,100 @@ mod tests {
                 "loaded kernel does not fit in this microVM's memory"
             );
         }
+    }
+}
+/// 起動途中の失敗で取得済みの資源が解放されること（TASK-75.4.2・#887・MVM-1・ERR-1）。KVM は使わない。
+#[cfg(test)]
+mod failure_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::virtio_block::MemoryBlockBackend;
+    use crate::virtio_net::MemoryNetBackend;
+
+    /// drop の回数を数える割り込み線（irqfd の代役）。
+    struct DropLine(Rc<Cell<u32>>);
+
+    impl InterruptLine for DropLine {
+        fn trigger(&self) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropLine {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// block 2 台・net 1 台の構成で 3 台目の割り込み線の取得が失敗しても、作成済みの 2 台分は解放される。
+    #[test]
+    fn mvm1_887_device_bus_partial_failure_drops_acquired_lines() {
+        let slots = layout_slots(2, 1).unwrap();
+        let blocks = (0..2)
+            .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
+            .collect();
+        let nets = vec![NetDeviceConfig {
+            backend: MemoryNetBackend::new(),
+            mac: [2, 0, 0, 0, 0, 1],
+        }];
+        let dropped = Rc::new(Cell::new(0u32));
+        let made = Cell::new(0u32);
+        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, |_| {
+            if made.get() == 2 {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::ResourceExhausted,
+                    "no irqfd",
+                ));
+            }
+            made.set(made.get() + 1);
+            Ok(DropLine(Rc::clone(&dropped)))
+        });
+        let Err(e) = r else { panic!("must fail") };
+        assert_eq!(e.code(), MicrovmErrorCode::ResourceExhausted);
+        assert_eq!(e.to_string(), "RESOURCE_EXHAUSTED: no irqfd");
+        assert_eq!(made.get(), 2);
+        assert_eq!(dropped.get(), 2);
+        assert_eq!(Rc::strong_count(&dropped), 1);
+    }
+
+    /// 窓が重なって dispatcher への登録が失敗しても、作成済みの割り込み線は解放される。
+    #[test]
+    fn mvm1_887_device_bus_dispatcher_failure_drops_acquired_lines() {
+        let mut slots = layout_slots(2, 0).unwrap();
+        slots[1].mmio_base = slots[0].mmio_base;
+        let blocks = (0..2)
+            .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
+            .collect();
+        let dropped = Rc::new(Cell::new(0u32));
+        let r = DeviceBus::<_, MemoryNetBackend, DropLine>::new(&slots, blocks, vec![], |_| {
+            Ok(DropLine(Rc::clone(&dropped)))
+        });
+        assert!(r.is_err());
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(Rc::strong_count(&dropped), 1);
+    }
+
+    #[test]
+    fn mvm1_887_classify_spawn_error_table() {
+        use std::io::Error;
+        let c = |e: Error| classify_spawn_error(&e);
+        assert_eq!(
+            c(Error::from_raw_os_error(EAGAIN)).to_string(),
+            "RESOURCE_EXHAUSTED: cannot spawn vCPU thread (errno 11)"
+        );
+        assert_eq!(
+            c(Error::from_raw_os_error(ENOMEM)).code(),
+            MicrovmErrorCode::ResourceExhausted
+        );
+        assert_eq!(
+            c(Error::from_raw_os_error(EINVAL)).to_string(),
+            "INTERNAL: cannot spawn vCPU thread (errno 22)"
+        );
+        assert_eq!(
+            c(Error::other("x")).to_string(),
+            "INTERNAL: cannot spawn vCPU thread"
+        );
     }
 }

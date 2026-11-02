@@ -545,6 +545,10 @@ where
             if let Some(drain) = self.drain.as_mut()
                 && drain.as_mut().poll(cx).is_ready()
             {
+                // EOF 未到達のまま打ち切った出力は欠損なので、Success Status にしない。
+                if self.stdout_reader.is_some() || self.stderr_reader.is_some() {
+                    self.output_failed = true;
+                }
                 return Poll::Ready(SessionEnd::Finished);
             }
 
@@ -659,7 +663,9 @@ where
                 data,
             } => self.client_data(stream_id, fin, &data),
             Frame::RstStream { stream_id, .. } => {
-                if !self.reset_ids.contains(&stream_id) {
+                // 開設済み（最大 5 本）のストリームだけ記録し、未知の ID は蓄積しない。
+                if self.opened.kind_of(stream_id).is_some() && !self.reset_ids.contains(&stream_id)
+                {
                     self.reset_ids.push(stream_id);
                 }
                 match self.opened.kind_of(stream_id) {

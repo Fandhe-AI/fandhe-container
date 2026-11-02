@@ -96,7 +96,7 @@ pub mod goaway_status {
     /// PROTOCOL_ERROR。
     pub const PROTOCOL_ERROR: u32 = 1;
     /// INTERNAL_ERROR。
-    pub const INTERNAL_ERROR: u32 = 11;
+    pub const INTERNAL_ERROR: u32 = 2;
 }
 
 /// SPDY の層の失敗。理由は固定の英語で、入力値を含めない（REPAIR-4）。

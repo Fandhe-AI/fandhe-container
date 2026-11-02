@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -831,6 +831,144 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_load_kernel_into_assembled_microvm() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+/// MVM-1・TASK-75.3.2: ロード済みカーネルのエントリから vCPU が実行を始める（x86_64）。合成 bzImage の 64-bit エントリに置いた
+/// コードが、(1) RSI（boot_params = 0x7000）を `out` で観測させ、(2) 64-bit の即値を GPA 0x1000_0000（MMIO 窓の外の未登録の
+/// アドレス）へ 8 バイトで書く。1 つ目は RIP がエントリであることと RSI の設定を、2 つ目は long mode（CS.L・ページング・恒等写像）を示す。
+/// in-kernel irqchip のため HLT は userspace へ出ないので、OUT と MMIO で観測する。誤った RIP は `ud2` → triple fault → `Shutdown` で速く失敗する。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+
+    // 合成 bzImage（kvm_device_load_kernel_into_assembled_microvm と同じ header）。payload の 0x200 が 64-bit エントリ。
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+    put(0x1F1, &[4]);
+    put(0x1FE, &0xAA55u16.to_le_bytes());
+    put(0x201, &[0x62]);
+    put(0x202, b"HdrS");
+    put(0x206, &0x020Fu16.to_le_bytes());
+    put(0x211, &[1]);
+    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+    put(0x230, &0x20_0000u32.to_le_bytes());
+    put(0x234, &[1]);
+    put(0x236, &1u16.to_le_bytes());
+    put(0x238, &2047u32.to_le_bytes());
+    put(0x258, &0x100_0000u64.to_le_bytes());
+    put(0x260, &0x40_0000u32.to_le_bytes());
+    let payload = 5 * 512;
+    // payload の残りは ud2（0F 0B）。エントリ（payload + 0x200）にテストコードを置く。
+    for (i, b) in img[payload..].iter_mut().enumerate() {
+        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
+    }
+    let mut code: Vec<u8> = vec![0x89, 0xF0, 0xE7, 0x10]; // mov eax,esi ; out 0x10,eax
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, imm64
+    code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xA3]); // movabs [moffs64], rax
+    code.extend_from_slice(&0x1000_0000u64.to_le_bytes());
+    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap();
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        assert_eq!(loaded.entry, GuestAddress::new(0x100_0200));
+        vm.setup_boot_vcpu(&loaded).unwrap();
+        let vcpu = vm.vcpu_mut(0).unwrap();
+        // 設定直後（実行前）の値。
+        let r = vcpu.regs().unwrap();
+        assert_eq!(
+            (r.rip, r.rsi, r.rsp, r.rbp, r.rflags),
+            (0x100_0200, 0x7000, 0x8FF0, 0x8FF0, 0x2)
+        );
+        let next = |vcpu: &mut fandhe_container_microvm::device::VcpuFd| loop {
+            match vcpu.run_once(Duration::from_secs(10)).unwrap() {
+                VcpuExit::Interrupted => continue,
+                e => return e,
+            }
+        };
+        let first = next(vcpu);
+        let rip_after_out = vcpu.regs().unwrap().rip;
+        let second = next(vcpu);
+        let _ = tx.send((first, rip_after_out, second));
+    });
+    let (first, rip_after_out, second) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("boot vCPU did not finish within 60s");
+    // 1 つ目: RSI = boot_params が eax 経由で OUT に出る。exit 時点の RIP は OUT 命令の位置（エントリ + mov の 2 バイト）。
+    assert_eq!(
+        first,
+        VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 4,
+            count: 1,
+            data: 0x7000u32.to_le_bytes().to_vec(),
+        }
+    );
+    assert_eq!(rip_after_out, 0x100_0202);
+    // 2 つ目: long mode でだけ起きる 8 バイトの MMIO 書き込み。
+    assert_eq!(
+        second,
+        VcpuExit::Mmio {
+            phys_addr: 0x1000_0000,
+            data: 0x1122_3344_5566_7788u64.to_le_bytes(),
+            len: 8,
+            is_write: true,
+        }
+    );
+}
+
+/// MVM-1・TASK-75.3.2: x86_64 以外ではレジスタ初期化も組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;

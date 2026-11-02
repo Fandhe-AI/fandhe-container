@@ -10,13 +10,16 @@
 //! 終了コード: 0 = 相手の正常切断、1 = その他の起動失敗、2 = `InvalidArgument`（起動引数・パス）、
 //! 3 = 接続失敗（別 UID の listener による `PERMISSION_DENIED` を含む）、4 = フレームループの異常終了。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データ・peer 拒否イベント行を含めない。
+//! 終了時は実行中の microVM を `stop_all` で期限つきに止める（TASK-117.2・#711）。
 //! SIGTERM でのグレースフルシャットダウンは未実装（REPAIR-3）。
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode, UdsStream};
-use fandhe_container_plugin_microvm::adapter::MicrovmRuntimeAdapter;
+use fandhe_container_plugin_microvm::adapter::{
+    MicrovmRuntimeAdapter, STOP_ALL_BUDGET, default_backend,
+};
 use fandhe_container_plugin_microvm::frame_loop::{LoopExit, serve};
 use fandhe_container_plugin_microvm::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
 
@@ -59,8 +62,17 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONNECT_FAILED);
         }
     };
-    let mut adapter = MicrovmRuntimeAdapter::new();
-    match serve(&mut stream, &mut adapter) {
+    let mut adapter = MicrovmRuntimeAdapter::new(default_backend());
+    let outcome = serve(&mut stream, &mut adapter);
+    // 接続終了時に実行中 VM を期限つきで止める（drop 任せだと 1 台あたり最大 5 秒待つため。REPAIR-5）。
+    let stop_report = adapter.stop_all(STOP_ALL_BUDGET);
+    if stop_report.remaining > 0 || stop_report.failed > 0 {
+        eprintln!(
+            "level=warn op=plugin.microvm.stop_all stopped={} failed={} remaining={}",
+            stop_report.stopped, stop_report.failed, stop_report.remaining
+        );
+    }
+    match outcome {
         Ok(LoopExit::PeerClosed) => ExitCode::SUCCESS,
         Err(e) => {
             report(&e);

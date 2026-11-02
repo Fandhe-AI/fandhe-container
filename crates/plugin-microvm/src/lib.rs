@@ -15,9 +15,13 @@
 //! # 実装済み（TASK-117.1・#710）
 //! 起動設定の解決・peer 認証つき接続・長さ接頭辞フレームの送受信ループ・`ping` / `pong` の最小 RPC 往復。
 //!
+//! # 実装済み（TASK-117.2・#711）
+//! `start` / `stop` の制御面 RPC と `fandhe-container-microvm` への委譲（契約は [`adapter`] の doc）。VM 内部の I/O は
+//! UDS を通らない（MVM-1）。plugin プロセスは SIGUSR2 を他の用途に使わない（microvm の vCPU 実行が handler を入れる）。
+//!
 //! # 未実装範囲（REPAIR-3）
-//! - microVM の start / stop RPC と `fandhe-container-microvm` への委譲は TASK-117.2（#711）。それまで `ping` 以外の
-//!   操作は `UNIMPLEMENTED` を返す。
+//! - kill / delete / state、create と start の分離、block / net の指定、2 台以上の vCPU は `UNIMPLEMENTED`
+//!   （型つき本体と合わせて #1869 の設計）。実 Linux カーネルの起動完走は保証しない（microvm 側の未実装）。
 //! - 別 UID の接続拒否の結合試験は TASK-117.3（#712）、core 経由の起動・停止の結合試験は TASK-117.4（#713）。
 //! - SIGTERM でのグレースフルシャットダウン（実行中 VM の停止）は未実装。終了は相手の切断（EOF）のみ。
 //! - 要求本体 `Vec<String>` は暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。

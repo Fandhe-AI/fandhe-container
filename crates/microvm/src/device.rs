@@ -231,6 +231,10 @@ fn classify_run_error(e: SysError) -> Result<VcpuExit, MicrovmError> {
             MicrovmErrorCode::ResourceExhausted,
             "resource exhausted running vCPU",
         )),
+        SysError::NullMapping => Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "KVM_RUN failed (unexpected null mapping)",
+        )),
         SysError::Os(n) => Err(MicrovmError::new(
             MicrovmErrorCode::Internal,
             format!("KVM_RUN failed (os error {n})"),
@@ -255,6 +259,11 @@ impl VcpuFd {
     }
 
     /// `KVM_RUN` を 1 回発行し、戻った理由（VM exit）を返す。ループは呼び出し側が組む。
+    ///
+    /// # プロセス全体への影響（SIGUSR2）
+    /// 初回の呼び出しで `SIGUSR2` に何もしない handler を入れ、プロセス全体の設定として元へ戻さない。
+    /// 本 crate を組み込むプロセスは `SIGUSR2` を他の用途に使わないこと（既存の別 handler・SIG_IGN があれば
+    /// 上書きせず `FailedPrecondition` で失敗する。crate doc 参照）。
     ///
     /// `timeout` を超えてもゲストが exit しないときは、別スレッドが `kvm_run.immediate_exit` を立てて
     /// 呼び出しスレッドへ `SIGUSR2` を送り（何もしない handler を `sigaction` で入れる。既存の別 handler があれば
@@ -328,6 +337,10 @@ impl VcpuFd {
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
             ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "cannot install vCPU kick handler (unexpected null mapping)",
+            ),
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::FailedPrecondition,
                 format!("cannot install vCPU kick handler (os error {n})"),
@@ -339,46 +352,52 @@ impl VcpuFd {
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
             ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "cannot unblock vCPU kick signal (unexpected null mapping)",
+            ),
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::FailedPrecondition,
                 format!("cannot unblock vCPU kick signal (os error {n})"),
             ),
         })?;
-        let target = sys::ThreadId::current();
+        // `target` は closure の中でだけ使え、vCPU スレッドが生存中であることを型が保証する（sys::KickTarget）。
         let timed_out = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel::<()>();
         let run = &self.run;
         let fd = self.fd.as_fd();
         let timed_out_ref = &timed_out;
-        let outcome = std::thread::scope(|scope| {
-            let watchdog = std::thread::Builder::new()
-                .name("kvm-run-deadline".into())
-                .spawn_scoped(scope, move || {
-                    if let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
-                        timed_out_ref.store(true, Ordering::SeqCst);
-                        let _ = run.set_immediate_exit(true);
-                        // シグナルが ioctl 突入前に届いても immediate_exit が効くが、取りこぼしに備えて繰り返す。
-                        loop {
-                            let _ = target.kick();
-                            if !matches!(
-                                rx.recv_timeout(KICK_INTERVAL),
-                                Err(RecvTimeoutError::Timeout)
-                            ) {
-                                break;
+        let outcome = sys::with_current_thread(|target| {
+            std::thread::scope(|scope| {
+                let watchdog = std::thread::Builder::new()
+                    .name("kvm-run-deadline".into())
+                    .spawn_scoped(scope, move || {
+                        if let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+                            timed_out_ref.store(true, Ordering::SeqCst);
+                            let _ = run.set_immediate_exit(true);
+                            // シグナルが ioctl 突入前に届いても immediate_exit が効くが、取りこぼしに備えて繰り返す。
+                            loop {
+                                let _ = target.kick();
+                                if !matches!(
+                                    rx.recv_timeout(KICK_INTERVAL),
+                                    Err(RecvTimeoutError::Timeout)
+                                ) {
+                                    break;
+                                }
                             }
                         }
-                    }
-                })
-                .map_err(|_| {
-                    MicrovmError::new(
-                        MicrovmErrorCode::ResourceExhausted,
-                        "cannot spawn KVM_RUN deadline thread",
-                    )
-                })?;
-            let r = sys::kvm_run(fd);
-            drop(tx);
-            let _ = watchdog.join();
-            Ok::<_, MicrovmError>(r)
+                    })
+                    .map_err(|_| {
+                        MicrovmError::new(
+                            MicrovmErrorCode::ResourceExhausted,
+                            "cannot spawn KVM_RUN deadline thread",
+                        )
+                    })?;
+                let r = sys::kvm_run(fd);
+                drop(tx);
+                let _ = watchdog.join();
+                Ok::<_, MicrovmError>(r)
+            })
         })?;
         let expired = timed_out.load(Ordering::SeqCst);
         if expired {
@@ -442,6 +461,11 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         SysError::Os(n) if n == ENOMEM || n == EMFILE || n == ENFILE => MicrovmError::new(
             MicrovmErrorCode::ResourceExhausted,
             format!("resource exhausted creating vCPU (os error {n})"),
+        ),
+        // mmap が NULL を返した（`VcpuStage::Mmap` だけで起きる。マッピングは sys 側で munmap 済み）。
+        SysError::NullMapping => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("{name} returned a null address"),
         ),
         SysError::Os(n) => MicrovmError::new(
             MicrovmErrorCode::Internal,
@@ -516,6 +540,10 @@ fn classify_create_vm_error(e: SysError) -> MicrovmError {
             MicrovmErrorCode::ResourceExhausted,
             format!("resource exhausted creating VM (os error {n})"),
         ),
+        SysError::NullMapping => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "KVM_CREATE_VM failed (unexpected null mapping)",
+        ),
         SysError::Os(n) => MicrovmError::new(
             MicrovmErrorCode::Internal,
             format!("KVM_CREATE_VM failed (os error {n})"),
@@ -560,7 +588,7 @@ impl KvmDevice {
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
             ),
-            SysError::Os(_) => {
+            SysError::Os(_) | SysError::NullMapping => {
                 MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM device")
             }
         })
@@ -575,6 +603,10 @@ impl KvmDevice {
                     SysError::Unsupported => MicrovmError::new(
                         MicrovmErrorCode::Unimplemented,
                         "KVM is not supported on this architecture",
+                    ),
+                    SysError::NullMapping => MicrovmError::new(
+                        MicrovmErrorCode::Internal,
+                        "KVM_GET_VCPU_MMAP_SIZE failed (unexpected null mapping)",
                     ),
                     SysError::Os(n) => MicrovmError::new(
                         MicrovmErrorCode::Internal,
@@ -669,6 +701,10 @@ impl KvmDevice {
             SysError::Unsupported => MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
+            ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (unexpected null mapping)"),
             ),
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::Internal,
@@ -780,6 +816,10 @@ impl KvmDevice {
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
             ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (unexpected null mapping)"),
+            ),
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::Internal,
                 format!("{what} failed (os error {n})"),
@@ -826,6 +866,10 @@ impl KvmDevice {
             SysError::Unsupported => MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
                 "KVM is not supported on this architecture",
+            ),
+            SysError::NullMapping => MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("{what} failed (unexpected null mapping)"),
             ),
             SysError::Os(n) => MicrovmError::new(
                 MicrovmErrorCode::Internal,
@@ -960,6 +1004,9 @@ mod tests {
         assert_eq!(c(SysError::Os(EMFILE)), MicrovmErrorCode::ResourceExhausted);
         assert_eq!(c(SysError::Os(ENFILE)), MicrovmErrorCode::ResourceExhausted);
         assert_eq!(c(SysError::Unsupported), MicrovmErrorCode::Unimplemented);
+        let m = classify_vcpu_error(VcpuStage::Mmap, SysError::NullMapping);
+        assert_eq!(m.code(), MicrovmErrorCode::Internal);
+        assert_eq!(m.message(), "mmap of kvm_run returned a null address");
         let m = classify_create_vm_error(SysError::Os(22));
         assert_eq!(m.code(), MicrovmErrorCode::Internal);
         assert_eq!(m.message(), "KVM_CREATE_VM failed (os error 22)");

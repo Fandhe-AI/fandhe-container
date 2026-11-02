@@ -4,7 +4,7 @@
 //! `TcpStream` に生の HTTP/1.1 の Upgrade 要求を送り、その後は本 crate の `spdy` モジュールでフレームを
 //! 組み立てる（サーバー側のタスクを塞がないよう `spawn_blocking` で別スレッドに逃がす）。転送先は試験用の
 //! dialer で loopback の echo サーバーへつなぐ。トークンの乱数源は unix のみのため全体を `cfg(unix)` にする。
-//! kubectl / crictl との相互運用は #683（TASK-63.5）の範囲。
+//! crictl 相当の操作の疎通は `tests/streaming.rs`（#683・TASK-63.5）。実 kubectl / crictl との照合は本番 backend の結線後（`docs/design/cri-streaming-server.md`「残るもの」）。
 #![cfg(unix)]
 
 use std::collections::HashMap;

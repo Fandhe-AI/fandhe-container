@@ -2,7 +2,7 @@
 //!
 //! 実サーバー（`StreamingServer` + `ExecStreamHandler`）に loopback の TCP で接続し、クライアント側は crate の
 //! `streaming::spdy` で SYN_STREAM / DATA を組む。プロセス側は注入トレイト `ExecStreamLauncher` の偽実装（メモリ内の
-//! パイプ）で、本物のコンテナ・crictl との疎通は #683（TASK-63.5）の範囲。クライアントは std の `TcpStream` を
+//! パイプ）で、crictl 相当の疎通は `tests/streaming.rs`（#683・TASK-63.5）で、本物のコンテナ・実 crictl との照合は本番 backend の結線後。クライアントは std の `TcpStream` を
 //! `spawn_blocking` で回す（読み取りに期限を付け、ハングは失敗にする）。トークンの乱数源が unix のみのため全体を
 //! `cfg(unix)` にする。
 

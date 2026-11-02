@@ -220,6 +220,7 @@ impl<B: BlockBackend> VirtioBlock<B> {
         &mut self,
         mem: &mut GuestMemory<M>,
     ) -> Result<BlockQueueStats, MicrovmError> {
+        self.aborted = BlockQueueStats::default();
         if self.queue.is_none() {
             let cfg = self.queue_cfg.ok_or_else(|| {
                 MicrovmError::new(
@@ -229,7 +230,6 @@ impl<B: BlockBackend> VirtioBlock<B> {
             })?;
             self.queue = Some(SplitQueue::new(&cfg, mem)?);
         }
-        self.aborted = BlockQueueStats::default();
         let mut stats = BlockQueueStats::default();
         let Some(mut queue) = self.queue.take() else {
             return Ok(stats);
@@ -286,13 +286,16 @@ impl<B: BlockBackend> VirtioBlock<B> {
     }
 
     /// 1 要求を処理する。`None` は status を書けない（malformed）。`Some` は (status, 書いたデータのバイト数)。
+    ///
+    /// 記述子の境界は意味を持たない。readable 側のバイト列の先頭 16 バイトがヘッダ、残りが OUT のデータ、
+    /// writable 側のバイト列の最終 1 バイトが status、その手前が IN のデータになる（virtio 1.2 の 2.7.4・MVM-1）。
     fn handle<M: GuestMemoryBacking>(
         &mut self,
         chain: &DescriptorChain,
         mem: &mut GuestMemory<M>,
     ) -> (Option<u8>, u32) {
         let descs = chain.descriptors();
-        let (Some(first), Some(last)) = (descs.first(), descs.last()) else {
+        let Some(last) = descs.last() else {
             return (None, 0);
         };
         if descs.len() < 2 || !last.writable || last.len == 0 {
@@ -303,24 +306,26 @@ impl<B: BlockBackend> VirtioBlock<B> {
         if chain.oversized() {
             return (Some(VIRTIO_BLK_S_IOERR), 0);
         }
-        if first.writable || first.len < HEADER_LEN {
-            return (Some(VIRTIO_BLK_S_IOERR), 0);
-        }
+        let ioerr = (Some(VIRTIO_BLK_S_IOERR), 0);
+        let readable: Vec<Descriptor> = descs.iter().filter(|d| !d.writable).copied().collect();
+        let writable: Vec<Descriptor> = descs.iter().filter(|d| d.writable).copied().collect();
         let mut header = [0u8; HEADER_LEN as usize];
-        if mem.read_at(first.addr, &mut header).is_err() {
-            return (Some(VIRTIO_BLK_S_IOERR), 0);
+        if !read_prefix(mem, &readable, &mut header) {
+            return ioerr;
         }
-        let ty = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let sector = u64::from_le_bytes([
-            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
-            header[15],
-        ]);
-        // 最後の記述子の本体以外（最終バイトが status）。status 記述子が複数バイトのとき、
-        // 先頭側はデータとして扱わない（IN の writable データは中間の記述子だけ）。
-        let data = descs.get(1..descs.len() - 1).unwrap_or(&[]);
+        let [t0, t1, t2, t3, _, _, _, _, s0, s1, s2, s3, s4, s5, s6, s7] = header;
+        let ty = u32::from_le_bytes([t0, t1, t2, t3]);
+        let sector = u64::from_le_bytes([s0, s1, s2, s3, s4, s5, s6, s7]);
+        let (Some(out_data), Some(in_data)) =
+            (carve(&readable, HEADER_LEN, 0), carve(&writable, 0, 1))
+        else {
+            return ioerr;
+        };
         match ty {
-            VIRTIO_BLK_T_IN => self.transfer(data, sector, mem, true),
-            VIRTIO_BLK_T_OUT => self.transfer(data, sector, mem, false),
+            // IN は readable にデータを持たず、OUT は writable に status 以外を持たない。
+            VIRTIO_BLK_T_IN if out_data.is_empty() => self.transfer(&in_data, sector, mem, true),
+            VIRTIO_BLK_T_OUT if in_data.is_empty() => self.transfer(&out_data, sector, mem, false),
+            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => ioerr,
             VIRTIO_BLK_T_FLUSH
                 if !self
                     .negotiated
@@ -345,7 +350,7 @@ impl<B: BlockBackend> VirtioBlock<B> {
     ) -> (Option<u8>, u32) {
         let ioerr = (Some(VIRTIO_BLK_S_IOERR), 0);
         if data.len() > SEG_MAX as usize
-            || data.iter().any(|d| d.writable != read || d.len > SIZE_MAX)
+            || data.iter().any(|d| d.len > SIZE_MAX)
             || (!read && self.backend.read_only())
         {
             return ioerr;
@@ -394,6 +399,65 @@ impl<B: BlockBackend> VirtioBlock<B> {
     }
 }
 
+/// 記述子列のバイト列の先頭から `buf.len()` バイトを、記述子の境界をまたいで読む。足りなければ false。
+fn read_prefix<M: GuestMemoryBacking>(
+    mem: &GuestMemory<M>,
+    descs: &[Descriptor],
+    buf: &mut [u8],
+) -> bool {
+    let mut filled = 0usize;
+    for d in descs {
+        if filled == buf.len() {
+            break;
+        }
+        let n = (buf.len() - filled).min(d.len as usize);
+        let Some(dst) = buf.get_mut(filled..filled + n) else {
+            return false;
+        };
+        if mem.read_at(d.addr, dst).is_err() {
+            return false;
+        }
+        filled += n;
+    }
+    filled == buf.len()
+}
+
+/// 記述子列のバイト列から先頭 `skip` バイトと末尾 `trim` バイトを除いた区間を記述子列として返す。
+/// バイト列が足りない・アドレスが溢れるときは `None`。
+fn carve(descs: &[Descriptor], skip: u32, trim: u32) -> Option<Vec<Descriptor>> {
+    let total: u64 = descs.iter().map(|d| u64::from(d.len)).sum();
+    if u64::from(skip) + u64::from(trim) > total {
+        return None;
+    }
+    let mut out = Vec::with_capacity(descs.len());
+    let mut skip = skip;
+    for d in descs {
+        let mut d = *d;
+        if skip >= d.len {
+            skip -= d.len;
+            continue;
+        }
+        if skip > 0 {
+            d.addr = d.addr.checked_add(u64::from(skip))?;
+            d.len -= skip;
+            skip = 0;
+        }
+        out.push(d);
+    }
+    let mut trim = trim;
+    while trim > 0 {
+        let last = out.last_mut()?;
+        if last.len <= trim {
+            trim -= last.len;
+            out.pop();
+        } else {
+            last.len -= trim;
+            trim = 0;
+        }
+    }
+    Some(out)
+}
+
 impl<B: BlockBackend> VirtioDevice for VirtioBlock<B> {
     fn device_type(&self) -> VirtioDeviceType {
         VirtioDeviceType::Block
@@ -435,6 +499,14 @@ impl<B: BlockBackend> VirtioDevice for VirtioBlock<B> {
         features: FeatureBits,
         queues: &[QueueConfig],
     ) -> Result<(), MicrovmError> {
+        // size_max / seg_max を広告して強制するため、ネゴシエートされていないドライバは拒否する（MVM-1）。
+        let required = FeatureBits::from_bits(VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX);
+        if !features.contains(required) {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "block driver must negotiate SIZE_MAX and SEG_MAX",
+            ));
+        }
         match queues.first() {
             Some(q) if q.ready() => {
                 self.queue_cfg = Some(*q);
@@ -463,11 +535,12 @@ mod tests {
 
     const N: u16 = VRING_DESC_F_NEXT;
     const W: u16 = VRING_DESC_F_WRITE;
+    const REQUIRED: u64 = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX;
 
     fn block(ro: bool) -> VirtioBlock<MemoryBlockBackend> {
         let mut b = VirtioBlock::new(MemoryBlockBackend::new(8192, ro).unwrap());
         b.activate(
-            FeatureBits::from_bits(VIRTIO_BLK_F_FLUSH),
+            FeatureBits::from_bits(REQUIRED | VIRTIO_BLK_F_FLUSH),
             &[queue_cfg(DESC, AVAIL, USED)],
         )
         .unwrap();
@@ -589,8 +662,11 @@ mod tests {
     fn mvm1_flush_without_negotiation_is_unsupp() {
         let mut m = new_mem();
         let mut b = VirtioBlock::new(MemoryBlockBackend::new(8192, false).unwrap());
-        b.activate(FeatureBits::EMPTY, &[queue_cfg(DESC, AVAIL, USED)])
-            .unwrap();
+        b.activate(
+            FeatureBits::from_bits(REQUIRED),
+            &[queue_cfg(DESC, AVAIL, USED)],
+        )
+        .unwrap();
         request(&mut m, VIRTIO_BLK_T_FLUSH, 0, 0, 0);
         assert_eq!(b.process_queue(&mut m).unwrap().unsupp, 1);
         assert_eq!(status(&m), VIRTIO_BLK_S_UNSUPP);
@@ -692,7 +768,7 @@ mod tests {
         let mut b = VirtioBlock::new(MemoryBlockBackend::new(512, false).unwrap());
         let e = b.process_queue(&mut m).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
-        assert!(b.activate(FeatureBits::EMPTY, &[]).is_err());
+        assert!(b.activate(FeatureBits::from_bits(REQUIRED), &[]).is_err());
         let mut b = block(false);
         publish(&mut m, 0, 0, 17);
         assert_eq!(
@@ -704,6 +780,46 @@ mod tests {
             b.process_queue(&mut m).unwrap_err().code(),
             MicrovmErrorCode::FailedPrecondition
         );
+    }
+
+    /// MVM-1: ヘッダ+データ同居・ヘッダ分割・status 分割でも記述子境界に依らず処理できる。
+    #[test]
+    fn mvm1_descriptor_boundaries_do_not_matter() {
+        // OUT: [header+data R][status W]。
+        let mut m = new_mem();
+        let mut b = block(false);
+        header(&mut m, BUF, VIRTIO_BLK_T_OUT, 1);
+        m.write_at(GuestAddress::new(BUF + 16), &[0x7e; 512])
+            .unwrap();
+        put_desc(&mut m, 0, BUF, 16 + 512, N, 1);
+        put_desc(&mut m, 1, BUF + 0x2000, 1, W, 0);
+        publish(&mut m, 0, 0, 1);
+        assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
+        assert_eq!(&b.backend().contents()[512..1024], &[0x7e; 512][..]);
+        // IN: ヘッダ 8+8 分割・[data+status W] 同居。
+        let mut m = new_mem();
+        let mut b = block(false);
+        header(&mut m, BUF, VIRTIO_BLK_T_IN, 0);
+        put_desc(&mut m, 0, BUF, 8, N, 1);
+        put_desc(&mut m, 1, BUF + 8, 8, N, 2);
+        put_desc(&mut m, 2, BUF + 0x1000, 513, W, 0);
+        publish(&mut m, 0, 0, 1);
+        assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
+        assert_eq!(m.read_u32_le(GuestAddress::new(USED + 8)).unwrap(), 513);
+        let mut st = [0u8; 1];
+        m.read_at(GuestAddress::new(BUF + 0x1000 + 512), &mut st)
+            .unwrap();
+        assert_eq!(st[0], VIRTIO_BLK_S_OK);
+    }
+
+    /// MVM-1: SIZE_MAX / SEG_MAX を受けないドライバは activate で拒否する。
+    #[test]
+    fn mvm1_activate_requires_size_and_seg_max() {
+        let mut b = VirtioBlock::new(MemoryBlockBackend::new(512, false).unwrap());
+        let e = b
+            .activate(FeatureBits::EMPTY, &[queue_cfg(DESC, AVAIL, USED)])
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
     }
 
     #[test]

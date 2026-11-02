@@ -124,6 +124,9 @@ pub struct StreamingConfig {
     pub bind: SocketAddr,
     /// loopback 以外のアドレスでの待ち受けを許すか。既定は false（明示の opt-in。TLS も認証も無い）。
     pub allow_external: bool,
+    /// 発行 URL に埋め込む広告アドレス（IP）。`bind` がワイルドカード（`0.0.0.0`・`::`）のときは必須
+    /// （kubelet から到達できない `http://0.0.0.0:port` を発行しないため。CRI-6）。ポートは実際の待ち受けポートを使う。
+    pub advertise_addr: Option<IpAddr>,
     /// トークンの有効期間。既定は 60 秒（kubelet のトークンキャッシュの TTL に合わせる）。
     pub token_ttl: Duration,
     /// 同時に保持できる未消費トークンの上限。既定は 1000（kubelet の上限に合わせる）。
@@ -139,6 +142,7 @@ impl Default for StreamingConfig {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             allow_external: false,
+            advertise_addr: None,
             token_ttl: Duration::from_secs(60),
             max_in_flight: 1000,
             header_read_timeout: Duration::from_secs(10),
@@ -157,6 +161,12 @@ impl StreamingConfig {
     /// 外部アドレスでの待ち受けを許すかを指定する。
     pub fn with_allow_external(mut self, allow_external: bool) -> Self {
         self.allow_external = allow_external;
+        self
+    }
+
+    /// 発行 URL の広告アドレスを指定する。
+    pub fn with_advertise_addr(mut self, advertise_addr: IpAddr) -> Self {
+        self.advertise_addr = Some(advertise_addr);
         self
     }
 
@@ -189,6 +199,18 @@ impl StreamingConfig {
         if !self.bind.ip().is_loopback() && !self.allow_external {
             return Err(CriError::invalid_argument(
                 "streaming server address must be loopback unless external exposure is explicitly enabled",
+            ));
+        }
+        if let Some(adv) = self.advertise_addr
+            && (adv.is_unspecified() || adv.is_multicast())
+        {
+            return Err(CriError::invalid_argument(
+                "streaming advertise address must be a concrete unicast address",
+            ));
+        }
+        if self.bind.ip().is_unspecified() && self.advertise_addr.is_none() {
+            return Err(CriError::invalid_argument(
+                "streaming advertise address is required when binding a wildcard address",
             ));
         }
         if self.token_ttl.is_zero() || self.token_ttl > MAX_TOKEN_TTL {
@@ -577,8 +599,12 @@ impl StreamingServer {
             .local_addr()
             .map_err(|_| CriError::unavailable("failed to read streaming server address"))?;
         let cache = Arc::new(TokenCache::new(config.token_ttl, config.max_in_flight));
+        let advertised = match config.advertise_addr {
+            Some(ip) => SocketAddr::new(ip, local_addr.port()),
+            None => local_addr,
+        };
         let issuer = Arc::new(StreamingUrlIssuer {
-            base_url: format!("http://{local_addr}"),
+            base_url: format!("http://{advertised}"),
             cache: Arc::clone(&cache),
         });
         let conns = Arc::new(AtomicUsize::new(0));
@@ -897,15 +923,68 @@ mod tests {
             let cfg = StreamingConfig::default().with_bind(addr.parse().expect("addr"));
             let err = cfg.validate().expect_err(addr);
             assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
-            cfg.with_allow_external(true)
-                .validate()
-                .expect("opt-in allows");
+            let cfg = cfg
+                .with_allow_external(true)
+                .with_advertise_addr("192.0.2.7".parse().expect("ip"));
+            cfg.validate().expect("opt-in allows");
         }
         for addr in ["127.0.0.1:0", "[::1]:0"] {
             StreamingConfig::default()
                 .with_bind(addr.parse().expect("addr"))
                 .validate()
                 .expect(addr);
+        }
+    }
+
+    /// CRI-6: ワイルドカード bind は広告アドレスが無ければ拒否し、広告アドレスが未指定アドレスでも拒否する。
+    #[test]
+    fn cri6_config_wildcard_requires_advertise() {
+        for addr in ["0.0.0.0:0", "[::]:0"] {
+            let base = StreamingConfig::default()
+                .with_bind(addr.parse().expect("addr"))
+                .with_allow_external(true);
+            let err = base.validate().expect_err(addr);
+            assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+            let bad = base
+                .clone()
+                .with_advertise_addr("0.0.0.0".parse().expect("ip"));
+            assert!(bad.validate().is_err());
+            base.with_advertise_addr("192.0.2.7".parse().expect("ip"))
+                .validate()
+                .expect("advertise ok");
+        }
+    }
+
+    /// CRI-6: ワイルドカード bind でも発行 URL は広告アドレスと実ポートで組み立てる（IPv6 は括弧つき）。
+    #[tokio::test]
+    async fn cri6_base_url_uses_advertise_addr() {
+        let server = StreamingServer::bind(
+            StreamingConfig::default()
+                .with_bind("0.0.0.0:0".parse().expect("addr"))
+                .with_allow_external(true)
+                .with_advertise_addr("192.0.2.7".parse().expect("ip")),
+        )
+        .await
+        .expect("bind");
+        let port = server.local_addr().port();
+        assert_eq!(
+            server.issuer().base_url(),
+            format!("http://192.0.2.7:{port}")
+        );
+        let server = StreamingServer::bind(
+            StreamingConfig::default()
+                .with_bind("[::]:0".parse().expect("addr"))
+                .with_allow_external(true)
+                .with_advertise_addr("2001:db8::1".parse().expect("ip")),
+        )
+        .await;
+        // IPv6 が使えない環境では bind 自体が失敗しうるため、成功したときだけ URL を照合する。
+        if let Ok(server) = server {
+            let port = server.local_addr().port();
+            assert_eq!(
+                server.issuer().base_url(),
+                format!("http://[2001:db8::1]:{port}")
+            );
         }
     }
 

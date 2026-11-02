@@ -11,7 +11,8 @@
 
 use std::num::{NonZeroU8, NonZeroU32};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::state_store::Annotations;
 use super::types::{ContainerId, ErrorCode, TraitError};
@@ -27,6 +28,7 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    から共有できることを前提にしてよい。
 /// 4. 本 crate（core）にはこのトレイトの実装を置かない。実装は plugin 側にある
 ///    （PLUG-1・#1869 の設計・TASK-114）。「実装済みを装わない」という REPAIR-3 の方針に基づく。
+///    既定メソッド（`wait_exit`）は状態照会だけを使う期限つきの代替で、実装の代わりではない。
 /// 5. plugin の信頼境界（UDS の所有者・権限検証、別 UID からの接続切断等。PLUG-11・PLUG-12）
 ///    はこのトレイトの外側、境界機構（`fandhe-container-plugin`）の責務であり、
 ///    `ContainerRuntime` の呼び出し側はそれらが検証済みであることを前提にしてよい。
@@ -75,6 +77,55 @@ pub trait ContainerRuntime: Send + Sync {
     /// 前提: 対象コンテナが存在すること。存在しなければ [`ErrorCode::NotFound`] を返す。
     /// 対応: CORE-2・ERR-2。
     fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError>;
+
+    /// コンテナが [`ContainerState::Stopped`] になるまで、[`WaitExitRequest::timeout`] を上限に待つ。
+    ///
+    /// containerd shim v2 の `Wait`（CRI-1・CRI-5）の終了待ちの拡張点（PLUG-1・REPAIR-5）。
+    /// 返すのは `Stopped` の状態だけで、期限内に止まらなければ [`ErrorCode::Timeout`]、
+    /// [`WaitExitRequest::is_cancelled`] が真になれば [`ErrorCode::Unavailable`] で戻る。
+    /// 未起動の `Created` や `Unknown` は終了扱いにしない。`state` の失敗（途中で削除された
+    /// ときの [`ErrorCode::NotFound`] を含む）は再試行せずそのまま返す。
+    ///
+    /// 簡易実装（REPAIR-3）: 既定の本体は `state` を [`WaitExitRequest::poll_interval`] ごとに
+    /// 照会するだけの代替で、終了通知は使わない。終了通知を持つ実装（supervisor の終了通知など）は
+    /// 上書きしてイベント駆動にしてよい。上書きする実装も、期限と取り消しを有界の刻みで守り、
+    /// `Stopped` 以外を返さない契約を負う。plugin 越しの実装（#1869）は RPC の期限を
+    /// `timeout` に余裕を足した値以上にする。
+    fn wait_exit(&self, req: &WaitExitRequest<'_>) -> Result<ContainerStatus, TraitError> {
+        const CANCEL_SLICE: Duration = Duration::from_millis(10);
+        let deadline = Instant::now()
+            .checked_add(req.timeout())
+            .ok_or_else(|| TraitError::new(ErrorCode::Internal, "wait deadline overflow"))?;
+        let state_req = StateRequest::new(req.id().clone());
+        let cancelled = || Err(TraitError::new(ErrorCode::Unavailable, "wait cancelled"));
+        loop {
+            if req.is_cancelled() {
+                return cancelled();
+            }
+            let st = self.state(&state_req)?;
+            if st.state() == ContainerState::Stopped {
+                return Ok(st);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "wait exceeded its deadline",
+                ));
+            }
+            let sleep_end = now + req.poll_interval().min(deadline - now);
+            loop {
+                if req.is_cancelled() {
+                    return cancelled();
+                }
+                let now = Instant::now();
+                if now >= sleep_end {
+                    break;
+                }
+                thread::sleep(CANCEL_SLICE.min(sleep_end - now));
+            }
+        }
+    }
 }
 
 /// Linux のシグナル番号（`kill`/`stop` で使う）。
@@ -456,6 +507,94 @@ impl StopRequest {
     /// SIGKILL までの猶予時間を返す。
     pub fn grace(&self) -> Duration {
         self.grace
+    }
+}
+
+/// [`WaitExitRequest`] が受理する期限・照会間隔の上限（REPAIR-5）。`STOP_GRACE_MAX` と同じ 24 時間。
+const WAIT_EXIT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// [`WaitExitRequest::poll_interval`] の既定値。
+const WAIT_EXIT_POLL_DEFAULT: Duration = Duration::from_millis(100);
+
+/// [`ContainerRuntime::wait_exit`] の要求（CRI-1・CRI-5・PLUG-1）。
+///
+/// 期限は必須で（無期限を許さない。REPAIR-5）、ゼロと 24 時間超は拒否する。
+/// 取り消し判定（サーバー停止・接続切断）は呼び出し側のクロージャで渡す。
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct WaitExitRequest<'a> {
+    id: ContainerId,
+    timeout: Duration,
+    poll_interval: Duration,
+    cancel: Option<&'a (dyn Fn() -> bool + 'a)>,
+}
+
+impl<'a> WaitExitRequest<'a> {
+    /// 対象コンテナの ID と期限から作る。`timeout` がゼロまたは 24 時間超なら
+    /// [`ErrorCode::InvalidArgument`]。
+    pub fn new(id: ContainerId, timeout: Duration) -> Result<Self, TraitError> {
+        Self::check("timeout", timeout)?;
+        Ok(Self {
+            id,
+            timeout,
+            poll_interval: WAIT_EXIT_POLL_DEFAULT,
+            cancel: None,
+        })
+    }
+
+    fn check(name: &str, d: Duration) -> Result<(), TraitError> {
+        if d.is_zero() || d > WAIT_EXIT_MAX {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("wait {name} must be in 1ns..={WAIT_EXIT_MAX:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 既定実装の照会間隔を変える（既定 100 ミリ秒）。ゼロと 24 時間超は拒否する。
+    pub fn with_poll_interval(mut self, interval: Duration) -> Result<Self, TraitError> {
+        Self::check("poll_interval", interval)?;
+        self.poll_interval = interval;
+        Ok(self)
+    }
+
+    /// 取り消し判定を付ける。真を返したら待ちを打ち切る。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a (dyn Fn() -> bool + 'a)) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn id(&self) -> &ContainerId {
+        &self.id
+    }
+
+    /// 待ちの期限（相対）を返す。
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 既定実装の照会間隔を返す。
+    pub fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+
+    /// 取り消しが要求されているか。判定が付いていなければ常に偽。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c())
+    }
+}
+
+impl std::fmt::Debug for WaitExitRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitExitRequest")
+            .field("id", &self.id)
+            .field("timeout", &self.timeout)
+            .field("poll_interval", &self.poll_interval)
+            .field("has_cancel", &self.cancel.is_some())
+            .finish()
     }
 }
 
@@ -1200,5 +1339,171 @@ mod tests {
         assert_eq!(CleanupTarget::SupervisorLog.as_str(), "supervisor_log");
         assert_eq!(CleanupTarget::ContainerLog.as_str(), "container_log");
         assert_eq!(CleanupTarget::ImageRef.as_str(), "image_ref");
+    }
+
+    /// `wait_exit` の既定実装を試すための偽 runtime。`state` の呼び出し回数を数える。
+    struct WaitFake {
+        started: std::time::Instant,
+        stop_after: Option<Duration>,
+        calls: std::sync::atomic::AtomicUsize,
+        fail_after_calls: Option<usize>,
+    }
+
+    impl WaitFake {
+        fn new(stop_after: Option<Duration>) -> Self {
+            Self {
+                started: std::time::Instant::now(),
+                stop_after,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_after_calls: None,
+            }
+        }
+    }
+
+    impl ContainerRuntime for WaitFake {
+        fn create(&self, _: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn start(&self, _: &StartRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail_after_calls.is_some_and(|k| n > k) {
+                return Err(TraitError::new(ErrorCode::NotFound, "gone"));
+            }
+            match self.stop_after {
+                Some(d) if self.started.elapsed() >= d => {
+                    Ok(ContainerStatus::stopped(req.id().clone(), Some(42)))
+                }
+                _ => Ok(ContainerStatus::created(req.id().clone(), None)),
+            }
+        }
+    }
+
+    /// REPAIR-5: `WaitExitRequest` の期限と照会間隔は 1ns..=24h だけ受理する。
+    #[test]
+    fn repair5_wait_exit_request_validation() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        let ns = Duration::from_nanos(1);
+        assert_eq!(
+            WaitExitRequest::new(sample_id(), Duration::ZERO)
+                .expect_err("zero")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert!(WaitExitRequest::new(sample_id(), day).is_ok());
+        assert_eq!(
+            WaitExitRequest::new(sample_id(), day + ns)
+                .expect_err("over a day")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let ok = WaitExitRequest::new(sample_id(), day).expect("ok");
+        assert_eq!(ok.poll_interval(), Duration::from_millis(100));
+        assert!(ok.clone().with_poll_interval(day).is_ok());
+        assert!(ok.clone().with_poll_interval(Duration::ZERO).is_err());
+        assert!(ok.with_poll_interval(day + ns).is_err());
+    }
+
+    /// CRI-1: 既定の `wait_exit` は `Stopped` になったら終了コードつきで戻る。
+    #[test]
+    fn cri1_wait_exit_default_returns_stopped_status() {
+        let rt = WaitFake::new(Some(Duration::from_millis(150)));
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(10))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(20))
+            .expect("interval");
+        let st = rt.wait_exit(&req).expect("stopped");
+        assert_eq!(st.state(), ContainerState::Stopped);
+        assert_eq!(st.exit_code(), Some(42));
+    }
+
+    /// REPAIR-5: 止まらない（`Created` のまま）なら期限で `Timeout`。
+    #[test]
+    fn repair5_wait_exit_default_times_out() {
+        let rt = WaitFake::new(None);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_millis(100))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(20))
+            .expect("interval");
+        let t0 = std::time::Instant::now();
+        let err = rt.wait_exit(&req).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(err.message(), "wait exceeded its deadline");
+        assert!(t0.elapsed() >= Duration::from_millis(100));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REPAIR-5: 取り消しは `Unavailable`（"wait cancelled"）で、期限よりずっと早く戻る。
+    #[test]
+    fn repair5_wait_exit_default_is_cancellable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rt = WaitFake::new(None);
+        let flag = AtomicBool::new(false);
+        let cancel = || flag.load(Ordering::SeqCst);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(30))
+            .expect("req")
+            .with_cancel(&cancel);
+        let t0 = std::time::Instant::now();
+        let err = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+            });
+            rt.wait_exit(&req).expect_err("cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(err.message(), "wait cancelled");
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    /// CRI-1: 途中の `state` の失敗（削除された等）は再試行せずそのまま返る。
+    #[test]
+    fn cri1_wait_exit_default_propagates_state_error() {
+        let mut rt = WaitFake::new(None);
+        rt.fail_after_calls = Some(2);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(10))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(10))
+            .expect("interval");
+        let err = rt.wait_exit(&req).expect_err("not found");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            rt.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the failing call is not retried"
+        );
+    }
+
+    /// REPAIR-5: 期限の時刻にも 1 回照会してから `Timeout` にする（最後の照会で止まっていれば成功）。
+    #[test]
+    fn repair5_wait_exit_default_probes_at_deadline() {
+        let rt = WaitFake::new(None);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_millis(60))
+            .expect("req")
+            .with_poll_interval(Duration::from_secs(10))
+            .expect("interval");
+        let err = rt.wait_exit(&req).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        // 開始直後の 1 回と、期限の時刻の 1 回。
+        assert_eq!(rt.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// CRI-7: `wait_exit` も dyn 互換で呼べる。
+    #[test]
+    fn cri7_wait_exit_is_dyn_compatible() {
+        let rt: Box<dyn ContainerRuntime> = Box::new(WaitFake::new(Some(Duration::ZERO)));
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(1)).expect("req");
+        assert_eq!(rt.wait_exit(&req).expect("ok").exit_code(), Some(42));
     }
 }

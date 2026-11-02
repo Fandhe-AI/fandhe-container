@@ -121,7 +121,8 @@ fn rd<const N: usize>(img: &[u8], off: usize) -> Result<[u8; N], MicrovmError> {
 }
 
 fn rd_u8(img: &[u8], off: usize) -> Result<u8, MicrovmError> {
-    Ok(rd::<1>(img, off)?[0])
+    let [b] = rd::<1>(img, off)?;
+    Ok(b)
 }
 fn rd_u16(img: &[u8], off: usize) -> Result<u16, MicrovmError> {
     Ok(u16::from_le_bytes(rd(img, off)?))
@@ -239,6 +240,43 @@ pub struct VirtioMmioParam {
     pub gsi: u32,
 }
 
+/// `user` を引用符の外の単独の `--` で `(前半, 後半)` に分ける（後半は `--` を含む。`--` が無ければ後半は空）。
+/// 閉じていない引用符は `InvalidArgument`。前半の末尾の空白は落とす。
+fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
+    let bytes = user.as_bytes();
+    let mut in_quote = false;
+    let mut split: Option<usize> = None;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= bytes.len() {
+        let c = bytes.get(i).copied();
+        if c == Some(b'"') {
+            in_quote = !in_quote;
+        } else if !in_quote && (c.is_none() || c == Some(b' ')) {
+            if split.is_none() && bytes.get(start..i) == Some(b"--".as_slice()) {
+                split = Some(start);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if in_quote {
+        return Err(invalid("kernel command line has an unclosed quote"));
+    }
+    match split {
+        Some(off) => {
+            let head = user
+                .get(..off)
+                .ok_or_else(|| invalid("kernel command line split failed"))?;
+            let tail = user
+                .get(off..)
+                .ok_or_else(|| invalid("kernel command line split failed"))?;
+            Ok((head.trim_end_matches(' '), tail))
+        }
+        None => Ok((user, "")),
+    }
+}
+
 /// 検証済みの cmdline（印字可能な ASCII のみ。virtio-mmio の項目はコードが型つきの値から生成して足す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelCmdline {
@@ -256,21 +294,21 @@ impl KernelCmdline {
                 "kernel command line must be printable ASCII without control characters",
             ));
         }
-        // カーネルは単独の `--` 以降を init の引数として扱うため、自動生成項目はその前に挿入する。
-        let (head, tail) = match user.split(' ').position(|t| t == "--") {
-            Some(i) => {
-                let off: usize = user.split(' ').take(i).map(|t| t.len() + 1).sum();
-                (user[..off].trim_end_matches(' '), &user[off..])
-            }
-            None => (user, ""),
-        };
+        // カーネルは引用符の外の単独の `--` 以降を init の引数として扱うため、自動生成項目はその前に挿入する。
+        let (head, tail) = split_at_init_args(user)?;
         let mut text = head.to_owned();
         // 追加前に残り容量（終端 NUL 分を含む）を確認し、拒否する入力のために確保を膨らませない。
         let limit = usize::try_from(CMDLINE_CAPACITY - 1).unwrap_or(0);
-        let mut total = text.len() + if tail.is_empty() { 0 } else { 1 + tail.len() };
+        let mut total = text.len()
+            + if tail.is_empty() {
+                0
+            } else {
+                tail.len() + usize::from(!text.is_empty())
+            };
         for d in devices {
             let item = format!("virtio_mmio.device=0x{:x}@0x{:x}:{}", d.len, d.base, d.gsi);
             let add = item.len() + usize::from(!text.is_empty());
+            // head が空で tail だけのとき、tail の前の区切りは head 側の空白としては数えない。
             total = total.saturating_add(add);
             if total > limit {
                 return Err(invalid("kernel command line too long"));
@@ -281,7 +319,9 @@ impl KernelCmdline {
             text.push_str(&item);
         }
         if !tail.is_empty() {
-            text.push(' ');
+            if !text.is_empty() {
+                text.push(' ');
+            }
             text.push_str(tail);
         }
         if text.len() as u64 >= CMDLINE_CAPACITY {
@@ -508,6 +548,9 @@ pub fn load_linux<B: GuestMemoryBacking>(
         let image = u32::try_from(addr).map_err(|_| invalid("initrd address exceeds 4 GiB"))?;
         let size = u32::try_from(len).map_err(|_| invalid("initrd size exceeds 4 GiB"))?;
         page.set_ramdisk(image, size)?;
+    } else {
+        // 入力イメージの header に非ゼロの値があっても、置いていない initrd をゲストに渡さない。
+        page.set_ramdisk(0, 0)?;
     }
     page.set_cmd_line_ptr(CMDLINE_ADDR as u32)?;
     page.set_e820(&plan.e820)?;
@@ -770,6 +813,30 @@ mod tests {
             KernelCmdline::new("-- rescue", &d).unwrap().as_str(),
             "virtio_mmio.device=0x1000@0xd0000000:5 -- rescue"
         );
+    }
+
+    /// MVM-1・TASK-75.3.1: 引用符内の `--` は区切りにせず、閉じていない引用符は拒否し、user が最大長でも先頭に空白を入れない。
+    #[test]
+    fn mvm1_884_cmdline_quote_aware_split() {
+        let d = [VirtioMmioParam {
+            base: 0xd000_0000,
+            len: 0x1000,
+            gsi: 5,
+        }];
+        assert_eq!(
+            KernelCmdline::new("foo=\"x -- y\" -- init", &d)
+                .unwrap()
+                .as_str(),
+            "foo=\"x -- y\" virtio_mmio.device=0x1000@0xd0000000:5 -- init"
+        );
+        assert_eq!(
+            KernelCmdline::new("foo=\"x -- y\"", &d).unwrap().as_str(),
+            "foo=\"x -- y\" virtio_mmio.device=0x1000@0xd0000000:5"
+        );
+        assert!(KernelCmdline::new("foo=\"x -- y", &d).is_err());
+        assert_eq!(KernelCmdline::new("-- a", &[]).unwrap().as_str(), "-- a");
+        let long = format!("--{}", "a".repeat(CMDLINE_CAPACITY as usize - 3));
+        assert_eq!(KernelCmdline::new(&long, &[]).unwrap().as_str(), long);
     }
 
     /// MVM-1・TASK-75.3.1: 件数が多く容量を超える devices は途中で拒否する。

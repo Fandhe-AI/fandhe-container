@@ -4,6 +4,9 @@
 //! HTTP/1.1 を送る（ブロッキングなので `spawn_blocking` で別スレッドに逃がし、サーバー側のタスクを塞がない）。
 //! トークンの乱数源は unix の `/dev/urandom` のみで、非 unix では発行が `Unavailable` になることだけを照合する。
 
+// 発行（乱数源）は unix のみのため、非 unix では unix 専用試験だけが使う補助が未使用になる。
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -366,4 +369,91 @@ async fn cri6_issue_unavailable_on_non_unix() {
         ))
         .expect_err("unavailable");
     assert_eq!(err.code(), CriErrorCode::Unavailable);
+}
+
+/// Upgrade を受け付けて、期限の数倍の間つないだ後に 1 バイト列を書くテスト用ハンドラ。
+#[cfg(unix)]
+struct UpgradeHoldHandler {
+    hold: Duration,
+}
+
+#[cfg(unix)]
+impl fandhe_container_cri::streaming::StreamHandler for UpgradeHoldHandler {
+    fn handle(
+        &self,
+        _request: fandhe_container_cri::streaming::StreamRequest,
+        mut http: hyper::Request<hyper::body::Incoming>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = hyper::Response<fandhe_container_cri::streaming::StreamBody>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let hold = self.hold;
+        Box::pin(async move {
+            let on_upgrade = hyper::upgrade::on(&mut http);
+            tokio::spawn(async move {
+                let Ok(upgraded) = on_upgrade.await else {
+                    return;
+                };
+                let mut io = upgraded;
+                tokio::time::sleep(hold).await;
+                let _ = std::future::poll_fn(|cx| {
+                    hyper::rt::Write::poll_write(std::pin::Pin::new(&mut io), cx, b"late-data")
+                })
+                .await;
+            });
+            let mut response =
+                hyper::Response::new(fandhe_container_cri::streaming::StreamBody::empty());
+            *response.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
+            response.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("Upgrade"),
+            );
+            response.headers_mut().insert(
+                hyper::header::UPGRADE,
+                hyper::header::HeaderValue::from_static("SPDY/3.1"),
+            );
+            response
+        })
+    }
+}
+
+/// CRI-6・REPAIR-5・#679: Upgrade した接続は、Upgrade しない要求向けの接続全体の期限
+/// （`header_read_timeout * 3`）を超えても切られない（Upgrade 後の期限は #680〜#682 が決める）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_upgraded_connection_survives_overall_deadline() {
+    let header_timeout = Duration::from_millis(100);
+    let hold = header_timeout * 8;
+    let server = StreamingServer::bind_with_handler(
+        StreamingConfig::default().with_header_read_timeout(header_timeout),
+        Arc::new(UpgradeHoldHandler { hold }),
+    )
+    .await
+    .expect("bind");
+    let url = server
+        .issuer()
+        .issue(fandhe_container_cri::streaming::StreamRequest::Exec(
+            exec_request("c1"),
+        ))
+        .expect("issue");
+    let path = path_of(&url);
+    let raw = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n"
+    );
+    let response = tokio::time::timeout(Duration::from_secs(8), http_raw(server.local_addr(), raw))
+        .await
+        .expect("client must finish within the test deadline");
+    assert_eq!(
+        status_line(&response),
+        "HTTP/1.1 101 Switching Protocols",
+        "{response}"
+    );
+    assert!(
+        response.ends_with("late-data"),
+        "upgraded connection was closed before the handler wrote: {response}"
+    );
 }

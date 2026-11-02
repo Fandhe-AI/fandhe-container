@@ -459,7 +459,9 @@ fn plain_response(status: StatusCode, message: &'static str) -> Response<StreamB
 /// トークンの照合に成功した要求の処理口（拡張点）。
 ///
 /// #680（Exec）・#681（Attach）・#682（PortForward）が実装し、`Upgrade` 後の SPDY/3.1 を扱う。
-/// Upgrade 後の idle の期限もそちらが決める（本モジュールの接続全体の期限は Upgrade しない要求のためのもの）。
+/// Upgrade 後の idle の期限もそちらが決める。本モジュールの接続全体の期限（`header_read_timeout * 3`）は
+/// Upgrade しない要求のためのもので、101 応答で `Upgraded` へ IO を渡した接続には及ばない
+/// （接続の future が Upgrade の引き渡しで完了するため。#679）。
 pub trait StreamHandler: Send + Sync + 'static {
     /// 照合済みの要求と HTTP 要求（`hyper::upgrade::on` に渡せる）から応答を作る。
     fn handle(
@@ -675,7 +677,9 @@ async fn accept_loop(
                 .keep_alive(false)
                 .serve_connection(TokioIo::new(stream), service)
                 .with_upgrades();
-            // Upgrade しない要求の接続全体の期限（REPAIR-5）。Upgrade 後の期限は #680〜#682 が決める。
+            // Upgrade しない要求の接続全体の期限（REPAIR-5）。hyper の `with_upgrades` 付き接続の future は、
+            // 101 応答の送出後に IO を `Upgraded` へ渡した時点で完了する。よって Upgrade 後のストリームは
+            // この期限の対象外で、期限は #680〜#682 が決める（試験 `cri6_upgraded_connection_survives_overall_deadline`）。
             let deadline = header_read_timeout.saturating_mul(3);
             let _ = tokio::time::timeout(deadline, connection).await;
         });

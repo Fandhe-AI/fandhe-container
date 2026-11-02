@@ -94,6 +94,16 @@ pub enum CriOpKind {
     AttachStreamRead,
     /// Attach の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.3・REPAIR-4）。
     AttachStreamWrite,
+    /// Exec ストリーミングの 1 セッション（接続から終了まで。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecSession,
+    /// Exec の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecStreamRead,
+    /// Exec の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecStreamWrite,
+    /// Exec の通信路（クライアント接続）からの読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecConnRead,
+    /// Exec の通信路（クライアント接続）への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecConnWrite,
 }
 
 impl CriOpKind {
@@ -129,6 +139,11 @@ impl CriOpKind {
             CriOpKind::AttachSession => "cri.attach.session",
             CriOpKind::AttachStreamRead => "cri.attach.stream_read",
             CriOpKind::AttachStreamWrite => "cri.attach.stream_write",
+            CriOpKind::ExecSession => "cri.exec.session",
+            CriOpKind::ExecStreamRead => "cri.exec.stream_read",
+            CriOpKind::ExecStreamWrite => "cri.exec.stream_write",
+            CriOpKind::ExecConnRead => "cri.exec.conn_read",
+            CriOpKind::ExecConnWrite => "cri.exec.conn_write",
         }
     }
 }
@@ -437,7 +452,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 26] = [
+    const ALL_KINDS: [CriOpKind; 31] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -464,6 +479,11 @@ mod tests {
         CriOpKind::AttachSession,
         CriOpKind::AttachStreamRead,
         CriOpKind::AttachStreamWrite,
+        CriOpKind::ExecSession,
+        CriOpKind::ExecStreamRead,
+        CriOpKind::ExecStreamWrite,
+        CriOpKind::ExecConnRead,
+        CriOpKind::ExecConnWrite,
     ];
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

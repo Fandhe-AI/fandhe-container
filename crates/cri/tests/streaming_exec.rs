@@ -19,6 +19,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use fandhe_container_cri::error::CriError;
+use fandhe_container_cri::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime::v1;
 use fandhe_container_cri::streaming::exec::{
     ExecLaunch, ExecObserver, ExecSession, ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
@@ -32,6 +33,7 @@ use fandhe_container_cri::streaming::{
     StreamDispatcher, StreamRequest, StreamingConfig, StreamingServer,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tonic::Code;
 
 const STATUS_SUCCESS: &str = r#"{"metadata":{},"status":"Success"}"#;
 
@@ -103,6 +105,27 @@ impl AsyncRead for PipeReader {
             g.waker = Some(cx.waker().clone());
             Poll::Pending
         }
+    }
+}
+
+/// 書き込みが常に失敗する stdin（backend が stdin を閉じた状況の再現）。
+struct BrokenWriter;
+
+impl AsyncWrite for BrokenWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -243,6 +266,15 @@ impl ExecStreamLauncher for FakeLauncher {
                         cell.set(code);
                     });
                 }
+                "broken-stdin" => {
+                    // stdin の書き込みは失敗するが、プロセスは少し後に 0 で終わる。
+                    let (stdout_p, cell) = (stdout_p.clone(), cell.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        stdout_p.close();
+                        cell.set(0);
+                    });
+                }
                 "exit-no-close" => {
                     // 終了コード 0 で終わるが stdout を閉じない（drain の期限切れの再現）。
                     stdout_p.send(b"partial\n");
@@ -267,9 +299,13 @@ impl ExecStreamLauncher for FakeLauncher {
                 _ => {} // "hang": 終了しない。
             }
             Ok(ExecSession {
-                stdin: req
-                    .stdin
-                    .then(|| Box::new(PipeWriter(stdin_p)) as Box<dyn AsyncWrite + Send + Unpin>),
+                stdin: req.stdin.then(|| {
+                    if program == "broken-stdin" {
+                        Box::new(BrokenWriter) as Box<dyn AsyncWrite + Send + Unpin>
+                    } else {
+                        Box::new(PipeWriter(stdin_p)) as Box<dyn AsyncWrite + Send + Unpin>
+                    }
+                }),
                 stdout: req
                     .stdout
                     .then(|| Box::new(PipeReader(stdout_p)) as Box<dyn AsyncRead + Send + Unpin>),
@@ -298,6 +334,19 @@ impl ExecObserver for Obs {
     }
 }
 
+/// 操作別計装の記録先（種別とコードだけを保持する）。
+#[derive(Default)]
+struct Rec(Mutex<Vec<(CriOpKind, Code)>>);
+
+impl CriOpRecorder for Rec {
+    fn record_cri_op(&self, sample: &CriOpSample) {
+        self.0
+            .lock()
+            .expect("lock")
+            .push((sample.kind(), sample.code()));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // フィクスチャとクライアント
 // ---------------------------------------------------------------------------------------------
@@ -306,16 +355,19 @@ struct Fixture {
     server: StreamingServer,
     launcher: Arc<FakeLauncher>,
     obs: Arc<Obs>,
+    rec: Arc<Rec>,
 }
 
 impl Fixture {
     async fn new(config: ExecStreamConfig, max_connections: usize) -> Self {
         let launcher = Arc::new(FakeLauncher::default());
         let obs = Arc::new(Obs::default());
+        let rec = Arc::new(Rec::default());
         let handler =
             ExecStreamHandler::new(Arc::clone(&launcher) as Arc<dyn ExecStreamLauncher>, config)
                 .expect("handler")
-                .with_observer(Arc::clone(&obs) as Arc<dyn ExecObserver>);
+                .with_observer(Arc::clone(&obs) as Arc<dyn ExecObserver>)
+                .with_recorder(Arc::clone(&rec) as Arc<dyn CriOpRecorder>);
         // 共通の振り分け（StreamDispatcher）に Exec を登録する。Attach は未登録で 501 になる。
         let dispatcher = StreamDispatcher::new().with_exec(Arc::new(handler));
         let server = StreamingServer::bind_with_handler(
@@ -328,6 +380,7 @@ impl Fixture {
             server,
             launcher,
             obs,
+            rec,
         }
     }
 
@@ -372,6 +425,11 @@ impl Fixture {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// 計装の記録（セッションの記録が出るまで待つ。observer より後に呼ばれるため observer の後で読む）。
+    fn recorded(&self) -> Vec<(CriOpKind, Code)> {
+        self.rec.0.lock().expect("lock").clone()
     }
 
     async fn wait_dropped(&self) {
@@ -1069,5 +1127,192 @@ async fn cri6_exec_drain_expiry_is_not_success() {
     assert_eq!(
         fx.wait_outcomes(1).await,
         vec![ExecStreamOutcome::OutputTruncated]
+    );
+}
+
+/// CRI-6・TASK-63.2: クライアントが stdout を RST_STREAM した後は、その ID へ DATA・FIN を送らない。
+/// 他のストリーム（stderr・error）は続き、成功の Status で終わる。
+#[tokio::test]
+async fn cri6_exec_reset_stdout_stops_sending_to_that_stream_only() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-exit"], false, true, true, true);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        client.syn(7, "stderr");
+        for id in [1, 3, 5, 7] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"a", false);
+        // stdout の最初の DATA を確認してからリセットする。
+        loop {
+            match client.recv() {
+                Some(Frame::Data {
+                    stream_id, data, ..
+                }) if stream_id == sid(5) => {
+                    assert_eq!(data, b"a".to_vec());
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("closed before stdout data"),
+            }
+        }
+        client.send(&Frame::RstStream {
+            stream_id: sid(5),
+            status: rst_status::CANCEL,
+        });
+        // リセット後の入力はプロセスが stdout へ書くが、クライアントへは送られない。
+        client.data(3, b"b", false);
+        client.data(3, b"", true);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert!(
+        !c.data.contains_key(&5),
+        "DATA after RST: {:?}",
+        c.data.get(&5)
+    );
+    assert!(!c.fins.contains(&5), "FIN after RST");
+    assert_eq!(c.text(7), "bye-from-stderr\n");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert!(c.fins.contains(&1) && c.fins.contains(&7));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 0 }]
+    );
+}
+
+/// CRI-6・TASK-63.2: error ストリームを RST_STREAM した後は、終了の Status もその ID へ送らない。
+#[tokio::test]
+async fn cri6_exec_reset_error_stream_gets_no_status() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-exit"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.send(&Frame::RstStream {
+            stream_id: sid(1),
+            status: rst_status::CANCEL,
+        });
+        client.data(3, b"x", true);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert!(!c.data.contains_key(&1), "DATA on reset error stream");
+    assert!(!c.fins.contains(&1));
+    assert_eq!(c.text(5), "x");
+    assert!(c.fins.contains(&5));
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+}
+
+/// CRI-6・TASK-63.2: ストリームが揃う前に stdout をリセットしても、その ID へは何も送らない。
+#[tokio::test]
+async fn cri6_exec_reset_before_all_streams_is_honored() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-exit"], false, true, true, true);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        client.send(&Frame::RstStream {
+            stream_id: sid(5),
+            status: rst_status::CANCEL,
+        });
+        client.syn(7, "stderr");
+        for id in [1, 3, 5, 7] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"early", true);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert!(!c.data.contains_key(&5));
+    assert!(!c.fins.contains(&5));
+    assert_eq!(c.text(7), "bye-from-stderr\n");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+}
+
+/// REPAIR-4・CRI-6・TASK-63.2: 正常終了では、セッションと backend・通信路の読み書きが成功として記録される。
+#[tokio::test]
+async fn cri6_exec_records_session_and_io_operations() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-exit"], false, true, true, true);
+    let addr = fx.addr();
+    tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        client.syn(7, "stderr");
+        for id in [1, 3, 5, 7] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"hello", true);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    fx.wait_outcomes(1).await;
+    let mut got = fx.recorded();
+    got.sort_by_key(|(k, _)| k.as_str());
+    let mut want = vec![
+        (CriOpKind::ExecSession, Code::Ok),
+        (CriOpKind::ExecStreamRead, Code::Ok),
+        (CriOpKind::ExecStreamWrite, Code::Ok),
+        (CriOpKind::ExecConnRead, Code::Ok),
+        (CriOpKind::ExecConnWrite, Code::Ok),
+    ];
+    want.sort_by_key(|(k, _)| k.as_str());
+    assert_eq!(got, want);
+}
+
+/// REPAIR-4・CRI-6・TASK-63.2: stdin の書き込み失敗は、最終結果が Exited でも書き込みの失敗として記録される。
+#[tokio::test]
+async fn cri6_exec_records_stdin_write_failure_even_when_exited() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["broken-stdin"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"x", false);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 0 }]
+    );
+    let got = fx.recorded();
+    assert!(got.contains(&(CriOpKind::ExecSession, Code::Ok)), "{got:?}");
+    assert!(
+        got.contains(&(CriOpKind::ExecStreamWrite, Code::Unavailable)),
+        "{got:?}"
+    );
+    assert!(
+        !got.contains(&(CriOpKind::ExecStreamWrite, Code::Ok)),
+        "{got:?}"
     );
 }

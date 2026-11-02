@@ -21,6 +21,10 @@
 //! - 交渉: [`super::remotecommand::negotiate`]（v4・v3・v2。クライアントの提示順で最初に対応する版）
 //! - ストリーム: ヘッダ `streamtype` で種別を決める。保存済みの `ExecRequest` が求める組
 //!   （[`StreamOptions::expected`]）だけを受け付け、想定外・重複は RST_STREAM で拒否する
+//!   クライアントが RST_STREAM で閉じた stdin・stdout・stderr・error・resize は、以後その ID へ DATA・FIN を送らず、
+//!   stdout・stderr の読み手は解放する（SPDY/3 §2.3.7。CRI-6・TASK-63.2）
+//! - 計装: セッションの結果・所要時間と backend・通信路の読み書きの成否を [`CriOpRecorder`] へ渡す
+//!   （[`ExecStreamHandler::with_recorder`]。REPAIR-4）
 //! - 終了の通知: error ストリームへ書く。v4 は `metav1.Status` の JSON（成功は `Success`、非 0 は
 //!   `NonZeroExitCode` と `ExitCode` の cause）。v3・v2 は成功時に何も書かず、非 0 は終了コードの文
 //! - フロー制御: moby/spdystream は WINDOW_UPDATE を送らず、受けても無視する。したがってこちらも送信窓に従わず、
@@ -40,6 +44,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
+use tonic::Code;
 
 use super::remotecommand::{
     HEADER_STREAM_TYPE, MAX_SESSION_STEP_TIMEOUT, Protocol, ResizeParser, SessionLimits,
@@ -51,6 +56,7 @@ use super::spdy::{
 };
 use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
 use crate::error::CriError;
+use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 use crate::runtime::v1;
 
 /// 送信キュー（未送信バイト）の上限。超えそうなときは stdout / stderr を読まない（背圧）。
@@ -230,6 +236,7 @@ pub struct ExecStreamHandler {
     launcher: Arc<dyn ExecStreamLauncher>,
     config: ExecStreamConfig,
     observer: Arc<dyn ExecObserver>,
+    recorder: Arc<dyn CriOpRecorder>,
 }
 
 impl fmt::Debug for ExecStreamHandler {
@@ -251,12 +258,19 @@ impl ExecStreamHandler {
             launcher,
             config,
             observer: Arc::new(NoopExecObserver),
+            recorder: Arc::new(NoopCriOpRecorder),
         })
     }
 
     /// 観測口を差し替える（REPAIR-4）。
     pub fn with_observer(mut self, observer: Arc<dyn ExecObserver>) -> Self {
         self.observer = observer;
+        self
+    }
+
+    /// 操作別の計装先を差し替える（セッションの結果と、backend・通信路の読み書きの成否。CRI-6・TASK-63.2・REPAIR-4）。
+    pub fn with_recorder(mut self, recorder: Arc<dyn CriOpRecorder>) -> Self {
+        self.recorder = recorder;
         self
     }
 
@@ -274,10 +288,11 @@ impl ExecStreamHandler {
         let on_upgrade = hyper::upgrade::on(http);
         let launcher = Arc::clone(&self.launcher);
         let observer = Arc::clone(&self.observer);
+        let recorder = Arc::clone(&self.recorder);
         let config = self.config.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = match on_upgrade.await {
+            let (outcome, stats) = match on_upgrade.await {
                 Ok(upgraded) => {
                     run_exec_session(
                         TokioIo::new(upgraded),
@@ -289,9 +304,11 @@ impl ExecStreamHandler {
                     )
                     .await
                 }
-                Err(_) => ExecStreamOutcome::PeerClosed,
+                Err(_) => (ExecStreamOutcome::PeerClosed, IoStats::default()),
             };
-            observer.observe(outcome, started.elapsed());
+            let elapsed = started.elapsed();
+            record_session(recorder.as_ref(), outcome, &stats, elapsed);
+            observer.observe(outcome, elapsed);
             // 枠は IO の寿命まで保持する（#679 の契約。落とすと同時接続数の上限が破れる）。
             drop(permit);
         });
@@ -313,6 +330,85 @@ impl StreamHandler for ExecStreamHandler {
                 _ => plain_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
             }
         })
+    }
+}
+
+/// セッション内の読み書きの成否（成功と失敗は別に立てる。REPAIR-4）。内容・ID は持たない。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IoStats {
+    /// backend の stdout / stderr を 1 回以上読めた。
+    pub(crate) stream_read_ok: bool,
+    /// backend の stdout / stderr の読み取りが失敗した。
+    pub(crate) stream_read_failed: bool,
+    /// backend の stdin へ 1 回以上書けた。
+    pub(crate) stream_write_ok: bool,
+    /// backend の stdin への書き込みが失敗した（入力を捨てて継続する場合を含む）。
+    pub(crate) stream_write_failed: bool,
+    /// 通信路から 1 回以上読めた。
+    pub(crate) conn_read_ok: bool,
+    /// 通信路の読み取りが失敗した。
+    pub(crate) conn_read_failed: bool,
+    /// 通信路へ 1 回以上書けた。
+    pub(crate) conn_write_ok: bool,
+    /// 通信路への書き込みが失敗した。
+    pub(crate) conn_write_failed: bool,
+}
+
+/// 終わり方を gRPC のコードへ写す（操作別計装の結果区分。終了コードが非 0 でも運用上の失敗ではない）。
+fn outcome_code(outcome: ExecStreamOutcome) -> Code {
+    match outcome {
+        ExecStreamOutcome::Exited { .. } => Code::Ok,
+        ExecStreamOutcome::ExecFailed | ExecStreamOutcome::OutputFailed => Code::Internal,
+        ExecStreamOutcome::OutputTruncated | ExecStreamOutcome::LaunchFailed => Code::Unavailable,
+        ExecStreamOutcome::StreamCreationTimeout | ExecStreamOutcome::IdleTimeout => {
+            Code::DeadlineExceeded
+        }
+        ExecStreamOutcome::ProtocolError => Code::InvalidArgument,
+        ExecStreamOutcome::PeerClosed => Code::Cancelled,
+    }
+}
+
+/// セッションの結果・所要時間と、読み書きの成否を記録先へ渡す（CRI-6・TASK-63.2・REPAIR-4）。
+///
+/// ID・コマンド・内容は渡さない。失敗があれば成功より優先して失敗を 1 件記録する。
+fn record_session(
+    recorder: &dyn CriOpRecorder,
+    outcome: ExecStreamOutcome,
+    stats: &IoStats,
+    latency: Duration,
+) {
+    recorder.record_cri_op(&CriOpSample::new(
+        CriOpKind::ExecSession,
+        outcome_code(outcome),
+        latency,
+    ));
+    for (kind, ok, failed) in [
+        (
+            CriOpKind::ExecStreamRead,
+            stats.stream_read_ok,
+            stats.stream_read_failed,
+        ),
+        (
+            CriOpKind::ExecStreamWrite,
+            stats.stream_write_ok,
+            stats.stream_write_failed,
+        ),
+        (
+            CriOpKind::ExecConnRead,
+            stats.conn_read_ok,
+            stats.conn_read_failed,
+        ),
+        (
+            CriOpKind::ExecConnWrite,
+            stats.conn_write_ok,
+            stats.conn_write_failed,
+        ),
+    ] {
+        if failed {
+            recorder.record_cri_op(&CriOpSample::new(kind, Code::Unavailable, latency));
+        } else if ok {
+            recorder.record_cri_op(&CriOpSample::new(kind, Code::Ok, latency));
+        }
     }
 }
 
@@ -362,6 +458,8 @@ struct Conn<T> {
     wpos: usize,
     dec: FrameDecoder,
     enc: FrameEncoder,
+    /// 通信路の読み書きの成否（REPAIR-4）。
+    stats: IoStats,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
@@ -372,6 +470,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
             wpos: 0,
             dec: FrameDecoder::new(),
             enc: FrameEncoder::new(),
+            stats: IoStats::default(),
         }
     }
 
@@ -398,10 +497,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
             let chunk = self.wbuf.get(self.wpos..).unwrap_or(&[]);
             match Pin::new(&mut self.io).poll_write(cx, chunk) {
                 Poll::Ready(Ok(0)) => {
+                    self.stats.conn_write_failed = true;
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
                 }
-                Poll::Ready(Ok(n)) => self.wpos = self.wpos.saturating_add(n),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(n)) => {
+                    self.stats.conn_write_ok = true;
+                    self.wpos = self.wpos.saturating_add(n);
+                }
+                Poll::Ready(Err(e)) => {
+                    self.stats.conn_write_failed = true;
+                    return Poll::Ready(Err(e));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -425,10 +531,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
         match Pin::new(&mut self.io).poll_read(cx, &mut buf) {
             Poll::Ready(Ok(())) => {
                 let filled = buf.filled();
+                if !filled.is_empty() {
+                    self.stats.conn_read_ok = true;
+                }
                 self.dec.extend(filled);
                 Poll::Ready(Ok(filled.len()))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(ReadStop::Io)),
+            Poll::Ready(Err(_)) => {
+                self.stats.conn_read_failed = true;
+                Poll::Ready(Err(ReadStop::Io))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -482,6 +594,8 @@ struct EarlyStdin {
     fin: bool,
     /// ストリームが揃う前に届いた resize の DATA（上限つき。Relay 起動後に端末サイズとして適用する。CRI-6）。
     resize: Vec<u8>,
+    /// ストリームが揃う前に RST_STREAM で閉じられた ID（Relay へ引き継ぎ、以後は送らない。CRI-6）。
+    reset: Vec<StreamId>,
 }
 
 /// 受け付けたストリームの ID。
@@ -515,6 +629,18 @@ impl Streams {
             StreamType::Stderr => self.stderr,
             StreamType::Resize => self.resize,
         }
+    }
+
+    /// 受け付け済みのストリームの ID か。
+    fn is_known(&self, id: StreamId) -> bool {
+        [
+            self.error,
+            self.stdin,
+            self.stdout,
+            self.stderr,
+            self.resize,
+        ]
+        .contains(&Some(id))
     }
 
     fn complete(&self, expected: &[StreamType]) -> bool {
@@ -576,8 +702,13 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 early.resize.extend_from_slice(&data);
                 Ok(())
             }
-            Frame::RstStream { stream_id, .. } if streams.stdin == Some(stream_id) => {
-                early.fin = true;
+            Frame::RstStream { stream_id, .. } if streams.is_known(stream_id) => {
+                if streams.stdin == Some(stream_id) {
+                    early.fin = true;
+                }
+                if !early.reset.contains(&stream_id) {
+                    early.reset.push(stream_id);
+                }
                 Ok(())
             }
             Frame::Ping { id } if id % 2 == 1 => conn.queue(&Frame::Ping { id }),
@@ -631,6 +762,8 @@ struct Output {
     eof: bool,
     /// 読み取りがエラーで終わった（正常 EOF と区別する）。
     failed: bool,
+    /// 1 回以上データを読めた（操作別計装用。REPAIR-4）。
+    read_ok: bool,
 }
 
 /// 中継の終わり方。
@@ -668,9 +801,61 @@ struct Relay<T> {
     drain_timeout: Duration,
     idle: Pin<Box<Sleep>>,
     idle_timeout: Duration,
+    /// RST_STREAM を受けたストリーム。以後そのストリームへは何も送らない（SPDY/3 §2.3.7。CRI-6）。
+    reset_ids: Vec<StreamId>,
+    /// backend 側（stdin・stdout・stderr）の読み書きの成否。閉じた出力の分もここへ畳む（REPAIR-4）。
+    stats: IoStats,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
+    fn is_reset(&self, id: StreamId) -> bool {
+        self.reset_ids.contains(&id)
+    }
+
+    /// クライアントがリセットした出力の読み手を解放する（以後その ID へ DATA・FIN を送らない）。
+    fn retire_output(&mut self, id: StreamId) {
+        for slot in [&mut self.stdout, &mut self.stderr] {
+            if slot.as_ref().is_some_and(|o| o.id == id)
+                && let Some(out) = slot.take()
+            {
+                self.stats.stream_read_ok |= out.read_ok;
+                self.stats.stream_read_failed |= out.failed;
+            }
+        }
+    }
+
+    /// 通信路と backend の成否をまとめる（セッション終了時に呼ぶ）。
+    fn collect_stats(&self) -> IoStats {
+        let mut stats = self.stats;
+        for out in [self.stdout.as_ref(), self.stderr.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            stats.stream_read_ok |= out.read_ok;
+            stats.stream_read_failed |= out.failed;
+        }
+        stats.conn_read_ok = self.conn.stats.conn_read_ok;
+        stats.conn_read_failed = self.conn.stats.conn_read_failed;
+        stats.conn_write_ok = self.conn.stats.conn_write_ok;
+        stats.conn_write_failed = self.conn.stats.conn_write_failed;
+        stats
+    }
+
+    /// RST_STREAM を受けた既知のストリームを記録し、対応する資源を解放する。
+    fn on_reset(&mut self, stream_id: StreamId) {
+        if !self.streams.is_known(stream_id) || self.is_reset(stream_id) {
+            return;
+        }
+        self.reset_ids.push(stream_id);
+        if Some(stream_id) == self.streams.stdin {
+            self.stdin_fin = true;
+        }
+        if Some(stream_id) == self.streams.resize {
+            self.resizer = None;
+        }
+        self.retire_output(stream_id);
+    }
+
     fn touch(&mut self) {
         self.idle
             .as_mut()
@@ -686,7 +871,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 data,
             } => {
                 self.touch();
-                if Some(stream_id) == self.streams.stdin {
+                if self.is_reset(stream_id) {
+                    // リセット済みのストリームの DATA は捨てる。
+                } else if Some(stream_id) == self.streams.stdin {
                     if self.stdin.is_some() {
                         self.stdin_buf.extend_from_slice(&data);
                     }
@@ -697,11 +884,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     self.feed_resize(&data);
                 }
             }
-            Frame::RstStream { stream_id, .. } => {
-                if Some(stream_id) == self.streams.stdin {
-                    self.stdin_fin = true;
-                }
-            }
+            Frame::RstStream { stream_id, .. } => self.on_reset(stream_id),
             Frame::Ping { id } if id % 2 == 1 => {
                 self.conn
                     .queue(&Frame::Ping { id })
@@ -762,6 +945,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     match Pin::new(&mut *writer).poll_write(cx, chunk) {
                         Poll::Ready(Ok(n)) if n > 0 => {
                             self.stdin_pos = self.stdin_pos.saturating_add(n);
+                            self.stats.stream_write_ok = true;
                             progress = true;
                             stdin_progressed = true;
                         }
@@ -773,7 +957,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                     }
                 }
                 if broken {
-                    // プロセス側が閉じた。以後の stdin は捨てる。
+                    // プロセス側が閉じた。以後の stdin は捨てる（失敗は計装に残す。REPAIR-4）。
+                    self.stats.stream_write_failed = true;
                     self.stdin = None;
                     self.stdin_buf.clear();
                     self.stdin_pos = 0;
@@ -974,6 +1159,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 error_id,
                 status,
                 extra_fins,
+                &self.reset_ids,
                 self.streams.last_id,
                 self.close_timeout,
             )
@@ -1001,6 +1187,7 @@ fn pump_output<T: AsyncRead + AsyncWrite + Unpin>(
         match Pin::new(&mut out.reader).poll_read(cx, &mut buf) {
             Poll::Pending => break,
             Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
+                out.read_ok = true;
                 conn.queue(&Frame::Data {
                     stream_id: out.id,
                     fin: false,
@@ -1030,15 +1217,19 @@ async fn send_status<T: AsyncRead + AsyncWrite + Unpin>(
     error_id: StreamId,
     status: Option<&[u8]>,
     extra_fins: &[StreamId],
+    reset: &[StreamId],
     last_good: u32,
     close_timeout: Duration,
 ) {
-    let _ = conn.queue(&Frame::Data {
-        stream_id: error_id,
-        fin: true,
-        data: status.map(<[u8]>::to_vec).unwrap_or_default(),
-    });
-    for id in extra_fins {
+    // クライアントがリセットしたストリームへは何も送らない（SPDY/3 §2.3.7）。
+    if !reset.contains(&error_id) {
+        let _ = conn.queue(&Frame::Data {
+            stream_id: error_id,
+            fin: true,
+            data: status.map(<[u8]>::to_vec).unwrap_or_default(),
+        });
+    }
+    for id in extra_fins.iter().filter(|id| !reset.contains(id)) {
         let _ = conn.queue(&Frame::Data {
             stream_id: *id,
             fin: true,
@@ -1059,7 +1250,7 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     req: &v1::ExecRequest,
     launcher: &dyn ExecStreamLauncher,
     config: &ExecStreamConfig,
-) -> ExecStreamOutcome {
+) -> (ExecStreamOutcome, IoStats) {
     let mut conn = Conn::new(io);
     let expected = options.expected(protocol);
     let close_timeout = config.limits.close_timeout;
@@ -1076,9 +1267,9 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         Err(_) => {
             conn.goodbye(streams.last_id, goaway_status::OK, close_timeout)
                 .await;
-            return ExecStreamOutcome::StreamCreationTimeout;
+            return (ExecStreamOutcome::StreamCreationTimeout, conn.stats);
         }
-        Ok(StreamWait::Closed) => return ExecStreamOutcome::PeerClosed,
+        Ok(StreamWait::Closed) => return (ExecStreamOutcome::PeerClosed, conn.stats),
         Ok(StreamWait::Protocol) => {
             conn.goodbye(
                 streams.last_id,
@@ -1086,12 +1277,12 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
                 close_timeout,
             )
             .await;
-            return ExecStreamOutcome::ProtocolError;
+            return (ExecStreamOutcome::ProtocolError, conn.stats);
         }
         Ok(StreamWait::Ready) => {}
     }
     let Some(error_id) = streams.error else {
-        return ExecStreamOutcome::ProtocolError;
+        return (ExecStreamOutcome::ProtocolError, conn.stats);
     };
 
     // 2. 起動（期限つき）。
@@ -1112,11 +1303,12 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
                 error_id,
                 Some(&status),
                 &[],
+                &early.reset,
                 streams.last_id,
                 close_timeout,
             )
             .await;
-            return ExecStreamOutcome::LaunchFailed;
+            return (ExecStreamOutcome::LaunchFailed, conn.stats);
         }
     };
 
@@ -1128,12 +1320,14 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         exit,
         resize,
     } = session;
+    // 揃う前にリセットされた出力は読み手を持たない（ここで drop して解放する）。
     let output = |reader: Option<BoxedRead>, id: Option<StreamId>| match (reader, id) {
-        (Some(reader), Some(id)) => Some(Output {
+        (Some(reader), Some(id)) if !early.reset.contains(&id) => Some(Output {
             reader,
             id,
             eof: false,
             failed: false,
+            read_ok: false,
         }),
         _ => None,
     };
@@ -1159,6 +1353,8 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
         drain_timeout: config.limits.drain_timeout,
         idle: Box::pin(tokio::time::sleep(config.limits.stream_idle_timeout)),
         idle_timeout: config.limits.stream_idle_timeout,
+        reset_ids: early.reset.clone(),
+        stats: IoStats::default(),
     };
     // 確立前に届いた resize を適用する（初期サイズを落とさない。CRI-6）。
     for chunk in early.resize.chunks(EARLY_RESIZE_REPLAY_CHUNK) {
@@ -1166,7 +1362,8 @@ pub(crate) async fn run_exec_session<T: AsyncRead + AsyncWrite + Unpin>(
     }
     let end = poll_fn(|cx| relay.poll_run(cx)).await;
     // relay を drop すると ExecSession 由来の資源が解放され、プロセスが止まる（契約）。
-    relay.finalize(end).await
+    let outcome = relay.finalize(end).await;
+    (outcome, relay.collect_stats())
 }
 
 /// launcher が要求どおりの stdio を返したか。
@@ -1280,12 +1477,14 @@ mod tests {
             id: StreamId::new(3).expect("id"),
             eof: false,
             failed: false,
+            read_ok: false,
         };
         let mut stderr = Output {
             reader: Box::new(OneShot(false)),
             id: StreamId::new(5).expect("id"),
             eof: false,
             failed: false,
+            read_ok: false,
         };
         assert!(pump_output(&mut conn, &mut stdout, &mut cx).expect("stdout"));
         let after_stdout = conn.pending_write();

@@ -2,7 +2,7 @@
 
 CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流さず「ストリーミングサーバーの URL」を返す。kubelet / apiserver はその URL へ HTTP（SPDY/3.1 の Upgrade）で接続して入出力をやり取りする。本書は、その土台（HTTP サーバーの起動・URL 発行・トークンの失効）の設計記録である（CRI-6・TASK-63.1・#679。依存の承認は #678）。
 
-実装は `crates/cri/src/streaming.rs`（Attach の SPDY は `streaming/spdy.rs`・`streaming/remotecommand.rs`・`streaming/attach.rs`）。結合試験は `crates/cri/tests/streaming_server.rs`・`streaming_attach.rs`。
+実装は `crates/cri/src/streaming.rs`（SPDY は `streaming/spdy.rs`・`streaming/remotecommand.rs`、Attach は `streaming/attach.rs`、Exec は `streaming/exec.rs`）。結合試験は `crates/cri/tests/streaming_server.rs`・`streaming_attach.rs`・`streaming_exec.rs`。
 
 ## スコープ
 
@@ -11,7 +11,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | HTTP/1.1 サーバーの起動・ルーティング・接続の上限と期限 | 実装済み | #679 |
 | URL の発行（一意・単回使用・TTL つき） | 実装済み | #679 |
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
-| Exec のハンドラ本体 | 未実装（501 を返す）。SPDY の codec・remotecommand の部品・振り分けは #681 のものを再利用できる | #680（TASK-63.2） |
+| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装で、注入が無ければ 501） | #680（TASK-63.2） |
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続（注入が無ければ 501） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | 後続の issue |
@@ -61,7 +61,7 @@ Upgrade 後の期限（`StreamingConfig::stream_creation_timeout` 既定 30 秒�
 
 | ファイル | 役割 |
 | -------- | ---- |
-| `streaming/spdy.rs` | SPDY/3.1 のフレーム codec。型付きの `Frame`・31 ビットの `StreamId`・辞書つき zlib のヘッダブロック。Exec・PortForward も再利用する |
+| `streaming/spdy.rs` | SPDY/3.1 のフレーム codec。型付きの `Frame`・31 ビットの `StreamId`・辞書つき zlib のヘッダブロック。Exec（`exec.rs`）・PortForward も再利用する |
 | `streaming/spdy_dictionary.rs` | SPDY/3 の辞書 1423 バイト。出典は `NOTICE`（moby/spdystream）。Adler-32 を draft の辞書 ID（`0xe3c6a7c2`）と照合する試験がある |
 | `streaming/remotecommand.rs` | `*.channel.k8s.io` の交渉（v4・v3・v2）・`streamtype` の割り当て・`metav1.Status` の JSON・resize の JSON・`SessionLimits` |
 | `streaming/attach.rs` | `AttachHandler`（`StreamHandler`）・`AttachBackend`（注入点）・1 接続 1 タスクのセッション |
@@ -101,6 +101,20 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立てもこれと同じ後続の issue。
 
+## Exec（#680・TASK-63.2・CRI-6）
+
+`ExecStreamHandler`（`StreamHandler` の実装）を `StreamDispatcher::with_exec` で登録する（単独なら `bind_with_handler` に直接渡してもよい。Exec 以外の種別は 501）。SPDY の codec・交渉・status・resize の解析・期限（`SessionLimits`）は Attach と共通の `spdy.rs`・`remotecommand.rs` を使い、`exec.rs` に残るのは Exec 固有の部分（起動役 `ExecStreamLauncher`・プロセスの終了コードから Status への変換・stdin の stall 期限）だけである。
+
+- 交渉・ストリーム割り当ては Attach と同じ（v4・v3・v2。resize は v3 以降）。受け付ける組は発行時に保存した `ExecRequest` から決める（`StreamOptions::expected`）
+- 終了の通知: v4 は error ストリームに `metav1.Status` の JSON。成功は `{"metadata":{},"status":"Success"}`、非 0 は `reason: NonZeroExitCode` と `details.causes: [{"reason":"ExitCode","message":"<code>"}]`。v3・v2 は成功時に何も書かず、非 0 は `command terminated with exit code <code>` のテキスト（kubelet と同じ）。起動失敗・待ち失敗は `InternalError` の固定文で、内部のパス・エラー文は載せない。続けて未 FIN の出力に FIN、GOAWAY を送り閉じる
+- フロー制御は Attach と同じく強制しない（「意図的な逸脱」）。送信キュー 1 MiB の上限と、stdin をプロセスへ書き終えるまで次のフレームを読まないことで背圧を TCP に任せる。試験 `cri6_exec_large_stdin_roundtrip_beyond_window` が 256 KiB の往復を固定する
+- 期限（REPAIR-5）: `SessionLimits`（作成 30 秒・idle 4 時間・流し切り 5 秒・最後の送出 5 秒）に加え、Exec 固有の `launch_timeout`（既定 30 秒）と `stdin_stall_timeout`（既定 60 秒。溜めた stdin をプロセスが読まないとき、ソケットを読めず切断を検知できない時間の上限）
+- 受信バッファが上限を超えた場合は EOF と区別して `ProtocolError`（GOAWAY）で閉じる
+
+### 注入トレイト `ExecStreamLauncher`
+
+core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は無い（REPAIR-3）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しは後続の issue。
+
 ## PortForward（#682・TASK-63.4・CRI-6）
 
 - Upgrade 前の照合: `Connection: Upgrade`・`Upgrade: SPDY/3.1`・`X-Stream-Protocol-Version: portforward.k8s.io` のすべてが揃わなければ 400（Upgrade しない）。101 応答に同じ 3 ヘッダを載せる。WebSocket は未対応
@@ -128,9 +142,9 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 - ヘッダブロックの上限と SPDY/3 の zlib 辞書（出典と帰属表示）は共通 codec（`spdy`・`spdy_dictionary`）の記述に従う。超えたら GOAWAY(PROTOCOL_ERROR) で切断する
 - 観測: セッションの終了理由（`PortForwardEnd`）を `PortForwardObserver` に渡す。ポート・トークン・アドレスは載せない
 
-## #680 に残るもの
+## 残るもの
 
-- Exec のハンドラ本体（SPDY の codec・remotecommand の部品・`StreamDispatcher`・`SessionLimits` は再利用する。Exec は `RemoteCommand` の v4 の終了コード付き Status が要る）
+- `ExecStreamLauncher` の本番の実装と plugin-cri からの `StreamingServer` の起動・注入
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
 - kubelet / crictl の実クライアントでの照合（#683 の実機前提試験）

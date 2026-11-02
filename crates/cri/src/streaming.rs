@@ -12,8 +12,9 @@
 //! 有効なトークンへの要求は、種別ごとのハンドラが無ければ [`NotImplementedHandler`] が `501 Not Implemented` を返す。
 //! Attach は #681（TASK-63.3）が SPDY/3.1 の codec（[`spdy`]）・remotecommand の交渉（[`remotecommand`]）・
 //! セッション（[`attach`]）を実装済みだが、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は未接続で、
-//! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）、PortForward は #682（TASK-63.4）が
-//! [`StreamDispatcher`] へハンドラを足して実装する。
+//! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
+//! 交渉を使って実装済みだが、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、
+//! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が [`StreamDispatcher`] へ足して実装する。
 //!
 //! ## 安全側の既定
 //!
@@ -47,6 +48,7 @@ use crate::error::CriError;
 use crate::runtime::v1;
 
 pub mod attach;
+pub mod exec;
 pub mod port_forward;
 pub mod remotecommand;
 pub mod spdy;
@@ -495,7 +497,8 @@ fn plain_response(status: StatusCode, message: &'static str) -> Response<StreamB
 
 /// トークンの照合に成功した要求の処理口（拡張点）。
 ///
-/// #680（Exec）・#681（Attach）・#682（PortForward）が実装し、`Upgrade` 後の SPDY/3.1 を扱う。
+/// Exec（[`exec::ExecStreamHandler`]・#680）・Attach（[`attach::AttachHandler`]・#681）が実装済みで、
+/// #682（PortForward）が同じ形で実装し、`Upgrade` 後の SPDY/3.1 を扱う。
 /// Upgrade 後の idle の期限もそちらが決める。本モジュールの接続全体の期限（`header_read_timeout * 3`）は
 /// Upgrade しない要求のためのもので、101 応答で `Upgraded` へ IO を渡した接続には及ばない
 /// （接続の future が Upgrade の引き渡しで完了するため。#679）。
@@ -899,7 +902,24 @@ fn check_id(value: &str, what: &'static str) -> Result<(), CriError> {
     Ok(())
 }
 
-/// `ExecRequest` の入力検証（存在照合の前。深い意味検証は #680）。
+/// stdio と tty の組の検証（Exec・Attach 共通。kubelet の `NewOptions` / `ValidateExecRequest` と同じ規則）。
+///
+/// どれも false の要求と、tty と stderr の同時指定は拒否する（tty では stderr が stdout に合流するため。CRI-6）。
+fn check_stdio_options(stdin: bool, stdout: bool, stderr: bool, tty: bool) -> Result<(), CriError> {
+    if !(stdin || stdout || stderr) {
+        return Err(CriError::invalid_argument(
+            "one of stdin, stdout, or stderr must be set",
+        ));
+    }
+    if tty && stderr {
+        return Err(CriError::invalid_argument(
+            "stderr must be false when tty is set",
+        ));
+    }
+    Ok(())
+}
+
+/// `ExecRequest` の入力検証（存在照合の前。CRI-6・TASK-63.2・#680）。
 pub fn validate_exec_request(req: &v1::ExecRequest) -> Result<(), CriError> {
     check_id(&req.container_id, "container_id")?;
     if req.cmd.is_empty() {
@@ -915,12 +935,7 @@ pub fn validate_exec_request(req: &v1::ExecRequest) -> Result<(), CriError> {
     if total > MAX_EXEC_CMD_BYTES {
         return Err(CriError::invalid_argument("cmd is too large"));
     }
-    if !(req.stdin || req.stdout || req.stderr) {
-        return Err(CriError::invalid_argument(
-            "one of stdin, stdout, or stderr must be set",
-        ));
-    }
-    Ok(())
+    check_stdio_options(req.stdin, req.stdout, req.stderr, req.tty)
 }
 
 /// `AttachRequest` の入力検証（存在照合の前。CRI-6・TASK-63.3・#681）。
@@ -929,17 +944,7 @@ pub fn validate_exec_request(req: &v1::ExecRequest) -> Result<(), CriError> {
 /// 守らない要求は `INVALID_ARGUMENT`。接続時のハンドラは kubelet に合わせて、tty の stderr を無視する。
 pub fn validate_attach_request(req: &v1::AttachRequest) -> Result<(), CriError> {
     check_id(&req.container_id, "container_id")?;
-    if req.tty && req.stderr {
-        return Err(CriError::invalid_argument(
-            "stderr must be false when tty is set",
-        ));
-    }
-    if !(req.stdin || req.stdout || req.stderr) {
-        return Err(CriError::invalid_argument(
-            "one of stdin, stdout, or stderr must be set",
-        ));
-    }
-    Ok(())
+    check_stdio_options(req.stdin, req.stdout, req.stderr, req.tty)
 }
 
 /// `PortForwardRequest` の入力検証（存在照合の前。到達性の検証は #682）。
@@ -1267,6 +1272,18 @@ mod tests {
         let mut many = ok.clone();
         many.cmd = vec!["x".into(); MAX_EXEC_ARGS + 1];
         assert!(validate_exec_request(&many).is_err());
+        // kubelet と同じく tty と stderr の同時指定は不正（#680）。tty 単独・stderr 単独は有効。
+        let mut tty_stderr = ok.clone();
+        tty_stderr.tty = true;
+        tty_stderr.stderr = true;
+        let err = validate_exec_request(&tty_stderr).expect_err("tty and stderr");
+        assert_eq!(err.message(), "stderr must be false when tty is set");
+        let mut tty_only = ok.clone();
+        tty_only.tty = true;
+        validate_exec_request(&tty_only).expect("tty only");
+        let mut stderr_only = ok.clone();
+        stderr_only.stderr = true;
+        validate_exec_request(&stderr_only).expect("stderr only");
 
         let pf = v1::PortForwardRequest {
             pod_sandbox_id: "p".into(),

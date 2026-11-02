@@ -101,9 +101,36 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立てもこれと同じ後続の issue。
 
-## #680・#682 に残るもの
+## PortForward（#682・TASK-63.4・CRI-6）
 
-- Exec・PortForward のハンドラ本体（SPDY の codec・remotecommand の部品・`StreamDispatcher`・`SessionLimits` は再利用する。Exec は `RemoteCommand` の v4 の終了コード付き Status が要る）
+- Upgrade 前の照合: `Connection: Upgrade`・`Upgrade: SPDY/3.1`・`X-Stream-Protocol-Version: portforward.k8s.io` のすべてが揃わなければ 400（Upgrade しない）。101 応答に同じ 3 ヘッダを載せる。WebSocket は未対応
+- ストリームの対: クライアントが `streamtype`（error / data）・`port`・`requestid` のヘッダ付きで SYN_STREAM を送る。受けるたびに SYN_REPLY を返し、同じ `requestid` の error と data が揃ったら転送先へ接続する。クライアント起点の ID は奇数のみ
+- 拒否（RST_STREAM の REFUSED_STREAM）: 不正な `streamtype`・`port`（10 進の数字のみ・1..=65535）・`requestid`（空・64 バイト超）、保存済み要求の `port` 一覧が非空でそれに無いポート、同時ストリーム数の超過、同じ対への重複
+- 転送: data の DATA は TCP へ書き、FIN で TCP の書き込み側を shutdown する。TCP の EOF は DATA の FIN にし、両方向が閉じたら error ストリームも FIN で閉じる。接続失敗は error ストリームへ固定の英文（`error forwarding port <port>: connection failed`）を書いて両ストリームを FIN で閉じる
+- 他の種別と同居させるときは `StreamDispatcher::with_port_forward` に登録する（`with_fallback` の連鎖は持たない）
+- PING は同じ ID で返す。SETTINGS・WINDOW_UPDATE・HEADERS は読み飛ばし、フロー制御は持たない（kubelet の SPDY 実装も窓を強制しない前提。実クライアントでの確認は #683）。GOAWAY・切断で終了する
+- 転送先への接続は `PortForwardDialer`（`pod_sandbox_id` と `port` で `std::net::TcpStream` を返す）に切り出す。cri は名前空間の具象を知らず、既定でホストの loopback へつなぐ実装を置かない。本番の dialer（NODE ネットワークの pod と、pod の netns へ入って接続する POD ネットワークの pod）と plugin-cri でのサーバー起動・ハンドラ注入は後続の issue
+
+| 項目 | 既定値 | 設定 |
+| ---- | ------ | ---- |
+| 転送先への接続の期限 | 10 秒 | `PortForwardConfig::dial_timeout` |
+| 対が揃うまでの期限 | 30 秒（kubelet の stream creation timeout 相当） | `pair_timeout` |
+| Upgrade 後の idle の期限 | 4 時間（kubelet の stream idle timeout 相当） | `idle_timeout` |
+| 同時ストリーム数 | 128 | `max_streams` |
+| 受ける DATA の 1 フレームの最大長 | 256 KiB（共通 codec の `MAX_INCOMING_PAYLOAD`。1024..=この値） | `max_frame_bytes` |
+| 1 対の書き込み滞留・送信キューの上限 | 256 KiB（超えると読み取りを止める） | `max_pending_bytes` |
+| 転送先への書き込みが進まないまま滞留してよい時間（対ごと） | 30 秒 | `write_stall_timeout` |
+| blocking の dial の同時件数（ハンドラ全体） | 32（1..=256。取れなければ接続失敗） | `max_inflight_dials` |
+
+- 転送先が TCP を読まない対は、滞留が上限に達すると SPDY 接続全体の読み取りが止まり、別の対の DATA・RST_STREAM も処理できなくなる。`write_stall_timeout` の間書き込みが 1 バイトも進まなければ、その対を RST_STREAM(CANCEL) で閉じて滞留分を捨て、受信を再開する（書き込みが進む遅い転送先は打ち切らない。REPAIR-5）。試験は `cri6_stalled_target_does_not_block_other_pairs_or_rst_stream`
+- blocking の dial の枠は `PortForwardHandler` が持ち、全セッションで共有する。枠は `spawn_blocking` の処理が終わるまで返らないため、future の破棄・期限切れ・セッションの張り直しで上限を超えて積めない。残余: 起動済み・待機中の blocking 処理そのものは取り消せない（dialer の `timeout` に委ねる）
+
+- ヘッダブロックの上限と SPDY/3 の zlib 辞書（出典と帰属表示）は共通 codec（`spdy`・`spdy_dictionary`）の記述に従う。超えたら GOAWAY(PROTOCOL_ERROR) で切断する
+- 観測: セッションの終了理由（`PortForwardEnd`）を `PortForwardObserver` に渡す。ポート・トークン・アドレスは載せない
+
+## #680 に残るもの
+
+- Exec のハンドラ本体（SPDY の codec・remotecommand の部品・`StreamDispatcher`・`SessionLimits` は再利用する。Exec は `RemoteCommand` の v4 の終了コード付き Status が要る）
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
 - kubelet / crictl の実クライアントでの照合（#683 の実機前提試験）

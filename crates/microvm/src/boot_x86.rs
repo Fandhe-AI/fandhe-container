@@ -396,46 +396,67 @@ pub fn plan_boot(
     let relocated = || -> Result<u64, MicrovmError> {
         align_up(HIMEM_START, align).ok_or_else(|| invalid("kernel load address overflows"))
     };
-    // relocatable で pref_address 配置が RAM に収まらないときは再配置先（1 MiB を alignment で切り上げた位置）へ
-    // フォールバックする。非 relocatable は pref_address 固定のため収まらなければ下で拒否する。
-    let (load_addr, kernel_end) = if pref_usable {
-        let end = range_end(pref)?;
-        if header.relocatable && align_ok && end > mem_len {
-            let alt = relocated()?;
-            (alt, range_end(alt)?)
-        } else {
-            (pref, end)
+    // 配置の候補を優先順に並べ、カーネルと initrd の両方が収まる最初の候補を採る。
+    // relocatable は pref_address で収まらない場合（カーネル単体・initrd のどちらでも）再配置先
+    // （1 MiB を alignment で切り上げた位置）を試す。非 relocatable は pref_address 固定。
+    let mut candidates: [Option<u64>; 2] = [None, None];
+    if pref_usable {
+        candidates[0] = Some(pref);
+        if header.relocatable && align_ok {
+            candidates[1] = Some(relocated()?);
         }
     } else if header.relocatable && align_ok {
-        let alt = relocated()?;
-        (alt, range_end(alt)?)
+        candidates[0] = Some(relocated()?);
     } else {
         return Err(invalid(
             "kernel cannot be placed (alignment or preferred address)",
         ));
-    };
-    if kernel_end > mem_len {
-        return Err(err(
-            MicrovmErrorCode::ResourceExhausted,
-            "kernel does not fit in guest memory",
-        ));
     }
-    let initrd = match initrd_len {
-        None => None,
-        Some(0) => return Err(invalid("initrd must not be empty")),
-        Some(len) => {
-            let top = mem_len.min(u64::from(header.initrd_addr_max) + 1);
-            let start = top
-                .checked_sub(len)
-                .map(|s| s & !(INITRD_ALIGN - 1))
-                .filter(|s| *s >= kernel_end)
-                .ok_or_else(|| {
-                    err(
-                        MicrovmErrorCode::ResourceExhausted,
-                        "initrd does not fit in guest memory",
-                    )
-                })?;
-            Some((start, len))
+    let place = |load_addr: u64| -> Result<(u64, Option<(u64, u64)>), MicrovmError> {
+        let kernel_end = range_end(load_addr)?;
+        if kernel_end > mem_len {
+            return Err(err(
+                MicrovmErrorCode::ResourceExhausted,
+                "kernel does not fit in guest memory",
+            ));
+        }
+        let initrd = match initrd_len {
+            None => None,
+            Some(0) => return Err(invalid("initrd must not be empty")),
+            Some(len) => {
+                let top = mem_len.min(u64::from(header.initrd_addr_max) + 1);
+                let start = top
+                    .checked_sub(len)
+                    .map(|s| s & !(INITRD_ALIGN - 1))
+                    .filter(|s| *s >= kernel_end)
+                    .ok_or_else(|| {
+                        err(
+                            MicrovmErrorCode::ResourceExhausted,
+                            "initrd does not fit in guest memory",
+                        )
+                    })?;
+                Some((start, len))
+            }
+        };
+        Ok((kernel_end, initrd))
+    };
+    let mut chosen = None;
+    let mut first_err: Option<MicrovmError> = None;
+    for load_addr in candidates.into_iter().flatten() {
+        match place(load_addr) {
+            Ok((end, initrd)) => {
+                chosen = Some((load_addr, end, initrd));
+                break;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    let (load_addr, kernel_end, initrd) = match chosen {
+        Some(c) => c,
+        None => {
+            return Err(first_err.unwrap_or_else(|| invalid("kernel cannot be placed")));
         }
     };
     Ok(BootPlan {
@@ -541,6 +562,12 @@ pub fn load_linux<B: GuestMemoryBacking>(
         .get(header.payload_offset..)
         .ok_or_else(|| invalid("kernel image has no protected-mode part"))?;
     let payload_len = payload.len() as u64;
+    // 返す entry（load_addr + ENTRY_64_OFFSET）が書き込む payload の内側であることを書き込み前に保証する。
+    if payload_len <= ENTRY_64_OFFSET {
+        return Err(invalid(
+            "kernel protected-mode part does not contain the 64-bit entry point",
+        ));
+    }
     let plan = plan_boot(
         &header,
         payload_len,
@@ -947,6 +974,33 @@ mod tests {
     }
 
     /// MVM-1・TASK-75.3.1: 不正・非対応のイメージは書き込みの前に具体的な code と message で拒否される。
+    /// MVM-1・TASK-75.3.1: initrd が優先配置に収まらないだけでも、relocatable は再配置先で initrd ごと置く。
+    #[test]
+    fn mvm1_884_relocates_when_only_initrd_does_not_fit() {
+        let img = Img {
+            pref: 16 * MIB,
+            ..Img::default()
+        }
+        .build();
+        let initrd = vec![0xAB; (48 * MIB) as usize];
+        let mut m = mem(64 * MIB);
+        let l = load_linux(&mut m, &img, Some(&initrd), &cmd("")).unwrap();
+        assert_eq!(l.kernel_addr, GuestAddress::new(0x20_0000));
+        assert_eq!(l.initrd.unwrap().0, GuestAddress::new(16 * MIB));
+    }
+
+    /// MVM-1・TASK-75.3.1: 64-bit エントリ位置を含まない payload は書き込み前に InvalidArgument で拒否する。
+    #[test]
+    fn mvm1_884_rejects_payload_without_entry_point() {
+        let mut img = Img::default().build();
+        // payload を 1 バイトだけ残して切り詰める。
+        let setup = (usize::from(Img::default().setup_sects) + 1) * 512;
+        img.truncate(setup + 1);
+        let mut m = mem(64 * MIB);
+        let e = load_linux(&mut m, &img, None, &cmd("")).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    }
+
     #[test]
     fn mvm1_884_rejects_invalid_images() {
         let inv = MicrovmErrorCode::InvalidArgument;

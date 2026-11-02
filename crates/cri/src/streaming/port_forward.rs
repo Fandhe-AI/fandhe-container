@@ -95,6 +95,10 @@ pub struct PortForwardConfig {
     /// 転送先への書き込み滞留量（全対の合計）と送信キューの上限。超えている間は SPDY 接続の読み取りを止める
     /// （バックプレッシャー。1 フレームが上限を超えても、`max_frame_bytes` 以内なら受け取って TCP へ排出する）。既定 256 KiB。
     pub max_pending_bytes: usize,
+    /// ハンドラ全体（全セッション合計）で同時に持てる blocking の dial の件数（実行中と待機中の合計）。既定 32。
+    ///
+    /// future を捨てても blocking 処理は止まらないため、セッションを張り直しても枠は返らない（REPAIR-5）。
+    pub max_inflight_dials: usize,
 }
 
 impl Default for PortForwardConfig {
@@ -106,6 +110,7 @@ impl Default for PortForwardConfig {
             max_streams: 128,
             max_frame_bytes: 1024 * 1024,
             max_pending_bytes: 256 * 1024,
+            max_inflight_dials: 32,
         }
     }
 }
@@ -132,6 +137,11 @@ impl PortForwardConfig {
         if self.max_pending_bytes < DATA_CHUNK {
             return Err(CriError::invalid_argument(
                 "port forward max_pending_bytes is too small",
+            ));
+        }
+        if !(1..=256).contains(&self.max_inflight_dials) {
+            return Err(CriError::invalid_argument(
+                "port forward max_inflight_dials must be between 1 and 256",
             ));
         }
         Ok(())
@@ -173,6 +183,8 @@ pub struct PortForwardHandler {
     config: PortForwardConfig,
     fallback: Arc<dyn StreamHandler>,
     observer: Arc<dyn PortForwardObserver>,
+    /// blocking の dial の実行中・待機中の件数。全セッションで共有する（`DialSlot` が増減する）。
+    dial_inflight: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for PortForwardHandler {
@@ -195,6 +207,7 @@ impl PortForwardHandler {
             config,
             fallback: Arc::new(NotImplementedHandler),
             observer: Arc::new(NoopPortForwardObserver),
+            dial_inflight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -224,6 +237,7 @@ impl PortForwardHandler {
         let dialer = Arc::clone(&self.dialer);
         let observer = Arc::clone(&self.observer);
         let config = self.config.clone();
+        let dial_inflight = Arc::clone(&self.dial_inflight);
         // 0 は有効なポートに一致しないので、範囲外の値が一覧から消えて「任意」に化けることはない。
         let allowed: Vec<u16> = request
             .port
@@ -235,7 +249,14 @@ impl PortForwardHandler {
             let started = Instant::now();
             let end = match on_upgrade.await {
                 Ok(upgraded) => {
-                    match Session::new(TokioIo::new(upgraded), dialer, sandbox, allowed, config) {
+                    match Session::new(
+                        TokioIo::new(upgraded),
+                        dialer,
+                        sandbox,
+                        allowed,
+                        config,
+                        dial_inflight,
+                    ) {
                         Some(session) => session.run().await,
                         None => PortForwardEnd::ProtocolError,
                     }
@@ -443,7 +464,7 @@ struct Session<IO> {
     last_activity: Instant,
     /// 対の処理を始める位置。毎回進めて、送信キューの空きを先頭の対が独占しないようにする。
     pair_cursor: usize,
-    /// blocking の dial の実行中・待機中の件数（`DialSlot` が増減する）。
+    /// blocking の dial の実行中・待機中の件数（`DialSlot` が増減する）。ハンドラの全セッションで共有する。
     dial_inflight: Arc<AtomicUsize>,
     tick: Pin<Box<Sleep>>,
     tick_every: Duration,
@@ -457,6 +478,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
         sandbox: String,
         allowed: Vec<u16>,
         config: PortForwardConfig,
+        dial_inflight: Arc<AtomicUsize>,
     ) -> Option<Self> {
         let tick_every = (config.pair_timeout.min(config.idle_timeout) / 4)
             .clamp(Duration::from_millis(10), Duration::from_secs(1));
@@ -479,7 +501,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             scratch: vec![0u8; DATA_CHUNK],
             last_activity: Instant::now(),
             pair_cursor: 0,
-            dial_inflight: Arc::new(AtomicUsize::new(0)),
+            dial_inflight,
             tick: Box::pin(tokio::time::sleep(tick_every)),
             tick_every,
             end: None,
@@ -776,7 +798,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             && matches!(pair.phase, Phase::Waiting)
         {
             // 対のキャンセル後も blocking の dial は残るため、総数に上限を設ける。取れなければ接続失敗として扱う。
-            let slot = DialSlot::acquire(&self.dial_inflight, (self.config.max_streams / 2).max(1));
+            let slot = DialSlot::acquire(&self.dial_inflight, self.config.max_inflight_dials);
             pair.phase = Phase::Dialing(make_dial(
                 Arc::clone(&self.dialer),
                 self.sandbox.clone(),
@@ -1094,6 +1116,14 @@ mod tests {
                 max_pending_bytes: 10,
                 ..Default::default()
             },
+            PortForwardConfig {
+                max_inflight_dials: 0,
+                ..Default::default()
+            },
+            PortForwardConfig {
+                max_inflight_dials: 257,
+                ..Default::default()
+            },
         ];
         for cfg in bad {
             assert_eq!(
@@ -1101,5 +1131,76 @@ mod tests {
                 crate::error::CriErrorCode::InvalidArgument
             );
         }
+    }
+
+    /// 門（フラグ）が開くまで blocking プール上で待つ dialer（枠の共有の試験用）。
+    struct BlockingDialer {
+        open: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PortForwardDialer for BlockingDialer {
+        fn dial(
+            &self,
+            _pod_sandbox_id: &str,
+            _port: u16,
+            _timeout: Duration,
+        ) -> Result<std::net::TcpStream, CriError> {
+            while !self.open.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(CriError::invalid_argument("test dial refused"))
+        }
+    }
+
+    /// CRI-6・REPAIR-5・TASK-63.4: 遅い dial を残したままセッションを張り直しても、
+    /// 同時に走る blocking の dial はハンドラの上限（ここでは 2）を超えず、future を捨てても
+    /// blocking 処理が終わるまで枠は返らない。
+    #[tokio::test]
+    async fn cri6_dial_slots_are_shared_across_sessions_until_blocking_ends() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialer: Arc<dyn PortForwardDialer> = Arc::new(BlockingDialer {
+            open: Arc::clone(&open),
+        });
+        let handler = PortForwardHandler::new(
+            Arc::clone(&dialer),
+            PortForwardConfig {
+                max_inflight_dials: 2,
+                ..Default::default()
+            },
+        )
+        .expect("handler");
+        let limit = handler.config.max_inflight_dials;
+        assert_eq!(limit, 2);
+
+        // セッション 1 と、張り直したセッション 2 が同じ枠（ハンドラ共有）を使う。
+        let mut handles = Vec::new();
+        for _session in 0..2 {
+            let slot = DialSlot::acquire(&handler.dial_inflight, limit);
+            assert!(slot.is_some());
+            let fut = make_dial(
+                Arc::clone(&dialer),
+                "sb".to_string(),
+                80,
+                Duration::from_millis(50),
+                slot,
+            );
+            handles.push(tokio::spawn(fut));
+        }
+        for h in handles {
+            // timeout で future は完了・破棄されるが、blocking は門で止まったまま。
+            assert!(h.await.expect("join").is_err());
+        }
+        assert_eq!(handler.dial_inflight.load(Ordering::Acquire), 2);
+        assert!(DialSlot::acquire(&handler.dial_inflight, limit).is_none());
+
+        open.store(true, Ordering::Release);
+        for _ in 0..300 {
+            if handler.dial_inflight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(handler.dial_inflight.load(Ordering::Acquire), 0);
+        assert!(DialSlot::acquire(&handler.dial_inflight, limit).is_some());
     }
 }

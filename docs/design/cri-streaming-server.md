@@ -79,6 +79,9 @@ Upgrade 後の idle の期限は #680〜#682 が決める。接続は 1 要求�
 | 同時ストリーム数 | 128 | `max_streams` |
 | 受けるフレーム本体の最大長 | 1 MiB | `max_frame_bytes` |
 | 1 対の書き込み滞留・送信キューの上限 | 256 KiB（超えると読み取りを止める） | `max_pending_bytes` |
+| blocking の dial の同時件数（ハンドラ全体） | 32（1..=256。取れなければ接続失敗） | `max_inflight_dials` |
+
+- blocking の dial の枠は `PortForwardHandler` が持ち、全セッションで共有する。枠は `spawn_blocking` の処理が終わるまで返らないため、future の破棄・期限切れ・セッションの張り直しで上限を超えて積めない。残余: 起動済み・待機中の blocking 処理そのものは取り消せない（dialer の `timeout` に委ねる）
 
 - ヘッダブロックの上限: 展開後 64 KiB・64 件・名前と値は各 8 KiB。超えたら GOAWAY(PROTOCOL_ERROR) で切断する
 - SPDY/3 の zlib 辞書（1423 バイト）は SPDY Protocol Draft 3 の 2.6.10.1 節（<https://datatracker.ietf.org/doc/html/draft-mbelshe-httpbis-spdy-00#section-2.6.10.1>）を一次情報にして作り、実装コードからは写していない。長さと Adler-32（`0xe3c6a7c2`）を試験で固定している。帰属表示の要否は PR でユーザー確認に残す（licensing.md「非 Cargo 資産」）

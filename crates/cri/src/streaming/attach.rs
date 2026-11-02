@@ -31,6 +31,7 @@ use hyper::{Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
+use tonic::Code;
 
 use super::remotecommand::{
     HEADER_STREAM_TYPE, Protocol, ResizeParser, SessionLimits, StreamOptions, StreamType,
@@ -42,7 +43,10 @@ use super::spdy::{
 };
 use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
 use crate::error::CriError;
+use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 
+/// 消費済みの先頭領域をこの大きさ以上溜めたら詰め直す（部分書き込みが続いても確保量を有界にする）。
+const COMPACT_THRESHOLD: usize = 32 * 1024;
 /// 1 回の IO 読み取りの大きさ。
 const IO_CHUNK: usize = 16 * 1024;
 /// 出力バッファがこれを超えている間は、backend の出力とクライアントの入力を読まない（背圧）。
@@ -112,6 +116,7 @@ pub trait AttachBackend: Send + Sync + 'static {
 pub struct AttachHandler {
     backend: Arc<dyn AttachBackend>,
     limits: SessionLimits,
+    recorder: Arc<dyn CriOpRecorder>,
 }
 
 impl std::fmt::Debug for AttachHandler {
@@ -126,7 +131,17 @@ impl AttachHandler {
     /// backend と期限を指定して作る。期限は `StreamingConfig::session_limits()` の値を渡す。
     pub fn new(backend: Arc<dyn AttachBackend>, limits: SessionLimits) -> Result<Self, CriError> {
         limits.validate()?;
-        Ok(Self { backend, limits })
+        Ok(Self {
+            backend,
+            limits,
+            recorder: Arc::new(NoopCriOpRecorder),
+        })
+    }
+
+    /// セッションの結果・所要時間・読み書きの成否の記録先を指定する（REPAIR-4）。既定は記録しない。
+    pub fn with_recorder(mut self, recorder: Arc<dyn CriOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 }
 
@@ -157,12 +172,14 @@ impl StreamHandler for AttachHandler {
             let on_upgrade = hyper::upgrade::on(http);
             let backend = Arc::clone(&self.backend);
             let limits = self.limits;
+            let recorder = Arc::clone(&self.recorder);
             tokio::spawn(async move {
                 // 同時接続数の枠は IO の寿命まで保持する（`StreamHandler::handle` の契約）。
                 let _permit = permit;
                 let Ok(upgraded) = on_upgrade.await else {
                     return;
                 };
+                // 終わり方・所要時間・読み書きの成否は run_session が recorder へ記録する。
                 let _end = run_session(
                     TokioIo::new(upgraded),
                     protocol,
@@ -170,6 +187,7 @@ impl StreamHandler for AttachHandler {
                     target,
                     backend,
                     limits,
+                    recorder,
                 )
                 .await;
             });
@@ -266,6 +284,15 @@ enum Phase {
     Draining,
 }
 
+/// セッション内の読み書きの成否（記録用。値のみで内容は持たない）。
+#[derive(Debug, Default, Clone, Copy)]
+struct IoStats {
+    read_ok: bool,
+    read_failed: bool,
+    write_ok: bool,
+    write_failed: bool,
+}
+
 type BackendFuture = Pin<Box<dyn Future<Output = Result<AttachSession, CriError>> + Send>>;
 
 struct Session<IO> {
@@ -291,6 +318,12 @@ struct Session<IO> {
     stdin_pending: Vec<u8>,
     stdin_pos: usize,
     stdin_fin: bool,
+    /// RST_STREAM を受けたストリーム。以後そのストリームへは何も送らない。
+    reset_ids: Vec<StreamId>,
+    /// backend の出力の読み取りが失敗した（出力欠損。Success Status を返さない）。
+    output_failed: bool,
+    started: Instant,
+    stats: IoStats,
     stdout_reader: Option<Box<dyn AsyncRead + Send + Unpin>>,
     stderr_reader: Option<Box<dyn AsyncRead + Send + Unpin>>,
     stdout_fin_sent: bool,
@@ -314,6 +347,7 @@ pub(super) async fn run_session<IO>(
     target: AttachTarget,
     backend: Arc<dyn AttachBackend>,
     limits: SessionLimits,
+    recorder: Arc<dyn CriOpRecorder>,
 ) -> SessionEnd
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send,
@@ -321,6 +355,7 @@ where
     let mut session = Session::new(io, protocol, options, target, backend, limits);
     let end = poll_fn(|cx| session.poll_step(cx)).await;
     session.finish(end).await;
+    session.record(end, recorder.as_ref());
     end
 }
 
@@ -360,6 +395,10 @@ where
             stdin_pending: Vec::new(),
             stdin_pos: 0,
             stdin_fin: false,
+            reset_ids: Vec::new(),
+            output_failed: false,
+            started: now,
+            stats: IoStats::default(),
             stdout_reader: None,
             stderr_reader: None,
             stdout_fin_sent: false,
@@ -374,6 +413,42 @@ where
             idle: Box::pin(tokio::time::sleep_until(now + limits.stream_idle_timeout)),
             drain: None,
         }
+    }
+
+    /// セッションの結果・所要時間と、読み書きの成否を記録先へ渡す（REPAIR-4。ID・トークン・内容は渡さない）。
+    fn record(&self, end: SessionEnd, recorder: &dyn CriOpRecorder) {
+        let latency = self.started.elapsed();
+        let code = match end {
+            SessionEnd::Finished if self.output_failed => Code::Internal,
+            SessionEnd::Finished => Code::Ok,
+            SessionEnd::ClientClosed => Code::Cancelled,
+            SessionEnd::CreationTimeout | SessionEnd::IdleTimeout => Code::DeadlineExceeded,
+            SessionEnd::ProtocolError => Code::InvalidArgument,
+            SessionEnd::BackendFailed | SessionEnd::IoError => Code::Unavailable,
+        };
+        recorder.record_cri_op(&CriOpSample::new(CriOpKind::AttachSession, code, latency));
+        for (kind, ok, failed) in [
+            (
+                CriOpKind::AttachStreamRead,
+                self.stats.read_ok,
+                self.stats.read_failed,
+            ),
+            (
+                CriOpKind::AttachStreamWrite,
+                self.stats.write_ok,
+                self.stats.write_failed,
+            ),
+        ] {
+            if failed {
+                recorder.record_cri_op(&CriOpSample::new(kind, Code::Unavailable, latency));
+            } else if ok {
+                recorder.record_cri_op(&CriOpSample::new(kind, Code::Ok, latency));
+            }
+        }
+    }
+
+    fn is_reset(&self, id: StreamId) -> bool {
+        self.reset_ids.contains(&id)
     }
 
     fn touch(&mut self) {
@@ -392,6 +467,10 @@ where
 
     /// DATA を `MAX_OUTGOING_DATA` ごとに分けて積む。
     fn queue_data(&mut self, stream_id: StreamId, data: &[u8], fin: bool) -> bool {
+        // RST_STREAM 済みのストリームへは送らない。
+        if self.is_reset(stream_id) {
+            return true;
+        }
         if data.is_empty() {
             return !fin
                 || self.queue(&Frame::Data {
@@ -424,6 +503,11 @@ where
                 Poll::Ready(Ok(n)) => {
                     self.out_pos += n;
                     progress = true;
+                    // 消費済みの先頭領域を溜め続けない（部分書き込みが続いても確保量を有界にする）。
+                    if self.out_pos >= COMPACT_THRESHOLD {
+                        self.out.drain(..self.out_pos);
+                        self.out_pos = 0;
+                    }
                 }
                 Poll::Pending => return Ok(progress),
             }
@@ -575,6 +659,9 @@ where
                 data,
             } => self.client_data(stream_id, fin, &data),
             Frame::RstStream { stream_id, .. } => {
+                if !self.reset_ids.contains(&stream_id) {
+                    self.reset_ids.push(stream_id);
+                }
                 match self.opened.kind_of(stream_id) {
                     Some(StreamType::Stdin) => self.stdin_fin = true,
                     Some(StreamType::Stdout) => self.stdout_reader = None,
@@ -705,6 +792,17 @@ where
         self.stdout_reader = if self.options.stdout { stdout } else { None };
         self.stderr_reader = if self.options.stderr { stderr } else { None };
         self.resize_fn = if self.options.tty { resize } else { None };
+        // 接続前に RST_STREAM を受けたストリームは再開しない。
+        if self.opened.stdout.is_some_and(|id| self.is_reset(id)) {
+            self.stdout_reader = None;
+        }
+        if self.opened.stderr.is_some_and(|id| self.is_reset(id)) {
+            self.stderr_reader = None;
+        }
+        if self.opened.stdin.is_some_and(|id| self.is_reset(id)) {
+            self.stdin_writer = None;
+            self.stdin_fin = true;
+        }
         if let (Some(resize), Some(size)) = (self.resize_fn.as_mut(), self.pending_resize.take()) {
             resize(size);
         }
@@ -744,10 +842,17 @@ where
             match Pin::new(writer).poll_write(cx, pending) {
                 Poll::Ready(Ok(n)) if n > 0 => {
                     self.stdin_pos += n;
+                    self.stats.write_ok = true;
                     progress = true;
+                    // 消費済みの先頭領域を溜め続けない（backend が少量ずつ消費しても確保量を有界にする）。
+                    if self.stdin_pos >= COMPACT_THRESHOLD {
+                        self.stdin_pending.drain(..self.stdin_pos);
+                        self.stdin_pos = 0;
+                    }
                 }
                 // 書けない（backend が stdin を閉じた）。以降の入力は捨てる。
                 Poll::Ready(_) => {
+                    self.stats.write_failed = true;
                     self.stdin_writer = None;
                     self.stdin_pending.clear();
                     self.stdin_pos = 0;
@@ -788,6 +893,7 @@ where
                     if chunk.is_empty() {
                         true
                     } else {
+                        self.stats.read_ok = true;
                         let Some(id) = self.opened.get(kind) else {
                             continue;
                         };
@@ -798,8 +904,12 @@ where
                         false
                     }
                 }
-                // 読み取りの失敗は出力の終端として扱う。
-                Poll::Ready(Err(_)) => true,
+                // 読み取りの失敗は出力の欠損として保持し、Success Status を返さない（終端の FIN は送る）。
+                Poll::Ready(Err(_)) => {
+                    self.stats.read_failed = true;
+                    self.output_failed = true;
+                    true
+                }
             };
             if eof {
                 progress = true;
@@ -840,6 +950,11 @@ where
             SessionEnd::Finished | SessionEnd::BackendFailed => {
                 let status = match (end, self.failure.as_ref()) {
                     (SessionEnd::BackendFailed, Some(e)) => Some(status_failure(self.protocol, e)),
+                    // 固定メッセージ（下位のエラー文言は載せない）。
+                    _ if self.output_failed => Some(status_failure(
+                        self.protocol,
+                        &CriError::internal("attach output read failed"),
+                    )),
                     _ => status_success(self.protocol),
                 };
                 self.queue_final(status, last_good)

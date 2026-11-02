@@ -286,8 +286,9 @@ fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
 }
 
 fn read_u24(buf: &[u8], at: usize) -> Option<usize> {
-    let slice = buf.get(at..at.checked_add(3)?)?;
-    Some((usize::from(slice[0]) << 16) | (usize::from(slice[1]) << 8) | usize::from(slice[2]))
+    let bytes: [u8; 3] = buf.get(at..at.checked_add(3)?)?.try_into().ok()?;
+    let [a, b, c] = bytes;
+    Some((usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c))
 }
 
 fn nonzero_stream_id(raw: u32) -> Result<StreamId, SpdyError> {

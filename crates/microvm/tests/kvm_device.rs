@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -627,4 +627,116 @@ fn kvm_device_guest_writes_registered_memory() {
         .expect("guest memory test did not finish within 30s")
         .unwrap();
     assert_eq!(byte, 0x5A);
+}
+
+/// MVM-1・TASK-75.2: デバイス・vCPU・メモリを 1 つの VM 構成体に組み立て、一貫した経路で触れること。
+/// 破棄後に同じ `KvmDevice` で再度組み立てられる（資源が解放されている）ことも確かめる（x86_64）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assemble_microvm() {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::interrupt::InterruptDelivery;
+    use fandhe_container_microvm::microvm::{
+        DeviceSlot, MicroVm, MicroVmConfig, NetDeviceConfig, QueueNotifyReport, VirtioDeviceKind,
+    };
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_mmio::{MAGIC_VALUE, reg};
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config = || MicroVmConfig {
+        vcpu_count: 2,
+        mem_size: 2 << 20,
+        block: vec![MemoryBlockBackend::new(16 * 512, false).unwrap()],
+        net: vec![NetDeviceConfig {
+            backend: MemoryNetBackend::new(),
+            mac: [0x02, 0, 0, 0, 0, 1],
+        }],
+    };
+    for _ in 0..2 {
+        let mut vm: MicroVm<_, _> = MicroVm::assemble(&dev, config()).unwrap();
+        let ids: Vec<u32> = vm.vcpus().iter().map(|v| v.id()).collect();
+        assert_eq!(ids, vec![0, 1]);
+        assert_eq!(vm.memory().base(), GuestAddress::new(0));
+        assert_eq!(vm.memory().len(), 2 << 20);
+        vm.memory_mut()
+            .write_at(GuestAddress::new(0x1000), &[0xDE, 0xAD, 0xBE, 0xEF])
+            .unwrap();
+        assert_eq!(
+            vm.memory().read_u32_le(GuestAddress::new(0x1000)).unwrap(),
+            0xEFBE_ADDE
+        );
+        let infos = vm.devices();
+        assert_eq!(
+            infos.iter().map(|i| i.slot).collect::<Vec<_>>(),
+            vec![
+                DeviceSlot {
+                    kind: VirtioDeviceKind::Block,
+                    index: 0,
+                    mmio_base: 0xd000_0000,
+                    mmio_len: 0x1000,
+                    gsi: 5,
+                },
+                DeviceSlot {
+                    kind: VirtioDeviceKind::Net,
+                    index: 0,
+                    mmio_base: 0xd000_1000,
+                    mmio_len: 0x1000,
+                    gsi: 6,
+                },
+            ]
+        );
+        let mut buf = [0u8; 4];
+        vm.with_block(0, |t| t.read(reg::MAGIC, &mut buf)).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), MAGIC_VALUE);
+        vm.with_net(0, |t| t.read(reg::DEVICE_ID, &mut buf))
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 1);
+        match vm.complete_queue_notify(infos[0].id, 0).unwrap() {
+            QueueNotifyReport::Block(r) => assert_eq!(r.delivery, InterruptDelivery::NotNeeded),
+            other => panic!("unexpected report: {other:?}"),
+        }
+        assert_eq!(
+            vm.with_block(1, |_| ()).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        let exit = fandhe_container_microvm::exit::VcpuExit::Hlt;
+        assert_eq!(
+            vm.handle_exit(2, &exit).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+}
+
+/// MVM-1・TASK-75.2: x86_64 以外では組み立てが最初の ioctl より前に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assemble_microvm() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
 }

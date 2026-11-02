@@ -588,12 +588,27 @@ impl VmFd {
     ///
     /// irqchip を先に作ること（無いと `FailedPrecondition`）。GSI の範囲はカーネルの検証に任せる。
     /// 同じ組の二重登録は `AlreadyExists`。割り込みは edge 扱い（level の再注入は未実装）。
-    pub fn register_irqfd(&self, gsi: u32) -> Result<IrqFd<'_>, MicrovmError> {
+    pub fn register_irqfd(&self, gsi: u32) -> Result<IrqFd, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IRQFD, "KVM_CAP_IRQFD")?;
+        // 順序は dup → eventfd 作成 → KVM_IRQFD（dup に失敗しても何も漏らさない。TASK-75.2）。
+        let vm_fd = self.fd.as_fd().try_clone_to_owned().map_err(|e| {
+            let n = e.raw_os_error().unwrap_or(0);
+            if n == EMFILE || n == ENFILE {
+                MicrovmError::new(
+                    MicrovmErrorCode::ResourceExhausted,
+                    format!("resource exhausted duplicating VM fd for irqfd (os error {n})"),
+                )
+            } else {
+                MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    format!("duplicating VM fd for irqfd failed (os error {n})"),
+                )
+            }
+        })?;
         let event = EventFd::new()?;
         sys::kvm_irqfd(self.fd.as_fd(), event.as_fd(), gsi, false)
             .map_err(|e| classify_irq_error(IrqStage::Irqfd, e))?;
-        Ok(IrqFd::registered(self.fd.as_fd(), event, gsi))
+        Ok(IrqFd::registered(vm_fd, event, gsi))
     }
 
     /// ゲストの `spec` への書き込みを VM exit なしで eventfd へ通す（`KVM_IOEVENTFD`）。

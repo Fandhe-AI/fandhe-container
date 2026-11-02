@@ -395,6 +395,16 @@ impl<B: BlockBackend> VirtioBlock<B> {
                 };
             }
         }
+        // FLUSH 未合意のドライバには書き込みキャッシュが無いデバイスに見える（CONFIG_WCE を
+        // 提供しない）ため、成功応答の前に永続化する（writethrough。MVM-1）。
+        if !read
+            && !self
+                .negotiated
+                .contains(FeatureBits::from_bits(VIRTIO_BLK_F_FLUSH))
+            && self.backend.flush().is_err()
+        {
+            return (Some(VIRTIO_BLK_S_IOERR), written);
+        }
         (Some(VIRTIO_BLK_S_OK), written)
     }
 }
@@ -670,6 +680,91 @@ mod tests {
         request(&mut m, VIRTIO_BLK_T_FLUSH, 0, 0, 0);
         assert_eq!(b.process_queue(&mut m).unwrap().unsupp, 1);
         assert_eq!(status(&m), VIRTIO_BLK_S_UNSUPP);
+    }
+
+    /// flush の回数と失敗を制御できる backend（試験用）。
+    struct FlushSpy {
+        inner: MemoryBlockBackend,
+        flushes: u32,
+        fail_flush: bool,
+    }
+
+    impl BlockBackend for FlushSpy {
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.capacity_bytes()
+        }
+        fn read_only(&self) -> bool {
+            self.inner.read_only()
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
+            self.inner.write_at(offset, data)
+        }
+        fn flush(&mut self) -> Result<(), MicrovmError> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(invalid("flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn spy_block(features: u64, fail_flush: bool) -> VirtioBlock<FlushSpy> {
+        let mut b = VirtioBlock::new(FlushSpy {
+            inner: MemoryBlockBackend::new(8192, false).unwrap(),
+            flushes: 0,
+            fail_flush,
+        });
+        b.activate(
+            FeatureBits::from_bits(features),
+            &[queue_cfg(DESC, AVAIL, USED)],
+        )
+        .unwrap();
+        b
+    }
+
+    /// MVM-1: FLUSH 未合意の OUT は成功応答前に backend.flush を 1 回呼ぶ。
+    #[test]
+    fn mvm1_write_without_flush_feature_is_writethrough() {
+        let mut m = new_mem();
+        let mut b = spy_block(REQUIRED, false);
+        request(&mut m, VIRTIO_BLK_T_OUT, 0, 512, 0);
+        assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
+        assert_eq!(status(&m), VIRTIO_BLK_S_OK);
+        assert_eq!(b.backend().flushes, 1);
+    }
+
+    /// MVM-1: FLUSH 未合意で flush が失敗した OUT は IOERR。
+    #[test]
+    fn mvm1_write_without_flush_feature_flush_failure_is_ioerr() {
+        let mut m = new_mem();
+        let mut b = spy_block(REQUIRED, true);
+        request(&mut m, VIRTIO_BLK_T_OUT, 0, 512, 0);
+        assert_eq!(b.process_queue(&mut m).unwrap().ioerr, 1);
+        assert_eq!(status(&m), VIRTIO_BLK_S_IOERR);
+        assert_eq!(b.backend().flushes, 1);
+    }
+
+    /// MVM-1: FLUSH 合意時は OUT で flush を呼ばず、IN でも呼ばない。
+    #[test]
+    fn mvm1_write_with_flush_feature_does_not_flush() {
+        let mut m = new_mem();
+        let mut b = spy_block(REQUIRED | VIRTIO_BLK_F_FLUSH, true);
+        request(&mut m, VIRTIO_BLK_T_OUT, 0, 512, 0);
+        assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
+        assert_eq!(b.backend().flushes, 0);
+    }
+
+    /// MVM-1: FLUSH 未合意でも IN は flush を呼ばない。
+    #[test]
+    fn mvm1_read_without_flush_feature_does_not_flush() {
+        let mut m = new_mem();
+        let mut b = spy_block(REQUIRED, true);
+        request(&mut m, VIRTIO_BLK_T_IN, 0, 512, W);
+        assert_eq!(b.process_queue(&mut m).unwrap().ok, 1);
+        assert_eq!(b.backend().flushes, 0);
     }
 
     /// MVM-1: 途中で壊れたチェーンに当たっても、先に完了した要求の内訳を取れる。

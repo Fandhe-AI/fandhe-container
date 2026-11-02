@@ -450,6 +450,43 @@ mod unix_impl {
         if meta.mode() & 0o077 != 0 {
             return Err(failed("socket dir permissions are too open"));
         }
+        check_ancestors(dir)
+    }
+
+    /// 祖先ディレクトリの信頼性を確かめる（PLUG-12・SEC-1）。最終要素だけの検査では、祖先を持つ別ユーザーが
+    /// 検証後にディレクトリを rename して差し替え、後続の lock・socket・ops.log の操作（パスの再解決）を別の場所へ
+    /// 向けられるため、パスを変更できる主体を現在のユーザーと root に限る。
+    /// - 元のパスの祖先の symlink は root 所有のもの（macOS の `/tmp` → `/private/tmp` 等）だけ許す
+    /// - 解決後の祖先は、所有者が現在のユーザーか root であること
+    /// - 他ユーザーが書ける祖先は、スティッキーかつ経路上の子が現在のユーザー所有（他人が rename・削除できない）の場合だけ許す
+    fn check_ancestors(dir: &Path) -> Result<(), CriError> {
+        let euid = crate::sys::effective_uid();
+        for a in dir.ancestors().skip(1) {
+            let m =
+                fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
+            if m.file_type().is_symlink() && m.uid() != 0 {
+                return Err(failed("socket dir ancestor is a symlink not owned by root"));
+            }
+        }
+        let canon = fs::canonicalize(dir).map_err(|_| internal("cannot resolve socket dir"))?;
+        let mut child = canon.as_path();
+        for a in canon.ancestors().skip(1) {
+            let m =
+                fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
+            if !m.is_dir() {
+                return Err(failed("socket dir ancestor is not a directory"));
+            }
+            if m.uid() != euid && m.uid() != 0 {
+                return Err(failed("socket dir ancestor is owned by another user"));
+            }
+            if m.mode() & 0o022 != 0 {
+                let child_owned = fs::symlink_metadata(child).is_ok_and(|c| c.uid() == euid);
+                if m.mode() & 0o1000 == 0 || !child_owned {
+                    return Err(failed("socket dir ancestor is writable by other users"));
+                }
+            }
+            child = a;
+        }
         Ok(())
     }
 

@@ -194,3 +194,67 @@ fn repair4_872_concurrent_ops_log_keeps_every_line() {
     assert_eq!(log.lines().count(), 8, "{log}");
     assert!(log.lines().all(|l| l.starts_with('{') && l.ends_with('}')));
 }
+
+/// 上書き先 `dir` で `action` を実行する（祖先検査の試験用）。
+fn run_in(sc: &Scratch, dir: &std::path::Path, id: &str, action: &str) -> Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "-namespace",
+        "default",
+        "-address",
+        "/run/containerd/containerd.sock",
+        "-id",
+        id,
+    ])
+    .args(if action == "delete" {
+        vec!["-bundle", "/tmp/b"]
+    } else {
+        vec![]
+    })
+    .arg(action)
+    .env("FANDHE_CONTAINER_SHIM_SOCKET_DIR", dir)
+    .current_dir(&sc.root)
+    .stdin(Stdio::null());
+    reap::output_within(&mut cmd, LIMIT).expect("shim child must exit")
+}
+
+/// PLUG-12・SEC-1・#872: 祖先が他ユーザー書き込み可（スティッキーなし）なら、最終要素が 0700 でも start / delete を拒否する。
+#[test]
+fn plug12_872_group_writable_ancestor_is_rejected() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let sc = Scratch::new();
+    let anc = sc.root.join("anc");
+    std::fs::DirBuilder::new().mode(0o700).create(&anc).unwrap();
+    let dir = anc.join("sock");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o770)).unwrap();
+    for action in ["start", "delete"] {
+        let out = run_in(&sc, &dir, "wa", action);
+        assert!(!out.status.success(), "{action}: {out:?}");
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
+
+/// PLUG-12・SEC-1・#872: 祖先が（利用者所有の）symlink なら拒否し、参照先へ socket・ログを作らない。
+#[test]
+fn plug12_872_symlinked_ancestor_is_rejected() {
+    use std::os::unix::fs::DirBuilderExt;
+    let sc = Scratch::new();
+    let real = sc.root.join("realanc");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&real)
+        .unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(real.join("sock"))
+        .unwrap();
+    let link = sc.root.join("linkanc");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let dir = link.join("sock");
+    for action in ["start", "delete"] {
+        let out = run_in(&sc, &dir, "sa", action);
+        assert!(!out.status.success(), "{action}: {out:?}");
+    }
+    assert_eq!(std::fs::read_dir(real.join("sock")).unwrap().count(), 0);
+}

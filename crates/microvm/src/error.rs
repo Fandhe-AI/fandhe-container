@@ -50,6 +50,8 @@ impl MicrovmErrorCode {
     ];
 
     /// ワイヤー・ログ用の文字列表現（`PluginErrorCode::as_str` と同じ表記）。
+    ///
+    /// ERR-1 では期限切れを `DEADLINE_EXCEEDED` ではなく `TIMEOUT` と表記する（TASK-75.4.2・#887）。
     pub const fn as_str(self) -> &'static str {
         match self {
             MicrovmErrorCode::NotFound => "NOT_FOUND",
@@ -60,7 +62,7 @@ impl MicrovmErrorCode {
             MicrovmErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             MicrovmErrorCode::AlreadyExists => "ALREADY_EXISTS",
             MicrovmErrorCode::Internal => "INTERNAL",
-            MicrovmErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            MicrovmErrorCode::DeadlineExceeded => "TIMEOUT",
         }
     }
 
@@ -154,10 +156,12 @@ mod tests {
         );
         assert_eq!(MicrovmErrorCode::AlreadyExists.as_str(), "ALREADY_EXISTS");
         assert_eq!(MicrovmErrorCode::Internal.as_str(), "INTERNAL");
+        assert_eq!(MicrovmErrorCode::DeadlineExceeded.as_str(), "TIMEOUT");
         assert_eq!(
-            MicrovmErrorCode::DeadlineExceeded.as_str(),
-            "DEADLINE_EXCEEDED"
+            MicrovmErrorCode::from_name("TIMEOUT"),
+            Some(MicrovmErrorCode::DeadlineExceeded)
         );
+        assert_eq!(MicrovmErrorCode::from_name("DEADLINE_EXCEEDED"), None);
         for c in MicrovmErrorCode::ALL {
             assert_eq!(MicrovmErrorCode::from_name(c.as_str()), Some(c));
         }

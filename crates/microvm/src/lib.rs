@@ -27,6 +27,7 @@
 //! RSI = boot_params。`unsafe` は `sys` の `KVM_{GET,SET}_{REGS,SREGS}` のみ）。
 //! TASK-75.4.1・MVM-1: `microvm::MicroVm::start` / `RunningMicroVm::stop`（vCPU 0 の実行ループ・停止要求のポーリング・
 //! 停止時の fd・mmap・irqfd の後始末。ゲスト起因の終了は `microvm::StopReason` で報告。`unsafe` なし）。
+//! TASK-75.4.2・#887・MVM-1・ERR-1: 起動途中の失敗でも取得済みの fd・mmap・irqfd を解放し、エラーは `error::MicrovmError`（`<CODE>: <message>`）で返す（期限切れの文字列表現は `TIMEOUT`。`unsafe` 追加なし）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
 //! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・CPUID / MSR / FPU / LAPIC の設定と AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。

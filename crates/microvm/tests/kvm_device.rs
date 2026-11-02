@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -1135,4 +1135,131 @@ fn kvm_device_start_stop_microvm() {
         MicroVm::assemble(&dev, config).unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
     );
+}
+/// MVM-1・TASK-75.4.2・#887: 起動の途中で失敗しても fd・mmap が解放され、エラーは ERR-1 の形（`<CODE>: <message>`）で返る。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_failure_releases_resources() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct Nop;
+    impl RunObserver for Nop {
+        fn record(&self, _record: &RunRecord) {}
+    }
+
+    type Vm = MicroVm<MemoryBlockBackend, MemoryNetBackend>;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let image = {
+        let mut img = vec![0u8; 5 * 512 + 0x1000];
+        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+        put(0x1F1, &[4]);
+        put(0x1FE, &0xAA55u16.to_le_bytes());
+        put(0x201, &[0x62]);
+        put(0x202, b"HdrS");
+        put(0x206, &0x020Fu16.to_le_bytes());
+        put(0x211, &[1]);
+        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+        put(0x230, &0x20_0000u32.to_le_bytes());
+        put(0x234, &[1]);
+        put(0x236, &1u16.to_le_bytes());
+        put(0x238, &2047u32.to_le_bytes());
+        put(0x258, &0x100_0000u64.to_le_bytes());
+        put(0x260, &0x40_0000u32.to_le_bytes());
+        img
+    };
+    let assemble = |mem_size: u64, net: usize| -> Vm {
+        MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size,
+                block: vec![],
+                net: (0..net)
+                    .map(|_| fandhe_container_microvm::microvm::NetDeviceConfig {
+                        backend: MemoryNetBackend::new(),
+                        mac: [2, 0, 0, 0, 0, 1],
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap()
+    };
+
+    // (a) setup_boot_vcpu の失敗: 大きいメモリでロードした結果を、小さいメモリの VM の start に渡す。
+    let mut big = assemble(64 << 20, 0);
+    let loaded = big.load_kernel(&image, None, "console=ttyS0").unwrap();
+    let mut small = assemble(2 << 20, 0);
+    let obs = Arc::new(Nop);
+    small.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let e = small.start(&loaded).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (b) net デバイスを含む構成の start は Unimplemented で、解放される。
+    let mut vm = assemble(64 << 20, 1);
+    let loaded = vm.load_kernel(&image, None, "console=ttyS0").unwrap();
+    let obs = Arc::new(Nop);
+    vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let e = vm.start(&loaded).unwrap_err();
+    assert!(e.to_string().starts_with("UNIMPLEMENTED: "), "{e}");
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (c) load_kernel に不正なイメージを渡すと InvalidArgument。MicroVm は残り、drop で解放される。
+    let mut vm = assemble(64 << 20, 0);
+    let obs = Arc::new(Nop);
+    vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let e = vm.load_kernel(&[0u8; 16], None, "").unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+    assert_eq!(Arc::strong_count(&obs), 2);
+    drop(vm);
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (d) assemble の ioctl 前の失敗。
+    let bad = |vcpu_count: u32, mem_size: u64| {
+        MicroVm::<MemoryBlockBackend, MemoryNetBackend>::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count,
+                mem_size,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .expect_err("must fail")
+    };
+    let e = bad(0, 1 << 20);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+    let e = bad(1, u64::MAX / 2);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+
+    // (e) open_at の失敗: メッセージにパスを載せない。
+    let missing = std::path::Path::new("/nonexistent/fandhe-kvm-887");
+    let e = KvmDevice::open_at(missing).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::NotFound);
+    assert!(!e.message().contains("fandhe-kvm-887"), "{e}");
+    let e = KvmDevice::open_at(std::path::Path::new("/dev/null")).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_failure_releases_resources() {
+    let e = KvmDevice::open_at(std::path::Path::new("/nonexistent/fandhe-kvm-887")).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::NotFound);
+    assert!(e.to_string().starts_with("NOT_FOUND: "), "{e}");
 }

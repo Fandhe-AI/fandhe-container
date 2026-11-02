@@ -943,7 +943,7 @@ impl KvmDevice {
         let mut vcpu = vm.create_vcpu(0)?;
 
         let result = (|| {
-            let ready_exit = vcpu.run_once(PROBE_RUN_DEADLINE)?;
+            let ready_exit = run_skipping_interrupted(|| vcpu.run_once(PROBE_RUN_DEADLINE))?;
             if ready_exit != io_out(0x10, 0x42) {
                 return Err(MicrovmError::new(
                     MicrovmErrorCode::Internal,
@@ -951,7 +951,7 @@ impl KvmDevice {
                 ));
             }
             let notify_count = ioevent.consume()?;
-            let idle_outcome = match vcpu.run_once(IDLE_DEADLINE) {
+            let idle_outcome = match run_skipping_interrupted(|| vcpu.run_once(IDLE_DEADLINE)) {
                 Err(e) => e.code(),
                 Ok(_) => {
                     return Err(MicrovmError::new(
@@ -961,16 +961,17 @@ impl KvmDevice {
                 }
             };
             on_notify(&irqfd)?;
-            let interrupt_exit = vcpu.run_once(PROBE_RUN_DEADLINE).map_err(|e| {
-                if e.code() == MicrovmErrorCode::DeadlineExceeded {
-                    MicrovmError::new(
-                        MicrovmErrorCode::Internal,
-                        "interrupt did not reach the guest",
-                    )
-                } else {
-                    e
-                }
-            })?;
+            let interrupt_exit = run_skipping_interrupted(|| vcpu.run_once(PROBE_RUN_DEADLINE))
+                .map_err(|e| {
+                    if e.code() == MicrovmErrorCode::DeadlineExceeded {
+                        MicrovmError::new(
+                            MicrovmErrorCode::Internal,
+                            "interrupt did not reach the guest",
+                        )
+                    } else {
+                        e
+                    }
+                })?;
             Ok(QueueInterruptProbe {
                 ready_exit,
                 notify_count,
@@ -1200,6 +1201,25 @@ impl KvmDevice {
     }
 }
 
+/// `Interrupted`（ホスト側の EINTR / EAGAIN。ゲストの exit ではない）を読み飛ばして再実行し、
+/// 最初の実 exit かエラーを返す。回数上限（[`PROBE_MAX_RUNS`]）まで `Interrupted` が続けば
+/// `Internal` で失敗にする（fail-closed。MVM-1・REPAIR-5）。
+#[cfg(target_arch = "x86_64")]
+fn run_skipping_interrupted(
+    mut run: impl FnMut() -> Result<VcpuExit, MicrovmError>,
+) -> Result<VcpuExit, MicrovmError> {
+    for _ in 0..PROBE_MAX_RUNS {
+        match run()? {
+            VcpuExit::Interrupted => {}
+            other => return Ok(other),
+        }
+    }
+    Err(MicrovmError::new(
+        MicrovmErrorCode::Internal,
+        "vcpu run was interrupted up to the probe run limit",
+    ))
+}
+
 /// 自己診断のループ本体。`Hlt` で完了したときだけ `Ok`、回数上限（[`PROBE_MAX_RUNS`]）に達しても
 /// `Hlt` に至らなければ `Internal` で失敗にする（fail-closed。TASK-74.4.1・MVM-1・REPAIR-5）。
 #[cfg(target_arch = "x86_64")]
@@ -1243,6 +1263,29 @@ mod tests {
         assert_eq!(calls, 8);
         let e = run_probe_loop(|| Ok(VcpuExit::Shutdown)).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::Internal);
+    }
+
+    /// MVM-1: `Interrupted` はホスト側の中断で、読み飛ばして次の実 exit を返す。上限まで続けば `Internal`。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn run_skipping_interrupted_returns_first_real_exit() {
+        let mut seq = vec![VcpuExit::Hlt, VcpuExit::Interrupted, VcpuExit::Interrupted];
+        let exit = run_skipping_interrupted(|| Ok(seq.pop().unwrap())).unwrap();
+        assert_eq!(exit, VcpuExit::Hlt);
+        assert!(seq.is_empty());
+        let mut calls = 0usize;
+        let e = run_skipping_interrupted(|| {
+            calls += 1;
+            Ok(VcpuExit::Interrupted)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(calls, 8);
+        let e = run_skipping_interrupted(|| {
+            Err(MicrovmError::new(MicrovmErrorCode::DeadlineExceeded, "x"))
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
     }
 
     /// MVM-1: `Interrupted` を挟んでも `Hlt` で完了すれば `Ok`。

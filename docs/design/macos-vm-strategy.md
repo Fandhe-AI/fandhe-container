@@ -6,7 +6,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 - 対象ビヘイビア: MAC-4（関連: MAC-1・MAC-2・MVM-1・MVM-5・PLUG-1・PLUG-6・CORE-1）
 - タスク: TASK-66（MS-5・G5。前提 TASK-65 は完了）。既定方式の実装は TASK-191（前提 TASK-64・65・66・115）
-- 関連 issue: #369（本書）・#370（内容確認。2026-10-12 に確認済み）・#1836（本更新）・#1905（未決事項の確定と実装 issue の起票）・#1906（設計の承認）
+- 関連 issue: #369（本書）・#370（内容確認。2026-10-12 に確認済み）・#1836（本更新）・#1905（未決事項の確定と実装 issue の起票）・#1906（設計の承認）・#705・#707（TASK-78。MVM-5 の追従）
 - 出典: `docs/spec/04-behavior/api-platform-macos.md` の `MAC-4`、`api-microvm.md` の `MVM-1`・`MVM-5`、`05-tasks.md` の TASK-66・TASK-191（submodule リビジョン `fe33bef`）
 
 ## 2 方式の比較
@@ -35,7 +35,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 ## オプション方式（1 コンテナ = 1 VM）
 
 - コンテナごとに専用 VM を割り当て、ゲストカーネルを共有しない。マルチテナント分離やカーネル脆弱性クラスへの耐性が要る用途向け（MVM-1 の前提）
-- MVM-1 は microVM を選択可能なオプションとして提供するビヘイビア（Should・確定）。macOS への展開のバックエンド方針は MVM-5（Hypervisor.framework。文書化は TASK-78、Linux 側の実装は TASK-74 / TASK-75）
+- MVM-1 は microVM を選択可能なオプションとして提供するビヘイビア（Should・確定）。macOS への展開のバックエンド方針は MVM-5（Hypervisor.framework。文書化は TASK-78〔[architecture.md](../architecture.md) の「microVM の 3 OS 展開方針（MVM-5）」節〕、Linux 側の実装は TASK-74 / TASK-75）
 - 本書では断定しない事項: macOS でのオプション方式の実現経路（TASK-64 の Virtualization.framework `Vm` をコンテナごとに起動するか、MVM-5 系統の Hypervisor.framework 上の自前 VMM か）は MAC-4 からは定まらない。選択の UI（CLI フラグ・TOML キー）も未定義である。MVM-3（切り替えしきい値）は spec 上「検討中」のため確定扱いしない
 
 ## TASK-64 / TASK-65 実装との対応
@@ -89,4 +89,4 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 ## 見直し
 
-MAC-4・MVM-1・MVM-5 の更新時、TASK-191 の未決事項の確定時（#1905・#1906）、TASK-78 の完了時、core 側配線（#1869・承認は #2232）の確定時に本書を追従する。
+MAC-4・MVM-1・MVM-5 の更新時、TASK-191 の未決事項の確定時（#1905・#1906）、architecture.md の MVM-5 節の更新時、core 側配線（#1869・承認は #2232）の確定時に本書を追従する。

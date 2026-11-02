@@ -450,43 +450,103 @@ mod unix_impl {
         if meta.mode() & 0o077 != 0 {
             return Err(failed("socket dir permissions are too open"));
         }
+        // 最終ディレクトリ自身の拡張 ACL（macOS。mode 0700 でも別ユーザーへ変更権限を与えられる）。
+        reject_extended_acl(dir)?;
         check_ancestors(dir)
     }
 
     /// 祖先ディレクトリの信頼性を確かめる（PLUG-12・SEC-1）。最終要素だけの検査では、祖先を持つ別ユーザーが
     /// 検証後にディレクトリを rename して差し替え、後続の lock・socket・ops.log の操作（パスの再解決）を別の場所へ
     /// 向けられるため、パスを変更できる主体を現在のユーザーと root に限る。
+    ///
+    /// 方式の選択（P0-2）: 後続処理は元の `dir` を再解決するので、解決後の正規パスだけを検査すると、
+    /// 「別ユーザー所有の親の中にある root 所有の symlink」が信頼できる場所を指す構成を通してしまい、親の所有者が
+    /// symlink を rename・置換して操作先を差し替えられる。検証済み正規パスを固定して使う案（b）は lock・socket・
+    /// ops.log・子プロセスへ渡す経路の全てを書き換える必要があり漏れが残りうるため、より閉じる案（a）として
+    /// 元の経路の全祖先にも同じ検査（所有者・書き込み権限・ACL）を適用する。
     /// - 元のパスの祖先の symlink は root 所有のもの（macOS の `/tmp` → `/private/tmp` 等）だけ許す
-    /// - 解決後の祖先は、所有者が現在のユーザーか root であること
+    /// - 元のパスの symlink でない祖先と解決後の祖先は、所有者が現在のユーザーか root であること
     /// - 他ユーザーが書ける祖先は、スティッキーかつ経路上の子が現在のユーザー所有（他人が rename・削除できない）の場合だけ許す
+    /// - macOS では拡張 ACL を持つ祖先・判定できない祖先も拒否する（mode bits を迂回して変更権限を与えうる）
     fn check_ancestors(dir: &Path) -> Result<(), CriError> {
         let euid = crate::sys::effective_uid();
+        let mut lexical_child = dir;
         for a in dir.ancestors().skip(1) {
+            // 相対パスの終端（空の祖先）は正規パス側の検査（カレントディレクトリ以上）が担う。
+            if a.as_os_str().is_empty() {
+                break;
+            }
             let m =
                 fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
-            if m.file_type().is_symlink() && m.uid() != 0 {
-                return Err(failed("socket dir ancestor is a symlink not owned by root"));
+            if m.file_type().is_symlink() {
+                if m.uid() != 0 {
+                    return Err(failed("socket dir ancestor is a symlink not owned by root"));
+                }
+            } else {
+                let child_owned =
+                    fs::symlink_metadata(lexical_child).is_ok_and(|c| c.uid() == euid);
+                check_ancestor_dir(&m, a, euid, child_owned)?;
             }
+            lexical_child = a;
         }
         let canon = fs::canonicalize(dir).map_err(|_| internal("cannot resolve socket dir"))?;
         let mut child = canon.as_path();
         for a in canon.ancestors().skip(1) {
             let m =
                 fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
-            if !m.is_dir() {
-                return Err(failed("socket dir ancestor is not a directory"));
-            }
-            if m.uid() != euid && m.uid() != 0 {
-                return Err(failed("socket dir ancestor is owned by another user"));
-            }
-            if m.mode() & 0o022 != 0 {
-                let child_owned = fs::symlink_metadata(child).is_ok_and(|c| c.uid() == euid);
-                if m.mode() & 0o1000 == 0 || !child_owned {
-                    return Err(failed("socket dir ancestor is writable by other users"));
-                }
-            }
+            let child_owned = fs::symlink_metadata(child).is_ok_and(|c| c.uid() == euid);
+            check_ancestor_dir(&m, a, euid, child_owned)?;
             child = a;
         }
+        Ok(())
+    }
+
+    /// 祖先ディレクトリ 1 つの検査（種別・所有者・他者の書き込み権限・拡張 ACL）。
+    /// `child_owned` は経路上の子が現在のユーザー所有か（スティッキーの許可条件）。
+    fn check_ancestor_dir(
+        m: &fs::Metadata,
+        path: &Path,
+        euid: u32,
+        child_owned: bool,
+    ) -> Result<(), CriError> {
+        ancestor_mode_verdict(m.is_dir(), m.uid(), m.mode(), euid, child_owned).map_err(failed)?;
+        reject_extended_acl(path)
+    }
+
+    /// 祖先ディレクトリの mode・所有者の判定（純粋関数。PLUG-12・SEC-1）。
+    pub(super) fn ancestor_mode_verdict(
+        is_dir: bool,
+        uid: u32,
+        mode: u32,
+        euid: u32,
+        child_owned: bool,
+    ) -> Result<(), &'static str> {
+        if !is_dir {
+            return Err("socket dir ancestor is not a directory");
+        }
+        if uid != euid && uid != 0 {
+            return Err("socket dir ancestor is owned by another user");
+        }
+        if mode & 0o022 != 0 && (mode & 0o1000 == 0 || !child_owned) {
+            return Err("socket dir ancestor is writable by other users");
+        }
+        Ok(())
+    }
+
+    /// macOS の拡張 ACL（mode bits を迂回して他ユーザーへ変更権限を与えられる）が付いていたら拒否する。
+    /// 中身は解釈せず、付いているだけ・判定できないときも拒否する（fail-closed。PLUG-12・SEC-1）。
+    #[cfg(target_os = "macos")]
+    fn reject_extended_acl(path: &Path) -> Result<(), CriError> {
+        match crate::sys::has_extended_acl(path) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(failed("socket dir or ancestor has an extended ACL")),
+            Err(()) => Err(internal("cannot inspect the ACL of the socket dir")),
+        }
+    }
+
+    /// macOS 以外では対象外（Linux は mode bits と所有者で判定する）。
+    #[cfg(not(target_os = "macos"))]
+    fn reject_extended_acl(_path: &Path) -> Result<(), CriError> {
         Ok(())
     }
 
@@ -1123,5 +1183,93 @@ mod tests {
             socket_path(&long, &inv).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
+    }
+
+    /// PLUG-12・SEC-1・#872: 祖先の mode・所有者の判定を具体値で照合する（P0-2）。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_872_ancestor_mode_verdict() {
+        use unix_impl::ancestor_mode_verdict as v;
+        // (is_dir, uid, mode, euid, child_owned)
+        assert_eq!(v(true, 1000, 0o755, 1000, true), Ok(()));
+        assert_eq!(v(true, 0, 0o755, 1000, false), Ok(()));
+        assert_eq!(
+            v(true, 2000, 0o755, 1000, true),
+            Err("socket dir ancestor is owned by another user")
+        );
+        assert_eq!(
+            v(true, 1000, 0o777, 1000, true),
+            Err("socket dir ancestor is writable by other users")
+        );
+        assert_eq!(v(true, 0, 0o1777, 1000, true), Ok(()));
+        assert_eq!(
+            v(true, 0, 0o1777, 1000, false),
+            Err("socket dir ancestor is writable by other users")
+        );
+        assert_eq!(
+            v(false, 1000, 0o755, 1000, true),
+            Err("socket dir ancestor is not a directory")
+        );
+    }
+
+    /// 試験用の一意な作業ディレクトリ。
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("fc-872-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// PLUG-12・SEC-1・#872: 元の経路の祖先が他者に書き込み可（非スティッキー）なら拒否する（P0-2）。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_872_rejects_world_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("wwanc");
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = prepare_socket_dir(&open.join("sock")).unwrap_err();
+        assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PLUG-12・SEC-1・#872: 現在のユーザー所有の symlink は祖先に置けない（P0-2。元の経路の検査）。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_872_rejects_user_owned_symlink_ancestor() {
+        let base = scratch("symanc");
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let err = prepare_socket_dir(&base.join("link").join("sock")).unwrap_err();
+        assert_eq!(err.code(), CriErrorCode::FailedPrecondition);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PLUG-12・SEC-1・#872: 拡張 ACL が付いた最終ディレクトリ・祖先は mode 0700 でも拒否する（P0-1。macOS のみ）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plug12_872_rejects_extended_acl_dir_and_ancestor() {
+        let add_acl = |p: &std::path::Path| crate::sys::set_everyone_acl_for_test(p).unwrap();
+        let base = scratch("acl");
+        let ok = base.join("ok");
+        prepare_socket_dir(&ok).unwrap();
+        // 最終ディレクトリ。
+        add_acl(&ok);
+        assert_eq!(
+            prepare_socket_dir(&ok).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition
+        );
+        // 祖先。
+        let anc = base.join("anc");
+        std::fs::create_dir(&anc).unwrap();
+        add_acl(&anc);
+        assert_eq!(
+            prepare_socket_dir(&anc.join("sock")).unwrap_err().code(),
+            CriErrorCode::FailedPrecondition
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

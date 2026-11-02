@@ -358,6 +358,15 @@ impl ExecStreamLauncher for FakeLauncher {
                         cell.set(0);
                     });
                 }
+                "exit3-stuck-flush" => {
+                    // flush が完了しない stdin のまま、少し後に終了コード 3 で終わる。
+                    let (stdout_p, cell) = (stdout_p.clone(), cell.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        stdout_p.close();
+                        cell.set(3);
+                    });
+                }
                 "exit-no-close" => {
                     // 終了コード 0 で終わるが stdout を閉じない（drain の期限切れの再現）。
                     stdout_p.send(b"partial\n");
@@ -387,7 +396,7 @@ impl ExecStreamLauncher for FakeLauncher {
                         Box::new(BrokenWriter) as Box<dyn AsyncWrite + Send + Unpin>
                     } else if program == "shutdown-err" {
                         Box::new(ShutdownErrWriter) as Box<dyn AsyncWrite + Send + Unpin>
-                    } else if program == "stuck-flush" {
+                    } else if program == "stuck-flush" || program == "exit3-stuck-flush" {
                         Box::new(StuckFlushWriter) as Box<dyn AsyncWrite + Send + Unpin>
                     } else if program == "echo-once" {
                         Box::new(BufferedWriter {
@@ -1741,4 +1750,75 @@ async fn cri6_exec_stdin_stall_timeout_notifies_failure_status() {
             "{version}"
         );
     }
+}
+
+/// CRI-6・REPAIR-5: flush 待ちの stdin の間にプロセスが終了コード 3 で終わったら、期限切れ（Timeout）ではなく
+/// 実際の終了コードの Status（v4 の NonZeroExitCode）と `Exited { code: 3 }` を返す。
+#[tokio::test]
+async fn cri6_exec_exit_wins_over_stdin_stall_timeout() {
+    let mut config = fast_config();
+    config.stdin_stall_timeout = Duration::from_millis(600);
+    let fx = Fixture::new(config, 8).await;
+    let path = fx.exec_path(&["exit3-stuck-flush"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.syn(5, "stdout");
+        for id in [1, 3, 5] {
+            client.expect_reply(id);
+        }
+        client.data(3, b"x", false);
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(
+        c.text(1),
+        r#"{"metadata":{},"status":"Failure","message":"command terminated with non-zero exit code: command terminated with exit code 3","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"3"}]}}"#
+    );
+    assert_eq!(c.goaway, Some(goaway_status::OK));
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 3 }]
+    );
+}
+
+/// CRI-6: 拒否された FIN 付きの再送 SYN_STREAM（stdin の ID の再利用）は early の FIN を立てず、
+/// その後の正当な stdin DATA がプロセスへ届く。
+#[tokio::test]
+async fn cri6_exec_rejected_fin_syn_does_not_close_early_stdin() {
+    let fx = Fixture::new(fast_config(), 8).await;
+    let path = fx.exec_path(&["echo-once"], false, true, true, false);
+    let addr = fx.addr();
+    let c = tokio::task::spawn_blocking(move || {
+        let mut client = Client::upgrade(addr, &path);
+        client.syn(1, "error");
+        client.syn(3, "stdin");
+        client.send(&Frame::SynStream {
+            stream_id: sid(3),
+            associated_to: 0,
+            priority: 0,
+            fin: true,
+            unidirectional: false,
+            headers: {
+                let mut h = Headers::new();
+                h.push("streamtype", "stdin");
+                h
+            },
+        });
+        client.data(3, b"ok\n", false);
+        client.syn(5, "stdout");
+        client.collect()
+    })
+    .await
+    .expect("join");
+    assert_eq!(c.rst, vec![(3, rst_status::PROTOCOL_ERROR)]);
+    assert_eq!(c.text(5), "ok\n");
+    assert_eq!(c.text(1), STATUS_SUCCESS);
+    assert_eq!(
+        fx.wait_outcomes(1).await,
+        vec![ExecStreamOutcome::Exited { code: 0 }]
+    );
 }

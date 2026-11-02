@@ -809,8 +809,10 @@ async fn await_streams<T: AsyncRead + AsyncWrite + Unpin>(
                 fin,
                 ..
             } => {
+                let before = streams.stdin;
                 let r = accept_stream(conn, expected, streams, stream_id, &headers);
-                if fin && streams.stdin == Some(stream_id) {
+                // FIN は SYN_STREAM を受理して stdin に割り当てた場合だけ立てる（拒否した再送では立てない）。
+                if fin && before.is_none() && streams.stdin == Some(stream_id) {
                     early.fin = true;
                 }
                 r
@@ -1099,6 +1101,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
         loop {
             let mut progress = false;
 
+            // プロセスの終了を stdin の期限や idle の判定より先に確かめる（終了済みの実行を
+            // Timeout の Status にしない。CRI-6・REPAIR-5）。終了済みなら stdin の残りは捨てて通常の終了経路へ進む。
+            if self.exit_result.is_none()
+                && let Some(fut) = self.exit.as_mut()
+                && let Poll::Ready(result) = fut.as_mut().poll(cx)
+            {
+                self.exit_result = Some(result);
+                self.exit = None;
+                self.drain = Some(Box::pin(tokio::time::sleep(self.drain_timeout)));
+                self.stdin = None;
+                self.stdin_buf.clear();
+                self.stdin_pos = 0;
+                self.stdin_flush_pending = false;
+                self.stdin_stall = None;
+                progress = true;
+            }
+
             // 送信キューを書き出す。
             let before = self.conn.pending_write();
             if let Poll::Ready(Err(_)) = self.conn.poll_flush(cx) {
@@ -1258,16 +1277,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Relay<T> {
                 }
             }
 
-            // プロセスの終了。
-            if self.exit_result.is_none()
-                && let Some(fut) = self.exit.as_mut()
-                && let Poll::Ready(result) = fut.as_mut().poll(cx)
-            {
-                self.exit_result = Some(result);
-                self.exit = None;
-                self.drain = Some(Box::pin(tokio::time::sleep(self.drain_timeout)));
-                progress = true;
-            }
             if self.exit_result.is_some() {
                 let outputs_done = self.stdout.as_ref().is_none_or(|o| o.eof)
                     && self.stderr.as_ref().is_none_or(|o| o.eof);

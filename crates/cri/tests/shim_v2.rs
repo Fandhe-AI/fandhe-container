@@ -467,18 +467,13 @@ mod e2e {
 
     impl Drop for DaemonGuard {
         fn drop(&mut self) {
-            #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-            let id = self.0.as_str();
-            #[cfg(target_os = "linux")]
-            {
-                let pids = leftover_shims(id);
-                for pid in &pids {
-                    kill_pid("KILL", *pid);
-                }
-                let _ = wait_until(Duration::from_secs(10), || {
-                    pids.iter().all(|p| !pid_alive(*p))
-                });
+            let pids = leftover_shims(self.0.as_str());
+            for pid in &pids {
+                kill_pid("KILL", *pid);
             }
+            let _ = wait_until(Duration::from_secs(10), || {
+                pids.iter().all(|p| !pid_alive(*p))
+            });
         }
     }
 
@@ -497,7 +492,6 @@ mod e2e {
                     kill_pid("KILL", pid);
                 }
                 // 今回の試験が起動した ID の shim だけを止める（並行実行中の別の試験は巻き込まない）。
-                #[cfg(target_os = "linux")]
                 for id in SHIM_IDS.lock().map(|g| g.clone()).unwrap_or_default() {
                     for pid in leftover_shims(&id) {
                         kill_pid("KILL", pid);
@@ -563,6 +557,23 @@ mod e2e {
                 std::fs::read(format!("/proc/{pid}/cmdline"))
                     .is_ok_and(|c| String::from_utf8_lossy(&c).contains(needle.as_str()))
             })
+            .collect()
+    }
+
+    /// 非 Linux（macOS）では `/proc` が無いため `pgrep -f` で `-id <id>` を含む他プロセスを探す。
+    /// ID は pid を含み一意で、pgrep は自分自身を結果から除く。期限つき（REPAIR-5）。
+    #[cfg(not(target_os = "linux"))]
+    fn leftover_shims(id: &str) -> Vec<u32> {
+        let mut cmd = Command::new("pgrep");
+        cmd.args(["-f", "--"]).arg(format!("-id {id}($| )"));
+        let Ok(out) = reap::output_within(&mut cmd, Duration::from_secs(5)) else {
+            return Vec::new();
+        };
+        let own = std::process::id();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|&p| p != own)
             .collect()
     }
 
@@ -939,7 +950,11 @@ mod e2e {
                 }
                 eprintln!("shim_v2: FAILED: {e}");
                 if has_mounts_under(&dir) {
+                    eprintln!("shim_v2: mounts remain under the work dir; not removing it");
                     std::mem::forget(work);
+                } else {
+                    // exit はデストラクタを走らせないため、root 所有の作業ディレクトリを先に回収する。
+                    drop(work);
                 }
                 std::process::exit(1);
             }

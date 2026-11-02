@@ -1346,7 +1346,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn plug12_872_rejects_extended_acl_dir_and_ancestor() {
-        let add_acl = |p: &std::path::Path| crate::sys::set_everyone_acl_for_test(p).unwrap();
+        let add_acl = |p: &std::path::Path| {
+            crate::sys::set_everyone_acl_for_test(p)
+                .unwrap_or_else(|errno| panic!("set ACL on {}: errno {errno}", p.display()))
+        };
         let base = scratch("acl");
         let ok = base.join("ok");
         prepare_socket_dir(&ok).unwrap();

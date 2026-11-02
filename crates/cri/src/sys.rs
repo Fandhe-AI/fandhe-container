@@ -173,23 +173,33 @@ pub(crate) fn has_extended_acl(path: &std::path::Path) -> Result<bool, ()> {
     }
 }
 
-/// 試験専用: `path` へ「everyone に add_file・delete_child を許可」の拡張 ACL を付ける（macOS 限定。
-/// `has_extended_acl` の陽性対照。CRI 層は子プロセスを起動しないため `chmod +a` を使わない）。
+/// 試験専用: `path` へ「everyone に write(= ディレクトリでは add_file)・delete_child を許可」の拡張 ACL を付ける
+/// （macOS 限定。`has_extended_acl` の陽性対照。CRI 層は子プロセスを起動しないため `chmod +a` を使わない。
+/// PLUG-12・SEC-1・#872）。失敗は原因の errno を返す(`acl_from_text` / `acl_set_file` のどちらで失敗したかは区別しない)。
+///
+/// テキスト形式は Apple Libc の `posix1e/acl_translate.c`(`acl_from_text`)の解析に合わせる:
+/// 1 行目 `!#acl 1`、以降 `<user|group>:<uuid>:<name>:<id>:<allow|deny>[,<flags>]:<perms>` を `:` 区切りで読む。
+/// 権限は最後の `:` の後にカンマ区切りで置く(`allow` の直後に `,` で続けると flags 扱いで `EINVAL`)。
+/// 権限名はディレクトリ用の `add_file` が解析表でコメントアウトされており(`write` と同じビット)、`write` と書く。
+/// `libc` に `acl_*` の宣言が無いため、ここでは自前宣言の `acl_from_text` / `acl_set_file` を使う。
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn set_everyone_acl_for_test(path: &std::path::Path) -> Result<(), ()> {
+pub(crate) fn set_everyone_acl_for_test(path: &std::path::Path) -> Result<(), i32> {
     use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| ())?;
-    let text = c"!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow,add_file,delete_child\n";
+    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)?;
+    let text = c"!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow:write,delete_child\n";
     // SAFETY: `text` は NUL 終端の定数文字列で、呼び出しの間生存する。
     let acl = unsafe { acl_from_text(text.as_ptr()) };
     if acl.is_null() {
-        return Err(());
+        return Err(errno());
     }
     // SAFETY: `c_path` は NUL 終端で生存中、`acl` は直前に得た非 NULL の `acl_t`。
     let rc = unsafe { acl_set_file(c_path.as_ptr(), ACL_TYPE_EXTENDED, acl) };
+    // errno は `acl_free` で上書きされうるので、解放の前に控える。
+    let set_errno = errno();
     // SAFETY: `acl` は `acl_from_text` が返した非 NULL の `acl_t` で他に所有者がいない。1 回だけ解放し以後使わない。
     let _ = unsafe { acl_free(acl) };
-    if rc == 0 { Ok(()) } else { Err(()) }
+    if rc == 0 { Ok(()) } else { Err(set_errno) }
 }
 
 /// 対応外の unix では取得できない（呼び出し側は fail-closed にする）。

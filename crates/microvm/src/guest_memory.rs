@@ -3,11 +3,11 @@
 //! virtqueue（`virtqueue`）と virtio デバイス（`virtio_block` ほか）が、ゲストが書いた descriptor・データを
 //! 読み書きする唯一の入口。docs/design/microvm-memory-ownership.md の決め事に従い、(1) アドレスは
 //! [`GuestAddress`] の newtype、(2) 外へ参照を渡さず常にコピーで読み書きする（vCPU が並行して書き換えるため）、
-//! (3) backing は [`GuestMemoryBacking`] で差し替える。実機の mmap backing と KVM への登録は TASK-75.1 が持つ。
+//! (3) backing は [`GuestMemoryBacking`] で差し替える。実機の mmap backing と KVM への登録は `crate::microvm`（TASK-75.1。Linux のみ）が持つ。
 //!
 //! # 範囲外（REPAIR-3）
 //! 領域は 1 つだけ（MMIO hole などを含む複数領域は未対応。判断記録の再評価条件）。
-//! backing は本モジュールの [`HeapBacking`]（`Vec<u8>`。試験と KVM を使わない用途）だけを提供する。
+//! 本モジュールが提供する backing は [`HeapBacking`]（`Vec<u8>`。試験と KVM を使わない用途）だけで、mmap の backing は `crate::microvm` が提供する。
 //!
 //! # 外部入力の扱い
 //! アドレス・長さはゲストが決める非信頼入力。範囲検査はすべて checked 演算で行い、panic しない。

@@ -49,7 +49,8 @@ tokio = { workspace = true, features = ["rt", "net", "time"] }
 # ストリーミングサーバー（CRI-6・TASK-63.1・#679。承認: #678）。http-body-util・bytes・http は直接依存にしない（hyper の再 export を使う）。
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
-# SPDY/3.1 のヘッダブロック（辞書つき zlib。TASK-63.4・#682・CRI-6）。承認: #678。workspace 既存の固定版で新規パッケージなし。
+# SPDY/3 のヘッダブロック（辞書つき zlib。CRI-6・TASK-63.3・#681。承認: #678 のオーナー判断 2026-10-10。新規パッケージなし）。
+# 展開後サイズは呼び出し側（streaming/spdy.rs）で上限を検証する。
 flate2.workspace = true
 # bundle の config.json 生成（CRI-1・CRI-2・#2395）。serde / serde_json は #138 で承認済み（用途: OCI config.json）。
 # workspace 既存の =x.y.z 固定版を参照するだけで Cargo.lock に新規パッケージは増えない。

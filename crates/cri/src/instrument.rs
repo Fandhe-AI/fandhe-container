@@ -88,6 +88,12 @@ pub enum CriOpKind {
     Attach,
     /// `RuntimeService.PortForward` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
     PortForward,
+    /// Attach ストリーミングの 1 セッション（接続から終了まで。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachSession,
+    /// Attach の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachStreamRead,
+    /// Attach の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachStreamWrite,
 }
 
 impl CriOpKind {
@@ -120,6 +126,9 @@ impl CriOpKind {
             CriOpKind::Exec => "cri.exec",
             CriOpKind::Attach => "cri.attach",
             CriOpKind::PortForward => "cri.port_forward",
+            CriOpKind::AttachSession => "cri.attach.session",
+            CriOpKind::AttachStreamRead => "cri.attach.stream_read",
+            CriOpKind::AttachStreamWrite => "cri.attach.stream_write",
         }
     }
 }
@@ -428,7 +437,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 23] = [
+    const ALL_KINDS: [CriOpKind; 26] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -452,6 +461,9 @@ mod tests {
         CriOpKind::Exec,
         CriOpKind::Attach,
         CriOpKind::PortForward,
+        CriOpKind::AttachSession,
+        CriOpKind::AttachStreamRead,
+        CriOpKind::AttachStreamWrite,
     ];
 
     /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。

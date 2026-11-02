@@ -37,13 +37,10 @@ use tokio::net::TcpStream;
 use tokio::time::Sleep;
 
 use super::spdy::{
-    Frame, FrameDecoder, GOAWAY_OK, GOAWAY_PROTOCOL_ERROR, HeaderCompressor, RST_CANCEL,
-    RST_PROTOCOL_ERROR, RST_REFUSED_STREAM, SpdyError, StreamId,
+    Frame, FrameDecoder, FrameEncoder, Headers, MAX_INCOMING_PAYLOAD, SpdyError, StreamId,
+    goaway_status, rst_status,
 };
-use super::{
-    ConnectionPermit, NotImplementedHandler, StreamBody, StreamHandler, StreamRequest,
-    plain_response,
-};
+use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
 use crate::error::CriError;
 
 /// Upgrade で合意する HTTP の `Upgrade` ヘッダ値。
@@ -90,7 +87,7 @@ pub struct PortForwardConfig {
     pub idle_timeout: Duration,
     /// 同時に持てるストリーム数（error と data の合計）。既定 128。
     pub max_streams: usize,
-    /// 受け取るフレーム本体の最大バイト数。既定 1 MiB。
+    /// 受け取る DATA の 1 フレームあたりの最大バイト数（1024..=`MAX_INCOMING_PAYLOAD`）。既定は共通 codec の上限（256 KiB）。
     pub max_frame_bytes: usize,
     /// 転送先への書き込み滞留量（全対の合計）と送信キューの上限。超えている間は SPDY 接続の読み取りを止める
     /// （バックプレッシャー。1 フレームが上限を超えても、`max_frame_bytes` 以内なら受け取って TCP へ排出する）。既定 256 KiB。
@@ -108,7 +105,7 @@ impl Default for PortForwardConfig {
             pair_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(4 * 60 * 60),
             max_streams: 128,
-            max_frame_bytes: 1024 * 1024,
+            max_frame_bytes: MAX_INCOMING_PAYLOAD,
             max_pending_bytes: 256 * 1024,
             max_inflight_dials: 32,
         }
@@ -129,7 +126,7 @@ impl PortForwardConfig {
                 "port forward max_streams must be between 2 and 1024",
             ));
         }
-        if !(1024..=super::spdy::MAX_FRAME_LEN).contains(&self.max_frame_bytes) {
+        if !(1024..=MAX_INCOMING_PAYLOAD).contains(&self.max_frame_bytes) {
             return Err(CriError::invalid_argument(
                 "port forward max_frame_bytes is out of range",
             ));
@@ -175,13 +172,13 @@ impl PortForwardObserver for NoopPortForwardObserver {
     fn observe(&self, _end: PortForwardEnd, _elapsed: Duration) {}
 }
 
-/// `PortForward` 要求だけを扱う [`StreamHandler`]。それ以外の種別は `fallback`（既定 501）へ委ねる。
+/// `PortForward` 要求だけを扱う [`StreamHandler`]。
 ///
-/// #680（Exec）・#681（Attach）のハンドラも同じ形で `with_fallback` に連ねられる。
+/// 他の種別と同居させるときは [`super::StreamDispatcher::with_port_forward`] に登録する。
+/// `PortForward` 以外の要求が届いた場合は 501 を返す（振り分けを誤った構成を実装済みと偽らない）。
 pub struct PortForwardHandler {
     dialer: Arc<dyn PortForwardDialer>,
     config: PortForwardConfig,
-    fallback: Arc<dyn StreamHandler>,
     observer: Arc<dyn PortForwardObserver>,
     /// blocking の dial の実行中・待機中の件数。全セッションで共有する（`DialSlot` が増減する）。
     dial_inflight: Arc<AtomicUsize>,
@@ -205,16 +202,9 @@ impl PortForwardHandler {
         Ok(Self {
             dialer,
             config,
-            fallback: Arc::new(NotImplementedHandler),
             observer: Arc::new(NoopPortForwardObserver),
             dial_inflight: Arc::new(AtomicUsize::new(0)),
         })
-    }
-
-    /// PortForward 以外の種別を委ねるハンドラを指定する。
-    pub fn with_fallback(mut self, fallback: Arc<dyn StreamHandler>) -> Self {
-        self.fallback = fallback;
-        self
     }
 
     /// 観測口を指定する（REPAIR-4）。
@@ -283,7 +273,12 @@ impl StreamHandler for PortForwardHandler {
                 let response = self.start(pf, http, permit);
                 Box::pin(async move { response })
             }
-            other => self.fallback.handle(other, http, permit),
+            _ => Box::pin(async {
+                plain_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "streaming protocol is not implemented",
+                )
+            }),
         }
     }
 }
@@ -395,15 +390,17 @@ impl Pair {
 struct Outbox {
     buf: Vec<u8>,
     pos: usize,
-    comp: HeaderCompressor,
+    enc: FrameEncoder,
     failed: bool,
 }
 
 impl Outbox {
     fn send(&mut self, frame: &Frame) {
-        match frame.encode(&mut self.comp) {
-            Ok(bytes) => self.buf.extend_from_slice(&bytes),
-            Err(_) => self.failed = true,
+        let before = self.buf.len();
+        if self.enc.encode(frame, &mut self.buf).is_err() {
+            // 途中まで書いた分を残さない（圧縮文脈は壊れたので、呼び出し側が接続を閉じる）。
+            self.buf.truncate(before);
+            self.failed = true;
         }
     }
 
@@ -482,15 +479,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     ) -> Option<Self> {
         let tick_every = (config.pair_timeout.min(config.idle_timeout) / 4)
             .clamp(Duration::from_millis(10), Duration::from_secs(1));
-        let comp = HeaderCompressor::new().ok()?;
         Some(Self {
             io,
-            decoder: FrameDecoder::new(config.max_frame_bytes),
+            decoder: FrameDecoder::new(),
             outbox: Outbox {
                 buf: Vec::new(),
                 pos: 0,
                 failed: false,
-                comp,
+                enc: FrameEncoder::new(),
             },
             streams: HashMap::new(),
             last_syn_id: 0,
@@ -520,12 +516,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             let status = if reason == PortForwardEnd::ProtocolError
                 || reason == PortForwardEnd::LimitExceeded
             {
-                GOAWAY_PROTOCOL_ERROR
+                goaway_status::PROTOCOL_ERROR
             } else {
-                GOAWAY_OK
+                goaway_status::OK
             };
             self.outbox.send(&Frame::GoAway {
-                last_good: 0,
+                last_good_stream_id: 0,
                 status,
             });
         }
@@ -533,7 +529,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
     fn finish_for(&mut self, err: SpdyError) {
         match err {
-            SpdyError::LimitExceeded(_) => self.finish(PortForwardEnd::LimitExceeded),
+            SpdyError::FrameTooLarge | SpdyError::HeaderBlockTooLarge => {
+                self.finish(PortForwardEnd::LimitExceeded)
+            }
             _ => self.finish(PortForwardEnd::ProtocolError),
         }
     }
@@ -617,17 +615,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     /// SPDY 接続から読んでフレームを処理する。進捗があれば true。
     fn poll_read_io(&mut self, cx: &mut Context<'_>) -> bool {
         let mut chunk = [0u8; READ_CHUNK];
-        // 復号器の残り容量までしか読まない（TCP のまとめ方で正常入力を拒否しない）。
-        let limit = self.decoder.free_capacity().min(READ_CHUNK);
-        if limit == 0 {
-            self.finish_for(SpdyError::LimitExceeded("receive buffer is full"));
-            return true;
-        }
-        let Some(window) = chunk.get_mut(..limit) else {
-            self.finish_for(SpdyError::LimitExceeded("receive window out of range"));
-            return true;
-        };
-        let mut buf = ReadBuf::new(window);
+        // 復号器は 1 回の読み取りの後に取り出せるだけ取り出すので、溜まるのは未完の 1 フレーム
+        // （`MAX_INCOMING_PAYLOAD` で有界）と今回の読み取り分だけになる。
+        let mut buf = ReadBuf::new(&mut chunk);
         match Pin::new(&mut self.io).poll_read(cx, &mut buf) {
             Poll::Pending => false,
             Poll::Ready(Err(_)) => {
@@ -641,10 +631,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                     return true;
                 }
                 self.last_activity = Instant::now();
-                if let Err(e) = self.decoder.push(filled) {
-                    self.finish_for(e);
-                    return true;
-                }
+                self.decoder.extend(filled);
                 loop {
                     match self.decoder.next_frame() {
                         Ok(Some(frame)) => self.on_frame(frame),
@@ -665,20 +652,28 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
     fn refuse(&mut self, stream: StreamId) {
         self.outbox.send(&Frame::RstStream {
-            stream,
-            status: RST_REFUSED_STREAM,
+            stream_id: stream,
+            status: rst_status::REFUSED_STREAM,
         });
     }
 
     fn on_frame(&mut self, frame: Frame) {
         match frame {
             Frame::SynStream {
-                stream,
+                stream_id,
                 headers,
                 fin,
                 ..
-            } => self.on_syn_stream(stream, &headers, fin),
-            Frame::Data { stream, fin, data } => {
+            } => self.on_syn_stream(stream_id, &headers, fin),
+            Frame::Data {
+                stream_id: stream,
+                fin,
+                data,
+            } => {
+                if data.len() > self.config.max_frame_bytes {
+                    self.finish(PortForwardEnd::LimitExceeded);
+                    return;
+                }
                 if data.is_empty()
                     && matches!(self.streams.get(&stream.get()), Some((_, Kind::Error)))
                 {
@@ -692,8 +687,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                     if pair.peer_fin {
                         // 半閉じ後の DATA は不正。TCP へ転送せず、このストリームをリセットする。
                         self.outbox.send(&Frame::RstStream {
-                            stream,
-                            status: RST_PROTOCOL_ERROR,
+                            stream_id: stream,
+                            status: rst_status::PROTOCOL_ERROR,
                         });
                         self.abort_pair(&key, Some(stream));
                         return;
@@ -705,23 +700,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 } else {
                     // 未知のストリーム、または error ストリームへの DATA。
                     self.outbox.send(&Frame::RstStream {
-                        stream,
-                        status: RST_PROTOCOL_ERROR,
+                        stream_id: stream,
+                        status: rst_status::PROTOCOL_ERROR,
                     });
                 }
             }
-            Frame::RstStream { stream, .. } => {
+            Frame::RstStream {
+                stream_id: stream, ..
+            } => {
                 if let Some((key, _)) = self.streams.get(&stream.get()).cloned() {
                     self.abort_pair(&key, Some(stream));
                 }
             }
-            Frame::Ping(id) => self.outbox.send(&Frame::Ping(id)),
+            Frame::Ping { id } => self.outbox.send(&Frame::Ping { id }),
             Frame::GoAway { .. } => self.finish(PortForwardEnd::Completed),
-            Frame::SynReply { .. } | Frame::Ignored => {}
+            // SETTINGS・WINDOW_UPDATE・HEADERS・未知の制御フレームは読み飛ばす（フロー制御は持たない）。
+            Frame::SynReply { .. }
+            | Frame::Settings { .. }
+            | Frame::Headers { .. }
+            | Frame::WindowUpdate { .. }
+            | Frame::Unknown { .. } => {}
         }
     }
 
-    fn on_syn_stream(&mut self, stream: StreamId, headers: &[(String, String)], fin: bool) {
+    fn on_syn_stream(&mut self, stream: StreamId, headers: &Headers, fin: bool) {
         // クライアント起点のストリーム ID は奇数で、重複しない。
         if stream.get().is_multiple_of(2)
             || stream.get() <= self.last_syn_id
@@ -731,12 +733,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             return;
         }
         self.last_syn_id = stream.get();
-        let find = |name: &str| {
-            headers
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.as_str())
-        };
+        let find = |name: &str| headers.get(name);
         let kind = match find("streamtype") {
             Some("error") => Kind::Error,
             Some("data") => Kind::Data,
@@ -788,9 +785,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
         self.streams
             .insert(stream.get(), (request_id.clone(), kind));
         self.outbox.send(&Frame::SynReply {
-            stream,
+            stream_id: stream,
             fin: false,
-            headers: Vec::new(),
+            headers: Headers::new(),
         });
         if let Some(pair) = self.pairs.get_mut(&request_id)
             && pair.error.is_some()
@@ -816,8 +813,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
                 self.streams.remove(&id.get());
                 if Some(id) != except {
                     self.outbox.send(&Frame::RstStream {
-                        stream: id,
-                        status: RST_CANCEL,
+                        stream_id: id,
+                        status: rst_status::CANCEL,
                     });
                 }
             }
@@ -926,12 +923,12 @@ fn step_pair(
             Poll::Ready(Err(())) => {
                 // 固定の英文のみ（内部情報を含めない）。
                 outbox.send(&Frame::Data {
-                    stream: error_id,
+                    stream_id: error_id,
                     fin: true,
                     data: format!("error forwarding port {port}: connection failed").into_bytes(),
                 });
                 outbox.send(&Frame::Data {
-                    stream: data_id,
+                    stream_id: data_id,
                     fin: true,
                     data: Vec::new(),
                 });
@@ -987,14 +984,14 @@ fn step_pair(
                     if filled.is_empty() {
                         conn.tcp_eof = true;
                         outbox.send(&Frame::Data {
-                            stream: data_id,
+                            stream_id: data_id,
                             fin: true,
                             data: Vec::new(),
                         });
                         break;
                     }
                     outbox.send(&Frame::Data {
-                        stream: data_id,
+                        stream_id: data_id,
                         fin: false,
                         data: filled.to_vec(),
                     });
@@ -1004,7 +1001,7 @@ fn step_pair(
     }
     if conn.tcp_eof && conn.write_shut {
         outbox.send(&Frame::Data {
-            stream: error_id,
+            stream_id: error_id,
             fin: true,
             data: Vec::new(),
         });

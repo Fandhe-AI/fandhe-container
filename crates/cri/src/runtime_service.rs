@@ -3715,11 +3715,12 @@ impl CriRuntimeService {
         Ok(v1::ExecResponse { url })
     }
 
-    /// `Attach` の本体（CRI-6・TASK-63.1）。
+    /// `Attach` の本体（CRI-6・TASK-63.1・TASK-63.3）。running のコンテナだけに URL を発行する
+    /// （接続時にも backend が再確認する）。
     fn attach_impl(&self, req: v1::AttachRequest) -> Result<v1::AttachResponse, CriError> {
         let issuer = self.streaming_issuer("attach")?;
         validate_attach_request(&req)?;
-        self.require_container(&req.container_id)?;
+        self.require_running_container(&req.container_id)?;
         let url = issuer.issue(StreamRequest::Attach(req))?;
         Ok(v1::AttachResponse { url })
     }
@@ -3748,6 +3749,22 @@ impl CriRuntimeService {
         self.streaming
             .clone()
             .ok_or_else(|| CriError::unimplemented(rpc))
+    }
+
+    /// コンテナが存在し running であることを照合する（未知は `NOT_FOUND`、running 以外は `FAILED_PRECONDITION`）。
+    fn require_running_container(&self, container_id: &str) -> Result<(), CriError> {
+        let state = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
+            .containers
+            .get(container_id)
+            .map(|c| c.state);
+        match state {
+            None => Err(CriError::not_found("container not found")),
+            Some(ContainerState::Running) => Ok(()),
+            Some(_) => Err(CriError::failed_precondition("container is not running")),
+        }
     }
 
     /// コンテナの存在を照合する。レジストリのロックは返す前に放す（発行とロックを入れ子にしない）。

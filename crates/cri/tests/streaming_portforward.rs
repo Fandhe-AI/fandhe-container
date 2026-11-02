@@ -19,10 +19,11 @@ use fandhe_container_cri::streaming::port_forward::{
     PortForwardConfig, PortForwardDialer, PortForwardHandler,
 };
 use fandhe_container_cri::streaming::spdy::{
-    Frame, FrameDecoder, GOAWAY_PROTOCOL_ERROR, HeaderCompressor, RST_CANCEL, RST_REFUSED_STREAM,
-    StreamId,
+    Frame, FrameDecoder, FrameEncoder, Headers, StreamId, goaway_status, rst_status,
 };
-use fandhe_container_cri::streaming::{StreamRequest, StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{
+    StreamDispatcher, StreamRequest, StreamingConfig, StreamingServer,
+};
 
 /// 転送先ポート番号から echo サーバーのアドレスへ写す試験用 dialer。表に無いポートは接続失敗にする。
 struct MapDialer(HashMap<u16, SocketAddr>);
@@ -86,7 +87,8 @@ async fn fixture(
         map.insert(8080u16, echo);
     }
     let handler = PortForwardHandler::new(Arc::new(MapDialer(map)), pf).expect("handler");
-    let server = StreamingServer::bind_with_handler(streaming, Arc::new(handler))
+    let dispatcher = StreamDispatcher::new().with_port_forward(Arc::new(handler));
+    let server = StreamingServer::bind_with_handler(streaming, Arc::new(dispatcher))
         .await
         .expect("bind");
     let url = server
@@ -103,7 +105,7 @@ async fn fixture(
 
 struct Client {
     tcp: TcpStream,
-    comp: HeaderCompressor,
+    enc: FrameEncoder,
     dec: FrameDecoder,
 }
 
@@ -149,27 +151,31 @@ impl Client {
         );
         Self {
             tcp,
-            comp: HeaderCompressor::new().expect("comp"),
-            dec: FrameDecoder::new(1 << 20),
+            enc: FrameEncoder::new(),
+            dec: FrameDecoder::new(),
         }
     }
 
     fn send(&mut self, frame: &Frame) {
-        let bytes = frame.encode(&mut self.comp).expect("encode");
+        let mut bytes = Vec::new();
+        self.enc.encode(frame, &mut bytes).expect("encode");
         self.tcp.write_all(&bytes).expect("send");
     }
 
     fn syn(&mut self, id: u32, kind: &str, port: &str, request_id: &str) {
         self.send(&Frame::SynStream {
-            stream: sid(id),
-            associated: 0,
+            stream_id: sid(id),
+            associated_to: 0,
             priority: 0,
             fin: false,
-            headers: vec![
-                ("streamtype".to_string(), kind.to_string()),
-                ("port".to_string(), port.to_string()),
-                ("requestid".to_string(), request_id.to_string()),
-            ],
+            unidirectional: false,
+            headers: {
+                let mut h = Headers::new();
+                h.push("streamtype", kind);
+                h.push("port", port);
+                h.push("requestid", request_id);
+                h
+            },
         });
     }
 
@@ -194,7 +200,7 @@ impl Client {
                     return None;
                 }
                 Err(e) => panic!("read failed (disconnect not observed): {e}"),
-                Ok(n) => self.dec.push(&buf[..n]).expect("push"),
+                Ok(n) => self.dec.extend(&buf[..n]),
             }
         }
     }
@@ -202,7 +208,7 @@ impl Client {
     /// `want` 個の SYN_REPLY を読み飛ばさず順に確認する。
     fn expect_reply(&mut self, id: u32) {
         match self.recv() {
-            Some(Frame::SynReply { stream, .. }) => assert_eq!(stream.get(), id),
+            Some(Frame::SynReply { stream_id, .. }) => assert_eq!(stream_id.get(), id),
             other => panic!("expected SYN_REPLY for {id}, got {other:?}"),
         }
     }
@@ -212,7 +218,11 @@ impl Client {
         let mut out = Vec::new();
         loop {
             match self.recv().expect("frame before eof") {
-                Frame::Data { stream, fin, data } if stream.get() == id => {
+                Frame::Data {
+                    stream_id,
+                    fin,
+                    data,
+                } if stream_id.get() == id => {
                     out.extend(data);
                     if fin {
                         return out;
@@ -230,7 +240,7 @@ fn sid(v: u32) -> StreamId {
 
 fn data(id: u32, fin: bool, payload: &[u8]) -> Frame {
     Frame::Data {
-        stream: sid(id),
+        stream_id: sid(id),
         fin,
         data: payload.to_vec(),
     }
@@ -263,7 +273,9 @@ async fn cri6_port_forward_round_trip() {
         let mut got = Vec::new();
         while got.len() < 5 {
             match c.recv().expect("echo") {
-                Frame::Data { stream, data, .. } if stream.get() == 3 => got.extend(data),
+                Frame::Data {
+                    stream_id, data, ..
+                } if stream_id.get() == 3 => got.extend(data),
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -312,8 +324,12 @@ async fn cri6_port_forward_concurrent_pairs() {
         let mut fins = 0;
         while fins < 4 {
             match c.recv().expect("frame") {
-                Frame::Data { stream, fin, data } => {
-                    match stream.get() {
+                Frame::Data {
+                    stream_id,
+                    fin,
+                    data,
+                } => {
+                    match stream_id.get() {
                         3 => first.extend(data),
                         7 => second.extend(data),
                         _ => assert!(data.is_empty()),
@@ -381,26 +397,31 @@ async fn cri6_port_forward_port_outside_allowed_list_refused() {
         assert_eq!(
             c.recv(),
             Some(Frame::RstStream {
-                stream: sid(1),
-                status: RST_REFUSED_STREAM
+                stream_id: sid(1),
+                status: rst_status::REFUSED_STREAM
             })
         );
         // 不正な streamtype・port・requestid の欠落も同様に拒否される。
         c.syn(3, "bogus", "8080", "0");
         c.syn(5, "data", "80x", "0");
         c.send(&Frame::SynStream {
-            stream: sid(7),
-            associated: 0,
+            stream_id: sid(7),
+            associated_to: 0,
             priority: 0,
             fin: false,
-            headers: vec![("streamtype".to_string(), "data".to_string())],
+            unidirectional: false,
+            headers: {
+                let mut h = Headers::new();
+                h.push("streamtype", "data");
+                h
+            },
         });
         for id in [3, 5, 7] {
             assert_eq!(
                 c.recv(),
                 Some(Frame::RstStream {
-                    stream: sid(id),
-                    status: RST_REFUSED_STREAM
+                    stream_id: sid(id),
+                    status: rst_status::REFUSED_STREAM
                 })
             );
         }
@@ -426,8 +447,8 @@ async fn cri6_port_forward_ping_is_echoed() {
     let path = fx.path.clone();
     blocking(move || {
         let mut c = Client::connect(addr, &path);
-        c.send(&Frame::Ping(1));
-        assert_eq!(c.recv(), Some(Frame::Ping(1)));
+        c.send(&Frame::Ping { id: 1 });
+        assert_eq!(c.recv(), Some(Frame::Ping { id: 1 }));
     })
     .await;
     drop(fx);
@@ -451,7 +472,7 @@ async fn cri6_port_forward_data_for_unknown_stream_is_reset() {
         assert_eq!(
             c.recv(),
             Some(Frame::RstStream {
-                stream: sid(7),
+                stream_id: sid(7),
                 status: 1
             })
         );
@@ -480,8 +501,8 @@ async fn cri6_port_forward_non_monotonic_stream_id_closes_session() {
         assert_eq!(
             c.recv(),
             Some(Frame::GoAway {
-                last_good: 0,
-                status: GOAWAY_PROTOCOL_ERROR
+                last_good_stream_id: 0,
+                status: goaway_status::PROTOCOL_ERROR
             })
         );
         assert_eq!(c.recv(), None);
@@ -510,7 +531,7 @@ async fn cri6_port_forward_idle_timeout_closes_session() {
         assert_eq!(
             c.recv(),
             Some(Frame::GoAway {
-                last_good: 0,
+                last_good_stream_id: 0,
                 status: 0
             })
         );
@@ -543,8 +564,8 @@ async fn cri6_port_forward_oversize_frame_closes_session() {
         assert_eq!(
             c.recv(),
             Some(Frame::GoAway {
-                last_good: 0,
-                status: GOAWAY_PROTOCOL_ERROR
+                last_good_stream_id: 0,
+                status: goaway_status::PROTOCOL_ERROR
             })
         );
         assert_eq!(c.recv(), None);
@@ -575,8 +596,8 @@ async fn cri6_port_forward_unpaired_stream_times_out() {
         assert_eq!(
             c.recv(),
             Some(Frame::RstStream {
-                stream: sid(1),
-                status: RST_CANCEL
+                stream_id: sid(1),
+                status: rst_status::CANCEL
             })
         );
     })
@@ -607,17 +628,19 @@ async fn cri6_port_forward_rejects_missing_upgrade_headers() {
     drop(fx);
 }
 
-/// CRI-6: PortForward 以外の種別（Exec）は fallback（既定 501）へ渡る。
+/// CRI-6: `StreamDispatcher` に PortForward だけを登録した構成で、未登録の種別（Exec）は 501 になる。
 #[tokio::test]
-async fn cri6_port_forward_handler_delegates_other_kinds_to_fallback() {
+async fn cri6_dispatcher_with_port_forward_only_returns_501_for_exec() {
     let handler = PortForwardHandler::new(
         Arc::new(MapDialer(HashMap::new())),
         PortForwardConfig::default(),
     )
     .expect("handler");
-    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(handler))
-        .await
-        .expect("bind");
+    let dispatcher = StreamDispatcher::new().with_port_forward(Arc::new(handler));
+    let server =
+        StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(dispatcher))
+            .await
+            .expect("bind");
     let url = server
         .issuer()
         .issue(StreamRequest::Exec(v1::ExecRequest {
@@ -671,8 +694,8 @@ async fn cri6_port_forward_session_holds_connection_permit() {
                 ) => {}
             other => panic!("second connection must be closed, got {other:?}"),
         }
-        c.send(&Frame::Ping(1));
-        assert_eq!(c.recv(), Some(Frame::Ping(1)));
+        c.send(&Frame::Ping { id: 1 });
+        assert_eq!(c.recv(), Some(Frame::Ping { id: 1 }));
         drop(c);
     })
     .await;

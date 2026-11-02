@@ -504,6 +504,13 @@ impl<B: BlockBackend> VirtioDevice for VirtioBlock<B> {
 
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
 
+    /// SIZE_MAX / SEG_MAX を広告して強制するため、両方を選ばないドライバは FEATURES_OK で拒否する（MVM-1）。
+    fn accepts_features(&self, features: FeatureBits) -> bool {
+        features.contains(FeatureBits::from_bits(
+            VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX,
+        ))
+    }
+
     fn activate(
         &mut self,
         features: FeatureBits,
@@ -949,6 +956,40 @@ mod tests {
             .activate(FeatureBits::EMPTY, &[queue_cfg(DESC, AVAIL, USED)])
             .unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+    }
+
+    /// MVM-1: SIZE_MAX / SEG_MAX の片方でも欠けた交渉は FEATURES_OK で拒否される（DRIVER_OK まで持ち越さない）。
+    #[test]
+    fn mvm1_features_ok_rejects_missing_required_feature() {
+        use crate::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+        let wr = |t: &mut VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>>,
+                  off: u64,
+                  v: u32| { t.write(off, &v.to_le_bytes()) };
+        let try_features = |low: u32| {
+            let mut t = VirtioMmioTransport::new(VirtioBlock::new(
+                MemoryBlockBackend::new(512, false).unwrap(),
+            ))
+            .unwrap();
+            wr(&mut t, reg::STATUS, 1);
+            wr(&mut t, reg::STATUS, 3);
+            wr(&mut t, reg::DRIVER_FEATURES_SEL, 0);
+            wr(&mut t, reg::DRIVER_FEATURES, low);
+            wr(&mut t, reg::DRIVER_FEATURES_SEL, 1);
+            wr(&mut t, reg::DRIVER_FEATURES, 1); // VERSION_1
+            let out = wr(&mut t, reg::STATUS, 11);
+            let mut b = [0u8; 4];
+            t.read(reg::STATUS, &mut b);
+            (out, u32::from_le_bytes(b))
+        };
+        let size = VIRTIO_BLK_F_SIZE_MAX as u32;
+        let seg = VIRTIO_BLK_F_SEG_MAX as u32;
+        assert_eq!(try_features(0), (MmioWriteOutcome::FeaturesRejected, 3));
+        assert_eq!(try_features(size), (MmioWriteOutcome::FeaturesRejected, 3));
+        assert_eq!(try_features(seg), (MmioWriteOutcome::FeaturesRejected, 3));
+        assert_eq!(
+            try_features(size | seg),
+            (MmioWriteOutcome::FeaturesAccepted, 11)
+        );
     }
 
     #[test]

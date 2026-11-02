@@ -304,6 +304,12 @@ pub trait VirtioDevice {
     fn read_config(&self, offset: u64, data: &mut [u8]);
     /// 設定空間の書き込み（同上）。
     fn write_config(&mut self, offset: u64, data: &[u8]);
+    /// ドライバが選んだ feature をデバイス固有の必須条件で検証する。`false` なら FEATURES_OK を
+    /// 立てずに交渉を拒否する（VIRTIO 1.2 3.1.1。DRIVER_OK 時の DEVICE_NEEDS_RESET に頼らない）。
+    /// 既定は常に受理。
+    fn accepts_features(&self, _features: FeatureBits) -> bool {
+        true
+    }
     /// DRIVER_OK に達したとき 1 回呼ばれる。失敗は DEVICE_NEEDS_RESET になる。
     fn activate(
         &mut self,
@@ -726,7 +732,10 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
     fn negotiate(&mut self, new: DeviceStatus) -> MmioWriteOutcome {
         let [low, high] = self.driver_features;
         let driver = FeatureBits::from_bits(u64::from(low) | (u64::from(high) << 32));
-        if driver.is_subset_of(self.offered_features()) && driver.contains(FeatureBits::VERSION_1) {
+        if driver.is_subset_of(self.offered_features())
+            && driver.contains(FeatureBits::VERSION_1)
+            && self.device.accepts_features(driver)
+        {
             self.negotiated = Some(driver);
             self.status = new;
             MmioWriteOutcome::FeaturesAccepted

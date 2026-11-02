@@ -14,7 +14,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use fandhe_container_cri::shim_v2::{
-    DeleteResponse, FrameHeader, HEADER_LEN, MessageType, TtrpcRequest, TtrpcResponse,
+    DeleteResponse, FrameHeader, HEADER_LEN, MessageType, ShutdownRequest, TtrpcRequest,
+    TtrpcResponse,
 };
 use prost::Message;
 
@@ -86,11 +87,16 @@ fn sock_of(address: &str) -> PathBuf {
 }
 
 fn call(path: &Path, service: &str) -> TtrpcResponse {
+    call_method(path, service, "Create", Vec::new())
+}
+
+fn call_method(path: &Path, service: &str, method: &str, payload: Vec<u8>) -> TtrpcResponse {
     let mut s = UnixStream::connect(path).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let body = TtrpcRequest {
         service: service.into(),
-        method: "Create".into(),
+        method: method.into(),
+        payload,
         ..Default::default()
     }
     .encode_to_vec();
@@ -176,6 +182,49 @@ fn cri5_872_delete_cleans_up_and_daemon_exits() {
         }
         assert!(!daemon_alive(&id), "daemon must exit after delete");
     }
+}
+
+/// CRI-5・TASK-62.7.2・#873: Shutdown RPC がデーモンを正常終了させ、socket と lock を片付け、再 start できる。
+#[test]
+fn cri5_873_shutdown_rpc_ends_daemon() {
+    let sc = Scratch::new();
+    let id = format!("sd{}", std::process::id());
+    let addr = start_ok(&sc, &id);
+    let sock = sock_of(&addr);
+    let payload = ShutdownRequest {
+        id: id.clone(),
+        now: false,
+    }
+    .encode_to_vec();
+    let r = call_method(&sock, "containerd.task.v2.Task", "Shutdown", payload);
+    assert!(r.status.is_none(), "{:?}", r.status);
+    assert!(r.payload.is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while sock.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!sock.exists(), "socket must be removed after shutdown");
+    let lock = PathBuf::from(format!("{}.lock", sock.display()));
+    assert!(!lock.exists(), "lock must be removed after shutdown");
+    #[cfg(target_os = "linux")]
+    {
+        while daemon_alive(&id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!daemon_alive(&id), "daemon must exit after shutdown");
+    }
+    // 正常終了ならエラー行（`"code"` を含む JSON）は daemon.log に残らない。
+    let log = std::fs::read_to_string(sc.sock_dir().join("daemon.log")).unwrap_or_default();
+    assert!(!log.contains("\"code\""), "{log}");
+    assert!(!log.contains("left in place"), "{log}");
+    // 同じ id で再 start できる。
+    let again = start_ok(&sc, &id);
+    assert_eq!(again, addr);
+    assert!(
+        run(&sc, &id, "delete", &["-bundle", "/tmp/b"])
+            .status
+            .success()
+    );
 }
 
 /// CRI-5・#872: 残骸の socket があっても start は置き換えて成功する。

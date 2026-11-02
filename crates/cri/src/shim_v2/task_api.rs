@@ -1,7 +1,7 @@
-//! containerd Task API のメッセージ型（Create / Start / Delete / Exec / Wait 分。CRI-5・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・MS-7）。
+//! containerd Task API のメッセージ型（Create / Start / Delete / Exec / Wait / State / Kill / Shutdown 分。CRI-5・TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2・MS-7）。
 //!
 //! containerd の `api/runtime/task/v2/shim.proto`（commit `aefce4e7cdbf9a8ce754cd4edb1de5d44f0c704d`）と
-//! `api/types/mount.proto` のフィールド番号を prost の derive で手書きする。`.proto` は持ち込まない
+//! `api/types/mount.proto`・`api/types/task/task.proto`（`Status` enum）のフィールド番号を prost の derive で手書きする。`.proto` は持ち込まない
 //! （#670。取り込みと SPDX・NOTICE の扱いは #669 で決める）。同 commit で v3 の `shim.proto` と diff した
 //! ところ `package` と `go_package` の 2 行以外は同一だったため、1 組の型で v2 / v3 の両サービスを扱える
 //! （版はサービス名だけで区別する。決定は #669）。
@@ -182,6 +182,106 @@ pub struct ExecProcessRequest {
     pub spec: Option<Any>,
 }
 
+/// `containerd.v1.types.Status`（State の応答の状態。番号は `api/types/task/task.proto`）。
+///
+/// `Paused` / `Pausing` は core に対応が無く shim は返さない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum TaskStatus {
+    /// 不明。
+    Unknown = 0,
+    /// 作成済み・未起動。
+    Created = 1,
+    /// 実行中。
+    Running = 2,
+    /// 停止済み。
+    Stopped = 3,
+    /// 一時停止（未対応）。
+    Paused = 4,
+    /// 一時停止中（未対応）。
+    Pausing = 5,
+}
+
+/// `StateRequest`（State RPC。TASK-62.7.2）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StateRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// exec の ID。空でなければ exec の状態（未対応）。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+}
+
+/// `StateResponse`。
+///
+/// `bundle`・stdio・`terminal`・`exited_at`・`exec_id` は shim が持たない（または core が持たない）ため
+/// 常に空・未設定（REPAIR-3）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StateResponse {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// bundle のパス。未提供（空）。
+    #[prost(string, tag = "2")]
+    pub bundle: String,
+    /// init プロセスの PID。0 は「不明」。
+    #[prost(uint32, tag = "3")]
+    pub pid: u32,
+    /// 状態（[`TaskStatus`] の値）。
+    #[prost(enumeration = "TaskStatus", tag = "4")]
+    pub status: i32,
+    /// stdin の FIFO。未対応（空）。
+    #[prost(string, tag = "5")]
+    pub stdin: String,
+    /// stdout の FIFO。未対応（空）。
+    #[prost(string, tag = "6")]
+    pub stdout: String,
+    /// stderr の FIFO。未対応（空）。
+    #[prost(string, tag = "7")]
+    pub stderr: String,
+    /// pty の要否。未対応（false）。
+    #[prost(bool, tag = "8")]
+    pub terminal: bool,
+    /// 終了コード（停止済みのときだけ意味を持つ）。
+    #[prost(uint32, tag = "9")]
+    pub exit_status: u32,
+    /// 終了時刻。core が持たないため常に未設定。
+    #[prost(message, optional, tag = "10")]
+    pub exited_at: Option<Timestamp>,
+    /// exec の ID。常に空。
+    #[prost(string, tag = "11")]
+    pub exec_id: String,
+}
+
+/// `KillRequest`（Kill RPC。TASK-62.7.2）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct KillRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// exec の ID。空でなければ exec への送信（未対応）。
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+    /// シグナル番号。
+    #[prost(uint32, tag = "3")]
+    pub signal: u32,
+    /// 全プロセスへ送るか。core は init にしか送れないため真は拒否する。
+    #[prost(bool, tag = "4")]
+    pub all: bool,
+}
+
+/// `ShutdownRequest`（Shutdown RPC。TASK-62.7.2）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShutdownRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// コンテナが残っていても終了するか。
+    #[prost(bool, tag = "2")]
+    pub now: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +403,64 @@ mod tests {
         assert_eq!(
             ExecProcessRequest::decode(&r.encode_to_vec()[..]).unwrap(),
             r
+        );
+    }
+
+    /// CRI-5・TASK-62.7.2: State / Kill / Shutdown の番号の固定バイト列。
+    #[test]
+    fn cri5_873_state_kill_shutdown_wire_bytes() {
+        let r = StateRequest {
+            id: "a".into(),
+            exec_id: "e".into(),
+        };
+        assert_eq!(r.encode_to_vec(), [0x0a, 1, b'a', 0x12, 1, b'e']);
+        let s = StateResponse {
+            id: "a".into(),
+            bundle: "b".into(),
+            pid: 7,
+            status: TaskStatus::Stopped as i32,
+            stdin: "i".into(),
+            stdout: "o".into(),
+            stderr: "r".into(),
+            terminal: true,
+            exit_status: 3,
+            exited_at: Some(Timestamp {
+                seconds: 1,
+                nanos: 2,
+            }),
+            exec_id: "x".into(),
+        };
+        assert_eq!(
+            s.encode_to_vec(),
+            [
+                0x0a, 1, b'a', 0x12, 1, b'b', 0x18, 7, 0x20, 3, 0x2a, 1, b'i', 0x32, 1, b'o', 0x3a,
+                1, b'r', 0x40, 1, 0x48, 3, 0x52, 4, 0x08, 1, 0x10, 2, 0x5a, 1, b'x'
+            ]
+        );
+        assert_eq!(StateResponse::decode(&s.encode_to_vec()[..]).unwrap(), s);
+        let k = KillRequest {
+            id: "a".into(),
+            exec_id: "e".into(),
+            signal: 15,
+            all: true,
+        };
+        assert_eq!(
+            k.encode_to_vec(),
+            [0x0a, 1, b'a', 0x12, 1, b'e', 0x18, 15, 0x20, 1]
+        );
+        let d = ShutdownRequest {
+            id: "a".into(),
+            now: true,
+        };
+        assert_eq!(d.encode_to_vec(), [0x0a, 1, b'a', 0x10, 1]);
+        assert_eq!(
+            [
+                TaskStatus::Unknown as i32,
+                TaskStatus::Created as i32,
+                TaskStatus::Running as i32,
+                TaskStatus::Stopped as i32
+            ],
+            [0, 1, 2, 3]
         );
     }
 }

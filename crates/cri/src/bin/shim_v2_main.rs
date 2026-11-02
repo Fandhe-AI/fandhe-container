@@ -2,7 +2,7 @@
 //!
 //! containerd が exec する shim バイナリの薄い main。引数の解釈と start / delete / serve の本体は
 //! `fandhe_container_cri::shim_v2::bootstrap` にあり、ここでは結果の出力と終了コードだけを扱う。
-//! 登録するサービスは中身の無い Task サービス（v2・v3）だけで、本番の `ContainerRuntime` の結線は
+//! 登録するサービスは中身の無い Task サービス（v2・v3。Shutdown RPC だけは処理してデーモンを終了させる。TASK-62.7.2）だけで、本番の `ContainerRuntime` の結線は
 //! 後続（cri は plugin-cri へ依存できないため。bootstrap の doc を参照。REPAIR-3）。
 //! 失敗時は stdout へ何も書かず、stderr へ `{"code":"<CODE>","message":"<message>"}` の 1 行（JSON）を出して終了コード 1 にする（ERR 系）。
 //! start の成功経路では stderr へ何も書かない（containerd が stdout と stderr をまとめて読むため）。
@@ -13,13 +13,17 @@ use std::sync::Arc;
 
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::bootstrap::{parse_args, run};
-use fandhe_container_cri::shim_v2::{EmptyTaskService, ServiceRegistry, TaskApiVersion};
+use fandhe_container_cri::shim_v2::{
+    EmptyTaskService, ServiceRegistry, ShutdownSignal, TaskApiVersion,
+};
 
-fn registry() -> Result<ServiceRegistry, CriError> {
+fn registry(signal: ShutdownSignal) -> Result<ServiceRegistry, CriError> {
     let mut reg = ServiceRegistry::new();
     for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
-        reg.register(Arc::new(EmptyTaskService::new(v)))
-            .map_err(|_| CriError::internal("cannot register task service"))?;
+        reg.register(Arc::new(
+            EmptyTaskService::new(v).with_shutdown(signal.clone()),
+        ))
+        .map_err(|_| CriError::internal("cannot register task service"))?;
     }
     Ok(reg)
 }

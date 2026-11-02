@@ -27,6 +27,8 @@
 //! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
 //! サーバーは要求を接続内で並行 dispatch するため待ちは他の RPC を止めず、停止・切断の通知を受けた Wait は期限前に取り消される。
 //!
+//! Connect（TASK-62.6）: `id` をアダプタの state で確かめ、`shim_pid`（自プロセス）と `task_pid`（無ければ 0）を返す。`version` は空。
+//!
 //! State / Kill / Shutdown（TASK-62.7.2）:
 //! - State: `exec_id` 非空は `UNIMPLEMENTED`。状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
 //!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`bundle`・stdio・`terminal`・`exited_at` は
@@ -54,9 +56,9 @@ use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
 use super::shutdown::ShutdownSignal;
 use super::task_api::{
-    CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    KillRequest, ShutdownRequest, StartRequest, StartResponse, StateRequest, StateResponse,
-    TaskStatus, WaitRequest, WaitResponse,
+    ConnectRequest, ConnectResponse, CreateTaskRequest, CreateTaskResponse, DeleteRequest,
+    DeleteResponse, ExecProcessRequest, KillRequest, ShutdownRequest, StartRequest, StartResponse,
+    StateRequest, StateResponse, TaskStatus, WaitRequest, WaitResponse,
 };
 use super::wait::WaitConfig;
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
@@ -160,6 +162,21 @@ impl TaskService {
             status: status as i32,
             exit_status,
             ..Default::default()
+        }
+        .encode_to_vec())
+    }
+
+    /// `Connect`: shim デーモンと init プロセスの PID を返す（TASK-62.6・CRI-5）。
+    ///
+    /// containerd の `shimTask.PID` が Create の直後と Wait の前に呼び、失敗すると Create 全体が失敗する
+    /// （containerd v2.1.4 `plugins/services/tasks/local.go`・`core/runtime/v2/shim.go`）。未起動は `task_pid = 0`。
+    fn connect(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        let req = ConnectRequest::decode(payload).map_err(|_| decode_failure())?;
+        let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
+        Ok(ConnectResponse {
+            shim_pid: std::process::id(),
+            task_pid: st.pid.unwrap_or(0),
+            version: String::new(),
         }
         .encode_to_vec())
     }
@@ -468,6 +485,7 @@ impl TtrpcService for TaskService {
             "State" => self.state(payload),
             "Kill" => self.kill(payload),
             "Shutdown" => self.shutdown(payload),
+            "Connect" => self.connect(payload),
             _ => Err(unimplemented_status("method", method)),
         }
     }
@@ -548,7 +566,10 @@ mod tests {
 
     use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL};
     use super::super::service::RequestDeadline;
-    use super::super::task_api::{Any, KillRequest as WireKill, Mount, StateRequest as WireState};
+    use super::super::task_api::{
+        Any, ConnectRequest, ConnectResponse, KillRequest as WireKill, Mount,
+        StateRequest as WireState,
+    };
     use super::*;
 
     /// 呼び出しと状態を記録する偽のランタイム。
@@ -1095,6 +1116,28 @@ mod tests {
                 .unwrap()
                 .insert("c1".into(), ContainerStatus::stopped(id, None));
             assert_eq!(state_of(&s, "c1").exit_status, 255);
+        }
+    }
+
+    /// CRI-5・TASK-62.6: Connect は Created で task_pid 0・Running で pid・shim_pid は自 pid を返す。
+    #[test]
+    fn cri5_676_connect_reports_pids() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, _) = svc(v, Fake::default());
+            let conn = |id: &str| {
+                s.handle("Connect", &ConnectRequest { id: id.into() }.encode_to_vec())
+                    .map(|o| ConnectResponse::decode(&o[..]).unwrap())
+            };
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            let r = conn("c1").unwrap();
+            assert_eq!(
+                (r.shim_pid, r.task_pid, r.version.as_str()),
+                (std::process::id(), 0, "")
+            );
+            s.handle("Start", &start_req("c1")).unwrap();
+            assert_eq!(conn("c1").unwrap().task_pid, 4242);
+            assert_eq!(conn("nope").unwrap_err().code, NOT_FOUND);
+            assert_eq!(err_code(s.handle("Connect", &[0xff, 0xff])).0, INVALID);
         }
     }
 

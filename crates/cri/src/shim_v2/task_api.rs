@@ -254,6 +254,31 @@ pub struct StateResponse {
     pub exec_id: String,
 }
 
+/// `ConnectRequest`（Connect RPC。TASK-62.6・CRI-5）。
+///
+/// containerd は Create の直後（`shimTask.PID`）と Wait の前に呼ぶ。出典: containerd
+/// `api/runtime/task/v2/shim.proto`（v2.1.4）の `ConnectRequest`。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConnectRequest {
+    /// コンテナ ID。
+    #[prost(string, tag = "1")]
+    pub id: String,
+}
+
+/// `ConnectResponse`。`version` は containerd が使わないため常に空（REPAIR-3）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConnectResponse {
+    /// shim デーモン自身の PID。
+    #[prost(uint32, tag = "1")]
+    pub shim_pid: u32,
+    /// init プロセスの PID。0 は「未起動または不明」。
+    #[prost(uint32, tag = "2")]
+    pub task_pid: u32,
+    /// shim の版。常に空。
+    #[prost(string, tag = "3")]
+    pub version: String,
+}
+
 /// `KillRequest`（Kill RPC。TASK-62.7.2）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct KillRequest {

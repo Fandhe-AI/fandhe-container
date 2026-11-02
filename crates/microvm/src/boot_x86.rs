@@ -1,6 +1,6 @@
 //! x86_64 の Linux カーネル（bzImage）・initrd・cmdline のゲストメモリへのロード（TASK-75.3.1・MVM-1・MS-7。OS 非依存・unsafe なし）。
 //!
-//! 呼び出し元は [`crate::microvm::MicroVm::load_kernel`]（Linux のみ）と、将来の plugin-microvm（TASK-117）。
+//! 呼び出し元は `MicroVm::load_kernel`（Linux のみ）と、将来の plugin-microvm（TASK-117）。
 //! 戻り値の [`LoadedKernel`] を #885（TASK-75.3.2。vCPU のレジスタ初期化）が受け取り、`entry` を RIP、`boot_params` を RSI に設定する。
 //!
 //! # 準拠するブートプロトコル（一次情報）
@@ -256,15 +256,33 @@ impl KernelCmdline {
                 "kernel command line must be printable ASCII without control characters",
             ));
         }
-        let mut text = user.to_owned();
+        // カーネルは単独の `--` 以降を init の引数として扱うため、自動生成項目はその前に挿入する。
+        let (head, tail) = match user.split(' ').position(|t| t == "--") {
+            Some(i) => {
+                let off: usize = user.split(' ').take(i).map(|t| t.len() + 1).sum();
+                (user[..off].trim_end_matches(' '), &user[off..])
+            }
+            None => (user, ""),
+        };
+        let mut text = head.to_owned();
+        // 追加前に残り容量（終端 NUL 分を含む）を確認し、拒否する入力のために確保を膨らませない。
+        let limit = usize::try_from(CMDLINE_CAPACITY - 1).unwrap_or(0);
+        let mut total = text.len() + if tail.is_empty() { 0 } else { 1 + tail.len() };
         for d in devices {
+            let item = format!("virtio_mmio.device=0x{:x}@0x{:x}:{}", d.len, d.base, d.gsi);
+            let add = item.len() + usize::from(!text.is_empty());
+            total = total.saturating_add(add);
+            if total > limit {
+                return Err(invalid("kernel command line too long"));
+            }
             if !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(&format!(
-                "virtio_mmio.device=0x{:x}@0x{:x}:{}",
-                d.len, d.base, d.gsi
-            ));
+            text.push_str(&item);
+        }
+        if !tail.is_empty() {
+            text.push(' ');
+            text.push_str(tail);
         }
         if text.len() as u64 >= CMDLINE_CAPACITY {
             return Err(invalid("kernel command line too long"));
@@ -732,6 +750,40 @@ mod tests {
             KernelCmdline::new("", &devs[..1]).unwrap().as_str(),
             "virtio_mmio.device=0x1000@0xd0000000:5"
         );
+    }
+
+    /// MVM-1・TASK-75.3.1: user の `--` より前に virtio 項目を入れ、`--` 以降は init 引数のまま保つ。
+    #[test]
+    fn mvm1_884_cmdline_inserts_devices_before_double_dash() {
+        let d = [VirtioMmioParam {
+            base: 0xd000_0000,
+            len: 0x1000,
+            gsi: 5,
+        }];
+        assert_eq!(
+            KernelCmdline::new("console=ttyS0 -- rescue", &d)
+                .unwrap()
+                .as_str(),
+            "console=ttyS0 virtio_mmio.device=0x1000@0xd0000000:5 -- rescue"
+        );
+        assert_eq!(
+            KernelCmdline::new("-- rescue", &d).unwrap().as_str(),
+            "virtio_mmio.device=0x1000@0xd0000000:5 -- rescue"
+        );
+    }
+
+    /// MVM-1・TASK-75.3.1: 件数が多く容量を超える devices は途中で拒否する。
+    #[test]
+    fn mvm1_884_cmdline_rejects_oversized_devices() {
+        let d = vec![
+            VirtioMmioParam {
+                base: 0xd000_0000,
+                len: 0x1000,
+                gsi: 5,
+            };
+            1_000
+        ];
+        assert!(KernelCmdline::new("", &d).is_err());
     }
 
     /// MVM-1・TASK-75.3.1: 非 relocatable は pref_address、pref_address の無い relocatable は alignment で切り上げた 1 MiB に置く。

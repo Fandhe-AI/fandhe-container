@@ -219,6 +219,7 @@ impl TtrpcServer {
             None => (None, None),
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let dispatching = Arc::new(AtomicUsize::new(0));
         let ctx = Arc::new(Ctx {
             registry: Arc::clone(&self.registry),
             recorder: Arc::clone(&self.recorder),
@@ -227,6 +228,7 @@ impl TtrpcServer {
             config: self.config.clone(),
             stop: Arc::clone(&stop),
             active: AtomicUsize::new(0),
+            dispatching: Arc::clone(&dispatching),
         });
         let accept = thread::Builder::new()
             .name("ttrpc-accept".into())
@@ -234,6 +236,7 @@ impl TtrpcServer {
             .map_err(|e| ShimV2Error::Listener(e.kind()))?;
         Ok(ServerHandle {
             stop,
+            dispatching,
             accept: Some(accept),
             audit_done,
             shutdown_timeout: self.config.shutdown_timeout,
@@ -245,6 +248,7 @@ impl TtrpcServer {
 /// 起動中のサーバーの操作口。Drop でも停止フラグを立てる（join はしない）。
 pub struct ServerHandle {
     stop: Arc<AtomicBool>,
+    dispatching: Arc<AtomicUsize>,
     accept: Option<JoinHandle<()>>,
     /// 監査の書き込みスレッドの終了通知(監査なしなら `None`)。送信側は `Ctx` だけが持つため、accept スレッドと
     /// 接続スレッドが終わって `Ctx` が落ちると、スレッドは残りを書いて終わり通知を送る。
@@ -254,6 +258,21 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// 処理中の要求（応答の書き込み完了まで）が無くなるか `grace` が過ぎるまで待ち、空になったかを返す。
+    ///
+    /// Shutdown RPC の応答は `shutdown` の停止フラグで書き込みを打ち切られるため、デーモンは停止の前に
+    /// これで応答を流し切る（TASK-62.7.2・REPAIR-5）。待ちは `grace` で必ず打ち切る。
+    pub fn wait_idle(&self, grace: Duration) -> bool {
+        let deadline = deadline_after(Instant::now(), grace);
+        while self.dispatching.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
     /// 停止して、期限内にスレッドの終了と監査キューの排出を待つ(SEC-4・REPAIR-5)。
     ///
     /// accept・接続スレッドの終了後に `Ctx`(監査の送信側)が落ち、監査スレッドが残りを書き終えて通知する。これを
@@ -299,6 +318,8 @@ struct Ctx {
     config: ServerConfig,
     stop: Arc<AtomicBool>,
     active: AtomicUsize,
+    /// 全接続の処理中（読み込み後〜応答の書き込み完了）の要求数。`ServerHandle::wait_idle` が読む。
+    dispatching: Arc<AtomicUsize>,
 }
 
 /// 接続スレッドの終了で接続数を戻す。
@@ -800,10 +821,12 @@ fn conn_loop<'scope, 'env>(
                                         ),
                                     )
                                 } else {
+                                    ctx.dispatching.fetch_add(1, Ordering::SeqCst);
                                     let spawned = thread::Builder::new()
                                         .name("ttrpc-req".into())
                                         .spawn_scoped(scope, move || {
                                             let _g = InflightGuard(inflight);
+                                            let _d = InflightGuard(&ctx.dispatching);
                                             let cancelled = || {
                                                 ctx.stop.load(Ordering::SeqCst)
                                                     || done.load(Ordering::SeqCst)
@@ -824,6 +847,7 @@ fn conn_loop<'scope, 'env>(
                                         // spawn 失敗時は closure ごと破棄され guard が戻らないため手で戻す。
                                         Err(_) => {
                                             inflight.fetch_sub(1, Ordering::SeqCst);
+                                            ctx.dispatching.fetch_sub(1, Ordering::SeqCst);
                                             (
                                                 CriOpKind::ShimV2Dispatch,
                                                 status_response(
@@ -877,6 +901,7 @@ mod tests {
             config: ServerConfig::default(),
             stop: Arc::new(AtomicBool::new(false)),
             active: AtomicUsize::new(0),
+            dispatching: Arc::new(AtomicUsize::new(0)),
         }
     }
 

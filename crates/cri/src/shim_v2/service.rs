@@ -3,12 +3,17 @@
 //! `server` が復号した [`TtrpcRequest`] を [`ServiceRegistry::dispatch`] へ渡し、
 //! サービス名で [`TtrpcService`] を引いて呼ぶ。未知のサービス・メソッドは `Unimplemented`。
 //! [`EmptyTaskService`] はどのメソッドにも `Unimplemented` を返す空の Task サービスで、ランタイム未注入の起動経路用。
-//! Create / Start / Delete を持つ実装は `task_service::TaskService`（TASK-62.2・TASK-62.3.1）。Wait は TASK-62.3.2、State / Kill 等は後続 issue（REPAIR-3）。
+//! Create / Start / Delete / Wait / State / Kill / Shutdown を持つ実装は `task_service::TaskService`（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.7.2）。
+//! [`EmptyTaskService`] も Shutdown だけは処理する（ランタイムを持たずコンテナが無いため無条件に終了を要求する。TASK-62.7.2）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use prost::Message;
+
 use super::message::{RpcStatus, TtrpcRequest, TtrpcResponse};
+use super::shutdown::ShutdownSignal;
+use super::task_api::ShutdownRequest;
 use crate::error::CriErrorCode;
 
 /// 応答 message に入れる名前の最大バイト数（外部入力で応答が肥大化しないよう切る）。
@@ -51,16 +56,26 @@ pub trait TtrpcService: Send + Sync {
     }
 }
 
-/// 空の Task サービス。全メソッドに `Unimplemented` を返す。
-#[derive(Debug, Clone, Copy)]
+/// 空の Task サービス。`with_shutdown` で終了要求の送り先を差し込んだときの Shutdown 以外は `Unimplemented` を返す。
+#[derive(Debug, Clone)]
 pub struct EmptyTaskService {
     version: TaskApiVersion,
+    shutdown: Option<ShutdownSignal>,
 }
 
 impl EmptyTaskService {
     /// 版を指定して作る。
     pub fn new(version: TaskApiVersion) -> Self {
-        Self { version }
+        Self {
+            version,
+            shutdown: None,
+        }
+    }
+
+    /// Shutdown RPC の終了要求の送り先を差し込む（TASK-62.7.2）。
+    pub fn with_shutdown(mut self, signal: ShutdownSignal) -> Self {
+        self.shutdown = Some(signal);
+        self
     }
 }
 
@@ -69,8 +84,17 @@ impl TtrpcService for EmptyTaskService {
         self.version.service_name()
     }
 
-    fn handle(&self, method: &str, _payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
-        Err(unimplemented_status("method", method))
+    fn handle(&self, method: &str, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
+        match (method, self.shutdown.as_ref()) {
+            ("Shutdown", Some(signal)) => {
+                ShutdownRequest::decode(payload).map_err(|_| {
+                    RpcStatus::from_code(CriErrorCode::InvalidArgument, "malformed request payload")
+                })?;
+                signal.request();
+                Ok(Vec::new())
+            }
+            _ => Err(unimplemented_status("method", method)),
+        }
     }
 }
 
@@ -174,6 +198,34 @@ mod tests {
             assert_eq!(st.code, code);
             assert_eq!(st.message, "method Create");
         }
+    }
+
+    /// CRI-5・TASK-62.7.2: Shutdown だけは処理し、他は Unimplemented のまま。
+    #[test]
+    fn cri5_873_empty_service_shutdown() {
+        let sig = ShutdownSignal::new();
+        let mut reg = ServiceRegistry::new();
+        reg.register(Arc::new(
+            EmptyTaskService::new(TaskApiVersion::V2).with_shutdown(sig.clone()),
+        ))
+        .unwrap();
+        let mut r = req("containerd.task.v2.Task", "Shutdown");
+        r.payload = vec![0xff, 0xff];
+        assert_eq!(reg.dispatch(&r).status.unwrap().code, 3);
+        assert!(!sig.is_requested());
+        r.payload = ShutdownRequest {
+            id: "x".into(),
+            now: false,
+        }
+        .encode_to_vec();
+        let resp = reg.dispatch(&r);
+        assert!(resp.status.is_none() && resp.payload.is_empty());
+        assert!(sig.is_requested());
+        let st = reg
+            .dispatch(&req("containerd.task.v2.Task", "State"))
+            .status
+            .unwrap();
+        assert_eq!(st.code, 12);
     }
 
     /// CRI-5: 二重登録は Err、未知サービスは Unimplemented。

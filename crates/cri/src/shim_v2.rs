@@ -9,7 +9,8 @@
 //! - [`frame`]: 10 バイトのヘッダ（壊れた値を表現できない型。REPAIR-2）
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
-//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4）
+//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait / State / Kill / Shutdown のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2）
+//! - [`shutdown`]: Shutdown RPC からデーモンへ終了を伝えるシグナル（TASK-62.7.2）
 //! - [`bootstrap`]: 起動バイナリの start / delete / serve と引数解釈（TASK-62.7.1・#872）
 //! - [`wait`]: Wait の期限と照会間隔の設定・ポーリング本体（TASK-62.3.2）
 //! - [`exec`]: Exec の検証済み型・登録簿・起動役のトレイト（TASK-62.4）
@@ -26,7 +27,7 @@
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）:
 //! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669）。メッセージ型は手書きでサービス名だけで版を分ける
-//! - State / Kill / Shutdown（#873）。`Unimplemented`
+//! - State / Kill の exec_id 指定・Kill の `all`・State の `bundle`・stdio・`exited_at`（常に空・未設定または `UNIMPLEMENTED`。TASK-62.7.2）。Pause / Resume / Pids / Stats 等の他メソッドは `Unimplemented`
 //! - Wait の `exec_id`・`exited_at`（常に未設定）・`timeout_nano`（期限は shim 側の [`wait::WaitConfig`] だけで決める）。
 //!   サーバーは接続内で要求ごとに並行 dispatch し（同時処理数に上限あり）、Wait の待ちは他の RPC を止めない。
 //!   サーバーの停止・接続の切断・応答の書き込み失敗は処理中のハンドラへ通知され、Wait は期限前に取り消される
@@ -45,6 +46,7 @@ pub mod message;
 #[cfg(unix)]
 pub mod server;
 pub mod service;
+pub mod shutdown;
 pub mod task_api;
 pub mod task_service;
 pub mod wait;
@@ -55,9 +57,11 @@ pub use message::{KeyValue, RpcStatus, TtrpcRequest, TtrpcResponse};
 #[cfg(unix)]
 pub use server::{ServerConfig, ServerHandle, ShimV2Error, TtrpcServer};
 pub use service::{EmptyTaskService, ServiceRegistry, TaskApiVersion, TtrpcService};
+pub use shutdown::ShutdownSignal;
 pub use task_api::{
     Any, CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    Mount, StartRequest, StartResponse, Timestamp, WaitRequest, WaitResponse,
+    KillRequest, Mount, ShutdownRequest, StartRequest, StartResponse, StateRequest, StateResponse,
+    TaskStatus, Timestamp, WaitRequest, WaitResponse,
 };
 pub use task_service::TaskService;
 pub use wait::WaitConfig;

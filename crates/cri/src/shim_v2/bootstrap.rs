@@ -40,8 +40,9 @@
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
 //!
 //! 範囲外（REPAIR-3。未実装を装わない）:
-//! - State / Kill / Shutdown（#873）。デーモンの寿命は暫定で socket の `(dev, ino)` の生存確認（1 秒間隔）に結びつけ、
-//!   #873 で Shutdown RPC に置き換えるか併用する
+//! - デーモンの寿命は Shutdown RPC（[`ShutdownSignal`]。TASK-62.7.2・#873）と socket の `(dev, ino, mtime)` の生存確認（1 秒間隔。
+//!   delete 経路用）の併用。Shutdown で抜けたときは応答を流し切る有界な猶予（`SHUTDOWN_RESPONSE_GRACE`）の後にサーバーを止め、
+//!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
 //! - delete での実行層のコンテナの後始末（本番の runtime の結線後）
 //! - stdin の options・`-publish-binary` のイベント publish・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
@@ -52,6 +53,7 @@ use std::path::PathBuf;
 use fandhe_container_oci::reference::Digest;
 
 use super::service::ServiceRegistry;
+use super::shutdown::ShutdownSignal;
 use crate::error::CriError;
 
 /// 起動バイナリ名。containerd の runtime_type `io.containerd.fandhe-container.v2` に対応する。
@@ -341,11 +343,12 @@ fn version_text() -> Vec<u8> {
 
 /// 操作を実行し、stdout へ書くバイト列を返す（serve は終了まで戻らず空を返す）。
 ///
-/// `make_registry` は serve だけが呼ぶ（サービスの注入口。本モジュールの doc を参照）。
+/// `make_registry` は serve だけが呼ぶ（サービスの注入口。本モジュールの doc を参照）。渡される [`ShutdownSignal`] を
+/// Task サービスの `with_shutdown` に差し込むと、Shutdown RPC でデーモンが終了する（TASK-62.7.2）。
 #[cfg(unix)]
 pub fn run<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<u8>, CriError>
 where
-    F: FnOnce() -> Result<ServiceRegistry, CriError>,
+    F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -369,7 +372,7 @@ where
 #[cfg(not(unix))]
 pub fn run<F>(inv: ShimInvocation, _make_registry: F) -> Result<Vec<u8>, CriError>
 where
-    F: FnOnce() -> Result<ServiceRegistry, CriError>,
+    F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -405,6 +408,7 @@ mod unix_impl {
     use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
     use crate::shim_v2::server::{ServerConfig, TtrpcServer};
     use crate::shim_v2::service::ServiceRegistry;
+    use crate::shim_v2::shutdown::ShutdownSignal;
     use fandhe_container_core::audit_log::AuditSink;
     #[cfg(target_os = "linux")]
     use fandhe_container_core::audit_log::{ControlAuditRelay, FileAuditSink};
@@ -421,6 +425,8 @@ mod unix_impl {
     const REAP_TIMEOUT: Duration = Duration::from_secs(5);
     /// デーモンが socket の生存を確かめる間隔。
     const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+    /// Shutdown で抜けたあと、処理中の要求（Shutdown 自身の応答を含む）を流し切るのを待つ上限（REPAIR-5）。
+    const SHUTDOWN_RESPONSE_GRACE: Duration = Duration::from_secs(1);
     /// 同一 id の排他ロックを待つ上限（REPAIR-5）。
     const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
     /// ロックの再試行間隔。
@@ -1203,7 +1209,7 @@ mod unix_impl {
     /// 5. `run_serve`
     pub fn run_daemon<F>(inv: &ShimInvocation, dir: &Path, make_registry: F) -> Result<(), CriError>
     where
-        F: FnOnce() -> Result<ServiceRegistry, CriError>,
+        F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
     {
         let expected = socket_path(dir, inv)?;
         let listener = adopt_stdin_listener(&expected)?;
@@ -1217,11 +1223,50 @@ mod unix_impl {
             .map_err(|_| internal("cannot redirect stdin"))?;
         drop(null);
         let audit = open_audit_sink()?;
-        run_serve(dir, listener, &expected, audit, make_registry)
+        run_serve(inv, dir, listener, &expected, audit, make_registry)
     }
 
-    /// デーモン本体。取り込み済みの listener で serve し、socket が消えたら終わる(`run_daemon` から呼ばれる)。
+    /// socket の同一性。inode の再利用（delete 直後の再 start）を見分けるため mtime（bind 時刻）も併用する。
+    fn sock_ident(p: &Path) -> Option<(u64, u64, i64, i64)> {
+        fs::symlink_metadata(p)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
+    }
+
+    /// Shutdown で抜けたあとの片付け。ロック保持下で、自分が bind した実体（`first` と一致）だけを消す。
+    ///
+    /// ロックが取れない・別の実体に置き換わっているときは消さず、固定語彙を 1 行 stderr（`daemon.log`）へ出す
+    /// （並行 `start` が返した生きたアドレスを消さない。残った stale は次の `start` が回収する。PLUG-12・REPAIR-5）。
+    fn cleanup_after_shutdown(
+        inv: &ShimInvocation,
+        dir: &Path,
+        expected: &Path,
+        first: (u64, u64, i64, i64),
+    ) {
+        let Ok(lock) = acquire_lock(dir, inv) else {
+            eprintln!("shim: socket left in place after shutdown (lock unavailable)");
+            return;
+        };
+        match sock_ident(expected) {
+            Some(now) if now == first => {
+                if fs::remove_file(expected).is_err() {
+                    eprintln!("shim: socket left in place after shutdown (remove failed)");
+                    return;
+                }
+            }
+            Some(_) => {
+                eprintln!("shim: socket left in place after shutdown (replaced)");
+                return;
+            }
+            None => {}
+        }
+        // ロックを持ったまま消す（取得側が inode を照合して取り直す。run_delete と同じ）。
+        let _ = fs::remove_file(&lock.path);
+    }
+
+    /// デーモン本体。取り込み済みの listener で serve し、Shutdown RPC か socket の消失で終わる（`run_daemon` から呼ばれる）。
     fn run_serve<F>(
+        inv: &ShimInvocation,
         dir: &Path,
         listener: UnixListener,
         expected: &Path,
@@ -1229,16 +1274,11 @@ mod unix_impl {
         make_registry: F,
     ) -> Result<(), CriError>
     where
-        F: FnOnce() -> Result<ServiceRegistry, CriError>,
+        F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
     {
-        // inode の再利用（delete 直後の再 start）を見分けるため、mtime（bind 時刻）も併用する。
-        let ident = |p: &Path| {
-            fs::symlink_metadata(p)
-                .ok()
-                .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
-        };
-        let first = ident(expected).ok_or_else(|| failed("socket path is missing"))?;
-        let registry = make_registry()?;
+        let first = sock_ident(expected).ok_or_else(|| failed("socket path is missing"))?;
+        let signal = ShutdownSignal::new();
+        let registry = make_registry(signal.clone())?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
             // 同じ uid と root だけを受ける（PLUG-12）。
@@ -1259,12 +1299,25 @@ mod unix_impl {
                 .and_then(|()| out.flush())
                 .map_err(|_| internal("cannot signal readiness"))?;
         }
-        while ident(expected) == Some(first) {
-            thread::sleep(WATCH_INTERVAL);
+        // Shutdown RPC（即時に起きる）と socket の消失（delete 経路。1 秒間隔）のどちらかで抜ける。
+        let mut shutdown_requested = false;
+        while sock_ident(expected) == Some(first) {
+            if signal.wait_timeout(WATCH_INTERVAL) {
+                shutdown_requested = true;
+                break;
+            }
         }
-        handle
+        if shutdown_requested {
+            // 停止フラグは応答の書き込みを打ち切るため、先に Shutdown 自身の応答を流し切る（有界）。
+            let _ = handle.wait_idle(SHUTDOWN_RESPONSE_GRACE);
+        }
+        let result = handle
             .shutdown()
-            .map_err(|_| CriError::new(CriErrorCode::Timeout, "server shutdown timed out"))
+            .map_err(|_| CriError::new(CriErrorCode::Timeout, "server shutdown timed out"));
+        if shutdown_requested {
+            cleanup_after_shutdown(inv, dir, expected, first);
+        }
+        result
     }
 }
 
@@ -1411,7 +1464,7 @@ mod tests {
             parse_args(args(&["-info"])).unwrap().action,
             ShimAction::Info
         );
-        let out = run(parse_args(args(&["-v"])).unwrap(), || {
+        let out = run(parse_args(args(&["-v"])).unwrap(), |_| {
             Ok(ServiceRegistry::new())
         })
         .unwrap();

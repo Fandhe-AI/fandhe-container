@@ -131,6 +131,11 @@ pub struct BlockNotifyReport {
 ///
 /// `process_queue` が `Err` でも、それまでに used へ返した分（`stats_before_error`）があれば割り込みを上げる
 /// （virtio_block.rs の契約）。停止・リセットの判断は呼び出し元に残す。外側の `Err` は割り込み線の失敗だけ。
+///
+/// 残余: `trigger` が失敗すると外側の `Err` だけを返し、処理済みの `stats` は呼び出し元へ渡らない。
+/// その時点で `interrupt_status` の `UsedBuffer` は立ったままだが、ゲストへの再通知は行われない
+/// （次の `QueueNotify` か `InterruptACK` の読み取りで回復しうる）。`IrqFd::trigger` は eventfd 書き込みで
+/// 失敗は稀なため、現状はエラーに `stats` を含めない（MVM-1）。
 pub fn complete_block_notify<B: BlockBackend, M: GuestMemoryBacking>(
     transport: &mut VirtioMmioTransport<VirtioBlock<B>>,
     mem: &mut GuestMemory<M>,

@@ -14,7 +14,7 @@
 //! `complete_block_notify`）と、KVM の ioeventfd（ゲストの `QueueNotify` を VM exit なしで受ける）・irqfd（eventfd への書き込みを
 //! GSI の割り込みに変える）・in-kernel irqchip（`irq`・`device::VmFd::{create_irqchip, register_irqfd, register_ioeventfd}`。Linux のみ。
 //! x86_64 は `device::KvmDevice::probe_queue_interrupt` で実機確認できる）。
-//! 未実装: virtio-net の virtqueue 処理（TASK-74.3.1）・virtio-net の割り込み糊（TASK-74.3.2）・aarch64 の vGIC・resamplefd による level の再注入・
+//! 未実装: virtio-net の virtqueue 処理（TASK-74.3.1）・virtio-net の割り込み結線（TASK-74.3.2）・aarch64 の vGIC・resamplefd による level の再注入・
 //! eventfd を待つ常駐のイベントループ（TASK-75）・ゲストメモリの mmap backing と KVM 登録（TASK-75.1。docs/design/microvm-memory-ownership.md）・レジスタ設定（REPAIR-3）。vCPU の外部からの停止（TASK-75）・PIO の具体デバイスも未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!

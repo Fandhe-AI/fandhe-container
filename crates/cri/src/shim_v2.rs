@@ -9,7 +9,7 @@
 //! - [`frame`]: 10 バイトのヘッダ（壊れた値を表現できない型。REPAIR-2）
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
-//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait / State / Kill / Shutdown のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2）
+//! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait / State / Kill / Shutdown / Connect のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2・TASK-62.6）
 //! - [`shutdown`]: Shutdown RPC からデーモンへ終了を伝えるシグナル（TASK-62.7.2）
 //! - [`bootstrap`]: 起動バイナリの start / delete / serve と引数解釈（TASK-62.7.1・#872）
 //! - [`wait`]: Wait の期限と照会間隔の設定・ポーリング本体（TASK-62.3.2）
@@ -28,6 +28,7 @@
 //! 範囲外（REPAIR-3。未実装を装わない）:
 //! - containerd の task API の `.proto` 取り込みと v2 / v3 の決定（#669）。メッセージ型は手書きでサービス名だけで版を分ける
 //! - State / Kill の exec_id 指定・Kill の `all`・State の `bundle`・stdio・`exited_at`（常に空・未設定または `UNIMPLEMENTED`。TASK-62.7.2）。Pause / Resume / Pids / Stats 等の他メソッドは `Unimplemented`
+//! - Connect の `version`（常に空。containerd は使わない。TASK-62.6）
 //! - Wait の `exec_id`・`exited_at`（常に未設定）。`timeout_nano` は Wait の期限に使い（実効の期限は `min(timeout_nano, wait::WaitConfig::timeout)`、負値は即 `DEADLINE_EXCEEDED`）、他のメソッドでは使わない。
 //!   終了待ちは core の `ContainerRuntime::wait_exit`（既定は状態の照会。終了通知によるイベント駆動の上書きは後続）。
 //!   サーバーは接続内で要求ごとに並行 dispatch し（同時処理数に上限あり）、Wait の待ちは他の RPC を止めない。
@@ -63,9 +64,9 @@ pub use service::{
 };
 pub use shutdown::ShutdownSignal;
 pub use task_api::{
-    Any, CreateTaskRequest, CreateTaskResponse, DeleteRequest, DeleteResponse, ExecProcessRequest,
-    KillRequest, Mount, ShutdownRequest, StartRequest, StartResponse, StateRequest, StateResponse,
-    TaskStatus, Timestamp, WaitRequest, WaitResponse,
+    Any, ConnectRequest, ConnectResponse, CreateTaskRequest, CreateTaskResponse, DeleteRequest,
+    DeleteResponse, ExecProcessRequest, KillRequest, Mount, ShutdownRequest, StartRequest,
+    StartResponse, StateRequest, StateResponse, TaskStatus, Timestamp, WaitRequest, WaitResponse,
 };
 pub use task_service::TaskService;
 pub use wait::WaitConfig;

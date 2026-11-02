@@ -19,6 +19,13 @@ autobins = false
 name = "containerd-shim-fandhe-container-v2"
 path = "src/bin/shim_v2_main.rs"
 
+# containerd 経由の shim v2 疎通確認（TASK-62.6・CRI-5・#676）。試験バイナリ自身が shim 役を兼ねるため
+# 自前の main（harness = false）。既定は非 root の配線確認、`--ignored` で root・containerd の実機シナリオ。依存は足さない。
+[[test]]
+name = "shim_v2"
+path = "tests/shim_v2.rs"
+harness = false
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

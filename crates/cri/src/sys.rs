@@ -83,6 +83,28 @@ const ENOENT: i32 = 2;
 #[cfg(target_os = "macos")]
 const EINVAL: i32 = 22;
 
+/// `open(2)` に渡す `O_NOFOLLOW | O_NONBLOCK`(最終要素が symlink なら `ELOOP`、FIFO への書き込みオープンは読み手が
+/// 無ければ `ENXIO` で待たずに失敗する。`daemon.log` を開くために使う。PLUG-12・SEC-1・REPAIR-5・#3663)。
+/// 値は OS・アーキで異なり、`None` の対象は呼び出し側が fail-closed にする。出典は core の `sys.rs`(`O_NOFOLLOW`・`O_NONBLOCK`
+/// の記録)と同じ一次情報:
+/// - Linux x86_64: `include/uapi/asm-generic/fcntl.h` の `O_NOFOLLOW = 0o400000`・`O_NONBLOCK = 0o4000`
+/// - Linux aarch64: `arch/arm64/include/uapi/asm/fcntl.h` の `O_NOFOLLOW = 0o100000`、`O_NONBLOCK = 0o4000`(asm-generic)
+/// - macOS: `sys/fcntl.h` の `O_NOFOLLOW = 0x0100`・`O_NONBLOCK = 0x0004`
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const OPEN_NOFOLLOW_NONBLOCK: Option<i32> = Some(0o400_000 | 0o4_000);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) const OPEN_NOFOLLOW_NONBLOCK: Option<i32> = Some(0o100_000 | 0o4_000);
+#[cfg(target_os = "macos")]
+pub(crate) const OPEN_NOFOLLOW_NONBLOCK: Option<i32> = Some(0x0100 | 0x0004);
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos"
+)))]
+pub(crate) const OPEN_NOFOLLOW_NONBLOCK: Option<i32> = None;
+
 /// 標準入出力のうち差し替えを許す番号（stdin・stderr）。任意の fd 番号を渡せないようにする。
 #[derive(Clone, Copy)]
 pub(crate) enum StdSlot {
@@ -95,6 +117,11 @@ pub(crate) enum StdSlot {
 /// 置き換え後の fd は close-on-exec ではない。`EINTR` は数回やり直し、失敗は `Err`。
 pub(crate) fn replace_std(slot: StdSlot, src: std::os::fd::BorrowedFd<'_>) -> Result<(), ()> {
     use std::os::fd::AsRawFd;
+    // 起動時に fd 0/2 が閉じていると、新たに開いた fd が同じ番号になりうる。`dup2(n, n)` は何もせず成功し、呼び出し元が
+    // 元の所有者を drop すると差し替えた fd 自体が閉じるため、拒否する(安全側。起動を止める)。
+    if src.as_raw_fd() == slot as i32 {
+        return Err(());
+    }
     for _ in 0..8 {
         // SAFETY: `src` は呼び出しの間生きている有効な fd で、`slot` は 0 か 2 に限られる。ポインタを渡さず、
         // 戻り値を検査する。`dup2` はプロセス全体の fd 表を書き換えるため、呼び出し元は fd 0/2 を別スレッドが使って
@@ -241,4 +268,17 @@ pub(crate) fn set_everyone_acl_for_test(path: &std::path::Path) -> Result<(), i3
 )))]
 pub(crate) fn peer_uid(_stream: &UnixStream) -> Result<u32, ()> {
     Err(())
+}
+
+#[cfg(test)]
+mod replace_std_tests {
+    use super::{StdSlot, replace_std};
+    use std::os::fd::AsFd;
+
+    /// #3663: 差し替え元が差し替え先と同じ番号の fd なら(起動時に fd が閉じていた場合)、何もせず `Err` にする。
+    #[test]
+    fn replace_std_refuses_same_fd_number() {
+        let stdin = std::io::stdin();
+        assert_eq!(replace_std(StdSlot::Stdin, stdin.as_fd()), Err(()));
+    }
 }

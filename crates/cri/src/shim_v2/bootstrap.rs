@@ -608,6 +608,9 @@ mod unix_impl {
                         // ディレクトリ)基準で続ける。
                         steps_of(&target, &mut todo, true);
                     } else {
+                        if !m.is_dir() {
+                            return Err(failed("socket dir ancestor is not a directory"));
+                        }
                         leave(&cur, m.uid() == euid)?;
                         cur = next;
                     }
@@ -1070,10 +1073,15 @@ mod unix_impl {
     /// グループ/その他の権限なしを確かめる(PLUG-12・SEC-1)。`OpenOptions` に `O_NOFOLLOW` の定数を渡す代わりに、
     /// lstat と開いた fd の `(dev, ino)` の一致で差し替えを検出する(置き場所は自分と root しか変更できない)。
     ///
+    /// ハードリンク(`nlink != 1`)は拒否する。回転の rename は並行する別のデーモンの書き込みと競合しうる(書き込みは
+    /// 回転後の `.1` に残り失われない。P3-3)。relay の helper は fd 1(`start` が読む readiness の pipe)と fd 2
+    /// を継承し、本体の終了後も最大 `RECORD_WAIT_LIMIT` 保つが、`start` は期限つき(`START_READY_TIMEOUT`)で読む
+    /// ため待ち続けない(P3-4)。
+    ///
     /// 肥大の上限: 開く時点で `OPS_LOG_MAX_BYTES` 以上なら `daemon.log.1` へ回す(1 世代)。デーモンの稼働中は
     /// fd を差したままなので回さないが、書く行は固定語彙で `server.rs` の `STDERR_NOTICE_LIMIT`(256 行)で打ち切るため、
     /// 1 デーモンあたり約 25 KB に収まる。複数のデーモンが同じファイルへ追記しうる(`O_APPEND`)。
-    fn open_daemon_log(dir: &Path) -> Result<File, CriError> {
+    pub(super) fn open_daemon_log(dir: &Path) -> Result<File, CriError> {
         let path = dir.join(DAEMON_LOG_NAME);
         let euid = crate::sys::effective_uid();
         match fs::symlink_metadata(&path) {
@@ -1092,17 +1100,24 @@ mod unix_impl {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(internal("cannot stat daemon log")),
         }
+        // O_NOFOLLOW|O_NONBLOCK: lstat と open の間に dangling symlink へ差し替えられてもリンク先に作らず(ELOOP)、
+        // FIFO へ差し替えられても無期限に待たない(ENXIO。REPAIR-5)。通常ファイルへの書き込みに O_NONBLOCK は影響しない。
+        let flags = crate::sys::OPEN_NOFOLLOW_NONBLOCK
+            .ok_or_else(|| failed("daemon log is not supported on this platform"))?;
         let f = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(flags)
             .open(&path)
             .map_err(|_| internal("cannot open daemon log"))?;
         let fm = f
             .metadata()
             .map_err(|_| internal("cannot stat daemon log"))?;
         let lm = fs::symlink_metadata(&path).map_err(|_| internal("cannot stat daemon log"))?;
-        if !lm.file_type().is_file()
+        if !fm.is_file()
+            || fm.nlink() != 1
+            || !lm.file_type().is_file()
             || (lm.dev(), lm.ino()) != (fm.dev(), fm.ino())
             || fm.uid() != euid
             || fm.mode() & 0o077 != 0
@@ -1666,5 +1681,72 @@ mod tests {
             "{}",
             e.message()
         );
+    }
+
+    /// PLUG-12・SEC-1・REPAIR-5・#3663: `daemon.log` を開く `O_NOFOLLOW|O_NONBLOCK` は、lstat と open の間に差し替えられた
+    /// dangling symlink のリンク先に作らず(`ELOOP`)、読み手の無い FIFO で待たずに失敗する(`ENXIO`)。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_3663_daemon_log_open_flags_refuse_symlink_and_fifo() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let t = Tmp::new("flags");
+        let flags = crate::sys::OPEN_NOFOLLOW_NONBLOCK.expect("supported target");
+        let open = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .custom_flags(flags)
+                .open(p)
+        };
+        let victim = t.0.join("victim");
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(open(&link).is_err());
+        assert!(!victim.exists(), "the link target must not be created");
+        // FIFO は src から spawn せずに作れないため(CRI 層はプロセスを起動しない。task_59_4)、同じく非ブロックで
+        // 拒否される特殊ファイル(UDS)で O_NONBLOCK 経路を確かめる。FIFO の実物は結合試験
+        // `plug12_3663_fifo_daemon_log_does_not_hang_start` が固定する。
+        let sock = t.0.join("sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let started = std::time::Instant::now();
+        assert!(open(&sock).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // 通常ファイルは開けて追記できる(O_NONBLOCK は書き込みに影響しない)。
+        let mut f = open(&t.0.join("plain")).unwrap();
+        std::io::Write::write_all(&mut f, b"x\n").unwrap();
+        assert_eq!(std::fs::read(t.0.join("plain")).unwrap(), b"x\n");
+    }
+
+    /// PLUG-12・SEC-1・#3663: 既存の `daemon.log` が FIFO・symlink・ハードリンクなら開かない。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_3663_open_daemon_log_rejects_unsafe_existing_files() {
+        let t = Tmp::new("log");
+        unix_impl::open_daemon_log(&t.0).unwrap();
+        let log = t.0.join("daemon.log");
+        std::fs::hard_link(&log, t.0.join("alias")).unwrap();
+        let e = unix_impl::open_daemon_log(&t.0).unwrap_err();
+        assert!(
+            e.message().contains("private plain file"),
+            "{}",
+            e.message()
+        );
+        std::fs::remove_file(t.0.join("alias")).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(t.0.join("victim"), &log).unwrap();
+        assert!(unix_impl::open_daemon_log(&t.0).is_err());
+        assert!(!t.0.join("victim").exists());
+    }
+
+    /// PLUG-12・#3663: 祖先として辿る要素が通常ファイルなら、理由を正確に「ディレクトリでない」として拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn plug12_3663_non_directory_ancestor_is_rejected() {
+        let t = Tmp::new("file");
+        std::fs::write(t.0.join("f"), b"").unwrap();
+        let e = unix_impl::check_ancestors_with(&t.0.join("f").join("sock"), true, |_| false)
+            .unwrap_err();
+        assert!(e.message().contains("not a directory"), "{}", e.message());
     }
 }

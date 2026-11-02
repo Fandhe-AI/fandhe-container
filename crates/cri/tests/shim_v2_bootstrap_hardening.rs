@@ -1,7 +1,7 @@
 //! shim v2 起動バイナリの排他・計測の結合試験（REPAIR-4・REPAIR-5・PLUG-12・CRI-5・TASK-62.7.1・#872）。
 #![cfg(unix)]
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -301,4 +301,31 @@ fn plug12_3663_writable_parent_of_missing_dir_creates_nothing() {
         "{out:?}"
     );
     assert_eq!(std::fs::read_dir(&anc).unwrap().count(), 0);
+}
+
+/// PLUG-12・SEC-1・REPAIR-5・#3663: `daemon.log` が FIFO に差し替わっていても、daemon は無期限に待たず起動を拒否する。
+#[test]
+fn plug12_3663_fifo_daemon_log_does_not_hang_start() {
+    use std::os::unix::fs::DirBuilderExt;
+    let sc = Scratch::new();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(sc.sock_dir())
+        .unwrap();
+    let fifo = sc.sock_dir().join("daemon.log");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = run(&sc, "fifo", "start");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
 }

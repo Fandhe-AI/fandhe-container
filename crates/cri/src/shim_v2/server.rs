@@ -379,6 +379,8 @@ fn judge_peer(ctx: &Ctx, allowed: &[u32], uid: Result<u32, ()>) -> bool {
 /// 組み立てられない・積めない場合は stderr へ固定語彙の 1 行を残す(接続の拒否は変えない)。
 fn submit_audit(ctx: &Ctx, rejection: PluginPeerRejection) {
     let Some(tx) = &ctx.audit else {
+        // 記録先が無い(非 Linux。#2430)。拒否は変えず、記録できなかったことを固定語彙で残す(SEC-4)。
+        stderr_notice(AUDIT_UNAVAILABLE_LINE);
         return;
     };
     let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {

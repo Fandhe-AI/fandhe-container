@@ -15,7 +15,8 @@
 //! # 外部入力としての検証
 //! `kvm_run` 領域の内容はカーネル（と間接的にゲスト）が書いた値であり、各フィールドを検証してから使う
 //! （coding-rust.md「エラーハンドリング」）。`size` は 1 / 2 / 4、`count` は 1 以上、`data_offset + size * count` は
-//! 領域内、MMIO の `len` は 1..=8。違反は [`MicrovmErrorCode::Internal`] の `malformed KVM exit` で返す。
+//! 領域内かつ `data_offset >= sizeof(struct kvm_run)`（ヘッダ・exit union を IO データとして読み書きさせない。
+//! 防御の深さ）、MMIO の `len` は 1..=8。違反は [`MicrovmErrorCode::Internal`] の `malformed KVM exit` で返す。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 
@@ -26,6 +27,11 @@ pub(crate) const RUN_UNION: usize = 32;
 /// `kvm_run` 領域として最低限必要な大きさ（union の先頭 + 余裕）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const RUN_MIN_LEN: usize = RUN_UNION + 256;
+/// `sizeof(struct kvm_run)`（x86_64・aarch64。`linux/kvm.h`）。ヘッダ 32 + exit union 256 +
+/// `kvm_valid_regs`・`kvm_dirty_regs` 各 8 + `s`（sync_regs）の padding 2048 = 2352。IO のデータ領域はこの後ろ
+/// （実カーネルは `KVM_PIO_PAGE_OFFSET * PAGE_SIZE` = 4096）にあるため、これ未満の `data_offset` は拒否する。
+pub(crate) const RUN_STRUCT_LEN: usize = RUN_MIN_LEN + 16 + 2048;
+const _: () = assert!(RUN_STRUCT_LEN > RUN_MIN_LEN && RUN_STRUCT_LEN == 2352);
 
 const KVM_EXIT_IO: u32 = 2;
 const KVM_EXIT_HLT: u32 = 5;
@@ -203,6 +209,9 @@ fn read_io_header(area: &impl RunArea) -> Result<IoHeader, MicrovmError> {
         .checked_mul(usize::try_from(count).map_err(|_| malformed("io count"))?)
         .ok_or_else(|| malformed("io length"))?;
     let off = usize::try_from(data_offset).map_err(|_| malformed("io data_offset"))?;
+    if off < RUN_STRUCT_LEN {
+        return Err(malformed("io data_offset"));
+    }
     let end = off
         .checked_add(total)
         .ok_or_else(|| malformed("io data_offset"))?;
@@ -483,6 +492,12 @@ mod tests {
             ("io data_offset", io_area(1, 4, 0x10, 1, u64::MAX)),
             ("io data_offset", io_area(1, 1, 0x10, 1, 4096 + 64)),
             ("io data_offset", io_area(1, 4, 0x10, u32::MAX, 4096)),
+            ("io data_offset", io_area(1, 1, 0x10, 1, 0)),
+            ("io data_offset", io_area(1, 1, 0x10, 1, RUN_UNION as u64)),
+            (
+                "io data_offset",
+                io_area(1, 1, 0x10, 1, RUN_STRUCT_LEN as u64 - 1),
+            ),
         ];
         for (what, v) in bad {
             let e = decode_exit(&v).unwrap_err();
@@ -560,6 +575,13 @@ mod tests {
             msg(complete_mmio_read(&mut v, &[1]).unwrap_err()),
             "KVM exit completion mismatch (exit reason)"
         );
+        // ヘッダ領域を指す data_offset は書き戻し前に拒否され、領域は変わらない。
+        let mut v = io_area(0, 1, 0x10, 1, 0);
+        assert_eq!(
+            msg(complete_io_in(&mut v, &[1]).unwrap_err()),
+            "malformed KVM exit (io data_offset)"
+        );
+        assert_eq!(v[0], 0);
         // 範囲外の data_offset は malformed のまま拒否される。
         let mut v = io_area(0, 1, 0x10, 1, u64::MAX);
         assert_eq!(

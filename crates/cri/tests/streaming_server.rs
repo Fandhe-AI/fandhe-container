@@ -4,18 +4,17 @@
 //! HTTP/1.1 を送る（ブロッキングなので `spawn_blocking` で別スレッドに逃がし、サーバー側のタスクを塞がない）。
 //! トークンの乱数源は unix の `/dev/urandom` のみで、非 unix では発行が `Unavailable` になることだけを照合する。
 
-// 発行（乱数源）は unix のみのため、非 unix では unix 専用試験だけが使う補助が未使用になる。
-#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
-
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_cri::error::CriErrorCode;
+use fandhe_container_cri::runtime::v1::{self, runtime_service_server::RuntimeService};
+#[cfg(unix)]
 use fandhe_container_cri::runtime::v1::{
-    self, ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
-    runtime_service_server::RuntimeService,
+    ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
 };
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_cri::streaming::{StreamingConfig, StreamingServer};
@@ -38,6 +37,7 @@ async fn http_raw(addr: SocketAddr, raw: String) -> String {
     .expect("join")
 }
 
+#[cfg(unix)]
 async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
     http_raw(
         addr,
@@ -46,16 +46,19 @@ async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
     .await
 }
 
+#[cfg(unix)]
 fn status_line(response: &str) -> &str {
     response.lines().next().unwrap_or("")
 }
 
+#[cfg(unix)]
 fn path_of(url: &str) -> String {
     let rest = url.strip_prefix("http://").expect("http url");
     let idx = rest.find('/').expect("path");
     rest[idx..].to_string()
 }
 
+#[cfg(unix)]
 fn pod_config() -> PodSandboxConfig {
     PodSandboxConfig {
         metadata: Some(PodSandboxMetadata {
@@ -68,6 +71,7 @@ fn pod_config() -> PodSandboxConfig {
     }
 }
 
+#[cfg(unix)]
 async fn run_sandbox(service: &CriRuntimeService) -> String {
     service
         .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
@@ -80,6 +84,7 @@ async fn run_sandbox(service: &CriRuntimeService) -> String {
         .pod_sandbox_id
 }
 
+#[cfg(unix)]
 async fn create_container(service: &CriRuntimeService, sandbox_id: &str) -> String {
     service
         .create_container(Request::new(v1::CreateContainerRequest {
@@ -383,6 +388,7 @@ impl fandhe_container_cri::streaming::StreamHandler for UpgradeHoldHandler {
         &self,
         _request: fandhe_container_cri::streaming::StreamRequest,
         mut http: hyper::Request<hyper::body::Incoming>,
+        permit: fandhe_container_cri::streaming::ConnectionPermit,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -395,6 +401,8 @@ impl fandhe_container_cri::streaming::StreamHandler for UpgradeHoldHandler {
         Box::pin(async move {
             let on_upgrade = hyper::upgrade::on(&mut http);
             tokio::spawn(async move {
+                // Upgrade 後の IO の寿命まで接続枠を保持する（契約: StreamHandler::handle）。
+                let _permit = permit;
                 let Ok(upgraded) = on_upgrade.await else {
                     return;
                 };
@@ -455,5 +463,70 @@ async fn cri6_upgraded_connection_survives_overall_deadline() {
     assert!(
         response.ends_with("late-data"),
         "upgraded connection was closed before the handler wrote: {response}"
+    );
+}
+
+/// 観測イベントを溜めるテスト用の観測口。
+#[cfg(unix)]
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<fandhe_container_cri::streaming::ConnectionEvent>>);
+
+#[cfg(unix)]
+impl fandhe_container_cri::streaming::ConnectionObserver for Recorder {
+    fn observe(&self, event: fandhe_container_cri::streaming::ConnectionEvent) {
+        self.0.lock().expect("lock").push(event);
+    }
+}
+
+/// CRI-6・REPAIR-5・REPAIR-4・#679: Upgrade 後の IO が生きている間は接続枠が返らず
+/// （`max_connections = 1` で 2 本目が閉じられ `Rejected` が記録される）、解放後は再び受け付ける。
+/// 結果別の観測（`Finished`）も記録され、トークンを含まない。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_upgrade_holds_connection_slot_and_observes() {
+    use fandhe_container_cri::streaming::{ConnectionEvent, ConnectionOutcome, StreamRequest};
+    let hold = Duration::from_millis(1500);
+    let recorder = Arc::new(Recorder::default());
+    let server = StreamingServer::bind_with_observer(
+        StreamingConfig::default().with_max_connections(1),
+        Arc::new(UpgradeHoldHandler { hold }),
+        recorder.clone(),
+    )
+    .await
+    .expect("bind");
+    let addr = server.local_addr();
+    let url = server
+        .issuer()
+        .issue(StreamRequest::Exec(exec_request("c1")))
+        .expect("issue");
+    let path = path_of(&url);
+    let raw = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n"
+    );
+    let first = tokio::spawn(http_raw(addr, raw));
+    // 1 本目の接続の future は 101 の直後に終わるので、少し待ってから 2 本目を送る。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = request(addr, "GET", "/exec/none").await;
+    assert_eq!(
+        second, "",
+        "second connection must be closed while the slot is held"
+    );
+    let response = first.await.expect("join");
+    assert!(response.ends_with("late-data"), "{response}");
+    // 枠が返った後は受け付ける（404 が返る）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let third = request(addr, "GET", "/exec/none").await;
+    assert_eq!(status_line(&third), "HTTP/1.1 404 Not Found", "{third}");
+    let events = recorder.0.lock().expect("lock").clone();
+    assert!(events.contains(&ConnectionEvent::Rejected), "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ConnectionEvent::Finished {
+                outcome: ConnectionOutcome::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
     );
 }

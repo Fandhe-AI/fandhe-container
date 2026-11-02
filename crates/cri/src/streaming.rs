@@ -464,10 +464,15 @@ fn plain_response(status: StatusCode, message: &'static str) -> Response<StreamB
 /// （接続の future が Upgrade の引き渡しで完了するため。#679）。
 pub trait StreamHandler: Send + Sync + 'static {
     /// 照合済みの要求と HTTP 要求（`hyper::upgrade::on` に渡せる）から応答を作る。
+    ///
+    /// `permit` は同時接続数（`max_connections`）の枠を表す。101 応答で `Upgraded` へ IO を渡すと
+    /// サーバー側の接続タスクは終わるため、Upgrade 後の IO を使うタスクは `permit` を move して
+    /// IO の寿命まで保持すること（落とすとその時点で枠が返り、上限の契約が破れる。CRI-6・REPAIR-5）。
     fn handle(
         &self,
         request: StreamRequest,
         http: Request<Incoming>,
+        permit: ConnectionPermit,
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>>;
 }
 
@@ -480,6 +485,7 @@ impl StreamHandler for NotImplementedHandler {
         &self,
         _request: StreamRequest,
         _http: Request<Incoming>,
+        _permit: ConnectionPermit,
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
         Box::pin(async {
             plain_response(
@@ -527,6 +533,7 @@ async fn route(
     request: Request<Incoming>,
     cache: &TokenCache,
     handler: &dyn StreamHandler,
+    permit: ConnectionPermit,
 ) -> Response<StreamBody> {
     let matched = match classify(request.method(), request.uri().path()) {
         Route::MethodNotAllowed => {
@@ -540,7 +547,7 @@ async fn route(
         Route::Stream { kind, token } => cache.consume_at(Instant::now(), kind, token),
     };
     match matched {
-        Some(stream_request) => handler.handle(stream_request, request).await,
+        Some(stream_request) => handler.handle(stream_request, request, permit).await,
         // 未知・失効・使用済み・種別違いを区別しない（探索の手がかりを与えない）。
         None => plain_response(StatusCode::NOT_FOUND, "not found"),
     }
@@ -563,6 +570,67 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// 同時接続数の枠の保持票（複製可。最後の複製が落ちたときに枠が返る）。
+///
+/// サーバーは接続の future が終わるまで 1 つ持ち、[`StreamHandler::handle`] にも 1 つ渡す。
+/// Upgrade 後の IO を扱うタスクがこれを保持し続ける間は枠が返らない。
+#[derive(Clone)]
+pub struct ConnectionPermit {
+    _guard: Arc<ConnectionGuard>,
+}
+
+impl fmt::Debug for ConnectionPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConnectionPermit")
+    }
+}
+
+/// 接続処理の結果（トークン・パス・相手アドレスは含めない。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionOutcome {
+    /// 接続の future が正常に終わった（Upgrade の引き渡しを含む）。
+    Completed,
+    /// HTTP の解析・読み書きの失敗（ヘッダ読み取りの期限切れを含む）。
+    HttpError,
+    /// 接続全体の期限（`header_read_timeout * 3`）で打ち切った。
+    DeadlineExceeded,
+}
+
+/// 接続の観測イベント（REPAIR-4）。メトリクス・構造化ログの注入点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    /// `accept` の失敗。
+    AcceptFailed,
+    /// 同時接続数の上限超過で接続を閉じた。
+    Rejected,
+    /// 接続処理が終わった。`elapsed` は受け付けてから接続の future が終わるまで。
+    Finished {
+        /// 結果。
+        outcome: ConnectionOutcome,
+        /// 所要時間。
+        elapsed: Duration,
+    },
+}
+
+/// [`ConnectionEvent`] の受け口。同期・短時間で返すこと（accept のタスクから呼ばれる）。
+pub trait ConnectionObserver: Send + Sync + 'static {
+    /// イベントを記録する。
+    fn observe(&self, event: ConnectionEvent);
+}
+
+/// 何も記録しない既定の観測口。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopObserver;
+
+impl ConnectionObserver for NoopObserver {
+    fn observe(&self, _event: ConnectionEvent) {}
+}
+
+/// 発行 URL の基底（`http://host:port`。IPv6 は括弧つき）。ソケットを要さない純関数。
+fn format_base_url(advertised: SocketAddr) -> String {
+    format!("http://{advertised}")
 }
 
 /// 起動済みのストリーミングサーバー。破棄または [`Self::shutdown`] で待ち受けを止める。
@@ -593,6 +661,15 @@ impl StreamingServer {
         config: StreamingConfig,
         handler: Arc<dyn StreamHandler>,
     ) -> Result<Self, CriError> {
+        Self::bind_with_observer(config, handler, Arc::new(NoopObserver)).await
+    }
+
+    /// ハンドラと観測口を指定して起動する（REPAIR-4）。
+    pub async fn bind_with_observer(
+        config: StreamingConfig,
+        handler: Arc<dyn StreamHandler>,
+        observer: Arc<dyn ConnectionObserver>,
+    ) -> Result<Self, CriError> {
         config.validate()?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -606,11 +683,13 @@ impl StreamingServer {
             None => local_addr,
         };
         let issuer = Arc::new(StreamingUrlIssuer {
-            base_url: format!("http://{advertised}"),
+            base_url: format_base_url(advertised),
             cache: Arc::clone(&cache),
         });
         let conns = Arc::new(AtomicUsize::new(0));
-        let accept_task = tokio::spawn(accept_loop(listener, config, cache, handler, conns));
+        let accept_task = tokio::spawn(accept_loop(
+            listener, config, cache, handler, conns, observer,
+        ));
         Ok(Self {
             local_addr,
             issuer,
@@ -646,11 +725,13 @@ async fn accept_loop(
     cache: Arc<TokenCache>,
     handler: Arc<dyn StreamHandler>,
     conns: Arc<AtomicUsize>,
+    observer: Arc<dyn ConnectionObserver>,
 ) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _peer)) => stream,
             Err(_) => {
+                observer.observe(ConnectionEvent::AcceptFailed);
                 // fd 枯渇などの一時的な失敗でビジー再試行しない。
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -658,17 +739,26 @@ async fn accept_loop(
         };
         let Some(guard) = ConnectionGuard::acquire(&conns, config.max_connections) else {
             drop(stream);
+            observer.observe(ConnectionEvent::Rejected);
             continue;
         };
         let cache = Arc::clone(&cache);
         let handler = Arc::clone(&handler);
+        let observer = Arc::clone(&observer);
         let header_read_timeout = config.header_read_timeout;
         tokio::spawn(async move {
-            let _guard = guard;
+            let started = Instant::now();
+            let permit = ConnectionPermit {
+                _guard: Arc::new(guard),
+            };
+            let service_permit = permit.clone();
             let service = service_fn(move |request| {
                 let cache = Arc::clone(&cache);
                 let handler = Arc::clone(&handler);
-                async move { Ok::<_, Infallible>(route(request, &cache, handler.as_ref()).await) }
+                let permit = service_permit.clone();
+                async move {
+                    Ok::<_, Infallible>(route(request, &cache, handler.as_ref(), permit).await)
+                }
             });
             let connection = http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -681,7 +771,17 @@ async fn accept_loop(
             // 101 応答の送出後に IO を `Upgraded` へ渡した時点で完了する。よって Upgrade 後のストリームは
             // この期限の対象外で、期限は #680〜#682 が決める（試験 `cri6_upgraded_connection_survives_overall_deadline`）。
             let deadline = header_read_timeout.saturating_mul(3);
-            let _ = tokio::time::timeout(deadline, connection).await;
+            let outcome = match tokio::time::timeout(deadline, connection).await {
+                Ok(Ok(())) => ConnectionOutcome::Completed,
+                Ok(Err(_)) => ConnectionOutcome::HttpError,
+                Err(_) => ConnectionOutcome::DeadlineExceeded,
+            };
+            observer.observe(ConnectionEvent::Finished {
+                outcome,
+                elapsed: started.elapsed(),
+            });
+            // permit はここまで保持する。Upgrade 後の IO を持つタスクが複製を持つ間は枠が返らない。
+            drop(permit);
         });
     }
 }
@@ -975,21 +1075,11 @@ mod tests {
             server.issuer().base_url(),
             format!("http://192.0.2.7:{port}")
         );
-        let server = StreamingServer::bind(
-            StreamingConfig::default()
-                .with_bind("[::]:0".parse().expect("addr"))
-                .with_allow_external(true)
-                .with_advertise_addr("2001:db8::1".parse().expect("ip")),
-        )
-        .await;
-        // IPv6 が使えない環境では bind 自体が失敗しうるため、成功したときだけ URL を照合する。
-        if let Ok(server) = server {
-            let port = server.local_addr().port();
-            assert_eq!(
-                server.issuer().base_url(),
-                format!("http://[2001:db8::1]:{port}")
-            );
-        }
+        // IPv6 の表現はソケットを要さない純関数で必ず照合する（環境の IPv6 可否に依らない）。
+        assert_eq!(
+            format_base_url("[2001:db8::1]:8443".parse().expect("addr")),
+            "http://[2001:db8::1]:8443"
+        );
     }
 
     /// CRI-6: TTL の 0 と上限超過は拒否する。

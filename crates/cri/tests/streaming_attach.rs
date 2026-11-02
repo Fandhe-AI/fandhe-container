@@ -3,7 +3,7 @@
 //! loopback の TCP だけで完結し、root も外部ネットワークも要らない。クライアントは本 crate の公開 codec
 //! （`streaming::spdy`）で組んだ最小の SPDY クライアントで、サーバーと同じ codec を使うため「codec の自己照合」
 //! である（他実装との互換は `spdy` の単体試験が CPython の zlib が作ったブロックの復号で固定している）。
-//! kubelet / crictl の実クライアントとの照合は #683 の実機前提試験で行う。コンテナ側の stdio は
+//! crictl 相当の疎通は `tests/streaming.rs`（#683・TASK-63.5）。実クライアントとの照合は本番 backend の結線後。コンテナ側の stdio は
 //! `UnixStream::pair()` の fake backend で与える。各試験は期限つきで書き、ハングしない（REPAIR-5）。
 //! トークンの乱数源が unix のみのため、全体を `cfg(unix)` にする。
 #![cfg(unix)]

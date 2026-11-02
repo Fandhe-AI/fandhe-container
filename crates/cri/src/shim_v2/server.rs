@@ -31,7 +31,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
-    AuditRecord, AuditSink, AuditTimestamp, PluginPeerRejection, current_pid,
+    AuditRecord, AuditSink, AuditTimestamp, PluginPeerRejection, RECORD_WAIT_LIMIT, current_pid,
 };
 use prost::Message;
 use tonic::Code;
@@ -54,6 +54,9 @@ pub struct ServerConfig {
     pub write_timeout: Duration,
     /// 停止時に各スレッドの終了を待つ期限。
     pub shutdown_timeout: Duration,
+    /// 停止時に監査の書き込みキューの排出を待つ期限(SEC-4・REPAIR-5)。既定は [`AUDIT_DRAIN_LIMIT`]。
+    /// 期限が切れたら未書き込みの拒否レコードが失われうる旨を stderr へ出して停止を続ける(永久に待たない)。
+    pub audit_drain_timeout: Duration,
     /// 停止フラグを確かめる間隔。
     pub poll_interval: Duration,
     /// 接続を受け入れる peer の実効 uid（PLUG-12）。accept 直後、要求を読む前に照合し、
@@ -71,6 +74,7 @@ impl ServerConfig {
             ("frame_read_timeout", self.frame_read_timeout),
             ("write_timeout", self.write_timeout),
             ("shutdown_timeout", self.shutdown_timeout),
+            ("audit_drain_timeout", self.audit_drain_timeout),
             ("poll_interval", self.poll_interval),
         ];
         for (name, d) in checks {
@@ -99,6 +103,7 @@ impl Default for ServerConfig {
             frame_read_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(5),
+            audit_drain_timeout: AUDIT_DRAIN_LIMIT,
             poll_interval: Duration::from_millis(50),
             allowed_peer_uids: Some(vec![crate::sys::effective_uid()]),
         }
@@ -139,6 +144,17 @@ pub struct TtrpcServer {
 /// 監査レコードの書き込み待ちの上限(REPAIR-5。あふれた分は捨てて stderr へ残す)。
 const AUDIT_QUEUE_CAPACITY: usize = 64;
 
+/// 停止時に監査キューの排出を待つ既定の期限(REPAIR-5)。
+///
+/// 根拠: `sink.record` 1 回の待ちは [`RECORD_WAIT_LIMIT`](約 11.45 秒)で打ち切られる。健全な sink なら 1 件は
+/// ミリ秒で済み、`AUDIT_QUEUE_CAPACITY`(64)件でも期限に遠く収まる。sink が壊れていると 1 件ごとに
+/// `RECORD_WAIT_LIMIT` を使い、全件(64 倍 = 約 12 分)を待つのは停止を事実上止めるだけなので、書き込み中の 1 件と
+/// 次の 1 件の分(2 倍)で打ち切る。超えた分は失われうる旨を stderr へ残す。
+pub const AUDIT_DRAIN_LIMIT: Duration = RECORD_WAIT_LIMIT.saturating_mul(2);
+
+/// 期限切れで排出を待ち切れなかったときの stderr の行(固定語彙のみ)。
+const AUDIT_DRAIN_TIMEOUT_LINE: &str = "{\"code\":\"audit_drain_timeout\",\"event\":\"shim_peer_audit_may_be_lost\",\"outcome\":\"error\"}";
+
 impl TtrpcServer {
     /// 登録簿と設定から作る（計測しない）。
     pub fn new(registry: ServiceRegistry, config: ServerConfig) -> Self {
@@ -160,7 +176,7 @@ impl TtrpcServer {
     }
 
     /// peer UID の拒否を記録する監査の記録先を付ける(SEC-4・PLUG-12)。本番の bootstrap は状態ルートの
-    /// `@audit.log` を主経路とする `FileAuditSink` を渡す。
+    /// `@audit.log` へ書く `ControlAuditRelay`(Linux。単一スレッドの間に作った helper 経由)を渡す。
     #[must_use]
     pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.audit = Some(sink);
@@ -178,9 +194,12 @@ impl TtrpcServer {
             .ok()
             .and_then(|a| a.as_pathname().map(std::path::Path::to_path_buf))
             .unwrap_or_default();
-        let audit = match &self.audit {
-            Some(sink) => Some(spawn_audit_writer(Arc::clone(sink))?),
-            None => None,
+        let (audit, audit_done) = match &self.audit {
+            Some(sink) => {
+                let w = spawn_audit_writer(Arc::clone(sink))?;
+                (Some(w.tx), Some(w.done))
+            }
+            None => (None, None),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = Arc::new(Ctx {
@@ -199,7 +218,9 @@ impl TtrpcServer {
         Ok(ServerHandle {
             stop,
             accept: Some(accept),
+            audit_done,
             shutdown_timeout: self.config.shutdown_timeout,
+            audit_drain_timeout: self.config.audit_drain_timeout,
         })
     }
 }
@@ -208,11 +229,19 @@ impl TtrpcServer {
 pub struct ServerHandle {
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    /// 監査の書き込みスレッドの終了通知(監査なしなら `None`)。送信側は `Ctx` だけが持つため、accept スレッドと
+    /// 接続スレッドが終わって `Ctx` が落ちると、スレッドは残りを書いて終わり通知を送る。
+    audit_done: Option<std::sync::mpsc::Receiver<()>>,
     shutdown_timeout: Duration,
+    audit_drain_timeout: Duration,
 }
 
 impl ServerHandle {
-    /// 停止して、期限内にスレッドの終了を待つ。
+    /// 停止して、期限内にスレッドの終了と監査キューの排出を待つ(SEC-4・REPAIR-5)。
+    ///
+    /// accept・接続スレッドの終了後に `Ctx`(監査の送信側)が落ち、監査スレッドが残りを書き終えて通知する。これを
+    /// `audit_drain_timeout` まで待つ。期限切れは失われうる旨を stderr へ出して `Ok` で進む。
+    /// `Drop` だけでは待たない(停止フラグを立てるのみ)。
     pub fn shutdown(mut self) -> Result<(), ShimV2Error> {
         self.stop.store(true, Ordering::SeqCst);
         let Some(h) = self.accept.take() else {
@@ -226,7 +255,14 @@ impl ServerHandle {
             thread::sleep(Duration::from_millis(5));
         }
         // 終了済みなので join は即座に戻る。panic は停止の失敗として扱う。
-        h.join().map_err(|_| ShimV2Error::ShutdownTimeout)
+        h.join().map_err(|_| ShimV2Error::ShutdownTimeout)?;
+        if let Some(done) = self.audit_done.take() {
+            // 通知が来る・送信側が落ちる(スレッドの panic)・期限切れのいずれでも戻る。後二者は失われうる。
+            if !matches!(done.recv_timeout(self.audit_drain_timeout), Ok(())) {
+                eprintln!("{AUDIT_DRAIN_TIMEOUT_LINE}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -341,12 +377,22 @@ fn submit_audit(ctx: &Ctx, rejection: PluginPeerRejection) {
 /// 監査レコードを積めなかったときの stderr の行(固定語彙のみ)。
 const AUDIT_DROPPED_LINE: &str = "{\"event\":\"shim_peer_audit_dropped\",\"outcome\":\"error\"}";
 
-/// 監査レコードを `sink` へ書く専用スレッドを起こす。全送信側が落ちるとスレッドは終わる(join しない)。
+/// 監査の書き込みスレッドの送信口と終了通知。
+struct AuditWriter {
+    tx: std::sync::mpsc::SyncSender<AuditRecord>,
+    /// スレッドがキューを排出して終わると `()` が届く(`ServerHandle::shutdown` が期限つきで待つ)。
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// 監査レコードを `sink` へ書く専用スレッドを起こす。全送信側が落ちると、キューに残った分を書き終えてから
+/// 終了通知を送って終わる(`ServerHandle::shutdown` が `done` を期限つきで待つ)。
 /// スレッドを作れなければ `Err`(記録経路なしで受け付けない。SEC-4)。
-fn spawn_audit_writer(
-    sink: Arc<dyn AuditSink>,
-) -> Result<std::sync::mpsc::SyncSender<AuditRecord>, ShimV2Error> {
+///
+/// 専用スレッド+キューにしているのは、accept スレッドで同期記録すると sink が遅いときに別 UID の連続接続で
+/// accept が止まる(DoS)ため。
+fn spawn_audit_writer(sink: Arc<dyn AuditSink>) -> Result<AuditWriter, ShimV2Error> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<AuditRecord>(AUDIT_QUEUE_CAPACITY);
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
     thread::Builder::new()
         .name("ttrpc-audit".into())
         .spawn(move || {
@@ -357,9 +403,10 @@ fn spawn_audit_writer(
                     );
                 }
             }
+            let _ = done_tx.send(());
         })
         .map_err(|e| ShimV2Error::Listener(e.kind()))?;
-    Ok(tx)
+    Ok(AuditWriter { tx, done })
 }
 
 /// 読み取りの結果。
@@ -828,8 +875,8 @@ mod tests {
     #[test]
     fn sec4_872_peer_rejections_are_audited_with_distinct_reasons() {
         let sink = Arc::new(Collect(Mutex::new(Vec::new())));
-        let tx = spawn_audit_writer(Arc::clone(&sink) as Arc<dyn AuditSink>).unwrap();
-        let ctx = ctx_with(tx);
+        let w = spawn_audit_writer(Arc::clone(&sink) as Arc<dyn AuditSink>).unwrap();
+        let ctx = ctx_with(w.tx.clone());
         assert!(judge_peer(&ctx, &[1000], Ok(1000)));
         assert!(!judge_peer(&ctx, &[1000], Ok(1001)));
         assert!(!judge_peer(&ctx, &[1000], Err(())));

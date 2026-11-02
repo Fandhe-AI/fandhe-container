@@ -30,8 +30,9 @@
 //!
 //! peer UID（PLUG-12）: デーモンは accept 直後に `SO_PEERCRED` / `getpeereid` で接続元を照合し、
 //! 実効 uid と root（0）以外を切断する。拒否は理由（許可外 uid・uid 取得失敗）を区別して、状態ルート直下の
-//! `@audit.log`（core の `FileAuditSink`）へ監査レコードとして届ける（SEC-4）。置き場所の上書き（試験用）が
-//! あるときだけ、記録先を開けなくても起動する。
+//! `@audit.log`（Linux は core の `FileAuditSink` を包んだ `ControlAuditRelay` 経由。単一スレッドの間に作る）へ
+//! 監査レコードとして届ける（SEC-4）。置き場所の上書き（試験用）があるときだけ、状態ルートを開けなくても起動する。
+//! 非 Linux は記録先を持たない（plugin-cri の main と同じ。#2430）。
 //!
 //! 計測（REPAIR-4）: `start` / `delete` / デーモンの ttrpc は、結果と所要時間を置き場所の `ops.log`
 //! （0600・JSON Lines・1 MiB で `ops.log.1` へ回す）へ追記する。stdout / stderr は汚さない。
@@ -405,7 +406,9 @@ mod unix_impl {
     use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample};
     use crate::shim_v2::server::{ServerConfig, TtrpcServer};
     use crate::shim_v2::service::ServiceRegistry;
-    use fandhe_container_core::audit_log::{AuditSink, FileAuditSink};
+    use fandhe_container_core::audit_log::AuditSink;
+    #[cfg(target_os = "linux")]
+    use fandhe_container_core::audit_log::{ControlAuditRelay, FileAuditSink};
 
     /// sun_path の上限（NUL を除く）。
     #[cfg(target_os = "linux")]
@@ -439,7 +442,18 @@ mod unix_impl {
     }
 
     /// 置き場所のディレクトリを末尾 1 段だけ 0700 で作り、symlink でない・ディレクトリ・グループ/その他の権限なしを確かめる。
+    ///
+    /// 未作成のときは、**作成より前に**親と全祖先の信頼性を検査する(`check_ancestors` の `pending` 経路)。作成後の検査だけだと、
+    /// 祖先が別ユーザーの symlink のとき、参照先にディレクトリを作ってから拒否することになり、生成物が残る(root 実行では
+    /// 作成先を誘導できる。SEC-1・PLUG-12)。検査を通った祖先は現在のユーザーと root しか rename・差し替えできない
+    /// (スティッキーの例外も子が自分の所有の場合のみ)ため、検査から `create` までの間に別ユーザーが経路を変えられず、
+    /// fd 基準の `mkdirat` を足さなくても検査と作成の間の差し替えは閉じる(後続の lock・socket の操作も同じ前提)。
     pub fn prepare_socket_dir(dir: &Path) -> Result<(), CriError> {
+        match fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => check_ancestors(dir, true)?,
+            Err(_) => return Err(internal("cannot stat socket dir")),
+        }
         match DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -465,7 +479,7 @@ mod unix_impl {
         }
         // 最終ディレクトリ自身の拡張 ACL（macOS。mode 0700 でも別ユーザーへ変更権限を与えられる）。
         reject_extended_acl(dir)?;
-        check_ancestors(dir)
+        check_ancestors(dir, false)
     }
 
     /// 祖先ディレクトリの信頼性を確かめる（PLUG-12・SEC-1）。最終要素だけの検査では、祖先を持つ別ユーザーが
@@ -481,34 +495,59 @@ mod unix_impl {
     /// - 元のパスの symlink でない祖先と解決後の祖先は、所有者が現在のユーザーか root であること
     /// - 他ユーザーが書ける祖先は、スティッキーかつ経路上の子が現在のユーザー所有（他人が rename・削除できない）の場合だけ許す
     /// - macOS では拡張 ACL を持つ祖先・判定できない祖先も拒否する（mode bits を迂回して変更権限を与えうる）
-    fn check_ancestors(dir: &Path) -> Result<(), CriError> {
+    ///
+    /// `pending` が true のときは `dir` がまだ無く、これから現在のユーザーの所有で作る(作成前の検査)。`dir` の存在を
+    /// 前提にせず、`dir` を現在のユーザー所有の子として扱い、正規パスは親の正規化に `dir` の名前を足して組む。
+    fn check_ancestors(dir: &Path, pending: bool) -> Result<(), CriError> {
         let euid = crate::sys::effective_uid();
+        let owned_by_us = |p: &Path| {
+            (pending && p == dir) || fs::symlink_metadata(p).is_ok_and(|c| c.uid() == euid)
+        };
         let mut lexical_child = dir;
         for a in dir.ancestors().skip(1) {
             // 相対パスの終端（空の祖先）は正規パス側の検査（カレントディレクトリ以上）が担う。
             if a.as_os_str().is_empty() {
                 break;
             }
-            let m =
-                fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
+            let m = match fs::symlink_metadata(a) {
+                Ok(m) => m,
+                Err(e) if pending && e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(failed("socket dir parent does not exist"));
+                }
+                Err(_) => return Err(internal("cannot stat socket dir ancestor")),
+            };
             if m.file_type().is_symlink() {
                 if m.uid() != 0 {
                     return Err(failed("socket dir ancestor is a symlink not owned by root"));
                 }
             } else {
-                let child_owned =
-                    fs::symlink_metadata(lexical_child).is_ok_and(|c| c.uid() == euid);
-                check_ancestor_dir(&m, a, euid, child_owned)?;
+                check_ancestor_dir(&m, a, euid, owned_by_us(lexical_child))?;
             }
             lexical_child = a;
         }
-        let canon = fs::canonicalize(dir).map_err(|_| internal("cannot resolve socket dir"))?;
-        let mut child = canon.as_path();
+        let canon = if pending {
+            let parent = match dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let name = dir
+                .file_name()
+                .ok_or_else(|| failed("socket dir has no final component"))?;
+            fs::canonicalize(parent)
+                .map_err(|_| internal("cannot resolve socket dir"))?
+                .join(name)
+        } else {
+            fs::canonicalize(dir).map_err(|_| internal("cannot resolve socket dir"))?
+        };
+        let pending_path = canon.as_path();
+        let owned_canon = |p: &Path| {
+            (pending && p == pending_path) || fs::symlink_metadata(p).is_ok_and(|c| c.uid() == euid)
+        };
+        let mut child = pending_path;
         for a in canon.ancestors().skip(1) {
             let m =
                 fs::symlink_metadata(a).map_err(|_| internal("cannot stat socket dir ancestor"))?;
-            let child_owned = fs::symlink_metadata(child).is_ok_and(|c| c.uid() == euid);
-            check_ancestor_dir(&m, a, euid, child_owned)?;
+            check_ancestor_dir(&m, a, euid, owned_canon(child))?;
             child = a;
         }
         Ok(())
@@ -927,17 +966,40 @@ mod unix_impl {
         Ok(encode_delete_response())
     }
 
-    /// 本番の監査の記録先を開く(状態ルート直下の `@audit.log` を主経路とする `FileAuditSink`。SEC-4・PLUG-12)。
+    /// 本番の監査の記録先を開く(状態ルート直下の `@audit.log`。SEC-4・PLUG-12・REPAIR-5)。
     ///
-    /// peer UID の拒否の記録先なので、開けなければ起動しない(fail-closed)。ただし置き場所を環境変数で
-    /// 上書きしている(`overridden`。主に試験用)ときは既定の状態ルートが無い環境でも動かせるよう、
-    /// 記録先なし(`None`)で続ける。
+    /// Linux では `FileAuditSink` を `ControlAuditRelay`(監査専用の helper プロセス)で包んで返す。`FileAuditSink`
+    /// の主経路は呼び出しプロセスが単一スレッドのときしか fork できず、serve 後は accept・接続・監査のスレッドが
+    /// 並ぶため、そのまま渡すと rootless では記録も失敗通知も残らない(daemon の stderr は /dev/null)。
+    /// relay は plugin-cri の `open_audit_relay_in` と同じ組み立て(spawn → probe)で、**単一スレッドの間に**呼ぶこと
+    /// (`run` の Serve 経路は、本関数の前にスレッドも runtime も作らない。listener は stdin の継承で、helper は fd 3
+    /// 以上を閉じるため影響しない)。
+    ///
+    /// peer UID の拒否の記録先なので、relay の構築・probe に失敗したら起動しない(fail-closed。plugin-cri と同じ)。
+    /// 状態ルートを開けない場合だけ、置き場所を環境変数で上書きしている(`overridden`。主に試験用)ときは
+    /// 既定の状態ルートが無い環境でも動かせるよう、記録先なし(`None`)で続ける。
+    ///
+    /// 非 Linux は relay が無く(`ControlAuditRelay` は Linux のみ)、plugin-cri の main と同じく記録先を持たず
+    /// 拒否を記録しない(`None`。REPAIR-3: 非 Linux の監査経路は #2430 の判断待ち)。
+    #[cfg(target_os = "linux")]
     pub fn open_audit_sink(overridden: bool) -> Result<Option<Arc<dyn AuditSink>>, CriError> {
-        match FileAuditSink::open_in_state_root(None) {
-            Ok(sink) => Ok(Some(Arc::new(sink))),
-            Err(_) if overridden => Ok(None),
-            Err(_) => Err(internal("cannot open audit log")),
-        }
+        let sink = match FileAuditSink::open_in_state_root(None) {
+            Ok(sink) => sink,
+            Err(_) if overridden => return Ok(None),
+            Err(_) => return Err(internal("cannot open audit log")),
+        };
+        let relay = ControlAuditRelay::spawn_ignoring_stop_signals(sink)
+            .map_err(|_| internal("cannot start audit relay"))?;
+        relay
+            .probe()
+            .map_err(|_| internal("cannot open audit log"))?;
+        Ok(Some(Arc::new(relay)))
+    }
+
+    /// 非 Linux では記録先を持たない(上の Linux 版の doc を参照。#2430)。
+    #[cfg(not(target_os = "linux"))]
+    pub fn open_audit_sink(_overridden: bool) -> Result<Option<Arc<dyn AuditSink>>, CriError> {
+        Ok(None)
     }
 
     /// デーモン本体。stdin の listener を検証して serve し、socket が消えたら終わる。

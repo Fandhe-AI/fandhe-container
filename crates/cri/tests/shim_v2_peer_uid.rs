@@ -134,3 +134,108 @@ fn sec4_872_denied_connection_is_audited_once() {
         "plugin_peer_uid_mismatch"
     );
 }
+
+/// 書き込みに時間がかかる(または止まる)sink。`release` が立つまで `record` を保留する。
+struct SlowSink {
+    entered: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+    written: std::sync::atomic::AtomicUsize,
+    hold: Duration,
+}
+
+impl fandhe_container_core::audit_log::AuditSink for SlowSink {
+    fn record(
+        &self,
+        _record: &fandhe_container_core::audit_log::AuditRecord,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        use std::sync::atomic::Ordering;
+        self.entered.store(true, Ordering::SeqCst);
+        let end = std::time::Instant::now() + self.hold;
+        while std::time::Instant::now() < end && !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.written.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// 拒否 1 件を遅い sink へ積ませてから `shutdown` した結果(経過時間・書き込み件数・shutdown の戻り)を返す。
+fn shutdown_with_slow_sink(
+    tag: &str,
+    hold: Duration,
+    drain: Duration,
+) -> (
+    Duration,
+    usize,
+    Result<(), fandhe_container_cri::shim_v2::ShimV2Error>,
+) {
+    use std::sync::atomic::Ordering;
+    let probe = test_root::test_root("peeruid", &format!("{tag}probe"));
+    let euid = std::fs::metadata(&probe).unwrap().uid();
+    let root = test_root::test_root("peeruid", tag);
+    let path = root.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut reg = ServiceRegistry::new();
+    reg.register(Arc::new(EmptyTaskService::new(TaskApiVersion::V2)))
+        .unwrap();
+    let sink = Arc::new(SlowSink {
+        entered: false.into(),
+        release: false.into(),
+        written: 0.into(),
+        hold,
+    });
+    let cfg = ServerConfig {
+        allowed_peer_uids: Some(vec![euid.wrapping_add(1)]),
+        audit_drain_timeout: drain,
+        ..ServerConfig::default()
+    };
+    let h = TtrpcServer::new(reg, cfg)
+        .with_audit_sink(sink.clone())
+        .serve(listener)
+        .unwrap();
+    let _s = UnixStream::connect(&path).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !sink.entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(sink.entered.load(Ordering::SeqCst), "sink was never called");
+    let started = std::time::Instant::now();
+    let r = h.shutdown();
+    let elapsed = started.elapsed();
+    let written = sink.written.load(Ordering::SeqCst);
+    sink.release.store(true, Ordering::SeqCst);
+    (elapsed, written, r)
+}
+
+/// SEC-4・REPAIR-5: `shutdown` は書き込み中の拒否レコードの完了まで待つ(排出前に戻らない)。
+#[test]
+fn sec4_3663_shutdown_waits_for_inflight_audit_record() {
+    let (elapsed, written, r) = shutdown_with_slow_sink(
+        "drainwait",
+        Duration::from_millis(400),
+        Duration::from_secs(10),
+    );
+    r.unwrap();
+    assert_eq!(
+        written, 1,
+        "the in-flight record must be written before shutdown returns"
+    );
+    assert!(elapsed >= Duration::from_millis(100), "elapsed={elapsed:?}");
+}
+
+/// SEC-4・REPAIR-5: 監査の書き込みが止まっていても、`audit_drain_timeout` で `shutdown` は戻る(永久に待たない)。
+#[test]
+fn sec4_3663_shutdown_returns_at_drain_deadline_when_sink_hangs() {
+    let (elapsed, written, r) = shutdown_with_slow_sink(
+        "drainhang",
+        Duration::from_secs(60),
+        Duration::from_millis(300),
+    );
+    r.unwrap();
+    assert_eq!(
+        written, 0,
+        "the hung record must not be reported as written"
+    );
+    assert!(elapsed >= Duration::from_millis(250), "elapsed={elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "elapsed={elapsed:?}");
+}

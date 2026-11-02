@@ -258,3 +258,44 @@ fn plug12_872_symlinked_ancestor_is_rejected() {
     }
     assert_eq!(std::fs::read_dir(real.join("sock")).unwrap().count(), 0);
 }
+
+/// PLUG-12・SEC-1・#3663: 未作成の socket ディレクトリの祖先が（利用者所有の＝root 所有でない）symlink のとき、
+/// start は何も作らずに拒否する（参照先に `sock` を作ってから拒否しない）。
+#[test]
+fn plug12_3663_symlinked_ancestor_of_missing_dir_creates_nothing() {
+    use std::os::unix::fs::DirBuilderExt;
+    let sc = Scratch::new();
+    let real = sc.root.join("realanc");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&real)
+        .unwrap();
+    let link = sc.root.join("linkanc");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let dir = link.join("sock");
+    let out = run_in(&sc, &dir, "ma", "start");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("symlink not owned by root"),
+        "{out:?}"
+    );
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}
+
+/// PLUG-12・SEC-1・#3663: 未作成の socket ディレクトリの親が他ユーザー書き込み可（スティッキーなし）なら、
+/// start は何も作らずに拒否する。
+#[test]
+fn plug12_3663_writable_parent_of_missing_dir_creates_nothing() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let sc = Scratch::new();
+    let anc = sc.root.join("anc");
+    std::fs::DirBuilder::new().mode(0o700).create(&anc).unwrap();
+    std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let out = run_in(&sc, &anc.join("sock"), "mw", "start");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("writable by other users"),
+        "{out:?}"
+    );
+    assert_eq!(std::fs::read_dir(&anc).unwrap().count(), 0);
+}

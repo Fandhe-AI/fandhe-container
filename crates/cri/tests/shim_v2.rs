@@ -72,8 +72,6 @@ mod e2e {
     const TRACE_ENV: &str = "FANDHE_CONTAINER_SHIM_V2_E2E_TRACE";
     /// `bootstrap` の socket 置き場所の上書き。
     const SOCKET_DIR_ENV: &str = "FANDHE_CONTAINER_SHIM_SOCKET_DIR";
-    /// 偽ランタイムが Start から Stopped へ移るまでの時間。Wait が Start より前に張られることを確かめる余地になる。
-    const RUN_FOR: Duration = Duration::from_millis(200);
     /// 偽ランタイムの終了コード。containerd を通って `ctr` の終了コードへ伝わることの証跡にする。
     const EXIT_CODE: i32 = 42;
     const WATCHDOG: Duration = Duration::from_secs(180);
@@ -85,7 +83,7 @@ mod e2e {
     #[derive(Clone, Copy, PartialEq)]
     enum Life {
         Created,
-        Running(Instant),
+        Running,
         Stopped(i32),
     }
 
@@ -96,6 +94,20 @@ mod e2e {
     #[derive(Default)]
     struct Fake {
         entries: Mutex<HashMap<String, Life>>,
+    }
+
+    impl Fake {
+        /// 実行中のエントリを終了コード `EXIT_CODE` の Stopped へ進める。経過時間ではなく、クライアントが
+        /// Start 後の Connect の応答を確かめた直後に `Traced` が呼ぶ（固定時間に依存しない明示的な同期）。
+        fn release_running(&self) {
+            if let Ok(mut m) = self.entries.lock() {
+                for l in m.values_mut() {
+                    if *l == Life::Running {
+                        *l = Life::Stopped(EXIT_CODE);
+                    }
+                }
+            }
+        }
     }
 
     struct Shared(Arc<Fake>);
@@ -118,7 +130,7 @@ mod e2e {
             match m.get_mut(r.id().as_str()) {
                 None => Err(not_found()),
                 Some(l @ Life::Created) => {
-                    *l = Life::Running(Instant::now());
+                    *l = Life::Running;
                     Ok(ContainerStatus::running(
                         r.id().clone(),
                         NonZeroU32::new(std::process::id()),
@@ -143,7 +155,7 @@ mod e2e {
             let mut m = self.0.entries.lock().unwrap();
             match m.get(r.id().as_str()) {
                 None => Err(not_found()),
-                Some(Life::Running(_)) => {
+                Some(Life::Running) => {
                     Err(TraitError::new(ErrorCode::FailedPrecondition, "running"))
                 }
                 Some(_) => {
@@ -155,14 +167,9 @@ mod e2e {
         fn state(&self, r: &RtState) -> Result<ContainerStatus, TraitError> {
             let mut m = self.0.entries.lock().unwrap();
             let l = m.get_mut(r.id().as_str()).ok_or_else(not_found)?;
-            if let Life::Running(at) = *l
-                && at.elapsed() >= RUN_FOR
-            {
-                *l = Life::Stopped(EXIT_CODE);
-            }
             Ok(match *l {
                 Life::Created => ContainerStatus::created(r.id().clone(), None),
-                Life::Running(_) => {
+                Life::Running => {
                     ContainerStatus::running(r.id().clone(), NonZeroU32::new(std::process::id()))
                 }
                 Life::Stopped(c) => ContainerStatus::stopped(r.id().clone(), Some(c)),
@@ -179,6 +186,8 @@ mod e2e {
     struct Traced {
         inner: TaskService,
         trace: Option<PathBuf>,
+        /// Connect の完了後に実行中のエントリを終了させるための偽ランタイムへの参照。
+        fake: Arc<Fake>,
     }
 
     impl Traced {
@@ -192,6 +201,12 @@ mod e2e {
                 .open(p);
             if let Ok(mut f) = f {
                 let _ = f.write_all(format!("{text}\n").as_bytes());
+            }
+        }
+        /// Connect の応答を作り終えた後に、実行中のコンテナを終了へ進める（Created のものは動かさない）。
+        fn after(&self, method: &str) {
+            if method == "Connect" {
+                self.fake.release_running();
             }
         }
         fn result(&self, method: &str, r: &Result<Vec<u8>, RpcStatus>) {
@@ -219,6 +234,7 @@ mod e2e {
             self.line(&format!("{method} begin"));
             let r = self.inner.handle(method, payload);
             self.result(method, &r);
+            self.after(method);
             r
         }
         fn handle_with_context(
@@ -230,6 +246,7 @@ mod e2e {
             self.line(&format!("{method} begin"));
             let r = self.inner.handle_with_context(method, payload, ctx);
             self.result(method, &r);
+            self.after(method);
             r
         }
     }
@@ -241,7 +258,8 @@ mod e2e {
     }
 
     fn registry(signal: ShutdownSignal) -> Result<ServiceRegistry, CriError> {
-        let adapter = RuntimeAdapter::from_runtime(Shared(Arc::new(Fake::default())));
+        let fake = Arc::new(Fake::default());
+        let adapter = RuntimeAdapter::from_runtime(Shared(fake.clone()));
         let trace = parse_trace(std::env::var_os(TRACE_ENV));
         let v2 =
             TaskService::new(TaskApiVersion::V2, adapter.clone()).with_shutdown(signal.clone());
@@ -253,6 +271,7 @@ mod e2e {
             let svc = Traced {
                 inner,
                 trace: trace.clone(),
+                fake: fake.clone(),
             };
             reg.register(Arc::new(svc))
                 .map_err(|_| CriError::internal("cannot register task service"))?;
@@ -449,9 +468,11 @@ mod e2e {
 
     impl Drop for DaemonGuard {
         fn drop(&mut self) {
+            #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+            let id = self.0.as_str();
             #[cfg(target_os = "linux")]
             {
-                let pids = leftover_shims(&self.0);
+                let pids = leftover_shims(id);
                 for pid in &pids {
                     kill_pid("KILL", *pid);
                 }
@@ -559,11 +580,13 @@ mod e2e {
             let listener = UnixListener::bind(&path).unwrap();
             let signal = ShutdownSignal::new();
             let mut reg = ServiceRegistry::new();
-            let adapter = RuntimeAdapter::from_runtime(Shared(Arc::new(Fake::default())));
+            let fake = Arc::new(Fake::default());
+            let adapter = RuntimeAdapter::from_runtime(Shared(fake.clone()));
             let trace = root.join("trace");
             reg.register(Arc::new(Traced {
                 inner: TaskService::new(version, adapter).with_shutdown(signal.clone()),
                 trace: Some(trace.clone()),
+                fake,
             }))
             .unwrap();
             let handle = TtrpcServer::new(reg, ServerConfig::default())
@@ -855,12 +878,19 @@ mod e2e {
                     ));
                 }
             }
+            use std::os::unix::fs::FileTypeExt as _;
             let socks = match std::fs::read_dir(dir.join("s")) {
                 Ok(rd) => {
                     let mut n = 0usize;
                     for e in rd {
-                        e.map_err(|e| format!("read socket dir entry: {e}"))?;
-                        n += 1;
+                        let e = e.map_err(|e| format!("read socket dir entry: {e}"))?;
+                        // daemon.log / daemon.log.lock は正常な Shutdown 後も残る永続ファイルなので、socket だけを数える。
+                        let t = e
+                            .file_type()
+                            .map_err(|e| format!("read socket dir entry type: {e}"))?;
+                        if t.is_socket() {
+                            n += 1;
+                        }
                     }
                     n
                 }

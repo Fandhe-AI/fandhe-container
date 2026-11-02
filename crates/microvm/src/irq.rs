@@ -4,7 +4,8 @@
 //! `KVM_IRQFD` / `KVM_IOEVENTFD` を発行して [`IrqFd`] / [`IoEventFd`] を返す。[`IrqFd`] は
 //! `crate::interrupt::InterruptLine` を実装し、`signal` で書いた eventfd を KVM が GSI の割り込みに変える。
 //! [`IoEventFd`] はゲストの `QueueNotify` 書き込み（VM exit なし）で発火する eventfd を持ち、
-//! [`IoEventFd::consume`] で回数を読む。どちらも drop で登録を解く（`'vm` で VM fd より先に解放される）。
+//! [`IoEventFd::consume`] で回数を読む。[`IrqFd`] は VM fd を dup して所有する（VM 構成体が VM fd と一緒に保持できる。TASK-75.2）。
+//! [`IoEventFd`] は `'vm` の借用。どちらも drop で登録を解く。
 //!
 //! # 待ちを持たない設計（REPAIR-5）
 //! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で
@@ -18,7 +19,7 @@
 
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec};
@@ -88,15 +89,18 @@ impl AsFd for EventFd {
 }
 
 /// `KVM_IRQFD` で GSI に結んだ eventfd。[`InterruptLine`] として割り込みを注入する。
+///
+/// VM fd の dup を所有するので借用を持たず、VM 構成体（TASK-75.2）が VM fd と同じ構造体に保持できる。
+/// drop の解除は dup した fd で発行するため、VM fd 本体より後に drop されても効く。
 #[derive(Debug)]
-pub struct IrqFd<'vm> {
-    vm: BorrowedFd<'vm>,
+pub struct IrqFd {
+    vm: OwnedFd,
     event: EventFd,
     gsi: u32,
 }
 
-impl<'vm> IrqFd<'vm> {
-    pub(crate) fn registered(vm: BorrowedFd<'vm>, event: EventFd, gsi: u32) -> Self {
+impl IrqFd {
+    pub(crate) fn registered(vm: OwnedFd, event: EventFd, gsi: u32) -> Self {
         Self { vm, event, gsi }
     }
 
@@ -106,15 +110,15 @@ impl<'vm> IrqFd<'vm> {
     }
 }
 
-impl InterruptLine for IrqFd<'_> {
+impl InterruptLine for IrqFd {
     fn trigger(&self) -> Result<(), MicrovmError> {
         self.event.signal()
     }
 }
 
-impl Drop for IrqFd<'_> {
+impl Drop for IrqFd {
     fn drop(&mut self) {
-        let _ = sys::kvm_irqfd(self.vm, self.event.as_fd(), self.gsi, true);
+        let _ = sys::kvm_irqfd(self.vm.as_fd(), self.event.as_fd(), self.gsi, true);
     }
 }
 

@@ -13,6 +13,7 @@
 # TASK-75.1 で microvm（ゲスト RAM の mmap と KVM 登録）を追加（依存は増やさない。unsafe は sys.rs のみ）。
 # TASK-74.3.2 で interrupt に virtio-net の割り込み通知を追加（依存は増やさない。unsafe なし）。
 # TASK-74.5 で tests/device.rs（VM exit 振り分け経由の結合試験）と crate 全体の deny(unsafe_code) を追加（依存は増やさない。unsafe は sys.rs のみ）。
+# TASK-75.2 で microvm に VM 構成体の組み立てを追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

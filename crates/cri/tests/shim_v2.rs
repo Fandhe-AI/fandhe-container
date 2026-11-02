@@ -98,7 +98,8 @@ mod e2e {
 
     impl Fake {
         /// 実行中のエントリを終了コード `EXIT_CODE` の Stopped へ進める。経過時間ではなく、クライアントが
-        /// Start 後の Connect の応答を確かめた直後に `Traced` が呼ぶ（固定時間に依存しない明示的な同期）。
+        /// Start の応答を作り終えた直後に `Traced` が呼ぶ（固定時間に依存しない明示的な同期）。
+        /// `ctr run` は Connect を Start より前に 2 回呼ぶため、Connect を契機にすると Wait が閉じない。
         fn release_running(&self) {
             if let Ok(mut m) = self.entries.lock() {
                 for l in m.values_mut() {
@@ -186,7 +187,7 @@ mod e2e {
     struct Traced {
         inner: TaskService,
         trace: Option<PathBuf>,
-        /// Connect の完了後に実行中のエントリを終了させるための偽ランタイムへの参照。
+        /// Start の完了後に実行中のエントリを終了させるための偽ランタイムへの参照。
         fake: Arc<Fake>,
     }
 
@@ -203,9 +204,9 @@ mod e2e {
                 let _ = f.write_all(format!("{text}\n").as_bytes());
             }
         }
-        /// Connect の応答を作り終えた後に、実行中のコンテナを終了へ進める（Created のものは動かさない）。
+        /// Start の応答を作り終えた後に、実行中のコンテナを終了へ進める（Created のものは動かさない）。
         fn after(&self, method: &str) {
-            if method == "Connect" {
+            if method == "Start" {
                 self.fake.release_running();
             }
         }
@@ -393,10 +394,8 @@ mod e2e {
             "fake runtime reports the daemon pid"
         );
         let conn2: ConnectResponse = c.ok(svc, "Connect", ConnectRequest { id: id.into() });
-        assert_eq!(
-            (conn2.shim_pid, conn2.task_pid),
-            (conn.shim_pid, started.pid)
-        );
+        // Start の直後に偽ランタイムが Stopped へ進むため、task_pid は照合しない（shim の pid のみ）。
+        assert_eq!(conn2.shim_pid, conn.shim_pid);
         assert_eq!(waiter.join().expect("wait thread"), EXIT_CODE as u32);
 
         let st: StateResponse = c.ok(

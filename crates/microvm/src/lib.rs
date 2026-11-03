@@ -1,5 +1,9 @@
 //! fandhe-container-microvm: KVM 直接制御・最小 virtio デバイスモデル（Linux オプション）。
 //!
+//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM だけで、先行して進める。macOS（Hypervisor.framework。TASK-192）と
+//! Windows（WHP。将来オプションで MVP には実装しない）の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
+//! 2026-11-03 決定）は、`docs/architecture.md` の「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
+//!
 //! 実装済み（TASK-74.1.1・MVM-1。Linux のみ）: `/dev/kvm` のオープン・API 版数 12 の確認・`KVM_CREATE_VM` による
 //! VM fd の取得（`error` は OS 非依存、`device` は Linux 限定）、TASK-74.1.2・MVM-1: `KVM_CREATE_VCPU` による
 //! vCPU fd の取得（x86_64・aarch64。aarch64 は初期化 ioctl も発行するが型検査のみで実行は未検証）。

@@ -8,12 +8,16 @@
 //!
 //! 1. 要求の構築（`ExecRequest`: 絶対パス・argv・`--env` の上限検証。状態ルートを触る前に不正入力を断る）
 //! 2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる
+//! 2a. launch 時の env 上書き（create の起動オプション文書。supervisor の `container_options::store::launch_env_for`）を
+//!    状態記録の世代と照合して読む（SUP-12・#2713）。launch の Entrypoint と exec の env を揃えるため（healthcheck と同じ）。
+//!    文書が欠けている・世代が合わない場合は **exec しない**（`FailedPrecondition`。オプションを黙って落とさない）
 //! 3. 監査の記録先を作る（[`default_audit_sink`]。`<状態ルート>/@audit.log`）。**作れなければ exec しない**（fail-closed。
 //!    監査なしで実行する経路は無い。SEC-4）。supervisor へ接続する前に作るのは、監査できない exec のために pidfd を
 //!    複製させないため
 //! 4. supervisor の制御チャネルから起動時 pidfd の複製を受け取る（`ExecPidfdSource`。`state.json` の pid から
 //!    `pidfd_open` する縮退はしない。SEC-1）
-//! 5. `run_command_with_pidfd` を呼ぶ（監査 sink を必須引数として渡す）
+//! 5. `run_command_with_pidfd_env` を呼ぶ（監査 sink を必須引数として渡す。env は `config.json` の `process.env` の上に
+//!    2a の launch 時 env、その上に `--env` を重ねる）
 //!
 //! 委譲スコープ（#2626 の review 対応）: core の cgroup 参加は移動元と移動先の共通祖先への書き込み権を要するため、
 //! ログインセッションの cgroup からでは `PermissionDenied` になる。`run_exec` は 1 の検査と「稼働中か」の確認の後、
@@ -44,6 +48,8 @@
 //! - supervisor 不在（孤児化・supervisor の再起動後）の exec は拒否される（起動時 pidfd を失うため。担当は #2688）。
 //! - rootful の起動（`start` が `UNIMPLEMENTED`）は対象外。healthcheck の配線は #2441。
 //! - 非 Linux は plugin 経由（#1869 の設計・TASK-125）。現状は他のコマンドと同じく fail-closed で失敗する。
+//! - 2a の文書の読み取りは期限つきの作業スレッドで包まない（5 の単一スレッドの前提を保つため。healthcheck の exec 専用
+//!   helper と同じ残余。REPAIR-5）。全体の期限は委譲スコープの親が `--timeout` と猶予で縛る。
 
 #[cfg(target_os = "linux")]
 pub(super) use linux::run_exec;
@@ -81,10 +87,11 @@ mod linux {
         ContainerId, ContainerState, ErrorCode, GetStateRequest, StateRecord, StateStore,
         TraitError,
     };
+    use fandhe_container_supervisor::container_options::store::launch_env_for;
     use fandhe_container_supervisor::control::listener::effective_uid;
     use fandhe_container_supervisor::control::{ExecPidfdSource, production_exec_pidfd_source};
     use fandhe_container_supervisor::exec::{
-        AuditedOutcome, ExecRequest, default_audit_sink, run_command_with_pidfd,
+        AuditedOutcome, ExecRequest, default_audit_sink, run_command_with_pidfd_env,
     };
     use fandhe_container_supervisor::start_client::locate_systemd_run;
     use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
@@ -102,13 +109,15 @@ mod linux {
     /// 監査の記録先を作る注入点（本番は [`production_sink`]）。引数は検査済みの状態ルート。
     type SinkFactory<'a> = dyn Fn(&Path) -> Result<Box<dyn AuditSink>, TraitError> + 'a;
 
-    /// `run_command_with_pidfd` の注入点（本番は [`production_runner`]。試験は偽の実行役を渡す）。
+    /// `run_command_with_pidfd_env` の注入点（本番は [`production_runner`]。試験は偽の実行役を渡す）。
+    /// 4 番目の引数は launch 時の env 上書き（`KEY=VALUE`。状態記録の世代と照合済みの文書から読んだもの）。
     /// 成功側は終了状態（`ExecExit`）だけを返す。`AuditedOutcome` の他の欄（適用件数・監査配送の結果）は CLI の
     /// 終了コードに影響せず、`ExecOutcome` は外から構築できないため、注入点は `ExecExit` に絞る。
     type Runner<'a> = dyn Fn(
             &StateRecord,
             BorrowedFd<'_>,
             &ExecRequest,
+            &[String],
             Duration,
             &dyn AuditSink,
         ) -> Result<ExecExit, AuditedRejection<TraitError>>
@@ -119,15 +128,16 @@ mod linux {
         default_audit_sink(Some(root.to_path_buf())).map(|s| Box::new(s) as Box<dyn AuditSink>)
     }
 
-    /// 本番の実行役: supervisor の通しの入口。
+    /// 本番の実行役: supervisor の通しの入口（launch 時 env を重ねる版。healthcheck と同じ env の規則。#2713）。
     fn production_runner(
         record: &StateRecord,
         pidfd: BorrowedFd<'_>,
         request: &ExecRequest,
+        launch_env: &[String],
         timeout: Duration,
         audit: &dyn AuditSink,
     ) -> Result<ExecExit, AuditedRejection<TraitError>> {
-        run_command_with_pidfd(record, pidfd, request, timeout, audit)
+        run_command_with_pidfd_env(record, pidfd, request, timeout, audit, launch_env)
             .map(|AuditedOutcome { outcome, .. }| outcome.exit)
     }
 
@@ -181,13 +191,15 @@ mod linux {
                 "the state store does not expose a host state root",
             )
         })?;
+        // launch 時の env 上書きを状態記録の世代と照合して読む（欠落・世代不一致は exec しない。SUP-12・#2713）。
+        let launch_env = launch_env_for(root, &record)?;
         let sink = make_sink(root)?;
 
         // pidfd の受け渡しは全体の期限の内側で、さらに上限を設ける。
         let handover_deadline = total_deadline.min(started + HANDOVER_BUDGET);
         let pidfd = source.obtain(id, pid, handover_deadline)?;
 
-        // 残りの時間が `run_command_with_pidfd` の全体の上限になる（準備から終了待ちまで）。
+        // 残りの時間が `run_command_with_pidfd_env` の全体の上限になる（準備から終了待ちまで）。
         let remaining = total_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(TraitError::new(
@@ -195,7 +207,14 @@ mod linux {
                 "exec timed out before the command started",
             ));
         }
-        match run(&record, pidfd.as_fd(), request, remaining, sink.as_ref()) {
+        match run(
+            &record,
+            pidfd.as_fd(),
+            request,
+            &launch_env,
+            remaining,
+            sink.as_ref(),
+        ) {
             Ok(exit) => Ok(child_exit_code(exit.child_exit())),
             // 拒否は記録の成否に関わらず覆らない。記録の失敗の通知は sink が 1 回だけ出す（ここでは出し直さない）。
             Err(AuditedRejection { error, .. }) => Err(error),

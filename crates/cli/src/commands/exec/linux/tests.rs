@@ -14,7 +14,11 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::audit_log::{AuditDelivery, AuditRecord, record_exit_signal};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
-use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest, UpdateStateRequest};
+use fandhe_container_core::traits::{
+    Annotations, ContainerStatus, CreateStateRequest, UpdateStateRequest,
+};
+use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+use fandhe_container_supervisor::container_options::store::{GENERATION_ANNOTATION, write_new};
 
 use super::*;
 
@@ -63,15 +67,28 @@ fn open(base: &TmpDir) -> FileStateStore {
 
 /// `name` の記録を作る（Created。`running` なら Running(PID) へ更新する）。
 fn seed(base: &TmpDir, store: &FileStateStore, name: &str, running: bool) {
+    seed_with_generation(base, store, name, running, None);
+}
+
+/// [`seed`] に、create の起動オプション文書の世代注釈（`GENERATION_ANNOTATION`）を付けられるようにしたもの。
+fn seed_with_generation(
+    base: &TmpDir,
+    store: &FileStateStore,
+    name: &str,
+    running: bool,
+    generation: Option<&str>,
+) {
     let bundle = base.0.join("bundle");
     std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(bundle.join("config.json"), "{}").expect("config");
-    let created = store
-        .create(
-            &CreateStateRequest::new(ContainerStatus::created(id(name), None), bundle)
-                .expect("req"),
-        )
-        .expect("create");
+    let mut request =
+        CreateStateRequest::new(ContainerStatus::created(id(name), None), bundle).expect("req");
+    if let Some(g) = generation {
+        let annotations =
+            Annotations::new([(GENERATION_ANNOTATION.to_owned(), g.to_owned())]).expect("ann");
+        request = request.with_annotations(annotations);
+    }
+    let created = store.create(&request).expect("create");
     if running {
         store
             .update(&UpdateStateRequest::new(
@@ -141,6 +158,8 @@ impl ExecPidfdSource for FakeSource {
 /// 偽の実行役が見た入力と、返す結果。
 struct FakeRun {
     seen: Mutex<Vec<(u32, bool)>>,
+    /// 実行役へ渡った launch 時の env 上書き（呼び出しごと）。
+    launch_envs: Mutex<Vec<Vec<String>>>,
     result: Mutex<Option<Result<ExecExit, AuditedRejection<TraitError>>>>,
 }
 
@@ -148,6 +167,7 @@ impl FakeRun {
     fn returning(result: Result<ExecExit, AuditedRejection<TraitError>>) -> Self {
         Self {
             seen: Mutex::new(Vec::new()),
+            launch_envs: Mutex::new(Vec::new()),
             result: Mutex::new(Some(result)),
         }
     }
@@ -165,9 +185,14 @@ impl FakeRun {
         record: &StateRecord,
         pidfd: BorrowedFd<'_>,
         request: &ExecRequest,
+        launch_env: &[String],
         _timeout: Duration,
         audit: &dyn AuditSink,
     ) -> Result<ExecExit, AuditedRejection<TraitError>> {
+        self.launch_envs
+            .lock()
+            .expect("lock")
+            .push(launch_env.to_vec());
         self.seen.lock().expect("lock").push((
             record.status().pid().map_or(0, NonZeroU32::get),
             pidfd.as_raw_fd() >= 0,
@@ -186,11 +211,12 @@ fn runner(
     &StateRecord,
     BorrowedFd<'_>,
     &ExecRequest,
+    &[String],
     Duration,
     &dyn AuditSink,
 ) -> Result<ExecExit, AuditedRejection<TraitError>>
 + '_ {
-    move |r, fd, req, t, a| fake.run(r, fd, req, t, a)
+    move |r, fd, req, env, t, a| fake.run(r, fd, req, env, t, a)
 }
 
 fn req() -> ExecRequest {
@@ -277,6 +303,11 @@ fn sup6_exit_codes_pass_through_the_wiring() {
         assert_eq!(run_with(&store, &probe, &fake, &source, "c1"), Ok(expected));
         assert_eq!(*source.calls.lock().unwrap(), vec![PID]);
         assert_eq!(*fake.seen.lock().unwrap(), vec![(PID, true)]);
+        // 起動オプション文書の無い（世代注釈の無い）記録では launch 時の env 上書きは空。
+        assert_eq!(
+            *fake.launch_envs.lock().unwrap(),
+            vec![Vec::<String>::new()]
+        );
         assert_eq!(
             *probe.roots.lock().unwrap(),
             vec![store.host_state_root().expect("root").to_path_buf()]
@@ -517,4 +548,49 @@ fn err1_start_line_splits_wrapper_diagnostic_from_child_output() {
     assert_eq!(mixed.get(end..), Some(tail));
     assert_eq!(find_after(b"Failed to connect to bus\n", &needle), None);
     assert_eq!(find_after(&needle[..needle.len() - 1], &needle), None);
+}
+
+/// SUP-12・SUP-6・#2713・#2626: create の起動オプション文書の env（世代が記録と一致するもの）は、launch と同じく
+/// exec の実行役へ launch 時の env 上書きとして渡る（healthcheck と同じ env の規則）。
+#[test]
+fn sup12_sup6_launch_env_reaches_exec_runner() {
+    let base = TmpDir::new("launchenv");
+    let store = open(&base);
+    seed_with_generation(&base, &store, "c1", true, Some("g1"));
+    let root = store.host_state_root().expect("root").to_path_buf();
+    let document = ContainerOptionsDocument::new(
+        Vec::new(),
+        vec!["TOKEN=dummy-value".into(), "MODE=exec".into()],
+        None,
+        None,
+        Vec::new(),
+    )
+    .expect("doc")
+    .with_generation("g1".into())
+    .expect("generation");
+    write_new(&root, &id("c1"), &document).expect("write");
+    let (probe, source) = (Probe::default(), FakeSource::ok());
+    let fake = FakeRun::returning(Ok(ExecExit::Command(ChildExit::Exited(0))));
+    assert_eq!(run_with(&store, &probe, &fake, &source, "c1"), Ok(0));
+    assert_eq!(
+        *fake.launch_envs.lock().unwrap(),
+        vec![vec!["TOKEN=dummy-value".to_owned(), "MODE=exec".to_owned()]]
+    );
+    assert_eq!(*source.calls.lock().unwrap(), vec![PID]);
+}
+
+/// SUP-12・SUP-6・#2713・#2626: 記録が世代注釈を持つのに起動オプション文書が無いときは FailedPrecondition（5）で
+/// 拒否し、監査の記録先も作らず、supervisor へ pidfd を求めず、実行役も呼ばない（オプションを黙って落とさない）。
+#[test]
+fn sup12_sup6_missing_options_document_rejects_before_handover() {
+    let base = TmpDir::new("launchenv-missing");
+    let store = open(&base);
+    seed_with_generation(&base, &store, "c1", true, Some("g1"));
+    let (probe, source, fake) = (Probe::default(), FakeSource::ok(), FakeRun::must_not_run());
+    let e = run_with(&store, &probe, &fake, &source, "c1").unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "the container options file is missing");
+    assert!(probe.roots.lock().unwrap().is_empty());
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert!(fake.seen.lock().unwrap().is_empty());
 }

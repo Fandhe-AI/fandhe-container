@@ -17,8 +17,10 @@
 # TASK-74.5 で tests/device.rs（VM exit 振り分け経由の結合試験）と crate 全体の deny(unsafe_code) を追加（依存は増やさない。unsafe は sys.rs のみ）。
 # TASK-75.2 で microvm に VM 構成体の組み立てを追加（依存は増やさない。unsafe なし）。
 # TASK-75.3.1 で boot_x86（カーネル・initrd のゲストメモリへのロード）を追加（依存は増やさない。unsafe なし）。
+# TASK-75.5 の #3739 で uart（8250 / 16550 互換の UART のレジスタモデル）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.3.2 で vCPU のレジスタ初期化（KVM_GET/SET_REGS・KVM_GET/SET_SREGS・boot_x86 の GDT・ページテーブル）を追加（依存は増やさない。unsafe は sys.rs のみ）。
 # #3769 で RunRecord に値つき exit の記録（opt-in・上限つき）と BoundedRunLog を追加（依存は増やさない。unsafe なし）。
+# #3731 で x86_64 の CPUID・MSR・FPU・LAPIC・TSS / identity map の ioctl ラッパーを追加（依存は増やさない。unsafe は sys.rs のみ）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

@@ -12,6 +12,9 @@
 //! TASK-74.4.2 で `kvm_run` 領域への応答の書き戻し（`KvmRunMap::write_from`。`device::VcpuFd::handle_exit` が呼ぶ）を足した。
 //! TASK-75.3.2 で vCPU のレジスタ初期化用に `KVM_GET_REGS` / `KVM_SET_REGS` / `KVM_GET_SREGS` / `KVM_SET_SREGS`
 //! （x86_64 のみ。`KvmRegs`・`KvmSregs` ほか。`device::VcpuFd::set_boot_state` / `regs` が呼ぶ）を足した。
+//! #3731（TASK-75.3.2・MVM-1・MVM-4）で x86_64 の `KVM_GET_SUPPORTED_CPUID`・`KVM_SET_CPUID2`・`KVM_{GET,SET}_MSRS`・
+//! `KVM_{GET,SET}_FPU`・`KVM_{GET,SET}_LAPIC`・`KVM_SET_TSS_ADDR`・`KVM_SET_IDENTITY_MAP_ADDR` を足した
+//! （呼び出し側は #3732〜#3735 で足す。それまでは試験からだけ呼ぶ）。
 //! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
 //! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
@@ -34,6 +37,9 @@
 //! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
 //! 対応物が無く、サイズ・オフセットを const assert で固定する。
 //! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
+//! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
+//! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。上限の `KVM_MAX_CPUID_ENTRIES`・
+//! `MAX_IO_MSRS` はカーネル内部の値で uapi にも無い。
 //! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
 //! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
 
@@ -90,6 +96,12 @@ pub(crate) const fn iow(ty: u64, nr: u64, size: u64) -> u64 {
     ioc(IOC_WRITE, ty, nr, size)
 }
 
+/// `_IOWR(type, nr, size)`（読み書き両方向。#3731・x86_64 の `KVM_GET_SUPPORTED_CPUID` / `KVM_GET_MSRS`）。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) const fn iowr(ty: u64, nr: u64, size: u64) -> u64 {
+    ioc(IOC_READ | IOC_WRITE, ty, nr, size)
+}
+
 /// `linux/kvm.h` の `KVMIO`。
 const KVMIO: u64 = 0xAE;
 
@@ -133,6 +145,46 @@ pub(crate) mod consts {
     pub const KVM_GET_SREGS: u64 = super::ior(super::KVMIO, 0x83, 312);
     /// `_IOW(KVMIO, 0x84, struct kvm_sregs)`（312 バイト）。
     pub const KVM_SET_SREGS: u64 = super::iow(super::KVMIO, 0x84, 312);
+    // ---- #3731（TASK-75.3.2・MVM-1・MVM-4）: x86_64 起動用の ioctl 番号 ----
+    // 出典: Linux の `include/uapi/linux/kvm.h`（ioctl 番号）と `arch/x86/include/uapi/asm/kvm.h`（構造体）。
+    // linux-libc-dev 7.0.0 のヘッダと照合済み。
+    /// `_IOWR(KVMIO, 0x05, struct kvm_cpuid2)`（ヘッダ 8 バイト。system fd に発行する）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_GET_SUPPORTED_CPUID: u64 = super::iowr(super::KVMIO, 0x05, 8);
+    /// `_IOW(KVMIO, 0x90, struct kvm_cpuid2)`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_CPUID2: u64 = super::iow(super::KVMIO, 0x90, 8);
+    /// `_IOWR(KVMIO, 0x88, struct kvm_msrs)`（ヘッダ 8 バイト）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_GET_MSRS: u64 = super::iowr(super::KVMIO, 0x88, 8);
+    /// `_IOW(KVMIO, 0x89, struct kvm_msrs)`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_MSRS: u64 = super::iow(super::KVMIO, 0x89, 8);
+    /// `_IOR(KVMIO, 0x8c, struct kvm_fpu)`（416 バイト）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_GET_FPU: u64 = super::ior(super::KVMIO, 0x8c, 416);
+    /// `_IOW(KVMIO, 0x8d, struct kvm_fpu)`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_FPU: u64 = super::iow(super::KVMIO, 0x8d, 416);
+    /// `_IOR(KVMIO, 0x8e, struct kvm_lapic_state)`（1024 バイト）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_GET_LAPIC: u64 = super::ior(super::KVMIO, 0x8e, 1024);
+    /// `_IOW(KVMIO, 0x8f, struct kvm_lapic_state)`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_LAPIC: u64 = super::iow(super::KVMIO, 0x8f, 1024);
+    /// `_IO(KVMIO, 0x47)`（引数は `unsigned long` の値渡し。VM fd）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_TSS_ADDR: u64 = super::io(super::KVMIO, 0x47);
+    /// `_IOW(KVMIO, 0x48, __u64)`（引数は `u64` へのポインタ。VM fd）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const KVM_SET_IDENTITY_MAP_ADDR: u64 = super::iow(super::KVMIO, 0x48, 8);
+    /// `KVM_MAX_CPUID_ENTRIES`（`arch/x86/include/asm/kvm_host.h`。カーネル内部の値で uapi に無い）。
+    /// `KVM_SET_CPUID2` は `nent` がこれを超えると E2BIG、`KVM_GET_SUPPORTED_CPUID` はこの件数に丸める。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const MAX_CPUID_ENTRIES: usize = 256;
+    /// `MAX_IO_MSRS = 256`（`arch/x86/kvm/x86.c`。`nmsrs >= 256` が E2BIG のため上限は 255）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const MAX_MSR_ENTRIES: usize = 255;
     pub const KVM_CAP_IRQCHIP: u64 = 0;
     pub const KVM_CAP_IRQFD: u64 = 32;
     pub const KVM_CAP_IOEVENTFD: u64 = 36;
@@ -359,6 +411,110 @@ const _: () = {
     assert!(consts::KVM_SET_REGS == 0x4090_AE82);
     assert!(consts::KVM_GET_SREGS == 0x8138_AE83);
     assert!(consts::KVM_SET_SREGS == 0x4138_AE84);
+};
+
+// ---- #3731（TASK-75.3.2・MVM-1・MVM-4）: x86_64 起動用の構造体 ----
+// 呼び出し側（`device` / `microvm`）は #3732〜#3735 で足す。それまでは試験からだけ使うため `dead_code` を許可し、
+// 呼び出しが入ったら外す。
+
+/// x86_64 の `struct kvm_cpuid_entry2`（`asm/kvm.h`。40 バイト）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct KvmCpuidEntry2 {
+    pub function: u32,
+    pub index: u32,
+    pub flags: u32,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub padding: [u32; 3],
+}
+
+/// x86_64 の `struct kvm_msr_entry`（`asm/kvm.h`。16 バイト）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct KvmMsrEntry {
+    pub index: u32,
+    pub reserved: u32,
+    pub data: u64,
+}
+
+/// x86_64 の `struct kvm_fpu`（`asm/kvm.h`。416 バイト）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct KvmFpu {
+    pub fpr: [[u8; 16]; 8],
+    pub fcw: u16,
+    pub fsw: u16,
+    pub ftwx: u8,
+    pub pad1: u8,
+    pub last_opcode: u16,
+    pub last_ip: u64,
+    pub last_dp: u64,
+    pub xmm: [[u8; 16]; 16],
+    pub mxcsr: u32,
+    pub pad2: u32,
+}
+
+/// x86_64 の `struct kvm_lapic_state`（`asm/kvm.h`。`char regs[KVM_APIC_REG_SIZE = 0x400]`）。
+/// C の `char` は x86_64 で符号付きだがレイアウトは `u8` と同一。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct KvmLapicState {
+    pub regs: [u8; 1024],
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl Default for KvmLapicState {
+    fn default() -> Self {
+        KvmLapicState { regs: [0; 1024] }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<KvmCpuidEntry2>() == 40);
+    assert!(align_of::<KvmCpuidEntry2>() == 4);
+    assert!(offset_of!(KvmCpuidEntry2, flags) == 8);
+    assert!(offset_of!(KvmCpuidEntry2, eax) == 12);
+    assert!(offset_of!(KvmCpuidEntry2, edx) == 24);
+    assert!(offset_of!(KvmCpuidEntry2, padding) == 28);
+    assert!(size_of::<KvmMsrEntry>() == 16);
+    assert!(align_of::<KvmMsrEntry>() == 8);
+    assert!(offset_of!(KvmMsrEntry, data) == 8);
+    assert!(size_of::<KvmFpu>() == 416);
+    assert!(align_of::<KvmFpu>() == 8);
+    assert!(offset_of!(KvmFpu, fcw) == 128);
+    assert!(offset_of!(KvmFpu, ftwx) == 132);
+    assert!(offset_of!(KvmFpu, last_opcode) == 134);
+    assert!(offset_of!(KvmFpu, last_ip) == 136);
+    assert!(offset_of!(KvmFpu, last_dp) == 144);
+    assert!(offset_of!(KvmFpu, xmm) == 152);
+    assert!(offset_of!(KvmFpu, mxcsr) == 408);
+    assert!(offset_of!(KvmFpu, pad2) == 412);
+    assert!(size_of::<KvmLapicState>() == 1024);
+    assert!(align_of::<KvmLapicState>() == 1);
+    assert!(consts::KVM_GET_SUPPORTED_CPUID == 0xC008_AE05);
+    assert!(consts::KVM_SET_CPUID2 == 0x4008_AE90);
+    assert!(consts::KVM_GET_MSRS == 0xC008_AE88);
+    assert!(consts::KVM_SET_MSRS == 0x4008_AE89);
+    assert!(consts::KVM_GET_FPU == 0x81A0_AE8C);
+    assert!(consts::KVM_SET_FPU == 0x41A0_AE8D);
+    assert!(consts::KVM_GET_LAPIC == 0x8400_AE8E);
+    assert!(consts::KVM_SET_LAPIC == 0x4400_AE8F);
+    assert!(consts::KVM_SET_TSS_ADDR == 0xAE47);
+    assert!(consts::KVM_SET_IDENTITY_MAP_ADDR == 0x4008_AE48);
 };
 
 /// `struct kvm_userspace_memory_region`（`linux/kvm.h`。32 バイト）。対応外 arch では使われない。
@@ -1389,6 +1545,329 @@ pub(crate) fn kvm_set_sregs(vcpu: BorrowedFd<'_>, sregs: &KvmSregs) -> Result<()
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 可変長ヘッダ付きバッファ（`struct kvm_cpuid2` / `struct kvm_msrs` 用。#3731・MVM-1・MVM-4）。
+///
+/// 先頭 8 バイトのヘッダ（先頭 4 バイトが件数 `u32`、残りは padding）の直後に `E` が `cap` 件続く 1 つの連続領域を
+/// ちょうどの大きさで確保する。不変条件: 作成時にヘッダの件数へ `cap` を書く（ioctl 後はカーネルが書き戻した
+/// 非信頼の値になるため、読むときは `entries` が容量以下を検証する）。
+/// `E` はどのビットパターンも有効な整数だけの `repr(C)` 型（`KvmCpuidEntry2`・`KvmMsrEntry`）に限る。
+/// 呼び出し元は下の `kvm_get_supported_cpuid` などの安全なラッパーだけ。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct FlexBuf<E: Copy> {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    cap: usize,
+    _entry: std::marker::PhantomData<E>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl<E: Copy> FlexBuf<E> {
+    const HEADER: usize = 8;
+
+    /// `n` 件分を確保する。`n > max` は確保より前に E2BIG（7）で拒否する。
+    fn with_capacity(n: usize, max: usize) -> Result<Self, SysError> {
+        if n > max {
+            return Err(SysError::Os(7));
+        }
+        let count = u32::try_from(n).map_err(|_| SysError::Os(7))?;
+        let size = std::mem::size_of::<E>()
+            .checked_mul(n)
+            .and_then(|b| b.checked_add(Self::HEADER))
+            .ok_or(SysError::Os(22))?;
+        let align = std::mem::align_of::<E>().max(4);
+        let layout = Layout::from_size_align(size, align).map_err(|_| SysError::Os(22))?;
+        // SAFETY: `size >= 8` で非 0。戻り値の null は直後に検査する。
+        let p = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(p).ok_or(SysError::Os(12))?;
+        let buf = FlexBuf {
+            ptr,
+            layout,
+            cap: n,
+            _entry: std::marker::PhantomData,
+        };
+        buf.set_count(count);
+        Ok(buf)
+    }
+
+    /// ヘッダの件数を書く。
+    fn set_count(&self, count: u32) {
+        // SAFETY: `ptr` は 8 バイト以上でアライン 4 以上の確保の先頭。先頭 4 バイトへの書き込みで範囲内。
+        unsafe { self.ptr.as_ptr().cast::<u32>().write(count) };
+    }
+
+    /// ヘッダの件数（ioctl 後はカーネルが書き戻した値で、非信頼）。
+    fn count(&self) -> u32 {
+        // SAFETY: `ptr` は 8 バイト以上でアライン 4 以上の確保の先頭で、ゼロ埋め済み（初期化済み）。
+        unsafe { self.ptr.as_ptr().cast::<u32>().read() }
+    }
+
+    fn as_ioctl_ptr(&mut self) -> *mut c_void {
+        self.ptr.as_ptr().cast::<c_void>()
+    }
+
+    /// 先頭 `count` 件を読む。`count > cap` は不整合として EINVAL（22）。
+    fn entries(&self, count: usize) -> Result<&[E], SysError> {
+        if count > self.cap {
+            return Err(SysError::Os(22));
+        }
+        // SAFETY: entries は先頭から 8 バイト後で、確保のアラインは `max(4, align_of::<E>())`（<= 8）のため
+        // `E` のアラインに合う。`count <= cap` で範囲内、ゼロ埋め以後は整数だけで有効なビットパターン、
+        // `&self` の間は他に書き手がいない。
+        Ok(unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr().add(Self::HEADER).cast::<E>(), count)
+        })
+    }
+
+    /// 先頭 `src.len()` 件へ書く。`src.len() > cap` は EINVAL（22）。
+    fn fill(&mut self, src: &[E]) -> Result<(), SysError> {
+        if src.len() > self.cap {
+            return Err(SysError::Os(22));
+        }
+        // SAFETY: 範囲は `src.len() <= cap` を検査済みで、アラインは `entries` と同じ。`&mut self` で排他的、
+        // `src` は別の確保で重ならない。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                self.ptr.as_ptr().add(Self::HEADER).cast::<E>(),
+                src.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+impl<E: Copy> Drop for FlexBuf<E> {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` は `with_capacity` が同じ `layout` で確保したもので、drop は 1 度だけ。
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// `KVM_GET_SUPPORTED_CPUID`（system fd = `/dev/kvm`）でホストの CPUID 候補を最大 `max_entries` 件読む（x86_64 のみ）。
+///
+/// `max_entries` が 0 または 256 超なら確保前に E2BIG。容量不足でカーネルが E2BIG を返したときもそのまま返す
+/// （再試行の方針は #3733 が決める）。書き戻された件数は非信頼として容量以下を検証する。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_get_supported_cpuid(
+    kvm: BorrowedFd<'_>,
+    max_entries: usize,
+) -> Result<Vec<KvmCpuidEntry2>, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if max_entries == 0 {
+        return Err(SysError::Os(7));
+    }
+    let mut buf = FlexBuf::<KvmCpuidEntry2>::with_capacity(max_entries, consts::MAX_CPUID_ENTRIES)?;
+    // SAFETY: `kvm` は借用中の生存 fd。`buf` は `8 + 40 * max_entries` バイトの確保で、ヘッダの件数が確保した
+    // 容量と一致する（カーネルはこの件数の範囲内だけを書く）。呼び出し中は `&mut` で排他的に生存し、
+    // 同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            kvm.as_raw_fd(),
+            consts::KVM_GET_SUPPORTED_CPUID,
+            buf.as_ioctl_ptr(),
+        )
+    };
+    if r < 0 {
+        return Err(last_error());
+    }
+    Ok(buf.entries(buf.count() as usize)?.to_vec())
+}
+
+/// `KVM_SET_CPUID2`（vCPU fd）で CPUID を設定する（x86_64 のみ）。256 件超は確保前に E2BIG。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_cpuid2(
+    vcpu: BorrowedFd<'_>,
+    entries: &[KvmCpuidEntry2],
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut buf =
+        FlexBuf::<KvmCpuidEntry2>::with_capacity(entries.len(), consts::MAX_CPUID_ENTRIES)?;
+    buf.fill(entries)?;
+    // SAFETY: `vcpu` は借用中の生存 fd。`buf` は `8 + 40 * len` バイトでヘッダの件数 = 容量。カーネルは
+    // その範囲を読むだけで書かず、呼び出し中は生存し、同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe { ioctl(vcpu.as_raw_fd(), consts::KVM_SET_CPUID2, buf.as_ioctl_ptr()) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_MSRS`（vCPU fd）で MSR を読む（x86_64 のみ）。`entries[i].index` に読む MSR 番号を入れて渡す。
+///
+/// 戻り値は処理できた MSR の件数（0 でも成功。途中の MSR で止まると `len` 未満の非負値が返り errno は無い）。
+/// 呼び出し側が `== entries.len()` を確かめること。先頭の戻り値件数だけを `entries` へ書き戻す。
+/// 255 件超は確保前に E2BIG。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_get_msrs(
+    vcpu: BorrowedFd<'_>,
+    entries: &mut [KvmMsrEntry],
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut buf = FlexBuf::<KvmMsrEntry>::with_capacity(entries.len(), consts::MAX_MSR_ENTRIES)?;
+    buf.fill(entries)?;
+    // SAFETY: `vcpu` は借用中の生存 fd。`buf` は `8 + 16 * len` バイトでヘッダの件数 = 容量（カーネルは
+    // その範囲内だけを読み書きする）。呼び出し中は `&mut` で排他的に生存し、同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe { ioctl(vcpu.as_raw_fd(), consts::KVM_GET_MSRS, buf.as_ioctl_ptr()) };
+    let n = msr_result(r, entries.len())?;
+    let got = buf.entries(n)?;
+    let dst = entries.get_mut(..n).ok_or(SysError::Os(22))?;
+    dst.copy_from_slice(got);
+    Ok(n)
+}
+
+/// `KVM_SET_MSRS`（vCPU fd）で MSR を書く（x86_64 のみ）。戻り値の意味は [`kvm_get_msrs`] と同じ
+/// （設定できた件数。呼び出し側が `== entries.len()` を確かめる）。255 件超は確保前に E2BIG。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_msrs(
+    vcpu: BorrowedFd<'_>,
+    entries: &[KvmMsrEntry],
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut buf = FlexBuf::<KvmMsrEntry>::with_capacity(entries.len(), consts::MAX_MSR_ENTRIES)?;
+    buf.fill(entries)?;
+    // SAFETY: `vcpu` は借用中の生存 fd。`buf` は `8 + 16 * len` バイトでヘッダの件数 = 容量。カーネルは
+    // その範囲を読むだけで書かず、呼び出し中は生存し、同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe { ioctl(vcpu.as_raw_fd(), consts::KVM_SET_MSRS, buf.as_ioctl_ptr()) };
+    msr_result(r, entries.len())
+}
+
+/// MSR 系 ioctl の戻り値を検証する。負は errno、要求件数超はカーネル応答の不整合として EINVAL（22）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn msr_result(r: i32, requested: usize) -> Result<usize, SysError> {
+    if r < 0 {
+        return Err(last_error());
+    }
+    let n = usize::try_from(r).map_err(|_| SysError::Os(22))?;
+    if n > requested {
+        return Err(SysError::Os(22));
+    }
+    Ok(n)
+}
+
+/// `KVM_GET_FPU`（vCPU fd）で FPU 状態を読む（x86_64 のみ）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_get_fpu(vcpu: BorrowedFd<'_>) -> Result<KvmFpu, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut fpu = KvmFpu::default();
+    // SAFETY: `vcpu` は借用中の生存 fd。`fpu` は `repr(C)` で 416 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 416 バイトだけを
+    // 書き、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_FPU,
+            &mut fpu as *mut KvmFpu,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(fpu) }
+}
+
+/// `KVM_SET_FPU`（vCPU fd）で FPU 状態を書く（x86_64 のみ）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_fpu(vcpu: BorrowedFd<'_>, fpu: &KvmFpu) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vcpu` は借用中の生存 fd。`fpu` は `repr(C)` で 416 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 416 バイトを読むだけで書かず、
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe { ioctl(vcpu.as_raw_fd(), consts::KVM_SET_FPU, fpu as *const KvmFpu) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_LAPIC`（vCPU fd）で LAPIC レジスタ面を読む（x86_64 のみ）。in-kernel irqchip
+/// （`KVM_CREATE_IRQCHIP`）が無いと EINVAL になる。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_get_lapic(vcpu: BorrowedFd<'_>) -> Result<KvmLapicState, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut lapic = KvmLapicState::default();
+    // SAFETY: `vcpu` は借用中の生存 fd。`lapic` は `repr(C)` で 1024 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 1024 バイトだけを
+    // 書き、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_LAPIC,
+            &mut lapic as *mut KvmLapicState,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(lapic) }
+}
+
+/// `KVM_SET_LAPIC`（vCPU fd）で LAPIC レジスタ面を書く（x86_64 のみ。in-kernel irqchip が前提）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_lapic(vcpu: BorrowedFd<'_>, lapic: &KvmLapicState) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vcpu` は借用中の生存 fd。`lapic` は `repr(C)` で 1024 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 1024 バイトを読むだけで書かず、
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_SET_LAPIC,
+            lapic as *const KvmLapicState,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_SET_TSS_ADDR`（VM fd）で TSS 用の 3 ページ（12 KiB）の置き場を指定する（x86_64 のみ）。
+/// vCPU 作成前に発行する。引数は `unsigned long` の値渡し。値の選定と他領域との重なり検証は呼び出し側（#3732）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_tss_addr(vm: BorrowedFd<'_>, addr: u64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vm` は借用中の生存 fd。引数は値渡し（ポインタではない）で、カーネルはユーザー空間のメモリを読み書きしない。
+    let r = unsafe { ioctl(vm.as_raw_fd(), consts::KVM_SET_TSS_ADDR, addr) };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_SET_IDENTITY_MAP_ADDR`（VM fd）で identity map 用の 1 ページの置き場を指定する（x86_64 のみ）。
+/// vCPU 作成前に発行する。引数は `u64` へのポインタ（`KVM_SET_TSS_ADDR` の値渡しとは形が違う）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn kvm_set_identity_map_addr(vm: BorrowedFd<'_>, addr: u64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vm` は借用中の生存 fd。`addr` は 8 バイト（ioctl 番号のサイズ符号と一致）のローカルの借用で、
+    // 呼び出し中は生存する。カーネルは 8 バイトを読むだけで書かず、同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vm.as_raw_fd(),
+            consts::KVM_SET_IDENTITY_MAP_ADDR,
+            &addr as *const u64,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,6 +1888,7 @@ mod tests {
         assert_eq!(ior(0xAE, 0xAF, 32), 0x8020_AEAF);
         assert_eq!(iow(0xAE, 0xAE, 32), 0x4020_AEAE);
         assert_eq!(ioc(0, 0xAE, 0x41, 0), 0xAE41);
+        assert_eq!(iowr(0xAE, 0x05, 8), 0xC008_AE05);
     }
 
     /// MVM-1: `KVM_CREATE_VCPU = _IO(KVMIO, 0x41)`。
@@ -1667,5 +2147,134 @@ mod tests {
     fn arm_vcpu_constants_match_kernel_abi() {
         assert_eq!(consts::KVM_ARM_VCPU_INIT, 0x4020_AEAE);
         assert_eq!(consts::KVM_ARM_PREFERRED_TARGET, 0x8020_AEAF);
+    }
+
+    /// MVM-1・MVM-4・#3731: x86_64 起動用の ioctl 番号と上限の具体値。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn x86_boot_ioctl_constants_match_kernel_abi() {
+        assert_eq!(iowr(0xAE, 0x05, 8), 0xC008_AE05);
+        assert_eq!(consts::KVM_GET_SUPPORTED_CPUID, 0xC008_AE05);
+        assert_eq!(consts::KVM_SET_CPUID2, 0x4008_AE90);
+        assert_eq!(consts::KVM_GET_MSRS, 0xC008_AE88);
+        assert_eq!(consts::KVM_SET_MSRS, 0x4008_AE89);
+        assert_eq!(consts::KVM_GET_FPU, 0x81A0_AE8C);
+        assert_eq!(consts::KVM_SET_FPU, 0x41A0_AE8D);
+        assert_eq!(consts::KVM_GET_LAPIC, 0x8400_AE8E);
+        assert_eq!(consts::KVM_SET_LAPIC, 0x4400_AE8F);
+        assert_eq!(consts::KVM_SET_TSS_ADDR, 0xAE47);
+        assert_eq!(consts::KVM_SET_IDENTITY_MAP_ADDR, 0x4008_AE48);
+        assert_eq!(consts::MAX_CPUID_ENTRIES, 256);
+        assert_eq!(consts::MAX_MSR_ENTRIES, 255);
+    }
+
+    /// MVM-1・MVM-4・#3731: 構造体のサイズと主要オフセットの具体値。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn x86_boot_struct_layout_matches_kernel_abi() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<KvmCpuidEntry2>(), 40);
+        assert_eq!(offset_of!(KvmCpuidEntry2, padding), 28);
+        assert_eq!(size_of::<KvmMsrEntry>(), 16);
+        assert_eq!(offset_of!(KvmMsrEntry, data), 8);
+        assert_eq!(size_of::<KvmFpu>(), 416);
+        assert_eq!(offset_of!(KvmFpu, xmm), 152);
+        assert_eq!(offset_of!(KvmFpu, mxcsr), 408);
+        assert_eq!(size_of::<KvmLapicState>(), 1024);
+    }
+
+    /// MVM-1・#3731: 起動用 ioctl は KVM でない fd に対して ENOTTY（unsafe 経路を KVM 無しで通す）。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn x86_boot_ioctls_on_non_kvm_fd_are_enotty() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        let fd = f.as_fd();
+        let enotty = SysError::Os(25);
+        assert_eq!(kvm_get_supported_cpuid(fd, 8), Err(enotty));
+        assert_eq!(
+            kvm_set_cpuid2(fd, &[KvmCpuidEntry2::default(); 2]),
+            Err(enotty)
+        );
+        let mut m = [KvmMsrEntry {
+            index: 0x10,
+            ..Default::default()
+        }];
+        assert_eq!(kvm_get_msrs(fd, &mut m), Err(enotty));
+        assert_eq!(kvm_set_msrs(fd, &m), Err(enotty));
+        assert_eq!(kvm_get_fpu(fd), Err(enotty));
+        assert_eq!(kvm_set_fpu(fd, &KvmFpu::default()), Err(enotty));
+        assert_eq!(kvm_get_lapic(fd), Err(enotty));
+        assert_eq!(kvm_set_lapic(fd, &KvmLapicState::default()), Err(enotty));
+        assert_eq!(kvm_set_tss_addr(fd, 0xFFFB_D000), Err(enotty));
+        assert_eq!(kvm_set_identity_map_addr(fd, 0xFFFB_C000), Err(enotty));
+    }
+
+    /// MVM-4・REPAIR-5・#3731: 件数の上限超過は確保・ioctl より前に E2BIG（ENOTTY でないので ioctl 未到達）。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn x86_boot_entry_limits_are_rejected_before_allocation() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        let fd = f.as_fd();
+        let e2big = SysError::Os(7);
+        assert_eq!(kvm_get_supported_cpuid(fd, 257), Err(e2big));
+        assert_eq!(kvm_get_supported_cpuid(fd, usize::MAX), Err(e2big));
+        assert_eq!(kvm_get_supported_cpuid(fd, 0), Err(e2big));
+        assert_eq!(
+            kvm_set_cpuid2(fd, &vec![KvmCpuidEntry2::default(); 257]),
+            Err(e2big)
+        );
+        let mut m = vec![KvmMsrEntry::default(); 256];
+        assert_eq!(kvm_get_msrs(fd, &mut m), Err(e2big));
+        assert_eq!(kvm_set_msrs(fd, &m), Err(e2big));
+        // 境界は ioctl まで届く。
+        assert_eq!(
+            kvm_set_cpuid2(fd, &vec![KvmCpuidEntry2::default(); 256]),
+            Err(SysError::Os(25))
+        );
+        let mut m = vec![KvmMsrEntry::default(); 255];
+        assert_eq!(kvm_get_msrs(fd, &mut m), Err(SysError::Os(25)));
+    }
+
+    /// MVM-4・#3731: 可変長バッファの往復と、カーネル応答（件数・戻り値）の検証。
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn flex_buffer_roundtrip_and_untrusted_count() {
+        let mut b = FlexBuf::<KvmCpuidEntry2>::with_capacity(3, 256).unwrap();
+        assert_eq!(b.count(), 3);
+        let src = [
+            KvmCpuidEntry2 {
+                function: 1,
+                eax: 7,
+                ..Default::default()
+            },
+            KvmCpuidEntry2 {
+                function: 0xB,
+                edx: 9,
+                ..Default::default()
+            },
+        ];
+        b.fill(&src).unwrap();
+        assert_eq!(b.entries(2).unwrap(), &src);
+        assert_eq!(b.entries(4), Err(SysError::Os(22)));
+        assert_eq!(
+            b.fill(&[KvmCpuidEntry2::default(); 4]),
+            Err(SysError::Os(22))
+        );
+        // カーネルが容量超の件数を書き戻した場合を模擬する。
+        b.set_count(4);
+        assert_eq!(b.entries(b.count() as usize), Err(SysError::Os(22)));
+
+        let m = FlexBuf::<KvmMsrEntry>::with_capacity(2, 255).unwrap();
+        assert_eq!(m.count(), 2);
+        assert_eq!(m.ptr.as_ptr() as usize % 8, 0);
+        assert_eq!(
+            FlexBuf::<KvmMsrEntry>::with_capacity(256, 255).err(),
+            Some(SysError::Os(7))
+        );
+        assert_eq!(msr_result(2, 2), Ok(2));
+        assert_eq!(msr_result(0, 2), Ok(0));
+        assert_eq!(msr_result(3, 2), Err(SysError::Os(22)));
     }
 }

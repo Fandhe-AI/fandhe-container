@@ -1091,6 +1091,14 @@ jobs:
         timeout-minutes: 5
         run: make guest-initrd-build-selftest
 
+      # microVM の実カーネル試験用の最小 initrd 生成スクリプト（scripts/build-microvm-test-initrd.sh）の自己テスト（#3770・MVM-1・REPAIR-12）。
+      # 一時ディレクトリとスタブの gzip だけを使い、実カーネル・ネットワーク・secrets は使わない。
+      # Windows（Git Bash）では unsupported-os の拒否の契約だけを照合する。新ジョブは増やさず既存ジョブのステップとする
+      - name: microVM 最小 initrd 生成スクリプトの自己テスト（#3770・MVM-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make microvm-test-initrd-build-selftest
+
       # /dev/fd/N 経由の権限検査の観測スクリプト（scripts/probe-dev-fd-perm.sh）の自己テスト（#2088・MAC-1・REPAIR-12）。
       # 一時ファイルだけを使う。macOS では観測値を assert せず形式だけ照合し、ログが一次データになる。
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）

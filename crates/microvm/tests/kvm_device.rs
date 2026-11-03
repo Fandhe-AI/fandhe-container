@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -990,6 +990,101 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
         MicrovmErrorCode::Unimplemented
     );
 }
+/// MVM-1・#3735: `setup_boot_vcpu` が BSP の LAPIC の LVT LINT0 を ExtINT（マスク解除）、LINT1 を NMI にし、`KVM_GET_LAPIC` で読み戻せる。
+/// 経路は `assemble` → `load_kernel` → `setup_boot_vcpu` を通す（呼び出し箇所の付け忘れを検出するため）。LINT0 は
+/// `KVM_X86_QUIRK_LINT0_REENABLED` で設定前から ExtINT のことがあり判別子にならないため、設定前に NMI でなかった LINT1 を変化の証跡にする。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_boot_lapic_lints_read_back() {
+    use fandhe_container_microvm::lapic_x86::{LvtDeliveryMode, virtual_wire_lvt};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+
+    // 合成 bzImage（kvm_device_boot_vcpu_starts_at_kernel_entry と同じ header）。コードは使わない（実行しない）。
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+    put(0x1F1, &[4]);
+    put(0x1FE, &0xAA55u16.to_le_bytes());
+    put(0x201, &[0x62]);
+    put(0x202, b"HdrS");
+    put(0x206, &0x020Fu16.to_le_bytes());
+    put(0x211, &[1]);
+    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+    put(0x230, &0x20_0000u32.to_le_bytes());
+    put(0x234, &[1]);
+    put(0x236, &1u16.to_le_bytes());
+    put(0x238, &2047u32.to_le_bytes());
+    put(0x258, &0x100_0000u64.to_le_bytes());
+    put(0x260, &0x40_0000u32.to_le_bytes());
+
+    let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![],
+        },
+    )
+    .unwrap();
+    let pre = vm.vcpu_mut(0).unwrap().lapic_lints().unwrap();
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    vm.setup_boot_vcpu(&loaded).unwrap();
+    let post = vm.vcpu_mut(0).unwrap().lapic_lints().unwrap();
+
+    // LINT1: NMI・マスク解除（設定前は NMI かつマスク解除ではない = 変化の証跡）。
+    assert_eq!(post.lint1, 0x0000_0400);
+    assert!(!(pre.lint1_mode() == LvtDeliveryMode::Nmi && !pre.lint1_masked()));
+    // LINT0: ExtINT・マスク解除。
+    assert_eq!(post.lint0_mode(), LvtDeliveryMode::ExtInt);
+    assert!(!post.lint0_masked());
+    // 純粋関数と ioctl 経路の結びつき。
+    assert_eq!(
+        post.lint0,
+        virtual_wire_lvt(pre.lint0, LvtDeliveryMode::ExtInt)
+    );
+    assert_eq!(
+        post.lint1,
+        virtual_wire_lvt(pre.lint1, LvtDeliveryMode::Nmi)
+    );
+}
+
+/// MVM-1・#3735: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_boot_lapic_lints_read_back() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
 /// MVM-1・#3733・TASK-75.3.2: `MicroVm::assemble` が設定した `KVM_SET_CPUID2` がゲストから見える。vCPU 0 のゲストが
 /// leaf 0 の vendor（EBX・EDX・ECX）と leaf 1 の APIC ID（EBX\[31:24\]）・hypervisor ビット（ECX\[31\]）を `out 0x10` で返し、
 /// ホスト側の期待値（`KVM_GET_SUPPORTED_CPUID` の leaf 0 と、設定した APIC ID = 0）と具体値で照合する。

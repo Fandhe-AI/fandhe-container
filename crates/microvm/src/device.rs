@@ -19,7 +19,8 @@
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
-//! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の設定は未実装で #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
+//! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
+//! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する [`VcpuFd::set_boot_lints`] と観測用の [`VcpuFd::lapic_lints`] を足した。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
@@ -287,7 +288,7 @@ impl VcpuFd {
     /// `apic_base`・`interrupt_bitmap` は読んだ値のまま保つ。最初の [`VcpuFd::run_once`] より前に、BSP（vCPU 0）にだけ呼ぶ。
     /// GDT・ページテーブルなど `state` が指すゲストメモリの内容は呼び出し側が先に書く（`boot_x86::write_boot_tables`）。
     /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID は [`VcpuFd::set_cpuid`]、MSR・FPU は [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`]
-    /// （`MicroVm::setup_boot_vcpu` が続けて呼ぶ）で別に設定する。
+    /// （`MicroVm::setup_boot_vcpu` が続けて呼ぶ）で別に設定する。LAPIC の LINT は [`VcpuFd::set_boot_lints`]（#3735）。
     #[cfg(target_arch = "x86_64")]
     pub fn set_boot_state(&mut self, state: &BootCpuState) -> Result<(), MicrovmError> {
         let fd = self.fd.as_fd();
@@ -496,6 +497,37 @@ impl VcpuFd {
             r15: r.r15,
             rip: r.rip,
             rflags: r.rflags,
+        })
+    }
+
+    /// BSP の LAPIC の LVT LINT0 を ExtINT、LINT1 を NMI（ともにマスク解除）にして `KVM_SET_LAPIC` で書き戻す（#3735・MVM-1。
+    /// x86_64 のみ）。設定後の LINT の値を返す。
+    ///
+    /// `MicroVm::setup_boot_vcpu` が BSP（vCPU 0）にだけ呼ぶ。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
+    /// マスクも解除する理由は `lapic_x86` モジュールを参照。in-kernel irqchip が前提で、無い VM では `FailedPrecondition`。
+    /// AP は INIT/SIPI を待つため触らない。エラー message にレジスタ値は載せない（ERR-1）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_boot_lints(&mut self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
+        let fd = self.fd.as_fd();
+        let mut state =
+            sys::kvm_get_lapic(fd).map_err(|e| classify_vcpu_error(VcpuStage::GetLapic, e))?;
+        let lints = crate::lapic_x86::apply_boot_lints(&mut state.regs)?;
+        sys::kvm_set_lapic(fd, &state).map_err(|e| classify_vcpu_error(VcpuStage::SetLapic, e))?;
+        Ok(lints)
+    }
+
+    /// LAPIC の LVT LINT0 / LINT1 の現在値を読む（観測用。#3735。x86_64 のみ）。
+    ///
+    /// [`VcpuFd::regs`] と同じく `&self` で、`run_once`（`&mut self`）とは借用規則で排他される。
+    #[cfg(target_arch = "x86_64")]
+    pub fn lapic_lints(&self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
+        let state = sys::kvm_get_lapic(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetLapic, e))?;
+        crate::lapic_x86::LapicLints::from_regs(&state.regs).ok_or_else(|| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "LAPIC register page is too short for LVT LINT0/LINT1",
+            )
         })
     }
 
@@ -850,6 +882,11 @@ enum VcpuStage {
     GetFpu,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetFpu,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetLapic,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetLapic,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetCpuid,
     PreferredTarget,
     VcpuInit,
@@ -870,6 +907,8 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::SetMsrs => "KVM_SET_MSRS",
         VcpuStage::GetFpu => "KVM_GET_FPU",
         VcpuStage::SetFpu => "KVM_SET_FPU",
+        VcpuStage::GetLapic => "KVM_GET_LAPIC",
+        VcpuStage::SetLapic => "KVM_SET_LAPIC",
         VcpuStage::SetCpuid => "KVM_SET_CPUID2",
     };
     let registers = matches!(
@@ -882,6 +921,7 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
             | VcpuStage::SetMsrs
             | VcpuStage::GetFpu
             | VcpuStage::SetFpu
+            | VcpuStage::SetLapic
     );
     let msrs = matches!(stage, VcpuStage::GetMsrs | VcpuStage::SetMsrs);
     match e {
@@ -892,6 +932,11 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         SysError::Os(EINVAL) if stage == VcpuStage::Create => {
             MicrovmError::new(MicrovmErrorCode::InvalidArgument, "invalid vCPU id")
         }
+        // in-kernel irqchip が無い VM の LAPIC 読み取り（BSP の LINT 設定の前提違反）。
+        SysError::Os(EINVAL) if stage == VcpuStage::GetLapic => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_GET_LAPIC requires an in-kernel irqchip",
+        ),
         // レジスタ値の拒否。値・アドレスは message に載せない（ERR-1）。
         SysError::Os(EINVAL) if registers => MicrovmError::new(
             MicrovmErrorCode::InvalidArgument,

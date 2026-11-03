@@ -38,6 +38,7 @@
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
+//! TASK-192.8・#3785・MVM-5: arm64 の ESR（例外 syndrome）の復号（`esr`。OS 非依存・`unsafe` なし）。
 //! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
 //! TASK-192.2・#3786・MVM-5: vCPU・レジスタ・exit・vtimer（`hvf_abi` の `HvReg`・`HvSysReg`・`HvVcpuExit`・`decode_exit`。
@@ -66,6 +67,7 @@ pub mod cpuid_x86;
 pub mod device;
 pub mod dispatch;
 pub mod error;
+pub mod esr;
 pub mod exit;
 pub mod guest_memory;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

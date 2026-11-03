@@ -1523,6 +1523,57 @@ fn validate_vcpu_threads(n: usize) -> Result<u32, MicrovmError> {
     }
 }
 
+/// 全 vCPU スレッドの生成が終わるまでゲスト実行を始めさせない起動ゲート（#3738・REPAIR-4・REPAIR-5）。
+///
+/// 生成途中の失敗でも、生成済みスレッドは一度もゲストを実行していないので、停止要求を立ててゲートを開ければ
+/// `step` を呼ばずに body を drop して確実に回収できる（回収未完了の資源を `Err` の外へ残さない）。
+struct StartGate {
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// ゲート待ちの上限（呼び出し側が必ず開けるので通常は到達しない。到達しても停止要求の確認へ進むだけで無限待ちを作らない）。
+const START_GATE_WAIT: Duration = Duration::from_secs(30);
+
+impl StartGate {
+    fn new() -> Self {
+        StartGate {
+            open: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let limit = Instant::now() + START_GATE_WAIT;
+        let mut g = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*g {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            g = self
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// drop で必ずゲートを開ける（spawn の panic でも待機中のスレッドを残さない）。
+struct GateRelease(Arc<StartGate>);
+
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// 生成するスレッドの本体（試験で生成を差し替えるための型）。
 type VcpuJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -1569,19 +1620,25 @@ where
         vcpu_count: count,
     });
     let mut handles = Vec::with_capacity(bodies.len());
+    let gate = Arc::new(StartGate::new());
+    let release = GateRelease(Arc::clone(&gate));
     for (i, body) in bodies.into_iter().enumerate() {
+        let thread_gate = Arc::clone(&gate);
         let index = u32::try_from(i).unwrap_or(u32::MAX);
         let guard = VcpuThreadGuard::new(Arc::clone(&agg), index);
         // panic の unwind でも計上を残す。`body` は `vcpu_loop` のフレームが所有するため、unwind では
         // `body` の drop がこの guard の drop より先に走り、「解放後に計上」の順序が正常・panic の両経路で成り立つ。
         let job: VcpuJob = Box::new(move || {
             let guard = guard;
+            thread_gate.wait();
             vcpu_loop(body, &guard);
         });
         match spawn(format!("microvm-vcpu-{index}"), job) {
             Ok(h) => handles.push(h),
             Err(e) => {
+                // 停止要求を先に立ててからゲートを開ける。生成済みスレッドは 1 step も実行せず body を drop して終わる。
                 stop.request();
+                drop(release);
                 let limit = Instant::now() + DROP_STOP_WAIT;
                 if join_all(handles, limit).timed_out {
                     log_line(format_args!(
@@ -1593,6 +1650,7 @@ where
             }
         }
     }
+    drop(release);
     Ok(RunningMicroVm {
         exit,
         stop,
@@ -2719,6 +2777,8 @@ mod lifecycle_tests {
         assert_eq!(names, ["microvm-vcpu-0", "microvm-vcpu-1"]);
         assert_eq!(p.drops(), 3);
         assert_eq!(Arc::strong_count(&p.hold), 1);
+        // 起動ゲートにより、生成済みスレッドもゲストを一度も実行していない（回収が 5 秒を超える窓が無い）。
+        assert_eq!(p.total_steps.load(Ordering::SeqCst), 0);
     }
 }
 #[cfg(test)]

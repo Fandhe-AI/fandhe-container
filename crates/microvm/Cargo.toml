@@ -29,6 +29,7 @@
 # #3783（TASK-192.1）で src/sys/hvf.rs・hvf_abi・hvf を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3787（TASK-192.4）で hvf/memory.rs とゲスト RAM のコピー API を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3844 で hvf_abi に check_vm_map（map の IPA 上限の検査）と HvVcpu の !Send / !Sync の const 判定を追加（依存は増やさない。unsafe 追加なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

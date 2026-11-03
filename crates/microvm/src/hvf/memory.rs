@@ -10,8 +10,20 @@
 //! 登録済みの RAM は `&'vm HvVm` を借用するため、`HvVm`（`hv_vm_destroy`）より先に drop される。drop は
 //! `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。
 //!
+//! # volatile アクセスの前提（デバイス側の責務。MVM-1・MVM-5・#3844）
+//! - `read` / `write`（とその上の `GuestMemory` の多バイトの読み書き）は 1 バイト単位の volatile コピーで、
+//!   2 / 4 / 8 バイトの値を 1 命令でも原子的にも読み書きしない。vCPU が並行して書く値は途中の状態（tear）で
+//!   読めることがあり、ホストが書く多バイト値もゲストから途中の状態で見えることがある。
+//! - volatile はバイト同士の順序もゲストとの順序も保証せず、Rust のメモリモデルの上では `fence` も非 atomic の
+//!   アクセスを順序づけない。順序は arm64 の実機のバリア命令に頼る（`virtqueue.rs` のモジュール doc と同じ前提）。
+//! - デバイス側（virtqueue とその上の virtio デバイス）の責務: 共有の index（avail.idx・used.idx）と記述子は
+//!   1 回だけコピーして同じ値で検査して使う（TOCTOU 防止）。読む順序と書く順序は fence で表す（`SplitQueue::pop` の
+//!   Acquire・`add_used` の Release）。tear した値も非信頼入力として範囲検査で受け止め、リング破損として扱う。
+//!   多バイトのアクセスの原子性に頼る設計を足すときは、この backing の側を先に変える。
+//!
 //! # 範囲外（REPAIR-3）
-//! 複数領域・`hv_vm_protect`・`Send` / `Sync`（#3797・#3798）。IPA の上限は暫定（#3788・#3803）。
+//! 複数領域・`hv_vm_protect`・`Send` / `Sync`（#3797・#3798）。IPA の上限の値は暫定（#3788・#3803）。
+//! `register` はレイアウトの上限を、`HvVm::map` は既定の上限を検査する（#3844）。
 //! 解除失敗の構造化ログは未実装。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -52,7 +64,8 @@ impl HvfGuestRam {
 
     /// `vm` の `[base, base + size)` に RWX で対応付け、アクセス型に包んで返す。
     ///
-    /// `ipa_limit` は IPA の上限（レイアウトの値。暫定は `HVF_DEFAULT_IPA_LIMIT`）。失敗しても取得済みの資源は解放する。
+    /// `ipa_limit` は IPA の上限（レイアウトの値。暫定は `HVF_DEFAULT_IPA_LIMIT`）。`HvVm::map` も既定の上限を
+    /// 検査するため二重の検査になり、こちらの（より厳しい）上限が先に効く。失敗しても取得済みの資源は解放する。
     pub fn register<'vm>(
         self,
         vm: &'vm HvVm,

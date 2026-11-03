@@ -8,7 +8,7 @@
 //!
 //! 呼び出し契約: config blob 自体の digest 検証（`layer::verify_blob_digest`）は呼び出し側の責務で、
 //! `parse_image_config_rootfs` / `parse_image_config_process` は本文の JSON だけを見る。
-//! 読むのは `rootfs`（`diff_ids`）と `config` 節の Entrypoint・Cmd・Env・WorkingDir・User だけで、
+//! 読むのは `rootfs`（`diff_ids`）と `config` 節の Entrypoint・Cmd・Env・WorkingDir・User・StopSignal だけで、
 //! `history` 等は読まない。`config` 節は create 経路が bundle の `config.json` の既定値に使う（#2433・CRI-2）。
 //! 読んだバイト列そのものを照合してから両方を解析する入口が [`parse_verified_image_config`]
 //! （検証と解析の内容がずれない）。
@@ -111,6 +111,8 @@ pub const MAX_PROCESS_STRING_BYTES: usize = 131_071;
 pub const MAX_PROCESS_PATH_BYTES: usize = 4096;
 /// `config` 節の User の長さ上限。
 pub const MAX_PROCESS_USER_BYTES: usize = 256;
+/// `config` 節の StopSignal の長さ上限（シグナル名・番号として十分な長さ。解釈は呼び出し側）。
+pub const MAX_PROCESS_STOP_SIGNAL_BYTES: usize = 64;
 
 /// image config の `config` 節（実行の既定値。#2433・CRI-2）。
 ///
@@ -124,6 +126,7 @@ pub struct ImageProcessConfig {
     env: Vec<String>,
     working_dir: String,
     user: String,
+    stop_signal: String,
 }
 
 impl ImageProcessConfig {
@@ -147,6 +150,10 @@ impl ImageProcessConfig {
     pub fn user(&self) -> &str {
         &self.user
     }
+    /// StopSignal（空は未指定。シグナル名または番号の文字列。解釈は呼び出し側。#2771・CRI-2）。
+    pub fn stop_signal(&self) -> &str {
+        &self.stop_signal
+    }
 }
 
 #[derive(Deserialize)]
@@ -166,6 +173,8 @@ struct RawProcess {
     working_dir: Option<String>,
     #[serde(rename = "User")]
     user: Option<String>,
+    #[serde(rename = "StopSignal")]
+    stop_signal: Option<String>,
 }
 
 fn check_items(items: &[String], max_items: usize) -> Result<(), OciError> {
@@ -197,7 +206,7 @@ fn check_string(s: &str, max_bytes: usize) -> Result<(), OciError> {
     Ok(())
 }
 
-/// config 本文から `config` 節（Entrypoint・Cmd・Env・WorkingDir・User）を検証して取り出す（#2433・CRI-2）。
+/// config 本文から `config` 節（Entrypoint・Cmd・Env・WorkingDir・User・StopSignal）を検証して取り出す（#2433・CRI-2）。
 ///
 /// エラー: 本文が [`MAX_CONFIG_BYTES`] 超・件数や長さの超過は `ResourceExhausted`、JSON として不正・型が違う・
 /// NUL を含むは `InvalidArgument`（黙って捨てない。fail-closed）。
@@ -222,17 +231,20 @@ pub fn parse_image_config_process(body: &[u8]) -> Result<ImageProcessConfig, Oci
     let env = raw.env.unwrap_or_default();
     let working_dir = raw.working_dir.unwrap_or_default();
     let user = raw.user.unwrap_or_default();
+    let stop_signal = raw.stop_signal.unwrap_or_default();
     check_items(&entrypoint, MAX_PROCESS_ITEMS)?;
     check_items(&cmd, MAX_PROCESS_ITEMS)?;
     check_items(&env, MAX_PROCESS_ITEMS)?;
     check_string(&working_dir, MAX_PROCESS_PATH_BYTES)?;
     check_string(&user, MAX_PROCESS_USER_BYTES)?;
+    check_string(&stop_signal, MAX_PROCESS_STOP_SIGNAL_BYTES)?;
     Ok(ImageProcessConfig {
         entrypoint,
         cmd,
         env,
         working_dir,
         user,
+        stop_signal,
     })
 }
 
@@ -281,6 +293,32 @@ mod tests {
         let n =
             process(r#"{"config":{"Entrypoint":null,"Cmd":null,"Env":null,"User":null}}"#).unwrap();
         assert_eq!(n, ImageProcessConfig::default());
+    }
+
+    /// CRI-2・OCI-1: StopSignal が具体値で取れ、欠落・null は空、型違い・NUL・長すぎる値は拒否される（#2771）。
+    #[test]
+    fn cri2_process_section_reads_stop_signal() {
+        let p = process(r#"{"config":{"StopSignal":"SIGINT"}}"#).unwrap();
+        assert_eq!(p.stop_signal(), "SIGINT");
+        let n = process(r#"{"config":{"StopSignal":"9"}}"#).unwrap();
+        assert_eq!(n.stop_signal(), "9");
+        let null = process(r#"{"config":{"StopSignal":null}}"#).unwrap();
+        assert_eq!(null.stop_signal(), "");
+        assert_eq!(process(r#"{"config":{}}"#).unwrap().stop_signal(), "");
+        let code = |b: &str| process(b).unwrap_err().code();
+        assert_eq!(
+            code(r#"{"config":{"StopSignal":15}}"#),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(r#"{"config":{"StopSignal":"SIG\u0000"}}"#),
+            OciErrorCode::InvalidArgument
+        );
+        let long = "S".repeat(MAX_PROCESS_STOP_SIGNAL_BYTES + 1);
+        assert_eq!(
+            code(&format!(r#"{{"config":{{"StopSignal":"{long}"}}}}"#)),
+            OciErrorCode::ResourceExhausted
+        );
     }
 
     /// CRI-2: 型違い・NUL は InvalidArgument、件数と長さの超過は ResourceExhausted。

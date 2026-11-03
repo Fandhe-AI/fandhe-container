@@ -9,14 +9,18 @@ use fandhe_container_guest_init::directive::{
     MAX_GUEST_MOUNT_ELEMENT_BYTES, MAX_GUEST_MOUNT_POINT_BYTES, MAX_VIRTIOFS_SHARES,
     MAX_VIRTIOFS_TAG_BYTES, Tag, decode_all,
 };
+use fandhe_container_guest_init::link_probe as link;
 use fandhe_container_guest_init::probe::{
-    GUEST_MOUNT, ProbePlan, SHARE_TAG, TEST_KEY, TOKEN_VIRTIOFS_IO, TestMode, WRITE_LINE,
-    WRITE_LINES, decode_test_mode, run_virtiofs_io,
+    GUEST_MOUNT, ProbePlan, SHARE_TAG, TEST_KEY, TOKEN_VIRTIOFS_IO, TOKEN_VIRTIOFS_LINK, TestMode,
+    WRITE_LINE, WRITE_LINES, decode_test_mode, run_virtiofs_io,
 };
 use fandhe_container_guest_init::report::{
     Errno, InitStage, MAX_PROBE_LINE_BYTES, MAX_REPORT_LINE_BYTES, PROBE_NAMESPACE, PROBE_PREFIX,
     ProbeEntries, ProbeOp, ProbeValue, REPORT_PREFIX, ReportLine,
 };
+#[cfg(unix)]
+use fandhe_container_platform_macos::config as host_config;
+use fandhe_container_platform_macos::guest_link_probe as host_link;
 use fandhe_container_platform_macos::guest_mount as host;
 use fandhe_container_platform_macos::guest_mount::{GuestMountOutcome, parse_report_line};
 use fandhe_container_platform_macos::guest_probe as host_probe;
@@ -402,4 +406,217 @@ fn mac1_shared_dir_under_symlinked_ancestor_is_rejected() {
         Err(ConfigError::SharedDirSymlink { path: link })
     );
     assert!(SharedDirectoryPath::try_new(&real.join("share")).is_ok());
+}
+
+// ---- virtiofs_link の観測契約（MAC-1・SEC-4・#1877）----
+
+#[test]
+fn mac1_sec4_link_constants_match_host() {
+    assert_eq!(
+        TOKEN_VIRTIOFS_LINK,
+        host::GuestTestMode::VirtiofsLink.token()
+    );
+    assert_eq!(link::LINK_NAMESPACE, host_link::LINK_NAMESPACE);
+    assert_eq!(link::LINK_PREFIX, host_link::LINK_PREFIX);
+    assert_eq!(link::MAX_LINK_LINE_BYTES, host_link::MAX_LINK_LINE_BYTES);
+    assert_eq!(link::MAX_LINK_READ_BYTES, host_link::MAX_LINK_READ_BYTES);
+    assert_eq!(link::RO_TAG, host_link::RO_TAG);
+    assert_eq!(link::RO_MOUNT, host_link::RO_MOUNT);
+    assert_eq!(link::RW_TAG, host_link::RW_TAG);
+    assert_eq!(link::RW_MOUNT, host_link::RW_MOUNT);
+    assert_eq!(link::RO_LINK_NAMES, host_link::RO_LINK_NAMES);
+    assert_eq!(link::RW_SRC_NAME, host_link::RW_SRC_NAME);
+    assert_eq!(link::RW_SYM_NAME, host_link::RW_SYM_NAME);
+    assert_eq!(link::RW_HARD_NAME, host_link::RW_HARD_NAME);
+    assert_eq!(link::RW_SRC_LINE, host_link::RW_SRC_LINE);
+}
+
+/// 名前空間・接頭辞・マーカーはどの組み合わせでも前方一致しない（ホストの各パーサが互いの行を誤認しない）。
+#[test]
+fn mac1_sec4_link_lines_are_not_mistaken_for_other_lines() {
+    let ns = [
+        REPORT_PREFIX,
+        PROBE_NAMESPACE,
+        link::LINK_NAMESPACE,
+        READY_MARKER,
+    ];
+    for (i, a) in ns.iter().enumerate() {
+        for (j, b) in ns.iter().enumerate() {
+            assert!(i == j || !a.starts_with(b), "{a} / {b}");
+        }
+    }
+    let line = format!("{}done", link::LINK_PREFIX);
+    assert_eq!(
+        host_probe::parse_probe_line(line.as_bytes()),
+        host_probe::ProbeLine::Other
+    );
+    assert_eq!(parse_report_line(line.as_bytes()), None);
+    // io のプローブ行・mount 報告・ready は link のパーサに無視される。
+    let tag = Tag::try_new(SHARE_TAG).unwrap();
+    let mut log = String::new();
+    for l in [
+        ReportLine::ok(&tag),
+        ReportLine::ready(),
+        ReportLine::probe_done(),
+    ] {
+        log.push_str(l.as_str());
+        log.push('\n');
+    }
+    assert_eq!(
+        host_link::parse_link_log(&log),
+        host_link::LinkLog::default()
+    );
+}
+
+#[cfg(unix)]
+fn link_log(plan: link::LinkPlan, ro: &std::path::Path, rw: &std::path::Path) -> String {
+    let mut log = String::new();
+    link::run_virtiofs_link(plan, ro, rw, &mut |l| {
+        log.push_str(l.as_str());
+        log.push('\n');
+    });
+    log
+}
+
+#[cfg(unix)]
+const LINK_RUN: link::LinkPlan = link::LinkPlan {
+    ro: link::SharePlan::Run,
+    rw: link::SharePlan::Run,
+};
+
+/// 一時ディレクトリに fixture を作る（ro の 3 リンクと空の rw）。絶対パスの symlink は実体パスを指す。
+#[cfg(unix)]
+fn link_fixture(t: &Tmp) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (ro, rw) = (t.0.join("ro"), t.0.join("rw"));
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::create_dir_all(&rw).unwrap();
+    std::fs::write(ro.join("inside.txt"), "inside\n").unwrap();
+    std::os::unix::fs::symlink("inside.txt", ro.join("inside_link")).unwrap();
+    std::os::unix::fs::symlink(ro.join("inside.txt"), ro.join("abs_inside_link")).unwrap();
+    std::os::unix::fs::symlink(ro.join("missing"), ro.join("dangling_inside_link")).unwrap();
+    (ro, rw)
+}
+
+#[cfg(unix)]
+fn link_specs(t: &Tmp, ro: &std::path::Path, rw: &std::path::Path) -> host_config::VmConfigSpec {
+    use fandhe_container_platform_macos::guest_mount::GuestMountPoint;
+    use fandhe_container_platform_macos::virtiofs::{
+        ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
+    };
+    let kernel = t.0.join("vmlinux");
+    std::fs::write(&kernel, b"k").unwrap();
+    let share = |tag: &str, dir: &std::path::Path, access, mount: &str| {
+        VirtiofsShareSpec::new(
+            VirtiofsTag::try_new(tag).unwrap(),
+            SharedDirectoryPath::try_new(dir).unwrap(),
+            access,
+        )
+        .with_guest_mount(GuestMountPoint::try_new(mount).unwrap())
+    };
+    let shares = VirtiofsSharesSpec::try_new(vec![
+        share(link::RO_TAG, ro, ShareAccess::ReadOnly, link::RO_MOUNT),
+        share(link::RW_TAG, rw, ShareAccess::ReadWrite, link::RW_MOUNT),
+    ])
+    .unwrap();
+    host_config::VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+        .unwrap()
+        .with_shared_directories(shares)
+}
+
+/// 実際に走らせた出力をホストのパーサが受理する（観測 18 行・done・不正なし）。fixture はホストの起動前検査も通る。
+#[cfg(unix)]
+#[test]
+fn mac1_sec4_real_link_output_is_accepted_by_host_log_parser() {
+    let t = Tmp::new("link-ok");
+    let (ro, rw) = link_fixture(&t);
+    // 起動前の検査（範囲内リンクのみ・nlink=1）を通る fixture であること。
+    link_specs(&t, &ro, &rw).check_share_conflicts().unwrap();
+    let tag = Tag::try_new(link::RO_TAG).unwrap();
+    let mut log = String::new();
+    for l in [ReportLine::ok(&tag), ReportLine::ready()] {
+        log.push_str(l.as_str());
+        log.push('\n');
+    }
+    log.push_str(&link_log(LINK_RUN, &ro, &rw));
+    let parsed = host_link::parse_link_log(&log);
+    assert!(parsed.done && !parsed.invalid, "{log}");
+    assert_eq!(parsed.lines.len(), 18);
+    assert_eq!(
+        parsed.lines.first().map(String::as_str),
+        Some("share=ro name=inside_link op=readlink result=ok value=inside.txt")
+    );
+    assert_eq!(
+        parsed.lines.last().map(String::as_str),
+        Some("share=rw name=hard op=lstat result=ok kind=file nlink=2 size=24")
+    );
+    // 書いた内容は、ホストが観察するときの期待内容と一致する。
+    assert_eq!(
+        std::fs::read(rw.join(host_link::RW_SRC_NAME)).unwrap(),
+        format!("{}\n", host_link::RW_SRC_LINE).into_bytes()
+    );
+    assert_eq!(
+        std::fs::read_link(rw.join(host_link::RW_SYM_NAME)).unwrap(),
+        std::path::Path::new(host_link::RW_SRC_NAME)
+    );
+    // mount 報告は従来どおり読め、link 行は報告として読まれない。
+    let reports: Vec<_> = log
+        .lines()
+        .filter_map(|l| parse_report_line(l.as_bytes()))
+        .collect();
+    assert_eq!(reports.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn mac1_sec4_missing_link_output_is_accepted_by_host_log_parser() {
+    let t = Tmp::new("link-missing");
+    let (ro, rw) = link_fixture(&t);
+    let both = link::LinkPlan {
+        ro: link::SharePlan::Missing,
+        rw: link::SharePlan::Missing,
+    };
+    let parsed = host_link::parse_link_log(link_log(both, &ro, &rw));
+    assert_eq!(
+        parsed.lines,
+        vec![
+            "share=ro op=mount result=missing".to_string(),
+            "share=rw op=mount result=missing".to_string(),
+        ]
+    );
+    assert!(parsed.done && !parsed.invalid);
+    assert_eq!(std::fs::read_dir(&rw).unwrap().count(), 0);
+}
+
+/// ホストが付けた予約キーだけで観測モードが有効になり、付けなければ Absent のまま。io 用のモードとは排他。
+#[cfg(unix)]
+#[test]
+fn mac1_sec4_host_effective_cmdline_enables_link_only_when_requested() {
+    use fandhe_container_platform_macos::guest_mount::GuestTestMode;
+    let t = Tmp::new("link-cmdline");
+    let (ro, rw) = link_fixture(&t);
+    let off = link_specs(&t, &ro, &rw);
+    let off_cmdline = off.effective_cmdline().unwrap();
+    assert_eq!(decode_test_mode(off_cmdline.as_str()), TestMode::Absent);
+    let on_cmdline = off
+        .with_guest_test(GuestTestMode::VirtiofsLink)
+        .effective_cmdline()
+        .unwrap();
+    assert_eq!(
+        decode_test_mode(on_cmdline.as_str()),
+        TestMode::VirtiofsLink
+    );
+    let d = decode_all(on_cmdline.as_str()).unwrap();
+    assert_eq!(d.len(), 2);
+    assert_eq!(
+        (d[0].tag.as_str(), d[0].mount_point.as_str(), d[0].access),
+        (link::RO_TAG, link::RO_MOUNT, Access::ReadOnly)
+    );
+    assert_eq!(
+        (d[1].tag.as_str(), d[1].mount_point.as_str(), d[1].access),
+        (link::RW_TAG, link::RW_MOUNT, Access::ReadWrite)
+    );
+    assert_eq!(
+        host::parse_directives(on_cmdline.as_str()).unwrap().len(),
+        2
+    );
 }

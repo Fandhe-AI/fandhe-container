@@ -7,6 +7,9 @@
 //! 対応 ID: TASK-116・PLUG-1・PLUG-12・WIN-1・REPAIR-5。
 #![cfg(unix)]
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -91,7 +94,7 @@ impl Harness {
             }
             if start.elapsed() > WAIT {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                crate::reap::reap_or_report(&mut self.child, crate::reap::reap_within());
                 panic!("plugin binary did not exit within deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -108,7 +111,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::reap::reap_on_drop(&mut self.child);
         let _ = std::fs::remove_dir_all(&self.dir); // 排他作成した自前のディレクトリのみ
     }
 }
@@ -331,11 +334,10 @@ fn task116_3_plug1_adapter_delegates_and_maps_errors() {
 
 /// 子プロセスへ SIGTERM を送る（テスト側に FFI を足さないため `kill` コマンドを使う。自分が spawn した子の PID のみ）。
 fn sigterm(h: &Harness) {
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(h.child.id().to_string())
-        .status()
-        .expect("kill");
+    let mut cmd = Command::new("kill");
+    cmd.arg("-TERM").arg(h.child.id().to_string());
+    let status = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
+        .unwrap_or_else(|e| panic!("sigterm to plugin child: {e}"));
     assert!(status.success());
 }
 

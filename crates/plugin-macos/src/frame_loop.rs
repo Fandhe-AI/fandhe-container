@@ -1,7 +1,7 @@
 //! UDS 上の長さ接頭辞フレームの送受信ループ（TASK-115.2・#386。PLUG-1・MAC-1・REPAIR-5）。
 //!
 //! `main.rs`（バイナリ入口）が `UdsStream::connect` で core の listener へ接続した後、本モジュールの
-//! [`serve`] を呼ぶ。core 側 proxy（`ResidentPlugin`。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）は 1 本の接続で要求を順次往復させる。
+//! [`serve`] を呼ぶ。core 側 proxy（`ResidentPlugin`。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）は 1 本の接続で要求を順次往復させる。
 //! 本モジュールは `fandhe-container-plugin` の `frame`・`message`・`transport` の公開 API だけで受信を組み、
 //! 共有 crate は変更しない。
 //!
@@ -19,7 +19,7 @@
 //! その接続に閉じる。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計で確定する。
+//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。
 //! [`UnimplementedHandler`] は未結線時・テスト用の全操作 `UNIMPLEMENTED` ハンドラで、実運用の要求は
 //! `adapter::MacosRuntimeAdapter`（#387）が処理する。
 //!

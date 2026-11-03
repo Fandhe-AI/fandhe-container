@@ -2,7 +2,7 @@
 //!
 //! PLUG-12 は plugin との UDS を `$XDG_RUNTIME_DIR/fandhe-container/` 相当の、0700 かつ core 実行 UID
 //! 所有のディレクトリ配下にのみ作ることを求める。本モジュールはその「解決・作成・検証」を担い、
-//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
+//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
 //! [`crate::UdsListener::bind`] へ渡す入口になる。
 //!
 //! # 契約
@@ -798,6 +798,8 @@ mod imp {
     /// その回の結果で上書き・削除する（壊れたヒントが残り続けて再開できなくなるのを防ぐ）。確認できない既存ファイル（他
     /// ファイルへのハードリンク・無関係な内容）には書き込み・切り詰め・unlink をせず、ヒントを諦めて
     /// 先頭から走査し、保存もしない。他の掃除が保持中・開けない場合も同様（best-effort）。
+    /// 同じプロセスの子が fork から exec までの間に継承したロック済みの open file description も
+    /// 「保持中」に見える（並行する spawn と重なった回。#3148）。その回も先頭から走査し、保存しない。
     struct SweepCursor {
         handle: crate::sys::LockHandle,
         name: std::ffi::CString,
@@ -933,6 +935,8 @@ mod imp {
             let first = lock_file_at(dir, &name, LockOpen::Create);
             let first_try = LockTry::of(&first);
             let Ok(held) = first else {
+                // `Held` は他の掃除の保持のほか、並行する子が fork から exec までの間に継承した
+                // ロック済みの open file description でも起きる。どちらも「その回はヒントなし」（#3148）。
                 return (judge_flock_probe(first_try, None), None);
             };
             match names_open_file(dir, &name, &held.file) {
@@ -963,26 +967,50 @@ mod imp {
         (FlockProbe::Unknown, None)
     }
 
+    /// 走査位置ヒントを使えなかった理由（[`SweepCursor::open_checked`] の拒否条件。試験の観測用）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CursorReject {
+        Name,
+        Metadata,
+        NotOwnSingleFile,
+        TooLong,
+        Read,
+        ShortRead,
+        BadContent,
+    }
+
     impl SweepCursor {
         /// 取得済みのロック（[`probe_flock`]）から、検証して走査位置ヒントを開く。
+        /// 使えなければ `None`（先頭から走査し、保存しない）。
+        #[cfg(not(test))]
         fn open(handle: crate::sys::LockHandle, euid: u32) -> Option<Self> {
+            Self::open_checked(handle, euid).ok()
+        }
+
+        /// 本体。拒否の条件と順序は従来のまま、理由だけを返す（試験が空振りの理由を数えるため。#3148）。
+        fn open_checked(handle: crate::sys::LockHandle, euid: u32) -> Result<Self, CursorReject> {
             use std::os::unix::fs::FileExt;
-            let name = std::ffi::CString::new(SWEEP_CURSOR_NAME).ok()?;
-            let meta = handle.file.metadata().ok()?;
-            if !meta.is_file()
-                || meta.uid() != euid
-                || meta.nlink() != 1
-                || meta.len() > SWEEP_CURSOR_MAX_LEN as u64
-            {
-                return None;
+            let name = std::ffi::CString::new(SWEEP_CURSOR_NAME).map_err(|_| CursorReject::Name)?;
+            let meta = handle.file.metadata().map_err(|_| CursorReject::Metadata)?;
+            if !meta.is_file() || meta.uid() != euid || meta.nlink() != 1 {
+                return Err(CursorReject::NotOwnSingleFile);
+            }
+            if meta.len() > SWEEP_CURSOR_MAX_LEN as u64 {
+                return Err(CursorReject::TooLong);
             }
             let mut buf = [0u8; SWEEP_CURSOR_MAX_LEN];
-            let n = handle.file.read_at(&mut buf, 0).ok()?;
+            let n = handle
+                .file
+                .read_at(&mut buf, 0)
+                .map_err(|_| CursorReject::Read)?;
             if n as u64 != meta.len() {
-                return None;
+                return Err(CursorReject::ShortRead);
             }
-            let start = cursor_start(buf.get(..n)?)?;
-            Some(Self {
+            let start = buf
+                .get(..n)
+                .and_then(cursor_start)
+                .ok_or(CursorReject::BadContent)?;
+            Ok(Self {
                 handle,
                 name,
                 start,
@@ -1187,6 +1215,25 @@ mod imp {
                 "runtime directory does not provide verified exclusive file locks",
             ));
         }
+        #[cfg(test)]
+        let cursor = match handle {
+            // 最初のロック取得が `Held` で、ハンドルを得られなかった回（`probe_flock` の `(Held, None)`）。
+            None => {
+                sweep_trace_test_hook::record(sweep_trace_test_hook::HintUse::NoHandle);
+                None
+            }
+            Some(h) => match SweepCursor::open_checked(h, euid) {
+                Ok(c) => {
+                    sweep_trace_test_hook::record(sweep_trace_test_hook::HintUse::Used);
+                    Some(c)
+                }
+                Err(r) => {
+                    sweep_trace_test_hook::record(sweep_trace_test_hook::HintUse::Rejected(r));
+                    None
+                }
+            },
+        };
+        #[cfg(not(test))]
         let cursor = handle.and_then(|h| SweepCursor::open(h, euid));
         let start = cursor.as_ref().map_or_else(ScanPos::default, |c| c.start);
         // 段階 1: 列挙して候補名を集める（削除しない）。
@@ -1519,6 +1566,36 @@ mod imp {
             && init.iter().all(|t| !t.is_empty() && digits(t))
             && digits(last)
             && (!complete || (tokens.len() == fields && !last.is_empty()))
+    }
+
+    /// 掃除の 1 回がヒントを使えたか・使えなかった理由の記録係（`#[cfg(test)]` のみ。製品の挙動は変えない。
+    /// 試験が「ヒントを使えず先頭から走査した回」を理由つきで数えるために使う。#3148・REPAIR-12）。
+    /// thread-local のため他テストのスレッドには漏れない。
+    #[cfg(test)]
+    pub(super) mod sweep_trace_test_hook {
+        use super::CursorReject;
+        use std::cell::Cell;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum HintUse {
+            Used,
+            /// ロックのハンドルを得られなかった（`Held`）。
+            NoHandle,
+            Rejected(CursorReject),
+        }
+
+        thread_local! {
+            static LAST: Cell<Option<HintUse>> = const { Cell::new(None) };
+        }
+
+        pub(super) fn record(h: HintUse) {
+            LAST.with(|c| c.set(Some(h)));
+        }
+
+        /// 直近の記録を返して消す。
+        pub(super) fn take() -> Option<HintUse> {
+            LAST.with(Cell::take)
+        }
     }
 
     /// bind ロックの競合経路をテストで決定的に再現する注入点（`#[cfg(test)]` のみ。製品ビルドには存在せず、
@@ -1885,6 +1962,67 @@ mod imp {
             }
         }
 
+        /// 空振り（ヒントを使えず先頭から走査した回）の上限。原因の分からない余分な回は失敗にする（#3148）。
+        ///
+        /// 空振りの原因は並行する試験の子が fork から exec までの間に継承したロック（`Held`）で、継続は
+        /// 回数ではなく時間で決まる。空振りの回は 1 回が数十 µs で終わるため、無待ちで回すと負荷の高い
+        /// ランナーで 1 つの継承期間に 9 回以上当たる（#3701）。そこで空振りのたびに
+        /// [`FALLBACK_BACKOFF`] 待ち、上限は継承期間が十分に明ける回数（約 4 秒分）にする。
+        /// 理由の照合（`NoHandle` 以外は失敗）と、読み取り・ヒント不変の照合は変えない。
+        const MAX_FALLBACKS: usize = 200;
+
+        /// 空振りの回の後の待ち（継承したロックが exec で閉じられるのを待つ。#3701）。
+        const FALLBACK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+        /// 掃除を 1 回行い、その回のヒントの使われ方を返す（空振りは理由つきで観測する）。
+        fn sweep_pass(
+            dir: &Path,
+            euid: u32,
+            max_scan: usize,
+        ) -> (OneShotSweep, usize, sweep_trace_test_hook::HintUse) {
+            let _ = sweep_trace_test_hook::take();
+            let (r, read) = sweep_one_shot_counted(dir, euid, max_scan, 256, 65_536).unwrap();
+            let hint = sweep_trace_test_hook::take().expect("sweep_dir must record hint use");
+            (r, read, hint)
+        }
+
+        /// 走査の上限と読み飛ばしの上限を指定して掃除を 1 回行い、その回のヒントの使われ方を返す（`sweep_pass` の引数違い）。
+        fn counted_pass(
+            dir: &Path,
+            euid: u32,
+            max_scan: usize,
+            skip_cap: u64,
+        ) -> (OneShotSweep, usize, sweep_trace_test_hook::HintUse) {
+            let _ = sweep_trace_test_hook::take();
+            let (r, read) = sweep_one_shot_counted(dir, euid, max_scan, 256, skip_cap).unwrap();
+            let hint = sweep_trace_test_hook::take().expect("sweep_dir must record hint use");
+            (r, read, hint)
+        }
+
+        /// 試行を、ヒントを使えない回（`Some(hint)` を返した試行）が無くなるまでやり直す。空振りの理由が
+        /// `NoHandle` 以外なら失敗、回数が [`MAX_FALLBACKS`] を超えても失敗にする（#3148・#3701・REPAIR-12）。
+        fn retry_until_hint_used(
+            mut attempt: impl FnMut() -> Option<sweep_trace_test_hook::HintUse>,
+        ) {
+            let mut fallbacks = 0;
+            while let Some(hint) = attempt() {
+                assert_expected_fallback(hint);
+                fallbacks += 1;
+                assert!(fallbacks <= MAX_FALLBACKS, "fallbacks={fallbacks}");
+            }
+        }
+
+        /// 空振りとして許す理由（並行する子が継承したロックによる `Held`）。それ以外は失敗にする。
+        /// 許す理由だった場合は、継承が明けるまで [`FALLBACK_BACKOFF`] 待つ（#3701）。
+        fn assert_expected_fallback(hint: sweep_trace_test_hook::HintUse) {
+            assert_eq!(
+                hint,
+                sweep_trace_test_hook::HintUse::NoHandle,
+                "unexpected reason for not using the hint"
+            );
+            std::thread::sleep(FALLBACK_BACKOFF);
+        }
+
         /// 走査位置ヒントの現在値を読む（無ければ `None`）。
         fn stored_pos(dir: &Path) -> Option<ScanPos> {
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
@@ -1924,26 +2062,40 @@ mod imp {
             );
             let euid = crate::sys::effective_uid();
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
+            // ヒントを使えなかった回（並行する子の継承ロックによる `NoHandle`）は書きかけが残るため、
+            // 使えた試行でだけ判定する（#3148・REPAIR-12）。
             // 末尾まで走査し終えた回: 書きかけのヒントは削除される。
-            let t = Tmp::new();
-            std::fs::write(t.0.join(name), b"123 4").unwrap();
-            let lock = t.0.join("oneshot-1-0.sock.lock");
-            std::fs::write(&lock, b"").unwrap();
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 65_536).unwrap();
-            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
-            assert!(!lock.exists());
-            assert_eq!(stored_pos(&t.0), None);
+            retry_until_hint_used(|| {
+                let t = Tmp::new();
+                std::fs::write(t.0.join(name), b"123 4").unwrap();
+                let lock = t.0.join("oneshot-1-0.sock.lock");
+                std::fs::write(&lock, b"").unwrap();
+                let (r, read, hint) = counted_pass(&t.0, euid, 1024, 65_536);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+                assert!(!lock.exists());
+                assert_eq!(stored_pos(&t.0), None);
+                None
+            });
             // 上限で打ち切った回: 書きかけのヒントは完全な形式で上書きされ、次回から再開できる。
-            let t = Tmp::new();
-            std::fs::write(t.0.join(name), b"123 4").unwrap();
-            for i in 0..5 {
-                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
-            }
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 2, 256, 65_536).unwrap();
-            assert_eq!((r.truncated, read), (true, 3));
-            let stored = std::fs::read(t.0.join(name)).unwrap();
-            let pos = parse_scan_pos(&stored).expect("hint must be rewritten in full form");
-            assert_eq!(pos.skip, 2);
+            retry_until_hint_used(|| {
+                let t = Tmp::new();
+                std::fs::write(t.0.join(name), b"123 4").unwrap();
+                for i in 0..5 {
+                    std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+                }
+                let (r, read, hint) = counted_pass(&t.0, euid, 2, 65_536);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((r.truncated, read), (true, 3));
+                let stored = std::fs::read(t.0.join(name)).unwrap();
+                let pos = parse_scan_pos(&stored).expect("hint must be rewritten in full form");
+                assert_eq!(pos.skip, 2);
+                None
+            });
         }
 
         /// PLUG-7・REPAIR-5（#1310）: 走査位置ヒントは `<offset> <skip>\n` に厳密一致する内容だけを受け付ける。
@@ -1996,21 +2148,97 @@ mod imp {
             let mut truncated = Vec::new();
             // 削除した回は同じ位置から走査し直すため、打ち切った回にロックを消したら 1 回増える。
             let mut repeated = 0;
+            let mut fallbacks = 0;
+            let mut removed_by_fallback = false;
             loop {
-                let skip = stored_pos(&t.0).map_or(0, |p| p.skip) as usize;
+                let before = stored_pos(&t.0);
+                let skip = before.map_or(0, |p| p.skip) as usize;
                 let existed = lock.exists();
-                let (r, read) = sweep_one_shot_counted(&t.0, euid, MAX_SCAN, 256, 65_536).unwrap();
-                assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                let (r, read, hint) = sweep_pass(&t.0, euid, MAX_SCAN);
                 truncated.push(r.truncated);
-                repeated += usize::from(existed && !lock.exists() && r.truncated);
+                if hint == sweep_trace_test_hook::HintUse::Used {
+                    assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                    repeated += usize::from(existed && !lock.exists() && r.truncated);
+                } else {
+                    assert_expected_fallback(hint);
+                    assert!(read <= MAX_SCAN + 1, "read={read}");
+                    assert_eq!(stored_pos(&t.0), before, "fallback must not touch the hint");
+                    fallbacks += 1;
+                    // 先頭からの走査で残骸を先に消した場合、以降のヒントを使う回は減りうる。
+                    removed_by_fallback |= existed && !lock.exists();
+                }
                 if !r.truncated {
                     break;
                 }
-                assert!(truncated.len() < 4, "truncated={truncated:?}");
+                assert!(fallbacks <= MAX_FALLBACKS, "fallbacks={fallbacks}");
+                assert!(
+                    truncated.len() < 4 + fallbacks,
+                    "truncated={truncated:?} fallbacks={fallbacks}"
+                );
             }
-            assert_eq!(truncated.len(), 3 + repeated, "truncated={truncated:?}");
+            if removed_by_fallback {
+                assert!(
+                    truncated.len() <= 3 + repeated + fallbacks,
+                    "truncated={truncated:?}"
+                );
+            } else {
+                assert_eq!(
+                    truncated.len(),
+                    3 + repeated + fallbacks,
+                    "truncated={truncated:?}"
+                );
+            }
             assert!(!lock.exists());
             assert_eq!(stored_pos(&t.0), None);
+        }
+
+        /// PLUG-7・REPAIR-5・REPAIR-12（#3148）: ヒントのロックを別の open file description が保持している回
+        /// （並行する子が継承した場合と同じ状態）は、`NoHandle` として観測され、先頭から走査し、ヒントを
+        /// 更新せず、読み取りは上限内に収まる。保持が外れれば同じ流れで末尾に達する。
+        #[test]
+        fn plug7_repair5_sweep_counts_pass_with_held_cursor_lock() {
+            use std::fs::File;
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            const MAX_SCAN: usize = 8;
+            for i in 0..20 {
+                std::fs::write(t.0.join(format!("other-{i}")), b"").unwrap();
+            }
+            // 残骸のロックは置かない（空振りの回が先に消してしまうと回数が読めないため）。
+            // 他の試験の spawn が重なって空振りした回は、ヒントに触れないので再試行する。
+            let used_pass = |max_tries: usize| {
+                for _ in 0..max_tries {
+                    let (r, read, hint) = sweep_pass(&t.0, euid, MAX_SCAN);
+                    if hint == sweep_trace_test_hook::HintUse::Used {
+                        return (r, read);
+                    }
+                    assert_expected_fallback(hint);
+                }
+                panic!("hint was never usable in {max_tries} passes");
+            };
+            // 1 回目: ヒントを使い、打ち切って位置を保存する。
+            let (r, _) = used_pass(MAX_FALLBACKS);
+            assert!(r.truncated);
+            let saved = stored_pos(&t.0).expect("hint saved after a truncated pass");
+            // 別の open file description でヒントを保持する。
+            let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
+            let holder = File::open(t.0.join(name)).unwrap();
+            holder.lock().unwrap();
+            let (r, read, hint) = sweep_pass(&t.0, euid, MAX_SCAN);
+            assert_eq!(hint, sweep_trace_test_hook::HintUse::NoHandle);
+            assert!(r.truncated);
+            assert!(read <= MAX_SCAN + 1, "read={read}");
+            assert_eq!(stored_pos(&t.0), Some(saved));
+            drop(holder);
+            // 保持が外れた後は、ヒントを使った回で末尾まで到達してヒントが消える。
+            for _ in 0..6 {
+                let (r, _) = used_pass(MAX_FALLBACKS);
+                if !r.truncated {
+                    assert_eq!(stored_pos(&t.0), None);
+                    return;
+                }
+            }
+            panic!("sweep did not reach the end");
         }
 
         /// PLUG-7・REPAIR-5（#1310）: libc のまとめ読みをまたぐ大きさ（対象外 6,100 件）でも、再開位置は
@@ -2021,6 +2249,11 @@ mod imp {
         /// 方式では回ごとに先頭から読み直すため、回数に比例して増える）。
         #[test]
         fn plug7_repair5_sweep_resumes_by_kernel_position_in_large_directory() {
+            assert_large_directory_converges();
+        }
+
+        /// 大きいディレクトリの掃除が末尾へ収束することを照合する本体（空振りの回は理由を確かめて数える）。
+        fn assert_large_directory_converges() {
             let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             const MAX_SCAN: usize = 500;
@@ -2032,36 +2265,58 @@ mod imp {
             std::fs::write(&lock, b"").unwrap();
             let mut passes = 0;
             let mut repeated = 0;
-            let mut total_read = 0;
+            let mut fallbacks = 0;
+            let mut removed_by_fallback = false;
+            let mut hinted_passes = 0;
+            let mut hinted_read = 0;
             let mut offsets = std::collections::BTreeSet::new();
-            // 失敗時の診断用: 各回の（開始位置, 読み取り数, 打ち切り）。
+            // 失敗時の診断用: 各回の（開始位置, 読み取り数, 打ち切り, ヒントの使われ方）。
             let mut history = Vec::new();
             loop {
                 let before = stored_pos(&t.0);
                 let skip = before.map_or(0, |p| p.skip) as usize;
                 let existed = lock.exists();
-                let (r, read) = sweep_one_shot_counted(&t.0, euid, MAX_SCAN, 256, 65_536).unwrap();
-                history.push((before, read, r.truncated));
-                repeated += usize::from(existed && !lock.exists() && r.truncated);
+                let (r, read, hint) = sweep_pass(&t.0, euid, MAX_SCAN);
+                history.push((before, read, r.truncated, hint));
                 passes += 1;
-                total_read += read;
-                assert!(skip < OTHERS, "skip={skip}");
-                assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                if hint == sweep_trace_test_hook::HintUse::Used {
+                    hinted_passes += 1;
+                    hinted_read += read;
+                    repeated += usize::from(existed && !lock.exists() && r.truncated);
+                    assert!(skip < OTHERS, "skip={skip}");
+                    assert!(read <= skip + MAX_SCAN + 1, "read={read} skip={skip}");
+                } else {
+                    assert_expected_fallback(hint);
+                    assert!(read <= MAX_SCAN + 1, "read={read} history={history:?}");
+                    assert_eq!(stored_pos(&t.0), before, "fallback must not touch the hint");
+                    fallbacks += 1;
+                    // 先頭からの走査で残骸を先に消した場合、以降のヒントを使う回は減りうる。
+                    removed_by_fallback |= existed && !lock.exists();
+                }
                 if let Some(p) = stored_pos(&t.0) {
                     offsets.insert(p.offset);
                 }
                 if !r.truncated {
                     break;
                 }
-                assert!(passes < 14, "sweep did not reach the end: {history:?}");
+                assert!(fallbacks <= MAX_FALLBACKS, "history={history:?}");
+                assert!(
+                    passes < 14 + fallbacks,
+                    "sweep did not reach the end: {history:?}"
+                );
             }
-            assert_eq!(passes, 13 + repeated, "history={history:?}");
+            if removed_by_fallback {
+                assert!(hinted_passes <= 13 + repeated, "history={history:?}");
+            } else {
+                assert_eq!(hinted_passes, 13 + repeated, "history={history:?}");
+            }
+            assert_eq!(passes, hinted_passes + fallbacks, "history={history:?}");
             assert!(!lock.exists());
             assert_eq!(stored_pos(&t.0), None);
             // 先頭（0）以外のカーネル位置から再開した回がある（まとめ読みの境界を越えて進んだ）。
             assert!(offsets.iter().any(|o| *o != 0), "offsets={offsets:?}");
-            // 読み取り総数はエントリ数に比例する（各回の読み飛ばしはまとめ読み 1 回分のエントリ数未満）。
-            assert!(total_read < 4 * OTHERS, "total_read={total_read}");
+            // ヒントを使った回の読み取り総数はエントリ数に比例する（各回の読み飛ばしはまとめ読み 1 回分未満）。
+            assert!(hinted_read < 4 * OTHERS, "hinted_read={hinted_read}");
         }
 
         /// PLUG-7・REPAIR-5（#1310）: `lseek` が拒否する位置・巨大な読み飛ばし件数のヒント（破損・改ざん）でも
@@ -2070,28 +2325,45 @@ mod imp {
         fn plug7_cursor_garbage_position_terminates_and_recovers() {
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
             let euid = crate::sys::effective_uid();
+            // ヒントを使えなかった回（`NoHandle`）は事前のヒントが残るため、使えた試行でだけ判定する
+            // （#3148・REPAIR-12）。
             // (a) 位置が不正（`lseek` が失敗する）: 同じ回のうちに先頭から走査し直す。
-            let t = Tmp::new();
-            std::fs::write(t.0.join(name), b"18446744073709551615 7\n").unwrap();
-            let lock = t.0.join("oneshot-1-0.sock.lock");
-            std::fs::write(&lock, b"").unwrap();
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 65_536).unwrap();
-            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
-            assert!(!lock.exists());
-            assert_eq!(stored_pos(&t.0), None);
+            retry_until_hint_used(|| {
+                let t = Tmp::new();
+                std::fs::write(t.0.join(name), b"18446744073709551615 7\n").unwrap();
+                let lock = t.0.join("oneshot-1-0.sock.lock");
+                std::fs::write(&lock, b"").unwrap();
+                let (r, read, hint) = counted_pass(&t.0, euid, 1024, 65_536);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+                assert!(!lock.exists());
+                assert_eq!(stored_pos(&t.0), None);
+                None
+            });
             // (b) 読み飛ばし件数が巨大: 読み飛ばしの途中（2 エントリ）で末尾に達して終わり、ヒントを
-            // 消す。残骸は次の回に先頭から走査して消える。
-            let t = Tmp::new();
-            std::fs::write(t.0.join(name), b"0 999999999\n").unwrap();
-            let lock = t.0.join("oneshot-1-0.sock.lock");
-            std::fs::write(&lock, b"").unwrap();
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 65_536).unwrap();
-            assert_eq!((r.examined, r.truncated, read), (0, false, 2));
-            assert!(lock.exists());
-            assert_eq!(stored_pos(&t.0), None);
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 65_536).unwrap();
-            assert_eq!((r.examined, r.truncated, read), (1, false, 2));
-            assert!(!lock.exists());
+            // 消す。残骸は次の回に先頭から走査して消える（2 回の掃除を 1 試行とする）。
+            retry_until_hint_used(|| {
+                let t = Tmp::new();
+                std::fs::write(t.0.join(name), b"0 999999999\n").unwrap();
+                let lock = t.0.join("oneshot-1-0.sock.lock");
+                std::fs::write(&lock, b"").unwrap();
+                let (r, read, hint) = counted_pass(&t.0, euid, 1024, 65_536);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((r.examined, r.truncated, read), (0, false, 2));
+                assert!(lock.exists());
+                assert_eq!(stored_pos(&t.0), None);
+                let (r, read, hint) = counted_pass(&t.0, euid, 1024, 65_536);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((r.examined, r.truncated, read), (1, false, 2));
+                assert!(!lock.exists());
+                None
+            });
         }
 
         /// REPAIR-5（#1310）: ヒントの読み飛ばし件数は上限（ここでは 4 件）で打ち切り、超えた分は読み飛ばさずに
@@ -2099,39 +2371,69 @@ mod imp {
         /// 読み飛ばすのは 4 件だけで、残り 27 エントリ（ロックは 26 件以上）を走査する。
         #[test]
         fn repair5_cursor_skip_is_capped() {
-            let t = Tmp::new();
             let euid = crate::sys::effective_uid();
             let name = std::str::from_utf8(SWEEP_CURSOR_NAME).unwrap();
-            for i in 0..30 {
-                std::fs::write(t.0.join(format!("oneshot-1-{i}.sock.lock")), b"").unwrap();
-            }
-            std::fs::write(t.0.join(name), b"0 25\n").unwrap();
-            let (r, read) = sweep_one_shot_counted(&t.0, euid, 1024, 256, 4).unwrap();
-            assert_eq!((read, r.truncated), (31, false));
-            assert!((26..=27).contains(&r.examined), "examined={}", r.examined);
-            assert_eq!(stored_pos(&t.0), None);
+            // ヒントを使えなかった回（`NoHandle`）は事前のヒントが残るため、使えた試行でだけ判定する
+            // （#3148・REPAIR-12）。
+            retry_until_hint_used(|| {
+                let t = Tmp::new();
+                for i in 0..30 {
+                    std::fs::write(t.0.join(format!("oneshot-1-{i}.sock.lock")), b"").unwrap();
+                }
+                std::fs::write(t.0.join(name), b"0 25\n").unwrap();
+                let (r, read, hint) = counted_pass(&t.0, euid, 1024, 4);
+                if hint != sweep_trace_test_hook::HintUse::Used {
+                    return Some(hint);
+                }
+                assert_eq!((read, r.truncated), (31, false));
+                assert!((26..=27).contains(&r.examined), "examined={}", r.examined);
+                assert_eq!(stored_pos(&t.0), None);
+                None
+            });
         }
 
         /// PLUG-7（#1310）: 削除した回は開始位置から走査し直すため、削除で並びが詰まっても未処理の残骸を
         /// 飛ばさない。候補上限 2 件でロック 6 件を掃除すると、ちょうど 3 回ですべて消える。
+        ///
+        /// 並行する試験の子が継承したロックで 3 回のどれかがヒントを使えない（`NoHandle`）と、保存・削除の
+        /// 検査がすり抜けるか残骸が残る（#3148・#3701 と同じ現象。REPAIR-12）。そのため 3 回すべてが
+        /// ヒントを使えた（`Used`）試行でだけ判定し、そうでない試行は捨てて新しい `Tmp` でやり直す。
         #[test]
         fn plug7_cursor_restarts_pass_after_removal() {
-            let t = Tmp::new();
             let euid = crate::sys::effective_uid();
-            let locks: Vec<_> = (0..6)
-                .map(|i| t.0.join(format!("oneshot-1-{i}.sock.lock")))
-                .collect();
-            for l in &locks {
-                std::fs::write(l, b"").unwrap();
+            let mut fallbacks = 0;
+            loop {
+                let t = Tmp::new();
+                let locks: Vec<_> = (0..6)
+                    .map(|i| t.0.join(format!("oneshot-1-{i}.sock.lock")))
+                    .collect();
+                for l in &locks {
+                    std::fs::write(l, b"").unwrap();
+                }
+                let mut results = Vec::new();
+                let mut unused = None;
+                for _ in 0..3 {
+                    let _ = sweep_trace_test_hook::take();
+                    let r = sweep_one_shot_limited(&t.0, euid, 1024, 2).unwrap();
+                    let hint =
+                        sweep_trace_test_hook::take().expect("sweep_dir must record hint use");
+                    results.push((r.examined, r.truncated));
+                    if hint != sweep_trace_test_hook::HintUse::Used {
+                        unused = Some(hint);
+                        break;
+                    }
+                }
+                if let Some(hint) = unused {
+                    assert_expected_fallback(hint);
+                    fallbacks += 1;
+                    assert!(fallbacks <= MAX_FALLBACKS, "fallbacks={fallbacks}");
+                    continue;
+                }
+                assert_eq!(results, [(2, true), (2, true), (2, false)]);
+                assert_eq!(locks.iter().filter(|l| l.exists()).count(), 0);
+                assert_eq!(stored_pos(&t.0), None);
+                break;
             }
-            let mut results = Vec::new();
-            for _ in 0..3 {
-                let r = sweep_one_shot_limited(&t.0, euid, 1024, 2).unwrap();
-                results.push((r.examined, r.truncated));
-            }
-            assert_eq!(results, [(2, true), (2, true), (2, false)]);
-            assert_eq!(locks.iter().filter(|l| l.exists()).count(), 0);
-            assert_eq!(stored_pos(&t.0), None);
         }
 
         /// PLUG-12（#1310）: 削除を拒否する socket（symlink・記録なしの socket 以外）のロックファイルは、
@@ -2250,8 +2552,8 @@ mod imp {
 
         #[test]
         fn plug12_clear_stale_socket_rejects_foreign_uid_and_keeps_file() {
-            let d = std::env::temp_dir().join(format!("fcst-{}", std::process::id()));
-            std::fs::create_dir_all(&d).unwrap();
+            // 残骸の socket の上で bind が EADDRINUSE にならないよう補助を使う（REPAIR-12・#3375）。
+            let d = crate::test_root::test_root("fcst", "stale");
             let sock = d.join("s");
             let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
             let dir = File::open(&d).unwrap();
@@ -2269,24 +2571,84 @@ mod imp {
             std::fs::remove_dir_all(&d).ok();
         }
 
-        struct Tmp(std::path::PathBuf);
+        /// PLUG-12・REPAIR-12(#3375・#3475): 前回の残骸（bind 済みの古い socket ファイル）が同じ位置に残っていても
+        /// `test_root_at` は消さず別名の空ディレクトリを作り、そこへの bind が `EADDRINUSE` にならない。
+        /// 残骸の socket は無傷で残る。
+        #[test]
+        fn plug12_repair12_test_root_leaves_stale_socket_residue_untouched() {
+            let parent = crate::test_root::test_root("fcst-stale", "parent");
+            let p = parent.join("stale");
+            std::fs::create_dir_all(&p).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(p.join("s")).unwrap());
+            // listener を閉じても socket ファイルは残り、再 bind は EADDRINUSE になる（元の失敗の再現）。
+            let e = std::os::unix::net::UnixListener::bind(p.join("s")).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+            {
+                let root = crate::test_root::test_root_at(p.clone());
+                assert_ne!(&*root, p.as_path());
+                assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+                let _l = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
+            }
+            use std::os::unix::fs::FileTypeExt as _;
+            assert!(
+                std::fs::symlink_metadata(p.join("s"))
+                    .unwrap()
+                    .file_type()
+                    .is_socket()
+            );
+        }
+
+        /// 試験用ディレクトリ。`.0` は排他作成したパス、`.1` は Drop で自分が作ったパスだけを消す所有者。
+        /// 既存の名前は消さず・辿らず別名で作る（共有部品 `test_root`。REPAIR-12・#3375・#3506）。
+        struct Tmp(
+            std::path::PathBuf,
+            #[allow(dead_code)] crate::test_root::TestRoot,
+        );
         impl Tmp {
             fn new() -> Self {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fcus-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                DirBuilder::new().mode(0o700).create(&p).unwrap();
-                Self(p)
+                let root = crate::test_root::test_root(
+                    "fcus",
+                    &N.fetch_add(1, Ordering::Relaxed).to_string(),
+                );
+                Self(root.to_path_buf(), root)
             }
         }
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+
+        /// PLUG-12・REPAIR-12・#3506: 残骸の symlink（実在ディレクトリ・宛先なし）を辿らず、別名で作る。
+        /// 実在ディレクトリの mode と中身は変わらず、宛先なしの symlink の宛先は作られない。
+        #[test]
+        fn plug12_repair12_3506_tmp_root_does_not_follow_symlink_residue() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let parent = Tmp::new();
+            let victim = parent.0.join("victim");
+            DirBuilder::new().mode(0o755).create(&victim).unwrap();
+            std::fs::write(victim.join("keep"), b"keep").unwrap();
+            let link = parent.0.join("link");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let target = parent.0.join("nowhere");
+            let dangling = parent.0.join("dangling");
+            std::os::unix::fs::symlink(&target, &dangling).unwrap();
+
+            let r1 = crate::test_root::test_root_at(link.clone());
+            let r2 = crate::test_root::test_root_at(dangling.clone());
+            assert_ne!(&*r1, link.as_path());
+            assert_ne!(&*r2, dangling.as_path());
+            assert!(
+                !std::fs::symlink_metadata(&*r1)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_dir(&*r1).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+            assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"keep");
+            assert_eq!(
+                std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert!(!target.exists());
         }
 
         /// PLUG-12・REPAIR-12・#2228: 名前が別 inode を指す状態が `LOCK_ATTEMPTS` 回続くと、待たずに

@@ -13,6 +13,8 @@
 //! - parse / serialize の公開入口はまだ無い（担当は後続。STACK-1）。テストは `toml` を直接使う。
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,13 +55,16 @@ pub struct Project {
 
 /// `[services.<name>]` テーブル（STACK-1・TASK-149.3・#585）。
 ///
-/// 基本フィールド 10 個を持つ。拡張フィールド（restart・devices・profiles・healthcheck・
-/// deploy.resources 等）は TASK-149.4（#862・#863）で足す。`deny_unknown_fields` のため、
-/// 未定義のキー（拡張フィールドと typo）は今も拒否する（fail-closed）。
+/// 基本フィールド 10 個（TASK-149.3・#585）、拡張フィールド 8 個（restart・secrets・configs・
+/// ulimits・shm_size・tmpfs・devices・profiles。TASK-149.4.1・#862）、`healthcheck` と
+/// `deploy.resources`（TASK-149.4.2・#863）を持つ。`deny_unknown_fields` のため、
+/// 未定義のキー（typo を含む）は今も拒否する（fail-closed）。
 ///
 /// 値は検証しない。`env_files`・`volumes` のホスト側パス（`..`・symlink を含む範囲外参照）、
 /// `ports`、`image` の参照形式の検証と、`command` / `entrypoint` をシェルへ連結せず配列のまま
 /// exec へ渡すことは、読み込み側（parse の入口・`up`〔TASK-155〕・supervisor）の責務である。
+/// `healthcheck` の時間文字列・`retries` の検証は supervisor の `HealthcheckDefinition::parse`（SUP-4）、
+/// `deploy.resources` の `cpus`・`memory`・CDI 名の検証は `up`（TASK-155）と gpu 側の責務である。
 /// 空のコレクションは「キーが無い」と同じ意味のため出力から省く。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +72,13 @@ pub struct Service {
     /// イメージ参照（未検証）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// 固定のコンテナ名（compose の `container_name`。TASK-153.1・#609・STACK-6。未検証）。
+    ///
+    /// 名前の形式・長さ・プロジェクト内の重複の検査は `up`（TASK-155）が CLI へ渡す時点で行う。
+    /// CLI の `create` には名前を指定する引数が無いため `create_option_args` へは写さない
+    /// （結線は未実装。REPAIR-3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
     /// 起動コマンド（配列のみ。compose の文字列形は変換器〔TASK-151〕が配列へ正規化する）。
     ///
     /// PoC-16 の `Vec<String>` と違い `Option` とする。キー無し（イメージの既定を使う）と
@@ -76,6 +88,40 @@ pub struct Service {
     /// エントリポイント。`command` と同じく `Option` で `[]` を保つ。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
+    /// コンテナ内の作業ディレクトリ（compose の `working_dir`。OCI の `process.cwd`。TASK-153.1・#609・STACK-6）。
+    ///
+    /// 絶対パスであること・`..` を含まないことの検査は core の `ContainerWorkingDir` に任せ、
+    /// シェル文字列へ連結しない。`create` への結線は未実装（REPAIR-3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// 落とす capability の名前（compose の `cap_drop`。TASK-153.2・#610・STACK-6・SEC-1）。
+    ///
+    /// 値は compose の綴りのまま持つ。正規化（`CAP_` 接頭辞・大文字小文字・`ALL`）と件数・長さの検査は
+    /// CLI の `create --cap-drop` が core の `parse_drop_list` で行う（CRI と共有の唯一の正規化）。
+    /// stack では検証しない。drop しか表せず、capability を足す経路（`cap_add`）は無い。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// セキュリティオプション（compose の `security_opt`。TASK-153.2・#610・STACK-6・SEC-1。未検証の文字列）。
+    ///
+    /// `create` への写しは未実装（CLI に `--security-opt` が無い。REPAIR-3）。`up`（TASK-155）は
+    /// 解釈できない項目と分離を弱める項目（seccomp / apparmor / label の unconfined・disable 等）を
+    /// 黙って捨てず、従わずにエラーで拒否する。`no-new-privileges` は常に有効な固定段と同じ意味になる。
+    /// シェル文字列へ連結しない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_opt: Vec<String>,
+    /// stdin を開いたままにするか（compose の `stdin_open`。TASK-153.3・#611・STACK-6）。
+    ///
+    /// 真偽値だけを受け、変換器は文字列（`"true"`・`yes`）を真偽値へ読み替えない。`false` と「キー無し」は
+    /// 同じ意味だが、明示した値を往復で保つため `Option` にする。`create` への写しは未実装（CLI に `-i` が無く、
+    /// CRI も tty / stdin を `UNIMPLEMENTED` で拒否する。REPAIR-3）。`up`（TASK-155）は `true` を黙って
+    /// 無視せず、stdin をつなぐ経路ができるまでエラーで拒否する前提（fail-closed）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_open: Option<bool>,
+    /// 疑似端末（TTY）を割り当てるか（compose の `tty`。TASK-153.3・#611・STACK-6）。
+    ///
+    /// 扱いは `stdin_open` と同じ（真偽値のみ・`create` への写しは未実装・`up` は `true` を黙って無視しない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
     /// 環境変数（compose の `environment` に当たる）。
     ///
     /// 値を持たない compose の `KEY` だけの形は表せない（変換器が空文字列に読み替える）。
@@ -100,6 +146,169 @@ pub struct Service {
     /// ラベル。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// 再起動ポリシーの文字列(`no`・`always`・`unless-stopped`・`on-failure[:N]`。SUP-3・STACK-1)。
+    ///
+    /// supervisor の `RestartPolicy::from_str` が受ける形のまま持つ。引数つきの語彙で、パーサが別 crate に
+    /// あるため、stack では二重のパーサを作らず文字列にする(untagged enum も解釈が曖昧になるため採らない)。
+    /// 検証は `up`(TASK-155)が supervisor のパーサへ渡す時点で行う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
+    /// 参照する `[secrets.<name>]` の名前(short syntax のみ。compose の long syntax は変換器が正規化する)。
+    ///
+    /// 値(資格情報)は持たない。参照先の存在とファイルパスの範囲の照合は読み込み側の責務である。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// 参照する `[configs.<name>]` の名前。扱いは `secrets` と同じ。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configs: Vec<String>,
+    /// rlimit の指定(キーは Docker の名前。例: `nofile`。値は `"<soft>[:<hard>]"`。例: `"65536:65536"`・`"-1"`)。
+    ///
+    /// `up` が `--ulimit <name>=<value>` に組み、検証(名前の許可リスト・soft <= hard・件数)は supervisor の
+    /// `Ulimit::parse` と CLI の create が行う。compose の整数形・`{soft, hard}` 形は変換器(TASK-151)が
+    /// この文字列へ正規化する。整数で書いた TOML は型エラーで拒否する(fail-closed)。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ulimits: BTreeMap<String, String>,
+    /// `/dev/shm` のサイズ(CLI の `--shm-size <size>` と同じ文字列。例: `"64m"`。未検証)。
+    ///
+    /// compose の整数のバイト数は変換器が文字列へ正規化する。検証は CLI の create が行う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// tmpfs マウント(CLI の `--tmpfs <dest>[:<opts>]` と同じ文字列。例: `"/run:size=64m"`。未検証)。
+    ///
+    /// dest の絶対パス・トラバーサル・オプションの検証は CLI / core が行う。シェル文字列へ連結しない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmpfs: Vec<String>,
+    /// CDI の完全修飾デバイス名(`<vendor>/<class>=<name>`。例: `nvidia.com/gpu=all`。GPU-1・STACK-1)。
+    ///
+    /// compose のホストパス形(`/dev/x:/dev/x`)は表さず変換器が扱う。非 GPU への一般化は GPU-9(検討中)で
+    /// 確定扱いしない。名前の解析と spec の解決は gpu crate が `up`(TASK-155・TASK-156)の時点で行う。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+    /// このサービスが属するプロファイル名(STACK-10・TASK-187 の絞り込みが参照する)。
+    ///
+    /// 空は「常に対象」を意味する。トップレベルの `profiles` は置かない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// ヘルスチェック定義（STACK-1・TASK-149.4.2・#863）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
+    /// `[services.<name>.deploy]`（STACK-1・TASK-149.4.2・#863。`resources` のみ）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<Deploy>,
+}
+
+/// `[services.<name>.healthcheck]`（STACK-1・CLI-4・TASK-149.4.2・#863）。
+///
+/// supervisor の healthcheck 定義（SUP-4。`crates/supervisor/src/healthcheck.rs`）へ写す前段の
+/// 未検証の型で、`up`（TASK-155）が結線する。時間は文字列のまま持ち、解釈と範囲検査は
+/// supervisor の `HealthcheckDefinition::parse` が行う。`retries` は supervisor に合わせて
+/// 符号付き整数で受け、負値の拒否も supervisor の構造化エラーに任せる。
+/// `test` は argv の配列のみ（compose の文字列形・`CMD` / `CMD-SHELL` / `NONE` の正規化は変換器
+/// 〔TASK-151〕の責務）で、シェルへ連結しない。`disable`・`start_interval` は表現先が無く拒否する。
+/// `test` に資格情報が入りうるため `{:?}` をログ・エラーに出さない。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Healthcheck {
+    /// 実行する argv。`command` と同じく `Option` にして `[]` とキー無しの違いを往復で保つ。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<Vec<String>>,
+    /// 実行間隔（時間文字列。例: `30s`。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// 1 回の実行の期限（時間文字列。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// unhealthy と判定する連続失敗回数（未検証。負値も型の段階では受ける）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<i64>,
+    /// 起動直後に失敗を数えない猶予（時間文字列。未検証）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_period: Option<String>,
+}
+
+/// `[services.<name>.deploy]`。STACK-1 の範囲は `resources` だけで、`placement`・`replicas` 等は
+/// 足さず拒否する（TASK-149.4.2・#863）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deploy {
+    /// リソースの上限と予約。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<DeployResources>,
+}
+
+/// `[services.<name>.deploy.resources]`（STACK-1・TASK-149.4.2・#863）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployResources {
+    /// 上限（`limits`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ResourceLimits>,
+    /// 予約（`reservations`。STACK-1 の範囲は GPU の `devices` だけ）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservations: Option<ResourceReservations>,
+}
+
+/// `deploy.resources.limits`。`pids` 等は範囲外で拒否する。値は未検証（検証は `up`・TASK-155）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLimits {
+    /// CPU 上限（文字列のまま。例: `2.5`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
+    /// メモリ上限（文字列のまま。例: `512M`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+}
+
+/// `deploy.resources.reservations`（STACK-1・STACK-9）。
+///
+/// TASK-156（`crates/compose-convert` の GPU 予約変換）が変換結果を書く先である。
+/// `cpus`・`memory`・`generic_resources` は範囲外で拒否する。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceReservations {
+    /// 予約する GPU 等の CDI 完全修飾名（例: `nvidia.com/gpu=0`）。
+    ///
+    /// compose の構造（driver・count・device_ids・capabilities）は持たず、`count: N` 等を一意な
+    /// CDI 名へ決める規則は変換側（STACK-9・TASK-156）にある。stack は文字列を解釈・検証しない。
+    /// `Service.devices`（#862）とは別のフィールドで、GPU 予約の出力先はこちらである。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+}
+
+impl Service {
+    /// このサービスの環境変数・env ファイル・ラベルを、CLI の `create` の引数列へ写す(SUP-12・CLI-1・CLI-4・#2713)。
+    ///
+    /// 返すのは `--env-file <path>`(`env_files`。相対パスは `project_dir` 起点で解決)、`--env <KEY=VALUE>`(`env`。
+    /// キー昇順)、`--label <KEY=VALUE>`(`labels`。キー昇順)の列で、`up`(TASK-155)が CLI の `create` を呼ぶ想定に
+    /// 合わせた argv の断片である。stack が cli・supervisor・core へ依存する新しい辺を作らないよう、値の検証
+    /// (キーの形式・件数・長さ・env ファイルの読み取り)は受け取る CLI 側が既存のパーサで一元的に行う。
+    /// `ulimits`・`tmpfs`・`shm_size` はスキーマにあるが(#862)、`--ulimit`・`--tmpfs`・`--shm-size` への写しは
+    /// 未実装で含めない。`container_name`・`working_dir`(#609)・`security_opt`(#610)・`stdin_open`・`tty`(#611)も同様に写しは未実装。`up` からの結線は TASK-155 の後続(REPAIR-3)。
+    /// `cap_drop`(#610)は `--cap-drop <name>` へ入力順のまま写す(正規化は CLI ⇒ core)。`cap_add` はスキーマに無い(オーナー判断待ち。#2666)。
+    ///
+    /// 値に資格情報が入りうるため、戻り値を `{:?}` でログ・エラーに出さない。`env_files` の絶対パスや `..` を含む
+    /// パスは検証しない(読むのは CLI が利用者の権限で行う。範囲外参照の扱いは `up` の責務)。
+    pub fn create_option_args(&self, project_dir: &Path) -> Vec<OsString> {
+        let mut args = Vec::new();
+        for file in &self.env_files {
+            args.push(OsString::from("--env-file"));
+            args.push(project_dir.join(file).into_os_string());
+        }
+        for (key, value) in &self.env {
+            args.push(OsString::from("--env"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+        for (key, value) in &self.labels {
+            args.push(OsString::from("--label"));
+            args.push(OsString::from(format!("{key}={value}")));
+        }
+        for name in &self.cap_drop {
+            args.push(OsString::from("--cap-drop"));
+            args.push(OsString::from(name));
+        }
+        args
+    }
 }
 
 /// `depends_on` の起動条件（STACK-1・D-17 論点 2）。
@@ -169,12 +378,70 @@ pub struct Config {
 mod tests {
     use super::*;
 
+    /// SUP-12・CLI-4(#2713): env・env_files・labels が create の引数列に具体値で写る(env ファイルは project_dir 起点)。
+    #[test]
+    fn sup12_service_create_option_args() {
+        let service = Service {
+            env: BTreeMap::from([("B".into(), "2".into()), ("A".into(), "x=y".into())]),
+            env_files: vec![".env".into(), "/abs/other.env".into()],
+            labels: BTreeMap::from([("tier".into(), "web".into())]),
+            cap_drop: vec!["ALL".into(), "chown".into()],
+            security_opt: vec!["no-new-privileges:true".into()],
+            tty: Some(true),
+            stdin_open: Some(true),
+            ..Service::default()
+        };
+        let args: Vec<String> = service
+            .create_option_args(Path::new("/proj"))
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8"))
+            .collect();
+        // 期待値の env ファイルのパスも `Path::join` で組み立てる（Windows では区切りが `\` になるため。CLI-1）。
+        let joined = |file: &str| {
+            Path::new("/proj")
+                .join(file)
+                .into_os_string()
+                .into_string()
+                .expect("utf-8")
+        };
+        assert_eq!(
+            args,
+            [
+                "--env-file",
+                joined(".env").as_str(),
+                "--env-file",
+                joined("/abs/other.env").as_str(),
+                "--env",
+                "A=x=y",
+                "--env",
+                "B=2",
+                "--label",
+                "tier=web",
+                "--cap-drop",
+                "ALL",
+                "--cap-drop",
+                "chown",
+            ]
+        );
+        assert!(
+            Service::default()
+                .create_option_args(Path::new("/proj"))
+                .is_empty()
+        );
+    }
+
     const FULL: &str = r#"
 [project]
 name = "demo"
 
 [services.web]
 image = "example/web:1"
+container_name = "fixed-web"
+working_dir = "/app"
+cap_drop = ["NET_RAW"]
+security_opt = ["no-new-privileges:true"]
+stdin_open = true
+tty = false
 command = ["serve", "--port", "8080"]
 entrypoint = []
 env_files = [".env"]
@@ -207,6 +474,12 @@ file = "./app.conf"
     fn web_service() -> Service {
         Service {
             image: Some("example/web:1".into()),
+            container_name: Some("fixed-web".into()),
+            working_dir: Some("/app".into()),
+            cap_drop: vec!["NET_RAW".into()],
+            security_opt: vec!["no-new-privileges:true".into()],
+            stdin_open: Some(true),
+            tty: Some(false),
             command: Some(vec!["serve".into(), "--port".into(), "8080".into()]),
             entrypoint: Some(vec![]),
             env: BTreeMap::from([("MODE".into(), "dummy".into())]),
@@ -216,6 +489,132 @@ file = "./app.conf"
             volumes: vec!["models:/models:ro".into()],
             depends_on: BTreeMap::from([("db".into(), DependsOnCondition::Healthy)]),
             labels: BTreeMap::from([("tier".into(), "front".into())]),
+            ..Service::default()
+        }
+    }
+
+    const HC_DEPLOY: &str = r#"
+[services.web]
+image = "example/web:1"
+
+[services.web.healthcheck]
+test = ["/bin/check", "--quick"]
+interval = "30s"
+timeout = "5s"
+retries = 3
+start_period = "10s"
+
+[services.web.deploy.resources.limits]
+cpus = "2.5"
+memory = "512M"
+
+[services.web.deploy.resources.reservations]
+devices = ["nvidia.com/gpu=0", "nvidia.com/gpu=all"]
+"#;
+
+    /// STACK-1・TASK-149.4.2(#863): healthcheck の 5 フィールドが具体値で読める。
+    #[test]
+    fn stack_1_healthcheck_fields_parse() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let svc = doc.services.get("web").expect("web");
+        assert_eq!(
+            svc.healthcheck,
+            Some(Healthcheck {
+                test: Some(vec!["/bin/check".into(), "--quick".into()]),
+                interval: Some("30s".into()),
+                timeout: Some("5s".into()),
+                retries: Some(3),
+                start_period: Some("10s".into()),
+            })
+        );
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): deploy.resources の入れ子と reservations.devices に届く。
+    #[test]
+    fn stack_1_deploy_resources_nested_parse() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let svc = doc.services.get("web").expect("web");
+        assert_eq!(
+            svc.deploy,
+            Some(Deploy {
+                resources: Some(DeployResources {
+                    limits: Some(ResourceLimits {
+                        cpus: Some("2.5".into()),
+                        memory: Some("512M".into()),
+                    }),
+                    reservations: Some(ResourceReservations {
+                        devices: vec!["nvidia.com/gpu=0".into(), "nvidia.com/gpu=all".into()],
+                    }),
+                }),
+            })
+        );
+        let devices = &svc
+            .deploy
+            .as_ref()
+            .and_then(|d| d.resources.as_ref())
+            .and_then(|r| r.reservations.as_ref())
+            .expect("reservations")
+            .devices;
+        assert_eq!(devices.len(), 2);
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): 往復が一致し決定的で、空テーブルの Some も保たれる。
+    #[test]
+    fn stack_1_healthcheck_deploy_roundtrip() {
+        let doc: ComposeToml = toml::from_str(HC_DEPLOY).expect("parse");
+        let text = toml::to_string(&doc).expect("serialize");
+        let again: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(again, doc);
+        assert_eq!(toml::to_string(&again).expect("serialize"), text);
+
+        let empty = Service {
+            healthcheck: Some(Healthcheck::default()),
+            deploy: Some(Deploy::default()),
+            ..Service::default()
+        };
+        let text = toml::to_string(&empty).expect("serialize");
+        let back: Service = toml::from_str(&text).expect("reparse");
+        assert_eq!(back, empty);
+        assert_eq!(toml::to_string(&Service::default()).expect("serialize"), "");
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): `test = []` は Some(空)、キー無しは None。
+    #[test]
+    fn stack_1_healthcheck_test_empty_list_preserved() {
+        let hc: Healthcheck = toml::from_str("test = []").expect("parse");
+        assert_eq!(hc.test, Some(vec![]));
+        assert!(
+            toml::to_string(&hc)
+                .expect("serialize")
+                .contains("test = []")
+        );
+        let none: Healthcheck = toml::from_str("").expect("parse");
+        assert_eq!(none.test, None);
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): retries は符号付きで受ける(拒否は supervisor の parse の責務)。
+    #[test]
+    fn stack_1_healthcheck_retries_signed() {
+        let hc: Healthcheck = toml::from_str("retries = -1").expect("parse");
+        assert_eq!(hc.retries, Some(-1));
+    }
+
+    /// STACK-1・TASK-149.4.2(#863): 範囲外のキー・typo・形の違う値は拒否する(fail-closed)。
+    #[test]
+    fn stack_1_healthcheck_deploy_reject_unknown_keys() {
+        let bad = [
+            "[healthcheck]\nintreval = \"1s\"\n",
+            "[healthcheck]\ndisable = true\n",
+            "[healthcheck]\nstart_interval = \"1s\"\n",
+            "[deploy]\nplacement = {}\n",
+            "[deploy]\nreplicas = 2\n",
+            "[deploy.resources.limits]\npids = 10\n",
+            "[deploy.resources.reservations]\ncpus = \"1\"\n",
+            "[deploy.resources.reservations]\ndevices = \"nvidia.com/gpu=all\"\n",
+            "[deploy.resources.reservations]\ndevices = [{ driver = \"nvidia\" }]\n",
+        ];
+        for doc in bad {
+            assert!(toml::from_str::<Service>(doc).is_err(), "accepted: {doc}");
         }
     }
 
@@ -367,5 +766,264 @@ file = "./app.conf"
     fn stack_1_service_empty_collections_are_omitted() {
         let text = toml::to_string(&Service::default()).expect("serialize");
         assert_eq!(text, "");
+    }
+
+    const EXTENDED: &str = r#"
+[services.s]
+restart = "on-failure:3"
+secrets = ["api_key"]
+configs = ["app"]
+shm_size = "64m"
+tmpfs = ["/run:size=64m"]
+devices = ["nvidia.com/gpu=all", "nvidia.com/gpu=0"]
+profiles = ["dev", "gpu"]
+
+[services.s.ulimits]
+nofile = "65536:65536"
+nproc = "-1"
+"#;
+
+    fn extended_service() -> Service {
+        Service {
+            restart: Some("on-failure:3".into()),
+            secrets: vec!["api_key".into()],
+            configs: vec!["app".into()],
+            ulimits: BTreeMap::from([
+                ("nofile".into(), "65536:65536".into()),
+                ("nproc".into(), "-1".into()),
+            ]),
+            shm_size: Some("64m".into()),
+            tmpfs: vec!["/run:size=64m".into()],
+            devices: vec!["nvidia.com/gpu=all".into(), "nvidia.com/gpu=0".into()],
+            profiles: vec!["dev".into(), "gpu".into()],
+            ..Service::default()
+        }
+    }
+
+    /// STACK-1・TASK-149.4.1: 拡張 8 フィールドが具体値で読める。
+    #[test]
+    fn stack_1_service_extended_fields_parse() {
+        let parsed: ComposeToml = toml::from_str(EXTENDED).expect("valid");
+        assert_eq!(parsed.services["s"], extended_service());
+    }
+
+    /// STACK-1・TASK-149.4.1: 拡張フィールドは書き出して読み直すと一致し、書き出しは安定する。
+    #[test]
+    fn stack_1_service_extended_fields_roundtrip() {
+        let parsed: ComposeToml = toml::from_str(EXTENDED).expect("valid");
+        let text = toml::to_string(&parsed).expect("serialize");
+        assert!(text.contains("restart = \"on-failure:3\""), "{text}");
+        assert!(text.contains("nofile = \"65536:65536\""), "{text}");
+        let again: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(again, parsed);
+        assert_eq!(toml::to_string(&again).expect("serialize"), text);
+    }
+
+    /// STACK-1・GPU-1・TASK-149.4.1: `devices` は CDI 完全修飾名の文字列配列で、文字列・テーブルは拒否する。
+    #[test]
+    fn stack_1_devices_are_cdi_name_strings() {
+        let ok: ComposeToml =
+            toml::from_str("[services.s]\ndevices = [\"nvidia.com/gpu=all\"]\n").expect("valid");
+        assert_eq!(
+            ok.services["s"].devices,
+            vec!["nvidia.com/gpu=all".to_string()]
+        );
+        for bad in [
+            "[services.s]\ndevices = \"nvidia.com/gpu=all\"\n",
+            "[services.s]\ndevices = [{ name = \"x\" }]\n",
+        ] {
+            assert!(
+                toml::from_str::<ComposeToml>(bad).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    /// STACK-1・STACK-10・TASK-149.4.1: `profiles` は文字列配列で、無ければ空・書き出しに出ない。
+    #[test]
+    fn stack_10_profiles_are_string_list() {
+        let ok: ComposeToml =
+            toml::from_str("[services.s]\nprofiles = [\"dev\"]\n").expect("valid");
+        assert_eq!(ok.services["s"].profiles, vec!["dev".to_string()]);
+        assert!(toml::from_str::<ComposeToml>("[services.s]\nprofiles = \"dev\"\n").is_err());
+        let none: ComposeToml = toml::from_str("[services.s]\n").expect("valid");
+        assert!(none.services["s"].profiles.is_empty());
+        let text = toml::to_string(&none).expect("serialize");
+        assert!(!text.contains("profiles"), "{text}");
+    }
+
+    /// STACK-1・TASK-149.4.1: typo と誤った型は拒否する(fail-closed)。
+    #[test]
+    fn stack_1_extended_fields_reject_typo_and_wrong_type() {
+        for bad in [
+            "[services.s]\nprofile = [\"dev\"]\n",
+            "[services.s]\nrestart_policy = \"always\"\n",
+            "[services.s.ulimit]\nnofile = \"1\"\n",
+            "[services.s.ulimits]\nnofile = 1024\n",
+            "[services.s]\nshm_size = 67108864\n",
+            "[services.s]\nrestart = { policy = \"always\" }\n",
+        ] {
+            assert!(
+                toml::from_str::<ComposeToml>(bad).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    /// 全型の全フィールドを埋めた合成フィクスチャ（STACK-1・TASK-149.5・#587）。
+    const ROUNDTRIP_FULL: &str = include_str!("../testdata/schema_roundtrip_full.toml");
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn map(v: &[(&str, &str)]) -> BTreeMap<String, String> {
+        v.iter()
+            .map(|(k, x)| ((*k).to_string(), (*x).to_string()))
+            .collect()
+    }
+
+    /// `ROUNDTRIP_FULL` の期待値。`..` を使わず全フィールドを書く。フィールドが増えたときに
+    /// コンパイルを失敗させ、フィクスチャと期待値の更新を強いるため（REPAIR-1・REPAIR-12）。
+    fn roundtrip_full_value() -> ComposeToml {
+        let web = Service {
+            image: Some("example/web:1".into()),
+            container_name: Some("roundtrip-web".into()),
+            working_dir: Some("/app".into()),
+            cap_drop: strs(&["NET_RAW", "ALL"]),
+            security_opt: strs(&["no-new-privileges:true"]),
+            stdin_open: Some(true),
+            tty: Some(true),
+            command: Some(strs(&["serve", "--port=8080"])),
+            entrypoint: Some(strs(&["/entry"])),
+            env: map(&[("MODE", "dummy"), ("LEVEL", "debug")]),
+            env_files: strs(&[".env", "./extra.env"]),
+            ports: strs(&["8080:80"]),
+            networks: strs(&["backend"]),
+            volumes: strs(&["models:/models:ro"]),
+            depends_on: BTreeMap::from([
+                ("db".into(), DependsOnCondition::Started),
+                ("cache".into(), DependsOnCondition::Healthy),
+                ("migrate".into(), DependsOnCondition::Completed),
+            ]),
+            labels: map(&[("tier", "front")]),
+            restart: Some("on-failure:3".into()),
+            secrets: strs(&["api_key"]),
+            configs: strs(&["app"]),
+            ulimits: map(&[("nofile", "65536:65536"), ("nproc", "-1")]),
+            shm_size: Some("64m".into()),
+            tmpfs: strs(&["/run:size=64m"]),
+            devices: strs(&["nvidia.com/gpu=all"]),
+            profiles: strs(&["dev", "gpu"]),
+            healthcheck: Some(Healthcheck {
+                test: Some(strs(&["CMD", "true"])),
+                interval: Some("30s".into()),
+                timeout: Some("5s".into()),
+                retries: Some(3),
+                start_period: Some("10s".into()),
+            }),
+            deploy: Some(Deploy {
+                resources: Some(DeployResources {
+                    limits: Some(ResourceLimits {
+                        cpus: Some("2.5".into()),
+                        memory: Some("512M".into()),
+                    }),
+                    reservations: Some(ResourceReservations {
+                        devices: strs(&["nvidia.com/gpu=0"]),
+                    }),
+                }),
+            }),
+        };
+        let worker = Service {
+            image: None,
+            container_name: None,
+            working_dir: None,
+            cap_drop: vec![],
+            security_opt: vec![],
+            stdin_open: None,
+            tty: None,
+            command: Some(vec![]),
+            entrypoint: Some(vec![]),
+            env: BTreeMap::new(),
+            env_files: vec![],
+            ports: vec![],
+            networks: vec![],
+            volumes: vec![],
+            depends_on: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            restart: None,
+            secrets: vec![],
+            configs: vec![],
+            ulimits: BTreeMap::new(),
+            shm_size: None,
+            tmpfs: vec![],
+            devices: vec![],
+            profiles: vec![],
+            healthcheck: Some(Healthcheck {
+                test: Some(vec![]),
+                interval: None,
+                timeout: None,
+                retries: None,
+                start_period: None,
+            }),
+            deploy: Some(Deploy { resources: None }),
+        };
+        ComposeToml {
+            project: Some(Project {
+                name: Some("roundtrip".into()),
+            }),
+            services: BTreeMap::from([("web".into(), web), ("worker".into(), worker)]),
+            networks: BTreeMap::from([(
+                "backend".into(),
+                Network {
+                    driver: Some("bridge".into()),
+                    external: Some(false),
+                },
+            )]),
+            volumes: BTreeMap::from([(
+                "models".into(),
+                Volume {
+                    driver: Some("io-share".into()),
+                    external: Some(true),
+                },
+            )]),
+            secrets: BTreeMap::from([(
+                "api_key".into(),
+                Secret {
+                    file: Some("./secrets/api_key".into()),
+                    external: Some(false),
+                },
+            )]),
+            configs: BTreeMap::from([(
+                "app".into(),
+                Config {
+                    file: Some("./app.conf".into()),
+                    external: Some(true),
+                },
+            )]),
+        }
+    }
+
+    /// STACK-1・CLI-4・TASK-149.5（#587）: 全フィールドの合成フィクスチャで、TOML → ComposeToml → TOML の
+    /// 往復が構造体と TOML の値の両方で一致する（STACK-5 の往復検証の土台）。
+    #[test]
+    fn stack_1_full_fixture_roundtrip_matches_toml_value() {
+        let parsed: ComposeToml = toml::from_str(ROUNDTRIP_FULL).expect("fixture parses");
+        assert_eq!(parsed, roundtrip_full_value());
+
+        let text = toml::to_string(&parsed).expect("serialize");
+        let reparsed: ComposeToml = toml::from_str(&text).expect("reparse");
+        assert_eq!(reparsed, parsed, "struct mismatch; written:\n{text}");
+
+        // 出力が決定的であること。
+        assert_eq!(toml::to_string(&reparsed).expect("serialize again"), text);
+
+        // 書き出した文書が入力の文書と TOML の値として一致すること。
+        let input_value: toml::Table = toml::from_str(ROUNDTRIP_FULL).expect("table");
+        let output_value: toml::Table = toml::from_str(&text).expect("table");
+        assert_eq!(
+            output_value, input_value,
+            "toml value mismatch; written:\n{text}"
+        );
     }
 }

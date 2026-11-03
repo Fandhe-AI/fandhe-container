@@ -4,5 +4,12 @@
     "namespace": "crictl-smoke",
     "uid": "crictl-smoke-uid-0001",
     "attempt": 0
+  },
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 2
+      }
+    }
   }
 }

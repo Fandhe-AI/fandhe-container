@@ -12,9 +12,8 @@
 //!   前提で、本 crate はダウンロードも同梱もしない。手順は AGENTS.md「実機前提テスト」節。
 #![cfg(target_os = "macos")]
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use fandhe_container_platform_macos::config::{
     BlockDeviceId, BlockDeviceSpec, ConfigError, ConsoleLogPath, CpuCount, DeviceConfigSpec,
@@ -27,55 +26,17 @@ use fandhe_container_platform_macos::virtiofs::{
 };
 use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmEvent, VmState};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとの新規ディレクトリ（0700）。`keep` が false なら `Drop` で削除する（実機テストはログを残す）。
-struct Scratch {
-    dir: PathBuf,
-    keep: bool,
-}
-
-impl Scratch {
-    /// `CARGO_TARGET_TMPDIR` 配下に新規作成する。`create_dir` は既存に失敗するため、他のディレクトリを
-    /// 再利用・削除しない。親に symlink を含めないよう canonicalize した基点を使う。
-    fn new(tag: &str, keep: bool) -> Self {
-        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(base).expect("create tmp base");
-        let base = base.canonicalize().expect("canonicalize tmp base");
-        for _ in 0..100 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos());
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = base.join(format!("{tag}-{}-{nanos}-{n}", std::process::id()));
-            if std::fs::create_dir(&dir).is_ok() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod scratch dir");
-                return Self { dir, keep };
-            }
-        }
-        panic!("could not create a fresh scratch directory");
-    }
-
-    /// 0600 のファイルを作る。
-    fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = self.dir.join(name);
-        std::fs::write(&p, bytes).expect("write fixture");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod fixture");
-        p
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-}
+#[path = "support/common.rs"]
+mod common;
+use common::{Scratch, resolve_secs, tail_lossy};
+#[path = "support/vm_guest.rs"]
+mod vm_guest;
+use vm_guest::{GuestAssets, console_boot_spec};
+#[path = "support/guest_markers.rs"]
+mod guest_markers;
+use guest_markers::{
+    markers_observed_in_order, resolve_boot_marker, resolve_ready_marker, validate_marker_pair,
+};
 
 /// ダミー kernel とコンソールログ付きの最小 spec（VM 生成までは到達しない用途）。
 fn spec_with_console(s: &Scratch) -> (VmConfigSpec, PathBuf) {
@@ -375,69 +336,13 @@ fn mac1_sec4_build_vz_configuration_rejects_share_swapped_to_symlink() {
     }
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
-
-/// 必須のゲストカーネルパスを読む。無ければ panic する（黙って成功させない）。
-fn require_kernel() -> PathBuf {
-    env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
-        panic!(
-            "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) and \
+/// kernel 未設定時の panic 文言（必須・任意の環境変数の一覧）。
+const KERNEL_HELP: &str = "FANDHE_CONTAINER_MACOS_VM_KERNEL (absolute path to a guest kernel) and \
              FANDHE_CONTAINER_MACOS_VM_READY_MARKER (a string the guest prints only after boot completes) \
              are required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, \
              FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
              FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER (default \"Linux version\"), \
-             FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
-        )
-    })
-}
-
-/// ブートマーカーを決める。未指定は既定値、空文字列は拒否する。
-///
-/// 空マーカーは `contains` が常に true になり、ゲストが何も出力しなくても起動確認を通過してしまうため（MAC-1）。
-fn resolve_boot_marker(raw: Option<String>) -> Result<String, String> {
-    match raw {
-        None => Ok("Linux version".to_string()),
-        Some(m) if m.is_empty() => {
-            Err("boot marker must not be empty (it would match any console output)".to_string())
-        }
-        Some(m) => Ok(m),
-    }
-}
-
-/// 起動完了マーカーを決める。既定値は無く、未指定・空文字列は拒否する。
-///
-/// `Linux version` のような起動初期のマーカーだけでは、直後にゲストが停止しても成功してしまう。
-/// ゲスト資産が起動完了後にだけ出力する文字列を呼び出し側に必ず指定させる（MAC-1）。
-fn resolve_ready_marker(raw: Option<String>) -> Result<String, String> {
-    match raw {
-        None => Err("FANDHE_CONTAINER_MACOS_VM_READY_MARKER is required".to_string()),
-        Some(m) if m.is_empty() => Err("ready marker must not be empty".to_string()),
-        Some(m) => Ok(m),
-    }
-}
-
-/// ブートマーカーと起動完了マーカーの重複を拒否する。
-///
-/// 一致・包含関係にあると起動初期の出力だけで両方が成立し、起動完了前にゲストが停止しても通ってしまう（MAC-1）。
-fn validate_marker_pair(boot: &str, ready: &str) -> Result<(), String> {
-    if boot.contains(ready) || ready.contains(boot) {
-        return Err(format!(
-            "boot marker {boot:?} and ready marker {ready:?} must not be equal or contain one another"
-        ));
-    }
-    Ok(())
-}
-
-/// ブートマーカーの出現より後に起動完了マーカーが現れたかを返す。
-///
-/// 起動完了マーカーはブートマーカー末尾以降だけを探索し、順序（ブート後に起動完了）を保証する（MAC-1）。
-fn markers_observed_in_order(text: &str, boot: &str, ready: &str) -> bool {
-    text.find(boot)
-        .and_then(|pos| text.get(pos + boot.len()..))
-        .is_some_and(|rest| rest.contains(ready))
-}
+             FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS (1-600, default 60). See AGENTS.md.";
 
 #[test]
 fn mac1_marker_pair_rejects_overlap() {
@@ -484,12 +389,6 @@ fn mac1_boot_marker_rejects_empty_and_defaults_when_unset() {
     assert!(resolve_boot_marker(Some(String::new())).is_err());
 }
 
-/// 末尾の最大 `max` バイトを文字列にする（失敗時の診断用）。
-fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    let start = bytes.len().saturating_sub(max);
-    String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).into_owned()
-}
-
 /// MAC-1・TASK-64.6: 実機で最小 VM を起動し、コンソールにブートマーカーと起動完了マーカーが出て、停止できる。
 ///
 /// 実機前提のため既定集合から分離している（CI 通過のための弱体化ではない）。必要なもの: 実機 macOS 13 以上、
@@ -497,43 +396,26 @@ fn tail_lossy(bytes: &[u8], max: usize) -> String {
 #[test]
 #[ignore = "requires real macOS 13+ with Virtualization.framework, a test binary codesigned with com.apple.security.virtualization, and guest assets (TASK-64.hdep2); see AGENTS.md"]
 fn mac1_minimal_vm_boots_and_stops_on_real_macos() {
-    let kernel = require_kernel();
-    let initrd = env_path("FANDHE_CONTAINER_MACOS_VM_INITRD");
-    let disk = env_path("FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE");
-    let cmdline = std::env::var("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
-        .unwrap_or_else(|_| "console=hvc0".to_string());
+    let assets = GuestAssets::from_env(KERNEL_HELP);
     let marker = resolve_boot_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER").ok())
         .expect("invalid FANDHE_CONTAINER_MACOS_VM_BOOT_MARKER");
     let ready_marker =
         resolve_ready_marker(std::env::var("FANDHE_CONTAINER_MACOS_VM_READY_MARKER").ok())
             .expect("invalid FANDHE_CONTAINER_MACOS_VM_READY_MARKER");
     validate_marker_pair(&marker, &ready_marker).expect("invalid marker pair");
-    let boot_secs: u64 =
-        match std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS") {
-            Ok(v) => v.parse().ok().filter(|n| (1..=600).contains(n)).expect(
-                "FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS must be an integer in 1..=600",
-            ),
-            Err(_) => 60,
-        };
+    let boot_secs = resolve_secs(
+        std::env::var("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS").ok(),
+        60,
+        (1, 600),
+    )
+    .unwrap_or_else(|_| {
+        panic!("FANDHE_CONTAINER_MACOS_VM_BOOT_TIMEOUT_SECS must be an integer in 1..=600")
+    });
 
     // 失敗時の診断のためコンソールログは残す。
     let s = Scratch::new("vm-boot", true);
     let log = s.dir.join("console.log");
-    let blocks = disk
-        .iter()
-        .map(|p| BlockDeviceSpec::root(DiskImagePath::try_new(p).expect("disk image path")))
-        .collect();
-    let devices = DeviceConfigSpec::try_new(
-        blocks,
-        Some(SerialConsoleSink::LogFile(
-            ConsoleLogPath::try_new(&log).expect("console log path"),
-        )),
-    )
-    .expect("device spec");
-    let spec = VmConfigSpec::from_parts(&kernel, initrd.as_deref(), &cmdline)
-        .expect("spec")
-        .with_devices(devices)
-        .expect("with_devices");
+    let spec = console_boot_spec(&assets, &log);
     let timeouts = OpTimeouts::try_new(
         Duration::from_secs(30),
         Duration::from_secs(15),

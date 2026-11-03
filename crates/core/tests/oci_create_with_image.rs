@@ -8,6 +8,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::num::NonZeroU32;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -36,16 +39,20 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 /// テストごとに排他作成する一時ディレクトリ（bundle と状態ルートの親。終了時に削除）。
 struct Sandbox {
     dir: PathBuf,
+    /// sandbox の親（tmpfiles の flock 走査から守る。最後に drop される）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
-        let dir = tmp.join(format!(
-            "fandhe-core-create-image-it-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
+        let scratch = scratch_root::ScratchDir::new(
+            &format!(
+                "fandhe-core-create-image-it-{}",
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("sandbox");
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -65,7 +72,10 @@ impl Sandbox {
             .expect("ser"),
         )
         .expect("config");
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn bundle(&self) -> PathBuf {

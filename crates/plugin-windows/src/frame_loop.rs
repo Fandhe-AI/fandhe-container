@@ -1,7 +1,7 @@
 //! UDS 上の長さ接頭辞フレームの送受信ループ（TASK-116.2・#393。PLUG-1・WIN-1・REPAIR-5）。
 //!
 //! `main.rs`（バイナリ入口）が `UdsStream::connect` で core の listener へ接続した後、本モジュールの
-//! [`serve`] を呼ぶ。接続の往復は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕の 4.4 と windows-execution-layout.md〔#1862〕で決める（1 本の接続で要求を順次往復させる想定）。
+//! [`serve`] を呼ぶ。接続の往復は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕の 4.4 と windows-execution-layout.md〔#1862〕で決める（1 本の接続で要求を順次往復させる想定）。
 //! 本モジュールは `fandhe-container-plugin` の `frame`・`message`・`transport` の公開 API だけで受信を組み、
 //! 共有 crate は変更しない。
 //!
@@ -19,7 +19,7 @@
 //! その接続に閉じる。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計で確定する。
+//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。
 //! 既定ハンドラ [`UnimplementedHandler`] は全操作に `UNIMPLEMENTED` を返す（アダプタ未結線時・テスト用。
 //! 実ハンドラは `adapter::WindowsRuntimeAdapter`・#394）。ヘルスチェック（`ping`）は adapter が応答する（#396）。
 //!

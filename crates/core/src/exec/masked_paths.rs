@@ -75,8 +75,9 @@
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
 //! - debugfs・tracefs・securityfs・bpf 等の擬似 FS の覆い（moby の一覧に無い。範囲はオーナー判断待ち。`path_masks` 参照）
-//! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由で記録され、記録の理由だけでは段が分からない
-//!   （段は返る `ExecError::stage` に載る）。段のフィールドは #653（TASK-98.2）の共通ログ型の範囲
+//!
+//! 記録の `stage` キー（#3121・SEC-4・ERR-4）: 経路検査の拒否は汎用理由で記録されるが、親が `ExecError::stage` の
+//! 段 `mount_masked_paths` を記録の末尾（`container_id` の後ろ）に載せるため、記録だけで段が分かる。
 //!
 //! # 監査（SEC-4）
 //!
@@ -866,6 +867,11 @@ mod tests {
         assert_eq!(recs[0].layer(), AuditLayer::Mount);
         assert_eq!(recs[0].path(), None);
         assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+        // #3121: 汎用理由でも記録だけで段が分かる。
+        assert_eq!(
+            recs[0].stage().map(|s| s.as_str()),
+            Some("mount_masked_paths")
+        );
         let reason = recs[0].reason().map(|r| r.as_str().to_string());
         (out.error, reason.expect("reason"))
     }

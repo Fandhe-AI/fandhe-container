@@ -15,7 +15,11 @@
 //! - Landlock は加算的で、祖先より狭い権利を子に強制できない。書き込み系（[`AccessFs::WRITE`]）の制限が
 //!   祖先ルールで無効になる構成（書き込み可能な root の下の `ro` mount・疑似 FS 等）は、最小権限を
 //!   保証できないため [`LandlockRuleErrorKind::WriteRestrictionShadowed`] で拒否する（fail-closed。CORE-5）。
-//!   疑似 FS の書き込み禁止は VFS の裏付けが無く Landlock だけが担うため、記録だけでは守れない
+//!   疑似 FS の書き込み禁止は VFS の裏付けが無く Landlock だけが担うため、記録だけでは守れない。
+//!   例外は**検証済みの `ro` の bind mount**（`BindMountSet` に同じ `index` の spec があり `read_only()` で、宛先が一致し、
+//!   ルール自身が `WRITE` を持たないもの。#1917・#1910 の決定 B）だけで、書き込みの禁止は実際に載せた bind の VFS の
+//!   読み取り専用属性が担い、ここでは [`ShadowBacking::ReadOnlyBind`] として記録する（監査用。適用時に VFS の ro を確かめる
+//!   のは `apply`）。config だけを受ける入口は空の集合を渡すため、`ro` の bind はこれまでどおり拒否する
 //! - 実行・`IOCTL_DEV` だけが祖先で広がる箇所（`/dev` 配下の `noexec,nodev` mount 等）は、VFS の
 //!   `noexec` / `nodev` が必ず効くため許容し、[`LandlockRuleset::shadowed`] に記録する（監査は TASK-41・SEC-4）
 //! - 暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`。オーナー判断 #1609）は `mounts[]` に関係なく常に載るため、
@@ -38,13 +42,17 @@ use std::fmt;
 use super::{LandlockAuditMode, LandlockSupport, landlock_audit_mode_for_abi};
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount, ImplicitDevMounts};
 use crate::oci_runtime::{
-    CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciMountKind,
-    OciRoot,
+    BindMountSet, CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount,
+    OciMountKind, OciRoot,
 };
+use crate::tmpfs::TMPFS_MAX_MOUNTS;
 use crate::traits::ErrorCode;
 
 /// 生成するルール本数の上限（mount 上限 + rootfs 1 本 + 暗黙の `/dev` 系 3 本。DoS 防止）。
-pub const MAX_LANDLOCK_RULES: usize = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
+///
+/// 利用者指定の tmpfs（`--tmpfs`。上限 [`TMPFS_MAX_MOUNTS`]）は `mounts[]` とは別枠で数える（SUP-12・CORE-5・#2625）。
+pub const MAX_LANDLOCK_RULES: usize =
+    CONFIG_MAX_MOUNTS + TMPFS_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
 
 /// Landlock の fs アクセス権ビット集合。既知の 16 ビット以外を表現できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,11 +211,24 @@ pub enum RuleOrigin {
         /// `mounts` 内の位置。
         index: usize,
     },
+    /// 利用者指定の tmpfs（`--tmpfs`。tmpfs の段が載せた同じ宛先のマウントと照合する。SUP-12・CORE-5・#2625）。
+    UserTmpfs,
     /// ランタイムが暗黙に載せるマウント（`/dev`・`/dev/pts`・`/dev/shm`。#1657）。
     Implicit {
         /// 対象のマウント。
         mount: ImplicitDevMount,
     },
+}
+
+impl RuleOrigin {
+    /// ランタイムが載せたマウント由来のルール（`Root` 以外）か。適用時の識別子の照合、launch の子の識別子の報告、
+    /// 親の期待列の 3 か所が共有する唯一の述語（`RecordedTarget::is_mount_origin` と同じ集合。REPAIR-1・#3201）。
+    pub fn is_mount_origin(&self) -> bool {
+        matches!(
+            self,
+            Self::Implicit { .. } | Self::Mount { .. } | Self::UserTmpfs
+        )
+    }
 }
 
 /// パス 1 件分の許可ルール。
@@ -224,8 +245,9 @@ pub struct PathRule {
 
 /// Landlock では狭められない制限（祖先ルールがより広い権利を与えている）。
 ///
-/// 書き込み系の権利が広がる場合は記録せず拒否する（[`LandlockRuleErrorKind::WriteRestrictionShadowed`]）
-/// ため、ここに残るのは VFS の `noexec` / `nodev` が保護する実行・`IOCTL_DEV` の差分だけである。
+/// 書き込み系の権利が広がる場合は、検証済みの `ro` の bind（[`ShadowBacking::ReadOnlyBind`]）を除き記録せず拒否する
+/// （[`LandlockRuleErrorKind::WriteRestrictionShadowed`]）。それ以外に残るのは VFS の `noexec` / `nodev` が保護する
+/// 実行・`IOCTL_DEV` の差分（[`ShadowBacking::VfsExecDev`]）だけである。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ShadowedRestriction {
@@ -235,6 +257,21 @@ pub struct ShadowedRestriction {
     pub intended: AccessFs,
     /// 祖先ルールの和集合に対象ルール自身の許可を加えたもの（実際に効く権限）。
     pub effective: AccessFs,
+    /// Landlock で狭められない分を実際に止める裏付け。
+    pub backing: ShadowBacking,
+}
+
+/// [`ShadowedRestriction`] の制限を実際に担う裏付け（CORE-5・SEC-4・#1917）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShadowBacking {
+    /// VFS の `noexec` / `nodev`（実行・`IOCTL_DEV` の差分）。
+    VfsExecDev,
+    /// 検証済みの `ro` の bind mount の VFS の読み取り専用属性（書き込みの差分。`index` は `mounts[]` の位置）。
+    ReadOnlyBind {
+        /// config の `mounts` 内の位置。
+        index: usize,
+    },
 }
 
 /// 生成結果。
@@ -334,6 +371,17 @@ pub enum LandlockRuleErrorKind {
         /// config の `mounts` 内の位置。
         index: usize,
     },
+    /// 検証済みの bind の集合と `mounts[]` の解釈が食い違う（宛先の不一致、`ro` の spec なのにルールが `WRITE` を持つ）。
+    /// 2 つの解釈の不整合は内部不変条件違反として拒否する（fail-closed。#1917）。
+    VerifiedBindMismatch {
+        /// config の `mounts` 内の位置。
+        index: usize,
+    },
+    /// 許容した `ro` の bind の宛先より下に、書き込み可能なルールがある（読み取り専用が見かけだけになる）。
+    WritableBeneathReadOnlyBind {
+        /// 上位の `ro` の bind の `mounts` 内の位置。
+        index: usize,
+    },
 }
 
 impl LandlockRuleErrorKind {
@@ -345,6 +393,8 @@ impl LandlockRuleErrorKind {
             Self::RightsExceedHandled => "rights_exceed_handled",
             Self::WriteRestrictionShadowed { .. } => "write_restriction_shadowed",
             Self::ImplicitMountConflict { .. } => "implicit_mount_conflict",
+            Self::VerifiedBindMismatch { .. } => "verified_bind_mismatch",
+            Self::WritableBeneathReadOnlyBind { .. } => "writable_beneath_read_only_bind",
         }
     }
 }
@@ -390,6 +440,14 @@ impl LandlockRuleError {
                     "mounts[{index}] targets a mount point the runtime provides implicitly \
                      (/dev, /dev/pts or /dev/shm)"
                 ),
+            ),
+            LandlockRuleErrorKind::VerifiedBindMismatch { index } => (
+                ErrorCode::Internal,
+                format!("mounts[{index}] disagrees with the verified bind mount set"),
+            ),
+            LandlockRuleErrorKind::WritableBeneathReadOnlyBind { index } => (
+                ErrorCode::InvalidArgument,
+                format!("a writable rule lies beneath the read-only bind mounts[{index}]"),
             ),
         };
         Self {
@@ -550,7 +608,7 @@ pub fn build_path_rules(
 /// `ImplicitDevMounts::for_tmpfs_set` で実際に載せる tmpfs 集合から選ぶ（#1672 事後監査 P2）。どの variant でも、
 /// 暗黙分のパスが実際に期待する fs の独立したマウントであることは適用時に確かめる（`apply` の `check_implicit_mount`）。
 ///
-/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。本番の launcher は `All` を使う）向けで、
+/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。配線しないと #2700 で決定。本番の launcher は `All` を使う）向けで、
 /// ルールが減るだけで権利は広がらない。このとき `mounts` は上限 +3 件まで通るが、`mounts[]` の件数は
 /// config のパース時に [`CONFIG_MAX_MOUNTS`] で制限済みのため確保量は抑えられる。
 ///
@@ -561,17 +619,62 @@ pub fn build_path_rules_with_dev(
     mounts: &[OciMount],
     implicit: ImplicitDevMounts,
 ) -> Result<LandlockRuleset, LandlockRuleError> {
+    // 公開の入口は検証済みの bind の集合を持たないため空を渡す（`ro` の bind は拒否のまま。#1917）。
+    build_path_rules_with_user_tmpfs(
+        support,
+        root,
+        mounts,
+        &[],
+        implicit,
+        &BindMountSet::default(),
+    )
+}
+
+/// [`build_path_rules_with_dev`] に利用者指定の tmpfs（`--tmpfs`。暗黙の `/dev/shm` を除く）を足せる版
+/// （SUP-12・CORE-5・#2625）。
+///
+/// 利用者 tmpfs は `mounts[]` の後に重ね、ルールの由来は [`RuleOrigin::UserTmpfs`]（`mounts[]` の位置は持たない）。
+/// `ro` の tmpfs はルールを作らない: 書き込み可能な祖先（root）の下では Landlock で書き込みを狭められず
+/// `WriteRestrictionShadowed` になるだけで、書き込みの禁止は VFS の `ro` が担う（`/sys` の sysfs と同じ扱い）。
+/// 件数は `mounts` と別枠で [`TMPFS_MAX_MOUNTS`] まで許す。
+///
+/// `binds` は start が検証し launcher が適用する bind の集合（`spec.bind_mounts()`）。書き込み可能な祖先の下の
+/// `ro` の mount は、`binds` に同じ `index` の `read_only()` の spec があり、宛先が一致し、ルール自身が `WRITE` を
+/// 持たない場合に限り許容する（#1917）。理由と残余は [`requires_read_only_mount`] の doc を参照。
+pub(crate) fn build_path_rules_with_user_tmpfs(
+    support: &LandlockSupport,
+    root: &OciRoot,
+    mounts: &[OciMount],
+    user_tmpfs: &[OciMount],
+    implicit: ImplicitDevMounts,
+    binds: &BindMountSet,
+) -> Result<LandlockRuleset, LandlockRuleError> {
     let handled = handled_for_abi(support.abi.get());
     let implicit_mounts = implicit.entries();
     let count = mounts
         .len()
+        .saturating_add(user_tmpfs.len())
         .saturating_add(1)
         .saturating_add(implicit_mounts.len());
-    if count > MAX_LANDLOCK_RULES {
+    // `mounts[]` 側（root・暗黙分を含む）と利用者 tmpfs 側は別枠で検証する（片方の余りでもう片方の超過を通さない）。
+    let base = mounts
+        .len()
+        .saturating_add(1)
+        .saturating_add(implicit_mounts.len());
+    let base_max = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
+    if base > base_max {
         return Err(LandlockRuleError::new(
             LandlockRuleErrorKind::TooManyRules {
-                count,
-                max: MAX_LANDLOCK_RULES,
+                count: base,
+                max: base_max,
+            },
+        ));
+    }
+    if user_tmpfs.len() > TMPFS_MAX_MOUNTS {
+        return Err(LandlockRuleError::new(
+            LandlockRuleErrorKind::TooManyRules {
+                count: user_tmpfs.len(),
+                max: TMPFS_MAX_MOUNTS,
             },
         ));
     }
@@ -588,7 +691,9 @@ pub fn build_path_rules_with_dev(
             origin: RuleOrigin::Implicit { mount },
         });
     }
-    for (index, m) in mounts.iter().enumerate() {
+    let user_start = mounts.len();
+    for (index, m) in mounts.iter().chain(user_tmpfs).enumerate() {
+        let is_user_tmpfs = index >= user_start;
         let dest = m.mount_destination();
         let len = dest.as_str().len();
         if len > CONFIG_MAX_PATH_BYTES {
@@ -619,18 +724,48 @@ pub fn build_path_rules_with_dev(
         if OciMountKind::of(m) == OciMountKind::Sysfs && dest.as_str() == "/sys" {
             continue;
         }
+        if is_user_tmpfs && m.options().iter().any(|o| o == "ro") {
+            continue;
+        }
         rules.push(PathRule {
             path: RulePath::Beneath(dest.clone()),
             allowed: mount_rights(m),
-            origin: RuleOrigin::Mount { index },
+            origin: if is_user_tmpfs {
+                RuleOrigin::UserTmpfs
+            } else {
+                RuleOrigin::Mount { index }
+            },
         });
     }
 
     let mut shadowed = Vec::new();
+    // 許容した `ro` の bind の宛先（後段の「配下に書き込み可能なルールが無い」検査用）。
+    let mut readonly_binds: Vec<(usize, String)> = Vec::new();
     for r in &rules {
         // rootfs には祖先が無い。
         if r.origin == RuleOrigin::Root {
             continue;
+        }
+        // 検証済みの bind の集合と `mounts[]` の解釈の照合（宛先、`ro` なのに `WRITE` を持つルール）。
+        let verified = match r.origin {
+            RuleOrigin::Mount { index } => binds
+                .mounts()
+                .iter()
+                .find(|b| b.index() == index)
+                .map(|b| (index, b)),
+            _ => None,
+        };
+        if let Some((index, spec)) = verified {
+            let dest_matches = mounts
+                .get(index)
+                .is_some_and(|m| m.mount_destination().as_str() == spec.destination().as_str());
+            let write_matches =
+                !spec.read_only() || r.allowed.intersection(AccessFs::WRITE).is_empty();
+            if !dest_matches || !write_matches {
+                return Err(LandlockRuleError::new(
+                    LandlockRuleErrorKind::VerifiedBindMismatch { index },
+                ));
+            }
         }
         let effective = rules
             .iter()
@@ -639,7 +774,6 @@ pub fn build_path_rules_with_dev(
         let widened = effective.difference(r.allowed);
         let granted_writes = widened.intersection(AccessFs::WRITE);
         if !granted_writes.is_empty() {
-            // Landlock は祖先の許可を子で取り消せないため、書き込み制限を黙って失わせず拒否する。
             // 暗黙分は 3 本とも `WRITE` を持つので構造上ここへ来ない。来たら内部不変条件違反として扱う
             // （`index` は `mounts[]` の位置を表すため暗黙分には流用しない）。
             let RuleOrigin::Mount { index } = r.origin else {
@@ -647,6 +781,18 @@ pub fn build_path_rules_with_dev(
                     LandlockRuleErrorKind::RightsExceedHandled,
                 ));
             };
+            // 例外は検証済みの `ro` の bind だけ。書き込みの禁止は載せた bind の VFS の ro が担う（#1917）。
+            if verified.is_some_and(|(_, spec)| spec.read_only()) {
+                readonly_binds.push((index, r.path.as_str().to_owned()));
+                shadowed.push(ShadowedRestriction {
+                    path: r.path.clone(),
+                    intended: r.allowed,
+                    effective,
+                    backing: ShadowBacking::ReadOnlyBind { index },
+                });
+                continue;
+            }
+            // Landlock は祖先の許可を子で取り消せないため、書き込み制限を黙って失わせず拒否する。
             return Err(LandlockRuleError::new(
                 LandlockRuleErrorKind::WriteRestrictionShadowed {
                     index,
@@ -659,7 +805,20 @@ pub fn build_path_rules_with_dev(
                 path: r.path.clone(),
                 intended: r.allowed,
                 effective,
+                backing: ShadowBacking::VfsExecDev,
             });
+        }
+    }
+    // 多重防御: `ro` の bind の下に書き込み可能なルールがあると、読み取り専用が見かけだけになる。
+    // bind 同士の入れ子・tmpfs・注入・保護パスとの重なりは上流が止めるが、生成器は公開 API なのでここでも閉じる。
+    for (index, dest) in &readonly_binds {
+        if rules.iter().any(|q| {
+            is_ancestor(dest, q.path.as_str())
+                && !q.allowed.intersection(AccessFs::WRITE).is_empty()
+        }) {
+            return Err(LandlockRuleError::new(
+                LandlockRuleErrorKind::WritableBeneathReadOnlyBind { index: *index },
+            ));
         }
     }
 
@@ -678,6 +837,43 @@ pub fn build_path_rules_with_dev(
         shadowed,
         audit: support.audit_mode(),
     })
+}
+
+/// `rules[i]` が「祖先の書き込み権を VFS の読み取り専用属性で打ち消す」ルールか（#1917）。
+///
+/// 条件は、由来が `Mount` で、自身が `WRITE` を持たず、祖先ルールの和集合が `WRITE` を含むこと。この形のルールは
+/// 生成器が検証済みの `ro` の bind（[`BindMountSet`] の spec と一致）を許容したときだけ作るので、launch の記録から
+/// 組み直した ruleset でも同じ判定ができる（`state.json` の形式は変えない）。適用の段（`apply`）はこのルールが指す
+/// マウントが実際に読み取り専用であること（`fstatfs` の `ST_RDONLY`）を `landlock_add_rule` の前に確かめる。
+///
+/// # 読み取り専用を外せないことの根拠（CORE-5・SEC-1・REPAIR-3）
+///
+/// - bind は PID 1 が `unshare(CLONE_NEWNS)` の**後**に自分の mount namespace で作るため `MNT_LOCKED` ではなく、
+///   ホストから引き継いだマウントより根拠が弱い。user namespace の root は自分の namespace のマウントの ro を
+///   `mount_setattr` で外せる（`exec/sysfs.rs` の実測と同じ構造）
+/// - よって防御は 2 本に依存する: (1) 能力の削減の段で許可集合に `CAP_SYS_ADMIN` が無いこと、(2) 既定の seccomp が
+///   `mount`・`umount2`・`open_tree`・`move_mount`・`fsopen`・`fsconfig`・`fsmount`・`fspick`・`mount_setattr` を拒否すること。
+///   両段は `StagePipeline` の組み込みの固定段でフックでは差し替えられず、exec の再適用も同じ集合で掛ける
+/// - rootful（user namespace なし）は bind を受けない（`exec/bind_mounts.rs` の `user_namespace_required`）
+/// - 書き込みの open は VFS の読み取り専用の検査が Landlock の `file_open` より先に走り `EROFS` になる見込み
+///   （実機での確認は #1916）
+///
+/// 残余: マウント元の別名は検出しない（同じホストのディレクトリを rw の別の bind でも公開する場合、元が書き込み可能な
+/// rootfs の配下にあり rootfs 側から同じデータへ書ける場合）。これは宛先への書き込み禁止という VFS の ro の意味を
+/// 超えたデータの別名の問題で、別途追跡する。
+pub(crate) fn requires_read_only_mount(rules: &[PathRule], i: usize) -> bool {
+    let Some(r) = rules.get(i) else {
+        return false;
+    };
+    if !matches!(r.origin, RuleOrigin::Mount { .. })
+        || !r.allowed.intersection(AccessFs::WRITE).is_empty()
+    {
+        return false;
+    }
+    rules
+        .iter()
+        .filter(|a| is_ancestor(a.path.as_str(), r.path.as_str()))
+        .any(|a| !a.allowed.intersection(AccessFs::WRITE).is_empty())
 }
 
 /// [`build_path_rules`] の `OciConfig` 版の薄いラッパー（暗黙の `/dev` 系を含める。#1657）。
@@ -1155,7 +1351,336 @@ mod tests {
         );
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
-        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+        assert_eq!(MAX_LANDLOCK_RULES, 1092);
+    }
+
+    /// 検証済みの bind の集合を渡して生成する（本番の launcher と同じ経路。#1917）。
+    fn build_verified(
+        c: &OciConfig,
+        implicit: ImplicitDevMounts,
+    ) -> Result<LandlockRuleset, LandlockRuleError> {
+        let s = evaluate_abi(6).expect("abi6");
+        let binds = BindMountSet::from_mounts(c.mounts()).expect("bind accepted");
+        build_path_rules_with_user_tmpfs(&s, c.root(), c.mounts(), &[], implicit, &binds)
+    }
+
+    fn ro_bind(opts: Value) -> Value {
+        json!([{"destination": "/data", "type": "bind", "source": "/srv/data", "options": opts}])
+    }
+
+    /// CORE-5・OCI-4・#1917: 書き込み可能な root の下の検証済みの `ro` の bind を受け、`ReadOnlyBind` で記録する
+    /// （ルールは残る。`bind` / `rbind` ・`noexec` の併用、暗黙の `/dev` の有無のどちらでも同じ）。
+    #[test]
+    fn core5_1917_verified_readonly_bind_is_accepted_under_writable_root() {
+        for implicit in [ImplicitDevMounts::None, ImplicitDevMounts::All] {
+            for (opts, intended) in [
+                (json!(["bind", "ro"]), 0x000Du64),
+                (json!(["rbind", "ro"]), 0x000D),
+                (json!(["bind", "ro", "noexec"]), 0x000C),
+            ] {
+                let c = cfg(false, ro_bind(opts.clone()));
+                let rs = build_verified(&c, implicit).expect("accepted");
+                assert_eq!(rule(&rs, "/data").allowed.bits(), intended, "{opts}");
+                assert_eq!(
+                    rs.shadowed()
+                        .iter()
+                        .filter(|s| s.path.as_str() == "/data")
+                        .map(|s| (s.intended.bits(), s.effective.bits(), s.backing))
+                        .collect::<Vec<_>>(),
+                    vec![(intended, 0x77BF, ShadowBacking::ReadOnlyBind { index: 0 })],
+                    "{opts}"
+                );
+                let i = rs
+                    .rules()
+                    .iter()
+                    .position(|r| r.path.as_str() == "/data")
+                    .expect("rule");
+                assert!(requires_read_only_mount(rs.rules(), i));
+            }
+        }
+    }
+
+    /// CORE-5・#1917: 読み取り専用の root の下では記録も要らない（shadowed は空）。`requires_read_only_mount` は偽。
+    #[test]
+    fn core5_1917_readonly_bind_under_readonly_root_records_nothing() {
+        let c = cfg(true, ro_bind(json!(["bind", "ro"])));
+        let rs = build_verified(&c, ImplicitDevMounts::None).expect("accepted");
+        assert!(rs.shadowed().is_empty());
+        assert!(
+            !(0..rs.rules().len()).any(|i| requires_read_only_mount(rs.rules(), i)),
+            "{:?}",
+            rs.rules()
+        );
+    }
+
+    /// CORE-5・#1917: 集合に `index` が無い（空の集合）なら、従来どおり `WriteRestrictionShadowed`。
+    #[test]
+    fn core5_1917_readonly_bind_without_matching_spec_is_refused() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(false, ro_bind(json!(["bind", "ro"])));
+        let e = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            c.mounts(),
+            &[],
+            ImplicitDevMounts::None,
+            &BindMountSet::default(),
+        )
+        .expect_err("empty set");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::WriteRestrictionShadowed {
+                index: 0,
+                granted: AccessFs::WRITE
+            }
+        );
+        // 公開の入口（config だけ）も同じ。
+        let e = build_path_rules_with_dev(&s, c.root(), c.mounts(), ImplicitDevMounts::None)
+            .expect_err("public entry");
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    /// CORE-5・#1917: 宛先が食い違う集合（別の config から作った集合）は `VerifiedBindMismatch`（`Internal`）。
+    #[test]
+    fn core5_1917_mismatched_verified_set_is_internal_error() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(false, ro_bind(json!(["bind", "ro"])));
+        let other = cfg(
+            false,
+            json!([{"destination": "/other", "type": "bind", "source": "/srv/o", "options": ["bind", "ro"]}]),
+        );
+        let binds = BindMountSet::from_mounts(other.mounts()).expect("bind accepted");
+        let e = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            c.mounts(),
+            &[],
+            ImplicitDevMounts::None,
+            &binds,
+        )
+        .expect_err("mismatch");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::VerifiedBindMismatch { index: 0 }
+        );
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert_eq!(e.kind.as_str(), "verified_bind_mismatch");
+        // spec が `ro` なのにルールが `WRITE` を持つ（`rw` の config に `ro` の集合を当てた）場合も同じ。
+        let rw = cfg(false, ro_bind(json!(["bind", "rw"])));
+        let ro_set = BindMountSet::from_mounts(c.mounts()).expect("bind accepted");
+        let e = build_path_rules_with_user_tmpfs(
+            &s,
+            rw.root(),
+            rw.mounts(),
+            &[],
+            ImplicitDevMounts::None,
+            &ro_set,
+        )
+        .expect_err("ro spec with writable rule");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::VerifiedBindMismatch { index: 0 }
+        );
+    }
+
+    /// CORE-5・#1917: 許容した `ro` の bind の下に書き込み可能なルール（利用者 tmpfs）があれば拒否する。
+    #[test]
+    fn core5_1917_writable_rule_beneath_readonly_bind_is_refused() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(false, ro_bind(json!(["bind", "ro"])));
+        let binds = BindMountSet::from_mounts(c.mounts()).expect("bind accepted");
+        let tmp = cfg(
+            false,
+            json!([{"destination": "/data/tmp", "type": "tmpfs", "options": ["rw", "nosuid", "nodev"]}]),
+        );
+        let e = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            c.mounts(),
+            tmp.mounts(),
+            ImplicitDevMounts::None,
+            &binds,
+        )
+        .expect_err("writable beneath ro bind");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::WritableBeneathReadOnlyBind { index: 0 }
+        );
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        assert_eq!(e.kind.as_str(), "writable_beneath_read_only_bind");
+    }
+
+    /// CORE-5・#1917: `requires_read_only_mount` の真理値表（読み取り専用の root・Implicit・UserTmpfs・rw の Mount は偽）。
+    #[test]
+    fn core5_1917_requires_read_only_mount_truth_table() {
+        let c = cfg(false, ro_bind(json!(["bind", "ro"])));
+        let rs = build_verified(&c, ImplicitDevMounts::All).expect("accepted");
+        let got: Vec<(String, bool)> = rs
+            .rules()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    r.path.as_str().to_owned(),
+                    requires_read_only_mount(rs.rules(), i),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/".to_owned(), false),
+                ("/dev".to_owned(), false),
+                ("/dev/pts".to_owned(), false),
+                ("/dev/shm".to_owned(), false),
+                ("/data".to_owned(), true),
+            ]
+        );
+        assert!(!requires_read_only_mount(rs.rules(), 99));
+    }
+
+    /// SUP-12・CORE-5(#2625): 利用者 tmpfs は `UserTmpfs` 由来で書き込み可能に載り、`ro` は書き込み可能な root の下でも
+    /// `WriteRestrictionShadowed` にならずルールを作らない。件数は `mounts[]` と別枠。
+    #[test]
+    fn sup12_user_tmpfs_rules_are_separate_origin_and_ro_is_skipped() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(
+            false,
+            json!([
+                {"destination": "/run", "type": "tmpfs", "options": ["rw", "nosuid", "nodev"]},
+                {"destination": "/ro", "type": "tmpfs", "options": ["ro", "nosuid", "nodev"]}
+            ]),
+        );
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            c.mounts(),
+            ImplicitDevMounts::None,
+            &BindMountSet::default(),
+        )
+        .expect("rules");
+        let got: Vec<(&str, RuleOrigin)> = rs
+            .rules()
+            .iter()
+            .map(|r| (r.path.as_str(), r.origin))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("/", RuleOrigin::Root), ("/run", RuleOrigin::UserTmpfs)]
+        );
+        let many = vec![c.mounts()[0].clone(); TMPFS_MAX_MOUNTS + 1];
+        let e = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            &many,
+            ImplicitDevMounts::None,
+            &BindMountSet::default(),
+        )
+        .expect_err("over tmpfs limit");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::TooManyRules {
+                count: TMPFS_MAX_MOUNTS + 1,
+                max: TMPFS_MAX_MOUNTS
+            }
+        );
+        // mounts[] が上限ちょうどでも、利用者 tmpfs を足して拒否されない。
+        let full = vec![c.mounts()[0].clone(); CONFIG_MAX_MOUNTS];
+        build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &full,
+            &c.mounts()[..1],
+            ImplicitDevMounts::All,
+            &BindMountSet::default(),
+        )
+        .expect("mounts at limit plus tmpfs");
+    }
+
+    /// SUP-12・CORE-5・SEC-2(#2714): 読み取り専用 root では、利用者の rw tmpfs の宛先と暗黙の `/dev` 系だけが
+    /// 書き込み可能になり、`/` は READ のまま。`ro` の利用者 tmpfs はルールを作らない。
+    #[test]
+    fn sup12_readonly_root_user_tmpfs_is_the_only_extra_writable_path() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(true, json!([]));
+        let tmpfs = |dest: &str, opts: Value| {
+            parse_config_bytes(
+                json!({"ociVersion": "1.2.0", "root": {"path": "rootfs"},
+                       "mounts": [{"destination": dest, "type": "tmpfs", "options": opts}]})
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("valid config")
+            .mounts()[0]
+                .clone()
+        };
+        let rw = ["rw", "nosuid", "nodev", "noexec"];
+        let run = tmpfs("/run", json!(rw));
+        let dev = |m| RuleOrigin::Implicit { mount: m };
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            std::slice::from_ref(&run),
+            ImplicitDevMounts::All,
+            &BindMountSet::default(),
+        )
+        .expect("rules");
+        assert_eq!(
+            summary(&rs),
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/dev", dev(ImplicitDevMount::Dev), 0xF7BF),
+                ("/dev/pts", dev(ImplicitDevMount::DevPts), 0xF7BE),
+                ("/dev/shm", dev(ImplicitDevMount::DevShm), 0x77BE),
+                ("/run", RuleOrigin::UserTmpfs, 0x77BE),
+            ]
+        );
+        assert_eq!(
+            shadowed_summary(&rs),
+            vec![
+                ("/dev/pts", 0xF7BE, 0xF7BF),
+                ("/dev/shm", 0x77BE, 0xF7BF),
+                ("/run", 0x77BE, 0x77BF),
+            ]
+        );
+        // WRITE を 1 ビットでも持つ宛先は、暗黙の /dev 系と利用者 tmpfs だけ。
+        let writable: Vec<&str> = rs
+            .rules()
+            .iter()
+            .filter(|r| !r.allowed.intersection(AccessFs::WRITE).is_empty())
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(writable, vec!["/dev", "/dev/pts", "/dev/shm", "/run"]);
+        assert!(
+            rule(&rs, "/")
+                .allowed
+                .intersection(AccessFs::WRITE)
+                .is_empty()
+        );
+
+        // ro の利用者 tmpfs と、2 件目の rw tmpfs。
+        let ro = tmpfs("/ro", json!(["ro", "nosuid", "nodev"]));
+        let cache = tmpfs("/var/cache", json!(rw));
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            &[ro, run, cache],
+            ImplicitDevMounts::None,
+            &BindMountSet::default(),
+        )
+        .expect("rules");
+        assert_eq!(
+            summary(&rs),
+            vec![
+                ("/", RuleOrigin::Root, 0x000D),
+                ("/run", RuleOrigin::UserTmpfs, 0x77BE),
+                ("/var/cache", RuleOrigin::UserTmpfs, 0x77BE),
+            ]
+        );
     }
 
     /// CORE-5（#1657）: 暗黙分を含めない版は root のみで、上限は暗黙分を含めた値のまま。
@@ -1164,7 +1689,7 @@ mod tests {
         let rs = build(&cfg(true, json!([])));
         assert_eq!(summary(&rs), vec![("/", RuleOrigin::Root, 0x000D)]);
         assert!(rs.shadowed().is_empty());
-        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+        assert_eq!(MAX_LANDLOCK_RULES, 1092);
     }
 
     /// CORE-5（#1657）: `mounts[]` が空でも暗黙の `/dev` 系のルールが具体的な権利で付く。

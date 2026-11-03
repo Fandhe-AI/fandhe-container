@@ -8,7 +8,7 @@ rootless の `/sys`（ホストの `/sys` の読み取り専用 rbind）を実�
 
 - `crates/core/src/exec/sysfs.rs` の rootless 経路（`SysfsSource::HostReadOnlyRbind`。本番の `start` は常にここを通る）は、`open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)` でホストの `/sys` を複製し、`mount_setattr` で再帰の `ro,noexec` を付けてから載せる
 - 疑い（P2-1）: unshare した時点でホストの `/sys` が rw なら、複製に後から付けた ro には `MNT_LOCK_READONLY` が立たない見込みである。そうなら、user namespace の root（`CAP_SYS_ADMIN` あり・seccomp なし）は `mount_setattr` で ro を外せる。いまコンテナ内から外されないのは、SEC-1 の capability 削減と seccomp による `mount_setattr` の拒否（`ERRNO(EPERM)`）だけに頼っているためである
-- これはカーネルソース（`fs/namespace.c` の `lock_mnt_tree`・`clone_mnt`・`mount_setattr_prepare`・`can_change_locked_flags`）との照合を済ませていない推論である。本書の測定で確かめる。結果が出るまで `sysfs.rs` の docs には確定事項として書かない
+- これはカーネルソース（`fs/namespace.c` の `lock_mnt_tree`・`clone_mnt`・`mount_setattr_prepare`・`can_change_locked_flags`）との照合を済ませていない推論である。本書の測定で確かめる。ホステッド runner での初回の観測が出たため、`sysfs.rs` の docs は #2789 で観測結果に更新した（下記「`platform-ci` での継続観測」）。人間の実機（rootful 経路・別カーネル）の確認は引き続き必要で、本書の結果記録を置き換えない
 - 測定は結合試験 `tests/sysfs_mount.rs` のシナリオ `ro-clear`（`escape-probe` feature 限定の試験用入口 `probe_clear_sysfs_readonly_for_test`）が行う。従来の `default` シナリオ（P2-3: rootless 実機での `sysfs_mount` の初回実行）と同じ 1 コマンドで両方の観測値が得られる
 
 ## 事前確認
@@ -91,7 +91,29 @@ sysfs_mount: ro-clear on /sys top mount (stack=<N>): undefended=<0|errno>, defen
 - 判定: <外せた／外せなかった>
 ```
 
+## `platform-ci` での継続観測（ホステッド runner）
+
+`platform-ci (ubuntu-latest)` の `sysfs_mount の実行` ステップが PR・main ごとに `--ignored` で `sysfs_mount` を回し、成功行 3 本を照合して step summary に `kernel:` と観測行を出す（#2533・PR #2781）。`ro-clear` の `defended errno=1` の照合は、/sys の ro を保つ前提（`CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否）が崩れたことの検出に使われる（#2789）。
+
+初回の観測値（PR #2781・run 40271388345。GitHub ホステッド runner。イメージ ubuntu-24.04 / 20261012.334.1。カーネル 6.17.0-1022-azure はイメージのリリースノートからの転記で、step summary の `kernel:` 行の確認は人間が行う）:
+
+| 項目 | 値 |
+| ---- | -- |
+| host /sys read-only | false |
+| sys_stack | 2 |
+| top_opts | `ro,nosuid,nodev,noexec,relatime` |
+| ro_clear_errno（防御なし） | 0 |
+| top_ro_after_clear | false |
+| children_after_clear | 19 |
+| children_ro_after_clear | true |
+| open_w_errno_after_clear | 4 パスとも 13（`EACCES`） |
+| ro_clear_defended_errno（防御あり） | 1（`EPERM`） |
+
+予測表との対応: rw ホストで「0（外せる）」の予測は一致した。`cgroup.procs` は予測の 30（`EROFS`）ではなく 13（`EACCES`）で、DAC の検査が先に効いたと見られる。これはホステッド runner の 1 回分の観測であり、本書の結果記録（人間の実機）を置き換えない。
+
 ## 外せた場合（`ro_clear_errno=0`）の起票文の下書き
+
+> #2789 として起票済み（2026-10-26。ホステッド runner の観測に基づく）。以下は人間の実機で外せた場合の下書きとして残す。
 
 条件 3 のとき、次の issue を起票する（起票は人間の承認を経る）。
 

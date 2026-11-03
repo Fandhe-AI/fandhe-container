@@ -31,9 +31,10 @@
 //! `create_new`（`O_EXCL`）で開くため既存のファイルや symlink を辿らない。FS 操作の期限（REPAIR-5）は
 //! ホスト側の `FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS` が担う（PID 1 にスレッドを足さない）。
 //!
-//! # 未実装（REPAIR-3）
+//! # 他のモード
 //!
-//! symlink・ハードリンクの観測モードは #1877 が [`TestMode`] に variant を足して実装する。
+//! symlink・ハードリンクの観測モード `virtiofs-link` は [`TestMode::VirtiofsLink`] で、行の生成は
+//! [`crate::link_probe`]（#1877）。両モードは値が排他（トークンは 1 個）で、同時には走らない。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -47,6 +48,8 @@ use crate::report::{MAX_PROBE_LINE_BYTES, ProbeEntries, ProbeOp, ProbeValue, Rep
 pub const TEST_KEY: &str = "fandhe.guest-test=";
 /// virtiofs-io モードの値。ホストの `GuestTestMode::VirtiofsIo.token()` と同値。
 pub const TOKEN_VIRTIOFS_IO: &str = "virtiofs-io";
+/// virtiofs-link モードの値。ホストの `GuestTestMode::VirtiofsLink.token()` と同値。
+pub const TOKEN_VIRTIOFS_LINK: &str = "virtiofs-link";
 /// プローブ用の共有タグ。ホストの `guest_probe::SHARE_TAG` と同値。
 pub const SHARE_TAG: &str = "fandhe-io";
 /// プローブ用共有のゲスト内 mount point。ホストの `guest_probe::GUEST_MOUNT` と同値。
@@ -67,6 +70,8 @@ pub enum TestMode {
     Absent,
     /// virtiofs-io のプローブを要求している。
     VirtiofsIo,
+    /// virtiofs の symlink・ハードリンクの観測を要求している（[`crate::link_probe`]。#1877）。
+    VirtiofsLink,
     /// キーはあるが値が未知、またはトークンが 2 個以上（fail-closed でプローブを走らせない）。
     Invalid,
 }
@@ -79,6 +84,7 @@ pub fn decode_test_mode(cmdline: &str) -> TestMode {
     match (values.next(), values.next()) {
         (None, _) => TestMode::Absent,
         (Some(TOKEN_VIRTIOFS_IO), None) => TestMode::VirtiofsIo,
+        (Some(TOKEN_VIRTIOFS_LINK), None) => TestMode::VirtiofsLink,
         _ => TestMode::Invalid,
     }
 }
@@ -95,7 +101,8 @@ pub enum ProbePlan {
 /// 起動条件（キーと mount の AND）から計画を決める。`None` なら何も出さない。
 pub fn probe_plan(mode: TestMode, outcome: &ProcessOutcome) -> Option<ProbePlan> {
     match mode {
-        TestMode::Absent | TestMode::Invalid => None,
+        // virtiofs-link の観測は `link_probe::link_plan` が担う（io のプローブは走らせない）。
+        TestMode::Absent | TestMode::Invalid | TestMode::VirtiofsLink => None,
         TestMode::VirtiofsIo => {
             let mounted = outcome.mounted_directives.iter().any(|d| {
                 d.tag.as_str() == SHARE_TAG
@@ -203,14 +210,18 @@ mod tests {
     static N: AtomicU64 = AtomicU64::new(0);
 
     /// テストごとの一時ディレクトリ（Drop で削除）。
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
             let n = N.fetch_add(1, Ordering::Relaxed);
             let p =
                 std::env::temp_dir().join(format!("fandhe-guest-probe-{}-{n}", std::process::id()));
-            fs::create_dir_all(&p).unwrap();
-            Self(p)
+            Self::at(p)
+        }
+        /// 指定パスを第 1 候補に排他作成する。残骸は消さず別名で作る（REPAIR-12・#3475）。
+        fn at(p: PathBuf) -> Self {
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
         fn layout(&self) {
             fs::create_dir_all(self.0.join("in").join("dir")).unwrap();
@@ -221,10 +232,23 @@ mod tests {
             }
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+    /// MAC-1・REPAIR-12・#3475: 残骸（古い `out/` の中身）があっても消さず別名で作られ、
+    /// drop 後は別名だけが消えて残骸は無傷で残る。
+    #[test]
+    fn mac1_repair12_tmp_leaves_stale_residue_untouched() {
+        let parent = Tmp::new();
+        let p = parent.0.join("stale");
+        fs::create_dir_all(p.join("out")).unwrap();
+        fs::write(p.join("out").join("stale.txt"), "old").unwrap();
+        let rp;
+        {
+            let t = Tmp::at(p.clone());
+            rp = t.0.clone();
+            assert_ne!(t.0, p);
+            assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
         }
+        assert!(!rp.exists());
+        assert_eq!(fs::read(p.join("out").join("stale.txt")).unwrap(), b"old");
     }
 
     fn run(plan: ProbePlan, root: &Path) -> Vec<String> {
@@ -391,9 +415,16 @@ mod tests {
             "fandhe.guest-test=virtiofs-io fandhe.guest-test=virtiofs-io",
             "fandhe.guest-test=virtiofs-io fandhe.guest-test=other",
             "fandhe.guest-test=virtiofs-io2",
+            "fandhe.guest-test=virtiofs-io fandhe.guest-test=virtiofs-link",
+            "fandhe.guest-test=virtiofs-link fandhe.guest-test=virtiofs-link",
+            "fandhe.guest-test=virtiofs-linkx",
         ] {
             assert_eq!(decode_test_mode(bad), TestMode::Invalid, "{bad}");
         }
+        assert_eq!(
+            decode_test_mode("console=hvc0 fandhe.guest-test=virtiofs-link\n"),
+            TestMode::VirtiofsLink
+        );
         // キー名の一部だけが似ているトークンは無視する。
         assert_eq!(
             decode_test_mode("xfandhe.guest-test=virtiofs-io"),
@@ -426,6 +457,7 @@ mod tests {
         assert_eq!(probe_plan(TestMode::VirtiofsIo, &ok), Some(ProbePlan::Run));
         assert_eq!(probe_plan(TestMode::Absent, &ok), None);
         assert_eq!(probe_plan(TestMode::Invalid, &ok), None);
+        assert_eq!(probe_plan(TestMode::VirtiofsLink, &ok), None);
         for bad in [
             outcome(&[]),
             outcome(&[(SHARE_TAG, GUEST_MOUNT, ReadOnly)]),

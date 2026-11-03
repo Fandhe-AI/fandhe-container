@@ -35,9 +35,11 @@
 //!
 //! `body` を不透明なバイト列として追記するのはスタブの意味論であり
 //! （REPAIR-3）、ファイル操作（パス・rename・truncate 等。TASK-14 の整合性
-//! スイートが要する）をペイロードで表す形式は、今後のプロトコル拡張
-//! （IO-1 の I/O 契約変更。`PROTOCOL_VERSION` の繰り上げを伴いうる）として
-//! 別途扱う。
+//! スイートが要する）をペイロードで表す形式のうち作成・追記・Close・Nack は v2
+//! （`PROTOCOL_VERSION` 2。#3161）の符号化と復号が実装済みで、その処理は別モード
+//! （ファイル操作モード。[`crate::file_serve::serve_file_connection`]・#3163）が担う。
+//! 本関数は単一 sink モードで、v2 のファイル操作の種別を受けたら接続全体を
+//! `InvalidArgument` で終える（F3）。
 //!
 //! パスを持つ作成の入口は [`crate::guest_files::GuestFileCreator`]（TASK-19.2・
 //! IO-5・#100）で、サーバー側 API が大文字小文字衝突を検査したうえでファイルを
@@ -420,6 +422,59 @@ impl AppendFileSink {
         self
     }
 
+    /// 次の永続化の対象か（`serve_file_connection` の接続単位の FLUSH が使う。F9・IO-2）。
+    /// 書き込みが入った、または親ディレクトリのエントリが未同期なら真。
+    pub(crate) fn needs_persist(&self) -> bool {
+        self.dirty_since_persist || !self.parent_dirs_synced
+    }
+
+    /// 対象ファイルの複製ハンドル（接続単位の永続化に渡す。パスは再解決しない）。
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "macOS / Windows の接続単位の永続化だけが使う")
+    )]
+    pub(crate) fn clone_file_for_persist(&self) -> Result<File, IoError> {
+        self.file.try_clone().map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!("failed to duplicate handle for persist ({:?})", err.kind()),
+            )
+        })
+    }
+
+    /// 未同期の親ディレクトリの複製ハンドル。同期済みなら空。親ディレクトリを持たない sink は
+    /// 新規作成ファイルの名前を保証できないため `Unimplemented`（`persist` と同じ fail-closed）。
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "macOS / Windows の接続単位の永続化だけが使う")
+    )]
+    pub(crate) fn clone_unsynced_dirs_for_persist(&self) -> Result<Vec<File>, IoError> {
+        let Some(dirs) = self.parent_dirs.as_ref().filter(|dirs| !dirs.is_empty()) else {
+            return Err(IoError::new(
+                IoErrorCode::Unimplemented,
+                "parent directories are not configured; cannot persist the directory entry, refusing to send FlushAck",
+            ));
+        };
+        if self.parent_dirs_synced {
+            return Ok(Vec::new());
+        }
+        dirs.iter()
+            .map(File::try_clone)
+            .collect::<Result<Vec<File>, _>>()
+            .map_err(|err| {
+                IoError::new(
+                    IoErrorCode::Internal,
+                    format!("failed to duplicate directory handle ({:?})", err.kind()),
+                )
+            })
+    }
+
+    /// 接続単位の永続化が成功したことを記録する（以後の FLUSH は再同期しない）。
+    pub(crate) fn mark_persisted(&mut self) {
+        self.dirty_since_persist = false;
+        self.parent_dirs_synced = true;
+    }
+
     /// [`BatchSink::persist`] のタイムアウトを差し替える（既定は
     /// [`MAX_IO_TIMEOUT`]。REPAIR-5）。
     ///
@@ -470,6 +525,32 @@ impl BatchSink for AppendFileSink {
 
     fn persist(&mut self) -> Result<SinkPersistReport, IoError> {
         self.persist_with_support(crate::barrier::persist_support())
+    }
+}
+
+impl AppendFileSink {
+    /// `body` を現在の EOF へ 1 件追記し、書いたバイト数を返す（ファイル操作モード
+    /// `file_serve` の WriteFile 用。#3163）。
+    ///
+    /// `write_batch` と同じ契約を 1 件分で守る: 書き込み前に dirty を立て（途中失敗でも
+    /// 一部が書かれうる）、毎回 EOF へ位置合わせしてから書く（外部 truncate 後の穴を
+    /// 作らない。IO-4）。エラーにはパス・データの中身を載せない。
+    pub(crate) fn append_body(&mut self, body: &[u8]) -> Result<u64, IoError> {
+        self.dirty_since_persist = true;
+        self.file.seek(SeekFrom::End(0)).map_err(|err| {
+            IoError::new(
+                IoErrorCode::Internal,
+                format!(
+                    "sink seek to end failed ({:?}) before appending",
+                    err.kind()
+                ),
+            )
+        })?;
+        self.file
+            .write_all(body)
+            .map_err(|err| sink_error_from_io(&err, 1))?;
+        u64::try_from(body.len())
+            .map_err(|_| IoError::new(IoErrorCode::Internal, "body length does not fit in u64"))
     }
 }
 
@@ -623,8 +704,14 @@ pub(crate) enum LeafOpen {
     CreateOrAppend,
 }
 
-/// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か（`GuestFileCreator` の
-/// コンポーネント検証と同じ基準。3 OS で挙動を揃えるため `\`・`:` も拒否する）。
+/// [`AppendFileSink::open_in`] の `name` が単一の通常の名前か。
+///
+/// `guest_path::check_rules` の `HOST_NAME`（構造規則と禁止文字。3 OS で挙動を揃える
+/// ため `\`・`:` も拒否する）に加えて `/` を含まないことを求める（単一コンポーネント）。
+/// この条件を通る名前はどの OS でも `Path::components()` がちょうど 1 個の `Normal` に
+/// なる。`GUEST` の長さ上限（名前 255 バイト等）は意図して当てない: sink 名はホスト側の
+/// 信頼できる設定値で、NTFS・APFS は 255 バイトを超える多バイト名を作れ、長さの判定は
+/// ホスト FS に任せる（#3352・REPAIR-1）。
 fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
     let invalid = || {
         IoError::new(
@@ -632,14 +719,12 @@ fn validate_sink_file_name(name: &str) -> Result<(), IoError> {
             "sink file name must be a single normal path component",
         )
     };
-    if name.contains(['\\', ':', '\0']) {
+    crate::guest_path::check_rules(name, crate::guest_path::GuestPathRules::HOST_NAME)
+        .map_err(|_| invalid())?;
+    if name.contains('/') {
         return Err(invalid());
     }
-    let mut parts = Path::new(name).components();
-    match (parts.next(), parts.next()) {
-        (Some(std::path::Component::Normal(_)), None) => Ok(()),
-        _ => Err(invalid()),
-    }
+    Ok(())
 }
 
 /// `dir` を開き、そのハンドル相対で `name` を開く（[`AppendFileSink::open_in`] の OS 別
@@ -653,7 +738,7 @@ fn open_leaf_in_dir(dir: &Path, name: &str, mode: LeafOpen) -> Result<(File, Fil
         BeneathError::AlreadyExists => {
             IoError::new(IoErrorCode::AlreadyExists, "sink file already exists")
         }
-        BeneathError::AncestorNotDirectory => IoError::new(
+        BeneathError::AncestorSymlink | BeneathError::AncestorNotDirectory => IoError::new(
             IoErrorCode::InvalidArgument,
             "sink directory is not a directory",
         ),
@@ -1103,10 +1188,19 @@ where
                 }
                 stats.flush_acks_sent = stats.flush_acks_sent.saturating_add(1);
             }
-            FrameKind::Ack | FrameKind::FlushAck => {
+            FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => {
                 let err = IoError::new(
                     IoErrorCode::InvalidArgument,
-                    "client must not send Ack/FlushAck frames to the writeback server",
+                    "client must not send Ack/FlushAck/Nack frames to the writeback server",
+                );
+                return finish(stats, &buffer, err);
+            }
+            // ファイル操作の種別はファイル操作モード（#3163）専用で、単一 sink モード
+            // には合わない（F3）。接続全体の InvalidArgument として終える。
+            FrameKind::Create | FrameKind::WriteFile | FrameKind::Close => {
+                let err = IoError::new(
+                    IoErrorCode::InvalidArgument,
+                    "file operation frames are not accepted in single-sink mode",
                 );
                 return finish(stats, &buffer, err);
             }
@@ -1327,6 +1421,30 @@ mod tests {
         assert_eq!(sink.calls, 0, "malformed flush must not trigger a write");
         assert_eq!(report.stats.discarded_pending_frames, 1);
         assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+    }
+
+    /// IO-1・REPAIR-2・#3161（F3）: 単一 sink モードにファイル操作の種別
+    /// （Create・WriteFile・Close）が届いたら、応答 0 件で接続全体が
+    /// `InvalidArgument` として終わる。
+    #[test]
+    fn io1_single_sink_mode_rejects_file_operation_frames() {
+        let frames_per_kind = [
+            Frame::new(FrameKind::Create, vec![0u8; 12]).expect("frame"),
+            Frame::new(FrameKind::WriteFile, vec![0u8; 17]).expect("frame"),
+            Frame::new(FrameKind::Close, vec![0u8; 16]).expect("frame"),
+        ];
+        for frame in frames_per_kind {
+            let mut conn = FakeTransport::new(vec![frame]);
+            let mut sink = FakeSink::new();
+            let config = BatchConfig::new(4).expect("4 must be valid");
+
+            let report = serve_connection(&mut conn, config, &mut sink, timeouts());
+
+            assert_eq!(report.stats.acks_sent, 0);
+            assert_eq!(sink.calls, 0);
+            assert_eq!(report.end.code(), IoErrorCode::InvalidArgument);
+            assert!(report.end.message().contains("single-sink"));
+        }
     }
 
     /// IO-1・REPAIR-2（Codex #822 レビュー指摘）: request id に続けて余分な
@@ -1935,12 +2053,36 @@ mod tests {
     }
 
     fn temp_append_sink(tag: &str) -> AppendFileSink {
-        let dir = std::env::temp_dir();
-        let name = format!("fandhe-io-{tag}-{}", std::process::id());
-        let sink = AppendFileSink::open_in(&dir, &name, SinkOpenMode::CreateOrTruncate)
-            .expect("sink must construct");
-        let _ = std::fs::remove_file(dir.join(&name));
-        sink
+        temp_append_sink_in(&std::env::temp_dir(), tag).1
+    }
+
+    /// `dir/fandhe-io-<tag>-<pid>-<n>` を `CreateNew` で作り、直後に unlink する。既存のパス
+    /// （通常ファイル・symlink）は切り詰めず辿らず、連番を進める（REPAIR-12・#3479）。
+    fn temp_append_sink_in(dir: &std::path::Path, tag: &str) -> (String, AppendFileSink) {
+        for n in 0..1000u32 {
+            let name = format!("fandhe-io-{tag}-{}-{n}", std::process::id());
+            match AppendFileSink::open_in(dir, &name, SinkOpenMode::CreateNew) {
+                Ok(sink) => {
+                    let _ = std::fs::remove_file(dir.join(&name));
+                    return (name, sink);
+                }
+                Err(e) if e.code() == IoErrorCode::AlreadyExists => continue,
+                Err(e) => panic!("sink must construct: {e:?}"),
+            }
+        }
+        panic!("too many stale test files");
+    }
+
+    /// 残骸を先に置いても切り詰めず、連番を進めて排他作成すること（IO-2・REPAIR-12・#3479）。
+    #[test]
+    fn io2_repair12_temp_append_sink_skips_stale_residue() {
+        let parent = crate::test_temp_file::TempDir::new("fcio-wb-residue");
+        let pid = std::process::id();
+        let stale = parent.path().join(format!("fandhe-io-r-{pid}-0"));
+        std::fs::write(&stale, b"stale").expect("stale");
+        let (name, _sink) = temp_append_sink_in(parent.path(), "r");
+        assert_eq!(name, format!("fandhe-io-r-{pid}-1"));
+        assert_eq!(std::fs::read(&stale).expect("read"), b"stale");
     }
 
     /// IO-2・TASK-15.2.2: 書き込みのない連続 persist は syncfs を再発行せず
@@ -2022,23 +2164,15 @@ mod tests {
     }
 
     /// 一時ディレクトリ（テストごとに一意）を作り、drop で消す。
-    struct TempDirGuard(std::path::PathBuf);
+    struct TempDirGuard(
+        std::path::PathBuf,
+        #[allow(dead_code)] crate::test_root::TestRoot,
+    );
     impl TempDirGuard {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "fcio-open-in-{tag}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).expect("temp dir");
-            Self(path)
-        }
-    }
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root("fcio-open-in", tag);
+            Self(root.to_path_buf(), root)
         }
     }
 
@@ -2081,7 +2215,9 @@ mod tests {
         let t = TempDirGuard::new("names");
         let inner = t.0.join("inner");
         std::fs::create_dir(&inner).expect("inner");
-        for name in ["", ".", "..", "../x", "a/b", "a\\b", "a:b", "a\0b"] {
+        for name in [
+            "", ".", "..", "../x", "a/b", "a\\b", "a:b", "a\0b", "a/", "a/.", "/a", "./a",
+        ] {
             assert_eq!(
                 AppendFileSink::open_in(&inner, name, SinkOpenMode::CreateOrTruncate)
                     .err()
@@ -2092,6 +2228,19 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&inner).expect("inner").count(), 0);
         assert_eq!(std::fs::read_dir(&t.0).expect("outer").count(), 1);
+    }
+
+    /// REPAIR-1: sink 名の規則集合（長さは見ない・禁止文字と構造規則と単一名）。
+    #[test]
+    fn io2_repair1_sink_name_rule_set() {
+        let long = "x".repeat(300);
+        for ok in ["out.bin", ".hidden", "...", "a b", "日本語", long.as_str()] {
+            assert!(validate_sink_file_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["", ".", "..", "a/b", "a/", "a\\b", "a:b", "a\0b"] {
+            let err = validate_sink_file_name(bad).expect_err(bad);
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{bad:?}");
+        }
     }
 
     /// IO-2・TASK-15.3: `open_in` は通常ファイル以外（ディレクトリ）を sink にしない。

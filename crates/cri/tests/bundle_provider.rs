@@ -11,10 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::oci_runtime;
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
-use fandhe_container_cri::bundle::{ImageDefaults, RootfsSource, SpecBundleProvider};
+use fandhe_container_cri::bundle::{
+    ImageDefaults, RootfsSource, SpecBundleProvider, UserResolveRequest,
+};
 use fandhe_container_cri::error::{CriError, CriErrorCode};
 use fandhe_container_cri::runtime::v1::{
-    ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig,
+    ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec, Int64Value, LinuxContainerConfig,
+    LinuxContainerSecurityContext, PodSandboxConfig, SupplementalGroupsPolicy,
 };
 
 struct TempDir(PathBuf);
@@ -51,16 +54,33 @@ struct FakeRootfs {
     prepares: AtomicUsize,
     releases: AtomicUsize,
     defaults: Mutex<ImageDefaults>,
+    /// 受け取った解決要求の run_as_username。
+    seen_username: Mutex<Option<String>>,
+    /// 真なら要求を解決して `resolved_run_as_username` を返す（偽は要求を無視する実装を模す）。
+    resolve_username: Mutex<Option<(u32, u32)>>,
+    /// 受け取った解決要求の (run_as_user, image_groups)（#2667）。
+    seen_groups_request: Mutex<Option<(Option<u32>, bool)>>,
 }
 
 impl RootfsSource for FakeRootfs {
-    fn prepare(&self, _image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError> {
+    fn prepare(
+        &self,
+        _image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+    ) -> Result<ImageDefaults, CriError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
+        *self.seen_username.lock().unwrap() = user.run_as_username.map(str::to_owned);
+        *self.seen_groups_request.lock().unwrap() = Some((user.run_as_user, user.image_groups));
         fs::create_dir(rootfs).map_err(|_| CriError::internal("rootfs"))?;
         if *self.fail_prepare.lock().unwrap() {
             return Err(CriError::resource_exhausted("no space"));
         }
-        Ok(self.defaults.lock().unwrap().clone())
+        let mut d = self.defaults.lock().unwrap().clone();
+        if user.run_as_username.is_some() {
+            d.resolved_run_as_username = *self.resolve_username.lock().unwrap();
+        }
+        Ok(d)
     }
     fn release(&self, rootfs: &Path) -> Result<(), CriError> {
         self.releases.fetch_add(1, Ordering::SeqCst);
@@ -97,6 +117,7 @@ fn setup(tag: &str) -> (TempDir, Arc<FakeRootfs>, SpecBundleProvider) {
 fn prepare(p: &SpecBundleProvider, id: &str, c: &ContainerConfig) -> Result<PathBuf, CriError> {
     let pod = PodSandboxConfig::default();
     p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+        .map(|b| b.path().to_path_buf())
 }
 
 fn mode(p: &Path) -> u32 {
@@ -119,6 +140,129 @@ fn prepare_creates_bundle_with_private_modes_and_a_parsable_config() {
         ["/bin/sh", "-c", "sleep 30"]
     );
     assert_eq!(rootfs.prepares.load(Ordering::SeqCst), 1);
+}
+
+/// CRI-2・SEC-5（#2664）: run_as_username が RootfsSource へ渡り、解決結果が config.json の process.user になる。
+#[test]
+fn run_as_username_is_resolved_through_the_rootfs_source() {
+    let (_tmp, rootfs, p) = setup("username");
+    *rootfs.resolve_username.lock().unwrap() = Some((1000, 1001));
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: "app".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let dir = prepare(&p, "ctr1", &c).expect("prepare");
+    assert_eq!(rootfs.seen_username.lock().unwrap().as_deref(), Some("app"));
+    oci_runtime::load_config(&dir.join("config.json")).expect("core parses config.json");
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(v["process"]["user"]["uid"], 1000);
+    assert_eq!(v["process"]["user"]["gid"], 1001);
+}
+
+/// CRI-2・SEC-5（#2667）: run_as_user と方針（Merge か Strict）が解決要求に載り、RootfsSource が返したイメージ由来の
+/// 補助グループが CRI の一覧に先立って config.json の additionalGids になる。Strict ではイメージ由来を使わない。
+#[test]
+fn supplemental_groups_request_and_merge_reach_the_config() {
+    let sc = |policy: SupplementalGroupsPolicy| LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_user: Some(Int64Value { value: 1000 }),
+            supplemental_groups: vec![70, 60],
+            supplemental_groups_policy: policy as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let gids = |dir: &Path| -> serde_json::Value {
+        let v: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        v["process"]["user"]["additionalGids"].clone()
+    };
+    let (_tmp, rootfs, p) = setup("groups-merge");
+    *rootfs.defaults.lock().unwrap() = ImageDefaults {
+        supplementary_gids: vec![50, 60],
+        ..Default::default()
+    };
+    let mut c = container();
+    c.linux = Some(sc(SupplementalGroupsPolicy::Merge));
+    let dir = prepare(&p, "ctr1", &c).expect("prepare");
+    assert_eq!(
+        *rootfs.seen_groups_request.lock().unwrap(),
+        Some((Some(1000), true))
+    );
+    assert_eq!(gids(&dir), serde_json::json!([50, 60, 70]));
+    oci_runtime::load_config(&dir.join("config.json")).expect("core parses config.json");
+
+    c.linux = Some(sc(SupplementalGroupsPolicy::Strict));
+    let dir = prepare(&p, "ctr2", &c).expect("prepare");
+    assert_eq!(
+        *rootfs.seen_groups_request.lock().unwrap(),
+        Some((Some(1000), false))
+    );
+    assert_eq!(gids(&dir), serde_json::json!([70, 60]));
+}
+
+/// CRI-2・OCI-1・SEC-5（#2771）: prepare の結果が、config.json に書いた識別情報と解決済みの stop signal を報告する。
+#[test]
+fn prepared_bundle_reports_the_applied_user_and_resolved_stop_signal() {
+    use fandhe_container_cri::adapter::PreparedBundle;
+    use fandhe_container_cri::runtime::v1::Signal;
+    let full = |p: &SpecBundleProvider, id: &str, c: &ContainerConfig| -> PreparedBundle {
+        let pod = PodSandboxConfig::default();
+        p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+            .expect("prepare")
+    };
+    let (_tmp, rootfs, p) = setup("report");
+    *rootfs.defaults.lock().unwrap() = ImageDefaults {
+        supplementary_gids: vec![50, 60],
+        stop_signal: Some(Signal::Sigint),
+        ..Default::default()
+    };
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_user: Some(Int64Value { value: 1000 }),
+            run_as_group: Some(Int64Value { value: 2000 }),
+            supplemental_groups: vec![70, 60],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    // CRI が RUNTIME_DEFAULT ならイメージの StopSignal。
+    let r = full(&p, "ctr1", &c);
+    let u = r.user().expect("user reported");
+    assert_eq!((u.uid(), u.gid()), (1000, 2000));
+    assert_eq!(u.additional_gids(), [50, 60, 70]);
+    assert_eq!(r.stop_signal(), Some(Signal::Sigint));
+    // CRI の明示値が優先される。
+    c.stop_signal = Signal::Sigkill as i32;
+    assert_eq!(full(&p, "ctr2", &c).stop_signal(), Some(Signal::Sigkill));
+    // イメージに値が無ければ SIGTERM。
+    *rootfs.defaults.lock().unwrap() = ImageDefaults::default();
+    c.stop_signal = 0;
+    assert_eq!(full(&p, "ctr3", &c).stop_signal(), Some(Signal::Sigterm));
+}
+
+/// CRI-2・SEC-5（#2664）: 解決要求を無視する実装では UNIMPLEMENTED で拒否し、bundle を残さない。
+#[test]
+fn run_as_username_without_resolution_is_rejected_and_rolled_back() {
+    let (tmp, rootfs, p) = setup("username-unresolved");
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: "app".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let e = prepare(&p, "ctr1", &c).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    assert_eq!(rootfs.releases.load(Ordering::SeqCst), 1);
+    assert!(!tmp.0.join("ctr1").exists());
 }
 
 #[test]
@@ -292,8 +436,13 @@ fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
     // 解放失敗時は資源を保持し、後続の release が回収する（rootfs 解放 → bundle 削除の順）。
     struct StickyRootfs(Arc<FakeRootfs>);
     impl RootfsSource for StickyRootfs {
-        fn prepare(&self, i: &ImageSpec, r: &Path) -> Result<ImageDefaults, CriError> {
-            self.0.prepare(i, r)
+        fn prepare(
+            &self,
+            i: &ImageSpec,
+            r: &Path,
+            u: &UserResolveRequest<'_>,
+        ) -> Result<ImageDefaults, CriError> {
+            self.0.prepare(i, r, u)
         }
         fn release(&self, _r: &Path) -> Result<(), CriError> {
             Err(CriError::internal("rootfs release"))
@@ -330,6 +479,152 @@ fn release_after_a_precheck_failure_keeps_an_existing_bundle_with_the_same_id() 
     assert!(tmp.0.join("ctr1/rootfs").is_dir());
 
     // 通常の release は消す。
+    p.release("ctr1").expect("release");
+    assert!(!dir.exists());
+}
+
+fn dns_pod() -> PodSandboxConfig {
+    PodSandboxConfig {
+        dns_config: Some(DnsConfig {
+            servers: vec!["10.0.0.10".into(), "2001:db8::1".into()],
+            searches: vec!["svc.cluster.local".into()],
+            options: vec!["ndots:5".into()],
+        }),
+        ..Default::default()
+    }
+}
+
+fn prepare_dns(p: &SpecBundleProvider, id: &str) -> Result<PathBuf, CriError> {
+    let pod = dns_pod();
+    p.prepare(&BundleRequest::new(id, "sb", &pod, &container()))
+        .map(|b| b.path().to_path_buf())
+}
+
+/// CRI-2・NET-5（#2665）: resolv.conf が 0644 で生成され、config.json の bind の source になる。
+#[test]
+fn dns_config_generates_resolv_conf_and_binds_it() {
+    let (_tmp, _rootfs, p) = setup("dns");
+    let dir = prepare_dns(&p, "ctr1").expect("prepare");
+    let resolv = dir.join("resolv.conf");
+    assert_eq!(mode(&resolv), 0o644);
+    assert_eq!(
+        fs::read_to_string(&resolv).unwrap(),
+        "# Generated by fandhe-container (CRI-2)\n\
+         nameserver 10.0.0.10\n\
+         nameserver 2001:db8::1\n\
+         search svc.cluster.local\n\
+         options ndots:5\n"
+    );
+    oci_runtime::load_config(&dir.join("config.json")).expect("core parses config.json");
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(v["mounts"][0]["destination"], "/etc/resolv.conf");
+    assert_eq!(v["mounts"][0]["source"], resolv.to_str().unwrap());
+}
+
+/// CRI-2・NET-5（#2665）: umask 077 のプロセスでも resolv.conf は 0644（非 root のコンテナ側が読める）。
+/// umask はプロセス全体の状態なので、`umask 077` を掛けた子プロセスとして自分自身を再実行して確かめる。
+#[test]
+fn dns_resolv_conf_is_0644_even_under_umask_077() {
+    const CHILD: &str = "FANDHE_TEST_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let (_tmp, _rootfs, p) = setup("dnsumask");
+        let dir = prepare_dns(&p, "ctr1").expect("prepare");
+        assert_eq!(mode(&dir.join("resolv.conf")), 0o644);
+        assert_eq!(mode(&dir.join("config.json")), 0o600);
+        return;
+    }
+    let exe = std::env::current_exe().expect("exe");
+    // REPAIR-5: 子が停止しても試験が止まらないよう、期限つきで待ち、超過したら kill して回収する。
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 077; exec \"$0\" --exact dns_resolv_conf_is_0644_even_under_umask_077 --test-threads=1")
+        .arg(exe)
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // 出力は別スレッドで収集する（パイプ満杯による子のブロックを避ける）。結果は channel で受け、
+    // 孫プロセスがパイプを握り続けても join で無期限に止まらないようにする。
+    let mut so = child.stdout.take().expect("stdout");
+    let mut se = child.stderr.take().expect("stderr");
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut so, &mut b);
+        let _ = tx_out.send(b);
+    });
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut se, &mut b);
+        let _ = tx_err.send(b);
+    });
+    let grace = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if std::time::Instant::now() >= deadline {
+            // kill の結果を確認し、回収も有限の猶予内の try_wait ポーリングで行う。
+            let kill_result = child.kill();
+            let reap_deadline = std::time::Instant::now() + grace;
+            let mut reaped = false;
+            while std::time::Instant::now() < reap_deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("child timed out after 60s (kill: {kill_result:?}, reaped: {reaped})");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout_bytes = rx_out.recv_timeout(grace).unwrap_or_default();
+    let stderr_bytes = rx_err.recv_timeout(grace).unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let status = status.expect("status is Some when the loop breaks normally");
+    assert!(
+        status.success(),
+        "child failed: {stdout} {}",
+        String::from_utf8_lossy(&stderr_bytes)
+    );
+    assert!(stdout.contains("1 passed"), "child did not run: {stdout}");
+}
+
+#[test]
+fn no_dns_config_creates_no_resolv_conf() {
+    let (_tmp, _rootfs, p) = setup("nodns");
+    let dir = prepare(&p, "ctr1", &container()).expect("prepare");
+    assert!(!dir.join("resolv.conf").exists());
+}
+
+#[test]
+fn invalid_dns_config_creates_no_directory() {
+    let (tmp, rootfs, p) = setup("baddns");
+    let pod = PodSandboxConfig {
+        dns_config: Some(DnsConfig {
+            servers: vec!["bogus".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let e = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &container()))
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+    assert!(!tmp.0.join("ctr1").exists());
+    assert_eq!(rootfs.prepares.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn release_removes_the_resolv_conf_with_the_bundle() {
+    let (_tmp, _rootfs, p) = setup("dns-release");
+    let dir = prepare_dns(&p, "ctr1").expect("prepare");
     p.release("ctr1").expect("release");
     assert!(!dir.exists());
 }

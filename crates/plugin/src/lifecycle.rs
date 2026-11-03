@@ -3,7 +3,7 @@
 //! 子モジュール `mode` のモード選択 API（TASK-110.3・#260）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
-//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は
+//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 ほか。依存方向は
 //! `core -> plugin` のため、本モジュールは core の登録表を参照せず、検証済みの fd を持つ起動対象 [`PluginLaunchTarget`] を受け取る。#1856）。
 //!
 //! # 契約
@@ -58,7 +58,8 @@
 //!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
 //!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`PLUGIN_STDERR_DRAIN_TIMEOUT`]
-//!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
+//!   以内に終端へ達しなければ、停止用 pipe の書き込み端を閉じて（`POLLHUP`）読み取りを打ち切る（待ちは `poll` の期限で有限。
+//!   macOS の `shutdown` と `recv` の競合に依存しない。#3003。`poll` 非対応の構成だけ従来の `shutdown`）。
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -66,8 +67,9 @@
 //! - 起動対象の信頼性検証そのもの（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
 //!   行わず、呼び出し側が検証済みの fd を持つ起動対象を渡すことを前提とする（起動 API はパスだけでは
 //!   起動できない。#1856）。Linux は fd の実体を実行し、検証後のパス差し替えでは別の実行ファイルを
-//!   起動しない。macOS は実体のパスで起動し、起動直前の同一性確認は未実装（#1866）。構築口と本番配線は
-//!   #1857・#1869。
+//!   起動しない。macOS は実体のパスで起動するが、spawn 直前に `lstat` の dev / ino を保持 fd と照合し、
+//!   不一致なら spawn しない（#1866。残余は確認から exec までの窓での同じ UID / root による差し替えで、
+//!   PLUG-11 の脅威の外）。構築口は #1857、本番配線は #1869 の設計（承認と実装 issue の起票は #2232）。
 //! - 孫プロセスの回収の残る制限（#1311・#1604）。タイムアウト・後始末の kill は子のプロセスグループ全体へ
 //!   送るため孫も止まる。plugin が自発終了した場合も、`waitid(WNOWAIT)`（`sys::probe_child_exit`）で回収せずに
 //!   終了を観測し（ゾンビのまま pgid は再利用されない）、グループへ `SIGKILL` を送ってから回収する
@@ -168,11 +170,12 @@ pub const PLUGIN_STDERR_MAX_BYTES: usize = 64 * 1024;
 pub const PLUGIN_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 打ち切りを指示した後、読み取りスレッドの停止を確認するまで待つ上限（REPAIR-5。都度起動と常駐で共用する。#2608）。
-/// shutdown で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける。
+/// 停止用 pipe で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける
+/// （この期限内に止まらなければ最後の手段としてソケットを shutdown する。#3003）。
 pub const PLUGIN_STDERR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// stderr の読み取り 1 回の待ち上限。読み取りスレッドはこの間隔で停止指示を確認する
-/// （shutdown による起床が効かない場合でも、この間隔で停止できる）。
+/// （`poll` の期限。停止用 pipe の起床が効かない場合でも、この間隔で停止できる）。
 #[cfg(unix)]
 const STDERR_READ_POLL: Duration = Duration::from_millis(100);
 
@@ -361,8 +364,12 @@ struct StderrCapture {
     state: Arc<Mutex<PluginStderr>>,
     done: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
-    /// ブロック中の読み取りを起こす操作（ソケットの shutdown）。1 回だけ実行する。
+    /// ブロック中の読み取りを起こす操作（停止用 pipe の書き込み端を閉じる。`poll` 非対応の構成はソケットの
+    /// shutdown）。1 回だけ実行する。
     wake: Option<Box<dyn FnOnce() + Send>>,
+    /// 停止用 pipe の起床でも [`PLUGIN_STDERR_STOP_TIMEOUT`] 内に止まらなかったときだけ実行する最後の
+    /// 手段（ソケットの shutdown。以後、孫の書き込みは `EPIPE` になる。#3003）。
+    last_resort: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl StderrCapture {
@@ -376,13 +383,22 @@ impl StderrCapture {
         source: R,
         wake: Box<dyn FnOnce() + Send>,
     ) -> io::Result<Self> {
+        Self::start_with_stop(source, wake, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`Self::start`] の本体。停止フラグを外から受け取る（`PolledStderr` が停止用 pipe の起床の理由を
+    /// 判別するため、読み取り入力と収集器でフラグを共有する。#3256）。
+    fn start_with_stop<R: Read + Send + 'static>(
+        source: R,
+        wake: Box<dyn FnOnce() + Send>,
+        stop_requested: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(PluginStderr {
             bytes: Vec::new(),
             total_bytes: 0,
             complete: false,
             reader_stopped: false,
         }));
-        let stop_requested = Arc::new(AtomicBool::new(false));
         let (tx, done) = mpsc::channel();
         let shared = Arc::clone(&state);
         let stop = Arc::clone(&stop_requested);
@@ -398,25 +414,50 @@ impl StderrCapture {
             done,
             stop_requested,
             wake: Some(wake),
+            last_resort: None,
         })
     }
 
-    /// 子の stderr を受けるソケットの読み取り側から収集を始める。停止時はソケットを shutdown して
-    /// ブロック中の読み取りを起こす（以後、書き込み端を保持する孫の書き込みは `EPIPE` になる）。
+    /// 子の stderr を受けるソケットの読み取り側から収集を始める。
+    ///
+    /// `poll` 対応の構成では、読み取りスレッドが「ソケット」と「停止用 pipe」を `poll` で待つ。停止時は
+    /// pipe の書き込み端を閉じて `POLLHUP` で起こし、`shutdown` は呼ばない（macOS で `shutdown` が別スレッドの `recv` と
+    /// 競合して読み取りが戻らない場面の回避。REPAIR-5・#3003）。それでも止まらなかった場合に限り、最後の
+    /// 手段として `shutdown` する。対応外の構成は従来どおり受信期限と `shutdown` で止める。
     #[cfg(unix)]
-    fn attach(reader: StderrReader) -> io::Result<Self> {
-        let waker = reader.try_clone()?;
-        Self::start(
-            reader,
+    fn attach(reader: StderrReader, deadline: Instant) -> io::Result<Self> {
+        let shutdown_sock = reader.try_clone()?;
+        let shutdown = move || {
+            let _ = shutdown_sock.shutdown(std::net::Shutdown::Both);
+        };
+        if !crate::sys::POLL_SUPPORTED {
+            return Self::start(reader, Box::new(shutdown));
+        }
+        // 読み取り側は非ブロッキングにする（`poll` が読めると言った後だけ読む。偽の起床でも止まらない）。
+        reader.set_nonblocking(true)?;
+        // ゲート待ちは呼び出し元の合計期限までに限る（REPAIR-5）。
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(deadline, io::pipe)?;
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut capture = Self::start_with_stop(
+            PolledStderr {
+                sock: reader,
+                stop: stop_rx,
+                stop_requested: Arc::clone(&stop_requested),
+            },
             Box::new(move || {
-                let _ = waker.shutdown(std::net::Shutdown::Both);
+                // 書き込み端を閉じて `POLLHUP` で起こす。pipe へは書かない（読み手が先に去っていると `EPIPE` と
+                // `SIGPIPE` になり、ホストの signal 設定が既定のままだとプロセスごと落ちるため。REPAIR-5・#3003）。
+                drop(stop_tx);
             }),
-        )
+            stop_requested,
+        )?;
+        capture.last_resort = Some(Box::new(shutdown));
+        Ok(capture)
     }
 
     /// 非 unix では子を spawn しないため、空の入力を読むだけになる（即座に終端へ達する）。
     #[cfg(not(unix))]
-    fn attach(reader: StderrReader) -> io::Result<Self> {
+    fn attach(reader: StderrReader, _deadline: Instant) -> io::Result<Self> {
         Self::start(reader, Box::new(|| {}))
     }
 
@@ -439,6 +480,9 @@ impl StderrCapture {
         if !stopped {
             self.request_stop();
             stopped = !timed_out(self.done.recv_timeout(PLUGIN_STDERR_STOP_TIMEOUT));
+            if !stopped && let Some(last_resort) = self.last_resort.take() {
+                last_resort();
+            }
         }
         let mut result = lock_stderr(&self.state).clone();
         result.reader_stopped = stopped;
@@ -468,7 +512,7 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &Atom
             return;
         }
         match source.read(&mut chunk) {
-            // 停止指示による shutdown でも 0 が返るため、指示後の 0 は終端として扱わない。
+            // 最後の手段の shutdown でも 0 が返るため、指示後の 0 は終端として扱わない。
             Ok(0) => {
                 if !stop.load(Ordering::SeqCst) {
                     lock_stderr(state).complete = true;
@@ -499,6 +543,48 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &Atom
     }
 }
 
+/// ソケットと停止用 pipe を `poll` で同時に待つ stderr 入力（unix。`poll` 対応の構成のみ。#3003）。
+///
+/// [`StderrCapture::attach`] が作り、読み取りスレッド（[`drain_stderr`]）の `read` として呼ばれる。
+/// 1 回の待ちは [`STDERR_READ_POLL`] で有限。停止用 pipe が ready（書き込み端の close による `POLLHUP`）に
+/// なったとき、停止フラグが立っていれば `Interrupted` を返し、呼び出し側が停止フラグ（pipe より先に
+/// 立つ）を見て抜ける。フラグが立っていないのに ready（`POLLERR`・`POLLNVAL`・書き込み端の予期しない
+/// close）ならエラーで抜ける（`Interrupted` のままだと `drain_stderr` の再試行と即戻る `poll` で CPU を
+/// 空回しするため。REPAIR-5・#3256）。ソケット側は `sock` が非ブロッキングなので、起床後の
+/// `read` が待つことはない。
+#[cfg(unix)]
+struct PolledStderr {
+    sock: std::os::unix::net::UnixStream,
+    stop: io::PipeReader,
+    /// 収集器と共有する停止フラグ。`request_stop` がフラグを立ててから pipe の書き込み端を閉じるので、
+    /// 正規の停止による起床ではここが真になっている。
+    stop_requested: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl Read for PolledStderr {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let ms = i32::try_from(STDERR_READ_POLL.as_millis()).unwrap_or(100);
+        match crate::sys::poll_two(&self.sock, &self.stop, ms)? {
+            crate::sys::PollOutcome::TimedOut => Err(io::ErrorKind::WouldBlock.into()),
+            // 正規の停止。`drain_stderr` がループ先頭でフラグを見て抜ける。
+            crate::sys::PollOutcome::Ready { second: true, .. }
+                if self.stop_requested.load(Ordering::SeqCst) =>
+            {
+                Err(io::ErrorKind::Interrupted.into())
+            }
+            // フラグ未設定で pipe 側が ready。`Interrupted` を返すと再試行されて busy loop になるため、
+            // 再試行されない種類のエラーで抜ける。`drain_stderr` 側で一律に抜けないのは、`Interrupted` が
+            // 本物の `EINTR` でも来るため（signal で出力を落とさない）。
+            crate::sys::PollOutcome::Ready { second: true, .. } => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "plugin stderr stop pipe became ready without a stop request",
+            )),
+            crate::sys::PollOutcome::Ready { .. } => self.sock.read(buf),
+        }
+    }
+}
+
 /// 親が読む側の stderr 入力。unix は UNIX ソケット、非 unix は空の入力（子を spawn しないため）。
 #[cfg(unix)]
 type StderrReader = std::os::unix::net::UnixStream;
@@ -508,12 +594,18 @@ type StderrReader = io::Empty;
 /// 子の stderr に渡す書き込み端と、親が読む側の組を作る（REPAIR-5）。
 ///
 /// pipe ではなく UNIX ソケット対を使う。pipe の読み取りは期限を掛けられず、書き込み端を孫が保持
-/// している間は読み取りスレッドを止められない。ソケットなら読み取り期限と shutdown で確実に止め
-/// られる（標準ライブラリの安全な API だけで実現できる）。子から見た書き込みは pipe と同様（端末ではなく、読み手が
+/// している間は読み取りスレッドを止められない。ソケットなら `poll` の期限と停止用 pipe（対応外の構成は
+/// 受信期限と shutdown）で確実に止められる。子から見た書き込みは pipe と同様（端末ではなく、読み手が
 /// 閉じれば `EPIPE`）。どちらの端も close-on-exec で、子へ渡るのは fd 2 に複製した書き込み端のみ。
+/// macOS では作成と close-on-exec の設定が別 syscall のため、並行する spawn へ漏れないよう
+/// `spawn_gate` で排他する（#3139）。
 #[cfg(unix)]
-fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
-    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+fn stderr_channel(deadline: Instant) -> io::Result<(Stdio, StderrReader)> {
+    // macOS の std は close-on-exec を作成後に別 syscall で立てるため、並行する spawn と排他にする
+    // （`spawn_gate`。PLUG-7・SEC-1・#3139）。
+    // ゲート待ちは呼び出し元の合計期限までに限る（REPAIR-5）。
+    let (reader, writer) =
+        crate::spawn_gate::create_fds(deadline, std::os::unix::net::UnixStream::pair)?;
     // 相手が健在なうちに期限を設定する（macOS は相手切断後の設定が EINVAL になる）。
     reader.set_read_timeout(Some(STDERR_READ_POLL))?;
     Ok((Stdio::from(std::os::fd::OwnedFd::from(writer)), reader))
@@ -521,7 +613,7 @@ fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
 
 /// 非 unix では listener を bind できず子を spawn しないため到達しない（stderr は破棄する設定を返す）。
 #[cfg(not(unix))]
-fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
+fn stderr_channel(_deadline: Instant) -> io::Result<(Stdio, StderrReader)> {
     Ok((Stdio::null(), io::empty()))
 }
 
@@ -1123,12 +1215,30 @@ fn rpc_timeout(remaining: Duration) -> Result<RpcTimeout, PluginError> {
     RpcTimeout::new(remaining.min(UDS_RPC_TIMEOUT_MAX))
 }
 
+/// stderr 収集の準備で失敗した `io::Error` を写す。ゲート待ちの期限切れ（`TimedOut`）は `Timeout`、
+/// それ以外は `Internal`（`message` 付き）にする（REPAIR-5。`spawn_gate::create_fds` の契約）。
+/// 期限切れ時の `Timeout` の文言は呼び出し側（都度起動・常駐）が `on_timeout` で与える。
+fn stderr_prepare_error(
+    e: &io::Error,
+    message: &'static str,
+    on_timeout: fn() -> PluginError,
+) -> PluginError {
+    if e.kind() == io::ErrorKind::TimedOut {
+        return on_timeout();
+    }
+    PluginError::new(PluginErrorCode::Internal, message)
+}
+
 fn spawn_error(e: &io::Error) -> PluginError {
     let (code, msg) = match e.kind() {
         io::ErrorKind::NotFound => (PluginErrorCode::NotFound, "plugin program not found"),
         io::ErrorKind::PermissionDenied => (
             PluginErrorCode::PermissionDenied,
             "permission denied spawning plugin program",
+        ),
+        io::ErrorKind::TimedOut => (
+            PluginErrorCode::Timeout,
+            "timed out waiting to spawn plugin program",
         ),
         _ => (
             PluginErrorCode::Unavailable,
@@ -1277,7 +1387,9 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
 ///
 /// 実行するプログラムは起動対象から決める（#1856・PLUG-11）。Linux は保持した fd の実体を
 /// `/proc/self/fd/<N>` 経由で実行し（実行できなければ `FailedPrecondition`。パスへ縮退しない）、
-/// それ以外はパス（`exec_path`）で起動する（macOS の起動直前の同一性確認は未実装。#1866）。
+/// Linux 以外の unix はパス（`exec_path`）で起動するが、spawn の直前に `lstat` で dev / ino を保持 fd と
+/// 照合し、違えば `FailedPrecondition` で子を spawn しない（#1866。常駐の再起動でも毎回通る）。
+/// 非 unix はパスで起動する（listener の bind が先に `Unimplemented` を返し子は spawn されない）。
 /// `argv[0]` は OS を問わず実体の正規パス。
 fn plugin_command(
     plugin: &PluginLaunchSpec,
@@ -1286,7 +1398,9 @@ fn plugin_command(
 ) -> Result<Command, PluginError> {
     #[cfg(target_os = "linux")]
     let program = launch_target::linux_fd_exec_path(&plugin.target, Path::new("/proc/self/fd"))?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let program = launch_target::checked_exec_path(&plugin.target)?;
+    #[cfg(not(unix))]
     let program = plugin.target.exec_path().to_path_buf();
 
     let mut cmd = Command::new(program);
@@ -1308,10 +1422,16 @@ fn plugin_command(
 
 /// spawn の失敗を起動対象の経路に合わせて写す。Linux は fd を保持しているのでファイル不在
 /// （`NotFound`）はあり得ず、確認後に `/proc` が使えなくなった等の競合として fd 経由の起動失敗にする。
+/// Linux 以外の unix の `NotFound` は、直前の `lstat` 確認を通った後にパスが消えた（残余の窓）ことなので、
+/// 確認での拒否と同じ「検証したファイルを指していない」エラーにする（#1866）。
 fn launch_spawn_error(e: PluginError) -> PluginError {
     #[cfg(target_os = "linux")]
     if e.code() == PluginErrorCode::NotFound {
         return launch_target::fd_launch_error();
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if e.code() == PluginErrorCode::NotFound {
+        return launch_target::path_identity_error();
     }
     e
 }
@@ -1341,19 +1461,20 @@ fn call_once_inner(
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let listener = match UdsListener::bind(&plugin.socket_dir.join(name)) {
+    let listener = match UdsListener::bind_before(&plugin.socket_dir.join(name), deadline) {
         Ok(l) => l,
         Err(e) => return (Err(e), PluginStderr::empty()),
     };
 
     // stderr は親へ継承させない（plugin が親の stderr へ任意の量・内容を書けてしまうため）。
-    let (child_stderr, reader) = match stderr_channel() {
+    let (child_stderr, reader) = match stderr_channel(deadline) {
         Ok(pair) => pair,
-        Err(_) => {
+        Err(e) => {
             return (
-                Err(PluginError::new(
-                    PluginErrorCode::Internal,
+                Err(stderr_prepare_error(
+                    &e,
                     "failed to prepare capturing plugin stderr",
+                    timeout_error,
                 )),
                 PluginStderr::empty(),
             );
@@ -1365,7 +1486,7 @@ fn call_once_inner(
             Ok(c) => c,
             Err(e) => return (Err(e), PluginStderr::empty()),
         };
-        spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)
+        spawn_registered(&mut cmd, registry, deadline).map_err(launch_spawn_error)
     };
     let mut guard = match spawned {
         Ok(g) => g,
@@ -1373,17 +1494,14 @@ fn call_once_inner(
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
-    let capture = match StderrCapture::attach(reader) {
+    let capture = match StderrCapture::attach(reader, deadline) {
         Ok(c) => c,
         // 読み取り手がいないまま子を走らせるとバッファが埋まって子が詰まるため、往復せず回収する。
-        Err(_) => {
+        Err(e) => {
             drop(listener);
             let error = reap_after_failure(
                 &mut guard,
-                PluginError::new(
-                    PluginErrorCode::Internal,
-                    "failed to start capturing plugin stderr",
-                ),
+                stderr_prepare_error(&e, "failed to start capturing plugin stderr", timeout_error),
             );
             return (Err(error), PluginStderr::empty());
         }
@@ -1416,6 +1534,7 @@ fn call_once_inner(
 fn spawn_registered(
     cmd: &mut Command,
     registry: &'static Registry,
+    deadline: Instant,
 ) -> Result<ChildGuard, PluginError> {
     let mut slot = registry.reserve()?;
     #[cfg(unix)]
@@ -1423,7 +1542,15 @@ fn spawn_registered(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().map_err(|e| spawn_error(&e))?;
+    // 非原子の fd 生成と排他で spawn する（`spawn_gate`。PLUG-7・SEC-1・#3139）。非 unix は fd を作らない。
+    #[cfg(unix)]
+    let spawned = crate::spawn_gate::spawn(deadline, cmd);
+    #[cfg(not(unix))]
+    let spawned = {
+        let _ = deadline;
+        cmd.spawn()
+    };
+    let child = spawned.map_err(|e| spawn_error(&e))?;
     let pid = child.id();
     // activate が失敗した場合は guard の Drop が子を kill・回収する。
     let guard = ChildGuard::new(child);
@@ -1563,6 +1690,27 @@ fn check_termination_after_response(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    /// 試験用の十分遠い合計期限。
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// REPAIR-5: stderr 準備のゲート待ちの期限切れは `Internal` ではなく `Timeout` に写す。
+    #[test]
+    fn repair5_stderr_prepare_timeout_maps_to_timeout() {
+        let e = io::Error::new(io::ErrorKind::TimedOut, "gate");
+        assert_eq!(
+            stderr_prepare_error(&e, "m", timeout_error).code(),
+            PluginErrorCode::Timeout
+        );
+        let e = io::Error::other("x");
+        assert_eq!(
+            stderr_prepare_error(&e, "m", timeout_error).code(),
+            PluginErrorCode::Internal
+        );
+    }
+
     use super::*;
 
     thread_local! {
@@ -1945,7 +2093,7 @@ mod tests {
     fn run_child_role(test: &str, env: &str, value: &str, stderr: Stdio) {
         let exe = std::env::current_exe().unwrap();
         let mut child = Command::new(exe)
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test, "--no-capture", "--test-threads=1"])
             .env(env, value)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2326,7 +2474,9 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("fcos-spawn-marker-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let script = format!("touch '{}'", marker.display());
-        let e = spawn_registered(&mut sh(&script), reg).err().unwrap();
+        let e = spawn_registered(&mut sh(&script), reg, far_deadline())
+            .err()
+            .unwrap();
         assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
         assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
         std::thread::sleep(Duration::from_millis(100));
@@ -2362,13 +2512,13 @@ mod tests {
         };
         // kill_and_reap
         let (mut cmd, marker) = make_ignoring("a");
-        let mut g = spawn_registered(&mut cmd, reg).unwrap();
+        let mut g = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
         wait_marker(&marker);
         assert_eq!(targets(reg), 1);
         assert!(g.kill_and_reap().is_reaped());
         assert_eq!(targets(reg), 0);
         // 自発終了を try_wait で回収
-        let mut g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exit 0"), reg, far_deadline()).unwrap();
         let start = Instant::now();
         while g.try_wait().unwrap().is_none() {
             assert!(start.elapsed() < Duration::from_secs(5));
@@ -2377,7 +2527,7 @@ mod tests {
         assert_eq!(targets(reg), 0);
         // 生存中の try_wait は登録を保つ
         let (mut cmd, marker) = make_ignoring("b");
-        let mut live = spawn_registered(&mut cmd, reg).unwrap();
+        let mut live = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
         wait_marker(&marker);
         assert!(live.try_wait().unwrap().is_none());
         assert_eq!(targets(reg), 1);
@@ -2408,7 +2558,7 @@ mod tests {
     #[test]
     fn plug7_spawn_registered_establishes_own_process_group() {
         let reg = local_registry(2);
-        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg, far_deadline()).unwrap();
         let pid = g.child.as_ref().unwrap().id();
         assert_eq!(process_group_of(pid), pid);
         assert!(g.kill_and_reap().is_reaped());
@@ -2421,7 +2571,7 @@ mod tests {
         use crate::signal_forward::ForwardSignal;
         use std::os::unix::process::ExitStatusExt;
         let reg = local_registry(2);
-        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg).unwrap();
+        let mut g = spawn_registered(&mut sh("exec sleep 30"), reg, far_deadline()).unwrap();
         assert_eq!(reg.forward(ForwardSignal::Terminate).targets, 1);
         let start = Instant::now();
         let status = loop {
@@ -2446,7 +2596,7 @@ mod tests {
             let reg = local_registry(2);
             let mut cmd = sh("/bin/sleep 30 >/dev/null 2>&1 & echo $!; wait");
             cmd.stdout(Stdio::piped());
-            let mut g = spawn_registered(&mut cmd, reg).unwrap();
+            let mut g = spawn_registered(&mut cmd, reg, far_deadline()).unwrap();
             let out = g.child.as_mut().unwrap().stdout.take().unwrap();
             let gc: u32 = read_grandchild_pid(&mut g, out);
             assert!(is_running(gc));
@@ -2941,7 +3091,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair5_stderr_capture_stops_reader_while_another_process_holds_the_writer() {
-        let (child_stderr, reader) = stderr_channel().unwrap();
+        let (child_stderr, reader) = stderr_channel(far_deadline()).unwrap();
         // 書き込み端を保持したまま何も書かないプロセス（孫プロセスの代役）。
         let holder = Command::new("/bin/sh")
             .args(["-c", "echo held >&2; exec sleep 30"])
@@ -2951,7 +3101,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut holder = ChildGuard::new(holder);
-        let capture = StderrCapture::attach(reader).unwrap();
+        let capture = StderrCapture::attach(reader, far_deadline()).unwrap();
         let waited = Instant::now();
         while lock_stderr(&capture.state).total_bytes < 5 {
             assert!(waited.elapsed() < Duration::from_secs(5));
@@ -2966,6 +3116,136 @@ mod tests {
         assert!(!got.is_complete());
         assert!(got.reader_stopped());
         assert!(holder.kill_and_reap().is_reaped());
+    }
+
+    /// 停止用 pipe の書き込み端を閉じた `PolledStderr` を作る（フラグは `stop_requested` を共有）。
+    /// 返す `UnixStream` は相手側で、試験の終わりまで持ち続ける（EOF で抜ける経路と区別するため）。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    fn polled_with_closed_stop_pipe(
+        stop_requested: &Arc<AtomicBool>,
+    ) -> (PolledStderr, std::os::unix::net::UnixStream) {
+        let (peer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        // 素の `io::pipe()` は並行する試験の子へ書き込み端が漏れ、`POLLHUP` が遅れうるため使わない。
+        let (stop_rx, stop_tx) = crate::spawn_gate::create_fds(far_deadline(), io::pipe).unwrap();
+        drop(stop_tx);
+        (
+            PolledStderr {
+                sock: reader,
+                stop: stop_rx,
+                stop_requested: Arc::clone(stop_requested),
+            },
+            peer,
+        )
+    }
+
+    /// REPAIR-5・PLUG-7・#3256: 停止フラグが未設定のまま停止用 pipe が ready になったら、`Interrupted`
+    /// （再試行されて busy loop になる）ではなく `BrokenPipe` で抜ける。フラグが立っていれば従来どおり
+    /// `Interrupted`。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    #[test]
+    fn repair5_polled_stderr_read_errors_when_stop_pipe_ready_without_stop_request() {
+        let read_kind = |flag: &Arc<AtomicBool>| {
+            let (mut polled, _peer) = polled_with_closed_stop_pipe(flag);
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut buf = [0u8; 16];
+            loop {
+                match polled.read(&mut buf) {
+                    // fork から exec までの窓で `POLLHUP` が遅れる間は待つ。
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {}
+                    other => return other.map_err(|e| e.kind()),
+                }
+            }
+        };
+        assert_eq!(
+            read_kind(&Arc::new(AtomicBool::new(false))),
+            Err(io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(
+            read_kind(&Arc::new(AtomicBool::new(true))),
+            Err(io::ErrorKind::Interrupted)
+        );
+    }
+
+    /// REPAIR-5・PLUG-7・#3256: 停止フラグ未設定で停止用 pipe が ready になっても、読み取りスレッドは
+    /// 空回しせず自分で抜ける。`finish` は期限後に停止を指示するので、期限より十分早く戻れば自力で
+    /// 抜けたことになる（修正前は期限まで空回しする）。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    #[test]
+    fn repair5_stderr_capture_reader_exits_when_stop_pipe_ready_without_stop_request() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (polled, _peer) = polled_with_closed_stop_pipe(&flag);
+        let capture = StderrCapture::start_with_stop(polled, Box::new(|| {}), flag).unwrap();
+        let started = Instant::now();
+        let got = capture.finish(Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(got.reader_stopped());
+        assert!(!got.is_complete());
+        assert_eq!(got.total_bytes(), 0);
+    }
+
+    /// REPAIR-5・PLUG-7・#3003: 書き込み端を保持する別プロセスがいても、`shutdown` を使わない通常の
+    /// 停止（`poll` と停止用 pipe）で毎回、期限内に読み取りスレッドが止まる。macOS で `shutdown` との
+    /// 競合により 1 回だけ止まらなかった間欠失敗を拾うため、同じ場面を繰り返す。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_stderr_capture_stops_reader_repeatedly_while_writer_is_held() {
+        for round in 0..20 {
+            let (child_stderr, reader) = stderr_channel(far_deadline()).unwrap();
+            let holder = Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(child_stderr)
+                .spawn()
+                .unwrap();
+            let mut holder = ChildGuard::new(holder);
+            let capture = StderrCapture::attach(reader, far_deadline()).unwrap();
+            let limit = Duration::from_millis(50);
+            let started = Instant::now();
+            let got = capture.finish(limit);
+            let elapsed = started.elapsed();
+            assert!(got.reader_stopped(), "round {round}: {elapsed:?}");
+            assert!(!got.is_complete(), "round {round}");
+            assert_eq!(got.total_bytes(), 0, "round {round}");
+            assert!(elapsed >= limit, "round {round}: {elapsed:?}");
+            assert!(
+                elapsed < limit + PLUGIN_STDERR_STOP_TIMEOUT,
+                "round {round}: {elapsed:?}"
+            );
+            assert!(holder.kill_and_reap().is_reaped());
+        }
     }
 
     /// PLUG-7: 未回収として pid を報告した子は、ガードの破棄時に回収しない（報告した pid を
@@ -3026,9 +3306,8 @@ mod tests {
     #[test]
     fn plug7_accept_rejects_other_pid_and_accepts_expected() {
         use crate::transport::UdsStream;
-        use std::os::unix::fs::DirBuilderExt;
-        let dir = std::env::temp_dir().join(format!("fcos-unit-{}", std::process::id()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        // 残骸の socket / ディレクトリの上で進めない（連番・作成前削除・0700。REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fcos-unit", "unit");
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
@@ -3072,9 +3351,7 @@ mod tests {
     #[test]
     fn plug7_abort_is_checked_after_pid_mismatch() {
         use crate::transport::UdsStream;
-        use std::os::unix::fs::DirBuilderExt;
-        let dir = std::env::temp_dir().join(format!("fcos-abort-{}", std::process::id()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let dir = crate::test_root::test_root("fcos-abort", "abort");
         let listener = UdsListener::bind(&dir.join("a.sock")).unwrap();
         let path = listener.path().to_path_buf();
         let me = std::process::id();
@@ -3113,7 +3390,7 @@ mod tests {
     #[cfg(unix)]
     fn spawn_then_reap_elsewhere(reg: &'static Registry) -> ChildGuard {
         use crate::signal_forward::ForwardSignal;
-        let g = spawn_registered(&mut sh("exit 0"), reg).unwrap();
+        let g = spawn_registered(&mut sh("exit 0"), reg, far_deadline()).unwrap();
         assert_eq!(reg.forward(ForwardSignal::Hangup).targets, 1);
         let pid = g.pid().unwrap();
         let start = Instant::now();

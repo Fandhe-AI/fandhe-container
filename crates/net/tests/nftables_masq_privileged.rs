@@ -29,6 +29,9 @@
 //! host の設定は変えない。待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る
 //! （REPAIR-5）。前提（root・`unshare`・カーネルモジュール）を満たさない場合は skip せず失敗する。
 
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("nftables_masq_privileged: Linux only, not applicable on this OS");
@@ -279,8 +282,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 
@@ -367,13 +369,15 @@ mod linux {
             .as_deref()
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
-        let ok = Command::new("unshare")
-            .arg("--help")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok = crate::reap::run_within(
+            Command::new("unshare")
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            crate::reap::reap_within(),
+        )
+        .inspect_err(|e| eprintln!("precondition probe: {e}"))
+        .is_ok_and(|s| s.success());
         assert!(ok, "util-linux `unshare` is required; see AGENTS.md");
     }
 

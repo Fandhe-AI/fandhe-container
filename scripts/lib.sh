@@ -147,7 +147,7 @@ BENCH_STAGED_NAMES="plugin_boundary plugin_boundary_list_images small_files"
 # Unix 限定ベンチ名: Windows（OS=Windows_NT）では実行せず、baseline・metrics からも除く。
 # plugin 境界ベンチは Unix ドメインソケット前提（PLUG-5）。small_files は基準値（#230）が ubuntu の CI 環境の値で、
 # Windows の永続化は file 単位の同期（SupportedFileSync）と Linux の syncfs で計測方式が異なり、登録後に
-# Windows で比べると偽の回帰が出るため除く。metric 名は「<ベンチ名>_」で始まる命名規約に従う
+# Windows で比べると偽の回帰が出るため除く。wire 経路（#2074）は UDS 前提で Windows では動かない。metric 名は「<ベンチ名>_」で始まる命名規約に従う
 # （bench_metric_prefixes_jq が一覧から jq 用の接頭辞配列を作る）。
 BENCH_UNIX_ONLY_NAMES="plugin_boundary plugin_boundary_list_images small_files"
 
@@ -312,13 +312,14 @@ bench_filter_metrics_for_run() {
 #   --file-size 2         既定値を明示
 #   --layout tree         3〜5 万件の実測（#107）で auto が選ぶ配置形にそろえ、平置きのディレクトリ走査が区間を支配しない
 #   --config bind         ラベルのみ（挙動は変えない）
+#   --route wire          UDS 越しのワイヤー経路の files/s を測る（#2074。既定の server-api ではない）。Linux 限定のゲートのため問題なし（Windows は BENCH_UNIX_ONLY_NAMES で除外）
 #   --trials 3            中央値が 1 回の外れ値に耐える最小数
 #   --trial-timeout-secs 120 / --timeout-secs 300  ジョブ上限（15 分）より十分短く切る（REPAIR-5）
 # 3〜5 万件の実測は人間がハーネスを直接実行する（#107）。他のベンチは引数なし。
 bench_args_for() {
   case "$1" in
     small_files)
-      printf '%s\n' --count 2000 --batch-size 1 --file-size 2 --layout tree --config bind \
+      printf '%s\n' --count 2000 --batch-size 1 --file-size 2 --layout tree --config bind --route wire \
         --trials 3 --trial-timeout-secs 120 --timeout-secs 300 --root "$2"
       ;;
     *) ;;

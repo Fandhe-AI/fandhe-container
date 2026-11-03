@@ -234,11 +234,9 @@ mod tests {
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("fc-pidsmax-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        base
+    fn scratch(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fc-pidsmax-{tag}"), "d")
     }
 
     /// SUP-13・TASK-170 追補・REPAIR-4: `set_pids_max` が成功と失敗（pids.max 不在）を
@@ -252,11 +250,11 @@ mod tests {
         use crate::observability::OpName;
         let name = OpName::new(SET_PIDS_MAX_OP_NAME).unwrap();
         let rec = OpRecorder::new();
-        let ok = scratch("rec-ok");
+        let (_scratch, ok) = scratch("rec-ok");
         std::fs::write(ok.join("pids.max"), b"").unwrap();
         let dir = File::open(&ok).unwrap();
         write_pids_max_recorded(dir.as_fd(), &rec, &PidsMax::count(100).unwrap()).unwrap();
-        let ng = scratch("rec-ng");
+        let (_scratch, ng) = scratch("rec-ng");
         let dir2 = File::open(&ng).unwrap();
         write_pids_max_recorded(dir2.as_fd(), &rec, &PidsMax::count(100).unwrap()).unwrap_err();
         let stats = rec.snapshot_op(&name).expect("recorded");
@@ -266,8 +264,6 @@ mod tests {
             rec.snapshot_op(&OpName::new("cgroup.set_io_weight").unwrap())
                 .is_none()
         );
-        std::fs::remove_dir_all(&ok).unwrap();
-        std::fs::remove_dir_all(&ng).unwrap();
     }
 
     /// SUP-13・TASK-170.2: 通常ファイル上で書き込みと読み戻しが具体値で一致する（受け入れ条件の機械照合）。
@@ -277,7 +273,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_pids_write_and_read_back() {
-        let base = scratch("ok");
+        let (_scratch, base) = scratch("ok");
         std::fs::write(base.join("pids.max"), b"").unwrap();
         let dir = File::open(&base).unwrap();
         let want = PidsMax::count(100).unwrap();
@@ -286,7 +282,6 @@ mod tests {
             std::fs::read_to_string(base.join("pids.max")).unwrap(),
             "100"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: `pids.max` が無い（controller 未有効）場合は `FailedPrecondition`。
@@ -296,12 +291,11 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_pids_missing_file_is_failed_precondition() {
-        let base = scratch("missing");
+        let (_scratch, base) = scratch("missing");
         let dir = File::open(&base).unwrap();
         let e = write_pids_max_at(dir.as_fd(), &PidsMax::count(100).unwrap()).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.step, CgroupStep::SetPidsMax);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: 読み戻しが要求と食い違えば成功扱いにしない。
@@ -311,12 +305,11 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_pids_read_back_mismatch_fails() {
-        let base = scratch("mismatch");
+        let (_scratch, base) = scratch("mismatch");
         std::fs::write(base.join("pids.max"), b"99999999").unwrap();
         let dir = File::open(&base).unwrap();
         let e = write_pids_max_at(dir.as_fd(), &PidsMax::count(100).unwrap()).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: `pids.max` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
@@ -326,7 +319,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_pids_symlink_is_rejected() {
-        let base = scratch("symlink");
+        let (_scratch, base) = scratch("symlink");
         std::fs::write(base.join("target"), b"untouched").unwrap();
         std::os::unix::fs::symlink(base.join("target"), base.join("pids.max")).unwrap();
         let dir = File::open(&base).unwrap();
@@ -335,6 +328,5 @@ mod tests {
             std::fs::read_to_string(base.join("target")).unwrap(),
             "untouched"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 }

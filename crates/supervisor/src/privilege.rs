@@ -33,7 +33,7 @@
 //! - fd 検証付き exec（`execveat`・所有者 / 権限の検証）・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin:
 //!   `crate::launcher`（#1719。実装済み）
 //! - ambient は exec 後の子孫へ引き継がれる。コンテナの子は core の制限段で消すが、healthcheck の exec など
-//!   supervisor が起動する子での解除は TASK-161.2 の healthcheck exec（#2441）の実装時（設計書 5 章 5・10 章）
+//!   supervisor が起動する子での解除は、healthcheck exec では helper 自身は継承したまま動き、コマンドの `execveat` の前に core の再適用が落とす（#2441。設計書 5 章 5・10 章。`docs/design/healthcheck-exec-helper.md`）
 //! - file capability / setuid ビットの付与（インストール）: `scripts/install-privileged-launcher.sh`（#1721。実装済み。
 //!   実機での実行と検証は人間担当: #538・#539）
 
@@ -1035,7 +1035,7 @@ impl PrivilegeKernel for RealKernel {
 ///   補助グループを持つ利用者向けに `CAP_SETGID` を effective 付きで持たせる必要がある（`plan_reduction` の前提。
 ///   必要最小集合は広げない。付与は `scripts/install-privileged-launcher.sh`〔#1721〕が行う）
 /// - ambient は exec 後の子孫へ引き継がれる。子での解除は本関数の範囲外（コンテナの子は core の制限段、
-///   supervisor が起動する子は TASK-161.2・#2441）
+///   supervisor が起動する healthcheck の helper は #2441。コマンドの子は core の再適用が ambient を落とす）
 ///
 /// fd 検証付き exec・入口検証は本関数の範囲外（#1719）。非 Linux では常に `Unimplemented`（SUP-14 の対象は Linux の
 /// rootful 経路で、macOS / Windows は VM 内で動く）。

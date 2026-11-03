@@ -39,9 +39,20 @@
 //!
 //! # 対象外の経路
 //!
-//! external netns から PREROUTING を通る DNAT と、コンテナ発の masquerade は検証しない。masquerade 本体は
-//! `network.rs` で未実装（REPAIR-3）であり、PREROUTING 側のルール単位の検証は `nftables_paths_privileged` が行う。
-//! `ip_forward` は変更しない。
+//! external netns から PREROUTING を通る DNAT は検証しない（PREROUTING 側のルール単位の検証は
+//! `nftables_paths_privileged` が行う）。`--hold` / `--measure` の経路は外向き通信を扱わない。
+//!
+//! # 経路 (d)（コンテナ発の外向き通信。`--ignored` のみ。NET-1・NET-11・#3348）
+//!
+//! ```text
+//! c1 (10.214.0.2) -> bridge -> host（隔離 netns。ip_forward=1）-- fcex0 (10.214.2.1) <-> fcex1 (10.214.2.2) -- 外部 netns
+//! ```
+//!
+//! `create_network` が投入する masquerade（#3073）により、外部 netns の受信側が見る送信元 IP が出口の
+//! `10.214.2.1` に変わり、`C1_ADDR` のままではないことを確かめる。外部 netns は `unshare --net -- <exe> --ext-child`
+//! の子で、10.214.0.0/24 への戻り経路を持たない。`ip_forward` は隔離を確かめた後の inner の netns だけで 1 にする
+//! （netns ごとの値で host へは及ばない）。経路 (a)（出口が bridge のため変換しない）が除外 `oifname != bridge` の
+//! 陰性対照になる。実機（root）での実行は #1626（人間担当）で未実施。
 //!
 //! # 所要時間計測（`--measure --trials N --warmup W`）
 //!
@@ -52,6 +63,29 @@
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! 外部コマンド）を満たさない場合は skip せず失敗する。実機（root）での実行結果は TASK-140 で人間が記録する。
+//!
+//! # トポロジーの保持（`--hold --max-secs N`。NET-2・NET-3・TASK-140 準備・#1881）
+//!
+//! TASK-140（#319）の iperf3 や 1 バイト TCP 往復（`tcp_rtt_probe`）を流す間、トポロジーを保持する入口。
+//! `create_network` -> `attach_container` x2（c1 は TCP 公開 `10.214.1.1:18080 -> 9080` と `:15201 -> 5201`、
+//! c2 は公開なし）の後、準備完了を stdout に 1 行の JSON（`event: "ready"`。`inner_pid`・`host_netns`・
+//! `mount_ns`・各コンテナの `addr`・`pin`・`netns`・`publishes`）で出し、stdin の `release` 行・EOF・`N` 秒の
+//! 期限（1..=3600。必須）のいずれかまで保持して `delete_network` と取り残し確認を行い、
+//! `event: "released"` の行を出して終了する。stdout は JSON 行専用で、診断は stderr。
+//!
+//! 隔離: 計測と同じ `unshare --net --mount` の新規 netns の中で保持する。bridge・veth・nft テーブルは新規 netns、
+//! pin は private な mount namespace の tmpfs にあるため、期限・シグナル・ランチャや親スクリプトの死亡の
+//! どれでもプロセスの終了で netns ごとカーネルが回収し、ホストの link・nft・mount に何も残らない
+//! （シグナルハンドラを持たず `sys` 外の unsafe を作らない）。pin はホストの mount namespace から見えないため、
+//! 計測プロセスは `nsenter --net=/proc/<inner_pid>/root<pin>`（出力の `netns`）で入る。
+//! 制約（出力の `method` にも書く）: コンテナ役は `nsenter` で入った任意のプロセスで製品の起動経路を通らず、
+//! masquerade 経由の外向き通信は未検証、ホスト役は実ホストでなく隔離 netns。値は暫定（`provisional`）で NET-2・NET-3 の
+//! 判定には使わない。詳細は `docs/design/net-tcp-rtt-bench.md`。
+
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -60,18 +94,28 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    use std::time::Duration;
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--child") {
         linux::child(&args);
+    } else if args.iter().any(|a| a == "--ext-child") {
+        linux::ext_child();
     } else if args.iter().any(|a| a == "--inner") {
         linux::inner(&args);
     } else if args.iter().any(|a| a == "--ignored") {
-        linux::launcher(Vec::new());
+        linux::launcher(Vec::new(), Duration::ZERO);
     } else if args.iter().any(|a| a == "--measure") {
-        linux::launcher(linux::measure_args(&args));
+        linux::launcher(linux::measure_args(&args), Duration::ZERO);
+    } else if args.iter().any(|a| a == "--hold-check") {
+        linux::hold_check();
+    } else if args.iter().any(|a| a == "--hold") {
+        let (extra, hold_secs) = linux::hold_args(&args);
+        linux::launcher(extra, Duration::from_secs(u64::from(hold_secs)));
     } else {
+        // root 不要の契約の自己試験は既定の実行で走らせる（実機前提の部分は `--ignored` / `--hold-check`）。
+        linux::hold_contract_selftest();
         println!(
-            "network_paths_privileged: ignored (requires root, `unshare`, `nsenter`; run the built executable with `--ignored` or `--measure` under `sudo`, see AGENTS.md)"
+            "network_paths_privileged: ignored (requires root, `unshare`, `nsenter`; run the built executable with `--ignored`, `--measure` or `--hold --max-secs N` under `sudo`, see AGENTS.md)"
         );
     }
 }
@@ -91,11 +135,13 @@ mod linux {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink_route::{
         AddrScope, AddressSpec, IfName, IpPrefix, LinkCreate, LinkRef, LinkSet, NetlinkRouteSocket,
+        NetnsPid, NetnsTarget,
     };
+    use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
-        ContainerAttachSpec, CreatedNetwork, EndpointId, NetworkCreateSpec, NetworkName,
-        PortProtocol, PortPublish, PortRegistry, StaticIpam, attach_container, create_network,
-        delete_network,
+        AttachedContainer, ContainerAttachSpec, CreatedNetwork, EndpointId, NetworkCreateSpec,
+        NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, attach_container,
+        create_network, delete_network,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -103,6 +149,14 @@ mod linux {
     const INNER_PID_ENV: &str = "FANDHE_PATHS_TEST_INNER_PID";
     const DIR_ENV: &str = "FANDHE_PATHS_TEST_DIR";
     const OK_PREFIX: &str = "network_paths_privileged: three paths verified";
+    /// 経路 (d)（コンテナ発の外向き通信）の外部 netns 側。inner 側 `fcex0` が出口のアドレスで、
+    /// masquerade が変換する送信元になる。外部 netns には 10.214.0.0/24 への戻り経路を置かない。
+    const EXT_OUT0: &str = "fcex0";
+    const EXT_OUT1: &str = "fcex1";
+    const EXT_EGRESS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 214, 2, 1);
+    const EXT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 214, 2, 2);
+    /// 経路 (d) の外部 netns の待受ポート。
+    const PORT_D: u16 = 9104;
     const PAYLOAD: &[u8] = b"fandhe";
     /// 公開ポート（DNAT 前の宛先ポート）。
     const HOST_PORT: u16 = 18080;
@@ -124,6 +178,13 @@ mod linux {
     const TRIALS_DEFAULT: u32 = 20;
     const WARMUP_MAX: u32 = 20;
     const WARMUP_DEFAULT: u32 = 1;
+    /// 保持モードの期限の上限（秒）。
+    const HOLD_SECS_MAX: u32 = 3600;
+    /// iperf3 用の公開ポート（ホスト側 -> c1 側）。
+    const IPERF_HOST_PORT: u16 = 15201;
+    const IPERF_CONT_PORT: u16 = 5201;
+    const HOLD_SCHEMA: &str = "fandhe-container.net-hold/v1";
+    const HOLD_METHOD: &str = "data path (bridge/veth/nftables) built by the crates/net integration API in a fresh netns; container role is a process entered via nsenter --net=<pin> and does not go through the product launch path (namespace isolation, cgroup, seccomp); masquerade rule is installed by create_network but egress through it is not exercised here; host role is the isolated netns, not the real host; values are provisional and not used for NET-2/NET-3 judgement";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -191,6 +252,55 @@ mod linux {
         }
     }
 
+    /// `--max-secs N` を取り出す。欠落・非数値・範囲外（1..=3600 の外）は `None`（純関数。自己試験の対象）。
+    fn parse_hold_secs(args: &[String]) -> Option<u32> {
+        args.iter()
+            .position(|a| a == "--max-secs")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| (1..=HOLD_SECS_MAX).contains(v))
+    }
+
+    /// 保持の解放の理由を決める。`next` が `release` の行を返せば `release`、行が尽きれば（EOF）`eof`。
+    /// 他の行は読み捨てる（純関数。stdin の読み取りは呼び出し側が渡す）。
+    fn wait_release(mut next: impl FnMut() -> Option<String>) -> &'static str {
+        loop {
+            match next() {
+                None => return "eof",
+                Some(l) if l == "release" => return "release",
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// 準備完了行（`event: "ready"`）を組み立てる。`c1_json`・`c2_json` は `container_json` の出力。
+    fn ready_line(max_secs: u32, pid: u32, c1_json: &str, c2_json: &str) -> String {
+        format!(
+            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"ready\",\"provisional\":true,\"method\":\"{HOLD_METHOD}\",\"isolation\":\"unshare --net --mount (fresh netns)\",\"max_secs\":{max_secs},\"inner_pid\":{pid},\"host_netns\":\"/proc/{pid}/ns/net\",\"mount_ns\":\"/proc/{pid}/ns/mnt\",\"host\":{{\"bridge_addr\":\"{GATEWAY}\",\"outer_addr\":\"{HOST_OUTER}\"}},\"containers\":[{c1_json},{c2_json}]}}"
+        )
+    }
+
+    /// 解放完了行（`event: "released"`）を組み立てる。`reason` は `eof` / `release` / `deadline`。
+    fn released_line(reason: &str) -> String {
+        format!(
+            "{{\"schema\":\"{HOLD_SCHEMA}\",\"event\":\"released\",\"reason\":\"{reason}\",\"cleanup\":\"ok\",\"provisional\":true}}"
+        )
+    }
+
+    /// 保持モードの引数を検証する。`--max-secs` は必須（1..=3600）。範囲外・欠落・非数値は終了コード 2。
+    /// 戻り値は inner へ渡す引数と保持秒数（ランチャの期限の算出用）。root の確認より前に呼ぶ。
+    pub fn hold_args(args: &[String]) -> (Vec<String>, u32) {
+        match parse_hold_secs(args) {
+            Some(n) => (vec!["--hold".into(), "--max-secs".into(), n.to_string()], n),
+            None => {
+                eprintln!(
+                    "network_paths_privileged: --hold requires --max-secs N (1..={HOLD_SECS_MAX})"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     fn require_root_and_tools() {
         let uid_root = fs::read_to_string("/proc/self/status")
             .expect("read /proc/self/status")
@@ -201,38 +311,55 @@ mod linux {
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
         for tool in ["unshare", "nsenter", "mount"] {
-            let ok = Command::new(tool)
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = crate::reap::run_within(
+                Command::new(tool)
+                    .arg("--help")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            )
+            .inspect_err(|e| eprintln!("precondition probe: {e}"))
+            .is_ok_and(|s| s.success());
             assert!(ok, "util-linux `{tool}` is required; see AGENTS.md");
         }
     }
 
     /// プロセスグループ `pgid` の全員に SIGKILL を送り、グループが空になる（`kill -0` が失敗する）まで
     /// 期限つきで待つ。空になったことを確認できたら true（外部 `kill` コマンド経由で `sys` 外の unsafe を避ける）。
+    /// 外部 `kill` 自体にも期限を付ける（1 回の上限は全体の残り期限。下限 100ms）。`kill` が期限内に
+    /// 戻らない場合は stderr に出して false を返す（REPAIR-5・#3306）。
     fn kill_group(pgid: u32, leader: &mut std::process::Child) -> bool {
         let target = format!("-{pgid}");
-        let signal = |sig: &str| {
-            Command::new("kill")
-                .args([sig, "--", &target])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        };
-        let _ = signal("-KILL");
         let deadline = Instant::now() + timeout();
+        // `Ok(true)`: シグナル送達に成功、`Ok(false)`: kill が失敗終了（対象なし）、`Err`: 期限切れ・起動失敗。
+        let signal = |sig: &str| -> Result<bool, String> {
+            let per_call = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(100));
+            crate::reap::run_within(
+                Command::new("kill")
+                    .args([sig, "--", &target])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                per_call,
+            )
+            .map(|s| s.success())
+        };
+        let report = |e: String| {
+            eprintln!("kill failure: {e}");
+            false
+        };
+        if let Err(e) = signal("-KILL") {
+            return report(e);
+        }
         loop {
             // グループリーダー（unshare）が未回収のゾンビのままだと `kill -0` が成功し続けるため、先に回収する。
             let _ = leader.try_wait();
-            if !signal("-0") {
-                return true;
+            match signal("-0") {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(e) => return report(e),
             }
             if Instant::now() >= deadline {
                 eprintln!(
@@ -240,21 +367,32 @@ mod linux {
                 );
                 return false;
             }
-            let _ = signal("-KILL");
+            if let Err(e) = signal("-KILL") {
+                return report(e);
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って inner を起動する。
-    pub fn launcher(extra: Vec<String>) {
+    /// `extra_deadline` は保持モードの保持秒数（それ以外は 0）。ランチャの期限に上乗せする。
+    pub fn launcher(extra: Vec<String>, extra_deadline: Duration) {
         require_root_and_tools();
-        let dir = std::env::temp_dir().join(format!("fandhe-paths-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-paths-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         // 専用プロセスグループで起動し、期限切れ時に inner・nsenter・その配下の子孫をまとめて停止できるようにする。
+        // 保持モードの解放は stdin で受ける。分離した（バックグラウンドの）プロセスグループが制御端末を直接
+        // 読むと SIGTTIN で停止するため、inner の stdin はパイプにし、ランチャ（前面のグループ）が自身の
+        // stdin を転送する。保持モード以外は stdin を使わないので null にする（REPAIR-5）。
+        let hold = extra.iter().any(|a| a == "--hold");
         let mut child = Command::new("unshare")
             .process_group(0)
+            .stdin(if hold {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .args(["--net", "--mount", "--"])
             .arg(exe)
             .arg("--inner")
@@ -263,9 +401,22 @@ mod linux {
             .env(DIR_ENV, &dir)
             .spawn()
             .expect("spawn unshare --net --mount");
+        if let Some(mut pipe) = child.stdin.take() {
+            // ランチャの stdin の各行を inner へ転送する。EOF で pipe を閉じ、inner 側にも EOF を伝える。
+            std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    let Ok(line) = line else { break };
+                    if writeln!(pipe, "{line}").is_err() || pipe.flush().is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         // 計測は最大 (200 + 20) 試行になり得るため、期限は試行数に依らず固定倍率にせず十分長く取る。
         let pgid = child.id();
-        let deadline = Instant::now() + timeout() * 60;
+        let deadline = Instant::now() + timeout() * 60 + extra_deadline;
         let code = loop {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
@@ -364,8 +515,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -418,12 +568,16 @@ mod linux {
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 if expected != Some(std::os::unix::process::parent_id()) {
-                    let _ = Command::new("kill")
-                        .args(["-KILL", "--", &format!("-{}", std::process::id())])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                    if let Err(e) = crate::reap::run_within(
+                        Command::new("kill")
+                            .args(["-KILL", "--", &format!("-{}", std::process::id())])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null()),
+                        crate::reap::reap_within(),
+                    ) {
+                        eprintln!("kill failure: {e}");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -433,7 +587,12 @@ mod linux {
     pub fn inner(args: &[String]) {
         spawn_launcher_watchdog();
         let measuring = args.iter().any(|a| a == "--measure");
-        let result = if measuring {
+        let result = if args.iter().any(|a| a == "--hold") {
+            match parse_hold_secs(args) {
+                Some(n) => hold(n),
+                None => Err(fail("invalid --max-secs")),
+            }
+        } else if measuring {
             let trials = flag_value(args, "--trials", TRIALS_DEFAULT, TRIALS_MAX, 1);
             let warmup = flag_value(args, "--warmup", WARMUP_DEFAULT, WARMUP_MAX, 0);
             match (trials, warmup) {
@@ -533,9 +692,55 @@ mod linux {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| fail("missing or invalid child address"))?;
+        say("ready");
+        serve(addr)
+    }
+
+    /// `--ext-child` の入口。経路 (d) の「外部 netns」役。inner が `unshare --net` で起動したときだけ動く
+    /// （親 pid と netns の両方を確かめる fail-closed）。`setup` の行を受けたら移ってきた `fcex1` と `lo` を up にして
+    /// `EXT_ADDR` を付け、以降は `--child` と同じ行プロトコルで受信側を務める。戻り経路は付けない。
+    pub fn ext_child() {
+        if let Err(e) = ext_child_inner() {
+            println!("network_paths_privileged: ext-child failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    fn ext_child_inner() -> Result<(), NetError> {
+        let expected = std::env::var(INNER_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let parent = std::os::unix::process::parent_id();
+        if expected != Some(parent) {
+            return Err(fail("`--ext-child` must be started by `--inner`; refusing"));
+        }
+        let own = fs::read_link("/proc/self/ns/net").map_err(|e| fail(format!("readlink: {e}")))?;
+        let parent_ns = fs::read_link(format!("/proc/{parent}/ns/net"))
+            .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing")))?;
+        if own == parent_ns {
+            return Err(fail("`--ext-child` shares the parent netns; refusing"));
+        }
+        say("ready");
+        if read_line().as_deref() != Some("setup") {
+            return Err(fail("expected `setup`"));
+        }
+        let route = NetlinkRouteSocket::open()?;
+        let t = timeout();
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname("lo")?)), t)?;
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname(EXT_OUT1)?)), t)?;
+        let idx = route.link_index(&ifname(EXT_OUT1)?, t)?;
+        route.add_address(
+            &AddressSpec::new(idx, IpPrefix::new(v4(EXT_ADDR), 24)?, AddrScope::Universe),
+            t,
+        )?;
+        say("configured");
+        serve(EXT_ADDR)
+    }
+
+    /// `listen` / `recv` / `send` の行プロトコルを EOF まで処理する（`--child` と `--ext-child` で共有）。
+    fn serve(addr: Ipv4Addr) -> Result<(), NetError> {
         let mut listeners: Vec<(u16, UdpSocket)> = Vec::new();
         let mut held_senders: Vec<(u16, UdpSocket)> = Vec::new();
-        say("ready");
         while let Some(cmd) = read_line() {
             let mut parts = cmd.split_whitespace();
             match (parts.next(), parts.next(), parts.next()) {
@@ -587,8 +792,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 
@@ -598,16 +802,29 @@ mod linux {
             let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
             let mut netns_arg = std::ffi::OsString::from("--net=");
             netns_arg.push(netns_path);
-            let mut child = Command::new("nsenter")
-                .arg(netns_arg)
+            let mut cmd = Command::new("nsenter");
+            cmd.arg(netns_arg)
                 .arg("--")
                 .arg(exe)
-                .args(["--child", &addr.to_string()])
+                .args(["--child", &addr.to_string()]);
+            Self::spawn_command(role, cmd)
+        }
+
+        /// 新しい netns（`unshare --net`）で `--ext-child` を起動する。経路 (d) の外部 netns 役。
+        fn spawn_ext(role: &'static str) -> Result<Self, NetError> {
+            let exe = std::env::current_exe().map_err(|e| fail(format!("current_exe: {e}")))?;
+            let mut cmd = Command::new("unshare");
+            cmd.args(["--net", "--"]).arg(exe).arg("--ext-child");
+            Self::spawn_command(role, cmd)
+        }
+
+        fn spawn_command(role: &'static str, mut cmd: Command) -> Result<Self, NetError> {
+            let mut child = cmd
                 .env(INNER_PID_ENV, std::process::id().to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
-                .map_err(|e| fail(format!("spawn nsenter: {e}")))?;
+                .map_err(|e| fail(format!("spawn {role}: {e}")))?;
             let stdin = child.stdin.take();
             let stdout = child
                 .stdout
@@ -756,6 +973,98 @@ mod linux {
         )
     }
 
+    /// `delete_network` を呼び、取り残しが無く、bridge・host 側 veth・pin が消えていることを確かめる
+    /// （`verify_paths` と `hold` の共通の後始末確認）。`expect_gone` は (bridge, host 側 veth, pin)。
+    fn delete_and_verify(
+        route: &NetlinkRouteSocket,
+        nft: &NetlinkNetfilterSocket,
+        net: &CreatedNetwork,
+        attached: Vec<AttachedContainer<ContainerNetns>>,
+        ipam: &mut StaticIpam,
+        ports: &mut PortRegistry,
+        expect_gone: (&IfName, &[IfName], &[PathBuf]),
+    ) -> Result<(), NetError> {
+        let t = timeout();
+        let (bridge, hosts, pins) = expect_gone;
+        let report = delete_network(route, nft, net, attached, ipam, ports, t).map_err(|e| {
+            fail(format!(
+                "delete_network failed at {:?}: {e}; report: {:?}",
+                e.step, e.report
+            ))
+        })?;
+        if !report.leftover.is_empty() {
+            return Err(fail(format!("unexpected leftover: {:?}", report.leftover)));
+        }
+        if !gone(route, bridge, t) {
+            return Err(fail("bridge still exists after delete_network"));
+        }
+        for host in hosts {
+            if !gone(route, host, t) {
+                return Err(fail(format!("veth {} still exists", host.as_str())));
+            }
+        }
+        for pin in pins {
+            if pin.exists() {
+                return Err(fail(format!("pin {} still exists", pin.display())));
+            }
+        }
+        Ok(())
+    }
+
+    /// 経路 (d) の照合。外部 netns 役の子へ `fcex1` を移し、c1 から送って受信側が見る送信元 IP が
+    /// 出口の `EXT_EGRESS_ADDR` であって `C1_ADDR` ではないことを確かめる（ポートは照合しない）。
+    /// `ip_forward` は隔離確認済みの inner の netns だけで有効にする（値は netns ごとで host へ及ばない。
+    /// 設計 D11 の「host の `ip_forward` は変更しない」とは矛盾しない）。
+    fn verify_egress(
+        route: &NetlinkRouteSocket,
+        c1: &mut ChildGuard,
+        c1_ports: &mut Vec<u16>,
+    ) -> Result<SocketAddr, NetError> {
+        let t = timeout();
+        // 隔離の確認は `prepare_isolation`（`ensure_isolated_netns`）が済ませている。ここでは再確認しない
+        // （bridge・veth が既にあるため「新規作成直後」の検査は通らない）が、親 netns と別であることだけは確かめる。
+        let own = fs::read_link("/proc/self/ns/net").map_err(|e| fail(format!("readlink: {e}")))?;
+        let parent = fs::read_link(format!(
+            "/proc/{}/ns/net",
+            std::os::unix::process::parent_id()
+        ))
+        .map_err(|e| fail(format!("cannot read parent netns ({e}); refusing")))?;
+        if own == parent {
+            return Err(fail("refusing to enable ip_forward in the parent netns"));
+        }
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+            .map_err(|e| fail(format!("enable ip_forward in the isolated netns: {e}")))?;
+        let mut ext = ChildGuard::spawn_ext("ext")?;
+        ext.expect_prefix("ready")?;
+        route.create_link(&LinkCreate::veth(ifname(EXT_OUT0)?, ifname(EXT_OUT1)?)?, t)?;
+        let pid = NetnsPid::new(ext.child.id())?;
+        route.set_link(
+            &LinkSet::move_to_netns(LinkRef::Name(ifname(EXT_OUT1)?), NetnsTarget::Pid(pid)),
+            t,
+        )?;
+        route.set_link(&LinkSet::up(LinkRef::Name(ifname(EXT_OUT0)?)), t)?;
+        let idx = route.link_index(&ifname(EXT_OUT0)?, t)?;
+        route.add_address(
+            &AddressSpec::new(
+                idx,
+                IpPrefix::new(v4(EXT_EGRESS_ADDR), 24)?,
+                AddrScope::Universe,
+            ),
+            t,
+        )?;
+        ext.send("setup")?;
+        ext.expect_prefix("configured")?;
+        ext.listen(PORT_D)?;
+        c1.send_to((EXT_ADDR, PORT_D), c1_ports)?;
+        let seen = ext.recv(PORT_D)?;
+        expect_eq(seen.ip(), v4(EXT_EGRESS_ADDR), "path (d) source address")?;
+        if seen.ip() == v4(C1_ADDR) {
+            return Err(fail("path (d): source address was not translated"));
+        }
+        ext.finish()?;
+        Ok(seen)
+    }
+
     /// 3 経路疎通の照合本体（`--ignored`）。
     fn verify_paths() -> Result<(), NetError> {
         let base = prepare_isolation()?;
@@ -823,6 +1132,10 @@ mod linux {
         let c = c1.recv(CONT_PORT)?;
         expect_eq(c, SocketAddr::new(v4(HOST_OUTER), pc), "path (c)")?;
 
+        // (d) コンテナ発の外向き通信: c1 -> 外部 netns。出口が bridge 以外のため masquerade が送信元を
+        // 出口のアドレスへ変換する（NET-1・NET-11・#3348）。経路 (a)（出口が bridge で変換しない）が陰性対照になる。
+        let d = verify_egress(&route, &mut c1, &mut c1_ports)?;
+
         c1.finish()?;
         c2.finish()?;
 
@@ -833,38 +1146,283 @@ mod linux {
             c1_attached.netns_path.clone(),
             c2_attached.netns_path.clone(),
         ];
-        let report = delete_network(
+        delete_and_verify(
             &route,
             &nft,
             &net,
             vec![c1_attached, c2_attached],
             &mut ipam,
             &mut ports,
-            t,
+            (&bridge, &hosts, &pins),
+        )?;
+        println!("{OK_PREFIX} a={a} b={b} c={c} d={d} (NET-1 NET-11)");
+        Ok(())
+    }
+
+    /// JSON 文字列へ載せてよいパスか（文字種 `[A-Za-z0-9/._-]` のみ。`TMPDIR` 由来の文字で行が壊れる・
+    /// 注入されるのを防ぐ）。
+    fn json_safe_path(p: &Path) -> Result<&str, NetError> {
+        let s = p
+            .to_str()
+            .ok_or_else(|| fail("pin path is not UTF-8; refusing to print"))?;
+        if s.is_empty()
+            || !s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+        {
+            return Err(fail(
+                "pin path has characters outside [A-Za-z0-9/._-]; refusing to print",
+            ));
+        }
+        Ok(s)
+    }
+
+    fn container_json(
+        id: &str,
+        addr: Ipv4Addr,
+        pin: &Path,
+        publishes: &[(u16, u16)],
+    ) -> Result<String, NetError> {
+        let pin_s = json_safe_path(pin)?;
+        let pid = std::process::id();
+        let pubs: Vec<String> = publishes
+            .iter()
+            .map(|(h, c)| {
+                format!(
+                    "{{\"proto\":\"tcp\",\"host_addr\":\"{HOST_OUTER}\",\"host_port\":{h},\"container_port\":{c}}}"
+                )
+            })
+            .collect();
+        Ok(format!(
+            "{{\"id\":\"{id}\",\"addr\":\"{addr}\",\"pin\":\"{pin_s}\",\"netns\":\"/proc/{pid}/root{pin_s}\",\"publishes\":[{}]}}",
+            pubs.join(",")
+        ))
+    }
+
+    /// 保持モードの契約の自己試験（root 不要。引数なしの既定の実行で走る。NET-3・TASK-140 準備・#1881・REPAIR-12）。
+    /// 引数の境界値、解放の理由、ready / released 行の具体値を照合する。失敗は panic（非 0 終了）。
+    pub fn hold_contract_selftest() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        // --max-secs の境界値: 1 と 3600 は受理、0・3601・負数・非数値・欠落・値なしは拒否。
+        assert_eq!(parse_hold_secs(&a(&["--hold", "--max-secs", "1"])), Some(1));
+        assert_eq!(
+            parse_hold_secs(&a(&["--hold", "--max-secs", "3600"])),
+            Some(3600)
+        );
+        for bad in ["0", "3601", "-1", "abc", "", "4294967296"] {
+            assert_eq!(
+                parse_hold_secs(&a(&["--hold", "--max-secs", bad])),
+                None,
+                "--max-secs {bad:?} must be rejected"
+            );
+        }
+        assert_eq!(parse_hold_secs(&a(&["--hold"])), None);
+        assert_eq!(parse_hold_secs(&a(&["--hold", "--max-secs"])), None);
+        // 解放の理由: release 行は release、release が無いまま行が尽きれば eof。
+        let mut it = vec!["noise", "release", "later"].into_iter();
+        assert_eq!(wait_release(|| it.next().map(str::to_owned)), "release");
+        let mut it = vec!["noise", "other"].into_iter();
+        assert_eq!(wait_release(|| it.next().map(str::to_owned)), "eof");
+        assert_eq!(wait_release(|| None), "eof");
+        // released 行の具体値。
+        assert_eq!(
+            released_line("deadline"),
+            "{\"schema\":\"fandhe-container.net-hold/v1\",\"event\":\"released\",\"reason\":\"deadline\",\"cleanup\":\"ok\",\"provisional\":true}"
+        );
+        // ready 行の構造と具体値。
+        let line = ready_line(30, 4242, "{\"id\":\"c1\"}", "{\"id\":\"c2\"}");
+        for needle in [
+            "\"schema\":\"fandhe-container.net-hold/v1\"",
+            "\"event\":\"ready\"",
+            "\"provisional\":true",
+            "\"max_secs\":30",
+            "\"inner_pid\":4242",
+            "\"host_netns\":\"/proc/4242/ns/net\"",
+            "\"mount_ns\":\"/proc/4242/ns/mnt\"",
+            "\"bridge_addr\":\"10.214.0.1\"",
+            "\"outer_addr\":\"10.214.1.1\"",
+            "\"containers\":[{\"id\":\"c1\"},{\"id\":\"c2\"}]",
+        ] {
+            assert!(line.contains(needle), "ready line lacks {needle}: {line}");
+        }
+        assert!(!line.contains('\n'), "ready line must be a single line");
+        // pin の文字種検査: 許可外の文字（引用符・空白）を含む pin は出力させない。
+        assert!(json_safe_path(Path::new("/tmp/a\"b")).is_err());
+        assert!(json_safe_path(Path::new("/tmp/a b")).is_err());
+        assert_eq!(
+            json_safe_path(Path::new("/tmp/x-1.y_z/pin")).ok(),
+            Some("/tmp/x-1.y_z/pin")
+        );
+        let c = container_json(
+            "c1",
+            C1_ADDR,
+            Path::new("/tmp/p"),
+            &[(18080, 9080), (15201, 5201)],
         )
-        .map_err(|e| {
-            fail(format!(
-                "delete_network failed at {:?}: {e}; report: {:?}",
-                e.step, e.report
-            ))
-        })?;
-        if !report.leftover.is_empty() {
-            return Err(fail(format!("unexpected leftover: {:?}", report.leftover)));
-        }
-        if !gone(&route, &bridge, t) {
-            return Err(fail("bridge still exists after delete_network"));
-        }
-        for host in &hosts {
-            if !gone(&route, host, t) {
-                return Err(fail(format!("veth {} still exists", host.as_str())));
+        .expect("container_json");
+        assert!(c.contains("\"addr\":\"10.214.0.2\""), "{c}");
+        assert!(c.contains("\"pin\":\"/tmp/p\""), "{c}");
+        assert!(
+            c.contains("\"host_addr\":\"10.214.1.1\",\"host_port\":18080,\"container_port\":9080"),
+            "{c}"
+        );
+        println!("network_paths_privileged: hold contract self-test passed (NET-3)");
+    }
+
+    /// 保持モードの実機確認（`--hold-check`。root・util-linux 前提）。自分自身を `--hold --max-secs N` で起動し、
+    /// 準備完了行の検証、`release` 行・stdin EOF・期限による解放と、解放完了行（保持側が削除確認を済ませて
+    /// `cleanup:ok` を出す）・終了コード 0 を照合する（NET-3・TASK-140 準備・#1881・REPAIR-12）。
+    pub fn hold_check() {
+        require_root_and_tools();
+        let exe = std::env::current_exe().expect("current_exe");
+        for (case, max_secs, expect) in [
+            ("release", 60u32, "release"),
+            ("eof", 60, "eof"),
+            ("deadline", 1, "deadline"),
+        ] {
+            let mut child = Command::new(&exe)
+                .args(["--hold", "--max-secs", &max_secs.to_string()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn --hold");
+            let mut stdin = child.stdin.take();
+            let out = child.stdout.take().expect("stdout pipe");
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                for l in BufReader::new(out).lines().map_while(Result::ok) {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+            });
+            let recv = |what: &str, child: &mut Child| -> String {
+                match rx.recv_timeout(timeout() * 6 + Duration::from_secs(u64::from(max_secs))) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        let _ = child.kill();
+                        panic!("hold-check[{case}]: no {what} line before deadline");
+                    }
+                }
+            };
+            let ready = recv("ready", &mut child);
+            for needle in [
+                "\"event\":\"ready\"",
+                "\"provisional\":true",
+                &format!("\"max_secs\":{max_secs}"),
+                "\"addr\":\"10.214.0.2\"",
+                "\"addr\":\"10.214.0.3\"",
+                "\"host_port\":18080,\"container_port\":9080",
+                "\"host_port\":15201,\"container_port\":5201",
+            ] {
+                assert!(
+                    ready.contains(needle),
+                    "hold-check[{case}]: ready lacks {needle}: {ready}"
+                );
             }
-        }
-        for pin in &pins {
-            if pin.exists() {
-                return Err(fail(format!("pin {} still exists", pin.display())));
+            // ready 行の `netns`（/proc/<inner_pid>/root<pin>）がホストの mount namespace から実在することを確かめる。
+            let mut netns_seen = 0;
+            for part in ready.split("\"netns\":\"").skip(1) {
+                let path = part.split('"').next().unwrap_or("");
+                assert!(
+                    Path::new(path).exists(),
+                    "hold-check[{case}]: netns path {path} does not exist while holding"
+                );
+                netns_seen += 1;
             }
+            assert_eq!(netns_seen, 2, "hold-check[{case}]: expected 2 netns paths");
+            match case {
+                "release" => {
+                    let w = stdin.as_mut().expect("stdin pipe");
+                    w.write_all(b"release\n").expect("write release");
+                    w.flush().expect("flush");
+                }
+                "eof" => drop(stdin.take()),
+                _ => {}
+            }
+            let released = recv("released", &mut child);
+            assert_eq!(
+                released,
+                released_line(expect),
+                "hold-check[{case}]: unexpected released line"
+            );
+            drop(stdin);
+            let status =
+                match crate::reap::wait_within(&mut child, std::time::Duration::from_secs(60)) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+                        panic!("hold-check[{case}]: {e}");
+                    }
+                };
+            assert!(status.success(), "hold-check[{case}]: exit status {status}");
         }
-        println!("{OK_PREFIX} a={a} b={b} c={c} (NET-1)");
+        println!("network_paths_privileged: hold verified release/eof/deadline (NET-3)");
+    }
+
+    /// トポロジーの保持（`--hold`）。解放の理由は stdin の `release` 行・EOF・期限のいずれか。
+    /// 失敗時は stderr に診断を出して非 0 で終わり、後始末は netns・mount namespace の消滅に委ねる。
+    fn hold(max_secs: u32) -> Result<(), NetError> {
+        let base = prepare_isolation()?;
+        let route = NetlinkRouteSocket::open()?;
+        let nft = NetlinkNetfilterSocket::open()?;
+        let t = timeout();
+        prepare_outer_address(&route)?;
+
+        let net = create_network(&route, &nft, &create_spec("hld")?, t)
+            .map_err(|e| fail(format!("create_network failed at {:?}: {e}", e.step)))?;
+        let mut ipam = StaticIpam::for_network(&net)?;
+        let mut ports = PortRegistry::new();
+        let pubs = vec![
+            PortPublish::new(PortProtocol::Tcp, HOST_OUTER, HOST_PORT, CONT_PORT)?,
+            PortPublish::new(
+                PortProtocol::Tcp,
+                HOST_OUTER,
+                IPERF_HOST_PORT,
+                IPERF_CONT_PORT,
+            )?,
+        ];
+        let spec1 = ContainerAttachSpec::new(EndpointId::new("c1")?, &net, base.clone())?
+            .with_port_publishes(pubs)?;
+        let c1 = attach_container(&route, &nft, &spec1, &mut ipam, &mut ports, t)
+            .map_err(|e| fail(format!("attach c1 failed at {:?}: {e}", e.step)))?;
+        let spec2 = ContainerAttachSpec::new(EndpointId::new("c2")?, &net, base.clone())?;
+        let c2 = attach_container(&route, &nft, &spec2, &mut ipam, &mut ports, t)
+            .map_err(|e| fail(format!("attach c2 failed at {:?}: {e}", e.step)))?;
+        expect_eq(c1.address, IpPrefix::new(v4(C1_ADDR), 24)?, "c1 address")?;
+        expect_eq(c2.address, IpPrefix::new(v4(C2_ADDR), 24)?, "c2 address")?;
+
+        let pid = std::process::id();
+        let c1_json = container_json(
+            "c1",
+            C1_ADDR,
+            &c1.netns_path,
+            &[(HOST_PORT, CONT_PORT), (IPERF_HOST_PORT, IPERF_CONT_PORT)],
+        )?;
+        let c2_json = container_json("c2", C2_ADDR, &c2.netns_path, &[])?;
+        // stdin の読み取りを先に始める（ready を出した直後の release / EOF を取りこぼさない）。
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_release(read_line));
+        });
+        say(&ready_line(max_secs, pid, &c1_json, &c2_json));
+        let reason = rx
+            .recv_timeout(Duration::from_secs(u64::from(max_secs)))
+            .unwrap_or("deadline");
+
+        let bridge = net.bridge.clone();
+        let hosts = [c1.host_veth.clone(), c2.host_veth.clone()];
+        let pins = [c1.netns_path.clone(), c2.netns_path.clone()];
+        delete_and_verify(
+            &route,
+            &nft,
+            &net,
+            vec![c1, c2],
+            &mut ipam,
+            &mut ports,
+            (&bridge, &hosts, &pins),
+        )?;
+        say(&released_line(reason));
         Ok(())
     }
 

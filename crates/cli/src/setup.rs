@@ -19,7 +19,7 @@
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
 //!
-//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
+//! 将来仕様: ステップの検出・適用（Windows は WIN-1・WIN-2・WIN-4・WIN-5、macOS は MAC-1〔Virtualization.framework 経路〕。plugin 経由。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125。本タスクは TASK-80.1・MS-6・CLI-2）。
 //! 日常操作コマンドからの切り離しは TASK-80.2 で確立済み（参照点は `commands::run_setup` のみ）。分離の単体テストは `tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 
 use std::io::Write;
@@ -463,28 +463,48 @@ mod tests {
     /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
     const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
 
-    struct TmpDir(PathBuf);
+    /// Linux では `ScratchDir`（systemd-tmpfiles の aging 走査と BundleLock の flock の競合を避ける。
+    /// #3141・CORE-5・REPAIR-12）の子に作る。他 OS は `temp_dir()` 直下（flock を取る経路が無い）。
+    struct TmpDir(
+        PathBuf,
+        #[cfg(target_os = "linux")]
+        #[allow(dead_code)]
+        crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        // 非 Linux は残骸を消して作った実体（Drop で後始末。REPAIR-12・#3435）。
+        #[cfg(not(target_os = "linux"))]
+        #[allow(dead_code)]
+        crate::test_root::TestRoot,
+    );
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            #[cfg(target_os = "linux")]
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fc-cli-setup",
+                std::time::Duration::from_secs(10),
+            );
+            #[cfg(target_os = "linux")]
+            let p = scratch.path().join(format!("{tag}-{n}"));
+            #[cfg(not(target_os = "linux"))]
             let p =
                 std::env::temp_dir().join(format!("fc-cli-setup-{tag}-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&p).expect("mkdir");
-            #[cfg(unix)]
+            // Linux は ScratchDir が作成前の削除を担う。他 OS は残骸・PID 再利用との衝突を避けるため
+            // 作成前に削除する（REPAIR-12・#3435）。
+            #[cfg(target_os = "linux")]
             {
+                std::fs::create_dir_all(&p).expect("mkdir");
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod");
+                Self(p, scratch)
             }
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            #[cfg(not(target_os = "linux"))]
+            {
+                let root = crate::test_root::test_root_at(p);
+                Self(root.to_path_buf(), root)
+            }
         }
     }
 
@@ -580,6 +600,7 @@ mod tests {
                 // （非 Linux は plugin 解決の失敗の 5。いずれも OS 固有設定を要求しない。#1718）。
                 Command::Start => (vec!["start", "c1"], 5, ""),
                 Command::Stop => (vec!["stop", "c1"], 5, ""),
+                Command::Kill => (vec!["kill", "c1"], 5, ""),
                 Command::Delete => (vec!["delete", "d1"], if linux { 0 } else { 5 }, ""),
                 Command::List => (
                     vec!["list"],
@@ -593,6 +614,10 @@ mod tests {
                 Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
                 // c1 は Created（稼働中ではない）なので exec は FAILED_PRECONDITION（5）。非 Linux は plugin 解決の失敗の 5。
                 Command::Exec => (vec!["exec", "c1", "/bin/true"], 5, ""),
+                // 不在 ID の inspect は Linux で NOT_FOUND(3)、非 Linux は plugin 解決の失敗(5)。出力は無い。
+                Command::Inspect => (vec!["inspect", "none"], if linux { 3 } else { 5 }, ""),
+                // state も inspect と同じ(不在 ID は Linux で NOT_FOUND(3)、非 Linux は plugin 解決の失敗(5)。#1903)。
+                Command::State => (vec!["state", "none"], if linux { 3 } else { 5 }, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },
@@ -606,6 +631,12 @@ mod tests {
                     vec!["system", "df", "--image-root", &ir],
                     if linux { 0 } else { 5 },
                     if linux { SYSTEM_DF_EMPTY } else { "" },
+                ),
+                // network は Linux 以外では状態ルートも作らず UNIMPLEMENTED(8。#3066・NET-6)。
+                Command::Network => (
+                    vec!["network", "ls"],
+                    if linux { 0 } else { 8 },
+                    if linux { "NAME\tMODE\tSUBNET\n" } else { "" },
                 ),
                 Command::Setup | Command::Doctor => continue,
             };
@@ -629,7 +660,8 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                "state", "image", "system", "network"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

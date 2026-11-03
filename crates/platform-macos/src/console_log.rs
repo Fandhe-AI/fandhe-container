@@ -35,7 +35,7 @@
 //!   現在のログが無い・空なら世代を消費しない。世代ファイルや保護入力に異常があれば何も動かさず拒否する。
 //! - 削除: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete では
 //!   `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。delete からの呼び出しの配線は
-//!   plugin-macos の delete 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）待ちで、本 crate では部品の提供までである。
+//!   plugin-macos の delete 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）待ちで、本 crate では部品の提供までである。
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -65,7 +65,8 @@ pub const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
 /// 保持するコンソールログの世代数（現在のログを含む。`<name>`・`<name>.1`・`<name>.2`）。
 ///
 /// supervisor の `SUPERVISOR_LOG_GENERATIONS`（`crates/supervisor`）と同じ値と意味（新しいほど番号が小さい）。
-/// コードは共有しない（platform-macos は supervisor へ依存しないため。共通化は crate 境界の変更として別途）。
+/// コードは共有しない（platform-macos は supervisor へ依存しないため）。共通化しない判断と再評価条件は
+/// `docs/design/rotating-log-sharing.md`（#2172・REPAIR-1）。
 /// 回転・削除は `config::VmConfigSpec` の `open_serial_console`（回転）と `remove_console_logs`（削除）が行う。
 pub const CONSOLE_LOG_GENERATIONS: u32 = 3;
 

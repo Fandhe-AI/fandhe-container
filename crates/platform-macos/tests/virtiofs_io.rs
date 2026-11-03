@@ -9,6 +9,9 @@
 //! - 実機テスト（`#[ignore]`）: macOS 13 以上・`com.apple.security.virtualization` 付き署名・
 //!   `fandhe.virtiofs=` 指示と下記プローブ契約を実装したゲスト資産を要する。手順は AGENTS.md「実機前提テスト」節。
 //!
+//! 補助関数（Scratch・VM 起動後の done 行待ち・停止・ログの確定待ち〔#3416〕・期限）は `tests/support/virtiofs_harness.rs` に共通化し、
+//! その単体試験は `tests/virtiofs_harness.rs`（MAC-1・REPAIR-1・#3099）。
+//!
 //! プローブ契約（行の形・名前空間・順序・起動条件）の SSOT は `guest_probe` モジュール。実装は
 //! `crates/guest-init`（#1876）で、`VmConfigSpec::with_guest_test(GuestTestMode::VirtiofsIo)` が付ける
 //! 予約キー `fandhe.guest-test=virtiofs-io` で有効になる（利用者のコマンドラインでは指定できない）。
@@ -19,14 +22,13 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fandhe_container_platform_macos::config::{
     BlockDeviceSpec, ConsoleLogPath, DeviceConfigSpec, DiskImagePath, SerialConsoleSink,
     VmConfigSpec, build_vz_configuration,
 };
-use fandhe_container_platform_macos::console_log::TRUNCATION_MARKER;
 use fandhe_container_platform_macos::guest_mount::{GuestMountPoint, GuestTestMode};
 use fandhe_container_platform_macos::guest_probe::{
     GUEST_MOUNT, ProbeLog, SHARE_TAG, WRITE_LINE, WRITE_LINES, compare_entries, parse_probe_log,
@@ -34,70 +36,17 @@ use fandhe_container_platform_macos::guest_probe::{
 use fandhe_container_platform_macos::virtiofs::{
     ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
 };
-use fandhe_container_platform_macos::vm::{OpTimeouts, Vm, VmState};
+
+#[path = "support/common.rs"]
+mod common;
+use common::{COUNTER, Scratch, tail_lossy};
+#[path = "support/virtiofs_harness.rs"]
+mod harness;
+#[path = "support/vm_guest.rs"]
+mod vm_guest;
+use harness::{launch_until_done, resolve_probe_timeout};
 
 const MAX_OUT_ENTRIES: usize = 16;
-/// VM 破棄後、コンソールログの書き出しスレッドが EOF で終わるのを待つ上限（REPAIR-5）。
-const CONSOLE_LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// 以下 Scratch / env_path / tail_lossy は vm_boot.rs からの複製（共通化は vm_boot.rs を巻き込むため別タスク）。
-
-/// テストごとの新規ディレクトリ（0700）。`keep` が false なら `Drop` で削除する。
-struct Scratch {
-    dir: PathBuf,
-    keep: bool,
-}
-
-impl Scratch {
-    fn new(tag: &str, keep: bool) -> Self {
-        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(base).expect("create tmp base");
-        let base = base.canonicalize().expect("canonicalize tmp base");
-        for _ in 0..100 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos());
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = base.join(format!("{tag}-{}-{nanos}-{n}", std::process::id()));
-            if std::fs::create_dir(&dir).is_ok() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod scratch dir");
-                return Self { dir, keep };
-            }
-        }
-        panic!("could not create a fresh scratch directory");
-    }
-
-    fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = self.dir.join(name);
-        std::fs::write(&p, bytes).expect("write fixture");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod fixture");
-        p
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
-
-fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    let start = bytes.len().saturating_sub(max);
-    String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).into_owned()
-}
-
 /// ホストが起動前に共有へ置く fixture。
 struct Fixture {
     share_dir: PathBuf,
@@ -173,55 +122,6 @@ fn probe_spec(
         .with_shared_directories(shares)
         .with_guest_test(GuestTestMode::VirtiofsIo)
 }
-/// コンソールログが書き出しスレッドの上限（`MAX_CONSOLE_LOG_BYTES`）で打ち切られたか。
-/// 区切り文は上限到達時に末尾へ 1 回だけ書かれ、以後ゲスト出力は破棄されるため、
-/// 末尾が区切り文ならプローブ行の後続は観測できない。
-fn log_truncated(bytes: &[u8]) -> bool {
-    bytes.ends_with(TRUNCATION_MARKER)
-}
-
-/// コンソールログの書き出しスレッド（`console_log`）がログを閉じ終えるまで待つ。
-///
-/// 書き出しスレッドはログへの排他 advisory lock（unix では `flock(2)`）を EOF でファイルを閉じるまで
-/// 保持する（`console_log` モジュールの「排他」）。EOF は VM と設定が解放され serial の書き込み端が
-/// すべて閉じたときに来るため、`Vm` を破棄した後に lock を取れれば、ゲスト出力はすべてファイルへ
-/// 反映済みで以後増えない。期限内に取れなければ不完全なログで判定しないよう `Err` を返す（fail-closed）。
-fn wait_console_log_settled(path: &Path, timeout: Duration) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open console log: {e}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match file.try_lock() {
-            // 取得した lock は `file` の drop で解放される。
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("lock console log: {e}"));
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "console log writer did not finish within {timeout:?}"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn resolve_probe_timeout(raw: Option<String>) -> Result<Duration, String> {
-    match raw {
-        None => Ok(Duration::from_secs(60)),
-        Some(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| (1..=600).contains(n))
-            .map(Duration::from_secs)
-            .ok_or_else(|| {
-                "FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS must be an integer in 1..=600"
-                    .to_string()
-            }),
-    }
-}
-
 /// VM 停止後に `out/write.txt` を検証する。ゲストは untrusted のため、停止後に symlink を拒否し、
 /// 読み込みは期待長 + 1 バイトで打ち切る。
 fn verify_write(share_dir: &Path) -> Result<(), String> {
@@ -270,19 +170,14 @@ struct ProbeOutcome {
     write_check: Result<(), String>,
 }
 
+/// kernel 未設定時の panic 文言（必須・任意の環境変数の一覧）。
+const KERNEL_HELP: &str = "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
+             FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
+             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md.";
+
 /// 実機で VM を起動してプローブを走らせ、停止後に結果を集める。
 fn boot_and_probe(tag: &str) -> ProbeOutcome {
-    let kernel = env_path("FANDHE_CONTAINER_MACOS_VM_KERNEL").unwrap_or_else(|| {
-        panic!(
-            "FANDHE_CONTAINER_MACOS_VM_KERNEL is required. Optional: FANDHE_CONTAINER_MACOS_VM_INITRD, \
-             FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE, FANDHE_CONTAINER_MACOS_VM_CMDLINE (default \"console=hvc0\"), \
-             FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS (1-600, default 60). See AGENTS.md."
-        )
-    });
-    let initrd = env_path("FANDHE_CONTAINER_MACOS_VM_INITRD");
-    let disk = env_path("FANDHE_CONTAINER_MACOS_VM_DISK_IMAGE");
-    let cmdline = std::env::var("FANDHE_CONTAINER_MACOS_VM_CMDLINE")
-        .unwrap_or_else(|_| "console=hvc0".to_string());
+    let assets = vm_guest::GuestAssets::from_env(KERNEL_HELP);
     let timeout =
         resolve_probe_timeout(std::env::var("FANDHE_CONTAINER_MACOS_VM_PROBE_TIMEOUT_SECS").ok())
             .unwrap_or_else(|e| panic!("{e}"));
@@ -292,62 +187,16 @@ fn boot_and_probe(tag: &str) -> ProbeOutcome {
     let spec = probe_spec(
         &s,
         &fixture,
-        &kernel,
-        initrd.as_deref(),
-        disk.as_deref(),
-        &cmdline,
+        &assets.kernel,
+        assets.initrd.as_deref(),
+        assets.disk.as_deref(),
+        &assets.cmdline,
     );
     let log_path = s.dir.join("console.log");
     eprintln!("virtiofs_io: console log at {}", log_path.display());
-    let vm = match Vm::launch(&spec, OpTimeouts::default()) {
-        Ok(vm) => vm,
-        Err(e) => panic!("launch failed: code={} message={}", e.code(), e.message()),
-    };
-
-    // ログの大きさは書き出しスレッドが MAX_CONSOLE_LOG_BYTES で打ち切るため、読み込みは有界。
-    let deadline = Instant::now() + timeout;
-    let mut last = Vec::new();
-    loop {
-        if let Ok(bytes) = std::fs::read(&log_path) {
-            last = bytes;
-        }
-        if parse_probe_log(&last).done {
-            break;
-        }
-        if log_truncated(&last) {
-            // 上限後のゲスト出力は破棄されるため、待っても done は観測できない。明示的に失敗させる。
-            let _ = vm.stop();
-            panic!(
-                "console log hit the size limit before the probe done line; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        if Instant::now() >= deadline {
-            let _ = vm.stop();
-            panic!(
-                "probe done line not observed within {timeout:?}; console tail:\n{}",
-                tail_lossy(&last, 4096)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // ゲストとの TOCTOU を避けるため、停止を確認してから共有の中身を検証する。
-    vm.stop().expect("stop");
-    assert_eq!(vm.state(), VmState::Stopped);
-    // stop は VM の停止だけを待ち、pipe からログへの書き出しは非同期に続く。VM を破棄して書き込み端を
-    // 閉じ、書き出しスレッドの終了（lock の解放）を確認してから確定したログで最終判定する。
-    drop(vm);
-    if let Err(e) = wait_console_log_settled(&log_path, CONSOLE_LOG_SETTLE_TIMEOUT) {
-        panic!("{e}; console tail:\n{}", tail_lossy(&last, 4096));
-    }
-    last = std::fs::read(&log_path).expect("read settled console log");
-    // done 検出後〜停止までにゲスト出力が上限へ達すると、done の後の重複報告・エラーが破棄される。
-    // 停止後に読み直したログでも打ち切りを拒否する（fail-closed）。
-    assert!(
-        !log_truncated(&last),
-        "console log hit the size limit after the probe done line; later guest output was lost; console tail:\n{}",
-        tail_lossy(&last, 4096)
-    );
+    let last = launch_until_done(&spec, &log_path, "probe", timeout, |b| {
+        parse_probe_log(b).done
+    });
     let write_check = verify_write(&fixture.share_dir);
     ProbeOutcome {
         log: parse_probe_log(&last),
@@ -384,15 +233,6 @@ fn mac1_io5_probe_spec_builds_with_rw_share_and_guest_mount() {
     );
 }
 
-/// MAC-1・IO-5・TASK-65.4: 上限到達で打ち切られたログは末尾の区切り文で判別できる。
-#[test]
-fn mac1_io5_log_truncation_is_detected_by_marker() {
-    let mut cut = b"noise".to_vec();
-    cut.extend_from_slice(TRUNCATION_MARKER);
-    assert!(log_truncated(&cut));
-    assert!(!log_truncated(b"noise"));
-}
-
 /// MAC-1・IO-5・TASK-65.4: fixture のレイアウト。
 #[test]
 fn mac1_io5_prepare_fixture_layout() {
@@ -413,56 +253,6 @@ fn mac1_io5_prepare_fixture_layout() {
             .expect("out")
             .count(),
         0
-    );
-}
-
-/// MAC-1・IO-5・TASK-65.4: 実機テストの期限は 1..=600 秒（既定 60）。
-#[test]
-fn mac1_io5_probe_timeout_bounds() {
-    assert_eq!(resolve_probe_timeout(None), Ok(Duration::from_secs(60)));
-    assert_eq!(
-        resolve_probe_timeout(Some("1".into())),
-        Ok(Duration::from_secs(1))
-    );
-    assert_eq!(
-        resolve_probe_timeout(Some("600".into())),
-        Ok(Duration::from_secs(600))
-    );
-    for bad in ["0", "601", "abc", ""] {
-        assert!(resolve_probe_timeout(Some(bad.into())).is_err(), "{bad}");
-    }
-}
-
-/// MAC-1・IO-5・TASK-65.4・REPAIR-5: ログの確定待ちは書き出し側の lock 解放で完了し、
-/// 解放されなければ期限で失敗する。
-#[test]
-fn mac1_io5_wait_console_log_settled_follows_writer_lock() {
-    let s = Scratch::new("settle", false);
-    let log = s.file("console.log", b"boot\n");
-    // 書き出しスレッドの代役: 別の open で排他 lock を保持し、200ms 後に閉じる。
-    let writer = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&log)
-        .expect("open writer");
-    writer.lock().expect("writer lock");
-    assert_eq!(
-        wait_console_log_settled(&log, Duration::from_millis(100)),
-        Err("console log writer did not finish within 100ms".to_string())
-    );
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        drop(writer);
-    });
-    assert_eq!(
-        wait_console_log_settled(&log, Duration::from_secs(10)),
-        Ok(())
-    );
-    release.join().expect("release thread");
-    // ログが無ければ待たずに失敗する。
-    let missing = s.dir.join("missing.log");
-    assert!(
-        wait_console_log_settled(&missing, Duration::from_secs(1))
-            .is_err_and(|e| e.starts_with("open console log: "))
     );
 }
 

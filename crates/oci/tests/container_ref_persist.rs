@@ -55,7 +55,7 @@ fn oci7_persist_child_registers() {
 
 fn run_child(root: &std::path::Path) {
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
         .env(ROOT_ENV, root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

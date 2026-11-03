@@ -10,7 +10,7 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_binds` の成功直後に
+//! - 記録: `RealPrePivotOps` が `create_default_devices`・`mount_tmpfs`・`inject_files`・`mount_etc_files`・`mount_binds` の成功直後に
 //!   [`MountedTargets::push`] する。段の順に並ぶ（同じキーが複数あれば後勝ち。後から載せたものが上になる）
 //! - 受け渡し: `run_child_then` が `StagePipeline::with_mounted_targets` で Landlock 段へ渡す（pivot で `mnt_id` と
 //!   `(st_dev, st_ino)` は変わらない。`PivotReport.new_root_mnt_id` の pivot 後の再照合が先例）
@@ -22,12 +22,18 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - exec の再適用（SUP-6）は launch 時の記録を持たない（`LaunchIsolationRecord` がマウントの識別子を持たず、
-//!   マウント ID は restart で変わる）ため [`MountCheck::NotRecorded`] で、従来どおり暗黙のマウントの
-//!   fs 種別・独立性の確認だけを行う。永続化と照合は後続作業
+//! - exec の再適用（SUP-6）は、`state.json` に永続化した launch 時の識別子（`RecordedMountIdentity`）を
+//!   [`MountedTargets::from_recorded`] で組み直して [`MountCheck::Recorded`] で照合する（#3201）。識別子の無い旧記録は
+//!   exec の入口が `FailedPrecondition` で拒否するため、本モジュールの [`MountCheck::NotRecorded`] に落ちない。
+//!   マウント ID は restart で変わるが、restart は Running(新 pid) の更新で記録を新しい識別子へ置き換える（契約 12）
+//! - 読み取り専用の記録（`MountedTarget::read_only`。#1917）は bind の段の事後検証済みの値だけを持ち、exec の再適用も
+//!   永続化した値で照合する
 //! - 利用者の tmpfs・注入の宛先には今は Landlock のルールが無い。識別子は記録するが、照合の対象は
 //!   今あるルール（暗黙の `/dev` 系 3 本と bind）だけ
-//! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）による強化は将来仕様
+//! - `STATX_MNT_ID_UNIQUE`（64 ビット・再利用されない ID）は使わない（#2130 の判断）。`mnt_id` の再利用による取り違えは
+//!   `(st_dev, st_ino)` の照合で防げており、一意性は restart をまたいで残らないため永続化した記録の強化にもならない。
+//!   使うには `statx` のラッパーを `sys` に新しい `unsafe` として足し（ユーザー承認が要る）、カーネル 6.8 未満では
+//!   fdinfo へ縮退する分岐も要る。必要になったら、その承認を得たうえで改めて採否を決める
 
 use crate::dev_mounts::ImplicitDevMount;
 
@@ -58,6 +64,10 @@ pub(crate) enum MountedBy {
     Tmpfs,
     /// ファイル注入の段（注入ディレクトリの tmpfs）。
     Inject,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind mount の段（識別子の記録のみ。Landlock のルールは作らない。NET-12・#1872）。
+    /// ファイルの bind mount はアクセス時のパス探索がマウント点（rootfs 側の `/etc/hosts`）を経て rootfs の root ルールへ届くため、
+    /// 実効の権利は root と同じで、`/sys` の sysfs（`build_path_rules_with_dev` の `/sys` の項）と同じ理由で個別のルールを要さない。
+    EtcFile,
     /// bind mount の段。`index` は `mounts[]` 内の位置（`RuleOrigin::Mount` と同じ番号）。
     Bind {
         /// `mounts[]` 内の位置。
@@ -74,6 +84,9 @@ pub(crate) struct MountedTarget {
     pub(crate) destination: String,
     /// 載せた直後に観測した識別子。
     pub(crate) identity: MountIdentity,
+    /// 載せたマウントが読み取り専用か（bind は事後検証済みの値。それ以外の段は `false`。#1917・CORE-5）。
+    /// 検証済みの `ro` の bind に頼るルール（`requires_read_only_mount`）の適用時の照合に使う。
+    pub(crate) read_only: bool,
 }
 
 /// pivot 前段が載せたマウントの記録（段の順）。既定値は空で、空のまま Mount 由来のルールがあれば照合は拒否する。
@@ -99,6 +112,44 @@ impl MountedTargets {
         Ok(())
     }
 
+    /// 分離の記録（`state.json` の `launch_isolation`）に残した launch 時の識別子から、exec の再適用が照合に使う
+    /// 記録を組み直す（SEC-1・SEC-4・#3201）。
+    ///
+    /// [`Self::target_for`] の引き方と鏡写しにする: 暗黙の `/dev`・`/dev/pts` は専用 `/dev` の段、`/dev/shm` は
+    /// **tmpfs の段**（宛先 `/dev/shm`。`DefaultDevices` にしない）、`Mount` は bind の段の同じ `index`、利用者 tmpfs は
+    /// tmpfs の段の同じ宛先。識別子の無い規則（`Root`・旧記録）は載せない。
+    pub(crate) fn from_recorded(
+        recorded: &crate::launch_isolation::RecordedLandlock,
+    ) -> Result<Self, MountedTargetsFull> {
+        use crate::launch_isolation::RecordedTarget;
+        let mut out = Self::new();
+        for rule in recorded.rules() {
+            let Some(id) = rule.mount() else { continue };
+            let (by, destination) = match rule.target() {
+                RecordedTarget::Root => continue,
+                RecordedTarget::Implicit(ImplicitDevMount::DevShm) => {
+                    (MountedBy::Tmpfs, ImplicitDevMount::DevShm.destination())
+                }
+                RecordedTarget::Implicit(m) => (MountedBy::DefaultDevices(*m), m.destination()),
+                RecordedTarget::Mount { destination, index } => {
+                    (MountedBy::Bind { index: *index }, destination.as_str())
+                }
+                RecordedTarget::Tmpfs { destination } => (MountedBy::Tmpfs, destination.as_str()),
+            };
+            out.push(MountedTarget {
+                by,
+                destination: destination.to_string(),
+                identity: MountIdentity {
+                    mnt_id: id.mnt_id(),
+                    dev: id.dev(),
+                    ino: id.ino(),
+                },
+                read_only: id.read_only(),
+            })?;
+        }
+        Ok(out)
+    }
+
     /// 件数。
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -115,8 +166,22 @@ impl MountedTargets {
     ///
     /// - `Implicit{Dev|DevPts}` は専用 `/dev` の段、`Implicit{DevShm}` は tmpfs の段で宛先が `/dev/shm` の件
     /// - `Mount{index}` は bind の段の同じ `index`
-    pub(crate) fn expected_for(&self, origin: &RuleOrigin) -> Option<&MountIdentity> {
-        let found = self.0.iter().rev().find(|t| match origin {
+    /// - `UserTmpfs` は tmpfs の段で宛先がルールの宛先（`destination`）と一致する件（SUP-12・#2625）
+    pub(crate) fn expected_for(
+        &self,
+        origin: &RuleOrigin,
+        destination: &str,
+    ) -> Option<&MountIdentity> {
+        self.target_for(origin, destination).map(|t| &t.identity)
+    }
+
+    /// [`Self::expected_for`] と同じ引き方で、記録 1 件（`read_only` を含む）を返す（#1917）。
+    pub(crate) fn target_for(
+        &self,
+        origin: &RuleOrigin,
+        destination: &str,
+    ) -> Option<&MountedTarget> {
+        self.0.iter().rev().find(|t| match origin {
             RuleOrigin::Implicit {
                 mount: ImplicitDevMount::DevShm,
             } => {
@@ -124,9 +189,9 @@ impl MountedTargets {
             }
             RuleOrigin::Implicit { mount } => t.by == MountedBy::DefaultDevices(*mount),
             RuleOrigin::Mount { index } => t.by == MountedBy::Bind { index: *index },
+            RuleOrigin::UserTmpfs => t.by == MountedBy::Tmpfs && t.destination == destination,
             _ => false,
-        });
-        found.map(|t| &t.identity)
+        })
     }
 }
 
@@ -135,7 +200,7 @@ impl MountedTargets {
 pub(crate) enum MountCheck<'a> {
     /// launch 経路。pivot 前段が記録した識別子と照合する。ルールが Mount 由来で記録が引けなければ拒否する。
     Recorded(&'a MountedTargets),
-    /// launch 時の記録を照合に使えない経路（exec の再適用と結合試験専用の観測関数）。暗黙のマウントの
+    /// launch 時の記録を照合に使えない経路（結合試験専用の観測関数。exec の再適用は #3201 で `Recorded` になった）。暗黙のマウントの
     /// fs 種別・独立性の確認は従来どおり行い、識別子の照合はしない（弱めない。REPAIR-3 の例外。launch の入口
     /// 〔`StagePipeline`〕はこの variant を構築しない）。
     NotRecorded,
@@ -156,6 +221,7 @@ mod tests {
             by,
             destination: destination.to_string(),
             identity: MountIdentity { mnt_id, ..ID },
+            read_only: false,
         }
     }
 
@@ -178,7 +244,8 @@ mod tests {
         ] {
             m.push(t).expect("capacity");
         }
-        let id = |o: RuleOrigin| m.expected_for(&o).map(|i| i.mnt_id);
+        let id = |o: RuleOrigin| m.expected_for(&o, "").map(|i| i.mnt_id);
+        let tmpfs = |d: &str| m.expected_for(&RuleOrigin::UserTmpfs, d).map(|i| i.mnt_id);
         assert_eq!(
             id(RuleOrigin::Implicit {
                 mount: ImplicitDevMount::Dev
@@ -201,6 +268,9 @@ mod tests {
         assert_eq!(id(RuleOrigin::Mount { index: 1 }), Some(16));
         assert_eq!(id(RuleOrigin::Mount { index: 2 }), None);
         assert_eq!(id(RuleOrigin::Root), None);
+        // 利用者 tmpfs は tmpfs の段の同じ宛先で引く(bind の段は拾わない)。
+        assert_eq!(tmpfs("/run"), Some(12));
+        assert_eq!(tmpfs("/a"), None);
         assert_eq!(m.len(), 7);
         assert_eq!(m.targets().len(), 7);
     }

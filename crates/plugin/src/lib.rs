@@ -17,7 +17,7 @@
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
 //! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
 //! 別 UID 接続拒否の結合試験（TASK-124.4・#295。実機前提の 2 件は人間が実行）と peer 認証が最初の読み書きより前であることの照合テスト（TASK-124.6・#1389）も追加済みで、
-//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
+//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。
@@ -37,6 +37,9 @@ pub mod lifecycle;
 pub mod message;
 pub mod rss;
 pub mod signal_forward;
+// fd の生成と spawn の直列化（macOS の std の close-on-exec 非原子化の窓。PLUG-7・SEC-1・#3139）。
+#[cfg(unix)]
+pub(crate) mod spawn_gate;
 // syscall・FFI の薄いラッパーの置き場で、`unsafe` を許すのはここだけ（#4 の事前承認は `sys` に限る。
 // `unsafe fn` を外へ公開せず安全な `pub(crate)` 関数だけを出す契約は `sys` の冒頭 doc を参照）。
 #[cfg(unix)]
@@ -90,3 +93,9 @@ pub use transport::{
 pub use uds_security::{
     ONE_SHOT_SWEEP_MAX_ENTRIES, ONE_SHOT_SWEEP_MAX_SCAN, OneShotSweep, RUNTIME_DIR_NAME, RuntimeDir,
 };
+
+// pid だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3375）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

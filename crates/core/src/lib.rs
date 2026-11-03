@@ -39,8 +39,8 @@
 //! - `observability`: メトリクス集計型 `OpStats` 等（TASK-84.1）と記録 API `OpRecorder`
 //!   （TASK-84.2）は実装済み（REPAIR-4）。JSON Lines 出力（TASK-84.3）も実装済み。create / start / kill の計装は実装済み（TASK-84.4）、delete も TASK-30.2 で同じパターンにより計装済み。io 向け連携点は io 側に定義済み（TASK-84.5）
 //! - `landlock`: Landlock ABI 検出（TASK-39.1・#181）とパスルール生成（TASK-39.2・#182）と ruleset 適用（TASK-39.3・#183）を実装済み（Linux 限定。CORE-5）。ステージ列への組み込み口（`StagePipeline::with_landlock`・TASK-39.4・#184）は実装済みで、制限適用の証跡は `LaunchReady`（#1714）で配線済み。本番 launcher（`oci_runtime::ProductionLauncher`）からの呼び出しは実装済み（#1816。実プロセスでの確認は `tests/production_launcher.rs`・#1818）。
-//! - `legacy_tiocsti`: 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告の構造化ログを 1 行出す（観測のみで起動は止めない。CORE-5・SEC-1・REPAIR-4・#1658 の案 A・#1739。OS 非依存。呼び出し元は `exec::spawn_container_with_stages` と本番 launcher の入口 `exec::spawn_container_via_intermediate`〔#2008〕）
-//! - `logging`: JSON Lines 共通ログ型 `LogLine` 等と書き出し口（TASK-98.1・ERR-4。OS 非依存）。既存出力の移行は TASK-98.2（#653）で未実装（REPAIR-3）
+//! - `legacy_tiocsti`: 起動時に `dev.tty.legacy_tiocsti` を読み、`1` のときだけ警告の構造化ログを 1 行出す（観測のみで起動は止めない。CORE-5・SEC-1・REPAIR-4・#1658 の案 A・#1739。OS 非依存。呼び出し元は `exec::spawn_container_with_stages`〔結合試験専用・`exec-test-support`〕と本番 launcher の入口 `exec::spawn_container_via_intermediate`〔#2008〕）
+//! - `logging`: JSON Lines 共通ログ型 `LogLine` 等と書き出し口（TASK-98.1・ERR-4。OS 非依存）。監査ログ（#3115）と `observability` の op_stats（#3116）は移行済み。その他の既存出力の移行は TASK-98.2（#653）で未実装（REPAIR-3）
 //! - `rlimits`: rlimit（`process.rlimits`・`--ulimit`）の検証済み型 `Rlimit`・`Rlimits`（SUP-12・TASK-169.1・#526。OS 非依存）。適用は `exec::StagePipeline::with_rlimits`（Linux 限定）で、OCI config からの結線は未実装（REPAIR-3）
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
@@ -60,7 +60,7 @@
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
-//!   start（TASK-29.3）の起動は `ProcessLauncher` の依存注入で、本番 launcher（`ProductionLauncher`・Linux。#1816）は実装済み。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み（#1819）。restart の再 launch は未対応（#2043）。
+//!   start（TASK-29.3）の起動は `ProcessLauncher` の依存注入で、本番 launcher（`ProductionLauncher`・Linux。#1816）は実装済み。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み（#1819）。restart の再 launch は supervisor が常駐スレッドを止めて呼び出しスレッドで直接行う（#2043。core のコードは変えず `Threads: 1` の検査も弱めない）。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
 //! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、
@@ -79,13 +79,15 @@
 //!   発見・登録・起動の本番配線は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
 //!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
-//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。非 Linux は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装
+//! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。macOS は実装済み（拡張 ACL を含む。#1865）、Windows は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
 //! - `exec`・`sys`（`sys.rs`）は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
 //!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。macOS には別ファイル `sys/macos.rs`
-//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出のみ。`state_store` 用。#2247・OCI-5）を
+//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出〔`state_store` 用。#2247・OCI-5〕と、
+//!   plugin 検証向けの symlink 非追従の fd 相対 open・fd の実体パス取得・fd の拡張 ACL 検出〔`plugin_fs`。
+//!   呼び出し元は `plugin_trust`〔#1865〕。#1864・PLUG-11〕のみ）を
 //!   `#[cfg(target_os = "macos")]` で取り込み、Linux の宣言は macOS に漏らさない。`traits` は OS 非依存で 3 OS に公開される
 //! - `sys` の `extern "C"` 宣言と `unsafe` は glibc / musl の型幅・syscall 番号を前提とするため、
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）
@@ -112,6 +114,7 @@ pub mod capabilities;
 pub mod cgroups;
 pub mod container_usage;
 pub mod dev_mounts;
+pub mod etc_files;
 #[cfg(target_os = "linux")]
 pub mod exec;
 pub mod injected_files;
@@ -136,12 +139,18 @@ pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
+pub mod sysctl;
 // macOS 向けの `sys` は別ファイル（Linux の宣言を macOS へ漏らさない。#2247・OCI-5）。
 #[cfg(target_os = "macos")]
 #[path = "sys/macos.rs"]
 mod sys;
 #[cfg(test)]
 mod test_support;
+// 単体試験の一時領域を残骸・tmpfiles の flock 走査から守る共有部品（#3373・#2958・REPAIR-12）。
+// 試験専用で製品・rlib に影響しない。3 OS の試験（`oci_runtime::config` 等）から使う。
+#[cfg(test)]
+#[path = "../tests/support/scratch_root.rs"]
+mod scratch_root;
 pub mod tmpfs;
 pub mod traits;
 

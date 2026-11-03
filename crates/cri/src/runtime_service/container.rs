@@ -6,18 +6,21 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`image_id`・`user`・`message`・`info` は空のスタブ（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`message`・`info` は方針として常に空（#2901。`image_ref`・`image_id` は CreateContainer 時の解決結果を返し、報告の無い経路は空。#2831。`image` は在庫のタグ）（`user` は実行層の経路のみ報告。#2771）（REPAIR-3。項目ごとの扱いは `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
 //! 記録上の遷移と除去だけで、プロセスの終了・猶予待ちは行わない。TASK-59（CRI-2）で `ContainerRuntime`
 //! 経由の namespace 分離起動・終了と `StateStore` へ置き換える。
-//! `command`・`mounts`・`log_path` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+//! `command`・`mounts` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+//! `log_path` は実行層接続時に `log_directory` と結合・検証した値を別途保持する（`resolved_log_path`。#2671）。
 
 use std::collections::HashMap;
 
 use crate::adapter::RuntimeTerminationReason;
+use crate::bundle::{AppliedUser, ResolvedImage};
 use crate::error::CriError;
+use fandhe_container_core::traits::ContainerLogPath;
 use prost::Message;
 
 use super::config_limits::{
@@ -137,6 +140,10 @@ pub(super) struct ContainerRecord {
     /// 実行層が報告した特別な終了理由（OOM 等。CRI-2・CORE-4）。未報告は None。
     pub(super) termination: Option<RuntimeTerminationReason>,
     pub(super) retained_bytes: usize,
+    /// `log_directory` と `log_path` を結合・検証した CRI ログの書き先（実行層接続時の CreateContainer のみ。
+    /// CRI-2・SUP-4・#2671）。`ContainerStatus.log_path` に返し（kubelet・crictl が直接開く）、StartContainer が
+    /// supervisor へ渡す。スタブ経路・両方空・`log_directory` だけのときは `None`。
+    pub(super) resolved_log_path: Option<ContainerLogPath>,
     /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
     /// 状態は呼び出し前のまま、並行する Start・Stop・Remove・親サンドボックスの停止・除去を `FAILED_PRECONDITION` で
@@ -148,6 +155,32 @@ pub(super) struct ContainerRecord {
     /// 真の間、Stop・Remove は記録上の遷移ではなく実行層の stop・delete を経由する（TASK-59.3）。
     /// 意味は「実行層が所有する」。
     pub(super) runtime_owned: bool,
+    /// 実際に stop で使うシグナル（CRI の `Signal` の i32。`RUNTIME_DEFAULT`（0）は入れない。#2771・CRI-2・OCI-1）。
+    ///
+    /// 作成時は config の値（`RUNTIME_DEFAULT` なら `SIGTERM`）で、`BundleProvider` が解決済みの値を報告したら
+    /// イメージ config の `StopSignal` を反映した値で上書きされる。`ContainerStatus.stop_signal` と
+    /// StopContainer / StopPodSandbox が使う。記録ストア注入時はコンテナ記録へも書く（R5 #2934。再起動後は R7 #2936 の `readopt_containers` が記録から復元する）
+    /// （`exit_code`・`resolved_log_path` と同じ寿命。config の annotations には書かない）。
+    pub(super) stop_signal: i32,
+    /// 起動時に適用する識別情報（`ContainerStatus.user.linux` の元。#2771・CRI-2・SEC-5・KEP-3619）。
+    ///
+    /// 実行層の経路で `SpecBundleProvider` が config.json に書いた値だけが入る。報告の無い経路は `None`
+    /// （root を作り出さない）。寿命は `stop_signal` と同じ。
+    pub(super) applied_user: Option<AppliedUser>,
+    /// CreateContainer 時に解決したイメージ（`image_ref`・`image_id` の元。#2831・CRI-2・OCI-1）。
+    ///
+    /// 置き場所はプロセス内メモリのレジストリで、寿命は `applied_user`・`stop_signal` と同じ（annotations にも
+    /// `StateStore` にも書かない。記録ストア注入時はコンテナ記録へも書く。再起動後は R7 #2936 の `readopt_containers` が記録から復元する）。報告の無い経路（スタブ・外部 bundle）は `None`。
+    pub(super) resolved_image: Option<ResolvedImage>,
+}
+
+/// 新しい記録の `stop_signal` の初期値（config の値。`RUNTIME_DEFAULT` は `SIGTERM`）。
+pub(super) fn initial_stop_signal(configured: i32) -> i32 {
+    if configured == v1::Signal::RuntimeDefault as i32 {
+        v1::Signal::Sigterm as i32
+    } else {
+        configured
+    }
 }
 
 /// 終了コード 0 の `ContainerStatus.reason`（containerd・kubelet の慣例に合わせた CamelCase。CRI-2）。
@@ -187,19 +220,32 @@ fn exit_reason(
 impl ContainerRecord {
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
-    /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
+    /// labels・annotations・mounts は保持した値を無改変で返す。`log_path` は結合済みの絶対パス（`resolved_log_path`。
+    /// containerd と同じ。kubelet の GetContainerLogs と crictl logs が直接開く）があればそれ、無ければ保持した値を返す。`envs`・`command`・`args` は
     /// 応答項目に無く（秘密値が入り得る）、返さない。`exit_code` は実行層が報告した値（不明は 0）、
     /// `reason` は `exit_reason` で導く（`Completed`・`Error`・`OOMKilled`）。
     ///
-    /// **スタブの明示（REPAIR-3・CRI-2）**: 次の項目は返せる情報源が無く、空・`None` のまま。
-    /// - `image_ref`・`image_id`: `CriRuntimeService` が `ImageStore` を持たない。将来は CreateContainer 時に
-    ///   `ImageStore` で解決して記録へ保持した digest 等を返す（未注入・未解決は空のまま）。
-    /// - `user`: 実プロセスの uid / gid / 補助 group が必要。将来は `BundleProvider` の本番実装
-    ///   （TASK-114）が作った bundle の `process.user` から返す。
-    /// - `message`: 実行層の応答文字列を外へ出さない方針のため固定文字列のみ許す。OOM でも空。
-    /// - `info`（verbose）: 固定キーの診断情報を将来返す。現状は空。
+    /// - `image`（#2901）: CreateContainer 時に在庫から得た `repo_tags[0]` があれば、containerd と同じく新しい `ImageSpec`
+    ///   （`image` のみ。annotations・`user_specified_image` は落ちる）に置き換える。タグが無い・報告の無い経路は `config.image` のまま。
+    ///   containerd b7a2526 の `container_status.go` L65 は Status のたびに在庫を引くが、本実装は create 時のスナップショット。
+    ///   `to_summary`（ListContainers）は containerd の `toCRIContainer` と同じく置き換えず `config.image` を返す。
     ///
-    /// これらの実装は TASK-59 追補（#2322）の分割 issue で追う。
+    /// **方針として空の項目と未実装の明示（REPAIR-3・CRI-2）**:
+    /// - `image_ref`・`image_id`（#2831）: `BundleProvider` が報告した CreateContainer 時の解決結果を返す。
+    ///   `image_id` は image ID（`sha256:<config digest>`。`PullImageResponse.image_ref` と同じ）、`image_ref` は在庫の
+    ///   `repo_digests[0]`（無ければ image ID。multi-arch のタグ pull では index digest で containerd と同じ。#2969）。報告の無い経路（スタブ・外部 bundle）は両方空（digest を推測しない。
+    ///   containerd は空を返さない本リポ固有の挙動）。containerd b7a2526 は Status の時点で在庫を引き直すが、
+    ///   本実装は create 時のスナップショットを返し続ける（既知の差。`docs/design/cri-config-acceptance.md`）。
+    /// - `user`: 実行層の経路で `BundleProvider` が報告した config.json の `process.user`（起動時に適用する値。
+    ///   `applied_user`）を返す。報告の無い経路（スタブ等）と、補助グループが空で実プロセスのグループと一致を保証できない場合は `None`。`supplemental_groups` は重複除去後の最終の
+    ///   集合で、主 gid は自動では含めない（containerd は含めることがある既知の差）。`stop_signal` は実際に
+    ///   stop で使う解決済みの値（#2771）。
+    /// - `message`: 常に空（決定。#2901）。containerd が書くのは start 失敗の `retErr.Error()` だけで、実行層の応答文字列を
+    ///   外へ出さない方針に合わない。OOM でも空。
+    /// - `info`（verbose）: 常に空（決定。#2901）。containerd の `info` は config（envs）・OCI spec（ホストパス）等で、
+    ///   内部のパス・構成を出さない方針に合わない。将来値を入れる場合も、キーは `"info"` の 1 つで値は JSON 文字列とする。
+    ///
+    /// 差の詳細は `docs/design/cri-config-acceptance.md`。
     pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
         let linux = self
             .config
@@ -224,34 +270,79 @@ impl ContainerRecord {
             started_at: self.started_at_nanos,
             finished_at: self.finished_at_nanos,
             exit_code: self.exit_code.unwrap_or(0),
-            image: self.config.image.clone(),
-            image_ref: String::new(),
+            image: self
+                .resolved_image
+                .as_ref()
+                .and_then(ResolvedImage::tag)
+                .map(|tag| v1::ImageSpec {
+                    image: tag.to_owned(),
+                    ..Default::default()
+                })
+                .or_else(|| self.config.image.clone()),
+            image_ref: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.image_ref().to_owned()),
             reason: exit_reason(self.state, self.exit_code, self.termination).to_owned(),
             message: String::new(),
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
             mounts: self.config.mounts.clone(),
-            log_path: self.config.log_path.clone(),
+            log_path: self
+                .resolved_log_path
+                .as_ref()
+                .map_or_else(|| self.config.log_path.clone(), |p| p.as_str().to_owned()),
             resources,
-            image_id: String::new(),
-            user: None,
-            stop_signal: self.config.stop_signal,
+            image_id: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
+            // 補助グループが明示（非空）のときだけ報告する。空の指定は core が `setgroups(0)` で消去するが、
+            // `RootlessSingleId` のように user namespace が `setgroups` を禁じる構成では起動元の補助グループを
+            // 現状維持して起動を続ける（`KeptSetgroupsDenied`）。cri 側では実際に残るグループを知り得ず、
+            // 空を報告すると実プロセスと食い違うため、その場合は user を未報告にする（CRI-2・SEC-5。
+            // 実行層が確定した初期グループを記録へ返す経路は未実装）。非空は適用できなければ起動が失敗する。
+            user: self
+                .applied_user
+                .as_ref()
+                .filter(|u| !u.additional_gids().is_empty())
+                .map(|u| v1::ContainerUser {
+                    linux: Some(v1::LinuxContainerUser {
+                        uid: i64::from(u.uid()),
+                        gid: i64::from(u.gid()),
+                        supplemental_groups: u
+                            .additional_gids()
+                            .iter()
+                            .map(|g| i64::from(*g))
+                            .collect(),
+                    }),
+                }),
+            stop_signal: self.stop_signal,
         }
     }
 
-    /// ListContainers 応答用の変換（Status の部分集合。`image_ref`・`image_id` は TASK-59 まで空）。
+    /// ListContainers 応答用の変換（Status の部分集合）。
+    ///
+    /// `image_ref`・`image_id` はどちらも image ID（containerd b7a2526 の `toCRIContainer` と同じ）。
+    /// 報告の無い経路は空（#2831）。
     pub(super) fn to_summary(&self, id: &str) -> v1::Container {
         v1::Container {
             id: id.to_owned(),
             pod_sandbox_id: self.pod_sandbox_id.clone(),
             metadata: self.config.metadata.clone(),
             image: self.config.image.clone(),
-            image_ref: String::new(),
+            image_ref: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
             state: self.state.to_proto() as i32,
             created_at: self.created_at_nanos,
-            labels: self.config.labels.clone(),
-            annotations: self.config.annotations.clone(),
-            image_id: String::new(),
+            labels: self.config.labels.clone().into_iter().collect(),
+            annotations: self.config.annotations.clone().into_iter().collect(),
+            image_id: self
+                .resolved_image
+                .as_ref()
+                .map_or_else(String::new, |i| i.id_str().to_owned()),
         }
     }
 }
@@ -324,21 +415,13 @@ pub(super) struct ValidatedCreate {
     pub(super) config: BoundedContainerConfig,
 }
 
-/// `CreateContainer` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+/// `ContainerConfig` の必須項目と上限を検証し、保持用に作り直す（CreateContainer と記録の復号が共有する。
+/// #2930・CRI-1・REPAIR-1・REPAIR-2）。
 ///
-/// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
-pub(super) fn validate_create_request(
-    req: v1::CreateContainerRequest,
-) -> Result<ValidatedCreate, CriError> {
-    let v1::CreateContainerRequest {
-        pod_sandbox_id,
-        config,
-        sandbox_config,
-    } = req;
-    if pod_sandbox_id.is_empty() {
-        return Err(CriError::invalid_argument("pod_sandbox_id is required"));
-    }
-    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
+/// 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
+pub(super) fn validate_container_config(
+    config: ContainerConfig,
+) -> Result<BoundedContainerConfig, CriError> {
     let metadata = config
         .metadata
         .as_ref()
@@ -355,12 +438,6 @@ pub(super) fn validate_create_request(
     if image.image.is_empty() {
         return Err(CriError::invalid_argument("config.image.image is required"));
     }
-    if let Some(sandbox_config) = sandbox_config.as_ref()
-        && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
-    {
-        return Err(CriError::invalid_argument("sandbox_config is too large"));
-    }
-    // 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
     if metadata.name.len() > MAX_METADATA_FIELD_BYTES {
         return Err(CriError::invalid_argument(format!(
             "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
@@ -373,9 +450,37 @@ pub(super) fn validate_create_request(
             "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
         )));
     }
-    let name = metadata.name.clone();
-    let attempt = metadata.attempt;
-    let config = BoundedContainerConfig::new(config)?;
+    BoundedContainerConfig::new(config)
+}
+
+/// `CreateContainer` の入力検証（ERR-3: 必須欠落・値域外・サイズ超過は `INVALID_ARGUMENT`）。
+///
+/// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
+pub(super) fn validate_create_request(
+    req: v1::CreateContainerRequest,
+) -> Result<ValidatedCreate, CriError> {
+    let v1::CreateContainerRequest {
+        pod_sandbox_id,
+        config,
+        sandbox_config,
+    } = req;
+    if pod_sandbox_id.is_empty() {
+        return Err(CriError::invalid_argument("pod_sandbox_id is required"));
+    }
+    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
+    if let Some(sandbox_config) = sandbox_config.as_ref()
+        && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
+    {
+        return Err(CriError::invalid_argument("sandbox_config is too large"));
+    }
+    // 名前・attempt は検証後の config から取る（metadata 必須は validate_container_config が保証する）。
+    let config = validate_container_config(config)?;
+    let (name, attempt) = config
+        .config()
+        .metadata
+        .as_ref()
+        .map(|m| (m.name.clone(), m.attempt))
+        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
     Ok(ValidatedCreate {
         pod_sandbox_id,
         name,
@@ -407,6 +512,11 @@ impl BoundedContainerConfig {
             config,
             retained_bytes,
         })
+    }
+
+    /// 検証済みの `config` を借りる（CRI ログの書き先の結合に使う）。
+    pub(super) fn config(&self) -> &ContainerConfig {
+        &self.config
     }
 
     /// 保持量の見積もり。

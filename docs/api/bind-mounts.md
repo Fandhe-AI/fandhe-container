@@ -23,14 +23,17 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 
 ## 受けるオプション
 
-`bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`。後に書いた指定が勝つ（`ro` と `rw`、`noexec` と `exec`）。`rbind` のときだけ再帰的に bind する。
+`bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`・`rslave`。後に書いた指定が勝つ（`ro` と `rw`、`noexec` と `exec`）。`rbind` のときだけ再帰的に bind する。
+
+`rslave` は、ホストの peer group から受けるだけの slave で付ける（ホストで後からその元の下にマウントされた内容がコンテナ内に見える。コンテナからホストへは伝播しない）。元が属するホスト側のマウントが shared か slave である必要があり、private なら `start` は rootfs に触れる前に `FAILED_PRECONDITION` で失敗する（黙って private で載せない）。`private`・`rprivate` との併記は `INVALID_ARGUMENT`。CRI の HostToContainer はこの指定へ変換される（#2669・CRI-2・OCI-4）。
 
 ## 拒否するもの
 
 | 指定 | 理由 |
 | ---- | ---- |
 | `suid`・`dev` | 必須の制限を外すため（SEC-1） |
-| `shared`・`rshared`・`slave`・`rslave`・`unbindable`・`runbindable` | 伝播は常に private（ホストへのマウントの漏れを防ぐ） |
+| `shared`・`rshared`・`slave`・`unbindable`・`runbindable` | コンテナからホストへ伝播させない（ホストへのマウントの漏れを防ぐ）。user namespace の中ではホストの shared マウントが slave に格下げされるため、`rshared` は原理的に成り立たない（`docs/design/mount-propagation.md`）。`slave`（非再帰）は `rbind` で配下も slave になり意味が食い違うため受けない |
+| `rslave` と `private`・`rprivate` の併記 | 意味が曖昧なため（#2669。`bind` と `rbind` の併記と同じ扱い） |
 | 上記以外のオプション（`defaults`・`rro`・`idmap` を含む） | 未知の指定は fail-closed |
 | `bind` と `rbind` の併記 | 意味が曖昧なため |
 | 相対パス・`..`・`.`・空要素・`\`・NUL を含む `source`、`source: "/"` | 絶対パスの正規形のみ受ける |
@@ -65,7 +68,7 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 ## Docker / runc と異なる既定
 
 - `nosuid` と `nodev` を常に付ける。外せない
-- 伝播は常に private
+- 伝播は private が既定。`rslave` だけ受け、ホスト側の元が private なら runc と違って起動を拒否する（runc は private のまま載せる）
 - `source` は絶対パスのみ（bundle 相対は不可）
 - 疑似 FS（procfs・sysfs・cgroup など）上の `source` は拒否する（runc は受ける）
 - ホストの `/dev`（devtmpfs）配下の `source` は拒否する（runc は受ける。SEC-1・#2129）
@@ -75,13 +78,15 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 
 ## 制約と未対応
 
-- `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を保証できないため、起動前に拒否される。解消は #1917
+- `rslave` でホストから伝播してきたマウントには、ホスト側のマウントの属性とカーネルのロックが付き、こちらの `nosuid`・`nodev`・`ro`・`noexec` は付かない。疑似 FS と状態ルートの検査も付け替えた時点の 1 回だけである（HostToContainer の意味に内在する。引き起こせるのはホスト側の特権主体だけ。#2669）。実機での伝播の確認は [verification](../verification/bind-rslave-propagation.md)
+- `ro` の bind は、root が書き込み可能な構成でも受ける（CORE-5・#1917。#1910 の決定 B）。Landlock は祖先の書き込み権を子で取り消せないため、書き込みの禁止は実際に載せた bind mount の VFS の読み取り専用属性が担い、Landlock の側は `noexec`・`nodev` と同じ「狭められない制限」として監査用に記録するだけである。受けるのは start が検証した bind の集合（`spec.bind_mounts()`）と一致する `ro` の bind だけで、集合に無い・宛先が食い違う・`ro` の bind の下に書き込み可能な mount がある場合は起動前に拒否する。適用の段は、`landlock_add_rule` の前に開いた fd の `ST_RDONLY` と bind の事後検証の結果を確かめ、読み取り専用でなければ `FAILED_PRECONDITION` で拒否する。読み取り専用を外せないことの根拠は能力の削減（`CAP_SYS_ADMIN` を持たない）と既定の seccomp（`mount` 系・`mount_setattr` の拒否）の 2 本で、bind は `MNT_LOCKED` ではないためこの 2 本に依存する。残余: マウント元の別名（同じホストのディレクトリを rw の別の bind でも公開する場合など）は検出しない。実機での `EROFS` の確認は #1916。`root.readonly=true`（start が受け、pivot 直後に rootfs を読み取り専用にする。#2767。`create --read-only` でも同じ実効値になる。#2828）の構成では root に書き込み権が無いため、記録も要らず `ro` で適用される
 - bind と `/sys` の sysfs（下記）以外の `mounts[]` の種類は未対応
 - 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。start は状態ルート配下の通常ファイルのリンク数を上限つきで走査し、リンク数 2 以上のものがある〔または走査できない〕場合は、同じファイルシステム上のディレクトリ元も適用の段で拒否する）。元のマウント ID は `O_PATH` で固定した fd から取り、FIFO への差し替えでもブロックしない（REPAIR-5）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する
 - 疑似 FS の拒否は拒否リストの方式のため、リストにない未知の疑似 FS は受ける。許可リスト方式にすると zfs・ceph・9p・virtiofs などを壊すため採らず、リストの見直しはカーネルの版を上げるときに行う（SEC-1・#2129）。実機での確認は #1916
 - FUSE（`fuse`・`fuseblk`・`fuse.lxcfs` などの派生名）はデータを持つ FS として受ける。FUSE デーモンが見せる中身は検出しない。中身はデーモンの資格情報の範囲を超えないためである
 - overlayfs 上の元は、付け替えた木の mountinfo の super_options（`lowerdir`・`lowerdir+`・`datadir+`・`upperdir`・`workdir`）の層を `/` から辿り、rootfs・状態ルートと同一・祖先・子孫でないことを inode で照合する（`rbind` では配下の overlay も対象。SEC-1・#2166）。次の場合は `FAILED_PRECONDITION` で拒否する。(1) 層を現在の mount namespace で解決できない（相対パス・消えた層・symlink・ディレクトリでない層）。たとえば Docker のコンテナ内のように `/` が overlay で下層が見えない環境では、その overlay 上の元を拒否する。(2) super_options を解析できない、または上限（層 500・1 層 4096 バイト・1 件の bind で合計 4096 層）を超える。(3) 層が別の overlay の上にある（入れ子。再帰的には照合しない）。層は inode の鎖に加え、層の属するマウントの ID から求めた mountinfo の `(dev, path)` でも保護対象・子マウントと照合する（bind mount を挟んだ祖先関係の検出）。(4) 上の照合に通っても、overlay の元は拒否する。開き直した層のパスは overlay が保持する実際の backing directory と同一とは限らず（作成後に lowerdir のパスを別の bind mount で覆う等）、同一性を保証できる識別情報が無いため fail-closed とする。違反の記録には層のパスを載せない
-- 保護対象（状態ルート・rootfs・bundle）の側が overlayfs の上にある場合は、逆方向の別名も照合する（SEC-1・#2317）。overlay と下層の FS は `st_dev` が異なるため、元が層の実パス（下層の FS 上）を指しても、保護対象の dev との比較では一致しない。適用の時点の mountinfo で保護対象の dev の行が `overlay` なら、その super_options の層を `/` から辿って保護対象に加え、元が層と同一・祖先・子孫であれば宛先を作る前に拒否する。状態ルート由来の層は `bind_source_reaches_state_root`、rootfs・bundle 由来の層は同一・祖先・子孫のすべてを `bind_source_contains_rootfs` とする（overlay の内側の対応〔redirect_dir・metacopy〕は信頼できず、配下のどこが rootfs の祖先に当たるかを決められないため。層は実行基盤の内部の backing storage で、配下を元にできなくても実害は小さい）。層は inode の鎖に加え、層の属するマウントの `(dev, path)` でも照合し（bind mount を挟んだ別名と、`rbind` で一緒に公開される子マウントを検出）、状態ルートのハードリンクの検査にも層の dev を加える。層を解決できない・解析できない・上限超過・入れ子・同じ dev の行の食い違いは `FAILED_PRECONDITION`。**挙動の変化**: Docker のコンテナ内のように保護対象が `/` の overlay の上にあり下層が見えない環境では、層を解決できないため、volume を元にした bind を含めすべての bind mount が `FAILED_PRECONDITION` で拒否される（緩和は後続の課題）。残余: 開き直した層は overlay の実際の backing directory と同一とは限らない（上の (4) と同じ）が、逆方向では一律拒否にしない（一律拒否にすると保護対象が overlay 上にある限りどの bind も拒否になり、層を解決できる環境の無関係な元まで止まるため）。照合は検出できる範囲に限る。違反の記録には層のパスを載せない
+- 保護対象（状態ルート・rootfs・bundle）の側が overlayfs の上にある場合は、逆方向の別名も照合する（SEC-1・#2317）。overlay と下層の FS は `st_dev` が異なるため、元が層の実パス（下層の FS 上）を指しても、保護対象の dev との比較では一致しない。適用の時点の mountinfo で保護対象の dev の行が `overlay` なら、その super_options の層を `/` から辿って保護対象に加え、元が層と同一・祖先・子孫であれば宛先を作る前に拒否する。状態ルート由来の層は `bind_source_reaches_state_root`、rootfs・bundle 由来の層は同一・祖先・子孫のすべてを `bind_source_contains_rootfs` とする（overlay の内側の対応〔redirect_dir・metacopy〕は信頼できず、配下のどこが rootfs の祖先に当たるかを決められないため。層は実行基盤の内部の backing storage で、配下を元にできなくても実害は小さい）。層は inode の鎖に加え、層の属するマウントの `(dev, path)` でも照合し（bind mount を挟んだ別名と、`rbind` で一緒に公開される子マウントを検出）、状態ルートのハードリンクの検査にも層の dev を加える。層を解決できない・解析できない・上限超過・入れ子・同じ dev の行の食い違いは `FAILED_PRECONDITION`。**挙動の変化**: Docker のコンテナ内のように保護対象が `/` の overlay の上にあり下層が見えない環境では、層を解決できないため、volume を元にした bind を含めすべての bind mount が `FAILED_PRECONDITION` で拒否される（緩和は後続の課題）。残余: 開き直した層は overlay の実際の backing directory と同一とは限らない（上の (4) と同じ）が、逆方向では一律拒否にしない（一律拒否にすると保護対象が overlay 上にある限りどの bind も拒否になり、層を解決できる環境の無関係な元まで止まるため）。照合は検出できる範囲に限る。違反の記録には層のパスを載せない 保護対象の dev の行が適用の時点の mountinfo に無い場合は、保護対象の FS の種別を確認できず照合が素通りするため、状態ルート・rootfs・bundle のいずれでも `FAILED_PRECONDITION` で拒否する（#2536。mountinfo の行数上限は解析より先に効かせる）。**既知の残余**: fstype が `overlay` の完全一致でない積層 FS（`fuse.fuse-overlayfs` など）が保護対象の下にあると、super_options に層のパスが載らず層を解決できないため、逆方向の照合は効かない（FUSE は上の項目のとおりデータを持つ FS として受ける）。実機の overlayfs での確認は `crates/core/src/exec/bind_mounts.rs` の `sec1_2536_protected_root_on_real_overlay`（実機前提・`AGENTS.md`「実機前提テスト」）で行う
+- 判断待ち（#2536。オーナー判断。判断が出るまで #2536 は close しない）: 逆方向で開き直した層が overlay の実際の backing directory と同一とは限らない残余を受け入れるか。選択肢は (1) 受け入れる（現状。検出できる範囲だけを照合し、無関係な元は通す）、(2) 一律拒否（保護対象が overlay 上にある限りすべての bind が `FAILED_PRECONDITION`。残余は無くなるが、層を解決できる環境の無関係な元まで止まる）。現状の挙動は (1) だが、判断済みではない
 - start の後に状態ルートが移動・改名・差し替えられた場合、適用の段（restart を含む）は記録したホスト側パスを辿り直し、固定した実体と一致しなければ `FAILED_PRECONDITION` で拒否する（SEC-1・#2129）。mountinfo の `(dev, path)`（状態ルートと、その配下の子マウント）も適用の時点で作り直し、start の記録と作り直した値の両方で照合する。作り直せない、または dev が記録と食い違う場合は `FAILED_PRECONDITION` で拒否する（#2166）
 - restart でも、起動時と同じ bind の集合を適用する
 

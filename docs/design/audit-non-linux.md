@@ -16,14 +16,14 @@
 
 | 箇所 | 非 Linux の現状 | 担当 |
 | ---- | --------------- | ---- |
-| `run_isolated`（主経路の隔離） | 常に失敗（`IsolationUnavailable`） | macOS は #2429、Windows は本書の論点 1 |
-| `file_writer.rs` の `open_checked` | `Unsupported` | macOS は #2429（fd 相対 open は #1864） |
+| `run_isolated`（主経路の隔離） | macOS は実装済み（#2429。pidfd が無いため SIGCHLD の自動回収を事前に拒否し、継承 fd は `proc_pidinfo` の列挙で閉じて再列挙で確かめる）。Windows は常に失敗（`IsolationUnavailable`） | Windows は本書の論点 1 |
+| `file_writer.rs` の `open_checked` | macOS は実装済み（#2429。fd 相対 open と拡張 ACL の拒否）。Windows は `Unsupported` | Windows は #2428 |
 | `kernel_audit.rs`（代替経路） | `UnsupportedTransport` | 本書の論点 2 |
 
 | 環境 | 拒否が起きる場所 | 現 main の記録先の状態 |
 | ---- | ---------------- | ---------------------- |
 | Linux | 同一ホストの seccomp・Landlock | 実装済み・一部未着手（audit-delivery.md） |
-| macOS ホスト | ホスト側の層（plugin の信頼性検証・CLI）のみ | `FileStateStore` は通る（#2247）が記録は `SinkFailed` |
+| macOS ホスト | ホスト側の層（plugin の信頼性検証・CLI）のみ | `FileStateStore` は通り（#2247）、主経路は実装済み（#2429）で成功すれば記録される。代替経路は無く、主経路が失敗すれば `SinkFailed` |
 | macOS ゲスト VM | ゲストの Linux 内（seccomp・Landlock） | 本書の論点外（9 章） |
 | Windows ホスト | ホスト側の層のみ（構成 C ではゲスト内の core が分離を担う。#1415・#1539） | `FileStateStore::open` が `Unimplemented`（#2428）で構築入口も fail-closed |
 | WSL2 ゲスト | ゲスト内の Linux | Linux の実装がそのまま動く |
@@ -49,7 +49,7 @@ origin/main の `git grep` による。
 
 | 呼び出し元 | 内容 | 非 Linux での到達 |
 | ---------- | ---- | ----------------- |
-| `crates/cli/src/commands/plugin_backend.rs` | `FileAuditSink::open_in_state_root` を作り `verify_candidate_audited` に渡す | macOS は到達する（記録は `SinkFailed`）。Windows は `FileStateStore::open` が `Unimplemented` のため構築で fail-closed |
+| `crates/cli/src/commands/plugin_backend.rs` | `FileAuditSink::open_in_state_root` を作り `verify_candidate_audited` に渡す | macOS は到達し、主経路が成功すれば記録される（失敗すれば `SinkFailed`）。Windows は `FileStateStore::open` が `Unimplemented` のため構築で fail-closed |
 | `crates/supervisor/src/exec.rs` | `open_in_state_root`（supervisor はゲスト内の Linux で動く想定） | Windows ホスト・macOS ホストでは動かさない想定 |
 | `crates/core/src/plugin_trust/report.rs` | `verify_candidate_audited` / `record_plugin_trust_rejection` | 上の CLI 経由 |
 

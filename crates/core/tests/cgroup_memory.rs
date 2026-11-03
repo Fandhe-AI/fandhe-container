@@ -11,10 +11,23 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/cgroup_memory-XXXX> --ignored
 //! ```
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use fandhe_container_core::cgroups::{
-        CgroupName, Controller, ControllerSet, DelegatedCgroup, MemoryLimit, MemoryLimits,
+        CgroupName, Controller, ControllerSet, MemoryLimit, MemoryLimits,
     };
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
     use std::fs;
@@ -28,7 +41,7 @@ mod linux {
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn core3_task32_2_set_memory_limits_on_delegated_cgroup() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let parent = PathBuf::from("/sys/fs/cgroup").join(delegated.path().trim_start_matches('/'));
         let id = ContainerId::new(format!("m{}", std::process::id())).unwrap();
         let name = CgroupName::new(&id).unwrap();

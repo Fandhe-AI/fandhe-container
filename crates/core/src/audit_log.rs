@@ -2,9 +2,13 @@
 //!
 //! # 役割
 //!
-//! seccomp・Landlock・マウント検証/API・plugin 信頼検証（TASK-122.5）・exec 対象（#1465）・エントリポイント検証（#1595）の 6 レイヤーで起きた分離違反の試行を、原因特定に必要な情報
-//! （syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
-//! 本モジュールは型のみで、syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
+//! `AuditLayer` の 11 種（seccomp・landlock・mount・plugin_trust・plugin_peer・exec_target・entrypoint・
+//! control_channel・exit_signal・audit_coverage・pasta_verify）で起きた分離違反の試行と、それに付随する補助の記録を、
+//! 原因特定に必要な情報（syscall 番号・対象パス・プロセス ID・タイムスタンプ）付きで表す固定スキーマの型を定義する。
+//! `exit_signal` は違反そのものではなく回収点が見た終了シグナルの補助記録、`audit_coverage` は監査を 100% 満たせない
+//! 環境で起動を続けた縮退の記録である。
+//! 本モジュール本体（`audit_log.rs`）の型定義は syscall も I/O も持たない（OS 非依存。3 OS でコンパイルされる）。
+//! I/O を持つのは下位モジュール（`file_writer`・`kernel_audit`・`control_relay`・`file_sink` など）である。
 //!
 //! # 呼び出し元・契約
 //!
@@ -13,7 +17,7 @@
 //!   本番 sink `FileAuditSink`〔#1594〕は実装済み。CLI の create は destination 拒否を配線済み〔#2480〕。plugin-cri の peer 認証の拒否は層 `plugin_peer` として配線済み〔#2484〕。healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
-//!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`
+//!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection_at` で、種別 `rootfs_pivot`
 //!   の `rootfs_is_host_root` は層 `mount` のパスなし・理由コードつきの 1 件になる）。パスは持たない（型で保証）
 //! - エントリポイント検証の拒否（層 `entrypoint`。#1595）は `exec::audit_entrypoint_violation` /
 //!   `exec::record_entrypoint_rejection` が [`AuditEvent::Entrypoint`] として記録する。launch と exec の
@@ -21,7 +25,29 @@
 //!   `SetupFailed` は supervisor の `run_command*` が親側で 1 拒否 1 件を記録する。パスは持たない
 //!   （型で保証）。記録の PID と時刻は記録を行った親プロセスのもので、時刻は拒否から最大で exec の
 //!   上限時間ぶん遅れ得る。ワイヤー形式には安定値 `entrypoint` が `layer` に増える（既存の層の行は不変。
-//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路（本番 launcher の子）の entrypoint 違反は、子が状態 pipe の exec 前の 2 行目で返し、親〔launcher の呼び出し元〕が `exec::audit_entrypoint_violation` で記録して配線済み（#2624）。状態 pipe を持たない `spawn_container` 系の子は報告しない（REPAIR-3）
+//!   `reason` を持つ層は plugin_trust・plugin_peer・exec_target・entrypoint・pasta_verify・control_channel と、理由つきの mount のレコード）。launch 経路（本番 launcher の子）の entrypoint 違反は、子が状態 pipe の exec 前の 2 行目で返し、親〔launcher の呼び出し元〕が `exec::audit_entrypoint_violation` で記録して配線済み（#2624）。`R` の後の `execveat` の errno 由来の失敗は `X` 行で届き起動失敗になるが、違反ではないため記録しない（#2716）。状態 pipe を持たない `spawn_container` 系の子は、製品コードからの呼び出し元が無いため配線しないと決定（#2716。製品の入口を足すときは状態 pipe 付きの `spawn_container_via_intermediate` を通すこと。REPAIR-3）
+//! - pasta バイナリの起動時の再検証の拒否（層 `pasta_verify`。SEC-4・PLUG-11・NET-9・#3330）は、supervisor の start の入口が
+//!   [`AuditEvent::PastaVerify`] として中継 sink（`ControlAuditRelay`）経由で 1 拒否 1 件を配送する（実装済み）。理由は
+//!   [`PastaVerifyRejection`] の 2 種（`pasta_record_changed`・`pasta_permission_denied`）で、パスは持たない（型で保証）。
+//!   作成時（CLI の create）の `PermissionDenied` は D2 と両立しないため記録しない
+//! - supervisor の制御チャネルの接続元の拒否（層 `control_channel`。SEC-4・SEC-1・SUP-1・#2058）は、制御チャネルのサーバー
+//!   （`fandhe-container-supervisor` の `control/server.rs`）が `ControlObserver::record_peer_rejection`
+//!   （`control/observe.rs`）経由で [`AuditEvent::ControlPeer`] として記録する。理由は [`ControlPeerRejection`] の 2 種
+//!   （`control_peer_uid_mismatch`・`control_peer_credentials_unavailable`）で、パス・接続元の uid と pid は持たない。
+//!   コンテナ ID は observer が持っていれば付く。supervisor は複数スレッドのため配送は中継 `ControlAuditRelay` を通し、
+//!   記録先へ書けなければ構造化ログ（`control_peer_rejected`）に出す
+//! - 終了シグナルの補助記録（層 `exit_signal`。SEC-4・ESC-06・#2004）は、本番 launcher の回収点
+//!   （`oci_runtime::launch` の `with_exit_audit`・`record_exit_signal_once`）が、SIGSYS で終わったのを初めて見たときに
+//!   回収の後で 1 回だけ [`AuditEvent::ExitSignal`] として記録する。[`record_exit_signal_until`] を [`RECORD_WAIT_LIMIT`]
+//!   の期限つきで使い、記録先は supervisor が単一スレッドの間に作った `ControlAuditRelay`（`exit_audit_sink`。#2236）。
+//!   コンテナ ID・signal・target_pid（回収した側の PID namespace の値）を載せ、syscall・arch は持たない。
+//!   seccomp 由来とは断定できない補助の記録で、正の記録はカーネルの `AUDIT_SECCOMP`。pid 1 以外の子孫は観測できない
+//! - 監査の縮退の記録（層 `audit_coverage`。SEC-4・#2027）の判定は `coverage` モジュール（[`assess`]・[`AuditCoverage`]・
+//!   [`AuditCoveragePolicy`] の `best-effort`・`strict`）で行う。本番 launcher の `assess_audit_coverage` が fork の前に評価し、
+//!   厳格モードなら起動を拒否する。縮退していれば [`AuditEvent::AuditCoverageDegraded`] を `mount::deliver_until` で
+//!   コンテナ ID つき・launch の期限つきの 1 件として配送する。書けなければ [`AUDIT_COVERAGE_RECORD_FAILED_LINE`] を出し、
+//!   分離の記録（`state.json` の `launchIsolation`・inspect）にも失敗を載せる（#2468）。理由は `reason` ではなく
+//!   `seccomp_kill`・`landlock` の 2 欄（ワイヤーでは `seccomp_kill_reason`・`landlock_reason`。`coverage_reasons()`）で持つ
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）
@@ -35,14 +61,17 @@
 //!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
-//!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
+//!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（共通ログ型 `LogLine` 経由で書く。#3115・ERR-4）。
 //!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
 //!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
-//!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、
-//!   healthcheck・launch 経路（launcher）への配線は **未実装**（REPAIR-3: 実装済みを装わない）。plugin 信頼検証は
+//!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持は **未実装**（REPAIR-3: 実装済みを装わない。追跡先は #3417 のコメントで諮る）。
+//!   launch 経路（launcher）への配線は supervisor の start 経路から結線済み（#1819。`default_audit_sink` の sink を本番 launcher へ渡す）で、
+//!   healthcheck は単一スレッドの exec 専用 helper（supervisor の `healthcheck-exec`）が `FileAuditSink` を直接使う（#2441。周期実行の結線は #2953 で実装済み。`@audit.log` のサイズ上限は `AUDIT_LOG_MAX_BYTES`）。CLI の exec への配線は #2626 が追う（未実装）。plugin 信頼検証は
 //!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
-//!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、非 Linux では `FileStateStore` が未実装のため
-//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕
+//!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、macOS では主経路（`file_writer` の fd 相対 open と
+//!   拡張 ACL の拒否、`file_sink` の `run_isolated` の macOS 版。#2429）が成功すれば `Recorded` になる（代替経路は
+//!   未実装で、主経路が失敗すれば `SinkFailed`。#2430）。Windows では `FileStateStore` が未実装のため記録先を作れず
+//!   `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する
@@ -52,10 +81,32 @@
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
 //! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
-//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。landlock への配線は未実装。plugin_trust は
-//! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
+//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。
+//! pasta_verify〔start の入口。#3330〕・control_channel〔observer が分かる場合〕・exit_signal〔#2004〕・audit_coverage〔#2027〕も載せる。landlock への配線は未実装。
+//! plugin_trust は検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕。plugin_peer も特定のコンテナに属さないため載せない）。
+//! 拒否した段は #3121 で [`AuditRecord::stage`] として追加済み（`IsolationStage` と同じ固定語彙の [`AuditStage`]）。
+//! `ExecError::stage` が手元にある記録点（`exec` のマウント・exec 対象・entrypoint の違反と launch の pre-pivot 失敗）と、
+//! supervisor の exec の親の記録が載せる。他の層は載せない（キー自体を出さない）。親の記録点の段の対応づけ（#3209・#3294）:
+//!
+//! - **entrypoint**（worker の `ok` 行。`exec::record_entrypoint_rejection_at`）: 結果行で届いた `ExecChildStep` を
+//!   `ExecChildStep::stage` で写す。届かなければ載せない
+//! - **worker の失敗**（worker の `err` 行。`exec::record_exec_worker_rejection_at`）: `err` 行の段の欄は
+//!   `IsolationStage::as_str` のトークンで、親は `IsolationStage::from_token` で引き直してそのまま記録の `stage` に載せる
+//!   （恒等の写像で、第 2 の対応表は持たない）。worker は違反を伴うときだけ `ExecError::stage` を運ぶ。bundle の rootfs の
+//!   固定の拒否〔`RootfsPinError`〕は段を持たないため、利用者向けメッセージ（`exec stage Validate:`）と同じ出所の
+//!   `Validate` を呼び出した段として運ぶ。欄の無い旧形式の行・未知のトークン・違反なしで段ありは
+//!   壊れた行として拒否し、記録しない（fail-closed）。違反ありで段なしは受理し、段を捏造せず段なしで記録する
+//!
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
+//!
+//! # 段を載せない記録点と理由（未実装。#3209・REPAIR-3）
+//!
+//! - **制御チャネルの中継**（`ControlAuditRelay`）: 枠が段を運ばず、段つきの記録を通すと段は落ちる（拒否せず記録は
+//!   残す。試験で固定）。現行の配線では段つきの記録（単一スレッドの launch と pre-pivot）は `FileAuditSink` へ直接
+//!   書かれ中継を通らず、exec の親も中継ではなく `FileAuditSink` を使うため、段を運ぶ必要が生じていない。拡張が
+//!   要るのは、複数スレッドの文脈から中継経由で段つきの層を記録する経路を足すとき（healthcheck は
+//!   単一スレッドの helper が `FileAuditSink` を直接使うため該当しない。#2441）。そのときは段だけでなく Entrypoint・ExecTarget などの層ごと運べるようにする
 
 #[cfg(target_os = "linux")]
 mod control_relay;
@@ -74,8 +125,9 @@ pub use coverage::{
 };
 pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
 pub use file_writer::{
-    AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
-    AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line, write_with_fallback,
+    AUDIT_LINE_MAX_BYTES, AUDIT_LOG_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError,
+    AuditWriteErrorKind, AuditWriteFailure, AuditWriteOutcome, NoAuditFallback, encode_json_line,
+    write_with_fallback,
 };
 
 pub use kernel_audit::{KERNEL_AUDIT_ACK_TIMEOUT, KernelAuditFallback};
@@ -390,6 +442,28 @@ impl AuditReason {
     }
 }
 
+/// 監査レコードに載せる、拒否した段（stage）のトークン（SEC-4・ERR-4・REPAIR-4・#3121）。
+///
+/// 語彙は実行層の `IsolationStage`（`ExecError::stage`）の固定語彙（snake_case）と同じで、Linux 限定の
+/// `From<IsolationStage>`（`exec.rs`）が唯一の生成経路。構築子は crate 内専用なので、外部入力由来の
+/// 文字列を載せられない（ログ注入の防止。REPAIR-2）。`audit_log` は 3 OS でコンパイルされ
+/// `IsolationStage` は Linux 限定のため、型自体は文字列の newtype にしてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditStage(&'static str);
+
+impl AuditStage {
+    /// 静的トークンから構築する（crate 内専用）。
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn new(token: &'static str) -> Self {
+        Self(token)
+    }
+
+    /// トークンを返す。
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// 違反を検知したレイヤー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -417,6 +491,8 @@ pub enum AuditLayer {
     ExitSignal,
     /// 監査の記録を 100% 満たせない環境で起動を続けた縮退の記録（SEC-4・#2027）。
     AuditCoverage,
+    /// start の起動時に行う pasta バイナリの再検証が改ざんの疑いで拒否した記録（SEC-4・PLUG-11・NET-9・#3330）。
+    PastaVerify,
 }
 
 impl AuditLayer {
@@ -433,6 +509,7 @@ impl AuditLayer {
             AuditLayer::ControlChannel => "control_channel",
             AuditLayer::ExitSignal => "exit_signal",
             AuditLayer::AuditCoverage => "audit_coverage",
+            AuditLayer::PastaVerify => "pasta_verify",
         }
     }
 }
@@ -514,6 +591,14 @@ pub enum AuditEvent {
         /// 拒否理由トークン（`entrypoint_*` 等の静的トークン。[`AuditReason`] 参照）。
         reason: AuditReason,
     },
+    /// start の起動時の pasta バイナリの再検証が改ざんの疑いで拒否した記録（SEC-4・PLUG-11・NET-9・#3330）。
+    ///
+    /// 理由トークンだけを持ち、**パスは持たない**（型で保証する。REPAIR-2）。構築は
+    /// [`PastaVerifyRejection::audit_event`] で行う。
+    PastaVerify {
+        /// 拒否理由トークン（[`PastaVerifyRejection::as_str`]）。
+        reason: AuditReason,
+    },
     /// supervisor の制御チャネルが接続元を拒否した記録（SEC-4・SEC-1・SUP-1・#2058）。
     ///
     /// 理由トークンだけを持ち、パス・接続元の uid・pid は持たない（型で保証する。REPAIR-2）。
@@ -547,6 +632,33 @@ pub enum AuditEvent {
         /// Landlock の `AUDIT_LANDLOCK_*` が縮退している場合の理由。
         landlock: Option<AuditReason>,
     },
+}
+
+/// pasta バイナリの起動時の再検証が改ざんの疑いで拒否した理由（SEC-4・PLUG-11・NET-9・#3330）。固定語彙で、入力値を載せない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PastaVerifyRejection {
+    /// 記録した識別（所有者・inode・サイズ・ハッシュ等）と今のバイナリが一致しない。
+    RecordChanged,
+    /// バイナリまたは祖先ディレクトリの権限・所有者の検査に通らない。
+    PermissionDenied,
+}
+
+impl PastaVerifyRejection {
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordChanged => "pasta_record_changed",
+            Self::PermissionDenied => "pasta_permission_denied",
+        }
+    }
+
+    /// 対応する監査イベントを返す。
+    pub fn audit_event(self) -> AuditEvent {
+        AuditEvent::PastaVerify {
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
 }
 
 /// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
@@ -627,6 +739,7 @@ impl AuditEvent {
             AuditEvent::PluginPeer { .. } => AuditLayer::PluginPeer,
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
+            AuditEvent::PastaVerify { .. } => AuditLayer::PastaVerify,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
             AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
             AuditEvent::AuditCoverageDegraded { .. } => AuditLayer::AuditCoverage,
@@ -659,6 +772,7 @@ pub struct AuditRecord {
     pid: AuditPid,
     event: AuditEvent,
     container_id: Option<ContainerId>,
+    stage: Option<AuditStage>,
 }
 
 impl AuditRecord {
@@ -669,7 +783,26 @@ impl AuditRecord {
             pid,
             event,
             container_id: None,
+            stage: None,
         }
+    }
+
+    /// 拒否した段を載せる（SEC-4・ERR-4・#3121）。
+    ///
+    /// 経路検査の拒否は汎用の理由トークンで記録されるため、どの段（readonly_paths か masked_paths か等）
+    /// の拒否かは `ExecError::stage` にしか無かった。段を知る呼び出し側（`exec` の記録点）だけがこれで足す。
+    /// 段を持たない記録ではワイヤーにキー自体を出さず、既存の行は変わらない。
+    /// 制御チャネルの中継（`ControlAuditRelay`）は枠が段を運ばないので、通すと段は落ちる（REPAIR-3。試験で固定、
+    /// 理由はモジュール doc の「段を載せない記録点と理由」。#3209）。
+    #[must_use]
+    pub(crate) fn with_stage(mut self, stage: AuditStage) -> Self {
+        self.stage = Some(stage);
+        self
+    }
+
+    /// 記録に載せた段。載せない記録は `None`（ワイヤーではキー自体が無い）。
+    pub fn stage(&self) -> Option<AuditStage> {
+        self.stage
     }
 
     /// 検証済みのコンテナ ID を載せる（#1618）。
@@ -720,6 +853,7 @@ impl AuditRecord {
             | AuditEvent::PluginPeer { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
+            | AuditEvent::PastaVerify { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -756,6 +890,7 @@ impl AuditRecord {
             AuditEvent::Seccomp { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
+            | AuditEvent::PastaVerify { .. }
             | AuditEvent::ControlPeer { .. }
             | AuditEvent::ExitSignal { .. }
             | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -778,8 +913,9 @@ impl AuditRecord {
         }
     }
 
-    /// 拒否理由トークン（plugin 信頼検証・exec 対象・エントリポイント、および理由を持つ mount のレコード。
-    /// seccomp・landlock と理由なしの mount は `None`）。
+    /// 拒否理由トークン（plugin_trust・plugin_peer・exec_target・entrypoint・pasta_verify・control_channel、
+    /// および理由を持つ mount のレコード。seccomp・landlock・exit_signal・理由なしの mount は `None`。
+    /// audit_coverage の理由は 2 欄に分かれるため `coverage_reasons()` で得る）。
     pub fn reason(&self) -> Option<AuditReason> {
         match &self.event {
             AuditEvent::Mount { reason, .. } => *reason,
@@ -787,6 +923,7 @@ impl AuditRecord {
             | AuditEvent::PluginPeer { reason, .. }
             | AuditEvent::ExecTarget { reason }
             | AuditEvent::Entrypoint { reason }
+            | AuditEvent::PastaVerify { reason }
             | AuditEvent::ControlPeer { reason } => Some(*reason),
             _ => None,
         }
@@ -956,6 +1093,32 @@ mod tests {
                 .layer(),
             AuditLayer::ControlChannel
         );
+    }
+
+    /// SEC-4・NET-9・#3330: pasta_verify の層トークン・理由トークン・レコードのアクセサ（パスを持たない）。
+    #[test]
+    fn sec4_3330_pasta_verify_tokens_and_accessors() {
+        assert_eq!(AuditLayer::PastaVerify.as_str(), "pasta_verify");
+        assert_eq!(
+            PastaVerifyRejection::RecordChanged.as_str(),
+            "pasta_record_changed"
+        );
+        assert_eq!(
+            PastaVerifyRejection::PermissionDenied.as_str(),
+            "pasta_permission_denied"
+        );
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(9).unwrap(),
+            PastaVerifyRejection::PermissionDenied.audit_event(),
+        );
+        assert_eq!(r.layer(), AuditLayer::PastaVerify);
+        assert_eq!(
+            r.reason().map(AuditReason::as_str),
+            Some("pasta_permission_denied")
+        );
+        assert!(r.path().is_none());
+        assert!(r.syscall().is_none());
     }
 
     /// SEC-4・PLUG-12・#2484: plugin_peer の理由トークン 5 種・層トークン・パスと理由のアクセサ。

@@ -57,8 +57,10 @@
 //! `--follow` に当たる指定は [`reader::read_container_log_with`] が受ける（CLI-1・SUP-7）。
 //!
 //! # 後始末（#2446・#2593・SUP-7・CLI-1・CRI-2）
-//! CLI の `delete` と plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
-//! 消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
+//! CLI の `delete` と plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）が core の delete の成功後に
+//! [`remove_container_logs_guarded_bounded_waiting`]（sink 閉鎖の窓を期限つきで待つ。#2634・#2698）で現在ログ・全世代・
+//! ロックファイルを消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
+//! 待ちを超えて残った分は、同じ ID の CLI `create` が core を呼ぶ前に [`remove_container_logs_guarded_bounded`] で回収する（#2698）。
 //!
 //! # 未実装（将来仕様。REPAIR-3）
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
@@ -68,12 +70,16 @@
 //!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
 //!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher` が `LaunchedProcess::take_output` で返す読み取り側を、
 //!   supervisor の bin の入口（`start_entry::run_supervised`）が捕捉ハブへ渡す（#1819）。実プロセスでの確認は
-//!   実機前提の `tests/supervisor_bin_real.rs`。再起動をまたぐ捕捉は、再 launch の実機での成立（#2043）を待つ。
+//!   実機前提の `tests/supervisor_bin_real.rs`。再起動をまたぐ捕捉の実機での照合は `supervisor_bin_real` のシナリオ C（#2043）。
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 
+pub mod cri;
 pub mod reader;
 pub mod rotating;
+
+#[cfg(all(test, unix))]
+mod sweep_tests;
 
 pub use reader::{
     ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure,
@@ -106,7 +112,7 @@ pub fn remove_container_logs(
 
 /// [`remove_container_logs`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2446・SUP-7）。
 ///
-/// `guard` が `false` なら何も消さずに 0 件で成功する。CLI の `delete` は「同じ ID が再作成されていない」ことを
+/// `guard` が `false` なら何も消さずに 0 件で成功する（`RemovedLogs::guard_declined()` が真。#3143）。CLI の `delete` は「同じ ID が再作成されていない」ことを
 /// 返す。確認はロック保持中で、以後に同じ ID の sink は開けない（同じロックが要る）ため、削除待ちの間に再作成・
 /// 起動・終了した別インスタンスのログを消さない。
 pub fn remove_container_logs_guarded(
@@ -131,7 +137,7 @@ pub const CONTAINER_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duratio
 
 /// [`remove_container_logs`] を作業スレッドで `timeout` までだけ待って実行する（REPAIR-5）。
 ///
-/// 期限切れ・同時実行枠の満杯・スレッド起動失敗のときは `Timeout` のエラーを返す（作業スレッドは残り得る）。
+/// 期限切れ・スレッド起動失敗のときは `Timeout`、同時実行枠の満杯（何も実行していない）のときは `ResourceExhausted` のエラーを返す（`Timeout` では作業スレッドは残り得る）。
 /// 同時実行枠は supervisor ログの削除と共有する。core の `delete` より前には呼ばない。
 pub fn remove_container_logs_bounded(
     root: &std::path::Path,
@@ -151,18 +157,26 @@ pub fn remove_container_logs_guarded_bounded(
     timeout: std::time::Duration,
     guard: impl Fn() -> bool + Send + 'static,
 ) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    use crate::supervisor_log::BoundedFailure;
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     let root = root.to_path_buf();
     let id = id.clone();
-    crate::supervisor_log::run_bounded(
+    crate::supervisor_log::run_bounded_classified(
         move || remove_container_logs_guarded(&root, &id, &guard),
         timeout,
     )
-    .unwrap_or_else(|| {
-        Err(TraitError::new(
-            ErrorCode::Timeout,
-            "container log removal did not finish within the deadline",
-        ))
+    .unwrap_or_else(|f| {
+        Err(match f {
+            // 枠が満杯（何も実行していない）。この削除自身の期限切れと区別する（#2760）。
+            BoundedFailure::Busy => TraitError::new(
+                ErrorCode::ResourceExhausted,
+                "container log removal workers are busy",
+            ),
+            BoundedFailure::Unfinished => TraitError::new(
+                ErrorCode::Timeout,
+                "container log removal did not finish within the deadline",
+            ),
+        })
     })
 }
 
@@ -177,7 +191,7 @@ pub const CONTAINER_LOG_LOCK_WAIT: std::time::Duration = std::time::Duration::fr
 pub const CONTAINER_LOG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// [`remove_container_logs_guarded_bounded`] を、`FailedPrecondition`（同じ ID の sink が生存中）のあいだ
-/// `lock_wait` まで試し直す版（plugin-cri の `RemoveContainer` 用。SUP-7・CRI-2・REPAIR-5・#2634）。
+/// `lock_wait` まで試し直す版（CLI の `delete` と plugin-cri の `RemoveContainer` 用。SUP-7・CLI-1・CRI-2・REPAIR-5・#2634）。
 ///
 /// running への force 削除や `stop` 直後の削除では、状態が `Stopped` になっても supervisor が sink を閉じきるまで
 /// ロックが取れない。ここでは呼び出し元スレッドが sleep するだけで、I/O と同時実行枠（supervisor ログの削除と共有）は
@@ -210,6 +224,223 @@ pub fn remove_container_logs_guarded_bounded_waiting(
             _ => return result,
         }
     }
+}
+
+/// コンテナログの sink を開くとき、ロック競合（`FailedPrecondition`）を試し直す上限（SUP-7・CRI-2・REPAIR-5・#2760）。
+///
+/// plugin-cri の起動時掃除（[`sweep_stale_container_logs`]）は ID ごとに短時間ロックを保持して消す。kubelet が同じ残存 ID で
+/// create → start を進めると、掃除の保持中に start の open が当たり得る。この窓だけを覆う短い値で、
+/// 本当に別の sink が生存中の場合は上限後に `FailedPrecondition` のまま返す。
+pub const CONTAINER_LOG_OPEN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`rotating::RotatingFileSink::open`] を、`FailedPrecondition` のあいだ `lock_wait` まで試し直す版（#2760）。
+///
+/// 呼び出し元スレッドが [`CONTAINER_LOG_LOCK_POLL`] 刻みで sleep するだけで、他のコードは走らない。
+/// `FailedPrecondition` 以外は即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
+pub fn open_container_log_sink_waiting(
+    dir: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    config: RotationConfig,
+    lock_wait: std::time::Duration,
+) -> Result<rotating::RotatingFileSink, fandhe_container_core::traits::TraitError> {
+    let started = Instant::now();
+    loop {
+        match rotating::RotatingFileSink::open(dir, id, config) {
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                let Some(remaining) = lock_wait
+                    .checked_sub(started.elapsed())
+                    .filter(|r| !r.is_zero())
+                else {
+                    return Err(e);
+                };
+                std::thread::sleep(CONTAINER_LOG_LOCK_POLL.min(remaining));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// 待ちを使い切っても同じ ID の sink が閉じなかったことを示す警告行の `reason`（閉じた語彙。#2760・SUP-7・CRI-2・REPAIR-4）。
+///
+/// [`remove_container_logs_guarded_bounded_waiting`] が `FailedPrecondition` を返すのは `lock_wait` を使い切ったときだけ
+/// （途中の `FailedPrecondition` は試し直す）なので、delete の後始末の `FailedPrecondition` はこの意味で一意に読める。
+/// CLI の警告行と plugin-cri の `container_delete_cleanup` 行が共有する唯一の定義（二重管理しない。REPAIR-1）。
+pub const REASON_SINK_OPEN_AFTER_WAIT: &str = "sink_open_after_wait";
+
+/// コンテナログ削除の失敗コードに対応する警告行の `reason`。待ち切れなかった（`FailedPrecondition`）ときだけ `Some`。
+pub fn container_log_removal_reason(code: ErrorCode) -> Option<&'static str> {
+    (code == ErrorCode::FailedPrecondition).then_some(REASON_SINK_OPEN_AFTER_WAIT)
+}
+
+/// [`reclaim_stale_container_logs`] の結果（CLI の `create` と plugin-cri の `CreateContainer` が共有する。#2760・REPAIR-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleLogReclaim {
+    /// 1 件以上のログファイルを消した（件数）。
+    Removed(u32),
+    /// 消すものが無かった、または guard が見送った（状態が既にある ID）。
+    Nothing,
+    /// 回収に失敗した（生きている sink のロック等）。create は続ける（best effort）。
+    Failed(ErrorCode),
+    /// 期限切れ。作業スレッドが残り得るので、呼び出し元は core を呼ばずに失敗させる（SEC-4）。
+    TimedOut,
+}
+
+/// 同じ ID の前のインスタンスが残したコンテナログを、core の create の前に 1 回だけ回収する（#2698・#2760・SUP-7・CRI-2・CLI-1）。
+///
+/// 待たずに [`CONTAINER_LOG_REMOVE_TIMEOUT`] まで 1 回だけ試す（create を遅らせない）。ロックが取れない（古い sink が
+/// 生きている）ときは何も消さず `Failed(FailedPrecondition)`。`guard` はロック保持中に評価され、`false`（状態が既にある）
+/// なら何も消さない。観測（記録器への計上）と `TimedOut` の写像は呼び出し元の責務。
+pub fn reclaim_stale_container_logs(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> StaleLogReclaim {
+    match remove_container_logs_guarded_bounded(root, id, CONTAINER_LOG_REMOVE_TIMEOUT, guard) {
+        Ok(removed) if removed.log_files() > 0 => StaleLogReclaim::Removed(removed.log_files()),
+        Ok(_) => StaleLogReclaim::Nothing,
+        Err(e) if e.code() == ErrorCode::Timeout => StaleLogReclaim::TimedOut,
+        Err(e) => StaleLogReclaim::Failed(e.code()),
+    }
+}
+
+/// 起動時の走査が処理する ID 数の上限（無制限の走査を避ける。REPAIR-5）。
+pub const MAX_SWEEP_IDS: usize = 4096;
+
+/// [`sweep_stale_container_logs`] の結果。パス・ID は含めない（件数のみ。ERR-1）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// 走査したディレクトリエントリ数。
+    pub scanned: usize,
+    /// 消せた ID の数。
+    pub reclaimed_ids: usize,
+    /// 消せたログファイルの数。
+    pub removed_files: u32,
+    /// 生きている sink があり見送った ID の数。
+    pub skipped_live: usize,
+    /// 状態ストアに記録のある ID で見送った数。
+    pub skipped_present: usize,
+    /// ID に戻せず（帰属を確定できず）見送った名前の数。
+    pub skipped_undecodable: usize,
+    /// それ以外の失敗の数（名前空間の不正・I/O 失敗等）。
+    pub failed: usize,
+    /// 期限切れまたは上限に達して打ち切った。
+    pub timed_out: bool,
+    /// 同時実行枠が満杯で打ち切った（期限切れの `timed_out` とは区別する。#2894・ERR-1）。
+    pub workers_busy: bool,
+}
+
+/// 状態ルートの `@container-logs` を走査し、状態の記録が無い ID の残りログを回収する（起動時に 1 回。#2760・SUP-7・CRI-2・REPAIR-4）。
+///
+/// CRI は ID を使い回さないため、delete の待ちを超えて残ったログを「同じ ID の create」では回収できない。plugin-cri の
+/// 起動時にこれを 1 回呼んで残りを消す（設計: `docs/design/container-log-removal-wait.md`）。名前から ID を復元できたものだけを対象とし、
+/// 削除は ID ごとに [`remove_container_logs_guarded_bounded`]（ロックと名前空間の検査つき）に任せる。待たず 1 回だけ試すので、
+/// 生きている sink（ロックが取れない）は見送る。`may_remove(id)` はロック保持中に評価され、`false`（状態に記録がある）なら消さない
+/// （評価できない場合も `false` に倒す）。全体の期限は `budget`、ID 数の上限は [`MAX_SWEEP_IDS`]。
+pub fn sweep_stale_container_logs(
+    root: &std::path::Path,
+    may_remove: Arc<dyn Fn(&fandhe_container_core::traits::ContainerId) -> bool + Send + Sync>,
+    budget: Duration,
+) -> SweepReport {
+    use std::sync::atomic::AtomicBool;
+    let started = Instant::now();
+    let mut report = SweepReport::default();
+    let dir = container_log_dir(root);
+    // 初期検査と列挙も無期限に止まり得る（応答しない FUSE 等）ため、残り予算で期限つきの作業スレッドに包む（REPAIR-5）。
+    enum Initial {
+        Missing,
+        Failed,
+        Scan(rotating::StaleLogScan),
+    }
+    let Some(first) = budget
+        .checked_sub(started.elapsed())
+        .filter(|r| !r.is_zero())
+    else {
+        report.timed_out = true;
+        return report;
+    };
+    let initial = crate::supervisor_log::run_bounded_classified(
+        move || match std::fs::symlink_metadata(&dir) {
+            Ok(_) => match rotating::list_stale_log_ids(&dir, MAX_SWEEP_IDS) {
+                Ok(s) => Initial::Scan(s),
+                Err(_) => Initial::Failed,
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => Initial::Missing,
+            Err(_) => Initial::Failed,
+        },
+        first,
+    );
+    let scan = match initial {
+        Ok(Initial::Scan(s)) => s,
+        Ok(Initial::Missing) => return report,
+        Ok(Initial::Failed) => {
+            report.failed = 1;
+            return report;
+        }
+        // 枠の満杯（何も実行していない。期限切れとは区別する。#2894）。
+        Err(crate::supervisor_log::BoundedFailure::Busy) => {
+            report.workers_busy = true;
+            return report;
+        }
+        // 期限切れ・起動失敗。作業スレッドは残り得るので打ち切る。
+        Err(crate::supervisor_log::BoundedFailure::Unfinished) => {
+            report.timed_out = true;
+            return report;
+        }
+    };
+    report.scanned = scan.scanned;
+    report.skipped_undecodable = scan.undecodable;
+    report.timed_out = scan.truncated;
+    for id in &scan.ids {
+        let Some(remaining) = budget
+            .checked_sub(started.elapsed())
+            .filter(|r| !r.is_zero())
+        else {
+            report.timed_out = true;
+            break;
+        };
+        let blocked = Arc::new(AtomicBool::new(false));
+        let guard_blocked = Arc::clone(&blocked);
+        let guard_fn = Arc::clone(&may_remove);
+        let guard_id = id.clone();
+        let result = remove_container_logs_guarded_bounded(
+            root,
+            id,
+            CONTAINER_LOG_REMOVE_TIMEOUT.min(remaining),
+            move || {
+                let ok = guard_fn(&guard_id);
+                if !ok {
+                    guard_blocked.store(true, Ordering::SeqCst);
+                }
+                ok
+            },
+        );
+        match result {
+            Ok(removed) if removed.log_files() > 0 => {
+                report.reclaimed_ids = report.reclaimed_ids.saturating_add(1);
+                report.removed_files = report.removed_files.saturating_add(removed.log_files());
+            }
+            Ok(_) => {
+                if blocked.load(Ordering::SeqCst) {
+                    report.skipped_present = report.skipped_present.saturating_add(1);
+                }
+            }
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                report.skipped_live = report.skipped_live.saturating_add(1);
+            }
+            Err(e) if e.code() == ErrorCode::ResourceExhausted => {
+                // 枠が満杯。期限切れとは区別し、これ以上の試行を重ねず打ち切る（#2894）。
+                report.workers_busy = true;
+                break;
+            }
+            Err(e) if e.code() == ErrorCode::Timeout => {
+                // 作業スレッドが残り得る。これ以上の試行を重ねず打ち切る。
+                report.timed_out = true;
+                break;
+            }
+            Err(_) => report.failed = report.failed.saturating_add(1),
+        }
+    }
+    report
 }
 
 /// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。
@@ -758,15 +989,22 @@ impl LogCapture {
             let spawned = std::thread::Builder::new()
                 .name(format!("supervisor-log-{}", kind.as_str()))
                 .spawn(move || {
-                    // スレッド終了時（正常・中止とも）に枠を返す。
-                    let _reader_slot = reader_slot;
+                    // 中止・早期 return・panic の巻き戻しでもスコープ終了時に枠を返す。正常系は下で送信前に明示的に手放す。
+                    let reader_slot = reader_slot;
                     // ゲートが解放されずに閉じた（部分起動の中止）なら、stream に触れず終わる。
                     if gate_rx.recv().is_err() {
                         return;
                     }
                     let stream = slot.lock().ok().and_then(|mut g| g.take());
                     let Some(stream) = stream else { return };
+                    drop(slot);
                     let summary = pump(stream, kind, sink.as_ref(), &cancel);
+                    // 結果を送ってから資源を持ち続けると、drain が Ok で戻った時点で枠が戻っておらず
+                    // quiesce 後の budget.live() が 0 にならない窓ができる（#3453 と同じ型。#3507・SUP-7・REPAIR-5）。
+                    // そのため送信の前に枠と sink / cancel の参照を手放す。
+                    drop(sink);
+                    drop(cancel);
+                    drop(reader_slot);
                     // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
                     let _ = tx.send((kind, summary));
                 });
@@ -809,6 +1047,9 @@ impl LogCapture {
     ///
     /// `Err` を返す全経路で、返る前に捕捉を取り消す（`self` を消費するため、呼び出し側は後から止められない）。
     /// 取消しの要求後に新しい追記は始まらず、リーダーは次に `read` が戻った時点で終了する。
+    ///
+    /// `Ok` で戻った時点で、EOF まで読み切ったリーダーは読み取り枠と sink への参照を手放し終えている
+    /// （スレッド自体の終了は保証しない。SUP-7・REPAIR-5・#3507）。
     ///
     /// EOF は `timeout` いっぱいまで待つ（期限内に届いた EOF は成功）。sink の追記が止まっていても `timeout` 以内に
     /// 返る（REPAIR-5）ため、期限切れでは実行中の追記の完了を待たない。その時点で実行中だった追記
@@ -1162,9 +1403,29 @@ mod tests {
         let cap =
             LogCapture::start(OutputStreams::new(&budget, stdout, stderr), sink.clone()).unwrap();
         let sum = cap.drain(Duration::from_secs(10)).unwrap();
-        // EOF まで読み切ったリーダーは枠を返す（送信後のスレッド終了を待つ）。
-        assert_eq!(wait_live(&budget, 0), 0);
+        // EOF まで読み切ったリーダーは結果の送信前に枠を返す（待たずに照合する。#3507）。
+        assert_eq!(budget.live(), 0);
         (sink, sum)
+    }
+
+    /// SUP-7・SUP-1・REPAIR-5・#3507（#3453 と同じ型）: リーダーは結果の送信前に読み取り枠と sink の
+    /// 参照を手放す。`drain` が `Ok` で戻った直後に、待たずに同期的に照合する（300 回繰り返す）。
+    #[test]
+    fn sup7_3507_reader_releases_slot_and_sink_before_reporting() {
+        for i in 0..300 {
+            let budget = ReaderBudget::new(2).unwrap();
+            let sink = Arc::new(MemoryLogSink::default());
+            let cap = LogCapture::start(
+                OutputStreams::new(&budget, boxed(b"a\n"), boxed(b"b\n")),
+                sink.clone(),
+            )
+            .unwrap();
+            let sum = cap.drain(Duration::from_secs(10)).unwrap();
+            assert_eq!(budget.live(), 0, "round {i}");
+            assert_eq!(Arc::strong_count(&sink), 1, "round {i}");
+            assert_eq!(sum.stdout().unwrap().lines(), 1_u64, "round {i}");
+            assert_eq!(sum.stderr().unwrap().lines(), 1_u64, "round {i}");
+        }
     }
 
     /// `budget.live()` が `want` になるのを最大 10 秒待ち、最後に観測した値を返す。

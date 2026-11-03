@@ -42,10 +42,10 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`）は `exec/landlock.rs` の写像で
-//!   SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みだが、監査の記録先（親の `AuditSink`）へ
-//!   運ぶ経路は未実装（pivot 後の段の違反を親へ届ける経路が無い。`docs/design/audit-delivery.md`・#2023〜#2028・#2004、
-//!   #2013 と同種の欠落）
+//! - Mount 由来のルールの識別子の照合の違反（`MountNotRoot`・`MountIdentityMismatch`・`MountNotReadOnly`）は
+//!   `exec/landlock.rs` の写像で SEC-4 の違反理由（`ViolationReason::LandlockMount*`）へ対応づけ済みで、launch 経路は
+//!   親の `AuditSink` まで配線済み（子が状態 pipe に `E landlock ...` を書き、親が層 `mount` に記録する。#2130）。
+//!   未実装なのは exec の再適用（`NotRecorded`）での識別子の照合と、その違反の配送（識別子の永続化が前提。後続 issue）
 //! - ステージ列への組み込み口（`with_landlock`・#184）は実装済み。[`LandlockApplyReport`] は制限適用の証跡では
 //!   なく、`require_restriction_evidence` の判定には使えない（証跡は `with_landlock` 経由の適用成功時に `run_then` が作る `LaunchReady`。#1714）。
 
@@ -149,6 +149,13 @@ pub enum LandlockApplyErrorKind {
         /// errno（errno を伴わない失敗は 0）。
         errno: i32,
     },
+    /// 祖先の書き込み権を VFS の読み取り専用属性で打ち消すルール（検証済みの `ro` の bind。`requires_read_only_mount`）の
+    /// 対象が、実際には読み取り専用でない（`fstatfs` の `ST_RDONLY` が無い、観測できない、記録の `read_only` が偽）。
+    /// `landlock_add_rule` の前に拒否する（書き込みを禁じる層が Landlock には無いため。#1917・CORE-5・SEC-1）。
+    MountNotReadOnly {
+        /// ルールの位置。
+        index: usize,
+    },
     /// 内部不整合（パスに NUL が含まれる等。型により通常は起こらない）。
     Internal,
 }
@@ -173,6 +180,7 @@ impl LandlockApplyErrorKind {
             Self::MountNotRoot { .. } => "landlock_mount_not_root",
             Self::MountIdentityMismatch { .. } => "landlock_mount_identity_mismatch",
             Self::MountIdentityUnobservable { .. } => "landlock_mount_identity_unobservable",
+            Self::MountNotReadOnly { .. } => "landlock_mount_not_read_only",
             Self::Internal => "internal",
         }
     }
@@ -309,6 +317,8 @@ pub(crate) trait LandlockKernel {
     fn probe_mount(&self, path: &Self::PathFd) -> Result<MountProbe, SysError>;
     /// ルール対象（`open_rule_path` が返した fd。開き直さない）のマウントの識別子を観測する（#2071）。
     fn mount_identity(&self, path: &Self::PathFd) -> Result<MountIdentity, SysError>;
+    /// ルール対象（開き直さない）のマウントのフラグを観測する（`ro` の bind に頼るルールの確認。#1917）。
+    fn mount_flags(&self, path: &Self::PathFd) -> Result<sys::MountFlags, SysError>;
 }
 
 /// 実カーネルへの適用（`crate::sys` の安全なラッパーを呼ぶだけ）。
@@ -318,6 +328,9 @@ struct RealKernel<'a> {
     /// ルールのパスを辿る起点。`None` は呼び出しプロセスの `/`（launch 経路。pivot 後）。`Some` は
     /// 呼び出し側が検証済みのディレクトリの fd（exec 経路。`setns` 後にコンテナの rootfs と照合した `/`）。
     root: Option<BorrowedFd<'a>>,
+    /// `mnt_id` を読む fdinfo の起点（保持した自プロセスの `/proc/<pid>`）。`None` は `/proc/thread-self`（launch 経路）。
+    /// exec の再適用は `setns` の後に `thread-self` が解決できないため `Some` を渡す（#3201）。
+    fdinfo_dir: Option<BorrowedFd<'a>>,
 }
 
 impl LandlockKernel for RealKernel<'_> {
@@ -360,7 +373,14 @@ impl LandlockKernel for RealKernel<'_> {
     }
 
     fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
-        MountIdentity::of_fd(path)
+        match self.fdinfo_dir {
+            Some(dir) => MountIdentity::of_fd_in(dir, path),
+            None => MountIdentity::of_fd(path),
+        }
+    }
+
+    fn mount_flags(&self, path: &OwnedFd) -> Result<sys::MountFlags, SysError> {
+        sys::mount_flags(path.as_fd())
     }
 
     fn probe_mount(&self, path: &OwnedFd) -> Result<MountProbe, SysError> {
@@ -444,17 +464,30 @@ impl MountIdentity {
     /// `(st_dev, st_ino)` は `fstat`。pivot 前段の記録と適用時の照合が同じ関数を使い、出どころを揃える
     /// （#2071）。fdinfo は上限つきで読む。
     pub(crate) fn of_fd(fd: &OwnedFd) -> Result<Self, SysError> {
-        use std::io::Read as _;
-        use std::os::fd::AsRawFd as _;
+        Self::of_fd_with(fd, None)
+    }
+
+    /// [`Self::of_fd`] の、`mnt_id` を保持した procfs ディレクトリ `fdinfo_dir`（`/proc/<自分の pid>`）の
+    /// `fdinfo/N` から読む版（exec の再適用。`setns` の後に `thread-self` が解決できないため。#3201）。
+    pub(crate) fn of_fd_in(fdinfo_dir: BorrowedFd<'_>, fd: &OwnedFd) -> Result<Self, SysError> {
+        Self::of_fd_with(fd, Some(fdinfo_dir))
+    }
+
+    fn of_fd_with(fd: &OwnedFd, fdinfo_dir: Option<BorrowedFd<'_>>) -> Result<Self, SysError> {
+        use std::os::fd::AsFd as _;
         use std::os::unix::fs::MetadataExt as _;
         let io = |e: std::io::Error| SysError::Os(e.raw_os_error().unwrap_or(sys::EINVAL));
-        let mut text = String::new();
-        std::fs::File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
-            .map_err(io)?
-            .take(FDINFO_MAX_BYTES)
-            .read_to_string(&mut text)
-            .map_err(io)?;
-        let mnt_id = crate::exec::parse_fdinfo_mnt_id(&text).ok_or(SysError::Os(sys::EINVAL))?;
+        use crate::oci_runtime::mountinfo_identity::{
+            FdinfoMountIdError, read_fd_mnt_id, read_fd_mnt_id_at,
+        };
+        let mnt_id = match fdinfo_dir {
+            Some(dir) => read_fd_mnt_id_at(dir, fd.as_fd()),
+            None => read_fd_mnt_id(fd.as_fd()),
+        }
+        .map_err(|e| match e {
+            FdinfoMountIdError::Read(e) => io(e),
+            _ => SysError::Os(sys::EINVAL),
+        })?;
         let meta = std::fs::File::from(fd.try_clone().map_err(io)?)
             .metadata()
             .map_err(io)?;
@@ -465,9 +498,6 @@ impl MountIdentity {
         })
     }
 }
-
-/// fdinfo を読む上限（バイト。実際は数行）。
-const FDINFO_MAX_BYTES: u64 = 4096;
 
 /// Mount 由来のルール対象が、pivot 前段が載せたマウントのルートであることの判定（純粋関数。#2071・CORE-5・SEC-1）。
 ///
@@ -536,25 +566,28 @@ pub(crate) fn apply_landlock_ruleset(
     ruleset: &LandlockRuleset,
     check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
-    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None, check)
+    apply_landlock_ruleset_with(ruleset, &mut ThreadCountSource::ProcSelf, None, None, check)
 }
 
 /// [`apply_landlock_ruleset`] のスレッド数取得元とルールパスの起点を差し替える版（SUP-6・TASK-163.3・#502）。
 ///
 /// exec の再適用が、`setns` の前に開いた status fd と、`setns` の後に開いてコンテナの rootfs と照合した
 /// `/` の fd（`root`）を渡すために使う。`root` が `None` なら呼び出しプロセスの `/` を起点にする
-/// （[`apply_landlock_ruleset`] と同じ）。前提検査（NNP・適用前後の `Threads: 1`）と、パスの辿り方
+/// （[`apply_landlock_ruleset`] と同じ）。`fdinfo_dir` は `mnt_id` を読む fdinfo の起点（保持した自プロセスの
+/// `/proc/<pid>`）で、`None` は `/proc/thread-self`（#3201）。前提検査（NNP・適用前後の `Threads: 1`）と、パスの辿り方
 /// （1 要素ずつ symlink 非追従・解決できないパスは拒否）は [`apply_landlock_ruleset`] と同一。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_landlock_ruleset_with(
     ruleset: &LandlockRuleset,
     threads: &mut ThreadCountSource,
     root: Option<BorrowedFd<'_>>,
+    fdinfo_dir: Option<BorrowedFd<'_>>,
     check: MountCheck<'_>,
 ) -> Result<LandlockApplyReport, LandlockApplyError> {
     let kernel = RealKernel {
         threads: std::cell::RefCell::new(threads),
         root,
+        fdinfo_dir,
     };
     apply_with(&kernel, ruleset, check)
 }
@@ -666,12 +699,9 @@ fn apply_with<K: LandlockKernel>(
         // Mount 由来のルール（暗黙の `/dev` 系と bind）は、pivot 前段が載せた直後に記録した識別子と、いま開いた fd
         // の識別子が一致することを要求する。`add_rule` の前に拒否するため、誤った木には権利が付かない（#2071）。
         if let MountCheck::Recorded(recorded) = check
-            && matches!(
-                rule.origin,
-                RuleOrigin::Implicit { .. } | RuleOrigin::Mount { .. }
-            )
+            && rule.origin.is_mount_origin()
         {
-            let Some(expected) = recorded.expected_for(&rule.origin) else {
+            let Some(expected) = recorded.expected_for(&rule.origin, rule.path.as_str()) else {
                 return Err(LandlockApplyError::new(
                     ErrorCode::FailedPrecondition,
                     Kind::MountRecordMissing { index },
@@ -687,6 +717,28 @@ fn apply_with<K: LandlockKernel>(
             })?;
             check_mount_identity(index, expected, &observed)?;
             report.mounts_verified += 1;
+        }
+        // 祖先の書き込み権を VFS の読み取り専用属性で打ち消すルール（検証済みの `ro` の bind）は、対象のマウントが
+        // 実際に読み取り専用であることを確かめてから足す。launch の経路では記録の `read_only` も照合する（#1917）。
+        if super::rules::requires_read_only_mount(ruleset.rules(), index) {
+            let not_ro = || {
+                LandlockApplyError::new(
+                    ErrorCode::FailedPrecondition,
+                    Kind::MountNotReadOnly { index },
+                    "rule target relies on a read-only mount but the mount is writable",
+                )
+            };
+            let flags = kernel.mount_flags(&fd).map_err(|_| not_ro())?;
+            if !(flags.is_valid() && flags.is_read_only()) {
+                return Err(not_ro());
+            }
+            if let MountCheck::Recorded(recorded) = check
+                && recorded
+                    .target_for(&rule.origin, rule.path.as_str())
+                    .is_none_or(|t| !t.read_only)
+            {
+                return Err(not_ro());
+            }
         }
         let allowed = effective_allowed(rule, kind);
         if kind == PathKind::File {
@@ -847,6 +899,8 @@ mod tests {
         probes: RefCell<Vec<Result<MountProbe, SysError>>>,
         /// `mount_identity` の応答を呼び出し順に返す（尽きたら `ID_A`）。
         identities: RefCell<Vec<Result<MountIdentity, SysError>>>,
+        /// `mount_flags` の応答を呼び出し順に返す（尽きたら読み取り専用で有効）。
+        flags: RefCell<Vec<Result<sys::MountFlags, SysError>>>,
     }
 
     /// 偽カーネルが既定で返す識別子。
@@ -863,6 +917,13 @@ mod tests {
     ) -> Result<LandlockApplyReport, LandlockApplyError> {
         super::apply_with(k, rs, MountCheck::NotRecorded)
     }
+
+    /// 読み取り専用で有効な `f_flags`（`ST_VALID | ST_RDONLY`）。
+    const RO_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x21);
+    /// 書き込み可能で有効な `f_flags`（`ST_VALID` のみ）。
+    const RW_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x20);
+    /// `ST_VALID` が立っていない `f_flags`（信用できない値）。
+    const INVALID_FLAGS: sys::MountFlags = sys::MountFlags::from_bits(0x1);
 
     /// 期待どおりの tmpfs の独立したマウントのルート。
     const TMPFS_ROOT: MountProbe = MountProbe {
@@ -890,6 +951,7 @@ mod tests {
                 restrict: Ok(()),
                 probes: RefCell::new(Vec::new()),
                 identities: RefCell::new(Vec::new()),
+                flags: RefCell::new(Vec::new()),
             }
         }
         fn log(&self, s: impl Into<String>) {
@@ -938,6 +1000,15 @@ mod tests {
             self.log(format!("identity:{path}"));
             let mut p = self.identities.borrow_mut();
             if p.is_empty() { Ok(ID_A) } else { p.remove(0) }
+        }
+        fn mount_flags(&self, path: &usize) -> Result<sys::MountFlags, SysError> {
+            self.log(format!("flags:{path}"));
+            let mut p = self.flags.borrow_mut();
+            if p.is_empty() {
+                Ok(RO_FLAGS)
+            } else {
+                p.remove(0)
+            }
         }
         fn probe_mount(&self, path: &usize) -> Result<MountProbe, SysError> {
             self.log(format!("probe:{path}"));
@@ -1014,13 +1085,7 @@ mod tests {
     #[test]
     fn sup6_task163_3_rule_paths_resolve_beneath_the_given_root() {
         use std::os::unix::fs::MetadataExt as _;
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-landlock-root-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-landlock-root", "d");
         let root = base.join("root");
         let outside = base.join("outside");
         std::fs::create_dir_all(root.join("data/inner")).expect("tree");
@@ -1034,6 +1099,7 @@ mod tests {
         let kernel = RealKernel {
             threads: std::cell::RefCell::new(&mut threads),
             root: Some(root_fd.as_fd()),
+            fdinfo_dir: None,
         };
         let meta = |p: &std::path::Path| {
             let m = std::fs::metadata(p).expect("metadata");
@@ -1078,7 +1144,6 @@ mod tests {
             kernel.open_rule_path(&rule_path("/proc")).err(),
             Some(OpenError::Sys(SysError::Os(sys::ENOENT)))
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: NNP 未設定は何も呼ばずに `FailedPrecondition`（受入条件）。
@@ -1388,19 +1453,14 @@ mod tests {
     /// `..` と同じになり、暗黙のマウントとして通らない（イメージ同梱の `dev` に権利を付けない）。
     #[test]
     fn core5_sec1_real_probe_rejects_plain_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-landlock-probe-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-landlock-probe", "d");
         std::fs::create_dir_all(base.join("dev")).expect("tree");
         let root_fd = OwnedFd::from(std::fs::File::open(&base).expect("open root"));
         let mut threads = ThreadCountSource::ProcSelf;
         let kernel = RealKernel {
             threads: std::cell::RefCell::new(&mut threads),
             root: Some(root_fd.as_fd()),
+            fdinfo_dir: None,
         };
         let (fd, kind) = kernel
             .open_rule_path(&RulePath::ImplicitDev(ImplicitDevMount::Dev))
@@ -1417,7 +1477,6 @@ mod tests {
                 mount: ImplicitDevMount::Dev
             }
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// CORE-5・TASK-39.3: add / restrict / create の errno がコードへ写る。
@@ -1495,6 +1554,7 @@ mod tests {
                 by: *by,
                 destination: (*dest).to_string(),
                 identity: *identity,
+                read_only: false,
             })
             .expect("capacity");
         }
@@ -1551,6 +1611,93 @@ mod tests {
         assert_eq!((r.rules_added, r.mounts_verified), (2, 1));
         assert!(k.calls().contains(&"identity:1".to_string()));
         assert!(k.calls().contains(&"add:1:0xffff".to_string()));
+    }
+
+    /// 書き込み可能な root の下の `ro` の bind（`/data`。`requires_read_only_mount` が真になる形）の ruleset。
+    fn ro_bind_rs() -> LandlockRuleset {
+        LandlockRuleset::for_observation(
+            6,
+            vec![
+                PathRule {
+                    path: RulePath::Root,
+                    allowed: AccessFs::READ.union(AccessFs::WRITE),
+                    origin: RuleOrigin::Root,
+                },
+                PathRule {
+                    path: rule_path("/data"),
+                    allowed: AccessFs::READ,
+                    origin: RuleOrigin::Mount { index: 0 },
+                },
+            ],
+        )
+    }
+
+    fn recorded_ro(read_only: bool) -> MountedTargets {
+        let mut m = MountedTargets::new();
+        m.push(MountedTarget {
+            by: MountedBy::Bind { index: 0 },
+            destination: "/data".to_string(),
+            identity: ID_A,
+            read_only,
+        })
+        .expect("capacity");
+        m
+    }
+
+    /// CORE-5・SEC-1・#1917: `ro` の bind に頼るルールは、開いた fd のマウントが `ST_VALID | ST_RDONLY` なら通り、
+    /// `landlock_add_rule` の前に `fstatfs` で確かめる。頼らないルール（root）には問い合わせない。
+    #[test]
+    fn core5_1917_readonly_bind_rule_checks_flags_before_add_rule() {
+        let k = Fake::ok(2);
+        let r = apply_with(&k, &ro_bind_rs()).expect("applied");
+        assert_eq!(r.rules_added, 2);
+        let calls = k.calls();
+        let flags = calls.iter().position(|c| c == "flags:1").expect("flags:1");
+        let add = calls
+            .iter()
+            .position(|c| c.starts_with("add:1"))
+            .expect("add:1");
+        assert!(flags < add, "{calls:?}");
+        assert!(!calls.contains(&"flags:0".to_string()), "{calls:?}");
+    }
+
+    /// CORE-5・SEC-1・#1917: 書き込み可能・`ST_VALID` なし・観測失敗はいずれも `MountNotReadOnly`
+    /// （`FailedPrecondition`）で、`add_rule`・`restrict_self` を呼ばない（fail-closed）。
+    #[test]
+    fn core5_1917_not_read_only_mount_refuses_before_add_rule() {
+        for resp in [
+            Ok(RW_FLAGS),
+            Ok(INVALID_FLAGS),
+            Err(SysError::Os(sys::EACCES)),
+        ] {
+            let k = Fake::ok(2);
+            *k.flags.borrow_mut() = vec![resp];
+            let e = apply_with(&k, &ro_bind_rs()).expect_err("not read-only");
+            assert_eq!(
+                e.kind,
+                LandlockApplyErrorKind::MountNotReadOnly { index: 1 }
+            );
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+            assert_eq!(e.kind.as_str(), "landlock_mount_not_read_only");
+            let calls = k.calls();
+            assert!(!calls.iter().any(|c| c.starts_with("add:1")), "{calls:?}");
+            assert!(!calls.contains(&"restrict".to_string()), "{calls:?}");
+        }
+    }
+
+    /// CORE-5・SEC-1・#1917: launch の経路（`Recorded`）では、記録の `read_only` も真であることを要求する。
+    #[test]
+    fn core5_1917_recorded_read_only_flag_is_required() {
+        let k = Fake::ok(2);
+        let e = apply_recorded(&k, &ro_bind_rs(), &recorded_ro(false)).expect_err("recorded rw");
+        assert_eq!(
+            e.kind,
+            LandlockApplyErrorKind::MountNotReadOnly { index: 1 }
+        );
+        assert!(!k.calls().contains(&"restrict".to_string()));
+        let k = Fake::ok(2);
+        let r = apply_recorded(&k, &ro_bind_rs(), &recorded_ro(true)).expect("applied");
+        assert_eq!((r.rules_added, r.mounts_verified), (2, 1));
     }
 
     /// CORE-5・SEC-1・#2071: 識別子が違えば `restrict_self` の前に拒否する（権利は `add_rule` されない）。
@@ -1712,6 +1859,9 @@ mod tests {
         }
         fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
             MountIdentity::of_fd(path)
+        }
+        fn mount_flags(&self, path: &OwnedFd) -> Result<sys::MountFlags, SysError> {
+            sys::mount_flags(path.as_fd())
         }
     }
 

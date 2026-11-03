@@ -35,6 +35,9 @@
 //! 目的が「Landlock を載せない exec 層のマウントの結果」の観測にあるため。exec 経路は `LaunchReady` のために Landlock が
 //! 必須で、本番は同じ重なりを start で拒否する（Landlock 段の照合は #2071）。移すと観測の対象そのものが変わる。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]
 mod temp_rootfs;
@@ -299,11 +302,13 @@ mod linux {
                 Ok(Some(st)) => break (st.success(), format!("{st:?}")),
                 Ok(None) if Instant::now() >= deadline => {
                     // 子孫ごと終了させる（プロセスグループ宛の SIGKILL）。
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", "--", &format!("-{pgid}")])
-                        .status();
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // 期限なしの `status()` を避ける（REPAIR-5・#3409）。失敗は表に出すが、回収は続ける。
+                    let mut kill = std::process::Command::new("kill");
+                    kill.args(["-KILL", "--", &format!("-{pgid}")]);
+                    if let Err(e) = crate::reap::run_within(&mut kill, crate::reap::reap_within()) {
+                        eprintln!("group SIGKILL: {e}");
+                    }
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     break (false, "killed: scenario exceeded its deadline".to_string());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),

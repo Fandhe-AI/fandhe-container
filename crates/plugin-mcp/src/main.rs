@@ -19,11 +19,11 @@
 //! （空・相対・`..` 含み）は 2（`INVALID_ARGUMENT`）、UDS への接続失敗は 3（plugin-macos / -windows と同じ値で、
 //! core 側 proxy が同じ規則で扱えるようにする）。引数・環境変数の値・socket パスは出力へ埋め込まない。
 //! peer 認証の拒否イベントは、socket パスを除いた構造化 1 行（`PathlessPeerAuthObserver`）にして
-//! 接続失敗の診断の直前に stderr へ出す（SEC-4。永続的な監査ログへの配線は core 側との結線で未実装（結線は別 issue で行う。#1869 の設計の 4.9 では入口の対象外で、追跡 issue は未起票）。REPAIR-3）。
+//! 接続失敗の診断の直前に stderr へ出す（SEC-4。永続的な監査ログへの配線は core 側との結線で未実装（結線は別 issue で行う。#1869 で設計した plugin-backend-wiring.md 4.9 では入口の対象外で、追跡 issue は未起票。起票の要否は #3417 のコメントでユーザーに諮った）。REPAIR-3）。
 //! `list_containers` の状態ルート解決では core が `XDG_RUNTIME_DIR` を読む。
 //!
 //! 未実装（REPAIR-3。TASK-118 の後続 sub で扱う）: `start_container` の本番起動（supervisor 起動の
-//! adapter。#1718 待ちで、現状は `UNIMPLEMENTED` を `isError` で返す）、core 側 proxy との結線・UDS 上のフレーミングの確定（別 issue で行う。#1869 の設計の 4.9 では入口の対象外で、追跡 issue は未起票。現状は改行区切りの暫定契約）。
+//! adapter。#1718 待ちで、現状は `UNIMPLEMENTED` を `isError` で返す）、core 側 proxy との結線・UDS 上のフレーミングの確定（別 issue で行う。#1869 で設計した plugin-backend-wiring.md 4.9 では入口の対象外で、追跡 issue は未起票。起票の要否は #3417 のコメントでユーザーに諮った。現状は改行区切りの暫定契約）。
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;

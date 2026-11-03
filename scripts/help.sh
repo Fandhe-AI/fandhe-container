@@ -51,6 +51,10 @@ cat <<'EOF'
                                         venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
   check-cli-backend-deps              scripts/targets/check-cli-backend-deps.sh
                                         cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
+  check-microvm-deps                  scripts/check-microvm-deps.sh
+                                        依存ツリー（ルート workspace と venus 試験治具。normal/build/dev・全ターゲット・全 feature）に rust-vmm 系の禁止クレートが含まれないことを検証する（MVM-4・TASK-73.1）
+  check-microvm-deps-selftest         scripts/check-microvm-deps-selftest.sh
+                                        check-microvm-deps の自己テスト（MVM-4・REPAIR-12。スタブの cargo のみ）
   check-launch-target                 scripts/targets/check-launch-target.sh
                                         plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
   check-launch-target-selftest        scripts/check-plugin-launch-target-construction-selftest.sh
@@ -61,8 +65,10 @@ cat <<'EOF'
                                         check-standalone-clippy の自己テスト（REPAIR-12。スタブの cargo のみ。jq が必要）
   test-core-no-plugin                 scripts/targets/test-core-no-plugin.sh
                                         core を --no-default-features でテストし plugin 依存が入らないことを検証する
+  check-cli-no-plugin                 scripts/targets/check-cli-no-plugin.sh
+                                        CLI を --no-default-features で clippy し plugin 依存が入らないことを検証する（PLUG-3・#3204）
   plugin-feature-size                 scripts/targets/plugin-feature-size.sh
-                                        core の既定 / plugin 除外 release ビルドの rlib サイズを記録する（PLUG-3・TASK-111.2）
+                                        CLI の実行ファイルの既定 / plugin 除外 release ビルドのサイズを記録する（PLUG-3・TASK-111.2・#3204）
   plug4-core-invariance               scripts/with-workspace.sh plug4-core-invariance bash scripts/check-plug4-core-invariance.sh
                                         plugin 追加前後で core の指紋が不変か別ビルドで比較する（PLUG-4・TASK-109.4）
   plug4-core-invariance-selftest      scripts/with-tools.sh cargo,git scripts/check-plug4-core-invariance-selftest.sh
@@ -93,10 +99,16 @@ cat <<'EOF'
                                         macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
   guest-initrd-build-selftest         scripts/build-guest-initrd-selftest.sh
                                         ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
+  dev-fd-perm-probe                   scripts/probe-dev-fd-perm.sh
+                                        /dev/fd/N 経由の権限検査が macOS で効かない原因の観測（#2088・MAC-1。実機前提。make ci には含めない）
+  dev-fd-perm-probe-selftest          scripts/probe-dev-fd-perm-selftest.sh
+                                        /dev/fd 権限検査の観測スクリプトの自己テスト（#2088・MAC-1・REPAIR-12。一時ファイルのみ）
   third-party-licenses-selftest       scripts/generate-third-party-licenses-selftest.sh
                                         ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
   deny-license-fail-closed-selftest   scripts/targets/deny-license-fail-closed-selftest.sh
                                         deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）
+  deny-bans-fail-closed-selftest      scripts/targets/deny-bans-fail-closed-selftest.sh
+                                        deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（TASK-73.2・MVM-4・REPAIR-9）
   bench-check-selftest                scripts/with-tools.sh jq scripts/check-bench-regression-selftest.sh
                                         ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
   bench-baseline-selftest             scripts/with-tools.sh jq scripts/bench/generate_baseline_selftest.sh
@@ -109,8 +121,12 @@ cat <<'EOF'
                                         起動時間計測スクリプトの自己テスト（REPAIR-12。実ランタイム不要）
   net-setup-timing-selftest           scripts/with-tools.sh jq scripts/bench/net_setup_timing_selftest.sh
                                         ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
+  net-throughput-rtt-selftest         scripts/with-tools.sh jq scripts/bench/net_throughput_rtt_selftest.sh
+                                        iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプトの自己テスト（NET-2・NET-3・REPAIR-12。実機・docker 不要）
   small-files-compare-selftest        scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
                                         bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
+  mac-small-files-selftest            scripts/with-tools.sh jq scripts/bench/mac_small_files_selftest.sh
+                                        MAC-3 小ファイル多数計測スクリプトの自己テスト（REPAIR-12。実 Docker Desktop 不要。#1880）
   dns-helper-measure-selftest         scripts/with-tools.sh jq scripts/bench/dns_helper_measure_selftest.sh
                                         DNS ヘルパー計測スクリプトの自己テスト（NET-5・REPAIR-12。実機不要）
   idle-memory-selftest                scripts/bench/idle_memory_selftest.sh
@@ -129,8 +145,18 @@ cat <<'EOF'
                                         特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
   crictl-smoke-selftest               scripts/cri/crictl-smoke-selftest.sh
                                         crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
+  docker-hub-ratelimit-probe-selftest scripts/cri/docker-hub-ratelimit-probe-selftest.sh
+                                        Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
-                                        repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
+                                        repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合・委譲スコープモード・TEST_ENV の検証をスタブで確認。#2886）
+  run-in-user-scope-selftest          scripts/run-in-user-scope-selftest.sh
+                                        run-in-user-scope.sh の自己テスト（#3486・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査をスタブで確認）
+  test-bin-watchdog-selftest          scripts/test-bin-watchdog-selftest.sh
+                                        試験バイナリ watchdog（.cargo/config.toml の runner）の自己テスト（#3504・REPAIR-5・REPAIR-12。期限切れ・終了コード・シグナルの透過。Linux のみ）
+  run-with-deadline-selftest          scripts/run-with-deadline-selftest.sh
+                                        run-with-deadline.sh の自己テスト（#3505・REPAIR-5・REPAIR-12。期限切れ・孤児・入力検査を実プロセスで確認）
+  check-success-lines-selftest        scripts/check-success-lines-selftest.sh
+                                        check-success-lines.sh の自己テスト（REPAIR-7・REPAIR-12・PLUG-12。ソース導出の期待行の照合・双方向照合・forbid の矛盾検査・fail-closed を fixture で確認）
   deny                                scripts/targets/deny.sh
                                         cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
   deny-poc-venus-jig                  scripts/targets/deny-poc-venus-jig.sh
@@ -154,21 +180,29 @@ cat <<'EOF'
   bench-baseline                      scripts/targets/bench-baseline.sh
                                         ベンチを実行し baseline.json を再生成する（TASK-88.1・REPAIR-8）
   cli-parity                          scripts/targets/cli-parity.sh
-                                        CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+                                        CLI 3 OS 比較の capture（CLI/OUTPUT。任意で TIMEOUT=1〜600 秒）または compare（BASELINE/CANDIDATE）を実行する
   fio-bench                           scripts/targets/fio-bench.sh
                                         fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）
   fio-baseline-ratio                  scripts/targets/fio-baseline-ratio.sh
                                         fio ベースライン比を算出する（BASELINE/CANDIDATE に results.json のパスを指定）
   startup-latency                     scripts/targets/startup-latency.sh
-                                        起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+                                        起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL OUTPUT）
   startup-latency-docker              scripts/targets/startup-latency-docker.sh
-                                        Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。TASK-46.2）
+                                        Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL IMAGE OUTPUT。TASK-46.2）
   startup-latency-report              scripts/targets/startup-latency-report.sh
                                         own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）
   net-setup-timing                    scripts/targets/net-setup-timing.sh
                                         ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
+  net-throughput-rtt                  scripts/targets/net-throughput-rtt.sh
+                                        iperf3 スループットと 1 バイト TCP 往復を計測し JSON で出力する（実機前提。PROBE・EXE 必須。TARGET=docker|both は docker を使うため人間の承認後。NET-2・NET-3・TASK-140 準備）
+  net-throughput-rtt-compare          scripts/targets/net-throughput-rtt-compare.sh
+                                        2 つの計測結果から Docker 比（%）と p50・p99 の倍率を出す（OWN_RESULT・DOCKER_RESULT 必須。合否なし。NET-2・NET-3）
   small-files-compare                 scripts/targets/small-files-compare.sh
                                         bind / named volume の 2 構成で small_files を回し JSON で出力する（実機前提。BIND_ROOT・VOLUME_ROOT 必須。IO-7・TASK-24.1）
+  mac-small-files-docker              scripts/targets/mac-small-files-docker.sh
+                                        Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・#1880）
+  mac-small-files-report              scripts/targets/mac-small-files-report.sh
+                                        own と Docker Desktop の小ファイル多数の結果を統合する（OWN_RESULT=<file> BASELINE_RESULT=<file> 必須。合否は出さない。MAC-3・#1880）
   dns-helper-measure                  scripts/targets/dns-helper-measure.sh
                                         DNS ヘルパーの正答率・レイテンシ・常駐 PSS を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-5・TASK-141.3）
   idle-memory                         scripts/targets/idle-memory.sh
@@ -189,8 +223,10 @@ cat <<'EOF'
                                         restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
   crictl-smoke                        scripts/targets/crictl-smoke.sh
                                         crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
+  docker-hub-ratelimit-probe          scripts/cri/docker-hub-ratelimit-probe.sh
+                                        Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS=]。CRI-3・#2818）
   repeat-test                         scripts/targets/repeat-test.sh
-                                        指定した試験を N 回繰り返して間欠失敗を検出する（REPAIR-12。1 回ごとに timeout・成功行 `1 passed` を照合）
+                                        指定した試験を N 回繰り返して間欠失敗を検出する（REPAIR-12。1 回ごとに timeout・成功行 `1 passed` を照合。USER_SCOPE=1 で委譲スコープ実行・TEST_ENV で子への環境変数。#2886）
   docker-build                        docker compose build
                                         開発コンテナイメージをビルドする
   docker-shell                        docker compose run --rm dev

@@ -13,11 +13,17 @@
 //!
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
+//! - 段（`AuditRecord::stage`。#3121）は枠が運ばない。段つきの記録を通すと段は落ちる（現行の配線では段つきの
+//!   pre-pivot の記録は単一スレッドの launch が sink へ直接書き、中継を通らない。REPAIR-3）。落ちることは試験
+//!   `sec4_err4_3209_stage_is_dropped_by_relay_frame` が固定する（枠が段の有無でバイト同一・復号後は段なし）。
+//!   段つきを拒否せず落とすのは、記録そのものを失わないため（記録の成否で拒否は覆らない。fail-closed）
 //! - 運べるのは [`AuditEvent::PluginPeer`]（#2484。plugin-cri の peer 認証の拒否。socket のパスは mount と同じ枠で運ぶ）・
 //!   [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
 //!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
 //!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）・閉じた表（`MOUNT_REASONS`）の理由つきの `Mount`（#2623。start の
-//!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）の記録だけ（他の層と、表に無い理由の `Mount` は
+//!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）・[`AuditEvent::PastaVerify`]（#3330。
+//!   supervisor の `start` が構築済みの中継経由で期限つきに配送する pasta バイナリの再検証の拒否。理由は閉じた表
+//!   `PASTA_VERIFY_REJECTIONS` の 2 理由）の記録だけ（他の層と、表に無い理由の `Mount`・`PastaVerify` は
 //!   `InvalidArgument`。理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せるものだけを運ぶ。それ以外の
 //!   理由つきの記録は単一スレッドの launch が `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
@@ -27,6 +33,8 @@
 //!   helper を SIGKILL して以後の `record` を `Unavailable` で拒否する（ずれた応答を次の要求へ取り違えない。fail-closed）。
 //!   拒否の判定自体は呼び出し側で既に確定しており、本中継の失敗は判定を覆さない
 //! - 親が終了すると socketpair が EOF になり helper も終了する。drop でも SIGKILL して回収を試みる
+//! - [`ControlAuditRelay::spawn_ignoring_stop_signals`]（#3300。plugin-cri と supervisor が使う〔#3415〕）の helper は SIGTERM・SIGINT を無視する（グループ・cgroup 宛ての
+//!   停止で先に死なない）。終わるのは本体の終了（EOF）か SIGKILL のとき。本体が死んだ後の残存は最悪 [`RECORD_WAIT_LIMIT`]
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -58,6 +66,8 @@ const ACK_OK: u8 = 1;
 const ACK_FAIL: u8 = 0;
 /// helper が fd 3 以上を閉じられなかったときの終了コード。
 const CLOSE_FDS_FAILED_EXIT: i32 = 3;
+/// helper が停止シグナル（SIGTERM・SIGINT）を無視にできなかったときの終了コード（親の `probe` が失敗として検出する）。
+const IGNORE_SIGNALS_FAILED_EXIT: i32 = 4;
 /// 回収待ちの上限（drop 時）。
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
@@ -107,6 +117,18 @@ const PLUGIN_PEER_REJECTIONS: [PluginPeerRejection; 5] = [
     PluginPeerRejection::Unknown,
 ];
 
+/// pasta の検証拒否（`AuditEvent::PastaVerify`。SEC-4・NET-9・PLUG-11・#3330）の記録を示す先頭バイト。コンテナ ID の後に
+/// 理由の添字（`PASTA_VERIFY_REJECTIONS` の位置 1）が付く。supervisor の start が、構築済みの relay 経由で期限つきに配送する。
+const TAG_PASTA_VERIFY: u8 = 0x86;
+/// pasta_verify の枠だけが持つ追加部の長さ（理由の添字 1）。
+const PASTA_VERIFY_EXTRA_LEN: usize = 1;
+
+/// pasta_verify で運べる拒否理由（枠の添字）。
+const PASTA_VERIFY_REJECTIONS: [super::PastaVerifyRejection; 2] = [
+    super::PastaVerifyRejection::RecordChanged,
+    super::PastaVerifyRejection::PermissionDenied,
+];
+
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
@@ -115,6 +137,7 @@ const fn extra_len(tag: u8) -> usize {
         TAG_MOUNT => MOUNT_EXTRA_LEN,
         TAG_PLUGIN_PEER => PLUGIN_PEER_EXTRA_LEN,
         TAG_MOUNT_REASON => MOUNT_REASON_EXTRA_LEN,
+        TAG_PASTA_VERIFY => PASTA_VERIFY_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -129,7 +152,8 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
     TraitError::new(code, message)
 }
 
-/// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
+/// 記録を枠へ符号化する。運べる層（モジュール doc の「契約」の列挙）以外の層、運べない理由、長すぎるコンテナ ID は
+/// `InvalidArgument` で拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     let (tag, extra, exit_signal) = match record.event() {
         AuditEvent::Mount { path, reason: None } => {
@@ -157,6 +181,22 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
             };
             (tag, None, None)
         }
+        AuditEvent::PastaVerify { reason } => {
+            let Some(index) = PASTA_VERIFY_REJECTIONS
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this pasta rejection reason",
+                ));
+            };
+            let mut frame = Vec::with_capacity(FIXED_LEN + 1 + PASTA_VERIFY_EXTRA_LEN);
+            push_head(&mut frame, TAG_PASTA_VERIFY, record)?;
+            frame.push(index);
+            return Ok(frame);
+        }
         AuditEvent::Seccomp { syscall, arch } => {
             (TAG_SECCOMP, Some((syscall.get(), arch.get())), None)
         }
@@ -168,7 +208,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, plugin peer, seccomp, exit signal and mount records",
+                "the audit relay only carries control channel, plugin peer, pasta verify, seccomp, exit signal and mount records",
             ));
         }
     };
@@ -421,6 +461,13 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
         decode_mount_reason(rest, id_len)?
     } else if tag == TAG_PLUGIN_PEER {
         decode_plugin_peer(rest, id_len)?
+    } else if tag == TAG_PASTA_VERIFY {
+        if rest.len() != id_len.checked_add(PASTA_VERIFY_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let rejection = PASTA_VERIFY_REJECTIONS.get(usize::from(*extra.first()?))?;
+        (id, rejection.audit_event())
     } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
@@ -543,14 +590,37 @@ impl ControlAuditRelay {
     /// `sink` を持つ helper を fork する。呼び出しプロセスが複数スレッドなら `FailedPrecondition`。
     /// fork 直後に未回収の自分の子と確認できなければ `Unavailable`（pid を保持しない）。
     ///
-    /// 呼び出し元: supervisor の `start`（制御チャネルの `install` の前、スレッドを作る前）。
+    /// 本番の呼び出し元は無い（supervisor・plugin-cri とも停止シグナルを無視する [`ControlAuditRelay::spawn_ignoring_stop_signals`]
+    /// を使う。#3415）。停止シグナルで死んでよい用途（試験）向け。
     pub fn spawn(sink: FileAuditSink) -> Result<Self, TraitError> {
+        Self::spawn_inner(sink, false)
+    }
+
+    /// [`ControlAuditRelay::spawn`] と同じだが、helper が SIGTERM・SIGINT を `SIG_IGN` にしてから動く（#3300）。
+    ///
+    /// プロセスグループ宛ての SIGTERM や systemd の `KillMode=control-group`（cgroup 全体宛て）で helper が本体より
+    /// 先に死ぬと、本体のドレイン中の拒否が `@audit.log` に届かない（SEC-4）。本口の helper は停止シグナルでは死なず、
+    /// 本体の終了（socketpair の EOF）で `serve` から戻って終わる。本体が先に死んだ後に残る時間は、処理中の 1 件を
+    /// 書き終えるまでで最悪 [`RECORD_WAIT_LIMIT`]（REPAIR-5）。`SIGKILL` は無視できないので最終の回収は妨げない。
+    /// helper は exec しない（`SIG_IGN` はコンテナ内のコマンドへ持ち込まれない）。helper の子（`FileAuditSink` の隔離の
+    /// 子）も無視を継承するが、期限と SIGKILL で回収される。
+    ///
+    /// 呼び出し元: plugin-cri の `open_audit_relay_in` と supervisor の `open_control_audit_relay`（#3415）。supervisor は
+    /// 本体が停止シグナルのハンドラを持たず即座に死ぬため、守れるのは到着時に helper が書いている途中の 1 件に限る。
+    pub fn spawn_ignoring_stop_signals(sink: FileAuditSink) -> Result<Self, TraitError> {
+        Self::spawn_inner(sink, true)
+    }
+
+    fn spawn_inner(sink: FileAuditSink, ignore_stop: bool) -> Result<Self, TraitError> {
         let unavailable = || err(ErrorCode::Unavailable, "failed to start the audit relay");
         let (parent, child) = UnixStream::pair().map_err(|_| unavailable())?;
         let parent = dup_high(parent).ok_or_else(unavailable)?;
         let child = dup_high(child).ok_or_else(unavailable)?;
         let forked = sys::fork_single_threaded_no_flush(
             || {
+                if ignore_stop && sys::ignore_stop_signals().is_err() {
+                    return IGNORE_SIGNALS_FAILED_EXIT;
+                }
                 if sys::close_fds_from_except(3, child.as_fd()).is_err() {
                     return CLOSE_FDS_FAILED_EXIT;
                 }
@@ -1143,6 +1213,45 @@ mod tests {
         assert!(decode(&zero_pid).is_none());
     }
 
+    /// SEC-4・ERR-4・REPAIR-3・#3209: 段つきの記録を中継の枠へ通すと段は落ちる（枠は段の有無でバイト同一で、
+    /// 復号後の記録は段なし・他の値は一致）。拒否ではなく落とすのは、記録そのものを失わないため。
+    #[test]
+    fn sec4_err4_3209_stage_is_dropped_by_relay_frame() {
+        use super::super::AuditStage;
+        use crate::exec::IsolationStage;
+        let stage = AuditStage::from(IsolationStage::MountBinds);
+        let mut records = vec![
+            sample(ControlPeerRejection::PeerUidMismatch, Some("c1")),
+            exit_signal_sample(31, 4321, Some("c1")),
+            mount_sample(Some(AuditPath::new("/a/b")), Some("c1")),
+            plugin_peer_sample(PLUGIN_PEER_REJECTIONS[0], "/run/p/cri.sock"),
+            reason_sample(None, MOUNT_REASONS[0].as_str(), Some("c1")),
+            reason_sample(
+                Some(AuditPath::new("/a")),
+                MOUNT_REASONS[1].as_str(),
+                Some("c1"),
+            ),
+            seccomp_sample(165, 0xC000_003E, Some("c1")),
+        ];
+        assert_eq!(records.len(), 7);
+        for plain in records.drain(..) {
+            let staged = plain.clone().with_stage(stage);
+            assert_eq!(staged.stage(), Some(stage));
+            let frame = encode(&staged).unwrap();
+            assert_eq!(
+                frame,
+                encode(&plain).unwrap(),
+                "frame must not carry the stage"
+            );
+            let back = decode(&frame).unwrap();
+            assert_eq!(back.stage(), None);
+            assert_eq!(back.event(), plain.event());
+            assert_eq!(back.timestamp(), plain.timestamp());
+            assert_eq!(back.pid(), plain.pid());
+            assert_eq!(back.container_id(), plain.container_id());
+        }
+    }
+
     fn exit_signal_sample(signal: i32, target: i32, id: Option<&str>) -> AuditRecord {
         let r = AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 9)),
@@ -1155,6 +1264,47 @@ mod tests {
         match id {
             Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
             None => r,
+        }
+    }
+
+    /// SEC-4・NET-9・PLUG-11・#3330: pasta_verify の枠は理由・コンテナ ID・PID・時刻が往復で一致し、
+    /// 壊れた枠(不足・余り・未知の理由の添字)は記録にしない。
+    #[test]
+    fn sec4_3330_pasta_verify_frame_round_trips() {
+        for (rejection, token) in [
+            (
+                super::super::PastaVerifyRejection::RecordChanged,
+                "pasta_record_changed",
+            ),
+            (
+                super::super::PastaVerifyRejection::PermissionDenied,
+                "pasta_permission_denied",
+            ),
+        ] {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+                AuditPid::new(77).unwrap(),
+                rejection.audit_event(),
+            )
+            .with_container_id(ContainerId::new("web-1").unwrap());
+            let frame = encode(&rec).unwrap();
+            assert_eq!(frame.len(), FIXED_LEN + 5 + PASTA_VERIFY_EXTRA_LEN);
+            assert_eq!(extra_len(frame[0]), PASTA_VERIFY_EXTRA_LEN);
+            let back = decode(&frame).unwrap();
+            assert_eq!(
+                back.reason().map(super::super::AuditReason::as_str),
+                Some(token)
+            );
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+            assert!(decode(&frame[..frame.len() - 1]).is_none());
+            let mut longer = frame.clone();
+            longer.push(0);
+            assert!(decode(&longer).is_none());
+            let mut unknown = frame.clone();
+            *unknown.last_mut().unwrap() = 2;
+            assert!(decode(&unknown).is_none());
         }
     }
 

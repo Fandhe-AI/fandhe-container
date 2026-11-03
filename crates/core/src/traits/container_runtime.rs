@@ -2,7 +2,7 @@
 //!
 //! CRI サーバー層（`fandhe-container-cri`）・将来の containerd shim v2（CRI-5）は、
 //! この内部トレイトを呼ぶアダプタとなる想定（PoC-7 の原案）。実装は本 crate には置かず、
-//! 別プロセス plugin（`fandhe-container-plugin-cri` 等は TASK-114、バックエンド plugin は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）が担い、core 側の
+//! 別プロセス plugin（`fandhe-container-plugin-cri` 等は TASK-114、バックエンド plugin は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）が担い、core 側の
 //! proxy（G8・TASK-107。バックエンド plugin 向けは #1869 の設計の 4.1・4.3）が UDS＋長さ接頭辞フレームの RPC へ変換して
 //! `Box<dyn ContainerRuntime>` として呼び出し側へ渡す（PLUG-1）。
 //!
@@ -11,8 +11,10 @@
 
 use std::num::{NonZeroU8, NonZeroU32};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
+use super::state_store::Annotations;
 use super::types::{ContainerId, ErrorCode, TraitError};
 
 /// コンテナのライフサイクル（create/start/kill/stop/delete/state）を抽象化する拡張点。
@@ -26,6 +28,7 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 ///    から共有できることを前提にしてよい。
 /// 4. 本 crate（core）にはこのトレイトの実装を置かない。実装は plugin 側にある
 ///    （PLUG-1・#1869 の設計・TASK-114）。「実装済みを装わない」という REPAIR-3 の方針に基づく。
+///    既定メソッド（`wait_exit`）は状態照会だけを使う期限つきの代替で、実装の代わりではない。
 /// 5. plugin の信頼境界（UDS の所有者・権限検証、別 UID からの接続切断等。PLUG-11・PLUG-12）
 ///    はこのトレイトの外側、境界機構（`fandhe-container-plugin`）の責務であり、
 ///    `ContainerRuntime` の呼び出し側はそれらが検証済みであることを前提にしてよい。
@@ -53,7 +56,8 @@ pub trait ContainerRuntime: Send + Sync {
     /// 対応: CORE-2・ERR-2。
     fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError>;
 
-    /// SIGTERM を送り、猶予時間（[`StopRequest::grace`]）を過ぎたら SIGKILL で強制停止する。
+    /// [`StopRequest::signal`]（既定 SIGTERM）を停止の意図つきで 1 回送り、猶予時間
+    /// （[`StopRequest::grace`]）を過ぎたら SIGKILL で強制停止する。
     ///
     /// CLI の `stop` サブコマンド（CLI-1）と CRI `StopContainer` に対応する。
     /// 猶予は呼び出し側が明示し、無期限には待たない（REPAIR-5）。
@@ -73,6 +77,55 @@ pub trait ContainerRuntime: Send + Sync {
     /// 前提: 対象コンテナが存在すること。存在しなければ [`ErrorCode::NotFound`] を返す。
     /// 対応: CORE-2・ERR-2。
     fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError>;
+
+    /// コンテナが [`ContainerState::Stopped`] になるまで、[`WaitExitRequest::timeout`] を上限に待つ。
+    ///
+    /// containerd shim v2 の `Wait`（CRI-1・CRI-5）の終了待ちの拡張点（PLUG-1・REPAIR-5）。
+    /// 返すのは `Stopped` の状態だけで、期限内に止まらなければ [`ErrorCode::Timeout`]、
+    /// [`WaitExitRequest::is_cancelled`] が真になれば [`ErrorCode::Unavailable`] で戻る。
+    /// 未起動の `Created` や `Unknown` は終了扱いにしない。`state` の失敗（途中で削除された
+    /// ときの [`ErrorCode::NotFound`] を含む）は再試行せずそのまま返す。
+    ///
+    /// 簡易実装（REPAIR-3）: 既定の本体は `state` を [`WaitExitRequest::poll_interval`] ごとに
+    /// 照会するだけの代替で、終了通知は使わない。終了通知を持つ実装（supervisor の終了通知など）は
+    /// 上書きしてイベント駆動にしてよい。上書きする実装も、期限と取り消しを有界の刻みで守り、
+    /// `Stopped` 以外を返さない契約を負う。plugin 越しの実装（#1869）は RPC の期限を
+    /// `timeout` に余裕を足した値以上にする。
+    fn wait_exit(&self, req: &WaitExitRequest<'_>) -> Result<ContainerStatus, TraitError> {
+        const CANCEL_SLICE: Duration = Duration::from_millis(10);
+        let deadline = Instant::now()
+            .checked_add(req.timeout())
+            .ok_or_else(|| TraitError::new(ErrorCode::Internal, "wait deadline overflow"))?;
+        let state_req = StateRequest::new(req.id().clone());
+        let cancelled = || Err(TraitError::new(ErrorCode::Unavailable, "wait cancelled"));
+        loop {
+            if req.is_cancelled() {
+                return cancelled();
+            }
+            let st = self.state(&state_req)?;
+            if st.state() == ContainerState::Stopped {
+                return Ok(st);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "wait exceeded its deadline",
+                ));
+            }
+            let sleep_end = now + req.poll_interval().min(deadline - now);
+            loop {
+                if req.is_cancelled() {
+                    return cancelled();
+                }
+                let now = Instant::now();
+                if now >= sleep_end {
+                    break;
+                }
+                thread::sleep(CANCEL_SLICE.min(sleep_end - now));
+            }
+        }
+    }
 }
 
 /// Linux のシグナル番号（`kill`/`stop` で使う）。
@@ -106,6 +159,101 @@ impl Signal {
     pub fn as_u8(&self) -> u8 {
         self.0.get()
     }
+
+    /// Docker の `--signal` / `STOPSIGNAL` と同じ表記（番号または名前）を解釈する
+    /// （CLI-1・ERR-1。CLI の `stop --signal` が使う。moby の `ParseSignal` の語彙）。
+    ///
+    /// - 数字だけなら Linux の番号（1..=64。glibc が予約する 32・33 は拒否する）
+    /// - それ以外は ASCII の大文字小文字を区別しない名前で、`SIG` 接頭辞は任意
+    ///   （`RTMIN`・`RTMIN+1..=15`・`RTMAX-14..=-1`・`RTMAX`。オフセットは先頭 0 なしの 1〜2 桁で moby の `SignalMap` と同じ。別名の `IOT`・`CLD`・`POLL` を含む）
+    /// - 空・長さ上限（64 バイト）超え・非 ASCII・符号つき数字・空白は拒否する。長さは解釈の前に検査する
+    ///
+    /// エラーは [`ErrorCode::InvalidArgument`] で、固定の英語文言にし入力値を含めない。
+    pub fn parse_notation(text: &str) -> Result<Self, TraitError> {
+        let invalid = || TraitError::new(ErrorCode::InvalidArgument, "signal is invalid");
+        if text.is_empty() || text.len() > MAX_SIGNAL_NOTATION_BYTES || !text.is_ascii() {
+            return Err(invalid());
+        }
+        let number = if text.bytes().all(|b| b.is_ascii_digit()) {
+            text.parse::<u32>().map_err(|_| invalid())?
+        } else {
+            signal_number_of_name(&text.to_ascii_uppercase()).ok_or_else(invalid)?
+        };
+        // 32・33 は glibc が予約する番号（実時間シグナルの先頭は 34）。
+        if number == 32 || number == 33 {
+            return Err(invalid());
+        }
+        let value = u8::try_from(number).map_err(|_| invalid())?;
+        Self::new(value).map_err(|_| invalid())
+    }
+}
+
+/// [`Signal::parse_notation`] が受ける文字列の長さの上限（バイト）。
+const MAX_SIGNAL_NOTATION_BYTES: usize = 64;
+
+/// 大文字化済みの名前を Linux のシグナル番号へ写す（x86_64 / aarch64 共通の体系）。
+fn signal_number_of_name(upper: &str) -> Option<u32> {
+    let name = upper.strip_prefix("SIG").unwrap_or(upper);
+    let fixed = match name {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" | "CLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" => 31,
+        "RTMIN" => 34,
+        "RTMAX" => 64,
+        _ => 0,
+    };
+    if fixed != 0 {
+        return Some(fixed);
+    }
+    if let Some(n) = name.strip_prefix("RTMIN+") {
+        let n = parse_small_decimal(n)?;
+        return (1..=15).contains(&n).then_some(34 + n);
+    }
+    if let Some(n) = name.strip_prefix("RTMAX-") {
+        let n = parse_small_decimal(n)?;
+        return (1..=14).contains(&n).then_some(64 - n);
+    }
+    None
+}
+
+/// 1〜2 桁の ASCII 数字だけの文字列を数にする（符号・空白・長い桁は `None`）。
+fn parse_small_decimal(text: &str) -> Option<u32> {
+    if text.is_empty() || text.len() > 2 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // moby の `SignalMap` に先頭 0 のキー（`RTMIN+01` 等）は無い。イメージ由来の入力の受理範囲を広げない。
+    if text.len() == 2 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// [`ContainerRuntime::create`] の要求。
@@ -114,6 +262,7 @@ impl Signal {
 pub struct CreateRequest {
     id: ContainerId,
     bundle: PathBuf,
+    annotations: Annotations,
 }
 
 impl CreateRequest {
@@ -130,7 +279,27 @@ impl CreateRequest {
                 "bundle path must be absolute",
             ));
         }
-        Ok(Self { id, bundle })
+        Ok(Self {
+            id,
+            bundle,
+            annotations: Annotations::default(),
+        })
+    }
+
+    /// `state.json` へ記録する label(`--label`。検証済みの [`Annotations`]。SUP-12・CLI-1・#2713)。既定は空。
+    ///
+    /// core の `create` が [`CreateStateRequest::with_annotations`](super::state_store::CreateStateRequest::with_annotations)
+    /// へそのまま渡す。plugin 境界のワイヤー(`CreateRequest` の符号化)は label を運ばないため、plugin 経由の
+    /// backend では無視される(REPAIR-3。Linux の CLI は core を直接呼ぶので影響しない)。
+    #[must_use]
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    /// 記録する label を返す(未指定なら空)。
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
     }
 
     /// 対象コンテナの ID を返す。
@@ -149,17 +318,83 @@ impl CreateRequest {
 #[non_exhaustive]
 pub struct StartRequest {
     id: ContainerId,
+    log_path: Option<ContainerLogPath>,
 }
 
 impl StartRequest {
-    /// 対象コンテナの ID から要求を作る。
+    /// 対象コンテナの ID から要求を作る（CRI ログの書き先なし）。
     pub fn new(id: ContainerId) -> Self {
-        Self { id }
+        Self { id, log_path: None }
+    }
+
+    /// CRI ログの書き先（`log_directory/log_path` を結合・検証済みの絶対パス）を付ける
+    /// （CRI-2・SUP-4・#2671）。supervisor はコンテナ出力を CRI ログ形式でこのパスへ書く。
+    #[must_use]
+    pub fn with_log_path(mut self, log_path: ContainerLogPath) -> Self {
+        self.log_path = Some(log_path);
+        self
     }
 
     /// 対象コンテナの ID を返す。
     pub fn id(&self) -> &ContainerId {
         &self.id
+    }
+
+    /// CRI ログの書き先を返す。`None` は CRI ログなし（従来どおり）。
+    pub fn log_path(&self) -> Option<&ContainerLogPath> {
+        self.log_path.as_ref()
+    }
+}
+
+/// [`ContainerLogPath::new`] が受理するバイト長の上限（argv の 1 要素の上限と同じ 4096）。
+pub const CONTAINER_LOG_PATH_MAX_BYTES: usize = 4096;
+
+/// CRI ログの書き先パス（検証済みの絶対 POSIX パス。CRI-2・SUP-4・#2671）。
+///
+/// CRI の `log_directory` と `log_path` を cri crate が結合した結果を、
+/// [`StartRequest`] 経由で plugin-cri → supervisor の argv（`--cri-log-path`）へ運ぶ。
+/// supervisor 側でも外部入力として同じ検証を再度通す。
+///
+/// ログのパスは Linux の supervisor ホスト上のパスであり、[`Signal`] が Linux の番号体系を使うのと
+/// 同じ理由で、ホストの `Path` の意味（Windows の `is_absolute` 等）に依らない POSIX 文字列として
+/// 検証する（3 OS で同じ結果になる）。
+///
+/// 不変条件: 先頭が `/`、`/` 区切りの各要素が空でなく `.`・`..` でもない（連続する `/`・末尾の `/` は拒否）、
+/// NUL と制御文字を含まない、2〜[`CONTAINER_LOG_PATH_MAX_BYTES`] バイト。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContainerLogPath(String);
+
+impl ContainerLogPath {
+    /// 文字列を検証して作る。違反は [`ErrorCode::InvalidArgument`]（メッセージに値を含めない）。
+    pub fn new(value: impl Into<String>) -> Result<Self, TraitError> {
+        let value = value.into();
+        let invalid = || {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "container log path must be a normalized absolute path",
+            )
+        };
+        if value.len() < 2 || value.len() > CONTAINER_LOG_PATH_MAX_BYTES {
+            return Err(invalid());
+        }
+        let Some(rest) = value.strip_prefix('/') else {
+            return Err(invalid());
+        };
+        if value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        if rest
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(invalid());
+        }
+        Ok(Self(value))
+    }
+
+    /// 検証済みのパス文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -218,11 +453,18 @@ impl KillRequest {
 const STOP_GRACE_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// [`ContainerRuntime::stop`] の要求。
+///
+/// 実装は [`StopRequest::signal`]（既定 SIGTERM）を停止の意図つきで 1 回送り、
+/// [`StopRequest::grace`] を過ぎても止まらなければ、シグナルが何であっても無条件に
+/// SIGKILL へ切り替える（全体の待ちは有界のまま。REPAIR-5）。CRI の `stop_signal`
+/// （CRI-2。#2668）を運ぶための欄で、番号は Linux の体系（[`Signal`] の doc 参照）。
+/// 対応: PLUG-1。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StopRequest {
     id: ContainerId,
     grace: Duration,
+    signal: Signal,
 }
 
 impl StopRequest {
@@ -238,7 +480,23 @@ impl StopRequest {
                 format!("grace must not exceed {STOP_GRACE_MAX:?}"),
             ));
         }
-        Ok(Self { id, grace })
+        Ok(Self {
+            id,
+            grace,
+            signal: Signal::SIGTERM,
+        })
+    }
+
+    /// 猶予の間に最初に送るシグナルを指定する（既定は SIGTERM）。
+    #[must_use]
+    pub fn with_signal(mut self, signal: Signal) -> Self {
+        self.signal = signal;
+        self
+    }
+
+    /// 最初に送るシグナル（既定 SIGTERM）を返す。
+    pub fn signal(&self) -> Signal {
+        self.signal
     }
 
     /// 対象コンテナの ID を返す。
@@ -249,6 +507,94 @@ impl StopRequest {
     /// SIGKILL までの猶予時間を返す。
     pub fn grace(&self) -> Duration {
         self.grace
+    }
+}
+
+/// [`WaitExitRequest`] が受理する期限・照会間隔の上限（REPAIR-5）。`STOP_GRACE_MAX` と同じ 24 時間。
+const WAIT_EXIT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// [`WaitExitRequest::poll_interval`] の既定値。
+const WAIT_EXIT_POLL_DEFAULT: Duration = Duration::from_millis(100);
+
+/// [`ContainerRuntime::wait_exit`] の要求（CRI-1・CRI-5・PLUG-1）。
+///
+/// 期限は必須で（無期限を許さない。REPAIR-5）、ゼロと 24 時間超は拒否する。
+/// 取り消し判定（サーバー停止・接続切断）は呼び出し側のクロージャで渡す。
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct WaitExitRequest<'a> {
+    id: ContainerId,
+    timeout: Duration,
+    poll_interval: Duration,
+    cancel: Option<&'a (dyn Fn() -> bool + 'a)>,
+}
+
+impl<'a> WaitExitRequest<'a> {
+    /// 対象コンテナの ID と期限から作る。`timeout` がゼロまたは 24 時間超なら
+    /// [`ErrorCode::InvalidArgument`]。
+    pub fn new(id: ContainerId, timeout: Duration) -> Result<Self, TraitError> {
+        Self::check("timeout", timeout)?;
+        Ok(Self {
+            id,
+            timeout,
+            poll_interval: WAIT_EXIT_POLL_DEFAULT,
+            cancel: None,
+        })
+    }
+
+    fn check(name: &str, d: Duration) -> Result<(), TraitError> {
+        if d.is_zero() || d > WAIT_EXIT_MAX {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                format!("wait {name} must be in 1ns..={WAIT_EXIT_MAX:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 既定実装の照会間隔を変える（既定 100 ミリ秒）。ゼロと 24 時間超は拒否する。
+    pub fn with_poll_interval(mut self, interval: Duration) -> Result<Self, TraitError> {
+        Self::check("poll_interval", interval)?;
+        self.poll_interval = interval;
+        Ok(self)
+    }
+
+    /// 取り消し判定を付ける。真を返したら待ちを打ち切る。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a (dyn Fn() -> bool + 'a)) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 対象コンテナの ID を返す。
+    pub fn id(&self) -> &ContainerId {
+        &self.id
+    }
+
+    /// 待ちの期限（相対）を返す。
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 既定実装の照会間隔を返す。
+    pub fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+
+    /// 取り消しが要求されているか。判定が付いていなければ常に偽。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c())
+    }
+}
+
+impl std::fmt::Debug for WaitExitRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitExitRequest")
+            .field("id", &self.id)
+            .field("timeout", &self.timeout)
+            .field("poll_interval", &self.poll_interval)
+            .field("has_cancel", &self.cancel.is_some())
+            .finish()
     }
 }
 
@@ -472,6 +818,11 @@ pub enum CleanupOutcome {
     Removed,
     /// 既に無かった（冪等な再実行）。
     AlreadyAbsent,
+    /// 同じ ID が再作成済みで、新しいインスタンスの資源として消さずに残した（SUP-7・REPAIR-4・#3143）。
+    ///
+    /// 失敗ではないため警告しない（[`DeleteResponse::kept`] にも載せない）。ロック保持中の確認（guard）が
+    /// 偽だったときだけで、ファイルが無くて 0 件だった成功は [`Self::Removed`] のまま。
+    Superseded,
     /// 消せずに残した。`code` は理由の分類。
     Kept {
         /// 残した理由の機械可読な分類。
@@ -489,6 +840,8 @@ pub enum CleanupTarget {
     SupervisorLog,
     /// コンテナログ（CRI-2）。
     ContainerLog,
+    /// イメージストア側のコンテナ参照（OCI-7。使用中イメージの保護）。
+    ImageRef,
 }
 
 impl CleanupTarget {
@@ -498,6 +851,7 @@ impl CleanupTarget {
             Self::ImageRootfs => "image_rootfs",
             Self::SupervisorLog => "supervisor_log",
             Self::ContainerLog => "container_log",
+            Self::ImageRef => "image_ref",
         }
     }
 }
@@ -507,16 +861,18 @@ impl CleanupTarget {
 ///
 /// 各欄は既定で [`CleanupOutcome::NotApplicable`]。埋める層は欄ごとに異なる:
 /// - `image_rootfs`: core の delete（記録の無い rootfs は `NotApplicable`）
-/// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`）。CLI は
-///   トレイトを通らず、自前の警告で出すため欄を使わない
+/// - `image_ref`: イメージ参照の解除つき delete（`delete_releasing_image_ref`。OCI-7。通常の delete は `NotApplicable`）
+/// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`・CLI の `delete`）。
+///   CLI も `finish_delete` で埋める（警告の 1 行 JSON は CLI 自前の形式。#2698）
 ///
-/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869）の DTO への追加は未実装。
+/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869 の設計。承認と実装 issue の起票は #2232）の DTO への追加は未実装。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeleteResponse {
     image_rootfs: CleanupOutcome,
     supervisor_log: CleanupOutcome,
     container_log: CleanupOutcome,
+    image_ref: CleanupOutcome,
 }
 
 impl DeleteResponse {
@@ -543,6 +899,12 @@ impl DeleteResponse {
         self
     }
 
+    /// イメージストア側のコンテナ参照の解除の結果を設定する（OCI-7・REPAIR-4）。
+    pub fn with_image_ref(mut self, outcome: CleanupOutcome) -> Self {
+        self.image_ref = outcome;
+        self
+    }
+
     /// イメージ由来 rootfs の後始末の結果。
     pub fn image_rootfs(&self) -> CleanupOutcome {
         self.image_rootfs
@@ -558,12 +920,18 @@ impl DeleteResponse {
         self.container_log
     }
 
-    /// 残した資源を固定順（rootfs・supervisor ログ・コンテナログ）で返す。
+    /// イメージストア側のコンテナ参照の解除の結果。解除つき delete だけが埋める。
+    pub fn image_ref(&self) -> CleanupOutcome {
+        self.image_ref
+    }
+
+    /// 残した資源を固定順（rootfs・supervisor ログ・コンテナログ・イメージ参照）で返す。
     pub fn kept(&self) -> impl Iterator<Item = (CleanupTarget, ErrorCode)> {
         [
             (CleanupTarget::ImageRootfs, self.image_rootfs),
             (CleanupTarget::SupervisorLog, self.supervisor_log),
             (CleanupTarget::ContainerLog, self.container_log),
+            (CleanupTarget::ImageRef, self.image_ref),
         ]
         .into_iter()
         .filter_map(|(t, o)| match o {
@@ -577,6 +945,42 @@ impl DeleteResponse {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// CRI-2・SUP-4（#2671）: `ContainerLogPath` の受理と拒否。
+    #[test]
+    fn container_log_path_validation() {
+        let ok = ContainerLogPath::new("/var/log/pods/ns_p_uid/c/0.log").expect("ok");
+        assert_eq!(ok.as_str(), "/var/log/pods/ns_p_uid/c/0.log");
+        let long_ok = format!("/{}", "a".repeat(CONTAINER_LOG_PATH_MAX_BYTES - 1));
+        assert!(ContainerLogPath::new(long_ok).is_ok());
+        let too_long = format!("/{}", "a".repeat(CONTAINER_LOG_PATH_MAX_BYTES));
+        for bad in [
+            "",
+            "/",
+            "rel/x.log",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/b/",
+            "/a/\0b",
+            "/a/\nb",
+            "/a/\rb",
+            too_long.as_str(),
+        ] {
+            let e = ContainerLogPath::new(bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad:?}");
+        }
+    }
+
+    /// CRI-2・SUP-4（#2671）: `StartRequest` は既定で書き先なし、付けると返す。
+    #[test]
+    fn start_request_log_path_roundtrip() {
+        let id = sample_id();
+        assert!(StartRequest::new(id.clone()).log_path().is_none());
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("ok");
+        let req = StartRequest::new(id).with_log_path(lp.clone());
+        assert_eq!(req.log_path(), Some(&lp));
+    }
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
     struct StubRuntime;
@@ -723,6 +1127,71 @@ mod tests {
         assert_eq!(ok, DeleteResponse::new());
     }
 
+    /// CLI-1: Docker 表記のシグナルを具体値で解釈する。
+    #[test]
+    fn cli1_signal_parse_notation_accepts() {
+        for (text, want) in [
+            ("SIGKILL", 9),
+            ("kill", 9),
+            ("TERM", 15),
+            ("sigusr1", 10),
+            ("SIGRTMIN", 34),
+            ("rtmin+1", 35),
+            ("RTMIN+15", 49),
+            ("SIGRTMAX-1", 63),
+            ("RTMAX-14", 50),
+            ("SIGRTMAX", 64),
+            ("IOT", 6),
+            ("CLD", 17),
+            ("POLL", 29),
+            ("10", 10),
+            ("1", 1),
+            ("64", 64),
+        ] {
+            assert_eq!(
+                Signal::parse_notation(text).unwrap().as_u8(),
+                want,
+                "{text}"
+            );
+        }
+    }
+
+    /// CLI-1・ERR-1: 範囲外・予約・不正な表記は固定文言の `InvalidArgument` で拒否する。
+    #[test]
+    fn cli1_signal_parse_notation_rejects() {
+        let long = "S".repeat(65);
+        for text in [
+            "",
+            "0",
+            "32",
+            "33",
+            "65",
+            "256",
+            "99999999999",
+            "+15",
+            "-1",
+            " SIGTERM",
+            "SIGTERM ",
+            "SIGFOO",
+            "SIG",
+            "RTMIN+0",
+            "RTMIN+16",
+            "RTMAX-15",
+            "RTMAX-0",
+            "RTMIN+01",
+            "RTMAX-01",
+            "SIGRTMIN+09",
+            "RTMIN+",
+            "SIGNAL_SIGTERM",
+            "ＳＩＧＫＩＬＬ",
+            long.as_str(),
+        ] {
+            let err = Signal::parse_notation(text).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{text}");
+            assert_eq!(err.message(), "signal is invalid", "{text}");
+        }
+    }
+
     /// REPAIR-5: `Signal::new` は境界値 1・64 を受理し、値が一致する。
     #[test]
     fn cri7_signal_new_accepts_boundary_values() {
@@ -745,6 +1214,24 @@ mod tests {
         let err_max = StopRequest::new(sample_id(), Duration::MAX)
             .expect_err("Duration::MAX must be rejected");
         assert_eq!(err_max.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// PLUG-1・CRI-2: `StopRequest` の停止シグナルの既定は SIGTERM。
+    #[test]
+    fn plug1_stop_request_default_signal_is_sigterm() {
+        let req = StopRequest::new(sample_id(), Duration::from_secs(5)).expect("valid grace");
+        assert_eq!(req.signal(), Signal::SIGTERM);
+    }
+
+    /// PLUG-1・CRI-2: `with_signal` は signal だけを差し替え、id と grace を保つ。
+    #[test]
+    fn plug1_stop_request_with_signal_round_trips() {
+        let req = StopRequest::new(sample_id(), Duration::from_secs(5))
+            .expect("valid grace")
+            .with_signal(Signal::new(2).expect("2 is valid"));
+        assert_eq!(req.signal().as_u8(), 2);
+        assert_eq!(req.grace(), Duration::from_secs(5));
+        assert_eq!(req.id(), &sample_id());
     }
 
     /// OCI Runtime Spec: `ContainerState::as_str` が全バリアントで規定の小文字文字列を返す。
@@ -815,6 +1302,7 @@ mod tests {
         assert_eq!(r.image_rootfs(), CleanupOutcome::NotApplicable);
         assert_eq!(r.supervisor_log(), CleanupOutcome::NotApplicable);
         assert_eq!(r.container_log(), CleanupOutcome::NotApplicable);
+        assert_eq!(r.image_ref(), CleanupOutcome::NotApplicable);
         assert_eq!(r.kept().count(), 0);
     }
 
@@ -826,6 +1314,9 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
             })
             .with_supervisor_log(CleanupOutcome::Removed)
+            .with_image_ref(CleanupOutcome::Kept {
+                code: ErrorCode::Internal,
+            })
             .with_image_rootfs(CleanupOutcome::Kept {
                 code: ErrorCode::Unimplemented,
             });
@@ -836,6 +1327,7 @@ mod tests {
             vec![
                 (CleanupTarget::ImageRootfs, ErrorCode::Unimplemented),
                 (CleanupTarget::ContainerLog, ErrorCode::FailedPrecondition),
+                (CleanupTarget::ImageRef, ErrorCode::Internal),
             ]
         );
     }
@@ -846,5 +1338,172 @@ mod tests {
         assert_eq!(CleanupTarget::ImageRootfs.as_str(), "image_rootfs");
         assert_eq!(CleanupTarget::SupervisorLog.as_str(), "supervisor_log");
         assert_eq!(CleanupTarget::ContainerLog.as_str(), "container_log");
+        assert_eq!(CleanupTarget::ImageRef.as_str(), "image_ref");
+    }
+
+    /// `wait_exit` の既定実装を試すための偽 runtime。`state` の呼び出し回数を数える。
+    struct WaitFake {
+        started: std::time::Instant,
+        stop_after: Option<Duration>,
+        calls: std::sync::atomic::AtomicUsize,
+        fail_after_calls: Option<usize>,
+    }
+
+    impl WaitFake {
+        fn new(stop_after: Option<Duration>) -> Self {
+            Self {
+                started: std::time::Instant::now(),
+                stop_after,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_after_calls: None,
+            }
+        }
+    }
+
+    impl ContainerRuntime for WaitFake {
+        fn create(&self, _: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn start(&self, _: &StartRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn kill(&self, _: &KillRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+        fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail_after_calls.is_some_and(|k| n > k) {
+                return Err(TraitError::new(ErrorCode::NotFound, "gone"));
+            }
+            match self.stop_after {
+                Some(d) if self.started.elapsed() >= d => {
+                    Ok(ContainerStatus::stopped(req.id().clone(), Some(42)))
+                }
+                _ => Ok(ContainerStatus::created(req.id().clone(), None)),
+            }
+        }
+    }
+
+    /// REPAIR-5: `WaitExitRequest` の期限と照会間隔は 1ns..=24h だけ受理する。
+    #[test]
+    fn repair5_wait_exit_request_validation() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        let ns = Duration::from_nanos(1);
+        assert_eq!(
+            WaitExitRequest::new(sample_id(), Duration::ZERO)
+                .expect_err("zero")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert!(WaitExitRequest::new(sample_id(), day).is_ok());
+        assert_eq!(
+            WaitExitRequest::new(sample_id(), day + ns)
+                .expect_err("over a day")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let ok = WaitExitRequest::new(sample_id(), day).expect("ok");
+        assert_eq!(ok.poll_interval(), Duration::from_millis(100));
+        assert!(ok.clone().with_poll_interval(day).is_ok());
+        assert!(ok.clone().with_poll_interval(Duration::ZERO).is_err());
+        assert!(ok.with_poll_interval(day + ns).is_err());
+    }
+
+    /// CRI-1: 既定の `wait_exit` は `Stopped` になったら終了コードつきで戻る。
+    #[test]
+    fn cri1_wait_exit_default_returns_stopped_status() {
+        let rt = WaitFake::new(Some(Duration::from_millis(150)));
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(10))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(20))
+            .expect("interval");
+        let st = rt.wait_exit(&req).expect("stopped");
+        assert_eq!(st.state(), ContainerState::Stopped);
+        assert_eq!(st.exit_code(), Some(42));
+    }
+
+    /// REPAIR-5: 止まらない（`Created` のまま）なら期限で `Timeout`。
+    #[test]
+    fn repair5_wait_exit_default_times_out() {
+        let rt = WaitFake::new(None);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_millis(100))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(20))
+            .expect("interval");
+        let t0 = std::time::Instant::now();
+        let err = rt.wait_exit(&req).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(err.message(), "wait exceeded its deadline");
+        assert!(t0.elapsed() >= Duration::from_millis(100));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// REPAIR-5: 取り消しは `Unavailable`（"wait cancelled"）で、期限よりずっと早く戻る。
+    #[test]
+    fn repair5_wait_exit_default_is_cancellable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rt = WaitFake::new(None);
+        let flag = AtomicBool::new(false);
+        let cancel = || flag.load(Ordering::SeqCst);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(30))
+            .expect("req")
+            .with_cancel(&cancel);
+        let t0 = std::time::Instant::now();
+        let err = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+            });
+            rt.wait_exit(&req).expect_err("cancelled")
+        });
+        assert_eq!(err.code(), ErrorCode::Unavailable);
+        assert_eq!(err.message(), "wait cancelled");
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    /// CRI-1: 途中の `state` の失敗（削除された等）は再試行せずそのまま返る。
+    #[test]
+    fn cri1_wait_exit_default_propagates_state_error() {
+        let mut rt = WaitFake::new(None);
+        rt.fail_after_calls = Some(2);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(10))
+            .expect("req")
+            .with_poll_interval(Duration::from_millis(10))
+            .expect("interval");
+        let err = rt.wait_exit(&req).expect_err("not found");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            rt.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the failing call is not retried"
+        );
+    }
+
+    /// REPAIR-5: 期限の時刻にも 1 回照会してから `Timeout` にする（最後の照会で止まっていれば成功）。
+    #[test]
+    fn repair5_wait_exit_default_probes_at_deadline() {
+        let rt = WaitFake::new(None);
+        let req = WaitExitRequest::new(sample_id(), Duration::from_millis(60))
+            .expect("req")
+            .with_poll_interval(Duration::from_secs(10))
+            .expect("interval");
+        let err = rt.wait_exit(&req).expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        // 開始直後の 1 回と、期限の時刻の 1 回。
+        assert_eq!(rt.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// CRI-7: `wait_exit` も dyn 互換で呼べる。
+    #[test]
+    fn cri7_wait_exit_is_dyn_compatible() {
+        let rt: Box<dyn ContainerRuntime> = Box::new(WaitFake::new(Some(Duration::ZERO)));
+        let req = WaitExitRequest::new(sample_id(), Duration::from_secs(1)).expect("req");
+        assert_eq!(rt.wait_exit(&req).expect("ok").exit_code(), Some(42));
     }
 }

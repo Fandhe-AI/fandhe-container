@@ -3,8 +3,8 @@
 //! core の `OpRecorder`（成功・失敗件数とレイテンシ分布の集計。TASK-84.2）へ、io の
 //! read / write 経路が計測結果を渡すための境界。依存方向は `core → io` のため、io は
 //! core の型を参照できない。そこで本モジュールが io 内の型だけで完結するトレイトを定義し、
-//! core 側の記録器への接続は「core と io の両方に依存する上位 crate（supervisor 等）」に置く
-//! newtype アダプタが担う。アダプタは `sample.kind().as_str()` を core の `OpName::new` へ
+//! core 側の記録器への接続は、`docs/architecture.md` の「計装アダプタの配置」の原則（io の操作を本番で呼び、
+//! `OpRecorder` を持つ crate に newtype アダプタを置く）に従う。アダプタは `sample.kind().as_str()` を core の `OpName::new` へ
 //! 渡し、`sample.outcome()` / `sample.latency()` を `OpRecorder::record` へ写す。
 //!
 //! 既存の [`crate::observe::ServerObserver`] / [`crate::observe::SendObserver`] は
@@ -14,8 +14,8 @@
 //! # 未実装範囲（REPAIR-3）
 //!
 //! - `persist`（FLUSH バリア）の計装: [`IoOpKind`] への種別追加を要するため未実装
-//! - core の `OpRecorder` との接続アダプタ: core → io（またはアダプタ配置 crate）の
-//!   workspace 内依存辺の承認後
+//! - core の `OpRecorder` との接続アダプタ: 本番で io の write 経路を呼ぶ crate が無く未配線。
+//!   機能上の依存辺（core → io 等）を入れる issue でアダプタも一緒に入れる（計装だけのために辺は足さない）
 //! - [`IoOpKind::Read`] の呼び出し元: 現状の io にはファイル読み出し経路がなく、未使用
 //!
 //! Write 経路（`writeback` の `BatchSink::write_batch`）は TASK-84.7 で計装済み
@@ -40,6 +40,8 @@ pub enum IoOpKind {
     Read,
     /// 書き込み（`writeback` の `BatchSink::write_batch` 経路で計装済み。TASK-84.7）。
     Write,
+    /// ファイル操作モードの作成（`file_serve` の `GuestFileCreator::create_file_inner`。#3163）。
+    Create,
 }
 
 impl IoOpKind {
@@ -48,6 +50,7 @@ impl IoOpKind {
         match self {
             IoOpKind::Read => "read",
             IoOpKind::Write => "write",
+            IoOpKind::Create => "create",
         }
     }
 }
@@ -221,12 +224,13 @@ mod tests {
     fn repair4_io_op_kind_as_str_is_stable() {
         assert_eq!(IoOpKind::Read.as_str(), "read");
         assert_eq!(IoOpKind::Write.as_str(), "write");
+        assert_eq!(IoOpKind::Create.as_str(), "create");
     }
 
     #[test]
     fn repair4_io_op_kind_names_fit_core_op_name_contract() {
         // core の OpName::new と同じ規則。io は core に依存できないため重複して固定する。
-        for kind in [IoOpKind::Read, IoOpKind::Write] {
+        for kind in [IoOpKind::Read, IoOpKind::Write, IoOpKind::Create] {
             let s = kind.as_str();
             assert!(!s.is_empty() && s.len() <= 64);
             assert!(

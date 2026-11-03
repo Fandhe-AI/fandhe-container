@@ -12,15 +12,21 @@
 //! root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため、ストアを使う試験は
 //! `linux` モジュールに置く（非 Linux の fail-closed は `state_store_wiring.rs` が照合済み）。
 
-use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+#[path = "support/child_process.rs"]
+mod child_process;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+// 残骸・PID 再利用との衝突を避ける作成前削除つきの一時ディレクトリ（REPAIR-12・#3435）。
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+use child_process::ChildProcess;
+
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
-use fandhe_container_core::traits::{ErrorCode, TraitError};
 
 /// 期限つき待機の上限（AGENTS.md の推奨（子プロセス応答待ちは 5〜10 秒）に収める。REPAIR-5）。
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -31,110 +37,6 @@ const CHILD_WAIT: Duration = Duration::from_secs(8);
 
 const ENV_GO: &str = "FANDHE_SUP_RUN_IT_GO";
 const ENV_EXIT: &str = "FANDHE_SUP_RUN_IT_EXIT";
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// 一意な一時パス（テスト間・並列実行間で衝突しない）。
-fn unique_path(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!(
-        "fandhe-sup-run-it-{tag}-{}-{n}",
-        std::process::id()
-    ))
-}
-
-fn internal(msg: &'static str) -> TraitError {
-    TraitError::new(ErrorCode::Internal, msg)
-}
-
-/// 実プロセス（`std::process::Child`）を [`LaunchedProcess`] として扱うテスト用アダプタ。
-///
-/// 本番 launcher が未提供のため、監視ループ（`run::monitor`）へ注入する起動ハンドルの代役を務める。
-/// `Drop` で kill + 回収し、テスト失敗時にもプロセスを残さない。
-struct ChildProcess {
-    pid: NonZeroU32,
-    child: Mutex<Child>,
-}
-
-impl ChildProcess {
-    fn new(child: Child) -> Self {
-        let pid = NonZeroU32::new(child.id()).expect("child pid must be non-zero");
-        Self {
-            pid,
-            child: Mutex::new(child),
-        }
-    }
-
-    /// 強制終了（SIGKILL 相当）を送る。シグナル終了の試験用（Linux のテストだけが使う）。
-    #[cfg(target_os = "linux")]
-    fn kill(&self) {
-        if let Ok(mut c) = self.child.lock() {
-            let _ = c.kill();
-        }
-    }
-}
-
-fn map_exit(status: std::process::ExitStatus) -> Result<ProcessExit, TraitError> {
-    if let Some(code) = status.code() {
-        return Ok(ProcessExit::Exited(code));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return Ok(ProcessExit::Signaled(sig));
-        }
-    }
-    Err(internal("unrecognized exit status"))
-}
-
-impl LaunchedProcess for ChildProcess {
-    fn pid(&self) -> NonZeroU32 {
-        self.pid
-    }
-
-    fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
-        let end = Instant::now() + timeout;
-        loop {
-            {
-                let mut c = self
-                    .child
-                    .lock()
-                    .map_err(|_| internal("child lock poisoned"))?;
-                if let Some(status) = c.try_wait().map_err(|_| internal("try_wait failed"))? {
-                    return map_exit(status).map(Some);
-                }
-            }
-            if Instant::now() >= end {
-                return Ok(None);
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-
-    fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-        {
-            let mut c = self
-                .child
-                .lock()
-                .map_err(|_| internal("child lock poisoned"))?;
-            let _ = c.kill();
-        }
-        match self.wait(timeout)? {
-            Some(_) => Ok(()),
-            None => Err(TraitError::new(ErrorCode::Timeout, "terminate timed out")),
-        }
-    }
-}
-
-impl Drop for ChildProcess {
-    fn drop(&mut self) {
-        if let Ok(c) = self.child.get_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
 
 /// コンテナ役の子プロセス本体。通常のテスト実行では環境変数が無く即 return する（no-op）。
 ///
@@ -168,7 +70,7 @@ fn container_command(go: &Path, exit_code: i32) -> Command {
         "--exact",
         "child_container_role",
         "--test-threads=1",
-        "--nocapture",
+        "--no-capture",
     ])
     .env(ENV_GO, go)
     .env(ENV_EXIT, exit_code.to_string())
@@ -182,13 +84,15 @@ fn spawn_container(go: &Path, exit_code: i32) -> ChildProcess {
     let child = container_command(go, exit_code)
         .spawn()
         .expect("spawn container role");
-    ChildProcess::new(child)
+    ChildProcess::new(child, POLL).expect("child pid must be non-zero")
 }
 
 /// 起動ハンドルのアダプタ自体の検証（3 OS 共通）。生存中は `None`、終了後は具体の終了コードを返す。
 #[test]
 fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
-    let go = unique_path("smoke-go");
+    // 古い go マーカーが残っていると子がすぐ終わり偽の赤になるため、残骸を消した専用ディレクトリに置く（#3435）。
+    let root = test_root::test_root("fandhe-sup-run-it", "smoke");
+    let go = root.join("go");
     let p = spawn_container(&go, 3);
     assert_eq!(p.wait(Duration::from_millis(50)).unwrap(), None);
     std::fs::write(&go, b"").unwrap();
@@ -203,11 +107,29 @@ fn sup1_task157_8_process_handle_reports_alive_then_exit_code() {
     assert_eq!(exit, ProcessExit::Exited(3));
 }
 
+/// SUP-1・REPAIR-12・#3475: 前回の残骸（古い `go` マーカー）があっても消さず別名の空ディレクトリを使い、
+/// 残骸は無傷で残る。
+#[test]
+fn sup1_repair12_smoke_marker_residue_is_left_untouched() {
+    let parent = test_root::test_root("fandhe-sup-run-residue", "parent");
+    let stale = parent.join("stale");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("go"), b"").unwrap();
+    let root = test_root::test_root_at(stale.clone());
+    assert_ne!(&*root, stale.as_path());
+    assert!(!root.join("go").exists());
+    assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+    assert!(stale.join("go").exists());
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use std::fs;
+    use std::num::NonZeroU32;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, ContainerStatus, CreateStateRequest, HealthStatus, StateStore,
@@ -218,6 +140,17 @@ mod linux {
         MonitorConfig, MonitorOutcome, StderrLogObserver, StopToken, monitor,
     };
     use fandhe_container_supervisor::state::{SupervisedState, open_default_store};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// 一意な一時パス（テスト間・並列実行間で衝突しない）。
+    fn unique_path(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "fandhe-sup-run-it-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
 
     const ENV_ROOT: &str = "FANDHE_SUP_RUN_IT_SUP_ROOT";
     const ENV_ID: &str = "FANDHE_SUP_RUN_IT_SUP_ID";
@@ -506,7 +439,8 @@ mod linux {
         cmd.env_remove(ENV_ROOT)
             .env_remove(ENV_ID)
             .env_remove(ENV_SUP_GO);
-        let child = ChildProcess::new(cmd.spawn().expect("spawn grandchild"));
+        let child = ChildProcess::new(cmd.spawn().expect("spawn grandchild"), POLL)
+            .expect("child pid must be non-zero");
         let mut state = mark_running(&root, &id, child.pid());
         let outcome = monitor(&mut state, &child, &cfg(), &StopToken::new()).expect("monitor");
         match outcome {
@@ -527,7 +461,7 @@ mod linux {
                 "--exact",
                 "linux::child_supervisor_role",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(ENV_ROOT, &root)
             .env(ENV_ID, "c1")
@@ -537,7 +471,7 @@ mod linux {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn supervisor role");
-        let sup = ChildProcess::new(child);
+        let sup = ChildProcess::new(child, POLL).expect("child pid must be non-zero");
 
         let release = Release(t.go());
         // コンテナ 1 個の間は supervisor が 1 個生存し、状態に監視権が記録される。

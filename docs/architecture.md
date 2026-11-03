@@ -3,10 +3,10 @@
 crate 境界・依存方向・実装コードを持たない確定済み設計判断への索引となる文書（REPAIR-3）。個々の crate の責務・PLUG-1 区分の確定一覧は [crate-naming.md](design/crate-naming.md) を正とし、本書ではそれを層構造・依存方向の観点で要約する。
 
 - 作成日: 2026-09-27
-- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）
+- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）・#707（TASK-78.2）・#4（microVM のバックエンドの配置。2026-11-03 オーナー決定。TASK-192 の配置の前提）
 - ステータス: #24（TASK-6.h1）で内容レビュー承認待ち
-- 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6
-- 対象マイルストーン: MS-0
+- 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6・MVM-5
+- 対象マイルストーン: MS-0（「microVM の 3 OS 展開方針（MVM-5）」節は MS-7・TASK-78）
 
 spec（`docs/spec/04-behavior/`）と本書の記述が食い違う場合は spec を正とする（[spec-reference](../.claude/rules/spec-reference.md)）。
 
@@ -80,6 +80,7 @@ flowchart TB
 
     cli --> core
     supervisor --> core
+    supervisor --> net
     compose_convert --> stack
 
     plugin_cri --> cri
@@ -140,6 +141,7 @@ cargo metadata --format-version 1 --no-deps | jq '[.packages[] | {name, deps: [.
 flowchart LR
     compose_convert["compose-convert"] -->|確定| stack
     supervisor -->|確定| core
+    supervisor -->|確定| net
     plugin_cri["plugin-cri"] -->|確定| cri
     plugin_cri -->|確定| net
     plugin_cri -->|確定| supervisor
@@ -167,20 +169,20 @@ flowchart LR
 | `compose-convert` → `stack` | crate-naming.md 決定 5（TOML の型は `stack` のものを使う） | 確定 |
 | `guest-init` →(dev) `platform-macos` | ゲスト init と `guest_mount` の契約の機械照合（`tests/contract.rs`。MAC-1・#1875。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない） | 確定 |
 | `oci` →(dev) `core` | 実機前提ハーネス `tests/pull_e2e.rs` の実行段が TASK-29 の `create` / `start` と `ProductionLauncher` を使う（OCI-1・TASK-55.1・#420。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない。将来 `core` が `oci` に通常依存すると dev 循環になるため、その時はハーネスの置き場所を見直す） | 確定 |
-| `core` →(通常) `oci` は張らない | create / delete の OCI-7 参照登録・解除（TASK-183.8.1・#853・#2315）は、core が `oci_runtime::ContainerImageRefs`（依存注入のトレイト。`register` / `release` / `bind` / `registration` / `release_if` の 5 メソッド）を定義する。参照には登録ごとに採番する世代（oci の `ContainerRefGeneration` と core の `ImageRefGeneration`。`from_raw` / `as_raw` で写す）と確定・未確定の状態があり、メソッドは `ImageStore` の `register_container_ref`（未確定で登録する。`Registered` / `AlreadyRegistered` を返し、世代は返さない）・`release_container_ref`（ID 指定。create の失敗経路の巻き戻し用）・`bind_container_ref`（状態作成の成功直後に確定し、世代を返す）・`container_ref_registration`（確定済みの世代だけを返す）・`release_container_ref_if`（世代が一致するときだけ外す。delete 用）に対応する。未確定のまま残った参照の回収（`release_unbound_container_ref_if`・`reconcile_container_refs`）は再起動時の照合（#854・TASK-183.8.2）が起動点を持ち、トレイトには含めない（本番 probe と起動時の配線はアダプタ側の担当）。このトレイトを満たす本番アダプタ（`StoreImageRefs`。`crates/cli/src/commands/image_refs.rs`）は、oci と core の両方に通常依存する上位 crate に置く。置き場所のオーナー判断は #2315 で未取得で、既存の `cli → oci`・`cli → core` の辺だけで足りる cli に暫定で置いた（新しい辺は無い。別 crate に決まったらそのまま移せる）。`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から digest へ解決する。#2496）と `delete --image-root <dir>` が配線する（レイヤー展開は #2377、manifest の在庫・タグ・リースの永続化は #2380 で実装済み）。core の依存ツリーに oci の通信・展開系クレートを入れず、`pull_e2e` の dev 依存との循環も作らないため。`oci` の結合試験 `tests/container_image_refs.rs` は dev 依存の core で試験用アダプタを使う | 確定 |
-| `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない） | 確定 |
+| `core` →(通常) `oci` は張らない | create / delete の OCI-7 参照登録・解除（TASK-183.8.1・#853・#2315）は、core が `oci_runtime::ContainerImageRefs`（依存注入のトレイト。`register` / `release` / `bind` / `registration` / `release_if` の 5 メソッド）を定義する。参照には登録ごとに採番する世代（oci の `ContainerRefGeneration` と core の `ImageRefGeneration`。`from_raw` / `as_raw` で写す）と確定・未確定の状態があり、メソッドは `ImageStore` の `register_container_ref`（未確定で登録する。`Registered` / `AlreadyRegistered` を返し、世代は返さない）・`release_container_ref`（ID 指定。create の失敗経路の巻き戻し用）・`bind_container_ref`（状態作成の成功直後に確定し、世代を返す）・`container_ref_registration`（確定済みの世代だけを返す）・`release_container_ref_if`（世代が一致するときだけ外す。delete 用）に対応する。未確定のまま残った参照の回収（`release_unbound_container_ref_if`・`reconcile_container_refs`）は再起動時の照合（#854・TASK-183.8.2）が起動点を持ち、トレイトには含めない（本番 probe と起動時の配線はアダプタ側の担当）。このトレイトを満たす本番アダプタ（`StoreImageRefs`。`crates/cli/src/commands/image_refs.rs`）は、oci と core の両方に通常依存する上位 crate に置く。置き場所のオーナー判断は #2315 で未取得で、既存の `cli → oci`・`cli → core` の辺だけで足りる cli に暫定で置いた（新しい辺は無い。別 crate に決まったらそのまま移せる）。`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から digest へ解決する。#2496）と `delete`（`--image-root <dir>` は任意で、省くと create が状態記録へ残したストア root から解除する。#2499）が配線する（レイヤー展開は #2377、manifest の在庫・タグ・リースの永続化は #2380 で実装済み）。core の依存ツリーに oci の通信・展開系クレートを入れず、`pull_e2e` の dev 依存との循環も作らないため。`oci` の結合試験 `tests/container_image_refs.rs` は dev 依存の core で試験用アダプタを使う | 確定 |
+| `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない）。core は `default-features = false` で引く（plugin ゲートを使わず、依存元の実行ファイルで core の `plugin` が再有効化されないようにする。PLUG-3・#3204） | 確定 |
 | `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114）。`adapter` が `CriRuntimeService` を組み立てる（TASK-114.2・#458。workspace 内 path 依存で外部クレートの追加なし） | 確定 |
 | `plugin-cri` → `core` | `adapter` が `ContainerRuntime`・`StateStore`・`NetworkPlugin` の実装を選んで注入し、`oci_runtime`・`state_store` のライブラリ関数を使う（CRI-7・PLUG-1・TASK-114.2・#458。`default-features = false`・workspace 内 path 依存で外部クレートの追加なし）。core・cri から plugin-cri への辺は無い | 確定 |
-| `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
+| `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼び、結果を `ImageStore` の在庫（blob のリース・公開、manifest とタグの登録）へ登録する（#2539・OCI-7。[pull-inventory-wiring.md](design/pull-inventory-wiring.md)）。（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `cri` → `core` | `RuntimeAdapter` が `ContainerRuntime` トレイト（`traits` のみ。具象の実行層は参照しない）を呼ぶ（CRI-2・CRI-7・TASK-59.1・#437。workspace 内 path 依存・`default-features = false` で外部クレートの追加なし）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `plugin-macos` → `platform-macos` | crate-naming.md 表 #16（TASK-115） | 確定 |
 | `plugin-windows` → `platform-windows` | crate-naming.md 表 #17（TASK-116）。plugin-windows の位置づけ（起動役の補助への作り替え）は [windows-execution-layout.md](design/windows-execution-layout.md) で承認待ち | 確定（Windows 部分は設計ドラフト・承認待ち） |
 | `plugin-microvm` → `microvm` | crate-naming.md 表 #18（TASK-117） | 確定 |
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定。担当 TASK と時期は #2451 で判断待ち: [volume-provider-implementation.md](design/volume-provider-implementation.md)） | 想定 |
-| `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
-| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る。`start` の起動・受信の実装は `supervisor::start_client`、`stop` / `delete` の signaler・cgroup remover は `supervisor::control` / `supervisor::cgroup_remover` にあり、plugin-cri と共有する（#2434。CLI は薄い呼び出し層）（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
-| `cli` → `oci` | `image ls`・`system df`・`image rm [--force]`・`image tag` が oci の管理 API（`image_management`）を呼ぶ（#2221・#2316・CLI-1・OCI-7・TASK-183。workspace 内 path 依存で実装済み。外部クレートの追加ではない。oci は cli に依存せず循環しない）。あわせて `create --image-root --image` / `delete --image-root` が OCI-7 のコンテナ参照の登録・解除に `ImageStore` を使う（#2315。アダプタは cli 内）。コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みだが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、現状の観測値は `image ls` がヘッダのみ・`image rm` / `image tag` / `create --image` が `NOT_FOUND` | 確定 |
+| `cli` → `core` | 統一 CLI が実行層を呼ぶ（core は `default-features = false` で引き、core の `plugin` は cli の `plugin` feature〔既定で有効〕が連動して有効にする。PLUG-3・#3204）。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`inspect` と `state` が `inspect::inspect` の `InspectReport` をそれぞれ `write_json` / `write_oci_state_json`（OCI Runtime Spec の state の項目だけ。#1903・CLI-1・SUP-11）で出す。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る。`start` の起動・受信の実装は `supervisor::start_client`、`stop` / `delete` の signaler・cgroup remover は `supervisor::control` / `supervisor::cgroup_remover` にあり、plugin-cri と共有する（#2434。CLI は薄い呼び出し層）（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core と net にのみ依存し、どちらも supervisor・cli に依存しないため循環しない） | 確定 |
+| `cli` → `oci` | `image ls`・`system df`・`image rm [--force]`・`image tag` が oci の管理 API（`image_management`）を呼ぶ（#2221・#2316・CLI-1・OCI-7・TASK-183。workspace 内 path 依存で実装済み。外部クレートの追加ではない。oci は cli に依存せず循環しない）。あわせて `create --image-root --image` / `delete`（`--image-root` は任意。#2499）が OCI-7 のコンテナ参照の登録・解除に `ImageStore` を使う（#2315。アダプタは cli 内）。コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みだが、在庫を埋める経路（pull → `ImageStore`）は `cri` の `OciImagePuller::pull` に配線済み（#2539。[pull-inventory-wiring.md](design/pull-inventory-wiring.md)）で、同じ root を `--image-root` に渡せば `image ls` 等から見える。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。pull していない root の観測値は `image ls` がヘッダのみ・`image rm` / `image tag` / `create --image` が `NOT_FOUND` | 確定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
 | `cli` → `plugin`（境界基盤） | バイナリ `fandhe-container` が受けた SIGINT・SIGTERM・SIGHUP を、起動中の plugin へ転送する API（`signal_forward`）を呼ぶ。シグナルハンドラの登録はバイナリの責務（PLUG-7・#1513・#1403。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。`plugin` は境界基盤で `plugin-*` バイナリ crate ではないため規則 2 に抵触しない | 確定 |
@@ -190,8 +192,8 @@ flowchart LR
 | `plugin-*`（バイナリ群） → `core` | トレイト型（`ContainerRuntime` 等の共通型）を参照する想定（TASK-114〜118） | 想定 |
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
-| `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は `Cargo.toml` にまだ無く、依存の向き・feature の切り方は #1870 の設計で決める） | 想定 |
-| `plugin-cri` → `supervisor` | `CoreLifecycleRuntime` の `start`・`kill`・`stop` と `delete` の cgroup remover を CLI と同じ本番経路へ結線する（`supervisor::start_client`〔supervisor の bin の委譲 scope 起動と結果の受信〕・`control::production_signaler` / `production_stop_signaler`〔制御チャネル経由。stop の意図は SUP-9〕・`cgroup_remover`・`supervisor_log::remove_bounded`。CLI の private 実装を複製せず移設して共有した。#2434・CRI-2・PLUG-1・SUP-1・SUP-9・REPAIR-1。workspace 内 path 依存で外部クレートの追加なし。辺は一方向で、supervisor は core にのみ依存するため循環しない。supervisor が core を既定 feature〔`plugin`〕で引くため、`-p fandhe-container-plugin-cri` のビルドでは feature 統合で core の `plugin` feature が有効になる。PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない） | 確定 |
+| `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は #3065 で `Cargo.toml` に追加した。依存の向きは feature を切らない通常の依存に確定〔#1870・[network-wiring.md](design/network-wiring.md) D5〕。起動オプション文書 FCOPT1 の network・add-host・dns を復号のたびに net で再検証する用途も同じ辺を使う〔#3065・NET-6・NET-12〕。外部クレートの追加なし） | 確定 |
+| `plugin-cri` → `supervisor` | `CoreLifecycleRuntime` の `start`・`kill`・`stop` と `delete` の cgroup remover を CLI と同じ本番経路へ結線する（`supervisor::start_client`〔supervisor の bin の委譲 scope 起動と結果の受信〕・`control::production_signaler` / `production_stop_signaler`〔制御チャネル経由。stop の意図は SUP-9〕・`cgroup_remover`・`supervisor_log::remove_guarded_bounded_waiting`〔#2964。コンテナログと共有する期限つきの待ち〕・`logs`〔コンテナログの削除と起動時の回収〕・`container_options::store`。CLI の private 実装を複製せず移設して共有した。#2434・CRI-2・PLUG-1・SUP-1・SUP-9・REPAIR-1。workspace 内 path 依存で外部クレートの追加なし。辺は一方向で、supervisor は core にのみ依存するため循環しない。supervisor が core を既定 feature〔`plugin`〕で引くため、`-p fandhe-container-plugin-cri` のビルドでは feature 統合で core の `plugin` feature が有効になる。PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない） | 確定 |
 | `plugin-cri` → `net` | `NetworkPlugin` の実装（`netsetup`）が TASK-139 の統合 API（`create_network`・`attach_container`・`delete_network`）を呼ぶ（CRI-7・PLUG-1・NET-1〜NET-3・TASK-114.4・#460・MS-4。workspace 内 path 依存で外部クレートの追加なし。`net` は依存を持たない core 側ライブラリで、辺は一方向）。DNS ヘルパーの起動・停止（NET-5・NET-7）は未実装 | 確定 |
 | `gpu` の GPU-1〜4 以外を含む辺 | GPU-5・7・8 は境界表に明示判定なし、GPU-9 は「検討中」（`api-gpu.md`） | 未確定 |
 | macOS Venus（GPU-6）関連の辺 | 成果物は `plugin-macos` 側に置く定義のみが確定しており、依存の詳細な方向は未確定 | 未確定 |
@@ -238,11 +240,44 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である。その上で、以下の 2 方式については MVP スコープを次のとおり判断する。
 
 - **Windows ネイティブコンテナ**（Windows Server ベースイメージ専用のコンテナ実行）は、本プロジェクトの主目的である「OCI 準拠 Linux コンテナ実行基盤」とは別カテゴリの技術であり、**MVP の射程外**とする
-- **Hyper-V 直接方式**（WHP〔Windows Hypervisor Platform〕API 経由で VMM をフルスクラッチ実装する経路）は、将来の強い分離オプションとして**設計上は残すが MVP には実装しない**。これは microVM の 3 OS 展開方針（`api-microvm.md` MVM-5。本書「確定済み設計判断」節を参照）で Windows（WHP）を将来オプションと位置づけているのと同系統の扱いである。ただし、この方式を実装する場合の crate 配置（`microvm` 系統に含めるか等）は [crate-naming.md](design/crate-naming.md) に現時点で明示判定がなく、MVM-5 の本書追記を担う TASK-78 側で確定する事項であり、本節では断定しない
+- **Hyper-V 直接方式**（WHP〔Windows Hypervisor Platform〕API 経由で VMM をフルスクラッチ実装する経路）は、将来の強い分離オプションとして**設計上は残すが MVP には実装しない**。これは microVM の 3 OS 展開方針（`api-microvm.md` MVM-5。本書「microVM の 3 OS 展開方針（MVM-5）」節を参照）で Windows（WHP）を将来オプションと位置づけているのと同系統の扱いである。この方式を実装する場合の crate 配置は 2026-11-03 に決定した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)）。新しい crate は作らず、`crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`）に置き、`plugin-microvm` が動かす。`plugin-windows` には載せない。詳細は本書「microVM の 3 OS 展開方針（MVM-5）」節の「バックエンドの配置（2026-11-03 決定）」を参照する。WHP は引き続き将来オプションで、MVP には実装しない
 
 根拠は PoC-4 の机上検証であり、実機性能計測ではない点に注意する（`README.md` 記載の PoC 位置づけと同様）。
 
 出典: `docs/spec/04-behavior/api-platform-windows.md`（submodule リビジョン `2241961`）の `WIN-6`。
+
+## microVM の 3 OS 展開方針（MVM-5）
+
+microVM は Linux の既定（namespaces）に加える選択式のオプション（MVM-1）で、`fandhe-container-plugin-microvm` が `crates/microvm` を別プロセスで動かす plugin として提供する（PLUG-1。境界は制御面のみ）。VMM はフルスクラッチで、rust-vmm 系クレートは使わない（MVM-4。[from-scratch-policy.md](design/from-scratch-policy.md)）。OS ごとの方針と実装優先順位は次のとおり。
+
+| 優先順位 | OS | バックエンド | 位置づけ | 現状 |
+| -------- | -- | ------------ | -------- | ---- |
+| 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75（#688・#695）で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc） |
+| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装。実装は TASK-192（spec リポジトリの #27 で新設。`crates/microvm` の macOS バックエンド。対応 OS は macOS 15 以降、MS-7）。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
+| 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装。配置は `crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`。2026-11-03 決定。下の「バックエンドの配置」を参照）。実装の計画は無い |
+
+実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進める。Windows（WHP）は優先順位の外に置く。
+
+### バックエンドの配置（2026-11-03 決定）
+
+microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）は、新しい crate を作らず `crates/microvm` の中に `cfg(target_os = ...)` で置き、`fandhe-container-plugin-microvm` が別プロセスで動かす（PLUG-1）。FFI は各バックエンドの `sys` モジュールに置く。
+
+- 決定: [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)（2026-11-03 オーナー決定）
+- 理由: `crates/microvm` の責務は OS ではなく VMM の実装ライブラリで、virtio のデバイスモデル・ゲストメモリ・起動フローを OS 間で共有する。`platform-windows` は WSL2 の主経路（WIN-1・WIN-2）を担うため、microVM のバックエンドを載せない
+- 採らなかった案: `crates/microvm-windows` の新設、`crates/platform-windows` への配置。いずれも [crate-naming.md](design/crate-naming.md) の確定一覧（REPAIR-1）を変えることになるため採らない
+- WHP の FFI の宣言方法（既存の `windows-sys`〔=0.61.2〕へ feature `Win32_System_Hypervisor` を足すか、自前宣言か）は実装の計画時に決める。feature の追加はユーザー承認を経る（[dependency-policy](../.claude/rules/dependency-policy.md)）
+- Hypervisor.framework の FFI は `sys` の自前宣言（`#[link(name = "Hypervisor", kind = "framework")]`）とし、新しい依存を足さない。これは Agent の判断であり、オーナーの承認対象は WHP のみとする。異論があれば TASK-192 の着手前に見直す
+- microVM の FFI は各 crate の `sys` の自前宣言とし、`libc` は dev-dependencies の機械照合のみに使う。`nix` は採用しない（MVM-4）
+- WHP は引き続き将来オプションで、MVP には実装しない（MVM-5・WIN-6）
+
+本書で断定しない事項:
+
+- macOS の microVM オプションと macOS バックエンド（MAC-1 の Virtualization.framework、TASK-64 の `Vm`）との関係、TASK-65（MAC-1）の virtiofs 共有と I/O 共有プロトコルを microVM の I/O パスが再利用するか、MAC-4 の「1 コンテナ = 1 VM」オプションの実現経路は、[macos-vm-strategy.md](design/macos-vm-strategy.md) が未定としているのに合わせて決めない
+- GPU-6・MAC-5 の VMM 統合先は TASK-172 の 3 段目の判定（#1057。TASK-172.h5）で分岐し、統合は TASK-180 が担い、不可の場合に限り Hypervisor.framework 上の自前 VMM（MVM-5 の macOS 展開と共通化）へ切り替える。本節はその判定を先取りしない
+
+根拠は PoC-6（microvm-isolation-cost）と PoC-4（windows-support-path）の机上検証であり、実機計測ではない。PoC-6 の「Linux は rust-vmm 活用」の記述は MVM-1・MVM-4（rust-vmm 不使用）とフルスクラッチ方針で上書きされている。
+
+出典: `docs/spec/04-behavior/api-microvm.md`（submodule リビジョン `644661b`）の `MVM-5`、`docs/spec/05-tasks.md` の TASK-78（整合確認の参照: TASK-64・TASK-65・TASK-67・TASK-180）と TASK-192（macOS 展開。前提 TASK-75・TASK-78・TASK-117。spec リポジトリの #27 で新設）、`docs/spec/06-roadmap.md` の MS-7。
 
 ## 確定済み設計判断（実装コードを持たないもの）
 
@@ -251,25 +286,53 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | CRI-8 | オーケストレーション本体（スケジューラ・マルチノード調整）は MVP 対象外とし、4 つの拡張点トレイトの設計のみを MVP に含める | `api-cri.md` | [orchestration-scope.md](design/orchestration-scope.md)（TASK-5・#20） |
 | WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-shared-vm.md](design/macos-shared-vm.md)（TASK-191 の未決事項の設計案。承認待ち #1906）・[macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。#370〔TASK-66.h1〕で確認済み・2026-10-12。既定方式の実装は TASK-191〔#1905・#1906〕） |
-| MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書へ TASK-78 で追記予定 |
-| NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340） |
+| REPAIR-1・REPAIR-4・MAC-1 のログ回転の共通化 | supervisor の `RotatingFileSink` と platform-macos のコンソールログ回転は共通化せず 2 か所に置く（オーナー決定ではなく現状維持の判断。再評価条件あり） | REPAIR 系・MAC-1・SUP-7 の各ビヘイビア | [rotating-log-sharing.md](design/rotating-log-sharing.md)（#2172） |
+| MVM-1・MVM-4 のゲスト物理メモリアクセス型の所有先 | アクセス型は TASK-74.1 側（OS 非依存・コピー API・heap backing で試験）、mmap と KVM 登録は TASK-75.1 側（オーナー決定ではなく Agent の記録した判断。再評価条件あり） | MVM-1・MVM-4 | [microvm-memory-ownership.md](design/microvm-memory-ownership.md)（#876） |
+| MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書「microVM の 3 OS 展開方針（MVM-5）」節を参照（TASK-78・#705・#706・#707） |
+| MVM-5・WIN-6 のバックエンドの配置 | microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）は `crates/microvm` の中に `cfg` で置き、`plugin-microvm` が動かす。FFI は `sys`。新しい crate は作らない | `api-microvm.md`・`api-platform-windows.md` | 本書「バックエンドの配置（2026-11-03 決定）」節と [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)（2026-11-03 オーナー決定。Hypervisor.framework への適用は Agent の判断） |
+| NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340。起動点・同期・入口・版の固定は 12 章・#1935） |
 | NET-5 | DNS ヘルパーを D-14 の原則の例外として認める | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6128207567)（2026-10-12 オーナー決定） |
 | NET-5・NET-9 の配置 | pasta は core 側（コンテナごとの supervisor が起動・監視・回収）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止）、`crates/net` は core 側のライブラリ（プロセスの寿命を持つ側に置く） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)（2026-10-12 オーナー決定） |
+| NET-6・NET-12 の CLI・起動経路への結線 | `--network` / `--add-host` / `--dns` は `create` で受け FCOPT1 で supervisor へ渡す。supervisor → net は通常の依存。none は rootless の中間プロセスで netns と `lo` を用意し、hosts / resolv.conf は `@container-etc` に生成して bind mount。ネットワーク定義は `@networks` のファイルストア（rootful の実行主体を除く） | `api-network.md` | [network-wiring.md](design/network-wiring.md)（#1870） |
 | 未解決疑問点 11 の残りの配置 | CDI の適用・OCI hook の実行は core（hook のタイムアウトとパスの検証を必須）、supervisor は core（追認）、rootful のネットワーク設定は plugin 側（`NetworkPlugin` の実装が `crates/net` を使う。core は network namespace を渡すだけ） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)（2026-10-15 オーナー決定） |
 | REPAIR-11 | モデル規模で自己補修の可否を一律禁止せず、ハーネス（REPAIR-7・REPAIR-12）を通過した変更のみ採用する | `ai-self-repair.md` | [small-model-repair-policy.md](design/small-model-repair-policy.md)（TASK-92。当該メモ自体は #44〔TASK-92.h1〕で再承認待ち） |
 | REPAIR-1 | 19 crate＋`benches` の workspace 構成（crate 分割の前提として本書冒頭の「crate 境界」節が参照する） | `ai-self-repair.md` | [crate-naming.md](design/crate-naming.md)（TASK-1.h1・#9） |
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |
 | SEC-4 | seccomp・Landlock の拒否の配送: ERRNO の 40 件は USER_NOTIF で supervisor が記録して EPERM で応答、KILL_PROCESS の 3 件はカーネル監査と終了シグナル（補助）、Landlock はカーネル監査（未対応なら縮退を明示）。確実な層は fail-closed・カーネル監査頼みは警告して続行・厳格モードは opt-in | `security-isolation.md` | [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。2026-10-15 オーナー決定・#2018。実装は #2023〜#2028・#2004） |
+| REPAIR-4・REPAIR-1・PLUG-1 の計装アダプタの配置 | 各 crate の計装トレイトを core の `OpRecorder` へつなぐアダプタは、その操作を本番で呼び `OpRecorder` を持つ crate に置く。計装だけのために依存辺は足さない | `ai-self-repair.md`・`plugin-system.md` | 本書の下の「計装アダプタの配置」・[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)（2026-10-12 オーナー決定。#1860） |
+| IO-1・IO-2（追補） | ワイヤー上のファイル操作要求（`Create`・`WriteFile`・`Close`・`Nack`。`PROTOCOL_VERSION` 2。ファイル操作モード）と UDS クライアントの本番結合を設計確定（#3159〜#3166 で実装済み。crash_safety・break_detection は #3167）。FLUSH ACK の範囲は 1 接続内の複数ファイルとディレクトリエントリ。spec の確認事項はオーナーへ報告済みで、回答次第で見直す | `api-io-share.md` | [io-protocol.md](design/io-protocol.md)「ワイヤー上のファイル操作要求と UDS クライアント」節（#1886） |
+
+### 計装アダプタの配置（REPAIR-4・REPAIR-1・PLUG-1）
+
+core を参照しない crate（`io`・`net`・`oci`・`cri`・`platform-windows`）は、自前の計装トレイト（`IoOpRecorder`・`NetOpRecorder`・`OciOpRecorder`・`CriOpRecorder`・`WinOpRecorder`）を持つ。これを core の `OpRecorder` へつなぐアダプタの置き場の原則は次のとおり（TASK-84 追補。2026-10-12 オーナー決定、[#1322 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/1322#issuecomment-6118815409)）。
+
+- 配置: アダプタは、その操作を本番で呼び、かつ `OpRecorder` を持っている crate に置く
+- 依存辺: 計装だけのために workspace 内の依存辺は足さない。機能上の辺（例: core → io の `VolumeProvider`、core → net の依存辺の採否（net の PLUG-1 区分は core 側ライブラリで確定済み））を入れる issue で、アダプタも一緒に入れる
+- 対象外: plugin の計装（`crates/plugin/src/lifecycle.rs` の observer）は、core 側の proxy を配線する場所で `OpRecorder` に渡す（[plugin-backend-wiring.md](design/plugin-backend-wiring.md)）
+- #653（TASK-98.2）は出力形式の統一で、配置とは独立。5 つのトレイトの統合は #653 の後に再検討する
+- 採らなかった案: cli か core に集める。計装のための辺が増えるため。core → net は net が core 側ライブラリに確定済みだが、依存辺の採否（向き・feature の切り方）が未決（#1870）
+
+現状の当てはめ（詳細の正は各 crate の `instrument` モジュールの doc）:
+
+- plugin-cri: `CoreCriRecorder`（cri）・`CoreNetRecorder`（net）・`CoreOciRecorder`（oci）
+- cli: `CliOciRecorder`（oci の `image ls` / `rm` / `tag`・`system df`）
+- io: 本番で io の write 経路を呼ぶ crate が無く、未配線
+- platform-windows: 本番の呼び出し元は plugin-windows だが core に依存せず、`OpRecorder` へは未接続（stderr の JSON 行に出している）
 
 ## 設計ドラフト（採否未決）
 
+- rootful の CLI 経路のユーザー定義ネットワークの実行主体（NET-1・PLUG-1・SUP-14）: [network-wiring.md](design/network-wiring.md) D13（#1870。判断シートあり・オーナー承認待ち。判断は #3057。決まるまで rootful の bridge の結線〔#3069・#3074〕は着手しない）
 - `VolumeProvider` の core 側実装の担当 TASK と時期（CRI-7・PLUG-1・IO-7）: [volume-provider-implementation.md](design/volume-provider-implementation.md)（#2451。オーナー承認待ち。決まるまで core に実装は無い）
 - イメージストア root の検査の基準（OCI-7・SEC-1）: [image-store-root-trust.md](design/image-store-root-trust.md)（#2547。権限ビットと所有者の基準はオーナー承認待ち。決まるまで現行を保つ）
 - macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
 - Windows の `FileStateStore` の所有者 SID・保護 DACL の実装方式（OCI-5・SEC-4）: [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428。オーナー承認待ち）
 - 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路。SEC-4・REPAIR-3）: [audit-non-linux.md](design/audit-non-linux.md)（#2430。判断シートあり・オーナー承認待ち）
+- 電源断・カーネルクラッシュ後の媒体永続化の検証方式（IO-2・IO-3）: [io-power-loss-verification.md](design/io-power-loss-verification.md)（#1965。オーナー承認待ち。実機前提の試験 `power_loss` は用意済みで実行は人間）
+- ランタイム自身の封印複製（方式 B。CORE-5・CORE-7〜9・REPAIR-3）: [runtime-self-sealed-copy.md](design/runtime-self-sealed-copy.md)（#2686。オーナー承認待ち。決まるまで現行の A・B'・C を保つ）
+- fdinfo の `mnt_id` 解析（core・net・gpu の 3 か所）の置き場所（GPU-2・SEC-1・REPAIR-1）: [fdinfo-mnt-id-parsing.md](design/fdinfo-mnt-id-parsing.md)（#3140。共有せず共有 fixture の照合試験で一致を担保する案 C を採用。新しい辺は無い。共有下位 crate の案 B はオーナー承認待ち）
+- `build:`・Docker ソケットを使う既存構成の移行方針（STACK-7・未解決疑問点 13・15）: [build-migration.md](design/build-migration.md)（#615。オーナー承認待ち。外部ビルド手順の概要は現行実装の記述）
 
 ## 見直し
 
-REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。採否未決の設計ドラフトを追加したら「設計ドラフト」の小節を設け、方式が決まったら確定済み設計判断の表へ移す。
+REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。`api-microvm.md` の `MVM-5` が更新されたら「microVM の 3 OS 展開方針（MVM-5）」節も追従する。TASK-64・TASK-65・TASK-67 の方針や TASK-172 の 3 段目の判定（#1057）が変わったときも同節を見直す。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。採否未決の設計ドラフトを追加したら「設計ドラフト」の小節を設け、方式が決まったら確定済み設計判断の表へ移す。

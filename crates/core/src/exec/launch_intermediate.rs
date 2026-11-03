@@ -35,6 +35,14 @@
 //! 起動失敗として観測する(従来は PID 1 の終了として観測していた。具体的な原因は PID 1 の stderr に残る)。
 //! 応答ループは #2025。本番の filter は当面 ERRNO 版のため通知は生じない。
 //!
+//! # netns の素性の同期点(NET-6・SEC-1・SEC-4・#3206。`docs/design/network-wiring.md` D8)
+//!
+//! `IntermediateSpec::netns_sync` が `Some`(`network_mode=host` / `loopback` の起動)なら、C は fork の前に基準(自分の netns の
+//! (dev, ino))を取り、listener 用とは別の socketpair を作る。PID 1 は開始ゲートの通過後・`child_main` の前に自分の netns を
+//! 送って ACK を待ち、C は中間プロセスの回収後・状態 `P` の判定の前に受信して期待と照合する([`super::netns_sync`])。不一致・
+//! 形式違反は層 `mount` に 1 件記録し、EOF・期限切れを含むどの失敗でも PID 1 を回収して起動失敗(fail-closed)。
+//! C の端は I で閉じるので、C が死ぬと PID 1 は EOF で exec せずに終わる。
+//!
 //! # 報告 pipe のワイヤー形式(REPAIR-2。ASCII 1 行・LF 終端・最大 [`REPORT_MAX_BYTES`] バイト)
 //!
 //! ```text
@@ -78,20 +86,29 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    ALL_ERROR_CODES, LaunchAudit, PrePivotStatusError, read_exec_phase_status, read_line_bounded,
-    read_pre_pivot_status, resolve_exec_phase_status, resolve_pre_pivot_status,
+    ExecPhaseOutcome, ExecPhaseStep, LaunchAudit, PrePivotStatus, PrePivotStatusError,
+    read_exec_phase_until_close, read_line_bounded, read_mount_identity_block,
+    read_pre_pivot_status, read_pre_pivot_status_leaving_tail, resolve_exec_phase_status,
+    resolve_pre_pivot_status,
+};
+use super::netns_sync::{
+    AttachCheck, NETNS_SYNC_ACK_TIMEOUT, NetnsCheck, NetnsHandover, NetnsSyncRequest,
+    NetnsSyncSender, capture_baseline, capture_user_baseline, netns_socketpair, receive_and_verify,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
 };
 use super::seccomp_listener::{
-    ListenerSender, SeccompListener, listener_socketpair, receive_listener,
+    ListenerReceiveFailure, ListenerSender, SeccompListener, listener_socketpair,
+    receive_listener_or_closed,
 };
 use super::{
     ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
     SubordinateIsolationPlan, isolate, isolate_rootless_subordinate_no_flush,
 };
+use crate::launch_isolation::RecordedMountIdentity;
+use crate::oci_runtime::NetnsAttachHook;
 
 /// 報告行の最大バイト数(LF を含む)。最長の行(`R FAILED_PRECONDITION isolate\n` 約 30 バイト)より大きい固定上限。
 pub(super) const REPORT_MAX_BYTES: usize = 48;
@@ -226,10 +243,7 @@ impl IntermediateReport {
         match parts.as_slice() {
             ["K", pid] => Ok(Self::Pid1(parse_pid(pid)?)),
             ["R", code, phase] => {
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let phase =
                     IntermediatePhase::from_token(phase).ok_or(PrePivotStatusError::Malformed)?;
                 Ok(Self::Failed { code, phase })
@@ -410,6 +424,8 @@ fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), Pre
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
     plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(あれば `isolate` は作成ではなく参加する。#2674)。
+    join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -420,6 +436,10 @@ struct RealIntermediateOps<'a> {
     gate_r: &'a std::fs::File,
     /// seccomp の listener を C へ渡す socketpair の子の端(借用。PID 1 は複製を `Seccomp` 段へ渡す。SEC-4・#2024)。
     listener_end: &'a OwnedFd,
+    /// netns の素性の同期点の socketpair の子の端(同期点を通す起動だけ `Some`。PID 1 は複製を使う。NET-6・#3206)。
+    netns_end: Option<&'a OwnedFd>,
+    /// 同期点で子が渡す fd の組(Attachable は netns と user namespace の 2 本。NET-9・#1939)。
+    netns_handover: NetnsHandover,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -431,6 +451,10 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         // 作らずに失敗させる(fail-closed)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
+        // pod の namespace へ join する起動は mapper・holder を使わず、参加先の写像を計画と照合する(#2674)。
+        if let Some(join) = self.join {
+            return super::isolate_join(self.plan, join);
+        }
         match self.plan {
             IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
             // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。
@@ -457,6 +481,16 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         })?)
         .with_delivery(delivery);
         let stages = stages.with_listener_sender(sender);
+        // netns の同期点の口。複製できなければ PID 1 を作らずに失敗させる(同期点を飛ばして走らせない。fail-closed。#3206)。
+        let netns_handover = self.netns_handover;
+        let netns_sender = self
+            .netns_end
+            .map(|end| {
+                end.try_clone().map(NetnsSyncSender::new).map_err(|e| {
+                    ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the netns socket")
+                })
+            })
+            .transpose()?;
         let gate_r = self.gate_r;
         let report_fd = self.report.as_raw_fd();
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
@@ -471,10 +505,20 @@ impl IntermediateOps for RealIntermediateOps<'_> {
                 if close_inherited(report_fd).is_err() {
                     return EXIT_SETUP_FAILED;
                 }
-                match await_start_gate(gate_r, START_GATE_TIMEOUT) {
-                    Ok(()) => child_main(rootfs, entry, stages, Some(setup), stdio),
-                    Err(_) => EXIT_SETUP_FAILED,
+                if await_start_gate(gate_r, START_GATE_TIMEOUT).is_err() {
+                    return EXIT_SETUP_FAILED;
                 }
+                // exec 直前の同期点(NET-6・SEC-1・#3206): pivot と資格情報の切り替え(`CapabilityDrop` 段)より前に、
+                // 自分の netns(Attachable は続けて user namespace)を C へ渡して検証済みの ACK を待つ。ACK が無ければ
+                // (EOF・期限切れ・拒否・呼び出し側のフックの失敗)exec しない。
+                if let Some(sender) = netns_sender
+                    && sender
+                        .hand_over(netns_handover, NETNS_SYNC_ACK_TIMEOUT)
+                        .is_err()
+                {
+                    return EXIT_SETUP_FAILED;
+                }
+                child_main(rootfs, entry, stages, Some(setup), stdio)
             },
             EXIT_SETUP_FAILED,
         )
@@ -506,12 +550,20 @@ pub(crate) enum IntermediatePlan<'a> {
 pub(crate) struct IntermediateSpec<'a> {
     /// 検証済みの分離計画(euid 0 の写像は計画の段階で拒否済み。SEC-5)。
     pub(crate) plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(`None` なら新しく作る。CRI-2・CORE-3。#2674)。
+    pub(crate) join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。
     pub(crate) entry: &'a Entrypoint,
     /// pivot 前段の指定。`status` は本入口が上書きする。
     pub(crate) setup: PrePivotSetup<'a>,
+    /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は通さない。
+    /// NET-6・SEC-1・#3206。`docs/design/network-wiring.md` D8)。
+    pub(crate) netns_sync: Option<NetnsSyncRequest>,
+    /// 同期点の中で呼ぶ呼び出し側の準備処理(`Attachable` の起動だけ `Some`。他は `None`。欠落は launch の入口が fork の前に
+    /// 拒否する。NET-9・CORE-6・#1939)。
+    pub(crate) netns_attach: Option<&'a dyn NetnsAttachHook>,
 }
 
 /// 中間プロセス経由でコンテナの PID 1 を起動する(本番 launcher の唯一の起動入口。#1816)。
@@ -525,14 +577,14 @@ pub(crate) struct IntermediateSpec<'a> {
 /// (`P`)の後は seccomp の listener を受け取り、さらに PID 1 が `execveat` の直前に書く 2 行目(`R`)まで読んで成功とする。
 /// エントリポイントの検証の失敗(`E`。entrypoint 系の違反 8 理由。`launch_status` の「exec 前の 2 行目」)は起動失敗として
 /// 返り、違反ありなら C が `audit_entrypoint_violation` で層 `entrypoint` に 1 件記録する(SEC-4・#2624)。
-/// 本入口が返った後の失敗は、`R` の後の `execveat` 自体の errno 由来の失敗で、PID 1 の終了として観測される
-/// (違反ではないため記録の対象外)。
+/// `R` の後の `execveat` 自体の errno 由来の失敗は、PID 1 が `X <CODE>` を書き、C が `R` の後も EOF まで読んで
+/// 起動失敗にする(違反ではないため記録の対象外。#2716)。EOF が来なければ期限切れで失敗にして PID 1 を回収する。
 ///
 /// `dev.tty.legacy_tiocsti` の警告(CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739・#2008): 中間プロセスの fork に成功した
 /// 後、C の側で 1 回だけ、host の値が `1` のときに固定の 1 行を C の stderr へ出す(従来経路
 /// `spawn_container_with_stages` と同じ契約。観測のみで起動の可否は変えない)。fork 前の拒否(複数スレッド・pipe・
 /// fork の失敗)では出さない。出力は待たず(AF_UNIX の socket 以外へは書かない)、報告を読む期限を食わない。
-/// restart の再 launch(#2043)が本入口を通れば launch のたびに 1 行出る(host のグローバルな値の観測のため)。
+/// restart の再 launch(#2043)も本入口を通るため launch のたびに 1 行出る(supervisor は再出力しない)(host のグローバルな値の観測のため)。
 /// stderr が AF_UNIX の socket でない構成(CLI の `start` は null)では捨てられるため、supervisor が start の成功後に
 /// 同じ観測を自分のログ(`@supervisor-logs`)へも残す。
 pub(crate) fn spawn_container_via_intermediate(
@@ -545,32 +597,80 @@ pub(crate) fn spawn_container_via_intermediate(
 ) -> Result<LaunchedChild, Box<PreparedLaunchFailure>> {
     let IntermediateSpec {
         plan,
+        join,
         rootfs,
         entry,
         setup,
+        netns_sync,
+        netns_attach,
     } = spec;
     let tag = LaunchTag::fresh();
+    let netns_handover = netns_sync.map_or(NetnsHandover::NetOnly, |r| r.handover);
+    // 基準(supervisor 自身の netns)は fork の前に取る。取れなければ子を作らずに拒否する(fail-closed。#3206)。
+    let netns = match netns_sync {
+        None => None,
+        Some(request) => {
+            let baseline = match request.baseline {
+                Some(baseline) => baseline,
+                None => capture_baseline().map_err(|e| {
+                    Box::new(PreparedLaunchFailure::clean(
+                        AuditedRejection::not_applicable(e),
+                    ))
+                })?,
+            };
+            // 2 本版(Attachable)はフックと C 自身の user namespace の基準が要る。欠ければ子を作らずに拒否する
+            // (フック無しで合図を送らない。fail-closed。NET-9・#1939)。
+            let attach = match (request.handover, netns_attach) {
+                (NetnsHandover::NetOnly, _) => None,
+                (NetnsHandover::NetAndUser, None) => {
+                    return Err(Box::new(PreparedLaunchFailure::clean(
+                        AuditedRejection::not_applicable(ExecError::new(
+                            ErrorCode::Internal,
+                            IsolationStage::NetnsAttach,
+                            "the attachable network mode has no attach hook",
+                        )),
+                    )));
+                }
+                (NetnsHandover::NetAndUser, Some(hook)) => Some(AttachCheck {
+                    user_baseline: capture_user_baseline().map_err(|e| {
+                        Box::new(PreparedLaunchFailure::clean(
+                            AuditedRejection::not_applicable(e),
+                        ))
+                    })?,
+                    hook,
+                }),
+            };
+            Some(NetnsCheck {
+                expectation: request.expectation,
+                baseline,
+                attach,
+            })
+        }
+    };
+    // 子が状態 pipe で返す識別子のブロックの期待列（Mount 由来のルールの位置）。fork の前に ruleset から計算する（#3201）。
+    let expected_mounts = stages.mount_rule_positions();
     launch_via_intermediate(
         sys::self_is_single_threaded,
-        |status, report, gate_r, listener_end| {
+        |status, report, gate_r, listener_end, netns_end| {
             let mut ops = RealIntermediateOps {
                 plan,
+                join,
                 rootfs,
                 entry,
                 stages: Some(stages),
                 stdio: Some(stdio),
-                setup: PrePivotSetup {
-                    status: Some(status),
-                    ..setup
-                },
+                setup: with_status(setup, status),
                 report,
                 tag,
                 gate_r,
                 listener_end,
+                netns_end,
+                netns_handover,
             };
             intermediate_body(&mut ops)
         },
-        true,
+        Some(&expected_mounts),
+        netns,
         subreaper,
         audit,
         timeout,
@@ -582,6 +682,15 @@ pub(crate) fn spawn_container_via_intermediate(
     )
 }
 
+/// 呼び出し側の `setup` に状態 pipe の書き込み側だけを足す。`sysctls` を含むほかの段は必ず引き継ぐ
+/// (捨てると config の `linux.sysctl` が受理されたのに適用されない。CRI-2・CORE-3・SEC-1・#2670)。
+fn with_status<'a>(setup: PrePivotSetup<'a>, status: &'a std::fs::File) -> PrePivotSetup<'a> {
+    PrePivotSetup {
+        status: Some(status),
+        ..setup
+    }
+}
+
 /// 起動に成功した PID 1 のハンドルと、PID 1 から受け取った seccomp の listener(SEC-4・#2024)。
 #[derive(Debug)]
 pub(crate) struct LaunchedChild {
@@ -590,24 +699,41 @@ pub(crate) struct LaunchedChild {
     /// 検証済みの listener。本番の入口(`spawn_container_via_intermediate`)は必ず `Some`(受け取れなければ
     /// 起動失敗)。受け渡し無しの試験用経路だけが `None`。
     pub(crate) listener: Option<SeccompListener>,
+    /// 子が pivot 前段の直後に返した Mount 由来のルールの launch 時の識別子（`(ルール位置, 識別子)`。昇順。親が fork の前に
+    /// 計算した期待列と完全一致を確認済み）。launcher が分離の記録へ添える（SEC-1・SEC-4・#3201）。受け渡し無しの
+    /// 試験用経路は空。
+    pub(crate) mount_identities: Vec<(usize, RecordedMountIdentity)>,
 }
 
 /// [`spawn_container_via_intermediate`] の本体。中間プロセスの動作(`intermediate`)と fork 前のスレッド数判定を
 /// 注入できるようにして、成功・各失敗・無報告の期限切れを結合試験で照合する(REPAIR-10・REPAIR-12)。
 ///
 /// `intermediate` は fork した中間プロセスの中で `(状態 pipe の書き込み側, 報告 pipe の書き込み側, 開始ゲートの
-/// 読み取り側, listener socketpair の子の端)` を受けて呼ばれ、戻り値が `_exit` の終了コードになる。
+/// 読み取り側, listener socketpair の子の端, netns 同期点の socketpair の子の端〔`netns` が `Some` のときだけ〕)` を
+/// 受けて呼ばれ、戻り値が `_exit` の終了コードになる。
 ///
-/// `with_listener` が真なら、状態の判定が成功した後に PID 1 から seccomp の listener を期限つきで受け取って検証し
-/// (EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗。fail-closed)、ACK を返す。偽は受け渡しの無い試験用の
-/// 立て替え PID 1 のためだけに使い、本番の入口は常に真。
+/// `netns` が `Some` なら、PID 1 が exec 直前に渡す自分の netns を状態の判定より前に受け取って検証し(基準と期待の
+/// 照合。不一致・形式違反は層 `mount` に 1 件記録する)、合格したときだけ ACK を返す。EOF・期限切れ・不合格は PID 1 を
+/// 回収して起動失敗(fail-closed)。NET-6・SEC-1・SEC-4・#3206。
+///
+/// `listener_handoff` が `Some(expected_mounts)` なら、状態の判定（`P`）が成功した後に、子が返す識別子のブロック
+/// （`launch_status` の `L`/`M`。ルール位置が `expected_mounts` と完全一致すること。#3201）を読み切り、そのあと PID 1 から
+/// seccomp の listener を期限つきで受け取って検証し(EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗。
+/// fail-closed)、ACK を返す。`None` は受け渡しの無い試験用の立て替え PID 1 のためだけに使い、本番の入口は常に `Some`。
 // 理由: 注入点(スレッド判定・中間プロセス・listener の有無)と、期限・監査・識別子・警告の出力先は独立に差し替える値で、
 // 束ねる型を作ると試験側の組み立てが増えるだけのため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn launch_via_intermediate(
     is_single_threaded: impl FnOnce() -> bool,
-    intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File, &OwnedFd) -> i32,
-    with_listener: bool,
+    intermediate: impl FnOnce(
+        &std::fs::File,
+        &std::fs::File,
+        &std::fs::File,
+        &OwnedFd,
+        Option<&OwnedFd>,
+    ) -> i32,
+    listener_handoff: Option<&[usize]>,
+    netns: Option<NetnsCheck<'_>>,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -628,8 +754,18 @@ fn launch_via_intermediate(
     let (gate_r, gate_w) = exec_status_pipe().map_err(not_started)?;
     // seccomp の listener の受け渡し(SEC-4・#2024)。C の端は `SO_PASSCRED` 設定済み(送信元の pid を受け取る)。
     let (parent_end, child_end) = listener_socketpair().map_err(not_started)?;
+    // netns の素性の同期点(NET-6・#3206)。同期点を通す起動だけ作る。C の端も `SO_PASSCRED` 設定済み。
+    let netns_pair = netns
+        .as_ref()
+        .map(|_| netns_socketpair().map_err(not_started))
+        .transpose()?;
+    let (netns_parent, netns_child) = match netns_pair {
+        Some((parent, child)) => (Some(parent), Some(child)),
+        None => (None, None),
+    };
     let (status_ref, report_ref) = (&status_w, &report_w);
-    let (gate_r_ref, child_end_ref) = (&gate_r, &child_end);
+    let (gate_r_ref, child_end_ref, netns_child_ref) = (&gate_r, &child_end, netns_child.as_ref());
+    let netns_parent_fd = netns_parent.as_ref().map(|f| f.as_raw_fd());
     let (gate_w_fd, report_r_fd, status_r_fd, parent_end_fd) = (
         gate_w.as_raw_fd(),
         report_r.as_raw_fd(),
@@ -650,7 +786,19 @@ fn launch_via_intermediate(
             {
                 return EXIT_SETUP_FAILED;
             }
-            intermediate(status_ref, report_ref, gate_r_ref, child_end_ref)
+            // netns 同期点の C の端も閉じる(PID 1 へ継承されると、C の死を PID 1 が EOF で検出できない。REPAIR-5)。
+            if let Some(fd) = netns_parent_fd
+                && close_inherited(fd).is_err()
+            {
+                return EXIT_SETUP_FAILED;
+            }
+            intermediate(
+                status_ref,
+                report_ref,
+                gate_r_ref,
+                child_end_ref,
+                netns_child_ref,
+            )
         },
         EXIT_SETUP_FAILED,
     )
@@ -663,6 +811,7 @@ fn launch_via_intermediate(
     drop(gate_r);
     // 子の端を C が持ち続けると、PID 1 が送る前に死んでも EOF を観測できない。
     drop(child_end);
+    drop(netns_child);
     let intermediate_child = ContainerChild::spawned(intermediate_pid);
 
     let report = read_line_bounded::<REPORT_MAX_BYTES>(&report_r, remaining())
@@ -738,33 +887,106 @@ fn launch_via_intermediate(
         }));
     }
 
-    let status = read_pre_pivot_status(&status_r, remaining());
+    // exec 直前の同期点: PID 1 の netns の素性を状態の判定より前に検証する(PID 1 は pivot の前でこれを待つ。NET-6・SEC-1・
+    // #3206)。不一致・形式違反は層 `mount` に 1 件記録し、EOF・期限切れ・errno は記録しない(系のエラー)。
+    if let (Some(check), Some(sock)) = (netns.as_ref(), netns_parent.as_ref())
+        && let Err(failure) = receive_and_verify(sock.as_fd(), pid1.get(), check, deadline)
+    {
+        let rejection = match failure.reason {
+            Some(reason) => super::record_launch_mount_rejection_at(
+                failure.error,
+                reason,
+                Some(IsolationStage::NetnsVerify),
+                audit.container,
+                audit.sink,
+            ),
+            None => AuditedRejection::not_applicable(failure.error),
+        };
+        return Err(kill_pid1_failure(child, rejection));
+    }
+    // listener を受け取る経路(本番)は、後ろのバイト(Landlock 段の `E`)を取り込まない版で 1 行目を読む(#2130)。
+    let status = if listener_handoff.is_some() {
+        read_pre_pivot_status_leaving_tail(&status_r, remaining())
+    } else {
+        read_pre_pivot_status(&status_r, remaining())
+    };
+    // `P` の直後の識別子のブロックは、listener を受け取る前に読み切る(PID 1 は `P` の後に先にこれを書く。#3201)。
+    // 欠落・形式違反・期限切れは listener を受け取らず PID 1 を回収する(記録できない識別子で走らせない。fail-closed)。
+    let mut mount_identities = Vec::new();
+    let status = match (status, listener_handoff) {
+        (Ok(PrePivotStatus::Ready), Some(expected)) => {
+            match read_mount_identity_block(&status_r, expected, remaining()) {
+                Ok(ids) => {
+                    mount_identities = ids;
+                    Ok(PrePivotStatus::Ready)
+                }
+                Err(e) => {
+                    return Err(kill_pid1_failure(
+                        child,
+                        AuditedRejection::not_applicable(e.to_exec_error()),
+                    ));
+                }
+            }
+        }
+        (other, _) => other,
+    };
     match resolve_pre_pivot_status(status, audit) {
-        Ok(()) if !with_listener => Ok(LaunchedChild {
+        Ok(()) if listener_handoff.is_none() => Ok(LaunchedChild {
             child,
             listener: None,
+            mount_identities: Vec::new(),
         }),
-        Ok(()) => match receive_listener(parent_end.as_fd(), pid1.get(), deadline) {
+        Ok(()) => match receive_listener_or_closed(parent_end.as_fd(), pid1.get(), deadline) {
             // listener を受け取って ACK を返した後に、PID 1 が書く exec 前の 2 行目(`R`/`E`)を読む(SEC-4・#2624)。
             // 順序の根拠: PID 1 は ACK を待ってからエントリポイントの検証へ進み、C は上の `P` の判定より前に listener を
             // 受け取らない。したがって 2 行目は `P` を読み終えた後にしか書かれず、2 行が 1 回の `read` に混ざらない。
             Ok(listener) => {
-                let exec_phase = read_exec_phase_status(&status_r, remaining());
+                let exec_phase = read_exec_phase_until_close(&status_r, remaining());
                 match resolve_exec_phase_status(exec_phase, audit) {
                     Ok(()) => Ok(LaunchedChild {
                         child,
                         listener: Some(listener),
+                        mount_identities,
                     }),
                     Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
                 }
             }
             // 受け渡せなければ listener 無しで走らせない。PID 1 は ACK 待ちか既に終了しているため回収する。
-            Err(e) => Err(kill_pid1_failure(
+            // 送り手が閉じただけ(seccomp より前で子が終わった)なら、Landlock 段の失敗が状態 pipe の `E landlock ...`
+            // で照合の違反を運んでいないか読む(SEC-4・#2130)。何も無い・他の形・読み取り失敗のときは従来どおり
+            // 元の `ExecError` を記録なしで返す(拒否は覆さない。期限は入口の単一期限の残り)。
+            Err(f) => Err(kill_pid1_failure(
                 child,
-                AuditedRejection::not_applicable(e),
+                landlock_rejection_after_sender_closed(&f, &status_r, remaining(), audit),
             )),
         },
         Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
+    }
+}
+
+/// listener の送り手が閉じた失敗 `f` について、状態 pipe の Landlock 段の `E` 行を読み、照合の違反があれば層 `mount` に
+/// 1 件記録した拒否を返す(SEC-1・SEC-4・CORE-5・#2130)。`E landlock` 以外(何も無い・`R`・他の段・形式違反・期限切れ)は
+/// `f.error` を `not_applicable` で返す(従来の挙動。記録の失敗や読み取りの失敗で拒否は覆らない)。
+fn landlock_rejection_after_sender_closed(
+    f: &ListenerReceiveFailure,
+    status_r: &std::fs::File,
+    timeout: Duration,
+    audit: LaunchAudit<'_>,
+) -> AuditedRejection<ExecError> {
+    let fallback = || AuditedRejection::not_applicable(f.error.clone());
+    if !f.sender_closed {
+        return fallback();
+    }
+    match read_exec_phase_until_close(status_r, timeout) {
+        Ok(
+            outcome @ ExecPhaseOutcome::Failed {
+                step: ExecPhaseStep::Landlock,
+                ..
+            },
+        ) => resolve_exec_phase_status(Ok(outcome), audit)
+            .err()
+            .map_or_else(fallback, |r| *r),
+        _ => fallback(),
     }
 }
 
@@ -1325,11 +1547,45 @@ mod tests {
     // (`fork_single_threaded_with_no_flush`)を使う。fork 子は他スレッドが握っていた stdout / stderr の
     // ロックを引き継ぐため、flush する版だと子の中で永久に止まり得る(本番の spawn_pid1・mapper も flush しない)。
     use super::*;
+
+    /// 中間プロセス経路の setup 組み直しが sysctls を落とさない(CRI-2・CORE-3・SEC-1・#2670)。
+    #[test]
+    fn with_status_keeps_sysctl_plan() {
+        let mut set = crate::sysctl::SysctlSet::new();
+        set.insert(
+            crate::sysctl::SysctlKey::parse("kernel.shmmax").unwrap(),
+            crate::sysctl::SysctlValue::parse("16384").unwrap(),
+        )
+        .unwrap();
+        let plan = crate::exec::sysctls::SysctlPlan::new(&set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
+        let file = std::fs::File::open("/").unwrap();
+        let setup = PrePivotSetup {
+            config_paths: crate::exec::ConfigPaths::NONE,
+            devices: crate::exec::DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            etc_files: None,
+            binds: None,
+            sysfs: None,
+            sysctls: Some(&plan),
+            pinned_rootfs: None,
+            status: None,
+            working_dir: None,
+            root_readonly: true,
+        };
+        let out = with_status(setup, &file);
+        assert!(out.sysctls.is_some());
+        assert!(out.root_readonly);
+        assert!(out.status.is_some());
+    }
+
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
     use crate::exec::launch_status::{
-        PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
-        report_ready,
+        ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
+        report_exec_returned, report_failure, report_mount_identities, report_ready,
     };
     use crate::exec::process::ChildExit;
     use crate::traits::{ContainerId, TraitError};
@@ -1388,7 +1644,7 @@ mod tests {
     /// REPAIR-2: 全 `ErrorCode` と全段が往復でき、最長の行が上限に収まる。
     #[test]
     fn repair2_every_code_and_phase_fits_and_roundtrips() {
-        for code in ALL_ERROR_CODES {
+        for code in ErrorCode::ALL {
             for phase in IntermediatePhase::ALL {
                 let report = IntermediateReport::Failed { code, phase };
                 let encoded = report.encode();
@@ -1715,7 +1971,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, _listener_end| {
+            |status, report, gate_r, _listener_end, _netns_end| {
                 match behavior {
                     Behavior::Ready => {
                         let pid1 = fork_stand_in(status, &pid_write, |s| {
@@ -1812,7 +2068,8 @@ mod tests {
                 }
                 0
             },
-            false,
+            None,
+            None,
             &subreaper,
             audit,
             timeout,
@@ -1834,24 +2091,47 @@ mod tests {
     enum Handoff {
         /// 実 listener を載せて送り、ACK を待って exec 前の `R` を書き、0 で終了する(正常)。
         Good,
-        /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて眠る(SEC-4・#2624)。
+        /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて終了する(SEC-4・#2624)。
         ExecViolation,
-        /// ACK の後に理由なしの失敗 `E NOT_FOUND -` を書いて眠る(記録されない)。
+        /// ACK の後に理由なしの失敗 `E verify_root NOT_FOUND -` を書いて終了する(記録されない)。
         ExecFailureWithoutReason,
-        /// ACK の後に許可リスト外の理由(`E PERMISSION_DENIED target_moved`)を書いて眠る(`Malformed`)。
+        /// ACK の後に許可リスト外の理由(`E open_entrypoint PERMISSION_DENIED target_moved`)を書いて終了する(`Malformed`)。
         ExecForeignReason,
+        /// ACK の後に共有外の exec の段(`E parent_lifetime INTERNAL -`)を書いて終了する(`Malformed`。#2895)。
+        ExecForeignStep,
         /// ACK の後に 2 行目を書かずに終了する(EOF)。
         ExecSilentExit,
         /// ACK の後に 2 行目を書かずに眠る(期限切れ)。
         ExecSilentSleep,
+        /// ACK の後に `R` と `X NOT_FOUND` を書いて終了する(`execveat` が errno で失敗。起動失敗・記録なし。#2716)。
+        ExecReturned,
+        /// ACK の後に `R` を書き、書き込み側を持ったまま眠る(EOF が来ない。期限切れで失敗・回収。#2716)。
+        ExecReadyThenSleep,
         /// `P` を報告して何も送らずに終了する(EOF で即時に失敗するはず)。
         NoSend,
+        /// `P` を報告し、listener を送らずに Landlock 段の照合の違反 `E landlock ... landlock_mount_not_root` を書いて
+        /// 終了する(seccomp より前の Landlock 段の失敗。SEC-4・#2130)。
+        LandlockViolation,
+        /// 上と同じだが、違反の理由なしの `E landlock UNIMPLEMENTED -` を書く(記録されない)。
+        LandlockWithoutReason,
         /// listener ではない fd(pipe)を送る(種別の不一致)。
         WrongFd,
         /// PID 1 ではなく中間プロセスが listener を送る(送信元 pid の不一致)。
         WrongSender,
         /// listener を得る前の適用失敗(`EBUSY` 相当の `FailedPrecondition`)を構造化して送り、0 で終了する。
         ReportBusy,
+        /// `P` の直後に Mount 由来のルール 2 本(位置 1・3)の識別子のブロックを書き、`Good` と同じに進む(#3201)。
+        MountIdentitiesGood,
+        /// 上と同じだが、2 本目のルール位置が期待(3)と食い違う 4 を書く(`Malformed`。listener は受け取らない)。
+        MountIdentitiesWrongRule,
+    }
+
+    /// `MountIdentitiesGood` が書く識別子(位置 1・3)。
+    fn fake_mount_identities() -> Vec<(usize, RecordedMountIdentity)> {
+        vec![
+            (1, RecordedMountIdentity::new(11, 2, 3, false).unwrap()),
+            (3, RecordedMountIdentity::new(13, 4, 5, true).unwrap()),
+        ]
     }
 
     /// 実 listener を載せた状態の fd を作る(forked 単一スレッドの子の中でだけ呼ぶ。filter は子に残る)。
@@ -1898,16 +2178,32 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, listener_end| {
+            |status, report, gate_r, listener_end, _netns_end| {
                 let end = listener_end.try_clone().expect("dup");
                 let pid1 = fork_stand_in(status, &pid_write, move |s| {
                     if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
                         return EXIT_SETUP_FAILED;
                     }
                     let _ = report_ready(s);
+                    // `P` の直後に識別子のブロックを書く(`NoSend` は書かずに終了する。#3201)。
+                    let block = match mode {
+                        Handoff::NoSend => None,
+                        Handoff::MountIdentitiesGood => Some(fake_mount_identities()),
+                        Handoff::MountIdentitiesWrongRule => {
+                            let mut ids = fake_mount_identities();
+                            ids[1].0 = 4;
+                            Some(ids)
+                        }
+                        _ => Some(Vec::new()),
+                    };
+                    if let Some(entries) = block {
+                        let _ = report_mount_identities(s, &entries);
+                    }
                     let sender = ListenerSender::new(end);
                     match mode {
-                        Handoff::Good => {
+                        Handoff::Good
+                        | Handoff::MountIdentitiesGood
+                        | Handoff::MountIdentitiesWrongRule => {
                             match sender.hand_over(child_listener(), Duration::from_secs(10)) {
                                 Ok(()) => {
                                     let _ = report_exec_ready(s);
@@ -1919,8 +2215,11 @@ mod tests {
                         Handoff::ExecViolation
                         | Handoff::ExecFailureWithoutReason
                         | Handoff::ExecForeignReason
+                        | Handoff::ExecForeignStep
                         | Handoff::ExecSilentExit
-                        | Handoff::ExecSilentSleep => {
+                        | Handoff::ExecSilentSleep
+                        | Handoff::ExecReturned
+                        | Handoff::ExecReadyThenSleep => {
                             if sender
                                 .hand_over(child_listener(), Duration::from_secs(10))
                                 .is_err()
@@ -1932,6 +2231,9 @@ mod tests {
                                 Handoff::ExecViolation => {
                                     let _ = report_exec_failure(
                                         s,
+                                        ExecPhaseStep::Child(
+                                            crate::exec::ExecChildStep::OpenEntrypoint,
+                                        ),
                                         &ExecError::from_violation_at(
                                             ViolationReason::EntrypointIsRuntimeBinary,
                                             None,
@@ -1942,6 +2244,7 @@ mod tests {
                                 Handoff::ExecFailureWithoutReason => {
                                     let _ = report_exec_failure(
                                         s,
+                                        ExecPhaseStep::VerifyRoot,
                                         &ExecError::new(
                                             ErrorCode::NotFound,
                                             IsolationStage::Exec,
@@ -1949,19 +2252,57 @@ mod tests {
                                         ),
                                     );
                                 }
+                                Handoff::ExecReturned => {
+                                    let _ = report_exec_ready(s);
+                                    let _ = report_exec_returned(s, ErrorCode::NotFound);
+                                }
+                                Handoff::ExecReadyThenSleep => {
+                                    let _ = report_exec_ready(s);
+                                }
+                                Handoff::ExecForeignStep => {
+                                    let _ = w.write_all(b"E parent_lifetime INTERNAL -\n");
+                                }
                                 Handoff::ExecForeignReason => {
-                                    let _ = w.write_all(b"E PERMISSION_DENIED target_moved\n");
+                                    let _ = w.write_all(
+                                        b"E open_entrypoint PERMISSION_DENIED target_moved\n",
+                                    );
                                 }
                                 _ => {}
                             }
-                            if mode == Handoff::ExecSilentExit {
-                                0
-                            } else {
+                            // 実際の子は `E` を書いた後に終了する(親は EOF まで読む。#2716)。眠るのは無報告の試験だけ。
+                            if matches!(
+                                mode,
+                                Handoff::ExecSilentSleep | Handoff::ExecReadyThenSleep
+                            ) {
                                 std::thread::sleep(Duration::from_secs(120));
-                                0
                             }
+                            0
                         }
                         Handoff::NoSend | Handoff::WrongSender => 0,
+                        Handoff::LandlockViolation => {
+                            let _ = report_exec_failure(
+                                s,
+                                ExecPhaseStep::Landlock,
+                                &ExecError::from_violation_at(
+                                    ViolationReason::LandlockMountNotRoot,
+                                    None,
+                                    IsolationStage::Landlock,
+                                ),
+                            );
+                            0
+                        }
+                        Handoff::LandlockWithoutReason => {
+                            let _ = report_exec_failure(
+                                s,
+                                ExecPhaseStep::Landlock,
+                                &ExecError::new(
+                                    ErrorCode::Unimplemented,
+                                    IsolationStage::Landlock,
+                                    "unavailable",
+                                ),
+                            );
+                            0
+                        }
                         Handoff::ReportBusy => {
                             sender.report_failure(&ExecError::new(
                                 ErrorCode::FailedPrecondition,
@@ -1993,7 +2334,11 @@ mod tests {
                 }
                 0
             },
-            true,
+            Some(match mode {
+                Handoff::MountIdentitiesGood | Handoff::MountIdentitiesWrongRule => &[1, 3],
+                _ => &[],
+            }),
+            None,
             &subreaper,
             audit,
             timeout,
@@ -2042,7 +2387,7 @@ mod tests {
         assert_eq!(records[0].path(), None);
     }
 
-    /// SEC-4・#2624: 理由なしの失敗(`E NOT_FOUND -`)は起動失敗にするが記録しない。
+    /// SEC-4・#2624: 理由なしの失敗(`E verify_root NOT_FOUND -`)は起動失敗にするが記録しない。
     #[test]
     fn sec4_2624_launch_fails_without_record_for_reasonless_exec_failure() {
         let _serial = serialize_forks();
@@ -2051,6 +2396,10 @@ mod tests {
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::NotFound);
         assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure.rejection.error.message,
+            "exec phase step 'verify_root' failed in the container child"
+        );
         assert_eq!(
             failure.rejection.delivery,
             crate::audit_log::AuditDelivery::NotApplicable
@@ -2068,6 +2417,12 @@ mod tests {
         for (mode, timeout, message) in [
             (
                 Handoff::ExecForeignReason,
+                Duration::from_secs(20),
+                "the pre-pivot status is malformed",
+            ),
+            (
+                // exec と共有しない段(#2895)は語彙外として拒否する。
+                Handoff::ExecForeignStep,
                 Duration::from_secs(20),
                 "the pre-pivot status is malformed",
             ),
@@ -2094,6 +2449,70 @@ mod tests {
             assert!(records.is_empty());
             assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
         }
+    }
+
+    /// SEC-4・#2716: `R` の後の `execveat` の失敗(`X`)は、記録なしの起動失敗で PID 1 を回収する。`R` の後に EOF が
+    /// 来なければ(書き込み側を保持したまま停止)期限切れで失敗にして回収する(REPAIR-5)。
+    #[test]
+    fn sec4_2716_launch_fails_on_execveat_failure_after_ready_and_on_silence_after_ready() {
+        let _serial = serialize_forks();
+        let (result, elapsed, pid1, records) =
+            run_handoff_audited(Handoff::ExecReturned, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::NotFound);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure.rejection.error.message,
+            "the entrypoint execveat failed in the container child"
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+
+        let (result, elapsed, pid1, records) =
+            run_handoff_audited(Handoff::ExecReadyThenSleep, Duration::from_secs(4));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(
+            failure.rejection.error.message,
+            "timed out waiting for the pre-pivot status"
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    }
+
+    /// SEC-1・SEC-4・#3201: `P` の直後に子が返した Mount 由来のルールの識別子が、期待列(位置 1・3)と一致すれば
+    /// `LaunchedChild::mount_identities` に載る。位置が期待と食い違えば listener を受け取らず PID 1 を回収して
+    /// 起動失敗にする(fail-closed)。
+    #[test]
+    fn sec1_3201_launch_carries_mount_identities_and_rejects_a_mismatch() {
+        let _serial = serialize_forks();
+        let (result, _, _) = run_handoff(Handoff::MountIdentitiesGood, Duration::from_secs(20));
+        let launched = result.expect("launch must succeed");
+        assert_eq!(launched.mount_identities, fake_mount_identities());
+        assert!(launched.listener.is_some());
+
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::MountIdentitiesWrongRule, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.error.message,
+            "the pre-pivot status is malformed"
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
     }
 
     /// SEC-4・#2024: PID 1 が載せた実 listener を C が受け取り、種別・close-on-exec を満たす。PID 1 は ACK を
@@ -2124,9 +2543,70 @@ mod tests {
         let (result, elapsed, _) = run_handoff(Handoff::NoSend, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
-        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Spawn);
         assert!(failure.unreaped.is_empty());
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// SEC-4・SEC-1・CORE-5・#2130: seccomp より前の Landlock 段の照合の違反は、listener の EOF に潰れず、層 `mount`・
+    /// 段 `landlock` の記録が 1 件残る。PID 1 は回収される。
+    #[test]
+    fn sec4_2130_launch_records_landlock_violation_after_sender_closed() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::LandlockViolation, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::Recorded
+        );
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Landlock);
+        assert_eq!(
+            failure
+                .rejection
+                .error
+                .violation
+                .as_ref()
+                .map(|v| v.reason.as_str()),
+            Some("landlock_mount_not_root")
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].layer(), crate::audit_log::AuditLayer::Mount);
+        assert_eq!(records[0].path(), None);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("landlock_mount_not_root")
+        );
+    }
+
+    /// SEC-4・#2130: 理由なしの Landlock 段の失敗は記録せず、段 `Landlock` の失敗のまま(`NotApplicable`)。
+    /// 何も書かずに終わった場合(`NoSend`)は従来の EOF 由来の `Internal`・段 `Seccomp` のまま記録なし。
+    #[test]
+    fn sec4_2130_landlock_failure_without_reason_and_silent_exit_are_not_recorded() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::LandlockWithoutReason, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert_eq!(failure.rejection.error.code, ErrorCode::Unimplemented);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Landlock);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+
+        let (result, _, _, records) = run_handoff_audited(Handoff::NoSend, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Spawn);
+        assert!(records.is_empty());
     }
 
     /// SEC-4・#2024: listener 取得前の適用失敗(祖先に listener がある `EBUSY`)は EOF 由来の `Internal` に潰れず、
@@ -2527,15 +3007,19 @@ mod tests {
     }
 
     /// 疑似 `/proc`(一時ディレクトリ)に `<pid>/stat` を置く。
-    fn fake_proc(label: &str, stats: &[(u32, &str)]) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("core2-2394-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn fake_proc(
+        label: &str,
+        stats: &[(u32, &str)],
+    ) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (scratch, root) =
+            crate::test_support::scratch_child(&format!("core2-2394-{label}"), "d");
         for (pid, stat) in stats {
             let dir = root.join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("stat"), stat).unwrap();
         }
-        root
+        (scratch, root)
     }
 
     /// CORE-2・REPAIR-12(#2394): 探索処理そのものに fixture を渡す。終了処理中(`X` / `x`)の task は除外され
@@ -2545,7 +3029,7 @@ mod tests {
         let dying_x = "300 (a) X 0 -1 -1 0 -1 4227148\n";
         let dying_lx = "301 (b) x 0 -1 -1 0 -1 4227148\n";
         let child = "302 (c) S 100 100 100 0 -1 0\n";
-        let root = fake_proc(
+        let (_scratch, root) = fake_proc(
             "skip",
             &[
                 (300, dying_x),
@@ -2566,7 +3050,7 @@ mod tests {
     #[test]
     fn core2_descendants_unparsable_live_stat_marks_incomplete() {
         let broken = "303 (d) S 0 -1 -1 0 -1 4227148\n";
-        let root = fake_proc("broken", &[(303, broken)]);
+        let (_scratch, root) = fake_proc("broken", &[(303, broken)]);
         let mut out = Rescan::default();
         let found = descendants_in(&root, 100, 1, &mut out);
         let _ = std::fs::remove_dir_all(&root);
@@ -2593,6 +3077,355 @@ mod tests {
             ChildExit::Exited(0)
         );
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    /// netns 同期点の代役の PID 1 の振る舞い。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NetnsStandIn {
+        /// 本物の送り手で自分の netns(`NetAndUser` は続けて user namespace)を送り、ACK を受けたら `P` を書いて 0 で終了する。
+        Honest(NetnsHandover),
+        /// 何も送らず眠る(C は期限で失敗にする)。
+        Silent,
+        /// 何も送らずに終了する(C は EOF を観測する)。
+        ExitsEarly,
+    }
+
+    /// 同期点を通す起動を代役の PID 1 で行う(`with_listener = false`)。結果・代役の pid・記録を返す。
+    fn run_netns(
+        mode: NetnsStandIn,
+        check: NetnsCheck<'_>,
+        timeout: Duration,
+    ) -> (
+        Result<LaunchedChild, Box<PreparedLaunchFailure>>,
+        u32,
+        Vec<AuditRecord>,
+    ) {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let (mut pid_read, pid_write) = std::io::pipe().unwrap();
+        let pid_write = std::fs::File::from(std::os::fd::OwnedFd::from(pid_write));
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let id = ContainerId::new("c3206").unwrap();
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
+        let tag = LaunchTag::fresh();
+        let result = launch_via_intermediate(
+            || true,
+            |status, report, gate_r, _listener_end, netns_end| {
+                let end = netns_end.expect("netns end").try_clone().expect("dup");
+                let pid1 = fork_stand_in(status, &pid_write, move |s| {
+                    if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    match mode {
+                        NetnsStandIn::Honest(handover) => {
+                            match NetnsSyncSender::new(end)
+                                .hand_over(handover, Duration::from_secs(10))
+                            {
+                                Ok(()) => {
+                                    let _ = report_ready(s);
+                                    0
+                                }
+                                Err(_) => 3,
+                            }
+                        }
+                        NetnsStandIn::Silent => {
+                            std::thread::sleep(Duration::from_secs(120));
+                            0
+                        }
+                        NetnsStandIn::ExitsEarly => 3,
+                    }
+                });
+                send_report(report, &IntermediateReport::Pid1(pid(pid1)));
+                0
+            },
+            None,
+            Some(check),
+            &subreaper,
+            audit,
+            timeout,
+            &tag,
+            (crate::legacy_tiocsti::LegacyTiocsti::Absent, out_tx.as_fd()),
+        );
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut pid_read, &mut buf).expect("pid1");
+        let records = sink.0.lock().unwrap().clone();
+        (result, u32::from_le_bytes(buf), records)
+    }
+
+    fn own_netns() -> super::super::netns_sync::NetnsIdentity {
+        capture_baseline().expect("own netns")
+    }
+
+    /// NET-6・SEC-1(#3206): Host 相当(基準と同じ)の代役は同期点を通り、起動に成功する。記録は 0 件。
+    #[test]
+    fn net6_sec1_3206_launch_passes_the_netns_sync_point_when_identity_matches() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: None,
+        };
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            check,
+            Duration::from_secs(20),
+        );
+        let launched = result.expect("must launch");
+        assert_eq!(launched.child.pid(), pid1);
+        assert_eq!(
+            launched
+                .child
+                .wait_timeout(Duration::from_secs(10))
+                .unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert!(records.is_empty());
+    }
+
+    /// NET-6・SEC-1・SEC-4(#3206): Loopback 相当(基準と異なる)なのに基準と同じ netns なら、`netns_identity_mismatch` で
+    /// 拒否して 1 件記録し、PID 1 は exec せずに回収される。段は `netns_verify`、code は FailedPrecondition。
+    #[test]
+    fn net6_sec1_sec4_3206_launch_rejects_and_audits_a_netns_mismatch() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::DiffersFromBaseline,
+            baseline: own_netns(),
+            attach: None,
+        };
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            check,
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert_eq!(
+            failure
+                .rejection
+                .error
+                .violation
+                .as_ref()
+                .map(|v| v.reason.as_str()),
+            Some("netns_identity_mismatch")
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::Recorded
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].layer(), crate::audit_log::AuditLayer::Mount);
+        assert_eq!(records[0].path(), None);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("netns_identity_mismatch")
+        );
+        assert_eq!(records[0].stage().map(|s| s.as_str()), Some("netns_verify"));
+    }
+
+    /// REPAIR-5(#3206): 代役が何も送らず終了(EOF)・眠る(期限切れ)のどちらも、記録なしの起動失敗になり PID 1 は回収される。
+    #[test]
+    fn repair5_3206_launch_fails_closed_when_the_netns_never_arrives() {
+        let _serial = serialize_forks();
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: None,
+        };
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::ExitsEarly, check, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+
+        let check = NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: None,
+        };
+        let started = Instant::now();
+        let (result, pid1, records) =
+            run_netns(NetnsStandIn::Silent, check, Duration::from_secs(2));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
+    /// 呼び出しを記録するフック(C 側で呼ばれる)。`delay` の間眠ってから `result` を返す。
+    struct AttachHookProbe {
+        calls: Mutex<Vec<(super::super::netns_sync::NetnsIdentity, bool)>>,
+        result: Result<(), ErrorCode>,
+        delay: Duration,
+    }
+
+    impl NetnsAttachHook for AttachHookProbe {
+        fn attach(
+            &self,
+            namespaces: crate::oci_runtime::AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), crate::traits::types::TraitError> {
+            use std::os::unix::fs::MetadataExt as _;
+            let net = std::fs::File::from(namespaces.net().try_clone_to_owned().unwrap())
+                .metadata()
+                .unwrap();
+            let user = std::fs::File::from(namespaces.user().try_clone_to_owned().unwrap())
+                .metadata()
+                .unwrap();
+            let own_user = std::fs::metadata("/proc/thread-self/ns/user").unwrap();
+            let id =
+                super::super::netns_sync::NetnsIdentity::from_parts_for_test(net.dev(), net.ino());
+            self.calls
+                .lock()
+                .unwrap()
+                .push((id, user.ino() == own_user.ino()));
+            std::thread::sleep(self.delay);
+            self.result
+                .map_err(|c| crate::traits::types::TraitError::new(c, "private detail"))
+        }
+    }
+
+    fn probe(result: Result<(), ErrorCode>, delay: Duration) -> AttachHookProbe {
+        AttachHookProbe {
+            calls: Mutex::new(Vec::new()),
+            result,
+            delay,
+        }
+    }
+
+    fn attach_check(hook: &AttachHookProbe) -> NetnsCheck<'_> {
+        NetnsCheck {
+            expectation: super::super::netns_sync::NetnsExpectation::SameAsBaseline,
+            baseline: own_netns(),
+            attach: Some(AttachCheck {
+                // 代役は試験プロセスと同じ user namespace にいるため、基準は別の値にして「異なる」判定を通す。
+                user_baseline: super::super::netns_sync::NetnsIdentity::from_parts_for_test(0, 0),
+                hook,
+            }),
+        }
+    }
+
+    /// NET-9・CORE-6・SEC-1(#1939): 2 本版は net → user の順に届き、フックが 1 回だけ呼ばれ(受け取った netns の素性が
+    /// 送り手のものと一致)、合図(ACK)の後に `P` が届いて起動が成功する。記録は 0 件。
+    #[test]
+    fn net9_core6_1939_attachable_calls_hook_once_then_launches() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let launched = result.expect("must launch");
+        assert_eq!(launched.child.pid(), pid1);
+        assert_eq!(
+            launched
+                .child
+                .wait_timeout(Duration::from_secs(10))
+                .unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert!(records.is_empty());
+        let calls = hook.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (own_netns(), true));
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックが Err なら ACK を送らず PID 1 を回収する。code を保ち、段は `NetnsAttach`、記録は 0 件。
+    #[test]
+    fn net9_repair5_1939_hook_failure_reaps_pid1_without_ack_or_audit() {
+        let _serial = serialize_forks();
+        let hook = probe(Err(ErrorCode::Unavailable), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Unavailable);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsAttach);
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        assert_eq!(hook.calls.lock().unwrap().len(), 1);
+    }
+
+    /// NET-9・REPAIR-5(#1939): フックが Ok でも launch の期限を越えていれば `Timeout`(段 `NetnsAttach`)で失敗し、回収する。
+    #[test]
+    fn net9_repair5_1939_hook_returning_after_the_deadline_is_a_timeout() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::from_millis(2500));
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetAndUser),
+            attach_check(&hook),
+            Duration::from_secs(2),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsAttach);
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
+    /// NET-9・SEC-1・SEC-4(#1939): 2 本を期待したのに 1 本しか送らない子は `netns_handoff_invalid` を 1 件記録して回収され、
+    /// フックは呼ばれない。
+    #[test]
+    fn net9_sec1_sec4_1939_single_fd_sender_is_rejected_before_the_hook() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::Honest(NetnsHandover::NetOnly),
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::NetnsVerify);
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("netns_handoff_invalid")
+        );
+        assert!(hook.calls.lock().unwrap().is_empty());
+    }
+
+    /// NET-9・REPAIR-5(#1939): 2 本版でも代役が何も送らず終了・眠るなら、記録なしの起動失敗になり PID 1 は回収される。
+    #[test]
+    fn net9_repair5_1939_attachable_fails_closed_when_nothing_arrives() {
+        let _serial = serialize_forks();
+        let hook = probe(Ok(()), Duration::ZERO);
+        let (result, pid1, records) = run_netns(
+            NetnsStandIn::ExitsEarly,
+            attach_check(&hook),
+            Duration::from_secs(20),
+        );
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+        let (result, pid1, _records) = run_netns(
+            NetnsStandIn::Silent,
+            attach_check(&hook),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            result.expect_err("must fail").rejection.error.code,
+            ErrorCode::Timeout
+        );
+        assert!(gone(pid1));
+        assert!(hook.calls.lock().unwrap().is_empty());
     }
 
     /// 子プロセス側の本体(`REPAIR12_2249_CHILD` が無ければ何もしない)。別スレッドが stdout / stderr の
@@ -2641,7 +3474,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
                 "exec::launch_intermediate::tests::repair12_2249_stand_in_fork_ignores_stdio_locks_helper",
             ])
@@ -2887,7 +3720,7 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, _report, gate_r, _listener_end| {
+            |status, _report, gate_r, _listener_end, _netns_end| {
                 let _ = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
@@ -2904,7 +3737,8 @@ mod tests {
                 // 報告せずに終了する。
                 EXIT_SETUP_FAILED
             },
-            false,
+            None,
+            None,
             &_subreaper,
             audit,
             Duration::from_secs(5),
@@ -3154,8 +3988,9 @@ mod tests {
         let (out_tx, _out_rx) = UnixStream::pair().unwrap();
         let result = launch_via_intermediate(
             || false,
-            |_, _, _, _| panic!("the intermediate must not run"),
-            false,
+            |_, _, _, _, _| panic!("the intermediate must not run"),
+            None,
+            None,
             &subreaper,
             audit,
             Duration::from_secs(1),
@@ -3200,15 +4035,14 @@ mod tests {
         }
         let (reader, writer) = std::io::pipe().unwrap();
         let filler_writer = writer.try_clone().unwrap();
-        let marker = std::env::temp_dir().join(format!("repair5-1816-{}", std::process::id()));
+        // 予測できる名前を先に消さず、排他作成の `ScratchDir` の子に置く（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("repair5-1816", "d");
+        let marker = dir.join("marker");
         let (ready, go) = (marker.with_extension("ready"), marker.with_extension("go"));
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
                 "exec::launch_intermediate::tests::repair5_1816_child_stdout_full_helper",
             ])
@@ -3238,9 +4072,6 @@ mod tests {
         let _ = child.wait();
         drop(reader);
         let _ = filler.join();
-        for f in [&marker, &ready, &go] {
-            let _ = std::fs::remove_file(f);
-        }
         assert!(finished, "launch blocked on a full stdout pipe");
     }
 }

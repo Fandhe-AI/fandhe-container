@@ -6,7 +6,7 @@
 //!
 //! | トレイト | 実装の置き場所 |
 //! | -------- | -------------- |
-//! | `ContainerRuntime` | plugin（別プロセス＋UDS。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114） |
+//! | `ContainerRuntime` | plugin（別プロセス＋UDS。#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114） |
 //! | `NetworkPlugin` | plugin（別プロセス＋UDS） |
 //! | `StateStore` | core に既定実装（ファイルベース）。plugin で差し替え可能 |
 //! | `VolumeProvider` | core（データパス。トレイト定義・実装とも core 側） |
@@ -26,21 +26,24 @@ pub mod types;
 pub mod volume_provider;
 
 pub use container_runtime::{
-    CleanupOutcome, CleanupTarget, ContainerRuntime, ContainerState, ContainerStatus,
-    CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal, StartRequest, StateRequest,
-    StopRequest, TerminationReason,
+    CONTAINER_LOG_PATH_MAX_BYTES, CleanupOutcome, CleanupTarget, ContainerLogPath,
+    ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
+    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
+    TerminationReason, WaitExitRequest,
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,
-    DeleteNetworkResponse, DetachRequest, DetachResponse, IpCidr, NetnsName, NetnsStatus,
-    NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol, PublishPortRequest,
+    DeleteNetworkResponse, DetachRequest, DetachResponse, IpCidr, MSG_UNPUBLISH_PORT_UNSUPPORTED,
+    NetnsName, NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, PortMapping, Protocol,
+    PublishPortRequest, UnpublishPortRequest, UnpublishPortResponse,
 };
 pub use state_store::{
     ANNOTATION_MAX_KEY_BYTES, ANNOTATIONS_MAX_ENTRIES, ANNOTATIONS_MAX_TOTAL_BYTES, Annotations,
     CgroupPlacement, CgroupScope, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
     ExplicitStop, GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord,
-    ListStateRequest, MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN, MAX_PAGE_SIZE, StateList,
-    StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState, UpdateStateRequest,
+    LaunchIsolationUpdate, ListStateRequest, MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN, MAX_PAGE_SIZE,
+    StateList, StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState,
+    UpdateStateRequest,
 };
 pub use types::{ContainerId, ErrorCode, TRAIT_ERROR_MESSAGE_MAX_BYTES, TraitError};
 pub use volume_provider::{

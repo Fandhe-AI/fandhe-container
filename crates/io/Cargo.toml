@@ -31,9 +31,22 @@ name = "crash_safety"
 path = "tests/crash_safety.rs"
 required-features = ["crash-test-server"]
 
+# 電源断・カーネルクラッシュ後の媒体永続化（IO-2）の実機前提試験（#1965）。
+# root 前提の本体は #[ignore]（docs/design/io-power-loss-verification.md）。
+[[test]]
+name = "power_loss"
+path = "tests/power_loss.rs"
+required-features = ["crash-test-server"]
+
 # NFC/NFD の別表記の衝突検出用（IO-5・TASK-21.1）。承認: Issue #798・#1720。nfd() だけを使う。
 [dependencies]
 unicode-normalization = { workspace = true }
+
+# `src/sys.rs` / `src/sys/vsock.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1842・#1318・#1837・MVM-4・REPAIR-12）。
+# 承認元: #1318 のオーナー判断（版は workspace の =0.2.189 のまま・用途は照合の試験に限る）。
+# 製品の依存には入れない（cargo tree -e normal,build に現れない）。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

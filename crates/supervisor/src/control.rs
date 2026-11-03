@@ -35,8 +35,9 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - CLI の `kill` への結線（`stop` は `stop_delete::production_stop_signaler` で結線済み。#2059・#2162。`kill` は #1902 が
-//!   `ControlSignaler::new`〔stop の意図を立てない kind 2〕を使う。`kill` が意図を立てるかは #1902 の判断）
+//! - CLI の `kill` は結線済み（#1902。`ControlSignaler::new`〔stop の意図を立てない kind 2〕。`stop` は
+//!   `stop_delete::production_stop_signaler`。#2059・#2162）。残余: moby の `kill` は SIGKILL か StopSignal と一致するとき再起動を
+//!   止めるが、本実装は意図を立てないため `kill <id> KILL` の後に再起動されうる（Docker 互換にするかはオーナー判断待ち）
 //! - 明示 stop の意図は StopRequest（kind 4。稼働中）か CancelRestartRequest（kind 5。バックオフ・再 launch 中。#2440）が
 //!   `StopToken::mark_explicit_stop` で立て、restart の判定が読む（SUP-9・#2162）。supervisor の寿命の中では `always`・
 //!   `unless-stopped` を含む全ポリシーで、stop 後は再起動しない。明示 stop は `restart` ループが state.json の `Stopped` の記録へ
@@ -45,7 +46,7 @@
 //!   終了から記録までの間に supervisor が死んだ場合も記録は残らず、その後の re-adopt では `unless-stopped` が起こし得る。
 //!   re-adopt 本体（`restart::evaluate_resume` を呼ぶ側）は未実装（#514・SUP-8）
 //! - restart の再 launch を単一スレッドで行う再構成（#2043）では、制御チャネルのスレッドも止める対象になる
-//!   （停止の口は `ControlServer::shutdown` に用意済み）
+//!   （再 launch の間は `PausableServer::pause` / `resume` で止めて作り直す。#2043）
 //! - 異常終了で残った `supervisor.sock` は、core の `StateStore::delete`（`FileStateStore`）が `<id>/` を開いた fd を
 //!   起点に種別（ソケット）と所有者（実効 UID）を検証してから消す（#2174・OCI-6・SUP-1）。ソケット以外・他 UID 所有の
 //!   同名は消さず `<id>/` を残す。`purge_corrupted` は触れない
@@ -227,7 +228,7 @@ mod install {
 
     use super::listener::{ControlListener, effective_uid};
     use super::observe::ControlObserver;
-    use super::server::{ControlServer, ServeConfig};
+    use super::server::{PausableServer, ServeConfig};
     use super::target::{ControlledProcess, ControlledRelauncher, SignalSlot};
     use crate::run::StopToken;
     use crate::start_entry::Running;
@@ -238,9 +239,19 @@ mod install {
     /// 作成に失敗していたら [`Self::failure`] が構造化エラーを返す。
     #[must_use = "dropping the handle stops the control channel"]
     pub struct ControlHandle {
-        _server: Option<ControlServer>,
+        server: Option<Arc<PausableServer>>,
         _listener: Option<ControlListener>,
         failure: Option<TraitError>,
+    }
+
+    impl Drop for ControlHandle {
+        /// サーバスレッドを先に止め、その後にフィールドの drop が listener を閉じてソケットを消す。
+        /// relauncher が `Arc` を保持していても、ここで確実に止める（#2043）。
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                server.shutdown();
+            }
+        }
     }
 
     impl ControlHandle {
@@ -270,7 +281,7 @@ mod install {
         );
         let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
         ControlHandle {
-            _server: None,
+            server: None,
             _listener: None,
             failure: Some(error),
         }
@@ -306,27 +317,40 @@ mod install {
             logs,
             seccomp,
         } = running;
-        let running = Running {
-            process: Box::new(ControlledProcess::new(process, slot.clone())),
-            relauncher: Arc::new(ControlledRelauncher::new(relauncher, slot.clone())),
-            instance,
-            logs,
-            seccomp,
-        };
         let observer = Arc::new(ControlObserver::new(audit, Some(id.clone())));
-        let server = listener
-            .try_clone_listener()
-            .and_then(|l| ControlServer::spawn(l, slot, uid, ServeConfig::default(), observer));
+        let server = listener.try_clone_listener().and_then(|l| {
+            PausableServer::spawn(l, slot.clone(), uid, ServeConfig::default(), observer)
+        });
         match server {
-            Ok(s) => (
-                running,
-                ControlHandle {
-                    _server: Some(s),
-                    _listener: Some(listener),
-                    failure: None,
-                },
-            ),
+            Ok(s) => {
+                let s = Arc::new(s);
+                // 再 launch の間だけ accept スレッドを止める（単一スレッドを要求する本番 launcher のため。#2043）。
+                let controlled =
+                    ControlledRelauncher::new(relauncher, slot.clone()).with_pause(s.clone());
+                let running = Running {
+                    process: Box::new(ControlledProcess::new(process, slot)),
+                    relauncher: Arc::new(controlled),
+                    instance,
+                    logs,
+                    seccomp,
+                };
+                (
+                    running,
+                    ControlHandle {
+                        server: Some(s),
+                        _listener: Some(listener),
+                        failure: None,
+                    },
+                )
+            }
             Err(_) => {
+                let running = Running {
+                    process: Box::new(ControlledProcess::new(process, slot.clone())),
+                    relauncher: Arc::new(ControlledRelauncher::new(relauncher, slot)),
+                    instance,
+                    logs,
+                    seccomp,
+                };
                 stop.request_stop();
                 let mut handle = failed_handle(TraitError::new(
                     ErrorCode::Internal,

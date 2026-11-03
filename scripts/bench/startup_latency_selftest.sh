@@ -4,7 +4,8 @@
 # 役割: 実ランタイム・root を使わず、bash のスタブランタイム（create / start / delete /
 # kill を模し、固定 sleep と呼び出しログを持つ）で、終了コード・出力 JSON の値・呼び出し
 # 順序・タイムアウト・後始末を具体値で機械照合する。own 実装の実測そのものは行わない
-# （own の実測は #1890 の後に人間が #213 で実施する。startup_latency.sh 冒頭の「現状の制約」参照）。
+# （own の実測は人間が #213 で実施する。スタブの出力形は CLI の state / kill / delete の実契約〔#1903・#1902〕に
+# 合わせてある〔#3123〕。startup_latency.sh 冒頭の「現状の制約」参照）。
 # 呼び出し元は Makefile の `startup-latency-selftest` ターゲットと
 # `.github/workflows/ci.yml` の `bench-regression` ジョブ。
 #
@@ -22,7 +23,18 @@ bash_bin="$(command -v bash)"
 
 failures=0
 tmp_root="$(mktemp -d)"
-trap 'rm -rf "$tmp_root"' EXIT
+# 状態ルートはスクリプトが /tmp/fcsl.* に作る。正常終了では本体が消すが、残存ケースの後始末として
+# スタブが記録した /tmp/fcsl.* のものだけを消す（それ以外のパスは触らない）。
+cleanup_selftest() {
+  local r
+  if [ -r "$tmp_root/work/stub-roots.log" ]; then
+    while IFS= read -r r; do
+      case "$r" in /tmp/fcsl.*) rm -rf -- "$r" ;; *) ;; esac
+    done <"$tmp_root/work/stub-roots.log"
+  fi
+  rm -rf "$tmp_root"
+}
+trap cleanup_selftest EXIT
 
 last_output=""
 last_stdout=""
@@ -143,8 +155,9 @@ cat >>"$stub" <<'STUB'
 #   exec-never: start 後の state が created のまま
 #   exec-late: start 後の state が 0.6 秒かけて created、次に 0.6 秒かけて running を返す
 #              （--timeout 1 では観測の完了が期限を過ぎる）
-#   running-race: start 後は running。実行中の delete を拒否し、kill 後も 2 回は拒否する
-#   never-stops: start 後は running のままで kill も効かない
+#   running-race: start 後は running。実行中の delete を構造化エラー（FAILED_PRECONDITION・exit 5。本物の
+#                CLI と同じ形。#3203）で拒否し、kill 後も 2 回は拒否する
+#   never-stops: start 後は running のままで kill も効かない（delete は同じ構造化エラーで拒否）
 #   cleanup-hang: start 後は running のままで、delete・kill がいずれも応答しない（ハング）
 #   exec-hang-poll: start 後の state が 1.5 秒かけて created を返し、2 回目以降はハングする
 #   exec-after-1s: start 後 1 秒間は state が即座に created を返し、その後 running を返す
@@ -152,8 +165,26 @@ cat >>"$stub" <<'STUB'
 #               子プロセスを起こしてから正常終了する（子の PID を $STUB_STATE/holders に記録）
 #   state-pad: create 後の state が有効な JSON の後に 1.1 MiB の空白を出す（ログ上限で切り詰められる）
 #   holder-long: create が 20 秒残る子プロセスにログを継承させ、delete が常に失敗する
+#   kill-not-running: start 後の state は stopped。delete は 2 回 FAILED_PRECONDITION（5）で拒否し、
+#     kill は実行中でないため FAILED_PRECONDITION（5）を返す
+#   delete-gone-after-timeout: 初回の delete は状態を消した後にハングし、以後の delete・state は NOT_FOUND
+#   create-fail-root-parent: create が失敗し、以後の state は状態ルートの親が無い NOT_FOUND（3）を返す
 #   id-in-use: create 前から同じ ID のコンテナが存在する
 mode="${STUB_MODE:-ok}"
+# CLI のグローバル --root（サブコマンドの前）。絶対パスのディレクトリで、所有者が自分・権限 0700
+# でなければ INVALID_ARGUMENT（終了コード 2）にする（本物の CLI の検査に合わせた回帰検出）。
+if [ "${1:-}" != --root ] || [ "$#" -lt 2 ]; then
+  echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
+  exit 2
+fi
+root="$2"
+shift 2
+case "$root" in /*) ;; *) echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2; exit 2 ;; esac
+if [ ! -d "$root" ] || [ "$(stat -c %a "$root")" != 700 ] || [ ! -O "$root" ]; then
+  echo '{"code":"INVALID_ARGUMENT","message":"invalid argument"}' >&2
+  exit 2
+fi
+echo "$root" >>"$STUB_ROOTS_LOG"
 cmd="$1"
 shift
 case "$cmd" in
@@ -161,6 +192,7 @@ case "$cmd" in
   *) id="$1" ;;
 esac
 echo "$cmd $id" >>"$STUB_LOG"
+if [ -n "${STUB_ARGV0_FILE:-}" ]; then echo "$0" >>"$STUB_ARGV0_FILE"; fi
 if [ "$mode" = log-holder ] && { [ "$cmd" = create ] || [ "$cmd" = start ] || [ "$cmd" = delete ]; }; then
   # stdout / stderr（run_rt が向けたログファイル）を継承したまま残る子プロセス。
   sleep 3 &
@@ -174,14 +206,17 @@ fi
 # create 前の事前確認（不存在応答）は通常経路に任せ、create 後の state だけを切り詰め対象にする。
 # 切り詰め後に残る先頭は単一の有効な state JSON なので、log_truncated を無視すると受理されてしまう。
 if [ "$mode" = state-pad ] && [ "$cmd" = state ] && [ -e "$m.bundle" ]; then
-  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","pid":0,"bundle":"/x"}\n' "$id"
+  printf '{"ociVersion":"1.3.0","id":"%s","status":"stopped","bundle":"/x","annotations":{}}\n' "$id"
   head -c 1153434 /dev/zero | tr '\0' ' '
   exit 0
 fi
 # bundle は create が受け取った --bundle を返す（OCI state の bundle は絶対パス）。
+# CLI の state と同じ形（キーの順・ociVersion・pid は実行中だけ・annotations）にする。
 state_json() {
-  printf '{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":0,"bundle":"%s"}\n' \
-    "$id" "$1" "$(cat "$m.bundle" 2>/dev/null || echo /other)"
+  local pidpart=""
+  [ "$1" = running ] && pidpart='"pid":4242,'
+  printf '{"ociVersion":"1.3.0","id":"%s","status":"%s",%s"bundle":"%s","annotations":{}}\n' \
+    "$id" "$1" "$pidpart" "$(cat "$m.bundle" 2>/dev/null || echo /other)"
 }
 # 不存在エラー。ERR-1 の構造化エラー（code: NOT_FOUND）を出す。create-fail-plain では
 # 自由文だけ（構造化エラーを持たないランタイム相当）。
@@ -189,9 +224,14 @@ not_exist() {
   if [ "$mode" = create-fail-plain ]; then
     echo "time=\"$(date +%s)\" level=error msg=\"container $id does not exist\"" >&2
   else
-    printf '{"code":"NOT_FOUND","message":"container %s does not exist"}\n' "$id" >&2
+    # state は message "container not found"（ERR-1 の 2 フィールド）、他は op 付きの 3 フィールド。
+    if [ "$cmd" = state ]; then
+      echo '{"code":"NOT_FOUND","message":"container not found"}' >&2
+    else
+      printf '{"op":"%s","code":"NOT_FOUND","message":"container state not found"}\n' "$cmd" >&2
+    fi
   fi
-  exit 1
+  exit 3
 }
 if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ] || [ "$mode" = foreign-race ]; then
   case "$cmd" in
@@ -199,7 +239,7 @@ if [ "$mode" = foreign-perm ] || [ "$mode" = foreign-late ] || [ "$mode" = forei
       if [ "$mode" != foreign-perm ] && [ -e "$m.probed" ]; then state_json created; exit 0; fi
       touch "$m.probed"
       if [ "$mode" = foreign-race ]; then
-        printf '{"code":"NOT_FOUND","message":"container %s does not exist"}\n' "$id" >&2
+        printf '{"code":"NOT_FOUND","message":"container not found"}\n' >&2
       else
         echo "stub: open state.json: permission denied" >&2
       fi
@@ -225,7 +265,7 @@ case "$cmd" in
     [ -n "${STUB_CREATE_FIFO:-}" ] && [ ! -e "$STUB_CREATE_FIFO" ] && mkfifo "$STUB_CREATE_FIFO"
     [ "$1" = --bundle ] && printf '%s' "$2" >"$m.bundle"
     case "$mode" in
-      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-slow-state | create-fail-nf-*)
+      create-fail | create-fail-root-parent | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-slow-state | create-fail-nf-*)
         echo "stub: create failed" >&2; exit 1 ;;
       create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
     esac
@@ -249,6 +289,7 @@ case "$cmd" in
     if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
     if [ -e "$m.attempted" ] && [ ! -e "$m.created" ]; then
       [ "$mode" = create-fail-slow-state ] && sleep 1.0
+      [ "$mode" = create-fail-root-parent ] && { echo '{"code":"NOT_FOUND","message":"parent of the state root not found"}' >&2; exit 3; }
       [ "$mode" = create-fail-state-error ] && { echo '{"code":"PERMISSION_DENIED","message":"open state.json: permission denied"}' >&2; exit 1; }
       case "$mode" in
         create-fail-nf-plus-text) printf '{"code":"NOT_FOUND","message":"x"}\nstub: permission denied\n' >&2; exit 1 ;;
@@ -293,20 +334,37 @@ case "$cmd" in
   kill)
     [ -e "$m.created" ] || not_exist
     [ "$mode" = cleanup-hang ] && exec sleep 30
+    if [ "$mode" = kill-not-running ]; then
+      echo '{"op":"kill","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+      exit 5
+    fi
     touch "$m.killed"
     ;;
   delete)
     [ -e "$m.created" ] || not_exist
     case "$mode" in
       cleanup-hang) exec sleep 30 ;;
+      delete-gone-after-timeout)
+        # 状態を消した後にログのロック解放を待ってハングする（CLI の delete の挙動）。
+        rm -f -- "$m".*
+        exec sleep 30
+        ;;
+      kill-not-running)
+        n=$(($(cat "$m.delete-n" 2>/dev/null || echo 0) + 1))
+        echo "$n" >"$m.delete-n"
+        if [ "$n" -le 2 ]; then
+          echo '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is not running"}' >&2
+          exit 5
+        fi
+        ;;
       delete-fail | holder-long | create-fail-delete-fail) echo "stub: delete failed" >&2; exit 1 ;;
-      never-stops) [ -e "$m.started" ] && { echo "stub: cannot delete running container" >&2; exit 1; } ;;
+      never-stops) [ -e "$m.started" ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; } ;;
       running-race)
         if [ -e "$m.started" ]; then
-          [ -e "$m.killed" ] || { echo "stub: cannot delete running container" >&2; exit 1; }
+          [ -e "$m.killed" ] || { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
           n=$(($(cat "$m.delete-after-kill" 2>/dev/null || echo 0) + 1))
           echo "$n" >"$m.delete-after-kill"
-          [ "$n" -le 2 ] && { echo "stub: container is still running" >&2; exit 1; }
+          [ "$n" -le 2 ] && { printf '{"op":"delete","code":"FAILED_PRECONDITION","message":"container is still running"}\n' >&2; exit 5; }
         fi
         ;;
     esac
@@ -320,6 +378,7 @@ exit 0
 STUB
 chmod 755 "$stub"
 export STUB_LOG="$stub_log"
+export STUB_ROOTS_LOG="$work/stub-roots.log"
 export STUB_STATE="$stub_state"
 
 reset_log() {
@@ -514,7 +573,7 @@ expect_rc "input-bundle-symlink" 2 --runtime "$stub" --bundle "$work/bundlelink"
 for v in 0 1001 abc 01 -1; do
   expect_rc "input-iterations-$v" 2 --runtime "$stub" --bundle "$work/bundle" --iterations "$v"
 done
-for v in 0 61; do
+for v in 0 121; do
   expect_rc "input-timeout-$v" 2 --runtime "$stub" --bundle "$work/bundle" --timeout "$v"
 done
 expect_rc "input-warmup-101" 2 --runtime "$stub" --bundle "$work/bundle" --warmup 101
@@ -538,6 +597,68 @@ expect_rc "target-explicit-label" 0 --runtime "$stub" --bundle "$work/bundle" --
 expect_eq "target-explicit-label-value" "runc baseline-1" "$(jq -r '"\(.target) \(.label)"' <<<"$last_stdout")"
 default_args=(--target own)
 expect_rc "help" 0 --help
+expect_contains "help-timeout-range" "--timeout <1-120>"
+
+# --- 項目 3（#3203）: --timeout の上限 120 秒（CLI の start 受信期限 58.9 秒との差を確保）---
+reset_log
+export STUB_MODE=ok
+expect_rc "timeout-max-accepted" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 120
+expect_eq "timeout-max-accepted-param" "120" "$(jq -r '.params.timeout_secs' <<<"$last_stdout")"
+expect_rc "timeout-60-accepted" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 60
+
+# --- 項目 2（#3203）: スタブの実行中 delete 拒否は本物の CLI と同じ構造化エラー（FAILED_PRECONDITION・exit 5）---
+reset_log
+sroot="$work/stub-direct-root"
+mkdir -p "$sroot"
+chmod 700 "$sroot"
+: >"$stub_state/direct-id.created"
+: >"$stub_state/direct-id.started"
+stub_rc=0
+stub_err="$(STUB_MODE=never-stops "$stub" --root "$sroot" delete direct-id 2>&1 >/dev/null)" || stub_rc=$?
+expect_eq "stub-delete-running-rc" "5" "$stub_rc"
+expect_eq "stub-delete-running-code" "FAILED_PRECONDITION" "$(jq -r '.code' <<<"$stub_err")"
+expect_eq "stub-delete-running-op" "delete" "$(jq -r '.op' <<<"$stub_err")"
+expect_eq "stub-delete-running-message" "container is still running" "$(jq -r '.message' <<<"$stub_err")"
+reset_log
+
+# --- 項目 1（#3203）: --runtime の信頼性検査（所有者・権限・symlink・祖先）---
+# 所有者が他 uid の場面は root が無いと作れないため照合しない（実機確認は人間担当）。
+mkdir -p "$work/rt"
+cp "$stub" "$work/rt/gw"
+cp "$stub" "$work/rt/ow"
+chmod 0775 "$work/rt/gw"
+chmod 0757 "$work/rt/ow"
+for case_rt in gw ow; do
+  reset_log
+  expect_rc "runtime-$case_rt-writable" 2 --runtime "$work/rt/$case_rt" --bundle "$work/bundle" --iterations 1 --warmup 0
+  expect_contains "runtime-$case_rt-writable-error" "invalid-runtime"
+  expect_eq "runtime-$case_rt-writable-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
+done
+ln -s "$stub" "$work/rt/link-safe"
+ln -s "$work/rt/gw" "$work/rt/link-unsafe"
+ln -s "$work/rt/nonexistent" "$work/rt/link-dangling"
+reset_log
+argv0_file="$work/argv0.log"
+: >"$argv0_file"
+STUB_ARGV0_FILE="$argv0_file" expect_rc "runtime-symlink-to-safe" 0 --runtime "$work/rt/link-safe" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "runtime-symlink-exec-resolved" "$stub" "$(sort -u "$argv0_file")"
+reset_log
+expect_rc "runtime-symlink-to-unsafe" 2 --runtime "$work/rt/link-unsafe" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "runtime-symlink-to-unsafe-error" "invalid-runtime"
+expect_rc "runtime-dangling-symlink" 2 --runtime "$work/rt/link-dangling" --bundle "$work/bundle" --iterations 1 --warmup 0
+mkdir -p "$work/rt-wdir" "$work/rt-sdir"
+chmod 0777 "$work/rt-wdir"
+chmod 1777 "$work/rt-sdir"
+cp "$stub" "$work/rt-wdir/stub"
+cp "$stub" "$work/rt-sdir/stub"
+chmod 0755 "$work/rt-wdir/stub" "$work/rt-sdir/stub"
+reset_log
+expect_rc "runtime-in-writable-dir" 2 --runtime "$work/rt-wdir/stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_contains "runtime-in-writable-dir-error" "invalid-runtime"
+expect_eq "runtime-in-writable-dir-no-runtime-call" "0" "$(wc -l <"$stub_log" | tr -d ' ')"
+# 祖先の sticky は PLUG-11 と揃えず許可する（理由は startup_latency.sh 冒頭「--runtime の検査」）。
+reset_log
+expect_rc "runtime-in-sticky-dir" 0 --runtime "$work/rt-sdir/stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 
 # --- 6. create / start 失敗 ---
 # create がランタイム自身のエラーで終了し、state が構造化された NOT_FOUND を返せば未作成と
@@ -636,12 +757,14 @@ expect_contains "id-in-use-error" "container-id-in-use"
 expect_eq "id-in-use-untouched" "state" "$(cut -d' ' -f1 "$stub_log" | sort -u | tr '\n' ' ' | sed 's/ $//')"
 reset_log
 STUB_MODE=start-fail expect_rc "start-fail" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_not_contains "start-fail-no-hint" "hint: start was cut off"
 if grep -q '^delete ' "$stub_log"; then pass "start-fail-delete-called"; else fail "start-fail-delete-called"; fi
 
 # --- 7. start ハング（REPAIR-5）: timeout で打ち切り、delete が呼ばれる ---
 reset_log
 started="$SECONDS"
 STUB_MODE=start-hang expect_rc "start-hang" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "start-hang-deadline-hint" "hint: start was cut off"
 elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "start-hang-elapsed (${elapsed}s < 15s)"; else fail "start-hang-elapsed (${elapsed}s)"; fi
 if grep -q '^delete ' "$stub_log"; then pass "start-hang-delete-called"; else fail "start-hang-delete-called"; fi
@@ -814,6 +937,37 @@ STUB_MODE=never-stops expect_rc "never-stops" 4 --runtime "$stub" --bundle "$wor
 elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "never-stops-bounded (${elapsed}s < 15s)"; else fail "never-stops-bounded (${elapsed}s)"; fi
 expect_contains "never-stops-leftover-id" "containers left behind: fandhe-startup-"
+
+# --- 8c. CLI の契約への照合（#3123・CLI-1・CORE-10） ---
+# 状態ルート: 専用の /tmp/fcsl.* を全呼び出しの --root に渡し（スタブが形を検査）、正常終了で消す。
+# 利用者の既定の状態ルートは使わない。出力 JSON にはパスを含めない。
+reset_log
+roots_before="$(wc -l <"$work/stub-roots.log" 2>/dev/null || echo 0)"
+expect_rc "state-root-run" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 2 --warmup 0
+expect_eq "state-root-single-path" "1" "$(tail -n +$((roots_before + 1)) "$work/stub-roots.log" | sort -u | wc -l | tr -d ' ')"
+root_used="$(tail -n +$((roots_before + 1)) "$work/stub-roots.log" | sort -u | head -n 1)"
+case "$root_used" in /tmp/fcsl.*) pass "state-root-under-tmp" ;; *) fail "state-root-under-tmp ($root_used)" ;; esac
+if [ -e "$root_used" ]; then fail "state-root-removed ($root_used)"; else pass "state-root-removed"; fi
+expect_eq "state-root-not-in-output" "false" "$(jq -r --arg p "$root_used" 'tostring | contains($p)' <<<"$last_stdout")"
+# kill が実行中でないコンテナで FAILED_PRECONDITION（5）になっても、後始末は delete の再試行で成功する。
+reset_log
+STUB_MODE=kill-not-running expect_rc "kill-not-running" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
+expect_eq "kill-not-running-sequence" "state create start state delete kill delete delete" \
+  "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
+# delete が状態を消した後に待ちで期限切れになっても、NOT_FOUND と state の不存在で削除済みと確定する。
+reset_log
+started="$SECONDS"
+STUB_MODE=delete-gone-after-timeout expect_rc "delete-gone-after-timeout" 0 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 4
+elapsed=$((SECONDS - started))
+expect_eq "delete-gone-sequence" "state create start state delete kill delete state" \
+  "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
+expect_not_contains "delete-gone-no-leftover" "containers left behind"
+if [ "$elapsed" -lt 12 ]; then pass "delete-gone-bounded (${elapsed}s < 12s)"; else fail "delete-gone-bounded (${elapsed}s)"; fi
+# 状態ルートの親が無い NOT_FOUND はコンテナの不存在ではない。未作成と確定せず残存として exit 4。
+reset_log
+STUB_MODE=create-fail-root-parent expect_rc "root-parent-not-found" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+expect_contains "root-parent-leftover-id" "containers left behind: fandhe-startup-"
+expect_contains "root-parent-kept-root" "state root kept for manual inspection: /tmp/fcsl."
 
 # 後始末の delete・kill がいずれもハングしても、後始末全体を 1 つの期限（--timeout 2 秒）内に
 # 収めて exit 4（Codex P1。REPAIR-5）。期限が呼び出しごとに延びる実装（delete・kill が各
@@ -1136,7 +1290,7 @@ expect_contains "mode-invalid-error" "invalid-mode"
 expect_rc "mode-duplicate" 2 --mode oci --mode docker --runtime "$stub" --bundle "$work/bundle"
 expect_rc "mode-oci-explicit" 0 --mode oci --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0
 expect_eq "oci-mode-field" "oci" "$(jq -r '.mode' <<<"$last_stdout")"
-expect_eq "oci-method-field" "create-to-exec-observed" "$(jq -r '.method' <<<"$last_stdout")"
+expect_eq "oci-method-field" "cli-create-to-exec-observed" "$(jq -r '.method' <<<"$last_stdout")"
 expect_eq "oci-no-image-param" "false" "$(jq -r '.params | has("image")' <<<"$last_stdout")"
 oci_json="$last_stdout"
 
@@ -1158,7 +1312,7 @@ default_args=()
 own_fixture="$work/own-fixture.json"
 docker_fixture="$work/docker-fixture.json"
 cat >"$own_fixture" <<'JSON'
-{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":230000},{"total_us":240000},{"total_us":250000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
+{"schema_version":1,"benchmark":"startup_latency","mode":"oci","method":"cli-create-to-exec-observed","target":"own","label":"own","params":{"iterations":3,"warmup":1,"timeout_secs":10},"samples_us":[{"total_us":230000},{"total_us":240000},{"total_us":250000}],"metrics":{"startup_latency_p50_ms":{"value":240,"unit":"ms"},"startup_latency_min_ms":{"value":230,"unit":"ms"},"startup_latency_max_ms":{"value":250,"unit":"ms"}}}
 JSON
 cat >"$docker_fixture" <<'JSON'
 {"schema_version":1,"benchmark":"startup_latency","mode":"docker","method":"docker-run-rm-total","target":"docker","label":"docker","params":{"iterations":3,"warmup":1,"timeout_secs":10,"image":"alpine:3.20"},"samples_us":[{"run_us":290000,"total_us":290000},{"run_us":300000,"total_us":300000},{"run_us":310000,"total_us":310000}],"metrics":{"startup_latency_p50_ms":{"value":300,"unit":"ms"},"startup_latency_min_ms":{"value":290,"unit":"ms"},"startup_latency_max_ms":{"value":310,"unit":"ms"}}}
@@ -1191,8 +1345,10 @@ expect_rc "report-mode-swapped" 2 --mode report --own-result "$docker_fixture" -
 jq '.method = "docker-run-rm-total"' "$own_fixture" >"$work/bad-method-own.json"
 expect_rc "report-method-forged-same" 2 --mode report --own-result "$work/bad-method-own.json" --docker-result "$docker_fixture"
 expect_contains "report-method-forged-error" "invalid-result"
-jq '.method = "create-to-exec-observed"' "$docker_fixture" >"$work/bad-method-docker.json"
+jq '.method = "cli-create-to-exec-observed"' "$docker_fixture" >"$work/bad-method-docker.json"
 expect_rc "report-method-forged-docker" 2 --mode report --own-result "$own_fixture" --docker-result "$work/bad-method-docker.json"
+jq '.method = "create-to-exec-observed"' "$own_fixture" >"$work/bad-method-legacy.json"
+expect_rc "report-method-legacy-rejected" 2 --mode report --own-result "$work/bad-method-legacy.json" --docker-result "$docker_fixture"
 jq '.method = "other"' "$own_fixture" >"$work/bad-method-other.json"
 expect_rc "report-method-unknown" 2 --mode report --own-result "$work/bad-method-other.json" --docker-result "$docker_fixture"
 # samples_us と整合しない p50・件数不一致・不正なサンプルは拒否する（p50 だけの書き換えを防ぐ）。
@@ -1228,6 +1384,37 @@ expect_rc "report-extra-bundle" 2 --mode report --own-result "$own_fixture" --do
 expect_rc "report-extra-iterations" 2 --mode report --own-result "$own_fixture" --docker-result "$docker_fixture" --iterations 3
 expect_rc "own-result-in-oci-mode" 2 --mode oci --target own --runtime "$stub" --bundle "$work/bundle" --own-result "$own_fixture"
 default_args=(--target own)
+
+# --- 項目 4（#3203）: make の入口（scripts/targets/）が WARMUP・TIMEOUT・OUTPUT を通す ---
+# lib.sh は source 時にリポジトリルートへ移るので、パスはすべて絶対パスで渡す。
+targets_dir="${script_dir}/../targets"
+make_stdout="$work/make-entry.stdout"
+run_make_entry() {
+  local script="$1"
+  last_rc=0
+  "$bash_bin" "${targets_dir}/${script}" >"$make_stdout" 2>"$work/make-entry.stderr" || last_rc=$?
+}
+reset_log
+export STUB_MODE=ok
+make_out="$work/make-out.json"
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 WARMUP=0 TIMEOUT=7 OUTPUT="$make_out" run_make_entry startup-latency.sh
+expect_eq "make-entry-output-rc" "0" "$last_rc"
+expect_eq "make-entry-output-first-line" "bash scripts/bench/startup_latency.sh" "$(head -n 1 "$make_stdout" | cut -d" " -f1-2)"
+expect_eq "make-entry-output-params" "oci 1 0 7" "$(jq -r '"\(.mode) \(.params.iterations) \(.params.warmup) \(.params.timeout_secs)"' "$make_out" 2>/dev/null)"
+reset_log
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 run_make_entry startup-latency.sh
+expect_eq "make-entry-defaults-rc" "0" "$last_rc"
+expect_eq "make-entry-defaults-params" "1 10" "$(tail -n +2 "$make_stdout" | jq -r '"\(.params.warmup) \(.params.timeout_secs)"' 2>/dev/null)"
+RUNTIME="$stub" BUNDLE="$work/bundle" TARGET=own ITERATIONS=1 TIMEOUT=121 run_make_entry startup-latency.sh
+expect_eq "make-entry-timeout-invalid-rc" "2" "$last_rc"
+BUNDLE="$work/bundle" TARGET=own run_make_entry startup-latency.sh
+expect_eq "make-entry-missing-vars-rc" "2" "$last_rc"
+reset_dlog
+export DSTUB_MODE=ok
+make_dout="$work/make-docker-out.json"
+DOCKER="$dstub" ITERATIONS=1 WARMUP=0 TIMEOUT=3 OUTPUT="$make_dout" run_make_entry startup-latency-docker.sh
+expect_eq "make-entry-docker-rc" "0" "$last_rc"
+expect_eq "make-entry-docker-params" "docker 0 3" "$(jq -r '"\(.mode) \(.params.warmup) \(.params.timeout_secs)"' "$make_dout" 2>/dev/null)"
 
 if [ "$failures" -ne 0 ]; then
   echo "startup_latency_selftest: $failures failure(s)" >&2

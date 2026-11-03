@@ -18,7 +18,8 @@
 //! `RegistryClient::fetch_manifest`）。取得した manifest は本文 digest 未検証（突合は未実装）。
 //!
 //! 実装済み: blob のストリーミング取得（TASK-51.4・OCI-1・MS-4・#403。`RegistryClient::fetch_blob`。
-//! サイズ上限・`Content-Length` 検証・CDN リダイレクトの手動追従）。取得した blob は `fetch_blob` 自体では digest 未検証。
+//! サイズ上限・`Content-Length` 検証・CDN リダイレクトの手動追従）。書き込み先は `PullSession::open_staged_blob` が検査済み
+//! root の fd 起点で開いた `StagedBlobWriter` で、パスは受け取らない（#2765）。取得した blob は `fetch_blob` 自体では digest 未検証。
 //!
 //! 実装済み: 取得済み blob の sha256 digest 検証（TASK-52.1・OCI-1・MS-4・#405。`layer::verify_blob_digest`）。
 //! `fetch_blob` への組み込みと manifest 本文の digest 突合は未実装。
@@ -39,7 +40,7 @@
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
 //! 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、変更操作の前に
 //! `AlreadyExists` で拒否する（IO-5）。
-//! 複数レイヤーは `layer::extract::extract_layers` / `extract_layer_blobs` で下位から同一ルートへ重ねて展開する
+//! 複数レイヤーは `layer::extract::extract_layers` / `extract_image_layers` で下位から同一ルートへ重ねて展開する
 //! （TASK-52.4・OCI-1・#410）。
 //! whiteout（`.wh.<name>`）と不透明ディレクトリ（`.wh..wh..opq`）は展開パイプラインへ統合済みで、上位レイヤーが
 //! 下位レイヤーの実体だけを消す（レイヤーごとに収集・適用・展開の 3 パスで、tar 内の並び順に依らない。既存パスは
@@ -63,7 +64,7 @@
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! 実装済み: ローカルイメージ管理の参照テーブルのデータ構造と登録・解除・カウント API（TASK-183.1・OCI-7・MS-4・#472。
-//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image rm`（既定・`--force`・実削除。TASK-183.5/183.6・#480/#481）と `image tag` の API（TASK-183.4・#479）も実装済み。`image prune` の本体（無参照イメージ・レイヤーの回収。TASK-183.7・#476。`image_management::ReferenceTable::execute_image_prune`）も実装済み。 pull のリース登録とステージング書き込み（TASK-183.9・#474。`image_management::PullSession`）も実装済み。pull の公開と失敗時のロールバック（TASK-183.10・#475。`PullSession::publish` / `abort`）も実装済み（cri からの配線は未実装）。クラッシュで残った pull のリース・ステージングの回収 GC（TASK-183.11.2・#852。`ImageStore::recover_stale_pulls`）も実装済み（起動時の配線は未実装）。
+//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image rm`（既定・`--force`・実削除。TASK-183.5/183.6・#480/#481）と `image tag` の API（TASK-183.4・#479）も実装済み。`image prune` の本体（無参照イメージ・レイヤーの回収。TASK-183.7・#476。`image_management::ReferenceTable::execute_image_prune`）も実装済み。 pull のリース登録とステージング書き込み（TASK-183.9・#474。`image_management::PullSession`）も実装済み。pull の公開と失敗時のロールバック（TASK-183.10・#475。`PullSession::publish` / `abort`）も実装済み（cri の `OciImagePuller::pull` から配線済み・#2539）。クラッシュで残った pull のリース・ステージングの回収 GC（TASK-183.11.2・#852。`ImageStore::recover_stale_pulls`）も実装済み（起動時の配線は未実装）。
 //! 永続化・GC・`image rm`/`tag`/`prune` の CLI 経路は未実装。
 //! `sys` は unix の `geteuid(2)` の薄いラッパー（イメージストア root の所有者検査用。OCI-7・SEC-1・#2381）と、Linux の x86_64 / aarch64 限定の fd 起点操作 `at`（#2437）。
 //! PLUG-1 区分は core（crate-naming.md）。
@@ -81,3 +82,9 @@ pub mod registry;
 mod sys;
 mod tls;
 mod whiteout;
+
+// 先に消してから作る試験補助を排他作成へ揃えるための共有部品（自 crate の結合試験の補助を取り込む。
+// REPAIR-12・#3506）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../tests/support/test_root.rs"]
+mod test_root;

@@ -34,6 +34,11 @@
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
 # TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
 # #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
+# #2835 で範囲写像の rootless コンテナへ create・start・exec を本番の入口だけで通す実機前提の結合試験 exec_subordinate_e2e を追加した（依存は不変）。#3291 で bind 先へ別のマウントを重ねた exec の拒否と監査の場面を足した（依存は不変）。
+# #1840 で sys の自前 FFI 宣言と libc の照合試験を追加した（dev-dependencies に workspace の libc =0.2.189。Linux のみ）。
+# #3065 で fandhe-container-net への workspace 内 path 依存（supervisor -> net の一方向。network-wiring.md D5）を追加した（外部クレートの追加なし）。
+# #3198 で netns holder の起動・回収（src/netns_holder.rs）と bin の振り分けを追加した（依存は不変）。
+# #1940 で rootless の pasta 構成の結線（src/pasta_attach.rs。holder → pasta の起動・コンテナの寿命への連動）を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -65,7 +70,11 @@ path = "src/bin/fandhe-container-launcher.rs"
 doc = false
 
 [dependencies]
-fandhe-container-core = { path = "../core" }
+# core の plugin feature を要求しない（PLUG-3・#3204）。supervisor は `fandhe_container_core::plugin`（plugin 境界基盤の再エクスポート）を
+# 使わないため、既定 feature のまま引くと CLI など依存元の実行ファイルで feature 統合により core の `plugin` が再有効化されてしまう
+# （plugin-cri の #2434 と同じ原因）。oci・cri・plugin-cri と同じく default-features = false で引く。
+fandhe-container-core = { path = "../core", default-features = false }
+fandhe-container-net = { path = "../net" }
 
 # exec-test-support: 実機結合試験（tests/exec_setns_join.rs）専用の入口 `exec::identify_pid1_in`（期待 cgroup
 # パスを呼び出し側から受け取る）を公開する。既定のビルドには含めず、記録から期待値を導く `identify_pid1` だけを
@@ -73,7 +82,8 @@ fandhe-container-core = { path = "../core" }
 # （`Pid1Target::open_with_cgroup_path`）を連動して有効にする。
 # worker 機構を任意の `work` で直接呼ぶ `exec::run_in_worker_for_test`（tests/exec_timeout.rs）も同じ feature の下に
 # 置く（TASK-163 追補・#1460）。縮退経路の通しの入口 `exec::run_command` も同じ feature の下に置く（#1617。本番の通しの
-# 入口は `run_command_with_pidfd` だけ）。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
+# 入口は `run_command_with_pidfd` だけ）。2c の期限超過の拒否後の始末を通す `start_entry::run_start_after_options_worker_for_test`
+# （tests/start_entry.rs。#3473）も同じ feature の下に置く。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。
 [features]
 exec-test-support = ["fandhe-container-core/exec-test-support"]
 
@@ -83,6 +93,11 @@ exec-test-support = ["fandhe-container-core/exec-test-support"]
 # 通常のビルド（`cargo build`・リリース成果物）は dev-dependency を解決しないため、feature は無効のまま。
 [dev-dependencies]
 fandhe-container-supervisor = { path = ".", features = ["exec-test-support"] }
+
+# 自前 FFI 宣言と libc のコンパイル時照合（`src/sys/linux.rs` の `libc_abi`。#1840・#1318・MVM-4・REPAIR-12。
+# 方式は docs/design/ffi-libc-check.md）。dev-dependencies のみで製品コードの依存には入れない。sys は Linux 限定。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
 
 # 実 pid1 の 5 種 namespace への setns 参加の結合試験（TASK-163.1・#500・SUP-6）。
 # setns(CLONE_NEWNS) は複数スレッドのプロセスから拒否されるため、単一スレッドの独自 main（harness = false）で動かす。
@@ -233,4 +248,61 @@ harness = false
 [[test]]
 name = "privilege"
 path = "tests/privilege.rs"
+harness = false
+
+# 範囲写像（subordinate ids）の rootless コンテナへ、本番の入口（ProductionLauncher の create → start と
+# `run_command_with_pidfd`）だけで exec を通す実機前提の結合試験（SEC-5・CORE-6・SUP-6・#2835）。setns・fork が単一スレッドの
+# 呼び出し元を要求し、`DelegatedCgroup::prepare` は 1 プロセスで 1 回だけのため、単一スレッドの独自 main（harness = false）で動かす。
+# `FANDHE_CONTAINER_TEST_ID_HELPER=1`・uidmap・subuid / subgid・委譲 cgroup v2・Landlock ABI 6 以上を要し、`-- --ignored` 指定時のみ
+# 実行する（AGENTS.md「実機前提テスト」）。`exec-test-support` の試験専用入口は使わない。
+[[test]]
+name = "exec_subordinate_e2e"
+path = "tests/exec_subordinate_e2e.rs"
+harness = false
+
+# rootless の exec が起動経路（ProductionLauncher の Loopback / Attachable）で作った netns へ参加して通ることを、本番の入口
+# （create → start、run_command_with_pidfd、spawn_netns_holder）だけで照合する実機前提の結合試験（SUP-6・NET-9・CORE-6・#3349。依存は不変）。
+# spawn_netns_holder が自身を再実行するため独自 main（harness = false）で `netns-holder` を振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "exec_launch_netns_rootless"
+path = "tests/exec_launch_netns_rootless.rs"
+harness = false
+
+# 本番 launcher（ProductionLauncher）と実際の pasta を通した rootless の通し確認の実機前提の結合試験（NET-9・NET-3・CORE-1・SUP-2・#3331。依存は不変）。
+# holder と pasta を試験バイナリ自身の再実行で起動するため独自 main（harness = false）で `netns-holder` を振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "pasta_launch_rootless"
+path = "tests/pasta_launch_rootless.rs"
+harness = false
+
+# supervisor の bin の `netns-holder` 振り分けと、holder の起動の失敗・期限・回収の結合試験（NET-9・CORE-1・REPAIR-5・#3198）。
+# 同じ実行ファイルが holder の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
+# root・user namespace 不要で既定のテスト集合で実行する（試験専用の入口は exec-test-support の下。依存は不変）。
+[[test]]
+name = "netns_holder_launch"
+path = "tests/netns_holder_launch.rs"
+harness = false
+
+# holder が実 namespace へ参加し、メモリを継承せず、supervisor の異常終了で消えることの実機前提の結合試験
+# （NET-9・CORE-1・CORE-6・SUP-12・SEC-5・#3198）。非特権 user namespace を要し、`-- --ignored` 指定時のみ実行する
+# （AGENTS.md「実機前提テスト」）。依存は不変。
+[[test]]
+name = "netns_holder_launch_userns"
+path = "tests/netns_holder_launch_userns.rs"
+harness = false
+
+# healthcheck の本番アダプタ `ExecHealthProbe` の結合試験（SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441）。
+# 同じ実行ファイルが helper の代役も兼ねる（`/proc/self/exe` の exec し直し）ため独自 main（harness = false）で動かす。
+# root・namespace 不要で既定のテスト集合で実行する（実コンテナへの exec は行わない。依存は不変）。
+[[test]]
+name = "healthcheck_exec_probe"
+path = "tests/healthcheck_exec_probe.rs"
+harness = false
+
+# 本物の helper（reaper → `run_health_exec_main` → `run_command_with_pidfd_output_notify`）から、rootless コンテナの中で実コマンドを
+# 走らせて stdout / stderr・終了コード・期限切れの停止を照合する実機前提の結合試験（SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441。依存は不変）。
+# reaper・helper を試験バイナリ自身の再実行で起動するため独自 main（harness = false）で振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "healthcheck_exec_real"
+path = "tests/healthcheck_exec_real.rs"
 harness = false

@@ -11,7 +11,9 @@
 //! 報告の復号は契約の型（`StartReport::decode`）に任せ、ここで書式を組まない・割らない（REPAIR-2）。
 //!
 //! # 契約の要点（呼び出し側の責務。詳細は `start_contract` の module doc）
-//! - argv: `start --root <状態ルートの絶対パス> <id>`（`--restart` は渡さず既定の `no`）。`env_clear` の後に渡す環境は
+//! - argv: `start --root <状態ルートの絶対パス> [--audit-policy <best-effort|strict>] [--cri-log-path <絶対パス>] <id>`（`--restart` は渡さず既定の `no`。
+//!   `--audit-policy` は CLI の `start --audit-policy` が指定したときだけ載せ、未指定なら supervisor の既定 best-effort が効く。
+//!   `--cri-log-path` は plugin-cri だけが使う。SEC-4・#2761）。`env_clear` の後に渡す環境は
 //!   許可リストの 2 つだけ: 固定の `PATH` と、`XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。絶対パスを検証する）。
 //!   `DBUS_SESSION_BUS_ADDRESS` は渡さない（sd-bus のアドレスは `unixexec:` 等で任意プログラムの起動や接続先の付け替えができ、
 //!   user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる。`man sd_bus_default` と systemd の
@@ -84,7 +86,7 @@
 //!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告は supervisor のログへ残る。#2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
-//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は fail-closed（#2043）。実機での通し確認
+//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は #2043 で成立（常駐スレッドを止めて監視スレッドで直接 launch）。実機での通し確認
 //!   （委譲 cgroup の準備で拒否されないか）は未実施（#2062。`tests/supervisor_bin_real.rs` は実機前提）。
 //! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
 //!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。
@@ -106,9 +108,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use fandhe_container_core::audit_log::AuditCoveragePolicy;
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
 use fandhe_container_core::plugin_trust::{PluginTrustErrorKind, check_owner_and_mode};
-use fandhe_container_core::traits::{ContainerId, ErrorCode};
+use fandhe_container_core::traits::{ContainerId, ContainerLogPath, ErrorCode};
 
 use crate::launcher::{LAUNCHER_FILE_NAME, SUPERVISOR_FILE_NAME};
 use crate::start_contract::{
@@ -225,13 +228,52 @@ fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
     }
 }
 
+/// `start` の argv に載せる任意の項目（`--audit-policy`・`--cri-log-path`）。
+///
+/// 呼び出し側（CLI の `start`・plugin-cri）が supervisor の契約（`crate::start_contract::StartArgs`）の任意引数を
+/// 渡すための入口。未指定（`None`）の項目は argv に載らず、supervisor の既定が効く。監査の方針は core のライフサイクル要求ではなく
+/// CLI と supervisor の間の契約の値のため、`StartRequest` ではなくここに置く（SEC-4・#2761）。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct StartOptions<'a> {
+    /// CRI ログの書き先（plugin-cri だけが指定する。CRI-2・SUP-4・#2671）。
+    pub cri_log_path: Option<&'a ContainerLogPath>,
+    /// 監査の縮退の扱い（`start --audit-policy`。SEC-4・#2027・#2761）。
+    pub audit_policy: Option<AuditCoveragePolicy>,
+}
+
+impl<'a> StartOptions<'a> {
+    /// すべて未指定の options。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// CRI ログの書き先を設定する。
+    pub fn with_cri_log_path(mut self, path: Option<&'a ContainerLogPath>) -> Self {
+        self.cri_log_path = path;
+        self
+    }
+
+    /// 監査の縮退の扱いを設定する（`None` は argv に載せない）。
+    pub fn with_audit_policy(mut self, policy: Option<AuditCoveragePolicy>) -> Self {
+        self.audit_policy = policy;
+        self
+    }
+}
+
 /// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
 /// プロセスグループは設定しない（直接経路は [`configure`]、ランチャー経路は付けない。#2442）。
-fn configure_common(cmd: &mut Command, root: &Path, id: &ContainerId) {
-    cmd.arg("start")
-        .arg("--root")
-        .arg(root)
-        .arg(id.as_str())
+fn configure_common(cmd: &mut Command, root: &Path, opts: &StartOptions<'_>, id: &ContainerId) {
+    cmd.arg("start").arg("--root").arg(root);
+    // 監査の縮退の扱いは CLI が指定したときだけ載せる（SEC-4・#2761）。固定語彙の `as_str()` を argv の 1 要素として渡す。
+    if let Some(policy) = opts.audit_policy {
+        cmd.arg("--audit-policy").arg(policy.as_str());
+    }
+    // CRI ログの書き先は位置引数（ID）の前に置く（CRI-2・SUP-4・#2671）。値は検証済みの型で、argv の 1 要素として渡す。
+    if let Some(path) = opts.cri_log_path {
+        cmd.arg("--cri-log-path").arg(path.as_str());
+    }
+    cmd.arg(id.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -241,8 +283,8 @@ fn configure_common(cmd: &mut Command, root: &Path, id: &ContainerId) {
 }
 
 /// 直接経路（rootless）の設定: [`configure_common`] に `process_group(0)` を足す。
-fn configure(cmd: &mut Command, root: &Path, id: &ContainerId) {
-    configure_common(cmd, root, id);
+fn configure(cmd: &mut Command, root: &Path, opts: &StartOptions<'_>, id: &ContainerId) {
+    configure_common(cmd, root, opts, id);
     cmd.process_group(0);
 }
 
@@ -475,6 +517,7 @@ fn scoped_command(
     launcher: Option<&Path>,
     supervisor: &Path,
     root: &Path,
+    opts: &StartOptions<'_>,
     id: &ContainerId,
     xdg: &OsStr,
 ) -> Command {
@@ -483,11 +526,11 @@ fn scoped_command(
     match launcher {
         Some(launcher) => {
             cmd.arg(launcher);
-            configure_common(&mut cmd, root, id);
+            configure_common(&mut cmd, root, opts, id);
         }
         None => {
             cmd.arg(supervisor);
-            configure(&mut cmd, root, id);
+            configure(&mut cmd, root, opts, id);
         }
     }
     cmd.env("XDG_RUNTIME_DIR", xdg);
@@ -597,11 +640,43 @@ pub fn start_with(
     id: &ContainerId,
     within: Duration,
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    start_with_cri_log(launch, root, None, id, within)
+}
+
+/// [`start_with`] に CRI ログの書き先（`--cri-log-path`。CRI-2・SUP-4・#2671）を足したもの。`None` は同じ挙動。
+///
+/// 常駐する plugin-cri の StartContainer が、cri が結合・検証した `log_directory/log_path` を渡す。supervisor 側で
+/// 再検証され、特権ランチャー経由（ambient capability あり）では fail-closed で拒否される（`crate::start_entry` の doc）。
+pub fn start_with_cri_log(
+    launch: &SupervisorLaunch,
+    root: &Path,
+    cri_log_path: Option<&ContainerLogPath>,
+    id: &ContainerId,
+    within: Duration,
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    start_with_options(
+        launch,
+        root,
+        &StartOptions::new().with_cri_log_path(cri_log_path),
+        id,
+        within,
+    )
+}
+
+/// [`start_with`] に任意の argv 項目（[`StartOptions`]）を足したもの。CLI の `start --audit-policy`（SEC-4・#2761）が使う。
+pub fn start_with_options(
+    launch: &SupervisorLaunch,
+    root: &Path,
+    opts: &StartOptions<'_>,
+    id: &ContainerId,
+    within: Duration,
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
     let cmd = scoped_command(
         &launch.systemd_run,
         launch.launcher.as_deref(),
         &launch.supervisor,
         root,
+        opts,
         id,
         &launch.xdg_runtime_dir,
     );
@@ -622,20 +697,25 @@ mod tests {
     use std::time::Instant;
 
     /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-    struct TmpDir(PathBuf);
+    struct TmpDir(
+        PathBuf,
+        #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+    );
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir().join(format!("fc-sup-{tag}-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&p).expect("mkdir");
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-sup", std::time::Duration::from_secs(10));
+            let p = scratch.path().join(format!("{tag}-{n}"));
+            std::fs::create_dir(&p).expect("mkdir");
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod");
             }
-            Self(p)
+            Self(p, scratch)
         }
     }
 
@@ -695,7 +775,7 @@ mod tests {
         fn fake(&self, script: &str) -> Command {
             let mut cmd = Command::new("/bin/sh");
             cmd.arg("-c").arg(script).arg("fake-supervisor");
-            configure(&mut cmd, &self.root, &self.id);
+            configure(&mut cmd, &self.root, &StartOptions::new(), &self.id);
             cmd
         }
     }
@@ -842,7 +922,7 @@ mod tests {
     fn err2_cli_spawn_not_installed() {
         let fx = Fixture::new("noexe");
         let mut cmd = Command::new(fx.root.join("no-such-supervisor"));
-        configure(&mut cmd, &fx.root, &fx.id);
+        configure(&mut cmd, &fx.root, &StartOptions::new(), &fx.id);
         let (result, child) = launch_and_receive(cmd, Duration::from_secs(10));
         assert!(child.is_none());
         let e = result.expect_err("not installed");
@@ -880,7 +960,7 @@ mod tests {
     fn sup1_configure_follows_contract() {
         let id = ContainerId::new("c1").expect("id");
         let mut cmd = Command::new("/bin/true");
-        configure(&mut cmd, Path::new("/r"), &id);
+        configure(&mut cmd, Path::new("/r"), &StartOptions::new(), &id);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -946,6 +1026,7 @@ mod tests {
             Some(Path::new("/opt/x/fandhe-container-launcher")),
             Path::new("/opt/x/fandhe-container-supervisor"),
             Path::new("/r"),
+            &StartOptions::new(),
             &id,
             OsStr::new("/run/user/1000"),
         );
@@ -1059,6 +1140,39 @@ mod tests {
         );
     }
 
+    /// CRI-2・SUP-4・#2671: CRI ログの書き先は `--cri-log-path <絶対パス>` として ID の前に載り、直接経路でもランチャー経路でも同じ。
+    #[test]
+    fn cri2_scoped_command_carries_cri_log_path() {
+        let id = ContainerId::new("c1").expect("id");
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("log path");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let cmd = scoped_command(
+                Path::new("/usr/bin/systemd-run"),
+                launcher,
+                Path::new("/opt/x/fandhe-container-supervisor"),
+                Path::new("/r"),
+                &StartOptions::new().with_cri_log_path(Some(&lp)),
+                &id,
+                OsStr::new("/run/user/1000"),
+            );
+            let args: Vec<_> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                args[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--cri-log-path",
+                    "/l/c/0.log",
+                    "c1"
+                ]
+            );
+        }
+    }
+
     /// CORE-3・SUP-1: systemd-run で包んだ argv・環境・cwd は固定（環境は PATH と XDG_RUNTIME_DIR だけ）。
     #[test]
     fn core3_sup1_scoped_command_argv_env_cwd() {
@@ -1068,6 +1182,7 @@ mod tests {
             None,
             Path::new("/opt/x/fandhe-container-supervisor"),
             Path::new("/r"),
+            &StartOptions::new(),
             &id,
             OsStr::new("/run/user/1000"),
         );
@@ -1113,6 +1228,74 @@ mod tests {
             ]
         );
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    /// SEC-4・#2761: `--audit-policy` は `--root` の直後・ID の前に載り、直接経路でもランチャー経路でも同じ。
+    /// 組み立てた argv は契約の復号（`StartArgs::parse`）で元の方針に戻る（REPAIR-12）。
+    #[test]
+    fn sec4_scoped_command_carries_audit_policy() {
+        use crate::start_contract::StartArgs;
+        let id = ContainerId::new("c1").expect("id");
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("log path");
+        for launcher in [None, Some(Path::new("/opt/x/fandhe-container-launcher"))] {
+            let args_of = |opts: &StartOptions<'_>| -> Vec<String> {
+                let cmd = scoped_command(
+                    Path::new("/usr/bin/systemd-run"),
+                    launcher,
+                    Path::new("/opt/x/fandhe-container-supervisor"),
+                    Path::new("/r"),
+                    opts,
+                    &id,
+                    OsStr::new("/run/user/1000"),
+                );
+                cmd.get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect()
+            };
+            let strict = StartOptions::new().with_audit_policy(Some(AuditCoveragePolicy::Strict));
+            let a = args_of(&strict);
+            assert_eq!(
+                a[7..],
+                ["start", "--root", "/r", "--audit-policy", "strict", "c1"]
+            );
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.audit_policy, AuditCoveragePolicy::Strict);
+            let best = StartOptions::new().with_audit_policy(Some(AuditCoveragePolicy::BestEffort));
+            assert_eq!(
+                args_of(&best)[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--audit-policy",
+                    "best-effort",
+                    "c1"
+                ]
+            );
+            assert_eq!(
+                args_of(&StartOptions::new())[7..],
+                ["start", "--root", "/r", "c1"]
+            );
+            let both = strict.with_cri_log_path(Some(&lp));
+            let a = args_of(&both);
+            assert_eq!(
+                a[7..],
+                [
+                    "start",
+                    "--root",
+                    "/r",
+                    "--audit-policy",
+                    "strict",
+                    "--cri-log-path",
+                    "/l/c/0.log",
+                    "c1"
+                ]
+            );
+            let parsed =
+                StartArgs::parse(a[7..].iter().map(std::ffi::OsString::from)).expect("contract");
+            assert_eq!(parsed.audit_policy, AuditCoveragePolicy::Strict);
+        }
     }
 
     /// CLI-1・CORE-3: systemd-run の解決失敗は 2 つの固定文言へ写り、パスを載せない。

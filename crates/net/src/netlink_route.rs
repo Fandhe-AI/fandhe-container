@@ -283,9 +283,9 @@ mod socket {
     use crate::error::{NetError, NetErrorCode};
     use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
     use crate::netlink::{
-        ALIGN_TO, MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_DUMP_INTR, NLM_F_MATCH, NLM_F_REQUEST,
-        NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NLMSG_HEADER_LEN, NLMSG_NOOP, NLMSG_OVERRUN,
-        NlMsgBuilder, NlMsgHeader, NlMsgIter,
+        ALIGN_TO, MAX_MESSAGE_LEN, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MATCH,
+        NLM_F_REQUEST, NLM_F_ROOT, NLMSG_DONE, NLMSG_ERROR, NLMSG_HEADER_LEN, NLMSG_NOOP,
+        NLMSG_OVERRUN, NlMsgBuilder, NlMsgHeader, NlMsgIter,
     };
     use crate::netlink_route::{
         IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, LinkCreate, LinkDelete, LinkSet, RTM_GETLINK,
@@ -655,6 +655,45 @@ mod socket {
             timeout: Duration,
             build: impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError>,
         ) -> Result<NetlinkReply, NetError> {
+            self.exchange(fixed_seq, None, msg_type, flags, timeout, build)
+        }
+
+        /// dump 要求（`NLM_F_DUMP` を足し、`NLMSG_DONE` で終端する往復）を送る（NET-3・#3063）。
+        ///
+        /// [`request_with_seq`](Self::request_with_seq) は rtnetlink の GET（`msg_type & 3 == 2`）しか dump と
+        /// 判定しない（[`is_dump_request`]）。nfnetlink の `GETRULE`（0x0A07）・`GETTABLE`（0x0A01）は
+        /// 当てはまらないため、呼び出し側が dump であると明示する版。nfnetlink の dump は開始に成功すると
+        /// `netlink_dump_start` が `-EINTR` を返し ACK を送らない。付けた `NLM_F_ACK` に対する errno 0 の
+        /// ACK が来ても終端にせず、`NLMSG_DONE` まで読み進める。`NLM_F_DUMP_INTR` は `FailedPrecondition`
+        /// （再試行可能）で返す。seq・期限の扱いは `request_with_seq` と同じ（REPAIR-5）。
+        pub(crate) fn dump_with_seq(
+            &self,
+            fixed_seq: Option<u32>,
+            msg_type: u16,
+            flags: u16,
+            timeout: Duration,
+            build: impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError>,
+        ) -> Result<NetlinkReply, NetError> {
+            self.exchange(
+                fixed_seq,
+                Some(true),
+                msg_type,
+                flags | NLM_F_DUMP,
+                timeout,
+                build,
+            )
+        }
+
+        /// 往復の共通本体。`dump` が `None` なら [`is_dump_request`] で判定し、`Some` なら呼び出し側の指定に従う。
+        fn exchange(
+            &self,
+            fixed_seq: Option<u32>,
+            dump: Option<bool>,
+            msg_type: u16,
+            flags: u16,
+            timeout: Duration,
+            build: impl FnOnce(&mut NlMsgBuilder) -> Result<(), NetError>,
+        ) -> Result<NetlinkReply, NetError> {
             record_net_op(self.recorder.as_ref(), NetOpKind::NetlinkRequest, || {
                 let deadline = Deadline::after(timeout);
                 let _turn = self.gate.acquire(&deadline, timeout)?;
@@ -668,7 +707,7 @@ mod socket {
                     Some(s) => s,
                     None => self.seq.next(),
                 };
-                let dump = is_dump_request(msg_type, flags);
+                let dump = dump.unwrap_or_else(|| is_dump_request(msg_type, flags));
                 let mut builder =
                     NlMsgBuilder::new(msg_type, flags | NLM_F_REQUEST | NLM_F_ACK, seq, 0);
                 build(&mut builder)?;
@@ -694,6 +733,8 @@ mod socket {
         /// として記録する（内側の request / send / recv も個別に記録）。`timeout` は全体の期限
         /// （推奨 5〜10 秒）。`Timeout` / `DataLoss` ではカーネル側で作成済みか不明なため、状態を再照会すること。
         /// 同名が既にあれば `AlreadyExists`、権限不足は `PermissionDenied`。
+        /// `LinkCreate::with_echo` の要求では `reply.messages()` に作成通知（`RTM_NEWLINK`）が入る（v6.2 以降。
+        /// 検証は bridge が `decode_created_link`、veth が `decode_created_veth`。Issue #1972・#3205）。
         pub fn create_link(
             &self,
             req: &LinkCreate,
@@ -1192,6 +1233,8 @@ mod socket {
     /// - カーネルは `NLM_F_ROOT`・`NLM_F_MATCH` のどちらか一方でも dump として扱う（両方揃いを要求すると、
     ///   片方だけの GET で ACK が来ないまま DONE で終わる応答を非 dump として扱い、判定がずれる）
     fn is_dump_request(msg_type: u16, flags: u16) -> bool {
+        // 出典: `include/uapi/linux/rtnetlink.h` の `RTM_BASE`（Linux 7.0.14 の uapi で値を確認。libc 0.2.189 に
+        // 無い。関数内のローカル定数で照合できないため値だけ出典で固定する）。
         const RTM_BASE: u16 = 16;
         msg_type >= RTM_BASE && msg_type & 3 == 2 && flags & (NLM_F_ROOT | NLM_F_MATCH) != 0
     }
@@ -2049,6 +2092,48 @@ mod socket {
             )
             .expect("ok");
             assert_eq!(r.messages().len(), 2);
+        }
+
+        /// NET-3・#3063: nfnetlink の GETTABLE（0x0A01）・GETRULE（0x0A07）は `is_dump_request`（rtnetlink の
+        /// GET 判定）では dump にならない。`dump_with_seq` が明示するため、NEWRULE（0x0A06）の応答の途中に errno 0 の
+        /// ACK が混ざっても完了せず、DONE までの応答を集める。
+        #[test]
+        fn net3_nfnetlink_dump_collects_until_done() {
+            assert!(!is_dump_request(0x0A01, NLM_F_DUMP));
+            assert!(!is_dump_request(0x0A07, NLM_F_DUMP));
+            let items = vec![
+                plain_dgram(0x0A06, 9, b"aaaa"),
+                err_dgram(9, 0, 9),
+                plain_dgram(0x0A06, 9, b"bbbb"),
+                plain_dgram(NLMSG_DONE, 9, &[0u8; 4]),
+            ];
+            let r = await_reply_for(
+                9,
+                true,
+                TEST_LOCAL_PID,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(items),
+            )
+            .expect("ok");
+            assert_eq!(r.messages().len(), 2);
+            assert!(r.messages().iter().all(|m| m.msg_type() == 0x0A06));
+            // 非 dump として扱うと最初のデータグラムの後 ACK で終端し、DONE までは読まない。
+            let items = vec![
+                plain_dgram(0x0A06, 9, b"aaaa"),
+                err_dgram(9, 0, 9),
+                plain_dgram(0x0A06, 9, b"bbbb"),
+            ];
+            let r = await_reply_for(
+                9,
+                false,
+                TEST_LOCAL_PID,
+                &Deadline::after(Duration::from_secs(5)),
+                Duration::from_secs(5),
+                script(items),
+            )
+            .expect("ok");
+            assert_eq!(r.messages().len(), 1);
         }
 
         /// NET-11: ACK と同じデータグラムで ACK の後ろに同じ seq の応答があれば、送出順に反するため DataLoss。

@@ -19,11 +19,23 @@
 //! `PermissionDenied`（段は `QueryDeviceProgram`）の `Err` に写す。したがって `Rootless` が `Ok` を返したことは、
 //! `bpf(2)` を呼んでいない（呼んでいれば同じ `EPERM` が `Err` になる）ことを意味する。
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use fandhe_container_core::cgroups::{
-        CgroupName, CgroupStep, DelegatedCgroup, DevicePolicyMode, DevicePolicyNotApplied,
-        DevicePolicyOutcome,
+        CgroupName, CgroupStep, DevicePolicyMode, DevicePolicyNotApplied, DevicePolicyOutcome,
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::traits::{ContainerId, ErrorCode};
@@ -47,7 +59,7 @@ mod linux {
     #[ignore = "requires a non-root user with a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
     fn sec1_task32_apply_default_device_policy_rootless_is_not_applied() {
         assert_ne!(euid(), 0, "this test must run as a non-root user");
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let id = ContainerId::new(format!("dp{}", std::process::id())).unwrap();
         let name = CgroupName::new(&id).unwrap();
         let (child, _proof) = delegated.prepare(&name).expect("prepare");

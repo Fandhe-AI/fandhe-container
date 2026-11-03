@@ -53,6 +53,13 @@ tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
 fandhe-container-cri = { path = "../cri" }
 
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1843・#1318・#1837・REPAIR-12）。
+# 承認: #1318 のオーナー判断 2026-10-12（版は workspace の =0.2.189 のまま・用途は照合の試験に限る）。
+# 製品の依存には入れない（`cargo tree -e normal,build` に現れない。外部の plugin の作者の依存グラフも変えない）。
+# 方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 [[test]]
 name = "grpc_basic"
 required-features = ["grpc"]

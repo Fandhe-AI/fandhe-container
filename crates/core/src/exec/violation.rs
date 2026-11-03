@@ -20,10 +20,11 @@
 //! `path_symlink_or_not_directory`・`path_missing`）から監査イベントへの写像は [`ViolationReason::exec_worker_audit_event`]
 //! （`exec_target` は `ExecTarget`、他の 3 理由は `mount_audit_event` と同じ `Mount` のパスなし・理由コードつき。#1614 の事後監査・#1702）。
 //! ファイルへの永続化（TASK-41.5.1・#839）とカーネル監査フォールバック（#840）も `audit_log` に実装済みで、
-//! 本モジュールの記録を実際の sink へ流す本番経路（launcher・CLI への配線）は未実装
-//! （REPAIR-3: 実装済みを装わない）。launch 経路の pivot 前段の失敗は、子が状態 pipe で理由を親へ返し親が
+//! 本モジュールの記録を実際の sink へ流す本番経路は配線済み（CLI の create / start・delete は
+//! `FileAuditSink::in_state_store`、本番 launcher `oci_runtime::ProductionLauncher` は `audit_sink`・`rejection_audit_sink`、
+//! supervisor の exec は `default_audit_sink`。SEC-4・REPAIR-3）。launch 経路の pivot 前段の失敗は、子が状態 pipe で理由を親へ返し親が
 //! `exec::record_launch_mount_rejection` で記録する入口まで実装済み（`exec/launch_status.rs`。#1815）で、
-//! 本番 launcher からの呼び出しは未実装（Phase B）。
+//! 本番 launcher（`oci_runtime::ProductionLauncher`）からの呼び出しは実装済み（#1816・#2130）。
 //!
 //! # 違反とシステムエラーの区別
 //!
@@ -96,6 +97,10 @@ pub enum ViolationKind {
     /// （古いカーネル・LSM）と rootfs の内容起因を親が区別できないため、違反の試行として記録する
     /// （SEC-4・SEC-2・TASK-41 追補・#2013）。
     ProtectedPathApply,
+    /// entrypoint の exec 直前の同期点で、子が自分の network namespace として渡した fd の素性（dev, ino）が
+    /// モードの期待と食い違う、または受け渡しの形式が壊れている（NET-6・SEC-1・SEC-4・#3206。
+    /// `docs/design/network-wiring.md` D8）。
+    NetnsIdentity,
 }
 
 impl ViolationKind {
@@ -111,6 +116,7 @@ impl ViolationKind {
             Self::Entrypoint => "entrypoint",
             Self::ExecTarget => "exec_target",
             Self::ProtectedPathApply => "protected_path_apply",
+            Self::NetnsIdentity => "netns_identity",
         }
     }
 }
@@ -198,6 +204,9 @@ pub enum ViolationReason {
     /// Landlock の適用時に、Mount 由来のルールの対象がマウントのルートでない（マウントの内側のディレクトリを
     /// 指している。CORE-5・SEC-1・SEC-4・#2071）。
     LandlockMountNotRoot,
+    /// Landlock の適用時に、祖先の書き込み権を VFS の読み取り専用属性で打ち消すはずのルール（検証済みの `ro` の bind）の
+    /// 対象のマウントが、実際には読み取り専用でない（CORE-5・SEC-1・SEC-4・#1917）。
+    LandlockMountNotReadOnly,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -289,6 +298,12 @@ pub enum ViolationReason {
     /// ホスト `/sys` の ro rbind・配下に rw のマウントが残る等の事後条件違反。対象の検査〔symlink・shared〕の
     /// 拒否は含まない。SEC-2・SEC-4・OCI-4・#2020）。
     SysfsApplyFailed,
+    /// 子が渡した network namespace の素性が期待と食い違う(`network_mode=host` なのに supervisor の netns と
+    /// 異なる、`loopback` なのに supervisor の netns と同じ。NET-6・SEC-1・SEC-4・#3206)。
+    NetnsIdentityMismatch,
+    /// 子の netns の受け渡しが形式違反(fd の本数・切り詰め・送信元 pid・close-on-exec・nsfs でない・netns でない・
+    /// 本文。NET-6・SEC-1・SEC-4・#3206)。
+    NetnsHandoffInvalid,
 }
 
 impl ViolationReason {
@@ -371,10 +386,14 @@ impl ViolationReason {
     /// [`Self::EXEC_TARGET_REASONS`] の 10 理由と、`prepare_exec_restrictions` の `reject_own_root` が返す
     /// 種別 `rootfs_pivot` の `rootfs_is_host_root`（worker 自身の `/` が bundle の rootfs と同じディレクトリ）、
     /// bundle の rootfs の固定（`oci_runtime::RootfsDir::pin`）が検証後の差し替えで拒否する種別 `mount_target` の
-    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）から成る。
+    /// `path_symlink_or_not_directory`・`path_missing`（`RootfsPinError` が運ぶ。#1702）、Landlock の再適用が
+    /// `NotRecorded` でも行う読み取り専用属性の照合の拒否（種別 `mount_target` の `landlock_mount_not_read_only`。
+    /// `ro` の bind の属性が失われた・観測できない場合。CORE-5・SEC-1・SEC-4・#1917）と、再適用が `state.json` の識別子で行う
+    /// 照合の拒否（種別 `mount_target` の `landlock_mount_identity_mismatch`・`landlock_mount_not_root`。重ねられた・
+    /// 入れ替わったマウント。SEC-1・SEC-4・#3201）から成る。
     /// 一覧と worker の経路のソースが作る理由の一致は `exec/violation_scan.rs` の単体テストが固定する。
     /// exec の子が `execve` 前に報告する違反（種別 `entrypoint`）は `ok` 行の `SetupFailed` で運ばれるためここに含めない。
-    pub const EXEC_WORKER_REASONS: [ViolationReason; 13] = [
+    pub const EXEC_WORKER_REASONS: [ViolationReason; 16] = [
         Self::ExecTargetNotNestedPid1,
         Self::ExecTargetCgroupMismatch,
         Self::ExecTargetSharesPidNamespace,
@@ -388,6 +407,9 @@ impl ViolationReason {
         Self::RootfsIsHostRoot,
         Self::PathSymlinkOrNotDirectory,
         Self::PathMissing,
+        Self::LandlockMountNotReadOnly,
+        Self::LandlockMountIdentityMismatch,
+        Self::LandlockMountNotRoot,
     ];
 
     /// worker の結果行の種別名 `kind` と理由コード `reason` から理由を引き直す（許可リスト照合。SEC-4・SUP-6）。
@@ -424,7 +446,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 64] = [
+    pub(super) const ALL: [ViolationReason; 67] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -462,6 +484,7 @@ impl ViolationReason {
         Self::BindTargetKindMismatch,
         Self::LandlockMountIdentityMismatch,
         Self::LandlockMountNotRoot,
+        Self::LandlockMountNotReadOnly,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -489,6 +512,8 @@ impl ViolationReason {
         Self::ReadonlyPathApplyFailed,
         Self::MaskedPathApplyFailed,
         Self::SysfsApplyFailed,
+        Self::NetnsIdentityMismatch,
+        Self::NetnsHandoffInvalid,
     ];
 
     /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
@@ -523,7 +548,9 @@ impl ViolationReason {
         if let Some(event) = self.mount_layer_audit_event(None) {
             return Some(event);
         }
-        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self) {
+        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self)
+            || self.kind() == ViolationKind::NetnsIdentity
+        {
             return Some(AuditEvent::Mount {
                 path: None,
                 reason: Some(AuditReason::new(self.as_str())),
@@ -537,6 +564,35 @@ impl ViolationReason {
     /// 組のときだけ追加で受ける。理由の集合の唯一の定義。
     pub(super) const MOUNT_BINDS_USER_NAMESPACE_REASONS: [Self; 2] =
         [Self::UserNamespaceRequired, Self::HostRootIdentityMapping];
+
+    /// launch の Landlock 段（`ExecPhaseStep::Landlock`）が `E` 行で運ぶ、Mount 由来のルールの照合の違反の 3 理由
+    /// （SEC-1・SEC-4・CORE-5・#2130）。種別は `MountTarget` だが、他の段では受けないため
+    /// [`Self::from_launch_token`] には入れず、`launch_status` が段 `landlock` と組のときだけ引き直す。
+    /// 理由の集合の唯一の定義（`from_landlock_apply_kind` の分岐との一致は単体テストが固定する）。
+    pub(super) const LANDLOCK_APPLY_REASONS: [Self; 3] = [
+        Self::LandlockMountIdentityMismatch,
+        Self::LandlockMountNotRoot,
+        Self::LandlockMountNotReadOnly,
+    ];
+
+    /// launch の Landlock 段の `E` 行の理由コード `token` から理由を引き直す（許可リスト照合。untrusted な子の入力）。
+    pub(super) fn from_landlock_apply_token(token: &str) -> Option<Self> {
+        Self::LANDLOCK_APPLY_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == token)
+    }
+
+    /// launcher の `plan()` が拒否した理由（種別 `PlanRejected`）を、launch 経路で記録する `Mount` 監査イベントへ
+    /// 写す（パスなし・理由コードつき。SEC-4・SEC-1・#2130）。他の種別は `None`。
+    ///
+    /// [`Self::mount_layer_audit_event`] は `PlanRejected` を記録しない（#2109 の判断。exec の worker の経路が
+    /// 共有するため広げない）。launch の計画の拒否は launcher が親として直接記録するので、専用の写像に分ける。
+    pub(super) fn launch_plan_audit_event(self) -> Option<AuditEvent> {
+        (self.kind() == ViolationKind::PlanRejected).then(|| AuditEvent::Mount {
+            path: None,
+            reason: Some(AuditReason::new(self.as_str())),
+        })
+    }
 
     /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
     /// `Mount` 監査イベントを返す。それ以外の種別は `None`（#1701）。
@@ -556,15 +612,18 @@ impl ViolationReason {
             | ViolationKind::EstablishPrecondition
             | ViolationKind::EvidenceMismatch
             | ViolationKind::Entrypoint
-            | ViolationKind::ExecTarget => None,
+            | ViolationKind::ExecTarget
+            | ViolationKind::NetnsIdentity => None,
         }
     }
 
     /// Landlock 適用の失敗の種別から、対応する違反理由を引く（Mount 由来のルールの識別子の照合の違反だけ。
     /// 他は分離違反の試行ではないため `None`。CORE-5・SEC-4・#2071）。
     ///
-    /// launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の再適用（worker の経路）は `NotRecorded` で
-    /// 照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    /// 3 理由とも launch 経路と、exec の再適用（worker の経路。#3201 で `MountCheck::Recorded` になった）の両方で生じ、
+    /// `EXEC_WORKER_REASONS` に含める。`exec/landlock.rs` の `from_landlock_apply` は走査（`violation_scan`）が字面で
+    /// 拾えるよう明示の腕で同じ対応を持つ。本関数はその対応と一覧の一致を試験で固定するために置く。
+    #[cfg(test)]
     pub(super) fn from_landlock_apply_kind(
         kind: &crate::landlock::LandlockApplyErrorKind,
     ) -> Option<Self> {
@@ -572,6 +631,7 @@ impl ViolationReason {
         match kind {
             K::MountIdentityMismatch { .. } => Some(Self::LandlockMountIdentityMismatch),
             K::MountNotRoot { .. } => Some(Self::LandlockMountNotRoot),
+            K::MountNotReadOnly { .. } => Some(Self::LandlockMountNotReadOnly),
             _ => None,
         }
     }
@@ -616,6 +676,7 @@ impl ViolationReason {
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
             Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
             Self::LandlockMountNotRoot => "landlock_mount_not_root",
+            Self::LandlockMountNotReadOnly => "landlock_mount_not_read_only",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -645,6 +706,8 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed => "readonly_path_apply_failed",
             Self::MaskedPathApplyFailed => "masked_path_apply_failed",
             Self::SysfsApplyFailed => "sysfs_apply_failed",
+            Self::NetnsIdentityMismatch => "netns_identity_mismatch",
+            Self::NetnsHandoffInvalid => "netns_handoff_invalid",
         }
     }
 
@@ -687,6 +750,7 @@ impl ViolationReason {
             | Self::BindTargetKindMismatch
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -716,6 +780,7 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => ViolationKind::ProtectedPathApply,
+            Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => ViolationKind::NetnsIdentity,
         }
     }
 
@@ -745,10 +810,13 @@ impl ViolationReason {
             | Self::BindSourceReachesStateRoot
             | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
-            Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
+            Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly => "CORE-5",
             Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
             | Self::SysfsApplyFailed => "SEC-2",
+            Self::NetnsIdentityMismatch | Self::NetnsHandoffInvalid => "NET-6",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -801,6 +869,7 @@ impl ViolationReason {
             | Self::HostDeviceNodeUnexpected
             | Self::LandlockMountIdentityMismatch
             | Self::LandlockMountNotRoot
+            | Self::LandlockMountNotReadOnly
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -820,7 +889,9 @@ impl ViolationReason {
             | Self::EntrypointCopySealUnverified
             | Self::ReadonlyPathApplyFailed
             | Self::MaskedPathApplyFailed
-            | Self::SysfsApplyFailed => ErrorCode::FailedPrecondition,
+            | Self::SysfsApplyFailed
+            | Self::NetnsIdentityMismatch
+            | Self::NetnsHandoffInvalid => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -839,6 +910,7 @@ impl ViolationReason {
             ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
             ViolationKind::Entrypoint => IsolationStage::Exec,
             ViolationKind::ExecTarget => IsolationStage::SetNs,
+            ViolationKind::NetnsIdentity => IsolationStage::NetnsVerify,
             ViolationKind::ProtectedPathApply => match self {
                 Self::MaskedPathApplyFailed => IsolationStage::MountMaskedPaths,
                 Self::SysfsApplyFailed => IsolationStage::MountSysfs,
@@ -934,6 +1006,9 @@ impl ViolationReason {
                 "the mount identity of a landlock rule target differs from the one recorded after mounting"
             }
             Self::LandlockMountNotRoot => "the landlock rule target is not the root of its mount",
+            Self::LandlockMountNotReadOnly => {
+                "the landlock rule target relies on a read-only mount but the mount is writable"
+            }
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }
@@ -1004,6 +1079,12 @@ impl ViolationReason {
             Self::ReadonlyPathApplyFailed => "failed to apply a read-only path protection",
             Self::MaskedPathApplyFailed => "failed to apply a masked path protection",
             Self::SysfsApplyFailed => "failed to apply the read-only sysfs mount",
+            Self::NetnsIdentityMismatch => {
+                "the network namespace of the container init does not match the requested network mode"
+            }
+            Self::NetnsHandoffInvalid => {
+                "the network namespace handoff from the container init was malformed"
+            }
         }
     }
 }
@@ -1059,8 +1140,8 @@ impl ViolationSubject {
 ///
 /// `ExecError::violation` から取り出す。生成は `crate::exec` の拒否経路のみ。
 ///
-/// - **記録の経路のみ**: ファイルへの永続化は `audit_log` に実装済みだが、本番経路への sink の
-///   配線は未実装（REPAIR-3）。呼び出し側は受け取った記録を必要に応じて自分で扱う
+/// - **記録の型のみ**: 永続化は `audit_log` が担い、本番経路（CLI・本番 launcher・supervisor の exec）への
+///   sink の配線は実装済み（SEC-4・REPAIR-3）。個別の呼び出し側は受け取った記録を必要に応じて自分で扱う
 /// - **違反**（構成・呼び出し文脈・パスが分離の前提を満たさず fail-closed で拒否したもの）
 ///   にだけ付く。**システムエラー**（syscall 失敗・procfs の読み取り失敗・mountinfo の書式
 ///   不正・権限不足）と hostname の書式エラーには付かない
@@ -1122,19 +1203,67 @@ impl IsolationViolation {
     }
 }
 
-/// [`ViolationReason::from_landlock_apply_kind`] の自由関数版（`exec/landlock.rs` が呼ぶ入口）。
-///
-/// worker の経路のソース走査（`violation_scan`）は `ViolationReason::<名前>` の字面を数えるため、launch 経路でだけ
-/// 生じる本理由の引き直しは自由関数を経由する（exec の再適用は `NotRecorded` でこの違反を作らない。#2071）。
-pub(super) fn landlock_apply_violation(
-    kind: &crate::landlock::LandlockApplyErrorKind,
-) -> Option<ViolationReason> {
-    ViolationReason::from_landlock_apply_kind(kind)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-4・CORE-5・#2130: Landlock 段の 3 理由の一覧は `from_landlock_apply_kind` の分岐と一致し、トークンから
+    /// 引き直せる。種別は `MountTarget` で、他の種別・未知のトークンは引き直さない。
+    #[test]
+    fn sec4_2130_landlock_apply_reasons_match_kind_mapping() {
+        use crate::landlock::LandlockApplyErrorKind as K;
+        let kinds = [
+            K::MountIdentityMismatch { index: 0 },
+            K::MountNotRoot { index: 0 },
+            K::MountNotReadOnly { index: 0 },
+        ];
+        let mapped: Vec<ViolationReason> = kinds
+            .iter()
+            .filter_map(ViolationReason::from_landlock_apply_kind)
+            .collect();
+        assert_eq!(mapped, ViolationReason::LANDLOCK_APPLY_REASONS.to_vec());
+        for r in ViolationReason::LANDLOCK_APPLY_REASONS {
+            assert_eq!(r.kind(), ViolationKind::MountTarget);
+            assert_eq!(
+                ViolationReason::from_landlock_apply_token(r.as_str()),
+                Some(r)
+            );
+        }
+        assert_eq!(
+            ViolationReason::from_landlock_apply_token("no_namespaces"),
+            None
+        );
+        assert_eq!(
+            ViolationReason::from_landlock_apply_token("entrypoint_is_runtime_binary"),
+            None
+        );
+        assert_eq!(ViolationReason::from_landlock_apply_token(""), None);
+    }
+
+    /// SEC-4・#2130: 計画の拒否(`PlanRejected`)だけが launch 専用の写像で `Mount`(パスなし・理由つき)になる。
+    /// 共有の写像(`launch_mount_audit_event` の `plan_rejected` の扱い)は変わらない(#2109 の判断)。
+    #[test]
+    fn sec4_2130_launch_plan_audit_event_maps_only_plan_rejected() {
+        for r in ViolationReason::ALL {
+            let ev = r.launch_plan_audit_event();
+            if r.kind() == ViolationKind::PlanRejected {
+                assert_eq!(
+                    ev,
+                    Some(AuditEvent::Mount {
+                        path: None,
+                        reason: Some(AuditReason::new(r.as_str())),
+                    }),
+                    "{r:?}"
+                );
+            } else {
+                assert_eq!(ev, None, "{r:?}");
+            }
+        }
+        assert_eq!(
+            ViolationReason::NoNamespaces.mount_layer_audit_event(None),
+            None
+        );
+    }
 
     /// `ALL` は `as_str` の全分岐を網羅する（足し忘れの検出。SEC-4・#1815）。
     #[test]
@@ -1215,7 +1344,8 @@ mod tests {
                 ViolationKind::PlanRejected
                 | ViolationKind::Entrypoint
                 | ViolationKind::ExecTarget
-                | ViolationKind::ProtectedPathApply => false,
+                | ViolationKind::ProtectedPathApply
+                | ViolationKind::NetnsIdentity => false,
             };
             let expected = accepted.then_some(r);
             assert_eq!(ViolationReason::from_launch_token(r.as_str()), expected);
@@ -1747,11 +1877,11 @@ mod tests {
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 16 理由は `<種別>/<理由>` で往復でき、層は exec_target か mount の
     /// どちらか 1 つだけ（パスなし）。一覧外・種別の食い違い・未知は引けず、監査イベントも作らない。
     #[test]
     fn sec4_sup6_exec_worker_token_allowlist_maps_each_reason_to_one_layer() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 16);
         for r in ViolationReason::EXEC_TARGET_REASONS {
             assert!(ViolationReason::EXEC_WORKER_REASONS.contains(&r), "{r:?}");
         }
@@ -1903,7 +2033,7 @@ mod tests {
         }
     }
 
-    /// SEC-4・SUP-6・SEC-1: worker の経路の 13 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
+    /// SEC-4・SUP-6・SEC-1: worker の経路の 16 理由はそれぞれ 1 件だけ記録される（exec 対象は層 exec_target と理由
     /// コード、`rootfs_is_host_root` と rootfs の固定の 2 理由〔#1702〕は層 mount で理由コードつき。どちらもパスなし）。一覧外は 0 件、失敗でも error は不変。
     #[test]
     fn sec4_sup6_record_exec_worker_rejection_records_once_per_reason() {
@@ -1946,6 +2076,55 @@ mod tests {
             assert_eq!(out.delivery, AuditDelivery::NotApplicable, "{r:?}");
             assert_eq!(sink.snapshot().len(), 0);
         }
+    }
+
+    /// SEC-4・ERR-4・SUP-6・#3294: 段つきの版は worker の 16 理由すべてで記録の `stage` に段を載せ、`None` では載せない。
+    /// 一覧外の理由は段があっても 0 件。記録の JSON 行の末尾は `"container_id":...,"stage":"set_ns"}` になる。
+    #[test]
+    fn sec4_err4_record_exec_worker_rejection_at_carries_stage() {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, encode_json_line};
+        use crate::exec::record_exec_worker_rejection_at;
+        use crate::traits::ContainerId;
+
+        let id = ContainerId::new("c1").unwrap();
+        for r in ViolationReason::EXEC_WORKER_REASONS {
+            let sink = VecSink::new(false);
+            let out = record_exec_worker_rejection_at(
+                "rejected",
+                r,
+                Some(IsolationStage::SetNs),
+                Some(&id),
+                &sink,
+            );
+            assert_eq!(out.delivery, AuditDelivery::Recorded, "{r:?}");
+            assert_eq!(out.error, "rejected");
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{r:?}");
+            assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("set_ns"), "{r:?}");
+            let line = String::from_utf8(encode_json_line(&recs[0]).unwrap()).unwrap();
+            assert!(
+                line.ends_with(&format!(
+                    "\"reason\":\"{}\",\"container_id\":\"c1\",\"stage\":\"set_ns\"}}\n",
+                    r.as_str()
+                )),
+                "{line}"
+            );
+
+            let sink = VecSink::new(false);
+            record_exec_worker_rejection_at("rejected", r, None, Some(&id), &sink);
+            assert_eq!(sink.snapshot()[0].stage(), None, "{r:?}");
+        }
+        let sink = VecSink::new(false);
+        let out = record_exec_worker_rejection_at(
+            "x",
+            ViolationReason::RootfsMoved,
+            Some(IsolationStage::SetNs),
+            None,
+            &sink,
+        );
+        assert_eq!(out.delivery, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 
     /// SEC-4・SUP-6・TASK-163 追補・#1595: ExecError 入口は種別 Entrypoint のときだけ 1 件記録する。

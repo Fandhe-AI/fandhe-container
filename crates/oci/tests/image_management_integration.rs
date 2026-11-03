@@ -367,8 +367,9 @@ fn oci7_scenario_tag_move_then_prune_and_rm() {
 /// ステージングへ書いて sha256 を検証し、digest を返す。
 fn stage(s: &mut PullSession<'_>, data: &[u8]) -> Digest {
     let dg = sha_of(data);
-    let path = s.staged_blob_path(&dg).expect("path");
-    fs::write(path, data).expect("write");
+    let mut w = s.open_staged_blob(&dg).expect("writer");
+    std::io::Write::write_all(&mut w, data).expect("write");
+    w.commit().expect("commit");
     s.verify_staged_blob(&dg, 1024).expect("verify");
     dg
 }

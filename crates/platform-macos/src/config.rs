@@ -214,6 +214,9 @@ pub enum ConfigError {
     /// ゲスト試験モード（virtiofs-io）が指定されたが、プローブ用の共有（tag `fandhe-io`・RW・
     /// ゲスト mount `/mnt/fandhe/io`）が無い（fail-closed。#1876）。
     GuestTestRequiresProbeShare,
+    /// ゲスト試験モード（virtiofs-link）が指定されたが、観測用の共有（tag `ro`・RO・ゲスト mount
+    /// `/mnt/fandhe/ro` と tag `rw`・RW・ゲスト mount `/mnt/fandhe/rw`）が揃っていない（fail-closed。#1877）。
+    GuestTestRequiresLinkShares,
     /// virtiofs 共有数が上限を超えた。
     TooManyVirtiofsShares { count: usize, max: usize },
     /// 共有ディレクトリがディレクトリでない。
@@ -328,6 +331,7 @@ impl ConfigError {
             ConfigError::GuestMountRequiresConsoleArg => "config.guest_mount_requires_console_arg",
             ConfigError::CommandLineReservedKey { .. } => "config.command_line_reserved_key",
             ConfigError::GuestTestRequiresProbeShare => "config.guest_test_requires_probe_share",
+            ConfigError::GuestTestRequiresLinkShares => "config.guest_test_requires_link_shares",
             ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
             ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
             ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
@@ -532,6 +536,10 @@ impl ConfigError {
             }
             ConfigError::GuestTestRequiresProbeShare => {
                 "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
+                    .to_string()
+            }
+            ConfigError::GuestTestRequiresLinkShares => {
+                "guest test mode virtiofs-link requires a read-only 'ro' share mounted at /mnt/fandhe/ro and a read-write 'rw' share mounted at /mnt/fandhe/rw"
                     .to_string()
             }
             ConfigError::DuplicateVirtiofsTag { tag } => {
@@ -1749,6 +1757,13 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
 /// `mountinfo`（`/proc/self/mountinfo` の内容）上で、`dir` の真の配下にあるマウントポイントを返す
 /// （OS 呼び出しを含まない純粋関数）。`dir` 自身がマウントポイントなのは対象外。比較は要素単位
 /// （`/x/share2` を `/x/share` の配下と誤判定しない）。欄が欠けた行は読み飛ばす。
+///
+/// 点検（#2908・SEC-1・IO-5・MAC-1。core の #2853 と同じ観点）: パス文字列で行を選ぶが、結果は「拒否」にだけ使う。
+/// `dir` は実体パスへ正規化済みで、mountinfo のマウントポイントもカーネルの実体パスなので、到達できる配下の
+/// マウントは必ず前方一致に入り、見逃し（誤受理）は起きない。祖先の overmount で隠れた行や、同じパスに積まれた
+/// マウントの下の行も数えるため、結果は誤拒否側（fail-closed）に倒れる。残余は、共有の祖先が overmount されて
+/// いる場合の誤拒否（可用性のみ・受け入れる）。実行されるのは Linux の CI・開発環境だけで、macOS の本番経路は
+/// この関数を通らず、`sys::mount_identity`（`statfs`）と `st_dev` の比較で走査中の各ディレクトリを実体照合する。
 #[cfg(target_os = "linux")]
 fn mount_point_under(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
@@ -2342,16 +2357,12 @@ impl VmConfigSpec {
         crate::guest_mount::reject_reserved_keys(self.cmdline.as_str())?;
         let mut tokens = crate::guest_mount::encode_directives(&self.shares);
         if let Some(mode) = self.guest_test {
-            // 試験モードはプローブ用の共有が実在するときだけ許す（ゲストも mount 成功を AND 条件にする）。
-            let has_probe_share = self.shares.shares().iter().any(|s| {
-                s.tag.as_str() == crate::guest_probe::SHARE_TAG
-                    && !s.access.is_read_only()
-                    && s.guest_mount
-                        .as_ref()
-                        .is_some_and(|m| m.as_str() == crate::guest_probe::GUEST_MOUNT)
-            });
-            if !has_probe_share {
-                return Err(ConfigError::GuestTestRequiresProbeShare);
+            // 試験モードは必要な共有が実在するときだけ許す（ゲストも mount 成功を AND 条件にする）。
+            if !self.guest_test_shares_present(mode) {
+                return Err(match mode {
+                    GuestTestMode::VirtiofsLink => ConfigError::GuestTestRequiresLinkShares,
+                    _ => ConfigError::GuestTestRequiresProbeShare,
+                });
             }
             if !tokens.is_empty() {
                 tokens.push(' ');
@@ -2368,6 +2379,28 @@ impl VmConfigSpec {
             format!("{} {tokens}", self.cmdline.as_str())
         };
         KernelCommandLine::try_new(&joined)
+    }
+
+    /// 試験モードが要求する共有（tag・access・ゲスト mount）が、そのとおり揃っているか（#1876・#1877）。
+    fn guest_test_shares_present(&self, mode: GuestTestMode) -> bool {
+        let has = |tag: &str, mount: &str, read_only: bool| {
+            self.shares.shares().iter().any(|s| {
+                s.tag.as_str() == tag
+                    && s.access.is_read_only() == read_only
+                    && s.guest_mount.as_ref().is_some_and(|m| m.as_str() == mount)
+            })
+        };
+        match mode {
+            GuestTestMode::VirtiofsLink => {
+                use crate::guest_link_probe::{RO_MOUNT, RO_TAG, RW_MOUNT, RW_TAG};
+                has(RO_TAG, RO_MOUNT, true) && has(RW_TAG, RW_MOUNT, false)
+            }
+            _ => has(
+                crate::guest_probe::SHARE_TAG,
+                crate::guest_probe::GUEST_MOUNT,
+                false,
+            ),
+        }
     }
 
     /// ゲスト mount の結果を待つ対象の tag（mount 指定が無ければ `None`）。
@@ -2439,7 +2472,7 @@ impl VmConfigSpec {
     ///
     /// VM の stop・起動失敗では呼ばない（診断材料として残す）。使用中なら `ConsoleLogInUse`、世代ファイルや
     /// 現在のログに異常があれば何も消さずに拒否する。コンソールログ未指定なら 0 件。plugin-macos の delete
-    /// からの呼び出しの配線は delete の実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）待ちで、現時点で呼び出し元は無い。
+    /// からの呼び出しの配線は delete の実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）待ちで、現時点で呼び出し元は無い。
     #[cfg(unix)]
     pub fn remove_console_logs(&self) -> Result<RemovedConsoleLogs, ConfigError> {
         match self.devices.serial_console() {
@@ -2720,17 +2753,23 @@ fn build_vz_configuration_limited(
 mod tests {
     use super::*;
 
-    /// テスト専用の一時ディレクトリ（終了時に削除）。
-    struct TempDir(PathBuf);
+    /// テスト専用の一時ディレクトリ。既存の名前は消さず・辿らず排他作成（unix は 0700）し、Drop で自分が作った
+    /// パスだけを消す（共有部品 `test_root`。REPAIR-12・#3375・#3506）。`.0` は正規化済みのパス。
+    struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self::at(
+                std::env::temp_dir().join(format!("fandhe-macos-cfg-{tag}-{}", std::process::id())),
+            )
+        }
+
+        /// `p` を第 1 候補に排他作成する。既にあれば別名になるため、`.0` は `p` と異なることがある。
+        fn at(p: PathBuf) -> Self {
+            let root = crate::test_root::test_root_at(p);
             // macOS の一時ディレクトリ（/var/folders/...）は /private/var への symlink を含み、共有ディレクトリの
             // symlink 拒否検証（SharedDirSymlink）に掛かるため、正規化済みパスを使う。
-            let dir = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
+            let dir = std::fs::canonicalize(&*root).expect("canonicalize temp dir");
             // umask に依らず親ディレクトリ検査（他者書き込み可能かつ sticky なしは拒否）を通る 0700 にする。
             #[cfg(unix)]
             {
@@ -2738,7 +2777,7 @@ mod tests {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod temp dir");
             }
-            Self(dir)
+            Self(dir, root)
         }
 
         fn file(&self, name: &str) -> PathBuf {
@@ -2755,10 +2794,60 @@ mod tests {
         }
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    /// MAC-1・REPAIR-12(#3506): 同じ位置の前回の残骸（古いファイル・ディレクトリ）を消さず、別名の空の
+    /// ディレクトリを返す。残骸は無傷で残り、drop で新しい方だけが消える。
+    #[test]
+    fn mac1_repair12_3506_temp_dir_leaves_stale_residue_untouched() {
+        let parent = TempDir::new("stale-parent");
+        let stale = parent.0.join("stale");
+        std::fs::create_dir_all(stale.join("old")).expect("stale dir");
+        std::fs::write(stale.join("old.txt"), b"x").expect("stale file");
+        let path = {
+            let t = TempDir::at(stale.clone());
+            assert_ne!(t.0, stale);
+            assert_eq!(t.0.parent(), Some(parent.0.as_path()));
+            assert_eq!(std::fs::read_dir(&t.0).expect("read_dir").count(), 0);
+            t.0.clone()
+        };
+        assert!(!path.exists());
+        assert!(stale.join("old").is_dir());
+        assert_eq!(std::fs::read(stale.join("old.txt")).expect("read"), b"x");
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_repair12_3506_temp_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = TempDir::new("symlink-parent");
+        let victim = parent.0.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.0.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.0.join("nowhere");
+        let dangling = parent.0.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let t1 = TempDir::at(link.clone());
+        let t2 = TempDir::at(dangling.clone());
+        assert_ne!(t1.0, link);
+        assert_ne!(t2.0, dangling);
+        assert_eq!(std::fs::read_dir(&t1.0).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     /// MAC-1・TASK-64.2: 正常な 3 入力で仕様が組み立てられ、既定の CPU・メモリが入る。
@@ -3537,6 +3626,39 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// #2908・SEC-1・IO-5: 重なった・隠れたマウントの fixture でも、配下の行を見逃さず取り違えない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2908_mount_point_under_with_stacked_and_hidden_mounts() {
+        // `/x` に overmount（50 の上に 60）があり、50 の下で隠れた子 51 がある。隠れていても拒否側に倒れる。
+        let hidden = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+50 22 8:1 /a /x rw - ext4 /dev/sda1 rw
+60 50 8:1 /b /x rw - tmpfs tmpfs rw
+51 50 8:1 /c /x/share/sub rw - ext4 /dev/sda1 rw
+";
+        assert_eq!(
+            mount_point_under(hidden, Path::new("/x/share")),
+            Some(PathBuf::from("/x/share/sub"))
+        );
+        // 共有ルート自身に積まれたマウントだけで配下が無ければ対象外。
+        let only_self = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+50 22 8:1 /a /x/share rw - ext4 /dev/sda1 rw
+60 50 8:1 /b /x/share rw - tmpfs tmpfs rw
+";
+        assert_eq!(mount_point_under(only_self, Path::new("/x/share")), None);
+        // 兄弟は要素単位で対象外。
+        let sibling = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n51 22 8:1 /c /x/share2/sub rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(mount_point_under(sibling, Path::new("/x/share")), None);
+        // 8 進エスケープを含む隠れた子。
+        let esc = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n51 50 8:1 /c /x/share/my\\040dir rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            mount_point_under(esc, Path::new("/x/share")),
+            Some(PathBuf::from("/x/share/my dir"))
+        );
     }
 
     /// MAC-1・TASK-65.1: 同一デバイスの bind mount（`st_dev` が同じ）もマウント表から検出する。
@@ -4558,6 +4680,96 @@ broken line
                 "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
             );
         }
+    }
+
+    /// MAC-1・SEC-4・#1877: virtiofs-link は既定で無効で、有効にすると ro / rw の指示つきの実効コマンドラインになる。
+    #[test]
+    fn guest_test_link_cmdline_is_exact_when_on() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("guest-test-link");
+        let k = t.file("vmlinux");
+        let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(mount_shares(
+                &t.0,
+                &[
+                    ("ro", "/mnt/fandhe/ro", ReadOnly),
+                    ("rw", "/mnt/fandhe/rw", ReadWrite),
+                ],
+            ));
+        assert_eq!(
+            plain.effective_cmdline().unwrap().as_str(),
+            "console=hvc0 fandhe.virtiofs=ro:/mnt/fandhe/ro:ro fandhe.virtiofs=rw:/mnt/fandhe/rw:rw"
+        );
+        // virtiofs_link.rs（macOS 専用）の期待値と同一の文字列。打ち間違いを Linux CI で検出する。
+        assert_eq!(
+            plain
+                .with_guest_test(GuestTestMode::VirtiofsLink)
+                .effective_cmdline()
+                .unwrap()
+                .as_str(),
+            "console=hvc0 fandhe.virtiofs=ro:/mnt/fandhe/ro:ro fandhe.virtiofs=rw:/mnt/fandhe/rw:rw fandhe.guest-test=virtiofs-link"
+        );
+    }
+
+    /// MAC-1・SEC-4・#1877: ro / rw が揃わない構成（欠け・access 逆・mount point 違い・io 用だけ）は拒否する。
+    #[test]
+    fn guest_test_link_requires_both_shares() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("guest-test-link-reject");
+        let k = t.file("vmlinux");
+        let base = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_guest_test(GuestTestMode::VirtiofsLink);
+        let reject = |spec: &VmConfigSpec| {
+            let err = spec.effective_cmdline().unwrap_err();
+            assert_eq!(err.code(), "config.guest_test_requires_link_shares");
+            assert_eq!(
+                err.message(),
+                "guest test mode virtiofs-link requires a read-only 'ro' share mounted at /mnt/fandhe/ro and a read-write 'rw' share mounted at /mnt/fandhe/rw"
+            );
+        };
+        reject(&base);
+        for shares in [
+            &[("ro", "/mnt/fandhe/ro", ReadOnly)][..],
+            &[("rw", "/mnt/fandhe/rw", ReadWrite)][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadWrite),
+                ("rw", "/mnt/fandhe/rw", ReadWrite),
+            ][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadOnly),
+                ("rw", "/mnt/fandhe/rw", ReadOnly),
+            ][..],
+            &[
+                ("ro", "/mnt/fandhe/ro", ReadOnly),
+                ("rw", "/mnt/fandhe/other", ReadWrite),
+            ][..],
+            &[("fandhe-io", "/mnt/fandhe/io", ReadWrite)][..],
+        ] {
+            reject(
+                &base
+                    .clone()
+                    .with_shared_directories(mount_shares(&t.0, shares)),
+            );
+        }
+        // io 用モードの要求は変わらず、link 用の共有だけでは満たされない。
+        let io = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_guest_test(GuestTestMode::VirtiofsIo)
+            .with_shared_directories(mount_shares(
+                &t.0,
+                &[
+                    ("ro", "/mnt/fandhe/ro", ReadOnly),
+                    ("rw", "/mnt/fandhe/rw", ReadWrite),
+                ],
+            ));
+        assert_eq!(
+            io.effective_cmdline().unwrap_err().code(),
+            "config.guest_test_requires_probe_share"
+        );
     }
 
     /// MAC-1・TASK-65.3: mount 指定があるのにコンソールが無い構成は fail-closed で拒否する。

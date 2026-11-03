@@ -12,8 +12,11 @@
 //! - パスは Linux コンテナ内の `/` 区切り文字列として扱い `std::path::Path` を使わない
 //!   （Windows ホストで区切り文字の解釈が変わるため）。
 //!
-//! 範囲外（REPAIR-3）: rootfs 内で相対リンクを 1 段辿る解決と、パスの絶対性・`..` の検証は
-//! TASK-127 の担当。hooks の `path` は完全一致でのみ畳む規則のため正規化しない。
+//! 範囲外（REPAIR-3）: rootfs 内のリンクを辿る解決は行わない（#1910 の項目 5）。usr-merge の
+//! リンクは本モジュールの正規化で避け、それ以外の symlink を含む宛先は core の適用の段が拒否する
+//! （固定する試験は `tests/cdi_mount_destination_links.rs`。#2985・GPU-1・GPU-2・SEC-1）。
+//! パスの絶対性・`..` の検証は `cdi_apply::mounts`（TASK-127.2）の字句検査が担う。
+//! hooks の `path` は完全一致でのみ畳む規則のため正規化しない。
 
 use std::borrow::Cow;
 use std::io::ErrorKind;
@@ -125,7 +128,7 @@ impl PathLayouts {
 
 /// 先頭の 1 要素が merged なディレクトリ名に完全一致するとき `/usr` を足す（冪等）。
 ///
-/// 相対パス・空文字列・`//lib/x` など同じ対象と断定できない表記は変えない（検証は TASK-127）。
+/// 相対パス・空文字列・`//lib/x` など同じ対象と断定できない表記は変えない（検証は `cdi_apply::mounts` の字句検査。TASK-127.2）。
 /// 書き換えるときだけ 1 回確保する（入力 + 4 バイト）。
 pub fn normalize_usr_merge_path<'a>(path: &'a str, layout: &UsrMergeLayout) -> Cow<'a, str> {
     let Some(rest) = path.strip_prefix('/') else {

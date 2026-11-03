@@ -158,6 +158,7 @@ mod tests {
     use crate::oci_runtime::OciConfigErrorKind;
     use crate::traits::ErrorCode;
 
+    /// パスの計算だけで FS には触れない（作成も削除もしない）ため、予測できる名前のままでよい（#3434・REPAIR-12）。
     fn rootfs(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("fandhe-mnt-ut-{name}-{}", std::process::id()))
     }

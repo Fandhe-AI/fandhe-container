@@ -5,7 +5,7 @@
 //! plugin-cri（TASK-108）と同じ立場で生成された `RuntimeService` トレイト経由で、PodSandbox 作成から
 //! コンテナの作成・起動・停止・削除・サンドボックスの停止・削除までを 1 本で通して各段階の状態を具体値で確かめる。
 //! RPC ごとの個別検証は `runtime_service_runtime.rs`、namespace 分離の実機前提試験は
-//! `runtime_service_namespaces.rs` が担う。本番の launcher との結線は本試験の範囲外（#1819・TASK-114）。
+//! `runtime_service_namespaces.rs` が担う。本番経路（plugin-cri が supervisor 経由で core の本番 launcher を使う。#2434）の通しは `crates/plugin-cri/tests/container_grpc.rs` の `production_binary_full_lifecycle_real`（実機前提）が担い、本試験の範囲外。
 //!
 //! CRI 層がホストのプロセスを直接起動せず、実行層（plugin 側の実装）だけが起動・回収することは、
 //! 静的照合（src に `Command::new` が無い）と Linux の実プロセス試験の両方で確かめる。
@@ -18,7 +18,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
     DeleteResponse, ErrorCode, KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -161,14 +163,14 @@ fn bundle_root() -> PathBuf {
 struct RecordingBundles(Mutex<Vec<String>>);
 
 impl BundleProvider for RecordingBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map_or("", |m| m.name.as_str());
         self.0
             .lock()
             .unwrap()
             .push(format!("prepare {container_id} {sandbox_id} {name}"));
-        Ok(bundle_root().join(container_id))
+        Ok(PreparedBundle::new(bundle_root().join(container_id)))
     }
     fn release(&self, container_id: &str) -> Result<(), CriError> {
         self.0
@@ -525,8 +527,18 @@ fn task_59_4_cri_layer_never_spawns_host_processes() {
     rust_files(&src, &mut files);
     assert!(!files.is_empty());
     for file in files {
+        // 唯一の例外: shim v2 の起動バイナリの bootstrap（#872・CRI-5）。自分自身（current_exe）を
+        // デーモンとして再実行するだけで、コンテナのプロセスは起動しない。他のファイルへ広げない。
+        // 許すのは `Command::new(exe)`（exe は current_exe）と `CommandExt` の import だけで、ファイル単位では除外しない。
+        let is_bootstrap = file.ends_with("shim_v2/bootstrap.rs");
         let text = std::fs::read_to_string(&file).expect("read source");
         for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            if is_bootstrap
+                && (line.contains("Command::new(exe)")
+                    || line.trim() == "use std::os::unix::process::CommandExt;")
+            {
+                continue;
+            }
             assert!(
                 !line.contains("Command::new") && !line.contains("process::Command"),
                 "CRI layer must not spawn processes: {}: {line}",

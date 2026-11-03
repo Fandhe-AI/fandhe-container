@@ -5,8 +5,9 @@
 //! plugin-cri（TASK-108）と同じ立場で生成された `RuntimeService` トレイト経由で呼ぶ。実際の namespace
 //! 分離プロセスの確認は実機前提の `runtime_service_namespaces.rs`（`#[ignore]`）で行う。
 
+use fandhe_container_oci::reference::Digest;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,7 +15,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -28,6 +31,8 @@ use tonic::{Code, Request, Status};
 #[derive(Default)]
 struct FakeRuntime {
     calls: Mutex<Vec<String>>,
+    /// stop が受けたシグナル番号（CRI-2・#2668）。
+    stop_signals: Mutex<Vec<u8>>,
     fail_create: Mutex<Option<ErrorCode>>,
     fail_start: Mutex<Option<ErrorCode>>,
     /// true のとき start は created を返す（running でない応答の検証用）。
@@ -68,6 +73,8 @@ struct FakeRuntime {
     stop_oom_killed: AtomicBool,
     /// true のとき start の stopped 応答が OOM の停止を報告する（同上）。
     start_oom_killed: AtomicBool,
+    /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
+    start_log_paths: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeRuntime {
@@ -105,6 +112,11 @@ impl ContainerRuntime for Shared {
             .lock()
             .unwrap()
             .push(format!("start {}", r.id().as_str()));
+        self.0
+            .start_log_paths
+            .lock()
+            .unwrap()
+            .push(r.log_path().map(|p| p.as_str().to_owned()));
         while self.0.hold_start.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -137,6 +149,7 @@ impl ContainerRuntime for Shared {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        self.0.stop_signals.lock().unwrap().push(r.signal().as_u8());
         self.0.calls.lock().unwrap().push(format!(
             "stop {} {}s",
             r.id().as_str(),
@@ -197,6 +210,19 @@ struct FakeBundles {
     sandbox_hostnames: Mutex<Vec<String>>,
     fail: AtomicBool,
     fail_release: AtomicBool,
+    /// 設定されていれば prepare が報告する識別情報（#2771）。
+    report_user: Mutex<Option<fandhe_container_cri::bundle::AppliedUser>>,
+    /// 設定されていれば prepare が報告する解決済みの stop signal（#2771）。
+    report_stop_signal: Mutex<Option<v1::Signal>>,
+    /// 設定されていれば prepare が報告する解決済みイメージ（#2831）。
+    report_image: Mutex<Option<fandhe_container_cri::bundle::ResolvedImage>>,
+    /// true の間、prepare は保留する（RPC の期限切れ後の worker の打ち切りの検証用。#2899）。
+    hold_prepare: AtomicBool,
+    /// 保留明けの prepare が見た取り消しの旗の値（#2899）。
+    cancel_seen: Mutex<Vec<bool>>,
+    /// 0 でなければ `release_bounded` はこのミリ秒だけ遅く動く。5ms ごとに予算（期限・取り消しの旗）を見て、
+    /// 尽きたら `release_cut` を記録して `Timeout` を返す（予算を守る遅い解放の模擬。#3142）。
+    slow_release_ms: AtomicU64,
 }
 
 fn bundle_root() -> PathBuf {
@@ -208,7 +234,7 @@ fn bundle_root() -> PathBuf {
 }
 
 impl BundleProvider for FakeBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map(|m| m.name.as_str());
         self.sandbox_hostnames
@@ -219,10 +245,48 @@ impl BundleProvider for FakeBundles {
             "prepare {container_id} {sandbox_id} {}",
             name.unwrap_or("")
         ));
+        while self.hold_prepare.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if req.cancel.is_some() {
+            self.cancel_seen
+                .lock()
+                .unwrap()
+                .push(req.cancel.is_some_and(|c| c.load(Ordering::SeqCst)));
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("no space"));
         }
-        Ok(bundle_root().join(container_id))
+        let mut prepared = PreparedBundle::new(bundle_root().join(container_id));
+        if let Some(u) = self.report_user.lock().unwrap().clone() {
+            prepared = prepared.with_user(u);
+        }
+        if let Some(sig) = *self.report_stop_signal.lock().unwrap() {
+            prepared = prepared.with_stop_signal(sig);
+        }
+        if let Some(i) = self.report_image.lock().unwrap().clone() {
+            prepared = prepared.with_image(i);
+        }
+        Ok(prepared)
+    }
+    fn release_bounded(
+        &self,
+        container_id: &str,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        let slow = self.slow_release_ms.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(slow) {
+            if let Err(e) = budget.check() {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("release_cut {container_id}"));
+                return Err(e);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.release(container_id)
     }
     fn release(&self, container_id: &str) -> Result<(), CriError> {
         self.calls
@@ -311,6 +375,26 @@ async fn create(service: &CriRuntimeService, sandbox: &str, name: &str) -> Resul
         Request::new(v1::CreateContainerRequest {
             pod_sandbox_id: sandbox.into(),
             config: Some(container(name)),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().container_id)
+}
+
+async fn create_with_signal(
+    service: &CriRuntimeService,
+    sandbox: &str,
+    name: &str,
+    stop_signal: v1::Signal,
+) -> Result<String, Status> {
+    let mut config = container(name);
+    config.stop_signal = stop_signal as i32;
+    RuntimeService::create_container(
+        service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox.into(),
+            config: Some(config),
             sandbox_config: None,
         }),
     )
@@ -794,6 +878,64 @@ async fn task_59_2_create_timeout_defers_release_until_worker_finishes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("worker did not roll back");
+}
+
+/// REPAIR-5・CRI-2（#2899）: bundle 用意の途中で RPC が期限切れになると、worker は後続の create へ進まず、
+/// bundle を解放して記録を除去する。prepare は取り消しの旗が立った状態を観測する。
+#[tokio::test]
+async fn repair5_create_timeout_during_prepare_stops_worker_before_dispatch() {
+    let h = harness();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(50));
+    let sb = run_sandbox(&service).await;
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    h.bundles.hold_prepare.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if released(&h.bundles) == 1 && list_count(&service).await == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(released(&h.bundles), 1);
+    assert_eq!(list_count(&service).await, 0);
+    assert_eq!(h.bundles.cancel_seen.lock().unwrap().clone(), vec![true]);
+    assert_eq!(
+        h.runtime.calls(),
+        Vec::<String>::new(),
+        "the runtime layer must never be reached"
+    );
+}
+
+/// REPAIR-5・CRI-2（#2899）: RPC の future が破棄されても（kubelet の取り消し）、dispatch 前の worker は
+/// 後続へ進まない。
+#[tokio::test]
+async fn repair5_create_future_drop_during_prepare_stops_worker_before_dispatch() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    let fut = create(&h.service, &sb, "c");
+    let timed = tokio::time::timeout(Duration::from_millis(50), fut).await;
+    assert!(timed.is_err(), "the create future must still be pending");
+    h.bundles.hold_prepare.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if released(&h.bundles) == 1 && list_count(&h.service).await == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(released(&h.bundles), 1);
+    assert_eq!(list_count(&h.service).await, 0);
+    assert_eq!(h.runtime.calls(), Vec::<String>::new());
+}
+
+fn released(b: &FakeBundles) -> usize {
+    b.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("release "))
+        .count()
 }
 
 fn release_count(h: &Harness) -> usize {
@@ -1503,7 +1645,7 @@ async fn task_59_3_stop_exit_code_is_reflected_in_status() {
     );
 }
 
-/// CRI-2・CORE-4: 実行層が OOM の停止を報告したら reason は `OOMKilled`（Stop・StopPodSandbox の経路。終了コード 0 でも OOMKilled）。message・image_ref・image_id・user は REPAIR-3 のスタブで空。
+/// CRI-2・CORE-4: 実行層が OOM の停止を報告したら reason は `OOMKilled`（Stop・StopPodSandbox の経路。終了コード 0 でも OOMKilled）。message は REPAIR-3 のスタブで空。image_ref・image_id・user は報告の無い経路では空（#2831）。
 #[tokio::test]
 async fn cri_2_oom_killed_is_reflected_in_reason() {
     let h = harness();
@@ -1609,4 +1751,618 @@ async fn cri_2_repair_3_stopped_start_response_reflects_exit_code() {
         (st.state, st.exit_code, st.reason.as_str()),
         (S::ContainerExited as i32, 1, "Error")
     );
+}
+
+/// CRI-2・SUP-4（#2671）: log_directory と log_path は結合され、status と StartRequest に同じ値で現れる。
+#[tokio::test]
+async fn cri_2_log_path_is_joined_and_reaches_start_request() {
+    let h = harness();
+    let sb = RuntimeService::run_pod_sandbox(
+        &h.service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut cfg = container("c");
+    cfg.log_path = "c/0.log".into();
+    let id = RuntimeService::create_container(
+        &h.service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb.clone(),
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("create")
+    .into_inner()
+    .container_id;
+    let expected = "/var/log/pods/ns_pod_uid-1/c/0.log";
+    assert_eq!(status(&h.service, &id).await.log_path, expected);
+    start(&h.service, &id).await.expect("start");
+    assert_eq!(
+        h.runtime.start_log_paths.lock().unwrap().clone(),
+        vec![Some(expected.to_owned())]
+    );
+    assert_eq!(status(&h.service, &id).await.log_path, expected);
+}
+
+/// CRI-2・SUP-4（#2671）: log_path だけ（基点なし）の CreateContainer は INVALID_ARGUMENT で、記録を残さない。
+#[tokio::test]
+async fn cri_2_log_path_without_directory_is_rejected_on_create() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let mut cfg = container("c");
+    cfg.log_path = "c/0.log".into();
+    let err = RuntimeService::create_container(
+        &h.service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb,
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(list_count(&h.service).await, 0);
+}
+
+/// CRI-2・SUP-4（#2671）: 実行層が Unimplemented（supervisor が CRI ログを受けられない構成）で
+/// start に失敗したら確定失敗として created へ戻る。
+#[tokio::test]
+async fn cri_2_start_unimplemented_returns_to_created() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    *h.runtime.fail_start.lock().unwrap() = Some(ErrorCode::Unimplemented);
+    let err = start(&h.service, &id).await.expect_err("start");
+    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerCreated as i32
+    );
+}
+
+/// CRI-2・PLUG-1（#2668）: StopContainer は作成時の stop_signal を Linux の番号へ写して実行層へ渡す（既定は SIGTERM）。
+#[tokio::test]
+async fn cri2_stop_container_uses_config_stop_signal() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let a = create_with_signal(&h.service, &sb, "a", v1::Signal::Sigint)
+        .await
+        .expect("create a");
+    start(&h.service, &a).await.expect("start a");
+    stop_c(&h.service, &a).await.expect("stop a");
+    let b = create(&h.service, &sb, "b").await.expect("create b");
+    start(&h.service, &b).await.expect("start b");
+    stop_c(&h.service, &b).await.expect("stop b");
+    assert_eq!(h.runtime.stop_signals.lock().unwrap().clone(), vec![2, 15]);
+}
+
+/// CRI-2・PLUG-1（#2668）: StopPodSandbox はコンテナごとの stop_signal を使う。
+#[tokio::test]
+async fn cri2_stop_pod_sandbox_uses_each_container_stop_signal() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    for (name, sig) in [("a", v1::Signal::Sigint), ("b", v1::Signal::Sigusr1)] {
+        let id = create_with_signal(&h.service, &sb, name, sig)
+            .await
+            .expect("create");
+        start(&h.service, &id).await.expect("start");
+    }
+    stop_sb(&h.service, &sb).await.expect("stop sandbox");
+    let mut got = h.runtime.stop_signals.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![2, 10]);
+}
+
+/// CRI-2・OCI-1・SEC-5（#2771）: 報告された識別情報と解決済みの stop signal が ContainerStatus と stop に反映される。
+#[tokio::test]
+async fn cri2_status_reports_applied_user_and_resolved_stop_signal() {
+    let h = harness();
+    *h.bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        vec![3000],
+    ));
+    *h.bundles.report_stop_signal.lock().unwrap() = Some(v1::Signal::Sigint);
+    let sb = run_sandbox(&h.service).await;
+    // config は RUNTIME_DEFAULT。
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.stop_signal, v1::Signal::Sigint as i32);
+    let linux = st.user.expect("user").linux.expect("linux");
+    assert_eq!(
+        (linux.uid, linux.gid, linux.supplemental_groups),
+        (1000, 2000, vec![3000])
+    );
+    start(&h.service, &id).await.expect("start");
+    stop_c(&h.service, &id).await.expect("stop");
+    assert_eq!(h.runtime.stop_signals.lock().unwrap().clone(), vec![2]);
+}
+
+/// CRI-2・SEC-5（#2771）: 補助グループが空の識別情報は、core が起動元のグループを現状維持し得る
+/// （`KeptSetgroupsDenied`）ため実プロセスとの一致を保証できず、user は未報告になる。
+#[tokio::test]
+async fn cri2_status_omits_user_when_supplemental_groups_empty() {
+    let h = harness();
+    *h.bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        Vec::new(),
+    ));
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert!(st.user.is_none());
+}
+
+/// CRI-2・OCI-1（#2831）: 報告された解決結果が ContainerStatus と ListContainers の image_ref・image_id になる。
+/// Status の image_ref は digest 参照、image_id と List の両項目は image ID（containerd main cfb18c4）。
+#[tokio::test]
+async fn cri2_status_and_list_report_resolved_image() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let hex = "a".repeat(64);
+    let id = Digest::parse(&format!("sha256:{hex}")).unwrap();
+    let digest_ref = format!("docker.io/library/alpine@sha256:{}", "b".repeat(64));
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() =
+        Some(ResolvedImage::new(id, Some(digest_ref.clone())));
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(st.image_ref, digest_ref);
+    assert_eq!(st.image_id, format!("sha256:{hex}"));
+    let list = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].image_ref, format!("sha256:{hex}"));
+    assert_eq!(list[0].image_id, format!("sha256:{hex}"));
+}
+
+/// CRI-2・OCI-1（#2831）: digest 参照が無い解決結果は image_ref も image ID。報告が無い経路は空。
+#[tokio::test]
+async fn cri2_status_image_without_digest_ref_and_without_report() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let hex = "c".repeat(64);
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() = Some(ResolvedImage::new(
+        Digest::parse(&format!("sha256:{hex}")).unwrap(),
+        None,
+    ));
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(
+        (st.image_ref.as_str(), st.image_id.as_str()),
+        (
+            format!("sha256:{hex}").as_str(),
+            format!("sha256:{hex}").as_str()
+        )
+    );
+    let h2 = harness();
+    let sb2 = run_sandbox(&h2.service).await;
+    let cid2 = create(&h2.service, &sb2, "a").await.expect("create");
+    let st2 = status(&h2.service, &cid2).await;
+    assert_eq!((st2.image_ref.as_str(), st2.image_id.as_str()), ("", ""));
+}
+
+/// CRI-2・OCI-1（#2901）: 在庫のタグがあれば Status の image は新しい ImageSpec（タグのみ）、List は config の値のまま。
+/// タグが無い・報告が無い経路は config の値。message は常に空、verbose でも info は空。
+#[tokio::test]
+async fn cri2_status_image_uses_inventory_tag_and_message_info_stay_empty() {
+    use fandhe_container_cri::bundle::ResolvedImage;
+    let id = Digest::parse(&format!("sha256:{}", "d".repeat(64))).unwrap();
+    let h = harness();
+    *h.bundles.report_image.lock().unwrap() = Some(
+        ResolvedImage::new(id.clone(), None)
+            .with_tag(Some("docker.io/library/busybox:1.36".into())),
+    );
+    let sb = run_sandbox(&h.service).await;
+    let cid = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &cid).await;
+    assert_eq!(
+        st.image,
+        Some(ImageSpec {
+            image: "docker.io/library/busybox:1.36".into(),
+            ..Default::default()
+        })
+    );
+    assert_eq!(st.message, "");
+    let verbose = RuntimeService::container_status(
+        &h.service,
+        Request::new(v1::ContainerStatusRequest {
+            container_id: cid.clone(),
+            verbose: true,
+        }),
+    )
+    .await
+    .expect("verbose status")
+    .into_inner();
+    assert!(verbose.info.is_empty());
+    let list = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(
+        list[0].image.as_ref().map(|i| i.image.as_str()),
+        Some("busybox:1.36")
+    );
+
+    // タグが無い報告・報告が無い経路は config の値。
+    let h2 = harness();
+    *h2.bundles.report_image.lock().unwrap() = Some(ResolvedImage::new(id, None));
+    let sb2 = run_sandbox(&h2.service).await;
+    let cid2 = create(&h2.service, &sb2, "a").await.expect("create");
+    assert_eq!(
+        status(&h2.service, &cid2).await.image.map(|i| i.image),
+        Some("busybox:1.36".to_string())
+    );
+    let h3 = harness();
+    let sb3 = run_sandbox(&h3.service).await;
+    let cid3 = create(&h3.service, &sb3, "a").await.expect("create");
+    assert_eq!(
+        status(&h3.service, &cid3).await.image.map(|i| i.image),
+        Some("busybox:1.36".to_string())
+    );
+}
+
+/// CRI-2（#2771）: 報告の無い bundle 供給元では user は未報告で、RUNTIME_DEFAULT は SIGTERM（23）と報告される。
+#[tokio::test]
+async fn cri2_status_without_report_has_no_user_and_defaults_to_sigterm() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "a").await.expect("create");
+    let st = status(&h.service, &id).await;
+    assert!(st.user.is_none());
+    assert_eq!(st.stop_signal, v1::Signal::Sigterm as i32);
+}
+
+/// CRI-2・REPAIR-5（#2771）: 報告された識別情報が保持量の上限を超えたら FAILED_PRECONDITION で、記録と bundle を残さない。
+#[tokio::test]
+async fn cri2_applied_user_over_retained_limit_is_rejected_and_rolled_back() {
+    let runtime = Arc::new(FakeRuntime::default());
+    let bundles = Arc::new(FakeBundles::default());
+    let service = CriRuntimeService::new()
+        .with_container_limits(
+            fandhe_container_cri::runtime_service::ContainerLimits::default()
+                .with_max_retained_bytes(8 * 1024),
+        )
+        .with_runtime(
+            RuntimeAdapter::new(Arc::new(Shared(runtime.clone()))),
+            bundles.clone(),
+        );
+    *bundles.report_user.lock().unwrap() = Some(fandhe_container_cri::bundle::AppliedUser::new(
+        1000,
+        2000,
+        (1..=4000).collect(),
+    ));
+    let sb = run_sandbox(&service).await;
+    let err = create(&service, &sb, "a").await.expect_err("over limit");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(list_count(&service).await, 0);
+    assert!(
+        bundles
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("release "))
+    );
+    assert_eq!(runtime.calls().len(), 0);
+}
+
+/// OCI-1・CRI-2（#2771）: runtime_features は supplemental_groups_policy だけを真にする。
+#[test]
+fn cri2_runtime_features_enable_supplemental_groups_policy() {
+    let f = fandhe_container_cri::runtime_service::runtime_features();
+    assert!(f.supplemental_groups_policy);
+    assert!(!f.user_namespaces_host_network);
+    assert!(!f.mount_options);
+}
+
+/// 記録上の最初のコンテナ ID（1 件だけ残っている前提）。
+async fn only_container_id(service: &CriRuntimeService) -> String {
+    let list = RuntimeService::list_containers(
+        service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(list.len(), 1);
+    list[0].id.clone()
+}
+
+fn cut_count(b: &FakeBundles) -> usize {
+    b.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("release_cut "))
+        .count()
+}
+
+/// `release_cut` が `n` 件になるまで待つ（上限 `limit`）。
+async fn wait_cuts(b: &FakeBundles, n: usize, limit: Duration) {
+    let until = std::time::Instant::now() + limit;
+    while cut_count(b) < n {
+        assert!(std::time::Instant::now() < until, "release must be cut");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// 解放を速くして Remove を再試行し、成功するまで（worker の終了を待つ間の FAILED_PRECONDITION を除き）繰り返す。
+async fn retry_remove_until_ok(service: &CriRuntimeService, b: &FakeBundles, id: &str) {
+    b.slow_release_ms.store(0, Ordering::SeqCst);
+    for _ in 0..200 {
+        match remove(service, id).await {
+            Ok(()) => return,
+            Err(e) if e.code() == Code::FailedPrecondition => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("retry must succeed: {e:?}"),
+        }
+    }
+    panic!("retry did not settle");
+}
+
+/// CRI-2・REPAIR-5・OCI-7（#3142）: RemoveContainer の bundle 解放は RPC の期限で打ち切られる。RPC は期限で
+/// `DEADLINE_EXCEEDED`、worker も期限の直後に止まり、再試行（delete は再実行、解放は続きから）で記録が消える。
+#[tokio::test]
+async fn cri2_repair5_3142_remove_container_release_cut_at_deadline() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    let (runtime, bundles) = (h.runtime.clone(), h.bundles.clone());
+    let service = h.service.with_runtime_timeout(Duration::from_millis(300));
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    start(&service, &id).await.expect("start");
+    bundles.slow_release_ms.store(5_000, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let err = remove(&service, &id).await.expect_err("remove");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(started.elapsed() < Duration::from_millis(900));
+    wait_cuts(&bundles, 1, Duration::from_millis(600)).await;
+    assert!(started.elapsed() < Duration::from_millis(1_200));
+    assert_eq!(released(&bundles), 0);
+    // 記録は exited で保持される（所有の証明を失わない）。
+    for _ in 0..200 {
+        if state_of(&service, &id).await == S::ContainerExited as i32 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state_of(&service, &id).await, S::ContainerExited as i32);
+    retry_remove_until_ok(&service, &bundles, &id).await;
+    assert_eq!(list_count(&service).await, 0);
+    assert_eq!(released(&bundles), 1);
+    assert_eq!(
+        runtime
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("delete "))
+            .count(),
+        2
+    );
+}
+
+/// CRI-2・REPAIR-5（#3142）: RemoveContainer の RPC の future を破棄すると取り消しの旗が立ち、worker の解放は
+/// 期限（60 秒）を待たずに止まる。
+#[tokio::test]
+async fn cri2_repair5_3142_remove_container_future_drop_cancels_worker() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    let bundles = h.bundles.clone();
+    let service = h.service;
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    start(&service, &id).await.expect("start");
+    bundles.slow_release_ms.store(30_000, Ordering::SeqCst);
+    let fut = remove(&service, &id);
+    let timed = tokio::time::timeout(Duration::from_millis(100), fut).await;
+    assert!(timed.is_err(), "the remove future must still be pending");
+    wait_cuts(&bundles, 1, Duration::from_millis(500)).await;
+    retry_remove_until_ok(&service, &bundles, &id).await;
+    assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-5・OCI-7（#3142）: Create の巻き戻しの解放も期限で打ち切られる。打ち切ったら結果不明（unknown・
+/// `runtime_owned`）で記録を保持し、続く RemoveContainer（delete → 続きから解放）で回収できる。
+///
+/// RPC の期限と巻き戻しの解放の期限はどちらも同じ `runtime_timeout` のため、prepare が即座に失敗すると RPC の
+/// コードが OS のタイマー粒度の競争で決まっていた（macOS・Windows で `ResourceExhausted` になった。#3257）。
+/// #3307 で解放の打ち切りは `DeadlineExceeded` に揃えた（競争の場面は下の `cri2_repair5_3307_*` が照合する）。
+/// 本試験は prepare を保留して RPC の期限切れを先に確定させる経路の照合として残す。
+#[tokio::test]
+async fn cri2_repair5_3142_create_rollback_release_is_bounded() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    h.bundles.slow_release_ms.store(5_000, Ordering::SeqCst);
+    let bundles = h.bundles.clone();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(300));
+    let sb = run_sandbox(&service).await;
+    let started = std::time::Instant::now();
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(started.elapsed() < Duration::from_millis(900));
+    // 保留を解く。prepare が失敗し、巻き戻しの解放が期限（Drop の開始から 300ms）で打ち切られる。
+    bundles.hold_prepare.store(false, Ordering::SeqCst);
+    wait_cuts(&bundles, 1, Duration::from_millis(600)).await;
+    // 結果不明として記録が残る。
+    let mut id = None;
+    for _ in 0..200 {
+        let list = RuntimeService::list_containers(
+            &service,
+            Request::new(v1::ListContainersRequest { filter: None }),
+        )
+        .await
+        .expect("list")
+        .into_inner()
+        .containers;
+        if let Some(c) = list.first()
+            && state_of(&service, &c.id).await == S::ContainerUnknown as i32
+        {
+            id = Some(c.id.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let id = id.expect("the record must be kept as unknown");
+    assert_eq!(only_container_id(&service).await, id);
+    retry_remove_until_ok(&service, &bundles, &id).await;
+    assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-4・REPAIR-5（#3307）: prepare が即座に失敗し、巻き戻しの解放が期限で打ち切られる場面（#3257 で
+/// OS により `ResourceExhausted` と `DeadlineExceeded` に揺れた競争そのもの）でも、3 OS で常に `DeadlineExceeded`
+/// と固定文言を返す。記録は結果不明で残り、続く RemoveContainer で回収できる。
+#[tokio::test]
+async fn cri2_repair5_3307_create_rollback_cut_returns_deadline_exceeded() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.slow_release_ms.store(5_000, Ordering::SeqCst);
+    let bundles = h.bundles.clone();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(300));
+    let sb = run_sandbox(&service).await;
+    let started = std::time::Instant::now();
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert_eq!(err.message(), "runtime operation timed out");
+    assert!(started.elapsed() < Duration::from_millis(900));
+    wait_cuts(&bundles, 1, Duration::from_millis(600)).await;
+    assert_eq!(list_count(&service).await, 1);
+    let id = only_container_id(&service).await;
+    assert_eq!(state_of(&service, &id).await, S::ContainerUnknown as i32);
+    retry_remove_until_ok(&service, &bundles, &id).await;
+    assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-5（#3307）: 解放が期限以外の理由で失敗したときは、元のコード（prepare の `ResourceExhausted`）を
+/// 保つ。記録は結果不明で残る。
+#[tokio::test]
+async fn cri2_repair5_3307_create_rollback_release_failure_keeps_original_code() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.bundles.fail.store(true, Ordering::SeqCst);
+    h.bundles.fail_release.store(true, Ordering::SeqCst);
+    let service = h.service;
+    let sb = run_sandbox(&service).await;
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::ResourceExhausted);
+    assert_eq!(list_count(&service).await, 1);
+    let id = only_container_id(&service).await;
+    assert_eq!(state_of(&service, &id).await, S::ContainerUnknown as i32);
+}
+
+/// CRI-2・REPAIR-5（#3142）: 手放した Create（RPC の期限切れで取り消しの旗が立った後）の巻き戻しの解放は、その旗で
+/// 即座には止まらない（止まると bundle が必ず残る）。期限内に終わる解放は最後まで走る。
+#[tokio::test]
+async fn cri2_repair5_3142_abandoned_create_rollback_release_ignores_the_cancel_flag() {
+    let h = harness();
+    h.bundles.hold_prepare.store(true, Ordering::SeqCst);
+    h.bundles.slow_release_ms.store(40, Ordering::SeqCst);
+    let bundles = h.bundles.clone();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(200));
+    let sb = run_sandbox(&service).await;
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    bundles.hold_prepare.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if released(&bundles) == 1 && list_count(&service).await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(released(&bundles), 1);
+    assert_eq!(cut_count(&bundles), 0);
+    assert_eq!(list_count(&service).await, 0);
+}
+
+/// CRI-2・REPAIR-5（#3142）: RemovePodSandbox の合計は `runtime_timeout` 1 回分で頭打ちになる（配下 N 件 ×
+/// `runtime_timeout` にならない）。尽きたら新しい段を始めず、未処理の配下は `in_flight` が外れ、sandbox は残る。
+/// 再試行を重ねると全件と sandbox が消える。
+#[tokio::test]
+async fn cri2_repair5_3142_remove_pod_sandbox_total_is_bounded() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    let (runtime, bundles) = (h.runtime.clone(), h.bundles.clone());
+    let service = h.service.with_runtime_timeout(Duration::from_millis(500));
+    let sb = run_sandbox(&service).await;
+    for name in ["a", "b", "c"] {
+        create(&service, &sb, name).await.expect("create");
+    }
+    // 1 件 400ms。逐次に各 500ms を使えば 1,200ms かかるが、合計 500ms で頭打ちになる。
+    bundles.slow_release_ms.store(400, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let err = remove_sb(&service, &sb).await.expect_err("remove sandbox");
+    let elapsed = started.elapsed();
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(elapsed < Duration::from_millis(900), "elapsed={elapsed:?}");
+    // 3 件目は始めない（delete は最大 2 回）。
+    assert!(
+        runtime
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("delete "))
+            .count()
+            <= 2
+    );
+    // sandbox と未回収の記録は残る。
+    assert!(list_count(&service).await >= 1);
+    bundles.slow_release_ms.store(0, Ordering::SeqCst);
+    let mut done = false;
+    for _ in 0..200 {
+        match remove_sb(&service, &sb).await {
+            Ok(()) => {
+                done = true;
+                break;
+            }
+            Err(e) if e.code() == Code::FailedPrecondition => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("retry must succeed: {e:?}"),
+        }
+    }
+    assert!(done, "the retry must settle");
+    assert_eq!(list_count(&service).await, 0);
+    let status = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(v1::PodSandboxStatusRequest {
+            pod_sandbox_id: sb,
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status.code(), Code::NotFound);
 }

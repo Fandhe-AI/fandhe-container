@@ -27,6 +27,7 @@ use super::{NftExprAttr, NftExprValue, data_loss, invalid};
 use crate::error::NetError;
 
 /// データ値の属性（`NFTA_DATA_VALUE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_DATA_VALUE: u16 = 1;
 /// データ値の最大長（`NFT_REG_SIZE`）。
 pub const NFT_REG_SIZE: usize = 16;
@@ -83,4 +84,15 @@ impl NftDataValue {
         };
         Self::new(b).map_err(|_| data_loss("nft data value length out of range"))
     }
+}
+
+/// data 属性のレジスタ幅の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_DATA_VALUE` は定義の横に出典を書いた。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_REG_SIZE, usize, c_int);
+    };
 }

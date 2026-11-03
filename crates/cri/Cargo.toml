@@ -2,6 +2,8 @@
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G4（TASK-56〜63）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # TASK-56.1（#423・CRI-3）で雛形を確認済み。build.rs・build-dependencies は TASK-56.3（#426）で追加済み、実行時依存 tonic・tonic-prost・prost は TASK-56.4（#427）で追加（承認: #425）。
+# TASK-62.1（#671）の shim v2 の ttrpc は既存の prost（derive）と std だけで作り、依存を足さない（#670）。
+# TASK-63.1（#679）の CRI ストリーミングサーバーに hyper・hyper-util と tokio の net・time を使う（承認: #678。新規パッケージなし）。
 # 依存の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -10,6 +12,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+# src/bin/shim_v2_main.rs を shim_v2_main として二重に自動検出させない（下の [[bin]] で名前を明示。#872・CRI-5）。
+autobins = false
+
+# containerd が exec する shim v2 の起動バイナリ（TASK-62.7.1・#872・CRI-5）。依存は足さない。
+[[bin]]
+name = "containerd-shim-fandhe-container-v2"
+path = "src/bin/shim_v2_main.rs"
+
+# containerd 経由の shim v2 疎通確認（TASK-62.6・CRI-5・#676）。試験バイナリ自身が shim 役を兼ねるため
+# 自前の main（harness = false）。既定は非 root の配線確認、`--ignored` で root・containerd の実機シナリオ。依存は足さない。
+[[test]]
+name = "shim_v2"
+path = "tests/shim_v2.rs"
+harness = false
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
@@ -29,7 +45,13 @@ fandhe-container-oci = { path = "../oci" }
 # ContainerRuntime トレイト境界の呼び出しアダプタ（TASK-59.1・#437・CRI-2・CRI-7）。workspace 内 path 依存で外部クレートの追加ではない。
 # 参照は core の traits のみ。plugin feature は引き込まない（default-features = false）。
 fandhe-container-core = { path = "../core", default-features = false }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+# ストリーミングサーバー（CRI-6・TASK-63.1・#679。承認: #678）。http-body-util・bytes・http は直接依存にしない（hyper の再 export を使う）。
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+# SPDY/3 のヘッダブロック（辞書つき zlib。CRI-6・TASK-63.3・#681。承認: #678 のオーナー判断 2026-10-10。新規パッケージなし）。
+# 展開後サイズは呼び出し側（streaming/spdy.rs）で上限を検証する。
+flate2.workspace = true
 # bundle の config.json 生成（CRI-1・CRI-2・#2395）。serde / serde_json は #138 で承認済み（用途: OCI config.json）。
 # workspace 既存の =x.y.z 固定版を参照するだけで Cargo.lock に新規パッケージは増えない。
 serde.workspace = true
@@ -39,4 +61,11 @@ tonic-prost.workspace = true
 prost.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
+
+# CRI 記録の fsync が RPC のレイテンシ（p50・p95）に与える影響の計測ハーネス（#3224・CORE-10・CRI-1・REPAIR-8）。
+# 自前の main（harness = false）。依存は足さない（既存の normal / dev 依存だけ）。CI では実行せず、
+# metrics.json・BENCH_NAMES・baseline にも登録しない（基準値の確定は #230 の別件）。
+[[bench]]
+name = "record_store_rpc_latency"
+harness = false

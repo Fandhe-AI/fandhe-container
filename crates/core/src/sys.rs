@@ -35,7 +35,8 @@
 //! 見る `fstatfs(2)` を呼ぶ。実行そのものは既存の `execveat(2)`（`exec_fd`）を使う。
 //! 基本デバイスノード作成は、`mknodat(2)`・`O_PATH` での `openat(2)` を呼ぶために使う。
 //! デバイス cgroup の層ごとの実機照合（TASK-32 追補・#1681）は、`ptmx` を開いた pty の slave を開けるよう
-//! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。
+//! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。`ioctl(2)` は nsfs の namespace fd の素性の
+//! 照合（`NS_GET_NSTYPE`・`NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_OWNER_UID`。#2674・CORE-3・CRI-2）にも使う。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
@@ -78,16 +79,20 @@
 //!   `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` / `nix` について
-//! `libc` は #86 で採用承認済みだが、自動運転下では「追加時点で新しい版があれば PR で
-//! 確認する」運用条件を満たせないため、`crates/io/src/sys.rs` と同じ流儀で `Cargo.toml`
-//! を変更せず必要最小限の `extern "C"` 宣言を自前で持つ（dependency-policy）。
+//! `sys` の本体は `libc` へ切り替えず、`crates/io/src/sys.rs` と同じ流儀で必要最小限の `extern "C"`
+//! 宣言を自前で持つ（#1318・dependency-policy）。`libc` は `cfg(unix)` の dev-dependencies で宣言の機械照合に
+//! だけ使う。照合の置き場所は、syscall 番号が各 arch の `consts` の `libc_abi`（#1847）、番号以外の定数が
+//! `libc_consts_checks!`（#1848）、構造体と関数の型が最上位の `libc_abi`・`sys/seccomp_notify.rs`・
+//! `sys/macos.rs`（#1849）。方式は `docs/design/ffi-libc-check.md`。`nix` は不採用。
 
 #![cfg(target_os = "linux")]
 
 use crate::seccomp::{BpfInstruction, SeccompProgram};
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{
+    AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd,
+};
 
 /// syscall 失敗の分類。`crate::exec` が `ErrorCode` へ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +100,7 @@ pub(crate) enum SysError {
     /// 対応外として拒否した操作（縮退せず fail-closed）。`crate::exec` が `ErrorCode::Unimplemented` に写し、
     /// 表示文言は "not supported by the kernel or the target architecture"（#1690）。次の経路で返る:
     /// - 対応外アーキテクチャ: `consts::SUPPORTED` が偽、または `ArchSysNo::get` が番号を持たない（#1619）
+    /// - 対応外アーキテクチャ（非 LP64）で FFI スタブの `-1` を `last_error()` が写したもの（#3313）
     /// - 古いカーネル: 新マウント API（`fsopen`・`fsconfig`・`fsmount`・`move_mount`・`open_tree` は
     ///   Linux 5.2 未満、`mount_setattr` は 5.12 未満）が返した `ENOSYS` を `new_mount_api_error` が写す。
     ///   それ以外の syscall の `ENOSYS` は写さず [`SysError::Os`] のまま返す
@@ -155,16 +161,21 @@ mod sysno {
 
     /// カーネルへ渡せる syscall 番号。`extern` の `syscall` の第 1 引数はこの型だけを受ける。
     /// `repr(transparent)` により ABI は C の `long`（対応 arch は LP64 のみのため i64）と同一。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[repr(transparent)]
     #[derive(Clone, Copy)]
-    #[cfg_attr(
-        not(all(
-            target_pointer_width = "64",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )),
-        allow(dead_code, reason = "対応外 arch では構築されない（常に Unsupported）")
-    )]
     pub(super) struct SyscallNumber(i64);
+
+    /// 対応外 arch では値を持たない型にする（構築できず、`syscall` を型の上で呼べない。#3202）。
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    #[derive(Clone, Copy)]
+    pub(super) enum SyscallNumber {}
 
     impl SyscallNumber {
         /// 固定値テスト専用の生の番号（対応 arch のみ）。`consts` の固定値テストが `ArchSysNo::get` を
@@ -242,6 +253,305 @@ mod sysno {
 }
 use sysno::{ArchSysNo, SyscallNumber};
 
+/// `syscall(2)` を呼ぶマクロ。LP64 の x86_64・aarch64 ではそのまま `syscall` の呼び出しに展開する。
+/// それ以外では引数を評価して捨て、型の上で到達不能な `syscall_unsupported` へ渡す（#3202）。
+/// 呼び出しは `unsafe` ブロック内に置く。
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+macro_rules! ffi_syscall {
+    ($($arg:expr),* $(,)?) => {
+        $crate::sys::syscall($($arg),*)
+    };
+}
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+macro_rules! ffi_syscall {
+    ($nr:expr $(, $arg:expr)* $(,)?) => {{
+        let _ = ($(&$arg,)*);
+        $crate::sys::unsupported_ffi::syscall_unsupported($nr)
+    }};
+}
+
+/// `ioctl(2)` を呼ぶマクロ。LP64 の x86_64・aarch64 ではそのまま `ioctl` の呼び出しに展開する。
+/// それ以外では引数を評価して捨て、FFI を呼ばずに `-1` を返す（#3202）。呼び出しは `unsafe` ブロック内に置く。
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+macro_rules! ffi_ioctl {
+    ($($arg:expr),* $(,)?) => {
+        $crate::sys::ioctl($($arg),*)
+    };
+}
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+macro_rules! ffi_ioctl {
+    ($fd:expr, $req:expr $(, $arg:expr)* $(,)?) => {{
+        let _ = (&$fd, &$req, $(&$arg,)*);
+        $crate::sys::unsupported_ffi::ioctl_unsupported()
+    }};
+}
+
+/// 自前の定数と `libc` の定数を `const` 評価で 1 件照合する試験専用マクロ（#1848・#1837・#1318・MVM-4・
+/// REPAIR-7・REPAIR-12）。`consts::libc_abi`（arch ごと）・最上位の `libc_abi`・`seccomp_notify::libc_abi`・
+/// から、そのモジュールの `super::<名前>` と `libc::<名前>` を比べるために使う（`sys/macos.rs` は別ファイルのため複製を持つ）。
+///
+/// 両辺の型を引数で明記する。`libc` 側の型（`c_int`・`c_uint`・`c_ulong`・`Ioctl` 等）が将来変わったときは
+/// E0308 で表に出る。比較は `as i128` で行い、これは 64 bit 以下の整数同士では値を切り詰めない（符号の違う
+/// 型も値のまま比べる）ので、幅の違いが食い違いを隠すことはない。食い違いは宣言を直す別 issue とし、
+/// 試験側を宣言に合わせて通さない。関数は呼ばず `unsafe` を使わない。
+#[cfg(test)]
+macro_rules! libc_const_eq {
+    ($own:path, $own_ty:ty, $lib:path, $lib_ty:ty) => {{
+        const OWN: $own_ty = $own;
+        const LIB: $lib_ty = $lib;
+        assert!(
+            OWN as i128 == LIB as i128,
+            concat!("libc mismatch: ", stringify!($own))
+        );
+    }};
+    ($name:ident, $own_ty:ty, $lib_ty:ty) => {
+        libc_const_eq!(super::$name, $own_ty, libc::$name, $lib_ty)
+    };
+}
+
+/// x86_64・aarch64 の `consts` が持つ番号以外の定数を `libc` と照合する一覧（#1848）。両 arch の
+/// `consts::libc_abi` から展開し、`super::` はその arch の `consts`、`libc::` はそのターゲットの `libc`
+/// を指す（他 arch の値は流用しない）。
+///
+/// `libc` に対応物が無く対象外とするもの（一次情報は Linux カーネルのヘッダ）。
+/// - fs magic: `BINFMTFS_MAGIC`・`CONFIGFS_MAGIC`・`EFIVARFS_MAGIC`・`FUSE_CTL_SUPER_MAGIC`・
+///   `MQUEUE_MAGIC`・`PSTOREFS_MAGIC`（include/uapi/linux/magic.h と各 fs の定義）
+/// - `BINDERFS_SUPER_MAGIC`（`libc` は gnu・uclibc にしか持たないため、gnu に限って照合する）
+/// - `ST_VALID`（include/linux/statfs.h）
+/// - bpf: `BPF_PROG_LOAD`・`BPF_PROG_ATTACH`・`BPF_PROG_QUERY`・`BPF_PROG_TYPE_CGROUP_DEVICE`・
+///   `BPF_CGROUP_DEVICE`・`BPF_LOG_LEVEL1`（include/uapi/linux/bpf.h・include/linux/bpf_verifier.h）
+/// - `KCMP_VM`（include/uapi/linux/kcmp.h。`libc` では FreeBSD にしか無い）・`KEXEC_SEGMENT_MAX`
+///   （include/linux/kexec.h）
+/// - Landlock: `LANDLOCK_CREATE_RULESET_VERSION`・`LANDLOCK_RULE_PATH_BENEATH`・
+///   `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`（include/uapi/linux/landlock.h）
+/// - `LINUX_CAPABILITY_VERSION_3`（include/uapi/linux/capability.h の `_LINUX_CAPABILITY_VERSION_3`）
+///
+/// 環境（`target_env`）で `libc` の型が変わる `Ioctl` 型（`NS_GET_*`・`TIOCGPTN`・`TIOCSPTLCK`）・
+/// `RLIMIT_*`・`PTRACE_CONT` は gnu に限って照合する。musl は `libc` の型が `c_int` で、
+/// `TIOCGPTN`（0x8004_5430）が負の値になるため、`as` の読み替えで通さず対象外とする
+/// （core は musl 向けに CI でビルドしない）。
+#[cfg(test)]
+macro_rules! libc_consts_checks {
+    () => {
+        const _: () = {
+            use libc::{c_int, c_long, c_short, c_uint, c_ulong};
+            libc_const_eq!(CLONE_FS, i32, c_int);
+            libc_const_eq!(CLONE_NEWNS, i32, c_int);
+            libc_const_eq!(CLONE_NEWUTS, i32, c_int);
+            libc_const_eq!(CLONE_NEWIPC, i32, c_int);
+            libc_const_eq!(CLONE_NEWUSER, i32, c_int);
+            libc_const_eq!(CLONE_NEWPID, i32, c_int);
+            libc_const_eq!(CLONE_NEWNET, i32, c_int);
+            libc_const_eq!(MS_RDONLY, u64, c_ulong);
+            libc_const_eq!(MS_NOSUID, u64, c_ulong);
+            libc_const_eq!(MS_NODEV, u64, c_ulong);
+            libc_const_eq!(MS_NOEXEC, u64, c_ulong);
+            libc_const_eq!(MS_BIND, u64, c_ulong);
+            libc_const_eq!(MS_REC, u64, c_ulong);
+            libc_const_eq!(MS_PRIVATE, u64, c_ulong);
+            libc_const_eq!(MS_SLAVE, u64, c_ulong);
+            libc_const_eq!(MNT_DETACH, i32, c_int);
+            libc_const_eq!(FSOPEN_CLOEXEC, u32, c_uint);
+            libc_const_eq!(FSMOUNT_CLOEXEC, u32, c_uint);
+            libc_const_eq!(FSCONFIG_SET_FLAG, u32, libc::fsconfig_command);
+            libc_const_eq!(FSCONFIG_SET_STRING, u32, libc::fsconfig_command);
+            libc_const_eq!(FSCONFIG_CMD_CREATE, u32, libc::fsconfig_command);
+            libc_const_eq!(MOUNT_ATTR_RDONLY, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NOSUID, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NODEV, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_NOEXEC, u32, u64);
+            libc_const_eq!(MOUNT_ATTR_STRICTATIME, u32, u64);
+            libc_const_eq!(MOVE_MOUNT_F_EMPTY_PATH, u32, c_uint);
+            libc_const_eq!(MOVE_MOUNT_T_EMPTY_PATH, u32, c_uint);
+            libc_const_eq!(OPEN_TREE_CLONE, u32, c_uint);
+            libc_const_eq!(OPEN_TREE_CLOEXEC, u32, c_uint);
+            // `open_tree`・`mount_setattr` 用に u32 で持つ `AT_*`。名前が `libc` と違う（`libc` は `AT_EMPTY_PATH`・`AT_RECURSIVE`）。
+            libc_const_eq!(
+                super::OPEN_TREE_AT_EMPTY_PATH,
+                u32,
+                libc::AT_EMPTY_PATH,
+                c_int
+            );
+            libc_const_eq!(
+                super::OPEN_TREE_AT_RECURSIVE,
+                u32,
+                libc::AT_RECURSIVE,
+                c_int
+            );
+            libc_const_eq!(
+                super::MOUNT_SETATTR_AT_EMPTY_PATH,
+                u32,
+                libc::AT_EMPTY_PATH,
+                c_int
+            );
+            libc_const_eq!(
+                super::MOUNT_SETATTR_AT_RECURSIVE,
+                u32,
+                libc::AT_RECURSIVE,
+                c_int
+            );
+            libc_const_eq!(CLOSE_RANGE_CLOEXEC, i64, c_uint);
+            libc_const_eq!(WNOHANG, i32, c_int);
+            libc_const_eq!(SIGKILL, i32, c_int);
+            libc_const_eq!(SIGPIPE, i32, c_int);
+            libc_const_eq!(SIGINT, i32, c_int);
+            libc_const_eq!(SIGCHLD, i32, c_int);
+            libc_const_eq!(SIGTERM, i32, c_int);
+            libc_const_eq!(O_DIRECTORY, i32, c_int);
+            libc_const_eq!(O_NOFOLLOW, i32, c_int);
+            libc_const_eq!(O_CLOEXEC, i32, c_int);
+            libc_const_eq!(O_PATH, i32, c_int);
+            libc_const_eq!(O_NONBLOCK, i32, c_int);
+            libc_const_eq!(O_RDWR, i32, c_int);
+            libc_const_eq!(O_NOCTTY, i32, c_int);
+            libc_const_eq!(O_RDONLY, i32, c_int);
+            libc_const_eq!(O_WRONLY, i32, c_int);
+            libc_const_eq!(O_CREAT, i32, c_int);
+            libc_const_eq!(O_EXCL, i32, c_int);
+            libc_const_eq!(AT_REMOVEDIR, i32, c_int);
+            libc_const_eq!(EBUSY, i32, c_int);
+            libc_const_eq!(ENOTEMPTY, i32, c_int);
+            // `statfs.f_type` の magic。`libc` は s390x 以外で `c_long`（= i64）。
+            libc_const_eq!(CGROUP2_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(SYSFS_MAGIC, i64, c_long);
+            libc_const_eq!(DEBUGFS_MAGIC, i64, c_long);
+            libc_const_eq!(TRACEFS_MAGIC, i64, c_long);
+            libc_const_eq!(SECURITYFS_MAGIC, i64, c_long);
+            libc_const_eq!(CGROUP_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(BPF_FS_MAGIC, i64, c_long);
+            libc_const_eq!(SELINUX_MAGIC, i64, c_long);
+            libc_const_eq!(SMACK_MAGIC, i64, c_long);
+            libc_const_eq!(RDTGROUP_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(XENFS_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(NSFS_MAGIC, i64, c_long);
+            libc_const_eq!(ST_NOEXEC, i64, c_ulong);
+            libc_const_eq!(ST_NODEV, i64, c_ulong);
+            libc_const_eq!(ST_RDONLY, i64, c_ulong);
+            libc_const_eq!(ST_NOSUID, i64, c_ulong);
+            libc_const_eq!(AT_EMPTY_PATH, i64, c_int);
+            libc_const_eq!(AT_EXECVE_CHECK, i64, c_int);
+            libc_const_eq!(MFD_CLOEXEC, u32, c_uint);
+            libc_const_eq!(MFD_ALLOW_SEALING, u32, c_uint);
+            libc_const_eq!(MFD_EXEC, u32, c_uint);
+            libc_const_eq!(MFD_NOEXEC_SEAL, u32, c_uint);
+            libc_const_eq!(F_ADD_SEALS, i32, c_int);
+            libc_const_eq!(F_GET_SEALS, i32, c_int);
+            libc_const_eq!(F_SEAL_SEAL, u32, c_int);
+            libc_const_eq!(F_SEAL_SHRINK, u32, c_int);
+            libc_const_eq!(F_SEAL_GROW, u32, c_int);
+            libc_const_eq!(F_SEAL_WRITE, u32, c_int);
+            libc_const_eq!(F_SEAL_EXEC, u32, c_int);
+            libc_const_eq!(F_GETFD, i32, c_int);
+            libc_const_eq!(F_SETFD, i32, c_int);
+            libc_const_eq!(F_GETFL, i32, c_int);
+            libc_const_eq!(F_SETFL, i32, c_int);
+            libc_const_eq!(FD_CLOEXEC, i32, c_int);
+            libc_const_eq!(F_DUPFD_CLOEXEC, i32, c_int);
+            libc_const_eq!(EPERM, i32, c_int);
+            libc_const_eq!(ENOENT, i32, c_int);
+            libc_const_eq!(EACCES, i32, c_int);
+            libc_const_eq!(EEXIST, i32, c_int);
+            libc_const_eq!(ENOTDIR, i32, c_int);
+            libc_const_eq!(EINVAL, i32, c_int);
+            libc_const_eq!(EOPNOTSUPP, i32, c_int);
+            libc_const_eq!(ELOOP, i32, c_int);
+            libc_const_eq!(ESRCH, i32, c_int);
+            libc_const_eq!(ECHILD, i32, c_int);
+            libc_const_eq!(EINTR, i32, c_int);
+            libc_const_eq!(E2BIG, i32, c_int);
+            libc_const_eq!(ENOEXEC, i32, c_int);
+            libc_const_eq!(EBADF, i32, c_int);
+            libc_const_eq!(ENOSYS, i32, c_int);
+            libc_const_eq!(ENOMEM, i32, c_int);
+            libc_const_eq!(ENFILE, i32, c_int);
+            libc_const_eq!(EMFILE, i32, c_int);
+            libc_const_eq!(ENOSPC, i32, c_int);
+            libc_const_eq!(S_IFCHR, u32, libc::mode_t);
+            libc_const_eq!(PR_SET_NO_NEW_PRIVS, i32, c_int);
+            libc_const_eq!(PR_GET_NO_NEW_PRIVS, i32, c_int);
+            libc_const_eq!(PR_GET_DUMPABLE, i32, c_int);
+            libc_const_eq!(PR_SET_DUMPABLE, i32, c_int);
+            libc_const_eq!(PR_SET_PDEATHSIG, i32, c_int);
+            libc_const_eq!(PR_SET_KEEPCAPS, i32, c_int);
+            libc_const_eq!(PR_SET_CHILD_SUBREAPER, i32, c_int);
+            libc_const_eq!(PR_SET_NAME, i32, c_int);
+            libc_const_eq!(PR_GET_CHILD_SUBREAPER, i32, c_int);
+            libc_const_eq!(PR_GET_SECCOMP, i32, c_int);
+            libc_const_eq!(PR_SET_SECCOMP, i32, c_int);
+            libc_const_eq!(SECCOMP_MODE_FILTER, u64, c_uint);
+            libc_const_eq!(PR_CAPBSET_READ, i32, c_int);
+            libc_const_eq!(PR_CAPBSET_DROP, i32, c_int);
+            libc_const_eq!(PR_CAP_AMBIENT, i32, c_int);
+            libc_const_eq!(PR_CAP_AMBIENT_CLEAR_ALL, u64, c_int);
+            libc_const_eq!(AF_NETLINK, u16, c_int);
+            libc_const_eq!(SOCK_RAW, i32, c_int);
+            libc_const_eq!(SOCK_CLOEXEC, i32, c_int);
+            libc_const_eq!(AF_INET, i32, c_int);
+            libc_const_eq!(SOCK_DGRAM, i32, c_int);
+            libc_const_eq!(IFF_UP, i16, c_int);
+            libc_const_eq!(IFF_LOOPBACK, i16, c_int);
+            libc_const_eq!(IFNAMSIZ, usize, libc::size_t);
+            libc_const_eq!(NETLINK_AUDIT, i32, c_int);
+            libc_const_eq!(POLLIN, i16, c_short);
+            libc_const_eq!(MSG_DONTWAIT, i32, c_int);
+            libc_const_eq!(SOL_SOCKET, i32, c_int);
+            libc_const_eq!(SO_DOMAIN, i32, c_int);
+            libc_const_eq!(AF_UNIX, i32, c_int);
+            libc_const_eq!(MSG_NOSIGNAL, i32, c_int);
+            libc_const_eq!(EAGAIN, i32, c_int);
+            libc_const_eq!(EPIPE, i32, c_int);
+            libc_const_eq!(EPROTONOSUPPORT, i32, c_int);
+            libc_const_eq!(EAFNOSUPPORT, i32, c_int);
+            libc_const_eq!(ECONNREFUSED, i32, c_int);
+        };
+        // `libc` の型が環境で変わる定数は gnu に限る（`libc::Ioctl` = `c_ulong`、`RLIMIT_*` = `c_uint`、
+        // `PTRACE_CONT` = `c_uint`、`BINDERFS_SUPER_MAGIC` は gnu・uclibc にだけある。musl は `c_int` で
+        // `TIOCGPTN` が負になるため対象外）。
+        #[cfg(target_env = "gnu")]
+        const _: () = {
+            use libc::{c_long, c_uint, c_ulong};
+            libc_const_eq!(BINDERFS_SUPER_MAGIC, i64, c_long);
+            libc_const_eq!(NS_GET_USERNS, u64, c_ulong);
+            libc_const_eq!(SIOCGIFFLAGS, u64, c_ulong);
+            libc_const_eq!(SIOCSIFFLAGS, u64, c_ulong);
+            libc_const_eq!(NS_GET_PARENT, u64, c_ulong);
+            libc_const_eq!(NS_GET_NSTYPE, u64, c_ulong);
+            libc_const_eq!(NS_GET_OWNER_UID, u64, c_ulong);
+            libc_const_eq!(TIOCGPTN, u64, c_ulong);
+            libc_const_eq!(TIOCSPTLCK, u64, c_ulong);
+            libc_const_eq!(PTRACE_CONT, i64, c_uint);
+            libc_const_eq!(RLIMIT_CPU, i32, c_uint);
+            libc_const_eq!(RLIMIT_FSIZE, i32, c_uint);
+            libc_const_eq!(RLIMIT_DATA, i32, c_uint);
+            libc_const_eq!(RLIMIT_STACK, i32, c_uint);
+            libc_const_eq!(RLIMIT_CORE, i32, c_uint);
+            libc_const_eq!(RLIMIT_RSS, i32, c_uint);
+            libc_const_eq!(RLIMIT_NPROC, i32, c_uint);
+            libc_const_eq!(RLIMIT_NOFILE, i32, c_uint);
+            libc_const_eq!(RLIMIT_MEMLOCK, i32, c_uint);
+            libc_const_eq!(RLIMIT_AS, i32, c_uint);
+            libc_const_eq!(RLIMIT_LOCKS, i32, c_uint);
+            libc_const_eq!(RLIMIT_SIGPENDING, i32, c_uint);
+            libc_const_eq!(RLIMIT_MSGQUEUE, i32, c_uint);
+            libc_const_eq!(RLIMIT_NICE, i32, c_uint);
+            libc_const_eq!(RLIMIT_RTPRIO, i32, c_uint);
+            libc_const_eq!(RLIMIT_RTTIME, i32, c_uint);
+        };
+    };
+}
+
 pub(crate) mod bpf;
 pub(crate) mod seccomp_notify;
 
@@ -258,6 +568,14 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
+    // （4 つとも `_IO(0xb7, 1)`〜`_IO(0xb7, 4)`。`NS_GET_OWNER_UID` は `uid_t` を書き込むが定義は `_IOR` ではなく
+    // `_IO` で、方向・大きさのビットを持たないため x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。
+    // #2674・CORE-3）。
+    pub const NS_GET_USERNS: u64 = 0xb701;
+    pub const NS_GET_PARENT: u64 = 0xb702;
+    pub const NS_GET_NSTYPE: u64 = 0xb703;
+    pub const NS_GET_OWNER_UID: u64 = 0xb704;
     pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
@@ -265,6 +583,8 @@ mod consts {
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MS_SLAVE`（1 << 19。全アーキテクチャ共通）。
+    pub const MS_SLAVE: u64 = 0x8_0000;
     // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
     pub const MNT_DETACH: i32 = 2;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pivot_root`。
@@ -314,6 +634,8 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（x86_64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGINT`（停止シグナルを無視する helper の構築口が使う。#3300）。
+    pub const SIGINT: i32 = 2;
     // arch/x86/include/uapi/asm/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
@@ -406,6 +728,8 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
     pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/memfd.h の `MFD_NOEXEC_SEAL`（6.3+。実行不可で `F_SEAL_EXEC` つきの memfd。全アーキテクチャ共通）。
+    pub const MFD_NOEXEC_SEAL: u32 = 0x8;
     // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
     pub const F_ADD_SEALS: i32 = 1033;
     pub const F_GET_SEALS: i32 = 1034;
@@ -569,6 +893,16 @@ mod consts {
     pub const AF_NETLINK: u16 = 16;
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    // include/linux/socket.h・uapi/asm-generic/socket.h・uapi/linux/sockios.h・uapi/linux/if.h の値
+    // （rootless の中間プロセスが新しい network namespace の `lo` を up にする `SIOCGIFFLAGS` /
+    // `SIOCSIFFLAGS`。NET-6・CORE-6・#3064）。`IFF_UP`・`IFF_LOOPBACK` は `ifr_flags`（`short`）のビット。
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_DGRAM: i32 = 2;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const IFF_UP: i16 = 0x1;
+    pub const IFF_LOOPBACK: i16 = 0x8;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
@@ -584,6 +918,62 @@ mod consts {
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
+
+    /// x86_64 の syscall 番号を `libc` 0.2.189 と `const` 評価で照合する（#1847・#1837・#1318・MVM-4・
+    /// REPAIR-7・REPAIR-12）。関数は呼ばず `unsafe` を使わない。
+    ///
+    /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
+    /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
+    /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
+    /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
+    /// 一次情報: arch/x86/entry/syscalls/syscall_64.tbl、`libc` の `src/unix/linux_like/linux/{gnu,musl}/b64/`。
+    /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::super::ArchSysNo;
+
+        const fn nr(n: ArchSysNo) -> i64 {
+            match n.get() {
+                Ok(v) => v.raw(),
+                // 対応 arch の cfg の下でだけ定義するため到達しない（到達すればコンパイルエラー）。
+                Err(_) => panic!("unsupported arch"),
+            }
+        }
+
+        const _: () = {
+            assert!(nr(super::SYS_PIVOT_ROOT) == libc::SYS_pivot_root);
+            assert!(nr(super::SYS_CLOSE_RANGE) == libc::SYS_close_range);
+            assert!(nr(super::SYS_MOVE_MOUNT) == libc::SYS_move_mount);
+            assert!(nr(super::SYS_FSOPEN) == libc::SYS_fsopen);
+            assert!(nr(super::SYS_FSCONFIG) == libc::SYS_fsconfig);
+            assert!(nr(super::SYS_FSMOUNT) == libc::SYS_fsmount);
+            assert!(nr(super::SYS_OPEN_TREE) == libc::SYS_open_tree);
+            assert!(nr(super::SYS_MOUNT_SETATTR) == libc::SYS_mount_setattr);
+            assert!(nr(super::SYS_PIDFD_SEND_SIGNAL) == libc::SYS_pidfd_send_signal);
+            assert!(nr(super::SYS_PIDFD_OPEN) == libc::SYS_pidfd_open);
+            assert!(nr(super::SYS_EXECVEAT) == libc::SYS_execveat);
+            assert!(nr(super::SYS_MEMFD_CREATE) == libc::SYS_memfd_create);
+            assert!(nr(super::SYS_LANDLOCK_CREATE_RULESET) == libc::SYS_landlock_create_ruleset);
+            assert!(nr(super::SYS_LANDLOCK_ADD_RULE) == libc::SYS_landlock_add_rule);
+            assert!(nr(super::SYS_LANDLOCK_RESTRICT_SELF) == libc::SYS_landlock_restrict_self);
+            assert!(nr(super::SYS_BPF) == libc::SYS_bpf);
+            assert!(nr(super::SYS_CAPGET) == libc::SYS_capget);
+            assert!(nr(super::SYS_CAPSET) == libc::SYS_capset);
+            assert!(nr(super::SYS_GETGROUPS) == libc::SYS_getgroups);
+            assert!(nr(super::SYS_SETGROUPS) == libc::SYS_setgroups);
+            assert!(nr(super::SYS_SETRESUID) == libc::SYS_setresuid);
+            assert!(nr(super::SYS_GETRESUID) == libc::SYS_getresuid);
+            assert!(nr(super::SYS_SETRESGID) == libc::SYS_setresgid);
+            assert!(nr(super::SYS_GETRESGID) == libc::SYS_getresgid);
+            assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
+            assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
+            assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+        };
+
+        libc_consts_checks!();
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
@@ -598,6 +988,14 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    // include/uapi/linux/nsfs.h の `NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_NSTYPE`・`NS_GET_OWNER_UID`
+    // （4 つとも `_IO(0xb7, 1)`〜`_IO(0xb7, 4)`。`NS_GET_OWNER_UID` は `uid_t` を書き込むが定義は `_IOR` ではなく
+    // `_IO` で、方向・大きさのビットを持たないため x86_64 と aarch64 で同じ値。namespace の fd の素性を照合する。
+    // #2674・CORE-3）。
+    pub const NS_GET_USERNS: u64 = 0xb701;
+    pub const NS_GET_PARENT: u64 = 0xb702;
+    pub const NS_GET_NSTYPE: u64 = 0xb703;
+    pub const NS_GET_OWNER_UID: u64 = 0xb704;
     pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
@@ -605,6 +1003,8 @@ mod consts {
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MS_SLAVE`（1 << 19。全アーキテクチャ共通）。
+    pub const MS_SLAVE: u64 = 0x8_0000;
     // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
     pub const MNT_DETACH: i32 = 2;
     // include/uapi/asm-generic/unistd.h の `__NR_pivot_root`（arm64 は asm-generic の表を使う。
@@ -658,6 +1058,8 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGKILL`・`SIGPIPE`（arm64 は上書きしない）。
     pub const SIGKILL: i32 = 9;
     pub const SIGPIPE: i32 = 13;
+    // include/uapi/asm-generic/signal.h の `SIGINT`（停止シグナルを無視する helper の構築口が使う。#3300）。
+    pub const SIGINT: i32 = 2;
     // include/uapi/asm-generic/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
@@ -754,6 +1156,8 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
     pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/memfd.h の `MFD_NOEXEC_SEAL`（6.3+。実行不可で `F_SEAL_EXEC` つきの memfd。全アーキテクチャ共通）。
+    pub const MFD_NOEXEC_SEAL: u32 = 0x8;
     // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
     pub const F_ADD_SEALS: i32 = 1033;
     pub const F_GET_SEALS: i32 = 1034;
@@ -913,6 +1317,16 @@ mod consts {
     pub const AF_NETLINK: u16 = 16;
     pub const SOCK_RAW: i32 = 3;
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
+    // include/linux/socket.h・uapi/asm-generic/socket.h・uapi/linux/sockios.h・uapi/linux/if.h の値
+    // （rootless の中間プロセスが新しい network namespace の `lo` を up にする `SIOCGIFFLAGS` /
+    // `SIOCSIFFLAGS`。NET-6・CORE-6・#3064）。`IFF_UP`・`IFF_LOOPBACK` は `ifr_flags`（`short`）のビット。
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_DGRAM: i32 = 2;
+    pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
+    pub const IFF_UP: i16 = 0x1;
+    pub const IFF_LOOPBACK: i16 = 0x8;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
@@ -928,6 +1342,62 @@ mod consts {
     pub const EPROTONOSUPPORT: i32 = 93;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ECONNREFUSED: i32 = 111;
+
+    /// aarch64 の syscall 番号を `libc` 0.2.189 と `const` 評価で照合する（#1847・#1837・#1318・MVM-4・
+    /// REPAIR-7・REPAIR-12）。関数は呼ばず `unsafe` を使わない。
+    ///
+    /// 値の読み出しは既存の `ArchSysNo::get` と試験専用の `SyscallNumber::raw` だけを使い、
+    /// 型の保証（対応外 arch では番号を取り出せない）は変えない。名前は小文字化で `libc` の
+    /// `SYS_<name>` と 1 対 1 に対応する（名前違いなし。27 件すべて照合）。
+    /// 対象外: 対応外 arch の `consts` と `seccomp_notify` の対応外側は `ArchSysNo::UNSUPPORTED` で
+    /// 番号を持たず、照合する値が無い（#1619）。x32・ILP32 は `target_pointer_width = "64"` の cfg で
+    /// 対応外（`libc` の x32 の番号は `__X32_SYSCALL_BIT` 付きで別物）。
+    /// 一次情報: include/uapi/asm-generic/unistd.h、`libc` の `src/unix/linux_like/linux/{gnu,musl}/b64/`。
+    /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::super::ArchSysNo;
+
+        const fn nr(n: ArchSysNo) -> i64 {
+            match n.get() {
+                Ok(v) => v.raw(),
+                // 対応 arch の cfg の下でだけ定義するため到達しない（到達すればコンパイルエラー）。
+                Err(_) => panic!("unsupported arch"),
+            }
+        }
+
+        const _: () = {
+            assert!(nr(super::SYS_PIVOT_ROOT) == libc::SYS_pivot_root);
+            assert!(nr(super::SYS_CLOSE_RANGE) == libc::SYS_close_range);
+            assert!(nr(super::SYS_MOVE_MOUNT) == libc::SYS_move_mount);
+            assert!(nr(super::SYS_FSOPEN) == libc::SYS_fsopen);
+            assert!(nr(super::SYS_FSCONFIG) == libc::SYS_fsconfig);
+            assert!(nr(super::SYS_FSMOUNT) == libc::SYS_fsmount);
+            assert!(nr(super::SYS_OPEN_TREE) == libc::SYS_open_tree);
+            assert!(nr(super::SYS_MOUNT_SETATTR) == libc::SYS_mount_setattr);
+            assert!(nr(super::SYS_PIDFD_SEND_SIGNAL) == libc::SYS_pidfd_send_signal);
+            assert!(nr(super::SYS_PIDFD_OPEN) == libc::SYS_pidfd_open);
+            assert!(nr(super::SYS_EXECVEAT) == libc::SYS_execveat);
+            assert!(nr(super::SYS_MEMFD_CREATE) == libc::SYS_memfd_create);
+            assert!(nr(super::SYS_LANDLOCK_CREATE_RULESET) == libc::SYS_landlock_create_ruleset);
+            assert!(nr(super::SYS_LANDLOCK_ADD_RULE) == libc::SYS_landlock_add_rule);
+            assert!(nr(super::SYS_LANDLOCK_RESTRICT_SELF) == libc::SYS_landlock_restrict_self);
+            assert!(nr(super::SYS_BPF) == libc::SYS_bpf);
+            assert!(nr(super::SYS_CAPGET) == libc::SYS_capget);
+            assert!(nr(super::SYS_CAPSET) == libc::SYS_capset);
+            assert!(nr(super::SYS_GETGROUPS) == libc::SYS_getgroups);
+            assert!(nr(super::SYS_SETGROUPS) == libc::SYS_setgroups);
+            assert!(nr(super::SYS_SETRESUID) == libc::SYS_setresuid);
+            assert!(nr(super::SYS_GETRESUID) == libc::SYS_getresuid);
+            assert!(nr(super::SYS_SETRESGID) == libc::SYS_setresgid);
+            assert!(nr(super::SYS_GETRESGID) == libc::SYS_getresgid);
+            assert!(nr(super::SYS_PTRACE) == libc::SYS_ptrace);
+            assert!(nr(super::SYS_KEXEC_LOAD) == libc::SYS_kexec_load);
+            assert!(nr(super::SYS_KCMP) == libc::SYS_kcmp);
+        };
+
+        libc_consts_checks!();
+    }
 }
 
 /// 対応外アーキテクチャ: 定数は 0 で、ラッパーは `Unsupported` を返す。errno は実在しない
@@ -947,6 +1417,10 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
     pub const CLONE_NEWNET: i32 = 0;
+    pub const NS_GET_USERNS: u64 = 0;
+    pub const NS_GET_PARENT: u64 = 0;
+    pub const NS_GET_NSTYPE: u64 = 0;
+    pub const NS_GET_OWNER_UID: u64 = 0;
     pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
@@ -954,6 +1428,7 @@ mod consts {
     pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
+    pub const MS_SLAVE: u64 = 0;
     pub const MNT_DETACH: i32 = 0;
     pub const SYS_PIVOT_ROOT: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_CLOSE_RANGE: ArchSysNo = ArchSysNo::UNSUPPORTED;
@@ -990,6 +1465,7 @@ mod consts {
     pub const WNOHANG: i32 = 0;
     pub const SIGKILL: i32 = 0;
     pub const SIGPIPE: i32 = 0;
+    pub const SIGINT: i32 = 0;
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 0;
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
@@ -1043,6 +1519,7 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0;
     pub const MFD_ALLOW_SEALING: u32 = 0;
     pub const MFD_EXEC: u32 = 0;
+    pub const MFD_NOEXEC_SEAL: u32 = 0;
     pub const F_ADD_SEALS: i32 = 0;
     pub const F_GET_SEALS: i32 = 0;
     pub const F_SEAL_SEAL: u32 = 0;
@@ -1160,6 +1637,13 @@ mod consts {
     pub const AF_NETLINK: u16 = 0;
     pub const SOCK_RAW: i32 = 0;
     pub const SOCK_CLOEXEC: i32 = 0;
+    pub const AF_INET: i32 = 0;
+    pub const SOCK_DGRAM: i32 = 0;
+    pub const SIOCGIFFLAGS: u64 = 0;
+    pub const SIOCSIFFLAGS: u64 = 0;
+    pub const IFF_UP: i16 = 0;
+    pub const IFF_LOOPBACK: i16 = 0;
+    pub const IFNAMSIZ: usize = 16;
     pub const NETLINK_AUDIT: i32 = 0;
     pub const POLLIN: i16 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
@@ -1186,7 +1670,8 @@ pub(crate) enum NsFlag {
     Ipc,
     User,
     Pid,
-    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）専用で、`unshare` 経路は使わない。
+    /// network namespace。`setns(2)` による参加（SUP-6・TASK-163.1）と、Loopback モードの `unshare`
+    /// （rootless の中間プロセスが新しい netns を作る。NET-6・#3064）で使う。
     Net,
 }
 
@@ -1204,14 +1689,16 @@ impl NsFlag {
     }
 }
 
+// `long` / `unsigned long` / `off_t` の幅に依存する宣言。`long` が 64 bit の LP64（x86_64・aarch64）でのみ宣言する。
+// cfg は最上位の `libc_abi` の照合と同一にし、宣言があるのに照合されないターゲットを作らない
+// （#3202・MVM-4・SUP-6・REPAIR-12）。それ以外のターゲットでは宣言を持たず、下のスタブとマクロが
+// FFI を呼ばずに失敗させる（`compile_error!` にしない理由: 他の fail-closed と形を揃え、非 LP64 でも
+// crate をビルドできるため。supervisor が core に依存するため）。
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 unsafe extern "C" {
-    // SAFETY（宣言そのものの妥当性）: glibc 2.14+ / musl の `int setns(int fd, int nstype)` と同じ型幅
-    // （SUP-6・TASK-163.1）。`syscall(2)` 経由にせず arch 別の syscall 番号を増やさない。
-    fn setns(fd: i32, nstype: i32) -> i32;
-    // SAFETY（宣言そのものの妥当性）: glibc / musl の `int unshare(int flags)` と同じ型幅。
-    fn unshare(flags: i32) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `int sethostname(const char *name, size_t len)`。
-    fn sethostname(name: *const core::ffi::c_char, len: usize) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int mount(const char *source, const char *target,
     // const char *fstype, unsigned long flags, const void *data)`（`c_ulong` は LP64 で u64）。
     fn mount(
@@ -1221,17 +1708,133 @@ unsafe extern "C" {
         flags: u64,
         data: *const core::ffi::c_void,
     ) -> i32;
-    // SAFETY（宣言そのものの妥当性）: `int openat(int dirfd, const char *path, int flags, ...)`
-    // と同じく可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
-    // 異なる ABI で未定義動作になる）。可変長部は mode で、O_CREAT / O_TMPFILE 不使用の
-    // ため渡さない（カーネル・libc は読まない）。
-    fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `long syscall(long number, ...)`（glibc / musl。LP64 で
     // `long` は i64）。`pivot_root(2)` は glibc にラッパーが無いため使う。可変長引数として宣言する
     // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
     // 第 1 引数は `repr(transparent)` の `SyscallNumber`（中身 i64）で `long` と ABI が同一。
     // 番号は `ArchSysNo::get` からしか得られない（#1619。対応外 arch では常に `Unsupported`）。
     fn syscall(number: SyscallNumber, ...) -> i64;
+    // SAFETY（宣言そのものの妥当性）: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は
+    // `request` が `int`）。可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
+    // 異なる ABI で未定義動作になる）。`c_ulong` は LP64 で u64。pty の unlock と番号の取得（`TIOCSPTLCK`・
+    // `TIOCGPTN`。#1681）と、nsfs の namespace fd の素性の照合（`NS_GET_NSTYPE`・`NS_GET_USERNS`・`NS_GET_PARENT`・
+    // `NS_GET_OWNER_UID`。#2674・CORE-3・CRI-2）に使う。
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
+    // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
+    // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
+    fn prctl(option: i32, ...) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)`
+    // （glibc / musl。Linux の LP64 で `off_t` は i64・`ssize_t` は isize）。型（`off_t *`・`size_t`・`ssize_t`）は
+    // 最上位の `libc_abi` で `libc` と `const` 評価で照合する（#1849・#2759・#2728 P2-3）。#2628・CORE-6・SEC-5。
+    fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize;
+    // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
+    // （`nfds_t` は `unsigned long`＝LP64 で u64）。
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+/// 非 LP64（x32・ILP32 を含む）向けのスタブ群。`long` / `unsigned long` / `off_t` の幅が食い違う ABI で
+/// FFI を発行せず、`-1` を返して失敗させる（fail-closed）。呼び出し元は各ラッパー冒頭の `consts::SUPPORTED`
+/// 検査で先に `Unsupported` を返すため通常は到達しない。万一すり抜けても `-1` は失敗として扱われ、成功に倒れない
+/// （スタブは errno を設定しないが、非 LP64 では `last_error()` が errno を読まず `SysError::Unsupported` を
+/// 返すため、`Unsupported` に倒れる。#3313・MVM-4）。
+///
+/// 各スタブを `unsafe fn` にしているのは、LP64 側の `unsafe extern "C"` 宣言と呼び出し側の
+/// `unsafe { ... }` の形を両 cfg で揃えるため（片側だけ安全な関数にすると呼び出し側の cfg 分岐が要る）。
+/// いずれも本体は引数（ポインタを含む）を読まず FFI・syscall を発行せず `-1` を返すだけで、呼び出し側に
+/// 追加の前提は無い（#3313・REPAIR-3）。
+/// `syscall` は [`SyscallNumber`] が非 LP64 では値を持たない型のため、型の上で呼べない（`ffi_syscall!`）。
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+mod unsupported_ffi {
+    use super::PollFd;
+
+    /// `mount(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
+    pub(super) unsafe fn mount(
+        _source: *const core::ffi::c_char,
+        _target: *const core::ffi::c_char,
+        _fstype: *const core::ffi::c_char,
+        _flags: u64,
+        _data: *const core::ffi::c_void,
+    ) -> i32 {
+        -1
+    }
+
+    /// `prctl(2)` の非 LP64 スタブ（呼び出しはすべて option + 4 引数）。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
+    pub(super) unsafe fn prctl<A, B, C, D>(_option: i32, _a: A, _b: B, _c: C, _d: D) -> i32 {
+        -1
+    }
+
+    /// `sendfile(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
+    pub(super) unsafe fn sendfile(
+        _out_fd: i32,
+        _in_fd: i32,
+        _offset: *mut i64,
+        _count: usize,
+    ) -> isize {
+        -1
+    }
+
+    /// `poll(2)` の非 LP64 スタブ。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
+    pub(super) unsafe fn poll(_fds: *mut PollFd, _nfds: u64, _timeout: i32) -> i32 {
+        -1
+    }
+
+    /// `ioctl(2)` の非 LP64 スタブ（`ffi_ioctl!` が引数を評価して捨てたあとに呼ぶ）。何も発行せず `-1`。
+    ///
+    /// # Safety
+    ///
+    /// 引数を読まず FFI も発行しない（`-1` を返すだけ）ため、呼び出し側に追加の前提は無い。戻り値 `-1` は失敗として扱う。
+    pub(in crate::sys) unsafe fn ioctl_unsupported() -> i32 {
+        -1
+    }
+
+    /// `syscall(2)` の非 LP64 スタブ。[`SyscallNumber`](super::SyscallNumber) は値を持たない型なので呼べない。
+    ///
+    /// # Safety
+    ///
+    /// `SyscallNumber` は非 LP64 では値を持たない型で、この関数は呼べない（`match nr {}` に到達しない）ため前提も無い。
+    pub(in crate::sys) unsafe fn syscall_unsupported(nr: super::SyscallNumber) -> i64 {
+        match nr {}
+    }
+}
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+use unsupported_ffi::{mount, poll, prctl, sendfile};
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: glibc 2.14+ / musl の `int setns(int fd, int nstype)` と同じ型幅
+    // （SUP-6・TASK-163.1）。`syscall(2)` 経由にせず arch 別の syscall 番号を増やさない。
+    fn setns(fd: i32, nstype: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: glibc / musl の `int unshare(int flags)` と同じ型幅。
+    fn unshare(flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int sethostname(const char *name, size_t len)`。
+    fn sethostname(name: *const core::ffi::c_char, len: usize) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int openat(int dirfd, const char *path, int flags, ...)`
+    // と同じく可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
+    // 異なる ABI で未定義動作になる）。可変長部は mode で、O_CREAT / O_TMPFILE 不使用の
+    // ため渡さない（カーネル・libc は読まない）。
+    fn openat(dirfd: i32, path: *const core::ffi::c_char, flags: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int umount2(const char *target, int flags)`。
     fn umount2(target: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fchdir(int fd)`。
@@ -1241,10 +1844,6 @@ unsafe extern "C" {
     fn mknodat(dirfd: i32, path: *const core::ffi::c_char, mode: u32, dev: u64) -> i32;
     // SAFETY（宣言そのものの妥当性）: `uid_t geteuid(void)`（Linux の `uid_t` は u32）。
     fn geteuid() -> u32;
-    // SAFETY（宣言そのものの妥当性）: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は
-    // `request` が `int`）。可変長引数として宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が
-    // 異なる ABI で未定義動作になる）。`c_ulong` は LP64 で u64。pty の unlock と番号の取得だけに使う。
-    fn ioctl(fd: i32, request: u64, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `gid_t getegid(void)`（Linux の `gid_t` は u32）。
     fn getegid() -> u32;
     // SAFETY（宣言そのものの妥当性）: `pid_t fork(void)`（Linux の `pid_t` は i32）。
@@ -1268,13 +1867,11 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（Linux の `pid_t` は i32。失敗は `(pid_t)-1`）。
     // libc のラッパーを使い、arch 別の syscall 番号を増やさない（SUP-6・TASK-163 追補・#1456）。
     fn setsid() -> i32;
-    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc / musl）。可変長引数として
-    // 宣言する（非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。
-    // 可変長部は `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
-    fn prctl(option: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int mkdirat(int dirfd, const char *path, mode_t mode)`
     // （LP64 で `mode_t` は u32）。
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int chmod(const char *path, mode_t mode)`（LP64 で `mode_t` は u32）。
+    fn chmod(path: *const core::ffi::c_char, mode: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
@@ -1324,9 +1921,6 @@ unsafe extern "C" {
         addr: *mut SockaddrNl,
         addrlen: *mut u32,
     ) -> isize;
-    // SAFETY（宣言そのものの妥当性）: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`
-    // （`nfds_t` は `unsigned long`＝LP64 で u64）。
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int prlimit(pid_t pid, int resource, const struct rlimit64 *new_limit,
     // struct rlimit64 *old_limit)`（glibc 2.13 以降・musl。LP64 の `pid_t` は i32、`resource` は
     // `enum __rlimit_resource` 相当で `int` 幅）。構造体は下の [`RLimit64`]（`rlim64_t` = u64 × 2）。
@@ -1397,6 +1991,108 @@ struct StatFs {
 struct StatFs {
     f_type: i64,
     f_flags: i64,
+}
+
+/// `struct ifreq` のうち `ifr_flags`（`SIOCGIFFLAGS` / `SIOCSIFFLAGS`）だけを表す型（NET-6・#3064）。
+///
+/// 名前は常に `lo` で、呼び出し元から受け取らない（壊れた値を表現できない形にする。REPAIR-2）。
+/// カーネルは `sizeof(struct ifreq)`（16 バイトの名前 + 24 バイトの union。union は pointer を含み
+/// アラインメント 8）= 40 バイトを読み書きするため、`_pad` で union の大きさを埋める。レイアウトは
+/// 最上位の `libc_abi` で `libc::ifreq` と `const` 評価で照合する。
+#[repr(C, align(8))]
+struct IfReqFlags {
+    ifr_name: [u8; consts::IFNAMSIZ],
+    ifr_flags: i16,
+    _pad: [u8; 22],
+}
+
+impl IfReqFlags {
+    /// 名前 `lo`・flags 0 の要求を作る。
+    fn loopback() -> Self {
+        let mut ifr_name = [0u8; consts::IFNAMSIZ];
+        ifr_name[0] = b'l';
+        ifr_name[1] = b'o';
+        Self {
+            ifr_name,
+            ifr_flags: 0,
+            _pad: [0; 22],
+        }
+    }
+}
+
+/// `socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0)` を開く（`lo` の flags の ioctl 用。送受信はしない）。
+fn inet_dgram_socket() -> Result<OwnedFd, SysError> {
+    // SAFETY: 引数はすべて値渡しの整数でポインタを取らない。成功時の戻り値は新規 fd で、直後に
+    // `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe {
+        socket(
+            consts::AF_INET,
+            consts::SOCK_DGRAM | consts::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した socket が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 現在の network namespace の `lo` の flags を `SIOCGIFFLAGS` で読む。読み取りだけで特権は要らない。
+fn get_loopback_flags(fd: BorrowedFd<'_>) -> Result<i16, SysError> {
+    let mut req = IfReqFlags::loopback();
+    // SAFETY: `req` はスタック上の初期化済み 40 バイトの `repr(C, align(8))` で、カーネルが
+    // `SIOCGIFFLAGS` で読み書きする `struct ifreq`（40 バイト）と同じ大きさ・アラインメント
+    // （`libc_abi` で照合）。`fd` は生存中の `BorrowedFd`。`req` は呼び出しの間ほかから借用されない。
+    let r = unsafe { ffi_ioctl!(fd.as_raw_fd(), consts::SIOCGIFFLAGS, &raw mut req) };
+    if r < 0 {
+        return Err(last_error());
+    }
+    Ok(req.ifr_flags)
+}
+
+/// 現在の network namespace の `lo` の flags を返す（`SIOCGIFFLAGS`。読み取りのみ）。
+///
+/// 呼び出し元の netns の `lo` を観測する試験・診断用。ホストの設定は変えない（NET-6・#3064）。
+#[cfg(test)]
+pub(crate) fn loopback_flags() -> Result<i16, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let sock = inet_dgram_socket()?;
+    get_loopback_flags(sock.as_fd())
+}
+
+/// 現在の network namespace の `lo` を up にする（NET-6・CORE-6・#3064）。
+///
+/// rootless の中間プロセスが新しい netns（コンテナの user namespace が所有）へ入った直後、exec より前に
+/// 呼ぶ。`SIOCSIFFLAGS` は netns を所有する user namespace の `CAP_NET_ADMIN` を要する。fail-closed:
+/// `lo` が loopback でなければ拒否し、get してから `IFF_UP` を足して set し、事後に up を確かめる。
+/// 名前は固定の `lo`。ホストの netns に対して呼ばないこと（呼び出しは `exec` の `Net` 分岐だけ）。
+pub(crate) fn set_loopback_up() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let sock = inet_dgram_socket()?;
+    let flags = get_loopback_flags(sock.as_fd())?;
+    if flags & consts::IFF_LOOPBACK == 0 {
+        return Err(SysError::Os(consts::EINVAL));
+    }
+    if flags & consts::IFF_UP == 0 {
+        let mut req = IfReqFlags::loopback();
+        req.ifr_flags = flags | consts::IFF_UP;
+        // SAFETY: `req` はスタック上の初期化済み 40 バイトの `repr(C, align(8))`（`struct ifreq` と同じ
+        // 大きさ・アラインメント。`libc_abi` で照合）。`sock` は生存中の `OwnedFd`。カーネルは
+        // `SIOCSIFFLAGS` で `req` を読むだけで、呼び出しの間ほかから借用されない。
+        let r = unsafe { ffi_ioctl!(sock.as_raw_fd(), consts::SIOCSIFFLAGS, &raw const req) };
+        if r < 0 {
+            return Err(last_error());
+        }
+    }
+    if get_loopback_flags(sock.as_fd())? & consts::IFF_UP == 0 {
+        return Err(SysError::Os(consts::EINVAL));
+    }
+    Ok(())
 }
 
 /// カーネル監査（NETLINK_AUDIT）用のソケットを開く（`SOCK_RAW|SOCK_CLOEXEC`。TASK-41.5.2・#840）。
@@ -1584,9 +2280,121 @@ pub(crate) fn setns_pidfd(pidfd: BorrowedFd<'_>, flags: &[NsFlag]) -> Result<(),
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 開いた namespace の fd へ `setns(2)` で参加する（`flag` は fd の種別と一致していること。不一致はカーネルが
+/// `EINVAL`）。pod の user・ipc namespace の join 専用（CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+///
+/// 呼び出しは `crate::exec` の join 分離のみで、`Threads: 1` の中間プロセス（fork 子）から呼ぶ。
+/// `NsFlag::User` は単一スレッドで `fs_struct` を共有しないことを要する（満たさなければ `EINVAL`）。
+pub(crate) fn setns_fd(fd: BorrowedFd<'_>, flag: NsFlag) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを取らない。`fd` は呼び出しの間有効な `BorrowedFd`。副作用は
+    // 呼び出しスレッドの namespace 所属の変更で、呼び出し側が単一スレッドであることを確認済み。失敗時（-1）は
+    // カーネルが namespace を変更しない。
+    let rc = unsafe { setns(fd.as_raw_fd(), flag.bits()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// namespace の fd の種別（`NS_GET_NSTYPE`。`CLONE_NEW*` のビット値）を返す。
+pub(crate) fn ns_type(fd: BorrowedFd<'_>) -> Result<i32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`NS_GET_NSTYPE` は追加引数を取らず、種別を戻り値で返すだけで
+    // 呼び出し側のメモリに書かない。
+    let rc = unsafe { ffi_ioctl!(fd.as_raw_fd(), consts::NS_GET_NSTYPE) };
+    if rc < 0 { Err(last_error()) } else { Ok(rc) }
+}
+
+/// namespace `fd` を所有する user namespace の fd（`NS_GET_USERNS`）を返す。
+///
+/// 自分の user namespace の外（祖先の外側）の所有者は `EPERM`。戻りの fd は新規で `OwnedFd` が唯一の所有者。
+pub(crate) fn ns_owner_userns(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    ns_fd_ioctl(fd, consts::NS_GET_USERNS)
+}
+
+/// user namespace `fd` の親 user namespace の fd（`NS_GET_PARENT`）を返す。
+///
+/// 呼び出し側の user namespace の祖先でない（親が見えない）ときは `EPERM`、初期 user namespace は `EPERM`。
+pub(crate) fn ns_parent(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    ns_fd_ioctl(fd, consts::NS_GET_PARENT)
+}
+
+/// fd を返す nsfs の ioctl（追加引数なし）の共通部。
+fn ns_fd_ioctl(fd: BorrowedFd<'_>, request: u64) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`request` は呼び出し元の 2 関数が渡す `NS_GET_USERNS` /
+    // `NS_GET_PARENT` だけで、どちらも追加引数を取らず、成功時は新しい fd を戻り値で返し、呼び出し側のメモリには
+    // 書かない。
+    let rc = unsafe { ffi_ioctl!(fd.as_raw_fd(), request) };
+    if rc < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `rc` は上で成功した ioctl が返した新規 fd で、他に所有者がいない（二重 close なし）。
+    Ok(unsafe { OwnedFd::from_raw_fd(rc) })
+}
+
+/// user namespace `fd` の作成者の euid（`NS_GET_OWNER_UID`）を返す。user namespace 以外は `EINVAL`。
+pub(crate) fn ns_owner_uid(fd: BorrowedFd<'_>) -> Result<u32, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut uid: u32 = 0;
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`NS_GET_OWNER_UID` はスタック上の `uid_t`（u32）を指す書き込み可能な
+    // ポインタを取り、カーネルはそこへ 4 バイトだけを書く（`uid` は呼び出しの間生存する）。
+    let rc = unsafe {
+        ffi_ioctl!(
+            fd.as_raw_fd(),
+            consts::NS_GET_OWNER_UID,
+            std::ptr::from_mut(&mut uid),
+        )
+    };
+    if rc < 0 { Err(last_error()) } else { Ok(uid) }
+}
+
+/// namespace ファイル（`/proc/<pid>/ns/*` 等。最終要素の magic link は辿る）を `O_RDONLY|O_NONBLOCK|O_NOCTTY|
+/// O_CLOEXEC` で開く。nsfs 以外（FIFO・tty 等）を指されても open で止まらず、制御端末にもならない
+/// （種別は呼び出し側が `fs_type` と `ns_type` で確かめる。CRI-2・CORE-3・SEC-1。#2674）。
+pub(crate) fn open_ns_file(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY | consts::O_CLOEXEC;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。dirfd は `AT_FDCWD`。flags に
+    // O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// 直前の失敗した syscall の errno を `SysError` にする（失敗直後に呼ぶこと）。
+///
+/// 非 LP64（`consts::SUPPORTED` が偽）では errno を読まず `SysError::Unsupported` を返す。FFI スタブ
+/// （`unsupported_ffi`）は errno を設定しないため、直前の古い errno を拾って `Os(..)` に誤分類しないようにする
+/// （#3313・MVM-4）。代償として、`SUPPORTED` 検査を持たないラッパーも非 LP64 では実 errno の代わりに
+/// `Unsupported` を返すが、非 LP64 は arch ごと対応外なので許容する。スタブ側で errno を設定する案は、新しい
+/// `extern` 宣言と `unsafe` が要り、非 LP64 では `libc_abi` の照合も働かないため採らない。
+/// 対応 arch では `SUPPORTED` が定数の真で分岐は消え、挙動は変わらない。
 fn last_error() -> SysError {
-    SysError::Os(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    classify_last_error(consts::SUPPORTED, || {
+        io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    })
+}
+
+/// [`last_error`] の分類本体。`supported` が偽なら `read_errno` を呼ばず `Unsupported` を返す
+/// （非 LP64 でも x86_64 上で分岐を試験できるよう、`SUPPORTED` と errno の読み出しを引数で受ける。#3313・MVM-4）。
+fn classify_last_error(supported: bool, read_errno: impl FnOnce() -> i32) -> SysError {
+    if !supported {
+        return SysError::Unsupported;
+    }
+    SysError::Os(read_errno())
 }
 
 /// 指定 namespace 群を 1 回の `unshare(2)` で分離する。
@@ -1632,19 +2440,44 @@ pub(crate) fn set_hostname(name: &[u8]) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `/` の再帰的な伝播の設定（`mount(2)` の `MS_REC` と組み合わせる種類）。値は 2 つに限り、任意のフラグを渡す経路を
+/// 持たない（REPAIR-2・SEC-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootPropagation {
+    /// `MS_REC|MS_PRIVATE`。以後のマウントをホストへ伝播させず、ホストからも受けない（既定）。
+    Private,
+    /// `MS_REC|MS_SLAVE`。ホストからは受け、ホストへは伝播させない。`master:` の関係を消さないためだけに使い、
+    /// `rslave` の bind mount を求めた起動の中間プロセス側に限る（OCI-4・CRI-2・SEC-1。`docs/design/mount-propagation.md`）。
+    Slave,
+}
+
+/// [`RootPropagation`] の `mount(2)` のフラグ（`MS_REC` を含む）。
+pub(crate) const fn root_propagation_flags(mode: RootPropagation) -> u64 {
+    match mode {
+        RootPropagation::Private => consts::MS_REC | consts::MS_PRIVATE,
+        RootPropagation::Slave => consts::MS_REC | consts::MS_SLAVE,
+    }
+}
+
 /// `/` を再帰的に private へ変更し、以後のマウントをホストへ伝播させない。
 pub(crate) fn mount_root_private_recursive() -> Result<(), SysError> {
+    mount_root_recursive(RootPropagation::Private)
+}
+
+/// `/` を再帰的に `mode` の伝播へ変更する。`Slave` でもコンテナからホストへは伝播しない（slave は受けるだけ）。
+pub(crate) fn mount_root_recursive(mode: RootPropagation) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     // SAFETY: `c"/"` は NUL 終端の静的文字列。source / fstype / data は NULL で、
-    // MS_REC|MS_PRIVATE の propagation 変更ではカーネルが参照しない。
+    // MS_REC|MS_PRIVATE / MS_REC|MS_SLAVE の propagation 変更ではカーネルが参照しない。
+    // フラグは列挙型から `root_propagation_flags` が作る 2 通りだけ。
     let rc = unsafe {
         mount(
             core::ptr::null(),
             c"/".as_ptr(),
             core::ptr::null(),
-            consts::MS_REC | consts::MS_PRIVATE,
+            root_propagation_flags(mode),
             core::ptr::null(),
         )
     };
@@ -2056,7 +2889,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // ポインタを保持しない。可変長引数は register 幅（`i64` / ポインタ）で渡す。成功時の戻り値は新規 fd で、
     // 直後に `new_mount_api_fd` が唯一の所有者にする。
     let fs_fd = new_mount_api_fd(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsopen,
             c"tmpfs".as_ptr(),
             i64::from(consts::FSOPEN_CLOEXEC),
@@ -2068,7 +2901,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
         // aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
         let rc = unsafe {
             match param {
-                FsconfigParam::String(key, value) => syscall(
+                FsconfigParam::String(key, value) => ffi_syscall!(
                     nr_fsconfig,
                     i64::from(fs_fd.as_raw_fd()),
                     i64::from(consts::FSCONFIG_SET_STRING),
@@ -2076,7 +2909,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
                     value.as_ptr(),
                     0i64,
                 ),
-                FsconfigParam::Flag(key) => syscall(
+                FsconfigParam::Flag(key) => ffi_syscall!(
                     nr_fsconfig,
                     i64::from(fs_fd.as_raw_fd()),
                     i64::from(consts::FSCONFIG_SET_FLAG),
@@ -2091,7 +2924,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // SAFETY: `fs_fd` は生存中の fsopen の fd。key・value は NULL、aux は 0（`FSCONFIG_CMD_CREATE` の仕様）。
     // 副作用は superblock の作成（まだどこにも接続されない）に限る。
     fsconfig_result(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsconfig,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSCONFIG_CMD_CREATE),
@@ -2104,7 +2937,7 @@ fn mount_tmpfs_impl(target_dir: BorrowedFd<'_>, params: &TmpfsParams) -> Result<
     // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsmount,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSMOUNT_CLOEXEC),
@@ -2155,7 +2988,7 @@ fn move_mount_empty_path_raw(from: RawFd, to: RawFd) -> Result<(), SysError> {
     // 対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace へのマウント 1 件の追加に限る
     // （接続先は private であること〔`MountIsolation::establish` の `MS_REC|MS_PRIVATE` 済み〕が前提。shared なら peer へ伝播する）。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(from),
             c"".as_ptr(),
@@ -2342,7 +3175,7 @@ fn open_tree_raw(node: RawFd, flags: u32) -> Result<OwnedFd, SysError> {
     // `open_tree_bind_flags` が `MountTreeScope::Recursive` のときに限り付ける。成功時の戻り値は新規 fd で、直後に
     // `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の複製マウント（再帰時は配下を含む）の作成に限る
     // （fd を閉じれば破棄される）。
-    new_mount_api_fd(unsafe { syscall(nr, i64::from(node), c"".as_ptr(), i64::from(flags)) })
+    new_mount_api_fd(unsafe { ffi_syscall!(nr, i64::from(node), c"".as_ptr(), i64::from(flags)) })
 }
 
 /// 複製・属性設定の対象範囲（`AT_RECURSIVE` の有無）。真偽値の取り違えを避ける列挙型で、`open_tree` と
@@ -2556,7 +3389,8 @@ const fn clear_read_only_probe_mount_attr() -> MountAttr {
 /// `attr_clr` = 0 のため、元のマウントでロックされた属性は外さない（`rw` 指定も ro を外さない）。
 /// `propagation` は 0（変更しない）。切り離した（`OPEN_TREE_CLONE` の匿名 namespace の）マウントに対する propagation 変更は
 /// Linux v5.12・v6.12・v7.0 の `mount_setattr` 系（`mount_setattr_prepare`／`do_mount_setattr`）で許されると確認済み（#2064）だが、
-/// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し、
+/// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し（`rslave` の bind は
+/// 例外で、`establish_with` が private 化の前に複製して `master` を保つ。#2669。`propagation` = 0 は変えない）、
 /// 明示設定はせず、呼び出し側（#1913）が付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
 /// 明示設定を足すと構築子の `propagation` = 0 という不変条件が崩れるため、#2165 で見送った（SEC-1・OCI-4）。
 const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
@@ -2749,6 +3583,8 @@ fn set_mount_nodev_raw(fd: RawFd) -> Result<(), SysError> {
 ///
 /// 意味論: `MS_REMOUNT` が superblock ごと ro にするのに対し、本関数はこのマウントの `MNT_READONLY` だけを立てる。
 /// 呼び出し側は同じ superblock の別マウントを作らないため、コンテナから見た保証（`EROFS`）は変わらない。
+/// 呼び出し元は inject の tmpfs・`path_masks` の読み取り専用化に加え、`root.readonly=true` の rootfs の mount top
+/// （`exec::make_root_read_only`。CORE-5・SEC-1・#2767）。
 /// 書き込み中の fd が残っていると `EBUSY` になるので、呼び出し前にすべて閉じておくこと。
 /// fd がマウントのルートでないと `EINVAL`。必要なカーネルは Linux 5.12 以降で、`ENOSYS` は
 /// [`SysError::Unsupported`] で返し `mount(2)` へは縮退しない。
@@ -2784,7 +3620,7 @@ fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr, flags: u32) -> Resul
     // （再帰時は配下全体）への属性の追加に限る（本番は既存の属性を外さず、伝播も変えない。試験専用の構築子は ro だけを外す）。
     // 構築子を足すときは本コメントと構築子一覧の試験を更新する。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(fd),
             c"".as_ptr(),
@@ -2914,7 +3750,7 @@ pub(crate) fn mount_devpts_on(
     // ポインタを保持しない。可変長引数は register 幅（`i64` / ポインタ）で渡す。成功時の戻り値は新規 fd で、
     // 直後に `new_mount_api_fd` が唯一の所有者にする。
     let fs_fd = new_mount_api_fd(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsopen,
             c"devpts".as_ptr(),
             i64::from(consts::FSOPEN_CLOEXEC),
@@ -2928,7 +3764,7 @@ pub(crate) fn mount_devpts_on(
         // SAFETY: `fs_fd` は生存中の fsopen の fd。`key`・`value` は借用した NUL 終端文字列で
         // 呼び出しの間生存し、カーネルは保持しない。aux は 0。副作用はこの fs コンテキストへのパラメータ設定に限る。
         fsconfig_result(unsafe {
-            syscall(
+            ffi_syscall!(
                 nr_fsconfig,
                 i64::from(fs_fd.as_raw_fd()),
                 i64::from(consts::FSCONFIG_SET_STRING),
@@ -2941,7 +3777,7 @@ pub(crate) fn mount_devpts_on(
     // SAFETY: `fs_fd` は生存中の fsopen の fd。key・value は NULL、aux は 0（`FSCONFIG_CMD_CREATE` の仕様）。
     // 副作用は superblock の作成（まだどこにも接続されない）に限る。
     fsconfig_result(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsconfig,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSCONFIG_CMD_CREATE),
@@ -2954,7 +3790,7 @@ pub(crate) fn mount_devpts_on(
     // 成功時の戻り値は新規 fd で、直後に `new_mount_api_fd` が唯一の所有者にする。副作用は未接続の
     // マウントの作成に限る（fd を閉じればカーネルが破棄する）。
     let mnt_fd = new_mount_api_fd(unsafe {
-        syscall(
+        ffi_syscall!(
             nr_fsmount,
             i64::from(fs_fd.as_raw_fd()),
             i64::from(consts::FSMOUNT_CLOEXEC),
@@ -2965,7 +3801,7 @@ pub(crate) fn mount_devpts_on(
     // `*_EMPTY_PATH` により fd 自身が対象になる（パス解決なし）。副作用は呼び出しスレッドの mount namespace への
     // マウント 1 件の追加に限る。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr_move_mount,
             i64::from(mnt_fd.as_raw_fd()),
             c"".as_ptr(),
@@ -3037,7 +3873,7 @@ pub(crate) fn pivot_root_dot() -> Result<(), SysError> {
     // 引数として register 幅で渡され、カーネルは 2 引数だけ読む）。番号 `nr` は `ArchSysNo::get` を
     // 通した arch ごとの定数（#1619）。
     // 戻り値 -1 のとき直後に errno を確保する。
-    let rc = unsafe { syscall(nr, c".".as_ptr(), c".".as_ptr()) };
+    let rc = unsafe { ffi_syscall!(nr, c".".as_ptr(), c".".as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -3331,7 +4167,7 @@ pub(crate) fn exec_fd(fd: BorrowedFd<'_>, argv: &[CString], envp: &[CString]) ->
     // 組で使う。`argv_ptrs` / `envp_ptrs` は末尾が NULL のポインタ配列で、各要素は呼び出しの間生存する
     // `argv` / `envp`（NUL 終端の `CString`）を指す。成功時は戻らず、失敗時は配列を読み取っただけ。
     unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(fd.as_raw_fd()),
             c"".as_ptr(),
@@ -3353,6 +4189,10 @@ impl SealSet {
     pub(crate) const EXEC_COPY: SealSet = SealSet(
         consts::F_SEAL_SEAL | consts::F_SEAL_SHRINK | consts::F_SEAL_GROW | consts::F_SEAL_WRITE,
     );
+
+    /// 注入ファイルの内容用 memfd に付ける seal（書き込み・伸長・縮小・seal の追加を禁止。#2628）。
+    /// `MFD_NOEXEC_SEAL` が付ける `F_SEAL_EXEC` は含めず、検証は [`SealSet::contains`] で行う。
+    pub(crate) const DATA_COPY: SealSet = SealSet::EXEC_COPY;
 
     /// seal のビット値（診断・テスト用）。
     pub(crate) fn bits(self) -> u32 {
@@ -3384,11 +4224,80 @@ pub(crate) fn memfd_create_for_exec_copy(name: &'static CStr) -> Result<OwnedFd,
     }
 }
 
+/// 注入ファイルの内容を置く memfd を作る（`memfd_create(2)`。`MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL`）。
+///
+/// 内容をユーザー空間のバッファへ載せず、ホストのファイルから `sendfile(2)` のカーネル内コピーだけで置く入口
+/// （ID 写像の holder が fork で継承するメモリへ secret を載せないため。#2628・CORE-6・SEC-5）。実行できない
+/// memfd にする（`MFD_EXEC` は付けない）。`MFD_NOEXEC_SEAL` を知らないカーネル（6.3 未満）は `EINVAL` を返すため、
+/// そのときだけ外して 1 回再試行する（6.3 未満の memfd は実行可能だが、内容用で実行には使わない）。実行できないこと
+/// の保証（`F_SEAL_EXEC`）は Linux 6.3 以降に限る。本番の起動は Landlock ABI 6（6.12 以降）が必須なので本番では常に
+/// 満たされる（#2759・#2728 P2-1）。
+/// それ以外の失敗（`EPERM` = seccomp・`ENOSYS` など）はそのまま返し、呼び出し側が拒否する（fail-closed）。
+/// `name` は固定値を渡す前提で外部入力を混ぜない。
+pub(crate) fn memfd_create_for_data(name: &'static CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let base = consts::MFD_CLOEXEC | consts::MFD_ALLOW_SEALING;
+    match memfd_create_raw(name, base | consts::MFD_NOEXEC_SEAL) {
+        Err(SysError::Os(e)) if e == EINVAL => memfd_create_raw(name, base),
+        other => other,
+    }
+}
+
+/// `input` の `*offset` から最大 `count` バイトを `out` へカーネル内でコピーする（`sendfile(2)`。EINTR は再試行）。
+///
+/// 戻り値はコピーしたバイト数（0 は `input` の終端）。`*offset` はコピーした分だけ進み、`input` のファイル位置は
+/// 動かさない。ユーザーバッファを経由しないため、secret の内容を呼び出し元のメモリへ載せない（#2628）。
+pub(crate) fn sendfile_at(
+    out: BorrowedFd<'_>,
+    input: BorrowedFd<'_>,
+    offset: &mut i64,
+    count: usize,
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    loop {
+        // SAFETY: `out` / `input` は生存中の `BorrowedFd`。`offset` は呼び出しの間有効な `&mut i64`（カーネルが
+        // 読み書きするのは `off_t` 1 個分だけ）。`count` は size_t で、カーネルはその範囲を超えてコピーしない。
+        let rc = unsafe {
+            sendfile(
+                out.as_raw_fd(),
+                input.as_raw_fd(),
+                std::ptr::from_mut(offset),
+                count,
+            )
+        };
+        if rc < 0 {
+            let e = last_error();
+            if e == SysError::Os(EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        return usize::try_from(rc).map_err(|_| SysError::Os(EINVAL));
+    }
+}
+
+/// `fd`（[`memfd_create_for_data`] で作り内容を書き終えたもの）に [`SealSet::DATA_COPY`] を付け、含まれることを確かめる。
+/// 以後の書き込み・伸長・縮小・seal の変更は `EPERM`。確認できなければ `Err`（封印を確かめていない内容を使わない）。
+pub(crate) fn seal_data_memfd(fd: BorrowedFd<'_>) -> Result<(), SealError> {
+    add_seals(fd, SealSet::DATA_COPY).map_err(SealError::Sys)?;
+    let actual = get_seals(fd).map_err(SealError::Sys)?;
+    if !actual.contains(SealSet::DATA_COPY) {
+        return Err(SealError::Unexpected {
+            actual: actual.bits(),
+        });
+    }
+    Ok(())
+}
+
 fn memfd_create_raw(name: &CStr, flags: u32) -> Result<OwnedFd, SysError> {
     let nr = consts::SYS_MEMFD_CREATE.get()?;
     // SAFETY: `name` は呼び出しの間生存する NUL 終端の借用で、カーネルは読み取るだけ。`flags` は整数
     // （unsigned int 引数は register 幅に拡張して渡され、カーネルは下位 32 bit を読む）。
-    let rc = unsafe { syscall(nr, name.as_ptr(), i64::from(flags)) };
+    let rc = unsafe { ffi_syscall!(nr, name.as_ptr(), i64::from(flags)) };
     if rc < 0 {
         return Err(last_error());
     }
@@ -3573,7 +4482,7 @@ pub(crate) fn exec_check_fd(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     // `AT_EXECVE_CHECK` によりカーネルは判定だけを行って戻り、呼び出しプロセスを置き換えない（未対応カーネルは
     // フラグを `EINVAL` で拒否し、何も実行しない）。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(fd.as_raw_fd()),
             c"".as_ptr(),
@@ -3595,7 +4504,7 @@ fn close_range_raw(first: u32, last: u32, flags: i64) -> Result<(), SysError> {
     // SAFETY: 引数は整数のみでポインタを取らない（unsigned int 引数は register 幅に拡張して渡され、カーネルは
     // 下位 32 bit を読む）。`flags` は 0（閉じる）か `CLOSE_RANGE_CLOEXEC`（閉じずに close-on-exec を立てる）で、
     // 対象は `first`〜`last` の fd だけ。閉じる場合、呼び出し側（exec 直前の子）はそれらの fd をこの後使わない前提。
-    let rc = unsafe { syscall(nr, i64::from(first), i64::from(last), flags) };
+    let rc = unsafe { ffi_syscall!(nr, i64::from(first), i64::from(last), flags) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -3931,8 +4840,9 @@ pub(crate) fn open_path_follow_at(
 /// 保持中の `O_PATH` fd `pinned` が指す inode を `/proc/thread-self/fd/N` 経由で
 /// `O_RDONLY|O_NONBLOCK|O_CLOEXEC` に開き直す。パスの再解決（symlink チェーンの再走査）を
 /// 行わず、`pinned` が固定した inode そのものを開く（magic link はリンク先を再 walk しない）。
-/// 呼び出し側は `pinned` への fstat で通常ファイルと確認済みであること（デバイス・FIFO 等への
-/// open の副作用を避ける。REPAIR-5・PLUG-11・TASK-122.2）。
+/// 呼び出し側は `pinned` への fstat で通常ファイルまたはディレクトリと確認済みであること
+/// （デバイス・FIFO 等への open の副作用を避ける。ディレクトリは `O_RDONLY` で開いても副作用が無く、
+/// 他の検査済み固定 inode の読み取りに使う。REPAIR-5・PLUG-11・TASK-122.2・SEC-1）。
 pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
     let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
         // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。
@@ -3943,6 +4853,23 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         &path,
         consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
     )
+}
+
+/// 保持中の `O_PATH` fd `pinned` が指す inode のモードを `/proc/thread-self/fd/N`（magic link）経由の
+/// `chmod(2)` で `mode` に固定する。`O_RDONLY` への開き直しを要しないため、所有者の読み取り権限が無い
+/// （umask 0400 等で mkdir した 0300 の）ディレクトリでも成功する。magic link は inode を再 walk しない
+/// ので、検査と操作の間にパスを差し替える窓が無い（`etc_files`・NET-12・SEC-1）。
+/// 呼び出し側は `pinned` を fstat で検査済みであること。
+pub(crate) fn chmod_pinned(pinned: BorrowedFd<'_>, mode: u32) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let path = std::ffi::CString::new(format!("/proc/thread-self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| SysError::Os(consts::EINVAL))?;
+    // SAFETY: `path` は NUL 終端の借用で呼び出しの間生存する。対象は `pinned` が固定した inode で、
+    // 副作用はそのモードビットの変更のみ。ポインタは保持されない。
+    let rc = unsafe { chmod(path.as_ptr(), mode & 0o7777) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。
@@ -4212,6 +5139,29 @@ pub(crate) fn ignore_sigpipe() -> Result<(), SysError> {
     }
 }
 
+/// `SIGTERM` と `SIGINT` の disposition を `SIG_IGN` にする。無視は `fork` の子へ継承される（#3300）。
+///
+/// 監査 relay の helper が、プロセスグループ宛て・cgroup 全体宛ての停止シグナルで本体より先に死なず、
+/// 本体の終了（socketpair の EOF）まで記録を書き続けられるようにする（SEC-4・REPAIR-5）。`SIGKILL` は
+/// 無視できないため、最終的な回収は妨げない。呼び出し元は exec しない fork の子（helper）に限る
+/// （`execve` を越えて無視が継承されるため、コンテナ内のコマンドへ持ち込まない）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの disposition を変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn ignore_stop_signals() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    for sig in [consts::SIGTERM, consts::SIGINT] {
+        // SAFETY: 引数は整数（`SIG_IGN` = 1）のみでポインタを取らない。ハンドラ関数を登録しないため、
+        // シグナルハンドラの再入・非同期安全性の問題は生じない。単一スレッドから fork した子で呼ぶ。
+        let prev = unsafe { signal(sig, SIG_IGN) };
+        if prev == SIG_ERR {
+            return Err(last_error());
+        }
+    }
+    Ok(())
+}
+
 /// 呼び出しプロセスを新しいセッションのリーダーにし、制御端末から切り離す（`setsid(2)`。
 /// SUP-6・SEC-1・TASK-163 追補・#1456）。戻り値は新しいセッション ID（= 呼び出しプロセスの pid）。
 ///
@@ -4248,7 +5198,7 @@ pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
     let nr = consts::SYS_GETGROUPS.get()?;
     // SAFETY: `getgroups(int size, gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは `list` を
     // 参照せず件数だけを返す（getgroups(2)）ため、ポインタは読み書きされない。引数は register 幅の整数として渡す。
-    let count = unsafe { syscall(nr, 0i64, core::ptr::null_mut::<u32>()) };
+    let count = unsafe { ffi_syscall!(nr, 0i64, core::ptr::null_mut::<u32>()) };
     if count < 0 {
         return Err(last_error());
     }
@@ -4260,7 +5210,11 @@ pub(crate) fn supplementary_group_count() -> Result<usize, SysError> {
 ///
 /// 自分の user namespace の `CAP_SETGID` を要し、user namespace が `setgroups` を `deny` にしている場合
 /// （非特権で作った user namespace。`/proc/<pid>/setgroups`）は権限があっても `EPERM` になる。生の syscall のため
-/// 効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+/// 効果は呼び出しスレッドだけに及ぶ。単一スレッドであることは呼び出し側が確かめる:
+/// 本番の呼び出し元 `exec::capabilities` の `apply_capabilities_single_threaded_with_groups` と
+/// `clear_groups_single_threaded` が、副作用の前後で自プロセスの `Threads: 1` を確かめる（満たさなければ前は
+/// `FailedPrecondition`、後は `Internal`）。他スレッドに古い補助グループが残る状態のまま進まないための検査で、
+/// 外してはならない（#2759・#2731 P2-2）。
 // テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
 // 変えないため）。
 #[cfg_attr(test, allow(dead_code))]
@@ -4271,9 +5225,80 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     let nr = consts::SYS_SETGROUPS.get()?;
     // SAFETY: `setgroups(size_t size, const gid_t *list)` に size = 0 と NULL を渡す。size が 0 のときカーネルは
     // `list` を読まない（空のグループ集合を設定する）ため、ポインタは参照されない。効果は呼び出しスレッドの
-    // 資格情報（補助グループ）の変更のみで、メモリには触れない。
-    let rc = unsafe { syscall(nr, 0i64, core::ptr::null::<u32>()) };
+    // 資格情報（補助グループ）の変更のみで、メモリには触れない（単一スレッドの担保は呼び出し側の `Threads: 1` 検査。
+    // 上の doc を参照）。
+    let rc = unsafe { ffi_syscall!(nr, 0i64, core::ptr::null::<u32>()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 補助グループの件数の上限（`NGROUPS_MAX` = 65536。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// `set_supplementary_groups` / `read_supplementary_groups` が syscall の前に件数を検査する上限で、
+/// `oci_runtime/config.rs` の `process.user.additionalGids` の上限と同値。
+pub(crate) const SUPPLEMENTARY_GROUPS_MAX: usize = 65_536;
+
+/// 呼び出しスレッドの補助グループを `gids` に置き換える（`setgroups(len, list)`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// launch の子の capability 削減段が、`process.user.additionalGids` を適用するために呼ぶ（launcher が fork の前に
+/// user namespace の gid 写像と照合済み）。`CAP_SETGID` を要し、`setgroups` が `deny` の user namespace では
+/// `EPERM`、写像されていない gid は `EINVAL`。件数が [`SUPPLEMENTARY_GROUPS_MAX`] を超える場合は syscall の前に
+/// `EINVAL`。生の syscall のため効果は呼び出しスレッドだけに及ぶ。単一スレッドであることは呼び出し側が確かめる:
+/// 本番の呼び出し元 `exec::capabilities` の `apply_capabilities_single_threaded_with_groups` と
+/// `clear_groups_single_threaded` が、副作用の前後で自プロセスの `Threads: 1` を確かめる（満たさなければ前は
+/// `FailedPrecondition`、後は `Internal`）。他スレッドに古い補助グループが残る状態のまま進まないための検査で、
+/// 外してはならない（#2759・#2731 P2-2）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_supplementary_groups(gids: &[u32]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if gids.len() > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    let nr = consts::SYS_SETGROUPS.get()?;
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に `gids.len()` と `gids.as_ptr()` を渡す。ポインタは
+    // `len` 個の `u32`（gid_t と同幅）の有効な領域を指し、カーネルはそこを読むだけで書き込まない。呼び出しの間
+    // `gids` は借用されたまま生きている。効果は呼び出しスレッドの資格情報の変更のみ（他スレッドに古い補助グループが
+    // 残らないことは、呼び出し側が副作用の前後に `Threads: 1` を確かめることで担保する。上の doc を参照）。
+    let rc = unsafe { ffi_syscall!(nr, gids.len() as i64, gids.as_ptr()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの補助グループを読み戻す（`getgroups`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// 件数を `getgroups(0, NULL)` で取り、[`SUPPLEMENTARY_GROUPS_MAX`] 以下を確かめてから確保して読む。
+/// 読んだ件数が最初の件数と食い違えば `EINVAL`（呼び出しの間に変わった = 単一スレッドの前提違反）。
+///
+/// fork 子で呼ぶ場合の確保（本関数の `vec!`）は安全である: 子は必ず `fork_single_threaded*`（`fork_checked`。core で
+/// 唯一の `fork()` 呼び出し）を経ており、fork 直前の `Threads: 1` が強制されるため、他スレッドが握ったアロケータの
+/// ロックを引き継がない。本番の経路（launch の C → I → PID 1、exec worker、mapper）はどれも本物のスレッド数判定を
+/// 渡し、定数判定（`|| true`）は `#[cfg(test)]` の中だけにある。同じ段は既に確保もしている。この前提は
+/// `fork_checked` の強制に依存するため、そこを変えるときは再確認する（#2759・#2731 P2-1）。
+// テストビルドでは capability 削減段が偽のカーネルを使うため、本関数は sys の試験からだけ呼ばれる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn read_supplementary_groups() -> Result<Vec<u32>, SysError> {
+    let n = supplementary_group_count()?;
+    if n > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let nr = consts::SYS_GETGROUPS.get()?;
+    let mut buf = vec![0u32; n];
+    // SAFETY: `getgroups(int size, gid_t *list)` に `n` と、`n` 個の `u32`（gid_t と同幅）を持つ `buf` の
+    // 先頭ポインタを渡す。カーネルは最大 `n` 個を書き込み、それ以上は書かない（足りなければ `EINVAL`）。
+    // `buf` は呼び出しの間可変借用されたまま生きている。
+    let got = unsafe { ffi_syscall!(nr, n as i64, buf.as_mut_ptr()) };
+    if got < 0 {
+        return Err(last_error());
+    }
+    if usize::try_from(got) != Ok(n) {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(buf)
 }
 
 /// 呼び出しスレッドの実効 gid・実 gid・保存 gid を `gid` に揃える（`setresgid(gid, gid, gid)`。SUP-6・SEC-5・
@@ -4293,7 +5318,7 @@ pub(crate) fn set_res_gid(gid: u32) -> Result<(), SysError> {
     let nr = consts::SYS_SETRESGID.get()?;
     // SAFETY: `setresgid(gid_t rgid, gid_t egid, gid_t sgid)` に整数 3 つだけを渡し、ポインタを取らない。
     // 効果は呼び出しスレッドの資格情報の変更のみでメモリには触れない。
-    let rc = unsafe { syscall(nr, i64::from(gid), i64::from(gid), i64::from(gid)) };
+    let rc = unsafe { ffi_syscall!(nr, i64::from(gid), i64::from(gid), i64::from(gid)) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -4308,7 +5333,7 @@ pub(crate) fn set_res_uid(uid: u32) -> Result<(), SysError> {
     let nr = consts::SYS_SETRESUID.get()?;
     // SAFETY: `setresuid(uid_t ruid, uid_t euid, uid_t suid)` に整数 3 つだけを渡し、ポインタを取らない。
     // 効果は呼び出しスレッドの資格情報の変更のみでメモリには触れない。
-    let rc = unsafe { syscall(nr, i64::from(uid), i64::from(uid), i64::from(uid)) };
+    let rc = unsafe { ffi_syscall!(nr, i64::from(uid), i64::from(uid), i64::from(uid)) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -4324,7 +5349,7 @@ pub(crate) fn get_res_gid() -> Result<[u32; 3], SysError> {
     // SAFETY: `getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)` に、呼び出しの間有効で互いに重ならない
     // 3 つの `u32` への書き込みポインタを渡す。カーネルは各ポインタへ 4 バイトだけを書く。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             std::ptr::from_mut(r),
             std::ptr::from_mut(e),
@@ -4346,7 +5371,7 @@ pub(crate) fn get_res_uid() -> Result<[u32; 3], SysError> {
     // SAFETY: `getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)` に、呼び出しの間有効で互いに重ならない
     // 3 つの `u32` への書き込みポインタを渡す。カーネルは各ポインタへ 4 バイトだけを書く。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             std::ptr::from_mut(r),
             std::ptr::from_mut(e),
@@ -4545,7 +5570,7 @@ pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, SysError> {
     let nr = consts::SYS_PIDFD_OPEN.get()?;
     // SAFETY: 引数は整数のみでポインタを取らない（glibc 2.36 未満に無いため `syscall(2)` 経由）。
     // `raw` は正であることを確認済み。flags は 0 で、成功時は新規 fd を返す。
-    let fd = unsafe { syscall(nr, i64::from(raw), 0_i64) };
+    let fd = unsafe { ffi_syscall!(nr, i64::from(raw), 0_i64) };
     if fd == -1 {
         return Err(last_error());
     }
@@ -4564,8 +5589,423 @@ pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<()
 }
 
 /// `pidfd_send_signal(2)` の `flags` に渡す `PIDFD_SIGNAL_PROCESS_GROUP`(`include/uapi/linux/pidfd.h` の `1 << 2`。
-/// Linux 6.9 以降。全アーキテクチャ共通の値)。`libc` に対応物が無い(カーネル ABI のフラグを直接使う)ため照合しない。
+/// Linux 6.9 以降。全アーキテクチャ共通の値)。`libc` 0.2.189 の `PIDFD_SIGNAL_PROCESS_GROUP`
+/// (`new/linux_uapi/linux/pidfd.rs`)と最上位の `libc_abi` で照合する(#1848)。
 const PIDFD_SIGNAL_PROCESS_GROUP: i64 = 1 << 2;
+
+/// `consts` の外にある定数(`AT_FDCWD`・fs magic・`SIG_*`・`PIDFD_SIGNAL_PROCESS_GROUP`・`renameat2` の
+/// `RENAME_NOREPLACE`)を `libc` 0.2.189 と `const` 評価で照合する(#1848・#1837・#1318・MVM-4・REPAIR-7・
+/// REPAIR-12)。関数は呼ばず `unsafe` を使わない。`consts` の中の定数は各 arch の `consts::libc_abi` が担う。
+///
+/// cfg は `seccomp_notify::libc_abi` と揃える。64 bit かつ x86_64 / aarch64 に限るため、`*_MAGIC` の `i64` と
+/// `libc` の `c_long` の比較が成り立つ(s390x の `c_uint` 版は評価されない)。
+///
+/// 名前が `libc` と違う対応: `PROC_MAGIC` = `PROC_SUPER_MAGIC`、`DEVPTS_MAGIC` = `DEVPTS_SUPER_MAGIC`。
+/// `renameat2` のローカル定数 `RENAME_NOREPLACE` は関数の中にあり項目として参照できないため、`libc` 側が
+/// ラッパーの宣言(`1`)と同じであることだけを確かめる。
+///
+/// 対象外(`libc` に対応物が無い、または FFI の値でない方針値・内部の上限):
+/// - `SUPPLEMENTARY_GROUPS_MAX`: `libc` の linux に `NGROUPS_MAX` が無い。カーネルの include/uapi/linux/limits.h の
+///   `NGROUPS_MAX`(65536)と同値の方針値
+/// - `SIGTERM_HANDLER_EXIT_CODE`・`DevptsCreate::*`・`DevTmpfsCreate::*`・`SealSet::*`・
+///   `LANDLOCK_RESTRICT_SELF_KNOWN_FLAGS`: 本実装の方針値(カーネル ABI の値でない)
+/// - 試験の中の `CAP_SYS_ADMIN_BIT`(include/uapi/linux/capability.h の `CAP_SYS_ADMIN` = 21)・`READ_DIR`
+///   (include/uapi/linux/landlock.h の `LANDLOCK_ACCESS_FS_READ_DIR`): `libc` の linux に定義が無い
+/// - 試験の `BOGUS_FD`・`*_ENV`: FFI の値でない
+///
+/// # 構造体と `extern "C"` 関数の型(#1849・#1837)
+///
+/// 構造体は `size_of`・`align_of` に加え、`libc` のフィールドが pub のものはフィールドのオフセットまで
+/// `offset_of!` で照合する。関数は同じ関数ポインタ型へ自前と `libc` の両方を代入して照合する(関数は呼ばない)。
+/// 自前の構造体を指すポインタ(`fstatfs`・`sendto`・`recvfrom`・`poll`・`prlimit`)は、自前側と `libc` 側で
+/// ポインタ先の型を別々に書く(構造体の同一性は構造体の照合が保証する)。
+///
+/// 型の綴りの違いで ABI は同じもの(止める条件ではない): `prlimit` の `resource`(自前 `i32`・`libc` は
+/// `__rlimit_resource_t` = `c_uint`。幅は同じで 32 bit 整数引数の渡し方は符号で変わらない。自前を `u32` に
+/// 揃えるかはオーナー判断で、`sys` の本体は変えていない)、`syscall` の第 1 引数(自前 `SyscallNumber` は
+/// `repr(transparent)` の `i64`、`libc` は `c_long`。`size_of`・`align_of` で照合)、`SockFprog.filter` の
+/// `*const`(`libc` は `*mut`。レイアウトは同じ)。
+///
+/// `target_env = "gnu"` に限るもの: `ioctl`(musl の `request` は `int`)・`prlimit`(musl の `resource` は `int`)・
+/// `renameat2`・`StatFs.f_flags` の位置(`libc` の gnu の `statfs` の非公開 `f_spare` の先頭。出典は glibc
+/// `sysdeps/unix/sysv/linux/bits/statfs.h` で、`f_frsize` の直後 = 80)。core は musl 向けに CI でビルドしないため
+/// musl は未照合のまま残る。
+///
+/// 対象外の構造体(`libc` 0.2.189 に対応物が無い。一次情報は Linux v6.12 の uapi ヘッダ):
+/// - `CapUserHeader`・`CapUserData`: include/uapi/linux/capability.h(supervisor の #1840 と同じ扱い)
+/// - `LandlockRulesetAttr`・`LandlockPathBeneathAttr`: include/uapi/linux/landlock.h(サイズ 24 / 12・`parent_fd` の
+///   オフセット 8 は既存の実行時の試験が照合している)
+/// - `sys/bpf.rs` の `BpfProgLoadAttr`・`BpfProgAttachAttr`・`BpfProgQueryAttr`: `union bpf_attr`
+///   (include/uapi/linux/bpf.h)。`libc` に無い
+/// - `crate::seccomp::BpfInstruction` はフィールドが `seccomp` の非公開で `sys` から見えないため、
+///   `libc::sock_filter` とサイズ・アラインメントだけを照合する
+///
+/// 食い違いは宣言を直す別 issue とし、試験側を合わせない。
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod libc_abi {
+    use libc::{c_int, c_long, c_uint};
+
+    const _: () = {
+        libc_const_eq!(super::AT_FDCWD, i32, libc::AT_FDCWD, c_int);
+        libc_const_eq!(super::TMPFS_MAGIC, i64, libc::TMPFS_MAGIC, c_long);
+        libc_const_eq!(super::PROC_MAGIC, i64, libc::PROC_SUPER_MAGIC, c_long);
+        libc_const_eq!(super::DEVPTS_MAGIC, i64, libc::DEVPTS_SUPER_MAGIC, c_long);
+        libc_const_eq!(super::SIG_DFL, usize, libc::SIG_DFL, libc::sighandler_t);
+        libc_const_eq!(super::SIG_ERR, usize, libc::SIG_ERR, libc::sighandler_t);
+        libc_const_eq!(super::SIG_IGN, usize, libc::SIG_IGN, libc::sighandler_t);
+        libc_const_eq!(
+            super::PIDFD_SIGNAL_PROCESS_GROUP,
+            i64,
+            libc::PIDFD_SIGNAL_PROCESS_GROUP,
+            c_uint
+        );
+    };
+    // `renameat2` の関数内ローカル定数 `RENAME_NOREPLACE`(u32)。宣言の値 `1` と `libc` を比べる。
+    const _: () = assert!(libc::RENAME_NOREPLACE == 1);
+
+    use core::mem::{align_of, offset_of, size_of};
+    use libc::{c_char, c_ulong, c_void};
+
+    // ---- 構造体(#1849) ----
+
+    // `RLimit64`: `libc::rlimit64`(`cur` = `rlim_cur`・`max` = `rlim_max`)。64 bit では `libc::rlimit` も同じ形。
+    const _: () = {
+        assert!(size_of::<super::RLimit64>() == size_of::<libc::rlimit64>());
+        assert!(align_of::<super::RLimit64>() == align_of::<libc::rlimit64>());
+        assert!(offset_of!(super::RLimit64, cur) == offset_of!(libc::rlimit64, rlim_cur));
+        assert!(offset_of!(super::RLimit64, max) == offset_of!(libc::rlimit64, rlim_max));
+        assert!(size_of::<libc::rlim64_t>() == size_of::<u64>());
+        assert!(size_of::<super::RLimit64>() == size_of::<libc::rlimit>());
+        assert!(align_of::<super::RLimit64>() == align_of::<libc::rlimit>());
+    };
+
+    // `IfReqFlags`: `libc::ifreq`（NET-6・#3064）。`ifr_flags` は `ifr_ifru` union の先頭にある。
+    const _: () = {
+        assert!(size_of::<super::IfReqFlags>() == size_of::<libc::ifreq>());
+        assert!(align_of::<super::IfReqFlags>() == align_of::<libc::ifreq>());
+        assert!(offset_of!(super::IfReqFlags, ifr_name) == offset_of!(libc::ifreq, ifr_name));
+        assert!(offset_of!(super::IfReqFlags, ifr_flags) == offset_of!(libc::ifreq, ifr_ifru));
+        assert!(size_of::<libc::c_short>() == size_of::<i16>());
+    };
+
+    // `SockaddrNl`: `libc::sockaddr_nl`。`nl_pad` は `libc` で非公開のため、自前のオフセットと
+    // 「`nl_family` の直後」で代わりに照合する(net crate の #1841 と同じ扱い)。
+    const _: () = {
+        assert!(size_of::<super::SockaddrNl>() == size_of::<libc::sockaddr_nl>());
+        assert!(align_of::<super::SockaddrNl>() == align_of::<libc::sockaddr_nl>());
+        assert!(
+            offset_of!(super::SockaddrNl, nl_family) == offset_of!(libc::sockaddr_nl, nl_family)
+        );
+        assert!(size_of::<u16>() == size_of::<libc::sa_family_t>());
+        assert!(
+            offset_of!(super::SockaddrNl, nl_pad)
+                == offset_of!(libc::sockaddr_nl, nl_family) + size_of::<libc::sa_family_t>()
+        );
+        assert!(offset_of!(super::SockaddrNl, nl_pid) == offset_of!(libc::sockaddr_nl, nl_pid));
+        assert!(
+            offset_of!(super::SockaddrNl, nl_groups) == offset_of!(libc::sockaddr_nl, nl_groups)
+        );
+    };
+
+    // `PollFd`: `libc::pollfd`。
+    const _: () = {
+        assert!(size_of::<super::PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<super::PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(super::PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(super::PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(super::PollFd, revents) == offset_of!(libc::pollfd, revents));
+    };
+
+    // `StatFs`(x86_64 と aarch64 は cfg で別定義。ここは各ターゲットの定義とそのターゲットの `libc::statfs` を
+    // 比べる): サイズ・アラインメントと `f_type`。`f_flags` の位置は gnu の `libc` では非公開の `f_spare` の
+    // 先頭(`f_frsize` の直後)のため、gnu に限って `f_frsize` のオフセット + 1 語で照合する(下の節)。
+    const _: () = {
+        assert!(size_of::<super::StatFs>() == size_of::<libc::statfs>());
+        assert!(align_of::<super::StatFs>() == align_of::<libc::statfs>());
+        assert!(offset_of!(super::StatFs, f_type) == offset_of!(libc::statfs, f_type));
+        assert!(size_of::<i64>() == size_of::<libc::__fsword_t>());
+    };
+    #[cfg(target_env = "gnu")]
+    const _: () = {
+        assert!(
+            offset_of!(super::StatFs, f_flags)
+                == offset_of!(libc::statfs, f_frsize) + size_of::<libc::__fsword_t>()
+        );
+    };
+
+    // `MountAttr`: `libc::mount_attr`(uapi 版)。
+    const _: () = {
+        assert!(size_of::<super::MountAttr>() == size_of::<libc::mount_attr>());
+        assert!(align_of::<super::MountAttr>() == align_of::<libc::mount_attr>());
+        assert!(offset_of!(super::MountAttr, attr_set) == offset_of!(libc::mount_attr, attr_set));
+        assert!(offset_of!(super::MountAttr, attr_clr) == offset_of!(libc::mount_attr, attr_clr));
+        assert!(
+            offset_of!(super::MountAttr, propagation) == offset_of!(libc::mount_attr, propagation)
+        );
+        assert!(offset_of!(super::MountAttr, userns_fd) == offset_of!(libc::mount_attr, userns_fd));
+    };
+
+    // `SockFprog`: `libc::sock_fprog`。`filter` は自前が `*const BpfInstruction`、`libc` が `*mut sock_filter`
+    // で、ポインタの可変性とポインタ先の型だけが違う(オフセットとサイズは同じ)。`BpfInstruction` は
+    // フィールドが非公開のためサイズ・アラインメントだけを `libc::sock_filter` と照合する。
+    const _: () = {
+        assert!(size_of::<super::SockFprog>() == size_of::<libc::sock_fprog>());
+        assert!(align_of::<super::SockFprog>() == align_of::<libc::sock_fprog>());
+        assert!(offset_of!(super::SockFprog, len) == offset_of!(libc::sock_fprog, len));
+        assert!(offset_of!(super::SockFprog, filter) == offset_of!(libc::sock_fprog, filter));
+        assert!(size_of::<crate::seccomp::BpfInstruction>() == size_of::<libc::sock_filter>());
+        assert!(align_of::<crate::seccomp::BpfInstruction>() == align_of::<libc::sock_filter>());
+    };
+
+    // `SyscallNumber`(`repr(transparent)` の `i64`): `syscall(2)` の第 1 引数 `long` と同じ大きさ・整列。
+    const _: () = {
+        assert!(size_of::<super::SyscallNumber>() == size_of::<libc::c_long>());
+        assert!(align_of::<super::SyscallNumber>() == align_of::<libc::c_long>());
+    };
+
+    // ---- `extern "C"` 関数の型(#1849) ----
+    // 同じ関数ポインタ型へ自前と `libc` を代入する。可変長引数・`-> !` はそのまま書く。
+
+    macro_rules! fn_type_eq {
+        ($ty:ty, $own:path, $lib:path) => {
+            const _: $ty = $own;
+            const _: $ty = $lib;
+        };
+    }
+
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int) -> c_int,
+        super::setns,
+        libc::setns
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int) -> c_int,
+        super::unshare,
+        libc::unshare
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, libc::size_t) -> c_int,
+        super::sethostname,
+        libc::sethostname
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            c_ulong,
+            *const c_void,
+        ) -> c_int,
+        super::mount,
+        libc::mount
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, c_int, ...) -> c_int,
+        super::openat,
+        libc::openat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, c_int) -> c_int,
+        super::umount2,
+        libc::umount2
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int) -> c_int,
+        super::fchdir,
+        libc::fchdir
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, libc::mode_t, libc::dev_t) -> c_int,
+        super::mknodat,
+        libc::mknodat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::uid_t,
+        super::geteuid,
+        libc::geteuid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::gid_t,
+        super::getegid,
+        libc::getegid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::pid_t,
+        super::fork,
+        libc::fork
+    );
+    fn_type_eq!(unsafe extern "C" fn(c_int) -> !, super::_exit, libc::_exit);
+    fn_type_eq!(
+        unsafe extern "C" fn(libc::pid_t, *mut c_int, c_int) -> libc::pid_t,
+        super::waitpid,
+        libc::waitpid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(libc::pid_t, c_int) -> c_int,
+        super::kill,
+        libc::kill
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t,
+        super::signal,
+        libc::signal
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, ...) -> c_int,
+        super::fcntl,
+        libc::fcntl
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int) -> c_int,
+        super::dup2,
+        libc::dup2
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn() -> libc::pid_t,
+        super::setsid,
+        libc::setsid
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, ...) -> c_int,
+        super::prctl,
+        libc::prctl
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, libc::mode_t) -> c_int,
+        super::mkdirat,
+        libc::mkdirat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(*const c_char, libc::mode_t) -> c_int,
+        super::chmod,
+        libc::chmod
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int,
+        super::unlinkat,
+        libc::unlinkat
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, c_int) -> c_int,
+        super::socket,
+        libc::socket
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, *const c_void, libc::size_t, c_int) -> libc::ssize_t,
+        super::send,
+        libc::send
+    );
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void, *mut libc::socklen_t) -> c_int,
+        super::getsockopt,
+        libc::getsockopt
+    );
+    // `sendfile(out_fd, in_fd, off_t *offset, size_t count)`(#2759・#2728 P2-3・#2628)。
+    fn_type_eq!(
+        unsafe extern "C" fn(c_int, c_int, *mut libc::off_t, libc::size_t) -> libc::ssize_t,
+        super::sendfile,
+        libc::sendfile
+    );
+
+    // 自前の構造体を指すポインタを含むもの: 自前側と `libc` 側でポインタ先の型を別々に書く。
+    const _: unsafe extern "C" fn(c_int, *mut super::StatFs) -> c_int = super::fstatfs;
+    const _: unsafe extern "C" fn(c_int, *mut libc::statfs) -> c_int = libc::fstatfs;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *const c_void,
+        libc::size_t,
+        c_int,
+        *const super::SockaddrNl,
+        libc::socklen_t,
+    ) -> libc::ssize_t = super::sendto;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *const c_void,
+        libc::size_t,
+        c_int,
+        *const libc::sockaddr,
+        libc::socklen_t,
+    ) -> libc::ssize_t = libc::sendto;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *mut c_void,
+        libc::size_t,
+        c_int,
+        *mut super::SockaddrNl,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = super::recvfrom;
+    const _: unsafe extern "C" fn(
+        c_int,
+        *mut c_void,
+        libc::size_t,
+        c_int,
+        *mut libc::sockaddr,
+        *mut libc::socklen_t,
+    ) -> libc::ssize_t = libc::recvfrom;
+    const _: unsafe extern "C" fn(*mut super::PollFd, libc::nfds_t, c_int) -> c_int = super::poll;
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int = libc::poll;
+
+    // `syscall(long number, ...)`: 第 1 引数は自前が `SyscallNumber`(`repr(transparent)` の `i64`。上の
+    // `size_of`・`align_of` の照合が `long` との同一性を保証する)、`libc` が `c_long`。
+    const _: unsafe extern "C" fn(super::SyscallNumber, ...) -> i64 = super::syscall;
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = libc::syscall;
+
+    // `sigterm_exit_handler`: `libc` に型付きのハンドラ型が無い(`sighandler_t` は `size_t`)ため、
+    // 引数の型だけを `extern "C" fn(c_int)` への代入で照合する。
+    #[cfg(feature = "exec-test-support")]
+    const _: extern "C" fn(c_int) = super::sigterm_exit_handler;
+
+    // gnu に限るもの。musl は `ioctl` の `request` が `int`、`prlimit` の `resource` が `int` で型が違い、
+    // core は musl 向けに CI でビルドしないため未照合(読み替えで通さない)。
+    #[cfg(target_env = "gnu")]
+    mod gnu_fns {
+        use super::{c_char, c_int, c_ulong};
+        use core::mem::size_of;
+
+        const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = super::super::ioctl;
+        const _: unsafe extern "C" fn(c_int, c_ulong, ...) -> c_int = libc::ioctl;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const c_char,
+            c_int,
+            *const c_char,
+            libc::c_uint,
+        ) -> c_int = super::super::renameat2;
+        const _: unsafe extern "C" fn(
+            c_int,
+            *const c_char,
+            c_int,
+            *const c_char,
+            libc::c_uint,
+        ) -> c_int = libc::renameat2;
+
+        // `prlimit`: 自前は `resource: i32`・`*const RLimit64`。`libc` は `__rlimit_resource_t`(`c_uint`)と
+        // `rlimit`(`prlimit64` は `rlimit64`)。幅・整列は同じ(`size_of` と構造体の照合)で、型の綴りの違い。
+        const _: () = assert!(size_of::<i32>() == size_of::<libc::__rlimit_resource_t>());
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            i32,
+            *const super::super::RLimit64,
+            *mut super::super::RLimit64,
+        ) -> c_int = super::super::prlimit;
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            libc::__rlimit_resource_t,
+            *const libc::rlimit,
+            *mut libc::rlimit,
+        ) -> c_int = libc::prlimit;
+        const _: unsafe extern "C" fn(
+            libc::pid_t,
+            libc::__rlimit_resource_t,
+            *const libc::rlimit64,
+            *mut libc::rlimit64,
+        ) -> c_int = libc::prlimit64;
+    }
+}
 
 /// [`pidfd_open`] で得た pidfd の指すプロセスの**プロセスグループ全員**へシグナルを送る
 /// (`pidfd_send_signal(fd, sig, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`。Linux 6.9 以降。CORE-6・SEC-5・#2551)。
@@ -4612,7 +6052,7 @@ fn pidfd_send_signal_raw(pidfd: BorrowedFd<'_>, number: i32, flags: i64) -> Resu
     // 1..=64 を直前で確認済み、`flags` は呼び出し元(この関数は非公開)が渡す 0 か
     // `PIDFD_SIGNAL_PROCESS_GROUP` のどちらかである。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(pidfd.as_raw_fd()),
             i64::from(number),
@@ -5035,7 +6475,7 @@ pub(crate) fn cap_get_thread() -> Result<ThreadCaps, SysError> {
     // 呼び出しの間有効かつ排他的に借用されている。可変長部のポインタはカーネルが
     // `CapUserHeader` と `[CapUserData; 2]` の大きさだけ読み書きする。影響は呼び出したスレッドの
     // 読み取りのみ。
-    let rc = unsafe { syscall(nr, &raw mut header, data.as_mut_ptr()) };
+    let rc = unsafe { ffi_syscall!(nr, &raw mut header, data.as_mut_ptr()) };
     if rc == -1 {
         return Err(last_error());
     }
@@ -5070,7 +6510,7 @@ pub(crate) fn cap_set_thread(caps: ThreadCaps) -> Result<(), SysError> {
     // SAFETY: `header` と `data`（v3 が要求する 2 要素）はスタック上の `#[repr(C)]` 値で、呼び出しの
     // 間有効。カーネルは読み取りのみ行う（const ポインタ）。資格情報の変更は呼び出したスレッドに
     // 限られ、メモリ安全性には影響しない。
-    let rc = unsafe { syscall(nr, &raw const header, data.as_ptr()) };
+    let rc = unsafe { ffi_syscall!(nr, &raw const header, data.as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5136,7 +6576,7 @@ pub(crate) fn landlock_abi_version() -> Result<u32, SysError> {
     // ポインタ・`usize`・`u64` とレジスタ幅で渡す（32 bit 値を可変長で渡すと上位ビットが未規定に
     // なり得るため、flags は `prctl` と同様に `u64` へ拡幅する。カーネルは `__u32` へ切り詰める）。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             core::ptr::null::<core::ffi::c_void>(),
             0usize,
@@ -5183,7 +6623,7 @@ pub(crate) fn landlock_create_ruleset_fs(handled_fs: u64) -> Result<OwnedFd, Sys
     // `size` バイトを読んでコピーするだけでポインタを保持しない。`size` は実際の構造体サイズと一致する。
     // flags は 0。可変長 `syscall(2)` へはポインタ・`usize`・`u64` とレジスタ幅で渡す。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             &raw const attr,
             core::mem::size_of::<LandlockRulesetAttr>(),
@@ -5218,7 +6658,7 @@ pub(crate) fn landlock_add_path_beneath(
     // カーネルは読み取りのみでポインタを保持しない。`ruleset`・`parent` は生存中の `BorrowedFd`。
     // flags は 0。可変長引数はレジスタ幅（`i32` は `i64` へ拡幅して符号を保つ）で渡す。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(ruleset.as_raw_fd()),
             u64::from(consts::LANDLOCK_RULE_PATH_BENEATH),
@@ -5259,7 +6699,7 @@ pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>, flags: u32) -> Res
     // SAFETY: 引数は生存中の `BorrowedFd` の fd 番号と flags の整数のみでポインタを渡さない。
     // メモリには触れず、影響は呼び出したスレッドの Landlock ドメインの追加（権限を減らす方向）のみ。
     // flags はドメインの監査ログの設定だけで、許可する権利は広がらない（冒頭の既知ビット検査で担保）。
-    let rc = unsafe { syscall(nr, i64::from(ruleset.as_raw_fd()), u64::from(flags)) };
+    let rc = unsafe { ffi_syscall!(nr, i64::from(ruleset.as_raw_fd()), u64::from(flags)) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5278,7 +6718,7 @@ pub(crate) fn ptrace_cont_probe(pid: u32) -> Result<(), SysError> {
     // SAFETY: 引数はすべて整数（request・pid・addr=0・data=0）でポインタを渡さず、PTRACE_CONT では
     // カーネルは data をシグナル番号としてしか読まない（メモリは読まない）。attach を伴わないため、
     // フィルタが欠けていても対象プロセスへの副作用は無い（`ESRCH`）。
-    let rc = unsafe { syscall(nr, consts::PTRACE_CONT, i64::from(pid), 0_i64, 0_i64) };
+    let rc = unsafe { ffi_syscall!(nr, consts::PTRACE_CONT, i64::from(pid), 0_i64, 0_i64) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5298,7 +6738,7 @@ pub(crate) fn kcmp_self_probe() -> Result<(), SysError> {
     let pid = i64::from(std::process::id());
     // SAFETY: 引数はすべて整数（pid1・pid2・type・idx1=0・idx2=0）でポインタを渡さない。KCMP_VM では
     // idx は読まれず、自プロセス同士の比較のため副作用は無く、結果は 0 か errno のみ。
-    let rc = unsafe { syscall(nr, pid, pid, consts::KCMP_VM, 0_i64, 0_i64) };
+    let rc = unsafe { ffi_syscall!(nr, pid, pid, consts::KCMP_VM, 0_i64, 0_i64) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5318,7 +6758,7 @@ pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
     // SAFETY: segments は NULL（整数 0 として渡す）。nr_segments が上限を超えるためカーネルは
     // segments を読む前に拒否する。flags は無効値で、どの経路でもロード・アンロードに至らない。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             0_i64,
             consts::KEXEC_SEGMENT_MAX + 1,
@@ -5378,7 +6818,7 @@ pub(crate) fn pty_unlock_and_index(master: BorrowedFd<'_>) -> Result<u32, SysErr
     // カーネルはそこから 4 バイトを読むだけ（`unlock` は呼び出しの間生存し、読み取り専用で渡す）。
     // 他の副作用は対象 pty のロックの解除だけ。
     let rc = unsafe {
-        ioctl(
+        ffi_ioctl!(
             master.as_raw_fd(),
             consts::TIOCSPTLCK,
             std::ptr::from_ref(&unlock),
@@ -5391,7 +6831,7 @@ pub(crate) fn pty_unlock_and_index(master: BorrowedFd<'_>) -> Result<u32, SysErr
     // SAFETY: `master` は生存中の `BorrowedFd`。`TIOCGPTN` はスタック上の `u32` を指す書き込み可能な
     // ポインタを取り、カーネルはそこへ 4 バイトだけを書く（`index` は呼び出しの間生存する）。
     let rc = unsafe {
-        ioctl(
+        ffi_ioctl!(
             master.as_raw_fd(),
             consts::TIOCGPTN,
             std::ptr::from_mut(&mut index),
@@ -5431,6 +6871,41 @@ pub(crate) fn effective_gid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// 対応外 arch では古い errno（ここでは EACCES=13）が残っていても errno を読まず `Unsupported` になる
+    /// （#3313・MVM-4・REPAIR-12）。
+    #[test]
+    fn classify_last_error_unsupported_ignores_stale_errno() {
+        let mut read = false;
+        let e = classify_last_error(false, || {
+            read = true;
+            13
+        });
+        assert!(matches!(e, SysError::Unsupported), "got {e:?}");
+        assert!(!read, "errno must not be read on unsupported arch");
+    }
+
+    /// 対応 arch（x86_64・aarch64）では従来どおり errno が `Os(errno)` として維持される
+    /// （#3313・MVM-4・REPAIR-12）。
+    #[test]
+    fn classify_last_error_supported_keeps_errno() {
+        for errno in [1, 2, 13, 22] {
+            let e = classify_last_error(true, || errno);
+            assert!(matches!(e, SysError::Os(n) if n == errno), "got {e:?}");
+        }
+    }
+
+    /// 実際の `last_error()` は対応 arch で直前の errno を `Os` として返す（#3313・MVM-4・REPAIR-12）。
+    #[test]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn last_error_reads_errno_on_supported_arch() {
+        // SAFETY 不要: std 経由で errno を設定する。
+        let _ = std::fs::File::open("/nonexistent/fandhe-3313");
+        let e = last_error();
+        assert!(matches!(e, SysError::Os(2)), "got {e:?}");
+    }
     /// CORE-6・SEC-5(#2644): 自分の pidfd への検査の結果が、実際のグループ送信の対応可否(`EINVAL` かどうか)と一致する。
     #[cfg(target_os = "linux")]
     #[test]
@@ -5664,7 +7139,6 @@ mod tests {
             Err(other) => panic!("unexpected result: {other:?}"),
         }
     }
-    use std::os::fd::AsFd as _;
 
     /// REPAIR-5・#1697: AF_UNIX の socket だけが送信対象と判定され、pipe・通常ファイル・`/dev/null`・TCP・UDP は
     /// `Unsupported` で何も書かれない。
@@ -5705,6 +7179,32 @@ mod tests {
             send_nonblocking_unix(udp.as_fd(), b"x"),
             Err(SysError::Unsupported)
         );
+    }
+
+    /// NET-6・#3064: `lo` の up に使う定数・構造体の固定値。
+    #[test]
+    fn net6_loopback_ioctl_constants_and_layout() {
+        assert_eq!(consts::SIOCGIFFLAGS, 0x8913);
+        assert_eq!(consts::SIOCSIFFLAGS, 0x8914);
+        assert_eq!(consts::IFF_UP, 1);
+        assert_eq!(consts::IFF_LOOPBACK, 8);
+        assert_eq!(consts::AF_INET, 2);
+        assert_eq!(consts::SOCK_DGRAM, 2);
+        assert_eq!(consts::IFNAMSIZ, 16);
+        assert_eq!(std::mem::size_of::<IfReqFlags>(), 40);
+        assert_eq!(std::mem::align_of::<IfReqFlags>(), 8);
+        let req = IfReqFlags::loopback();
+        assert_eq!(&req.ifr_name[..3], b"lo\0");
+        assert!(req.ifr_name[3..].iter().all(|b| *b == 0));
+        assert_eq!(req.ifr_flags, 0);
+    }
+
+    /// NET-6・#3064: ホストの netns の `lo` を読み取るだけ（変更しない）。`IFF_LOOPBACK` が立つ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_loopback_flags_reads_host_lo() {
+        let flags = loopback_flags().expect("read lo flags");
+        assert_eq!(flags & consts::IFF_LOOPBACK, consts::IFF_LOOPBACK);
     }
 
     /// SEC-4・TASK-41.5.2: netlink 監査用の定数・構造体レイアウトの具体値（kernel の uapi と照合）。
@@ -5970,6 +7470,29 @@ mod tests {
             .split_whitespace()
             .count();
         assert_eq!(supplementary_group_count(), Ok(groups));
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: 補助グループの読み戻しが実スレッドの `Groups:` と一致し、
+    /// 上限超過の `setgroups` は syscall の前に `EINVAL` になること（資格情報は変えない）。
+    #[test]
+    fn oci1_sec5_supplementary_groups_readback_matches_status_and_limit_is_enforced() {
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let mut expected: Vec<u32> = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .map(|g| g.parse().unwrap())
+            .collect();
+        let mut got = read_supplementary_groups().unwrap();
+        expected.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        let too_many = vec![1u32; SUPPLEMENTARY_GROUPS_MAX + 1];
+        assert_eq!(
+            set_supplementary_groups(&too_many),
+            Err(SysError::Os(EINVAL))
+        );
     }
 
     /// SUP-6・SEC-5・TASK-163 追補（#1462）: `setresuid` / `getresuid` / `setresgid` / `getresgid` の syscall
@@ -6312,6 +7835,12 @@ mod tests {
             devpts_real_mount_inner();
             return;
         }
+        // マウント先の親は pid だけの名前にせず `ScratchDir` にする（残骸との衝突を避ける。#3373・REPAIR-12）。
+        // 内側は子の `mnt` にだけマウントし、親自体にはマウントしない（drop の rmdir が EBUSY にならない）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-devpts",
+            std::time::Duration::from_secs(10),
+        );
         let exe = std::env::current_exe().unwrap();
         let mut child = std::process::Command::new("unshare")
             .args([
@@ -6326,10 +7855,11 @@ mod tests {
                 "--exact",
                 "sys::tests::core1_sec1_task29_devpts_real_mount",
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(INNER_ENV, "1")
+            .env(DEVPTS_DIR_ENV, scratch.path())
             .spawn()
             .expect("spawn unshare (util-linux required)");
         // 相手の終了待ちには必ず期限を設ける（REPAIR-5）。
@@ -6347,14 +7877,20 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        // 内側が作った空のマウント先（子の pid 名）を後始末する。マウントは namespace と共に消えている。
-        let _ =
-            std::fs::remove_dir(std::env::temp_dir().join(format!("fandhe-devpts-{}", child.id())));
+        // 内側が作った空のマウント先は `scratch` の drop が消す。マウントは namespace と共に消えている。
         assert!(
             status.success(),
             "inner devpts mount test failed: {status:?}"
         );
     }
+
+    /// 外側の試験が内側へマウント先の親（`ScratchDir`）を渡す環境変数名（試験専用）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const DEVPTS_DIR_ENV: &str = "FANDHE_DEVPTS_MOUNT_DIR";
 
     /// [`core1_sec1_task29_devpts_real_mount`] の内側（新しい user + mount namespace の中）。
     #[cfg(all(
@@ -6364,7 +7900,15 @@ mod tests {
     ))]
     fn devpts_real_mount_inner() {
         use std::os::unix::fs::MetadataExt as _;
-        let dir = std::env::temp_dir().join(format!("fandhe-devpts-{}", std::process::id()));
+        // 外側が渡した `ScratchDir` の子へマウントする。未設定・不在は fail-closed で panic する。
+        let parent = std::path::PathBuf::from(
+            std::env::var_os(DEVPTS_DIR_ENV).expect("FANDHE_DEVPTS_MOUNT_DIR must be set"),
+        );
+        assert!(
+            parent.is_dir(),
+            "FANDHE_DEVPTS_MOUNT_DIR must be a directory"
+        );
+        let dir = parent.join("mnt");
         std::fs::create_dir(&dir).unwrap();
         let cdir = CString::new(dir.to_str().unwrap()).unwrap();
         let target = open_dir_path_nofollow(None, &cdir).unwrap();
@@ -6385,21 +7929,15 @@ mod tests {
         let reopened = open_dir_path_nofollow(None, &cdir).unwrap();
         assert_eq!(fs_type(reopened.as_fd()).unwrap(), 0x1cd1);
 
-        // mountinfo: 指定先に fstype devpts・nosuid・noexec で現れ、nodev は付かない。5 列目は 8 進エスケープを
-        // 戻してから比べる（`TMPDIR` が空白等を含んでも見落とさない。`is_mount_point` と同じ扱い）。
+        // mountinfo: 返された fd の mount ID（fdinfo の `mnt_id`）で行を引き、fstype devpts・nosuid・noexec で現れ、
+        // nodev は付かないことを確かめる。マウントポイントの文字列で引くと、同じ点に別のマウントが重なる環境で
+        // 下側の行を拾いうる（#2823・SEC-1）。
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-        let dir_bytes = {
-            use std::os::unix::ffi::OsStrExt as _;
-            dir.as_os_str().as_bytes().to_vec()
-        };
+        let mnt_id = crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(mnt.as_fd()).unwrap();
         let line = mountinfo
             .lines()
-            .find(|l| {
-                l.split(' ')
-                    .nth(4)
-                    .is_some_and(|f| unescape_mountinfo_field(f.as_bytes()) == dir_bytes)
-            })
-            .expect("mountinfo entry for the target");
+            .find(|l| l.split(' ').next().and_then(|f| f.parse::<u64>().ok()) == Some(mnt_id))
+            .expect("mountinfo entry for the mount");
         let (pre, post) = line.split_once(" - ").unwrap();
         let opts: Vec<&str> = pre.split(' ').nth(5).unwrap().split(',').collect();
         assert!(
@@ -7065,9 +8603,7 @@ mod tests {
     #[test]
     fn sup12_task169_4_2_create_file_excl_at_refuses_existing_names() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let dir = std::env::temp_dir().join(format!("fandhe-sys-excl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-sys-excl", "d");
         let parent =
             open_dir_path_nofollow(None, &CString::new(dir.to_str().expect("utf8")).expect("c"))
                 .expect("open dir");
@@ -7090,7 +8626,25 @@ mod tests {
             SysError::Os(EEXIST)
         );
         assert!(!dir.join("target-not-created").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OCI-4・SEC-1: 根の伝播の設定は 2 通りのフラグだけを作る。
+    #[test]
+    fn oci4_root_propagation_flags_are_exact() {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            assert_eq!(
+                root_propagation_flags(RootPropagation::Private),
+                0x4000 | 0x4_0000
+            );
+            assert_eq!(
+                root_propagation_flags(RootPropagation::Slave),
+                0x4000 | 0x8_0000
+            );
+        }
     }
 
     /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに
@@ -8287,7 +9841,7 @@ mod tests {
                 "--exact",
                 "sys::tests::core6_sec5_open_tree_binds_host_device_node_in_userns",
                 "--ignored",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(OPEN_TREE_CHILD_ENV, "1");
@@ -8384,6 +9938,56 @@ mod tests {
         umount_detach_at(&target_c).expect("detach attached mount");
         std::fs::remove_dir_all(&dir).expect("remove temp dir after detach");
         assert!(!dir.exists(), "temp dir must be removed");
+    }
+
+    /// CRI-2・CORE-3（#2674）: nsfs の ioctl 番号の固定値（`_IO(0xb7, n)`。x86_64・aarch64 とも同じ）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_nsfs_ioctl_consts_are_exact() {
+        assert_eq!(consts::NS_GET_USERNS, 0xb701);
+        assert_eq!(consts::NS_GET_PARENT, 0xb702);
+        assert_eq!(consts::NS_GET_NSTYPE, 0xb703);
+        assert_eq!(consts::NS_GET_OWNER_UID, 0xb704);
+    }
+
+    /// CRI-2・CORE-3（#2674）: 自分の namespace の fd の種別・nsfs の判定・所有者の取得が非特権で動く。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_ns_type_and_owner_of_own_namespaces() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let ipc = std::fs::File::open("/proc/self/ns/ipc").expect("open ipc ns");
+        let user = std::fs::File::open("/proc/self/ns/user").expect("open user ns");
+        assert_eq!(fs_type(ipc.as_fd()).expect("fstatfs"), NSFS_MAGIC);
+        assert_eq!(ns_type(ipc.as_fd()).expect("ns type"), consts::CLONE_NEWIPC);
+        assert_eq!(
+            ns_type(user.as_fd()).expect("ns type"),
+            consts::CLONE_NEWUSER
+        );
+        // 所有する user namespace は、自分のものか祖先のもの(祖先は `EPERM`)。自分のものなら user namespace と同一。
+        match ns_owner_userns(ipc.as_fd()) {
+            Ok(owner) => {
+                let owner = std::fs::File::from(owner).metadata().expect("owner stat");
+                let mine = user.metadata().expect("user stat");
+                assert_eq!((owner.dev(), owner.ino()), (mine.dev(), mine.ino()));
+            }
+            Err(SysError::Os(e)) => assert_eq!(e, EPERM),
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+        // user namespace 以外への `NS_GET_OWNER_UID` は `EINVAL`。
+        assert_eq!(
+            ns_owner_uid(ipc.as_fd()).expect_err("not a user ns"),
+            SysError::Os(EINVAL)
+        );
+        // 通常ファイルは nsfs ではない。
+        let f = std::fs::File::open("/proc/self/status").expect("open status");
+        assert_ne!(fs_type(f.as_fd()).expect("fstatfs"), NSFS_MAGIC);
     }
 
     /// SEC-1・TASK-32 追補（#1681）: pty の ioctl 番号の固定値（x86_64・aarch64 とも asm-generic の値）。

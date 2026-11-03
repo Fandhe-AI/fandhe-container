@@ -23,6 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // 記録に載る config の map フィールドを BTreeMap にして符号化を決定的にする（記録の復号が再符号化とのバイト完全一致で正準性を判定するため。#2930・REPAIR-2）。
+        .btree_map(".runtime.v1.PodSandboxConfig")
+        .btree_map(".runtime.v1.LinuxPodSandboxConfig")
+        .btree_map(".runtime.v1.ContainerConfig")
+        .btree_map(".runtime.v1.ImageSpec")
+        .btree_map(".runtime.v1.LinuxContainerResources")
         .compile_fds(fds)?;
     Ok(())
 }

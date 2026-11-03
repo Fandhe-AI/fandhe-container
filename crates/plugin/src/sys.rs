@@ -6,8 +6,10 @@
 //! # 呼び出し文脈
 //! `crate::transport` の UDS listener が、bind 時に自プロセスの実効 uid を取得して配置ディレクトリ
 //! 所有者と照合し、accept ごとに接続元の接続時点の実効 uid を取得して照合する（PLUG-12・
-//! security.md「別 UID からの接続は peer credential 検証で切断する」）。`libc` / `nix` は依存追加が
-//! 禁止（dependency-policy）で `UnixStream::peer_cred` は unstable のため、`crates/io/src/sys.rs` と
+//! security.md「別 UID からの接続は peer credential 検証で切断する」）。製品の依存に `libc` は
+//! 入れず（`libc` は dev-dependencies で宣言の機械照合にだけ使う。#1318・#1843。照合は末尾の `libc_abi`
+//! と `tests::libc_abi_fixtures`。方式は `docs/design/ffi-libc-check.md`）、`nix` は不採用
+//! （dependency-policy）。`UnixStream::peer_cred` は unstable のため、`crates/io/src/sys.rs` と
 //! 同じ流儀で必要最小限の `extern "C"` 宣言を自前で持つ。
 //!
 //! - Linux（x86_64 / aarch64）: `getsockopt(SOL_SOCKET, SO_PEERCRED)` の `struct ucred`
@@ -28,7 +30,7 @@
 //!   ルートから 1 要素ずつ辿る（祖先要素の symlink を拒否。PLUG-12）
 //! - いずれの unix（対応 OS・アーキテクチャ）: `openat(O_CREAT | O_NOFOLLOW)` で bind ロックファイルを開く
 //!   （排他ロック自体は std の `File::try_lock`。fork 用のコールバック登録は行わない。PLUG-12・TASK-123.2）
-//! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
+//! - client connect（#249）: `socket(2)` / `connect(2)`（macOS は `fcntl(F_SETFD)` も。macOS では非原子で `spawn_gate` の外。plugin 側で spawn する実装が現れたらゲートに載せる。#3262）で非ブロッキング接続を期限までリトライする（REPAIR-5）。
 //!   対応外の OS・アーキテクチャは `Unsupported`
 //! - macOS の RSS 取得（TASK-112.1・#265）: `proc_pidinfo(PROC_PIDTASKINFO)`（`resident_size_bytes`。`crate::rss` から呼ばれる）
 //! - Linux・macOS: `killpg(2)`（`kill_process_group`。plugin の子のプロセスグループへ `SIGKILL`。#1311。それ以外の unix は `Unsupported`）
@@ -39,6 +41,8 @@
 //!   ホストが終了時に出す。#1673）
 //! - Linux（x86_64 / aarch64）・macOS: `waitid(2)`（`WEXITED | WNOHANG | WNOWAIT`。`probe_child_exit`。自発終了した plugin を回収せずに
 //!   観測し、グループへ送ってから回収するため。#1604・PLUG-7・REPAIR-5。それ以外は `Unsupported`）
+//! - Linux（x86_64 / aarch64）・macOS: `poll(2)`（`poll_two`。stderr 読み取りスレッドがソケットと停止用 pipe を同時に待つ。
+//!   macOS の `shutdown` と `recv` の競合に依存しない停止のため。REPAIR-5・PLUG-7・#3003。それ以外は `Unsupported`）
 //! - いずれの unix: `kill(2)` で起動中の plugin へ SIGINT・SIGTERM・SIGHUP を転送する（`send_signal`。
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
@@ -46,6 +50,8 @@
 //! - Linux・macOS: `fcntl(F_DUPFD_CLOEXEC, 3)`（`dup_cloexec_min3`。検証済みファイルの fd を 3 以上かつ close-on-exec で複製する）。
 //!   それ以外の unix は `try_clone`。`lifecycle/launch_target.rs` の `PluginLaunchTarget::from_verified_file` から呼ばれる
 //!   （PLUG-11・#1856）
+//! - Linux・macOS（試験専用 `#[cfg(test)]`）: `fcntl(F_GETFD / F_SETFD)`（`fd_cloexec`・`set_fd_cloexec`。`spawn_gate` の試験が
+//!   close-on-exec の有無を観測・操作する。#3139）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -2210,6 +2216,13 @@ mod dupfd_abi {
     pub(super) const F_DUPFD_CLOEXEC: i32 = 1030;
     #[cfg(target_os = "macos")]
     pub(super) const F_DUPFD_CLOEXEC: i32 = 67;
+    /// `F_GETFD` / `F_SETFD` / `FD_CLOEXEC`（Linux・macOS で同値。試験専用の `fd_cloexec` が使う。#3139）。
+    #[cfg(test)]
+    pub(super) const F_GETFD: i32 = 1;
+    #[cfg(test)]
+    pub(super) const F_SETFD: i32 = 2;
+    #[cfg(test)]
+    pub(super) const FD_CLOEXEC: i32 = 1;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int fcntl(int, int, ...)` と同じ型・幅。
@@ -2233,6 +2246,31 @@ pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
     }
     // SAFETY: `fd` は直前の fcntl が返した、他に所有者のいない有効な fd（非負を確認済み）。
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// 試験専用: `fd` の `FD_CLOEXEC` が立っているかを返す（`fcntl(F_GETFD)`。`spawn_gate` の試験が使う。#3139）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn fd_cloexec(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` は借用中で有効な fd。F_GETFD は追加引数を取らず、成否は戻り値で確認する。
+    let flags = unsafe { dupfd_abi::fcntl(fd.as_raw_fd(), dupfd_abi::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & dupfd_abi::FD_CLOEXEC != 0)
+}
+
+/// 試験専用: `fd` の `FD_CLOEXEC` を `on` にする（`fcntl(F_SETFD)`。非原子の窓の再現に使う。#3139）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_fd_cloexec(fd: std::os::fd::BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = if on { dupfd_abi::FD_CLOEXEC } else { 0 };
+    // SAFETY: `fd` は借用中で有効な fd。F_SETFD は int 引数 1 つ（フラグ）を取り、成否は戻り値で確認する。
+    let rc = unsafe { dupfd_abi::fcntl(fd.as_raw_fd(), dupfd_abi::F_SETFD, flags) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Linux・macOS 以外の unix 向け。`File::try_clone` に縮退する（呼び出し側が 3 未満を拒否する）。
@@ -2371,6 +2409,11 @@ fn connected_within_deadline(
 /// `InvalidInput`、期限超過は `TimedOut`、listener の backlog 満杯（Linux の `EAGAIN`）・`EINTR`・
 /// `EINPROGRESS` は期限までリトライする。connect 成功時も期限超過なら `TimedOut`。未対応の OS・アーキテクチャは `Unsupported`（fail-closed）。
 /// fd は socket 作成直後に `UnixStream` へ所有させ、どの失敗経路でも close される。
+///
+/// close-on-exec（macOS。PLUG-7・SEC-1）: `socket` の後に `fcntl(F_SETFD)` で立てるため非原子で、`spawn_gate` の外。
+/// 今の利用者は plugin 側（`plugin-macos` の main）だけで、そこには spawn が無くホスト側のゲートも効かない。
+/// plugin 側で子を spawn する実装が現れたら、`socket` と `fcntl` を `spawn_gate::create_fds` で包み、その spawn を
+/// `spawn_gate::spawn` に載せること。https://github.com/Fandhe-AI/fandhe-container/issues/3262
 pub(crate) fn connect_unix(
     path: &std::path::Path,
     deadline: std::time::Instant,
@@ -2429,6 +2472,7 @@ pub(crate) fn connect_unix(
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
         #[cfg(target_os = "macos")]
         {
+            // 非原子（socket との間に窓がある）。spawn ゲートに載せない理由は関数 doc と #3262 を参照。
             // SAFETY: `fd` は `stream` が所有する有効な fd。F_SETFD は int 引数 1 つを取る。
             let rc = unsafe { abi::fcntl(fd, abi::F_SETFD, abi::FD_CLOEXEC) };
             if rc != 0 {
@@ -2597,6 +2641,13 @@ mod tests {
         fn listen(sockfd: i32, backlog: i32) -> i32;
     }
 
+    /// `listen`（この `tests` の非公開宣言）の型を `libc` と照合する（#1843・REPAIR-12）。
+    #[cfg(target_os = "linux")]
+    mod libc_abi_fixtures {
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = super::listen;
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int) -> libc::c_int = libc::listen;
+    }
+
     /// REPAIR-5: accept しない listener の backlog が埋まると blocking connect は無期限に待つが、
     /// 期限付き connect は `TimedOut` で戻る（Linux の満杯時 `EAGAIN` 経路。macOS は即
     /// `ECONNREFUSED` のため対象外）。backlog は std の既定が大きく埋めにくいため、テスト内で
@@ -2683,17 +2734,12 @@ mod peer_sentinel_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     /// 一時ディレクトリ（0700）に listener を bind し、実接続した (client, server) を返す。
     fn connected_pair(tag: &str) -> (UnixStream, UnixStream) {
-        let dir = std::env::temp_dir().join(format!("fc-peer-{}-{tag}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .expect("create tmp dir");
+        // 残骸の socket の上で bind が EADDRINUSE にならないよう補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fc-peer", tag);
         let path = dir.join("s");
         let listener = UnixListener::bind(&path).expect("bind");
         let client = UnixStream::connect(&path).expect("connect");
@@ -3016,6 +3062,170 @@ pub(crate) fn send_signal(pid: i32, sig: i32) -> bool {
     unsafe { kill(pid, sig) == 0 }
 }
 
+/// [`poll_two`] の結果。真偽値にせず、待ちの結末を区別する（REPAIR-5・#3003）。
+///
+/// 生成するのは `poll_two`（macOS と LP64 の x86_64・aarch64 Linux のみ）だけなので、それ以外
+/// （x32 など）では未構築の警告を許す（型は呼び出し側の match のために全構成で残す。#3202・MVM-4）。
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollOutcome {
+    /// 期限内にどちらも読み取り可能（EOF・エラーを含む。読めば待たずに戻る）にならなかった
+    /// （シグナルによる中断を含む。呼び出し側が再度呼ぶ）。
+    TimedOut,
+    /// 1 つ以上が読み取り可能（`POLLIN`・`POLLHUP`・`POLLERR`・`POLLNVAL` のいずれか）になった。
+    Ready { first: bool, second: bool },
+}
+
+/// `poll(2)` が使える構成か（[`poll_two`] が `Unsupported` を返さない構成）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+pub(crate) const POLL_SUPPORTED: bool = true;
+/// 対応外の OS・アーキテクチャでは `poll(2)` を使わない（呼び出し側が従来の受信期限へ縮退する）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+pub(crate) const POLL_SUPPORTED: bool = false;
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod poll_abi {
+    /// `struct pollfd`（`<poll.h>`。Linux・macOS とも `int fd; short events; short revents;`）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct PollFd {
+        pub(super) fd: i32,
+        pub(super) events: i16,
+        pub(super) revents: i16,
+    }
+    pub(super) const POLLIN: i16 = 0x0001;
+    pub(super) const POLLERR: i16 = 0x0008;
+    pub(super) const POLLHUP: i16 = 0x0010;
+    pub(super) const POLLNVAL: i16 = 0x0020;
+
+    /// `nfds_t`。Linux は `unsigned long`（LP64 で 64 bit）、macOS は `unsigned int`。
+    #[cfg(target_os = "linux")]
+    pub(super) type NfdsT = u64;
+    #[cfg(target_os = "macos")]
+    pub(super) type NfdsT = u32;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`。出典: `man 2 poll`。
+        pub(super) fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+    }
+}
+
+/// 2 つの fd が読み取り可能になるか `timeout_ms` が尽きるまで待つ（`poll(2)`。stderr 読み取りスレッドが
+/// 「ソケットの到着」と「停止用 pipe」を同時に待つために使う。REPAIR-5・PLUG-7・#3003）。
+///
+/// macOS ではソケットの `shutdown` が別スレッドの `recv` の起床・受信期限と競合して読み取りが戻らない
+/// 場面を観測した（#3003）ため、停止指示を `shutdown` ではなく pipe の書き込み端を閉じて（`POLLHUP`）届け、待ち自体を
+/// `poll` の期限で必ず有限にする。`EINTR` は `TimedOut` として返す（呼び出し側が再度呼ぶ）。
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+pub(crate) fn poll_two(
+    first: &impl AsFd,
+    second: &impl AsFd,
+    timeout_ms: i32,
+) -> io::Result<PollOutcome> {
+    use poll_abi::{POLLERR, POLLHUP, POLLIN, POLLNVAL, PollFd, poll};
+    let mut fds = [
+        PollFd {
+            fd: first.as_fd().as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: second.as_fd().as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `fds` はスタック上の初期化済み配列で、渡す要素数 2 と `nfds` が一致する。`poll` は各要素の
+    // `revents` だけを書き換え、呼び出しの後は参照を保持しない。fd は呼び出し側の借用が呼び出し中開いて
+    // いることを保証する（閉じられていれば `POLLNVAL` で戻り、メモリ安全性には影響しない）。
+    let n = unsafe { poll(fds.as_mut_ptr(), 2, timeout_ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted {
+            Ok(PollOutcome::TimedOut)
+        } else {
+            Err(e)
+        };
+    }
+    let ready = |f: &PollFd| f.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0;
+    let (a, b) = (ready(&fds[0]), ready(&fds[1]));
+    if a || b {
+        Ok(PollOutcome::Ready {
+            first: a,
+            second: b,
+        })
+    } else {
+        Ok(PollOutcome::TimedOut)
+    }
+}
+
+/// 対応外の OS・アーキテクチャ向け。待たず `Unsupported`（呼び出し側が従来の受信期限へ縮退する）。
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+)))]
+pub(crate) fn poll_two(
+    first: &impl AsFd,
+    second: &impl AsFd,
+    timeout_ms: i32,
+) -> io::Result<PollOutcome> {
+    let _ = (first, second, timeout_ms);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(test)]
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: POSIX の `pid_t waitpid(pid_t pid, int *status, int options)`
@@ -3272,12 +3482,13 @@ mod write_nonblocking_flag_tests {
         assert_eq!(AF_UNIX, 1);
     }
 
-    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。試験プロセスは `SIGPIPE` を無視しているため、
+    /// 相手が閉じた socket への送信は `EPIPE`（`BrokenPipe`）で戻る。相手の close が届く前の 1 回の
+    /// send は成功しうる（並行試験の fork、特に `write_to_shut_down_socket_in_child` の `Command` が
+    /// 相手 fd を一時的に複製するため。#3436・#3474）ので、EOF を期限つきで確かめてから送る。試験プロセスは `SIGPIPE` を無視しているため、
     /// `SIGPIPE` が出ないことそのものは下の `repair5_send_to_shut_down_socket_raises_no_sigpipe_under_sig_dfl` で照合する。
     #[test]
     fn repair5_send_to_closed_peer_returns_epipe() {
-        let (a, b) = UnixStream::pair().unwrap();
-        drop(b);
+        let a = crate::spawn_gate::unix_pair_with_closed_peer();
         let e = write_nonblocking(&a, b"x\n").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -3496,5 +3707,684 @@ mod waitid_abi_macos_tests {
         assert_eq!((info.si_signo, info.si_errno, info.si_code), (0, 0, 0));
         assert_eq!((info.si_pid, info.si_uid, info.si_status), (0, 0, 0));
         assert_eq!(info.rest, [0u64; 10]);
+    }
+}
+/// 自前の FFI 宣言（定数・`#[repr(C)]` 構造体・`extern "C"` 関数）を `libc`（dev-dependencies のみ。
+/// #1318・#1837・#1843・MVM-4・REPAIR-7・REPAIR-12）とコンパイル時の `const` で突き合わせる。
+/// 方式は `docs/design/ffi-libc-check.md`。関数は呼ばず、`unsafe` も足さない。
+///
+/// 各ブロックの cfg は、照合する宣言の cfg と同じ式を写す。アーキテクチャで値が変わる宣言
+/// （`O_DIRECTORY`・`O_NOFOLLOW`・`SO_DOMAIN`・`MSG_NOSIGNAL` 等）の期待値は、そのターゲットの
+/// `libc::X` であり、他ターゲットの値やリテラルは使わない。
+///
+/// 型の綴りだけが違う箇所（値・サイズ・ABI は同じ）:
+/// - `waitid` の `idtype`: 自前は `i32`、`libc` は `idtype_t`（`c_uint`）。C の `idtype_t` は列挙型で、
+///   列挙子がすべて負でないため `libc` は `unsigned int` を選ぶ。幅・アラインメントは同じで、
+///   32 bit 整数引数の渡し方は符号で変わらない（x86_64 SysV・AAPCS64）ため ABI は一致する。
+///   関数は引数の型を別々に書いて照合し、`P_PID` は負でないことを確かめてから比べる。
+/// - `send` の `buf`（`*const u8` と `*const c_void`）・`readdir` の戻り値（`*mut u8` と `*mut dirent`）・
+///   `DIR`（`*mut c_void` と `*mut DIR`）・`statx` / `fstatat` / `waitid` / `connect` の構造体ポインタは、
+///   どれもポインタ（ABI 同一）。自前側と `libc` 側の型を別々に書き、指す先の構造体の同一性は
+///   サイズ・オフセットの照合が担う。
+///
+/// 関数本体の中のローカル項目（`fchmodat_via_opath` の `O_PATH`、`peer_pid` の `SOL_LOCAL`・
+/// `LOCAL_PEERPID`・`getsockopt`、`resident_size_bytes` の `PROC_PIDTASKINFO`・`ProcTaskInfo`・
+/// `proc_pidinfo`、`reap_child_for_test` の `WNOHANG`、試験の `EPROTO`）は項目として参照できない。
+/// `sys` の本体を変えないため、`libc` 側の値・サイズ・オフセットを自前と同じ値で assert し、関数は
+/// 自前の宣言と同じ並びで書き出した型へ `libc` の関数を代入する（関数名をコメントに書く）。
+///
+/// 対象外（理由）:
+/// - FFI でない値: `PROBE_EINTR_RETRIES`・`CREATED_LOCK_WAIT_*`・`OPEN_ATTEMPTS`・`RETRY_INTERVAL`・
+///   `TOTAL`、`UCRED_SIZE` / `UCRED_LEN`（`Ucred` のサイズから導かれ、`Ucred` の照合に含まれる）、
+///   `MTIME_INDEX`（配列の添字。`stx_mtime` のオフセットの照合に含まれる）、`FileIdent` 等の安全な型
+/// - `link_name`（macOS x86_64 の `fstatat$INODE64`・`fdopendir$INODE64`・`readdir$INODE64`）:
+///   型の照合ではシンボル名を検査できない。`libc` 0.2.189 の `unix/bsd/apple/mod.rs` も同じ名前を使う
+/// - `SigInfo`（Linux）の `si_pid`: `libc` の gnu の `siginfo_t` は `si_pid` をアクセサの裏に隠し
+///   `offset_of!` で取れない。位置 16 は本体の assert（`bits/types/siginfo_t.h`）が担う
+/// - `Statx::pad0`・`Statx` の予約領域: `libc` 側が非公開
+#[cfg(test)]
+mod libc_abi {
+    use super::*;
+
+    /// `libc` の `c_int` 定数を負でないことを確かめて `u64` へ広げる（切り詰めを隠さない）。
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    const fn widen(v: libc::c_int) -> u64 {
+        assert!(v >= 0);
+        v as u64
+    }
+
+    // ---- unix 共通 ----
+    const _: unsafe extern "C" fn() -> libc::uid_t = geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = kill;
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = libc::kill;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        c_unlinkat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        libc::unlinkat;
+    // `waitpid`（`cfg(test)` のトップレベル）。
+    const _: unsafe extern "C" fn(libc::pid_t, *mut libc::c_int, libc::c_int) -> libc::pid_t =
+        waitpid;
+    const _: unsafe extern "C" fn(libc::pid_t, *mut libc::c_int, libc::c_int) -> libc::pid_t =
+        libc::waitpid;
+    const _: () = {
+        assert!(SIGKILL == libc::SIGKILL);
+        // `reap_child_for_test` の関数内ローカル `WNOHANG`（値 1）。
+        assert!(libc::WNOHANG == 1);
+    };
+
+    // ---- poll（Linux 64 bit・macOS。#3003）----
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: () = {
+        use core::mem::{align_of, offset_of, size_of};
+        assert!(size_of::<poll_abi::PollFd>() == size_of::<libc::pollfd>());
+        assert!(align_of::<poll_abi::PollFd>() == align_of::<libc::pollfd>());
+        assert!(offset_of!(poll_abi::PollFd, fd) == offset_of!(libc::pollfd, fd));
+        assert!(offset_of!(poll_abi::PollFd, events) == offset_of!(libc::pollfd, events));
+        assert!(offset_of!(poll_abi::PollFd, revents) == offset_of!(libc::pollfd, revents));
+        assert!(poll_abi::POLLIN == libc::POLLIN);
+        assert!(poll_abi::POLLERR == libc::POLLERR);
+        assert!(poll_abi::POLLHUP == libc::POLLHUP);
+        assert!(poll_abi::POLLNVAL == libc::POLLNVAL);
+        // `poll` の nfds 引数の幅（Linux は unsigned long、macOS は unsigned int）。関数ポインタの照合は
+        // 自前の型どうしでしか見ないため、`NfdsT` と `libc::nfds_t` の幅はここで直接突き合わせる（#3003・#3145）。
+        assert!(size_of::<poll_abi::NfdsT>() == size_of::<libc::nfds_t>());
+        assert!(align_of::<poll_abi::NfdsT>() == align_of::<libc::nfds_t>());
+    };
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: unsafe extern "C" fn(
+        *mut poll_abi::PollFd,
+        poll_abi::NfdsT,
+        libc::c_int,
+    ) -> libc::c_int = poll_abi::poll;
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        libc::poll;
+    // 関数ポインタの照合は片側の型にしか効かないため、`NfdsT` と `libc::nfds_t` を直接突き合わせる
+    // （Linux は `unsigned long`・macOS は `unsigned int`。#3145・#3256・REPAIR-7）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    const _: fn(poll_abi::NfdsT) -> libc::nfds_t = |x| x;
+
+    // ---- Linux・macOS 共通 ----
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: () = {
+        assert!(AT_SYMLINK_NOFOLLOW == libc::AT_SYMLINK_NOFOLLOW);
+        assert!(dupfd_abi::F_DUPFD_CLOEXEC == libc::F_DUPFD_CLOEXEC);
+        assert!(dupfd_abi::F_GETFD == libc::F_GETFD);
+        assert!(dupfd_abi::F_SETFD == libc::F_SETFD);
+        assert!(dupfd_abi::FD_CLOEXEC == libc::FD_CLOEXEC);
+    };
+    // `killpg` は `link_name` が同名（`c_killpg` は Rust 側の名前だけ）。`ModeT` の幅は `mode_t` との
+    // 型の一致で確かめる（Linux `u32`・macOS `u16`）。`fcntl` は両方とも可変長。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = c_killpg;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = libc::killpg;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::mode_t,
+        libc::c_int,
+    ) -> libc::c_int = c_fchmodat;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::mode_t,
+        libc::c_int,
+    ) -> libc::c_int = libc::fchmodat;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = dupfd_abi::fcntl;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = libc::fcntl;
+
+    // ---- Linux 64 bit（x86_64 / aarch64）の宣言 ----
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    mod linux64 {
+        use super::super::*;
+        use super::widen;
+        use core::mem::{align_of, offset_of, size_of};
+
+        // `send` の `buf` は自前が `*const u8`、`libc` が `*const c_void`（どちらもポインタで ABI 同一）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const u8,
+            libc::size_t,
+            libc::c_int,
+        ) -> libc::ssize_t = c_send;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_void,
+            libc::size_t,
+            libc::c_int,
+        ) -> libc::ssize_t = libc::send;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = c_getsockopt;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = linux::getsockopt;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = libc::getsockopt;
+        // `prctl` は両方とも可変長。
+        const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = prctl;
+        const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = libc::prctl;
+        const _: unsafe extern "C" fn() -> libc::pid_t = getppid;
+        const _: unsafe extern "C" fn() -> libc::pid_t = libc::getppid;
+
+        const _: () = {
+            assert!(SOL_SOCKET == libc::SOL_SOCKET);
+            assert!(SO_DOMAIN == libc::SO_DOMAIN);
+            assert!(AF_UNIX == libc::AF_UNIX);
+            assert!(MSG_DONTWAIT == libc::MSG_DONTWAIT);
+            assert!(MSG_NOSIGNAL == libc::MSG_NOSIGNAL);
+            // `fchmodat_via_opath` の関数内ローカル `O_PATH`（x86_64 / aarch64 とも 0o10000000）。
+            assert!(libc::O_PATH == 0o10000000);
+            // `write_to_shut_down_socket_in_child` の関数内ローカル `EPROTO`（71）。
+            assert!(libc::EPROTO == 71);
+            assert!(pdeathsig_abi::PR_SET_PDEATHSIG == libc::PR_SET_PDEATHSIG);
+            assert!(pdeathsig_abi::SIGKILL == widen(libc::SIGKILL));
+            assert!(pdeathsig_abi::ESRCH == libc::ESRCH);
+            assert!(linux::SOL_SOCKET == libc::SOL_SOCKET);
+            assert!(linux::SO_PEERCRED == libc::SO_PEERCRED);
+        };
+
+        // `struct ucred`（pid・uid・gid の各 4 バイト）。
+        const _: () = {
+            assert!(size_of::<linux::Ucred>() == size_of::<libc::ucred>());
+            assert!(align_of::<linux::Ucred>() == align_of::<libc::ucred>());
+            assert!(offset_of!(linux::Ucred, pid) == offset_of!(libc::ucred, pid));
+            assert!(offset_of!(linux::Ucred, uid) == offset_of!(libc::ucred, uid));
+            assert!(offset_of!(linux::Ucred, gid) == offset_of!(libc::ucred, gid));
+        };
+
+        // `waitid`。`idtype` の型の綴りだけが違う（モジュールの doc を参照）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::id_t,
+            *mut waitid_abi::SigInfo,
+            libc::c_int,
+        ) -> libc::c_int = waitid_abi::waitid;
+        const _: unsafe extern "C" fn(
+            libc::idtype_t,
+            libc::id_t,
+            *mut libc::siginfo_t,
+            libc::c_int,
+        ) -> libc::c_int = libc::waitid;
+        const _: () = {
+            assert!(size_of::<libc::c_int>() == size_of::<libc::idtype_t>());
+            assert!(align_of::<libc::c_int>() == align_of::<libc::idtype_t>());
+            assert!(waitid_abi::P_PID >= 0 && waitid_abi::P_PID as u32 == libc::P_PID);
+            assert!(waitid_abi::WNOHANG == libc::WNOHANG);
+            assert!(waitid_abi::WEXITED == libc::WEXITED);
+            assert!(waitid_abi::WNOWAIT == libc::WNOWAIT);
+            // `siginfo_t`。`si_pid` は対象外（モジュールの doc を参照）。
+            assert!(size_of::<waitid_abi::SigInfo>() == size_of::<libc::siginfo_t>());
+            assert!(align_of::<waitid_abi::SigInfo>() == align_of::<libc::siginfo_t>());
+            assert!(
+                offset_of!(waitid_abi::SigInfo, si_signo) == offset_of!(libc::siginfo_t, si_signo)
+            );
+            assert!(
+                offset_of!(waitid_abi::SigInfo, si_errno) == offset_of!(libc::siginfo_t, si_errno)
+            );
+            assert!(
+                offset_of!(waitid_abi::SigInfo, si_code) == offset_of!(libc::siginfo_t, si_code)
+            );
+        };
+    }
+
+    // ---- Linux（gnu）の statx。`libc` が gnu でだけ `statx` を定義する ----
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    mod linux_gnu_statx {
+        use super::super::*;
+        use core::mem::{align_of, offset_of, size_of};
+        use statx_abi::{Statx, StatxTimestamp};
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            libc::c_uint,
+            *mut Statx,
+        ) -> libc::c_int = statx_abi::statx;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            libc::c_uint,
+            *mut libc::statx,
+        ) -> libc::c_int = libc::statx;
+
+        const _: () = {
+            assert!(AT_EMPTY_PATH == libc::AT_EMPTY_PATH);
+            assert!(
+                statx_abi::REQUIRED_MASK
+                    == libc::STATX_TYPE
+                        | libc::STATX_MODE
+                        | libc::STATX_UID
+                        | libc::STATX_MTIME
+                        | libc::STATX_INO
+            );
+            // 自前は 4 つの時刻を配列、末尾の予約をまとめた形で持つ。名前の対応をつけて位置を比べる。
+            assert!(size_of::<Statx>() == size_of::<libc::statx>());
+            assert!(align_of::<Statx>() == align_of::<libc::statx>());
+            assert!(offset_of!(Statx, mask) == offset_of!(libc::statx, stx_mask));
+            assert!(offset_of!(Statx, blksize) == offset_of!(libc::statx, stx_blksize));
+            assert!(offset_of!(Statx, attributes) == offset_of!(libc::statx, stx_attributes));
+            assert!(offset_of!(Statx, nlink) == offset_of!(libc::statx, stx_nlink));
+            assert!(offset_of!(Statx, uid) == offset_of!(libc::statx, stx_uid));
+            assert!(offset_of!(Statx, gid) == offset_of!(libc::statx, stx_gid));
+            assert!(offset_of!(Statx, mode) == offset_of!(libc::statx, stx_mode));
+            assert!(offset_of!(Statx, ino) == offset_of!(libc::statx, stx_ino));
+            assert!(offset_of!(Statx, size) == offset_of!(libc::statx, stx_size));
+            assert!(offset_of!(Statx, blocks) == offset_of!(libc::statx, stx_blocks));
+            assert!(
+                offset_of!(Statx, attributes_mask) == offset_of!(libc::statx, stx_attributes_mask)
+            );
+            assert!(offset_of!(Statx, timestamps) == offset_of!(libc::statx, stx_atime));
+            assert!(
+                offset_of!(Statx, timestamps)
+                    + statx_abi::MTIME_INDEX * size_of::<StatxTimestamp>()
+                    == offset_of!(libc::statx, stx_mtime)
+            );
+            assert!(offset_of!(Statx, rdev_major) == offset_of!(libc::statx, stx_rdev_major));
+            assert!(offset_of!(Statx, rdev_minor) == offset_of!(libc::statx, stx_rdev_minor));
+            assert!(offset_of!(Statx, dev_major) == offset_of!(libc::statx, stx_dev_major));
+            assert!(offset_of!(Statx, dev_minor) == offset_of!(libc::statx, stx_dev_minor));
+            assert!(offset_of!(Statx, tail) == offset_of!(libc::statx, stx_mnt_id));
+
+            assert!(size_of::<StatxTimestamp>() == size_of::<libc::statx_timestamp>());
+            assert!(align_of::<StatxTimestamp>() == align_of::<libc::statx_timestamp>());
+            assert!(offset_of!(StatxTimestamp, sec) == offset_of!(libc::statx_timestamp, tv_sec));
+            assert!(offset_of!(StatxTimestamp, nsec) == offset_of!(libc::statx_timestamp, tv_nsec));
+        };
+    }
+
+    // ---- Linux 64 bit・macOS 共通の宣言 ----
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    mod linux64_macos {
+        use super::super::*;
+        use core::mem::{align_of, offset_of, size_of};
+
+        const _: () = {
+            // `O_DIRECTORY` / `O_NOFOLLOW` はアーキテクチャで値が違う。期待値はそのターゲットの `libc`。
+            assert!(O_DIRECTORY == libc::O_DIRECTORY);
+            assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
+            assert!(O_CLOEXEC == libc::O_CLOEXEC);
+            assert!(AT_FDCWD == libc::AT_FDCWD);
+            assert!(O_RDWR == libc::O_RDWR);
+            assert!(O_CREAT == libc::O_CREAT);
+            assert!(O_EXCL == libc::O_EXCL);
+            assert!(O_NONBLOCK == libc::O_NONBLOCK);
+            // 番兵は `(uid_t)-1`。名前のある `libc` 定数が無いため `uid_t::MAX` で比べる。
+            assert!(PEER_ID_SENTINEL == libc::uid_t::MAX);
+            assert!(connect_abi::AF_UNIX == libc::AF_UNIX);
+            assert!(connect_abi::SOCK_STREAM == libc::SOCK_STREAM);
+            assert!(connect_abi::EISCONN == libc::EISCONN);
+            assert!(connect_abi::EINPROGRESS == libc::EINPROGRESS);
+            assert!(connect_abi::EALREADY == libc::EALREADY);
+            assert!(connect_abi::EAGAIN == libc::EAGAIN);
+            assert!(connect_abi::EINTR == libc::EINTR);
+            // `sockaddr_un`。`SUN_PATH_LEN` は構造体末尾の配列長。
+            assert!(size_of::<connect_abi::SockaddrUn>() == size_of::<libc::sockaddr_un>());
+            assert!(align_of::<connect_abi::SockaddrUn>() == align_of::<libc::sockaddr_un>());
+            assert!(
+                offset_of!(connect_abi::SockaddrUn, sun_family)
+                    == offset_of!(libc::sockaddr_un, sun_family)
+            );
+            assert!(
+                offset_of!(connect_abi::SockaddrUn, sun_path)
+                    == offset_of!(libc::sockaddr_un, sun_path)
+            );
+            assert!(SUN_PATH_OFFSET == offset_of!(libc::sockaddr_un, sun_path));
+            assert!(
+                connect_abi::SUN_PATH_LEN
+                    == size_of::<libc::sockaddr_un>() - offset_of!(libc::sockaddr_un, sun_path)
+            );
+            assert!(dir_abi::DIRENT_NAME_OFFSET == offset_of!(libc::dirent, d_name));
+        };
+
+        // `openat` は両方とも可変長。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = c_openat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = libc::openat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = c_mkdirat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = libc::mkdirat;
+        // `DIR` は自前が `*mut c_void`、`libc` が `*mut DIR`。`dirent` も同様（どちらもポインタ）。
+        // macOS x86_64 の `$INODE64` の `link_name` は対象外（モジュールの doc を参照）。
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut libc::c_void = dir_abi::fdopendir;
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut libc::DIR = libc::fdopendir;
+        const _: unsafe extern "C" fn(*mut libc::c_void) -> *mut u8 = dir_abi::readdir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent = libc::readdir;
+        const _: unsafe extern "C" fn(*mut libc::c_void) -> libc::c_int = dir_abi::closedir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int = libc::closedir;
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+            connect_abi::socket;
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int, libc::c_int) -> libc::c_int =
+            libc::socket;
+        // `connect` は自前が `*const SockaddrUn`、`libc` が `*const sockaddr`。`socklen_t` は厳密に比べる。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const connect_abi::SockaddrUn,
+            libc::socklen_t,
+        ) -> libc::c_int = connect_abi::connect;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::sockaddr,
+            libc::socklen_t,
+        ) -> libc::c_int = libc::connect;
+    }
+
+    // ---- Linux 64 bit のみ（`connect_abi` の Linux 固有の定数と errno 取得） ----
+    #[cfg(all(
+        target_os = "linux",
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    mod linux64_only {
+        use super::super::*;
+        const _: () = assert!(connect_abi::SOCK_CLOEXEC == libc::SOCK_CLOEXEC);
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = dir_abi::__errno_location;
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__errno_location;
+    }
+
+    // ---- macOS ----
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::super::*;
+        use core::mem::{align_of, offset_of, size_of};
+
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = dir_abi::__error;
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__error;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = getpeereid;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::uid_t,
+            *mut libc::gid_t,
+        ) -> libc::c_int = libc::getpeereid;
+        const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int =
+            connect_abi::fcntl;
+        // `peer_pid` の関数内ローカル `getsockopt`（libSystem。`optlen` は `socklen_t`）と同じ並びの型。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            libc::c_int,
+            *mut libc::c_void,
+            *mut libc::socklen_t,
+        ) -> libc::c_int = libc::getsockopt;
+        // `resident_size_bytes` の関数内ローカル `proc_pidinfo` と同じ並びの型。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::c_int,
+            u64,
+            *mut libc::c_void,
+            libc::c_int,
+        ) -> libc::c_int = libc::proc_pidinfo;
+        // `fstatat` は自前が `*mut Stat`、`libc` が `*mut stat`。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut stat_abi::Stat,
+            libc::c_int,
+        ) -> libc::c_int = stat_abi::fstatat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut libc::stat,
+            libc::c_int,
+        ) -> libc::c_int = libc::fstatat;
+        // `waitid`。`idtype` の型の綴りだけが違う（モジュールの doc を参照）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            libc::id_t,
+            *mut waitid_abi::SigInfo,
+            libc::c_int,
+        ) -> libc::c_int = waitid_abi::waitid;
+        const _: unsafe extern "C" fn(
+            libc::idtype_t,
+            libc::id_t,
+            *mut libc::siginfo_t,
+            libc::c_int,
+        ) -> libc::c_int = libc::waitid;
+
+        const _: () = {
+            assert!(waitid_abi::WNOHANG == libc::WNOHANG);
+            assert!(waitid_abi::WEXITED == libc::WEXITED);
+            assert!(waitid_abi::WNOWAIT == libc::WNOWAIT);
+            assert!(waitid_abi::P_PID >= 0 && waitid_abi::P_PID as u32 == libc::P_PID);
+            assert!(size_of::<libc::c_int>() == size_of::<libc::idtype_t>());
+            assert!(align_of::<libc::c_int>() == align_of::<libc::idtype_t>());
+            assert!(connect_abi::F_SETFD == libc::F_SETFD);
+            assert!(connect_abi::FD_CLOEXEC == libc::FD_CLOEXEC);
+            // `peer_pid` / `resident_size_bytes` の関数内ローカル定数・構造体。
+            assert!(libc::SOL_LOCAL == 0);
+            assert!(libc::LOCAL_PEERPID == 0x002);
+            assert!(libc::PROC_PIDTASKINFO == 4);
+            assert!(size_of::<libc::proc_taskinfo>() == 96);
+            assert!(align_of::<libc::proc_taskinfo>() == 8);
+            assert!(offset_of!(libc::proc_taskinfo, pti_resident_size) == 8);
+        };
+
+        // `siginfo_t`（`rest` は `si_addr` 以降を不透明に写す）。
+        const _: () = {
+            use waitid_abi::SigInfo;
+            assert!(size_of::<SigInfo>() == size_of::<libc::siginfo_t>());
+            assert!(align_of::<SigInfo>() == align_of::<libc::siginfo_t>());
+            assert!(offset_of!(SigInfo, si_signo) == offset_of!(libc::siginfo_t, si_signo));
+            assert!(offset_of!(SigInfo, si_errno) == offset_of!(libc::siginfo_t, si_errno));
+            assert!(offset_of!(SigInfo, si_code) == offset_of!(libc::siginfo_t, si_code));
+            assert!(offset_of!(SigInfo, si_pid) == offset_of!(libc::siginfo_t, si_pid));
+            assert!(offset_of!(SigInfo, si_uid) == offset_of!(libc::siginfo_t, si_uid));
+            assert!(offset_of!(SigInfo, si_status) == offset_of!(libc::siginfo_t, si_status));
+            assert!(offset_of!(SigInfo, rest) == offset_of!(libc::siginfo_t, si_addr));
+        };
+
+        // `struct stat`（64 bit inode 版）。自前は時刻を `Timespec` の入れ子で持ち、`libc` は
+        // `st_atime` と `st_atime_nsec` の個別フィールドで持つ。位置の対応をつけて比べる。
+        const _: () = {
+            use stat_abi::{Stat, Timespec};
+            assert!(size_of::<Stat>() == size_of::<libc::stat>());
+            assert!(align_of::<Stat>() == align_of::<libc::stat>());
+            assert!(offset_of!(Stat, st_dev) == offset_of!(libc::stat, st_dev));
+            assert!(offset_of!(Stat, st_mode) == offset_of!(libc::stat, st_mode));
+            assert!(offset_of!(Stat, st_nlink) == offset_of!(libc::stat, st_nlink));
+            assert!(offset_of!(Stat, st_ino) == offset_of!(libc::stat, st_ino));
+            assert!(offset_of!(Stat, st_uid) == offset_of!(libc::stat, st_uid));
+            assert!(offset_of!(Stat, st_gid) == offset_of!(libc::stat, st_gid));
+            assert!(offset_of!(Stat, st_rdev) == offset_of!(libc::stat, st_rdev));
+            assert!(offset_of!(Stat, st_atimespec) == offset_of!(libc::stat, st_atime));
+            assert!(offset_of!(Stat, st_mtimespec) == offset_of!(libc::stat, st_mtime));
+            assert!(offset_of!(Stat, st_ctimespec) == offset_of!(libc::stat, st_ctime));
+            assert!(offset_of!(Stat, st_birthtimespec) == offset_of!(libc::stat, st_birthtime));
+            assert!(
+                offset_of!(Stat, st_atimespec) + offset_of!(Timespec, tv_nsec)
+                    == offset_of!(libc::stat, st_atime_nsec)
+            );
+            assert!(
+                offset_of!(Stat, st_mtimespec) + offset_of!(Timespec, tv_nsec)
+                    == offset_of!(libc::stat, st_mtime_nsec)
+            );
+            assert!(
+                offset_of!(Stat, st_ctimespec) + offset_of!(Timespec, tv_nsec)
+                    == offset_of!(libc::stat, st_ctime_nsec)
+            );
+            assert!(
+                offset_of!(Stat, st_birthtimespec) + offset_of!(Timespec, tv_nsec)
+                    == offset_of!(libc::stat, st_birthtime_nsec)
+            );
+            assert!(offset_of!(Stat, st_size) == offset_of!(libc::stat, st_size));
+            assert!(offset_of!(Stat, st_blocks) == offset_of!(libc::stat, st_blocks));
+            assert!(offset_of!(Stat, st_blksize) == offset_of!(libc::stat, st_blksize));
+            assert!(offset_of!(Stat, st_flags) == offset_of!(libc::stat, st_flags));
+            assert!(offset_of!(Stat, st_gen) == offset_of!(libc::stat, st_gen));
+            assert!(offset_of!(Stat, st_lspare) == offset_of!(libc::stat, st_lspare));
+            assert!(offset_of!(Stat, st_qspare) == offset_of!(libc::stat, st_qspare));
+            assert!(size_of::<Timespec>() == size_of::<libc::timespec>());
+            assert!(align_of::<Timespec>() == align_of::<libc::timespec>());
+            assert!(offset_of!(Timespec, tv_sec) == offset_of!(libc::timespec, tv_sec));
+            assert!(offset_of!(Timespec, tv_nsec) == offset_of!(libc::timespec, tv_nsec));
+        };
+    }
+}
+
+/// [`poll_two`] の結末の区別（REPAIR-5・#3003）。pipe で結末を具体値で照合する。
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    )
+))]
+mod poll_two_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn repair5_poll_two_distinguishes_timeout_data_and_hangup() {
+        let (r1, mut w1) = std::io::pipe().unwrap();
+        let (r2, w2) = std::io::pipe().unwrap();
+        // 何も書かれていなければ期限で TimedOut。
+        assert_eq!(poll_two(&r1, &r2, 10).unwrap(), PollOutcome::TimedOut);
+        // 1 本目にだけ書けば first のみ。
+        w1.write_all(b"x").unwrap();
+        assert_eq!(
+            poll_two(&r1, &r2, 1000).unwrap(),
+            PollOutcome::Ready {
+                first: true,
+                second: false
+            }
+        );
+        // 2 本目の書き込み端を閉じる（EOF = POLLHUP）と second も ready。
+        // 並行する別テストの fork から exec までの間は（macOS ではさらに fd の作成から close-on-exec の設定までの
+        // 窓でも。後者は `spawn_gate` の試験で扱う。#3139）、子が複製した書き込み端を保持して EOF が遅れ得るため、
+        // 期限つきで待つ（本番も停止フラグと `poll` の期限で有限に止まる。REPAIR-5・#3003）。
+        drop(w2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let got = poll_two(&r1, &r2, 100).unwrap();
+            if got
+                == (PollOutcome::Ready {
+                    first: true,
+                    second: true,
+                })
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "got={got:?}");
+        }
+    }
+
+    #[test]
+    fn repair5_poll_two_reports_only_second_when_stop_pipe_written() {
+        let (r1, _w1) = std::io::pipe().unwrap();
+        let (r2, mut w2) = std::io::pipe().unwrap();
+        w2.write_all(b"s").unwrap();
+        assert_eq!(
+            poll_two(&r1, &r2, 1000).unwrap(),
+            PollOutcome::Ready {
+                first: false,
+                second: true
+            }
+        );
     }
 }

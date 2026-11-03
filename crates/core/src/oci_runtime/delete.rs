@@ -64,8 +64,9 @@
 //! その create の参照を外さない。状態作成後〜確定前に delete が状態を消した場合は、create が確定後に
 //! 状態の不在を検知して自分で外す。
 //!
-//! 登録世代の読み取りや解除の失敗は delete の結果を変えず（状態は消えており、エラーで返すと再実行が
-//! `NotFound` になるため）、操作名 `image_ref_release` で `recorder` に記録する。読み取りに失敗したときは
+//! 登録世代の読み取りや解除の失敗は delete の成否を変えず（状態は消えており、エラーで返すと再実行が
+//! `NotFound` になるため）、結果は [`DeleteResponse::image_ref`] で呼び出し元へ返し、操作名
+//! `image_ref_release` でも `recorder` に記録する。読み取りに失敗したときは
 //! 解除しない。残った参照はデータを余分に持つ安全側で、起動時の照合（#854）が回収する。
 //! 参照を登録しない [`delete`] でイメージつきのコンテナを消すと参照が残る（同じく安全側）。
 //!
@@ -116,6 +117,23 @@
 //! 回さず、そのエラーを返す（壊れた環境で記録の経路を使わない安全側の判断。#2133 で再検討し維持した。
 //! 理由と回避策は CLI の `stop_delete` の module doc）。
 //!
+//! # 待ちの上限（REPAIR-5・CRI-2・#3027）
+//!
+//! 成功の経路で `delete` が待つ箇所は次のとおりで、どれも定数で有界である（I/O 自体の時間は別）。数え方の規則は
+//! 「`StateStore` の呼び出し 1 回につき `STATE_LOCK_TIMEOUT`（5 秒）を 1 回」。
+//!
+//! | 段 | 待ち | 上限 |
+//! | -- | ---- | ---- |
+//! | `StateStore::get`（手順 2） | プロセス内ゲートと `@lock` の flock | 5 秒 |
+//! | `ContainerCgroupRemover::scope` | `/proc/self/cgroup` の読み取りのみ | 待ちなし |
+//! | `StateStore::get`（cgroup の配置が記録されているときの revision の再確認） | 同上 | 5 秒 |
+//! | cgroup の削除 | 残った `exec-*` の掃除全体で 1 つの期限（`EXEC_SWEEP_DELETE_TIMEOUT`）と rmdir | 5 秒 |
+//! | `StateStore::delete`（手順 5） | 同上 | 5 秒 |
+//!
+//! 合計は 3 × `STATE_LOCK_TIMEOUT` + `EXEC_SWEEP_DELETE_TIMEOUT` = 20 秒。`BundleLock` は `LOCK_NB` で待たない。
+//! revision 不一致の再試行の `get` は `Err` で終わる経路にだけ足される。呼び出し元の plugin-cri はこの値を
+//! `PLUGIN_RUNTIME_TIMEOUT` の内訳に使う（`docs/design/container-log-removal-wait.md`）。
+//!
 //! # 削除・再作成との競合（OCI-6・CORE-2）
 //!
 //! cgroup の削除は名前指定（`unlinkat`）で、`StateStore` の楽観的排他とは原子的に組み合わせられない。
@@ -158,7 +176,7 @@
 //! エラーメッセージは固定文言のみで、pid・パス・errno を含めない。
 
 use super::error::{LifecycleOp, OciRuntimeError};
-use super::image_refs::ContainerImageRefs;
+use super::image_refs::{ContainerImageRefs, ImageRefRelease};
 use super::image_rootfs::{
     ImageRootfsPrivilege, RecordedRootfsRemoval, remove_recorded_rootfs_with,
 };
@@ -333,7 +351,8 @@ pub fn delete_with_options(
 /// [`delete`] に、OCI-7 のイメージ参照の解除を後置したもの（TASK-183.8.1）。
 ///
 /// [`delete`] が `Ok` を返した後にだけ `refs.release` を呼ぶ（根拠はモジュール doc「イメージ参照の解除」）。
-/// 解除の失敗は戻り値に影響させず、操作名 `image_ref_release` で `recorder` に記録する。
+/// 解除の結果は [`DeleteResponse::image_ref`] へ載せ（失敗は `Kept { code }`。delete の成否は変えない）、
+/// 操作名 `image_ref_release` でも `recorder` に記録する（REPAIR-4）。
 pub fn delete_releasing_image_ref(
     store: &dyn StateStore,
     recorder: &OpRecorder,
@@ -361,28 +380,47 @@ pub fn delete_releasing_image_ref_with_options(
     options: &DeleteOptions,
 ) -> Result<DeleteResponse, OciRuntimeError> {
     let response = delete_with_options(store, recorder, cgroups, req, options)?;
-    // 状態の削除後に、先に登録世代を読み、そのあとで状態が無いことを確かめる（この順序が要点）。
-    // 確定済みの登録は、外されるまで同じ ID の他の create が登録できないので、状態が無い時点で読んだ
-    // 確定済みの世代は、削除したコンテナ（または既に消えた別のコンテナ）のものである。読んだ後に状態が
-    // 存在するなら、それは並行する create が作り直した新しいコンテナで、外さない（OCI-7）。
-    let generation = (|| {
-        let name = OpName::new(IMAGE_REF_LOOKUP_OP_NAME).ok()?;
-        let generation = recorder
-            .record_op(&name, || refs.registration(req.id()))
-            .ok()
-            .flatten()?;
-        let state_gone = matches!(
-            store.get(&GetStateRequest::new(req.id().clone())),
-            Err(ref e) if e.code() == ErrorCode::NotFound
-        );
-        state_gone.then_some(generation)
-    })();
-    if let Some(generation) = generation
-        && let Ok(name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME)
-    {
-        let _ = recorder.record_op(&name, || refs.release_if(req.id(), generation));
+    Ok(response.with_image_ref(release_image_ref(store, recorder, refs, req)))
+}
+
+/// 状態削除後のイメージ参照の解除（結果は [`DeleteResponse::image_ref`] へ写す。REPAIR-4）。
+///
+/// 先に登録世代を読み、そのあとで状態が無いことを確かめる（この順序が要点）。
+/// 確定済みの登録は、外されるまで同じ ID の他の create が登録できないので、状態が無い時点で読んだ
+/// 確定済みの世代は、削除したコンテナ（または既に消えた別のコンテナ）のものである。読んだ後に状態が
+/// 存在するなら、それは並行する create が作り直した新しいコンテナで、外さない（OCI-7）。
+fn release_image_ref(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    refs: &dyn ContainerImageRefs,
+    req: &DeleteRequest,
+) -> CleanupOutcome {
+    let Ok(lookup_name) = OpName::new(IMAGE_REF_LOOKUP_OP_NAME) else {
+        return CleanupOutcome::Kept {
+            code: ErrorCode::Internal,
+        };
+    };
+    let generation = match recorder.record_op(&lookup_name, || refs.registration(req.id())) {
+        Err(e) => return CleanupOutcome::Kept { code: e.code() },
+        Ok(None) => return CleanupOutcome::AlreadyAbsent,
+        Ok(Some(generation)) => generation,
+    };
+    match store.get(&GetStateRequest::new(req.id().clone())) {
+        Err(e) if e.code() == ErrorCode::NotFound => {}
+        // 並行する create が作り直したコンテナの参照なので外さない（自分の後始末の対象ではない）。
+        Ok(_) => return CleanupOutcome::NotApplicable,
+        Err(e) => return CleanupOutcome::Kept { code: e.code() },
     }
-    Ok(response)
+    let Ok(release_name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME) else {
+        return CleanupOutcome::Kept {
+            code: ErrorCode::Internal,
+        };
+    };
+    match recorder.record_op(&release_name, || refs.release_if(req.id(), generation)) {
+        Ok(ImageRefRelease::Released) => CleanupOutcome::Removed,
+        Ok(ImageRefRelease::NotRegistered) => CleanupOutcome::AlreadyAbsent,
+        Err(e) => CleanupOutcome::Kept { code: e.code() },
+    }
 }
 
 fn delete_inner(
@@ -1028,6 +1066,23 @@ mod tests {
         assert_eq!(rec.revision(), StateRevision::from_raw(2));
     }
 
+    /// REPAIR-5・#3027: 成功の経路の `StateStore` の呼び出しは、cgroup の配置が記録されていれば get 2 回、無ければ 1 回で、
+    /// どちらも delete は 1 回。module doc「待ちの上限」の 3 回（get 2 + delete 1）という数え方の根拠。
+    #[test]
+    fn repair5_3027_delete_store_calls_are_bounded() {
+        let with_scope =
+            MemStateStore::with_scope(ContainerStatus::stopped(cid("c1"), Some(0)), SCOPE);
+        let remover = RecordingRemover::removed();
+        run_with(&with_scope, &remover, "c1", false).expect("delete");
+        assert_eq!(*with_scope.gets.lock().expect("lock"), 2);
+        assert!(!with_scope.has("c1"));
+
+        let without = MemStateStore::with(ContainerStatus::stopped(cid("c2"), Some(0)));
+        run_with(&without, &RecordingRemover::removed(), "c2", false).expect("delete");
+        assert_eq!(*without.gets.lock().expect("lock"), 1);
+        assert!(!without.has("c2"));
+    }
+
     /// OCI-6・CORE-3（AC2）: Stopped は cgroup 削除がちょうど 1 回、正しい ID で呼ばれ、レコードも消える。
     #[test]
     fn oci6_delete_stopped_removes_cgroup_then_record() {
@@ -1454,6 +1509,8 @@ mod tests {
         generation: Option<ImageRefGeneration>,
         /// true なら `registration` の中で同じ ID を作り直す（並行する create の完了を模す）。
         recreate_on_lookup: bool,
+        /// `Some` なら `registration` がこの失敗を返す。
+        lookup_error: Option<TraitError>,
     }
 
     impl<'a> ProbeRefs<'a> {
@@ -1464,7 +1521,12 @@ mod tests {
                 result,
                 generation: Some(ImageRefGeneration::from_raw(1)),
                 recreate_on_lookup: false,
+                lookup_error: None,
             }
+        }
+        fn with_lookup_error(mut self, e: TraitError) -> Self {
+            self.lookup_error = Some(e);
+            self
         }
         fn with_recreate_on_lookup(mut self) -> Self {
             self.recreate_on_lookup = true;
@@ -1494,6 +1556,9 @@ mod tests {
             &self,
             _id: &ContainerId,
         ) -> Result<Option<ImageRefGeneration>, TraitError> {
+            if let Some(e) = &self.lookup_error {
+                return Err(e.clone());
+            }
             if self.recreate_on_lookup {
                 self.store
                     .create(
@@ -1548,8 +1613,9 @@ mod tests {
     fn oci7_delete_releases_after_state_delete() {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released));
-        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        let resp = run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
         assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
+        assert_eq!(resp.image_ref(), CleanupOutcome::Removed);
     }
 
     /// OCI-7: 状態削除が失敗したら参照は外さない（FailedPrecondition・NotFound）。
@@ -1571,7 +1637,7 @@ mod tests {
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::NotRegistered));
         assert_eq!(
             run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete"),
-            DeleteResponse::new()
+            DeleteResponse::new().with_image_ref(CleanupOutcome::AlreadyAbsent)
         );
     }
 
@@ -1581,7 +1647,13 @@ mod tests {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Err(TraitError::new(ErrorCode::Timeout, "lock")));
         let rec = OpRecorder::new();
-        run_releasing(&store, &refs, &rec, "c1").expect("delete still succeeds");
+        let resp = run_releasing(&store, &refs, &rec, "c1").expect("delete still succeeds");
+        assert_eq!(
+            resp.image_ref(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Timeout
+            }
+        );
         let stats = rec
             .snapshot_op(&OpName::new("image_ref_release").expect("name"))
             .expect("recorded");
@@ -1594,8 +1666,39 @@ mod tests {
     fn oci7_delete_without_registration_never_releases() {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released)).with_generation(None);
-        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        let resp = run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
         assert_eq!(refs.calls(), vec![]);
+        assert_eq!(resp.image_ref(), CleanupOutcome::AlreadyAbsent);
+    }
+
+    /// OCI-7・REPAIR-4: 世代の読み取りの失敗は `Kept` で返り、解除は呼ばれない。
+    #[test]
+    fn oci7_delete_lookup_failure_is_reported_as_kept() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
+            .with_lookup_error(TraitError::new(ErrorCode::Unavailable, "lookup"));
+        let resp = run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        assert_eq!(
+            resp.image_ref(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Unavailable
+            }
+        );
+        assert_eq!(refs.calls(), vec![]);
+    }
+
+    /// OCI-7・REPAIR-4: `release_if` の内部エラーは `Kept { Internal }`。
+    #[test]
+    fn oci7_delete_release_internal_error_is_reported_as_kept() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let refs = ProbeRefs::new(&store, Err(TraitError::new(ErrorCode::Internal, "x")));
+        let resp = run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        assert_eq!(
+            resp.image_ref(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Internal
+            }
+        );
     }
 
     /// OCI-7: 解除は状態削除後に読んだ世代で行う（`release_if` の `expected` 照合は ProbeRefs が assert）。
@@ -1613,8 +1716,9 @@ mod tests {
     fn oci7_delete_does_not_release_when_state_recreated_after_lookup() {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released)).with_recreate_on_lookup();
-        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        let resp = run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
         assert_eq!(refs.calls(), vec![]);
+        assert_eq!(resp.image_ref(), CleanupOutcome::NotApplicable);
         assert!(store.has("c1"));
     }
 }

@@ -3,16 +3,33 @@
 //! 「CI で分離込みの起動を測れるか」の根拠を実 runner のログに残すための 1 行を作る
 //! （`docs/design/bench-calibration.md`「CI の扱いの決定（TASK-190）」）。値は固定語彙・数値だけで、
 //! パス・ホスト名・ユーザー名は出さない。
+//!
+//! user マネージャの確認先は本番の `start`・`doctor`・ベンチの事前検査と同じ
+//! `fandhe_container_supervisor::user_scope::user_manager_env`（`$XDG_RUNTIME_DIR/systemd/private` の
+//! lstat。#2133・#2161・CORE-3）。実 connect は読み取り専用のスモークに入れない（#2448）。
 
 use fandhe_container_core::cgroups::DelegatedCgroup;
 use fandhe_container_core::landlock::detect_landlock_abi;
-use std::path::Path;
+use fandhe_container_supervisor::user_scope::{UserManagerError, user_manager_env};
+use std::ffi::OsStr;
 
 /// `/proc/self/status` の実効 UID。読めない場合は `None`（呼び出し側は fail-closed にする）。
 pub fn effective_uid() -> Option<u32> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
     line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// スモークの `user_manager=` の値（固定語彙: present / runtime_dir_unset / unreachable / unknown）。
+/// 判定は supervisor の `user_scope::user_manager_env`（lstat のみ。実 connect はしない。CORE-10・CORE-3・REPAIR-8）。
+/// 未知のエラー理由は fail-closed で `unreachable` にする。
+fn user_manager_state(xdg: Option<&OsStr>, euid: Option<u32>) -> &'static str {
+    let Some(euid) = euid else { return "unknown" };
+    match user_manager_env(xdg, euid) {
+        Ok(_) => "present",
+        Err(UserManagerError::RuntimeDirUnset) => "runtime_dir_unset",
+        Err(_) => "unreachable",
+    }
 }
 
 fn read_trimmed(path: &str) -> String {
@@ -25,9 +42,9 @@ fn read_trimmed(path: &str) -> String {
 /// スモークで標準出力へ出す 1 行。
 pub fn host_probe_line() -> String {
     let euid = effective_uid();
-    let bus_present = euid.is_some_and(|uid| Path::new(&format!("/run/user/{uid}/bus")).exists());
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR");
     format!(
-        "startup_latency: smoke; apparmor_restrict_unprivileged_userns={} max_user_namespaces={} landlock={} user_bus={} delegated_cgroup={} euid_root={}",
+        "startup_latency: smoke; apparmor_restrict_unprivileged_userns={} max_user_namespaces={} landlock={} user_manager={} delegated_cgroup={} euid_root={}",
         read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
         read_trimmed("/proc/sys/user/max_user_namespaces"),
         if detect_landlock_abi().is_ok() {
@@ -35,7 +52,7 @@ pub fn host_probe_line() -> String {
         } else {
             "unavailable"
         },
-        if bus_present { "present" } else { "absent" },
+        user_manager_state(xdg.as_deref(), euid),
         if DelegatedCgroup::detect().is_ok() {
             "ok"
         } else {
@@ -239,6 +256,79 @@ mod tests {
             ..HostSignals::default()
         };
         assert_eq!(classify_host_kind(&sig, "x86_64"), "unknown");
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let d = std::env::temp_dir().join(format!("fc-probeenv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+        d
+    }
+
+    /// CORE-10・CORE-3: euid 不明は unknown、XDG 未設定・空・相対は runtime_dir_unset。
+    #[test]
+    fn user_manager_state_unset_and_unknown() {
+        assert_eq!(user_manager_state(None, None), "unknown");
+        assert_eq!(user_manager_state(None, Some(1000)), "runtime_dir_unset");
+        assert_eq!(
+            user_manager_state(Some(OsStr::new("")), Some(1000)),
+            "runtime_dir_unset"
+        );
+        assert_eq!(
+            user_manager_state(Some(OsStr::new("rel/dir")), Some(1000)),
+            "runtime_dir_unset"
+        );
+    }
+
+    /// CORE-10・REPAIR-8: systemd/private のソケットだけを見る。bus だけある場合は unreachable（本 issue の回帰）。
+    #[test]
+    fn user_manager_state_checks_private_socket_only() {
+        use std::os::unix::net::UnixListener;
+        let euid = effective_uid().unwrap();
+
+        let none = scratch("none");
+        assert_eq!(
+            user_manager_state(Some(none.as_os_str()), Some(euid)),
+            "unreachable"
+        );
+        let _ = std::fs::remove_dir_all(&none);
+
+        let bus = scratch("bus");
+        let _l = UnixListener::bind(bus.join("bus")).unwrap();
+        assert_eq!(
+            user_manager_state(Some(bus.as_os_str()), Some(euid)),
+            "unreachable"
+        );
+        drop(_l);
+        let _ = std::fs::remove_dir_all(&bus);
+
+        let ok = scratch("ok");
+        std::fs::create_dir(ok.join("systemd")).unwrap();
+        let _l = UnixListener::bind(ok.join("systemd/private")).unwrap();
+        assert_eq!(
+            user_manager_state(Some(ok.as_os_str()), Some(euid)),
+            "present"
+        );
+        assert_eq!(
+            user_manager_state(Some(ok.as_os_str()), Some(euid.wrapping_add(1))),
+            "unreachable"
+        );
+        drop(_l);
+        let _ = std::fs::remove_dir_all(&ok);
+    }
+
+    #[test]
+    fn probe_line_uses_user_manager_key() {
+        let line = host_probe_line();
+        assert!(!line.contains("user_bus="), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        let v = line
+            .split(" user_manager=")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .unwrap();
+        assert!(["present", "runtime_dir_unset", "unreachable", "unknown"].contains(&v));
     }
 
     #[test]

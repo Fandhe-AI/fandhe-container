@@ -7,6 +7,8 @@
 //!
 //! # 構成と責務境界
 //!
+//! - dump（`dump_table_names`・`dump_rules`。NET-3・#3063）は読み取り専用で、`NetlinkRouteSocket::dump_with_seq`
+//!   に `NLMSG_DONE` 終端を明示して往復する
 //! - ソケットの open / bind / send / recv は `NetlinkRouteSocket`（TASK-136.2。protocol だけ
 //!   `NETLINK_NETFILTER` に差し替えて再利用）が担い、本型は seq の採番・往復の直列化・期限の管理だけを持つ。
 //!   rtnetlink 固有の往復（dump / DONE の終端規則）は公開しない
@@ -29,13 +31,15 @@ use std::time::Duration;
 use super::ack::{NFT_MSG_GETGEN, NftBatchAck, NftBatchAckCollector, NftBatchError, Progress};
 use super::{
     BATCH_MARKER_LEN, ChainGet, ChainInfo, MAX_BATCH_LEN, NFNL_SUBSYS_NFTABLES, NFPROTO_UNSPEC,
-    NFT_MSG_NEWCHAIN, NFT_MSG_NEWTABLE, NfGenMsg, NftBatch, NftBatchBytes, TableGet, TableInfo,
-    nfnl_msg_type,
+    NFT_MSG_NEWCHAIN, NFT_MSG_NEWTABLE, NfGenMsg, NftBatch, NftBatchBytes, NftFamily, NftName,
+    TableDump, TableGet, TableInfo, decode_table_name, nfnl_msg_type,
 };
 use crate::error::{NetError, NetErrorCode};
 use crate::instrument::{NetOpKind, NetOpRecorder, NoopNetOpRecorder, record_net_op};
 use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NlMsgBuilder};
 use crate::netlink_route::{NetlinkRouteSocket, RequestGate};
+use crate::network_store::NetnsIdentity;
+use crate::nftables_rules::{DumpedRule, NFT_MSG_NEWRULE, RuleDump};
 use crate::sys::Deadline;
 
 /// bind 済みの `NETLINK_NETFILTER` ソケット（NET-11）。
@@ -48,6 +52,9 @@ pub struct NetlinkNetfilterSocket {
     gate: RequestGate,
     /// 次のバッチの BEGIN の seq（0 は使わない）。`gate` 保持中だけ読み書きする。
     next_seq: AtomicU32,
+    /// ソケットを開いたスレッドの network namespace（開いた時点の値。`/proc/self` はメインスレッドの値なので
+    /// 使わない。読めなければ `None` で、世代の取得は fail-closed に拒否する）。
+    netns: Option<NetnsIdentity>,
 }
 
 /// `end_seq` の次に使う seq（0 は飛ばす）。
@@ -220,6 +227,7 @@ fn drain_until_barrier(
 /// - `NLMSG_NOOP` は `NLMSG_MIN_TYPE` 未満の制御メッセージで nfnetlink の要求ではないため使わない。
 ///   BEGIN / END への `NLM_F_ACK` はカーネル版数によっては ACK されないため完了条件にできない
 /// - GETGEN は読み取りのみの照会で、ルールセットを変更しない
+/// - 応答の NEWGEN の nfgenmsg は family 0・version 0 であることを ack 側が照合する（#3039）
 fn encode_barrier(seq: u32) -> Result<Vec<u8>, NetError> {
     let mut b = NlMsgBuilder::new(
         nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETGEN),
@@ -243,11 +251,28 @@ impl NetlinkNetfilterSocket {
     /// ソケットを開いて bind し、以後の open / send / recv / バッチ往復の結果と所要時間を
     /// `recorder` へ渡す（REPAIR-4）。
     pub fn open_with_recorder(recorder: Arc<dyn NetOpRecorder>) -> Result<Self, NetError> {
+        // ソケットは作成したスレッドの netns に束縛される。作成の直前に同じスレッドの値を採る。
+        let netns = NetnsIdentity::of_current_thread().ok();
         Ok(Self {
             inner: NetlinkRouteSocket::open_netfilter_with_recorder(recorder)?,
             gate: RequestGate::default(),
             next_seq: AtomicU32::new(1),
+            netns,
         })
+    }
+
+    /// このソケットが束縛された network namespace と現在の boot ID から、nft ハンドルの世代を作る。
+    ///
+    /// ソケットを開いたスレッドの namespace を使う（プロセス既定の `/proc/self` ではない）。記録の書き込みと
+    /// 照合はこの値で行う。namespace を採れていないソケットは `FailedPrecondition`（fail-closed。NET-3・SEC-1・#3068）。
+    pub fn host_generation(&self) -> Result<crate::network_store::HostGeneration, NetError> {
+        let netns = self.netns.ok_or_else(|| {
+            NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "netfilter socket network namespace is unknown",
+            )
+        })?;
+        crate::network_store::HostGeneration::for_netns(netns)
     }
 
     /// 専用テーブルの識別情報（ハンドル・ユーザーデータ）を `NFT_MSG_GETTABLE` で照会する
@@ -305,6 +330,95 @@ impl NetlinkNetfilterSocket {
             .find(|m| m.msg_type() == want)
             .ok_or_else(|| NetError::new(NetErrorCode::DataLoss, "no NEWCHAIN in chain reply"))?;
         ChainInfo::decode(msg.payload())
+    }
+
+    /// `family` のテーブル名を `NFT_MSG_GETTABLE` の dump で全件列挙する（読み取り専用。NET-3・#3063）。
+    ///
+    /// 公開の前に他の状態ルートの `fandhe_net_*` テーブルを見つけるための入口。応答はカーネル由来の外部入力で、
+    /// 接頭辞 `prefix` に一致するテーブルだけを返し（他者のテーブルは名前を検証せず読み飛ばす）、
+    /// 一致したものが復号できなければ `DataLoss`（fail-closed）。総数の上限 `max_total`（接頭辞で絞る前の件数）を超えたら `ResourceExhausted`。
+    /// 一致したテーブル数の上限は呼び出し側が掛ける（応答の総量は `MAX_REPLY_BYTES` / `MAX_REPLY_MESSAGES` で既に上限がある）。`timeout` は順番待ちと
+    /// 往復を通した全体の期限（REPAIR-5）。dump 中の変更（`NLM_F_DUMP_INTR`）は `FailedPrecondition`。
+    /// seq の確保は [`Self::table_info`] と同じ（バッチ用の空間から取り、再利用しない）。
+    pub fn dump_table_names(
+        &self,
+        family: NftFamily,
+        prefix: &str,
+        max_total: usize,
+        timeout: Duration,
+    ) -> Result<Vec<NftName>, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let req = TableDump::new(family);
+        let reply = self.inner.dump_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        // 接頭辞で絞る前の総数に上限を掛ける（他者のテーブルも数える。絞り込み後の件数では
+        // 総数の上限が効かないため）。
+        if reply.messages().len() > max_total {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many nftables tables in the dump reply",
+            ));
+        }
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWTABLE);
+        let mut names = Vec::new();
+        for m in reply.messages() {
+            if m.msg_type() != want {
+                return Err(NetError::new(
+                    NetErrorCode::DataLoss,
+                    "unexpected message type in table dump reply",
+                ));
+            }
+            // 接頭辞に一致しない他者のテーブルは読み飛ばす（名前を検証しない）。
+            if let Some(n) = decode_table_name(m.payload(), family, prefix)? {
+                names.push(n);
+            }
+        }
+        Ok(names)
+    }
+
+    /// 1 テーブルの全ルールを `NFT_MSG_GETRULE` の dump で列挙する（読み取り専用。NET-3・#3063）。
+    ///
+    /// 要求にテーブル名を付けてカーネル側で絞り込む。応答の各ルールの family・テーブル名が要求と
+    /// 一致することを確かめ、1 件でも復号できなければ `DataLoss`。期限・seq・`NLM_F_DUMP_INTR` の扱いは
+    /// [`Self::dump_table_names`] と同じ。ルールのハンドルは読まない（再起動後のハンドルは記録から復元する。#3068）。
+    pub fn dump_rules(
+        &self,
+        req: &RuleDump,
+        timeout: Duration,
+    ) -> Result<Vec<DumpedRule>, NetError> {
+        let deadline = Deadline::after(timeout);
+        let _turn = self.gate.acquire(&deadline, timeout)?;
+        let seq = reserve_first_seq(self.next_seq.load(Ordering::Relaxed));
+        self.next_seq.store(seq_after(seq), Ordering::Relaxed);
+        let reply = self.inner.dump_with_seq(
+            Some(seq),
+            req.msg_type(),
+            req.flags(),
+            deadline.remaining(),
+            |b| req.encode(b),
+        )?;
+        let want = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        reply
+            .messages()
+            .iter()
+            .map(|m| {
+                if m.msg_type() != want {
+                    return Err(NetError::new(
+                        NetErrorCode::DataLoss,
+                        "unexpected message type in rule dump reply",
+                    ));
+                }
+                DumpedRule::decode(m.payload(), req.family(), req.table())
+            })
+            .collect()
     }
 
     /// バッチを組み立てて送り、本体メッセージごとの ACK / エラーが揃うまで待つ（NET-11・TASK-137.3）。
@@ -367,6 +481,36 @@ impl NetlinkNetfilterSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-3・SEC-1・#3068: ソケットの世代は、ソケットを開いたスレッドの network namespace を指す
+    /// （`/proc/self` ではない）。別スレッドが unshare した後に開いたソケットを別スレッドへ渡しても、
+    /// 開いた時点の namespace のままで、メインスレッドで開いたソケットとは異なる。
+    /// `CAP_SYS_ADMIN` が要るため既定では実行しない。実行: `unshare --map-root-user --net -- \
+    /// cargo test -p fandhe-container-net --lib -- --ignored net3_3068_socket_generation_follows_opening_thread`
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN (unshare --map-root-user --net)"]
+    fn net3_3068_socket_generation_follows_opening_thread() {
+        let main_ns = crate::network_store::NetnsIdentity::of_current_thread().unwrap();
+        let main_sock = NetlinkNetfilterSocket::open().unwrap();
+        assert_eq!(main_sock.host_generation().unwrap().netns(), main_ns);
+        let other = std::thread::spawn(|| {
+            crate::sys::unshare_net().unwrap();
+            let ns = crate::network_store::NetnsIdentity::of_current_thread().unwrap();
+            (ns, NetlinkNetfilterSocket::open().unwrap())
+        })
+        .join()
+        .unwrap();
+        let (other_ns, other_sock) = other;
+        assert_ne!(other_ns, main_ns);
+        // スレッドを越えて渡しても、開いた時点の namespace のまま。
+        let moved = std::thread::spawn(move || other_sock.host_generation().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(moved.netns(), other_ns);
+        assert_ne!(moved, main_sock.host_generation().unwrap());
+        // `/proc/self`（メインスレッド）の値には戻らない。
+        assert_eq!(main_sock.host_generation().unwrap().netns(), main_ns);
+    }
     use crate::instrument::NetOpOutcome;
     use crate::instrument::testing::Collect;
     use crate::netlink::{NLM_F_ACK, NLM_F_REQUEST, NLMSG_ERROR, NlMsgBuilder};
@@ -415,7 +559,7 @@ mod tests {
             seq,
             0,
         );
-        NfGenMsg::new(NFPROTO_UNSPEC, 0)
+        NfGenMsg::new(NFPROTO_UNSPEC, 0x0102)
             .put_into(&mut b)
             .expect("nfgenmsg");
         b.finish().expect("finish")
@@ -471,6 +615,66 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(ack.body_seqs(), &[11, 12][..]);
+    }
+
+    /// NET-3・#2839: echo 付き NEWRULE 2 件を、echo → ACK → NEWGEN → ACK（同期点）の通しで受け、
+    /// ハンドルが添字ごとに具体値で返る。echo が欠ければ成功にならない。
+    #[test]
+    fn net3_exchange_returns_echoed_rule_handles() {
+        use crate::netlink::NLM_F_ECHO;
+        use crate::nftables_rules::NFT_MSG_NEWRULE;
+        let newrule = nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_NEWRULE);
+        let mut nb = NftBatch::new(10).expect("new");
+        for _ in 0..2 {
+            nb.push_with(|seq| {
+                let mut m =
+                    NlMsgBuilder::new(newrule, NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO, seq, 0);
+                NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0).put_into(&mut m)?;
+                m.put_attr(1, b"t\0")?;
+                m.put_attr(2, b"c\0")?;
+                Ok(m)
+            })
+            .expect("push");
+        }
+        let b = nb.finish().expect("finish");
+        let echo = |seq: u32, handle: u64| {
+            let mut m = NlMsgBuilder::new(newrule, 0, seq, 0);
+            NfGenMsg::new(crate::nftables_batch::NFPROTO_IPV4, 0)
+                .put_into(&mut m)
+                .expect("nfg");
+            m.put_attr(1, b"t\0").expect("table");
+            m.put_attr(2, b"c\0").expect("chain");
+            m.put_attr(3, &handle.to_be_bytes()).expect("handle");
+            m.finish().expect("finish")
+        };
+        let ack = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([echo(11, 2), err_dgram(11, 0), echo(12, 3), err_dgram(12, 0)].concat()),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect("ok");
+        let got: Vec<Option<u64>> = (0..2)
+            .map(|i| ack.rule_handle(i).map(|h| h.get()))
+            .collect();
+        assert_eq!(got, vec![Some(2), Some(3)]);
+
+        let e = run(
+            &b,
+            Duration::from_secs(5),
+            |_| Ok(()),
+            script(vec![
+                Ok([echo(11, 2), err_dgram(11, 0), err_dgram(12, 0)].concat()),
+                Ok(gen_dgram(14)),
+                Ok(err_dgram(14, 0)),
+            ]),
+        )
+        .expect_err("missing echo");
+        assert_eq!(e.outcome(), NftBatchOutcome::Unknown);
     }
 
     /// NET-11: 本体の ACK が揃った後に別データグラムで届く END の非 0 errno を見逃さない。

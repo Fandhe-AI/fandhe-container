@@ -18,6 +18,8 @@ impl TempDir {
             "fandhe-macos-virtiofs-io-{tag}-{}",
             std::process::id()
         ));
+        // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+        let _ = std::fs::remove_dir_all(&raw);
         std::fs::create_dir_all(&raw).expect("create temp dir");
         Self(std::fs::canonicalize(&raw).expect("canonicalize temp dir"))
     }
@@ -173,6 +175,26 @@ fn protocol_error_code_mapping() {
         op: VirtiofsIoOp::Flush,
     };
     assert_eq!(e.code(), "virtiofs_io.unexpected_ack");
+}
+
+/// REPAIR-1・ERR-1: 表が `IoErrorCode::ALL` を過不足なく覆い、キー・値に重複がなく、
+/// `ALL` のどの要素も倒し先（`virtiofs_io.error`）に落ちない。
+#[test]
+fn protocol_code_table_covers_io_error_code_all() {
+    use super::{PROTOCOL_CODE_FALLBACK, PROTOCOL_CODE_TABLE};
+    assert_eq!(PROTOCOL_CODE_TABLE.len(), IoErrorCode::ALL.len());
+    for c in IoErrorCode::ALL {
+        let n = PROTOCOL_CODE_TABLE.iter().filter(|(k, _)| *k == c).count();
+        assert_eq!(n, 1, "{c:?}");
+        let e = VirtiofsIoError::Protocol {
+            op: VirtiofsIoOp::Write,
+            source: IoError::new(c, "x"),
+        };
+        assert_ne!(e.code(), PROTOCOL_CODE_FALLBACK, "{c:?}");
+    }
+    let names: std::collections::HashSet<_> = PROTOCOL_CODE_TABLE.iter().map(|(_, n)| *n).collect();
+    assert_eq!(names.len(), PROTOCOL_CODE_TABLE.len());
+    assert_eq!(PROTOCOL_CODE_FALLBACK, "virtiofs_io.error");
 }
 
 /// ERR-1・TASK-65.2: PlatformError へ束ねても code / message が変わらない。

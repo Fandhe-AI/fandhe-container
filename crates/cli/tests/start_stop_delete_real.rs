@@ -33,7 +33,41 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/start_stop_delete_real-XXXX> --ignored
 //! ```
 //!
+//! # create の起動オプションと `start --audit-policy` の観測（#2761・SUP-12・SEC-4・CLI-1）
+//! create に `--ulimit nofile=256:512` と `--env FANDHE_OPT_PROBE=observed-2761` を付け、start に `--audit-policy best-effort` を付ける。
+//! プローブはコンテナ内の `/proc/self/limits` の `Max open files` の soft / hard と、`/proc/self/environ` の
+//! `FANDHE_OPT_PROBE` の値を `OPT_NOFILE <soft> <hard>`・`OPT_ENV <値>` として出し、親が `logs` で完全一致の行として照合する
+//! （値が supervisor の launcher まで届き、コンテナの rlimit と environ に載ったことの観測）。hard を継承値より上げる指定は
+//! `prlimit` の EPERM で起動失敗になるため、継承値より十分小さい 512 を使う。`--audit-policy` は strict を使わない
+//! （CI の runner は監査が縮退している可能性があり、拒否されうるため）。best-effort で実際の supervisor が argv を受理して
+//! 起動まで通ることを確かめる（strict の argv の組み立ては supervisor の `start_client` の単体試験が照合する）。
+//!
+//! # create の `--cap-drop` の観測（#2833・SEC-1・CLI-1）
+//! 1 つ目のコンテナの create に `--cap-drop NET_RAW` を付け、プローブが `/proc/self/status` の `CapInh`・`CapPrm`・`CapEff`・`CapBnd`・`CapAmb` を
+//! `OPT_CAP <キー> <16 桁 16 進>` として出す。親は `logs` の完全一致と、ホスト側の `/proc/<pid>/status` の数値で、
+//! `CapPrm`・`CapEff`・`CapBnd` が OCI 既定から NET_RAW（bit 13）だけ落ちた `00000000a80405fb`、`CapInh`・`CapAmb` が 0 であることを照合し、
+//! `inspect` の `capabilities.bounding` が NET_RAW を除いた 13 個であることも照合する（コンテナ内とホストの 2 つの視点）。
+//! 2 つ目のコンテナは `--cap-drop ALL` で短い一連（create → start → 観測 → stop → delete）を通し、5 集合すべてが 0・`bounding` が `[]` であることを照合する。
+//! `production_launcher` のシナリオ T は config の `process.capabilities` を直接書く経路で、本節は CLI の `create --cap-drop` → `start` 経路の担当（分担）。
+//!
+//! # create の `--read-only` の観測（#2828・CLI-1・SUP-12・CORE-5）
+//! 1 つ目のコンテナの create には `--read-only` も付ける（#2828・CLI-1・SUP-12・CORE-5）。プローブは rootfs 直下への新規作成の errno を
+//! `OPT_ROOT_RO <errno>` として出し、親が `logs` で `stdout OPT_ROOT_RO 30`（`EROFS`。Landlock の `EACCES` = 13 ではなく
+//! mount の RDONLY が効いたことの観測）を完全一致で照合する。あわせて `inspect` の出力に `"rootReadonly":true` が出ることも照合する。
+//!
+//! # `state` と `kill` の照合（#3097・CLI-1・SUP-11・SUP-4）
+//! 1 つ目のコンテナで create 後・start 後・stop 後の `state <id>` を 1 行 JSON の完全一致（キー順込み）で照合する。
+//! status は created / running / stopped で、`pid` は running の間だけ出て `list` の pid と一致する（created・stopped は `pid` キーを出さない）。
+//! 1 つ目のコンテナは起動オプションを持つため、CLI の create が annotations に作成世代
+//! （`io.fandhe.container.options-generation`。`bind_generation`）を足し、`state` の annotations はその 1 件になる。
+//! 世代の値は状態記録から読み、32 桁の小文字 16 進であることと 3 時点で変わらないことも確かめる。
+//! 3 つ目のコンテナ（オプション無しだが、Linux の create は既定の `network none` を文書に書くため作成世代の 1 件を持つ。#1873）では、実行中に `kill <id> TERM` を送り、終了を待って `state` が stopped
+//! になることを照合する。`start` は `--restart` を渡さず restart 方針は既定の `no` のため、意図を立てない kill の現状
+//! （#3087 の対象外の残余）に結果が左右されない。記録の `explicit_stop` が `NotRecorded` のままであることを stop との区別に使い、
+//! 終了コードは 43（寿命切れの 8 と区別できる）、停止済みへの 2 回目の kill は `FAILED_PRECONDITION`（終了コード 5）で拒否されることも照合する。
+//!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
+//! 前提欠如（委譲 cgroup・Landlock ABI）は 1 行目が `start_stop_delete_real: PRECONDITION FAILED (test environment, ...)` になり、それ以外の失敗は `start_stop_delete_real: FAILED: ...`（分類元は core の `tests/support/precondition.rs`（cli は薄いアダプタ経由）。#2957・CLI-1・REPAIR-12）。CI は両方を禁止行にする。
 //! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
 
 #[cfg(not(target_os = "linux"))]
@@ -73,6 +107,36 @@ fn main() -> std::process::ExitCode {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "../../core/tests/support/minimal_rootfs.rs"]
+mod minimal_rootfs;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/precondition.rs"]
+mod precondition;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod linux {
     use std::fs;
     use std::io::{Read, Write as _};
@@ -83,12 +147,14 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
+    use fandhe_container_core::capabilities::{Capability, OCI_DEFAULT_CAPABILITIES};
+    use fandhe_container_core::cgroups::CgroupName;
     use fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST;
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
-        ContainerId, ContainerState, GetStateRequest, StateRecord, StateStore,
+        ContainerId, ContainerState, ExplicitStop, GetStateRequest, StateRecord, StateStore,
     };
+    use fandhe_container_supervisor::container_options::store::GENERATION_ANNOTATION;
 
     /// `start` を待つ上限（CLI 自身の受信期限より長く取る。REPAIR-5）。
     const START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -101,8 +167,35 @@ mod linux {
     const POLL: Duration = Duration::from_millis(20);
     /// プローブの寿命の上限。これを過ぎたら終了コード 8 で終わる（寿命切れを停止と取り違えないための目印）。
     const PROBE_LIFETIME: Duration = Duration::from_secs(60);
+    /// プローブが `/proc` から読む上限(バイト)。
+    const PROBE_PROC_READ_MAX: u64 = 64 * 1024;
+    /// create に渡す `--ulimit`(nofile の soft:hard)と、コンテナ内で観測されるべき行。
+    const OPT_ULIMIT: &str = "nofile=256:512";
+    const OPT_NOFILE_LINE: &str = "stdout OPT_NOFILE 256 512";
+    /// create に渡す `--env` と、コンテナ内で観測されるべき行(ダミー値。秘密情報ではない)。
+    const OPT_ENV: &str = "FANDHE_OPT_PROBE=observed-2761";
+    const OPT_ENV_LINE: &str = "stdout OPT_ENV observed-2761";
+    /// create に渡す `--cap-drop`（Docker 互換の接頭辞なし表記。正規化は core の `parse_drop_list` が担う。#2833・SEC-1・CLI-1）。
+    const OPT_CAP_DROP: &str = "NET_RAW";
+    /// OCI 既定 14 個のビットマスク（`CapBnd` 等。bit 番号は Linux の capability 番号。#2833・SEC-1）。
+    const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
+    /// OCI 既定から NET_RAW（bit 13）だけを落としたマスク。`production_launcher` のシナリオ T（0xa00405fb）とは別の値。
+    const NET_RAW_DROPPED_MASK: u64 = 0x0000_0000_a804_05fb;
+    /// `/proc/self/status` から読む capability 5 集合のキー（プローブの出力順）。
+    const CAP_KEYS: [&str; 5] = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
+    /// NET_RAW を落としたときの `inspect` の `capabilities` の観測（番号順の 13 個）。
+    const NET_RAW_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[\"CAP_CHOWN\",\"CAP_DAC_OVERRIDE\",\"CAP_FOWNER\",\"CAP_FSETID\",\"CAP_KILL\",\"CAP_SETGID\",\"CAP_SETUID\",\"CAP_SETPCAP\",\"CAP_NET_BIND_SERVICE\",\"CAP_SYS_CHROOT\",\"CAP_MKNOD\",\"CAP_AUDIT_WRITE\",\"CAP_SETFCAP\"]}";
+    /// `--cap-drop ALL` のときの `inspect` の `capabilities` の観測。
+    const ALL_DROPPED_INSPECT: &str = "\"capabilities\":{\"bounding\":[]}";
+    /// `create --read-only` のコンテナ内で、rootfs 直下への新規作成が返すべき errno(`EROFS` = 30。#2828)。
+    /// mount の RDONLY が Landlock の拒否(`EACCES` = 13)より先に効くため 30 になる。13 や 0 は失敗として扱う。
+    const OPT_ROOT_RO_LINE: &str = "stdout OPT_ROOT_RO 30";
     /// `/proc/<pid>/status` の `SigCgt` で SIGTERM（15）に当たるビット（1 << 14）。
     const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
+    /// `state` の `ociVersion` の期待値（リテラル）。supervisor の `OCI_STATE_VERSION` と二重に照合する（#3097）。
+    const OCI_STATE_VERSION_LITERAL: &str = "1.3.0";
+    /// `kill` に渡すシグナル。TERM はプローブのハンドラが終了コード 43 で終わるため、init への到達が終了コードで分かる（#3097）。
+    const KILL_SIGNAL: &str = "TERM";
 
     /// コンテナ内で動くプローブ。SIGTERM のハンドラ（`_exit(43)` のみ）を登録してから `READY_TERM` を出して待つ。
     pub fn probe() -> ! {
@@ -112,6 +205,12 @@ mod linux {
             let _ = out.flush();
             std::process::exit(9);
         }
+        let _ = writeln!(out, "OPT_NOFILE {}", read_nofile());
+        let _ = writeln!(out, "OPT_ENV {}", read_probe_env());
+        for key in CAP_KEYS {
+            let _ = writeln!(out, "OPT_CAP {key} {}", read_cap(key));
+        }
+        let _ = writeln!(out, "OPT_ROOT_RO {}", probe_root_write_errno());
         let _ = writeln!(out, "READY_TERM");
         let _ = out.flush();
         let deadline = Instant::now() + PROBE_LIFETIME;
@@ -121,7 +220,71 @@ mod linux {
         std::process::exit(8);
     }
 
+    /// rootfs 直下へ新規ファイルを作る試みの errno(成功したら `0` で、作ったファイルは消す。errno が無い失敗は `-1`)。
+    fn probe_root_write_errno() -> i32 {
+        let path = "/fandhe_ro_probe_2828";
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => {
+                let _ = fs::remove_file(path);
+                0
+            }
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        }
+    }
+
+    /// `/proc/self/limits` の `Max open files` 行の soft / hard（読めなければ `unreadable`）。読み取りには上限を付ける。
+    fn read_nofile() -> String {
+        let mut text = String::new();
+        let read = fs::File::open("/proc/self/limits")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_string(&mut text));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        text.lines()
+            .find_map(|l| l.strip_prefix("Max open files"))
+            .and_then(|rest| {
+                let mut cols = rest.split_whitespace();
+                Some(format!("{} {}", cols.next()?, cols.next()?))
+            })
+            .unwrap_or_else(|| "unreadable".to_string())
+    }
+
+    /// `/proc/self/status` の capability 集合 `key` の値（16 桁 16 進。読めなければ `unreadable`）。読み取りには上限を付ける（#2833）。
+    fn read_cap(key: &str) -> String {
+        let mut text = String::new();
+        let read = fs::File::open("/proc/self/status")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_string(&mut text));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        let prefix = format!("{key}:");
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map_or_else(|| "unreadable".to_string(), |v| v.trim().to_string())
+    }
+
+    /// `/proc/self/environ`(NUL 区切り)の `FANDHE_OPT_PROBE` の値(無ければ `missing`、読めなければ `unreadable`)。
+    fn read_probe_env() -> String {
+        let mut buf = Vec::new();
+        let read = fs::File::open("/proc/self/environ")
+            .and_then(|f| f.take(PROBE_PROC_READ_MAX).read_to_end(&mut buf));
+        if read.is_err() {
+            return "unreadable".to_string();
+        }
+        buf.split(|b| *b == 0)
+            .find_map(|kv| kv.strip_prefix(b"FANDHE_OPT_PROBE="))
+            .map_or_else(
+                || "missing".to_string(),
+                |v| String::from_utf8_lossy(v).into_owned(),
+            )
+    }
+
     pub fn main() -> ExitCode {
+        super::precondition::self_check();
         if !std::env::args().skip(1).any(|a| a == "--ignored") {
             println!(
                 "start_stop_delete_real: skipped (real-host scenario; run with `-- --ignored` inside a delegated cgroup, e.g. `systemd-run --user --scope -p Delegate=yes`)"
@@ -131,6 +294,21 @@ mod linux {
         match scenario() {
             Ok(scope_present) => {
                 println!(
+                    "start_stop_delete_real: create options observed in the container: /proc/self/limits nofile soft=256 hard=512; environ FANDHE_OPT_PROBE=observed-2761; start passed --audit-policy best-effort"
+                );
+                println!(
+                    "start_stop_delete_real: create --cap-drop NET_RAW observed in the container: CapPrm=CapEff=CapBnd=00000000a80405fb CapInh=CapAmb=0000000000000000; inspect bounding lists 13 capabilities without CAP_NET_RAW"
+                );
+                println!(
+                    "start_stop_delete_real: create --cap-drop ALL observed in the container: CapPrm=CapEff=CapBnd=CapInh=CapAmb=0000000000000000; inspect bounding is empty; stop recorded Stopped(43); delete left no state dir"
+                );
+                println!(
+                    "start_stop_delete_real: state printed one-line OCI state JSON: created without pid, running with the list pid, stopped without pid after stop"
+                );
+                println!(
+                    "start_stop_delete_real: kill TERM ended the running container under restart policy no: state stopped without pid; recorded Stopped(43) without an explicit stop intent; second kill refused with FAILED_PRECONDITION; delete left no state dir"
+                );
+                println!(
                     "start_stop_delete_real: scenario ok scope_present_before_delete={scope_present}"
                 );
                 println!(
@@ -138,7 +316,11 @@ mod linux {
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
+            Err(super::precondition::Failure::Precondition(msg)) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+            Err(super::precondition::Failure::Other(e)) => {
                 eprintln!("start_stop_delete_real: FAILED: {e}");
                 ExitCode::FAILURE
             }
@@ -147,6 +329,180 @@ mod linux {
 
     fn expect(cond: bool, what: &str) -> Result<(), String> {
         if cond { Ok(()) } else { Err(what.to_string()) }
+    }
+
+    /// `caps` から作るビットマスク（bit 番号は capability 番号）。
+    fn mask_of(caps: &[Capability]) -> u64 {
+        caps.iter().fold(0u64, |m, c| m | (1u64 << c.index()))
+    }
+
+    /// 期待マスクのリテラルを core の公開 API（`OCI_DEFAULT_CAPABILITIES`）から導出した値と突き合わせる（#2833・SEC-1・CLI-1）。
+    /// リテラルの打ち間違いで試験が弱まるのを防ぐ二重照合。
+    fn check_expected_masks() -> Result<(), String> {
+        let default = mask_of(&OCI_DEFAULT_CAPABILITIES);
+        expect(
+            default == OCI_DEFAULT_MASK,
+            &format!("OCI default mask: literal {OCI_DEFAULT_MASK:#x}, derived {default:#x}"),
+        )?;
+        let dropped = default & !(1u64 << Capability::NetRaw.index());
+        expect(
+            dropped == NET_RAW_DROPPED_MASK,
+            &format!(
+                "NET_RAW dropped mask: literal {NET_RAW_DROPPED_MASK:#x}, derived {dropped:#x}"
+            ),
+        )
+    }
+
+    /// プローブの `OPT_CAP` 5 行（`stdout OPT_CAP <キー> <値>` の完全一致）が期待どおりか。
+    /// `CapInh`・`CapAmb` は 0、`CapPrm`・`CapEff`・`CapBnd` は `expected`（`check_host_caps` と同じ期待。launch 後の `CapInh`・`CapAmb` は常に 0）。
+    fn has_cap_lines(logs: &str, expected: u64) -> bool {
+        CAP_KEYS.iter().all(|key| {
+            let value = if *key == "CapInh" || *key == "CapAmb" {
+                0
+            } else {
+                expected
+            };
+            let want = format!("stdout OPT_CAP {key} {value:016x}");
+            logs.lines().any(|l| l == want)
+        })
+    }
+
+    /// ホストから見た `/proc/<pid>/status` の 5 集合が、`CapInh`・`CapAmb` は 0、`CapPrm`・`CapEff`・`CapBnd` は `expected` であること。
+    fn check_host_caps(pid: u32, expected: u64) -> Result<(), String> {
+        let text = fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|e| format!("read /proc/{pid}/status: {e}"))?;
+        for key in CAP_KEYS {
+            let prefix = format!("{key}:");
+            let got = text
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                .ok_or_else(|| format!("{key} missing in /proc/{pid}/status"))?;
+            let want = if key == "CapInh" || key == "CapAmb" {
+                0
+            } else {
+                expected
+            };
+            if got != want {
+                return Err(format!(
+                    "host /proc/{pid}/status {key}: want {want:016x}, got {got:016x}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `inspect` の終了コード 0 と、`capabilities` の部分文字列（他のフィールドに依存しない）を照合する。
+    fn check_inspect_caps(cli: &Path, root_s: &str, id_s: &str, want: &str) -> Result<(), String> {
+        let out = run_cli(cli, &["--root", root_s, "inspect", id_s], CLI_TIMEOUT)?;
+        expect_ok_code(&out, "inspect")?;
+        expect(
+            out.stdout.contains(want),
+            &format!("inspect lacks {want}: {:?}", out.stdout),
+        )
+    }
+
+    /// `state` が出すべき 1 行（末尾 LF 込み）を固定のキー順で組み立てる（#3097）。
+    /// `pid` は `Some` のときだけ出す。値のエスケープは行わない（`check_json_plain` で不要な値に限る）。
+    fn oci_state_line(
+        id: &str,
+        status: &str,
+        pid: Option<u32>,
+        bundle: &str,
+        annotations: &[(&str, &str)],
+    ) -> String {
+        let mut s = format!(
+            "{{\"ociVersion\":\"{OCI_STATE_VERSION_LITERAL}\",\"id\":\"{id}\",\"status\":\"{status}\""
+        );
+        if let Some(p) = pid {
+            s.push_str(&format!(",\"pid\":{p}"));
+        }
+        s.push_str(&format!(",\"bundle\":\"{bundle}\",\"annotations\":{{"));
+        for (i, (k, v)) in annotations.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":\"{v}\""));
+        }
+        s.push_str("}}\n");
+        s
+    }
+
+    /// JSON のエスケープが要る文字（`"`・バックスラッシュ・U+0020 未満）を含まないこと。含む値は試験側にエスケープを
+    /// 再実装せず失敗にする（fail-closed）。
+    fn check_json_plain(v: &str, what: &str) -> Result<(), String> {
+        expect(
+            !v.chars()
+                .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20),
+            &format!("{what} needs JSON escaping: {v:?}"),
+        )
+    }
+
+    /// `state <id>` を呼び、終了コード 0・stderr 空・stdout が `want` と完全一致することを照合する（#3097）。
+    fn expect_state(cli: &Path, root_s: &str, id_s: &str, want: &str) -> Result<(), String> {
+        let out = run_cli(cli, &["--root", root_s, "state", id_s], CLI_TIMEOUT)?;
+        if out.code != Some(0) || !out.stderr.is_empty() || out.stdout != want {
+            return Err(format!(
+                "state: want exit 0, empty stderr, stdout {want:?}; got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        Ok(())
+    }
+
+    /// 記録の annotations がちょうど作成世代の 1 件で、値が 32 桁の小文字 16 進であることを確かめて値を返す（#3097）。
+    fn options_generation(rec: &StateRecord) -> Result<String, String> {
+        let ann = rec.annotations();
+        expect(
+            ann.len() == 1,
+            &format!(
+                "annotations must hold only the generation: {} entries",
+                ann.len()
+            ),
+        )?;
+        let generation = ann
+            .get(GENERATION_ANNOTATION)
+            .ok_or("record lacks the options-generation annotation")?
+            .to_string();
+        expect(
+            generation.len() == 32
+                && generation
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            &format!("generation is not 32 lowercase hex digits: {generation:?}"),
+        )?;
+        Ok(generation)
+    }
+
+    /// `/proc/<pid>/status` の `SigCgt` に SIGTERM のビットが立つまで待つ（登録前に TERM を送ると PID 1 では捨てられる）。
+    fn wait_sigterm_handler(pid: u32, what: &str) -> Result<(), String> {
+        wait_until(STATE_TIMEOUT, what, || {
+            fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.strip_prefix("SigCgt:"))
+                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                })
+                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
+        })
+    }
+
+    /// この状態ルートの supervisor が全員終わるまで待つ。delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、
+    /// sink のロックを手放す（プロセス終了）まで待つ。
+    fn wait_supervisor_exit(
+        sup_needle: &[u8],
+        root_needle: &[u8],
+        what: &str,
+    ) -> Result<(), String> {
+        wait_until(REAP_TIMEOUT, what, || {
+            count_processes(|dir| {
+                fs::read(dir.join("cmdline")).is_ok_and(|c| {
+                    c.starts_with(sup_needle)
+                        && c.windows(root_needle.len()).any(|w| w == root_needle)
+                })
+            }) == 0
+        })
     }
 
     /// 子を kill し、`REAP_TIMEOUT` 内に `try_wait` で回収する（無期限の `wait` を避ける。REPAIR-5）。
@@ -221,11 +577,16 @@ mod linux {
             if let Err(e) = fs::remove_dir_all(&self.work) {
                 eprintln!("start_stop_delete_real: cleanup remove work dir failed: {e}");
             }
+            // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）。診断用に work を残す分岐では消さない（#2887）。
+            super::scratch_root::remove_scratch_root();
         }
     }
 
     /// 前提の検査。欠けたら skip せず失敗にする。
-    fn check_prerequisites() -> Result<(), String> {
+    ///
+    /// 委譲 cgroup と Landlock ABI の欠如だけを `PRECONDITION FAILED` にする（#2957）。root・cgroup v2 の有無・
+    /// 自 cgroup の不一致・user manager の socket は環境起因と断定できないため、従来どおり `FAILED:` のまま回帰側に倒す。
+    fn check_prerequisites() -> Result<(), super::precondition::Failure> {
         if effective_uid()? == 0 {
             return Err("must run as a non-root user: owner checks are skipped for root".into());
         }
@@ -235,8 +596,7 @@ mod linux {
             );
         }
         let hint = "run this test inside `systemd-run --user --scope -p Delegate=yes`";
-        let delegated = DelegatedCgroup::detect()
-            .map_err(|e| format!("no delegated cgroup ({e:?}); {hint}"))?;
+        let delegated = super::precondition::delegated_cgroup()?;
         let own = fs::read_to_string("/proc/self/cgroup")
             .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
         let own_path = own
@@ -244,7 +604,7 @@ mod linux {
             .find_map(|l| l.strip_prefix("0::"))
             .ok_or("no cgroup v2 line in /proc/self/cgroup")?;
         if own_path.trim_end_matches('/') != delegated.path().trim_end_matches('/') {
-            return Err(format!("detected cgroup differs from own cgroup; {hint}"));
+            return Err(format!("detected cgroup differs from own cgroup; {hint}").into());
         }
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
         let private = Path::new(&runtime).join("systemd/private");
@@ -252,14 +612,23 @@ mod linux {
             .map(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
             .unwrap_or(false);
         expect(is_socket, "the systemd user manager socket is missing")?;
-        fandhe_container_core::landlock::detect_landlock_abi()
-            .map_err(|e| format!("Landlock ABI 6 or newer is required: {e:?}"))?;
+        super::precondition::landlock_support()?;
         Ok(())
     }
 
     /// 戻り値は削除前に記録のスコープのディレクトリが存在したか。
-    fn scenario() -> Result<bool, String> {
+    fn scenario() -> Result<bool, super::precondition::Failure> {
         check_prerequisites()?;
+        scenario_body().map_err(super::precondition::Failure::Other)
+    }
+
+    /// 前提の検査を終えた後の本体。ここでの失敗は回帰として扱う。
+    fn scenario_body() -> Result<bool, String> {
+        check_expected_masks()?;
+        expect(
+            fandhe_container_supervisor::inspect::OCI_STATE_VERSION == OCI_STATE_VERSION_LITERAL,
+            "OCI state version literal differs from the supervisor's OCI_STATE_VERSION",
+        )?;
         let cli_src = PathBuf::from(env!("CARGO_BIN_EXE_fandhe-container"));
         let sup_src = cli_src
             .parent()
@@ -276,8 +645,7 @@ mod linux {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let work = fs::canonicalize(std::env::temp_dir())
-            .map_err(|e| format!("canonicalize temp_dir: {e}"))?
+        let work = super::scratch_root::scratch_root("fandhe-ssd-real-scratch", CLI_TIMEOUT)
             .join(format!("fandhe-ssd-real-{}-{nanos}", std::process::id()));
         fs::create_dir(&work).map_err(|e| format!("create work dir: {e}"))?;
         set_mode(&work, 0o700)?;
@@ -319,14 +687,54 @@ mod linux {
         // 1. create
         let out = run_cli(
             &cli,
-            &["--root", &root_s, "create", "--bundle", bundle_s, &id_s],
+            &[
+                "--root",
+                &root_s,
+                "create",
+                "--read-only",
+                "--ulimit",
+                OPT_ULIMIT,
+                "--env",
+                OPT_ENV,
+                "--cap-drop",
+                OPT_CAP_DROP,
+                "--bundle",
+                bundle_s,
+                &id_s,
+            ],
             CLI_TIMEOUT,
         )?;
         expect_ok(&out, "create")?;
         cleanup.armed = true;
 
+        // 1b. state（created）。起動オプションを持つため annotations は作成世代の 1 件（#3097・CLI-1・SUP-11）
+        check_json_plain(bundle_s, "bundle path")?;
+        let generation = {
+            let store = open_store(&root)?;
+            options_generation(&get_record(&store, &id)?)?
+        };
+        check_json_plain(&generation, "generation")?;
+        let ann = [(GENERATION_ANNOTATION, generation.as_str())];
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "created", None, bundle_s, &ann),
+        )?;
+
         // 2. start
-        let out = run_cli(&cli, &["--root", &root_s, "start", &id_s], START_TIMEOUT)?;
+        let out = run_cli(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "start",
+                "--audit-policy",
+                "best-effort",
+                &id_s,
+            ],
+            START_TIMEOUT,
+        )?;
         expect_ok(&out, "start")?;
 
         // 3. list（Running）と状態記録・cgroup 配置
@@ -341,6 +749,17 @@ mod linux {
         expect(
             rec.status().pid().map(|p| p.get()) == Some(pid),
             "state record pid differs from list pid",
+        )?;
+        expect(
+            options_generation(&rec)? == generation,
+            "generation changed between create and start",
+        )?;
+        // state（running）: pid は list の pid と一致（#3097）
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "running", Some(pid), bundle_s, &ann),
         )?;
         let placement = rec.cgroup().ok_or("record has no cgroup placement")?;
         let scope = placement.scope().as_str().to_string();
@@ -362,41 +781,57 @@ mod linux {
         }
 
         // 4. SIGTERM のハンドラ登録を待つ（登録前に stop すると PID 1 では捨てられる）
-        wait_until(STATE_TIMEOUT, "SIGTERM handler registration", || {
-            fs::read_to_string(format!("/proc/{pid}/status"))
-                .ok()
-                .and_then(|t| {
-                    t.lines()
-                        .find_map(|l| l.strip_prefix("SigCgt:"))
-                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
-                })
-                .is_some_and(|m| m & SIGTERM_CAUGHT_BIT != 0)
-        })?;
+        wait_sigterm_handler(pid, "SIGTERM handler registration")?;
 
         // 5. logs
         // ハンドラ登録後でも supervisor の非同期ログ捕捉・flush は未完のことがあるため、期限内で再取得する（REPAIR-5）。
         let mut last_logs = String::new();
-        let logs_ok =
-            wait_until(
-                STATE_TIMEOUT,
-                "logs to contain `stdout READY_TERM`",
-                || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
-                    Ok(o) if o.code == Some(0) => {
-                        let found = o.stdout.lines().any(|l| l == "stdout READY_TERM");
-                        last_logs = o.stdout;
-                        found
-                    }
-                    Ok(o) => {
-                        last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
-                        false
-                    }
-                    Err(e) => {
-                        last_logs = e;
-                        false
-                    }
-                },
-            );
+        let logs_ok = wait_until(
+            STATE_TIMEOUT,
+            "logs to contain the probe lines (READY_TERM, OPT_NOFILE, OPT_ENV, OPT_ROOT_RO, OPT_CAP)",
+            || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
+                Ok(o) if o.code == Some(0) => {
+                    let has = |want: &str| o.stdout.lines().any(|l| l == want);
+                    let found = has("stdout READY_TERM")
+                        && has(OPT_NOFILE_LINE)
+                        && has(OPT_ENV_LINE)
+                        && has(OPT_ROOT_RO_LINE)
+                        && has_cap_lines(&o.stdout, NET_RAW_DROPPED_MASK);
+                    last_logs = o.stdout;
+                    found
+                }
+                Ok(o) => {
+                    last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                    false
+                }
+                Err(e) => {
+                    last_logs = e;
+                    false
+                }
+            },
+        );
         logs_ok.map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
+        // create --cap-drop NET_RAW: ホスト側の /proc と inspect でも照合する（#2833・SEC-1・CLI-1）
+        check_host_caps(pid, NET_RAW_DROPPED_MASK)?;
+        check_inspect_caps(&cli, &root_s, &id_s, NET_RAW_DROPPED_INSPECT)?;
+        // `--read-only` の実効値は分離の記録として `inspect` にも出る(CLI-1・SUP-12・#2828)。
+        let out = run_cli(&cli, &["--root", &root_s, "inspect", &id_s], CLI_TIMEOUT)?;
+        expect_ok_code(&out, "inspect")?;
+        if !out.stdout.contains("\"status\":\"running\"") {
+            return Err(format!("inspect did not report running: {:?}", out.stdout));
+        }
+        if !out.stdout.contains("\"capabilities\":{\"bounding\":[") {
+            return Err(format!(
+                "inspect did not report capabilities.bounding: {:?}",
+                out.stdout
+            ));
+        }
+        if !out.stdout.contains("\"rootReadonly\":true") {
+            return Err(format!(
+                "inspect did not report rootReadonly=true: {:?}",
+                out.stdout
+            ));
+        }
         let container_log = root.join("@container-logs").join(format!("{id_s}.log"));
         let supervisor_log = root.join("@supervisor-logs").join(format!("{id_s}.log"));
         expect(
@@ -426,7 +861,18 @@ mod linux {
                 rec.status().exit_code()
             ));
         }
+        expect(
+            options_generation(&rec)? == generation,
+            "generation changed after stop",
+        )?;
         drop(store);
+        // state（stopped）: pid キーは出ない（#3097）
+        expect_state(
+            &cli,
+            &root_s,
+            &id_s,
+            &oci_state_line(&id_s, "stopped", None, bundle_s, &ann),
+        )?;
 
         // 8. プロセスの消滅とソケット
         wait_until(REAP_TIMEOUT, "the container process to vanish", || {
@@ -444,14 +890,7 @@ mod linux {
         })?;
         let sup_needle = supervisor.to_string_lossy().into_owned().into_bytes();
         let root_needle = root_s.clone().into_bytes();
-        wait_until(REAP_TIMEOUT, "the supervisor to exit", || {
-            count_processes(|dir| {
-                fs::read(dir.join("cmdline")).is_ok_and(|c| {
-                    c.starts_with(&sup_needle)
-                        && c.windows(root_needle.len()).any(|w| w == root_needle)
-                })
-            }) == 0
-        })?;
+        wait_supervisor_exit(&sup_needle, &root_needle, "the supervisor to exit")?;
         expect(
             !control_socket.exists(),
             "supervisor.sock remains after the supervisor exited",
@@ -516,6 +955,204 @@ mod linux {
                 "second delete: want op=delete code=NOT_FOUND, got op={op} code={code}"
             ));
         }
+
+        // 13. create --cap-drop ALL の短い一連（#2833・SEC-1・CLI-1）。guard は 1 つのまま id を差し替える。
+        let all_id_s = format!("ssd{}all", std::process::id());
+        cleanup.id = all_id_s.clone();
+        let out = run_cli(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "create",
+                "--cap-drop",
+                "ALL",
+                "--bundle",
+                bundle_s,
+                &all_id_s,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create --cap-drop ALL")?;
+        cleanup.armed = true;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &all_id_s],
+            START_TIMEOUT,
+        )?;
+        expect_ok(&out, "start (cap-drop ALL)")?;
+        let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
+        let all_pid = parse_running_list(&out, &all_id_s)?;
+        wait_sigterm_handler(all_pid, "SIGTERM handler registration (ALL)")?;
+        let mut last_logs = String::new();
+        wait_until(
+            STATE_TIMEOUT,
+            "logs to contain READY_TERM and zero OPT_CAP lines (ALL)",
+            || match run_cli(&cli, &["--root", &root_s, "logs", &all_id_s], CLI_TIMEOUT) {
+                Ok(o) if o.code == Some(0) => {
+                    let found = o.stdout.lines().any(|l| l == "stdout READY_TERM")
+                        && has_cap_lines(&o.stdout, 0);
+                    last_logs = o.stdout;
+                    found
+                }
+                Ok(o) => {
+                    last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                    false
+                }
+                Err(e) => {
+                    last_logs = e;
+                    false
+                }
+            },
+        )
+        .map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
+        check_host_caps(all_pid, 0)?;
+        check_inspect_caps(&cli, &root_s, &all_id_s, ALL_DROPPED_INSPECT)?;
+        let out = run_cli(&cli, &["--root", &root_s, "stop", &all_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "stop (cap-drop ALL)")?;
+        let want = format!("ID\tSTATUS\tPID\n{all_id_s}\tstopped\t-\n");
+        wait_until(STATE_TIMEOUT, "list to report stopped (ALL)", || {
+            run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
+                .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
+        })?;
+        let all_cid = ContainerId::new(all_id_s.clone()).map_err(|e| format!("id (ALL): {e:?}"))?;
+        let store = open_store(&root)?;
+        let rec = get_record(&store, &all_cid)?;
+        if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
+            return Err(format!(
+                "exit code after stop (ALL): want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
+                rec.status().exit_code()
+            ));
+        }
+        drop(store);
+        wait_until(REAP_TIMEOUT, "the ALL container process to vanish", || {
+            !Path::new(&format!("/proc/{all_pid}")).exists()
+        })?;
+        // delete の supervisor ログ削除は 1 回だけ試す（待たない）ため、supervisor が sink のロックを手放す
+        // （プロセス終了）まで待つ。待たないと `FAILED_PRECONDITION` の警告が出る（1 つ目の一連の手順 8 と同じ）。
+        wait_supervisor_exit(&sup_needle, &root_needle, "the ALL supervisor to exit")?;
+        let out = run_cli(&cli, &["--root", &root_s, "delete", &all_id_s], CLI_TIMEOUT)?;
+        expect_ok(&out, "delete (cap-drop ALL)")?;
+        expect(
+            !root.join(&all_id_s).exists(),
+            "state dir remains after delete (ALL)",
+        )?;
+        cleanup.armed = false;
+
+        // 14. kill TERM の一連（#3097・CLI-1・SUP-11・SUP-4）。オプション無しでも Linux の create は既定の `network none` を書くため、annotations は作成世代の 1 件（#1873）。
+        // start は `--restart` を渡さず restart 方針は既定の `no`。意図を立てない kill の現状に結果が左右されない。
+        let kill_id_s = format!("ssd{}kill", std::process::id());
+        cleanup.id = kill_id_s.clone();
+        let out = run_cli(
+            &cli,
+            &[
+                "--root", &root_s, "create", "--bundle", bundle_s, &kill_id_s,
+            ],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "create (kill)")?;
+        cleanup.armed = true;
+        let kill_generation = {
+            let store = open_store(&root)?;
+            options_generation(&get_record(
+                &store,
+                &ContainerId::new(kill_id_s.clone()).map_err(|e| format!("id (kill): {e:?}"))?,
+            )?)?
+        };
+        check_json_plain(&kill_generation, "generation (kill)")?;
+        let kill_ann = [(GENERATION_ANNOTATION, kill_generation.as_str())];
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "created", None, bundle_s, &kill_ann),
+        )?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "start", &kill_id_s],
+            START_TIMEOUT,
+        )?;
+        expect_ok(&out, "start (kill)")?;
+        let out = run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)?;
+        let kill_pid = parse_running_list(&out, &kill_id_s)?;
+        wait_sigterm_handler(kill_pid, "SIGTERM handler registration (kill)")?;
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "running", Some(kill_pid), bundle_s, &kill_ann),
+        )?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "kill", &kill_id_s, KILL_SIGNAL],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "kill")?;
+        let want = format!("ID\tSTATUS\tPID\n{kill_id_s}\tstopped\t-\n");
+        wait_until(STATE_TIMEOUT, "list to report stopped (kill)", || {
+            run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
+                .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
+        })?;
+        let kill_cid =
+            ContainerId::new(kill_id_s.clone()).map_err(|e| format!("id (kill): {e:?}"))?;
+        let store = open_store(&root)?;
+        let rec = get_record(&store, &kill_cid)?;
+        if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
+            return Err(format!(
+                "exit code after kill: want {SIGTERM_HANDLER_EXIT_CODE_FOR_TEST}, got {:?}",
+                rec.status().exit_code()
+            ));
+        }
+        expect(
+            rec.explicit_stop() == ExplicitStop::NotRecorded,
+            &format!(
+                "kill must not record an explicit stop, got {:?}",
+                rec.explicit_stop()
+            ),
+        )?;
+        expect(
+            rec.restart_count() == 0,
+            &format!("restart_count after kill: {}", rec.restart_count()),
+        )?;
+        drop(store);
+        expect_state(
+            &cli,
+            &root_s,
+            &kill_id_s,
+            &oci_state_line(&kill_id_s, "stopped", None, bundle_s, &kill_ann),
+        )?;
+        // 停止済みへの kill は core が `FAILED_PRECONDITION` で拒否する（終了コード 5・op は kill）
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "kill", &kill_id_s, KILL_SIGNAL],
+            CLI_TIMEOUT,
+        )?;
+        if out.code != Some(5) || !out.stdout.is_empty() {
+            return Err(format!(
+                "kill after stop: want exit 5, got {:?} stdout={:?} stderr={:?}",
+                out.code, out.stdout, out.stderr
+            ));
+        }
+        let (op, code) = op_and_code(&out.stderr)?;
+        if op != "kill" || code != "FAILED_PRECONDITION" {
+            return Err(format!(
+                "kill after stop: want op=kill code=FAILED_PRECONDITION, got op={op} code={code}"
+            ));
+        }
+        wait_until(REAP_TIMEOUT, "the kill container process to vanish", || {
+            !Path::new(&format!("/proc/{kill_pid}")).exists()
+        })?;
+        wait_supervisor_exit(&sup_needle, &root_needle, "the kill supervisor to exit")?;
+        let out = run_cli(
+            &cli,
+            &["--root", &root_s, "delete", &kill_id_s],
+            CLI_TIMEOUT,
+        )?;
+        expect_ok(&out, "delete (kill)")?;
+        expect(
+            !root.join(&kill_id_s).exists(),
+            "state dir remains after delete (kill)",
+        )?;
         cleanup.armed = false;
         Ok(scope_present)
     }
@@ -709,102 +1346,16 @@ mod linux {
         })
     }
 
-    // ---- bundle の用意（supervisor_bin_real.rs の make_rootfs 等を写したもの。crate が違うため共有できない） ----
-
-    fn mkdir(path: &Path) -> Result<(), String> {
-        fs::create_dir_all(path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
-        set_mode(path, 0o755)
-    }
-
-    /// `host` のファイルを rootfs 内の同じ絶対パスへコピーする。
-    fn copy_into(rootfs: &Path, host: &Path) -> Result<(), String> {
-        let rel = host
-            .strip_prefix("/")
-            .map_err(|_| format!("not absolute: {}", host.display()))?;
-        let dest = rootfs.join(rel);
-        mkdir(dest.parent().ok_or("no parent")?)?;
-        let _ = fs::remove_file(&dest);
-        fs::copy(host, &dest)
-            .map_err(|e| format!("copy {} -> {}: {e}", host.display(), dest.display()))?;
-        set_mode(&dest, 0o755)
-    }
-
-    /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` で検査する。
-    fn elf_interp(exe: &[u8]) -> Option<String> {
-        let u16_at = |o: usize| Some(u16::from_le_bytes(exe.get(o..o + 2)?.try_into().ok()?));
-        let u32_at = |o: usize| Some(u32::from_le_bytes(exe.get(o..o + 4)?.try_into().ok()?));
-        let u64_at = |o: usize| Some(u64::from_le_bytes(exe.get(o..o + 8)?.try_into().ok()?));
-        if exe.get(0..4)? != b"\x7fELF" {
-            return None;
-        }
-        let phoff = usize::try_from(u64_at(0x20)?).ok()?;
-        let phentsize = usize::from(u16_at(0x36)?);
-        let phnum = usize::from(u16_at(0x38)?);
-        for i in 0..phnum {
-            let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
-            if u32_at(base)? == 3 {
-                let off = usize::try_from(u64_at(base + 8)?).ok()?;
-                let len = usize::try_from(u64_at(base + 32)?).ok()?;
-                let raw = exe.get(off..off.checked_add(len)?)?;
-                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-                return String::from_utf8(raw.get(..end)?.to_vec()).ok();
-            }
-        }
-        None
-    }
-
-    /// 自プロセスに読み込み済みの共有ライブラリの実パス（`/proc/self/maps` から。重複なし）。
-    fn loaded_libraries(exe: &Path) -> Result<Vec<PathBuf>, String> {
-        let maps = fs::read_to_string("/proc/self/maps").map_err(|e| format!("read maps: {e}"))?;
-        let mut libs: Vec<PathBuf> = Vec::new();
-        for line in maps.lines() {
-            let Some(path) = line.split_whitespace().nth(5) else {
-                continue;
-            };
-            let p = PathBuf::from(path);
-            if !path.starts_with('/')
-                || p == exe
-                || ["/dev/", "/proc/", "/sys/", "/tmp/", "/memfd:"]
-                    .iter()
-                    .any(|pre| path.starts_with(pre))
-                || libs.contains(&p)
-            {
-                continue;
-            }
-            if fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-                libs.push(p);
-            }
-        }
-        Ok(libs)
-    }
+    // ---- bundle の用意（rootfs の部品は core の tests/support/minimal_rootfs.rs と共有。#2963・REPAIR-1） ----
 
     /// bundle（`config.json` と最小 rootfs）を作る。`/probe` は本試験の実行ファイルのコピー。
     fn make_bundle(bundle: &Path) -> Result<(), String> {
-        mkdir(bundle)?;
-        let rootfs = bundle.join("rootfs");
-        for d in ["", "proc", "dev", "tmp", "etc"] {
-            mkdir(&rootfs.join(d))?;
-        }
-        let exe =
-            fs::canonicalize(std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?)
-                .map_err(|e| format!("canonicalize exe: {e}"))?;
-        let probe = rootfs.join("probe");
-        fs::copy(&exe, &probe).map_err(|e| format!("copy probe binary: {e}"))?;
-        set_mode(&probe, 0o755)?;
-        let bytes = fs::read(&exe).map_err(|e| format!("read exe: {e}"))?;
-        let mut lib_dirs: Vec<String> = Vec::new();
-        if let Some(interp) = elf_interp(&bytes) {
-            copy_into(&rootfs, Path::new(&interp))?;
-        }
-        for lib in loaded_libraries(&exe)? {
-            copy_into(&rootfs, &lib)?;
-            if let Some(dir) = lib.parent().and_then(Path::to_str)
-                && !lib_dirs.iter().any(|d| d == dir)
-            {
-                lib_dirs.push(dir.to_string());
-            }
-        }
-        let ld = lib_dirs.join(":");
+        super::minimal_rootfs::mkdir(bundle)?;
+        let ld = super::minimal_rootfs::install_binary_at(
+            &bundle.join("rootfs"),
+            "probe",
+            &["proc", "dev", "tmp", "etc"],
+        )?;
         // uidMappings / gidMappings・cgroupsPath は書かない（それぞれ UNIMPLEMENTED で拒否される）。
         let config = format!(
             r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-ssd",

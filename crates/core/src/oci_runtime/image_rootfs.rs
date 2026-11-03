@@ -94,6 +94,10 @@ const MARKER_MAX_BYTES: u64 = 128;
 #[cfg(target_os = "linux")]
 const USERNS_REMOVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// userns の中での seal / publish に与える予算（写像の書き込みの期限とは別。REPAIR-5・#2690）。
+#[cfg(target_os = "linux")]
+const USERNS_FINALIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 公開済みの孤児の回収で、状態を調べるページ数・1 ページの件数の上限（無制限の走査を避ける。REPAIR-5）。
 #[cfg(target_os = "linux")]
 const ORPHAN_SCAN_MAX_PAGES: usize = 200;
@@ -530,6 +534,11 @@ pub(super) enum OrphanReap {
 /// 6. `store` の全レコードに、印のトークンを持つものも、同じ bundle を指すものも無い（一覧の失敗・打ち切りは
 ///    確かめられないので残す）
 ///
+/// 最上位が subuid 所有・0700 でホストの実効 uid から開けない木（`flock` 用の open が `EACCES`）は、権限が
+/// `SubordinateIds` のときだけ、3.〜6. を userns の子の中で評価する（親は先にストアを走査して結果だけを渡し、
+/// 子はロックを保持したまま照合から削除まで行う。#2769・`docs/design/image-rootfs-lifetime.md` 決定 H）。
+/// `HostEffectiveIds` では昇格せず `Unverified` で残す。
+///
 /// 別の状態ルート（`--root` 違い）のコンテナが同じ bundle の rootfs を共有する構成は支援しない。core 製の木に
 /// ついては 5. で消さずに残す。通常の create が core 製の木を `root.path` で採用した構成は検出できない
 /// （`docs/design/image-rootfs-lifetime.md`）。Linux 以外は常に `NotPresent`（作成が `Unimplemented`）。
@@ -606,8 +615,18 @@ impl CreatedRootfs {
     ///
     /// Linux は固定した親の下で `renameat2(RENAME_NOREPLACE)` により改名し、最終の名前が既にあれば
     /// `AlreadyExists`（置き換えない）。Linux 以外は作成自体が拒否されるため到達しない。
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn publish(&mut self) -> Result<(), TraitError> {
-        imp::publish(&mut self.backing)
+        self.publish_with(&HOST_PRIVILEGE)
+    }
+
+    /// [`Self::publish`] に権限を指定したもの。子 rootfs が subuid 所有で権限が `SubordinateIds` なら、改名を
+    /// userns の中で行う（rootless の `./` が root 以外の所有のとき。OCI-7・SEC-5・#2690）。
+    pub(super) fn publish_with(
+        &mut self,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        imp::publish(&mut self.backing, privilege)
     }
 
     /// 最終の名前への改名が済んでいるか。`publish` が Err でも true なら公開済みで、他の create が
@@ -640,8 +659,19 @@ impl CreatedRootfs {
     ///
     /// `state_root_scope` は [`state_root_scope`] の識別子（印 v3 の 3 行目。`None` なら v2 を書き、孤児の回収は
     /// この木を残す。#2635・OCI-5）。
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn seal(&mut self, state_root_scope: Option<&str>) -> Result<(), TraitError> {
-        imp::seal(&mut self.backing, state_root_scope)
+        self.seal_with(state_root_scope, &HOST_PRIVILEGE)
+    }
+
+    /// [`Self::seal`] に権限を指定したもの。子 rootfs が subuid 所有で権限が `SubordinateIds` なら、印の書き込みを
+    /// userns の中で行う（OCI-7・SEC-5・#2690）。
+    pub(super) fn seal_with(
+        &mut self,
+        state_root_scope: Option<&str>,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        imp::seal(&mut self.backing, state_root_scope, privilege)
     }
 
     /// rootfs を消す。
@@ -705,7 +735,9 @@ mod imp {
         ORPHAN_SCAN_MAX_PAGES, ORPHAN_SCAN_PAGE_SIZE, OrphanReap, RecordedRootfsRemoval,
         STAGING_PREFIX, StagingReclamation, UnverifiedReason, invalid, refuse, remove_failed,
     };
-    use super::{HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_REMOVE_BUDGET};
+    use super::{
+        HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_FINALIZE_BUDGET, USERNS_REMOVE_BUDGET,
+    };
     use crate::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, isolate_rootless_subordinate,
         plan_rootless_subordinate, wait_forked_child,
@@ -779,7 +811,251 @@ mod imp {
         Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 
-    pub(super) fn seal(b: &mut Backing, scope: Option<&str>) -> Result<(), TraitError> {
+    /// 子が実効 uid 所有でない（rootless で `./` が subuid 所有）ときの、ホストでは改名できないことの明示エラー。
+    fn foreign_root_err() -> TraitError {
+        TraitError::new(
+            ErrorCode::Internal,
+            "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+        )
+    }
+
+    /// seal / publish の実行場所（[`finalize_route`] の結果）。
+    #[derive(Debug)]
+    pub(super) enum FinalizeRoute<'a> {
+        /// ホストの実効 uid で行う。`foreign` は子が別 uid 所有（失敗時に明示エラーへ読み替える）。
+        Host { foreign: bool },
+        /// 子プロセスの user namespace の中で行う（子が subuid 所有で、権限が `SubordinateIds`。#2690）。
+        Userns(&'a SubordinateIdSource),
+    }
+
+    /// 子 rootfs の所有者と権限から、seal / publish を行う場所を決める（純関数。OCI-7・SEC-5・#2690）。
+    ///
+    /// 所有者が実効 uid または不明なら従来どおりホスト（fork しない）。別 uid 所有で権限が `SubordinateIds` のときだけ
+    /// userns の中で行う。`HostEffectiveIds` では暗黙に userns へ昇格せず、ホストで試して明示エラーで拒否する。
+    pub(super) fn finalize_route<'a>(
+        child_owner: Option<u32>,
+        euid: u32,
+        privilege: &'a ImageRootfsPrivilege,
+    ) -> FinalizeRoute<'a> {
+        let foreign = child_owner.is_some_and(|o| o != euid);
+        match (foreign, privilege) {
+            (true, ImageRootfsPrivilege::SubordinateIds(source)) => FinalizeRoute::Userns(source),
+            _ => FinalizeRoute::Host { foreign },
+        }
+    }
+
+    /// seal の失敗（userns の子の終了コードの語彙と 1 対 1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SealFailure {
+        Stat,
+        Exists,
+        Widen,
+        Write,
+        Restore,
+    }
+
+    const SEAL_OK: i32 = 0;
+    const SEAL_EXISTS: i32 = 30;
+    const SEAL_WIDEN_FAILED: i32 = 31;
+    const SEAL_WRITE_FAILED: i32 = 32;
+    const SEAL_RESTORE_FAILED: i32 = 33;
+    const SEAL_STAT_FAILED: i32 = 34;
+
+    impl SealFailure {
+        fn code(self) -> i32 {
+            match self {
+                Self::Stat => SEAL_STAT_FAILED,
+                Self::Exists => SEAL_EXISTS,
+                Self::Widen => SEAL_WIDEN_FAILED,
+                Self::Write => SEAL_WRITE_FAILED,
+                Self::Restore => SEAL_RESTORE_FAILED,
+            }
+        }
+
+        /// 失敗の写し方。`foreign` なら書き込み系の失敗は原因が分かる明示エラーにする。
+        fn into_error(self, foreign: bool) -> TraitError {
+            match self {
+                Self::Stat => TraitError::new(ErrorCode::Internal, "failed to stat rootfs"),
+                Self::Exists => TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "rootfs owner marker already exists",
+                ),
+                Self::Widen | Self::Write if foreign => foreign_root_err(),
+                Self::Widen | Self::Write => {
+                    TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                }
+                Self::Restore => {
+                    TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+                }
+            }
+        }
+    }
+
+    /// fd の指す rootfs の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
+    ///
+    /// ホストの `seal` と、userns の子（#2690）の両方が呼ぶ。展開器は rootfs 自身の mode を変えてよい（契約は
+    /// 禁止していない）ので、所有者の write・search 権限が無いと印を作れず従来成功した create が失敗する
+    /// 退行になる。`/proc/self/fd/N` は経路を再解決しない。
+    fn write_marker_widened(dir: BorrowedFd<'_>, content: &str) -> Result<(), SealFailure> {
+        let proc_dir = format!("/proc/self/fd/{}", dir.as_raw_fd());
+        let original = fstat(dir)
+            .map(|(_, _, _, mode)| mode & 0o7777)
+            .map_err(|_| SealFailure::Stat)?;
+        let widened = original | 0o300;
+        if widened != original {
+            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
+                .map_err(|_| SealFailure::Widen)?;
+        }
+        let written = write_marker(&proc_dir, content).map_err(|e| match e.code() {
+            ErrorCode::AlreadyExists => SealFailure::Exists,
+            _ => SealFailure::Write,
+        });
+        if widened != original {
+            let restored =
+                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
+            written?;
+            restored.map_err(|_| SealFailure::Restore)?;
+        } else {
+            written?;
+        }
+        Ok(())
+    }
+
+    /// userns の子の実行が親へ返すエラー（固定語彙）。
+    #[derive(Debug, PartialEq, Eq)]
+    enum UsernsRunError {
+        MultiThreaded,
+        Timeout,
+        Other(ErrorCode),
+    }
+
+    impl UsernsRunError {
+        fn into_error(self) -> TraitError {
+            match self {
+                Self::MultiThreaded => TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "cannot finalize a subordinate-owned rootfs in a user namespace",
+                ),
+                Self::Timeout => TraitError::new(
+                    ErrorCode::Timeout,
+                    "finalizing a subordinate-owned rootfs timed out",
+                ),
+                Self::Other(code) => TraitError::new(
+                    code,
+                    "failed to finalize a subordinate-owned rootfs in a user namespace",
+                ),
+            }
+        }
+    }
+
+    /// [`spawn_in_userns`] の失敗（どの段で失敗したかを区別する。呼び出し側が自分の文言・語彙へ写す）。
+    ///
+    /// `Inputs` / `Plan` / `MultiThreaded` / `ForkOther` は fork の前（子は作られず、木に触れていない）。
+    /// `Timeout` / `WaitOther` は fork の後（子が木に触れた可能性がある）。
+    #[derive(Debug)]
+    enum UsernsSpawnError {
+        /// 写像の入力（subuid / subgid の解決）の失敗。
+        Inputs(TraitError),
+        /// 補助の user namespace の計画の失敗。
+        Plan(ErrorCode),
+        /// 呼び出しプロセスがマルチスレッド（fork の検査が拒否）。
+        MultiThreaded,
+        /// マルチスレッド以外の fork の失敗。
+        ForkOther,
+        /// 期限内に子が終わらなかった（kill して回収済み）。
+        Timeout,
+        /// シグナル終了・Timeout 以外の待ちの失敗。
+        WaitOther,
+    }
+
+    /// 子プロセスの user namespace（User のみ・holder / mapper 方式。#2374）の中で `child` を実行し、終了コードを返す。
+    ///
+    /// seal / publish（#2690）の `run_in_userns`、削除の `userns_run`、孤児の回収の
+    /// `orphan_reap_in_userns`（#2769）が共有する骨格である（REPAIR-1）: 写像の入力の解決 → 計画 →
+    /// 単一スレッドの fork → 子で `isolate_rootless_subordinate`（失敗なら `CHILD_SETUP_FAILED`）→ `child()` →
+    /// 期限つきの待ち。親は期限（写像の書き込みの最大 3 × 期限 + 5 秒 + `work_budget`）を超えたら kill して回収する
+    /// （REPAIR-5）。呼び出しプロセスがマルチスレッドなら fork の検査が拒否する（CRI / tokio 経路の子プロセス方式の
+    /// 配線は #2315 の範囲）。子から親へは終了コードだけを運ぶ。
+    fn spawn_in_userns(
+        source: &SubordinateIdSource,
+        work_budget: std::time::Duration,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsSpawnError> {
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let inputs = source
+            .removal_inputs(euid, egid)
+            .map_err(UsernsSpawnError::Inputs)?;
+        let config = IsolationConfig {
+            namespaces: NamespaceSet::empty().with(Namespace::User),
+            hostname: None,
+        };
+        let helper_timeout = inputs.timeout;
+        let plan = plan_rootless_subordinate(
+            &config,
+            inputs.uid,
+            inputs.gid,
+            inputs.writer,
+            helper_timeout,
+        )
+        .map_err(|e| UsernsSpawnError::Plan(e.code))?;
+        let pid = sys::fork_single_threaded(
+            || {
+                if isolate_rootless_subordinate(&plan).is_err() {
+                    return CHILD_SETUP_FAILED;
+                }
+                child()
+            },
+            CHILD_SETUP_FAILED,
+        )
+        .map_err(|e| match e {
+            SysError::MultiThreaded => UsernsSpawnError::MultiThreaded,
+            _ => UsernsSpawnError::ForkOther,
+        })?;
+        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + work_budget;
+        match wait_forked_child(pid, budget) {
+            Ok(ChildExit::Exited(code)) => Ok(code),
+            Err(e) if e.code == ErrorCode::Timeout => Err(UsernsSpawnError::Timeout),
+            _ => Err(UsernsSpawnError::WaitOther),
+        }
+    }
+
+    /// seal / publish 用の [`spawn_in_userns`]（失敗を [`UsernsRunError`] の固定語彙へ写す）。
+    fn run_in_userns(
+        source: &SubordinateIdSource,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsRunError> {
+        spawn_in_userns(source, USERNS_FINALIZE_BUDGET, child).map_err(|e| match e {
+            UsernsSpawnError::Inputs(e) => UsernsRunError::Other(e.code()),
+            UsernsSpawnError::Plan(c) => UsernsRunError::Other(c),
+            UsernsSpawnError::MultiThreaded => UsernsRunError::MultiThreaded,
+            UsernsSpawnError::Timeout => UsernsRunError::Timeout,
+            UsernsSpawnError::ForkOther | UsernsSpawnError::WaitOther => {
+                UsernsRunError::Other(ErrorCode::Internal)
+            }
+        })
+    }
+    /// userns の中の seal の結果を親の結果へ写す（純関数）。
+    fn seal_outcome(run: Result<i32, UsernsRunError>) -> Result<(), TraitError> {
+        match run {
+            Ok(SEAL_OK) => Ok(()),
+            Ok(SEAL_EXISTS) => Err(SealFailure::Exists.into_error(true)),
+            Ok(SEAL_WIDEN_FAILED) => Err(SealFailure::Widen.into_error(true)),
+            Ok(SEAL_WRITE_FAILED) => Err(SealFailure::Write.into_error(true)),
+            Ok(SEAL_RESTORE_FAILED) => Err(SealFailure::Restore.into_error(true)),
+            Ok(SEAL_STAT_FAILED) => Err(SealFailure::Stat.into_error(true)),
+            Ok(_) => Err(TraitError::new(
+                ErrorCode::Internal,
+                "failed to write rootfs owner token",
+            )),
+            Err(e) => Err(e.into_error()),
+        }
+    }
+
+    pub(super) fn seal(
+        b: &mut Backing,
+        scope: Option<&str>,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         if scope.is_some_and(|s| !is_hex32(s)) {
             return Err(TraitError::new(
                 ErrorCode::Internal,
@@ -787,35 +1063,6 @@ mod imp {
             ));
         }
         let token = new_token()?;
-        // 展開器は rootfs 自身の mode を変えてよい（契約は禁止していない）。所有者の write・search 権限が無いと
-        // 印を作れず、従来成功した create が失敗する退行になるため、固定した fd の実体（`/proc/self/fd/N` は
-        // 経路を再解決しない）の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
-        let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
-        let original = fstat(b.dir.as_fd())
-            .map(|(_, _, _, mode)| mode & 0o7777)
-            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
-        let widened = original | 0o300;
-        // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と、mode の補完も
-        // 印の作成もできない。seal は publish より先に走るため、汎用の印の書き込み失敗ではなく publish と同じ
-        // 診断で拒否する（利用者が原因を判別できるように。OCI-7）。
-        let foreign = fd_owner(b.dir.as_fd()).is_some_and(|o| o != sys::effective_uid());
-        let foreign_err = || {
-            TraitError::new(
-                ErrorCode::Internal,
-                "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
-            )
-        };
-        if widened != original {
-            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
-                |_| {
-                    if foreign {
-                        foreign_err()
-                    } else {
-                        TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
-                    }
-                },
-            )?;
-        }
         // v2: 1 行目 = トークン、2 行目 = 木の作成時の `<dev>:<ino>`。複製（`cp -a`）は inode が新しくなり
         // 2 行目が一致しないので、孤児の回収が利用者の複製を消さない（#2540）。
         // v3（#2635）: 3 行目 = 状態ルートの識別子。別の状態ルートの木を孤児の回収が消さない（OCI-5）。
@@ -824,22 +1071,20 @@ mod imp {
             Some(scope) => format!("{token}\n{}:{}\n{scope}\n", b.identity.0, b.identity.1),
             None => format!("{token}\n{}:{}\n", b.identity.0, b.identity.1),
         };
-        let written = write_marker(&proc_dir, &content).map_err(|e| {
-            if foreign && e.code() == ErrorCode::Internal {
-                foreign_err()
-            } else {
-                e
+        match finalize_route(fd_owner(b.dir.as_fd()), sys::effective_uid(), privilege) {
+            FinalizeRoute::Host { foreign } => {
+                write_marker_widened(b.dir.as_fd(), &content).map_err(|f| f.into_error(foreign))?;
             }
-        });
-        if widened != original {
-            let restored =
-                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
-            written?;
-            restored.map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
-            })?;
-        } else {
-            written?;
+            FinalizeRoute::Userns(source) => {
+                // 子が subuid 所有（#2690）。ホストの uid では mode の補完も印の作成もできないので、userns の中で
+                // 行う。印はコンテナ 0 = ホストの実効 uid 所有・0400 で作られ、孤児の回収の厳格照合と整合する。
+                let dir = b.dir.as_fd();
+                let run = run_in_userns(source, || match write_marker_widened(dir, &content) {
+                    Ok(()) => SEAL_OK,
+                    Err(f) => f.code(),
+                });
+                seal_outcome(run)?;
+            }
         }
         b.token = Some(token);
         Ok(())
@@ -978,60 +1223,162 @@ mod imp {
         PathBuf::from(format!("/proc/self/fd/{}", b.dir.as_raw_fd()))
     }
 
-    pub(super) fn publish(b: &mut Backing) -> Result<(), TraitError> {
-        if b.published {
-            return Ok(());
+    /// 改名の失敗（userns の子の終了コードの語彙と 1 対 1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PublishFailure {
+        Stat,
+        Widen,
+        Exists,
+        Rename,
+        /// 改名には成功したが、mode を戻せなかった。
+        RestoreAfterRename,
+    }
+
+    const PUB_RENAMED: i32 = 0;
+    const PUB_EXISTS: i32 = 20;
+    const PUB_WIDEN_FAILED: i32 = 21;
+    const PUB_RENAME_FAILED: i32 = 22;
+    const PUB_RESTORE_FAILED: i32 = 23;
+    const PUB_STAT_FAILED: i32 = 24;
+
+    impl PublishFailure {
+        fn code(self) -> i32 {
+            match self {
+                Self::Stat => PUB_STAT_FAILED,
+                Self::Widen => PUB_WIDEN_FAILED,
+                Self::Exists => PUB_EXISTS,
+                Self::Rename => PUB_RENAME_FAILED,
+                Self::RestoreAfterRename => PUB_RESTORE_FAILED,
+            }
         }
-        let child = cstr(OsStr::new(STAGING_CHILD))?;
-        // 別のディレクトリの下へ移すには、移すディレクトリ自身への write 権限が要る（`..` の付け替え。同じ親の下の
-        // 改名では要らなかった）。展開器は rootfs 自身の mode を変えてよい（例: 0555）ので、write が無ければ
-        // 固定した fd の実体（`/proc/self/fd/N` は経路を再解決しない）の mode を一時的に補い、改名の後に戻す。
+
+        fn into_error(self) -> TraitError {
+            match self {
+                Self::Stat => TraitError::new(ErrorCode::Internal, "failed to stat rootfs"),
+                Self::Widen => foreign_root_err(),
+                Self::Exists => TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists"),
+                Self::Rename => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
+                Self::RestoreAfterRename => {
+                    TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+                }
+            }
+        }
+    }
+
+    /// 子 rootfs を最終の名前へ `RENAME_NOREPLACE` で改名する。ホストと userns の子（#2690）の両方が呼ぶ。
+    ///
+    /// 別のディレクトリの下へ移すには、移すディレクトリ自身への write 権限が要る（`..` の付け替え。同じ親の下の
+    /// 改名では要らなかった）。展開器は rootfs 自身の mode を変えてよい（例: 0555）ので、write が無ければ固定した
+    /// fd の実体（`/proc/self/fd/N` は経路を再解決しない）の mode を一時的に補い、改名の後に戻す。
+    fn rename_widened(b: &Backing) -> Result<(), PublishFailure> {
+        let child = cstr(OsStr::new(STAGING_CHILD)).map_err(|_| PublishFailure::Rename)?;
         let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
         let original = fstat(b.dir.as_fd())
             .map(|(_, _, _, mode)| mode & 0o7777)
-            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
+            .map_err(|_| PublishFailure::Stat)?;
         let widened = original | 0o200;
         if widened != original {
-            // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と chmod できず、
-            // 改名もできない。成功を装わず、理由が分かる明示エラーで拒否する。
             std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
-                .map_err(|_| {
-                    TraitError::new(
-                        ErrorCode::Internal,
-                        "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
-                    )
-                })?;
+                .map_err(|_| PublishFailure::Widen)?;
         }
         let renamed =
             sys::rename_noreplace_at(b.wrapper.as_fd(), &child, b.parent.as_fd(), &b.final_name);
         if widened != original {
             let restored =
                 std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
-            // 改名に成功していれば公開済みとして扱い（後始末で消さない）、戻せなかったことだけを報告する。
+            // 改名に成功していれば公開済みとして扱い、戻せなかったことだけを報告する。
             if renamed.is_ok() && restored.is_err() {
-                b.published = true;
-                return Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to restore rootfs mode",
-                ));
+                return Err(PublishFailure::RestoreAfterRename);
             }
         }
         renamed.map_err(|e| match e {
-            SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => {
-                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
+            SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => PublishFailure::Exists,
+            _ => PublishFailure::Rename,
+        })
+    }
+
+    /// 最終の名前が、展開した実体（dev・ino）を指しているか。改名は原子的なので、これが公開済みの判定になる。
+    fn observe_published(b: &Backing) -> bool {
+        open_dir(b.parent.as_fd(), &b.final_name)
+            .ok()
+            .and_then(|fd| fstat(fd.as_fd()).ok())
+            .is_some_and(|(dev, ino, is_dir, _)| is_dir && (dev, ino) == b.identity)
+    }
+
+    /// userns の中の改名の結果を `(公開済みか, 結果)` へ写す（純関数）。
+    ///
+    /// 公開済みかは終了コードではなく観測（`observed`）で決める。期限切れで kill した場合も、改名が済んでいれば
+    /// 公開済みとして残す（OCI-7 の使用中 rootfs の保持。create は公開済みの木を消さない）。
+    fn publish_outcome(
+        run: Result<i32, UsernsRunError>,
+        observed: bool,
+    ) -> (bool, Result<(), TraitError>) {
+        if observed {
+            // 公開済みの観測が保証するのは改名が済んだことだけで、mode の復元までは保証しない。
+            // 子が改名の後・復元の前に止まった場合（期限切れの kill・異常終了）に成功を装わない（fail-closed）。
+            // 公開済みの木は消さず（published = true）、エラーで返す。
+            return match run {
+                Ok(PUB_RENAMED) => (true, Ok(())),
+                Ok(PUB_RESTORE_FAILED) | Ok(_) => {
+                    (true, Err(PublishFailure::RestoreAfterRename.into_error()))
+                }
+                Err(e) => (true, Err(e.into_error())),
+            };
+        }
+        let err = match run {
+            Ok(PUB_EXISTS) => PublishFailure::Exists.into_error(),
+            Ok(PUB_WIDEN_FAILED) => PublishFailure::Widen.into_error(),
+            Ok(PUB_STAT_FAILED) => PublishFailure::Stat.into_error(),
+            // 改名したと言うのに最終の名前が展開した実体を指さない。成功を装わない。
+            Ok(PUB_RENAMED) => refuse(),
+            Ok(_) => PublishFailure::Rename.into_error(),
+            Err(e) => e.into_error(),
+        };
+        (false, Err(err))
+    }
+
+    pub(super) fn publish(
+        b: &mut Backing,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        if b.published {
+            return Ok(());
+        }
+        match finalize_route(fd_owner(b.dir.as_fd()), sys::effective_uid(), privilege) {
+            FinalizeRoute::Host { .. } => match rename_widened(b) {
+                Ok(()) => {}
+                Err(PublishFailure::RestoreAfterRename) => {
+                    b.published = true;
+                    return Err(PublishFailure::RestoreAfterRename.into_error());
+                }
+                Err(f) => return Err(f.into_error()),
+            },
+            FinalizeRoute::Userns(source) => {
+                // 子が subuid 所有（#2690）。ホストの uid では mode の補完も改名もできないので userns の中で行う。
+                // 子が触れるのは固定済みの fd と固定の 2 つの名前だけで、経路を再解決しない。
+                let run = run_in_userns(source, || match rename_widened(b) {
+                    Ok(()) => PUB_RENAMED,
+                    Err(f) => f.code(),
+                });
+                let observed = observe_published(b);
+                let (published, result) = publish_outcome(run, observed);
+                if published {
+                    b.published = true;
+                    let _ = sys::remove_dir_at(b.parent.as_fd(), &b.wrapper_name);
+                }
+                return result;
             }
-            _ => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
-        })?;
+        }
         b.published = true;
         // 空になったラッパーは best effort で消す（消し損ねても、次の回収が予約名の空の木として拾う）。
         let _ = sys::remove_dir_at(b.parent.as_fd(), &b.wrapper_name);
         // 改名した先を固定済みの親から開き直し、展開した実体（保持中の fd の dev・ino）と一致することを確認する。
         // 一致しなければ公開した名前は別の実体を指しており、成功を装わず拒否する。
-        let same = open_dir(b.parent.as_fd(), &b.final_name)
-            .ok()
-            .and_then(|fd| fstat(fd.as_fd()).ok())
-            .is_some_and(|(dev, ino, is_dir, _)| is_dir && (dev, ino) == b.identity);
-        if same { Ok(()) } else { Err(refuse()) }
+        if observe_published(b) {
+            Ok(())
+        } else {
+            Err(refuse())
+        }
     }
 
     /// 最終の名前への改名が済んでいるか。
@@ -1281,6 +1628,9 @@ mod imp {
         Unverified,
         /// 印の状態ルートの識別子が現在のストアと一致しない・無い（#2635）。
         ForeignStateRoot,
+        /// ホストの実効 uid ではツリーを開けず（EACCES。subuid 所有・0700）ロックを取れなかった。木の
+        /// (dev, ino) を持つ。権限が `SubordinateIds` なら userns の子の中で続きを行う（#2769・SEC-5）。
+        LockDenied((u64, u64)),
         Orphan(Orphan),
     }
 
@@ -1289,6 +1639,38 @@ mod imp {
         identity: (u64, u64),
         token: String,
         _lock: File,
+    }
+
+    /// [`check_marker`] が証拠として認めなかった理由。
+    enum MarkerVerdict {
+        /// 印が無い・形式や所有者・mode が合わない・木の実体と一致しない。
+        Unverified,
+        /// 印の状態ルートの識別子が現在のストアと一致しない・無い（#2635）。
+        ForeignStateRoot,
+    }
+
+    /// 固定した木の fd の印を孤児の証拠として照合する（ホストの `inspect_published` と、userns の子の
+    /// 孤児の回収〔#2769〕が共有する）。
+    ///
+    /// 印は v2 以降（同一性つき）で、木の実体 `identity` と一致するものだけを証拠にする（v1 や複製された印は
+    /// 残す）。状態ルートの識別子が `expected_scope` と一致する木だけを候補にする（別の状態ルートのコンテナが
+    /// 使う rootfs は、このストアの一覧に見えないだけで孤児ではない。v2・識別子の無いストアも残す。#2635）。
+    /// userns の子の中でも「所有者が実効 uid」の厳格照合は同じ意味を保つ: 補助の userns はコンテナ 0 を
+    /// ホストの実効 uid に写すので、ホストの実効 uid 所有の印は uid 0 に見え、`geteuid` も 0 を返す。
+    /// subuid 所有の偽の印は 1 以上（写像外なら overflowuid）に見えて拒否される。
+    fn check_marker(
+        dir: BorrowedFd<'_>,
+        identity: (u64, u64),
+        expected_scope: Option<&str>,
+    ) -> Result<Marker, MarkerVerdict> {
+        let marker = read_marker(dir, true).ok_or(MarkerVerdict::Unverified)?;
+        if marker.identity != Some(identity) {
+            return Err(MarkerVerdict::Unverified);
+        }
+        if !matches!((marker.scope.as_deref(), expected_scope), (Some(m), Some(e)) if m == e) {
+            return Err(MarkerVerdict::ForeignStateRoot);
+        }
+        Ok(marker)
     }
 
     /// 親 `cur`（固定済みの fd）の下の最終の名前 `cname` が、孤児の条件（[`super::reap_published_orphan`] の
@@ -1314,8 +1696,11 @@ mod imp {
         if mount_id(cur) != Some(mnt) {
             return Probe::Unverified;
         }
-        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-            return Probe::Unverified;
+        let lock = match File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+            Ok(lock) => lock,
+            // 最上位が subuid 所有・0700 の木はホストの uid では開けない。続きは呼び出し側が判断する。
+            Err(e) if e.raw_os_error() == Some(sys::EACCES) => return Probe::LockDenied(identity),
+            Err(_) => return Probe::Unverified,
         };
         match lock.try_lock() {
             Ok(()) => {}
@@ -1330,18 +1715,11 @@ mod imp {
             Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
             Err(_) => return Probe::Unverified,
         }
-        // 印は v2 以降（同一性つき）で、木の実体と一致するものだけを証拠にする。v1 や複製された印は残す。
-        let Some(marker) = read_marker(fd.as_fd(), true) else {
-            return Probe::Unverified;
+        let marker = match check_marker(fd.as_fd(), identity, expected_scope) {
+            Ok(m) => m,
+            Err(MarkerVerdict::Unverified) => return Probe::Unverified,
+            Err(MarkerVerdict::ForeignStateRoot) => return Probe::ForeignStateRoot,
         };
-        if marker.identity != Some(identity) {
-            return Probe::Unverified;
-        }
-        // 状態ルートの識別子が現在のストアと一致する木だけを孤児の候補にする（別の状態ルートのコンテナが
-        // 使う rootfs は、このストアの一覧に見えないだけで孤児ではない。v2・識別子の無いストアも残す。#2635）。
-        if !matches!((marker.scope.as_deref(), expected_scope), (Some(m), Some(e)) if m == e) {
-            return Probe::ForeignStateRoot;
-        }
         Probe::Orphan(Orphan {
             identity,
             token: marker.token,
@@ -1349,11 +1727,33 @@ mod imp {
         })
     }
 
-    /// `store` の全レコードを調べ、印のトークンを持つもの・同じ bundle を指すものがあるか。
+    /// `store` の走査結果（孤児の判定の材料）。
+    struct StoreRefs {
+        /// 同じ bundle（同じ実体を含む）を指すレコードがある。
+        bundle_referenced: bool,
+        /// 全レコードの rootfs の印のトークン（`bundle_referenced` で打ち切ったときは途中まで）。
+        /// 件数は `ORPHAN_SCAN_MAX_PAGES × ORPHAN_SCAN_PAGE_SIZE` 件（10 万）が上限で、トークンは 32 文字。
+        tokens: Vec<String>,
+    }
+
+    impl StoreRefs {
+        fn references(&self, token: &str) -> bool {
+            self.bundle_referenced || self.tokens.iter().any(|t| t == token)
+        }
+    }
+
+    /// `store` の全レコードを調べ、同じ bundle を指すものと印のトークンの一覧を集める。
     /// 一覧の失敗・ページ数の上限超過・bundle の同一性を確かめられない場合は `None`（不明。呼び出し側は残す）。
-    fn store_references(store: &dyn StateStore, bundle: &Path, token: &str) -> Option<bool> {
+    ///
+    /// userns の子は `store` に触れない（`@lock` を持つファイルストアや plugin 実装に子の触れる範囲を
+    /// 広げない）ため、親がこの関数で先に走査し、結果だけを子へ渡す（#2769）。
+    fn scan_store_refs(store: &dyn StateStore, bundle: &Path) -> Option<StoreRefs> {
         let bundle_meta = std::fs::metadata(bundle).ok()?;
         let page_size = std::num::NonZeroU32::new(ORPHAN_SCAN_PAGE_SIZE)?;
+        let mut refs = StoreRefs {
+            bundle_referenced: false,
+            tokens: Vec::new(),
+        };
         let mut cursor = None;
         for _ in 0..ORPHAN_SCAN_MAX_PAGES {
             let mut req = ListStateRequest::new(page_size).ok()?;
@@ -1362,15 +1762,17 @@ mod imp {
             }
             let page = store.list(&req).ok()?;
             for rec in page.records() {
-                if rec.image_rootfs().and_then(ImageRootfsRecord::token) == Some(token) {
-                    return Some(true);
+                if let Some(t) = rec.image_rootfs().and_then(ImageRootfsRecord::token) {
+                    refs.tokens.push(t.to_owned());
                 }
                 if rec.bundle() == bundle {
-                    return Some(true);
+                    refs.bundle_referenced = true;
+                    return Some(refs);
                 }
                 match std::fs::metadata(rec.bundle()) {
                     Ok(m) if (m.dev(), m.ino()) == (bundle_meta.dev(), bundle_meta.ino()) => {
-                        return Some(true);
+                        refs.bundle_referenced = true;
+                        return Some(refs);
                     }
                     Ok(_) => {}
                     // 相手の bundle が無ければ別物。それ以外の失敗は判定不能として残す。
@@ -1379,13 +1781,87 @@ mod imp {
                 }
             }
             match page.next_cursor() {
-                None => return Some(false),
+                None => return Some(refs),
                 Some(c) => cursor = Some(c.clone()),
             }
         }
         None
     }
 
+    // userns の子（孤児の回収）の終了コード。削除 10〜16・publish 20〜24・seal 30〜34 と重ねない。
+    const CHILD_MARKER_UNVERIFIED: i32 = 17;
+    const CHILD_FOREIGN_STATE_ROOT: i32 = 18;
+    const CHILD_REFERENCED: i32 = 19;
+
+    /// 孤児の回収の子の終了コードを [`OrphanReap`] へ写す（純関数）。
+    ///
+    /// fork の前の失敗（木に触れていない）は `Unverified`、fork の後の失敗（子が削除の途中まで進んだ可能性が
+    /// ある）は `Failed`。確かめられないものはすべて残す側（OCI-7）。
+    fn orphan_outcome(run: Result<i32, UsernsSpawnError>) -> OrphanReap {
+        match run {
+            Ok(CHILD_REMOVED) => OrphanReap::Reclaimed,
+            Ok(CHILD_NOT_PRESENT) => OrphanReap::NotPresent,
+            Ok(CHILD_ALIVE) => OrphanReap::Alive,
+            Ok(CHILD_LOCK_ERROR | CHILD_IDENTITY | CHILD_MARKER_UNVERIFIED | CHILD_REFERENCED) => {
+                OrphanReap::Unverified
+            }
+            Ok(CHILD_FOREIGN_STATE_ROOT) => OrphanReap::ForeignStateRoot,
+            Ok(_) => OrphanReap::Failed,
+            Err(
+                UsernsSpawnError::Inputs(_)
+                | UsernsSpawnError::Plan(_)
+                | UsernsSpawnError::MultiThreaded
+                | UsernsSpawnError::ForkOther,
+            ) => OrphanReap::Unverified,
+            Err(UsernsSpawnError::Timeout | UsernsSpawnError::WaitOther) => OrphanReap::Failed,
+        }
+    }
+
+    /// ホストの実効 uid ではロックを取れない subuid 所有・0700 の公開済みの木を、userns の子の中で
+    /// 孤児と確かめて回収する（#2769・OCI-7・SEC-5）。
+    ///
+    /// 呼び出し元は `BundleLock` を保持している。親は先に `store` を走査して結果だけを子へ渡し、参照が
+    /// ある・走査できないなら fork せずに残す。子は `lock_and_recheck` でロックを取り、そのまま保持して
+    /// 印の照合（`check_marker`）→ トークンの参照確認 → 削除（`remove_tree_at` が印を再照合）まで行う。
+    /// 子から親へは終了コードだけを運ぶ。
+    fn orphan_reap_in_userns(
+        source: &SubordinateIdSource,
+        store: &dyn StateStore,
+        bundle: &Path,
+        cur: BorrowedFd<'_>,
+        cname: &CString,
+        identity: (u64, u64),
+        expected_scope: Option<&str>,
+    ) -> OrphanReap {
+        let Some(refs) = scan_store_refs(store, bundle) else {
+            return OrphanReap::Unverified;
+        };
+        if refs.bundle_referenced {
+            return OrphanReap::Unverified;
+        }
+        let run = spawn_in_userns(source, USERNS_REMOVE_BUDGET, || {
+            let locked = match lock_and_recheck(cur, cname, identity) {
+                Ok(l) => l,
+                Err(f) => return f.code(),
+            };
+            let marker = match check_marker(locked.dir.as_fd(), identity, expected_scope) {
+                Ok(m) => m,
+                Err(MarkerVerdict::Unverified) => return CHILD_MARKER_UNVERIFIED,
+                Err(MarkerVerdict::ForeignStateRoot) => return CHILD_FOREIGN_STATE_ROOT,
+            };
+            if refs.references(&marker.token) {
+                return CHILD_REFERENCED;
+            }
+            // ロック（`locked`）は削除が終わるまで保持する。
+            remove_exit_code(remove_tree_at(
+                cur,
+                cname,
+                identity,
+                Owner::Token(Some(&marker.token)),
+            ))
+        });
+        orphan_outcome(run)
+    }
     pub(super) fn reap_published_orphan(
         store: &dyn StateStore,
         bundle: &Path,
@@ -1423,10 +1899,26 @@ mod imp {
             Probe::Alive => return OrphanReap::Alive,
             Probe::Unverified => return OrphanReap::Unverified,
             Probe::ForeignStateRoot => return OrphanReap::ForeignStateRoot,
+            // 暗黙に昇格しない: 権限が `SubordinateIds` のときだけ userns の子で続ける（#2769）。
+            Probe::LockDenied(identity) => {
+                return match privilege {
+                    ImageRootfsPrivilege::SubordinateIds(source) => orphan_reap_in_userns(
+                        source,
+                        store,
+                        bundle,
+                        cur.as_fd(),
+                        &cname,
+                        identity,
+                        expected_scope.as_deref(),
+                    ),
+                    _ => OrphanReap::Unverified,
+                };
+            }
             Probe::Orphan(o) => o,
         };
-        if store_references(store, bundle, &orphan.token) != Some(false) {
-            return OrphanReap::Unverified;
+        match scan_store_refs(store, bundle) {
+            Some(refs) if !refs.references(&orphan.token) => {}
+            _ => return OrphanReap::Unverified,
         }
         match remove_tree_priv(
             privilege,
@@ -1687,6 +2179,108 @@ mod imp {
         }
     }
 
+    /// 子の中でロックを取り直した結果の失敗（終了コードへ写す）。
+    enum ChildLockFail {
+        Alive,
+        LockError,
+        Identity,
+        Gone,
+    }
+
+    impl ChildLockFail {
+        fn code(self) -> i32 {
+            match self {
+                Self::Alive => CHILD_ALIVE,
+                Self::LockError => CHILD_LOCK_ERROR,
+                Self::Identity => CHILD_IDENTITY,
+                Self::Gone => CHILD_NOT_PRESENT,
+            }
+        }
+    }
+
+    /// 子が保持するロックと、同一性を再確認した木の fd（ロックは保持している間だけ有効）。
+    struct ChildLocked {
+        _lock: File,
+        dir: OwnedFd,
+    }
+
+    /// userns の子の中で、`name` の木に `flock` を取り、名前から開き直した実体の (dev, ino) が `identity` と
+    /// 一致することを確かめる（ホストの uid では開けない 0700 の木用。#2540・#2769）。
+    ///
+    /// 削除の `lock_in_child` と孤児の回収の子が共有する。ホスト側の `reap_one` / `inspect_published` の
+    /// ロック処理とは別に保つ（挙動の差があるため）。
+    fn lock_and_recheck(
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+    ) -> Result<ChildLocked, ChildLockFail> {
+        let fd = sys::open_dir_path_nofollow(Some(parent), name)
+            .map_err(|_| ChildLockFail::LockError)?;
+        let lock = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .map_err(|_| ChildLockFail::LockError)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(ChildLockFail::Alive),
+            Err(_) => return Err(ChildLockFail::LockError),
+        }
+        match sys::open_dir_path_nofollow(Some(parent), name) {
+            Ok(again) => match fstat(again.as_fd()) {
+                Ok((dev, ino, true, _)) if (dev, ino) == identity => Ok(ChildLocked {
+                    _lock: lock,
+                    dir: again,
+                }),
+                _ => Err(ChildLockFail::Identity),
+            },
+            Err(SysError::Os(n)) if n == sys::ENOENT => Err(ChildLockFail::Gone),
+            Err(_) => Err(ChildLockFail::Identity),
+        }
+    }
+
+    /// `remove_tree_at` の結果を userns の子の終了コードへ写す。
+    fn remove_exit_code(result: Result<RecordedRootfsRemoval, TraitError>) -> i32 {
+        match result {
+            Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
+            Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
+            Err(_) => CHILD_FAILED,
+        }
+    }
+
+    /// 削除側の [`spawn_in_userns`] の失敗を、従来の文言・コードの [`TraitError`] へ写す（純関数）。
+    fn removal_spawn_error(e: UsernsSpawnError) -> TraitError {
+        let unavailable = |code: ErrorCode| {
+            TraitError::new(
+                code,
+                "cannot remove a subordinate-owned rootfs in a user namespace",
+            )
+        };
+        match e {
+            UsernsSpawnError::Inputs(e) => e,
+            UsernsSpawnError::Plan(c) => unavailable(c),
+            UsernsSpawnError::MultiThreaded => unavailable(ErrorCode::FailedPrecondition),
+            UsernsSpawnError::ForkOther => unavailable(ErrorCode::Internal),
+            UsernsSpawnError::Timeout => TraitError::new(
+                ErrorCode::Timeout,
+                "removing a subordinate-owned rootfs timed out",
+            ),
+            UsernsSpawnError::WaitOther => remove_failed(),
+        }
+    }
+
+    /// 削除側の子の終了コードを結果へ写す（純関数）。`lock_in_child` のときだけ
+    /// `Alive` / `LockError` / `Identity` が出る。
+    fn removal_outcome(code: i32, lock_in_child: bool) -> Result<UsernsOutcome, TraitError> {
+        match code {
+            CHILD_REMOVED => Ok(UsernsOutcome::Removed),
+            CHILD_NOT_PRESENT => Ok(UsernsOutcome::NotPresent),
+            CHILD_ALIVE if lock_in_child => Ok(UsernsOutcome::Alive),
+            CHILD_LOCK_ERROR if lock_in_child => Ok(UsernsOutcome::LockError),
+            CHILD_IDENTITY if lock_in_child => Ok(UsernsOutcome::Identity),
+            CHILD_REFUSED => Err(refuse()),
+            _ => Err(remove_failed()),
+        }
+    }
+
     /// [`remove_tree_in_userns`] の本体。`lock_in_child` なら、子が userns に入った後で木に `flock` を取り、
     /// 名前から開き直した実体の同一性を再確認してから削除する（ホストの uid では開けない 0700 の木用）。
     fn userns_run(
@@ -1697,88 +2291,20 @@ mod imp {
         owner: Owner<'_>,
         lock_in_child: bool,
     ) -> Result<UsernsOutcome, TraitError> {
-        let unavailable = |code: ErrorCode| {
-            TraitError::new(
-                code,
-                "cannot remove a subordinate-owned rootfs in a user namespace",
-            )
-        };
-        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
-        let inputs = source.removal_inputs(euid, egid)?;
-        let config = IsolationConfig {
-            namespaces: NamespaceSet::empty().with(Namespace::User),
-            hostname: None,
-        };
-        let helper_timeout = inputs.timeout;
-        let plan = plan_rootless_subordinate(
-            &config,
-            inputs.uid,
-            inputs.gid,
-            inputs.writer,
-            helper_timeout,
-        )
-        .map_err(|e| unavailable(e.code))?;
-        let pid = sys::fork_single_threaded(
-            || {
-                if isolate_rootless_subordinate(&plan).is_err() {
-                    return CHILD_SETUP_FAILED;
+        let code = spawn_in_userns(source, USERNS_REMOVE_BUDGET, || {
+            // ロックは子の終了（`_exit`）まで保持する。
+            let _locked;
+            if lock_in_child {
+                match lock_and_recheck(parent, name, identity) {
+                    Ok(l) => _locked = l,
+                    Err(f) => return f.code(),
                 }
-                // ロックは子の終了（`_exit`）まで保持する。
-                let _lock;
-                if lock_in_child {
-                    let Ok(fd) = sys::open_dir_path_nofollow(Some(parent), name) else {
-                        return CHILD_LOCK_ERROR;
-                    };
-                    let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-                        return CHILD_LOCK_ERROR;
-                    };
-                    match lock.try_lock() {
-                        Ok(()) => {}
-                        Err(std::fs::TryLockError::WouldBlock) => return CHILD_ALIVE,
-                        Err(_) => return CHILD_LOCK_ERROR,
-                    }
-                    _lock = lock;
-                    match sys::open_dir_path_nofollow(Some(parent), name) {
-                        Ok(again) => match fstat(again.as_fd()) {
-                            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
-                            _ => return CHILD_IDENTITY,
-                        },
-                        Err(SysError::Os(n)) if n == sys::ENOENT => return CHILD_NOT_PRESENT,
-                        Err(_) => return CHILD_IDENTITY,
-                    }
-                }
-                match remove_tree_at(parent, name, identity, owner) {
-                    Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
-                    Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
-                    Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
-                    Err(_) => CHILD_FAILED,
-                }
-            },
-            CHILD_SETUP_FAILED,
-        )
-        .map_err(|e| match e {
-            SysError::MultiThreaded => unavailable(ErrorCode::FailedPrecondition),
-            _ => unavailable(ErrorCode::Internal),
-        })?;
-        // 写像の書き込み（holder の待ちを含む最大 3 × 期限 + 5 秒）と削除の予算を合わせた期限。
-        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_REMOVE_BUDGET;
-        match wait_forked_child(pid, budget) {
-            Ok(ChildExit::Exited(CHILD_REMOVED)) => Ok(UsernsOutcome::Removed),
-            Ok(ChildExit::Exited(CHILD_NOT_PRESENT)) => Ok(UsernsOutcome::NotPresent),
-            Ok(ChildExit::Exited(CHILD_ALIVE)) if lock_in_child => Ok(UsernsOutcome::Alive),
-            Ok(ChildExit::Exited(CHILD_LOCK_ERROR)) if lock_in_child => {
-                Ok(UsernsOutcome::LockError)
             }
-            Ok(ChildExit::Exited(CHILD_IDENTITY)) if lock_in_child => Ok(UsernsOutcome::Identity),
-            Ok(ChildExit::Exited(CHILD_REFUSED)) => Err(refuse()),
-            Err(e) if e.code == ErrorCode::Timeout => Err(TraitError::new(
-                ErrorCode::Timeout,
-                "removing a subordinate-owned rootfs timed out",
-            )),
-            _ => Err(remove_failed()),
-        }
+            remove_exit_code(remove_tree_at(parent, name, identity, owner))
+        })
+        .map_err(removal_spawn_error)?;
+        removal_outcome(code, lock_in_child)
     }
-
     /// 展開途中の木の所有者として受ける uid（実効 uid。権限が `SubordinateIds` なら subuid の範囲も）。
     struct OwnerPolicy {
         euid: u32,
@@ -1926,9 +2452,7 @@ mod imp {
     /// fd の属するマウント ID（fdinfo の `mnt_id`）。経路の文字列に依存せず、固定した fd の実体で判定する
     /// （改名・bind mount の別名・非 UTF-8 の名前の影響を受けない。SEC-1）。読めない場合は `None`。
     fn mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
-        let text =
-            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
-        crate::oci_runtime::mountinfo_identity::parse_fdinfo_mnt_id(&text)
+        crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(fd).ok()
     }
 
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。
@@ -2012,6 +2536,260 @@ mod imp {
         }
         Ok(())
     }
+
+    /// OCI-7・SEC-5・#2690: seal / publish の実行場所の分岐と、userns の子の終了コードの写し方。
+    #[cfg(test)]
+    mod finalize_tests {
+        use super::*;
+
+        fn sub() -> ImageRootfsPrivilege {
+            let source = SubordinateIdSource::with_id_files(
+                None,
+                Path::new("/nonexistent/subuid"),
+                Path::new("/nonexistent/subgid"),
+            )
+            .expect("source");
+            ImageRootfsPrivilege::SubordinateIds(source)
+        }
+
+        #[test]
+        fn route_host_when_owner_is_euid_or_unknown() {
+            let p = sub();
+            assert!(matches!(
+                finalize_route(Some(1000), 1000, &p),
+                FinalizeRoute::Host { foreign: false }
+            ));
+            assert!(matches!(
+                finalize_route(None, 1000, &p),
+                FinalizeRoute::Host { foreign: false }
+            ));
+        }
+
+        #[test]
+        fn route_foreign_host_effective_ids_stays_on_host() {
+            assert!(matches!(
+                finalize_route(Some(100_000), 1000, &HOST_PRIVILEGE),
+                FinalizeRoute::Host { foreign: true }
+            ));
+        }
+
+        #[test]
+        fn route_userns_when_foreign_and_subordinate() {
+            let p = sub();
+            assert!(matches!(
+                finalize_route(Some(100_000), 1000, &p),
+                FinalizeRoute::Userns(_)
+            ));
+        }
+
+        #[test]
+        fn seal_outcome_maps_every_exit_code() {
+            assert!(seal_outcome(Ok(SEAL_OK)).is_ok());
+            let e = seal_outcome(Ok(SEAL_EXISTS)).expect_err("exists");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            let e = seal_outcome(Ok(SEAL_WIDEN_FAILED)).expect_err("widen");
+            assert_eq!(e.code(), ErrorCode::Internal);
+            assert!(e.message().contains("cannot make unpacked root writable"));
+            let e = seal_outcome(Ok(SEAL_WRITE_FAILED)).expect_err("write");
+            assert!(e.message().contains("cannot make unpacked root writable"));
+            let e = seal_outcome(Ok(SEAL_RESTORE_FAILED)).expect_err("restore");
+            assert_eq!(e.message(), "failed to restore rootfs mode");
+            let e = seal_outcome(Ok(CHILD_SETUP_FAILED)).expect_err("setup");
+            assert_eq!(e.code(), ErrorCode::Internal);
+            let e = seal_outcome(Err(UsernsRunError::MultiThreaded)).expect_err("mt");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            let e = seal_outcome(Err(UsernsRunError::Timeout)).expect_err("timeout");
+            assert_eq!(e.code(), ErrorCode::Timeout);
+        }
+
+        #[test]
+        fn publish_outcome_observation_decides_published() {
+            let (p, r) = publish_outcome(Ok(PUB_RENAMED), true);
+            assert!(p && r.is_ok());
+            // 期限切れで kill しても、改名が済んでいれば公開済みとして残す（削除しない）が、
+            // mode の復元を確認できないので成功にはしない（Timeout のエラーで返す）。
+            let (p, r) = publish_outcome(Err(UsernsRunError::Timeout), true);
+            assert!(p);
+            assert_eq!(r.expect_err("timeout").code(), ErrorCode::Timeout);
+            // 改名の後に異常終了した子も同様（復元前に止まった可能性）。
+            let (p, r) = publish_outcome(Ok(99), true);
+            assert!(p);
+            assert_eq!(
+                r.expect_err("abnormal").message(),
+                "failed to restore rootfs mode"
+            );
+            let (p, r) = publish_outcome(Err(UsernsRunError::Other(ErrorCode::Internal)), true);
+            assert!(p);
+            assert_eq!(r.expect_err("other").code(), ErrorCode::Internal);
+            let (p, r) = publish_outcome(Ok(PUB_RESTORE_FAILED), true);
+            assert!(p);
+            assert_eq!(
+                r.expect_err("restore").message(),
+                "failed to restore rootfs mode"
+            );
+            let (p, r) = publish_outcome(Ok(PUB_EXISTS), false);
+            assert!(!p);
+            assert_eq!(r.expect_err("exists").code(), ErrorCode::AlreadyExists);
+            let (p, r) = publish_outcome(Ok(PUB_WIDEN_FAILED), false);
+            assert!(!p);
+            assert!(
+                r.expect_err("widen")
+                    .message()
+                    .contains("cannot make unpacked root writable")
+            );
+            // 改名したと言うのに観測できない場合は成功を装わない。
+            let (p, r) = publish_outcome(Ok(PUB_RENAMED), false);
+            assert!(!p);
+            assert_eq!(r.expect_err("refuse").code(), ErrorCode::FailedPrecondition);
+            let (_, r) = publish_outcome(Ok(PUB_RENAME_FAILED), false);
+            assert_eq!(r.expect_err("rename").message(), "failed to publish rootfs");
+            let (_, r) = publish_outcome(Ok(99), false);
+            assert_eq!(r.expect_err("unknown").code(), ErrorCode::Internal);
+            let (_, r) = publish_outcome(Err(UsernsRunError::MultiThreaded), false);
+            assert_eq!(r.expect_err("mt").code(), ErrorCode::FailedPrecondition);
+        }
+    }
+
+    /// OCI-7・SEC-5・REPAIR-1・#2769: userns 実行の骨格の共通化後も、削除側の文言・終了コードの写し方が
+    /// 変わらないこと、孤児の回収の子の終了コードの写し方。
+    #[cfg(test)]
+    mod userns_tests {
+        use super::*;
+
+        fn err(code: ErrorCode, message: &str) -> TraitError {
+            TraitError::new(code, message)
+        }
+
+        #[test]
+        fn remove_outcome_maps_every_exit_code() {
+            assert!(matches!(
+                removal_outcome(CHILD_REMOVED, false),
+                Ok(UsernsOutcome::Removed)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_NOT_PRESENT, false),
+                Ok(UsernsOutcome::NotPresent)
+            ));
+            for lock in [false, true] {
+                assert_eq!(
+                    removal_outcome(CHILD_REFUSED, lock).err(),
+                    Some(err(
+                        ErrorCode::FailedPrecondition,
+                        "rootfs was replaced; refusing to remove"
+                    ))
+                );
+                for code in [CHILD_FAILED, CHILD_SETUP_FAILED, 99, 125] {
+                    assert_eq!(
+                        removal_outcome(code, lock).err(),
+                        Some(err(ErrorCode::Internal, "failed to remove rootfs"))
+                    );
+                }
+            }
+            assert!(matches!(
+                removal_outcome(CHILD_ALIVE, true),
+                Ok(UsernsOutcome::Alive)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_LOCK_ERROR, true),
+                Ok(UsernsOutcome::LockError)
+            ));
+            assert!(matches!(
+                removal_outcome(CHILD_IDENTITY, true),
+                Ok(UsernsOutcome::Identity)
+            ));
+            // lock_in_child でないときのロック系の終了コードは削除の失敗として扱う。
+            for code in [CHILD_ALIVE, CHILD_LOCK_ERROR, CHILD_IDENTITY] {
+                assert_eq!(
+                    removal_outcome(code, false).err(),
+                    Some(err(ErrorCode::Internal, "failed to remove rootfs"))
+                );
+            }
+        }
+
+        #[test]
+        fn remove_spawn_error_keeps_wording() {
+            let unavailable = "cannot remove a subordinate-owned rootfs in a user namespace";
+            let inputs = err(ErrorCode::NotFound, "no subordinate ids");
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Inputs(inputs.clone())),
+                inputs
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Plan(ErrorCode::Unavailable)),
+                err(ErrorCode::Unavailable, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::MultiThreaded),
+                err(ErrorCode::FailedPrecondition, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::ForkOther),
+                err(ErrorCode::Internal, unavailable)
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::Timeout),
+                err(
+                    ErrorCode::Timeout,
+                    "removing a subordinate-owned rootfs timed out"
+                )
+            );
+            assert_eq!(
+                removal_spawn_error(UsernsSpawnError::WaitOther),
+                err(ErrorCode::Internal, "failed to remove rootfs")
+            );
+        }
+
+        #[test]
+        fn orphan_outcome_maps_every_exit_code() {
+            assert_eq!(orphan_outcome(Ok(CHILD_REMOVED)), OrphanReap::Reclaimed);
+            assert_eq!(
+                orphan_outcome(Ok(CHILD_NOT_PRESENT)),
+                OrphanReap::NotPresent
+            );
+            assert_eq!(orphan_outcome(Ok(CHILD_ALIVE)), OrphanReap::Alive);
+            for code in [
+                CHILD_LOCK_ERROR,
+                CHILD_IDENTITY,
+                CHILD_MARKER_UNVERIFIED,
+                CHILD_REFERENCED,
+            ] {
+                assert_eq!(orphan_outcome(Ok(code)), OrphanReap::Unverified);
+            }
+            assert_eq!(
+                orphan_outcome(Ok(CHILD_FOREIGN_STATE_ROOT)),
+                OrphanReap::ForeignStateRoot
+            );
+            for code in [CHILD_REFUSED, CHILD_FAILED, CHILD_SETUP_FAILED, 99] {
+                assert_eq!(orphan_outcome(Ok(code)), OrphanReap::Failed);
+            }
+            // fork の前の失敗は木に触れていないので Unverified、後の失敗は Failed。
+            for e in [
+                UsernsSpawnError::Inputs(err(ErrorCode::NotFound, "x")),
+                UsernsSpawnError::Plan(ErrorCode::Internal),
+                UsernsSpawnError::MultiThreaded,
+                UsernsSpawnError::ForkOther,
+            ] {
+                assert_eq!(orphan_outcome(Err(e)), OrphanReap::Unverified);
+            }
+            for e in [UsernsSpawnError::Timeout, UsernsSpawnError::WaitOther] {
+                assert_eq!(orphan_outcome(Err(e)), OrphanReap::Failed);
+            }
+        }
+
+        #[test]
+        fn orphan_child_exit_codes_do_not_overlap_existing_ones() {
+            let orphan = [
+                CHILD_MARKER_UNVERIFIED,
+                CHILD_FOREIGN_STATE_ROOT,
+                CHILD_REFERENCED,
+            ];
+            assert_eq!(orphan, [17, 18, 19]);
+            for code in orphan {
+                assert!(![CHILD_REMOVED, 10, 11, 12, 13, 14, 15, 16].contains(&code));
+                assert!(!(20..=24).contains(&code) && !(30..=34).contains(&code));
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2037,7 +2815,10 @@ mod imp {
         path.to_path_buf()
     }
 
-    pub(super) fn publish(_b: &mut Backing) -> Result<(), TraitError> {
+    pub(super) fn publish(
+        _b: &mut Backing,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         Ok(())
     }
 
@@ -2094,7 +2875,11 @@ mod imp {
     }
 
     /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
-    pub(super) fn seal(_b: &mut Backing, _scope: Option<&str>) -> Result<(), TraitError> {
+    pub(super) fn seal(
+        _b: &mut Backing,
+        _scope: Option<&str>,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "image rootfs requires Linux",
@@ -2132,24 +2917,16 @@ mod imp {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        // 呼び出しごとに固有（並行する試験が同じ名前を使っても相手のディレクトリを消さない。REPAIR-12）。
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-image-rootfs-{name}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        dir
+    fn tmp(name: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-image-rootfs-{name}"), "d")
     }
 
     /// OCI-7・SEC-1: 公開後の最終の経路が別の実体（同名の差し替え）なら展開した実体と見なさない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_is_unpacked_at_rejects_replaced_directory() {
-        let b = tmp("replaced");
+        let (_scratch, b) = tmp("replaced");
         std::fs::create_dir(b.join("p")).expect("parent");
         let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         c.publish().expect("publish");
@@ -2157,14 +2934,13 @@ mod tests {
         std::fs::rename(b.join("p"), b.join("moved")).expect("rename");
         std::fs::create_dir_all(b.join("p/rootfs")).expect("new");
         assert!(!c.is_unpacked_at(&b.join("p/rootfs")));
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 空の rootfs を作り、展開先の経路へ書いて公開し、remove で消せる。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_creates_empty_dir_publishes_and_remove_deletes_it() {
-        let b = tmp("basic");
+        let (_scratch, b) = tmp("basic");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
         // 公開前は最終の名前に存在しない（他の create から rootfs として見えない）。
@@ -2176,14 +2952,13 @@ mod tests {
         assert!(b.join("rootfs").join("f").exists());
         c.remove().expect("remove");
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 既存の rootfs・bundle 自身・`..` は拒否し、既存の中身に触れない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_rejects_existing_bundle_itself_and_parent_dir() {
-        let b = tmp("reject");
+        let (_scratch, b) = tmp("reject");
         std::fs::create_dir(b.join("rootfs")).expect("mk");
         std::fs::write(b.join("rootfs").join("keep"), b"x").expect("w");
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("exists");
@@ -2193,7 +2968,6 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         let e = prepare_rootfs_target(&b, Path::new("../x")).expect_err("parent");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 読み取り専用 mode の木も権限を補正して消せる。
@@ -2201,7 +2975,7 @@ mod tests {
     #[test]
     fn oci7_remove_restores_permissions_for_read_only_tree() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("ro");
+        let (_scratch, b) = tmp("ro");
         let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let sub = c.unpack_path().join("sub");
         std::fs::create_dir(&sub).expect("sub");
@@ -2209,7 +2983,6 @@ mod tests {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("ro");
         c.remove().expect("remove");
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 中間要素が symlink なら拒否し、bundle 外に何も作らない。
@@ -2217,22 +2990,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn oci7_prepare_rejects_symlink_parent() {
-        let b = tmp("symparent");
-        let outside = tmp("symparent-out");
+        let (_scratch, b) = tmp("symparent");
+        let (_scratch, outside) = tmp("symparent-out");
         std::os::unix::fs::symlink(&outside, b.join("link")).expect("symlink");
         let e = prepare_rootfs_target(&b, Path::new("link/rootfs")).expect_err("symlink");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(std::fs::read_dir(&outside).expect("read").count(), 0);
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 差し替えられた rootfs（symlink）は消さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_refuses_replaced_rootfs() {
-        let b = tmp("replaced");
-        let outside = tmp("replaced-out");
+        let (_scratch, b) = tmp("replaced");
+        let (_scratch, outside) = tmp("replaced-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         c.publish().expect("publish");
@@ -2241,8 +3012,6 @@ mod tests {
         let e = c.remove().expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("marker").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 作成後に親ディレクトリが symlink へ差し替えられても、後始末は固定済みの親の下だけを消し、
@@ -2250,8 +3019,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_ignores_parent_swapped_for_symlink() {
-        let b = tmp("parentswap");
-        let outside = tmp("parentswap-out");
+        let (_scratch, b) = tmp("parentswap");
+        let (_scratch, outside) = tmp("parentswap-out");
         std::fs::create_dir(b.join("p")).expect("p");
         let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("mine"), b"x").expect("mine");
@@ -2263,16 +3032,14 @@ mod tests {
         c.remove().expect("remove");
         assert!(outside.join("rootfs").join("marker").exists());
         assert!(!b.join("p_moved").join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 後始末は木の内側の symlink を辿らず、リンク自体だけを消す。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_does_not_follow_symlinks_inside_tree() {
-        let b = tmp("innerlink");
-        let outside = tmp("innerlink-out");
+        let (_scratch, b) = tmp("innerlink");
+        let (_scratch, outside) = tmp("innerlink-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::os::unix::fs::symlink(&outside, c.unpack_path().join("dirlink")).expect("symlink");
@@ -2280,19 +3047,16 @@ mod tests {
         c.remove().expect("remove");
         assert!(outside.join("marker").exists());
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 展開中の非公開の名前（予約名）は root.path として拒否する。
     #[test]
     fn oci7_prepare_rejects_reserved_staging_name() {
-        let b = tmp("reserved");
+        let (_scratch, b) = tmp("reserved");
         let e = prepare_rootfs_target(&b, Path::new(".fandhe-unpack-1-0")).expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(has_staging_component(Path::new("a/.fandhe-unpack-x/b")));
         assert!(!has_staging_component(Path::new("a/rootfs")));
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: setgid の親の下で 02700 になる展開先も採用できる。
@@ -2300,32 +3064,30 @@ mod tests {
     #[test]
     fn oci7_prepare_accepts_setgid_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("setgid");
+        let (_scratch, b) = tmp("setgid");
         std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o2755)).expect("setgid");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         c.publish().expect("publish");
         assert!(c.is_published());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 返す経路は正規化済みで、等価な書き方の `root.path` でも同じ場所に作る。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_normalizes_path() {
-        let b = tmp("normalize");
+        let (_scratch, b) = tmp("normalize");
         let mut c = prepare_rootfs_target(&b, Path::new("./rootfs/")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
         c.publish().expect("publish");
         assert!(b.join("rootfs").is_dir());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1: 展開先は固定した rootfs の fd を指し、作成後に親を symlink へ差し替えても bundle 外へ書かない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_unpack_path_survives_parent_swap() {
-        let b = tmp("unpackswap");
-        let outside = tmp("unpackswap-out");
+        let (_scratch, b) = tmp("unpackswap");
+        let (_scratch, outside) = tmp("unpackswap-out");
         std::fs::create_dir(b.join("p")).expect("p");
         let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
         std::fs::rename(b.join("p"), b.join("p_moved")).expect("move");
@@ -2336,15 +3098,13 @@ mod tests {
             std::fs::read_dir(b.join("p_moved")).expect("read").count(),
             1
         );
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 最終の名前が公開前に作られていたら、公開は置き換えずに拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_publish_refuses_when_final_name_appeared() {
-        let b = tmp("pubrace");
+        let (_scratch, b) = tmp("pubrace");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::create_dir(b.join("rootfs")).expect("mk");
         std::fs::write(b.join("rootfs").join("keep"), b"x").expect("w");
@@ -2353,7 +3113,6 @@ mod tests {
         assert!(b.join("rootfs").join("keep").exists());
         c.remove().expect("remove staging");
         assert!(b.join("rootfs").join("keep").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// 公開済みの rootfs を作り、記録を返す（`<b>/<rel>` に `f` を置く）。
@@ -2372,7 +3131,7 @@ mod tests {
     #[test]
     fn oci7_seal_works_on_read_only_rootfs_and_restores_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("seal-ro");
+        let (_scratch, b) = tmp("seal-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
@@ -2389,7 +3148,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7（#2378）: 展開器が rootfs 自身から所有者の search 権限まで外しても（0600・0000）、削除側は
@@ -2399,7 +3157,7 @@ mod tests {
     fn oci7_remove_recorded_rootfs_without_owner_search_permission() {
         use std::os::unix::fs::PermissionsExt;
         for (i, m) in [0o600u32, 0o000].into_iter().enumerate() {
-            let b = tmp(&format!("rec-nosearch-{i}"));
+            let (_scratch, b) = tmp(&format!("rec-nosearch-{i}"));
             let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
             std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
             std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(m))
@@ -2413,7 +3171,6 @@ mod tests {
                 "mode {m:o}"
             );
             assert!(!b.join("rootfs").exists());
-            let _ = std::fs::remove_dir_all(&b);
         }
     }
 
@@ -2422,7 +3179,7 @@ mod tests {
     #[test]
     fn sec1_remove_recorded_rootfs_restores_mode_on_token_mismatch() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("rec-nosearch-mismatch");
+        let (_scratch, b) = tmp("rec-nosearch-mismatch");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o000))
@@ -2445,7 +3202,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1（#2378）: 記録した rootfs を手で消して同名のディレクトリを作り直した（印が無い・別の印）
@@ -2453,7 +3209,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_recreated_dir_without_matching_token() {
-        let b = tmp("rec-token");
+        let (_scratch, b) = tmp("rec-token");
         let rec = published_record(&b, "rootfs");
         let token = rec.token().expect("token").to_owned();
         assert_eq!(token.len(), 32);
@@ -2482,14 +3238,13 @@ mod tests {
             .expect("symlink");
         assert!(remove_recorded_rootfs(&b, &rec).is_err());
         assert!(root.join("user-data").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1（#2378）: トークンの無い旧記録は、実体が一致しても消さない（fail-closed）。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_record_without_token() {
-        let b = tmp("rec-notoken");
+        let (_scratch, b) = tmp("rec-notoken");
         let rec = published_record(&b, "rootfs");
         let (dev, ino) = rec.identity();
         let legacy =
@@ -2502,27 +3257,25 @@ mod tests {
             remove_recorded_rootfs(&b, &rec).expect("matching"),
             RecordedRootfsRemoval::Removed
         );
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7（#2378）: 展開済みの木に同名の印のファイルがあれば（イメージ由来の偽の印）採用せず拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_seal_refuses_preexisting_marker() {
-        let b = tmp("seal-pre");
+        let (_scratch, b) = tmp("seal-pre");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join(super::OWNER_TOKEN_FILE), "x").expect("fake");
         let e = c.seal(None).expect_err("exists");
         assert_eq!(e.code(), ErrorCode::AlreadyExists);
         c.remove().expect("cleanup");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 記録から公開済みの rootfs を消せる。bundle と他のファイルは残る。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_deletes_tree() {
-        let b = tmp("rec-del");
+        let (_scratch, b) = tmp("rec-del");
         std::fs::write(b.join("config.json"), b"{}").expect("config");
         let rec = published_record(&b, "rootfs");
         assert_eq!(rec.relative_path(), Path::new("rootfs"));
@@ -2532,14 +3285,13 @@ mod tests {
         );
         assert!(!b.join("rootfs").exists());
         assert!(b.join("config.json").is_file());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 入れ子の `root.path` でも記録の経路で消せる。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_nested_path() {
-        let b = tmp("rec-nested");
+        let (_scratch, b) = tmp("rec-nested");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
         assert_eq!(
@@ -2548,14 +3300,13 @@ mod tests {
         );
         assert!(b.join("p").is_dir());
         assert!(!b.join("p/rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 既に無ければ `NotPresent`（冪等な再実行）。bundle・中間要素が無い場合も同じ。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_recorded_rootfs_absent_is_not_present() {
-        let b = tmp("rec-absent");
+        let (_scratch, b) = tmp("rec-absent");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
         std::fs::remove_dir_all(b.join("p/rootfs")).expect("gone");
@@ -2579,7 +3330,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_replaced_dir() {
-        let b = tmp("rec-replaced");
+        let (_scratch, b) = tmp("rec-replaced");
         let rec = published_record(&b, "rootfs");
         std::fs::rename(b.join("rootfs"), b.join("moved")).expect("move");
         std::fs::create_dir(b.join("rootfs")).expect("replacement");
@@ -2589,24 +3340,22 @@ mod tests {
         assert!(b.join("rootfs/marker").is_file());
 
         std::fs::remove_dir_all(b.join("rootfs")).expect("rm replacement");
-        let outside = tmp("rec-replaced-out");
+        let (_scratch, outside) = tmp("rec-replaced-out");
         std::fs::write(outside.join("marker"), b"o").expect("marker");
         std::os::unix::fs::symlink(&outside, b.join("rootfs")).expect("symlink");
         let e = remove_recorded_rootfs(&b, &rec).expect_err("symlink");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("marker").is_file());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1: 中間要素が bundle 外への symlink に差し替えられても、外側は消さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_parent_symlink_untouched() {
-        let b = tmp("rec-parent");
+        let (_scratch, b) = tmp("rec-parent");
         std::fs::create_dir(b.join("p")).expect("parent");
         let rec = published_record(&b, "p/rootfs");
-        let outside = tmp("rec-parent-out");
+        let (_scratch, outside) = tmp("rec-parent-out");
         std::fs::create_dir(outside.join("rootfs")).expect("outside rootfs");
         std::fs::write(outside.join("rootfs/marker"), b"o").expect("marker");
         std::fs::rename(b.join("p"), b.join("p-moved")).expect("move");
@@ -2614,8 +3363,6 @@ mod tests {
         let e = remove_recorded_rootfs(&b, &rec).expect_err("symlinked parent");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert!(outside.join("rootfs/marker").is_file());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7: 展開時に読み取り専用にされたディレクトリを含む木も消せる。
@@ -2623,7 +3370,7 @@ mod tests {
     #[test]
     fn oci7_remove_recorded_rootfs_handles_read_only_dirs() {
         use std::os::unix::fs::PermissionsExt as _;
-        let b = tmp("rec-ro");
+        let (_scratch, b) = tmp("rec-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let up = c.unpack_path();
         std::fs::create_dir(up.join("ro")).expect("ro");
@@ -2638,18 +3385,16 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・SEC-1: Linux 以外は展開先を固定できないため、作成の前に Unimplemented で拒否する。
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sec1_prepare_refuses_without_fd_pinning() {
-        let b = tmp("winrefuse");
+        let (_scratch, b) = tmp("winrefuse");
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert!(!b.join("rootfs").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// `mkfifo` の終了待ちの期限（REPAIR-5）。
@@ -2686,7 +3431,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_refuses_non_regular_marker() {
-        let b = tmp("marker-fifo");
+        let (_scratch, b) = tmp("marker-fifo");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let marker = root.join(super::OWNER_TOKEN_FILE);
@@ -2702,14 +3447,13 @@ mod tests {
             .expect("must not block");
         assert!(refused);
         assert!(root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・OCI-7: bundle が FIFO に差し替えられても delete は open でブロックせず拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_remove_recorded_rootfs_fifo_bundle_does_not_block() {
-        let b = tmp("fifo-bundle");
+        let (_scratch, b) = tmp("fifo-bundle");
         let fifo = b.join("fifo");
         make_fifo(&fifo);
         let rec = published_record(&b, "rootfs");
@@ -2722,7 +3466,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("must not block");
         assert!(refused);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// 持ち主のいない展開途中の木を `parent` の下に作る（`name` は予約名。中にファイルとサブディレクトリを置く）。
@@ -2742,7 +3485,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_reclaims_staging_left_by_crashed_create() {
-        let b = tmp("reap-crashed");
+        let (_scratch, b) = tmp("reap-crashed");
         let mut published = prepare_rootfs_target(&b, Path::new("rootfs")).expect("first");
         std::fs::write(published.unpack_path().join("keep"), b"x").expect("write");
         published.publish().expect("publish");
@@ -2768,14 +3511,13 @@ mod tests {
         let again = reap_stale_unpacks(&b, Path::new("third")).expect("public");
         assert!(again.reclaimed.is_empty());
         assert_eq!(again.kept_alive.len(), 1, "the live `third` staging");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2379: ロックを保持中の（生きている）create の展開先は回収せず、両方が共存する。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_keeps_live_staging() {
-        let b = tmp("reap-live");
+        let (_scratch, b) = tmp("reap-live");
         let first = prepare_rootfs_target(&b, Path::new("a")).expect("first");
         std::fs::write(first.unpack_path().join("f"), b"x").expect("write");
         let second = prepare_rootfs_target(&b, Path::new("b")).expect("second");
@@ -2790,7 +3532,6 @@ mod tests {
         assert!(r.reclaimed.is_empty());
         first.remove().expect("rm first");
         second.remove().expect("rm second");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2379: PID が再利用されて同じ名前の持ち主のいない木が残っていても、次の create は
@@ -2798,7 +3539,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_reap_resolves_pid_reuse_collision() {
-        let b = tmp("reap-pid-reuse");
+        let (_scratch, b) = tmp("reap-pid-reuse");
         let pid = std::process::id();
         for seq in 0..16 {
             plant_staging(&b, &format!("{STAGING_PREFIX}{pid}-{seq}"));
@@ -2808,7 +3549,6 @@ mod tests {
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         c.publish().expect("publish");
         assert!(b.join("rootfs/f").exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・OCI-7・#2379: 回収は予約名の symlink・通常ファイル・mode が違うディレクトリを辿らず消さず、
@@ -2817,8 +3557,8 @@ mod tests {
     #[test]
     fn sec1_reap_does_not_follow_or_delete_foreign_entries() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-foreign");
-        let outside = tmp("reap-foreign-out");
+        let (_scratch, b) = tmp("reap-foreign");
+        let (_scratch, outside) = tmp("reap-foreign-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
         std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
@@ -2852,8 +3592,6 @@ mod tests {
         assert!(!wide.exists());
         assert!(b.join(".fandhe-unpack-4-").is_dir());
         assert!(b.join(".fandhe-unpack-99999999999-1").is_dir());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// SEC-1・#2379: 持ち主のいない木の中の symlink は辿らず、リンクだけを消す。読み取り専用の木も消せる。
@@ -2861,8 +3599,8 @@ mod tests {
     #[test]
     fn sec1_reap_does_not_follow_symlinks_inside_tree() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-inner");
-        let outside = tmp("reap-inner-out");
+        let (_scratch, b) = tmp("reap-inner");
+        let (_scratch, outside) = tmp("reap-inner-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
         let t = plant_staging(&b, ".fandhe-unpack-5-5");
         std::os::unix::fs::symlink(&outside, t.join("dirlink")).expect("symlink");
@@ -2875,8 +3613,6 @@ mod tests {
         );
         assert!(!t.exists());
         assert!(outside.join("marker").exists());
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7・#2379: 別のプロセス（ここでは別の open file description）がロックを持つ木は生きていると
@@ -2884,7 +3620,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_lock_held_by_other_is_reported_as_alive_not_deleted() {
-        let b = tmp("reap-lock-other");
+        let (_scratch, b) = tmp("reap-lock-other");
         let t = plant_staging(&b, ".fandhe-unpack-6-6");
         let holder = std::fs::File::open(&t).expect("open");
         holder.try_lock().expect("lock");
@@ -2897,7 +3633,6 @@ mod tests {
         drop(holder);
         let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
         assert_eq!(r.reclaimed.len(), 1);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// REPAIR-4・#2379: 親が書込・探索可能だが読めない（走査できない）とき、create は成功するが回収は
@@ -2906,7 +3641,7 @@ mod tests {
     #[test]
     fn repair4_reap_reports_scan_failure_for_unreadable_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("reap-unreadable");
+        let (_scratch, b) = tmp("reap-unreadable");
         std::fs::create_dir(b.join("p")).expect("p");
         std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o300))
             .expect("chmod");
@@ -2929,15 +3664,14 @@ mod tests {
         let clean = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
         assert!(!clean.scan_failed);
         assert!(!clean.is_incomplete());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// SEC-1・#2379: 公開入口は `prepare_rootfs_target` と同じ経路検査を通す（`..`・予約名・bundle 自身・symlink の親）。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_reap_stale_unpacks_validates_paths() {
-        let b = tmp("reap-paths");
-        let outside = tmp("reap-paths-out");
+        let (_scratch, b) = tmp("reap-paths");
+        let (_scratch, outside) = tmp("reap-paths-out");
         plant_staging(&outside, ".fandhe-unpack-7-7");
         std::os::unix::fs::symlink(&outside, b.join("link")).expect("symlink");
         for bad in ["../x", ".fandhe-unpack-1-0", ".", "link/rootfs"] {
@@ -2947,18 +3681,15 @@ mod tests {
         assert!(outside.join(".fandhe-unpack-7-7/sub/f").exists());
         let e = reap_stale_unpacks(&b.join("nope"), Path::new("rootfs")).expect_err("no bundle");
         assert_eq!(e.code(), ErrorCode::NotFound);
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// OCI-7・SEC-1: Linux 以外は回収も `Unimplemented`（実装済みを装わない。REPAIR-3）。
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sec1_reap_stale_unpacks_is_unimplemented_outside_linux() {
-        let b = tmp("reap-nonlinux");
+        let (_scratch, b) = tmp("reap-nonlinux");
         let e = reap_stale_unpacks(&b, Path::new("rootfs")).expect_err("unimplemented");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[cfg(target_os = "linux")]
@@ -2975,7 +3706,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_marker_v2_is_written_and_v1_is_still_accepted_by_delete() {
-        let b = tmp("marker-v2");
+        let (_scratch, b) = tmp("marker-v2");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let token = rec.token().expect("token").to_owned();
@@ -3002,7 +3733,6 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!root.exists());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2540: 削除の途中で失敗しても印は最後に消すので残り、次の孤児の回収が木を見分けられる。
@@ -3010,7 +3740,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_keeps_marker_until_the_rest_is_removed() {
-        let b = tmp("marker-last");
+        let (_scratch, b) = tmp("marker-last");
         let rec = published_record(&b, "rootfs");
         let root = b.join("rootfs");
         let deep: PathBuf = std::iter::repeat_n("d", 300).collect();
@@ -3018,7 +3748,6 @@ mod tests {
         let e = remove_recorded_rootfs(&b, &rec).expect_err("too deep");
         assert_eq!(e.code(), ErrorCode::Internal);
         assert!(root.join(super::OWNER_TOKEN_FILE).is_file());
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// REPAIR-4・#2540: `reap_stale_unpacks_with` は確かめられず残した木を 1 件ずつ失敗として記録し、
@@ -3026,14 +3755,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn repair4_reap_with_records_each_kept_unverified_tree() {
-        let b = tmp("reap-with");
+        let (_scratch, b) = tmp("reap-with");
         let rec = OpRecorder::new();
         let r = reap_stale_unpacks_with(&b, Path::new("rootfs"), &ReapOptions::new(), &rec)
             .expect("empty");
         assert!(!r.is_noteworthy());
         assert!(rec.snapshot().is_empty());
 
-        let outside = tmp("reap-with-out");
+        let (_scratch, outside) = tmp("reap-with-out");
         std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
         std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
         plant_staging(&b, ".fandhe-unpack-3-3");
@@ -3051,8 +3780,6 @@ mod tests {
         assert_eq!(count("image_rootfs_reap"), (0, 1));
         assert_eq!(count("image_rootfs_reap_kept_unverified"), (0, 2));
         assert_eq!(count("image_rootfs_reap_failed"), (0, 0));
-        let _ = std::fs::remove_dir_all(&b);
-        let _ = std::fs::remove_dir_all(&outside);
     }
     /// 印 v3 の検証用の状態ルートの識別子（小文字 16 進 32 文字）。
     #[cfg(target_os = "linux")]
@@ -3077,7 +3804,7 @@ mod tests {
     #[test]
     fn oci7_2635_staging_uses_core_owned_wrapper() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let b = tmp("wrapper");
+        let (_scratch, b) = tmp("wrapper");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         let wrappers = |dir: &Path| -> Vec<std::ffi::OsString> {
             let mut v: Vec<_> = std::fs::read_dir(dir)
@@ -3117,7 +3844,6 @@ mod tests {
         assert_eq!((published.dev(), published.ino()), child_id);
         let rec = c.record().expect("record");
         assert_eq!(rec.identity(), child_id);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 展開器が子の mode を 0 にしても（rootful で所有者が変わる場合の代役）、回収が判定するのは
@@ -3127,7 +3853,7 @@ mod tests {
     fn oci7_2635_reap_reclaims_wrapper_when_child_mode_changed() {
         use std::os::unix::fs::PermissionsExt;
         for child_mode in [0o000, 0o755] {
-            let b = tmp("wrapper-reap");
+            let (_scratch, b) = tmp("wrapper-reap");
             let w = b.join(".fandhe-unpack-1-0");
             std::fs::create_dir(&w).expect("wrapper");
             std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o700)).expect("0700");
@@ -3144,7 +3870,6 @@ mod tests {
             );
             assert!(r.kept_unverified.is_empty() && r.failed.is_empty());
             assert!(!w.exists());
-            let _ = std::fs::remove_dir_all(&b);
         }
     }
 
@@ -3152,12 +3877,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_2635_unpublished_remove_removes_wrapper() {
-        let b = tmp("wrapper-remove");
+        let (_scratch, b) = tmp("wrapper-remove");
         let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         c.remove().expect("remove");
         assert_eq!(std::fs::read_dir(&b).expect("read").count(), 0);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 展開器が子を 0555（write なし）にしても、公開（別ディレクトリへの改名）は成功し、公開後の
@@ -3166,7 +3890,7 @@ mod tests {
     #[test]
     fn oci7_2635_publish_works_when_child_has_no_write_permission() {
         use std::os::unix::fs::PermissionsExt;
-        let b = tmp("wrapper-ro");
+        let (_scratch, b) = tmp("wrapper-ro");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
             .expect("ro");
@@ -3178,14 +3902,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o555);
         std::fs::set_permissions(b.join("rootfs"), std::fs::Permissions::from_mode(0o755))
             .expect("restore");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・OCI-5・#2635: 印 v3 は `トークン\n<dev>:<ino>\n識別子\n` と完全に一致し、識別子の無い seal は v2 を書く。
     #[cfg(target_os = "linux")]
     #[test]
     fn oci7_2635_seal_writes_v3_with_scope_and_v2_without() {
-        let b = tmp("seal-v3");
+        let (_scratch, b) = tmp("seal-v3");
         let mut c = prepare_rootfs_target(&b, Path::new("a")).expect("prepare");
         c.seal(Some(SCOPE)).expect("seal");
         c.publish().expect("publish");
@@ -3209,7 +3932,6 @@ mod tests {
         let mut c3 = prepare_rootfs_target(&b, Path::new("c")).expect("prepare 3");
         let e = c3.seal(Some("NOT-HEX")).expect_err("invalid scope");
         assert_eq!(e.code(), ErrorCode::Internal);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7・#2635: 印の解析は v1・v2・v3 だけを受け、3 行目が小文字 16 進 32 文字でない・4 行目がある・

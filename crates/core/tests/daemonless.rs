@@ -17,6 +17,9 @@
 //! TASK-45・47・49 の担当で、本テストは保証しない。root・namespace 不要で既定のテスト集合で動く。
 //! 同等の走査補助は別 crate のテストと共有できないため `supervisor/tests/daemonless.rs` にも複製してある。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 /// `environ`（NUL 区切りの `KEY=VALUE` 列）に `KEY=nonce` が完全一致で含まれるかを判定する。OS 非依存。
 fn environ_has_marker(environ: &[u8], key: &str, nonce: &str) -> bool {
     let want = format!("{key}={nonce}");
@@ -46,6 +49,10 @@ fn core1_task28_2_environ_marker_matching_is_exact() {
     assert!(!environ_has_marker(b"OTHER=n1\0", key, "n1"));
     assert!(!environ_has_marker(b"", key, "n1"));
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -218,18 +225,23 @@ mod linux {
 
     impl Drop for Role {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 
     /// テスト用一時ディレクトリ（0700。drop で削除）。
-    struct Tmp(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct Tmp(PathBuf, super::scratch_root::ScratchDir);
 
     impl Tmp {
         fn new(tag: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let p = std::env::temp_dir().join(format!("fandhe-daemonless-{}", unique(tag)));
+            let scratch = super::scratch_root::ScratchDir::new(
+                "fandhe-daemonless",
+                std::time::Duration::from_secs(10),
+            );
+            let p = scratch.path().join(unique(tag));
+            fs::create_dir_all(&p).expect("mkdir tmp");
             fs::create_dir_all(p.join("state")).expect("mkdir state");
             fs::create_dir_all(p.join("bundle").join("rootfs")).expect("mkdir bundle");
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -244,7 +256,7 @@ mod linux {
                 serde_json::to_vec(&cfg).expect("serialize"),
             )
             .expect("write config");
-            Self(p)
+            Self(p, scratch)
         }
         fn state(&self) -> PathBuf {
             self.0.join("state")
@@ -274,7 +286,7 @@ mod linux {
 
     fn role_command(nonce: &str, test: &str) -> Command {
         let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
-        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        cmd.args(["--exact", test, "--test-threads=1", "--no-capture"])
             .env(PROBE, nonce)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

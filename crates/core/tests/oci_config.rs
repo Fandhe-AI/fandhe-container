@@ -13,13 +13,19 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::traits::ErrorCode;
 
-/// テストごとに専用の一時ディレクトリを作る（並列実行でも衝突しないよう名前とプロセス ID を含める）。
-fn temp_dir(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("fandhe-core-oci-it-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+/// テストごとに専用の一時ディレクトリ（排他作成した `ScratchDir` の子）を作る。guard は試験の終わりまで
+/// 束縛し、drop で消える。pid だけの名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
+fn temp_dir(name: &str) -> (scratch_root::ScratchDir, PathBuf) {
+    let scratch = scratch_root::ScratchDir::new(
+        &format!("fandhe-core-oci-it-{name}"),
+        std::time::Duration::from_secs(10),
+    );
+    let dir = scratch.path().join("d");
+    std::fs::create_dir(&dir).expect("mkdir");
+    (scratch, dir)
 }
 
 const VALID: &str = r#"{
@@ -43,7 +49,7 @@ const VALID: &str = r#"{
 /// OCI-4: 通常ファイルの bundle 設定を読み、検証済みの値と未解釈プロパティを返す。
 #[test]
 fn oci4_load_config_reads_bundle_file() {
-    let dir = temp_dir("valid");
+    let (_scratch, dir) = temp_dir("valid");
     let path = dir.join("config.json");
     std::fs::write(&path, VALID).expect("write");
 
@@ -63,14 +69,12 @@ fn oci4_load_config_reads_bundle_file() {
     // SEC-1・CORE-5: 解釈しない seccomp は破棄せず報告される。
     assert_eq!(cfg.unapplied_fields(), [UnappliedField::LinuxSeccomp]);
     assert_eq!(cfg.unapplied_fields()[0].as_str(), "linux.seccomp");
-
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 /// OCI-4・ERR-1: 異常入力は機械可読な code / kind と位置で返り、入力値を含まない。
 #[test]
 fn oci4_load_config_reports_invalid_content() {
-    let dir = temp_dir("invalid");
+    let (_scratch, dir) = temp_dir("invalid");
 
     let syntax = dir.join("syntax.json");
     std::fs::write(&syntax, "{\"ociVersion\": }").expect("write");
@@ -104,14 +108,12 @@ fn oci4_load_config_reports_invalid_content() {
     let e = load_config(&big).expect_err("too large");
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
     assert_eq!(*e.kind(), OciConfigErrorKind::TooLarge);
-
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 /// ERR-1・REPAIR-5: 非通常ファイル・存在しないパスは 3 OS で同じ分類になる。
 #[test]
 fn err1_load_config_classifies_path_errors_on_all_os() {
-    let dir = temp_dir("paths");
+    let (_scratch, dir) = temp_dir("paths");
 
     let as_dir = dir.join("config.json");
     std::fs::create_dir_all(&as_dir).expect("mkdir");
@@ -133,8 +135,6 @@ fn err1_load_config_classifies_path_errors_on_all_os() {
     let e = load_config(&file.join("config.json")).expect_err("not a directory");
     assert_eq!(e.code(), ErrorCode::NotFound);
     assert_eq!(*e.kind(), OciConfigErrorKind::Io);
-
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 /// OCI-4: メモリ上の入力でもファイル経由と同じ検証結果になる。
@@ -187,6 +187,7 @@ fn oci4_core2_mount_destination_normalized_and_resolved() {
             Path::new("/etc")
         ]
     );
+    // パス計算だけで FS には触れない（作成も削除もしない）ため、予測できる名前のままでよい（#3434）。
     let rootfs =
         std::env::temp_dir().join(format!("fandhe-core-oci-it-rootfs-{}", std::process::id()));
     assert_eq!(

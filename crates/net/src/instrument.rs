@@ -4,15 +4,14 @@
 //! 1 回の操作ごとの結果（成功 / 失敗）と所要時間を記録先へ渡すための境界。集計（成功・失敗件数と
 //! レイテンシ分布）と構造化ログへの出力は core の `OpRecorder` が担うが、net は core に依存しない
 //! ため、本モジュールが net 内の型だけで完結するトレイトを定義する（`fandhe-container-io` の
-//! `instrument` モジュールと同じ形）。core の記録器への接続は、core と net の両方に依存する上位
-//! crate に置く newtype アダプタが担い、`sample.kind().as_str()` を core の `OpName::new` へ、
-//! `sample.outcome()` / `sample.latency()` を `OpRecorder::record` へ写す。
+//! `instrument` モジュールと同じ形）。core の記録器への接続は、`docs/architecture.md` の「計装アダプタの配置」の原則
+//! （net の操作を本番で呼び、`OpRecorder` を持つ crate に置く newtype アダプタ）に従う。
+//! アダプタは `sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` / `sample.latency()` を `OpRecorder::record` へ写す。
 //!
 //! OS 非依存（型とトレイトのみ）で、Linux 以外でもアダプタをビルドできる。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - core の `OpRecorder` との接続アダプタ（上位 crate の担当。net からは提供しない）
 //! - 後続の操作（address / route 送信ラッパー等。#301）の種別は、送信ラッパーと一緒に
 //!   [`NetOpKind`] へ追加する
 //!
@@ -64,6 +63,46 @@ pub enum NetOpKind {
     /// 軽量運用（DNS ヘルパーなし）のサービス名 hosts 静的注入（検証 + 追記。
     /// `etc_hosts::inject_service_hosts_with_recorder`。TASK-146.1・#334・NET-8）。
     StaticHostsInject,
+    /// pasta の起動と準備完了待ち（`pasta::process::spawn_pasta_with_recorder`。NET-9・#1938）。
+    PastaStart,
+    /// pasta の停止と回収（`PastaProcess::stop_with_recorder`。NET-9・#1938）。
+    PastaStop,
+    /// ネットワーク定義ストアの open（`NetworkStore::open`。NET-6・#3059）。
+    NetworkStoreOpen,
+    /// ネットワーク定義の作成（`NetworkStore::create`。ロック待ちを含む）。
+    NetworkStoreCreate,
+    /// ネットワーク定義の取得（`NetworkStore::get`）。
+    NetworkStoreGet,
+    /// ネットワーク定義の一覧（`NetworkStore::list`）。
+    NetworkStoreList,
+    /// ネットワーク定義の削除（`NetworkStore::remove`）。
+    NetworkStoreRemove,
+    /// メンバー記録・意図記録の書き込み（`NetworkLockGuard::write_member_intent` / `commit_member`。NET-1・#3067）。
+    NetworkStoreMemberWrite,
+    /// メンバー記録・意図記録の削除（`NetworkLockGuard::remove_member` / `remove_member_intent`。NET-1・#3067）。
+    NetworkStoreMemberRemove,
+    /// `realized`・`realized.intent` の書き込み（NET-1・#3067）。
+    NetworkStoreRealizedWrite,
+    /// `realized`・`realized.intent` の削除（NET-1・#3067）。
+    NetworkStoreRealizedRemove,
+    /// 記録からの IPAM の組み直し（`NetworkLockGuard::rebuild_ipam`。NET-1・#3067）。
+    NetworkStoreIpamRebuild,
+    /// 回収待ちの請求書の書き込み・削除（`pending-reclaim/`。NET-1・REPAIR-4・#3067）。
+    NetworkStoreReclaimWrite,
+    /// DNS ヘルパーの記録（`dns-helper`・`dns-helper.intent`）の書き込み（NET-5・NET-7・REPAIR-4・#3070）。
+    NetworkStoreDnsHelperWrite,
+    /// DNS ヘルパーの記録の削除（NET-5・NET-7・REPAIR-4・#3070）。
+    NetworkStoreDnsHelperRemove,
+    /// 起動窓の意図記録の回収（`recover_dns_helper_intent`。NET-5・NET-7・REPAIR-4・#3070）。
+    DnsHelperRecover,
+    /// DNS ヘルパーへの `Reload` の送信と `Loaded` の待ち（`reload_dns_helper`。制御 UDS。NET-5・REPAIR-4・#3071）。
+    DnsHelperReload,
+    /// 記録だけからのメンバー 1 件の切り離し全体（検証拒否・回収・記録の削除を含む。
+    /// `detach_member_recorded_with`。NET-1・NET-6・REPAIR-4・#3347）。
+    MemberDetachRecorded,
+    /// ホストの再起動（boot ID の違い）をまたぐ記録だけからの切り離し全体
+    /// （`detach_member_after_reboot_with`。NET-1・NET-3・REPAIR-4・#3412）。
+    MemberDetachAfterReboot,
 }
 
 impl NetOpKind {
@@ -83,6 +122,25 @@ impl NetOpKind {
             NetOpKind::AddHostsApply => "hosts.add_host.apply",
             NetOpKind::DnsResolvConfWrite => "dns.resolv_conf.write",
             NetOpKind::StaticHostsInject => "hosts.static.inject",
+            NetOpKind::PastaStart => "pasta.start",
+            NetOpKind::PastaStop => "pasta.stop",
+            NetOpKind::NetworkStoreOpen => "network.store.open",
+            NetOpKind::NetworkStoreCreate => "network.store.create",
+            NetOpKind::NetworkStoreGet => "network.store.get",
+            NetOpKind::NetworkStoreList => "network.store.list",
+            NetOpKind::NetworkStoreRemove => "network.store.remove",
+            NetOpKind::NetworkStoreMemberWrite => "network.store.member_write",
+            NetOpKind::NetworkStoreMemberRemove => "network.store.member_remove",
+            NetOpKind::NetworkStoreRealizedWrite => "network.store.realized_write",
+            NetOpKind::NetworkStoreRealizedRemove => "network.store.realized_remove",
+            NetOpKind::NetworkStoreIpamRebuild => "network.store.ipam_rebuild",
+            NetOpKind::NetworkStoreReclaimWrite => "network.store.reclaim_write",
+            NetOpKind::NetworkStoreDnsHelperWrite => "network.store.dns_helper_write",
+            NetOpKind::NetworkStoreDnsHelperRemove => "network.store.dns_helper_remove",
+            NetOpKind::DnsHelperRecover => "dns.helper.recover",
+            NetOpKind::DnsHelperReload => "dns.helper.reload",
+            NetOpKind::MemberDetachRecorded => "network.member.detach_recorded",
+            NetOpKind::MemberDetachAfterReboot => "network.member.detach_after_reboot",
         }
     }
 }
@@ -257,7 +315,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [NetOpKind; 13] = [
+    const ALL_KINDS: [NetOpKind; 32] = [
         NetOpKind::NetlinkOpen,
         NetOpKind::NetlinkSend,
         NetOpKind::NetlinkRecv,
@@ -271,6 +329,25 @@ mod tests {
         NetOpKind::AddHostsApply,
         NetOpKind::DnsResolvConfWrite,
         NetOpKind::StaticHostsInject,
+        NetOpKind::PastaStart,
+        NetOpKind::PastaStop,
+        NetOpKind::NetworkStoreOpen,
+        NetOpKind::NetworkStoreCreate,
+        NetOpKind::NetworkStoreGet,
+        NetOpKind::NetworkStoreList,
+        NetOpKind::NetworkStoreRemove,
+        NetOpKind::NetworkStoreMemberWrite,
+        NetOpKind::NetworkStoreMemberRemove,
+        NetOpKind::NetworkStoreRealizedWrite,
+        NetOpKind::NetworkStoreRealizedRemove,
+        NetOpKind::NetworkStoreIpamRebuild,
+        NetOpKind::NetworkStoreReclaimWrite,
+        NetOpKind::NetworkStoreDnsHelperWrite,
+        NetOpKind::NetworkStoreDnsHelperRemove,
+        NetOpKind::DnsHelperRecover,
+        NetOpKind::DnsHelperReload,
+        NetOpKind::MemberDetachRecorded,
+        NetOpKind::MemberDetachAfterReboot,
     ];
 
     /// REPAIR-4: 操作名は安定した固定文字列。
@@ -292,6 +369,50 @@ mod tests {
             "dns.resolv_conf.write"
         );
         assert_eq!(NetOpKind::StaticHostsInject.as_str(), "hosts.static.inject");
+        assert_eq!(
+            NetOpKind::NetworkStoreMemberWrite.as_str(),
+            "network.store.member_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreMemberRemove.as_str(),
+            "network.store.member_remove"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreRealizedWrite.as_str(),
+            "network.store.realized_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreRealizedRemove.as_str(),
+            "network.store.realized_remove"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreIpamRebuild.as_str(),
+            "network.store.ipam_rebuild"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreReclaimWrite.as_str(),
+            "network.store.reclaim_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreDnsHelperWrite.as_str(),
+            "network.store.dns_helper_write"
+        );
+        assert_eq!(
+            NetOpKind::NetworkStoreDnsHelperRemove.as_str(),
+            "network.store.dns_helper_remove"
+        );
+        assert_eq!(NetOpKind::DnsHelperRecover.as_str(), "dns.helper.recover");
+        assert_eq!(NetOpKind::DnsHelperReload.as_str(), "dns.helper.reload");
+        assert_eq!(
+            NetOpKind::MemberDetachRecorded.as_str(),
+            "network.member.detach_recorded"
+        );
+        assert_eq!(
+            NetOpKind::MemberDetachAfterReboot.as_str(),
+            "network.member.detach_after_reboot"
+        );
+        assert_eq!(NetOpKind::PastaStart.as_str(), "pasta.start");
+        assert_eq!(NetOpKind::PastaStop.as_str(), "pasta.stop");
     }
 
     /// REPAIR-4: 操作名は core の `OpName::new` と同じ規則に収まる（net は core に依存できないため

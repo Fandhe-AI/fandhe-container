@@ -6,8 +6,16 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blobs};
+use fandhe_container_oci::error::{OciError, OciErrorCode};
+#[cfg(unix)]
+use fandhe_container_oci::layer::VerifiedLayerBlob;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::decompress_layer_to_writer;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::extract::extract_layers;
+use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractedLayer};
+#[cfg(unix)]
+use fandhe_container_oci::layer::extract::{ImageLayer, extract_image_layers};
 use fandhe_container_oci::layer::verify_blob_digest;
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
@@ -126,6 +134,59 @@ fn limits() -> ExtractLimits {
     ExtractLimits::new(100, 1 << 20, 1 << 30, 1 << 20)
 }
 
+/// gzip の tar を gunzip する（blob の diff_id = 展開後 tar の sha256 を計算するため）。
+#[cfg(unix)]
+fn gunzip(gz: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(gz)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+/// digest 検証済みの gzip blob を、下位から上位の順に `root` へ重ねて展開する（パスで開く旧入口の代わり。#2535・OCI-1）。
+///
+/// Unix（Linux・macOS）は本番と同じ検証済みハンドル版（`VerifiedLayerBlob` → `extract_image_layers`）を通す。
+/// blob は 0600 にして umask に依らず信頼条件を満たす。Windows は `VerifiedLayerBlob` を作れない（`Unimplemented`）ため、
+/// 検証 → gzip 展開 → ストリーム展開（`extract_layers`）の連結で代える。パスを開き直す展開入口は使わず、期待値は 3 OS 共通。
+fn extract_blobs(
+    blobs: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mut opened = Vec::new();
+        for p in blobs {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let gz = std::fs::read(p).unwrap();
+            let owner = std::fs::metadata(p).unwrap().uid();
+            let blob = VerifiedLayerBlob::open(p, &sha(&gz), gz.len() as u64, owner)?;
+            opened.push((blob, sha(&gunzip(&gz))));
+        }
+        let layers: Vec<ImageLayer<'_>> = opened
+            .iter()
+            .map(|(b, d)| ImageLayer::new(b, "application/vnd.oci.image.layer.v1.tar+gzip", d))
+            .collect();
+        extract_image_layers(&layers, root, max_uncompressed_bytes, limits)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut tars = Vec::new();
+        for p in blobs {
+            let gz = std::fs::read(p).unwrap();
+            verify_blob_digest(p, &sha(&gz), gz.len() as u64)?;
+            let mut tar = Vec::new();
+            decompress_layer_to_writer(p, max_uncompressed_bytes, &mut tar)?;
+            tars.push(std::io::Cursor::new(tar));
+        }
+        extract_layers(tars, root, limits)
+    }
+}
+
 /// `root` 配下の全パス（相対・`/` 区切り）の集合。
 fn tree(root: &Path) -> BTreeSet<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut BTreeSet<String>) {
@@ -172,7 +233,7 @@ fn oci1_three_layers_overlay_final_contents() {
         .map(|(i, z)| t.blob(&format!("l{i}.tar.gz"), z))
         .collect();
     let refs: Vec<&Path> = blobs.iter().map(PathBuf::as_path).collect();
-    let r = extract_layer_blobs(&refs, &t.root(), 1 << 20, limits()).unwrap();
+    let r = extract_blobs(&refs, &t.root(), 1 << 20, limits()).unwrap();
 
     // レイヤーごとの件数。L1 は親ディレクトリを暗黙に作るが、数えるのは tar のエントリだけ。
     assert_eq!(
@@ -214,7 +275,7 @@ fn oci1_layer_order_matters() {
         .map(|&i| t.blob(&format!("l{i}.tar.gz"), &ls[i]))
         .collect();
     let refs: Vec<&Path> = blobs.iter().map(PathBuf::as_path).collect();
-    extract_layer_blobs(&refs, &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&refs, &t.root(), 1 << 20, limits()).unwrap();
     assert_eq!(
         std::fs::read(t.root().join("etc/os-release")).unwrap(),
         b"ID=base\n"
@@ -234,11 +295,17 @@ fn oci1_digest_mismatch_blob_is_rejected_before_extract() {
     assert!(tree(&t.root()).is_empty());
 }
 
-/// OCI-1: 空の layer 列は InvalidArgument。
+/// OCI-1: ストリーム版の空の layer 列は InvalidArgument（ハンドル版の空は「レイヤー 0 のイメージ」で成功する。
+/// layer_image.rs が確かめる）。
 #[test]
 fn oci1_empty_layer_list_is_rejected() {
     let t = Tmp::new("empty");
-    let e = extract_layer_blobs(&[], &t.root(), 1 << 20, limits()).unwrap_err();
+    let e = fandhe_container_oci::layer::extract::extract_layers(
+        Vec::<std::io::Cursor<Vec<u8>>>::new(),
+        &t.root(),
+        limits(),
+    )
+    .unwrap_err();
     assert_eq!(e.code(), OciErrorCode::InvalidArgument);
 }
 
@@ -264,7 +331,7 @@ fn oci1_overlay_across_entry_types_and_modes() {
     ]);
     let b1 = t.blob("l1.tar.gz", &l1);
     let b2 = t.blob("l2.tar.gz", &l2);
-    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
     let root = t.root();
     assert_eq!(std::fs::read_link(root.join("a")).unwrap(), Path::new("c"));
     assert!(
@@ -301,7 +368,7 @@ fn oci1_upper_file_replaces_lower_dir_with_contents() {
     let l2 = layer_gz(&[E::File("d", 0o644, b"file-d")]);
     let b1 = t.blob("l1.tar.gz", &l1);
     let b2 = t.blob("l2.tar.gz", &l2);
-    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
     let root = t.root();
     assert_eq!(std::fs::read(root.join("d")).unwrap(), b"file-d");
     let expected: BTreeSet<String> = ["d", "keep"].iter().map(|s| (*s).to_string()).collect();
@@ -317,7 +384,7 @@ fn oci1_upper_symlink_replaces_lower_dir() {
     let l2 = layer_gz(&[E::Symlink("d", "keep")]);
     let b1 = t.blob("l1.tar.gz", &l1);
     let b2 = t.blob("l2.tar.gz", &l2);
-    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
     assert_eq!(
         std::fs::read_link(t.root().join("d")).unwrap(),
         Path::new("keep")
@@ -335,7 +402,7 @@ fn oci1_replacement_through_lower_symlink_stays_in_root() {
     let l2 = layer_gz(&[E::File("out/d", 0o644, b"file-d")]);
     let b1 = t.blob("l1.tar.gz", &l1);
     let b2 = t.blob("l2.tar.gz", &l2);
-    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
     assert_eq!(std::fs::read(t.root().join("d")).unwrap(), b"file-d");
     let outside: BTreeSet<String> = std::fs::read_dir(&t.base)
         .unwrap()
@@ -371,8 +438,7 @@ fn oci1_replacement_entry_with_parent_dir_is_rejected() {
     let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     z.write_all(&raw).unwrap();
     let b2 = t.blob("l2.tar.gz", &z.finish().unwrap());
-    let e = extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits())
-        .unwrap_err();
+    let e = extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap_err();
     assert_eq!(e.code(), OciErrorCode::PermissionDenied);
     assert_eq!(std::fs::read(t.root().join("d/x")).unwrap(), b"x");
 }
@@ -416,7 +482,7 @@ fn io5_oci1_upper_alias_file_over_lower_dir_follows_destination_fs() {
         let b1 = t.blob("l1.tar.gz", &l1);
         let b2 = t.blob("l2.tar.gz", &l2);
         let same = resolves_as_same(&t.base, lower, upper);
-        let r = extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits());
+        let r = extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits());
         let mut expect: BTreeSet<String> = [lower, &format!("{lower}/sub"), &ly, &lx, "keep"]
             .into_iter()
             .map(String::from)
@@ -471,7 +537,7 @@ fn oci1_upper_layer_cannot_escape_through_lower_symlink() {
     let l2 = layer_gz(&[E::File("out/evil", 0o644, b"x")]);
     let b1 = t.blob("l1.tar.gz", &l1);
     let b2 = t.blob("l2.tar.gz", &l2);
-    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
     // chroot 意味論: `out` -> `/` は root 自身を指すので、書き込み先は root 配下になる。
     assert_eq!(std::fs::read(t.root().join("evil")).unwrap(), b"x");
     let outside: BTreeSet<String> = std::fs::read_dir(&t.base)

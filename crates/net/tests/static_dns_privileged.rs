@@ -24,6 +24,11 @@
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・外部コマンド）を
 //! 満たさない場合は skip せず失敗する。
 
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("static_dns_privileged: Linux only, not applicable on this OS");
@@ -127,22 +132,26 @@ mod linux {
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
         // sh は dash 等が `--help` を受け付けず終了コード 2 を返すため、POSIX sh で必ず成功する `-c ':'` で存在確認する。
-        let sh_ok = Command::new("sh")
-            .args(["-c", ":"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let sh_ok = crate::reap::run_within(
+            Command::new("sh")
+                .args(["-c", ":"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            crate::reap::reap_within(),
+        )
+        .inspect_err(|e| eprintln!("precondition probe: {e}"))
+        .is_ok_and(|s| s.success());
         assert!(sh_ok, "`sh` is required; see AGENTS.md");
         for tool in ["setsid", "unshare", "nsenter", "mount"] {
-            let ok = Command::new(tool)
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = crate::reap::run_within(
+                Command::new(tool)
+                    .arg("--help")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            )
+            .inspect_err(|e| eprintln!("precondition probe: {e}"))
+            .is_ok_and(|s| s.success());
             assert!(ok, "util-linux `{tool}` is required; see AGENTS.md");
         }
     }
@@ -174,13 +183,17 @@ mod linux {
             if pids.is_empty() {
                 return;
             }
-            let _ = Command::new("kill")
-                .args(["-KILL", "--"])
-                .args(&pids)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Err(e) = crate::reap::run_within(
+                Command::new("kill")
+                    .args(["-KILL", "--"])
+                    .args(&pids)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            ) {
+                eprintln!("kill failure: {e}");
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -188,9 +201,7 @@ mod linux {
     /// ランチャ（host netns の root プロセス）。自身では何も変更せず、一時ディレクトリを作って子を起動する。
     pub fn launcher() {
         require_root_and_tools();
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-staticdns-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+        let dir = crate::exclusive_dir::create("fandhe-staticdns-test").expect("create temp dir");
         // 管理ルートは symlink を含まない絶対パスで渡す契約（`inject_service_hosts` は正規化しない）。
         let dir = fs::canonicalize(&dir).expect("canonicalize temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
@@ -213,8 +224,7 @@ mod linux {
                 None if Instant::now() >= deadline => {
                     // --inner と run_cmd 配下の nsenter・probe 等、セッション内の全プロセスを SIGKILL して回収する。
                     kill_session(sid);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("static_dns_privileged: inner did not finish before deadline");
                     break 1;
                 }
@@ -296,14 +306,18 @@ mod linux {
             .map_err(|e| fail(format!("spawn {program}: {e}")))?;
         let pgid = child.id();
         let kill_group = |child: &mut std::process::Child| {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pgid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            // 期限つきで kill を実行する。失敗は握り潰さず stderr に出す（呼び出し元は既に失敗を返す経路。REPAIR-5）。
+            if let Err(e) = crate::reap::run_within(
+                Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pgid}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            ) {
+                eprintln!("kill failure: {e}");
+            }
+            crate::reap::reap_or_report(child, crate::reap::reap_within());
         };
         let (out_rx, out_over) = spawn_capped_reader(child.stdout.take());
         let (err_rx, err_over) = spawn_capped_reader(child.stderr.take());

@@ -56,15 +56,16 @@ use std::fmt;
 
 #[cfg(not(test))]
 use super::ThreadCountSource;
-use super::capabilities::ProcessIds;
 #[cfg(not(test))]
 use super::capabilities::apply_default_capabilities_for_launch;
+use super::capabilities::{NormalizedGroups, ProcessIds};
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
 use super::seccomp::{apply_default_seccomp, apply_default_seccomp_with_listener};
 use super::seccomp_listener::ListenerSender;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs, rlimits};
+use crate::capabilities::ContainerCapabilities;
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
 use super::capabilities::testing::apply_default_capabilities_ids;
@@ -347,6 +348,13 @@ pub struct StagePipeline {
     /// `process.user` の uid・gid（0/0 以外のときだけ `Some`）。組み込みの capability 削減段が、補助グループの
     /// 消去の後・bounding set の削減の前に切り替える（#1462 の経路。OCI-1・SEC-5・TASK-29）。
     process_ids: Option<ProcessIds>,
+    /// `process.user.additionalGids`。空でなければ組み込みの capability 削減段が `setgroups(list)` で適用し、
+    /// 読み戻して確かめる（空なら補助グループを消去する。写像との照合は launcher が fork の前に済ませる。
+    /// OCI-1・SEC-5・CORE-6・#2667）。
+    supplementary_groups: NormalizedGroups,
+    /// 組み込みの capability 削減段が適用する許可集合（既定は OCI 既定集合。`process.capabilities` の drop で絞る。
+    /// SEC-1・CRI-2・#2666）。OCI 既定の部分集合だけを表す型なので、ここから広げる経路は無い。
+    capabilities: ContainerCapabilities,
     /// seccomp の listener fd を C へ渡す送り手（SEC-4・#2024）。あれば組み込みの `Seccomp` 段が `NEW_LISTENER` 付きで
     /// 適用して渡し、ACK を待つ。無ければ従来の `prctl` 適用（旧経路・観測用の入口）。
     listener_sender: Option<ListenerSender>,
@@ -395,6 +403,8 @@ impl StagePipeline {
             landlock: None,
             mounts: MountedTargets::new(),
             process_ids: None,
+            supplementary_groups: NormalizedGroups::empty(),
+            capabilities: ContainerCapabilities::oci_default(),
             listener_sender: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
         }
@@ -414,6 +424,18 @@ impl StagePipeline {
     /// seccomp の listener fd を C へ渡す送り手を登録する（本番 launch 経路だけが呼ぶ。SEC-4・#2024）。
     pub(crate) fn with_listener_sender(mut self, sender: ListenerSender) -> Self {
         self.listener_sender = Some(sender);
+        self
+    }
+
+    /// capability 削減段が適用する許可集合を設定する（本番 launcher だけが `config.json` の解釈結果で呼ぶ。SEC-1・#2666）。
+    pub(crate) fn with_capabilities(mut self, capabilities: ContainerCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// `process.user.additionalGids` を capability 削減段で適用させる（launch。OCI-1・SEC-5・CORE-6・#2667）。
+    pub(crate) fn with_supplementary_groups(mut self, gids: NormalizedGroups) -> Self {
+        self.supplementary_groups = gids;
         self
     }
 
@@ -437,6 +459,46 @@ impl StagePipeline {
     pub(crate) fn with_mounted_targets(mut self, mounts: MountedTargets) -> Self {
         self.mounts = mounts;
         self
+    }
+
+    /// 登録した ruleset の Mount 由来のルールの位置（`rules()` 内の添字。昇順）。親が fork の前に計算し、子が状態 pipe で
+    /// 返す識別子のブロックの期待列として使う（登録が無ければ空。SEC-1・SEC-4・#3201）。
+    pub(crate) fn mount_rule_positions(&self) -> Vec<usize> {
+        self.landlock.as_ref().map_or_else(Vec::new, |rs| {
+            rs.rules()
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.origin.is_mount_origin())
+                .map(|(i, _)| i)
+                .collect()
+        })
+    }
+
+    /// pivot 前段が記録した識別子から、Mount 由来のルールごとの launch 時の識別子を作る（`(ルール位置, 識別子)`。
+    /// 位置は昇順）。記録が引けないルールは載せない（親の期待列との不一致として拒否される。fail-closed）。
+    /// `run_child_then` が `with_mounted_targets` の後・Landlock 段より前に呼び、状態 pipe へ書く（#3201）。
+    pub(crate) fn mount_identity_report(
+        &self,
+    ) -> Vec<(usize, crate::launch_isolation::RecordedMountIdentity)> {
+        let Some(rs) = self.landlock.as_ref() else {
+            return Vec::new();
+        };
+        rs.rules()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.origin.is_mount_origin())
+            .filter_map(|(i, r)| {
+                let t = self.mounts.target_for(&r.origin, r.path.as_str())?;
+                let id = crate::launch_isolation::RecordedMountIdentity::new(
+                    t.identity.mnt_id,
+                    t.identity.dev,
+                    t.identity.ino,
+                    t.read_only,
+                )
+                .ok()?;
+                Some((i, id))
+            })
+            .collect()
     }
 
     /// core の Landlock 適用処理（TASK-39.4・#184・CORE-5）を Landlock 段へ登録する。
@@ -571,7 +633,8 @@ impl StagePipeline {
     /// - 変更内容: `pub fn run_then` から `pub(crate) fn run_then` へ縮小した。crate 外から
     ///   `StagePipeline::run_then` を直接呼ぶことはできなくなった。
     /// - 理由: 組み込みの `NO_NEW_PRIVS` 段が不可逆のため、親プロセスからの誤呼び出しを型で防ぐ。
-    /// - 移行方法: 外部 crate は `StagePipeline` を `spawn_container_with_stages` に渡す。
+    /// - 移行方法: 本番は `ProductionLauncher`（`spawn_container_via_intermediate`）が `StagePipeline` を渡す。
+    ///   `spawn_container_with_stages` は結合試験専用（`exec-test-support`）。
     ///   `run_then` は fork 後の子（`process.rs::run_child`）内で core が呼ぶ。`run_then` を
     ///   単体で呼んでいた利用者は、ステージ列の順序・失敗時の挙動の確認を
     ///   `spawn_container_with_stages` 経由の結合試験（`fork_exec_isolation` の `stages-order`）へ移す。
@@ -615,9 +678,15 @@ impl StagePipeline {
                     let applied = apply_default_capabilities_for_launch(
                         &mut ThreadCountSource::ProcSelf,
                         self.process_ids,
+                        &self.supplementary_groups,
+                        self.capabilities,
                     );
                     #[cfg(test)]
-                    let applied = apply_default_capabilities_ids(self.process_ids);
+                    let applied = apply_default_capabilities_ids(
+                        self.process_ids,
+                        &self.supplementary_groups,
+                        self.capabilities,
+                    );
                     let r = applied.map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     capability_report = Some(r);
                     capabilities_ev = Some(CapabilitiesDropped { _private: () });
@@ -1139,9 +1208,7 @@ mod tests {
         use std::os::fd::OwnedFd;
 
         take();
-        let dir = std::env::temp_dir().join(format!("fandhe-stages-cgjoin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-stages-cgjoin", "d");
         let procs = dir.join("cgroup.procs");
         std::fs::write(&procs, "").unwrap();
         let fd = OwnedFd::from(std::fs::File::open(&dir).unwrap());
@@ -1181,7 +1248,6 @@ mod tests {
                 "exec"
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-5・TASK-38.3・MS-2（受け入れ条件）: seccomp は Landlock の直後・exec の直前に走る。
@@ -1252,6 +1318,7 @@ mod tests {
                 by: MountedBy::Bind { index },
                 destination: format!("/d{index}"),
                 identity: id,
+                read_only: false,
             })
             .unwrap();
         }
@@ -1396,6 +1463,54 @@ mod tests {
         assert_eq!(
             granted,
             Some(crate::capabilities::CapabilitySet::oci_default())
+        );
+        take();
+    }
+
+    /// SEC-1・CRI-2・#2666: `with_capabilities` の集合が削減段へ渡り、終端の `granted` が指定集合になる
+    /// （既定の部分集合。drop した `CAP_NET_RAW`・`CAP_MKNOD` が落ちる）。
+    #[test]
+    fn sec1_cri2_with_capabilities_reaches_capability_drop() {
+        use crate::capabilities::{Capability, CapabilitySet};
+        take();
+        let mut set = CapabilitySet::oci_default();
+        let mut kept = CapabilitySet::empty();
+        for c in set.iter() {
+            if c != Capability::NetRaw && c != Capability::Mknod {
+                kept = kept.with(c);
+            }
+        }
+        set = kept;
+        let caps = ContainerCapabilities::restrict(set).unwrap();
+        let granted = StagePipeline::new()
+            .with_capabilities(caps)
+            .run_then(|_, caps, _| Ok(caps.map(|c| c.granted)))
+            .unwrap();
+        assert_eq!(granted, Some(set));
+        assert_eq!(set.len(), 12);
+        assert_eq!(
+            super::super::capabilities::testing::take_allowed_seen(),
+            Some(caps)
+        );
+        take();
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: `with_supplementary_groups` の一覧が削減段へ届き、既定は空。
+    #[test]
+    fn oci1_sec5_with_supplementary_groups_reaches_capability_drop() {
+        take();
+        StagePipeline::new()
+            .with_supplementary_groups(NormalizedGroups::new(&[6, 5, 6]).unwrap())
+            .run_then(|_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            super::super::capabilities::testing::take_groups_seen(),
+            Some(vec![5, 6])
+        );
+        StagePipeline::new().run_then(|_, _, _| Ok(())).unwrap();
+        assert_eq!(
+            super::super::capabilities::testing::take_groups_seen(),
+            Some(Vec::new())
         );
         take();
     }

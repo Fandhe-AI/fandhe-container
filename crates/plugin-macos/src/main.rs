@@ -1,6 +1,6 @@
 //! `fandhe-container-plugin-macos` バイナリの入口（TASK-115.1・#385、TASK-115.2・#386。MAC-1・PLUG-1）。
 //!
-//! 呼び出し元: core 側 plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）の `PluginLaunchSpec` / `ResidentPlugin` が検証済み fd を持つ起動対象（`PluginLaunchTarget`。#1856）経由で spawn し、
+//! 呼び出し元: core 側 plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）の `PluginLaunchSpec` / `ResidentPlugin` が検証済み fd を持つ起動対象（`PluginLaunchTarget`。#1856）経由で spawn し、
 //! `env_clear()` 後に `PLUGIN_SOCKET_ENV` のみ渡す（stdin / stdout は null、stderr は専用ソケット）。
 //! 役割は起動引数の解析と socket パス解決を `startup::run` へ委ね、core が bind 済みの UDS へ
 //! `UdsStream::connect`（peer credential 検証つき。PLUG-12）で接続し、`frame_loop::serve_until` で要求を

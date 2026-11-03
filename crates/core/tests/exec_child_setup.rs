@@ -48,6 +48,9 @@
 //! `make test-integration`）で実行する。fork は呼び出しプロセスが単一スレッドであることを要求するため、
 //! libtest ではなく `harness = false` の単一スレッド `main` で動かす。非 Linux では対象外（OS 非該当）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("exec_child_setup: Linux only, not applicable on this OS");
@@ -101,7 +104,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecCommand, ExecExit,
+        ChildExit, ContainerEnv, ExecChildSetupReport, ExecChildStep, ExecCommand, ExecExit,
         MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
         ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
         observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
@@ -269,8 +272,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = script.kill();
-                let _ = script.wait();
+                crate::reap::reap_or_report(&mut script, crate::reap::reap_within());
                 panic!("`script` did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -410,6 +412,8 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                    code: ViolationReason::EntrypointInterpreterIsRuntimeBinary.error_code(),
+                    step: Some(ExecChildStep::Interpreter),
                 },
                 "{name}"
             );
@@ -506,6 +510,8 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointCopyTooLarge),
+                code: ViolationReason::EntrypointCopyTooLarge.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -527,6 +533,8 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::SelectExecutable),
                 }
             );
             assert_eq!(observation.report, None);
@@ -552,6 +560,8 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -593,6 +603,8 @@ mod linux {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -649,8 +661,7 @@ mod linux {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the fsize child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -705,6 +716,8 @@ mod linux {
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(125),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::DeferredRlimit),
                 }
             );
             assert_eq!(observation.report, None);
@@ -789,8 +802,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the noexec mount child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -828,6 +840,8 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                code: ViolationReason::EntrypointOnNoexecMount.error_code(),
+                step: Some(ExecChildStep::SelectExecutable),
             }
         );
         assert_eq!(observation.report, None);
@@ -857,6 +871,8 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(127),
                 violation: None,
+                code: ErrorCode::NotFound,
+                step: Some(ExecChildStep::OpenEntrypoint),
             }
         );
         assert!(!observation.exit.command_started());
@@ -869,6 +885,8 @@ exec "$2" "$3" "$1""#;
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
+                code: ViolationReason::EntrypointIsRuntimeBinary.error_code(),
+                step: Some(ExecChildStep::RuntimeIdentity),
             }
         );
         // 対照: 手順を通った子は「起動した」側に分類される。
@@ -1012,8 +1030,7 @@ exec "$2" "$3" "$1""#;
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("the groups child did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1071,6 +1088,8 @@ exec "$2" "$3" "$1""#;
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
                 "{name}"
             );
@@ -1109,28 +1128,12 @@ exec "$2" "$3" "$1""#;
         for closed in ["0", "0,1", "0,1,2"] {
             let label = closed.replace(',', "");
             let exe = std::env::current_exe().expect("current exe");
-            let mut child = Command::new(exe)
-                .arg(CLOSED_STDIO_CHILD)
-                .arg(work)
-                .arg(closed)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn the closed-stdio child");
-            let deadline = Instant::now() + timeout();
-            let status = loop {
-                if let Some(status) = child.try_wait().expect("poll the child") {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("closed {closed}: the child timed out");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            let output = child.wait_with_output().expect("collect the child output");
+            let mut cmd = Command::new(exe);
+            cmd.arg(CLOSED_STDIO_CHILD).arg(work).arg(closed);
+            // spawn・期限・出力回収を一括で期限つきにする（スレッドを立てない。REPAIR-5・#3409）。
+            let output = crate::reap::output_within(&mut cmd, timeout())
+                .unwrap_or_else(|e| panic!("closed {closed}: {e}"));
+            let status = output.status;
             let result = fs::read_to_string(closed_stdio_result(work, &label)).unwrap_or_default();
             assert!(
                 status.success() && result == "ok\n",

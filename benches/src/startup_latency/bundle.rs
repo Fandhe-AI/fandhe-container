@@ -3,13 +3,23 @@
 //! ベンチ自身の実行ファイルを rootfs の `/probe` へコピーし、動的ローダと読み込み済みの共有ライブラリを同じ
 //! 絶対パスへ写す。ワークロードは同じ実行ファイルを `--startup-latency-probe <nonce>` で再実行したもの
 //! （固定時間眠って終了。`startup_latency::run_workload`）。方式は
-//! `crates/supervisor/tests/supervisor_bin_real.rs`（#1819）の rootfs 構築を写した（crate が違うため共有できない）。
-//! ELF 解析・`/proc/self/maps` の解釈は `get()` と checked 演算だけで行う（外部入力の経路の規約）。
+//! `crates/supervisor/tests/supervisor_bin_real.rs`（#1819）の rootfs 構築と同じで、解析部品（ELF・maps・
+//! `LD_LIBRARY_PATH`）は core の `tests/support/loader_deps.rs`、コピーは `file_copy.rs`（`create_new`）と共有する
+//! （#2963・#3041）。エラーにパスを載せない契約は、ここの包み（`io_err`）が `ErrorKind` だけを出して保つ。
 //! bundle は計測の前に 1 回だけ作り、全試行で再利用する（区間の外）。
 
 use super::StartupLatencyError;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
+
+/// ELF の解析・maps の解釈・`LD_LIBRARY_PATH` の組み立て。core・supervisor・cli の試験と共有する
+/// （`#[path]`。置き場所の判断は同ファイルの `//!`。#2963・REPAIR-1）。
+#[path = "../../../crates/core/tests/support/loader_deps.rs"]
+mod loader_deps;
+
+/// `create_new` のコピー。core・supervisor・cli の試験と共有する（#3041・REPAIR-1）。エラー整形は呼び出し側。
+#[path = "../../../crates/core/tests/support/file_copy.rs"]
+mod file_copy;
 
 fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
     StartupLatencyError::new("io-error", format!("{what} failed ({:?})", e.kind()))
@@ -23,23 +33,9 @@ fn mkdir_all(path: &Path, mode: u32) -> Result<(), StartupLatencyError> {
         .map_err(|e| io_err("create directory", &e))
 }
 
-fn chmod(path: &Path, mode: u32) -> Result<(), StartupLatencyError> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| io_err("set permissions", &e))
-}
-
-/// `src` を `dest` へ新規作成でコピーする。宛先は `create_new`（O_CREAT|O_EXCL）で開くため、既存のファイルや
-/// symlink があれば（指す先を辿らずに）失敗し、呼び出しユーザーの任意のファイルを上書きしない。mode は 0755。
+/// 共有部品 `file_copy::copy_new`（`create_new`・symlink を辿らない・mode 0755）の包み。エラーは `ErrorKind` だけを出す。
 fn copy_new(src: &Path, dest: &Path, what: &'static str) -> Result<(), StartupLatencyError> {
-    let mut input = std::fs::File::open(src).map_err(|e| io_err(what, &e))?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(dest)
-        .map_err(|e| io_err(what, &e))?;
-    std::io::copy(&mut input, &mut output).map_err(|e| io_err(what, &e))?;
-    chmod(dest, 0o755)
+    file_copy::copy_new(src, dest).map_err(|e| io_err(what, &e))
 }
 
 /// `host` のファイルを rootfs 内の同じ絶対パスへコピーする。
@@ -51,68 +47,7 @@ fn copy_into(rootfs: &Path, host: &Path) -> Result<(), StartupLatencyError> {
     if let Some(parent) = dest.parent() {
         mkdir_all(parent, 0o755)?;
     }
-    let _ = std::fs::remove_file(&dest);
-    copy_new(host, &dest, "copy library")
-}
-
-/// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` と checked 演算で検査する。
-fn elf_interp(exe: &[u8]) -> Option<String> {
-    let u16_at = |o: usize| {
-        Some(u16::from_le_bytes(
-            exe.get(o..o.checked_add(2)?)?.try_into().ok()?,
-        ))
-    };
-    let u32_at = |o: usize| {
-        Some(u32::from_le_bytes(
-            exe.get(o..o.checked_add(4)?)?.try_into().ok()?,
-        ))
-    };
-    let u64_at = |o: usize| {
-        Some(u64::from_le_bytes(
-            exe.get(o..o.checked_add(8)?)?.try_into().ok()?,
-        ))
-    };
-    if exe.get(0..4)? != b"\x7fELF" {
-        return None;
-    }
-    let phoff = usize::try_from(u64_at(0x20)?).ok()?;
-    let phentsize = usize::from(u16_at(0x36)?);
-    let phnum = usize::from(u16_at(0x38)?);
-    for i in 0..phnum {
-        let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
-        if u32_at(base)? == 3 {
-            let off = usize::try_from(u64_at(base.checked_add(8)?)?).ok()?;
-            let len = usize::try_from(u64_at(base.checked_add(32)?)?).ok()?;
-            let raw = exe.get(off..off.checked_add(len)?)?;
-            let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-            return String::from_utf8(raw.get(..end)?.to_vec()).ok();
-        }
-    }
-    None
-}
-
-/// `/proc/self/maps` の本文から、読み込み済み共有ライブラリの実パスを重複なしで集める。
-fn libraries_from_maps(maps: &str, exe: &Path) -> Vec<PathBuf> {
-    let mut libs: Vec<PathBuf> = Vec::new();
-    for line in maps.lines() {
-        let Some(path) = line.split_whitespace().nth(5) else {
-            continue;
-        };
-        let p = PathBuf::from(path);
-        if !path.starts_with('/')
-            || p == exe
-            || ["/dev/", "/proc/", "/sys/", "/tmp/", "/memfd:"]
-                .iter()
-                .any(|pre| path.starts_with(pre))
-            || libs.contains(&p)
-        {
-            continue;
-        }
-        if std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-            libs.push(p);
-        }
-    }
-    libs
+    file_copy::replace_with_copy(host, &dest).map_err(|e| io_err("copy library", &e))
 }
 
 /// 最小 rootfs を作り、`LD_LIBRARY_PATH` に使う値を返す。
@@ -126,20 +61,15 @@ fn make_rootfs(rootfs: &Path) -> Result<String, StartupLatencyError> {
     let probe = rootfs.join("probe");
     copy_new(&exe, &probe, "copy probe binary")?;
     let bytes = std::fs::read(&exe).map_err(|e| io_err("read current exe", &e))?;
-    if let Some(interp) = elf_interp(&bytes) {
+    if let Some(interp) = loader_deps::elf_interp(&bytes) {
         copy_into(rootfs, Path::new(&interp))?;
     }
     let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| io_err("read maps", &e))?;
-    let mut lib_dirs: Vec<String> = Vec::new();
-    for lib in libraries_from_maps(&maps, &exe) {
-        copy_into(rootfs, &lib)?;
-        if let Some(dir) = lib.parent().and_then(Path::to_str)
-            && !lib_dirs.iter().any(|d| d == dir)
-        {
-            lib_dirs.push(dir.to_string());
-        }
+    let libs = loader_deps::libraries_from_maps(&maps, &exe);
+    for lib in &libs {
+        copy_into(rootfs, lib)?;
     }
-    Ok(lib_dirs.join(":"))
+    Ok(loader_deps::ld_library_path(&libs))
 }
 
 /// `<dir>/bundle`（rootfs と `config.json`）を作り、bundle のパスを返す。`nonce` は英数字（後始末の目印）。
@@ -170,6 +100,7 @@ pub fn build_bundle(dir: &Path, nonce: &str) -> Result<PathBuf, StartupLatencyEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn le_elf_with_interp(interp: &[u8]) -> Vec<u8> {
         // 最小の ELF64 ヘッダ + 1 個のプログラムヘッダ（PT_INTERP）+ 文字列。
@@ -191,18 +122,18 @@ mod tests {
     fn interp_is_extracted() {
         let elf = le_elf_with_interp(b"/lib64/ld-linux-x86-64.so.2");
         assert_eq!(
-            elf_interp(&elf).as_deref(),
+            loader_deps::elf_interp(&elf).as_deref(),
             Some("/lib64/ld-linux-x86-64.so.2")
         );
     }
 
     #[test]
     fn truncated_or_non_elf_input_is_none() {
-        assert_eq!(elf_interp(b"not elf"), None);
+        assert_eq!(loader_deps::elf_interp(b"not elf"), None);
         let mut elf = le_elf_with_interp(b"/lib/ld.so");
         elf.truncate(0x50);
-        assert_eq!(elf_interp(&elf), None);
-        assert_eq!(elf_interp(&[]), None);
+        assert_eq!(loader_deps::elf_interp(&elf), None);
+        assert_eq!(loader_deps::elf_interp(&[]), None);
     }
 
     #[test]
@@ -212,39 +143,130 @@ mod tests {
 7f01-7f02 r-xp 0 00:00 0 [vdso]\n\
 7f02-7f03 r-xp 0 00:00 0\n\
 7f03-7f04 r-xp 0 00:00 0 /nonexistent/libx.so\n";
-        assert!(libraries_from_maps(maps, Path::new("/x/exe")).is_empty());
+        assert!(loader_deps::libraries_from_maps(maps, Path::new("/x/exe")).is_empty());
     }
 
-    #[test]
-    fn copy_new_refuses_existing_symlink_without_following_it() {
-        let dir = std::env::temp_dir().join(format!("fc-bundle-copy-{}", std::process::id()));
+    /// 試験ごとの使い捨てディレクトリ（`src` に内容 `new` を置く）。
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fc-filecopy-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::write(dir.join("src"), b"new").expect("write src");
+        dir
+    }
+
+    fn is_symlink(p: &Path) -> bool {
+        std::fs::symlink_metadata(p)
+            .expect("lstat")
+            .file_type()
+            .is_symlink()
+    }
+
+    /// REPAIR-12・#3041: 新規作成は内容が写り mode 0755。
+    #[test]
+    fn copy_new_creates_with_0755() {
+        let dir = scratch("create");
+        let dest = dir.join("dest");
+        file_copy::copy_new(&dir.join("src"), &dest).expect("copy");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"new");
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-12・#3041: 既存の通常ファイルは `AlreadyExists` で内容も変わらない。
+    #[test]
+    fn copy_new_refuses_existing_file() {
+        let dir = scratch("exist");
+        let dest = dir.join("dest");
+        std::fs::write(&dest, b"old").expect("write");
+        let e = file_copy::copy_new(&dir.join("src"), &dest).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"old");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-12・SEC-2・#3041: 宛先が symlink なら辿らず失敗し、指す先は変わらない。
+    #[test]
+    fn copy_new_refuses_symlink_without_following_it() {
+        let dir = scratch("symlink");
         let victim = dir.join("victim");
         std::fs::write(&victim, b"keep").expect("write");
-        let src = dir.join("src");
-        std::fs::write(&src, b"new").expect("write");
         let dest = dir.join("dest");
         std::os::unix::fs::symlink(&victim, &dest).expect("symlink");
-        let e = copy_new(&src, &dest, "copy test").unwrap_err();
-        assert_eq!(e.code, "io-error");
+        let e = file_copy::copy_new(&dir.join("src"), &dest).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).expect("read"), b"keep");
+        assert!(is_symlink(&dest));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-12・SEC-2・#3041: dangling symlink でも失敗し、指す先は作られない。
+    #[test]
+    fn copy_new_refuses_dangling_symlink_without_creating_target() {
+        let dir = scratch("dangling");
+        let target = dir.join("target");
+        let dest = dir.join("dest");
+        std::os::unix::fs::symlink(&target, &dest).expect("symlink");
+        let e = file_copy::copy_new(&dir.join("src"), &dest).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-12・#3041: `replace_with_copy` は symlink 自体を消して通常ファイルを作り、指す先は変えない
+    /// （`fs::copy` が symlink 越しに書いていた挙動との差を固定する）。
+    #[test]
+    fn replace_with_copy_replaces_symlink_not_its_target() {
+        let dir = scratch("replace-link");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep").expect("write");
+        let dest = dir.join("dest");
+        std::os::unix::fs::symlink(&victim, &dest).expect("symlink");
+        file_copy::replace_with_copy(&dir.join("src"), &dest).expect("replace");
+        assert!(!is_symlink(&dest));
+        assert_eq!(std::fs::read(&dest).expect("read"), b"new");
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
         assert_eq!(std::fs::read(&victim).expect("read"), b"keep");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    /// REPAIR-12・#3041: `replace_with_copy` は既存の通常ファイルを置き換える。
     #[test]
-    fn copy_new_refuses_existing_file_and_creates_new_with_0755() {
-        let dir = std::env::temp_dir().join(format!("fc-bundle-copy2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).expect("mkdir");
-        let src = dir.join("src");
-        std::fs::write(&src, b"new").expect("write");
+    fn replace_with_copy_replaces_existing_file() {
+        let dir = scratch("replace-file");
         let dest = dir.join("dest");
-        copy_new(&src, &dest, "copy test").expect("first copy");
+        std::fs::write(&dest, b"old").expect("write");
+        file_copy::replace_with_copy(&dir.join("src"), &dest).expect("replace");
         assert_eq!(std::fs::read(&dest).expect("read"), b"new");
-        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
-        assert_eq!(mode & 0o777, 0o755);
-        assert!(copy_new(&src, &dest, "copy test").is_err());
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// REPAIR-8・#3041: 包みはパスを載せず `io-error` と `ErrorKind` だけを出す。
+    #[test]
+    fn copy_new_wrapper_reports_kind_without_path() {
+        let dir = scratch("wrapper");
+        let dest = dir.join("dest");
+        std::fs::write(&dest, b"old").expect("write");
+        let e = copy_new(&dir.join("src"), &dest, "copy test").unwrap_err();
+        assert_eq!(e.code, "io-error");
+        assert!(!e.message.contains("fc-filecopy"), "{}", e.message);
+        assert!(e.message.contains("AlreadyExists"), "{}", e.message);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn ld_library_path_dedups_parents_in_order() {
+        let libs = [
+            PathBuf::from("/a/lib/x.so"),
+            PathBuf::from("/b/y.so"),
+            PathBuf::from("/a/lib/z.so"),
+        ];
+        assert_eq!(loader_deps::ld_library_path(&libs), "/a/lib:/b");
+        assert_eq!(loader_deps::ld_library_path(&[]), "");
     }
 }

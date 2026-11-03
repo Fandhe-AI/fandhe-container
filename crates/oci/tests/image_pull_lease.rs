@@ -48,8 +48,9 @@ fn oci7_reuse_leases_and_staged_blob_is_invisible() {
     let reuse = session.lease_existing_blob(&cached).expect("lease");
     assert!(matches!(reuse, BlobReuse::Leased(_)));
 
-    let staged = session.staged_blob_path(&d(2)).expect("staged");
-    fs::write(&staged, vec![7u8; 64]).expect("write staged");
+    let mut w = session.open_staged_blob(&d(2)).expect("writer");
+    std::io::Write::write_all(&mut w, &[7u8; 64]).expect("write staged");
+    w.commit().expect("commit");
 
     let guard = store.lock().expect("lock");
     assert_eq!(guard.blob_references(&cached).leases, vec![id]);

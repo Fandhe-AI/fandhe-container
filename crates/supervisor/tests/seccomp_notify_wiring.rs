@@ -4,9 +4,14 @@
 //! `user_notif_probe_for_test`）を、起動と再起動の両方で `run_start` → `run_supervised` が受け取って応答ハブへ渡すこと、
 //! listener が届かないときは起動したプロセスを回収して非 0 で終わること（fail-closed）を具体値で照合する。
 //! launcher はテスト用のフェイク（本番 launcher が PID 1 から listener を渡す部分は core の `tests/production_launcher.rs`
-//! が照合する。再 launch が本番で成り立つかは #2043）。root 不要。Linux 限定。
+//! が照合する。再 launch の本番での成立は #2043 で、`supervisor_bin_real` のシナリオ C が照合する）。root 不要。Linux 限定。
 
 #![cfg(target_os = "linux")]
+
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
 
 use std::num::{NonZeroU8, NonZeroU32};
 use std::path::PathBuf;
@@ -37,17 +42,17 @@ struct Env {
     id: String,
     base: PathBuf,
     store: Arc<dyn StateStore>,
+    /// tmpfiles の flock 走査から守る親（#3026）。`base` はその子。最後のフィールドで、`Drop` の後に親が消える。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Env {
     fn new(tag: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let base = std::env::temp_dir().join(format!(
-            "fandhe-sup-seccomp-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let scratch =
+            scratch_root::ScratchDir::new("fandhe-sup-seccomp", std::time::Duration::from_secs(10));
+        let base = scratch.path().join(format!("{tag}-{n}"));
         std::fs::create_dir_all(base.join("bundle/rootfs")).unwrap();
         std::fs::write(
             base.join("bundle/config.json"),
@@ -64,7 +69,12 @@ impl Env {
         let id = format!("c-{tag}-{n}");
         let req = CreateRequest::new(ContainerId::new(&id).unwrap(), base.join("bundle")).unwrap();
         create(store.as_ref(), &OpRecorder::new(), &req).unwrap();
-        Self { id, base, store }
+        Self {
+            id,
+            base,
+            store,
+            _scratch: scratch,
+        }
     }
 }
 

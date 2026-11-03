@@ -20,7 +20,7 @@
 //! `ProductionLauncher` は [`LaunchMode::SelfBounded`] を宣言し、start は別スレッドを作らず呼び出しスレッドで
 //! 直接 `launch` を呼ぶ。起動済みの子の終了・回収は `ContainerChildProcess`(Linux。`exec::ContainerChild` の
 //! 回収状態の排他を再利用する)が担う。実機前提の結合試験は `tests/production_launcher.rs`(#1818。実行は
-//! `-- --ignored`)。supervisor の呼び出しスレッドの再構成(#1819)は後続(REPAIR-3)。
+//! `-- --ignored`)。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み(#1819)。restart の再 launch は supervisor が呼び出しスレッドで直接行う(#2043)。
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
@@ -37,6 +37,8 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
+use super::namespace_join::NamespaceJoin;
+use super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
@@ -348,6 +350,14 @@ impl Eq for RootfsDir {}
 /// 立つ（その者は config.json と rootfs を丸ごと差し替えて起動内容を制御できるため、新たな能力にはならない）。
 /// bundle とその祖先を書き換えられない者に対する排他である。
 ///
+/// # 既知の制約（待たない取得と tmpfiles の aging 走査。#2840・CORE-2・REPAIR-5）
+///
+/// 取得は待たない（`try_lock`）。bundle の inode を読み取りで開ける者が一時的に `flock` を持つと、create・start・
+/// delete が `FailedPrecondition`（`container start is in progress in another process`）で失敗しうる。
+/// 例は `systemd-tmpfiles-clean` で、aging 対象のディレクトリ（Ubuntu の `/tmp`・`/var/tmp`）の走査中は
+/// サブディレクトリごとに `flock(LOCK_EX|LOCK_NB)` を取る。そこに bundle を置くと、走査と重なった 1 回だけ
+/// 誤って失敗する。挙動は変えていない（方式の見直しは追跡 issue で判断する）。
+///
 /// # 設計判断（起動権の排他方式。#1316・2026-10-12 確定、#1854。CORE-2・OCI-5・PLUG-1・SEC-1）
 ///
 /// 起動権は、revision 照合つきの `StateStore::update`（Created から Running・pid なし）と、この
@@ -481,6 +491,19 @@ pub struct LaunchSpec {
     working_dir: ContainerWorkingDir,
     /// `process.user` の (uid, gid)（名前空間内の値。写像との整合は launcher が fork 前に検査する。OCI-1・SEC-5）。
     user: (u32, u32),
+    /// `process.user.additionalGids`（start が件数の上限を検証済み。写像との照合と適用は launcher。
+    /// OCI-1・SEC-5・CORE-6・#2667）。
+    additional_gids: Vec<u32>,
+    /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
+    /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+    namespace_join: Option<NamespaceJoin>,
+    /// start が起動オプションと config を突き合わせた network の実効の扱い(NET-6・SEC-1・#3058)。
+    network: EffectiveNetwork,
+    /// 突き合わせに使ったモード(launcher が自身のモードと照合し、転送漏れによる縮退を拒否する)。
+    network_mode: LaunchNetworkMode,
+    /// `start` が使った状態ルート（`StateStore::host_state_root()`。管理ルートの `/etc/hosts` 等の元の場所を導く入力。
+    /// 無ければ `None`。NET-12・#1872）。
+    state_root: Option<PathBuf>,
 }
 
 impl LaunchSpec {
@@ -515,7 +538,75 @@ impl LaunchSpec {
             sysfs: None,
             working_dir,
             user,
+            additional_gids: Vec::new(),
+            namespace_join: None,
+            network: EffectiveNetwork::HostShared,
+            network_mode: LaunchNetworkMode::FromConfig,
+            state_root: None,
         }
+    }
+
+    /// 突き合わせた network の扱いとそのモードを載せる(`start` だけが呼ぶ。NET-6・#3058)。
+    pub(super) fn with_network(
+        mut self,
+        network: EffectiveNetwork,
+        mode: LaunchNetworkMode,
+    ) -> Self {
+        self.network = network;
+        self.network_mode = mode;
+        self
+    }
+
+    /// network の実効の扱い(NET-6・SEC-1)。`NewLoopback` は新しい netns の作成を要求する(実体は #3064 で実装済み。`Attachable` モードも同じ実効値で、同期点が fd 2 本を渡す差だけ。#1939)。
+    pub fn network(&self) -> EffectiveNetwork {
+        self.network
+    }
+
+    /// `network()` を決めた起動オプションのモード。
+    pub fn network_mode(&self) -> LaunchNetworkMode {
+        self.network_mode
+    }
+
+    /// `start` が使った状態ルートを載せる(`start` だけが呼ぶ。呼び出し側が任意のパスを渡す入口にしない。NET-12・#1872)。
+    pub(super) fn with_state_root(mut self, state_root: Option<PathBuf>) -> Self {
+        self.state_root = state_root;
+        self
+    }
+
+    /// `start` が使った状態ルート(`StateStore::host_state_root()` の値。無ければ `None`)。
+    ///
+    /// 本番 launcher が、`LaunchOptions::etc_files` の指定時に `<state_root>/@container-etc/<id>/` の生成物を
+    /// fork 前に検証するために使う(NET-12・#1872)。
+    pub fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
+    }
+
+    /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。
+    pub(super) fn with_additional_gids(mut self, gids: Vec<u32>) -> Self {
+        self.additional_gids = gids;
+        self
+    }
+
+    /// `process.user.additionalGids`（名前空間内の値。OCI-1・SEC-5・CORE-6・#2667）。
+    ///
+    /// 本番 launcher が fork の前に gid の写像と照合し、子の capability 削減段が `setgroups(list)` で適用する。
+    /// 空なら補助グループを持たせない（持ち越しもしない）。
+    pub fn additional_gids(&self) -> &[u32] {
+        &self.additional_gids
+    }
+
+    /// 検証済みの pod の namespace への join を載せる（`start` と launcher の試験が呼ぶ。#2674）。
+    pub(super) fn with_namespace_join(mut self, join: Option<NamespaceJoin>) -> Self {
+        self.namespace_join = join;
+        self
+    }
+
+    /// pod の user・ipc namespace への join（無ければ `None`。CRI-2・CORE-3。#2674）。
+    ///
+    /// 本番 launcher が中間プロセスの分離で `setns` に使う。`namespaces()` には `User`・`Ipc` が含まれ（新規作成ではなく
+    /// join する）、restart の再 launch でも同じ fd を使う。
+    pub fn namespace_join(&self) -> Option<&NamespaceJoin> {
+        self.namespace_join.as_ref()
     }
 
     /// 検証済みの sysfs の指定を載せる（`start` だけが呼ぶ。#2020）。
@@ -657,7 +748,8 @@ impl std::fmt::Debug for ContainerOutput {
 /// start が成功すると、ハンドルは `StartedContainer` として呼び出し元へ引き渡され、呼び出し元
 /// （supervisor〔TASK-157・SUP 系〕等）が監視・回収の所有者になる（[`Self::wait`]・[`Self::terminate`]）。
 /// 実装は `Drop` で kill / 回収しなくてよい（コンテナの寿命をハンドルに暗黙で縛らない）ため、所有者は
-/// 終了まで待って回収する責任を負う。
+/// 終了まで待って回収する責任を負う。なお本番 launcher のハンドルは drop 時に、シグナルも待ちも伴わずに子を起動台帳へ
+/// 戻す（未回収なら後続の `confirm_no_process` が止める。#3432）。
 pub trait LaunchedProcess: Send {
     /// 起動したコンテナプロセスの pid。**コンテナの PID 1**（launcher の PID namespace から見て `NSpid` が
     /// 2 要素で末尾 1）を指すこと。中間プロセス（fork 親・mapper・代役 init）を返してはならない。違反すると
@@ -736,6 +828,14 @@ pub trait LaunchedProcess: Send {
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         None
     }
+
+    /// launch が `Rlimits` 段へ渡した全 16 種の rlimit 集合(`--ulimit` の指定値と継承値の補完。SUP-12・#2713)。
+    /// start / restart が Running の更新と同じ `update` で `state.json` へ書き、exec の再適用が launch と同じ制限を
+    /// 載せる根拠になる。`LaunchedProcess` を包み直す実装は内側へ転送すること(`launch_isolation` と同じ注意)。
+    /// 持たない実装は `None`(既定。前の記録が引き継がれる)。
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -747,7 +847,9 @@ pub trait LaunchedProcess: Send {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct ContainerChildProcess {
-    child: crate::exec::ContainerChild,
+    /// `Arc` なのは、Drop で未回収の子を起動台帳へ移す（`drop_notice`）ため。子のハンドル（pidfd と回収状態の
+    /// 排他）をそのまま渡し、pid の番号から作り直さない（pid 再利用で別のプロセスを止めない。SEC-1）。
+    child: Arc<crate::exec::ContainerChild>,
     pid: NonZeroU32,
     /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
     /// `&self` のため `Mutex` で保持する。
@@ -757,8 +859,14 @@ pub struct ContainerChildProcess {
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
+    /// ハンドルを drop したときに 1 回呼ぶ通知（子と、回収済みか）。本番 launcher が、`terminate` に失敗した
+    /// まま捨てられた子を起動台帳へ戻すために付ける（確認つき回復が `Handed` で詰まらないように。
+    /// CORE-2・NET-9・REPAIR-5・#3432）。
+    drop_notice: Option<DropNotice>,
     /// launch が確定した分離の記録（本番 launcher が付ける。[`LaunchedProcess::launch_isolation`]）。
     launch_isolation: Option<crate::launch_isolation::LaunchIsolationRecord>,
+    /// launch が `Rlimits` 段へ渡した全 16 種の集合(本番 launcher が付ける。[`LaunchedProcess::launch_rlimits`])。
+    launch_rlimits: Option<crate::rlimits::Rlimits>,
     /// SIGSYS 終了の補助記録（SEC-4・ESC-06・#2004）。本番 launcher だけが付ける。
     exit_audit: Option<ExitAudit>,
 }
@@ -797,6 +905,34 @@ impl std::fmt::Debug for ReapNotice {
     }
 }
 
+/// [`ContainerChildProcess::with_drop_notice`] の通知（引数は子のハンドルと、drop 時点で回収済みか）。
+#[cfg(target_os = "linux")]
+type DropNoticeFn = Box<dyn Fn(Arc<crate::exec::ContainerChild>, bool) + Send + Sync>;
+
+/// drop 通知の入れ物（`Debug` を手で実装する。クロージャは `Debug` を持たないため）。
+#[cfg(target_os = "linux")]
+struct DropNotice(DropNoticeFn);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for DropNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropNotice")
+    }
+}
+
+/// 本番 launcher のハンドルは drop 時に、通知を付けていれば子を起動台帳へ戻す(シグナルも待ちも伴わない)。
+/// 回収済みなら `Clean`、未回収なら `Pending` として、後続の `confirm_no_process` と再 launch の `admit` が
+/// 期限つきで kill・回収する(#3432)。
+#[cfg(target_os = "linux")]
+impl Drop for ContainerChildProcess {
+    fn drop(&mut self) {
+        if let Some(notice) = &self.drop_notice {
+            let reaped = self.child.is_reaped();
+            (notice.0)(Arc::clone(&self.child), reaped);
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl ContainerChildProcess {
     /// fork した子のハンドルから作る。pid が 0 のハンドルは `InvalidArgument`（fork の戻り値では生じない）。
@@ -808,12 +944,14 @@ impl ContainerChildProcess {
             )
         })?;
         Ok(Self {
-            child,
+            child: Arc::new(child),
             pid,
             output: std::sync::Mutex::new(None),
             seccomp_listener: std::sync::Mutex::new(None),
             reap_notice: None,
+            drop_notice: None,
             launch_isolation: None,
+            launch_rlimits: None,
             exit_audit: None,
         })
     }
@@ -825,6 +963,13 @@ impl ContainerChildProcess {
         record: crate::launch_isolation::LaunchIsolationRecord,
     ) -> Self {
         self.launch_isolation = Some(record);
+        self
+    }
+
+    /// launch が適用した全 16 種の rlimit 集合を持たせる([`LaunchedProcess::launch_rlimits`] で返る。#2713)。
+    #[must_use]
+    pub(crate) fn with_launch_rlimits(mut self, rlimits: crate::rlimits::Rlimits) -> Self {
+        self.launch_rlimits = Some(rlimits);
         self
     }
 
@@ -890,6 +1035,14 @@ impl ContainerChildProcess {
         self
     }
 
+    /// ハンドルを drop したときに呼ぶ通知を持たせる（起動台帳への子の引き継ぎ。CORE-2・#3432）。
+    /// 通知は台帳の Mutex を短く取るだけで、待たない・シグナルを送らない。
+    #[must_use]
+    pub(crate) fn with_drop_notice(mut self, notice: DropNoticeFn) -> Self {
+        self.drop_notice = Some(DropNotice(notice));
+        self
+    }
+
     /// 子の stdout / stderr の読み取り側を持たせる（`exec::ChildStdio::pipes` が返したもの。#1471）。
     /// [`LaunchedProcess::take_output`] で 1 回だけ取り出される。
     #[must_use]
@@ -936,6 +1089,10 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
         self.launch_isolation.as_ref()
+    }
+
+    fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+        self.launch_rlimits.as_ref()
     }
 
     fn take_output(&self) -> Option<ContainerOutput> {
@@ -1045,6 +1202,14 @@ pub trait ProcessLauncher: Send + Sync {
         None
     }
 
+    /// 起動オプションの network モード(NET-6・SEC-1・#3058)。start が予約・fork より前に config と突き合わせる。
+    ///
+    /// 既定は `FromConfig`。ラッパー実装は必ず内側へ転送すること(転送しないと `FromConfig` へ黙って縮退する。
+    /// 本番 launcher は spec のモードと自身のモードの不一致を `FailedPrecondition` で拒否する)。
+    fn network_mode(&self) -> LaunchNetworkMode {
+        LaunchNetworkMode::FromConfig
+    }
+
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。
     fn launch(
         &self,
@@ -1123,9 +1288,13 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-bundle-lock-inherit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 製品の `BundleLock` は `ScratchDir` 自身ではなくその子の bundle にかける（親の共有 flock と衝突させない。#3373）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-bundle-lock-inherit",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
+        std::fs::create_dir(&dir).expect("mkdir");
         let lock = BundleLock::acquire(&dir).expect("acquire");
         // 子の stdin へ同じ OFD の dup を渡し、fork 継承で fd が残る状況を模す。
         let dup = lock._file.try_clone().expect("dup");
@@ -1151,7 +1320,6 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(dup);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5: 上限は 0 と `START_TIMEOUT_MAX` 超過を拒否し、境界値は受理する。
@@ -1353,23 +1521,19 @@ mod tests {
 
     /// テスト用の一意なディレクトリ（終了時に削除）。
     #[cfg(target_os = "linux")]
-    struct TempDir(PathBuf);
+    struct TempDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     #[cfg(target_os = "linux")]
     impl TempDir {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-oci-launch-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("mkdir");
-            Self(dir)
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-oci-launch-{name}"), "d");
+            Self(dir, scratch)
         }
     }
 

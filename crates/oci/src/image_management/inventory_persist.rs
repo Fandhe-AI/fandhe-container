@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use super::root_handle::RootHandle;
+use super::root_handle::{RootHandle, map_root_io};
 use super::tag::MAX_TAG_REFS;
 use super::{ManifestComposition, PullId, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
@@ -273,11 +273,13 @@ fn load_with_limits(
     let pre = match root.stat_name(IMAGE_INVENTORY_FILE_NAME) {
         Ok(Some(m)) => m,
         Ok(None) => return Ok(None),
-        Err(_) => {
-            return Err(e(
-                OciErrorCode::Internal,
-                "failed to inspect the image inventory file",
-            ));
+        Err(err) => {
+            return Err(map_root_io(&err, || {
+                e(
+                    OciErrorCode::Internal,
+                    "failed to inspect the image inventory file",
+                )
+            }));
         }
     };
     check_trust(&pre)?;
@@ -289,7 +291,7 @@ fn load_with_limits(
     };
     let file = root
         .open_read(IMAGE_INVENTORY_FILE_NAME)
-        .map_err(|_| open_failed())?
+        .map_err(|err| map_root_io(&err, open_failed))?
         .ok_or_else(open_failed)?;
     let post = file.metadata().map_err(|_| {
         e(
@@ -727,9 +729,11 @@ fn save_with_limits(
 /// 一時ファイルを書いて固定名へ公開し、root を fsync する。すべて検査済み root の fd 起点（#2638）。
 fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), OciError> {
     let fail = |msg: &'static str| e(OciErrorCode::Internal, msg);
+    // root 配下の別マウント（EXDEV）は対応外として原因を示す（#2701）。
+    let fail_io = |err: &std::io::Error, msg: &'static str| map_root_io(err, || fail(msg));
     let mut f = root
         .create_new(tmp)
-        .map_err(|_| fail("failed to create the image inventory temp file"))?;
+        .map_err(|err| fail_io(&err, "failed to create the image inventory temp file"))?;
     f.write_all(bytes)
         .map_err(|_| fail("failed to write the image inventory temp file"))?;
     f.sync_all()
@@ -738,7 +742,7 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
     // 確定の直前に、root が unlink されて到達不能になっていないことを確かめる。
     root.ensure_linked()?;
     root.rename(tmp, IMAGE_INVENTORY_FILE_NAME)
-        .map_err(|_| fail("failed to replace the image inventory file"))?;
+        .map_err(|err| fail_io(&err, "failed to replace the image inventory file"))?;
     // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。
     root.sync()
         .map_err(|_| fail("failed to sync the image store directory"))?;
@@ -751,7 +755,6 @@ mod tests {
     use crate::image_management::ImageStore;
     use crate::image_management::root_handle::rh;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
     fn d(n: u8) -> Digest {
@@ -770,20 +773,86 @@ mod tests {
         PullId::new(s).expect("pull id")
     }
 
-    fn root(label: &str) -> PathBuf {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "fc-oci-inv-persist-{}-{}-{label}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&p).expect("mkdir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
-        p
+    /// 試験ごとに一意な一時 root。既存の名前は消さず・辿らず、排他作成（unix は 0700）で作り、
+    /// drop で自分が作ったパスだけを消す（共有部品 `test_root`。#3237・#3506・OCI-7・REPAIR-12）。
+    use crate::test_root::TestRoot;
+
+    /// 指定パスを第 1 候補に root を排他作成する。既にあれば別名になるため、呼び出し側は返り値を使う。
+    fn root_at(p: PathBuf) -> TestRoot {
+        crate::test_root::test_root_at(p)
+    }
+
+    fn root(label: &str) -> TestRoot {
+        crate::test_root::test_root("fc-oci-inv-persist", label)
+    }
+
+    /// OCI-7・REPAIR-12・#3506: 前回の実行の残骸（同名ディレクトリとその中身）があっても消さず辿らず、
+    /// 別名の空の root から始まり、後始末は新しい root だけを消す。
+    #[test]
+    fn oci7_repair12_3506_root_at_leaves_stale_residue_untouched() {
+        let parent = root("residue-parent");
+        let p = parent.join("stale");
+        fs::create_dir_all(p.join(IMAGE_INVENTORY_FILE_NAME)).expect("residue dir");
+        let stale_tmp = p.join(format!("{IMAGE_INVENTORY_TMP_PREFIX}stale"));
+        fs::write(&stale_tmp, b"stale").expect("residue tmp");
+
+        let r = root_at(p.clone());
+        assert_ne!(&*r, p.as_path());
+        assert_eq!(r.parent(), Some(&*parent));
+        assert_eq!(fs::read_dir(&r).expect("read_dir").count(), 0);
+        // 残骸は無傷で残る。
+        assert!(p.join(IMAGE_INVENTORY_FILE_NAME).is_dir());
+        assert_eq!(fs::read(&stale_tmp).expect("read"), b"stale");
+        // 失敗した呼び出しと同じ排他作成が新しい root 上で成功する。
+        fs::create_dir(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("create_dir");
+        let err = load_image_inventory(&rh(&r)).expect_err("dir is not a file");
+        assert_eq!(err.code(), OciErrorCode::Internal);
+
+        let new_path = r.to_path_buf();
+        drop(r);
+        let gone = fs::symlink_metadata(&new_path).expect_err("removed on drop");
+        assert_eq!(gone.kind(), std::io::ErrorKind::NotFound);
+        assert!(p.join(IMAGE_INVENTORY_FILE_NAME).is_dir());
+    }
+
+    /// OCI-7・REPAIR-12・#3506: 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_repair12_3506_root_at_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let parent = root("symlink-parent");
+        let victim = parent.join("victim");
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let dangling = parent.join("dangling");
+        let target = parent.join("nowhere");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let r1 = root_at(link.clone());
+        let r2 = root_at(dangling.clone());
+        assert_ne!(&*r1, link.as_path());
+        assert_ne!(&*r2, dangling.as_path());
+        assert!(
+            !fs::symlink_metadata(&r1)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&r1).expect("read_dir").count(), 0);
+        assert_eq!(fs::read_dir(&victim).expect("victim dir").count(), 1);
+        assert_eq!(fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            fs::metadata(&victim).expect("meta").permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(fs::symlink_metadata(&dangling).is_ok());
     }
 
     fn open(root: &Path) -> ImageStore {
@@ -1087,7 +1156,6 @@ mod tests {
         let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
         assert_eq!(loaded.manifests.len(), MAX_IMAGE_MANIFESTS);
         assert_eq!(loaded.tag_refs.len(), MAX_TAG_REFS);
-        let _ = fs::remove_dir_all(&r);
     }
 
     /// OCI-7: 書き込み側も上限を守る（保存できない状態を作らない）。

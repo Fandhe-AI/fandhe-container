@@ -164,12 +164,31 @@ mod linux {
         });
 
         // 拒否された接続は 1 バイトも受け取らずに切断される。
+        // set_read_timeout は使わない: macOS では相手が閉じた socket への setsockopt が EINVAL に
+        // なるため（#2711。本試験は Linux 限定だが crates/plugin の試験と方式を揃える）。
+        // setsockopt を伴わない set_nonblocking と、全 client 共有の期限つきループで待つ。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         for mut client in clients {
-            client
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("read timeout");
+            client.set_nonblocking(true).expect("nonblocking");
             let mut buf = [0u8; 16];
-            let n = client.read(&mut buf).expect("read until EOF");
+            let n = loop {
+                match client.read(&mut buf) {
+                    Ok(n) => break n,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe => break 0,
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "no EOF from the rejecting server within the deadline"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        _ => panic!("unexpected read error: {e:?}"),
+                    },
+                }
+            };
             assert_eq!(n, 0, "a rejected peer must not receive any byte");
         }
 

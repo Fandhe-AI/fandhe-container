@@ -10,31 +10,32 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use fandhe_container_core::plugin_discovery::{
     DiscoveryOptions, PathSearchPolicy, PluginCandidate, PluginDirKind, PluginFileKind,
     PluginRegistry, PluginSearchDir, RegistrationStatus, discover_candidates,
     discover_with_options, write_path_warnings,
 };
 
-/// テスト用の一意な一時ディレクトリ（終了時に削除）。
-struct Tmp(PathBuf);
+/// テスト用の一意な一時ディレクトリ（排他作成した `ScratchDir` の子。drop で消える）。
+/// pid だけの名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
+struct Tmp(
+    PathBuf,
+    #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+    scratch_root::ScratchDir,
+);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "fandhe-plugin-discovery-{}-{}",
-            std::process::id(),
-            tag
-        ));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("create tmp dir");
-        Self(p)
-    }
-}
-
-impl Drop for Tmp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-plugin-discovery-{tag}"),
+            std::time::Duration::from_secs(10),
+        );
+        let p = scratch.path().join("d");
+        fs::create_dir(&p).expect("create tmp dir");
+        Self(p, scratch)
     }
 }
 

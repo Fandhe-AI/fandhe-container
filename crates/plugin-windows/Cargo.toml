@@ -6,7 +6,8 @@
 # E2E 結合試験（tests/e2e.rs）は TASK-116.6（#397）で追加した（依存の追加なし）。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # 依存は `fandhe-container-plugin`（境界機構）の workspace path 依存と、`fandhe-container-platform-windows` の path 依存
-# （TASK-116.3・#394。architecture.md・crate-naming.md 表 #17 で確定済みの内部辺）のみで、外部クレートの追加はない。
+# （TASK-116.3・#394。architecture.md・crate-naming.md 表 #17 で確定済みの内部辺）のみで、製品の依存に外部クレートはない
+# （試験専用の dev-dependency として `libc` のみ。下記・#1846）。
 # 外部クレートの追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -23,6 +24,11 @@ path = "src/main.rs"
 [dependencies]
 fandhe-container-plugin = { workspace = true }
 fandhe-container-platform-windows = { path = "../platform-windows" }
+
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1846・#1318・#1837・MVM-4・REPAIR-12）。製品の依存には入れない
+# （cargo tree -e normal,build に現れない）。`sys.rs` の宣言は unix でだけ有効なため unix に限る。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

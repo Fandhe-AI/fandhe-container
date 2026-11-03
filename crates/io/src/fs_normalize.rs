@@ -63,7 +63,9 @@
 //!
 //! # 検証の位置づけ（多層防御の 1 枚）
 //! `validate_guest_relative_path` は先頭 `/`・`.`・`..`・空コンポーネント・
-//! NUL を拒否するが、これはパストラバーサルを主目的として防ぐ層ではない。
+//! NUL を `guest_path::check_rules`（`STRUCTURAL`）で拒否する（規則の本体は
+//! `GuestPath::parse` と共有。禁止文字と長さ上限は、ホストの実在名も索引に入れるため
+//! 意図して当てない。#3352・REPAIR-1）。これはパストラバーサルを主目的として防ぐ層ではない。
 //! rootfs 配下への閉じ込めを保証する本来の検証は、サーバー側の書き込み経路
 //! （[`crate::guest_files`] のコンポーネント検証・祖先確認・`create_new`。#100）の
 //! 責務であり、本モジュールの検証はそれとは独立に、同一表記
@@ -74,7 +76,8 @@
 //! - サーバーのファイル作成経路への組み込み・結合試験 → #100（TASK-19.2。
 //!   `guest_files` で実装済み。ワイヤー上の作成要求は未実装）
 //! - パス長 260 超の検出: 検証関数は TASK-20.1（#102）で実装済み
-//!   （[`check_host_path_length`]）。書き込み経路への組み込みは後続（REPAIR-3）。
+//!   （[`check_host_path_length`]）。書き込み経路へは #3160 で `GuestFileCreator` に組み込み済み
+//!   （計測は [`measure_host_path_length`]。Windows ホストはエラー、その他の OS は警告）。
 //!   WIN-4 の per-directory case-sensitive フラグとの関係は記載済み
 //!   （[`check_host_path_length`] の doc の `# WIN-4 との関係` 節。TASK-20.2・#797）
 //! - NFC / NFD の方針の文書化は `docs/design/fs-normalization.md`（TASK-21.2・#106）に作成済み。
@@ -83,7 +86,11 @@
 //!   扱い → TASK-21 以降
 //! - Windows（Win32 API 経由）固有の名前の同一視（末尾の `.` / 空白の除去・
 //!   8.3 短縮名・`CON` 等の予約デバイス名）は大文字小文字とは別種の差異であり、
-//!   本モジュールは検出しない（担当タスク未確定）
+//!   いまは検出しない（#1317 のオーナー判断・2026-10-12）。理由は、spec（IO-5・WIN-4）
+//!   が求めていないこと、WSL2 の共有で実際に起きるかが実機で未確認なこと、名前だけで
+//!   3 OS 一律に拒否すると Linux で普通の名前（`aux.c` 等）まで拒否してしまうこと。
+//!   実機の観測は #379（TASK-68.h1）に記録する。観測項目と再検討の条件は
+//!   `docs/design/fs-normalization.md` を参照
 //! - 削除・リネームは追跡しない。登録は追加のみのため、時系列上は解消済みの
 //!   衝突（`Foo` を削除してから `foo` を作る等）も衝突として報告する
 //!   （過検出側。方針どおり）
@@ -107,8 +114,7 @@
 //! 大文字小文字の区別だけを変え、`MAX_PATH` を緩めない。詳細と、シンボリックリンク
 //! 作成時の Developer Mode 前提は [`check_host_path_length`] を参照（TASK-20.2・#797）。
 //!
-//! 未実装（REPAIR-3）: 書き込み経路（`GuestFileCreator` 等）への組み込み、
-//! `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
+//! 未実装（REPAIR-3）: `\\?\` 長パス・`LongPathsEnabled` 対応、コンポーネント単位の 255 制限。
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -342,55 +348,23 @@ struct NodeEntry {
 
 /// ゲスト相対パスの形式を検証する（[`CaseCollisionSet::try_insert`] の入口）。
 ///
-/// 次のいずれかに該当する場合は [`IoErrorCode::InvalidArgument`] を返す:
-/// - 空文字列
-/// - 先頭が `/`（絶対パス表現）
-/// - 空コンポーネントを含む（連続する `/`・先頭または末尾の `/`）
-/// - `.` または `..` のコンポーネントを含む
-/// - NUL 文字（`\0`）を含む
+/// 構造規則（空・NUL・絶対・空コンポーネント・`.` / `..`）だけを
+/// `guest_path::check_rules` の `STRUCTURAL` で検査し、違反は
+/// [`IoErrorCode::InvalidArgument`]（文言は `GuestPathError` のもの）にする。
+/// これらを拒否するのは、`a//B` のような表記ゆれが `a/b` と同じコンポーネント列に
+/// 畳み込まれて衝突検出をすり抜けることを防ぐため（多層防御の 1 枚であり、
+/// パストラバーサル防止の本体はサーバー側の責務。モジュール doc「検証の位置づけ」）。
 ///
-/// これらを個別に拒否するのは、`a//B` のような表記ゆれが `a/b` と同じ
-/// コンポーネント列に畳み込まれて衝突検出をすり抜けることを防ぐため
-/// （多層防御の 1 枚であり、パストラバーサル防止の本体はサーバー側の責務。
-/// モジュール doc「検証の位置づけ」参照）。
+/// 禁止文字（`\`・`:`）と長さ・件数の上限（`GUEST` の規則）は意図して当てない
+/// （#3352・REPAIR-1）。`guest_files::index_existing` がホストから読んだ実在エントリ名
+/// （Linux / macOS では `:` や `\` を含みうる。多バイト名や `prefix + name` が上限を
+/// 超えうる）も本検証を通して索引に入れ、`Invalid` を無視するため、全規則を当てると
+/// 実在項目が黙って索引から落ちて衝突を見逃す（IO-5 の過検出の方針に反する）。
+/// 公開 API の `CaseCollisionSet` でこれまで受理した入力が拒否に変わることもある。
 fn validate_guest_relative_path(path: &str) -> Result<Vec<&str>, IoError> {
-    if path.is_empty() {
-        return Err(IoError::new(
-            IoErrorCode::InvalidArgument,
-            "guest relative path must not be empty",
-        ));
-    }
-    if path.contains('\0') {
-        return Err(IoError::new(
-            IoErrorCode::InvalidArgument,
-            "guest relative path must not contain a NUL byte",
-        ));
-    }
-    if path.starts_with('/') {
-        return Err(IoError::new(
-            IoErrorCode::InvalidArgument,
-            "guest relative path must not be absolute (must not start with '/')",
-        ));
-    }
-
-    let components: Vec<&str> = path.split('/').collect();
-    for component in &components {
-        if component.is_empty() {
-            return Err(IoError::new(
-                IoErrorCode::InvalidArgument,
-                "guest relative path must not contain an empty component (repeated or \
-                 trailing '/')",
-            ));
-        }
-        if *component == "." || *component == ".." {
-            return Err(IoError::new(
-                IoErrorCode::InvalidArgument,
-                "guest relative path must not contain '.' or '..' components",
-            ));
-        }
-    }
-
-    Ok(components)
+    crate::guest_path::check_rules(path, crate::guest_path::GuestPathRules::STRUCTURAL)
+        .map_err(IoError::from)?;
+    Ok(path.split('/').collect())
 }
 
 /// エラーメッセージへ埋め込むためにパスを衛生化する（改行・制御文字による
@@ -423,6 +397,34 @@ pub(crate) fn quote_for_message(path: &str) -> String {
     format!("{kept:?}")
 }
 
+/// 衝突の種類（Nack の reason の `CaseCollision` / `NormalizationCollision` に対応。
+/// F10・#3160）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollisionKind {
+    /// 大文字小文字の畳み込みだけで一致する。
+    Case,
+    /// 正規化（NFC / NFD）を経て初めて一致する。
+    Normalization,
+}
+
+/// [`CaseCollisionSet::check_insertable_detailed`] の失敗（種類を保つ）。
+pub(crate) enum InsertCheckError {
+    /// 形式不正（`InvalidArgument`）。
+    Invalid(IoError),
+    /// 既存コンポーネントとの衝突（`AlreadyExists`）。
+    Collision { kind: CollisionKind, error: IoError },
+}
+
+/// 衝突した 2 つのコンポーネントの衝突の種類を判定する（文言の選択と reason の
+/// 分類の共通の根拠）。
+pub(crate) fn collision_kind(component: &str, existing_component: &str) -> CollisionKind {
+    if case_fold_chars(component) == case_fold_chars(existing_component) {
+        CollisionKind::Case
+    } else {
+        CollisionKind::Normalization
+    }
+}
+
 /// 衝突を表す構造化エラーを組み立てる。パス・コンポーネントはすべて
 /// [`quote_for_message`] で衛生化してから埋め込む（生の値を埋め込まない）。
 pub(crate) fn collision_error(
@@ -433,10 +435,9 @@ pub(crate) fn collision_error(
 ) -> IoError {
     // 大文字小文字の畳み込みだけで一致する組は従来の文言を保つ。正規化を経て初めて
     // 一致する組は、NFC/NFD の別表記を含むことを文言に出す（TASK-21.1）。
-    let reason = if case_fold_chars(component) == case_fold_chars(existing_component) {
-        "case"
-    } else {
-        "case or Unicode normalization (NFC/NFD)"
+    let reason = match collision_kind(component, existing_component) {
+        CollisionKind::Case => "case",
+        CollisionKind::Normalization => "case or Unicode normalization (NFC/NFD)",
     };
     IoError::new(
         IoErrorCode::AlreadyExists,
@@ -509,7 +510,19 @@ impl CaseCollisionSet {
     /// [`Self::try_insert`] と同じ）。既存ノードが無い位置から下はすべて新設に
     /// なり衝突しえないため、そこで検査を打ち切る。
     pub fn check_insertable(&self, path: &str) -> Result<(), IoError> {
-        let components = validate_guest_relative_path(path)?;
+        self.check_insertable_detailed(path)
+            .map_err(|err| match err {
+                InsertCheckError::Invalid(error) | InsertCheckError::Collision { error, .. } => {
+                    error
+                }
+            })
+    }
+
+    /// [`Self::check_insertable`] の詳細版。失敗が形式不正か衝突か、衝突なら種類を
+    /// 保ったまま返す（`crate::guest_files` が Nack の reason へ写す元。#3160・IO-5。
+    /// エラー文言は公開版と同一）。
+    pub(crate) fn check_insertable_detailed(&self, path: &str) -> Result<(), InsertCheckError> {
+        let components = validate_guest_relative_path(path).map_err(InsertCheckError::Invalid)?;
         let mut parent = ROOT_NODE;
         for component in &components {
             match self.nodes.get(&CaseFoldKey::new(parent, component)) {
@@ -519,12 +532,10 @@ impl CaseCollisionSet {
                             .origins
                             .get(entry.introduced_by)
                             .map_or("", String::as_str);
-                        return Err(collision_error(
-                            path,
-                            existing_path,
-                            component,
-                            &entry.original,
-                        ));
+                        return Err(InsertCheckError::Collision {
+                            kind: collision_kind(component, &entry.original),
+                            error: collision_error(path, existing_path, component, &entry.original),
+                        });
                     }
                     parent = entry.id;
                 }
@@ -1151,6 +1162,89 @@ mod tests {
             .map(|c| format!("U+{:04X}", u32::from(c)))
             .collect();
         assert_eq!(differing, Vec::<String>::new());
+    }
+
+    /// REPAIR-1: ホスト由来の名前（禁止文字・長い名前・長いパス・多数のコンポーネント）
+    /// を索引が引き続き受理する（`GUEST` の規則を当てない固定）。
+    #[test]
+    fn io5_repair1_structural_rules_keep_host_names_indexable() {
+        let long_name = "x".repeat(300);
+        let long_path = format!("{}/z", ["d"; 2500].join("/"));
+        let many = (0..300)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        for path in [
+            "a\\b",
+            "a:b",
+            "C:x",
+            long_name.as_str(),
+            long_path.as_str(),
+            many.as_str(),
+        ] {
+            let mut set = CaseCollisionSet::new();
+            set.try_insert(path)
+                .expect("host-derived name must be accepted");
+        }
+    }
+
+    /// REPAIR-1: 構造違反の拒否文言は `GuestPathError` のものと一致する。
+    #[test]
+    fn io5_repair1_rejections_use_guest_path_error() {
+        use crate::guest_path::GuestPathError as E;
+        let cases = [
+            ("", E::Empty),
+            ("a\0b", E::ContainsNul),
+            ("/abs", E::Absolute),
+            ("a//b", E::EmptyComponent),
+            ("a/", E::EmptyComponent),
+            ("./a", E::DotComponent),
+            ("a/../b", E::DotComponent),
+        ];
+        for (path, want) in cases {
+            let err = CaseCollisionSet::new()
+                .try_insert(path)
+                .expect_err("structural violation must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{path:?}");
+            assert_eq!(err.message(), want.to_string(), "{path:?}");
+        }
+    }
+
+    /// REPAIR-1: `GuestPath::parse` が受理する入力は索引も受理し、構造違反は索引も拒否する。
+    #[test]
+    fn io5_repair1_guest_path_accepts_imply_index_accepts() {
+        use crate::guest_path::{GuestPath, GuestPathError as E};
+        let inputs = [
+            "",
+            "/a",
+            "a//b",
+            "a/",
+            ".",
+            "a/../b",
+            "a\0b",
+            "a\\b",
+            "a:b",
+            "a/b",
+            ".hidden",
+            "日本語/ファイル",
+        ];
+        for path in inputs {
+            let parsed = GuestPath::parse(path);
+            let inserted = CaseCollisionSet::new().try_insert(path);
+            if parsed.is_ok() {
+                assert!(inserted.is_ok(), "{path:?}");
+            }
+            if matches!(
+                parsed,
+                Err(E::Empty | E::ContainsNul | E::Absolute | E::EmptyComponent | E::DotComponent)
+            ) {
+                assert_eq!(
+                    inserted.expect_err("structural").code(),
+                    IoErrorCode::InvalidArgument,
+                    "{path:?}"
+                );
+            }
+        }
     }
 
     /// IO-5: 不正な形式のパスはすべて `InvalidArgument` で拒否される。

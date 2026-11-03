@@ -67,13 +67,29 @@
 //! 7. **移動検査**: 付け替えの直前にマウント先が改名・移動・削除されていないことを fd の現在位置で確かめる（`target_moved`）
 //! 8. **付け替え**: `move_mount(2)` の空パス + fd 指定。直後に自分のマウントの fd を保持する
 //! 9. **事後検証**: マウント前と別のマウントであること・自分のマウントの ID であること・`mount_flags` が要求どおりであること・
-//!    元と同じ `(st_dev, st_ino)` であること・mountinfo で自分のマウント（`rbind` は配下全体）に `shared:`・`master:` が無く
+//!    元と同じ `(st_dev, st_ino)` であること・mountinfo で自分のマウント（`rbind` は配下全体）に `shared:`・`master:` が無く（`rslave` は
+//!    `shared:` が無く、最上位に `master:` か `propagate_from:` があること）
 //!    per-mount options が要求を満たすこと。満たさなければ fail-closed で失敗にする。続けて同じ mountinfo で、自分のマウント
 //!    （`rbind` は配下全体）の fstype を拒否リストの名前と照合し、疑似 FS が 1 つでもあれば `bind_source_pseudo_fs` で拒否する
 //!    （配下だけ除いて載せることはしない。付け替えた木そのものを見るため、検査から複製までの間に元の下へマウントが足される
 //!    TOCTOU が無い。拒否は付け替えの後だが `pivot_root`・exec の前で、後始末が自分のマウントを外す）
 //!
-//! **伝播**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
+//! **`rslave` の例外（#2669・OCI-4・CRI-2・SEC-1）**: `BindMountSpec::propagation()` が `HostSlave` の bind だけは、下の「`/` が
+//! private である前提」の例外になる。`/` の再帰 private 化は接続済みの木の `master` 関係をすべて消すため、`MountIsolation::
+//! establish_with` が `unshare(CLONE_NEWNS)` の直後・private 化の前に、その元を固定して `clone_host_slave_sources` で複製する
+//! （ホスト側の元が shared か slave でなければ、rootfs に触れる前に `FAILED_PRECONDITION`）。複製は匿名 namespace にあり、
+//! private 化の対象にならないため `master` を保つ。本段（`apply_one`）は手順 1 の固定と手順 5 の `open_tree` の代わりにその固定と
+//! 複製を使い、他の手順（疑似 FS・rootfs・状態ルートの照合、属性、移動検査、付け替え）は private の bind と同じ。手順 9 は、
+//! `shared:` を全メンバーで禁止したまま、最上位に `master:`・`propagate_from:` のどちらかを必須にする（配下の `master:` は許す）。
+//! 付け替え先は手順 4 で非 shared と確認済みで、slave の複製はコンテナからホストへ伝播しない。
+//!
+//! 残余（REPAIR-3）: ホストから `rslave` の bind へ伝播してきたマウントは、ホスト側のマウントの属性とカーネルのロックを持ち、
+//! こちらの `nosuid`・`nodev`・`ro`・`noexec` が付かない。疑似 FS と状態ルートの検査も付け替え時点の 1 回だけである。これは
+//! HostToContainer の意味に内在し、引き起こせるのはホスト側の特権主体だけ。Landlock は経路で判定するため、bind 先の規則は
+//! 伝播したマウントにも効く。`rshared`（コンテナからホストへの伝播）は、user namespace の中では原理的に成り立たないため受けない
+//! （`docs/design/mount-propagation.md`）。
+//!
+//! **伝播（private の bind）**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
 //! namespace のマウントは shared でも slave でもない。shared でも slave でもないマウントの複製はやはりそうなる。付け替え先は
 //! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。`establish` の private 化は計画の
 //! namespace 集合に依らず無条件で、`mount_binds` は `&MountIsolation`（`establish` の証跡）を引数に取るため、型の上で
@@ -135,7 +151,7 @@
 //!   リンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。状態ルート配下の状態ファイルが
 //!   別名を持つ場合は、同じ FS 上のディレクトリ元も拒否する）。残余は検査から `open_tree` までの間の差し替え（固定した fd への複製のため元の差し替えは効かない）。
 //!   実機前提の結合試験の段ごとの観測（#1916。通しの確認は `tests/production_launcher.rs` のシナリオ D〔#1915〕）。
-//!   `ro` と Landlock の衝突解消（#1917）
+//!   `ro` と Landlock の衝突は #1917 で解消済み（`landlock::rules` の `ShadowBacking::ReadOnlyBind`）
 //! - 状態ルートの inode の照合（#2066）は start の段で鎖を固定した実体に対するもので、start の後に状態ルートが祖先ごと改名されても
 //!   効く（inode は変わらない）。start の後に状態ルートを**別の親ディレクトリへ付け替えた**場合は、
 //!   適用の段が start の記録したホスト側パスを `/` から辿り直し（`O_NOFOLLOW`。`resolve_fresh_state_chains`）、固定した実体と
@@ -164,7 +180,9 @@
 //!   保護対象の dev の行が `overlay` なら、その層を `resolve_overlay_layers` で解決して保護対象に加え（`protected_overlay_layers`）、
 //!   宛先を作る前に inode（`judge_source_against_layers`）と mountinfo の `(dev, path)` で照合する。rootfs・bundle 由来の層は同一・
 //!   祖先・子孫のすべてを `bind_source_contains_rootfs` で拒否する。層を解決できない場合（Docker のように `/` が overlay で下層が
-//!   見えない環境を含む）は `FAILED_PRECONDITION`。残余は順方向と同じく、開き直した層が実際の backing directory と同一とは限らない点で、
+//!   見えない環境を含む）、および保護対象の dev の行が mountinfo に無い場合は `FAILED_PRECONDITION`（#2536。fail-closed）。
+//!   fstype が `overlay` の完全一致でない積層 FS（`fuse.fuse-overlayfs` 等。super_options に層のパスが載らない）は検出対象外の残余。
+//!   開き直した層の同一性の残余を許可に倒す点はオーナー判断待ち（#2536）。残余は順方向と同じく、開き直した層が実際の backing directory と同一とは限らない点で、
 //!   逆方向では一律拒否にしない（一律拒否にすると保護対象が overlay 上にある限りどの bind も拒否になるため）。入れ子の overlay は拒否で代える。
 //!   `start` の fork 前の一次検査（`MountRow` が fstype を持たない）には足さず、restart を含めて毎回走る適用の段が権威である
 //! - 疑似 FS の元は `f_type`（と配下の mountinfo の fstype）の**拒否リスト**で拒否する（#2098・#2065 案 B）。リストにない未知の
@@ -178,6 +196,7 @@
 //! 新マウント API・属性の観測・mountinfo は [`BindDeps`] の差し込み点で差し替える（本番は `mount_binds`、単体テストは
 //! 記録つきの dry-run）。元の固定・種別・読めるかは実ファイルで照合する。実機の挙動は #1916 の結合試験で確認する。
 
+use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::io::Read as _;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
@@ -186,11 +205,11 @@ use std::path::{Path, PathBuf};
 
 use crate::oci_runtime::ProtectedFsRoot;
 use crate::oci_runtime::mountinfo_identity::{
-    FsIdentity, MountRow, dir_identity_chain, dir_identity_chain_with_mnt_id, exposed_devs,
-    fs_identity, mounts_under, parse_fdinfo_mnt_id, parse_mountinfo, path_mount_id,
-    source_contains, source_reaches,
+    FsIdentity, MOUNTINFO_MAX_LINES, MountRow, dir_identity_chain, dir_identity_chain_with_mnt_id,
+    exposed_devs, fs_identity, mounts_under, parse_mountinfo, path_mount_id, source_contains,
+    source_reaches,
 };
-use crate::oci_runtime::{BindMountSet, BindMountSpec};
+use crate::oci_runtime::{BindMountSet, BindMountSpec, BindPropagation};
 use crate::rootless::parse_id_map;
 use crate::sys::{
     self, BindMountAttrs, BindSourceError, BindSourceKind, MountFlags, MountTreeScope, SysError,
@@ -310,6 +329,7 @@ fn mount_binds_checked(
         is_shared: &|dir| mount_is_shared(dir, STAGE),
         still_at: &fd_still_at,
         open_tree: &sys::open_tree_clone_bind,
+        pre_cloned: &|index| isolation.host_slave_clones().take(index),
         set_attrs: &sys::set_bind_mount_attrs,
         flags_of: &sys::mount_flags,
         attach: &sys::move_mount_empty_path,
@@ -333,6 +353,9 @@ struct BindDeps<'a> {
     still_at: &'a dyn Fn(&OwnedFd, &Path) -> bool,
     /// 検証済みの元を切り離して複製する。
     open_tree: &'a dyn Fn(&VerifiedBindSourceFd, MountTreeScope) -> Result<OwnedFd, SysError>,
+    /// `rslave` の bind について、`MountIsolation::establish_with` が `/` の private 化の前に固定・複製した元と複製を取り出す
+    /// （1 件につき 1 回。#2669）。`rslave` でない bind では呼ばない。
+    pre_cloned: &'a dyn Fn(usize) -> Option<HostSlaveClone>,
     /// 切り離したマウントへ属性を足す。
     set_attrs: &'a dyn Fn(BorrowedFd<'_>, BindMountAttrs, MountTreeScope) -> Result<(), SysError>,
     /// fd が属するマウントのフラグ。
@@ -356,6 +379,112 @@ struct BindDeps<'a> {
     state_identity: &'a dyn Fn(&ProtectedFsRoot, &[MountRow]) -> Option<FsIdentity>,
     /// 移動検査の後・付け替えの直前に呼ぶ（本番は空。結合試験専用の入口だけが差し込む）。
     before_attach: &'a dyn Fn(),
+}
+
+/// `rslave` の bind について、`/` の再帰 private 化の前に固定・複製した元と複製（#2669・OCI-4・CRI-2・SEC-1）。
+pub(super) struct HostSlaveClone {
+    /// 固定した元（`mount_binds` が、従来の固定の代わりに使う。同じ inode の照合は変えない）。
+    source: PinnedSource,
+    /// 切り離した複製（`ro`・`noexec` の属性はまだ付いていない）。
+    clone: OwnedFd,
+}
+
+/// `MountIsolation` が持つ `HostSlaveClone` の置き場（`spec.index()` で取り出す。1 件につき 1 回）。
+///
+/// `MountIsolation` の `Debug`・`PartialEq` のために、未取得の添字だけで比べる。fd は持ち出せない。
+#[derive(Default)]
+pub(super) struct HostSlaveClones {
+    items: RefCell<Vec<(usize, HostSlaveClone)>>,
+}
+
+impl HostSlaveClones {
+    /// `index` の複製を取り出す（取り出すと無くなる）。
+    pub(super) fn take(&self, index: usize) -> Option<HostSlaveClone> {
+        let mut items = self.items.borrow_mut();
+        let pos = items.iter().position(|(i, _)| *i == index)?;
+        Some(items.swap_remove(pos).1)
+    }
+
+    fn indices(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.items.borrow().iter().map(|(i, _)| *i).collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+impl std::fmt::Debug for HostSlaveClones {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSlaveClones")
+            .field("indices", &self.indices())
+            .finish()
+    }
+}
+
+impl PartialEq for HostSlaveClones {
+    fn eq(&self, other: &Self) -> bool {
+        self.indices() == other.indices()
+    }
+}
+
+impl Eq for HostSlaveClones {}
+
+/// mountinfo の `mnt_id` のマウントが「ホストから受ける slave」か（`master:` か `propagate_from:` があり、`shared:` が無い）。
+/// 該当なし・複数・書式違反は `Err`（fail-closed。純関数）。
+fn source_mount_is_host_slave(info: &str, mnt_id: u64) -> Result<bool, String> {
+    let entries = parse_all_mountinfo(info)?;
+    let mut found = entries.iter().filter(|e| e.id == mnt_id);
+    let Some(e) = found.next() else {
+        return Err("no mount entry found for the bind mount source".to_owned());
+    };
+    if found.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo".to_owned());
+    }
+    let slave = e
+        .optional
+        .iter()
+        .any(|f| f.starts_with("master:") || f.starts_with("propagate_from:"));
+    let shared = e.optional.iter().any(|f| f.starts_with("shared:"));
+    Ok(slave && !shared)
+}
+
+/// `rslave` の bind の元を固定し、ホスト側が shared か slave であることを確かめて、`/` の再帰 private 化の前に複製する
+/// （`MountIsolation::establish_with` から、`unshare(CLONE_NEWNS)` の直後に呼ぶ。#2669）。
+///
+/// 再帰 private 化は接続済みの木の `master` 関係を消すため、後からでは `rslave` を表現できない。同じ mount namespace の中で
+/// 複製するので `check_mnt` を満たす。元のマウントが slave でない（ホスト側が private）なら、rootfs に触れる前に
+/// `FAILED_PRECONDITION` で拒否する（黙って private で載せない。containerd の `ensureSharedOrSlave` 相当）。
+/// 疑似 FS・rootfs・状態ルートとの重なりの検査は、従来どおり `mount_binds` が付け替えの前に行う。
+pub(super) fn clone_host_slave_sources(set: &BindMountSet) -> Result<HostSlaveClones, ExecError> {
+    let clones = HostSlaveClones::default();
+    for spec in set
+        .mounts()
+        .iter()
+        .filter(|m| m.propagation() == BindPropagation::HostSlave)
+    {
+        let source = pin_source(spec)?;
+        let mnt_id = pinned_source_mnt_id(&source.fd).map_err(|e| annotate(spec, e))?;
+        let info = read_thread_mountinfo(STAGE).map_err(|e| annotate(spec, e))?;
+        let is_slave =
+            source_mount_is_host_slave(&info, mnt_id).map_err(|why| failed(spec, &why))?;
+        if !is_slave {
+            return Err(failed(
+                spec,
+                "the rslave bind mount source is not a shared or slave mount on the host; make it shared (for example `mount --make-rshared`) or remove rslave",
+            ));
+        }
+        let scope = if spec.recursive() {
+            MountTreeScope::Recursive
+        } else {
+            MountTreeScope::MountOnly
+        };
+        let clone = sys::open_tree_clone_bind(&source.fd, scope)
+            .map_err(|e| open_tree_error(spec, e, scope))?;
+        clones
+            .items
+            .borrow_mut()
+            .push((spec.index(), HostSlaveClone { source, clone }));
+    }
+    Ok(clones)
 }
 
 /// 拒否リストの 1 行（疑似 FS の `statfs.f_type` と、mountinfo の fstype 欄の名前）。
@@ -671,7 +800,25 @@ fn apply_one(
     state: &mut Applied<'_>,
 ) -> Result<BindSourceKind, ExecError> {
     let deps = ctx.deps;
-    let PinnedSource { fd: src, dir_ids } = pin_source(spec)?;
+    // `rslave` の bind は、`establish_with` が `/` の private 化の前に固定・複製した元と複製を使う（そこで master 関係が
+    // 消える前に複製しておく必要がある。取り出せなければ establish を通っていないため fail-closed。#2669）。
+    let (PinnedSource { fd: src, dir_ids }, mut pre_clone) = if spec.propagation()
+        == BindPropagation::HostSlave
+    {
+        let Some(HostSlaveClone { source, clone }) = (deps.pre_cloned)(spec.index()) else {
+            return Err(annotate(
+                spec,
+                ExecError::new(
+                    ErrorCode::Internal,
+                    STAGE,
+                    "the rslave bind mount source was not cloned before the root was made private",
+                ),
+            ));
+        };
+        (source, Some(clone))
+    } else {
+        (pin_source(spec)?, None)
+    };
     // 固定した fd の FS の種類を見る（パスで再解決しない）。procfs・sysfs などの疑似 FS は、宛先に何も作る前に拒否する（#2098・SEC-1）。
     let f_type = (deps.source_fs_type)(&src)
         .map_err(|e| mount_api_error(spec, e, "fstatfs(bind mount source)"))?;
@@ -722,7 +869,10 @@ fn apply_one(
         read_only: spec.read_only(),
         noexec: spec.noexec(),
     };
-    let clone = (deps.open_tree)(&src, scope).map_err(|e| open_tree_error(spec, e, scope))?;
+    let clone = match pre_clone.take() {
+        Some(clone) => clone,
+        None => (deps.open_tree)(&src, scope).map_err(|e| open_tree_error(spec, e, scope))?,
+    };
     (deps.set_attrs)(
         clone.as_fd(),
         BindMountAttrs {
@@ -757,8 +907,14 @@ fn apply_one(
     let observed = (deps.observe)(&dest, &after, own)?;
     check_new_bind(&observed, expected, src.dev_ino()).map_err(|why| failed(spec, &why))?;
     let info = (deps.mountinfo)()?;
-    check_bind_subtree(&info, observed.own_mnt_id, expected, spec.recursive())
-        .map_err(|why| failed(spec, &why))?;
+    check_bind_subtree_with(
+        &info,
+        observed.own_mnt_id,
+        expected,
+        spec.recursive(),
+        spec.propagation() == BindPropagation::HostSlave,
+    )
+    .map_err(|why| failed(spec, &why))?;
     // 付け替えた木そのものの fstype を照合する（`rbind` の配下の疑似 FS を含む。検査から複製までの TOCTOU が無い）。
     match find_pseudo_fs_in_subtree(&info, observed.own_mnt_id, spec.recursive()) {
         Ok(None) => {}
@@ -787,6 +943,9 @@ fn check_overlay_layers(
     info: &str,
     own_id: u64,
 ) -> Result<(), ExecError> {
+    // 行数上限つきの解析を先に行う（#2536）。
+    let rows = parse_mountinfo(info)
+        .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
     let entries = parse_all_mountinfo(info).map_err(|why| failed(spec, &why))?;
     let members =
         subtree_members(&entries, own_id, spec.recursive()).map_err(|why| failed(spec, &why))?;
@@ -796,8 +955,6 @@ fn check_overlay_layers(
             "the overlay layers of the bind mount source cannot be checked",
         )
     };
-    let rows = parse_mountinfo(info)
-        .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
     let mut budget = OVERLAY_LAYER_BUDGET;
     let mut found_overlay = false;
     // inode の照合をすべての層で終えてから、mountinfo の照合に進む（違反の理由を inode 側で先に確定させる）。
@@ -940,7 +1097,8 @@ impl ProtectedOverlayLayers {
 }
 
 /// `dev` の FS が overlay なら、その層を解決する。overlay でなければ空。同じ dev に overlay と他の fstype が混在する、
-/// または super_options が食い違う場合は `Err`（fail-closed）。
+/// super_options が食い違う、または `dev` の行が mountinfo に 1 つも無い（保護対象の FS を確認できない）場合は
+/// `Err`（fail-closed。#2536）。
 fn overlay_layers_of_dev(
     entries: &[MountInfoEntry<'_>],
     rows: &[MountRow],
@@ -950,7 +1108,7 @@ fn overlay_layers_of_dev(
     let on_dev: Vec<&MountInfoEntry<'_>> = entries.iter().filter(|e| e.dev == dev).collect();
     let overlays = on_dev.iter().filter(|e| e.fstype == "overlay").count();
     let Some(first) = on_dev.first() else {
-        return Ok(Vec::new());
+        return Err(());
     };
     if overlays == 0 {
         return Ok(Vec::new());
@@ -991,9 +1149,10 @@ fn protected_overlay_layers(
             "the overlay layers of a protected root cannot be checked",
         )
     };
-    let entries = parse_all_mountinfo(info).map_err(|why| failed(spec, &why))?;
+    // 行数上限つきの解析を先に行う（#2536）。
     let rows = parse_mountinfo(info)
         .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
+    let entries = parse_all_mountinfo(info).map_err(|why| failed(spec, &why))?;
     let mut budget = OVERLAY_LAYER_BUDGET;
     let mut by_dev: Vec<(&str, Vec<ProtectedLayer>)> = Vec::new();
     let mut out = ProtectedOverlayLayers::default();
@@ -1001,6 +1160,13 @@ fn protected_overlay_layers(
         let idx = if let Some(i) = by_dev.iter().position(|(d, _)| *d == p.dev()) {
             i
         } else {
+            // 保護対象の dev の行が無いと FS の種別を確認できず、逆方向の照合が素通りする（fail-open）ため拒否する（#2536）。
+            if !entries.iter().any(|e| e.dev == p.dev()) {
+                return Err(failed(
+                    spec,
+                    "the filesystem of a protected root is not found in mountinfo",
+                ));
+            }
             let layers = overlay_layers_of_dev(&entries, &rows, p.dev(), &mut budget)
                 .map_err(|()| unchecked())?;
             by_dev.push((p.dev(), layers));
@@ -1159,7 +1325,7 @@ fn check_place_not_protected(
             targets.extend(
                 mounts_under(mounts, chain_path)
                     .into_iter()
-                    .map(|(id, _)| id),
+                    .map(|(id, _, _)| id),
             );
         }
         for target in &targets {
@@ -1218,13 +1384,13 @@ fn fresh_state_identity(p: &ProtectedFsRoot, mounts: &[MountRow]) -> Option<FsId
 
 /// 固定した元の属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。
 fn pinned_source_mnt_id(src: &VerifiedBindSourceFd) -> Result<u64, ExecError> {
-    let fdinfo = std::fs::read_to_string(format!(
-        "/proc/thread-self/fdinfo/{}",
-        src.as_fd().as_raw_fd()
-    ))
-    .map_err(|_| mountinfo_failed("cannot read fdinfo of the pinned bind mount source"))?;
-    parse_fdinfo_mnt_id(&fdinfo)
-        .ok_or_else(|| mountinfo_failed("no mnt_id in fdinfo of the pinned bind mount source"))
+    use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
+    read_fd_mnt_id(src.as_fd()).map_err(|e| match e {
+        FdinfoMountIdError::Read(_) | FdinfoMountIdError::TooLarge => {
+            mountinfo_failed("cannot read fdinfo of the pinned bind mount source")
+        }
+        _ => mountinfo_failed("no mnt_id in fdinfo of the pinned bind mount source"),
+    })
 }
 
 /// 固定した元の現在のパス（`/proc/thread-self/fd/N` のリンク先）。削除済み・絶対パスでないものは拒否する。
@@ -1243,7 +1409,7 @@ fn mountinfo_failed(msg: &str) -> ExecError {
 }
 
 /// 固定した元と、辿った途中のディレクトリ（`/` から葉の親まで）の `(st_dev, st_ino)`。
-struct PinnedSource {
+pub(super) struct PinnedSource {
     fd: VerifiedBindSourceFd,
     /// 元の祖先ディレクトリの実体。元が状態ルートの bind 別名の配下にあれば、別名の mount root（状態ルートと同じ inode）が入る。
     dir_ids: Vec<(u64, u64)>,
@@ -1717,7 +1883,11 @@ fn find_pseudo_fs_in_subtree(
         .find_map(|e| pseudo_fs_by_name(e.fstype)))
 }
 
+/// mountinfo 全行を解析する。行数上限は [`parse_mountinfo`] と同じ（解析より先に効かせる。#2536）。
 fn parse_all_mountinfo(info: &str) -> Result<Vec<MountInfoEntry<'_>>, String> {
+    if info.lines().nth(MOUNTINFO_MAX_LINES).is_some() {
+        return Err("oversized /proc/thread-self/mountinfo".to_owned());
+    }
     info.lines()
         .map(|l| {
             parse_mountinfo_line(l)
@@ -1732,11 +1902,25 @@ fn parse_all_mountinfo(info: &str) -> Result<Vec<MountInfoEntry<'_>>, String> {
 /// 自分のマウント（mount top）は `ro`・`noexec` の有無が要求と完全に一致すること。配下は、要求した制限
 /// （`ro`・`noexec`）が付いていれば足りる（元が持つ、より強い制限は安全側のため許す）。書式に反する行・該当なし・
 /// 重複は fail-closed。
+#[cfg(test)]
 fn check_bind_subtree(
     info: &str,
     own_id: u64,
     expected: Expected,
     recursive: bool,
+) -> Result<(), String> {
+    check_bind_subtree_with(info, own_id, expected, recursive, false)
+}
+
+/// [`check_bind_subtree`] の本体。`host_slave` が真（`rslave` の bind）のときは、`shared:` を全メンバーで禁止したまま、
+/// 自分のマウント（mount top）に `master:`・`propagate_from:` のどちらかを必須にし、配下の `master:` は許す（配下も
+/// 元の slave を引き継ぐため。#2669・OCI-4・SEC-1）。偽のときは従来どおり 3 つとも禁止する。
+fn check_bind_subtree_with(
+    info: &str,
+    own_id: u64,
+    expected: Expected,
+    recursive: bool,
+    host_slave: bool,
 ) -> Result<(), String> {
     let entries = parse_all_mountinfo(info)?;
     let members = subtree_members(&entries, own_id, recursive)?;
@@ -1745,11 +1929,20 @@ fn check_bind_subtree(
     };
     let has = |e: &MountInfoEntry<'_>, opt: &str| e.options.split(',').any(|o| o == opt);
     for e in &members {
-        if e.optional.iter().any(|f| {
-            f.starts_with("shared:") || f.starts_with("master:") || f.starts_with("propagate_from:")
-        }) {
+        let slave_field = |f: &&str| f.starts_with("master:") || f.starts_with("propagate_from:");
+        if e.optional.iter().any(|f| f.starts_with("shared:")) {
             return Err(
                 "the bind mount is shared or a slave in /proc/thread-self/mountinfo".to_owned(),
+            );
+        }
+        if !host_slave && e.optional.iter().any(slave_field) {
+            return Err(
+                "the bind mount is shared or a slave in /proc/thread-self/mountinfo".to_owned(),
+            );
+        }
+        if host_slave && e.id == top.id && !e.optional.iter().any(slave_field) {
+            return Err(
+                "the rslave bind mount is not a slave in /proc/thread-self/mountinfo".to_owned(),
             );
         }
         if !has(e, "nosuid") || !has(e, "nodev") {
@@ -2366,6 +2559,8 @@ mod tests {
     /// dry-run の挙動を変える設定。
     #[derive(Default)]
     struct Knobs {
+        /// `rslave` の bind の事前の複製を返す（`establish_with` の代わり。#2669）。
+        pre_cloned: bool,
         shared: bool,
         moved: bool,
         open_tree_err: Option<SysError>,
@@ -2374,6 +2569,9 @@ mod tests {
         clone_flags: Option<i64>,
         observe_mod: Option<fn(BindObservation) -> BindObservation>,
         mountinfo: Option<String>,
+        /// 真なら、保護対象の dev の行が無い mountinfo をそのまま渡す（#2536 の拒否の試験）。既定では、保護対象の dev ごとに
+        /// overlay ではない行を `with_protected_dev_rows` で足す（既存の試験の意図を保つため。足した行は配下・祖先の判定に入らない）。
+        strict_protected_dev: bool,
         umount_fail: bool,
         /// 固定した元の `f_type` を差し替える（`None` は本番と同じ `sys::fs_type`）。
         source_fs_type: Option<Result<i64, SysError>>,
@@ -2398,6 +2596,26 @@ mod tests {
         format!("{own} 1 0:1 / /x {opts} - tmpfs none rw\n")
     }
 
+    /// 保護対象の dev の行が `info` に無ければ、overlay ではない行（tmpfs。親は `/`、マウントポイントは保護対象と無関係）を足す。
+    /// fail-closed 化（#2536）前の試験が前提にしていた「保護対象の dev は mountinfo に有る」状態を明示的に作る。
+    fn with_protected_dev_rows(info: &str, roots: &[ProtectedFsRoot]) -> String {
+        let mut out = info.to_owned();
+        let mut seen: Vec<&str> = Vec::new();
+        for r in roots {
+            let dev = r.dev();
+            if seen.contains(&dev) || info.lines().any(|l| l.split(' ').nth(2) == Some(dev)) {
+                continue;
+            }
+            seen.push(dev);
+            out.push_str(&format!(
+                "{} 1 {dev} / /fixture-protected-dev-{} rw - tmpfs none rw\n",
+                9000 + seen.len(),
+                seen.len()
+            ));
+        }
+        out
+    }
+
     /// dry-run で `mount_binds_at` を回し、結果と呼び出し記録を返す。
     fn run(
         fx: &Fx,
@@ -2418,6 +2636,17 @@ mod tests {
             still_at: &|_, p| {
                 push(format!("still_at({})", fx.rel(p)));
                 !k.moved
+            },
+            pre_cloned: &|index| {
+                push(format!("pre_cloned({index})"));
+                if !k.pre_cloned {
+                    return None;
+                }
+                let spec = set.mounts().iter().find(|m| m.index() == index)?;
+                let source = pin_source(spec).ok()?;
+                src_id.set(source.fd.dev_ino());
+                let clone = source.fd.as_fd().try_clone_to_owned().ok()?;
+                Some(HostSlaveClone { source, clone })
             },
             open_tree: &|src, scope| {
                 push(format!("open_tree({scope:?})"));
@@ -2461,9 +2690,15 @@ mod tests {
             mountinfo: &|| {
                 push("mountinfo".into());
                 let (ro, ne) = attrs.get();
-                Ok(k.mountinfo
+                let info = k
+                    .mountinfo
                     .clone()
-                    .unwrap_or_else(|| ideal_mountinfo(200, ro, ne)))
+                    .unwrap_or_else(|| ideal_mountinfo(200, ro, ne));
+                Ok(if k.strict_protected_dev {
+                    info
+                } else {
+                    with_protected_dev_rows(&info, set.protected_roots())
+                })
             },
             source_mnt_id: &|_| Ok(1),
             source_path: &|src| {
@@ -3577,6 +3812,126 @@ mod tests {
         format!("{id} {parent} 0:1 / /x {opts} {optional} - tmpfs none rw\n")
     }
 
+    /// OCI-4・SEC-1（#2669）: `rslave` の bind は事前の複製を使い、`open_tree` を呼ばない。最上位に `master:` があれば受ける。
+    #[test]
+    fn oci4_rslave_bind_uses_pre_cloned_source_and_accepts_master() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+        let knobs = Knobs {
+            pre_cloned: true,
+            mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        let (r, log) = run(&fx, &set, &knobs);
+        let report = r.unwrap_or_else(|e| panic!("unexpected error: {e}; log: {log:?}"));
+        assert_eq!(log.first().map(String::as_str), Some("pre_cloned(0)"));
+        assert!(!log.iter().any(|l| l.starts_with("open_tree(")), "{log:?}");
+        assert_eq!(report.mounts.len(), 1);
+        assert!(report.mounts[0].recursive);
+    }
+
+    /// SEC-1（#2669）: `rslave` でも最上位に `master:` が無ければ（private で載った）拒否し、`shared:` は拒否する。
+    #[test]
+    fn sec1_rslave_bind_requires_master_and_rejects_shared() {
+        for (info, needle) in [
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev - tmpfs none rw\n",
+                "not a slave",
+            ),
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev shared:5 - tmpfs none rw\n",
+                "shared or a slave",
+            ),
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev shared:5 master:3 - tmpfs none rw\n",
+                "shared or a slave",
+            ),
+        ] {
+            let fx = fx();
+            let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+            let knobs = Knobs {
+                pre_cloned: true,
+                mountinfo: Some(info.to_owned()),
+                ..Knobs::default()
+            };
+            let (r, _log) = run(&fx, &set, &knobs);
+            let err = r.expect_err(info);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{info}");
+            assert!(err.message.contains(needle), "{info}: {}", err.message);
+        }
+    }
+
+    /// SEC-1（#2669）: private の bind は従来どおり `master:` を拒否する（`rslave` の許可を private へ広げない）。
+    #[test]
+    fn sec1_private_bind_still_rejects_master() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind"]);
+        let knobs = Knobs {
+            mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("master on a private bind");
+        assert!(err.message.contains("shared or a slave"), "{}", err.message);
+    }
+
+    /// SEC-1（#2669）: `establish_with` を通っていない（事前の複製が無い）`rslave` の bind は、何も作らず `INTERNAL` で拒否する。
+    #[test]
+    fn sec1_rslave_bind_without_pre_clone_fails_closed() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+        let (r, log) = run(&fx, &set, &Knobs::default());
+        let err = r.expect_err("no pre clone");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(log, ["pre_cloned(0)"]);
+        assert!(!fx.rootfs.join("d").exists());
+    }
+
+    /// OCI-4（#2669）: ホスト側の元が slave か判定する純関数。`master:`・`propagate_from:` があり `shared:` が無ければ真。
+    #[test]
+    fn oci4_source_mount_is_host_slave_by_mountinfo() {
+        let l = |id: u64, optional: &str| line(id, 1, "rw", optional);
+        assert_eq!(source_mount_is_host_slave(&l(10, "master:3"), 10), Ok(true));
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "master:3 propagate_from:2"), 10),
+            Ok(true)
+        );
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "propagate_from:2"), 10),
+            Ok(true)
+        );
+        assert_eq!(source_mount_is_host_slave(&l(10, ""), 10), Ok(false));
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "shared:5"), 10),
+            Ok(false)
+        );
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "shared:5 master:3"), 10),
+            Ok(false)
+        );
+        // 別のマウントの行は見ない。
+        let two = format!("{}{}", l(10, ""), l(11, "master:3"));
+        assert_eq!(source_mount_is_host_slave(&two, 10), Ok(false));
+        assert_eq!(source_mount_is_host_slave(&two, 11), Ok(true));
+        // 該当なし・重複・書式違反は fail-closed。
+        assert!(
+            source_mount_is_host_slave(&l(10, "master:3"), 99)
+                .unwrap_err()
+                .contains("no mount entry")
+        );
+        let dup = format!("{}{}", l(10, "master:3"), l(10, "master:3"));
+        assert!(
+            source_mount_is_host_slave(&dup, 10)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(
+            source_mount_is_host_slave("x y\n", 10)
+                .unwrap_err()
+                .contains("malformed")
+        );
+    }
+
     /// `check_bind_subtree`: 自分のマウントは `ro`・`noexec` が要求と完全一致、配下は要求した制限が付いていればよい。
     #[test]
     fn check_bind_subtree_is_exact_for_top_and_requires_restrictions_for_children() {
@@ -4144,6 +4499,7 @@ mod tests {
             is_shared: &|_| Ok(false),
             still_at: &|_, _| true,
             open_tree: &|_, _| Err(unused()),
+            pre_cloned: &|_| None,
             set_attrs: &|_, _, _| Err(unused()),
             flags_of: &|_| Err(unused()),
             attach: &|_, _| Err(unused()),
@@ -4184,6 +4540,7 @@ mod tests {
             is_shared: &|_| Ok(false),
             still_at: &|_, _| true,
             open_tree: &|_, _| Err(unused()),
+            pre_cloned: &|_| None,
             set_attrs: &|_, _, _| Err(unused()),
             flags_of: &|_| Err(unused()),
             attach: &|_, _| Err(unused()),
@@ -4884,6 +5241,359 @@ mod tests {
                 log.iter().any(|l| l.starts_with("umount(")),
                 "{opt}: {log:?}"
             );
+        }
+    }
+
+    /// SEC-1・OCI-4・SEC-5（#2536）: 保護対象の dev の行が適用の時点の mountinfo に無いときは、状態ルート・rootfs・bundle の
+    /// いずれでも `FAILED_PRECONDITION` で拒否する（保護対象の FS を確認できず逆方向の照合が素通りするため）。
+    /// dev の行が有り overlay でなければ、無関係な元は従来どおり通る。
+    #[test]
+    fn sec1_2536_protected_root_dev_absent_from_mountinfo_fails_closed() {
+        let fx = fx();
+        let (state_set, _) = overlay_state_set(&fx, &[]);
+        let contained_set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(pinned(vec![
+            ProtectedFsRoot::contained("7:7".to_owned(), "/".to_owned()),
+        ]));
+        // dev `9:9`・`7:7` の行を持たない mountinfo。
+        let absent = Knobs {
+            mountinfo: Some(ideal_mountinfo(200, false, false)),
+            strict_protected_dev: true,
+            ..Knobs::default()
+        };
+        for (what, set) in [("state", &state_set), ("contained", &contained_set)] {
+            let (r, log) = run(&fx, set, &absent);
+            let err = r.expect_err(what);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{what}");
+            assert!(err.violation.is_none(), "{what}");
+            assert!(err.message.contains("protected root"), "{}", err.message);
+            assert!(
+                !err.message.contains(fx.tmp.path().to_str().expect("utf8")),
+                "{}",
+                err.message
+            );
+            assert_rejected_before_target(&fx, &log, what);
+            assert_eq!(log.last().map(String::as_str), Some("mountinfo"), "{what}");
+        }
+        // dev の行が有り overlay ではない形は、無関係な元を受理する。
+        let present = Knobs {
+            mountinfo: Some(format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n{}9001 1 9:9 / /fixture-state rw - tmpfs none rw\n9002 1 7:7 / /fixture-root rw - tmpfs none rw\n",
+                ideal_mountinfo(200, false, false)
+            )),
+            strict_protected_dev: true,
+            ..Knobs::default()
+        };
+        for (what, set) in [("state", &state_set), ("contained", &contained_set)] {
+            let (r, log) = run(&fx, set, &present);
+            r.unwrap_or_else(|e| panic!("{what}: unrelated source must pass: {e}; {log:?}"));
+            assert!(fx.rootfs.join("mnt/d").is_dir(), "{what}");
+            std::fs::remove_dir_all(fx.rootfs.join("mnt")).expect("reset target");
+        }
+    }
+
+    /// SEC-1（#2536）: `parse_all_mountinfo` の行数上限は `parse_mountinfo` と同じで、解析より先に効く
+    /// （上限ちょうどは通り、超えたら 1 行目が壊れていても `oversized` で拒否する）。
+    #[test]
+    fn sec1_2536_parse_all_mountinfo_rejects_oversized_before_parsing() {
+        let line = "1 0 0:1 / / rw - tmpfs none rw\n";
+        let ok = line.repeat(MOUNTINFO_MAX_LINES);
+        assert_eq!(
+            parse_all_mountinfo(&ok).map(|v| v.len()),
+            Ok(MOUNTINFO_MAX_LINES)
+        );
+        let over = line.repeat(MOUNTINFO_MAX_LINES + 1);
+        let err = parse_all_mountinfo(&over).err().expect("over the limit");
+        assert!(err.contains("oversized"), "{err}");
+        let broken_first = format!("garbage\n{}", line.repeat(MOUNTINFO_MAX_LINES));
+        let err = parse_all_mountinfo(&broken_first)
+            .err()
+            .expect("over the limit and malformed");
+        assert!(err.contains("oversized"), "{err}");
+        // 保護対象つきの適用でも、上限超過の mountinfo は宛先を作る前に FAILED_PRECONDITION。
+        let fx = fx();
+        let (set, _) = overlay_state_set(&fx, &[]);
+        let knobs = Knobs {
+            mountinfo: Some(over),
+            strict_protected_dev: true,
+            ..Knobs::default()
+        };
+        let (r, log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("oversized mountinfo");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.contains("oversized"), "{}", err.message);
+        assert_rejected_before_target(&fx, &log, "oversized");
+    }
+
+    /// glibc の `gnu_dev_major` / `gnu_dev_minor` と同じ式（`st_dev` から mountinfo の `major:minor` を求める試験用）。
+    fn dev_major_minor(dev: u64) -> (u64, u64) {
+        (
+            ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff),
+            (dev & 0xff) | ((dev >> 12) & !0xff),
+        )
+    }
+
+    #[test]
+    fn sec1_2536_dev_major_minor_matches_glibc_encoding() {
+        // makedev(8, 1) = 0x801、makedev(259, 70000) = (259 << 8) | (70000 & 0xff) | ((70000 & !0xff) << 12)。
+        assert_eq!(dev_major_minor(0x801), (8, 1));
+        let dev = (259u64 << 8) | (70000 & 0xff) | ((70000 & !0xffu64) << 12);
+        assert_eq!(dev_major_minor(dev), (259, 70000));
+        assert_eq!(dev_major_minor(0), (0, 0));
+    }
+
+    /// 回収猶予内に子を回収できなければ無期限に待たず失敗させる（REPAIR-5）。
+    fn reap_within(child: &mut std::process::Child, grace: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(start.elapsed() < grace, "child was not reaped in time");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// SEC-1・OCI-4・SEC-5（TASK-29 追補・#2536）: 実機の overlayfs（mount(2) 形式の `lowerdir=a:b` と、新マウント API 形式の
+    /// `lowerdir+`、空白を含む層のパス）の上にある保護対象について、逆方向の照合を実 mountinfo で確認する実機前提試験。
+    ///
+    /// `#[ignore]` で既定のテスト集合から分離する（実行は
+    /// `cargo test -p fandhe-container-core --lib -- --ignored sec1_2536_protected_root_on_real_overlay`）。必要環境は
+    /// Linux 6.8 以降（非特権 user namespace 内の overlayfs と `lowerdir+`）・util-linux の `unshare` / `mount`・非特権 user
+    /// namespace を許可するホスト。libtest はテストをスレッドで動かし `CLONE_NEWUSER` が `EINVAL` になるため、外側のテストが
+    /// `unshare --user --map-root-user --mount` で自身を再実行し、内側（環境変数で判別）が namespace 内で overlay を作る。
+    /// ホストのマウントは変えない。内側は (a) start が記録する dev（mountinfo の `major:minor`）が overlay の行の dev と一致する、
+    /// (b) それが `st_dev` から求めた `major:minor` と一致する、(c) 層（lower 2・upper・work）が過不足なく解決される、
+    /// (d) 層を元にすると `BindSourceReachesStateRoot`、(e) rootfs 側は `BindSourceContainsRootfs`、
+    /// (f) mountinfo に無い dev は `FAILED_PRECONDITION` になる、ことを具体値で照合する。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[ignore = "real-machine test: needs Linux 6.8+ (unprivileged overlayfs in a user namespace, lowerdir+), util-linux unshare and mount, unprivileged user namespaces. SEC-1/OCI-4/SEC-5"]
+    fn sec1_2536_protected_root_on_real_overlay() {
+        const INNER_ENV: &str = "FANDHE_BIND_OVERLAY_INNER";
+        if std::env::var_os(INNER_ENV).is_some() {
+            real_overlay_inner();
+            return;
+        }
+        // tmpfs のマウント先の親は pid だけの名前にせず `ScratchDir` にする（残骸との衝突を避ける。#3373・REPAIR-12）。
+        // 内側は子の `base` にだけマウントし、親自体にはマウントしない（drop の rmdir が EBUSY にならない）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-bind-overlay",
+            std::time::Duration::from_secs(10),
+        );
+        let exe = std::env::current_exe().expect("current exe");
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("unshare")
+            // 専用のプロセスグループで起動し、期限超過時に内側の `mount` などの子孫も含めて回収する（REPAIR-5）。
+            .process_group(0)
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                "exec::bind_mounts::tests::sec1_2536_protected_root_on_real_overlay",
+                "--ignored",
+                "--no-capture",
+                "--test-threads=1",
+            ])
+            .env(INNER_ENV, "1")
+            .env(OVERLAY_DIR_ENV, scratch.path())
+            .spawn()
+            .expect("spawn unshare (util-linux required)");
+        // 相手の終了待ちには必ず期限を設ける（REPAIR-5）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                // グループ全体（pgid = 子の pid）へ SIGKILL を送り、孤児の `mount` を残さない。
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .status();
+                let _ = child.kill();
+                reap_within(&mut child, std::time::Duration::from_secs(5));
+                panic!("inner overlay test timed out after 60s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // 内側が作った空のマウント先は `scratch` の drop が消す。マウントは namespace と共に消えている。
+        assert!(status.success(), "inner overlay test failed: {status:?}");
+    }
+
+    /// 外側の試験が内側へマウント先の親（`ScratchDir`）を渡す環境変数名（試験専用）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const OVERLAY_DIR_ENV: &str = "FANDHE_BIND_OVERLAY_DIR";
+
+    /// [`sec1_2536_protected_root_on_real_overlay`] の内側（新しい user + mount namespace の中）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn real_overlay_inner() {
+        use crate::oci_runtime::mountinfo_identity::read_mountinfo_bounded;
+        use std::os::unix::fs::MetadataExt as _;
+
+        fn mount(args: &[&str]) {
+            let out = std::process::Command::new("mount")
+                .args(args)
+                .output()
+                .expect("spawn mount");
+            assert!(
+                out.status.success(),
+                "mount {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn mkdir(p: &Path) -> String {
+            std::fs::create_dir_all(p).expect("mkdir");
+            p.to_str().expect("utf8").to_owned()
+        }
+
+        // 外側が渡した `ScratchDir` の子へマウントする。未設定・不在は fail-closed で panic する。
+        let parent = std::path::PathBuf::from(
+            std::env::var_os(OVERLAY_DIR_ENV).expect("FANDHE_BIND_OVERLAY_DIR must be set"),
+        );
+        assert!(
+            parent.is_dir(),
+            "FANDHE_BIND_OVERLAY_DIR must be a directory"
+        );
+        let base = parent.join("base");
+        std::fs::create_dir(&base).expect("base");
+        let base_s = base.to_str().expect("utf8").to_owned();
+        mount(&["-t", "tmpfs", "tmpfs", &base_s]);
+
+        // 層のパスの 1 つに空白を含め、mountinfo の `\040` エスケープを往復させる。
+        for (case, plus) in [("mount2", false), ("plus", true)] {
+            let root = base.join(case);
+            let lower1 = mkdir(&root.join("lower one"));
+            let lower2 = mkdir(&root.join("lower2"));
+            let upper = mkdir(&root.join("upper"));
+            let work = mkdir(&root.join("work"));
+            let merged = mkdir(&root.join("merged"));
+            let opts = if plus {
+                format!("lowerdir+={lower1},lowerdir+={lower2},upperdir={upper},workdir={work}")
+            } else {
+                format!("lowerdir={lower1}:{lower2},upperdir={upper},workdir={work}")
+            };
+            mount(&["-t", "overlay", "overlay", "-o", &opts, &merged]);
+            let state = mkdir(&Path::new(&merged).join("state"));
+
+            let info = read_mountinfo_bounded("/proc/thread-self/mountinfo").expect("mountinfo");
+            let entries = parse_all_mountinfo(&info).expect("entries");
+            let rows = parse_mountinfo(&info).expect("rows");
+
+            // (a) start と同じ求め方の dev が、マウントポイントが merged の overlay の行の dev と一致する。
+            let mnt = path_mount_id(&state).expect("mount id of state");
+            let identity = fs_identity(&rows, mnt, &state).expect("identity");
+            let overlay_row = rows
+                .iter()
+                .find(|r| r.point == merged)
+                .unwrap_or_else(|| panic!("{case}: no row for the overlay mount"));
+            assert_eq!(identity.dev, overlay_row.dev, "{case}");
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.dev == identity.dev && e.fstype == "overlay"),
+                "{case}"
+            );
+            // (b) st_dev から求めた major:minor と一致する（ディレクトリで比べる）。
+            let st_dev = std::fs::metadata(&merged).expect("stat merged").dev();
+            let (major, minor) = dev_major_minor(st_dev);
+            assert_eq!(identity.dev, format!("{major}:{minor}"), "{case}");
+
+            // (c) 層が過不足なく解決される（lower 2・upper・work）。
+            let mut budget = OVERLAY_LAYER_BUDGET;
+            let layers = overlay_layers_of_dev(&entries, &rows, &identity.dev, &mut budget)
+                .unwrap_or_else(|()| panic!("{case}: layers must resolve"));
+            assert_eq!(layers.len(), 4, "{case}");
+            for dir in [&lower1, &lower2, &upper, &work] {
+                let meta = std::fs::metadata(dir).expect("stat layer");
+                assert!(
+                    layers
+                        .iter()
+                        .any(|l| l.chain.first() == Some(&(meta.dev(), meta.ino()))),
+                    "{case}: layer {dir} not resolved"
+                );
+            }
+            let base_dev = rows
+                .iter()
+                .find(|r| r.point == base_s)
+                .map(|r| r.dev.clone())
+                .expect("tmpfs base row");
+            assert!(layers.iter().all(|l| l.identity.dev == base_dev), "{case}");
+
+            // (d) 状態ルートが overlay 上にあるとき、層を元にすると拒否する。宛先は作らない。
+            let chain = dir_identity_chain(&state).expect("state chain");
+            let state_root = || {
+                ProtectedFsRoot::new(identity.dev.clone(), identity.path.clone(), false)
+                    .with_inode_chain(state.clone(), chain.clone())
+            };
+            let knobs = Knobs {
+                mountinfo: Some(format!("{info}{}", ideal_mountinfo(200, false, false))),
+                strict_protected_dev: true,
+                ..Knobs::default()
+            };
+            let fx = fx();
+            for (what, src) in [("upper", &upper), ("lower", &lower1)] {
+                let set = one("/mnt/d", src, &[]).with_protected_roots(vec![state_root()]);
+                let (r, log) = run(&fx, &set, &knobs);
+                assert_eq!(
+                    reason_of(&r.expect_err(what)),
+                    Some(ViolationReason::BindSourceReachesStateRoot),
+                    "{case}/{what}"
+                );
+                assert_rejected_before_target(&fx, &log, what);
+            }
+            // (e) rootfs・bundle が overlay 上にあるときは `BindSourceContainsRootfs`。
+            // 状態ルートは overlay と重ならない非 overlay の実在 FS（tmpfs 上の別ディレクトリ）にする。同じ overlay を渡すと
+            // 状態ルート由来の層が先に判定され `BindSourceReachesStateRoot` になり、rootfs の照合に到達しない。
+            // `pinned` は dev 9:9 の保護対象を足し、実 mountinfo に無いため使わない。
+            let other_state = mkdir(&base.join(format!("state-{case}")));
+            let other_mnt = path_mount_id(&other_state).expect("mount id of other state");
+            let other_id = fs_identity(&rows, other_mnt, &other_state).expect("other identity");
+            assert_ne!(
+                other_id.dev, identity.dev,
+                "{case}: state root must not be on the overlay"
+            );
+            let other_chain = dir_identity_chain(&other_state).expect("other chain");
+            let other_state_root = || {
+                ProtectedFsRoot::new(other_id.dev.clone(), other_id.path.clone(), false)
+                    .with_inode_chain(other_state.clone(), other_chain.clone())
+            };
+            let contained = vec![
+                other_state_root(),
+                ProtectedFsRoot::contained(identity.dev.clone(), identity.path.clone()),
+            ];
+            let set = one("/mnt/d", &upper, &[]).with_protected_roots(contained);
+            let (r, log) = run(&fx, &set, &knobs);
+            assert_eq!(
+                reason_of(&r.expect_err("contained")),
+                Some(ViolationReason::BindSourceContainsRootfs),
+                "{case}"
+            );
+            assert_rejected_before_target(&fx, &log, "contained");
+            // (f) mountinfo に存在しない dev は fail-closed。
+            let ghost = vec![
+                other_state_root(),
+                ProtectedFsRoot::contained("4095:1048575".to_owned(), "/".to_owned()),
+            ];
+            let set = one("/mnt/d", &upper, &[]).with_protected_roots(ghost);
+            let (r, log) = run(&fx, &set, &knobs);
+            let err = r.expect_err("ghost dev");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{case}");
+            assert!(err.message.contains("protected root"), "{}", err.message);
+            assert_rejected_before_target(&fx, &log, "ghost");
         }
     }
 }

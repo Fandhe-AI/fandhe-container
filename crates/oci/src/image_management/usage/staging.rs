@@ -5,17 +5,15 @@
 //!
 //! サイズの定義は blob キャッシュと同じ見かけのサイズ。書き込み途中の一時名も実使用量として含める
 //! （名前では絞らない）。キャッシュ側の `bytes` / `images.bytes` には混ぜない。
+//! 検査済み root の fd 起点で読む（#2695）。パス起点の実装（macOS・Windows 等）は従来どおり。
 //! 所有者専用の領域なので、`stat` の失敗は `NotFound`（pull の完了と競合）以外は過少計上せず
 //! `Internal` で失敗させる（`scan_cache` と同じ方針）。
-
-use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
 
 use super::{MAX_CACHE_SCAN_ENTRIES, add, err};
 use crate::error::{OciError, OciErrorCode};
 use crate::image_management::PullId;
 use crate::image_management::pull::STAGING_DIR_NAME;
+use crate::image_management::root_handle::{RootHandle, SubDirError};
 
 /// ステージング領域の使用容量。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,64 +30,71 @@ pub struct StagingUsage {
     pub foreign_entries: usize,
 }
 
-fn not_found(e: &std::io::Error) -> bool {
-    e.kind() == ErrorKind::NotFound
-}
-
 /// `<root>/staging` を走査する。無ければ全 0、symlink・非ディレクトリは `FailedPrecondition`、
 /// エントリ数が `MAX_CACHE_SCAN_ENTRIES` を超えたら `ResourceExhausted`。
-pub(super) fn scan_staging(root: &Path) -> Result<StagingUsage, OciError> {
-    let dir = root.join(STAGING_DIR_NAME);
-    match fs::symlink_metadata(&dir) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => {
+///
+/// 検査済み root の fd 起点で読む（#2695）。`staging` と各 `<pull-id>` は開いたディレクトリの fd から
+/// 辿り、stat と open の間に差し替えられた `<pull-id>`（symlink 等）は中へ降りず foreign に数える。
+pub(super) fn scan_staging(root: &RootHandle) -> Result<StagingUsage, OciError> {
+    let dir = match root.open_subdir(STAGING_DIR_NAME) {
+        Ok(Some(d)) => d,
+        Ok(None) => return Ok(StagingUsage::default()),
+        Err(SubDirError::NotPlain) => {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
                 "staging is not a plain directory",
             ));
         }
-        Err(e) if not_found(&e) => return Ok(StagingUsage::default()),
-        Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat staging")),
-    }
+        Err(SubDirError::Io) => return Err(err(OciErrorCode::Internal, "failed to stat staging")),
+    };
     let mut usage = StagingUsage::default();
     let mut seen = 0usize;
-    let rd = fs::read_dir(&dir)
+    let rd = dir
+        .entries()
         .map_err(|_| err(OciErrorCode::Internal, "failed to read staging directory"))?;
     for ent in rd {
-        let ent = ent.map_err(|_| err(OciErrorCode::Internal, "failed to read staging entry"))?;
+        let name = ent.map_err(|_| err(OciErrorCode::Internal, "failed to read staging entry"))?;
         bump(&mut seen)?;
-        let valid_name = ent
-            .file_name()
-            .to_str()
-            .is_some_and(|n| PullId::new(n).is_ok());
-        let meta = match fs::symlink_metadata(ent.path()) {
-            Ok(m) => m,
-            Err(e) if not_found(&e) => continue,
+        let valid_name = name.to_str().is_some_and(|n| PullId::new(n).is_ok());
+        let meta = match dir.stat(&name) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
             Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat staging entry")),
         };
         if !valid_name || !meta.is_dir() {
             usage.foreign_entries += 1;
             continue;
         }
-        let inner = match fs::read_dir(ent.path()) {
-            Ok(rd) => rd,
+        let pull = match dir.open_subdir(&name) {
+            Ok(Some(d)) => d,
             // pull の完了（公開・ロールバック）と競合して消えた。
-            Err(e) if not_found(&e) => continue,
-            Err(_) => {
+            Ok(None) => continue,
+            // stat の後に通常ディレクトリでないものへ差し替えられた。降りずに foreign とする。
+            Err(SubDirError::NotPlain) => {
+                usage.foreign_entries += 1;
+                continue;
+            }
+            Err(SubDirError::Io) => {
                 return Err(err(
                     OciErrorCode::Internal,
                     "failed to read pull staging directory",
                 ));
             }
         };
+        let inner = pull.entries().map_err(|_| {
+            err(
+                OciErrorCode::Internal,
+                "failed to read pull staging directory",
+            )
+        })?;
         usage.pulls += 1;
         for f in inner {
-            let f =
+            let fname =
                 f.map_err(|_| err(OciErrorCode::Internal, "failed to read pull staging entry"))?;
             bump(&mut seen)?;
-            let m = match fs::symlink_metadata(f.path()) {
-                Ok(m) => m,
-                Err(e) if not_found(&e) => continue,
+            let m = match pull.stat(&fname) {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
                 Err(_) => {
                     return Err(err(
                         OciErrorCode::Internal,
@@ -98,7 +103,7 @@ pub(super) fn scan_staging(root: &Path) -> Result<StagingUsage, OciError> {
                 }
             };
             // 生存確認用のロックファイル（#852）は blob ではないので数えない。
-            if f.file_name() == super::super::pull::PULL_LOCK_FILE_NAME && m.is_file() {
+            if fname == super::super::pull::PULL_LOCK_FILE_NAME && m.is_file() {
                 continue;
             }
             if m.is_file() {
@@ -126,6 +131,8 @@ fn bump(seen: &mut usize) -> Result<(), OciError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_management::root_handle::rh;
+    use std::fs;
 
     struct Root(std::path::PathBuf);
     impl Root {
@@ -153,7 +160,7 @@ mod tests {
         fs::write(s.join("p1").join("aa"), vec![0u8; 300]).unwrap();
         fs::write(s.join("p1").join("bb.tmp"), vec![0u8; 40]).unwrap();
         fs::write(s.join("p2").join("cc"), vec![0u8; 5]).unwrap();
-        let u = scan_staging(&r.0).unwrap();
+        let u = scan_staging(&rh(&r.0)).unwrap();
         assert_eq!(
             u,
             StagingUsage {
@@ -173,7 +180,7 @@ mod tests {
         fs::create_dir_all(s.join("p1")).unwrap();
         fs::write(s.join("p1").join("@pull.lock"), vec![0u8; 9]).unwrap();
         fs::write(s.join("p1").join("aa"), vec![0u8; 10]).unwrap();
-        let u = scan_staging(&r.0).unwrap();
+        let u = scan_staging(&rh(&r.0)).unwrap();
         assert_eq!(
             u,
             StagingUsage {
@@ -189,7 +196,7 @@ mod tests {
     #[test]
     fn oci7_staging_missing_is_zero() {
         let r = Root::new("none");
-        assert_eq!(scan_staging(&r.0).unwrap(), StagingUsage::default());
+        assert_eq!(scan_staging(&rh(&r.0)).unwrap(), StagingUsage::default());
     }
 
     /// OCI-7: staging が非ディレクトリなら FailedPrecondition。
@@ -197,7 +204,7 @@ mod tests {
     fn oci7_staging_rejects_non_directory() {
         let r = Root::new("file");
         fs::write(r.0.join("staging"), b"x").unwrap();
-        let e = scan_staging(&r.0).unwrap_err();
+        let e = scan_staging(&rh(&r.0)).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
     }
 
@@ -209,7 +216,7 @@ mod tests {
         let other = r.0.join("other");
         fs::create_dir_all(&other).unwrap();
         std::os::unix::fs::symlink(&other, r.0.join("staging")).unwrap();
-        let e = scan_staging(&r.0).unwrap_err();
+        let e = scan_staging(&rh(&r.0)).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
     }
 
@@ -225,7 +232,7 @@ mod tests {
         std::os::unix::fs::symlink(s.join("p1").join("aa"), s.join("p1").join("lnk")).unwrap();
         fs::write(s.join("stray"), vec![0u8; 77]).unwrap();
         std::os::unix::fs::symlink(&s, s.join("p-link")).unwrap();
-        let u = scan_staging(&r.0).unwrap();
+        let u = scan_staging(&rh(&r.0)).unwrap();
         assert_eq!(u.pulls, 1);
         assert_eq!(u.file_count, 1);
         assert_eq!(u.bytes, 10);

@@ -99,7 +99,7 @@ fn oci7_gate_excludes_reconcile_until_creator_is_killed() {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+        .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
         .env(ROOT_ENV, &root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

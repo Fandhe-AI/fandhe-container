@@ -62,30 +62,38 @@
 //! `Unimplemented` で拒否する（指定より強い権限・弱い分離での起動を防ぐ）。後続タスクが適用を
 //! 実装した時点で該当検査を外す。
 //!
-//! - `process.user.additionalGids` が空でない（補助グループの適用は未実装。`process.cwd` は pivot 直後に fd 起点で適用し、
-//!   `process.user` の uid・gid は launcher が user namespace の写像と照合して適用する。OCI-1・SEC-5）
+//! - （適用済み）`process.cwd` は pivot 直後に fd 起点で適用し、`process.user` の uid・gid と
+//!   `additionalGids` は launcher が user namespace の写像と照合して適用する（OCI-1・SEC-5・CORE-6・#2667）。
+//!   `additionalGids` の写像外・単一 ID 写像での指定は launcher が fork の前に拒否する
+//! - （適用済み）`root.readonly=true` は pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足して適用する
+//!   （`mount_setattr`。`nodev` 等の既存属性を落とさず rootless でも成り立つ。`/proc`・`/dev` 系・tmpfs・bind は自分の属性のまま。
+//!   Landlock の規則も同じ実効値から決まる。実効値は config の値と起動オプション `--read-only` の OR で、狭める方向のみ。CLI-1・CORE-5・SEC-1・SUP-12・#2767・#2828）
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
-//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
-//! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
-//! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
+//!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind は root が書き込み可能でも受ける〔#1917。Landlock のルール生成へ検証済みの集合を渡す〕）
+//! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
+//!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
+//!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
+//! - `cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）。`network` は起動オプションの network モードとの
+//!   突き合わせ（`network_mode.rs` の D7 の表。NET-6・SEC-1・#3058）で、既定の `FromConfig` ではエントリありを `Unimplemented`
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
-//!   未実装のため必須。`InvalidArgument`。SEC-1）
+//!   launcher の起動オプション〔`LaunchOptions` の `Host`。SUP-12・#2625〕だけで、config.json からは外せないため必須。`InvalidArgument`。SEC-1）
 //! - `linux.namespaces` に PID・mount・UTS namespace が無い（CORE-1 の最小分離〔PID/mount/UTS/IPC〕を
 //!   欠く起動を防ぐ。UTS は hostname 指定の有無にかかわらず必須で、無いとホストの hostname を共有・
 //!   変更し得る。`InvalidArgument`。SEC-1）
 //!
 //! 必須とする namespace は CORE-1 の最小分離（PID・mount・UTS・IPC）と user（SEC-5）。network は
-//! 指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
-//! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。
+//! `FromConfig` で指定が無ければホストの network namespace を共有する NET-6 の host モードに当たり（ネットワーク分離は
+//! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。起動オプションの
+//! `Host` / `Loopback` / `Attachable` との突き合わせは予約・fork の前に行う（`Loopback` の netns の実体は #3064 で実装済み。
+//! `Attachable` は `Loopback` と同じ行で、exec 直前の同期点が netns と user namespace を呼び出し側へ渡す点だけが違う。NET-9・#1939）。
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
 //!   写像は launcher が権限モデルから導く。受けるかはオーナー判断待ちで #2240 と
 //!   `docs/design/config-id-mappings.md` に判断材料があり、決まるまで拒否のまま）
-//! - `root.readonly` が true（読み取り専用 rootfs 未実装）
 //! - `linux.readonlyPaths` / `maskedPaths` が暗黙の `/dev`・`/dev/pts`・`/dev/shm` と同じか祖先を指す
 //!   （`InvalidArgument`。fork・予約より前。SEC-2・CORE-5・#2015。子孫は受ける）
 //!
@@ -111,8 +119,8 @@
 //! 本関数は launcher の実装を知らない。`process.args` 等がそのまま launcher へ渡り、launcher の返した
 //! pid で Running へ遷移するところまでが本関数の責務である。本番の [`ProcessLauncher`]
 //! （`ProductionLauncher`。Linux。#1816）は実装済みで、制限ステージ（TASK-37〜39）を通した実プロセスの
-//! 起動は `tests/production_launcher.rs`（#1818。実機前提）で通している。supervisor の呼び出しスレッドの
-//! 再構成（#1819）は未実装（REPAIR-3）。
+//! 起動は `tests/production_launcher.rs`（#1818。実機前提）で通している。supervisor の start 経路は呼び出しスレッドでの
+//! 直接 launch へ再構成済み（#1819）。restart の再 launch は supervisor が呼び出しスレッドで直接行う（#2043）。
 //!
 //! エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や OS 依存の I/O エラー
 //! 文字列を含めない。
@@ -134,9 +142,12 @@ use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
+use super::namespace_join::NamespaceJoin;
+use super::network_mode::{EffectiveNetwork, reconcile_network};
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
+use crate::sysctl::SysctlNamespace;
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
     StateRecord, StateStore, TraitError, UpdateStateRequest,
@@ -675,11 +686,16 @@ fn launch_inner(
 
     let running = ContainerStatus::running(id.clone(), Some(process.pid()));
     // launch が確定した分離の記録は Running の記録と同じ 1 回の update で書く(exec の根拠。SUP-6・CORE-5・#2007)。
-    // 記録を持たない launcher(偽の実装・Linux 以外)では付けず、前の値が引き継がれる(契約 12)。本番 launcher は
-    // 記録を作れなければ launch 自体が失敗するため、ここへ記録なしの Running は届かない。
+    // 記録を持たない launcher(偽の実装・Linux 以外)では付けず Inherit のままにする(契約 12)。start は Created からの
+    // 初回 launch で引き継ぐ前の値は常に None のため、消去と等価。restart の再 launch は Clear を使う(#2238)。
+    // 本番 launcher は記録を作れなければ launch 自体が失敗するため、ここへ記録なしの Running は届かない。
     let mut running_update = UpdateStateRequest::new(running, claimed.revision());
     if let Some(isolation) = process.launch_isolation() {
         running_update = running_update.with_launch_isolation(isolation.clone());
+    }
+    // launch が適用した rlimit(16 種)も同じ update で書く。exec の再適用が launch と同じ制限を載せる(SUP-12・#2713)。
+    if let Some(rlimits) = process.launch_rlimits() {
+        running_update = running_update.with_rlimits(rlimits.clone());
     }
     match store.update(&running_update) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
@@ -738,7 +754,8 @@ fn keep_unreaped(process: Box<dyn LaunchedProcess>) {
 ///
 /// 返したハンドルの所有権は呼び出し元（監視側）へ移り、レジストリからは消える。呼び出し元は
 /// [`LaunchedProcess::terminate`]・[`LaunchedProcess::wait`] を再試行して回収する（ハンドルは `Drop` で
-/// 回収しないため、捨てるとゾンビが残り得る）。
+/// kill / 回収しない。本番 launcher のハンドルは drop で未回収の子を起動台帳へ戻す〔#3432〕が、それ以外の実装では
+/// 捨てるとゾンビが残り得る）。
 pub fn take_unreaped_processes() -> Vec<Box<dyn LaunchedProcess>> {
     std::mem::take(&mut *UNREAPED.lock().unwrap_or_else(PoisonError::into_inner))
 }
@@ -851,6 +868,7 @@ fn build_spec_with_swap(
     validate_entrypoint_limits(process.args(), process.env())?;
     let user = process.user();
     let ids = (user.uid(), user.gid());
+    let additional_gids = user.additional_gids().to_vec();
     // cwd は字句検証だけここで行い、適用は子が pivot 直後に fd 起点で行う（不在・非ディレクトリは launch 側の拒否。OCI-1）。
     let working_dir = ContainerWorkingDir::parse(process.cwd()).ok_or_else(|| {
         TraitError::new(
@@ -858,14 +876,15 @@ fn build_spec_with_swap(
             "process.cwd must be a normalized absolute path without .. components",
         )
     })?;
-    // uid・gid は launcher が写像と照合して適用する（SEC-5）。補助グループは未実装のため拒否する（REPAIR-3）。
-    if !user.additional_gids().is_empty() {
-        return Err(unsupported("process.user.additionalGids"));
-    }
+    // uid・gid・補助グループは launcher が写像と照合して適用する（SEC-5・#2667）。
     if process.terminal() {
         return Err(unsupported("process.terminal"));
     }
+    // 起動オプションの network モードと config の突き合わせ(D7)は予約・fork より前に終える(NET-6・SEC-1・#3058)。
+    let network_mode = launcher.network_mode();
+    let network = reconcile_network(&config, network_mode)?;
     reject_unsupported_linux(&config)?;
+    reject_net_sysctls_without_network_namespace(&config, network)?;
     reject_protected_paths_over_implicit_dev(&config)?;
     // user namespace が無いと process.user がホストの uid として働いてしまう（SEC-5）。
     if !config
@@ -888,8 +907,8 @@ fn build_spec_with_swap(
             "the PID and mount namespaces are required",
         ));
     }
-    // IPC namespace が無いとホストの IPC（SysV IPC・POSIX メッセージキュー）を共有する。共有を明示許可する
-    // 仕組みが無いため fail-closed で必須とする（SEC-1）。
+    // IPC namespace が無いとホストの IPC（SysV IPC・POSIX メッセージキュー）を共有する。共有の明示許可は
+    // launcher の起動オプション（`LaunchOptions` の `Host`。#2625）だけで、config.json からは外せない。fail-closed で必須とする（SEC-1）。
     if !has(NamespaceKind::Ipc) {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
@@ -922,6 +941,9 @@ fn build_spec_with_swap(
     }
     // 違反の理由（`RootfsPinError::violation`）は launcher の拒否の記録先へ記録する（#2623・#1702）。
     let rootfs_dir = pin_rootfs_audited(bundle, &rootfs, id, launcher)?;
+    // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
+    // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
+    let namespace_join = pin_namespace_join_audited(&config, id, launcher)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -936,7 +958,41 @@ fn build_spec_with_swap(
         working_dir,
         ids,
     )
-    .with_sysfs(sysfs))
+    .with_sysfs(sysfs)
+    .with_additional_gids(additional_gids)
+    .with_namespace_join(namespace_join)
+    .with_network(network, network_mode)
+    .with_state_root(state_root.map(Path::to_path_buf)))
+}
+
+/// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・
+/// パスの形の不正。`PermissionDenied` / `InvalidArgument`）なら launcher の拒否の記録先へ記録する
+/// （SEC-4・SEC-1・CORE-3・#2674）。
+///
+/// 記録は層 `mount`・理由なし（中継が運ぶ閉じた理由表に join 用の語彙がまだ無いため。REPAIR-3）で、参加先の
+/// user namespace のパスとコンテナ ID を載せる。記録の成否で拒否は覆さない。I/O の失敗（`Internal` 等）と
+/// 非 Linux の `Unimplemented` は検証による拒否ではないため記録しない。
+fn pin_namespace_join_audited(
+    config: &OciConfig,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<Option<NamespaceJoin>, TraitError> {
+    let Some((user, ipc)) = NamespaceJoin::paths_of(config)? else {
+        return Ok(None);
+    };
+    NamespaceJoin::pin(user, ipc).map(Some).inspect_err(|err| {
+        if matches!(
+            err.code(),
+            ErrorCode::PermissionDenied | ErrorCode::InvalidArgument
+        ) && let Some(sink) = launcher.rejection_audit_sink()
+        {
+            let event = crate::audit_log::AuditEvent::Mount {
+                path: Some(crate::audit_log::AuditPath::new(user)),
+                reason: None,
+            };
+            let _ = crate::audit_log::mount::deliver(event, Some(id), sink);
+        }
+    })
 }
 
 /// rootfs を固定し、検証後の差し替えによる違反（`RootfsPinError::violation`）なら launcher の拒否の記録先
@@ -1065,7 +1121,7 @@ fn validate_bind_mounts(
     };
     // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
     let children = mounts_under(&mounts, &state_real);
-    let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    let mut roots = build_protected_roots(&state_id, &state_real, &children, &child_is_visible);
     // 状態ルートの実体（dev, ino）の鎖を fd で固定する。適用の段（restart を含む毎回）が、mountinfo の文字列に依らず
     // 元との同一・祖先・子孫を inode で照合する（SEC-1・SEC-4・#2066）。固定できなければ fail-closed（パスは載せない）。
     let Some(chain) = dir_identity_chain(&state_real) else {
@@ -1130,10 +1186,10 @@ fn source_reaches_protected(
     src_real: &str,
     recursive: bool,
     state_id: &FsIdentity,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
 ) -> bool {
     std::iter::once(state_id)
-        .chain(children.iter().map(|(id, _)| id))
+        .chain(children.iter().map(|(id, _, _)| id))
         .any(|protected| {
             source_reaches(mounts, src_mnt_id, src_real, recursive, protected).unwrap_or(true)
         })
@@ -1144,37 +1200,62 @@ fn source_reaches_protected(
 /// 状態ファイルのハードリンクは、適用の段が毎回走査し直す。走査は保護対象ごとに自分のマウントの木に限り、別の FS の
 /// マウントポイントへは降りない（他の FS 上のリンクのせいで無関係な FS 上のディレクトリ元を誤って拒否しない）。
 /// 子マウントは自分のマウントポイントを走査根にする。同じマウントポイントに複数のマウントが重なるなど、走査で
-/// 実体を確定できないものは「リンクあり」に固定する（fail-closed）。
+/// 実体を確定できないもの（祖先の overmount で隠れた子を含む。#2823）は「リンクあり」に固定する（fail-closed）。
 fn build_protected_roots(
     state_id: &FsIdentity,
     state_real: &str,
-    children: &[(FsIdentity, String)],
+    children: &[(FsIdentity, String, u64)],
+    is_visible: &dyn Fn(&str, u64) -> bool,
 ) -> Vec<ProtectedFsRoot> {
+    // 見えているか（point を `/` から辿った先の mount ID が子の ID と一致するか）。祖先の overmount で隠れた子は
+    // 見えていない。見えていない子の中身を point のパスで歩くと覆っている別のマウントの中身を取り違えるため、
+    // 走査せず「リンクあり」に固定し、他の走査の枝刈りからも外す（走査範囲が広がる向きだけに倒す）。
+    let visible: Vec<bool> = children
+        .iter()
+        .map(|(_, point, id)| is_visible(point, *id))
+        .collect();
     let prune_for = |dev: &str, scan_root: &str| -> Vec<String> {
         children
             .iter()
-            .filter(|(id, point)| {
-                id.dev != dev
+            .zip(&visible)
+            .filter(|((id, point, _), vis)| {
+                **vis
+                    && id.dev != dev
                     && point != scan_root
                     && Path::new(point).starts_with(Path::new(scan_root))
             })
-            .map(|(_, point)| point.clone())
+            .map(|((_, point, _), _)| point.clone())
             .collect()
     };
     let mut roots = vec![
         ProtectedFsRoot::new(state_id.dev.clone(), state_id.path.clone(), true)
             .with_scan_root(state_real.to_owned(), prune_for(&state_id.dev, state_real)),
     ];
-    for (id, point) in children {
-        let shared = children.iter().filter(|(_, p)| p == point).count() > 1;
+    for ((id, point, _), vis) in children.iter().zip(&visible) {
+        let shared = children.iter().filter(|(_, p, _)| p == point).count() > 1;
         let root = ProtectedFsRoot::new(id.dev.clone(), id.path.clone(), true);
-        roots.push(if shared {
+        roots.push(if shared || !vis {
             root
         } else {
             root.with_scan_root(point.clone(), prune_for(&id.dev, point))
         });
     }
     roots
+}
+
+/// 状態ルート配下の子マウントが、いま見えている（point を `/` から辿った先の mount ID が一致する）か（#2823・SEC-1・CORE-2）。
+///
+/// 辿れない（symlink・ディレクトリでない・深すぎる）ときも見えていないものとして扱い、呼び出し側が fail-closed にする。
+/// start と同じ mount namespace・同じスレッドで呼ぶこと（mount ID は namespace ごとに振られる）。
+#[cfg(target_os = "linux")]
+fn child_is_visible(point: &str, id: u64) -> bool {
+    super::mountinfo_identity::dir_identity_chain_with_mnt_id(point).is_some_and(|(_, m)| m == id)
+}
+
+/// Linux 以外では fd の mount ID を取れないため、見えていないものとして扱う（bind mount は Linux 限定。fail-closed）。
+#[cfg(not(target_os = "linux"))]
+fn child_is_visible(_point: &str, _id: u64) -> bool {
+    false
 }
 
 /// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
@@ -1257,20 +1338,39 @@ fn reject_config_id_mappings(config: &OciConfig) -> Result<(), TraitError> {
 }
 
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
-    if config.root().readonly() {
-        return Err(unsupported("root.readonly"));
-    }
+    // `root.readonly=true` は受ける: launcher が pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を足し、
+    // Landlock の規則（`root_rights`）も同じ config から決まる（CORE-5・SEC-1・SUP-12・#2767）。
     reject_config_id_mappings(config)?;
+    // path は user と ipc の組だけを受ける（pod の join。形の検査だけここで行い、開いて固定するのは rootfs の
+    // 固定の段。他の種別の path・片方だけの path は `Unimplemented`。#2674）。
+    NamespaceJoin::paths_of(config)?;
     for ns in config.namespaces() {
-        if ns.path().is_some() {
-            return Err(unsupported("linux.namespaces[].path"));
-        }
-        if matches!(
-            ns.kind(),
-            NamespaceKind::Network | NamespaceKind::Cgroup | NamespaceKind::Time
-        ) {
+        // network の扱いは起動オプションとの突き合わせ(`reconcile_network`)が先に決めて拒否済み(NET-6・#3058)。
+        if matches!(ns.kind(), NamespaceKind::Cgroup | NamespaceKind::Time) {
             return Err(unsupported("network / cgroup / time namespace"));
         }
+    }
+    Ok(())
+}
+
+/// `net.*` の sysctl は network namespace が無いとホストの値を書き換えるため拒否する（CRI-2・CORE-3・SEC-1・#2670）。
+///
+/// 実効の network が `HostShared`（ホストの netns を共有）なら `net.*` を拒否する。`NewLoopback`（新しい netns。
+/// 実体は #3064 で実装済み）なら通す。`FromConfig` で network エントリがある構成は `reconcile_network` が先に `Unimplemented`
+/// で拒否する（pod の netns の結線は #2675）。起動オプションの network モードとの突き合わせは NET-6・#3058。
+/// IPC 系は IPC namespace の必須検査（本関数の呼び出し側）と、launcher の実効の名前空間との照合
+/// （`--ipc=host` との組み合わせの拒否）が担う。
+fn reject_net_sysctls_without_network_namespace(
+    config: &OciConfig,
+    network: EffectiveNetwork,
+) -> Result<(), TraitError> {
+    if config.sysctls().has_namespace(SysctlNamespace::Net)
+        && network == EffectiveNetwork::HostShared
+    {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "linux.sysctl net.* requires a network namespace",
+        ));
     }
     Ok(())
 }
@@ -1403,9 +1503,12 @@ mod tests {
                 cur.bundle().to_path_buf(),
                 cur.revision().next()?,
             )?;
-            // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
-            if let Some(l) = req.launch_isolation().or(cur.launch_isolation()) {
+            // 契約 12: Replace は置き換え、Clear は消し、Inherit は既存の値を引き継ぐ。
+            if let Some(l) = req.launch_isolation_update().apply(cur.launch_isolation()) {
                 next = next.with_launch_isolation(l.clone());
+            }
+            if let Some(r) = req.rlimits().or(cur.rlimits()) {
+                next = next.with_rlimits(r.clone());
             }
             records.insert(req.status().id().clone(), next.clone());
             Ok(next)
@@ -1501,8 +1604,12 @@ mod tests {
         audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
         /// launch が返すハンドルに持たせる分離の記録(未設定なら記録なし。#2007)。
         isolation: Mutex<Option<crate::launch_isolation::LaunchIsolationRecord>>,
+        /// launch が返すハンドルに持たせる rlimit 集合(未設定なら記録なし。#2713)。
+        rlimits: Mutex<Option<crate::rlimits::Rlimits>>,
         /// `confirm_no_process_recorded` に渡された配置（呼び出し順。#2011）。
         recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
+        /// `network_mode` が返すモード(既定 `FromConfig`。NET-6・#3058)。
+        network_mode: Mutex<super::super::network_mode::LaunchNetworkMode>,
     }
 
     impl RecordingLauncher {
@@ -1522,8 +1629,14 @@ mod tests {
                 may_leave: AtomicBool::new(false),
                 audit: std::sync::OnceLock::new(),
                 isolation: Mutex::new(None),
+                rlimits: Mutex::new(None),
                 recorded: Mutex::new(Vec::new()),
+                network_mode: Mutex::new(super::super::network_mode::LaunchNetworkMode::FromConfig),
             })
+        }
+
+        fn set_network_mode(&self, mode: super::super::network_mode::LaunchNetworkMode) {
+            *self.network_mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
         }
 
         /// 次の launch が返すハンドルに持たせる分離の記録を設定する。
@@ -1556,6 +1669,7 @@ mod tests {
         Arc<Gate>,
         NonZeroU32,
         Option<crate::launch_isolation::LaunchIsolationRecord>,
+        Option<crate::rlimits::Rlimits>,
     );
 
     impl LaunchedProcess for FakeProcess {
@@ -1565,6 +1679,10 @@ mod tests {
 
         fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
             self.4.as_ref()
+        }
+
+        fn launch_rlimits(&self) -> Option<&crate::rlimits::Rlimits> {
+            self.5.as_ref()
         }
 
         /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
@@ -1587,6 +1705,10 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn network_mode(&self) -> super::super::network_mode::LaunchNetworkMode {
+            *self.network_mode.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
             self.audit
                 .get()
@@ -1665,6 +1787,10 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
+                self.rlimits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
             )))
         }
     }
@@ -1723,18 +1849,23 @@ mod tests {
         .expect("timeouts")
     }
 
-    /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
+    /// テストごとに一意な bundle ディレクトリ（`ScratchDir` の子。終了時に親ごと削除される）。
+    ///
+    /// bundle は親の子にする。親は Linux で共有 flock を持つため、`BundleLock` の排他 flock を親に取ると失敗する
+    /// （pid だけの名前を先に消す旧方式の置き換え。#3434・REPAIR-12）。
     struct Bundle {
         dir: PathBuf,
+        _scratch: crate::scratch_root::ScratchDir,
     }
 
     impl Bundle {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-oci-start-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create bundle dir");
-            Self { dir }
+            let (scratch, dir) =
+                crate::test_support::scratch_child(&format!("fandhe-oci-start-{name}"), "bundle");
+            Self {
+                dir,
+                _scratch: scratch,
+            }
         }
 
         fn write_config(&self, v: &Value) {
@@ -1748,12 +1879,6 @@ mod tests {
         fn create_req(&self, id: &str) -> CreateRequest {
             CreateRequest::new(ContainerId::new(id).expect("id"), self.dir.clone())
                 .expect("absolute bundle")
-        }
-    }
-
-    impl Drop for Bundle {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -2064,19 +2189,92 @@ mod tests {
         assert_eq!(err.message(), "process.args[0] must not be empty");
     }
 
+    /// CRI-2・CORE-3・SEC-1（#2674）: user と ipc の path が呼び出し側自身の namespace を指す config は、
+    /// 予約・launch の前に `PermissionDenied` で拒否し、状態は Created のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_start_rejects_pod_join_to_own_namespaces() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-own", &cfg);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        // 開けない path は FailedPrecondition。
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/2147483647/ns/ipc"},
+            {"type": "user", "path": "/proc/2147483647/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-gone", &cfg);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
+    /// SEC-4・CORE-3（#2674）: pod の namespace join の検証による拒否は、launcher の拒否の記録先へ mount 層で
+    /// コンテナ ID つき 1 件記録される。開けない path（`FailedPrecondition`）は検証による拒否ではなく記録しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_start_records_pod_join_rejection_to_launcher_audit_sink() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let (b, store) = created("rej-join-audit");
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let err = run(&store, &launcher, "rej-join-audit").expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(launcher.calls(), 0);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        let line = format!("{:?}", recs[0]);
+        assert!(line.contains("rej-join-audit"), "{line}");
+        assert!(line.contains("/proc/self/ns/user"), "{line}");
+    }
+
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。
     #[test]
     fn sec1_start_rejects_unsupported_fields() {
         let cases: Vec<Case> = vec![
-            (
-                "addgid",
-                Box::new(|c| c["process"]["user"]["additionalGids"] = json!([5])),
-            ),
             ("tty", Box::new(|c| c["process"]["terminal"] = json!(true))),
             (
                 "nspath",
                 Box::new(|c| {
                     c["linux"]["namespaces"] = json!([{"type": "pid", "path": "/proc/1/ns/pid"}])
+                }),
+            ),
+            // #2674: path は user と ipc の組だけを受ける。mount・uts への path と片方だけの path は未実装。
+            (
+                "nspath-mount",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount", "path": "/proc/1/ns/mnt"},
+                        {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-ipc-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                        {"type": "ipc", "path": "/proc/1/ns/ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-user-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"},
+                        {"type": "user", "path": "/proc/1/ns/user"}
+                    ])
                 }),
             ),
             (
@@ -2090,7 +2288,6 @@ mod tests {
                         json!([{"containerID": 0, "hostID": 1000, "size": 1}])
                 }),
             ),
-            ("ro", Box::new(|c| c["root"]["readonly"] = json!(true))),
         ];
         for (name, mutate) in cases {
             let mut cfg = valid_config();
@@ -2103,6 +2300,26 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// CORE-5・SEC-1・SUP-12（#2767）: `root.readonly=true` は start が受け、launcher へ届く `LaunchSpec` の
+    /// config が同じ値を持つ（本番の launcher はここから `PrePivotSetup::root_readonly` と Landlock の規則を作る）。
+    /// 成功する start は rootfs の固定（Linux 限定）を要するため Linux 限定（#2817）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core5_sec1_start_accepts_root_readonly() {
+        let name = "ro-root";
+        let (b, store) = created(name);
+        let mut cfg = valid_config();
+        cfg["root"]["readonly"] = json!(true);
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, name).expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        assert_eq!(launcher.calls(), 1);
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert!(spec.config().root().readonly());
     }
 
     /// SEC-5・CORE-6・TASK-40（#2240）: config 指定の ID 写像は uid のみ・gid のみ・両方のどれでも
@@ -2160,6 +2377,22 @@ mod tests {
             err.message(),
             "process.cwd must be a normalized absolute path without .. components"
         );
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: `process.user.additionalGids` は start で拒否せず、検証済みの値として
+    /// launcher へ渡る（写像との照合と適用は launcher と子）。指定が無ければ空。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci1_start_passes_additional_gids_to_launcher() {
+        let mut cfg = valid_config();
+        cfg["process"]["user"]["uid"] = json!(1000);
+        cfg["process"]["user"]["gid"] = json!(1000);
+        cfg["process"]["user"]["additionalGids"] = json!([5, 6]);
+        let spec = build_spec_with_state_root("addgids", &cfg, None).expect("spec");
+        assert_eq!(spec.additional_gids(), [5, 6]);
+
+        let spec = build_spec_with_state_root("no-addgids", &valid_config(), None).expect("spec");
+        assert_eq!(spec.additional_gids(), [] as [u32; 0]);
     }
 
     /// bind mount つきの config（宛先・元・オプションを指定）。
@@ -2834,6 +3067,25 @@ mod tests {
         assert!(stored.launch_isolation() == Some(&iso_record(7, 11)));
     }
 
+    /// SUP-12・CLI-1(#2713): ハンドルが持つ rlimit 集合は、Running の更新と同じ update で状態へ載る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup12_running_record_carries_launch_rlimits() {
+        use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
+        let (_b, store) = created("rl-carry");
+        let launcher = RecordingLauncher::new(false);
+        let set = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 1024, 2048).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        *launcher.rlimits.lock().unwrap() = Some(set.clone());
+        let record = run(&store, &launcher, "rl-carry").expect("start");
+        assert_eq!(record.rlimits(), Some(&set));
+        let (_b2, store2) = created("rl-none");
+        let none = run(&store2, &RecordingLauncher::new(false), "rl-none").expect("start");
+        assert!(none.rlimits().is_none());
+    }
+
     /// SUP-6(#2007): 記録を持たないハンドルでは、従来どおり分離の記録は付かない。
     #[cfg(target_os = "linux")]
     #[test]
@@ -3050,6 +3302,139 @@ mod tests {
         let err = start_rejected_after_rewrite("ns-no-uts-no-hostname", &cfg);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "the UTS namespace is required");
+    }
+
+    /// CRI-2・CORE-3（#2670）: IPC 系の `linux.sysctl` は start を通り、launcher の `spec.config()` に検証済みで渡る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_start_passes_ipc_sysctls_to_launcher() {
+        let name = "sysctl-ipc";
+        let b = Bundle::new(name);
+        let mut cfg = valid_config();
+        cfg["linux"]["sysctl"] =
+            json!({"kernel.shmmax": "68719476736", "kernel.sem": "250 32000 32 128"});
+        b.write_config(&cfg);
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, name).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let got: Vec<(&str, &str)> = specs
+            .first()
+            .expect("spec")
+            .config()
+            .sysctls()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("kernel.sem", "250 32000 32 128"),
+                ("kernel.shmmax", "68719476736")
+            ]
+        );
+    }
+
+    /// 指定のモードで start を試み、拒否されたときの誤りを返す(launcher 0 回・記録は Created のまま)。
+    fn start_rejected_with_mode(
+        name: &str,
+        cfg: &Value,
+        mode: super::super::network_mode::LaunchNetworkMode,
+    ) -> OciRuntimeError {
+        let (b, store) = created(name);
+        b.write_config(cfg);
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(mode);
+        let err = run(&store, &launcher, name).expect_err("must fail");
+        assert_eq!(launcher.calls(), 0);
+        let got = store
+            .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+            .expect("stored");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        err
+    }
+
+    fn with_network_entry(entry: Value) -> Value {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"]
+            .as_array_mut()
+            .expect("array")
+            .push(entry);
+        cfg
+    }
+
+    /// NET-6・NET-9・SEC-1（#3058・#1939）: `Loopback` / `Attachable` / `Host` と path 付きの network エントリは予約の前に `InvalidArgument`。
+    #[test]
+    fn net6_sec1_start_rejects_network_mode_conflicting_with_path() {
+        use super::super::network_mode::LaunchNetworkMode;
+        let cfg = with_network_entry(json!({"type": "network", "path": "/run/netns/x"}));
+        for (name, mode) in [
+            ("net-loop-path", LaunchNetworkMode::Loopback),
+            ("net-attach-path", LaunchNetworkMode::Attachable),
+            ("net-host-path", LaunchNetworkMode::Host),
+        ] {
+            let err = start_rejected_with_mode(name, &cfg, mode);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+            assert_eq!(
+                err.message(),
+                "the network mode conflicts with a linux.namespaces network path"
+            );
+        }
+    }
+
+    /// NET-6・SEC-1（#3058）: `Host` で `net.*` の sysctl はホストの値を書き換えるため拒否する。
+    #[test]
+    fn net6_sec1_start_rejects_net_sysctls_in_host_mode() {
+        use super::super::network_mode::LaunchNetworkMode;
+        let mut cfg = with_network_entry(json!({"type": "network"}));
+        cfg["linux"]["sysctl"] = json!({"net.ipv4.ip_forward": "1"});
+        let err = start_rejected_with_mode("net-host-sysctl", &cfg, LaunchNetworkMode::Host);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl net.* requires a network namespace"
+        );
+    }
+
+    /// NET-6（#3058）: `Host` + path 無しの network エントリは start が受け、spec に `HostShared` と
+    /// モードが載る。成功する start は rootfs の固定を要するため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net6_start_host_mode_with_pathless_entry_shares_host() {
+        use super::super::network_mode::{EffectiveNetwork, LaunchNetworkMode};
+        let name = "net-host-ok";
+        let (b, store) = created(name);
+        b.write_config(&with_network_entry(json!({"type": "network"})));
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_network_mode(LaunchNetworkMode::Host);
+        run(&store, &launcher, name).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert_eq!(spec.network(), EffectiveNetwork::HostShared);
+        assert_eq!(spec.network_mode(), LaunchNetworkMode::Host);
+    }
+
+    /// CRI-2・CORE-3・SEC-1（#2670）: network namespace の無い `net.*` は host の値を書き換えるため `InvalidArgument`、
+    /// network namespace ありは未実装の名前空間として従来どおり `Unimplemented`。launcher は呼ばれない。
+    #[test]
+    fn cri2_start_rejects_net_sysctls_without_usable_network_namespace() {
+        let mut cfg = valid_config();
+        cfg["linux"]["sysctl"] = json!({"net.ipv4.ip_unprivileged_port_start": "0"});
+        let err = start_rejected_after_rewrite("sysctl-net-host", &cfg);
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl net.* requires a network namespace"
+        );
+
+        cfg["linux"]["namespaces"]
+            .as_array_mut()
+            .expect("array")
+            .push(json!({"type": "network"}));
+        let err = start_rejected_after_rewrite("sysctl-net-own", &cfg);
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
     }
 
     /// CORE-2: 中断された予約（Running・pid なし）は識別でき、回復後に start できる。
@@ -3300,9 +3685,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_start_rejects_bundle_under_symlinked_ancestor() {
-        let base =
-            std::env::temp_dir().join(format!("fandhe-oci-start-anc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-start-anc", "d");
         let real = base.join("real");
         std::fs::create_dir_all(real.join("bundle").join("rootfs")).expect("mkdir");
         std::fs::write(
@@ -3330,7 +3714,6 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
         let got = store.get(&GetStateRequest::new(id)).expect("stored");
         assert_eq!(got.status().state(), ContainerState::Created);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1・CLI-1: Linux 以外は rootfs を fd で固定できないため、予約・launch の前に Unimplemented で拒否する。
@@ -3688,8 +4071,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_hard_link_scan_is_confined_to_each_protected_filesystem() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci-hl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-hl", "d");
         let state = base.join("state");
         let sub = state.join("sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
@@ -3708,8 +4091,9 @@ mod tests {
                 path: "/c1".to_owned(),
             },
             sub_s.clone(),
+            30,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &children);
+        let roots = build_protected_roots(&state_id, &state_s, &children, &|_, _| true);
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].dev(), "8:1");
         assert!(
@@ -3725,18 +4109,18 @@ mod tests {
                 path: "/srv/state/sub".to_owned(),
             },
             sub_s,
+            31,
         )];
-        let roots = build_protected_roots(&state_id, &state_s, &same);
+        let roots = build_protected_roots(&state_id, &state_s, &same, &|_, _| true);
         assert!(roots[0].has_hard_linked_files());
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// SEC-1（#1915）: 同じマウントポイントに複数のマウントが重なる子は走査で確定できないため「リンクあり」に固定する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec1_shared_mount_point_child_is_fixed_to_linked() {
-        let base = std::env::temp_dir().join(format!("fandhe-oci-hl2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-hl2", "d");
         let sub = base.join("sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
         let state_s = base.to_str().expect("utf8").to_owned();
@@ -3752,12 +4136,207 @@ mod tests {
                     path: "/".to_owned(),
                 },
                 sub_s.clone(),
+                40,
             )
         };
-        let roots = build_protected_roots(&state_id, &state_s, &[child("8:2"), child("8:3")]);
+        let roots = build_protected_roots(
+            &state_id,
+            &state_s,
+            &[child("8:2"), child("8:3")],
+            &|_, _| true,
+        );
         assert!(roots[1].has_hard_linked_files());
         assert!(roots[2].has_hard_linked_files());
-        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子は走査せず「リンクあり」に固定し、他の走査の枝刈りから外す。
+    /// 状態ルート `/state`(dev A・ID 20)、X(dev C・ID 30・`/state/x/y`・隠れている)、Y(dev A・ID 35・`/state/x`)。
+    #[test]
+    fn sec1_2823_hidden_child_is_fixed_to_linked_and_not_pruned() {
+        let id = |dev: &str| FsIdentity {
+            dev: dev.to_owned(),
+            path: "/".to_owned(),
+        };
+        let state_id = id("A");
+        let children = vec![
+            (id("C"), "/state/x/y".to_owned(), 30),
+            (id("A"), "/state/x".to_owned(), 35),
+        ];
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, mnt| mnt != 30);
+        assert_eq!(roots.len(), 3);
+        // 隠れた X の point は状態ルートの枝刈りに入らない（Y の中の `/y` 配下も走査する）。
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec![])
+        );
+        // X は走査根を持たず固定で「リンクあり」。
+        assert_eq!(
+            roots[1],
+            ProtectedFsRoot::new("C".to_owned(), "/".to_owned(), true)
+        );
+        #[cfg(target_os = "linux")]
+        assert!(roots[1].has_hard_linked_files());
+        // Y は自分の point を走査根にする。
+        assert_eq!(
+            roots[2],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state/x".to_owned(), vec![])
+        );
+        // 対照: すべて見えているなら、別 FS の X の point は Y(同 dev)の枝刈りに入らず、状態ルート（同 dev A）の枝刈りには入る。
+        let roots = build_protected_roots(&state_id, "/state", &children, &|_, _| true);
+        assert_eq!(
+            roots[0],
+            ProtectedFsRoot::new("A".to_owned(), "/".to_owned(), true)
+                .with_scan_root("/state".to_owned(), vec!["/state/x/y".to_owned()])
+        );
+    }
+
+    /// SEC-1・CORE-2（#2823）の本番経路: 実際の fd の mount ID 照合（`child_is_visible`）を通す。
+    /// 実在するディレクトリは自分の mount ID と一致して「見える」、食い違う ID は「見えない」と判定される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2823_child_is_visible_matches_real_mount_id() {
+        let (_scratch, base) = crate::test_support::scratch_child("fandhe-oci-vis", "d");
+        let point = base.to_str().expect("utf8").to_owned();
+        let mnt = path_mount_id(&point).expect("mount id");
+        assert!(child_is_visible(&point, mnt));
+        assert!(!child_is_visible(&point, mnt + 1));
+        assert!(!child_is_visible(&format!("{point}/missing"), mnt));
+        // 本番の判定を build_protected_roots へ渡すと、ID が食い違う子は走査根を持たず「リンクあり」に固定される。
+        let state_id = FsIdentity {
+            dev: "A".to_owned(),
+            path: "/".to_owned(),
+        };
+        let child = |id: u64| {
+            vec![(
+                FsIdentity {
+                    dev: "B".to_owned(),
+                    path: "/".to_owned(),
+                },
+                point.clone(),
+                id,
+            )]
+        };
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt), &child_is_visible);
+        assert!(!roots[1].has_hard_linked_files());
+        let roots = build_protected_roots(&state_id, "/state", &child(mnt + 1), &child_is_visible);
+        assert!(roots[1].has_hard_linked_files());
+    }
+
+    /// SEC-1・CORE-2（#2823）の実マウント結合試験（実機前提・`--ignored`）。非特権 user / mount namespace
+    /// （util-linux の `unshare`）の中で、子マウント Y（ハードリンクを持つ tmpfs）を祖先の overmount で隠し、
+    /// 本番経路（mountinfo の解釈・`path_mount_id`・`child_is_visible`・`build_protected_roots`）で隠れた子が
+    /// 「リンクあり」に固定されることを具体値で照合する。成功行は `ok: sec1_2823_overmount`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires unprivileged user namespaces and util-linux unshare/mount (SEC-1, CORE-2, #2823)"]
+    fn sec1_2823_overmount_hides_child_in_real_namespace() {
+        const NAME: &str =
+            "oci_runtime::start::tests::sec1_2823_overmount_hides_child_in_real_namespace";
+        // マウント先は外側が排他作成した `ScratchDir` の子にそろえる。外側は環境変数で親を渡し、内側は子 `base`
+        // にだけマウントする（親自体にはマウントしないので、外側の drop が EBUSY にならない）。旧方式の pid
+        // だけの名前の残骸に強いことは `repair12_3373_scratch_dir_ignores_legacy_pid_residue` が担保する（#3434・REPAIR-12）。
+        const OVERMOUNT_DIR_ENV: &str = "FANDHE_OCI_2823_DIR";
+        if std::env::var_os("FANDHE_2823_INNER").is_none() {
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fandhe-oci-2823",
+                std::time::Duration::from_secs(10),
+            );
+            let exe = std::env::current_exe().expect("current_exe");
+            let mut cmd = std::process::Command::new("unshare");
+            cmd.args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+            ])
+            .arg(exe)
+            .args([
+                "--exact",
+                NAME,
+                "--ignored",
+                "--no-capture",
+                "--test-threads=1",
+            ])
+            .env("FANDHE_2823_INNER", "1")
+            .env(OVERMOUNT_DIR_ENV, scratch.path());
+            // 外側の待機は期限つき（REPAIR-5）。内側の mount 3 回分より長く 30 秒とする。
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(30))
+                .expect("unshare must finish before the deadline");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "inner failed: {text}");
+            assert!(
+                text.contains("ok: sec1_2823_overmount"),
+                "no success line: {text}"
+            );
+            println!("ok: sec1_2823_overmount");
+            return;
+        }
+        let parent = std::path::PathBuf::from(
+            std::env::var_os(OVERMOUNT_DIR_ENV).expect("FANDHE_OCI_2823_DIR must be set"),
+        );
+        assert!(parent.is_dir(), "scratch parent must exist: {parent:?}");
+        let base = parent.join("base");
+        std::fs::create_dir(&base).expect("create base");
+        let mount_tmpfs = |dir: &Path| {
+            let mut cmd = std::process::Command::new("mount");
+            cmd.args(["-t", "tmpfs", "tmpfs"]).arg(dir);
+            let out = crate::test_support::run_bounded(cmd, std::time::Duration::from_secs(5))
+                .expect("mount must finish before the deadline");
+            assert!(
+                out.status.success(),
+                "mount tmpfs on {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let x = base.join("x");
+        let y = x.join("y");
+        std::fs::create_dir_all(&y).expect("mkdir");
+        // 状態ルート = base(tmpfs A)。その下の x/y に tmpfs Y を置き、Y にハードリンクを作る。
+        mount_tmpfs(&base);
+        std::fs::create_dir_all(&y).expect("mkdir y");
+        mount_tmpfs(&y);
+        std::fs::write(y.join("f"), b"x").expect("write");
+        std::fs::hard_link(y.join("f"), y.join("g")).expect("link");
+        // 祖先 x を別の tmpfs で覆う。Y は mountinfo に残るが x/y のパスからは辿れなくなる。
+        mount_tmpfs(&x);
+        std::fs::create_dir_all(&y).expect("mkdir y over");
+        let base_s = base.to_str().expect("utf8").to_owned();
+        let mountinfo = read_mountinfo_bounded("/proc/thread-self/mountinfo").expect("mountinfo");
+        let mounts = parse_mountinfo(&mountinfo).expect("parse");
+        let state_mnt = path_mount_id(&base_s).expect("state mnt");
+        let state_id = fs_identity(&mounts, state_mnt, &base_s).expect("state id");
+        let children = mounts_under(&mounts, &base_s);
+        assert_eq!(children.len(), 2);
+        // 覆われた Y（x/y の位置の行）は見えず、覆っている tmpfs（x の位置の行）は見える。
+        let hidden = children
+            .iter()
+            .find(|(_, p, _)| {
+                p.ends_with("/x/y") && !child_is_visible(p, children_id(&children, p))
+            })
+            .expect("hidden child");
+        let roots = build_protected_roots(&state_id, &base_s, &children, &child_is_visible);
+        let idx = children.iter().position(|c| c.2 == hidden.2).expect("pos") + 1;
+        assert!(
+            roots[idx].has_hard_linked_files(),
+            "hidden child must be fixed to linked"
+        );
+        // 覆っている x は見えていて、走査してもリンクは無い。
+        let xi = children
+            .iter()
+            .position(|c| c.1.ends_with("/x"))
+            .expect("x")
+            + 1;
+        assert!(!roots[xi].has_hard_linked_files());
+        println!("ok: sec1_2823_overmount");
+
+        fn children_id(children: &[(FsIdentity, String, u64)], p: &str) -> u64 {
+            children.iter().find(|c| c.1 == p).map_or(0, |c| c.2)
+        }
     }
 
     /// SEC-1（#1915）: rbind が公開する子マウントが別名で bundle を含むとき、元の位置を問わず拒否する。

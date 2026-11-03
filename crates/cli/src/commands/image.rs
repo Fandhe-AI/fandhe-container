@@ -10,8 +10,22 @@
 //! （`MSG_BAD_DIGEST`）で拒否する。repository 名が `sha256` のイメージは `docker.io/library/sha256:<tag>` と書く。
 //!
 //! `name@digest` は `create --image` と違い受ける（digest 優先。#2221・#2316 以来の契約）。rm / tag は manifest digest 自体を
-//! 対象にする管理操作で、name は構文検証だけ通して捨て、digest 部は `Digest::parse` で厳格に検証するため取り違えは起きない。
-//! name と manifest の対応を検証できない制約は create と同じで、在庫が repository を持つ（pull の配線後）時点で揃えるかを再判断する。
+//! 対象にする管理操作で、name は構文検証だけ通して捨て、digest 部は `Digest::parse` で厳格に検証するため、操作の範囲は
+//! 素の digest を渡した場合と同じで広がらない。
+//!
+//! ## `name@digest` を受け続ける判断（#2659・OCI-7・CLI-1・TASK-183。pull の配線 #2539・#2800 の後の再判断）
+//!
+//! 現時点の決定は (a) 受け続ける（挙動を変えない）。理由は次のとおり。
+//!
+//! - 配線の後も在庫は manifest ごとの repository を持たない。repository を持つのはタグ（`TagKey`）だけで、digest 指定で
+//!   pull した manifest には名前が残らない。このため「name と在庫の repository の一致を要求する」(b) は、正確には実装できない。
+//!   実装できる形は「その manifest に付いたタグの host / repository と照合する」だけで、タグの無い manifest では常に不一致になり (c) と同じになる。
+//! - (b) を正しく実装するには、在庫のスキーマへ manifest ごとの repository を記録する必要がある（oci の永続化形式の変更）。
+//! - (c)（`create --image` と同じ拒否）は既存契約（#2221・#2316）の破壊になる。
+//!
+//! (b)・(c) への切り替えはオーナーの判断待ちで、見直しの契機は「在庫が manifest ごとの repository を持ったとき」
+//! または「オーナーが (b)・(c) を選んだとき」。残余リスク: 食い違う name を黙って捨てるため、別 repository のタグごと
+//! 削除・タグ付けしうる（素の digest でも同じ範囲）。この決定は `cli1_oci7_image_rm_name_at_digest_*` などの試験で固定している。
 //!
 //! # 構文
 //!
@@ -54,18 +68,23 @@
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
 //! - コンテナ参照（`@container-refs.json`）は永続化済み（#2341・#2352）で、manifest の在庫・タグ・リース（`@image-inventory.json`）も
-//!   oci 側で永続化済み（#2380。`ImageStore::lock` が排他取得のたびに読み直すので、CLI 側の配線は要らない）。ただし本番で在庫を埋める
-//!   経路（pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、
-//!   現状は `image ls` が常にヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
-//!   `image rm` と `image tag` が常に `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
+//!   oci 側で永続化済み（#2380。`ImageStore::lock` が排他取得のたびに読み直すので、CLI 側の配線は要らない）。在庫を埋める経路は cri の
+//!   `OciImagePuller::pull`（`PullImage`）に配線済み（#2539）。CLI に `pull` サブコマンドは無く、同じ root を `--image-root` に渡せば
+//!   その在庫が見える。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。pull していない root の在庫は
+//!   空のため、その root では `image ls` がヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
+//!   `image rm` と `image tag` が `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
+//! - `--image-root` の経路では `recover_stale_pulls`（残った pull の回収 GC）を呼ばない。CLI は pull を持たず短命のため、同じ root を使う plugin-cri の起動時に回収される（#2819・OCI-7）。
 //! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
-//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
+//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）は範囲外。
+//! - oci の `OciOpRecorder` は `oci_recorder::CliOciRecorder` で CLI の `OpRecorder` へ橋渡しし、`image ls` / `image rm` / `image tag` / `system df` の
+//!   `ImageStore` に付ける（`oci.*` の名前で記録。#2968・REPAIR-4・OCI-1）。CLI に pull・展開の経路は無いため、それらの計装は経路が入った時点で同じアダプタを渡す。
 
 use std::io::Write;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Instant;
 
 use fandhe_container_core::observability::OpRecorder;
@@ -78,16 +97,17 @@ use fandhe_container_oci::image_management::{
     ImageRmTarget, ImageStore, ImageTagChange, ImageTagOutcome, ImageTagSource, StoppedContainers,
     TagKey,
 };
+use fandhe_container_oci::instrument::OciOpRecorder;
 use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 
 use super::CliExit;
 use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
-use super::image_refs::{is_bare_digest_form, ref_key, state_scope};
+use super::image_refs::{is_bare_digest_form, legacy_scope, ref_key, state_scope};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
+use super::oci_recorder::CliOciRecorder;
 use super::ref_reconcile::reconcile_for_image_rm;
 use crate::error::CliError;
-use fandhe_container_core::state_store::StateRoot;
 
 /// `image ls` の固定ヘッダ行（LF 終端）。
 const IMAGE_LS_HEADER: &str = "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n";
@@ -130,7 +150,8 @@ pub(super) enum Stage {
     Resolve,
 }
 
-/// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` は `#[non_exhaustive]` ではないが、将来の追加に備え未知は `Internal`。
+/// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` も `#[non_exhaustive]` で `_` 腕が要り、
+/// `DataLoss`（core に対応が無い）と未知は `Internal` に畳む。全件の対応は試験が `OciErrorCode::ALL` から照合する。
 pub(super) fn map_code(code: OciErrorCode) -> ErrorCode {
     match code {
         OciErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
@@ -361,10 +382,24 @@ fn run_image_tag_with(
     }
 }
 
-/// `image ls` の実処理（ストアは呼び出し側が開く）。
+/// `image ls` の実処理（ストアは呼び出し側が開く。計装なし。試験用）。
+#[cfg(test)]
 fn run_image_ls_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
+    run_image_ls_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        out,
+    )
+}
+
+/// 計装つきの `image ls`。`list_images_with` へ記録先を渡す（ストアの記録先はロック取得だけに効くため。#2968）。
+fn run_image_ls_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
+    out: &mut dyn Write,
+) -> CliExit {
     let list = match store.lock() {
-        Ok(g) => g.list_images(store.root()),
+        Ok(g) => g.list_images_with(recorder, store.root()),
         Err(e) => return oci_failure(&e, Stage::Lock),
     };
     match list {
@@ -376,10 +411,24 @@ fn run_image_ls_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
     }
 }
 
-/// `system df` の実処理。
+/// `system df` の実処理（計装なし。試験用）。
+#[cfg(test)]
 fn run_system_df_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
+    run_system_df_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        out,
+    )
+}
+
+/// 計装つきの `system df`（#2968）。
+fn run_system_df_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
+    out: &mut dyn Write,
+) -> CliExit {
     let usage = match store.lock() {
-        Ok(g) => g.disk_usage(store.root()),
+        Ok(g) => g.disk_usage_with(recorder, store.root()),
         Err(e) => return oci_failure(&e, Stage::Lock),
     };
     match usage {
@@ -407,8 +456,30 @@ fn run_image_rm_with(
 ///
 /// 1 回目の判定が使用中で拒否したら、**ガードを手放した状態で** `reclaim`（拒否に載った参照の照合と回収。契機 B・#2495）を
 /// 呼び、判定をやり直す。照合に失敗・保留しても従来どおりの拒否に進む（残す側に誤る）。
+#[cfg(test)]
 fn run_image_rm_reclaiming(
     store: &ImageStore,
+    target: &ImageRmTarget,
+    force: bool,
+    snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
+    reclaim: &dyn Fn(&[ContainerRefId]),
+    out: &mut dyn Write,
+) -> CliExit {
+    run_image_rm_recorded(
+        store,
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        target,
+        force,
+        snapshot,
+        reclaim,
+        out,
+    )
+}
+
+/// 計装つきの `image rm`（`execute_image_rm_with` へ記録先を渡す。#2968）。
+fn run_image_rm_recorded(
+    store: &ImageStore,
+    recorder: &dyn OciOpRecorder,
     target: &ImageRmTarget,
     force: bool,
     snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
@@ -431,7 +502,8 @@ fn run_image_rm_reclaiming(
         match guard.plan_image_rm_with(target, &opts, &none) {
             Err(e) => Err(oci_failure(&e, Stage::Remove)),
             Ok(ImageRmPlan::Refuse(u)) => Ok(Err(u.containers)),
-            Ok(_) => Ok(Ok(guard.execute_image_rm(
+            Ok(_) => Ok(Ok(guard.execute_image_rm_with(
+                recorder,
                 store.root(),
                 target,
                 &opts,
@@ -468,7 +540,9 @@ fn run_image_rm_reclaiming(
             match guard.plan_image_rm_with(target, &opts, &stopped) {
                 Err(e) => return oci_failure(&e, Stage::Remove),
                 Ok(ImageRmPlan::Refuse(_)) => return in_use(true),
-                Ok(_) => guard.execute_image_rm(store.root(), target, &opts, &stopped),
+                Ok(_) => {
+                    guard.execute_image_rm_with(recorder, store.root(), target, &opts, &stopped)
+                }
             }
         }
     };
@@ -497,23 +571,28 @@ fn stopped_snapshot(global: &GlobalArgs) -> Result<StoppedContainers, CliExit> {
     let store = open_store(global).map_err(|e| store_open_failure(&e))?;
     // 参照キーは create / delete と同じ状態ルートの scope を含める（含めないと `plan_image_rm_with` の完全一致で
     // 停止中と判定されず `image rm --force` が拒否される。OCI-7）。
-    let scope = state_scope(
-        &StateRoot::resolve(global.root.clone()).map_err(|e| CliExit::failed(e.code()))?,
-    );
-    snapshot_from(&store, &scope).map_err(|e| CliExit::failed(e.code()))
+    let scope = state_scope(&store).map_err(|e| CliExit::failed(e.code()))?;
+    // 旧版の scope（`--root` の字面から決めたもの）のキーで残った参照も停止中として扱う（#2499・OCI-7）。
+    let legacy = legacy_scope(global.root.clone(), &scope);
+    let scopes: Vec<&str> = std::iter::once(scope.as_str())
+        .chain(legacy.as_deref())
+        .collect();
+    snapshot_from(&store, &scopes).map_err(|e| CliExit::failed(e.code()))
 }
 
-fn snapshot_from(store: &dyn StateStore, scope: &str) -> Result<StoppedContainers, TraitError> {
+fn snapshot_from(store: &dyn StateStore, scopes: &[&str]) -> Result<StoppedContainers, TraitError> {
     let page_size = NonZeroU32::new(MAX_PAGE_SIZE).unwrap_or(NonZeroU32::MIN);
     let mut req = ListStateRequest::new(page_size)?;
     let mut stopped = StoppedContainers::new();
     for _ in 0..MAX_LIST_PAGES {
         let page = store.list(&req)?;
         for record in page.records() {
-            if record.status().state() == ContainerState::Stopped
-                && let Ok(id) = ContainerRefId::new(&ref_key(scope, record.id().as_str()))
-            {
-                stopped.insert(id);
+            if record.status().state() == ContainerState::Stopped {
+                for scope in scopes {
+                    if let Ok(id) = ContainerRefId::new(&ref_key(scope, record.id().as_str())) {
+                        stopped.insert(id);
+                    }
+                }
             }
         }
         match page.next_cursor() {
@@ -528,10 +607,13 @@ fn snapshot_from(store: &dyn StateStore, scope: &str) -> Result<StoppedContainer
 }
 
 /// 計測へ成功・失敗を 1 回記録して出力する（REPAIR-4）。
-fn with_ops(op_name: &str, f: impl FnOnce() -> CliExit) -> CliExit {
+///
+/// closure には記録器の共有ハンドルを渡す。イメージストアを開く入口（`open_image_store_recorded`）へ渡すと、
+/// oci 内の操作が同じ記録器へ `oci.*` の名前で入る（`oci_recorder`。REPAIR-4・OCI-1・#2968）。
+fn with_ops(op_name: &str, f: impl FnOnce(&Arc<OpRecorder>) -> CliExit) -> CliExit {
     let started = Instant::now();
-    let recorder = OpRecorder::new();
-    let exit = f();
+    let recorder = Arc::new(OpRecorder::new());
+    let exit = f(&recorder);
     record_op(
         &recorder,
         op_name,
@@ -560,24 +642,38 @@ fn open_image_store(root: &std::path::Path) -> Result<ImageStore, CliExit> {
     ImageStore::open(root).map_err(|e| oci_failure(&e, Stage::Open))
 }
 
+/// `open_image_store` に oci の計装（`OciOpRecorder`）を `recorder` へ橋渡しして付ける（#2968）。
+fn open_image_store_recorded(
+    root: &std::path::Path,
+    recorder: &Arc<OpRecorder>,
+) -> Result<ImageStore, CliExit> {
+    open_image_store(root)
+        .map(|s| s.with_recorder(Arc::new(CliOciRecorder::new(Arc::clone(recorder)))))
+}
+
 /// 本番入口の `image`。
 pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn Write) -> CliExit {
     if let Some(e) = non_linux_failure(global) {
         return e;
     }
     match args {
-        ImageArgs::Ls(a) => with_ops("image_ls", || match open_image_store(&a.image_root) {
-            Ok(store) => run_image_ls_with(&store, stdout),
-            Err(e) => e,
+        ImageArgs::Ls(a) => with_ops("image_ls", |rec| {
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => {
+                    run_image_ls_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
+                }
+                Err(e) => e,
+            }
         }),
-        ImageArgs::Rm(a) => with_ops("image_rm", || {
+        ImageArgs::Rm(a) => with_ops("image_rm", |rec| {
             let target = match parse_target(&a.reference) {
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store(&a.image_root) {
-                Ok(store) => run_image_rm_reclaiming(
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => run_image_rm_recorded(
                     &store,
+                    &CliOciRecorder::new(Arc::clone(rec)),
                     &target,
                     a.force,
                     &|| stopped_snapshot(global),
@@ -587,7 +683,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Err(e) => e,
             }
         }),
-        ImageArgs::Tag(a) => with_ops("image_tag", || {
+        ImageArgs::Tag(a) => with_ops("image_tag", |rec| {
             let source = match parse_tag_source(&a.source) {
                 Ok(s) => s,
                 Err(e) => return e,
@@ -596,7 +692,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match open_image_store(&a.image_root) {
+            match open_image_store_recorded(&a.image_root, rec) {
                 Ok(store) => run_image_tag_with(&store, &source, target, stdout),
                 Err(e) => e,
             }
@@ -614,9 +710,13 @@ pub(super) fn run_system(
         return e;
     }
     match args {
-        SystemArgs::Df(a) => with_ops("system_df", || match open_image_store(&a.image_root) {
-            Ok(store) => run_system_df_with(&store, stdout),
-            Err(e) => e,
+        SystemArgs::Df(a) => with_ops("system_df", |rec| {
+            match open_image_store_recorded(&a.image_root, rec) {
+                Ok(store) => {
+                    run_system_df_recorded(&store, &CliOciRecorder::new(Arc::clone(rec)), stdout)
+                }
+                Err(e) => e,
+            }
         }),
     }
 }
@@ -624,6 +724,22 @@ pub(super) fn run_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-1・ERR-1: `OciErrorCode::ALL` の全件を照合する。`Internal` へ畳まれるのは
+    /// `Internal` と `DataLoss` だけで、それ以外は同名の core の code に写る。
+    #[test]
+    fn err1_map_code_covers_all_oci_codes() {
+        let mut folded = Vec::new();
+        for oc in OciErrorCode::ALL {
+            let mapped = map_code(oc);
+            if mapped == ErrorCode::Internal {
+                folded.push(oc);
+            } else {
+                assert_eq!(mapped.as_str(), oc.as_str(), "{oc:?}");
+            }
+        }
+        assert_eq!(folded, [OciErrorCode::DataLoss, OciErrorCode::Internal]);
+    }
     use fandhe_container_oci::image_management::{ManifestComposition, ReferenceTable};
     use fandhe_container_oci::reference::{RegistryHost, Repository, Tag};
     use std::cell::Cell;
@@ -631,7 +747,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// 試験用の一時ディレクトリ（drop で削除）。
-    struct Tmp(PathBuf);
+    /// 第 2 要素は排他作成した実体（Drop で後始末する。REPAIR-12・#3475）。
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
@@ -640,14 +757,11 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
+            let root = crate::test_root::test_root_at(p);
+            let p = root.to_path_buf();
             std::fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod");
-            }
-            Tmp(p)
+            Tmp(p, root)
         }
         fn path(&self) -> &Path {
             &self.0
@@ -665,12 +779,6 @@ mod tests {
             self.0.join("blobs").join("sha256").join(hex).exists()
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn dg(c: char) -> Digest {
         Digest::parse(&format!(
             "sha256:{}",
@@ -866,6 +974,52 @@ mod tests {
         assert!(!tmp.has_blob('a'));
     }
 
+    /// OCI-7・#2659: `name@digest` は name が一致しても digest で解決し、素の digest と同じ出力で削除する。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_digest_matching_name_deletes_by_digest() {
+        let tmp = Tmp::new();
+        tmp.put_blob('a', 1);
+        tmp.put_blob('b', 1);
+        let store = rm_store(&tmp, &[]);
+        let d = format!("busybox@sha256:{}", "1".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 0);
+        let h1 = "1".repeat(64);
+        assert!(out.starts_with("untagged\tregistry-1.docker.io/library/busybox:latest\n"));
+        assert!(out.contains(&format!("deleted\tsha256:{h1}\n")));
+        assert!(out.contains(&format!("deleted-blob\tsha256:{}\n", "a".repeat(64))));
+        assert!(out.contains(&format!("deleted-blob\tsha256:{}\n", "b".repeat(64))));
+        assert!(!tmp.has_blob('a') && !tmp.has_blob('b'));
+    }
+
+    /// OCI-7・#2659: name が食い違っても digest 優先で削除する（(a) の残余リスクを固定。切り替え時は意図した試験の変更になる）。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_digest_mismatched_name_is_digest_first() {
+        let tmp = Tmp::new();
+        tmp.put_blob('a', 1);
+        tmp.put_blob('b', 1);
+        let store = rm_store(&tmp, &[]);
+        let d = format!("nginx@sha256:{}", "1".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 0);
+        assert!(out.starts_with("untagged\tregistry-1.docker.io/library/busybox:latest\n"));
+        assert!(out.contains(&format!("deleted\tsha256:{}\n", "1".repeat(64))));
+        assert!(!tmp.has_blob('a') && !tmp.has_blob('b'));
+    }
+
+    /// OCI-7・#2659: 在庫に無い digest の `name@digest` は INVALID_ARGUMENT ではなく 3 / NOT_FOUND。
+    #[test]
+    fn cli1_oci7_image_rm_name_at_unknown_digest_is_not_found() {
+        let tmp = Tmp::new();
+        let store = rm_store(&tmp, &[]);
+        let d = format!("nginx@sha256:{}", "9".repeat(64));
+        let (e, out) = out_of(|o| run_image_rm_with(&store, &target(&d), false, &no_snapshot, o));
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(e.code(), Some("NOT_FOUND"));
+        assert!(stderr_of(&e).contains(MSG_IMAGE_NOT_FOUND));
+        assert_eq!(out, "");
+    }
+
     /// OCI-7: コンテナ参照ありで --force なしは 5。文言は固定でコンテナ ID を含まない。ファイルは不変。
     #[test]
     fn cli1_oci7_image_rm_in_use_refuses_without_leaking_container_id() {
@@ -914,7 +1068,7 @@ mod tests {
     #[test]
     fn oci7_image_rm_reclaims_stale_ref_then_deletes() {
         use super::super::ref_reconcile::reconcile_in_use;
-        use fandhe_container_core::state_store::FileStateStore;
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
         let scope = "0123456789abcdef0123456789abcdef";
         let other = "fedcba9876543210fedcba9876543210";
         let state_tmp = Tmp::new();
@@ -1072,6 +1226,61 @@ mod tests {
         }
     }
 
+    /// REPAIR-4・OCI-1: 記録付きで開いたストアの `image ls` / `system df` が `oci.*` の操作を記録器へ入れる。
+    #[test]
+    fn repair4_recorded_store_feeds_oci_ops_into_recorder() {
+        let tmp = Tmp::new();
+        let rec = Arc::new(OpRecorder::new());
+        let store = open_image_store_recorded(tmp.path(), &rec).expect("open");
+        let bridge = CliOciRecorder::new(Arc::clone(&rec));
+        let (e, _) = out_of(|o| run_image_ls_recorded(&store, &bridge, o));
+        assert_eq!(e.exit_code(), 0);
+        let (e, _) = out_of(|o| run_system_df_recorded(&store, &bridge, o));
+        assert_eq!(e.exit_code(), 0);
+        let get = |n: &str| {
+            let name = fandhe_container_core::observability::OpName::new(n).expect("name");
+            rec.snapshot_op(&name).map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get("oci.image.list"), Some((1, 0)));
+        assert_eq!(get("oci.image.df"), Some((1, 0)));
+        assert_eq!(get("oci.store.lock"), Some((2, 0)));
+    }
+
+    /// REPAIR-4・OCI-7（#2223）: 記録付きストアの `image rm` が実行段の成功を `oci.image.rm` に記録する。
+    #[test]
+    fn repair4_image_rm_records_oci_image_rm() {
+        let tmp = Tmp::new();
+        let rec = Arc::new(OpRecorder::new());
+        let bridge = CliOciRecorder::new(Arc::clone(&rec));
+        let store = tag_store(&tmp, &[("latest", '1'), ("v1", '1')])
+            .with_recorder(Arc::new(CliOciRecorder::new(Arc::clone(&rec))));
+        let get = || {
+            let name =
+                fandhe_container_core::observability::OpName::new("oci.image.rm").expect("name");
+            rec.snapshot_op(&name).map(|s| (s.success(), s.failure()))
+        };
+        let run = |reference: &str| {
+            out_of(|o| {
+                run_image_rm_recorded(
+                    &store,
+                    &bridge,
+                    &target(reference),
+                    false,
+                    &no_snapshot,
+                    &|_| {},
+                    o,
+                )
+            })
+        };
+        let (e, out) = run("busybox:v1");
+        assert_eq!(e.exit_code(), 0, "{out}");
+        assert_eq!(get(), Some((1, 0)));
+        // 計画段階（plan）で NotFound になった参照は execute に届かないため、`oci.image.rm` は増えない。
+        let (e, _) = run("busybox:nope");
+        assert_ne!(e.exit_code(), 0);
+        assert_eq!(get(), Some((1, 0)));
+    }
+
     /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。
     #[cfg(unix)]
     #[test]
@@ -1163,6 +1372,20 @@ mod tests {
                 "1".repeat(64)
             )
         );
+    }
+
+    /// CLI-1・OCI-7・#2659: tag の source が `name@digest` なら name の一致・不一致によらず digest で解決する。
+    #[test]
+    fn cli1_oci7_image_tag_name_at_digest_source_match_and_mismatch() {
+        let h = "1".repeat(64);
+        let want = format!("tagged\tregistry-1.docker.io/library/busybox:v1\tsha256:{h}\n");
+        for name in ["busybox", "nginx"] {
+            let tmp = Tmp::new();
+            let store = tag_store(&tmp, &[]);
+            let (e, out) = run_tag(&store, &format!("{name}@sha256:{h}"), "busybox:v1");
+            assert_eq!(e.exit_code(), 0, "{name}");
+            assert_eq!(out, want, "{name}");
+        }
     }
 
     /// CLI-1・OCI-7: 別 manifest を指すタグの付け替えは retagged 行（付け替え前 → 後）。

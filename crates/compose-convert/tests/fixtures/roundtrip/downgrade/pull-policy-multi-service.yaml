@@ -1,0 +1,11 @@
+# STACK-5・TASK-152.1・#605 の格下げモード用。pull_policy を 2 サービスに置く（出現数 2）。
+services:
+  one:
+    image: example.invalid/one:1
+    pull_policy: always
+  two:
+    image: example.invalid/two:1
+    pull_policy: missing
+    volumes: ["vol:/data"]
+volumes:
+  vol:

@@ -13,8 +13,10 @@
 //! カーネルの ACK（`NLMSG_ERROR`）を [`KERNEL_AUDIT_ACK_TIMEOUT`] を上限に待って閉じる（稀な経路のため
 //! 常駐 fd を持たない）。メッセージ型は `AUDIT_TRUSTED_APP`（1121。auditd の libaudit が定義する
 //! 信頼済みアプリ向けの自由形式テキスト。カーネルは `AUDIT_FIRST_USER_MSG..=AUDIT_LAST_USER_MSG`
-//! の範囲のユーザーメッセージとして受理する）。`AUDIT_USER_AVC`（1107）は SELinux AVC 用の別扱い
-//! （カーネルが `audit_enabled` 無効でも処理する等）のため採らない。
+//! の範囲のユーザーメッセージとして受理する。カーネルの uapi ヘッダに `AUDIT_TRUSTED_APP` の定義は無い）。
+//! `AUDIT_USER_AVC`（1107）は、カーネルが `audit_enabled` 無効でもこの型だけ処理する例外
+//! （`!audit_enabled && msg_type != AUDIT_USER_AVC`）を持つ別扱いのため採らない（ヘッダの注記は
+//! "We filter this differently" のみで、SELinux の AVC 用という説明はカーネル側に無い。#2498）。
 //!
 //! # 契約・エラー分類（`AuditWriteError` の kind と `ErrorCode`）
 //!
@@ -36,9 +38,40 @@
 //! - 本文は末尾に `container_id=<id>`（不明なら `?`）を持つ。メッセージ上限に収めるため、パスの hex は残りの予算まで
 //!   切り詰めることがある（`path_truncated=1`、`path_original_len` は元の長さ）。主経路〔JSON〕のパスは 4096 バイトを保つので、
 //!   この経路だけ短くなりうる
-//! - `audit_enabled` が無効なカーネルでも ACK は 0（成功）で返るため、「ACK 成功 = 監査ログへ必ず出た」
-//!   ではなく「カーネルが受理した」を意味する
+//! - ACK 成功は「監査ログへ必ず出た」ではなく「カーネルが受理した」を意味する。カーネルは次の場合に
+//!   記録を出さないまま ACK 0 を返す（出典は下記「一次情報」）
+//!   - 実行時に `audit_enabled` が無効（`auditctl -e 0`）: `audit_receive_msg` が `audit_log_*` より前に `return 0`
+//!     し、`audit_receive` が `NLM_F_ACK` に応じて ACK 0 を返す
+//!   - USER フィルタ規則（`AUDIT_FILTER_USER`）が `never` で一致し、`audit_filter` が 0 を返した
+//!   - `audit_log_start` が NULL を返した（EXCLUDE 規則・backlog 上限超過・確保失敗）。後続の
+//!     `audit_log_format` / `audit_log_end` は NULL を無視する
+//! - 起動時の `audit=0` は上と別の状態: `audit_init` が `register_pernet_subsys` に届かず NETLINK_AUDIT が
+//!   登録されないため、`socket()` 自体が `EPROTONOSUPPORT`（`netlink_create`）で失敗する見込みで、
+//!   表の「socket 作成不可」（`KernelAuditUnavailable`）に当たる（`coverage.rs` の
+//!   `kernel_audit_disabled_at_boot` と同じ区別）。実機での観測は未実施で、ソースからの読み取り
 //! - 両経路が失敗したときの扱いは [`AuditWriteFailure`](super::AuditWriteFailure) の rustdoc を参照
+//!
+//! # 一次情報（Linux v6.12。タグ commit `adc218676eef25575469234709c2d87185ca223a`。2026-10-26 に原文で確認。#2498）
+//!
+//! 行番号は v6.12 のもの。カーネル（GPL-2.0）のコードは写さず、関数名と条件の要約だけを書く。
+//!
+//! - `kernel/audit.c` `audit_receive_msg`: ユーザーメッセージ（`AUDIT_FIRST_USER_MSG..=AUDIT_LAST_USER_MSG`）の
+//!   case（L1375 以降）で、L1378 が `!audit_enabled && msg_type != AUDIT_USER_AVC` なら `return 0`、
+//!   L1381 が `data_len < 2` を `EINVAL`、L1384 が `audit_filter(.., AUDIT_FILTER_USER)` の結果が 1 のときだけ記録、
+//!   L1392 が本文の最終バイトを NUL で上書きする。`audit_log_common_recv_msg`（L1092）も同じ例外を持つ
+//! - `kernel/audit.c` `audit_receive`（L1554）: L1570–1576 で `NLM_F_ACK` が立っていれば `err == 0` でも `netlink_ack`
+//! - `kernel/audit.c` `audit_netlink_ok`（L1030）: L1045 で初期 user namespace 以外は `ECONNREFUSED`、
+//!   L1073–1077 でユーザーメッセージに `CAP_AUDIT_WRITE` が無ければ `EPERM`（PID namespace は見ない）
+//! - `kernel/audit.c` `audit_init`（L1689）: `audit_initialized == AUDIT_DISABLED` なら先頭で戻り、
+//!   `register_pernet_subsys(&audit_net_ops)`（L1710 付近。`audit_net_init` が `NETLINK_AUDIT` を作る）に届かない。
+//!   `audit_enable`（`audit=` の解釈）が `audit=0|off` でこの状態にする
+//! - `net/netlink/af_netlink.c` `netlink_create`（L647）: 未登録のプロトコルは `EPROTONOSUPPORT`（L678）
+//! - `kernel/audit.c` `audit_log_start`（L1858）: `audit_initialized` が未初期化、EXCLUDE 規則（`audit_filter`）に
+//!   一致、backlog 超過（待てなければ）、確保失敗で NULL
+//! - `kernel/auditfilter.c` `audit_filter`（L1331）: 既定の戻りは 1。規則に一致して動作が `never`
+//!   （EXCLUDE の一覧では一致そのもの）なら 0
+//! - `include/uapi/linux/audit.h`: `AUDIT_FIRST_USER_MSG` 1100・`AUDIT_USER_AVC` 1107・`AUDIT_LAST_USER_MSG` 1199
+//!   （L75–78）・`AUDIT_MESSAGE_TEXT_MAX` 8560（L457）
 //!
 //! # 未実装（REPAIR-3）
 //!
@@ -63,7 +96,7 @@ const ACK_BUF_LEN: usize = 64;
 
 /// `AUDIT_TRUSTED_APP`（auditd の libaudit が定義するユーザー空間監査メッセージ型）。
 const AUDIT_TRUSTED_APP: u16 = 1121;
-/// `AUDIT_MESSAGE_TEXT_MAX`（include/uapi/linux/audit.h）。カーネルが 1 メッセージに載せる本文の上限。
+/// `AUDIT_MESSAGE_TEXT_MAX`（Linux v6.12 の include/uapi/linux/audit.h L457。#2498）。カーネルが 1 メッセージに載せる本文の上限。
 const AUDIT_MESSAGE_TEXT_MAX: usize = 8560;
 /// `NLM_F_REQUEST`・`NLM_F_ACK`（include/uapi/linux/netlink.h）。
 const NLM_F_REQUEST: u16 = 0x01;
@@ -125,7 +158,8 @@ impl AuditNetlinkFrame {
         if payload.len() > AUDIT_MESSAGE_TEXT_MAX {
             return Err(too_long());
         }
-        // AUDIT_TRUSTED_APP ではカーネルが本文の最終バイトを NUL で上書きするため、libaudit と同じく
+        // AUDIT_TRUSTED_APP ではカーネルが本文の最終バイトを NUL で上書きする（v6.12 kernel/audit.c の
+        // `audit_receive_msg` L1392。#2498）ため、libaudit と同じく
         // 末尾 NUL を含めた strlen+1 を `nlmsg_len` に入れる（含めないと最後のフィールドが欠ける）。
         let total = NLMSG_HDRLEN
             .checked_add(payload.len())
@@ -244,6 +278,7 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         AuditEvent::Seccomp { .. }
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
+        | AuditEvent::PastaVerify { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => None,
@@ -285,6 +320,11 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
             tail.push_str(id.as_str());
         }
         None => tail.push_str(" container_id=?"),
+    }
+    // 拒否した段（静的語彙 `[a-z_]` のみ。段を持つ記録だけ。#3121）。
+    if let Some(stage) = record.stage() {
+        tail.push_str(" stage=");
+        tail.push_str(stage.as_str());
     }
     // パス欄の予算 = 上限 - (ここまで + パス以外の固定部 + 末尾)。hex は 1 バイトにつき 2 文字。
     let mut no_hex = String::new();
@@ -846,6 +886,47 @@ mod tests {
         );
     }
 
+    /// SEC-4・ERR-4・#3121: 段つきの本文は ` stage=<トークン>` を container_id の後ろに付け、段なしの本文は不変。
+    #[test]
+    fn sec4_3121_payload_stage_is_exact_and_optional() {
+        let ev = || AuditEvent::Mount {
+            path: None,
+            reason: Some(crate::audit_log::AuditReason::new(
+                "masked_path_apply_failed",
+            )),
+        };
+        let plain = encode_payload(&rec(ev()).with_container_id(cid("c1"))).unwrap();
+        assert!(plain.ends_with(" reason=masked_path_apply_failed container_id=c1"));
+        assert!(!plain.contains("stage="), "{plain}");
+        let staged = encode_payload(
+            &rec(ev())
+                .with_container_id(cid("c1"))
+                .with_stage(crate::audit_log::AuditStage::new("mount_masked_paths")),
+        )
+        .unwrap();
+        assert_eq!(staged, format!("{plain} stage=mount_masked_paths"));
+    }
+
+    /// SEC-4・ERR-4・#3121: 最悪ケースでも上限に収まり、末尾の `stage=` は残る（切られるのはパスの hex 側）。
+    #[test]
+    fn sec4_3121_payload_stage_worst_case_fits() {
+        let id = "a".repeat(255);
+        let r = rec(AuditEvent::Mount {
+            path: Some(AuditPath::new(&"a".repeat(4096))),
+            reason: Some(crate::audit_log::AuditReason::new(
+                "rootfs_symlink_or_not_directory",
+            )),
+        })
+        .with_container_id(cid(&id))
+        .with_stage(crate::audit_log::AuditStage::new("mount_readonly_paths"));
+        let t = encode_payload(&r).unwrap();
+        assert!(t.len() <= AUDIT_MESSAGE_TEXT_MAX, "{}", t.len());
+        assert!(
+            t.ends_with(&format!(" container_id={id} stage=mount_readonly_paths")),
+            "{t}"
+        );
+    }
+
     /// SEC-4・#1618: ID が無い本文は ` container_id=?`（既存の `?` の慣例）。
     #[test]
     fn sec4_1618_payload_without_container_id_is_question_mark() {
@@ -1122,7 +1203,7 @@ mod tests {
     }
 
     fn failing_primary() -> AuditFileWriter {
-        let f = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let f = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
         AuditFileWriter::from_file_unchecked(f)
     }
 

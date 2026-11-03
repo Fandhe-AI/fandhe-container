@@ -6,7 +6,7 @@
 # 損失件数を CI の実行結果（GITHUB_STEP_SUMMARY。未設定なら stdout）に出す。
 # 呼び出し元: Makefile の `crash-summary-check`（CI の platform-ci「crash_safety 件数の集計」ステップ）。
 # scripts/lib.sh は source しない（作業ディレクトリをルートへ移すため、相対の --dir が壊れる）。
-# 検証: Linux / macOS は期待 3 ケースのファイルがすべて通常ファイル（symlink 不可）・1 行・JSON で、
+# 検証: Linux / macOS は期待 4 ケースのファイルがすべて通常ファイル（symlink 不可）・1 行・JSON で、
 # 項目の型が正しいこと。余分なファイルがあれば失敗。Windows は UDS 未対応のためケース 0 件であること。
 # 使い方: check-crash-summary.sh --dir <dir> [--os Linux|macOS|Windows]
 # 終了コード: 0 成功 / 1 検証失敗 / 2 usage 誤り。bash 3.2 互換。
@@ -71,7 +71,7 @@ for f in "${dir}"/* "${dir}"/.[!.]* "${dir}"/..?*; do
 done
 
 case "${os}" in
-  Linux | macOS) expected="flushed deferred_unflushed deferred_flushed" ;;
+  Linux | macOS) expected="flushed deferred_unflushed deferred_flushed file_ops_flushed" ;;
   Windows)
     [ -z "${entries}" ] || fail "Windows must have no crash_safety cases (UDS unsupported), found: ${entries}"
     {

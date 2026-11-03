@@ -1,4 +1,4 @@
-//! WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（TASK-67.6・#377。WIN-1・WIN-2・MS-5・REPAIR-12）。
+//! WSL2 virtiofs 共有の Windows 固有検証と実機結合試験（TASK-67.6・#377 で作成。実機の実行記録は #353。WIN-1・WIN-2・MS-5・REPAIR-12）。
 //!
 //! Windows でのみビルドする（他 OS は 0 件の test target。`tests/vm_boot.rs`〔platform-macos〕と同じ方式）。
 //! feature `wsl2-test-support` は使わず公開 API だけを使うため、`make test-integration` の既定集合に入る。
@@ -15,6 +15,9 @@
 //! 実機テストは `.wslconfig` に書き込まない（`virtiofs=true` と `wsl --shutdown` は事前に人間が行う）。
 
 #![cfg(windows)]
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,7 +211,7 @@ fn guest_sh(distro: &str, script: &str, timeout: Duration) -> (bool, String) {
             Some(s) => break s,
             None if start.elapsed() > timeout => {
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("wsl.exe timed out: {script}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),

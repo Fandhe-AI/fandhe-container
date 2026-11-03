@@ -1,4 +1,4 @@
-//! `stop` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・SEC-1・ERR-2・SUP-1・SUP-9・SUP-3・#2059・#2162・#2440）。
+//! `stop`・`kill` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・#1902・SEC-1・ERR-2・SUP-1・SUP-9・SUP-3・#2059・#2162・#2440）。
 //!
 //! 本番入口 `commands::run_to` から、フェイクの supervisor（`ControlServer` と模擬の起動ハンドル）の UDS までを
 //! 実際に通し、終了コードと stderr の JSON を具体値で照合する。root・実コンテナは不要で既定のテスト集合で動く。
@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 use fandhe_container_cli::commands::run_to;
 use fandhe_container_core::observability::OpRecorder;
@@ -99,19 +103,25 @@ impl ProcessLauncher for PidLauncher {
     }
 }
 
-struct Tmp(PathBuf);
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+/// 第 2 フィールドは tmpfiles の flock 走査から守る親（最後のため `Drop` の削除の後に消える。#3026）。
+struct Tmp(
+    PathBuf,
+    #[allow(dead_code)] scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+);
 
 impl Tmp {
     fn new(tag: &str) -> Self {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p =
-            std::env::temp_dir().join(format!("fc-cli-stopctl-{tag}-{}-{n}", std::process::id()));
+        let scratch =
+            scratch_root::ScratchDir::new("fc-cli-stopctl", std::time::Duration::from_secs(10));
+        // 制御用 UDS のパス長を抑えるため子の名前は短くする。
+        let p = scratch.path().join(tag);
         std::fs::create_dir_all(&p).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(p)
+        Self(p, scratch)
     }
 }
 
@@ -269,7 +279,15 @@ fn running_container(tag: &str, pid: u32) -> Env {
         ),
         &mut out,
     );
-    assert_eq!(ex.exit_code(), 0);
+    // 失敗時の原因（TIMEOUT か ResourceExhausted か等）を見分けられるよう stderr を assert の文言へ含める（#2834）。
+    let mut err = Vec::new();
+    ex.write_stderr(&mut err).unwrap();
+    assert_eq!(
+        ex.exit_code(),
+        0,
+        "create failed: {}",
+        String::from_utf8_lossy(&err)
+    );
     let id = ContainerId::new(tag).unwrap();
     let store = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap();
     let launcher: Arc<dyn ProcessLauncher> = Arc::new(PidLauncher(pid));
@@ -317,6 +335,35 @@ fn stop(env: &Env) -> (u8, String, String) {
     )
 }
 
+fn stop_with_signal(env: &Env, signal: &str) -> (u8, String, String) {
+    let mut out = Vec::new();
+    let ex = run_to(
+        argv(&env.root, &["stop", "--signal", signal, env.id.as_str()]),
+        &mut out,
+    );
+    let mut err = Vec::new();
+    ex.write_stderr(&mut err).unwrap();
+    (
+        ex.exit_code(),
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+fn kill_cmd(env: &Env, extra: &[&str]) -> (u8, String, String) {
+    let mut rest = vec!["kill", env.id.as_str()];
+    rest.extend_from_slice(extra);
+    let mut out = Vec::new();
+    let ex = run_to(argv(&env.root, &rest), &mut out);
+    let mut err = Vec::new();
+    ex.write_stderr(&mut err).unwrap();
+    (
+        ex.exit_code(),
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
 fn err_line(code: &str, message: &str) -> String {
     format!("{{\"op\":\"kill\",\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
 }
@@ -335,6 +382,113 @@ fn cli1_sec1_stop_delivers_sigterm_via_supervisor() {
         ExplicitStopState::Requested
     );
     assert!(!sup.intent.is_stop_requested());
+}
+
+/// CLI-1・SEC-1(#2775): `--signal SIGKILL` は番号 9 が supervisor の起動ハンドルへ 1 回だけ届く(意図の記録は SIGTERM と同じ)。
+#[test]
+fn cli1_stop_signal_delivers_the_requested_number_via_supervisor() {
+    let env = running_container("stopsig", 4243);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4243, true);
+    let (code, out, err) = stop_with_signal(&env, "SIGKILL");
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(sup.recorded(), vec![9]);
+}
+
+/// CLI-1・ERR-1(#2775): 不正な `--signal` は INVALID_ARGUMENT(2)で、supervisor には何も届かない。
+#[test]
+fn cli1_stop_invalid_signal_is_rejected_before_any_delivery() {
+    let env = running_container("stopbadsig", 4244);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4244, true);
+    for bad in ["BOGUS", "65", "32", ""] {
+        let (code, out, err) = stop_with_signal(&env, bad);
+        assert_eq!(code, 2, "{bad}");
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            err_line("INVALID_ARGUMENT", "signal is invalid"),
+            "{bad}"
+        );
+    }
+    assert_eq!(sup.recorded(), Vec::<u8>::new());
+}
+
+/// CLI-1・SEC-1・#1902: `kill <id>` は SIGTERM（15）を 1 回送り、stop と違って明示 stop の意図は立てない（kind 2）。
+#[test]
+fn cli1_sec1_kill_delivers_sigterm_by_default_via_supervisor() {
+    let env = running_container("killok", 4250);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4250, true);
+    let (code, out, err) = kill_cmd(&env, &[]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(sup.recorded(), vec![15]);
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::NotRequested
+    );
+}
+
+/// CLI-1・#1902: 指定した名前・番号がそのまま 1 回だけ届き、意図は立たない。
+#[test]
+fn cli1_kill_delivers_requested_signal_via_supervisor() {
+    for (tag, sig, want) in [("killnine", "KILL", 9u8), ("killten", "10", 10)] {
+        let env = running_container(tag, 4251);
+        let sup = FakeSupervisor::start(&env.root, &env.id, 4251, true);
+        let (code, out, err) = kill_cmd(&env, &[sig]);
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""), "{sig}");
+        assert_eq!(sup.recorded(), vec![want], "{sig}");
+        assert_eq!(
+            sup.intent.explicit_stop_state(),
+            ExplicitStopState::NotRequested
+        );
+    }
+}
+
+/// CLI-1・ERR-1・#1902: 不正なシグナルは INVALID_ARGUMENT（2）で、supervisor には何も届かない。
+#[test]
+fn cli1_kill_invalid_signal_is_rejected_before_any_delivery() {
+    let env = running_container("killbadsig", 4252);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4252, true);
+    for bad in ["BOGUS", "term", "RTMIN+1", ""] {
+        let (code, out, err) = kill_cmd(&env, &[bad]);
+        assert_eq!(code, 2, "{bad}");
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            err_line("INVALID_ARGUMENT", "signal is invalid"),
+            "{bad}"
+        );
+    }
+    // 範囲外の番号は core の `Signal::new` が固定文言で拒否する。
+    let (code, _out, err) = kill_cmd(&env, &["65"]);
+    assert_eq!(code, 2);
+    assert_eq!(
+        err,
+        err_line("INVALID_ARGUMENT", "signal number must be in 1..=64")
+    );
+    assert_eq!(sup.recorded(), Vec::<u8>::new());
+}
+
+/// SEC-1・ERR-2・#1902: supervisor が無ければ UNAVAILABLE（9）で、pid へ kill(2) で縮退しない。
+#[test]
+fn sec1_err2_kill_without_supervisor_is_unavailable_and_does_not_kill() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let env = running_container("killnosup", child.id());
+    let (code, _out, err) = kill_cmd(&env, &[]);
+    let alive = child.try_wait().unwrap().is_none();
+    if let Err(e) = reap::reap(&mut child, reap::reap_within()) {
+        panic!("{e}");
+    }
+    assert_eq!(code, 9);
+    assert_eq!(
+        err,
+        err_line(
+            "UNAVAILABLE",
+            "the supervisor control channel is unavailable"
+        )
+    );
+    assert!(alive, "kill must not fall back to kill(2)");
 }
 
 /// SUP-9・ERR-2: 意図を記録できない supervisor には SIGTERM を送らず、FAILED_PRECONDITION（5）で失敗する。
@@ -369,8 +523,9 @@ fn sec1_err2_stop_without_supervisor_is_unavailable_and_does_not_kill() {
     let env = running_container("stopnosup", child.id());
     let (code, _out, err) = stop(&env);
     let alive = child.try_wait().unwrap().is_none();
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(e) = reap::reap(&mut child, reap::reap_within()) {
+        panic!("{e}");
+    }
     assert_eq!(code, 9);
     assert_eq!(
         err,

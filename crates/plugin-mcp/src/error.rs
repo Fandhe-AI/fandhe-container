@@ -141,20 +141,13 @@ impl ToolError {
         self.code.as_str()
     }
 
-    /// 分類ごとの固定英文。
+    /// 分類ごとの固定英文。`ErrorCode::ALL` と同数の表から引く（`Internal` も明示。表の外の
+    /// 将来の code は `"Internal error"`。REPAIR-1・ERR-1）。
     pub fn message(&self) -> &'static str {
-        match self.code {
-            ErrorCode::InvalidArgument => "Invalid argument",
-            ErrorCode::NotFound => "Container not found",
-            ErrorCode::AlreadyExists => "Already exists",
-            ErrorCode::FailedPrecondition => "Operation not allowed in the current state",
-            ErrorCode::Unimplemented => "Not implemented",
-            ErrorCode::PermissionDenied => "Permission denied",
-            ErrorCode::Timeout => "Operation timed out",
-            ErrorCode::Unavailable => "Backend unavailable",
-            ErrorCode::ResourceExhausted => "Resource exhausted",
-            _ => "Internal error",
-        }
+        TOOL_ERROR_MESSAGES
+            .iter()
+            .find(|(c, _)| *c == self.code)
+            .map_or("Internal error", |(_, m)| m)
     }
 
     /// `tools/call` の result（`isError: true`。`content[0].text` は `{"code","message"}` の JSON 文字列）。
@@ -167,9 +160,42 @@ impl ToolError {
     }
 }
 
+/// `ToolError::message` の表（`ErrorCode::ALL` と同数。試験が網羅と重複なしを照合する）。
+const TOOL_ERROR_MESSAGES: [(ErrorCode, &str); 10] = [
+    (ErrorCode::InvalidArgument, "Invalid argument"),
+    (ErrorCode::NotFound, "Container not found"),
+    (ErrorCode::AlreadyExists, "Already exists"),
+    (
+        ErrorCode::FailedPrecondition,
+        "Operation not allowed in the current state",
+    ),
+    (ErrorCode::Unimplemented, "Not implemented"),
+    (ErrorCode::Internal, "Internal error"),
+    (ErrorCode::PermissionDenied, "Permission denied"),
+    (ErrorCode::Timeout, "Operation timed out"),
+    (ErrorCode::Unavailable, "Backend unavailable"),
+    (ErrorCode::ResourceExhausted, "Resource exhausted"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-1・ERR-1: 文言の表が `ErrorCode::ALL` を過不足なく覆い、全件で文言が空でない。
+    #[test]
+    fn mcp4_err5_tool_error_message_table_covers_all() {
+        assert_eq!(TOOL_ERROR_MESSAGES.len(), ErrorCode::ALL.len());
+        for (i, code) in ErrorCode::ALL.into_iter().enumerate() {
+            let hits = TOOL_ERROR_MESSAGES
+                .iter()
+                .filter(|(c, _)| *c == code)
+                .count();
+            assert_eq!(hits, 1, "{code:?}");
+            assert_eq!(TOOL_ERROR_MESSAGES[i].0, code);
+            let m = ToolError { code }.message();
+            assert!(!m.is_empty(), "{code:?}");
+        }
+    }
 
     #[test]
     fn mcp4_err5_protocol_error_table() {

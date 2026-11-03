@@ -12,6 +12,21 @@
 //! `PermissionDenied`・`ResourceExhausted` は既存の CRI 実装が返しているが ERR-3 の表に無い拡張で、
 //! spec への反映要否は報告事項とする。
 //!
+//! ## レジストリの HTTP 状態の運び方（#2898・CRI-3・OCI-1・REPAIR-4・ERR-1）
+//!
+//! 1. gRPC コードは oci の分類（`code_for_http_status`）を `From<PullError>` の表で写して決まる。
+//!    401/403 は `PERMISSION_DENIED`、404 は `NOT_FOUND`、408 は `DEADLINE_EXCEEDED`、
+//!    429 と 5xx は `UNAVAILABLE`、その他の 4xx は `INVALID_ARGUMENT`。
+//! 2. HTTP 状態は message に入れず、トレーラーのメタデータ [`REGISTRY_HTTP_STATUS_METADATA_KEY`]
+//!    （10 進。範囲は 100..=599）でだけ運ぶ。範囲外は付けない。
+//! 3. message は分類ごとの固定の英語文言（URL・応答本文・資格情報を含めない）。429 だけが専用の固定文言
+//!    `registry rate limit exceeded` を持つ（メタデータを捨てる経路でも見分けるため）。
+//! 4. 付けるのはレジストリ由来の失敗（`PullError::from_oci`）だけで、ストア・展開・config 由来には付けない。
+//! 5. plugin 境界の `PluginError` はメタデータを運ばない（対象外）。`ErrorInfo`（details）は新規依存が要るため採らない。
+//! 6. 読み手は [`registry_http_status_from_metadata`] だけ（書き手 `From<CriError> for Status` と対）。
+//!    操作記録（`crate::instrument::CriOpTimer`。#2966）と実機前提試験の失敗表示が使う。区分の語彙は
+//!    `crate::instrument::RegistryHttpClass`。
+//!
 //! `PullError` の `AlreadyExists` は意図して `INTERNAL` に写す（`ALREADY_EXISTS` にしない。
 //! 理由は `From<PullError> for CriError` の doc。ERR-3・TASK-97・#2321）。
 
@@ -19,10 +34,28 @@ use std::fmt;
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 use fandhe_container_oci::error::OciErrorCode;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Status};
 
 use crate::image_pull::PullError;
 use crate::instrument::code_name;
+
+/// レジストリの HTTP 状態を運ぶトレーラーメタデータのキー（値は 10 進の ASCII。例: `429`）。
+pub const REGISTRY_HTTP_STATUS_METADATA_KEY: &str = "fandhe-registry-http-status";
+
+/// `Status` のメタデータから [`REGISTRY_HTTP_STATUS_METADATA_KEY`] の値を厳格に読む（#2966・CRI-3・REPAIR-4）。
+///
+/// 書き手（`From<CriError> for Status`）と対になる唯一の読み手。ちょうど 3 桁の ASCII 数字で
+/// 100..=599 に入るときだけ `Some`、それ以外（キー無し・空白・先頭 0 の 4 桁・範囲外）は `None`
+/// （fail-closed。アロケーションしない）。
+pub fn registry_http_status_from_metadata(md: &MetadataMap) -> Option<u16> {
+    let text = md.get(REGISTRY_HTTP_STATUS_METADATA_KEY)?.to_str().ok()?;
+    if text.len() != 3 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u16 = text.parse().ok()?;
+    (100..=599).contains(&value).then_some(value)
+}
 
 /// `Status` のメッセージ上限（バイト）。plugin・レジストリ由来の文字列で応答が肥大化するのを防ぐ。
 pub(crate) const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
@@ -79,6 +112,28 @@ impl CriErrorCode {
     pub fn as_str(self) -> &'static str {
         code_name(self.grpc_code())
     }
+
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験が検出する。
+    pub const ALL: [CriErrorCode; 11] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::FailedPrecondition,
+        Self::Unimplemented,
+        Self::DataLoss,
+        Self::Timeout,
+        Self::Unavailable,
+        Self::PermissionDenied,
+        Self::ResourceExhausted,
+        Self::Internal,
+    ];
+
+    /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None`（呼び出し側は fail-closed で扱う）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 /// CRI の失敗（区分とメッセージ）。`tonic::Status` へは [`From`] で変換する。
@@ -86,6 +141,7 @@ impl CriErrorCode {
 pub struct CriError {
     code: CriErrorCode,
     message: String,
+    registry_http_status: Option<u16>,
 }
 
 impl CriError {
@@ -99,7 +155,16 @@ impl CriError {
             }
             message.truncate(end);
         }
-        Self { code, message }
+        Self {
+            code,
+            message,
+            registry_http_status: None,
+        }
+    }
+
+    /// レジストリ由来の HTTP 状態（`PullError` 経由のときだけ入る）。
+    pub fn registry_http_status(&self) -> Option<u16> {
+        self.registry_http_status
     }
 
     /// `INVALID_ARGUMENT` のエラーを作る。
@@ -168,25 +233,49 @@ impl std::error::Error for CriError {}
 
 impl From<CriError> for Status {
     fn from(err: CriError) -> Self {
-        Status::new(err.code.grpc_code(), err.message)
+        match err.registry_http_status {
+            Some(status) => {
+                let mut metadata = MetadataMap::new();
+                metadata.insert(
+                    REGISTRY_HTTP_STATUS_METADATA_KEY,
+                    MetadataValue::from(status),
+                );
+                Status::with_metadata(err.code.grpc_code(), err.message, metadata)
+            }
+            None => Status::new(err.code.grpc_code(), err.message),
+        }
     }
 }
 
-/// core の `ContainerRuntime` のエラーを写す。未知の区分（`#[non_exhaustive]`）は fail-closed で `Internal`。
+/// core の `ErrorCode` から `CriErrorCode` への表（`ErrorCode::ALL` と同数。`Internal` も明示。
+/// 試験が網羅と重複なしを照合する。REPAIR-1・ERR-3）。
+const TRAIT_ERROR_TABLE: [(ErrorCode, CriErrorCode); 10] = [
+    (ErrorCode::InvalidArgument, CriErrorCode::InvalidArgument),
+    (ErrorCode::NotFound, CriErrorCode::NotFound),
+    (ErrorCode::AlreadyExists, CriErrorCode::AlreadyExists),
+    (
+        ErrorCode::FailedPrecondition,
+        CriErrorCode::FailedPrecondition,
+    ),
+    (ErrorCode::Unimplemented, CriErrorCode::Unimplemented),
+    (ErrorCode::Internal, CriErrorCode::Internal),
+    (ErrorCode::PermissionDenied, CriErrorCode::PermissionDenied),
+    (ErrorCode::Timeout, CriErrorCode::Timeout),
+    (ErrorCode::Unavailable, CriErrorCode::Unavailable),
+    (
+        ErrorCode::ResourceExhausted,
+        CriErrorCode::ResourceExhausted,
+    ),
+];
+
+/// core の `ContainerRuntime` のエラーを写す。表に無い区分（`#[non_exhaustive]` の将来の variant）は
+/// fail-closed で `Internal`。
 impl From<&TraitError> for CriError {
     fn from(err: &TraitError) -> Self {
-        let code = match err.code() {
-            ErrorCode::InvalidArgument => CriErrorCode::InvalidArgument,
-            ErrorCode::NotFound => CriErrorCode::NotFound,
-            ErrorCode::AlreadyExists => CriErrorCode::AlreadyExists,
-            ErrorCode::FailedPrecondition => CriErrorCode::FailedPrecondition,
-            ErrorCode::Unimplemented => CriErrorCode::Unimplemented,
-            ErrorCode::PermissionDenied => CriErrorCode::PermissionDenied,
-            ErrorCode::Timeout => CriErrorCode::Timeout,
-            ErrorCode::Unavailable => CriErrorCode::Unavailable,
-            ErrorCode::ResourceExhausted => CriErrorCode::ResourceExhausted,
-            _ => CriErrorCode::Internal,
-        };
+        let code = TRAIT_ERROR_TABLE
+            .iter()
+            .find(|(c, _)| *c == err.code())
+            .map_or(CriErrorCode::Internal, |(_, cri)| *cri);
         Self::new(code, err.message())
     }
 }
@@ -217,13 +306,78 @@ impl From<PullError> for CriError {
             OciErrorCode::AlreadyExists => CriErrorCode::Internal,
             _ => CriErrorCode::Internal,
         };
-        Self::new(code, err.message())
+        let mut out = Self::new(code, err.message());
+        out.registry_http_status = err.http_status();
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_oci::error::OciError;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: CriErrorCode) -> usize {
+        match code {
+            CriErrorCode::InvalidArgument => 0,
+            CriErrorCode::NotFound => 1,
+            CriErrorCode::AlreadyExists => 2,
+            CriErrorCode::FailedPrecondition => 3,
+            CriErrorCode::Unimplemented => 4,
+            CriErrorCode::DataLoss => 5,
+            CriErrorCode::Timeout => 6,
+            CriErrorCode::Unavailable => 7,
+            CriErrorCode::PermissionDenied => 8,
+            CriErrorCode::ResourceExhausted => 9,
+            CriErrorCode::Internal => 10,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err3_cri_error_code_all_covers_every_variant() {
+        for (i, c) in CriErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(CriErrorCode::ALL.len(), 11);
+        let set: std::collections::HashSet<_> = CriErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 11);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err3_cri_error_code_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (CriErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (CriErrorCode::NotFound, "NOT_FOUND"),
+            (CriErrorCode::AlreadyExists, "ALREADY_EXISTS"),
+            (CriErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (CriErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (CriErrorCode::DataLoss, "DATA_LOSS"),
+            (CriErrorCode::Timeout, "DEADLINE_EXCEEDED"),
+            (CriErrorCode::Unavailable, "UNAVAILABLE"),
+            (CriErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (CriErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (CriErrorCode::Internal, "INTERNAL"),
+        ];
+        assert_eq!(table.len(), CriErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(CriErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(CriErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(CriErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
     use crate::adapter::trait_error_to_status;
 
     fn code_of(e: CriError) -> Code {
@@ -349,12 +503,132 @@ mod tests {
             (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (ErrorCode::Internal, Code::Internal),
         ];
+        assert_eq!(cases.len(), ErrorCode::ALL.len());
+        for c in ErrorCode::ALL {
+            assert!(cases.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+        }
         for (ec, expected) in cases {
             let te = TraitError::new(ec, "msg");
             let st = Status::from(CriError::from(&te));
             assert_eq!(st.code(), expected);
             assert_eq!(st.message(), "msg");
             assert_eq!(st.code(), trait_error_to_status(&te).code());
+        }
+    }
+
+    /// CRI-3・OCI-1・ERR-3: 429・503・状態なしは同じ `UNAVAILABLE` のまま、メタデータ（と 429 の固定文言）で区別できる。
+    #[test]
+    fn cri3_registry_http_status_is_carried_in_metadata() {
+        let to_status = |http: Option<u16>| {
+            let mut e = OciError::new(OciErrorCode::Unavailable, "upstream detail token=dummy");
+            if let Some(h) = http {
+                e = e.with_http_status(h);
+            }
+            let ce = CriError::from(PullError::from_oci(&e));
+            assert_eq!(ce.registry_http_status(), http);
+            Status::from(ce)
+        };
+        let st = to_status(Some(429));
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry rate limit exceeded");
+        assert_eq!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .map(|v| v.to_str().unwrap()),
+            Some("429")
+        );
+        for leaked in ["429", "token=", "upstream"] {
+            assert!(!st.message().contains(leaked));
+        }
+        let st = to_status(Some(503));
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry is unavailable");
+        assert_eq!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .map(|v| v.to_str().unwrap()),
+            Some("503")
+        );
+        let st = to_status(None);
+        assert_eq!(st.code(), Code::Unavailable);
+        assert_eq!(st.message(), "registry is unavailable");
+        assert!(
+            st.metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    /// CRI-3・REPAIR-4（#2966）: メタデータの読み手は 3 桁・範囲内だけを受け、書き手と往復一致する。
+    #[test]
+    fn cri3_registry_http_status_from_metadata_is_strict() {
+        let md_of = |v: &str| {
+            let mut md = MetadataMap::new();
+            md.insert(
+                REGISTRY_HTTP_STATUS_METADATA_KEY,
+                v.parse::<MetadataValue<_>>().unwrap(),
+            );
+            md
+        };
+        for (raw, expected) in [
+            ("429", Some(429)),
+            ("100", Some(100)),
+            ("599", Some(599)),
+            ("099", None),
+            ("600", None),
+            ("0429", None),
+            (" 429", None),
+            ("42", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                registry_http_status_from_metadata(&md_of(raw)),
+                expected,
+                "raw={raw:?}"
+            );
+        }
+        assert_eq!(
+            registry_http_status_from_metadata(&MetadataMap::new()),
+            None
+        );
+        for http in [401u16, 429, 503] {
+            let ce = CriError::from(PullError::from_oci(
+                &OciError::new(OciErrorCode::Unavailable, "x").with_http_status(http),
+            ));
+            let st = Status::from(ce);
+            assert_eq!(
+                registry_http_status_from_metadata(st.metadata()),
+                Some(http)
+            );
+        }
+    }
+
+    /// CRI-3・OCI-1: HTTP 状態ごとの gRPC コードとメタデータ値（余計なキーは付かない）。
+    #[test]
+    fn cri3_registry_http_status_table() {
+        let cases = [
+            (
+                401u16,
+                OciErrorCode::PermissionDenied,
+                Code::PermissionDenied,
+            ),
+            (403, OciErrorCode::PermissionDenied, Code::PermissionDenied),
+            (404, OciErrorCode::NotFound, Code::NotFound),
+            (408, OciErrorCode::Timeout, Code::DeadlineExceeded),
+            (500, OciErrorCode::Unavailable, Code::Unavailable),
+            (400, OciErrorCode::InvalidArgument, Code::InvalidArgument),
+        ];
+        for (http, oci, want) in cases {
+            let e = OciError::new(oci, "m").with_http_status(http);
+            let st = Status::from(CriError::from(PullError::from_oci(&e)));
+            assert_eq!(st.code(), want, "{http}");
+            assert_eq!(st.metadata().len(), 1, "{http}");
+            let v = st
+                .metadata()
+                .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+                .unwrap();
+            assert_eq!(v.to_str().unwrap(), http.to_string());
         }
     }
 
@@ -372,6 +646,7 @@ mod tests {
             (OciErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (OciErrorCode::FailedPrecondition, Code::FailedPrecondition),
             (OciErrorCode::AlreadyExists, Code::Internal),
+            (OciErrorCode::Internal, Code::Internal),
         ];
         for (oc, expected) in cases {
             let pe = PullError::new(oc, "msg");
@@ -379,6 +654,55 @@ mod tests {
             assert_eq!(st.code(), expected);
             assert_eq!(st.message(), "msg");
             assert_eq!(st.code(), Status::from(pe).code());
+        }
+    }
+
+    /// REPAIR-1・ERR-3: core の `ErrorCode::ALL` の全件が表にあり、同名の区分へ写る
+    /// （名前が食い違うのは `Timeout` の gRPC 名だけ）。core の像に入らない区分は `DataLoss` だけ。
+    #[test]
+    fn err3_trait_error_table_covers_all() {
+        assert_eq!(TRAIT_ERROR_TABLE.len(), ErrorCode::ALL.len());
+        let mut image = Vec::new();
+        for (i, code) in ErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(TRAIT_ERROR_TABLE[i].0, code);
+            let cri = CriError::from(&TraitError::new(code, "m")).code();
+            assert_eq!(cri, TRAIT_ERROR_TABLE[i].1);
+            if code == ErrorCode::Timeout {
+                assert_eq!(
+                    (code.as_str(), cri.as_str()),
+                    ("TIMEOUT", "DEADLINE_EXCEEDED")
+                );
+            } else {
+                assert_eq!(cri.as_str(), code.as_str());
+            }
+            image.push(cri);
+        }
+        let outside: Vec<_> = CriErrorCode::ALL
+            .into_iter()
+            .filter(|c| !image.contains(c))
+            .collect();
+        assert_eq!(outside, [CriErrorCode::DataLoss]);
+    }
+
+    /// REPAIR-1・ERR-3: `OciErrorCode::ALL` の全件が写り、`AlreadyExists` と `Internal` だけが
+    /// `Internal`（#2321）。それ以外は同名の gRPC 区分。
+    #[test]
+    fn err3_pull_error_mapping_covers_all_oci_codes() {
+        for oc in OciErrorCode::ALL {
+            let cri = CriError::from(PullError::new(oc, "m")).code();
+            match oc {
+                OciErrorCode::AlreadyExists | OciErrorCode::Internal => {
+                    assert_eq!(cri, CriErrorCode::Internal, "{oc:?}")
+                }
+                _ => {
+                    let expected = if oc == OciErrorCode::Timeout {
+                        "DEADLINE_EXCEEDED"
+                    } else {
+                        oc.as_str()
+                    };
+                    assert_eq!(cri.as_str(), expected, "{oc:?}");
+                }
+            }
         }
     }
 }

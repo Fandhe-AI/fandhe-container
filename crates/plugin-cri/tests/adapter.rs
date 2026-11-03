@@ -25,6 +25,11 @@ use fandhe_container_plugin_cri::adapter::{
     UnimplementedBundleProvider, UnimplementedNetwork,
 };
 
+// 予測できる名前を消さずに排他作成する補助（net の試験補助を取り込む。REPAIR-12・#3479）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).expect("valid id")
 }
@@ -94,6 +99,33 @@ fn plug1_backends_hold_injected_trait_objects() {
     assert_eq!(net.code(), ErrorCode::Unimplemented);
     // 組み立て（serve はしない）がパニックしないこと。
     let _svc = backends.runtime_service(Arc::new(UnimplementedBundleProvider));
+}
+
+/// 注入で組んだ backends には状態ルートが無く、`ImageService` は `FAILED_PRECONDITION`（CRI-3・PLUG-1。#2592）。
+#[cfg(unix)]
+#[test]
+fn cri3_image_service_requires_production_backends() {
+    let state: Arc<dyn fandhe_container_core::traits::StateStore> = Arc::new(NoState);
+    let backends = CriPluginBackends::new(Arc::new(Fake), state, Arc::new(UnimplementedNetwork));
+    let e = backends.image_service().expect_err("no state root");
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "state root is not configured");
+}
+
+/// 期限の大小関係（REPAIR-5・#2592）: pull の期限 < gRPC の 1 リクエストの期限 <= `GRPC_TIMEOUT_MAX`。
+/// 実行層の待ち（start）も 1 リクエストの期限に収まる。
+#[test]
+fn repair5_pull_deadline_fits_inside_request_timeout() {
+    use fandhe_container_plugin::grpc::GRPC_TIMEOUT_MAX;
+    use fandhe_container_plugin_cri::adapter::{
+        PLUGIN_PULL_DEADLINE, PLUGIN_REQUEST_TIMEOUT, PLUGIN_RUNTIME_TIMEOUT,
+    };
+    use std::time::Duration;
+    assert_eq!(PLUGIN_PULL_DEADLINE, Duration::from_secs(540));
+    assert_eq!(PLUGIN_REQUEST_TIMEOUT, Duration::from_secs(600));
+    assert!(PLUGIN_PULL_DEADLINE < PLUGIN_REQUEST_TIMEOUT);
+    assert!(PLUGIN_REQUEST_TIMEOUT <= GRPC_TIMEOUT_MAX);
+    assert!(PLUGIN_RUNTIME_TIMEOUT < PLUGIN_REQUEST_TIMEOUT);
 }
 
 /// 何も保持しない `StateStore`（全操作 Unimplemented）。
@@ -218,23 +250,43 @@ fn cri2_production_unimplemented_off_linux() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod store_backed {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerState, CreateRequest};
 
     use super::*;
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fc-plugin-cri-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("tmp dir");
-        // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    /// 試験用の一時ディレクトリ。予測できる名前を消さずに排他作成し、drop で自分の分だけ消す
+    /// （REPAIR-12・#3479。pid だけの名前の先行削除を避ける）。
+    struct TmpDir(PathBuf);
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
         }
-        std::fs::canonicalize(&d).expect("canonicalize")
+    }
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> TmpDir {
+        tmp_dir_in(&std::env::temp_dir(), tag)
+    }
+
+    /// `parent` 直下に `fc-plugin-cri-<tag>-<pid>-<n>` を 0700 で排他作成する。macOS の `/var` →
+    /// `/private/var` のような別名を `StateRoot` が嫌うため、正規化したパスを持たせる。
+    fn tmp_dir_in(parent: &std::path::Path, tag: &str) -> TmpDir {
+        let d = crate::exclusive_dir::create_in(parent, &format!("fc-plugin-cri-{tag}"))
+            .expect("tmp dir");
+        TmpDir(std::fs::canonicalize(&d).expect("canonicalize"))
     }
 
     fn make_bundle(dir: &std::path::Path) -> PathBuf {
@@ -279,8 +331,94 @@ mod store_backed {
             .delete(&DeleteRequest::new(cid("c1")))
             .expect_err("second delete");
         assert_eq!(twice.code(), ErrorCode::NotFound);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// 実ストアへ委譲し、呼び出し回数を数える（`StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT` の数え方の照合用。#3143）。
+    struct CountingStore {
+        inner: Arc<dyn fandhe_container_core::traits::StateStore>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl CountingStore {
+        fn note(&self, name: &'static str) {
+            self.calls.lock().expect("lock").push(name);
+        }
+    }
+
+    impl fandhe_container_core::traits::StateStore for CountingStore {
+        fn create(
+            &self,
+            r: &fandhe_container_core::traits::CreateStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("create");
+            self.inner.create(r)
+        }
+        fn get(
+            &self,
+            r: &fandhe_container_core::traits::GetStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("get");
+            self.inner.get(r)
+        }
+        fn update(
+            &self,
+            r: &fandhe_container_core::traits::UpdateStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateRecord,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("update");
+            self.inner.update(r)
+        }
+        fn delete(
+            &self,
+            r: &fandhe_container_core::traits::DeleteStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::DeleteStateResponse,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("delete");
+            self.inner.delete(r)
+        }
+        fn list(
+            &self,
+            r: &fandhe_container_core::traits::ListStateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::StateList,
+            fandhe_container_core::traits::TraitError,
+        > {
+            self.note("list");
+            self.inner.list(r)
+        }
+        fn host_state_root(&self) -> Option<&std::path::Path> {
+            self.inner.host_state_root()
+        }
+    }
+
+    /// REPAIR-5・#3143: plugin-cri の `create`（新しい ID）が `StateStore` を呼ぶのは `create` 1 回だけ（`update`・`delete`・
+    /// `list` は 0 回）。`repair5_create_worst_case_fits_runtime_timeout` が状態ロックを 1 回と数える根拠の照合。
+    /// 新しい状態ルートでは回収の guard〔`get`〕は評価されない（ログ・文書が無いため）。
+    #[test]
+    fn repair5_3143_create_calls_state_store_once() {
+        let dir = tmp_dir("create-count");
+        let bundle = make_bundle(&dir);
+        let root = StateRoot::resolve(Some(dir.join("state"))).expect("root");
+        let inner: Arc<dyn fandhe_container_core::traits::StateStore> =
+            Arc::new(FileStateStore::open(root).expect("open"));
+        let counting = Arc::new(CountingStore {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let rt = CoreLifecycleRuntime::new(counting.clone());
+        rt.create(&CreateRequest::new(cid("c1"), bundle).expect("req"))
+            .expect("create");
+        assert_eq!(*counting.calls.lock().expect("lock"), ["create"]);
     }
 
     // ---- コンテナログの後始末（#2593・SUP-7・CRI-2・CLI-1）----
@@ -413,7 +551,6 @@ mod store_backed {
         assert_eq!(log_remove_counts(&recorder), Some((1, 0)));
         let st = rt.state(&StateRequest::new(cid("c2"))).expect("c2 state");
         assert_eq!(st.state(), ContainerState::Created);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-7・CRI-2・#2593: sink が生きている間は `delete` は `Ok` のままログを残し、失敗を構造化エラーで観測できる。
@@ -440,7 +577,7 @@ mod store_backed {
         assert_eq!(
             lines,
             vec![
-                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"cleanup after delete left resources behind\"}"
+                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
                     .to_owned()
             ]
         );
@@ -467,7 +604,6 @@ mod store_backed {
         drop(sink);
         rt.remove_container_log(&cid("c1")).expect("removed");
         assert!(sorted_dir_names(&logs).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-7・CRI-2・#2593: 同じ ID が再作成されていたら（ガードが偽）ログを消さない。
@@ -485,6 +621,49 @@ mod store_backed {
         // 状態が残っている（再作成された扱い）間は成功しても現在ログは残る（ロックだけは片付く）。
         rt.remove_container_log(&cid("c1")).expect("skipped");
         assert_eq!(sorted_dir_names(&logs), ["c1.log"]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 残骸（同名のディレクトリ・symlink）を先に置いても消さず・辿らず連番を進めること
+    /// （CRI-2・REPAIR-12・#3479）。
+    #[test]
+    fn cri2_repair12_tmp_dir_skips_stale_residue() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let parent = tmp_dir("residue");
+        let canary = parent.join("canary");
+        std::fs::create_dir(&canary).unwrap();
+        std::fs::write(canary.join("keep"), b"canary").unwrap();
+        std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid = std::process::id();
+        let stale0 = parent.join(format!("fc-plugin-cri-t-{pid}-0"));
+        std::fs::create_dir(&stale0).unwrap();
+        std::fs::write(stale0.join("stale"), b"stale").unwrap();
+        let link1 = parent.join(format!("fc-plugin-cri-t-{pid}-1"));
+        symlink(&canary, &link1).unwrap();
+        let new_path = {
+            let d = tmp_dir_in(&parent, "t");
+            assert_eq!(
+                &*d,
+                parent.join(format!("fc-plugin-cri-t-{pid}-2")).as_path()
+            );
+            assert_eq!(std::fs::read_dir(&*d).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::metadata(&*d).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            d.0.clone()
+        };
+        assert!(!new_path.exists(), "own dir must be removed on drop");
+        assert_eq!(std::fs::read(stale0.join("stale")).unwrap(), b"stale");
+        assert_eq!(std::fs::read(canary.join("keep")).unwrap(), b"canary");
+        assert_eq!(
+            std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            std::fs::symlink_metadata(&link1)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

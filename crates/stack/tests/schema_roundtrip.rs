@@ -1,11 +1,12 @@
-//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・REPAIR-12）。
+//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・TASK-149.4.1・#862・TASK-149.4.2・#863・REPAIR-12）。
 //!
 //! 6 テーブル（project・services・networks・volumes・secrets・configs）の読み込みと、
 //! 書き出し・再読み込みの往復を具体値で照合する。parse / serialize の公開入口は
 //! 後続のため、`toml` を直接使う。
 
 use fandhe_container_stack::schema::{
-    ComposeToml, Config, DependsOnCondition, Network, Project, Secret, Service, Volume,
+    ComposeToml, Config, DependsOnCondition, Deploy, DeployResources, Healthcheck, Network,
+    Project, ResourceLimits, ResourceReservations, Secret, Service, Volume,
 };
 
 const DOC: &str = r#"
@@ -122,4 +123,139 @@ fn stack_1_public_api_empty_document() {
 fn stack_1_public_api_rejects_unknown_keys() {
     assert!(toml::from_str::<ComposeToml>("profiles = [\"dev\"]").is_err());
     assert!(toml::from_str::<ComposeToml>("[secrets.k]\nfiel = \"x\"\n").is_err());
+}
+
+/// STACK-1・STACK-10・GPU-1・TASK-149.4.1: 拡張フィールドを公開パスで読み、往復できる。
+#[test]
+fn stack_1_public_api_service_extended_fields() {
+    let doc = r#"
+[services.gpu]
+restart = "always"
+devices = ["nvidia.com/gpu=all"]
+profiles = ["gpu"]
+
+[services.gpu.ulimits]
+nofile = "1024:2048"
+"#;
+    let parsed: ComposeToml = toml::from_str(doc).expect("valid");
+    let svc = &parsed.services["gpu"];
+    assert_eq!(svc.restart.as_deref(), Some("always"));
+    assert_eq!(svc.devices, vec!["nvidia.com/gpu=all".to_string()]);
+    assert_eq!(svc.profiles, vec!["gpu".to_string()]);
+    assert_eq!(
+        svc.ulimits.get("nofile").map(String::as_str),
+        Some("1024:2048")
+    );
+    let text = toml::to_string(&parsed).expect("serialize");
+    let again: ComposeToml = toml::from_str(&text).expect("reparse");
+    assert_eq!(again, parsed);
+}
+
+/// STACK-1・TASK-149.4.2(#863): 公開パスから healthcheck と入れ子の deploy.resources を読み、往復が一致する。
+#[test]
+fn stack_1_public_api_healthcheck_and_deploy_resources() {
+    let doc = r#"
+[services.gpu]
+image = "example/gpu:1"
+
+[services.gpu.healthcheck]
+test = ["/bin/check"]
+interval = "10s"
+retries = 5
+
+[services.gpu.deploy.resources.limits]
+memory = "1G"
+
+[services.gpu.deploy.resources.reservations]
+devices = ["nvidia.com/gpu=all"]
+"#;
+    let parsed: ComposeToml = toml::from_str(doc).expect("parse");
+    let svc = parsed.services.get("gpu").expect("gpu");
+    assert_eq!(
+        svc.healthcheck,
+        Some(Healthcheck {
+            test: Some(vec!["/bin/check".into()]),
+            interval: Some("10s".into()),
+            retries: Some(5),
+            ..Healthcheck::default()
+        })
+    );
+    assert_eq!(
+        svc.deploy,
+        Some(Deploy {
+            resources: Some(DeployResources {
+                limits: Some(ResourceLimits {
+                    cpus: None,
+                    memory: Some("1G".into()),
+                }),
+                reservations: Some(ResourceReservations {
+                    devices: vec!["nvidia.com/gpu=all".into()],
+                }),
+            }),
+        })
+    );
+    let text = toml::to_string(&parsed).expect("serialize");
+    assert_eq!(
+        toml::from_str::<ComposeToml>(&text).expect("reparse"),
+        parsed
+    );
+}
+
+/// STACK-6・TASK-153.1（#609）: container_name・working_dir を公開パスから読み、往復し、型違いを拒否する。
+#[test]
+fn stack_6_public_api_container_name_and_working_dir() {
+    let doc = "[services.s]\ncontainer_name = \"fixed\"\nworking_dir = \"/srv/app\"\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.container_name.as_deref(), Some("fixed"));
+    assert_eq!(s.working_dir.as_deref(), Some("/srv/app"));
+    let out = toml::to_string(&t).unwrap();
+    assert!(out.contains("container_name = \"fixed\""), "{out}");
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ncontainer_name = 1\n",
+        "[services.s]\nworking_dir = [\"/a\"]\n",
+        "[services.s]\nworkdir = \"/a\"\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
+}
+
+/// STACK-6・TASK-153.2（#610）: cap_drop・security_opt を公開パスから読み、往復し、型違いを拒否する。
+/// cap_add はオーナー判断待ちでスキーマに無く、`deny_unknown_fields` で拒否される（SEC-1）。
+#[test]
+fn stack_6_public_api_cap_drop_and_security_opt() {
+    let doc = "[services.s]\ncap_drop = [\"ALL\"]\nsecurity_opt = [\"no-new-privileges:true\"]\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.cap_drop, ["ALL"]);
+    assert_eq!(s.security_opt, ["no-new-privileges:true"]);
+    let out = toml::to_string(&t).unwrap();
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ncap_drop = \"ALL\"\n",
+        "[services.s]\nsecurity_opt = [1]\n",
+        "[services.s]\ncap_add = [\"NET_ADMIN\"]\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
+}
+
+/// STACK-6・TASK-153.3（#611）: stdin_open・tty を公開パスから読み、往復し、型違いを拒否する。
+#[test]
+fn stack_6_public_api_stdin_open_and_tty() {
+    let doc = "[services.s]\nstdin_open = true\ntty = false\n";
+    let t: ComposeToml = toml::from_str(doc).unwrap();
+    let s = &t.services["s"];
+    assert_eq!(s.stdin_open, Some(true));
+    assert_eq!(s.tty, Some(false));
+    let out = toml::to_string(&t).unwrap();
+    assert_eq!(toml::from_str::<ComposeToml>(&out).unwrap(), t);
+    for bad in [
+        "[services.s]\ntty = \"true\"\n",
+        "[services.s]\nstdin_open = 1\n",
+        "[services.s]\ntty = [true]\n",
+    ] {
+        assert!(toml::from_str::<ComposeToml>(bad).is_err(), "{bad}");
+    }
 }

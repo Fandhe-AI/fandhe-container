@@ -8,7 +8,7 @@
 //! peer credential を検証する（PLUG-12・security.md「UDS は所有者・権限・
 //! symlink を検証してから bind し、別 UID からの接続は peer credential 検証で
 //! 切断する」）ために、std だけでは取得できない次の値を FFI で直接取得する。
-//! `libc` / `nix` は依存追加が禁止されている
+//! `libc` / `nix` は製品の依存に入れない
 //! （dependency-policy。`std::os::unix::net::UnixStream::peer_cred` は
 //! unstable のため使えない）ため、本モジュールが必要最小限のラッパーを持つ。
 //!
@@ -80,7 +80,10 @@
 //! 確認する」という運用条件を満たせないため、本モジュールは `Cargo.toml` を
 //! 変更せず、既存の `getsockopt`・`getpeereid`・`geteuid` と同じ流儀で
 //! 必要最小限の `extern "C"` 宣言を自前で持つ（dependency-policy「ユーザー
-//! 承認制」）。
+//! 承認制」）。ただし #1318 の決定により、`libc` は試験専用の dev-dependency
+//! として宣言の機械照合にだけ使う（子モジュール `libc_abi`・`beneath::libc_abi`・
+//! `tests::libc_abi_fixtures` と `sys/vsock.rs` の `libc_abi`。#1842・MVM-4・REPAIR-12。
+//! 方式は `docs/design/ffi-libc-check.md`）。製品コードは `libc` を参照しない。
 //!
 //! # `syncfs` の定数について
 //! `syncfs(2)` はアーキテクチャ非依存の libc シンボル名で呼び出す（生の
@@ -115,6 +118,23 @@ fn last_os_error_to_ioerror(context: &str) -> IoError {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod vsock;
+
+pub(crate) mod uds;
+
+/// `connect(2)` の FFI 宣言を 1 か所に集約する（vsock と UDS の両方が使う）。
+///
+/// 同じシンボル名を別々の引数型（`*const SockaddrVm` と `*const SockaddrUn`）で宣言すると
+/// `clashing_extern_declarations` が出るため、アドレスは型を消した `*const c_void` で受け、
+/// 呼び出し側が自分の `sockaddr_*` 構造体のポインタを渡す（IO-1・#3165）。
+mod sock_raw {
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の
+        // `int connect(int, const struct sockaddr *, socklen_t)` と同じ引数の型・幅
+        // （`socklen_t` は `u32`。アドレスはポインタ幅で ABI 上 `const struct sockaddr *` と同じ）。
+        // 呼び出し側の不変条件は各呼び出し箇所の SAFETY コメントを参照。
+        pub(super) fn connect(sockfd: i32, addr: *const core::ffi::c_void, addrlen: u32) -> i32;
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -499,7 +519,10 @@ pub(crate) fn full_fsync(file: &std::fs::File) -> io::Result<()> {
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BeneathError {
-    /// 辿ろうとした要素が symlink または非ディレクトリだった（symlink は辿らない）。
+    /// 辿ろうとした要素が symlink だった（辿らない。IO-5。呼び出し側で `EscapesRoot` に
+    /// 写す。#3352）。
+    AncestorSymlink,
+    /// 辿ろうとした要素が symlink 以外の非ディレクトリだった。
     AncestorNotDirectory,
     /// 作ろうとした末端が既に存在した（symlink を含む。辿らない）。
     AlreadyExists,
@@ -690,6 +713,15 @@ mod beneath {
             // （`mode_t` は Linux が u32、macOS が u16。`beneath_consts::ModeT`）。
             pub(super) fn mkdirat(dirfd: i32, path: *const c_char, mode: super::c::ModeT) -> i32;
             // SAFETY（宣言そのものの妥当性）: POSIX の
+            // `ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)`
+            // （Linux・macOS とも接尾辞なしの同名シンボル。`ssize_t` は `isize`）。
+            pub(super) fn readlinkat(
+                dirfd: i32,
+                path: *const c_char,
+                buf: *mut c_char,
+                bufsiz: usize,
+            ) -> isize;
+            // SAFETY（宣言そのものの妥当性）: POSIX の
             // `int unlinkat(int dirfd, const char *path, int flags)`。
             pub(super) fn unlinkat(dirfd: i32, path: *const c_char, flags: i32) -> i32;
             // SAFETY（宣言そのものの妥当性）: POSIX の
@@ -801,8 +833,13 @@ mod beneath {
     }
 
     /// `dir` 直下のサブディレクトリ `name` を、ハンドル相対・symlink 非追従
-    /// （`openat` + `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`）で開く。symlink・
-    /// 非ディレクトリは `AncestorNotDirectory`、無ければ `Io(NotFound)`。
+    /// （`openat` + `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`）で開く。symlink は
+    /// `AncestorSymlink`、それ以外の非ディレクトリは `AncestorNotDirectory`、無ければ
+    /// `Io(NotFound)`。
+    ///
+    /// Linux では `O_DIRECTORY|O_NOFOLLOW` は末端が symlink でも `ENOTDIR` を返す
+    /// （`ELOOP` ではない）ため、`ENOTDIR` のときは [`is_symlink_beneath`] で種類を
+    /// 判別する（#3352）。分類が変わるだけで、どちらも拒否である（fail-closed）。
     pub(crate) fn open_dir_beneath(dir: &File, name: &str) -> Result<File, BeneathError> {
         let cname = cstr(name)?;
         // SAFETY: `dir`・`cname` は mkdir_beneath と同じ。O_CREAT を指定しない
@@ -815,12 +852,33 @@ mod beneath {
             )
         };
         own_fd(fd, |errno, kind| {
-            if errno == c::ELOOP || errno == c::ENOTDIR {
-                BeneathError::AncestorNotDirectory
+            if errno == c::ELOOP {
+                BeneathError::AncestorSymlink
+            } else if errno == c::ENOTDIR {
+                if is_symlink_beneath(dir, &cname) {
+                    BeneathError::AncestorSymlink
+                } else {
+                    BeneathError::AncestorNotDirectory
+                }
             } else {
                 BeneathError::Io(kind)
             }
         })
+    }
+
+    /// `dir` 直下の `name` が symlink か（`readlinkat`。リンクの中身は 1 バイトだけ
+    /// 受けて捨て、辿らない・書き込まない）。symlink 以外（`EINVAL`）・消えた等は
+    /// `false`。`openat` との間にすり替えられても変わるのは分類だけで、拒否は変わらない。
+    fn is_symlink_beneath(dir: &File, cname: &CString) -> bool {
+        let mut buf = [0 as core::ffi::c_char; 1];
+        // SAFETY: `dir` は呼び出し元が借用中の有効なディレクトリ fd で、呼び出しの
+        // 間閉じられない。`cname` は NUL 終端の有効な C 文字列で呼び出しの間生きて
+        // いる。`buf` は長さ 1 のスタック配列で、`bufsiz = 1` を超えて書かれない。
+        // 戻り値（長さ、または -1）だけを読み、`buf` の中身は使わない。
+        let rc = unsafe {
+            raw::readlinkat(dir.as_raw_fd(), cname.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
+        rc >= 0
     }
 
     /// `dir` 直下に通常ファイル `name` を `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|
@@ -1109,6 +1167,142 @@ mod beneath {
             Ok(entries)
         }
     }
+
+    /// `raw` の関数の型と `beneath_consts` を `libc` と照合する（#1842・IO-5・IO-2・REPAIR-12）。関数は呼ばない。
+    /// 親 `beneath` と同じ cfg（macOS、Linux の LP64 x86_64 / aarch64）の下にあり、ターゲットごとの
+    /// `libc` の値と比べる。対象外: `LINKAT_FLAGS`（`libc` に無い方針値。`AT_SYMLINK_FOLLOW` を
+    /// 含まないことだけ照合）。
+    #[cfg(test)]
+    mod libc_abi {
+        use super::c;
+        use super::raw;
+        use std::mem::{offset_of, size_of};
+
+        const _: () = {
+            assert!(c::O_WRONLY == libc::O_WRONLY);
+            assert!(c::O_CREAT == libc::O_CREAT);
+            assert!(c::O_EXCL == libc::O_EXCL);
+            assert!(c::O_APPEND == libc::O_APPEND);
+            assert!(c::O_NONBLOCK == libc::O_NONBLOCK);
+            assert!(c::O_DIRECTORY == libc::O_DIRECTORY);
+            assert!(c::O_NOFOLLOW == libc::O_NOFOLLOW);
+            assert!(c::O_CLOEXEC == libc::O_CLOEXEC);
+            assert!(c::AT_REMOVEDIR == libc::AT_REMOVEDIR);
+            assert!(c::AT_SYMLINK_FOLLOW == libc::AT_SYMLINK_FOLLOW);
+            // `linkat` は symlink を辿らない（`AT_SYMLINK_FOLLOW` を含まない）ことを固定する。
+            assert!(c::LINKAT_FLAGS & libc::AT_SYMLINK_FOLLOW == 0);
+            assert!(c::EEXIST == libc::EEXIST);
+            assert!(c::ENOTDIR == libc::ENOTDIR);
+            assert!(c::ELOOP == libc::ELOOP);
+
+            // `mode_t` の幅（Linux は u32、macOS は u16）。
+            assert!(size_of::<c::ModeT>() == size_of::<libc::mode_t>());
+
+            // `readdir` が返す先頭バイトから `d_ino`（u64 で読む）と `d_name` を固定オフセットで読む。
+            assert!(size_of::<u64>() == size_of::<libc::ino_t>());
+            assert!(c::DIRENT_INO_OFFSET == offset_of!(libc::dirent, d_ino));
+            assert!(c::DIRENT_NAME_OFFSET == offset_of!(libc::dirent, d_name));
+        };
+
+        // `openat` は自前も `libc` も可変長（第 4 引数 mode は `O_CREAT` のときだけ読まれる）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = raw::openat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            ...
+        ) -> libc::c_int = libc::openat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = raw::mkdirat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::mode_t,
+        ) -> libc::c_int = libc::mkdirat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut libc::c_char,
+            libc::size_t,
+        ) -> libc::ssize_t = raw::readlinkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            *mut libc::c_char,
+            libc::size_t,
+        ) -> libc::ssize_t = libc::readlinkat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = raw::unlinkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = libc::unlinkat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+        ) -> libc::c_int = raw::renameat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+        ) -> libc::c_int = libc::renameat;
+
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = raw::linkat;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+            *const libc::c_char,
+            libc::c_int,
+        ) -> libc::c_int = libc::linkat;
+
+        // DIR は自前では不透明な `*mut c_void`、`readdir` の戻りは先頭バイトへの `*mut u8`、
+        // `libc` では `*mut DIR`・`*mut dirent`。ポインタ先の型は別書きで、ABI は同じポインタ幅。
+        // `dirent` の中身のオフセットの一致は上の `offset_of!` が担う。macOS x86_64 の
+        // `$INODE64` の link_name は `libc` も同じ（`fdopendir`・`readdir`・`rewinddir`）。
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut core::ffi::c_void = raw::fdopendir;
+        const _: unsafe extern "C" fn(libc::c_int) -> *mut libc::DIR = libc::fdopendir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut u8 = raw::readdir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> *mut libc::dirent = libc::readdir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) = raw::rewinddir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) = libc::rewinddir;
+        const _: unsafe extern "C" fn(*mut core::ffi::c_void) -> libc::c_int = raw::closedir;
+        const _: unsafe extern "C" fn(*mut libc::DIR) -> libc::c_int = libc::closedir;
+
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = raw::__errno_location;
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__errno_location;
+        #[cfg(target_os = "macos")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = raw::__error;
+        #[cfg(target_os = "macos")]
+        const _: unsafe extern "C" fn() -> *mut libc::c_int = libc::__error;
+    }
 }
 
 /// 対応外アーキテクチャ向け（fail-closed）。実装（unsafe を含む）はビルドから
@@ -1197,6 +1391,83 @@ mod beneath {
     ) -> Result<Vec<DirEntryName>, ReadDirError> {
         Err(ReadDirError::Io(io::ErrorKind::Unsupported))
     }
+}
+
+/// 自前の FFI 宣言を `libc` 0.2.189 と `const` 評価で照合する（#1842・PLUG-12・IO-2・MVM-4・REPAIR-12）。
+/// 関数は呼ばない。ターゲットごとに `cfg` を揃え、そのターゲットの `libc` の値・レイアウトと比べる。
+/// `beneath` の定数・関数は `beneath::libc_abi`、`TEST_O_PATH` は `tests::libc_abi_fixtures`、
+/// vsock は `sys/vsock.rs` の `libc_abi` で照合する。
+///
+/// 対象外（理由つき）:
+/// - `linux::UCRED_SIZE`・`linux::UCRED_LEN`: `size_of::<Ucred>()` 由来で、構造体のサイズ照合に含まれる
+/// - `MAX_FULL_FSYNC_EINTR_RETRIES`: 再試行の上限で FFI ではない
+/// - 安全なラッパー群と `windows.rs`（Windows API。#1837 の範囲外）
+#[cfg(test)]
+mod libc_abi {
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const _: () = {
+        use super::linux::{SO_PEERCRED, SOL_SOCKET, Ucred};
+        use std::mem::{align_of, offset_of, size_of};
+        assert!(SOL_SOCKET == libc::SOL_SOCKET);
+        assert!(SO_PEERCRED == libc::SO_PEERCRED);
+        assert!(size_of::<Ucred>() == size_of::<libc::ucred>());
+        assert!(align_of::<Ucred>() == align_of::<libc::ucred>());
+        assert!(offset_of!(Ucred, pid) == offset_of!(libc::ucred, pid));
+        assert!(offset_of!(Ucred, uid) == offset_of!(libc::ucred, uid));
+        assert!(offset_of!(Ucred, gid) == offset_of!(libc::ucred, gid));
+        assert!(size_of::<i32>() == size_of::<libc::pid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::uid_t>());
+        assert!(size_of::<u32>() == size_of::<libc::gid_t>());
+    };
+
+    // 自前は `*mut core::ffi::c_void`・`*mut u32`、`libc` は `*mut c_void`・`*mut socklen_t`（= u32）。
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = super::linux::getsockopt;
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int = libc::getsockopt;
+
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = super::syncfs_raw::syncfs;
+    #[cfg(target_os = "linux")]
+    const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::syncfs;
+
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, *mut libc::uid_t, *mut libc::gid_t) -> libc::c_int =
+        super::getpeereid;
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, *mut libc::uid_t, *mut libc::gid_t) -> libc::c_int =
+        libc::getpeereid;
+
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(super::full_fsync_raw::F_FULLFSYNC == libc::F_FULLFSYNC);
+        assert!(super::full_fsync_raw::EINTR == libc::EINTR);
+    };
+    // `fcntl` は自前も `libc` も可変長。
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int =
+        super::full_fsync_raw::fcntl;
+    #[cfg(target_os = "macos")]
+    const _: unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int = libc::fcntl;
 }
 
 #[cfg(test)]
@@ -1297,6 +1568,16 @@ mod tests {
     ))]
     const TEST_O_PATH: i32 = 0o10_000_000;
 
+    /// `TEST_O_PATH` を `libc` と照合する（#1842。使う試験は `io2_syncfs_on_o_path_fd_returns_ebadf`）。
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod libc_abi_fixtures {
+        const _: () = assert!(super::TEST_O_PATH == libc::O_PATH);
+    }
+
     #[cfg(all(
         target_os = "linux",
         all(
@@ -1337,11 +1618,10 @@ mod tests {
     fn io2_full_fsync_on_file_and_dir_succeeds() {
         use std::io::Write as _;
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("fcio-full-fsync-{}", std::process::id()));
-        let mut file = std::fs::File::create(&path).expect("create");
+        let (_guard, mut file) =
+            crate::test_temp_file::create_in(&dir, "fcio-full-fsync").expect("create");
         file.write_all(b"x").expect("write");
         let result = full_fsync(&file);
-        let _ = std::fs::remove_file(&path);
         result.expect("F_FULLFSYNC on a regular file must succeed");
         let dir_handle = std::fs::File::open(&dir).expect("open dir");
         full_fsync(&dir_handle).expect("F_FULLFSYNC on a directory must succeed");
@@ -1452,26 +1732,18 @@ mod tests {
         use super::*;
 
         /// テスト用の一時ディレクトリ（drop で削除する）。
-        struct TmpDir(std::path::PathBuf);
+        struct TmpDir(
+            std::path::PathBuf,
+            #[allow(dead_code)] crate::test_root::TestRoot,
+        );
         impl TmpDir {
             fn new(tag: &str) -> Self {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fcio-sys-{tag}-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::create_dir_all(&p).expect("temp dir");
-                Self(p)
+                // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+                let root = crate::test_root::test_root("fcio-sys", tag);
+                Self(root.to_path_buf(), root)
             }
             fn open(&self) -> std::fs::File {
                 std::fs::File::open(&self.0).expect("open dir")
-            }
-        }
-        impl Drop for TmpDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 
@@ -1575,7 +1847,12 @@ mod tests {
             );
             assert_eq!(
                 open_dir_beneath(&root, "l").err(),
-                Some(BeneathError::AncestorNotDirectory)
+                Some(BeneathError::AncestorSymlink)
+            );
+            std::os::unix::fs::symlink(t.0.join("nowhere"), t.0.join("dl")).expect("dangling");
+            assert_eq!(
+                open_dir_beneath(&root, "dl").err(),
+                Some(BeneathError::AncestorSymlink)
             );
             assert_eq!(
                 open_dir_beneath(&root, "f").err(),

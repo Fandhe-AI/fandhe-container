@@ -302,6 +302,12 @@ dependencies = [
 [[package]]
 name = "fandhe-container-compose-convert"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-stack",
+ "serde",
+ "serde-saphyr",
+ "toml",
+]
 
 [[package]]
 name = "fandhe-container-core"
@@ -309,6 +315,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-plugin",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -320,6 +327,9 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-oci",
+ "flate2",
+ "hyper",
+ "hyper-util",
  "prost",
  "protox",
  "serde",
@@ -343,12 +353,14 @@ name = "fandhe-container-guest-init"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-platform-macos",
+ "libc",
 ]
 
 [[package]]
 name = "fandhe-container-io"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "unicode-normalization",
 ]
 
@@ -359,6 +371,10 @@ version = "0.0.0"
 [[package]]
 name = "fandhe-container-net"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-net",
+ "libc",
+]
 
 [[package]]
 name = "fandhe-container-oci"
@@ -384,6 +400,7 @@ dependencies = [
  "block2",
  "dispatch2",
  "fandhe-container-io",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
@@ -402,6 +419,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-cri",
  "hyper-util",
+ "libc",
  "prost",
  "serde",
  "serde_json",
@@ -417,6 +435,7 @@ dependencies = [
  "fandhe-container-core",
  "fandhe-container-cri",
  "fandhe-container-net",
+ "fandhe-container-oci",
  "fandhe-container-plugin",
  "fandhe-container-supervisor",
  "tokio",
@@ -430,6 +449,7 @@ dependencies = [
  "fandhe-container-io",
  "fandhe-container-platform-macos",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]
@@ -445,6 +465,10 @@ dependencies = [
 [[package]]
 name = "fandhe-container-plugin-microvm"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-microvm",
+ "fandhe-container-plugin",
+]
 
 [[package]]
 name = "fandhe-container-plugin-windows"
@@ -452,6 +476,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-platform-windows",
  "fandhe-container-plugin",
+ "libc",
 ]
 
 [[package]]
@@ -467,7 +492,9 @@ name = "fandhe-container-supervisor"
 version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
+ "fandhe-container-net",
  "fandhe-container-supervisor",
+ "libc",
 ]
 
 [[package]]

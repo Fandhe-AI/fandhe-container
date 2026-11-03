@@ -21,16 +21,27 @@
 //! 共有する（`Send + Sync`）。
 //!
 //! # スタブの明示（REPAIR-3）
-//! ワイヤー形式（[`crate::payload`]）の `Write` はパスを持たず、ワイヤー上から
-//! 作成要求を受ける経路はまだない。フレーム種別・ペイロードの拡張は IO-1 の
-//! I/O 契約変更（`PROTOCOL_VERSION` の繰り上げを伴いうる）であり、本モジュールは
-//! ワイヤー形式を変えずにサーバー側 API として組み込む。ワイヤーからの作成要求
-//! （IO-1・TASK-14 のファイル操作ペイロード拡張）は後続。
+//! ワイヤー形式（[`crate::payload`]）の `Write` はパスを持たない。v2 の `Create`
+//! （`encode_create` / `decode_create`。#3161）の符号化と復号は実装済みだが、これを
+//! 受けて本モジュールを呼ぶサーバーは [`crate::file_serve::serve_file_connection`]
+//! （#3163）で、内部入口 `create_file_inner` を呼ぶ。パスの構文検証は
+//! [`crate::guest_path::GuestPath`]（F5・#3159）に集約済みで、#3161 の復号は長さと
+//! UTF-8 だけを見る。ワイヤー上の作成の構文検証は、送信側（#3162 の
+//! `PipelineClient::create`。実装済み）が `GuestPath` で行い、サーバー側は
+//! `create_file_inner` が行う（構文違反は reason `PathSyntax` の Nack になる。#3163）。
+//!
+//! ホストパス長（260 UTF-16 単位。F5・IO-5・#3160）は構文検証の直後、ロックと走査の
+//! 前に純計算で検査する。Windows ホストは何も作らずに `InvalidArgument`（reason
+//! `HostPathTooLong`）で拒否し、その他の OS は作成を続けて警告（`host_path_warning`）
+//! を内部の戻り値に持つ（Linux / macOS で npm の深いパスを拒否しないため）。警告は
+//! `serve_file_connection` が件数として観測（`FileServeStats`）へ流し、拒否理由 reason は
+//! Nack と統計へ流す（#3163）。公開の [`GuestFileCreator::create_file`] は警告を捨てる。reason の値表は
+//! `crate::nack_reason`、失敗の分類は内部関数 `classify_create_failure`（F10・#3160）。
 //!
 //! # 契約と既知の限界
-//! - 閉じ込め: ゲストパスを `Path::join` へ渡さず、検証済みコンポーネント
-//!   （ホスト上でちょうど 1 個の `Normal`。`\` と `:` は 3 OS とも拒否して挙動を
-//!   揃える）だけを扱う。Linux / macOS では共有ルートのディレクトリ fd を起点に
+//! - 閉じ込め: ゲストパスを `Path::join` へ渡さず、`GuestPath` の OS 非依存の規則で
+//!   検証したコンポーネント（`.`・`..`・空・`\`・`:`・NUL を拒否するため、どの OS でも
+//!   ホスト上でちょうど 1 個の `Normal`）だけを扱う。Linux / macOS では共有ルートのディレクトリ fd を起点に
 //!   `mkdirat` / `openat`（`O_DIRECTORY|O_NOFOLLOW`）で祖先を 1 個ずつ辿り、末端は
 //!   `O_CREAT|O_EXCL|O_NOFOLLOW` で作る（`crate::sys::mkdir_beneath`・
 //!   `crate::sys::open_dir_beneath`・`crate::sys::create_leaf_beneath`）。
@@ -62,8 +73,16 @@
 //! - 作成は全接続で直列化される（性能最適化は範囲外）。
 //! - 名前は正規化しないが、NFC / NFD の別表記は `fs_normalize` の衝突キーで検出して
 //!   `ALREADY_EXISTS` にする（TASK-21.1・#103。APFS では NFD の既存名に NFC で `O_EXCL`
-//!   作成すると EEXIST になり `ExistsAs` の衝突として扱う）。260 文字超の検証関数は
-//!   `fs_normalize::check_host_path_length`（TASK-20.1）だが、作成経路への組み込みは未実装（REPAIR-3）。
+//!   作成すると EEXIST になり `ExistsAs` の衝突として扱う）。
+//! - ホストパス長は共有ルート（設定値 `root`）に検証済みのコンポーネントを足した計測用の
+//!   `PathBuf` で測る（I/O には使わない）。Windows の正規パス（`\\?\` 付きの `base`）や
+//!   `LongPathsEnabled` は考慮しない（REPAIR-3）。
+//! - 祖先が symlink または reparse point の場合は reason `EscapesRoot`、それ以外の
+//!   ディレクトリでない祖先は `NotADirectory` に分類する（#3352）。`EscapesRoot` は
+//!   「辿れば共有ルートの外へ出うる経路」の意で、リンク先が実際にルートの外かどうかは
+//!   見ない（辿らない）。Linux では `O_DIRECTORY|O_NOFOLLOW` が symlink にも `ENOTDIR`
+//!   を返すため、`sys` が `readlinkat` で種類を判別する。判別は分類だけで、拒否は
+//!   どちらの reason でも変わらない（fail-closed）。
 //!
 //! # プロセス間の競合（作成後の再検証と取り消し。Linux / macOS）
 //! `Mutex` はインスタンス内にしか効かないため、走査から作成までの間に別プロセス・
@@ -151,16 +170,19 @@ use std::fs::File;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{IoError, IoErrorCode};
-use crate::fs_normalize::{CaseCollisionSet, collision_error, quote_for_message};
+use crate::fs_normalize::{
+    CaseCollisionSet, CollisionKind, HostPathLength, InsertCheckError, collision_error,
+    collision_kind, measure_host_path_length, quote_for_message,
+};
+use crate::guest_path::GuestPath;
+use crate::nack_reason::NackReason;
 use crate::writeback::AppendFileSink;
 
-/// ゲスト相対パスのバイト長の上限（Linux の PATH_MAX 相当。DoS 防止のため
-/// 畳み込みやアロケーションの前に検証する）。
-pub const MAX_GUEST_PATH_BYTES: usize = 4096;
+pub use crate::guest_path::MAX_GUEST_PATH_BYTES;
 
 /// 索引へ登録できるパス件数の上限の最大値（`fs_normalize` は件数上限を呼び出し側の
 /// 責務としているため本型が持つ）。
@@ -203,19 +225,93 @@ fn too_many() -> IoError {
     )
 }
 
-/// 単一のゲストパスコンポーネントがホスト上でちょうど 1 個の `Normal` に
-/// なることを確かめる（`..`・空・`.`・`\`・`:`・NUL を拒否する）。
-fn validate_host_component(component: &str) -> Result<(), IoError> {
-    if component.contains(['\\', ':', '\0']) {
-        return Err(invalid(
-            "guest path component must not contain '\\', ':' or NUL",
-        ));
+/// 作成に成功した結果（内部用。公開の [`GuestFileCreator::create_file`] は `sink` だけ返す）。
+pub(crate) struct CreatedGuestFile {
+    /// 検査済みの書き込み先。
+    pub(crate) sink: AppendFileSink,
+    /// ホストパス長が 260 を超えたが、Windows 以外のため作成を続けたときの計測結果
+    /// （F5。`file_serve` が件数として観測へ流す。#3163）。
+    pub(crate) host_path_warning: Option<HostPathLength>,
+}
+
+/// 作成の失敗（内部用）。`reason` が `None` の失敗は要求単位の Nack にせず、接続全体の
+/// 失敗として扱う（F10: `Internal`・ロックの poison・再検証や取り消しの失敗。fail-closed）。
+pub(crate) struct CreateFailure {
+    /// 公開の `create_file` が返すエラー（code・文言は従来どおり）。
+    pub(crate) error: IoError,
+    /// 発生した箇所で付ける拒否理由（エラー文言の照合では分類しない）。
+    pub(crate) reason: Option<NackReason>,
+}
+
+impl CreateFailure {
+    fn with(error: IoError, reason: NackReason) -> Self {
+        Self {
+            error,
+            reason: Some(reason),
+        }
     }
-    let mut parts = Path::new(component).components();
-    match (parts.next(), parts.next()) {
-        (Some(Component::Normal(_)), None) => Ok(()),
-        _ => Err(invalid("guest path component must be a single normal name")),
+
+    /// 1 接続が持てる番兵 fd のデバイス数の上限に達した拒否（F9・F11。reason `DeviceLimit`、
+    /// code は `ResourceExhausted`）。`pre_mutation` コールバックが何も作る前に返す（#3164）。
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "番兵 fd は Linux だけ")
+    )]
+    pub(crate) fn device_limit(error: IoError) -> Self {
+        Self::with(error, NackReason::DeviceLimit)
     }
+
+    /// 要求単位に分類できない失敗（接続全体の失敗側）。`pre_mutation` コールバックが
+    /// 内部の失敗を返すためにも使う（#3164）。
+    pub(crate) fn unclassified(error: IoError) -> Self {
+        Self {
+            error,
+            reason: None,
+        }
+    }
+
+    /// 走査や作成の `IoError` から写す。件数上限（`ResourceExhausted`）だけが
+    /// `TrackedPathsLimit` で、それ以外は分類しない。
+    fn from_io(error: IoError) -> Self {
+        if error.code() == IoErrorCode::ResourceExhausted {
+            Self::with(error, NackReason::TrackedPathsLimit)
+        } else {
+            Self::unclassified(error)
+        }
+    }
+
+    fn collision(kind: CollisionKind, error: IoError) -> Self {
+        Self::with(
+            error,
+            match kind {
+                CollisionKind::Case => NackReason::CaseCollision,
+                CollisionKind::Normalization => NackReason::NormalizationCollision,
+            },
+        )
+    }
+}
+
+/// 失敗を F10 の要求単位の拒否理由へ分類する。`reason` があり、その `code()` が
+/// 実際のエラーの code と一致するときだけ `Some`（要求単位の Nack）。`None` は接続全体の
+/// 失敗（不一致は fail-closed でこちらに倒す）。#3163 の `serve_file_connection` が
+/// Nack と接続の失効を分けるのに使う。
+pub(crate) fn classify_create_failure(failure: &CreateFailure) -> Option<NackReason> {
+    let reason = failure.reason?;
+    (reason.code() == Some(failure.error.code())).then_some(reason)
+}
+
+/// ホストパス長の超過を Windows ホストで拒否するときの失敗。ゲストパスだけを衛生化
+/// して載せ、ホストのパス（共有ルート）は載せない（情報漏洩防止）。
+fn host_path_too_long(length: HostPathLength, guest_path: &str) -> CreateFailure {
+    CreateFailure::with(
+        invalid(&format!(
+            "host path length {} UTF-16 units exceeds limit of {} (NTFS MAX_PATH): {}",
+            length.units(),
+            length.limit(),
+            quote_for_message(guest_path)
+        )),
+        NackReason::HostPathTooLong,
+    )
 }
 
 impl GuestFileCreator {
@@ -278,51 +374,116 @@ impl GuestFileCreator {
     /// 走査・再検証・取り消しの失敗は `Internal`
     /// （IO-5・TASK-19.2）。
     pub fn create_file(&self, guest_path: &str) -> Result<AppendFileSink, IoError> {
-        if guest_path.len() > MAX_GUEST_PATH_BYTES {
-            return Err(invalid("guest path is too long"));
-        }
-        // ロックと走査の前にホスト側の検証を済ませる。
-        let components: Vec<&str> = guest_path.split('/').collect();
-        for component in &components {
-            validate_host_component(component)?;
-        }
+        // ホストパス長の警告は公開 API では捨てる（観測への配線は file_serve が行う。#3163）。
+        self.create_file_inner(guest_path, &mut |_| Ok(()))
+            .map(|created| created.sink)
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::create_file`] の本体。警告と拒否理由 reason を保って返す（F5・F10・
+    /// #3160）。`serve_file_connection` が呼ぶ。
+    ///
+    /// `pre_mutation` は、構文検証・ホストパス長・衝突検査を通り、最初の `mkdir` またはファイル
+    /// 作成を行う直前に 1 回だけ呼ぶ。引数は「存在する最も深い祖先」（新設が要らなければ葉の親）の
+    /// ハンドルで、`serve_file_connection` が FLUSH 用の番兵 fd（F9。IO-2）をここで開く。
+    /// 失敗したら何も作らずにその失敗を返す。設計の `mode` 引数は、ワイヤーの Create に mode が
+    /// 無いため足していない（#3164）。
+    pub(crate) fn create_file_inner(
+        &self,
+        guest_path: &str,
+        pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
+    ) -> Result<CreatedGuestFile, CreateFailure> {
+        // ロックと走査の前に構文検証を済ませる（OS 非依存の規則は GuestPath に集約。
+        // F5・#3159。受理した各コンポーネントはどの OS でもホスト上でちょうど 1 個の
+        // `Normal` になる）。
+        let path = GuestPath::parse(guest_path)
+            .map_err(|err| CreateFailure::with(err.into(), NackReason::PathSyntax))?;
+        let guest_path = path.as_str();
+        let components: Vec<&str> = path.components().collect();
+
+        // ホストパス長（F5・IO-5）。FS に触れない純計算で、ロックと走査より前に行うため、
+        // Windows で拒否したときは mkdir もファイル作成もしない。計測用の `PathBuf` は
+        // 長さを測るだけで I/O には使わない（閉じ込めはハンドル起点の `*_beneath` が担う）。
+        // 確保量は GuestPath の上限（4096 バイト・256 コンポーネント）で抑えられる。
+        let mut host_path = self.root.clone();
+        host_path.extend(&components);
+        let host_length = measure_host_path_length(&host_path);
+        let host_path_warning = if host_length.exceeds_limit() {
+            if cfg!(windows) {
+                return Err(host_path_too_long(host_length, guest_path));
+            }
+            Some(host_length)
+        } else {
+            None
+        };
 
         // 走査から作成・再検証までを同じガードで直列化する。
-        let _guard = self.lock.lock().map_err(|_| poisoned())?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| CreateFailure::unclassified(poisoned()))?;
         let (ancestors, leaf) = match components.split_last() {
             Some((leaf, ancestors)) => (ancestors, *leaf),
-            None => return Err(invalid("guest path is empty")),
+            None => {
+                return Err(CreateFailure::with(
+                    invalid("guest path is empty"),
+                    NackReason::PathSyntax,
+                ));
+            }
         };
         // 実在する項目（表記違いの祖先など）から、この作成限りの索引を作って検査する。
         let existing = self.index_existing(ancestors)?;
-        existing.check_insertable(guest_path)?;
+        existing
+            .check_insertable_detailed(guest_path)
+            .map_err(|err| match err {
+                InsertCheckError::Invalid(error) => {
+                    CreateFailure::with(error, NackReason::PathSyntax)
+                }
+                InsertCheckError::Collision { kind, error } => {
+                    CreateFailure::collision(kind, error)
+                }
+            })?;
 
         #[cfg(test)]
         fault::run_hook(fault::Hook::BeforeCreate);
-        let created = match create_beneath(&self.root_dir, &self.base, ancestors, leaf) {
-            Ok(created) => created,
-            Err(CreateError::Exists) => {
-                return Err(IoError::new(
-                    IoErrorCode::AlreadyExists,
-                    format!(
-                        "guest file already exists: {}",
-                        quote_for_message(guest_path)
-                    ),
-                ));
-            }
-            Err(CreateError::ExistsAs(existing)) => {
-                // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
-                // ホストが既存として拒否した。衝突として返す。
-                let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
-                return Err(collision_error(
-                    guest_path,
-                    &format!("{prefix}{existing}"),
-                    leaf,
-                    &existing,
-                ));
-            }
-            Err(CreateError::Other(err)) => return Err(err),
-        };
+        let created =
+            match create_beneath(&self.root_dir, &self.base, ancestors, leaf, pre_mutation) {
+                Ok(created) => created,
+                Err(CreateError::Exists) => {
+                    return Err(CreateFailure::with(
+                        IoError::new(
+                            IoErrorCode::AlreadyExists,
+                            format!(
+                                "guest file already exists: {}",
+                                quote_for_message(guest_path)
+                            ),
+                        ),
+                        NackReason::Exists,
+                    ));
+                }
+                Err(CreateError::ExistsAs(existing)) => {
+                    // 走査の後に別の作成者が大小違いの項目を作り、大文字小文字を区別しない
+                    // ホストが既存として拒否した。衝突として返す。
+                    let prefix: String = ancestors.iter().map(|a| format!("{a}/")).collect();
+                    return Err(CreateFailure::collision(
+                        collision_kind(leaf, &existing),
+                        collision_error(
+                            guest_path,
+                            &format!("{prefix}{existing}"),
+                            leaf,
+                            &existing,
+                        ),
+                    ));
+                }
+                Err(CreateError::NotADirectory(err)) => {
+                    return Err(CreateFailure::with(err, NackReason::NotADirectory));
+                }
+                Err(CreateError::EscapesRoot(err)) => {
+                    return Err(CreateFailure::with(err, NackReason::EscapesRoot));
+                }
+                Err(CreateError::Other(err)) => return Err(CreateFailure::from_io(err)),
+                Err(CreateError::Callback(failure)) => return Err(failure),
+            };
         #[cfg(test)]
         fault::run_hook(fault::Hook::AfterCreate);
         // 走査から作成までの間に別プロセスが足した大小違いの項目を再検証する
@@ -331,7 +492,13 @@ impl GuestFileCreator {
         // 新規作成したファイル（と祖先ディレクトリ）のエントリを macOS / Windows の
         // persist で永続化するため、作成に使った保持済みのハンドルを末端の親から root まで
         // 全階層渡す（パスは再解決しない。IO-2・TASK-15.3）。
-        AppendFileSink::new(file).map(|sink| sink.with_parent_dir_handles(dir_handles))
+        let sink = AppendFileSink::new(file)
+            .map(|sink| sink.with_parent_dir_handles(dir_handles))
+            .map_err(CreateFailure::unclassified)?;
+        Ok(CreatedGuestFile {
+            sink,
+            host_path_warning,
+        })
     }
 
     /// `ancestors` に沿って実在するディレクトリの項目を読み、この作成限りの衝突
@@ -341,39 +508,45 @@ impl GuestFileCreator {
     /// 上限を超えたら `ResourceExhausted`、読み取りの失敗は `Internal`、既存項目
     /// どうしの大文字小文字衝突は `AlreadyExists`（IO-5 の検査を完了できないまま
     /// 作成へ進まない。fail-closed）。
-    fn index_existing(&self, ancestors: &[&str]) -> Result<CaseCollisionSet, IoError> {
+    fn index_existing(&self, ancestors: &[&str]) -> Result<CaseCollisionSet, CreateFailure> {
         let mut set = CaseCollisionSet::new();
-        let mut cursor = ScanCursor::root(&self.root_dir, &self.base)?;
+        let mut cursor =
+            ScanCursor::root(&self.root_dir, &self.base).map_err(CreateFailure::from_io)?;
         let mut prefix = String::new();
         for level in 0..=ancestors.len() {
-            let entries = cursor.read_entries(self.max_tracked)?;
+            let entries = cursor
+                .read_entries(self.max_tracked)
+                .map_err(CreateFailure::from_io)?;
             for name in entries {
                 let Some(name) = name.to_str() else { continue };
                 let path = format!("{prefix}{name}");
                 // 衝突は件数上限より先に報告する（大文字小文字を区別しないホストでは
                 // 表記違いの祖先がそのまま開けるため、要求の表記で数えた項目が前の
                 // 階層の項目と衝突しうる。上限に達していても衝突として返す）。
-                match set.check_insertable(&path) {
+                match set.check_insertable_detailed(&path) {
                     Ok(()) => {}
                     // 形式不正の名前（ホストで表現できない等）は索引化できないだけで
                     // 無視する。
-                    Err(err) if err.code() == IoErrorCode::InvalidArgument => continue,
+                    Err(InsertCheckError::Invalid(_)) => continue,
                     // 共有ルートに元から大文字小文字違いの項目が併存している等、
                     // 衝突検出を完了できない状態は走査順で結果が変わるため、
                     // 握りつぶさず作成を中止する（fail-closed。IO-5）。
-                    Err(err) => return Err(err),
+                    Err(InsertCheckError::Collision { kind, error }) => {
+                        return Err(CreateFailure::collision(kind, error));
+                    }
                 }
                 if set.len() >= self.max_tracked {
-                    return Err(too_many());
+                    return Err(CreateFailure::from_io(too_many()));
                 }
-                set.try_insert(&path)?;
+                // 事前の検査を通っているため衝突では失敗しない。万一の失敗は分類しない。
+                set.try_insert(&path).map_err(CreateFailure::unclassified)?;
             }
             let Some(component) = ancestors.get(level) else {
                 break;
             };
             // 未作成・通常ファイル・symlink の祖先より下に取り込む項目は無い
             // （作成時に新設される、または作成側が拒否する）。
-            match cursor.descend(component)? {
+            match cursor.descend(component).map_err(CreateFailure::from_io)? {
                 Some(next) => cursor = next,
                 None => break,
             }
@@ -512,7 +685,8 @@ impl ScanCursor {
         use crate::sys::{BeneathError, open_dir_beneath};
         match open_dir_beneath(&self.0, name) {
             Ok(dir) => Ok(Some(Self(dir))),
-            Err(BeneathError::AncestorNotDirectory) => Ok(None),
+            // symlink・非ディレクトリより下は読まない（作成側も拒否する）。
+            Err(BeneathError::AncestorSymlink | BeneathError::AncestorNotDirectory) => Ok(None),
             Err(BeneathError::Io(ErrorKind::NotFound)) => Ok(None),
             Err(BeneathError::Io(kind)) => Err(internal("failed to inspect guest directory", kind)),
             Err(BeneathError::AlreadyExists) => Err(internal(
@@ -566,25 +740,38 @@ impl ScanCursor {
     fn descend(mut self, name: &str) -> Result<Option<Self>, IoError> {
         let next = self.path.join(name);
         match open_pinned_dir(&next) {
-            Ok(Some(dir)) => {
+            Ok(Pinned::Dir(dir)) => {
                 self.pinned.push(dir);
                 self.path = next;
                 Ok(Some(self))
             }
             // reparse point・非ディレクトリより下は読まない（作成側も拒否する）。
-            Ok(None) => Ok(None),
+            Ok(Pinned::Reparse | Pinned::NotDir) => Ok(None),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(internal("failed to inspect guest directory", err.kind())),
         }
     }
 }
 
+/// [`open_pinned_dir`] の結果（Windows）。reparse point の判定を非ディレクトリの判定より
+/// 先に行う（#3352。reason `EscapesRoot` と `NotADirectory` を分けるため）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+enum Pinned {
+    /// 通常ディレクトリ（保持用のハンドル）。
+    Dir(File),
+    /// reparse point（ジャンクション・symlink 等。辿らない）。
+    Reparse,
+    /// reparse point 以外のディレクトリでないもの。
+    NotDir,
+}
+
 /// Windows: `path` を reparse point を辿らず（`FILE_FLAG_OPEN_REPARSE_POINT`）・
 /// `FILE_SHARE_DELETE` なしで開き、通常ディレクトリ（reparse point でない）なら保持用の
-/// ハンドルを返す（そうでなければ `None`）。保持中は OS が改名・削除・差し替えを拒否
-/// する。走査（`ScanCursor::descend`）と作成（[`create_beneath`]）で同じ判定を使う。
+/// ハンドルを返す（そうでなければ [`Pinned::Reparse`] / [`Pinned::NotDir`]）。保持中は
+/// OS が改名・削除・差し替えを拒否する。走査（`ScanCursor::descend`）と作成
+/// （[`create_beneath`]）で同じ判定を使う。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
+fn open_pinned_dir(path: &Path) -> std::io::Result<Pinned> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
     const FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
@@ -599,10 +786,13 @@ fn open_pinned_dir(path: &Path) -> std::io::Result<Option<File>> {
         .share_mode(SHARE)
         .open(path)?;
     let meta = dir.metadata()?;
-    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
-        return Ok(None);
+    if meta.file_attributes() & REPARSE != 0 {
+        return Ok(Pinned::Reparse);
     }
-    Ok(Some(dir))
+    if !meta.is_dir() {
+        return Ok(Pinned::NotDir);
+    }
+    Ok(Pinned::Dir(dir))
 }
 
 /// 同期用（`FlushFileBuffers`。書き込み権限が必要）のディレクトリハンドルを開く。
@@ -628,8 +818,13 @@ fn open_sync_dir(path: &Path) -> Result<File, CreateError> {
         .open(path)
         .map_err(|err| fail(err.kind()))?;
     let meta = dir.metadata().map_err(|err| fail(err.kind()))?;
-    if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
-        return Err(CreateError::Other(invalid(
+    if meta.file_attributes() & REPARSE != 0 {
+        return Err(CreateError::EscapesRoot(invalid(
+            "guest path ancestor is a symbolic link or reparse point",
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(CreateError::NotADirectory(invalid(
             "guest path ancestor is not a directory",
         )));
     }
@@ -644,8 +839,15 @@ enum CreateError {
     /// 表記（値）のエントリがあった（大文字小文字を区別しないホストで、走査の後に
     /// 別の作成者が作った場合）。
     ExistsAs(String),
+    /// 祖先が symlink または reparse point（辿らない。リンク先がルートの外かは見ない）。
+    /// reason `EscapesRoot` に分類する。
+    EscapesRoot(IoError),
+    /// 祖先が symlink 以外のディレクトリでないもの。reason `NotADirectory` に分類する。
+    NotADirectory(IoError),
     /// 構造化済みのその他のエラー。
     Other(IoError),
+    /// `pre_mutation` コールバックの失敗（何も作っていない。そのまま返す。#3164）。
+    Callback(CreateFailure),
 }
 
 /// 末端の作成が既存として失敗したとき、親ディレクトリ `parent` で実在する表記を
@@ -719,14 +921,18 @@ fn create_beneath(
     _root: &Path,
     ancestors: &[&str],
     leaf: &str,
+    pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
 ) -> Result<Created, CreateError> {
     use crate::sys::{BeneathError, DirMode, create_leaf_beneath, mkdir_beneath, open_dir_beneath};
 
     fn map(err: BeneathError) -> CreateError {
         match err {
             BeneathError::AlreadyExists => CreateError::Exists,
+            BeneathError::AncestorSymlink => CreateError::EscapesRoot(invalid(
+                "guest path ancestor is a symbolic link or reparse point",
+            )),
             BeneathError::AncestorNotDirectory => {
-                CreateError::Other(invalid("guest path ancestor is not a directory"))
+                CreateError::NotADirectory(invalid("guest path ancestor is not a directory"))
             }
             BeneathError::Io(kind) => {
                 CreateError::Other(internal("failed to create guest file", kind))
@@ -737,11 +943,44 @@ fn create_beneath(
     let root = root_dir
         .try_clone()
         .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?;
-    // 祖先数は MAX_GUEST_PATH_BYTES で検証済みのパス長で抑えられている。
+    // 祖先数は GuestPath::parse で検証済みの MAX_GUEST_PATH_COMPONENTS で抑えられている。
     let mut dirs = Vec::with_capacity(ancestors.len().saturating_add(1));
     dirs.push(root);
     let mut made = Vec::with_capacity(ancestors.len());
+
+    // 第 1 段（作成を伴わない）: 存在する最も深い祖先まで symlink 非追従で辿る。symlink や
+    // 非ディレクトリの祖先はここで（何も作る前に）拒否する。
     for name in ancestors {
+        let Some(parent) = dirs.last() else {
+            return Err(CreateError::Other(internal(
+                "failed to create guest file",
+                ErrorKind::Other,
+            )));
+        };
+        match open_dir_beneath(parent, name) {
+            Ok(dir) => {
+                made.push(false);
+                dirs.push(dir);
+            }
+            Err(BeneathError::Io(ErrorKind::NotFound)) => break,
+            Err(err) => return Err(map(err)),
+        }
+    }
+
+    // 最初の mkdir またはファイル作成の直前に 1 回だけ、存在する最も深い祖先を渡す
+    // （F9: 番兵 fd は書き込みより前に新しく開く）。失敗したら何も作っていない。
+    {
+        let Some(deepest) = dirs.last() else {
+            return Err(CreateError::Other(internal(
+                "failed to create guest file",
+                ErrorKind::Other,
+            )));
+        };
+        pre_mutation(deepest).map_err(CreateError::Callback)?;
+    }
+
+    // 第 2 段: 残りの祖先を作って開く。
+    for name in ancestors.iter().skip(made.len()) {
         let Some(parent) = dirs.last() else {
             return Err(CreateError::Other(internal(
                 "failed to create guest file",
@@ -771,7 +1010,14 @@ fn create_beneath(
     };
     #[cfg(test)]
     fault::run_hook(fault::Hook::BeforeLeaf);
-    match create_leaf_beneath(parent, leaf) {
+    #[cfg(test)]
+    let leaf_result = match fault::take_leaf_failure() {
+        Some(kind) => Err(BeneathError::Io(kind)),
+        None => create_leaf_beneath(parent, leaf),
+    };
+    #[cfg(not(test))]
+    let leaf_result = create_leaf_beneath(parent, leaf);
+    match leaf_result {
         Ok(file) => Ok(Created { file, dirs, made }),
         Err(BeneathError::AlreadyExists) => {
             // 実在する表記を確かめる（大文字小文字を区別しないホストでは、走査の後に
@@ -828,12 +1074,15 @@ fn verify_created(
     guest_path: &str,
     ancestors: &[&str],
     leaf: &str,
-) -> Result<(File, Vec<File>), IoError> {
+) -> Result<(File, Vec<File>), CreateFailure> {
     use crate::fs_normalize::fold_component;
     use std::ops::ControlFlow;
     use std::os::unix::fs::MetadataExt;
 
-    let fail = |created: &Created, err: IoError| rollback_after(created, ancestors, leaf, err);
+    let fail =
+        |created: &Created, err: CreateFailure| rollback_after(created, ancestors, leaf, err);
+    let internal_failure =
+        |context: &str, kind: ErrorKind| CreateFailure::unclassified(internal(context, kind));
     let mut prefix = String::new();
     for level in 0..=ancestors.len() {
         let component = ancestors.get(level).copied().unwrap_or(leaf);
@@ -843,7 +1092,7 @@ fn verify_created(
             Some(&created.file)
         };
         let (Some(dir), Some(child)) = (created.dirs.get(level), child) else {
-            let err = internal("failed to verify guest directory", ErrorKind::Other);
+            let err = internal_failure("failed to verify guest directory", ErrorKind::Other);
             return Err(fail(&created, err));
         };
         let metas = dir
@@ -852,7 +1101,7 @@ fn verify_created(
         let (dir_meta, child_meta) = match metas {
             Ok(metas) => metas,
             Err(err) => {
-                let err = internal("failed to verify guest directory", err.kind());
+                let err = internal_failure("failed to verify guest directory", err.kind());
                 return Err(fail(&created, err));
             }
         };
@@ -871,36 +1120,45 @@ fn verify_created(
             ControlFlow::Continue(())
         });
         if let Err(err) = scanned {
-            return Err(fail(&created, err));
+            return Err(fail(&created, CreateFailure::from_io(err)));
         }
         if dir_meta.dev() == child_meta.dev() {
             match own_ino {
                 Some(ino) if ino == child_meta.ino() => {}
                 Some(_) => {
-                    let err = IoError::new(
+                    let err = CreateFailure::unclassified(IoError::new(
                         IoErrorCode::Internal,
                         "created guest path was replaced during create",
-                    );
+                    ));
                     return Err(fail(&created, err));
                 }
                 None => {
                     // 大文字小文字を区別しないホストでは、走査の後に作られた表記違いの
                     // 祖先をそのまま開いて作成しうる。その場合は衝突として返す。
                     let err = match &other {
-                        Some((name, ino)) if *ino == child_meta.ino() => {
-                            collision_error(guest_path, &format!("{prefix}{name}"), component, name)
-                        }
-                        _ => IoError::new(
+                        Some((name, ino)) if *ino == child_meta.ino() => CreateFailure::collision(
+                            collision_kind(component, name),
+                            collision_error(
+                                guest_path,
+                                &format!("{prefix}{name}"),
+                                component,
+                                name,
+                            ),
+                        ),
+                        _ => CreateFailure::unclassified(IoError::new(
                             IoErrorCode::Internal,
                             "created guest path was removed or renamed during create",
-                        ),
+                        )),
                     };
                     return Err(fail(&created, err));
                 }
             }
         }
         if let Some((other, _)) = other {
-            let err = collision_error(guest_path, &format!("{prefix}{other}"), component, &other);
+            let err = CreateFailure::collision(
+                collision_kind(component, &other),
+                collision_error(guest_path, &format!("{prefix}{other}"), component, &other),
+            );
             return Err(fail(&created, err));
         }
         prefix.push_str(component);
@@ -920,7 +1178,7 @@ fn verify_created(
     _guest_path: &str,
     _ancestors: &[&str],
     _leaf: &str,
-) -> Result<(File, Vec<File>), IoError> {
+) -> Result<(File, Vec<File>), CreateFailure> {
     Ok((created.file, created.dirs))
 }
 
@@ -940,23 +1198,34 @@ enum RollbackError {
 /// guest file`）か、取り消し失敗（`Internal`。`created guest file could not be
 /// rolled back`）を返す。どちらも理由と `cause` のメッセージを併記する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rollback_after(created: &Created, ancestors: &[&str], leaf: &str, cause: IoError) -> IoError {
+fn rollback_after(
+    created: &Created,
+    ancestors: &[&str],
+    leaf: &str,
+    cause: CreateFailure,
+) -> CreateFailure {
     match rollback_created(created, ancestors, leaf) {
         Ok(()) => cause,
-        Err(RollbackError::Conflict(detail)) => IoError::new(
-            IoErrorCode::AlreadyExists,
-            format!(
-                "concurrent writer replaced the created guest file ({detail}); cause: {}",
-                cause.message()
+        // 自分の作成は取り消され他者の実体が残る。F8「Nack はその要求が効果を持たない」
+        // に合うため `Exists` に寄せる（要求単位の拒否）。
+        Err(RollbackError::Conflict(detail)) => CreateFailure::with(
+            IoError::new(
+                IoErrorCode::AlreadyExists,
+                format!(
+                    "concurrent writer replaced the created guest file ({detail}); cause: {}",
+                    cause.error.message()
+                ),
             ),
+            NackReason::Exists,
         ),
-        Err(RollbackError::Failed(detail)) => IoError::new(
+        // 取り消しを完了できない失敗は接続全体の失敗（reason なし）。
+        Err(RollbackError::Failed(detail)) => CreateFailure::unclassified(IoError::new(
             IoErrorCode::Internal,
             format!(
                 "created guest file could not be rolled back ({detail}); cause: {}",
-                cause.message()
+                cause.error.message()
             ),
-        ),
+        )),
     }
 }
 
@@ -1235,11 +1504,14 @@ fn restore_moved(
 /// ルート相対ハンドル作成への置き換えは後続。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_beneath(
-    _root_dir: &File,
+    root_dir: &File,
     root: &Path,
     ancestors: &[&str],
     leaf: &str,
+    pre_mutation: &mut dyn FnMut(&File) -> Result<(), CreateFailure>,
 ) -> Result<Created, CreateError> {
+    // 最初の作成の前に 1 回だけ呼ぶ（Windows のコールバックは番兵を持たず何もしない）。
+    pre_mutation(root_dir).map_err(CreateError::Callback)?;
     let mut path = root.to_path_buf();
     // 固定済みの祖先ハンドル（葉の作成が終わるまで保持する）。
     let mut pinned: Vec<File> = Vec::with_capacity(ancestors.len());
@@ -1266,9 +1538,21 @@ fn create_beneath(
                 )));
             }
         }
-        let dir = open_pinned_dir(&path)
-            .map_err(|err| CreateError::Other(internal("failed to create guest file", err.kind())))?
-            .ok_or_else(|| CreateError::Other(invalid("guest path ancestor is not a directory")))?;
+        let dir = match open_pinned_dir(&path).map_err(|err| {
+            CreateError::Other(internal("failed to create guest file", err.kind()))
+        })? {
+            Pinned::Dir(dir) => dir,
+            Pinned::Reparse => {
+                return Err(CreateError::EscapesRoot(invalid(
+                    "guest path ancestor is a symbolic link or reparse point",
+                )));
+            }
+            Pinned::NotDir => {
+                return Err(CreateError::NotADirectory(invalid(
+                    "guest path ancestor is not a directory",
+                )));
+            }
+        };
         dir_paths.push(path.clone());
         needs_sync.push(false);
         pinned.push(dir);
@@ -1335,6 +1619,7 @@ mod fault {
     thread_local! {
         static SCAN_CALLS: Cell<usize> = const { Cell::new(0) };
         static FAIL_SCAN_AT: Cell<Option<usize>> = const { Cell::new(None) };
+        static FAIL_LEAF: Cell<Option<std::io::ErrorKind>> = const { Cell::new(None) };
         static BEFORE_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         static AFTER_CREATE: RefCell<Option<HookFn>> = const { RefCell::new(None) };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1349,6 +1634,7 @@ mod fault {
     pub(super) fn reset() {
         SCAN_CALLS.with(|c| c.set(0));
         FAIL_SCAN_AT.with(|f| f.set(None));
+        FAIL_LEAF.with(|f| f.set(None));
         BEFORE_CREATE.with(|h| h.borrow_mut().take());
         AFTER_CREATE.with(|h| h.borrow_mut().take());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1363,6 +1649,18 @@ mod fault {
     pub(super) fn fail_scan_at(n: usize) {
         SCAN_CALLS.with(|c| c.set(0));
         FAIL_SCAN_AT.with(|f| f.set(Some(n)));
+    }
+
+    /// 以降の葉の作成を `kind` の I/O エラーで失敗させる（Linux / macOS）。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn fail_leaf_with(kind: std::io::ErrorKind) {
+        FAIL_LEAF.with(|f| f.set(Some(kind)));
+    }
+
+    /// 葉の作成口から呼ばれ、注入された失敗があれば取り出す。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn take_leaf_failure() -> Option<std::io::ErrorKind> {
+        FAIL_LEAF.with(|f| f.take())
     }
 
     /// 走査の読み取り口から呼ばれ、失敗させる回なら `true`。
@@ -1408,27 +1706,23 @@ mod fault {
     }
 }
 
+/// 他モジュールの試験（`file_serve`）が、次の葉の作成を I/O エラーで失敗させる継ぎ目
+/// （接続全体の失敗を決定的に作る。Linux / macOS。現スレッドにだけ効く）。
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn test_fail_next_leaf_creation() {
+    fault::fail_leaf_with(std::io::ErrorKind::Other);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    struct Tmp(PathBuf);
+    struct Tmp(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl Tmp {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcio-gf-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&p).expect("temp dir");
-            Self(p)
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため作成前に削除する（REPAIR-12・#3435）。
+            let root = crate::test_root::test_root("fcio-gf", "t");
+            Self(root.to_path_buf(), root)
         }
     }
 
@@ -1531,6 +1825,10 @@ mod tests {
         let c = GuestFileCreator::new(root).expect("creator");
         let err = c.create_file("link/f").err().expect("must reject");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "guest path ancestor is a symbolic link or reparse point"
+        );
         assert_eq!(entries(&outside.0), 0);
     }
 
@@ -1583,27 +1881,40 @@ mod tests {
         let t = Tmp::new();
         std::fs::create_dir(t.0.join("keep")).expect("keep");
         let c = GuestFileCreator::new(t.0.clone()).expect("creator");
-        // 葉が長すぎて作成に失敗する（祖先 `a`・`a/b` は新設後に取り除かれる）。
-        let long = "x".repeat(300);
-        let err = c
-            .create_file(&format!("a/b/{long}"))
-            .err()
-            .expect("must fail");
+        // 葉の作成が失敗する（祖先 `a`・`a/b` は新設後に取り除かれる）。
+        fault::fail_leaf_with(ErrorKind::InvalidFilename);
+        let err = c.create_file("a/b/leaf").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert_eq!(
             err.message(),
             "failed to create guest file (InvalidFilename)"
         );
         assert!(!t.0.join("a").exists());
-        let err = c
-            .create_file(&format!("keep/{long}"))
-            .err()
-            .expect("must fail");
+        fault::fail_leaf_with(ErrorKind::InvalidFilename);
+        let err = c.create_file("keep/leaf").err().expect("must fail");
         assert_eq!(err.code(), IoErrorCode::Internal);
         assert!(t.0.join("keep").is_dir());
         assert_eq!(entries(&t.0), 1);
         // 取り除かれた `a` は索引にも実体にも残らないため、表記違いも作れる。
         c.create_file("A/b").expect("no leftover ancestor");
+    }
+
+    /// 名前長の超過は FS に触れる前（mkdir の前）に拒否される（F5・IO-5・REPAIR-2）。
+    #[test]
+    fn io5_overlong_name_is_rejected_before_any_mkdir() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let long = "x".repeat(256);
+        let err = c
+            .create_file(&format!("a/b/{long}"))
+            .err()
+            .expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(entries(&t.0), 0);
+        let many = vec!["a"; 257].join("/");
+        let err = c.create_file(&many).err().expect("must fail");
+        assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(entries(&t.0), 0);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2146,6 +2457,11 @@ mod tests {
         let err = c.create_file("j/foo").err().expect("must reject");
         assert_eq!(err.code(), IoErrorCode::InvalidArgument, "{err:?}");
         assert_eq!(entries(&outside.0), 1);
+        assert_eq!(
+            classified(&c, "j/foo"),
+            (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot))
+        );
+        assert_eq!(entries(&outside.0), 1);
     }
 
     /// 構築後にルートのパスを範囲外への symlink へ差し替えても、作成は保持した
@@ -2233,5 +2549,316 @@ mod tests {
     fn io5_creator_is_send_sync() {
         fn assert_ss<T: Send + Sync>() {}
         assert_ss::<GuestFileCreator>();
+    }
+
+    /// 失敗を (code, 分類した reason) に落とす。reason は発生源で付けた値で、
+    /// エラー文言を照合しない（F10・#3160）。
+    fn classified(c: &GuestFileCreator, path: &str) -> (IoErrorCode, Option<NackReason>) {
+        let failure = c
+            .create_file_inner(path, &mut |_| Ok(()))
+            .err()
+            .expect("must fail");
+        (failure.error.code(), classify_create_failure(&failure))
+    }
+
+    /// 計測値がちょうど `target` 単位になるゲストパスを組み立てる（各コンポーネントは
+    /// 200 バイト以下。tempdir の長さに依らない）。
+    fn guest_path_for_host_length(root: &Path, target: usize) -> String {
+        let base = measure_host_path_length(root).units();
+        let mut remaining = target - base;
+        let mut parts = Vec::new();
+        while remaining > 0 {
+            // 1 コンポーネントは区切り 1 + 名前 n 単位。残りが 1 単位だけにならないようにする。
+            let mut n = remaining.saturating_sub(1).min(200);
+            if remaining - (n + 1) == 1 {
+                n -= 1;
+            }
+            parts.push("x".repeat(n));
+            remaining -= n + 1;
+        }
+        let guest = parts.join("/");
+        let mut host = root.to_path_buf();
+        host.extend(guest.split('/'));
+        assert_eq!(measure_host_path_length(&host).units(), target);
+        guest
+    }
+
+    /// 260 ちょうどは許容し、警告も出さない（F5・IO-5・REPAIR-3）。
+    #[test]
+    fn io5_host_path_length_260_is_accepted_without_warning() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let guest = guest_path_for_host_length(c.root(), 260);
+        let created = c
+            .create_file_inner(&guest, &mut |_| Ok(()))
+            .ok()
+            .expect("260 is allowed");
+        assert_eq!(created.host_path_warning, None);
+    }
+
+    /// 261 は Windows 以外では警告だけで作成を続ける（npm の深いパスを拒否しない）。
+    #[cfg(not(windows))]
+    #[test]
+    fn io5_host_path_length_261_warns_and_still_creates_off_windows() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let guest = guest_path_for_host_length(c.root(), 261);
+        let created = c
+            .create_file_inner(&guest, &mut |_| Ok(()))
+            .ok()
+            .expect("warning only");
+        let warning = created.host_path_warning.expect("warning");
+        assert_eq!(warning.units(), 261);
+        assert_eq!(warning.limit(), 260);
+        let mut host = t.0.clone();
+        host.extend(guest.split('/'));
+        assert!(host.is_file());
+        // 公開の create_file は警告を捨てて成功する。
+        let guest2 = guest_path_for_host_length(c.root(), 262);
+        c.create_file(&guest2).expect("public API ignores warning");
+    }
+
+    /// 261 は Windows ホストでは何も作らずに `HostPathTooLong` で拒否する。
+    #[cfg(windows)]
+    #[test]
+    fn io5_host_path_length_261_is_rejected_on_windows_before_any_mkdir() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let guest = guest_path_for_host_length(c.root(), 261);
+        assert_eq!(
+            classified(&c, &guest),
+            (
+                IoErrorCode::InvalidArgument,
+                Some(NackReason::HostPathTooLong)
+            )
+        );
+        assert_eq!(entries(&t.0), 0);
+    }
+
+    /// 拒否のエラーは計測値・上限・ゲストパスだけを載せ、ホストのパスを載せない。
+    #[test]
+    fn io5_host_path_too_long_failure_names_guest_path_only() {
+        let t = Tmp::new();
+        let length = measure_host_path_length(&t.0.join("a"));
+        let failure = host_path_too_long(length, "a");
+        assert_eq!(failure.error.code(), IoErrorCode::InvalidArgument);
+        assert_eq!(
+            failure.error.message(),
+            format!(
+                "host path length {} UTF-16 units exceeds limit of 260 (NTFS MAX_PATH): \"a\"",
+                length.units()
+            )
+        );
+        assert_eq!(
+            classify_create_failure(&failure),
+            Some(NackReason::HostPathTooLong)
+        );
+    }
+
+    /// 発生源ごとの分類（F10 の表。code と reason の具体値）。
+    #[test]
+    fn io5_classify_create_failure_by_source() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        for bad in ["a/../b", "a\\b", "/abs", ""] {
+            assert_eq!(
+                classified(&c, bad),
+                (IoErrorCode::InvalidArgument, Some(NackReason::PathSyntax)),
+                "{bad:?}"
+            );
+        }
+        c.create_file("dup").expect("first");
+        assert_eq!(
+            classified(&c, "dup"),
+            (IoErrorCode::AlreadyExists, Some(NackReason::Exists))
+        );
+        c.create_file("Foo").expect("first");
+        assert_eq!(
+            classified(&c, "foo"),
+            (IoErrorCode::AlreadyExists, Some(NackReason::CaseCollision))
+        );
+        c.create_file("caf\u{e9}").expect("nfc");
+        assert_eq!(
+            classified(&c, "cafe\u{301}"),
+            (
+                IoErrorCode::AlreadyExists,
+                Some(NackReason::NormalizationCollision)
+            )
+        );
+        // 祖先が通常ファイル。
+        assert_eq!(
+            classified(&c, "dup/child"),
+            (
+                IoErrorCode::InvalidArgument,
+                Some(NackReason::NotADirectory)
+            )
+        );
+    }
+
+    /// 祖先が symlink の場合は `EscapesRoot`（`NotADirectory` と分ける。#3352）。
+    #[cfg(unix)]
+    #[test]
+    fn io5_classify_symlink_ancestor_as_escapes_root() {
+        let t = Tmp::new();
+        let outside = Tmp::new();
+        let root = t.0.join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::os::unix::fs::symlink(&outside.0, root.join("link")).expect("symlink");
+        let c = GuestFileCreator::new(root).expect("creator");
+        assert_eq!(
+            classified(&c, "link/f"),
+            (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot))
+        );
+        assert_eq!(entries(&outside.0), 0);
+    }
+
+    /// 深い位置・ルート内を指す・宛先の無い symlink もすべて `EscapesRoot`（#3352）。
+    #[cfg(unix)]
+    #[test]
+    fn io5_classify_symlink_ancestor_variants_as_escapes_root() {
+        let t = Tmp::new();
+        let root = t.0.join("root");
+        std::fs::create_dir_all(root.join("d")).expect("d");
+        std::fs::create_dir(root.join("real")).expect("real");
+        std::os::unix::fs::symlink(root.join("real"), root.join("d/link")).expect("deep");
+        std::os::unix::fs::symlink(root.join("real"), root.join("inside")).expect("inside");
+        std::os::unix::fs::symlink(t.0.join("nowhere"), root.join("dangling")).expect("dangling");
+        let c = GuestFileCreator::new(root.clone()).expect("creator");
+        for path in ["d/link/f", "inside/f", "dangling/f"] {
+            assert_eq!(
+                classified(&c, path),
+                (IoErrorCode::InvalidArgument, Some(NackReason::EscapesRoot)),
+                "{path}"
+            );
+        }
+        assert_eq!(entries(&root.join("real")), 0);
+        assert!(!t.0.join("nowhere").exists());
+    }
+
+    /// 件数上限は `TrackedPathsLimit`。
+    #[test]
+    fn io5_classify_tracked_limit() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::with_max_tracked_paths(t.0.clone(), 1).expect("creator");
+        c.create_file("a").expect("first");
+        c.create_file("b").expect("second");
+        assert_eq!(
+            classified(&c, "c"),
+            (
+                IoErrorCode::ResourceExhausted,
+                Some(NackReason::TrackedPathsLimit)
+            )
+        );
+    }
+
+    /// 走査の失敗（`Internal`）は分類せず、接続全体の失敗側に倒す。
+    #[test]
+    fn io5_classify_internal_failure_is_connection_wide() {
+        fault::reset();
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        fault::fail_scan_at(0);
+        assert_eq!(classified(&c, "a"), (IoErrorCode::Internal, None));
+        fault::reset();
+    }
+
+    /// reason と code が食い違う失敗は要求単位に分類しない（fail-closed）。
+    #[test]
+    fn io5_classify_mismatched_reason_and_code_is_unclassified() {
+        let failure =
+            CreateFailure::with(IoError::new(IoErrorCode::Internal, "x"), NackReason::Exists);
+        assert_eq!(classify_create_failure(&failure), None);
+    }
+
+    /// F9: `pre_mutation` は最初の `mkdir` の前に、存在する最も深い祖先（ここではルート）で
+    /// 呼ばれる。コールバックの時点で新設する祖先はまだ存在しない。
+    #[cfg(unix)]
+    #[test]
+    fn io2_pre_mutation_runs_before_any_mkdir_with_deepest_existing_ancestor() {
+        use std::os::unix::fs::MetadataExt;
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let root = t.0.clone();
+        let mut calls = 0u32;
+        let mut seen_ino = 0u64;
+        let created = c
+            .create_file_inner("a/b/f", &mut |dir| {
+                calls += 1;
+                assert!(!root.join("a").exists(), "no directory may exist yet");
+                seen_ino = dir.metadata().expect("stat").ino();
+                Ok(())
+            })
+            .ok()
+            .expect("create");
+        drop(created);
+        assert_eq!(calls, 1);
+        assert_eq!(seen_ino, std::fs::metadata(&t.0).expect("root").ino());
+        assert!(t.0.join("a/b/f").is_file());
+
+        // 祖先 `a` が既にあるときは `a` が渡される。
+        std::fs::create_dir(t.0.join("x")).expect("x");
+        let mut seen_ino = 0u64;
+        c.create_file_inner("x/y/g", &mut |dir| {
+            seen_ino = dir.metadata().expect("stat").ino();
+            assert!(!root.join("x/y").exists());
+            Ok(())
+        })
+        .ok()
+        .expect("create");
+        assert_eq!(seen_ino, std::fs::metadata(t.0.join("x")).expect("x").ino());
+
+        // 新設が要らない（葉の親が既にある）ときは葉の親が渡される。
+        let mut seen_ino = 0u64;
+        c.create_file_inner("x/h", &mut |dir| {
+            seen_ino = dir.metadata().expect("stat").ino();
+            Ok(())
+        })
+        .ok()
+        .expect("create");
+        assert_eq!(seen_ino, std::fs::metadata(t.0.join("x")).expect("x").ino());
+    }
+
+    /// コールバックが失敗したら何も作らず、その失敗（reason `DeviceLimit`）をそのまま返す。
+    #[test]
+    fn io2_pre_mutation_failure_creates_nothing_and_keeps_reason() {
+        let t = Tmp::new();
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let failure = c
+            .create_file_inner("a/b/f", &mut |_| {
+                Err(CreateFailure::device_limit(IoError::new(
+                    IoErrorCode::ResourceExhausted,
+                    "too many devices",
+                )))
+            })
+            .err()
+            .expect("must fail");
+        assert_eq!(
+            classify_create_failure(&failure),
+            Some(NackReason::DeviceLimit)
+        );
+        assert!(!t.0.join("a").exists());
+    }
+
+    /// symlink の祖先は、コールバックの前に（何も作らず）拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn io2_pre_mutation_is_not_called_for_symlink_ancestor() {
+        let t = Tmp::new();
+        let outside = Tmp::new();
+        std::os::unix::fs::symlink(&outside.0, t.0.join("link")).expect("symlink");
+        let c = GuestFileCreator::new(t.0.clone()).expect("creator");
+        let mut calls = 0u32;
+        let failure = c
+            .create_file_inner("link/x", &mut |_| {
+                calls += 1;
+                Ok(())
+            })
+            .err()
+            .expect("must fail");
+        assert_eq!(calls, 0);
+        assert_eq!(
+            classify_create_failure(&failure),
+            Some(NackReason::EscapesRoot)
+        );
     }
 }

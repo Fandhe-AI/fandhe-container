@@ -9,6 +9,9 @@ use fandhe_container_oci::layer::{decompress_layer_to_writer, verify_blob_digest
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
 
+#[path = "support/test_root.rs"]
+mod test_root;
+
 fn gz(data: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     e.write_all(data).unwrap();
@@ -28,8 +31,7 @@ fn sha(data: &[u8]) -> Digest {
 fn oci1_verify_then_decompress() {
     let tar_like: Vec<u8> = (0..2048u32).map(|i| (i % 253) as u8).collect();
     let z = gz(&tar_like);
-    let dir = std::env::temp_dir().join(format!("fc-oci-gz-it-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_root::test_root("fc-oci-gz-it", "verify");
     let p = dir.join("layer.tar.gz");
     std::fs::write(&p, &z).unwrap();
     let v = verify_blob_digest(&p, &sha(&z), 1 << 20).unwrap();
@@ -43,5 +45,4 @@ fn oci1_verify_then_decompress() {
     assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
     assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
     assert_eq!(out.len(), 2047);
-    std::fs::remove_dir_all(&dir).unwrap();
 }

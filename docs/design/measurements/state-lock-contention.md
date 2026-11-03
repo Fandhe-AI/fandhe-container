@@ -12,7 +12,7 @@ Issue #2229（SUP-1・REPAIR-5・TASK-157.9・OCI-5）の記録。対象は `cra
 
 - 連続側（子プロセス。CLI 役）: 自分の ID に対し `get` + `update` を sleep なしで回し続ける
 - 待ち側（親。supervisor 役）: 別の ID に対し `get` + `update` を 50ms 間隔で 20 回行い、1 回ごとの所要時間と `TIMEOUT` 件数を測る
-- 実行: `cargo test -p fandhe-container-core --test state_store_lock_fairness -- --nocapture`
+- 実行: `cargo test -p fandhe-container-core --test state_store_lock_fairness -- --no-capture`
 - 環境: Linux 7.0 の開発機、状態ルートは `/tmp` 配下（fsync が速い FS）。各条件 3 回実行
 
 ## 結果

@@ -35,7 +35,9 @@
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! - `NFTA_TABLE_FLAGS`（dormant / owner）、`NFTA_CHAIN_POLICY`（書き込み）/ `FLAGS` / `HANDLE`、チェインの handle 指定の削除
-//! - `DELCHAIN`・GETTABLE / GETCHAIN 以外の GET 系（ダンプ要求を含む）・`NFT_MSG_DESTROYTABLE`
+//! - `DELCHAIN`・GETTABLE / GETCHAIN / GETRULE 以外の GET 系・`NFT_MSG_DESTROYTABLE`
+//!   （テーブルの dump 要求は [`TableDump`]・[`decode_table_name`]、ルールの dump は
+//!   `nftables_rules::RuleDump` で実装済み。NET-3・#3063）
 //!
 //! 読み取りは `NFT_MSG_GETCHAIN` と応答の `NFTA_CHAIN_POLICY` の復号のみ実装済み（[`ChainGet`]・[`ChainInfo`]。
 //! TASK-148.1・NET-10。cli の `doctor` がホストの `ip filter FORWARD` チェイン policy を調べるために使う）。
@@ -60,30 +62,40 @@ pub const NFT_MSG_NEWCHAIN: u8 = 3;
 /// チェイン照会（`NFT_MSG_GETCHAIN`）。
 pub const NFT_MSG_GETCHAIN: u8 = 4;
 /// テーブル名属性（`NFTA_TABLE_NAME`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_NAME: u16 = 1;
 /// テーブルのハンドル属性（`NFTA_TABLE_HANDLE`。`__be64`。カーネルが採番し再利用されない）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_HANDLE: u16 = 4;
 /// テーブルのユーザーデータ属性（`NFTA_TABLE_USERDATA`。最大 `NFT_USERDATA_MAXLEN` バイト）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_TABLE_USERDATA: u16 = 6;
 /// ユーザーデータの最大長（`NFT_USERDATA_MAXLEN`）。
 pub const NFT_USERDATA_MAXLEN: usize = 256;
 /// チェインの所属テーブル名属性（`NFTA_CHAIN_TABLE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_TABLE: u16 = 1;
 /// チェイン名属性（`NFTA_CHAIN_NAME`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_NAME: u16 = 3;
 /// base chain の policy 属性（`NFTA_CHAIN_POLICY`。`__be32` の `NF_DROP` / `NF_ACCEPT`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_POLICY: u16 = 5;
 /// policy 値 drop（`linux/netfilter.h` の `NF_DROP`）。
 pub const NF_DROP: u32 = 0;
 /// policy 値 accept（`NF_ACCEPT`）。
 pub const NF_ACCEPT: u32 = 1;
 /// base chain の hook 指定（ネスト。`NFTA_CHAIN_HOOK`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_HOOK: u16 = 4;
 /// チェイン種別属性（`NFTA_CHAIN_TYPE`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CHAIN_TYPE: u16 = 7;
 /// hook 番号（`NFTA_HOOK_HOOKNUM`。`__be32`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_HOOK_HOOKNUM: u16 = 1;
 /// hook 優先度（`NFTA_HOOK_PRIORITY`。`__be32` 上の符号付き値）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_HOOK_PRIORITY: u16 = 2;
 /// 名前の最大長（NUL を含む。`NFT_NAME_MAXLEN`）。
 pub const NFT_NAME_MAXLEN: usize = 256;
@@ -131,6 +143,27 @@ impl NftFamily {
     /// 本モジュールが base chain を組み立てられる family か（inet / ip / ip6 のみ）。
     const fn supports_base_chain(self) -> bool {
         matches!(self, Self::Inet | Self::Ipv4 | Self::Ipv6)
+    }
+}
+
+/// カーネルが採番した nft テーブルのハンドル。0 は無効値で表現できない（REPAIR-2）。
+///
+/// ルールハンドルはテーブルごとに採番されるため、記録したルールハンドルが「記録時のテーブル」のものかを
+/// 解除の前に照合する鍵として使う（テーブルが作り直されるとハンドルが変わる。NET-3・SEC-1・#3068）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NftTableHandle(std::num::NonZeroU64);
+
+impl NftTableHandle {
+    /// 0 は `InvalidArgument`。
+    pub fn new(handle: u64) -> Result<Self, NetError> {
+        std::num::NonZeroU64::new(handle)
+            .map(Self)
+            .ok_or_else(|| invalid("nft table handle must be non-zero"))
+    }
+
+    /// ハンドル値。
+    pub fn get(self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -415,6 +448,89 @@ impl TableGet {
         NfGenMsg::new(self.family.nfproto(), 0).put_into(b)?;
         self.name.put_into(b, NFTA_TABLE_NAME)
     }
+}
+
+/// `NFT_MSG_GETTABLE` の dump 要求。family のテーブルを全件列挙する（NET-3・#3063）。
+///
+/// 公開の前に、他の状態ルートが作った `fandhe_net_*` テーブルを見つけるために使う
+/// （`network::listener_dump`）。読み取り専用でルールセットを変更しない。`NLM_F_DUMP` は送信側
+/// （`NetlinkNetfilterSocket::dump_table_names`）が足す。応答は `NFT_MSG_NEWTABLE` がテーブル数だけ
+/// 並び、`NLMSG_DONE` で終わる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableDump {
+    family: NftFamily,
+}
+
+impl TableDump {
+    /// 列挙する family を指定して作る。
+    pub fn new(family: NftFamily) -> Self {
+        Self { family }
+    }
+
+    /// `nlmsg_type`。
+    pub fn msg_type(&self) -> u16 {
+        nfnl_msg_type(NFNL_SUBSYS_NFTABLES, NFT_MSG_GETTABLE)
+    }
+
+    /// 操作フラグ（なし。REQUEST / ACK / DUMP は送信側が付ける）。
+    pub fn flags(&self) -> u16 {
+        0
+    }
+
+    /// nfgenmsg を `b` へ追記する（属性なし）。
+    pub fn encode(&self, b: &mut NlMsgBuilder) -> Result<(), NetError> {
+        NfGenMsg::new(self.family.nfproto(), 0).put_into(b)
+    }
+}
+
+/// `NFT_MSG_GETTABLE` dump の応答 1 件（`NFT_MSG_NEWTABLE`）から `NFTA_TABLE_NAME` を取り出す
+/// （NET-3・#3063）。
+///
+/// カーネル応答は外部入力。短い・属性が壊れている・名前が無い／重複・NUL 終端でない・
+/// 接頭辞 `prefix` に一致する名前が [`NftName`] の検証を通らないものは `DataLoss`。接頭辞に一致しない
+/// 他者のテーブルは名前を検証せず `Ok(None)`（読み飛ばし）。family が要求した値と異なるものも `DataLoss`。
+/// エラーメッセージに名前の値は載せない。
+pub fn decode_table_name(
+    payload: &[u8],
+    family: NftFamily,
+    prefix: &str,
+) -> Result<Option<NftName>, NetError> {
+    let loss = |m: &'static str| NetError::new(NetErrorCode::DataLoss, m);
+    let head = NfGenMsg::decode(payload)?;
+    if head.family() != family.nfproto() {
+        return Err(loss("table dump reply has an unexpected family"));
+    }
+    let attrs = payload
+        .get(NFGENMSG_LEN..)
+        .ok_or_else(|| loss("table reply is shorter than nfgenmsg"))?;
+    let mut found: Option<Option<NftName>> = None;
+    for attr in crate::netlink::AttrIter::new(attrs) {
+        let attr = attr?;
+        if attr.attr_type() != NFTA_TABLE_NAME {
+            continue;
+        }
+        if found.is_some() {
+            return Err(loss("duplicate table name attribute"));
+        }
+        if attr.is_nested() || attr.is_net_byteorder() {
+            return Err(loss("table name attribute has unexpected flags"));
+        }
+        let bytes = match attr.payload().split_last() {
+            Some((0, name)) if !name.contains(&0) => name,
+            _ => return Err(loss("table name is not a single NUL-terminated string")),
+        };
+        if !bytes.starts_with(prefix.as_bytes()) {
+            // 他者のテーブル（docker・kube-proxy 等）は名前を検証せず読み飛ばす。nft の識別子は
+            // `/` や先頭 `.` を許し NftName より広いため、検証すると無関係なテーブル 1 件で全公開が失敗する。
+            found = Some(None);
+            continue;
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| loss("table name is not valid text"))?;
+        found = Some(Some(
+            NftName::new(text).map_err(|_| loss("table name is not a valid nft name"))?,
+        ));
+    }
+    found.ok_or_else(|| loss("table name attribute is missing"))
 }
 
 /// `NFT_MSG_GETTABLE` 応答（`NFT_MSG_NEWTABLE`）から読み取ったテーブルの識別情報（TASK-139.4・#317）。
@@ -835,6 +951,111 @@ mod tests {
         assert_eq!(attrs, vec![(1, false, false, b"fandhe\0".to_vec())]);
     }
 
+    /// NET-3・#3063: GETTABLE の dump 要求は nfgenmsg（family ipv4 = 2）だけで属性を持たない
+    /// （type 0x0A01。DUMP フラグは送信側が足す）。
+    #[test]
+    fn net3_tabledump_is_bare_nfgenmsg() {
+        let d = TableDump::new(NftFamily::Ipv4);
+        let mut b = NlMsgBuilder::new(d.msg_type(), d.flags() | NLM_F_REQUEST | NLM_F_ACK, 3, 0);
+        d.encode(&mut b).expect("encode");
+        let bytes = b.finish().expect("finish");
+        let msg = crate::netlink::NlMsgIter::new(&bytes)
+            .next()
+            .expect("one")
+            .expect("msg");
+        assert_eq!(msg.header().msg_type(), 0x0A01);
+        assert_eq!(msg.payload(), &[2, 0, 0, 0]);
+    }
+
+    fn table_reply(family: u8, extra: impl FnOnce(&mut NlMsgBuilder)) -> Vec<u8> {
+        let mut b = NlMsgBuilder::new(0x0A00, 0, 3, 0);
+        NfGenMsg::new(family, 0).put_into(&mut b).expect("nfgen");
+        extra(&mut b);
+        let bytes = b.finish().expect("finish");
+        crate::netlink::NlMsgIter::new(&bytes)
+            .next()
+            .expect("one")
+            .expect("msg")
+            .payload()
+            .to_vec()
+    }
+
+    /// NET-3・#3063: dump 応答からテーブル名を取り出し、異常はすべて DataLoss（名前の値は載せない）。
+    #[test]
+    fn net3_decode_table_name_validates_reply() {
+        let ok = table_reply(2, |b| {
+            b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_web\0").expect("n");
+            b.put_attr(NFTA_TABLE_HANDLE, &7u64.to_be_bytes())
+                .expect("h");
+        });
+        assert_eq!(
+            decode_table_name(&ok, NftFamily::Ipv4, "fandhe_net_")
+                .expect("name")
+                .expect("ours")
+                .as_str(),
+            "fandhe_net_web"
+        );
+        // 他者のテーブルは不正な nft 名（`/`・先頭 `.`・非 UTF-8）でも読み飛ばす。
+        for foreign in [&b"a/b\0"[..], b".x\0", b"\xff\xfe\0", b"1abc\0"] {
+            let r = table_reply(2, |b| {
+                b.put_attr(NFTA_TABLE_NAME, foreign).expect("n");
+            });
+            assert_eq!(
+                decode_table_name(&r, NftFamily::Ipv4, "fandhe_net_").expect("skip"),
+                None
+            );
+        }
+        // 接頭辞が一致して名前が不正なものは fail-closed のまま。
+        let bad = table_reply(2, |b| {
+            b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_a/b\0").expect("n");
+        });
+        assert_eq!(
+            decode_table_name(&bad, NftFamily::Ipv4, "fandhe_net_")
+                .expect_err("bad")
+                .code(),
+            NetErrorCode::DataLoss
+        );
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "family",
+                table_reply(10, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"t\0").expect("n");
+                }),
+            ),
+            ("missing", table_reply(2, |_| {})),
+            (
+                "no nul",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"abc").expect("n");
+                }),
+            ),
+            (
+                "inner nul",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"a\0b\0").expect("n");
+                }),
+            ),
+            (
+                "invalid name",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"fandhe_net_1/\0").expect("n");
+                }),
+            ),
+            (
+                "duplicate",
+                table_reply(2, |b| {
+                    b.put_attr(NFTA_TABLE_NAME, b"a\0").expect("n");
+                    b.put_attr(NFTA_TABLE_NAME, b"b\0").expect("n");
+                }),
+            ),
+            ("short", vec![2, 0]),
+        ];
+        for (label, payload) in cases {
+            let e = decode_table_name(&payload, NftFamily::Ipv4, "fandhe_net_").expect_err(label);
+            assert_eq!(e.code(), NetErrorCode::DataLoss, "{label}");
+        }
+    }
+
     /// NET-11・TASK-139.4: 所有トークンは NFTA_TABLE_USERDATA(6) に載り、範囲外は拒否される。
     #[test]
     fn net11_newtable_carries_userdata() {
@@ -1077,4 +1298,85 @@ mod tests {
             m.build(5).expect("build").finish().expect("f")
         );
     }
+}
+
+/// nf_tables の table / chain 系定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `NFTA_TABLE_*`・`NFTA_CHAIN_*`・`NFTA_HOOK_*` は
+/// 定義の横に出典を書いた。`NFT_NAME_MAXLEN` は `NFT_TABLE_MAXNAMELEN` / `NFT_CHAIN_MAXNAMELEN` と名前が
+/// 違う対応で照合する。`NftFamily::nfproto`・`NfInetHook::value` は `const fn` の評価で照合する。
+///
+/// 対象外（黙って省かない）: 非公開の `NFGENMSG_LEN` は親の同名定義との一致のみ確かめる
+/// （`struct nfgenmsg` は `libc` に無く、出典は親の定義の横）。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use super::{NfInetHook, NftFamily};
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NFT_MSG_NEWTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_DELTABLE, u8, c_int);
+        libc_const_eq!(NFT_MSG_NEWCHAIN, u8, c_int);
+        libc_const_eq!(NFT_MSG_GETCHAIN, u8, c_int);
+        libc_const_eq!(NFT_USERDATA_MAXLEN, usize, c_int);
+        libc_const_eq!(NF_DROP, u32, c_int);
+        libc_const_eq!(NF_ACCEPT, u32, c_int);
+        libc_const_eq!(NF_IP_PRI_FILTER, i32, c_int);
+        libc_const_eq!(NF_IP_PRI_NAT_DST, i32, c_int);
+        libc_const_eq!(NF_IP_PRI_NAT_SRC, i32, c_int);
+        // 名前が違う対応（table 名・chain 名の上限はどちらも 256）。
+        libc_const_eq!(
+            super::NFT_NAME_MAXLEN,
+            usize,
+            libc::NFT_TABLE_MAXNAMELEN,
+            c_int
+        );
+        libc_const_eq!(
+            super::NFT_NAME_MAXLEN,
+            usize,
+            libc::NFT_CHAIN_MAXNAMELEN,
+            c_int
+        );
+        // 非公開の重複定義が親の定義と一致していること。
+        assert!(super::NFGENMSG_LEN == crate::nftables_batch::NFGENMSG_LEN);
+        // const fn 経由の family / hook。
+        libc_const_eq!(NftFamily::Inet.nfproto(), u8, libc::NFPROTO_INET, c_int);
+        libc_const_eq!(NftFamily::Ipv4.nfproto(), u8, libc::NFPROTO_IPV4, c_int);
+        libc_const_eq!(NftFamily::Ipv6.nfproto(), u8, libc::NFPROTO_IPV6, c_int);
+        libc_const_eq!(NftFamily::Arp.nfproto(), u8, libc::NFPROTO_ARP, c_int);
+        libc_const_eq!(NftFamily::Bridge.nfproto(), u8, libc::NFPROTO_BRIDGE, c_int);
+        libc_const_eq!(NftFamily::Netdev.nfproto(), u8, libc::NFPROTO_NETDEV, c_int);
+        libc_const_eq!(
+            NfInetHook::PreRouting.value(),
+            u32,
+            libc::NF_INET_PRE_ROUTING,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::LocalIn.value(),
+            u32,
+            libc::NF_INET_LOCAL_IN,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::Forward.value(),
+            u32,
+            libc::NF_INET_FORWARD,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::LocalOut.value(),
+            u32,
+            libc::NF_INET_LOCAL_OUT,
+            c_int
+        );
+        libc_const_eq!(
+            NfInetHook::PostRouting.value(),
+            u32,
+            libc::NF_INET_POST_ROUTING,
+            c_int
+        );
+    };
 }

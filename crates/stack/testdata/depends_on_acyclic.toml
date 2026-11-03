@@ -1,0 +1,25 @@
+# 循環なしの合成フィクスチャ（STACK-2・TASK-150.1）。ダイヤモンド形と 3 条件を含む。
+[project]
+name = "acyclic-demo"
+
+[services.web]
+image = "example/web:1"
+
+[services.web.depends_on]
+api = "started"
+worker = "healthy"
+
+[services.api]
+image = "example/api:1"
+
+[services.api.depends_on]
+migrate = "completed"
+
+[services.worker]
+image = "example/worker:1"
+
+[services.worker.depends_on]
+migrate = "completed"
+
+[services.migrate]
+image = "example/migrate:1"

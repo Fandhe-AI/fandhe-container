@@ -15,6 +15,10 @@
 //! supervisor（TASK-157）の責務のため `StateStore::update` で代替する。root 不要で既定のテスト集合で動く。
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::num::NonZeroU32;
@@ -62,17 +66,20 @@ mod linux {
     }
 
     /// テストごとに一意な作業ディレクトリ（0700。drop で削除）。
-    struct TmpDir(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct TmpDir(PathBuf, super::scratch_root::ScratchDir);
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let dir = std::env::temp_dir()
-                .join(format!("fandhe-state-lc-{tag}-{}-{n}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
+            let scratch = super::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-lc-{tag}-{n}"),
+                std::time::Duration::from_secs(10),
+            );
+            let dir = scratch.path().join("work");
             fs::create_dir_all(&dir).expect("create tmp dir");
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-            Self(dir)
+            Self(dir, scratch)
         }
     }
 
@@ -83,23 +90,24 @@ mod linux {
     }
 
     /// `rootfs/` と `config.json` を持つ bundle（start の `BundleLock` はディレクトリ単位のため一意にする）。
-    struct Bundle(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct Bundle(PathBuf, super::scratch_root::ScratchDir);
 
     impl Bundle {
         fn ready(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let dir = std::env::temp_dir().join(format!(
-                "fandhe-state-lc-bundle-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&dir);
+            let scratch = super::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-lc-bundle-{tag}-{n}"),
+                std::time::Duration::from_secs(10),
+            );
+            let dir = scratch.path().join("bundle");
             fs::create_dir_all(dir.join("rootfs")).expect("create bundle");
             fs::write(
                 dir.join("config.json"),
                 serde_json::to_vec(&lifecycle_config()).expect("serialize"),
             )
             .expect("write config");
-            Self(dir)
+            Self(dir, scratch)
         }
 
         fn create_request(&self, id: &str) -> CreateRequest {

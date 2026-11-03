@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ use fandhe_container_cri::runtime::v1::{
 };
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::image_management::StagedBlobWriter;
+use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
 use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractOptions, SpecialBitsPolicy};
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
@@ -209,14 +212,15 @@ impl RegistryPullClient for FakeClient {
         _r: &Repository,
         d: &Descriptor,
         _a: &RegistryAuth,
-        dest: &Path,
+        dest: &mut StagedBlobWriter,
     ) -> Result<(), OciError> {
         let hex = d.digest.as_str().trim_start_matches("sha256:");
         let body = self
             .blobs
             .get(hex)
             .ok_or_else(|| OciError::new(OciErrorCode::NotFound, "blob"))?;
-        fs::write(dest, body).map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
+        dest.write_all(body)
+            .map_err(|_| OciError::new(OciErrorCode::Internal, "write"))
     }
 }
 
@@ -373,6 +377,7 @@ fn container(image: &str) -> ContainerConfig {
 fn prepare(p: &SpecBundleProvider, id: &str, c: &ContainerConfig) -> Result<PathBuf, CriError> {
     let pod = PodSandboxConfig::default();
     p.prepare(&BundleRequest::new(id, "sb", &pod, c))
+        .map(|b| b.path().to_path_buf())
 }
 
 /// 木の（相対パス, 種別, mode, 内容）の一覧。symlink は辿らない。
@@ -587,6 +592,83 @@ fn cri2_image_store_resolves_tags() {
     assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
 }
 
+/// 在庫の記録の `repo_digests[0]` が解決結果の digest 参照になり、image ID は config digest になる（CRI-2・OCI-1。#2831）。
+#[test]
+fn cri2_prepare_reports_resolved_image_with_digest_ref() {
+    let env = pulled_env("store-digest-ref", CONFIG_SECTION);
+    let digest_ref = format!("docker.io/library/alpine@sha256:{}", "d".repeat(64));
+    let store = Arc::new(InMemoryImageStore::new());
+    store
+        .upsert(
+            ImageRecord::new(
+                env.image_id.clone(),
+                vec!["docker.io/library/alpine:3.20".to_owned()],
+                vec![digest_ref.clone()],
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let pod = PodSandboxConfig::default();
+    let c = container("docker.io/library/alpine:3.20");
+    let prepared = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &c))
+        .expect("prepare");
+    let image = prepared.image().expect("image reported");
+    assert_eq!(image.id_str(), env.image_id);
+    assert_eq!(image.image_ref(), digest_ref);
+}
+
+/// 在庫なしで image ID を指定したときは image_ref も image ID（CRI-2・OCI-1。#2831）。
+#[test]
+fn cri2_prepare_reports_image_id_without_store() {
+    let env = pulled_env("no-store-ref", CONFIG_SECTION);
+    let p = env.provider();
+    let pod = PodSandboxConfig::default();
+    let c = container(&env.image_id);
+    let prepared = p
+        .prepare(&BundleRequest::new("ctr1", "sb", &pod, &c))
+        .expect("prepare");
+    let image = prepared.image().expect("image reported");
+    assert_eq!(image.id_str(), env.image_id);
+    assert_eq!(image.image_ref(), env.image_id);
+}
+
+/// 短縮名（`alpine:3.20`）は PullImage と同じ規則で正規化したタグ（`docker.io/library/alpine:3.20`）として登録された
+/// 記録へ解決される（CRI-2・CRI-3・CRI-4。#2592）。
+#[test]
+fn cri2_image_store_resolves_short_name_via_canonical() {
+    let env = pulled_env("store-short", CONFIG_SECTION);
+    let store = Arc::new(InMemoryImageStore::new());
+    store
+        .upsert(
+            ImageRecord::new(
+                env.image_id.clone(),
+                vec!["docker.io/library/alpine:3.20".to_owned()],
+                vec![],
+                10,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let dir = prepare(&p, "ctr1", &container("alpine:3.20")).expect("prepare");
+    assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
+}
+
+/// 正規化しても在庫に無い短縮名は NOT_FOUND で、bundle は残らない（CRI-2・CRI-3。#2592）。
+#[test]
+fn cri2_image_store_short_name_miss_is_not_found() {
+    let env = pulled_env("store-short-miss", CONFIG_SECTION);
+    let store = Arc::new(InMemoryImageStore::new());
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let e = prepare(&p, "ctr1", &container("alpine:3.20")).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::NotFound);
+    assert_eq!(e.message(), "image reference is not found");
+    assert_eq!(bundle_count(&env), 0);
+}
+
 /// 解決器を注入済みで参照が未知のときは UNIMPLEMENTED ではなく NOT_FOUND（CRI-2）。
 #[test]
 fn cri2_image_store_miss_is_not_found() {
@@ -712,10 +794,71 @@ fn oci1_extract_limits_are_enforced_and_leave_no_bundle() {
     let p = env.provider_with(ImageRootfsSource::new(cfg));
     let e = prepare(&p, "c3", &container(&env.image_id)).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Timeout);
+    // blob の検証前に期限を確かめ、固定文言で返す（REPAIR-5・ERR-1・#2821）。
+    assert_eq!(
+        e.message(),
+        "image rootfs preparation exceeded its deadline"
+    );
     assert_eq!(bundle_count(&env), 0);
     // 上限内なら成功する（上の失敗が環境起因でないことの対）。
     let dir = prepare(&env.provider(), "c4", &container(&env.image_id)).expect("ok");
     assert!(dir.join("rootfs/world").exists());
+}
+
+/// 最初の `ExtractLayer` の記録を見たら取り消しの旗を立てる記録先（展開の途中を決定的に作る。#2899）。
+#[derive(Debug)]
+struct CancelAfterFirstLayer {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    samples: std::sync::Mutex<Vec<(OciOpKind, OciOpOutcome, Option<OciErrorCode>)>>,
+}
+
+impl OciOpRecorder for CancelAfterFirstLayer {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        self.samples
+            .lock()
+            .unwrap()
+            .push((sample.kind(), sample.outcome(), sample.error_code()));
+        if sample.kind() == OciOpKind::ExtractLayer {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// REPAIR-5・CRI-2（#2899）: 展開の途中（1 層目の後）で取り消しの旗が立つと、2 層目の前で止まり、
+/// `DEADLINE_EXCEEDED` に写る固定文言で返り、rootfs・bundle が残らない。計装には 2 層目が TIMEOUT で残る。
+#[test]
+fn repair5_cancel_during_extraction_stops_at_next_layer_and_leaves_no_bundle() {
+    let env = pulled_env("cancel", CONFIG_SECTION);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rec = Arc::new(CancelAfterFirstLayer {
+        flag: Arc::clone(&flag),
+        samples: std::sync::Mutex::new(Vec::new()),
+    });
+    let source = ImageRootfsSource::new(env.extract_config()).with_recorder(rec.clone());
+    let p = env.provider_with(source);
+    let pod = PodSandboxConfig::default();
+    let c = container(&env.image_id);
+    let e = p
+        .prepare(&BundleRequest::new("c1", "sb", &pod, &c).with_cancel(&flag))
+        .map(|b| b.path().to_path_buf())
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Timeout);
+    assert_eq!(
+        e.message(),
+        "image rootfs preparation exceeded its deadline"
+    );
+    assert_eq!(bundle_count(&env), 0);
+    assert_eq!(
+        rec.samples.lock().unwrap().clone(),
+        vec![
+            (OciOpKind::ExtractLayer, OciOpOutcome::Success, None),
+            (
+                OciOpKind::ExtractLayer,
+                OciOpOutcome::Failure,
+                Some(OciErrorCode::Timeout)
+            ),
+        ]
+    );
 }
 
 /// release: 0555 を含む rootfs を含む bundle を消せ、不在は成功で冪等。
@@ -866,4 +1009,107 @@ fn sec1_symlinked_etc_in_image_is_not_read() {
     let parsed = oci_runtime::load_config(&dir.join("config.json")).unwrap();
     let u = parsed.process().unwrap().user();
     assert_eq!((u.uid(), u.gid()), (33, 0));
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_as_username_container(image: &str, name: &str, gid: Option<i64>) -> ContainerConfig {
+    let mut c = container(image);
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: name.into(),
+            run_as_group: gid.map(|value| Int64Value { value }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    c
+}
+
+/// CRI-2・SEC-5（#2664）: run_as_username が rootfs の passwd で解決され、run_as_group が gid を上書きする。
+/// イメージ User が未解決（`ghost`）でも username が解決すれば成功する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn cri2_run_as_username_is_resolved_from_rootfs_passwd() {
+    let l1 = tar_of(&[
+        tar_entry("etc/", 0o755, b"", true),
+        tar_entry(
+            "etc/passwd",
+            0o644,
+            b"root:x:0:0:r:/root:/bin/sh\napp:x:1000:1001::/h:/bin/sh\n",
+            false,
+        ),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "run-as-username",
+        r#""config":{"Entrypoint":["/bin/app"],"User":"ghost"},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let ids = |dir: &Path| {
+        let parsed = oci_runtime::load_config(&dir.join("config.json")).unwrap();
+        let u = parsed.process().unwrap().user();
+        (u.uid(), u.gid())
+    };
+    let d = prepare(
+        &p,
+        "c1",
+        &run_as_username_container(&env.image_id, "app", None),
+    )
+    .expect("c1");
+    assert_eq!(ids(&d), (1000, 1001));
+    let d = prepare(
+        &p,
+        "c2",
+        &run_as_username_container(&env.image_id, "app", Some(44)),
+    )
+    .expect("c2");
+    assert_eq!(ids(&d), (1000, 44));
+    // passwd に無い名前は INVALID_ARGUMENT で、bundle を残さない。
+    let before = bundle_count(&env);
+    let e = prepare(
+        &p,
+        "c3",
+        &run_as_username_container(&env.image_id, "nobody", None),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+    assert_eq!(bundle_count(&env), before);
+}
+
+/// SEC-1・SEC-5（#2664）: `etc` がホストを指す symlink のイメージでは passwd を読まず FAILED_PRECONDITION にする。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn sec1_run_as_username_with_symlinked_etc_is_rejected() {
+    let l1 = tar_of(&[
+        tar_symlink("etc", "/etc"),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "username-symlink-etc",
+        r#""config":{"Entrypoint":["/bin/app"]},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let e = prepare(
+        &p,
+        "c1",
+        &run_as_username_container(&env.image_id, "root", None),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(bundle_count(&env), 0);
 }

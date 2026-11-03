@@ -12,7 +12,7 @@
 //!
 //! 未実装・差分（REPAIR-3）: core の本番 launcher（`ProductionLauncher`）は呼び出しプロセスが単一スレッドで
 //! あることを要求する（CORE-1）一方、`spawn_blocking` は tokio のスレッドプールを作るため CRI サービスと
-//! 同一プロセスでは使えない。その結線は supervisor 側（#1819）と plugin 境界化（TASK-114）で解く。本試験は
+//! 同一プロセスでは使えない。本番は plugin-cri が supervisor の bin 経由で launch する形で解いた（#1819・#2434）。本試験はテスト側の `ContainerRuntime` を注入する。本試験は
 //! テスト側の `ContainerRuntime`（`unshare(1)` で起動）を注入し、CRI ハンドラが adapter 経由で実際の
 //! プロセス起動まで到達することを照合する。core の分離実装そのものの照合ではない。
 
@@ -28,7 +28,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
@@ -139,8 +141,10 @@ impl ContainerRuntime for UnshareRuntime {
 struct FixedBundle;
 
 impl BundleProvider for FixedBundle {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
-        Ok(PathBuf::from("/tmp/unused-bundle").join(req.container_id))
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
+        Ok(PreparedBundle::new(
+            PathBuf::from("/tmp/unused-bundle").join(req.container_id),
+        ))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())

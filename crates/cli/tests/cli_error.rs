@@ -45,6 +45,10 @@ fn err1_exit_code_table() {
         (ErrorCode::ResourceExhausted, 10),
         (ErrorCode::Internal, 1),
     ];
+    assert_eq!(table.len(), ErrorCode::ALL.len());
+    for c in ErrorCode::ALL {
+        assert!(table.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+    }
     for (code, want) in table {
         assert_eq!(CliError::new(code, "x").exit_code().get(), want);
     }

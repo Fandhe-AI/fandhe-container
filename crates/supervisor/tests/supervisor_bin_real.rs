@@ -24,9 +24,10 @@
 //!   届く。成功行の前に `seccomp denial returned EPERM and left exactly 1 record in @audit.log` を出す
 //! - シナリオ B（起動失敗で何も残らない。A6）: rootfs から `proc/` を除いて pre-pivot 段で失敗させ、報告が ERR・bin の
 //!   終了コードが非 0・状態が Created（pid なし）・作った cgroup が消え・プローブのプロセスが残らないことを照合する
-//! - シナリオ C（restart の fail-closed。SUP-3・#2043）: `--restart always` でプローブが終了した後、再 launch は
-//!   単一スレッドの要求を満たせず本番 launcher が拒否する。新しい子は作られず、状態は Stopped で、bin の終了コードは
-//!   FAILED_PRECONDITION の写像になる。再 launch が実機で成立する再構成（#2043）が入ったら、この項目を置き換える
+//! - シナリオ C（restart の再 launch。SUP-3・CORE-1・SUP-7・SEC-4・#2043）: `--restart on-failure:1` でプローブが終了した後、
+//!   常駐スレッドを止めて監視ループのスレッドで直接再 launch する。`restart_count` が 1 に進んで新しい pid で Running に戻り、
+//!   2 回目の終了で Stopped（終了コード 7）・bin の終了コード 0 で終わる。ログ sink に `READY` が 2 回、`@audit.log` に seccomp の
+//!   行がちょうど 2 行届く
 //! - シナリオ D（SIGTERM の配送 → Stopped → 停止後の delete。SUP-4・SUP-1・CORE-2・OCI-6・#2392）: Running の間の delete は
 //!   FAILED_PRECONDITION で拒否され記録が残る。プローブの SIGTERM ハンドラ登録を待ってから、CLI `stop` と同じ
 //!   `ControlSignaler::for_stop` 経由で core の `kill`（SIGTERM）を送る。monitor が Stopped を記録し、終了コードは
@@ -60,7 +61,7 @@
 //! ```
 //!
 //! 成功時の最終行: `supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs
-//! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM
+//! captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM
 //! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
 //! SeccompNotifyHub and recorded once`。
 //! CI（ubuntu-latest）以外の環境・root の分岐の実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
@@ -101,14 +102,39 @@ fn main() {
         }
     } else if has("--delete-helper") {
         linux::delete_helper();
-    } else if std::env::args().any(|a| a == "--ignored") {
-        linux::run();
     } else {
-        println!(
-            "supervisor_bin_real: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
-        );
+        // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
+        linux::self_check_precondition();
+        if has("--ignored") {
+            linux::run();
+        } else {
+            println!(
+                "supervisor_bin_real: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
+            );
+        }
     }
 }
+
+// 最小 rootfs の組み立て部品は `exec_subordinate_e2e` と共有する（REPAIR-1・#2889）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/rootfs.rs"]
+mod rootfs;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(all(
     target_os = "linux",
@@ -276,11 +302,54 @@ mod linux {
         std::process::exit(PROBE_EXIT);
     }
 
-    fn require(ok: bool, msg: &str) {
-        if !ok {
-            eprintln!("supervisor_bin_real: precondition failed: {msg}");
-            std::process::exit(1);
+    /// euid の前提の分類（#2788・SEC-4・REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum EuidCheck {
+        NonRoot,
+        /// root で実行されている（rootful start は拒否されるため前提欠如。試験環境の問題）。
+        Root,
+        /// 判定不能。前提欠如とは断定しない（fail-closed）。
+        Unknown,
+    }
+
+    /// `/proc/self/status` の内容から euid（`Uid:` の 2 列目）を分類する。
+    fn classify_euid(status: Option<&str>) -> EuidCheck {
+        let euid = status
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:")))
+            .and_then(|v| v.split_whitespace().nth(1));
+        match euid {
+            Some("0") => EuidCheck::Root,
+            Some(v) if v.parse::<u32>().is_ok() => EuidCheck::NonRoot,
+            _ => EuidCheck::Unknown,
         }
+    }
+
+    /// 前提欠如の panic メッセージ（1 行目で前提欠如と回帰を判別できる）。
+    fn precondition_message() -> String {
+        "supervisor_bin_real: PRECONDITION FAILED (test environment, not a supervisor launch regression): \
+         must run as a non-root user (euid=0); rootful start is refused (SEC-5).\n\
+         hint: run it as an unprivileged user (see AGENTS.md supervisor_bin_real for the --no-run and systemd-run --user --scope steps)."
+            .to_string()
+    }
+
+    pub fn self_check_precondition() {
+        assert_eq!(
+            classify_euid(Some("Uid:\t1000\t1000\t1000\t1000\n")),
+            EuidCheck::NonRoot
+        );
+        assert_eq!(
+            classify_euid(Some("Uid:\t1000\t0\t0\t0\n")),
+            EuidCheck::Root
+        );
+        assert_eq!(classify_euid(Some("Name:\tx\n")), EuidCheck::Unknown);
+        assert_eq!(classify_euid(Some("Uid:\t0\tx\n")), EuidCheck::Unknown);
+        assert_eq!(classify_euid(None), EuidCheck::Unknown);
+        assert_eq!(
+            precondition_message().lines().next(),
+            Some(
+                "supervisor_bin_real: PRECONDITION FAILED (test environment, not a supervisor launch regression): must run as a non-root user (euid=0); rootful start is refused (SEC-5)."
+            )
+        );
     }
 
     fn status_field(path: &str, key: &str) -> Option<String> {
@@ -288,106 +357,6 @@ mod linux {
             .ok()?
             .lines()
             .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
-    }
-
-    fn mkdir(path: &Path) {
-        std::fs::create_dir_all(path).unwrap_or_else(|e| panic!("mkdir {}: {e}", path.display()));
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
-    }
-
-    /// `host` のファイルを rootfs 内の同じ絶対パスへコピーする。
-    fn copy_into(rootfs: &Path, host: &Path, mode: u32) {
-        let dest = rootfs.join(host.strip_prefix("/").expect("absolute path"));
-        mkdir(dest.parent().expect("parent"));
-        let _ = std::fs::remove_file(&dest);
-        std::fs::copy(host, &dest)
-            .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", host.display(), dest.display()));
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
-            .unwrap_or_else(|e| panic!("chmod {}: {e}", dest.display()));
-    }
-
-    /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` で検査する。
-    fn elf_interp(exe: &[u8]) -> Option<String> {
-        let u16_at = |o: usize| Some(u16::from_le_bytes(exe.get(o..o + 2)?.try_into().ok()?));
-        let u32_at = |o: usize| Some(u32::from_le_bytes(exe.get(o..o + 4)?.try_into().ok()?));
-        let u64_at = |o: usize| Some(u64::from_le_bytes(exe.get(o..o + 8)?.try_into().ok()?));
-        if exe.get(0..4)? != b"\x7fELF" {
-            return None;
-        }
-        let phoff = usize::try_from(u64_at(0x20)?).ok()?;
-        let phentsize = usize::from(u16_at(0x36)?);
-        let phnum = usize::from(u16_at(0x38)?);
-        for i in 0..phnum {
-            let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
-            if u32_at(base)? == 3 {
-                let off = usize::try_from(u64_at(base + 8)?).ok()?;
-                let len = usize::try_from(u64_at(base + 32)?).ok()?;
-                let raw = exe.get(off..off.checked_add(len)?)?;
-                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-                return String::from_utf8(raw.get(..end)?.to_vec()).ok();
-            }
-        }
-        None
-    }
-
-    /// 自プロセスに読み込み済みの共有ライブラリの実パス（`/proc/self/maps` から。重複なし）。
-    fn loaded_libraries(exe: &Path) -> Vec<PathBuf> {
-        let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
-        let mut libs: Vec<PathBuf> = Vec::new();
-        for line in maps.lines() {
-            let Some(path) = line.split_whitespace().nth(5) else {
-                continue;
-            };
-            let p = PathBuf::from(path);
-            if !path.starts_with('/')
-                || p == exe
-                || ["/dev/", "/proc/", "/sys/", "/tmp/", "/memfd:"]
-                    .iter()
-                    .any(|pre| path.starts_with(pre))
-                || libs.contains(&p)
-            {
-                continue;
-            }
-            if std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-                libs.push(p);
-            }
-        }
-        libs
-    }
-
-    /// 最小 rootfs を作る。`with_proc` が false なら `proc/` を作らない（シナリオ B の失敗注入）。
-    /// 戻り値はプローブが使う `LD_LIBRARY_PATH` の値。
-    fn make_rootfs(rootfs: &Path, with_proc: bool) -> String {
-        mkdir(rootfs);
-        let dirs: &[&str] = if with_proc {
-            &["proc", "dev", "tmp", "etc"]
-        } else {
-            &["dev", "tmp", "etc"]
-        };
-        for d in dirs {
-            mkdir(&rootfs.join(d));
-        }
-        let exe = std::env::current_exe().expect("current_exe");
-        let exe = std::fs::canonicalize(exe).expect("canonicalize exe");
-        let probe = rootfs.join("probe");
-        std::fs::copy(&exe, &probe).expect("copy probe binary");
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod probe");
-        let bytes = std::fs::read(&exe).expect("read exe");
-        let mut lib_dirs: Vec<String> = Vec::new();
-        if let Some(interp) = elf_interp(&bytes) {
-            copy_into(rootfs, Path::new(&interp), 0o755);
-        }
-        for lib in loaded_libraries(&exe) {
-            copy_into(rootfs, &lib, 0o755);
-            if let Some(dir) = lib.parent().and_then(Path::to_str)
-                && !lib_dirs.iter().any(|d| d == dir)
-            {
-                lib_dirs.push(dir.to_string());
-            }
-        }
-        lib_dirs.join(":")
     }
 
     /// 一時ディレクトリ（bundle と状態ルート。drop で削除）。
@@ -418,18 +387,23 @@ mod linux {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
-                .join(format!(
-                    "fandhe-supbinreal-{tag}-{}-{nanos}",
-                    std::process::id()
-                ));
+            let dir =
+                super::scratch_root::scratch_root("fandhe-supbinreal-scratch", REPORT_TIMEOUT)
+                    .join(format!(
+                        "fandhe-supbinreal-{tag}-{}-{nanos}",
+                        std::process::id()
+                    ));
             std::fs::create_dir(&dir).expect("exclusively create the work dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod work dir");
             let bundle = dir.join("bundle");
             std::fs::create_dir(&bundle).expect("create bundle");
-            let ld = make_rootfs(&bundle.join("rootfs"), with_proc);
+            let proc_dir = if with_proc {
+                super::rootfs::ProcDir::Create
+            } else {
+                super::rootfs::ProcDir::Omit
+            };
+            let ld = super::rootfs::make_rootfs(&bundle.join("rootfs"), proc_dir);
             let config = format!(
                 r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-supbin",
 "process":{{"user":{{"uid":0,"gid":0}},"args":[{probe_args}],
@@ -575,24 +549,23 @@ mod linux {
     }
 
     pub fn run() {
-        let status = std::fs::read_to_string("/proc/self/status").expect("read status");
-        let euid_is_root = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|v| v.split_whitespace().nth(1).map(str::to_owned))
-            .as_deref()
-            == Some("0");
-        require(
-            !euid_is_root,
-            "must run as a non-root user (rootful start is refused)",
-        );
+        // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）を panic でも消す（#2887）。
+        let _scratch_cleanup = super::scratch_root::ScratchRootCleanup;
+        let status = std::fs::read_to_string("/proc/self/status").ok();
+        match classify_euid(status.as_deref()) {
+            EuidCheck::NonRoot => {}
+            EuidCheck::Root => panic!("{}", precondition_message()),
+            EuidCheck::Unknown => {
+                panic!("supervisor_bin_real: could not determine euid from /proc/self/status")
+            }
+        }
         scenario_a_start_monitor_record();
         scenario_b_failed_start_leaves_nothing();
-        scenario_c_restart_fails_closed();
+        scenario_c_restart_relaunch_succeeds();
         scenario_d_sigterm_stop_delete();
         scenario_e_esc03_mount_via_hub();
         println!(
-            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
+            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart relaunched on the calling thread with restart_count 1 and both launches captured and audited; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
         );
     }
 
@@ -809,27 +782,82 @@ mod linux {
         println!("supervisor_bin_real: scenario=B ok code={}", code.as_str());
     }
 
-    /// シナリオ C: restart の再 launch は fail-closed（#2043 まで）。
-    fn scenario_c_restart_fails_closed() {
+    /// シナリオ C: restart の再 launch が本番 launcher で成り立つ(SUP-3・CORE-1・SUP-7・SEC-4・#2043)。
+    ///
+    /// `--restart on-failure:1` でプローブが終了コード 7 で終わると、supervisor は stderr・制御チャネル・捕捉・seccomp 通知の
+    /// 常駐スレッドを止めて監視ループのスレッドで直接再 launch する。`restart_count` が 1 に進み、新しい pid で Running に戻り、
+    /// 2 回目の終了(上限)で Stopped(7)・bin の終了コード 0 で終わる。ログ sink に READY が 2 回、`@audit.log` に seccomp の
+    /// 行がちょうど 2 行(各起動の listener がハブへ渡り直っている)届く。
+    fn scenario_c_restart_relaunch_succeeds() {
         let env = Env::new("c", true, Probe::Exit7);
         let id = format!("sbc{}", std::process::id());
         env.create(&id);
-        let mut sup = spawn_supervisor(&env, &id, Some("always"));
-        let pid = match sup.report() {
+        let mut sup = spawn_supervisor(&env, &id, Some("on-failure:1"));
+        let first_pid = match sup.report() {
             StartReport::Started { pid } => pid,
             other => panic!("expected OK, got {other:?}"),
         };
-        let bin_exit = sup.exit_code();
+        // 再 launch の後の Running(restart_count = 1・別の pid)を期限つきで待つ。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let relaunched_pid = loop {
+            let rec = env.record(&id);
+            if rec.restart_count() == 1
+                && rec.status().state() == ContainerState::Running
+                && let Some(pid) = rec.status().pid()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the restart did not reach Running with restart_count 1: {:?}",
+                rec.status()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_ne!(
+            relaunched_pid, first_pid,
+            "the relaunch must create a new process"
+        );
+        // 上限(1 回)に達しているので、2 回目の終了で再起動せずに終わる。
         assert_eq!(
-            bin_exit,
-            i32::from(exit_code_for(ErrorCode::FailedPrecondition).get()),
-            "the relaunch must be refused by the single-thread requirement"
+            sup.exit_code(),
+            0,
+            "the supervisor must finish cleanly after the restart limit"
         );
         let rec = env.record(&id);
         assert_eq!(rec.status().state(), ContainerState::Stopped);
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_eq!(rec.status().exit_code(), Some(PROBE_EXIT));
+        assert_eq!(rec.restart_count(), 1);
+        for pid in [first_pid, relaunched_pid] {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "pid {pid} must be reaped"
+            );
+        }
         assert!(no_probe_remains(), "no probe process may remain");
-        println!("supervisor_bin_real: scenario=C ok first_pid={pid}");
+        // 再起動をまたいで、両方の起動の出力が同じログ sink に残る(SUP-7)。
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
+        let ready_lines: usize = std::fs::read_dir(&logs)
+            .expect("log directory")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&id))
+            .map(|e| {
+                std::fs::read_to_string(e.path())
+                    .map(|t| t.lines().filter(|l| l.contains("READY")).count())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(ready_lines, 2, "READY must be captured once per launch");
+        // seccomp の通知は各起動の listener で応答され、拒否が 2 行届く(SEC-4)。
+        let audit = std::fs::read_to_string(env.root().join("@audit.log")).unwrap_or_default();
+        let seccomp_lines = audit
+            .lines()
+            .filter(|l| l.contains("\"layer\":\"seccomp\""))
+            .count();
+        assert_eq!(seccomp_lines, 2, "one seccomp record per launch: {audit:?}");
+        println!(
+            "supervisor_bin_real: scenario=C ok first_pid={first_pid} relaunched_pid={relaunched_pid}"
+        );
     }
 
     /// delete の補助役の結果。

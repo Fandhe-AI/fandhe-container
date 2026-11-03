@@ -8,8 +8,10 @@
 //!   （TASK-141.2・#322）。上流 DNS への転送（コンテナ別の `--dns` マッピング）は [`upstream`]
 //!   （NET-12・TASK-185.3・#346）、参照カウントによるオンデマンド起動・終了は
 //!   [`refcount`]（NET-7・TASK-144.1・#329）が持つ。SIGTERM による正常終了は未実装（REPAIR-3）
-//! - 呼び出し側（将来の統一 CLI / 製品バイナリ。TASK-79）は [`spawn_dns_helper`] で自身または専用バイナリを
-//!   `--listen <ipv4:port>` つきで起動し、ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
+//! - 製品の経路は [`detach`]（#3070・NET-5・NET-7）: ヘルパーを `setsid` と二重 fork 相当で親から切り離して起動し、
+//!   `dns-helper` に pid・開始時刻・boot id を記録し（[`record`]・[`identity`]）、別プロセスから pidfd 経由で停止する
+//! - [`spawn_dns_helper`] と [`DnsHelperProcess`] は `Child` を握り `Drop` で止める**試験専用**の形（D11）。
+//!   [`refcount::ProcessLauncher`] と結合試験が使う。ヘルパー側の `main` は [`run_dns_helper_main`] を呼ぶ
 //!
 //! # netns の解釈
 //! 現行の bridge は `create_network` の呼び出し元の netns に作られる。ヘルパーは起動元の netns を継承し、
@@ -20,19 +22,21 @@
 //! コンテナ接続（`network::attach_container` の `AttachedContainer.address` が IPv4 のとき）で
 //! [`DnsRegistry::register`]、切断・停止で [`DnsRegistry::unregister`] を呼ぶ。
 //!
-//! # 未実装（REPAIR-3）
-//! プロセス外（ヘルパープロセス）へ名前の登録・削除を伝える経路はまだ無い（CORE-1 により起動・停止は別プロセスで
-//! 起きるため、経路の設計は後続タスクで決める）。経路ができるまで [`run_dns_helper_main`] は
-//! [`RegistryHandler`] に切り替えず、全クエリに NOTIMP を返す [`NotImplementedHandler`] を使い続ける
-//! （登録できない空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
-//! 登録側（テスト・将来の組み込み）から使える。TCP・AAAA・EDNS0 も未対応（上流転送は次に記す）。
+//! # 名前の経路と未実装（REPAIR-3）
+//! 切り離し起動（[`detach`]）したヘルパーは、制御 UDS（[`control`]。`Reload` の ack と `Stop`。#3071・D11）を持ち、
+//! `Reload` のたびにメンバー記録（`members/<id>`）を読み直して [`DnsRegistry`] を一括に差し替える
+//! （[`load`] が記録から名前を導く）。[`run_dns_helper_main`] はこの経路では [`RegistryHandler`] で答える。
+//! 単独の `--listen`（試験専用）は名前の経路を持たないので、従来どおり全クエリに NOTIMP を返す
+//! [`NotImplementedHandler`] を使う（空レジストリで実際の名前解決を妨げない）。[`RegistryHandler`] は同一プロセス内の
+//! 登録側（テスト・将来の組み込み）からも使える。TCP・AAAA・EDNS0 も未対応（上流転送は次に記す）。
 //! レジストリに無い名前は存在・不存在を断定せず REFUSED（AA=0）を返す。ただし [`upstream::ForwardingHandler`]
 //! （NET-12・TASK-185.3・#346）を組み立てた場合に限り、上流マッピング登録済みのコンテナからの管理外名は
-//! そのコンテナの `--dns` 上流へ転送する。この転送機構も同じ理由で製品の入口には未接続で、同一プロセス内の
-//! 登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
+//! そのコンテナの `--dns` 上流へ転送する。この転送機構は製品の入口にはまだ未接続（`--dns` の上流の記録からの組み立ては #3072）で、
+//! 同一プロセス内の登録側（テスト・将来の組み込み）からのみ到達できる。転送は `serve` の受信ループではなく最大
 //! [`MAX_INFLIGHT_DEFERRED`] 件のワーカー（[`HandlerOutcome::Defer`]）で行い、上流の応答待ちで他のクエリを
 //! 待たせない。TCP 再試行（TC=1 応答）は未対応。
-//! PLUG-1 における DNS ヘルパーの core / plugin 区分は検討中で、確定扱いにはしない。
+//! DNS ヘルパーは plugin 側（`NetworkPlugin` の実装）が起動し、`crates/net` は core 側のライブラリである
+//! （PLUG-1。2026-10-12 のオーナー決定・`docs/design/network-wiring.md` の前提）。
 //!
 //! # 実機計測（TASK-141.3・#323）
 //! 正答率・レイテンシ・常駐 PSS の実機計測は `crates/net/tests/dns_helper_privileged.rs` の `--measure` モードと
@@ -62,6 +66,13 @@ use std::time::{Duration, Instant};
 use crate::error::{NetError, NetErrorCode};
 use crate::network::CreatedNetwork;
 
+use self::record::HelperNonce;
+
+pub mod control;
+pub mod detach;
+pub mod identity;
+pub mod load;
+pub mod record;
 pub mod refcount;
 pub mod upstream;
 
@@ -109,7 +120,7 @@ fn invalid(msg: &str) -> NetError {
 }
 
 /// `io::Error` を `NetError` の分類へ写す（OS 非依存。メッセージは OS のエラー文言のみで、パケット内容を含めない）。
-fn map_io(context: &str, e: &io::Error) -> NetError {
+pub(crate) fn map_io(context: &str, e: &io::Error) -> NetError {
     let code = match e.kind() {
         io::ErrorKind::PermissionDenied => NetErrorCode::PermissionDenied,
         io::ErrorKind::AddrInUse => NetErrorCode::AlreadyExists,
@@ -546,6 +557,31 @@ impl DnsRegistry {
         }
         map.insert(name.as_str().to_owned(), addr);
         Ok(RegisterOutcome::Inserted)
+    }
+
+    /// 登録を `entries` で一括に差し替える（制御 UDS の `Reload` が使う。NET-5・#3071）。
+    ///
+    /// 書き込みロックの下で map ごと入れ替えるため、読み手は古い内容か新しい内容のどちらかだけを見る
+    /// （半端な状態を見せない）。件数が [`MAX_REGISTRY_ENTRIES`] を超えるときは何も変えず
+    /// `ResourceExhausted`。`entries` の名前が重複していれば、後の方が前を上書きする
+    /// （呼び出し側の `load::names_from_members` が重複を作らない）。
+    pub fn replace_all(&self, entries: &[(DnsName, Ipv4Addr)]) -> Result<(), NetError> {
+        if entries.len() > MAX_REGISTRY_ENTRIES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "DNS registry is full",
+            ));
+        }
+        let fresh: HashMap<String, Ipv4Addr> = entries
+            .iter()
+            .map(|(n, a)| (n.as_str().to_owned(), *a))
+            .collect();
+        let mut map = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *map = fresh;
+        Ok(())
     }
 
     /// 登録を削除する。未登録でもエラーにしない。
@@ -1071,37 +1107,161 @@ impl DnsHelperServer {
     }
 }
 
-/// ヘルパープロセスの入口（`--listen <ipv4:port>` のみ受理）。bind 後に stdout へ `READY <ip:port>` を 1 行だけ
-/// 出し、以後 stdout には書かない（親が pipe を閉じても EPIPE で落ちないため）。失敗は stderr に英語 1 行
-/// （code / message。ERR-1）を出して非ゼロで終了する（引数エラーは 2）。
+/// 起動方式（`run_dns_helper_main` の引数から決まる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperMode {
+    /// `--listen` のみ（試験専用の従来の起動。親の `Child` として動く）。
+    Plain,
+    /// 切り離し起動の段 1（`--dns-helper-detach --listen A --nonce N`）。`setsid` して段 2 を起動し即終了する。
+    Detach,
+    /// 切り離し起動の段 2（`--dns-helper-stage2 --listen A --nonce N`）。ack を受けてから bind する。
+    Stage2,
+}
+
+/// ヘルパープロセスの入口。受理する引数は次のとおり（それ以外は終了コード 2）。
+/// - `--listen <ipv4:port>` のみ: 従来の起動（試験専用。D11）。bind 後に stdout へ `READY <ip:port>` を 1 行だけ
+///   出し、以後 stdout には書かない（親が pipe を閉じても EPIPE で落ちないため）
+/// - `--dns-helper-detach --listen A --nonce N`: 切り離し起動の段 1（Linux のみ。`detach` の doc）
+/// - `--dns-helper-stage2 --listen A --nonce N --state-root P --network NAME`: 段 2。識別行を stdout へ送り、stdin の
+///   ack を 2 秒まで待ち、受けたらストアを開き直して制御 UDS を bind し、メンバー記録から名前を読み込み、
+///   UDP を bind して `READY`。以後 `Reload` で読み直し、`Stop` で終了する（`control`。#3071）。
+///   受けられなければ bind せずに終了する
+/// - 段 1 の `--state-root`（絶対パス）と `--network` は、切り離し起動の 2 段でだけ受ける（単独の `--listen` では受けない）
+///
+/// 失敗は stderr に英語 1 行（code / message。ERR-1）を出して非ゼロで終了する。
 pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
     fn fail_line(code: &str, message: &str) {
         let _ = writeln!(io::stderr(), "error code={code} message={message}");
     }
     let mut listen: Option<DnsListenAddr> = None;
+    let mut nonce: Option<HelperNonce> = None;
+    let mut state_root: Option<std::path::PathBuf> = None;
+    let mut network: Option<crate::network::NetworkName> = None;
+    let mut mode = HelperMode::Plain;
     let mut args = args;
     while let Some(arg) = args.next() {
-        if arg != "--listen" || listen.is_some() {
+        if arg == "--listen" && listen.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| s.parse::<SocketAddrV4>().ok())
+                .and_then(|a| DnsListenAddr::new(*a.ip(), a.port()).ok());
+            match parsed {
+                Some(a) => listen = Some(a),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid listen address");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if arg == detach::ARG_NONCE && nonce.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| HelperNonce::new(&s).ok());
+            match parsed {
+                Some(n) => nonce = Some(n),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid nonce");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if arg == detach::ARG_STATE_ROOT && state_root.is_none() {
+            let parsed = args
+                .next()
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute());
+            match parsed {
+                Some(p) => state_root = Some(p),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid state root");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if arg == detach::ARG_NETWORK && network.is_none() {
+            let parsed = args
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| crate::network::NetworkName::new(&s).ok());
+            match parsed {
+                Some(n) => network = Some(n),
+                None => {
+                    fail_line("INVALID_ARGUMENT", "invalid network name");
+                    return ExitCode::from(2);
+                }
+            }
+        } else if mode == HelperMode::Plain && arg == detach::ARG_DETACH {
+            mode = HelperMode::Detach;
+        } else if mode == HelperMode::Plain && arg == detach::ARG_STAGE2 {
+            mode = HelperMode::Stage2;
+        } else {
             fail_line("INVALID_ARGUMENT", "unexpected or duplicate argument");
             return ExitCode::from(2);
-        }
-        let parsed = args
-            .next()
-            .and_then(|v| v.into_string().ok())
-            .and_then(|s| s.parse::<SocketAddrV4>().ok())
-            .and_then(|a| DnsListenAddr::new(*a.ip(), a.port()).ok());
-        match parsed {
-            Some(a) => listen = Some(a),
-            None => {
-                fail_line("INVALID_ARGUMENT", "invalid listen address");
-                return ExitCode::from(2);
-            }
         }
     }
     let Some(listen) = listen else {
         fail_line("INVALID_ARGUMENT", "missing --listen");
         return ExitCode::from(2);
     };
+    // nonce は切り離し起動の 2 段（段 1・段 2）でだけ受け、単独の `--listen` では受けない。
+    if (mode == HelperMode::Plain) != nonce.is_none() {
+        fail_line(
+            "INVALID_ARGUMENT",
+            "--nonce is required with, and only with, a detach mode",
+        );
+        return ExitCode::from(2);
+    }
+    // 状態ルートとネットワーク名も、切り離し起動の 2 段でだけ受け、2 つそろって渡されなければならない。
+    if (mode == HelperMode::Plain) == (state_root.is_some() || network.is_some())
+        || state_root.is_some() != network.is_some()
+    {
+        fail_line(
+            "INVALID_ARGUMENT",
+            "--state-root and --network are required with, and only with, a detach mode",
+        );
+        return ExitCode::from(2);
+    }
+    #[cfg(target_os = "linux")]
+    let mut control: Option<control::HelperControl> = None;
+    #[cfg(target_os = "linux")]
+    match (
+        mode,
+        nonce.as_ref(),
+        state_root.as_deref(),
+        network.as_ref(),
+    ) {
+        (HelperMode::Detach, Some(n), Some(root), Some(net)) => {
+            return match detach::run_stage1(listen, n, root, net) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    fail_line(e.code().as_str(), e.message());
+                    ExitCode::from(1)
+                }
+            };
+        }
+        (HelperMode::Stage2, Some(n), Some(root), Some(net)) => {
+            // ack を受けるまで bind しない（D14 (ii)。起動元が記録の前に死んでも孤児が残らない）。
+            if let Err(e) = detach::run_stage2_handshake(n) {
+                fail_line(e.code().as_str(), e.message());
+                return ExitCode::from(1);
+            }
+            // 制御 UDS の bind と最初の名前の読み込みも UDP の bind の前に済ませる（失敗したら READY を出さない）。
+            // gateway は待ち受けアドレスの IPv4（製品では gateway:53。`--dns` に gateway を指定したメンバーを飛ばす基準）。
+            let gateway = *listen.socket_addr().ip();
+            match control::prepare_helper_control(root, net, gateway) {
+                Ok(c) => control = Some(c),
+                Err(e) => {
+                    fail_line(e.code().as_str(), e.message());
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        _ => {}
+    }
+    #[cfg(not(target_os = "linux"))]
+    if mode != HelperMode::Plain {
+        fail_line("UNIMPLEMENTED", "detached start is supported only on Linux");
+        return ExitCode::from(1);
+    }
     let mut server = match DnsHelperServer::bind(listen) {
         Ok(s) => s,
         Err(e) => {
@@ -1109,17 +1269,25 @@ pub fn run_dns_helper_main(args: impl Iterator<Item = OsString>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut stdout = io::stdout();
-    if writeln!(stdout, "{READY_PREFIX}{}", server.local_addr())
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if write_stdout_line_atomic(&format!("{READY_PREFIX}{}", server.local_addr())).is_err() {
         fail_line("INTERNAL", "cannot write readiness line");
         return ExitCode::from(1);
     }
-    // 親が kill するまで動き続ける。正常終了（SIGTERM）は未実装（REPAIR-3）。
-    // プロセス外からの登録経路が未実装（REPAIR-3）の間は RegistryHandler に切り替えず NOTIMP を返す
-    // （空レジストリで名前解決を妨げない）。経路の接続は後続タスク（NET-5）。
+    // 切り離し起動（段 2）は制御 UDS と並行して動かし、`Reload` で読み直した名前を `RegistryHandler` で答える。
+    // `--dns` の上流の割り当ても読み直すが、転送は `SourceVerified` の製品での証明が無いため有効にしない（#3072）。
+    // `Stop` で正常終了する（#3071）。SIGTERM による正常終了は未実装（REPAIR-3）。
+    #[cfg(target_os = "linux")]
+    if let Some(c) = control {
+        return match c.serve(&mut server) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                fail_line(e.code().as_str(), e.message());
+                ExitCode::from(1)
+            }
+        };
+    }
+    // 単独の `--listen`（試験専用）は名前の経路を持たないので、従来どおり全クエリに NOTIMP を返す
+    // （空レジストリで名前解決を妨げない）。親が kill するまで動き続ける。
     let stop = AtomicBool::new(false);
     match server.serve(&NotImplementedHandler, &stop) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1137,7 +1305,7 @@ pub struct DnsHelperProcess {
     listen: SocketAddrV4,
 }
 
-fn check_timeout(t: Duration) -> Result<(), NetError> {
+pub(crate) fn check_timeout(t: Duration) -> Result<(), NetError> {
     if t.is_zero() || t > TIMEOUT_MAX {
         return Err(invalid(
             "timeout must be greater than 0 and at most 10 seconds",
@@ -1161,7 +1329,7 @@ fn kill_and_reap(child: &mut Child, timeout: Duration) -> bool {
 
 /// kill して期限内に回収し、できなければ回収権をバックグラウンドの回収スレッドへ移す（ゾンビを残さない）。
 /// 期限内に回収できたら true。kill 済みのため、回収スレッドの `wait` は子の終了後に必ず戻る。
-fn kill_reap_or_detach(mut child: Child, timeout: Duration) -> bool {
+pub(crate) fn kill_reap_or_detach(mut child: Child, timeout: Duration) -> bool {
     if kill_and_reap(&mut child, timeout) {
         return true;
     }
@@ -1244,9 +1412,66 @@ impl Drop for DnsHelperProcess {
     }
 }
 
-/// stdout から準備完了行を最大 [`READY_LINE_MAX`] バイト、改行まで読む。
-fn read_ready_line(mut out: impl io::Read) -> Result<String, &'static str> {
-    let mut line = Vec::with_capacity(READY_LINE_MAX);
+/// pipe への 1 回の `write(2)` が他の書き手と混ざらない上限（Linux の `PIPE_BUF`）。
+/// 切り離し起動では、段 1 の `SPAWN` 行・段 2 の識別行と準備完了行が同じ pipe に並行して書かれるため、
+/// 各行は改行込みでこの長さ以下の 1 回の書き込みにする（行の途中に別プロセスの出力が入らない。NET-5・REPAIR-2）。
+pub(crate) const PIPE_ATOMIC_MAX: usize = 4096;
+
+// 読み側の行の上限は、書き込みの原子性の上限（改行を含む）に収まる。
+const _: () = assert!(READY_LINE_MAX < PIPE_ATOMIC_MAX);
+
+/// `bytes` を 1 回の `write` で送る。`PIPE_ATOMIC_MAX` 超は書かずに `InvalidInput`、短い書き込みは
+/// `WriteFailed` 扱いの `Other`（`write_all` のように続きを別の write で送ると他の書き手と混ざるため）。
+/// `Interrupted`（何も書いていない）だけ再試行する。
+pub(crate) fn write_atomic(w: &mut impl io::Write, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > PIPE_ATOMIC_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message length is outside the atomic pipe write range",
+        ));
+    }
+    loop {
+        match w.write(bytes) {
+            Ok(n) if n == bytes.len() => return Ok(()),
+            Ok(_) => return Err(io::Error::other("short write")),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `line` に改行を付けた 1 件を [`write_atomic`] で送る。
+pub(crate) fn write_line_atomic(w: &mut impl io::Write, line: &str) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    write_atomic(w, &buf)
+}
+
+/// 標準出力へ 1 行を単一の `write(2)` で送る。Unix では fd 1 を複製した `File` へ直接書く
+/// （`Stdout` の行バッファ経由だと分割されうるため）。
+pub(crate) fn write_stdout_line_atomic(line: &str) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd as _;
+        let mut f = std::fs::File::from(io::stdout().as_fd().try_clone_to_owned()?);
+        write_line_atomic(&mut f, line)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut out = io::stdout();
+        write_line_atomic(&mut out, line)?;
+        out.flush()
+    }
+}
+
+/// stdout から 1 行を最大 `max` バイト、改行まで読む（バッファリングしない読み出しで、続く行を食べない）。
+/// 切り離し起動（[`detach`]）は識別行と準備完了行を同じ pipe から順に読むため、共通化している。
+pub(crate) fn read_line_limited(
+    mut out: impl io::Read,
+    max: usize,
+) -> Result<String, &'static str> {
+    let mut line = Vec::with_capacity(max);
     let mut byte = [0u8; 1];
     loop {
         match out.read(&mut byte) {
@@ -1256,14 +1481,19 @@ fn read_ready_line(mut out: impl io::Read) -> Result<String, &'static str> {
         }
         match byte.first().copied() {
             Some(b'\n') => break,
-            Some(b) if line.len() < READY_LINE_MAX => line.push(b),
+            Some(b) if line.len() < max => line.push(b),
             _ => return Err("readiness line too long"),
         }
     }
     String::from_utf8(line).map_err(|_| "readiness line is not UTF-8")
 }
 
-fn parse_ready(line: &str, want: SocketAddrV4) -> Result<SocketAddrV4, NetError> {
+/// stdout から準備完了行を最大 [`READY_LINE_MAX`] バイト、改行まで読む。
+fn read_ready_line(out: impl io::Read) -> Result<String, &'static str> {
+    read_line_limited(out, READY_LINE_MAX)
+}
+
+pub(crate) fn parse_ready(line: &str, want: SocketAddrV4) -> Result<SocketAddrV4, NetError> {
     let bad = || NetError::new(NetErrorCode::FailedPrecondition, "malformed readiness line");
     let addr: SocketAddrV4 = line
         .strip_prefix(READY_PREFIX)
@@ -1818,6 +2048,27 @@ mod tests {
         assert_eq!(answer(&h, &pkt).get(3), Some(&5));
     }
 
+    /// NET-5・#3071: `replace_all` は一括で差し替え、消えた名前は引けなくなる。上限超過は何も変えず拒否する。
+    #[test]
+    fn net5_3071_replace_all_swaps_and_bounds() {
+        let reg = DnsRegistry::new();
+        let web = DnsName::new("web").expect("web");
+        let db = DnsName::new("db").expect("db");
+        reg.replace_all(&[(web.clone(), Ipv4Addr::new(10, 1, 0, 2))])
+            .expect("first");
+        assert_eq!(reg.lookup("web"), Some(Ipv4Addr::new(10, 1, 0, 2)));
+        reg.replace_all(&[(db, Ipv4Addr::new(10, 1, 0, 3))])
+            .expect("second");
+        assert_eq!(reg.lookup("web"), None);
+        assert_eq!(reg.lookup("db"), Some(Ipv4Addr::new(10, 1, 0, 3)));
+        let too_many: Vec<(DnsName, Ipv4Addr)> = (0..=MAX_REGISTRY_ENTRIES)
+            .map(|i| (web.clone(), Ipv4Addr::from(u32::try_from(i).unwrap_or(0))))
+            .collect();
+        let e = reg.replace_all(&too_many).expect_err("full");
+        assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(reg.len(), 1, "unchanged after a rejected replace");
+    }
+
     /// 固定長の応答を返すハンドラ（`serve` の増幅ガード境界の検証用）。
     struct FixedLenHandler(usize);
 
@@ -1889,5 +2140,67 @@ mod tests {
             assert_eq!(got[1].get(3), Some(&5));
         });
         assert_eq!(server.stats().answered, 2);
+    }
+
+    /// 書き込みごとに受け付ける長さを制限する書き手 (短い書き込みの模擬)。
+    struct Limited {
+        max: usize,
+        calls: usize,
+        got: Vec<u8>,
+    }
+    impl io::Write for Limited {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let n = b.len().min(self.max);
+            self.got.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// NET-5・REPAIR-2: 1 行は改行込みの 1 回の write で送る。
+    #[test]
+    fn net5_3070_write_line_atomic_single_write() {
+        let mut w = Limited {
+            max: usize::MAX,
+            calls: 0,
+            got: Vec::new(),
+        };
+        write_line_atomic(&mut w, "READY 127.0.0.1:53").expect("write");
+        assert_eq!(w.calls, 1);
+        assert_eq!(w.got, b"READY 127.0.0.1:53\n");
+    }
+
+    /// 短い書き込みは続きを送らず失敗にする (他の書き手と混ざらない)。
+    #[test]
+    fn net5_3070_write_line_atomic_short_write_fails() {
+        let mut w = Limited {
+            max: 5,
+            calls: 0,
+            got: Vec::new(),
+        };
+        let e = write_line_atomic(&mut w, "READY 127.0.0.1:53").expect_err("short");
+        assert_eq!(e.to_string(), "short write");
+        assert_eq!(w.calls, 1);
+        assert_eq!(w.got, b"READY");
+    }
+
+    /// PIPE_BUF 以下までは書け、超えると何も書かずに InvalidInput。
+    #[test]
+    fn net5_3070_write_atomic_length_bounds() {
+        let mut w = Limited {
+            max: usize::MAX,
+            calls: 0,
+            got: Vec::new(),
+        };
+        write_atomic(&mut w, &vec![b'a'; PIPE_ATOMIC_MAX]).expect("max");
+        assert_eq!(w.got.len(), 4096);
+        let e = write_atomic(&mut w, &vec![b'a'; PIPE_ATOMIC_MAX + 1]).expect_err("over");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = write_atomic(&mut w, &[]).expect_err("empty");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.calls, 1);
     }
 }

@@ -153,9 +153,10 @@ mod exec_join;
 mod exec_kill;
 mod recorded_scope;
 pub(crate) use exec_join::{ExecJoinFds, contains_pid, open_cgroup_by_path};
+pub use exec_kill::EXEC_SWEEP_DELETE_TIMEOUT;
 pub(crate) use exec_kill::{
-    EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
-    remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
+    ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode, remove_exec_child_cgroup_at,
+    sweep_exec_children_at, validate_exec_child_name,
 };
 pub use recorded_scope::{
     RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
@@ -2050,21 +2051,19 @@ mod tests {
     }
 
     /// 一時ディレクトリ（std のみ）。drop で削除する。
-    struct TmpDir(std::path::PathBuf);
+    ///
+    /// pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    struct TmpDir(
+        std::path::PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new(label: &str) -> Self {
-            let p =
-                std::env::temp_dir().join(format!("fandhe-cgjoin-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let (scratch, p) =
+                crate::test_support::scratch_child(&format!("fandhe-cgjoin-{label}"), "d");
+            Self(p, scratch)
         }
     }
 
@@ -2208,7 +2207,11 @@ mod tests {
     ))]
     #[test]
     fn core3_task32_1_lookup_under_removed_dir_is_enoent() {
-        let base = std::env::temp_dir().join(format!("fc-cgroups-rm-{}", std::process::id()));
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fc-cgroups-rm",
+            std::time::Duration::from_secs(10),
+        );
+        let base = scratch.path().to_path_buf();
         std::fs::create_dir_all(base.join("child")).unwrap();
         std::fs::write(base.join("child").join("cgroup.events"), b"populated 0\n").unwrap();
         let parent = File::open(&base).unwrap();
@@ -2221,7 +2224,6 @@ mod tests {
         let err = sys::open_read_at(held.as_fd(), &events).unwrap_err();
         assert_eq!(err, SysError::Os(sys::ENOENT));
         assert!(removal_confirmed(&err));
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// CORE-3・TASK-32.1: errno から `ErrorCode` への写像。

@@ -26,7 +26,7 @@
 //!   （`run_isolated`）・`open_checked`・代替経路が Linux 専用のため、検証が常に返す `unsupported` の拒否の記録は
 //!   `SinkFailed` のまま。Windows は `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査が未実装）
 //!   で記録先を作れない。どちらも残りの実装待ち（SEC-4）
-//! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
+//! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
 //!
 //! # `container_id` を付けない理由（R4）
 //!
@@ -58,6 +58,7 @@ impl PluginTrustErrorKind {
         match self {
             PluginTrustErrorKind::UntrustedOwner => "untrusted_owner",
             PluginTrustErrorKind::GroupOrOtherWritable => "group_or_other_writable",
+            PluginTrustErrorKind::ExtendedAcl => "extended_acl",
             PluginTrustErrorKind::NotRegularFile => "not_regular_file",
             PluginTrustErrorKind::NotDirectory => "not_directory",
             PluginTrustErrorKind::InvalidPath => "invalid_path",
@@ -79,6 +80,7 @@ impl PluginTrustErrorKind {
                 "plugin owner is neither root nor the effective user"
             }
             PluginTrustErrorKind::GroupOrOtherWritable => "plugin is writable by group or other",
+            PluginTrustErrorKind::ExtendedAcl => "plugin path has an extended ACL",
             PluginTrustErrorKind::NotRegularFile => "plugin is not a regular file",
             PluginTrustErrorKind::NotDirectory => {
                 "plugin directory is not a directory or is a symlink"
@@ -104,6 +106,7 @@ impl PluginTrustErrorKind {
         match self {
             PluginTrustErrorKind::UntrustedOwner
             | PluginTrustErrorKind::GroupOrOtherWritable
+            | PluginTrustErrorKind::ExtendedAcl
             | PluginTrustErrorKind::HashMismatch => ErrorCode::PermissionDenied,
             PluginTrustErrorKind::NotRegularFile
             | PluginTrustErrorKind::NotDirectory
@@ -240,9 +243,10 @@ mod tests {
     use crate::traits::TraitError;
     use std::path::Path;
 
-    const ALL: [PluginTrustErrorKind; 11] = [
+    const ALL: [PluginTrustErrorKind; 12] = [
         PluginTrustErrorKind::UntrustedOwner,
         PluginTrustErrorKind::GroupOrOtherWritable,
+        PluginTrustErrorKind::ExtendedAcl,
         PluginTrustErrorKind::NotRegularFile,
         PluginTrustErrorKind::NotDirectory,
         PluginTrustErrorKind::InvalidPath,
@@ -271,7 +275,7 @@ mod tests {
             );
             assert!(seen.insert(r), "duplicate reason {r}");
         }
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 12);
     }
 
     /// 受入基準 B: message は英語 ASCII で、パスを含まない。代表 3 種は具体値で照合する。
@@ -294,6 +298,15 @@ mod tests {
             PluginTrustErrorKind::HashMismatch.message(),
             "plugin sha256 digest is not in the allowed hash list"
         );
+    }
+
+    /// macOS の拡張 ACL 拒否（#1865・PLUG-11・#1539）の reason / message / code を具体値で固定する。
+    #[test]
+    fn plug11_1865_extended_acl_reason_message_code() {
+        let e = err(PluginTrustErrorKind::ExtendedAcl, "/x");
+        assert_eq!(PluginTrustErrorKind::ExtendedAcl.as_str(), "extended_acl");
+        assert_eq!(e.message(), "plugin path has an extended ACL");
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
     }
 
     /// code は既存の TraitError 変換と全 kind で一致する（写像の不変）。

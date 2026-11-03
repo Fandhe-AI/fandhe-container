@@ -3,18 +3,21 @@
 //! # 役割と呼び出し文脈
 //!
 //! `crate::exec` の最小実行フロー第 5 段。namespace 分離済み（`isolate` /
-//! `isolate_rootful_host_root` の後）の親から [`spawn_container`] で子を fork し、子（新しい PID
-//! namespace の PID 1）が次を順に行う。呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と
-//! supervisor（TASK-157）を想定する。
+//! `isolate_rootful_host_root` の後）の親から `spawn_container` で子を fork し、子（新しい PID
+//! namespace の PID 1）が次を順に行う。製品コードの呼び出し元は本番 launcher
+//! （`ProductionLauncher`）の `spawn_container_via_intermediate` で、最小入口 `spawn_container` は結合試験だけが呼ぶ（#2700）ため、
+//! `exec-test-support` の背後へ移した（#2762）。stdout / stderr のパイプ接続は `spawn_container_via_intermediate` だけが行う。
 //!
 //! ```text
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
 //!   子: MountIsolation::establish()
 //!       -> prepare_rootfs(&isolation, rootfs)
-//!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
+//!       -> (apply_sysctls)  // `linux.sysctl` の指定時のみ。verify_pinned の直後・mount_sysfs の前（CRI-2・CORE-3・#2670）
+//!       -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_etc_files -> mount_binds)   // 起動設定 `setup` の指定時のみ（bind mount は `binds` の指定時のみ。#1914）
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
+//!       -> make_root_read_only(&report)                // `root.readonly=true` のときだけ（pivot 直後。CORE-5・SEC-1・#2767）
 //!       -> enter_working_dir(&report, &cwd)            // process.cwd が `/` 以外のときだけ（pivot 直後・ステージ列の前。OCI-1・TASK-29）
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
@@ -55,17 +58,18 @@
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
-//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch への適用の追跡は #2687）。
+//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch に適用しない判断は `docs/design/launch-sealed-copy.md`・#2687）。
 //!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
-//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない）
+//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない。配線しない判断は #2700）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
 //! - **子の失敗の通知は終了コードと stderr**: 段の失敗は stderr に英語 1 行を出し、
 //!   [`EXIT_SETUP_FAILED`]（125: exec 前までの失敗・子の panic）・[`EXIT_EXEC_NOT_EXECUTABLE`]
 //!   （126: exec の失敗のうち不在以外）・[`EXIT_EXEC_NOT_FOUND`]（127: エントリポイント不在）で
-//!   分類する（docker / runc の慣例）。親子間の同期・構造化エラーパイプ（子の [`ExecError`] を構造の
-//!   まま親へ返す）は未実装で、TASK-29/30（OCI `create` / `start` の分離）で扱う
+//!   分類する（docker / runc の慣例）。稼働中コンテナへの exec の子は、失敗した手順の段（[`ExecChildStep`]）・ERR-1 コード・
+//!   違反の理由を状態 pipe の 1 行で親へ返す（#2822）。launch の PID 1 は `launch_status.rs` の `F`/`E`/`X` で返す。
+//!   子の [`ExecError`] の自由文メッセージ（パス・errno 文字列を含み得る）は untrusted 扱いのため運ばない
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: [`ContainerChild::wait_timeout`] のみを
 //!   提供する。`Drop` では kill / wait しない（コンテナの寿命を親ハンドルに暗黙で縛らない）ため、
 //!   回収の責任は呼び出し元にある
@@ -85,9 +89,11 @@
 //!   （`reapply_restrictions`）とも同じ関数が空にする（`setgroups(0)`。`exec/capabilities.rs` の
 //!   `SupplementaryGroups`）。本モジュールの子の手順は資格情報を変更しない（uid / gid は呼び出しプロセスのもの）
 //! - **`execve` 前の失敗を親へ知らせる**（REPAIR-3・TASK-163 追補・#1460）: 稼働中コンテナへの exec の子は、
-//!   close-on-exec の pipe で「手順を終えた」「失敗した（終了コードと違反の理由）」を親へ返し、親は
-//!   「コマンドが起動して終了した」のか「起動していない」のかを [`ExecExit`] で区別する（終了コード 125〜127 は
-//!   コマンド自身も返し得るため）。launch 経路は従来どおり終了コードと stderr のみ（下記）
+//!   close-on-exec の pipe で「手順を終えた」「失敗した（終了コード・ERR-1 コード・違反の理由）」を親へ返し、
+//!   親は「コマンドが起動して終了した」のか「起動していない」のかを [`ExecExit`] で区別する（終了コード
+//!   125〜127 はコマンド自身も返し得るため）。`R` の後の `execveat` の失敗も同じ形式の失敗の行で返り、
+//!   ERR-1 コードは launch の `X <CODE>` と同じ errno の写像になる（#2763）。launch 経路の状態 pipe は
+//!   `launch_status.rs`（`R` / `X`）
 //!
 //! # 単体テストの安全策
 //!
@@ -115,8 +121,8 @@ use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{
-    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
-    report_ready,
+    ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
+    report_exec_returned, report_failure, report_mount_identities, report_ready,
 };
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
@@ -125,10 +131,12 @@ use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
 use super::stages::{LaunchNotReady, LaunchReady};
+use super::sysctls::{self, SysctlPlan};
 use super::{
-    DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir, fd_mount_id,
-    inject_files, mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
+    DeviceReport, DevptsGidSource, EtcFileMounts, ExecError, IsolationStage, MountIsolation,
+    PivotReport, StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir,
+    fd_mount_id, inject_files, mount_etc_files, mount_sysfs, mount_tmpfs, pivot_root,
+    prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
@@ -336,6 +344,15 @@ impl Entrypoint {
     pub fn path(&self) -> &Path {
         Path::new(OsStr::from_bytes(self.path.to_bytes()))
     }
+
+    /// 渡した env を `KEY=VALUE` の文字列で返す(試験専用。launcher が env の上書きを重ねた結果の照合に使う。#2713)。
+    #[cfg(test)]
+    pub(crate) fn env_for_test(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .map(|e| e.to_string_lossy().into_owned())
+            .collect()
+    }
 }
 
 /// 1 要素を検証して `CString` にする。`total` に NUL 込みのバイト数を加算する。
@@ -479,7 +496,7 @@ pub fn exec_entrypoint(
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。稼働中コンテナへの exec の子〔`EntrypointSource::Switchable`〕
 ///    は、封印した複製を使える環境なら照合した本体を封印した memfd に複製し〔`sealed_copy.rs`。#1531〕、以降の解析・照合・
 ///    実行を複製に対して行う〔使えない環境は現行方式で、理由を記録する。オーナー判断 2026-10-09〕。
-///    launch は複製しない〔常駐メモリの設計判断。追跡は #2687〕。ランタイム自身の封印複製の追跡は #2686）。シェバンの連鎖・
+///    launch は複製しない〔適用しない判断。`docs/design/launch-sealed-copy.md`・#2687〕。ランタイム自身の封印複製の判断記録は `docs/design/runtime-self-sealed-copy.md`〔#2686〕）。シェバンの連鎖・
 ///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
@@ -529,10 +546,10 @@ fn verify_pivot_root(pivot_mnt_id: u64) -> Result<(), ExecError> {
 /// launch の PID 1 の終端（`run_child`）。[`exec_entrypoint_verified_with`] の手順に、状態 pipe `status` への
 /// 2 行目の報告を足したもの（SEC-4・#2624。ワイヤー形式は `launch_status` の「exec 前の 2 行目」）。
 ///
-/// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <CODE> <reason|->` を書いて失敗を返し、全手順が
+/// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <step> <CODE> <reason|->`（`step` は失敗した手順の固定語彙。#2895）を書いて失敗を返し、全手順が
 /// 通ったら `R` を書いてから `execveat` する（`R` を書けなければ `execveat` へ進まない。fail-closed）。`R` の後の
-/// `execveat` 自体の失敗は何も書かない（親が `R` を読んだ後に `E` が混ざらないようにするため。errno 由来で、
-/// PID 1 の終了として観測される）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
+/// `execveat` 自体が errno で失敗したら `X <CODE>`（errno の分類のみ）を書く（`E` は混ぜない。親は `R` の後も
+/// EOF まで読み、`X` を起動失敗として扱う。#2716）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
 /// （close-on-exec）。`status` が `None` なら [`exec_entrypoint_verified_with`] と同じ（何も書かない）。
 fn exec_entrypoint_verified_reporting(
     pivot_mnt_id: u64,
@@ -543,30 +560,44 @@ fn exec_entrypoint_verified_reporting(
     let Some(status) = status else {
         return exec_entrypoint_verified_with(pivot_mnt_id, entry, nulling);
     };
-    let prepared = verify_pivot_root(pivot_mnt_id).and_then(|()| {
-        prepare_exec_child(
-            entry,
-            Some(status.as_fd()),
-            EntrypointSource::Pinned,
-            None,
-            nulling,
-        )
-    });
+    // 失敗した手順を `E <step> ...` の段として運ぶ（#2895）。`prepare_exec_child` の段は共有語彙のまま写す。
+    let prepared = verify_pivot_root(pivot_mnt_id)
+        .map_err(|e| (ExecPhaseStep::VerifyRoot, Box::new(e)))
+        .and_then(|()| {
+            prepare_exec_child(
+                entry,
+                Some(status.as_fd()),
+                EntrypointSource::Pinned,
+                None,
+                nulling,
+            )
+            .map_err(|f| (ExecPhaseStep::Child(f.step), f.error))
+        });
     match prepared {
-        Err(err) => {
-            report_exec_failure_best_effort(status, &err);
-            Err(err)
+        Err((step, err)) => {
+            report_exec_failure_best_effort(status, step, &err);
+            Err(*err)
         }
         Ok(exe) => {
             report_exec_ready(status)?;
-            Err(execve_checked(entry, &exe))
+            let err = execve_checked(entry, &exe);
+            // `execveat` が戻った（errno 由来の失敗）。親は `R` の後も EOF まで読むため、分類だけを `X` で伝える
+            // （#2716）。書けなくても元のエラーを返す（親は EOF を成功と取り違える窓があるが、書けない状況は
+            // pipe の破損のみで、PID 1 はこの後すぐ終了する）。
+            if report_exec_returned(status, err.code).is_err() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fandhe-container: the execveat failure could not be reported"
+                );
+            }
+            Err(err)
         }
     }
 }
 
 /// `execveat` 前の失敗を状態 pipe へ書く。書けなくても元のエラーを返す（親は EOF を起動失敗として扱う）。
-fn report_exec_failure_best_effort(status: &std::fs::File, err: &ExecError) {
-    if report_exec_failure(status, err).is_err() {
+fn report_exec_failure_best_effort(status: &std::fs::File, step: ExecPhaseStep, err: &ExecError) {
+    if report_exec_failure(status, step, err).is_err() {
         let _ = writeln!(
             std::io::stderr(),
             "fandhe-container: the exec phase status could not be reported"
@@ -582,17 +613,25 @@ fn exec_checked_entrypoint(
     entry: &Entrypoint,
     nulling: StdioNulling,
 ) -> Result<Infallible, ExecError> {
-    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None, nulling)?;
+    let exe = prepare_exec_child(entry, None, EntrypointSource::Pinned, None, nulling)
+        .map_err(|f| *f.error)?;
     Err(execve_checked(entry, &exe))
 }
 
 /// 検査済みの fd を `execveat` する。成功すると戻らず、戻ったら失敗（errno を `Exec` 段のエラーへ写す）。
 fn execve_checked(entry: &Entrypoint, exe: &ExecutableFd) -> ExecError {
-    let err = do_execve(entry, exe);
+    execve_error(entry.path(), do_execve(entry, exe))
+}
+
+/// `execveat` が戻した errno を `Exec` 段のエラーへ写す（純関数。分類は [`exec_errno_to_code`]）。
+///
+/// launch の `X <CODE>` と稼働中コンテナへの exec の失敗行（[`exec_failure_line`]）が、同じ写像で
+/// `R` の後の失敗を分類するための 1 か所（SEC-4・CORE-5・SUP-6。#2763）。
+fn execve_error(path: &Path, err: SysError) -> ExecError {
     ExecError::new(
         exec_errno_to_code(err),
         IsolationStage::Exec,
-        format!("execve({:?}) failed: {}", entry.path(), describe(err)),
+        format!("execve({:?}) failed: {}", path, describe(err)),
     )
 }
 
@@ -612,30 +651,36 @@ fn prepare_exec_child(
     source: EntrypointSource,
     deferred_fsize: Option<Rlimit>,
     nulling: StdioNulling,
-) -> Result<ExecutableFd, ExecError> {
+) -> Result<ExecutableFd, ExecChildFailure> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     // 継承したホスト側の fd 3 以上を開く前に閉じる（rootfs 内の /proc/self/fd/N 経由で実体を開かれない）。
-    close_inherited_fds(keep)?;
+    close_inherited_fds(keep).map_err(at(ExecChildStep::CloseFds))?;
     // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
-    detach_session()?;
+    detach_session().map_err(at(ExecChildStep::Setsid))?;
     // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
     // 子の cwd も同じディレクトリ）と、その procfs。ランタイムの同一性の基準・固定した fd の開き直しの起点にする。
     // どちらも標準入出力の置換まで保持するため、番号を 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると
     // `openat` はその番号を返し、置換（`dup2`）した `/dev/null` を、この関数の終わりの close が閉じてしまう）。
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))
-        .and_then(keep_above_stdio)?;
-    let procfs = open_root_procfs(root.as_fd()).and_then(keep_above_stdio)?;
+        .and_then(keep_above_stdio)
+        .map_err(at(ExecChildStep::OpenRoot))?;
+    let procfs = open_root_procfs(root.as_fd())
+        .and_then(keep_above_stdio)
+        .map_err(at(ExecChildStep::OpenRoot))?;
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     // 種別（通常ファイル・標準入出力と別の実体）は開く前に確かめる（`setsid` の後は、端末を開くと制御端末に
     // なるため。#1456）。
-    let (file, meta, resolved) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())?;
-    let runtime = runtime_identity(procfs.as_fd())?;
+    let (file, meta, resolved) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())
+        .map_err(at(ExecChildStep::OpenEntrypoint))?;
+    let runtime = runtime_identity(procfs.as_fd()).map_err(at(ExecChildStep::RuntimeIdentity))?;
     if (meta.dev(), meta.ino()) == runtime {
-        return Err(ExecError::from_violation_at(
-            ViolationReason::EntrypointIsRuntimeBinary,
-            Some(resolved.as_path()),
-            STAGE,
+        return Err(at(ExecChildStep::RuntimeIdentity)(
+            ExecError::from_violation_at(
+                ViolationReason::EntrypointIsRuntimeBinary,
+                Some(resolved.as_path()),
+                STAGE,
+            ),
         ));
     }
     // 稼働中コンテナへの exec は、判定した方式（`SealPolicy::mode`。オーナー判断 2026-10-09「条件付き切り替え」。
@@ -648,13 +693,9 @@ fn prepare_exec_child(
         EntrypointSource::Pinned => (ExecutableFd::Pinned(file), meta),
         EntrypointSource::Switchable(policy) => match policy.mode() {
             EntrypointExecMode::SealedCopy => {
-                let copy = seal_entrypoint_copy(
-                    &file,
-                    &meta,
-                    procfs.as_fd(),
-                    resolved.as_path(),
-                    &policy,
-                )?;
+                let copy =
+                    seal_entrypoint_copy(&file, &meta, procfs.as_fd(), resolved.as_path(), &policy)
+                        .map_err(at(ExecChildStep::SelectExecutable))?;
                 drop(file);
                 let meta = copy.metadata().clone();
                 (ExecutableFd::Sealed(copy), meta)
@@ -663,7 +704,8 @@ fn prepare_exec_child(
             // 直後の `execveat` が同じ fd・同じ domain で同じ検査（`noexec`・`MAY_EXEC`・Landlock・LSM）を必ず行うため、
             // 事前判定は保証を増やさず、AppArmor 等の拒否の監査イベントを二重にするだけになる。
             EntrypointExecMode::PinnedInode { .. } => {
-                check_not_on_noexec_mount(&file, resolved.as_path())?;
+                check_not_on_noexec_mount(&file, resolved.as_path())
+                    .map_err(at(ExecChildStep::SelectExecutable))?;
                 (ExecutableFd::Pinned(file), meta)
             }
         },
@@ -674,35 +716,39 @@ fn prepare_exec_child(
     // メモリ制限は維持される。capability 削減後でも、rlimit を下げる `prlimit` は特権を要さない。
     if let Some(fsize) = deferred_fsize {
         let set = Rlimits::new(vec![fsize]).map_err(|_| {
-            ExecError::new(
+            at(ExecChildStep::DeferredRlimit)(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Rlimits,
                 "failed to build the deferred RLIMIT_FSIZE",
-            )
+            ))
         })?;
-        apply_rlimits(&set)?;
+        apply_rlimits(&set).map_err(at(ExecChildStep::DeferredRlimit))?;
     }
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
-    reject_runtime_interpreter(file, resolved.as_path(), runtime, procfs.as_fd())?;
+    reject_runtime_interpreter(file, resolved.as_path(), runtime, procfs.as_fd())
+        .map_err(at(ExecChildStep::Interpreter))?;
     // シェバン付きスクリプトは fd が CLOEXEC だと execveat が ENOENT になるため、その場合だけ
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
     let is_script = matches!(file.read_at(&mut magic, 0), Ok(2)) && &magic == b"#!";
     if is_script {
         // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
-        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, &resolved)?;
+        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, &resolved)
+            .map_err(at(ExecChildStep::ScriptFd))?;
     }
 
-    mark_fds_cloexec()?;
-    reset_sigpipe(!nulling.stdout || !nulling.stderr)?;
+    mark_fds_cloexec().map_err(at(ExecChildStep::PrepareFds))?;
+    reset_sigpipe(!nulling.stdout || !nulling.stderr).map_err(at(ExecChildStep::PrepareFds))?;
     if is_script {
         sys::set_cloexec(file.as_fd(), false)
-            .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))?;
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))
+            .map_err(at(ExecChildStep::PrepareFds))?;
     }
     // 最後に標準入出力を置換する（以降の execve 失敗の診断は stderr へ出せず、終了コードのみで通知）。
     // stdout / stderr をログ用パイプへ付け替え済みの番号は置換しない（`nulling` が外す。#1471）。
-    redirect_stdio_to_null(root.as_fd(), procfs.as_fd(), nulling)?;
+    redirect_stdio_to_null(root.as_fd(), procfs.as_fd(), nulling)
+        .map_err(at(ExecChildStep::StdioNull))?;
     Ok(exe)
 }
 
@@ -732,7 +778,7 @@ impl ExecutableFd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntrypointSource {
     /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
-    /// 封印した複製の適用は未着手で、追跡は #2687）。
+    /// 封印した複製は適用しない判断で、理由は `docs/design/launch-sealed-copy.md`・#2687）。
     Pinned,
     /// 稼働中コンテナへの exec。値（`prepare_exec_restrictions` が `setns` の前に作る判定。#1531）の方式に従い、
     /// 封印した memfd に複製して `execveat` するか、照合した元の fd をそのまま `execveat` する（現行方式。#1478）。
@@ -1315,6 +1361,167 @@ fn do_execve(entry: &Entrypoint, _exe: &ExecutableFd) -> SysError {
     SysError::Os(sys::EINTR)
 }
 
+/// 稼働中コンテナへの exec の子が `execveat` までに通る手順の段（失敗の行で親へ返す固定語彙。
+/// SUP-6・REPAIR-3・REPAIR-4・SEC-4・CORE-5。#2822）。
+///
+/// [`IsolationStage`] は子の手順のほぼすべてが `Exec` で区別がつかないため、子の中の手順を 1 対 1 で表す。
+/// 形は `launch_status::PrePivotStep` と同じ（`ALL`・snake_case のトークン・`ALL` を走査する `from_token`）。
+/// 子は untrusted 扱いなので、運ぶのはこのトークンだけで、親は `from_token` で静的な値に引き直す
+/// （未知・長すぎるトークンは `SetupFailed { step: None }`）。メッセージは子の `ExecError.message`
+/// （コンテナ内の解決後パス・errno 文字列を含み得る）を運ばず、親が [`ExecChildStep::message`] で固定の英文を引く。
+///
+/// # launch の状態 pipe（`launch_status.rs` の `F <step>`・`E`・`X`）との対応
+///
+/// | exec の段 | launch での対応 |
+/// | --------- | --------------- |
+/// | `parent_lifetime` | 対応なし（launch の PID 1 は親死亡シグナルで縛らない） |
+/// | `cgroup_join` | 対応なし（launch の cgroup 参加は `StagePipeline` の段で、状態 pipe の対象外） |
+/// | `close_fds` から `stdio_null` | 同じ `prepare_exec_child` の手順。launch では `E <step> <CODE> <reason>` の行で同じトークンを運ぶ（#2895。`deferred_rlimit` は launch が持ち越しの `RLIMIT_FSIZE` を持たないため実際には届かない） |
+/// | `report_ready` | `R` を書けない場合（専用の行は無い。書けなければ `execveat` へ進まない） |
+/// | `execveat` | `X <CODE>`（`R` の後だけ。errno の写像は同じ `exec_errno_to_code`） |
+///
+/// launch の `F <step>`（`PrePivotStep` の 14 段）に対応する exec の段は無い（exec は pivot しない）。
+/// worker 側の段（`SetNs`・`CgroupJoin`・`Rlimits`・`CapabilityDrop`・`NoNewPrivs`・`Landlock`・`Seccomp`。fork の前）の
+/// 失敗は supervisor の `err` 行の `TraitError`（`exec stage {:?}: <message>`）で届き、`SetupFailed` には載らない。
+/// launch の `E` 行は、この語彙のうち上表の `close_fds` から `stdio_null` の 11 段だけを受け（それ以外は親が
+/// `Malformed` にする）、加えて launch だけの段 `verify_caller`・`restriction_evidence`・`verify_root` を運ぶ
+/// （`launch_status::ExecPhaseStep`。#2895）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecChildStep {
+    /// 親の生存への結び付け（親死亡シグナルと pidfd の確認。`exec_command::bind_to_parent_lifetime`）。
+    ParentLifetime,
+    /// exec 用の子 cgroup への参加（`exec_command::join_exec_cgroup`）。
+    CgroupJoin,
+    /// 継承した fd 3 以上の close（`close_range`）。
+    CloseFds,
+    /// セッション・制御端末の切り離し（`setsid`）。
+    Setsid,
+    /// 照合済みの `/` と procfs を開く手順。
+    OpenRoot,
+    /// エントリポイントを開いて種別を確かめる手順。
+    OpenEntrypoint,
+    /// ランタイム自身のバイナリとの同一性の照合。
+    RuntimeIdentity,
+    /// 実行に使う fd の選択（封印した複製の作成・`noexec` マウントの判定）。
+    SelectExecutable,
+    /// 持ち越した `RLIMIT_FSIZE` の適用。
+    DeferredRlimit,
+    /// シェバン・`PT_INTERP` の解決先の照合。
+    Interpreter,
+    /// シェバン付きスクリプトの `/dev/fd/N` の照合。
+    ScriptFd,
+    /// 継承 fd の close-on-exec 化・`SIGPIPE` の復元・スクリプトの fd の継承設定。
+    PrepareFds,
+    /// 標準入出力の `/dev/null` への置換。
+    StdioNull,
+    /// 準備完了の報告（`R`）の書き込み。
+    ReportReady,
+    /// `execveat` 自体（`R` の後だけ）。
+    Execveat,
+}
+
+impl ExecChildStep {
+    /// 全段（子の実行順）。
+    pub const ALL: [Self; 15] = [
+        Self::ParentLifetime,
+        Self::CgroupJoin,
+        Self::CloseFds,
+        Self::Setsid,
+        Self::OpenRoot,
+        Self::OpenEntrypoint,
+        Self::RuntimeIdentity,
+        Self::SelectExecutable,
+        Self::DeferredRlimit,
+        Self::Interpreter,
+        Self::ScriptFd,
+        Self::PrepareFds,
+        Self::StdioNull,
+        Self::ReportReady,
+        Self::Execveat,
+    ];
+
+    /// ワイヤー上のトークン（snake_case の ASCII。`PrePivotStep` のトークンと重ならない）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentLifetime => "parent_lifetime",
+            Self::CgroupJoin => "cgroup_join",
+            Self::CloseFds => "close_fds",
+            Self::Setsid => "setsid",
+            Self::OpenRoot => "open_root",
+            Self::OpenEntrypoint => "open_entrypoint",
+            Self::RuntimeIdentity => "runtime_identity",
+            Self::SelectExecutable => "select_executable",
+            Self::DeferredRlimit => "deferred_rlimit",
+            Self::Interpreter => "interpreter",
+            Self::ScriptFd => "script_fd",
+            Self::PrepareFds => "prepare_fds",
+            Self::StdioNull => "stdio_null",
+            Self::ReportReady => "report_ready",
+            Self::Execveat => "execveat",
+        }
+    }
+
+    /// トークンから静的な値へ引き直す（`ALL` の走査。未知のトークンは `None`）。
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == token)
+    }
+
+    /// 対応する [`IsolationStage`]（監査・ログで既存の段の語彙に写すとき用）。
+    pub fn stage(self) -> IsolationStage {
+        match self {
+            Self::ParentLifetime => IsolationStage::Spawn,
+            Self::CgroupJoin => IsolationStage::CgroupJoin,
+            Self::DeferredRlimit => IsolationStage::Rlimits,
+            _ => IsolationStage::Exec,
+        }
+    }
+
+    /// 段ごとの固定の英文（親が引くメッセージ。子の自由文・パス・errno 文字列は含まない）。
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ParentLifetime => "the exec child could not bind to the lifetime of its parent",
+            Self::CgroupJoin => "the exec child could not join its child cgroup",
+            Self::CloseFds => "the exec child could not close the inherited file descriptors",
+            Self::Setsid => "the exec child could not detach from the caller session",
+            Self::OpenRoot => "the exec child could not open the container root",
+            Self::OpenEntrypoint => "the exec child could not open the entrypoint",
+            Self::RuntimeIdentity => "the exec child refused the entrypoint identity",
+            Self::SelectExecutable => "the exec child could not select the executable file",
+            Self::DeferredRlimit => "the exec child could not apply the deferred file size limit",
+            Self::Interpreter => "the exec child refused the entrypoint interpreter",
+            Self::ScriptFd => "the exec child could not verify the script file descriptor path",
+            Self::PrepareFds => "the exec child could not prepare its file descriptors",
+            Self::StdioNull => "the exec child could not redirect its standard streams",
+            Self::ReportReady => "the exec child could not report that it is ready",
+            Self::Execveat => "the exec child could not execute the entrypoint",
+        }
+    }
+}
+
+/// 子の全段（[`ExecChildStep::ALL`] の読み取り専用の参照）。supervisor の単体試験が全段の往復を確かめるために
+/// 公開する（通常の利用者は呼ばない。`exec_child_violation_reasons` と同じ流儀。#2822）。
+#[doc(hidden)]
+pub fn exec_child_steps() -> &'static [ExecChildStep] {
+    &ExecChildStep::ALL
+}
+
+/// 子の手順の失敗（段つき。[`prepare_exec_child`] の戻り値。ワイヤーへは段・ERR-1 コード・違反の理由だけを写す）。
+#[derive(Debug)]
+struct ExecChildFailure {
+    step: ExecChildStep,
+    /// `Err` の大きさを抑えるため箱に入れる（`result_large_err`）。
+    error: Box<ExecError>,
+}
+
+/// 手順の `ExecError` に段を付ける（`map_err(at(ExecChildStep::X))`）。
+fn at(step: ExecChildStep) -> impl FnOnce(ExecError) -> ExecChildFailure {
+    move |error| ExecChildFailure {
+        step,
+        error: Box::new(error),
+    }
+}
+
 /// 稼働中コンテナへの exec の結果（SUP-6・REPAIR-3・TASK-163 追補・#1460）。
 ///
 /// `execve` より前に子が失敗した場合の終了コード（125 / 126 / 127）は、実行されたコマンド自身も返し得る値で、
@@ -1333,10 +1540,27 @@ pub enum ExecExit {
         /// 分離違反による拒否だった場合の理由（SEC-4。ランタイム自身のバイナリ・インタープリタ経由・
         /// `/dev/null` の差し替え）。違反でない失敗・理由を受け取れなかった場合は `None`。
         violation: Option<ViolationReason>,
+        /// 子が報告した失敗の分類（errno 由来。`R` の後の `execveat` の失敗は launch の `X <CODE>` と同じ
+        /// 写像: `ENOENT`/`ENOTDIR` → `NotFound`、`EACCES`/`EPERM` → `PermissionDenied`、`ENOEXEC`/`E2BIG` →
+        /// `InvalidArgument`、その他 → `Internal`。#2763）。子が何も書かずに終わった場合と解釈できない内容
+        /// のときは `Internal`（起動していない扱いを保つ fail-closed）。
+        code: ErrorCode,
+        /// 子が失敗した手順の段（固定語彙 [`ExecChildStep`]。SUP-6・REPAIR-3・#2822）。子が何も書かずに終わった
+        /// 場合（手順の途中でシグナルを受けた等）と、解釈できない内容・未知の段のときは `None`。メッセージが
+        /// 要るときは [`ExecChildStep::message`] で段から固定の英文を引く（子の自由文は運ばない）。
+        step: Option<ExecChildStep>,
     },
 }
 
 impl ExecExit {
+    /// 失敗した手順の段（`SetupFailed` のときだけ。`Command` と、段を受け取れなかった場合は `None`）。
+    pub fn failure_step(self) -> Option<ExecChildStep> {
+        match self {
+            Self::Command(_) => None,
+            Self::SetupFailed { step, .. } => step,
+        }
+    }
+
     /// 子プロセスの終了状態（コマンドが起動したかどうかによらない）。
     pub fn child_exit(self) -> ChildExit {
         match self {
@@ -1353,8 +1577,14 @@ impl ExecExit {
 /// 子が「手順を終えて `execveat` を呼ぶ直前」に書く 1 行（[`read_exec_status`] のプロトコル）。
 const EXEC_STATUS_READY: &[u8] = b"R\n";
 
-/// 子が親へ返す状態の読み取り上限（バイト。1 行 2 件ぶんより十分大きい）。
+/// 子が親へ返す状態の読み取り上限（バイト。`R` の行と失敗の行 1 件ぶんより十分大きい）。
 const EXEC_STATUS_MAX: usize = 256;
+
+/// 失敗の行の 1 語あたりの上限（バイト。語彙を引く前に確かめる。#2822）。
+const EXEC_FAILURE_TOKEN_MAX: usize = 48;
+
+/// 失敗の行 1 件の上限（バイト。改行を含む。#2822）。
+const EXEC_FAILURE_LINE_MAX: usize = 128;
 
 /// 子が違反として報告し得る理由（`execveat` 前の手順が返す違反。[`read_exec_status`] が名前から引き直す）。
 ///
@@ -1375,8 +1605,8 @@ const EXEC_STATUS_MAX: usize = 256;
 ///   開き直しの間の競合による拒否で、分離境界の突破試行とは断定できない
 /// - `FailedPrecondition`（`/dev/null`・`/proc`・`/dev/fd` の不在や準備不足）: 差し替えではなく前提不足
 /// - `execveat` 自体の失敗（`R` の後）と状態書き込みの失敗: errno 由来のシステムエラー
-/// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。何も書かずに終了）: 親の生存確認と
-///   cgroup 参加のシステムエラー
+/// - `bind_to_parent_lifetime` / `join_exec_cgroup` の失敗（`exec_command.rs`。理由 `-` の失敗の行を best-effort で
+///   書いて終了。段は `parent_lifetime` / `cgroup_join`。#2822）: 親の生存確認と cgroup 参加のシステムエラー
 ///
 /// 照合の限界: 対象は `process.rs`・`interpreter.rs`・`sealed_copy.rs` だけ。`prepare_exec_child` から別ファイルの違反生成
 /// ヘルパを呼ぶようになったら、そのファイルを照合対象に加えること（`rootfs.rs`・`setns.rs` 等は子の経路の外の
@@ -1410,7 +1640,8 @@ pub fn exec_child_violation_reasons() -> &'static [ViolationReason] {
 /// 1. `execveat` より前の全手順（`prepare_exec_child`）が通ったら [`EXEC_STATUS_READY`] を書く
 /// 2. `terminal`（本番は `execveat`）を呼ぶ。`execveat` が成功すれば pipe は close-on-exec で閉じ、親は
 ///    「`R` の 1 行だけ」を読む = コマンドは起動した
-/// 3. 手順か `terminal` が失敗したら `<終了コード> <違反の理由コードまたは ->` の 1 行を書く
+/// 3. 手順か `terminal` が失敗したら `<終了コード> <ERR-1 コード> <違反の理由コードまたは ->` の 1 行を書く
+///    （`R` の後の `execveat` の失敗も同じ形式で、ERR-1 コードは launch と同じ errno の写像。#2763）
 ///
 /// 親（[`read_exec_status`]）は、`R` だけなら起動、失敗の行があれば未起動、何も無ければ「手順の途中で子が
 /// 終了した」= 未起動と判定する。`R` を書けなければ `execveat` へ進まない（親へ知らせられない状態で実行しない）。
@@ -1419,30 +1650,38 @@ fn run_exec_child(
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
+    stdio: ChildStdio,
     terminal: impl FnOnce(&Entrypoint, &ExecutableFd) -> Result<i32, ExecError>,
 ) -> i32 {
-    let result = prepare_exec_child(
-        entry,
-        Some(status.as_fd()),
-        EntrypointSource::Switchable(seal_policy),
-        deferred_fsize,
-        StdioNulling::ALL,
-    )
-    .and_then(|exe| {
-        write_exec_status(status, EXEC_STATUS_READY)?;
-        terminal(entry, &exe)
-    });
+    // 出力の付け替えは `close_range` を含む `prepare_exec_child` より前に行う（付け替えた 1・2 を閉じないため。
+    // launch の `child_main` と同じ位置）。指定なし（`ChildStdio::none`）なら何もせず、3 本とも `/dev/null` へ置換する。
+    let result = stdio
+        .install()
+        .map_err(at(ExecChildStep::PrepareFds))
+        .and_then(|nulling| {
+            prepare_exec_child(
+                entry,
+                Some(status.as_fd()),
+                EntrypointSource::Switchable(seal_policy),
+                deferred_fsize,
+                nulling,
+            )
+        })
+        .and_then(|exe| {
+            write_exec_status(status, EXEC_STATUS_READY).map_err(at(ExecChildStep::ReportReady))?;
+            terminal(entry, &exe).map_err(at(ExecChildStep::Execveat))
+        });
     match result {
         Ok(code) => code,
-        Err(err) => {
+        Err(ExecChildFailure { step, error }) => {
+            let err = *error;
             let code = exit_code_for(&err);
             let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
-            let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
             // 失敗の行を書けなかった場合（`R` を書いた後の `execveat` の失敗で起き得る）、親は「起動した」と
             // 誤判定する。書き込みは fd を複製せず 1 回の `write` で行い（複製の失敗という要因を持たない）、
             // それでも書けなければ stderr に残す（stderr は既に `/dev/null` の場合がある。限界は
             // `exec/exec_command.rs`）。
-            if write_exec_status(status, format!("{code} {reason}\n").as_bytes()).is_err() {
+            if write_exec_status(status, exec_failure_line(step, &err).as_bytes()).is_err() {
                 let _ = writeln!(
                     std::io::stderr(),
                     "fandhe-container: the exec status could not be reported"
@@ -1451,6 +1690,34 @@ fn run_exec_child(
             code
         }
     }
+}
+
+/// 失敗の行 `<終了コード> <step> <ERR-1 コード> <違反の理由コードまたは ->\n`（純関数。親の
+/// [`classify_exec_status`] が復号する唯一の形式。errno の生値・文字列・パスは運ばない。#2763・#2822）。
+fn exec_failure_line(step: ExecChildStep, err: &ExecError) -> String {
+    let reason = err.violation.as_ref().map_or("-", |v| v.reason.as_str());
+    format!(
+        "{} {} {} {reason}\n",
+        exit_code_for(err),
+        step.as_str(),
+        err.code.as_str()
+    )
+}
+
+/// 子の前段（`bind_to_parent_lifetime`・`join_exec_cgroup`。`exec_command.rs`）の失敗を状態 pipe へ書く
+/// （best-effort。書けなければ従来どおり何も届かず、親は `step: None` の `SetupFailed` と判定する。#2822）。
+/// 違反ではない失敗なので理由は `-`、終了コードは [`EXIT_SETUP_FAILED`]。
+pub(super) fn report_exec_child_failure(
+    status: &std::fs::File,
+    step: ExecChildStep,
+    code: ErrorCode,
+) {
+    let line = format!(
+        "{EXIT_SETUP_FAILED} {} {} -\n",
+        step.as_str(),
+        code.as_str()
+    );
+    let _ = write_exec_status(status, line.as_bytes());
 }
 
 /// 子が状態を返す pipe を作る。戻り値は `(読み取り側, 書き込み側)`（両端とも close-on-exec）。
@@ -1480,10 +1747,16 @@ pub(super) fn exec_child_main(
     status: &std::fs::File,
     deferred_fsize: Option<Rlimit>,
     seal_policy: SealPolicy,
+    stdio: ChildStdio,
 ) -> i32 {
-    run_exec_child(entry, status, deferred_fsize, seal_policy, |entry, exe| {
-        Err(execve_checked(entry, exe))
-    })
+    run_exec_child(
+        entry,
+        status,
+        deferred_fsize,
+        seal_policy,
+        stdio,
+        |entry, exe| Err(execve_checked(entry, exe)),
+    )
 }
 
 /// 終了した子が pipe（`status` = 読み取り側）へ残した状態から、コマンドが起動したかどうかを判定する
@@ -1521,23 +1794,79 @@ pub(super) fn read_exec_status(
 }
 
 /// pipe の内容 `status` と子の終了状態から結果を決める（純関数。規則は [`run_exec_child`]）。
+///
+/// 失敗の行は `<終了コード> <step> <ERR-1 コード> <理由|->\n` の 4 語ちょうど（単一スペース区切り）。行・語の
+/// 長さを語彙を引く前に上限検証し、段・コード・理由は静的な値に引き直す。`execveat` の段は `R` の後だけ受ける
+/// （launch の `X` と同じ形）。どれかに外れたら起動していない扱いで `Internal`・段なし（fail-closed。#2822）。
 fn classify_exec_status(status: &[u8], exit: ChildExit) -> ExecExit {
     if status == EXEC_STATUS_READY {
         return ExecExit::Command(exit);
     }
-    // 失敗の行（`R` の後、または単独）の 2 つ目の語が違反の理由コード。
-    let violation = status
-        .strip_prefix(EXEC_STATUS_READY)
-        .unwrap_or(status)
-        .split(|b| *b == b'\n')
-        .next()
-        .and_then(|line| line.split(|b| *b == b' ').nth(1))
-        .and_then(|name| {
-            EXEC_CHILD_VIOLATIONS
-                .into_iter()
-                .find(|reason| reason.as_str().as_bytes() == name)
-        });
-    ExecExit::SetupFailed { exit, violation }
+    // 解釈できない内容（空・切れた行・旧形式・未知の語・余分なバイト）は、起動していない扱いで
+    // 理由なし・段なし・`Internal`（fail-closed）。
+    let unparsed = ExecExit::SetupFailed {
+        exit,
+        violation: None,
+        code: ErrorCode::Internal,
+        step: None,
+    };
+    let after_ready = status.starts_with(EXEC_STATUS_READY);
+    let line = status.strip_prefix(EXEC_STATUS_READY).unwrap_or(status);
+    if line.len() > EXEC_FAILURE_LINE_MAX {
+        return unparsed;
+    }
+    let Some(line) = line.strip_suffix(b"\n") else {
+        return unparsed;
+    };
+    let mut words = line.split(|b| *b == b' ');
+    let (Some(_exit), Some(step), Some(code), Some(reason), None) = (
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+        words.next(),
+    ) else {
+        return unparsed;
+    };
+    if [step, code, reason]
+        .iter()
+        .any(|w| w.len() > EXEC_FAILURE_TOKEN_MAX)
+    {
+        return unparsed;
+    }
+    let Some(step) = std::str::from_utf8(step)
+        .ok()
+        .and_then(ExecChildStep::from_token)
+    else {
+        return unparsed;
+    };
+    // `execveat` の失敗は `R` の後にしか起き得ない（`R` が無い `execveat` は不整合）。
+    if (step == ExecChildStep::Execveat) != after_ready {
+        return unparsed;
+    }
+    let Some(code) = std::str::from_utf8(code)
+        .ok()
+        .and_then(ErrorCode::from_name)
+    else {
+        return unparsed;
+    };
+    let violation = if reason == b"-" {
+        None
+    } else {
+        match EXEC_CHILD_VIOLATIONS
+            .into_iter()
+            .find(|v| v.as_str().as_bytes() == reason)
+        {
+            Some(v) => Some(v),
+            None => return unparsed,
+        }
+    };
+    ExecExit::SetupFailed {
+        exit,
+        violation,
+        code,
+        step: Some(step),
+    }
 }
 
 /// [`observe_exec_child_setup`] の観測結果（結合試験専用。SUP-6・SEC-1・TASK-163 追補・#1456）。
@@ -1745,6 +2074,7 @@ fn observe_exec_child_setup_policy(
                 &status_write,
                 deferred_fsize,
                 policy,
+                ChildStdio::none(),
                 |entry, exe| {
                     after_prepare();
                     write_setup_report(entry, report, exe.file()).map(|()| 0)
@@ -2006,7 +2336,7 @@ impl StdioNulling {
 
 /// 子の stdout / stderr へ付け替えるパイプの書き込み側（TASK-164 追補・#1471・SUP-7・SUP-1）。
 ///
-/// 親（launcher）が fork の前に [`ChildStdio::pipes`] で作り、`spawn_container_with_stages_and_stdio` へ渡す。
+/// 親（launcher）が fork の前に [`ChildStdio::pipes`] で作り、`spawn_container_via_intermediate` へ渡す。
 /// 読み取り側は親に残り、supervisor の行単位捕捉（`LogCapture`）へ `ContainerOutput` として渡る。
 /// fork 後の親側のコピーは spawn が drop して書き込み側を閉じるため、子と孫がすべて終了すれば読み取り側は EOF に
 /// なる。fd は `pipe()` の close-on-exec のまま保持し、子が `install` で 1・2 へ複製した分だけが
@@ -2043,6 +2373,22 @@ impl ChildStdio {
             out_r,
             err_r,
         ))
+    }
+
+    /// 稼働中コンテナへの exec の子（healthcheck の出力取得。SUP-4・SUP-6・#2441）が、stdout と stderr の両方を
+    /// 同じ 1 本の出力用 fd（呼び出し側が作った `UnixStream` の子側等）へ付け替えるための指定。
+    ///
+    /// stdout には `output` をそのまま、stderr には close-on-exec の複製を割り当てる（Docker の Output と同じく
+    /// 結合した 1 本。ストリーム名の区別は付けない）。複製の失敗は `ExecError`（段 `Spawn`）。fd 0（stdin）は付け替えず、
+    /// 子の側で常に `/dev/null` へ置換する。
+    pub fn from_output(output: OwnedFd) -> Result<Self, ExecError> {
+        let dup = output.try_clone().map_err(|e| {
+            ExecError::from_io(&e, IsolationStage::Spawn, "dup(exec output for stderr)")
+        })?;
+        Ok(Self {
+            stdout: Some(output),
+            stderr: Some(dup),
+        })
     }
 
     /// パイプ指定なし（stdout / stderr とも従来どおり `/dev/null`）。
@@ -2126,14 +2472,19 @@ fn run_child(
     let status = setup.and_then(|s| s.status);
     run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
+        // 失敗した検証を `E <step> ...` の段として運ぶ（#2895）。
         let checked = isolation
             .verify_caller(IsolationStage::Exec)
-            .and_then(|()| require_restriction_evidence(evidence));
-        if let Err(err) = checked {
+            .map_err(|e| (ExecPhaseStep::VerifyCaller, Box::new(e)))
+            .and_then(|()| {
+                require_restriction_evidence(evidence)
+                    .map_err(|e| (ExecPhaseStep::RestrictionEvidence, Box::new(e)))
+            });
+        if let Err((step, err)) = checked {
             if let Some(status) = status {
-                report_exec_failure_best_effort(status, &err);
+                report_exec_failure_best_effort(status, step, &err);
             }
-            return Err(err);
+            return Err(*err);
         }
         exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status)
     })
@@ -2154,6 +2505,10 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) tmpfs: Option<&'a TmpfsMountSet>,
     /// tmpfs の後に注入するファイル（無ければ注入しない）。
     pub(crate) inject: Option<&'a InjectedFileSet>,
+    /// 注入の後・bind mount の前に載せる、管理ルートの `/etc/hosts`・`/etc/resolv.conf`(無ければ載せない。NET-12・#1872)。
+    /// launcher が fork 前に `EtcFileMounts::verify` で検証したものだけを渡す。[`run_pre_pivot`] は tmpfs・注入・bind との
+    /// 重なりを副作用の前に再検査する(多重防御)。
+    pub(crate) etc_files: Option<&'a EtcFileMounts>,
     /// 注入の後に載せる bind mount（無ければ載せない。#1914・TASK-29 追補）。呼び出し側（`start` が host_paths・保護パスを、
     /// 本番 launcher が tmpfs を検査済み。#1915）が `check_against_*` を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・
     /// 保護パスとの重なりを副作用の前に再検査する（多重防御）。本番の launcher は `LaunchSpec::bind_mounts` が非空のときだけ渡す。
@@ -2162,6 +2517,9 @@ pub(crate) struct PrePivotSetup<'a> {
     /// #2020・SEC-2・OCI-4）。procfs を `prepare_rootfs` が載せるのと対の位置で、`readonly_paths` より前に
     /// 載せて、その再帰 bind と読み取り専用化が上に載るようにする。
     pub(crate) sysfs: Option<&'a SysfsMountSpec>,
+    /// `verify_pinned` の直後（`mount_sysfs` の前）に適用する namespaced な sysctl（無ければ書かない。`readonly_paths` が
+    /// `/proc/sys` を読み取り専用にする前でなければ書けない。実効の名前空間と照合済みの計画だけを渡せる。CRI-2・CORE-3・#2670）。
+    pub(crate) sysctls: Option<&'a SysctlPlan<'a>>,
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
@@ -2174,6 +2532,10 @@ pub(crate) struct PrePivotSetup<'a> {
     /// pivot 後に移る作業ディレクトリ（`process.cwd`。`None` または `Root` なら移らない。OCI-1・TASK-29）。
     /// 違反は状態 pipe の段 `working_dir` で親へ返る。
     pub(crate) working_dir: Option<&'a ContainerWorkingDir>,
+    /// 真なら `pivot_root` の直後（`working_dir` の前）に rootfs の mount top を読み取り専用にする
+    /// （config の `root.readonly`。CORE-5・SEC-1・SUP-12・#2767）。値は config そのもので、外す・緩める入口ではない。
+    /// 失敗は状態 pipe の段 `root_readonly` で親へ返る（fail-closed。縮退しない）。
+    pub(crate) root_readonly: bool,
 }
 
 /// config の `linux.readonlyPaths` / `maskedPaths`（検証済み）。固定集合に**追加**されるだけで、外す・緩める
@@ -2203,7 +2565,8 @@ trait PrePivotOps {
     type Pivoted;
     /// `mount_sysfs` の成功の証跡。`masked_paths` 段へ渡し、sysfs を供給したときだけ `/sys` 配下を覆う（#2014）。
     type Sysfs;
-    fn establish(&self) -> Result<Self::Isolation, ExecError>;
+    /// `binds` に `rslave` があれば、`/` の private 化の前にその元を複製する（#2669）。
+    fn establish(&self, binds: Option<&BindMountSet>) -> Result<Self::Isolation, ExecError>;
     fn prepare_rootfs(
         &self,
         isolation: &Self::Isolation,
@@ -2213,6 +2576,13 @@ trait PrePivotOps {
         &self,
         prepared: &Self::Prepared,
         pinned: BorrowedFd<'_>,
+    ) -> Result<(), ExecError>;
+    /// namespaced な sysctl の適用（#2670）。`verify_pinned` の直後・`mount_sysfs` の前（`/proc/sys` が読み取り専用になる前）。
+    fn apply_sysctls(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        plan: &SysctlPlan<'_>,
     ) -> Result<(), ExecError>;
     /// `/sys` への読み取り専用の sysfs の供給（#2020）。procfs と対の位置で、`readonly_paths` より前に載せる。
     fn mount_sysfs(
@@ -2239,6 +2609,13 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         set: &InjectedFileSet,
+    ) -> Result<(), ExecError>;
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind(NET-12・#1872)。`inject_files` の後・`mount_binds` の前。
+    fn mount_etc_files(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        mounts: &EtcFileMounts,
     ) -> Result<(), ExecError>;
     /// 検証済みの bind mount の適用。`/dev` とその配下は宛先にできない（`RESERVED_DESTINATIONS`）ため、
     /// `mount_tmpfs` と違い `/dev` の作成順の証跡（`Devices`）は受けない（#1914）。
@@ -2267,6 +2644,8 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: Self::Prepared,
     ) -> Result<Self::Pivoted, ExecError>;
+    /// pivot 直後に rootfs の mount top を読み取り専用にする（`root.readonly`。#2767）。`enter_working_dir` の前。
+    fn make_root_read_only(&self, pivoted: &Self::Pivoted) -> Result<(), ExecError>;
     /// pivot 直後に `process.cwd` へ移る（OCI-1）。
     fn enter_working_dir(
         &self,
@@ -2301,6 +2680,7 @@ impl RealPrePivotOps {
         prepared: &PreparedRootfs,
         by: MountedBy,
         destination: &str,
+        read_only: bool,
         stage: IsolationStage,
     ) -> Result<(), ExecError> {
         let identity = crate::landlock::observe_mount_beneath(prepared.new_root(), destination)
@@ -2313,6 +2693,7 @@ impl RealPrePivotOps {
                 by,
                 destination: destination.to_string(),
                 identity,
+                read_only,
             })
             .map_err(|_| {
                 ExecError::new(
@@ -2336,8 +2717,8 @@ impl PrePivotOps for RealPrePivotOps {
     type Pivoted = PivotReport;
     type Sysfs = SysfsReport;
 
-    fn establish(&self) -> Result<MountIsolation, ExecError> {
-        MountIsolation::establish()
+    fn establish(&self, binds: Option<&BindMountSet>) -> Result<MountIsolation, ExecError> {
+        MountIsolation::establish_with(binds)
     }
 
     fn prepare_rootfs(
@@ -2365,6 +2746,15 @@ impl PrePivotOps for RealPrePivotOps {
         check_rootfs_identity(identity(pinned)?, identity(prepared.new_root())?)
     }
 
+    fn apply_sysctls(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        plan: &SysctlPlan<'_>,
+    ) -> Result<(), ExecError> {
+        sysctls::apply_sysctls(isolation, prepared, plan)
+    }
+
     fn mount_sysfs(
         &self,
         isolation: &MountIsolation,
@@ -2388,6 +2778,7 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::DefaultDevices(mount),
                 mount.destination(),
+                false,
                 IsolationStage::CreateDevices,
             )?;
         }
@@ -2407,6 +2798,7 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::Tmpfs,
                 &outcome.destination,
+                false,
                 IsolationStage::MountTmpfs,
             )?;
         }
@@ -2425,7 +2817,27 @@ impl PrePivotOps for RealPrePivotOps {
                 prepared,
                 MountedBy::Inject,
                 &dir.destination,
+                false,
                 IsolationStage::InjectFiles,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn mount_etc_files(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        mounts: &EtcFileMounts,
+    ) -> Result<(), ExecError> {
+        let report = mount_etc_files(isolation, prepared, mounts)?;
+        for outcome in &report.mounts {
+            self.record(
+                prepared,
+                MountedBy::EtcFile,
+                outcome.destination,
+                outcome.read_only,
+                IsolationStage::MountEtcFiles,
             )?;
         }
         Ok(())
@@ -2445,6 +2857,8 @@ impl PrePivotOps for RealPrePivotOps {
                     index: outcome.index,
                 },
                 &outcome.destination,
+                // 事後検証済みの値（`ro` の bind に頼る Landlock のルールの適用時の照合に使う。#1917）。
+                outcome.read_only,
                 IsolationStage::MountBinds,
             )?;
         }
@@ -2478,6 +2892,10 @@ impl PrePivotOps for RealPrePivotOps {
         prepared: PreparedRootfs,
     ) -> Result<PivotReport, ExecError> {
         pivot_root(isolation, prepared)
+    }
+
+    fn make_root_read_only(&self, pivoted: &PivotReport) -> Result<(), ExecError> {
+        crate::exec::make_root_read_only(pivoted).map(|_| ())
     }
 
     fn enter_working_dir(
@@ -2524,10 +2942,22 @@ fn check_bind_overlaps(
         .map_err(to_exec)
 }
 
+/// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` が tmpfs・注入・bind の宛先と重ならないことを再検査する(純関数。NET-12・SEC-1)。
+fn check_etc_overlaps_exec(
+    mounts: &EtcFileMounts,
+    tmpfs: Option<&TmpfsMountSet>,
+    inject: Option<&InjectedFileSet>,
+    binds: Option<&BindMountSet>,
+) -> Result<(), ExecError> {
+    let empty = TmpfsMountSet::new();
+    crate::etc_files::check_etc_overlaps(mounts.selection(), tmpfs.unwrap_or(&empty), inject, binds)
+        .map_err(|e| ExecError::new(e.code(), IsolationStage::MountEtcFiles, e.message()))
+}
+
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
-/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `mount_sysfs`（指定時）→ `create_default_devices` →
-/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
+/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `apply_sysctls`（指定時。#2670）→ `mount_sysfs`（指定時）→ `create_default_devices` →
+/// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_etc_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
 /// `masked_paths`（`setup` 指定時）→ `pivot_root`。
 ///
 /// # bind mount の段の位置（#1914・TASK-29 追補。CORE-1・CORE-5・SEC-1・SEC-2）
@@ -2544,8 +2974,11 @@ fn check_bind_overlaps(
 /// 5. OCI の「`mounts` は列挙順に適用」は、bind 以外を拒否し `mount_binds` が指定順に適用することで守る。他の段とは
 ///    重ならないため、順序を入れ替えても木は同じになる。
 ///
-/// #1872（`/etc/hosts`・`/etc/resolv.conf`）の段は `inject_files` と同種のため、`inject_files` の後・`mount_binds` の前に
-/// 置く想定。その際は `/etc` などの祖先 bind を拒否する重なり検査も要る（本 PR は先取りしない）。
+/// `/etc/hosts`・`/etc/resolv.conf` の段(`mount_etc_files`。指定時のみ。NET-12・#1872)は `inject_files` と同種のため、
+/// `inject_files` の後・`mount_binds` の前に置く。`/etc` などの祖先の tmpfs・bind と、`/etc/hosts` 自体への重なりは
+/// 段の先頭の `check_etc_overlaps_exec` が副作用の前に拒否する。bind より前に置くのは、利用者の bind が `/etc/hosts` と
+/// 重なる構成を型の検査で除外済みであること(重なれば `check_etc_overlaps_exec` が拒否)と、作成を伴う段を bind より
+/// 前に置く規則(上の 2)に揃えるため。
 ///
 /// Landlock との整合: `mount_binds` が付け替え後に自分のマウントを事後検証し、以降の段は `/proc`・`/sys` だけを対象と
 /// するため、pivot 時点で宛先の最上位のマウントは bind のまま残る。`RulePath::Beneath(dest)` を辿ると適用した bind の
@@ -2572,13 +3005,19 @@ fn check_bind_overlaps(
 /// `mounts[]` の sysfs（`mount_sysfs`。#2020）は `verify_pinned` の直後（`create_default_devices` の前）に載せ、
 /// `readonly_paths` の再帰 bind と読み取り専用化がその上に載るようにする。順序は単体テスト
 /// `core1_run_pre_pivot_order_is_fixed` が、積み方は結合試験 `readonly_paths`・`masked_paths` が検査する。
+///
+/// `root.readonly=true`（`setup.root_readonly`。#2767）は `pivot_root` → `root_readonly` → `working_dir` の順で、
+/// pivot 前の段が rootfs へ書き込み終えた後に `/` の mount top へ読み取り専用の属性を足す（非再帰・属性の追加のみ。
+/// ステージ列の seccomp が `mount_setattr` を拒否する前に済ませる）。`false` または `setup` なしでは呼ばない。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
     setup: Option<PrePivotSetup<'_>>,
 ) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
     use PrePivotStep as S;
-    let isolation = ops.establish().map_err(StepError::at(S::Establish))?;
+    let isolation = ops
+        .establish(setup.as_ref().and_then(|s| s.binds))
+        .map_err(StepError::at(S::Establish))?;
     let prepared = ops
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
@@ -2589,6 +3028,10 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(pinned) = setup.pinned_rootfs {
             ops.verify_pinned(&prepared, pinned)
                 .map_err(StepError::at(S::VerifyPinned))?;
+        }
+        if let Some(plan) = setup.sysctls {
+            ops.apply_sysctls(&isolation, &prepared, plan)
+                .map_err(StepError::at(S::ApplySysctls))?;
         }
         if let Some(spec) = setup.sysfs {
             sysfs = Some(
@@ -2606,6 +3049,13 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(set) = setup.inject {
             ops.inject_files(&isolation, &prepared, set)
                 .map_err(StepError::at(S::InjectFiles))?;
+        }
+        if let Some(mounts) = setup.etc_files {
+            // 多重防御: launcher の fork 前の検査と同じ規則を、副作用の前に再検査する(NET-12・SEC-1)。
+            check_etc_overlaps_exec(mounts, setup.tmpfs, setup.inject, setup.binds)
+                .map_err(StepError::at(S::EtcFiles))?;
+            ops.mount_etc_files(&isolation, &prepared, mounts)
+                .map_err(StepError::at(S::EtcFiles))?;
         }
         if let Some(set) = setup.binds {
             check_bind_overlaps(set, setup.tmpfs, setup.inject, setup.config_paths)
@@ -2631,6 +3081,12 @@ fn run_pre_pivot<O: PrePivotOps>(
     let pivoted = ops
         .pivot_root(&isolation, prepared)
         .map_err(StepError::at(S::PivotRoot))?;
+    // pivot 直後に rootfs を読み取り専用にする（`root.readonly`。#2767）。pivot 前の段は rootfs へ書き込むため
+    // これより前に済ませ、既定の seccomp が拒否する `mount_setattr(2)` を使うためステージ列より前に走らせる。
+    if setup.is_some_and(|s| s.root_readonly) {
+        ops.make_root_read_only(&pivoted)
+            .map_err(StepError::at(S::RootReadOnly))?;
+    }
     // pivot 直後・ステージ列の前に作業ディレクトリへ移る（OCI-1）。根は pivot_root 済みのため省く。
     if let Some(wd) = setup.and_then(|s| s.working_dir).filter(|w| !w.is_root()) {
         ops.enter_working_dir(&pivoted, wd)
@@ -2691,9 +3147,28 @@ fn run_child_then<T>(
     };
     // pivot 後・終端前にステージ列を固定順で実行する。pivot 前段が記録したマウントの識別子を Landlock 段へ渡す
     // （Mount 由来のルールの対象がマウントのルートであることの照合。#2071）。
-    stages.with_mounted_targets(ops.into_mounted()).run_then(
-        |_stage_report, _capability_report, evidence| terminal(&isolation, &report, evidence),
-    )
+    let stages = stages.with_mounted_targets(ops.into_mounted());
+    // 成功の報告（`P`）の直後に、Mount 由来のルールの識別子を親へ返す（exec の再適用が `state.json` の識別子で
+    // 重ねられたマウントを検出する元。SEC-1・SEC-4・#3201）。書けなければ先へ進まない（fail-closed）。
+    if let Some(status) = status {
+        report_mount_identities(status, &stages.mount_identity_report())?;
+    }
+    let mut terminal_ran = false;
+    let result = stages.run_then(|_stage_report, _capability_report, evidence| {
+        terminal_ran = true;
+        terminal(&isolation, &report, evidence)
+    });
+    // Landlock 段の失敗は seccomp の listener を送る前に起きるため、親は listener の EOF しか見えない。
+    // 照合の違反を親の監査へ届けられるよう、状態 pipe に `E landlock ...` を書く（SEC-1・SEC-4・CORE-5・#2130）。
+    // 他の段の失敗は従来どおり何も書かない。書けなくても失敗は変わらない（best-effort）。
+    // 終端（`verify_caller` 等。自前の `E` 行を書く）まで進んだ後の失敗は対象外（`E` 行の二重書き込みを避ける）。
+    if let (Err(err), Some(status)) = (&result, status)
+        && !terminal_ran
+        && err.stage == IsolationStage::Landlock
+    {
+        report_exec_failure_best_effort(status, ExecPhaseStep::Landlock, err);
+    }
+    result
 }
 
 /// 結合試験専用: exec の代わりに任意の攻撃プローブを実行する子を fork する（SEC-2・TASK-42.1・#199）。
@@ -2924,9 +3399,11 @@ where
     let pid = sys::fork_single_threaded(
         move || {
             let setup = PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
@@ -2936,6 +3413,7 @@ where
                 },
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             };
             let result = run_child_then(
                 rootfs,
@@ -2980,12 +3458,15 @@ where
     let pid = sys::fork_single_threaded(
         move || {
             let setup = PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: Some(sysfs),
                 working_dir: None,
+                root_readonly: false,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -3022,19 +3503,40 @@ where
 /// 戻り値の [`ContainerChild`] は [`ContainerChild::wait_timeout`] で回収する。`unshare(CLONE_NEWPID)`
 /// の最初の子だけが PID 1 になり、それが終わると namespace は以後 fork できないため、分離した親からの
 /// `spawn_container` は 1 回だけ成功する。
+///
+/// 専用の `/dev`（`create_default_devices`）は載せない（#2700・CORE-2・SEC-2・REPAIR-3。配線しないと決めた）。
+/// 製品コードにこの入口の呼び出し元は無く（結合試験だけ）、本番の起動は `ProductionLauncher` が
+/// `spawn_container_via_intermediate` を通す経路で、`PrePivotSetup.devices` から `/dev` を結線済み（#1816）。
+/// 配線しない理由は次のとおり。
+/// - 本番は常に `setup` を渡すため、ここへ配線しても本番の挙動は変わらない
+/// - `StagePipeline::new()`（Landlock 無し）では制限適用の証跡（`LaunchReady`。#1714）が作られず、exec は常に拒否される
+///   （fail-closed。`/dev` を足しても観測できる効果が無い）
+/// - 配線には `DevptsGidSource` の入力が要り、本番で使わない関数の公開シグネチャを変えることになる
+/// - `masked_paths` も適用しない最小構成に `/dev` だけを足すと部分適用になり、実装済みを装う（REPAIR-3）
+/// - `/dev` が要る試験には試験専用の入口 `spawn_container_with_stages_and_devices` がある
+///
+/// 本番の起動にこの入口を使ってはならない（分離が弱くなる）。
+/// 結合試験専用のため `exec-test-support` の背後に置く（#2762・REPAIR-3・CORE-2）。lib.rs の `compile_error!` が release
+/// ビルドでの有効化を禁じるので、製品バイナリからは呼べない。なお stdout / stderr を付け替える `_and_stdio` 版は
+/// 呼び出し元が無く削除した（パイプ接続は `spawn_container_via_intermediate` だけが行う）。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
     spawn_container_with_stages(rootfs, entry, StagePipeline::new())
 }
 
-/// [`spawn_container`] にステージ列（#832・TASK-27.4.2）を渡す版。
+/// `spawn_container` にステージ列（#832・TASK-27.4.2）を渡す版。
 ///
 /// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
 /// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。
+/// `/dev` は載せない（`spawn_container` と同じ。#2700）。
 /// 挙動の変更（#1714）: `stages` に `with_landlock` を載せて全段が成功したときだけ制限適用の証跡
 /// （`LaunchReady`）がそろい exec へ進む。Landlock 無し・独自の Landlock フック・ダミーフックだけでは
 /// 証跡にならず exec は拒否される（fail-closed）。
 /// fork に成功した後、親の側で `dev.tty.legacy_tiocsti` が `1` のときだけ警告 1 行を標準エラーへ待たずに出す
 /// （CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739。出力は `report_legacy_tiocsti_to`。起動の可否は変えない）。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
 pub fn spawn_container_with_stages(
     rootfs: &Path,
     entry: &Entrypoint,
@@ -3046,30 +3548,6 @@ pub fn spawn_container_with_stages(
         stages,
         crate::legacy_tiocsti::read_host(),
         std::io::stderr().as_fd(),
-    )
-    .map(|(child, _report)| child)
-}
-
-/// [`spawn_container_with_stages`] に、コンテナの stdout / stderr の付け替え先（[`ChildStdio`]）を足した版
-/// （TASK-164 追補・#1471・SUP-7・SUP-1）。
-///
-/// `stdio` の書き込み側は子が fd 1・2 へ付け替えて exec へ引き継ぎ、親の側のコピーは fork 後に閉じる。読み取り側
-/// （[`ChildStdio::pipes`] が返したもの）は呼び出し側が保持し、supervisor の行単位捕捉へ渡す。
-/// `ChildStdio::none()` なら [`spawn_container_with_stages`] と同じ（3 本とも `/dev/null`）。
-/// 副作用: パイプ指定時、子の setup 失敗診断（`fandhe-container: ...` の 1 行）もコンテナのログに入る。
-pub fn spawn_container_with_stages_and_stdio(
-    rootfs: &Path,
-    entry: &Entrypoint,
-    stages: StagePipeline,
-    stdio: ChildStdio,
-) -> Result<ContainerChild, ExecError> {
-    spawn_container_reporting_with_stdio(
-        rootfs,
-        entry,
-        stages,
-        crate::legacy_tiocsti::read_host(),
-        std::io::stderr().as_fd(),
-        stdio,
     )
     .map(|(child, _report)| child)
 }
@@ -3098,9 +3576,10 @@ pub fn report_legacy_tiocsti_to(
     }
 }
 
-/// `spawn_container_with_stages` の本体。観測値 `state` と警告の出力先 `out` を注入できる形にして、起動経路から
+/// `spawn_container_with_stages` の本体（結合試験専用。#2762）。観測値 `state` と警告の出力先 `out` を注入できる形にして、起動経路から
 /// 警告が出ることを結合試験で照合する（REPAIR-12・#1739）。fork に成功した後、親の側で 1 回だけ報告する
 /// （fork 失敗時は出さない）。子は exec 直前に fd 0〜2 を `/dev/null` へ差し替えるため、運用者へ確実に届く親の側で出す。
+#[cfg(feature = "exec-test-support")]
 fn spawn_container_reporting(
     rootfs: &Path,
     entry: &Entrypoint,
@@ -3108,19 +3587,8 @@ fn spawn_container_reporting(
     state: crate::legacy_tiocsti::LegacyTiocsti,
     out: BorrowedFd<'_>,
 ) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
-    spawn_container_reporting_with_stdio(rootfs, entry, stages, state, out, ChildStdio::none())
-}
-
-/// [`spawn_container_reporting`] に stdout / stderr の付け替え先を足した本体（#1471）。`stdio` は fork 後に
-/// 親の側でも drop され、親が持つ書き込み側は閉じる（読み取り側が EOF に達するための条件）。
-fn spawn_container_reporting_with_stdio(
-    rootfs: &Path,
-    entry: &Entrypoint,
-    stages: StagePipeline,
-    state: crate::legacy_tiocsti::LegacyTiocsti,
-    out: BorrowedFd<'_>,
-    stdio: ChildStdio,
-) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
+    // stdout / stderr のパイプ接続は本番 launcher（`spawn_container_via_intermediate`）だけが行う。ここは常に `/dev/null`。
+    let stdio = ChildStdio::none();
     let pid = sys::fork_single_threaded(
         move || child_main(rootfs, entry, stages, None, stdio),
         EXIT_SETUP_FAILED,
@@ -3149,7 +3617,7 @@ pub fn spawn_container_with_stages_reporting_for_test(
 ///
 /// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
 /// 実 exec（`execveat`）の成功で照合するための入口。本番の `/dev` は launcher 経路で結線済み（#1816）で、
-/// これは最小入口 `spawn_container` に `/dev` を足すための試験専用の入口。
+/// 最小入口 `spawn_container` へは `/dev` を配線しない（#2700）ため、`/dev` が要る試験だけが使う試験専用の入口。
 /// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
 /// 通常の利用者は呼ばない。
 #[doc(hidden)]
@@ -3166,15 +3634,18 @@ pub fn spawn_container_with_stages_and_devices(
             entry,
             stages,
             Some(PrePivotSetup {
+                sysctls: None,
                 devices,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
             StdioNulling::ALL,
         ) {
@@ -3479,6 +3950,16 @@ impl ContainerChild {
     /// 子のプロセス ID（親の PID namespace での値）。回収済みなら別プロセスに再利用され得る。
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// 子が回収済み（`Reaped`）か。syscall を伴わず、回収状態のロックだけで判定する（`Lost` は回収の証跡が
+    /// 無いため `false`）。
+    ///
+    /// 期限切れの `SIGKILL` を送る `wait_timeout(Duration::ZERO)` と違い、観測だけで状態を進めない。
+    /// `ContainerChildProcess` の Drop が、回収済みの子だけを起動台帳で `Clean` へ進める判断に使う
+    /// （CORE-2・#3432）。
+    pub(crate) fn is_reaped(&self) -> bool {
+        matches!(self.lock().state, ReapState::Reaped { .. })
     }
 
     /// fork 直後（回収前）に開いた pidfd の借用（なければ `None`）。
@@ -4397,6 +4878,61 @@ mod tests {
         assert_eq!(only_out_piped.targets(), vec![0, 2]);
     }
 
+    /// SUP-4・SUP-6（#2441）: `from_output` は 1 本の出力 fd から stdout と stderr の両方を作り、子へ付け替えた後は
+    /// どちらへ書いても同じ読み取り側に届く。親が複製を閉じれば読み取り側は EOF になる。
+    #[test]
+    fn sup4_sup6_2441_from_output_feeds_both_streams_to_one_reader() {
+        use std::io::Read as _;
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stdio = ChildStdio::from_output(OwnedFd::from(theirs)).unwrap();
+        assert!(stdio.stdout.is_some() && stdio.stderr.is_some());
+        let (a, b) = (
+            stdio.stdout.as_ref().unwrap(),
+            stdio.stderr.as_ref().unwrap(),
+        );
+        {
+            use std::os::fd::AsRawFd as _;
+            assert_ne!(a.as_raw_fd(), b.as_raw_fd());
+        }
+        let mut out = std::fs::File::from(a.try_clone().unwrap());
+        let mut err = std::fs::File::from(b.try_clone().unwrap());
+        out.write_all(b"OUT;").unwrap();
+        err.write_all(b"ERR;").unwrap();
+        drop((out, err, stdio));
+        let mut text = String::new();
+        (&mine).read_to_string(&mut text).unwrap();
+        assert_eq!(text, "OUT;ERR;");
+    }
+
+    /// SUP-4・SUP-6（#2441）: 出力を付け替えた exec の子は、`/dev/null` への置換が fd 0 だけになり、`SIGPIPE` を無視する。
+    /// 指定なしは従来どおり 3 本とも置換して `SIG_DFL` のまま。
+    #[test]
+    fn sup4_sup6_2441_piped_exec_nulls_only_stdin_and_ignores_sigpipe() {
+        let dir = TempDir::create("exec-2441");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
+        let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let piped = StdioNulling {
+            stdout: false,
+            stderr: false,
+        };
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, piped);
+        let piped_calls = take_calls();
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, StdioNulling::ALL);
+        let default_calls = take_calls();
+        drop(dir);
+        assert!(piped_calls.contains(&"signal(SIGPIPE,SIG_IGN)".to_string()));
+        assert!(piped_calls.contains(&"stdio[0]->/dev/null".to_string()));
+        assert!(!piped_calls.iter().any(|c| c.contains("stdio->/dev/null")));
+        assert!(default_calls.contains(&"signal(SIGPIPE,SIG_DFL)".to_string()));
+        assert!(default_calls.contains(&"stdio->/dev/null".to_string()));
+    }
+
     /// SUP-7・SUP-1（#1471）: 親が書き込み側（`ChildStdio`）を閉じると、読み取り側は EOF になる
     /// （`drain` が終わるための条件。閉じ忘れると読み取りが終わらない）。
     #[test]
@@ -4445,7 +4981,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::sup7_1471_install_routes_fd1_and_fd2_to_separate_pipes",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(STDIO_INSTALL_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -4549,7 +5085,19 @@ mod tests {
     /// 無ければ起動していない。違反の理由コードは `execveat` 前の手順が返すものだけを引き直す。
     #[test]
     fn sup6_task163_classify_exec_status_is_exact() {
-        let failed = |exit, violation| ExecExit::SetupFailed { exit, violation };
+        let failed = |exit, violation| ExecExit::SetupFailed {
+            exit,
+            violation,
+            code: ErrorCode::Internal,
+            step: None,
+        };
+        let failed_with = |exit, violation, code, step| ExecExit::SetupFailed {
+            exit,
+            violation,
+            code,
+            step: Some(step),
+        };
+        let at_open = ExecChildStep::OpenEntrypoint;
         for code in [0, 1, 125, 126, 127] {
             let exit = ChildExit::Exited(code);
             assert_eq!(classify_exec_status(b"R\n", exit), ExecExit::Command(exit));
@@ -4564,43 +5112,77 @@ mod tests {
         assert_eq!(classify_exec_status(b"", signaled), failed(signaled, None));
 
         let exit = ChildExit::Exited(126);
-        assert_eq!(classify_exec_status(b"126 -\n", exit), failed(exit, None));
-        // `execveat` 自体の失敗（`R` の後に失敗の行）。
         assert_eq!(
-            classify_exec_status(b"R\n126 -\n", exit),
-            failed(exit, None)
+            classify_exec_status(b"126 INTERNAL -\n", exit),
+            failed(exit, None),
+            "the old 3-word line is no longer accepted"
         );
+        // `execveat` 自体の失敗（`R` の後に失敗の行）。ERR-1 コードが運ばれる（#2763）。
+        for (line, code) in [
+            (&b"R\n127 execveat NOT_FOUND -\n"[..], ErrorCode::NotFound),
+            (
+                &b"R\n126 execveat PERMISSION_DENIED -\n"[..],
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                &b"R\n126 execveat INVALID_ARGUMENT -\n"[..],
+                ErrorCode::InvalidArgument,
+            ),
+            (&b"R\n126 execveat INTERNAL -\n"[..], ErrorCode::Internal),
+        ] {
+            assert_eq!(
+                classify_exec_status(line, exit),
+                failed_with(exit, None, code, ExecChildStep::Execveat),
+                "{line:?}"
+            );
+        }
         for reason in EXEC_CHILD_VIOLATIONS {
-            let line = format!("126 {}\n", reason.as_str());
+            let line = format!(
+                "126 open_entrypoint PERMISSION_DENIED {}\n",
+                reason.as_str()
+            );
             assert_eq!(
                 classify_exec_status(line.as_bytes(), exit),
-                failed(exit, Some(reason))
+                failed_with(exit, Some(reason), ErrorCode::PermissionDenied, at_open)
             );
             assert_eq!(reason.kind().as_str(), "entrypoint");
         }
         assert_eq!(
-            classify_exec_status(b"126 entrypoint_interpreter_is_runtime_binary\n", exit),
-            failed(
+            classify_exec_status(
+                b"126 interpreter PERMISSION_DENIED entrypoint_interpreter_is_runtime_binary\n",
+                exit
+            ),
+            failed_with(
                 exit,
-                Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary)
+                Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                ErrorCode::PermissionDenied,
+                ExecChildStep::Interpreter
             )
         );
         // 封印した複製の拒否（#1531）の理由コードは、子から親へ違反として運ばれる。
         for (line, reason) in [
             (
-                &b"126 entrypoint_copy_too_large\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_copy_too_large\n"[..],
                 ViolationReason::EntrypointCopyTooLarge,
             ),
             (
-                &b"126 entrypoint_copy_seal_unverified\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_copy_seal_unverified\n"[..],
                 ViolationReason::EntrypointCopySealUnverified,
             ),
             (
-                &b"126 entrypoint_on_noexec_mount\n"[..],
+                &b"126 select_executable PERMISSION_DENIED entrypoint_on_noexec_mount\n"[..],
                 ViolationReason::EntrypointOnNoexecMount,
             ),
         ] {
-            assert_eq!(classify_exec_status(line, exit), failed(exit, Some(reason)));
+            assert_eq!(
+                classify_exec_status(line, exit),
+                failed_with(
+                    exit,
+                    Some(reason),
+                    ErrorCode::PermissionDenied,
+                    ExecChildStep::SelectExecutable
+                )
+            );
         }
         // 解釈できない内容・子が返さないはずの理由コード・切れた行は、起動していない扱い（理由なし）。
         for garbage in [
@@ -4611,6 +5193,30 @@ mod tests {
             b"126 rootfs_is_host_root\n",
             b"126",
             b"R\nR\n",
+            // 旧形式（2 語）・未知の ERR-1 コード・未知の理由・語数の過不足・改行なし・余分な行。
+            b"R\n126 -\n",
+            b"126 entrypoint_is_runtime_binary\n",
+            b"126 BOGUS -\n",
+            b"126 not_found -\n",
+            b"126 NOT_FOUND bogus_reason\n",
+            b"126 NOT_FOUND - extra\n",
+            b"126 NOT_FOUND\n",
+            b"126 NOT_FOUND -",
+            b"126 NOT_FOUND -\nx",
+            b"R\n126 NOT_FOUND -\n126 NOT_FOUND -\n",
+            b"126  NOT_FOUND -\n",
+            // 新形式の不正: 未知の段・段の欠落・語数の過不足・二重スペース・長すぎる語。
+            b"126 bogus_step NOT_FOUND -\n",
+            b"126 NOT_FOUND - -\n",
+            b"126 open_entrypoint NOT_FOUND\n",
+            b"126 open_entrypoint NOT_FOUND - extra\n",
+            b"126  open_entrypoint NOT_FOUND -\n",
+            b"126 open_entrypoint  NOT_FOUND -\n",
+            b"126 OPEN_ENTRYPOINT NOT_FOUND -\n",
+            // `execveat` は `R` の後だけ。`R` の後は `execveat` だけ。
+            b"126 execveat NOT_FOUND -\n",
+            b"R\n126 open_entrypoint NOT_FOUND -\n",
+            b"R\n126 report_ready INTERNAL -\n",
         ] {
             assert_eq!(
                 classify_exec_status(garbage, exit),
@@ -4622,6 +5228,261 @@ mod tests {
         assert!(!failed(exit, None).command_started());
         assert_eq!(failed(exit, None).child_exit(), exit);
         assert_eq!(ExecExit::Command(signaled).child_exit(), signaled);
+    }
+
+    /// SEC-4・CORE-5・SUP-6・REPAIR-12（#2763）: `R` の後の `execveat` の errno は、launch と同じ写像で
+    /// ERR-1 コードの失敗行になり（`NOT_FOUND` は 127、他は 126）、親の復号が同じ値に戻す。errno の生値・
+    /// 文字列・パスは行に載らない。
+    #[test]
+    fn sec4_2763_execveat_errno_roundtrips_as_code_line() {
+        let path = Path::new("/secret/dir/app");
+        let exit_of = |n| ChildExit::Exited(n);
+        for (errno, line, code, exit) in [
+            (
+                sys::ENOENT,
+                "127 execveat NOT_FOUND -\n",
+                ErrorCode::NotFound,
+                127,
+            ),
+            (
+                sys::EACCES,
+                "126 execveat PERMISSION_DENIED -\n",
+                ErrorCode::PermissionDenied,
+                126,
+            ),
+            (
+                sys::ENOEXEC,
+                "126 execveat INVALID_ARGUMENT -\n",
+                ErrorCode::InvalidArgument,
+                126,
+            ),
+            (
+                sys::EINTR,
+                "126 execveat INTERNAL -\n",
+                ErrorCode::Internal,
+                126,
+            ),
+        ] {
+            let err = execve_error(path, SysError::Os(errno));
+            assert_eq!((err.code, err.stage), (code, IsolationStage::Exec));
+            let written = exec_failure_line(ExecChildStep::Execveat, &err);
+            assert_eq!(written, line, "errno {errno}");
+            assert!(!written.contains("secret"), "{written}");
+            let status = format!("R\n{written}");
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit_of(exit)),
+                ExecExit::SetupFailed {
+                    exit: exit_of(exit),
+                    violation: None,
+                    code,
+                    step: Some(ExecChildStep::Execveat),
+                }
+            );
+        }
+        // 違反を伴う失敗は理由コードも載る。
+        let violation = ExecError::from_violation(ViolationReason::EntrypointIsRuntimeBinary, None);
+        assert_eq!(
+            exec_failure_line(ExecChildStep::RuntimeIdentity, &violation),
+            format!(
+                "126 runtime_identity {} entrypoint_is_runtime_binary\n",
+                violation.code.as_str()
+            )
+        );
+    }
+
+    /// SUP-6・REPAIR-3・REPAIR-4・SEC-4（#2822）: 全段で失敗の行が往復し、行の文字列・復号結果を具体値で照合する。
+    /// `execveat` は `R` の後だけ。メッセージは段から引く固定の英文で、パス・errno 文字列を含まない。
+    #[test]
+    fn sup6_2822_failure_line_roundtrips_every_step() {
+        let exit = ChildExit::Exited(126);
+        let err = ExecError::new(
+            ErrorCode::PermissionDenied,
+            IsolationStage::Exec,
+            "secret /host/path errno 13",
+        );
+        assert_eq!(ExecChildStep::ALL.len(), 15);
+        for step in ExecChildStep::ALL {
+            let line = exec_failure_line(step, &err);
+            assert_eq!(line, format!("126 {} PERMISSION_DENIED -\n", step.as_str()));
+            assert!(!line.contains("secret"), "{line}");
+            let status = if step == ExecChildStep::Execveat {
+                format!("R\n{line}")
+            } else {
+                line.clone()
+            };
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit),
+                ExecExit::SetupFailed {
+                    exit,
+                    violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(step),
+                },
+                "{step:?}"
+            );
+            assert_eq!(
+                classify_exec_status(status.as_bytes(), exit).failure_step(),
+                Some(step)
+            );
+            assert_eq!(ExecChildStep::from_token(step.as_str()), Some(step));
+            assert!(step.message().starts_with("the exec child "), "{step:?}");
+            assert!(!step.message().contains('/'), "{step:?}");
+        }
+        assert_eq!(ExecChildStep::from_token("bogus"), None);
+        assert_eq!(ExecChildStep::from_token(""), None);
+        assert_eq!(
+            ExecExit::Command(exit).failure_step(),
+            None,
+            "a started command has no failed step"
+        );
+        // 段の写像（既存の `IsolationStage` の語彙）。
+        assert_eq!(ExecChildStep::ParentLifetime.stage(), IsolationStage::Spawn);
+        assert_eq!(
+            ExecChildStep::CgroupJoin.stage(),
+            IsolationStage::CgroupJoin
+        );
+        assert_eq!(
+            ExecChildStep::DeferredRlimit.stage(),
+            IsolationStage::Rlimits
+        );
+        assert_eq!(ExecChildStep::Execveat.stage(), IsolationStage::Exec);
+        // トークンは互いに異なる。
+        let tokens: std::collections::HashSet<_> =
+            ExecChildStep::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(tokens.len(), ExecChildStep::ALL.len());
+        assert_eq!(exec_child_steps(), &ExecChildStep::ALL[..]);
+    }
+
+    /// 前段（`parent_lifetime`・`cgroup_join`）の失敗の行は、違反ではない（理由 `-`）終了コード 125 の 4 語で、
+    /// 親が段つきで復号する（#2822）。
+    #[test]
+    fn sup6_2822_pre_step_failure_is_reported_with_its_step() {
+        let exit = ChildExit::Exited(EXIT_SETUP_FAILED);
+        // 他のテストスレッドの fork が pipe の書き込み側の複製を持つと読み取りが `Err` になる。報告行は一度読むと
+        // 消費されるため、再試行ごとに pipe の作成と報告行の書き込みからやり直す（REPAIR-12）。
+        let result = (0..200)
+            .find_map(|_| {
+                let (reader, writer) = exec_status_pipe().unwrap();
+                report_exec_child_failure(
+                    &writer,
+                    ExecChildStep::CgroupJoin,
+                    ErrorCode::PermissionDenied,
+                );
+                drop(writer);
+                read_exec_status(&reader, exit).ok()
+            })
+            .expect("readable");
+        assert_eq!(
+            result,
+            ExecExit::SetupFailed {
+                exit,
+                violation: None,
+                code: ErrorCode::PermissionDenied,
+                step: Some(ExecChildStep::CgroupJoin),
+            }
+        );
+    }
+
+    /// 段 `parent_lifetime` の CODE は親の消失なら `FAILED_PRECONDITION`、syscall の予期しない失敗なら
+    /// `INTERNAL` で、行と復号の具体値が一致する（SUP-6・REPAIR-4・#2895）。
+    #[test]
+    fn sup6_2895_parent_lifetime_code_roundtrips() {
+        let exit = ChildExit::Exited(EXIT_SETUP_FAILED);
+        for (code, line) in [
+            (
+                ErrorCode::Internal,
+                &b"125 parent_lifetime INTERNAL -\n"[..],
+            ),
+            (
+                ErrorCode::FailedPrecondition,
+                b"125 parent_lifetime FAILED_PRECONDITION -\n",
+            ),
+        ] {
+            // 他スレッドの fork による読み取り失敗に備え、毎回 pipe の作成から再試行する（REPAIR-12）。
+            let result = (0..200)
+                .find_map(|_| {
+                    let (reader, writer) = exec_status_pipe().unwrap();
+                    report_exec_child_failure(&writer, ExecChildStep::ParentLifetime, code);
+                    drop(writer);
+                    read_exec_status(&reader, exit).ok()
+                })
+                .expect("readable");
+            assert_eq!(
+                result,
+                ExecExit::SetupFailed {
+                    exit,
+                    violation: None,
+                    code,
+                    step: Some(ExecChildStep::ParentLifetime),
+                },
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    /// 不正な段・長すぎる語・語数の過不足・`execveat` と `R` の不整合は、すべて段なし・`Internal` の未起動に落ちる
+    /// （子は untrusted。語彙を引く前に長さを検証する。#2822）。
+    #[test]
+    fn sup6_2822_rejects_unknown_or_oversized_step() {
+        let exit = ChildExit::Exited(126);
+        let unparsed = ExecExit::SetupFailed {
+            exit,
+            violation: None,
+            code: ErrorCode::Internal,
+            step: None,
+        };
+        let long_step = format!(
+            "126 {} NOT_FOUND -\n",
+            "s".repeat(EXEC_FAILURE_TOKEN_MAX + 1)
+        );
+        let long_line = format!(
+            "126 setsid NOT_FOUND {}\n",
+            "a".repeat(EXEC_FAILURE_LINE_MAX)
+        );
+        for bad in [
+            "126 unknown_step NOT_FOUND -\n".to_string(),
+            "126 setsid NOT_FOUND\n".to_string(),
+            "126 setsid NOT_FOUND - x\n".to_string(),
+            "126  setsid NOT_FOUND -\n".to_string(),
+            "126 execveat NOT_FOUND -\n".to_string(),
+            "R\n126 setsid NOT_FOUND -\n".to_string(),
+            long_step,
+            long_line,
+        ] {
+            assert_eq!(
+                classify_exec_status(bad.as_bytes(), exit),
+                unparsed,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// 全段 x 全 ERR-1 コード x 全理由の最長の行が上限（行・読み取り）に収まる（#2822）。
+    #[test]
+    fn sup6_2822_longest_failure_line_fits() {
+        let mut longest = 0usize;
+        for step in ExecChildStep::ALL {
+            assert!(step.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+            for code in ErrorCode::ALL {
+                assert!(code.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+                for reason in EXEC_CHILD_VIOLATIONS {
+                    assert!(reason.as_str().len() <= EXEC_FAILURE_TOKEN_MAX);
+                    let line = format!(
+                        "126 {} {} {}\n",
+                        step.as_str(),
+                        code.as_str(),
+                        reason.as_str()
+                    );
+                    longest = longest.max(line.len());
+                }
+            }
+        }
+        assert!(longest <= EXEC_FAILURE_LINE_MAX, "{longest}");
+        assert!(
+            longest + EXEC_STATUS_READY.len() <= EXEC_STATUS_MAX,
+            "{longest}"
+        );
     }
 
     /// SUP-6・REPAIR-5・TASK-163 追補（#1460）: 実 pipe からの読み取り。書き込み側が閉じていれば内容（または
@@ -4648,21 +5509,37 @@ mod tests {
             read(b""),
             ExecExit::SetupFailed {
                 exit,
-                violation: None
+                violation: None,
+                code: ErrorCode::Internal,
+                step: None,
             }
         );
         assert_eq!(
-            read(b"127 stdio_null_not_null_device\n"),
+            read(b"127 stdio_null PERMISSION_DENIED stdio_null_not_null_device\n"),
             ExecExit::SetupFailed {
                 exit,
-                violation: Some(ViolationReason::StdioNullNotNullDevice)
+                violation: Some(ViolationReason::StdioNullNotNullDevice),
+                code: ErrorCode::PermissionDenied,
+                step: Some(ExecChildStep::StdioNull),
+            }
+        );
+        // `R` の後の `execveat` の失敗（#2763）。
+        assert_eq!(
+            read(b"R\n127 execveat NOT_FOUND -\n"),
+            ExecExit::SetupFailed {
+                exit,
+                violation: None,
+                code: ErrorCode::NotFound,
+                step: Some(ExecChildStep::Execveat),
             }
         );
         assert_eq!(
             read(&[b'R'; 4096]),
             ExecExit::SetupFailed {
                 exit,
-                violation: None
+                violation: None,
+                code: ErrorCode::Internal,
+                step: None,
             }
         );
 
@@ -5350,7 +6227,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::sup6_rep5_1617_container_child_new_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -5450,7 +6327,7 @@ mod tests {
                 "--exact",
                 "exec::process::tests::rep5_1697_diagnostic_emit_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_EMIT_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -5820,9 +6697,24 @@ mod tests {
                 "injected failure",
             )
             .or_violation(ViolationReason::MaskedPathApplyFailed, None),
+            "root_readonly" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::RootReadOnly,
+                "injected failure",
+            ),
             "working_dir" => ExecError::new(
                 ErrorCode::NotFound,
                 IsolationStage::WorkingDir,
+                "injected failure",
+            ),
+            "apply_sysctls" => ExecError::new(
+                ErrorCode::InvalidArgument,
+                IsolationStage::ApplySysctls,
+                "injected failure",
+            ),
+            "etc_files" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountEtcFiles,
                 "injected failure",
             ),
             _ => ExecError::new(
@@ -5854,7 +6746,7 @@ mod tests {
         type Devices = ();
         type Pivoted = ();
         type Sysfs = ();
-        fn establish(&self) -> Result<(), ExecError> {
+        fn establish(&self, _: Option<&BindMountSet>) -> Result<(), ExecError> {
             self.step("establish")
         }
         fn prepare_rootfs(&self, _: &(), _: &Path) -> Result<(), ExecError> {
@@ -5862,6 +6754,9 @@ mod tests {
         }
         fn verify_pinned(&self, _: &(), _: BorrowedFd<'_>) -> Result<(), ExecError> {
             self.step("verify_pinned")
+        }
+        fn apply_sysctls(&self, _: &(), _: &(), _: &SysctlPlan<'_>) -> Result<(), ExecError> {
+            self.step("apply_sysctls")
         }
         fn mount_sysfs(&self, _: &(), _: &(), _: &SysfsMountSpec) -> Result<(), ExecError> {
             self.step("mount_sysfs")
@@ -5879,6 +6774,9 @@ mod tests {
         }
         fn inject_files(&self, _: &(), _: &(), _: &InjectedFileSet) -> Result<(), ExecError> {
             self.step("inject_files")
+        }
+        fn mount_etc_files(&self, _: &(), _: &(), _: &EtcFileMounts) -> Result<(), ExecError> {
+            self.step("etc_files")
         }
         fn mount_binds(&self, _: &(), _: &(), _: &BindMountSet) -> Result<(), ExecError> {
             self.step("mount_binds")
@@ -5904,6 +6802,9 @@ mod tests {
         }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
             self.step("pivot_root")
+        }
+        fn make_root_read_only(&self, _: &()) -> Result<(), ExecError> {
+            self.step("root_readonly")
         }
         fn enter_working_dir(&self, _: &(), _: &ContainerWorkingDir) -> Result<(), ExecError> {
             self.step("working_dir")
@@ -5946,21 +6847,35 @@ mod tests {
         let inject = InjectedFileSet::new();
         let binds = test_binds("/mnt/data");
         let sysfs = test_sysfs();
+        let sysctl_set = test_sysctl_set();
+        let sysctl_plan = SysctlPlan::new(&sysctl_set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
         let pinned = std::fs::File::open("/").unwrap();
+        let etc_mounts = EtcFileMounts::for_test(
+            &[
+                crate::etc_files::EtcFileKind::Hosts,
+                crate::etc_files::EtcFileKind::ResolvConf,
+            ],
+            false,
+        );
         let _ = take_calls();
         run_pre_pivot(
             &RecordingOps { fail_at: None },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: Some(&sysctl_plan),
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
+                etc_files: Some(&etc_mounts),
                 binds: Some(&binds),
                 sysfs: Some(&sysfs),
                 pinned_rootfs: Some(pinned.as_fd()),
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .unwrap();
@@ -5970,16 +6885,74 @@ mod tests {
                 "establish",
                 "prepare_rootfs",
                 "verify_pinned",
+                "apply_sysctls",
                 "mount_sysfs",
                 "create_default_devices",
                 "mount_tmpfs",
                 "inject_files",
+                "etc_files",
                 "mount_binds",
                 "readonly_paths",
                 "masked_paths",
                 "pivot_root",
             ]
         );
+    }
+
+    /// CRI-2・CORE-3（#2670）: sysctl の適用が失敗したら、`readonly_paths` 以降（特に `pivot_root`）へ進まない。
+    /// 失敗の段は `ApplySysctls`、符号化した状態行は段名つきで往復する。
+    #[test]
+    fn cri2_run_pre_pivot_sysctl_failure_stops_before_later_steps() {
+        let sysctl_set = test_sysctl_set();
+        let plan = SysctlPlan::new(&sysctl_set, crate::exec::NamespaceSet::all())
+            .unwrap()
+            .unwrap();
+        let pinned = std::fs::File::open("/").unwrap();
+        let _ = take_calls();
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("apply_sysctls"),
+            },
+            Path::new("/rootfs"),
+            Some(PrePivotSetup {
+                sysctls: Some(&plan),
+                devices: DevptsGidSource::Rootful,
+                tmpfs: None,
+                inject: None,
+                etc_files: None,
+                binds: None,
+                sysfs: None,
+                pinned_rootfs: Some(pinned.as_fd()),
+                config_paths: ConfigPaths::NONE,
+                status: None,
+                working_dir: None,
+                root_readonly: false,
+            }),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.step, PrePivotStep::ApplySysctls);
+        assert_eq!(err.error.stage, IsolationStage::ApplySysctls);
+        assert_eq!(err.error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            take_calls(),
+            [
+                "establish",
+                "prepare_rootfs",
+                "verify_pinned",
+                "apply_sysctls"
+            ]
+        );
+    }
+
+    fn test_sysctl_set() -> crate::sysctl::SysctlSet {
+        let mut set = crate::sysctl::SysctlSet::new();
+        set.insert(
+            crate::sysctl::SysctlKey::parse("kernel.shmmax").unwrap(),
+            crate::sysctl::SysctlValue::parse("16384").unwrap(),
+        )
+        .unwrap();
+        set
     }
 
     /// SEC-2（#2014）: `masked_paths` 段へは `mount_sysfs` の証跡が、sysfs の指定があるときだけ渡る。
@@ -5992,15 +6965,18 @@ mod tests {
                 &RecordingOps { fail_at: None },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: None,
                     inject: None,
+                    etc_files: None,
                     binds: None,
                     sysfs: spec,
                     pinned_rootfs: None,
                     config_paths: ConfigPaths::NONE,
                     status: None,
                     working_dir: None,
+                    root_readonly: false,
                 }),
             )
             .unwrap();
@@ -6017,15 +6993,18 @@ mod tests {
             &RecordingOps { fail_at: None },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .unwrap();
@@ -6056,15 +7035,18 @@ mod tests {
     #[test]
     fn oci1_run_pre_pivot_enters_working_dir_after_pivot() {
         let setup = |wd: Option<&'static ContainerWorkingDir>| PrePivotSetup {
+            sysctls: None,
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             pinned_rootfs: None,
             config_paths: ConfigPaths::NONE,
             status: None,
             working_dir: wd,
+            root_readonly: false,
         };
         let app: &'static ContainerWorkingDir = Box::leak(Box::new(
             ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
@@ -6106,6 +7088,64 @@ mod tests {
         assert_eq!(err.error.code, ErrorCode::NotFound);
     }
 
+    /// CORE-5・SEC-1（#2767）: `root_readonly` は `pivot_root` の直後・`working_dir` の前に 1 回だけ呼ばれ、
+    /// `false` と `setup` なしでは呼ばれない。失敗は段 `RootReadOnly` で返り、後段へ進まない。
+    #[test]
+    fn core5_run_pre_pivot_root_readonly_after_pivot_before_working_dir() {
+        let app: &'static ContainerWorkingDir = Box::leak(Box::new(
+            ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
+        ));
+        let setup = |ro: bool| PrePivotSetup {
+            sysctls: None,
+            devices: DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            etc_files: None,
+            binds: None,
+            sysfs: None,
+            pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
+            status: None,
+            working_dir: Some(app),
+            root_readonly: ro,
+        };
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .unwrap();
+        let calls = take_calls();
+        assert_eq!(
+            calls.iter().rev().take(3).cloned().collect::<Vec<_>>(),
+            ["working_dir", "root_readonly", "pivot_root"]
+        );
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(false)),
+        )
+        .unwrap();
+        assert!(!take_calls().iter().any(|c| c == "root_readonly"));
+        run_pre_pivot(&RecordingOps { fail_at: None }, Path::new("/rootfs"), None).unwrap();
+        assert!(!take_calls().iter().any(|c| c == "root_readonly"));
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("root_readonly"),
+            },
+            Path::new("/rootfs"),
+            Some(setup(true)),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::RootReadOnly);
+        assert_eq!(err.error.stage, IsolationStage::RootReadOnly);
+        let calls = take_calls();
+        assert_eq!(calls.last().map(String::as_str), Some("root_readonly"));
+        assert!(!calls.iter().any(|c| c == "working_dir"));
+    }
+
     /// SEC-2（#1850）: 読み取り専用パスの適用が失敗したら `pivot_root` へ進まない。`setup` が `None` の最小構成でも
     /// 適用され、失敗の段は `ReadonlyPaths`・段のエラーは `MountReadonlyPaths`。
     #[test]
@@ -6134,15 +7174,18 @@ mod tests {
     #[test]
     fn sec2_run_pre_pivot_masked_paths_failure_stops_before_pivot() {
         let setup = || PrePivotSetup {
+            sysctls: None,
             devices: DevptsGidSource::Rootful,
             tmpfs: None,
             inject: None,
+            etc_files: None,
             binds: None,
             sysfs: None,
             pinned_rootfs: None,
             config_paths: ConfigPaths::NONE,
             status: None,
             working_dir: None,
+            root_readonly: false,
         };
         let _ = take_calls();
         let err = run_pre_pivot(
@@ -6199,15 +7242,18 @@ mod tests {
             },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: Some(&tmpfs),
                 inject: None,
+                etc_files: None,
                 binds: None,
                 sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .err()
@@ -6231,15 +7277,18 @@ mod tests {
             },
             Path::new("/rootfs"),
             Some(PrePivotSetup {
+                sysctls: None,
                 devices: DevptsGidSource::Rootful,
                 tmpfs: None,
                 inject: None,
+                etc_files: None,
                 binds: Some(&binds),
                 sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
                 working_dir: None,
+                root_readonly: false,
             }),
         )
         .err()
@@ -6305,9 +7354,11 @@ mod tests {
                 &RecordingOps { fail_at: None },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
+                    etc_files: None,
                     binds: Some(&binds),
                     sysfs: None,
                     pinned_rootfs: None,
@@ -6317,6 +7368,7 @@ mod tests {
                     },
                     status: None,
                     working_dir: None,
+                    root_readonly: false,
                 }),
             )
             .err()
@@ -6370,6 +7422,7 @@ mod tests {
             ),
             ("mount_tmpfs", ErrorCode::NotFound, None),
             ("inject_files", ErrorCode::InvalidArgument, None),
+            ("etc_files", ErrorCode::FailedPrecondition, None),
             (
                 "mount_binds",
                 ErrorCode::PermissionDenied,
@@ -6393,6 +7446,7 @@ mod tests {
             ("working_dir", ErrorCode::NotFound, None),
         ];
         let wd = ContainerWorkingDir::parse(Path::new("/app")).unwrap();
+        let etc_mounts = EtcFileMounts::for_test(&[crate::etc_files::EtcFileKind::Hosts], false);
         for (name, code, reason) in expected {
             let err = run_pre_pivot(
                 &RecordingOps {
@@ -6400,15 +7454,18 @@ mod tests {
                 },
                 Path::new("/rootfs"),
                 Some(PrePivotSetup {
+                    sysctls: None,
                     devices: DevptsGidSource::Rootful,
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
+                    etc_files: Some(&etc_mounts),
                     binds: Some(&binds),
                     sysfs: None,
                     pinned_rootfs: Some(pinned.as_fd()),
                     config_paths: ConfigPaths::NONE,
                     status: None,
                     working_dir: Some(&wd),
+                    root_readonly: false,
                 }),
             )
             .err()

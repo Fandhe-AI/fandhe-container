@@ -237,6 +237,8 @@ fn sup6_setup_failed_keeps_child_exit_status() {
     let exit = ExecExit::SetupFailed {
         exit: ChildExit::Exited(127),
         violation: None,
+        code: ErrorCode::NotFound,
+        step: None,
     };
     assert_eq!(child_exit_code(exit.child_exit()), 127);
     assert_eq!(
@@ -258,6 +260,8 @@ fn sup6_exit_codes_pass_through_the_wiring() {
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(127),
                 violation: None,
+                code: ErrorCode::NotFound,
+                step: None,
             },
             127,
         ),

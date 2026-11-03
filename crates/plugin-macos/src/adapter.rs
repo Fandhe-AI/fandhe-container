@@ -7,7 +7,7 @@
 //! 関数呼び出し → 応答本体 / [`PluginError`]」だけを担う。呼び出し先の VM 操作は [`MacosBackend`] 越しにし、
 //! 実 VM を起動できない 3 OS の CI でも偽実装でテストできるようにする。
 //!
-//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）
+//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）
 //!
 //! | 操作 | 要求本体 | 成功応答本体 |
 //! | ---- | -------- | ------------ |
@@ -25,7 +25,7 @@
 //! 対象外（PLUG-4）。
 //!
 //! `id` は core の `ContainerId` と同じ規則（空・`.`・`..` 不可、255 バイト以下、`[A-Za-z0-9._-]`）で
-//! 検証する（#1869 の設計で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
+//! 検証する（#1869 の設計で core 型へ置換。起票は #2232）。create は検証と登録のみ、start が `Vm::launch`、stop が
 //! `Vm::stop` と登録解除（delete が無いため stop が資源をすべて手放す）。
 //!
 //! # エラー対応表（[`to_plugin_error`] が唯一の変換箇所）
@@ -120,7 +120,7 @@
 //!   終了）の挙動は実機未確認。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
-//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（#1869 の設計待ち）。
+//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（#1869 の設計。承認と実装 issue の起票は #2232）。
 //!   コンソールログの削除（現在のログと全世代。`VmConfigSpec::remove_console_logs`）は delete の実装時に呼ぶ予定で、
 //!   現時点では呼び出し元が無い（ログは stop 後も残る。#2138）。
 //! - virtiofs 共有は、マウント先とコンソールログを指定すればゲスト init の報告を待つ（上の節）。initrd へのゲスト init の梱包
@@ -872,6 +872,27 @@ fn backend_to_plugin(e: &BackendError) -> PluginError {
     }
 }
 
+/// `VirtiofsIoError::Protocol` の `virtiofs_io.*` コードから `PluginErrorCode` への写像表（ERR-1・REPAIR-1）。
+///
+/// `IoErrorCode` の全 variant を明示する（`virtiofs_io.internal` も含む）。`resource_exhausted` は既存の
+/// ワイヤー互換のため `FailedPrecondition` へ据え置く。表に無い将来分は `Internal`（fail-closed）。
+const VIRTIOFS_IO_TO_PLUGIN: [(&str, PluginErrorCode); 8] = [
+    (
+        "virtiofs_io.invalid_argument",
+        PluginErrorCode::InvalidArgument,
+    ),
+    ("virtiofs_io.timeout", PluginErrorCode::Timeout),
+    ("virtiofs_io.unavailable", PluginErrorCode::Unavailable),
+    ("virtiofs_io.unimplemented", PluginErrorCode::Unimplemented),
+    ("virtiofs_io.internal", PluginErrorCode::Internal),
+    ("virtiofs_io.data_loss", PluginErrorCode::DataLoss),
+    (
+        "virtiofs_io.resource_exhausted",
+        PluginErrorCode::FailedPrecondition,
+    ),
+    ("virtiofs_io.already_exists", PluginErrorCode::AlreadyExists),
+];
+
 /// platform-macos のエラーを plugin のエラーフレーム用へ変換する唯一の箇所（モジュール doc の対応表）。
 pub fn to_plugin_error(e: &PlatformError) -> PluginError {
     use PluginErrorCode as C;
@@ -934,16 +955,10 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
         }
         PlatformError::VirtiofsIo(v) => {
             let code = match v {
-                VirtiofsIoError::Protocol { .. } => match e.code() {
-                    "virtiofs_io.invalid_argument" => C::InvalidArgument,
-                    "virtiofs_io.timeout" => C::Timeout,
-                    "virtiofs_io.unavailable" => C::Unavailable,
-                    "virtiofs_io.unimplemented" => C::Unimplemented,
-                    "virtiofs_io.data_loss" => C::DataLoss,
-                    "virtiofs_io.already_exists" => C::AlreadyExists,
-                    "virtiofs_io.resource_exhausted" => C::FailedPrecondition,
-                    _ => C::Internal,
-                },
+                VirtiofsIoError::Protocol { .. } => VIRTIOFS_IO_TO_PLUGIN
+                    .iter()
+                    .find(|(name, _)| *name == e.code())
+                    .map_or(C::Internal, |(_, pc)| *pc),
                 VirtiofsIoError::ReadOnlyShare { .. } => C::FailedPrecondition,
                 VirtiofsIoError::InFlightLimitTooSmall { .. }
                 | VirtiofsIoError::InvalidReconnectPolicy { .. } => C::InvalidArgument,
@@ -1084,10 +1099,100 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("mkdir");
-        d.canonicalize().expect("canon")
+    /// 試験用ディレクトリ。既存の名前は消さず・辿らず排他作成（unix は 0700）し、Drop で自分が作った
+    /// パスだけを消す（共有部品 `test_root`。REPAIR-12・#3375・#3506）。Deref 先は正規化済みのパス。
+    struct TmpDir {
+        canon: PathBuf,
+        #[allow(dead_code)] // Drop で消す所有者。`raw` は unix の試験だけが使う
+        root: crate::test_root::TestRoot,
+    }
+
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.canon
+        }
+    }
+
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.canon
+        }
+    }
+
+    impl TmpDir {
+        /// 正規化していない綴り(macOS では祖先に symlink を含む)。排他作成した実体と同じ場所。
+        #[cfg(unix)]
+        fn raw(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    /// `p` を第 1 候補に排他作成する。既にあれば別名になるため、返り値のパスを使う。
+    fn tmp_dir_at(p: PathBuf) -> TmpDir {
+        let root = crate::test_root::test_root_at(p);
+        let canon = root.canonicalize().expect("canon");
+        TmpDir { canon, root }
+    }
+
+    fn tmp_dir(name: &str) -> TmpDir {
+        tmp_dir_at(std::env::temp_dir().join(format!("fc-adapter-{}-{name}", std::process::id())))
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 前回の残骸（同名のディレクトリと古い kernel）があっても `tmp_dir_at` は
+    /// 消さず、別名の空のディレクトリを返す。残骸は無傷で残り、drop で新しい方だけが消える。
+    #[test]
+    fn mac1_repair12_3506_tmp_dir_leaves_stale_residue_untouched() {
+        let parent = tmp_dir("stale-parent");
+        let stale = parent.join("stale");
+        std::fs::create_dir_all(stale.join("old")).expect("stale dir");
+        std::fs::write(stale.join("vmlinuz"), b"old").expect("stale file");
+        let new_path = {
+            let d = tmp_dir_at(stale.clone());
+            assert_ne!(&*d, stale.as_path());
+            assert_eq!(d.parent(), Some(&*parent));
+            assert_eq!(std::fs::read_dir(&d).expect("read_dir").count(), 0);
+            d.to_path_buf()
+        };
+        assert!(!new_path.exists());
+        assert!(stale.join("old").is_dir());
+        assert_eq!(std::fs::read(stale.join("vmlinuz")).expect("read"), b"old");
+    }
+
+    /// MAC-1・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_repair12_3506_tmp_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = tmp_dir("symlink-parent");
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let d1 = tmp_dir_at(link.clone());
+        let d2 = tmp_dir_at(dangling.clone());
+        assert_ne!(&*d1, link.as_path());
+        assert_ne!(&*d2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&d1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
     }
 
     fn kernel(dir: &Path) -> String {
@@ -1594,9 +1699,8 @@ mod tests {
         let dir = tmp_dir("share-temp");
         let k = kernel(&dir);
         // 正規化していない綴り（macOS では祖先に symlink を含む）。
-        let raw = std::env::temp_dir()
-            .join(format!("fc-adapter-{}-share-temp", std::process::id()))
-            .join("share");
+        let raw = dir.raw().join("share");
+        // 親は `tmp_dir` が排他作成した同じ場所（kernel を置いている）。ここでは消さない。
         std::fs::create_dir_all(&raw).expect("mkdir");
         let (mut a, f) = adapter();
         assert_eq!(
@@ -2164,6 +2268,33 @@ mod tests {
         );
     }
 
+    /// REPAIR-1・ERR-1: `IoErrorCode::ALL` の各要素が表の期待どおりの `PluginErrorCode` へ写る
+    /// （期待表の件数が `ALL` と一致し、`Internal` も表から引かれる）。
+    #[test]
+    fn err1_virtiofs_io_table_covers_io_error_code_all() {
+        use PluginErrorCode as C;
+        let expected = [
+            (IoErrorCode::InvalidArgument, C::InvalidArgument),
+            (IoErrorCode::Timeout, C::Timeout),
+            (IoErrorCode::Unavailable, C::Unavailable),
+            (IoErrorCode::Unimplemented, C::Unimplemented),
+            (IoErrorCode::Internal, C::Internal),
+            (IoErrorCode::DataLoss, C::DataLoss),
+            (IoErrorCode::ResourceExhausted, C::FailedPrecondition),
+            (IoErrorCode::AlreadyExists, C::AlreadyExists),
+        ];
+        assert_eq!(expected.len(), IoErrorCode::ALL.len());
+        assert_eq!(VIRTIOFS_IO_TO_PLUGIN.len(), IoErrorCode::ALL.len());
+        for (i, (io_code, plugin_code)) in expected.into_iter().enumerate() {
+            assert_eq!(IoErrorCode::ALL[i], io_code);
+            let e = PlatformError::VirtiofsIo(VirtiofsIoError::Protocol {
+                op: VirtiofsIoOp::Write,
+                source: IoError::new(io_code, "x"),
+            });
+            assert_eq!(pe(e).0, plugin_code, "{io_code:?}");
+        }
+    }
+
     /// TASK-115.3・ERR-1・IO-2: virtiofs I/O エラーの対応（データ喪失の可能性を区別する）。
     #[test]
     fn task115_3_err1_virtiofs_io_mapping() {
@@ -2510,9 +2641,14 @@ mod tests {
     }
 
     /// マウント先つきで create し、backend の launch が `err` を返すようにして start の結果を返す。
+    /// `name` は試験ごとに異なる一時ディレクトリ名にする（並行実行する試験が同じ
+    /// ディレクトリを取り合わないため。MAC-1・REPAIR-12）。
     #[cfg(unix)]
-    fn gm_started(err: PlatformError) -> (MacosRuntimeAdapter<Fake>, (PluginErrorCode, String)) {
-        let dir = tmp_dir("gm-launch");
+    fn gm_started(
+        name: &str,
+        err: PlatformError,
+    ) -> (MacosRuntimeAdapter<Fake>, (PluginErrorCode, String)) {
+        let dir = tmp_dir(name);
         let k = kernel(&dir);
         let d1 = gm_share_dir(&dir, "s1");
         let log = dir.join("console.log");
@@ -2534,10 +2670,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mac1_guest_mount_report_timeout_maps_to_timeout() {
-        let (mut a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Timeout {
-            after: LAUNCH_GUEST_MOUNT_TIMEOUT,
-            pending: vec!["SECRETTAG".into()],
-        }));
+        let (mut a, e) = gm_started(
+            "gm-launch-timeout",
+            PlatformError::GuestMount(GuestMountError::Timeout {
+                after: LAUNCH_GUEST_MOUNT_TIMEOUT,
+                pending: vec!["SECRETTAG".into()],
+            }),
+        );
         assert_eq!(
             e,
             (
@@ -2559,10 +2698,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mac1_guest_mount_failure_report_maps_to_internal() {
-        let (_a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Failed {
-            tag: "SECRETTAG".into(),
-            errno: 5,
-        }));
+        let (_a, e) = gm_started(
+            "gm-launch-failed",
+            PlatformError::GuestMount(GuestMountError::Failed {
+                tag: "SECRETTAG".into(),
+                errno: 5,
+            }),
+        );
         assert_eq!(
             e,
             (

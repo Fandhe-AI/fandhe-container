@@ -1,11 +1,12 @@
-//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `exec` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `kill` / `delete` / `list` / `logs` / `exec` / `inspect` / `state` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
-//! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
+//! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`・`--pasta-path`・`--pasta-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start [--audit-policy <best-effort|strict>] <id>` / `... stop [--signal <名前|番号>] <id>` / `... kill <id> [<signal>]` / `... inspect <id>` / `... state <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! `exec`（SUP-6・#2626）は `... exec [--env KEY=VALUE]... [--timeout <秒>] <id> <path> [<arg>...]`（オプションは `<id>` の前だけ）。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
+//! ユーザー定義ネットワーク（#3066・NET-6）は `network create <name>` / `network rm <name>` / `network ls`（オプションなし）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -23,6 +24,18 @@ pub(super) struct GlobalArgs {
     ///
     /// 3 OS で同一構文を受理する（CLI-1）が、Linux は plugin を介さず core を直接呼ぶため効果はない。
     pub(super) plugin_path_search: bool,
+    /// `--pasta-path <絶対パス>` / `--pasta-path-search`（rootless のユーザー定義ネットワークで使う pasta の指定。
+    /// NET-9・PLUG-11・CLI-1・#3199。両方の指定は使い方エラー）。効くのは `create` だけ（`create_pasta` が判定する）。
+    pub(super) pasta: Option<PastaSource>,
+}
+
+/// pasta の場所の指定（2 つのグローバルフラグは排他）。値の形の検証は net の `verify_pasta_binary` に任せる（二重実装を避ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PastaSource {
+    /// `--pasta-path <path>`（絶対パス。相対パスなどは net が `INVALID_ARGUMENT` にする）。
+    Path(PathBuf),
+    /// `--pasta-path-search`（CLI 自身の `PATH` を探索する opt-in。採ったパスは警告 1 行で出す）。
+    PathSearch,
 }
 
 /// `create` の引数。
@@ -32,7 +45,60 @@ pub(super) struct CreateArgs {
     pub(super) id: String,
     /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
     pub(super) image: Option<CreateImageArgs>,
+    /// `--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`(未検証の文字列。意味検証は `create_options`)と、`--network`・`--add-host`・`--dns`(`options.network`。意味検証は `create_network`。NET-12・#1871)。
+    /// SUP-12・CLI-1・#2713)。
+    pub(super) options: CreateOptionArgs,
 }
+
+/// `create` の起動オプションの指定(argv の生の値。件数の上限だけをここで見て、形式の検証は `create_options` が既存の
+/// パーサで行う。SUP-12・SEC-1・#2713)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct CreateOptionArgs {
+    /// `--ulimit <name>=<soft>[:<hard>]`(最大 [`MAX_CREATE_ULIMITS`] 件)。
+    pub(super) ulimits: Vec<String>,
+    /// `--env` / `-e` `<KEY=VALUE>`(最大 `ENV_MAX_ENTRIES` 件)。
+    pub(super) env: Vec<String>,
+    /// `--env-file <path>`(最大 [`MAX_CREATE_ENV_FILES`] 件。CLI が非特権のまま読む)。
+    pub(super) env_files: Vec<PathBuf>,
+    /// `--label <key>[=<value>]`(最大 `ANNOTATIONS_MAX_ENTRIES` − 1 件。世代の注釈の分を空ける)。
+    pub(super) labels: Vec<String>,
+    /// `--ipc <private|shareable|host>`(1 回まで)。
+    pub(super) ipc: Option<String>,
+    /// `--shm-size <size>`(1 回まで)。
+    pub(super) shm_size: Option<String>,
+    /// `--tmpfs <dest>[:<opts>]`(最大 `TMPFS_MAX_MOUNTS` 件)。
+    pub(super) tmpfs: Vec<String>,
+    /// `--cap-drop <CAP>`(最大 core の `MAX_DROP_NAMES` 件。`ALL` を含む。CLI-1・SEC-1・#2775)。
+    pub(super) cap_drop: Vec<String>,
+    /// `--read-only`(値を取らないフラグ。1 回まで。`root.readonly` と OR で効く。CLI-1・SUP-12・#2828)。
+    pub(super) read_only: bool,
+    /// `--network`・`--add-host`・`--dns`(未検証の文字列。意味検証は `create_network`。NET-12・CLI-1・#1871)。
+    pub(super) network: CreateNetworkArgs,
+}
+
+/// `create` のネットワーク関連フラグ(argv の生の値。件数と 1 値の長さの上限だけをここで見る。#1871・NET-12)。
+///
+/// 意味検証は `create_network::validate_network_options` が net の検証関数で行う。Linux の `none` / `host` /
+/// `--add-host` / `--dns` は #1873(PR #3322)で結線済みで、ユーザー定義名・`container:`・`-p` と非 Linux の指定は
+/// 検証を通っても `UNIMPLEMENTED` で拒否する(判定は `create_network::reject_unwired_network`。
+/// rootless のユーザー定義名と `-p` は #3329 で結線済み〔rootful は D13 の判断待ちで `UNIMPLEMENTED`〕。NET-6・REPAIR-3)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct CreateNetworkArgs {
+    /// `--network <none|host|名前>`(1 回まで。64 バイト以下)。
+    pub(super) network: Option<String>,
+    /// `--add-host <hostname>:<ip>`(最大 `MAX_ADD_HOST_ENTRIES` 件。1 件 `MAX_ADD_HOST_LEN` バイト以下)。
+    pub(super) add_hosts: Vec<String>,
+    /// `--dns <ip>`(最大 `MAX_DNS_SERVERS` 件。1 件 `MAX_IP_TEXT_LEN` バイト以下)。
+    pub(super) dns: Vec<String>,
+    /// `-p` / `--publish <[ipv4:]host:container[/tcp|udp]>`(最大 `MAX_PORT_PUBLISHES` 件。1 件 `MAX_PORT_FORWARD_SPEC_LEN` バイト以下。
+    /// rootless の pasta のみ。NET-9・NET-3・#3200)。
+    pub(super) publish: Vec<String>,
+}
+
+/// `create --ulimit` の最大件数(rlimit の種別数と同じ 16)。
+pub(super) const MAX_CREATE_ULIMITS: usize = 16;
+/// `create --env-file` の最大件数。
+pub(super) const MAX_CREATE_ENV_FILES: usize = 64;
 
 /// `create` のイメージ指定。意味検証（digest・タグ参照の形式、ストア root の存在）は呼び出し元が core / oci の型に委ねる。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +113,36 @@ pub(super) struct CreateImageArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StartArgs {
     pub(super) id: String,
+    /// `--audit-policy` の生の値(未検証。語彙の検証は `create_start` が core の `AuditCoveragePolicy` に委ねる。SEC-4・#2761)。
+    pub(super) audit_policy: Option<String>,
 }
 
 /// `stop` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StopArgs {
+    pub(super) id: String,
+    /// `--signal <名前|番号>` の生の値(未検証。Docker 表記の解釈は `stop_delete` が core の `Signal::parse_notation` に
+    /// 委ねる。未指定は SIGTERM。CLI-1・ERR-1・#2775)。
+    pub(super) signal: Option<String>,
+}
+
+/// `kill` の引数（CLI-1・#1902）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KillArgs {
+    pub(super) id: String,
+    /// 位置引数 `<signal>` の生の値（未検証。解釈は `kill_signal::parse_kill_signal`。未指定は SIGTERM）。
+    pub(super) signal: Option<String>,
+}
+
+/// `state` の引数(CLI-1・SUP-11・#1903)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StateArgs {
+    pub(super) id: String,
+}
+
+/// `inspect` の引数(CLI-1・SUP-11・#2775)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InspectArgs {
     pub(super) id: String,
 }
 
@@ -61,7 +152,8 @@ pub(super) struct DeleteArgs {
     pub(super) id: String,
     /// `--force`（core の `DeleteRequest::with_force` へ素通しする。生存中コンテナへは core が拒否する）。
     pub(super) force: bool,
-    /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は解除しない。OCI-7・#2315）。
+    /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は create 時に状態記録へ残した root を使い、
+    /// 指定が記録と食い違えば拒否する。記録の無いコンテナでは解除しない。OCI-7・#2315・#2499）。
     pub(super) image_root: Option<PathBuf>,
 }
 
@@ -137,6 +229,17 @@ pub(super) enum ImageArgs {
     Tag(ImageTagArgs),
 }
 
+/// `network` サブコマンドの引数（NET-6・CLI-1・#3066。オプションは持たず位置引数だけ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NetworkArgs {
+    /// `network create <name>`（名前の意味検証は net の `NetworkName::new` に委ねる）。
+    Create(String),
+    /// `network rm <name>`。
+    Rm(String),
+    /// `network ls`。
+    Ls,
+}
+
 /// `image tag` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ImageTagArgs {
@@ -186,7 +289,8 @@ pub(super) struct UsageError;
 
 /// 先頭のグローバルオプションを読み、残り（サブコマンド名以降）を返す。
 ///
-/// 現状のグローバルオプションは `--root <dir>` のみ。重複・値欠落は使い方エラー。
+/// グローバルオプションは `--root <dir>`・`--plugin-path-search`・`--pasta-path <path>`・`--pasta-path-search`（順不同・各 1 回まで。
+/// `--pasta-path` と `--pasta-path-search` の併用も不可）。重複・値欠落は使い方エラー。
 pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsString>), UsageError> {
     let mut global = GlobalArgs::default();
     let mut it = args.into_iter().peekable();
@@ -204,6 +308,19 @@ pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsStr
                 return Err(UsageError);
             }
             global.plugin_path_search = true;
+        } else if it.peek().is_some_and(|a| a == "--pasta-path") {
+            it.next();
+            let value = it.next().ok_or(UsageError)?;
+            if global.pasta.is_some() {
+                return Err(UsageError);
+            }
+            global.pasta = Some(PastaSource::Path(PathBuf::from(value)));
+        } else if it.peek().is_some_and(|a| a == "--pasta-path-search") {
+            it.next();
+            if global.pasta.is_some() {
+                return Err(UsageError);
+            }
+            global.pasta = Some(PastaSource::PathSearch);
         } else {
             break;
         }
@@ -217,12 +334,43 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
     let mut bundle: Option<PathBuf> = None;
     let mut image_root: Option<PathBuf> = None;
     let mut reference: Option<String> = None;
+    let mut options = CreateOptionArgs::default();
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         if a == "--" {
             positional.extend(it.by_ref());
             break;
+        } else if let Some(kind) = repeatable_option(&a) {
+            let value = it.next().ok_or(UsageError)?;
+            push_option(&mut options, kind, value)?;
+        } else if a == "--ipc" || a == "--shm-size" {
+            let value = it.next().ok_or(UsageError)?;
+            let slot = if a == "--ipc" {
+                &mut options.ipc
+            } else {
+                &mut options.shm_size
+            };
+            if slot.is_some() {
+                return Err(UsageError);
+            }
+            *slot = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if a == "--network" {
+            let value = it.next().ok_or(UsageError)?;
+            if options.network.network.is_some() {
+                return Err(UsageError);
+            }
+            let value = value.into_string().map_err(|_| UsageError)?;
+            if value.len() > fandhe_container_net::network::NAME_MAX_LEN {
+                return Err(UsageError);
+            }
+            options.network.network = Some(value);
+        } else if a == "--read-only" {
+            // 値を取らない(`--read-only=false` は未知のオプション、`--read-only true` は余剰の位置引数で使い方エラー)。
+            if options.read_only {
+                return Err(UsageError);
+            }
+            options.read_only = true;
         } else if a == "--bundle" {
             let value = it.next().ok_or(UsageError)?;
             if bundle.is_some() {
@@ -266,19 +414,228 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
         bundle: bundle.ok_or(UsageError)?,
         id,
         image,
+        options,
     })
 }
 
-/// `start <id>` を解析する。
+/// 繰り返せる `create` のオプションの種類。
+#[derive(Clone, Copy)]
+enum RepeatableOption {
+    Ulimit,
+    Env,
+    EnvFile,
+    Label,
+    Tmpfs,
+    CapDrop,
+    AddHost,
+    Dns,
+    Publish,
+}
+
+fn repeatable_option(a: &OsString) -> Option<RepeatableOption> {
+    if a == "--ulimit" {
+        Some(RepeatableOption::Ulimit)
+    } else if a == "--env" || a == "-e" {
+        Some(RepeatableOption::Env)
+    } else if a == "--env-file" {
+        Some(RepeatableOption::EnvFile)
+    } else if a == "--label" {
+        Some(RepeatableOption::Label)
+    } else if a == "--tmpfs" {
+        Some(RepeatableOption::Tmpfs)
+    } else if a == "--cap-drop" {
+        Some(RepeatableOption::CapDrop)
+    } else if a == "--add-host" {
+        Some(RepeatableOption::AddHost)
+    } else if a == "--dns" {
+        Some(RepeatableOption::Dns)
+    } else if a == "--publish" || a == "-p" {
+        Some(RepeatableOption::Publish)
+    } else {
+        None
+    }
+}
+
+/// 値を種類ごとの列へ足す。件数が上限を超えたら使い方エラー(確保の前に止める。値の形式はここでは見ない)。
+fn push_option(
+    options: &mut CreateOptionArgs,
+    kind: RepeatableOption,
+    value: OsString,
+) -> Result<(), UsageError> {
+    use fandhe_container_core::capabilities::MAX_DROP_NAMES;
+    use fandhe_container_core::tmpfs::TMPFS_MAX_MOUNTS;
+    use fandhe_container_core::traits::ANNOTATIONS_MAX_ENTRIES;
+    use fandhe_container_supervisor::container_options::env::ENV_MAX_ENTRIES;
+    fn text(value: OsString) -> Result<String, UsageError> {
+        value.into_string().map_err(|_| UsageError)
+    }
+    match kind {
+        RepeatableOption::Ulimit => {
+            if options.ulimits.len() >= MAX_CREATE_ULIMITS {
+                return Err(UsageError);
+            }
+            options.ulimits.push(text(value)?);
+        }
+        RepeatableOption::Env => {
+            if options.env.len() >= ENV_MAX_ENTRIES {
+                return Err(UsageError);
+            }
+            options.env.push(text(value)?);
+        }
+        RepeatableOption::EnvFile => {
+            if options.env_files.len() >= MAX_CREATE_ENV_FILES {
+                return Err(UsageError);
+            }
+            options.env_files.push(PathBuf::from(value));
+        }
+        RepeatableOption::Label => {
+            // 作成世代の注釈(CLI が足す 1 件)の分を確保する(#2713)。
+            if options.labels.len() >= ANNOTATIONS_MAX_ENTRIES - 1 {
+                return Err(UsageError);
+            }
+            options.labels.push(text(value)?);
+        }
+        RepeatableOption::Tmpfs => {
+            if options.tmpfs.len() >= TMPFS_MAX_MOUNTS {
+                return Err(UsageError);
+            }
+            options.tmpfs.push(text(value)?);
+        }
+        RepeatableOption::CapDrop => {
+            if options.cap_drop.len() >= MAX_DROP_NAMES {
+                return Err(UsageError);
+            }
+            options.cap_drop.push(text(value)?);
+        }
+        RepeatableOption::AddHost => {
+            use fandhe_container_net::add_host_dns::{MAX_ADD_HOST_ENTRIES, MAX_ADD_HOST_LEN};
+            let v = text(value)?;
+            if options.network.add_hosts.len() >= MAX_ADD_HOST_ENTRIES || v.len() > MAX_ADD_HOST_LEN
+            {
+                return Err(UsageError);
+            }
+            options.network.add_hosts.push(v);
+        }
+        RepeatableOption::Dns => {
+            use fandhe_container_net::add_host_dns::MAX_IP_TEXT_LEN;
+            use fandhe_container_net::add_host_dns::resolv_conf::MAX_DNS_SERVERS;
+            let v = text(value)?;
+            if options.network.dns.len() >= MAX_DNS_SERVERS || v.len() > MAX_IP_TEXT_LEN {
+                return Err(UsageError);
+            }
+            options.network.dns.push(v);
+        }
+        RepeatableOption::Publish => {
+            use fandhe_container_net::network::MAX_PORT_PUBLISHES;
+            use fandhe_container_net::pasta::MAX_PORT_FORWARD_SPEC_LEN;
+            let v = text(value)?;
+            if options.network.publish.len() >= MAX_PORT_PUBLISHES
+                || v.len() > MAX_PORT_FORWARD_SPEC_LEN
+            {
+                return Err(UsageError);
+            }
+            options.network.publish.push(v);
+        }
+    }
+    Ok(())
+}
+
+/// `start [--audit-policy <値>] <id>` を解析する(オプションは 1 回だけ・順不同・`--` 以降は位置引数。SEC-4・#2761)。
+/// 値の意味の検証はここでは行わない(core の型に委ねる)。
 pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> {
+    let mut audit_policy: Option<String> = None;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--audit-policy" {
+            let value = it.next().ok_or(UsageError)?;
+            if audit_policy.is_some() {
+                return Err(UsageError);
+            }
+            audit_policy = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
     Ok(StartArgs {
+        id: single_id(positional)?,
+        audit_policy,
+    })
+}
+
+/// `stop [--signal <名前|番号>] <id>` を解析する(`--signal` は 1 回まで・`--` 以降は位置引数)。
+/// Docker の `-s` は受けない(`logs -f` と同じく長い形だけ。D06)。値の意味はここでは見ない(core の型に委ねる)。
+pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
+    let mut signal: Option<String> = None;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--signal" {
+            let value = it.next().ok_or(UsageError)?;
+            if signal.is_some() {
+                return Err(UsageError);
+            }
+            signal = Some(value.into_string().map_err(|_| UsageError)?);
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
+    Ok(StopArgs {
+        id: single_id(positional)?,
+        signal,
+    })
+}
+
+/// `kill <id> [<signal>]` を解析する（`--` 以降は位置引数。位置引数は 1〜2 個。オプションは受けない）。
+/// 値の意味はここでは見ない（シグナルは `kill_signal::parse_kill_signal`、ID は core の型に委ねる）。
+pub(super) fn parse_kill(args: Vec<OsString>) -> Result<KillArgs, UsageError> {
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(UsageError);
+    }
+    let mut it = positional.into_iter();
+    let id = it
+        .next()
+        .and_then(|v| v.into_string().ok())
+        .ok_or(UsageError)?;
+    let signal = match it.next() {
+        Some(v) => Some(v.into_string().map_err(|_| UsageError)?),
+        None => None,
+    };
+    Ok(KillArgs { id, signal })
+}
+
+/// `inspect <id>` を解析する(オプションは受け付けない)。
+pub(super) fn parse_inspect(args: Vec<OsString>) -> Result<InspectArgs, UsageError> {
+    Ok(InspectArgs {
         id: single_positional(args)?,
     })
 }
 
-/// `stop <id>` を解析する（オプションは受け付けない）。
-pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
-    Ok(StopArgs {
+/// `state <id>` を解析する(オプションは受け付けない)。
+pub(super) fn parse_state(args: Vec<OsString>) -> Result<StateArgs, UsageError> {
+    Ok(StateArgs {
         id: single_positional(args)?,
     })
 }
@@ -513,6 +870,27 @@ pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> 
     }
 }
 
+/// `network <create|rm|ls> ...` を解析する（サブコマンド無し・未知・位置引数の過不足は使い方エラー。NET-6・CLI-1）。
+pub(super) fn parse_network(args: Vec<OsString>) -> Result<NetworkArgs, UsageError> {
+    let mut it = args.into_iter();
+    let sub = it.next().ok_or(UsageError)?;
+    let rest: Vec<OsString> = it.collect();
+    if sub == "create" {
+        Ok(NetworkArgs::Create(single_positional(rest)?))
+    } else if sub == "rm" {
+        Ok(NetworkArgs::Rm(single_positional(rest)?))
+    } else if sub == "ls" {
+        // 位置引数なし。`--` 以降も含め、何かあれば使い方エラー。
+        if rest.is_empty() {
+            Ok(NetworkArgs::Ls)
+        } else {
+            Err(UsageError)
+        }
+    } else {
+        Err(UsageError)
+    }
+}
+
 /// `system df --image-root <dir>` を解析する。
 pub(super) fn parse_system(args: Vec<OsString>) -> Result<SystemArgs, UsageError> {
     let mut it = args.into_iter();
@@ -639,6 +1017,38 @@ mod tests {
         );
     }
 
+    /// NET-9・PLUG-11・CLI-1(#3199): pasta の 2 フラグは他のグローバルオプションと順不同で受理し、重複・併用・値欠落は使い方エラー。
+    #[test]
+    fn cli1_plug11_parse_global_pasta_flags() {
+        let (g, rest) = parse_global(v(&[
+            "--pasta-path",
+            "/usr/bin/pasta",
+            "--root",
+            "/r",
+            "--plugin-path-search",
+            "list",
+        ]))
+        .expect("ok");
+        assert_eq!(g.pasta, Some(PastaSource::Path("/usr/bin/pasta".into())));
+        assert_eq!(g.root, Some(PathBuf::from("/r")));
+        assert!(g.plugin_path_search);
+        assert_eq!(rest, v(&["list"]));
+        let (g, rest) =
+            parse_global(v(&["--root", "/r", "--pasta-path-search", "create"])).expect("ok");
+        assert_eq!(g.pasta, Some(PastaSource::PathSearch));
+        assert_eq!(rest, v(&["create"]));
+        assert_eq!(parse_global(v(&["list"])).expect("ok").0.pasta, None);
+        for bad in [
+            &["--pasta-path"][..],
+            &["--pasta-path", "/a", "--pasta-path", "/b", "list"],
+            &["--pasta-path-search", "--pasta-path-search", "list"],
+            &["--pasta-path", "/a", "--pasta-path-search", "list"],
+            &["--pasta-path-search", "--pasta-path", "/a", "list"],
+        ] {
+            assert_eq!(parse_global(v(bad)), Err(UsageError), "{bad:?}");
+        }
+    }
+
     /// PLUG-11・CLI-1: `--plugin-path-search` は `--root` と順不同で受理し、重複は使い方エラー。
     #[test]
     fn plug11_parse_global_plugin_path_search() {
@@ -665,6 +1075,7 @@ mod tests {
         let r = root.to_str().unwrap();
         let d = format!("sha256:{}", "a".repeat(64));
         let expect = Ok(CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
             image: Some(CreateImageArgs {
@@ -752,10 +1163,176 @@ mod tests {
         }
     }
 
+    /// SUP-12・CLI-1(#2713): create の起動オプションは生の文字列のまま集め、繰り返しは指定順に保つ。
+    #[test]
+    fn sup12_parse_create_collects_options() {
+        let got = parse_create(v(&[
+            "--ulimit",
+            "nofile=1024:2048",
+            "--ulimit",
+            "nproc=64",
+            "-e",
+            "A=1",
+            "--env",
+            "B=2",
+            "--env-file",
+            "/e.env",
+            "--label",
+            "tier=web",
+            "--ipc",
+            "private",
+            "--shm-size",
+            "128m",
+            "--tmpfs",
+            "/run:rw",
+            "--bundle",
+            "/b",
+            "c1",
+        ]))
+        .expect("parsed");
+        assert_eq!(
+            got.options,
+            CreateOptionArgs {
+                ulimits: vec!["nofile=1024:2048".into(), "nproc=64".into()],
+                env: vec!["A=1".into(), "B=2".into()],
+                env_files: vec![PathBuf::from("/e.env")],
+                labels: vec!["tier=web".into()],
+                ipc: Some("private".into()),
+                shm_size: Some("128m".into()),
+                tmpfs: vec!["/run:rw".into()],
+                cap_drop: Vec::new(),
+                read_only: false,
+                network: CreateNetworkArgs::default(),
+            }
+        );
+    }
+
+    /// CLI-1・SUP-12(#2828): `create --read-only` は値を取らないフラグで、指定の有無が `read_only` になる。
+    /// 重複・`--read-only=true`・`--read-only true`(余剰の位置引数)は使い方エラー。
+    #[test]
+    fn cli1_parse_create_read_only() {
+        let a = parse_create(v(&["--read-only", "--bundle", "/b", "c1"])).expect("parsed");
+        assert!(a.options.read_only);
+        assert_eq!(a.id, "c1");
+        let a = parse_create(v(&["--bundle", "/b", "c1", "--read-only"])).expect("parsed");
+        assert!(a.options.read_only);
+        let a = parse_create(v(&["--bundle", "/b", "c1"])).expect("parsed");
+        assert!(!a.options.read_only);
+        for bad in [
+            v(&["--read-only", "--read-only", "--bundle", "/b", "c1"]),
+            v(&["--read-only=true", "--bundle", "/b", "c1"]),
+            v(&["--read-only=false", "--bundle", "/b", "c1"]),
+            v(&["--read-only", "true", "--bundle", "/b", "c1"]),
+        ] {
+            assert!(parse_create(bad).is_err());
+        }
+    }
+
+    /// NET-12・CLI-1(#1871): ネットワーク関連フラグは生の文字列のまま指定順に集める。
+    #[test]
+    fn cli1_net12_parse_create_network_options() {
+        let got = parse_create(v(&[
+            "--network",
+            "host",
+            "--add-host",
+            "a:1.2.3.4",
+            "--add-host",
+            "b:::1",
+            "--dns",
+            "127.0.0.1",
+            "--bundle",
+            "/b",
+            "c1",
+        ]))
+        .expect("parsed");
+        assert_eq!(
+            got.options.network,
+            CreateNetworkArgs {
+                network: Some("host".into()),
+                add_hosts: vec!["a:1.2.3.4".into(), "b:::1".into()],
+                dns: vec!["127.0.0.1".into()],
+                publish: vec![],
+            }
+        );
+    }
+
+    /// NET-12・SEC-1(#1871): 重複・値の欠落・件数と 1 値の長さの上限超過は使い方エラー(確保の前に止める)。
+    #[test]
+    fn cli1_net12_parse_create_network_limits() {
+        let with = |extra: Vec<OsString>| {
+            let mut a = extra;
+            a.extend(v(&["--bundle", "/b", "c1"]));
+            parse_create(a)
+        };
+        let rep = |flag: &str, value: &str, n: usize| -> Vec<OsString> {
+            (0..n).flat_map(|_| v(&[flag, value])).collect()
+        };
+        assert!(with(rep("--add-host", "h:1.2.3.4", 256)).is_ok());
+        assert_eq!(with(rep("--add-host", "h:1.2.3.4", 257)), Err(UsageError));
+        assert!(with(rep("--dns", "127.0.0.1", 32)).is_ok());
+        assert_eq!(with(rep("--dns", "127.0.0.1", 33)), Err(UsageError));
+        assert!(with(rep("--add-host", &"a".repeat(299), 1)).is_ok());
+        assert_eq!(
+            with(rep("--add-host", &"a".repeat(300), 1)),
+            Err(UsageError)
+        );
+        assert!(with(rep("--dns", &"1".repeat(45), 1)).is_ok());
+        assert_eq!(with(rep("--dns", &"1".repeat(46), 1)), Err(UsageError));
+        assert!(with(rep("--publish", "8080:80", 64)).is_ok());
+        assert_eq!(with(rep("--publish", "8080:80", 65)), Err(UsageError));
+        assert!(with(rep("-p", &"1".repeat(64), 1)).is_ok());
+        assert_eq!(with(rep("-p", &"1".repeat(65), 1)), Err(UsageError));
+        assert!(with(rep("--network", &"a".repeat(64), 1)).is_ok());
+        assert_eq!(with(rep("--network", &"a".repeat(65), 1)), Err(UsageError));
+        assert_eq!(with(rep("--network", "none", 2)), Err(UsageError));
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--dns"])),
+            Err(UsageError)
+        );
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--network"])),
+            Err(UsageError)
+        );
+    }
+
+    /// SUP-12・SEC-1(#2713): `--ipc` / `--shm-size` の重複、値の欠落、繰り返しの件数超過は使い方エラー。
+    #[test]
+    fn sup12_parse_create_rejects_bad_options() {
+        for bad in [
+            v(&["--ipc", "host", "--ipc", "private", "--bundle", "/b", "c1"]),
+            v(&[
+                "--shm-size",
+                "1m",
+                "--shm-size",
+                "2m",
+                "--bundle",
+                "/b",
+                "c1",
+            ]),
+            v(&["--bundle", "/b", "c1", "--ulimit"]),
+            v(&["--bundle", "/b", "c1", "--env"]),
+        ] {
+            assert_eq!(parse_create(bad), Err(UsageError));
+        }
+        let mut many = vec![];
+        for _ in 0..=MAX_CREATE_ULIMITS {
+            many.extend(v(&["--ulimit", "nofile=1"]));
+        }
+        many.extend(v(&["--bundle", "/b", "c1"]));
+        assert_eq!(parse_create(many), Err(UsageError));
+        let mut files = vec![];
+        for _ in 0..=MAX_CREATE_ENV_FILES {
+            files.extend(v(&["--env-file", "/e"]));
+        }
+        files.extend(v(&["--bundle", "/b", "c1"]));
+        assert_eq!(parse_create(files), Err(UsageError));
+    }
+
     /// CLI-1: create の正常系（順不同・`--` 以降は位置引数）。
     #[test]
     fn cli1_parse_create_ok() {
         let expect = CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
             image: None,
@@ -794,12 +1371,52 @@ mod tests {
     /// CLI-1: start の正常系と異常系。
     #[test]
     fn cli1_parse_start() {
-        assert_eq!(parse_start(v(&["c1"])), Ok(StartArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_start(v(&["c1"])),
+            Ok(StartArgs {
+                id: "c1".into(),
+                audit_policy: None
+            })
+        );
         assert_eq!(
             parse_start(v(&["--", "-c"])),
-            Ok(StartArgs { id: "-c".into() })
+            Ok(StartArgs {
+                id: "-c".into(),
+                audit_policy: None
+            })
         );
         for a in [v(&[]), v(&["a", "b"]), v(&["--all", "a"]), v(&["-a"])] {
+            assert_eq!(parse_start(a), Err(UsageError));
+        }
+    }
+
+    /// SEC-4・#2761: `--audit-policy` は値つきで 1 回だけ・順不同。生の値をそのまま保持する。
+    #[test]
+    fn sec4_cli1_parse_start_audit_policy() {
+        let ok = |id: &str, p: &str| {
+            Ok(StartArgs {
+                id: id.into(),
+                audit_policy: Some(p.into()),
+            })
+        };
+        assert_eq!(
+            parse_start(v(&["--audit-policy", "strict", "c1"])),
+            ok("c1", "strict")
+        );
+        assert_eq!(
+            parse_start(v(&["c1", "--audit-policy", "best-effort"])),
+            ok("c1", "best-effort")
+        );
+        assert_eq!(
+            parse_start(v(&["--audit-policy", "x", "--", "-c"])),
+            ok("-c", "x")
+        );
+        for a in [
+            v(&["--audit-policy"]),
+            v(&["--audit-policy", "strict"]),
+            v(&["--audit-policy", "strict", "--audit-policy", "strict", "c1"]),
+            v(&["--audit-policy", "strict", "a", "b"]),
+        ] {
             assert_eq!(parse_start(a), Err(UsageError));
         }
     }
@@ -818,14 +1435,137 @@ mod tests {
     /// CLI-1: stop は位置引数 1 個のみ。
     #[test]
     fn cli1_parse_stop() {
-        assert_eq!(parse_stop(v(&["c1"])), Ok(StopArgs { id: "c1".into() }));
+        assert_eq!(
+            parse_stop(v(&["c1"])),
+            Ok(StopArgs {
+                id: "c1".into(),
+                signal: None
+            })
+        );
         assert_eq!(
             parse_stop(v(&["--", "-c"])),
-            Ok(StopArgs { id: "-c".into() })
+            Ok(StopArgs {
+                id: "-c".into(),
+                signal: None
+            })
         );
         for a in [v(&[]), v(&["a", "b"]), v(&["--force", "a"]), v(&["-a"])] {
             assert_eq!(parse_stop(a), Err(UsageError));
         }
+    }
+
+    /// CLI-1・#1902: `kill <id> [<signal>]` の構文（値の意味は見ない）。
+    #[test]
+    fn cli1_parse_kill() {
+        let ok = |id: &str, signal: Option<&str>| {
+            Ok(KillArgs {
+                id: id.to_owned(),
+                signal: signal.map(str::to_owned),
+            })
+        };
+        assert_eq!(parse_kill(v(&["c1"])), ok("c1", None));
+        assert_eq!(parse_kill(v(&["c1", "KILL"])), ok("c1", Some("KILL")));
+        assert_eq!(parse_kill(v(&["--", "-c"])), ok("-c", None));
+        assert_eq!(parse_kill(v(&["--", "c1", "-9"])), ok("c1", Some("-9")));
+        assert_eq!(parse_kill(v(&["c1", "BOGUS"])), ok("c1", Some("BOGUS")));
+        for a in [
+            v(&[]),
+            v(&["a", "b", "c"]),
+            v(&["--signal", "9", "c1"]),
+            v(&["-9", "c1"]),
+            v(&["c1", "-9"]),
+            v(&["--x", "c1"]),
+        ] {
+            assert_eq!(parse_kill(a), Err(UsageError));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli1_parse_kill_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = || OsString::from_vec(vec![0x66, 0xff]);
+        assert_eq!(parse_kill(vec![bad()]), Err(UsageError));
+        assert_eq!(
+            parse_kill(vec![OsString::from("c1"), bad()]),
+            Err(UsageError)
+        );
+    }
+
+    /// CLI-1・#2775: `stop --signal` は前後どちらでも受け、値の欠落・重複・`-s` は使い方エラー。値の意味は見ない。
+    #[test]
+    fn cli1_parse_stop_signal() {
+        let want = Ok(StopArgs {
+            id: "c1".into(),
+            signal: Some("SIGKILL".into()),
+        });
+        assert_eq!(parse_stop(v(&["--signal", "SIGKILL", "c1"])), want);
+        assert_eq!(parse_stop(v(&["c1", "--signal", "SIGKILL"])), want);
+        assert_eq!(
+            parse_stop(v(&["--signal", "BOGUS", "c1"])).map(|a| a.signal),
+            Ok(Some("BOGUS".into()))
+        );
+        for a in [
+            v(&["--signal"]),
+            v(&["c1", "--signal"]),
+            v(&["--signal", "9", "--signal", "15", "c1"]),
+            v(&["-s", "9", "c1"]),
+            v(&["--signal", "9"]),
+        ] {
+            assert_eq!(parse_stop(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・SUP-11・#1903: `state` は ID をちょうど 1 つ受け、オプション・余分な引数は使い方エラー。
+    #[test]
+    fn cli1_parse_state() {
+        assert_eq!(parse_state(v(&["c1"])), Ok(StateArgs { id: "c1".into() }));
+        for a in [
+            v(&[]),
+            v(&["a", "b"]),
+            v(&["--x", "c1"]),
+            v(&["--json", "c1"]),
+        ] {
+            assert_eq!(parse_state(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・#2775: `inspect` は ID をちょうど 1 つ受け、オプション・余分な引数は使い方エラー。
+    #[test]
+    fn cli1_parse_inspect() {
+        assert_eq!(
+            parse_inspect(v(&["c1"])),
+            Ok(InspectArgs { id: "c1".into() })
+        );
+        for a in [v(&[]), v(&["a", "b"]), v(&["--format", "a"]), v(&["-a"])] {
+            assert_eq!(parse_inspect(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1・#2775: `create --cap-drop` は繰り返し指定でき、値の欠落と件数超過は使い方エラー。値の意味は見ない。
+    #[test]
+    fn cli1_parse_create_cap_drop() {
+        let a = parse_create(v(&[
+            "--bundle",
+            "/b",
+            "--cap-drop",
+            "ALL",
+            "--cap-drop",
+            "chown",
+            "c1",
+        ]))
+        .expect("parse");
+        assert_eq!(a.options.cap_drop, vec!["ALL".to_string(), "chown".into()]);
+        assert_eq!(
+            parse_create(v(&["--bundle", "/b", "c1", "--cap-drop"])),
+            Err(UsageError)
+        );
+        let mut many = vec!["--bundle", "/b"];
+        for _ in 0..=fandhe_container_core::capabilities::MAX_DROP_NAMES {
+            many.extend(["--cap-drop", "chown"]);
+        }
+        many.push("c1");
+        assert_eq!(parse_create(v(&many)), Err(UsageError));
     }
 
     /// CLI-1: delete の正常系（`--force` は前後どちらでも・`--` 以降は位置引数）。
@@ -1183,6 +1923,52 @@ mod tests {
         // 上限ちょうどは受ける。
         let a = parse_exec(v(&["--timeout", "3600", "c1", "/bin/true"])).expect("ok");
         assert_eq!(a.timeout, Duration::from_secs(EXEC_MAX_TIMEOUT_SECS));
+    }
+
+    /// NET-6・CLI-1（#3066）: `network` の正常系（`--` 以降は位置引数）。
+    #[test]
+    fn cli1_net6_parse_network_accepts_valid() {
+        assert_eq!(
+            parse_network(vec!["create".into(), "n1".into()]),
+            Ok(NetworkArgs::Create("n1".into()))
+        );
+        assert_eq!(
+            parse_network(vec!["create".into(), "--".into(), "-x".into()]),
+            Ok(NetworkArgs::Create("-x".into()))
+        );
+        assert_eq!(
+            parse_network(vec!["rm".into(), "n1".into()]),
+            Ok(NetworkArgs::Rm("n1".into()))
+        );
+        assert_eq!(parse_network(vec!["ls".into()]), Ok(NetworkArgs::Ls));
+    }
+
+    /// NET-6・CLI-1（#3066）: サブコマンド無し・未知・位置引数の過不足・未知オプション・非 UTF-8 は使い方エラー。
+    #[test]
+    fn cli1_net6_parse_network_rejects_invalid() {
+        let bad: Vec<Vec<OsString>> = vec![
+            vec![],
+            vec!["bogus".into()],
+            vec!["create".into()],
+            vec!["create".into(), "a".into(), "b".into()],
+            vec!["create".into(), "--foo".into(), "a".into()],
+            vec!["rm".into()],
+            vec!["rm".into(), "a".into(), "b".into()],
+            vec!["ls".into(), "x".into()],
+            vec!["ls".into(), "--".into()],
+            vec!["ls".into(), "--foo".into()],
+        ];
+        for a in bad {
+            assert_eq!(parse_network(a.clone()), Err(UsageError), "{a:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert_eq!(
+                parse_network(vec!["create".into(), OsString::from_vec(vec![0xff])]),
+                Err(UsageError)
+            );
+        }
     }
 
     /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。

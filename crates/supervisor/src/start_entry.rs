@@ -13,12 +13,16 @@
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
+//!    2c. 起動オプション文書(状態ルート配下の `@container-options/<id>`。CLI の create が書く。形式は
+//!    [`crate::container_options::document`])を同じ期限つき作業スレッドで読む。無ければ既定値。読めない・壊れている
+//!    ときは手順 4 の [`StartDeps::check_launcher_available`] が cgroup にも launch にも触れずに止める。
+//!    期限超過だけは手順 3 に進まず `TIMEOUT` を報告して止まる(期限の配分に依らず固定。#3509・REPAIR-4)。#2713・SUP-12／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
 //!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
 //!    7. launcher の構築と [`SpecCapturingLauncher`] での包み／8. `oci_runtime::start`（**入口スレッドが直接行う**）／
-//!    9. `FCSUP1 OK <pid>` の報告／10. `SupervisedState::attach` → [`supervise_with_restart`]。
+//!    9. `FCSUP1 OK <pid>` の報告／10. `SupervisedState::attach` → [`supervise_with_restart_health`]。
 //!
 //! 手順 3・4 は cgroup の連鎖（手順 5）より前に置く。スコープの追記は 1 回限りで取り消す API が無いため、
 //! launcher が使えない場合や状態が Created でない場合に、スコープを残さずに止める。
@@ -47,8 +51,10 @@
 //!   - 予約（Running・pid なし）が残る（呼び出し境界の期限超過や、回収を確かめられなかった launch の失敗）:
 //!     `recover_interrupted_start` を約 50ms 刻みで再試行して Created へ戻し、`take_unreaped_processes` で
 //!     引き取ったハンドルを terminate する。戻せたら cgroup を消し、戻せなければ cgroup を消さない。
-//! - 手順 3〜7 の期限超過、または手順 8 の見込みが残らない: `INTERNAL`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する。
+//! - 手順 3〜7 の期限超過、または手順 8 の見込みが残らない: `TIMEOUT`（[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する
+//!   （ERR-3 の「期限内に完了しない操作」。2b・2c の期限超過と揃える。#3557）。
 //!   launch はしない。作業スレッドが後から準備を終えたら、launch せずに作った cgroup を消す。
+//! - 期限超過の後も、後始末を確かめられなければ・作業スレッドを放棄したときの終了コードは `INTERNAL`（報告は `TIMEOUT` のまま）。
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
 //! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
@@ -58,13 +64,19 @@
 //!   （`delete` と再作成を促す）を報告する。回復に失敗したらそのエラーを報告し、予約は残る（再試行できる）。
 //!
 //! # 未実装・残余（REPAIR-3）
-//! - **restart の再 launch**: 本番 launcher の結線は済んでいる（start と同じ launcher と `LaunchSpec` を使う）が、
-//!   再 launch は `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれるため、本番 launcher が
-//!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
-//!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
-//!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
-//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線（#1902）と
-//!   明示的な stop の意図の伝達（SUP-9）は未実装。
+//! - **restart の再 launch**（#2043・SUP-3・CORE-1）: start と同じ launcher と `LaunchSpec` を使い、`SelfBounded` の launcher は
+//!   監視ループのスレッド（入口スレッド）で直接呼ぶ（`fandhe-relaunch` スレッドを作らない）。再 launch の直前に、
+//!   制御チャネルの accept スレッド（`PausableServer::pause`）・捕捉と seccomp 通知のスレッド・`stderr_sink` の専用スレッドを
+//!   止め、スレッド数が 1 に落ち着くのを有界に待ってから launch し、成否に関わらず再開する。止められなければ launch せず
+//!   `RelaunchFailed`（fail-closed。core の `Threads: 1` の検査は弱めない）。
+//!   healthcheck の定期実行スレッドは monitor の 1 回の呼び出しの間だけ回り、monitor が戻る前に止めて回収する（#2953。
+//!   `run_supervised_with_health`）ため、再 launch の時点では居ない。期限内に止まらず残ったスレッドは `thread_settle` が
+//!   検出して再 launch を止める（fail-closed）。判定の本番アダプタは #2441。
+//!   pasta・netns holder 構成での restart の確認は #341・#3331。`legacy_tiocsti` の警告は supervisor からは再出力しない
+//!   （core が launch のたびに出す）。設計記録は `docs/design/restart-relaunch-single-thread.md`。
+//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線も済み（#1902。
+//!   意図は立てない）。明示的な stop の意図の伝達（SUP-9）は実装済み
+//!   （#2162・#2440。制御チャネルの StopRequest が意図を立て、restart ループは再起動を取りやめて `Stopped` と「明示 stop 済み」を記録する）。
 //! - 権限モデルは rootless のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。1 対 1 の `RootlessSingleId` か
 //!   範囲写像の `RootlessSubordinateIds` かは `/etc/subuid`・`/etc/subgid` の設定で選ぶ（#2243・CORE-6。規則と所有者名の
 //!   取得は `id_model`）。
@@ -91,11 +103,12 @@ use fandhe_container_core::traits::{
 };
 
 use crate::deadline_store::{DeadlineStore, LateWrites};
+use crate::healthcheck::HealthWiring;
 use crate::log_pipeline::CaptureHub;
 use crate::logs::LogSink;
 use crate::restart::{
     LateOrphans, LauncherRelauncher, Relauncher, RestartConfig, RestartPolicy,
-    SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart,
+    SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart_health,
 };
 use crate::run::{MonitorConfig, StderrLogObserver, StopToken};
 use crate::seccomp_notify::SeccompNotifyHub;
@@ -126,6 +139,28 @@ pub trait StartDeps {
         observed: &StateRecord,
     ) -> Result<Option<StateRevision>, TraitError>;
 
+    /// 手順 4b: ネットワーク指定の準備（`/etc/hosts`・`/etc/resolv.conf` の生成と host netns の基準照合。
+    /// #1873・NET-6・NET-12・D14）。起動権の予約（`claim_start`）の後・`launch_claimed` の前に呼ぶ（cgroup・監査 sink・launcher の構築より後）。
+    ///
+    /// 失敗する場合は実装が自分で作ったものを巻き戻してから返す。成功した場合の削除は [`Self::release_network`]。
+    /// 既定は何もしない（ネットワーク指定を持たないフェイクの [`StartDeps`] は上書きしなくてよい）。
+    fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
+        let _ = id;
+        Ok(())
+    }
+
+    /// 手順 4b で作った生成ファイルを消す。cgroup の削除が確かめられた後（逆順）にだけ呼ぶ。
+    /// 生存し得るコンテナの bind 元を消さないため、cgroup を消せなかった経路では呼ばれない。
+    /// 起動権の予約を手放した後の失敗（`start` の失敗の後始末）でも呼ばれない（別世代の生成物を消さないため）。
+    fn release_network(&mut self) -> Result<(), TraitError> {
+        Ok(())
+    }
+
+    /// start の成功後に構造化ログへ残す network モードの固定語彙（host のみ `Some("host")`。#1873・D8）。
+    fn network_log_mode(&self) -> Option<&'static str> {
+        None
+    }
+
     /// 手順 6: 監査 sink を構築する（fork の前。SEC-4）。実装が保持し [`Self::build_launcher`] が使う。
     fn build_audit_sink(&mut self) -> Result<(), TraitError>;
 
@@ -144,6 +179,29 @@ pub trait StartDeps {
     fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
         None
     }
+
+    /// restart の再 launch を単一スレッドで成り立たせるか（本番 launcher の `Threads: 1` の要求のため。#2043・SUP-3・CORE-1）。
+    ///
+    /// `true` を返す実装（本番）は、再 launch の直前に共有の stderr の専用スレッドを止め、スレッド数が 1 に落ち着くのを
+    /// 待ってから launch する。既定は `false`（フェイクの [`StartDeps`] は共有の出口を止めない）。
+    fn single_thread_relaunch(&self) -> bool {
+        false
+    }
+
+    /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
+    ///
+    /// `Some` のとき入口は、手順 3 で観測した記録の世代がこれと一致しない start を拒否する。2c の読み取りの後に同じ ID が
+    /// 削除・再作成されても、前の世代の env・ulimit・`--ipc=host` 等で新しいコンテナを起動しない(SEC-1・SUP-12・#2713)。
+    /// 既定は `None`(照合しない。フェイクの [`StartDeps`] は上書きしなくてよい)。
+    fn expected_options_generation(&self) -> Option<Option<String>> {
+        None
+    }
+
+    /// 単一スレッドの区間（手順 3〜8）で積んだ構造化ログを、start の報告の後に出す（成功・失敗の両方と、
+    /// 準備期限超過・放棄の後始末 `abandoned_cleanup` から呼ばれる。
+    /// rootless の pasta 構成の `pasta_verify` / `pasta_ready` など。#1940・#3359・REPAIR-4）。既定は何もしない。
+    /// 複数の経路から呼ばれうるため、実装は取り出しで空にする冪等なものでなければならない（各行は 1 度だけ出る）。
+    fn flush_deferred_logs(&self) {}
 
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
     fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError>;
@@ -206,6 +264,10 @@ impl Relauncher for NoSpecRelauncher {
 /// 読み手が止まって pipe が満杯でも、呼び出し側は期限で次へ進める（起動済みプロセスの監視・回収を止めない）。
 /// 期限後も書き込みスレッドは残り得るが、完了すれば終わる。1 回の `write_all` を 1 スレッドで行うため、
 /// 単一スレッド前提の区間（`oci_runtime::start` より前）の成功経路では使わない。
+///
+/// 契約（SUP-1・#3453・#2070）: 書き込みが期限内に終わって戻った時点で、作業スレッドは書き手への参照を
+/// 手放し終えている。戻った後にこの値を drop すれば書き手（結果チャネルの複製 fd）は同期的に閉じる。
+/// 期限超過（`TimedOut`）のときは、作業スレッドの書き込みが終わるまで書き手は開いたまま残る（従来どおりの残余）。
 pub struct BoundedWriter<W: Write + Send + 'static> {
     inner: Arc<Mutex<W>>,
     deadline: Duration,
@@ -247,8 +309,14 @@ impl<W: Write + Send + 'static> Write for BoundedWriter<W> {
         std::thread::Builder::new()
             .name("supervisor-write".into())
             .spawn(move || {
-                let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
-                let result = guard.write_all(&data).and_then(|()| guard.flush());
+                let result = {
+                    let mut guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.write_all(&data).and_then(|()| guard.flush())
+                };
+                // 結果を送る前に書き手への参照を手放す。送った後まで持つと、呼び出し側が戻って
+                // `BoundedWriter` を drop しても書き手（結果チャネルの複製 fd）が閉じず、入口の後の
+                // fd 走査に fd 3 が見える窓ができる（#3453・#2070）。
+                drop(inner);
                 let _ = tx.send(result);
             })
             .map_err(|_| std::io::Error::other("failed to spawn the write thread"))?;
@@ -299,6 +367,27 @@ fn log_legacy_tiocsti_to(
 /// `tests/start_tiocsti_wiring.rs` が別プロセスで共有 sink へ届くことを照合する（REPAIR-12）。
 fn log_legacy_tiocsti(observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti) {
     let _ = log_legacy_tiocsti_to(crate::stderr_sink::stderr(), observe());
+}
+
+/// start の成功後に network モードの固定 1 行を `sink` へ待たずに入れる（#1873・NET-6・D8・REPAIR-4）。
+///
+/// `mode` は `StartDeps::network_log_mode` の固定語彙（host のみ）で、入力値は載せない。`None` なら何もしない。
+/// host は分離を緩める指定のため、使われたことを構造化ログに残す（監査ログには書かない。分離違反の試行ではないため）。
+fn log_network_mode_to(
+    sink: &crate::stderr_sink::StderrSink,
+    mode: Option<&'static str>,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    let mode = mode?;
+    let line = format!(
+        "{{\"component\":\"supervisor\",\"event\":\"network_mode\",\"network_mode\":\"{mode}\"}}\n"
+    );
+    Some(sink.emit(line.into_bytes()))
+}
+
+/// 成功報告の後に [`log_network_mode_to`] を共有 sink へ出す（`log_legacy_tiocsti` と同じ位置・同じ制約。
+/// 常駐スレッドを作るため、単一スレッド前提の区間が終わった後にだけ呼ぶ）。
+fn log_network_mode(mode: Option<&'static str>) {
+    let _ = log_network_mode_to(crate::stderr_sink::stderr(), mode);
 }
 
 /// launch が評価した監査の網羅(`launchIsolation.auditCoverage`)が縮退していれば、固定の警告 1 行を `sink` へ待たずに入れる
@@ -500,10 +589,27 @@ fn write_report(out: &mut dyn Write, report: &StartReport) -> std::io::Result<()
     out.flush()
 }
 
+/// cgroup だけを消す。失敗はログへ出し、`false` を返す。
+fn release_cgroup_logged(deps: &mut dyn StartDeps) -> bool {
+    match deps.release_cgroup() {
+        Ok(()) => true,
+        Err(e) => {
+            log_event("cgroup_release_failed", Some(e.code()));
+            false
+        }
+    }
+}
+
 /// cgroup を消す。失敗は元のエラーを隠さずにログへ出し、`false` を返す（後始末の成否へ反映する）。
 fn release_logged(deps: &mut dyn StartDeps) -> bool {
     match deps.release_cgroup() {
-        Ok(()) => true,
+        Ok(()) => match deps.release_network() {
+            Ok(()) => true,
+            Err(e) => {
+                log_event("etc_files_release_failed", Some(e.code()));
+                false
+            }
+        },
         Err(e) => {
             log_event("cgroup_release_failed", Some(e.code()));
             false
@@ -529,9 +635,15 @@ pub const START_OP: &str = "supervisor.start";
 /// 行う（REPAIR-5。core の API を変えずに起動処理全体へ期限を課す）。
 /// - 期限内に成功: `OK <pid>` を報告して `Ok(Running)`（報告の書き込みに失敗しても監視は続ける）。
 /// - 期限内に失敗: そのエラーを報告してから後始末する。後始末を確かめられなければ終了コードは `Internal`。
-/// - 準備の期限超過、または手順 8 の見込み（[`launch_step_budget`]）が残らない: `INTERNAL`
-///   （[`DEADLINE_EXCEEDED_MESSAGE`]）を報告する。launch はしない。作業スレッドが後から準備を終えたら、作った
-///   cgroup を消す（`result_deadline` の長さまで待つ。それでも戻らなければ待つのをやめる）。終了コードは `Internal`。
+/// - 準備の期限超過、または手順 8 の見込み（[`launch_step_budget`]）が残らない: `TIMEOUT`
+///   （[`DEADLINE_EXCEEDED_MESSAGE`]。ERR-3。#3557）を報告する。launch はしない。作業スレッドが後から準備を終えたら、
+///   作った cgroup を消す（`result_deadline` の長さまで待つ。それでも戻らなければ待つのをやめる）。終了コードは
+///   後始末を確かめられれば `Timeout`、確かめられない・作業スレッドを放棄したときは `Internal`。
+///
+/// 計測行（`start_metrics`）の区間は手順 3〜8 の 1 回の呼び出しに限る。手順 3 より前の入口の失敗（0a〜2c。
+/// 2b・2c の期限超過を含む）は本関数を通らず、計測行を出さない。入口全体の件数は呼び出し側の計測（CLI の
+/// `start`・CRI の `cri.start_container`）と報告行のコードが担い、別の操作名は足さない（#3572。理由は
+/// `docs/design/rootless-network.md`）。
 ///
 /// 起動の成否とレイテンシは `recorder` の [`START_OP`] に記録し（準備と手順 8 を合わせた時間）、本関数の最後に
 /// 構造化ログ 1 行（[`start_metrics_line`]）で出す。
@@ -642,7 +754,7 @@ fn launch_after_prepare(
         return Attempt::Failed {
             error: OciRuntimeError::new(
                 LifecycleOp::Start,
-                ErrorCode::Internal,
+                ErrorCode::Timeout,
                 DEADLINE_EXCEEDED_MESSAGE,
             ),
             cleanup,
@@ -692,6 +804,8 @@ fn start_reporting(
     };
     let wait_until = deadline.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
     if let Some((deps, outcome)) = worker.wait_until(wait_until) {
+        // 成功後の構造化ログに使う network モード（deps は後始末へ移るため先に取る。#1873・D8）。
+        let net_mode = deps.network_log_mode();
         // 作業スレッドは結果を渡した直後に終わる。launch の前に終了を確かめる（単一スレッドの要求。CORE-1）。
         let worker_exited = worker.join();
         let attempt =
@@ -710,6 +824,8 @@ fn start_reporting(
                         Ok(r) => r,
                         Err(code) => {
                             record_start(recorder, started, false);
+                            // 失敗の早期 return でも積んだログを捨てない。
+                            deps.flush_deferred_logs();
                             return Err(code);
                         }
                     };
@@ -721,11 +837,15 @@ fn start_reporting(
                     },
                 );
                 log_legacy_tiocsti(observe);
+                log_network_mode(net_mode);
                 log_audit_coverage(running.process.as_ref());
+                // 単一スレッドの区間で積んだログは報告の後に出す（#1940）。
+                deps.flush_deferred_logs();
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {
                 report(out, &StartReport::failed(&error));
+                deps.flush_deferred_logs();
                 if cleanup_after_report(deps, store, req.id(), timeouts, cleanup) {
                     Err(error.exit_code())
                 } else {
@@ -737,7 +857,7 @@ fn start_reporting(
     // 準備の期限超過: 先に報告し、作業スレッドの結果を有限の期限まで待ってから後始末する。launch はしない。
     let overdue = OciRuntimeError::new(
         LifecycleOp::Start,
-        ErrorCode::Internal,
+        ErrorCode::Timeout,
         DEADLINE_EXCEEDED_MESSAGE,
     );
     log_event("start_deadline_exceeded", Some(ErrorCode::Timeout));
@@ -746,7 +866,10 @@ fn start_reporting(
     let late_until = Instant::now().checked_add(crate::start_contract::result_deadline(timeouts));
     match worker.wait_or_abandon(late_until) {
         Some((deps, outcome)) => {
-            abandoned_cleanup(deps, store, req.id(), timeouts, outcome);
+            // 報告は TIMEOUT のまま、後始末を確かめられなければ終了コードだけ INTERNAL にする（#3557）。
+            if abandoned_cleanup(deps, store, req.id(), timeouts, outcome) {
+                return Err(exit_code_for(ErrorCode::Timeout));
+            }
         }
         None => {
             // 作業スレッドがまだ戻らない（放棄は待ちの打ち切りと同じロックの下で記した）。以後に戻った結果は
@@ -877,6 +1000,8 @@ struct Prepared {
     logs: Option<Arc<CaptureHub>>,
     /// seccomp の通知への応答ハブ。
     seccomp: Option<Arc<SeccompNotifyHub>>,
+    /// 再 launch を単一スレッドで成り立たせる（本番のみ。#2043）。
+    single_thread_relaunch: bool,
     /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
     claimed: Box<ClaimedStart>,
 }
@@ -1075,20 +1200,25 @@ fn discard_prepared(prepared: Prepared) -> Cleanup {
 /// 入口が待つのをやめた後に作業スレッドが戻ったとき（または期限超過の報告の後に結果が出たとき）の後始末。
 ///
 /// launch はしない。準備が済んだ結果（`Ready`）は作った cgroup を消し、失敗の結果はその後始末を行う
-/// （best effort。プロセスの終了までに終われば行う）。
+/// （best effort。プロセスの終了までに終われば行う）。戻り値は後始末を確かめられたか（期限超過経路の終了コードの
+/// 決定に使う。#3557）。
+/// 報告の後に積んだ遅延ログ（`pasta_verify` の拒否行など）を先に出す。`deps` はここで消費されるため、
+/// 期限超過経路の出口はこの 1 箇所に集約する（#3359・SEC-4・REPAIR-5。flush は待たない）。
 fn abandoned_cleanup(
     deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
     outcome: PrepareOutcome,
-) {
+) -> bool {
+    deps.flush_deferred_logs();
     let cleanup = match outcome {
         PrepareOutcome::Ready(prepared) => discard_prepared(prepared),
         PrepareOutcome::Failed { cleanup, .. } => cleanup,
     };
-    let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
+    cleanup_after_report(deps, store, id, timeouts, cleanup)
 }
+
 /// `f`（状態ストア・cgroup への I/O を含む後始末の全体）を作業スレッドで実行し、`limit` まで結果を待つ。
 /// `f` が `true` を返したと確認できたら `true`。
 ///
@@ -1143,6 +1273,11 @@ fn cleanup_after_report(
                 "supervisor-claim-release",
                 crate::start_contract::result_deadline(timeouts),
                 move || {
+                    // 生成物は所有ロック（予約）を握っている間に消す。手放した後だと、並行する start が作り直した
+                    // 生成物を消し得る（CORE-2・SEC-1）。失敗はログへ残す。
+                    if let Err(e) = deps.release_network() {
+                        log_event("etc_files_release_failed", Some(e.code()));
+                    }
                     if claimed.release(store.as_ref()).is_ok() {
                         release_logged(deps.as_mut())
                     } else {
@@ -1172,7 +1307,10 @@ fn cleanup_after_report(
                         &late,
                     ) {
                         // cgroup の削除の失敗も後始末の失敗として返す（終了コードを INTERNAL にする。CORE-3）。
-                        release_logged(deps.as_mut())
+                        // 手順 4b の生成ファイル（`@container-etc/<id>`）はここでは消さない。起動権の予約はこの時点で
+                        // 解放済みで、並行する delete → 同じ ID の create / start が作った別世代の bind 元を消し得るため
+                        // （CORE-2・CORE-3・SEC-1）。残りは delete か次の start の準備（予約を握って作り直す）が消す。
+                        release_cgroup_logged(deps.as_mut())
                     } else {
                         // 予約か子が残り得る。cgroup は消さない（子が入っている可能性がある）。
                         log_event("start_cleanup_unconfirmed", Some(ErrorCode::Internal));
@@ -1244,6 +1382,24 @@ fn prepare_start(
             Cleanup::Nothing,
         );
     }
+    // 2c で文書を照合した作成世代と、ここで観測した記録の世代が違えば、2c の後に同じ ID が削除・再作成されている。
+    // 観測した記録は後続の世代の照合(cgroup の instance)で予約時点の記録と結びつくため、ここで一致を確かめれば
+    // 前の世代のオプションを新しいコンテナへ適用しない(SEC-1・SUP-12・#2713)。
+    if let Some(expected) = deps.expected_options_generation() {
+        let actual = observed
+            .annotations()
+            .get(crate::container_options::store::GENERATION_ANNOTATION)
+            .map(str::to_owned);
+        if actual != expected {
+            return fail(
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the container was recreated after its options were read; retry start",
+                ),
+                Cleanup::Nothing,
+            );
+        }
+    }
     // 4: 副作用なしで launcher の可用性を確かめる。
     if let Err(e) = deps.check_launcher_available() {
         return fail(e, Cleanup::Nothing);
@@ -1264,6 +1420,7 @@ fn prepare_start(
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
     let seccomp = deps.seccomp_hub();
+    let single_thread_relaunch = deps.single_thread_relaunch();
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -1282,6 +1439,16 @@ fn prepare_start(
             };
         }
     };
+    // 4b: ネットワーク指定の準備（hosts / resolv.conf の生成・host netns の基準照合。#1873・D14）。
+    // 起動権の予約（所有ロック）を握った後に行う。予約より前に生成・削除すると、並行する同じ ID の start が
+    // 先行する start の生成物を消してしまう（CORE-2・CORE-3・SEC-1）。失敗時は実装が自分で巻き戻し、予約は
+    // 報告の後に戻す（`DiscardClaim` は予約を手放す前に生成物を消す）。
+    if let Err(e) = deps.prepare_network(req.id()) {
+        return PrepareOutcome::Failed {
+            error: op_err(e),
+            cleanup: Cleanup::DiscardClaim(claimed),
+        };
+    }
     // 世代の照合。予約中のレコードは delete が拒否するため、予約の後にここで照合すれば、準備の後・予約の前に同じ ID が
     // 削除・再作成された場合を漏れなく拒否できる。launch 時に `store.get` を入口スレッドで行うと期限の保護から外れる
     // ため、作業スレッドで済ませる（CORE-2・CORE-3・SEC-1・REPAIR-5）。
@@ -1311,6 +1478,7 @@ fn prepare_start(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     })
 }
@@ -1329,6 +1497,7 @@ fn launch_prepared(
         launcher,
         logs,
         seccomp,
+        single_thread_relaunch,
         claimed,
     } = prepared;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
@@ -1356,6 +1525,9 @@ fn launch_prepared(
                     }
                     if let Some(hub) = &seccomp {
                         relauncher = relauncher.with_seccomp(Arc::clone(hub));
+                    }
+                    if single_thread_relaunch {
+                        relauncher = relauncher.with_single_thread_launch();
                     }
                     Arc::new(relauncher)
                 }
@@ -1779,6 +1951,23 @@ pub fn run_supervised(
     timeouts: &StartTimeouts,
     stop: &StopToken,
 ) -> u8 {
+    run_supervised_with_health(store, id, running, restart, timeouts, stop, None)
+}
+
+/// [`run_supervised`] に healthcheck の周期実行（#2953・SUP-4・TASK-161）を加える。
+///
+/// `health` は起動オプション文書の healthcheck 定義から入口が組む配線（本番の probe は Linux の
+/// `ExecHealthProbeFactory`）。`None`（定義が無い）のときは従来どおり周期実行を起動せず、`health` も書かない。
+/// 周期実行は世代ごとに monitor が起動・停止する（`crate::restart::supervise_with_restart_health`）。
+pub fn run_supervised_with_health(
+    store: Arc<dyn StateStore>,
+    id: ContainerId,
+    running: Running,
+    restart: RestartPolicy,
+    timeouts: &StartTimeouts,
+    stop: &StopToken,
+    health: Option<HealthWiring>,
+) -> u8 {
     let Running {
         process,
         relauncher,
@@ -1827,7 +2016,15 @@ pub fn run_supervised(
         }
     }
     let code = supervise_running(
-        store, id, process, relauncher, instance, restart, timeouts, stop,
+        store,
+        id,
+        process,
+        relauncher,
+        instance,
+        restart,
+        timeouts,
+        stop,
+        health.as_ref(),
     );
     // コンテナの回収の後に畳む（利用者が消えて listener が Closed になり、スレッドが終わる）。
     if let Some(hub) = seccomp {
@@ -1853,6 +2050,7 @@ fn supervise_running(
     restart: RestartPolicy,
     timeouts: &StartTimeouts,
     stop: &StopToken,
+    health: Option<&HealthWiring>,
 ) -> u8 {
     let mut state = match SupervisedState::attach(Arc::clone(&store), id.clone()) {
         Ok(s) => s,
@@ -1887,7 +2085,7 @@ fn supervise_running(
             );
         }
     };
-    let outcome = supervise_with_restart(
+    let outcome = supervise_with_restart_health(
         &mut state,
         process,
         &relauncher,
@@ -1895,6 +2093,7 @@ fn supervise_running(
         &restart_config,
         stop,
         &StderrLogObserver,
+        health,
     );
     match outcome {
         Err(e) => {
@@ -1977,8 +2176,10 @@ fn supervise_running(
         }
     }
 }
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+pub use linux::run_start_after_options_worker_for_test;
 #[cfg(target_os = "linux")]
-pub use linux::{ProductionStartDeps, run_main};
+pub use linux::{LATE_DRAIN_BUDGET, ProductionStartDeps, TAMPER_AUDIT_BUDGET, run_main};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -2001,8 +2202,10 @@ mod linux {
         LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
         load_resource_limits, load_resource_limits_audited,
     };
+    use fandhe_container_core::traits::ContainerLogPath;
 
     use super::*;
+    use crate::container_options::ContainerOptions;
     use crate::id_model::{
         RootlessIdResolution, SYSTEM_PASSWD, SYSTEM_SUBGID, SYSTEM_SUBUID,
         resolve_rootless_id_source,
@@ -2098,6 +2301,30 @@ mod linux {
         seccomp: Option<Arc<SeccompNotifyHub>>,
         /// 監査の網羅を満たせない環境への方針（`with_audit_policy`。既定 `BestEffort`。SEC-4・#2027）。
         audit_policy: AuditCoveragePolicy,
+        /// 起動オプション（`with_container_options`。`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・#2625）。
+        /// 既定（指定なし）は従来の動作と同じ。
+        container_options: ContainerOptions,
+        /// CRI ログの書き先（`with_cri_log_path`。`--cri-log-path`。CRI-2・SUP-4・#2671）。指定があれば `open_log_sink` が
+        /// `@container-logs` に加えて CRI 形式でここへも追記する。
+        cri_log_path: Option<ContainerLogPath>,
+        /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
+        /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
+        container_options_error: Option<TraitError>,
+        /// 手順 2c で文書を照合した状態記録の作成世代(`with_options_generation`。`expected_options_generation`)。
+        options_generation: Option<Option<String>>,
+        /// pasta 構成の結線に要るコンテナ ID と状態ルート(`with_pasta_target`。rootless のユーザー定義名のときだけ使う。#1940)。
+        pasta_target: Option<(ContainerId, PathBuf)>,
+        /// 単一スレッドの区間で積む pasta まわりの構造化ログ(`flush_deferred_logs` が報告の後に出す。#1940)。
+        pasta_logs: Arc<crate::pasta_attach::PastaLogBuffer>,
+        /// 手順 7 で作った pasta の結線(ユーザー定義名のときだけ `Some`)。手順 4b の準備と後始末が使う。
+        pasta: Option<crate::pasta_attach::PastaWiring>,
+        /// 手順 4b で置き場所の準備を試みたか(`release_network` が回収する対象の有無)。
+        pasta_prepare_attempted: bool,
+        /// host モードのとき、起動オプションを受けた時点(start の入口の単一スレッド区間)の supervisor の netns。
+        /// 手順 4b が作業スレッドの netns と照合する基準(#1873・NET-6・D8)。host 以外、または取得に失敗したら `None`。
+        netns_baseline: Option<fandhe_container_net::network_mode::host::NsId>,
+        /// 手順 4b で `@container-etc/<id>` を作ったか(`release_network` が消す対象の有無)。
+        etc_created: Option<ContainerId>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2209,7 +2436,76 @@ mod linux {
                 companions: Vec::new(),
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
+                container_options: ContainerOptions::default(),
+                cri_log_path: None,
+                container_options_error: None,
+                options_generation: None,
+                pasta_target: None,
+                pasta_logs: Arc::new(crate::pasta_attach::PastaLogBuffer::new()),
+                pasta: None,
+                pasta_prepare_attempted: false,
+                netns_baseline: None,
+                etc_created: None,
             }
+        }
+
+        /// pasta 構成の結線に使うコンテナ ID と状態ルート(ストアの検査済みの `host_state_root()` を優先したもの)を渡す
+        /// (rootless のユーザー定義名のときだけ使う。無いままユーザー定義名を選ぶと手順 4 が拒否する。NET-9・#1940)。
+        #[must_use]
+        pub fn with_pasta_target(mut self, id: ContainerId, state_root: PathBuf) -> Self {
+            self.pasta_target = Some((id, state_root));
+            self
+        }
+
+        /// 手順 2c が `pasta_verify` を積む遅延バッファ(`flush_deferred_logs` が出すものと同じ。#1940)。
+        pub fn pasta_log_buffer(&self) -> Arc<crate::pasta_attach::PastaLogBuffer> {
+            Arc::clone(&self.pasta_logs)
+        }
+
+        /// 起動オプション文書の読み込みに失敗したことを覚えさせる。手順 4 が cgroup の連鎖より前にそのエラーで止める
+        /// (手順 3 の中断起動の回復〔CORE-2〕は従来どおり先に走る。SUP-12・SEC-1・#2713)。
+        #[must_use]
+        pub fn with_container_options_error(mut self, error: TraitError) -> Self {
+            self.container_options_error = Some(error);
+            self
+        }
+
+        /// 手順 2c で文書を照合した作成世代を覚えさせる(手順 3 で観測した記録の世代と照合する。SEC-1・#2713)。
+        #[must_use]
+        pub fn with_options_generation(mut self, recorded: Option<String>) -> Self {
+            self.options_generation = Some(recorded);
+            self
+        }
+
+        /// CRI ログの書き先（`--cri-log-path`）を設定する（CRI-2・SUP-4・#2671）。
+        ///
+        /// `open_log_sink` が手順 6 で開く。特権ランチャー経由（effective / permitted の capability あり）では
+        /// `Unimplemented` で拒否する（`CAP_DAC_OVERRIDE` で任意のパスへ追記できてしまうため。
+        /// [`crate::logs::cri::deny_elevated_capabilities`]）。
+        #[must_use]
+        pub fn with_cri_log_path(mut self, path: Option<ContainerLogPath>) -> Self {
+            self.cri_log_path = path;
+            self
+        }
+
+        /// 起動オプション（`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs）を設定する（SUP-12・CORE-5・#2625）。
+        ///
+        /// 手順 4 が矛盾（`--ipc=host` と `--shm-size` 等。ファイルは読まない）を cgroup の連鎖より前に拒否し、手順 7 の
+        /// `build_launcher` が [`ContainerOptions::launch_options`] を本番 launcher へ渡す。restart の再 launch も同じ
+        /// launcher を使うので同じ指定が効く。ホストの secrets のファイルは手順 7 で一度だけ読み、launcher が保持する
+        /// （内容は core が封印 memfd に置くため、範囲写像の経路で holder が継承するメモリに載らない。#2628）。
+        /// CLI からの受け渡しは状態ルート配下の 0600 の文書(`run_main` が手順 2c で読む。#2713)。
+        #[must_use]
+        pub fn with_container_options(mut self, options: ContainerOptions) -> Self {
+            // host モードの基準は、単一スレッドの入口(本関数の呼び出し元)で自分の netns を取る(D8)。
+            self.netns_baseline = matches!(
+                options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Host)
+            )
+            .then(fandhe_container_net::network_mode::host::current_thread_netns)
+            .and_then(Result::ok);
+            self.container_options = options;
+            self
         }
 
         /// 監査の網羅を満たせない環境への方針を設定する（`--audit-policy`。start と restart の再 launch が同じ launcher を
@@ -2290,6 +2586,75 @@ mod linux {
             })
         }
 
+        /// ユーザー定義名の `--network` か(rootless の pasta 構成。NET-9)。
+        fn selects_named_network(&self) -> bool {
+            matches!(
+                self.container_options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Named(
+                    _
+                ))
+            )
+        }
+
+        /// 手順 4: pasta 構成の前提を副作用なしで確かめる(固定文言。パス・入力値を含めない。NET-9・ERR-1)。
+        ///
+        /// - ユーザー定義名なのに再検証済みの pasta が無い: `FailedPrecondition`(12.4。黙って `none` や host へ落とさない)
+        /// - ユーザー定義名なのに結線先(コンテナ ID・状態ルート)が無い: `Internal`
+        /// - pasta の記録があるのにユーザー定義名でない: `InvalidArgument`(取り違えを黙って無視しない)
+        fn check_pasta_wiring(&self) -> Result<(), TraitError> {
+            let named = self.selects_named_network();
+            let has_pasta = self.container_options.pasta_binary().is_some();
+            if named && !has_pasta {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "pasta path is not configured",
+                ));
+            }
+            if !named && has_pasta {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "a pasta record requires a user-defined network",
+                ));
+            }
+            if named && self.pasta_target.is_none() {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pasta wiring target is not set",
+                ));
+            }
+            Ok(())
+        }
+
+        /// ユーザー定義名のときだけ、holder と pasta を結線する一式を作る(手順 7。状態ルートの fd を開く)。
+        fn pasta_wiring(&self) -> Result<Option<crate::pasta_attach::PastaWiring>, TraitError> {
+            if !self.selects_named_network() {
+                return Ok(None);
+            }
+            self.check_pasta_wiring()?;
+            let (Some(binary), Some((container, root))) = (
+                self.container_options.pasta_binary(),
+                self.pasta_target.as_ref(),
+            ) else {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the pasta wiring was built before its prerequisites",
+                ));
+            };
+            let config = crate::pasta_attach::PastaAttachConfig {
+                binary: binary.clone(),
+                forwards: self.container_options.network().publish().clone(),
+                state_root: open_state_root_bounded(root)?,
+                state_root_path: root.clone(),
+                container: container.clone(),
+                ready_timeout: crate::pasta_attach::READY_TIMEOUT_DEFAULT,
+            };
+            // 置き場所(`@pasta/<id>/`)はここでは作らない。起動権の予約を握った後の手順 4b(`prepare_network`)で、
+            // コンテナ単位のロックの下に期限つきで作る。予約より前に作ると、その間に delete・再作成された新インスタンスの
+            // 置き場所を旧い start が再利用して壊す(CORE-2・NET-9)。
+            crate::pasta_attach::PastaWiring::production(config, Arc::clone(&self.pasta_logs))
+                .map(Some)
+        }
+
         /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
         #[must_use]
         pub fn with_companions(mut self, pids: Vec<u32>) -> Self {
@@ -2303,11 +2668,33 @@ mod linux {
             self.seccomp.clone()
         }
 
+        /// 本番の core launcher は `Threads: 1` を要求するため、再 launch の直前に stderr の専用スレッドを止める（#2043）。
+        fn single_thread_relaunch(&self) -> bool {
+            true
+        }
+
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を
         /// fork の前に拒否するが、cgroup の連鎖（取り消せないスコープの追記）の前に止めるためここで前倒しする（CORE-5）。
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
+        fn expected_options_generation(&self) -> Option<Option<String>> {
+            self.options_generation.clone()
+        }
+
+        fn flush_deferred_logs(&self) {
+            self.pasta_logs.flush();
+        }
+
         fn check_launcher_available(&self) -> Result<(), TraitError> {
+            // 起動オプション文書が読めない・壊れているときは、cgroup にも launch にも触れずに止める(SUP-12・#2713)。
+            if let Some(e) = &self.container_options_error {
+                return Err(e.clone());
+            }
             self.privilege.clone()?;
+            // pasta 構成の前提は cgroup の連鎖の前に確かめる(再検証済みのバイナリが無いまま、またはユーザー定義名の
+            // 無いまま pasta を走らせない。固定文言。NET-9・12.4・#1940)。
+            self.check_pasta_wiring()?;
+            // 起動オプションの矛盾は cgroup の連鎖の前に拒否する（ファイルは読まない純粋な検証。手順 7 が変換の本体）。
+            self.container_options.implicit_dev_mounts()?;
             // 確実な層（seccomp の ERRNO 側の USER_NOTIF）の応答者が無い構成は起動しない（fail-closed。SEC-4・#2027）。
             if self.seccomp.is_none() {
                 return Err(seccomp_audit_unavailable());
@@ -2422,8 +2809,23 @@ mod linux {
                 }
             }
             let config = crate::logs::container_log_rotation_config();
-            let sink = crate::logs::RotatingFileSink::open(&dir, id, config)?;
-            Ok(Some(Arc::new(sink)))
+            // 起動時の残存ログ掃除が同じ ID のロックを短く保持している窓を覆うため、有界で試し直す（#2760）。
+            let sink = crate::logs::open_container_log_sink_waiting(
+                &dir,
+                id,
+                config,
+                crate::logs::CONTAINER_LOG_OPEN_LOCK_WAIT,
+            )?;
+            let Some(cri_path) = &self.cri_log_path else {
+                return Ok(Some(Arc::new(sink)));
+            };
+            // 権限の確認は CRI ログを開く直前に行う（ambient capability つきで利用者指定のパスを開かない。fail-closed）。
+            crate::logs::cri::deny_elevated_capabilities(&read_self_status()?)?;
+            let cri_sink = crate::logs::cri::CriFileSink::open(cri_path)?;
+            Ok(Some(Arc::new(crate::logs::cri::TeeLogSink::new(
+                Arc::new(sink),
+                Arc::new(cri_sink),
+            ))))
         }
 
         /// 権限モデル・監査 sink・cgroup の参加フックの源を渡して `ProductionLauncher` を作る
@@ -2446,11 +2848,27 @@ mod linux {
                 Some(sink) => builder.rejection_audit_sink(Arc::clone(sink)),
                 None => builder,
             };
+            // 起動オプションの変換（secrets のファイル読み取りを含む）は fork 前の単一スレッドのこの手順で行う。失敗は
+            // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
+            let launch_options = self.container_options.launch_options()?;
+            // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
+            let wiring = self.pasta_wiring()?;
+            // 手順 4b / 後始末(`prepare_network` / `release_network`)が同じ結線を使えるよう控える。
+            self.pasta = wiring.clone();
+            let builder = match &wiring {
+                Some(w) => builder.netns_attach_hook(w.hook()),
+                None => builder,
+            };
             let launcher = builder
+                .launch_options(launch_options)
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
                 .build()?;
-            Ok(Arc::new(launcher))
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+            Ok(match wiring {
+                Some(w) => w.wrap(launcher),
+                None => launcher,
+            })
         }
 
         /// 参加フックの源を持たない `ProductionLauncher` で `recover_interrupted_start` を呼ぶ(launch はしないので
@@ -2469,6 +2887,62 @@ mod linux {
                     .build()?,
             );
             recover_interrupted_start(store, &launcher, id, timeouts).map(drop)
+        }
+
+        fn prepare_network(&mut self, id: &ContainerId) -> Result<(), TraitError> {
+            use crate::container_options::network::NetworkSelection;
+            // pasta 構成: 起動権の予約を握った今、コンテナ単位のロックの下で置き場所を作る(期限つき。取れなければ
+            // 触れずに失敗する。失敗しても `release_network` が自分の分だけ回収する)。
+            if let Some(w) = &self.pasta {
+                self.pasta_prepare_attempted = true;
+                w.prepare(Instant::now() + PASTA_PREPARE_BUDGET)?;
+            }
+            let network = self.container_options.network();
+            // 文書に network が無い(従来のコンテナ・plugin-cri)なら何もしない。
+            let Some(selection) = network.selection() else {
+                return Ok(());
+            };
+            if matches!(selection, NetworkSelection::Host) {
+                // 作業スレッドが start の入口の netns と同じであることを確かめる(多重防御。fail-closed)。
+                let baseline = self.netns_baseline.ok_or_else(|| {
+                    TraitError::new(
+                        ErrorCode::FailedPrecondition,
+                        "the host network namespace baseline is unavailable",
+                    )
+                })?;
+                fandhe_container_net::network_mode::host::HostNetns::detect(baseline)
+                    .map_err(|e| crate::container_options::network::net_error_to_trait(&e))?;
+            }
+            let selection =
+                crate::container_options::etc_files::prepare_etc_files(&self.root, id, network)?;
+            if !selection.is_empty() {
+                self.etc_created = Some(id.clone());
+            }
+            Ok(())
+        }
+
+        fn release_network(&mut self) -> Result<(), TraitError> {
+            // pasta の置き場所は、起動権の予約を握っている間に(コンテナ単位のロックの下で)回収する。
+            let pasta = match (
+                &self.pasta,
+                std::mem::take(&mut self.pasta_prepare_attempted),
+            ) {
+                (Some(w), true) => w.discard(),
+                _ => Ok(()),
+            };
+            let etc = match self.etc_created.take() {
+                Some(id) => crate::container_options::etc_files::discard_etc_files(&self.root, &id),
+                None => Ok(()),
+            };
+            pasta.and(etc)
+        }
+
+        fn network_log_mode(&self) -> Option<&'static str> {
+            matches!(
+                self.container_options.network().selection(),
+                Some(crate::container_options::network::NetworkSelection::Host)
+            )
+            .then_some("host")
         }
 
         fn release_cgroup(&mut self) -> Result<(), TraitError> {
@@ -2583,6 +3057,265 @@ mod linux {
         }
     }
 
+    /// 手順 2c: 起動オプション文書を読んで検証済みの [`ContainerOptions`] にする(#2713)。文書が無ければ `Ok(None)`。
+    ///
+    /// ストアの `host_state_root()`(検査済み。CLI の create が文書を書いた場所と同じ)を優先する。読み取りは状態ルートの
+    /// I/O が止まりうるため作業スレッドで行い `until` まで待つ(REPAIR-5)。成功時は `join` でスレッドの終了まで確認してから
+    /// 返す。期限超過は `Timeout`(作業スレッドは残るが、呼び出し側は手順 4 で止まり launch しない)。
+    ///
+    /// 戻り値の 2 つ目は、文書を照合した状態記録の作成世代(記録が無い・世代なしは `None`)。呼び出し側が deps に覚えさせ、
+    /// 手順 3 の観測と照合する(SEC-1)。
+    fn prepare_container_options_with_generation(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+    ) -> OptionsPrepared {
+        let (root, id) = (supervisor_log_root(store, root).to_path_buf(), id.clone());
+        let store = Arc::clone(store);
+        let worker_logs = Arc::clone(logs);
+        let worker_id = id.clone();
+        run_options_worker(
+            move || {
+                read_generation_checked_document(&store, &root, &worker_id).and_then(
+                    |(doc, rec)| {
+                        doc.map(|d| {
+                            options_with_verified_pasta(&d, &worker_id, &worker_logs, &root)
+                        })
+                        .transpose()
+                        .map(|o| (o, rec))
+                    },
+                )
+            },
+            until,
+            logs,
+            &id,
+        )
+    }
+
+    /// 手順 2c の期限超過で報告する固定の message。コードは `TIMEOUT` に固定し、残りの期限の配分で `INTERNAL` と
+    /// 揺らさない(SEC-4・REPAIR-4・REPAIR-5・#3509)。
+    const OPTIONS_PREPARE_TIMEOUT_MESSAGE: &str = "container options preparation timed out";
+
+    /// 2c の作業スレッドの結果(文書から作った options と照合した世代)。
+    type OptionsOutcome = Result<(Option<ContainerOptions>, Option<String>), TraitError>;
+
+    /// 2c の作業スレッド `fandhe-supopt` を起動し、`until`(報告の予約を引いた値)まで待つ(試験で本体を差し替えられる)。
+    ///
+    /// 期限超過では `pasta_verify`(`result:"timeout"`)を遅延バッファへ 1 度だけ積み(報告の後に flush が出す)、
+    /// 未回収の作業スレッドを [`UnjoinedOptionsWorker`] で返す。ここで新しく待たないので報告の期限は延びない(REPAIR-5・#3431)。
+    fn run_options_worker<F>(
+        work: F,
+        until: Option<Instant>,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        id: &ContainerId,
+    ) -> OptionsPrepared
+    where
+        F: FnOnce() -> OptionsOutcome + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = match std::thread::Builder::new()
+            .name("fandhe-supopt".into())
+            .spawn(move || {
+                let _ = tx.send(work());
+            }) {
+            Ok(h) => h,
+            Err(_) => {
+                return OptionsPrepared {
+                    result: Err(TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to spawn the container options worker",
+                    )),
+                    unjoined: None,
+                };
+            }
+        };
+        let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+        let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
+        match rx.recv_timeout(limit) {
+            Ok(result) => {
+                let _ = handle.join();
+                OptionsPrepared {
+                    result,
+                    unjoined: None,
+                }
+            }
+            Err(_) => {
+                // 作業スレッドを join できない。報告後に有界で回収できるよう rx と handle を残す。
+                crate::pasta_attach::log_pasta_verify_timeout(
+                    logs,
+                    id.as_str(),
+                    limit,
+                    logs.verify_started(),
+                );
+                OptionsPrepared {
+                    result: Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        OPTIONS_PREPARE_TIMEOUT_MESSAGE,
+                    )),
+                    unjoined: Some(UnjoinedOptionsWorker { rx, handle }),
+                }
+            }
+        }
+    }
+
+    /// 手順 2c の結果(世代つき)と、期限超過で回収できなかった作業スレッド。
+    struct OptionsPrepared {
+        result: OptionsOutcome,
+        unjoined: Option<UnjoinedOptionsWorker>,
+    }
+
+    /// 期限超過で join できなかった 2c の作業スレッド。`run_main_inner` が報告の後に [`Self::drain`] で有界に回収する。
+    struct UnjoinedOptionsWorker {
+        rx: std::sync::mpsc::Receiver<OptionsOutcome>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    /// 報告の後に作業スレッドを待つ上限(再検証の `--version` の期限 2 秒に余裕 1 秒。REPAIR-5・#3431)。
+    #[doc(hidden)]
+    pub const LATE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
+    impl UnjoinedOptionsWorker {
+        /// `budget` まで結果を待つ。届けば join して `true`(結果の値は捨てる。start は拒否済みで、改ざんの印と
+        /// 遅延ログは作業スレッドが `PastaLogBuffer` へ置き済み)。届かなければ `false`(残りの行・印は出せず、
+        /// 期限超過の行が終端の記録になる)。
+        fn drain(self, budget: Duration) -> bool {
+            match self.rx.recv_timeout(budget) {
+                Ok(_) => {
+                    let _ = self.handle.join();
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// 文書を検証済みの [`ContainerOptions`] にし、`pasta` の記録があれば起動時に再検証する(NET-9・PLUG-11・12.4・#1940)。
+    ///
+    /// 再検証(パスの辿り直し → 識別の照合 → `--version`)は作業スレッドの中で行い、期限は 2c の待ちに含まれる。
+    /// 通ったバイナリだけを options に持たせる(exec に使えるのはこれだけ)。失敗は固定文言のまま返し、手順 4 が
+    /// cgroup に触れる前に止める。結果は `pasta_verify` として遅延バッファへ積む(改ざんの疑いの印は `PastaLogBuffer::set_tamper` に置き、監査への配送は入口の `record_pasta_tamper` が行う。#3330 で実装済み)。
+    fn options_with_verified_pasta(
+        doc: &crate::container_options::document::ContainerOptionsDocument,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+        state_root: &std::path::Path,
+    ) -> Result<ContainerOptions, TraitError> {
+        let options = doc.to_container_options()?;
+        // ユーザー定義名の定義が create 後に消えていないかを、pasta の再検証(子プロセスの起動)より前に確かめる
+        // (NET-6・NET-9・D10・#3329)。
+        if let Some(crate::container_options::network::NetworkSelection::Named(name)) =
+            options.network().selection()
+        {
+            recheck_named_definition(state_root, name, id, logs)?;
+        }
+        let started = Instant::now();
+        if doc.pasta().is_some() {
+            // 期限超過の行の `stage` を決める印(#3431)。
+            logs.mark_verify_started();
+        }
+        match crate::container_options::pasta::reverify_recorded_pasta(doc) {
+            Ok(None) => Ok(options),
+            Ok(Some(binary)) => {
+                crate::pasta_attach::log_pasta_verify(
+                    logs,
+                    id.as_str(),
+                    Ok(binary.version().as_yyyymmdd()),
+                    started.elapsed(),
+                );
+                Ok(options.with_pasta_binary(binary))
+            }
+            Err(e) => {
+                let te = e.trait_error();
+                if let Some(rejection) = e.tamper_rejection() {
+                    logs.set_tamper(rejection);
+                }
+                crate::pasta_attach::log_pasta_verify(
+                    logs,
+                    id.as_str(),
+                    Err((te.code(), e.tamper_suspected())),
+                    started.elapsed(),
+                );
+                Err(te)
+            }
+        }
+    }
+
+    /// 定義の照合の共有ロックの待ちの上限。2c の予算(5 秒 − 報告の予約 1 秒)に、pasta の `--version`(2 秒)と
+    /// 合わせて収める(REPAIR-5)。
+    const NETWORK_DEFINITION_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// 定義の照合の失敗を start の失敗へ写す。コンテナの記録はあるので、定義の消失は `FailedPrecondition`
+    /// (`NotFound` だとコンテナの不在と区別できない)。入力値を含めない固定文言。改ざんではないため SEC-4 の
+    /// 監査には記録しない。
+    fn map_definition_check(
+        c: crate::container_options::network_definition::DefinitionCheck,
+    ) -> TraitError {
+        use crate::container_options::network_definition::DefinitionCheck as D;
+        match c {
+            D::Missing => TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "network definition no longer exists",
+            ),
+            D::NotPasta => TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "network definition does not match the container",
+            ),
+            D::Store(e) => crate::net_error::net_error_to_trait_keeping_code(&e),
+        }
+    }
+
+    /// 文書の `network <名前>` の定義を照合し直す(読み取りのみ。`PastaAttachHook` には入れない)。
+    fn recheck_named_definition(
+        state_root: &std::path::Path,
+        name: &fandhe_container_net::network::NetworkName,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+    ) -> Result<(), TraitError> {
+        // 定義ストアの open / get の成否と所要時間を、照合の後に遅延ログへ積む(REPAIR-4)。
+        let collector = Arc::new(crate::pasta_attach::CollectNetOps::default());
+        let result =
+            crate::container_options::network_definition::check_pasta_definition(
+                state_root,
+                name,
+                NETWORK_DEFINITION_LOCK_TIMEOUT,
+                Some(Arc::clone(&collector)
+                    as Arc<dyn fandhe_container_net::instrument::NetOpRecorder>),
+            )
+            .map_err(map_definition_check);
+        crate::pasta_attach::log_network_store_ops(logs, id.as_str(), &collector.take());
+        result
+    }
+
+    /// 起動オプション文書を読み、状態記録の作成世代と照合する(作業スレッドで実行する。#2713・SEC-1)。
+    ///
+    /// 記録が無い(`NotFound`)ときは文書を採用しない(後続の手順が記録の不在を報告する)。ほかの取得失敗はそのまま返す。
+    fn read_generation_checked_document(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+    ) -> Result<
+        (
+            Option<crate::container_options::document::ContainerOptionsDocument>,
+            Option<String>,
+        ),
+        TraitError,
+    > {
+        use crate::container_options::store as options;
+        let doc = options::read(root, id)?;
+        let recorded = match store.get(&GetStateRequest::new(id.clone())) {
+            Ok(record) => record
+                .annotations()
+                .get(options::GENERATION_ANNOTATION)
+                .map(str::to_owned),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok((None, None)),
+            Err(e) => return Err(e),
+        };
+        let selected = options::select_document(doc, recorded.as_deref())?;
+        Ok((selected, recorded))
+    }
+
     /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
     fn open_supervisor_log(
         store: &Arc<dyn StateStore>,
@@ -2649,6 +3382,111 @@ mod linux {
         let code = run_main_inner(args);
         let _ = crate::stderr_sink::flush_stderr(STDERR_DEADLINE);
         code
+    }
+
+    /// 2c の結果から deps を作った後の共通経路: 改ざんの印の配送(2c が戻った場合)→ `run_start_until` →
+    /// 拒否時の報告後の始末(`finish_after_refused_start`)。本番の入口 `run_main_inner` と、試験用の継ぎ目
+    /// `run_start_after_options_worker_for_test` の両方がここだけを通る(順序と上限を 1 か所で保つ。
+    /// SEC-4・NET-9・REPAIR-5・REPAIR-3・#3431・#3473)。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "本番の入口と試験用の継ぎ目で共有する手順で、各引数は別の所有者の資源のため束ねない"
+    )]
+    fn start_after_options(
+        unjoined_options: Option<UnjoinedOptionsWorker>,
+        deps: Box<dyn StartDeps + Send>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        pasta_logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        store: &Arc<dyn StateStore>,
+        req: &StartRequest,
+        timeouts: &StartTimeouts,
+        deadline: Option<Instant>,
+        out: &mut dyn Write,
+    ) -> Result<Running, NonZeroU8> {
+        // 2c の再検証が改ざんの疑いで拒否していたら監査へ配送する(作業スレッドは join 済みで単一スレッド。SEC-4・#3330)。
+        // 2c が期限超過で作業スレッドが残るときは、ここでは取り出さない(report の前に残り期限や REPORT_RESERVE を
+        // 配送待ちで食わず、report 後の回収側 `finish_after_refused_start` が印を取り出す。SEC-4・REPAIR-5・#3431)。
+        if let Some(w) = unjoined_options {
+            // 2c の期限超過は手順 3 以降へ進まず、残りの期限の配分に依らず `TIMEOUT` を 1 行報告して止まる
+            // (2b の期限超過と同じ形。未回収の作業スレッドを残したまま回復の launcher を組まない。
+            // 手順 3 の中断起動の回復は次の start が行う。計測行は 2b と揃えて出さない: `start_metrics` の区間は
+            // 手順 3〜8 で、手順 3 より前の失敗は混ぜない。2c の期限超過の記録は `pasta_verify`(timeout)の構造化ログと
+            // 報告行が担う。入口全体の件数は呼び出し側の計測が担い、別の操作名は足さない（#3572）。SEC-4・REPAIR-4・REPAIR-5・NET-9・#3509)。
+            let err = op_err(TraitError::new(
+                ErrorCode::Timeout,
+                OPTIONS_PREPARE_TIMEOUT_MESSAGE,
+            ));
+            report(out, &StartReport::failed(&err));
+            deps.flush_deferred_logs();
+            drop(deps);
+            finish_after_refused_start(Some(w), audit, id, pasta_logs, LATE_DRAIN_BUDGET);
+            return Err(err.exit_code());
+        }
+        record_pasta_tamper(audit, id, pasta_logs, deadline);
+        match run_start_until(
+            deps,
+            store,
+            &Arc::new(OpRecorder::new()),
+            req,
+            timeouts,
+            deadline,
+            out,
+        ) {
+            Ok(r) => Ok(r),
+            Err(code) => {
+                // deps が戻らない終わり方（作業スレッドの起動失敗・戻らない作業スレッド）の後ろ盾。
+                // 取り出しで空になるため、ほかの経路で出し済みなら何も出さない（#3359・SEC-4）。
+                // 2c の期限超過は上で短絡済み(#3509)。ここへ来るのは作業スレッドが残っていない経路だけ。
+                finish_after_refused_start(None, audit, id, pasta_logs, LATE_DRAIN_BUDGET);
+                Err(code)
+            }
+        }
+    }
+
+    /// 試験専用の継ぎ目: 2c の作業スレッドの本体 `work` と deps の組み立て `deps_for` だけを差し替え、期限超過の
+    /// 待ち・報告・報告後の回収・改ざんの印の監査配送・遅延ログの flush は本番と同じ `start_after_options` を通す。
+    /// `deps_for` には 2c の失敗(期限超過なら `Timeout`)が渡る。本番の入口には使わない(SEC-4・NET-9・REPAIR-5・#3473)。
+    #[cfg(feature = "exec-test-support")]
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "本番の入口と同じ資源を試験から差し替えるため束ねない"
+    )]
+    pub fn run_start_after_options_worker_for_test<W, D>(
+        work: W,
+        deps_for: D,
+        logs: &Arc<crate::pasta_attach::PastaLogBuffer>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        store: &Arc<dyn StateStore>,
+        req: &StartRequest,
+        timeouts: &StartTimeouts,
+        deadline: Option<Instant>,
+        out: &mut dyn Write,
+    ) -> Result<Running, NonZeroU8>
+    where
+        W: FnOnce() -> Result<(), TraitError> + Send + 'static,
+        D: FnOnce(Option<TraitError>) -> Box<dyn StartDeps + Send>,
+    {
+        let OptionsPrepared { result, unjoined } = run_options_worker(
+            move || work().map(|()| (None, None)),
+            deadline,
+            logs,
+            req.id(),
+        );
+        let deps = deps_for(result.err());
+        start_after_options(
+            unjoined,
+            deps,
+            audit,
+            req.id(),
+            logs,
+            store,
+            req,
+            timeouts,
+            deadline,
+            out,
+        )
     }
 
     fn run_main_inner<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
@@ -2739,11 +3577,10 @@ mod linux {
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
         // `run_start_until` が `stderr_sink` の常駐スレッドを作る前のここで作る（launch の単一スレッド要求にも触れない。
         // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
-        let relay = crate::exec::default_audit_sink(Some(args.root.clone()))
-            .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
-            // sink と helper を作れただけでは記録できるとは限らない（`@audit.log` がディレクトリ等だと記録時に初めて失敗する）。
-            // 起動前に helper へ保存先を開かせ、期限つきで確かめる。開けなければ記録経路なしとして起動を拒否する（SEC-4・#2027）。
-            .and_then(|relay| relay.probe().map(|()| relay))
+        // helper は停止シグナル(SIGTERM・SIGINT)を無視する構築口で作る(#3415)。supervisor 本体はハンドラを持たず停止
+        // シグナルで即座に死ぬため、守れるのは到着時に helper が書いている途中の 1 件だけ(`audit_relay` の doc)。
+        // 起動前に helper へ保存先を開かせ期限つきで確かめ、開けなければ記録経路なしとして起動を拒否する(SEC-4・#2027)。
+        let relay = crate::audit_relay::open_control_audit_relay(Some(args.root.clone()))
             .map_err(|e| e.code());
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
@@ -2761,7 +3598,14 @@ mod linux {
         // 触れない。
         let deps = ProductionStartDeps::new(args.root.clone())
             .with_companions(companions)
-            .with_audit_policy(args.audit_policy);
+            .with_audit_policy(args.audit_policy)
+            .with_cri_log_path(args.cri_log_path.clone());
+        // pasta 構成の結線先(コンテナ ID と、ストアの検査済みの状態ルート)。ユーザー定義名のときだけ使われる(#1940)。
+        let deps = deps.with_pasta_target(
+            args.id.clone(),
+            supervisor_log_root(&store, &args.root).to_path_buf(),
+        );
+        let pasta_logs = deps.pasta_log_buffer();
         let deps = Box::new(match &audit {
             // relay は launcher の回収点（複数スレッド）の `exit_signal` 監査の記録先にも渡す（#2236）。
             // start の検証（bind・sysfs）の拒否も作業スレッド（複数スレッド）で出るため relay へ渡す（#2481）。
@@ -2780,10 +3624,47 @@ mod linux {
         if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
             return fail(&mut out, op_err(e));
         }
-        let running = match run_start_until(
-            deps,
+        // 2c: 起動オプション文書(CLI の create が書いた ulimit・env・ipc・shm-size・tmpfs。#2713)を読む。2b と同じく期限つきの
+        // 作業スレッドで行い終了を確認してから進む(launch の単一スレッド要求を守る)。無ければ既定値。読めない・壊れている
+        // ときは deps が覚えて手順 4 で止める(手順 3 の回復は従来どおり先に走る。期限超過は除く: 手順 3 へ進まず TIMEOUT。#3509)。
+        let OptionsPrepared {
+            result: options_result,
+            unjoined: unjoined_options,
+        } = prepare_container_options_with_generation(
             &store,
-            &Arc::new(OpRecorder::new()),
+            &args.root,
+            &args.id,
+            deadline,
+            &pasta_logs,
+        );
+        // healthcheck の定義があるときだけ周期実行の配線を組む(無ければ `None`: 何も起動せず `health` も書かない。
+        // SUP-4・#2953)。組めないとき(文書の検証済みの定義では通常起きない)は、オプション文書の読み込み失敗と同じく
+        // 手順 4 で起動前に止める(fail-closed)。
+        let mut health_wiring: Option<HealthWiring> = None;
+        let deps = match options_result {
+            // 照合した世代を覚えさせ、手順 3 の観測と突き合わせる(2c の後の削除・再作成を拒否する。SEC-1)。
+            Ok((Some(options), recorded)) => {
+                match build_health_wiring(&options, &args.root, &args.id) {
+                    Ok(wiring) => {
+                        health_wiring = wiring;
+                        Box::new(
+                            deps.with_container_options(options)
+                                .with_options_generation(recorded),
+                        )
+                    }
+                    Err(e) => Box::new(deps.with_container_options_error(e)),
+                }
+            }
+            Ok((None, recorded)) => Box::new(deps.with_options_generation(recorded)),
+            Err(e) => Box::new(deps.with_container_options_error(e)),
+        };
+        let running = match start_after_options(
+            unjoined_options,
+            deps,
+            audit.as_ref(),
+            &args.id,
+            &pasta_logs,
+            &store,
             &req,
             &timeouts,
             deadline,
@@ -2802,12 +3683,123 @@ mod linux {
         // 記録先が無い構成は手順 4 で拒否済み(起動していない)ので、ここへ届くときは `Some`。
         let (running, control) =
             crate::control::install(&args.root, &args.id, running, &stop, audit);
-        let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
+        let code = run_supervised_with_health(
+            store,
+            args.id,
+            running,
+            args.restart,
+            &timeouts,
+            &stop,
+            health_wiring,
+        );
         // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
         let code = control.exit_code(code);
         // サーバスレッドを止めてからソケットを消す（RAII）。
         drop(control);
         ExitCode::from(code)
+    }
+
+    /// 起動オプションの healthcheck 定義から周期実行の配線を組む(定義が無ければ `None`。SUP-4・TASK-161・#2953)。
+    ///
+    /// 本番の probe は exec 専用 helper で実行する `ExecHealthProbeFactory`(#2441)。`root` は helper が状態を開く場所で、
+    /// supervisor の引数の状態ルートをそのまま使う(記録された pid を宛先に使わない: pidfd は起動ハンドルから複製する。SEC-1)。
+    fn build_health_wiring(
+        options: &ContainerOptions,
+        root: &Path,
+        id: &ContainerId,
+    ) -> Result<Option<HealthWiring>, TraitError> {
+        let Some(definition) = options.healthcheck() else {
+            return Ok(None);
+        };
+        let factory = Arc::new(crate::healthcheck::ExecHealthProbeFactory::new(
+            definition.clone(),
+            root.to_path_buf(),
+            id.clone(),
+        ));
+        HealthWiring::new(definition, factory).map(Some)
+    }
+
+    /// pasta 構成の準備段階(状態ルートの open と `@pasta/<id>/` の作成)の予算。
+    const PASTA_PREPARE_BUDGET: Duration = Duration::from_secs(5);
+
+    /// 状態ルートを作業スレッドで開く(止まった I/O で無期限に塞がらない。REPAIR-5)。
+    fn open_state_root_bounded(root: &std::path::Path) -> Result<std::os::fd::OwnedFd, TraitError> {
+        let root = root.to_path_buf();
+        match crate::supervisor_log::run_bounded_classified(
+            move || crate::pasta_attach::open_state_root(&root),
+            PASTA_PREPARE_BUDGET,
+        ) {
+            Ok(r) => r,
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "opening the state root timed out",
+            )),
+        }
+    }
+
+    /// 改ざんの疑いの監査配送の予算(起動の期限の残りと小さい方。REPAIR-5)。
+    #[doc(hidden)]
+    pub const TAMPER_AUDIT_BUDGET: Duration = Duration::from_secs(3);
+
+    /// 拒否の報告を書いた後の始末: 未回収の 2c 作業スレッドを `budget` まで待ち、届けば遅れて置かれた改ざんの印を
+    /// 監査へ配送し、最後に遅延ログを flush する(SEC-4・NET-9・REPAIR-5・#3431)。
+    ///
+    /// 報告の後に呼ぶので報告の期限は延びない。launch しない経路のため単一スレッド要求にも触れない。
+    fn finish_after_refused_start(
+        unjoined: Option<UnjoinedOptionsWorker>,
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+        budget: Duration,
+    ) {
+        if let Some(w) = unjoined {
+            // 回収できなくても、期限超過より前に置かれていた印は拾う(取り出しは空なら何もしない)。
+            let _ = w.drain(budget);
+            record_pasta_tamper(audit, id, logs, None);
+        }
+        logs.flush();
+    }
+
+    /// 手順 2c の pasta 再検証が置いた改ざんの疑いを、入口が構築済みの監査 relay 経由で `@audit.log` へ 1 件配送する
+    /// (SEC-4・PLUG-11・#3330)。
+    ///
+    /// relay は入口で作って確認済みの別プロセスの記録者で、配送は `record_until` の期限つき(起動の期限の残りと
+    /// [`TAMPER_AUDIT_BUDGET`] の小さい方)。ここで状態ルートを開き直したり fork したりしないので、配送全体が有界になる
+    /// (作業スレッドが残っていても影響しない)。relay が無い・記録できなければ `pasta_audit_unavailable` を構造化ログへ積む
+    /// (起動の拒否は 2c の結果のままで覆らない)。疑いが無ければ何もしない。
+    fn record_pasta_tamper(
+        audit: Option<&Arc<dyn AuditSink>>,
+        id: &ContainerId,
+        logs: &crate::pasta_attach::PastaLogBuffer,
+        start_deadline: Option<Instant>,
+    ) {
+        use fandhe_container_core::audit_log::{AuditRecord, AuditTimestamp, current_pid};
+        let Some(rejection) = logs.take_tamper() else {
+            return;
+        };
+        let Some(sink) = audit else {
+            crate::pasta_attach::log_pasta_audit_unavailable(
+                logs,
+                id.as_str(),
+                ErrorCode::NotFound,
+            );
+            return;
+        };
+        let budget_end = Instant::now() + TAMPER_AUDIT_BUDGET;
+        let until = start_deadline.map_or(budget_end, |d| d.min(budget_end));
+        let (Ok(ts), Ok(pid)) = (AuditTimestamp::now(), current_pid()) else {
+            crate::pasta_attach::log_pasta_audit_unavailable(
+                logs,
+                id.as_str(),
+                ErrorCode::Internal,
+            );
+            return;
+        };
+        let record =
+            AuditRecord::new(ts, pid, rejection.audit_event()).with_container_id(id.clone());
+        if let Err(e) = sink.record_until(&record, until) {
+            crate::pasta_attach::log_pasta_audit_unavailable(logs, id.as_str(), e.code());
+        }
     }
 
     /// 手順 5 で `config.json` を読み直し、`linux.resources` を取り出す（#2019）。`rejection_audit` があれば
@@ -2829,7 +3821,233 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        /// 試験用の薄い入口(世代を捨てる)。本番部分の `#[cfg(test)]` 分割に依存する照合試験があるため、
+        /// 本番側ではなく tests モジュールに置く。
+        fn prepare_container_options(
+            store: &Arc<dyn StateStore>,
+            root: &std::path::Path,
+            id: &ContainerId,
+            until: Option<Instant>,
+        ) -> Result<Option<ContainerOptions>, TraitError> {
+            let logs = Arc::new(crate::pasta_attach::PastaLogBuffer::new());
+            prepare_container_options_with_generation(store, root, id, until, &logs)
+                .result
+                .map(|(o, _)| o)
+        }
+
         use super::*;
+
+        /// 2c の期限超過を作る: `work` が合図まで戻らない状態で `until` を短く取って呼ぶ。
+        fn timed_out_worker(
+            stage_verify: bool,
+            late: impl FnOnce(&crate::pasta_attach::PastaLogBuffer) + Send + 'static,
+        ) -> (
+            Arc<crate::pasta_attach::PastaLogBuffer>,
+            OptionsPrepared,
+            std::sync::mpsc::Sender<()>,
+            Duration,
+        ) {
+            let logs = Arc::new(crate::pasta_attach::PastaLogBuffer::new());
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let wl = Arc::clone(&logs);
+            let id = ContainerId::new("web1").expect("id");
+            let until = Instant::now() + REPORT_RESERVE + Duration::from_millis(300);
+            let started = Instant::now();
+            let prepared = run_options_worker(
+                move || {
+                    if stage_verify {
+                        wl.mark_verify_started();
+                    }
+                    let _ = go_rx.recv_timeout(Duration::from_secs(30));
+                    late(&wl);
+                    Ok((None, None))
+                },
+                Some(until),
+                &logs,
+                &id,
+            );
+            (logs, prepared, go_tx, started.elapsed())
+        }
+
+        /// SEC-4・NET-9・REPAIR-5・#3431: 2c の期限超過は固定の `pasta_verify`(timeout)を 1 行だけ積み、待ちは期限を超えない。
+        #[test]
+        fn sec4_3431_options_timeout_pushes_one_timeout_line() {
+            let (logs, prepared, go, elapsed) = timed_out_worker(true, |_| {});
+            let err = prepared.result.expect_err("timeout");
+            assert_eq!(err.code(), ErrorCode::Timeout);
+            assert_eq!(err.message(), "container options preparation timed out");
+            assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
+            assert!(prepared.unjoined.is_some());
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].starts_with(
+                    "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":"
+                ),
+                "{lines:?}"
+            );
+            assert!(
+                lines[0].ends_with(",\"result\":\"timeout\",\"stage\":\"verify\"}\n"),
+                "{lines:?}"
+            );
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+        }
+
+        /// #3431: 再検証に入る前に止まれば `stage` は `document`。
+        #[test]
+        fn sec4_3431_options_timeout_before_verify_is_document_stage() {
+            let (logs, prepared, go, _) = timed_out_worker(false, |_| {});
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].ends_with(",\"result\":\"timeout\",\"stage\":\"document\"}\n"));
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+        }
+
+        /// SEC-4・#3431: 期限超過の後に作業スレッドが置いた拒否行と改ざんの印は、報告後の有界の回収で拾える。
+        #[test]
+        fn sec4_3431_late_worker_result_is_drained() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |l| {
+                l.set_tamper(
+                    fandhe_container_core::audit_log::PastaVerifyRejection::PermissionDenied,
+                );
+                crate::pasta_attach::log_pasta_verify(
+                    l,
+                    "web1",
+                    Err((ErrorCode::PermissionDenied, true)),
+                    Duration::from_millis(1),
+                );
+            });
+            assert_eq!(logs.take().len(), 1);
+            let _ = go.send(());
+            assert!(
+                prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_secs(5))
+            );
+            let lines = logs.take();
+            assert_eq!(
+                lines,
+                vec![
+                    "{\"component\":\"supervisor\",\"event\":\"pasta_verify\",\"container\":\"web1\",\"elapsed_ms\":1,\"result\":\"rejected\",\"code\":\"PERMISSION_DENIED\",\"tamper_suspected\":\"true\"}\n".to_owned()
+                ]
+            );
+            let id = ContainerId::new("web1").expect("id");
+            record_pasta_tamper(None, &id, &logs, None);
+            let lines = logs.take();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("\"event\":\"pasta_audit_unavailable\""));
+            assert!(lines[0].contains("\"code\":\"NOT_FOUND\""));
+            assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・NET-9・REPAIR-5・#3431: 入口の報告後の始末。2c を期限超過させ、遅れて置かれた改ざんの印が
+        /// 監査 sink へ 1 件届き、遅延ログ(期限超過の行・遅れた拒否の行)が flush で空になる。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_delivers_late_tamper_to_audit() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |l| {
+                l.set_tamper(PastaVerifyRejection::PermissionDenied);
+                crate::pasta_attach::log_pasta_verify(
+                    l,
+                    "web1",
+                    Err((ErrorCode::PermissionDenied, true)),
+                    Duration::from_millis(1),
+                );
+            });
+            // 報告の時点(回収前)では改ざんの印はまだ無く、期限超過の行が積まれているだけ。
+            assert!(logs.take_tamper().is_none());
+            assert!(prepared.result.is_err());
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let _ = go.send(());
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_secs(5),
+            );
+            let recs = sink.0.lock().unwrap();
+            assert_eq!(recs.len(), 1, "{recs:?}");
+            assert_eq!(recs[0].container_id(), Some(&id));
+            assert!(logs.take().is_empty(), "flushed");
+            assert!(logs.take_tamper().is_none());
+        }
+
+        /// SEC-4・REPAIR-5・#3431: 期限超過より前に置かれた改ざんの印は、回収できなくても報告後の始末で配送される
+        /// (報告前に取り出さない経路の回帰)。
+        #[test]
+        fn sec4_3431_finish_delivers_tamper_placed_before_timeout_even_if_undrained() {
+            use fandhe_container_core::audit_log::PastaVerifyRejection;
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            logs.set_tamper(PastaVerifyRejection::PermissionDenied);
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert_eq!(sink.0.lock().unwrap().len(), 1);
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
+        }
+
+        /// #3431: 回収できなければ(戻らない作業スレッド)監査へは何も送らず、遅延ログだけ flush する。
+        #[test]
+        fn sec4_3431_finish_after_refused_start_unreachable_worker_sends_nothing() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+            let dynsink: Arc<dyn AuditSink> = sink.clone();
+            let id = ContainerId::new("web1").expect("id");
+            let t = Instant::now();
+            finish_after_refused_start(
+                prepared.unjoined,
+                Some(&dynsink),
+                &id,
+                &logs,
+                Duration::from_millis(200),
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(sink.0.lock().unwrap().is_empty());
+            assert!(logs.take().is_empty(), "flushed");
+            let _ = go.send(());
+        }
+
+        /// REPAIR-5・#3431: 戻らない作業スレッドの回収は予算で打ち切り、行を増やさない。
+        #[test]
+        fn sec4_3431_drain_is_bounded() {
+            let (logs, prepared, go, _) = timed_out_worker(true, |_| {});
+            let _ = logs.take();
+            let t = Instant::now();
+            // 合図前なので届かない。
+            assert!(
+                !prepared
+                    .unjoined
+                    .expect("unjoined")
+                    .drain(Duration::from_millis(200))
+            );
+            assert!(t.elapsed() < Duration::from_secs(2));
+            assert!(logs.take().is_empty());
+            let _ = go.send(());
+        }
 
         /// 一時ディレクトリに passwd / subuid / subgid を置き、`resolve_launch_privilege` を呼ぶ。
         fn resolve_with(
@@ -2839,9 +4057,12 @@ mod linux {
             subgid: Option<&str>,
             uids: &str,
         ) -> Result<LaunchPrivilege, TraitError> {
-            let dir = std::env::temp_dir().join(format!("fc-idm-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir`（drop で消える）を使う（#3434・REPAIR-12）。
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fc-idm-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let dir = scratch.path().to_path_buf();
             let put = |name: &str, body: Option<&str>| {
                 let p = dir.join(name);
                 if let Some(b) = body {
@@ -2856,7 +4077,7 @@ mod linux {
             );
             let r =
                 resolve_launch_privilege(&status(uids, "1000\t1000\t1000\t1000"), &pw, &su, &sg);
-            let _ = std::fs::remove_dir_all(&dir);
+            drop(scratch);
             r
         }
 
@@ -2961,8 +4182,12 @@ mod linux {
             use fandhe_container_core::audit_log::AuditEvent;
             use fandhe_container_core::traits::ContainerId;
             for (i, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
-                let dir = std::env::temp_dir().join(format!("fc-2594-{}-{i}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
+                // 排他作成の `ScratchDir` の子を bundle にする（#3434・REPAIR-12）。
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    &format!("fc-2594-{i}"),
+                    std::time::Duration::from_secs(10),
+                );
+                let dir = scratch.path().join("bundle");
                 std::fs::create_dir_all(dir.join("rootfs")).unwrap();
                 let cfg = format!(
                     r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/true"],"cwd":"/"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/srv/x","options":["bind","rw"]}}]}}"#
@@ -2973,7 +4198,7 @@ mod linux {
                 let dynsink: Arc<dyn AuditSink> = sink.clone();
                 let err = resource_limits_for_start(&dir, &id, Some(&dynsink)).unwrap_err();
                 let plain = resource_limits_for_start(&dir, &id, None).unwrap_err();
-                let _ = std::fs::remove_dir_all(&dir);
+                drop(scratch);
                 assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
                 assert_eq!(err.code(), plain.code());
                 assert_eq!(err.message(), plain.message());
@@ -3022,6 +4247,354 @@ mod linux {
             let sink: Arc<dyn AuditSink> = Arc::new(OkSink);
             let got = require_seccomp_audit_sink(Ok(Arc::clone(&sink))).expect("kept");
             assert!(Arc::ptr_eq(&sink, &got));
+        }
+
+        /// SUP-12・SEC-1(#2713): 起動オプション文書の読み込みエラーは手順 4 がそのまま返して止める(既定値で続けない)。
+        #[test]
+        fn sup12_2713_options_error_stops_at_step_4() {
+            let deps = ProductionStartDeps::new(std::env::temp_dir()).with_container_options_error(
+                TraitError::new(ErrorCode::InvalidArgument, "options document is too large"),
+            );
+            let err = deps.check_launcher_available().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "options document is too large");
+        }
+
+        /// NET-9・12.4(#1940): ユーザー定義名の network は、再検証済みの pasta が無ければ手順 4 の前提確認で拒否し、
+        /// 指定が無い・`none`・`host` の起動は pasta に触れない(既定は従来のまま)。
+        #[test]
+        fn net9_1940_named_network_requires_a_verified_pasta() {
+            use crate::container_options::network::NetworkOptions;
+            let with = |network: Option<&str>| {
+                let n = NetworkOptions::parse(network, &[], &[], &[]).expect("network");
+                ProductionStartDeps::new(std::env::temp_dir())
+                    .with_container_options(ContainerOptions::new().with_network(n))
+            };
+            let err = with(Some("web")).check_pasta_wiring().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), "pasta path is not configured");
+            for network in [None, Some("none"), Some("host")] {
+                assert!(with(network).check_pasta_wiring().is_ok(), "{network:?}");
+                assert!(with(network).pasta_wiring().expect("wiring").is_none());
+            }
+        }
+
+        /// REPAIR-4(#1940): 単一スレッドの区間で積んだ pasta のログは `flush_deferred_logs` で空になる。
+        #[test]
+        fn repair4_1940_flush_deferred_logs_drains_the_buffer() {
+            let deps = ProductionStartDeps::new(std::env::temp_dir());
+            let buffer = deps.pasta_log_buffer();
+            buffer.push("{}\n".to_owned());
+            deps.flush_deferred_logs();
+            assert!(buffer.take().is_empty());
+        }
+
+        /// SEC-4(#3359): 放棄・期限超過の後始末 `abandoned_cleanup` も遅延バッファを空にする。
+        #[test]
+        fn sec4_3359_abandoned_cleanup_drains_pasta_logs() {
+            run_3359_abandoned_cleanup();
+        }
+
+        /// `sec4_3359_*` と `repair12_3434_*` が共有する本体。状態ルートは排他作成の `ScratchDir` の子（#3434）。
+        fn run_3359_abandoned_cleanup() {
+            // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子（0700）を状態ルートにする（#3434・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc3359", std::time::Duration::from_secs(10));
+            let dir = scratch.path().join("root");
+            std::fs::create_dir(&dir).expect("dir");
+            let deps = ProductionStartDeps::new(dir.clone());
+            let buffer = deps.pasta_log_buffer();
+            buffer.push("{}\n".to_owned());
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let store: Arc<dyn StateStore> = Arc::new(
+                fandhe_container_core::state_store::FileStateStore::open(
+                    fandhe_container_core::state_store::StateRoot::from_override(dir.clone())
+                        .expect("root"),
+                )
+                .expect("store"),
+            );
+            let id = ContainerId::new("c3359").expect("id");
+            let outcome = PrepareOutcome::Failed {
+                error: OciRuntimeError::new(LifecycleOp::Start, ErrorCode::Internal, "x"),
+                cleanup: Cleanup::Nothing,
+            };
+            abandoned_cleanup(
+                Box::new(deps),
+                &store,
+                &id,
+                &StartTimeouts::default(),
+                outcome,
+            );
+            assert!(buffer.take().is_empty());
+        }
+
+        /// REPAIR-12・#3434: 旧方式の pid だけの名前（`fc3359-<pid>`）の残骸（FIFO を含む）が残っていても、
+        /// 後始末の試験は残骸と衝突せず、残骸に触れない。残骸は排他作成できた場合だけ自分で消す。
+        #[cfg(unix)]
+        #[test]
+        fn repair12_3434_abandoned_cleanup_ignores_legacy_pid_residue() {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            fn snap(p: &std::path::Path) -> Option<(u64, u64, bool)> {
+                let m = std::fs::symlink_metadata(p).ok()?;
+                Some((m.dev(), m.ino(), m.file_type().is_fifo()))
+            }
+            struct Cleanup(std::path::PathBuf, bool);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                    }
+                }
+            }
+            let legacy = std::env::temp_dir().join(format!("fc3359-{}", std::process::id()));
+            let created = std::fs::create_dir(&legacy).is_ok();
+            let _cleanup = Cleanup(legacy.clone(), created);
+            if created {
+                // 期限つきで実行し、超過したら kill して期限つきで回収する（REPAIR-5）。
+                let mut child = std::process::Command::new("mkfifo")
+                    .arg(legacy.join("@lock"))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn mkfifo");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().expect("try_wait mkfifo") {
+                        assert!(status.success(), "mkfifo failed: {status:?}");
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let reap = Instant::now() + Duration::from_secs(5);
+                        while child.try_wait().ok().flatten().is_none() && Instant::now() < reap {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        panic!("mkfifo did not finish within 10s");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::write(legacy.join("file"), b"x").expect("write residue");
+            }
+            // 既存の残骸を使う場合は処理前の状態を記録し、不変性を比較する。
+            let before = snap(&legacy.join("@lock"));
+            run_3359_abandoned_cleanup();
+            let now = snap(&legacy.join("@lock"));
+            if created {
+                assert!(matches!(now, Some((_, _, true))), "{now:?}");
+            } else {
+                assert_eq!(now, before);
+            }
+        }
+
+        /// SUP-12(#2713): 文書が無ければ `None`、あれば検証済みのオプション、壊れていればエラー(手順 2c の本体)。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sup12_2713_prepare_container_options_reads_document() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use crate::container_options::store;
+            // 排他作成の `ScratchDir` の子を状態ルートにする（#3434・REPAIR-12）。
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-prep",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let store_dyn: Arc<dyn StateStore> = Arc::new(
+                fandhe_container_core::state_store::FileStateStore::open(
+                    fandhe_container_core::state_store::StateRoot::from_override(root.clone())
+                        .expect("root"),
+                )
+                .expect("store"),
+            );
+            let id = ContainerId::new("c1").expect("id");
+            let until = Some(Instant::now() + Duration::from_secs(30));
+            // 記録が無いときは文書を採用しない。
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("none")
+                    .is_none()
+            );
+            let bundle = root.join("bundle");
+            std::fs::create_dir_all(&bundle).expect("bundle");
+            let create_record = |generation: Option<&str>| {
+                let mut req = fandhe_container_core::traits::CreateStateRequest::new(
+                    fandhe_container_core::traits::ContainerStatus::created(id.clone(), None),
+                    bundle.clone(),
+                )
+                .expect("req");
+                if let Some(g) = generation {
+                    req = req.with_annotations(
+                        fandhe_container_core::traits::Annotations::new([(
+                            store::GENERATION_ANNOTATION.to_owned(),
+                            g.to_owned(),
+                        )])
+                        .expect("annotations"),
+                    );
+                }
+                store_dyn.create(&req).expect("create")
+            };
+            let doc = ContainerOptionsDocument::new(
+                vec!["nofile=1024:2048".into()],
+                vec!["A=1".into()],
+                None,
+                None,
+                vec![],
+            )
+            .expect("doc")
+            .with_generation("gen-1".into())
+            .expect("gen");
+            store::write_new(&root, &id, &doc).expect("write");
+            // 世代の無い記録(plugin-cri 経由・別の世代)では、残っていた文書を採用しない。
+            let rec = create_record(None);
+            assert!(
+                prepare_container_options(&store_dyn, &root, &id, until)
+                    .expect("stale is ignored")
+                    .is_none()
+            );
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が違う記録は、削除と作成の競合の疑いとして拒否する(旧文書で新記録を黙って既定値にしない)。
+            let rec = create_record(Some("gen-2"));
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            store_dyn
+                .delete(&fandhe_container_core::traits::DeleteStateRequest::new(
+                    id.clone(),
+                    rec.revision(),
+                ))
+                .expect("delete");
+            // 世代が一致すれば採用する。
+            create_record(Some("gen-1"));
+            let got = prepare_container_options(&store_dyn, &root, &id, until)
+                .expect("read")
+                .expect("some");
+            assert_eq!(got.env().to_env_strings(), vec!["A=1"]);
+            assert_eq!(got.rlimits().len(), 1);
+            // 記録は世代を持つのに文書が無ければ、黙って既定値にせず拒否する。
+            store::remove(&root, &id).expect("remove");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            // 壊れた文書は拒否する。
+            let path = store::options_path(&root, &id);
+            std::fs::write(&path, b"junk").expect("corrupt");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("chmod");
+            let err = prepare_container_options(&store_dyn, &root, &id, until).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// NET-6・NET-9・CLI-1(#3329): 手順 2c は、ユーザー定義名の定義が消えていれば pasta の再検証より前に拒否する。
+        /// none / host の文書と文書なしは、定義ストアを開かない(何も作らない)。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn net6_3329_options_recheck_named_definition_before_pasta_verify() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-3329",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let id = ContainerId::new("c1").expect("id");
+            let logs = crate::pasta_attach::PastaLogBuffer::new();
+            let named = ContainerOptionsDocument::default()
+                .with_network(Some("web".into()), vec![], vec![])
+                .expect("doc");
+            // 定義が無い: 固定文言の FailedPrecondition。ストアも作らない。
+            let err = options_with_verified_pasta(&named, &id, &logs, &root).unwrap_err();
+            assert_eq!(
+                (err.code(), err.message()),
+                (
+                    ErrorCode::FailedPrecondition,
+                    "network definition no longer exists"
+                )
+            );
+            assert!(!root.join("@networks").exists());
+            // none / host は照合しない。
+            for mode in ["none", "host"] {
+                let d = ContainerOptionsDocument::default()
+                    .with_network(Some(mode.into()), vec![], vec![])
+                    .expect("doc");
+                options_with_verified_pasta(&d, &id, &logs, &root).expect(mode);
+            }
+            assert!(!root.join("@networks").exists());
+            // 定義がある(pasta)と通る(pasta の記録は無いので再検証は呼ばれない)。
+            let store = NetworkStore::open(&root).expect("open");
+            store
+                .create(&NetworkDefinition::pasta("web").expect("def"))
+                .expect("create");
+            let _ = logs.take();
+            options_with_verified_pasta(&named, &id, &logs, &root).expect("present");
+            // 定義ストアの open / get の成否と所要時間が遅延ログに積まれる(REPAIR-4)。
+            let lines = logs.take().join("");
+            assert!(lines.contains("\"event\":\"network_store_op\""), "{lines}");
+            assert!(lines.contains("\"op\":\"network.store.get\""), "{lines}");
+            assert!(lines.contains("\"result\":\"ok\""), "{lines}");
+            // 消されると再び拒否する。
+            store
+                .remove(&fandhe_container_net::network::NetworkName::new("web").expect("n"))
+                .expect("rm");
+            let err = options_with_verified_pasta(&named, &id, &logs, &root).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        }
+
+        /// NET-6・NET-9・CLI-1・REPAIR-5(#3575・D10 のロック順): 手順 2c は net の全体ロックを待つ間、FCOPT1 の ID ロックを
+        /// 持たない(ID ロックを持ったまま net のロックを待つ逆順の経路が無いことの照合)。排他ロックを握る試験の間、
+        /// 同じ ID の ID ロックが即座に取れ、2c は期限(1 秒)で net のコードを保った `Timeout` になる。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn net6_net9_cli1_3575_step_2c_waits_on_net_lock_without_id_lock() {
+            use crate::container_options::document::ContainerOptionsDocument;
+            use crate::container_options::store as options_store;
+            use fandhe_container_net::network_store::{NetworkDefinition, NetworkStore};
+            let scratch = crate::scratch_root::ScratchDir::new(
+                "fcopt-3575",
+                std::time::Duration::from_secs(10),
+            );
+            let root = scratch.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .expect("chmod");
+            let id = ContainerId::new("c1").expect("id");
+            let named = ContainerOptionsDocument::default()
+                .with_network(Some("web".into()), vec![], vec![])
+                .expect("doc");
+            let net = NetworkStore::open(&root).expect("open");
+            net.create(&NetworkDefinition::pasta("web").expect("def"))
+                .expect("create");
+            // network rm の代役として全体の排他ロックを握る。
+            let _excl = net.lock_global_exclusive().expect("exclusive");
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|sc| {
+                let step = sc.spawn(|| {
+                    let logs = crate::pasta_attach::PastaLogBuffer::new();
+                    started_tx.send(()).expect("started");
+                    options_with_verified_pasta(&named, &id, &logs, &root)
+                });
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("2c started");
+                // 2c が net の待ちに入っている間も、同じ ID の ID ロックは取れる。
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let lock =
+                    options_store::acquire_lock(&root, &id, std::time::Duration::from_millis(500))
+                        .expect("2c must not hold the id lock while waiting on the net lock");
+                drop(lock);
+                let err = step.join().expect("2c thread").unwrap_err();
+                assert_eq!(err.code(), ErrorCode::Timeout);
+            });
         }
 
         /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。
@@ -3102,8 +4675,11 @@ mod linux {
                     Ok(())
                 }
             }
-            let dir = std::env::temp_dir().join(format!("fc-rec-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            // 一意・排他作成の親の子を使う（pid だけの名前の残骸を拾わない。#3374・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-rec", std::time::Duration::from_secs(10));
+            let dir = scratch.path().join("root");
+            std::fs::create_dir(&dir).unwrap();
             let missing = dir.join("absent");
             let source = SubordinateIdSource::with_paths(
                 Some("alice".to_owned()),
@@ -3140,7 +4716,6 @@ mod linux {
             ));
             assert!(deps.launcher_builder(true).is_err());
             assert!(deps.launcher_builder(false).is_ok());
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SEC-1・SUP-1・#2132: fd 0〜2 のどれかが閉じていれば FAILED_PRECONDITION、すべて開いていれば通る。
@@ -3169,21 +4744,24 @@ mod linux {
                 .find("fn run_main_inner<")
                 .expect("run_main_inner in the entry");
             let entry = src[body..]
-                .find("let relay = crate::exec::default_audit_sink(")
+                .find("let relay = crate::audit_relay::open_control_audit_relay(")
                 .map(|p| p + body)
                 .expect("relay construction in the entry");
             assert!(
                 entry < src.find("mod tests").unwrap_or(usize::MAX),
                 "relay construction must be found in the production code"
             );
-            let spawn = src[entry..]
-                .find("ControlAuditRelay::spawn")
-                .map(|p| p + entry)
-                .expect("relay spawn in the entry");
+            let spawn = entry;
+            // 停止シグナルを無視する構築口を使うこと(#3415)。実体は audit_relay.rs。
+            let relay_src = include_str!("audit_relay.rs");
+            assert!(
+                relay_src.contains(".and_then(ControlAuditRelay::spawn_ignoring_stop_signals)"),
+                "the supervisor relay must use the stop-signal-ignoring constructor"
+            );
             let run = src[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(spawn < run, "relay must be spawned before run_start_until");
             // CORE-3・SUP-1: helper は委譲 cgroup に属するため、deps へ同伴プロセスとして宣言してから起動する。
             let deps = src[entry..]
@@ -3210,9 +4788,9 @@ mod linux {
                 .map(|p| p + entry)
                 .expect("relay is passed as the exit audit sink");
             let run = production[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(wire < run, "relay must be wired before run_start_until");
             let build = production
                 .find("fn build_launcher(")
@@ -3250,9 +4828,9 @@ mod linux {
                 .map(|p| p + entry)
                 .expect("relay is passed as the rejection audit sink");
             let run = production[entry..]
-                .find("run_start_until(\n")
+                .find("start_after_options(\n")
                 .map(|p| p + entry)
-                .expect("run_start_until call in the entry");
+                .expect("start_after_options call in the entry");
             assert!(wire < run, "relay must be wired before run_start_until");
             let build = production
                 .find("fn build_launcher(")
@@ -3379,9 +4957,11 @@ mod linux {
         #[cfg(unix)]
         #[test]
         fn repair4_log_root_follows_store_host_state_root_through_symlink() {
-            let base = std::env::temp_dir().join(format!("fc-slog-{}", std::process::id()));
+            // 排他作成の `ScratchDir` の子 `base`（0700）を使う（#3434・REPAIR-12）。
+            let scratch =
+                crate::scratch_root::ScratchDir::new("fc-slog", std::time::Duration::from_secs(10));
+            let base = scratch.path().join("base");
             let real = base.join("real");
-            let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&real).expect("mkdir");
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -3397,7 +4977,6 @@ mod linux {
             let log_root = supervisor_log_root(&store, &raw_root).to_path_buf();
             let id = ContainerId::new("c1").expect("id");
             let opened = crate::supervisor_log::open(&log_root, &id);
-            let _ = std::fs::remove_dir_all(&base);
             assert!(
                 opened.is_ok(),
                 "log must open under the store root: {:?}",
@@ -3633,6 +5212,21 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// NET-6・D8・REPAIR-4(#1873): host のときだけ固定の 1 行が改行付きでログへ入る。`None` は何も出さない。
+    #[test]
+    fn net6_log_network_mode_line_is_fixed() {
+        use crate::stderr_sink::StderrSink;
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert!(log_network_mode_to(&sink, Some("host")).is_some());
+        assert_eq!(log_network_mode_to(&sink, None), None);
+        sink.flush(Duration::from_secs(5));
+        assert_eq!(
+            String::from_utf8(buf.0.lock().unwrap().clone()).unwrap(),
+            "{\"component\":\"supervisor\",\"event\":\"network_mode\",\"network_mode\":\"host\"}\n"
+        );
     }
 
     const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;

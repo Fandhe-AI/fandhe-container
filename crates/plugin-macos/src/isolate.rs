@@ -11,7 +11,13 @@
 //! [`IsolateError::Busy`] で拒否する（fail-closed）。残ったスレッドは plugin プロセスの終了で消える。
 //! 計数は [`Workers`] の実体ごとで、create の検証用（アダプタ）と launch 用（`PlatformBackend`）は別の実体を
 //! 持つ。プロセス全体で残り得る作業スレッドは最大 `2 * MAX_WORKERS`（8）。
-//! 期限後に作業スレッドが返した値は受け手が無いため drop される（`Vm` なら drop の停止要求が走る）。
+//! 期限後に作業スレッドが返した値は受け手が無いため、常に作業スレッド側で drop される（`Vm` なら drop の
+//! 停止要求が走る）。チャネルは容量 0（rendezvous）で、期限切れ直後の窓に送られた値が呼び出し元の
+//! スレッドで drop されることは無い（容量 1 では `rx` の drop が呼び出し元でバッファの値を捨てた。#3574）。
+//! 採らなかった案: `Timeout` 後の `try_recv`（`rx` の drop までの窓が残る）、`Mutex` の諦めフラグ（状態が増える）。
+//! 枠は結果と一緒に送り、受け手が受け取った直後に返す。[`run`] が `Ok` で戻った時点で、その作業の枠は
+//! 返却済みである（スレッド自体の終了は保証しない。#3453・#3507 と同じ「send の後の資源保持」の是正。
+//! #3549・PLUG-2・REPAIR-5）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +32,7 @@ pub const MAX_WORKERS: usize = 4;
 pub struct Workers(Arc<AtomicUsize>);
 
 impl Workers {
-    /// 生存中の作業スレッド数（計測・テスト用）。
+    /// 結果を受け取られていない作業の枠の数（期限超過で残ったものを含む。計測・テスト用）。
     pub fn live(&self) -> usize {
         self.0.load(Ordering::SeqCst)
     }
@@ -76,27 +82,57 @@ pub enum IsolateError {
 /// `f` は開始されないか（[`IsolateError::Busy`]・[`IsolateError::SpawnFailed`]）、ちょうど 1 回
 /// 実行される（[`IsolateError::Timeout`]・[`IsolateError::Died`] は開始後の失敗）。期限超過後も `f` は走り続け得るため、`f` の副作用は「期限超過でも完了し得る」前提で
 /// 呼び出し側が扱う（VM 起動なら停止未確認として記録する等）。
+/// [`IsolateError::Timeout`] を返した場合、`f` の戻り値は呼び出し元のスレッドでは drop されない
+/// （作業スレッド側で捨てる。#3574）。
 pub fn run<T, F>(workers: &Workers, timeout: Duration, f: F) -> Result<T, IsolateError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    run_inner(workers, timeout, f, || {})
+}
+
+/// [`run`] の本体。`after_timeout` は `recv_timeout` が期限切れで戻った直後、`rx` の drop 前に呼ぶ
+/// 試験用の差し込み口（期限切れ直後の窓を決定的に作る。製品では空のクロージャ。#3574）。
+fn run_inner<T, F, H>(
+    workers: &Workers,
+    timeout: Duration,
+    f: F,
+    after_timeout: H,
+) -> Result<T, IsolateError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    H: FnOnce(),
+{
     let slot = workers.acquire().ok_or(IsolateError::Busy)?;
-    let (tx, rx) = sync_channel::<T>(1);
+    let (tx, rx) = sync_channel::<(T, Slot)>(0);
     let spawned = std::thread::Builder::new()
         .name("fc-plugin-macos-isolated".to_string())
         .spawn(move || {
-            // 枠は処理の終了時（panic の巻き戻しを含む）に返す。
-            let _slot = slot;
-            // 受け手が期限超過で去っていれば値はここで drop される。
-            let _ = tx.send(f());
+            // 宣言順に注意: panic の巻き戻しは逆順で drop するため、`slot` が `tx` より先に返り、
+            // 呼び出し側が `Died` を観測した時点で枠は戻っている。
+            let tx = tx;
+            let slot = slot;
+            let v = f();
+            // 枠は結果と一緒に送り、受け手が受け取った直後に返す（send の後に枠を持ち続けない）。
+            // 容量 0 のため、受け手が待っている間しか成立しない。期限超過で受け手が去れば `SendError` が
+            // 中身を返し、(値, 枠) の順にこのスレッドで drop される（呼び出し元では drop しない。#3574）。
+            // 値（`Vm` なら停止要求）の片づけの間も枠を数え続け、残り得る作業スレッドの上限を保つ。
+            let _ = tx.send((v, slot));
         });
     if spawned.is_err() {
         return Err(IsolateError::SpawnFailed);
     }
     match rx.recv_timeout(timeout) {
-        Ok(v) => Ok(v),
-        Err(RecvTimeoutError::Timeout) => Err(IsolateError::Timeout { after: timeout }),
+        Ok((v, slot)) => {
+            drop(slot);
+            Ok(v)
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            after_timeout();
+            Err(IsolateError::Timeout { after: timeout })
+        }
         Err(RecvTimeoutError::Disconnected) => Err(IsolateError::Died),
     }
 }
@@ -123,7 +159,8 @@ mod tests {
     fn task115_3_repair5_isolated_result_is_returned() {
         let w = Workers::default();
         assert_eq!(run(&w, Duration::from_secs(30), || 41 + 1), Ok(42));
-        assert_eq!(wait_live(&w, 0), 0);
+        // 待たずに直接照合する（#3549: Ok で戻った時点で枠は返却済み）。
+        assert_eq!(w.live(), 0);
     }
 
     /// TASK-115.3・REPAIR-5: 戻らない処理は期限で打ち切って `Timeout` を返し、残ったスレッドが上限に
@@ -157,6 +194,86 @@ mod tests {
         drop(releases);
         assert_eq!(wait_live(&w, 0), 0);
         assert_eq!(run(&w, Duration::from_secs(30), || 7), Ok(7));
+        assert_eq!(w.live(), 0);
+    }
+
+    /// PLUG-2・REPAIR-5・#3549: 結果を受け取って戻った時点で枠は返却済みで、待たずに照合できる。
+    /// 上限ぎりぎりまで期限切れの作業を残しても、直後の `run` が誤って `Busy` にならない。
+    #[test]
+    fn plug2_3549_repair5_slot_is_returned_before_result_is_received() {
+        let w = Workers::default();
+        let mut releases = Vec::new();
+        for _ in 0..MAX_WORKERS - 1 {
+            let (release, blocked) = channel::<()>();
+            releases.push(release);
+            let after = Duration::from_millis(20);
+            assert_eq!(
+                run(&w, after, move || {
+                    let _ = blocked.recv();
+                }),
+                Err(IsolateError::Timeout { after })
+            );
+        }
+        for i in 0..300usize {
+            assert_eq!(
+                run(&w, Duration::from_secs(30), move || i),
+                Ok(i),
+                "round {i}"
+            );
+            assert_eq!(w.live(), MAX_WORKERS - 1, "round {i}");
+        }
+        drop(releases);
+        assert_eq!(wait_live(&w, 0), 0);
+    }
+
+    /// drop したスレッドの id を記録する値（期限切れ直後の送信値をどのスレッドが捨てるかの観測用）。
+    struct DropProbe(Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Ok(mut g) = self.0.lock() {
+                *g = Some(std::thread::current().id());
+            }
+        }
+    }
+
+    /// PLUG-2・REPAIR-5・#3574: 期限切れ直後に作業スレッドが返した値は、呼び出し元ではなく
+    /// 作業スレッド側で drop される。
+    #[test]
+    fn plug2_3574_repair5_value_sent_right_after_deadline_is_dropped_on_worker() {
+        let w = Workers::default();
+        let dropped = Arc::new(std::sync::Mutex::new(None));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (gate_tx, gate_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let after = Duration::from_millis(20);
+        let r = run_inner(
+            &w,
+            after,
+            move || {
+                let _ = gate_rx.recv();
+                let _ = done_tx.send(());
+                probe
+            },
+            || {
+                let _ = gate_tx.send(());
+                let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                // 作業スレッドが send に入るまで待つ（容量 1 ならここでバッファへ入る）。
+                std::thread::sleep(Duration::from_millis(50));
+            },
+        );
+        assert!(matches!(r, Err(IsolateError::Timeout { after: a }) if a == after));
+        let mut got = None;
+        for _ in 0..500 {
+            got = dropped.lock().ok().and_then(|g| *g);
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = got.expect("value must be dropped");
+        assert_ne!(id, std::thread::current().id());
+        assert_eq!(wait_live(&w, 0), 0);
     }
 
     /// TASK-115.3・REPAIR-5: 作業スレッドが panic しても呼び出し側は panic せず `Died` を受け取り、枠は戻る。
@@ -167,6 +284,7 @@ mod tests {
             std::panic::resume_unwind(Box::new("worker failure"));
         });
         assert_eq!(r, Err(IsolateError::Died));
-        assert_eq!(wait_live(&w, 0), 0);
+        // 巻き戻りで枠が tx より先に返るため、Died の観測時点で 0（#3549）。
+        assert_eq!(w.live(), 0);
     }
 }

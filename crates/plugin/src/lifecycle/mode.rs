@@ -2,7 +2,7 @@
 //!
 //! 都度起動（[`call_once`]。TASK-110.1）と常駐（[`ResidentPlugin`]。TASK-110.2）を、呼び出し側が
 //! 値（[`PluginMode`]）で選べる統一入口 [`PluginSession`] として束ねる。呼び出し元は core 側の
-//! plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin`）で、本モジュールは起動・接続・回収・
+//! plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 ほか。依存方向は `core -> plugin`）で、本モジュールは起動・接続・回収・
 //! stderr 収集を自前で行わず、各モードの実装へ委譲する。既存の [`call_once`] / [`ResidentPlugin`] は
 //! 変更せず公開のまま残す。
 //!

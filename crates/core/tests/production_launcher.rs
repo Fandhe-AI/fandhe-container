@@ -36,6 +36,18 @@
 //!   `/etc/subuid`・`/etc/subgid` の範囲写像（コンテナ 0 → 自 ID、コンテナ 1 以上 → subuid / subgid の範囲の先頭）と
 //!   完全一致することを照合する。opt-in 時に前提（`uidmap`・自ユーザーの subuid / subgid 行・`USER`）が無ければ失敗とする。
 //!   root で実行された場合は、この launcher の構築が `PermissionDenied`（SEC-5）で拒否されることだけを照合する
+//! - シナリオ S の範囲写像版（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ。CORE-6・SEC-5・SUP-12・#2628）: ホストのファイルを
+//!   `InjectedContent::from_file`（封印 memfd）にした注入を `RootlessSubordinateIds` の launcher で start し、注入の
+//!   内容とモードがコンテナ内で具体値で一致することを照合する（呼び出し元のメモリ由来の内容は launcher が拒否する。
+//!   holder のメモリに secret が無いことは `rootless_holder_memory` が照合する）。成功時は
+//!   `production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)` を出す
+//! - シナリオ Y（読み取り専用 rootfs。非 root。CORE-5・SEC-1・SUP-12・#2767）: `root.readonly=true` を start し、rootfs への新規作成・
+//!   既存ファイルへの書き込み・mkdir がすべて `EROFS`（30。Landlock だけが止めた `EACCES` は失敗）、`/` の per-mount オプションに
+//!   `ro` と `nodev`、`/proc` に `ro` が無い（非再帰）こと、`--tmpfs`（`/run`）・`/dev/shm`・`/dev/null`・rw の bind への書き込みが
+//!   成功しホスト側に内容が現れることを照合する。成功時は
+//!   `production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y` を出す
+//! - シナリオ V（sysctls。CRI-2・CORE-3・#2670）: `linux.sysctl` の `kernel.shmmax` がコンテナ内の IPC namespace で指定値になり、
+//!   ホスト側の値が変わらないことを照合する。成功時は `production_launcher: sysctls applied (scenario=V` を出す
 //! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
 //!   `/proc/self/status` が `CapInh`・`CapAmb` = 0、`CapPrm`・`CapEff`・`CapBnd` = `0x0000_0000_a804_25fb`（OCI 既定の 14 個。
 //!   公開 API の `OCI_DEFAULT_CAPABILITIES` から組んだマスクとリテラルの両方と照合）で、ホストから見た同プロセスの
@@ -56,11 +68,40 @@
 //!   当コンテナの `layer=exit_signal` の行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの PID・`syscall`/`arch` は null、
 //!   再度の `wait` / `terminate` の後も 1 行のままであることを照合する。成功行の前に
 //!   `production_launcher: exit_signal recorded once via audit relay (scenario=Q)` を出す
+//! - シナリオ U（`rslave` の bind。#2669・OCI-4・CRI-2・SEC-1）: 元（一時ディレクトリ）が属するホスト側のマウントの伝播を
+//!   `/proc/self/mountinfo` で先に読む。`shared:` か `master:` があれば `options: ["rbind", "rslave"]` の start が成功し、コンテナ内の
+//!   mountinfo で bind 先に `master:` があり `shared:` が無いことを照合する（`private` の bind は `master:` が無いシナリオ D で照合済み）。
+//!   どちらも無ければ（ホスト側が private）start が `FailedPrecondition` で失敗し、状態が Created のまま子が残らず、bind 先が
+//!   rootfs に作られないことを照合する。どちらの分岐でも `production_launcher: scenario=rslave-bind host=<..> ...` を出す。
+//!   ホスト側で後からマウントした内容がコンテナ内に見えること自体は root が要るため本試験では確かめない
+//!   （`docs/verification/bind-rslave-propagation.md`）
 //! - シナリオ S（launch 経路の entrypoint 系違反の記録。#2624・SEC-4・SUP-6）: 試験バイナリ自身のディレクトリを bind し、
 //!   `args[0]` をその中の試験バイナリ（PID 1 の `/proc/self/exe` と同一の inode）にした start が `PermissionDenied` で失敗し、
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
 //!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
 //!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
+//! - シナリオ X（launch 経路の entrypoint の実行失敗。#2763・SEC-4・CORE-5・REPAIR-12）: 3 ケースの `start` が、期待する ErrorCode で
+//!   失敗し、状態が Created のまま・`last_launch_may_have_left_process() == false`・`confirm_no_process` が `Ok`・子が残らず、
+//!   専用の記録先に監査の記録が 0 件（違反ではない失敗は記録しない）であることを照合する。メッセージは `Exec` 段の固定文言で、
+//!   `R` の前後の経路は公開 API から区別できない（成功行の `phase` は設計上の経路の表示）。
+//!   (1) ローダ欠落: rootfs 内の `PT_INTERP` のローダを消すと `NotFound`。ローダは `R` の前の `prepare_exec_child`
+//!   （`pin_interpreter`）で `O_PATH` で開かれ、不在はそこで拒否されるため、経路は `R` の前（`E <step> NOT_FOUND`）である。実カーネルで
+//!   `R` の後に `ENOENT` を決定的に起こす手段は無く、`R` の後の `NOT_FOUND` は単体試験
+//!   `sec4_2716_launch_fails_on_execveat_failure_after_ready_and_on_silence_after_ready` が担う。
+//!   (2) 0644: 実行ビットの無いエントリポイントは launch では事前検査が無く、`R` の後の `execveat` が `EACCES` →
+//!   `PermissionDenied`（`X PERMISSION_DENIED`）。(3) ゴミのバイト列: `#!` でも ELF でもない 0755 のファイルは `execveat` が
+//!   `ENOEXEC` → `InvalidArgument`（`X INVALID_ARGUMENT`）。各ケースの固有の成功行
+//!   `production_launcher: scenario=exec-failure case=<..> code=<..> phase=<..> ...` を CI が完全一致で照合する
+//! - シナリオ I・O の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`）で
+//!   `process.user` 1000:1000・`additionalGids` [3000, 2000] を指定すると、コンテナ内の `Groups:` が `2000,3000`、ホストから見た
+//!   `/proc/<pid>/status` の `Groups:` が subgid 先頭 + 1999 / + 2999 になる（成功行 `scenario=groups-applied gids=2000,3000
+//!   host_gids=<a>,<b>`）。単一 ID 写像で 0/0 に `additionalGids` [0] を指定した start は fork の前に `FailedPrecondition` で
+//!   拒否され、状態は Created のまま子が残らない（成功行 `scenario=groups-single-id-refused`）
+//! - シナリオ W（pod の user・ipc namespace への join。#2674・CRI-2・CORE-3・SEC-1・SEC-5）: コンテナ A を start し、B の
+//!   `linux.namespaces` の `user`・`ipc` に `/proc/<A の pid>/ns/{user,ipc}` の path を入れて start する。ホストから読んだ B の
+//!   `ns/user`・`ns/ipc` が A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なることを照合する。否定として、試験プロセス自身の
+//!   namespace を指す path は fork の前に `PermissionDenied` で拒否され、状態は Created のまま子が残らない。成功行の前に
+//!   `production_launcher: pod ipc namespace joined (scenario=W ...)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -81,9 +122,37 @@
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/production_launcher-XXXX> --ignored
 //! ```
 //!
+//! 前提（委譲 cgroup・範囲写像の `USER`・`uidmap`・subuid / subgid の自ユーザー行）の欠如は、1 行目
+//! `production_launcher: PRECONDITION FAILED (test environment, not a cgroup delegation regression)` /
+//! `(... not a subordinate id mapping regression)` で失敗する（分類は `tests/support/precondition.rs`。#2888・REPAIR-12）。
+//!
 //! シナリオ I（範囲写像）は `uidmap` パッケージ（`/usr/bin/newuidmap`・`/usr/bin/newgidmap`）と `/etc/subuid`・
 //! `/etc/subgid` の自ユーザー行が要るため、`FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けた時だけ実行する。実行時は成功行の前に
 //! `production_launcher: subordinate id mapping verified (uid extents=N, gid extents=M)` を出す。
+//!
+//! シナリオ N（Loopback モード。NET-6・CORE-6・SEC-1・#3064）は `LaunchNetworkMode::Loopback` の起動で、コンテナ内プローブが出す
+//! netns の識別子がホストと異なること・`/proc/self/net/dev` が `lo` とフォールバックトンネルだけであること・127.0.0.1 の自己宛て
+//! UDP が届くこと（`lo` が down だと受信が期限切れになる。#2077）と、終了後に netns の pin（nsfs のマウント・他プロセスの
+//! `ns/net`）が残らないことを照合し、`production_launcher: network loopback isolated lo up and self delivery ok; no netns pin
+//! after terminate (scenario=N)` を出す。範囲写像の経路は `(scenario=N-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
+//!
+//! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
+//! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
+//! 起動が `FailedPrecondition`（メッセージは launcher の固定文言 `container launch failed in the NetnsVerify stage`。違反の理由は
+//! 監査記録が担う）で拒否され、監査 sink に段 `netns_verify`・理由 `netns_identity_mismatch` の記録が 1 件残り、状態が Created のまま
+//! 子が残らないことを照合する。成功行は `production_launcher: network host netns sync accepted; forged baseline rejected
+//! with audit and no process (scenario=Z)`。Loopback の拒否は実機で作れない（子の netns は起動の時点まで未知）ため、
+//! `judge` と立て替えの PID 1 を使う単体試験が受け持つ。
+//!
+//! シナリオ A-attach（Attachable モード。rootless の pasta 構成向けの同期点。NET-9・CORE-6・SEC-1・REPAIR-5・#1939）は
+//! `LaunchNetworkMode::Attachable` とフック（`NetnsAttachHook`）の組で起動する。フックは受け取った netns・user namespace の fd の
+//! 素性がホストと異なること（`/proc/self/ns/{net,user}` との比較）と、合図の前（フックの中。約 200 ms 待つ）に PID 1 が exec して
+//! いないこと（子の `/proc/<pid>/status` の `Name:` が exec 後のエントリ名 `probe` でない）を確かめ、Ok を返す。受理の後は
+//! コンテナ内プローブの `NETNS` がフックで受けた netns と一致しホストと異なること、`NETDEV_LO=true`・`NETDEV_EXTRA=none`・
+//! `UDP_SELF=ok` を照合する。拒否の側は Err を返すフックで起動し、`start` の code が保たれ、メッセージが launcher の固定文言
+//! `container launch failed in the NetnsAttach stage` で、状態が Created のまま子が残らないことを照合する。成功行は
+//! `production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable)`。
+//! 範囲写像の経路は `(scenario=attachable-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
 //!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
 //! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
@@ -93,9 +162,9 @@
 //!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）。
 //!   capability と seccomp の実効はシナリオ J・K が exec 後のプロセスで直接照合する
 //! - seccomp の識別は、シナリオ J の exec 後の `kcmp` の `EPERM`（test 限定の入口 `probe_denied_syscalls_for_test`。
-//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
-//! - bind 以外の `mounts[]` の種類、`ro` の bind（#1917）、段ごとの個別観測（#1916）、`linux.resources`、
-//!   supervisor 経由の起動（#1819）は対象外
+//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗（1 行目 `production_launcher: PRECONDITION FAILED (test environment ...)`・#2788）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
+//! - bind 以外の `mounts[]` の種類、`ro` の bind の実機での `EROFS` の観測（ルール生成と適用の段は #1917 で実装済み、実機の確認は #1916）、段ごとの個別観測（#1916）、`linux.resources`、
+//!   supervisor 経由の起動は本試験の対象外で、`crates/supervisor/tests/supervisor_bin_real.rs`（#1819）が照合する
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
 
 #[cfg(not(target_os = "linux"))]
@@ -125,7 +194,12 @@ fn main() {
     // 子（コンテナ内）は同じバイナリを `--container-probe` で再実行したもの。
     if std::env::args().any(|a| a == "--container-probe") {
         linux::probe();
-    } else if std::env::args().any(|a| a == "--ignored") {
+        return;
+    }
+    // 前提欠如の分類の自己照合（既定のテスト集合でも常に走る。#2788・REPAIR-12）。
+    linux::self_check_precondition();
+    real_entry::precondition::self_check();
+    if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
         println!(
@@ -151,6 +225,10 @@ mod real_entry;
 #[path = "support/proc_status.rs"]
 mod proc_status;
 
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -159,7 +237,7 @@ mod proc_status;
     )
 ))]
 mod linux {
-    use super::real_entry;
+    use super::{real_entry, scratch_root};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -171,18 +249,23 @@ mod linux {
         AUDIT_LOG_FILE_NAME, AuditLayer, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
     };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
-    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup};
     use fandhe_container_core::exec::{
         EscapeSyscallProbe, IsolationPrivilege, ProbeOutcome, SeccompProbeRecord,
         escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
         probe_kcmp_self_for_test,
     };
+    use fandhe_container_core::injected_files::{
+        InjectedContent, InjectedFileMode, InjectedFileSet, InjectedFileSpec,
+    };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
+        AttachableNamespaces, LaunchIpcMode, LaunchNetworkMode, LaunchOptions, NetnsAttachHook,
         ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
         create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StartRequest,
         StateStore, TraitError,
@@ -203,6 +286,17 @@ mod linux {
     /// シナリオ D の bind 先のコンテナ内パスと、書くファイル名。
     const BIND_DEST: &str = "/data";
     const BIND_FILE: &str = "from-container";
+    /// シナリオ S（起動オプション。SUP-12・CORE-5・SEC-1・#2625）の注入ファイルのコンテナ内パス・内容（ダミー値）・モード。
+    const LO_SECRET_PATH: &str = "/secrets/token";
+    const LO_SECRET_CONTENT: &str = "dummy-secret-for-launch-options-test";
+    const LO_SECRET_MODE: u32 = 0o440;
+    /// シナリオ S で指定する tmpfs のコンテナ内パス。
+    const LO_TMPFS_DEST: &str = "/run";
+    /// シナリオ Y（読み取り専用 rootfs。#2767）: 試験が rootfs に先に置く既存ファイル・内容と、rw の bind に書く内容。
+    const RO_MARKER_FILE: &str = "ro-marker";
+    const RO_MARKER_CONTENT: &str = "ro-marker-original\n";
+    const RO_DATA_FILE: &str = "y";
+    const RO_DATA_CONTENT: &str = "written-to-rw-bind-under-readonly-root\n";
     /// 1 行の長さの上限（無制限確保を避ける。REPAIR-5 と同趣旨）。
     const LINE_MAX: u64 = 4096;
     /// 受け取る行数の上限。
@@ -229,6 +323,73 @@ mod linux {
             .and_then(|v| v.split_whitespace().nth(1).map(str::to_string))
             .as_deref()
             == Some("0")
+    }
+
+    /// 適用前の kcmp 対照の分類（#2788・CORE-5・SEC-4・REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum KcmpPrecondition {
+        Ok,
+        /// 外側の環境が kcmp を errno で拒否している（試験環境の問題で、フィルタの回帰ではない）。
+        Denied {
+            errno: i32,
+        },
+        /// 判定不能（`Unsupported`・`Failed`）。前提欠如とは断定しない。
+        Unknown,
+    }
+
+    fn classify_kcmp_before(outcome: ProbeOutcome) -> KcmpPrecondition {
+        match outcome {
+            ProbeOutcome::Ok => KcmpPrecondition::Ok,
+            ProbeOutcome::Errno(errno) => KcmpPrecondition::Denied { errno },
+            ProbeOutcome::Unsupported | ProbeOutcome::Failed => KcmpPrecondition::Unknown,
+        }
+    }
+
+    /// 前提欠如の panic メッセージ（1 行目で前提欠如と回帰を判別でき、値から決まるヒントだけを添える）。
+    fn precondition_message(errno: i32, seccomp_before: &str) -> String {
+        let hint = match (errno, seccomp_before) {
+            (1, "0") => "kcmp is denied by something other than seccomp (e.g. an LSM)",
+            (1, _) => {
+                "an outer seccomp filter denies kcmp (e.g. Docker's default seccomp profile under make docker-ci)"
+            }
+            (38, _) => "the kernel does not provide kcmp (CONFIG_KCMP)",
+            _ => "the environment denies kcmp",
+        };
+        format!(
+            "production_launcher: PRECONDITION FAILED (test environment, not a seccomp filter regression): \
+             kcmp(self, self, KCMP_VM) was denied with errno {errno} before the built-in seccomp stage \
+             (Seccomp: {seccomp_before}).\n\
+             hint: {hint}.\n\
+             Run it on the host: cargo test -p fandhe-container-core --test production_launcher --no-run, then \
+             systemd-run --user --scope -p Delegate=yes <binary> --ignored. See AGENTS.md production_launcher."
+        )
+    }
+
+    /// 分類とメッセージの自己照合（`main` から既定集合でも毎回走らせる。#2788）。
+    pub fn self_check_precondition() {
+        assert_eq!(classify_kcmp_before(ProbeOutcome::Ok), KcmpPrecondition::Ok);
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Errno(1)),
+            KcmpPrecondition::Denied { errno: 1 }
+        );
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Unsupported),
+            KcmpPrecondition::Unknown
+        );
+        assert_eq!(
+            classify_kcmp_before(ProbeOutcome::Failed),
+            KcmpPrecondition::Unknown
+        );
+        let msg = precondition_message(1, "2");
+        assert_eq!(
+            msg.lines().next(),
+            Some(
+                "production_launcher: PRECONDITION FAILED (test environment, not a seccomp filter regression): kcmp(self, self, KCMP_VM) was denied with errno 1 before the built-in seccomp stage (Seccomp: 2)."
+            )
+        );
+        assert!(msg.contains("--ignored"), "{msg}");
+        assert!(msg.contains("make docker-ci"), "{msg}");
+        assert!(precondition_message(38, "0").contains("CONFIG_KCMP"));
     }
 
     /// `/proc/<x>/status` 形式のファイルから、`key` で始まる行の値（key の後ろ）を返す。
@@ -361,6 +522,14 @@ mod linux {
                 field(key).split_whitespace().collect::<Vec<_>>().join(",")
             ));
         }
+        // シナリオ I の拡張（補助グループ。OCI-1・SEC-5・CORE-6・#2667）: `Groups:` をカンマ区切りで出す（空なら空文字）。
+        emit(format!(
+            "GROUPS {}",
+            field("Groups:")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
         // シナリオ K（exec 後の seccomp の識別的な拒否。#2012）: 禁止 syscall を 1 件発行する。フィルタが効いていれば
         // SIGSYS で終了して戻らない。戻った場合（フィルタ欠落）は固定語彙の行を出して正常終了し、親が失敗にする。
         let args: Vec<String> = std::env::args().collect();
@@ -400,6 +569,18 @@ mod linux {
                 control.map_or_else(|e| format!("error:{:?}", e.kind()), |_| "ok".to_string())
             ));
         }
+        // シナリオ N(Loopback モード。NET-6・CORE-6・#3064): 新しい netns の識別子・インターフェース・自己宛て UDP 配送を出す。
+        if args.iter().any(|a| a == "--net-loopback") {
+            net_loopback_probe(&mut emit);
+        }
+        // シナリオ V(sysctls の適用。#2670・CRI-2・CORE-3): コンテナ内の IPC namespace の `kernel.shmmax` を出す。
+        if args.iter().any(|a| a == "--with-sysctl") {
+            let v = std::fs::read_to_string("/proc/sys/kernel/shmmax").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |s| s.trim().to_string(),
+            );
+            emit(format!("SYSCTL_SHMMAX {v}"));
+        }
         // シナリオ D（bind mount。#1915）: bind 先へ固定の内容を書き、mountinfo 上のマウントオプションを出す。
         if std::env::args().any(|a| a == "--with-bind") {
             let wrote = std::fs::write(format!("{BIND_DEST}/{BIND_FILE}"), BIND_CONTENT);
@@ -422,6 +603,132 @@ mod linux {
             );
             emit(format!("BIND_OPTS {opts}"));
         }
+        // シナリオ U（`rslave` の bind。#2669）: bind 先のマウントの optional fields（`master:N` など）を出す。
+        if std::env::args().any(|a| a == "--with-rslave") {
+            let optional = std::fs::read_to_string("/proc/self/mountinfo").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |info| {
+                    info.lines()
+                        .filter_map(|l| {
+                            let f: Vec<&str> = l.split_whitespace().collect();
+                            (f.get(4).copied() == Some(BIND_DEST)).then(|| {
+                                f.iter()
+                                    .skip(6)
+                                    .take_while(|x| **x != "-")
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                        })
+                        .next_back()
+                        .unwrap_or_else(|| "not-mounted".to_string())
+                },
+            );
+            emit(format!("RSLAVE_OPTIONAL {optional}"));
+        }
+        // シナリオ Y（読み取り専用 rootfs。#2767）: rootfs への書き込みの errno（VFS の EROFS=30 か、Landlock だけが止めた
+        // EACCES=13 かを区別する）・`/` と `/proc` の per-mount オプション・書き込み可能であるべきマウントへの書き込み。
+        if std::env::args().any(|a| a == "--with-readonly-root") {
+            let errno = |r: std::io::Result<()>| {
+                r.map_or_else(
+                    |e| {
+                        e.raw_os_error()
+                            .map_or("none".to_string(), |n| n.to_string())
+                    },
+                    |()| "ok".to_string(),
+                )
+            };
+            emit(format!(
+                "RO_CREATE {}",
+                errno(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open("/ro-probe-new")
+                        .map(|_| ())
+                )
+            ));
+            emit(format!(
+                "RO_WRITE {}",
+                errno(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(format!("/{RO_MARKER_FILE}"))
+                        .map(|_| ())
+                )
+            ));
+            emit(format!(
+                "RO_MKDIR {}",
+                errno(std::fs::create_dir("/ro-dir"))
+            ));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            let opts_of = |dest: &str| -> String {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(5).copied().unwrap_or("").to_string())
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| "not-mounted".to_string())
+            };
+            emit(format!("RO_ROOT_OPTS {}", opts_of("/")));
+            emit(format!("RO_PROC_OPTS {}", opts_of("/proc")));
+            emit(format!(
+                "RO_RUN {}",
+                errno(std::fs::write("/run/y", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_SHM {}",
+                errno(std::fs::write("/dev/shm/y", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_DEVNULL {}",
+                errno(std::fs::write("/dev/null", RO_DATA_CONTENT))
+            ));
+            emit(format!(
+                "RO_DATA {}",
+                errno(std::fs::write(
+                    format!("{BIND_DEST}/{RO_DATA_FILE}"),
+                    RO_DATA_CONTENT
+                ))
+            ));
+        }
+        // シナリオ S（起動オプション。#2625）: IPC namespace の識別子・指定 tmpfs の種別・`/dev/shm` の有無・注入ファイル。
+        if std::env::args().any(|a| a == "--with-launch-options") {
+            let ipc = std::fs::read_link("/proc/self/ns/ipc").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |p| p.display().to_string(),
+            );
+            emit(format!("LO_IPC {ipc}"));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            // mountinfo の 5 番目がマウント先、`-` の次が fs 種別。
+            let fstype_of = |dest: &str| -> String {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        let dash = f.iter().position(|x| *x == "-")?;
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(dash + 1).copied().unwrap_or("").to_string())
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| "not-mounted".to_string())
+            };
+            emit(format!(
+                "LO_TMPFS {LO_TMPFS_DEST} {}",
+                fstype_of(LO_TMPFS_DEST)
+            ));
+            emit(format!("LO_SHM {}", fstype_of("/dev/shm")));
+            emit(format!("LO_SECRET_DIR {}", fstype_of("/secrets")));
+            let content = std::fs::read_to_string(LO_SECRET_PATH)
+                .unwrap_or_else(|e| format!("error:{:?}", e.kind()));
+            emit(format!("LO_SECRET {content}"));
+            let mode = std::fs::metadata(LO_SECRET_PATH).map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |m| format!("{:o}", m.permissions().mode() & 0o777),
+            );
+            emit(format!("LO_SECRET_MODE {mode}"));
+        }
         emit(PROBE_READY.to_string());
         // シナリオ P（名前だけの args[0]。#2314）: READY の後に指定の終了コードで終わる。
         let args: Vec<String> = std::env::args().collect();
@@ -442,18 +749,21 @@ mod linux {
         dir: PathBuf,
     }
 
+    /// 保護済みの親ディレクトリ（共通補助 `scratch_root`。tmpfiles の掃除と flock 競合の回避。#2840・#2887）。
+    fn scratch_root() -> &'static Path {
+        scratch_root::scratch_root("fandhe-prodlaunch", timeout())
+    }
+
     impl Bundle {
         fn new(tag: &str) -> Self {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
-                .join(format!(
-                    "fandhe-prodlaunch-{tag}-{}-{nanos}",
-                    std::process::id()
-                ));
+            let dir = scratch_root().join(format!(
+                "fandhe-prodlaunch-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
             std::fs::create_dir(&dir).expect("exclusively create bundle dir");
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod bundle dir");
@@ -487,6 +797,79 @@ mod linux {
         real_entry::mkdir(path);
     }
 
+    /// 新しい netns でカーネルが自動生成するフォールバックトンネルデバイス名(モジュールのロード状況で有無が変わる)。
+    const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
+        "tunl0",
+        "gre0",
+        "gretap0",
+        "erspan0",
+        "ip_vti0",
+        "ip6_vti0",
+        "sit0",
+        "ip6tnl0",
+        "ip6gre0",
+        "ip6erspan0",
+    ];
+    /// 自己宛て UDP の内容(固定)。
+    const NET_PING: &[u8] = b"fandhe-loopback-ping";
+
+    /// シナリオ N のコンテナ内プローブ(NET-6・#3064)。std だけを使い、`unsafe`・libc は使わない。
+    fn net_loopback_probe(emit: &mut dyn FnMut(String)) {
+        let ns = std::fs::read_link("/proc/self/ns/net").map_or_else(
+            |e| format!("error:{:?}", e.kind()),
+            |p| p.display().to_string(),
+        );
+        emit(format!("NETNS {ns}"));
+        let names = std::fs::read_to_string("/proc/self/net/dev").map_or_else(
+            |e| vec![format!("error:{:?}", e.kind())],
+            |t| {
+                t.lines()
+                    .skip(2)
+                    .filter_map(|l| l.split(':').next())
+                    .map(|n| n.trim().to_string())
+                    .collect()
+            },
+        );
+        emit(format!("NETDEV_LO {}", names.iter().any(|n| n == "lo")));
+        let extra: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| *n != "lo" && !FALLBACK_TUNNEL_DEVICES.contains(n))
+            .collect();
+        emit(format!(
+            "NETDEV_EXTRA {}",
+            if extra.is_empty() {
+                "none".to_string()
+            } else {
+                extra.join(",")
+            }
+        ));
+        let delivery = (|| -> Result<String, String> {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0")
+                .map_err(|e| format!("bind:{:?}", e.kind()))?;
+            sock.set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|e| format!("timeout:{:?}", e.kind()))?;
+            let me = sock
+                .local_addr()
+                .map_err(|e| format!("addr:{:?}", e.kind()))?;
+            sock.send_to(NET_PING, me)
+                .map_err(|e| format!("send:{:?}", e.kind()))?;
+            let mut buf = [0u8; 64];
+            let (n, from) = sock
+                .recv_from(&mut buf)
+                .map_err(|e| format!("recv:{:?}", e.kind()))?;
+            if buf.get(..n) == Some(NET_PING) && from == me {
+                Ok("ok".to_string())
+            } else {
+                Err("mismatch".to_string())
+            }
+        })();
+        emit(format!(
+            "UDP_SELF {}",
+            delivery.unwrap_or_else(|e| format!("error:{e}"))
+        ));
+    }
+
     fn write_config(
         bundle: &Bundle,
         ld_library_path: &str,
@@ -503,7 +886,20 @@ mod linux {
         extra_args: &[&str],
         mounts: serde_json::Value,
         cwd: &str,
+        user: (u32, u32),
+    ) {
+        write_config_groups(bundle, ld_library_path, extra_args, mounts, cwd, user, &[]);
+    }
+
+    /// `write_config_with` に `process.user.additionalGids` を指定できる版(OCI-1・SEC-5・CORE-6・#2667)。
+    fn write_config_groups(
+        bundle: &Bundle,
+        ld_library_path: &str,
+        extra_args: &[&str],
+        mounts: serde_json::Value,
+        cwd: &str,
         (uid, gid): (u32, u32),
+        additional_gids: &[u32],
     ) {
         let mut args = vec!["/probe", "--container-probe"];
         args.extend_from_slice(extra_args);
@@ -512,7 +908,7 @@ mod linux {
             "root": {"path": "rootfs", "readonly": false},
             "hostname": HOSTNAME,
             "process": {
-                "user": {"uid": uid, "gid": gid},
+                "user": {"uid": uid, "gid": gid, "additionalGids": additional_gids},
                 "args": args,
                 "env": [
                     "PATH=/",
@@ -528,6 +924,20 @@ mod linux {
         });
         std::fs::write(
             bundle.dir.join("config.json"),
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config.json");
+    }
+
+    /// 書き出し済みの `config.json` の `root.readonly` を真にする（シナリオ Y。#2767）。
+    fn set_root_readonly(bundle: &Bundle) {
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config.json"))
+                .expect("parse config.json");
+        config["root"]["readonly"] = json!(true);
+        std::fs::write(
+            &path,
             serde_json::to_vec(&config).expect("serialize config"),
         )
         .expect("write config.json");
@@ -651,12 +1061,54 @@ mod linux {
 
     fn do_create(env: &Env, bundle: &Bundle, id: &ContainerId) {
         let req = CreateRequest::new(id.clone(), bundle.dir.clone()).expect("absolute bundle");
-        create(&env.store, &env.recorder, &req).expect("create");
+        if let Err(e) = create(&env.store, &env.recorder, &req) {
+            // 間欠失敗（#2840）の再発時に 1 回でロック保持者を特定できるよう、bundle の flock の保持者を出す（判定は変えない）。
+            eprintln!(
+                "create failed for {}: lock holders: {}",
+                bundle.dir.display(),
+                lock_holders(&bundle.dir)
+            );
+            panic!("create: {e:?}");
+        }
+    }
+
+    /// `/proc/locks` から `path` の inode を持つ行と保持者の `comm` を文字列化する（診断専用。取れなければ "unknown"）。
+    fn lock_holders(path: &Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(md) = std::fs::metadata(path) else {
+            return "unknown".to_owned();
+        };
+        let needle = format!(":{}", md.ino());
+        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+            return "unknown".to_owned();
+        };
+        let rows: Vec<String> = locks
+            .lines()
+            .filter(|l| l.split_whitespace().any(|f| f.ends_with(&needle)))
+            .map(|l| {
+                let comm = l
+                    .split_whitespace()
+                    .nth(4)
+                    .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+                    .unwrap_or_default();
+                format!("[{l}] comm={}", comm.trim())
+            })
+            .collect();
+        if rows.is_empty() {
+            "none".to_owned()
+        } else {
+            rows.join("; ")
+        }
     }
 
     pub fn run() {
         let root = is_root();
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup v2");
+        // 前提（委譲 cgroup・範囲写像の helper ケースの `uidmap`・subuid / subgid・`USER`）の欠如は、回帰と見分けられる
+        // `PRECONDITION FAILED` の 1 行目で失敗させる（#2888・REPAIR-12）。失敗の範囲は変えない。
+        let delegated = real_entry::precondition::delegated_cgroup();
+        if subordinate_requested() && !root {
+            real_entry::precondition::require_subordinate_ids(own_ids().0);
+        }
         let tag = std::process::id();
         let cg_id = ContainerId::new(format!("pl{tag}")).expect("container id");
         let cg_name = CgroupName::new(&cg_id).expect("cgroup name");
@@ -676,6 +1128,7 @@ mod linux {
             scenarios(root, &container, &expected_cgroup, tag);
         }));
         let removed = delegated.remove_child(&container);
+        scratch_root::remove_scratch_root();
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
@@ -734,13 +1187,23 @@ mod linux {
         scenario_a_normal(&env, expected_cgroup, tag);
         scenario_b_failed_launch_leaves_nothing(&env, tag);
         scenario_c_multithreaded_refused(&env, tag);
+        scenario_dropped_handle_confirmed(&env, tag);
         scenario_d_bind_mount(&env, tag);
+        scenario_u_rslave_bind(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
         scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
+        scenario_s_launch_options(&env, tag);
+        scenario_y_readonly_root(&env, tag);
+        scenario_n_network_loopback(&env, tag, false);
+        scenario_z_network_host_netns_sync(&env, tag);
+        scenario_attachable_network(&env, tag, false);
         if subordinate_requested() {
+            scenario_n_network_loopback(&env, tag, true);
+            scenario_attachable_network(&env, tag, true);
             scenario_i_subordinate_ids(&env, tag);
+            scenario_s_subordinate_sealed_inject(&env, tag);
         } else {
             println!(
                 "production_launcher: subordinate id case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
@@ -748,12 +1211,17 @@ mod linux {
         }
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
+        scenario_t_capabilities_drop(&env, tag);
+        scenario_v_sysctls(&env, tag);
+        scenario_w_pod_ipc_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
+        scenario_o_groups_single_id_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
         scenario_s_entrypoint_violation_recorded(&env, container, tag);
+        scenario_x_exec_failures(&env, container, tag);
         scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
@@ -982,6 +1450,47 @@ mod linux {
         println!("production_launcher: scenario=multithreaded-refused code=FailedPrecondition");
     }
 
+    /// シナリオ dropped-handle: 起動に成功したハンドルを terminate せずに捨てても、同じ launcher の
+    /// `confirm_no_process` が子（PID 1）を kill・回収して `Ok` になる（`Handed` のまま詰まらない。
+    /// pasta ラッパーが attachment 欠落で terminate に失敗して捨てた場合と同じ状態。CORE-2・NET-9・REPAIR-5・#3432）。
+    fn scenario_dropped_handle_confirmed(env: &Env, tag: u32) {
+        let bundle = Bundle::new("dh");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        let id = ContainerId::new(format!("pldh{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let (_record, process) = started.into_parts();
+        drop(process);
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "dropping the handle must not kill or reap the child"
+        );
+        env.launcher
+            .confirm_no_process(&id, timeout())
+            .expect("confirm_no_process must reap the child of the dropped handle");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after the confirmation"
+        );
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain: {:?}",
+            children_of_self()
+        );
+        println!("production_launcher: scenario=dropped-handle-confirmed pid gone");
+    }
+
     /// シナリオ D: `mounts[]` の bind mount が start と本番 launcher を通って適用される（#1915・OCI-4・IO-8・SEC-1）。
     /// コンテナ内が bind 先へ書いた内容がホスト側の元に完全一致で現れ、bind 先のマウントに `nosuid`・`nodev` が付く。
     fn scenario_d_bind_mount(env: &Env, tag: u32) {
@@ -1032,6 +1541,362 @@ mod linux {
             assert_eq!(on_host, BIND_CONTENT);
             println!(
                 "production_launcher: scenario=bind-mount pid={pid} dest={BIND_DEST} visible on host, nosuid+nodev"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 元が属するホスト側のマウントの伝播（`/proc/self/mountinfo` の最長一致の行の optional fields。試験プロセスはホストの
+    /// mount namespace にいる）。`(shared, slave)`。
+    fn host_propagation_of(path: &Path) -> (bool, bool) {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let mut best: Option<(usize, bool, bool)> = None;
+        for line in info.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(mount_point) = f.get(4) else {
+                continue;
+            };
+            if !path.starts_with(mount_point) {
+                continue;
+            }
+            let optional: Vec<&str> = f
+                .iter()
+                .skip(6)
+                .take_while(|x| **x != "-")
+                .copied()
+                .collect();
+            let shared = optional.iter().any(|o| o.starts_with("shared:"));
+            let slave = optional
+                .iter()
+                .any(|o| o.starts_with("master:") || o.starts_with("propagate_from:"));
+            if best.is_none_or(|(len, _, _)| mount_point.len() >= len) {
+                best = Some((mount_point.len(), shared, slave));
+            }
+        }
+        let (_, shared, slave) = best.expect("a mount must contain the source directory");
+        (shared, slave)
+    }
+
+    /// シナリオ U: `rslave` の bind（#2669・OCI-4・CRI-2・SEC-1）。ホスト側の元のマウントが shared か slave なら起動でき、
+    /// コンテナ内の bind 先は `master:` を持ち `shared:` を持たない。ホスト側が private なら rootfs に触れる前に
+    /// `FailedPrecondition` で拒否される（黙って private で載せない）。
+    fn scenario_u_rslave_bind(env: &Env, tag: u32) {
+        let src = Bundle::new("u-src");
+        let bundle = Bundle::new("u");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["rbind", "rslave", "rw"]
+        }]);
+        write_config(&bundle, &ld, &["--with-rslave"], mounts);
+        let id = ContainerId::new(format!("plu{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        let (host_shared, host_slave) = host_propagation_of(&src.dir);
+        let host = match (host_shared, host_slave) {
+            (true, _) => "shared",
+            (false, true) => "slave",
+            (false, false) => "private",
+        };
+
+        wait_single_thread();
+        let result = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        );
+        if !(host_shared || host_slave) {
+            let err = match result {
+                Ok(_) => panic!("rslave bind of a private host mount must be refused"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.code(),
+                ErrorCode::FailedPrecondition,
+                "{}",
+                err.message()
+            );
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(!env.launcher.last_launch_may_have_left_process());
+            env.launcher
+                .confirm_no_process(&id, timeout())
+                .expect("confirm_no_process must be Ok for a cleanly failed launch");
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "no intermediate process or PID 1 may remain: {:?}",
+                children_of_self()
+            );
+            assert!(
+                !bundle.rootfs().join("data").exists(),
+                "the bind destination must not be created in the rootfs"
+            );
+            println!(
+                "production_launcher: scenario=rslave-bind host={host} refused code={:?} state=created children=0",
+                err.code()
+            );
+            return;
+        }
+        let started = result.unwrap_or_else(|e| {
+            panic!(
+                "start with rslave bind failed: {:?} {}",
+                e.code(),
+                e.message()
+            )
+        });
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            let optional = value_of(&lines, "RSLAVE_OPTIONAL");
+            let fields: Vec<&str> = optional.split(',').collect();
+            assert!(
+                fields.iter().any(|f| f.starts_with("master:")),
+                "the rslave bind must be a slave in the container: {optional}"
+            );
+            assert!(
+                !fields.iter().any(|f| f.starts_with("shared:")),
+                "the rslave bind must not be shared in the container: {optional}"
+            );
+            println!(
+                "production_launcher: scenario=rslave-bind host={host} pid={pid} dest={BIND_DEST} slave in the container, not shared"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ S(SUP-12・CORE-5・SEC-1・#2625): `ProductionLauncher::builder().launch_options(..)` で渡した
+    /// `--ipc=host` + `--tmpfs /run` + 注入ファイルが、`create` → `start` の実プロセスへ実効状態として届くことを
+    /// 具体値で照合する(IPC namespace の識別子がホストと一致・`/run` が tmpfs・`/dev/shm` を載せない・注入ファイルの
+    /// 内容とモード・注入ディレクトリが専用 tmpfs)。supervisor の `ContainerOptions::launch_options` から同じ
+    /// builder 呼び出しへ至る変換は supervisor 側の単体試験が担う。
+    fn scenario_s_launch_options(env: &Env, tag: u32) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+            .expect("push tmpfs");
+        let mut inject = InjectedFileSet::new();
+        inject
+            .push(
+                InjectedFileSpec::new(
+                    LO_SECRET_PATH,
+                    InjectedContent::from_bytes(LO_SECRET_CONTENT.as_bytes().to_vec())
+                        .expect("content"),
+                    InjectedFileMode::new(LO_SECRET_MODE).expect("mode"),
+                )
+                .expect("inject spec"),
+            )
+            .expect("push inject");
+        let options =
+            LaunchOptions::new(tmpfs, inject, LaunchIpcMode::Host).expect("launch options");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher with launch options"),
+        );
+        let host_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("host ipc ns")
+            .display()
+            .to_string();
+
+        let bundle = Bundle::new("s");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
+        let id = ContainerId::new(format!("plt{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            // ホストから見た PID 1 の IPC namespace も、コンテナ内の見え方も、起動側と同じ。
+            let from_host = std::fs::read_link(format!("/proc/{pid}/ns/ipc"))
+                .expect("container ipc ns from host")
+                .display()
+                .to_string();
+            assert_eq!(from_host, host_ipc);
+            assert_eq!(value_of(&lines, "LO_IPC"), host_ipc);
+            assert_eq!(
+                value_of(&lines, "LO_TMPFS"),
+                format!("{LO_TMPFS_DEST} tmpfs")
+            );
+            // `--ipc=host` では専用の `/dev/shm` を載せない。
+            assert_eq!(value_of(&lines, "LO_SHM"), "not-mounted");
+            assert_eq!(value_of(&lines, "LO_SECRET_DIR"), "tmpfs");
+            assert_eq!(value_of(&lines, "LO_SECRET"), LO_SECRET_CONTENT);
+            assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
+            println!(
+                "production_launcher: launch options reached the container (scenario=S ipc=host tmpfs={LO_TMPFS_DEST} secret mode=440)"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ Y（読み取り専用 rootfs。CORE-5・SEC-1・SUP-12・#2767）: `root.readonly=true` の config を start し、
+    /// rootfs への新規作成・既存ファイルへの書き込み・mkdir が **`EROFS`（30）** で拒否されることを照合する。
+    /// Landlock だけが止めている場合は `EACCES`（13）になるため、これを失敗として扱う（VFS の読み取り専用化が効いていることの
+    /// 判別条件。カーネルは `got_write` が無いとき Landlock のフックより先に `EROFS` を返す: `fs/namei.c` の `lookup_open`・
+    /// `filename_create` と `fs/open.c` の `do_dentry_open` で書き込みアクセスの取得が `security_*` より先）。
+    /// あわせて `/` の per-mount オプションに `ro` と `nodev` が含まれる（属性の追加だけで `nodev` が落ちない）こと、
+    /// `/proc` に `ro` が付かない（非再帰）こと、`--tmpfs`（`/run`）・専用 `/dev`（`/dev/shm`・`/dev/null`）・rw の bind
+    /// （`/data`）への書き込みが成功し、bind はホスト側に内容が現れることを照合する。非 root の経路だけで回す。
+    fn scenario_y_readonly_root(env: &Env, tag: u32) {
+        let _ = env;
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+            .expect("push tmpfs");
+        // Private IPC では専用の `/dev/shm` が要る(`LaunchOptions::new` の検査)。ここで既定の 1 件を足す。
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for readonly root"),
+        );
+        let src = Bundle::new("y-src");
+        let bundle = Bundle::new("y");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        std::fs::write(bundle.rootfs().join(RO_MARKER_FILE), RO_MARKER_CONTENT).expect("marker");
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["bind", "rw"]
+        }]);
+        write_config(&bundle, &ld, &["--with-readonly-root"], mounts);
+        set_root_readonly(&bundle);
+        let id = ContainerId::new(format!("ply{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            // EROFS = 30。13（EACCES）なら Landlock だけが止めていて、VFS の読み取り専用化が効いていない。
+            for key in ["RO_CREATE", "RO_WRITE", "RO_MKDIR"] {
+                assert_eq!(value_of(&lines, key), "30", "{key}: {lines:?}");
+            }
+            let root_opts: Vec<&str> = value_of(&lines, "RO_ROOT_OPTS").split(',').collect();
+            assert!(root_opts.contains(&"ro"), "{root_opts:?}");
+            assert!(root_opts.contains(&"nodev"), "{root_opts:?}");
+            let proc_opts: Vec<&str> = value_of(&lines, "RO_PROC_OPTS").split(',').collect();
+            assert!(!proc_opts.contains(&"ro"), "{proc_opts:?}");
+            for key in ["RO_RUN", "RO_SHM", "RO_DEVNULL", "RO_DATA"] {
+                assert_eq!(value_of(&lines, key), "ok", "{key}: {lines:?}");
+            }
+            let on_host = std::fs::read_to_string(src.dir.join(RO_DATA_FILE)).expect("host file");
+            assert_eq!(on_host, RO_DATA_CONTENT);
+            assert!(!bundle.rootfs().join("ro-probe-new").exists());
+            assert!(!bundle.rootfs().join("ro-dir").exists());
+            assert_eq!(
+                std::fs::read_to_string(bundle.rootfs().join(RO_MARKER_FILE)).expect("marker"),
+                RO_MARKER_CONTENT
+            );
+            println!(
+                "production_launcher: readonly rootfs refused writes with EROFS; tmpfs, /dev, bind writable (scenario=Y root=ro nodev=kept tmpfs={LO_TMPFS_DEST})"
             );
         }));
         let (_record, process) = started.into_parts();
@@ -1180,6 +2045,110 @@ mod linux {
         );
     }
 
+    /// シナリオ S の範囲写像版(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。CORE-6・SEC-5・SUP-12・#2628): ホストのファイルを
+    /// 封印 memfd(`InjectedContent::from_file`)にした注入が、`RootlessSubordinateIds` の launcher で拒否されず、
+    /// 内容とモードが具体値でコンテナへ届くことを照合する。呼び出し元のメモリの内容(`from_bytes`)は start の前に
+    /// 拒否されることも照合する。
+    fn scenario_s_subordinate_sealed_inject(env: &Env, tag: u32) {
+        let host_dir = scratch_root().join(format!("fandhe-plt-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host_dir);
+        std::fs::create_dir_all(&host_dir).expect("host dir");
+        let host_file = host_dir.join("secret");
+        std::fs::write(&host_file, LO_SECRET_CONTENT).expect("write host secret");
+        let build = |content: InjectedContent| -> Result<ProductionLauncher, TraitError> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs
+                .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+                .expect("push tmpfs");
+            let mut inject = InjectedFileSet::new();
+            inject
+                .push(
+                    InjectedFileSpec::new(
+                        LO_SECRET_PATH,
+                        content,
+                        InjectedFileMode::new(LO_SECRET_MODE).expect("mode"),
+                    )
+                    .expect("inject spec"),
+                )
+                .expect("push inject");
+            let options =
+                LaunchOptions::new(tmpfs, inject, LaunchIpcMode::Host).expect("launch options");
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                .subordinate_ids(SubordinateIdSource::system(std::env::var("USER").ok())?)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+        };
+        // 呼び出し元のメモリの内容は build で拒否される(fork 前)。
+        let refused = build(
+            InjectedContent::from_bytes(LO_SECRET_CONTENT.as_bytes().to_vec()).expect("content"),
+        )
+        .expect_err("caller-memory content must be refused under subordinate ids");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument);
+
+        let file = std::fs::File::open(&host_file).expect("open host secret");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            build(InjectedContent::from_file(&file).expect("sealed content"))
+                .expect("build subordinate launcher with sealed injection"),
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&host_dir);
+
+        let bundle = Bundle::new("ss");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
+        let id = ContainerId::new(format!("plss{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "LO_SECRET_DIR"), "tmpfs");
+            assert_eq!(value_of(&lines, "LO_SECRET"), LO_SECRET_CONTENT);
+            assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
+            println!(
+                "production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
     /// root で実行された場合のシナリオ I: `RootlessSubordinateIds` の構築が `PermissionDenied` で拒否される
     /// (コンテナ内 root をホスト root へ写さない。SEC-5・#2009)。
     fn scenario_i_root_refused() {
@@ -1203,10 +2172,28 @@ mod linux {
         prepare: &dyn Fn(&Path),
         tag: u32,
     ) -> Vec<String> {
+        run_probe_groups(env, launcher, name, cwd, user, &[], prepare, tag)
+    }
+
+    /// `run_probe_with` に `additionalGids` を指定できる版。ホストから見た補助グループを `HOST_GROUPS` 行として足す
+    /// (OCI-1・SEC-5・CORE-6・#2667)。
+    // 既存の `run_probe_with` と同じ並びに `additionalGids` を足した試験用ヘルパーで、引数は呼び出し側の
+    // 試験ごとに全て異なる値を取る。構造体に束ねると 1 回限りの型が増えるため抑止する。
+    #[allow(clippy::too_many_arguments)]
+    fn run_probe_groups(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        name: &str,
+        cwd: &str,
+        user: (u32, u32),
+        additional_gids: &[u32],
+        prepare: &dyn Fn(&Path),
+        tag: u32,
+    ) -> Vec<String> {
         let bundle = Bundle::new(name);
         let ld = make_rootfs(&bundle.rootfs(), true);
         prepare(&bundle.rootfs());
-        write_config_with(&bundle, &ld, &[], json!([]), cwd, user);
+        write_config_groups(&bundle, &ld, &[], json!([]), cwd, user, additional_gids);
         let id = ContainerId::new(format!("pl{name}{tag}")).expect("id");
         do_create(env, &bundle, &id);
         wait_single_thread();
@@ -1233,6 +2220,12 @@ mod linux {
                 lines.push(format!(
                     "HOST_UIDS {}",
                     host.split_whitespace().collect::<Vec<_>>().join(",")
+                ));
+                let groups = status_field(&format!("/proc/{pid}/status"), "Groups:")
+                    .unwrap_or_else(|| "missing".to_string());
+                lines.push(format!(
+                    "HOST_GROUPS {}",
+                    groups.split_whitespace().collect::<Vec<_>>().join(",")
                 ));
             }
         }));
@@ -1332,6 +2325,43 @@ mod linux {
         );
     }
 
+    /// シナリオ O の拡張(OCI-1・SEC-5・CORE-6・#2667): 単一 ID 写像では `setgroups` が `deny` のため、
+    /// `additionalGids` の指定は fork の前に `FailedPrecondition` で拒否され、状態は Created のまま子が残らない。
+    fn scenario_o_groups_single_id_refused(env: &Env, tag: u32) {
+        let bundle = Bundle::new("og");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config_groups(&bundle, &ld, &[], json!([]), "/", (0, 0), &[0]);
+        let id = ContainerId::new(format!("plog{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("start must fail for additionalGids under a single id mapping"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.message(),
+            "process.user.additionalGids requires a subordinate id mapping (SEC-5)"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(children_of_self().is_empty());
+        println!(
+            "production_launcher: scenario=groups-single-id-refused code={:?} state=created children=0",
+            err.code()
+        );
+    }
+
     /// シナリオ I の拡張(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。OCI-1・SEC-5): 範囲写像で `process.user` 1000:1000 を
     /// 指定すると、コンテナ内の実・実効・保存・FS の uid / gid が 1000 になり、ホストから見た uid は
     /// 「subuid の先頭 + 999」になる(コンテナ 1 → subuid 先頭)。
@@ -1366,6 +2396,28 @@ mod linux {
             "{lines:?}"
         );
         println!("production_launcher: scenario=user-applied uid=gid=1000 host_uid={host_uid}");
+        // 補助グループ(#2667): additionalGids [3000, 2000] は gid 写像内(コンテナ 1 → subgid 先頭)なので適用され、
+        // コンテナ内の Groups: はカーネルがソートした 2000,3000、ホストからは subgid 先頭 + 1999 / + 2999 に見える。
+        let gowner = SubIdOwner::new(euid, std::env::var("USER").ok()).expect("gid owner");
+        let granges =
+            load_subordinate_ids(Path::new("/etc/subgid"), &gowner).expect("load /etc/subgid");
+        let gbase = granges.first().expect("a subgid range").start();
+        let lines = run_probe_groups(
+            &env,
+            &launcher,
+            "ig",
+            "/",
+            (1000, 1000),
+            &[3000, 2000],
+            &|_| (),
+            tag,
+        );
+        assert_eq!(value_of(&lines, "GROUPS"), "2000,3000", "{lines:?}");
+        let host_gids = format!("{},{}", gbase + 1999, gbase + 2999);
+        assert_eq!(value_of(&lines, "HOST_GROUPS"), host_gids, "{lines:?}");
+        println!(
+            "production_launcher: scenario=groups-applied gids=2000,3000 host_gids={host_gids}"
+        );
     }
 
     /// シナリオ E: 状態ルート自身、または状態ルートへの symlink 別名を bind mount の元にした start は、本番 launcher
@@ -1676,12 +2728,18 @@ mod linux {
 
         // 適用前の kcmp 対照（親は組み込みフィルタを載せていない）。外側が拒否する環境は前提欠如として失敗させる（#2234）。
         let kcmp_before = probe_kcmp_self_for_test();
-        assert_eq!(
-            kcmp_before,
-            ProbeOutcome::Ok,
-            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp, so EPERM inside the container cannot be attributed to the built-in filter",
-            status_field("/proc/self/status", "Seccomp:").unwrap_or_default()
-        );
+        let seccomp_before =
+            status_field("/proc/self/status", "Seccomp:").unwrap_or_else(|| "unknown".to_string());
+        match classify_kcmp_before(kcmp_before) {
+            KcmpPrecondition::Ok => {}
+            KcmpPrecondition::Denied { errno } => {
+                panic!("{}", precondition_message(errno, &seccomp_before))
+            }
+            // 判定不能は前提欠如と表示せず、汎用の失敗にする（fail-closed）。
+            KcmpPrecondition::Unknown => panic!(
+                "production_launcher: kcmp control probe could not be evaluated (got {kcmp_before:?})"
+            ),
+        }
 
         let bundle = Bundle::new("j");
         let ld = make_rootfs(&bundle.rootfs(), true);
@@ -1767,6 +2825,717 @@ mod linux {
             children_of_self().is_empty(),
             "no child may remain after terminate"
         );
+    }
+
+    /// シナリオ T: `process.capabilities` の drop が exec 後の PID 1 に効く（#2666・SEC-1・CRI-2）。
+    /// 3 集合を「OCI 既定 - CAP_NET_RAW - CAP_MKNOD」にすると、`CapPrm`・`CapEff`・`CapBnd` が
+    /// `0xa80425fb` から bit 13・27 を除いた `0xa00405fb` になり、`CapInh`・`CapAmb` は 0 のまま。
+    fn scenario_t_capabilities_drop(env: &Env, tag: u32) {
+        const DROPPED_MASK: u64 = 0x0000_0000_a004_05fb;
+        let names: Vec<&str> = OCI_DEFAULT_CAPABILITIES
+            .iter()
+            .filter(|c| c.as_str() != "CAP_NET_RAW" && c.as_str() != "CAP_MKNOD")
+            .map(|c| c.as_str())
+            .collect();
+        let bundle = Bundle::new("t");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-restrictions"], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["process"]["capabilities"] =
+            json!({"bounding": names, "effective": names, "permitted": names});
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        let id = ContainerId::new(format!("plv{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            for (key, want) in [
+                ("CapInh", 0),
+                ("CapAmb", 0),
+                ("CapPrm", DROPPED_MASK),
+                ("CapEff", DROPPED_MASK),
+                ("CapBnd", DROPPED_MASK),
+            ] {
+                assert_eq!(
+                    cap_value(value_of(&lines, &format!("CAP {key}"))),
+                    want,
+                    "in-container {key}"
+                );
+                let host = status_field(&format!("/proc/{pid}/status"), &format!("{key}:"))
+                    .unwrap_or_else(|| panic!("host {key} missing"));
+                assert_eq!(cap_value(&host), want, "host view of {key}");
+            }
+            println!(
+                "production_launcher: capabilities drop applied (scenario=T pid={pid} cap_eff=0xa00405fb)"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ N(NET-6・CORE-6・SEC-1・#3064): `Loopback` モードの起動で、コンテナがホストと別の netns に入り、
+    /// `lo`(とカーネルのフォールバックトンネル)だけを持ち、`lo` が up で 127.0.0.1 の自己宛て UDP が届くことを
+    /// 具体値で照合する(`lo` が down だと受信が期限切れになる: #2077)。コンテナの終了後に netns の pin
+    /// (nsfs のマウント・自 uid で読める他プロセスの `ns/net`)が残らないことも照合する。
+    /// `subordinate` が真なら範囲写像(holder の user namespace へ `setns` した後の unshare)の経路で回す。
+    fn scenario_n_network_loopback(env: &Env, tag: u32, subordinate: bool) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("default dev shm");
+        let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("launch options")
+            .with_network(LaunchNetworkMode::Loopback);
+        let mut builder = ProductionLauncher::builder();
+        builder = if subordinate {
+            builder
+                .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                .subordinate_ids(
+                    SubordinateIdSource::system(std::env::var("USER").ok())
+                        .expect("subordinate ids"),
+                )
+        } else {
+            builder.privilege(IsolationPrivilege::RootlessSingleId)
+        };
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            builder
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for loopback network"),
+        );
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .expect("host net ns")
+            .display()
+            .to_string();
+
+        let bundle = Bundle::new(if subordinate { "ns" } else { "n" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        // 他シナリオの id(`pl{name}{tag}`。例: working-dir-refused の `pln{tag}`)と衝突しない固有の接頭辞にする。
+        let id = ContainerId::new(format!(
+            "plnet{}{tag}",
+            if subordinate { "sub" } else { "own" }
+        ))
+        .expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let mut container_netns = String::new();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            container_netns = value_of(&lines, "NETNS").to_string();
+            assert!(
+                container_netns.starts_with("net:["),
+                "container netns: {container_netns}"
+            );
+            assert_ne!(container_netns, host_netns, "must not share the host netns");
+            assert_eq!(value_of(&lines, "NETDEV_LO"), "true");
+            assert_eq!(value_of(&lines, "NETDEV_EXTRA"), "none");
+            assert_eq!(value_of(&lines, "UDP_SELF"), "ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+        // pin が残らない: nsfs のマウントも、自 uid で読める他プロセスの ns/net も、コンテナの netns を指さない。
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        assert!(
+            !mountinfo
+                .lines()
+                .any(|l| l.contains("nsfs") && l.contains(&container_netns)),
+            "no nsfs mount may pin the container netns"
+        );
+        let held = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter(|e| {
+                std::fs::read_link(e.path().join("ns/net"))
+                    .is_ok_and(|p| p.display().to_string() == container_netns)
+            })
+            .count();
+        assert_eq!(held, 0, "no process may keep the container netns alive");
+        // 成功行は固定文言(CI の照合が試験ソースの文字列リテラルから期待行を導出するため、プレースホルダを持たせない)。
+        if subordinate {
+            println!(
+                "production_launcher: network loopback isolated lo up and self delivery ok; no netns pin after terminate (scenario=N-subordinate)"
+            );
+        } else {
+            println!(
+                "production_launcher: network loopback isolated lo up and self delivery ok; no netns pin after terminate (scenario=N)"
+            );
+        }
+    }
+
+    /// シナリオ Z(NET-6・SEC-1・SEC-4・#3206): `Host` モードの起動が exec 直前の netns 素性の同期点を通る(受理)ことと、
+    /// 基準を差し替えた起動が拒否・監査・回収されることを具体値で照合する。
+    fn scenario_z_network_host_netns_sync(env: &Env, tag: u32) {
+        let host_netns = std::fs::read_link("/proc/self/ns/net")
+            .expect("host net ns")
+            .display()
+            .to_string();
+        let host_ino = std::fs::metadata("/proc/self/ns/net").expect("host ns meta");
+        let make_launcher = |sink: Arc<MemSink>, forged: bool| -> Arc<dyn ProcessLauncher> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs.ensure_default_dev_shm().expect("default dev shm");
+            let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+                .expect("launch options")
+                .with_network(LaunchNetworkMode::Host);
+            let mut builder = ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(sink)
+                .launch_options(options);
+            if forged {
+                use std::os::unix::fs::MetadataExt as _;
+                // 実在しない inode（0）。dev は本物のままで、素性が一致しない。
+                builder = builder.netns_baseline_override_for_test(host_ino.dev(), 0);
+            }
+            Arc::new(builder.build().expect("build launcher for host network"))
+        };
+
+        // 受理: 基準は supervisor 自身の netns（差し替えなし）。コンテナ内の netns の識別子がホストと同じ。
+        let accept_sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+        let launcher = make_launcher(Arc::clone(&accept_sink), false);
+        let bundle = Bundle::new("z");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plnethost{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "NETNS"),
+                host_netns,
+                "host mode must share the host netns"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            accept_sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an accepted netns sync must record nothing"
+        );
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain after terminate"
+        );
+
+        // 拒否: 基準を差し替えた起動は FailedPrecondition で失敗し、監査に 1 件残り、子が残らない。
+        let reject_sink = Arc::new(MemSink(std::sync::Mutex::new(Vec::new())));
+        let launcher = make_launcher(Arc::clone(&reject_sink), true);
+        let bundle = Bundle::new("zr");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plnethostrej{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("a forged netns baseline must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        // launcher は ExecError を段名だけの固定文言へ写す(`to_trait_error`)。理由は下の監査記録で照合する。
+        assert_eq!(
+            err.message(),
+            "container launch failed in the NetnsVerify stage"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        let records = reject_sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            records
+                .iter()
+                .all(|r| r.contains("netns_identity_mismatch") && r.contains("netns_verify")),
+            "{records:?}"
+        );
+        assert!(!launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "a rejected launch must leave no process: {:?}",
+            children_of_self()
+        );
+        println!(
+            "production_launcher: network host netns sync accepted; forged baseline rejected with audit and no process (scenario=Z)"
+        );
+    }
+
+    /// シナリオ A-attach の試験用フック。受け取った fd の素性と、合図の前に exec が起きていないことを記録して、`result` を返す。
+    struct AttachProbeHook {
+        /// 受け取った (net の ino, user の ino)。
+        seen: std::sync::Mutex<Option<(u64, u64)>>,
+        /// フックの中で「PID 1 がまだ exec していない」を確かめられたか。
+        not_exec_yet: std::sync::atomic::AtomicBool,
+        result: Result<(), ErrorCode>,
+    }
+
+    impl NetnsAttachHook for AttachProbeHook {
+        fn attach(
+            &self,
+            namespaces: AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), TraitError> {
+            let ino_of = |fd: std::os::fd::BorrowedFd<'_>| {
+                std::fs::File::from(fd.try_clone_to_owned().expect("dup ns fd"))
+                    .metadata()
+                    .expect("ns fd metadata")
+                    .ino()
+            };
+            let seen = (ino_of(namespaces.net()), ino_of(namespaces.user()));
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seen);
+            // 合図の前に PID 1 は exec していない: 子の `Name:` が exec 後のエントリ名 `probe` になるのは exec の後だけ。
+            let exec_started = || {
+                children_of_self().iter().any(|pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .ok()
+                        .and_then(|s| s.lines().next().map(str::to_owned))
+                        .is_some_and(|l| l.trim_end() == "Name:\tprobe")
+                })
+            };
+            let before = exec_started();
+            std::thread::sleep(Duration::from_millis(200));
+            let after = exec_started();
+            self.not_exec_yet
+                .store(!before && !after, std::sync::atomic::Ordering::SeqCst);
+            self.result
+                .map_err(|code| TraitError::new(code, "attach hook detail"))
+        }
+    }
+
+    /// シナリオ A-attach(NET-9・CORE-6・SEC-1・REPAIR-5・#1939): `Attachable` モードの同期点。受理の側は、フックが netns と
+    /// user namespace の fd(ホストと異なる素性)を合図の前に受け取り、その時点で PID 1 が exec しておらず、合図の後に
+    /// コンテナがフックで受けた netns の中で `lo` だけ up の状態で動くことを照合する。拒否の側は Err を返すフックで起動し、
+    /// `start` の code と固定文言・状態 Created・子が残らないことを照合する。
+    /// `subordinate` が真なら範囲写像の経路で回す。
+    fn scenario_attachable_network(env: &Env, tag: u32, subordinate: bool) {
+        use std::sync::atomic::Ordering;
+        let make_launcher = |hook: Arc<AttachProbeHook>| -> Arc<dyn ProcessLauncher> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs.ensure_default_dev_shm().expect("default dev shm");
+            let options = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+                .expect("launch options")
+                .with_network(LaunchNetworkMode::Attachable);
+            let builder = if subordinate {
+                ProductionLauncher::builder()
+                    .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                    .subordinate_ids(
+                        SubordinateIdSource::system(std::env::var("USER").ok())
+                            .expect("subordinate ids"),
+                    )
+            } else {
+                ProductionLauncher::builder().privilege(IsolationPrivilege::RootlessSingleId)
+            };
+            Arc::new(
+                builder
+                    .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                    .launch_options(options)
+                    .netns_attach_hook(hook)
+                    .build()
+                    .expect("build launcher for attachable network"),
+            )
+        };
+        let host_net_ino = std::fs::metadata("/proc/self/ns/net")
+            .expect("host net ns")
+            .ino();
+        let host_user_ino = std::fs::metadata("/proc/self/ns/user")
+            .expect("host user ns")
+            .ino();
+        let suffix = if subordinate { "sub" } else { "own" };
+
+        // 受理。
+        let hook = Arc::new(AttachProbeHook {
+            seen: std::sync::Mutex::new(None),
+            not_exec_yet: std::sync::atomic::AtomicBool::new(false),
+            result: Ok(()),
+        });
+        let launcher = make_launcher(Arc::clone(&hook));
+        let bundle = Bundle::new(if subordinate { "nasub" } else { "na" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plattach{suffix}{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let seen = *hook
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (hook_net, hook_user) = seen.expect("the hook must have been called once before exec");
+        assert_ne!(hook_net, host_net_ino, "the handed netns must be new");
+        assert_ne!(hook_user, host_user_ino, "the handed userns must be new");
+        assert!(
+            hook.not_exec_yet.load(Ordering::SeqCst),
+            "the container must not exec before the launcher's acknowledgement"
+        );
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "NETNS"),
+                format!("net:[{hook_net}]"),
+                "the container must run in the netns handed to the hook"
+            );
+            assert_eq!(value_of(&lines, "NETDEV_LO"), "true");
+            assert_eq!(value_of(&lines, "NETDEV_EXTRA"), "none");
+            assert_eq!(value_of(&lines, "UDP_SELF"), "ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no child may remain after terminate"
+        );
+
+        // 拒否: フックが Err なら exec させず、code を保ち、固定文言で、状態は Created のまま子が残らない。
+        let hook = Arc::new(AttachProbeHook {
+            seen: std::sync::Mutex::new(None),
+            not_exec_yet: std::sync::atomic::AtomicBool::new(false),
+            result: Err(ErrorCode::Unavailable),
+        });
+        let launcher = make_launcher(Arc::clone(&hook));
+        let bundle = Bundle::new(if subordinate { "narsub" } else { "nar" });
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--net-loopback"], json!([]));
+        let id = ContainerId::new(format!("plattachrej{suffix}{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("a failing attach hook must reject the start"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), ErrorCode::Unavailable, "{}", err.message());
+        assert_eq!(
+            err.message(),
+            "container launch failed in the NetnsAttach stage"
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(hook.not_exec_yet.load(Ordering::SeqCst));
+        assert!(!launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "a rejected launch must leave no process: {:?}",
+            children_of_self()
+        );
+        // 成功行は固定文言(CI の照合が試験ソースの文字列リテラルから期待行を導出するため、プレースホルダを持たせない)。
+        if subordinate {
+            println!(
+                "production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable-subordinate)"
+            );
+        } else {
+            println!(
+                "production_launcher: network attachable netns handed over before exec; hook failure left no process (scenario=attachable)"
+            );
+        }
+    }
+
+    /// シナリオ V: `linux.sysctl` の namespaced キー(IPC 系 `kernel.shmmax`)が実際の IPC namespace と procfs を通って
+    /// コンテナ内で指定どおりの値になり、ホスト側の値が変わらないことを照合する(CRI-2・CORE-3・SEC-1・REPAIR-12・#2670)。
+    fn scenario_v_sysctls(env: &Env, tag: u32) {
+        const WANT: &str = "4194304";
+        const HOST_FILE: &str = "/proc/sys/kernel/shmmax";
+        let host_before = std::fs::read_to_string(HOST_FILE)
+            .expect("read host shmmax")
+            .trim()
+            .to_string();
+        assert_ne!(
+            host_before, WANT,
+            "host shmmax must differ from the value under test"
+        );
+        let bundle = Bundle::new("sysctl");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-sysctl"], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["linux"]["sysctl"] = json!({"kernel.shmmax": WANT});
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        let id = ContainerId::new(format!("plsy{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(
+                value_of(&lines, "SYSCTL_SHMMAX"),
+                WANT,
+                "in-container shmmax"
+            );
+            let host_after = std::fs::read_to_string(HOST_FILE)
+                .expect("read host shmmax")
+                .trim()
+                .to_string();
+            assert_eq!(host_after, host_before, "host shmmax must be unchanged");
+            println!(
+                "production_launcher: sysctls applied (scenario=V shmmax={WANT} host_unchanged={host_before})"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 起動済みコンテナの標準出力を読み、プローブの `READY` までを回収する（exec 後の状態を観測するため）。
+    ///
+    /// リーダースレッドは `READY` を送った時点で終了し、ここで join する。スレッドを残すと次の launch の前提
+    /// （`wait_single_thread` の `Threads: 1`）に戻れないため（REPAIR-12）。`READY` の後のプローブは出力せず待つだけ。
+    fn wait_probe_ready(started: &fandhe_container_core::oci_runtime::StartedContainer) {
+        let output = started.process().take_output().expect("container output");
+        let stdout = output.stdout.expect("container stdout");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            for _ in 0..LINES_MAX {
+                let mut line = String::new();
+                match (&mut reader).take(LINE_MAX).read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let line = line.trim_end().to_string();
+                        let ready = line == PROBE_READY;
+                        if tx.send(line).is_err() || ready {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let _ = collect_probe(&rx);
+        handle.join().expect("join reader");
+    }
+
+    /// 名前空間の識別子（`/proc/<pid>/ns/<name>` のリンク先。例 `ipc:[4026531839]`）。
+    fn ns_link(pid: impl std::fmt::Display, name: &str) -> String {
+        std::fs::read_link(format!("/proc/{pid}/ns/{name}"))
+            .unwrap_or_else(|e| panic!("read_link /proc/{pid}/ns/{name}: {e}"))
+            .display()
+            .to_string()
+    }
+
+    /// シナリオ W: pod の user・ipc namespace への join（#2674・CRI-2・CORE-3・SEC-1・SEC-5）。
+    fn scenario_w_pod_ipc_join(env: &Env, tag: u32) {
+        // 否定: 試験プロセス自身の namespace を指す path は、fork の前に PermissionDenied で拒否される。
+        {
+            let bundle = Bundle::new("w-own");
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            write_config(&bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": "/proc/self/ns/ipc"},
+                    {"type": "user", "path": "/proc/self/ns/user"}
+                ]),
+            );
+            let id = ContainerId::new(format!("plwn{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let Err(err) = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) else {
+                panic!("joining the caller's own namespaces must be refused");
+            };
+            assert_eq!(err.code(), ErrorCode::PermissionDenied);
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(children_of_self().is_empty(), "no child may remain");
+        }
+
+        // 正常: A の user・ipc namespace に B が join する。
+        let a_bundle = Bundle::new("w-a");
+        let ld = make_rootfs(&a_bundle.rootfs(), true);
+        write_config(&a_bundle, &ld, &[], json!([]));
+        let a_id = ContainerId::new(format!("plwa{tag}")).expect("id");
+        do_create(env, &a_bundle, &a_id);
+        wait_single_thread();
+        let a = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(a_id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start A failed: {:?} {}", e.code(), e.message()));
+        let a_pid = a.process().pid();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_probe_ready(&a);
+            let b_bundle = Bundle::new("w-b");
+            let ld = make_rootfs(&b_bundle.rootfs(), true);
+            write_config(&b_bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &b_bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": format!("/proc/{a_pid}/ns/ipc")},
+                    {"type": "user", "path": format!("/proc/{a_pid}/ns/user")}
+                ]),
+            );
+            let b_id = ContainerId::new(format!("plwb{tag}")).expect("id");
+            do_create(env, &b_bundle, &b_id);
+            wait_single_thread();
+            let b = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(b_id.clone()),
+                &timeouts(),
+            )
+            .unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
+            let b_pid = b.process().pid();
+            let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_probe_ready(&b);
+                for shared in ["user", "ipc"] {
+                    assert_eq!(
+                        ns_link(b_pid, shared),
+                        ns_link(a_pid, shared),
+                        "B must share A's {shared} namespace"
+                    );
+                }
+                for own in ["pid", "mnt", "uts"] {
+                    assert_ne!(
+                        ns_link(b_pid, own),
+                        ns_link(a_pid, own),
+                        "B must have its own {own} namespace"
+                    );
+                }
+                // B の PID 1 は自分の pid namespace の PID 1(共有しない)。
+                let nspid =
+                    status_field(&format!("/proc/{b_pid}/status"), "NSpid:").expect("host NSpid");
+                assert_eq!(nspid.split_whitespace().last(), Some("1"));
+                println!(
+                    "production_launcher: pod ipc namespace joined (scenario=W user and ipc shared, pid/mnt/uts separate, join of own namespaces refused)"
+                );
+            }));
+            finish_started(b, b_verified);
+        }));
+        finish_started(a, verified);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 書き出した `config.json` の `linux.namespaces` を差し替える（シナリオ W）。
+    fn patch_namespaces(bundle: &Bundle, namespaces: serde_json::Value) {
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["linux"]["namespaces"] = namespaces;
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
     }
 
     /// シナリオ K: exec 後の seccomp が禁止 syscall を SIGSYS で拒否する（#2012・SEC-2・CORE-5）。
@@ -2060,6 +3829,153 @@ mod linux {
         println!(
             "production_launcher: entrypoint violation recorded once and launch refused (scenario=S)"
         );
+    }
+
+    /// シナリオ X（#2763・SEC-4・CORE-5・REPAIR-12）: launch の entrypoint の実行失敗（ローダ欠落・0644・ゴミのバイト列）が、
+    /// ErrorCode つきの起動失敗になり、何も残さず監査にも記録されない。
+    ///
+    /// ケースごとに専用の記録先を持つ launcher を作る（`scenarios()` 共有の `MemSink` は他のシナリオの記録が溜まり、
+    /// 0 件を照合できない）。cgroup の join は `container` の `join_hook` を使う（シナリオ S と同じ）。
+    fn scenario_x_exec_failures(env: &Env, container: &Arc<ContainerCgroup>, tag: u32) {
+        struct RecSink(std::sync::Mutex<Vec<AuditRecord>>);
+        impl AuditSink for RecSink {
+            fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(record.clone());
+                Ok(())
+            }
+        }
+        /// 呼び出し側（supervisor / CLI / CRI）へ返るメッセージは、`R` の前の拒否も `R` の後の `execveat` の失敗も
+        /// `Exec` 段の固定文言に揃う（パス・errno を載せない。`launch_error`）。経路（`phase`）は公開 API からは
+        /// 見分けられないため、設計上の経路を成功行の表示として記す（`R` の後の経路は単体試験が別に固定する）。
+        const EXEC_STAGE_MESSAGE: &str = "container launch failed in the Exec stage";
+
+        // (case, 期待する ErrorCode, 設計上の経路の名前)
+        let cases: [(&str, ErrorCode, &str); 3] = [
+            ("loader-missing", ErrorCode::NotFound, "prepare"),
+            ("not-executable", ErrorCode::PermissionDenied, "execveat"),
+            ("garbage", ErrorCode::InvalidArgument, "execveat"),
+        ];
+        for (index, (case, expected, phase)) in cases.into_iter().enumerate() {
+            let sink = Arc::new(RecSink(std::sync::Mutex::new(Vec::new())));
+            let join_container = Arc::clone(container);
+            let launcher = ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::clone(&sink) as Arc<dyn AuditSink>)
+                .cgroup_join_source(move || join_container.join_hook())
+                .build()
+                .expect("build the launcher with a recording sink");
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+
+            let bundle = Bundle::new(&format!("x{index}"));
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            let root = bundle.rootfs();
+            let entry = match case {
+                "loader-missing" => {
+                    // 動的ローダを rootfs から消す。ローダのパスは試験バイナリの `PT_INTERP`（静的リンクなら前提欠如で失敗）。
+                    let exe = std::fs::read(std::env::current_exe().expect("current_exe"))
+                        .expect("read the test binary");
+                    let interp = real_entry::elf_interp(&exe)
+                        .expect("the test binary must be dynamically linked (PT_INTERP)");
+                    std::fs::remove_file(root.join(interp.trim_start_matches('/')))
+                        .expect("remove the loader from the rootfs");
+                    "/probe"
+                }
+                "not-executable" => {
+                    std::fs::copy(root.join("probe"), root.join("probe-noexec"))
+                        .expect("copy probe");
+                    std::fs::set_permissions(
+                        root.join("probe-noexec"),
+                        std::fs::Permissions::from_mode(0o644),
+                    )
+                    .expect("chmod 0644");
+                    "/probe-noexec"
+                }
+                _ => {
+                    std::fs::write(root.join("garbage"), b"this is not an executable image\n")
+                        .expect("write the garbage entrypoint");
+                    std::fs::set_permissions(
+                        root.join("garbage"),
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .expect("chmod 0755");
+                    "/garbage"
+                }
+            };
+            let config = json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs", "readonly": false},
+                "hostname": HOSTNAME,
+                "process": {
+                    "user": {"uid": 0, "gid": 0},
+                    "args": [entry],
+                    "env": ["PATH=/", "TERM=dumb", format!("LD_LIBRARY_PATH={ld}")],
+                    "cwd": "/"
+                },
+                "mounts": [],
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                ]}
+            });
+            std::fs::write(
+                bundle.dir.join("config.json"),
+                serde_json::to_vec(&config).expect("serialize config"),
+            )
+            .expect("write config.json");
+            let id = ContainerId::new(format!("plx{index}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let err = match start(
+                &env.store,
+                &env.recorder,
+                &launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Ok(started) => {
+                    let _ = started.into_parts().1.terminate(timeout());
+                    panic!("{case}: the launch must fail");
+                }
+                Err(e) => e,
+            };
+            assert_ne!(err.code(), ErrorCode::Timeout, "{case}: {}", err.message());
+            assert_eq!(err.code(), expected, "{case}: {}", err.message());
+            assert_eq!(err.message(), EXEC_STAGE_MESSAGE, "{case} ({phase})");
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created, "{case}");
+            assert!(
+                env.store
+                    .get(&GetStateRequest::new(id.clone()))
+                    .expect("get state")
+                    .launch_isolation()
+                    .is_none(),
+                "{case}: a failed launch must leave no launch_isolation"
+            );
+            assert!(!launcher.last_launch_may_have_left_process(), "{case}");
+            launcher
+                .confirm_no_process(&id, timeout())
+                .unwrap_or_else(|e| panic!("{case}: confirm_no_process: {e:?}"));
+            let records = sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert!(
+                records.is_empty(),
+                "{case}: a non-violation failure must not be audited: {records:?}"
+            );
+            drop(launcher);
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "{case}: no process may remain: {:?}",
+                children_of_self()
+            );
+            println!(
+                "production_launcher: scenario=exec-failure case={case} code={:?} phase={phase} state=created audit=0 children=0",
+                err.code()
+            );
+        }
     }
 
     /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の

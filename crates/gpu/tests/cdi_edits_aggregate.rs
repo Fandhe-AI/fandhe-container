@@ -6,6 +6,9 @@ use fandhe_container_gpu::cdi_edits::{
 };
 use fandhe_container_gpu::cdi_spec::{CdiSpecErrorCode, parse_cdi_spec, read_cdi_spec_file};
 
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 const YAML: &str = "cdiVersion: 0.5.0
 kind: nvidia.com/gpu
 devices:
@@ -39,8 +42,8 @@ fn gpu1_parse_then_aggregate_two_devices() {
 
 #[test]
 fn gpu1_read_file_then_aggregate() {
-    let dir = std::env::temp_dir().join(format!("fandhe-gpu-edits-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // 前回の残骸の上で進めない（連番・作成前削除・Drop。REPAIR-12・#3375）。
+    let dir = test_root::test_root("fandhe-gpu-edits", "agg");
     let p = dir.join("nvidia.yaml");
     std::fs::write(&p, YAML).unwrap();
     let spec = read_cdi_spec_file(&p).unwrap();

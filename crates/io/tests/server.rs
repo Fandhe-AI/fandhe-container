@@ -5,14 +5,21 @@
 //! 具象実装ができるまでの代用）のみを使い、実際の UDS を通してフレームを
 //! 送受信できることを確かめる（受け入れ条件 3）。
 
+// 残骸・PID 再利用と衝突しない排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+// 残骸の回帰試験が専用の親を作るのに使う（REPAIR-12・#3435）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use std::io::{Read, Write};
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     use fandhe_container_io::{
@@ -39,14 +46,10 @@ mod unix {
         /// world-writable な検証にならない）、作成直後に `set_permissions` で
         /// umask の影響を受けない実効モードを明示的に確定させる。
         fn with_mode(mode: u32) -> Self {
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let dir = std::env::temp_dir().join(format!("fcio-{pid}-{n}"));
-            std::fs::DirBuilder::new()
-                .mode(mode)
-                .create(&dir)
+            // 残骸・PID 再利用との衝突を避ける排他作成（REPAIR-12・#3435）。
+            let dir = super::exclusive_dir::create("fcio")
                 .expect("must be able to create a temp dir for the socket");
+            // 排他作成は 0700 のため、要求の mode は直後に確定させる（下の set_permissions）。
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
                 .expect("must be able to force the exact directory mode regardless of umask");
             Self { path: dir }
@@ -61,6 +64,31 @@ mod unix {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// IO-1・REPAIR-12・#3435: 前回の残骸（`fcio-<pid>-0` と中身）があっても、排他作成は残骸を消さずに
+    /// 連番を進め、新しい空の 0700 のディレクトリを返す。
+    #[test]
+    fn io1_repair12_exclusive_dir_skips_stale_residue() {
+        let parent = super::test_root::test_root("fcio-residue", "parent");
+        let stale = parent.join(format!("fcio-{}-0", std::process::id()));
+        std::fs::create_dir(&stale).expect("stale dir");
+        std::fs::write(stale.join("old"), b"stale").expect("stale file");
+        let fresh = super::exclusive_dir::create_in(&parent, "fcio").expect("exclusive create");
+        assert_eq!(fresh, parent.join(format!("fcio-{}-1", std::process::id())));
+        assert_eq!(
+            std::fs::read(stale.join("old")).expect("stale kept"),
+            b"stale"
+        );
+        assert_eq!(std::fs::read_dir(&fresh).expect("read").count(), 0);
+        assert_eq!(
+            std::fs::metadata(&fresh)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     fn test_timeout() -> IoTimeout {

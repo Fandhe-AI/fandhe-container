@@ -38,12 +38,20 @@ escape-probe = []
 # TASK-163 追補・#1456）と、標準 fd を閉じた呼び出し側を作る `exec::close_standard_fds_for_test`（tests/exec_child_setup.rs・
 # tests/fork_exec_isolation.rs。#1299）も同じ feature の下に置く。core 自身のテストでは下の dev-dependency（自己参照）で有効にし、
 # `cargo test --workspace`・`make test-integration` の既定のテスト集合から外れないようにする。
+# 最小入口 `exec::spawn_container` / `spawn_container_with_stages` も結合試験専用としてこの feature の下に置く
+# （製品コードの呼び出し元が無いため。REPAIR-3・CORE-2・#2762）。
 exec-test-support = []
 
 # default-features = false は、`--no-default-features` のテスト時に自己参照経由で default が
 # 統合されて feature 無効構成を検証できなくなるのを防ぐ（既定の `cargo test` では影響しない）。
 [dev-dependencies]
 fandhe-container-core = { path = ".", default-features = false, features = ["escape-probe", "exec-test-support"] }
+
+# `sys` の自前 FFI 宣言（syscall 番号・番号以外の定数）を libc と照合する試験専用の依存（#1847・#1848・#1318・#1837・MVM-4・REPAIR-12）。
+# 製品の依存には入れない（cargo tree -e normal,build に現れない）。Linux 用の `sys.rs` と macOS 用の `sys/macos.rs`
+# （#1848）が使うため `cfg(unix)` にする。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 # namespace 分離の結合試験（CORE-1・TASK-27.2）。libtest はテストをスレッドで実行し
 # CLONE_NEWUSER が EINVAL になるため、単一スレッドの独自 main（harness = false）で動かす。
@@ -164,7 +172,7 @@ harness = false
 
 # FileAuditSink の主経路・失敗通知の子プロセス隔離の結合試験（REPAIR-5・SEC-4・TASK-163 追補・#1594）。fork は
 # 単一スレッドの呼び出し元を要求するため harness = false。root・実カーネル監査は不要で、既定のテスト集合で実行する
-# （`exec-test-support` は上の自己参照で有効）。
+# （`exec-test-support` は上の自己参照で有効）。Linux と macOS（#2429）で実行し、Windows は適用外。
 [[test]]
 name = "audit_sink_isolation"
 path = "tests/audit_sink_isolation.rs"
@@ -243,6 +251,22 @@ name = "inject_files"
 path = "tests/inject_files.rs"
 harness = false
 
+# 管理ルートの /etc/hosts・/etc/resolv.conf を rootfs へ bind する段（exec::mount_etc_files）を実カーネルで照合する結合試験
+# （NET-12・CORE-1・SEC-1・SEC-5・TASK-185 追補・#1872）。上と同じ理由で harness = false。Linux 5.12 以降（新マウント API）と
+# 非特権 user namespace（または root）が要るため `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "etc_files_mount"
+path = "tests/etc_files_mount.rs"
+harness = false
+
+# bind mount の適用の段（exec::mount_binds）を実カーネルで照合する結合試験（CORE-1・SEC-1・SEC-5・IO-8・TASK-29 追補・#1916）。
+# 上と同じ理由で harness = false。user namespace・新しいマウント API・root の経路が要るため `-- --ignored` 指定時のみ
+# 実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "bind_mounts_real"
+path = "tests/bind_mounts_real.rs"
+harness = false
+
 # user namespace UID/GID 写像（rootless）の結合試験（CORE-6・SEC-5・TASK-40.1）。上と同じ理由で
 # harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]
@@ -256,6 +280,14 @@ harness = false
 [[test]]
 name = "rootless_holder_expiry"
 path = "tests/rootless_holder_expiry.rs"
+harness = false
+
+# holder が継承するメモリに注入ファイルの secret が無いことを、本番の holder の `/proc/<pid>/mem` 走査で
+# 具体値で照合する結合試験（CORE-6・SEC-5・SUP-12・#2628）。単一スレッドの fork が要るため harness = false。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_holder_memory"
+path = "tests/rootless_holder_memory.rs"
 harness = false
 
 # rootless 起動フローへの統合（subuid 範囲写像 → spawn_container）の結合試験（CORE-6・SEC-5・TASK-40.2）。
@@ -353,7 +385,7 @@ harness = false
 
 # plugin 信頼検証の拒否が本番の記録先（FileAuditSink の @audit.log）へ届くことの結合試験（SEC-4・PLUG-11・#2013）。
 # FileAuditSink は主経路のファイル I/O を fork した子で行うため単一スレッドの独自 main（harness = false）で動かす。
-# root 不要で既定のテスト集合に含まれる。依存は不変。
+# root 不要で既定のテスト集合に含まれる。依存は不変。Linux と macOS（#2429）で実行し、Windows は適用外。
 [[test]]
 name = "plugin_trust_audit_delivery"
 path = "tests/plugin_trust_audit_delivery.rs"

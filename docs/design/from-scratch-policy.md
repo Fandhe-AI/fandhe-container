@@ -17,7 +17,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 禁止クレート一覧（rust-vmm organization）: `vm-memory`・`kvm-ioctls`・`kvm-bindings`・`vhost`・`vhost-user-backend`・`virtio-queue`・`vmm-sys-util`・`linux-loader`・`event-manager`・`vm-superio`
 
-機械判定（TASK-73・MVM-4）: `scripts/check-microvm-deps.sh` と `deny.toml` の `[bans]` で自動検出
+機械判定（TASK-73・MVM-4）: `scripts/check-microvm-deps.sh`（導入済み・TASK-73.1。禁止リストの正は同スクリプトの `--list`）と `deny.toml` の `[bans]`（導入済み・TASK-73.2。名前の完全一致で見る cargo-deny とスクリプトの補完関係で、一致と検出力は `make deny-bans-fail-closed-selftest` が照合）で自動検出。現状ワークスペースでの判定結果と再実行手順は [microvm-dependencies.md](microvm-dependencies.md)（TASK-73.3）
 
 ## 依存の判断基準
 
@@ -42,7 +42,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 | クレート | バージョン | 用途 | issue |
 | -------- | ---------- | ---- | ----- |
-| `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で完了し、`[workspace.dependencies]` と crates/cli・crates/oci の `cfg(unix)` の dev-dependencies に導入済み。oci は #2590） | #86・#1318・#2590 |
+| `libc` | =0.2.189 | 自前 FFI 宣言の機械照合（2026-10-12 の判断で用途を限定。dev-dependencies のみで、製品コードの依存には入れない。syscall の宣言自体は各 crate の `sys` の自前宣言を続ける。`Cargo.toml` への追加は #1838 で完了し、`[workspace.dependencies]` と、crates/cli・crates/core・crates/io・crates/oci・crates/platform-macos・crates/plugin・crates/plugin-macos・crates/plugin-windows の `cfg(unix)` と、crates/net・crates/supervisor の `cfg(target_os = "linux")` の dev-dependencies に導入済み。適用状況の正は `ffi-libc-check.md`「適用状況」。oci は #2590、io は #1842、plugin は #1843、supervisor は #1840、net は #1841、platform-macos は #1844、plugin-macos は #1845、plugin-windows は #1846、core は #1847〜#1849） | #86・#1318・#2590・#1840・#1841・#1842・#1843・#1844・#1845・#1846・#1847・#1848・#1849 |
 | `unicode-normalization` | =0.1.25 | NFC / NFD の別表記の衝突検出（IO-5。io crate のみ。名前は正規化せず、`nfd()` で比べて衝突を構造化エラーで拒否する。#103 の決定） | #798（#1720 でそのまま使うと決定） |
 | `serde` | =1.0.229 | データシリアライズ | #138 |
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |
@@ -75,7 +75,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 
 版は承認時点の値。`Cargo.toml` への追加時に新版がある場合は PR で再確認する。objc2 系は `default-features = false` で必要な feature だけを列挙し、AppKit（`objc2-app-kit`）を引き込まない。
 
-2026-10-10 承認分（#399・#406・#408・#425・#540・#582・#678）のうち、#540 の `serde-saphyr` は #542（TASK-126.1）で `Cargo.toml` に追加済み（crates/gpu）、#399 は #400（TASK-51.1）で `Cargo.toml` に追加済み（crates/oci。ureq・rustls・rustls-graviola・rustls-native-certs）、`toml` は #583（TASK-149.1）で `[workspace.dependencies]` に追加し crates/stack から参照する。#425 の build 時の依存 `tonic-prost-build`・`protox` は #426（TASK-56.3）で `Cargo.toml` に入った。`tonic`・`tonic-prost`・`prost` は #427（TASK-56.4）で crates/cri の実行時依存として入った。`tokio` は #453（TASK-108.1）で `[workspace.dependencies]` に追加し crates/plugin の非既定 feature `grpc` から参照する（core には入らない）。`hyper-util` は #454（TASK-108.2）で `[workspace.dependencies]` に追加し、同じ feature `grpc` の UDS connector（`TokioIo`）だけが使う（Cargo.lock には tonic の推移依存として既存）。残り（tokio-stream・tower-service・http 等）は直接依存としては入れていない（`tonic::codegen` の再 export を使う）。追加は各実装 issue（#407・#409・#426・#453・#454・#541・TASK-151・#583・#679）で行う。「cri / plugin の gRPC 面」は crates/cri・`fandhe-container-plugin-cri`・crates/plugin の gRPC 面（TASK-108）を指す。`prost-build`・`tonic-build` は `tonic-prost-build` から推移的に入るため直接の依存には書かない（版は `Cargo.lock` で固定される）。
+2026-10-10 承認分（#399・#406・#408・#425・#540・#582・#678）のうち、#540 の `serde-saphyr` は #542（TASK-126.1）で `Cargo.toml` に追加済み（crates/gpu）、crates/compose-convert からの参照は #595（TASK-151.1）で追加済み、#399 は #400（TASK-51.1）で `Cargo.toml` に追加済み（crates/oci。ureq・rustls・rustls-graviola・rustls-native-certs）、`toml` は #583（TASK-149.1）で `[workspace.dependencies]` に追加し crates/stack から参照する。#425 の build 時の依存 `tonic-prost-build`・`protox` は #426（TASK-56.3）で `Cargo.toml` に入った。`tonic`・`tonic-prost`・`prost` は #427（TASK-56.4）で crates/cri の実行時依存として入った。`tokio` は #453（TASK-108.1）で `[workspace.dependencies]` に追加し crates/plugin の非既定 feature `grpc` から参照する（core には入らない）。`hyper-util` は #454（TASK-108.2）で `[workspace.dependencies]` に追加し、同じ feature `grpc` の UDS connector（`TokioIo`）だけが使う（Cargo.lock には tonic の推移依存として既存）。残り（tokio-stream・tower-service・http 等）は直接依存としては入れていない（`tonic::codegen` の再 export を使う）。追加は各実装 issue（#407・#409・#426・#453・#454・#541・TASK-151・#583）で行い、`hyper` は #679 で crates/cri に追加済み（`hyper-util` と tokio の `net`/`time` も crates/cri から参照）。「cri / plugin の gRPC 面」は crates/cri・`fandhe-container-plugin-cri`・crates/plugin の gRPC 面（TASK-108）を指す。`prost-build`・`tonic-build` は `tonic-prost-build` から推移的に入るため直接の依存には書かない（版は `Cargo.lock` で固定される）。
 
 **非同期ランタイム**: tokio を承認（#425・2026-10-10）。使ってよいのは cri / plugin の gRPC 面だけで、core には入れない（PLUG-1・CORE-1）。例外は #678 で crates/cri の直接依存として承認した CRI ストリーミングサーバー（hyper・hyper-util の `tokio` feature。CRI-6）で、crates/cri の中で同じ tokio を使う。hyper・hyper-util の参照も cri / plugin に限る。
 

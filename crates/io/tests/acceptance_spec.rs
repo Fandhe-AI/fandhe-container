@@ -66,6 +66,9 @@
 //! もとにした暫定値であり、io の実 API が確定するタイミング（TASK-11・
 //! TASK-15 の ACK フレーム型確定）で実出力に接続する。
 
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
 use fandhe_container_io::{
     BatchBuffer, BatchConfig, BatchTrigger, Frame, FrameKind, IoErrorCode, PushOutcome,
 };
@@ -1700,13 +1703,33 @@ fn repair_12_doc_table_column_mismatch_is_detected() {
     );
 }
 
+/// IO-5・REPAIR-12(#3375・#3475): 前回の残骸（同名のファイル）があっても補助は消さず別名の空ディレクトリを
+/// 作り、古い名前との衝突で `create_file` の結果が変わらない。残骸は無傷で残る。
+#[test]
+fn io5_repair12_test_root_leaves_stale_residue_untouched() {
+    let parent = test_root::test_root("fcio-acc-io5-stale", "parent");
+    let p = parent.join("stale");
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("Foo.txt"), b"old").unwrap();
+    {
+        let root = test_root::test_root_at(p.clone());
+        assert_ne!(&*root, p.as_path());
+        assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+        let creator =
+            fandhe_container_io::GuestFileCreator::new(root.to_path_buf()).expect("creator");
+        creator.create_file("Foo.txt").expect("no stale collision");
+    }
+    assert_eq!(std::fs::read(p.join("Foo.txt")).unwrap(), b"old");
+}
+
 /// TASK-19（IO-5）: 大文字小文字の違いのみで衝突する 2 ファイル作成が
 /// 構造化エラー（`code`・`message`）で返ること（TASK-19.2・#100）。
 #[test]
 fn repair_12_io5_case_collision_returns_structured_error() {
-    let root = std::env::temp_dir().join(format!("fcio-acc-io5-{}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("root must be creatable");
-    let creator = fandhe_container_io::GuestFileCreator::new(root.clone()).expect("creator");
+    // 前回の `Foo.txt` / `foo.txt` の残骸があると衝突の結果が変わるため、連番・作成前削除・Drop の補助を使う
+    // （REPAIR-12・#3375）。
+    let root = test_root::test_root("fcio-acc-io5", "case");
+    let creator = fandhe_container_io::GuestFileCreator::new(root.to_path_buf()).expect("creator");
     creator.create_file("Foo.txt").expect("first create");
     let err = creator
         .create_file("foo.txt")

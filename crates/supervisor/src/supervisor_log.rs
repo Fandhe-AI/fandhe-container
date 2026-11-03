@@ -26,8 +26,10 @@
 //! のも専用スレッドだけで、呼び出し側の待ちは期限つき。
 //!
 //! # 後始末
-//! [`remove`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
-//! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。
+//! [`remove_guarded_bounded_waiting`] が delete 時に best effort で全ファイルを消す（stderr へ何も書かない。ERR-2）。消せなかった分は
+//! 1 ID あたり 3 MiB に収まり、同じ ID の次の start で世代として回される。CLI の `delete` は
+//! [`remove_guarded_bounded_waiting`] で、ロック保持中（`stop` 直後の drain 中）だけ期限つきで待つ（#2892）。
+//! plugin-cri の `RemoveContainer` も同じ関数で、コンテナログと待ちを共有する（#2964）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
@@ -37,7 +39,7 @@
 //! `legacy_tiocsti` の警告は #2008 の決定で、start の成功後に supervisor が自分で観測し（`start_entry`）、
 //! `stderr_sink` 経由で本ログへ 1 行残す（core の fd 2 経路は AF_UNIX の socket のときだけ届き、その構成では重複する）。
 //!
-//! 呼び出し元: `start_entry::run_main_inner`（open と差し込み）・CLI の `delete`（[`remove`]）。
+//! 呼び出し元: `start_entry::run_main_inner`（open と差し込み）・CLI の `delete` と plugin-cri の `RemoveContainer`（[`remove_guarded_bounded_waiting`]）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -149,6 +151,87 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
     }
 }
 
+/// [`remove`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2892・SUP-7・REPAIR-5）。
+///
+/// `guard` が `false`（同じ ID が再作成済み）なら何も消さず 0 件で成功する（`RemovedLogs::guard_declined()` が真。#3143）。確認はロック保持中に行うため、待ちの間に
+/// 再作成された別インスタンスの supervisor ログを消さない。ディレクトリが無ければ 0 件で成功する。
+pub fn remove_guarded(
+    root: &Path,
+    id: &ContainerId,
+    guard: &dyn Fn() -> bool,
+) -> Result<RemovedLogs, TraitError> {
+    let dir = log_dir(root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => RotatingFileSink::remove_all_quiet_guarded(&dir, id, guard),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemovedLogs::default()),
+        Err(_) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "supervisor log directory inspection failed",
+        )),
+    }
+}
+
+/// [`remove_guarded`] を作業スレッドで `timeout` までだけ待って 1 回試す（#2892・REPAIR-5）。
+///
+/// 枠の満杯（何も実行していない）は `ResourceExhausted`、期限切れ・起動失敗・panic は `Timeout`（コンテナログの
+/// `remove_container_logs_guarded_bounded` と同じ分類）。
+pub fn remove_guarded_bounded(
+    root: &Path,
+    id: &ContainerId,
+    timeout: std::time::Duration,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> Result<RemovedLogs, TraitError> {
+    let root = root.to_path_buf();
+    let id = id.clone();
+    run_bounded_classified(move || remove_guarded(&root, &id, &guard), timeout).unwrap_or_else(
+        |f| {
+            Err(match f {
+                BoundedFailure::Busy => TraitError::new(
+                    ErrorCode::ResourceExhausted,
+                    "supervisor log removal workers are busy",
+                ),
+                BoundedFailure::Unfinished => TraitError::new(
+                    ErrorCode::Timeout,
+                    "supervisor log removal did not finish within the deadline",
+                ),
+            })
+        },
+    )
+}
+
+/// [`remove_guarded_bounded`] を、`FailedPrecondition`（同じ ID の supervisor がログのロックを保持中）のあいだ
+/// `lock_wait` まで試し直す版（CLI の `delete` 用。#2892・SUP-7・CLI-1・REPAIR-5）。
+///
+/// `stop` 直後は supervisor が `Stopped` の記録後も drain を続け、プロセス終了までロックを持つ。待ちは呼び出し元
+/// スレッドの sleep（[`crate::logs::CONTAINER_LOG_LOCK_POLL`] 刻み）だけで、同時実行枠は試行の間しか使わない。
+/// 試し直すのは `FailedPrecondition` だけで、他のエラーは即座に返す。`lock_wait` が 0 なら 1 回だけ試す。
+/// 最悪の所要は `lock_wait` + `attempt_timeout`。plugin-cri の `RemoveContainer` も使う（#2964）。
+pub fn remove_guarded_bounded_waiting(
+    root: &Path,
+    id: &ContainerId,
+    lock_wait: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+    guard: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<RemovedLogs, TraitError> {
+    let started = std::time::Instant::now();
+    loop {
+        let g = Arc::clone(&guard);
+        let result = remove_guarded_bounded(root, id, attempt_timeout, move || g());
+        match &result {
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                let Some(remaining) = lock_wait
+                    .checked_sub(started.elapsed())
+                    .filter(|r| !r.is_zero())
+                else {
+                    return result;
+                };
+                std::thread::sleep(crate::logs::CONTAINER_LOG_LOCK_POLL.min(remaining));
+            }
+            _ => return result,
+        }
+    }
+}
+
 /// ログ削除を待つ既定の上限。ローカル FS の小さなファイル数個（世代数 × 3 MiB 以下）の unlink には十分長く、
 /// I/O 停止（NFS ハング等）でも呼び出し元が秒単位で戻れる値にする（REPAIR-5）。
 pub const SUPERVISOR_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -160,6 +243,8 @@ pub enum LogRemoval {
     Finished,
     /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
     TimedOut,
+    /// 同時実行枠が満杯で、作業スレッドを起動しなかった（削除は試していない。期限切れではない。#2894・ERR-1）。
+    Busy,
 }
 
 /// 同時に走らせる削除作業スレッドの上限。枠は期限切れではなく作業の実終了まで保持する（REPAIR-5）。
@@ -195,24 +280,27 @@ impl Drop for InflightSlot {
 ///
 /// 期限切れのとき作業スレッドは join せず残す（止まった I/O を中断する手段は無く、待てば呼び出し元が無期限に戻らなく
 /// なるため）。残るスレッドは `MAX_INFLIGHT_LOG_REMOVALS` 個までで、枠は作業の実終了まで保持する。枠が埋まっている
-/// ときは best effort として削除を諦め、スレッドを起動せず `TimedOut` を返す（REPAIR-5）。
+/// ときは best effort として削除を諦め、スレッドを起動せず `Busy` を返す（期限切れの `TimedOut` とは区別する。#2894・REPAIR-5）。
 /// スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
 /// CLI の `delete` の警告出力の期限（`emit_warning_bounded`）も同じ仕組みを使う（#2434 で CLI から移設）。
 pub fn run_log_removal_bounded(
     job: impl FnOnce() + Send + 'static,
     timeout: std::time::Duration,
 ) -> LogRemoval {
-    // 起動失敗は従来どおり `Finished` 扱い（結果を持ち帰る `run_bounded` では区別できないため、起動失敗を別に判定する）。
+    // 起動失敗・job の panic（`NoResult`）は、同期実行へ退避せず結果の無い job として `Finished` に畳む。
     match run_bounded_inner(job, timeout) {
         BoundedOutcome::TimedOut => LogRemoval::TimedOut,
+        BoundedOutcome::Busy => LogRemoval::Busy,
         BoundedOutcome::NoResult | BoundedOutcome::Done(()) => LogRemoval::Finished,
     }
 }
 
-/// [`run_bounded`] の内部結果。結果が無い理由（起動失敗・job の panic）を期限切れと区別するために持つ。
+/// [`run_log_removal_bounded`]・[`run_bounded_classified`]・`run_bounded_waiting` が共有する内部結果。結果が無い理由（起動失敗・job の panic）を期限切れと区別するために持つ。
 enum BoundedOutcome<T> {
     Done(T),
     TimedOut,
+    /// 同時実行枠が満杯でスレッドを起動しなかった（期限切れではない。#2760）。
+    Busy,
     NoResult,
 }
 
@@ -221,8 +309,17 @@ fn run_bounded_inner<T: Send + 'static>(
     timeout: std::time::Duration,
 ) -> BoundedOutcome<T> {
     let Some(slot) = InflightSlot::acquire() else {
-        return BoundedOutcome::TimedOut;
+        return BoundedOutcome::Busy;
     };
+    run_bounded_with_slot(slot, job, timeout)
+}
+
+/// 確保済みの枠で `job` を作業スレッドへ渡し、`timeout` までだけ待つ（枠は作業の実終了まで保持する）。
+fn run_bounded_with_slot<T: Send + 'static>(
+    slot: InflightSlot,
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> BoundedOutcome<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("supervisor-log-remove".to_string())
@@ -230,45 +327,110 @@ fn run_bounded_inner<T: Send + 'static>(
             let _slot = slot;
             let _ = tx.send(job());
         });
-    if spawned.is_err() {
+    let Ok(handle) = spawned else {
         return BoundedOutcome::NoResult;
-    }
+    };
     match rx.recv_timeout(timeout) {
-        Ok(v) => BoundedOutcome::Done(v),
+        Ok(v) => {
+            // 結果送信後の作業スレッドが生きたまま戻ると、呼び出し元が単一スレッド前提の処理
+            // （`FileAuditSink` の fork。SEC-4）へ進めなくなる。終了を有限時間だけ確かめ、確認できなければ
+            // 結果を捨てて期限切れ扱いにする（fail-closed。REPAIR-5）。
+            if join_worker_bounded(handle) {
+                BoundedOutcome::Done(v)
+            } else {
+                BoundedOutcome::TimedOut
+            }
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BoundedOutcome::TimedOut,
         // job の panic（結果を送らず終了）。従来どおり「終わった」扱いだが、値は無い。
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => BoundedOutcome::NoResult,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = join_worker_bounded(handle);
+            BoundedOutcome::NoResult
+        }
     }
 }
 
-/// `job` を作業スレッドで実行して結果を持ち帰る、期限つき実行（#2446。`run_log_removal_bounded` の汎用版）。
+/// 結果送信後の作業スレッドの終了を待つ上限（送信後は枠の返却だけで即終わるため短くてよい。REPAIR-5）。
+const WORKER_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 作業スレッドが `WORKER_EXIT_GRACE` 内に終了したら join して `true`。終わらなければ join せず `false`。
+fn join_worker_bounded(handle: std::thread::JoinHandle<()>) -> bool {
+    let deadline = std::time::Instant::now() + WORKER_EXIT_GRACE;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = handle.join();
+    true
+}
+
+/// [`run_bounded_classified`] が結果を得られなかった理由（#2760・REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedFailure {
+    /// 同時実行枠が満杯で、作業スレッドを起動しなかった（何も実行していない）。
+    Busy,
+    /// 期限切れ、スレッド起動失敗、または job の panic（作業スレッドが残り得る）。
+    Unfinished,
+}
+
+/// `job` を作業スレッドで実行して結果を持ち帰る期限つき実行で、枠の満杯とそれ以外の失敗を区別する（#2446・#2760）。
+/// [`run_log_removal_bounded`] の汎用版で、枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。
+/// 枠の満杯は即時に `Busy`、期限切れ・スレッド起動失敗・job の panic は `Unfinished`。枠を待つ場合は
+/// `run_bounded_waiting` を使う。両者を `None` に潰す `Option` 版は誤分類を呼ぶため削除済み（#2965）。
 ///
-/// 結果が得られなかったとき（期限切れ・同時実行枠の満杯・スレッド起動失敗・job の panic）は `None` を返す。
-/// 枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。呼び出し元は `None` を「結果が無い」として扱う
-/// （コンテナログの削除は `logs::remove_container_logs_bounded` が `Timeout` のエラーにする）。
-pub fn run_bounded<T: Send + 'static>(
+/// 枠が満杯なら job は実行されず `Busy`。長寿命の plugin-cri で、止まった作業が枠を埋めたことと、この job 自身の
+/// 期限切れを同じ失敗として扱わないために使う。
+pub fn run_bounded_classified<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
     timeout: std::time::Duration,
-) -> Option<T> {
+) -> Result<T, BoundedFailure> {
     match run_bounded_inner(job, timeout) {
-        BoundedOutcome::Done(v) => Some(v),
-        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => None,
+        BoundedOutcome::Done(v) => Ok(v),
+        BoundedOutcome::Busy => Err(BoundedFailure::Busy),
+        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),
     }
 }
 
-/// core の `delete` が成功した後に、`id` の supervisor ログを best effort で期限つきに消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+/// 枠が空くのを待つときの再試行間隔（枠の返却は作業スレッドの終了で、短い作業なら数 ms で空くため短くてよい）。
+const SLOT_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// [`run_bounded_classified`] の、枠の満杯を `timeout` の範囲で待つ版（#2834・REPAIR-5）。
 ///
-/// 失敗は握る（delete の結果は変えない）。期限切れなら [`LogRemoval::TimedOut`] を返すので、警告を出すかは呼び出し側が決める
-/// （CLI は stderr に 1 行の JSON、plugin-cri は構造化ログ）。core の `delete` より前には呼ばない（失敗時に稼働中のログを消さないため）。
-pub fn remove_bounded(root: &Path, id: &ContainerId, timeout: std::time::Duration) -> LogRemoval {
-    let root = root.to_path_buf();
-    let id = id.clone();
-    run_log_removal_bounded(
-        move || {
-            let _ = remove(&root, &id);
-        },
-        timeout,
-    )
+/// 枠が満杯でも即座に `Busy` にせず、`timeout` を上限に `SLOT_WAIT_POLL` 間隔で空きを待つ。待った時間は `timeout` から
+/// 引かれるので、全体の待ちは `timeout` を超えない（期限を延ばさない）。待っても空かなければ job を実行せず `Busy`
+/// （期限切れ `Unfinished` とは区別する）。CLI の `create` が 1 プロセスの中で複数の作業を同時に走らせる場面
+/// （並列の結合試験・止まった作業が枠を占めた後）で、一時的な満杯を `TIMEOUT` に誤分類しないために使う。
+/// 常駐の plugin-cri が使う即時 `Busy` の [`run_bounded_classified`]（#2760）は変えない。
+pub fn run_bounded_waiting<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<T, BoundedFailure> {
+    let started = std::time::Instant::now();
+    // 枠の確保の前後に毎回残り時間を確認する。期限が尽きていれば（最後の sleep 中に過ぎた場合を含む）
+    // 作業スレッドを生成せず `Busy` を返す（期限切れ後に job の副作用を走らせない。REPAIR-5）。
+    let (slot, remaining) = loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(BoundedFailure::Busy);
+        }
+        if let Some(slot) = InflightSlot::acquire() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // 確保後に期限が尽きた: 枠を返して job を起動しない。
+                drop(slot);
+                return Err(BoundedFailure::Busy);
+            }
+            break (slot, remaining);
+        }
+        std::thread::sleep(SLOT_WAIT_POLL.min(remaining));
+    };
+    match run_bounded_with_slot(slot, job, remaining) {
+        BoundedOutcome::Done(v) => Ok(v),
+        BoundedOutcome::Busy => Err(BoundedFailure::Busy),
+        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => Err(BoundedFailure::Unfinished),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -282,7 +444,8 @@ mod tests {
     use crate::logs::rotating::MIN_LOG_FILE_BYTES;
     use crate::stderr_sink::{EmitOutcome, StderrSink};
 
-    struct TmpDir(PathBuf);
+    /// 第 2 要素は残骸を消して作った実体（Drop で後始末する。REPAIR-12・#3435）。
+    struct TmpDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
@@ -292,15 +455,9 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::SeqCst)
             ));
-            fs::create_dir_all(&p).unwrap();
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+            let root = crate::test_root::test_root_at(p);
+            Self(root.to_path_buf(), root)
         }
     }
 
@@ -421,7 +578,7 @@ mod tests {
     }
 
     /// REPAIR-4: remove は全ファイルを消し冪等。生存中は FailedPrecondition で何も消さない。
-    /// REPAIR-5: 枠が埋まっているとスレッドを起動せず TimedOut を返し、実終了で枠が戻る。
+    /// REPAIR-5: 枠が埋まっているとスレッドを起動せず Busy を返し(期限切れの TimedOut とは別。#2894)、実終了で枠が戻る。
     #[test]
     fn repair5_inflight_cap_gives_up_and_releases_on_finish() {
         let slots: Vec<_> = std::iter::from_fn(InflightSlot::acquire).collect();
@@ -432,7 +589,7 @@ mod tests {
             move || r.store(true, Ordering::SeqCst),
             Duration::from_millis(50),
         );
-        assert_eq!(out, LogRemoval::TimedOut);
+        assert_eq!(out, LogRemoval::Busy);
         assert!(!ran.load(Ordering::SeqCst));
         drop(slots);
         assert_eq!(
@@ -711,21 +868,141 @@ mod tests {
         assert!(!crate::logs::container_log_dir(&t.0).exists());
     }
 
-    /// REPAIR-5・#2446: `run_bounded` は結果を返し、止まった job は期限で `None` になる。
+    /// 同時実行枠は全試験で共有のため、並列の他試験が埋めている間は `Busy` になる。空くまで再試行する
+    /// （`Busy` 以外の結果は即返す。枠は有限時間で戻るので上限 30 秒で打ち切る。REPAIR-5・REPAIR-12）。
+    fn classified_retry_on_busy<T: Send + 'static>(
+        mut make_job: impl FnMut() -> Box<dyn FnOnce() -> T + Send>,
+        timeout: Duration,
+    ) -> Result<T, BoundedFailure> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let job = make_job();
+            match run_bounded_classified(job, timeout) {
+                Err(BoundedFailure::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// REPAIR-5・#2446・#2965: `run_bounded_classified` は結果を返し、止まった job は期限で `Unfinished` になる。
+    /// 枠の満杯（`Busy`）は別試験の並列実行で起きうるため、再試行して結果の分類だけを確かめる。
     #[test]
-    fn repair5_run_bounded_returns_result_or_none() {
-        assert_eq!(run_bounded(|| 7_u32, Duration::from_secs(10)), Some(7));
+    fn repair5_run_bounded_classified_returns_result_or_unfinished() {
+        assert_eq!(
+            classified_retry_on_busy(|| Box::new(|| 7_u32), Duration::from_secs(10)),
+            Ok(7)
+        );
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let started = Instant::now();
-        let out = run_bounded(
-            move || {
-                let _ = release_rx.recv_timeout(Duration::from_secs(30));
-                1_u32
+        let out = classified_retry_on_busy(
+            || {
+                let rx = Arc::clone(&release_rx);
+                Box::new(move || {
+                    let _ = rx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .recv_timeout(Duration::from_secs(30));
+                    1_u32
+                })
             },
             Duration::from_millis(100),
         );
-        assert_eq!(out, None);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(out, Err(BoundedFailure::Unfinished));
+        assert!(started.elapsed() < Duration::from_secs(40));
         drop(release_tx);
+    }
+
+    fn always() -> Arc<dyn Fn() -> bool + Send + Sync> {
+        Arc::new(|| true)
+    }
+
+    /// SUP-7・REPAIR-5・#2892: ロックを持ち続ける書き手がいると、待ちを使い切って `FailedPrecondition`。ログは残る。
+    #[test]
+    fn sup7_repair5_waiting_keeps_logs_when_lock_held() {
+        let t = TmpDir::new("waitheld");
+        let _w = open(&t.0, &id()).unwrap();
+        let started = Instant::now();
+        let e = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect_err("held");
+        let elapsed = started.elapsed();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let dir = t.0.join("@supervisor-logs");
+        assert!(dir.join("c1.log").exists());
+        assert!(dir.join("c1.log.lock").exists());
+    }
+
+    /// SUP-7・#2892: 書き手が待ちの途中で閉じれば、待ちが終わり次第すべて消える。
+    #[test]
+    fn sup7_waiting_removes_after_release() {
+        let t = TmpDir::new("waitrel");
+        let w = open(&t.0, &id()).unwrap();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(w);
+        });
+        let removed = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect("removed after release");
+        h.join().unwrap();
+        assert_eq!(removed.log_files(), 1);
+        assert_eq!(
+            fs::read_dir(t.0.join("@supervisor-logs")).unwrap().count(),
+            0
+        );
+    }
+
+    /// REPAIR-5・#2892: `lock_wait` が 0 なら 1 回だけ試して即座に返る。
+    #[test]
+    fn repair5_waiting_zero_wait_tries_once() {
+        let t = TmpDir::new("waitzero");
+        let _w = open(&t.0, &id()).unwrap();
+        let started = Instant::now();
+        let e = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::ZERO,
+            Duration::from_secs(5),
+            always(),
+        )
+        .expect_err("held");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// SUP-7・#2892: guard が false（同じ ID が再作成済み）ならログ本体を消さず 0 件で成功する。
+    #[test]
+    fn sup7_waiting_guard_false_keeps_logs() {
+        let t = TmpDir::new("waitguard");
+        let mut w = open(&t.0, &id()).unwrap();
+        w.write_all(b"new\n").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let removed = remove_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            Arc::new(|| false),
+        )
+        .expect("guard skip");
+        assert_eq!(removed.log_files(), 0);
+        let body = fs::read_to_string(t.0.join("@supervisor-logs/c1.log")).unwrap();
+        assert_eq!(body, "stderr new\n");
     }
 }

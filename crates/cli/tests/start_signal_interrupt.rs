@@ -24,18 +24,31 @@ const STUB_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CLI_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 
-/// 状態ルートの祖先を 0700 にした一時ディレクトリ（Drop で削除）。
-struct TmpDir(PathBuf);
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+/// 状態ルートの祖先を 0700 にした一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る
+/// 親（最後のため `Drop` の削除の後に消える。#3026）。
+struct TmpDir(
+    PathBuf,
+    #[allow(dead_code)] scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
         // 状態ルートの祖先は group / other 書き込み不可でなければならないため、target 配下ではなく OS の一時領域に置く。
-        let p = std::env::temp_dir().join(format!("fc-cli-sigint-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+        let scratch =
+            scratch_root::ScratchDir::new("fc-cli-sigint", std::time::Duration::from_secs(10));
+        let p = scratch.path().join(tag);
         std::fs::create_dir_all(&p).expect("mkdir");
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        Self(p)
+        Self(p, scratch)
     }
 }
 
@@ -53,10 +66,17 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = self.cli.kill();
-        let _ = self.cli.wait();
+        // 回収の失敗でスタブの KILL が抜けないよう、先にスタブを片付けてから失敗を表に出す。
+        let reaped = reap::reap(&mut self.cli, reap::reap_within());
         if let Some(pid) = self.stub_pid {
             send("KILL", pid, false);
+        }
+        if let Err(e) = reaped {
+            if thread::panicking() {
+                eprintln!("reap failure: {e}");
+            } else {
+                panic!("reap failure: {e}");
+            }
         }
     }
 }
@@ -90,8 +110,7 @@ fn send(sig: &str, pid: u32, group: bool) {
         }
         thread::sleep(POLL);
     }
-    let _ = c.kill();
-    let _ = c.wait();
+    reap::reap_or_report(&mut c, reap::reap_within());
     panic!("kill command did not finish (REPAIR-5)");
 }
 
@@ -114,8 +133,7 @@ fn wait_ok(mut c: Child, what: &str) {
             return;
         }
         if Instant::now() >= deadline {
-            let _ = c.kill();
-            let _ = c.wait();
+            reap::reap_or_report(&mut c, reap::reap_within());
             panic!("{what} timed out (REPAIR-5)");
         }
         thread::sleep(POLL);

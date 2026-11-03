@@ -67,6 +67,8 @@ fn main() {
     )
 ))]
 fn main() {
+    // 分類の自己照合（既定のテスト集合でも常に走る。出力はしない）。
+    precondition::self_check();
     // `-- --ignored` を付けたときだけ実行する。子・孫は `--child` / `--grandchild` で再入する。
     if std::env::args().any(|a| a == "--ignored" || a == "--child" || a == "--grandchild") {
         linux::run();
@@ -76,6 +78,17 @@ fn main() {
         );
     }
 }
+
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/precondition.rs"]
+mod precondition;
 
 #[cfg(all(
     target_os = "linux",
@@ -365,7 +378,7 @@ mod linux {
         assert_test_major_unregistered();
 
         // 1. 委譲 cgroup とコンテナ用 cgroup。
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let delegated_path = delegated.path();
         let cgroup_base =
             PathBuf::from("/sys/fs/cgroup").join(delegated_path.trim_start_matches('/'));

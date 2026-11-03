@@ -5,6 +5,12 @@
 //! plugin 役の子プロセスはテストバイナリ自身を `--exact unix::plugin_child_entry` で再実行して
 //! 用意する（`lifecycle_resident.rs` と同方式。結合試験は別 crate のため harness を複製する）。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 /// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
 fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
     let p = std::env::current_exe().unwrap();
@@ -53,9 +59,7 @@ mod unix {
         PluginSession, PluginSessionShutdown, PluginTermination, RpcTimeout, UdsStream,
     };
     use std::ffi::OsString;
-    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -65,13 +69,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(behavior: &str) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcmd-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcmd").unwrap();
             std::fs::write(p.join("behavior"), behavior).unwrap();
             Self(p)
         }

@@ -473,18 +473,16 @@ mod tests {
         }
     }
 
-    struct Tmp(PathBuf);
+    /// pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    struct Tmp(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
     impl Tmp {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("fc-cusage-{tag}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
-            Tmp(p)
-        }
-    }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let (scratch, p) = crate::test_support::scratch_child(&format!("fc-cusage-{tag}"), "d");
+            Tmp(p, scratch)
         }
     }
 

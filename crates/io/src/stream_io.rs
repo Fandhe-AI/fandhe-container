@@ -106,7 +106,7 @@ pub(crate) fn accept_retry_deadline_or_limit(
 /// 「短時間に大量の切断が続く」病的なケースの保険）。
 pub(crate) const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 
-/// サーバーが受信してはならない応答系種別（`Ack`・`FlushAck`）を拒否する
+/// サーバーが受信してはならない応答系種別（`Ack`・`FlushAck`・`Nack`）を拒否する
 /// （IO-1・REPAIR-2・#820 レビュー指摘）。
 ///
 /// UDS・vsock のサーバー側はクライアントからの `Write` / `Flush` のみを受け取る
@@ -117,10 +117,18 @@ pub(crate) const MAX_ACCEPT_ABORT_RETRIES: u32 = 32;
 /// fail-closed）。`crates/io/src/recv_limits.rs` モジュール doc の
 /// 「スコープ外」節が「サーバー側で Ack / FlushAck を受信した場合の拒否は
 /// TASK-13.2.1（#820）が担う」としている箇所の実体がこの関数である。
+///
+/// v2 のファイル操作要求（`Create`・`WriteFile`・`Close`）はクライアント発の要求
+/// なのでここでは受理する。接続のモード（F3）に合わない種別の拒否は処理側
+/// （単一 sink モードは `writeback::serve_connection`）が担う。
 pub(crate) fn reject_client_originated_response_frame(kind: FrameKind) -> Result<(), IoError> {
     match kind {
-        FrameKind::Write | FrameKind::Flush => Ok(()),
-        FrameKind::Ack | FrameKind::FlushAck => Err(IoError::new(
+        FrameKind::Write
+        | FrameKind::Flush
+        | FrameKind::Create
+        | FrameKind::WriteFile
+        | FrameKind::Close => Ok(()),
+        FrameKind::Ack | FrameKind::FlushAck | FrameKind::Nack => Err(IoError::new(
             IoErrorCode::InvalidArgument,
             format!("server does not accept client-originated response frames: {kind:?}"),
         )),
@@ -820,4 +828,29 @@ pub(crate) fn write_all_until<S: TimedStream>(
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    /// IO-1・REPAIR-2・#3161: サーバーは Create / WriteFile / Close を受理し、
+    /// Ack / FlushAck / Nack（応答系）を InvalidArgument で拒否する。
+    #[test]
+    fn io1_server_accepts_file_requests_and_rejects_responses() {
+        for kind in [
+            FrameKind::Write,
+            FrameKind::Flush,
+            FrameKind::Create,
+            FrameKind::WriteFile,
+            FrameKind::Close,
+        ] {
+            reject_client_originated_response_frame(kind)
+                .expect("client-originated request kinds must be accepted");
+        }
+        for kind in [FrameKind::Ack, FrameKind::FlushAck, FrameKind::Nack] {
+            let err = reject_client_originated_response_frame(kind)
+                .expect_err("response kinds must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        }
+    }
 }

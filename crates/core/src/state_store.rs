@@ -99,11 +99,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
+use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
     AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
     RecordedAuditCoverage, RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock,
-    RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
+    RecordedLandlockAudit, RecordedMountIdentity, RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -1026,9 +1027,12 @@ impl StateStore for FileStateStore {
         if let Some(r) = req.rlimits().or(existing.rlimits()) {
             record = record.with_rlimits(r.clone());
         }
-        // launch 時の分離の記録は指定があれば置き換え（restart の再 launch で記録し直す）、なければ引き継ぐ
-        // （トレイト契約 12。#1468）。
-        if let Some(l) = req.launch_isolation().or(existing.launch_isolation()) {
+        // launch 時の分離の記録は Replace なら置き換え（restart の再 launch で記録し直す）、Clear なら消し、
+        // Inherit なら引き継ぐ（トレイト契約 12。#1468・#2238）。
+        if let Some(l) = req
+            .launch_isolation_update()
+            .apply(existing.launch_isolation())
+        {
             record = record.with_launch_isolation(l.clone());
         }
         // core が作った rootfs の記録は update で変えずに引き継ぐ（トレイト契約 13。supervisor の status 更新で
@@ -1740,6 +1744,23 @@ struct LaunchIsolationDto {
     /// launch が使った ID 写像（CORE-6・#2388）。無ければ記録なし。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id_mapping: Option<IdMappingDto>,
+    /// launch が適用した capability の許可集合（`CAP_*` 名。SEC-1・CRI-2・#2666）。無ければ記録なし
+    /// （導入前の launch は OCI 既定集合で起動したため、exec は OCI 既定集合として扱う）。
+    /// キー欠落だけを旧記録として許し、`null` を含む配列以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "capabilities_array"
+    )]
+    capabilities: Option<Vec<String>>,
+    /// launch が適用した `root.readonly` の実効値（CLI-1・SUP-12・#2828）。キー欠落だけを旧記録（`None`）と
+    /// 読み、`null` や bool 以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "root_readonly_bool"
+    )]
+    root_readonly: Option<bool>,
 }
 
 /// ID 写像の記録。`model` は `single` / `subordinate`。
@@ -1904,7 +1925,7 @@ impl LandlockAuditDto {
     }
 }
 
-/// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `implicit`。
+/// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `tmpfs`（利用者指定の tmpfs）/ `implicit`。
 #[derive(Debug, Serialize, Deserialize)]
 struct LandlockRuleDto {
     path: String,
@@ -1912,6 +1933,34 @@ struct LandlockRuleDto {
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     index: Option<u64>,
+    /// launch 時のマウントの識別子（SEC-1・SEC-4・#3201）。Mount 由来のルール（`mount` / `tmpfs` / `implicit`）だけが
+    /// 持つ。キーが無ければ旧記録（exec は拒否する）。`null`・型違い・`root` の規則への付与・一部だけの付与は破損。
+    /// 1 規則あたり約 70〜90 バイト増えるため、識別子つきで `MAX_STATE_FILE_BYTES` に収まる現実的な規則数は
+    /// およそ数百本まで（超える構成は従来どおり書き込みが `InvalidArgument` で失敗し、launch も失敗する）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "mount_identity_object"
+    )]
+    mount: Option<MountIdentityDto>,
+}
+
+/// マウントの識別子（`mnt_id`・`dev`・`ino`・`read_only`）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MountIdentityDto {
+    mnt_id: u64,
+    dev: u64,
+    ino: u64,
+    read_only: bool,
+}
+
+/// `mount` のキーが在るとき object だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn mount_identity_object<'de, D>(d: D) -> Result<Option<MountIdentityDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    MountIdentityDto::deserialize(d).map(Some)
 }
 
 impl LaunchIsolationDto {
@@ -1924,6 +1973,7 @@ impl LaunchIsolationDto {
                 let (origin, index) = match r.target() {
                     RecordedTarget::Root => ("root", None),
                     RecordedTarget::Mount { index, .. } => ("mount", Some(*index as u64)),
+                    RecordedTarget::Tmpfs { .. } => ("tmpfs", None),
                     RecordedTarget::Implicit(_) => ("implicit", None),
                 };
                 LandlockRuleDto {
@@ -1931,6 +1981,12 @@ impl LaunchIsolationDto {
                     allowed: r.allowed(),
                     origin: origin.to_owned(),
                     index,
+                    mount: r.mount().map(|m| MountIdentityDto {
+                        mnt_id: m.mnt_id(),
+                        dev: m.dev(),
+                        ino: m.ino(),
+                        read_only: m.read_only(),
+                    }),
                 }
             })
             .collect();
@@ -1951,6 +2007,10 @@ impl LaunchIsolationDto {
                 c
             }),
             id_mapping: record.id_mapping().map(IdMappingDto::from_record),
+            capabilities: record
+                .capabilities()
+                .map(|c| c.iter().map(|c| c.as_str().to_owned()).collect()),
+            root_readonly: record.root_readonly(),
         }
     }
 
@@ -1999,11 +2059,48 @@ impl LaunchIsolationDto {
             }
             None => record,
         };
-        Ok(match self.id_mapping {
+        let record = match self.id_mapping {
             Some(m) => record.with_id_mapping(m.into_record()?),
+            None => record,
+        };
+        let record = match self.capabilities {
+            Some(names) => record.with_capabilities(capabilities_from_names(&names)?),
+            None => record,
+        };
+        Ok(match self.root_readonly {
+            Some(ro) => record.with_root_readonly(ro),
             None => record,
         })
     }
+}
+
+/// `root_readonly` のキーが在るとき bool だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn root_readonly_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(d).map(Some)
+}
+
+/// `capabilities` のキーが在るとき配列だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn capabilities_array<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d).map(Some)
+}
+
+/// 記録された `CAP_*` 名を許可集合へ組み直す。件数は確保の前に既知の capability 数で検証し、未知名・
+/// OCI 既定外を含む集合は破損として拒否する（`ContainerCapabilities::restrict`。SEC-1・#2666）。
+fn capabilities_from_names(names: &[String]) -> Result<ContainerCapabilities, ()> {
+    if names.len() > Capability::ALL.len() {
+        return Err(());
+    }
+    let mut set = CapabilitySet::empty();
+    for n in names {
+        set = set.with(Capability::from_name(n).ok_or(())?);
+    }
+    ContainerCapabilities::restrict(set).map_err(|_| ())
 }
 
 impl LandlockRuleDto {
@@ -2014,6 +2111,9 @@ impl LandlockRuleDto {
                 destination: MountDestination::parse(&self.path).map_err(|_| ())?,
                 index: usize::try_from(index).map_err(|_| ())?,
             },
+            ("tmpfs", None) => RecordedTarget::Tmpfs {
+                destination: MountDestination::parse(&self.path).map_err(|_| ())?,
+            },
             ("implicit", None) => RecordedTarget::Implicit(
                 ImplicitDevMount::ALL
                     .into_iter()
@@ -2022,7 +2122,13 @@ impl LandlockRuleDto {
             ),
             _ => return Err(()),
         };
-        Ok(RecordedRule::new(target, self.allowed))
+        let rule = RecordedRule::new(target, self.allowed);
+        match self.mount {
+            Some(m) => Ok(rule.with_mount(
+                RecordedMountIdentity::new(m.mnt_id, m.dev, m.ino, m.read_only).map_err(|_| ())?,
+            )),
+            None => Ok(rule),
+        }
     }
 }
 
@@ -2413,13 +2519,15 @@ mod platform_tests {
         r.unwrap_err().code().as_str()
     }
 
-    fn scratch_lock_file(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-state-lockfile-{tag}-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir.join(LOCK_FILE_NAME)
+    /// 一時領域（`ScratchDir`。drop で消える）とその下のロックファイルのパスを返す。
+    /// 呼び出し側は試験の最後まで guard を束縛する（pid だけの名前の残骸を避ける。#3373・REPAIR-12）。
+    fn scratch_lock_file(tag: &str) -> (crate::scratch_root::ScratchDir, PathBuf) {
+        let scratch = crate::scratch_root::ScratchDir::new(
+            &format!("fandhe-state-lockfile-{tag}"),
+            Duration::from_secs(10),
+        );
+        let path = scratch.path().join(LOCK_FILE_NAME);
+        (scratch, path)
     }
 
     fn open_lock(path: &Path) -> File {
@@ -2435,7 +2543,7 @@ mod platform_tests {
     /// REPAIR-5・TASK-157.9: 別の記述子が保持するロックは期限で打ち切り、`Timeout` で失敗する（3 OS）。
     #[test]
     fn repair5_task157_9_lock_file_until_times_out_when_held() {
-        let path = scratch_lock_file("timeout");
+        let (_scratch, path) = scratch_lock_file("timeout");
         let holder = open_lock(&path);
         holder.try_lock().unwrap();
         let waiter = open_lock(&path);
@@ -2446,19 +2554,22 @@ mod platform_tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        // 明示 unlock で解放する（close だけでは並列の fork 子が fd の複製を持つ間は解放されない。#3292・#3420）。
+        holder.unlock().unwrap();
         drop(holder);
         drop(waiter);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// TASK-157.9: 保持側が解放すれば（即時でも期限内の遅延でも）取得できる（3 OS）。
     #[test]
     fn repair5_task157_9_lock_file_until_acquires_after_release() {
-        let path = scratch_lock_file("acquire");
+        let (_scratch, path) = scratch_lock_file("acquire");
         let holder = open_lock(&path);
         holder.try_lock().unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
+            // 並列の他の試験の fork 子が fd の複製を持っても `LOCK_UN` で解放される（REPAIR-12・#3292・#3420）。
+            holder.unlock().unwrap();
             drop(holder);
         });
         let waiter = open_lock(&path);
@@ -2469,7 +2580,6 @@ mod platform_tests {
         let again = open_lock(&path);
         lock_file_until(&again, Instant::now() + Duration::from_secs(1)).unwrap();
         drop(again);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -2529,9 +2639,12 @@ mod platform_tests {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn oci5_open_is_unimplemented_outside_linux() {
-        let root =
-            std::env::temp_dir().join(format!("fandhe-state-store-nolinux-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        // 作られないことを照合するため、排他作成の `ScratchDir` の下の存在しない子を渡す（#3434・REPAIR-12）。
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-state-store-nolinux",
+            std::time::Duration::from_secs(10),
+        );
+        let root = scratch.path().join("root");
         let e = FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(
@@ -2550,22 +2663,25 @@ mod macos_tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     /// 試験ごとの専用ディレクトリ（drop で削除）。
-    struct Dir(PathBuf);
+    ///
+    /// pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    struct Dir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl Dir {
         fn new(tag: &str) -> Self {
-            let base = fs::canonicalize(std::env::temp_dir()).expect("temp dir");
-            let dir = base.join(format!("fandhe-ss-macos-{tag}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-ss-macos-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let base = fs::canonicalize(scratch.path()).expect("temp dir");
+            let dir = base.join("root");
             fs::create_dir(&dir).expect("create");
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
-            Self(dir)
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            Self(dir, scratch)
         }
     }
 
@@ -2748,23 +2864,30 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// テスト用一時ディレクトリ（drop で削除）。`tempfile` は依存に追加しない。
-    struct TmpDir(PathBuf);
+    ///
+    /// 状態ルートは `ScratchDir` の子にする（親は Linux で共有 flock を持つため親を渡さない）。pid と連番の
+    /// 名前を先に消す旧方式の置き換え（#3434・REPAIR-12）。
+    struct TmpDir(
+        PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir().join(format!(
-                "fandhe-state-store-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&p);
-            fs::create_dir_all(&p).unwrap();
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-state-store-{tag}-{n}"),
+                std::time::Duration::from_secs(10),
+            );
+            let p = scratch.path().join("root");
+            fs::create_dir(&p).unwrap();
             // umask に依存せず、状態ルートとして信頼できるモード（0700）に固定する。
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
             }
-            Self(p)
+            Self(p, scratch)
         }
         fn path(&self) -> &Path {
             &self.0
@@ -2774,10 +2897,29 @@ mod tests {
         }
     }
 
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// REPAIR-12・#3434: 旧方式の pid と連番の名前の残骸（FIFO を含む）があっても `TmpDir` は別名の状態ルートを
+    /// 作って `open` に成功し、残骸に触れない。drop は自分のパスだけを消す。
+    #[test]
+    fn repair12_3434_tmp_dir_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-state-store-legacy3434-{}-0", std::process::id()),
+            "@lock",
+        );
+        let t = TmpDir::new("legacy3434");
+        assert_ne!(t.path(), residue.dir());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+        let store = t.open();
+        create(&store, "web");
+        assert!(t.path().join("web").is_dir());
+        residue.assert_untouched();
+        let path = t.path().to_path_buf();
+        drop(store);
+        drop(t);
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
     }
 
     fn cid(s: &str) -> ContainerId {
@@ -2791,16 +2933,13 @@ mod tests {
     /// 残骸ディレクトリの再利用は実名が要求 ID と完全一致するときだけ（IO-5・OCI-5）。
     #[test]
     fn ensure_exact_dir_name_rejects_case_variant_leftover() {
-        let tmp = std::env::temp_dir().join(format!("fandhe-exact-name-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir(&tmp).unwrap();
+        let (_scratch, tmp) = crate::test_support::scratch_child("fandhe-exact-name", "d");
         fs::create_dir(tmp.join("Web")).unwrap();
         assert_eq!(
             code(ensure_exact_dir_name(&tmp, "web")),
             "FAILED_PRECONDITION"
         );
         assert!(ensure_exact_dir_name(&tmp, "Web").is_ok());
-        fs::remove_dir_all(&tmp).unwrap();
     }
 
     fn create(store: &FileStateStore, id: &str) -> StateRecord {
@@ -3497,6 +3636,75 @@ mod tests {
         assert!(dto.into_record().is_err());
     }
 
+    /// SEC-1・CRI-2・#2666: capability の許可集合の記録が `CAP_*` 名の具体値で往復し、キーの無い旧記録は
+    /// `None`、未知名・OCI 既定外・件数超過・型不正は破損として拒否される。
+    #[test]
+    fn sec1_cri2_state_capabilities_roundtrip_and_rejects_corruption() {
+        let caps = ContainerCapabilities::restrict(
+            CapabilitySet::empty()
+                .with(Capability::Chown)
+                .with(Capability::Kill),
+        )
+        .unwrap();
+        let rec = iso(100).with_capabilities(caps);
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(
+            v["capabilities"],
+            serde_json::json!(["CAP_CHOWN", "CAP_KILL"])
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(back.into_record().unwrap().capabilities(), Some(caps));
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("capabilities").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().capabilities(), None);
+        let too_many: Vec<_> = (0..=Capability::ALL.len()).map(|_| "CAP_KILL").collect();
+        for bad in [
+            serde_json::json!(["CAP_NOPE"]),
+            serde_json::json!(["cap_kill"]),
+            serde_json::json!(["CAP_SYS_ADMIN"]),
+            serde_json::json!(too_many),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["capabilities"] = bad;
+            let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert!(dto.into_record().is_err());
+        }
+        let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        v["capabilities"] = serde_json::json!("CAP_KILL");
+        assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        // 明示的な null は旧記録ではなく破損（SEC-1 fail-closed）。
+        let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        v["capabilities"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+    }
+
+    /// CLI-1・SUP-12・#2828: `root.readonly` の実効値の記録が bool で往復し、キーの無い旧記録は `None`、
+    /// `null`・文字列・数値は破損として拒否される。
+    #[test]
+    fn cli1_sup12_state_root_readonly_roundtrip_and_rejects_corruption() {
+        for ro in [true, false] {
+            let rec = iso(100).with_root_readonly(ro);
+            let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+            assert_eq!(v["root_readonly"], serde_json::json!(ro));
+            let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert_eq!(back.into_record().unwrap().root_readonly(), Some(ro));
+        }
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("root_readonly").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().root_readonly(), None);
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["root_readonly"] = bad;
+            assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        }
+    }
+
     /// CORE-6・SEC-5・#2388: ID 写像の記録が JSON の具体値で往復し、無い旧記録は記録なし、
     /// 不正な値（未知の model・ホスト ID 0・重複・形の不一致・件数超過）は破損として拒否される。
     #[test]
@@ -3544,6 +3752,55 @@ mod tests {
         }
     }
 
+    /// SEC-1・SEC-4・#3201: Mount 由来のルールの識別子が JSON の具体値で往復し、`mount` の無い旧記録は
+    /// `Absent` として読め、`null`・不正な値(`mnt_id` 0)は破損として拒否される。
+    #[test]
+    fn sec1_3201_state_mount_identity_roundtrip_and_legacy() {
+        use crate::launch_isolation::RecordedMountIdentities;
+        let legacy = iso(100);
+        assert_eq!(
+            legacy.landlock().mount_identities(),
+            RecordedMountIdentities::Absent
+        );
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&legacy)).unwrap();
+        assert!(v["landlock"]["rules"][1].get("mount").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().landlock().mount_identities(),
+            RecordedMountIdentities::Absent
+        );
+
+        let positions = legacy.landlock().mount_rule_positions();
+        let entries = positions
+            .iter()
+            .map(|i| {
+                (
+                    *i,
+                    RecordedMountIdentity::new(20 + *i as u64, 7, 8, *i == 1).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let full = legacy.with_mount_identities(entries).unwrap();
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&full)).unwrap();
+        assert_eq!(
+            v["landlock"]["rules"][1]["mount"],
+            serde_json::json!({"mnt_id": 21, "dev": 7, "ino": 8, "read_only": true})
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.into_record().unwrap(), full);
+
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({"mnt_id": 0, "dev": 7, "ino": 8, "read_only": false}),
+            serde_json::json!({"mnt_id": 1, "dev": 7, "ino": 8}),
+        ] {
+            let mut v = v.clone();
+            v["landlock"]["rules"][1]["mount"] = bad;
+            let parsed = serde_json::from_value::<LaunchIsolationDto>(v);
+            assert!(parsed.map_or(true, |d| d.into_record().is_err()));
+        }
+    }
+
     /// SUP-6・TASK-163 追補・#1468: launch 時の分離の記録が `state.json` に書かれ（形を具体値で照合）、update で
     /// 引き継がれ・置き換えられ、再オープン後の get でも同じ値で読める（契約 12）。
     #[test]
@@ -3585,6 +3842,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replaced.launch_isolation(), Some(&iso(200)));
+        // #2238: Clear は記録を消し、state.json にキーを残さず、続く Inherit でも None のまま（再オープン後も）。
+        let cleared = store
+            .update(
+                &UpdateStateRequest::new(
+                    ContainerStatus::running(cid("web"), NonZeroU32::new(101)),
+                    replaced.revision(),
+                )
+                .clear_launch_isolation(),
+            )
+            .unwrap();
+        assert_eq!(cleared.launch_isolation(), None);
+        assert!(
+            read_json(&t, "web")
+                .get("launchIsolation")
+                .is_none_or(|v| v.is_null())
+        );
+        let after = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(cid("web"), NonZeroU32::new(101)),
+                cleared.revision(),
+            ))
+            .unwrap();
+        assert_eq!(after.launch_isolation(), None);
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.launch_isolation(), None);
     }
 
     fn image_rootfs_rec(path: &str, dev: u64, ino: u64) -> ImageRootfsRecord {
@@ -5037,6 +5319,8 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(elapsed >= STATE_LOCK_TIMEOUT, "{elapsed:?}");
         assert!(elapsed < STATE_LOCK_TIMEOUT + Duration::from_secs(5));
+        // 明示 unlock で解放する。close だけだと fork 子の fd 複製で解放が遅れ、直後の get が飢える（#3292・#3420）。
+        holder.unlock().unwrap();
         drop(holder);
         let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
         assert_eq!(got, rec);

@@ -5,7 +5,16 @@
 //! 用意する。`call_once` は子の環境を `env_clear()` するため、振る舞いは socket ディレクトリ内の
 //! `behavior` ファイルで子へ伝える。
 
-#[cfg(target_os = "linux")]
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
+#[cfg(unix)]
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+#[cfg(unix)]
 #[path = "support/swap.rs"]
 mod swap;
 
@@ -47,9 +56,7 @@ mod unix {
         call_once, call_once_observed,
     };
     use std::ffi::OsString;
-    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -59,13 +66,8 @@ mod unix {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(behavior: &str) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcos-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcos").unwrap();
             std::fs::write(p.join("behavior"), behavior).unwrap();
             Self(p)
         }
@@ -226,15 +228,16 @@ mod unix {
 
     /// 子プロセスと同じ UID の別プロセス（このテストバイナリの `decoy_entry`）を起動し、終了まで待つ。
     fn spawn_decoy_and_wait(sock: &std::path::Path) {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "unix::decoy_entry", "--test-threads=1"])
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "unix::decoy_entry", "--test-threads=1"])
             .env("FCOS_DECOY_SOCK", sock)
             .env_remove(PLUGIN_SOCKET_ENV)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
+            .stderr(std::process::Stdio::null());
+        // 期限なしの `status()` を避け、止まったら kill して回収し場所つきで失敗させる（REPAIR-5・#3409）。
+        let status = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
+            .unwrap_or_else(|e| panic!("decoy process: {e}"));
         assert!(status.success());
     }
 
@@ -818,6 +821,68 @@ mod unix {
         // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
         let err = fx.try_target_from_path().unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+    }
+
+    /// macOS 等（Linux 以外の unix）: 構築後にパスを別ファイルへ差し替えると、spawn 直前の同一性確認で
+    /// 拒否され、子は spawn されない（#1866・PLUG-11）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_one_shot_rejects_after_path_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let plugin = PluginLaunchSpec::new(fx.target(), vec![], dir.0.clone()).unwrap();
+        let marker = fx.marker_path();
+        fx.replace_with_marker_script(&marker);
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let err = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "plugin launch target path does not refer to the verified file"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "child must not be spawned");
+        // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
+        assert_eq!(
+            fx.try_target_from_path().unwrap_err().code(),
+            PluginErrorCode::InvalidArgument
+        );
+    }
+
+    /// macOS 等: 差し替えなしなら起動し、1 往復が成功する（#1866）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn plug11_1866_one_shot_runs_when_not_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let plugin = PluginLaunchSpec::new(fx.target(), args, dir.0.clone()).unwrap();
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let out = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            out.termination(),
+            PluginTermination::Exited { code: Some(0) }
+        );
+        assert_ne!(pid_of(out.response().payload()), std::process::id());
     }
 
     /// 構築後に同じ inode の内容が `#!` スクリプトへ書き換えられた場合は、解釈系が閉じた fd を開き直せず

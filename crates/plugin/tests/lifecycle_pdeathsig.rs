@@ -18,10 +18,13 @@ use fandhe_container_plugin::{
     ResidentPlugin, ResidentStartTimeout, UdsStream, call_once,
 };
 use std::ffi::OsString;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+// 予測できる名前を消さずに排他作成する補助（REPAIR-12・#3479。net の試験補助を共有する）。
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
 
 const ROLE_ENV: &str = "FC_PDEATH_ROLE";
 const DIR_ENV: &str = "FC_PDEATH_DIR";
@@ -31,11 +34,13 @@ const WAIT: Duration = Duration::from_secs(8);
 
 struct TempDir(PathBuf);
 impl TempDir {
+    /// `temp_dir()` 直下に `fcpd-<tag>-<pid>-<n>` を排他作成する（先行削除をしない。REPAIR-12・#3479）。
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("fcpd-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-        Self(p)
+        Self::new_in(&std::env::temp_dir(), tag)
+    }
+
+    fn new_in(parent: &Path, tag: &str) -> Self {
+        Self(exclusive_dir::create_in(parent, &format!("fcpd-{tag}")).unwrap())
     }
 }
 impl Drop for TempDir {
@@ -205,4 +210,45 @@ fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
         p,
     )
     .unwrap()
+}
+
+/// 残骸（同名のディレクトリ・symlink）を先に置いても消さず・辿らず、連番を進めて排他作成すること
+/// （REPAIR-12・#3479・PLUG-7）。
+#[test]
+fn plug7_repair12_pdeathsig_tempdir_skips_stale_residue() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let parent = TempDir::new("residue");
+    let canary = parent.0.join("canary");
+    std::fs::create_dir(&canary).unwrap();
+    std::fs::write(canary.join("keep"), b"canary").unwrap();
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pid = std::process::id();
+    let stale0 = parent.0.join(format!("fcpd-t-{pid}-0"));
+    std::fs::create_dir(&stale0).unwrap();
+    std::fs::write(stale0.join("stale"), b"stale").unwrap();
+    symlink(&canary, parent.0.join(format!("fcpd-t-{pid}-1"))).unwrap();
+
+    let new_path = {
+        let d = TempDir::new_in(&parent.0, "t");
+        assert_eq!(d.0, parent.0.join(format!("fcpd-t-{pid}-2")));
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::metadata(&d.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        d.0.clone()
+    };
+    assert!(!new_path.exists(), "own dir must be removed on drop");
+    assert_eq!(std::fs::read(stale0.join("stale")).unwrap(), b"stale");
+    assert_eq!(std::fs::read(canary.join("keep")).unwrap(), b"canary");
+    assert_eq!(
+        std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(
+        std::fs::symlink_metadata(parent.0.join(format!("fcpd-t-{pid}-1")))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }

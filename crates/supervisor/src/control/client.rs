@@ -2,7 +2,7 @@
 //!
 //! CLI の `stop`（と `kill`）が、起動ハンドルを持つ supervisor へシグナル送信を依頼するための公開 API。core の
 //! `ProcessSignaler`（`oci_runtime::kill` の送信境界）を実装する。CLI の `stop_delete::production_signaler` が
-//! これを使う（`stop` は [`ControlSignaler::for_stop`] で結線済み。#2059・#2162。`kill` は #1902 が [`ControlSignaler::new`] を使う。#1544 の段 C）。
+//! これを使う（`stop` は [`ControlSignaler::for_stop`] で結線済み。#2059・#2162。`kill` は #1902 で [`ControlSignaler::new`] を使って結線済み。#1544 の段 C）。
 //! `for_stop` は StopRequest（kind 4）を送り、supervisor に明示 stop の意図を記録させる（SUP-9）。意図を記録できない
 //! supervisor（書き先なし・古い版）は、シグナルを送らずに構造化エラーを返す（fail-closed）。
 //! `state.json` の pid へ生の `kill(2)` は送らない（pid 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。

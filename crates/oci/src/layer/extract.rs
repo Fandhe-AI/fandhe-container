@@ -22,20 +22,20 @@
 //!
 //! - イメージの展開（`extract_image_layers`）は、`VerifiedLayerBlob`（`open_blob_nofollow` で開き、同じハンドルで
 //!   信頼条件と digest を確かめた値。#2309）だけを受ける。パスを開き直さないため、検証と展開の間にパスを別の
-//!   ファイルへ差し替えられても展開物は変わらない。パスを受ける旧入口（`extract_layer_blob(s)*`。gzip 固定で
-//!   diff_id を突合しない）は、呼び出し側が排他的に所有する 0700 のステージングにある、直前に `verify_blob_digest` を
-//!   通した blob に限る。キャッシュの blob を再利用する経路と diff_id の突合には使わない。
+//!   ファイルへ差し替えられても展開物は変わらない。パスを受けて走査のたびに開き直す旧入口（`extract_layer_blob(s)*`）は、
+//!   検証と展開の間の差し替えを防げないため #2535 で廃止した（#2309）。入口は検証済みハンドル版
+//!   （`extract_image_layers*`）と、`Read + Seek` を受けるストリーム版（`extract_layers*`・`extract_tar*`）の 2 系統である。
 //! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
 //!   symlink であってはならない。空でなければ `FailedPrecondition` で拒否する（別表記の衝突の判定が
 //!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
 //!   書き換える競合（TOCTOU）は、Linux の x86_64 / aarch64 では変更操作を `root` のディレクトリ fd 起点に閉じて
 //!   防ぐ（下記「ディレクトリ fd 起点の解決」）。それ以外のホストでは防げない。
 //! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
-//! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
+//! - 複数レイヤーは `extract_layers` / `extract_image_layers` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
 //!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。
 //! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。ハンドル版（`VerifiedLayerBlob`）は各走査の前に
-//!   ハンドルの先頭へ戻し、パス版の旧入口は blob をパスから 2 回開き、ストリーム版（`extract_tar`・`extract_layers`）は
+//!   ハンドルの先頭へ戻し、ストリーム版（`extract_tar`・`extract_layers`）は
 //!   入力に `Seek` を求めて最初の位置へ戻す。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、
 //!   `extract_image_layers` では image config の `rootfs.diff_ids` と突合する（#2017・OCI-1）。パス 3 でも同じ構成で
 //!   同じハッシュを計算し、末尾でパス 1 の値と照合して、違えば `DataLoss` にする（#2309。同じ inode への上書きなど、
@@ -206,16 +206,20 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use tar::{Archive, EntryType};
 
 pub use super::idmap::{IdMap, IdRange};
 use sha2::{Digest as _, Sha256};
 
-use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree};
+use super::anchored::{
+    AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree, remove_path_tree_checked,
+};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
-    VerifiedLayerBlob, oci_error_from_layer_io, open_gzip_layer,
+    VerifiedLayerBlob, oci_error_from_layer_io,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -322,7 +326,7 @@ pub struct ExtractedLayer {
 
 /// 通常ファイルの setuid / setgid / sticky の扱い（SEC-5・SEC-1・#1810）。既定は `Strip`。
 ///
-/// 展開の入口 `extract_layers_with_policy` / `extract_layer_blobs_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
+/// 展開の入口 `extract_layers_with_policy` / `extract_image_layers_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
 /// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
 /// 変更〔TOCTOU〕は防げない）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
 /// ビットの保持までを扱う。
@@ -393,9 +397,118 @@ pub enum OwnershipPolicy {
     },
 }
 
+/// 展開の期限と取り消し（REPAIR-5・CRI-2・#2899）。
+///
+/// cri の `ImageRootfsSource::prepare`（CreateContainer の rootfs 用意）と `OciImagePuller`（PullImage。#2967）が
+/// `extract_image_layers_bounded` / `extract_layers_bounded` へ渡す。展開の結果を決める設定ではないため `ExtractOptions`（展開記録の `settings` に
+/// 直列化して pull と create の間で照合する）には入れない。既定（`new()`）は期限も取り消しも無く、従来の入口と同じ。
+///
+/// 確認はレイヤーの前・パス 1 のエントリごと・パス 2 のマーカーごと・パス 3 のエントリごと（書き込みの前）・
+/// 遅延ディレクトリ mode の適用の前に行い、期限超過か取り消しなら `OciErrorCode::Timeout` で止まる。分割できない区間は
+/// 1 エントリの本体の書き込み（最大 `max_total_bytes`）と 1 本の tar の終端後の読み捨て（入力上限で有界）。
+///
+/// 期限の判定に使う時計は `with_clock` で差し替えられる（#3297・REPAIR-5・REPAIR-12）。差し替えるのは cri の
+/// `PullBudget::extract_budget`（pull 全体の時計を展開と共有する）と試験だけで、CreateContainer 経路
+/// （cri の `adapter.rs`・`bundle/image_rootfs.rs`）は既定の `Instant::now` のまま使う。
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub struct ExtractBudget<'a> {
+    /// この時刻以降は `Timeout`（`None` は期限なし）。
+    deadline: Option<Instant>,
+    /// 立ったら `Timeout`（RPC の期限切れで worker を手放したとき等。`None` は取り消しなし）。
+    cancel: Option<&'a AtomicBool>,
+    /// 現在時刻の取得口（既定は `Instant::now`。試験の擬似時計は `with_clock` で差し替える）。
+    now: &'a (dyn Fn() -> Instant + Sync),
+}
+
+impl std::fmt::Debug for ExtractBudget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractBudget")
+            .field("deadline", &self.deadline)
+            .field("cancel", &self.cancel)
+            .field("now", &"<clock>")
+            .finish()
+    }
+}
+
+impl Default for ExtractBudget<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> ExtractBudget<'a> {
+    /// 期限も取り消しも無い予算（従来の入口と同じ）。
+    pub fn new() -> Self {
+        Self {
+            deadline: None,
+            cancel: None,
+            now: &Instant::now,
+        }
+    }
+
+    /// 期限（絶対時刻）を足す。
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// 期限の判定に使う現在時刻の取得口を差し替える（既定は `Instant::now`）。
+    ///
+    /// 試験が擬似時計で期限を決定的にするための口（#3297・REPAIR-5・REPAIR-12）。cri の `PullBudget` が pull の時計を
+    /// 展開と共有するためにも使う。本番の呼び出し元は既定のまま使うこと。戻り値は単調非減少でなければならず、
+    /// 止まった時計を渡すと期限が効かなくなる。
+    #[must_use]
+    pub fn with_clock(mut self, now: &'a (dyn Fn() -> Instant + Sync)) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// 取り消しの旗を足す。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 木の削除用の確認（文言のみ違う。`remove_extracted_tree_bounded` から呼ぶ。#3142）。
+    fn check_removal(&self) -> Result<(), OciError> {
+        self.check().map_err(|_| {
+            let cancelled = self.cancel.is_some_and(|c| c.load(AtomicOrdering::Acquire));
+            err(
+                OciErrorCode::Timeout,
+                if cancelled {
+                    "tree removal was cancelled"
+                } else {
+                    "tree removal exceeded its deadline"
+                },
+            )
+        })
+    }
+
+    /// 期限超過か取り消しなら `Timeout`。メッセージにエントリ名・パスは含めない（ERR-3）。
+    fn check(&self) -> Result<(), OciError> {
+        if let Some(c) = self.cancel
+            && c.load(AtomicOrdering::Acquire)
+        {
+            return Err(err(OciErrorCode::Timeout, "layer extraction was cancelled"));
+        }
+        if let Some(d) = self.deadline
+            && (self.now)() >= d
+        {
+            return Err(err(
+                OciErrorCode::Timeout,
+                "layer extraction exceeded its deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 展開の選択肢（所有者・特殊ビット）。将来の項目追加に備え `non_exhaustive`。
 ///
-/// `extract_layers_with_options` / `extract_layer_blobs_with_options` が受け取る。既定は従来の挙動
+/// `extract_layers_with_options` / `extract_image_layers_with_options` が受け取る。既定は従来の挙動
 /// （`chown` しない・特殊ビットは落とす）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -531,7 +644,7 @@ pub fn extract_tar<R: Read + Seek>(
 ///
 /// `src` は gzip 展開済みの tar バイトストリーム。tar を 2 回走査するため `Seek` を求め、各走査の前に
 /// 最初に渡された時点の位置へ戻す（モジュール冒頭「レイヤーごとの 3 パス」）。gzip の blob は
-/// `extract_layer_blob_with` を使う。契約はモジュール冒頭を参照。
+/// `extract_image_layers`（検証済みハンドル）を使う。契約はモジュール冒頭を参照。
 /// 複数レイヤーを重ねるときは `extract_layers_with` を使う（これは要素 1 つのスタックと同じ）。
 pub fn extract_tar_with<R: Read + Seek>(
     recorder: &dyn OciOpRecorder,
@@ -542,50 +655,6 @@ pub fn extract_tar_with<R: Read + Seek>(
     single(extract_stack(
         recorder,
         [Rewind::new(src)],
-        root,
-        limits,
-        host_lstat,
-        SpecialSetup::host(SpecialBitsPolicy::Strip),
-    )?)
-}
-
-/// 圧縮レイヤー blob（digest 検証済み）を開き、gzip 展開しながら `root` へ展開する便宜関数。
-///
-/// `max_uncompressed_bytes` は gzip 展開後（tar 全体）の上限で、`limits.max_total_bytes` とは別に効く。
-pub fn extract_layer_blob(
-    blob_path: &Path,
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<ExtractedLayer, OciError> {
-    extract_layer_blob_with(
-        &NoopOciOpRecorder,
-        blob_path,
-        root,
-        max_uncompressed_bytes,
-        limits,
-    )
-}
-
-/// `extract_layer_blob` の計装版。blob を開く処理から展開完了までを 1 回の
-/// `OciOpKind::ExtractLayer` として `recorder` へ記録する（open 失敗も記録対象。REPAIR-4）。
-///
-/// tar を 2 回走査するため、同じ blob を 2 回開く（モジュール冒頭「レイヤーごとの 3 パス」）。
-pub fn extract_layer_blob_with(
-    recorder: &dyn OciOpRecorder,
-    blob_path: &Path,
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<ExtractedLayer, OciError> {
-    single(extract_stack(
-        recorder,
-        [BlobLayer {
-            path: blob_path,
-            media_type: LayerMediaType::TarGzip,
-            max_uncompressed_bytes,
-            expected_diff_id: None,
-        }],
         root,
         limits,
         host_lstat,
@@ -661,85 +730,24 @@ pub fn extract_layers_with_options<R: Read + Seek>(
     )
 }
 
-/// 計装なしの `extract_layer_blobs_with`（`NoopOciOpRecorder`）。
-pub fn extract_layer_blobs(
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with(
-        &NoopOciOpRecorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-    )
-}
-
-/// 圧縮レイヤー blob（すべて digest 検証済み。下位から上位の順）を重ねて展開する（TASK-52.4・OCI-1・#410）。
-///
-/// `max_uncompressed_bytes` は各レイヤーの gzip 展開後の上限。各 blob は 2 回開く。その他は
-/// `extract_layers_with` と同じ。
-pub fn extract_layer_blobs_with(
+/// `extract_layers_with_options` に期限と取り消しの `budget` を足した版（REPAIR-5・#2899）。契約は
+/// `extract_image_layers_bounded` と同じ（`Err` のとき `root` は呼び出し側が破棄する）。
+pub fn extract_layers_bounded<R: Read + Seek>(
     recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
+    layers: impl IntoIterator<Item = R>,
     root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with_policy(
-        recorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-        SpecialBitsPolicy::Strip,
-    )
-}
-
-/// `extract_layer_blobs_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
-pub fn extract_layer_blobs_with_policy(
-    recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
-    limits: ExtractLimits,
-    policy: SpecialBitsPolicy,
-) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_layer_blobs_with_options(
-        recorder,
-        blob_paths,
-        root,
-        max_uncompressed_bytes,
-        limits,
-        &ExtractOptions::new().with_special_bits(policy),
-    )
-}
-
-/// `extract_layer_blobs_with` に所有者（`chown`）と特殊ビットの選択肢を足した版（SEC-5・OCI-1・#2225）。
-///
-/// `options` の契約は `extract_layers_with_options` と同じ。
-pub fn extract_layer_blobs_with_options(
-    recorder: &dyn OciOpRecorder,
-    blob_paths: &[&Path],
-    root: &Path,
-    max_uncompressed_bytes: u64,
     limits: ExtractLimits,
     options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
-    extract_stack(
+    extract_stack_bounded(
         recorder,
-        blob_paths.iter().map(|path| BlobLayer {
-            path,
-            media_type: LayerMediaType::TarGzip,
-            max_uncompressed_bytes,
-            expected_diff_id: None,
-        }),
+        layers.into_iter().map(Rewind::new),
         root,
         limits,
         host_lstat,
         SpecialSetup::from_options(options),
+        *budget,
     )
 }
 
@@ -804,7 +812,7 @@ impl<R: Read + Seek> LayerSource for Rewind<R> {
 
 /// blob 系 `LayerSource` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
 ///
-/// `R` は読み取り元で、パス版 `BlobLayer` は `File`、ハンドル版 `VerifiedBlobLayer` は `&File`。
+/// `R` は読み取り元で、ハンドル版 `VerifiedBlobLayer` は `&File`。
 enum LayerReader<R: Read> {
     Gzip(Box<GzipLayerReader<R>>),
     Plain(PlainLayerReader<R>),
@@ -816,41 +824,6 @@ impl<R: Read> Read for LayerReader<R> {
             Self::Gzip(r) => r.read(buf),
             Self::Plain(r) => r.read(buf),
         }
-    }
-}
-
-/// gzip 固定の旧入口（`extract_layer_blobs*`）が使う、パスから走査のたびに開き直す `LayerSource`。
-///
-/// 検証と展開の間の差し替え・symlink は検出しない（パス 3 の再ハッシュが内容の変化だけを `DataLoss` にする）。
-/// 呼び出し側が排他的に所有する 0700 のステージングにある、直前に検証した blob に限る（#2309）。
-/// キャッシュの blob を再利用する経路と diff_id の照合には `VerifiedBlobLayer` を使う。
-struct BlobLayer<'p> {
-    path: &'p Path,
-    media_type: LayerMediaType,
-    max_uncompressed_bytes: u64,
-    expected_diff_id: Option<Digest>,
-}
-
-impl LayerSource for BlobLayer<'_> {
-    type Reader<'a>
-        = LayerReader<File>
-    where
-        Self: 'a;
-
-    fn open(&mut self) -> Result<LayerReader<File>, OciError> {
-        match self.media_type {
-            LayerMediaType::TarGzip => open_gzip_layer(self.path, self.max_uncompressed_bytes)
-                .map(|r| LayerReader::Gzip(Box::new(r))),
-            // 旧入口は gzip 固定のため、非圧縮はここへ来ない。来たら推測で開かず拒否する。
-            LayerMediaType::Tar => Err(err(
-                OciErrorCode::Unimplemented,
-                "plain tar layers require a verified blob handle",
-            )),
-        }
-    }
-
-    fn expected_diff_id(&self) -> Option<&Digest> {
-        self.expected_diff_id.as_ref()
     }
 }
 
@@ -943,7 +916,7 @@ pub fn extract_image_layers(
 /// (2) 各レイヤーのパス 1 で計算した展開後 tar の sha256 を `diff_id` と突合する（不一致は `DataLoss`。そのレイヤーの
 /// 変更を始める前に止まるが、先行レイヤーの展開物は残るため、呼び出し側が `root` ごと破棄すること）。
 /// `layers` の件数と config の `diff_ids` の件数の照合は `image_layers_from` が行う
-/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layer_blobs_with` と同じ。
+/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layers_with` と同じ。
 pub fn extract_image_layers_with(
     recorder: &dyn OciOpRecorder,
     layers: &[ImageLayer<'_>],
@@ -992,7 +965,33 @@ pub fn extract_image_layers_with_options(
     limits: ExtractLimits,
     options: &ExtractOptions,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_bounded(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        options,
+        &ExtractBudget::new(),
+    )
+}
+
+/// `extract_image_layers_with_options` に期限と取り消しの `budget` を足した版（REPAIR-5・CRI-2・#2899）。
+///
+/// 空の `budget` なら既存の入口と同一。`budget` はエントリ単位で確かめ、超過・取り消しなら `OciErrorCode::Timeout`。
+/// `Err` のときは先行の展開物が `root` に残りうるため、呼び出し側が `root` ごと破棄すること
+/// （cri の `ImageRootfsSource::prepare` は `remove_extracted_tree` で消す）。
+pub fn extract_image_layers_bounded(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+    budget: &ExtractBudget<'_>,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     let setup = SpecialSetup::from_options(options);
+    budget.check()?;
     // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
     // `extract_stack` は空入力を拒否するため、ここで選択肢の組み合わせと root の前提だけ確かめて空の結果を返す。
     if layers.is_empty() {
@@ -1009,7 +1008,7 @@ pub fn extract_image_layers_with_options(
             })
         })
         .collect::<Result<Vec<_>, OciError>>()?;
-    extract_stack(recorder, sources, root, limits, host_lstat, setup)
+    extract_stack_bounded(recorder, sources, root, limits, host_lstat, setup, *budget)
 }
 
 /// レイヤー 0 のイメージの展開（選択肢と root の前提を確かめ、`ChownMapped` なら root だけ写像先へ `chown` する）。
@@ -1040,6 +1039,19 @@ fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<Extracte
 /// 使用までの TOCTOU を防げない（モジュール冒頭「未実装」）。
 pub fn remove_extracted_tree(path: &Path) -> Result<(), OciError> {
     remove_path_tree(path)
+}
+
+/// `remove_extracted_tree` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5・OCI-7）。
+///
+/// 呼び出し元は cri の bundle 解放（`RemoveContainer` の worker と `CreateContainer` の巻き戻し）。`budget` の
+/// 期限超過・取り消しはエントリ 1 件を消す前に確かめ、`Timeout` で止まる。止まるまでに消した分は残り、同じ
+/// `path` への再実行（冪等）が続きから消す。分割できない区間（`unlinkat` 1 回・`getdents64` 1 回分）は打ち切れない。
+/// symlink・マウント越えの拒否と深さ・走査回数の上限は `remove_extracted_tree` と同じ。
+pub fn remove_extracted_tree_bounded(
+    path: &Path,
+    budget: &ExtractBudget<'_>,
+) -> Result<(), OciError> {
+    remove_path_tree_checked(path, &|| budget.check_removal())
 }
 
 /// 件数と対応の照合つきで `ImageLayer` の列を作る補助（#2017・#2309・OCI-1）。
@@ -1307,6 +1319,8 @@ struct Extractor<'a> {
     /// `ExtractLimits::max_tracked_paths` を超えない。パス 3 の前後で空にする。
     layer_nodes: HashSet<u64>,
     lstat: Lstat,
+    /// 期限と取り消し（既定は無制限）。
+    budget: ExtractBudget<'a>,
 }
 
 pub(crate) fn err(code: OciErrorCode, msg: &'static str) -> OciError {
@@ -2769,6 +2783,7 @@ impl Extractor<'_> {
     fn apply_markers(&mut self, markers: &[Marker]) -> Result<(), OciError> {
         let mut plan = Vec::new();
         for m in markers {
+            self.budget.check()?;
             match m {
                 Marker::Whiteout { parent, target } => {
                     let Some(dir) = self.resolve_marker_parent(parent)? else {
@@ -2795,6 +2810,7 @@ impl Extractor<'_> {
             }
         }
         for r in plan {
+            self.budget.check()?;
             match r {
                 Removal::Tree {
                     parent_comps,
@@ -3100,6 +3116,7 @@ fn collect_markers<R: Read>(
                     "layer exceeds the entry count limit",
                 ));
             }
+            x.budget.check()?;
             if entry.header().entry_type() == EntryType::XGlobalHeader {
                 if x.own.is_some() {
                     global_owner.absorb(&mut entry)?;
@@ -3188,6 +3205,8 @@ fn extract_one_layer<S: LayerSource>(
                     "layer exceeds the entry count limit",
                 ));
             }
+            // 書き込みの前に期限・取り消しを確かめる（REPAIR-5・#2899）。
+            x.budget.check()?;
             if ty == EntryType::XGlobalHeader {
                 global_owner.absorb(&mut entry)?;
                 continue;
@@ -3268,7 +3287,7 @@ fn extract_one_layer<S: LayerSource>(
 
 /// レイヤー列を `root` へ下位から順に重ねて展開する本体（単一レイヤー API もこれの 1 要素版）。
 ///
-/// 各要素は `LayerSource`（blob 版は gzip を開き直す `BlobLayer`、ストリーム版は位置を戻す `Rewind`）。
+/// 各要素は `LayerSource`（ハンドル版は `VerifiedBlobLayer`、ストリーム版は位置を戻す `Rewind`）。
 /// `Extractor`（別表記の索引・遅延ディレクトリ mode・上限のカウンタ）は全レイヤーで共有し、上限は全体で
 /// 累積する。`lstat` はテストだけが差し替える（`Lstat` を参照）。
 fn extract_stack<S: LayerSource>(
@@ -3278,6 +3297,27 @@ fn extract_stack<S: LayerSource>(
     limits: ExtractLimits,
     lstat: Lstat,
     setup: SpecialSetup,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_stack_bounded(
+        recorder,
+        layers,
+        root,
+        limits,
+        lstat,
+        setup,
+        ExtractBudget::new(),
+    )
+}
+
+/// `extract_stack` の期限つき版。`stop` は各レイヤーの前に確かめ、`Extractor` に持たせて内側の走査でも確かめる。
+fn extract_stack_bounded<'a, S: LayerSource>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = S>,
+    root: &'a Path,
+    limits: ExtractLimits,
+    lstat: Lstat,
+    setup: SpecialSetup,
+    stop: ExtractBudget<'a>,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
     let mut x: Option<Extractor<'_>> = None;
     let mut input_used = 0u64;
@@ -3293,6 +3333,7 @@ fn extract_stack<S: LayerSource>(
         }
         let is_last = layers.peek().is_none();
         let res = record_oci_op(recorder, OciOpKind::ExtractLayer, || {
+            stop.check()?;
             if x.is_none() {
                 // 選択肢の不正な組み合わせ・非 Linux の `chown` は、`root` に触れる前に拒否する。
                 let own = setup.owner_ctx()?;
@@ -3318,6 +3359,7 @@ fn extract_stack<S: LayerSource>(
                     names: NameIndex::new(limits.max_tracked_paths),
                     layer_nodes: HashSet::new(),
                     lstat,
+                    budget: stop,
                 });
             }
             let Some(ex) = x.as_mut() else {
@@ -3330,6 +3372,7 @@ fn extract_stack<S: LayerSource>(
             let mut layer = layer;
             if is_last {
                 let chowned0 = ex.chowned;
+                stop.check()?;
                 ex.finish_dirs()?;
                 // `chown_root` は `root` の所有者を正当に変えるため、その前に確かめる。
                 ex.verify_root_after_special_bits()?;
@@ -4490,6 +4533,48 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::DataLoss);
     }
 
+    /// メモリ上の gzip を走査のたびに先頭から読み直す試験用 `LayerSource`。
+    ///
+    /// 旧入口 `extract_layer_blob(s)*` の廃止後も、gzip トレーラの検証と展開後サイズの上限を `extract_stack` の
+    /// 経路で（Seek 不要・3 OS で）確かめるために置く（#2535・OCI-1）。
+    struct MemGzip<'g> {
+        gz: &'g [u8],
+        max_uncompressed_bytes: u64,
+    }
+
+    impl LayerSource for MemGzip<'_> {
+        type Reader<'a>
+            = LayerReader<&'a [u8]>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<LayerReader<&[u8]>, OciError> {
+            Ok(LayerReader::Gzip(Box::new(GzipLayerReader::new(
+                self.gz,
+                self.max_uncompressed_bytes,
+            ))))
+        }
+    }
+
+    fn extract_mem_gzip(
+        sb: &Sandbox,
+        gz: &[u8],
+        max_uncompressed_bytes: u64,
+        lim: ExtractLimits,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        extract_stack(
+            &NoopOciOpRecorder,
+            [MemGzip {
+                gz,
+                max_uncompressed_bytes,
+            }],
+            &sb.root,
+            lim,
+            host_lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
+        )
+    }
+
     /// OCI-1: gzip トレーラ破損は終端後の読み捨てで DataLoss になる。上限は gzip 側でも効く。
     #[test]
     fn oci1_gzip_trailer_is_verified_after_tar_end() {
@@ -4500,26 +4585,21 @@ mod tests {
         let lim = ExtractLimits::new(10, 100, 1 << 30, 1 << 20);
 
         let sb = Sandbox::new();
-        let blob = sb.base.join("ok.gz");
-        fs::write(&blob, &gz).unwrap();
-        let r = extract_layer_blob(&blob, &sb.root, 1 << 20, lim).unwrap();
-        assert_eq!(r.bytes, 5);
+        let r = extract_mem_gzip(&sb, &gz, 1 << 20, lim).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].bytes, 5);
 
         let mut bad = gz.clone();
         let n = bad.len();
         bad[n - 8] ^= 0xff; // CRC32 を壊す。
         let sb = Sandbox::new();
-        let blob = sb.base.join("bad.gz");
-        fs::write(&blob, &bad).unwrap();
-        let e = extract_layer_blob(&blob, &sb.root, 1 << 20, lim).expect_err("crc");
+        let e = extract_mem_gzip(&sb, &bad, 1 << 20, lim).expect_err("crc");
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         // トレーラの検証はパス 1（副作用なし）の終端で行うため、rootfs には何も作られない（OCI-2）。
         assert!(names_in(&sb.root).is_empty());
 
         let sb = Sandbox::new();
-        let blob = sb.base.join("ok.gz");
-        fs::write(&blob, &gz).unwrap();
-        let e = extract_layer_blob(&blob, &sb.root, 600, lim).expect_err("gzip limit");
+        let e = extract_mem_gzip(&sb, &gz, 600, lim).expect_err("gzip limit");
         assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
     }
 
@@ -4552,20 +4632,36 @@ mod tests {
         assert_eq!(items[1].error_code(), Some(OciErrorCode::PermissionDenied));
     }
 
-    /// REPAIR-4: blob を開く失敗（不存在）も `oci.layer.extract` の失敗として記録される。
+    /// 開くたびに失敗する試験用 `LayerSource`（`LayerSource::open` の失敗の記録を確かめる）。
+    struct FailingOpen;
+
+    impl LayerSource for FailingOpen {
+        type Reader<'a>
+            = LayerReader<&'a [u8]>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<LayerReader<&[u8]>, OciError> {
+            Err(err(OciErrorCode::NotFound, "layer blob is missing"))
+        }
+    }
+
+    /// REPAIR-4: レイヤー入力を開く失敗も `oci.layer.extract` の失敗として 1 件記録される。
+    /// ハンドル版の open 失敗（`VerifiedLayerBlob::open_with`）は layer.rs 側の試験が確かめる。
     #[test]
     fn repair4_records_blob_open_failure() {
         let c = Collect::default();
         let sb = Sandbox::new();
-        let missing = sb.base.join("no-such-blob");
-        let e = extract_layer_blob_with(
+        let e = extract_stack(
             &c,
-            &missing,
+            [FailingOpen],
             &sb.root,
-            1 << 20,
             ExtractLimits::new(1, 1, 1 << 30, 1 << 20),
+            host_lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
         )
         .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::NotFound);
         let items = c.items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind().as_str(), "oci.layer.extract");
@@ -5408,6 +5504,95 @@ mod tests {
         }
     }
 
+    /// 別表記の whiteout・不透明マーカー検証用の下位レイヤー（`d/{x,sub/y}`・`café/z`・`keep`・`f`）。
+    fn alias_marker_lower() -> Vec<Vec<u8>> {
+        vec![
+            dir("d/", 0o755),
+            file("d/x", 0o644, b"x"),
+            file("d/sub/y", 0o644, b"y"),
+            dir("caf\u{e9}/", 0o755),
+            file("caf\u{e9}/z", 0o644, b"z"),
+            file("keep", 0o644, b"k"),
+            file("f", 0o644, b"F-lower"),
+        ]
+    }
+
+    /// 下位レイヤー（`alias_marker_lower`）の木がそのまま残っていることを具体値で確かめる。
+    fn assert_alias_marker_lower_intact(sb: &Sandbox, msg: &str) {
+        assert_eq!(
+            names_in(&sb.root),
+            vec!["caf\u{e9}", "d", "f", "keep"],
+            "{msg}"
+        );
+        assert_eq!(names_in(&sb.root.join("d")), vec!["sub", "x"], "{msg}");
+        assert_eq!(names_in(&sb.root.join("d/sub")), vec!["y"], "{msg}");
+        assert_eq!(names_in(&sb.root.join("caf\u{e9}")), vec!["z"], "{msg}");
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x", "{msg}");
+        assert_eq!(fs::read(sb.root.join("d/sub/y")).unwrap(), b"y", "{msg}");
+        assert_eq!(
+            fs::read(sb.root.join("caf\u{e9}/z")).unwrap(),
+            b"z",
+            "{msg}"
+        );
+        assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k", "{msg}");
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"F-lower", "{msg}");
+        sb.assert_outside_untouched();
+    }
+
+    /// IO-5・OCI-2: 区別しない FS（`folding_lstat` の模擬）で、上位レイヤーの whiteout（`.wh.<名前>`）・不透明
+    /// ディレクトリ（`.wh..wh..opq`）が、対象または親を別表記（大文字小文字・NFC / NFD）の名前で指すと、
+    /// 別表記の衝突として拒否される。名前は書き換えず（`F` を `f` と見なして消さない）、下位の木とルート外は
+    /// 変わらず、マーカー名も書かれない。有効なマーカーと混在させても、削除の前に全解決を済ませるため
+    /// 有効側も適用されない（パス 2 の解決の先行）。
+    #[test]
+    fn io5_oci2_stack_alias_markers_are_rejected_without_removal() {
+        let cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
+            ("wh-target-case", vec![wh(".wh.F")]),
+            ("wh-target-case-dir", vec![wh(".wh.D")]),
+            ("wh-target-nfd", vec![wh(".wh.cafe\u{301}")]),
+            ("wh-parent-case", vec![wh("D/.wh.x")]),
+            ("wh-parent-nfd", vec![wh("cafe\u{301}/.wh.z")]),
+            ("opq-parent-case", vec![wh("D/.wh..wh..opq")]),
+            ("opq-parent-nfd", vec![wh("cafe\u{301}/.wh..wh..opq")]),
+            ("valid-then-alias", vec![wh(".wh.keep"), wh("D/.wh.x")]),
+            ("alias-then-valid", vec![wh("D/.wh.x"), wh(".wh.keep")]),
+        ];
+        for (case, upper) in cases {
+            let sb = Sandbox::new();
+            let r = run_stack(&sb, &[alias_marker_lower(), upper], LIM(), folding_lstat);
+            assert_stack_spelling_collision(r);
+            assert_alias_marker_lower_intact(&sb, case);
+        }
+    }
+
+    /// IO-5・OCI-2: 上の拒否が模擬の過剰反応でないことの対照。同じ綴りのマーカーは効く。
+    #[test]
+    fn io5_oci2_stack_same_spelling_markers_still_apply() {
+        let sb = Sandbox::new();
+        run_stack(
+            &sb,
+            &[alias_marker_lower(), vec![wh(".wh.f")]],
+            LIM(),
+            folding_lstat,
+        )
+        .unwrap();
+        assert_eq!(names_in(&sb.root), vec!["caf\u{e9}", "d", "keep"]);
+        assert_eq!(fs::read(sb.root.join("d/x")).unwrap(), b"x");
+
+        let sb = Sandbox::new();
+        run_stack(
+            &sb,
+            &[alias_marker_lower(), vec![wh("d/.wh..wh..opq")]],
+            LIM(),
+            folding_lstat,
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(sb.root.join("d")).unwrap().is_dir());
+        assert!(names_in(&sb.root.join("d")).is_empty());
+        assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k");
+        sb.assert_outside_untouched();
+    }
+
     /// OCI-1: 上位レイヤーの `..` は既存どおり拒否され、ルート外へは何も書かれない。
     #[test]
     fn oci1_stack_upper_layer_traversal_is_rejected() {
@@ -5622,6 +5807,7 @@ mod tests {
             names: NameIndex::new(limits.max_tracked_paths),
             layer_nodes: HashSet::new(),
             lstat,
+            budget: ExtractBudget::new(),
         }
     }
 
@@ -7885,5 +8071,167 @@ mod tests {
             assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
             assert_eq!(e.message(), "an extraction path changed during extraction");
         }
+    }
+
+    // ---- 期限と取り消し（REPAIR-5・CRI-2・#2899） ----
+
+    thread_local! {
+        static CLOCK_BASE: Instant = Instant::now();
+        static CLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// 呼ぶたびに 1 秒進む試験用の時計（`ExtractBudget::with_clock` へ注入する）。
+    fn tick_clock() -> Instant {
+        let n = CLOCK_CALLS.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(n)
+    }
+
+    fn bounded(
+        sb: &Sandbox,
+        entries: &[Vec<u8>],
+        budget: &ExtractBudget<'_>,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        extract_layers_bounded(
+            &NoopOciOpRecorder,
+            [Cursor::new(archive(entries))],
+            &sb.root,
+            LIM(),
+            &ExtractOptions::new(),
+            budget,
+        )
+    }
+
+    /// REPAIR-5: 期限がすでに過ぎていれば、最初のエントリより前に止まり rootfs を変えない。
+    #[test]
+    fn repair5_extract_deadline_elapsed_before_first_entry() {
+        let sb = Sandbox::new();
+        let budget = ExtractBudget::new().with_deadline(Instant::now());
+        let e = bounded(&sb, &[file("a", 0o644, b"A")], &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction exceeded its deadline");
+        assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+        sb.assert_outside_untouched();
+    }
+
+    /// REPAIR-5: 期限はパス 3 のエントリごとに確かめる。3 件目の書き込みの前で止まり、先の 2 件は残る
+    /// （契約: 呼び出し側が root ごと破棄する）。`remove_extracted_tree` で消えることも確かめる。
+    #[test]
+    fn repair5_extract_deadline_checked_per_entry() {
+        let sb = Sandbox::new();
+        CLOCK_CALLS.with(|c| c.set(0));
+        // 呼び出し 0 = レイヤー前、1..=5 = パス 1 の 5 エントリ、6.. = パス 3。8 回目の呼び出し（3 件目）で期限。
+        let budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(8))
+            .with_clock(&tick_clock);
+        let entries = [
+            file("a", 0o644, b"A"),
+            file("b", 0o644, b"B"),
+            file("c", 0o644, b"C"),
+            file("d", 0o644, b"D"),
+            file("e", 0o644, b"E"),
+        ];
+        let e = bounded(&sb, &entries, &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction exceeded its deadline");
+        let mut names: Vec<_> = fs::read_dir(&sb.root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        remove_extracted_tree(&sb.root).unwrap();
+        assert!(!sb.root.exists());
+    }
+
+    /// REPAIR-5: 取り消しの旗が立っていれば最初の確認で止まる。
+    #[test]
+    fn repair5_extract_cancel_flag_stops_at_first_check() {
+        let sb = Sandbox::new();
+        let flag = AtomicBool::new(true);
+        let budget = ExtractBudget::new().with_cancel(&flag);
+        let e = bounded(&sb, &[file("a", 0o644, b"A")], &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "layer extraction was cancelled");
+        assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+    }
+
+    /// REPAIR-5: 空の予算は従来の入口と同じ結果になる。
+    #[test]
+    fn repair5_extract_empty_budget_matches_unbounded() {
+        let sb1 = Sandbox::new();
+        let sb2 = Sandbox::new();
+        let entries = [dir("d", 0o755), file("d/f", 0o644, b"F")];
+        let a = bounded(&sb1, &entries, &ExtractBudget::new()).unwrap();
+        let b = extract_layers([Cursor::new(archive(&entries))], &sb2.root, LIM()).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].entries, b[0].entries);
+        assert_eq!(fs::read(sb1.root.join("d/f")).unwrap(), b"F");
+    }
+
+    /// 削除用の木（`n` 個のファイルを持つ 2 階層）を作る。
+    fn removal_tree(sb: &Sandbox, n: usize) -> PathBuf {
+        let t = sb.root.join("t");
+        fs::create_dir_all(t.join("d")).unwrap();
+        for i in 0..n {
+            fs::write(t.join("d").join(format!("f{i}")), b"x").unwrap();
+        }
+        t
+    }
+
+    /// OCI-7・REPAIR-5・#3142: 取り消しの旗が立っていれば何も消さずに `Timeout`、旗を下ろした再実行で消え切る。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_stops_on_cancel() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 3);
+        let flag = AtomicBool::new(true);
+        let e = remove_extracted_tree_bounded(&t, &ExtractBudget::new().with_cancel(&flag))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "tree removal was cancelled");
+        assert_eq!(fs::read_dir(t.join("d")).unwrap().count(), 3);
+        flag.store(false, AtomicOrdering::Release);
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new().with_cancel(&flag)).unwrap();
+        assert!(!t.exists());
+    }
+
+    /// OCI-7・REPAIR-5・#3142: 期限は途中で切れ、木の一部が残る。期限なしの再実行（冪等）が続きから消し切る。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_stops_at_deadline_and_resumes() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 10);
+        CLOCK_CALLS.with(|c| c.set(0));
+        // 確認回数は OS ごとの実装（Linux の fd 起点の走査と非 Linux の whiteout 経路）で異なる。
+        // どちらでも木の 12 エントリ（t・d・ファイル 10 個）より十分手前の 4 回目の確認で期限になる値にする。
+        let budget = ExtractBudget::new()
+            .with_deadline(CLOCK_BASE.with(|b| *b) + std::time::Duration::from_secs(4))
+            .with_clock(&tick_clock);
+        let e = remove_extracted_tree_bounded(&t, &budget).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        assert_eq!(e.message(), "tree removal exceeded its deadline");
+        assert!(t.exists());
+        let left = fs::read_dir(t.join("d")).unwrap().count();
+        assert!(left > 0 && left <= 10, "left={left}");
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new()).unwrap();
+        assert!(!t.exists());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-7・SEC-5・#3142: 予算つきでも差し替えられた symlink は追従せず、外を消さない。
+    #[test]
+    fn oci7_repair5_3142_bounded_removal_keeps_symlink_untouched_outside() {
+        let sb = Sandbox::new();
+        let t = removal_tree(&sb, 1);
+        let out = sb.root.join("outside_target");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("keep"), b"k").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&out, t.join("lnk")).unwrap();
+        remove_extracted_tree_bounded(&t, &ExtractBudget::new()).unwrap();
+        assert!(!t.exists());
+        assert_eq!(fs::read(out.join("keep")).unwrap(), b"k");
     }
 }

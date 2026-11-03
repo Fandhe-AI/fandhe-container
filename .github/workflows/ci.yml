@@ -62,6 +62,27 @@ on:
           - step-timeout
           - script-deadline
         default: none
+      scope-hang-probe:
+        description: >-
+          platform-ci（ubuntu）の委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5）。
+          scope-orphan-pipe = 現行の形（systemd-run | tee）で孫が出力の書き込み端を持ったまま残る /
+          scope-orphan-devnull = 同じだが孫の fd を /dev/null へ（早く戻れば原因は fd の保持）/
+          noscope-orphan-pipe = scope なしの同じ注入 / scope-main-hang = scope 内の主プロセスが眠る /
+          helper = scripts/run-in-user-scope.sh（期限 60 秒）で期限内に deadline_exceeded で失敗することの実証 /
+          helper-noscope = scripts/run-with-deadline.sh（scope を作らない版・#3505。期限 60 秒）の同じ実証。
+          どのプローブ step も必ず失敗で終わる（結果の証拠は job の時刻とログ）。ref ごとに dispatch する。
+          プローブのステップは Linux の leg だけで実行する（macOS・Windows の leg は通常どおり 3 OS で回る・#3556）。
+          PR・push では存在しない（none 相当）
+        type: choice
+        options:
+          - none
+          - scope-orphan-pipe
+          - scope-orphan-devnull
+          - noscope-orphan-pipe
+          - scope-main-hang
+          - helper
+          - helper-noscope
+        default: none
       repeat-package:
         description: >-
           repeat-test と組で指定する Cargo パッケージ名（例: fandhe-container-supervisor）。間欠失敗の修正後に
@@ -76,12 +97,26 @@ on:
       repeat-test-bin:
         description: >-
           繰り返す harness = false の結合試験の名前（[[test]] の name。例 exec_seccomp_listener）。
-          repeat-test と排他で、repeat-success-line が必須（REPAIR-12・#2660）
+          repeat-test と排他で、repeat-success-line か repeat-libtest-name のどちらか一方が必須（REPAIR-12・#2660・#2962）
         type: string
         default: ''
       repeat-success-line:
         description: >-
-          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）
+          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）。
+          harness = false の試験用で、repeat-libtest-name と排他
+        type: string
+        default: ''
+      repeat-libtest-name:
+        description: >-
+          repeat-test-bin が libtest ハーネスのとき、ハーネス内の試験名（`--exact` で単独の試験へ絞り、
+          libtest の --logfile がちょうど 1 行の `ok <名前>` であることで判定し、
+          並列出力の行の割り込みを受けない。repeat-success-line と排他。REPAIR-12・#2962）
+        type: string
+        default: ''
+      repeat-forbidden-line:
+        description: >-
+          出たら失敗にする固定文字列（`|` 区切り・8 個以下・部分一致）。成功行が出ていても当たった回は失敗に数える
+          （REPAIR-12・#2962）
         type: string
         default: ''
       repeat-test-ignored:
@@ -94,6 +129,45 @@ on:
           試験用。既定 false は 3 OS）
         type: boolean
         default: false
+      repeat-os:
+        description: >-
+          繰り返しのステップを回す OS（既定 all は 3 OS）。cfg で Windows が対象外の試験は Windows 以外を選ぶ
+          （0 件実行で赤になるため。REPAIR-12・PLUG-12・#2768）。PR・push では存在しない
+        type: choice
+        options:
+          - all
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        default: all
+      repeat-features:
+        description: >-
+          繰り返す試験に渡す cargo の feature 名（カンマ区切り。既定 feature で有効にならない lib 試験用。
+          例 grpc。REPAIR-12・#2711）
+        type: string
+        default: ''
+      repeat-user-scope:
+        description: >-
+          true にすると repeat-test-bin を委譲スコープ（systemd-run --user --scope -p Delegate=yes）の中で直接
+          実行する（Linux 限定。cargo を cgroup に入れると失敗する production_launcher 等用。#2886）。繰り返しのステップは
+          Linux の leg だけで実行し、macOS・Windows の leg は通常どおり 3 OS で回る（#3571）
+        type: boolean
+        default: false
+      repeat-env:
+        description: >-
+          繰り返す試験の子プロセスにだけ渡す環境変数（FANDHE_CONTAINER_* の NAME=VALUE の空白区切り。
+          例 FANDHE_CONTAINER_TEST_ID_HELPER=1。#2886）
+        type: string
+        default: ''
+      repeat-run-timeout:
+        description: >-
+          repeat-user-scope=true のときの 1 回あたりの上限秒（1〜3600。既定 600。production_launcher は 1 回に
+          CI 上で最大 10 分の予算を使うため、既定の 120 秒では reason=timeout で打ち切られる。#2886）。
+          ステップ全体は 55 分で打ち切られる（ジョブ上限は repeat-user-scope の dispatch の ubuntu が 90 分。
+          ステップの開始はジョブ開始から約 20〜25 分。#3528）ため、遅い試験は repeat-count × 1 回の所要秒が
+          ビルド秒を除く 55 分に収まるよう repeat-count を分けて dispatch する
+        type: string
+        default: '600'
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -179,8 +253,9 @@ jobs:
   # deny ジョブ（REPAIR-7 ステージ 5: セキュリティチェック・依存監査。TASK-86.4・#38）は
   # 次の 4 種を `make deny` と同一集合で実行する。
   #   - advisories: RUSTSEC アドバイザリ（脆弱・unmaintained・unsound・yanked。REPAIR-9）
-  #   - bans: wildcards 等の禁止設定（rust-vmm 系クレートの禁止リストは MVM-4・
-  #     TASK-73 で deny.toml の [bans] へ追記予定。本 PR では追記しない）
+  #   - bans: wildcards・ring/cc/aws-lc-rs（#1779）に加え、rust-vmm 系の禁止 10 種（MVM-4・TASK-73.2）を
+  #     deny.toml の [bans] で検出する。一覧の正は check-microvm-deps.sh --list で、一致と検出力は
+  #     platform-ci の bans fail-closed 自己テストが照合する
   #   - licenses: 許可ライセンス外の依存を検出（OSS-4・OSS-5）
   #   - sources: crates.io 以外のレジストリ / git 依存を拒否
   # 「禁止 API リント」（REPAIR-7 ステージ 5 のもう一方の観点）は対応する TASK が
@@ -300,7 +375,7 @@ jobs:
   # `cargo metadata` + jq で件数を数え、0 件なら notice を出して成功で終える
   # （無言の skip にはしない）。jq の失敗は fail-closed で扱う。
   #
-  # タイムアウトは二段構え: ジョブ全体 60 分（統合前の 2 ジョブ各 30 分の合計に見合う
+  # タイムアウトは二段構え: ジョブ全体 60 分（ubuntu は 35 分。#3505。下の timeout-minutes 参照。
   # 多層防御）、実行ステップ 10 分（ハング検出の本体）。テスト 1 件ごとの推奨タイムアウト値
   # （PoC-8 実測に基づく 5〜10 秒のレンジ）は TASK-87.1（#40）で
   # FANDHE_CONTAINER_TEST_TIMEOUT_SECS（下記 env）として設定済み。main の 3 OS 実行
@@ -396,9 +471,33 @@ jobs:
           && '["ubuntu-latest"]'
           || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
-    # ハングしたジョブの無期限実行を防ぐ多層防御（統合前の 2 ジョブ各 30 分の合計に見合う値）。
-    # 実測（2026-10-10 時点）は統合前の 2 ジョブの合計で ubuntu 約 8 分・macOS 約 6 分
-    timeout-minutes: 60
+    # ハングしたジョブの無期限実行を防ぐ多層防御。ubuntu は 35 分、macOS・Windows は 60 分（#3505）。
+    # ubuntu ではランナー VM ごと止まる間欠事象があり、止まるとステップの timeout-minutes が効かず
+    # ジョブ上限まで動き続けて PR の CI を詰まらせるため、ubuntu だけ上限を下げる。成功した ubuntu の
+    # ジョブは 20〜26 分（2026-10-30 時点の直近 110 件）で、35 分なら約 9 分の余裕がある。
+    # 例外として、workflow_dispatch で繰り返し（repeat-test・repeat-test-bin・repeat-user-scope）か
+    # ハングプローブ（hang-probe・reclaim-hang-probe・scope-hang-probe）を指定したときは ubuntu も 60 分を
+    # 保つ（プローブは止まり方の観測が従来の上限を前提にするため）。
+    # 委譲スコープの繰り返し（repeat-user-scope）の ubuntu だけは 90 分にする（#3528）。そのステップは
+    # ジョブ開始から 19.8〜24.2 分後（2026-10-30 時点の直近 15 件）に始まり 55 分の上限を持つため、
+    # 60 分では 55 分の上限より先にジョブが取り消され、reason=timeout や集計行が残らなかった。
+    # 守る関係: ステップ上限 55 分 <= ジョブ上限 90 分 - 開始までの最大経過 約 25 分 - 余裕 約 10 分。
+    # 前段のステップを飛ばして開始を早める案は、約 60 ステップに条件を足す差分が大きいため採らない。
+    # 通常の繰り返し（30 分）は約 11 分で始まるため 60 分で足りる。ランナーを長く占有する代償は、
+    # 明示した手動 dispatch の ubuntu の leg に閉じる。
+    # job の timeout-minutes では runner コンテキストを使えないため matrix.os で判定する。inputs は
+    # workflow_dispatch 以外で null になり `null != 'none'` が真になるため、github.event_name で先に絞る。
+    # 代償: ubuntu の最後の container_grpc のステップ（開始は約 21〜25 分、試験の watchdog 各 900 秒、
+    # 補助の期限 1860 秒）がハングすると、watchdog・補助より先にジョブの上限で取り消される
+    timeout-minutes: >-
+      ${{ matrix.os == 'ubuntu-latest'
+      && github.event_name == 'workflow_dispatch' && inputs.repeat-user-scope
+      && 90
+      || (matrix.os == 'ubuntu-latest'
+      && !(github.event_name == 'workflow_dispatch'
+      && (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope
+      || inputs.hang-probe || inputs.reclaim-hang-probe != 'none' || inputs.scope-hang-probe != 'none'))
+      && 35 || 60) }}
     permissions:
       contents: read
     defaults:
@@ -415,6 +514,7 @@ jobs:
       HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.hang-probe == true }}
       # #1688: choice 入力も env 経由で受け渡す（run: へ ${{ }} を埋め込まない。HANG_PROBE と同じ対策）
       RECLAIM_HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.reclaim-hang-probe || 'none' }}
+      SCOPE_HANG_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope-hang-probe || 'none' }}
       # 個別テスト 1 件ごとの推奨タイムアウト値（秒。PoC-8 実測に基づく
       # 5〜10 秒のレンジの上限寄り。TASK-87.1・#40・REPAIR-5）。この値を読んで
       # 使う消費側は `crates/io/tests/responsiveness.rs` と
@@ -499,6 +599,7 @@ jobs:
       # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
       # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
+        if: env.HANG_PROBE != 'true'
         shell: bash
         timeout-minutes: 10
         run: make doc
@@ -506,30 +607,87 @@ jobs:
       # repeat-test は lib 試験、repeat-test-bin + repeat-success-line は harness = false の結合試験。
       # repeat-linux-only=true のときは Linux だけで回す（非 Linux で not applicable になる試験用）。
       # 入力は env 経由で渡し、run 内で式を展開しない（スクリプトインジェクション対策）。既存ジョブのステップ
+      # repeat-os で OS を 1 つに選べる（既定 all）。repeat-linux-only=true と Linux 以外の repeat-os の組は
+      # どの leg でも何も走らず緑になるため、直前のステップで矛盾を検出して失敗させる（#2768）。
+      - name: 繰り返し入力の整合確認（workflow_dispatch のみ）
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '' || inputs.repeat-user-scope) &&
+          matrix.os == 'ubuntu-latest'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          LINUX_ONLY: ${{ inputs.repeat-linux-only && '1' || '' }}
+          REPEAT_OS: ${{ inputs.repeat-os }}
+          USER_SCOPE: ${{ inputs.repeat-user-scope && '1' || '' }}
+          LIB_TEST: ${{ inputs.repeat-test }}
+          TEST_BIN_IN: ${{ inputs.repeat-test-bin }}
+        run: |
+          if [ -n "${LINUX_ONLY}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
+            echo "::error::repeat-linux-only=true conflicts with repeat-os=${REPEAT_OS} (nothing would run)" >&2
+            exit 1
+          fi
+          # repeat-user-scope は Linux の結合試験（repeat-test-bin）専用。lib 試験との併用、Linux 以外の OS だけの指定は
+          # どの leg でも走らず緑になるため失敗にする（#2886）。
+          if [ -n "${USER_SCOPE}" ] && [ -n "${LIB_TEST}" ]; then
+            echo "::error::repeat-user-scope=true cannot be combined with repeat-test (use repeat-test-bin)" >&2
+            exit 1
+          fi
+          if [ -n "${USER_SCOPE}" ] && [ -z "${TEST_BIN_IN}" ]; then
+            echo "::error::repeat-user-scope=true requires repeat-test-bin (nothing would run)" >&2
+            exit 1
+          fi
+          if [ -n "${USER_SCOPE}" ] && [ "${REPEAT_OS}" != "all" ] && [ "${REPEAT_OS}" != "ubuntu-latest" ]; then
+            echo "::error::repeat-user-scope=true conflicts with repeat-os=${REPEAT_OS} (Linux only)" >&2
+            exit 1
+          fi
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
         if: >-
           github.event_name == 'workflow_dispatch' &&
           (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
-          (!inputs.repeat-linux-only || runner.os == 'Linux')
+          !inputs.repeat-user-scope &&
+          (!inputs.repeat-linux-only || runner.os == 'Linux') &&
+          (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
         shell: bash
         timeout-minutes: 30
         env:
+          TEST_ENV: ${{ inputs.repeat-env }}
           PACKAGE: ${{ inputs.repeat-package }}
           TEST: ${{ inputs.repeat-test }}
           TEST_BIN: ${{ inputs.repeat-test-bin }}
           SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
+          FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
           TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
+          FEATURES: ${{ inputs.repeat-features }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test
+      # 上の cargo doc と下の 2 ステップは、hang-probe 時にハング検出のステップへ早く着くよう check-launch-target・
+      # 自己テスト群と同じく HANG_PROBE で飛ばす（ステージ 1・2 の build / clippy / test は従来どおり無条件。#2533）。
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
       # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
       - name: core plugin 無効構成の検証
+        if: env.HANG_PROBE != 'true'
         shell: bash
         run: make test-core-no-plugin
+      # CLI の plugin 無効構成（--no-default-features）の clippy と plugin 依存なしの検証（PLUG-3・#3204）。
+      # main では 3 OS で cfg 分岐をネイティブに見る。既存ジョブへのステップ追加（check-run 件数は不変）
+      - name: cli plugin 無効構成の検証
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        shell: bash
+        run: make check-cli-no-plugin
       # CLI がバックエンド実装 crate へ直接依存しない（CLI-1・PLUG-4・TASK-79.4）。既存ジョブへのステップ追加
       - name: cli のバックエンド直接依存なしの検証
+        if: env.HANG_PROBE != 'true'
         shell: bash
         run: make check-cli-backend-deps
+      # rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）。既存ジョブへのステップ追加（check-run 件数は不変）
+      - name: rust-vmm 系禁止クレートの混入なしの検証（MVM-4・TASK-73.1）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        shell: bash
+        run: make check-microvm-deps
       # plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけであることの
       # 機械判定（PLUG-11・#1857）。cargo を使わないソースの走査。既存ジョブへのステップ追加（check-run 件数は不変）
       - name: plugin 起動対象の構築箇所の検証（PLUG-11・#1857）
@@ -589,6 +747,14 @@ jobs:
         shell: bash
         timeout-minutes: 5
         run: make deny-license-fail-closed-selftest
+
+      # bans の判定も OS に依らず、cargo-deny の導入を 3 回払わないため ubuntu のみ。
+      # 既存ジョブへのステップ追加のため check-run 名は増えない。
+      - name: deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（MVM-4・REPAIR-9・TASK-73.2。ubuntu のみ）
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 5
+        run: make deny-bans-fail-closed-selftest
 
       # サードパーティのライセンス表記の生成（TASK-103.2・OSS-5）。about.toml が 5 ターゲットを固定する
       # ため生成結果は実行 OS に依らず、cargo-about の導入ビルドを 3 回払わないよう ubuntu のみで実行する。
@@ -730,6 +896,54 @@ jobs:
           echo "reclaim hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
           exit 1
 
+      # 委譲スコープ実行ステップのハング注入プローブ（#3486・REPAIR-5。workflow_dispatch の scope-hang-probe 指定時のみ）。
+      # 旧い実機前提ステップの形（systemd-run --user --scope ... | tee）に、孫が出力を持って残る等のハングを注入し、
+      # timeout-minutes が効くか・原因がどれか（fd の保持 / scope / 主プロセス）を切り分ける。helper は対策後の形が
+      # 期限内に失敗することの実証。戻った場合も false-green を防ぐため exit 1。新ジョブにしない（check-run 件数は不変）
+      - name: 委譲スコープ実行のハングプローブ（#3486。workflow_dispatch の scope-hang-probe 指定時のみ）
+        if: env.SCOPE_HANG_PROBE != 'none' && runner.os == 'Linux'
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          orphan='setsid sleep 3600 & exit 0'
+          sr="systemd-run --user --scope --quiet -p Delegate=yes"
+          pl="${RUNNER_TEMP}/scope-probe.log"
+          orphan_null='setsid sleep 3600 >/dev/null 2>&1 </dev/null & exit 0'
+          case "${SCOPE_HANG_PROBE}" in
+            scope-orphan-pipe)
+              ${sr} -- bash -c "${orphan}" 2>&1 | tee "${pl}"
+              ;;
+            scope-orphan-devnull)
+              ${sr} -- bash -c "${orphan_null}" 2>&1 | tee "${pl}"
+              ;;
+            noscope-orphan-pipe)
+              bash -c "${orphan}" 2>&1 | tee "${pl}"
+              ;;
+            scope-main-hang)
+              ${sr} -- sleep 3600 2>&1 | tee "${pl}"
+              ;;
+            helper)
+              scripts/run-in-user-scope.sh --name probe --deadline 60 --log "${RUNNER_TEMP}/scope-probe.log" -- \
+                bash -c 'setsid sleep 3600 & sleep 3600' 2>&1 | tee "${RUNNER_TEMP}/scope-probe-out.log"
+              if grep -q 'code=deadline_exceeded' "${RUNNER_TEMP}/scope-probe-out.log"; then
+                echo "::notice::scope probe: helper deadline fired (expected)"
+              fi
+              ;;
+            helper-noscope)
+              scripts/run-with-deadline.sh --name probe --deadline 60 --log "${RUNNER_TEMP}/scope-probe.log" -- \
+                bash -c 'setsid sleep 3600 & sleep 3600' 2>&1 | tee "${RUNNER_TEMP}/scope-probe-out.log"
+              if grep -q 'code=deadline_exceeded' "${RUNNER_TEMP}/scope-probe-out.log"; then
+                echo "::notice::scope probe: no-scope helper deadline fired (expected)"
+              fi
+              ;;
+            *)
+              echo "invalid scope-hang-probe: ${SCOPE_HANG_PROBE}" >&2
+              exit 1
+              ;;
+          esac
+          echo "scope hang probe returned (the probe is expected to fail by timeout or deadline)" >&2
+          exit 1
+
       - name: 結合試験の実行（ステージ 3・タイムアウト保護。REPAIR-5 / REPAIR-7）
         timeout-minutes: 10
         env:
@@ -742,7 +956,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${HANG_PROBE}" = "true" ]; then
-            cargo test --manifest-path "${RUNNER_TEMP}/hang-probe/Cargo.toml"
+            # プローブの目的は「ステップの timeout-minutes で止まる」ことの実証のため、試験バイナリ単位の
+            # watchdog（.cargo/config.toml の runner。#3504）は外す。
+            FANDHE_CONTAINER_TEST_BIN_DEADLINE_SECS=off \
+              cargo test --manifest-path "${RUNNER_TEMP}/hang-probe/Cargo.toml"
             echo "hang probe test returned without timing out" >&2
             exit 1
           fi
@@ -794,8 +1011,35 @@ jobs:
       # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（check-run 件数は不変）
       - name: CLI 3 OS 比較スクリプトの自己テスト（TASK-125.1・CLI-1。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
-        timeout-minutes: 5
-        run: make cli-parity-selftest
+        # 本ステップだけ timeout-minutes 10（他の自己テストは 5。#3238）。Windows の Git Bash はプロセス生成が遅く、
+        # 実測は 2:25〜5:08（最悪 5:08 で timeout 5 を超過）。10 分なら最悪値でも上限比 51%。ジョブ上限（Windows は 60 分）の範囲内
+        # #3378・#3399 の後の main の Windows は 149〜152 秒（上限比 25%。件数 92。#3378 単体は 76 秒・件数 84）。
+        # 監視の刻みの変更（Phase B）は未決定（3 OS の dispatch 実測は #3502 で採り #3299・#3481 に記録。採否は #3481 で決める）。
+        # 同じ実測で、変更前の Windows は 110〜152 秒の 2 群に分かれた（原因は未特定。#3502）
+        timeout-minutes: 10
+        run: |
+          date +%s > "$RUNNER_TEMP/cli-parity-selftest.start"
+          make cli-parity-selftest
+
+      # 上の自己テストの所要時間と上限（600 秒）との比を Step Summary に残し、余裕を可視化する（#3238）。
+      # 70% 超は警告のみ（失敗にしない。超過そのものは本体ステップが落とす）。値は整数と OS 名だけ
+      - name: CLI 3 OS 比較スクリプトの自己テストの所要時間（#3238）
+        if: always() && env.HANG_PROBE != 'true'
+        timeout-minutes: 1
+        run: |
+          f="$RUNNER_TEMP/cli-parity-selftest.start"
+          if [ ! -f "$f" ]; then
+            echo "cli-parity-selftest duration: not run on $RUNNER_OS" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          elapsed=$(( $(date +%s) - $(cat "$f") ))
+          limit=600
+          ratio=$(( elapsed * 100 / limit ))
+          msg="os=$RUNNER_OS elapsed=${elapsed}s limit=${limit}s ratio=${ratio}%"
+          echo "cli-parity-selftest duration: $msg" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ratio" -gt 70 ]; then
+            echo "::warning::cli-parity-selftest took ${ratio}% of its timeout on $RUNNER_OS"
+          fi
 
       # capture のタイムアウトでネイティブ exe の子孫が回収されるかの実測（#1548・TASK-125・CLI-1・REPAIR-5）。
       # ログの `cli-parity native reclaim:` 行が Windows での確認結果。既存ジョブのステップ（check-run 件数は不変）。
@@ -847,6 +1091,14 @@ jobs:
         timeout-minutes: 5
         run: make guest-initrd-build-selftest
 
+      # /dev/fd/N 経由の権限検査の観測スクリプト（scripts/probe-dev-fd-perm.sh）の自己テスト（#2088・MAC-1・REPAIR-12）。
+      # 一時ファイルだけを使う。macOS では観測値を assert せず形式だけ照合し、ログが一次データになる。
+      # 新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）
+      - name: /dev/fd 権限検査の観測スクリプトの自己テスト（#2088・MAC-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make dev-fd-perm-probe-selftest
+
       # commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh）の自己テスト
       # （Issue #1295・REPAIR-12）。一時ファイルと一時 git リポジトリだけを使い、ネットワーク・secrets・
       # `${{ }}` の埋め込みは使わない。フックは開発者の macOS（BSD tr / awk）・Windows（Git Bash）でも
@@ -873,6 +1125,15 @@ jobs:
         timeout-minutes: 5
         run: make lib-selftest
 
+      # mac_small_files.sh の自己テストを macOS で回す（#3104・MAC-3・REPAIR-12）。macOS 標準の /bin/bash 3.2 でも
+      # 全ケースを回し、PATH の perl（Homebrew 版のことがある）とは別に /usr/bin/perl の経路も回すのが目的（#3354。
+      # ubuntu は bench-regression で実行済み。Windows は macOS の Docker Desktop 向けの
+      # 計測で対象外）。スタブの docker と一時ディレクトリだけを使う。既存ジョブのステップ（check-run 件数は不変）
+      - name: mac-small-files 自己テスト（/bin/bash 3.2 と /usr/bin/perl を含む。#3104・#3354・MAC-3・REPAIR-12。macos）
+        if: env.HANG_PROBE != 'true' && runner.os == 'macOS'
+        timeout-minutes: 10
+        run: make mac-small-files-selftest
+
       # plugin 起動対象の構築箇所の判定スクリプトの自己テスト（#1857・REPAIR-12）。fixture の一時ツリーだけを使い、
       # BSD と Windows のシェルでのツール差（awk・find・grep）を確かめるため 3 OS で回す。
       # 既存ジョブのステップ（check-run 件数は不変）
@@ -888,12 +1149,51 @@ jobs:
         timeout-minutes: 5
         run: make check-standalone-clippy-selftest
 
+      # 禁止クレート判定の自己テスト（MVM-4・TASK-73.1・REPAIR-12）。スタブの cargo のみ。既存ジョブのステップ
+      - name: 禁止クレート判定の自己テスト（MVM-4・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-microvm-deps-selftest
+
       # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）
       - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・REPAIR-12。ubuntu・macos・windows）
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make repeat-test-selftest
+
+      # scope を作らない期限つき実行補助の自己テスト（#3505・REPAIR-5・REPAIR-12）。実プロセスのみ（setsid を使うため Linux のみ）。
+      - name: 期限つき実行補助の自己テスト（#3505。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make run-with-deadline-selftest
+
+      # 委譲スコープ実行補助の自己テスト（#3486・REPAIR-5・REPAIR-12）。スタブの systemd-run / systemctl のみ。
+      # Linux のステップからしか呼ばれない補助（systemd の user manager 専用・setsid 使用）のため ubuntu のみ。
+      - name: 委譲スコープ実行補助の自己テスト（#3486。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make run-in-user-scope-selftest
+
+      # cargo の runner（.cargo/config.toml）に入れた試験バイナリ単位の watchdog の自己テスト（#3504・REPAIR-5・REPAIR-7）。
+      # 期限切れ・正常終了・終了コードとシグナルの透過。スタブの子のみ。既存ジョブのステップ（check-run 件数は不変）
+      - name: 試験バイナリ watchdog の自己テスト（#3504。ubuntu のみ）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make test-bin-watchdog-selftest
+
+      # 実機前提テストの成功行照合スクリプト（試験ソースから期待行を導出してログと双方向照合。#2768・REPAIR-12）の
+      # 自己テスト。fixture のみ。既存ジョブのステップ（check-run 件数は不変）
+      - name: 成功行照合スクリプトの自己テスト（#2768・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-success-lines-selftest
+
+      # Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818）。スタブの curl のみ。既存ジョブのステップ
+      - name: Docker Hub 残量プローブの自己テスト（#2818・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make docker-hub-ratelimit-probe-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -923,19 +1223,14 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/unshare_isolation.log"
-          cargo test -p fandhe-container-core --test unshare_isolation -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'unshare_isolation: full isolation verified (root=false)' "${log}"; then
-            echo "::error::unshare_isolation did not report full isolation (possibly not executed)" >&2
-            exit 1
-          fi
-          sub_line='^unshare_isolation: subordinate isolation kept the caller non-dumpable \(samples=[0-9]+\)$'
-          if ! grep -Eq "${sub_line}" "${log}"; then
-            echo "::error::unshare_isolation did not report the non-dumpable subordinate check" >&2
-            exit 1
-          fi
-          echo "unshare_isolation: full isolation verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "unshare_isolation: subordinate isolation kept the caller non-dumpable" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::unshare_isolation verified"
+          scripts/run-with-deadline.sh --name unshare_isolation --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test unshare_isolation -- --ignored
+          # 期待行は試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
+          scripts/check-success-lines.sh --name unshare_isolation --src crates/core/tests/unshare_isolation.rs \
+            --log "${log}" \
+            --select '^unshare_isolation: (full isolation verified|subordinate isolation kept)' \
+            --subst is_root=false --subst-re 'samples=[0-9]+' --min 2 \
+            --forbid 'unshare_isolation: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
       # exec_setns_join（`crates/supervisor/tests/exec_setns_join.rs`。SUP-6・TASK-163.1・#500）:
       # 実 pid1 の 5 種 namespace への setns 参加を検証する実機前提テスト。unshare_isolation と同じ理由で
@@ -954,22 +1249,23 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/exec_setns_join.log"
-          cargo test -p fandhe-container-supervisor --features exec-test-support \
-            --test exec_setns_join -- --ignored 2>&1 | tee "${log}"
-          # 最後の成功行だけでなく、各シナリオの成功行をすべて照合する（シナリオが黙って外れた場合を
-          # 成功にしない。TASK-163 追補・#1460）。
-          for line in \
-            'exec_setns_join: rootless join into the target user namespace verified' \
-            'exec_setns_join: root after joining a pivoted target equals the pinned rootfs' \
-            'exec_setns_join: root after joining a mount-namespace-built rootfs equals the recorded root' \
-            'exec_setns_join: supplementary groups kept and recorded where setgroups is denied' \
-            'exec_setns_join: namespace join verified'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::exec_setns_join did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
+          # 範囲写像の対象への非 root の process.user と additionalGids の場面（#2770・SEC-5・CORE-6）は、uidmap と
+          # /etc/subuid・/etc/subgid の自ユーザー行を要するため FANDHE_CONTAINER_TEST_ID_HELPER=1 を付ける
+          # （前提は production_launcher の準備ステップが fail-closed に確認済み）。
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name exec_setns_join --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-supervisor --features exec-test-support \
+              --test exec_setns_join -- --ignored
+          # 各シナリオの成功行を試験ソースから導出して双方向に照合する（シナリオが黙って外れた場合を成功にしない。
+          # TASK-163 追補・#1460。共通スクリプト化は #2825・REPAIR-12）。
+          scn='supplementary groups|exec user|namespace join'
+          scripts/check-success-lines.sh --name exec_setns_join --src crates/supervisor/tests/exec_setns_join.rs \
+            --log "${log}" \
+            --select "^exec_setns_join: (rootless join|root after joining|${scn})" \
+            --min 6 \
+            --forbid 'exec_setns_join: ignored' --forbid 'subordinate id case not requested' \
+            --forbid 'exec_setns_join: not verified' --forbid 'PRECONDITION FAILED' \
+            --forbid 'not applicable' --summary
 
       # exec（`crates/supervisor/tests/exec.rs`。SUP-6・TASK-163.4・#503）: 稼働中コンテナへの setns・cgroup join・
       # 制限の再適用・execve の通し結合試験。rootful の pivot_root と cgroup v2 の書き込みに root が必要で、
@@ -982,7 +1278,7 @@ jobs:
       # container_options_ipc（`crates/supervisor/tests/container_options_ipc.rs`。SUP-12・TASK-169.3・#528）:
       # `--ipc=host` / `shareable` の IPC namespace 共有・分離を検証する実機前提テスト（harness = false）。
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・
-      # permissions は追加しない。`--ignored` が届かなくても exit 0 になるため成功行を grep で照合する。
+      # permissions は追加しない。`--ignored` が届かなくても exit 0 になるため成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: container_options_ipc のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-supervisor --test container_options_ipc --no-run
@@ -993,13 +1289,12 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/container_options_ipc.log"
-          cargo test -p fandhe-container-supervisor --test container_options_ipc -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'container_options_ipc: host shared / shareable isolated verified (root=false)' "${log}"; then
-            echo "::error::container_options_ipc did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
-          echo "container_options_ipc: host shared / shareable isolated verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::container_options_ipc verified"
+          scripts/run-with-deadline.sh --name container_options_ipc --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-supervisor --test container_options_ipc -- --ignored
+          scripts/check-success-lines.sh --name container_options_ipc \
+            --src crates/supervisor/tests/container_options_ipc.rs --log "${log}" \
+            --select '^container_options_ipc: host shared' --subst-pos false \
+            --forbid 'container_options_ipc: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
       # tmpfs_mount（`crates/core/tests/tmpfs_mount.rs`。SUP-12・TASK-169.2・#527）:
       # `--shm-size` / `--tmpfs` の実マウント（新マウント API: `fsopen`・`fsconfig`・`fsmount`・`move_mount`。
@@ -1007,7 +1302,7 @@ jobs:
       # `ro,exec` の実フラグ・サイズ未指定のマウントを検証する実機前提テスト（harness = false）。
       # unshare_isolation と同じく Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・sudo・
       # permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。`--ignored` が届かなくても
-      # exit 0 になるため成功行を grep で照合する。
+      # exit 0 になるため成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: tmpfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test tmpfs_mount --no-run
@@ -1018,19 +1313,52 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/tmpfs_mount.log"
-          cargo test -p fandhe-container-core --test tmpfs_mount -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'tmpfs_mount: mounts, flags and rollback verified (root=false)' "${log}"; then
-            echo "::error::tmpfs_mount did not report verification (possibly not executed)" >&2
+          scripts/run-with-deadline.sh --name tmpfs_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test tmpfs_mount -- --ignored
+          scripts/check-success-lines.sh --name tmpfs_mount --src crates/core/tests/tmpfs_mount.rs --log "${log}" \
+            --select '^tmpfs_mount: mounts, flags' --subst root=false \
+            --forbid 'tmpfs_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
+      # exec_child_setup の `--ignored` の場面（`crates/core/tests/exec_child_setup.rs`。SUP-6・SEC-1・
+      # REPAIR-7・REPAIR-12・#1531・#2854・#2885）: 非特権 user namespace + mount namespace の中で
+      # tmpfs を `noexec` と通常の 2 つでマウントし、`noexec` 上のエントリポイントが違反
+      # `entrypoint_on_noexec_mount`（126）で拒否され、通常の tmpfs 上では封印した複製まで進むことを照合する。
+      # 既定の場面は既定の結合試験で実行済み。Linux 限定・上で緩和した sysctl を再利用し、新しい check-run・
+      # sudo・permissions は追加しない。マウントは使い捨ての namespace 内（`--propagation private`）だけで、
+      # ホストのマウントは変えない。`--ignored` が届かなくても exit 0 になるため、成功行を共通スクリプトで
+      # 照合し、前提（util-linux の unshare・非特権の user / mount namespace）は事前に fail-closed で確認する。
+      - name: exec_child_setup のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test exec_child_setup --no-run
+
+      - name: exec_child_setup の実行（実機前提テスト・--ignored。SUP-6・SEC-1・#2885）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v unshare >/dev/null 2>&1; then
+            echo "::error::exec_child_setup requires util-linux unshare" >&2
             exit 1
           fi
-          echo "tmpfs_mount: mounts, flags and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::tmpfs_mount verified"
+          if ! unshare --user --map-root-user --mount --propagation private true; then
+            echo "::error::exec_child_setup requires unprivileged user and mount namespaces" >&2
+            exit 1
+          fi
+          log="${RUNNER_TEMP}/exec_child_setup.log"
+          scripts/run-with-deadline.sh --name exec_child_setup --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test exec_child_setup -- --ignored
+          scripts/check-success-lines.sh --name exec_child_setup --src crates/core/tests/exec_child_setup.rs \
+            --log "${log}" \
+            --select '^exec_child_setup: (all scenarios passed|noexec tmpfs scenario passed)$' --min 2 \
+            --forbid 'noexec tmpfs scenario ignored' --forbid 'not applicable' \
+            --forbid 'exec_child_setup: not verified' --summary
 
       # readonly_paths（`crates/core/tests/readonly_paths.rs`。SEC-2・CORE-5・#1850）と
       # config_paths_implicit_dev（`crates/core/tests/config_paths_implicit_dev.rs`。SEC-2・CORE-5・#2015）:
       # 読み取り専用化・覆いの rootless での実機結果を CI のログに残す実機前提テスト（harness = false）。
       # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。
-      # rootful 経路は人間担当で #1621 に記録する）。成功行を grep で照合する。
+      # rootful 経路は人間担当で #1621 に記録する）。成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: readonly_paths のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test readonly_paths --no-run
@@ -1041,15 +1369,12 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/readonly_paths.log"
-          cargo test -p fandhe-container-core --test readonly_paths -- --ignored 2>&1 | tee "${log}"
-          expected='readonly_paths: /proc bus,fs,irq,sys,sysrq-trigger and /sys mounted read-only,'
-          expected+=' writes refused, reads allowed (root=false)'
-          if ! grep -Fq "${expected}" "${log}"; then
-            echo "::error::readonly_paths did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
-          echo "readonly_paths: mounted read-only, writes refused, reads allowed (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::readonly_paths verified"
+          scripts/run-with-deadline.sh --name readonly_paths --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test readonly_paths -- --ignored
+          scripts/check-success-lines.sh --name readonly_paths --src crates/core/tests/readonly_paths.rs \
+            --log "${log}" \
+            --select '^readonly_paths: /proc bus,fs' --subst root=false \
+            --forbid 'readonly_paths: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
       - name: config_paths_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1061,16 +1386,49 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/config_paths_implicit_dev.log"
-          cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored 2>&1 | tee "${log}"
-          expected='config_paths_implicit_dev: 6 overlaps with the implicit /dev mounts applied at the exec layer'
-          expected+=' (no Landlock); start refuses them before fork (root=false)'
-          if ! grep -Fq "${expected}" "${log}"; then
-            echo "::error::config_paths_implicit_dev did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
+          scripts/run-with-deadline.sh --name config_paths_implicit_dev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored
+          scripts/check-success-lines.sh --name config_paths_implicit_dev \
+            --src crates/core/tests/config_paths_implicit_dev.rs --log "${log}" \
+            --select '^config_paths_implicit_dev: [^ ]+ overlaps with the implicit' \
+            --subst count=6 --subst root=false \
+            --forbid 'config_paths_implicit_dev: ignored' --forbid 'not applicable' --forbid 'root=true'
           grep -F 'observed:' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
-          echo "config_paths_implicit_dev: 6 overlaps observed (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::config_paths_implicit_dev verified"
+
+      # sysfs_mount（`crates/core/tests/sysfs_mount.rs`。SEC-2・SEC-1・OCI-4・#2020・#2305・#2533）:
+      # rootless の user namespace 内で rbind した /sys が読み取り専用 sysfs になること、覆いの件数、
+      # および user namespace の root から /sys の最上位の ro を外せるか（シナリオ ro-clear。#2305 の問い）を
+      # 観測する実機前提テスト（harness = false。--ignored の dispatcher がシナリオ default / ro-clear を再 exec する）。
+      # 上で緩和した sysctl を再利用し、sudo・permissions・check-run は増やさない（rootless 経路のみ。
+      # rootful は #1621）。escape-probe は dev-dependency の自己参照で有効なので --features は不要。
+      # ro-clear の防御なしの errno は測定値のため assert しない（防御ありの EPERM と測定成立は試験自身が assert する）。
+      # --ignored が届かないと exit 0 になるため、成功行 3 本を行頭・行末固定で照合して false-green を防ぐ。
+      - name: sysfs_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test sysfs_mount --no-run
+
+      - name: sysfs_mount の実行（実機前提テスト・--ignored。SEC-2・SEC-1・#2305・#2533）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sysfs_mount.log"
+          scripts/run-with-deadline.sh --name sysfs_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test sysfs_mount -- --ignored
+          check() {
+            scripts/check-success-lines.sh --name sysfs_mount --src crates/core/tests/sysfs_mount.rs --log "${log}" \
+              --subst root=false --forbid 'ro-clear not applicable' --forbid 'root=true' \
+              --forbid 'sysfs_mount: ignored' --forbid 'Linux only' "$@"
+          }
+          check --select '^sysfs_mount: /sys is a read-only sysfs'
+          check --select '/sys entries masked' --subst-pos-re '[0-9]+' --subst-pos-re '(true|false)' \
+            --subst-pos-re '(true|false)' --subst-pos-re '[0-9]+'
+          check --select 'ro-clear on /sys top mount' --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' --summary
+          {
+            echo "kernel: $(uname -r)"
+            grep -E '^sysfs_mount: host /sys read-only=' "${log}" || true
+            grep -F 'sysfs_mount: ro-clear observation:' "${log}" || true
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
       # secrets / configs の専用 tmpfs への注入・`mount_setattr(2)` による読み取り専用化
@@ -1079,7 +1437,7 @@ jobs:
       # 失敗時の後始末・内容がホストのディスクへ出ないことを検証する実機前提テスト（harness = false）。
       # Linux 5.12 以降が要る（未対応カーネルは mount(2) へ縮退せず unimplemented で拒否する）。
       # tmpfs_mount と同じく上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は
-      # 追加しない（rootless 経路のみ。rootful 経路は未検証）。成功行を grep で照合する。
+      # 追加しない（rootless 経路のみ。rootful 経路は未検証）。成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
       - name: inject_files のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         run: cargo test -p fandhe-container-core --test inject_files --no-run
@@ -1090,19 +1448,63 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/inject_files.log"
-          cargo test -p fandhe-container-core --test inject_files -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'inject_files: content, read-only and rollback verified (root=false)' "${log}"; then
-            echo "::error::inject_files did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
-          echo "inject_files: content, read-only and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::inject_files verified"
+          scripts/run-with-deadline.sh --name inject_files --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test inject_files -- --ignored
+          scripts/check-success-lines.sh --name inject_files --src crates/core/tests/inject_files.rs --log "${log}" \
+            --select '^inject_files: content, read-only' --subst root=false \
+            --forbid 'inject_files: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
+      # etc_files_mount（`crates/core/tests/etc_files_mount.rs`。NET-12・CORE-1・SEC-1・TASK-185 追補・#1872）:
+      # 管理ルートの /etc/hosts・/etc/resolv.conf を rootfs へ bind する段（exec::mount_etc_files）を、先が symlink の拒否と
+      # 後始末・空ファイルの作成・読み取り専用 rootfs での拒否と ro・`/etc` が symlink の拒否まで実カーネルで検証する
+      # 実機前提テスト（harness = false）。Linux 5.12 以降が要る。inject_files と同じく上で緩和した sysctl を再利用し、
+      # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証）。
+      # 成功行を共通スクリプトで照合する（#2825・REPAIR-12）。
+      - name: etc_files_mount のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test etc_files_mount --no-run
+
+      - name: etc_files_mount の実行（実機前提テスト・--ignored。NET-12・#1872）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/etc_files_mount.log"
+          scripts/run-with-deadline.sh --name etc_files_mount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test etc_files_mount -- --ignored
+          scripts/check-success-lines.sh --name etc_files_mount \
+            --src crates/core/tests/etc_files_mount.rs --log "${log}" \
+            --select '^etc_files_mount: content, read-only' --subst root=false \
+            --forbid 'etc_files_mount: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
+      # bind_mounts_real（`crates/core/tests/bind_mounts_real.rs`。
+      # CORE-1・CORE-2・OCI-4・SEC-1・SEC-5・TASK-29 追補・#1916・#3088）:
+      # bind mount の適用の段（exec::mount_binds）を、実マウント API での属性・private 伝播・巻き戻し・疑似 FS や overlay の拒否・
+      # ホストへ伝播しないことまで実カーネルで検証する実機前提テスト（harness = false）。Linux 5.12 以降が要る。
+      # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証・#1621）。
+      # 成功行は `(root=false)` まで固定のリテラルのため --subst は付けず、成功行を共通スクリプトで照合する（REPAIR-12）。
+      - name: bind_mounts_real のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test bind_mounts_real --no-run
+
+      - name: bind_mounts_real の実行（実機前提テスト・--ignored。SEC-1・SEC-5・#1916）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/bind_mounts_real.log"
+          scripts/run-with-deadline.sh --name bind_mounts_real --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test bind_mounts_real -- --ignored
+          scripts/check-success-lines.sh --name bind_mounts_real \
+            --src crates/core/tests/bind_mounts_real.rs --log "${log}" \
+            --select '^bind_mounts_real: binds applied' \
+            --forbid 'bind_mounts_real: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
 
       # lo_self_delivery（`crates/net/tests/lo_self_delivery.rs`。NET-2・NET-11・TASK-140 追補・#2077）:
       # 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れ
       # （#1927 の場面）と up 後の配送を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
       # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証で #319 が担う）。
-      # `--ignored` が届かなくても exit 0 になるため成功行を行単位で完全一致 grep する。
+      # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
       - name: lo_self_delivery のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -1114,23 +1516,67 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/lo_self_delivery.log"
-          cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored 2>&1 | tee "${log}"
-          line='lo_self_delivery: lo down timed out and lo up delivered (root=false)'
-          if ! grep -Fxq "${line}" "${log}"; then
-            echo "::error::lo_self_delivery did not report verification (possibly not executed)" >&2
-            exit 1
-          fi
-          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::lo_self_delivery verified"
+          scripts/run-with-deadline.sh --name lo_self_delivery --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored
+          scripts/check-success-lines.sh --name lo_self_delivery --src crates/net/tests/lo_self_delivery.rs \
+            --log "${log}" --select '^lo_self_delivery: lo down timed out' --subst root=false \
+            --forbid 'lo_self_delivery: ignored' --forbid 'not applicable' --forbid 'root=true' --summary
+
+      # netns_holder_userns（`crates/net/tests/netns_holder_userns.rs`。NET-9・CORE-6・SEC-5・REPAIR-5・#3197）:
+      # pasta 構成の netns holder が非特権の user + network namespace（`unshare --user --map-root-user --net`）へ参加し、
+      # capability を落として待機し、同じ uid の別プロセスが `/proc/<holder>/ns/*` を開けることを照合する実機前提テスト
+      # （harness = false）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
+      - name: netns_holder_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-net --test netns_holder_userns --no-run
+
+      - name: netns_holder_userns の実行（実機前提テスト・--ignored。NET-9・CORE-6・#3197）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/netns_holder_userns.log"
+          scripts/run-with-deadline.sh --name netns_holder_userns --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-net --test netns_holder_userns -- --ignored
+          scripts/check-success-lines.sh --name netns_holder_userns --src crates/net/tests/netns_holder_userns.rs \
+            --log "${log}" --select '^netns_holder_userns: holder joined' \
+            --forbid 'netns_holder_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
+
+      # netns_holder_launch_userns（`crates/supervisor/tests/netns_holder_launch_userns.rs`。NET-9・CORE-1・CORE-6・SUP-12・SEC-5・
+      # REPAIR-5・#3198）: supervisor の本番の spawn（`netns_holder::spawn_netns_holder`）で起動した holder が非特権の
+      # user + network namespace へ参加し、fd・環境・capability が最小で、supervisor のメモリを継承せず（陽性対照つき）、
+      # stop・drop・中間 supervisor の SIGKILL で回収されることを照合する実機前提テスト（harness = false）。
+      # 上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（rootless のみ）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を試験ソースから導出して双方向に照合する（#2825・REPAIR-12）。
+      - name: netns_holder_launch_userns のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns --no-run
+
+      - name: netns_holder_launch_userns の実行（実機前提テスト・--ignored。NET-9・CORE-1・#3198）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/netns_holder_launch_userns.log"
+          scripts/run-with-deadline.sh --name netns_holder_launch_userns --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-supervisor --test netns_holder_launch_userns -- --ignored
+          scripts/check-success-lines.sh --name netns_holder_launch_userns \
+            --src crates/supervisor/tests/netns_holder_launch_userns.rs \
+            --log "${log}" --select '^netns_holder_launch_userns: holder spawned' \
+            --forbid 'netns_holder_launch_userns: ignored' --forbid 'not applicable' --forbid 'FAILED' --summary
 
       # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
       # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、
       # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する
       # 実機前提テスト。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない。
       # テスト側の `ContainerRuntime`（`unshare(1)` で起動）を注入しているため、core の分離実装そのものは照合しない。
-      # 他のステップと違い `harness = false` ではなく libtest で、試験が自分で出す成功行が無い。そのため libtest の
-      # 結果行（`test <名前> ... ok`）を 1 行ずつ完全一致 grep する（`--ignored` が届かなければ `ignored` となり
-      # `ok` の行が出ないので fail-closed）。`--test-threads=1` は、解放された namespace の inode 番号を並行して走る
+      # 他のステップと違い `harness = false` ではなく libtest で、試験が自分で出す成功行が無い。そのため
+      # `check-success-lines.sh --libtest-ignored` が `#[ignore]` 関数から `test <名前> ... ok` を導出して照合し、
+      # `test result: ok. N passed; 0 failed;` も必須にする（`--ignored` が届かなければ `ignored` となり fail-closed。#2884）。
+      # `--test-threads=1` は、解放された namespace の inode 番号を並行して走る
       # 別の試験の新しい namespace が再利用し「参照者 0 件」の判定が誤って失敗するのを避けるため（判定は緩めない）。
       - name: runtime_service_namespaces のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1143,22 +1589,144 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/runtime_service_namespaces.log"
-          cargo test -p fandhe-container-cri --test runtime_service_namespaces \
-            -- --ignored --test-threads=1 2>&1 | tee "${log}"
-          for line in \
-            'test task_59_2_started_process_is_namespace_isolated ... ok' \
-            'test task_59_3_remove_container_releases_namespaces ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::runtime_service_namespaces did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::runtime_service_namespaces verified"
+          scripts/run-with-deadline.sh --name runtime_service_namespaces --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-cri --test runtime_service_namespaces \
+              -- --ignored --test-threads=1
+          scripts/check-success-lines.sh --name runtime_service_namespaces \
+            --src crates/cri/tests/runtime_service_namespaces.rs --log "${log}" --libtest-ignored \
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --min 2 --summary
+
+      # sec1_2536_protected_root_on_real_overlay（`crates/core/src/exec/bind_mounts.rs` の lib 内試験。SEC-1・OCI-4・SEC-5・
+      # TASK-29 追補・#2536・#2793）: 保護対象（状態ルート・rootfs・bundle）が実機の overlayfs の上にあるときの逆方向の照合を、
+      # 非特権 user + mount namespace の中の実 overlay と実 mountinfo で確かめる実機前提テスト（Linux 6.8 以降・util-linux の
+      # unshare / mount）。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない（ホストのマウントは
+      # 変えない）。結果行は check-success-lines.sh の `--libtest-ignored --libtest-module` が `#[ignore]` 関数から導出し、
+      # `1 passed; 0 failed;` と ignored / FAILED の不在を照合する（`--ignored` が届かないと `ignored` となり fail-closed）。
+      # 外側の試験は `unshare` で自身を再実行し内側の子が stdout を引き継ぐため、同じ `ok` 行が 2 回出るが受理される
+      # （自己テストの「libtest module duplicated nested ok line」）。外側の成否は補助 run-with-deadline.sh が子の終了コードを素通しして担う（#2959・#3505）。
+      - name: sec1_2536_protected_root_on_real_overlay のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --lib --no-run
+
+      - name: sec1_2536_protected_root_on_real_overlay の実行（実機前提テスト・--ignored。SEC-1・OCI-4・SEC-5・#2536）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sec1_2536_real_overlay.log"
+          scripts/run-with-deadline.sh --name sec1_2536_real_overlay --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --lib \
+              -- --ignored sec1_2536_protected_root_on_real_overlay
+          m='exec::bind_mounts::tests'
+          scripts/check-success-lines.sh --name sec1_2536_protected_root_on_real_overlay \
+            --src crates/core/src/exec/bind_mounts.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --summary
+          echo "kernel: $(uname -r)" >> "$GITHUB_STEP_SUMMARY"
+
+      # sec1_2823_overmount_hides_child_in_real_namespace（`crates/core/src/oci_runtime/start.rs` の lib 内試験。SEC-1・CORE-2・
+      # NET-1・#2823）: 祖先の overmount で隠れた子マウントを、本番の fd の mount ID 照合（`child_is_visible`）から
+      # `build_protected_roots` まで通し、隠れた子が「リンクあり」に固定されることを非特権 user + mount namespace の実マウントで
+      # 確かめる実機前提テスト。上で緩和した sysctl を使い回す。ビルドは sec1_2536 のステップが済ませた lib を使い回す。
+      # 結果行（`ok`）と内側の成功行 `ok: sec1_2823_overmount` を、check-success-lines.sh が試験ソースから導出して照合する（#2959）。
+      - name: sec1_2823_overmount_hides_child_in_real_namespace の実行（実機前提テスト・--ignored。SEC-1・CORE-2・#2823）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/sec1_2823_overmount.log"
+          scripts/run-with-deadline.sh --name sec1_2823_overmount --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --lib \
+              -- --ignored sec1_2823_overmount_hides_child_in_real_namespace --no-capture
+          m='oci_runtime::start::tests'
+          scripts/check-success-lines.sh --name sec1_2823_overmount_hides_child_in_real_namespace \
+            --src crates/core/src/oci_runtime/start.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^(test [A-Za-z0-9_:]+ \.\.\. |ok: sec1_2823)' --min 2 --summary
+
+      # CDI createContainer フックの namespace 前提の実機前提テスト 2 件（`crates/gpu/src/cdi_apply/hooks/run.rs` の lib 内
+      # `#[ignore]` 試験。GPU-2・SEC-1・REPAIR-2・REPAIR-12・TASK-127.3・#549・#2980・#2987）。上で緩和した sysctl を使い回し、
+      # sudo・新しい check-run・permissions は増やさない。stage_recheck_fails_after_unshare_in_thread は自分では namespace を
+      # 作らないため、外側を `unshare -r -m` で包む。bundle_remove_refuses_bind_mount_boundary はその中でさらに自分を
+      # `unshare -r -m` で再実行する（入れ子の user namespace。内側の出力も同じ stdout に出る）。
+      # `--test-threads=1` は付けない（直列だと開始時の `test X ... ` に子の出力が割り込み行が割れるため。割れても (b)(c) で
+      # false-red になるだけで false-green にはならない）。`2 passed` を照合するため 1 回の起動で 2 件を実行する。
+      # 成功行（mod 内の試験なので module 接頭辞つき）は `--libtest-module` で試験ソースから導出して照合する。
+      - name: gpu cdi hooks の namespace 試験のビルド（バイナリの特定。GPU-2・SEC-1・#2987）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/gpu-lib-build.json"
+          cargo test -p fandhe-container-gpu --lib --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.kind == ["lib"]'
+          sel="${sel}"' and .target.name == "fandhe_container_gpu") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::gpu lib test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "GPU_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: gpu cdi hooks の namespace 試験の実行（実機前提テスト・--ignored。GPU-2・SEC-1・#2987）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/gpu_cdi_hooks_ns.log"
+          m='cdi_apply::hooks::run::tests'
+          scripts/run-with-deadline.sh --name gpu_cdi_hooks_ns --deadline 240 --log "${log}" -- \
+            unshare -r -m -- "${GPU_LIB_TEST_BIN}" --ignored --exact \
+              "${m}::stage_recheck_fails_after_unshare_in_thread" \
+              "${m}::bundle_remove_refuses_bind_mount_boundary"
+          scripts/check-success-lines.sh --name gpu_cdi_hooks_ns \
+            --src crates/gpu/src/cdi_apply/hooks/run.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --min 2 --summary
+
+      # net の nft ソケットの世代が「開いたスレッドの netns」に従うことの実機前提テスト 1 件（`crates/net/src/nftables_batch/socket.rs`
+      # の lib 内 `#[ignore]` 試験 net3_3068_socket_generation_follows_opening_thread。NET-3・SEC-1・REPAIR-12・#3068・#3356）。
+      # スレッドの `unshare(CLONE_NEWNET)` には、そのスレッドの netns を所有する user namespace での CAP_SYS_ADMIN が要る。
+      # `unshare -r` だけだと netns は init user namespace 所有のままで EPERM になるため、`-r -n` で包む（新しい netns が
+      # 新しい user namespace の所有になり、その中の root が権限を持つ）。上で緩和した sysctl を使い回し、sudo・新しい
+      # check-run・permissions は増やさない。試験はバッチを送らずホストの nftables に触れない。`--ignored` が届かなくても
+      # exit 0 になるため、成功行を試験ソースから導出して照合する（`--libtest-module`）。
+      - name: net の socket 世代の namespace 試験のビルド（バイナリの特定。NET-3・SEC-1・#3356）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/net-lib-build.json"
+          cargo test -p fandhe-container-net --lib --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.kind == ["lib"]'
+          sel="${sel}"' and .target.name == "fandhe_container_net") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::net lib test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "NET_LIB_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: net の socket 世代の namespace 試験の実行（実機前提テスト・--ignored。NET-3・SEC-1・#3068・#3356）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/net_socket_generation_ns.log"
+          m='nftables_batch::socket::tests'
+          scripts/run-with-deadline.sh --name net_socket_generation_ns --deadline 240 --log "${log}" -- \
+            unshare -r -n -- "${NET_LIB_TEST_BIN}" --ignored --exact \
+              "${m}::net3_3068_socket_generation_follows_opening_thread"
+          scripts/check-success-lines.sh --name net_socket_generation_ns \
+            --src crates/net/src/nftables_batch/socket.rs --log "${log}" \
+            --libtest-ignored --libtest-module "${m}" \
+            --select '^test [A-Za-z0-9_:]+ \.\.\. ' --summary
 
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
-      # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
+      # start_stop_delete_real（cli）と、start_scope_real・delete_cgroup_real・start_recover_real（cli・#3105。下の専用ステップ）
+      # （CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
       # private ソケットは前提確認ステップで fail-closed にする）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
       # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
@@ -1194,6 +1762,37 @@ jobs:
             echo "Landlock ABI: ${abi}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 委譲スコープでの試験の繰り返し（workflow_dispatch の repeat-user-scope=true のときだけ。#2886・CORE-5・REPAIR-12）。
+      # production_launcher のように cargo を同じ cgroup に入れると prepare が失敗する試験を、`make repeat-test` の
+      # USER_SCOPE=1 で（ビルド 1 回・毎回 `systemd-run --user --scope` の中で直接実行）繰り返す。
+      # この位置にある理由: 上の AppArmor の緩和ステップと前提確認の後でないと ubuntu の Unshare 段で失敗するため
+      # （通常の「指定した試験の繰り返し」ステップはそれより前にあり、repeat-user-scope のときは飛ばす）。Linux 限定。
+      # 入力は env 経由（run 内で式を展開しない）。新しいジョブ・check-run は追加しない。
+      # 上限 55 分を保つ理由（#3528）: ジョブ上限 90 分 - この位置までの最大経過 約 25 分 - 後続と余裕 約 10 分。
+      # この位置を前へ動かす・後ろに重いステップを足すと関係が変わるため、ジョブ上限の式と合わせて見直す。
+      - name: 委譲スコープでの試験の繰り返し（workflow_dispatch のみ。#2886）
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.repeat-user-scope &&
+          inputs.repeat-test-bin != '' &&
+          runner.os == 'Linux' && env.HANG_PROBE != 'true' &&
+          (inputs.repeat-os == 'all' || inputs.repeat-os == matrix.os)
+        shell: bash
+        timeout-minutes: 55
+        env:
+          PACKAGE: ${{ inputs.repeat-package }}
+          TEST_BIN: ${{ inputs.repeat-test-bin }}
+          SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          LIBTEST_NAME: ${{ inputs.repeat-libtest-name }}
+          FORBIDDEN_LINE: ${{ inputs.repeat-forbidden-line }}
+          TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
+          FEATURES: ${{ inputs.repeat-features }}
+          COUNT: ${{ inputs.repeat-count }}
+          TEST_ENV: ${{ inputs.repeat-env }}
+          RUN_TIMEOUT: ${{ inputs.repeat-run-timeout }}
+          USER_SCOPE: '1'
+        run: make repeat-test
+
       # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・CORE-6・REPAIR-7・#2542・#2642）: rootless の
       # user namespace 内でのレイヤー展開（所有者・setuid・写像外 ID の拒否）を照合する実機前提テスト（harness = false）。
       # 単一行写像（`unshare --user --map-root-user`）に加え、`newuidmap` / `newgidmap` の範囲写像（subuid / subgid）のケース
@@ -1212,27 +1811,157 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/userns_extract.log"
-          USER="$(id -un)" cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
-          if grep -Fq 'userns_extract: ignored' "${log}"; then
-            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          for line in \
-            'ok: extract_ok' \
-            'ok: outside_map' \
-            'ok: map_mismatch' \
-            'ok: subordinate_extract_ok' \
-            'ok: subordinate_outside_map' \
-            'ok: subordinate_map_mismatch' \
-            'ok: subordinate_cleanup' \
-            'test userns_extract ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::userns_extract verified"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name userns_extract --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test userns_extract -- --ignored
+          cases=extract_ok,outside_map,map_mismatch,subordinate_extract_ok
+          cases+=,subordinate_outside_map,subordinate_map_mismatch,subordinate_cleanup
+          # case の集合は実行条件として手で宣言する（試験の match の腕と食い違えば導出との照合で失敗する）
+          scripts/check-success-lines.sh --name userns_extract --src crates/oci/tests/userns_extract.rs --log "${log}" \
+            --select '^(ok: |test userns_extract \.\.\. )' \
+            --subst "case=${cases}" \
+            --min 8 --forbid 'userns_extract: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
+
+      # image_store_xdev（`crates/oci/tests/image_store_xdev.rs`。OCI-7・SEC-1・ERR-1・#2701）: イメージストア root 配下の
+      # 別マウント（`blobs/sha256` と `@lock` の bind mount）が rm・prune・lock で `FailedPrecondition` になることを、
+      # 非特権の user / mount namespace の中の実マウントで照合する実機前提テスト（harness = false）。
+      # 新しい check-run・sudo・permissions は追加しない。成功行は行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
+      - name: image_store_xdev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test image_store_xdev --no-run
+
+      - name: image_store_xdev の実行（実機前提テスト・--ignored。OCI-7・SEC-1・ERR-1・#2701）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/image_store_xdev.log"
+          scripts/run-with-deadline.sh --name image_store_xdev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test image_store_xdev -- --ignored
+          # 成功行は試験ソースの println! から導出して双方向に照合する（#2768・REPAIR-12）
+          scripts/check-success-lines.sh --name image_store_xdev --src crates/oci/tests/image_store_xdev.rs \
+            --log "${log}" --select '^(ok: xdev_[a-z_]+|test image_store_xdev [.][.][.] ok)$' --min 5 \
+            --forbid 'image_store_xdev: ignored' --summary
+
+      # staged_blob_owner（`crates/oci/tests/staged_blob_owner.rs`。OCI-7・SEC-1・SEC-5・#2907）: `newuidmap` の範囲写像で
+      # 他 uid（subuid）所有にした staged blob を `verify_staged_blob` が chmod せずに拒否し、検証済みに登録しないことを
+      # 実ファイルで照合する実機前提テスト（harness = false）。範囲写像の前提確認ステップ（uidmap・subuid / subgid の行）に
+      # 依存するためその後に置く。`USER` を渡す。新しい check-run・sudo・permissions は追加しない。成功行は試験ソースから導出して
+      # 双方向に照合し、`ignored` 行の出現は失敗にする。root で走る分岐は CI では回さない（#1621）。
+      - name: staged_blob_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test staged_blob_owner --no-run
+
+      - name: staged_blob_owner の実行（実機前提テスト・--ignored。OCI-7・SEC-1・SEC-5・#2907）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/staged_blob_owner.log"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name staged_blob_owner --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-oci --test staged_blob_owner -- --ignored
+          scripts/check-success-lines.sh --name staged_blob_owner --src crates/oci/tests/staged_blob_owner.rs \
+            --log "${log}" --select '^(ok: [a-z_0-9]+|test staged_blob_owner [.][.][.] ok)$' --min 6 \
+            --forbid 'staged_blob_owner: ignored' --forbid 'not applicable' --forbid 'FAIL:' --summary
+
+      # landlock_implicit_dev（`crates/core/tests/landlock_implicit_dev.rs`。CORE-5・SEC-4・#1657・#2768）: 暗黙の /dev 系の
+      # Landlock 許可（/dev/null 書き込み・/dev/shm 作成・/dev/ptmx open）と mknod・外側書き込みの拒否を非特権 user namespace で
+      # 照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock ABI 6 以上の fail-closed 確認は上のステップを
+      # 再利用する（複製しない）。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: landlock_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test landlock_implicit_dev --no-run
+
+      - name: landlock_implicit_dev の実行（実機前提テスト・--ignored。CORE-5・SEC-4・#1657・#2768）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/landlock_implicit_dev.log"
+          scripts/run-with-deadline.sh --name landlock_implicit_dev --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test landlock_implicit_dev -- --ignored
+          scripts/check-success-lines.sh --name landlock_implicit_dev \
+            --src crates/core/tests/landlock_implicit_dev.rs --log "${log}" \
+            --select '^landlock_implicit_dev: /dev/null write' --subst root=false \
+            --forbid 'root=true' --forbid 'landlock_implicit_dev: ignored' --forbid 'not applicable' --summary
+
+      # fork_exec_isolation（`crates/core/tests/fork_exec_isolation.rs`。CORE-1・CORE-5・REPAIR-12・#3295）: fork / exec 前段の
+      # 到達と fail-closed を非特権 user namespace で照合する実機前提テスト（harness = false）。AppArmor の緩和と Landlock
+      # ABI 6 以上の fail-closed 確認は上のステップを再利用する。`--ignored` が届かなくても exit 0 になるため成功行を試験
+      # ソースから導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: fork_exec_isolation のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test fork_exec_isolation --no-run
+
+      - name: fork_exec_isolation の実行（実機前提テスト・--ignored。CORE-1・CORE-5・#3295）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/fork_exec_isolation.log"
+          scripts/run-with-deadline.sh --name fork_exec_isolation --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test fork_exec_isolation -- --ignored
+          scripts/check-success-lines.sh --name fork_exec_isolation \
+            --src crates/core/tests/fork_exec_isolation.rs --log "${log}" \
+            --select '^fork_exec_isolation: fork/exec verified' --subst is_root=false \
+            --forbid 'root=true' --forbid 'fork_exec_isolation: ignored' --forbid 'not applicable' \
+            --forbid 'not verified' --summary
+
+      # capabilities（`crates/core/tests/capabilities.rs`。SEC-1・CORE-5・REPAIR-12・#3422）: fork した実コンテナプロセスの
+      # exec 前の capability を親の /proc/<pid>/status で照合する実機前提テスト（harness = false）。前提の AppArmor の緩和は
+      # 上のステップを再利用する（Landlock は使わない）。`--ignored` が届かなくても exit 0 になるため成功行を試験ソースから
+      # 導出して照合する。root の分岐は CI では回さない（#1621）。sudo・permissions・check-run は追加しない。
+      - name: capabilities のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test capabilities --no-run
+
+      - name: capabilities の実行（実機前提テスト・--ignored。SEC-1・CORE-5・#3422）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/capabilities.log"
+          scripts/run-with-deadline.sh --name capabilities --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test capabilities -- --ignored
+          scripts/check-success-lines.sh --name capabilities \
+            --src crates/core/tests/capabilities.rs --log "${log}" \
+            --select '^capabilities: SEC-1 ' --subst-pos false --min 2 \
+            --forbid 'root=true' --forbid 'capabilities: ignored' --forbid 'not applicable' --summary
+
+      # escape_suite（`crates/core/tests/escape_suite.rs`。SEC-2・SEC-4・SEC-5・CORE-5・TASK-43 追補・#2016）: ESC-01〜10 の
+      # 攻撃ケース（制御・否定対照を含む 18 件）を制限ステージ通過後のコンテナプロセスで実行し、拒否を判定する実機前提テスト
+      # （harness = false）。前提の AppArmor の緩和と「範囲写像と委譲 cgroup の前提確認」（非 root と Landlock ABI 6 以上を
+      # fail-closed で確認）は上のステップを再利用する。非 root の 1 回だけ実行し、root の分岐（ESC-09 が対象外になる）は
+      # CI では回さない（#1621・#206）。カーネル監査の opt-in の段は CI 外（#2483）のため、ESC-01・07・10 は監査未検証として
+      # 一覧をちょうどこの 3 件に固定する（合格に数えない。SEC-4）。件数（15 / 18）は具体値で固定しており、ケースを足すと
+      # 照合が落ちる。件数を上げるときは AGENTS.md「実機前提テスト」も同じ PR で直す。
+      # `--forbid 'not applicable'` は成功行の `not applicable []` に当たるため使わず、`verdict=not-applicable` と
+      # `not applicable on this`（非 Linux・非対応アーキテクチャの行）で禁じる。sudo・permissions・check-run は追加しない。
+      - name: escape_suite のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test escape_suite --no-run
+
+      - name: escape_suite の実行（実機前提テスト・--ignored。SEC-2・SEC-4・SEC-5・CORE-5・#2016）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/escape_suite.log"
+          scripts/run-with-deadline.sh --name escape_suite --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test escape_suite -- --ignored
+          scripts/check-success-lines.sh --name escape_suite \
+            --src crates/core/tests/escape_suite.rs --log "${log}" \
+            --select '^escape_suite: SEC-2 harness verified ' \
+            --subst verified=15 --subst-pos 18 --subst-pos '[]' \
+            --subst-pos '["esc-10-landlock-outside", "esc-01-host-fs-write", "esc-07-runtime-binary-landlock"]' \
+            --subst-pos false --subst-pos false \
+            --forbid 'verdict=fail' --forbid 'verdict=not-applicable' --forbid 'escape_suite: ignored' \
+            --forbid 'not applicable on this' --forbid 'root=true' --forbid 'kernel_audit=true' --summary
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1259,38 +1988,124 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/production_launcher.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${PL_BIN}" --ignored 2>&1 | tee "${log}"
-          final='production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified;'
-          final+=' failed launch left no process; bind mount visible on host;'
-          final+=' post-exec capabilities and seccomp verified (root=false)'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::production_launcher did not report the final line (possibly not executed)" >&2
+            scripts/run-in-user-scope.sh --name production_launcher --deadline 540 --log "${log}" -- \
+              "${PL_BIN}" --ignored
+          check() {
+            scripts/check-success-lines.sh --name production_launcher \
+              --src crates/core/tests/production_launcher.rs --log "${log}" \
+              --forbid 'subordinate id case not requested' --forbid '(root=true)' \
+              --forbid 'production_launcher: ignored' --forbid 'PRECONDITION FAILED' \
+              --forbid 'not applicable' "$@"
+          }
+          code='[A-Z][A-Za-z]+'
+          # 二者択一（rslave-bind・p2/r3/r4 の start refused）と root 専用の行は select に入れない。
+          # --min は導出件数の実測値（A 24・B 9・C 2・D 2・E 1）で、select の書き損じによる取りこぼしを防ぐ。
+          # 定数の出典は production_launcher.rs の const（HOSTNAME・BIND_DEST・LO_TMPFS_DEST・WANT・EXIT_CODE）と scenario_k の配列。
+          # A: 位置プレースホルダの無い行（最終行・正常系・説明行）。rslave-bind は到達だけを --require で照合する
+          sel_a='^production_launcher: (pid1, default |scenario=(ok|bind-mount|multithreaded-refused|j|k'
+          sel_a+='|working-dir|dropped-handle-confirmed'
+          sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
+          sel_a+='|injected secret '
+          sel_a+='|capabilities drop |sysctls applied |pod ipc |entrypoint violation |exit_signal '
+          sel_a+='|network loopback )'
+          check --select "${sel_a}" \
+            --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst HOSTNAME=fandhe-prod-launcher --subst BIND_DEST=/data --subst LO_TMPFS_DEST=/run \
+            --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
+            --subst name=unshare,ptrace,kexec_load \
+            --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
+            --require 'production_launcher: scenario=rslave-bind host=' --min 24 --summary
+          # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
+          ef='production_launcher: scenario=exec-failure'
+          ef_tail='state=created audit=0 children=0'
+          sel_b='^production_launcher: scenario=(failed-launch|bind-over-protected-path-refused'
+          sel_b+='|state-root-moved-after-start'
+          sel_b+='|working-dir-refused|user-unmapped-refused|groups-single-id-refused|exec-failure) '
+          check --select "${sel_b}" \
+            --subst-pos-re "${code}" --subst cwd=/missing,/afile,/alink/x \
+            --subst-re case='[a-z-]+' --subst-re phase='[a-z]+' \
+            --require "${ef} case=loader-missing code=NotFound phase=prepare ${ef_tail}" \
+            --require "${ef} case=not-executable code=PermissionDenied phase=execveat ${ef_tail}" \
+            --require "${ef} case=garbage code=InvalidArgument phase=execveat ${ef_tail}" --min 9
+          # C / D: {label} の値の集合が異なるので別呼び出し
+          check --select '^production_launcher: scenario=state-root-bind-refused ' \
+            --subst label=direct,symlink --subst-pos-re "${code}" --min 2
+          check --select '^production_launcher: scenario=devtmpfs-bind-refused ' \
+            --subst label=bind,rbind --subst-pos-re "${code}" --min 2
+          # E: {} が 2 つの範囲写像の行
+          check --select '^production_launcher: subordinate id mapping verified ' \
+            --subst-pos-re '[1-9][0-9]*' --subst-pos-re '[1-9][0-9]*' --summary
+
+      # exec_subordinate_e2e（`crates/supervisor/tests/exec_subordinate_e2e.rs`。
+      # SEC-5・CORE-6・SUP-6・#2835。非 root の exec の capability の照合は SEC-1・#2889）: 範囲写像の rootless コンテナへ、
+      # ProductionLauncher の create → start と本番の exec 入口（run_command_with_pidfd）だけで exec を通す。
+      # 前提（uidmap・subuid / subgid・委譲 cgroup）は試験自身が fail-closed に確認する。
+      # cargo を経由せず委譲スコープで直接実行する。
+      - name: exec_subordinate_e2e のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/ese-build.json"
+          cargo test -p fandhe-container-supervisor --test exec_subordinate_e2e --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "exec_subordinate_e2e") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::exec_subordinate_e2e test binary not uniquely identified" >&2
             exit 1
           fi
-          for part in \
-            'production_launcher: subordinate id mapping verified (uid extents=' \
-            'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
-            'production_launcher: exit_signal recorded once via audit relay (scenario=Q)'; do
-            if ! grep -Fq "${part}" "${log}"; then
-              echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
-              exit 1
-            fi
-          done
-          for bad in \
-            'subordinate id case not requested' \
-            '(root=true)' \
-            'production_launcher: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::production_launcher reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "${final}"
-            grep -F 'production_launcher: subordinate id mapping verified' "${log}" || true
-            grep -F 'production_launcher: scenario=user-applied' "${log}" || true
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::production_launcher verified"
+          echo "ESE_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: exec_subordinate_e2e の実行（実機前提・--ignored・委譲スコープ。SEC-5・SEC-1・SEC-4・#2835・#3291）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/exec_subordinate_e2e.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name exec_subordinate_e2e --deadline 540 --log "${log}" -- \
+              "${ESE_BIN}" --ignored
+          scripts/check-success-lines.sh --name exec_subordinate_e2e \
+            --src crates/supervisor/tests/exec_subordinate_e2e.rs --log "${log}" \
+            --select '^exec_subordinate_e2e: (scenario=|create, start and exec)' --subst root=false --min 5 \
+            --forbid 'exec_subordinate_e2e: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
+
+      # exec_launch_netns_rootless（`crates/supervisor/tests/exec_launch_netns_rootless.rs`。
+      # SUP-6・NET-9・CORE-6・SEC-5・REPAIR-12・#3349）: rootless の exec が起動経路（ProductionLauncher の Loopback と、
+      # 本番の spawn_netns_holder を使う Attachable）で作った netns へ参加して通ることを inode の一致で照合する。
+      # pasta は使わない（#3331）。前提は試験自身が fail-closed に確認する。新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: exec_launch_netns_rootless のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/elnr-build.json"
+          cargo test -p fandhe-container-supervisor --test exec_launch_netns_rootless --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "exec_launch_netns_rootless") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::exec_launch_netns_rootless test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "ELNR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: exec_launch_netns_rootless の実行（実機前提・--ignored・委譲スコープ。SUP-6・NET-9・CORE-6・#3349）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/exec_launch_netns_rootless.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name exec_launch_netns_rootless --deadline 540 --log "${log}" -- \
+              "${ELNR_BIN}" --ignored
+          scripts/check-success-lines.sh --name exec_launch_netns_rootless \
+            --src crates/supervisor/tests/exec_launch_netns_rootless.rs --log "${log}" \
+            --select '^exec_launch_netns_rootless: (scenario=|rootless exec joined)' --subst root=false --min 5 \
+            --forbid 'exec_launch_netns_rootless: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
       - name: rootless_file_owner のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1304,22 +2119,12 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_file_owner.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored 2>&1 | tee "${log}"
-          for scenario in direct helper; do
-            line="rootless_file_owner: scenario ${scenario} verified (host uid=$(id -u), gid=$(id -g))"
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless_file_owner did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'helper case not requested' 'root=true' 'rootless_file_owner: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_file_owner reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless_file_owner verified"
+            scripts/run-with-deadline.sh --name rootless_file_owner --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored
+          scripts/check-success-lines.sh --name rootless_file_owner --src crates/core/tests/rootless_file_owner.rs \
+            --log "${log}" --select '^rootless_file_owner: scenario ' --subst name=direct,helper \
+            --subst-pos "$(id -u)" --subst-pos "$(id -g)" --min 2 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_file_owner: ignored' --summary
 
       - name: rootless_holder_expiry のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1334,17 +2139,34 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_holder_expiry.log"
-          cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored 2>&1 | tee "${log}"
-          line='rootless_holder_expiry: holder outlived the stopped helper until expiry, then killed its session ('
-          if ! grep -Fq "${line}" "${log}"; then
-            echo "::error::rootless_holder_expiry did not report: ${line} (possibly not executed)" >&2
-            exit 1
-          fi
-          if grep -Fq 'rootless_holder_expiry: ignored' "${log}"; then
-            echo "::error::rootless_holder_expiry reported an unexpected line: ignored" >&2
-            exit 1
-          fi
-          echo "::notice::rootless_holder_expiry verified"
+          scripts/run-with-deadline.sh --name rootless_holder_expiry --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored
+          scripts/check-success-lines.sh --name rootless_holder_expiry \
+            --src crates/core/tests/rootless_holder_expiry.rs \
+            --log "${log}" --select '^rootless_holder_expiry: holder outlived' --subst-pos-re '[0-9]+' \
+            --forbid 'rootless_holder_expiry: ignored' --forbid 'not applicable'
+
+      - name: rootless_holder_memory のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test rootless_holder_memory --no-run
+
+      # holder が継承するメモリに注入ファイルの secret が無いこと（本番の holder の /proc/<pid>/mem を走査。陽性対照つき。
+      # CORE-6・SEC-5・SUP-12・#2628）。範囲写像の前提は要らない（unshare の user namespace のみ。Yama ptrace_scope=1 は
+      # 祖先が読める。新しい check-run は増えない）。
+      - name: rootless_holder_memory の実行（実機前提テスト・--ignored。CORE-6・SEC-5・#2628）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_holder_memory.log"
+          scripts/run-with-deadline.sh --name rootless_holder_memory --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test rootless_holder_memory -- --ignored
+          scripts/check-success-lines.sh --name rootless_holder_memory \
+            --src crates/core/tests/rootless_holder_memory.rs \
+            --log "${log}" --select '^rootless_holder_memory: holder memory has no injected secret' \
+            --subst-pos-re '[1-9][0-9]*' --subst-pos 0 --subst-pos-re '[0-9]+' \
+            --forbid 'rootless_holder_memory: ignored' --forbid 'not applicable'
 
       - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1360,20 +2182,16 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
           USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
-          for scenario in a b c d e f; do
-            line="rootless_image_rootfs_remove: scenario ${scenario} verified"
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          if grep -Fq 'rootless_image_rootfs_remove: ignored' "${log}"; then
-            echo "::error::rootless_image_rootfs_remove reported an unexpected line: ignored" >&2
-            exit 1
-          fi
-          echo "::notice::rootless_image_rootfs_remove verified"
+            scripts/run-with-deadline.sh --name rootless_image_rootfs_remove --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored
+          # 期待する成功行は試験ソースの println! から導出する（手書きの並びとシナリオ集合のずれで
+          # 実行されない成功行を見逃さない。#2699・REPAIR-12）。集合は双方向で一致させる。
+          # 共通スクリプトへ移した（#2768）。下限 12 件・ignored / Linux only の出現は失敗は従来どおり
+          scripts/check-success-lines.sh --name rootless_image_rootfs_remove \
+            --src crates/core/tests/rootless_image_rootfs_remove.rs --log "${log}" \
+            --select '^rootless_image_rootfs_remove: scenario [A-Za-z0-9]+ verified$' --min 12 \
+            --forbid 'rootless_image_rootfs_remove: ignored' --forbid 'rootless_image_rootfs_remove: Linux only' \
+            --summary
 
       - name: seccomp のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1386,23 +2204,12 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/seccomp.log"
-          cargo test -p fandhe-container-core --test seccomp -- --ignored 2>&1 | tee "${log}"
-          for line in \
-            'seccomp: CORE-5 probe table and record parser verified' \
-            'seccomp: CORE-5 denied syscalls blocked inside the container (root=false)'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::seccomp did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'root=true' 'seccomp: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::seccomp reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::seccomp verified"
+          scripts/run-with-deadline.sh --name seccomp --deadline 240 --log "${log}" -- \
+            cargo test -p fandhe-container-core --test seccomp -- --ignored
+          # 成功行は試験ソースから導出する（`(root={})` は is_root() の実行時の値で、CI は非 root なので false。#2768）
+          scripts/check-success-lines.sh --name seccomp --src crates/core/tests/seccomp.rs --log "${log}" \
+            --select '^seccomp: CORE-5 ' --subst-pos false --min 2 \
+            --forbid 'root=true' --forbid 'seccomp: ignored' --summary
 
       # rootless_launch・rootless・rootless_uid_mapping（`crates/core/tests/`。CORE-6・SEC-1・SEC-5・REPAIR-7・#2596）:
       # 非特権 user namespace で動く `--ignored` の試験（harness = false）。cargo 経由で直接実行する（委譲スコープは要らない）。helper ケース
@@ -1421,23 +2228,12 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_launch.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_launch -- --ignored 2>&1 | tee "${log}"
-          for line in \
-            'rootless_launch: scenario direct verified (reached the exec stage)' \
-            'rootless_launch: scenario helper verified (reached the exec stage)'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless_launch did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for bad in 'helper case not requested' 'root=true' 'rootless_launch: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_launch reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless_launch verified"
+            scripts/run-with-deadline.sh --name rootless_launch --deadline 240 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_launch -- --ignored
+          # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。文言はソースから導出（#2768）
+          scripts/check-success-lines.sh --name rootless_launch --src crates/core/tests/rootless_launch.rs \
+            --log "${log}" --select '^rootless_launch: scenario ' --subst name=direct,helper --min 2 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless_launch: ignored' --summary
 
       - name: rootless の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1447,28 +2243,14 @@ jobs:
           log="${RUNNER_TEMP}/rootless.log"
           euid="$(id -u)"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless -- --ignored 2>&1 | tee "${log}"
-          for mode in direct helper; do
-            line="rootless: scenario ${mode} lifecycle verified with the real entrypoint as PID 1"
-            line+=" (create/start/kill/delete-rejected; host uid=${euid}; via ProductionLauncher)"
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::rootless did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          part='rootless: abandoned launch handle: PID 1 exited by its lifetime bound and left nothing behind ('
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::rootless did not report: ${part} (possibly not executed)" >&2
-            exit 1
-          fi
-          for bad in 'helper case not requested' 'root=true' 'rootless: ignored'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          echo "::notice::rootless verified"
+            scripts/run-with-deadline.sh --name rootless --deadline 540 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless -- --ignored
+          # direct,helper は FANDHE_CONTAINER_TEST_ID_HELPER=1 で決まる実行条件の宣言。
+          # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED（変われば導出との照合で失敗する）
+          scripts/check-success-lines.sh --name rootless --src crates/core/tests/rootless.rs --log "${log}" \
+            --select '^rootless: (scenario |abandoned launch handle)' --subst mode=direct,helper \
+            --subst EXIT_ENTRY_LIFETIME_EXPIRED=75 --subst euid="${euid}" --subst egid="$(id -g)" --min 3 \
+            --forbid 'helper case not requested' --forbid 'root=true' --forbid 'rootless: ignored' --summary
 
       - name: rootless_uid_mapping の実行（実機前提テスト・--ignored。CORE-6・SEC-5・ESC-09・#2596）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
@@ -1477,34 +2259,57 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_uid_mapping.log"
           FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
-            cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored 2>&1 | tee "${log}"
-          for mode in direct helper; do
-            for part in \
-              "rootless_uid_mapping: scenario ${mode} verified (host uid=" \
-              "rootless_uid_mapping: RESULT scenario=${mode} behavior=SEC-5,CORE-6,ESC-09 "; do
-              if ! grep -Fq "${part}" "${log}"; then
-                echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
-                exit 1
-              fi
-            done
-            if ! grep -F "RESULT scenario=${mode} " "${log}" | grep -Fq ' verdict=pass'; then
-              echo "::error::rootless_uid_mapping scenario ${mode} did not report verdict=pass" >&2
-              exit 1
-            fi
-          done
-          part='rootless_uid_mapping: hung entrypoint exited by its lifetime bound ('
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
+            scripts/run-with-deadline.sh --name rootless_uid_mapping --deadline 540 --log "${log}" -- \
+              cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored
+          # host uid / gid は helper の case で subuid になるため正規表現で受け、verdict=pass は行のリテラルで照合する。
+          # 75 は crates/core/tests/support/real_entry.rs の EXIT_ENTRY_LIFETIME_EXPIRED
+          check() {
+            scripts/check-success-lines.sh --name rootless_uid_mapping \
+              --src crates/core/tests/rootless_uid_mapping.rs --log "${log}" \
+              --forbid 'helper case not requested' --forbid 'root=true' \
+              --forbid 'rootless_uid_mapping: ignored' --forbid 'verdict=fail' "$@"
+          }
+          check --select '^rootless_uid_mapping: (scenario |RESULT )' --subst name=direct,helper \
+            --subst-pos-re '[0-9]+' --subst-pos-re '[0-9]+' \
+            --subst-re want_uid='[0-9]+' --subst-re want_gid='[0-9]+' --min 4 --summary
+          check --select '^rootless_uid_mapping: hung entrypoint' --subst-pos 75 \
+            --subst-re euid='[0-9]+' --subst-re egid='[0-9]+'
+
+      # healthcheck_exec_real（`crates/supervisor/tests/healthcheck_exec_real.rs`。SUP-4・SUP-6・REPAIR-5・REPAIR-12・#2441）:
+      # healthcheck の本番の経路（supervisor → reaper → helper → 実コマンド）を rootless の稼働中コンテナで通す。
+      # 試験自身が `systemd-run --user --scope` で `--scenario` を起動するため、試験バイナリは外側を包まず scope を作らない補助で
+      # 期限だけ持つ。reaper・helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
+      # 新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: healthcheck_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/her-build.json"
+          cargo test -p fandhe-container-supervisor --test healthcheck_exec_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "healthcheck_exec_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::healthcheck_exec_real test binary not uniquely identified" >&2
             exit 1
           fi
-          for bad in 'helper case not requested' 'root=true' 'rootless_uid_mapping: ignored' 'verdict=fail'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::rootless_uid_mapping reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          grep -F 'rootless_uid_mapping: RESULT' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
-          echo "::notice::rootless_uid_mapping verified"
+          echo "HER_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: healthcheck_exec_real の実行（実機前提テスト・--ignored。SUP-4・SUP-6・REPAIR-5・#2441）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/healthcheck_exec_real.log"
+          USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name healthcheck_exec_real --deadline 540 --log "${log}" -- \
+            "${HER_BIN}" --ignored
+          scripts/check-success-lines.sh --name healthcheck_exec_real \
+            --src crates/supervisor/tests/healthcheck_exec_real.rs --log "${log}" \
+            --select '^healthcheck_exec_real: (scenario=|real helper ran)' --min 2 \
+            --forbid 'healthcheck_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
       # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
       # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
@@ -1530,42 +2335,30 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/supervisor_bin_real.log"
-          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" "${SBR_BIN}" --ignored 2>&1 | tee "${log}"
-          final='supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs captured,'
-          final+=' seccomp denial recorded once; failed start left no process; restart fails closed until #2043;'
-          final+=' SIGTERM via the control channel recorded Stopped(43) and the stopped container was deleted;'
-          final+=' ESC-03 mount denied via the SeccompNotifyHub and recorded once'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::supervisor_bin_real did not report the final line (possibly not executed)" >&2
-            exit 1
-          fi
-          for part in \
-            'supervisor_bin_real: id mapping verified (model=subordinate' \
-            'supervisor_bin_real: scenario=A ok ' \
-            'supervisor_bin_real: scenario=B ok ' \
-            'supervisor_bin_real: scenario=C ok ' \
-            'supervisor_bin_real: scenario=D ok ' \
-            'supervisor_bin_real: scenario=E ok ' \
-            'supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log'; do
-            if ! grep -Fq "${part}" "${log}"; then
-              echo "::error::supervisor_bin_real did not report: ${part} (possibly not executed)" >&2
-              exit 1
-            fi
-          done
-          for bad in 'supervisor_bin_real: ignored' 'precondition failed' 'model=single'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::supervisor_bin_real reported an unexpected line: ${bad}" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "${final}"
-            grep -F 'supervisor_bin_real: id mapping verified' "${log}" || true
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::supervisor_bin_real verified"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name supervisor_bin_real --deadline 540 --log "${log}" -- \
+            "${SBR_BIN}" --ignored
+          check() {
+            scripts/check-success-lines.sh --name supervisor_bin_real \
+              --src crates/supervisor/tests/supervisor_bin_real.rs --log "${log}" \
+              --forbid 'supervisor_bin_real: ignored' --forbid 'PRECONDITION FAILED' \
+              --forbid 'not applicable' --forbid 'model=single' "$@"
+          }
+          # 7 は試験の PROBE_EXIT、43 は fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST（変われば導出との照合で失敗する）。
+          # scenario B の code は試験が Unimplemented 以外だけを assert するため正規表現で受ける
+          sel='^supervisor_bin_real: (start reported OK|scenario=[A-E] ok |seccomp denial returned|ESC-03 '
+          sel+='|SIGTERM delivered)'
+          check --select "${sel}" \
+            --subst PROBE_EXIT=7 --subst TERM_HANDLER_EXIT=43 --subst label=mount \
+            --subst-re pid='[1-9][0-9]*' --subst-re first_pid='[1-9][0-9]*' \
+            --subst-re relaunched_pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
+            --subst-pos-re '[A-Z_]+' --min 9 --summary
+          # model は subordinate に固定する（FANDHE_CONTAINER_TEST_ID_HELPER=1。single は期待行にも forbid にも掛かって失敗する）
+          check --select '^supervisor_bin_real: id mapping verified ' \
+            --subst-pos subordinate --subst-pos-re '[1-9][0-9]*' --subst-pos-re '[1-9][0-9]*' --summary
 
-      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・CORE-3・CORE-4・OCI-6・#2596）: CLI は同じディレクトリの
-      # supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
+      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・SUP-12・SEC-4・OCI-6・#2596・#2761・#3097）: CLI は
+      # ディレクトリの supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
       # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
       # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
       - name: start_stop_delete_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
@@ -1584,33 +2377,218 @@ jobs:
           fi
           echo "SSD_BIN=${bins}" >> "$GITHUB_ENV"
 
-      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・#2596）
+      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・SEC-1・#2596・#2833・#3097）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/start_stop_delete_real.log"
           USER="$(id -un)" \
-            systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
-          final='start_stop_delete_real: cli start ran the container under the production launcher;'
-          final+=' stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs'
-          if ! grep -Fxq "${final}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report the final line (possibly not executed)" >&2
+            scripts/run-in-user-scope.sh --name start_stop_delete_real --deadline 540 --log "${log}" -- \
+              "${SSD_BIN}" --ignored
+          # create の起動オプション・--cap-drop・state の 3 時点と kill TERM（#2761・#2833・#3097）・最終行を、ソースから導出して照合する
+          # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_stop_delete_real: FAILED`。両方を禁止（#2957）
+          scripts/check-success-lines.sh --name start_stop_delete_real \
+            --src crates/cli/tests/start_stop_delete_real.rs \
+            --log "${log}" --select '^start_stop_delete_real: (create |state |kill |scenario ok |cli start )' \
+            --subst-re scope_present='(true|false)' --min 7 \
+            --forbid 'start_stop_delete_real: skipped' --forbid 'start_stop_delete_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
+      # network_modes_real（`crates/cli/tests/`。NET-6・NET-12・CLI-1・SEC-1・REPAIR-12・#3345）:
+      # `create` の `--network none|host`・`--add-host`・`--dns` が本番の rootless の start でコンテナに
+      # 効くことと、delete 後に生成物の残骸が無いことを確かめる。
+      # 前提・実行方法は start_stop_delete_real と同じ（上の前提確認ステップ。supervisor の bin を先にビルドして置き、試験バイナリを
+      # 委譲スコープの中で直接実行する）。host モードは runner の netns を共有するだけで、ホストのネットワーク設定を変えない。
+      # 新しい check-run・sudo・permissions は追加しない。
+      - name: network_modes_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor
+          json="${RUNNER_TEMP}/nmr-build.json"
+          cargo test -p fandhe-container-cli --test network_modes_real --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "network_modes_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::network_modes_real test binary not uniquely identified" >&2
             exit 1
           fi
-          part='start_stop_delete_real: scenario ok scope_present_before_delete='
-          if ! grep -Fq "${part}" "${log}"; then
-            echo "::error::start_stop_delete_real did not report: ${part} (possibly not executed)" >&2
-            exit 1
-          fi
-          for bad in 'start_stop_delete_real: skipped' 'start_stop_delete_real: FAILED'; do
-            if grep -Fq "${bad}" "${log}"; then
-              echo "::error::start_stop_delete_real reported an unexpected line: ${bad}" >&2
+          echo "NMR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: network_modes_real の実行（実機前提テスト・--ignored・委譲スコープ。NET-6・NET-12・CLI-1・#3345）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/network_modes_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name network_modes_real --deadline 540 --log "${log}" -- \
+              "${NMR_BIN}" --ignored
+          # 成功行 5 件をソースから導出して照合する。失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `network_modes_real: FAILED`
+          scripts/check-success-lines.sh --name network_modes_real \
+            --src crates/cli/tests/network_modes_real.rs \
+            --log "${log}" --select '^network_modes_real: (default |none |a second start |host |delete )' --min 5 \
+            --forbid 'network_modes_real: skipped' --forbid 'network_modes_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'not applicable' --summary
+
+      # start_scope_real・delete_cgroup_real・start_recover_real（`crates/cli/tests/`。CORE-2・CORE-3・CORE-4・CORE-6・SUP-1・CLI-1・
+      # SEC-1・OCI-6・REPAIR-7・#2081・#2061・#2011・#3105）: 委譲 cgroup の CLI 実機前提テスト。前提（非 root・user manager の
+      # private ソケット・cgroup v2・Landlock ABI 6 以上）は上の前提確認ステップが fail-closed で確かめる。root の分岐は無い
+      # （3 本とも root を拒否する）。新しい check-run・sudo・permissions は追加しない。
+      # - start_scope_real は委譲スコープで**包まない**: シナリオ A は CLI が自分で `systemd-run --user --scope` を呼ぶ経路を通し、
+      #   シナリオ B（試験の感度）は試験プロセスが非委譲 cgroup にいて、同居した代役の detect / prepare が拒否されることを期待する。
+      #   包むと B の確認が逆になるため、「直す」つもりで包まないこと。
+      # - delete_cgroup_real・start_recover_real は委譲スコープの中で直接実行する（自分の cgroup = 検出する委譲 cgroup）。
+      # - start_recover_real は CLI と supervisor を試験本体が専用の bin/ へ複製し、launcher が無いことを確かめる
+      #   （target/debug の launcher が隣にあると rootful とみなされるため。CI のファイル削除では回避しない）。
+      - name: 委譲 cgroup の CLI 実機前提テスト 3 本のビルド（バイナリの特定。実行の時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/cli-cgroup-real-build.json"
+          cargo test -p fandhe-container-cli \
+            --test start_scope_real --test delete_cgroup_real --test start_recover_real \
+            --no-run --message-format=json > "${json}"
+          for pair in start_scope_real:SCR_BIN delete_cgroup_real:DCR_BIN start_recover_real:SRR_BIN; do
+            name="${pair%%:*}"
+            var="${pair##*:}"
+            sel="select(.profile.test == true and .target.name == \"${name}\") | .executable"
+            bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+            if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+              echo "::error::${name} test binary not uniquely identified" >&2
               exit 1
             fi
+            echo "${var}=${bins}" >> "$GITHUB_ENV"
           done
-          echo "${final}" >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::start_stop_delete_real verified"
+
+      - name: start_scope_real の実行（実機前提テスト・--ignored・包まない。CORE-3・CORE-4・SUP-1・CLI-1・#2081・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/start_scope_real.log"
+          USER="$(id -un)" scripts/run-with-deadline.sh --name start_scope_real --deadline 540 --log "${log}" -- \
+            "${SCR_BIN}" --ignored
+          # 失敗の 1 行目は前提欠如が `PRECONDITION FAILED`、それ以外が `start_scope_real: FAILED`
+          scripts/check-success-lines.sh --name start_scope_real \
+            --src crates/cli/tests/start_scope_real.rs \
+            --log "${log}" --select '^start_scope_real: supervisor ran alone' \
+            --forbid 'start_scope_real: skipped' --forbid 'start_scope_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' \
+            --summary
+
+      - name: delete_cgroup_real の実行（実機前提テスト・--ignored・委譲スコープ。OCI-6・CORE-3・SEC-1・#2061・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/delete_cgroup_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name delete_cgroup_real --deadline 540 --log "${log}" -- \
+              "${DCR_BIN}" --ignored
+          scripts/check-success-lines.sh --name delete_cgroup_real \
+            --src crates/cli/tests/delete_cgroup_real.rs \
+            --log "${log}" --select '^delete_cgroup_real: cli delete removed' \
+            --forbid 'delete_cgroup_real: skipped' --forbid 'delete_cgroup_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'delete_cgroup_real: cleanup incomplete' \
+            --summary
+
+      - name: start_recover_real の実行（実機前提テスト・--ignored・委譲スコープ。CORE-2・SEC-1・OCI-6・#2011・#3105）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/start_recover_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name start_recover_real --deadline 540 --log "${log}" -- \
+              "${SRR_BIN}" --ignored
+          scripts/check-success-lines.sh --name start_recover_real \
+            --src crates/cli/tests/start_recover_real.rs \
+            --log "${log}" --select '^start_recover_real: a second cli start' \
+            --forbid 'start_recover_real: skipped' --forbid 'start_recover_real: FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'start_recover_real: cleanup failed' \
+            --summary
+
+      # production_binary_full_lifecycle_real（`crates/plugin-cri/tests/container_grpc.rs`。libtest の
+      # `#[ignore]`。CRI-2・CRI-3・PLUG-1・#2592・#2818）: plugin-cri の本番バイナリ越しに、
+      # 実レジストリ（docker.io/library/busybox:1.36）からの PullImage →
+      # ImageStatus / ListImages → RunPodSandbox → タグで CreateContainer → Start → Stop → Remove → StopPodSandbox →
+      # RemovePodSandbox の一連を通す。前提（user namespace・委譲 cgroup・user manager の private ソケット・Landlock ABI 6 以上）は
+      # 上の前提確認ステップが fail-closed で確かめる（本試験の前提は同じ）。root の分岐は無い。新しいジョブ・check-run・sudo・
+      # permissions は追加しない。
+      # - launcher 回避: `target/debug/` には前段のビルドで fandhe-container-launcher が置かれる。plugin の隣にあると
+      #   ProductionStarter が rootful 経路（file capability 前提）へ入って失敗するため、試験本体が plugin と supervisor だけを
+      #   専用ディレクトリへ複製し、launcher が無いことを assert してから起動する（start_stop_delete_real と同じ扱い）。
+      # - 成功行の照合: scripts/check-success-lines.sh の `--libtest-ignored` が `#[ignore]` 関数から `test <名前> ... ok` を導き、
+      #   `test result: ok. 2 passed; 0 failed;` と ignored / FAILED の不在をあわせて照合する（runtime_service_namespaces と同じ。#2959）。
+      # - 2 試験を 1 回の起動で回す（#3225）: 同じファイルの `#[ignore]` は production_binary_full_lifecycle_real と
+      #   production_binary_restart_readopts_running_container_real（running のコンテナを残した
+      #   plugin-cri の再起動。CRI-1・CRI-2・CORE-1）の 2 件で、
+      #   インスタンスロックのため `--test-threads=1` の直列が必須（名前順で lifecycle が先）。
+      #   再起動の試験は supervisor の起動が本物の `XDG_RUNTIME_DIR/systemd/private` を要するため本物の状態ルートを共有し、記録が空でなければ fail-closed にする。
+      #   `--exact` を外したので、照合は 2 件の ok と `2 passed` を要求する。
+      # - rate limit の方式: 1 回の実行で pull は 2 回（各試験 1 回。小さい公開イメージの busybox:1.36）。事前に HEAD の manifest で匿名 pull の
+      #   残量を確かめる（HEAD は pull 回数に数えない）。残量 0・429 は識別文言（`anonymous pull rate limit exhausted`）で
+      #   pull を消費する前に fail-closed にする。試験自身も gRPC メタデータから 429 を識別して固定行を出す（#2966）が、
+      #   試験が失敗したときも同じプローブを事後診断として再実行し、rate limit が原因なら文言で分かるようにする。
+      #   最低残量（#3312）: pull は 2 回なので事前確認は PROBE_MIN_REMAINING=2 を要求し、残量 1 以下は
+      #   `anonymous pull remaining below required minimum` で pull を消費する前に fail-closed にする。
+      #   事後診断は 2 回 pull した後で残量 1 が正当にあり得るため、既定の 1 のまま回す（誤診断を避ける）。
+      # - 実行頻度: 他の `--ignored` 試験と揃えて PR と main の両方（ubuntu のみ）で回す。rate limit で頻繁に赤になる場合は
+      #   main と workflow_dispatch のみへ絞る判断をオーナーへ上げる（Docker Hub のミラー切替は試験定数の変更が要るため別 issue）。
+      # - timeout: 試験の watchdog が 900 秒と 600 秒（2 試験の和）・pull の期限が 300 秒のため、実行ステップは標準の 10 分ではなく 30 分にする
+      #   （watchdog より先に step timeout が切れると試験側の診断が失われる）。
+      - name: Docker Hub の匿名 pull 残量の確認（production_binary_full_lifecycle_real の前提。CRI-3・#2818・#3312）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          line="$(make --no-print-directory docker-hub-ratelimit-probe PROBE_MIN_REMAINING=2)"
+          echo "${line}"
+          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: production_binary_full_lifecycle_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/pcri-build.json"
+          cargo test -p fandhe-container-plugin-cri --test container_grpc --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "container_grpc") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::container_grpc test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "PCRI_TEST_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: container_grpc の実機前提試験 2 件の実行（--ignored・委譲スコープ。CRI-2・CRI-3・PLUG-1・#2818・#3225）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        # 全体期限 1860 秒 = timeout-minutes(32) × 60 - 60。2 試験の watchdog（各 900 秒）の和より後に効かせる（#3486・REPAIR-5）。
+        timeout-minutes: 32
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/production_binary_full_lifecycle_real.log"
+          rc=0
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name container_grpc --deadline 1860 --log "${log}" -- "${PCRI_TEST_BIN}" \
+            --ignored --test-threads=1 || rc=$?
+          if [ "${rc}" -ne 0 ]; then
+            # 事後診断: 試験の固定行（#2966）に加え、rate limit が原因ならここでも識別文言が出る。
+            make --no-print-directory docker-hub-ratelimit-probe || true
+            msg="production_binary_full_lifecycle_real failed"
+            msg+=" (see above; a docker hub rate limit is reported explicitly)"
+            echo "::error::${msg}" >&2
+            exit 1
+          fi
+          scripts/check-success-lines.sh --name production_binary_full_lifecycle_real \
+            --src crates/plugin-cri/tests/container_grpc.rs --log "${log}" --libtest-ignored \
+            --select '^test [A-Za-z0-9_]+ \.\.\. ' --summary
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
@@ -1652,12 +2630,14 @@ jobs:
       # 長いものを先に並べる。ターゲットごとのログは `::group::` で出力し、1 つでも失敗すれば失敗する。
       # 対象: fio-bench・fio-baseline-ratio（TASK-25.1・25.2・IO-8）・bench-check・bench-baseline（REPAIR-8・TASK-88.1）・
       # startup-latency（TASK-46.1・CORE-10）・net-setup-timing（TASK-139.5・NET-4。実測は TASK-140）・
+      # net-throughput-rtt（TASK-140 準備・#1882・NET-2・NET-3。スタブのみ。実測は #319）・
       # dns-helper-measure（TASK-141.3・NET-5。実測は TASK-142）・idle-memory（TASK-45.1・CORE-7）・
       # concurrent-memory（TASK-50.1・50.2・CORE-9）・idle-memory-supervised（TASK-47）・
       # supervisor-independence（TASK-162・SUP-5。実機実証は #499）・supervisor-pss（TASK-158・SUP-2。実測は #485）・
       # restart-latency（TASK-160・SUP-3。実測は #491）
       # crictl-smoke（TASK-60・CRI-1。スタブの crictl のみ。実機は #442）
       # small-files-compare（TASK-24.1・IO-7。スタブのハーネスのみ。実測は #107、評価は #110）
+      # mac-small-files（TASK-70 準備・#1880・MAC-3。スタブの docker のみ。実測は #381・#354）
       # install-launcher（TASK-171 追補・#1721・SUP-14。スタブのみ）・cli-parity の期限・回収（#1688・REPAIR-5。platform-ci の ubuntu 分を移した）
       - name: 計測スクリプト群の自己テスト（並列 3。REPAIR-12）
         run: >-
@@ -1677,8 +2657,10 @@ jobs:
           bench-check-selftest
           bench-baseline-selftest
           net-setup-timing-selftest
+          net-throughput-rtt-selftest
           dns-helper-measure-selftest
           small-files-compare-selftest
+          mac-small-files-selftest
       - name: ベンチ比較の配線確認（プレースホルダ・性能回帰は未検出）
         run: make bench-check
       # 計測とログ出力のみ。baseline.json 未登録のため基準値比較はせず、Δp50 の 15% 回帰判定は
@@ -1689,9 +2671,11 @@ jobs:
         run: make bench-plugin-boundary
       # core の既定 / plugin 除外（--no-default-features）release ビルドと成果物サイズの記録
       # （PLUG-3・TASK-111.2・#263）。新ジョブは check-run 名が増え ruleset 変更が要るため
-      # 既存ジョブのステップとする（本 workflow の check-run 件数は不変）。計測対象は rlib（最終バイナリ未実装。
-      # TASK-79 後に実行ファイルへ切り替える）で、差は僅少のため軽量化効果の実測ではない
+      # 既存ジョブのステップとする（本 workflow の check-run 件数は不変）。計測対象は rlib（CLI の実行ファイルは
+      # plugin を除外してビルドできないため。#2170）で、差は僅少のため軽量化効果の実測ではない
+      # CLI の実行ファイルを既定と --no-default-features の 2 回 release ビルドして記録する（#3204）。
       - name: plugin feature 除外ビルドとサイズ記録（PLUG-3・TASK-111.2）
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail

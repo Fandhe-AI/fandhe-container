@@ -9,6 +9,9 @@
 //! 結果のエラーを `CriError`（ERR-3）へ写す。core の型は公開 API へ漏らさず、
 //! [`RuntimeContainerStatus`] へ写して返す。
 //!
+//! 呼び出し元は `runtime_service` の RPC ハンドラと、shim v2 の `shim_v2::TaskService`（TASK-62.5）。
+//! 同じ [`RuntimeAdapter`] を clone して両方へ渡せる。
+//!
 //! **同期 API**: `ContainerRuntime` は同期トレイトで、plugin 越しの実装は REPAIR-5 のタイムアウトを持つ
 //! RPC になり得る。async ハンドラからは `tokio::task::spawn_blocking` 上で呼ぶこと（`image_pull` の前例）。
 //!
@@ -19,18 +22,19 @@
 //! （bundle の供給は [`BundleProvider`] の注入点だけを定義し、config 変換と bundle の寿命は `crate::bundle`）。
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_core::traits::{
-    CleanupOutcome, ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
-    DeleteRequest, DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
-    TerminationReason, TraitError,
+    CleanupOutcome, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
+    ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal,
+    StartRequest, StateRequest, StopRequest, TerminationReason, TraitError, WaitExitRequest,
 };
 use tonic::Status;
 
 use crate::error::{CriError, CriErrorCode};
+use crate::port_mapping::PodPortPublish;
 use crate::runtime::v1::ContainerState as CriContainerState;
 use crate::runtime::v1::{ContainerConfig, PodSandboxConfig};
 
@@ -148,6 +152,8 @@ pub enum RuntimeCleanupOutcome {
     Removed,
     /// 既に無かった。
     AlreadyAbsent,
+    /// 同じ ID が再作成済みで、新しいインスタンスの資源として消さずに残した（失敗ではない。SUP-7・#3143）。
+    Superseded,
     /// 消せずに残した。
     Kept {
         /// 残した理由の分類。
@@ -162,6 +168,7 @@ impl RuntimeCleanupOutcome {
             CleanupOutcome::NotApplicable => Self::NotApplicable,
             CleanupOutcome::Removed => Self::Removed,
             CleanupOutcome::AlreadyAbsent => Self::AlreadyAbsent,
+            CleanupOutcome::Superseded => Self::Superseded,
             CleanupOutcome::Kept { code } => Self::Kept {
                 code: CriError::from(&TraitError::new(code, "")).code(),
             },
@@ -223,6 +230,17 @@ pub struct BundleRequest<'a> {
     pub sandbox_config: &'a PodSandboxConfig,
     /// 作成するコンテナの設定。
     pub config: &'a ContainerConfig,
+    /// 所属サンドボックスの pod network namespace のパス（[`PodNetworkProvider::set_up`] が返した値。
+    /// 無ければ `None`）。`namespace_options.network` が `POD` のときだけ `linux.namespaces` の network に
+    /// `path` として出す（#2675・CRI-2・NET-1）。
+    pub pod_netns_path: Option<&'a Path>,
+    /// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。`Some` で ipc が `POD` のとき
+    /// だけ ipc を join にする。供給元（保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。
+    /// パスは sandbox の記録の保持役の pid から `crate::bundle::PodNamespacePaths::for_holder_pid` で作る（#2776）。
+    pub pod_namespaces: Option<&'a crate::bundle::PodNamespacePaths>,
+    /// 立ったら rootfs の用意（レイヤー展開）をエントリ単位で打ち切る取り消しの旗（REPAIR-5・CRI-2・#2899）。
+    /// `CreateContainer` の RPC が期限切れで worker を手放したときに立つ。`None` は取り消しなし。
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl<'a> BundleRequest<'a> {
@@ -238,7 +256,236 @@ impl<'a> BundleRequest<'a> {
             sandbox_id,
             sandbox_config,
             config,
+            pod_netns_path: None,
+            pod_namespaces: None,
+            cancel: None,
         }
+    }
+
+    /// rootfs の用意を打ち切る取り消しの旗を足す（#2899）。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a std::sync::atomic::AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// pod network namespace のパスを足す（#2675）。
+    #[must_use]
+    pub fn with_pod_netns_path(mut self, path: Option<&'a Path>) -> Self {
+        self.pod_netns_path = path;
+        self
+    }
+
+    /// pod の user・ipc namespace のパスを足す（#2674）。
+    #[must_use]
+    pub fn with_pod_namespaces(
+        mut self,
+        pod_namespaces: &'a crate::bundle::PodNamespacePaths,
+    ) -> Self {
+        self.pod_namespaces = Some(pod_namespaces);
+        self
+    }
+}
+
+/// pod の network namespace を `NetworkPlugin` 経由で作って結線する注入点（#2675・CRI-2・NET-1・PLUG-1）。
+///
+/// `RunPodSandbox`（`namespace_options.network` が `POD`）が worker スレッドから [`PodNetworkProvider::set_up`] を、
+/// `StopPodSandbox`・`RemovePodSandbox` が [`PodNetworkProvider::tear_down`] を呼ぶ。実装は plugin-cri が
+/// `NetworkPlugin`（core のトレイト境界）へ写して差す。cri は net の具象型を知らない（CRI-7）。
+///
+/// **未実装・簡易実装（REPAIR-3）**: コンテナが netns へ入る側（core の `linux.namespaces[].path` の受け入れ）は
+/// 未実装で、注入しても start は `UNIMPLEMENTED` で拒否される。本番の plugin-cri は注入しない
+/// （`docs/design/cri-config-acceptance.md` の順 13）。
+/// エラー文言に config の値・パスを含めないこと。
+pub trait PodNetworkProvider: Send + Sync {
+    /// サンドボックスの netns を作って結線し、そのパスを返す。失敗時は資源を残さない（残るなら `Err` で報告）。
+    fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError>;
+
+    /// `set_up` で用意した資源を解放する。冪等で、未知の ID・不在は `Ok`。失敗は資源が残るとみなされる。
+    fn tear_down(&self, sandbox_id: &str) -> Result<(), CriError>;
+}
+
+/// [`PodNetworkProvider::set_up`] への入力。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PodNetworkRequest<'a> {
+    /// サンドボックス ID（`RunPodSandbox` が採番した値）。
+    pub sandbox_id: &'a str,
+    /// サンドボックスの設定（dns_config 等。現状の実装は読まない）。公開指定は [`Self::port_publishes`] を使い、
+    /// `config.port_mappings` を直接読まない（検証済みの値だけを下流へ流すため）。
+    pub config: &'a PodSandboxConfig,
+    /// 検証済みの公開指定（`port_mappings` のうち `host_port > 0` のもの。#2676・CRI-2・NET-3）。
+    port_publishes: &'a [PodPortPublish],
+}
+
+impl<'a> PodNetworkRequest<'a> {
+    /// 各項目から入力を作る。公開指定は空（[`Self::with_port_publishes`] で足す）。
+    pub fn new(sandbox_id: &'a str, config: &'a PodSandboxConfig) -> Self {
+        Self {
+            sandbox_id,
+            config,
+            port_publishes: &[],
+        }
+    }
+
+    /// 検証済みの公開指定を足す。
+    pub fn with_port_publishes(mut self, port_publishes: &'a [PodPortPublish]) -> Self {
+        self.port_publishes = port_publishes;
+        self
+    }
+
+    /// 検証済みの公開指定。`set_up` はこれをすべて公開するか、失敗して資源を残さない。
+    pub fn port_publishes(&self) -> &'a [PodPortPublish] {
+        self.port_publishes
+    }
+}
+
+/// [`PodNetworkProvider::set_up`] の結果（結線済みの pod network namespace）。
+///
+/// 将来の項目（IP の報告等）の追加に備えて `#[non_exhaustive]` とし、[`PodNetns::new`] で作る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PodNetns {
+    path: PathBuf,
+}
+
+impl PodNetns {
+    /// Linux 側の netns の絶対パスから作る。bundle の `linux.namespaces[].path` へ載せる値なので、ホスト OS に
+    /// よらず `SpecBundleProvider` と同じ規則（`crate::bundle::spec` の `check_host_source`: `/` 始まり・`\` 無し・
+    /// `.`・`..`・空要素無し・4096 バイト以内・NUL 無し）で検証する（provider が受けたパスを bundle が拒否する
+    /// 食い違いを作らない。壊れた値を bundle へ流さない多層防御。違反は `INTERNAL`）。
+    pub fn new(path: PathBuf) -> Result<Self, CriError> {
+        let ok = path
+            .to_str()
+            .is_some_and(|s| crate::bundle::spec::check_host_source("pod netns path", s).is_ok());
+        if ok {
+            Ok(Self { path })
+        } else {
+            Err(CriError::internal("invalid pod network namespace path"))
+        }
+    }
+
+    /// netns のパス。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// [`BundleProvider::prepare`] の結果（bundle のパスと、実際に適用する値の報告。#2771・CRI-2・OCI-1・SEC-5）。
+///
+/// 将来の報告項目の追加に備えて `#[non_exhaustive]` とし、[`PreparedBundle::new`] と `with_*` で作る。
+/// `CriRuntimeService` が受け取って `ContainerRecord` に記録し、`ContainerStatus` の `user`・`stop_signal` と
+/// StopContainer が使うシグナルに反映する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PreparedBundle {
+    path: PathBuf,
+    user: Option<crate::bundle::AppliedUser>,
+    stop_signal: Option<crate::runtime::v1::Signal>,
+    image: Option<crate::bundle::ResolvedImage>,
+}
+
+impl PreparedBundle {
+    /// 報告なしで bundle のパスだけを返す。
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            user: None,
+            stop_signal: None,
+            image: None,
+        }
+    }
+    /// create 時に解決したイメージ（image ID と digest 参照）の報告を足す（#2831。`image_ref`・`image_id` の元）。
+    pub fn with_image(mut self, image: crate::bundle::ResolvedImage) -> Self {
+        self.image = Some(image);
+        self
+    }
+    /// 解決したイメージ（報告が無ければ `None`。`image_ref`・`image_id` は空になる）。
+    pub fn image(&self) -> Option<&crate::bundle::ResolvedImage> {
+        self.image.as_ref()
+    }
+    /// 起動時に適用する uid・gid・補助グループの報告を足す。
+    pub fn with_user(mut self, user: crate::bundle::AppliedUser) -> Self {
+        self.user = Some(user);
+        self
+    }
+    /// 実際に stop で使うシグナル（解決済み。`RUNTIME_DEFAULT` ではない）の報告を足す。
+    pub fn with_stop_signal(mut self, signal: crate::runtime::v1::Signal) -> Self {
+        self.stop_signal = Some(signal);
+        self
+    }
+    /// bundle の絶対パス。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// 適用する識別情報（報告が無ければ `None`。root を作り出さない）。
+    pub fn user(&self) -> Option<&crate::bundle::AppliedUser> {
+        self.user.as_ref()
+    }
+    /// 解決済みの stop signal（報告が無ければ `None`）。
+    pub fn stop_signal(&self) -> Option<crate::runtime::v1::Signal> {
+        self.stop_signal
+    }
+}
+
+/// bundle 解放に付ける期限と取り消しの旗（#3142・CRI-2・REPAIR-5・OCI-7）。
+///
+/// `RemoveContainer` の worker と `CreateContainer` の巻き戻しが `BundleProvider::release_bounded` へ渡す。
+/// 期限は絶対時刻、旗は RPC の期限切れ・future の破棄で立つ。尽きたら実装は次のエントリの前で止まり
+/// `Timeout` を返す（消した分は残り、再実行が続きから消す）。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct ReleaseBudget<'a> {
+    /// この時刻以降は尽きたとみなす（`None` は期限なし）。
+    pub deadline: Option<std::time::Instant>,
+    /// 立ったら尽きたとみなす（`None` は取り消しなし）。
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl<'a> ReleaseBudget<'a> {
+    /// 期限も取り消しも無い予算（従来の `release` と同じ）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 期限（絶対時刻）を足す。
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// 取り消しの旗を足す。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: &'a std::sync::atomic::AtomicBool) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// 尽きていれば固定文言の `Timeout`（ID・パスを含めない。ERR-3）。
+    pub fn check(&self) -> Result<(), CriError> {
+        if self
+            .cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(CriError::timeout("bundle release exceeded its deadline"));
+        }
+        Ok(())
+    }
+
+    /// oci の削除用の予算へ写す（`RootfsSource` の実装が使う）。
+    pub fn to_extract_budget(&self) -> fandhe_container_oci::layer::extract::ExtractBudget<'a> {
+        let mut b = fandhe_container_oci::layer::extract::ExtractBudget::new();
+        if let Some(d) = self.deadline {
+            b = b.with_deadline(d);
+        }
+        if let Some(c) = self.cancel {
+            b = b.with_cancel(c);
+        }
+        b
     }
 }
 
@@ -251,23 +498,39 @@ impl<'a> BundleRequest<'a> {
 /// 汎用の実装として `crate::bundle::SpecBundleProvider`（config 変換と bundle ディレクトリの寿命。#2395）がある。
 ///
 /// 本番の rootfs 供給は `crate::bundle::ImageRootfsSource`（pull 済みイメージの再展開と既定値の読み取り。#2433）で、
-/// plugin-cri が `SpecBundleProvider` と組んで差す。タグの解決は未実装（REPAIR-3。image ID のみ受ける）。
+/// plugin-cri が `SpecBundleProvider` と組んで差す。`ImageStore` を注入するとタグ・digest 参照も image ID へ解決し、解決結果を `PreparedBundle::image` で報告する（#2592・#2831）。未注入では image ID のみ受ける（REPAIR-3）。
 /// `config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
 pub trait BundleProvider: Send + Sync {
-    /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError>;
+    /// コンテナ用の bundle を用意し、その絶対パスと実際に適用する値の報告を返す。失敗は ERR-3 の gRPC ステータスで返す。
+    ///
+    /// 報告（[`PreparedBundle::user`]・[`PreparedBundle::stop_signal`]）の無い実装は [`PreparedBundle::new`] だけを返す。
+    /// その場合 `ContainerStatus.user` は未報告（`None`）、stop signal は CRI の config の値だけで解決する。
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError>;
 
     /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete は TASK-59.3 で接続済み）。
     ///
     /// 削除・解除に失敗したら `Err` を返す。呼び出し側は `Err` のとき資源が残っているとみなし、
     /// コンテナの記録と件数枠を保持して追跡を失わない（fail-closed）。不在は `Ok` としてよい。
     fn release(&self, container_id: &str) -> Result<(), CriError>;
+
+    /// `release` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5）。尽きたら `Timeout` を返し、残りは再実行が消す。
+    ///
+    /// 既定は予算を無視して `release` を呼ぶ（時間で打ち切れない実装向け。REPAIR-3: 打ち切れる実装だけが上書きする）。
+    fn release_bounded(
+        &self,
+        container_id: &str,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
+        let _ = budget;
+        self.release(container_id)
+    }
 }
 
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。
 ///
 /// トレイトオブジェクト（[`RuntimeAdapter::new`]）とジェネリクス（[`RuntimeAdapter::from_runtime`]）の
-/// 両方で受けられ、core の具象実装に依存しない。`Clone` は `Arc` の複製で安価。
+/// 両方で受けられ、core の具象実装に依存しない。`Clone` は `Arc` の複製で安価で、複製は同じ実装を指す
+/// （RuntimeService と shim v2 の `TaskService` が共有する。TASK-62.5・CRI-7）。
 #[derive(Clone)]
 pub struct RuntimeAdapter {
     runtime: Arc<dyn ContainerRuntime>,
@@ -303,7 +566,19 @@ impl RuntimeAdapter {
 
     /// `created` 状態のコンテナを開始する。
     pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
-        let req = StartRequest::new(Self::id(id)?);
+        self.start_with_log_path(id, None)
+    }
+
+    /// CRI ログの書き先つきで開始する（CRI-2・SUP-4・#2671）。`None` は [`Self::start`] と同じ。
+    pub fn start_with_log_path(
+        &self,
+        id: &str,
+        log_path: Option<ContainerLogPath>,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let mut req = StartRequest::new(Self::id(id)?);
+        if let Some(log_path) = log_path {
+            req = req.with_log_path(log_path);
+        }
         Self::finish(id, self.runtime.start(&req))
     }
 
@@ -311,8 +586,24 @@ impl RuntimeAdapter {
     ///
     /// 負値は 0（即時 SIGKILL）に丸める。上限（24 時間。REPAIR-5）超過は `INVALID_ARGUMENT`。
     pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, CriError> {
+        self.stop_with_signal(id, timeout_secs, Signal::SIGTERM.as_u8())
+    }
+
+    /// 最初に送るシグナル（Linux の番号 1..=64。範囲外は `INVALID_ARGUMENT`）を指定して停止する。
+    ///
+    /// CRI の `stop_signal`（`stop_signal::linux_stop_signal` で写した番号。CRI-2・PLUG-1。#2668）を
+    /// `StopRequest::with_signal` で実行層へ運ぶ。猶予後の SIGKILL への切り替えは実行層が無条件に行う。
+    pub fn stop_with_signal(
+        &self,
+        id: &str,
+        timeout_secs: i64,
+        signal: u8,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let signal = Signal::new(signal).map_err(|e| CriError::from(&e))?;
         let grace = Duration::from_secs(u64::try_from(timeout_secs).unwrap_or(0));
-        let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| CriError::from(&e))?;
+        let req = StopRequest::new(Self::id(id)?, grace)
+            .map_err(|e| CriError::from(&e))?
+            .with_signal(signal);
         Self::finish(id, self.runtime.stop(&req))
     }
 
@@ -337,6 +628,31 @@ impl RuntimeAdapter {
     pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
         let req = StateRequest::new(Self::id(id)?);
         Self::finish(id, self.runtime.state(&req))
+    }
+
+    /// コンテナが `Stopped` になるまで `timeout` を上限に待つ（`ContainerRuntime::wait_exit`。CRI-1・REPAIR-5）。
+    ///
+    /// shim v2 の `Wait` が呼ぶ。`poll_interval` は既定実装（状態の照会）の間隔のヒントで、
+    /// イベント駆動の実装は無視してよい。`cancelled` が真になれば `UNAVAILABLE` で戻る。
+    /// 実行層が `Stopped` 以外の状態を返したら、plugin の不正な応答として `INTERNAL` で拒否する。
+    pub fn wait_exit(
+        &self,
+        id: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let req = WaitExitRequest::new(Self::id(id)?, timeout)
+            .and_then(|r| r.with_poll_interval(poll_interval))
+            .map_err(|e| CriError::from(&e))?
+            .with_cancel(cancelled);
+        let st = Self::finish(id, self.runtime.wait_exit(&req))?;
+        if st.lifecycle != RuntimeLifecycle::Stopped {
+            return Err(CriError::internal(
+                "runtime returned a non-stopped status from wait",
+            ));
+        }
+        Ok(st)
     }
 
     /// 実行層の応答を CRI の語彙へ写す。応答の ID が要求の ID と異なれば plugin の不正な応答として
@@ -454,6 +770,11 @@ mod tests {
             .with_container_log(CleanupOutcome::Kept {
                 code: ErrorCode::FailedPrecondition,
             });
+        let superseded = DeleteResponse::new().with_container_log(CleanupOutcome::Superseded);
+        assert_eq!(
+            RuntimeDeleteResult::from(&superseded).container_log,
+            RuntimeCleanupOutcome::Superseded
+        );
         let got = RuntimeDeleteResult::from(&resp);
         assert_eq!(got.image_rootfs, RuntimeCleanupOutcome::AlreadyAbsent);
         assert_eq!(

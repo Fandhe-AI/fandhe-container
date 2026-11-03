@@ -18,8 +18,9 @@
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - 在庫・タグ・リースの永続化は #2380 で実装済み（ひとまとまりの操作の入口が排他の中で保存する。ガードから
-//!   下位メソッドを直接呼んだ変更は保存されない）。本番で在庫を埋める経路（pull → `ImageStore` の配線。cli・cri）は
-//!   未実装のため、本番のストアの在庫は空のまま。削除の永続化完了確認と再試行
+//!   下位メソッドを直接呼んだ変更は保存されない）。在庫を埋める経路（pull → `ImageStore` の配線）は cri の
+//!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。
+//!   削除の永続化完了確認と再試行
 //!   （削除ジャーナル `gc_journal`。fsync と取得時のロールフォワード）は実装済み（#851）だが、保証するのは
 //!   ジャーナルと blob ファイルの unlink の範囲だけ。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
@@ -28,7 +29,7 @@
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
-//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）。クラッシュで残った pull の
+//!   （#475・TASK-183.10）は `pull` で実装済み（cri の `OciImagePuller::pull` から配線済み・#2539。本番の `PullImage` へは #2592 で到達済み）。クラッシュで残った pull の
 //!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
 //!   実装済み（起動時の呼び出しの配線は未実装・#2315）
 //! - 件数の上限: コンテナ参照は `MAX_CONTAINER_REFS`、manifest は `MAX_IMAGE_MANIFESTS`、タグは
@@ -94,7 +95,7 @@ pub use usage::{
 mod pull;
 pub use pull::{
     BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME, PullAbortOutcome,
-    PullPublishOutcome, PullPublishRequest, PullSession, StagingCleanup,
+    PullPublishOutcome, PullPublishRequest, PullSession, StagedBlobWriter, StagingCleanup,
 };
 
 mod pull_recovery;
@@ -107,9 +108,24 @@ mod root_handle;
 #[cfg(test)]
 mod root_swap_tests;
 mod store;
+#[cfg(test)]
+mod xdev_tests;
 pub use store::{
     IMAGE_STORE_LOCK_FILE_NAME, IMAGE_STORE_LOCK_TIMEOUT, ImageStore, ImageStoreGuard,
 };
+
+/// イメージストア root 配下の blob 置き場の相対パス要素（`<root>/blobs/sha256`）。
+///
+/// oci の fd 起点の検査（`root_handle`）・在庫走査（`usage`）・pull と、cri のキャッシュ配置が
+/// 共有する配置の契約。直書きを散らさないための単一定義（OCI-7・REPAIR-1・#2223）。
+pub const IMAGE_STORE_BLOB_DIR: [&str; 2] = ["blobs", "sha256"];
+
+/// OCI-7・REPAIR-1（#2223）: 配置の契約値を具体値で固定する（cri のキャッシュ配置も同じ値に従う）。
+#[cfg(test)]
+#[test]
+fn oci7_repair1_image_store_blob_dir_is_blobs_sha256() {
+    assert_eq!(IMAGE_STORE_BLOB_DIR, ["blobs", "sha256"]);
+}
 
 /// `ContainerRefId` の最大バイト数（core の `ContainerId` と同じ）。
 pub const CONTAINER_REF_ID_MAX_BYTES: usize = 255;
@@ -368,9 +384,27 @@ pub struct ReferenceTable {
     journal_root: JournalRoot,
 }
 
-/// `ReferenceTable` に載せる検査用の root。等価比較・複製には影響しない（テーブルの内容ではないため）。
-#[derive(Debug, Clone, Default)]
+/// `ReferenceTable` に載せる検査用の root。等価比較には影響しない（テーブルの内容ではないため）。
+///
+/// 複製しても root は引き継がない（常に未設定）。排他区間のガードを drop した後に `(*guard).clone()` で
+/// 取り出した単体テーブルが、排他取得も在庫の読み直しもなしに rm・prune・復旧の永続化操作へ届く経路を
+/// 閉じるため（OCI-7・SEC-1・#2701）。
+#[derive(Debug, Default)]
 pub(crate) struct JournalRoot(Option<std::sync::Arc<root_handle::RootHandle>>);
+
+impl JournalRoot {
+    /// 同じ root のハンドルを共有する複製。読み取り専用の計画（`ExpandedSizePlan`）が検査済み root を持ち
+    /// 回るための明示的な経路で、`ReferenceTable` の複製には使わない。
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Clone for JournalRoot {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
 
 impl PartialEq for JournalRoot {
     fn eq(&self, _: &Self) -> bool {

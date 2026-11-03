@@ -6,8 +6,16 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blobs};
+use fandhe_container_oci::error::{OciError, OciErrorCode};
+#[cfg(unix)]
+use fandhe_container_oci::layer::VerifiedLayerBlob;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::decompress_layer_to_writer;
+#[cfg(not(unix))]
+use fandhe_container_oci::layer::extract::extract_layers;
+use fandhe_container_oci::layer::extract::{ExtractLimits, ExtractedLayer};
+#[cfg(unix)]
+use fandhe_container_oci::layer::extract::{ImageLayer, extract_image_layers};
 use fandhe_container_oci::layer::verify_blob_digest;
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
@@ -134,6 +142,59 @@ fn limits() -> ExtractLimits {
     ExtractLimits::new(100, 1 << 20, 1 << 30, 1 << 20)
 }
 
+/// gzip の tar を gunzip する（blob の diff_id = 展開後 tar の sha256 を計算するため）。
+#[cfg(unix)]
+fn gunzip(gz: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(gz)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+/// digest 検証済みの gzip blob を、下位から上位の順に `root` へ重ねて展開する（パスで開く旧入口の代わり。#2535・OCI-1）。
+///
+/// Unix（Linux・macOS）は本番と同じ検証済みハンドル版（`VerifiedLayerBlob` → `extract_image_layers`）を通す。
+/// blob は 0600 にして umask に依らず信頼条件を満たす。Windows は `VerifiedLayerBlob` を作れない（`Unimplemented`）ため、
+/// 検証 → gzip 展開 → ストリーム展開（`extract_layers`）の連結で代える。パスを開き直す展開入口は使わず、期待値は 3 OS 共通。
+fn extract_blobs(
+    blobs: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mut opened = Vec::new();
+        for p in blobs {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let gz = std::fs::read(p).unwrap();
+            let owner = std::fs::metadata(p).unwrap().uid();
+            let blob = VerifiedLayerBlob::open(p, &sha(&gz), gz.len() as u64, owner)?;
+            opened.push((blob, sha(&gunzip(&gz))));
+        }
+        let layers: Vec<ImageLayer<'_>> = opened
+            .iter()
+            .map(|(b, d)| ImageLayer::new(b, "application/vnd.oci.image.layer.v1.tar+gzip", d))
+            .collect();
+        extract_image_layers(&layers, root, max_uncompressed_bytes, limits)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut tars = Vec::new();
+        for p in blobs {
+            let gz = std::fs::read(p).unwrap();
+            verify_blob_digest(p, &sha(&gz), gz.len() as u64)?;
+            let mut tar = Vec::new();
+            decompress_layer_to_writer(p, max_uncompressed_bytes, &mut tar)?;
+            tars.push(std::io::Cursor::new(tar));
+        }
+        extract_layers(tars, root, limits)
+    }
+}
+
 /// `root` 配下の全パス（相対・`/` 区切り）の集合。
 fn tree(root: &Path) -> BTreeSet<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut BTreeSet<String>) {
@@ -167,7 +228,7 @@ fn extract(t: &Tmp, layers: &[Vec<u8>]) -> Result<(), OciErrorCode> {
         .map(|(i, z)| t.blob(&format!("l{i}.tar.gz"), z))
         .collect();
     let refs: Vec<&Path> = blobs.iter().map(PathBuf::as_path).collect();
-    extract_layer_blobs(&refs, &t.root(), 1 << 20, limits())
+    extract_blobs(&refs, &t.root(), 1 << 20, limits())
         .map(|_| ())
         .map_err(|e| e.code())
 }
@@ -330,5 +391,74 @@ fn oci2_aufs_reserved_unsupported_type_is_permission_denied() {
             "{name}"
         );
         assert_eq!(tree(&t.root()), set(&["a"]), "{name}");
+    }
+}
+/// `base` の FS が `a` と `b` を同じ名前として解決するか（`a` を作って `b` で引く。後始末する）。
+fn resolves_as_same(base: &Path, a: &str, b: &str) -> bool {
+    std::fs::write(base.join(a), b"p").unwrap();
+    let same = std::fs::symlink_metadata(base.join(b)).is_ok();
+    std::fs::remove_file(base.join(a)).unwrap();
+    same
+}
+
+/// IO-5・OCI-2: 上位レイヤーの whiteout・不透明ディレクトリが、対象または親を別表記（大文字小文字・NFC / NFD）の
+/// 名前で指す場合を、公開 API で実 FS に対して確かめる。ホスト FS で分岐する。別表記を同じ名前と解決する FS は
+/// `ALREADY_EXISTS` で拒否される（名前は書き換えない）。区別する FS では別の名前なので成功し、マーカーは存在しない
+/// 対象に対して何もしない。どちらでも下位の木と内容は変わらず、マーカー名は書かれず、root の外も変わらない。
+/// 区別しない FS の挙動はホストに依らない形で `extract.rs` の単体テスト（`folding_lstat`）が積み上げ全体で照合し、
+/// ここは実 FS での確認（Linux の PR CI は区別する側だけ。macOS / Windows の側は main の 3 OS 実行と
+/// `layer_overlay.rs` の `io5_default_host_fs_folds_spelling_variants` で固定する）。
+#[test]
+fn io5_oci2_alias_markers_follow_destination_fs() {
+    // (case, 下位ディレクトリ名, 上位マーカー, 別表記かの判定に使う (下位, 別表記))
+    let cases: [(&str, &str, &str, (&str, &str)); 5] = [
+        ("case-wh", "d", ".wh.D", ("d", "D")),
+        ("case-parent", "d", "D/.wh.x", ("d", "D")),
+        ("case-opq", "d", "D/.wh..wh..opq", ("d", "D")),
+        (
+            "nfd-wh",
+            "caf\u{e9}",
+            ".wh.cafe\u{301}",
+            ("caf\u{e9}", "cafe\u{301}"),
+        ),
+        (
+            "nfd-opq",
+            "caf\u{e9}",
+            "cafe\u{301}/.wh..wh..opq",
+            ("caf\u{e9}", "cafe\u{301}"),
+        ),
+    ];
+    for (case, lower, upper_marker, (a, b)) in cases {
+        let t = Tmp::new(&format!("alias-marker-{case}"));
+        let ld = format!("{lower}/");
+        let lx = format!("{lower}/x");
+        let l1 = layer_gz(&[E::Dir(&ld, 0o755), E::File(&lx, 0o644, b"x")]);
+        let l2 = layer_gz(&[marker(upper_marker)]);
+        let b1 = t.blob("l1.tar.gz", &l1);
+        let b2 = t.blob("l2.tar.gz", &l2);
+        let same = resolves_as_same(&t.base, a, b);
+        let r = extract_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits());
+        if same {
+            let e = r.expect_err(case);
+            assert_eq!(e.code(), OciErrorCode::AlreadyExists, "{case}");
+            assert_eq!(e.code().as_str(), "ALREADY_EXISTS", "{case}");
+            assert_eq!(
+                e.message(),
+                "entry name resolves to an existing entry with a different spelling \
+                 (case or Unicode normalization) on the destination filesystem",
+                "{case}"
+            );
+        } else {
+            r.expect(case);
+        }
+        // どちらの側でも下位の木・内容は変わらず、マーカー名は書かれない。
+        assert_eq!(tree(&t.root()), set(&[lower, &lx]), "{case}");
+        assert_eq!(std::fs::read(t.root().join(&lx)).unwrap(), b"x", "{case}");
+        let outside = set(&["l1.tar.gz", "l2.tar.gz", "root"]);
+        let names: BTreeSet<String> = std::fs::read_dir(&t.base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, outside, "{case}");
     }
 }

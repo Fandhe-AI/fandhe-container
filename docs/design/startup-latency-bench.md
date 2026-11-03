@@ -23,7 +23,7 @@
 | argv | `USER_SCOPE_WRAPPER_ARGS` の末尾 `--` の直前にベンチだけの `--unit=<名前>` を足す（後始末が scope の cgroup を名前で探すため。名前は実行ごとの nonce を含み一意） |
 | 環境 | `env_clear()` の後、固定 `PATH` と検証済み `XDG_RUNTIME_DIR` だけ。`DBUS_SESSION_BUS_ADDRESS` は渡さず user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` を使う |
 | cwd・その他 | cwd は `/`、`process_group(0)`、stdin は null、stderr は null |
-| 事前検査 | `$XDG_RUNTIME_DIR/systemd/private` が自 euid 所有のソケットでなければ、試行の前に `unsupported-environment` で止まる（CLI の `user_manager_env` と同じ判定。値は出力しない） |
+| 事前検査 | `$XDG_RUNTIME_DIR/systemd/private` が自 euid 所有のソケットでなければ、試行の前に `unsupported-environment` で止まる（CLI の `user_manager_env` と同じ判定。値は出力しない）。スモークの `user_manager=` も同じ判定を使う（CORE-10・REPAIR-8） |
 
 詳細は [cgroups.md](cgroups.md) を参照。
 
@@ -104,5 +104,5 @@ scope 取得だけを測る。本計測と同じ包み込み（`scope_wrap::scop
 
 - `user_manager_env` の判定の CLI との共通化（`start_contract` 等）
 - 委譲スコープの検出が失敗したときに記録の経路へ回すか（core の `delete` の契約の変更。オーナー判断待ち。#2133）
-- restart の再 launch（#2043）は対象外
+- restart の再 launch（#2043 で成立済み）は対象外（restart のレイテンシは #491）
 - CI の回帰ゲートへの接続は、オーナー判断（[bench-calibration.md](bench-calibration.md) の選択肢 (c)/(d)/(e)。#230）待ち。#1901 は暫定の実機前提として登録した

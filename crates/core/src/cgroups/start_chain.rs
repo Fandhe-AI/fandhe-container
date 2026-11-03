@@ -358,31 +358,15 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::path::{Path, PathBuf};
 
-    struct TmpDir(PathBuf);
+    struct TmpDir(PathBuf, #[allow(dead_code)] crate::scratch_root::ScratchDir);
 
     impl TmpDir {
         fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let p = std::env::temp_dir().join(format!(
-                "fandhe-start-chain-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            // 状態ルートの祖先は group / others 書き込み不可でなければならない。
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            Self(p)
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // pid＋nanos の名前を create_dir_all せず、排他作成の ScratchDir の子（0700。状態ルートの祖先は
+            // group / others 書き込み不可でなければならない）を使う（#3478・REPAIR-12）。
+            let (scratch, p) =
+                crate::test_support::scratch_child(&format!("fandhe-start-chain-{tag}"), "d");
+            Self(p, scratch)
         }
     }
 

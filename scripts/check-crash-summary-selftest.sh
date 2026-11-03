@@ -18,12 +18,13 @@ line() { # line <case> <persist_supported> <valid> <invalid> <aborted> <total_lo
     "$1" "$2" "$(($3 + $4))" "$3" "$4" "$5" "$3" "$6" "$6" "$7" "$7"
 }
 
-# mkgood <dir>: 正常な 3 ケースを書く
+# mkgood <dir>: 正常な 4 ケースを書く
 mkgood() {
   mkdir -p "$1"
   line flushed true 10 0 false 0 0 >"$1/flushed.json"
   line deferred_unflushed true 10 0 false 300 10 >"$1/deferred_unflushed.json"
   line deferred_flushed true 10 0 false 0 0 >"$1/deferred_flushed.json"
+  line file_ops_flushed true 10 0 false 0 0 >"$1/file_ops_flushed.json"
 }
 
 # run <名前> <期待rc> <os> <dir> [期待する出力の部分文字列]
@@ -55,10 +56,15 @@ command -v jq >/dev/null 2>&1 || {
 mkgood "${work}/good"
 run "good linux" 0 Linux "${work}/good" "| deferred_unflushed | true | 10 | 10 | 0 | false | 10 | 300 | 300 | 10 | 10 |"
 run "good macos" 0 macOS "${work}/good" "| flushed | true | 10 | 10 | 0 | false | 10 | 0 | 0 | 0 | 0 |"
+run "good file_ops_flushed row" 0 Linux "${work}/good" "| file_ops_flushed | true | 10 | 10 | 0 | false | 10 | 0 | 0 | 0 | 0 |"
 
 mkgood "${work}/missing"
 rm "${work}/missing/deferred_flushed.json"
 run "missing case" 1 Linux "${work}/missing" "missing or non-regular"
+
+mkgood "${work}/missing_fileops"
+rm "${work}/missing_fileops/file_ops_flushed.json"
+run "missing file_ops case" 1 Linux "${work}/missing_fileops" "missing or non-regular"
 
 mkgood "${work}/badjson"
 echo '{not json' >"${work}/badjson/flushed.json"

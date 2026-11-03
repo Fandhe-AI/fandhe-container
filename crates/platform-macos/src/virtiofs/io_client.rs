@@ -19,7 +19,8 @@
 //!   `ReconnectingVirtiofsIoClient` が担う（TASK-65.5）。
 //! - 共有が [`ShareAccess::ReadOnly`] の場合は構築を拒否する（fail-closed）。
 //! - virtiofs タグはワイヤーへ載せない（`writeback.rs` の D1）。タグは識別・観測用に保持するだけで、
-//!   載せるのは IO-1 契約の変更（`PROTOCOL_VERSION` の繰り上げを伴いうる）になるため行わない。
+//!   載せるのは IO-1 契約の変更になるため行わない。v2（#3161）でファイル操作の種別が足されたが、
+//!   本クライアントは単一 sink モードの `Write` / `Flush` だけを使い続け、意味論は変わらない（F3）。
 //!
 //! # 運用ルール（D3）
 //!
@@ -149,6 +150,27 @@ pub enum VirtiofsIoError {
     InvalidReconnectPolicy { field: &'static str },
 }
 
+/// `IoErrorCode` から `virtiofs_io.*` へのワイヤー文字列の表（ERR-1・REPAIR-1）。
+///
+/// `IoErrorCode` は `#[non_exhaustive]` で `_` 分岐に黙って吸収されやすいため、`IoErrorCode::ALL` と
+/// 同じ件数の表にして試験で網羅を照合する。値は互換のため変えない。
+pub(crate) const PROTOCOL_CODE_TABLE: [(IoErrorCode, &str); 8] = [
+    (IoErrorCode::InvalidArgument, "virtiofs_io.invalid_argument"),
+    (IoErrorCode::Timeout, "virtiofs_io.timeout"),
+    (IoErrorCode::Unavailable, "virtiofs_io.unavailable"),
+    (IoErrorCode::Unimplemented, "virtiofs_io.unimplemented"),
+    (IoErrorCode::Internal, "virtiofs_io.internal"),
+    (IoErrorCode::DataLoss, "virtiofs_io.data_loss"),
+    (
+        IoErrorCode::ResourceExhausted,
+        "virtiofs_io.resource_exhausted",
+    ),
+    (IoErrorCode::AlreadyExists, "virtiofs_io.already_exists"),
+];
+
+/// 表に無い（将来追加された）`IoErrorCode` の倒し先。
+pub(crate) const PROTOCOL_CODE_FALLBACK: &str = "virtiofs_io.error";
+
 impl VirtiofsIoError {
     /// 機械可読なエラーコード（`virtiofs_io.*`）。
     pub fn code(&self) -> &'static str {
@@ -163,17 +185,10 @@ impl VirtiofsIoError {
             VirtiofsIoError::InvalidReconnectPolicy { .. } => {
                 "virtiofs_io.invalid_reconnect_policy"
             }
-            VirtiofsIoError::Protocol { source, .. } => match source.code() {
-                IoErrorCode::InvalidArgument => "virtiofs_io.invalid_argument",
-                IoErrorCode::Timeout => "virtiofs_io.timeout",
-                IoErrorCode::Unavailable => "virtiofs_io.unavailable",
-                IoErrorCode::Unimplemented => "virtiofs_io.unimplemented",
-                IoErrorCode::Internal => "virtiofs_io.internal",
-                IoErrorCode::DataLoss => "virtiofs_io.data_loss",
-                IoErrorCode::ResourceExhausted => "virtiofs_io.resource_exhausted",
-                IoErrorCode::AlreadyExists => "virtiofs_io.already_exists",
-                _ => "virtiofs_io.error",
-            },
+            VirtiofsIoError::Protocol { source, .. } => PROTOCOL_CODE_TABLE
+                .iter()
+                .find(|(c, _)| *c == source.code())
+                .map_or(PROTOCOL_CODE_FALLBACK, |(_, name)| *name),
         }
     }
 

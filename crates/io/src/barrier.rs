@@ -15,7 +15,9 @@
 //! # 構築経路（偽造できないことの根拠）
 //!
 //! [`WriteAck`]・[`FlushAck`]・[`AckReceipt`] のフィールドはすべて非公開で、
-//! 生成できるのは本 crate 内の `AckReceipt::from_matched`（`pub(crate)`）
+//! 生成できるのは本 crate 内の `AckReceipt::from_matched` と
+//! `AckReceipt::from_nack`（いずれも `pub(crate)`。`from_nack` は v2 の
+//! ファイル操作要求への Nack 用で、[`RejectedRequest`] を作る。#3162・F12）
 //! だけである。これは [`crate::client::PipelineClient::recv_ack`] が、送信順・
 //! 種別対応を検証済みの [`crate::client::InFlightRequest`] とワイヤーから
 //! 復号した [`FrameKind`] からのみ呼び出す。相互変換（`WriteAck` ↔ `FlushAck`）
@@ -74,6 +76,8 @@ use std::time::{Duration, Instant};
 
 use crate::client::{InFlightRequest, RequestId};
 use crate::error::{IoError, IoErrorCode};
+use crate::nack_reason::NackReason;
+use crate::payload::NackCode;
 use crate::protocol::FrameKind;
 use crate::transport::IoTimeout;
 
@@ -204,6 +208,41 @@ pub enum AckReceipt {
     Write(WriteAck),
     /// [`FrameKind::FlushAck`]（IO-2）。
     Flush(FlushAck),
+    /// v2 のファイル操作要求（Create・WriteFile・Close）へのサーバーの Nack
+    /// （F8・F12。#3162）。要求単位の拒否で、接続は失効しない。
+    Rejected(RejectedRequest),
+}
+
+/// サーバーが要求単位で拒否したことを表す受領記録（`FrameKind::Nack`。F8・F10・F12。
+/// IO-1・REPAIR-4・#3162）。
+///
+/// Nack はその要求が効果を持たないことを表す（新設した空の祖先ディレクトリは
+/// 残りうる）。対象は Create・WriteFile・Close の要求だけで、Write・Flush への
+/// Nack はプロトコル違反として `recv_ack` が接続を失効させる。フィールドは非公開で、
+/// 生成できるのは `AckReceipt::from_nack`（`pub(crate)`）だけ。永続化の保証
+/// （[`FlushAck`]）へは変換できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedRequest {
+    request: InFlightRequest,
+    code: NackCode,
+    reason: NackReason,
+}
+
+impl RejectedRequest {
+    /// 拒否された、送信済みだった元のリクエストを返す。
+    pub fn request(&self) -> InFlightRequest {
+        self.request
+    }
+
+    /// 拒否の大分類（F10）。
+    pub fn code(&self) -> NackCode {
+        self.code
+    }
+
+    /// 拒否の理由（未知の値は [`NackReason::Other`]）。
+    pub fn reason(&self) -> NackReason {
+        self.reason
+    }
 }
 
 impl AckReceipt {
@@ -212,7 +251,9 @@ impl AckReceipt {
     ///
     /// [`crate::client::PipelineClient::recv_ack`] だけが呼び出す想定で、
     /// `request` は送信順・`ack_kind` はペイロード検証済みのワイヤー値を渡す。
-    /// `(Write, Ack)` → [`AckReceipt::Write`]、`(Flush, FlushAck)` →
+    /// `(Write, Ack)` と `(Create | WriteFile | Close, Ack)` → [`AckReceipt::Write`]
+    /// （IO-1 のバッファリング時点の保証。Create の Ack は名前空間に存在するまで、
+    /// Close の Ack はハンドルの解放だけを意味する。F8）、`(Flush, FlushAck)` →
     /// [`AckReceipt::Flush`] 以外の組み合わせは、呼び出し元がすでに
     /// `expected_ack_kind` で種別対応を検証しているため到達しないはずだが、
     /// `unwrap`・`expect` を使わず [`IoErrorCode::Internal`] を返して安全側
@@ -222,7 +263,10 @@ impl AckReceipt {
         ack_kind: FrameKind,
     ) -> Result<Self, IoError> {
         match (request.kind(), ack_kind) {
-            (FrameKind::Write, FrameKind::Ack) => Ok(AckReceipt::Write(WriteAck { request })),
+            (
+                FrameKind::Write | FrameKind::Create | FrameKind::WriteFile | FrameKind::Close,
+                FrameKind::Ack,
+            ) => Ok(AckReceipt::Write(WriteAck { request })),
             (FrameKind::Flush, FrameKind::FlushAck) => Ok(AckReceipt::Flush(FlushAck { request })),
             _ => Err(IoError::new(
                 IoErrorCode::Internal,
@@ -231,13 +275,38 @@ impl AckReceipt {
         }
     }
 
-    /// この ACK が対応付けた、送信済みだった元のリクエストを返す
-    /// （[`WriteAck::request`] / [`FlushAck::request`] の共通アクセサ。
-    /// TASK-12.2 時点の `AckReceipt::request` との互換のため残す）。
+    /// Create・WriteFile・Close への Nack から [`AckReceipt::Rejected`] を構築する
+    /// （`pub(crate)`。[`crate::client::PipelineClient::recv_ack`] だけが、送信順を
+    /// 検証した後に呼ぶ）。`request` がこれら 3 種別以外なら、到達しないはずだが
+    /// [`IoErrorCode::Internal`] で拒否する（fail-closed）。
+    pub(crate) fn from_nack(
+        request: InFlightRequest,
+        code: NackCode,
+        reason: NackReason,
+    ) -> Result<Self, IoError> {
+        match request.kind() {
+            FrameKind::Create | FrameKind::WriteFile | FrameKind::Close => {
+                Ok(AckReceipt::Rejected(RejectedRequest {
+                    request,
+                    code,
+                    reason,
+                }))
+            }
+            _ => Err(IoError::new(
+                IoErrorCode::Internal,
+                "nack received for a request kind that cannot be rejected; this must not happen",
+            )),
+        }
+    }
+
+    /// この応答が対応付けた、送信済みだった元のリクエストを返す
+    /// （[`WriteAck::request`] / [`FlushAck::request`] / [`RejectedRequest::request`]
+    /// の共通アクセサ。TASK-12.2 時点の `AckReceipt::request` との互換のため残す）。
     pub fn request(&self) -> InFlightRequest {
         match self {
             AckReceipt::Write(ack) => ack.request(),
             AckReceipt::Flush(ack) => ack.request(),
+            AckReceipt::Rejected(rejected) => rejected.request(),
         }
     }
 }
@@ -254,6 +323,10 @@ impl TryFrom<AckReceipt> for WriteAck {
                 IoErrorCode::InvalidArgument,
                 "AckReceipt is a Flush ack, not a Write ack",
             )),
+            AckReceipt::Rejected(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is a rejection, not a Write ack",
+            )),
         }
     }
 }
@@ -269,6 +342,26 @@ impl TryFrom<AckReceipt> for FlushAck {
             AckReceipt::Write(_) => Err(IoError::new(
                 IoErrorCode::InvalidArgument,
                 "AckReceipt is a Write ack, not a Flush ack",
+            )),
+            AckReceipt::Rejected(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is a rejection, not a Flush ack",
+            )),
+        }
+    }
+}
+
+impl TryFrom<AckReceipt> for RejectedRequest {
+    type Error = IoError;
+
+    /// `receipt` が [`AckReceipt::Rejected`] でなければ
+    /// [`IoErrorCode::InvalidArgument`] で拒否する。
+    fn try_from(receipt: AckReceipt) -> Result<Self, Self::Error> {
+        match receipt {
+            AckReceipt::Rejected(rejected) => Ok(rejected),
+            AckReceipt::Write(_) | AckReceipt::Flush(_) => Err(IoError::new(
+                IoErrorCode::InvalidArgument,
+                "AckReceipt is an ack, not a rejection",
             )),
         }
     }
@@ -705,6 +798,99 @@ pub(crate) fn persist_file_system(
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
+                Err(mismatched_support())
+            }
+        }
+        PersistSupport::KernelTooOld => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "kernel older than 5.8 (or unknown) cannot report syncfs write-back errors; refusing to send FlushAck",
+        ))),
+        PersistSupport::UnsupportedOs => Err(PersistFailure::not_issued(IoError::new(
+            IoErrorCode::Unimplemented,
+            "persist is not implemented on this OS",
+        ))),
+    }
+}
+
+/// 接続単位の永続化（F9）の対象。呼び出し側が複製したハンドルの束で、helper スレッドへ
+/// 所有権ごと渡す（パスは再解決しない）。
+#[derive(Default)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code, reason = "対応 OS の永続化経路だけが読む")
+)]
+pub(crate) struct PersistTargets {
+    /// Linux: デバイスごとの番兵 fd の複製。それぞれに `syncfs(2)` を 1 回ずつ発行する。
+    pub(crate) sentinels: Vec<File>,
+    /// macOS / Windows: 汚れたファイルの複製。`F_FULLFSYNC` / `FlushFileBuffers` を発行する。
+    pub(crate) files: Vec<File>,
+    /// macOS / Windows: 汚れた（エントリが未同期の）ディレクトリの複製。
+    pub(crate) dirs: Vec<File>,
+}
+
+impl PersistTargets {
+    /// 同期する対象が 1 つも無いか。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sentinels.is_empty() && self.files.is_empty() && self.dirs.is_empty()
+    }
+}
+
+/// 1 接続ぶんの FLUSH 全体（全デバイスの `syncfs`、または全ファイルとディレクトリの
+/// 同期）を、`limiter` の 1 枠と `timeout` の 1 つの期限の中で 1 本の helper スレッドが
+/// 順に実行する（IO-2・REPAIR-5・F9）。最初の失敗で止める（fail-closed）。
+///
+/// 判定 `support` が非対応（旧カーネル・非対応 OS・実行 OS と食い違う値）なら何も発行せず
+/// [`IoErrorCode::Unimplemented`]（`issued == false`）。発行後の失敗・期限切れは接続全体の
+/// 失敗として呼び出し側が扱う（状態を破棄し FlushAck を返さない）。
+pub(crate) fn persist_connection(
+    support: PersistSupport,
+    limiter: &'static PersistLimiter,
+    targets: PersistTargets,
+    timeout: IoTimeout,
+) -> Result<Duration, PersistFailure> {
+    match support {
+        PersistSupport::Supported => {
+            #[cfg(target_os = "linux")]
+            {
+                let mut dispatched = false;
+                run_with_deadline_tracked(
+                    limiter,
+                    timeout,
+                    move || targets.sentinels.iter().try_for_each(crate::sys::syncfs),
+                    &mut dispatched,
+                )
+                .map_err(|error| PersistFailure {
+                    error,
+                    issued: dispatched,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (limiter, targets, timeout);
+                Err(mismatched_support())
+            }
+        }
+        PersistSupport::SupportedFileSync => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                let mut dispatched = false;
+                run_with_deadline_tracked(
+                    limiter,
+                    timeout,
+                    move || {
+                        targets.files.iter().try_for_each(sync_file)?;
+                        targets.dirs.iter().try_for_each(sync_dir)
+                    },
+                    &mut dispatched,
+                )
+                .map_err(|error| PersistFailure {
+                    error,
+                    issued: dispatched,
+                })
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                let _ = (limiter, targets, timeout);
                 Err(mismatched_support())
             }
         }
@@ -1418,12 +1604,9 @@ mod tests {
     /// `Unimplemented`（`issued == false`）で拒否する。
     #[test]
     fn io2_persist_file_system_rejects_unsupported_without_issuing() {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-io-persist-unsupported-{}",
-            std::process::id()
-        ));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) = crate::test_temp_file::create("fandhe-io-persist-unsupported")
+            .expect("create temp file");
+        drop(guard);
         // 実行 OS と食い違う対応値（他 OS 用）も syscall を発行せず拒否する。
         #[cfg(target_os = "linux")]
         let mismatched = PersistSupport::SupportedFileSync;
@@ -1447,13 +1630,9 @@ mod tests {
     }
 
     fn tempfile_in_target() -> File {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-io-persist-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) =
+            crate::test_temp_file::create("fandhe-io-persist").expect("create temp file");
+        drop(guard);
         file
     }
 
@@ -1492,9 +1671,9 @@ mod tests {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[test]
     fn io2_persist_file_system_unimplemented_on_other_os() {
-        let path = std::env::temp_dir().join(format!("fandhe-io-persist-{}", std::process::id()));
-        let file = File::create(&path).expect("create temp file");
-        let _ = std::fs::remove_file(&path);
+        let (guard, file) =
+            crate::test_temp_file::create("fandhe-io-persist").expect("create temp file");
+        drop(guard);
         assert_eq!(persist_support(), PersistSupport::UnsupportedOs);
         let failure = persist_file_system(
             persist_support(),
@@ -1514,10 +1693,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn io2_persist_file_system_read_only_handle_fails_issued_on_windows() {
-        let path =
-            std::env::temp_dir().join(format!("fandhe-io-persist-ro-{}", std::process::id()));
-        File::create(&path).expect("create temp file");
-        let file = File::open(&path).expect("open read-only");
+        // guard を先に宣言するので、開いたハンドル（file）が先に閉じてから消える。
+        let (guard, created) =
+            crate::test_temp_file::create("fandhe-io-persist-ro").expect("create temp file");
+        drop(created);
+        let file = File::open(guard.path()).expect("open read-only");
         let failure = persist_file_system(
             PersistSupport::SupportedFileSync,
             default_persist_limiter(),
@@ -1529,7 +1709,6 @@ mod tests {
         assert!(failure.issued);
         assert_eq!(failure.error.code(), IoErrorCode::Internal);
         drop(file);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// テスト専用: 指定した種別の [`InFlightRequest`] を、公開 API
@@ -1548,7 +1727,7 @@ mod tests {
             AckReceipt::from_matched(request, FrameKind::Ack).expect("must accept (Write, Ack)");
         match receipt {
             AckReceipt::Write(ack) => assert_eq!(ack.request().id().get(), request.id().get()),
-            AckReceipt::Flush(_) => panic!("expected Write variant"),
+            _ => panic!("expected Write variant"),
         }
     }
 
@@ -1560,7 +1739,7 @@ mod tests {
             .expect("must accept (Flush, FlushAck)");
         match receipt {
             AckReceipt::Flush(ack) => assert_eq!(ack.request().id().get(), request.id().get()),
-            AckReceipt::Write(_) => panic!("expected Flush variant"),
+            _ => panic!("expected Flush variant"),
         }
     }
 
@@ -1684,5 +1863,62 @@ mod tests {
         assert!(!l.would_exceed_bytes(&backlog(1, 7), 3));
         assert!(l.would_exceed_bytes(&backlog(1, 7), 4));
         assert!(l.would_exceed_bytes(&backlog(1, u64::MAX), usize::MAX));
+    }
+
+    /// F9・IO-2: 旧カーネルの判定では接続単位の永続化も発行せず `Unimplemented`。
+    #[test]
+    fn io2_persist_connection_kernel_too_old_is_not_issued() {
+        static L: PersistLimiter = PersistLimiter::new(1);
+        let failure = persist_connection(
+            PersistSupport::KernelTooOld,
+            &L,
+            PersistTargets::default(),
+            IoTimeout::new(Duration::from_millis(100)).expect("valid timeout"),
+        )
+        .expect_err("kernel too old must be refused");
+        assert_eq!(failure.error.code(), IoErrorCode::Unimplemented);
+        assert!(!failure.issued);
+    }
+
+    /// F9・REPAIR-5: 枠が取れなければ期限で `Timeout`（未発行）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_persist_connection_slot_timeout_is_not_issued() {
+        static L: PersistLimiter = PersistLimiter::new(0);
+        let failure = persist_connection(
+            PersistSupport::Supported,
+            &L,
+            PersistTargets::default(),
+            IoTimeout::new(Duration::from_millis(50)).expect("valid timeout"),
+        )
+        .expect_err("no slot must time out");
+        assert_eq!(failure.error.code(), IoErrorCode::Timeout);
+        assert!(!failure.issued);
+    }
+
+    /// F9: 番兵が `syncfs` に失敗する（`O_PATH` の fd は EBADF）と、発行済みの失敗として返る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io2_persist_connection_real_syncfs_failure_is_issued() {
+        use std::os::unix::fs::OpenOptionsExt;
+        static L: PersistLimiter = PersistLimiter::new(1);
+        // O_PATH（x86_64・aarch64 とも 0o10000000）。
+        let broken = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o10_000_000)
+            .open(std::env::temp_dir())
+            .expect("open temp dir with O_PATH");
+        let targets = PersistTargets {
+            sentinels: vec![broken],
+            ..PersistTargets::default()
+        };
+        let failure = persist_connection(
+            PersistSupport::Supported,
+            &L,
+            targets,
+            IoTimeout::new(crate::MAX_IO_TIMEOUT).expect("valid timeout"),
+        )
+        .expect_err("syncfs on an O_PATH fd must fail");
+        assert!(failure.issued);
     }
 }

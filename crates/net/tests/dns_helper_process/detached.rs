@@ -1,0 +1,1587 @@
+//! 切り離し起動・記録・pidfd 経由の停止の結合試験（Linux のみ。NET-5・NET-7・REPAIR-5・SEC-1・#3070）。
+//!
+//! `dns_helper_process` の一部。ヘルパーは試験バイナリ自身の再実行（段 1 `--dns-helper-detach`・段 2
+//! `--dns-helper-stage2`）で、ループバックの `127.0.0.1:0` のみを使い root を要さない。待ちはすべて期限つき。
+
+use std::io::{BufRead, BufReader, Read};
+use std::net::{Ipv4Addr, UdpSocket};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use fandhe_container_net::dns_helper::control::frame::{
+    ControlFrame, ControlMessage, ReloadGeneration,
+};
+use fandhe_container_net::dns_helper::control::{
+    ControlStopRequest, ReloadOutcome, reload_dns_helper,
+};
+use fandhe_container_net::dns_helper::detach::{
+    ARG_DETACH, ARG_NETWORK, ARG_NONCE, ARG_STAGE2, ARG_STATE_ROOT, DNS_HELPER_ACK_TIMEOUT,
+    DnsHelperStopRequest, IntentRecovery, MAX_RECOVERY_CANDIDATES, NoStopRequest, RequestOutcome,
+    StopOutcome, override_recover_timeout_for_test, override_stop_timeouts_for_test,
+    recover_dns_helper_intent, spawn_detached_dns_helper, stop_recorded_dns_helper,
+};
+use fandhe_container_net::dns_helper::identity::{ProcessIdentity, read_identity};
+use fandhe_container_net::dns_helper::record::{DnsHelperIntent, DnsHelperRecord, HelperNonce};
+use fandhe_container_net::dns_helper::{DnsListenAddr, READY_TIMEOUT_DEFAULT};
+use fandhe_container_net::error::NetErrorCode;
+use fandhe_container_net::instrument::{
+    NetOpKind, NetOpOutcome, NetOpRecorder, NetOpSample, NoopNetOpRecorder,
+};
+use fandhe_container_net::netlink_route::IpPrefix;
+use fandhe_container_net::network::{EndpointId, NetworkName};
+use fandhe_container_net::network_store::{
+    MemberId, MemberRecord, NetworkDefinition, NetworkStore,
+};
+
+struct Tmp(PathBuf);
+impl Tmp {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("fc-dnsh-detach-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p)
+            .expect("tmp");
+        Tmp(p)
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `/proc/<pid>/stat` の (ppid, session)。
+fn ppid_sid(pid: u32) -> (u32, u32) {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let rest = raw.rsplit_once(')').expect("comm").1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    (f[1].parse().expect("ppid"), f[3].parse().expect("sid"))
+}
+
+/// プロセスが消える（ゾンビ含む。回収は init か subreaper が行う）のを期限つきで待つ。
+fn gone(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(s)
+                if s.rsplit_once(')')
+                    .is_some_and(|(_, r)| r.trim_start().starts_with('Z')) =>
+            {
+                return true;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    false
+}
+
+/// 切り離し起動のヘルパーが DNS クエリに応答するか（名前の経路を持つので、未登録の名前には REFUSED を返す。#3071）。
+fn answers(target: std::net::SocketAddrV4) -> bool {
+    matches!(
+        query_a(target, "example.com").map(|r| r.get(..4).map(<[u8]>::to_vec)),
+        Some(Some(h)) if h == [0xAB, 0xCD, 0x81, 0x05]
+    )
+}
+
+/// 制御 UDS へ期限つきで接続する（REPAIR-5）。`UnixStream::connect` は listener の backlog が満杯だと
+/// 無期限にブロックし、直後の `set_read_timeout` は効かないため、別スレッドで接続して受け取りを待つ。
+/// 期限切れのときは Err を返す（接続スレッドは置き去りになるが、呼び出し側が相手を回収して試験を落とす）。
+fn connect_within(path: &Path, within: Duration) -> Result<std::os::unix::net::UnixStream, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(&path));
+    });
+    match rx.recv_timeout(within) {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("connect failed: {e}")),
+        Err(e) => Err(format!("connect did not complete within {within:?}: {e}")),
+    }
+}
+
+/// `name` の A クエリ（ID 0xABCD）を送り、最初に届いた応答のバイト列を返す（届かなければ None）。
+fn query_a(target: std::net::SocketAddrV4, name: &str) -> Option<Vec<u8>> {
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client");
+    client
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        q.push(u8::try_from(label.len()).expect("label len"));
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.extend_from_slice(&[0, 0, 1, 0, 1]);
+    let mut buf = [0u8; 600];
+    for _ in 0..20 {
+        client.send_to(&q, target).expect("send");
+        if let Ok((n, _)) = client.recv_from(&mut buf) {
+            return buf.get(..n).map(<[u8]>::to_vec);
+        }
+    }
+    None
+}
+
+/// 試験用の停止要求: SIGTERM（既定動作で終了する）を `kill` コマンドで送り、要求を送ったことにする。
+struct TermRequest;
+impl DnsHelperStopRequest for TermRequest {
+    fn request(&self, record: &DnsHelperRecord) -> RequestOutcome {
+        let mut kill = Command::new("kill");
+        kill.arg(record.identity().pid.to_string());
+        // 期限なしの `status()` を避ける。期限切れ・spawn 失敗は `Unavailable` として理由を残す（REPAIR-5・#3409）。
+        let ok = match crate::reap::run_within(&mut kill, crate::reap::reap_within()) {
+            Ok(s) => s.success(),
+            Err(e) => {
+                eprintln!("TermRequest: {e}");
+                false
+            }
+        };
+        if ok {
+            RequestOutcome::Sent
+        } else {
+            RequestOutcome::Unavailable
+        }
+    }
+}
+
+fn setup(tmp: &Tmp) -> (NetworkStore, NetworkName) {
+    let store = NetworkStore::open(&tmp.0).expect("open");
+    store
+        .create(&NetworkDefinition::pasta("dnsh").expect("def"))
+        .expect("create");
+    (store, NetworkName::new("dnsh").expect("name"))
+}
+
+/// 起動元（`spawn_detached_dns_helper` の呼び出し側）としての再実行の引数（`launcher_killed_after_spawn_line` 用）。
+pub const ARG_LAUNCHER_CHILD: &str = "--launcher-child";
+
+/// 回収の期限を短縮した子としての再実行の引数（`recover_deadline_keeps_intent` 用。#3559）。
+pub const ARG_RECOVER_DEADLINE_CHILD: &str = "--recover-deadline-child";
+
+/// 段 1・段 2 としての再実行の引数か。
+pub fn is_helper_arg(a: &std::ffi::OsStr) -> bool {
+    a == ARG_DETACH || a == ARG_STAGE2
+}
+
+pub fn run(exe: &Path) {
+    lifecycle(exe);
+    stop_on_request(exe);
+    ack_timeout(exe);
+    recover_intent(exe);
+    recover_intent_by_nonce(exe);
+    start_failure_records(exe);
+    stopped_stage2_is_reaped(exe);
+    spawn_write_count(exe);
+    launcher_killed_after_spawn_line(exe);
+    launcher_self_exits_after_ack_deadline(exe);
+    recover_deadline_keeps_intent(exe);
+    control_reload(exe);
+    upstream_load(exe);
+}
+
+/// 切り離し起動 → 記録 → 二重起動の拒否 → 古い記録は何も送らない → 記録で停止（SIGKILL）。
+fn lifecycle(exe: &Path) {
+    let tmp = Tmp::new("life");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let pid = h.identity.pid;
+
+    // 親から切り離されている: 親は試験プロセスでなく、セッションも別。
+    let (ppid, sid) = ppid_sid(pid);
+    let (_, my_sid) = ppid_sid(std::process::id());
+    assert_ne!(ppid, std::process::id(), "helper must not be our child");
+    assert_ne!(sid, my_sid, "helper must be in a new session");
+
+    // 記録は実際のプロセスの値と一致し、意図記録は消えている。
+    let rec = n.read_dns_helper().expect("read").expect("record");
+    assert_eq!(rec.identity(), &h.identity);
+    assert_eq!(&read_identity(pid).expect("identity"), rec.identity());
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert!(answers(h.listen), "detached helper must answer");
+
+    // 二重起動はしない。
+    let e = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect_err("second spawn");
+    assert_eq!(e.code(), NetErrorCode::AlreadyExists);
+
+    // 開始時刻が違う記録（pid の再利用の想定）には何も送らず、記録だけを消す。
+    let mut stale_id = rec.identity().clone();
+    stale_id.start_time_ticks += 1;
+    let stale = DnsHelperRecord::new(stale_id, rec.nonce().clone(), rec.listen()).expect("stale");
+    n.remove_dns_helper().expect("rm");
+    n.write_dns_helper(&stale).expect("write stale");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::StaleRecord
+    );
+    assert_eq!(n.read_dns_helper().expect("read"), None);
+    assert!(answers(h.listen), "a stale record must not stop the helper");
+
+    // 正しい記録で停止（制御 UDS が無いので SIGKILL の段）。
+    n.write_dns_helper(&rec).expect("write");
+    let t = Instant::now();
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::Killed
+    );
+    assert!(t.elapsed() < Duration::from_secs(4));
+    assert!(gone(pid), "helper must be gone");
+    assert_eq!(n.read_dns_helper().expect("read"), None);
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::NoRecord
+    );
+    drop(n);
+    drop(g);
+}
+
+/// 停止要求が通れば、猶予内に自分で終了し SIGKILL は不要。
+fn stop_on_request(exe: &Path) {
+    let tmp = Tmp::new("req");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let t = Instant::now();
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &TermRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::StoppedOnRequest
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "must finish within the grace"
+    );
+    assert!(gone(h.identity.pid));
+    drop(n);
+    drop(g);
+}
+
+/// ack を返さなければ、段 2 は bind せずに約 2 秒で自分から終了する（D14 (ii)）。
+fn ack_timeout(exe: &Path) {
+    let nonce = HelperNonce::generate().expect("nonce");
+    let mut child = Command::new(exe)
+        .args([
+            ARG_STAGE2,
+            "--listen",
+            "127.0.0.1:0",
+            ARG_NONCE,
+            nonce.as_str(),
+            ARG_STATE_ROOT,
+            "/nonexistent-fandhe-state-root",
+            ARG_NETWORK,
+            "dnsh",
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn stage 2");
+    let _stdin = child.stdin.take().expect("stdin");
+    let mut out = BufReader::new(child.stdout.take().expect("stdout"));
+    // IDENT 行の読み取りにも期限を設ける（子が送らず止まっても試験が無期限に待たない。REPAIR-5）。
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let r = out.read_line(&mut line).map(|_| line);
+        let _ = tx.send(r);
+        out
+    });
+    let line = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(r) => r.expect("ident"),
+        Err(_) => {
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("helper did not print its identity line before the deadline");
+        }
+    };
+    let mut out = reader.join().expect("reader");
+    assert!(line.starts_with("IDENT "), "{line:?}");
+    let t = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(6),
+            "helper must exit by itself"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let waited = t.elapsed();
+    assert!(!status.success());
+    assert!(
+        waited >= DNS_HELPER_ACK_TIMEOUT - Duration::from_millis(300),
+        "{waited:?}"
+    );
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).expect("rest");
+    assert_eq!(rest, "", "must not print READY without ack");
+}
+
+/// 起動窓の意図記録の回収（D14 (iv)。NET-5・NET-7・REPAIR-5・REPAIR-12・#3070）。
+/// nonce 一致だけを停止し、不一致は残し、確定記録があれば意図記録だけを消し、候補の上限超過では意図記録を保持する。
+fn recover_intent(exe: &Path) {
+    let tmp = Tmp::new("recover");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let pid = h.identity.pid;
+    let rec = n.read_dns_helper().expect("read").expect("record");
+    let intent_of = |nonce: HelperNonce| DnsHelperIntent::new(name.clone(), nonce, rec.listen());
+
+    // 意図記録なし。
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::NoIntent
+    );
+
+    // 確定記録があれば意図記録だけを消し、プロセスには触れない。
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::IntentDiscarded
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert!(answers(h.listen), "a confirmed record must keep the helper");
+
+    // 確定記録を外す（起動窓で記録が無い状態）。
+    n.remove_dns_helper().expect("rm");
+
+    // nonce が一致しない子は残し、意図記録は消す。
+    n.write_dns_helper_intent(&intent_of(HelperNonce::generate().expect("nonce")))
+        .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::once(pid), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert!(answers(h.listen), "a different nonce must not be stopped");
+
+    // 候補の上限を超えたら走査を終えていないので意図記録を保持する。
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
+    let mut many = std::iter::repeat_n(0u32, MAX_RECOVERY_CANDIDATES + 1);
+    let e = recover_dns_helper_intent(&n, &mut many, &NoopNetOpRecorder).expect_err("too many");
+    assert_eq!(e.code(), NetErrorCode::ResourceExhausted);
+    assert!(n.read_dns_helper_intent().expect("intent").is_some());
+    assert!(
+        answers(h.listen),
+        "an incomplete scan must not stop anything"
+    );
+
+    // 同一性つきの意図記録は、候補なしでも同一性で帰属して止める。開始時刻が違えば何も送らない（#3344）。
+    let mut reused = h.identity.clone();
+    reused.start_time_ticks += 1;
+    n.remove_dns_helper_intent().expect("rm intent");
+    n.write_dns_helper_intent(
+        &intent_of(rec.nonce().clone())
+            .with_identity(reused)
+            .expect("identity"),
+    )
+    .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert!(answers(h.listen), "a reused pid must not be stopped");
+    n.write_dns_helper_intent(
+        &intent_of(rec.nonce().clone())
+            .with_identity(h.identity.clone())
+            .expect("identity"),
+    )
+    .expect("intent");
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the recorded identity must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+}
+
+/// 同一性の追記が無い従来の経路（#3070）: nonce が一致する子だけを停止し、意図記録を消す。
+fn recover_intent_by_nonce(exe: &Path) {
+    let tmp = Tmp::new("recover-nonce");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let pid = h.identity.pid;
+    let rec = n.read_dns_helper().expect("read").expect("record");
+    let intent_of = |nonce: HelperNonce| DnsHelperIntent::new(name.clone(), nonce, rec.listen());
+    n.remove_dns_helper().expect("rm");
+    n.write_dns_helper_intent(&intent_of(rec.nonce().clone()))
+        .expect("intent");
+    // nonce が一致する子だけを停止し、意図記録を消す。
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut [0u32, pid].into_iter(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the matching helper must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+}
+
+/// 起動失敗時の意図記録（NET-5・REPAIR-5・#3070）。`spawn` 自体の失敗は子が存在しないので消し、段 1 の起動後に
+/// 終了を確認できない失敗（識別行なし・段 1 の異常終了）は nonce の再試行に要るので残す。
+fn start_failure_records(_exe: &Path) {
+    let tmp = Tmp::new("startfail");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let ready = Duration::from_secs(2);
+
+    // 実行できないパス: spawn が失敗する（子は無い）→ 意図記録は消える。
+    let missing = tmp.0.join("no-such-program");
+    let e = spawn_detached_dns_helper(&n, &missing, listen, ready, &NoopNetOpRecorder)
+        .expect_err("spawn fails");
+    assert_ne!(e.code(), NetErrorCode::AlreadyExists);
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+
+    // 識別行を出さずに終了するプログラム: 起動後の失敗 → 意図記録を残す。
+    for prog in ["/bin/true", "/bin/false"] {
+        if !Path::new(prog).exists() {
+            continue;
+        }
+        let e = spawn_detached_dns_helper(&n, Path::new(prog), listen, ready, &NoopNetOpRecorder)
+            .expect_err("no identity line");
+        assert!(
+            e.message().contains("intent record kept"),
+            "{prog}: {}",
+            e.message()
+        );
+        let kept = n.read_dns_helper_intent().expect("intent");
+        assert!(kept.is_some(), "{prog}: intent must be kept");
+        assert_eq!(n.read_dns_helper().expect("record"), None);
+        // 回収（候補なし）で意図記録が消え、再び起動できる状態に戻る。
+        assert_eq!(
+            recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+                .expect("recover"),
+            IntentRecovery::Recovered { stopped: 0 }
+        );
+        assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    }
+    drop(n);
+    drop(g);
+}
+
+/// 開いている fd の数（`/proc/self/fd`）。
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").expect("fd dir").count()
+}
+
+/// 識別行を出す前に SIGSTOP された段 2（NET-5・REPAIR-5・#3070）。読み取りは poll と絶対期限で終わり
+/// （読み手スレッドが残らない）、段 1 が知らせた pid の pidfd で SIGKILL して回収し、意図記録を消す。
+/// 試験用の偽の段 1 は `SPAWN <pid>` を出して終了し、段 2 相当の `sh` は stdout を持ったまま自分を止める。
+fn stopped_stage2_is_reaped(_exe: &Path) {
+    let tmp = Tmp::new("stopped");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let script = tmp.0.join("fake-stage1.sh");
+    let pidfile = tmp.0.join("stage2.pid");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\n",
+            pidfile.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod");
+
+    let fds_before = open_fd_count();
+    let t = Instant::now();
+    let e = spawn_detached_dns_helper(
+        &n,
+        &script,
+        listen,
+        Duration::from_secs(2),
+        &NoopNetOpRecorder,
+    )
+    .expect_err("no identity line");
+    let took = t.elapsed();
+    assert_eq!(e.code(), NetErrorCode::Timeout, "{}", e.message());
+    // 識別行の期限（2 秒）の後、停止 → 回収の猶予（高々 4 秒）で戻る。
+    assert!(took < Duration::from_secs(9), "{took:?}");
+    assert_eq!(
+        open_fd_count(),
+        fds_before,
+        "no fd or reader thread may remain"
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(gone(pid), "the stopped stage 2 must be killed");
+    drop(n);
+    drop(g);
+}
+
+/// 記録先に渡されたサンプルを溜める。
+#[derive(Default)]
+struct Collect(std::sync::Mutex<Vec<NetOpSample>>);
+impl NetOpRecorder for Collect {
+    fn record_net_op(&self, sample: &NetOpSample) {
+        self.0.lock().expect("lock").push(*sample);
+    }
+}
+
+/// #3414: `SPAWN` 行の時点で同一性を記録しても、成功した起動の `NetworkStoreDnsHelperWrite` は 3 回
+/// （意図記録の新規・同一性つきへの置き換え 1 回・`dns-helper`）のまま。レイテンシは PR 本文用に stderr へ出す。
+fn spawn_write_count(exe: &Path) {
+    let tmp = Tmp::new("wcount");
+    let rec = std::sync::Arc::new(Collect::default());
+    let store = NetworkStore::open_with_recorder(&tmp.0, rec.clone()).expect("open");
+    store
+        .create(&NetworkDefinition::pasta("dnsh").expect("def"))
+        .expect("create");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let lat: Vec<u128> = rec
+        .0
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|s| {
+            s.kind() == NetOpKind::NetworkStoreDnsHelperWrite
+                && s.outcome() == NetOpOutcome::Success
+        })
+        .map(|s| s.latency().as_micros())
+        .collect();
+    eprintln!(
+        "dns_helper_process: dns_helper_write samples={} latencies_us={lat:?}",
+        lat.len()
+    );
+    assert_eq!(lat.len(), 3, "intent, intent replace, dns-helper");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::Killed
+    );
+    assert!(gone(h.identity.pid));
+    drop(n);
+    drop(g);
+}
+
+/// 起動元の子モード（`--launcher-child <state_root> <program>`）。偽の段 1 `program` で
+/// `spawn_detached_dns_helper` を呼び、識別行の待ちの途中で親に SIGKILL されることを前提にする。
+/// 呼び出しが戻った時点で場面は不成立（起動元自身が期限切れで後始末して意図記録を消すため、回収の照合が
+/// 緑に見える誤判定になる）なので、固有の終了コード 3 で終わる（REPAIR-4）。
+pub fn launcher_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let (Some(root), Some(program)) = (args.get(2), args.get(3)) else {
+        eprintln!("launcher_child: usage: --launcher-child <state_root> <program> [cleanup_ms]");
+        return std::process::ExitCode::from(2);
+    };
+    // 第 4 引数（ms）があれば後始末の期限を短縮する（#3508）。解釈・設定できなければ 2（呼び出しが戻った 3 と区別する）。
+    if let Some(ms) = args.get(4) {
+        let Some(ms) = ms.to_str().and_then(|v| v.parse::<u64>().ok()) else {
+            eprintln!("launcher_child: invalid cleanup deadline ms");
+            return std::process::ExitCode::from(2);
+        };
+        let d = Duration::from_millis(ms);
+        if let Err(e) = override_stop_timeouts_for_test(d, d) {
+            eprintln!(
+                "launcher_child: override failed: {:?} {}",
+                e.code(),
+                e.message()
+            );
+            return std::process::ExitCode::from(2);
+        }
+    }
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let r = spawn_detached_dns_helper(
+        &n,
+        Path::new(program),
+        listen,
+        READY_TIMEOUT_DEFAULT,
+        &NoopNetOpRecorder,
+    );
+    match r {
+        Ok(_) => eprintln!("launcher_child: spawn returned before being killed: Ok"),
+        Err(e) => eprintln!(
+            "launcher_child: spawn returned before being killed: {:?} {}",
+            e.code(),
+            e.message()
+        ),
+    }
+    std::process::ExitCode::from(3)
+}
+
+/// 失敗時に起動元の子と段 2 相当を片付ける（プロセスを漏らさない。REPAIR-5）。
+/// pid 番号への kill は後始末に限り、cmdline の `--nonce` の直後の引数が偽の段 1 の書いた nonce と
+/// 完全一致したときだけ送る（pid 再利用で別の試験のプロセスを止めない。#3482）。帰属できなければ送らない。
+/// 確認から kill までの再利用の窓は残るが、nonce は 128 bit の乱数で別プロセスに当たる確率は実質 0。
+struct KillGuard {
+    child: Option<std::process::Child>,
+    stage2: PathBuf,
+    nonce_file: PathBuf,
+}
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.child.as_mut() {
+            crate::reap::reap_or_report(c, crate::reap::reap_within());
+        }
+        let Some(pid) = std::fs::read_to_string(&self.stage2)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        let nonce = std::fs::read_to_string(&self.nonce_file)
+            .ok()
+            .and_then(|s| HelperNonce::new(s.trim()).ok());
+        if nonce.is_some_and(|n| cmdline_has_nonce(pid, &n)) {
+            let mut kill = Command::new("kill");
+            kill.args(["-KILL", &pid.to_string()]);
+            let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+        } else {
+            eprintln!("kill guard: pid {pid} not attributed by nonce; not killing");
+        }
+    }
+}
+
+/// `/proc/<pid>/cmdline` に隣接する `--nonce`・`<nonce>` の引数対が完全一致であるか（読めなければ false）。
+fn cmdline_has_nonce(pid: u32, nonce: &HelperNonce) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    args.windows(2)
+        .any(|w| w[0] == b"--nonce" && w[1] == nonce.as_str().as_bytes())
+}
+
+/// `/proc/<pid>/stat` の状態文字。
+fn proc_state(pid: u32) -> Option<char> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+/// 後始末を短縮して起動する起動元の ms。ack 期限の後に kill が遅れて届く窓を「ack 期限 + 約 50 ms」まで狭める（#3508）。
+const SHORT_CLEANUP_MS: u64 = 50;
+
+/// 偽の段 1・起動元の子・`KillGuard`・同一性つきの意図記録の観測までをまとめた場面の準備（2 つの場面で共有）。
+struct LauncherScene {
+    tmp: Tmp,
+    store: NetworkStore,
+    name: NetworkName,
+    pidfile: PathBuf,
+    nonce_file: PathBuf,
+    guard: KillGuard,
+    recorded: ProcessIdentity,
+    /// 意図記録の同一性を観測した時刻。
+    seen_at: Instant,
+}
+
+fn launcher_scene(exe: &Path, tag: &str) -> LauncherScene {
+    let tmp = Tmp::new(tag);
+    let (store, name) = setup(&tmp);
+    let script = tmp.0.join("fake-stage1.sh");
+    let pidfile = tmp.0.join("stage2.pid");
+    let nonce_file = tmp.0.join("stage2.nonce");
+    // 本体は複合コマンドにする（単一の `sleep` だと sh が exec して argv の nonce が消える）。
+    // nonce は KillGuard の帰属用に、段 2 相当の起動前に書く（試験が早期に panic しても帰属できる）。
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$5\" > '{}'\nsh -c 'kill -STOP $$; sleep 30' sh --nonce \"$5\" &\necho \"$!\" > '{}'\necho \"SPAWN $!\"\nexit 0\n",
+            nonce_file.display(),
+            pidfile.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod");
+
+    let child = Command::new(exe)
+        .arg(ARG_LAUNCHER_CHILD)
+        .arg(&tmp.0)
+        .arg(&script)
+        .arg(SHORT_CLEANUP_MS.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn launcher child");
+    let mut guard = KillGuard {
+        child: Some(child),
+        stage2: pidfile.clone(),
+        nonce_file: nonce_file.clone(),
+    };
+
+    // 同一性つきの意図記録が現れるのを、起動元の ack 期限（2 秒）より短い期限で待つ。
+    let intent_path = tmp.0.join("@networks/dnsh/dns-helper.intent");
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let recorded = loop {
+        match std::fs::read(&intent_path) {
+            Ok(bytes) => {
+                let i = DnsHelperIntent::decode(&bytes).expect("decode intent");
+                if let Some(id) = i.identity() {
+                    break id.clone();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("read intent: {e}"),
+        }
+        if Instant::now() >= deadline {
+            let st = guard.child.as_mut().and_then(|c| c.try_wait().ok());
+            panic!("intent record with identity did not appear in time; launcher status {st:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    LauncherScene {
+        tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file,
+        guard,
+        recorded,
+        seen_at: Instant::now(),
+    }
+}
+
+/// #3455（#3414 の残り。NET-5・NET-7・REPAIR-4・REPAIR-5・REPAIR-12）: 段 1 の `SPAWN <pid>` 行が識別行より先に
+/// 届き、起動元が同一性を意図記録へ追記した後、識別行が届く前に起動元が SIGKILL されても、次の回収が
+/// 記録した同一性で帰属して止める。回収は候補なしで呼び、帰属が cgroup 走査でなく記録から来たことを固定する。
+fn launcher_killed_after_spawn_line(exe: &Path) {
+    use std::os::unix::process::ExitStatusExt;
+    let LauncherScene {
+        tmp: _tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file,
+        mut guard,
+        recorded,
+        seen_at: _,
+    } = launcher_scene(exe, "killspawn");
+
+    let mut child = guard.child.take().expect("child");
+    child.kill().expect("SIGKILL launcher");
+    let status = match crate::reap::wait_within(&mut child, crate::reap::reap_within()) {
+        Ok(s) => s,
+        Err(e) => {
+            guard.child = Some(child);
+            panic!("launcher did not exit after SIGKILL: {e}");
+        }
+    };
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "launcher must die by our SIGKILL, not by itself (exit {:?}); see its stderr",
+        status.code()
+    );
+    // 起動元が ack 期限を過ぎて後始末へ進んでいたら、段 2 相当は起動元自身の pidfd 経由の kill で既に消えている。
+    // 下の停止中（T）の検査がその遅れ kill も検出する（#3508。短縮した後始末なら窓は ack 期限 + 約 50 ms）。
+
+    // 窓が本物だったこと: 同一性は段 2 相当の実値で、識別行は出ておらず（停止中）、確定記録は無い。
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert_eq!(recorded.pid, pid);
+    assert_eq!(read_identity(pid).expect("identity"), recorded);
+    // KillGuard の帰属の自己照合: 書かれた nonce は意図記録のものと一致し、cmdline の対にだけ一致する。
+    let written = HelperNonce::new(
+        std::fs::read_to_string(&nonce_file)
+            .expect("nonce file")
+            .trim(),
+    )
+    .expect("written nonce");
+    assert!(cmdline_has_nonce(pid, &written));
+    assert!(!cmdline_has_nonce(
+        pid,
+        &HelperNonce::generate().expect("other nonce")
+    ));
+    let stop_deadline = Instant::now() + Duration::from_secs(5);
+    while proc_state(pid) != Some('T') {
+        assert!(
+            Instant::now() < stop_deadline,
+            "stage 2 stand-in must be stopped, state {:?}",
+            proc_state(pid)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 起動元が死んだので flock はカーネルが解放済み。
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert_eq!(
+        n.read_dns_helper_intent()
+            .expect("intent")
+            .expect("kept")
+            .identity(),
+        Some(&recorded)
+    );
+    assert_eq!(n.read_dns_helper().expect("record"), None);
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::Recovered { stopped: 1 }
+    );
+    assert!(gone(pid), "the recorded identity must be stopped");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut std::iter::empty(), &NoopNetOpRecorder)
+            .expect("recover"),
+        IntentRecovery::NoIntent
+    );
+    // 起動できる状態に戻っている。
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("respawn");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &NoStopRequest, &NoopNetOpRecorder).expect("stop"),
+        StopOutcome::Killed
+    );
+    assert!(gone(h.identity.pid));
+    drop(n);
+    drop(g);
+    drop(guard);
+    eprintln!(
+        "dns_helper_process: launcher_killed_after_spawn_line ok launcher_signal=9 stage2_state=T recovered_stopped=1 intent_after=none record_after=none"
+    );
+}
+
+/// #3508（#3482 の否定確認の感度。NET-5・NET-7・REPAIR-5・REPAIR-12）の陽性対照: 起動元を kill せずに待つと、
+/// ack 期限の後に後始末（短縮済み）を終えて自分で終了コード 3 で終わる。`launcher_killed_after_spawn_line` の
+/// `signal == Some(9)` は、この自発終了より後に届いた kill では成り立たないため、見逃す窓が狭いことの裏付けになる。
+fn launcher_self_exits_after_ack_deadline(exe: &Path) {
+    use std::os::unix::process::ExitStatusExt;
+    let LauncherScene {
+        tmp: _tmp,
+        store,
+        name,
+        pidfile,
+        nonce_file: _,
+        mut guard,
+        recorded,
+        seen_at,
+    } = launcher_scene(exe, "selfexit");
+
+    let mut child = guard.child.take().expect("child");
+    let limit = DNS_HELPER_ACK_TIMEOUT + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if seen_at.elapsed() >= limit => {
+                guard.child = Some(child);
+                panic!("launcher did not exit by itself within {limit:?} after the intent record");
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let elapsed = seen_at.elapsed();
+    assert_eq!(status.code(), Some(3), "launcher must return by itself");
+    assert_eq!(status.signal(), None);
+    // 既定の後始末（猶予 + 終了待ちで約 4 秒）なら超える。短縮が効いていることの照合も兼ねる。
+    assert!(
+        elapsed <= DNS_HELPER_ACK_TIMEOUT + Duration::from_secs(1),
+        "cleanup must be shortened, elapsed {elapsed:?}"
+    );
+    eprintln!(
+        "dns_helper_process: launcher_self_exit_elapsed_ms={}",
+        elapsed.as_millis()
+    );
+
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert_eq!(recorded.pid, pid);
+    assert!(
+        gone(pid),
+        "the launcher must have stopped its stage 2 stand-in"
+    );
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    assert_eq!(n.read_dns_helper().expect("record"), None);
+    drop(n);
+    drop(g);
+    drop(guard);
+    eprintln!(
+        "dns_helper_process: launcher_self_exits_after_ack_deadline ok launcher_exit=3 stage2_gone=1 intent_after=none record_after=none"
+    );
+}
+
+/// ネットワーク `dnsh` のメンバー記録（ID = コンテナ ID が DNS 名になる。10.89.0.`last`/24）。
+/// 取り出しに `delay` かかる候補の列。最初の 1 件（自プロセスの pid。nonce は持たない）だけを返し、以降は空。
+/// 回収の期限検査は取り出し直後に行われるため、`next()` の遅れで期限が過ぎる場面を作れる。
+fn slow_candidates(delay: Duration) -> impl Iterator<Item = u32> {
+    let mut first = true;
+    std::iter::from_fn(move || {
+        if std::mem::take(&mut first) {
+            std::thread::sleep(delay);
+            Some(std::process::id())
+        } else {
+            None
+        }
+    })
+}
+
+/// 回収の期限を `<ms>` に短縮した子（`recover_deadline_keeps_intent` の被験側。NET-5・REPAIR-5・REPAIR-12・#3559）:
+/// `override_recover_timeout_for_test` の後、期限より遅い候補の列で回収が `Timeout` になり意図記録が残ることを
+/// 照合する。上書きはプロセス全体に効く大域状態なので、試験の親では呼ばずこの専用の子でだけ呼ぶ。
+/// 期待どおりなら終了コード 0、使い方・上書きの失敗は 2、期待外れ（`Ok` や別のコード）は 3。
+pub fn recover_deadline_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let (Some(root), Some(ms)) = (args.get(2), args.get(3)) else {
+        eprintln!("recover_deadline_child: usage: --recover-deadline-child <state_root> <ms>");
+        return std::process::ExitCode::from(2);
+    };
+    let Some(ms) = ms.to_str().and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("recover_deadline_child: invalid deadline ms");
+        return std::process::ExitCode::from(2);
+    };
+    if let Err(e) = override_recover_timeout_for_test(Duration::from_millis(ms)) {
+        eprintln!(
+            "recover_deadline_child: override failed: {:?} {}",
+            e.code(),
+            e.message()
+        );
+        return std::process::ExitCode::from(2);
+    }
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    if n.read_dns_helper_intent().expect("intent").is_none() {
+        eprintln!("recover_deadline_child: no intent record");
+        return std::process::ExitCode::from(3);
+    }
+    let started = Instant::now();
+    // 候補の取り出しに期限の 4 倍かかる。取り出し直後の期限検査で Timeout になる。
+    let mut cands = slow_candidates(Duration::from_millis(ms * 4));
+    let r = recover_dns_helper_intent(&n, &mut cands, &NoopNetOpRecorder);
+    let elapsed = started.elapsed();
+    let kept = n.read_dns_helper_intent().expect("intent").is_some();
+    match r {
+        Err(e)
+            if e.code() == NetErrorCode::Timeout
+                && e.message().contains("intent record kept")
+                && kept
+                && elapsed < Duration::from_secs(5) =>
+        {
+            eprintln!(
+                "recover_deadline_child: timeout elapsed_ms={}",
+                elapsed.as_millis()
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!(
+                "recover_deadline_child: unexpected result {:?} kept={kept} elapsed={elapsed:?}",
+                other.map_err(|e| (e.code(), e.message().to_owned()))
+            );
+            std::process::ExitCode::from(3)
+        }
+    }
+}
+
+/// #3559（#3540 の残り。NET-5・REPAIR-5・REPAIR-12）: 回収全体の期限切れで `Timeout` になり、意図記録（再試行に
+/// 要る nonce）を消さないこと（fail-closed）を、期限を 50 ms に短縮した専用の子（`--recover-deadline-child`）で
+/// 30 秒待たずに照合する。陽性対照として、上書きしない親プロセス（既定 30 秒）では同じ遅延の列が
+/// `Recovered { stopped: 0 }` で終わり意図記録が消える（遅延だけでは `Timeout` にならず、子の `Timeout` が
+/// 期限の短縮から来たことの裏付けになる）。親では上書きを呼ばない。
+fn recover_deadline_keeps_intent(exe: &Path) {
+    let tmp = Tmp::new("recover-deadline");
+    let (store, name) = setup(&tmp);
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 5353).expect("listen");
+    {
+        let g = store.lock_global_exclusive().expect("global");
+        let n = g.lock_network(&name).expect("net");
+        n.write_dns_helper_intent(&DnsHelperIntent::new(
+            name.clone(),
+            HelperNonce::generate().expect("nonce"),
+            listen,
+        ))
+        .expect("intent");
+        // 子が同じ排他ロックをとるため、起動の前にここで手放す。
+    }
+    let mut child = Command::new(exe)
+        .arg(ARG_RECOVER_DEADLINE_CHILD)
+        .arg(&tmp.0)
+        .arg("50")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let status = match crate::reap::wait_within(&mut child, crate::reap::reap_within()) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("recover deadline child did not finish: {e}");
+        }
+    };
+    assert_eq!(status.code(), Some(0), "child must observe Timeout");
+
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    assert!(
+        n.read_dns_helper_intent().expect("intent").is_some(),
+        "a timed-out recovery must keep the intent record"
+    );
+    // 陽性対照: 既定の期限では同じ遅延の列でも完了し、意図記録が消える。
+    let mut cands = slow_candidates(Duration::from_millis(200));
+    assert_eq!(
+        recover_dns_helper_intent(&n, &mut cands, &NoopNetOpRecorder).expect("recover"),
+        IntentRecovery::Recovered { stopped: 0 }
+    );
+    assert_eq!(n.read_dns_helper_intent().expect("intent"), None);
+    drop(n);
+    drop(g);
+    eprintln!(
+        "dns_helper_process: recover_deadline_keeps_intent ok child_exit=0 child_code=Timeout intent_kept=1 default_recovered_stopped=0 intent_after=none"
+    );
+}
+
+fn member(id: &str, last: u8) -> MemberRecord {
+    let token = format!("fandhe-net:dnsh:1:0:0/ep/{id}/g/00000000000000000000000000000001");
+    MemberRecord::new(
+        MemberId::new(id).expect("member id"),
+        EndpointId::new(id).expect("endpoint"),
+        IpPrefix::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), 24).expect("prefix"),
+        &token,
+        Path::new("/run/fc-test-ns"),
+        (8, 9),
+        &[],
+    )
+    .expect("member record")
+}
+
+/// A 応答の RCODE。
+fn rcode(resp: &[u8]) -> Option<u8> {
+    resp.get(3).map(|b| b & 0x0f)
+}
+
+/// 名前の A 応答のアドレス（NOERROR で answer 1 件のときだけ）。
+fn a_record(target: std::net::SocketAddrV4, name: &str) -> Option<Ipv4Addr> {
+    let r = query_a(target, name)?;
+    if rcode(&r) != Some(0) || r.get(7) != Some(&1) {
+        return None;
+    }
+    let tail: [u8; 4] = r.get(r.len().checked_sub(4)?..)?.try_into().ok()?;
+    Some(Ipv4Addr::from(tail))
+}
+
+/// 制御 UDS: 起動時の読み込み・`Reload` の ack・壊れた記録でも前の状態を保つ・メンバー削除の反映・
+/// `Stop` による停止と socket の後始末・残った socket の起動時の除去（NET-5・PLUG-12・REPAIR-5・#3071）。
+fn control_reload(exe: &Path) {
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+    let tmp = Tmp::new("ctl");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+
+    // ヘルパーが居なければ送るものがない。
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::NotRunning
+    );
+
+    // 起動前に書いたメンバーは、起動時の初回読み込みで答える。`_` を含む ID は DNS 名にできず登録されない。
+    n.commit_member(&member("web", 2)).expect("web");
+    n.commit_member(&member("my_app", 9)).expect("my_app");
+    // 前回の残りの制御 socket（listener は無い）は起動時に消される。
+    drop(std::os::unix::net::UnixListener::bind(&ctl).expect("stale socket"));
+    assert!(ctl.exists());
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    let meta = std::fs::symlink_metadata(&ctl).expect("ctl");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(a_record(h.listen, "web"), Some(Ipv4Addr::new(10, 89, 0, 2)));
+    assert_eq!(rcode(&query_a(h.listen, "my_app").expect("resp")), Some(5));
+
+    // Reload: 追加したメンバーが引けるようになる（ack の後に答える）。
+    n.commit_member(&member("db", 3)).expect("db");
+    let t = Instant::now();
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+    assert_eq!(a_record(h.listen, "web"), Some(Ipv4Addr::new(10, 89, 0, 2)));
+
+    // 壊れた記録があれば Reload は失敗し、前のレジストリは保たれる。
+    let junk = tmp.0.join("@networks/dnsh/members/zz");
+    std::fs::write(&junk, b"junk").expect("junk");
+    std::fs::set_permissions(&junk, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let e = reload_dns_helper(&n, &NoopNetOpRecorder).expect_err("corrupt");
+    assert_eq!(e.code(), NetErrorCode::DataLoss);
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+    std::fs::remove_file(&junk).expect("rm junk");
+
+    // メンバーを消して Reload すると、その名前は引けなくなる（REFUSED）。
+    assert!(
+        n.remove_member(&MemberId::new("web").expect("id"))
+            .expect("rm")
+    );
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    assert_eq!(rcode(&query_a(h.listen, "web").expect("resp")), Some(5));
+    assert_eq!(a_record(h.listen, "db"), Some(Ipv4Addr::new(10, 89, 0, 3)));
+
+    // 実在しない世代の Loaded を返さない相手（生のフレームで Reload を直接送る）への応答は同じ世代。
+    let raw = connect_within(&ctl, Duration::from_secs(10)).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("t");
+    let gen_ = ReloadGeneration::new(0xFEED).expect("gen");
+    let mut w = &raw;
+    ControlFrame::encode(ControlMessage::Reload(gen_))
+        .write_to(&mut w)
+        .expect("write");
+    let mut r = &raw;
+    assert_eq!(
+        ControlFrame::read_from(&mut r).expect("loaded"),
+        ControlMessage::Loaded(gen_)
+    );
+    drop(raw);
+
+    // Stop: 猶予内に自分で終了し、socket と記録が消える。
+    let t = Instant::now();
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &ControlStopRequest::new(&n), &NoopNetOpRecorder)
+            .expect("stop"),
+        StopOutcome::StoppedOnRequest
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "must finish within the grace"
+    );
+    assert!(gone(h.identity.pid));
+    assert!(!ctl.exists(), "the control socket must be removed");
+    assert_eq!(n.read_dns_helper().expect("read"), None);
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::NotRunning
+    );
+    drop(n);
+    drop(g);
+    println!("dns_helper_process: control_reload ok registered=db refused=web stop=on_request");
+}
+
+/// `dns` つきのメンバー記録（`member` の上流指定つき版）。
+fn member_dns(id: &str, last: u8, dns: &[std::net::IpAddr]) -> MemberRecord {
+    let token = format!("fandhe-net:dnsh:1:0:0/ep/{id}/g/00000000000000000000000000000001");
+    MemberRecord::new(
+        MemberId::new(id).expect("member id"),
+        EndpointId::new(id).expect("endpoint"),
+        IpPrefix::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 89, 0, last)), 24).expect("prefix"),
+        &token,
+        Path::new("/run/fc-test-ns"),
+        (8, 9),
+        dns,
+    )
+    .expect("member record")
+}
+
+/// 子の出力 1 本を行ごとに読み、チャネルへ流す（読み手は子の終了で EOF になって終わる）。
+fn pump_lines<R: Read + Send + 'static>(r: R) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(r).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// `prefix` で始まる次の行を期限つきで待つ（REPAIR-5）。
+fn next_line_with(rx: &std::sync::mpsc::Receiver<String>, prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(l) if l.starts_with(prefix) => return l,
+            Ok(_) => {}
+            Err(e) => panic!("no line starting with {prefix:?} before the deadline: {e}"),
+        }
+    }
+}
+
+/// 記録の `--dns` から上流の割り当てを組む製品経路を、実ヘルパー（段 2 を直接起動して stderr を読む）で確かめる
+/// （NET-12・NET-5・#3072・REPAIR-12）。上流の割り当ては転送が無効の間は外から観測できないため、`load_into` が
+/// 出す件数の行（`dns upstreams loaded count= skipped= collisions=`）で、起動時の初回読み込みと制御 UDS の
+/// `Reload` 後の再構築を具体値で照合する。アドレスが衝突したメンバーは collisions に数えられる。
+fn upstream_load(exe: &Path) {
+    use std::io::Write as _;
+    use std::net::IpAddr;
+    let ip = |a: u8, b: u8, c: u8, d: u8| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    let tmp = Tmp::new("ups");
+    let (store, name) = setup(&tmp);
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    n.commit_member(&member_dns("web", 2, &[ip(8, 8, 8, 8)]))
+        .expect("web");
+    n.commit_member(&member_dns("api", 3, &[ip(1, 1, 1, 1), ip(9, 9, 9, 9)]))
+        .expect("api");
+    // 同じアドレスのメンバーが 2 つあれば、他コンテナの上流を奪えないようどちらも登録しない（collisions）。
+    n.commit_member(&member_dns("dup1", 4, &[ip(8, 8, 8, 8)]))
+        .expect("dup1");
+    n.commit_member(&member_dns("dup2", 4, &[ip(1, 1, 1, 1)]))
+        .expect("dup2");
+    n.commit_member(&member("plain", 5)).expect("plain");
+
+    let nonce = HelperNonce::generate().expect("nonce");
+    let mut child = Command::new(exe)
+        .args([
+            ARG_STAGE2,
+            "--listen",
+            "127.0.0.1:0",
+            ARG_NONCE,
+            nonce.as_str(),
+            ARG_STATE_ROOT,
+        ])
+        .arg(&tmp.0)
+        .args([ARG_NETWORK, "dnsh"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stage 2");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let out = pump_lines(child.stdout.take().expect("stdout"));
+    let err = pump_lines(child.stderr.take().expect("stderr"));
+    next_line_with(&out, "IDENT ");
+    stdin.write_all(b"ACK\n").expect("ack");
+    stdin.flush().expect("flush");
+    next_line_with(&out, "READY ");
+
+    // 起動時の初回読み込み: web と api が登録、dup1・dup2 は衝突で落ち、plain は上流なし。
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=2 skipped=0 collisions=2"
+    );
+
+    // Reload 後の再構築: web を消し cache・solo を足すと api・cache・solo の 3 件、dup1・dup2 は衝突のまま。
+    assert!(
+        n.remove_member(&MemberId::new("web").expect("id"))
+            .expect("rm")
+    );
+    n.commit_member(&member_dns("cache", 6, &[ip(8, 8, 4, 4)]))
+        .expect("cache");
+    n.commit_member(&member_dns("solo", 7, &[ip(1, 0, 0, 1)]))
+        .expect("solo");
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+    let send = |msg: ControlMessage| {
+        let raw = connect_within(&ctl, Duration::from_secs(10)).expect("connect");
+        raw.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("t");
+        let mut w = &raw;
+        ControlFrame::encode(msg).write_to(&mut w).expect("write");
+        raw
+    };
+    let gen_ = ReloadGeneration::new(0xBEEF).expect("gen");
+    let raw = send(ControlMessage::Reload(gen_));
+    let mut r = &raw;
+    assert_eq!(
+        ControlFrame::read_from(&mut r).expect("loaded"),
+        ControlMessage::Loaded(gen_)
+    );
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=3 skipped=0 collisions=2"
+    );
+
+    // 衝突の片方を消して Reload すると、残った dup1 が登録され collisions が 0 になる。
+    assert!(
+        n.remove_member(&MemberId::new("dup2").expect("id"))
+            .expect("rm")
+    );
+    let gen2 = ReloadGeneration::new(0xCAFE).expect("gen");
+    let raw2 = send(ControlMessage::Reload(gen2));
+    let mut r2 = &raw2;
+    assert_eq!(
+        ControlFrame::read_from(&mut r2).expect("loaded"),
+        ControlMessage::Loaded(gen2)
+    );
+    assert_eq!(
+        next_line_with(&err, "dns upstreams loaded"),
+        "dns upstreams loaded count=4 skipped=0 collisions=0"
+    );
+
+    // Stop で自分で終了する。
+    drop(send(ControlMessage::Stop));
+    let t = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if t.elapsed() > Duration::from_secs(6) {
+            crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
+            panic!("helper did not stop on request");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    drop(n);
+    drop(g);
+    println!(
+        "dns_helper_process: upstream_load ok initial=2/collide2 reload=3/collide2 resolved=4/0"
+    );
+}
+
+/// 実機前提（`--ignored`・root と util-linux の `setpriv`）: 別 uid の接続は、フレームを読まれずに切断される
+/// （PLUG-12・NET-5・#3071）。
+///
+/// 非 root（uid 65534）の子にストアとヘルパーを作らせ、root の親が DAC を越えて `dns.ctl` へ接続して `Reload` を送る。
+/// `Loaded` も `Error` も返らず切断され、その後も同じ uid からの `Reload` は成功し、`Stop` で止まる。
+/// root でない・`setpriv` が無い場合は fail-closed に panic（非ゼロ終了）する。明示実行（`--ignored`）で前提未達を
+/// 成功として通さない（AGENTS.md に実行方法・REPAIR-12）。
+pub fn foreign_uid(exe: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let uid_line = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .unwrap_or_default();
+    let is_root = uid_line.split_whitespace().nth(2) == Some("0");
+    let have_setpriv = crate::reap::run_within(
+        Command::new("setpriv")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        crate::reap::reap_within(),
+    )
+    .is_ok_and(|s| s.success());
+    assert!(
+        is_root && have_setpriv,
+        "dns_helper_process: control_foreign_uid precondition failed (needs root and setpriv: root={is_root} setpriv={have_setpriv})"
+    );
+    let tmp = Tmp::new("foreign");
+    let nobody = 65534u32;
+    std::os::unix::fs::chown(&tmp.0, Some(nobody), Some(nobody)).expect("chown tmp");
+    // 子（uid 65534）が実行できるよう、試験バイナリを複製する。複製先は root 所有で他 uid が変更できない別ディレクトリにし、
+    // uid 65534 に渡した状態ディレクトリとは分ける（同 uid による symlink 差し替えで root のファイル操作を
+    // 誘導されない。他 uid へ渡したディレクトリ内で root はファイル操作をしない）。
+    let bindir = Tmp::new("foreign-bin");
+    std::fs::set_permissions(&bindir.0, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    let bin = bindir.0.join("test-bin");
+    std::fs::copy(exe, &bin).expect("copy exe");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut child = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg(&bin)
+        .arg(ARG_FOREIGN_UID_CHILD)
+        .arg(&tmp.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn child");
+    let mut stdin = child.stdin.take().expect("stdin");
+    // 子の標準出力は読み手スレッド経由で受け、待ちには期限を付ける（REPAIR-5）。期限切れは子とヘルパーを回収して失敗。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let child_out = child.stdout.take().expect("stdout");
+    std::thread::spawn(move || {
+        let mut out = BufReader::new(child_out);
+        loop {
+            let mut l = String::new();
+            match out.read_line(&mut l) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if tx.send(l).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let within = crate::reap::reap_within();
+    let helper = std::cell::Cell::new(None::<(u32, u64)>);
+    let recv_line = |child: &mut std::process::Child, what: &str| -> String {
+        match rx.recv_timeout(within) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(id) = helper.get() {
+                    kill_helper_if_same(id);
+                }
+                crate::reap::reap_or_report(child, within);
+                panic!("no {what} line from the foreign-uid child within {within:?}: {e}");
+            }
+        }
+    };
+    let line = recv_line(&mut child, "CHILD-READY");
+    // 子がヘルパーの同一性（pid・開始時刻）を知らせる。後始末の帰属確認に使う。
+    let helper_id = {
+        let mut it = line.split_whitespace();
+        assert_eq!(
+            it.next(),
+            Some("CHILD-READY"),
+            "child did not start the helper"
+        );
+        let pid = it
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("helper pid");
+        let start = it
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("helper start");
+        (pid, start)
+    };
+    helper.set(Some(helper_id));
+
+    // root は DAC を越えて接続できるが、ヘルパーは uid 不一致として読まずに切断する。
+    let ctl = tmp.0.join("@networks/dnsh/dns.ctl");
+    let raw = match connect_within(&ctl, within) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("root connect to the helper control socket: {e}");
+        }
+    };
+    raw.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("t");
+    let mut w = &raw;
+    let _ = ControlFrame::encode(ControlMessage::Reload(
+        ReloadGeneration::new(1).expect("gen"),
+    ))
+    .write_to(&mut w);
+    let mut r = &raw;
+    let mut one = [0u8; 1];
+    // 許すのは EOF と接続の切断だけ。WouldBlock / TimedOut（読み取り期限切れ）は切断されなかった証拠なので失敗（PLUG-12）。
+    match r.read(&mut one) {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Ok(_) => panic!("a foreign uid must not receive any frame"),
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign uid read was not a disconnect: {e:?}");
+        }
+    }
+    drop(raw);
+
+    // 同じ uid（子）からの Reload は成功し、Stop で止まる。
+    std::io::Write::write_all(&mut stdin, b"go\n").expect("go");
+    drop(stdin);
+    for want in ["CHILD-RELOADED", "CHILD-STOPPED"] {
+        let line = recv_line(&mut child, want);
+        assert_eq!(line.trim(), want);
+    }
+    let status = match crate::reap::wait_within(&mut child, within) {
+        Ok(st) => st,
+        Err(e) => {
+            if let Some(id) = helper.get() {
+                kill_helper_if_same(id);
+            }
+            crate::reap::reap_or_report(&mut child, within);
+            panic!("foreign-uid child did not exit: {e}");
+        }
+    };
+    assert!(status.success(), "child failed: {status:?}");
+    println!("dns_helper_process: control_foreign_uid ok peer_uid=65534 foreign=dropped");
+}
+
+/// 期限切れ時の回収。子が知らせたヘルパーの同一性（pid・開始時刻）と、実 uid が 65534 であることを確かめてから
+/// `kill -KILL` する（cmdline の部分文字列では選ばない。別プロセスや root のプロセスを止めない）。確認から kill までの
+/// pid 再利用の窓は残るが、開始時刻と uid の両方が一致する必要がある。外部 `kill` は期限つき実行。
+fn kill_helper_if_same((pid, start): (u32, u64)) {
+    let same_start = read_identity(pid).is_ok_and(|id| id.start_time_ticks == start);
+    let nobody_owned = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .is_some_and(|l| l.split_whitespace().nth(1) == Some("65534"));
+    if same_start && nobody_owned {
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", &pid.to_string()]);
+        let _ = crate::reap::run_within(&mut kill, crate::reap::reap_within());
+    } else {
+        eprintln!("kill helper: pid {pid} not attributed; not killing");
+    }
+}
+
+/// `foreign_uid` の子の引数。
+pub const ARG_FOREIGN_UID_CHILD: &str = "--foreign-uid-child";
+
+/// `foreign_uid` の子（uid 65534）。ストアとヘルパーを作り、親の合図の後に Reload と Stop を行う。
+pub fn foreign_uid_child(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    let Some(root) = args.get(2) else {
+        eprintln!("foreign_uid_child: usage: --foreign-uid-child <state_root>");
+        return std::process::ExitCode::from(2);
+    };
+    let exe = std::env::current_exe().expect("exe");
+    let store = NetworkStore::open(Path::new(root)).expect("open");
+    store
+        .create(&NetworkDefinition::pasta("dnsh").expect("def"))
+        .expect("create");
+    let name = NetworkName::new("dnsh").expect("name");
+    let g = store.lock_global_exclusive().expect("global");
+    let n = g.lock_network(&name).expect("net");
+    n.commit_member(&member("web", 2)).expect("web");
+    let listen = DnsListenAddr::new(Ipv4Addr::LOCALHOST, 0).expect("listen");
+    let h = spawn_detached_dns_helper(&n, &exe, listen, READY_TIMEOUT_DEFAULT, &NoopNetOpRecorder)
+        .expect("spawn");
+    println!(
+        "CHILD-READY {} {}",
+        h.identity.pid, h.identity.start_time_ticks
+    );
+    let mut go = String::new();
+    std::io::stdin().read_line(&mut go).expect("go");
+    assert_eq!(
+        reload_dns_helper(&n, &NoopNetOpRecorder).expect("reload"),
+        ReloadOutcome::Loaded
+    );
+    println!("CHILD-RELOADED");
+    assert_eq!(
+        stop_recorded_dns_helper(&n, &ControlStopRequest::new(&n), &NoopNetOpRecorder)
+            .expect("stop"),
+        StopOutcome::StoppedOnRequest
+    );
+    println!("CHILD-STOPPED");
+    std::process::ExitCode::SUCCESS
+}

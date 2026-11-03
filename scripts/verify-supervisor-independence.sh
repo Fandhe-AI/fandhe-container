@@ -13,7 +13,7 @@
 #       「同名のプロセスが居る」ではなく同一プロセスの照合）。再親化後の親 pid は参考値として出力する
 # 「監視継続」は既定では (b)+(c) の生存照合で定義する。残り N-1 個のコンテナを kill して再起動を確認する
 # PoC-17 相当の往復は --check-restart（opt-in・既定 off）で、SUP-3（restart ポリシー）の実装が前提のため
-# supervisor の再 launch が本番 launcher で拒否される間（#2043）は成立しない（#2043 の後に有効）。
+# supervisor の再 launch は #2043 で本番 launcher でも成立する（実機での実証は #499）。
 # 孤児コンテナの re-adopt・終了ポリシーは SUP-8・TASK-165 の課題で本スクリプトの範囲外。
 #
 # 呼び出し元: Makefile の `supervisor-independence`（操作者が明示実行。make ci には含めない）。
@@ -40,7 +40,7 @@
 # 後始末の第 1 段: 既定（--check-restart なし・restart ポリシー no）では、生存している監視プロセス（対象を除く）へ
 # CLI の stop（制御チャネル経由。Linux で結線済み・#2059・#2142）を期限付きで送る。対象は SIGKILL 済みで制御チャネルの
 # 相手がいないため stop を呼ばず、記録した pid での回収に任せる。--check-restart では stop の SIGTERM が restart の対象に
-# なる（SUP-9・#2162 待ち）ため呼ばない。stop は SIGTERM のみ（猶予後の SIGKILL は #1545 で未実装）で、init が SIGTERM を
+# なる。SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施のため呼ばない。stop は SIGTERM のみ（猶予後の SIGKILL は #1545 で未実装）で、init が SIGTERM を
 # 捨てうるため、以降の同一性照合つき回収を fallback として必ず残す。stop の成否は後始末の成否に影響しない。
 # 計測の起点（対象への SIGKILL）は変えない。CLI の delete は呼ばない（委譲スコープ外では cgroup 検出に失敗する・#2133）。
 # 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
@@ -486,7 +486,7 @@ tracked_alive() {
 # チャネルの相手がいない）以外へ `fandhe-container stop <id>` を送り、監視プロセスの終了を待つ。stop は SIGTERM を
 # 渡すだけで猶予後の SIGKILL を持たず（#1545）、PID 1 の init が SIGTERM を捨てる場合もあるため、成否に関わらず
 # 後続の同一性照合つき SIGTERM／SIGKILL を fallback として必ず残す（失敗は後始末の失敗にしない）。--check-restart
-# （--restart always）では stop の SIGTERM が restart の対象になる（SUP-9・#2162 待ち）ため呼ばない。
+# （--restart always）では stop の SIGTERM が restart の対象になる。SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施のため呼ばない。
 # 呼び出しごと・段全体に期限を付ける（REPAIR-5）。各 stop の上限・強制終了猶予・終了待機はすべて段全体 deadline の
 # 残り時間で制限し、段全体（既定 30 秒）を超えない。引数は検証済みの id_prefix と連番から配列で組み、出力は捨てる。
 cli_stop_survivors() {
@@ -789,7 +789,7 @@ for desc in ${DESC[$target_index]}; do
   if [ "$cppid" = "$tpid" ] && [ "$reparented_to" = "null" ] && [ -n "${SP[$cpid]:-}" ]; then reparented_to="${SP[$cpid]}"; fi
 done
 
-# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装と再 launch〔#2043〕が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
+# --- --check-restart（opt-in。SUP-3 の restart ポリシー実装と再 launch〔#2043 で成立〕が前提）: 残り N-1 個のコンテナ側プロセスを kill して再起動を確認 ---
 # 再起動の成立条件: kill した旧プロセス（pid・起動時刻）がすべて消滅していること、かつ各監視プロセスについて、kill 前に記録した子孫（pid・起動時刻）に含まれない「新しい」直接の子で、
 # kill した子とシグネチャ（comm＋完全な cmdline）が一致するものが、シグネチャごとに kill した直接の子の数以上、生存していること。
 # 同名・別コマンドの補助プロセスが増えただけでは成立しない。待機中と settle 中も子孫を追跡し続け（環境変数を

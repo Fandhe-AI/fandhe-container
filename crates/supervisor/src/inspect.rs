@@ -1,7 +1,7 @@
 //! コンテナ状態の `inspect` 相当の機械可読出力（SUP-11・TASK-168.1・#523・MS-9）。
 //!
-//! 自動化・AI 自己補修（REPAIR-4）や将来の CLI `inspect` 相当コマンドから呼ばれ、`state.json` の
-//! 1 レコードを 1 個の JSON オブジェクトへ整形する。CLI への配線は未実装（本モジュールは出力生成のみ）。
+//! 自動化・AI 自己補修（REPAIR-4）や CLI の `inspect` コマンド（#2775）から呼ばれ、`state.json` の
+//! 1 レコードを 1 個の JSON オブジェクトへ整形する。CLI の `inspect` コマンド（`crates/cli`。#2775）がこの出力をそのまま stdout へ書く（2 つ目の整形は持たない）。
 //! 出力を機械的にパースして型・値域・キー順・値を検証する結合テストは `tests/inspect_output.rs` に置く
 //! （TASK-168.2・#524。#523 で先行追加した試験へ #524 で型・キー順・列挙値の照合を追加した）。
 //!
@@ -25,8 +25,25 @@
 //! - `auditCoverage.record`（SEC-4・REPAIR-4・#2601）は縮退の監査記録を記録先へ書けなかったときだけ `"failed"`、
 //!   それ以外は `null`。`null` は「記録された」保証ではない（縮退なし・記録成功・#2468 より前の旧記録を区別しない）。
 //!   `auditCoverage` 自体が `null` のときは出ない。
+//! - `capabilities`（CLI-1・SEC-1・REPAIR-4・#2775）は launcher が適用前に保存した capability の許可上限
+//!   （`create --cap-drop` で狭めた後の値）。記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）
+//!   `null` で、OCI 既定とは推測しない。あるときは `{"bounding":[..]}` だけ（番号順の `CAP_*`。最大 41 件）。
+//!   実際に適用・確認した effective / permitted / inheritable / ambient は記録していないため出さない（推測しない）。
+//!   非 root の `process.user` で ambient が空のまま exec すると実効集合は上限より小さく（空にも）なるため、
+//!   `bounding` を「コンテナのプロセスが今持つ集合」と読んではならない。
+//! - `rootReadonly`（CLI-1・SUP-12・REPAIR-4・#2828）は launcher が実際に適用した `root.readonly` の実効値
+//!   （config の値と `create --read-only` の OR。mount の RDONLY・Landlock の root 規則と同じ値）で、`true` / `false`。
+//!   記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、書き込み可能とは推測しない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
+//! - `state <id>`（CLI-1・SUP-11・TASK-79 追補・#1903）は同じ [`InspectReport`] を OCI Runtime Spec の state の項目へ寄せた
+//!   [`InspectReport::to_oci_state_json`] で出す。キーは `ociVersion`・`id`・`status`・`pid`・`bundle`・`annotations` の
+//!   固定順（SUP-11 の拡張項目は `inspect` だけで、`state` には入れない。2026-10-12 のオーナー決定）。
+//!   `ociVersion` はランタイムの準拠版 [`OCI_STATE_VERSION`]（`state.json` 由来ではない）。`pid` は記録があるときだけ出し、
+//!   無ければキーごと省く（`null` は OCI schema の integer に違反し、推測・捏造もしない。start 前の `created` に init の pid は無い）。
+//!   OCI の本文は Linux の `created` / `running` で pid を REQUIRED とするため、start 前だけ差がある（オーナー報告事項）。
+//!   `annotations` は `create --label` の label で（bundle の `config.json` の annotations ではない）、無ければ `{}`。
+//!   値の上限検証は `from_record`（bundle）と core の `Annotations`（64 件・キー 255 B・合計 4 KiB）が持ち、ここでは二重に検証しない。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
 //!   エスケープで最大 6 倍。untrusted 値（bundle・cgroupScope）は必ずエスケープする。
 
@@ -42,6 +59,10 @@ use fandhe_container_core::traits::{
 
 /// bundle・cgroupScope の最大バイト数（出力有界化の上限。core の `state.json` 検証値と揃える）。
 const MAX_FIELD_BYTES: usize = 4096;
+
+/// `state` が出す `ociVersion`（このランタイムが準拠する OCI Runtime Spec の版。CORE-1・CLI-1・#1903）。
+/// bundle の `config.json` の `ociVersion` ではなく、ランタイム側の値である。
+pub const OCI_STATE_VERSION: &str = "1.3.0";
 
 /// 1 コンテナ分の inspect 出力の内容（SUP-11）。[`StateRecord`] のスナップショット。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,8 +206,49 @@ impl InspectReport {
         self.push_id_mapping(&mut s);
         s.push_str(",\"explicitStop\":");
         push_str_value(&mut s, self.explicit_stop().as_str());
+        s.push_str(",\"capabilities\":");
+        self.push_capabilities(&mut s);
+        s.push_str(",\"rootReadonly\":");
+        match self
+            .record
+            .launch_isolation()
+            .and_then(|l| l.root_readonly())
+        {
+            Some(true) => s.push_str("true"),
+            Some(false) => s.push_str("false"),
+            None => s.push_str("null"),
+        }
         s.push('}');
         s
+    }
+
+    /// launch が実際に適用した capability 集合（CLI-1・SEC-1・REPAIR-4・#2775）。記録が無ければ `null`
+    /// （OCI 既定とは推測しない）。値は固定語彙の `CAP_*` だけ（エスケープ不要）。
+    /// 出すのは許可上限 `bounding` だけ。effective / permitted 等は適用結果を記録していないため出さない。
+    fn push_capabilities(&self, s: &mut String) {
+        let Some(caps) = self
+            .record
+            .launch_isolation()
+            .and_then(|l| l.capabilities())
+        else {
+            s.push_str("null");
+            return;
+        };
+        let list = |s: &mut String| {
+            s.push('[');
+            for (i, c) in caps.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(c.as_str());
+                s.push('"');
+            }
+            s.push(']');
+        };
+        s.push_str("{\"bounding\":");
+        list(s);
+        s.push('}');
     }
 
     /// 選ばれた ID 写像のモデルと範囲（CORE-6・SEC-5・REPAIR-4・#2388）。記録が無ければ `null`。値はすべて数値と
@@ -259,8 +321,45 @@ impl InspectReport {
         s.push('}');
     }
 
+    /// OCI Runtime Spec の state の項目へ寄せた 1 個の JSON オブジェクト（末尾改行なし。CLI-1・#1903）。
+    ///
+    /// キーは `ociVersion`・`id`・`status`・`pid`（記録があるときだけ）・`bundle`・`annotations` の固定順。
+    /// `pid` は観測専用の記録値でシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
+    pub fn to_oci_state_json(&self) -> String {
+        let mut s = String::with_capacity(256);
+        s.push_str("{\"ociVersion\":");
+        push_str_value(&mut s, OCI_STATE_VERSION);
+        s.push_str(",\"id\":");
+        push_str_value(&mut s, self.id().as_str());
+        s.push_str(",\"status\":");
+        push_str_value(&mut s, self.status().as_str());
+        if let Some(p) = self.pid() {
+            let _ = write!(s, ",\"pid\":{p}");
+        }
+        s.push_str(",\"bundle\":");
+        push_str_value(&mut s, &self.bundle().to_string_lossy());
+        s.push_str(",\"annotations\":{");
+        for (i, (k, v)) in self.record.annotations().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            push_str_value(&mut s, k);
+            s.push(':');
+            push_str_value(&mut s, v);
+        }
+        s.push_str("}}");
+        s
+    }
+
+    /// [`Self::to_oci_state_json`] に LF を 1 個付けて書き出す（文字列を作り切ってから 1 回だけ書く）。
+    pub fn write_oci_state_json(&self, w: &mut (impl io::Write + ?Sized)) -> io::Result<()> {
+        let mut line = self.to_oci_state_json();
+        line.push('\n');
+        w.write_all(line.as_bytes())
+    }
+
     /// [`Self::to_json`] に LF を 1 個付けて書き出す。
-    pub fn write_json(&self, w: &mut impl io::Write) -> io::Result<()> {
+    pub fn write_json(&self, w: &mut (impl io::Write + ?Sized)) -> io::Result<()> {
         let mut line = self.to_json();
         line.push('\n');
         w.write_all(line.as_bytes())
@@ -355,6 +454,128 @@ mod tests {
         std::env::temp_dir().join("b")
     }
 
+    fn labels(e: &[(&str, &str)]) -> fandhe_container_core::traits::Annotations {
+        fandhe_container_core::traits::Annotations::new(
+            e.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+        )
+        .unwrap()
+    }
+
+    /// CLI-1・SUP-11(#1903): running・pid あり・annotations 2 件の OCI state は完全一致する。
+    #[test]
+    fn cli1_sup11_oci_state_running_exact() {
+        let b = bundle();
+        let rec = StateRecord::new(
+            ContainerStatus::running(cid("web-1"), nz(42)),
+            b.clone(),
+            StateRevision::from_raw(5),
+        )
+        .unwrap()
+        .with_annotations(labels(&[("b", "2"), ("a", "1")]));
+        let expected = format!(
+            "{{\"ociVersion\":\"1.3.0\",\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"bundle\":\"{}\",\"annotations\":{{\"a\":\"1\",\"b\":\"2\"}}}}",
+            json_escape(&b.to_string_lossy())
+        );
+        assert_eq!(
+            InspectReport::from_record(&rec)
+                .unwrap()
+                .to_oci_state_json(),
+            expected
+        );
+    }
+
+    /// CLI-1(#1903): pid の記録が無ければキーごと省き(null を出さない)、annotations は `{}`。
+    #[test]
+    fn cli1_oci_state_omits_pid_and_empty_annotations() {
+        let b = bundle();
+        for st in [
+            ContainerStatus::created(cid("c"), None),
+            ContainerStatus::stopped(cid("c"), Some(0)),
+        ] {
+            let name = st.state().as_str();
+            let rec = StateRecord::new(st, b.clone(), StateRevision::from_raw(1)).unwrap();
+            let expected = format!(
+                "{{\"ociVersion\":\"1.3.0\",\"id\":\"c\",\"status\":\"{name}\",\"bundle\":\"{}\",\"annotations\":{{}}}}",
+                json_escape(&b.to_string_lossy())
+            );
+            assert_eq!(
+                InspectReport::from_record(&rec)
+                    .unwrap()
+                    .to_oci_state_json(),
+                expected
+            );
+        }
+    }
+
+    /// CLI-1(#1903): pid の記録がある created は pid を出す。
+    #[test]
+    fn cli1_oci_state_created_with_pid() {
+        let rec = StateRecord::new(
+            ContainerStatus::created(cid("c"), nz(9)),
+            bundle(),
+            StateRevision::from_raw(1),
+        )
+        .unwrap();
+        let j = InspectReport::from_record(&rec)
+            .unwrap()
+            .to_oci_state_json();
+        assert!(
+            j.contains("\"status\":\"created\",\"pid\":9,\"bundle\""),
+            "{j}"
+        );
+    }
+
+    /// CLI-1(#1903): annotations のキー・値は必ずエスケープされ、生の制御文字が残らない。
+    #[test]
+    fn cli1_oci_state_escapes_annotations() {
+        let rec = StateRecord::new(
+            ContainerStatus::created(cid("c"), None),
+            bundle(),
+            StateRevision::from_raw(1),
+        )
+        .unwrap()
+        .with_annotations(labels(&[("k\"\\", "v\n\u{1}\u{1b}x")]));
+        let j = InspectReport::from_record(&rec)
+            .unwrap()
+            .to_oci_state_json();
+        assert!(
+            j.ends_with("\"annotations\":{\"k\\\"\\\\\":\"v\\n\\u0001\\u001bx\"}}"),
+            "{j}"
+        );
+        assert!(!j.chars().any(|c| (c as u32) < 0x20), "{j}");
+    }
+
+    /// CLI-1(#1903): LF は末尾に 1 個だけ。
+    #[test]
+    fn cli1_oci_state_write_appends_single_lf() {
+        let rec = StateRecord::new(
+            ContainerStatus::created(cid("c"), None),
+            bundle(),
+            StateRevision::from_raw(1),
+        )
+        .unwrap();
+        let r = InspectReport::from_record(&rec).unwrap();
+        let mut out = Vec::new();
+        r.write_oci_state_json(&mut out).unwrap();
+        let mut want = r.to_oci_state_json().into_bytes();
+        want.push(b'\n');
+        assert_eq!(out, want);
+        assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
+    }
+
+    /// CLI-1(#1903): ストアのエラーは `inspect` と同じ経路でそのまま返る(`state` も同じ読み口)。
+    #[test]
+    fn cli1_oci_state_store_errors_propagate() {
+        for c in [
+            ErrorCode::NotFound,
+            ErrorCode::Internal,
+            ErrorCode::PermissionDenied,
+        ] {
+            let e = inspect(&FakeStore(Err(c)), &cid("x")).unwrap_err();
+            assert_eq!(e.code(), c);
+        }
+    }
+
     #[test]
     fn sup11_task168_1_full_record_json_is_exact() {
         let b = bundle();
@@ -366,7 +587,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -385,7 +606,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -408,7 +629,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -429,7 +650,7 @@ mod tests {
         .unwrap()
         .with_explicit_stop(fandhe_container_core::traits::ExplicitStop::Recorded);
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\"}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

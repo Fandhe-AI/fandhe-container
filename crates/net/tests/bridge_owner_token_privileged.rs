@@ -21,7 +21,9 @@
 //!   #2467）が所有トークン一致の bridge・nft テーブルを消すこと、(6) bridge の別名が書き換えられていれば
 //!   bridge に触れず（テーブルは独立に消える）、別名を戻した再回収で収束すること、(7) 請求書を永続化記録（ファイル）
 //!   へ書いて読み戻した請求書で回収できること（#2604）、(8) 印を刻む前に失敗した bridge（別名なし）は回収が触れず、
-//!   手で消した後の再回収で収束すること（#2604）を確認する
+//!   手で消した後の再回収で収束すること（#2604）、(9) `NLM_F_ECHO` 付きの bridge 作成要求の作成通知から得た
+//!   ifindex が `ip -o link show` と一致すること（Linux v6.2 以降。それより前は通知が無く、戻し経路で
+//!   `create_network` が成功すること。Issue #1972）を確認する
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! `unshare`・`ip`）を満たさない場合は skip せず失敗する。
@@ -46,12 +48,18 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_net::netlink_route::{IpPrefix, NetlinkRouteSocket};
+    use fandhe_container_net::netlink_route::{
+        IfName, IpPrefix, LinkCreate, NetlinkRouteSocket, decode_created_link,
+    };
     use fandhe_container_net::network::{
         FailedCreateClaim, NetworkCreateSpec, NetworkName, NetworkResourceNames, PortRegistry,
         StaticIpam, create_network, delete_network, reclaim_failed_create,
@@ -141,25 +149,10 @@ mod linux {
 
     /// `ip` を実行して標準出力を返す（失敗は `Err` に標準エラーを載せる）。期限つき。
     fn ip(args: &[&str]) -> Result<String, String> {
-        let mut c = Command::new("ip")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn ip: {e}"))?;
-        let deadline = Instant::now() + timeout();
-        loop {
-            if c.try_wait().map_err(|e| e.to_string())?.is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let reaped = kill_and_reap(&mut c);
-                return Err(format!("ip timed out (reaped after SIGKILL: {reaped})"));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let out = c.wait_with_output().map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("ip");
+        cmd.args(args);
+        // spawn・期限・出力回収を一括で期限つきにする（`wait_with_output` の無期限待ちを避ける。REPAIR-5・#3409）。
+        let out = crate::reap::output_within(&mut cmd, timeout())?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -390,8 +383,59 @@ mod linux {
         ip(&["link", "delete", un_names.bridge().as_str()]).unwrap_or_else(|e| fail(&e));
         reclaim_failed_create(&route, &nft, &un_claim, t)
             .unwrap_or_else(|e| fail(&format!("reclaim after manual removal: {e}")));
-        println!(
-            "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept reclaim_restart=ok reclaim_manual=converged"
-        );
+
+        // (9) NLM_F_ECHO 付きの作成要求の作成通知から ifindex を得る（Issue #1972）。v6.2 以降は通知が届き、
+        // ifindex が実カーネルと一致する。それより前は通知が無く、戻し経路で create_network が成功する。
+        // 版を読めない・期待と違う場合は skip せず失敗する。
+        let release = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .unwrap_or_else(|e| fail(&format!("read osrelease: {e}")));
+        let mut nums = release
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u32>().ok());
+        let (major, minor) = match (nums.next().flatten(), nums.next().flatten()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => fail(&format!("cannot parse kernel release {release:?}")),
+        };
+        let echo_supported = (major, minor) >= (6, 2);
+        let eb = IfName::new("fcecho0").unwrap_or_else(|e| fail(&e.to_string()));
+        let reply = route
+            .create_link(&LinkCreate::bridge(eb.clone()).with_echo(), t)
+            .unwrap_or_else(|e| fail(&format!("create_link with echo: {e}")));
+        let echoed = decode_created_link(
+            reply.messages().iter().map(|m| (m.msg_type(), m.payload())),
+            &eb,
+        )
+        .unwrap_or_else(|e| fail(&format!("decode echo reply: {e}")));
+        let (actual_index, _) = show(eb.as_str()).unwrap_or_else(|e| fail(&e));
+        ip(&["link", "delete", eb.as_str()]).unwrap_or_else(|e| fail(&e));
+        match (echo_supported, echoed) {
+            (true, Some(i)) if i.get() == actual_index => {}
+            (false, None) => {}
+            (supported, got) => fail(&format!(
+                "unexpected echo result on kernel {release:?}: supported={supported} echoed={:?} actual={actual_index}",
+                got.map(|i| i.get())
+            )),
+        }
+        let en = create_network(&route, &nft, &spec("ec", [10, 219, 0, 1]), t)
+            .unwrap_or_else(|e| fail(&format!("create_network after echo: {e}")));
+        let (en_index, en_alias) = show(en.bridge.as_str()).unwrap_or_else(|e| fail(&e));
+        if en_index != en.bridge_index.get()
+            || en_alias.as_deref() != Some(en.bridge_token.as_str())
+        {
+            fail("create_network bridge does not match the created index or token");
+        }
+        delete_network(&route, &nft, &en, Vec::new(), &mut ipam, &mut ports, t)
+            .unwrap_or_else(|e| fail(&format!("delete_network ec: {e}")));
+        if echo_supported {
+            println!(
+                "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept reclaim_restart=ok reclaim_manual=converged echo=index"
+            );
+        } else {
+            println!(
+                "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept reclaim_restart=ok reclaim_manual=converged echo=fallback"
+            );
+        }
     }
 }

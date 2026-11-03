@@ -2,7 +2,7 @@
 //!
 //! core 側が plugin プロセスからの接続を待ち受ける `UdsListener`（bind / listen / accept）と、
 //! accept / connect で得た検証済み 1 接続を表す `UdsStream` を提供する。待ち受けは core 側
-//! （TASK-109・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
+//! （TASK-109・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
 //! の上に載る。
 //!
 //! # PLUG-12 の保護（本モジュールで実施する範囲）
@@ -67,7 +67,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audit::PeerAuthObserver;
 use crate::error::{PluginError, PluginErrorCode};
@@ -185,6 +185,17 @@ impl UdsListener {
     /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
     /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
+        #[cfg(unix)]
+        let wait = crate::spawn_gate::GATE_WAIT_DEFAULT;
+        // 非 unix ではゲートが無く `bind` は常に `Unimplemented` を返すため、待ち時間は使われない。
+        #[cfg(not(unix))]
+        let wait = Duration::ZERO;
+        Self::bind_before(path, Instant::now() + wait)
+    }
+
+    /// [`Self::bind`] の、`spawn_gate` の待ちを `deadline` までに限る版（期限切れは `Timeout`。REPAIR-5）。
+    /// 都度起動の合計期限の内側から呼ばれる（`lifecycle`）。
+    pub(crate) fn bind_before(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
         if path
@@ -199,7 +210,7 @@ impl UdsListener {
         let abs = std::path::absolute(path).map_err(|_| {
             PluginError::new(PluginErrorCode::InvalidArgument, "invalid socket path")
         })?;
-        let inner = imp::ListenerInner::bind(&abs)?;
+        let inner = imp::ListenerInner::bind(&abs, deadline)?;
         Ok(Self { inner })
     }
 
@@ -561,6 +572,7 @@ fn map_bind_error(kind: io::ErrorKind) -> PluginError {
             "socket parent directory does not exist",
         ),
         io::ErrorKind::InvalidInput => (PluginErrorCode::InvalidArgument, "invalid socket path"),
+        io::ErrorKind::TimedOut => (PluginErrorCode::Timeout, "timed out waiting to bind socket"),
         _ => (PluginErrorCode::Internal, "failed to bind socket"),
     };
     PluginError::new(code, message)
@@ -750,7 +762,7 @@ mod imp {
 
     impl ListenerInner {
         /// `path` は `..` を含まない絶対パス（`UdsListener::bind` が検証・変換済み）。
-        pub(super) fn bind(path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(path: &Path, deadline: Instant) -> Result<Self, PluginError> {
             let euid = sys::effective_uid();
             let (dir, canonical) = open_parent_dir(path, euid)?;
             let file_name = path.file_name().ok_or_else(|| {
@@ -772,7 +784,10 @@ mod imp {
             // （削除と取得の競合は取得側の同一性確認で排除する。`BindLock` の doc 参照）。
             let lock = crate::uds_security::acquire_bind_lock(&dir, &name, euid)?;
             crate::uds_security::clear_stale_socket(&dir, &name, euid, &lock)?;
-            let listener = UnixListener::bind(&target).map_err(|e| map_bind_error(e.kind()))?;
+            // macOS の std は socket の close-on-exec を作成後に立てるため、並行する spawn と排他にする
+            // （別 plugin の子へ listener が漏れない。`spawn_gate`。PLUG-12・SEC-1・#3139）。
+            let listener = crate::spawn_gate::create_fds(deadline, || UnixListener::bind(&target))
+                .map_err(|e| map_bind_error(e.kind()))?;
             // 以降の設定が失敗しても socket ファイルを残さないよう、先に後始末を持つ値を作る。
             let identity = sys::lstat_at(&dir, &name).ok();
             let inner = Self {
@@ -986,7 +1001,8 @@ mod imp {
             // `UDS_ACCEPT_PEER_REJECTION_LIMIT`（#1861）。
             let mut continued: u32 = 0;
             loop {
-                match self.listener.accept() {
+                // listener は非ブロッキング（1 回の accept で戻る）ため、ゲートを長く持たない。
+                match crate::spawn_gate::create_fds(deadline, || self.listener.accept()) {
                     Ok((stream, _)) => {
                         // 期限後に到着した接続は受理せず閉じて Timeout を返す（REPAIR-5。
                         // 期限直前のポーリング後のスリープ中に到着した接続が成功する経路を塞ぐ）。
@@ -1099,6 +1115,7 @@ mod imp {
                             io::ErrorKind::WouldBlock
                                 | io::ErrorKind::Interrupted
                                 | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::TimedOut
                         ) =>
                     {
                         let now = Instant::now();
@@ -1506,7 +1523,7 @@ mod imp {
     use crate::frame::Frame;
     use std::io;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// 構築不能（非 unix では listener を作れない）。
     #[derive(Debug)]
@@ -1516,7 +1533,7 @@ mod imp {
     pub(super) enum StreamInner {}
 
     impl ListenerInner {
-        pub(super) fn bind(_path: &Path) -> Result<Self, PluginError> {
+        pub(super) fn bind(_path: &Path, _deadline: Instant) -> Result<Self, PluginError> {
             Err(PluginError::new(
                 PluginErrorCode::Unimplemented,
                 "unix domain socket listener is not supported on this platform",
@@ -1616,35 +1633,24 @@ mod tests {
     mod plug12_order {
         use super::*;
         use std::io::{Read, Write};
-        use std::os::unix::fs::DirBuilderExt;
         use std::os::unix::net::{UnixListener, UnixStream};
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::mpsc;
 
         const WAIT: Duration = Duration::from_secs(5);
         const MISMATCH: &str = "peer credential does not match the current user";
 
         /// 0700 の一時ディレクトリ（socket の配置先。drop で削除）。
-        struct TempDir(PathBuf);
+        struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
         impl TempDir {
             fn new() -> Self {
-                static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "fctr-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-                Self(p)
+                // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+                // 名前は sun_path のため短く保つ。
+                let root = crate::test_root::test_root("fctr", "t");
+                Self(root.to_path_buf(), root)
             }
             fn sock(&self) -> PathBuf {
                 self.0.join("s.sock")
-            }
-        }
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 
@@ -1802,15 +1808,36 @@ mod tests {
     }
 
     /// 相手側の生 socket と、検証を経ずに包んだ `UdsStream` の対を作る。
+    ///
+    /// 対の生成は `spawn_gate::create_fds` の下で行い、`spawn_gate::spawn` 経由の spawn が
+    /// close-on-exec 前の fd を継承する窓を塞ぐ（#3139・#3436）。ゲートを通らない試験の直接
+    /// `Command::spawn` には効かないため、相手の切断に依存する試験は `peer.shutdown` や
+    /// [`stream_pair_with_closed_peer`] で fd の複製の有無に依らない形にする。
     #[cfg(unix)]
     fn stream_pair() -> (UdsStream, std::os::unix::net::UnixStream) {
-        let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (ours, peer) = crate::spawn_gate::create_fds(
+            std::time::Instant::now() + crate::spawn_gate::GATE_WAIT_DEFAULT,
+            std::os::unix::net::UnixStream::pair,
+        )
+        .unwrap();
         let stream = UdsStream {
             inner: imp::StreamInner::from_std(ours),
             poisoned: false,
             io_timeout_unrestored: false,
         };
         (stream, peer)
+    }
+
+    /// 相手を `drop` し、その close が自分側へ届いたこと（EOF）を期限つきで確かめてから包む。
+    /// 確認の方式と理由は `spawn_gate::unix_pair_with_closed_peer`（#3436・#3474）。
+    #[cfg(unix)]
+    fn stream_pair_with_closed_peer() -> UdsStream {
+        let ours = crate::spawn_gate::unix_pair_with_closed_peer();
+        UdsStream {
+            inner: imp::StreamInner::from_std(ours),
+            poisoned: false,
+            io_timeout_unrestored: false,
+        }
     }
 
     /// PLUG-7・PLUG-2・REPAIR-5: 送信直後に相手が応答を書いて切断し、期限を復元できなかった
@@ -1821,6 +1848,8 @@ mod tests {
         let (mut stream, mut peer) = stream_pair();
         let response = Frame::new(b"pong".to_vec()).unwrap();
         peer.write_all(&response.encode()).unwrap();
+        // fd の複製が残っても EOF が即時かつ決定的になるよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
 
         // write_frame が成功し、期限の復元だけが相手切断で失敗した状態。
@@ -1852,6 +1881,8 @@ mod tests {
     fn repair5_einval_read_falls_back_to_nonblocking_read_until_eof() {
         let (stream, mut peer) = stream_pair();
         peer.write_all(b"tail").unwrap();
+        // fd の複製が残っても残りデータの後に EOF を返すよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
         let einval = || Err(io::Error::from(io::ErrorKind::InvalidInput));
         let mut buf = [0u8; 16];
@@ -1898,8 +1929,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair5_einval_write_to_closed_peer_returns_broken_pipe() {
-        let (stream, peer) = stream_pair();
-        drop(peer);
+        // 相手の close が届いたことを確かめてから 1 回だけ試す（#3436）。
+        let stream = stream_pair_with_closed_peer();
         let e = stream
             .inner
             .write_once_after(b"x", Err(io::Error::from(io::ErrorKind::InvalidInput)))
@@ -1942,6 +1973,8 @@ mod tests {
         assert_eq!(&got, b"ping");
 
         peer.write_all(b"pong").unwrap();
+        // fd の複製が残っても EOF が即時になるよう、socket 自体の送信側を閉じる（#3436）。
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
         drop(peer);
         let n = stream.read_within(&mut buf, WITHIN).unwrap();
         assert_eq!(buf.get(..n), Some(&b"pong"[..]));

@@ -30,6 +30,9 @@
 //! 成功行 `inject_files: content, read-only and rollback verified (root=false)` を照合する。rootful 経路
 //! （root）の実行は root 権限コマンドのため明示指示のもとで行い、結果を PR に記録する。
 
+#[path = "support/reap.rs"]
+mod reap;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("inject_files: Linux only, not applicable on this OS");
@@ -50,6 +53,11 @@ fn main() {
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]
 mod temp_rootfs;
+
+// 予測できる名前の作成を避けるための排他作成の一時領域（#3478・#3434・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -171,8 +179,7 @@ mod linux {
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     panic!("child did not exit within {:?}", timeout());
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
@@ -267,13 +274,34 @@ mod linux {
         devs
     }
 
+    /// 内容をホストの一時ファイル経由の封印 memfd(`InjectedContent::from_file`。本番の secret の経路。#2628)にして、
+    /// 実 tmpfs へ `sendfile` で書かれる経路も通す。
+    fn sealed(body: &str, index: usize) -> InjectedContent {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // 共有 /tmp の予測できる名前へ書かず、排他作成した ScratchDir の子へ create_new する。rootful 分岐は
+        // root で動くため、先置きの symlink を辿らせない（#3478・SEC-1・REPAIR-12）。drop で消える。
+        let scratch = crate::scratch_root::ScratchDir::new("fandhe-inject-files-src", timeout());
+        let path = scratch.path().join(format!("src-{index}"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create host source")
+            .write_all(body.as_bytes())
+            .expect("write host source");
+        let file = std::fs::File::open(&path).expect("open host source");
+        InjectedContent::from_file(&file).expect("sealed content")
+    }
+
     fn set(files: &[(&str, &str, u32)]) -> InjectedFileSet {
         let mut s = InjectedFileSet::new();
-        for (dest, body, mode) in files {
+        for (i, (dest, body, mode)) in files.iter().enumerate() {
             s.push(
                 InjectedFileSpec::new(
                     dest,
-                    InjectedContent::from_bytes(body.as_bytes().to_vec()).expect("content"),
+                    sealed(body, i),
                     InjectedFileMode::new(*mode).expect("mode"),
                 )
                 .expect("spec"),

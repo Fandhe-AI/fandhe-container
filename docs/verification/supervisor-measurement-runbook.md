@@ -10,9 +10,9 @@
 
 | 項目 | 内容 |
 | ---- | ---- |
-| restart の再 launch（#491） | supervisor の再 launch は本番 launcher の単一スレッド要求で拒否される（#2043）。#2043 が入るまで `make restart-latency` は再起動未観測（終了コード 1）になり数値は出ない。`make supervisor-independence` の `--check-restart` も同じ |
+| restart の再 launch（#491） | supervisor の再 launch は #2043 で本番 launcher でも成立する（常駐スレッドを止めて監視スレッドで直接 launch。設計は `docs/design/restart-relaunch-single-thread.md`）。実機での数値は未取得（人間担当）。制御チャネルの accept の poll 間隔（100ms）が再 launch の待ちに載り得る |
 | 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。両立のため #2090 のオーナー決定（案 A）に従い、**計測（`/proc` の読み取りとシグナル送信）だけを root で行い、create・`systemd-run`・supervisor の起動は対象の利用者（`RUN_AS`）へ降格する**。#485 は「root が計測し、supervisor は対象の利用者が起動する」2 つのシェルで行う（これが案 A そのもの）。#219 の own は 1 つのスクリプトが root で動き、起動だけを `setpriv` で降格する（実装は #2099。自己テストはスタブのみで、**実機〔root〕での実行・検証は #485・#219 の人間担当が行う。結果は未取得**）。製品の `dumpable=0`・rootful 拒否は変えない |
-| supervisor の停止 | CLI の `stop` は Linux で制御チャネル経由に結線済み（#2059・#2142）だが、SIGTERM を渡すだけで猶予後の SIGKILL は無く（#1545）、restart ポリシーの下では終了が再起動の対象になる（SUP-9・#2162 待ち）。コンテナの PID 1 の init はハンドラが無いと SIGTERM を捨てる。このため restart ポリシー `no` の後始末（#499 の既定・#485 の手順 1）だけ `stop` を第 1 段にし、記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送る既存の回収を fallback として残す。#491 と #499 の `--check-restart` は `stop` を使わない。`stop` は supervisor と同じ利用者のシェルから呼ぶ（制御チャネルは別 uid の接続元を拒否する）。CLI の `delete` は委譲スコープの外では cgroup の検出に失敗するため呼ばず（#2133）、状態ルートごと削除する |
+| supervisor の停止 | CLI の `stop` は Linux で制御チャネル経由に結線済み（#2059・#2142）だが、SIGTERM を渡すだけで猶予後の SIGKILL は無く（#1545）、restart ポリシーの下では終了が再起動の対象になる（SUP-9 は #2162・#2440 で実装済みだが、本手順の stop 経由への切り替えは未実施）。コンテナの PID 1 の init はハンドラが無いと SIGTERM を捨てる。このため restart ポリシー `no` の後始末（#499 の既定・#485 の手順 1）だけ `stop` を第 1 段にし、記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送る既存の回収を fallback として残す。#491 と #499 の `--check-restart` は `stop` を使わない。`stop` は supervisor と同じ利用者のシェルから呼ぶ（制御チャネルは別 uid の接続元を拒否する）。CLI の `delete` は委譲スコープの外では cgroup の検出に失敗するため呼ばず（#2133）、状態ルートごと削除する |
 | バックオフ（#491） | supervisor の bin にバックオフを指定する引数は無く、既定 100ms 固定（`crates/supervisor/src/restart.rs` の `DEFAULT_BACKOFF`）。計測値はバックオフを含むため、スクリプトは差し引いた値も出す |
 
 ## 共通の必要環境
@@ -29,12 +29,17 @@
 
 ```bash
 cargo build --release -p fandhe-container-cli -p fandhe-container-supervisor
-chmod g-w target/release/fandhe-container target/release/fandhe-container-supervisor
-export BIN_DIR="$PWD/target/release"
+# fandhe-container-launcher を CLI の隣に置かない（置くと #2442 以降 start がランチャー経由の rootful 経路を選ぶ。
+# start_client.rs の classify_launcher_beside）。CLI と supervisor の 2 つだけを利用者所有の使い捨てディレクトリへ置く
+BIN_DIR="$(mktemp -d)" && chmod 0755 "$BIN_DIR"
+install -m 0755 target/release/fandhe-container "$BIN_DIR/fandhe-container"
+install -m 0755 target/release/fandhe-container-supervisor "$BIN_DIR/fandhe-container-supervisor"
+test ! -e "$BIN_DIR/fandhe-container-launcher"
+export BIN_DIR
 ```
 
 - `BIN_DIR` は `fandhe-container` と `fandhe-container-supervisor` を置いたディレクトリの絶対パス。スクリプトは固定名で解決し PATH 探索をしない
-- スクリプトはバイナリが symlink でなく、所有者が実行ユーザーか root で、group / other に書き込み権が無く、祖先ディレクトリも安全であることを検査する。umask 002 のビルドで拒否されたら `chmod g-w` する
+- スクリプトはバイナリが symlink でなく、所有者が実行ユーザーか root で、group / other に書き込み権が無く、祖先ディレクトリも安全であることを検査する。`install -m 0755` で group 書き込み権は付かないため umask 002 のビルドでも通る。`BIN_DIR` は `mktemp -d`（既定 `/tmp` は sticky）で、`RUN_AS` の利用者が辿れるよう 0755 にする。`target/release` を直接 `BIN_DIR` にしない（`cargo build` が `fandhe-container-launcher` も作るため）
 - `systemd-run` は既定 `/usr/bin/systemd-run`。違う場合は `SYSTEMD_RUN=<絶対パス>` を渡す
 
 ## bundle の用意
@@ -55,8 +60,8 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 - 非 root で実行する。N 個の supervisor を同時に起動し、1 個へ SIGKILL を送って次を判定する: (a) 対象の消滅・(b) 残り N-1 個の監視プロセスの生存・(c) 残りのコンテナ側プロセスの継続・(d) 対象のコンテナ側プロセスの稼働継続
 - 出力の読み方: JSON の `result` が `pass` なら全判定成立。`supervisors_alive_after_kill`・`monitored_containers_alive` は期待値 N-1。`target_container_reparented_to` は孤児化後の親 pid（参考値）
 - 終了コード: 0 = 全判定成立、1 = 判定不成立・起動数不足・期限切れ、2 = 引数・入力エラー、3 = 前提欠如（root 実行を含む）、4 = 後始末失敗
-- `--check-restart` は #2043 の後に有効（既定 off）
-- 後始末: 既定では残り N-1 個を CLI の `stop`（期限つき）で止めてから、記録した pid・起動時刻での回収を fallback として行う。対象の個体は SIGKILL 済みで `stop` が届かないため、記録した pid で回収する。`--check-restart` では `stop` を使わない（SUP-9 待ち）。stderr の `info: cli-stop: <成功>/<対象> supervisors exited after stop` は stop 後に監視プロセスが終了した数で、計測値ではない（0 でも fallback で回収され、判定は変わらない）
+- `--check-restart` は #2043 で前提が満たされた（既定 off。実機での確認は未実施）
+- 後始末: 既定では残り N-1 個を CLI の `stop`（期限つき）で止めてから、記録した pid・起動時刻での回収を fallback として行う。対象の個体は SIGKILL 済みで `stop` が届かないため、記録した pid で回収する。`--check-restart` では `stop` を使わない（SUP-9 は実装済みだが、stop 経由への切り替えは未実施）。stderr の `info: cli-stop: <成功>/<対象> supervisors exited after stop` は stop 後に監視プロセスが終了した数で、計測値ではない（0 でも fallback で回収され、判定は変わらない）
 - 実機でだけ確認できること: `systemd-run --scope` が pid・親子関係を変えずに supervisor を exec すること。実行後に `systemctl --user list-units --type=scope` へ残骸が無いこと
 
 ## #485 監視プロセスの常駐メモリ（SUP-2・TASK-158）
@@ -199,9 +204,9 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
 ## #491 restart レイテンシ（SUP-3・TASK-160）
 
-前提: #2043 が入っていること。入っていなければ再起動未観測で終了コード 1 になる。
+前提: #2043（再 launch の成立）は実装済み。実機（Linux 6.12 以上）で再起動が観測できない場合は `supervisor_bin_real` のシナリオ C で切り分ける。
 
-後始末で CLI の `stop` は使わない（`--restart` の下では SIGTERM の終了が restart の対象になる〔SUP-9・#2162 待ち〕ため）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、`stop` 経由にはしない。後始末の正常系は下記のとおり CLI の `delete`。
+後始末で CLI の `stop` は使わない（`--restart` の下では SIGTERM の終了が restart の対象になる〔SUP-9 は #2162・#2440 で実装済みだが、stop 経由への切り替えは未実施〕ため）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、`stop` 経由にはしない。後始末の正常系は下記のとおり CLI の `delete`。
 
 ```bash
 make restart-latency BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TRIALS=20 WARMUP=1 OUTPUT=<新規ファイル>
@@ -213,7 +218,7 @@ make restart-latency BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TRIALS=20 WA
   - `supervisor_reported`: ログの `elapsed_us`（終了検知から Running 記録完了まで。バックオフを含む）。件数が合わなければ `null`
   - `observed_minus_backoff`・`supervisor_reported_minus_backoff`: 上の値から `backoff_ms_assumed`（100ms）を差し引いた値。supervisor はバックオフ以上眠るので「バックオフを除いた遅延の上側の推定」（寝過ごし分を含む保守側）。負になったら計測異常で終了コード 1
   - SUP-3 の目標（バックオフ 0 で中央値 100ms 以下）との比較と合否は #491 の担当。PoC-17 は区間が異なるため直接比較しない
-- 後始末（OCI-6・#2157）: 計測値の確定後に、最後のコンテナ側プロセスへ SIGKILL を 1 回送って supervisor を `Stopped` で終わらせ、プロセスの回収を確認してから CLI の `delete`（`systemd-run --user --scope -p Delegate=yes -- fandhe-container --root <dir> delete <id>`）で状態を消す。結果の `cleanup.delete` が `ok` なら delete で消えている。`skipped`（`reason: state-not-stopped`）は自然停止しなかった場合（`--policy always` は SUP-9〔#2408〕の明示 stop の意図が入るまでこうなる）で、delete は呼ばず従来どおり回収する
+- 後始末（OCI-6・#2157）: 計測値の確定後に、最後のコンテナ側プロセスへ SIGKILL を 1 回送って supervisor を `Stopped` で終わらせ、プロセスの回収を確認してから CLI の `delete`（`systemd-run --user --scope -p Delegate=yes -- fandhe-container --root <dir> delete <id>`）で状態を消す。結果の `cleanup.delete` が `ok` なら delete で消えている。`skipped`（`reason: state-not-stopped`）は自然停止しなかった場合（`--policy always` は SIGKILL で終わらせるため再起動されてこうなる）で、delete は呼ばず従来どおり回収する
 - delete が拒否・期限超過になったら終了コード 4 で結果は出ず、stderr に `cleanup-failed: delete was rejected (<CODE>)` と残した状態の場所が出る。手動で回収するときは同じ包み込みで `systemd-run --user --scope -p Delegate=yes -- <bin-dir>/fandhe-container --root <残った状態の state ディレクトリ> delete <id>` を実行する（直接呼ぶと委譲スコープの検出が失敗する）
 - 終了コード: 0 = 成功、1 = 計測失敗、2 = 引数エラー、3 = 前提欠如、4 = 後始末失敗（delete の拒否・期限超過を含む）
 

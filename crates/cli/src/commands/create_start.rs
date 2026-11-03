@@ -12,11 +12,17 @@
 //! （core の `create_audited` / `create_with_image_audited`。SEC-4・OCI-4・#2480。Linux のみ。非 Linux は
 //! `open_store` が先に失敗するため到達しない）。
 //!
+//! `create` は core を呼ぶ前に、同じ ID の前のインスタンスが残したコンテナログを best effort で回収する
+//! （`reclaim_stale_container_log`。`delete` の待ちを超えて残った分。#2698・SUP-7・CLI-1）。本体は plugin-cri の
+//! `CreateContainer` と共有する supervisor の `logs::reclaim_stale_container_logs`（#2760）。ID を再利用しない
+//! CRI 側の残りは plugin-cri の起動時の走査で回収し、それでも残るものは手動で消す（`docs/setup/container-log-recovery.md`）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
-//!   manifest の在庫は永続化済み（#2380）だが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、`register` は
-//!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。
+//!   manifest の在庫は永続化済み（#2380）だが、在庫を埋める経路は cri の `OciImagePuller::pull` に配線済み（#2539）で、同じ root を
+//!   `--image-root` に渡せば `register` が成功する。本番の `PullImage` へは plugin-cri の ImageService（#2592）から届く。
+//!   pull していない root では在庫が空のため `register` は `NOT_FOUND` になる。
 //!   `--image` の判別規則（digest かタグ参照か）と解決・付け替えの扱いは `image_refs` module の doc（#2496）。
 //!   core 呼び出しの前に同じ参照キーの残骸（状態の無い参照）を回収し（契機 A）、呼び出し全体を create ゲートの共有で包む
 //!   （`ref_reconcile`・`docs/design/container-ref-reconcile.md`。#2495）。
@@ -29,11 +35,12 @@
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4。`plugin_backend` module）。非 Linux では
 //!   `production_runtime` が状態ストアの代わりに plugin の発見・信頼性検証を試み、現状は必ず fail-closed で
-//!   失敗する（起動と RPC は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125）。
+//!   失敗する（起動と RPC は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125）。
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use fandhe_container_core::audit_log::{AuditSink, FileAuditSink};
+use fandhe_container_core::audit_log::{AuditCoveragePolicy, AuditSink, FileAuditSink};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     ContainerImage, ImageManifestDigest, LifecycleOp, OciRuntimeError, create_audited,
@@ -46,10 +53,19 @@ use fandhe_container_core::traits::{
 
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
+use super::create_options;
 use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
-use super::image_refs::{StoreImageRefs, classify_create_image, resolve_create_image, state_scope};
+use super::image_refs::{
+    StoreImageRefs, attach_image_root, classify_create_image, legacy_scope, resolve_create_image,
+    state_scope,
+};
 use super::ref_reconcile::reclaim_stale_ref_recorded;
+use super::stop_delete::{
+    WARNING_WRITE_TIMEOUT, emit_warning_bounded, options_removal_warning, write_warning_to_stderr,
+};
 use fandhe_container_oci::image_management::{ContainerCreatePass, ImageStore};
+use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+use fandhe_container_supervisor::container_options::store as options_store;
 
 /// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
 pub(super) struct Runtime {
@@ -74,6 +90,33 @@ pub(super) struct CreateImage {
     pub(super) manifest: ImageManifestDigest,
     /// 参照キーの接頭辞（状態ルートごと。`image_refs::state_scope`。別の状態ルートの同名 ID と混ざらないようにする）。
     pub(super) scope: String,
+    /// 旧版の scope（`--root` の字面から決めたもの。新 scope と同じなら `None`）。残骸の回収だけに使う（#2499・OCI-7）。
+    pub(super) legacy_scope: Option<String>,
+}
+
+/// 状態ストアを開く前の段階のイメージつき create の入力（`scope` が未確定）。
+///
+/// 参照キーの接頭辞 `scope` は「開いた状態ストアの `host_state_root()`」から求める（`--root` の表記ゆれ・祖先の
+/// symlink を畳んだ正規パスにするため。#2499 P2-2）。ストアを開く前の `build_create` はこの型を返し、
+/// `run_create` がストアを開いた後に [`PendingImage::bind`] で [`CreateImage`] にする。
+pub(super) struct PendingImage {
+    pub(super) store: ImageStore,
+    pub(super) manifest: ImageManifestDigest,
+    /// グローバル引数の `--root`（旧 scope の算出用）。
+    pub(super) root_override: Option<std::path::PathBuf>,
+}
+
+impl PendingImage {
+    /// 開いた状態ストアから scope を求めて [`CreateImage`] にする。ストアが状態ルートを示せなければ失敗する。
+    pub(super) fn bind(self, state: &dyn StateStore) -> Result<CreateImage, TraitError> {
+        let scope = state_scope(state)?;
+        Ok(CreateImage {
+            legacy_scope: legacy_scope(self.root_override, &scope),
+            scope,
+            store: self.store,
+            manifest: self.manifest,
+        })
+    }
 }
 
 /// 構築済みの要求で core の `create_with_image` を呼ぶ（OCI-7・#2315）。
@@ -107,6 +150,16 @@ pub(super) fn create_container_with_image_reclaiming(
     image: &CreateImage,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
+    // create 時のイメージストア root を状態記録へ残す。`--image-root` を省いた delete が、この記録から参照を解除する
+    // （#2499・OCI-7・CLI-1）。状態を作る前に付けるので、状態の作成と同時に原子的に永続化される。
+    let started = Instant::now();
+    let req = &match attach_image_root(req, &image.store) {
+        Ok(r) => r,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
     reclaim_stale_ref_recorded(
         &image.store,
         rt.store.as_ref(),
@@ -114,6 +167,16 @@ pub(super) fn create_container_with_image_reclaiming(
         &image.scope,
         req.id(),
     );
+    // 旧版の scope（`--root` の字面から決めたもの）で残った同じ ID の残骸も回収する（#2499・OCI-7）。
+    if let Some(legacy) = &image.legacy_scope {
+        reclaim_stale_ref_recorded(
+            &image.store,
+            rt.store.as_ref(),
+            &rt.recorder,
+            legacy,
+            req.id(),
+        );
+    }
     let gate_started = Instant::now();
     let pass = image.store.enter_container_create().map_err(|e| {
         // ゲート取得の失敗は core に到達せず core 側の計測に載らないため、ここで create の失敗として記録する（REPAIR-4）。
@@ -130,7 +193,7 @@ pub(super) fn create_container_with_image_reclaiming(
 fn build_create(
     global: &GlobalArgs,
     args: &CreateArgs,
-) -> Result<(CreateRequest, Option<CreateImage>), TraitError> {
+) -> Result<(CreateRequest, Option<PendingImage>), TraitError> {
     let req = build_create_request(args)?;
     let image = match &args.image {
         None => None,
@@ -141,13 +204,10 @@ fn build_create(
             require_local_backend(global)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
             let manifest = resolve_create_image(&store, classified)?;
-            let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
-                global.root.clone(),
-            )?);
-            Some(CreateImage {
+            Some(PendingImage {
                 store,
                 manifest,
-                scope,
+                root_override: global.root.clone(),
             })
         }
     };
@@ -157,11 +217,22 @@ fn build_create(
 /// ID の文字種と bundle の絶対パスを core の型で検証する（相対パスの解決・canonicalize はしない。SEC-1）。
 fn build_create_request(args: &CreateArgs) -> Result<CreateRequest, TraitError> {
     let id = ContainerId::new(args.id.as_str())?;
-    CreateRequest::new(id, args.bundle.clone())
+    // `--label` は検証して状態記録の annotations へ直接書く(supervisor を通らない。#2713)。
+    let annotations = create_options::labels_of(&args.options)?;
+    Ok(CreateRequest::new(id, args.bundle.clone())?.with_annotations(annotations))
 }
 
 fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
     Ok(StartRequest::new(ContainerId::new(args.id.as_str())?))
+}
+
+/// `start --audit-policy` の値を core の固定語彙で検証する(未指定は `None` で、supervisor の既定が効く。SEC-4・#2761)。
+/// 不正な値は `INVALID_ARGUMENT`(入力値は文言に入らない)。
+fn build_audit_policy(args: &StartArgs) -> Result<Option<AuditCoveragePolicy>, TraitError> {
+    args.audit_policy
+        .as_deref()
+        .map(str::parse::<AuditCoveragePolicy>)
+        .transpose()
 }
 
 /// 要求を構築し、状態ルートを解決して本番の依存を組む。要求構築が先なので、不正な入力では状態ルートを作らない。
@@ -226,7 +297,7 @@ pub(super) fn open_store(global: &GlobalArgs) -> Result<FileStateStore, TraitErr
 
 /// core に到達する前の失敗を操作名 `op_name` の失敗として記録する（REPAIR-4）。
 /// core に到達した操作は core 自身が記録するため、ここで二重には記録しない。
-fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instant) {
+pub(super) fn record_pre_core_failure(recorder: &OpRecorder, op_name: &str, started: Instant) {
     if let Ok(name) = OpName::new(op_name) {
         let _ = recorder.record(&name, OpOutcome::Failure, started.elapsed());
     }
@@ -558,7 +629,7 @@ const OP_LOG_WRITE_ATTEMPTS: u32 = 4;
 /// 計測スナップショット全体を 1 つのバッファへ組み立て、`w` へ **1 回の `write`** で書く（REPAIR-4）。
 ///
 /// 複数の CLI プロセスが同じ計測ログへ並行に追記しても JSON 行が混ざらないようにするための入口。
-/// core の `OpRecorder::export_json_lines` は行本体と改行を別々の `write_all` で書くため、ファイルへ
+/// core の `OpRecorder::export_json_lines` は 1 行ごとに別々の `write_all` で書く（`write_all` 自体も複数回の write に分かれうる）ため、ファイルへ
 /// 直接渡すと「A の本体 → B の本体 → 改行」の順で 1 行に 2 つの JSON が並びうる。ここではメモリ上の
 /// バッファへ書かせ、全行（LF 終端）を 1 回の write(2) にまとめる。`O_APPEND` で開いた通常ファイルへの
 /// 1 回の write(2) は、追記位置の決定と書き込みを inode ロックの下で一括して行うため、他プロセスの
@@ -616,28 +687,335 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
     let _ = write_ops_once(recorder, &mut f);
 }
 
+/// 起動オプション文書の I/O(ロック取得・書き込み・巻き戻し)を作業スレッドで待つ上限(REPAIR-5)。
+const OPTIONS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// ID 単位のロックの取得を待つ上限(`OPTIONS_IO_TIMEOUT` より短くし、期限切れを作業スレッド側でも検知する)。
+const OPTIONS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 書いた起動オプション文書と、create の間保持する ID 単位のロック(#2713・SUP-12)。
+struct PreparedOptions {
+    lock: options_store::OptionsLock,
+    root: std::path::PathBuf,
+    /// 書かなかった(指定が空・既存の状態がある)ときは `None`。
+    written: Option<options_store::WrittenOptions>,
+}
+
+/// 起動オプション文書の I/O を期限つきの作業スレッドで行う（枠の満杯は期限内で待つ）。
+///
+/// 同時実行枠（プロセス共有）が期限まで空かなかったときは、何も実行していないので期限切れの `TIMEOUT` ではなく
+/// `RESOURCE_EXHAUSTED` を返す（ERR-2・REPAIR-4。#2834）。期限切れ・起動失敗・panic は従来どおり `TIMEOUT`。
+pub(super) fn run_options_io<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, TraitError> + Send + 'static,
+) -> Result<T, TraitError> {
+    use fandhe_container_supervisor::supervisor_log::{BoundedFailure, run_bounded_waiting};
+    match run_bounded_waiting(job, OPTIONS_IO_TIMEOUT) {
+        Ok(result) => result,
+        Err(BoundedFailure::Busy) => Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::ResourceExhausted,
+            "container options file workers are busy",
+        )),
+        Err(BoundedFailure::Unfinished) => Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Timeout,
+            "container options file I/O did not finish within the deadline",
+        )),
+    }
+}
+
+/// 起動オプション文書を書く前の整理と書き込み(#2713・SUP-12)。ロックと書いた文書の識別(巻き戻し用)を返す。
+///
+/// ID 単位のロック(`options_store::acquire_lock`)を取り、core の create が終わるまで保持する。同じ ID の並行 `create` /
+/// `delete` が、状態の不在確認と文書の掃除・書き込みの間に割り込んで他方の文書を消すのを防ぐ。
+/// ロック取得・掃除・書き込み(fsync を含む)は作業スレッドで期限つきに待つ(REPAIR-5。応答しない FUSE・ネットワーク FS
+/// で create が止まらない)。期限切れの作業スレッドは CLI の終了で消え、後から文書が残っても状態が無いので次の create /
+/// delete が掃除する(別の世代の文書は、掃除がロックと状態の不在確認の下で行われるため消えない)。
+///
+/// - 同じ ID の状態が既にある(または確認できない)なら `ALREADY_EXISTS` で拒否する(既存コンテナの文書は触らない)
+/// - 状態が無いのに文書が残っている(前のコンテナの残骸)なら先に消す。指定が空でもこの掃除は行う
+/// - 指定が空なら書かない(文書が無ければ supervisor は既定値で動く)
+/// - 状態ルートを持たない backend(非 Linux の plugin 経路)で指定があれば `UNIMPLEMENTED`(黙って捨てない)
+fn prepare_options_file(
+    rt: &Runtime,
+    id: &ContainerId,
+    document: &ContainerOptionsDocument,
+) -> Result<Option<PreparedOptions>, TraitError> {
+    let Some(root) = rt.store.host_state_root() else {
+        if document.is_empty() {
+            return Ok(None);
+        }
+        return Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "container options are not supported by this backend",
+        ));
+    };
+    let root = root.to_path_buf();
+    let job_root = root.clone();
+    let id = id.clone();
+    let document = document.clone();
+    let prepared = run_options_io(move || -> Result<_, TraitError> {
+        let lock = options_store::acquire_lock(&job_root, &id, OPTIONS_LOCK_WAIT)?;
+        // 同じ ID の状態が既にある(または確認できない)なら拒否する。ここで見送って core の create に任せると、
+        // 確認の後に並行 delete が状態を消したとき、世代注釈つきの新しい記録に対応する文書が無い(または前の世代の
+        // 文書が残る)状態で create が成功してしまう(SUP-12・SEC-1・#2713)。
+        if !super::stop_delete::id_is_still_deleted(&job_root, &id) {
+            return Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::AlreadyExists,
+                "the container already exists or its state cannot be checked",
+            ));
+        }
+        options_store::remove(&job_root, &id)?;
+        if document.is_empty() {
+            return Ok((lock, None));
+        }
+        let written = options_store::write_new(&job_root, &id, &document)?;
+        Ok((lock, Some(written)))
+    })?;
+    let (lock, written) = prepared;
+    Ok(Some(PreparedOptions {
+        lock,
+        root,
+        written,
+    }))
+}
+
+/// 空でない文書に作成世代を付け、同じ値を `req` の annotations(`GENERATION_ANNOTATION`)にも足す(#2713・SEC-1)。
+///
+/// 文書が空、または状態ルートを持たない backend(文書を書かない経路)では何も変えない。利用者の label が予約キーを
+/// 持っていても、ここで足す値が後勝ちで置き換える。
+fn bind_generation(
+    rt: &Runtime,
+    req: &CreateRequest,
+    document: &ContainerOptionsDocument,
+) -> Result<(CreateRequest, ContainerOptionsDocument), TraitError> {
+    if document.is_empty() || rt.store.host_state_root().is_none() {
+        return Ok((req.clone(), document.clone()));
+    }
+    let generation = options_store::new_generation()?;
+    let entries = req
+        .annotations()
+        .iter()
+        .filter(|(k, _)| *k != options_store::GENERATION_ANNOTATION)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .chain(std::iter::once((
+            options_store::GENERATION_ANNOTATION.to_owned(),
+            generation.clone(),
+        )));
+    let annotations = fandhe_container_core::traits::Annotations::new(entries)?;
+    Ok((
+        req.clone().with_annotations(annotations),
+        document.clone().with_generation(generation)?,
+    ))
+}
+
+/// create が失敗したときの巻き戻し。自分が作った inode だけを消し、ロックファイルも消す(期限つき)。
+fn rollback_options(prepared: PreparedOptions, id: &ContainerId) -> Result<(), TraitError> {
+    let PreparedOptions {
+        lock,
+        root,
+        written,
+    } = prepared;
+    let id = id.clone();
+    run_options_io(move || -> Result<(), TraitError> {
+        let result = match &written {
+            Some(w) => options_store::remove_if_same(&root, &id, w),
+            None => Ok(()),
+        };
+        lock.remove_lock_file();
+        result
+    })
+}
+
+/// 起動オプション文書を core の create の前に書き、create が失敗したら自分が作った inode だけを消す(#2713・SUP-12)。
+///
+/// 文書の準備に失敗したら core の create に入らない(オプションを黙って落とした状態を作らない。fail-closed)。
+/// core に到達しないので、この失敗は create の失敗として 1 回だけ計測する(REPAIR-4)。
+/// 巻き戻しの失敗は警告 1 行だけ出し、create の元のエラーを返す。
+fn create_with_options(
+    rt: &Runtime,
+    req: &CreateRequest,
+    image: Option<&CreateImage>,
+    document: &ContainerOptionsDocument,
+) -> Result<StateRecord, OciRuntimeError> {
+    let started = Instant::now();
+    // 文書を書くときは、作成世代を文書と状態記録の annotations の両方へ同じ値で入れる(supervisor が照合し、同じ ID の
+    // 前のコンテナの残骸を適用しない。#2713・SEC-1)。
+    let (req, document) = match bind_generation(rt, req, document) {
+        Ok(pair) => pair,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
+    let (req, document) = (&req, &document);
+    let prepared = match prepare_options_file(rt, req.id(), document) {
+        Ok(p) => p,
+        Err(e) => {
+            record_pre_core_failure(&rt.recorder, "create", started);
+            return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+        }
+    };
+    let r = match image {
+        Some(image) => create_container_with_image_reclaiming(rt, image, req),
+        None => create_container(rt, req),
+    };
+    if let Some(prepared) = prepared
+        && r.is_err()
+        && let Err(e) = rollback_options(prepared, req.id())
+    {
+        emit_warning_bounded(
+            options_removal_warning(&e),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
+    }
+    r
+}
 /// 本番入口の `create`。成功時は何も出さない（OCI の create 互換）。
 ///
 /// 要求構築・状態ストア初期化の失敗も操作名 `create` の失敗として計測する（REPAIR-4）。
 pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
+    // 定義照合の定義ストア操作(`network.store.open` / `network.store.get`)の記録先(REPAIR-4・NET-6・#3329)。
+    // 本体の記録器は production_runtime が所有するため別に持ち、末尾で同じ出力先へ書く。op ログには
+    // 「本体の組 → 定義照合の組」の最大 2 組(各組が自分のメタ行を持つ)が出る。照合が走らなければ 2 組目は無い。
+    // 統合しない理由と契約は docs/design/network-wiring.md(#3558)。
+    let net_recorder = Arc::new(OpRecorder::new());
     let result = production_runtime(global, recorder, "create", started, || {
-        build_create(global, args)
+        // ネットワーク関連フラグは状態ストアを開く・イメージストアを開く・env-file を読むより前に検証する(NET-12・#1871)。
+        let named = super::create_network::check_network_options(
+            &args.options.network,
+            super::create_network::resolve_publish_privilege,
+        )?;
+        // pasta の場所の判定・解決・検証(NET-9・#3199)。形式の不正より後、`UNIMPLEMENTED` より前。
+        // ユーザー定義名の定義は、インストールの種別の判定の後・pasta の解決の前に、何も作らずに照合する(D2・#3329)。
+        let pasta = super::create_pasta::resolve_for_create(global, named.as_ref(), |name| {
+            super::create_network::require_named_definition(
+                global,
+                name,
+                Some(Arc::new(super::net_recorder::CliNetRecorder::new(
+                    Arc::clone(&net_recorder),
+                ))),
+            )
+        })?;
+        super::create_network::reject_unwired_network(
+            &args.options.network,
+            cfg!(target_os = "linux"),
+        )?;
+        let (req, image) = build_create(global, args)?;
+        // 起動オプション(ulimit・env 等)の意味検証と `--env-file` の読み取りは core に入る前に行う(#2713)。
+        let document = create_options::document_of(&args.options, pasta.as_ref())?;
+        Ok((req, image, document, named))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
-    .and_then(|(rt, (req, image))| {
-        let r = match &image {
-            Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
-            None => create_container(&rt, &req),
+    .and_then(|(rt, (req, pending, document, named))| {
+        // 参照キーの scope は開いた状態ストアから求める（表記ゆれを畳んだ正規パス。#2499）。
+        let image = match pending.map(|p| p.bind(rt.store.as_ref())).transpose() {
+            Ok(i) => i,
+            Err(e) => {
+                record_pre_core_failure(&rt.recorder, "create", started);
+                export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+                return Err(OciRuntimeError::from_trait_error(LifecycleOp::Create, e));
+            }
+        };
+        let entered = std::cell::Cell::new(false);
+        let r = match reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder) {
+            // 回収の期限切れは core を呼ばずに create の失敗として計測する（REPAIR-4）。
+            Err(e) => {
+                if let Ok(name) = OpName::new("create") {
+                    let _ = rt
+                        .recorder
+                        .record(&name, OpOutcome::Failure, started.elapsed());
+                }
+                Err(e)
+            }
+            // ユーザー定義名のときは、2 回目の定義照合から状態記録の作成までを全体の共有ロックの下で行い、
+            // その間の `network rm` を待たせる(D10・#3550)。ロックの中は FCOPT1 の書き込みと core の create だけ。
+            Ok(()) => match (named.as_ref(), rt.store.host_state_root()) {
+                (Some(name), Some(root)) => super::create_network::with_named_definition_held(
+                    root,
+                    name,
+                    fandhe_container_net::network_store::DEFAULT_LOCK_TIMEOUT,
+                    Some(Arc::new(super::net_recorder::CliNetRecorder::new(
+                        Arc::clone(&net_recorder),
+                    ))),
+                    || {
+                        entered.set(true);
+                        create_with_options(&rt, &req, image.as_ref(), &document)
+                    },
+                )
+                // 照合・ロックの失敗は core に入らないので、ここで create の失敗として計測する(REPAIR-4)。
+                // `body` に入った後の失敗は `create_with_options` が計測済み。
+                .inspect_err(|_| {
+                    if !entered.get() {
+                        record_pre_core_failure(&rt.recorder, "create", started);
+                    }
+                }),
+                _ => create_with_options(&rt, &req, image.as_ref(), &document),
+            },
         };
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r
     });
+    // 2 組目(定義照合)。空なら出さない。本体の組の後に 1 回の write で追記する(#3558)。
+    if !net_recorder.snapshot().is_empty() {
+        export_ops(&net_recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    }
     match result {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
     }
+}
+
+/// 同じ ID の前のインスタンスが残したコンテナログを、core の create の前に回収する（#2698・SUP-7・CLI-1・REPAIR-4）。
+///
+/// `delete` はコンテナログの sink 閉鎖を最大 10 秒しか待たないため、supervisor の terminate がそれを超えるとログが残る。
+/// 残りは同じ ID の `create` で消す（そうしないと新しいインスタンスの sink が既存の `<id>.log` を世代へ退避し、
+/// 古い出力が新しい世代に混ざる）。待たずに 1 回だけ試す（create を遅らせない。上限は
+/// `CONTAINER_LOG_REMOVE_TIMEOUT`）。古い supervisor がまだ sink を持つ（ロックが取れない）ときは何も消さない。
+/// 回収が期限切れ（`Timeout`。I/O 停止等で作業スレッドが残り得る）のときは、残った作業スレッドを抱えたまま
+/// 後続の監査記録（`FileAuditSink` は単一スレッド前提の fork を要する。SEC-4）へ進まないよう、core を呼ばずに
+/// `TIMEOUT` で create を失敗させる（fail-closed。分離違反の監査記録を失わない）。作業スレッドは CLI の終了で消え、
+/// guard は削除直前にロック保持中で評価されるため、後から別インスタンスのログを消すことはない。
+/// guard は `stop_delete::id_is_still_deleted`（ロック保持中に状態の不在を確認）で、同じ ID が既にあるときは消さず、
+/// 続く core の create が `ALREADY_EXISTS` を返す。best effort で create の成否・stderr は変えない。
+/// 観測は op 名 `container_log_reclaim`（1 件以上消した Success、エラーの Failure）。0 件は記録しない。
+fn reclaim_stale_container_log(
+    store: &dyn StateStore,
+    id: &fandhe_container_core::traits::ContainerId,
+    recorder: &OpRecorder,
+) -> Result<(), OciRuntimeError> {
+    use fandhe_container_supervisor::logs::{StaleLogReclaim, reclaim_stale_container_logs};
+    let Some(root) = store.host_state_root() else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let guard_root = root.to_path_buf();
+    let guard_id = id.clone();
+    // 回収の本体は plugin-cri の `CreateContainer` と共有する（#2760・REPAIR-1）。ここは計上と期限切れの写像だけを持つ。
+    let (outcome, timed_out) = match reclaim_stale_container_logs(root, id, move || {
+        super::stop_delete::id_is_still_deleted(&guard_root, &guard_id)
+    }) {
+        StaleLogReclaim::Removed(_) => (OpOutcome::Success, false),
+        StaleLogReclaim::Nothing => return Ok(()),
+        StaleLogReclaim::Failed(_) => (OpOutcome::Failure, false),
+        StaleLogReclaim::TimedOut => (OpOutcome::Failure, true),
+    };
+    if let Ok(name) = OpName::new("container_log_reclaim") {
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+    reclaim_timeout_result(timed_out)
+}
+
+/// 回収の期限切れを create の失敗へ写す（残った作業スレッドを抱えたまま監査記録へ進まない。SEC-4・#2698）。
+fn reclaim_timeout_result(timed_out: bool) -> Result<(), OciRuntimeError> {
+    if timed_out {
+        return Err(OciRuntimeError::new(
+            LifecycleOp::Create,
+            fandhe_container_core::traits::ErrorCode::Timeout,
+            "stale container log reclaim did not finish within the deadline",
+        ));
+    }
+    Ok(())
 }
 
 /// 本番入口の `start`。成功時は何も出さない（OCI の start 互換）。
@@ -650,17 +1028,18 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
     let prepared = production_runtime(global, recorder, "start", started, || {
-        build_start_request(args)
+        Ok((build_start_request(args)?, build_audit_policy(args)?))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e));
-    let (rt, req) = match prepared {
+    let (rt, (req, audit_policy)) = match prepared {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
     let Runtime {
         store, recorder, ..
     } = rt;
-    let result = ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req));
+    let result =
+        ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req, audit_policy));
     record_start_outcome(&recorder, started, result.is_ok());
     export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
@@ -680,16 +1059,25 @@ fn ensure_exists(store: Box<dyn StateStore>, req: &StartRequest) -> Result<(), O
 
 /// 状態ルートの絶対パスを解決し、supervisor を起動して結果を受け取る。
 #[cfg(target_os = "linux")]
-fn launch_supervisor(global: &GlobalArgs, req: &StartRequest) -> Result<(), OciRuntimeError> {
+fn launch_supervisor(
+    global: &GlobalArgs,
+    req: &StartRequest,
+    audit_policy: Option<AuditCoveragePolicy>,
+) -> Result<(), OciRuntimeError> {
     use fandhe_container_core::state_store::StateRoot;
     let root = StateRoot::resolve(global.root.clone())
         .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))?;
-    super::supervisor_start::start_via_supervisor(root.path(), req.id()).map(|_pid| ())
+    super::supervisor_start::start_via_supervisor(root.path(), req.id(), audit_policy)
+        .map(|_pid| ())
 }
 
 /// 非 Linux は `production_runtime` が状態ストアを開く段階（plugin 解決）で必ず失敗するため到達しない。
 #[cfg(not(target_os = "linux"))]
-fn launch_supervisor(_global: &GlobalArgs, _req: &StartRequest) -> Result<(), OciRuntimeError> {
+fn launch_supervisor(
+    _global: &GlobalArgs,
+    _req: &StartRequest,
+    _audit_policy: Option<AuditCoveragePolicy>,
+) -> Result<(), OciRuntimeError> {
     Err(OciRuntimeError::new(
         LifecycleOp::Start,
         fandhe_container_core::traits::ErrorCode::Unimplemented,
@@ -711,8 +1099,11 @@ fn record_start_outcome(recorder: &OpRecorder, started: Instant, ok: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::args::CreateOptionArgs;
     use super::*;
     use fandhe_container_core::traits::ErrorCode;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
     use std::path::PathBuf;
     #[cfg(target_os = "linux")]
     use std::sync::Arc;
@@ -720,6 +1111,7 @@ mod tests {
 
     fn create_args(bundle: &str, id: &str) -> CreateArgs {
         CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: PathBuf::from(bundle),
             id: id.to_string(),
             image: None,
@@ -741,13 +1133,18 @@ mod tests {
     fn err2_build_requests_reject_invalid_id() {
         for id in ["a/b", "..", "", "a b"] {
             let e = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle: std::env::temp_dir(),
                 id: id.to_string(),
                 image: None,
             })
             .expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
-            let e = build_start_request(&StartArgs { id: id.to_string() }).expect_err("id");
+            let e = build_start_request(&StartArgs {
+                id: id.to_string(),
+                audit_policy: None,
+            })
+            .expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
         }
     }
@@ -758,6 +1155,7 @@ mod tests {
         // OS ごとに絶対パスの形が違う（Windows は `/abs/b` を絶対と見なさない）ため temp_dir 由来にする。
         let bundle = std::env::temp_dir().join("abs-b");
         let req = build_create_request(&CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: bundle.clone(),
             id: "c1".to_string(),
             image: None,
@@ -1356,11 +1754,13 @@ mod tests {
         GlobalArgs {
             root: Some(std::env::temp_dir().join("fc-cli-state-root")),
             plugin_path_search: false,
+            pasta: None,
         }
     }
 
     fn image_args(root: PathBuf, manifest: &str) -> CreateArgs {
         CreateArgs {
+            options: CreateOptionArgs::default(),
             bundle: std::env::temp_dir(),
             id: "c1".into(),
             image: Some(crate::commands::args::CreateImageArgs {
@@ -1429,22 +1829,28 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p =
-                    std::env::temp_dir().join(format!("fc-cli-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
         }
 
@@ -1485,6 +1891,7 @@ mod tests {
             let bundle = make_bundle(&base);
             let rt = runtime(&base);
             let args = CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle: bundle.clone(),
                 id: "c1".into(),
                 image: None,
@@ -1498,6 +1905,136 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
+        }
+
+        fn options_args(bundle: &Path, id: &str) -> CreateArgs {
+            CreateArgs {
+                options: CreateOptionArgs {
+                    ulimits: vec!["nofile=1024:2048".into()],
+                    env: vec!["A=1".into()],
+                    labels: vec!["tier=web".into()],
+                    cap_drop: vec!["chown".into(), "CAP_NET_RAW".into()],
+                    read_only: true,
+                    ..CreateOptionArgs::default()
+                },
+                bundle: bundle.to_path_buf(),
+                id: id.into(),
+                image: None,
+            }
+        }
+
+        /// SUP-12・CLI-1・SEC-1(#2713): create は label を状態記録へ書き、起動オプション文書を 0600 で
+        /// 状態ルート配下へ書く。同じ ID の再 create は `ALREADY_EXISTS` で、既存の文書は壊れない。
+        #[test]
+        fn sup12_create_writes_options_document_and_labels() {
+            use std::os::unix::fs::MetadataExt as _;
+            let base = TmpDir::new("opts");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let args = options_args(&bundle, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
+            let rec = create_with_options(&rt, &req, None, &doc).expect("create");
+            assert_eq!(rec.annotations().get("tier"), Some("web"));
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let path = options_store::options_path(&root, &id);
+            assert_eq!(
+                std::fs::metadata(&path).expect("meta").mode() & 0o777,
+                0o600
+            );
+            // 文書と状態記録の annotations は同じ作成世代を持つ(supervisor が照合する。#2713・SEC-1)。
+            let written = options_store::read(&root, &id)
+                .expect("read")
+                .expect("document");
+            let generation = rec
+                .annotations()
+                .get(options_store::GENERATION_ANNOTATION)
+                .expect("generation annotation");
+            assert_eq!(generation.len(), 32);
+            assert_eq!(written.generation(), Some(generation));
+            assert_eq!(written.env(), doc.env());
+            // `--cap-drop` も文書に載り、supervisor 側の復号で同じ集合になる(CLI-1・SEC-1・#2775)。
+            assert_eq!(written.cap_drop(), ["chown", "CAP_NET_RAW"]);
+            // `--read-only` も文書に載る(CLI-1・SUP-12・#2828)。
+            assert!(written.read_only());
+            let before = std::fs::read(&path).expect("bytes");
+            let e = create_with_options(&rt, &req, None, &doc).expect_err("dup");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            assert_eq!(std::fs::read(&path).expect("bytes"), before);
+        }
+
+        /// SUP-12・CLI-1(#2713): core の create が失敗したら、書いた文書を残さない。
+        #[test]
+        fn sup12_create_failure_rolls_back_options_document() {
+            let base = TmpDir::new("optsfail");
+            let missing = base.0.join("no-such-bundle");
+            let rt = runtime(&base);
+            let args = options_args(&missing, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
+            let e = create_with_options(&rt, &req, None, &doc).expect_err("must fail");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let path = options_store::options_path(&root, req.id());
+            assert!(!path.exists(), "the document must be rolled back");
+        }
+
+        /// SUP-12・REPAIR-4(#2713): 文書の準備が失敗したら core に入らず、失敗を 1 回だけ計測し、状態を作らない。
+        #[test]
+        fn repair4_options_prepare_failure_is_recorded_once_and_creates_no_state() {
+            let base = TmpDir::new("optsprep");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            // 文書ディレクトリの位置に通常ファイルを置いて、準備(ディレクトリの検証)を失敗させる。
+            std::fs::write(options_store::options_dir(&root), b"x").expect("blocker");
+            let args = options_args(&bundle, "c1");
+            let req = build_create_request(&args).expect("req");
+            let doc = create_options::document_of(&args.options, None).expect("doc");
+            create_with_options(&rt, &req, None, &doc).expect_err("must fail");
+            let name = OpName::new("create").expect("name");
+            let stats = rt.recorder.snapshot_op(&name).expect("recorded");
+            assert_eq!((stats.success(), stats.failure()), (0, 1));
+            assert!(
+                rt.store
+                    .get(&fandhe_container_core::traits::GetStateRequest::new(
+                        req.id().clone()
+                    ))
+                    .is_err(),
+                "core create must not have run"
+            );
+        }
+
+        /// SUP-12(#2713): 指定が空でも、状態の無い残骸の文書は create が掃除する(前のコンテナの設定が効かない)。
+        #[test]
+        fn sup12_create_clears_stale_options_document() {
+            let base = TmpDir::new("optsstale");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let root = rt.store.host_state_root().expect("root").to_path_buf();
+            let id = ContainerId::new("c1").expect("id");
+            let stale = create_options::document_of(
+                &CreateOptionArgs {
+                    env: vec!["OLD=1".into()],
+                    ..CreateOptionArgs::default()
+                },
+                None,
+            )
+            .expect("doc");
+            options_store::write_new(&root, &id, &stale).expect("stale");
+            let args = CreateArgs {
+                options: CreateOptionArgs::default(),
+                bundle,
+                id: "c1".into(),
+                image: None,
+            };
+            let req = build_create_request(&args).expect("req");
+            // Linux の `document_of` は既定の `network none` を必ず書く(#1873)ので、空の文書は直接作る。
+            let doc = ContainerOptionsDocument::default();
+            assert!(doc.is_empty());
+            create_with_options(&rt, &req, None, &doc).expect("create");
+            assert!(!options_store::options_path(&root, &id).exists());
         }
 
         const IMG_DIGEST_2: &str =
@@ -1573,8 +2110,8 @@ mod tests {
             global.root = Some(base.0.join("state"));
             let (_req, image) =
                 build_create(&global, &image_args(root.clone(), tag)).expect("build");
-            let image = image.expect("image");
-            assert_eq!(image.manifest.as_str(), IMG_DIGEST);
+            let pending = image.expect("image");
+            assert_eq!(pending.manifest.as_str(), IMG_DIGEST);
             // 解決のあとに別のストアのインスタンスで付け替える。
             let other = ImageStore::open(&root).expect("other");
             let key: TagKey =
@@ -1593,7 +2130,9 @@ mod tests {
                 fandhe_container_oci::image_management::ImageTagChange::Moved { .. }
             ));
             let rt = runtime(&base);
+            let image = pending.bind(rt.store.as_ref()).expect("bind");
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1628,6 +2167,7 @@ mod tests {
                 store: ImageStore::open(&root).expect("store"),
                 manifest: ImageManifestDigest::new(IMG_DIGEST).expect("digest"),
                 scope: "scope".into(),
+                legacy_scope: None,
             }
         }
 
@@ -1644,6 +2184,7 @@ mod tests {
                 .expect("q")
                 .expect("some");
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1673,6 +2214,7 @@ mod tests {
             )
             .expect("gate dir");
             let req = build_create_request(&CreateArgs {
+                options: CreateOptionArgs::default(),
                 bundle,
                 id: "c1".into(),
                 image: None,
@@ -1695,7 +2237,11 @@ mod tests {
             let rt = runtime(&base);
             let e = ensure_exists(
                 rt.store,
-                &build_start_request(&StartArgs { id: "nope".into() }).expect("req"),
+                &build_start_request(&StartArgs {
+                    id: "nope".into(),
+                    audit_policy: None,
+                })
+                .expect("req"),
             )
             .expect_err("nf");
             assert_eq!(e.code(), ErrorCode::NotFound);
@@ -1712,6 +2258,7 @@ mod tests {
             let rec = create_container(
                 &rt,
                 &build_create_request(&CreateArgs {
+                    options: CreateOptionArgs::default(),
                     bundle,
                     id: "c1".into(),
                     image: None,
@@ -1719,7 +2266,11 @@ mod tests {
                 .expect("req"),
             )
             .expect("create");
-            let req = build_start_request(&StartArgs { id: "c1".into() }).expect("req");
+            let req = build_start_request(&StartArgs {
+                id: "c1".into(),
+                audit_policy: None,
+            })
+            .expect("req");
             ensure_exists(rt.store, &req).expect("exists");
             let root =
                 fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))
@@ -1745,5 +2296,123 @@ mod tests {
                 .expect("snap");
             assert_eq!((snap.success(), snap.failure()), (1, 1));
         }
+    }
+}
+/// 同じ ID の create 前の残りログ回収（#2698・SUP-7・CLI-1・REPAIR-4）の試験。ディレクトリ 0700 を前提にするため Linux のみ。
+#[cfg(all(test, target_os = "linux"))]
+mod reclaim_tests {
+    use super::*;
+    use fandhe_container_core::state_store::StateRoot;
+    use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest};
+    use fandhe_container_supervisor::logs::{RotatingFileSink, container_log_rotation_config};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("fc-cli-rc-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("mkdir");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            Self(p)
+        }
+        fn root(&self) -> PathBuf {
+            self.0.join("state")
+        }
+        fn store(&self) -> FileStateStore {
+            FileStateStore::open(StateRoot::from_override(self.root()).expect("root"))
+                .expect("open")
+        }
+        /// ロックファイルを除いたログファイルの数（ロックは guard が false でも片付く）。
+        fn names(&self) -> usize {
+            std::fs::read_dir(self.root().join("@container-logs"))
+                .map(|d| {
+                    d.filter(|e| {
+                        !e.as_ref()
+                            .expect("e")
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".lock")
+                    })
+                    .count()
+                })
+                .unwrap_or(0)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn id(s: &str) -> ContainerId {
+        ContainerId::new(s).expect("id")
+    }
+
+    fn open_sink(t: &Tmp, name: &str) -> RotatingFileSink {
+        let dir = t.root().join("@container-logs");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        RotatingFileSink::open(&dir, &id(name), container_log_rotation_config()).expect("sink")
+    }
+
+    fn stats(rec: &OpRecorder) -> Option<(u64, u64)> {
+        let n = OpName::new("container_log_reclaim").expect("name");
+        rec.snapshot_op(&n).map(|s| (s.success(), s.failure()))
+    }
+
+    /// 残ったログ（sink は閉じ済み）は消え、Success が 1 件記録される。0 件のときは何も記録しない。
+    #[test]
+    fn sup7_cli1_create_reclaims_leftover_logs_for_same_id() {
+        let t = Tmp::new("leftover");
+        let st = t.store();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
+        assert_eq!(stats(&rec), None);
+        drop(open_sink(&t, "a1"));
+        assert!(t.names() > 0);
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
+        assert_eq!(t.names(), 0);
+        assert_eq!(stats(&rec), Some((1, 0)));
+    }
+
+    /// 同じ ID の状態が既にあるときは消さず、何も記録しない（続く core の create が ALREADY_EXISTS を返す）。
+    #[test]
+    fn sup7_cli1_create_reclaim_keeps_logs_when_state_present() {
+        let t = Tmp::new("present");
+        let st = t.store();
+        drop(open_sink(&t, "p1"));
+        let bundle = t.0.join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        let req =
+            CreateStateRequest::new(ContainerStatus::created(id("p1"), None), bundle).expect("req");
+        st.create(&req).expect("create");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("p1"), &rec).expect("ok");
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), None);
+    }
+
+    /// 回収が期限切れなら create は core を呼ばず TIMEOUT で失敗する（SEC-4・SUP-7・#2698）。
+    #[test]
+    fn sup7_cli1_create_reclaim_timeout_fails_create_before_core() {
+        assert!(reclaim_timeout_result(false).is_ok());
+        let e = reclaim_timeout_result(true).expect_err("timeout");
+        assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
+    }
+
+    /// 古い supervisor の sink が生きている（ロック保持）ときは消さず、Failure が 1 件記録される。
+    #[test]
+    fn sup7_cli1_create_reclaim_records_failure_when_sink_alive() {
+        let t = Tmp::new("alive");
+        let st = t.store();
+        let _sink = open_sink(&t, "l1");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("l1"), &rec).expect("ok");
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), Some((0, 1)));
     }
 }

@@ -29,7 +29,7 @@
 //!   失敗したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）も
 //!   実装済み。保存はひとまとまりの操作の入口が排他の中で行い、ガードから下位メソッドを直接呼んだ変更は
 //!   保存されない（試験と `with_table` の種入れ用の口。ファイルがあれば次の排他取得でディスクの内容になる）。
-//!   本番で在庫を埋める経路（pull → `ImageStore` の配線）は未実装（REPAIR-3）。
+//!   在庫を埋める経路（pull → `ImageStore`）は cri の `OciImagePuller::pull` に配線済み（#2539）。本番の `PullImage` へは #2592 で到達済み。
 //! - root の所有者・権限・祖先の検査は `open` / `with_table` で行う（#2381・SEC-1。unix のみ）。root は
 //!   現在の実効 uid の所有で group / other に書き込めないこと（`0o022` が立っていない。0700 と 0755 は受理、
 //!   0770・0757・1777 は拒否）、祖先は root か実効 uid の所有で、group / other に書き込めないこと
@@ -56,10 +56,10 @@ use std::time::{Duration, Instant};
 use super::ReferenceTable;
 use super::container_ref_persist::load_container_refs;
 use super::gc_journal::{
-    PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_exists, reap_stale_tmp,
+    PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_state, reap_stale_tmp,
 };
 use super::inventory_persist::load_image_inventory;
-use super::root_handle::RootHandle;
+use super::root_handle::{RootHandle, map_root_io};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -173,7 +173,7 @@ impl ImageStore {
             let guard = self.lock_inner()?;
             // 復旧後もジャーナル（墓標を含む）が見えているなら、変更を許さない（OCI-7）。
             // 古い untag・manifest 除去が再登録と両立しないため、障害が除かれて復旧が完了するまで拒否する。
-            if journal_exists(&self.handle) {
+            if journal_state(&self.handle)? {
                 return Err(OciError::new(
                     OciErrorCode::FailedPrecondition,
                     "a pending image deletion could not be completed; retry after it is recovered",
@@ -225,7 +225,7 @@ impl ImageStore {
         }
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
         reap_stale_tmp(&self.handle, STALE_TMP_PREFIXES);
-        let recovered = if journal_exists(&self.handle) {
+        let recovered = if journal_state(&self.handle)? {
             record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
                 guard.table.resume_pending_deletion_at(&self.handle)
             })?
@@ -440,23 +440,28 @@ pub(super) fn open_named_lock_file(root: &RootHandle, name: &str) -> Result<File
         Ok(Some(m)) if m.is_file() => Some(m),
         Ok(Some(_)) => return Err(lock_file_error()),
         Ok(None) => None,
-        Err(_) => {
-            return Err(OciError::new(
-                OciErrorCode::Internal,
-                "failed to inspect the image store lock file",
-            ));
+        Err(e) => {
+            return Err(map_root_io(&e, || {
+                OciError::new(
+                    OciErrorCode::Internal,
+                    "failed to inspect the image store lock file",
+                )
+            }));
         }
     };
     let file = match root.open_lock(name) {
         Ok(f) => f,
-        Err(_) => {
+        Err(e) => {
             // 検査後に symlink・ディレクトリへ差し替えられた場合（`O_NOFOLLOW` の拒否など）は通常ファイルでない扱い。
+            // root 配下の別マウント（`@lock` の bind mount 等。EXDEV）は対応外として原因を示す（#2701）。
             return Err(match root.stat_name(name) {
                 Ok(Some(m)) if !m.is_file() => lock_file_error(),
-                _ => OciError::new(
-                    OciErrorCode::Internal,
-                    "failed to open the image store lock file",
-                ),
+                _ => map_root_io(&e, || {
+                    OciError::new(
+                        OciErrorCode::Internal,
+                        "failed to open the image store lock file",
+                    )
+                }),
             });
         }
     };
@@ -552,6 +557,8 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        // PID の再利用で前回の実行の残骸と名前が衝突しうるため、作る前に消す（#3237）。
+        let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).expect("mkdir");
         #[cfg(unix)]
         {

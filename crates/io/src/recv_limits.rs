@@ -16,7 +16,9 @@
 //! （[`IoErrorCode::ResourceExhausted`]）で拒否する。受理した場合に限り、
 //! 本体バッファを確保できる型付きの証跡（[`AdmittedHeader`]）を返す。
 //! 設定上限（`max_bytes` 由来）は `Write` 用のバッチ集約上限であり、
-//! `Ack` / `Flush` / `FlushAck` 等の制御フレームには適用しない。その代わり
+//! `Ack` / `Flush` / `FlushAck` 等の制御フレームには適用しない（v2 の `WriteFile` は
+//! body を運ぶので `Write` と同じ設定上限、`Create` / `Close` / `Nack` は制御フレーム
+//! 側。#3161）。その代わり
 //! 制御フレームには [`MAX_CONTROL_PAYLOAD_LEN`]（`BatchConfig` に依存しない
 //! 固定の安全弁）を適用し、確保前検証を欠かさない（詳細は
 //! [`ReceiveLimits::admit`] のドキュメンテーションコメント参照）。
@@ -83,6 +85,9 @@ use std::num::NonZeroUsize;
 
 use crate::batch::{BatchConfig, MAX_BATCH_SIZE};
 use crate::error::{IoError, IoErrorCode};
+use crate::payload::{
+    CLOSE_PAYLOAD_LEN, CREATE_FIXED_LEN, MAX_CREATE_PAYLOAD_LEN, NACK_PAYLOAD_LEN,
+};
 use crate::protocol::{Frame, FrameHeader, FrameKind, MAX_PAYLOAD_LEN};
 
 /// 受信経路で滞留を許す最大フレーム件数の暫定上限（REPAIR-3: 実装済みを
@@ -104,8 +109,9 @@ pub const MAX_RECV_PENDING_FRAMES: usize = MAX_BATCH_SIZE;
 /// 制御フレームは [`crate::protocol::FrameHeader::from_bytes`] が検証する
 /// プロトコル上限 [`MAX_PAYLOAD_LEN`]（64 MiB）まで申告長を偽装でき、
 /// `allocate_body` がその長さのバッファを確保前検証なしに確保してしまう
-/// （P0）。制御フレームのペイロードレイアウトはまだ定義されていない
-/// （モジュール doc の「スコープ外」参照）ため、`BatchConfig` に依存しない
+/// （P0）。制御フレームのレイアウトは `crate::payload` が定める（`Flush`・`Ack`・
+/// `FlushAck`・`Close` は固定長、`Nack` は 11 バイト、`Create` は 4106 バイト以下。
+/// v2・#3161）が、受信ゲートは種別ごとの厳密な長さを見ず、`BatchConfig` に依存しない
 /// 固定の安全弁として本定数を設ける。値は [`MAX_BATCH_SIZE`]（4096）件分の
 /// request id 相当を想定しても十分な余裕を持つ 64 KiB とした。実際の
 /// 制御フレームのレイアウト確定・上限値の校正は TASK-12・TASK-13 の後続・
@@ -115,6 +121,15 @@ pub const MAX_CONTROL_PAYLOAD_LEN: u32 = 64 * 1024;
 // MAX_CONTROL_PAYLOAD_LEN はプロトコル上限を超えてはならない不変条件を
 // コンパイル時に保証する。
 const _: () = assert!(MAX_CONTROL_PAYLOAD_LEN <= MAX_PAYLOAD_LEN);
+
+/// UDS クライアントが受理する応答（Ack・FlushAck・Nack）のペイロード長の上限（B）。
+/// `admit` の固定長検証と合わせ、受理する最大の応答が 16 B 以下であることを固定する（#3165）。
+pub const MAX_CLIENT_RESPONSE_PAYLOAD_LEN: usize = 16;
+const _: () = assert!(crate::payload::ACK_PAYLOAD_LEN <= MAX_CLIENT_RESPONSE_PAYLOAD_LEN);
+const _: () = assert!(crate::payload::NACK_PAYLOAD_LEN <= MAX_CLIENT_RESPONSE_PAYLOAD_LEN);
+
+// Create の最大ペイロードは制御フレームの上限に収まる（v2・#3161）。
+const _: () = assert!(crate::payload::MAX_CREATE_PAYLOAD_LEN as u32 <= MAX_CONTROL_PAYLOAD_LEN);
 
 // MAX_RECV_PENDING_FRAMES は非ゼロでなければならない不変条件をコンパイル時に
 // 保証する（`batch.rs` の `const _: () = assert!(...)` と同種のパターン）。
@@ -278,7 +293,9 @@ impl ReceiveLimits {
         let payload_len = header.payload_len().get();
 
         match header.kind() {
-            FrameKind::Write => {
+            // WriteFile の body も Write と同じく設定上限の対象にする（64 KiB の
+            // 制御フレーム上限を超えうる。v2・#3161）。
+            FrameKind::Write | FrameKind::WriteFile => {
                 if payload_len > self.max_payload_len {
                     return Err(IoError::new(
                         IoErrorCode::ResourceExhausted,
@@ -301,7 +318,39 @@ impl ReceiveLimits {
                     ));
                 }
             }
-            FrameKind::Ack | FrameKind::Flush | FrameKind::FlushAck => {
+            // Create は最大 4106 バイト（MAX_CREATE_PAYLOAD_LEN）で制御フレームの
+            // 上限に収まる。厳密な長さは payload の復号が検証する。
+            FrameKind::Ack
+            | FrameKind::Flush
+            | FrameKind::FlushAck
+            | FrameKind::Create
+            | FrameKind::Close
+            | FrameKind::Nack => {
+                // v2 の新種別はレイアウトが固定長 / 有界のため、本体を確保する前に
+                // ヘッダの申告長を種別ごとの範囲で検証する（io-protocol.md F4・
+                // TASK-83.2・#3161）。Create の path_len と実長の照合は本体が
+                // 最大 4106 バイトに収まった後に復号が行う（確保量は有界）。
+                let accepted = match header.kind() {
+                    FrameKind::Close => payload_len as usize == CLOSE_PAYLOAD_LEN,
+                    FrameKind::Nack => payload_len as usize == NACK_PAYLOAD_LEN,
+                    // Ack / FlushAck は request id のみの固定長（payload.rs）。クライアント側が
+                    // 受ける応答の最大ペイロードを 16 B 以下に固定する（io-protocol.md F12・#3165）。
+                    FrameKind::Ack | FrameKind::FlushAck => {
+                        payload_len as usize == crate::payload::ACK_PAYLOAD_LEN
+                    }
+                    FrameKind::Create => (CREATE_FIXED_LEN + 1..=MAX_CREATE_PAYLOAD_LEN)
+                        .contains(&(payload_len as usize)),
+                    _ => true,
+                };
+                if !accepted {
+                    return Err(IoError::new(
+                        IoErrorCode::InvalidArgument,
+                        format!(
+                            "frame payload length {payload_len} is not valid for kind {:?}",
+                            header.kind()
+                        ),
+                    ));
+                }
                 if payload_len > MAX_CONTROL_PAYLOAD_LEN {
                     return Err(IoError::new(
                         IoErrorCode::ResourceExhausted,
@@ -432,6 +481,53 @@ mod tests {
         FrameHeader::new(FrameKind::Flush, 0).expect("header must be valid")
     }
 
+    /// IO-1・REPAIR-2・TASK-83.2・#3161: Close・Nack・Create は本体確保前に
+    /// ヘッダの申告長を種別ごとの範囲で検証する。
+    #[test]
+    fn io1_admit_rejects_v2_kind_length_mismatch_before_allocation() {
+        let limits = ReceiveLimits::default();
+        let cases: [(FrameKind, u32, bool); 15] = [
+            (FrameKind::Ack, 8, true),
+            (FrameKind::Ack, 7, false),
+            (FrameKind::Ack, 9, false),
+            (FrameKind::FlushAck, 8, true),
+            (FrameKind::FlushAck, 7, false),
+            (FrameKind::FlushAck, 9, false),
+            (FrameKind::Close, CLOSE_PAYLOAD_LEN as u32, true),
+            (FrameKind::Close, 65536, false),
+            (FrameKind::Close, CLOSE_PAYLOAD_LEN as u32 + 1, false),
+            (FrameKind::Nack, NACK_PAYLOAD_LEN as u32, true),
+            (FrameKind::Nack, NACK_PAYLOAD_LEN as u32 - 1, false),
+            (FrameKind::Create, CREATE_FIXED_LEN as u32, false),
+            (FrameKind::Create, CREATE_FIXED_LEN as u32 + 1, true),
+            (FrameKind::Create, MAX_CREATE_PAYLOAD_LEN as u32, true),
+            (FrameKind::Create, MAX_CREATE_PAYLOAD_LEN as u32 + 1, false),
+        ];
+        for (kind, len, ok) in cases {
+            let header = FrameHeader::new(kind, len).expect("header must be valid");
+            assert_eq!(
+                limits.admit(header, 0).is_ok(),
+                ok,
+                "kind={kind:?} len={len}"
+            );
+        }
+    }
+
+    /// IO-1・#3165: 受理する応答（Ack・FlushAck・Nack）の最大ペイロードは 16 B 以下で、
+    /// 64 KiB 級の Ack / FlushAck の申告長は本体確保前に `InvalidArgument` で拒否される。
+    #[test]
+    fn io1_admit_caps_response_payload_at_16_bytes() {
+        let limits = ReceiveLimits::default();
+        for kind in [FrameKind::Ack, FrameKind::FlushAck] {
+            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN).expect("header");
+            let err = limits
+                .admit(header, 0)
+                .expect_err("oversized ack must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument, "kind={kind:?}");
+        }
+        assert_eq!(MAX_CLIENT_RESPONSE_PAYLOAD_LEN, 16);
+    }
+
     /// IO-1・REPAIR-2: `0`・`MAX_PAYLOAD_LEN + 1`・`MAX_RECV_PENDING_FRAMES + 1` は
     /// 拒否され、境界値（`1`・`MAX_PAYLOAD_LEN`・`MAX_RECV_PENDING_FRAMES`）は
     /// 受理される。
@@ -558,7 +654,8 @@ mod tests {
     fn io1_admit_length_check_does_not_apply_to_control_frames() {
         let limits = ReceiveLimits::new(8, 8).expect("valid limits must succeed");
 
-        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+        {
+            let kind = FrameKind::Flush;
             let header =
                 FrameHeader::new(kind, 1024).expect("header within protocol limit must be valid");
             let _admitted = limits.admit(header, 0).expect(
@@ -661,7 +758,8 @@ mod tests {
         let limits = ReceiveLimits::new(MAX_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES)
             .expect("valid limits must succeed");
 
-        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+        {
+            let kind = FrameKind::Flush;
             let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN + 1)
                 .expect("header within protocol limit must be valid");
 
@@ -682,13 +780,45 @@ mod tests {
         );
     }
 
+    /// IO-1・REPAIR-2・#3161: v2 の `WriteFile` は `Write` と同じく設定上限
+    /// （`max_payload_len`）が適用され、超過は確保の前に `ResourceExhausted`。
+    /// `Create`・`Close`・`Nack` は制御フレームの固定上限が適用される。
+    #[test]
+    fn io1_admit_v2_kinds_use_write_limit_or_control_limit_before_allocation() {
+        reset_allocation_recorder();
+        let limits = ReceiveLimits::new(128 * 1024, 8).expect("valid limits");
+
+        let header = FrameHeader::new(FrameKind::WriteFile, 128 * 1024 + 1).expect("header");
+        let err = limits
+            .admit(header, 0)
+            .expect_err("WriteFile over max_payload_len must be rejected");
+        assert_eq!(err.code(), IoErrorCode::ResourceExhausted);
+        // 制御フレームの上限（64 KiB）を超えても、設定上限内の WriteFile は受理される。
+        let header =
+            FrameHeader::new(FrameKind::WriteFile, MAX_CONTROL_PAYLOAD_LEN + 1).expect("header");
+        let _admitted = limits
+            .admit(header, 0)
+            .expect("WriteFile within max_payload_len must be accepted");
+
+        // Create・Close・Nack は 64 KiB 級の申告長を種別ごとの範囲検証で拒否する。
+        for kind in [FrameKind::Create, FrameKind::Close, FrameKind::Nack] {
+            let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN).expect("header");
+            let err = limits
+                .admit(header, 0)
+                .expect_err("v2 control kinds with oversized length must be rejected");
+            assert_eq!(err.code(), IoErrorCode::InvalidArgument);
+        }
+        assert_eq!(allocation_count(), 0, "admit must not allocate a body");
+    }
+
     /// IO-1: 制御フレームは申告長がちょうど [`MAX_CONTROL_PAYLOAD_LEN`]
     /// （境界値）であれば受理される（`>` であり `>=` ではない判定）。
     #[test]
     fn io1_admit_accepts_control_frame_at_fixed_control_limit_boundary() {
         let limits = ReceiveLimits::new(8, 8).expect("valid limits must succeed");
 
-        for kind in [FrameKind::Ack, FrameKind::Flush, FrameKind::FlushAck] {
+        {
+            let kind = FrameKind::Flush;
             let header = FrameHeader::new(kind, MAX_CONTROL_PAYLOAD_LEN)
                 .expect("header within protocol limit must be valid");
 

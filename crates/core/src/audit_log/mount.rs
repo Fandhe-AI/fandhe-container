@@ -26,7 +26,8 @@ use std::path::Path;
 use crate::traits::{ContainerId, TraitError};
 
 use super::{
-    AuditEvent, AuditPath, AuditPid, AuditRecord, AuditRecordError, AuditSink, AuditTimestamp,
+    AuditEvent, AuditPath, AuditPid, AuditRecord, AuditRecordError, AuditSink, AuditStage,
+    AuditTimestamp,
 };
 
 /// 記録の結果。真偽値にせず将来拡張できる形にする。
@@ -91,6 +92,20 @@ pub(crate) fn deliver_until(
     sink: &dyn AuditSink,
     deadline: Option<std::time::Instant>,
 ) -> AuditDelivery {
+    deliver_with_stage_until(event, container, None, sink, deadline)
+}
+
+/// [`deliver_until`] に拒否した段を足した版（SEC-4・ERR-4・#3121）。
+///
+/// 呼び出し元: `ExecError::stage` を手元に持つ `exec` の記録点。段は `IsolationStage` からの
+/// `AuditStage`（静的語彙）だけで、`None` なら従来どおり段のキーを出さない。
+pub(crate) fn deliver_with_stage_until(
+    event: AuditEvent,
+    container: Option<&ContainerId>,
+    stage: Option<AuditStage>,
+    sink: &dyn AuditSink,
+    deadline: Option<std::time::Instant>,
+) -> AuditDelivery {
     let timestamp = match AuditTimestamp::now() {
         Ok(t) => t,
         Err(e) => return AuditDelivery::RecordUnavailable(e),
@@ -102,6 +117,9 @@ pub(crate) fn deliver_until(
     let mut record = AuditRecord::new(timestamp, pid, event);
     if let Some(id) = container {
         record = record.with_container_id(id.clone());
+    }
+    if let Some(stage) = stage {
+        record = record.with_stage(stage);
     }
     let result = match deadline {
         Some(deadline) => sink.record_until(&record, deadline),

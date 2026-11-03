@@ -19,6 +19,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -36,31 +40,25 @@ mod linux {
     const POLL_MARGIN: Duration = Duration::from_secs(5);
 
     /// 排他作成する一時ディレクトリ（drop で削除）。
-    struct TempDir(PathBuf);
+    #[allow(dead_code)] // 第 2 要素は親ディレクトリを drop まで保持するためだけに持つ。
+    struct TempDir(PathBuf, super::scratch_root::ScratchDir);
 
     impl TempDir {
         fn new(tag: &str, mode: u32) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            for attempt in 0..16u32 {
-                let path = std::env::temp_dir().join(format!(
-                    "fc-cmad-{tag}-{}-{nanos}-{attempt}",
-                    std::process::id()
-                ));
-                match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => {
-                        // umask に左右されないよう明示的に設定する。
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-                            .expect("set mode");
-                        return Self(path);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => panic!("create temp dir: {e}"),
-                }
-            }
-            panic!("could not create a unique temp dir");
+            // 親（tmpfiles の flock 走査から守る）の子に作る。mode は子に明示設定する。
+            let scratch = super::scratch_root::ScratchDir::new(
+                &format!("fc-cmad-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let path = scratch.path().join("d");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .expect("create temp dir");
+            // umask に左右されないよう明示的に設定する。
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set mode");
+            Self(path, scratch)
         }
     }
 

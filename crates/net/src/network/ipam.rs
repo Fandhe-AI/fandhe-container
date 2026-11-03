@@ -2,9 +2,9 @@
 //!
 //! 親モジュール `network` のコンテナ接続処理（`attach_container`）が、netns 移動の後に
 //! [`StaticIpam::allocate`] を呼んでコンテナ 1 つ分のアドレスを決める。常駐デーモンを持たない
-//! 方針（CORE-1）のため、状態は呼び出し側が所有するメモリ上の値で、永続化と再起動後の復元
-//! （[`StaticIpam::reserve`] で払い出し済みを戻す）は呼び出し側の責務。状態レジストリによる
-//! 永続化は未実装で担当 Issue 未確定（REPAIR-3）。IPv6 は未対応（IPv4 のみ）。
+//! 方針（CORE-1）のため、状態は呼び出し側が所有するメモリ上の値で、永続化は状態ストアの記録
+//! （`network_store`: `members/<id>`・`members-intent/<id>`。#3067）が担い、操作のたびに記録から組み直す
+//! （`network_store::rebuild_ipam`。独立したカウンタを持たない）。IPv6 は未対応（IPv4 のみ）。
 //!
 //! 接続処理は払い出しと同時に、その endpoint の netns pin 置き場（パスとディレクトリの識別子）を
 //! `NetnsDirRecord` として記録する。ネットワーク削除（`network::delete_network`。TASK-139.4・NET-1）は、
@@ -235,6 +235,21 @@ impl StaticIpam {
         }
         self.by_addr.insert(a, endpoint.clone());
         self.by_endpoint.insert(endpoint.clone(), a);
+        Ok(())
+    }
+
+    /// [`StaticIpam::reserve`] と同じく払い出しを戻し、成功したときだけ netns pin 置き場 `dir` を記録する。
+    ///
+    /// 状態ストアのメンバー記録（`network_store::member`）から IPAM を組み直す入口で、`delete_network` が
+    /// 復元した払い出しの pin も判定できるようにする（#3067・NET-1）。
+    pub(crate) fn reserve_pinned(
+        &mut self,
+        endpoint: &EndpointId,
+        addr: IpPrefix,
+        dir: NetnsDirRecord,
+    ) -> Result<(), NetError> {
+        self.reserve(endpoint, addr)?;
+        self.netns_dirs.insert(endpoint.clone(), dir);
         Ok(())
     }
 

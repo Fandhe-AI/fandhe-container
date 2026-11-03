@@ -362,18 +362,6 @@ const DELETE_STDERR_MAX: u64 = 4096;
 /// 取り出し、既知のコード（`ErrorCode::as_str`）なら固定文字列で返す。読めない・未知なら `UNPARSED`。
 /// message・パス・errno は返さない（出力へ載せない。外部入力は信頼しない）。
 fn delete_error_code(bytes: &[u8]) -> &'static str {
-    const KNOWN: [ErrorCode; 10] = [
-        ErrorCode::InvalidArgument,
-        ErrorCode::NotFound,
-        ErrorCode::AlreadyExists,
-        ErrorCode::FailedPrecondition,
-        ErrorCode::Unimplemented,
-        ErrorCode::Internal,
-        ErrorCode::PermissionDenied,
-        ErrorCode::Timeout,
-        ErrorCode::Unavailable,
-        ErrorCode::ResourceExhausted,
-    ];
     const KEY: &str = "\"code\":\"";
     let text = String::from_utf8_lossy(bytes);
     let Some(start) = text.find(KEY).map(|i| i + KEY.len()) else {
@@ -388,11 +376,7 @@ fn delete_error_code(bytes: &[u8]) -> &'static str {
     let Some(code) = rest.get(..end) else {
         return "UNPARSED";
     };
-    KNOWN
-        .iter()
-        .map(ErrorCode::as_str)
-        .find(|k| *k == code)
-        .unwrap_or("UNPARSED")
+    ErrorCode::from_name(code).map_or("UNPARSED", |c| c.as_str())
 }
 
 /// 一時 stderr ファイルの先頭を読んで拒否コードにする（読めなければ `UNPARSED`）。

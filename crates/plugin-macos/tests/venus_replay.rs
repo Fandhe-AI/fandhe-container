@@ -64,6 +64,8 @@ fn read_recording_file_roundtrip_and_rejects_directory() {
     let got = got.expect("read");
     assert_eq!(validate(&got).expect("validate").records().len(), 1);
 
+    // 前回の残骸があれば消してから作る（REPAIR-12・#3375）。
+    let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("mkdir");
     let r = read_recording_file(&base);
     let _ = std::fs::remove_dir(&base);

@@ -97,10 +97,10 @@ fn repair4_export_write_and_flush_failures_return_internal() {
     r.record(&name("read"), OpOutcome::Success, Duration::from_millis(1))
         .unwrap();
 
-    // 3 回目の write（2 行目本体）で失敗 = 1 行書けた時点。
+    // 2 回目の write（2 行目。1 行 1 回の write_all）で失敗 = 1 行書けた時点。
     let mut sink = FailingSink {
         writes: 0,
-        fail_write_at: Some(3),
+        fail_write_at: Some(2),
         fail_flush: false,
     };
     let e = r.export_json_lines(Some(&mut sink)).unwrap_err();

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 後始末つきの一時ディレクトリ（unix では 0700 にして check_dir を通す）。
-struct TmpDir(PathBuf);
+/// 第 2 要素は排他作成した実体（Drop で後始末する。REPAIR-12・#3475）。
+struct TmpDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
@@ -15,20 +16,43 @@ impl TmpDir {
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
-        fs::create_dir_all(&p).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        Self(p)
+        Self::at(p)
+    }
+
+    /// 指定パスを第 1 候補に排他作成する（残骸の回帰試験が専用のパスで呼ぶ。unix では 0700）。
+    fn at(p: PathBuf) -> Self {
+        // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（REPAIR-12・#3475）。
+        let root = crate::test_root::test_root_at(p);
+        Self(root.to_path_buf(), root)
     }
 }
 
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+/// SUP-7・REPAIR-12・#3475: 前回の異常終了などで同名の残骸があっても、消さず別名の空の 0700 で作られ、
+/// drop 後は別名のパスだけが消えて残骸は無傷で残る。
+#[test]
+fn sup7_repair12_tmp_dir_leaves_stale_residue_untouched() {
+    let parent = crate::test_root::test_root("fc-sup7-residue", "parent");
+    let p = parent.join("stale");
+    fs::create_dir_all(p.join("sub")).unwrap();
+    fs::write(p.join("c1.log"), b"stale").unwrap();
+    let rp;
+    {
+        let t = TmpDir::at(p.clone());
+        rp = t.0.clone();
+        assert_ne!(t.0, p);
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&t.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
+    assert!(!rp.exists());
+    assert_eq!(fs::read(p.join("c1.log")).unwrap(), b"stale");
+    assert!(p.join("sub").is_dir());
 }
 
 fn id() -> ContainerId {
@@ -1591,7 +1615,12 @@ fn cli1_sink_is_active_rejects_symlinked_lock() {
     assert_ne!(e.code(), ErrorCode::NotFound);
 }
 
-/// 検査が共有ロックを短時間持っている間の open は、有界の再試行で成功する。本物の sink が使用中なら拒否のまま。
+/// 検査が共有ロックを短時間持っている間の open は、有界の再試行で成功する。本物の sink が使用中なら
+/// 再試行が尽きたあと拒否のまま（CLI-1・SUP-7・REPAIR-12）。
+///
+/// 実時間の競争を避けるため、共有ロックの解放は `acquire_lock_with` に注入した sleep の中
+/// （1 回目の `WouldBlock` の直後）で行う。flock は open file description 単位なので、同一プロセス内の
+/// 別 fd でも競合し、順序はスレッドも待ち時間も使わずに確定する（#2911）。
 #[cfg(unix)]
 #[test]
 fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
@@ -1599,14 +1628,43 @@ fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
     let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
     let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    // 使用中の sink がある間は、再試行がちょうど尽きてから拒否される。
+    let mut calls = 0u32;
+    let e = acquire_lock_with(&t.0, "c1.log", LOCK_RETRY, || calls += 1).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(calls, LOCK_RETRY.max_sleeps);
     drop(s);
+
+    // 共有ロックが 1 回目の待ちの中で解放されれば、2 回目の試行で取れる。
     let probe = fs::File::open(t.0.join("c1.log.lock")).unwrap();
     probe.lock_shared().unwrap();
-    let h = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(15));
+    let mut calls = 0u32;
+    let r = acquire_lock_with(&t.0, "c1.log", LOCK_RETRY, || {
+        calls += 1;
         probe.unlock().unwrap();
     });
-    let s2 = RotatingFileSink::open(&t.0, &id(), small());
-    h.join().unwrap();
-    assert!(s2.is_ok());
+    assert!(r.is_ok());
+    assert_eq!(calls, 1);
+    drop(r);
+    assert!(RotatingFileSink::open(&t.0, &id(), small()).is_ok());
+}
+
+/// SUP-7・REPAIR-4・#3143: guard が偽の 0 件成功は `guard_declined()` が真で、ファイルが無くて 0 件の成功とは区別される。
+#[test]
+fn sup7_3143_guard_declined_is_distinguished_from_nothing_to_remove() {
+    let t = TmpDir::new("guard-declined");
+    drop(RotatingFileSink::open(&t.0, &id(), small()).unwrap());
+    // guard が偽: 何も消さず、再作成済みとして報告できる。
+    let declined = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| false).unwrap();
+    assert_eq!(declined.log_files(), 0);
+    assert!(declined.guard_declined());
+    assert_eq!(files(&t.0), ["c1.log"]);
+    // guard が真: 消す。
+    let removed = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| true).unwrap();
+    assert_eq!(removed.log_files(), 1);
+    assert!(!removed.guard_declined());
+    // ファイルが無くて 0 件: guard が真なら declined ではない。
+    let none = RotatingFileSink::remove_all_quiet_guarded(&t.0, &id(), &|| true).unwrap();
+    assert_eq!(none.log_files(), 0);
+    assert!(!none.guard_declined());
 }

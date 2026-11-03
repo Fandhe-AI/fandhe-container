@@ -16,7 +16,7 @@
 //!   ファイルは secrets が `/run/secrets/<name>`、configs が `/run/configs/<name>`（相対指定は既定
 //!   ディレクトリ配下として扱う）。`mode=` は 8 進数字のみ（`0777` 以下）で、未指定は `0444`
 //! - 内容の出所は [`InjectedSource`]: ホスト上のファイル（`File`）か、呼び出し側が組み立てた内容（`Inline`）。
-//!   ホストファイルは通常ファイルのみ・上限 [`INJECTED_FILE_MAX_BYTES`]・FIFO でブロックしない
+//!   ホストファイルは通常ファイルのみ・上限 `INJECTED_FILE_MAX_BYTES`・FIFO でブロックしない
 //!   （`EnvFile::read` と同じ手順。REPAIR-5）。読み取りは [`ContainerOptions::injected_files`](super::ContainerOptions::injected_files) の消費時点で行い、
 //!   指定モデルは出所のパスだけを保持する
 //!
@@ -32,12 +32,10 @@
 //! ため。env と同じ方針）、単一ファイルの bind 注入（Docker の configs 既定 `/<name>` は、rootfs 直下を覆う
 //! tmpfs になるため `/run/configs/<name>` を既定にしている）。
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use fandhe_container_core::injected_files::{
-    INJECTED_FILE_MAX_BYTES, INJECTED_MAX_FILES, InjectedContent, InjectedFileMode,
-    InjectedFileSet, InjectedFileSpec,
+    INJECTED_MAX_FILES, InjectedContent, InjectedFileMode, InjectedFileSet, InjectedFileSpec,
 };
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
 
@@ -235,7 +233,8 @@ fn parse_mode(text: &str) -> Result<InjectedFileMode, TraitError> {
     InjectedFileMode::new(bits)
 }
 
-/// ホストファイルを読む。通常ファイルのみ・上限付き・FIFO でブロックしない（`EnvFile::read` と同じ手順）。
+/// ホストファイルを読む。通常ファイルのみ・上限付き・FIFO でブロックしない（`EnvFile::read` と同じ手順。内容は
+/// [`InjectedContent::from_file`] で封印 memfd に置く）。
 /// message にパス・内容は含めない。
 fn read_host_file(path: &Path) -> Result<InjectedContent, TraitError> {
     let pre =
@@ -251,11 +250,9 @@ fn read_host_file(path: &Path) -> Result<InjectedContent, TraitError> {
     if !meta.is_file() {
         return Err(invalid("secret or config source must be a regular file"));
     }
-    let mut buf = Vec::new();
-    file.take(INJECTED_FILE_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|_| invalid("cannot read secret or config source"))?;
-    InjectedContent::from_bytes(buf)
+    // 内容はユーザー空間のバッファに載せず、core が封印 memfd へ `sendfile` で置く(範囲写像の ID 写像 holder が
+    // 継承するメモリへ secret を残さない。Linux。#2628・CORE-6・SEC-5)。上限は core が検証する。
+    InjectedContent::from_file(&file)
 }
 
 /// secrets / configs の指定一覧（`ContainerOptions` が保持する）。
@@ -314,6 +311,7 @@ fn check_list(list: &[InjectedFileOption], kind: InjectedKind) -> Result<(), Tra
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::injected_files::INJECTED_FILE_MAX_BYTES;
 
     const SENTINEL: &[u8] = b"SENTINEL-DUMMY-VALUE";
 
@@ -484,6 +482,13 @@ mod tests {
         assert_eq!(
             dest_mode(&ok),
             ("/run/secrets/s".to_owned(), 0o444, SENTINEL.len())
+        );
+        // #2628: ホストファイルの内容は呼び出し元のメモリに載せない(Linux は封印 memfd。非 Linux は holder が無い)。
+        let spec = ok.to_core_spec().expect("spec");
+        assert_eq!(spec.content().len(), SENTINEL.len());
+        assert_eq!(
+            spec.content().is_caller_memory(),
+            !cfg!(target_os = "linux")
         );
         let at_limit = file("limit", &vec![b'x'; INJECTED_FILE_MAX_BYTES]);
         assert_eq!(dest_mode(&at_limit).2, INJECTED_FILE_MAX_BYTES);

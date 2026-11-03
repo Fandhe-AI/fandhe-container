@@ -10,10 +10,15 @@
 //!   `start_contract::cli_receive_deadline`。REPAIR-5）。報告された pid を状態ストアの記録と照合し、Running で pid が
 //!   一致するか、直後に終了して Stopped が記録済みのときだけ成功とする。それ以外は `INTERNAL` で fail-closed。
 //! - `kill`: 意図なしの `ProcessSignaler` で core の `oci_runtime::kill` を呼ぶ（終了は待たない）。
-//! - `stop`: SIGTERM を stop の意図つきで送り（SUP-9。supervisor が意図を記録してから届けるので、`always` /
+//! - `stop`: `StopRequest::signal`（既定 SIGTERM。CRI の stop_signal。#2668）を stop の意図つきで送り（SUP-9。supervisor が意図を記録してから届けるので、`always` /
 //!   `on-failure` / `unless-stopped` でも再起動されない）、`grace` まで Stopped への遷移を状態ストアで待ち、超えたら
-//!   SIGKILL を送って最長 [`STOP_KILL_WAIT`] 待つ。待っても Stopped にならなければ `TIMEOUT`。全体の上限は
-//!   `grace + 2 × (KillTimeout + 1 秒) + STOP_KILL_WAIT` で有界（REPAIR-5）。
+//!   SIGKILL を送って最長 [`STOP_KILL_WAIT`] 待つ。待っても Stopped にならなければ `TIMEOUT`。
+//!   上限は `StateStore` の呼び出し 1 回を `STATE_LOCK_TIMEOUT`（期限つきのポーリングは within + `STATE_LOCK_TIMEOUT`）、
+//!   signaler の呼び出し 1 回を `KillTimeout` + `LAUNCHER_REPLY_GRACE` と数えて `grace + 42 秒`
+//!   （入口の読み取り 5 + 送信 11 + 読み取り 5 + 送信 11 + 待ち 10。REPAIR-5・#3143）。
+//! - `stop_within`: force delete 用。stop 全体に予算を持たせ、各段を「残り ≥ その段の最悪の所要」のときだけ始める。
+//!   始められなければ固定文言の `TIMEOUT` で止め（状態は消さない。再試行で回収される）、`delete` 全体の最悪を
+//!   [`FORCE_DELETE_STOP_BUDGET`] で頭打ちにする（#3143）。
 //! - `state.json` の pid へ生の `kill(2)` を送る縮退は持たない（PID 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
 //!   状態ストアが `host_state_root()` を持たなければ signaler は `UNIMPLEMENTED` で失敗する。
 //!
@@ -40,21 +45,30 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    KillTimeout, LifecycleOp, OciRuntimeError, ProcessSignaler, kill,
+    KillTimeout, LAUNCHER_REPLY_GRACE, LifecycleOp, OciRuntimeError, ProcessSignaler, kill,
 };
+use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, KillRequest, Signal,
-    StateStore, StopRequest, TraitError,
+    ContainerId, ContainerLogPath, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
+    KillRequest, Signal, StateStore, StopRequest, TraitError,
 };
 use fandhe_container_supervisor::control::{production_signaler, production_stop_signaler};
 use fandhe_container_supervisor::start_client::{
-    SupervisorLaunch, production_deadline, start_with,
+    SupervisorLaunch, production_deadline, start_with_cri_log,
 };
 
 /// 追跡する supervisor の子プロセスの上限。超えたら（回収しても空きが無ければ）新しい起動を拒否する（無制限の蓄積を防ぐ）。
 pub const MAX_TRACKED_SUPERVISORS: usize = 1024;
 /// SIGKILL を送った後に Stopped への遷移を待つ上限（REPAIR-5）。
 pub const STOP_KILL_WAIT: Duration = Duration::from_secs(5);
+/// force delete の stop 全体に持たせる予算（REPAIR-5・CRI-2・#3143）。
+///
+/// `PLUGIN_FORCE_DELETE_DEADLINE`（47 秒）から、stop の前の状態の読み取り 1 回（`STATE_LOCK_TIMEOUT` 5 秒）と core の
+/// delete の最悪 20 秒（状態ロック 3 回 + exec 掃除 5 秒）を引いた値。stop を始めた時点からの相対値で、
+/// [`SupervisedLifecycle::stop_within`] が各段の admission に使う。
+pub const FORCE_DELETE_STOP_BUDGET: Duration = Duration::from_secs(22);
+/// 予算を使い切って stop の次の段を始められなかったときの固定文言。
+pub const MSG_STOP_BUDGET: &str = "container stop did not fit in the delete budget";
 /// Stopped への遷移を状態ストアで見る間隔。
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -71,9 +85,12 @@ pub const MSG_STOP_DEADLINE: &str = "container did not stop within the deadline"
 /// [`SupervisedLifecycle::start`] だけが呼ぶ。戻りの `Child` は呼び出し側が回収する（wait も kill もこの口では行わない）。
 pub trait SupervisorStarter: Send + Sync {
     /// `root`（状態ルートの絶対パス）の `id` を起動し、pid か構造化エラーを期限つきで受け取る。
+    ///
+    /// `log_path` は CRI ログの書き先（supervisor の `--cri-log-path`。CRI-2・SUP-4・#2671）。`None` は従来どおり。
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>);
 }
@@ -87,6 +104,7 @@ impl SupervisorStarter for ProductionStarter {
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
         let exe = match std::env::current_exe() {
@@ -103,7 +121,7 @@ impl SupervisorStarter for ProductionStarter {
             }
         };
         match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => start_with(&launch, root, id, production_deadline()),
+            Ok(launch) => start_with_cri_log(&launch, root, log_path, id, production_deadline()),
             Err(e) => (Err(e), None),
         }
     }
@@ -129,9 +147,10 @@ impl SupervisorStarter for FixedLaunchStarter {
     fn start(
         &self,
         root: &Path,
+        log_path: Option<&ContainerLogPath>,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        start_with(&self.launch, root, id, self.within)
+        start_with_cri_log(&self.launch, root, log_path, id, self.within)
     }
 }
 
@@ -215,10 +234,14 @@ impl SupervisedLifecycle {
     }
 
     /// supervisor を起動して Running を返す（D6）。
+    ///
+    /// `log_path` は CRI ログの書き先（`StartRequest::log_path`。CRI-2・SUP-4・#2671）。supervisor へ `--cri-log-path` で渡し、
+    /// supervisor が再検証して CRI 形式で追記する（特権ランチャー経由では supervisor が拒否する）。
     pub fn start(
         &self,
         store: &dyn StateStore,
         id: &ContainerId,
+        log_path: Option<&ContainerLogPath>,
     ) -> Result<ContainerStatus, TraitError> {
         self.reap();
         let Some(root) = store.host_state_root() else {
@@ -238,7 +261,7 @@ impl SupervisedLifecycle {
             }
             self.reserved.fetch_add(1, Ordering::SeqCst);
         }
-        let (result, child) = self.starter.start(root, id);
+        let (result, child) = self.starter.start(root, log_path, id);
         {
             // 予約を解放し、Child を得たなら同じロックの下で追跡枠へ移す。
             let mut children = self.lock_children();
@@ -272,16 +295,34 @@ impl SupervisedLifecycle {
         kill(store, recorder, &signaler, req, &KillTimeout::default()).map_err(to_trait_error)
     }
 
-    /// SIGTERM（stop の意図つき）→ `grace` 待ち → SIGKILL → 最長 [`STOP_KILL_WAIT`] 待ち。
+    /// `req.signal()`（既定 SIGTERM。stop の意図つき）→ `grace` 待ち → SIGKILL → 最長 [`STOP_KILL_WAIT`] 待ち。
+    ///
+    /// 予算なし（`StopContainer` の経路。厳密に数えても `grace + 42 秒` で `PLUGIN_RUNTIME_TIMEOUT` に収まる。#3143）。
     pub fn stop(
         &self,
         store: &dyn StateStore,
         recorder: &OpRecorder,
         req: &StopRequest,
     ) -> Result<ContainerStatus, TraitError> {
+        self.stop_within(store, recorder, req, None)
+    }
+
+    /// [`Self::stop`] に予算 `budget` を持たせたもの（force delete の経路は [`FORCE_DELETE_STOP_BUDGET`]。#3143）。
+    ///
+    /// 各段（状態の読み取り・シグナル送信）は、予算の残りがその段の最悪の所要以上のときだけ始める。
+    /// 始められない段があれば `Timeout`（固定文言 [`MSG_STOP_BUDGET`]）で止め、後続を送らない（fail-closed）。
+    /// `None` は予算なしで従来どおり。
+    pub fn stop_within(
+        &self,
+        store: &dyn StateStore,
+        recorder: &OpRecorder,
+        req: &StopRequest,
+        budget: Option<Duration>,
+    ) -> Result<ContainerStatus, TraitError> {
         self.reap();
+        let budget = StopBudget::start(budget);
         let id = req.id();
-        let status = read_status(store, id)?;
+        let status = read_status_admitted(store, id, &budget)?;
         match status.state() {
             // 冪等: 停止済みには何も送らない。
             ContainerState::Stopped => return Ok(status),
@@ -302,18 +343,56 @@ impl SupervisedLifecycle {
             }
         }
         let term = self.signalers.for_stop(store);
-        let sigterm = KillRequest::new(id.clone(), Signal::SIGTERM);
-        send_or_observe_exit(store, recorder, &term, &sigterm)?;
-        if let Some(s) = wait_stopped(store, id, req.grace())? {
+        let first = KillRequest::new(id.clone(), req.signal());
+        // 送信の失敗後の読み直しで Stopped を観測済みなら、追加の読み取りをせずそれを返す（#3143）。
+        if let Some(s) = send_or_observe_exit(store, recorder, &term, &first, &budget)? {
             return Ok(s);
         }
-        // 意図は SIGTERM の段階で記録済みのため、SIGKILL は意図なしの signaler で送る。
+        if let Some(s) = wait_stopped(store, id, req.grace(), &budget)? {
+            return Ok(s);
+        }
+        // 意図は最初のシグナルの段階で記録済みのため、SIGKILL は意図なしの signaler で送る。
         let plain = self.signalers.plain(store);
         let sigkill = KillRequest::new(id.clone(), Signal::SIGKILL);
-        send_or_observe_exit(store, recorder, &plain, &sigkill)?;
-        match wait_stopped(store, id, STOP_KILL_WAIT)? {
+        if let Some(s) = send_or_observe_exit(store, recorder, &plain, &sigkill, &budget)? {
+            return Ok(s);
+        }
+        match wait_stopped(store, id, STOP_KILL_WAIT, &budget)? {
             Some(s) => Ok(s),
             None => Err(TraitError::new(ErrorCode::Timeout, MSG_STOP_DEADLINE)),
+        }
+    }
+}
+
+/// `stop_within` の予算。stop を始めた時点からの期限を持ち、各段を「残り ≥ その段の最悪の所要」のときだけ許す（#3143）。
+///
+/// `deadline` が `None` なら予算なし（常に許す）。
+struct StopBudget {
+    deadline: Option<Instant>,
+}
+
+/// 状態の読み取り 1 回の最悪の所要（`StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT`）。
+const GET_NEED: Duration = STATE_LOCK_TIMEOUT;
+/// シグナル送信 1 段の最悪の所要: core の `kill` の中の `get`（`STATE_LOCK_TIMEOUT`）+ signaler の期限
+/// （`KillTimeout::DEFAULT` + `LAUNCHER_REPLY_GRACE`）。
+const KILL_NEED: Duration = STATE_LOCK_TIMEOUT
+    .saturating_add(KillTimeout::DEFAULT)
+    .saturating_add(LAUNCHER_REPLY_GRACE);
+
+impl StopBudget {
+    fn start(budget: Option<Duration>) -> Self {
+        Self {
+            deadline: budget.and_then(|b| Instant::now().checked_add(b)),
+        }
+    }
+
+    /// 残りが `need` 以上なら許す。足りなければ固定文言の `Timeout`。
+    fn admit(&self, need: Duration) -> Result<(), TraitError> {
+        match self.deadline {
+            Some(d) if d.saturating_duration_since(Instant::now()) < need => {
+                Err(TraitError::new(ErrorCode::Timeout, MSG_STOP_BUDGET))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -329,16 +408,32 @@ fn read_status(store: &dyn StateStore, id: &ContainerId) -> Result<ContainerStat
         .map(|r| r.status().clone())
 }
 
+/// 予算の許す範囲で状態を 1 回読む（`StateStore` の呼び出し 1 回 = `STATE_LOCK_TIMEOUT` を数える。#3143）。
+fn read_status_admitted(
+    store: &dyn StateStore,
+    id: &ContainerId,
+    budget: &StopBudget,
+) -> Result<ContainerStatus, TraitError> {
+    budget.admit(GET_NEED)?;
+    read_status(store, id)
+}
+
 /// シグナルを 1 回送る。直前に終了していて core が `FAILED_PRECONDITION` を返したときは、記録を読み直し
 /// Stopped ならそれを成功として扱う（stop の競合）。それ以外の失敗はコードを保ったまま返す。
+///
+/// 送信の前に [`KILL_NEED`] を、失敗後の読み直しの前に [`GET_NEED`] を予算に照らす。読み直しを許されなければ
+/// 元の失敗をそのまま返す（#3143）。
+/// 戻り値の `Some` は読み直しで観測済みの Stopped（呼び出し元は追加の読み取りなしでそれを返す）。
 fn send_or_observe_exit(
     store: &dyn StateStore,
     recorder: &OpRecorder,
     signaler: &Arc<dyn ProcessSignaler>,
     req: &KillRequest,
-) -> Result<(), TraitError> {
+    budget: &StopBudget,
+) -> Result<Option<ContainerStatus>, TraitError> {
+    budget.admit(KILL_NEED)?;
     match kill(store, recorder, signaler, req, &KillTimeout::default()) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(None),
         Err(e) => {
             let e = to_trait_error(e);
             // 直前に終了した場合、core は FAILED_PRECONDITION を返し、本番の制御チャネルは supervisor が
@@ -346,9 +441,11 @@ fn send_or_observe_exit(
             if matches!(
                 e.code(),
                 ErrorCode::FailedPrecondition | ErrorCode::Unavailable
-            ) && read_status(store, req.id()).is_ok_and(|s| s.state() == ContainerState::Stopped)
+            ) && let Ok(s) = read_status_admitted(store, req.id(), budget)
+                && s.state() == ContainerState::Stopped
             {
-                return Ok(());
+                // 観測済みの Stopped を呼び出し元へ返し、追加の読み取りを省く。
+                return Ok(Some(s));
             }
             Err(e)
         }
@@ -356,14 +453,18 @@ fn send_or_observe_exit(
 }
 
 /// `within` まで状態ストアを見て、Stopped になれば状態を返す（`within` が 0 なら 1 回だけ見る。REPAIR-5）。
+///
+/// 期限つきのポーリングの最悪は `within + STATE_LOCK_TIMEOUT`（最後の読み取りが期限の直前に始まりうる）。
+/// 各読み取りは予算に照らして許されたときだけ出す（#3143）。
 fn wait_stopped(
     store: &dyn StateStore,
     id: &ContainerId,
     within: Duration,
+    budget: &StopBudget,
 ) -> Result<Option<ContainerStatus>, TraitError> {
     let deadline = Instant::now().checked_add(within);
     loop {
-        let status = read_status(store, id)?;
+        let status = read_status_admitted(store, id, budget)?;
         if status.state() == ContainerState::Stopped {
             return Ok(Some(status));
         }

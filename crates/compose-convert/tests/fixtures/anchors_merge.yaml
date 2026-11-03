@@ -1,0 +1,39 @@
+x-common: &common
+  restart: always
+  environment:
+    LOG: info
+  labels:
+    tier: base
+
+x-a: &a
+  image: img-a
+  user: from-a
+
+x-b: &b
+  image: img-b
+  user: from-b
+  tty: true
+
+x-nested: &nested
+  <<: *common
+  stop_signal: SIGINT
+
+x-img: &img busybox:1.36
+x-ports: &ports
+  - "8080:80"
+
+services:
+  web:
+    <<: *common
+    restart: "no"
+    flag: yes
+  api:
+    command: serve
+    <<: *common
+  worker:
+    <<: [*a, *b]
+  db:
+    <<: *nested
+  cache:
+    image: *img
+    ports: *ports

@@ -395,7 +395,7 @@ mod tests {
             Ok("orphan") => {
                 let exe = std::env::current_exe().unwrap();
                 let grandchild = Command::new(exe)
-                    .args(["--exact", HELPER, "--nocapture", "--test-threads=1"])
+                    .args(["--exact", HELPER, "--no-capture", "--test-threads=1"])
                     .env(ENV_MODE, "sleep")
                     .stdin(Stdio::null())
                     .spawn();
@@ -410,7 +410,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         run_capture(
             &exe,
-            &["--exact", HELPER, "--nocapture", "--test-threads=1"],
+            &["--exact", HELPER, "--no-capture", "--test-threads=1"],
             &[(ENV_MODE, mode)],
             timeout,
             max,
@@ -439,7 +439,7 @@ mod tests {
         let e = run_capture_in(
             &READERS,
             &exe,
-            &["--exact", HELPER, "--nocapture", "--test-threads=1"],
+            &["--exact", HELPER, "--no-capture", "--test-threads=1"],
             &[(ENV_MODE, "orphan")],
             timeout,
             65536,

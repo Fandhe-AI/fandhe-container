@@ -11,7 +11,7 @@ plugin 境界の UDS 受付（`crates/plugin/src/transport.rs` の `UdsListener:
 ## 実行
 
 ```bash
-cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_macos_peer_uid_after_client_close_probe --nocapture
+cargo test -p fandhe-container-plugin --test peer_auth -- --ignored plug12_macos_peer_uid_after_client_close_probe --no-capture
 sw_vers
 uname -m
 git rev-parse HEAD

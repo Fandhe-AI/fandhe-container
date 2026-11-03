@@ -43,10 +43,13 @@
 //!
 //! # ルールハンドルの前提
 //!
-//! ハンドル取得経路（NLM_F_ECHO・GETRULE dump）は未実装（`nftables_rules::rule` の未実装範囲）のため、
-//! kernel のテーブルごとの採番（`nf_tables_alloc_handle` が `++table->hgenerator`）を前提に、新規
-//! テーブルへ chain → rule の順で作ったルールのハンドルを [`EXPECTED_RULE_HANDLE`] とする。
-//! 前提が外れた場合は削除バッチが ENOENT で失敗するので、その旨を名指しして失敗する（fail-closed）。
+//! ルールは `RuleCreate::build_echo`（`NLM_F_ECHO`）で投入し、ACK 判定が回収した echo 応答のハンドル
+//! （`NftBatchAck::rule_handle`。NET-3・#2839）で削除する。あわせて kernel のテーブルごとの採番
+//! （`nf_tables_alloc_handle` が `++table->hgenerator`）の想定どおり、新規テーブルへ chain → rule の順で
+//! 作ったルールのハンドルが [`EXPECTED_RULE_HANDLE`] に一致することを照合する（外れたら名指しして失敗する）。
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -84,13 +87,14 @@ mod linux {
         LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder, RTM_GETLINK,
         RTM_NEWLINK, RouteNextHop, RouteSpec,
     };
+    use fandhe_container_net::network::{PortProtocol, PortPublish, published_dnat_listeners};
     use fandhe_container_net::nftables_batch::{
         BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NetlinkNetfilterSocket, NfInetHook,
         NftBatchOutcome, NftBatchPosition, NftFamily, NftName, TableCreate, TableDelete,
     };
     use fandhe_container_net::nftables_rules::{
         NftCmp, NftDataValue, NftImmediate, NftNat, NftPayload, NftRegister, NftRuleExprs,
-        NftRuleHandle, RuleCreate, RuleDelete,
+        RuleCreate, RuleDelete, RuleDump,
     };
 
     /// router の外側アドレスで公開するポート（DNAT 前の宛先ポート）。
@@ -109,6 +113,7 @@ mod linux {
     const RE: &str = "dre0";
     const EX: &str = "dex0";
     const OK_PREFIX: &str = "nftables_dnat_privileged: dnat verified";
+    const LISTENER_OK_PREFIX: &str = "nftables_dnat_privileged: listener dump verified";
     const UDP_PROTO: u8 = 17;
 
     fn timeout() -> Duration {
@@ -208,8 +213,7 @@ mod linux {
             match child.try_wait().expect("wait router") {
                 Some(st) => std::process::exit(st.code().unwrap_or(1)),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!("nftables_dnat_privileged: router did not finish before deadline");
                     std::process::exit(1);
                 }
@@ -384,8 +388,7 @@ mod linux {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            crate::reap::reap_on_drop(&mut self.child);
         }
     }
 
@@ -472,13 +475,15 @@ mod linux {
             .as_deref()
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
-        let ok = Command::new("unshare")
-            .arg("--help")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let ok = crate::reap::run_within(
+            Command::new("unshare")
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            crate::reap::reap_within(),
+        )
+        .inspect_err(|e| eprintln!("precondition probe: {e}"))
+        .is_ok_and(|s| s.success());
         assert!(ok, "util-linux `unshare` is required; see AGENTS.md");
     }
 
@@ -662,16 +667,25 @@ mod linux {
         let rule = RuleCreate::new(NftFamily::Ipv4, table.clone(), chain.clone(), dnat_exprs());
         let limit = timeout();
         let started = Instant::now();
-        guard
+        let installed = guard
             .socket
             .send_batch(limit, |b| {
                 b.push_with(|seq| create_table.build(seq))?;
                 b.push_with(|seq| create_chain.build(seq))?;
-                b.push_with(|seq| rule.build(seq))?;
+                b.push_with(|seq| rule.build_echo(seq))?;
                 Ok(())
             })
             .expect("install dnat rule (needs nf_tables, nft_chain_nat, nft_nat, nf_nat)");
         assert!(started.elapsed() < limit, "batch exceeded {limit:?}");
+        // echo 応答のハンドル（本体の添字 2 = rule。table・chain は echo を要求していない）。
+        let handle = installed.rule_handle(2).expect("echoed rule handle");
+        assert_eq!(installed.rule_handle(0), None, "table has no echo");
+        assert_eq!(installed.rule_handle(1), None, "chain has no echo");
+        assert_eq!(
+            handle.get(),
+            EXPECTED_RULE_HANDLE,
+            "the kernel is expected to assign handle 1 to the chain and 2 to the first rule of a new table (nf_tables_alloc_handle)"
+        );
 
         // 3. 投入後: container の CONT_PORT に届く（送信元は変換されない）。AC1。
         let port_after = external_sends(&mut external, &mut used_ports);
@@ -684,7 +698,6 @@ mod linux {
         );
 
         // 4. ハンドル指定で削除する。AC2。
-        let handle = NftRuleHandle::new(EXPECTED_RULE_HANDLE).expect("handle");
         let delete = RuleDelete::new(NftFamily::Ipv4, table.clone(), chain.clone(), handle);
         guard
             .socket
@@ -692,11 +705,7 @@ mod linux {
                 b.push_with(|seq| delete.build(seq))?;
                 Ok(())
             })
-            .unwrap_or_else(|e| {
-                panic!(
-                    "delete by handle {EXPECTED_RULE_HANDLE} failed: {e}; the test assumes the kernel assigns handle 1 to the chain and 2 to the first rule of a new table (nf_tables_alloc_handle)"
-                )
-            });
+            .unwrap_or_else(|e| panic!("delete by echoed handle {} failed: {e}", handle.get()));
 
         // 5. 削除後: 再び router 自身に届く（DNAT が外れた直接の証拠）。
         // 3 と異なる送信元ポートで送るため、3 で DNAT 済みの conntrack エントリは適用されない。
@@ -723,9 +732,73 @@ mod linux {
         assert_eq!(f.errno(), 2, "{err}");
         assert_eq!(f.code(), NetErrorCode::NotFound, "{err}");
 
+        // 7. 公開の前の DNAT dump（NET-3・#3063）。
+        let listeners = listener_dump_scenario(&guard.socket, limit);
+
         drop(guard);
         println!(
-            "{OK_PREFIX} before={before} after={after} removed={removed} handle={EXPECTED_RULE_HANDLE} (NET-11)"
+            "{OK_PREFIX} before={before} after={after} removed={removed} handle={} (NET-11)",
+            handle.get()
         );
+        println!("{LISTENER_OK_PREFIX} listeners={listeners} conflict=AlreadyExists (NET-3)");
+    }
+
+    /// NET-3・#3063: `fandhe_net_*` テーブルの DNAT だけを dump で拾い、接頭辞のないテーブルの同じ DNAT は
+    /// 拾わないこと、そしてカーネルが `NFTA_NAT_FLAGS`（`MAP_IPS | PROTO_SPECIFIED`）つきで返す実際の応答を
+    /// 認識できることを具体値で照合する。別テーブルへの同じ受け口の公開は衝突として検出でき、
+    /// 衝突を検出した側のテーブルにルールは増えない。隔離 netns の中に閉じ、終了時に netns ごと消える。
+    /// 戻り値は拾った受け口の件数（成功行に載せる）。
+    fn listener_dump_scenario(nft: &NetlinkNetfilterSocket, limit: Duration) -> usize {
+        let chain = nft_name("prerouting");
+        let base = BaseChain {
+            chain_type: ChainType::Nat,
+            hook: NfInetHook::PreRouting,
+            priority: NF_IP_PRI_NAT_DST,
+        };
+        let ita = nft_name("fandhe_net_ita");
+        let itb = nft_name("fandhe_net_itb");
+        let plain = nft_name("fandhe_dnat_plain");
+        nft.send_batch(limit, |b| {
+            for t in [&ita, &itb, &plain] {
+                let ct = TableCreate::new(NftFamily::Ipv4, t.clone()).exclusive();
+                b.push_with(|seq| ct.build(seq))?;
+                let cc = ChainCreate::base(NftFamily::Ipv4, t.clone(), chain.clone(), base)?;
+                b.push_with(|seq| cc.build(seq))?;
+            }
+            // ita と、接頭辞のない plain にだけ同じ DNAT を入れる。itb は空のまま。
+            for t in [&ita, &plain] {
+                let r = RuleCreate::new(NftFamily::Ipv4, t.clone(), chain.clone(), dnat_exprs());
+                b.push_with(|seq| r.build(seq))?;
+            }
+            Ok(())
+        })
+        .expect("install listener-dump tables");
+
+        let found = published_dnat_listeners(nft, limit).expect("dump fandhe_net listeners");
+        assert_eq!(
+            found.len(),
+            1,
+            "only the fandhe_net_ita rule is a published listener"
+        );
+        let l = found.listeners().first().copied().expect("one listener");
+        assert_eq!(l.protocol(), PortProtocol::Udp);
+        assert_eq!(l.host_addr(), ROUTER_OUTER_ADDR);
+        assert_eq!(l.host_port(), HOST_PORT);
+        // 同じ受け口を fandhe_net_itb へ公開しようとすると衝突として検出できる。
+        let again = PortPublish::new(PortProtocol::Udp, ROUTER_OUTER_ADDR, HOST_PORT, CONT_PORT)
+            .expect("port publish");
+        assert!(found.contains(&again), "same listener must conflict");
+        let other = PortPublish::new(PortProtocol::Tcp, ROUTER_OUTER_ADDR, HOST_PORT, CONT_PORT)
+            .expect("port publish");
+        assert!(
+            !found.contains(&other),
+            "different protocol must not conflict"
+        );
+        // 衝突を検出した側（itb）には何も投入されていない。
+        let itb_rules = nft
+            .dump_rules(&RuleDump::new(NftFamily::Ipv4, itb), limit)
+            .expect("dump itb rules");
+        assert!(itb_rules.is_empty(), "itb must stay empty");
+        found.len()
     }
 }

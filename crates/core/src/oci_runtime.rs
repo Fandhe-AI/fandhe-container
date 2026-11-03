@@ -5,7 +5,7 @@
 //! プロセス未起動の状態初期化 `create`（TASK-29.2）が実装済み。
 //! `start`（TASK-29.3）も実装済みで、起動は依存注入する `ProcessLauncher` に委ねる。本番 launcher
 //! `ProductionLauncher`（`launcher.rs`。Linux。#1816）は実装済みで、`confirm_no_process`（#1817）は launcher 自身が
-//! 起動した範囲の確認まで実装済み（別プロセスで起動した残存の確認は未対応）。supervisor の呼び出しスレッドの再構成（#1819）は未実装である（REPAIR-3）。
+//! 起動した範囲の確認まで実装済み（別プロセスで起動した残存の確認は未対応）。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み（#1819）。restart の再 launch は supervisor が呼び出しスレッドで直接行う（#2043）。
 //! 実プロセスで通す実機前提の結合試験は `tests/production_launcher.rs`（#1818。`-- --ignored`。実機での実行結果の記録は #1621）。
 //! `kill`（TASK-30.1。送信は依存注入する `ProcessSignaler` に委ね、本番実装は supervisor〔TASK-157〕待ち）
 //! も実装済み。`delete`（TASK-30.2・TASK-30.3）は cgroup（依存注入する `ContainerCgroupRemover`。Linux の
@@ -41,9 +41,14 @@ mod image_refs;
 mod image_rootfs;
 mod kill;
 mod launch;
+mod launch_options;
 mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
+mod namespace_join;
+#[cfg(target_os = "linux")]
+mod netns_attach;
+mod network_mode;
 mod resources;
 mod start;
 mod sysfs_mount;
@@ -52,7 +57,8 @@ mod working_dir;
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
-    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
+    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, BindPropagation,
+    audit_bind_mount_error,
 };
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,
@@ -99,10 +105,15 @@ pub use launch::{
     RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
     pin_bundle_rootfs_audited,
 };
+pub use launch_options::{LaunchIpcMode, LaunchOptions};
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
+pub use namespace_join::NamespaceJoin;
+#[cfg(target_os = "linux")]
+pub use netns_attach::{AttachableNamespaces, NetnsAttachHook};
+pub use network_mode::{EffectiveNetwork, LaunchNetworkMode};
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

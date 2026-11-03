@@ -38,7 +38,7 @@
 //!
 //! エラーは `SysError` のまま返し、縮退しない（`ENOSYS`・`EINVAL`・`EPERM` を区別できる）。
 
-use super::{ENOSPC, SysError, consts, last_error, syscall};
+use super::{ENOSPC, SysError, consts, last_error};
 use crate::cgroups::{DEVICE_PROGRAM_LICENSE, DeviceProgram};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
@@ -58,6 +58,10 @@ pub(crate) const DEVICE_PROG_TYPE: u32 = consts::BPF_PROG_TYPE_CGROUP_DEVICE;
 
 /// アタッチ・問い合わせの attach type（`BPF_CGROUP_DEVICE`）。用途は [`DEVICE_PROG_TYPE`] と同じ。
 pub(crate) const DEVICE_ATTACH_TYPE: u32 = consts::BPF_CGROUP_DEVICE;
+
+// 以下の 3 構造体は `libc` 0.2.189 に `union bpf_attr` が無く、`libc` との機械照合の対象外（一次情報は
+// include/uapi/linux/bpf.h・Linux v6.12。理由は `sys.rs` 最上位の `libc_abi` の doc。#1849・#1837）。
+// サイズ（72・32・64）とフィールドのオフセットは、本ファイルの試験が uapi の値で固定する。
 
 /// `union bpf_attr` の `BPF_PROG_LOAD` 用の先頭部分（72 バイト）。暗黙のパディングを作らず全バイトを
 /// 名前付きで持つ。
@@ -282,7 +286,7 @@ fn prog_load_raw(attr: &BpfProgLoadAttr) -> Result<OwnedFd, SysError> {
     // とき〕だけ。size 72 では `log_true_size` のオフセットに届かず、各 cnt は 72 バイトの外にあって
     // カーネルが 0 で埋めるため、どちらの条件も成り立たない）。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(consts::BPF_PROG_LOAD),
             std::ptr::from_ref(attr),
@@ -365,7 +369,7 @@ pub(crate) fn bpf_prog_attach_cgroup_device(
     // SAFETY: `attr` は呼び出しの間生存する `#[repr(C)]` の 32 バイトで、size 引数も同じ大きさ。
     // fd は生存中の借用が指す。ポインタ類を含まず、カーネルは複写するだけで保持しない。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(consts::BPF_PROG_ATTACH),
             std::ptr::from_ref(&attr),
@@ -389,7 +393,7 @@ pub(crate) fn bpf_prog_query_cgroup_device(
     // 構造体の内側（v6.12 の `__cgroup_bpf_query`。cgroup の問い合わせは `revision` を書かず、
     // `prog_attach_flags` は 0〔NULL〕なので書かれない）。`ids` は呼び出しの間生存する。
     let rc = unsafe {
-        syscall(
+        ffi_syscall!(
             nr,
             i64::from(consts::BPF_PROG_QUERY),
             std::ptr::from_mut(&mut attr),

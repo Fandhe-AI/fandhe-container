@@ -116,7 +116,23 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
     allow(dead_code)
 )]
 pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
-    remove_at(path, 0)
+    remove_at(path, 0, &|| Ok(()))
+}
+
+/// `remove_tree_nofollow` に確認点 `check`（期限・取り消し。#3142）を足した版。エントリ 1 件を消す前に呼ぶ。
+// Linux の x86_64 / aarch64 は fd 起点の実装を使うため、本体は他のホストと試験からだけ呼ばれる。
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    allow(dead_code)
+)]
+pub(crate) fn remove_tree_nofollow_checked(
+    path: &Path,
+    check: &dyn Fn() -> Result<(), OciError>,
+) -> Result<(), OciError> {
+    remove_at(path, 0, check)
 }
 
 /// `path` のディレクトリ自体は残し、直下の全エントリを symlink を追従せず再帰削除する（OCI-2・TASK-53.2・#413）。
@@ -147,12 +163,17 @@ pub(crate) fn remove_dir_contents_nofollow(path: &Path) -> Result<(), OciError> 
     make_dir_removable(path, &meta)?;
     for entry in fs::read_dir(path).map_err(|e| map_fs_err(&e))? {
         let entry = entry.map_err(|e| map_fs_err(&e))?;
-        remove_at(&entry.path(), 1)?;
+        remove_at(&entry.path(), 1, &|| Ok(()))?;
     }
     Ok(())
 }
 
-fn remove_at(path: &Path, depth: usize) -> Result<(), OciError> {
+fn remove_at(
+    path: &Path,
+    depth: usize,
+    check: &dyn Fn() -> Result<(), OciError>,
+) -> Result<(), OciError> {
+    check()?;
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -170,7 +191,7 @@ fn remove_at(path: &Path, depth: usize) -> Result<(), OciError> {
     make_dir_removable(path, &meta)?;
     for entry in fs::read_dir(path).map_err(|e| map_fs_err(&e))? {
         let entry = entry.map_err(|e| map_fs_err(&e))?;
-        remove_at(&entry.path(), depth + 1)?;
+        remove_at(&entry.path(), depth + 1, check)?;
     }
     fs::remove_dir(path).map_err(|e| map_fs_err(&e))
 }

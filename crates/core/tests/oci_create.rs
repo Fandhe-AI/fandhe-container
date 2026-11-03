@@ -3,6 +3,12 @@
 //! 公開 API（`create`・`StateStore` トレイト）だけを crate の外から呼び、bundle 検証から
 //! `StateStore` への状態作成までの連携を具体値で確かめる。実機権限は不要で 3 OS の既定のテスト集合で動く。
 
+#[cfg(windows)]
+#[path = "support/reap.rs"]
+mod reap;
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -69,17 +75,22 @@ impl StateStore for MemStateStore {
 /// テストごとに一意な bundle ディレクトリ（終了時に削除）。
 struct Bundle {
     dir: PathBuf,
+    /// bundle の親（tmpfiles の flock 走査から守る。最後に drop される）。
+    _scratch: scratch_root::ScratchDir,
 }
 
 impl Bundle {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-core-create-it-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-create-it-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
         std::fs::create_dir_all(&dir).expect("create bundle dir");
-        Self { dir }
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn write_config(&self, v: &Value) {
@@ -372,12 +383,14 @@ fn sec1_create_rejects_junction_rootfs() {
     let b = Bundle::new("junction");
     let outside = Bundle::new("junction-outside");
     std::fs::create_dir(outside.dir.join("rootfs")).expect("outside rootfs");
-    let status = std::process::Command::new("cmd")
+    let mut mklink = std::process::Command::new("cmd");
+    mklink
         .args(["/C", "mklink", "/J"])
         .arg(b.dir.join("link"))
-        .arg(&outside.dir)
-        .output()
-        .expect("mklink")
+        .arg(&outside.dir);
+    // 期限なしの `output()` を避ける（REPAIR-5・#3409）。
+    let status = reap::output_within(&mut mklink, reap::reap_within())
+        .unwrap_or_else(|e| panic!("mklink /J: {e}"))
         .status;
     assert!(status.success(), "mklink /J failed");
     let mut cfg = valid_config();

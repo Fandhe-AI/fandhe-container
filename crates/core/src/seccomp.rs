@@ -1581,4 +1581,50 @@ mod bpf_tests {
             SeccompBuildError::UnsupportedArch
         );
     }
+
+    /// SEC-2・SEC-1・CORE-5（#2789）: `exec/sysfs.rs` の rbind 最上位の ro を保つ前提の固定。
+    /// 本番と同じ `build_filter_for_target_arch*` が `mount_setattr` と mount 系を `ERRNO(EPERM)`
+    /// （supervisor 経路は `USER_NOTIF`。応答は `-EPERM`）にし、ランタイムの許可 syscall は通すことを具体値で照合する。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec2_sysfs_ro_premise_native_filter_denies_mount_family_with_eperm() {
+        #[cfg(target_arch = "x86_64")]
+        const EXECVE: u32 = 59;
+        #[cfg(target_arch = "aarch64")]
+        const EXECVE: u32 = 221;
+
+        let t = table_for_target_arch().unwrap();
+        let errno = build_filter_for_target_arch().unwrap();
+        let notif = build_filter_for_target_arch_with(ErrnoDelivery::UserNotif).unwrap();
+        let audit = t.audit_arch().get();
+
+        match t.number_of(DeniedSyscall::MountSetattr) {
+            SyscallLookup::Present(n) => assert_eq!(n.get(), 442),
+            SyscallLookup::AbsentOnArch => panic!("mount_setattr must be present"),
+        }
+        let family = [
+            DeniedSyscall::Mount,
+            DeniedSyscall::Umount2,
+            DeniedSyscall::OpenTree,
+            DeniedSyscall::MoveMount,
+            DeniedSyscall::Fsopen,
+            DeniedSyscall::Fsconfig,
+            DeniedSyscall::Fsmount,
+            DeniedSyscall::Fspick,
+            DeniedSyscall::MountSetattr,
+        ];
+        for d in family {
+            let SyscallLookup::Present(n) = t.number_of(d) else {
+                panic!("{} must be present", d.name());
+            };
+            assert_eq!(eval(&errno, n.get(), audit), ERRNO_EPERM, "{}", d.name());
+            assert_eq!(eval(&notif, n.get(), audit), USER_NOTIF, "{}", d.name());
+        }
+        // 陽性対照: フィルタが全拒否ではなく、ランタイムの syscall は通す。
+        assert_eq!(eval(&errno, EXECVE, audit), ALLOW);
+        assert_eq!(eval(&notif, EXECVE, audit), ALLOW);
+    }
 }

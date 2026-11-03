@@ -127,6 +127,8 @@ fn sup12_task169_5_1_store_is_unimplemented_outside_linux() {
     use fandhe_container_supervisor::state::open_default_store;
     let root =
         std::env::temp_dir().join(format!("fandhe-sup-labels-nolinux-{}", std::process::id()));
+    // PID 再利用による前回の残骸を、存在しないことの照合の前に消す（#3374・REPAIR-12）。
+    let _ = std::fs::remove_dir_all(&root);
     let e = open_default_store(Some(root.clone())).err().unwrap();
     assert_eq!(e.code(), ErrorCode::Unimplemented);
     assert!(!root.exists());

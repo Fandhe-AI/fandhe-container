@@ -5,24 +5,28 @@
 //! 構造化ログへの出力は core の `OpRecorder` が担うが、cri は core へ依存しない（PLUG-1・CRI-7・CRI-8）
 //! ため、本モジュールが cri 内の型だけで完結するトレイトを定義する（`fandhe-container-net`・
 //! `fandhe-container-io` の `instrument` モジュールと同じ形）。core の記録器への接続は、core と cri の
-//! 両方に依存する上位 crate（`fandhe-container-plugin-cri`。TASK-108）に置く newtype アダプタが担い、
+//! 両方に依存し CRI の RPC を本番で呼ぶ crate（`fandhe-container-plugin-cri`。TASK-108）に置く newtype アダプタが担い
+//! （`docs/architecture.md` の「計装アダプタの配置」の原則）、
 //! `sample.kind().as_str()` を core の `OpName::new` へ、`sample.outcome()` / `sample.latency()` を
 //! `OpRecorder::record` へ写す。
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
-//!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - core の `OpRecorder` との接続: 本番経路は plugin-cri の `CoreCriRecorder` を注入済み（TASK-108）。
+//!   記録先を注入しないコンストラクタの既定は [`NoopCriOpRecorder`] で、何も出力されない
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`Status`・`Version`・`UpdateRuntimeConfig`・`ListImages`・`ImageStatus`・`PullImage`・`RecordStoreLoad` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
-//! [`CriOpSample`] は種別・結果・ステータスコード・レイテンシのみを持つ。要求の中身（`config`・labels・
+//! [`CriOpSample`] は種別・結果・ステータスコード・レイテンシと、レジストリの HTTP 状態の区分
+//! （[`RegistryHttpClass`]。固定語彙の列挙で、生の HTTP 状態・URL・資格情報は持たない。#2966）のみを持つ。要求の中身（`config`・labels・
 //! annotations・サンドボックス ID）とエラー文言は持たせない（`.claude/rules/security.md`）。
 
 use std::time::{Duration, Instant};
 
 use tonic::{Code, Status};
+
+use crate::error::registry_http_status_from_metadata;
 
 /// 計装対象の CRI 操作の種別（REPAIR-4）。
 ///
@@ -54,12 +58,52 @@ pub enum CriOpKind {
     ListContainers,
     /// `RuntimeService.ContainerStatus` 1 回（読み取り専用の状態照会。CRI-1・TASK-58.3）。
     ContainerStatus,
+    /// `RuntimeService.Status` 1 回（待ちのない準備状態の報告。CRI-1・CRI-2・#2830）。
+    Status,
+    /// `RuntimeService.Version` 1 回（定数の応答。CRI-1・#2896）。
+    Version,
+    /// `RuntimeService.UpdateRuntimeConfig` 1 回（pod CIDR の検証と記録。CRI-1・CRI-2・#2896）。
+    UpdateRuntimeConfig,
     /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
     ListImages,
     /// `ImageService.ImageStatus` 1 回（ローカルキャッシュの単一参照解決。CRI-4・TASK-61.2）。
     ImageStatus,
     /// `ImageService.PullImage` 1 回（レジストリからのイメージ取り込み。CRI-4・OCI-1・TASK-61.3）。
     PullImage,
+    /// 起動時の記録の再採用の 1 件（記録ストアからの読み込みと復号。CRI-2・REPAIR-4・#2935）。
+    RecordStoreLoad,
+    /// shim v2 の ttrpc 要求の dispatch 1 回（サービス呼び出しの結果。CRI-5・TASK-62.1・MS-7・REPAIR-4）。
+    ShimV2Dispatch,
+    /// shim v2 の ttrpc の不正フレーム・不正な要求の拒否 1 回（CRI-5・TASK-62.1・MS-7・REPAIR-4）。
+    ShimV2Frame,
+    /// shim v2 の ttrpc の読み書き失敗・期限切れ 1 回（CRI-5・TASK-62.1・MS-7・REPAIR-4・REPAIR-5）。
+    ShimV2Io,
+    /// shim v2 起動バイナリの `start` 1 回（socket の用意からデーモンの準備完了まで。CRI-5・TASK-62.7.1・REPAIR-4）。
+    ShimV2Start,
+    /// shim v2 起動バイナリの `delete` 1 回（socket の片付け。CRI-5・TASK-62.7.1・REPAIR-4）。
+    ShimV2Delete,
+    /// `RuntimeService.Exec` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    Exec,
+    /// `RuntimeService.Attach` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    Attach,
+    /// `RuntimeService.PortForward` 1 回（検証とストリーミング URL の発行。CRI-6・TASK-63.1）。
+    PortForward,
+    /// Attach ストリーミングの 1 セッション（接続から終了まで。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachSession,
+    /// Attach の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachStreamRead,
+    /// Attach の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.3・REPAIR-4）。
+    AttachStreamWrite,
+    /// Exec ストリーミングの 1 セッション（接続から終了まで。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecSession,
+    /// Exec の backend 出力（stdout / stderr）の読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecStreamRead,
+    /// Exec の backend stdin への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecStreamWrite,
+    /// Exec の通信路（クライアント接続）からの読み取り（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecConnRead,
+    /// Exec の通信路（クライアント接続）への書き込み（セッション内の成功 / 失敗。CRI-6・TASK-63.2・REPAIR-4）。
+    ExecConnWrite,
 }
 
 impl CriOpKind {
@@ -77,9 +121,29 @@ impl CriOpKind {
             CriOpKind::RemoveContainer => "cri.remove_container",
             CriOpKind::ListContainers => "cri.list_containers",
             CriOpKind::ContainerStatus => "cri.container_status",
+            CriOpKind::Status => "cri.status",
+            CriOpKind::Version => "cri.version",
+            CriOpKind::UpdateRuntimeConfig => "cri.update_runtime_config",
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
+            CriOpKind::RecordStoreLoad => "cri.record_store_load",
+            CriOpKind::ShimV2Dispatch => "cri.shim_v2.dispatch",
+            CriOpKind::ShimV2Frame => "cri.shim_v2.frame",
+            CriOpKind::ShimV2Io => "cri.shim_v2.io",
+            CriOpKind::ShimV2Start => "cri.shim_v2.start",
+            CriOpKind::ShimV2Delete => "cri.shim_v2.delete",
+            CriOpKind::Exec => "cri.exec",
+            CriOpKind::Attach => "cri.attach",
+            CriOpKind::PortForward => "cri.port_forward",
+            CriOpKind::AttachSession => "cri.attach.session",
+            CriOpKind::AttachStreamRead => "cri.attach.stream_read",
+            CriOpKind::AttachStreamWrite => "cri.attach.stream_write",
+            CriOpKind::ExecSession => "cri.exec.session",
+            CriOpKind::ExecStreamRead => "cri.exec.stream_read",
+            CriOpKind::ExecStreamWrite => "cri.exec.stream_write",
+            CriOpKind::ExecConnRead => "cri.exec.conn_read",
+            CriOpKind::ExecConnWrite => "cri.exec.conn_write",
         }
     }
 }
@@ -135,6 +199,89 @@ pub fn code_name(code: Code) -> &'static str {
     }
 }
 
+/// レジストリの HTTP 状態の区分（固定の語彙。#2966・REPAIR-4・CRI-3・OCI-1）。
+///
+/// gRPC では 401/403 がどちらも `PERMISSION_DENIED`、429 と 5xx がどちらも `UNAVAILABLE` に潰れるため、
+/// 記録でそれらを見分ける目的で持つ。生の値は持たず、plugin-cri が
+/// [`op_name`](Self::op_name) を oci 専用の記録器へ失敗として記録する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RegistryHttpClass {
+    /// 401。
+    Unauthorized,
+    /// 403。
+    Forbidden,
+    /// 404。
+    NotFound,
+    /// 408。
+    RequestTimeout,
+    /// 429（rate limit）。
+    RateLimited,
+    /// 上記以外の 400..=499。
+    OtherClientError,
+    /// 500..=599。
+    ServerError,
+    /// 100..=399。
+    Other,
+}
+
+impl RegistryHttpClass {
+    /// 全区分（宣言順）。
+    pub const ALL: [RegistryHttpClass; 8] = [
+        Self::Unauthorized,
+        Self::Forbidden,
+        Self::NotFound,
+        Self::RequestTimeout,
+        Self::RateLimited,
+        Self::OtherClientError,
+        Self::ServerError,
+        Self::Other,
+    ];
+
+    /// HTTP 状態から区分を導く。100..=599 の外は `None`（数えない。fail-closed）。
+    pub fn from_http_status(status: u16) -> Option<Self> {
+        match status {
+            401 => Some(Self::Unauthorized),
+            403 => Some(Self::Forbidden),
+            404 => Some(Self::NotFound),
+            408 => Some(Self::RequestTimeout),
+            429 => Some(Self::RateLimited),
+            400..=499 => Some(Self::OtherClientError),
+            500..=599 => Some(Self::ServerError),
+            100..=399 => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// 区分の固定の接尾辞（`[a-z_]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::RequestTimeout => "request_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::OtherClientError => "client_error",
+            Self::ServerError => "server_error",
+            Self::Other => "other",
+        }
+    }
+
+    /// 記録器へ渡す完全な操作名（core の `OpName` 規則 `[A-Za-z0-9._-]`・64 バイト以下に収まる固定文字列）。
+    pub fn op_name(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "cri.pull_image.registry_http.unauthorized",
+            Self::Forbidden => "cri.pull_image.registry_http.forbidden",
+            Self::NotFound => "cri.pull_image.registry_http.not_found",
+            Self::RequestTimeout => "cri.pull_image.registry_http.request_timeout",
+            Self::RateLimited => "cri.pull_image.registry_http.rate_limited",
+            Self::OtherClientError => "cri.pull_image.registry_http.client_error",
+            Self::ServerError => "cri.pull_image.registry_http.server_error",
+            Self::Other => "cri.pull_image.registry_http.other",
+        }
+    }
+}
+
 /// 1 回の操作の計測結果（固定サイズの値型。ヒープ確保なし）。
 ///
 /// 結果区分はステータスコードから導くため、「成功なのにエラーコード」のような食い違った値は作れない。
@@ -144,6 +291,7 @@ pub struct CriOpSample {
     kind: CriOpKind,
     code: Code,
     latency: Duration,
+    registry_http: Option<RegistryHttpClass>,
 }
 
 impl CriOpSample {
@@ -153,7 +301,19 @@ impl CriOpSample {
             kind,
             code,
             latency,
+            registry_http: None,
         }
+    }
+
+    /// レジストリの HTTP 状態の区分を付ける（#2966）。
+    pub fn with_registry_http(mut self, class: RegistryHttpClass) -> Self {
+        self.registry_http = Some(class);
+        self
+    }
+
+    /// レジストリの HTTP 状態の区分。レジストリ由来の失敗（`PullImage`）以外は `None`。
+    pub fn registry_http(&self) -> Option<RegistryHttpClass> {
+        self.registry_http
     }
 
     /// 操作の種別。
@@ -219,28 +379,36 @@ impl<'a> CriOpTimer<'a> {
         }
     }
 
-    fn emit(&mut self, code: Code) {
+    fn emit(&mut self, code: Code, registry_http: Option<RegistryHttpClass>) {
         if self.done {
             return;
         }
         self.done = true;
-        let sample = CriOpSample::new(self.kind, code, self.started.elapsed());
+        let mut sample = CriOpSample::new(self.kind, code, self.started.elapsed());
+        if let Some(class) = registry_http {
+            sample = sample.with_registry_http(class);
+        }
         self.recorder.record_cri_op(&sample);
     }
 
     /// RPC の結果に応じて確定する（`Ok` は `Code::Ok`、`Err` はその `Status` のコード。文言は読まない）。
     pub fn finish_with<T>(mut self, result: &Result<T, Status>) {
-        let code = match result {
-            Ok(_) => Code::Ok,
-            Err(status) => status.code(),
+        let (code, class) = match result {
+            Ok(_) => (Code::Ok, None),
+            // メタデータを付けるのは `PullError::from_oci` 経由だけで、他の RPC では常に `None`（#2966）。
+            Err(status) => (
+                status.code(),
+                registry_http_status_from_metadata(status.metadata())
+                    .and_then(RegistryHttpClass::from_http_status),
+            ),
         };
-        self.emit(code);
+        self.emit(code, class);
     }
 }
 
 impl Drop for CriOpTimer<'_> {
     fn drop(&mut self) {
-        self.emit(Code::Internal);
+        self.emit(Code::Internal, None);
     }
 }
 
@@ -284,7 +452,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 14] = [
+    const ALL_KINDS: [CriOpKind; 31] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -296,10 +464,88 @@ mod tests {
         CriOpKind::RemoveContainer,
         CriOpKind::ListContainers,
         CriOpKind::ContainerStatus,
+        CriOpKind::Status,
+        CriOpKind::Version,
+        CriOpKind::UpdateRuntimeConfig,
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
+        CriOpKind::RecordStoreLoad,
+        CriOpKind::ShimV2Start,
+        CriOpKind::ShimV2Delete,
+        CriOpKind::Exec,
+        CriOpKind::Attach,
+        CriOpKind::PortForward,
+        CriOpKind::AttachSession,
+        CriOpKind::AttachStreamRead,
+        CriOpKind::AttachStreamWrite,
+        CriOpKind::ExecSession,
+        CriOpKind::ExecStreamRead,
+        CriOpKind::ExecStreamWrite,
+        CriOpKind::ExecConnRead,
+        CriOpKind::ExecConnWrite,
     ];
+
+    /// REPAIR-4・CRI-3（#2966）: HTTP 状態から区分への写像（境界値）と語彙の健全性。
+    #[test]
+    fn repair4_registry_http_class_table() {
+        use RegistryHttpClass as C;
+        for (status, expected) in [
+            (99, None),
+            (100, Some(C::Other)),
+            (399, Some(C::Other)),
+            (400, Some(C::OtherClientError)),
+            (401, Some(C::Unauthorized)),
+            (403, Some(C::Forbidden)),
+            (404, Some(C::NotFound)),
+            (408, Some(C::RequestTimeout)),
+            (429, Some(C::RateLimited)),
+            (499, Some(C::OtherClientError)),
+            (500, Some(C::ServerError)),
+            (599, Some(C::ServerError)),
+            (600, None),
+        ] {
+            assert_eq!(C::from_http_status(status), expected, "status={status}");
+        }
+        let mut names = std::collections::HashSet::new();
+        for c in C::ALL {
+            let name = c.op_name();
+            assert!(names.insert(name), "duplicate {name}");
+            assert!(name.len() <= 64);
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            );
+            assert_eq!(name, format!("cri.pull_image.registry_http.{}", c.as_str()));
+        }
+        assert_eq!(names.len(), 8);
+    }
+
+    /// REPAIR-4・CRI-3（#2966）: timer は失敗の Status のメタデータから区分を導く。
+    #[test]
+    fn repair4_timer_records_registry_http_class() {
+        use tonic::metadata::{MetadataMap, MetadataValue};
+        let with = |http: u16| {
+            let mut md = MetadataMap::new();
+            md.insert(
+                crate::error::REGISTRY_HTTP_STATUS_METADATA_KEY,
+                MetadataValue::from(http),
+            );
+            Status::with_metadata(Code::Unavailable, "x", md)
+        };
+        let run = |r: Result<(), Status>| {
+            let rec = Collect::default();
+            CriOpTimer::start(&rec, CriOpKind::PullImage).finish_with(&r);
+            rec.items()[0].registry_http()
+        };
+        assert_eq!(run(Err(with(429))), Some(RegistryHttpClass::RateLimited));
+        assert_eq!(run(Err(with(503))), Some(RegistryHttpClass::ServerError));
+        assert_eq!(run(Err(Status::unavailable("x"))), None);
+        assert_eq!(run(Ok(())), None);
+        let rec = Collect::default();
+        drop(CriOpTimer::start(&rec, CriOpKind::PullImage));
+        assert_eq!(rec.items()[0].registry_http(), None);
+    }
 
     /// REPAIR-4: 操作名は安定した固定文字列。
     #[test]
@@ -321,6 +567,12 @@ mod tests {
         assert_eq!(CriOpKind::RemoveContainer.as_str(), "cri.remove_container");
         assert_eq!(CriOpKind::ListContainers.as_str(), "cri.list_containers");
         assert_eq!(CriOpKind::ContainerStatus.as_str(), "cri.container_status");
+        assert_eq!(CriOpKind::Status.as_str(), "cri.status");
+        assert_eq!(CriOpKind::Version.as_str(), "cri.version");
+        assert_eq!(
+            CriOpKind::UpdateRuntimeConfig.as_str(),
+            "cri.update_runtime_config"
+        );
         assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
         assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
         assert_eq!(CriOpKind::PullImage.as_str(), "cri.pull_image");

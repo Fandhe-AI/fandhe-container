@@ -10,6 +10,35 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# 試験専用の故障注入（attach の巻き戻しの特定の段を失敗させる。NET-1・REPAIR-3・#2971）。依存は増えない。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 network_attach_privileged が使う。
+[features]
+attach-fault-test-support = []
+# 試験専用: pasta のバイナリ検証で anchor より上の所有者・権限の検査を省く入口（`/tmp` が 1777 のため。NET-9・#1936）。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 pasta_binary が使う。依存は増えない。
+pasta-test-support = []
+# 試験専用: netns holder へ任意のバイト列と任意本数の fd を送る入口 `send_raw_for_test`（負の場面の試験用。NET-9・REPAIR-2・#3197）。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 netns_holder_process が使う。依存は増えない。
+netns-holder-test-support = []
+# 試験専用: dns-helper の起動元の後始末の期限（停止の猶予・SIGKILL 後の終了待ち）を短くする入口 `override_stop_timeouts_for_test`
+# （`launcher_killed_after_spawn_line` の否定確認の感度のため。NET-5・REPAIR-5・REPAIR-12・#3508）と、起動窓の回収全体の期限
+# `override_recover_timeout_for_test`（期限切れの Timeout と意図記録の保持の照合のため。#3559）。
+# リリースビルドで有効なら lib.rs の compile_error! で止める。結合試験 dns_helper_process が使う。依存は増えない。
+dns-helper-test-support = []
+
+[dev-dependencies]
+# core・supervisor・cli と同じ方式の自己参照（外部クレートの追加ではない）。dev-dependency は通常のビルドでは
+# 解決されないため、製品の既定ビルドでは feature は無効のまま。`required-features` は使わない（既定の
+# `cargo test` から結合試験が外れないようにするため）。
+fandhe-container-net = { path = ".", features = ["attach-fault-test-support", "pasta-test-support", "netns-holder-test-support", "dns-helper-test-support"] }
+
+# pasta のバイナリの検証（パスの表・偽の pasta を子として実行する --version の振る舞い。NET-9・PLUG-11・#1936）。
+# 自身を偽の pasta として再実行するため harness = false。root 不要で 3 OS の既定集合で実行する。
+[[test]]
+name = "pasta_binary"
+path = "tests/pasta_binary.rs"
+harness = false
+
 # bridge・veth の作成 → netns 移動 → up の実機結合試験（NET-11・TASK-136.3.2・#846）。libtest のスレッド実行と
 # 子の再入（--child）を分けるため harness = false。root と unshare --net が要る実機前提テストなので
 # -- --ignored 指定時のみ実行する（AGENTS.md）。
@@ -49,7 +78,8 @@ path = "tests/bridge_owner_token_privileged.rs"
 harness = false
 
 # コンテナ接続（netns 作成・pin、veth 作成、bridge 接続、peer の netns 移動）の実機結合試験（NET-1・TASK-139.2.1・#847）。
-# 子の再入（--inner）と root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+# 子の再入（--inner。プロセスをまたぐ回収の子モード --attach-child / --reclaim-child もこの実行ファイルの再入）と
+# root 前提の分離のため harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
 [[test]]
 name = "network_attach_privileged"
 path = "tests/network_attach_privileged.rs"
@@ -57,10 +87,26 @@ harness = false
 
 # 統合 API（create_network / attach_container / delete_network）を通しで使う 3 経路疎通の実機結合試験と、
 # 作成・接続・削除の所要時間計測（NET-1・TASK-139.5・#318）。子の再入（--inner / --child）と root 前提の分離のため
-# harness = false。`--ignored`（疎通）または `--measure`（計測）指定時のみ実行する（AGENTS.md）。
+# harness = false。`--ignored`（疎通）、`--measure`（計測）、`--hold --max-secs N`（トポロジーの保持。#1881）の
+# 指定時のみ実行する（AGENTS.md）。
 [[test]]
 name = "network_paths_privileged"
 path = "tests/network_paths_privileged.rs"
+harness = false
+
+# 1 バイト TCP 往復の p50・p99 計測プログラム（NET-3・TASK-140 準備・#1881）。root 不要・std のみで、引数なしは
+# loopback の自己試験（3 OS の既定のテスト集合）。--serve / --client は保持入口の netns 内で nsenter 越しに使う。
+# 自身を子プロセスとして再入するため harness = false。
+# 記録つき合成（create → attach → detach → delete）の実カーネルでの通しの照合（NET-1・NET-7・REPAIR-12・#3348）。
+# root と `unshare --net --mount` が要る実機前提のため、`--ignored` を付けたときだけ実行する。
+[[test]]
+name = "network_recorded_lifecycle_privileged"
+path = "tests/network_recorded_lifecycle_privileged.rs"
+harness = false
+
+[[test]]
+name = "tcp_rtt_probe"
+path = "tests/tcp_rtt_probe.rs"
 harness = false
 
 # host モード（ホスト netns 共有）の実機結合試験（NET-6・TASK-143.1・#326）。root と util-linux の `unshare --net` が要り、
@@ -132,6 +178,69 @@ harness = false
 name = "lo_self_delivery"
 path = "tests/lo_self_delivery.rs"
 harness = false
+
+# netns holder の起動・fd の受け渡し・READY / STOP・期限・PDEATHSIG の非特権結合試験（NET-9・CORE-6・REPAIR-5・#3197）。
+# 自身を holder として再実行する（`netns-holder` を第 1 引数に起動されたら `run_netns_holder_main`）ため harness = false。
+# root 不要で Linux のみ（他 OS は not applicable を出して成功終了）。既定の集合で実行する。
+[[test]]
+name = "netns_holder_process"
+path = "tests/netns_holder_process.rs"
+harness = false
+
+# pasta の起動・準備完了の待ち・タイムアウト・途中死の検出・段階を上げた停止と回収・PDEATHSIG の非特権結合試験
+# （NET-9・REPAIR-5・ERR-1・#1938）。自身を偽の pasta として再実行する（第 1 引数 `-f`）ため harness = false。
+# root 不要・pasta 不要で、Linux 以外は Unimplemented と純関数だけを照合する。既定の集合で実行する。
+[[test]]
+name = "pasta_process"
+path = "tests/pasta_process.rs"
+harness = false
+
+# 非特権 user + network namespace（`unshare --user --map-root-user --net`）へ holder が実際に参加し、capability を落とし、
+# 同じ uid の別プロセスが `/proc/<holder>/ns/*` を開けること（pasta の前提。12.2）を照合する実機前提テスト
+# （NET-9・CORE-6・SEC-5・REPAIR-5・#3197）。子の再入のため harness = false。非特権 user namespace が要るため
+# `-- --ignored` 指定時のみ実行する。CI では platform-ci（ubuntu）が AppArmor 緩和ステップの後に実行し、成功行を
+# 照合する（AGENTS.md）。
+[[test]]
+name = "netns_holder_userns"
+path = "tests/netns_holder_userns.rs"
+harness = false
+
+# 公開ハンドルとテーブル handle の記録・再起動後の復元と個別解除・テーブル再作成時の拒否の実機結合試験
+# （NET-3・SEC-1・REPAIR-12・#3068）。root と `unshare --net`、`nft`、`ip` が要るため harness = false。
+# `-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_publish_record_privileged"
+path = "tests/network_publish_record_privileged.rs"
+harness = false
+
+# 残った `realized.intent` のカーネル照合（昇格・巻き戻し・据え置き・削除の完了）と実体の無い `members-intent` の掃除の
+# 実機結合試験（NET-1・NET-7・REPAIR-4・REPAIR-12・#3346）。root と `unshare --net --mount`、`nft`、`ip` が要るため
+# harness = false。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "network_reconcile_privileged"
+path = "tests/network_reconcile_privileged.rs"
+harness = false
+
+# 実際の pasta を本番の API（検証・置き場所・ポート公開・起動・停止）と netns holder に通す実機前提テスト
+# （NET-9・SEC-5・CORE-6・REPAIR-5・REPAIR-12・#1941）。再入のため harness = false。root 不要・pasta と非特権 user
+# namespace が要るため `-- --ignored` 指定時のみ実行する。CI のランナーには pasta が無いため CI では実行せず、
+# 実機での実行と結果の記録は人間が行う（#341。AGENTS.md）。
+[[test]]
+name = "pasta_rootless"
+path = "tests/pasta_rootless.rs"
+harness = false
+
+# ネットワーク定義ストアのプロセス間結合試験（排他・共有ロック・期限・保持プロセス終了後の再取得。
+# NET-6・REPAIR-5・REPAIR-12・#3059）。自分自身を子として再実行する。root 不要・Linux のみ（他 OS は空の試験）。
+[[test]]
+name = "network_store_process"
+path = "tests/network_store_process.rs"
+
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1841・#1318・#1837・MVM-4・REPAIR-12）。製品の依存には
+# 入れない（cargo tree -e normal,build に現れない）。`sys.rs` は Linux 限定のため Linux に限る。
+# 方式は docs/design/ffi-libc-check.md。
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

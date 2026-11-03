@@ -10,8 +10,8 @@
 //!
 //! - 各レイヤーのフック（seccomp / Landlock / マウント。TASK-41.2〜41.4）が組み立てた [`AuditRecord`] を
 //!   supervisor / CLI の配線が [`write_with_fallback`] へ渡す想定（`AuditSink` への適合は `FileAuditSink`〔#1594〕で実装済み）
-//! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840・#652（TASK-98.1・ERR-4 の共通ログ型）が再利用する
-//! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は末尾で常在）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
+//! - [`encode_json_line`] はワイヤースキーマの単一の定義点。#840。本体は非公開 DTO で、封筒（`event`）は共通ログ型 `logging::LogLine` が付ける（#3115・ERR-4）
+//! - 全キー常在の固定スキーマ。値が無いものは `null`（`reason` だけは対象外の層で省略。`container_id` は常在で、段を持つ記録だけその後ろに `stage`。#3121）。`path` は lossy UTF-8 で、制御文字・改行・NUL は
 //!   JSON エスケープされる（ログ注入対策: 生の LF は行末の 1 個だけ）
 //! - [`AuditFileWriter::open`] は symlink・FIFO・他者所有・group/other 権限付きのファイルを拒否する。
 //!   親ディレクトリも `/` から 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で辿って fd で固定し、いずれかが
@@ -28,8 +28,11 @@
 //!   書くため、プロセス内の待ち行列は事実上空である）
 //! - 部分書き込みで壊れた行は、次回書き込みの行頭に LF を付けて独立した行に隔離する（読み手は破損行を
 //!   読み飛ばす）。失敗時の重複（主経路に部分書き込み＋フォールバックにも記録）は許容し、欠落は許容しない
-//! - 非 Linux では symlink・所有者の信頼境界を検査できないため `open` は `Unimplemented` 相当の
-//!   `Unsupported`（fail-closed）
+//! - macOS（#2429）も同じ規則で、親は `openat` の fd 相対で辿り、最終要素は `lstat_at` で種別を見てから
+//!   `O_NOFOLLOW|O_NONBLOCK` で開く。さらに mode bits を迂回できる拡張 ACL を親の各要素とファイルで拒否する。
+//!   `probe_append`（`O_TMPFILE` が Linux 固有）は macOS では `Unsupported` のまま（REPAIR-3）
+//! - Windows は symlink・所有者の信頼境界を検査できないため `open` は `Unimplemented` 相当の
+//!   `Unsupported`（fail-closed。#2430）
 //!
 //! # 将来仕様
 //!
@@ -48,6 +51,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::{AuditEvent, AuditRecord};
+use crate::logging::{self, LogEvent, LogLine, LogLineErrorKind};
 use crate::traits::ErrorCode;
 
 /// 書き込みロック取得の待ち時間上限（REPAIR-5: 無期限に待たない）。
@@ -55,6 +59,15 @@ use crate::traits::ErrorCode;
 /// プロセス内の順番待ち（`TurnQueue`）と `flock` のポーリングを合わせた 1 本の期限として掛かる
 /// （2 段それぞれに 5 秒ずつ許して最大 10 秒待つことはしない）。
 const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// `@audit.log` の長さの上限(16 MiB。SEC-4・CORE-7・REPAIR-5・#2953)。
+///
+/// 追記の直前(排他 `flock` の下)に現在の長さを見て、`長さ + 追記する行 > 上限` なら書かずに
+/// [`AuditWriteErrorKind::SizeLimit`] を返す(呼び出し側は代替経路へ回す。拒否の判定は覆らない)。
+/// 値は本実装の判断で、spec の確定値ではない。監査 1 行は最大 [`AUDIT_LINE_MAX_BYTES`] のため約 16 Ki 件以上の
+/// 余裕があり、通常の運用では到達しない。entrypoint 層の理由はコンテナの中身で引き起こせる(定期 exec の
+/// healthcheck を配線すると同じ理由の行が周期的に増える)ため、tmpfs の `/run` が単調に増える経路を塞ぐ防御として置く。
+/// ローテーションは未実装(REPAIR-3)。上限に達したログは運用者が退避・削除するまで主経路で書けない。
+pub const AUDIT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// ロック取得のリトライ間隔。
 const AUDIT_LOCK_RETRY: Duration = Duration::from_millis(5);
 
@@ -147,7 +160,11 @@ impl Drop for TurnGuard<'_> {
 }
 
 /// 1 行（LF 含む）のバイト長上限。パス 4096 バイトの JSON エスケープ最大 6 倍＋固定部に収まる値。
-pub const AUDIT_LINE_MAX_BYTES: usize = 32 * 1024;
+///
+/// 値の定義元は [`logging::MAX_LOG_LINE_BYTES`] に一本化した（#3115・ERR-4）。共通ログ型は LF を除く
+/// 本体をこの値で縛り、監査は加えて LF 込みの長さを同じ値で縛る。そのため監査の実効上限は共通の上限より
+/// 1 バイト厳しい（既存の監査の上限を緩めないため）。
+pub const AUDIT_LINE_MAX_BYTES: usize = logging::MAX_LOG_LINE_BYTES;
 
 /// 監査書き込みエラーの分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,9 +180,9 @@ pub enum AuditWriteErrorKind {
     InsecureFile,
     /// ファイルを開けない（symlink 含む）。
     Open,
-    /// レコードをエンコードできない。
+    /// レコードをエンコードできない（共通ログ型の `Encode`: オブジェクトでない本体、LF / CR の防御検査）。
     Encode,
-    /// エンコード結果が [`AUDIT_LINE_MAX_BYTES`] を超えた。
+    /// エンコード結果が [`AUDIT_LINE_MAX_BYTES`] を超えた（共通ログ型の `TooLong` と、LF 込みの後段検査の両方）。
     LineTooLong,
     /// 書き込みに失敗した。
     Write,
@@ -197,6 +214,8 @@ pub enum AuditWriteErrorKind {
     /// 未満のカーネル等）。子は I/O せずに終わり、代替経路へ進む（fail-closed。`FileAuditSink`。fork 不能の
     /// `IsolationUnavailable` と運用で見分けるための別種別）。
     IsolationFdsNotClosed,
+    /// ログの長さが [`AUDIT_LOG_MAX_BYTES`] を超えるため追記しなかった(代替経路へ進む。SEC-4・#2953)。
+    SizeLimit,
 }
 
 impl AuditWriteErrorKind {
@@ -223,6 +242,7 @@ impl AuditWriteErrorKind {
             Self::IsolationTimeout => "isolation_timeout",
             Self::IsolationUnavailable => "isolation_unavailable",
             Self::IsolationFdsNotClosed => "isolation_fds_not_closed",
+            Self::SizeLimit => "size_limit_exceeded",
         }
     }
 }
@@ -308,6 +328,7 @@ impl AuditWriteError {
             AuditWriteErrorKind::IsolationFdsNotClosed => {
                 "isolated audit log writer could not close inherited file descriptors"
             }
+            AuditWriteErrorKind::SizeLimit => "audit log reached its size limit",
         }
     }
 }
@@ -320,10 +341,10 @@ impl fmt::Display for AuditWriteError {
 
 impl std::error::Error for AuditWriteError {}
 
-/// ワイヤー表現（非公開 DTO）。キー順はフィールド宣言順。
+/// ワイヤー表現（非公開 DTO。`LogLine` の本体）。キー順はフィールド宣言順で、先頭の `event` は封筒が付ける。
+/// 予約キー `level` / `event` を持たない（持つと重複キーになる。試験で検出する）。
 #[derive(Serialize)]
 struct AuditLineDto<'a> {
-    event: &'static str,
     layer: &'static str,
     ts_sec: u64,
     ts_nsec: u32,
@@ -352,14 +373,47 @@ struct AuditLineDto<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     landlock_reason: Option<&'static str>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
-    /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
+    /// 常在で、段を持たない記録では末尾（既存キーの値と順序は変えない。#1618）。
     container_id: Option<&'a str>,
+    /// 拒否した段（`IsolationStage` と同じ固定語彙）。段を持つ記録のみ、`container_id` の後ろに出す
+    /// （他は省略＝既存行は不変。#3121）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'static str>,
+}
+
+/// 監査行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
+const AUDIT_EVENT: LogEvent = match LogEvent::from_static("audit") {
+    Some(e) => e,
+    None => panic!("invalid audit log event name"),
+};
+
+/// 本体を共通ログ型（level なし）で 1 行（LF 終端）にする。
+///
+/// 共通ログ型の `TooLong` / `Encode` を [`AuditWriteErrorKind`] へ写し、さらに LF 込みの長さを
+/// [`AUDIT_LINE_MAX_BYTES`] で縛る（共通ログ型は LF を除く本体だけを縛るため、1 バイト厳しい）。
+fn encode_audit_body<F: Serialize>(body: &F) -> Result<Vec<u8>, AuditWriteError> {
+    let line = logging::encode_json_line(&LogLine::new(AUDIT_EVENT, body)).map_err(|e| {
+        AuditWriteError::new(match e.kind() {
+            LogLineErrorKind::TooLong => AuditWriteErrorKind::LineTooLong,
+            _ => AuditWriteErrorKind::Encode,
+        })
+    })?;
+    if line.len() > AUDIT_LINE_MAX_BYTES {
+        return Err(AuditWriteError::new(AuditWriteErrorKind::LineTooLong));
+    }
+    Ok(line)
 }
 
 /// レコードを JSON 1 行（LF 終端）へエンコードする。
 ///
 /// 非 UTF-8 のパスは lossy 変換する（`Serialize for Path` は非 UTF-8 でエラーになるため使わない）。
+/// 出力は共通ログ型 `LogLine` 経由で、移行前とバイト列が同じ（#3115・ERR-4）。
 pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError> {
+    encode_audit_body(&audit_line_dto(record))
+}
+
+/// レコードをワイヤー表現（`LogLine` の本体）へ写す。
+fn audit_line_dto(record: &AuditRecord) -> AuditLineDto<'_> {
     let (syscall, path) = match record.event() {
         AuditEvent::Seccomp { syscall, .. } => (Some(syscall.get()), None),
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
@@ -369,13 +423,13 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         }
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
+        | AuditEvent::PastaVerify { .. }
         | AuditEvent::ControlPeer { .. }
         | AuditEvent::ExitSignal { .. }
         | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
-    let dto = AuditLineDto {
-        event: "audit",
+    AuditLineDto {
         layer: record.event().layer().as_str(),
         ts_sec: ts.as_secs(),
         ts_nsec: ts.subsec_nanos(),
@@ -397,14 +451,8 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
             .and_then(|(_, l)| l)
             .map(|r| r.as_str()),
         container_id: record.container_id().map(|c| c.as_str()),
-    };
-    let mut line =
-        serde_json::to_vec(&dto).map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Encode))?;
-    line.push(b'\n');
-    if line.len() > AUDIT_LINE_MAX_BYTES {
-        return Err(AuditWriteError::new(AuditWriteErrorKind::LineTooLong));
+        stage: record.stage().map(|s| s.as_str()),
     }
-    Ok(line)
 }
 
 /// 追記専用の監査ログファイル（主経路）。
@@ -541,6 +589,24 @@ impl AuditFileWriter {
     }
 
     fn write_locked(&mut self, line: &[u8]) -> Result<(), AuditWriteError> {
+        self.write_locked_with_limit(line, AUDIT_LOG_MAX_BYTES)
+    }
+
+    /// [`Self::write_locked`] の本体(上限を差し替えられる。単体試験が 16 MiB を書かずに境界を確かめるため)。
+    fn write_locked_with_limit(&mut self, line: &[u8], limit: u64) -> Result<(), AuditWriteError> {
+        // 長さはロック下で読む(他の書き手の追記と競合しない)。読めなければ書かない(fail-closed)。
+        let len = self
+            .file
+            .metadata()
+            .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Write))?
+            .len();
+        // 先頭の LF を足す場合も含め、最大 1 行 + 1 バイトで判定する。
+        let add = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if len.saturating_add(add) > limit {
+            return Err(AuditWriteError::new(AuditWriteErrorKind::SizeLimit));
+        }
         let mut buf = Vec::with_capacity(line.len() + 1);
         // 行頭 LF の要否は、ロック下で確認した実際の末尾バイトだけで決める（自身の直前の失敗・他 writer・
         // 前回プロセスの部分行を区別せず扱う。sync 失敗後など末尾が既に LF なら空行を作らない）。
@@ -758,7 +824,129 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS 版の [`open_trusted_parent`]: `/` から 1 要素ずつ `O_NOFOLLOW|O_DIRECTORY` で fd 相対に辿り、各要素の
+/// 所有者・権限・拡張 ACL を検証して最後の要素の fd を返す（SEC-4・OCI-5・PLUG-11 と同じ方針。#2429）。
+///
+/// Linux 版との違いは、(1) `O_PATH` が無いため読み取り用に開く、(2) mode bits を迂回して他者に書き込みを許せる
+/// 拡張 ACL を各要素（`/` を含む）にも拒否する（付いていれば `InsecureFile`、判定できなければ `Open`。
+/// `plugin_trust` と同じ fail-closed）。`..`・相対要素は拒否する。ホームディレクトリのように既定で deny 系の ACL
+/// が付いた場所の下には置けない（状態ルートと同じ制約）。
+#[cfg(target_os = "macos")]
+fn open_trusted_parent(dir: &Path) -> Result<std::os::fd::OwnedFd, AuditWriteError> {
+    use crate::sys::plugin_fs;
+    use std::ffi::CString;
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let open_err = || AuditWriteError::new(AuditWriteErrorKind::Open);
+    let insecure = || AuditWriteError::new(AuditWriteErrorKind::InsecureFile);
+    let euid = crate::sys::effective_uid();
+
+    let mut names = Vec::new();
+    for c in dir.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(n) => names.push(CString::new(n.as_bytes()).map_err(|_| open_err())?),
+            _ => return Err(open_err()),
+        }
+    }
+    let mut cur = plugin_fs::open_dir_nofollow_at(None, c"/").map_err(|_| open_err())?;
+    let total = names.len();
+    let check = |fd: &std::os::fd::OwnedFd, is_parent: bool| -> Result<(), AuditWriteError> {
+        let meta = File::from(fd.as_fd().try_clone_to_owned().map_err(|_| open_err())?)
+            .metadata()
+            .map_err(|_| open_err())?;
+        if !meta.file_type().is_dir() {
+            return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
+        }
+        let owner_ok = meta.uid() == 0 || meta.uid() == euid;
+        let mode = meta.mode();
+        // group/other 書き込み可は、sticky 付きの祖先（/tmp 等）のみ許容する。直接の親は不可。
+        let writable_ok = mode & 0o022 == 0 || (!is_parent && mode & 0o1000 != 0);
+        if !(owner_ok && writable_ok) {
+            return Err(insecure());
+        }
+        match plugin_fs::has_extended_acl_fd(fd.as_fd()) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(insecure()),
+            Err(_) => Err(open_err()),
+        }
+    };
+    check(&cur, total == 0)?;
+    for (i, name) in names.iter().enumerate() {
+        let next =
+            plugin_fs::open_dir_nofollow_at(Some(cur.as_fd()), name).map_err(|_| open_err())?;
+        check(&next, i + 1 == total)?;
+        cur = next;
+    }
+    Ok(cur)
+}
+
+/// macOS 版の [`open_checked`]（SEC-4・OCI-5・#2429）。検査の規則は Linux 版と同じで、加えて拡張 ACL を拒否する。
+///
+/// 親は [`open_trusted_parent`] で fd に固定し、その fd 相対に `lstat_at`（open しない種別確認。FIFO・デバイスを
+/// 開く副作用を避ける）→ `openat(O_NOFOLLOW|O_NONBLOCK|O_CREAT, 0600)` → 開いた fd の fstat・ACL の再検査を行う。
+/// lstat と open の間の差し替えは、親が fd で固定されていること・`O_NOFOLLOW|O_NONBLOCK`・open 後の再検査で防ぐ。
+#[cfg(target_os = "macos")]
+fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
+    use crate::sys::{SysError, audit_fs, plugin_fs};
+    use plugin_fs::EntryKind;
+    use std::ffi::CString;
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let open_err = || AuditWriteError::new(AuditWriteErrorKind::Open);
+    // 最終要素はバイト列として扱う。検証は空・NUL のみ（NUL は open(2) に渡せない値のため弾く）。
+    let name = path
+        .file_name()
+        .filter(|n| !n.is_empty() && !n.as_bytes().contains(&0))
+        .ok_or_else(open_err)?;
+    let name_c = CString::new(name.as_bytes()).map_err(|_| open_err())?;
+    let parent = path.parent().ok_or_else(open_err)?;
+    let parent_fd = open_trusted_parent(parent)?;
+    match plugin_fs::lstat_at(parent_fd.as_fd(), &name_c) {
+        // symlink・ディレクトリは Open 失敗（open(2) の ELOOP / EISDIR 相当）、その他の種別は開かずに拒否。
+        Ok(st) => match st.kind() {
+            EntryKind::Symlink | EntryKind::Directory => return Err(open_err()),
+            EntryKind::Other => {
+                return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
+            }
+            EntryKind::Regular => {}
+        },
+        // 不在は新規作成のため許可。
+        Err(SysError::Os(e)) if e == plugin_fs::ENOENT => {}
+        Err(_) => return Err(open_err()),
+    }
+    let file = File::from(
+        audit_fs::open_append_create_nofollow_at(parent_fd.as_fd(), &name_c)
+            .map_err(|_| open_err())?,
+    );
+    drop(parent_fd);
+    let meta = file.metadata().map_err(|_| open_err())?;
+    if !meta.file_type().is_file() {
+        return Err(AuditWriteError::new(AuditWriteErrorKind::NotRegularFile));
+    }
+    // ハードリンク数が 1 でなければ、別パスの機密ファイルへの link を仕込まれた可能性がある（SEC-4）。
+    if meta.nlink() != 1 || meta.uid() != crate::sys::effective_uid() || meta.mode() & 0o077 != 0 {
+        return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
+    }
+    // 拡張 ACL は mode bits を迂回して他者に書き込みを許せる。付いていれば拒否し、判定できなくても拒否する。
+    match plugin_fs::has_extended_acl_fd(file.as_fd()) {
+        Ok(false) => {}
+        Ok(true) => return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile)),
+        Err(_) => return Err(open_err()),
+    }
+    Ok(AuditFileWriter {
+        file,
+        dir: Some(parent.to_path_buf()),
+    })
+}
+
+/// Linux・macOS 以外（Windows）では symlink・所有者の信頼境界を検査できないため拒否する（fail-closed。#2430）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_checked(_path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
     Err(AuditWriteError::new(AuditWriteErrorKind::Unsupported))
 }
@@ -863,18 +1051,37 @@ impl AuditWriteFailure {
     ///
     /// キーは `event`・`code`・`primary`・`primary_code`・`fallback`・`fallback_code` の固定順。
     /// 値はすべて固定トークンで、レコード内容・パス・errno を含めない（ログ注入・秘密情報の回避）。
+    /// 出力は共通ログ型 `LogLine` 経由で、移行前の `writeln!` とバイト列が同じ（#3209・ERR-4）。
+    /// 書き込みは `write_all` 1 回で、`writeln!` のように断片に分かれない。
     pub fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(
-            out,
-            "{{\"event\":\"audit_write_failure\",\"code\":\"{}\",\"primary\":\"{}\",\"primary_code\":\"{}\",\"fallback\":\"{}\",\"fallback_code\":\"{}\"}}",
-            self.error_code().as_str(),
-            self.primary.kind().as_str(),
-            self.primary.error_code().as_str(),
-            self.fallback.kind().as_str(),
-            self.fallback.error_code().as_str(),
-        )
+        let body = AuditWriteFailureDto {
+            code: self.error_code().as_str(),
+            primary: self.primary.kind().as_str(),
+            primary_code: self.primary.error_code().as_str(),
+            fallback: self.fallback.kind().as_str(),
+            fallback_code: self.fallback.error_code().as_str(),
+        };
+        logging::write_json_line(out, &LogLine::new(AUDIT_WRITE_FAILURE_EVENT, &body))
+            .map_err(|e| std::io::Error::other(e.message()))
     }
 }
+
+/// `audit_write_failure` 行の本体（非公開 DTO。`LogLine` の本体）。キー順はフィールド宣言順で、
+/// 値はすべて固定トークン。予約キー `level` / `event` を持たない（試験で検出する）。
+#[derive(Serialize)]
+struct AuditWriteFailureDto {
+    code: &'static str,
+    primary: &'static str,
+    primary_code: &'static str,
+    fallback: &'static str,
+    fallback_code: &'static str,
+}
+
+/// 両経路失敗行の `event` 値。コンパイル時に検証する（実行時に panic する経路を作らない）。
+const AUDIT_WRITE_FAILURE_EVENT: LogEvent = match LogEvent::from_static("audit_write_failure") {
+    Some(e) => e,
+    None => panic!("invalid audit_write_failure log event name"),
+};
 
 impl fmt::Display for AuditWriteFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -906,12 +1113,12 @@ pub fn write_with_fallback(
 mod tests {
     /// SEC-4・#2027: 別の open file description が排他 `flock` を保持していれば `probe_append` は `Lock` で失敗し、
     /// 解放後は監査ログへ 1 バイトも書かずに成功する(open できるだけでは記録経路の確認にならない)。
+    /// 並列の他の試験が fork した子が fd の複製を持っていても、明示解放(`LOCK_UN`)で通ることを毎回照合する
+    /// (並列の全件実行での間欠失敗の原因。REPAIR-12・#3292)。
     #[cfg(unix)]
     #[test]
     fn sec4_2027_probe_append_fails_while_locked_elsewhere() {
-        let dir = std::env::temp_dir().join(format!("fc-probe-append-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-append", "d");
         // 確認用の一時ファイルは信頼検査済みの親に作る(umask に依らず 0700 にする)。
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
@@ -929,13 +1136,18 @@ mod tests {
             .open(&path)
             .unwrap();
         other.lock().unwrap();
+        // 並列の他の試験が `|| true` で fork した子(exec しない)が引き継ぐ fd の代役。同じ OFD を指すため、
+        // `drop(other)`(close)だけでは flock が解放されない。
+        let inherited = other.try_clone().unwrap();
         let mut writer = AuditFileWriter::from_file_unchecked_in(holder, dir.clone());
         let e = writer
             .probe_append_with(&queue, Duration::from_millis(200))
             .unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::Lock);
+        // flock は OFD に付き、複製が残っていても `LOCK_UN` で解放される(flock(2))。close に頼ると
+        // 他の試験の fork 子が複製を持つ間は解放されない(#3292)。
+        other.unlock().unwrap();
         drop(other);
-        // 並行する他の試験の fork が fd の複製を持つ間は解放されないため、解放後は長めに待つ。
         let released = writer.probe_append_with(&queue, Duration::from_secs(5));
         #[cfg(target_os = "linux")]
         {
@@ -950,8 +1162,8 @@ mod tests {
             );
         }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(inherited);
         drop(file);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・#2027: 継承したファイルサイズ制限に 1 レコード分の余地が無ければ失敗し、あれば(無制限を含め)通る。
@@ -972,9 +1184,7 @@ mod tests {
     #[test]
     fn sec4_2027_probe_reads_inherited_fsize_limit() {
         let (soft, _) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize).unwrap();
-        let dir = std::env::temp_dir().join(format!("fc-probe-fsize-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-fsize", "d");
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -983,7 +1193,6 @@ mod tests {
         // 現在の制限で、空のログには余地がある(無制限または十分大きい)ことだけを確かめる。
         assert_eq!(w.check_fsize_room().is_ok(), fits_fsize_limit(0, soft));
         w.probe_append().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・REPAIR-5・#2027: 書き込み確認の一時ファイルは名前を持たない(`O_TMPFILE`)。開いている間もディレクトリには
@@ -993,9 +1202,7 @@ mod tests {
     fn sec4_repair5_probe_scratch_is_unnamed_while_open() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fc-probe-tmpfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-tmpfile", "d");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         match open_unnamed_scratch(&dir) {
             Ok(mut scratch) => {
@@ -1006,7 +1213,6 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), AuditWriteErrorKind::Unsupported),
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・REPAIR-5・#2027: 確認(`probe_append`)は共有ログを巻き戻さない。確認の前後で長さは変わらず(減らず)、
@@ -1015,9 +1221,7 @@ mod tests {
     #[test]
     fn sec4_repair5_probe_never_rewinds_shared_log() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fc-probe-mono-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-probe-mono", "d");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("audit.log");
         let mut w = AuditFileWriter::open(&path).unwrap();
@@ -1040,7 +1244,37 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["audit.log".to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・CORE-7・REPAIR-5・#2953: 長さ + 追記する行(先頭 LF 分の 1 バイトを含む)が上限ちょうどなら書け、
+    /// 1 バイト超えると書かずに `SizeLimit` を返す(ログの長さは変わらない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2953_size_limit_boundary_is_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_scratch, dir) = crate::test_support::scratch_child("fc-size-limit", "d");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("audit.log");
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        let r = rec(
+            9,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        let line = encode_json_line(&r).unwrap();
+        let line_len = line.len() as u64;
+        // 空のログ + 行 + 1 バイトちょうどが上限なら書ける。
+        w.write_locked_with_limit(&line, line_len + 1).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        // 2 行目は (line_len) + (line_len + 1) = 2 * line_len + 1 が必要。上限が 1 足りないと拒否される。
+        let e = w.write_locked_with_limit(&line, 2 * line_len).unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::SizeLimit);
+        assert_eq!(e.kind().as_str(), "size_limit_exceeded");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.write_locked_with_limit(&line, 2 * line_len + 1).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * line_len);
     }
 
     use super::*;
@@ -1234,6 +1468,90 @@ mod tests {
         );
     }
 
+    /// SEC-4・ERR-4・#3121: 段なしの記録は全層で `"stage"` キーを持たず、末尾は従来どおり `container_id`。
+    #[test]
+    fn sec4_3121_records_without_stage_keep_bytes() {
+        let events = [
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
+            },
+            AuditEvent::Landlock {
+                path: AuditPath::new("/etc/shadow"),
+                syscall: None,
+            },
+            AuditEvent::Mount {
+                path: None,
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "readonly_path_apply_failed",
+                )),
+            },
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p/plugin"),
+                reason: crate::audit_log::AuditReason::new("hash_mismatch"),
+            },
+            AuditEvent::ExecTarget {
+                reason: crate::audit_log::AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+            AuditEvent::Entrypoint {
+                reason: crate::audit_log::AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+        ];
+        for e in events {
+            let s = text(&rec(3, e.clone()));
+            assert!(!s.contains("\"stage\""), "{s}");
+            assert!(s.ends_with(",\"container_id\":null}\n"), "{s}");
+            let s = text(&rec(3, e).with_container_id(cid("c1")));
+            assert!(!s.contains("\"stage\""), "{s}");
+            assert!(s.ends_with(",\"container_id\":\"c1\"}\n"), "{s}");
+        }
+    }
+
+    /// SEC-4・ERR-4・#3121: 段つきの 1 行全体の厳密バイト列。`stage` は `container_id` の後ろ（ID が null でも）。
+    #[test]
+    fn sec4_3121_encode_mount_with_stage_is_exact() {
+        let ev = || AuditEvent::Mount {
+            path: None,
+            reason: Some(crate::audit_log::AuditReason::new(
+                "readonly_path_apply_failed",
+            )),
+        };
+        let stage = crate::audit_log::AuditStage::new("mount_readonly_paths");
+        let with_id = rec(8, ev()).with_container_id(cid("c1")).with_stage(stage);
+        assert_eq!(
+            text(&with_id),
+            "{\"event\":\"audit\",\"layer\":\"mount\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"readonly_path_apply_failed\",\"container_id\":\"c1\",\"stage\":\"mount_readonly_paths\"}\n"
+        );
+        let no_id = rec(8, ev()).with_stage(stage);
+        assert!(
+            text(&no_id).ends_with(",\"container_id\":null,\"stage\":\"mount_readonly_paths\"}\n"),
+            "{}",
+            text(&no_id)
+        );
+    }
+
+    /// SEC-4・ERR-4・#3121: 最悪ケース（制御文字だけの 4096 バイトのパス・最長の理由・255 バイトの ID・段）でも 1 行の上限に収まる。
+    #[test]
+    fn sec4_3121_stage_worst_case_line_fits() {
+        let id = "a".repeat(255);
+        let r = rec(
+            2_000_000_000,
+            AuditEvent::Mount {
+                path: Some(AuditPath::new(&"\u{1}".repeat(4096))),
+                reason: Some(crate::audit_log::AuditReason::new(
+                    "rootfs_symlink_or_not_directory",
+                )),
+            },
+        )
+        .with_container_id(cid(&id))
+        .with_stage(crate::audit_log::AuditStage::new("mount_readonly_paths"));
+        let line = encode_json_line(&r).expect("worst case encodes");
+        assert!(line.len() <= AUDIT_LINE_MAX_BYTES, "{}", line.len());
+        assert!(String::from_utf8(line).unwrap().ends_with(&format!(
+            ",\"container_id\":\"{id}\",\"stage\":\"mount_readonly_paths\"}}\n"
+        )));
+    }
+
     /// SEC-4・#1618: ID が無い記録は全層で `"container_id":null` を末尾に持つ。
     #[test]
     fn sec4_1618_encode_without_container_id_is_null() {
@@ -1404,8 +1722,11 @@ mod tests {
     }
 
     fn failing_writer() -> AuditFileWriter {
-        // 読み取り専用で開いた File への write は必ず失敗する。
-        AuditFileWriter::from_file_unchecked(File::open(std::env::current_exe().unwrap()).unwrap())
+        // 読み取り専用で開いた File への write は必ず失敗する。サイズ上限(`AUDIT_LOG_MAX_BYTES`)に達しない
+        // 小さなファイルを使う(巨大な試験バイナリだと `SizeLimit` が先に出て、`Write` の経路を試せない。#2953)。
+        AuditFileWriter::from_file_unchecked(
+            File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+        )
     }
 
     fn sample() -> AuditRecord {
@@ -1482,7 +1803,7 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_no_blank_line_when_tail_is_lf() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("nolf");
+        let (_scratch, dir) = fresh_dir("nolf");
         let path = dir.join("audit.log");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1503,7 +1824,7 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_reopen_isolates_torn_tail() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("torn");
+        let (_scratch, dir) = fresh_dir("torn");
         let path = dir.join("audit.log");
         std::fs::write(&path, b"{\"torn\":").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1519,24 +1840,50 @@ mod tests {
         let got = std::fs::read_to_string(&path).unwrap();
         let line = text(&sample());
         assert_eq!(got, format!("{{\"torn\":\n{line}{line}"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
-    fn fresh_dir(tag: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fandhe-auditw-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+    fn fresh_dir(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-auditw-{tag}"), "d")
+    }
+
+    /// REPAIR-12・#3434: 旧方式の pid だけの名前の残骸（FIFO を含む）があっても `fresh_dir` は別名の空の
+    /// ディレクトリを使って書き込みに成功し、残骸に触れない。drop は自分のパスだけを消す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair12_3434_fresh_dir_ignores_legacy_pid_residue() {
+        let residue = crate::test_support::LegacyResidue::new(
+            &format!("fandhe-auditw-legacy3434-{}", std::process::id()),
+            "audit.log",
+        );
+        let (scratch, dir) = fresh_dir("legacy3434");
+        assert_ne!(dir, residue.dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let mut w = AuditFileWriter::open(&dir.join("audit.log")).unwrap();
+        w.write_record(&sample()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        residue.assert_untouched();
+        drop(w);
+        drop(scratch);
+        assert_eq!(
+            std::fs::symlink_metadata(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        residue.assert_untouched();
     }
 
     /// SEC-4・TASK-41.5.1: 親ディレクトリが symlink なら拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_symlinked_parent() {
-        let dir = fresh_dir("symparent");
+        let (_scratch, dir) = fresh_dir("symparent");
         let real = dir.join("real");
         std::fs::create_dir(&real).unwrap();
         let link = dir.join("link");
@@ -1544,7 +1891,6 @@ mod tests {
         let e = AuditFileWriter::open(&link.join("audit.log")).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::Open);
         assert!(!real.join("audit.log").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: group/other が書き込める親ディレクトリは拒否する。
@@ -1552,20 +1898,19 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_rejects_world_writable_parent() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = fresh_dir("wwparent");
+        let (_scratch, dir) = fresh_dir("wwparent");
         let parent = dir.join("p");
         std::fs::create_dir(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
         let e = AuditFileWriter::open(&parent.join("audit.log")).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: 他パスへのハードリンクになっている既存ファイルは拒否し、内容を改変しない。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_hardlinked_file() {
-        let dir = fresh_dir("hardlink");
+        let (_scratch, dir) = fresh_dir("hardlink");
         let secret = dir.join("secret");
         std::fs::write(&secret, b"top-secret\n").unwrap();
         std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -1575,14 +1920,13 @@ mod tests {
         let e = AuditFileWriter::open(&audit).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::InsecureFile);
         assert_eq!(std::fs::read(&secret).unwrap(), b"top-secret\n");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-4・TASK-41.5.1: 既存の非通常ファイル（FIFO）は open せず NotRegularFile で拒否する。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_rejects_fifo_without_opening() {
-        let dir = fresh_dir("fifo");
+        let (_scratch, dir) = fresh_dir("fifo");
         let fifo = dir.join("audit.fifo");
         // unsafe を避けるため mkfifo(1) で作る（coreutils。無ければテスト環境不備として失敗させる）。
         let st = std::process::Command::new("mkfifo")
@@ -1592,7 +1936,6 @@ mod tests {
         assert!(st.success());
         let e = AuditFileWriter::open(&fifo).unwrap_err();
         assert_eq!(e.kind(), AuditWriteErrorKind::NotRegularFile);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TASK-41.5.1: 正当な非 UTF-8 ファイル名（Linux）でも開ける。
@@ -1600,13 +1943,12 @@ mod tests {
     #[test]
     fn sec4_task41_5_1_accepts_non_utf8_file_name() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = fresh_dir("nonutf8");
+        let (_scratch, dir) = fresh_dir("nonutf8");
         let path = dir.join(std::ffi::OsStr::from_bytes(b"audit-\xff.log"));
         let mut w = AuditFileWriter::open(&path).unwrap();
         w.write_record(&sample()).unwrap();
         drop(w);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text(&sample()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ERR-4: ロック I/O 失敗はタイムアウトと区別され、Timeout コードにならない。
@@ -1623,7 +1965,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_task41_5_1_concurrent_writers_do_not_interleave() {
-        let dir = fresh_dir("concurrent");
+        let (_scratch, dir) = fresh_dir("concurrent");
         let path = dir.join("audit.log");
         let long = format!("/{}", "a".repeat(3000));
         let handles: Vec<_> = (0..4)
@@ -1657,7 +1999,6 @@ mod tests {
                 "{l}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5・#1703: 解放直後に取り直す書き手より、先に並んだ待ち手が先に順番を得る。
@@ -1696,7 +2037,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_1703_queue_deadline_returns_lock_and_removes_ticket() {
-        let dir = fresh_dir("queue-deadline");
+        let (_scratch, dir) = fresh_dir("queue-deadline");
         let path = dir.join("audit.log");
         let queue = TurnQueue::new();
         let holder = queue
@@ -1711,14 +2052,13 @@ mod tests {
         assert_eq!(queue.len(), 1);
         drop(holder);
         assert_eq!(queue.len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// REPAIR-5・#1703: 保持者が解放済みで期限切れの待ち手が先頭になった場合は拒否し、チケットを残さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_1703_expired_waiter_at_front_is_rejected() {
-        let dir = fresh_dir("queue-expired-front");
+        let (_scratch, dir) = fresh_dir("queue-expired-front");
         let path = dir.join("audit.log");
         let queue = TurnQueue::new();
         let w = AuditFileWriter::open(&path).unwrap();
@@ -1730,6 +2070,416 @@ mod tests {
         let err = w.lock_exclusive(&queue, past).err().unwrap();
         assert_eq!(err.kind, AuditWriteErrorKind::Lock);
         assert_eq!(queue.len(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全種別の代表レコード。ワイルドカード無しの match で、`AuditEvent` に種別を足すとここが落ちる。
+    fn every_kind() -> Vec<(&'static str, AuditEvent)> {
+        use crate::audit_log::{AuditReason, AuditSignal, ControlPeerRejection};
+        let events = vec![
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(3221225534),
+            },
+            AuditEvent::Landlock {
+                path: AuditPath::new("/etc/shadow"),
+                syscall: AuditSyscallNr::new(2).ok(),
+            },
+            AuditEvent::Mount {
+                path: Some(AuditPath::new("/m")),
+                reason: Some(AuditReason::new("rootfs_is_host_root")),
+            },
+            AuditEvent::PluginTrust {
+                path: AuditPath::new("/p"),
+                reason: AuditReason::new("hash_mismatch"),
+            },
+            AuditEvent::PluginPeer {
+                path: AuditPath::new("/s"),
+                reason: AuditReason::new("plugin_peer_uid_mismatch"),
+            },
+            AuditEvent::ExecTarget {
+                reason: AuditReason::new("exec_target_cgroup_mismatch"),
+            },
+            AuditEvent::Entrypoint {
+                reason: AuditReason::new("entrypoint_is_runtime_binary"),
+            },
+            crate::audit_log::PastaVerifyRejection::RecordChanged.audit_event(),
+            ControlPeerRejection::PeerUidMismatch.audit_event(),
+            AuditEvent::ExitSignal {
+                signal: AuditSignal::new(31).unwrap(),
+                target_pid: AuditPid::new(1234).unwrap(),
+            },
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill: Some(AuditReason::new("seccomp_kill_audit_unavailable")),
+                landlock: Some(AuditReason::new("landlock_audit_abi_too_old")),
+            },
+        ];
+        events
+            .into_iter()
+            .map(|e| {
+                let name = match &e {
+                    AuditEvent::Seccomp { .. } => "seccomp",
+                    AuditEvent::Landlock { .. } => "landlock",
+                    AuditEvent::Mount { .. } => "mount",
+                    AuditEvent::PluginTrust { .. } => "plugin_trust",
+                    AuditEvent::PluginPeer { .. } => "plugin_peer",
+                    AuditEvent::ExecTarget { .. } => "exec_target",
+                    AuditEvent::Entrypoint { .. } => "entrypoint",
+                    AuditEvent::PastaVerify { .. } => "pasta_verify",
+                    AuditEvent::ControlPeer { .. } => "control_peer",
+                    AuditEvent::ExitSignal { .. } => "exit_signal",
+                    AuditEvent::AuditCoverageDegraded { .. } => "audit_coverage",
+                };
+                (name, e)
+            })
+            .collect()
+    }
+
+    /// ERR-4・SEC-4・#3115: 全種別を網羅し、本体が予約キー `event` / `level` を持たない（重複キーを出さない）。
+    #[test]
+    fn err4_sec4_3115_body_has_no_reserved_keys() {
+        let kinds = every_kind();
+        let names: std::collections::BTreeSet<_> = kinds.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names.len(), 11);
+        for (name, e) in kinds {
+            for cid_opt in [None, Some(cid("c1"))] {
+                let mut r = rec(5, e.clone());
+                if let Some(c) = cid_opt {
+                    r = r.with_container_id(c);
+                }
+                let v = serde_json::to_value(audit_line_dto(&r)).unwrap();
+                let obj = v
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{name}: not an object"));
+                assert!(!obj.contains_key("event"), "{name}");
+                assert!(!obj.contains_key("level"), "{name}");
+                let line = text(&r);
+                assert!(
+                    line.starts_with("{\"event\":\"audit\",\"layer\":"),
+                    "{name}: {line}"
+                );
+                assert!(line.contains("\"container_id\":"), "{name}");
+            }
+        }
+    }
+
+    /// ERR-4・SEC-4・#3209: `audit_write_failure` の行が移行前の `writeln!` とバイト単位で一致する
+    /// （全種別の組、完全一致のリテラル、予約キーを持たないこと）。
+    #[test]
+    fn err4_sec4_3209_write_failure_line_bytes_unchanged() {
+        use AuditWriteErrorKind as K;
+        let kinds = [
+            K::RelativePath,
+            K::Unsupported,
+            K::NotRegularFile,
+            K::InsecureFile,
+            K::Open,
+            K::Encode,
+            K::LineTooLong,
+            K::Write,
+            K::Lock,
+            K::LockFailed,
+            K::Sync,
+            K::FallbackUnavailable,
+            K::KernelAuditUnavailable,
+            K::KernelAuditPermissionDenied,
+            K::KernelAuditTimeout,
+            K::KernelAuditRejected,
+            K::KernelAuditIo,
+            K::IsolationTimeout,
+            K::IsolationUnavailable,
+            K::IsolationFdsNotClosed,
+        ];
+        for p in kinds {
+            for f in kinds {
+                let failure =
+                    AuditWriteFailure::new(AuditWriteError::new(p), AuditWriteError::new(f));
+                let mut out = Vec::new();
+                failure.write_json_line(&mut out).unwrap();
+                // 移行前の書式（writeln! の手組み）を試験内に写して照合する。
+                let old = format!(
+                    "{{\"event\":\"audit_write_failure\",\"code\":\"{}\",\"primary\":\"{}\",\"primary_code\":\"{}\",\"fallback\":\"{}\",\"fallback_code\":\"{}\"}}\n",
+                    failure.error_code().as_str(),
+                    failure.primary().kind().as_str(),
+                    failure.primary().error_code().as_str(),
+                    failure.fallback().kind().as_str(),
+                    failure.fallback().error_code().as_str(),
+                );
+                assert_eq!(String::from_utf8(out).unwrap(), old, "{p:?}/{f:?}");
+            }
+        }
+        let failure = AuditWriteFailure::new(
+            AuditWriteError::new(K::Write),
+            AuditWriteError::new(K::FallbackUnavailable),
+        );
+        let mut out = Vec::new();
+        failure.write_json_line(&mut out).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.starts_with(
+                "{\"event\":\"audit_write_failure\",\"code\":\"INTERNAL\",\"primary\":\"write\","
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "\"fallback\":\"fallback_unavailable\",\"fallback_code\":\"UNIMPLEMENTED\"}\n"
+            ),
+            "{line}"
+        );
+        let dto = AuditWriteFailureDto {
+            code: "INTERNAL",
+            primary: "write",
+            primary_code: "INTERNAL",
+            fallback: "open",
+            fallback_code: "INTERNAL",
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("event"));
+        assert!(!obj.contains_key("level"));
+    }
+
+    /// ERR-4・SEC-4・#3115: ControlPeer の行全体（移行前の出力の写し）。
+    #[test]
+    fn err4_sec4_3115_control_peer_exact_bytes() {
+        use crate::audit_log::ControlPeerRejection;
+        let r = rec(8, ControlPeerRejection::PeerUidMismatch.audit_event());
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"control_channel\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"control_peer_uid_mismatch\",\"container_id\":null}\n"
+        );
+        let r = rec(
+            8,
+            ControlPeerRejection::PeerCredentialsUnavailable.audit_event(),
+        )
+        .with_container_id(cid("c1"));
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"control_channel\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":8,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"reason\":\"control_peer_credentials_unavailable\",\"container_id\":\"c1\"}\n"
+        );
+    }
+
+    #[derive(Serialize)]
+    struct Pad<'a> {
+        s: &'a str,
+    }
+
+    /// ERR-4・SEC-4・#3115: 行長の境界。LF 込みの上限は緩めない（本体 = MAX は拒否）。
+    #[test]
+    fn err4_sec4_3115_line_limit_boundary() {
+        assert_eq!(AUDIT_LINE_MAX_BYTES, crate::logging::MAX_LOG_LINE_BYTES);
+        let fixed = "{\"event\":\"audit\",\"s\":\"\"}".len();
+        let pad = |body_len: usize| "a".repeat(body_len - fixed);
+        let ok = encode_audit_body(&Pad {
+            s: &pad(AUDIT_LINE_MAX_BYTES - 1),
+        })
+        .unwrap();
+        assert_eq!(ok.len(), AUDIT_LINE_MAX_BYTES);
+        for n in [AUDIT_LINE_MAX_BYTES, AUDIT_LINE_MAX_BYTES + 1] {
+            let e = encode_audit_body(&Pad { s: &pad(n) }).unwrap_err();
+            assert_eq!(e.kind, AuditWriteErrorKind::LineTooLong, "{n}");
+        }
+        let e = encode_audit_body(&42u32).unwrap_err();
+        assert_eq!(e.kind, AuditWriteErrorKind::Encode);
+    }
+}
+
+/// macOS 版 `open_checked` / `open_trusted_parent` の単体試験（SEC-4・OCI-5・#2429）。fork はしない。
+/// 一時ディレクトリは `/var` が symlink のため `canonicalize` した実体パスの下に作る。拡張 ACL は
+/// `chmod +a` を期限つきで実行して付ける（root 不要）。
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use crate::audit_log::{AuditPid, AuditSyscallArch, AuditSyscallNr, AuditTimestamp};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::process::{Command, Stdio};
+
+    fn record() -> AuditRecord {
+        AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::new(272).unwrap(),
+                arch: AuditSyscallArch::from_raw(0xC000_003E),
+            },
+        )
+    }
+
+    /// 0700 の実体パスの作業ディレクトリ（guard は試験の終わりまで束縛する）。
+    fn work_dir(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        let (scratch, dir) = crate::test_support::scratch_child(&format!("fc-2429-{tag}"), "d");
+        let real = std::fs::canonicalize(&dir).expect("canonicalize");
+        (scratch, real)
+    }
+
+    /// 期限つきで外部コマンドを実行し、成功を確かめる（REPAIR-5）。
+    fn run_limited(mut cmd: Command) {
+        let mut child = cmd.stdin(Stdio::null()).spawn().expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                assert!(st.success(), "command failed: {st}");
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("command timed out");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn add_ace(path: &Path, ace: &str) {
+        let mut cmd = Command::new("chmod");
+        cmd.arg("+a").arg(ace).arg(path);
+        run_limited(cmd);
+    }
+
+    fn kind(r: Result<AuditFileWriter, AuditWriteError>) -> AuditWriteErrorKind {
+        r.expect_err("open must be rejected").kind()
+    }
+
+    /// 正常: 0700 の親の下で開け、1 行（LF 終端）が書け、ファイルは 0600・euid 所有。
+    #[test]
+    fn sec4_2429_opens_and_appends_one_line() {
+        let (_g, dir) = work_dir("ok");
+        let path = dir.join("audit.log");
+        let mut w = AuditFileWriter::open(&path).expect("open");
+        w.write_record(&record()).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+        let md = std::fs::metadata(&path).expect("md");
+        assert_eq!(md.mode() & 0o777, 0o600);
+        assert_eq!(md.uid(), crate::sys::effective_uid());
+        // 既存ファイルを開き直しても追記される。
+        let mut w2 = AuditFileWriter::open(&path).expect("reopen");
+        w2.write_record(&record()).expect("write 2");
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    /// 最終要素の symlink・ディレクトリは `Open`、相対パスは `RelativePath`。
+    #[test]
+    fn sec4_2429_rejects_symlink_directory_and_relative() {
+        let (_g, dir) = work_dir("link");
+        std::fs::write(dir.join("real"), b"").expect("write");
+        std::fs::set_permissions(dir.join("real"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        symlink("real", dir.join("l")).expect("symlink");
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        assert_eq!(
+            kind(AuditFileWriter::open(&dir.join("l"))),
+            AuditWriteErrorKind::Open
+        );
+        assert_eq!(
+            kind(AuditFileWriter::open(&dir.join("sub"))),
+            AuditWriteErrorKind::Open
+        );
+        assert_eq!(
+            kind(AuditFileWriter::open(Path::new("relative/audit.log"))),
+            AuditWriteErrorKind::RelativePath
+        );
+    }
+
+    /// 親の途中の要素が symlink（未正規化の `/var/...` を含む）なら `Open`。
+    #[test]
+    fn sec4_2429_rejects_symlink_in_ancestors() {
+        let (_g, dir) = work_dir("anc");
+        let alias = dir.join("alias");
+        symlink(&dir, &alias).expect("symlink");
+        assert_eq!(
+            kind(AuditFileWriter::open(&alias.join("audit.log"))),
+            AuditWriteErrorKind::Open
+        );
+        // 実体パスでなければ、`/var` が symlink のため拒否される（/private/var の別名）。
+        let unresolved = std::path::PathBuf::from(
+            dir.to_string_lossy()
+                .strip_prefix("/private")
+                .expect("under /private")
+                .to_owned(),
+        );
+        assert_eq!(
+            kind(AuditFileWriter::open(&unresolved.join("audit.log"))),
+            AuditWriteErrorKind::Open
+        );
+    }
+
+    /// 直接の親が group/other 書き込み可なら（sticky 付きでも）`InsecureFile`。
+    #[test]
+    fn sec4_2429_rejects_writable_direct_parent() {
+        let (_g, dir) = work_dir("wr");
+        for mode in [0o777, 0o1777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert_eq!(
+                kind(AuditFileWriter::open(&dir.join("audit.log"))),
+                AuditWriteErrorKind::InsecureFile,
+                "mode {mode:o}"
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    /// 既存ファイルの権限が緩い（0644）・ハードリンク数が 2 なら `InsecureFile`。
+    #[test]
+    fn sec4_2429_rejects_loose_mode_and_hard_links() {
+        let (_g, dir) = work_dir("mode");
+        let loose = dir.join("loose.log");
+        std::fs::write(&loose, b"").expect("write");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            kind(AuditFileWriter::open(&loose)),
+            AuditWriteErrorKind::InsecureFile
+        );
+        let first = dir.join("first.log");
+        std::fs::write(&first, b"").expect("write");
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::hard_link(&first, dir.join("second.log")).expect("link");
+        assert_eq!(
+            kind(AuditFileWriter::open(&first)),
+            AuditWriteErrorKind::InsecureFile
+        );
+    }
+
+    /// FIFO は開かずに `NotRegularFile`（open の副作用が無く、止まらない）。
+    #[test]
+    fn sec4_2429_rejects_fifo_without_opening() {
+        let (_g, dir) = work_dir("fifo");
+        let fifo = dir.join("p");
+        let mut cmd = Command::new("mkfifo");
+        cmd.arg(&fifo);
+        run_limited(cmd);
+        assert_eq!(
+            kind(AuditFileWriter::open(&fifo)),
+            AuditWriteErrorKind::NotRegularFile
+        );
+    }
+
+    /// 親ディレクトリ・ファイルに拡張 ACL（mode bits を迂回できる）が付いていれば `InsecureFile`。
+    #[test]
+    fn sec4_2429_rejects_extended_acl_on_parent_and_file() {
+        let (_g, dir) = work_dir("acl");
+        add_ace(&dir, "everyone allow add_file");
+        assert_eq!(
+            kind(AuditFileWriter::open(&dir.join("audit.log"))),
+            AuditWriteErrorKind::InsecureFile
+        );
+        let mut strip = Command::new("chmod");
+        strip.arg("-N").arg(&dir);
+        run_limited(strip);
+
+        let file = dir.join("acl.log");
+        drop(AuditFileWriter::open(&file).expect("create"));
+        add_ace(&file, "everyone allow write");
+        assert_eq!(
+            kind(AuditFileWriter::open(&file)),
+            AuditWriteErrorKind::InsecureFile
+        );
     }
 }

@@ -7,7 +7,8 @@
 //!
 //! 役割分担: 写像表そのものの単体照合は `src/error.rs`、状態遷移と巻き戻しは
 //! `runtime_service_runtime.rs`、本物の pull 経路は `image_pull.rs`（unix 限定）が担う。
-//! 本ファイルは「区分×メッセージの素通し」だけを 3 OS で見て、状態の副作用は再照合しない。
+//! 本ファイルは「区分×メッセージの素通し」だけを 3 OS で見て、状態の副作用は再照合しない
+//! （例外: `err3_bundle_prepare_timeout_*` は #2899 の受け入れ条件のため、`release` と記録の除去も照合する）。
 //!
 //! `ErrorCode`・`OciErrorCode` は `#[non_exhaustive]` のため、下の表は現時点の区分の列挙であり網羅保証ではない。
 //! 未知の区分を `Internal` へ倒す fail-closed は `src/error.rs` 側の責務である。
@@ -20,7 +21,9 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::image_pull::{ImagePuller, PullError, PullRequest, PulledImage};
 use fandhe_container_cri::image_service::{CriImageService, InMemoryImageStore};
@@ -46,6 +49,15 @@ const TRAIT_CODES: [(ErrorCode, Code); 10] = [
     (ErrorCode::Unavailable, Code::Unavailable),
     (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
 ];
+
+/// REPAIR-1・ERR-3: 区分表が `ErrorCode::ALL` の全 variant を過不足なく持つ（足し忘れの検出）。
+#[test]
+fn err3_trait_codes_table_covers_every_error_code() {
+    assert_eq!(TRAIT_CODES.len(), ErrorCode::ALL.len());
+    for c in ErrorCode::ALL {
+        assert!(TRAIT_CODES.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+    }
+}
 
 /// 操作ごとに失敗コードを注入できるフェイクの実行層。
 #[derive(Default)]
@@ -107,11 +119,20 @@ impl ContainerRuntime for Shared {
 #[derive(Default)]
 struct FakeBundles {
     fail_prepare: AtomicBool,
+    /// true のとき prepare は rootfs 用意の期限切れ（`Timeout`）で失敗する（#2899・A3）。
+    timeout_prepare: AtomicBool,
+    /// `release` の呼び出し回数（#2899・A3）。
+    releases: AtomicUsize,
 }
 
 impl BundleProvider for FakeBundles {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let container_id = req.container_id;
+        if self.timeout_prepare.load(Ordering::SeqCst) {
+            return Err(CriError::timeout(
+                "image rootfs preparation exceeded its deadline",
+            ));
+        }
         if self.fail_prepare.load(Ordering::SeqCst) {
             return Err(CriError::resource_exhausted("bundle storage is full"));
         }
@@ -120,9 +141,10 @@ impl BundleProvider for FakeBundles {
         } else {
             PathBuf::from("/bundles")
         };
-        Ok(root.join(container_id))
+        Ok(PreparedBundle::new(root.join(container_id)))
     }
     fn release(&self, _: &str) -> Result<(), CriError> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -343,6 +365,53 @@ async fn err3_bundle_prepare_resource_exhausted_reaches_status() {
     );
 }
 
+/// ERR-3・REPAIR-5・CRI-2（#2899）: rootfs 用意の `Timeout` が `DEADLINE_EXCEEDED` とメッセージのまま届き、
+/// dispatch 前の失敗として `release` が 1 回呼ばれ、記録（名前キー）が残らない。実行層の `create` も呼ばれない。
+#[tokio::test]
+async fn err3_bundle_prepare_timeout_maps_to_deadline_exceeded_and_releases() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.bundles.timeout_prepare.store(true, Ordering::SeqCst);
+    let err = create(&h.service, &sb)
+        .await
+        .expect_err("prepare must time out");
+    assert_eq!(
+        pair(&err),
+        (
+            Code::DeadlineExceeded,
+            "image rootfs preparation exceeded its deadline".to_string()
+        )
+    );
+    assert!(h.runtime.calls.lock().unwrap().is_empty());
+    assert_eq!(h.bundles.releases.load(Ordering::SeqCst), 1);
+    let listed = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest { filter: None }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers
+    .len();
+    assert_eq!(listed, 0);
+    let recorded: Vec<(CriOpKind, &str)> = h
+        .recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.kind() == CriOpKind::CreateContainer)
+        .map(|s| (s.kind(), code_name(s.code())))
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![(CriOpKind::CreateContainer, "DEADLINE_EXCEEDED")]
+    );
+    // 名前キーが解放されているので、同じ名前で作り直せる。
+    h.bundles.timeout_prepare.store(false, Ordering::SeqCst);
+    create(&h.service, &sb).await.expect("re-create");
+}
+
 /// ERR-3・ERR-2: 実行層の長いメッセージ（6000 バイト）が RPC 経由でも 4095 バイト（4096 は文字の途中）に
 /// 1 回だけ切り詰められ、元の接頭辞のまま UTF-8 として妥当に届く。
 #[tokio::test]
@@ -502,4 +571,70 @@ async fn err3_pull_image_already_exists_maps_to_internal() {
         .map(|s| code_name(s.code()))
         .collect();
     assert_eq!(recorded, vec!["INTERNAL"]);
+}
+
+/// CRI-3・ERR-3・REPAIR-4: `PullImage` で 429・503・状態なしは同じ `UNAVAILABLE` のまま、
+/// メタデータ `fandhe-registry-http-status`（と 429 の固定文言）で区別できる。参照や上流文言は漏れない。
+#[tokio::test]
+async fn err3_pull_image_429_is_distinguishable_from_other_unavailable() {
+    use fandhe_container_cri::error::REGISTRY_HTTP_STATUS_METADATA_KEY;
+    let cases = [
+        (Some(429u16), "registry rate limit exceeded", Some("429")),
+        (Some(503), "registry is unavailable", Some("503")),
+        (None, "registry is unavailable", None),
+    ];
+    for (http, msg, meta) in cases {
+        let mut oe = OciError::new(
+            OciErrorCode::Unavailable,
+            "upstream detail private.example.com/team/app token=dummy",
+        );
+        if let Some(h) = http {
+            oe = oe.with_http_status(h);
+        }
+        let puller = Arc::new(FakePuller {
+            err: PullError::from_oci(&oe),
+            calls: AtomicUsize::new(0),
+        });
+        let recorder = Arc::new(Collect::default());
+        let svc = CriImageService::with_store_and_recorder(
+            Arc::new(InMemoryImageStore::new()),
+            recorder.clone(),
+        )
+        .with_puller(puller.clone());
+        let req = v1::PullImageRequest {
+            image: Some(ImageSpec {
+                image: "private.example.com/team/app:1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = ImageService::pull_image(&svc, Request::new(req))
+            .await
+            .expect_err("pull must fail");
+        assert_eq!(pair(&err), (Code::Unavailable, msg.to_string()), "{http:?}");
+        let got = err
+            .metadata()
+            .get(REGISTRY_HTTP_STATUS_METADATA_KEY)
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(got.as_deref(), meta, "{http:?}");
+        for leaked in ["private.example.com", "upstream detail", "token="] {
+            assert!(!err.message().contains(leaked), "{http:?} leaked {leaked}");
+        }
+        assert_eq!(puller.calls.load(Ordering::SeqCst), 1, "{http:?}");
+        // 操作記録にも HTTP 状態の区分が載る（#2966・REPAIR-4）。
+        let samples = recorder.0.lock().unwrap().clone();
+        assert_eq!(samples.len(), 1, "{http:?}");
+        let expected_class = match http {
+            Some(429) => Some(fandhe_container_cri::instrument::RegistryHttpClass::RateLimited),
+            Some(503) => Some(fandhe_container_cri::instrument::RegistryHttpClass::ServerError),
+            _ => None,
+        };
+        assert_eq!(samples[0].registry_http(), expected_class, "{http:?}");
+        let listed =
+            ImageService::list_images(&svc, Request::new(v1::ListImagesRequest::default()))
+                .await
+                .expect("list")
+                .into_inner();
+        assert!(listed.images.is_empty(), "{http:?}");
+    }
 }

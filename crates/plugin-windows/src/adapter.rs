@@ -6,7 +6,7 @@
 //! 共有マウントの準備・解除へ対応づける。platform-windows の失敗は [`to_plugin_error`] で 1 箇所に集約し、
 //! plugin のエラーフレーム（`code` / `message`）として core へ返す。
 //!
-//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕 で確定）
+//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕 で確定）
 //! | 操作 | 要求本体 | 成功応答本体 |
 //! | ---- | -------- | ------------ |
 //! | create | `["create", id, distro, policy, (mount_name, host_dir, mode)*]` | `["created", "", ""]` |
@@ -52,7 +52,7 @@
 //! マウントを行う。したがって本 plugin は Windows ホスト側プロセスとして動く前提である。非 Windows
 //! ビルド（WSL2 ゲスト内の Linux 等）では `wsl.exe` を解決できず、create は `UNIMPLEMENTED` で
 //! fail-closed になる（成功を装わない）。Windows ホスト上の UDS 接続は plugin 境界機構側が未対応で、
-//! #1869 の設計で確定する（REPAIR-3）。
+//! #1869 の設計（承認と実装 issue の起票は #2232）で確定する（REPAIR-3）。
 //!
 //! # 外部入力の扱い
 //! 受信文字列はすべて untrusted。platform-windows へは検証済み newtype（`DistroName`・`MountName`・
@@ -88,7 +88,7 @@ pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
 /// 要求元（core 側 proxy）の plugin RPC 既定期限 `UDS_RPC_TIMEOUT_DEFAULT`（上限も同じ値）から
 /// [`RESPONSE_MARGIN`] を引いた値で、起点は要求の処理開始時。検出・マウント準備・回復・解除の各段には
 /// この期限の残り時間から配分するため、成功応答も失敗時の解除結果も RPC 期限内に要求元へ届く。
-/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計で確定。
+/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計〔起票は #2232〕で確定。
 /// REPAIR-3）。期限切れになった `wsl.exe` を kill して回収する猶予（platform-windows 側）は含まない。
 pub const REQUEST_BUDGET: Duration = UDS_RPC_TIMEOUT_DEFAULT.saturating_sub(RESPONSE_MARGIN);
 
@@ -125,26 +125,52 @@ const MSG_BAD_ID: &str = "invalid container id";
 
 // ---- エラー変換（受け入れ基準 2）----
 
+/// `WinErrorCode` から plugin のエラーフレームの code への写像表（ERR-1・REPAIR-1）。
+///
+/// 3 列目は元の分類名を message 先頭に残すか。`WinErrorCode` は `#[non_exhaustive]` で `_` に黙って
+/// 吸収されやすいため、`WinErrorCode::ALL` と同じ件数の表にして試験で網羅を照合する。
+const WIN_TO_PLUGIN: [(WinErrorCode, PluginErrorCode, bool); 9] = [
+    (
+        WinErrorCode::InvalidArgument,
+        PluginErrorCode::InvalidArgument,
+        false,
+    ),
+    (WinErrorCode::NotFound, PluginErrorCode::NotFound, false),
+    (
+        WinErrorCode::PermissionDenied,
+        PluginErrorCode::PermissionDenied,
+        false,
+    ),
+    (
+        WinErrorCode::ResourceExhausted,
+        PluginErrorCode::FailedPrecondition,
+        true,
+    ),
+    (
+        WinErrorCode::Unimplemented,
+        PluginErrorCode::Unimplemented,
+        false,
+    ),
+    (
+        WinErrorCode::FailedPrecondition,
+        PluginErrorCode::FailedPrecondition,
+        false,
+    ),
+    (WinErrorCode::Timeout, PluginErrorCode::Timeout, false),
+    (WinErrorCode::DataLoss, PluginErrorCode::DataLoss, false),
+    (WinErrorCode::Internal, PluginErrorCode::Internal, false),
+];
+
 /// platform-windows のエラー分類を plugin のエラーフレームへ変換する唯一の箇所（ERR-1）。
 ///
-/// plugin 側に `RESOURCE_EXHAUSTED` が無いため `FAILED_PRECONDITION` へ写し、message 先頭に元の分類を残す。
-/// `#[non_exhaustive]` の将来追加分は `Internal`（fail-closed）。長さ上限は `PluginError::new` が担う。
+/// `ResourceExhausted` は既存のワイヤー互換のため `FAILED_PRECONDITION` へ写し、message 先頭に元の分類を
+/// 残す（`PluginErrorCode` に `RESOURCE_EXHAUSTED` はあるが、写し先の変更はワイヤーが変わるため据え置き）。
+/// 表に無い将来追加分は `Internal`（fail-closed）。長さ上限は `PluginError::new` が担う。
 pub fn to_plugin_error(code: WinErrorCode, message: &str) -> PluginError {
-    let plain = |c| PluginError::new(c, message);
-    match code {
-        WinErrorCode::InvalidArgument => plain(PluginErrorCode::InvalidArgument),
-        WinErrorCode::NotFound => plain(PluginErrorCode::NotFound),
-        WinErrorCode::PermissionDenied => plain(PluginErrorCode::PermissionDenied),
-        WinErrorCode::Unimplemented => plain(PluginErrorCode::Unimplemented),
-        WinErrorCode::FailedPrecondition => plain(PluginErrorCode::FailedPrecondition),
-        WinErrorCode::Timeout => plain(PluginErrorCode::Timeout),
-        WinErrorCode::DataLoss => plain(PluginErrorCode::DataLoss),
-        WinErrorCode::Internal => plain(PluginErrorCode::Internal),
-        WinErrorCode::ResourceExhausted => PluginError::new(
-            PluginErrorCode::FailedPrecondition,
-            format!("{}: {message}", code.as_str()),
-        ),
-        _ => plain(PluginErrorCode::Internal),
+    match WIN_TO_PLUGIN.iter().find(|(c, _, _)| *c == code) {
+        Some((_, pc, true)) => PluginError::new(*pc, format!("{}: {message}", code.as_str())),
+        Some((_, pc, false)) => PluginError::new(*pc, message),
+        None => PluginError::new(PluginErrorCode::Internal, message),
     }
 }
 
@@ -977,6 +1003,16 @@ mod tests {
             let e = to_plugin_error(w, "m");
             assert_eq!(e.code().as_str(), code);
             assert_eq!(e.message(), msg);
+        }
+    }
+
+    /// REPAIR-1・ERR-1: 写像表が `WinErrorCode::ALL` を過不足なく覆い、キーに重複がない。
+    #[test]
+    fn err1_win_to_plugin_table_covers_win_error_code_all() {
+        assert_eq!(WIN_TO_PLUGIN.len(), WinErrorCode::ALL.len());
+        for w in WinErrorCode::ALL {
+            let n = WIN_TO_PLUGIN.iter().filter(|(c, _, _)| *c == w).count();
+            assert_eq!(n, 1, "{w:?}");
         }
     }
 

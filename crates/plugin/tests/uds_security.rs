@@ -1,5 +1,11 @@
 //! runtime directory 解決・作成の結合試験（PLUG-12・TASK-123.1・#286、フォールバックは TASK-123.4・#289）。root・特権不要（別 UID 所有ディレクトリの拒否試験のみ TASK-123.5・#290 の実機前提テストとして `#[ignore]` 分離）。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
 #[cfg(not(unix))]
 #[test]
 fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
@@ -11,11 +17,15 @@ fn plug12_runtime_dir_is_unimplemented_on_non_unix() {
 }
 
 #[cfg(unix)]
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+#[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{PluginErrorCode, RUNTIME_DIR_NAME, RuntimeDir, UdsListener};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -27,13 +37,8 @@ mod unix {
             Self::new_in(PathBuf::from("/tmp"))
         }
         fn new_in(root: PathBuf) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = root.join(format!(
-                "fcrd-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create_in(&root, "fcrd").unwrap();
             Self(p)
         }
         fn rt(&self) -> PathBuf {
@@ -406,10 +411,10 @@ mod unix {
         let d = RuntimeDir::ensure_under(&t.0).unwrap();
         let p = d.path().join("s.sock");
         let fifo = d.path().join("s.sock.lock");
-        let st = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
+        let mut mkfifo = std::process::Command::new("mkfifo");
+        mkfifo.arg(&fifo);
+        let st = crate::reap::run_within(&mut mkfifo, crate::reap::reap_within())
+            .unwrap_or_else(|e| panic!("mkfifo at lock name: {e}"));
         assert!(st.success());
         let (tx, rx) = std::sync::mpsc::channel();
         let path = p.clone();

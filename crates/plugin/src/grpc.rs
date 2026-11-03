@@ -870,6 +870,11 @@ mod uds {
     /// accept の I/O エラー（fd 枯渇等）は `Err` として流し、tonic が記録して継続する。直後は 10ms の
     /// バックオフを挟み busy loop を避ける（REPAIR-5）。
     ///
+    /// close-on-exec（PLUG-7・SEC-1・#3262）: 待ち受け fd は `UdsListener::bind`（spawn ゲートの中）で作った fd の
+    /// `F_DUPFD_CLOEXEC` による複製で原子的。accept で得る接続は macOS では mio が `accept(2)` の後に
+    /// `fcntl` で立てるため非原子でゲート外。同じプロセスに `spawn_gate::spawn` が無い間は実害がない
+    /// （範囲と見直す条件は `spawn_gate` のモジュール doc を参照）。
+    ///
     /// `new` は tokio ランタイムの内側で呼ぶこと（reactor へ登録するため）。
     pub struct UdsIncoming {
         /// 非同期 accept 用（`listener` の fd を dup したもの）。
@@ -1080,6 +1085,9 @@ mod uds {
     /// `Channel` が再接続するたびに呼ばれるため、接続ごとに server の peer UID を検証する。不一致・取得不能は
     /// 何も送らず切断し、監査イベントを通知する。失敗の `PluginError` は `last_error` へ残し、
     /// [`connect_uds_channel`] が tonic の汎用エラーの代わりに返す（コード契約を `UdsStream::connect` と揃える）。
+    ///
+    /// close-on-exec（#3262）: client の socket は macOS では mio が `socket(2)` の後に `fcntl` で立てるため
+    /// 非原子でゲート外（`spawn_gate` のモジュール doc を参照）。
     #[derive(Clone)]
     struct UdsConnector {
         path: Arc<PathBuf>,
@@ -1535,9 +1543,7 @@ mod uds_peer_auth_tests {
         PeerAuthObserver, PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection, UdsListener,
     };
     use std::io::{Read, Write};
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixStream as StdStream;
-    use std::sync::atomic::AtomicU32;
 
     type Events = Arc<Mutex<Vec<(PeerAuthOp, PeerAuthRejectReason)>>>;
     type BackoffEvents = Arc<Mutex<Vec<(Option<u32>, Option<u64>)>>>;
@@ -1559,27 +1565,44 @@ mod uds_peer_auth_tests {
         }
     }
 
-    struct TempDir(PathBuf);
+    struct TempDir(PathBuf, #[allow(dead_code)] crate::test_root::TestRoot);
     impl TempDir {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcgp-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-            Self(p)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // 残骸・PID 再利用との衝突を避けるため排他作成し、既存の名前は消さず別名で作る（0700。REPAIR-12・#3475）。
+            // 名前は sun_path のため短く保つ。
+            let root = crate::test_root::test_root("fcgp", "t");
+            Self(root.to_path_buf(), root)
         }
     }
 
     fn other_uid() -> u32 {
         crate::sys::effective_uid().wrapping_add(1)
+    }
+
+    /// nonblocking の client stream が切断（EOF または reset 系）を観測するまで期限つきで待つ。
+    /// 拒否側 server の close を待つ試験用の補助で、`set_read_timeout` が macOS で EINVAL になる
+    /// 競合を避ける（`crates/io` の `is_peer_shutdown_einval` と同じ事情。#2711・PLUG-12・REPAIR-5）。
+    /// 期限内に切断を観測できなければ panic する（期限切れを EOF 扱いにして通さない。REPAIR-12）。
+    fn read_until_disconnect(c: &mut StdStream, deadline: std::time::Instant) -> usize {
+        let mut buf = [0u8; 8];
+        loop {
+            match c.read(&mut buf) {
+                Ok(n) => return n,
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe => return 0,
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no disconnect observed from the rejecting server within the deadline"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => panic!("unexpected read error: {e:?}"),
+                },
+            }
+        }
     }
 
     /// サーバー側: 不一致の接続は切断され、Accept 拒否が 1 件通知され、
@@ -1598,11 +1621,13 @@ mod uds_peer_auth_tests {
         let path = incoming.path().to_path_buf();
         let client = std::thread::spawn(move || {
             let mut c = StdStream::connect(path).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // macOS では相手が先に閉じた socket への setsockopt(SO_RCVTIMEO) が EINVAL になる
+            // （サーバーの拒否・close と競合する。#2711）。set_read_timeout は使わず、
+            // setsockopt を伴わない set_nonblocking（FIONBIO）と期限つきの待ちで期限を保つ。
+            c.set_nonblocking(true).unwrap();
             // 先送りしたバイトは読まれない。切断されると EOF（Ok(0)）か reset になる。
             let _ = c.write_all(b"early");
-            let mut buf = [0u8; 8];
-            c.read(&mut buf).unwrap_or(0)
+            read_until_disconnect(&mut c, std::time::Instant::now() + Duration::from_secs(5))
         });
         // 拒否されるので stream は yield されず、Pending のまま（終了も Err もしない）。
         let polled = tokio::time::timeout(

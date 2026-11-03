@@ -57,6 +57,27 @@ impl NetErrorCode {
             Self::Internal => "INTERNAL",
         }
     }
+
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験が検出する。
+    pub const ALL: [NetErrorCode; 10] = [
+        Self::InvalidArgument,
+        Self::DataLoss,
+        Self::Timeout,
+        Self::PermissionDenied,
+        Self::Unimplemented,
+        Self::ResourceExhausted,
+        Self::NotFound,
+        Self::AlreadyExists,
+        Self::FailedPrecondition,
+        Self::Internal,
+    ];
+
+    /// [`Self::as_str`] の逆写像。完全一致だけを受け、未知の文字列は `None`（呼び出し側は fail-closed で扱う）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
 }
 
 /// `fandhe-container-net` 共通のエラー（`code` と `message`）。
@@ -99,6 +120,66 @@ impl Error for NetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: NetErrorCode) -> usize {
+        match code {
+            NetErrorCode::InvalidArgument => 0,
+            NetErrorCode::DataLoss => 1,
+            NetErrorCode::Timeout => 2,
+            NetErrorCode::PermissionDenied => 3,
+            NetErrorCode::Unimplemented => 4,
+            NetErrorCode::ResourceExhausted => 5,
+            NetErrorCode::NotFound => 6,
+            NetErrorCode::AlreadyExists => 7,
+            NetErrorCode::FailedPrecondition => 8,
+            NetErrorCode::Internal => 9,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err1_net_error_code_all_covers_every_variant() {
+        for (i, c) in NetErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(NetErrorCode::ALL.len(), 10);
+        let set: std::collections::HashSet<_> = NetErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 10);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err1_net_error_code_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (NetErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (NetErrorCode::DataLoss, "DATA_LOSS"),
+            (NetErrorCode::Timeout, "TIMEOUT"),
+            (NetErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (NetErrorCode::Unimplemented, "UNIMPLEMENTED"),
+            (NetErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (NetErrorCode::NotFound, "NOT_FOUND"),
+            (NetErrorCode::AlreadyExists, "ALREADY_EXISTS"),
+            (NetErrorCode::FailedPrecondition, "FAILED_PRECONDITION"),
+            (NetErrorCode::Internal, "INTERNAL"),
+        ];
+        assert_eq!(table.len(), NetErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(NetErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(NetErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(NetErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
 
     /// NET-11・ERR-1: code 文字列と Display の具体値。
     #[test]

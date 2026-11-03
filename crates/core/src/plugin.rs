@@ -10,10 +10,11 @@
 //!
 //! 再エクスポートと、照合済み fd から起動対象を作る変換 [`HashVerifiedPluginFile::into_launch_target`]
 //! （PLUG-11・#1857）を持つ。変換は `unsafe`・パスの再 open・新しい I/O を持たない。本番で起動 API を
-//! 呼ぶ配線は未実装（#1869）。macOS 等の起動直前の同一性確認も未実装（#1866）。
+//! 呼ぶ配線は未実装（設計は #1869、承認と実装 issue の起票は #2232）。macOS 等は起動直前に dev / ino を照合する（#1866。実装済み）。
 //! plugin の発見・登録（TASK-109）はこのゲート配下に置く予定だが未実装で、現時点では軽量化の効果はほぼない。
 //! CI への組み込みとサイズ記録は TASK-111.2（#263）で導入済み（`make plugin-feature-size`・docs/design/plugin-feature-size-record.md）。
-//! 最終バイナリでの効果の実測は TASK-79・TASK-109・TASK-110 の後に行う。
+//! `make plugin-feature-size` は CLI の実行ファイルの既定 / 除外を比べる（cli の `plugin` feature・supervisor の
+//! `default-features = false` で feature 伝播を設計済み。#3204）。ゲート配下に実装が入る TASK-109・TASK-110 の後に再計測する。
 //!
 //! # 注意
 //!
@@ -38,7 +39,7 @@ impl HashVerifiedPluginFile {
     /// 照合に使った fd をそのまま渡し（plugin 側で close-on-exec に複製される）、パスは開き直さない。
     /// `display` は検証時のパス、`exec` は実体の正規パス。`#!` スクリプト等は plugin 側が
     /// `InvalidArgument` で拒否し、パス起動へは縮退しない（fail-closed）。
-    /// 本番で起動を呼ぶ配線は #1869、エラーコードへの写像も呼び出し側（#1869）が決める。
+    /// 本番で起動を呼ぶ配線は #1869 の設計（承認と実装 issue の起票は #2232）、エラーコードへの写像も呼び出し側が決める。
     pub fn into_launch_target(self) -> Result<PluginLaunchTarget, PluginError> {
         let display = self.path().to_path_buf();
         let exec = self.resolved_path().to_path_buf();

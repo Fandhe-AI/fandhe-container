@@ -25,22 +25,22 @@ SHELL := /bin/bash
 
 .PHONY: help setup rustup submodule hooks lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
-	check-launch-target check-launch-target-selftest \
+	check-launch-target check-launch-target-selftest check-microvm-deps check-microvm-deps-selftest \
 	check-standalone-clippy check-standalone-clippy-selftest \
-	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
+	test-core-no-plugin check-cli-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
-	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest dns-helper-measure-selftest idle-memory-selftest \
+	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest repeat-test repeat-test-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest docker-hub-ratelimit-probe-selftest repeat-test repeat-test-selftest run-in-user-scope-selftest run-with-deadline-selftest test-bin-watchdog-selftest check-success-lines-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
-	startup-latency-docker startup-latency-report net-setup-timing small-files-compare dns-helper-measure idle-memory \
+	startup-latency-docker startup-latency-report net-setup-timing net-throughput-rtt net-throughput-rtt-compare small-files-compare mac-small-files-docker mac-small-files-report dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
-	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-build docker-shell \
+	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-hub-ratelimit-probe docker-build docker-shell \
 	docker-ci
 
 # --------------------------------------------------
@@ -112,6 +112,12 @@ poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-che
 check-cli-backend-deps: ## cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
 	@scripts/targets/check-cli-backend-deps.sh
 
+check-microvm-deps: ## 依存ツリー（ルート workspace と venus 試験治具。normal/build/dev・全ターゲット・全 feature）に rust-vmm 系の禁止クレートが含まれないことを検証する（MVM-4・TASK-73.1）
+	@scripts/with-workspace.sh check-microvm-deps scripts/check-microvm-deps.sh
+
+check-microvm-deps-selftest: ## check-microvm-deps の自己テスト（MVM-4・REPAIR-12。スタブの cargo のみ）
+	@scripts/check-microvm-deps-selftest.sh
+
 check-launch-target: ## plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
 	@scripts/targets/check-launch-target.sh
 
@@ -127,7 +133,10 @@ check-standalone-clippy-selftest: ## check-standalone-clippy の自己テスト�
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 	@scripts/targets/test-core-no-plugin.sh
 
-plugin-feature-size: ## core の既定 / plugin 除外 release ビルドの rlib サイズを記録する（PLUG-3・TASK-111.2）
+check-cli-no-plugin: ## CLI を --no-default-features で clippy し plugin 依存が入らないことを検証する（PLUG-3・#3204）
+	@scripts/targets/check-cli-no-plugin.sh
+
+plugin-feature-size: ## CLI の実行ファイルの既定 / plugin 除外 release ビルドのサイズを記録する（PLUG-3・TASK-111.2・#3204）
 	@scripts/targets/plugin-feature-size.sh
 
 plug4-core-invariance: ## plugin 追加前後で core の指紋が不変か別ビルドで比較する（PLUG-4・TASK-109.4）
@@ -179,11 +188,20 @@ guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /i
 guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
 	@scripts/build-guest-initrd-selftest.sh
 
+dev-fd-perm-probe: ## /dev/fd/N 経由の権限検査が macOS で効かない原因の観測（#2088・MAC-1。実機前提。make ci には含めない。--foreign は scripts/probe-dev-fd-perm.sh を直接実行）
+	@scripts/probe-dev-fd-perm.sh
+
+dev-fd-perm-probe-selftest: ## /dev/fd 権限検査の観測スクリプトの自己テスト（#2088・MAC-1・REPAIR-12。一時ファイルのみ）
+	@scripts/probe-dev-fd-perm-selftest.sh
+
 third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
 	@scripts/generate-third-party-licenses-selftest.sh
 
 deny-license-fail-closed-selftest: ## deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）
 	@scripts/targets/deny-license-fail-closed-selftest.sh
+
+deny-bans-fail-closed-selftest: ## deny.toml の [bans] の rust-vmm 禁止クレートの fail-closed 自己テスト（TASK-73.2・MVM-4・REPAIR-9）
+	@scripts/targets/deny-bans-fail-closed-selftest.sh
 
 bench-check-selftest: ## ベンチ回帰比較スクリプトの自己テスト（REPAIR-8）
 	@scripts/with-tools.sh jq scripts/check-bench-regression-selftest.sh
@@ -203,8 +221,14 @@ startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト
 net-setup-timing-selftest: ## ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
 	@scripts/with-tools.sh jq scripts/bench/net_setup_timing_selftest.sh
 
+net-throughput-rtt-selftest: ## iperf3 スループットと 1 バイト TCP 往復の計測・Docker 比スクリプトの自己テスト（NET-2・NET-3・REPAIR-12。実機・docker 不要）
+	@scripts/with-tools.sh jq scripts/bench/net_throughput_rtt_selftest.sh
+
 small-files-compare-selftest: ## bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
 	@scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
+
+mac-small-files-selftest: ## MAC-3 小ファイル多数計測スクリプトの自己テスト（REPAIR-12。実 Docker Desktop 不要。#1880）
+	@scripts/with-tools.sh jq scripts/bench/mac_small_files_selftest.sh
 
 dns-helper-measure-selftest: ## DNS ヘルパー計測スクリプトの自己テスト（NET-5・REPAIR-12。実機不要）
 	@scripts/with-tools.sh jq scripts/bench/dns_helper_measure_selftest.sh
@@ -233,8 +257,22 @@ install-launcher-selftest: ## 特権ランチャーのインストールスク�
 repeat-test-selftest: ## repeat-test スクリプトの自己テスト（REPAIR-12・#2538。スタブの cargo のみ）
 	@scripts/repeat-test-selftest.sh
 
+run-in-user-scope-selftest: ## 委譲スコープ実行補助の自己テスト（#3486・REPAIR-5・REPAIR-12。スタブの systemd-run / systemctl のみ）
+	@scripts/run-in-user-scope-selftest.sh
+
+test-bin-watchdog-selftest: ## 試験バイナリ watchdog（cargo の runner）の自己テスト（#3504・REPAIR-5・REPAIR-12。Linux のみ）
+	@scripts/test-bin-watchdog-selftest.sh
+run-with-deadline-selftest: ## scope を作らない期限つき実行補助の自己テスト（#3505・REPAIR-5・REPAIR-12。実プロセスのみ・Linux）
+	@scripts/run-with-deadline-selftest.sh
+
+check-success-lines-selftest: ## 実機前提テストの成功行照合スクリプトの自己テスト（REPAIR-12・#2768。fixture のみ）
+	@scripts/check-success-lines-selftest.sh
+
 crictl-smoke-selftest: ## crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
 	@scripts/with-tools.sh python3 scripts/cri/crictl-smoke-selftest.sh
+
+docker-hub-ratelimit-probe-selftest: ## Docker Hub 匿名 pull 残量プローブの自己テスト（CRI-3・REPAIR-12・#2818。スタブの curl のみ）
+	@scripts/cri/docker-hub-ratelimit-probe-selftest.sh
 
 # --------------------------------------------------
 # 依存監査・ライセンス表記
@@ -284,7 +322,7 @@ bench-baseline: ## ベンチを実行し baseline.json を再生成する（TASK
 # 実機前提の計測・突き合わせ（make ci には含めない。必須変数は各スクリプト冒頭を参照）
 # --------------------------------------------------
 
-cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT）または compare（BASELINE/CANDIDATE）を実行する
+cli-parity: ## CLI 3 OS 比較の capture（CLI/OUTPUT。任意で TIMEOUT=1〜600 秒）または compare（BASELINE/CANDIDATE）を実行する
 	@scripts/targets/cli-parity.sh
 
 fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実機。TARGET_DIR/LABEL 必須）
@@ -293,10 +331,10 @@ fio-bench: ## fio 4K ランダム write ベンチを実行する（要 fio・実
 fio-baseline-ratio: ## fio ベースライン比を算出する（BASELINE/CANDIDATE に results.json のパスを指定）
 	@scripts/targets/fio-baseline-ratio.sh
 
-startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+startup-latency: ## 起動時間を計測する（実機前提。RUNTIME=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL OUTPUT）
 	@scripts/targets/startup-latency.sh
 
-startup-latency-docker: ## Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。TASK-46.2）
+startup-latency-docker: ## Docker の起動時間を計測する（実機前提。DOCKER=<docker の絶対パス> 必須。任意: ITERATIONS WARMUP TIMEOUT LABEL IMAGE OUTPUT。TASK-46.2）
 	@scripts/targets/startup-latency-docker.sh
 
 startup-latency-report: ## own と Docker の起動時間の結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-46.2）
@@ -304,6 +342,18 @@ startup-latency-report: ## own と Docker の起動時間の結果を 1 つの�
 
 net-setup-timing: ## ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
 	@scripts/targets/net-setup-timing.sh
+
+net-throughput-rtt: ## iperf3 スループットと 1 バイト TCP 往復を計測し JSON で出力する（実機前提。PROBE・EXE 必須。TARGET=docker|both は docker を使うため人間の承認後。NET-2・NET-3・TASK-140 準備）
+	@scripts/targets/net-throughput-rtt.sh
+
+net-throughput-rtt-compare: ## 2 つの計測結果から Docker 比（%）と p50・p99 の倍率を出す（OWN_RESULT・DOCKER_RESULT 必須。合否なし。NET-2・NET-3）
+	@scripts/targets/net-throughput-rtt-compare.sh
+
+mac-small-files-docker: ## Docker Desktop 側の小ファイル多数ワークロードを計測する（実機前提。DOCKER=<絶対パス> HOST_DIR=<絶対パス> 必須。MAC-3・TASK-70 準備・#1880）
+	@scripts/targets/mac-small-files-docker.sh
+
+mac-small-files-report: ## own と Docker Desktop の小ファイル多数の結果を統合する（OWN_RESULT=<file> BASELINE_RESULT=<file> 必須。合否は出さない。MAC-3・#1880）
+	@scripts/targets/mac-small-files-report.sh
 
 small-files-compare: ## bind / named volume の 2 構成で small_files を回し JSON で出力する（実機前提。BIND_ROOT・VOLUME_ROOT 必須。IO-7・TASK-24.1）
 	@scripts/targets/small-files-compare.sh
@@ -335,11 +385,14 @@ supervisor-independence: ## 監視プロセス 1 個を kill して他の継続�
 restart-latency: ## restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
 	@scripts/targets/restart-latency.sh
 
-repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<名> と TEST=<lib 試験の完全名> または TEST_BIN=<名> SUCCESS_LINE=<成功行> [TEST_IGNORED=1]、[COUNT=300 RUN_TIMEOUT=120]。REPAIR-12・#2538・#2660）
+repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<名> と TEST=<lib 試験の完全名> または TEST_BIN=<名> と SUCCESS_LINE=<成功行> または LIBTEST_NAME=<ハーネス内の試験名> [TEST_IGNORED=1]、[USER_SCOPE=1 委譲スコープで直接実行]、[TEST_ENV='FANDHE_CONTAINER_X=1 ...']、[FEATURES=<a,b>]、[FORBIDDEN_LINE='a|b' 出たら失敗]、[COUNT=300 RUN_TIMEOUT=120]。REPAIR-12・#2538・#2660・#2711・#2886・#2962）
 	@scripts/targets/repeat-test.sh
 
 crictl-smoke: ## crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
 	@scripts/targets/crictl-smoke.sh
+
+docker-hub-ratelimit-probe: ## Docker Hub の匿名 pull 残量の事前確認（実機前提・外向き通信が要る。[PROBE_REPO= PROBE_TAG= PROBE_TIMEOUT_SECS= PROBE_MIN_REMAINING=]。CRI-3・#2818・#3312）
+	@scripts/cri/docker-hub-ratelimit-probe.sh
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

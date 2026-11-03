@@ -2,20 +2,28 @@
 //!
 //! 生成物を core の `oci_runtime::parse_config_bytes` で読み戻し、具体値で照合する。
 
+use std::num::NonZeroU32;
+
 use fandhe_container_core::oci_runtime::{self, NamespaceKind};
 use fandhe_container_cri::bundle::spec::{
-    MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS, MAX_PATH_BYTES,
-    MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
+    MAX_ADDITIONAL_GIDS, MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS,
+    MAX_PATH_BYTES, MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
 };
-use fandhe_container_cri::bundle::{ImageDefaults, build_runtime_config, validate_config};
+use fandhe_container_cri::bundle::{
+    BundleFiles, ImageDefaults, PodNamespacePaths, build_runtime_config,
+    build_runtime_config_with_files, build_runtime_config_with_pod_namespaces,
+    build_runtime_config_with_pod_netns, resolve_log_path, validate_config,
+    validate_config_with_pods,
+};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
-    Capability, ContainerConfig, ContainerMetadata, ImageSpec, Int64Value, KeyValue,
+    Capability, ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec, Int64Value, KeyValue,
     LinuxContainerConfig, LinuxContainerResources, LinuxContainerSecurityContext,
     LinuxPodSandboxConfig, LinuxSandboxSecurityContext, Mount, MountPropagation, NamespaceMode,
     NamespaceOption, PodSandboxConfig, PodSandboxMetadata, SecurityProfile, UserNamespace,
     security_profile::ProfileType,
 };
+use fandhe_container_cri::runtime::v1::{CdiDevice, Device};
 use serde_json::Value;
 
 fn pod() -> PodSandboxConfig {
@@ -71,6 +79,34 @@ fn s(v: &Value) -> &str {
     v.as_str().expect("string")
 }
 
+/// CRI-2・CORE-5・SEC-1: readonly_rootfs=true は root.readonly=true へ写り、core が読み戻す（#2827）。
+#[test]
+fn cri2_core5_readonly_rootfs_maps_to_root_readonly() {
+    let c = with_sc(|sc| sc.readonly_rootfs = true);
+    let v = build(&pod(), &c);
+    assert_eq!(
+        v["root"],
+        serde_json::json!({"path": "rootfs", "readonly": true})
+    );
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("build");
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.root().readonly());
+    assert!(cfg.unapplied_fields().is_empty());
+}
+
+/// readonly_rootfs=false・security context なしは従来の出力のまま（readonly キーなし）。
+#[test]
+fn cri2_readonly_rootfs_false_keeps_output_unchanged() {
+    let a = build_runtime_config(&pod(), &ctr(), &ImageDefaults::default()).expect("build");
+    let f = with_sc(|sc| sc.readonly_rootfs = false);
+    let b = build_runtime_config(&pod(), &f, &ImageDefaults::default()).expect("build");
+    assert_eq!(a, b);
+    let v: Value = serde_json::from_slice(b.as_bytes()).expect("json");
+    assert_eq!(v["root"], serde_json::json!({"path": "rootfs"}));
+    let cfg = oci_runtime::parse_config_bytes(b.as_bytes()).expect("core parses it");
+    assert!(!cfg.root().readonly());
+}
+
 /// CRI-1: crictl 疎通確認の fixture（scripts/testdata/cri/{pod,container}.json と同内容）が core の parser に通る。
 #[test]
 fn cri_1_crictl_smoke_fixture_round_trip() {
@@ -115,6 +151,12 @@ fn limits_match_core_constants() {
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_MASKED_PATHS);
     assert_eq!(MAX_PROTECTED_PATHS, oci_runtime::CONFIG_MAX_READONLY_PATHS);
     assert_eq!(MAX_HOSTNAME_BYTES, oci_runtime::CONFIG_MAX_HOSTNAME_BYTES);
+    // pod の sysctls の件数上限は CRI の集合の上限と core の `linux.sysctl` の上限が同値（#2670）。
+    assert_eq!(
+        fandhe_container_cri::runtime_service::MAX_CONFIG_COLLECTION_ENTRIES,
+        fandhe_container_core::sysctl::SYSCTL_MAX_ENTRIES
+    );
+    assert_eq!(MAX_ADDITIONAL_GIDS, oci_runtime::CONFIG_MAX_ADDITIONAL_GIDS);
 }
 
 #[test]
@@ -172,6 +214,92 @@ fn env_merge_is_deterministic_and_container_overrides_image() {
         v["process"]["env"],
         serde_json::json!(["A=img", "B=ctr", "C=x=y"])
     );
+}
+
+/// CRI-2・CORE-4（#2672）: `linux.cgroup_parent` は判断が出るまで `UNIMPLEMENTED`。固定文言で、値を message に含めない。
+/// 空文字列（未指定）は拒否しない。
+#[test]
+fn cri2_core4_cgroup_parent_is_rejected_with_fixed_message() {
+    let long = "a".repeat(4097);
+    let cases: [(&str, &str); 5] = [
+        ("kubepods", "kubepods"),
+        ("/kubepods/burstable/pod-abc", "pod-abc"),
+        ("kubepods-burstable-pod_abc.slice", "pod_abc"),
+        ("../escape", "escape"),
+        (long.as_str(), "aaaa"),
+    ];
+    for (value, leak) in cases {
+        let mut p = pod();
+        p.linux = Some(LinuxPodSandboxConfig {
+            cgroup_parent: value.into(),
+            ..Default::default()
+        });
+        let e = build_runtime_config(&p, &ctr(), &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented, "{value}");
+        assert_eq!(e.message(), "linux.cgroup_parent is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &ctr()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented, "{value}");
+        assert_eq!(e.message(), "linux.cgroup_parent is not supported");
+    }
+    let mut p = pod();
+    p.linux = Some(LinuxPodSandboxConfig::default());
+    build_runtime_config(&p, &ctr(), &ImageDefaults::default())
+        .expect("empty cgroup_parent is accepted");
+}
+
+/// CRI-2・GPU-1（#2673）: `devices` / `cdi_devices` は判断が出るまで `UNIMPLEMENTED`。固定文言で、値を message に含めない。
+/// 両方指定は先に評価する `devices` の文言。空は拒否しない。
+#[test]
+fn cri2_gpu1_devices_and_cdi_devices_are_rejected_with_fixed_message() {
+    let long = "a".repeat(4097);
+    let dev = |path: &str, perms: &str| Device {
+        container_path: path.into(),
+        host_path: path.into(),
+        permissions: perms.into(),
+    };
+    let cases = [
+        (dev("/dev/nvidia0", "rwm"), "nvidia0"),
+        (dev("/dev/../etc/shadow", "rwm"), "shadow"),
+        (dev(long.as_str(), "rwm"), "aaaa"),
+        (dev("/dev/x\u{1}y", "r\u{7}"), "/dev/x"),
+    ];
+    for (d, leak) in cases {
+        let mut c = ctr();
+        c.devices = vec![d];
+        let p = pod();
+        let e = build_runtime_config(&p, &c, &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "devices is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &c).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "devices is not supported");
+    }
+    for (name, leak) in [
+        ("nvidia.com/gpu=all", "nvidia"),
+        ("vendor.example/class=dev0", "dev0"),
+        (long.as_str(), "aaaa"),
+    ] {
+        let mut c = ctr();
+        c.cdi_devices = vec![CdiDevice { name: name.into() }];
+        let p = pod();
+        let e = build_runtime_config(&p, &c, &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "cdi_devices is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &c).unwrap_err();
+        assert_eq!(e.message(), "cdi_devices is not supported");
+    }
+    let mut c = ctr();
+    c.devices = vec![dev("/dev/nvidia0", "rwm")];
+    c.cdi_devices = vec![CdiDevice {
+        name: "nvidia.com/gpu=all".into(),
+    }];
+    let e = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap_err();
+    assert_eq!(e.message(), "devices is not supported");
+    build_runtime_config(&pod(), &ctr(), &ImageDefaults::default())
+        .expect("empty devices and cdi_devices are accepted");
 }
 
 #[test]
@@ -233,6 +361,322 @@ fn user_mapping() {
     assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
 }
 
+/// CRI-2・SEC-1（#2666）: drop_capabilities は OCI 既定集合から除いた集合を 3 集合へ書き、core で読み戻せる。
+#[test]
+fn cri2_drop_capabilities_acceptance() {
+    let caps = |names: &[&str]| {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        with_sc(|sc| {
+            sc.capabilities = Some(Capability {
+                drop_capabilities: names,
+                ..Default::default()
+            });
+        })
+    };
+    let read_back = |c: &ContainerConfig| {
+        let json = build_runtime_config(&pod(), c, &ImageDefaults::default()).expect("build");
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+        assert!(
+            cfg.unapplied_fields().is_empty(),
+            "{:?}",
+            cfg.unapplied_fields()
+        );
+        let core: Vec<&str> = cfg.capabilities().iter().map(|c| c.as_str()).collect();
+        (v, core)
+    };
+    let names_of = |v: &Value, key: &str| -> Vec<String> {
+        v["process"]["capabilities"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect()
+    };
+    // 指定なしは capabilities を書かない（core の既定の 14 個）。
+    assert!(
+        build(&pod(), &ctr())["process"]
+            .get("capabilities")
+            .is_none()
+    );
+
+    // NET_RAW だけ drop: 既定 14 個から 13 個。
+    let (v, core) = read_back(&caps(&["NET_RAW"]));
+    let want = [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_KILL",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SYS_CHROOT",
+        "CAP_MKNOD",
+        "CAP_AUDIT_WRITE",
+        "CAP_SETFCAP",
+    ];
+    for key in ["bounding", "effective", "permitted"] {
+        assert_eq!(names_of(&v, key), want, "{key}");
+    }
+    assert!(v["process"]["capabilities"].get("ambient").is_none());
+    assert!(v["process"]["capabilities"].get("inheritable").is_none());
+    assert_eq!(core, want);
+
+    // 小文字・CAP_ 接頭辞つき・重複は同じ扱い。MKNOD も落ちて 12 個。
+    // containerd では `CAP_MKNOD` は no-op になる（既知の差。#2812）。
+    let (_, core) = read_back(&caps(&["cap_net_raw", "CAP_MKNOD", "net_raw"]));
+    assert_eq!(core.len(), 12);
+    assert!(!core.contains(&"CAP_NET_RAW") && !core.contains(&"CAP_MKNOD"));
+
+    // ALL は全 drop（3 集合とも空）。
+    let (v, core) = read_back(&caps(&["ALL"]));
+    assert!(names_of(&v, "bounding").is_empty() && names_of(&v, "permitted").is_empty());
+    assert!(core.is_empty());
+
+    // 既定に無い capability の drop は no-op（14 個のまま）。
+    let (_, core) = read_back(&caps(&["SYS_ADMIN"]));
+    assert_eq!(core.len(), 14);
+
+    // 未知名・空・長すぎる名前・非 ASCII は INVALID_ARGUMENT で、名前をエラーに載せない。
+    for bad in ["NOPE", "", "CAP_", "A".repeat(33).as_str(), "ＫＩＬＬ"] {
+        let e = build_runtime_config(&pod(), &caps(&[bad]), &ImageDefaults::default())
+            .expect_err("must be rejected");
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad:?}");
+        if !bad.is_empty() {
+            assert!(!e.to_string().contains(bad), "{bad:?}");
+        }
+    }
+    // 検証段（validate_config）でも同じく拒否する。
+    assert!(validate_config(&pod(), &caps(&["NOPE"])).is_err());
+    assert!(validate_config(&pod(), &caps(&["NET_RAW"])).is_ok());
+}
+
+/// CRI-2・SEC-5（#2664）: run_as_username は解決済みの (uid, gid) を採り、形式・相互排他・未解決を拒否する。
+#[test]
+fn run_as_username_acceptance() {
+    let u = |v: i64| Some(Int64Value { value: v });
+    let resolved = ImageDefaults {
+        resolved_run_as_username: Some((1000, 1001)),
+        ..Default::default()
+    };
+    let ids = |c: &ContainerConfig, img: &ImageDefaults| {
+        build_runtime_config(&pod(), c, img).map(|j| {
+            let v: Value = serde_json::from_slice(j.as_bytes()).unwrap();
+            (
+                v["process"]["user"]["uid"].as_u64().unwrap(),
+                v["process"]["user"]["gid"].as_u64().unwrap(),
+            )
+        })
+    };
+    let named = with_sc(|sc| sc.run_as_username = "app".into());
+    assert_eq!(ids(&named, &resolved).unwrap(), (1000, 1001));
+    let with_group = with_sc(|sc| {
+        sc.run_as_username = "app".into();
+        sc.run_as_group = u(44);
+    });
+    assert_eq!(ids(&with_group, &resolved).unwrap(), (1000, 44));
+    // イメージの User より username が勝つ。
+    let img = ImageDefaults {
+        user: Some((7, 8)),
+        ..resolved.clone()
+    };
+    assert_eq!(ids(&named, &img).unwrap(), (1000, 1001));
+    // イメージの User が未解決でも username が解決済みなら成功する。
+    let img = ImageDefaults {
+        user_unresolved: true,
+        ..resolved.clone()
+    };
+    assert_eq!(ids(&named, &img).unwrap(), (1000, 1001));
+    // 解決結果が無い（解決要求を無視する実装）ときは build が UNIMPLEMENTED。validate は通る。
+    assert_eq!(code(&pod(), &named), CriErrorCode::Unimplemented);
+    validate_config(&pod(), &named).expect("validate does not need the resolution");
+    // run_as_user との同時指定は両段で INVALID_ARGUMENT。
+    let both = with_sc(|sc| {
+        sc.run_as_user = u(33);
+        sc.run_as_username = "app".into();
+    });
+    assert_eq!(code(&pod(), &both), CriErrorCode::InvalidArgument);
+    assert_eq!(
+        validate_config(&pod(), &both).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    // 形式不正は両段で INVALID_ARGUMENT。
+    for bad in ["1000", "a:b", "a/b", "a\0b", "a\nb", &"a".repeat(257)] {
+        let c = with_sc(|sc| sc.run_as_username = bad.into());
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
+        assert_eq!(
+            validate_config(&pod(), &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{bad:?}"
+        );
+    }
+    // 256 バイトちょうどは形式として受ける。
+    let c = with_sc(|sc| sc.run_as_username = "a".repeat(256));
+    validate_config(&pod(), &c).expect("256 bytes");
+    // run_as_group 単独は従来どおり INVALID_ARGUMENT。
+    let c = with_sc(|sc| sc.run_as_group = u(44));
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+}
+
+/// CRI-2・SEC-5（#2771）: `process_user()` は config.json の `process.user` と一致する（Strict と Merge の両方）。
+#[test]
+fn cri2_process_user_matches_the_written_config() {
+    use fandhe_container_cri::runtime::v1::SupplementalGroupsPolicy;
+    let check = |policy: SupplementalGroupsPolicy, image_groups: Vec<u32>, want: Vec<u32>| {
+        let c = with_sc(|sc| {
+            sc.run_as_user = Some(Int64Value { value: 1000 });
+            sc.run_as_group = Some(Int64Value { value: 2000 });
+            sc.supplemental_groups = vec![10, 20, 10];
+            sc.supplemental_groups_policy = policy as i32;
+        });
+        let image = ImageDefaults {
+            supplementary_gids: image_groups,
+            ..Default::default()
+        };
+        let json = build_runtime_config(&pod(), &c, &image).expect("build");
+        let user = json.process_user();
+        assert_eq!((user.uid(), user.gid()), (1000, 2000));
+        assert_eq!(user.additional_gids(), want.as_slice());
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(v["process"]["user"]["uid"], 1000);
+        assert_eq!(v["process"]["user"]["gid"], 2000);
+        assert_eq!(
+            v["process"]["user"]["additionalGids"],
+            serde_json::json!(want)
+        );
+    };
+    check(SupplementalGroupsPolicy::Strict, vec![50], vec![10, 20]);
+    check(
+        SupplementalGroupsPolicy::Merge,
+        vec![50, 10],
+        vec![50, 10, 20],
+    );
+    // 指定なしは root で補助グループなし（config.json と同じ値をそのまま報告する）。
+    let json = build_runtime_config(&pod(), &ctr(), &ImageDefaults::default()).expect("build");
+    assert_eq!(json.process_user().uid(), 0);
+    assert!(json.process_user().additional_gids().is_empty());
+}
+
+/// CRI-2・SEC-5（#2667）: supplemental_groups とポリシー、イメージ由来のグループの合成を具体値で確かめる。
+#[test]
+fn cri2_supplemental_groups_acceptance() {
+    use fandhe_container_cri::runtime::v1::SupplementalGroupsPolicy;
+    let gids = |c: &ContainerConfig, img: &ImageDefaults| -> Option<Vec<u64>> {
+        let json = build_runtime_config(&pod(), c, img).expect("build");
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        v["process"]["user"].get("additionalGids").map(|a| {
+            a.as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g.as_u64().unwrap())
+                .collect()
+        })
+    };
+    let image = |uid: u32, groups: Vec<u32>| ImageDefaults {
+        user: Some((uid, uid)),
+        supplementary_gids: groups,
+        ..Default::default()
+    };
+    // 指定なしは additionalGids を出さない。
+    assert_eq!(gids(&ctr(), &ImageDefaults::default()), None);
+    // CRI の一覧は重複を除いて順序を保つ。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![10, 20, 10]);
+    assert_eq!(gids(&c, &ImageDefaults::default()), Some(vec![10, 20]));
+    // Merge（既定）: イメージ由来 → CRI の順で、重複は最初のものを残す。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![60, 70]);
+    assert_eq!(gids(&c, &image(1000, vec![50, 60])), Some(vec![50, 60, 70]));
+    // Strict: CRI の一覧だけ。
+    let c = with_sc(|sc| {
+        sc.supplemental_groups = vec![60, 70];
+        sc.supplemental_groups_policy = SupplementalGroupsPolicy::Strict as i32;
+    });
+    assert_eq!(gids(&c, &image(1000, vec![50, 60])), Some(vec![60, 70]));
+    // 実効 uid 0 にはイメージ由来を付けない。CRI の明示した一覧は付ける。
+    assert_eq!(gids(&ctr(), &image(0, vec![1, 10])), None);
+    let c = with_sc(|sc| sc.supplemental_groups = vec![5]);
+    assert_eq!(gids(&c, &image(0, vec![1, 10])), Some(vec![5]));
+    // 値域: 0 と u32::MAX - 1 は受け、負の値・u32::MAX・範囲外は INVALID_ARGUMENT（両段）。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![0, 4_294_967_294]);
+    assert_eq!(
+        gids(&c, &ImageDefaults::default()),
+        Some(vec![0, 4_294_967_294])
+    );
+    for bad in [-1, 4_294_967_295, 4_294_967_296] {
+        let c = with_sc(|sc| sc.supplemental_groups = vec![bad]);
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad}");
+        assert_eq!(
+            validate_config(&pod(), &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{bad}"
+        );
+    }
+    let c = with_sc(|sc| sc.supplemental_groups_policy = 7);
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+    assert_eq!(
+        validate_config(&pod(), &c).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    // sandbox 側: 受け入れて、出力には現れない。不正な値は INVALID_ARGUMENT。
+    let sandbox = |g: Vec<i64>| {
+        let mut p = pod();
+        p.linux = Some(LinuxPodSandboxConfig {
+            security_context: Some(LinuxSandboxSecurityContext {
+                supplemental_groups: g,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        p
+    };
+    let v = build(&sandbox(vec![1000]), &ctr());
+    assert!(v["process"]["user"].get("additionalGids").is_none());
+    assert_eq!(
+        validate_config(&sandbox(vec![-1]), &ctr())
+            .unwrap_err()
+            .code(),
+        CriErrorCode::InvalidArgument
+    );
+    // 合計の上限: ちょうどは受け、超えると FAILED_PRECONDITION。
+    let many: Vec<u32> = (0..u32::try_from(MAX_ADDITIONAL_GIDS).unwrap()).collect();
+    assert_eq!(
+        gids(&ctr(), &image(1000, many.clone())).map(|v| v.len()),
+        Some(MAX_ADDITIONAL_GIDS)
+    );
+    let c = with_sc(|sc| sc.supplemental_groups = vec![i64::from(u32::MAX) - 1]);
+    assert_eq!(
+        build_runtime_config(&pod(), &c, &image(1000, many))
+            .unwrap_err()
+            .code(),
+        CriErrorCode::FailedPrecondition
+    );
+    // 入力件数の上限: 重複で畳めても、件数が上限を超える要求は確保の前に拒否する（コンテナ側・sandbox 側とも）。
+    let dup = vec![1000_i64; MAX_ADDITIONAL_GIDS + 1];
+    let c = with_sc(|sc| sc.supplemental_groups = dup.clone());
+    assert_eq!(
+        build_runtime_config(&pod(), &c, &ImageDefaults::default())
+            .unwrap_err()
+            .code(),
+        CriErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        validate_config(&sandbox(dup), &ctr()).unwrap_err().code(),
+        CriErrorCode::FailedPrecondition
+    );
+    // 上限ちょうどの重複は受け、1 件に畳まれる。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![1000_i64; MAX_ADDITIONAL_GIDS]);
+    assert_eq!(gids(&c, &ImageDefaults::default()), Some(vec![1000]));
+    // core で読み戻せる（additionalGids が launch の入力になる）。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![3000, 2000]);
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses");
+    assert_eq!(
+        cfg.process().unwrap().user().additional_gids(),
+        [3000, 2000]
+    );
+}
+
 #[test]
 fn working_dir_and_hostname() {
     let mut c = ctr();
@@ -259,6 +703,74 @@ fn working_dir_and_hostname() {
         p.hostname = bad.into();
         assert_eq!(code(&p, &ctr()), CriErrorCode::InvalidArgument);
     }
+}
+
+/// CRI-2・SUP-4（#2671）: log_directory と log_path は結合され、config.json は変わらない。
+#[test]
+fn log_path_and_directory_are_joined_cri_2() {
+    let mut p = pod();
+    p.log_directory = "/var/log/pods/default_p_1234".into();
+    let mut c = ctr();
+    c.log_path = "c/0.log".into();
+    let joined = resolve_log_path(&p, &c).unwrap().unwrap();
+    assert_eq!(joined.as_str(), "/var/log/pods/default_p_1234/c/0.log");
+    assert_eq!(build(&p, &c), build(&pod(), &ctr()));
+    validate_config(&p, &c).unwrap();
+}
+
+/// CRI-2・SUP-4（#2671）: log_directory だけなら受け入れ、そのコンテナは CRI ログなし。
+#[test]
+fn log_directory_only_is_accepted_without_log() {
+    let mut p = pod();
+    p.log_directory = "/var/log/pods/x".into();
+    assert_eq!(resolve_log_path(&p, &ctr()).unwrap(), None);
+    validate_config(&p, &ctr()).unwrap();
+    assert_eq!(resolve_log_path(&pod(), &ctr()).unwrap(), None);
+}
+
+/// CRI-2・SUP-4（#2671）: 基点の無い log_path は黙って落とさず INVALID_ARGUMENT。
+#[test]
+fn log_path_without_directory_is_invalid_argument() {
+    let mut c = ctr();
+    c.log_path = "c/0.log".into();
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+}
+
+/// CRI-2・SUP-4・SEC-1（#2671）: トラバーサル・相対 log_directory・制御文字・長さ超過を拒否する。
+#[test]
+fn log_paths_reject_traversal() {
+    let cases: Vec<(String, String)> = vec![
+        ("/var/log/pods/x".into(), "../x.log".into()),
+        ("/var/log/pods/x".into(), "c/../../x".into()),
+        ("/var/log/pods/x".into(), "/abs.log".into()),
+        ("/var/log/pods/x".into(), "c/./0.log".into()),
+        ("/var/log/pods/x".into(), "c//0.log".into()),
+        ("/var/log/pods/x".into(), "c/".into()),
+        ("var/log".into(), "c/0.log".into()),
+        ("/var/log/../x".into(), "c/0.log".into()),
+        ("/var/log/".into(), "c/0.log".into()),
+        ("/var/log/pods/x".into(), "c\0/0.log".into()),
+        ("/var/log/pods/x".into(), "c\n/0.log".into()),
+        ("/var/\0log".into(), "c/0.log".into()),
+        (
+            format!("/{}", "d".repeat(MAX_PATH_BYTES - 2)),
+            "c/0.log".into(),
+        ),
+    ];
+    for (d, l) in cases {
+        let mut p = pod();
+        p.log_directory = d.clone();
+        let mut c = ctr();
+        c.log_path = l.clone();
+        assert_eq!(code(&p, &c), CriErrorCode::InvalidArgument, "{d:?} + {l:?}");
+    }
+    // 結合結果がちょうど 4096 バイトなら受理される。
+    let mut p = pod();
+    p.log_directory = format!("/{}", "d".repeat(4091));
+    let mut c = ctr();
+    c.log_path = "x".into();
+    // log_directory 4092 バイト + "/x" の 2 バイトで上限内。
+    assert!(resolve_log_path(&p, &c).unwrap().is_some());
 }
 
 type MountTweak = Box<dyn Fn(&mut Mount)>;
@@ -295,6 +807,37 @@ fn mounts_map_to_bind_with_ro_rw_options() {
     assert_eq!(cfg.mounts().len(), 2);
 }
 
+/// CRI-2・OCI-4（#2669）: HOST_TO_CONTAINER は `rslave` で書く。`rootfsPropagation` は出さず、core が受ける。
+#[test]
+fn mount_host_to_container_maps_to_rslave() {
+    let mut c = ctr();
+    let mut ro = mount("/srv/a", "/data", true);
+    ro.propagation = MountPropagation::PropagationHostToContainer as i32;
+    let mut rw = mount("/srv/b", "/work", false);
+    rw.propagation = MountPropagation::PropagationHostToContainer as i32;
+    c.mounts = vec![ro, rw];
+    let v = build(&pod(), &c);
+    assert_eq!(
+        v["mounts"],
+        serde_json::json!([
+            {"destination": "/data", "type": "bind", "source": "/srv/a",
+             "options": ["rbind", "rslave", "nosuid", "nodev", "ro"]},
+            {"destination": "/work", "type": "bind", "source": "/srv/b",
+             "options": ["rbind", "rslave", "nosuid", "nodev", "rw"]},
+        ])
+    );
+    assert!(
+        v["linux"].get("rootfsPropagation").is_none(),
+        "{}",
+        v["linux"]
+    );
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).unwrap();
+    let set = oci_runtime::BindMountSet::from_mounts(cfg.mounts()).expect("core accepts rslave");
+    assert!(set.has_host_slave());
+    assert_eq!(set.len(), 2);
+}
+
 #[test]
 fn mount_rejections() {
     let bad_paths = [
@@ -328,7 +871,7 @@ fn mount_rejections() {
     }
     let tweaks: Vec<MountTweak> = vec![
         Box::new(|m| m.propagation = MountPropagation::PropagationBidirectional as i32),
-        Box::new(|m| m.propagation = MountPropagation::PropagationHostToContainer as i32),
+        Box::new(|m| m.propagation = 7),
         Box::new(|m| m.selinux_relabel = true),
         Box::new(|m| m.recursive_read_only = true),
         Box::new(|m| m.image = Some(ImageSpec::default())),
@@ -551,6 +1094,117 @@ fn userns_mappings_are_rejected_but_node_mode_still_gets_a_user_namespace() {
     assert_eq!(code(&pod(), &c), CriErrorCode::Unimplemented);
 }
 
+fn pod_paths() -> PodNamespacePaths {
+    PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nonzero")).expect("paths")
+}
+
+fn build_with_pod(c: &ContainerConfig, paths: &PodNamespacePaths) -> Value {
+    let json =
+        build_runtime_config_with_pod_namespaces(&pod(), c, &ImageDefaults::default(), Some(paths))
+            .expect("build");
+    serde_json::from_slice(json.as_bytes()).expect("json")
+}
+
+/// CRI-2・CORE-3（#2674）: 供給元があり ipc が POD のとき、ipc と user だけが path つきの join になる。
+#[test]
+fn pod_ipc_is_joined_when_paths_are_supplied() {
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"},
+            {"type": "ipc", "path": "/proc/4242/ns/ipc"},
+            {"type": "mount"},
+            {"type": "uts"},
+            {"type": "user", "path": "/proc/4242/ns/user"},
+            {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn container_ipc_and_pid_never_join() {
+    // ipc CONTAINER は供給元があっても新しい namespace。
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(ns(
+            NamespaceMode::Pod,
+            NamespaceMode::Pod,
+            NamespaceMode::Container,
+        ));
+    });
+    let v = build_with_pod(&c, &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+    // pid POD も新しい namespace のまま（path なし）。
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"][0],
+        serde_json::json!({"type": "pid"})
+    );
+}
+
+#[test]
+fn without_supplier_output_is_unchanged() {
+    let plain = build(&pod(), &ctr());
+    let none = serde_json::from_slice::<Value>(
+        build_runtime_config_with_pod_namespaces(&pod(), &ctr(), &ImageDefaults::default(), None)
+            .expect("build")
+            .as_bytes(),
+    )
+    .expect("json");
+    assert_eq!(plain, none);
+    assert_eq!(
+        plain["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn pod_ipc_join_conflicts_with_container_userns() {
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(NamespaceOption {
+            userns_options: Some(UserNamespace {
+                mode: NamespaceMode::Container as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    });
+    let err = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &c,
+        &ImageDefaults::default(),
+        Some(&pod_paths()),
+    )
+    .expect_err("must be rejected");
+    assert_eq!(err.code(), CriErrorCode::Unimplemented);
+    // 供給元が無ければ従来どおり受ける。
+    build(&pod(), &c);
+}
+
+/// 公開の構築口は保持役の pid だけ（#2776）。文字列形式の拒否の照合は spec.rs の単体試験にある。
+#[test]
+fn pod_namespace_paths_only_from_holder_pid() {
+    let max = i32::MAX as u32;
+    for pid in [1, 4242, max] {
+        let p = PodNamespacePaths::for_holder_pid(NonZeroU32::new(pid).expect("nonzero"))
+            .expect("in range");
+        assert_eq!(p.user(), format!("/proc/{pid}/ns/user"));
+        assert_eq!(p.ipc(), format!("/proc/{pid}/ns/ipc"));
+    }
+    let e = PodNamespacePaths::for_holder_pid(NonZeroU32::new(max + 1).expect("nonzero"))
+        .expect_err("over pid_t");
+    assert_eq!(e.code(), CriErrorCode::Internal);
+}
+
 fn profile(t: ProfileType) -> Option<SecurityProfile> {
     Some(SecurityProfile {
         profile_type: t as i32,
@@ -576,18 +1230,14 @@ fn rejection_table_is_unimplemented() {
     add("cdi", &|_, c| {
         c.cdi_devices = vec![fandhe_container_cri::runtime::v1::CdiDevice::default()];
     });
-    add("stop_signal", &|_, c| c.stop_signal = 15);
-    add("log_path", &|_, c| c.log_path = "a.log".into());
-    add("log_directory", &|p, _| p.log_directory = "/var/log".into());
     add("windows ctr", &|_, c| {
         c.windows = Some(Default::default());
     });
     add("windows pod", &|p, _| {
         p.windows = Some(Default::default());
     });
-    add("dns", &|p, _| p.dns_config = Some(Default::default()));
     add("ports", &|p, _| {
-        p.port_mappings = vec![fandhe_container_cri::runtime::v1::PortMapping::default()];
+        p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
     });
     add("cgroup_parent", &|p, _| {
         p.linux = Some(LinuxPodSandboxConfig {
@@ -640,9 +1290,10 @@ fn rejection_table_is_unimplemented() {
             }),
         ),
         (
-            "drop caps",
+            "add caps with drop",
             Box::new(|sc| {
                 sc.capabilities = Some(Capability {
+                    add_capabilities: vec!["SYS_ADMIN".into()],
                     drop_capabilities: vec!["ALL".into()],
                     ..Default::default()
                 });
@@ -656,15 +1307,6 @@ fn rejection_table_is_unimplemented() {
                     ..Default::default()
                 });
             }),
-        ),
-        ("readonly_rootfs", Box::new(|sc| sc.readonly_rootfs = true)),
-        (
-            "username",
-            Box::new(|sc| sc.run_as_username = "nobody".into()),
-        ),
-        (
-            "supplemental",
-            Box::new(|sc| sc.supplemental_groups = vec![10]),
         ),
         (
             "selinux",
@@ -775,16 +1417,17 @@ fn validate_config_does_not_require_a_command() {
 fn issue_2554_review_rejections() {
     // sandbox の supplemental_groups・cpu_quota の不正な負値・swap の不整合・保護パスの `/`（CRI-1・SEC-1）。
     let mut p = pod();
+    // （#2667 で sandbox 側の supplemental_groups は受け入れに変わった。値の不正だけを拒否する。）
     p.linux = Some(LinuxPodSandboxConfig {
         security_context: Some(LinuxSandboxSecurityContext {
-            supplemental_groups: vec![1000],
+            supplemental_groups: vec![-1],
             ..Default::default()
         }),
         ..Default::default()
     });
     assert_eq!(
         validate_config(&p, &ctr()).unwrap_err().code(),
-        CriErrorCode::Unimplemented
+        CriErrorCode::InvalidArgument
     );
     let res = |f: fn(&mut LinuxContainerResources)| {
         let mut r = LinuxContainerResources::default();
@@ -863,4 +1506,418 @@ fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
         });
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
     }
+}
+
+fn pod_with_sysctls(entries: &[(&str, &str)]) -> PodSandboxConfig {
+    let mut l = LinuxPodSandboxConfig::default();
+    for (k, v) in entries {
+        l.sysctls.insert((*k).into(), (*v).into());
+    }
+    let mut p = pod();
+    p.linux = Some(l);
+    p
+}
+
+/// CRI-2・CORE-3（#2670）: IPC 系の pod sysctls は `linux.sysctl` へキー順で写り、core の parser が解釈済みとして読む。
+#[test]
+fn cri2_pod_ipc_sysctls_are_accepted() {
+    let p = pod_with_sysctls(&[
+        ("kernel.shmmax", "68719476736"),
+        ("kernel.sem", "250 32000 32 128"),
+        ("fs.mqueue.msg_max", "20"),
+    ]);
+    let json = build_runtime_config(&p, &ctr(), &ImageDefaults::default()).expect("build");
+    assert!(
+        std::str::from_utf8(json.as_bytes())
+            .expect("utf8")
+            .contains(
+                r#""sysctl":{"fs.mqueue.msg_max":"20","kernel.sem":"250 32000 32 128","kernel.shmmax":"68719476736"}"#
+            )
+    );
+    let v: Value = serde_json::from_slice(json.as_bytes()).expect("json");
+    assert_eq!(s(&v["linux"]["sysctl"]["kernel.shmmax"]), "68719476736");
+    assert_eq!(s(&v["linux"]["sysctl"]["kernel.sem"]), "250 32000 32 128");
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.unapplied_fields().is_empty());
+    let got: Vec<(&str, &str)> = cfg
+        .sysctls()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("fs.mqueue.msg_max", "20"),
+            ("kernel.sem", "250 32000 32 128"),
+            ("kernel.shmmax", "68719476736"),
+        ]
+    );
+    validate_config(&p, &ctr()).expect("validate accepts it too");
+    // 指定が無ければ出力に `sysctl` を含めない。
+    let v = build(&pod(), &ctr());
+    assert!(v["linux"].get("sysctl").is_none());
+}
+
+/// CRI-2（#2670）: `net.*` と UTS 系は `UNIMPLEMENTED`、名前空間を持たないキー・文法違反・不正な値は
+/// `INVALID_ARGUMENT`（SEC-1。ホストの値を書き換える経路を作らない）。
+#[test]
+fn cri2_pod_sysctls_rejections() {
+    for (k, v) in [
+        ("net.ipv4.ping_group_range", "0 0"),
+        ("net.ipv4.ip_unprivileged_port_start", "0"),
+        ("kernel.hostname", "x"),
+        ("kernel.domainname", "x"),
+    ] {
+        let p = pod_with_sysctls(&[(k, v)]);
+        assert_eq!(code(&p, &ctr()), CriErrorCode::Unimplemented, "{k}");
+    }
+    for (k, v) in [
+        ("kernel.panic", "1"),
+        ("vm.swappiness", "1"),
+        ("kernel/shmmax", "1"),
+        ("kernel..shmmax", "1"),
+        ("", "1"),
+        ("kernel.shmmax", ""),
+        ("kernel.shmmax", "1\n"),
+    ] {
+        let p = pod_with_sysctls(&[(k, v)]);
+        assert_eq!(
+            code(&p, &ctr()),
+            CriErrorCode::InvalidArgument,
+            "{k:?}={v:?}"
+        );
+    }
+    // エラーメッセージにキー・値を含めない。
+    let err = build_runtime_config(
+        &pod_with_sysctls(&[("kernel.panic", "secret-value")]),
+        &ctr(),
+        &ImageDefaults::default(),
+    )
+    .expect_err("rejected");
+    assert!(!err.to_string().contains("secret-value"), "{err}");
+    assert!(!err.to_string().contains("kernel.panic"), "{err}");
+    // 件数の上限を超えたら拒否する。
+    let many: Vec<(String, String)> = (0..=fandhe_container_core::sysctl::SYSCTL_MAX_ENTRIES)
+        .map(|i| (format!("fs.mqueue.k{i}"), "1".to_owned()))
+        .collect();
+    let refs: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        code(&pod_with_sysctls(&refs), &ctr()),
+        CriErrorCode::InvalidArgument
+    );
+}
+
+fn dns_pod(servers: &[&str]) -> PodSandboxConfig {
+    let mut p = pod();
+    p.dns_config = Some(DnsConfig {
+        servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+        searches: vec!["svc.cluster.local".into()],
+        options: vec!["ndots:5".into()],
+    });
+    p
+}
+
+fn build_with_resolv(p: &PodSandboxConfig, c: &ContainerConfig) -> Result<Value, CriErrorCode> {
+    let files = BundleFiles::with_resolv_conf("/b/ctr/resolv.conf");
+    build_runtime_config_with_files(p, c, &ImageDefaults::default(), &files)
+        .map(|j| serde_json::from_slice(j.as_bytes()).expect("json"))
+        .map_err(|e| e.code())
+}
+
+/// CRI-2・NET-5（#2665）: dns_config は /etc/resolv.conf への ro の bind として出る。
+#[test]
+fn cri2_dns_config_emits_a_readonly_resolv_conf_bind() {
+    let v = build_with_resolv(&dns_pod(&["10.0.0.10"]), &ctr()).expect("build");
+    assert_eq!(
+        v["mounts"],
+        serde_json::json!([{
+            "destination": "/etc/resolv.conf",
+            "type": "bind",
+            "source": "/b/ctr/resolv.conf",
+            "options": ["bind", "private", "nosuid", "nodev", "noexec", "ro"]
+        }])
+    );
+    // core の字句規則で読み戻せ、ro の非再帰 bind として受理される。
+    let json = build_runtime_config_with_files(
+        &dns_pod(&["10.0.0.10"]),
+        &ctr(),
+        &ImageDefaults::default(),
+        &BundleFiles::with_resolv_conf("/b/ctr/resolv.conf"),
+    )
+    .unwrap();
+    let parsed = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses");
+    assert!(parsed.unapplied_fields().is_empty());
+}
+
+/// 利用者の mount の後ろに足される。
+#[test]
+fn cri2_dns_bind_follows_user_mounts() {
+    let mut c = ctr();
+    c.mounts = vec![Mount {
+        container_path: "/data".into(),
+        host_path: "/srv/data".into(),
+        propagation: MountPropagation::PropagationPrivate as i32,
+        ..Default::default()
+    }];
+    let v = build_with_resolv(&dns_pod(&["10.0.0.10"]), &c).expect("build");
+    assert_eq!(v["mounts"][0]["destination"], "/data");
+    assert_eq!(v["mounts"][1]["destination"], "/etc/resolv.conf");
+}
+
+fn n_mounts(n: usize) -> ContainerConfig {
+    let mut c = ctr();
+    c.mounts = (0..n)
+        .map(|i| Mount {
+            container_path: format!("/m{i}"),
+            host_path: format!("/srv/{i}"),
+            propagation: MountPropagation::PropagationPrivate as i32,
+            ..Default::default()
+        })
+        .collect();
+    c
+}
+
+/// CRI-2・NET-5（#2665）: 生成する resolv.conf の bind を含む総件数が 1024 を超えると両段で INVALID_ARGUMENT。
+#[test]
+fn cri2_dns_bind_counts_toward_the_mount_limit() {
+    let p = dns_pod(&["10.0.0.10"]);
+    let over = n_mounts(1024);
+    assert_eq!(
+        validate_config(&p, &over).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        build_with_resolv(&p, &over).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
+    let ok = n_mounts(1023);
+    validate_config(&p, &ok).expect("1023 + dns = 1024");
+    let v = build_with_resolv(&p, &ok).expect("build");
+    assert_eq!(v["mounts"].as_array().unwrap().len(), 1024);
+    // dns_config なしなら 1024 件ちょうどは受理される。
+    validate_config(&pod(), &over).expect("1024 without dns");
+}
+
+/// ファイルのパスを渡さない入口では、要求を黙って落とさず UNIMPLEMENTED。
+#[test]
+fn cri2_dns_config_without_generated_file_is_unimplemented() {
+    let e = build_runtime_config(&dns_pod(&["10.0.0.10"]), &ctr(), &ImageDefaults::default())
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}
+
+/// 3 リストがすべて空の dns_config は指定なしと同じ（mount を出さない）。
+#[test]
+fn cri2_empty_dns_config_emits_no_mount() {
+    let mut p = pod();
+    p.dns_config = Some(DnsConfig::default());
+    let v = build_with_resolv(&p, &ctr()).expect("build");
+    assert!(v.get("mounts").is_none());
+}
+
+#[test]
+fn cri2_invalid_dns_values_are_invalid_argument_in_both_stages() {
+    let p = dns_pod(&["not-an-ip"]);
+    assert_eq!(
+        validate_config(&p, &ctr()).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        build_with_resolv(&p, &ctr()).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
+}
+
+/// 利用者の mount が /etc/resolv.conf またはその祖先を指すと、両段で INVALID_ARGUMENT（fail-closed）。
+#[test]
+fn cri2_dns_bind_conflicting_with_user_mount_is_rejected() {
+    for dest in ["/etc/resolv.conf", "/etc"] {
+        let mut c = ctr();
+        c.mounts = vec![Mount {
+            container_path: dest.into(),
+            host_path: "/srv/x".into(),
+            propagation: MountPropagation::PropagationPrivate as i32,
+            ..Default::default()
+        }];
+        let p = dns_pod(&["10.0.0.10"]);
+        assert_eq!(
+            validate_config(&p, &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{dest}"
+        );
+        assert_eq!(
+            build_with_resolv(&p, &c).unwrap_err(),
+            CriErrorCode::InvalidArgument,
+            "{dest}"
+        );
+    }
+}
+
+#[test]
+fn cri2_dns_bind_conflicting_with_readonly_paths_is_rejected() {
+    let c = with_sc(|sc| sc.readonly_paths = vec!["/etc/resolv.conf".into()]);
+    assert_eq!(
+        build_with_resolv(&dns_pod(&["10.0.0.10"]), &c).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
+}
+
+/// CRI-2（#2668）: stop_signal は受け入れる（config.json には出さず、停止時に StopRequest で運ぶ）。
+#[test]
+fn cri2_stop_signal_is_accepted() {
+    use fandhe_container_cri::runtime::v1::Signal;
+    for sig in [Signal::Sigint, Signal::Sigkill, Signal::RuntimeDefault] {
+        let mut c = ctr();
+        c.stop_signal = sig as i32;
+        build(&pod(), &c);
+    }
+}
+
+/// CRI-2（#2668）: 未知の stop_signal は `INVALID_ARGUMENT`。
+#[test]
+fn cri2_stop_signal_unknown_value_is_invalid_argument() {
+    for v in [66, -1] {
+        let mut c = ctr();
+        c.stop_signal = v;
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+    }
+}
+fn port_mapping(
+    protocol: i32,
+    host_port: i32,
+    container_port: i32,
+    host_ip: &str,
+) -> fandhe_container_cri::runtime::v1::PortMapping {
+    fandhe_container_cri::runtime::v1::PortMapping {
+        protocol,
+        container_port,
+        host_port,
+        host_ip: host_ip.into(),
+    }
+}
+
+const POD_NETNS: &str =
+    "/state/.netns/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn build_with_netns(p: &PodSandboxConfig, c: &ContainerConfig, netns: Option<&str>) -> Value {
+    let json =
+        build_runtime_config_with_pod_netns(p, c, &ImageDefaults::default(), netns).expect("build");
+    serde_json::from_slice(json.as_bytes()).expect("json")
+}
+
+fn network_entry(v: &Value) -> Option<&Value> {
+    v["linux"]["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["type"] == "network")
+}
+
+/// CRI-2・NET-1（#2675）: POD でパスを受けたときだけ network に `path` を出す。
+#[test]
+fn pod_netns_path_is_emitted_for_pod_mode() {
+    let v = build_with_netns(&pod(), &ctr(), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network", "path": POD_NETNS})
+    );
+    // 他の種別には path を付けない。
+    for n in v["linux"]["namespaces"].as_array().unwrap() {
+        if n["type"] != "network" {
+            assert!(n.get("path").is_none(), "{n}");
+        }
+    }
+}
+
+/// パスが無ければ従来どおり path なし（core の start が `UNIMPLEMENTED` で拒否する）。
+#[test]
+fn pod_mode_without_netns_path_keeps_pathless_network_entry() {
+    let v = build_with_netns(&pod(), &ctr(), None);
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network"})
+    );
+}
+
+/// NODE ではパスを渡されても network を出さない。CONTAINER は path なしのまま。TARGET は拒否のまま。
+#[test]
+fn pod_netns_path_is_ignored_for_other_modes() {
+    let mode = |m| {
+        with_sc(|sc| {
+            sc.namespace_options = Some(ns(m, NamespaceMode::Pod, NamespaceMode::Pod));
+        })
+    };
+    let v = build_with_netns(&pod(), &mode(NamespaceMode::Node), Some(POD_NETNS));
+    assert!(network_entry(&v).is_none());
+    let v = build_with_netns(&pod(), &mode(NamespaceMode::Container), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network"})
+    );
+    let e = build_runtime_config_with_pod_netns(
+        &pod(),
+        &mode(NamespaceMode::Target),
+        &ImageDefaults::default(),
+        Some(POD_NETNS),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}
+
+/// 壊れたパス（相対・`..`・空要素）は bundle へ流さない。
+#[test]
+fn malformed_pod_netns_path_is_rejected() {
+    for bad in ["relative/ns", "/a/../b", "/a//b", "/", "/a/./b", "/a\\b"] {
+        let e = build_runtime_config_with_pod_netns(
+            &pod(),
+            &ctr(),
+            &ImageDefaults::default(),
+            Some(bad),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad}");
+    }
+}
+
+/// CRI-2・NET-3（#2676）: 事前検証も生成時と同じく pod の netns で `port_mappings` を判定する
+/// （provider 注入の POD で RunPodSandbox の後の CreateContainer が失敗しない）。
+#[test]
+fn validate_with_pod_netns_accepts_port_mappings_like_build() {
+    let mut p = pod();
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    let e = validate_config_with_pods(&p, &ctr(), None, None).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    validate_config_with_pods(&p, &ctr(), None, Some(POD_NETNS)).expect("validate");
+}
+
+/// CRI-2・NET-3（#2676）: 公開する port_mappings は pod の netns がある構成だけ受け、config.json には出さない。
+#[test]
+fn port_mappings_are_accepted_only_with_pod_netns() {
+    let mut p = pod();
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    // pod の netns が無ければ UNIMPLEMENTED のまま。
+    assert_eq!(code(&p, &ctr()), CriErrorCode::Unimplemented);
+    // pod の netns があれば受け入れ、network namespace の path が出る。
+    let v = build_with_netns(&p, &ctr(), Some(POD_NETNS));
+    assert_eq!(
+        network_entry(&v).unwrap(),
+        &serde_json::json!({"type": "network", "path": POD_NETNS})
+    );
+    // コンテナ側の network が POD 以外だと DNAT の宛先と netns が食い違うため UNIMPLEMENTED。
+    p.port_mappings = vec![port_mapping(0, 8080, 80, "192.0.2.10")];
+    for bad in [NamespaceMode::Node, NamespaceMode::Container] {
+        let c = with_sc(|sc| {
+            sc.namespace_options = Some(ns(bad, NamespaceMode::Pod, NamespaceMode::Pod));
+        });
+        let e =
+            build_runtime_config_with_pod_netns(&p, &c, &ImageDefaults::default(), Some(POD_NETNS))
+                .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    }
+    // host_port 0（公開しない）は netns が無くても受ける。
+    p.port_mappings = vec![port_mapping(0, 0, 80, "")];
+    assert!(build_runtime_config(&p, &ctr(), &ImageDefaults::default()).is_ok());
+    // 値の不正は INVALID_ARGUMENT。
+    p.port_mappings = vec![port_mapping(0, 8080, 0, "192.0.2.10")];
+    assert_eq!(code(&p, &ctr()), CriErrorCode::InvalidArgument);
 }

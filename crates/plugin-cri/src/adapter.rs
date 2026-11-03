@@ -22,6 +22,8 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
+//! - `wait_exit` は上書きせず、core の既定（状態ストアの照会による待ち）を使う。supervisor の終了通知を使った
+//!   イベント駆動の上書きは後続（CRI-1・SUP-1。shim v2 の Wait が呼ぶ。#3666）
 //! - `start`・`kill`・`stop` は Linux で supervisor 経由の本番経路へ結線済み（`crate::supervised`。#2434）。契約・期限・
 //!   子プロセスの回収・前提（supervisor を plugin の実体と同じディレクトリに置く・`XDG_RUNTIME_DIR` が環境にある・rootful は
 //!   `UNIMPLEMENTED`）は同 module の doc に従う。実機での通し（委譲 scope 内）は未実施（#850・#2062）。非 Linux では
@@ -30,8 +32,8 @@
 //!   plugin プロセス自身の cgroup から委譲スコープを遅延検出する。plugin を委譲されたスコープの外（ログインセッション等）で
 //!   動かすと検出に失敗し、cgroup の配置を記録したコンテナの `delete` は記録を残したまま失敗する（fail-closed。CLI と同じ
 //!   方針で、検出の失敗を記録の経路へ回すかはオーナー判断待ち。#2133・#2060）。非 Linux は常に `Unimplemented`。
-//!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を期限つきで
-//!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）。
+//!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）も CLI と同じ
+//!   `remove_guarded_bounded_waiting` で消す（flock 保持中は `FailedPrecondition` として試し直す。待ちはコンテナログと共有する 10 秒で、guard は試行ごとにロック保持中に評価。#2964。失敗は戻り値に影響させず `Kept { code }` と記録器の `supervisor_log_remove` の失敗として計上する）。
 //!   続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロック。#2593・SUP-7・CRI-2・CLI-1）も CLI の `delete` と同じ
 //!   `remove_container_logs_guarded_bounded_waiting` で消す（同じ ID の sink が生きていれば `FailedPrecondition` で何も消さず、
 //!   最大 10 秒まで 50ms 間隔で試し直して sink の閉鎖を待つ。1 回の試行の期限は 5 秒。設計は
@@ -41,12 +43,21 @@
 //!   消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
 //!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
-//!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
-//!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。既知の制約として、既定を超える terminate で窓が 10 秒を超えると
-//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、回収の経路は無い）
+//!   supervisor ログと合わせて 20 秒（共有の待ち 10 + 各最後の試行 5 + 5）。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
+//!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。待ち切れなかった失敗（`FailedPrecondition`）は警告行に `reason: sink_open_after_wait` を足して他の失敗と区別する（#2760。terminate を設定する経路が無く、待ちを伸ばさない判断は `docs/design/container-log-removal-wait.md`）。待ちを超えて残ったログは、plugin の起動時の走査（[`sweep_leftover_container_logs`]）と同じ ID の `create` の前の回収（`reclaim_before_create`）で消える（生きている sink・状態がある ID・帰属できない名前は残り、手動で消す。docs/setup/container-log-recovery.md）。
+//!   core の `delete` の成功後には起動オプション文書（`<root>/@container-options/<id>`）の残骸も、記録の無い ID に限りロックの下で期限つきに消す（失敗は `container_options_remove` の Failure と `target: container_options` の警告行。`create` の前にも同じ掃除をする。SUP-12・#2760）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
-//!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
-//!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
+//!   ContainerConfig → config.json 変換。#2433）。`ImageService` は同じ UDS でサーブし（`CriPluginBackends::image_service`。#2592）、
+//!   `PullImage` が登録したタグ・digest・image ID を同じ在庫から解決する（未知の参照は `NOT_FOUND`）。
+//!   在庫は cri の `InMemoryImageStore`（プロセス内だけ）で、plugin-cri の再起動でタグの対応は失われる
+//!   （ディスク上のキャッシュは残るので `PullImage` をやり直せば blob を再取得せずに戻る）。oci の永続の在庫
+//!   〔TASK-183・OCI-7・#2315・#2380〕への配線は別途（REPAIR-3）。展開の所有者写像は既定の `Keep` + `Strip` のまま
+//!   （#2241・#2315・#482 が前提）。展開・pull・起動時の回収の計装（`OciOpRecorder`）は `CoreOciRecorder` で
+//!   oci 専用の `OpRecorder`（[`CriPluginBackends::oci_op_recorder`]）へ `oci.*` の名前で記録する（REPAIR-4・#2900）。
+//!   共有記録器は操作名の種類に上限（`MAX_TRACKED_OPS`）があり、pull が枠を取ると `create`・`delete` の記録を捨てさせるため分ける。
+//!   エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため）。同じ専用記録器へ、`PullImage` の失敗に付いたレジストリの HTTP 状態の区分を
+//!   `cri.pull_image.registry_http.<区分>`（固定の 8 種）の失敗として足す（`CoreCriRecorder`。#2966・docs/design/pull-inventory-wiring.md）。
+//!   起動時の残り pull の回収 GC（`ImageStore::recover_stale_pulls`）は `CriPluginBackends::recover_stale_image_pulls` で配線済み（#2819）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
 //!   記録先を注入したときだけ行う（[`CriPluginBackends::production_with_audit_sink`]。Linux の本番はこちら）。プロセスが常に複数
@@ -63,6 +74,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
 #[cfg(target_os = "linux")]
+use crate::supervised::FORCE_DELETE_STOP_BUDGET;
+#[cfg(target_os = "linux")]
 use crate::supervised::SupervisedLifecycle;
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink, RECORD_WAIT_LIMIT};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
@@ -75,17 +88,34 @@ use fandhe_container_core::traits::{
     GetStateRequest, KillRequest, NetnsStatus, NetworkPlugin, NetworkStatus, PortMapping,
     PublishPortRequest, StartRequest, StateRequest, StateStore, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
+use fandhe_container_cri::adapter::{
+    BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
+};
 use fandhe_container_cri::error::CriError;
+#[cfg(unix)]
+use fandhe_container_cri::image_pull::PullConfig;
+#[cfg(unix)]
+use fandhe_container_cri::image_service::CriImageService;
+use fandhe_container_cri::image_service::{ImageStore, InMemoryImageStore};
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
+#[cfg(unix)]
+use fandhe_container_cri::runtime_service::{
+    FileRecordStore, RecordStore, RecordStoreOp, RecordStoreOpRecorder, RecordStoreOpSample,
+    RecordStoreOutcome,
+};
+#[cfg(unix)]
+use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
+#[cfg(unix)]
+use fandhe_container_oci::registry::RegistryClientConfig;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::logs::{
-    CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs,
+    CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs, StaleLogReclaim,
+    container_log_removal_reason, reclaim_stale_container_logs,
     remove_container_logs_guarded_bounded_waiting,
 };
 use fandhe_container_supervisor::supervisor_log::{
-    LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_bounded,
+    SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_guarded_bounded_waiting,
 };
 
 /// 起動・シグナル系の未実装文言（固定。入力を含めない。非 Linux でだけ返す。Linux は supervisor 経由で結線済み）。
@@ -106,8 +136,16 @@ pub struct CriPluginBackends {
     network: Arc<dyn NetworkPlugin>,
     /// 実行層（`oci_runtime`）と CRI サービスが共有する記録器（REPAIR-4）。
     recorder: Arc<OpRecorder>,
+    /// oci の pull・展開・回収の操作統計（`oci.*`）と `cri.pull_image.registry_http.*`（#2966）専用の記録器。共有記録器とは枠を分ける（`MAX_TRACKED_OPS`。REPAIR-4・#2900）。
+    oci_recorder: Arc<OpRecorder>,
     /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
     state_root: Option<PathBuf>,
+    /// `production()` が取った状態ルートのインスタンスロック（`.cri/@instance.lock`。注入で組んだときは `None`）。
+    /// 全 clone が共有し、最後の clone が drop されるまで保持する（CRI-2・CORE-1・#2931）。
+    _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+    /// `ImageService`（`PullImage` の登録先）と本番の `BundleProvider`（`CreateContainer` のタグ解決）が共有する在庫。
+    /// プロセス内だけで永続化しない（再起動でタグの対応は失われる。モジュール doc の REPAIR-3）。
+    images: Arc<dyn ImageStore>,
 }
 
 impl fmt::Debug for CriPluginBackends {
@@ -139,7 +177,10 @@ impl CriPluginBackends {
             state,
             network,
             recorder,
+            oci_recorder: Arc::new(OpRecorder::new()),
             state_root: None,
+            _instance_lock: None,
+            images: Arc::new(InMemoryImageStore::new()),
         }
     }
 
@@ -168,6 +209,13 @@ impl CriPluginBackends {
         // 状態ルートの作成・検証・初期化（`FileStateStore::open`）を先に済ませる。`ReclaimStore::open` はルートが
         // 既にあることを前提にし、先に `.cri` を作ると新規ストアの判定を壊すため（NET-1・#2604）。
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
+        // 同じ状態ルートの別インスタンスを排他する（CRI-2・CORE-1・#2931）。回収記録（`ReclaimStore`）の読み込みは
+        // メモリへ取り込むため、先行インスタンスの追加・削除を見落とさないよう、必ずその読み込みより前に取る。
+        // 期限内に取れなければ `Timeout`（固定文言 `MSG_INSTANCE_LOCK_BUSY`）を返す。
+        let instance_lock = Arc::new(crate::instance_lock::acquire_instance_lock_in(
+            &state_root,
+            crate::instance_lock::INSTANCE_LOCK_TIMEOUT,
+        )?);
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
         // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
         #[cfg(target_os = "linux")]
@@ -190,20 +238,88 @@ impl CriPluginBackends {
         let runtime = Arc::new(runtime);
         let mut backends = Self::with_recorder(runtime, state, network, recorder);
         backends.state_root = Some(state_root);
+        backends._instance_lock = Some(instance_lock);
         Ok(backends)
+    }
+
+    /// `production()` が取ったインスタンスロック（注入で組んだときは `None`。R8 #2937 の孤児 bundle の回収が使う）。
+    #[cfg(unix)]
+    pub(crate) fn instance_lock(&self) -> Option<&Arc<crate::instance_lock::InstanceLock>> {
+        self._instance_lock.as_ref()
     }
 
     /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。
     ///
     /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。詳細は `bundle_provider_in`。
     #[cfg(unix)]
-    pub fn production_bundle_provider(&self) -> Result<Arc<dyn BundleProvider>, CriError> {
+    pub fn production_bundle_provider(
+        &self,
+    ) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
         match &self.state_root {
-            Some(root) => bundle_provider_in(root),
+            Some(root) => bundle_provider_with(
+                root,
+                Some(Arc::clone(&self.images)),
+                Some(self.oci_adapter()),
+            ),
             None => Err(CriError::failed_precondition(
                 "state root is not configured",
             )),
         }
+    }
+
+    /// 本番の `ImageService`（`PullImage`・`ImageStatus`・`ListImages`・`RemoveImage`・`ImageFsInfo`）を作る（CRI-3・CRI-4・PLUG-1。#2592）。
+    ///
+    /// `production_bundle_provider` と同じ在庫（[`Self::images`]）と、同じ `PullConfig`（キャッシュは
+    /// `<state_root>/.cri/images`）を共有するため、`PullImage` で登録したタグを `CreateContainer` が解決でき、
+    /// pull と create の展開設定が食い違わない。`production()` で組んだときだけ使え、注入で組んだときは
+    /// `FAILED_PRECONDITION`。レジストリクライアント（OS のルート証明書の読み込み）を作れなければエラーを返す。
+    /// 呼び出しは `production_bundle_provider` の後にする（置き場の作成と検証を先に済ませるため）。
+    #[cfg(unix)]
+    pub fn image_service(&self) -> Result<CriImageService, CriError> {
+        use fandhe_container_cri::image_pull::{OciImagePuller, OciRegistryClient};
+        let Some(root) = &self.state_root else {
+            return Err(CriError::failed_precondition(
+                "state root is not configured",
+            ));
+        };
+        let pull = production_pull_config(root)?;
+        let client = OciRegistryClient::new(&production_registry_config())
+            .map_err(|_| CriError::failed_precondition("failed to prepare the registry client"))?
+            .with_recorder(self.oci_adapter());
+        Ok(CriImageService::with_store_and_recorder(
+            Arc::clone(&self.images),
+            Arc::new(CoreCriRecorder::new(
+                Arc::clone(&self.recorder),
+                Arc::clone(&self.oci_recorder),
+            )),
+        )
+        .with_puller(Arc::new(
+            OciImagePuller::new(client, pull).with_recorder(self.oci_adapter()),
+        )))
+    }
+
+    /// 起動時に 1 回、`<state_root>/.cri/images` に残った pull のステージングとリースを回収する（OCI-7・OCI-1。#2819）。
+    ///
+    /// `image_service` の成功後、RPC を受け付ける前に `main.rs` の `serve` が呼ぶ。期限は [`STARTUP_PULL_RECOVERY_BUDGET`]。
+    /// 結果の扱い（どれで起動を止めるか）は `main.rs` と `docs/design/pull-inventory-wiring.md`。注入で組んだ場合は
+    /// `Failed("FAILED_PRECONDITION")`。
+    #[cfg(unix)]
+    pub fn recover_stale_image_pulls(&self, budget: Duration) -> StartupPullRecovery {
+        let Some(root) = &self.state_root else {
+            return StartupPullRecovery::Failed("FAILED_PRECONDITION");
+        };
+        let images_root = root.join(IMAGES_DIR);
+        let recorder = Arc::clone(&self.recorder);
+        let oci = self.oci_adapter();
+        run_startup_pull_recovery(
+            move || recover_stale_image_pulls_in(&images_root, &recorder, oci),
+            budget,
+        )
+    }
+
+    /// `ImageService` と bundle 供給が共有する在庫。
+    pub fn images(&self) -> &Arc<dyn ImageStore> {
+        &self.images
     }
 
     /// `ContainerRuntime` の実装。
@@ -216,7 +332,9 @@ impl CriPluginBackends {
         &self.state
     }
 
-    /// `NetworkPlugin` の実装（CRI の RPC からの呼び出しは #459 以降。写像は [`crate::pod_network`]。現状は呼び出し元が無い）。
+    /// `NetworkPlugin` の実装。写像は [`crate::pod_network`]（`NetsetupPodNetwork` が cri の `PodNetworkProvider` を実装）。
+    /// 本番の RPC からはまだ呼ばれない: core の network namespace の join が入るまで `with_pod_network` を差さない
+    /// （差すと RunPodSandbox が bridge・netns・veth を作るのに start が `UNIMPLEMENTED` で失敗する。#2675・REPAIR-3）。
     pub fn network(&self) -> &Arc<dyn NetworkPlugin> {
         &self.network
     }
@@ -227,6 +345,45 @@ impl CriPluginBackends {
         &self.recorder
     }
 
+    /// oci の pull・展開・起動時の回収の操作統計（`oci.*`）と、`PullImage` の失敗のレジストリ HTTP 状態の区分
+    /// （`cri.pull_image.registry_http.*`。#2966）の記録器。共有記録器とは枠を分ける
+    /// （操作名の種類の上限 `MAX_TRACKED_OPS` を pull が使い切って `create`・`delete` の記録を捨てさせないため。REPAIR-4・#2900）。
+    pub fn oci_op_recorder(&self) -> &Arc<OpRecorder> {
+        &self.oci_recorder
+    }
+
+    /// oci の `OciOpRecorder` を [`Self::oci_op_recorder`] へ流す橋渡し（pull・展開・回収の 3 か所へ渡す）。
+    #[cfg(unix)]
+    fn oci_adapter(&self) -> Arc<dyn OciOpRecorder> {
+        Arc::new(CoreOciRecorder(Arc::clone(&self.oci_recorder)))
+    }
+
+    /// 本番の記録ストア（`<状態ルート>/.cri/records`）を開く（R9 #2938。CRI-1・OCI-7・CORE-1）。
+    ///
+    /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。インスタンスロックの取得後に
+    /// 呼ぶ（`production_inner` の後。受付の前）。操作の統計は `cri.record_store.{put,remove,list}` として共有記録器へ流す。
+    #[cfg(unix)]
+    pub fn production_record_store(&self) -> Result<Arc<FileRecordStore>, CriError> {
+        match &self.state_root {
+            Some(root) => Ok(Arc::new(FileRecordStore::open(root)?.with_recorder(
+                Arc::new(CoreRecordStoreRecorder(Arc::clone(&self.recorder))),
+            ))),
+            None => Err(CriError::failed_precondition(
+                "state root is not configured",
+            )),
+        }
+    }
+
+    /// [`Self::runtime_service`] に記録ストアを注入したもの（R9 #2938。書く・消す時点と再採用が有効になる）。
+    #[cfg(unix)]
+    pub fn runtime_service_with_record_store(
+        &self,
+        bundles: Arc<dyn BundleProvider>,
+        records: Arc<dyn RecordStore>,
+    ) -> CriRuntimeService {
+        self.runtime_service(bundles).with_record_store(records)
+    }
+
     /// 実行層を接続した `CriRuntimeService` を作る。サーブは `server::serve` が担う（#849）。
     ///
     /// CRI 側の計測は共有記録器（[`Self::op_recorder`]）へ `cri.*` の操作名で記録する。
@@ -234,9 +391,12 @@ impl CriPluginBackends {
     /// 実行層の呼び出しの待ち上限は [`PLUGIN_RUNTIME_TIMEOUT`] にする（CRI の既定 10 秒では supervisor の起動の受信期限
     /// 〔約 58.9 秒〕より先に結果不明へ倒れるため。#2434・REPAIR-5）。
     pub fn runtime_service(&self, bundles: Arc<dyn BundleProvider>) -> CriRuntimeService {
-        CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))))
-            .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
-            .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
+        CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder::new(
+            Arc::clone(&self.recorder),
+            Arc::clone(&self.oci_recorder),
+        )))
+        .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
+        .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
     }
 }
 
@@ -244,7 +404,295 @@ impl CriPluginBackends {
 ///
 /// supervisor の起動結果の受信期限（`start_contract::cli_receive_deadline`）に 2 秒の余裕を足した値。CRI の既定
 /// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
+///
+/// `create` の最悪（#2760）: ログ回収 5 秒 + 起動オプション文書の掃除 10 秒 + 状態ロック 5 秒 + 監査記録 2 回（22.9 秒）= 42.9 秒。
+/// running への force `delete` の最悪: 全体を [`PLUGIN_FORCE_DELETE_DEADLINE`]（47 秒）で打ち切る。後始末の前は、状態の読み取り 5 秒、
+/// stop 22 秒（`FORCE_DELETE_STOP_BUDGET`。状態ロックの待ちを含めて各段を admission で頭打ちにする。#3143）、
+/// core の delete 20 秒（状態ロック 3 回と exec 掃除 5 秒）の計 47 秒で、後始末（ログ 2 件〔共有の待ち 10 秒と各最後の試行 5 秒ずつ。#2964〕と
+/// 起動オプション文書 10 秒）は 47 秒までの残りに収める（#3027）。bundle の解放は件数で有界（`runtime_remove_one`）。
+/// どちらもこの値に収まる（`tests/lifecycle_supervisor.rs` の `repair5_*_worst_case_fits_runtime_timeout` で照合する）。
+/// bundle の用意（`BundleProvider::prepare`）と core の create のファイル I/O は 2 段で上限づける（#2821）。RPC の応答は
+/// この値で打ち切られ（DEADLINE_EXCEEDED）、実行層への dispatch より前の worker は取り消しの旗で打ち切られる（展開は
+/// エントリ単位。#2899）。dispatch 後の worker は打ち切れず、core の create 42.9 秒 + 失敗時の削除確認（この値）で有限になる
+/// （内訳は `docs/design/container-log-removal-wait.md`、照合は `repair5_create_worker_residual_is_bounded`）。
 pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
+/// `CoreLifecycleRuntime::delete`（force を含む）が自分で守る全体の期限（REPAIR-5・CRI-2・#3027）。
+///
+/// 従来の文書が最悪として書いていた stop 17 秒 + ログ 2 件 20 秒 + 起動オプション文書 10 秒 = 47 秒をそのまま上限にする
+/// （17 秒は signaler の期限だけを数えた名目で、状態ロックの待ちを含めた stop の厳密な最悪は 42 秒。force delete の stop には
+/// 予算 `FORCE_DELETE_STOP_BUDGET`〔22 秒〕を持たせ、前置きの読み取り 5 秒・core の delete 20 秒と合わせて 47 秒に収める。#3143）。
+/// 後始末（ログ・起動オプション文書）の各段は、いまの上限とこの期限までの残りの小さい方で試し、残りが 0 の段は試さず
+/// `Timeout` として残す（消さずに残す側。`Kept` と警告行で知らせる）。core の delete を含む stop までの 42 秒は
+/// 打ち切れないが、この値より先に終わる（stop は予算つき、core の delete の 20 秒は上限）。
+/// `PLUGIN_RUNTIME_TIMEOUT` との余裕（13.9 秒）は I/O の時間だけに充てる（#3143）。
+pub const PLUGIN_FORCE_DELETE_DEADLINE: Duration = Duration::from_secs(47);
+
+/// イメージ由来 rootfs の用意（blob の検証と展開）の期限（REPAIR-5・#2821）。
+///
+/// `CreateContainer` の worker が `prepare` に使える時間の上限で、blob 1 本ごと・展開のエントリごと・展開の前後で確かめる。
+/// RPC の応答は [`PLUGIN_RUNTIME_TIMEOUT`] で先に打ち切られ、そのとき worker には取り消しの旗が立つ（dispatch 前なら次の確認で
+/// 止まる。#2899）。この値は取り消しが届かない場合の上限として残る。
+/// 値は既定（600 秒）のまま。変更はオーナー判断（本 issue では変えない）。
+pub const PLUGIN_ROOTFS_DEADLINE: Duration = fandhe_container_cri::bundle::DEFAULT_ROOTFS_DEADLINE;
+
+/// 本番の rootfs 展開設定（`ImageService` の pull と同じ値 + [`PLUGIN_ROOTFS_DEADLINE`] の明示）。
+#[cfg(unix)]
+fn production_extract_config(
+    state_root: &std::path::Path,
+) -> Result<fandhe_container_cri::bundle::ImageExtractConfig, CriError> {
+    let pull = production_pull_config(state_root)?;
+    let mut cfg = fandhe_container_cri::bundle::ImageExtractConfig::from_pull_config(&pull);
+    cfg.deadline = PLUGIN_ROOTFS_DEADLINE;
+    Ok(cfg)
+}
+
+/// 起動時の残りログの走査の全体の期限（#2760・REPAIR-5。サーブの開始は待たせず、別スレッドで走る）。
+pub const STARTUP_LOG_SWEEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// plugin の起動時に 1 回、状態の記録が無い ID の残りコンテナログを回収する（#2760・CRI-2・SUP-7・REPAIR-4）。
+///
+/// CRI は ID を使い回さないため、delete の待ちを超えて残ったログは同じ ID の `create` では回収されない。ここで
+/// `@container-logs` を走査し、状態ストアに記録が無く、sink も生きていない ID のログだけを消す
+/// （`fandhe_container_supervisor::logs::sweep_stale_container_logs`。生きている sink・記録のある ID・帰属できない名前は残す。
+/// 読み取りに失敗した ID も消さない）。状態ルートを持たないストアでは `None`。消せた ID ごとに記録器の
+/// `container_log_reclaim` へ Success を計上する。呼び出し元は `main.rs` の `serve`（ブロッキングスレッド）。
+/// 走査はこの時点で存在する残りだけを対象にし、稼働中に発生した残りは次の起動まで残る（設計: `docs/design/container-log-removal-wait.md`）。
+pub fn sweep_leftover_container_logs(
+    store: &Arc<dyn StateStore>,
+    recorder: &OpRecorder,
+    budget: Duration,
+) -> Option<fandhe_container_supervisor::logs::SweepReport> {
+    let root = store.host_state_root()?;
+    let started = Instant::now();
+    let guard_store = Arc::clone(store);
+    let report = fandhe_container_supervisor::logs::sweep_stale_container_logs(
+        root,
+        Arc::new(move |id| CoreLifecycleRuntime::id_is_absent(&guard_store, id)),
+        budget,
+    );
+    if report.reclaimed_ids > 0
+        && let Ok(name) = OpName::new("container_log_reclaim")
+    {
+        let each = started.elapsed() / u32::try_from(report.reclaimed_ids).unwrap_or(u32::MAX);
+        for _ in 0..report.reclaimed_ids {
+            let _ = recorder.record(&name, OpOutcome::Success, each);
+        }
+    }
+    Some(report)
+}
+
+/// ログ削除の結果（`Ok`／`Err`）を `container_delete_cleanup` の結果へ写す（#2894・#2964・ERR-1）。
+///
+/// `Err` はコードをそのまま `Kept` に載せる。supervisor ログ側の枠の満杯は `ResourceExhausted`、期限切れは `Timeout`、
+/// ロックが待ちの期限まで解放されなかったときは `FailedPrecondition`（`remove_guarded_bounded_waiting` が分類する）。
+fn cleanup_outcome_of(result: &Result<RemovedLogs, TraitError>) -> CleanupOutcome {
+    match result {
+        // guard が偽（同じ ID が再作成済み）の 0 件成功は `Removed` と報告しない（#3143・SUP-7）。
+        Ok(removed) if removed.guard_declined() => CleanupOutcome::Superseded,
+        Ok(_) => CleanupOutcome::Removed,
+        Err(e) => CleanupOutcome::Kept { code: e.code() },
+    }
+}
+
+/// 起動時の走査の結果の構造化ログ 1 行（`event: container_log_sweep`。#2760・REPAIR-4）。件数だけで、パス・ID は含めない。
+/// `workers_busy` は枠の満杯で打ち切ったことを示し、期限切れの `timed_out` とは別（#2894）。
+pub fn sweep_summary_line(r: &fandhe_container_supervisor::logs::SweepReport) -> String {
+    format!(
+        "{{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":{},\"reclaimed_ids\":{},\"removed_files\":{},\"skipped_live\":{},\"skipped_present\":{},\"skipped_undecodable\":{},\"failed\":{},\"timed_out\":{},\"workers_busy\":{}}}",
+        r.scanned,
+        r.reclaimed_ids,
+        r.removed_files,
+        r.skipped_live,
+        r.skipped_present,
+        r.skipped_undecodable,
+        r.failed,
+        r.timed_out,
+        r.workers_busy
+    )
+}
+
+/// 起動時の pull 回収 GC の全体の期限（#2819・REPAIR-5）。超えたら起動しない（取り残した worker が `@lock` を握ったまま受け付けないため）。
+#[cfg(unix)]
+pub const STARTUP_PULL_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// 起動時の記録の再採用（sandbox・コンテナ・stale create・孤児 bundle の 4 段）の全体の期限（R9 #2938・REPAIR-5）。
+///
+/// 1 件の期限は 10 秒（containerd の 10 秒/件を参考にした値）、4 段で全体の残りを分け合う。超えたら起動しない
+/// （registry は空のまま）。起動の最悪時間は [`STARTUP_PULL_RECOVERY_BUDGET`]（60 秒）+ 本予算（120 秒）。
+#[cfg(unix)]
+pub const STARTUP_RECORD_READOPTION_BUDGET: fandhe_container_cri::runtime_service::ListBudget =
+    fandhe_container_cri::runtime_service::ListBudget {
+        per_record: Duration::from_secs(10),
+        total: Duration::from_secs(120),
+    };
+
+/// 起動時の pull 回収 GC の結果の件数（パス・pull ID は含めない。REPAIR-4）。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullRecoveryCounts {
+    /// ステージングを消した pull の数。
+    pub reclaimed: usize,
+    /// 解放したリースの合計。
+    pub released_leases: usize,
+    /// 生きている pull のため残した数。
+    pub kept_live: usize,
+    /// 不在を確認できず残した数。
+    pub kept_undetermined: usize,
+    /// 削除に失敗した数（1 以上なら warn）。
+    pub failed: usize,
+    /// 触らなかったエントリ数。
+    pub foreign_entries: usize,
+}
+
+#[cfg(unix)]
+impl PullRecoveryCounts {
+    /// oci の回収結果から件数だけを写す（リースの和は飽和加算）。
+    pub fn from_recovery(r: &fandhe_container_oci::image_management::StalePullRecovery) -> Self {
+        Self {
+            reclaimed: r.reclaimed().len(),
+            released_leases: r
+                .released_leases()
+                .iter()
+                .fold(0usize, |acc, (_, n)| acc.saturating_add(*n)),
+            kept_live: r.kept_live().len(),
+            kept_undetermined: r.kept_undetermined().len(),
+            failed: r.failed().len(),
+            foreign_entries: r.foreign_entries(),
+        }
+    }
+
+    /// 構造化ログ 1 行（`event: image_pull_recovery`）。`failed` が 1 以上なら `warn`。
+    pub fn summary_line(&self) -> String {
+        format!(
+            "{{\"level\":\"{}\",\"event\":\"image_pull_recovery\",\"reclaimed\":{},\"released_leases\":{},\"kept_live\":{},\"kept_undetermined\":{},\"failed\":{},\"foreign_entries\":{}}}",
+            if self.failed > 0 { "warn" } else { "info" },
+            self.reclaimed,
+            self.released_leases,
+            self.kept_live,
+            self.kept_undetermined,
+            self.failed,
+            self.foreign_entries
+        )
+    }
+}
+
+/// 起動時の結果の構造化ログ 1 行（`event: image_pull_recovery`。#2819・REPAIR-4）。件数だけで、パス・ID は含めない。
+#[cfg(unix)]
+pub fn pull_recovery_summary_line(
+    r: &fandhe_container_oci::image_management::StalePullRecovery,
+) -> String {
+    PullRecoveryCounts::from_recovery(r).summary_line()
+}
+
+/// 起動時の pull 回収 GC の結末（#2819。`main.rs` の `serve` が分岐する）。
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupPullRecovery {
+    /// 回収を終えた（一部失敗は `failed` 件数に出る。起動は続ける）。
+    Completed(PullRecoveryCounts),
+    /// 開けない・排他を取れない等（エラーコード文字列）。起動しない。
+    Failed(&'static str),
+    /// 期限内に終わらなかった。起動しない。
+    TimedOut,
+    /// worker を作れなかった。起動しない。
+    SpawnFailed,
+}
+
+/// `images_root` の在庫を開いて `recover_stale_pulls` を 1 回呼び、`image_pull_recovery` を記録器へ計上する
+/// （OCI-7・OCI-1・REPAIR-4。#2819）。生存判定は `@pull.lock` の OS ロックで、生きている pull は回収しない。
+/// root は呼び出し側が状態ルート配下の固定位置を渡す（外部入力から受けない）。
+/// `oci` は oci 側の計装（`oci.pull.gc_recover`・`oci.store.lock`）の記録先で、本番は oci 専用の記録器への橋渡しを渡す（#2900）。
+#[cfg(unix)]
+pub fn recover_stale_image_pulls_in(
+    images_root: &std::path::Path,
+    recorder: &OpRecorder,
+    oci: Arc<dyn OciOpRecorder>,
+) -> Result<
+    fandhe_container_oci::image_management::StalePullRecovery,
+    fandhe_container_oci::error::OciError,
+> {
+    let started = Instant::now();
+    let r = fandhe_container_oci::image_management::ImageStore::open(images_root)
+        .map(|store| store.with_recorder(oci))
+        .and_then(|store| store.recover_stale_pulls());
+    if let Ok(name) = OpName::new("image_pull_recovery") {
+        let ok = matches!(&r, Ok(v) if v.failed().is_empty());
+        let outcome = if ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+    r
+}
+
+/// `f` を別スレッドで走らせ、`budget` 内の結果を待つ（REPAIR-5）。超えたら `TimedOut`（worker は取り残すため、
+/// 呼び出し側は起動を中止してプロセスを終える。ロックは終了時に OS が解放する）。
+#[cfg(unix)]
+pub fn run_startup_pull_recovery<F>(f: F, budget: Duration) -> StartupPullRecovery
+where
+    F: FnOnce() -> Result<
+            fandhe_container_oci::image_management::StalePullRecovery,
+            fandhe_container_oci::error::OciError,
+        > + Send
+        + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("pull-recovery".to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return StartupPullRecovery::SpawnFailed;
+    }
+    match rx.recv_timeout(budget) {
+        Ok(Ok(r)) => StartupPullRecovery::Completed(PullRecoveryCounts::from_recovery(&r)),
+        Ok(Err(e)) => StartupPullRecovery::Failed(e.code().as_str()),
+        Err(_) => StartupPullRecovery::TimedOut,
+    }
+}
+
+/// gRPC サーバーが 1 リクエストを待つ上限（REPAIR-5・#2592）。`GrpcServerConfig` の既定（10 秒）では `PullImage`
+/// （ネットワーク越し）も `StartContainer`（[`PLUGIN_RUNTIME_TIMEOUT`]）も途中で切れるため、`GRPC_TIMEOUT_MAX`（600 秒）以下で
+/// 引き上げる。クライアントが付ける `grpc-timeout` はこれより短ければそちらが効く。
+pub const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 停止シグナルを受けてから、実行中の RPC の完了を待つ猶予（REPAIR-5・CRI-1・#3226）。`GrpcServerConfig::with_shutdown_grace` へ渡す。
+/// 値は `GRPC_SHUTDOWN_GRACE_DEFAULT` と同じ 10 秒で、systemd の既定の停止猶予（90 秒）より十分短い。超えた RPC
+/// （PullImage の最大 540 秒や StartContainer 等）は意図して打ち切り、接続を強制的に閉じて結果不明のまま終える
+/// （記録は再起動時の再採用〔R7〕、pull は `recover_stale_image_pulls`〔OCI-7〕が扱う）。新しいインスタンスは
+/// `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了（プロセスの消滅）を待ってから起動する運用を前提とする。
+pub const PLUGIN_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// `PullImage` 全体の期限（[`PLUGIN_REQUEST_TIMEOUT`] より短くする）。gRPC 側が先に切れても、裏の `spawn_blocking` の取り込みが
+/// 有界時間で終わるようにするため（oci の既定は pull 1 時間・blob 30 分で、request timeout より長い）。
+/// 展開の `ExtractBudget` にも pull の開始時に求めた同じ絶対時刻を渡して期限を共有する（展開に別の予算は持たせない。
+/// 別予算にすると pull 全体が本値を超えうる。#2967・CRI-3・REPAIR-5。設計は `docs/design/container-log-removal-wait.md`。
+/// 照合は `cri3_repair5_extraction_shares_the_pull_deadline`・`repair5_pull_deadline_fits_inside_request_timeout`）。
+pub const PLUGIN_PULL_DEADLINE: Duration = Duration::from_secs(540);
+
+/// 本番の `PullConfig`（キャッシュは `<state_root>/.cri/images`。pull と create の展開設定の単一の出所）。
+///
+/// 所有者・特殊ビットは既定の `Keep` + `Strip` のまま（`ChownMapped` 等の本番値は #2241・#2315・#482 が前提。REPAIR-3）。
+#[cfg(unix)]
+fn production_pull_config(state_root: &std::path::Path) -> Result<PullConfig, CriError> {
+    let mut pull = PullConfig::new(state_root.join(IMAGES_DIR))?;
+    pull.pull_deadline = PLUGIN_PULL_DEADLINE;
+    Ok(pull)
+}
+
+/// 本番のレジストリクライアント設定。blob 1 本の期限を [`PLUGIN_PULL_DEADLINE`] に揃える。
+#[cfg(unix)]
+fn production_registry_config() -> RegistryClientConfig {
+    RegistryClientConfig {
+        blob_request_timeout: PLUGIN_PULL_DEADLINE,
+        ..RegistryClientConfig::default()
+    }
+}
 
 /// core の `oci_runtime` のライブラリ関数へ委ねる plugin 側の `ContainerRuntime`（CRI-2）。
 ///
@@ -257,8 +705,10 @@ pub struct CoreLifecycleRuntime {
     cgroups: Arc<dyn ContainerCgroupRemover>,
     /// `create` の `mounts[].destination` 拒否の記録先（`with_create_audit_sink`。#2594）。無ければ記録しない。
     create_audit: Option<Arc<dyn AuditSink>>,
-    /// コンテナログ削除で sink の閉鎖を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・REPAIR-5）。
+    /// supervisor ログとコンテナログの削除で共有する、ロック解放を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・#2964・REPAIR-5）。
     container_log_lock_wait: Duration,
+    /// `delete` 全体の期限（`PLUGIN_FORCE_DELETE_DEADLINE` 以下。後始末の各段の予算を残りで頭打ちにする。#3027・REPAIR-5）。
+    delete_deadline: Duration,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
     #[cfg(target_os = "linux")]
@@ -270,12 +720,90 @@ pub struct CoreLifecycleRuntime {
 /// 値は `ContainerId`（検証済みの文字種）・`CleanupTarget::as_str`・`ErrorCode::as_str` の固定語彙だけで組み、
 /// パス・errno・外部入力の文字列を含めない（ERR-1・ERR-2）。
 fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode) -> String {
+    // コンテナログが「待ちを使い切っても sink が閉じなかった」ときだけ `reason` を足す（他の失敗と見分ける。#2760・REPAIR-4）。
+    let reason = match target {
+        CleanupTarget::ContainerLog | CleanupTarget::SupervisorLog => {
+            container_log_removal_reason(code)
+        }
+        _ => None,
+    }
+    .map(|r| format!(",\"reason\":\"{r}\""))
+    .unwrap_or_default();
     format!(
-        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}",
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\"{reason},\"message\":\"cleanup after delete left resources behind\"}}",
         id.as_str(),
         target.as_str(),
         code.as_str()
     )
+}
+
+/// 試さなかった supervisor ログ・コンテナログの段の警告行（#3260・SUP-7・CRI-2・REPAIR-4・REPAIR-5）。
+///
+/// 全体の期限を使い切って段を試さなかったときだけ使う。ファイルの有無を確かめていないため、警告行だけを見た読み手が
+/// 「ファイルが残った」と誤読しないよう `existence: unverified` を足す（起動オプション文書の行と同じ規則。`reason` の語彙は
+/// 増やさない）。コードは `Timeout` 固定で、試して失敗した行（[`cleanup_warning_line`]）は変えない。期限後に存在を確かめる
+/// I/O は足さない（REPAIR-5）。値は `ContainerId`・`CleanupTarget::as_str`・固定語彙だけ（ERR-1・ERR-2）。
+fn skipped_log_cleanup_warning_line(id: &ContainerId, target: CleanupTarget) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}}",
+        id.as_str(),
+        target.as_str(),
+        ErrorCode::Timeout.as_str()
+    )
+}
+
+/// ログ 1 段の後始末の結果。全体の期限を使い切って試さなかった段を、試して期限切れになった段と区別する（#3260・REPAIR-4）。
+///
+/// `delete` が応答（`outcome`）と警告行の出し分け（`is_skipped`）に使う。core の `CleanupOutcome` は変えない（plugin 境界の型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogStage {
+    /// 試した（成功・guard 見送り・失敗を含む）。
+    Attempted(CleanupOutcome),
+    /// 全体の期限を使い切り、存在を確かめずに試さなかった（コードは `Timeout` 固定）。
+    Skipped,
+}
+
+impl LogStage {
+    /// 応答へ載せる `CleanupOutcome`。`Skipped` は `Kept { Timeout }`。
+    fn outcome(&self) -> CleanupOutcome {
+        match self {
+            Self::Attempted(o) => *o,
+            Self::Skipped => CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            },
+        }
+    }
+
+    fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+}
+
+/// `delete` の後の起動オプション文書の掃除に失敗した旨の構造化ログ 1 行（#2760・SUP-12・REPAIR-4）。
+///
+/// `CleanupTarget`（plugin 境界の型）には語彙を足さないため、`target` はこの module の固定文字列 `container_options` を使う。
+/// 値は `ContainerId`・`ErrorCode::as_str` の固定語彙だけで、パス・errno・文書の中身（env の値）を含めない（ERR-1・ERR-2）。
+fn options_cleanup_warning_line(id: &ContainerId, failure: OptionsCleanupFailure) -> String {
+    // 全体の期限を使い切って試さなかった段は、文書が実在したか確かめていない。警告行だけを見た読み手が「文書が残った」と
+    // 誤読しないよう `existence` で示す（`reason` の語彙は増やさない。#3027 の決定。#3143・REPAIR-4）。
+    let (code, existence) = match failure {
+        OptionsCleanupFailure::Skipped => (ErrorCode::Timeout, ",\"existence\":\"unverified\""),
+        OptionsCleanupFailure::Failed(code) => (code, ""),
+    };
+    format!(
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"container_options\",\"code\":\"{}\"{existence},\"message\":\"cleanup after delete left resources behind\"}}",
+        id.as_str(),
+        code.as_str()
+    )
+}
+
+/// 起動オプション文書の掃除が残した理由（`remove_stale_options` の失敗。#3143・REPAIR-4・REPAIR-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionsCleanupFailure {
+    /// 全体の期限を使い切り、文書の存在を確かめずに試さなかった（コードは `Timeout` 固定）。
+    Skipped,
+    /// 試して失敗した。
+    Failed(ErrorCode),
 }
 
 /// `create` の拒否の記録先を包み、記録の失敗を固定語彙の 1 行で stderr へ残す（結果は内側のまま返す。#2594）。
@@ -333,18 +861,68 @@ impl AuditSink for ObservedCreateAudit {
 
 /// cri の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `CriOpKind::as_str`）。
 /// 記録の失敗（名前種類の上限等）は `dropped_records` に計上され、RPC の結果は変えない。
-struct CoreCriRecorder(Arc<OpRecorder>);
+///
+/// 2 本の記録器を持つ。`shared` は従来どおり `cri.<操作>` の成功 / 失敗とレイテンシを受ける。
+/// `pull` は oci 専用の記録器で、`PullImage` の失敗に付いたレジストリの HTTP 状態の区分
+/// （`RegistryHttpClass`）を `cri.pull_image.registry_http.<区分>` の失敗として受ける（#2966・REPAIR-4・CRI-3）。
+/// 共有記録器の `MAX_TRACKED_OPS` を区分の 8 種で圧迫しないため分ける（22 + 8 は上限に収まる）。
+/// `cri.pull_image`（共有）の失敗 1 件と区分側の 1 件は同じ失敗を別の切り口で数えたもの（二重計上）。
+/// 生の HTTP 状態・URL・資格情報は記録しない。
+struct CoreCriRecorder {
+    shared: Arc<OpRecorder>,
+    pull: Arc<OpRecorder>,
+}
+
+impl CoreCriRecorder {
+    fn new(shared: Arc<OpRecorder>, pull: Arc<OpRecorder>) -> Self {
+        Self { shared, pull }
+    }
+}
 
 impl CriOpRecorder for CoreCriRecorder {
     fn record_cri_op(&self, sample: &CriOpSample) {
-        let Ok(name) = OpName::new(sample.kind().as_str()) else {
-            return;
-        };
         let outcome = match sample.outcome() {
             CriOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
-        let _ = self.0.record(&name, outcome, sample.latency());
+        if let Ok(name) = OpName::new(sample.kind().as_str()) {
+            let _ = self.shared.record(&name, outcome, sample.latency());
+        }
+        if outcome == OpOutcome::Failure
+            && let Some(class) = sample.registry_http()
+            && let Ok(name) = OpName::new(class.op_name())
+        {
+            let _ = self
+                .pull
+                .record(&name, OpOutcome::Failure, sample.latency());
+        }
+    }
+}
+
+/// 記録ストアの操作の計測結果を共有 `OpRecorder` へ流す橋渡し（R9 #2938・REPAIR-4）。
+///
+/// 操作名は `cri.record_store.{put,remove,list}` の 3 種に固定し、結果は Success / Failure に縮約する
+/// （`MAX_TRACKED_OPS` の枠を結果区分・種別で増やさないため）。未知の操作は記録しない。記録の失敗は無視する。
+#[cfg(unix)]
+struct CoreRecordStoreRecorder(Arc<OpRecorder>);
+
+#[cfg(unix)]
+impl RecordStoreOpRecorder for CoreRecordStoreRecorder {
+    fn record_store_op(&self, sample: &RecordStoreOpSample) {
+        let name = match sample.op {
+            RecordStoreOp::Put => "cri.record_store.put",
+            RecordStoreOp::Remove => "cri.record_store.remove",
+            RecordStoreOp::List => "cri.record_store.list",
+            _ => return,
+        };
+        let outcome = if sample.outcome == RecordStoreOutcome::Ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        if let Ok(name) = OpName::new(name) {
+            let _ = self.0.record(&name, outcome, sample.latency);
+        }
     }
 }
 
@@ -361,6 +939,69 @@ impl fandhe_container_net::instrument::NetOpRecorder for CoreNetRecorder {
         };
         let outcome = match sample.outcome() {
             NetOpOutcome::Success => OpOutcome::Success,
+            _ => OpOutcome::Failure,
+        };
+        let _ = self.0.record(&name, outcome, sample.latency());
+    }
+}
+
+/// oci の計測結果を oci 専用の `OpRecorder` へ流す橋渡し（操作名は `OciOpKind::as_str` と同じ固定 22 種。REPAIR-4・OCI-1・#2900）。
+///
+/// 呼び出し元は `CriPluginBackends` の pull（`OciImagePuller`・`OciRegistryClient`）・展開（`ImageRootfsSource`）・
+/// 起動時の回収（`recover_stale_image_pulls_in`）。`OciOpKind` は `#[non_exhaustive]` のため未知の種別は記録しない
+/// （名前の種類数を有界に保つ。追加時はここと試験を足す）。エラー code は名前に混ぜず落とす（種類数が掛け算で増えるため。
+/// 分類は oci のエラー応答と構造化ログに残る）。記録の失敗は無視し、操作の結果は変えない。
+#[cfg(unix)]
+struct CoreOciRecorder(Arc<OpRecorder>);
+
+#[cfg(unix)]
+impl fmt::Debug for CoreOciRecorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreOciRecorder").finish_non_exhaustive()
+    }
+}
+
+/// `OciOpKind` から操作名への写像（22 種。未知の種別は `None`）。
+#[cfg(unix)]
+fn oci_op_name(kind: OciOpKind) -> Option<&'static str> {
+    Some(match kind {
+        OciOpKind::AuthenticateAnonymous => "oci.auth.anonymous",
+        OciOpKind::AuthenticateBasic => "oci.auth.basic",
+        OciOpKind::AuthenticateBearer => "oci.auth.bearer",
+        OciOpKind::Authenticate => "oci.auth",
+        OciOpKind::FetchManifest => "oci.manifest.fetch",
+        OciOpKind::FetchBlob => "oci.blob.fetch",
+        OciOpKind::VerifyBlobDigest => "oci.blob.verify",
+        OciOpKind::DecompressLayer => "oci.layer.decompress",
+        OciOpKind::ExtractLayer => "oci.layer.extract",
+        OciOpKind::ListImages => "oci.image.list",
+        OciOpKind::DiskUsage => "oci.image.df",
+        OciOpKind::RemoveImage => "oci.image.rm",
+        OciOpKind::AcquireImageStoreLock => "oci.store.lock",
+        OciOpKind::BeginPull => "oci.pull.begin",
+        OciOpKind::LeaseBlob => "oci.pull.lease",
+        OciOpKind::ReleaseBlobLease => "oci.pull.release",
+        OciOpKind::PublishPull => "oci.pull.publish",
+        OciOpKind::AbortPull => "oci.pull.abort",
+        OciOpKind::PruneImages => "oci.image.prune",
+        OciOpKind::TagImage => "oci.image.tag",
+        OciOpKind::RecoverPendingDeletion => "oci.image.gc_recover",
+        OciOpKind::RecoverStalePulls => "oci.pull.gc_recover",
+        _ => return None,
+    })
+}
+
+#[cfg(unix)]
+impl OciOpRecorder for CoreOciRecorder {
+    fn record_oci_op(&self, sample: &OciOpSample) {
+        let Some(raw) = oci_op_name(sample.kind()) else {
+            return;
+        };
+        let Ok(name) = OpName::new(raw) else {
+            return;
+        };
+        let outcome = match sample.outcome() {
+            OciOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
         let _ = self.0.record(&name, outcome, sample.latency());
@@ -388,6 +1029,7 @@ impl CoreLifecycleRuntime {
             cgroups: Arc::new(production_cgroup_remover()),
             create_audit: None,
             container_log_lock_wait: CONTAINER_LOG_LOCK_WAIT,
+            delete_deadline: PLUGIN_FORCE_DELETE_DEADLINE,
             cleanup_warn: Arc::new(|line| {
                 let _ = crate::telemetry::stderr_sink().submit(line);
             }),
@@ -410,11 +1052,19 @@ impl CoreLifecycleRuntime {
         self
     }
 
-    /// コンテナログ削除で sink の閉鎖を待つ上限を変える（試験用。`CONTAINER_LOG_LOCK_WAIT` を超える値は切り詰める。
+    /// ログ 2 件の削除で共有するロック解放の待ちの上限を変える（試験用。`CONTAINER_LOG_LOCK_WAIT` を超える値は切り詰める。
     /// `PLUGIN_RUNTIME_TIMEOUT` に収まる予算の不変条件を壊さないため。#2634・REPAIR-5）。
     #[must_use]
     pub fn with_container_log_lock_wait(mut self, wait: Duration) -> Self {
         self.container_log_lock_wait = wait.min(CONTAINER_LOG_LOCK_WAIT);
+        self
+    }
+
+    /// `delete` 全体の期限を変える（試験用。`PLUGIN_FORCE_DELETE_DEADLINE` を超える値は切り詰める。
+    /// `PLUGIN_RUNTIME_TIMEOUT` に収まる予算の不変条件を壊さないため。#3027・REPAIR-5）。
+    #[must_use]
+    pub fn with_delete_deadline(mut self, deadline: Duration) -> Self {
+        self.delete_deadline = deadline.min(PLUGIN_FORCE_DELETE_DEADLINE);
         self
     }
 
@@ -448,29 +1098,54 @@ impl CoreLifecycleRuntime {
         &self.recorder
     }
 
-    /// core の `delete` が成功した後に、supervisor の構造化ログを期限つきで best effort に消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+    /// core の `delete` が成功した後に、supervisor の構造化ログを期限つきで消す（#2067・#2434・#2964・REPAIR-4・REPAIR-5）。
     ///
-    /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）。期限切れは記録器の操作名
-    /// `supervisor_log_remove` の失敗として計上し、観測できるようにする。
-    fn remove_supervisor_log(&self, id: &ContainerId) -> CleanupOutcome {
+    /// CLI の `delete` と同じ契約。`FailedPrecondition`（同じ ID の supervisor が drain 中にログの flock を保持）のあいだ
+    /// 最大 `lock_wait` まで試し直し、1 回の試行の期限は [`SUPERVISOR_LOG_REMOVE_TIMEOUT`]（5 秒）。guard（状態ストアが
+    /// `NotFound`）はロック保持中に試行ごと評価し、待つ間に同じ ID で作り直されたインスタンスのログは消さない。
+    /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）が、握りつぶさず `Kept { code }` と記録器の
+    /// `supervisor_log_remove` の失敗として観測できるようにする。
+    ///
+    /// `remaining` は `delete` 全体の期限までの残り。`lock_wait` と 1 回の試行の期限をこの残りで頭打ちにし
+    /// （最悪の所要は `lock_wait` + 試行の期限）、残りが 0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
+    /// 試さなかったときは [`LogStage::Skipped`] を返し、`delete` が警告行に `existence: unverified` を足す（#3260）。
+    fn remove_supervisor_log(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+        remaining: Duration,
+    ) -> LogStage {
         let Some(root) = self.store.host_state_root() else {
-            return CleanupOutcome::NotApplicable;
+            return LogStage::Attempted(CleanupOutcome::NotApplicable);
         };
         let started = Instant::now();
-        let outcome = remove_bounded(root, id, SUPERVISOR_LOG_REMOVE_TIMEOUT);
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let mut skipped = false;
+        let removed = match stage_budget(remaining, lock_wait, SUPERVISOR_LOG_REMOVE_TIMEOUT) {
+            Some((lock_wait, attempt)) => remove_guarded_bounded_waiting(
+                root,
+                id,
+                lock_wait,
+                attempt,
+                Arc::new(move || Self::id_is_absent(&store, &guard_id)),
+            ),
+            None => {
+                skipped = true;
+                Err(delete_deadline_exhausted())
+            }
+        };
         if let Ok(name) = OpName::new("supervisor_log_remove") {
-            let result = match outcome {
-                LogRemoval::Finished => OpOutcome::Success,
-                LogRemoval::TimedOut => OpOutcome::Failure,
+            let result = match &removed {
+                Ok(_) => OpOutcome::Success,
+                Err(_) => OpOutcome::Failure,
             };
             let _ = self.recorder.record(&name, result, started.elapsed());
         }
-        // `Finished` は期限内に作業を終えた best effort（個々の失敗は削除関数が握る）。
-        match outcome {
-            LogRemoval::Finished => CleanupOutcome::Removed,
-            LogRemoval::TimedOut => CleanupOutcome::Kept {
-                code: ErrorCode::Timeout,
-            },
+        if skipped {
+            LogStage::Skipped
+        } else {
+            LogStage::Attempted(cleanup_outcome_of(&removed))
         }
     }
 
@@ -486,8 +1161,24 @@ impl CoreLifecycleRuntime {
     ///
     /// # Errors
     /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（待ちの期限まで同じ ID の sink が閉じなかった）・
-    /// `Timeout`（期限切れか枠の満杯）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
+    /// `Timeout`（期限切れ）・`ResourceExhausted`（枠の満杯。何も実行していない。#2894）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
     pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
+        self.remove_container_log_within(
+            id,
+            self.container_log_lock_wait,
+            CONTAINER_LOG_REMOVE_TIMEOUT,
+        )
+    }
+
+    /// [`Self::remove_container_log`] の待ちの上限を呼び出し側が渡す版。`delete` が supervisor ログと待ちを共有するため、
+    /// 残りの予算（`container_log_lock_wait` 以下）と、`delete` 全体の期限で頭打ちにした 1 回の試行の期限を受け取る
+    /// （#2964・#3027・REPAIR-5）。
+    fn remove_container_log_within(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+        attempt_timeout: Duration,
+    ) -> Result<RemovedLogs, TraitError> {
         let Some(root) = self.store.host_state_root() else {
             return Ok(RemovedLogs::default());
         };
@@ -496,8 +1187,8 @@ impl CoreLifecycleRuntime {
         remove_container_logs_guarded_bounded_waiting(
             root,
             id,
-            self.container_log_lock_wait,
-            CONTAINER_LOG_REMOVE_TIMEOUT,
+            lock_wait,
+            attempt_timeout,
             Arc::new(move || {
                 matches!(
                     store.get(&GetStateRequest::new(guard_id.clone())),
@@ -508,12 +1199,27 @@ impl CoreLifecycleRuntime {
     }
 
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
-    fn record_container_log_removal(&self, id: &ContainerId) -> CleanupOutcome {
+    ///
+    /// `remaining` は `delete` 全体の期限までの残り。0 なら試さず `Timeout` として残す（#3027・REPAIR-5）。
+    /// 試さなかったときは [`LogStage::Skipped`]（警告行に `existence: unverified`。#3260）。
+    fn record_container_log_removal(
+        &self,
+        id: &ContainerId,
+        lock_wait: Duration,
+        remaining: Duration,
+    ) -> LogStage {
         if self.store.host_state_root().is_none() {
-            return CleanupOutcome::NotApplicable;
+            return LogStage::Attempted(CleanupOutcome::NotApplicable);
         }
         let started = Instant::now();
-        let removed = self.remove_container_log(id);
+        let mut skipped = false;
+        let removed = match stage_budget(remaining, lock_wait, CONTAINER_LOG_REMOVE_TIMEOUT) {
+            Some((lock_wait, attempt)) => self.remove_container_log_within(id, lock_wait, attempt),
+            None => {
+                skipped = true;
+                Err(delete_deadline_exhausted())
+            }
+        };
         let elapsed = started.elapsed();
         let result = match &removed {
             Ok(_) => OpOutcome::Success,
@@ -528,10 +1234,147 @@ impl CoreLifecycleRuntime {
         {
             let _ = self.recorder.record(&name, OpOutcome::Failure, elapsed);
         }
-        match removed {
-            Ok(_) => CleanupOutcome::Removed,
-            Err(e) => CleanupOutcome::Kept { code: e.code() },
+        if skipped {
+            LogStage::Skipped
+        } else {
+            LogStage::Attempted(cleanup_outcome_of(&removed))
         }
+    }
+}
+
+impl CoreLifecycleRuntime {
+    /// 状態ストアに `id` の記録が無い（`NotFound`）ときだけ `true`。読み取りに失敗したら `false`（fail-closed）。
+    ///
+    /// ログ・起動オプション文書の回収の guard（ロック保持中に評価される）。記録のある ID の資源は消さない。
+    fn id_is_absent(store: &Arc<dyn StateStore>, id: &ContainerId) -> bool {
+        matches!(
+            store.get(&GetStateRequest::new(id.clone())),
+            Err(e) if e.code() == ErrorCode::NotFound
+        )
+    }
+
+    /// core の `create` の前に、同じ ID の前のインスタンスが残したコンテナログを回収し、起動オプション文書の残骸を掃除する
+    /// （CLI の `create` と同じ契約。#2760・CRI-2・SUP-7・SUP-12・REPAIR-4・REPAIR-5）。
+    ///
+    /// CRI は ID を使い回さないため通常は何も無いが、`CreateContainer` が失敗した後の再試行や、手動で ID を指定した再作成で
+    /// 残りが新しい sink に混ざるのを防ぐ。待たずに 1 回だけ試し（ログ 5 秒・文書 10 秒が上限）、生きている sink・状態が既にある
+    /// ID には触れない。ログ回収が期限切れなら、作業スレッドが残り得るため core を呼ばずに `Timeout` で失敗させる
+    /// （後続の監査記録は単一スレッド前提の fork を要する。SEC-4）。それ以外の失敗は best effort で create を続ける。
+    /// 状態ルートを持たないストアでは何もしない。
+    ///
+    /// # Errors
+    /// ログ回収が期限切れのとき `Timeout`。
+    fn reclaim_before_create(&self, id: &ContainerId) -> Result<(), TraitError> {
+        use fandhe_container_supervisor::container_options::store as options_store;
+        let Some(root) = self.store.host_state_root() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let reclaim =
+            reclaim_stale_container_logs(root, id, move || Self::id_is_absent(&store, &guard_id));
+        let result = reclaim_timeout_result(reclaim);
+        let outcome = match reclaim {
+            StaleLogReclaim::Removed(_) => Some(OpOutcome::Success),
+            StaleLogReclaim::Nothing => None,
+            StaleLogReclaim::Failed(_) | StaleLogReclaim::TimedOut => Some(OpOutcome::Failure),
+        };
+        if let Some(outcome) = outcome
+            && let Ok(name) = OpName::new("container_log_reclaim")
+        {
+            let _ = self.recorder.record(&name, outcome, started.elapsed());
+        }
+        result?;
+        // 起動オプション文書の残骸（best effort。失敗しても create は続ける。文書は世代の照合で採用されない）。
+        let _ = self.remove_stale_options(id, options_store::OPTIONS_REMOVE_TIMEOUT);
+        Ok(())
+    }
+
+    /// 状態の記録が無い ID の起動オプション文書を、ID 単位のロックの下で期限つきに消す（#2760・SUP-12・REPAIR-5）。
+    ///
+    /// 同じ ID の記録がある（作り直された新しいインスタンスかもしれない）ときは消さない。文書が無ければロックも作らない。
+    /// 失敗は記録器の `container_options_remove` の Failure として計上する。Linux 以外は文書を書く経路が無く
+    /// （`Unimplemented`）、対象外として `Ok` を返し何も計上しない。戻り値は呼び出し元が警告行を出すかの判断に使う。
+    ///
+    /// `remaining` は呼び出し元の残りの予算（`create` は `OPTIONS_REMOVE_TIMEOUT`、`delete` は全体の期限までの残り。#3027）。
+    /// 全体の期限と `OPTIONS_REMOVE_TIMEOUT` の小さい方を期限にし、ロックの待ちはそれ以下にする。0 なら試さず `Timeout`。
+    fn remove_stale_options(
+        &self,
+        id: &ContainerId,
+        remaining: Duration,
+    ) -> Result<(), OptionsCleanupFailure> {
+        use fandhe_container_supervisor::container_options::store as options_store;
+        let Some(root) = self.store.host_state_root() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        let timeout = remaining.min(options_store::OPTIONS_REMOVE_TIMEOUT);
+        let skipped = timeout.is_zero();
+        let removed = if skipped {
+            Err(delete_deadline_exhausted())
+        } else {
+            options_store::remove_stale_bounded(
+                root,
+                id,
+                move || Self::id_is_absent(&store, &guard_id),
+                options_store::OPTIONS_LOCK_WAIT.min(timeout),
+                timeout,
+            )
+        };
+        match removed {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == ErrorCode::Unimplemented => Ok(()),
+            Err(e) => {
+                if let Ok(name) = OpName::new("container_options_remove") {
+                    let _ = self
+                        .recorder
+                        .record(&name, OpOutcome::Failure, started.elapsed());
+                }
+                Err(if skipped {
+                    OptionsCleanupFailure::Skipped
+                } else {
+                    OptionsCleanupFailure::Failed(e.code())
+                })
+            }
+        }
+    }
+}
+
+/// `delete` の後始末の 1 段に使える (ロックの待ち, 1 回の試行の期限) を、全体の期限までの `remaining` で頭打ちにして決める
+/// （最悪の所要は両者の和なので、和が `remaining` を超えないようにする。残りが 0 なら `None` で、その段は試さない。#3027・REPAIR-5）。
+fn stage_budget(
+    remaining: Duration,
+    lock_wait_cap: Duration,
+    attempt_cap: Duration,
+) -> Option<(Duration, Duration)> {
+    if remaining.is_zero() {
+        return None;
+    }
+    // 残りが小さいときは半分ずつ。試行の期限は上限であって通常は短時間で終わるため、残りを全部渡すとロックの待ちが消える。
+    let attempt = attempt_cap.min(remaining / 2);
+    let lock_wait = lock_wait_cap.min(remaining.saturating_sub(attempt));
+    Some((lock_wait, attempt))
+}
+
+/// `delete` 全体の期限を使い切って後始末の段を試さなかったときのエラー（`Timeout`。固定文言。#3027・REPAIR-5）。
+fn delete_deadline_exhausted() -> TraitError {
+    TraitError::new(
+        ErrorCode::Timeout,
+        "delete deadline exhausted before cleanup stage",
+    )
+}
+
+/// create 前のログ回収の結果を、core を呼ぶかの判断へ写す（期限切れだけが失敗。#2760・SEC-4・REPAIR-5）。
+fn reclaim_timeout_result(reclaim: StaleLogReclaim) -> Result<(), TraitError> {
+    match reclaim {
+        StaleLogReclaim::TimedOut => Err(TraitError::new(
+            ErrorCode::Timeout,
+            "stale container log reclaim did not finish within the deadline",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -556,7 +1399,8 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
 impl CoreLifecycleRuntime {
     /// force 削除の前に、生きている（Running・pid あり、または pid あり Created）コンテナを停止して終了を確認する。
     ///
-    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界（REPAIR-5）。記録が無い・停止済み・
+    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界、かつ全体を `FORCE_DELETE_STOP_BUDGET` で
+    /// 頭打ちにする（REPAIR-5・#3143）。記録が無い・停止済み・
     /// pid の無い状態は何もせず、core の delete の判定に任せる。
     #[cfg(target_os = "linux")]
     fn stop_live_before_force_delete(&self, id: &ContainerId) -> Result<(), TraitError> {
@@ -572,7 +1416,13 @@ impl CoreLifecycleRuntime {
         ) && status.pid().is_some();
         if live {
             let stop = StopRequest::new(id.clone(), Duration::ZERO)?;
-            self.supervised.stop(&*self.store, &self.recorder, &stop)?;
+            // 予算つき: 状態ロックの待ちを含めて stop の最悪を頭打ちにし、delete 全体を期限に収める（#3143・REPAIR-5）。
+            self.supervised.stop_within(
+                &*self.store,
+                &self.recorder,
+                &stop,
+                Some(FORCE_DELETE_STOP_BUDGET),
+            )?;
         }
         Ok(())
     }
@@ -585,6 +1435,7 @@ fn launch_unavailable() -> TraitError {
 
 impl ContainerRuntime for CoreLifecycleRuntime {
     fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
+        self.reclaim_before_create(req.id())?;
         let created = match &self.create_audit {
             Some(sink) => {
                 oci_runtime::create_audited(&*self.store, &self.recorder, req, sink.as_ref())
@@ -596,7 +1447,8 @@ impl ContainerRuntime for CoreLifecycleRuntime {
 
     #[cfg(target_os = "linux")]
     fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
-        self.supervised.start(&*self.store, req.id())
+        self.supervised
+            .start(&*self.store, req.id(), req.log_path())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -625,6 +1477,9 @@ impl ContainerRuntime for CoreLifecycleRuntime {
     }
 
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+        // 全体の期限（#3027）。stop・core の delete は打ち切れないが、後始末の各段はここまでの残りで頭打ちにする。
+        let deadline = Instant::now() + self.delete_deadline;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
         #[cfg(target_os = "linux")]
         {
             self.supervised.reap();
@@ -636,14 +1491,38 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         }
         let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
             .map_err(to_trait_error)?;
-        let supervisor_log = self.remove_supervisor_log(req.id());
-        let container_log = self.record_container_log_removal(req.id());
+        // 2 つのログで待ちを共有する（最悪 10 + 5 + 5 = 20 秒。独立に待つと 30 秒で `PLUGIN_RUNTIME_TIMEOUT` の余裕が尽きる。#2964）。
+        // 順序の根拠: コンテナログの sink は drain の終わりに閉じ、supervisor ログの flock はプロセス終了で外れる。
+        // supervisor ログが解放されればコンテナログはほぼ即座に消せるため、先に supervisor ログを待つ。
+        let wait = self.container_log_lock_wait;
+        let wait_deadline = Instant::now() + wait;
+        let supervisor_log = self.remove_supervisor_log(req.id(), wait, remaining());
+        let container_log = self.record_container_log_removal(
+            req.id(),
+            wait_deadline.saturating_duration_since(Instant::now()),
+            remaining(),
+        );
+        // 起動オプション文書の残骸（記録の無くなった ID の分。失敗は応答に載せず、計上と構造化ログで知らせる。#2760）。
+        if let Err(failure) = self.remove_stale_options(req.id(), remaining()) {
+            (self.cleanup_warn)(options_cleanup_warning_line(req.id(), failure));
+        }
         let response = response
-            .with_supervisor_log(supervisor_log)
-            .with_container_log(container_log);
+            .with_supervisor_log(supervisor_log.outcome())
+            .with_container_log(container_log.outcome());
         // 残した資源は `Err` にせず、応答と構造化ログで知らせる（再試行は core の `NOT_FOUND` で止まるため。#2633）。
         for (target, code) in response.kept() {
-            (self.cleanup_warn)(cleanup_warning_line(req.id(), target, code));
+            // 期限切れで試さなかったログの段だけ `existence: unverified` を足す（#3260）。
+            let skipped = match target {
+                CleanupTarget::SupervisorLog => supervisor_log.is_skipped(),
+                CleanupTarget::ContainerLog => container_log.is_skipped(),
+                _ => false,
+            };
+            let line = if skipped {
+                skipped_log_cleanup_warning_line(req.id(), target)
+            } else {
+                cleanup_warning_line(req.id(), target, code)
+            };
+            (self.cleanup_warn)(line);
         }
         Ok(response)
     }
@@ -705,11 +1584,29 @@ const IMAGES_DIR: &str = ".cri/images";
 /// 置き場は `<state_root>/.cri/{bundles,images}` の固定位置で、各ディレクトリは 0700 で作る。既存のものは symlink でなく、
 /// 状態ルートと同じ所有者で、group / other の権限が無いことを確かめ、反すれば消さずに拒否する（fail-closed）。
 /// 失敗の文言は固定で、パスや OS の文字列を含めない。
+///
+/// 展開設定（所有者・特殊ビット）は既定（`Keep` + `Strip`）のままで、`ChownMapped` 等の
+/// 本番の値は渡さない。配線の前提は #2241・#2315・#482（#2534・SEC-5。`fandhe_container_cri::image_pull` の
+/// 「未実装範囲」を参照）。
 #[cfg(unix)]
 pub fn bundle_provider_in(
     state_root: &std::path::Path,
-) -> Result<Arc<dyn BundleProvider>, CriError> {
-    use fandhe_container_cri::bundle::{ImageExtractConfig, ImageRootfsSource, SpecBundleProvider};
+) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
+    bundle_provider_with(state_root, None, None)
+}
+
+/// [`bundle_provider_in`] に、タグ・digest 参照を image ID へ解決する在庫 `store` を足した形（CRI-2・CRI-3。#2592）。
+///
+/// `store` は `ImageService` と同じものを渡す。`None` なら image ID（`sha256:<hex>`）だけを受ける。展開設定は
+/// `production_pull_config`（`ImageService` の pull と同じ値）から `ImageExtractConfig::from_pull_config` で作る。
+/// `recorder` が `Some` なら展開の計装（`oci.layer.extract` 等）をそこへ渡す（REPAIR-4・#2900）。
+#[cfg(unix)]
+pub fn bundle_provider_with(
+    state_root: &std::path::Path,
+    store: Option<Arc<dyn ImageStore>>,
+    recorder: Option<Arc<dyn OciOpRecorder>>,
+) -> Result<Arc<fandhe_container_cri::bundle::SpecBundleProvider>, CriError> {
+    use fandhe_container_cri::bundle::{ImageRootfsSource, SpecBundleProvider};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
     let fail = || CriError::failed_precondition("failed to prepare the bundle store");
@@ -733,10 +1630,16 @@ pub fn bundle_provider_in(
         }
         dirs.push(cur);
     }
-    let [bundles, images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
+    let [bundles, _images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
     // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
     let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
-    let source = ImageRootfsSource::new(ImageExtractConfig::new(images)?);
+    let mut source = ImageRootfsSource::new(production_extract_config(state_root)?);
+    if let Some(store) = store {
+        source = source.with_image_store(store);
+    }
+    if let Some(recorder) = recorder {
+        source = source.with_recorder(recorder);
+    }
     Ok(Arc::new(SpecBundleProvider::new(
         bundles,
         Arc::new(source),
@@ -749,7 +1652,7 @@ pub fn bundle_provider_in(
 pub struct UnimplementedBundleProvider;
 
 impl BundleProvider for UnimplementedBundleProvider {
-    fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         Err(CriError::unimplemented(MSG_BUNDLE_UNAVAILABLE))
     }
 
@@ -772,6 +1675,111 @@ mod tests {
     use fandhe_container_cri::instrument::{CriOpKind, CriOpTimer};
 
     use super::*;
+
+    /// REPAIR-5・#2821: 本番の rootfs 展開設定は `PLUGIN_ROOTFS_DEADLINE`（600 秒）を明示して使う。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_production_extract_config_uses_plugin_rootfs_deadline() {
+        let dir = std::env::temp_dir().join(format!("fcpc-extract-cfg-{}", std::process::id()));
+        let cfg = production_extract_config(&dir).expect("config");
+        assert_eq!(cfg.deadline, PLUGIN_ROOTFS_DEADLINE);
+        assert_eq!(cfg.deadline, Duration::from_secs(600));
+    }
+
+    /// CRI-2・REPAIR-12(#3506): 前回の残骸（古い `.cri/@instance.lock`）があっても消さず、別名の空のディレクトリを
+    /// 作る。残骸のロックファイルは無傷で残り、新しいディレクトリ上で `acquire_instance_lock_in` が取れる。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_repair12_3506_fresh_dir_leaves_stale_lock_residue_untouched() {
+        let parent = crate::test_root::test_root("fcpc-stale-parent", "t");
+        let stale = parent.join("stale");
+        std::fs::create_dir_all(stale.join(".cri")).expect("stale dir");
+        let stale_lock = stale.join(".cri").join("@instance.lock");
+        std::fs::write(&stale_lock, b"x").expect("stale lock");
+        let dir = crate::test_root::test_root_at(stale.clone());
+        assert_ne!(&*dir, stale.as_path());
+        assert_eq!(dir.parent(), Some(&*parent));
+        assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
+        let lock = crate::instance_lock::acquire_instance_lock_in(
+            &dir,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("lock on the fresh directory");
+        drop(lock);
+        assert_eq!(std::fs::read(&stale_lock).expect("read"), b"x");
+    }
+
+    /// CRI-2・REPAIR-12(#3506): 残骸の symlink（実在ディレクトリ・宛先なし）を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_repair12_3506_fresh_dir_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let parent = crate::test_root::test_root("fcpc-symlink-parent", "t");
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let d1 = crate::test_root::test_root_at(link.clone());
+        let d2 = crate::test_root::test_root_at(dangling.clone());
+        assert_ne!(&*d1, link.as_path());
+        assert_ne!(&*d2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&d1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
+    }
+
+    /// CRI-2・CORE-1・REPAIR-12・#3035: 注入で組んだバックエンドはインスタンスロックを持たず、状態ルートも持たない
+    /// （ロックファイル `.cri/@instance.lock` を作る経路が無い）。同じ状態ルートへの `production()` の排他を妨げない。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_injected_backends_hold_no_instance_lock_and_create_no_lock_file() {
+        let dir = crate::test_root::test_root("fcpc-inj-nolock", "t");
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rt = Arc::new(CoreLifecycleRuntime::new(Arc::clone(&store)));
+
+        let injected = CriPluginBackends::new(
+            rt.clone(),
+            Arc::clone(&store),
+            Arc::new(UnimplementedNetwork),
+        );
+        assert!(injected.instance_lock().is_none());
+        assert!(injected.state_root.is_none());
+
+        let with_rec = CriPluginBackends::with_recorder(
+            rt,
+            store,
+            Arc::new(UnimplementedNetwork),
+            Arc::new(OpRecorder::new()),
+        );
+        assert!(with_rec.instance_lock().is_none());
+        assert!(with_rec.state_root.is_none());
+
+        // 構築しても注入側は状態ルート配下に何も作らず、同じルートの排他は別の取得者が取れる。
+        assert!(!dir.join(".cri").exists());
+        let lock = crate::instance_lock::acquire_instance_lock_in(
+            &dir,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("lock is free for another acquirer");
+        drop(lock);
+    }
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).expect("valid id")
@@ -941,6 +1949,152 @@ mod tests {
         assert_eq!(*store.deletes.lock().expect("lock"), 1);
     }
 
+    /// #2760・SEC-4: create 前のログ回収は期限切れのときだけ create を失敗（`Timeout`）させ、それ以外は続ける。
+    #[test]
+    fn repair5_cri2_reclaim_timeout_fails_create_only_on_timeout() {
+        let e = reclaim_timeout_result(StaleLogReclaim::TimedOut).expect_err("timeout");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        for ok in [
+            StaleLogReclaim::Removed(2),
+            StaleLogReclaim::Nothing,
+            StaleLogReclaim::Failed(ErrorCode::FailedPrecondition),
+            // 作業スレッドの枠が満杯（何も実行していない）。create を恒久的に失敗させない（#2760）。
+            StaleLogReclaim::Failed(ErrorCode::ResourceExhausted),
+        ] {
+            assert!(reclaim_timeout_result(ok).is_ok());
+        }
+    }
+
+    /// #2760・REPAIR-4: 警告行の `reason` は、コンテナログが待ち切れなかった失敗にだけ付く。options 用の行は固定語彙。
+    #[test]
+    fn repair4_cri2_cleanup_warning_reason_only_for_sink_open() {
+        let id = cid("c1");
+        assert_eq!(
+            cleanup_warning_line(
+                &id,
+                CleanupTarget::ContainerLog,
+                ErrorCode::FailedPrecondition
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert!(
+            !cleanup_warning_line(&id, CleanupTarget::ContainerLog, ErrorCode::Timeout)
+                .contains("reason")
+        );
+        assert_eq!(
+            cleanup_warning_line(
+                &id,
+                CleanupTarget::SupervisorLog,
+                ErrorCode::FailedPrecondition
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert!(
+            !cleanup_warning_line(&id, CleanupTarget::SupervisorLog, ErrorCode::Timeout)
+                .contains("reason")
+        );
+        assert_eq!(
+            options_cleanup_warning_line(&id, OptionsCleanupFailure::Failed(ErrorCode::Timeout)),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        // 試さなかった段（期限切れ）だけ `existence` を足す。試して失敗した行は従来のまま（#3143）。
+        assert_eq!(
+            options_cleanup_warning_line(&id, OptionsCleanupFailure::Skipped),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+    }
+
+    /// #3260・REPAIR-4: 試さなかったログ 2 段の警告行だけ `existence` を持ち、試して失敗した行・段の写像は従来のまま。
+    #[test]
+    fn repair4_sup7_3260_skipped_log_warning_has_unverified_existence() {
+        let id = cid("c1");
+        assert_eq!(
+            skipped_log_cleanup_warning_line(&id, CleanupTarget::SupervisorLog),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            skipped_log_cleanup_warning_line(&id, CleanupTarget::ContainerLog),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"TIMEOUT\",\"existence\":\"unverified\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        // 試して期限切れになった行は変えない（existence も reason も無い）。
+        assert_eq!(
+            cleanup_warning_line(&id, CleanupTarget::SupervisorLog, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            cleanup_warning_line(&id, CleanupTarget::ContainerLog, ErrorCode::Timeout),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"TIMEOUT\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            LogStage::Skipped.outcome(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Timeout
+            }
+        );
+        assert!(LogStage::Skipped.is_skipped());
+        for o in [
+            CleanupOutcome::Removed,
+            CleanupOutcome::Superseded,
+            CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition,
+            },
+        ] {
+            let stage = LogStage::Attempted(o);
+            assert_eq!(stage.outcome(), o);
+            assert!(!stage.is_skipped());
+        }
+    }
+
+    /// #2894・#2964・ERR-1: ログ削除の `Err` は code をそのまま `Kept` に載せ、枠の満杯は `RESOURCE_EXHAUSTED` で警告行に出る。
+    #[test]
+    fn err1_2894_supervisor_log_busy_is_not_timeout() {
+        assert_eq!(
+            cleanup_outcome_of(&Err(TraitError::new(ErrorCode::ResourceExhausted, "busy"))),
+            CleanupOutcome::Kept {
+                code: ErrorCode::ResourceExhausted
+            }
+        );
+        assert_eq!(
+            cleanup_outcome_of(&Err(TraitError::new(ErrorCode::Timeout, "t"))),
+            CleanupOutcome::Kept {
+                code: ErrorCode::Timeout
+            }
+        );
+        assert_eq!(
+            cleanup_outcome_of(&Ok(RemovedLogs::default())),
+            CleanupOutcome::Removed
+        );
+        let id = cid("c1");
+        assert_eq!(
+            cleanup_warning_line(
+                &id,
+                CleanupTarget::SupervisorLog,
+                ErrorCode::ResourceExhausted
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"supervisor_log\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+        assert_eq!(
+            options_cleanup_warning_line(
+                &id,
+                OptionsCleanupFailure::Failed(ErrorCode::ResourceExhausted)
+            ),
+            "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_options\",\"code\":\"RESOURCE_EXHAUSTED\",\"message\":\"cleanup after delete left resources behind\"}"
+        );
+    }
+
+    /// #2894: 走査の要約行は `workers_busy` を `timed_out` と別に出す。
+    #[test]
+    fn err1_2894_sweep_summary_line_has_workers_busy() {
+        let r = fandhe_container_supervisor::logs::SweepReport {
+            workers_busy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sweep_summary_line(&r),
+            "{\"level\":\"info\",\"event\":\"container_log_sweep\",\"scanned\":0,\"reclaimed_ids\":0,\"removed_files\":0,\"skipped_live\":0,\"skipped_present\":0,\"skipped_undecodable\":0,\"failed\":0,\"timed_out\":false,\"workers_busy\":true}"
+        );
+    }
+
     /// 注入した記録器が CRI 計測の橋渡しにも使われ、`op_recorder` から件数を読める（REPAIR-4）。
     #[test]
     fn cri_recorder_bridge_writes_to_shared_recorder() {
@@ -957,7 +2111,10 @@ mod tests {
             Arc::clone(&recorder),
         );
         assert!(Arc::ptr_eq(backends.op_recorder(), &recorder));
-        let bridge = CoreCriRecorder(Arc::clone(backends.op_recorder()));
+        let bridge = CoreCriRecorder::new(
+            Arc::clone(backends.op_recorder()),
+            Arc::clone(backends.oci_op_recorder()),
+        );
         // 成功は `Ok(())`（Status 型は推論される）、未確定のまま Drop した場合は Internal の失敗。
         CriOpTimer::start(&bridge, CriOpKind::CreateContainer).finish_with(&Ok(()));
         drop(CriOpTimer::start(&bridge, CriOpKind::CreateContainer));
@@ -965,6 +2122,184 @@ mod tests {
             .snapshot_op(&OpName::new("cri.create_container").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// REPAIR-4・CRI-3（#2966）: `PullImage` の失敗の HTTP 状態の区分は pull 用の記録器だけに入り、共有記録器へは入らない。
+    #[test]
+    fn repair4_2966_pull_http_class_goes_to_pull_recorder() {
+        use fandhe_container_cri::instrument::RegistryHttpClass;
+        const {
+            assert!(
+                (22 + 3) + RegistryHttpClass::ALL.len()
+                    <= fandhe_container_core::observability::MAX_TRACKED_OPS
+            )
+        };
+        let shared = Arc::new(OpRecorder::new());
+        let pull = Arc::new(OpRecorder::new());
+        let bridge = CoreCriRecorder::new(Arc::clone(&shared), Arc::clone(&pull));
+        let ms = Duration::from_millis;
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Unavailable, ms(3))
+                .with_registry_http(RegistryHttpClass::RateLimited),
+        );
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Unavailable, ms(4))
+                .with_registry_http(RegistryHttpClass::ServerError),
+        );
+        // 成功には区分が付かない前提だが、付いていても数えない。
+        bridge.record_cri_op(
+            &CriOpSample::new(CriOpKind::PullImage, tonic::Code::Ok, ms(1))
+                .with_registry_http(RegistryHttpClass::RateLimited),
+        );
+        let get = |r: &OpRecorder, n: &str| {
+            r.snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get(&shared, "cri.pull_image"), Some((1, 2)));
+        assert_eq!(
+            get(&pull, "cri.pull_image.registry_http.rate_limited"),
+            Some((0, 1))
+        );
+        assert_eq!(
+            get(&pull, "cri.pull_image.registry_http.server_error"),
+            Some((0, 1))
+        );
+        assert_eq!(pull.snapshot().len(), 2);
+        assert_eq!(shared.snapshot().len(), 1);
+        assert_eq!(pull.dropped_records(), 0);
+    }
+
+    /// 22 種すべての `OciOpKind` の名前（REPAIR-4・OCI-1・#2900 の写像の固定用）。
+    #[cfg(unix)]
+    fn all_oci_kinds() -> [(OciOpKind, &'static str); 22] {
+        [
+            (OciOpKind::AuthenticateAnonymous, "oci.auth.anonymous"),
+            (OciOpKind::AuthenticateBasic, "oci.auth.basic"),
+            (OciOpKind::AuthenticateBearer, "oci.auth.bearer"),
+            (OciOpKind::Authenticate, "oci.auth"),
+            (OciOpKind::FetchManifest, "oci.manifest.fetch"),
+            (OciOpKind::FetchBlob, "oci.blob.fetch"),
+            (OciOpKind::VerifyBlobDigest, "oci.blob.verify"),
+            (OciOpKind::DecompressLayer, "oci.layer.decompress"),
+            (OciOpKind::ExtractLayer, "oci.layer.extract"),
+            (OciOpKind::ListImages, "oci.image.list"),
+            (OciOpKind::DiskUsage, "oci.image.df"),
+            (OciOpKind::RemoveImage, "oci.image.rm"),
+            (OciOpKind::AcquireImageStoreLock, "oci.store.lock"),
+            (OciOpKind::BeginPull, "oci.pull.begin"),
+            (OciOpKind::LeaseBlob, "oci.pull.lease"),
+            (OciOpKind::ReleaseBlobLease, "oci.pull.release"),
+            (OciOpKind::PublishPull, "oci.pull.publish"),
+            (OciOpKind::AbortPull, "oci.pull.abort"),
+            (OciOpKind::PruneImages, "oci.image.prune"),
+            (OciOpKind::TagImage, "oci.image.tag"),
+            (OciOpKind::RecoverPendingDeletion, "oci.image.gc_recover"),
+            (OciOpKind::RecoverStalePulls, "oci.pull.gc_recover"),
+        ]
+    }
+
+    /// REPAIR-4・CRI-1（#2938）: 記録ストアの操作は `cri.record_store.{put,remove,list}` の 3 名へ成功 / 失敗で計上される。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_2938_record_store_ops_reach_shared_recorder() {
+        // 排他作成(0700)した私有ディレクトリ。既存の名前は消さず・辿らず・chmod しない(REPAIR-12・#3506)。
+        let dir = crate::test_root::test_root("fandhe-plugin-cri-rsrec", "t");
+        let recorder = Arc::new(OpRecorder::new());
+        let store = FileRecordStore::open(&dir)
+            .expect("open")
+            .with_recorder(Arc::new(CoreRecordStoreRecorder(Arc::clone(&recorder))));
+        let kind = fandhe_container_cri::runtime_service::RecordKind::Sandbox;
+        let id = fandhe_container_cri::runtime_service::RecordId::new(&"a".repeat(64)).unwrap();
+        store.put(kind, &id, b"x").expect("put");
+        store
+            .list(
+                kind,
+                fandhe_container_cri::runtime_service::ListBudget::default(),
+                fandhe_container_cri::runtime_service::ListLimits::for_kind(kind),
+            )
+            .expect("list");
+        store.remove(kind, &id).expect("remove");
+        let get = |n: &str| {
+            recorder
+                .snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(get("cri.record_store.put"), Some((1, 0)));
+        assert_eq!(get("cri.record_store.list"), Some((1, 0)));
+        assert_eq!(get("cri.record_store.remove"), Some((1, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REPAIR-4・OCI-1: 写像の名前は 22 種で重複なく、`as_str` と一致し、`OpName` として有効で、記録器の枠に収まる。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_op_names_are_valid_and_bounded() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (kind, expected) in all_oci_kinds() {
+            assert_eq!(oci_op_name(kind), Some(expected));
+            assert_eq!(kind.as_str(), expected);
+            assert!(OpName::new(expected).is_ok(), "{expected}");
+            seen.insert(expected);
+        }
+        assert_eq!(seen.len(), 22);
+        const { assert!(22 <= fandhe_container_core::observability::MAX_TRACKED_OPS) };
+    }
+
+    /// REPAIR-4・OCI-1: 成功と失敗が操作名ごとに具体値で計上され、エラー code は名前に混ざらない。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_adapter_maps_success_and_failure() {
+        use fandhe_container_oci::error::OciErrorCode;
+        let rec = Arc::new(OpRecorder::new());
+        let bridge = CoreOciRecorder(Arc::clone(&rec));
+        bridge.record_oci_op(&OciOpSample::new(
+            OciOpKind::ExtractLayer,
+            OciOpOutcome::Success,
+            None,
+            Duration::from_millis(5),
+        ));
+        bridge.record_oci_op(&OciOpSample::new(
+            OciOpKind::PublishPull,
+            OciOpOutcome::Failure,
+            Some(OciErrorCode::Timeout),
+            Duration::from_millis(7),
+        ));
+        let get = |n: &str| {
+            rec.snapshot_op(&OpName::new(n).expect("name"))
+                .expect("recorded")
+        };
+        let ex = get("oci.layer.extract");
+        assert_eq!((ex.success(), ex.failure()), (1, 0));
+        let pu = get("oci.pull.publish");
+        assert_eq!((pu.success(), pu.failure()), (0, 1));
+        assert_eq!(rec.snapshot().len(), 2);
+        assert_eq!(rec.dropped_records(), 0);
+    }
+
+    /// REPAIR-4・#2900: oci の記録は専用記録器へ入り、共有記録器の枠を使わない。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_oci_recorder_is_separate_from_shared() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let shared = Arc::new(OpRecorder::new());
+        let rt = Arc::new(CoreLifecycleRuntime::with_recorder(
+            Arc::clone(&store),
+            Arc::clone(&shared),
+        ));
+        let backends =
+            CriPluginBackends::with_recorder(rt, store, Arc::new(UnimplementedNetwork), shared);
+        backends.oci_adapter().record_oci_op(&OciOpSample::new(
+            OciOpKind::FetchBlob,
+            OciOpOutcome::Success,
+            None,
+            Duration::from_millis(1),
+        ));
+        assert!(backends.op_recorder().snapshot().is_empty());
+        let s = backends
+            .oci_op_recorder()
+            .snapshot_op(&OpName::new("oci.blob.fetch").expect("name"))
+            .expect("recorded");
+        assert_eq!((s.success(), s.failure()), (1, 0));
     }
 
     /// SEC-4・REPAIR-4（#2594）: 記録の失敗は固定語彙の 1 行にだけ出し、結果（`code`）は内側のまま返す。成功では何も出さない。
@@ -1043,16 +2378,15 @@ mod tests {
                 Err(TraitError::new(ErrorCode::Internal, "sink down"))
             }
         }
-        let dir = std::env::temp_dir().join(format!("fc-cri-2594-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_root::test_root("fc-cri-2594", "t");
         std::fs::create_dir_all(dir.join("rootfs")).expect("rootfs");
         std::fs::write(
             dir.join("config.json"),
             r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/true"],"cwd":"/"},"mounts":[{"destination":"/../..","type":"bind","source":"/srv/x","options":["bind","rw"]}]}"#,
         )
         .expect("config");
-        let req =
-            CreateRequest::new(ContainerId::new("c1").expect("id"), dir.clone()).expect("req");
+        let req = CreateRequest::new(ContainerId::new("c1").expect("id"), dir.to_path_buf())
+            .expect("req");
         let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
         let plain = CoreLifecycleRuntime::new(Arc::clone(&store))
             .create(&req)
@@ -1061,7 +2395,6 @@ mod tests {
             .with_create_audit_sink(Arc::new(Failing))
             .create(&req)
             .expect_err("rejected");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(audited.code(), ErrorCode::InvalidArgument);
         assert_eq!(audited.code(), plain.code());
         assert_eq!(audited.message(), plain.message());
@@ -1112,5 +2445,190 @@ mod tests {
             names.insert(name);
         }
         assert_eq!(names.len(), 5);
+    }
+
+    /// REPAIR-5: 期限を超えたら待たずに `TimedOut`（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_startup_pull_recovery_times_out() {
+        let r = run_startup_pull_recovery(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(Default::default())
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, StartupPullRecovery::TimedOut);
+    }
+
+    /// OCI-7: 結果は `Completed` / `Failed(code)` に写る（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_startup_pull_recovery_maps_outcomes() {
+        let ok = run_startup_pull_recovery(|| Ok(Default::default()), Duration::from_secs(5));
+        assert_eq!(
+            ok,
+            StartupPullRecovery::Completed(PullRecoveryCounts::default())
+        );
+        let ng = run_startup_pull_recovery(
+            || {
+                Err(fandhe_container_oci::error::OciError::new(
+                    fandhe_container_oci::error::OciErrorCode::Timeout,
+                    "x",
+                ))
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(ng, StartupPullRecovery::Failed("TIMEOUT"));
+    }
+
+    /// REPAIR-4: `failed` が 1 以上なら warn、0 なら info（#2819）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_pull_recovery_summary_level_follows_failed() {
+        let warn = PullRecoveryCounts {
+            failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            warn.summary_line(),
+            "{\"level\":\"warn\",\"event\":\"image_pull_recovery\",\"reclaimed\":0,\"released_leases\":0,\"kept_live\":0,\"kept_undetermined\":0,\"failed\":1,\"foreign_entries\":0}"
+        );
+        assert!(
+            PullRecoveryCounts::default()
+                .summary_line()
+                .starts_with("{\"level\":\"info\"")
+        );
+    }
+
+    /// 注入で組んだ backends が使う一時ディレクトリ（0700）。Drop で消す。
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p =
+                std::env::temp_dir().join(format!("fcpc-nolock-{}-{nanos}", std::process::id()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&p)
+                .expect("scratch dir");
+            Self(p)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入（`new` / `with_recorder`）で組んだ backends はインスタンスロックも
+    /// 状態ルートも持たない。ロックを要する孤児 bundle の回収・記録の再採用は `instance_lock()` が
+    /// `None` のとき拒否される（拒否の挙動は tests/orphan_bundles.rs・tests/record_readoption.rs が補う）。
+    #[test]
+    fn cri2_core1_injected_backends_hold_no_instance_lock() {
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let rec = Arc::new(OpRecorder::new());
+        let rt = || {
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            ))
+        };
+        let built = [
+            CriPluginBackends::new(rt(), Arc::clone(&store), Arc::new(UnimplementedNetwork)),
+            CriPluginBackends::with_recorder(
+                rt(),
+                Arc::clone(&store),
+                Arc::new(UnimplementedNetwork),
+                Arc::clone(&rec),
+            ),
+        ];
+        for b in built {
+            for x in [b.clone(), b] {
+                assert!(x._instance_lock.is_none());
+                assert!(x.state_root.is_none());
+                #[cfg(unix)]
+                assert!(x.instance_lock().is_none());
+            }
+        }
+    }
+
+    /// CRI-2・CORE-1・#3035: 注入で組んでも状態ルート配下へ `.cri/@instance.lock` を作らない。
+    /// 陽性対照として、同じルートで別にロックを取ると `.cri/@instance.lock` が現れる。
+    #[cfg(unix)]
+    #[test]
+    fn cri2_core1_injected_backends_create_no_instance_lock_file() {
+        use crate::instance_lock::{INSTANCE_LOCK_NAME, acquire_instance_lock_in};
+
+        fn entries(dir: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        let scratch = ScratchDir::new();
+        let state = scratch.0.join("state");
+        let store: Arc<dyn StateStore> = Arc::new(
+            FileStateStore::open(StateRoot::resolve(Some(state.clone())).expect("root"))
+                .expect("open"),
+        );
+        let before = entries(&state);
+
+        let rec = Arc::new(OpRecorder::new());
+        let backends = CriPluginBackends::with_recorder(
+            Arc::new(CoreLifecycleRuntime::with_recorder(
+                Arc::clone(&store),
+                Arc::clone(&rec),
+            )),
+            store,
+            Arc::new(UnimplementedNetwork),
+            rec,
+        );
+        let cloned = backends.clone();
+
+        for b in [&backends, &cloned] {
+            assert!(b.instance_lock().is_none());
+            assert!(b.state_root.is_none());
+        }
+        // 状態ルート未設定の経路は早期に返り、何も作らない。
+        let e = backends.production_record_store().expect_err("err");
+        assert_eq!(
+            e.code(),
+            fandhe_container_cri::error::CriErrorCode::FailedPrecondition
+        );
+        assert_eq!(
+            backends.recover_stale_image_pulls(Duration::from_secs(1)),
+            StartupPullRecovery::Failed("FAILED_PRECONDITION")
+        );
+
+        let missing = |p: &std::path::Path| {
+            std::fs::symlink_metadata(p)
+                .expect_err("must not exist")
+                .kind()
+        };
+        assert_eq!(missing(&state.join(".cri")), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            missing(&state.join(".cri").join(INSTANCE_LOCK_NAME)),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(entries(&state), before);
+
+        // 陽性対照: backends が生きていても同じルートのロックを取れ、照合したパスに実体ができる。
+        let _held = acquire_instance_lock_in(&state, Duration::ZERO).expect("acquire");
+        let meta = std::fs::symlink_metadata(state.join(".cri").join(INSTANCE_LOCK_NAME))
+            .expect("lock file");
+        assert!(meta.is_file());
     }
 }

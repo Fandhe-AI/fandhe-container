@@ -13,7 +13,7 @@ setuid / setgid / sticky を常に落とし、件数を `ExtractedLayer::files_w
 
 `SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid }`（opt-in）を渡した呼び出しだけが、下表の条件を満たすビットを
 tar の値のまま適用する。満たさないものは落とす（fail-closed）。既存の入口は `Strip` のままで挙動を変えない。
-新しい入口は `extract_layers_with_policy` / `extract_layer_blobs_with_policy`。
+新しい入口は `extract_layers_with_policy` / `extract_image_layers_with_policy`（パスで開く旧入口 `extract_layer_blobs_with_*` は #2535 で廃止した）。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
 `IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
@@ -66,7 +66,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 ## 所有者の適用（chown。#2225・SEC-5）
 
 `ExtractOptions { ownership, special_bits }` を受ける入口 `extract_layers_with_options` /
-`extract_layer_blobs_with_options` を足した（既存の `*_with_policy` はこれへ委譲し、挙動は変えない）。
+`extract_image_layers_with_options`（当時はパス版の `extract_layer_blobs_with_options`。#2535 で廃止）を足した（既存の `*_with_policy` はこれへ委譲し、挙動は変えない）。
 `OwnershipPolicy::ChownMapped { uid, gid }`（複数行の写像 `IdMap`。core の `IdMapSet::new` と同じ検証規則で、
 `tests/idmap_core_parity.rs` が同じ入力の表で照合する）を渡すと、tar の uid / gid を写像してホストの ID へ `chown` する。
 既定は `Keep`（`chown` しない）。
@@ -193,7 +193,13 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   fail-closed にしホストでの展開に届かない／Linux の他アーキテクチャは展開が `Unimplemented` で展開物が無く、削除も空の木を
   消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
-- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
+- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線（#2534）。現状、本番の値は pull・create とも
+  既定の `Keep` + `Strip` で、plugin-cri の `bundle_provider_in` は `ImageExtractConfig::new` の既定を使う。配線の前提:
+  rootful の `ChownMapped` の可否（#2241）、core が user namespace へ入る配線による `ChownInUserNamespace`（#2315・#482。
+  記録の符号化も現状は受けない）、`PullConfig` を組む本番の呼び出し元（plugin-cri の ImageService。#2592）、所有者の解決の
+  部品 `image_ownership`（#2389。cli crate にあり、置き場所の判断が要る）。pull と create は `ImageExtractConfig` の 1 か所から
+  同じ値を配る（食い違うと記録の照合で `FAILED_PRECONDITION`）。配線するときの確認事項: `ChownMapped` で展開した rootfs に、
+  0700 の bundle 配下から写像先の uid で到達できること（core の launcher 側。SEC-5・CRI-2）の試験を同時に足す
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
 ## 試験との対応
@@ -232,3 +238,23 @@ rootless の user namespace の中での展開（#2382）: `extract.rs` の `cho
 `idmap.rs` の `sec5_parse_proc_id_map`・`sec5_same_lines_as`、`tests/idmap_core_parity.rs` の
 `oci2_parse_proc_id_map_matches_core`。実機前提の `tests/userns_extract.rs`（`harness = false`。`unshare --user --map-root-user`
 で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。AGENTS.md「実機前提テスト」）。
+
+PullImage の読み取り（#2534）: cri の `image_pull.rs` の `oci1_sec_config_rewritten_in_place_after_trust_check_is_rejected`
+（config は読んだ本文そのもののハッシュで照合する）・`oci1_unpack_record_worst_case_fits_within_the_limit`・
+`oci1_write_unpack_record_rejects_oversized_record_before_creating_it`、`tests/image_pull.rs` の
+`oci1_repair5_pull_rejects_fifo_unpack_record_without_hanging`・`oci1_pull_rejects_oversized_unpack_record_and_keeps_rootfs`・
+`oci1_repair5_pull_deadline_exceeded_during_extraction_is_not_published`。blob の信頼判定は oci の `check_blob_trust` に
+一本化し、`layer.rs` の `oci1_sec_blob_trust_*` で照合する。公開入口 `check_blob_trust(facts, owner: u32)` は所有者の
+照合が必須で、省略口を持たない（#2796・SEC-5）。所有者に `None` を受ける `check_blob_trust_with_owner` は `pub(crate)` で、
+oci 内部の非 unix 経路（`dir_owner` が `None` を返す場合）専用である。他 uid 所有の staged blob を `verify_staged_blob`
+が chmod せずに拒否し、検証済みに登録しないことは、実ファイルで `crates/oci/tests/staged_blob_owner.rs`
+（範囲写像の subuid 所有・`-- --ignored`・#2907・OCI-7・SEC-1）が照合する。
+
+pull 時と start 時の subuid / subgid のずれ（#2539・#2528 の事後監査 P3・SEC-5・CORE-6）: 展開結果は pull 時の所有者写像に
+依存する（rootfs の所有者は pull 時の `ExtractOptions` で決まる）。pull の後に subuid / subgid の割り当てが変わると、start 時の
+写像と展開済み rootfs の所有者が食い違う。検出は、公開済みエントリの展開設定の記録（`unpack-record` の設定行。
+`encode_extract_options` が id map の行を含む）を正とする。pull と create は `ImageExtractConfig` の 1 か所から同じ値を受け、
+食い違えば既存の `check_unpack_record` が `FAILED_PRECONDITION` で拒否する。start 時の写像（`image_ownership` の解決結果）と
+記録の照合の口は、`ChownMapped` / `ChownInUserNamespace` を本番へ配線するとき（#2592・#2377・#2241・#2315・#482）に足す。
+本番の値が現状 `Keep` + `Strip` で記録の写像が空のため、今は検出は効かない（実装済みを装わない。REPAIR-3）。
+詳細は [pull-inventory-wiring.md](pull-inventory-wiring.md)。

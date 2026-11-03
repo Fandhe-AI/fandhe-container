@@ -11,12 +11,18 @@
 //! 最後の永続化の完了まで）。作業ディレクトリの用意・`GuestFileCreator` の構築・書き込む `Batch`
 //! の組み立て・後始末は区間に入れない。祖先ディレクトリの作成は区間に入る。
 //!
-//! # ワイヤー経路ではない
+//! # 経路（`--route`）
 //!
-//! いまのワイヤー形式（IO-1）の `Write` はパスを持たず、1 接続で多数のファイルを作る要求を表せない。
-//! そのため本ハーネスは `serve_connection` を通さず、サーバー側の API を直接呼ぶ
-//! （結果の `method` は `server-api-direct/...`、`wire_path` は `false`）。フレームの符号化・復号の
-//! コストは含まない。ワイヤー経路への切り替えは #1886 の後に別 issue で行う。
+//! 2 つの経路を持ち、結果の `method`・`wire_path`・`params.route` で区別する（#2074）。
+//!
+//! | `--route` | 内容 | `method` の接頭辞 | `wire_path` |
+//! | --------- | ---- | ----------------- | ----------- |
+//! | `server-api`（既定） | サーバー側の API を直接呼ぶ（`serve_*_connection` を通さない）。符号化・復号・UDS を含まない | `server-api-direct/` | `false` |
+//! | `wire` | UDS 越しに I/O 共有層のフレーム（Create → WriteFile → Close → Flush。#1886 の v2）を送る。符号化・復号・UDS の往復・ACK の待ちを区間に含む（`small_files/wire.rs`）。Linux と macOS のみ | `wire-uds/` | `true` |
+//!
+//! 回帰ゲートの引数は `--route wire`（`scripts/lib.sh` の `bench_args_for`）。既定を `server-api`
+//! のままにしているのは、Windows（UDS なし）の引数なしスモークと、`scripts/bench/small_files_compare.sh`
+//! （server-api 経路で照合する）を壊さないため。経路の違う値同士は比べない（`method` を必ず照合する）。
 //!
 //! # FLUSH の位置（`method`）
 //!
@@ -43,6 +49,8 @@
 //!
 //! 書き込み先は `--root` の下に新しく作る専用サブディレクトリだけで、終了時（失敗時を含む）に
 //! 自分が作ったものだけを消す。`--root` の既存の内容には触れず、symlink は辿らない。
+
+pub mod wire;
 
 use fandhe_container_io::{
     BatchBuffer, BatchConfig, BatchSink, FrameKind, GuestFileCreator, InFlightLimit, IoError,
@@ -89,6 +97,10 @@ const METHOD_EVERY_K: &str = "server-api-direct/flush-every-k";
 const NOTE_PER_FILE: &str =
     "server API called directly, not the wire path; each file is flushed individually";
 const NOTE_EVERY_K: &str = "outside IO-2 guarantee; relies on syncfs flushing the whole file system (Linux only); server API called directly, not the wire path";
+const METHOD_WIRE_PER_FILE: &str = "wire-uds/flush-per-file";
+const METHOD_WIRE_EVERY_K: &str = "wire-uds/flush-every-k";
+const NOTE_WIRE_PER_FILE: &str = "wire path over UDS (frame encode/decode and round trips included); each file is flushed individually";
+const NOTE_WIRE_EVERY_K: &str = "wire path over UDS; multi-file FLUSH per #1886 F9; treated as outside IO-2 until spec confirmation (b) of #1886 is answered";
 
 /// 構造化エラー（標準エラーへ 1 行の JSON で出す。`code` は機械可読、`message` は英語）。
 ///
@@ -163,6 +175,24 @@ impl Layout {
     }
 }
 
+/// 計測する経路（モジュール doc「経路」参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// UDS 越しのフレーム（Linux / macOS のみ）。
+    Wire,
+    /// サーバー側の API の直接呼び出し。
+    ServerApi,
+}
+
+impl Route {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wire => "wire",
+            Self::ServerApi => "server-api",
+        }
+    }
+}
+
 /// 2 構成のラベル（挙動は変えない。モジュール doc 参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Config {
@@ -187,6 +217,7 @@ pub struct Plan {
     pub file_size: u64,
     pub layout: Layout,
     pub config: Config,
+    pub route: Route,
     pub trials: u64,
     pub trial_timeout: Duration,
     pub timeout: Duration,
@@ -201,6 +232,7 @@ impl Plan {
             file_size: DEFAULT_FILE_SIZE,
             layout: Layout::Flat,
             config: Config::Bind,
+            route: Route::ServerApi,
             trials: 1,
             trial_timeout: Duration::from_secs(SMOKE_TIMEOUT_SECS),
             timeout: Duration::from_secs(SMOKE_TIMEOUT_SECS),
@@ -229,6 +261,10 @@ impl Plan {
         check(
             (1..=MAX_BATCH_SIZE_ARG).contains(&self.batch_size) && self.batch_size <= self.count,
             "batch_size is out of range",
+        )?;
+        check(
+            self.route != Route::Wire || self.batch_size <= wire::WIRE_MAX_BATCH_SIZE,
+            "batch_size is out of range for the wire route",
         )?;
         check(
             (1..=MAX_FILE_SIZE).contains(&self.file_size),
@@ -287,6 +323,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, SmallFilesError> {
     let mut file_size = DEFAULT_FILE_SIZE;
     let mut layout_arg: Option<Layout> = None;
     let mut config = Config::Bind;
+    let mut route = Route::ServerApi;
     let mut trials = DEFAULT_TRIALS;
     let mut root: Option<PathBuf> = None;
     let mut trial_timeout = DEFAULT_TRIAL_TIMEOUT_SECS;
@@ -296,12 +333,13 @@ pub fn parse_args(args: &[String]) -> Result<Command, SmallFilesError> {
     let mut iter = args.iter().filter(|a| a.as_str() != "--bench");
     while let Some(arg) = iter.next() {
         let name = arg.as_str();
-        const KNOWN: [&str; 10] = [
+        const KNOWN: [&str; 11] = [
             "--count",
             "--batch-size",
             "--file-size",
             "--layout",
             "--config",
+            "--route",
             "--trials",
             "--root",
             "--trial-timeout-secs",
@@ -337,6 +375,13 @@ pub fn parse_args(args: &[String]) -> Result<Command, SmallFilesError> {
                     _ => return Err(SmallFilesError::args("invalid value for --config")),
                 }
             }
+            "--route" => {
+                route = match value.as_str() {
+                    "wire" => Route::Wire,
+                    "server-api" => Route::ServerApi,
+                    _ => return Err(SmallFilesError::args("invalid value for --route")),
+                }
+            }
             "--trials" => trials = parse_range(known, value, 1, MAX_TRIALS)?,
             "--root" => root = Some(PathBuf::from(value)),
             "--trial-timeout-secs" => {
@@ -358,6 +403,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, SmallFilesError> {
             "--batch-size must not exceed --count",
         ));
     }
+    if route == Route::Wire && batch_size > wire::WIRE_MAX_BATCH_SIZE {
+        return Err(SmallFilesError::args(
+            "--batch-size is out of range for --route wire",
+        ));
+    }
     let layout = layout_arg.unwrap_or(if count <= AUTO_FLAT_MAX {
         Layout::Flat
     } else {
@@ -370,6 +420,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, SmallFilesError> {
             file_size,
             layout,
             config,
+            route,
             trials,
             trial_timeout: Duration::from_secs(trial_timeout),
             timeout: Duration::from_secs(timeout),
@@ -416,11 +467,27 @@ fn flush_timeout(deadline: Instant) -> Result<IoTimeout, SmallFilesError> {
     IoTimeout::new(remaining.min(MAX_IO_TIMEOUT)).map_err(|e| from_io(&e))
 }
 
-/// 1 試行（計測区間）を実行して所要時間を返す。`trial_root` は存在するディレクトリ。
+/// 1 試行（計測区間）を `plan.route` の経路で実行して所要時間を返す。`trial_root` は存在する
+/// ディレクトリ。
+pub fn run_trial(
+    trial_root: &Path,
+    plan: &Plan,
+    trial_deadline: Instant,
+    overall_deadline: Instant,
+) -> Result<Duration, SmallFilesError> {
+    match plan.route {
+        Route::ServerApi => {
+            run_trial_server_api(trial_root, plan, trial_deadline, overall_deadline)
+        }
+        Route::Wire => wire::run_trial(trial_root, plan, trial_deadline, overall_deadline),
+    }
+}
+
+/// `server-api` 経路の 1 試行（計測区間）。
 ///
 /// 試行の期限 `trial_deadline` と全体の期限 `overall_deadline` を各ファイルの処理の前に照合する
 /// （協調的。モジュール doc 参照）。永続化は `plan.batch_size` 件ごと（と最後）に行う。
-pub fn run_trial(
+fn run_trial_server_api(
     trial_root: &Path,
     plan: &Plan,
     trial_deadline: Instant,
@@ -473,6 +540,11 @@ struct WorkDir {
 
 impl WorkDir {
     fn create(root: &Path) -> Result<Self, SmallFilesError> {
+        Self::create_with_prefix(root, "fandhe-small-files")
+    }
+
+    /// 接頭辞を指定して作る（wire 経路のソケット用は `sun_path` に収めるため短い接頭辞を使う）。
+    fn create_with_prefix(root: &Path, prefix: &str) -> Result<Self, SmallFilesError> {
         let meta = std::fs::metadata(root);
         match meta {
             Ok(m) if m.is_dir() => {}
@@ -483,10 +555,7 @@ impl WorkDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = root.join(format!(
-            "fandhe-small-files-{}-{nanos:x}",
-            std::process::id()
-        ));
+        let path = root.join(format!("{prefix}-{}-{nanos:x}", std::process::id()));
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -650,6 +719,9 @@ pub fn median(values: &[f64]) -> Option<f64> {
 /// 永続化の対応状況と FLUSH 方式を、ファイルを作る前に検査する（`run_trial` と
 /// `run_with_deadline` が共有する）。
 fn check_environment(plan: &Plan) -> Result<(), SmallFilesError> {
+    if plan.route == Route::Wire {
+        return wire::check_environment();
+    }
     if !persist_support().is_supported() {
         return Err(SmallFilesError::new(
             "persist-unsupported",
@@ -733,10 +805,17 @@ pub fn ensure_before(deadline: Instant) -> Result<(), SmallFilesError> {
 ///
 /// 文字列は enum と定数に由来するものだけで、パス・ホスト名・ユーザー名は含まない。
 pub fn results_json(plan: &Plan, support: PersistSupport, m: &Measurement) -> String {
-    let (method, note, guaranteed) = if plan.is_every_k() {
-        (METHOD_EVERY_K, NOTE_EVERY_K, false)
+    let (method, note, guaranteed) = match (plan.route, plan.is_every_k()) {
+        (Route::ServerApi, true) => (METHOD_EVERY_K, NOTE_EVERY_K, false),
+        (Route::ServerApi, false) => (METHOD_PER_FILE, NOTE_PER_FILE, true),
+        (Route::Wire, true) => (METHOD_WIRE_EVERY_K, NOTE_WIRE_EVERY_K, false),
+        (Route::Wire, false) => (METHOD_WIRE_PER_FILE, NOTE_WIRE_PER_FILE, true),
+    };
+    let wire_path = plan.route == Route::Wire;
+    let server_batch = if wire_path {
+        format!(", \"server_batch_size\": {}", wire::WIRE_SERVER_BATCH)
     } else {
-        (METHOD_PER_FILE, NOTE_PER_FILE, true)
+        String::new()
     };
     let support = match support {
         PersistSupport::Supported => "supported",
@@ -747,13 +826,14 @@ pub fn results_json(plan: &Plan, support: PersistSupport, m: &Measurement) -> St
     // String への write! は失敗しない。
     let _ = write!(
         s,
-        "{{\n  \"schema_version\": 1,\n  \"metrics\": {{ \"{METRIC_NAME}\": {{ \"value\": {:.3}, \"unit\": \"{METRIC_UNIT}\" }} }},\n  \"method\": \"{method}\",\n  \"wire_path\": false,\n  \"io2_guaranteed\": {guaranteed},\n  \"note\": \"{note}\",\n  \"aggregate\": \"median\",\n  \"persist_support\": \"{support}\",\n  \"params\": {{ \"count\": {}, \"batch_size\": {}, \"file_size_bytes\": {}, \"layout\": \"{}\", \"config\": \"{}\", \"trials\": {}, \"trial_timeout_secs\": {}, \"timeout_secs\": {} }},\n  \"trials\": [",
+        "{{\n  \"schema_version\": 1,\n  \"metrics\": {{ \"{METRIC_NAME}\": {{ \"value\": {:.3}, \"unit\": \"{METRIC_UNIT}\" }} }},\n  \"method\": \"{method}\",\n  \"wire_path\": {wire_path},\n  \"io2_guaranteed\": {guaranteed},\n  \"note\": \"{note}\",\n  \"aggregate\": \"median\",\n  \"persist_support\": \"{support}\",\n  \"params\": {{ \"count\": {}, \"batch_size\": {}, \"file_size_bytes\": {}, \"layout\": \"{}\", \"config\": \"{}\", \"route\": \"{}\"{server_batch}, \"trials\": {}, \"trial_timeout_secs\": {}, \"timeout_secs\": {} }},\n  \"trials\": [",
         m.median_files_per_sec,
         plan.count,
         plan.batch_size,
         plan.file_size,
         plan.layout.as_str(),
         plan.config.as_str(),
+        plan.route.as_str(),
         plan.trials,
         plan.trial_timeout.as_secs(),
         plan.timeout.as_secs(),
@@ -1047,6 +1127,77 @@ mod tests {
         assert!(json.contains("\"method\": \"server-api-direct/flush-every-k\""));
         assert!(json.contains("\"io2_guaranteed\": false"));
         assert!(json.contains("outside IO-2 guarantee"));
+        assert!(json.contains("\"route\": \"server-api\""));
+    }
+
+    /// REPAIR-8・#2074: wire 経路の method・wire_path・route・保証の扱い。
+    #[test]
+    fn repair8_results_json_wire_method() {
+        let m = Measurement {
+            trials: vec![TrialResult {
+                elapsed_ns: 1_000_000_000,
+                files_per_sec: 2000.0,
+            }],
+            median_files_per_sec: 2000.0,
+        };
+        let per_file = Plan {
+            count: 2_000,
+            route: Route::Wire,
+            ..Plan::smoke()
+        };
+        let json = results_json(&per_file, PersistSupport::Supported, &m);
+        for needle in [
+            "\"method\": \"wire-uds/flush-per-file\"",
+            "\"wire_path\": true",
+            "\"io2_guaranteed\": true",
+            "\"route\": \"wire\", \"server_batch_size\": 64",
+        ] {
+            assert!(json.contains(needle), "missing {needle} in {json}");
+        }
+        let every_k = Plan {
+            batch_size: 4,
+            ..per_file
+        };
+        let json = results_json(&every_k, PersistSupport::Supported, &m);
+        assert!(json.contains("\"method\": \"wire-uds/flush-every-k\""));
+        assert!(json.contains("\"io2_guaranteed\": false"));
+        assert!(json.contains("\"wire_path\": true"));
+    }
+
+    /// REPAIR-8・#2074: `--route` の解釈と、wire の K の上限。
+    #[test]
+    fn repair8_parse_args_route() {
+        let run = |extra: &[&str]| {
+            let mut v = vec!["--output", "/x/out.json"];
+            v.extend_from_slice(extra);
+            parse_args(&args(&v))
+        };
+        let route_of = |extra: &[&str]| match run(extra).unwrap() {
+            Command::Run { plan, .. } => plan.route,
+            Command::Smoke => unreachable!(),
+        };
+        assert_eq!(route_of(&[]), Route::ServerApi);
+        assert_eq!(route_of(&["--route", "wire"]), Route::Wire);
+        assert_eq!(route_of(&["--route", "server-api"]), Route::ServerApi);
+        for bad in [
+            &["--route", "udp"][..],
+            &["--route"][..],
+            &["--route", "wire", "--route", "wire"][..],
+        ] {
+            assert_eq!(run(bad).unwrap_err().code, "invalid-args");
+        }
+        let k =
+            |route: &str, k: &str| run(&["--count", "5000", "--route", route, "--batch-size", k]);
+        assert!(k("wire", "4095").is_ok());
+        assert_eq!(k("wire", "4096").unwrap_err().code, "invalid-args");
+        assert!(k("server-api", "4096").is_ok());
+        let bad_plan = Plan {
+            route: Route::Wire,
+            count: 5_000,
+            batch_size: 4_096,
+            ..Plan::smoke()
+        };
+        assert_eq!(bad_plan.validate().unwrap_err().code, "invalid-args");
     }
 
     /// REPAIR-3: エラーの JSON は固定の形で、パスを含まない。

@@ -15,7 +15,20 @@
 //!
 //! | #1473（TASK-169.4.2） | secrets / configs（[`secrets`]）。[`ContainerOptions::injected_files`] で core の注入仕様型へ変換 | core の `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化） |
 //!
-//! secrets / configs の指定モデルと core 側の注入は実装済みだが、launcher・CLI・stack（TOML）からの結線は未実装（REPAIR-3）。
+//! | #2775（CLI-1・SEC-1） | `--cap-drop`（[`ContainerOptions::with_cap_drop`]。core の `parse_drop_list` で検証済みの集合） | core の `LaunchOptions::with_capability_drop`（launch の段と分離の記録へ同じ狭めた集合） |
+//!
+//! | #3065（NET-6・NET-12・SUP-12） | `--network` / `--add-host` / `--dns`（[`network`]。net で再検証。`network` は core の `LaunchNetworkMode` へ。add-host / dns は start の手順 4b で生成し `with_etc_files` で bind） | core の `LaunchOptions::with_network` |
+//!
+//! | #2953（SUP-4・TASK-161） | healthcheck の定義（[`ContainerOptions::with_healthcheck`]。文書の kind `health-*`。CLI の書き手は後続） | supervisor の入口が `HealthWiring` を組み、monitor が周期実行を起動 |
+//!
+//! | #2828（CLI-1・SUP-12） | `--read-only`（[`ContainerOptions::with_read_only`]。config の `root.readonly` と OR で効き、狭める方向のみ） | core の `LaunchOptions::with_root_readonly`（mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値） |
+//!
+//! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
+//! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
+//! `--shm-size`・`--tmpfs`・secrets / configs・ulimit・env。#2625・#2713）は実装済み。CLI の `create` は
+//! `--ulimit`・`--env`・`--env-file`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only` を [`document`] の形で
+//! 状態ルート配下の 0600 のファイル（[`store`]）へ書き、supervisor の `start` が読む（#2713）。
+//! label は create 時に core の状態記録（`CreateRequest::with_annotations`）へ直接書く。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -23,7 +36,7 @@
 //! `state.json` に記録する launch 時の rlimit（exec が適用する値。TASK-169 追補・#1467）は、ここで保持する
 //! 「指定した種別だけ」の集合ではなく、core の `exec::launch_rlimits_from_self` で指定の無い種別を launch 時点の
 //! 実効値で埋めた全 16 種である。launcher はその同じ集合を `StagePipeline::with_rlimits` と
-//! `CreateStateRequest::with_rlimits` の両方へ渡す（結線は本番 launcher の後続作業。REPAIR-3）。
+//! `CreateStateRequest::with_rlimits` の両方へ渡す（本番 launcher の `launch_checked` が結線済み。#2713）。
 //!
 //! `--ipc`（`host` / `shareable`）は [`ipc`] サブモジュールの [`IpcMode`] で保持する（#528・TASK-169.3）。
 //!
@@ -34,31 +47,45 @@
 //!
 //! # 未結線の箇所（REPAIR-3）
 //!
-//! start 経路（`start_entry`・本番 launcher）からの結線が未実装のため、現時点で [`ContainerOptions`] の消費者は無い
-//! （CLI・launcher からの結線は後続作業。label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。OS 非依存で、3 OS でビルド・テストする。
+//! - secrets / configs は CLI のフラグも文書の kind も無い。ホストのパスを特権の supervisor が読むと confused deputy に
+//!   なりうるため、fd の所有者照合か非特権のままの受け渡しという別の設計が要る（後続）。
+//! - stack（TOML）の `up` からの結線は TASK-155 の後続（`Service::create_option_args` が create の引数列へ写す）。
+//!
+//! OS 非依存で、3 OS でビルド・テストする。
 //!
 //! # 外部入力の扱い
 //!
 //! `--ulimit` 文字列は外部入力として、長さ上限・形式・数値・種別名を検証してから型へ写す。
 //! エラーメッセージは固定の英語文言で、入力値は含めない。
 
+pub mod document;
 pub mod env;
+pub mod etc_files;
 pub mod ipc;
 pub mod labels;
 pub mod mounts;
+pub mod network;
+pub mod network_definition;
+pub mod pasta;
 pub mod secrets;
+pub mod store;
 
 pub use ipc::IpcMode;
 pub use labels::{Label, Labels};
 pub use mounts::{DEFAULT_SHM_SIZE_BYTES, MountOptions, ShmSize, TmpfsOption};
+pub use network::{NetworkOptions, NetworkSelection};
 pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, InjectedSource};
 
 use self::env::EnvSet;
+use crate::healthcheck::HealthcheckDefinition;
+use fandhe_container_core::capabilities::CapabilitySet;
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::injected_files::InjectedFileSet;
+use fandhe_container_core::oci_runtime::{LaunchIpcMode, LaunchOptions};
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
+use fandhe_container_net::pasta::binary::PastaBinary;
 
 /// `--ulimit` 1 件の最大バイト数（最長の名前 `sigpending` と u64 の 2 値に十分な余裕を持たせた上限）。
 const ULIMIT_MAX_LEN: usize = 64;
@@ -111,6 +138,16 @@ pub struct ContainerOptions {
     labels: Labels,
     mounts: MountOptions,
     injected: InjectedFileOptions,
+    /// `--cap-drop` で除く capability(狭める方向のみ。CLI-1・SEC-1・#2775)。
+    cap_drop: CapabilitySet,
+    /// `--read-only`(true なら `root.readonly` を実効的に true にする。狭める方向のみ。CLI-1・SUP-12・#2828)。
+    read_only: bool,
+    /// `--network`・`--add-host`・`--dns`(net で再検証済み。NET-6・NET-12・#3065)。
+    network: NetworkOptions,
+    /// 起動時の再検証を通した pasta のバイナリ(`pasta` の記録があるときだけ。exec に使えるのはこれだけ。NET-9・#1940)。
+    pasta: Option<PastaBinary>,
+    /// healthcheck の定義(検証済み。無ければ周期実行を起動しない。SUP-4・TASK-161・#2953)。
+    healthcheck: Option<HealthcheckDefinition>,
 }
 
 impl ContainerOptions {
@@ -123,6 +160,68 @@ impl ContainerOptions {
     pub fn with_ulimits(mut self, ulimits: Vec<Ulimit>) -> Result<Self, TraitError> {
         self.rlimits = Rlimits::new(ulimits.into_iter().map(|u| u.rlimit()).collect())?;
         Ok(self)
+    }
+
+    /// `--cap-drop` の集合を設定する(CLI-1・SEC-1・#2775)。名前の検証・正規化は core の
+    /// `parse_drop_list` が済ませた集合を受ける。
+    #[must_use]
+    pub fn with_cap_drop(mut self, drop: CapabilitySet) -> Self {
+        self.cap_drop = drop;
+        self
+    }
+
+    /// `--read-only` を設定する(CLI-1・SUP-12・#2828)。false は「指定なし」(config の値に従う)で、
+    /// `readonly:true` の config を書き込み可能に戻す経路は無い。
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// `--network`・`--add-host`・`--dns` の検証済みの組を設定する(NET-6・NET-12・#3065)。
+    #[must_use]
+    pub fn with_network(mut self, network: NetworkOptions) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// `--network`・`--add-host`・`--dns` の検証済みの組。
+    pub fn network(&self) -> &NetworkOptions {
+        &self.network
+    }
+
+    /// 起動時の再検証(`reverify_recorded_pasta`)を通した pasta のバイナリを持たせる(NET-9・#1940)。
+    #[must_use]
+    pub fn with_pasta_binary(mut self, binary: PastaBinary) -> Self {
+        self.pasta = Some(binary);
+        self
+    }
+
+    /// 再検証済みの pasta のバイナリ(記録が無ければ `None`)。
+    pub fn pasta_binary(&self) -> Option<&PastaBinary> {
+        self.pasta.as_ref()
+    }
+
+    /// healthcheck の定義を持たせる(SUP-4・TASK-161・#2953)。supervisor の入口が周期実行の配線に使う。
+    #[must_use]
+    pub fn with_healthcheck(mut self, definition: HealthcheckDefinition) -> Self {
+        self.healthcheck = Some(definition);
+        self
+    }
+
+    /// healthcheck の定義(無ければ `None`。周期実行は起動せず `health` も書かない)。
+    pub fn healthcheck(&self) -> Option<&HealthcheckDefinition> {
+        self.healthcheck.as_ref()
+    }
+
+    /// `--read-only` が指定されたか。
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// `--cap-drop` の集合。
+    pub fn cap_drop(&self) -> CapabilitySet {
+        self.cap_drop
     }
 
     /// `--ipc` の指定を設定する（SUP-12・TASK-169.3。未指定は `Private`）。
@@ -183,9 +282,9 @@ impl ContainerOptions {
     /// Landlock のルールに含める暗黙の `/dev` 系マウントを、実際に載せる tmpfs 集合（[`Self::tmpfs_set`]）から
     /// 選ぶ（CORE-5・SUP-12・#1672 事後監査 P2）。`--ipc=host` では `/dev/shm` を載せないため
     /// `ImplicitDevMounts::WithoutShm` になり、適用時に無い `/dev/shm` のルールで起動を拒否しない。
-    /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。core の `landlock::build_path_rules_with_dev`
-    /// へ渡す想定。本番 launcher は現在 `ContainerOptions` を受け取らず、暗黙の `/dev` 系は常に
-    /// `ImplicitDevMounts::All`（既定の `/dev/shm` を載せる）で作る。launcher からの結線は未実装（担当 #2625。REPAIR-3）。
+    /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。本番 launcher は
+    /// [`Self::launch_options`] 経由で受け取った tmpfs 集合から core 側で同じ規則（`ImplicitDevMounts::for_tmpfs_set`）
+    /// で導くため、この関数は launcher からは呼ばれない（検証と試験用の観測口。結線は #2625）。
     pub fn implicit_dev_mounts(&self) -> Result<ImplicitDevMounts, TraitError> {
         Ok(ImplicitDevMounts::for_tmpfs_set(&self.tmpfs_set()?))
     }
@@ -210,6 +309,34 @@ impl ContainerOptions {
         let set = self.injected.to_file_set()?;
         set.check_against_tmpfs(&self.tmpfs_set()?)?;
         Ok(set)
+    }
+
+    /// 本番 launcher（core の `ProductionLauncherBuilder::launch_options`）へ渡す起動オプションへ変換する
+    /// （SUP-12・CORE-5・SEC-1・#2625）。
+    ///
+    /// tmpfs 集合（`--ipc=host` 以外は `/dev/shm` を含む）・注入ファイル集合・IPC の扱いを 1 回の検証で作る。
+    /// ホスト上の secrets / configs のファイルはこの呼び出しで読むため、呼び出し元（start の `build_launcher`）は
+    /// fork 前の単一スレッドで呼ぶ。`Shareable` は join 側が未実装のため `Private` と同じ扱い（`ipc` モジュール）。
+    /// 矛盾した指定（`--ipc=host` と `--shm-size` 等）は `InvalidArgument` で拒否する。
+    ///
+    /// `network` は core の `LaunchNetworkMode` へ写して渡す(指定なしは `FromConfig`。NET-6・#3065)。
+    /// `add-host`・`dns` が生む `/etc/hosts`・`/etc/resolv.conf` は `with_etc_files` で bind 対象にする
+    /// (生成は start の手順 4b。#1873・NET-12・D9)。
+    pub fn launch_options(&self) -> Result<LaunchOptions, TraitError> {
+        let network_mode = self.network.launch_network_mode()?;
+        let ipc = if self.ipc.shares_host_namespace() {
+            LaunchIpcMode::Host
+        } else {
+            LaunchIpcMode::Private
+        };
+        // ulimit は種別ごとの指定値(launcher が 16 種へ補完)、env は `process.env` への上書き。core は再検証する。
+        LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)?
+            .with_rlimits(self.rlimits.clone())
+            .with_env(self.env.to_env_strings())?
+            .with_capability_drop(self.cap_drop)
+            .with_root_readonly(self.read_only)
+            .with_network(network_mode)
+            .with_etc_files(self.network.etc_file_selection())
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -472,5 +599,99 @@ mod tests {
             "mode=1777,size=67108864"
         );
         assert!(ContainerOptions::new().mounts().tmpfs().is_empty());
+    }
+
+    /// SUP-12・CORE-5(#2625): 既定の指定は core の既定の起動オプションと等しい(従来の動作)。
+    #[test]
+    fn sup12_launch_options_default_equals_core_default() {
+        let got = ContainerOptions::new().launch_options().expect("options");
+        let want = LaunchOptions::try_default().expect("default");
+        assert_eq!(got, want);
+    }
+
+    /// NET-12・#1873: add-host / dns は `etc_files()` の選択として `LaunchOptions` へ届く。
+    #[test]
+    fn net12_launch_options_carries_etc_files() {
+        use fandhe_container_core::etc_files::EtcFileKind;
+        let with = |hosts: &[&str], dns: &[&str]| {
+            let h: Vec<String> = hosts.iter().map(|s| (*s).to_owned()).collect();
+            let d: Vec<String> = dns.iter().map(|s| (*s).to_owned()).collect();
+            ContainerOptions::new()
+                .with_network(NetworkOptions::parse(Some("host"), &h, &d, &[]).expect("parse"))
+        };
+        let o = with(&["web:192.0.2.1"], &[])
+            .launch_options()
+            .expect("hosts");
+        assert_eq!(o.etc_files().kinds(), vec![EtcFileKind::Hosts]);
+        let o = with(&[], &["8.8.8.8"]).launch_options().expect("dns");
+        assert_eq!(o.etc_files().kinds(), vec![EtcFileKind::ResolvConf]);
+        assert!(
+            with(&[], &[])
+                .launch_options()
+                .expect("none")
+                .etc_files()
+                .is_empty()
+        );
+    }
+
+    /// SUP-12・SEC-1(#2625): `--ipc=host` は IPC を共有し、`/dev/shm` を載せない。`shareable` は `Private` に写る。
+    #[test]
+    fn sup12_launch_options_maps_ipc_modes() {
+        let host = ContainerOptions::new().with_ipc_mode(IpcMode::Host);
+        let o = host.launch_options().expect("host");
+        assert_eq!(o.ipc(), LaunchIpcMode::Host);
+        assert!(o.tmpfs().mounts().is_empty());
+        assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::WithoutShm);
+        let shareable = ContainerOptions::new().with_ipc_mode(IpcMode::Shareable);
+        let o = shareable.launch_options().expect("shareable");
+        assert_eq!(o.ipc(), LaunchIpcMode::Private);
+        assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::All);
+    }
+
+    /// SUP-12・CLI-1(#2713): ulimit と env は `LaunchOptions` へ具体値で届く(ulimit は指定した種別だけ)。
+    #[test]
+    fn sup12_launch_options_carries_ulimit_and_env() {
+        let vars = vec![
+            env::EnvVar::parse("A=1").expect("var"),
+            env::EnvVar::parse("B=2").expect("var"),
+        ];
+        let o = ContainerOptions::new()
+            .with_ulimits(vec![Ulimit::parse("nofile=1024:2048").expect("ulimit")])
+            .expect("ulimits")
+            .with_env(EnvSet::resolve(&[], &[], &vars).expect("env"))
+            .launch_options()
+            .expect("options");
+        let limits: Vec<_> = o
+            .rlimits()
+            .iter()
+            .map(|r| (r.kind(), r.soft(), r.hard()))
+            .collect();
+        assert_eq!(limits, vec![(RlimitKind::Nofile, 1024, 2048)]);
+        assert_eq!(o.merged_env(&["A=0".to_owned()]), vec!["A=1", "B=2"]);
+    }
+
+    /// SUP-12(#2625): `--shm-size 128m` は `/dev/shm` の size=134217728 になる。
+    #[test]
+    fn sup12_launch_options_applies_shm_size() {
+        let mounts = MountOptions::default().with_shm_size(ShmSize::parse("128m").expect("size"));
+        let o = ContainerOptions::new()
+            .with_mounts(mounts)
+            .launch_options()
+            .expect("options");
+        let shm = o.tmpfs().mounts().first().expect("shm");
+        assert_eq!(shm.destination.as_str(), "/dev/shm");
+        assert_eq!(shm.data_string(), "mode=1777,size=134217728");
+    }
+
+    /// SUP-12(#2625): `--ipc=host` と `--shm-size` の併用は固定文言で拒否する。
+    #[test]
+    fn sup12_launch_options_rejects_host_ipc_with_shm_size() {
+        let mounts = MountOptions::default().with_shm_size(ShmSize::parse("64m").expect("size"));
+        let err = ContainerOptions::new()
+            .with_ipc_mode(IpcMode::Host)
+            .with_mounts(mounts)
+            .launch_options()
+            .expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 }

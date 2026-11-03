@@ -24,9 +24,16 @@
 //!   `0o077` なし・symlink 非追従）、一時ファイル＋fsync＋rename で原子的に更新する。空・不完全な内容・
 //!   同じ受け口の重複行・書き込み側が出さない値（ポート 0・公開先範囲外のアドレス・CR）は予約ゼロ件ではなく
 //!   破損として拒否する。サイズ上限（1 MiB）は読み込み・書き込みの両方で同じ検査を通し、上限を超える
-//!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の復元と孤児エントリの回収は未実装で担当 Issue 未確定（REPAIR-3）
-//! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除はルールハンドルの取得経路が無く未対応
-//!   （ネットワーク削除時にテーブルごと解放する。`PortRegistry::release_network`。TASK-139.4）
+//!   予約は書き込む前に `ResourceExhausted` で拒否する（書いたファイルを次回読めなくならないため）。ロックは置き換えない `<path>.lock` に掛ける。再起動後の予約表の組み直しは `network::recorded::rebuild_port_registry_recorded`
+//!   （メンバー記録の公開の行から登録する。NET-3・REPAIR-4・#3362）。孤児エントリの回収は未実装で担当 Issue 未確定（REPAIR-3）
+//! - 状態ルートをまたぐ衝突は、公開の前にカーネルの全 `fandhe_net_*` テーブルの DNAT を dump して照合する
+//!   （`crate::network::listener_dump`。NET-3・#3063。`PortRegistry::reserve` の前に呼ぶ多層防御）。未実装範囲として、
+//!   照会から投入までを排他する共有ロックと、投入後の再 dump による事後確認が残る（照会から投入までの間に別の
+//!   状態ルートが割り込むと二重に投入できる窓がある。REPAIR-3。D11 の全体はまだ満たしていない。#3191）
+//! - IPv4 のみ（静的 IPAM が IPv4 のみのため）。公開の個別解除は
+//!   `network::unpublish_container_port`（NEWRULE の echo 応答のハンドル指定。NET-3・#2839）。プロセス再起動後は
+//!   `network::recorded` がメンバー記録に永続化したハンドルから復元して個別に解除する（#3068）。記録の無い公開と
+//!   ネットワーク削除時はテーブルごと解放する（`PortRegistry::release_network`。TASK-139.4）
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -177,8 +184,9 @@ type ListenerOwner = (NetworkName, EndpointId);
 /// `attach_container` が DNAT ルールを投入する前に受け口を予約し、既に誰かが公開している受け口なら
 /// 接続を失敗させる。nft は同一ルールの重複を拒否せず、先に入ったルールが優先されて後のコンテナの公開が
 /// 機能しないため。コンテナ間・ネットワーク間の競合を検出できるよう、呼び出し側が全ネットワークで 1 つを
-/// 共有する。状態は呼び出し側が所有するメモリ上の値（常駐デーモンを持たない。CORE-1）で、永続化は
-/// 未実装で担当 Issue 未確定（REPAIR-3）。
+/// 共有する。状態は呼び出し側が所有するメモリ上の値（常駐デーモンを持たない。CORE-1）で、それ自体は永続化しない。
+/// 再起動後は `network::recorded::rebuild_port_registry_recorded` がメンバー記録の公開の行から組み直す
+/// （組み直しが不完全な間は新規の予約を拒否する。NET-3・REPAIR-4・#3362）。
 ///
 /// # プロセス間の共有
 ///
@@ -186,11 +194,42 @@ type ListenerOwner = (NetworkName, EndpointId);
 /// 読み直し、競合検査と書き戻しを同じロックの中で行う。デーモンレス構成で別プロセスから接続した
 /// コンテナとも競合を検出できる。ロックの待ちには期限を設ける（REPAIR-5）。ファイルは所有者のみ
 /// 読み書き可（0600）で作り、symlink・通常ファイル以外・過大なファイル・壊れた内容は fail-closed で拒否する。
+///
+/// 組み直しの「不完全」の印は共有ファイルに載せず、プロセスごとに持つ。共有ファイルを使うプロセスも、最初の
+/// `reserve` の前に自分で `rebuild_port_registry_recorded` を呼ぶこと。`reserve` の製品の呼び出し元は、直前に
+/// カーネル dump の照合（`ensure_no_listener_conflict`）を通すこと（NET-3・REPAIR-4・#3433）。
+///
+/// 結線する側（#3074 の supervisor・#3075 の plugin-cri）は [`PortRegistry::awaiting_rebuild`] または
+/// [`PortRegistry::with_shared_file_awaiting_rebuild`] で作る。この「組み直し待ち」の予約表は、
+/// `rebuild_port_registry_recorded`（Linux 限定）を 1 回通るまで、受け口を伴う `reserve` を
+/// `FailedPrecondition` で断る（#3477。状態での拒否。型での拒否・既定の変更・共有ファイルへの印の記録は採らない。
+/// 判断は `docs/design/network-wiring.md`「Issue #3477 の実装メモ」）。`new()`・`with_shared_file()` は待ち状態にしない。
+/// 非 Linux には組み直しの関数が無いため、待ち状態の予約表は受け口を伴う予約を通さない（net の DNAT 公開は Linux 限定）。
+/// 待ち状態の構築口はまだどの製品経路にも結線していない（REPAIR-3。結線は #3074・#3075）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortRegistry {
     owners: HashMap<ListenerKey, ListenerOwner>,
     /// プロセス間で共有する予約ファイル（`None` ならプロセス内のみ）。
     shared: Option<PathBuf>,
+    /// 記録からの組み直しが不完全だった印。立っている間、受け口を伴う `reserve` は `FailedPrecondition` で拒否する
+    /// （予約が足りないまま新規公開を通すと二重投入になりうるため。fail-closed。NET-3・REPAIR-4・#3362）。
+    /// 解放系（`release*`）は止めない。呼び出し側のメモリ上の値で、他プロセスへは伝えない。各プロセスが自分で
+    /// 組み直す契約（#3433。同じ記録から同じ判定に至る）。
+    incomplete: bool,
+    /// 組み直す前の待ち状態（#3477）。立っている間、受け口を伴う `reserve` は `FailedPrecondition`。
+    /// `mark_incomplete` / `clear_incomplete`（組み直しの完了時に必ず呼ばれる）で解ける。既定は `false`。
+    awaiting_rebuild: bool,
+}
+
+/// [`PortRegistry::adopt`] の結果（記録からの組み直しの件数。#3362）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AdoptOutcome {
+    /// 新たに登録した受け口。
+    pub(crate) registered: usize,
+    /// 同じ持ち主で既に予約済みだった受け口。
+    pub(crate) already_held: usize,
+    /// 別の持ち主が持っていたため登録しなかった受け口。
+    pub(crate) conflicts: usize,
 }
 
 type ListenerKey = (PortProtocol, Ipv4Addr, u16);
@@ -456,7 +495,32 @@ impl PortRegistry {
         Self {
             owners: HashMap::new(),
             shared: Some(path),
+            incomplete: false,
+            awaiting_rebuild: false,
         }
+    }
+
+    /// 組み直し待ちの空の予約表（構造体 doc。#3477）。`rebuild_port_registry_recorded` を通すまで、
+    /// 受け口を伴う `reserve` は `FailedPrecondition`。再起動後に記録から組み直す呼び出し元が使う。
+    pub fn awaiting_rebuild() -> Self {
+        Self {
+            awaiting_rebuild: true,
+            ..Self::default()
+        }
+    }
+
+    /// [`PortRegistry::with_shared_file`] の組み直し待ち版（#3477）。共有ファイル上で他のプロセスが
+    /// 組み直し済みでも、このプロセスが自分で組み直すまで待ちは解けない。
+    pub fn with_shared_file_awaiting_rebuild(path: PathBuf) -> Self {
+        Self {
+            awaiting_rebuild: true,
+            ..Self::with_shared_file(path)
+        }
+    }
+
+    /// 組み直す前の待ち状態で、受け口を伴う新規の予約を拒否しているか（診断用。#3477）。
+    pub fn is_awaiting_rebuild(&self) -> bool {
+        self.awaiting_rebuild
     }
 
     /// 予約済みの受け口の件数（共有ファイル使用時は、このプロセスが最後に読み書きした時点の件数）。
@@ -469,6 +533,69 @@ impl PortRegistry {
         self.owners.is_empty()
     }
 
+    /// 組み直しが不完全で、受け口を伴う新規の予約を拒否している状態か（診断用）。
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    /// 組み直しが不完全だった印を立てる（`rebuild_port_registry_recorded` が使う）。
+    // 呼び出し元は Linux 限定の `network::recorded`。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn mark_incomplete(&mut self) {
+        self.incomplete = true;
+        self.awaiting_rebuild = false;
+    }
+
+    /// 組み直しが完全に成功したので印を外す。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn clear_incomplete(&mut self) {
+        self.incomplete = false;
+        self.awaiting_rebuild = false;
+    }
+
+    /// 記録から読んだ公開 `entries` を予約として登録する（再起動後の組み直し。NET-3・REPAIR-4・#3362）。
+    ///
+    /// 同じ持ち主の既存の予約は `already_held`（冪等）、別の持ち主の予約は `conflicts`（登録せず元の持ち主のまま）。
+    /// `entries` 内の同じ受け口も同じ規則で扱う。`entries` の件数は記録の上限（ネットワーク数 × メンバー数 ×
+    /// `MAX_PORT_PUBLISHES`）で有界。`reserve` のコンテナ単位の上限はここでは課さない（記録は復号時に 1 メンバー
+    /// `MAX_PORT_PUBLISHES` 件以下を保証済みで、超えた endpoint は以後の `reserve` が止まるだけで安全側）。
+    /// 共有ファイル使用時はロックの下で 1 回だけ読み直して合併し、追加があるときだけ 1 回書く
+    /// （サイズ上限超過は書かずに `ResourceExhausted`。ロック待ちの期限は `Timeout`）。失敗時は予約を増やさない。
+    // 呼び出し元は Linux 限定の `network::recorded`。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn adopt(
+        &mut self,
+        entries: &[(NetworkName, EndpointId, PortPublish)],
+    ) -> Result<AdoptOutcome, NetError> {
+        let _lock = match &self.shared {
+            Some(path) => {
+                let lock = open_locked(path)?;
+                self.owners = parse_shared(path)?;
+                Some(lock)
+            }
+            None => None,
+        };
+        let mut next = self.owners.clone();
+        let mut out = AdoptOutcome::default();
+        for (network, endpoint, p) in entries {
+            match next.get(&Self::key(p)) {
+                Some((n, e)) if n == network && e == endpoint => out.already_held += 1,
+                Some(_) => out.conflicts += 1,
+                None => {
+                    next.insert(Self::key(p), (network.clone(), endpoint.clone()));
+                    out.registered += 1;
+                }
+            }
+        }
+        if out.registered > 0
+            && let Some(path) = &self.shared
+        {
+            write_shared(path, &next)?;
+        }
+        self.owners = next;
+        Ok(out)
+    }
+
     fn key(p: &PortPublish) -> (PortProtocol, Ipv4Addr, u16) {
         (p.protocol, p.host_addr, p.host_port.get())
     }
@@ -476,7 +603,10 @@ impl PortRegistry {
     /// `owner` として `ports` の受け口をすべて予約する。1 件でも既に予約済み（同じ持ち主を含む）なら
     /// 何も予約せず `AlreadyExists`（all-or-nothing）。`ports` 内の重複も `AlreadyExists`。
     /// 共有ファイル使用時は、予約後の内容がサイズ上限を超えるなら書き込まず `ResourceExhausted`、
-    /// 破損は `Internal`、ロック待ちの期限切れは `Timeout`（いずれも予約は増えない）。
+    /// 破損は `Internal`、ロック待ちの期限切れは `Timeout`（いずれも予約は増えない）。`ports` が空なら常に `Ok`。
+    /// 組み直しが不完全な印（[`PortRegistry::is_incomplete`]）がある間、受け口を伴う予約は `FailedPrecondition`。
+    /// 組み直し待ち（[`PortRegistry::is_awaiting_rebuild`]）の間も同じく `FailedPrecondition`（#3477）。
+    /// 製品の呼び出し元は直前にカーネル dump の照合を通すこと（受け口不明の保持の防御はそれに依る。#3433）。
     pub(crate) fn reserve(
         &mut self,
         network: &NetworkName,
@@ -493,6 +623,20 @@ impl PortRegistry {
             // 公開なしの attach では共有予約表に触れない（ロック・解析の失敗で接続を落とさない）。
             return Ok(());
         }
+        // 組み直す前の待ち状態なら断る（共有ファイルのロックより前。何も変えず、ファイルも作らない。NET-3・#3477）。
+        if self.awaiting_rebuild {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "port registry has not been rebuilt from records",
+            ));
+        }
+        // 組み直しが不完全なら新規の予約を断る（共有ファイルのロックより前。何も変えない。NET-3・#3362）。
+        if self.incomplete {
+            return Err(NetError::new(
+                NetErrorCode::FailedPrecondition,
+                "port registry is incomplete; rebuild from records failed",
+            ));
+        }
         // 共有ファイルは排他ロックの中で最新を読み直し、検査と書き戻しを同じロックで行う。
         let _lock = match &self.shared {
             Some(path) => {
@@ -508,6 +652,19 @@ impl PortRegistry {
             {
                 return Err(conflict());
             }
+        }
+        // コンテナ単位の上限（MAX_PORT_PUBLISHES）は既存の予約（attach 時の公開分・結果不明の予約を含む）と
+        // 今回の件数の合計で検査する。予約・DNAT 投入の前に拒否する（繰り返し公開による無制限増加の防止）。
+        let held = self
+            .owners
+            .values()
+            .filter(|(n, e)| n == network && e == endpoint)
+            .count();
+        if held.saturating_add(ports.len()) > MAX_PORT_PUBLISHES {
+            return Err(NetError::new(
+                NetErrorCode::ResourceExhausted,
+                "too many published ports for the container",
+            ));
         }
         let mut next = self.owners.clone();
         for p in ports {
@@ -549,6 +706,62 @@ impl PortRegistry {
         Ok(before - self.owners.len())
     }
 
+    /// `endpoint`（`network` 内）が持つ予約のうち、`ports` の受け口だけを解放し、解放した件数を返す。
+    ///
+    /// attach 後の追加公開（`publish_container_ports`）が確定的に失敗したとき、今回の予約だけを戻すために使う。
+    /// 同じ endpoint が先に公開した受け口は残す。失敗時の扱い（予約を残して `Err`）は [`PortRegistry::release`]
+    /// と同じで、DNAT ルールが残っている可能性がある間（結果不明のバッチ）は呼ばないこと。
+    pub(crate) fn release_listeners(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+        ports: &[PortPublish],
+    ) -> Result<usize, NetError> {
+        let keys: Vec<_> = ports.iter().map(Self::key).collect();
+        let keep = |k: &ListenerKey, (n, e): &mut ListenerOwner| {
+            !(n == network && e == endpoint && keys.contains(k))
+        };
+        if let Some(path) = &self.shared {
+            let _lock = open_locked(path)?;
+            let mut map = parse_shared(path)?;
+            let before = map.len();
+            map.retain(keep);
+            write_shared(path, &map)?;
+            let released = before - map.len();
+            self.owners = map;
+            return Ok(released);
+        }
+        let before = self.owners.len();
+        self.owners.retain(keep);
+        Ok(before - self.owners.len())
+    }
+
+    /// `endpoint`（`network` 内）が持つ予約の件数を返す（予約は変えない。コンテナ単体の切り離し NET-1・NET-3・#3062）。
+    ///
+    /// 結果不明のまま記録した公開（ハンドルが無い）の予約が残っていないかの確認に使う。共有ファイル使用時は
+    /// ロックして最新を読み直す。ロック・解析の失敗は `Err`（呼び出し側は予約が残るものとして fail-closed に扱う）。
+    // 呼び出し元の `detach_container_with` は OS 非依存だが、実機の呼び出しは Linux 限定。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn held_by(
+        &mut self,
+        network: &NetworkName,
+        endpoint: &EndpointId,
+    ) -> Result<usize, NetError> {
+        let _lock = match &self.shared {
+            Some(path) => {
+                let lock = open_locked(path)?;
+                self.owners = parse_shared(path)?;
+                Some(lock)
+            }
+            None => None,
+        };
+        Ok(self
+            .owners
+            .values()
+            .filter(|(n, e)| n == network && e == endpoint)
+            .count())
+    }
+
     /// `network` の予約をすべて解放し、解放した件数を返す（ネットワーク削除用。TASK-139.4・NET-1）。
     ///
     /// 結果が不明なバッチで quarantine 中の endpoint の予約も含む。手順・失敗時の扱い（予約を残して `Err`）は
@@ -578,6 +791,46 @@ mod tests {
 
     fn a(x: [u8; 4]) -> Ipv4Addr {
         Ipv4Addr::from(x)
+    }
+
+    /// NET-4・NET-1: 同じ endpoint への繰り返し予約でも、累積が MAX_PORT_PUBLISHES を超えたら
+    /// 何も増やさず `ResourceExhausted` で拒否する。
+    #[test]
+    fn net4_reserve_rejects_cumulative_over_limit() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let mk = |range: std::ops::Range<u16>| -> Vec<PortPublish> {
+            range
+                .map(|i| {
+                    PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 10_000 + i, 80).unwrap()
+                })
+                .collect()
+        };
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, &mk(0..MAX_PORT_PUBLISHES as u16 - 1))
+            .unwrap();
+        let err = reg.reserve(&net, &ep, &mk(1000..1002)).unwrap_err();
+        assert_eq!(err.code(), NetErrorCode::ResourceExhausted);
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES - 1);
+        reg.reserve(&net, &ep, &mk(1000..1001)).unwrap();
+        assert_eq!(reg.len(), MAX_PORT_PUBLISHES);
+    }
+
+    /// NET-1・NET-4: `release_listeners` は指定した受け口だけを外し、同じ endpoint の他の予約を残す。
+    #[test]
+    fn net4_release_listeners_releases_only_given_ports() {
+        let net = NetworkName::new("web").unwrap();
+        let ep = EndpointId::new("c1").unwrap();
+        let p1 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8080, 80).unwrap();
+        let p2 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8081, 81).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p1)).unwrap();
+        reg.reserve(&net, &ep, std::slice::from_ref(&p2)).unwrap();
+        assert_eq!(reg.release_listeners(&net, &ep, &[p2]).unwrap(), 1);
+        assert_eq!(reg.len(), 1);
+        // p1 は残っているので再予約は衝突し、p2 は再予約できる。
+        assert!(reg.reserve(&net, &ep, std::slice::from_ref(&p1)).is_err());
+        reg.reserve(&net, &ep, &[p2]).unwrap();
     }
 
     /// NET-1・TASK-139.3: 非 loopback の unicast は受理し、未指定・loopback・broadcast・multicast・
@@ -726,12 +979,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// NET-1・NET-3・#3062: `held_by` は持ち主ごとの件数を返し、予約を変えない。共有ファイルでは別
+    /// インスタンスの予約も読み直して数え、壊れた内容は `Err`。
+    #[test]
+    fn net1_held_by_counts_owner_reservations() {
+        let web = NetworkName::new("web").unwrap();
+        let (c1, c2) = (
+            EndpointId::new("c1").unwrap(),
+            EndpointId::new("c2").unwrap(),
+        );
+        let mk = |p: u16| PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), p, 80).unwrap();
+        let mut r = PortRegistry::new();
+        r.reserve(&web, &c1, &[mk(8080), mk(8081)]).unwrap();
+        r.reserve(&web, &c2, &[mk(8082)]).unwrap();
+        assert_eq!(r.held_by(&web, &c1).unwrap(), 2);
+        assert_eq!(r.held_by(&web, &c2).unwrap(), 1);
+        assert_eq!(r.held_by(&NetworkName::new("db").unwrap(), &c1).unwrap(), 0);
+        assert_eq!(r.len(), 3);
+
+        let dir = shared_dir("held-by");
+        let path = dir.join("ports.reg");
+        let mut s1 = PortRegistry::with_shared_file(path.clone());
+        let mut s2 = PortRegistry::with_shared_file(path.clone());
+        s1.reserve(&web, &c1, &[mk(9000), mk(9001)]).unwrap();
+        assert_eq!(s2.held_by(&web, &c1).unwrap(), 2);
+        assert_eq!(s2.held_by(&web, &c2).unwrap(), 0);
+        write_private(&path, "fandhe-portreg v1\nbroken\nend\n");
+        assert_eq!(
+            s2.held_by(&web, &c1).unwrap_err().code(),
+            NetErrorCode::Internal
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-1・REPAIR-12(#3375・#3475): 前回の残骸（古い `ports.reg` と余計なディレクトリ）が同じ名前に残っていても
+    /// `test_root_at` は消さず別名の空ディレクトリを作り、共有ファイルの試験が古い予約を読まない。残骸は無傷で残る。
+    #[test]
+    fn net1_repair12_test_root_leaves_stale_residue_untouched() {
+        let parent = crate::test_root::test_root("fc-portreg-stale", "parent");
+        let p = parent.join("stale");
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        let reg = "fandhe-portreg v1\ntcp 192.0.2.10 80 web c9\n";
+        std::fs::write(p.join("ports.reg"), reg).unwrap();
+        {
+            let root = crate::test_root::test_root_at(p.clone());
+            assert_ne!(&*root, p.as_path());
+            assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+            assert!(!root.join("ports.reg").exists());
+            // 元の失敗（排他作成）と同じ作成が通る。
+            std::fs::create_dir(root.join("sub")).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(p.join("ports.reg")).unwrap(), reg);
+    }
+
     /// NET-1・TASK-139.3: 共有ファイルの予約は別インスタンス（別プロセス相当）との競合を検出し、
     /// 解放は他方から見える。壊れた内容は fail-closed。
     #[test]
     fn net1_shared_registry_detects_cross_instance_conflicts() {
-        let dir = std::env::temp_dir().join(format!("fc-portreg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 残骸の上で進めないよう、連番つき・作成前削除・Drop 後始末の補助を使う（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fc-portreg", "xinst");
         let path = dir.join("ports.reg");
         let _ = std::fs::remove_file(&path);
         let web = NetworkName::new("web").unwrap();
@@ -979,4 +1285,141 @@ mod tests {
         assert!(!none.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn adopt_fixture() -> (NetworkName, EndpointId, EndpointId, PortPublish) {
+        (
+            NetworkName::new("web").unwrap(),
+            EndpointId::new("c1").unwrap(),
+            EndpointId::new("c2").unwrap(),
+            PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8080, 80).unwrap(),
+        )
+    }
+
+    /// NET-3・REPAIR-4・#3362: `adopt` は 1 件登録し、同じ持ち主での再実行は `already_held`（冪等）。
+    #[test]
+    fn net3_3362_adopt_registers_and_is_idempotent() {
+        let (web, c1, _c2, p) = adopt_fixture();
+        let mut reg = PortRegistry::new();
+        let out = reg.adopt(&[(web.clone(), c1.clone(), p)]).unwrap();
+        assert_eq!(
+            out,
+            AdoptOutcome {
+                registered: 1,
+                already_held: 0,
+                conflicts: 0
+            }
+        );
+        assert_eq!(reg.len(), 1);
+        let again = reg.adopt(&[(web, c1, p)]).unwrap();
+        assert_eq!(
+            again,
+            AdoptOutcome {
+                registered: 0,
+                already_held: 1,
+                conflicts: 0
+            }
+        );
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// NET-3・#3362: 別の持ち主の受け口は `conflicts` で、持ち主は元のまま（元の持ち主の `release` で 1 件解放される）。
+    #[test]
+    fn net3_3362_adopt_keeps_first_owner_on_conflict() {
+        let (web, c1, c2, p) = adopt_fixture();
+        let mut reg = PortRegistry::new();
+        reg.adopt(&[(web.clone(), c1.clone(), p)]).unwrap();
+        let out = reg.adopt(&[(web.clone(), c2.clone(), p)]).unwrap();
+        assert_eq!(out.conflicts, 1);
+        assert_eq!(out.registered, 0);
+        assert_eq!(reg.release(&web, &c2).unwrap(), 0);
+        assert_eq!(reg.release(&web, &c1).unwrap(), 1);
+        assert!(reg.is_empty());
+    }
+
+    /// NET-3・REPAIR-4・#3362: 印が立つと受け口を伴う `reserve` は `FailedPrecondition` で何も変えず、
+    /// 空の `reserve` と解放は止まらない。印を外すと再び通る。
+    #[test]
+    fn net3_3362_incomplete_mark_fails_closed_for_reserve_only() {
+        let (web, c1, c2, p) = adopt_fixture();
+        let p2 = PortPublish::new(PortProtocol::Tcp, a([192, 0, 2, 10]), 8081, 80).unwrap();
+        let mut reg = PortRegistry::new();
+        reg.reserve(&web, &c1, &[p]).unwrap();
+        reg.mark_incomplete();
+        assert!(reg.is_incomplete());
+        let e = reg.reserve(&web, &c2, &[p2]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(reg.len(), 1);
+        reg.reserve(&web, &c2, &[]).unwrap();
+        assert_eq!(reg.release(&web, &c1).unwrap(), 1);
+        reg.clear_incomplete();
+        reg.reserve(&web, &c2, &[p2]).unwrap();
+        assert_eq!(reg.len(), 1);
+    }
+
+    /// NET-3・REPAIR-4・#3477: 組み直し待ちの予約表は受け口を伴う `reserve` を断り、空の `reserve` と解放は通す。
+    /// 既定（`new()`）は待ち状態にしない。
+    #[test]
+    fn net3_3477_awaiting_rebuild_rejects_reserve_with_ports() {
+        let (web, c1, c2, p) = adopt_fixture();
+        let mut reg = PortRegistry::awaiting_rebuild();
+        assert!(reg.is_awaiting_rebuild());
+        assert!(!reg.is_incomplete());
+        let e = reg.reserve(&web, &c1, &[p]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "port registry has not been rebuilt from records"
+        );
+        assert_eq!(reg.len(), 0);
+        reg.reserve(&web, &c2, &[]).unwrap();
+        assert_eq!(reg.release(&web, &c1).unwrap(), 0);
+        let mut plain = PortRegistry::new();
+        assert!(!plain.is_awaiting_rebuild());
+        plain.reserve(&web, &c1, &[p]).unwrap();
+        assert_eq!(plain.len(), 1);
+    }
+
+    /// NET-3・#3477: 共有ファイル版の待ち状態は、ロックより前に断るので共有ファイルもロックファイルも作らない。
+    #[test]
+    fn net3_3477_awaiting_shared_file_rejects_before_touching_file() {
+        let (web, c1, _c2, p) = adopt_fixture();
+        let dir = shared_dir("awaiting-shared");
+        let path = dir.join("ports.reg");
+        let mut reg = PortRegistry::with_shared_file_awaiting_rebuild(path.clone());
+        let e = reg.reserve(&web, &c1, &[p]).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(!path.exists());
+        let mut lock = path.clone().into_os_string();
+        lock.push(".lock");
+        assert!(!std::path::Path::new(&lock).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NET-3・#3362: 共有ファイルでは `adopt` の登録が別インスタンスの `reserve` に見える（同じ受け口は `AlreadyExists`）。
+    #[test]
+    fn net3_3362_adopt_is_visible_through_shared_file() {
+        let (web, c1, c2, p) = adopt_fixture();
+        let dir = shared_dir("adopt-shared");
+        let path = dir.join("ports.reg");
+        let mut r1 = PortRegistry::with_shared_file(path.clone());
+        let mut r2 = PortRegistry::with_shared_file(path);
+        assert_eq!(r1.adopt(&[(web.clone(), c1, p)]).unwrap().registered, 1);
+        assert_eq!(
+            r2.reserve(&web, &c2, &[p]).unwrap_err().code(),
+            NetErrorCode::AlreadyExists
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// nft の cmp データとしてカーネルへ渡る L4 プロトコル番号の `libc` 照合（NET-1・NET-3・MVM-4・REPAIR-12。#3102。
+/// 方式は `docs/design/ffi-libc-check.md`）。宣言と同じく Linux の試験ビルド限定。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(IPPROTO_TCP, u8, c_int);
+        libc_const_eq!(IPPROTO_UDP, u8, c_int);
+    };
 }

@@ -4,6 +4,15 @@
 //! 異常終了役の子プロセスはテストバイナリ自身を `--exact unix::sweep_child_entry` で再実行して
 //! 用意し、親が SIGKILL（`Child::kill`）で止めて残骸を作る。
 
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
 #[cfg(not(unix))]
 #[test]
 fn plug7_sweep_requires_unix_transport() {
@@ -17,11 +26,10 @@ mod unix {
     use fandhe_container_plugin::{
         ONE_SHOT_SWEEP_MAX_ENTRIES, OneShotSweep, RuntimeDir, UdsListener,
     };
-    use std::os::unix::fs::{DirBuilderExt, symlink};
+    use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     /// 子へ基底ディレクトリを渡すテスト専用の環境変数。
@@ -35,16 +43,11 @@ mod unix {
     struct Base(PathBuf);
     impl Base {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
             // macOS の sun_path 上限（104 バイト）に収めるため、長い `TMPDIR`（/var/folders/...）ではなく
             // 短い /tmp 直下に作る（/tmp は macOS で /private/tmp への symlink のため正規化する）。
             let tmp = std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::env::temp_dir());
-            let p = tmp.join(format!(
-                "fcsw-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create_in(&tmp, "fcsw").unwrap();
             Self(p)
         }
     }
@@ -98,14 +101,39 @@ mod unix {
         while !base.0.join(READY).exists() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("child did not become ready within {READY_WAIT:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         // unix の `kill` は SIGKILL。listener の後始末（drop）は走らない。
         child.kill().unwrap();
-        child.wait().unwrap();
+        crate::reap::reap(&mut child, crate::reap::reap_within()).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// 期限つきの待ちの期限切れが、具体的なメッセージの `Err` として表に出ること、続く `reap` で
+    /// 子を回収できる（ゾンビを残さない）ことの照合（REPAIR-5・REPAIR-12・#3304）。待機中の子は
+    /// 60 秒眠るため、200ms の期限では必ず切れる。
+    #[test]
+    fn repair5_wait_within_reports_expiry_and_reap_recovers() {
+        let base = Base::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix::sweep_child_entry", "--test-threads=1"])
+            .env(BASE_ENV, &base.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(
+            crate::reap::wait_within(&mut child, Duration::from_millis(200)),
+            Err(format!("child {pid} did not exit within 200ms"))
+        );
+        assert_eq!(
+            crate::reap::reap(&mut child, Duration::from_secs(10)),
+            Ok(())
+        );
     }
 
     /// 記録つきロックファイルを手で作る（実在しない同一性。socket とは一致しない）。

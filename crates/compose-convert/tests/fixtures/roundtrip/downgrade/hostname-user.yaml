@@ -1,0 +1,8 @@
+# STACK-5・TASK-152.1・#605 の格下げモード用。hostname・user（unsupported-yet）を --downgrade で許す。
+services:
+  app:
+    image: example.invalid/app:1
+    hostname: app-host
+    user: "1000:1000"
+    command: ["run"]
+    ports: ["9000:9000"]

@@ -43,6 +43,12 @@ objc2-virtualization = { workspace = true, features = [
 block2 = { workspace = true, features = ["std"] }
 dispatch2 = { workspace = true, features = ["std", "block2", "objc2"] }
 
+# `sys/mount.rs` / `sys/posix.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1844・#1318・#1837・REPAIR-12）。
+# 承認: #1318 のオーナー判断（2026-10-12。版は workspace の =0.2.189・dev-dependencies のみ・用途は照合の試験に限る）で、
+# 本 crate は #1837 の子。製品の依存には入れない（cargo tree -e normal,build に現れない）。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

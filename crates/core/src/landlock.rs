@@ -40,12 +40,14 @@ pub(crate) use apply::{
 #[cfg(test)]
 pub(crate) use mounted::MountIdentity;
 pub(crate) use mounted::{MountCheck, MountedBy, MountedTarget, MountedTargets};
-pub(crate) use rules::handled_for_abi;
+#[cfg(test)]
+pub(crate) use rules::requires_read_only_mount;
 pub use rules::{
     AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,
-    PathRule, RuleOrigin, RulePath, ShadowedRestriction, build_path_rules,
+    PathRule, RuleOrigin, RulePath, ShadowBacking, ShadowedRestriction, build_path_rules,
     build_path_rules_with_dev, path_rules_from_config,
 };
+pub(crate) use rules::{build_path_rules_with_user_tmpfs, handled_for_abi};
 
 use crate::sys::{self, SysError};
 use crate::traits::ErrorCode;

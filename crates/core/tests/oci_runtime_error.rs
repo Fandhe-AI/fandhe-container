@@ -7,6 +7,9 @@
 //! 実際の stderr への書き出しとプロセス終了は CLI 側（TASK-79・TASK-95）で未結線（REPAIR-3）。本ファイルは
 //! 任意の `Write` へ書いた 1 行と `exit_code()` で代替照合する。実プロセス・root は不要で 3 OS で動く。
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -142,13 +145,16 @@ impl ContainerCgroupRemover for NoCgroup {
 }
 
 /// テストごとに一意な bundle（`rootfs/` と任意の `config.json`。終了時に削除）。
-struct Bundle(PathBuf);
+#[allow(dead_code)] // 第 2 要素は bundle の親を drop まで保持するためだけに持つ。
+struct Bundle(PathBuf, scratch_root::ScratchDir);
 
 impl Bundle {
     fn new(name: &str, with_config: bool) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-core-err2-it-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = scratch_root::ScratchDir::new(
+            &format!("fandhe-core-err2-it-{name}"),
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().join("bundle");
         std::fs::create_dir_all(dir.join("rootfs")).expect("bundle dir");
         if with_config {
             let config = json!({
@@ -162,7 +168,7 @@ impl Bundle {
             )
             .expect("config");
         }
-        Self(dir)
+        Self(dir, scratch)
     }
     fn req(&self, id: &str) -> CreateRequest {
         CreateRequest::new(cid(id), self.0.clone()).expect("absolute bundle")

@@ -6,9 +6,18 @@
 //! 後続がこのファイルへ追記する。常駐 plugin の RSS 計測（TASK-112.3・#267）は
 //! `supported::resident` にあり、環境依存のため `#[ignore]` の実機前提テストとして既定集合から分離している
 //! （実行: `cargo test --release -p fandhe-container-plugin --test rss_comparison -- --ignored
-//! plug9_resident_plugin_rss_is_measured --nocapture`。Linux / macOS のみ）。
+//! plug9_resident_plugin_rss_is_measured --no-capture`。Linux / macOS のみ）。
 //! ここでは増加方向の下限だけを検査し、絶対値の比較は行わない（並列テストによる揺れを避ける）。
 //! RSS を読むテストは `RSS_LOCK` で直列化する。
+
+// 残骸・PID 再利用と衝突しない排他作成の補助（REPAIR-12・#3435）。root や別 UID の `#[ignore]` の場面を
+// 持つ試験ファイルがあるため、予測できる名前を消す補助は使わず排他作成で連番を進める。
+#[cfg(unix)]
+#[path = "../../net/tests/support/exclusive_dir.rs"]
+mod exclusive_dir;
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod supported {
@@ -108,11 +117,9 @@ mod supported {
     };
     use std::ffi::OsString;
     use std::io::Read;
-    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     /// PLUG-8 目標（TASK-112・MS-3）: 2 条件の差が 0.5 MiB 未満。PoC-13 の 3.375 は 3456 KiB ちょうどのため
@@ -194,13 +201,8 @@ mod supported {
     struct WorkDir(PathBuf);
     impl WorkDir {
         fn new(condition: &str) -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "fcrc-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+            let p = crate::exclusive_dir::create("fcrc").unwrap();
             std::fs::write(p.join("condition"), condition).unwrap();
             Self(p)
         }
@@ -338,7 +340,7 @@ mod supported {
             if Instant::now() >= deadline {
                 kill_process_group(&child);
                 let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 panic!("subject ({condition}) did not finish before its deadline");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -349,24 +351,25 @@ mod supported {
 
     /// 計測対象のプロセスグループ（計測対象と、その子孫である常駐 plugin）へ SIGKILL を送る。
     /// 計測対象は未回収（pid 保持中）の状態で呼ぶこと。pgid の再利用による誤殺を避けるため。
-    /// 本 crate は libc に依存せず unsafe も使えないため、OS 同梱の `kill` コマンドを環境空・
+    /// `libc` は unix の dev-dependency だが宣言の照合専用で、試験コードでは `sys` の外の `unsafe` を使えない（coding-rust.md）ため、OS 同梱の `kill` コマンドを環境空・
     /// 絶対パスで起動する。失敗は無視し、呼び出し側が続けて計測対象本体を kill する。
     fn kill_process_group(child: &std::process::Child) {
-        let target = format!("-{}", child.id());
-        // GNU（Linux）は `--` つき、BSD（macOS）の kill は `--` を pid として拒否するため
-        // `--` なしの形式も順に試す。どちらかが成功した時点で戻る。
-        let arg_forms: [&[&str]; 2] = [&["-s", "KILL", "--", &target], &["-s", "KILL", &target]];
+        // 引数形式は共有補助が OS ごとに決める（Linux は `--` つきだけ。`--` なしは ubuntu-24.04 の procps で
+        // `kill(-1)` になりうる。#3505）。どれかが成功した時点で戻る。
+        let arg_forms = crate::reap::group_kill_arg_forms(child.id());
         for bin in ["/bin/kill", "/usr/bin/kill"] {
-            for args in arg_forms {
-                let status = Command::new(bin)
-                    .args(args)
+            for args in &arg_forms {
+                let mut cmd = Command::new(bin);
+                cmd.args(args)
                     .env_clear()
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if status.is_ok_and(|s| s.success()) {
-                    return;
+                    .stderr(Stdio::null());
+                // 期限なしの `status()` を避ける（REPAIR-5・#3409）。期限切れ・spawn 失敗は次の形式へ進む。
+                match crate::reap::run_within(&mut cmd, crate::reap::reap_within()) {
+                    Ok(s) if s.success() => return,
+                    Ok(_) => {}
+                    Err(e) => eprintln!("kill_process_group: {e}"),
                 }
             }
         }
@@ -452,7 +455,7 @@ mod supported {
             "{c1:?} {c2:?}"
         );
         // PLUG-8: println!/eprintln! は libtest に捕捉され、成功時の既定実行
-        // （`make test`・CI は --nocapture を付けない）では表示されない。
+        // （`make test`・CI は --no-capture を付けない）では表示されない。
         // 捕捉対象外の stderr ハンドル直書きと、成果物ファイルの両方へ出す。
         let line = report_line(median(c1), median(c2));
         {
@@ -481,7 +484,6 @@ mod supported {
             ResidentStartTimeout, ResidentState, RpcTimeout, UdsStream, rss,
         };
         use std::ffi::OsString;
-        use std::os::unix::fs::DirBuilderExt;
         use std::path::PathBuf;
         use std::sync::mpsc;
         use std::time::Duration;
@@ -507,8 +509,8 @@ mod supported {
         struct TempDir(PathBuf);
         impl TempDir {
             fn new() -> Self {
-                let p = std::env::temp_dir().join(format!("fcrs-rss-{}", std::process::id()));
-                std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+                // 残骸・PID 再利用との衝突を避ける排他作成（既存のパスは消さず連番を進める。REPAIR-12・#3435）。
+                let p = crate::exclusive_dir::create("fcrs-rss").unwrap();
                 Self(p)
             }
         }

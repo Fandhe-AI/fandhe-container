@@ -460,11 +460,9 @@ mod tests {
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("fc-iomax-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        base
+    fn scratch(tag: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fc-iomax-{tag}"), "d")
     }
 
     /// SUP-13・TASK-170 追補・REPAIR-4: `set_io_max` が成功と失敗（io.max 不在）を
@@ -478,7 +476,7 @@ mod tests {
         use crate::observability::OpName;
         let name = OpName::new(SET_IO_MAX_OP_NAME).unwrap();
         let rec = OpRecorder::new();
-        let ok = scratch("rec-ok");
+        let (_scratch, ok) = scratch("rec-ok");
         std::fs::write(ok.join("io.max"), b"").unwrap();
         let dir = File::open(&ok).unwrap();
         write_io_max_recorded(
@@ -487,7 +485,7 @@ mod tests {
             &io(dev(259, 0), IoLimit::Value(1_048_576), U, U, U),
         )
         .unwrap();
-        let ng = scratch("rec-ng");
+        let (_scratch, ng) = scratch("rec-ng");
         let dir2 = File::open(&ng).unwrap();
         write_io_max_recorded(
             dir2.as_fd(),
@@ -502,8 +500,6 @@ mod tests {
             rec.snapshot_op(&OpName::new("cgroup.set_io_weight").unwrap())
                 .is_none()
         );
-        std::fs::remove_dir_all(&ok).unwrap();
-        std::fs::remove_dir_all(&ng).unwrap();
     }
 
     /// SUP-13・TASK-170.2: 通常ファイル上で書き込みと読み戻しが具体値で一致する（受け入れ条件の機械照合）。
@@ -513,7 +509,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_io_write_and_read_back() {
-        let base = scratch("ok");
+        let (_scratch, base) = scratch("ok");
         std::fs::write(base.join("io.max"), b"").unwrap();
         let dir = File::open(&base).unwrap();
         let want = io(
@@ -528,7 +524,6 @@ mod tests {
             std::fs::read_to_string(base.join("io.max")).unwrap(),
             "259:0 rbps=1048576 wbps=2097152 riops=100 wiops=200"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: `io.max` が無い（controller 未有効）場合は `FailedPrecondition`。
@@ -538,12 +533,11 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_io_missing_file_is_failed_precondition() {
-        let base = scratch("missing");
+        let (_scratch, base) = scratch("missing");
         let dir = File::open(&base).unwrap();
         let e = write_io_max_at(dir.as_fd(), &io(dev(8, 0), U, U, U, U)).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
         assert_eq!(e.step, CgroupStep::SetIoMax);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: 読み戻しが要求と食い違えば成功扱いにしない。
@@ -553,14 +547,13 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_io_read_back_mismatch_fails() {
-        let base = scratch("mismatch");
+        let (_scratch, base) = scratch("mismatch");
         let long = "8:0 rbps=1 wbps=max riops=max wiops=max\n".repeat(2);
         std::fs::write(base.join("io.max"), long).unwrap();
         let dir = File::open(&base).unwrap();
         let want = io(dev(8, 0), IoLimit::Value(1_048_576), U, U, U);
         let e = write_io_max_at(dir.as_fd(), &want).unwrap_err();
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// SUP-13・TASK-170.2: `io.max` が symlink なら `O_NOFOLLOW` で拒否され、リンク先へは書かれない。
@@ -570,7 +563,7 @@ mod tests {
     ))]
     #[test]
     fn sup13_task170_2_io_symlink_is_rejected() {
-        let base = scratch("symlink");
+        let (_scratch, base) = scratch("symlink");
         std::fs::write(base.join("target"), b"untouched").unwrap();
         std::os::unix::fs::symlink(base.join("target"), base.join("io.max")).unwrap();
         let dir = File::open(&base).unwrap();
@@ -579,6 +572,5 @@ mod tests {
             std::fs::read_to_string(base.join("target")).unwrap(),
             "untouched"
         );
-        std::fs::remove_dir_all(&base).unwrap();
     }
 }

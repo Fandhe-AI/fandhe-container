@@ -56,7 +56,7 @@ paths:
 | 環境構築 | `setup`・`hooks`・`install-cargo-about` | 再実行しても安全（冪等）。`rustup` は確認のみで自動導入しない（`curl \| sh` を作らない。[security](security.md)） |
 | 取得と実ビルド | `guest-kernel-build`・`guest-initrd-build` | `guest-kernel-build` はネットワーク取得と実ビルド（#1874）、`guest-initrd-build` はネットワーク取得なしのローカルの実ビルド（ゲスト init の静的リンクと initrd の梱包。#1878）を行う人間用のターゲット。`make ci` と CI には含めない。成果物は `target/` 配下へ出し、既存の出力は上書きしない |
 | 生成 | `third-party-licenses`・`bench-baseline`・`bench-baseline-manual` | 出力先は `target/` 配下か `OUTPUT` / `BENCH_BASELINE_OUT` で指定した 1 ファイルのみ |
-| 実機前提 | `bench-check-manual`・`cli-parity`・`fio-bench`・`startup-latency*`・`net-setup-timing`・`small-files-compare`・`dns-helper-measure`・`idle-memory*`・`supervisor-*`・`concurrent-memory*`・`restart-latency`・`crictl-smoke` | `make ci` に含めない。必須変数が無ければ usage を出して終了コード 2。sudo をスクリプト内で呼ばない（root 実行は操作者の明示操作）。timeout で包み、終了コードは契約の値へ変換する |
+| 実機前提 | `bench-check-manual`・`cli-parity`・`fio-bench`・`startup-latency*`・`net-setup-timing`・`net-throughput-rtt*`・`small-files-compare`・`dns-helper-measure`・`idle-memory*`・`supervisor-*`・`concurrent-memory*`・`restart-latency`・`crictl-smoke` | `make ci` に含めない。必須変数が無ければ usage を出して終了コード 2。sudo をスクリプト内で呼ばない（root 実行は操作者の明示操作）。timeout で包み、終了コードは契約の値へ変換する |
 | 集約 | `ci` | ワークスペース全体の任意の一括確認（CI の失敗の再現・リリース前。ローカル必須ではない。[ci](ci.md)「ローカルゲート」）。CI 全体とは同一ではない |
 
 - `clean` ターゲットは無い。追加する場合は `target/` など自分が作った生成物だけを消し、共有ディレクトリ（`$HOME`・リポジトリ外・`docs/spec` submodule）を消さない

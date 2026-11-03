@@ -19,18 +19,28 @@
 //!
 //! # 回収の契機と create ゲート（#854・#2495）
 //!
-//! 状態作成まで進まず未確定のまま残った参照、`--image-root` を省いた delete が残した確定済み参照の回収は、
+//! 状態作成まで進まず未確定のまま残った参照、delete が解除できずに残した確定済み参照（記録を持たない古いコンテナを含む）の後追いの回収は、
 //! `ref_reconcile` module が担う（契機 A: イメージつき create の core 呼び出し前に同じキー 1 件、契機 B: `image rm` が
 //! 使用中で拒否したとき）。未確定参照の回収の前提「進行中の create が無いこと」は、oci の create ゲート
 //! （`ImageStore::quiesce_container_creates`）で保証する。イメージつき create は `create_with_image` の呼び出し全体を
 //! ゲートの共有（`ImageStore::enter_container_create`）で包む。本アダプタをゲートなしで `create_with_image` に渡す新しい
-//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。参照キーの形式（`ref_key`・`state_scope`）は変えない。
+//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。
+//!
+//! # 参照キーの形式と旧形式の扱い（#2500）
+//!
+//! `state_scope` と `ref_key` の畳み込みは SHA-256 にした（旧: 非暗号の FNV-1a 64 を 2 本）。旧形式のキーは移行しない。
+//! SHA-256 化（PR #2782）は在庫登録の配線（#2539・PR #2800）と plugin-cri の ImageService（#2592）より前に入っており、
+//! 本番のストアに FNV 形式のコンテナ参照が書かれる経路は無かった（在庫が空なら `register` は `NOT_FOUND` で参照ができない）。
+//! 2026-10-26 に #2539 の配線後も再確認し、移行しない方針は変えない（#2796。CRI 側の参照の登録・解除 #2791 は新形式のキーだけを書く前提）。
+//! 在庫は cri の pull が登録した root を `--image-root` で渡したときだけ CLI から見える（CLI に pull は無い）。
+//! 開発・試験環境に旧キーが残った場合、新コードから見て別の状態ルートのキーになり、delete は外さず契機 B は回収しない
+//! （守りすぎの側に倒れる）。回復は、そのストアの `@container-refs.json` を消すかストアを作り直す。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
 //! - レイヤーの展開（本番の展開器）は #2377。展開器なしの `ContainerImage` を使うため、bundle の rootfs は展開済みの前提
-//! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。ただし本番で在庫を埋める経路
-//!   （pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、`register` は常に `NOT_FOUND`
+//! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。在庫を埋める経路は cri の
+//!   `OciImagePuller::pull` に配線済み（#2539）で、本番の `PullImage` へも plugin-cri の ImageService（#2592）から届く。pull していない root では在庫が空で、`register` は `NOT_FOUND`
 //! - `name@digest` 形式は受けない（在庫は manifest と repository を対応づけず、name を検証できないため fail-closed。#2496）
 //!
 //! # `create --image` の判別規則と解決（#2496・OCI-7・CLI-1）
@@ -41,7 +51,7 @@
 //!    `sha256:<小文字 hex 64 桁>` だけを受け、それ以外は `INVALID_ARGUMENT`（oci の `ImageReference::parse` が
 //!    `sha256:AAAA…` を repository `sha256` のタグと誤読するため、先にここで拒否する）。
 //!    この規則 1 は `image rm` / `image tag`（`image::parse_ref`）と [`is_bare_digest_form`] で共有する。`name@digest` の扱いだけは
-//!    意図して異なり、rm / tag は既存契約（#2221・#2316）の digest 優先で受ける（理由は `image` module doc）。
+//!    意図して異なり、rm / tag は既存契約（#2221・#2316）の digest 優先で受ける（理由と #2659 の再判断〔受け続ける〕は `image` module doc）。
 //! 2. それ以外は oci の `ImageReference::parse`（Docker 互換の正規化。ホスト省略は `registry-1.docker.io`、単一成分は `library/`、
 //!    タグ省略は `latest`）でタグ参照にする。repository 名が `sha256` のイメージは `docker.io/library/sha256:tag` と書けばよい。
 //! 3. 解析に失敗する入力と `name@digest`・`name:tag@digest` は `INVALID_ARGUMENT`（素の digest で指定する。将来広げる余地はある）。
@@ -59,8 +69,9 @@ use fandhe_container_core::oci_runtime::{
     ContainerImageRefs, ImageManifestDigest, ImageRefGeneration, ImageRefRegistration,
     ImageRefRelease,
 };
-use fandhe_container_core::state_store::StateRoot;
-use fandhe_container_core::traits::{ContainerId, TraitError};
+use fandhe_container_core::traits::{
+    Annotations, ContainerId, CreateRequest, StateStore, TraitError,
+};
 use fandhe_container_oci::error::OciError;
 use fandhe_container_oci::image_management::{
     ContainerRefGeneration, ContainerRefId, ContainerRefRegistration, ContainerRefRelease,
@@ -141,26 +152,92 @@ pub(super) fn resolve_create_image(
 ///
 /// イメージストアは状態ルートをまたいで共有できる（`--root` と `--image-root` は独立）。参照キーが
 /// `ContainerId` だけだと、別の状態ルートの同名コンテナの delete が他方の参照を外してしまう（OCI-7 の
-/// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスから決定的な 32 桁の小文字 hex
-/// （FNV-1a 64 を異なる初期値で 2 本。暗号学的ハッシュではなく、同一利用者の状態ルート同士の区別用）
-/// を作り、キーを `<hex>.<id>` にする。
-pub(super) fn state_scope(root: &StateRoot) -> String {
-    let bytes = root.path().as_os_str().as_encoded_bytes();
-    state_hash(bytes)
+/// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスの SHA-256 の先頭 32 桁（128 bit の
+/// 小文字 hex）を作り、キーを `<hex>.<id>` にする。入力は利用者が選ぶパスで、脅威は他人の scope への
+/// 第 2 原像のため 128 bit で足りる（core の `scope_of` と同じ切り詰め。#2500・REPAIR-12）。
+///
+/// 入力は「開いた状態ストアの `host_state_root()`」（`FileStateStore::open` が親の symlink を解決して固定した
+/// 正規パス）で、`--root` の表記（`//`・末尾 `/`・祖先の symlink）が create と delete で違っても同じ scope になる
+/// （#2499 P2-2）。字面だけを畳んで存在しないパスを許す経路は作らない。大文字小文字を区別しない FS の同一視は
+/// 範囲外（ローカル経路は Linux のみ）。
+///
+/// 表記ゆれで scope が割れない根拠（#2796。照合は `oci7_state_scope_is_stable_across_root_spellings` と
+/// `oci7_state_scope_rejects_parent_dir_and_final_symlink_spellings`）:
+/// - `//`・末尾 `/`・`.` は `StateRoot::from_override` が要素を組み直して落とす
+/// - `..` は `StateRoot::from_override` が `InvalidArgument` で拒否する（scope は作られない）
+/// - 祖先の symlink は `FileStateStore::open` の `canonical_root` が解決する
+/// - 最終要素の symlink は `FileStateStore::open` が `PermissionDenied` で拒否する
+///
+/// `legacy_scope` が字面をハッシュするのは旧 scope の読み戻し用の意図した互換処理で、ここには影響しない。
+pub(super) fn state_scope(store: &dyn StateStore) -> Result<String, TraitError> {
+    let root = store
+        .host_state_root()
+        .ok_or_else(|| TraitError::new(ErrorCode::FailedPrecondition, MSG_NO_STATE_ROOT))?;
+    Ok(state_hash(root.as_os_str().as_encoded_bytes()))
 }
 
-/// 32 桁の小文字 hex（FNV-1a 64 を異なる初期値で 2 本）。
+/// 旧版の scope（`--root` の字面から決めた状態ルートのハッシュ）を、新しい scope と違うときだけ返す（#2499・OCI-7）。
+///
+/// 旧版は `StateRoot::resolve(--root)` の字面をハッシュしていた。現行は開いたストアの `host_state_root()`
+/// （祖先の symlink を解決した正規パス）を使うため、`--root` に symlink を含む表記で作ったコンテナの参照は旧 scope の
+/// キーで残っている。旧 scope のキーは新規には作らず、delete の解除・create 前の回収・`image rm` の照合・停止中の判定だけで
+/// 読み戻す（既存の参照が回収不能になる退行を避ける互換処理）。解決できない・新 scope と同じなら `None`。
+pub(super) fn legacy_scope(
+    override_root: Option<std::path::PathBuf>,
+    current: &str,
+) -> Option<String> {
+    let root = fandhe_container_core::state_store::StateRoot::resolve(override_root).ok()?;
+    let legacy = state_hash(root.path().as_os_str().as_encoded_bytes());
+    (legacy != current).then_some(legacy)
+}
+
+const MSG_NO_STATE_ROOT: &str = "the state store does not expose a host state root";
+
+/// create 時のイメージストア root を状態記録の annotations に残す予約キー（#2499・OCI-7・CLI-1）。
+///
+/// 値は `ImageStore::root()`（検査済みの正規パス）。`--image-root` を省いた delete が、この記録のストアを開いて
+/// 参照を解除する。利用者の `--label` では書けない（`create_options::labels_of` が拒否する）。分離・権限の
+/// 判断には使わず、delete 側も値を信頼せず `ImageStore::open` の検査と開いた root との一致で確かめる。
+pub(super) const IMAGE_ROOT_ANNOTATION: &str = "io.fandhe.container.image-root";
+
+const MSG_IMAGE_ROOT_NOT_UTF8: &str = "image store root must be valid UTF-8";
+
+/// `req` の annotations に [`IMAGE_ROOT_ANNOTATION`] を足した要求を返す（同じキーの既存値は置き換える）。
+///
+/// UTF-8 にできない root と、annotations の上限（`Annotations::new` の判定）を超える場合は
+/// `INVALID_ARGUMENT` で失敗し、状態は作られない（fail-closed）。
+pub(super) fn attach_image_root(
+    req: &CreateRequest,
+    store: &ImageStore,
+) -> Result<CreateRequest, TraitError> {
+    let root = store
+        .root()
+        .to_str()
+        .ok_or_else(|| TraitError::new(ErrorCode::InvalidArgument, MSG_IMAGE_ROOT_NOT_UTF8))?;
+    let entries = req
+        .annotations()
+        .iter()
+        .filter(|(k, _)| *k != IMAGE_ROOT_ANNOTATION)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .chain(std::iter::once((
+            IMAGE_ROOT_ANNOTATION.to_owned(),
+            root.to_owned(),
+        )));
+    let annotations = Annotations::new(entries)?;
+    Ok(req.clone().with_annotations(annotations))
+}
+
+/// パスのバイト列から scope の 32 桁 hex を作る（[`state_scope`]・[`legacy_scope`] で共有）。
 fn state_hash(bytes: &[u8]) -> String {
-    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
-        bytes.iter().fold(seed, |h, b| {
-            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
-    format!(
-        "{:016x}{:016x}",
-        fnv1a(0xcbf2_9ce4_8422_2325, bytes),
-        fnv1a(0x8422_2325_cbf2_9ce4, bytes)
-    )
+    let full = sha256_hex(bytes);
+    full.get(..32).map_or_else(|| full.clone(), str::to_owned)
+}
+
+/// SHA-256 の小文字 hex 64 桁。oci の `Digest::sha256_of`（`sha256:` + 64 桁の不変条件）を使う。
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Digest::sha256_of(bytes);
+    let s = digest.as_str();
+    s.strip_prefix("sha256:").unwrap_or(s).to_owned()
 }
 
 /// `ImageStore` を借りて `ContainerImageRefs` を満たすアダプタ。参照キーは状態ルートごとに分ける。
@@ -186,17 +263,18 @@ const REF_KEY_MAX: usize = 255;
 /// 状態ルートの `scope` とコンテナ ID から参照キーを作る（create / delete / 停止中スナップショットで共有）。
 ///
 /// 通常は `<scope>.<id>`。接頭辞を足すと 255 バイトを超える長い ID（223 バイト以上）は
-/// `<scope>-<id の 32 桁 hex>` に畳む。区切りが `.` と `-` で違うため、通常形と畳んだ形は衝突しない。
+/// `<scope>-<id の SHA-256 の 64 桁 hex>`（256 bit。ID は攻撃者が選べる入力のため衝突耐性 2^128 を取る。
+/// 非暗号の FNV からの置き換え。#2500・OCI-7）に畳む。区切りが `.` と `-` で違うため、通常形と畳んだ形は衝突しない。
 /// 結果は常に `[A-Za-z0-9._-]` かつ 255 バイト以下で、変換は失敗しない。
 pub(super) fn ref_key(scope: &str, id: &str) -> String {
     let plain = format!("{scope}.{id}");
     if plain.len() <= REF_KEY_MAX {
         return plain;
     }
-    format!("{scope}-{}", state_hash(id.as_bytes()))
+    format!("{scope}-{}", sha256_hex(id.as_bytes()))
 }
 
-fn fail(e: OciError) -> TraitError {
+pub(super) fn fail(e: OciError) -> TraitError {
     trait_failure(&e, Stage::Refs)
 }
 
@@ -465,14 +543,263 @@ mod tests {
         );
     }
 
-    /// OCI-7: 状態ルートの識別子は決定的で、パスが違えば変わり、キー全体が ID の上限に収まる。
+    /// OCI-7: 状態ルートの識別子は決定的で、ルートが違えば変わり、キー全体が ID の上限に収まる。
+    #[cfg(unix)]
     #[test]
     fn oci7_state_scope_is_deterministic_and_distinct() {
-        let r1 = StateRoot::from_override(std::env::temp_dir().join("a")).expect("r1");
-        let r2 = StateRoot::from_override(std::env::temp_dir().join("b")).expect("r2");
-        assert_eq!(state_scope(&r1), state_scope(&r1));
-        assert_ne!(state_scope(&r1), state_scope(&r2));
-        assert_eq!(state_scope(&r1).len(), 32);
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        let tmp = Tmp::new("scope-distinct");
+        let open = |name: &str| {
+            FileStateStore::open(StateRoot::from_override(tmp.path().join(name)).expect("root"))
+                .expect("open")
+        };
+        let (a, b) = (open("a"), open("b"));
+        assert_eq!(state_scope(&a).expect("a"), state_scope(&a).expect("a"));
+        assert_ne!(state_scope(&a).expect("a"), state_scope(&b).expect("b"));
+        assert_eq!(state_scope(&a).expect("a").len(), 32);
+    }
+
+    /// OCI-7・#2499（P2-2）: `//`・末尾 `/`・祖先の symlink のどの表記で開いても scope は同じになる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_is_stable_across_root_spellings() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        let tmp = Tmp::new("scope-spellings");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).expect("symlink");
+        let scope = |root: std::path::PathBuf| {
+            let store =
+                FileStateStore::open(StateRoot::from_override(root).expect("root")).expect("open");
+            state_scope(&store).expect("scope")
+        };
+        let via_link = scope(tmp.path().join("link").join("state"));
+        let double_slash = scope(std::path::PathBuf::from(format!(
+            "{}//state",
+            real.display()
+        )));
+        let trailing = scope(std::path::PathBuf::from(format!(
+            "{}/state/",
+            real.display()
+        )));
+        let dot = scope(std::path::PathBuf::from(format!(
+            "{}/./state",
+            real.display()
+        )));
+        assert_eq!(via_link, double_slash);
+        assert_eq!(via_link, trailing);
+        assert_eq!(via_link, dot);
+        assert_eq!(via_link.len(), 32);
+    }
+
+    /// OCI-7・#2796: `..` を含む表記と最終要素が symlink の表記は、scope ができる前に fail-closed になる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_rejects_parent_dir_and_final_symlink_spellings() {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = Tmp::new("scope-reject");
+        let state = tmp.path().join("real").join("state");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let dotdot = tmp
+            .path()
+            .join("real")
+            .join("..")
+            .join("real")
+            .join("state");
+        let err = StateRoot::from_override(dotdot).expect_err("dotdot");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        let final_link = tmp.path().join("finallink");
+        std::os::unix::fs::symlink(&state, &final_link).expect("symlink");
+        let err = FileStateStore::open(StateRoot::from_override(final_link).expect("root"))
+            .expect_err("final symlink");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+    }
+
+    /// OCI-7・#2499: 状態ルートを示せないストアの scope は固定文言の `FAILED_PRECONDITION`。
+    #[test]
+    fn oci7_state_scope_without_host_root_fails_closed() {
+        struct NoRoot;
+        impl StateStore for NoRoot {
+            fn create(
+                &self,
+                _: &fandhe_container_core::traits::CreateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn get(
+                &self,
+                _: &fandhe_container_core::traits::GetStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn update(
+                &self,
+                _: &fandhe_container_core::traits::UpdateStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn list(
+                &self,
+                _: &fandhe_container_core::traits::ListStateRequest,
+            ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+            fn delete(
+                &self,
+                _: &fandhe_container_core::traits::DeleteStateRequest,
+            ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError>
+            {
+                Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+            }
+        }
+        let e = state_scope(&NoRoot).expect_err("no root");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), MSG_NO_STATE_ROOT);
+    }
+
+    /// OCI-7・#2499: create の要求にイメージストア root の記録が足され、既存の label は残り、同じキーは置き換わる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_attach_image_root_adds_the_recorded_root() {
+        let tmp = Tmp::new("attach-root");
+        let store = ImageStore::open(tmp.path()).expect("open");
+        let base = CreateRequest::new(
+            ContainerId::new("c1").expect("id"),
+            std::env::temp_dir().join("bundle"),
+        )
+        .expect("req")
+        .with_annotations(
+            Annotations::new([
+                ("k".to_string(), "v".to_string()),
+                (IMAGE_ROOT_ANNOTATION.to_string(), "/stale".to_string()),
+            ])
+            .expect("ann"),
+        );
+        let req = attach_image_root(&base, &store).expect("attach");
+        assert_eq!(req.annotations().get("k"), Some("v"));
+        assert_eq!(
+            req.annotations().get(IMAGE_ROOT_ANNOTATION),
+            store.root().to_str()
+        );
+    }
+
+    /// OCI-7・#2499: root の記録を足すと annotations の合計上限を超える場合は `INVALID_ARGUMENT` で、状態を作る前に失敗する。
+    /// 上限ちょうどまでは通る。
+    ///
+    /// 上限を超える長さの root を実ディレクトリで作ると macOS の PATH_MAX（1024）に当たるため、既存の
+    /// annotations で残りの予算を埋めて境界を作る（3 OS で同じ判定を照合する。#2794）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_attach_image_root_rejects_oversized_root() {
+        use fandhe_container_core::traits::ANNOTATIONS_MAX_TOTAL_BYTES;
+        let tmp = Tmp::new("attach-long");
+        let store = ImageStore::open(tmp.path()).expect("open");
+        let root_len = store.root().to_str().expect("utf-8").len();
+        // 記録 1 件ぶん（キー + root）を足すと合計がちょうど上限になる既存 annotations の値の長さ。
+        let fill = ANNOTATIONS_MAX_TOTAL_BYTES - IMAGE_ROOT_ANNOTATION.len() - root_len - "k".len();
+        let with_value_len = |len: usize| {
+            CreateRequest::new(
+                ContainerId::new("c1").expect("id"),
+                std::env::temp_dir().join("bundle"),
+            )
+            .expect("req")
+            .with_annotations(Annotations::new([("k".to_string(), "v".repeat(len))]).expect("ann"))
+        };
+        let req = attach_image_root(&with_value_len(fill), &store).expect("at limit");
+        assert_eq!(
+            req.annotations().get(IMAGE_ROOT_ANNOTATION),
+            store.root().to_str()
+        );
+        let e = attach_image_root(&with_value_len(fill + 1), &store).expect_err("too large");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: 畳んだ参照キーは SHA-256 の具体値と一致する。
+    #[test]
+    fn oci7_ref_key_sha256_known_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            ref_key(SCOPE, &"a".repeat(255)),
+            format!("{SCOPE}-b0f3323e7a3cad8ae6778340cc2a17ae0cb31c818df3767cda7c3dd423725e90")
+        );
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: scope は状態ルートのパスの SHA-256 の先頭 32 桁。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_state_scope_is_sha256_prefix() {
+        let tmp = Tmp::new("scope");
+        let path = tmp.path().join("state");
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert_eq!(state_hash(bytes), sha256_hex(bytes)[..32]);
+        assert_eq!(state_hash(b"/x/state"), "165fe1065cc95b4bb8e93c5a50ba3276");
+    }
+
+    /// OCI-7・REPAIR-12（#2500）: キーは常に `[A-Za-z0-9._-]` かつ 255 バイト以下。
+    #[test]
+    fn oci7_ref_key_charset_and_length() {
+        for len in [1usize, 222, 223, 254, 255] {
+            let id = "a".repeat(len);
+            let k = ref_key(SCOPE, &id);
+            assert!(k.len() <= 255, "{len}");
+            assert!(
+                k.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                "{len}"
+            );
+            if len <= 222 {
+                assert_eq!(k, format!("{SCOPE}.{id}"));
+            } else {
+                assert!(k.starts_with(&format!("{SCOPE}-")), "{len}");
+                let h = &k[SCOPE.len() + 1..];
+                assert_eq!(h.len(), 64);
+                assert!(h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+                assert_eq!(k.len(), 97);
+            }
+        }
+    }
+
+    /// OCI-7・REPAIR-12（#2500・P2-3）: 長い別 ID の release / release_if は他方の確定済み参照を外さない。
+    #[test]
+    fn oci7_long_id_delete_does_not_release_other() {
+        let tmp = Tmp::new("longdel");
+        let store = seeded(tmp.path(), &[MANIFEST]);
+        let refs = StoreImageRefs::new(&store, SCOPE);
+        let base = |n: usize| "a".repeat(n);
+        let pairs = [
+            (format!("{}x", base(222)), format!("{}y", base(222))),
+            (format!("{}x", base(253)), format!("{}y", base(253))),
+            (format!("{}x", base(254)), format!("{}y", base(254))),
+            (format!("{}xy", base(221)), format!("{}yx", base(221))),
+            (base(223), base(224)),
+        ];
+        for (x, y) in pairs {
+            let (a, b) = (cid(&x), cid(&y));
+            refs.register(&a, &mdigest(MANIFEST)).expect("reg a");
+            let ga = refs.bind(&a).expect("bind a");
+            refs.register(&b, &mdigest(MANIFEST)).expect("reg b");
+            let gb = refs.bind(&b).expect("bind b");
+            assert_eq!(
+                refs.release(&b).expect("release b"),
+                ImageRefRelease::Released
+            );
+            assert_eq!(refs.registration(&a).expect("a"), Some(ga));
+            assert_eq!(refs.registration(&b).expect("b"), None);
+            let _ = gb;
+            assert_eq!(
+                refs.release(&a).expect("release a"),
+                ImageRefRelease::Released
+            );
+        }
     }
 
     /// REPAIR-4・OCI-7: エラーの message は固定文言だけで、ID・パスを含まない。

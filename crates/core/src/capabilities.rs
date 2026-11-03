@@ -6,8 +6,8 @@
 //! OS 非依存のデータ型。適用処理（`capset(2)`・`prctl(2)`）は Linux 限定の
 //! `exec/capabilities.rs` の `apply_default_capabilities` が担い、本モジュールの
 //! [`CapabilitySet::oci_default`] を許可集合として使う。組み込みのステージ（`StagePipeline::run_then`）から呼ばれる（#173・TASK-37.2）。
-//! 将来 `config.json` の `process.capabilities` を解釈する際の型としても使える
-//! （現状は `UnappliedField::ProcessCapabilities` として記録するのみ）。
+//! `config.json` の `process.capabilities` の drop は [`ContainerCapabilities`]（OCI 既定の部分集合だけを表す型）で
+//! 受ける（#2666）。add・`inheritable`・`ambient` は `UnappliedField::ProcessCapabilities` として拒否する。
 //!
 //! # 契約
 //!
@@ -198,6 +198,12 @@ impl Capability {
         }
     }
 
+    /// `CAP_CHOWN` 形式の識別子の逆写像。`CAP_` 接頭辞つき・大文字の完全一致だけを受ける
+    /// （`config.json` の `process.capabilities` の名前の解釈用。SEC-1。未知名は `None`）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
+
     /// `CAP_CHOWN` 形式の機械可読な識別子。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -341,9 +347,261 @@ impl CapabilitySet {
     }
 }
 
+impl CapabilitySet {
+    /// `other` の部分集合か。
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    /// 差集合（`self` から `other` の要素を除いた集合。SEC-1）。
+    #[must_use]
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// 既知の全 capability の集合（`ALL` の drop 指定に使う）。
+    pub fn all_known() -> Self {
+        Capability::ALL
+            .iter()
+            .fold(Self::empty(), |set, c| set.with(*c))
+    }
+}
+
+/// drop 指定の名前の件数の上限（既知の capability 数の 2 倍。重複を許す）。
+pub const MAX_DROP_NAMES: usize = 2 * Capability::ALL.len();
+/// drop 指定の名前 1 件の長さの上限（バイト）。
+pub const MAX_DROP_NAME_BYTES: usize = 32;
+
+/// capability の drop 指定の名前が不正なことを表すエラー（ERR-1）。
+///
+/// 指定された名前は文言に載せない（固定の英語）。呼び出し元（CLI の `create --cap-drop`・
+/// CRI の `drop_capabilities`）が自分の `INVALID_ARGUMENT` へ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityDropError;
+
+impl std::fmt::Display for CapabilityDropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capability drop list is invalid")
+    }
+}
+
+impl std::error::Error for CapabilityDropError {}
+
+/// drop 指定の名前 1 件を capability 集合へ解釈する（`ALL` は既知の全集合）。
+///
+/// 大文字小文字を区別せず、`CAP_` 接頭辞は任意。空・長すぎる・非 ASCII・未知の名前は拒否する。
+/// 長さは確保の前に検査する。
+pub fn parse_drop_name(name: &str) -> Result<CapabilitySet, CapabilityDropError> {
+    if name.is_empty() || name.len() > MAX_DROP_NAME_BYTES || !name.is_ascii() {
+        return Err(CapabilityDropError);
+    }
+    let upper = name.to_ascii_uppercase();
+    if upper == "ALL" {
+        return Ok(CapabilitySet::all_known());
+    }
+    let full = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    let cap = Capability::from_name(&full).ok_or(CapabilityDropError)?;
+    Ok(CapabilitySet::empty().with(cap))
+}
+
+/// drop 指定の名前の並びを capability 集合へ解釈する（CRI-2・CLI-1・SEC-1）。
+///
+/// CRI の `drop_capabilities` と CLI の `create --cap-drop` が共有する唯一の正規化。
+/// 件数は [`MAX_DROP_NAMES`] 以下。1 件でも不正なら全体を拒否する。
+pub fn parse_drop_list<S: AsRef<str>>(names: &[S]) -> Result<CapabilitySet, CapabilityDropError> {
+    if names.len() > MAX_DROP_NAMES {
+        return Err(CapabilityDropError);
+    }
+    let mut dropped = CapabilitySet::empty();
+    for name in names {
+        let one = parse_drop_name(name.as_ref())?;
+        dropped = CapabilitySet(dropped.0 | one.0);
+    }
+    Ok(dropped)
+}
+
+/// OCI 既定集合に無い capability を許可集合へ入れようとして拒否したことを表すエラー（SEC-1・#2666）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityNotAllowed {
+    rejected: Vec<Capability>,
+}
+
+impl CapabilityNotAllowed {
+    /// 拒否した（OCI 既定集合に無い）capability を番号順に返す。
+    pub fn rejected(&self) -> &[Capability] {
+        &self.rejected
+    }
+}
+
+impl std::fmt::Display for CapabilityNotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capabilities outside the OCI default set are not allowed:")?;
+        for c in &self.rejected {
+            write!(f, " {}", c.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CapabilityNotAllowed {}
+
+/// コンテナへ許可する capability 集合（SEC-1・CRI-2・#2666）。
+///
+/// 作る経路を [`ContainerCapabilities::oci_default`] と、OCI 既定集合の部分集合だけを受ける
+/// [`ContainerCapabilities::restrict`] に限る。これで「OCI 既定より広い許可集合」を型の上で
+/// 表現できず、設定から capability を足す経路が無い（drop だけを受ける）ことを保証する。
+/// `config.json` の解釈（`oci_runtime/config.rs`）が作り、launch の `CapabilityDrop` 段と
+/// launch 時の分離の記録（exec の再適用）が使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerCapabilities(CapabilitySet);
+
+impl ContainerCapabilities {
+    /// OCI 既定集合そのもの。
+    pub fn oci_default() -> Self {
+        Self(CapabilitySet::oci_default())
+    }
+
+    /// `set` が OCI 既定集合の部分集合なら許可集合にする。既定外を含めば、その capability を
+    /// 保持した [`CapabilityNotAllowed`] を返す（SEC-1・#2666）。
+    pub fn restrict(set: CapabilitySet) -> Result<Self, CapabilityNotAllowed> {
+        let default = CapabilitySet::oci_default();
+        if set.is_subset_of(default) {
+            Ok(Self(set))
+        } else {
+            Err(CapabilityNotAllowed {
+                rejected: set.iter().filter(|c| !default.contains(*c)).collect(),
+            })
+        }
+    }
+
+    /// 許可集合（bounding / permitted / effective に使う）。
+    pub fn bounding(self) -> CapabilitySet {
+        self.0
+    }
+
+    /// 含む capability を番号順に返す。
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        self.0.iter()
+    }
+
+    /// `drop` の要素を除いた許可集合を返す（SEC-1・CLI-1）。部分集合の部分集合なので失敗せず、
+    /// 許可集合を広げる経路にはならない（add の経路は作らない）。
+    #[must_use]
+    pub fn without(self, drop: CapabilitySet) -> Self {
+        Self(self.0.without(drop))
+    }
+
+    /// OCI 既定集合と等しいか。
+    pub fn is_default(self) -> bool {
+        self.0 == CapabilitySet::oci_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-2・SEC-1（#2789）: `exec/sysfs.rs` の rbind 最上位の ro を保つ前提（`CAP_SYS_ADMIN` が許可集合に無い）の固定。
+    /// 既定集合に無く、add の経路が無く、drop の後にも現れないことを具体値で照合する。
+    #[test]
+    fn sec2_sysfs_ro_premise_default_caps_lack_sys_admin() {
+        assert_eq!(Capability::SysAdmin.index(), 21);
+        let words = CapabilitySet::oci_default().to_cap_words();
+        assert_eq!(words, [0xA804_25FB, 0]);
+        assert_eq!(words[0] & (1 << 21), 0);
+
+        let default = ContainerCapabilities::oci_default();
+        assert!(!default.bounding().contains(Capability::SysAdmin));
+
+        let err = ContainerCapabilities::restrict(
+            CapabilitySet::oci_default().with(Capability::SysAdmin),
+        )
+        .unwrap_err();
+        assert_eq!(err.rejected(), &[Capability::SysAdmin]);
+
+        let dropped_all = default.without(parse_drop_list(&["ALL"]).unwrap());
+        let dropped_chown = default.without(parse_drop_list(&["CHOWN"]).unwrap());
+        for c in [dropped_all, dropped_chown] {
+            assert!(!c.bounding().contains(Capability::SysAdmin));
+        }
+    }
+
+    /// SEC-1: 名前の逆写像は `as_str` と往復し、接頭辞なし・小文字・未知名は `None`。
+    #[test]
+    fn sec1_from_name_round_trips() {
+        for cap in Capability::ALL {
+            assert_eq!(Capability::from_name(cap.as_str()), Some(cap));
+        }
+        for bad in [
+            "",
+            "CHOWN",
+            "cap_chown",
+            "CAP_NOPE",
+            "CAP_CHOWN ",
+            "CAP_CHOWN\0",
+        ] {
+            assert_eq!(Capability::from_name(bad), None, "{bad:?}");
+        }
+    }
+
+    /// SEC-1: 許可集合は既定の部分集合だけを作れる。
+    #[test]
+    fn sec1_container_capabilities_restrict_only_subsets() {
+        let sub =
+            CapabilitySet::oci_default().intersect(CapabilitySet::empty().with(Capability::Kill));
+        let c = ContainerCapabilities::restrict(sub).unwrap();
+        assert_eq!(c.iter().collect::<Vec<_>>(), vec![Capability::Kill]);
+        assert!(!c.is_default());
+        assert!(ContainerCapabilities::restrict(CapabilitySet::empty()).is_ok());
+        assert!(ContainerCapabilities::oci_default().is_default());
+        let wide = CapabilitySet::oci_default().with(Capability::SysAdmin);
+        assert!(ContainerCapabilities::restrict(wide).is_err());
+    }
+
+    /// CLI-1・CRI-2: drop 名の正規化（接頭辞・大文字小文字・ALL・拒否）。
+    #[test]
+    fn cli1_parse_drop_list_normalizes() {
+        let chown = CapabilitySet::empty().with(Capability::Chown);
+        for n in ["chown", "CAP_CHOWN", "Cap_Chown"] {
+            assert_eq!(parse_drop_list(&[n]).unwrap(), chown, "{n}");
+        }
+        assert_eq!(
+            parse_drop_list(&["ALL"]).unwrap(),
+            CapabilitySet::all_known()
+        );
+        assert_eq!(
+            parse_drop_list::<&str>(&[]).unwrap(),
+            CapabilitySet::empty()
+        );
+        let long = "A".repeat(33);
+        let too_many = vec!["chown"; MAX_DROP_NAMES + 1];
+        assert!(parse_drop_list(&["CAP_BOGUS"]).is_err());
+        assert!(parse_drop_list(&[""]).is_err());
+        assert!(parse_drop_list(&[long.as_str()]).is_err());
+        assert!(parse_drop_list(&["ｃｈｏｗｎ"]).is_err());
+        assert!(parse_drop_list(&too_many).is_err());
+        assert_eq!(
+            CapabilityDropError.to_string(),
+            "capability drop list is invalid"
+        );
+    }
+
+    /// SEC-1: drop は狭める方向だけ（既定外の drop は no-op、ALL は空）。
+    #[test]
+    fn sec1_container_capabilities_without_only_narrows() {
+        let d = ContainerCapabilities::oci_default();
+        let noop = d.without(parse_drop_list(&["CAP_SYS_ADMIN"]).unwrap());
+        assert!(noop.is_default());
+        let less = d.without(parse_drop_list(&["chown"]).unwrap());
+        assert_eq!(less.iter().count(), 13);
+        assert!(!less.bounding().contains(Capability::Chown));
+        let none = d.without(parse_drop_list(&["ALL"]).unwrap());
+        assert!(none.bounding().is_empty());
+    }
 
     /// SEC-1: 既定集合は Docker の root コンテナの `CapEff`（`a80425fb`）と一致する。
     #[test]

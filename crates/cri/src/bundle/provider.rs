@@ -26,20 +26,109 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::ContainerId;
 
-use super::spec::{ImageDefaults, build_runtime_config, validate_config};
-use crate::adapter::{BundleProvider, BundleRequest};
+use super::resolv_conf;
+use super::spec::{
+    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pods, validate_config_with_pods,
+};
+use crate::adapter::{BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget};
 use crate::error::CriError;
-use crate::runtime::v1::ImageSpec;
+use crate::runtime::v1::{ImageSpec, SupplementalGroupsPolicy};
+use crate::stop_signal::resolve_stop_signal;
+
+/// `RootfsSource::prepare` へ渡す、rootfs の passwd 等で解決してほしい User 関連の要求（#2664・CRI-2・SEC-5）。
+///
+/// `SpecBundleProvider::prepare` が CRI の設定から作る。解決の要求を足せるよう、裸の引数にせず構造体にしている
+/// （`supplemental_groups` のイメージ由来の解決は #2667）。外部から作るときは [`Self::none`] /
+/// [`Self::with_run_as_username`] / [`Self::with_run_as_user`] / [`Self::with_image_groups`]。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct UserResolveRequest<'a> {
+    /// CRI の `run_as_username`（未指定は `None`）。形式は `validate_config` が検証済みだが、実装側も再検証する。
+    pub run_as_username: Option<&'a str>,
+    /// CRI の `run_as_user`（未指定は `None`）。実効ユーザーの名前を passwd から引くために使う（#2667）。
+    pub run_as_user: Option<u32>,
+    /// 実効ユーザーのイメージの `/etc/group` での所属グループを求めてほしい（`supplemental_groups_policy` が
+    /// `Merge`。#2667）。真のとき実装は [`ImageDefaults::supplementary_gids`] を埋める。
+    pub image_groups: bool,
+}
+
+impl<'a> UserResolveRequest<'a> {
+    /// 解決要求なし。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// `run_as_username` の解決を要求する。
+    pub fn with_run_as_username(name: &'a str) -> Self {
+        Self {
+            run_as_username: Some(name),
+            ..Self::default()
+        }
+    }
+
+    /// CRI の `run_as_user` を伝える（#2667）。
+    pub fn with_run_as_user(mut self, uid: u32) -> Self {
+        self.run_as_user = Some(uid);
+        self
+    }
+
+    /// イメージ由来の補助グループの解決を要求する（#2667）。
+    pub fn with_image_groups(mut self) -> Self {
+        self.image_groups = true;
+        self
+    }
+}
 
 /// `rootfs/` の用意と解放の注入点（本番の実装は [`super::ImageRootfsSource`]。#2433）。
 ///
 /// 実装は rootfs の内容と digest を検証する責務を持つ。
 pub trait RootfsSource: Send + Sync {
     /// 存在しないパス `rootfs` を作成して `image` の内容で満たし、イメージ config 由来の既定値を返す。
-    fn prepare(&self, image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError>;
+    ///
+    /// `user.run_as_username` が `Some` なら rootfs の passwd で解決して
+    /// [`ImageDefaults::resolved_run_as_username`] を埋めるか `Err` を返す。対応しない実装は無視してよく、
+    /// その場合 `build_runtime_config` が `UNIMPLEMENTED` で拒否する（#2664）。
+    fn prepare(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+    ) -> Result<ImageDefaults, CriError>;
+
+    /// `prepare` に取り消しの旗を足した版（REPAIR-5・CRI-2・#2899）。`cancel` が立ったら、実装は分割できない区間の
+    /// 合間で止まり `Timeout` を返してよい。既定は旗を無視して `prepare` を呼ぶ（取り消しに対応しない実装向け）。
+    /// `Err` のとき rootfs を残さない契約は `prepare` と同じ。
+    fn prepare_cancellable(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<ImageDefaults, CriError> {
+        let _ = cancel;
+        self.prepare(image, rootfs, user)
+    }
 
     /// `prepare` で作った rootfs を解放する（不在は `Ok`）。
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
+
+    /// `release` に期限と取り消しを足した版（#3142・CRI-2・REPAIR-5）。既定は予算を無視して `release` を呼ぶ。
+    fn release_bounded(&self, rootfs: &Path, budget: &ReleaseBudget<'_>) -> Result<(), CriError> {
+        let _ = budget;
+        self.release(rootfs)
+    }
+}
+
+/// `SpecBundleProvider::list_bundle_ids` の結果（R8 #2937）。ID 以外は件数のみ。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct BundleListing {
+    /// サービス採番の形のディレクトリ名（昇順）。
+    pub ids: Vec<String>,
+    /// サービス採番の形でない名前（触らない）。
+    pub skipped_unrecognized: usize,
+    /// 採番の形だがディレクトリでない（symlink・通常ファイル等。触らない）。
+    pub skipped_not_dir: usize,
 }
 
 /// `<root>/<container_id>/{config.json,rootfs/}` を作る [`BundleProvider`]。
@@ -142,6 +231,51 @@ impl SpecBundleProvider {
         Ok(())
     }
 
+    /// bundle の置き場 `root` 直下の ID を列挙する（孤児 bundle の回収の候補作り。R8 #2937・OCI-7・CRI-1）。
+    ///
+    /// plugin-cri の `reclaim_orphan_bundles`（インスタンスロックの下）が呼ぶ。列挙の前に `verify_root` で
+    /// root の (dev, ino) を確かめ、各エントリは `symlink_metadata` だけで判定する（symlink は辿らない）。サービス採番の
+    /// ID（64 文字の小文字 16 進。`RecordId` と同じ形）でない名前は [`BundleListing::skipped_unrecognized`]、
+    /// ディレクトリでないもの（symlink・通常ファイル等）は [`BundleListing::skipped_not_dir`] に数え、どちらも
+    /// 触らない。走査数が `max_entries` を超えたら何も返さず `FAILED_PRECONDITION`（無制限確保の防止）。
+    /// ID は昇順。パス・OS のエラー文字列は文言に含めない（REPAIR-4）。
+    #[cfg(unix)]
+    pub fn list_bundle_ids(&self, max_entries: usize) -> Result<BundleListing, CriError> {
+        self.verify_root()?;
+        let entries = fs::read_dir(&self.root)
+            .map_err(|_| CriError::internal("failed to list bundle root"))?;
+        let mut listing = BundleListing::default();
+        for (scanned, entry) in entries.enumerate() {
+            if scanned >= max_entries {
+                return Err(CriError::failed_precondition(
+                    "bundle root has too many entries",
+                ));
+            }
+            let entry = entry.map_err(|_| CriError::internal("failed to list bundle root"))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                listing.skipped_unrecognized += 1;
+                continue;
+            };
+            if crate::runtime_service::RecordId::new(name).is_err() {
+                listing.skipped_unrecognized += 1;
+                continue;
+            }
+            let is_dir = fs::symlink_metadata(entry.path())
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                listing.ids.push(name.to_owned());
+            } else {
+                listing.skipped_not_dir += 1;
+            }
+        }
+        // 列挙の途中で root が差し替わっていないことを再確認する。
+        self.verify_root()?;
+        listing.ids.sort();
+        Ok(listing)
+    }
+
     fn lock_refused(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
         self.refused.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -226,31 +360,52 @@ fn create_private_dir(path: &Path) -> Result<(), CriError> {
     })
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), CriError> {
+/// 既存・symlink を辿らず排他作成して書く。失敗の文言は固定（`what` はファイル名）。
+fn write_new_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    what: &'static str,
+) -> Result<(), CriError> {
     let mut o = fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
+        o.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut f = o
         .open(path)
-        .map_err(|_| CriError::internal("failed to create config.json"))?;
+        .map_err(|_| CriError::internal(format!("failed to create {what}")))?;
+    // open 時の mode は umask で削られる（umask 077 だと 0644 が 0600 になる）。排他作成した自分のハンドルに
+    // 対して明示的に設定し直す（プロセス全体の umask は変えない）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|_| CriError::internal(format!("failed to set permissions of {what}")))?;
+    }
     f.write_all(bytes)
         .and_then(|()| f.sync_all())
-        .map_err(|_| CriError::internal("failed to write config.json"))
+        .map_err(|_| CriError::internal(format!("failed to write {what}")))
 }
 
 impl BundleProvider for SpecBundleProvider {
-    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PreparedBundle, CriError> {
         let dir = self.bundle_dir(req.container_id)?;
         // 事前検証の失敗でも、同 ID の既存実体はこの provider が作っていない。直後の release（呼び出し元の
         // 巻き戻し）で消さないよう、bundle を作成できるまで ID を拒否扱いにしておく。
         self.lock_refused().insert(req.container_id.to_owned());
         self.verify_root()?;
         // ファイルシステムに触れる前に、設定だけで判定できる拒否を済ませる。
-        validate_config(req.sandbox_config, req.config)?;
+        validate_config_with_pods(
+            req.sandbox_config,
+            req.config,
+            req.pod_namespaces,
+            req.pod_netns_path.and_then(|p| p.to_str()),
+        )?;
         let image = req
             .config
             .image
@@ -262,23 +417,105 @@ impl BundleProvider for SpecBundleProvider {
         create_private_dir(&dir)?;
         self.lock_refused().remove(req.container_id);
         let rootfs = dir.join("rootfs");
-        let built = (|| {
-            let defaults = self.rootfs.prepare(image, &rootfs)?;
-            let json = build_runtime_config(req.sandbox_config, req.config, &defaults)?;
-            write_new_file(&dir.join("config.json"), json.as_bytes())
+        let username = req
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map(|s| s.run_as_username.as_str())
+            .filter(|n| !n.is_empty());
+        let sc = req
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref());
+        // `validate_config` が値の範囲と方針を検証済みなので、ここでの変換失敗は「要求なし」に倒す。
+        let run_as_user = sc
+            .and_then(|s| s.run_as_user.as_ref())
+            .and_then(|v| u32::try_from(v.value).ok());
+        let merge = sc
+            .is_none_or(|s| s.supplemental_groups_policy == SupplementalGroupsPolicy::Merge as i32);
+        let user = UserResolveRequest {
+            run_as_username: username,
+            run_as_user,
+            image_groups: merge,
+        };
+        let built = (|| -> Result<_, CriError> {
+            let defaults = self
+                .rootfs
+                .prepare_cancellable(image, &rootfs, &user, req.cancel)?;
+            // dns_config: 検証済みの resolv.conf を bundle に書き、そのパスを config.json の bind の source にする。
+            // mode は 0644（mount の root がファイル自身になり bundle の 0700 が効かないため、写像された
+            // 非 root の uid で動く process が読めるようにする。DNS 設定だけで秘密値は含まない）。
+            let resolv = req
+                .sandbox_config
+                .dns_config
+                .as_ref()
+                .map(resolv_conf::render)
+                .transpose()?
+                .flatten();
+            let resolv_path = dir.join("resolv.conf");
+            let files = match &resolv {
+                Some(r) => {
+                    write_new_file(&resolv_path, r.as_bytes(), 0o644, "resolv.conf")?;
+                    let p = resolv_path
+                        .to_str()
+                        .ok_or_else(|| CriError::internal("bundle path is not valid UTF-8"))?;
+                    BundleFiles::with_resolv_conf(p)
+                }
+                None => BundleFiles::none(),
+            };
+            let json = build_runtime_config_with_files_and_pods(
+                req.sandbox_config,
+                req.config,
+                &defaults,
+                &files,
+                req.pod_namespaces,
+                req.pod_netns_path.and_then(|p| p.to_str()),
+            )?;
+            write_new_file(
+                &dir.join("config.json"),
+                json.as_bytes(),
+                0o600,
+                "config.json",
+            )?;
+            // CRI が RUNTIME_DEFAULT のときだけイメージの StopSignal を使う（#2771・CRI-2・OCI-1）。
+            let stop = resolve_stop_signal(req.config.stop_signal, defaults.stop_signal)?;
+            Ok((
+                json.process_user().clone(),
+                stop,
+                defaults.resolved_image.clone(),
+            ))
         })();
-        if let Err(e) = built {
-            // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
-            // 順序: rootfs 解放 → bundle 削除）、再試行は呼び出し元の release が担う。元のエラーを返す。
-            if self.rootfs.release(&rootfs).is_ok() {
-                let _ = fs::remove_dir_all(&dir);
+        let (applied, stop, image) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ
+                // 順序: rootfs 解放 → bundle 削除）、再試行は呼び出し元の release が担う。元のエラーを返す。
+                if self.rootfs.release(&rootfs).is_ok() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        Ok(dir)
+        };
+        let prepared = PreparedBundle::new(dir)
+            .with_user(applied)
+            .with_stop_signal(stop);
+        Ok(match image {
+            Some(image) => prepared.with_image(image),
+            None => prepared,
+        })
     }
 
     fn release(&self, container_id: &str) -> Result<(), CriError> {
+        self.release_bounded(container_id, &ReleaseBudget::new())
+    }
+
+    fn release_bounded(
+        &self,
+        container_id: &str,
+        budget: &ReleaseBudget<'_>,
+    ) -> Result<(), CriError> {
         let dir = self.bundle_dir(container_id)?;
         // この provider が作っていない実体（prepare が既存を理由に拒否した ID）は消さない。
         if self.lock_refused().remove(container_id) {
@@ -294,7 +531,9 @@ impl BundleProvider for SpecBundleProvider {
         if !meta.file_type().is_dir() {
             return Err(CriError::internal("bundle path is not a directory"));
         }
-        self.rootfs.release(&dir.join("rootfs"))?;
+        budget.check()?;
+        self.rootfs.release_bounded(&dir.join("rootfs"), budget)?;
+        // rootfs を消した後の bundle 直下は小さなファイル（config.json 等）だけで、分割しない。
         fs::remove_dir_all(&dir).map_err(|_| CriError::internal("failed to remove bundle"))
     }
 }

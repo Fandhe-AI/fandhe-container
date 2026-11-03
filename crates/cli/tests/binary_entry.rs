@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|exec|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -277,6 +277,19 @@ fn cli1_list_logs_usage_errors() {
     }
 }
 
+/// CLI-1・SUP-11(#1903): state は ID をちょうど 1 つ受け、過不足・未知オプションは使い方エラー（2）。stdout は空。
+#[test]
+fn cli1_state_usage_errors() {
+    for a in [
+        &["state"][..],
+        &["state", "a", "b"],
+        &["state", "--bogus", "a"],
+        &["state", "--json", "a"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
 /// CLI-1: create / start は引数不足・未知オプションで使い方エラー（2）。
 #[test]
 fn cli1_create_start_usage_errors() {
@@ -285,6 +298,17 @@ fn cli1_create_start_usage_errors() {
         &["create", "c1"],
         &["create", "--bundle", "/b"],
         &["create", "--bundle", "/b", "--x", "c1"],
+        // `--read-only` は値を取らず 1 回まで(CLI-1・SUP-12・#2828)。
+        &[
+            "create",
+            "--read-only",
+            "--read-only",
+            "--bundle",
+            "/b",
+            "c1",
+        ],
+        &["create", "--read-only=true", "--bundle", "/b", "c1"],
+        &["create", "--read-only", "true", "--bundle", "/b", "c1"],
         &["start"],
         &["start", "a", "b"],
         &["--root"],
@@ -293,13 +317,17 @@ fn cli1_create_start_usage_errors() {
     }
 }
 
-/// CLI-1: stop / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
+/// CLI-1: stop / kill / delete は引数の過不足・未知オプション・`--force` 重複で使い方エラー（2）。
 #[test]
 fn cli1_stop_delete_usage_errors() {
     for a in [
         &["stop"][..],
         &["stop", "a", "b"],
         &["stop", "--force", "c1"],
+        &["kill"],
+        &["kill", "a", "b", "c"],
+        &["kill", "--x", "c1"],
+        &["kill", "-9", "c1"],
         &["delete"],
         &["delete", "--x", "c1"],
         &["delete", "--force", "--force", "c1"],
@@ -368,6 +396,28 @@ fn cli1_exec_rejections_on_linux() {
     assert!(line.starts_with("{\"code\":\"INVALID_ARGUMENT\""), "{line}");
 }
 
+/// CLI-1・NET-6（#3066）: network は引数の過不足・未知のサブコマンド・未知オプションで使い方エラー（2）。
+/// グローバルの `--pasta-path` は create 以外では使い方エラーのまま。
+#[test]
+fn cli1_net6_network_usage_errors() {
+    for a in [
+        &["network"][..],
+        &["network", "bogus"],
+        &["network", "create"],
+        &["network", "create", "a", "b"],
+        &["network", "create", "--x", "a"],
+        &["network", "rm"],
+        &["network", "ls", "x"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+    // create 以外へのグローバル `--pasta-path` は別の固定文言で使い方エラー（既存の規則）。
+    assert_eq!(
+        run(&["--pasta-path", "/x", "network", "ls"]).status.code(),
+        Some(2)
+    );
+}
+
 /// `parent` 配下に一意名のディレクトリを排他的に作る（既存パスは削除も採用もしない）。
 ///
 /// 共有 /tmp 上の推測可能な固定名を削除・再利用すると、競合で置かれた symlink を root が辿りうる。
@@ -396,12 +446,26 @@ fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
     panic!("could not exclusively create a dir for {prefix}");
 }
 
-/// 一意な一時ディレクトリ（Drop で削除）。
-struct TmpDir(std::path::PathBuf);
+// 一時領域の親を tmpfiles の flock 走査から守る共有部品（#3026・CORE-5・REPAIR-12）。
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+// kill 後の回収を期限つきにする共有補助（#3303・REPAIR-5）。
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
+
+/// 一意な一時ディレクトリ（Drop で削除）。第 2 フィールドは tmpfiles の flock 走査から守る親で、
+/// 最後のフィールドのため `Drop` の削除の後に消える（#3026）。
+struct TmpDir(
+    std::path::PathBuf,
+    #[allow(dead_code)] scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
-        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        let scratch =
+            scratch_root::ScratchDir::new("fc-cli-bin", std::time::Duration::from_secs(10));
+        let tmp = scratch.path().to_path_buf();
         let p = exclusive_dir(&tmp, &format!("fc-cli-bin-{tag}"));
         // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
         #[cfg(unix)]
@@ -409,7 +473,7 @@ impl TmpDir {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         }
-        Self(p)
+        Self(p, scratch)
     }
 }
 
@@ -736,6 +800,48 @@ fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// SEC-4・CORE-5・ERR-1・SUP-1・CLI-1（#2716）: launch の `R` の後の `execveat` の失敗は、supervisor が errno の分類
+/// （NOT_FOUND / PERMISSION_DENIED / INVALID_ARGUMENT）つきの固定文言の `ERR` として報告し、CLI はその終了コード
+/// （3 / 6 / 2）と構造化エラーの `op`・`code`・`message` で表示する。stdout は空で、状態は書かず created のまま。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_2716_start_exec_stage_failure_is_shown_with_code_and_fixed_message() {
+    let tmp = TmpDir::new("sup2716");
+    let dir = isolated_cli_dir("sup2716");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    let scope = FakeScope::new(&dir, &tmp);
+
+    for (code, exit) in [
+        ("NOT_FOUND", 3),
+        ("PERMISSION_DENIED", 6),
+        ("INVALID_ARGUMENT", 2),
+    ] {
+        install_fake_supervisor(
+            &dir,
+            &format!(
+                "printf 'FCSUP1 ERR {code} {exit} container launch failed in the Exec stage\\n'"
+            ),
+        );
+        let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+        assert_eq!(out.status.code(), Some(exit), "{code}");
+        assert_eq!(op_and_code(&out), ("start".into(), code.into()));
+        assert!(out.stdout.is_empty(), "{code}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("\"message\":\"container launch failed in the Exec stage\""),
+            "{stderr}"
+        );
+    }
+
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` -> 配置先の CLI）を作る。
 /// symlink の置き場所 `bin_dir` は呼び出し側が用意する。
 #[cfg(target_os = "linux")]
@@ -995,7 +1101,11 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
 
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    let out = run(&["--root", root_s, "kill", "nope"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("kill".into(), "NOT_FOUND".into()));
+
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root_s, cmd, "a/b"]);
         assert_eq!(out.status.code(), Some(2));
         assert_eq!(op_and_code(&out), (op.into(), "INVALID_ARGUMENT".into()));
@@ -1009,6 +1119,26 @@ fn cli1_stop_delete_flow_on_linux() {
     assert_eq!(
         op_and_code(&out),
         ("kill".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(root.join("c1").join("state.json").exists());
+
+    // kill: Created（pid なし）は 5。不正なシグナルは状態を触る前に 2（固定文言）。
+    for argv in [
+        &["--root", root_s, "kill", "c1"][..],
+        &["--root", root_s, "kill", "c1", "KILL"],
+    ] {
+        let out = run(argv);
+        assert_eq!(out.status.code(), Some(5), "{argv:?}");
+        assert_eq!(
+            op_and_code(&out),
+            ("kill".into(), "FAILED_PRECONDITION".into())
+        );
+    }
+    let out = run(&["--root", root_s, "kill", "c1", "BOGUS"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"op\":\"kill\",\"code\":\"INVALID_ARGUMENT\",\"message\":\"signal is invalid\"}\n"
     );
     assert!(root.join("c1").join("state.json").exists());
 
@@ -1213,7 +1343,7 @@ fn sup7_delete_warns_when_container_log_is_locked() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
+        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"reason\":\"sink_open_after_wait\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
     );
     assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
     let listed = run(&["--root", root_s, "list"]);
@@ -1382,13 +1512,33 @@ fn sec1_create_fails_closed_off_linux() {
 fn sec1_stop_delete_fail_closed_off_linux() {
     let tmp = TmpDir::new("offlinux-sd");
     let root = tmp.0.join("state");
-    for (cmd, op) in [("stop", "kill"), ("delete", "delete")] {
+    for (cmd, op) in [("stop", "kill"), ("kill", "kill"), ("delete", "delete")] {
         let out = run(&["--root", root.to_str().expect("utf8"), cmd, "c1"]);
         assert_eq!(out.status.code(), Some(5));
         assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
     assert_state_root_after_fail_closed(&root);
+}
+
+/// CLI-1・#1902: 不正なシグナルは OS を問わず状態ルートを開く前に INVALID_ARGUMENT（2）で拒否される。
+#[test]
+fn cli1_kill_invalid_signal_is_rejected_on_every_os() {
+    let tmp = TmpDir::new("killbadsig");
+    let root = tmp.0.join("state");
+    let out = run(&[
+        "--root",
+        root.to_str().expect("utf8"),
+        "kill",
+        "c1",
+        "BOGUS",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        op_and_code(&out),
+        ("kill".into(), "INVALID_ARGUMENT".into())
+    );
+    assert!(!root.exists(), "the state root must not be created");
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
@@ -1621,8 +1771,7 @@ impl FollowChild {
 #[cfg(target_os = "linux")]
 impl Drop for FollowChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        reap::reap_on_drop(&mut self.child);
     }
 }
 
@@ -1815,9 +1964,26 @@ fn plug11_path_search_is_off_by_default_off_linux() {
     assert!(out.stdout.is_empty());
 }
 
+/// 非 Linux で PATH 由来の候補が採用されないときの終了コードと最終行（#1867）。macOS は信頼性検証の拒否
+/// （PERMISSION_DENIED = 6）、Windows はホストが検証しない（UNIMPLEMENTED = 8）。拒否の理由は照合しない。
+#[cfg(not(target_os = "linux"))]
+fn path_search_rejection() -> (i32, &'static str) {
+    if cfg!(target_os = "macos") {
+        (
+            6,
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}",
+        )
+    } else {
+        (
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}",
+        )
+    }
+}
+
 /// PLUG-11・CLI-1・REPAIR-12: `--plugin-path-search` で opt-in すると候補ごとに警告が stderr へ出る
-/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、信頼性検証の未実装で拒否される
-/// （UNIMPLEMENTED = 8）。
+/// （macOS / Windows の 2 候補で 2 行）。名前一致だけでは採用されず、macOS は信頼性検証の拒否（6）、
+/// Windows はホストが検証しないため 8 で拒否される。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn plug11_path_search_flag_warns_and_rejects_off_linux() {
@@ -1832,15 +1998,13 @@ fn plug11_path_search_flag_warns_and_rejects_off_linux() {
         ],
         &[("PATH", tmp.0.as_os_str())],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let last = stderr.lines().last().expect("last line");
     // 「未導入」（FAILED_PRECONDITION）とは別の識別子で、パス・plugin 名を含まない（C1）。
-    assert_eq!(
-        last,
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(last, want_line);
     assert!(out.stdout.is_empty());
 }
 
@@ -1860,13 +2024,11 @@ fn plug11_path_search_env_warns_and_rejects_off_linux() {
             ),
         ],
     );
-    assert_eq!(out.status.code(), Some(8));
+    let (want_exit, want_line) = path_search_rejection();
+    assert_eq!(out.status.code(), Some(want_exit));
     assert_eq!(path_warning_lines(&out), 2);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(
-        stderr.lines().last().expect("last line"),
-        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}"
-    );
+    assert_eq!(stderr.lines().last().expect("last line"), want_line);
     assert!(out.stdout.is_empty());
 }
 
@@ -2857,10 +3019,14 @@ fn oci7_create_with_tag_ref_resolves_persisted_tag_on_linux() {
     assert_eq!(refs.containers.len(), 1);
     assert!(refs.containers[0].as_str().ends_with(".c1"));
 }
-/// 隣に置いた偽ランチャーで `doctor` を実行し、`check":"launcher"` の行と終了コードを返す。
+/// 隣に置いた偽ランチャーで `doctor` を実行し、`check":"launcher"` の行・終了コード・配置先ディレクトリ
+/// （正規化済み。マウント属性から期待値を選ぶ試験が使う）を返す。
 /// 一意のディレクトリ名（タグ）が出力に載らないことも照合する（REPAIR-4）。root では検査を省くため `None`。
 #[cfg(target_os = "linux")]
-fn doctor_launcher_line(tag: &str, launcher_mode: Option<&str>) -> Option<(Option<String>, i32)> {
+fn doctor_launcher_line(
+    tag: &str,
+    launcher_mode: Option<&str>,
+) -> Option<(Option<String>, i32, std::path::PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
         return None;
@@ -2884,14 +3050,15 @@ fn doctor_launcher_line(tag: &str, launcher_mode: Option<&str>) -> Option<(Optio
         .lines()
         .find(|l| l.contains("\"check\":\"launcher\""))
         .map(str::to_owned);
-    Some((line, out.status.code().expect("code")))
+    let real = dir.canonicalize().expect("canonicalize");
+    Some((line, out.status.code().expect("code"), real))
 }
 
 /// SUP-14・CORE-6・CLI-1（#2599）: 隣にランチャーが無い rootless のインストールは通知の 1 行。
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_absent_launcher() {
-    let Some((line, _)) = doctor_launcher_line("doctor-launcher-absent", None) else {
+    let Some((line, _, _)) = doctor_launcher_line("doctor-launcher-absent", None) else {
         return;
     };
     assert_eq!(
@@ -2904,7 +3071,8 @@ fn sup14_doctor_reports_absent_launcher() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_untrusted_launcher() {
-    let Some((line, code)) = doctor_launcher_line("doctor-launcher-untrusted", Some("775")) else {
+    let Some((line, code, _)) = doctor_launcher_line("doctor-launcher-untrusted", Some("775"))
+    else {
         return;
     };
     let line = line.expect("launcher line");
@@ -2921,24 +3089,1067 @@ fn sup14_doctor_reports_untrusted_launcher() {
     assert_eq!(code, 3);
 }
 
-/// SUP-14・CORE-6・CLI-1（#2599）: 信頼できるが file capability も setuid root も無いランチャーは warning・終了コード 3
+/// SUP-14・CORE-6・CLI-1（#2599・#2661）: 信頼できるが file capability も setuid root も無いランチャーは warning・終了コード 3
 /// （非 root では file capability を付けられないため、昇格手段なしの経路を実ファイルで照合する）。
+/// 配置先が `nosuid` のマウント上なら、昇格手段の判定より先に効かない理由として `nosuid_mount` になる（#2661）。
+/// 期待する message と state は、配置先のマウント属性を試験側で独立に求めて選ぶ（`test_side_is_nosuid`）。
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_launcher_without_elevation() {
-    let Some((line, code)) = doctor_launcher_line("doctor-launcher-noelev", Some("755")) else {
+    let Some((line, code, real)) = doctor_launcher_line("doctor-launcher-noelev", Some("755"))
+    else {
         return;
     };
     let line = line.expect("launcher line");
+    let (message, state) = if test_side_is_nosuid(&real) {
+        (
+            "the privileged launcher is on a filesystem mounted nosuid; setuid and file capabilities have no effect there and start cannot elevate",
+            "nosuid_mount",
+        )
+    } else {
+        (
+            "the privileged launcher has neither file capabilities nor the setuid root bit; start cannot elevate",
+            "no_file_capabilities",
+        )
+    };
     assert!(
-        line.starts_with(
-            "{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"the privileged launcher has neither file capabilities nor the setuid root bit; start cannot elevate\","
-        ),
-        "{line}"
+        line.starts_with(&format!(
+            "{{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"{message}\","
+        )),
+        "expected {state}: {line}"
     );
     assert!(
-        line.ends_with("\"check\":\"launcher\",\"state\":\"no_file_capabilities\"}"),
-        "{line}"
+        line.ends_with(&format!("\"check\":\"launcher\",\"state\":\"{state}\"}}")),
+        "expected {state}: {line}"
     );
     assert_eq!(code, 3);
+}
+
+/// `/proc/self/mountinfo` を試験側で独立に解析し、`path` を含む最長一致のマウント（同長は後の行）が
+/// `nosuid` かを返す。製品側（実体の fd の mount ID で mountinfo の行を引く `mount_option_by_id`）と別の方法で
+/// 期待値を決める。ここはパスの最長一致で選ぶため、試験の一時ディレクトリの祖先に後から重ねたマウント
+/// （古い子マウントを隠すもの）が無い前提で両者は一致する（ID で引くこと自体は net の単体試験
+/// `sup14_mount_option_by_id` が照合する）。
+#[cfg(target_os = "linux")]
+fn test_side_is_nosuid(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let info = std::fs::read("/proc/self/mountinfo").expect("mountinfo");
+    let target = path.as_os_str().as_bytes();
+    let mut best: Option<(usize, bool)> = None;
+    for line in info.split(|b| *b == b'\n') {
+        let f: Vec<&[u8]> = line
+            .split(|b| *b == b' ')
+            .filter(|x| !x.is_empty())
+            .collect();
+        let (Some(mp), Some(opts)) = (f.get(4), f.get(5)) else {
+            continue;
+        };
+        // 8 進エスケープは空白（\040）だけ戻せば試験の一時パスには足りる。
+        let mp: Vec<u8> = String::from_utf8_lossy(mp)
+            .replace("\\040", " ")
+            .into_bytes();
+        let covers = target == mp.as_slice()
+            || mp == b"/"
+            || (target.starts_with(&mp) && target.get(mp.len()) == Some(&b'/'));
+        if covers && best.is_none_or(|(l, _)| mp.len() >= l) {
+            best = Some((mp.len(), opts.split(|b| *b == b',').any(|t| t == b"nosuid")));
+        }
+    }
+    best.expect("covering mount").1
+}
+
+/// SUP-14・CORE-6（#2661）: 実バイナリの `doctor` が、兄弟のランチャー（file capability も setuid も持たない
+/// 信頼できる実行ファイル）の載るマウントの `nosuid` 属性を診断に反映する。`collect` の実体パス解決・実体の fd の
+/// mount ID の取得・mountinfo 読み取り・評価・JSON 出力・終了コードをつなぐ経路を観測する。期待値は試験側で独立に求める。nosuid ならば `nosuid_mount`、
+/// そうでなければ `no_file_capabilities`（どちらも warning・終了コード 3）。mountinfo を読めない場合の
+/// `mount_unreadable` は、実バイナリから /proc を差し替えられないため `launcher_check` の単体試験で照合する。
+/// nosuid マウントの人工的な構築（root・mount 権限が要る）はこの試験では行わない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_launcher_mount_state() {
+    if is_root() {
+        return; // root では検査を省く（`doctor_reports_unset_xdg_runtime_dir` が通知を照合する）。
+    }
+    let dir = isolated_cli_dir("doctor-mount");
+    install_fake_exe(&dir, "fandhe-container-launcher", "#!/bin/sh\nexit 0\n");
+    let real = dir.canonicalize().expect("canonicalize");
+    let expect_nosuid = test_side_is_nosuid(&real);
+    let out = run_isolated(&dir.join("fandhe-container"), &["doctor"]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"check\":\"launcher\""))
+        .unwrap_or_else(|| panic!("no launcher line: {stdout}"));
+    assert!(
+        line.starts_with("{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\""),
+        "{line}"
+    );
+    let state = if expect_nosuid {
+        "nosuid_mount"
+    } else {
+        "no_file_capabilities"
+    };
+    assert!(
+        line.ends_with(&format!("\"check\":\"launcher\",\"state\":\"{state}\"}}")),
+        "expected {state}: {line}"
+    );
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `c1` の状態記録へ、create が残すイメージストア root の記録（予約 annotations）を足す。
+/// イメージつきの create は取得済みイメージを要するため、記録だけを状態に直接書いて delete 側を実バイナリで確かめる。
+#[cfg(target_os = "linux")]
+fn record_image_root(state_root: &std::path::Path, image_root: &std::path::Path) {
+    let path = state_root.join("c1").join("state.json");
+    let text = std::fs::read_to_string(&path).expect("read state");
+    let entry = format!(
+        "\"io.fandhe.container.image-root\":\"{}\"",
+        image_root.to_str().expect("utf8")
+    );
+    // Linux の create は既定の `network none` の文書に伴う作成世代の注釈を残す(#1873)ため、
+    // `annotations` が既にあれば先頭へ足し、無ければ新設する(キーの重複は状態ファイルの破損になる)。
+    let patched = if let Some(at) = text.find("\"annotations\":{") {
+        let open = at + "\"annotations\":{".len();
+        let sep = if text[open..].starts_with('}') {
+            ""
+        } else {
+            ","
+        };
+        format!("{}{entry}{sep}{}", &text[..open], &text[open..])
+    } else {
+        let body = text.strip_prefix('{').expect("json object");
+        format!("{{\"annotations\":{{{entry}}},{body}")
+    };
+    std::fs::write(&path, patched).expect("write state");
+}
+
+/// 0700 の空のイメージストア root を作り、正規パスを返す。
+#[cfg(target_os = "linux")]
+fn empty_image_root(tmp: &TmpDir, name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp.0.join(name);
+    std::fs::create_dir(&root).expect("mkdir image root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    std::fs::canonicalize(&root).expect("canonical")
+}
+
+/// OCI-7・OCI-5・CLI-1（#2499）: 状態記録のストア root が開ければ、`--image-root` を省いた delete は成功して状態を消す。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_uses_recorded_image_root_on_linux() {
+    let tmp = TmpDir::new("del-rec");
+    let dir = isolated_cli_dir("del-rec");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(&cli, &["--root", &root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stderr.is_empty(), "stderr must be empty");
+    assert!(!root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// OCI-7・CLI-1（#2499）: 記録の root と同じ `--image-root` を渡した delete も成功する。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_with_matching_image_root_succeeds_on_linux() {
+    let tmp = TmpDir::new("del-same");
+    let dir = isolated_cli_dir("del-same");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "delete",
+            "--image-root",
+            images.to_str().expect("utf8"),
+            "c1",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(!root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// OCI-7・CLI-1（#2499）: 記録と異なる `--image-root` は FAILED_PRECONDITION（5）で拒否し、状態を消さない。
+/// 記録の root を開けない delete も状態を消さずに失敗する。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_2499_delete_rejects_mismatched_or_unopenable_image_root_on_linux() {
+    let tmp = TmpDir::new("del-mis");
+    let dir = isolated_cli_dir("del-mis");
+    let cli = dir.join("fandhe-container");
+    let (root, root_s) = prepare_c1(&tmp, &cli);
+    let images = empty_image_root(&tmp, "images");
+    let other = empty_image_root(&tmp, "other");
+    record_image_root(&root, &images);
+
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "delete",
+            "--image-root",
+            other.to_str().expect("utf8"),
+            "c1",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(5), "{:?}", out.stderr);
+    assert_eq!(
+        op_and_code(&out),
+        ("delete".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(out.stdout.is_empty());
+    assert!(root.join("c1").join("state.json").exists());
+
+    // 記録の root が消えている場合も、状態を残して失敗する。
+    std::fs::remove_dir(&images).expect("rm image root");
+    let out = run_isolated(&cli, &["--root", &root_s, "delete", "c1"]);
+    assert_ne!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(root.join("c1").join("state.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// SEC-4・CLI-1・ERR-1（#2761）: `start --audit-policy` の不正な値は INVALID_ARGUMENT（2）で拒否され、入力値は文言に入らず、
+/// 状態ルートは作られない。値の欠落は使い方エラー。正しい値で存在しない ID を渡せば従来どおり NOT_FOUND（3）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_cli1_start_rejects_invalid_audit_policy() {
+    let tmp = TmpDir::new("auditpol");
+    let dir = isolated_cli_dir("auditpol");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(
+        &cli,
+        &["--root", root_s, "start", "--audit-policy", "Strict", "c1"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        code_json(
+            "start",
+            "INVALID_ARGUMENT",
+            "the audit policy must be best-effort or strict"
+        )
+    );
+    assert!(!root.exists(), "state root must not be created");
+
+    assert_failure(
+        &run_isolated(&cli, &["--root", root_s, "start", "--audit-policy"]),
+        2,
+        USAGE_JSON,
+    );
+
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    let out = run_isolated(
+        &cli,
+        &[
+            "--root",
+            &root_s,
+            "start",
+            "--audit-policy",
+            "best-effort",
+            "nope",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("start".into(), "NOT_FOUND".into()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SEC-4・SUP-1・CLI-1（#2761）: `start --audit-policy strict` は supervisor の argv に `--root <root>` の直後、ID の前として
+/// 渡る。未指定のときは載らない（supervisor の既定が効く）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_start_passes_audit_policy_to_supervisor_argv() {
+    let tmp = TmpDir::new("auditargv");
+    let dir = isolated_cli_dir("auditargv");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, &observing_body("supervisor"));
+    let scope = FakeScope::new(&dir, &tmp);
+    let sup = dir.join("fandhe-container-supervisor");
+    let sup = sup.to_str().expect("utf8");
+
+    let out = scope.run(
+        &cli,
+        &["--root", &root_s, "start", "--audit-policy", "strict", "c1"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        lines[6..],
+        [
+            sup,
+            "start",
+            "--root",
+            &root_s,
+            "--audit-policy",
+            "strict",
+            "c1"
+        ],
+        "{argv}"
+    );
+
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        lines[6..],
+        [sup, "start", "--root", &root_s, "c1"],
+        "{argv}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// CORE-5・SEC-4・CLI-1（#2761）: 実バイナリの `doctor` は Landlock ABI の行をちょうど 1 行出し、`start` に要る下限（6）と
+/// 監査の下限（7）を数値で示す。`state` は固定語彙のどれか（実カーネルの結果は環境で変わるため語彙で照合する）。
+#[cfg(target_os = "linux")]
+#[test]
+fn core5_doctor_reports_landlock_line() {
+    let out = run_env(&["doctor"], &[]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("\"check\":\"landlock\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let line = lines[0];
+    assert!(
+        line.ends_with(",\"required\":6,\"audit_required\":7}"),
+        "{line}"
+    );
+    let states = [
+        "supported",
+        "audit_abi_too_old",
+        "abi_too_old",
+        "kernel_lacks_landlock",
+        "disabled_at_boot",
+        "unsupported_architecture",
+        "invalid_kernel_response",
+        "probe_failed",
+    ];
+    assert!(
+        states
+            .iter()
+            .any(|s| line.contains(&format!("\"state\":\"{s}\",\"abi\":"))),
+        "{line}"
+    );
+}
+/// `--pasta-path` / `--pasta-path-search` の拒否の分類を実バイナリで照合する（NET-9・CLI-1・PLUG-11・#3199）。
+///
+/// 結果の stderr の 1 行 JSON から `code` と `message` を取り出し、状態ルートが作られていないことも確かめる。
+mod pasta_flags {
+    use super::*;
+
+    const NOT_CREATE: &str =
+        "--pasta-path and --pasta-path-search apply only to the create command";
+    const NOT_APPLICABLE: &str = "--pasta-path and --pasta-path-search apply only to a user-defined network on a rootless install";
+
+    fn assert_rejected(out: &Output, code: &str, message: &str) {
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            err.contains(&format!("\"code\":\"{code}\"")),
+            "unexpected stderr: {err}"
+        );
+        assert!(
+            err.contains(&format!("\"message\":\"{message}\"")),
+            "unexpected stderr: {err}"
+        );
+        assert!(out.stdout.is_empty(), "stdout must be empty");
+    }
+
+    /// create 以外のサブコマンドに pasta のフラグがあれば、専用の文言で `INVALID_ARGUMENT`（終了コード 2）。
+    #[test]
+    fn net9_cli1_pasta_flags_rejected_outside_create() {
+        for args in [
+            &["--pasta-path", "/usr/bin/pasta", "list"][..],
+            &["--pasta-path-search", "setup"],
+            &["--pasta-path-search", "doctor"],
+            &[
+                "--root",
+                "/x",
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "start",
+                "c1",
+            ],
+        ] {
+            let out = run(args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert_rejected(&out, "INVALID_ARGUMENT", NOT_CREATE);
+        }
+    }
+
+    /// 重複・併用・値の欠落は使い方エラー。
+    #[test]
+    fn net9_cli1_pasta_flags_usage_errors() {
+        for args in [
+            &["--pasta-path", "/a", "--pasta-path-search", "list"][..],
+            &["--pasta-path-search", "--pasta-path-search", "list"],
+            &["--pasta-path", "/a", "--pasta-path", "/b", "list"],
+            &["--pasta-path"],
+        ] {
+            let out = run(args);
+            assert_failure(&out, 2, USAGE_JSON);
+        }
+    }
+
+    /// ユーザー定義名でない create に pasta のフラグがあれば `INVALID_ARGUMENT`。状態ルートは作らない。
+    #[test]
+    fn net9_cli1_pasta_flag_with_non_user_defined_network_is_rejected() {
+        let tmp = TmpDir::new("pasta-none");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        for network in [&["--network", "none"][..], &["--network", "host"], &[]] {
+            let mut args = vec![
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+            ];
+            args.extend_from_slice(network);
+            args.push("c1");
+            let out = run(&args);
+            assert_eq!(out.status.code(), Some(2), "{network:?}");
+            assert_rejected(&out, "INVALID_ARGUMENT", NOT_APPLICABLE);
+            assert!(!root.exists(), "state root must not be created");
+        }
+    }
+
+    /// rootless（隣にランチャーが無い）のユーザー定義名で定義が無い場合: フラグなしは `FAILED_PRECONDITION`
+    /// （判定が先）、フラグがあれば pasta の解決より前に `NOT_FOUND`（存在しないネットワークのために子を起動しない）。
+    /// いずれも状態ルートを作らない（D2・#3329）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_cli1_pasta_rootless_named_network_without_definition() {
+        let tmp = TmpDir::new("pasta-named");
+        let cli = isolated_cli_dir("pasta-named").join("fandhe-container");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        let create = |extra: &[&str]| {
+            let mut args = vec!["--root", root_s];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ]);
+            run_isolated(&cli, &args)
+        };
+        let out = create(&[]);
+        assert_rejected(&out, "FAILED_PRECONDITION", "pasta path is not configured");
+        for path in ["relative/pasta", "/nonexistent-dir/pasta"] {
+            let out = create(&["--pasta-path", path]);
+            assert_rejected(&out, "NOT_FOUND", "network not found");
+            assert!(!root.exists(), "state root must not be created");
+        }
+        assert!(!root.exists(), "state root must not be created");
+    }
+
+    /// 定義がある場合: 不正・不在のパスは net の分類のまま。いずれも `@container-options` と状態記録を作らない（#3329）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_cli1_pasta_rootless_named_network_with_definition() {
+        let tmp = TmpDir::new("pasta-defined");
+        let cli = isolated_cli_dir("pasta-defined").join("fandhe-container");
+        let root = tmp.0.join("state");
+        let root_s = root.to_str().expect("utf8");
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", "web"]);
+        assert_eq!(out.status.code(), Some(0), "{:?}", out);
+        let create = |extra: &[&str]| {
+            let mut args = vec!["--root", root_s];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ]);
+            run_isolated(&cli, &args)
+        };
+        let out = create(&["--pasta-path", "relative/pasta"]);
+        assert_rejected(
+            &out,
+            "INVALID_ARGUMENT",
+            "pasta path must be an absolute UTF-8 path without control characters or dot components",
+        );
+        let out = create(&["--pasta-path", "/nonexistent-dir/pasta"]);
+        assert_rejected(&out, "NOT_FOUND", "pasta binary was not found");
+        // 別名のネットワーク（定義が無い）は pasta の解決より前に NOT_FOUND。
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/nonexistent-dir/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "other",
+                "c1",
+            ],
+        );
+        assert_rejected(&out, "NOT_FOUND", "network not found");
+        assert!(
+            !root.join("@container-options").exists(),
+            "options dir must not be created"
+        );
+    }
+
+    /// 隣に信頼できないランチャーがあれば、直接経路へ落とさず `FAILED_PRECONDITION`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net9_sup14_pasta_untrusted_launcher_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("pasta-untrusted");
+        let dir = isolated_cli_dir("pasta-untrusted");
+        let launcher = dir.join("fandhe-container-launcher");
+        std::fs::write(&launcher, b"#!/bin/sh\nexit 0\n").expect("launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        let root = tmp.0.join("never-created");
+        let root_s = root.to_str().expect("utf8");
+        let out = run_isolated(
+            &dir.join("fandhe-container"),
+            &[
+                "--root",
+                root_s,
+                "--pasta-path",
+                "/usr/bin/pasta",
+                "create",
+                "--bundle",
+                "/nonexistent-bundle",
+                "--network",
+                "web",
+                "c1",
+            ],
+        );
+        assert_rejected(
+            &out,
+            "FAILED_PRECONDITION",
+            "privileged launcher is not a trusted executable (must be a regular file owned by root or the current user, not writable by group or others)",
+        );
+        assert!(!root.exists(), "state root must not be created");
+    }
+
+    /// Linux 以外ではユーザー定義名 + フラグは net の固定文言で `UNIMPLEMENTED`。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn net9_cli1_pasta_flag_is_unimplemented_off_linux() {
+        let out = run(&[
+            "--pasta-path",
+            "/usr/bin/pasta",
+            "create",
+            "--bundle",
+            "/nonexistent-bundle",
+            "--network",
+            "web",
+            "c1",
+        ]);
+        assert_rejected(&out, "UNIMPLEMENTED", "pasta is only supported on Linux");
+    }
+}
+
+/// NET-6・CLI-1・ERR-1（#3066）: 実バイナリで network create → ls → 重複 create → rm → ls を通す。
+/// 権限モデルは CLI の隣に特権ランチャーが無い rootless（uid 0 の実行は rootful 扱いで create が UNIMPLEMENTED）。
+#[cfg(target_os = "linux")]
+#[test]
+fn net6_network_create_ls_rm_flow_on_linux() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TmpDir::new("net6");
+    let dir = isolated_cli_dir("net6");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\tMODE\tSUBNET\n");
+
+    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+    if is_root {
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+
+    for n in ["n2", "n1"] {
+        let out = run_isolated(&cli, &["--root", root_s, "network", "create", n]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+    assert_failure(
+        &out,
+        4,
+        "{\"code\":\"ALREADY_EXISTS\",\"message\":\"network already exists\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn1\tpasta\t-\nn2\tpasta\t-\n"
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_failure(
+        &out,
+        3,
+        "{\"code\":\"NOT_FOUND\",\"message\":\"network not found\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn2\tpasta\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// NET-6・NET-9・CLI-1・ERR-1（#3529・D10）: 実バイナリで、pasta 構成のコンテナ（状態記録と起動オプション文書）が参照する
+/// ネットワークの `network rm` が `FAILED_PRECONDITION`（終了コード 5・構造化エラー）で拒否され、定義が残ること。
+/// 参照するコンテナの記録と文書を消せば `rm` は成功する。pasta の実起動は要らないため、記録は core・supervisor の
+/// 公開 API で直接作る（`create` の実起動は別の試験が担う）。
+#[cfg(target_os = "linux")]
+#[test]
+fn net6_net9_cli1_3529_network_rm_refused_while_referenced_then_succeeds() {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::traits::{
+        Annotations, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateRequest,
+        GetStateRequest, StateStore,
+    };
+    use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
+    use fandhe_container_supervisor::container_options::store::{
+        self as options_store, GENERATION_ANNOTATION,
+    };
+    use std::os::unix::fs::MetadataExt as _;
+
+    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+    if is_root {
+        // root の実行は rootful 扱いで user-defined network の create が UNIMPLEMENTED（net6 の試験と同じ前提）。
+        return;
+    }
+    let tmp = TmpDir::new("net6-3529");
+    let dir = isolated_cli_dir("net6-3529");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", root_s, "network", "create", "n1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 参照するコンテナ c1（世代 g1・文書の network は n1）の記録を作る。
+    let store = FileStateStore::open(StateRoot::from_override(root.clone()).expect("root"))
+        .expect("open store");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir_all(&bundle).expect("bundle");
+    let id = ContainerId::new("c1").expect("id");
+    let req = CreateStateRequest::new(ContainerStatus::created(id.clone(), None), bundle)
+        .expect("req")
+        .with_annotations(
+            Annotations::new([(GENERATION_ANNOTATION.to_owned(), "g1".to_owned())]).expect("ann"),
+        );
+    let rev = store.create(&req).expect("create record").revision();
+    let state_root = store.host_state_root().expect("root").to_path_buf();
+    let doc = ContainerOptionsDocument::default()
+        .with_network(Some("n1".to_owned()), vec![], vec![])
+        .expect("net")
+        .with_pasta(Some(
+            "20260120 2049 131074 1234567 1760000000 123456789 -5 0 0 755\n/usr/bin/pasta"
+                .to_owned(),
+        ))
+        .expect("pasta")
+        .with_generation("g1".to_owned())
+        .expect("gen");
+    options_store::write_new(&state_root, &id, &doc).expect("write doc");
+
+    // 参照中は拒否される。入力値とコンテナ ID は出力に出ず、定義は残る。
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_failure(
+        &out,
+        5,
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "NAME\tMODE\tSUBNET\nn1\tpasta\t-\n"
+    );
+
+    // 参照するコンテナを消せば rm は成功する。
+    let rev = store
+        .get(&GetStateRequest::new(id.clone()))
+        .map(|r| r.revision())
+        .unwrap_or(rev);
+    store
+        .delete(&DeleteStateRequest::new(id.clone(), rev))
+        .expect("delete record");
+    options_store::remove(&state_root, &id).expect("remove doc");
+    let out = run_isolated(&cli, &["--root", root_s, "network", "rm", "n1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_isolated(&cli, &["--root", root_s, "network", "ls"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\tMODE\tSUBNET\n");
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// op ログを読み、行を `(op, success, failure)` の `op_stats` 行とメタ行（`ops=N`）の列として照合する。
+///
+/// `expected` の各要素は 1 組（`op_stats` 行の列 + 対応するメタ行）。組内は操作名の昇順で、行の形式
+/// （接頭辞・末尾 `}`・`{` が 1 つだけ）は壊れた行を見逃さないよう完全一致で見る（#3558）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn assert_op_log_groups(log: &std::path::Path, expected: &[&[(&str, u32, u32)]]) {
+    let text = std::fs::read_to_string(log).expect("read op log");
+    assert!(text.ends_with('\n'), "{text:?}");
+    let mut lines = text.lines();
+    for group in expected {
+        for (op, ok, ng) in *group {
+            let line = lines.next().unwrap_or_default();
+            let head = format!(
+                "{{\"event\":\"op_stats\",\"op\":\"{op}\",\"success\":{ok},\"failure\":{ng},\"count\":{},\"min_us\":",
+                ok + ng
+            );
+            assert!(line.starts_with(&head), "{line:?} vs {head:?}\n{text}");
+            assert!(line.ends_with('}'), "{line:?}");
+            assert_eq!(line.matches('{').count(), 1, "{line:?}");
+        }
+        let meta = format!(
+            "{{\"event\":\"op_stats_meta\",\"ops\":{},\"dropped_records\":0}}",
+            group.len()
+        );
+        assert_eq!(lines.next(), Some(meta.as_str()), "{text}");
+    }
+    assert_eq!(lines.next(), None, "unexpected extra lines:\n{text}");
+}
+
+/// REPAIR-4・NET-6・CLI-1（#3558）: 実バイナリで `FANDHE_CONTAINER_OP_LOG` を設定した `create --network <名前>` が、
+/// 本体の記録器の組（`create`）と定義照合の記録器の組（`network.store.open` / `network.store.get`）をこの順で
+/// 別々の組（メタ行つき）として追記し、定義照合が走らない失敗では 2 組目を出さないこと。
+/// 記録器を統合しない判断は `docs/design/network-wiring.md`。成功経路（core の create まで到達）は
+/// `repair4_net6_cli1_3577_create_named_network_success_records_two_groups` が照合する。
+/// root の実行は rootful 扱いで名前つきネットワークが `UNIMPLEMENTED` のため、4 場面は照合せず明示の拒否を照合する。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[test]
+fn repair4_net6_cli1_3558_create_named_network_records_store_ops_in_second_group() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TmpDir::new("net6-3558");
+    let dir = isolated_cli_dir("net6-3558");
+    let cli = dir.join("fandhe-container");
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        // root は rootful 扱いで名前つきネットワークの create が UNIMPLEMENTED になる。何も照合せず成功させず、
+        // 明示的な拒否（net6 の試験と同じ固定値）を照合して終える。4 場面は非 root の実行で照合する。
+        let state = tmp.0.join("state");
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                state.to_str().expect("utf8"),
+                "network",
+                "create",
+                "web",
+            ],
+        );
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+    let state = tmp.0.join("state");
+    let state_s = state.to_str().expect("utf8");
+    let missing_pasta = "/nonexistent-dir/pasta";
+    let create = |log: &std::path::Path, root: &str, net: &str, pasta: bool| {
+        let mut args = vec!["--root", root];
+        if pasta {
+            args.extend(["--pasta-path", missing_pasta]);
+        }
+        args.extend([
+            "create",
+            "--bundle",
+            "/nonexistent-bundle",
+            "--network",
+            net,
+            "c1",
+        ]);
+        run_exe_env(&cli, &args, &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())])
+    };
+
+    // (a) 状態ルート未作成: 定義が無く NOT_FOUND。open は Ok(None) でも成功として数える。
+    let never = tmp.0.join("never-created");
+    let log = tmp.0.join("a.jsonl");
+    let out = create(&log, never.to_str().expect("utf8"), "web", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("network not found"));
+    assert!(!never.exists(), "state root must not be created");
+    assert_op_log_groups(
+        &log,
+        &[&[("create", 0, 1)], &[("network.store.open", 1, 0)]],
+    );
+
+    // 定義 web を作る（op ログなし）。
+    let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // (b) 別の名前: open 成功・get 失敗。
+    let log = tmp.0.join("b.jsonl");
+    let out = create(&log, state_s, "other", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("network not found"));
+    assert_op_log_groups(
+        &log,
+        &[
+            &[("create", 0, 1)],
+            &[("network.store.get", 0, 1), ("network.store.open", 1, 0)],
+        ],
+    );
+
+    // (c) 定義はあるが pasta が無い: 照合は成功し、その後の pasta の検証で失敗する。
+    let log = tmp.0.join("c.jsonl");
+    let out = create(&log, state_s, "web", true);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pasta binary was not found"));
+    assert_op_log_groups(
+        &log,
+        &[
+            &[("create", 0, 1)],
+            &[("network.store.get", 1, 0), ("network.store.open", 1, 0)],
+        ],
+    );
+
+    // (d) pasta の指定なし: decide の段で失敗し、定義照合は走らないので 2 組目は出ない。
+    let log = tmp.0.join("d.jsonl");
+    let out = create(&log, state_s, "web", false);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pasta path is not configured"));
+    assert_op_log_groups(&log, &[&[("create", 0, 1)]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+/// `$XDG_RUNTIME_DIR` 配下に排他作成した 0700 のディレクトリへ置く偽の pasta（`--version` にだけ答える）。
+///
+/// 製品の `verify_pasta_binary`（anchor なし）は `/` から全祖先までの所有者・権限を検査するため、`/tmp` や
+/// umask 002 で作られる `CARGO_TARGET_TMPDIR` では通らない。非 root の試験が自前で用意できる信頼できる経路は
+/// `$XDG_RUNTIME_DIR`（`/run/user/<uid>`）だけで、検証器は差し替えずに本物を通す（#3577・NET-9）。Drop で削除する。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+struct FakePasta {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl FakePasta {
+    /// 信頼できる `$XDG_RUNTIME_DIR` が無ければ、skip せず名前つきの前提エラーで失敗する（fail-closed）。
+    fn install() -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        let base = xdg
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.canonicalize().ok().filter(|c| *c == p).map(|_| p))
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRECONDITION FAILED: XDG_RUNTIME_DIR must be an absolute directory without symlinked ancestors for the fake pasta (NET-9, #3577)"
+                )
+            });
+        // 製品の検証が後で MSG_UNTRUSTED を返したときの原因切り分けのため、試験側でも全祖先を確かめる。
+        let euid = std::fs::metadata("/proc/self").expect("proc self").uid();
+        let mut cur = std::path::PathBuf::new();
+        for comp in base.components() {
+            cur.push(comp);
+            let m = std::fs::symlink_metadata(&cur).expect("stat ancestor");
+            assert!(
+                m.is_dir() && (m.uid() == 0 || m.uid() == euid) && m.mode() & 0o022 == 0,
+                "PRECONDITION FAILED: XDG_RUNTIME_DIR ancestor {} must be a root/euid-owned directory not writable by group/other (NET-9, #3577)",
+                cur.display()
+            );
+        }
+        let dir = exclusive_dir(&base, "fc-cli-pasta-3577");
+        let this = Self { dir };
+        install_fake_exe(
+            &this.dir,
+            "pasta",
+            "printf 'pasta 0.0~git20260120.386b5f5-1\\nCopyright Red Hat\\n'",
+        );
+        let m = std::fs::symlink_metadata(this.path()).expect("stat fake pasta");
+        assert!(m.is_file() && m.mode() & 0o7777 == 0o755, "{:o}", m.mode());
+        this
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.dir.join("pasta")
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+impl Drop for FakePasta {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// REPAIR-4・NET-6・CLI-1（#3577）: 実バイナリの `create --network <名前>` の成功経路と、保持区間（core の create）の
+/// 中での失敗で、op ログの 2 組目が `network.store.open` 2 回・`network.store.get` 2 回（早い段の
+/// `require_named_definition` と保持区間の `with_named_definition_held` の各 1 回）になること。
+/// pasta は create では起動されず信頼検証（`--version` のみ）を通ればよいため、本物の検証器を通す偽の pasta
+/// （[`FakePasta`]）で足りる。1 組目は本体の記録器の組。root は rootful 扱いで名前つきネットワークが
+/// `UNIMPLEMENTED` のため、照合せず明示の拒否を照合する。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[test]
+fn repair4_net6_cli1_3577_create_named_network_success_records_two_groups() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TmpDir::new("net6-3577");
+    let dir = isolated_cli_dir("net6-3577");
+    let cli = dir.join("fandhe-container");
+    let state = tmp.0.join("state");
+    let state_s = state.to_str().expect("utf8");
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+        assert_failure(
+            &out,
+            8,
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"user-defined networks on rootful installations are not supported yet\"}\n",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        return;
+    }
+    let pasta = FakePasta::install();
+    let pasta_path = pasta.path();
+    let pasta_s = pasta_path.to_str().expect("utf8");
+
+    let out = run_isolated(&cli, &["--root", state_s, "network", "create", "web"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    let config = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#;
+    let ok_bundle = tmp.0.join("bundle-ok");
+    std::fs::create_dir(&ok_bundle).expect("bundle");
+    std::fs::create_dir(ok_bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(ok_bundle.join("config.json"), config).expect("config");
+    // rootfs の無い bundle: core の create が失敗する（保持区間の中での失敗）。
+    let ng_bundle = tmp.0.join("bundle-norootfs");
+    std::fs::create_dir(&ng_bundle).expect("bundle");
+    std::fs::write(ng_bundle.join("config.json"), config).expect("config");
+
+    let create = |log: &std::path::Path, bundle: &std::path::Path, id: &str| {
+        run_exe_env(
+            &cli,
+            &[
+                "--root",
+                state_s,
+                "--pasta-path",
+                pasta_s,
+                "create",
+                "--bundle",
+                bundle.to_str().expect("utf8"),
+                "--network",
+                "web",
+                id,
+            ],
+            &[("FANDHE_CONTAINER_OP_LOG", log.as_os_str())],
+        )
+    };
+    let store_group: &[(&str, u32, u32)] =
+        &[("network.store.get", 2, 0), ("network.store.open", 2, 0)];
+
+    // (e) 成功: 終了コード 0・出力なし。1 組目は本体の create、2 組目は照合 2 回ぶん。
+    let log = tmp.0.join("e.jsonl");
+    let out = create(&log, &ok_bundle, "c1");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert_op_log_groups(&log, &[&[("create", 1, 0)], store_group]);
+    // 保持区間が状態記録まで届いた証拠: 参照中の定義は削除できない。
+    let out = run_isolated(&cli, &["--root", state_s, "network", "rm", "web"]);
+    assert_failure(
+        &out,
+        5,
+        "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"network is in use by a container; delete the containers that use it first\"}\n",
+    );
+
+    // (f) 保持区間の中での失敗: core の create が失敗しても 2 回目の照合は走り、2 組目に入る。
+    let log = tmp.0.join("f.jsonl");
+    let out = create(&log, &ng_bundle, "c2");
+    assert_failure(
+        &out,
+        3,
+        "{\"op\":\"create\",\"code\":\"NOT_FOUND\",\"message\":\"rootfs directory not found\"}\n",
+    );
+    assert_op_log_groups(&log, &[&[("create", 0, 1)], store_group]);
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -47,11 +47,28 @@
 //!   `FailedPrecondition`。rbind はホストの `/sys` 配下のマウント（cgroup2・securityfs・bpf 等）を持ち込むため、
 //!   その一つでも rw なら起動しない。`exec::setns` の「コンテナの中から cgroupfs に書けない」前提はこの再帰 ro と
 //!   `CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否に支えられる
-//! - **rbind の最上位の ro はロックされない可能性がある（未実測の読み。#2305）**: unshare の時点でホストの `/sys` が rw なら、
-//!   複製に後から付けた ro には `MNT_LOCK_READONLY` が立たず、user namespace の root が `mount_setattr` で外せる見込みがある。
-//!   その場合にコンテナ内から外されるのを防ぐのは CapabilityDrop（`CAP_SYS_ADMIN` の削減）と seccomp による
-//!   `mount_setattr` の拒否（`EPERM`）だけになる。実機での測定は `tests/sysfs_mount.rs` の `ro-clear` シナリオ
-//!   （手順は `docs/verification/rootless-sysfs-readonly.md`）で行い、結果が出るまで確定事項として扱わない
+//! - **rbind の最上位の ro は user namespace の root から外せる（ホステッド runner での観測。#2305・#2789）**:
+//!   `platform-ci`（ubuntu-latest。GitHub ホステッド runner、イメージ ubuntu-24.04・20261012.334.1、カーネルは同イメージの
+//!   リリースノートの `6.17.0-1022-azure`。一次の記録は CI の step summary の `kernel:` 行）の初回（PR #2781・run 40271388345）で、
+//!   ホストの `/sys` が rw のとき、防御なし（全 capability・seccomp なし）の `mount_setattr(attr_clr=MOUNT_ATTR_RDONLY)` は
+//!   最上位の ro を外せた（`ro_clear_errno=0`・`top_ro_after_clear=false`）。複製に後から付けた ro には `MNT_LOCK_READONLY` が立たない。
+//!   子マウント 19 件は ro のまま（`children_ro_after_clear=true`。再帰では外していない）。外した後の書き込み用 `open` は
+//!   観測した 4 パスで `EACCES` だったが、これはホストの root 所有ファイルの DAC によるもので、ro の代わりになる保証ではない。
+//!   防御あり（組み込みの `CapabilityDrop`・`Seccomp` 段の通過後）は `EPERM` で拒否された（`ro_clear_defended_errno=1`）。
+//!   観測はホステッド runner の 1 回分で、一般化しない。rootful 経路と別カーネルの実測は #2305・#1621（人間担当）に残る。
+//!   ro をロックさせる緩和策は別判断で、ここでは行わない
+//! - **/sys の ro を保つ前提**: コンテナ内から最上位の ro が外されないことは次の 2 つだけに依存する。(1) CapabilityDrop の
+//!   許可集合に `CAP_SYS_ADMIN` が無いこと（`ContainerCapabilities` は OCI 既定の部分集合だけを表し add の経路が無い）、
+//!   (2) 既定の seccomp が `mount_setattr` と mount 系（`mount`・`umount2`・`open_tree`・`move_mount`・`fsopen`・`fsconfig`・
+//!   `fsmount`・`fspick`）を `ERRNO(EPERM)`（supervisor 経路は `USER_NOTIF` で `-EPERM`）で拒否すること。両段は
+//!   `StagePipeline` の組み込みの固定段でフックでは差し替えられない。前提を固定する試験（名前のみ記す）:
+//!   `seccomp` の `bpf_tests::sec2_sysfs_ro_premise_native_filter_denies_mount_family_with_eperm`、
+//!   `capabilities` の `tests::sec2_sysfs_ro_premise_default_caps_lack_sys_admin`・`tests::sec1_oci_default_mask_matches_docker_capeff`・
+//!   `tests::sec1_container_capabilities_restrict_only_subsets`、`exec/stages.rs` の `core1_empty_pipeline_applies_builtin_stages`
+//! - **前提の崩れの検出（CI）**: `tests/sysfs_mount.rs` の `ro-clear` シナリオは `platform-ci`（ubuntu）で成功行
+//!   `… defended errno=1 (root=false)` を照合する。防御ありの試行が `EPERM` 以外になれば試験自身と CI の成功行の照合が失敗し、
+//!   capability 集合や seccomp の変更・段の順序の崩れを実カーネルで検出する。防御なしの値は測定値のため assert しない
+//!   （手順は `docs/verification/rootless-sysfs-readonly.md`）
 //! - **失敗時**: 後始末の umount はしない。呼び出し側はプロセスを破棄する（`crate::exec` のモジュール doc の契約）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
@@ -135,7 +152,9 @@ fn clear_probe_precondition(pid: u32, user_ns_inode: Option<u64>) -> bool {
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。
+/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。ただし `platform-ci` の `ro-clear` 照合
+/// （`defended errno=1`）が /sys の ro を保つ前提（`CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否）の継続検出に
+/// 使われている（#2533・#2789）。廃止・置き換えは、その検出役を別の試験へ移してから行う。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_clear_sysfs_readonly_for_test() -> Result<super::seccomp::ProbeOutcome, ExecError> {
@@ -317,7 +336,8 @@ fn open_sys_dir(new_root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
 /// mountinfo の 1 行の必要な部分。
 pub(super) struct Entry<'a> {
     pub(super) id: u64,
-    pub(super) mount_point: &'a str,
+    /// 親マウントの mount ID（2 列目）。部分木を親子関係で辿るために使う（#2823）。
+    pub(super) parent: u64,
     pub(super) options: &'a str,
     pub(super) fstype: &'a str,
 }
@@ -335,15 +355,47 @@ pub(super) fn parse_entry(line: &str) -> Option<Entry<'_>> {
         .checked_add(FIXED_FIELDS)?;
     Some(Entry {
         id: fields.first()?.parse().ok()?,
-        mount_point: fields.get(4)?,
+        parent: fields.get(1)?.parse().ok()?,
         options: fields.get(5)?,
         fstype: fields.get(sep.checked_add(1)?)?,
     })
 }
 
+/// `top_mnt_id` のマウントとその子孫（parent ID で辿る）を、先頭に top を置いて返す（純関数。fail-closed。#2823・SEC-1・CORE-2）。
+///
+/// マウントポイントのパス文字列の前方一致では、top の下に隠れた同じ点の下側の行や、
+/// 隠れた別の木の同じ接頭辞の行まで含めて取り違える。`bind_mounts::subtree_members` と同じく親子関係で降りる。
+/// top の不在は `missing`、mount ID の重複は固定の英文で拒否する。反復は行数で頭打ちにし、循環した親 ID でも終わる。
+pub(super) fn subtree_entries<'a>(
+    entries: &'a [Entry<'a>],
+    top_mnt_id: u64,
+    missing: &'static str,
+) -> Result<Vec<&'a Entry<'a>>, &'static str> {
+    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
+    let top = tops.next().ok_or(missing)?;
+    if tops.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
+    }
+    let mut members: Vec<&Entry<'_>> = vec![top];
+    let mut ids = vec![top.id];
+    for _ in 0..entries.len() {
+        let before = ids.len();
+        for e in entries {
+            if !ids.contains(&e.id) && ids.contains(&e.parent) {
+                ids.push(e.id);
+                members.push(e);
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    Ok(members)
+}
+
 /// 載せた `/sys` の事後条件（純関数。fail-closed）。
 ///
-/// `top_mnt_id` のマウントが sysfs で、同じマウントポイント以下（配下を含む）のすべてのマウントの per-mount options が
+/// `top_mnt_id` のマウントが sysfs で、その子孫（parent ID で辿る。#2823）を含むすべてのマウントの per-mount options が
 /// `ro,nosuid,nodev,noexec` を持つことを確かめる。書式に反する行・該当行なし・同じ mount ID の重複は拒否する。
 /// 返す文字列は固定の英文で、mountinfo の値（パス・オプション）を含めない。
 fn check_sysfs_tree(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
@@ -352,22 +404,18 @@ fn check_sysfs_tree(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
     for line in info.lines() {
         entries.push(parse_entry(line).ok_or(MALFORMED)?);
     }
-    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
-    let top = tops
-        .next()
+    let members = subtree_entries(
+        &entries,
+        top_mnt_id,
+        "no mount entry found for the sysfs mount",
+    )?;
+    let top = members
+        .first()
         .ok_or("no mount entry found for the sysfs mount")?;
-    if tops.next().is_some() {
-        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
-    }
     if top.fstype != "sysfs" {
         return Err("the /sys mount is not a sysfs");
     }
-    let prefix = format!("{}/", top.mount_point.trim_end_matches('/'));
-    for e in &entries {
-        let under = e.mount_point == top.mount_point || e.mount_point.starts_with(&prefix);
-        if !under {
-            continue;
-        }
+    for e in &members {
         let has = |flag: &str| e.options.split(',').any(|o| o == flag);
         if !(has("ro") && has("nosuid") && has("nodev") && has("noexec")) {
             return Err("a mount under /sys is not ro,nosuid,nodev,noexec");
@@ -616,7 +664,11 @@ mod tests {
     }
 
     fn line(id: u64, mp: &str, opts: &str, fstype: &str) -> String {
-        format!("{id} 1 0:5 / {mp} {opts} master:1 - {fstype} {fstype} rw")
+        linep(id, 1, mp, opts, fstype)
+    }
+
+    fn linep(id: u64, parent: u64, mp: &str, opts: &str, fstype: &str) -> String {
+        format!("{id} {parent} 0:5 / {mp} {opts} master:1 - {fstype} {fstype} rw")
     }
 
     /// SEC-2: 事後条件の判定。配下の 1 件でも rw なら拒否し、最上位が sysfs でなければ拒否する。
@@ -625,7 +677,7 @@ mod tests {
         let ro = "ro,nosuid,nodev,noexec,relatime";
         let ok = [
             line(10, "/r/sys", ro, "sysfs"),
-            line(11, "/r/sys/fs/cgroup", ro, "cgroup2"),
+            linep(11, 10, "/r/sys/fs/cgroup", ro, "cgroup2"),
             line(12, "/r/sysx", "rw,relatime", "tmpfs"),
             line(13, "/r/proc", "rw,nosuid", "proc"),
         ]
@@ -634,7 +686,13 @@ mod tests {
         // 配下の rw は拒否（`/r/sysx` は配下ではないので影響しない）。
         let child_rw = [
             line(10, "/r/sys", ro, "sysfs"),
-            line(11, "/r/sys/fs/cgroup", "rw,nosuid,nodev,noexec", "cgroup2"),
+            linep(
+                11,
+                10,
+                "/r/sys/fs/cgroup",
+                "rw,nosuid,nodev,noexec",
+                "cgroup2",
+            ),
         ]
         .join("\n");
         assert_eq!(
@@ -677,5 +735,38 @@ mod tests {
             check_sysfs_tree("garbage line", 10),
             Err("malformed line in /proc/thread-self/mountinfo")
         );
+    }
+
+    /// SEC-1・CORE-2（#2823）: 隠れた行・別の木の同接頭辞の行は数えず、top の子孫だけを判定する。
+    #[test]
+    fn sec1_2823_check_sysfs_tree_follows_parent_ids_not_path_prefix() {
+        let ro = "ro,nosuid,nodev,noexec";
+        let rw = "rw,relatime";
+        let hidden = [
+            linep(5, 1, "/r/sys", rw, "tmpfs"),
+            linep(10, 5, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/fs/cgroup", ro, "cgroup2"),
+            linep(20, 2, "/r/sys/other", rw, "tmpfs"),
+            linep(21, 2, "/r/sysx", rw, "tmpfs"),
+        ]
+        .join("\n");
+        assert_eq!(check_sysfs_tree(&hidden, 10), Ok(()));
+        let grand = [
+            linep(10, 1, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/a", ro, "cgroup2"),
+            linep(12, 11, "/r/sys/a/b", rw, "tmpfs"),
+        ]
+        .join("\n");
+        assert_eq!(
+            check_sysfs_tree(&grand, 10),
+            Err("a mount under /sys is not ro,nosuid,nodev,noexec")
+        );
+        let cyc = [
+            linep(10, 12, "/r/sys", ro, "sysfs"),
+            linep(11, 10, "/r/sys/a", ro, "cgroup2"),
+            linep(12, 11, "/r/sys/b", ro, "cgroup2"),
+        ]
+        .join("\n");
+        assert_eq!(check_sysfs_tree(&cyc, 10), Ok(()));
     }
 }

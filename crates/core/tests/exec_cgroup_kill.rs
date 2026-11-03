@@ -17,16 +17,30 @@
 //! 参加は fork した子が `cgroup.procs` へ `0` を書く操作で、ここではシェルが同じ書き込みを行って再現する
 //! （`spawn_exec_command` の子での参加は、root を要する `fandhe-container-supervisor` の `tests/exec.rs` が通す）。
 
+#[path = "support/reap.rs"]
+mod reap;
+
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 mod linux {
+    /// REPAIR-12・#2956: 前提欠如の分類（`precondition`）の自己照合。既定のテスト集合で常に走る。
+    /// 純粋計算でプロセスを cgroup 間で移さないため、1 ファイル 1 テストの規約（自プロセスを移す
+    /// 試験向け）の対象外。実機の実行は `--ignored` のため本番の試験と同時には走らない。
+    #[test]
+    fn repair12_precondition_self_check() {
+        crate::precondition::self_check();
+    }
+
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::cgroups::{
-        CgroupName, Controller, ControllerSet, DelegatedCgroup, PidsMax,
-    };
+    use fandhe_container_core::cgroups::{CgroupName, Controller, ControllerSet, PidsMax};
     use fandhe_container_core::exec::{
         ExecCgroupName, ExecCgroupRemoval, ExecChildCgroup, remove_exec_child_cgroup_in,
     };
@@ -77,7 +91,7 @@ mod linux {
     #[test]
     #[ignore = "requires a delegated cgroup v2 subtree with pids controller (systemd-run --user --scope -p Delegate=yes)"]
     fn sup6_exec_child_cgroup_kills_descendants_and_is_removed() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup");
+        let delegated = crate::precondition::delegated_cgroup();
         let delegated_path = delegated.path();
         let base = PathBuf::from("/sys/fs/cgroup").join(delegated_path.trim_start_matches('/'));
         let id = ContainerId::new(format!("c{}", std::process::id())).unwrap();
@@ -111,7 +125,8 @@ mod linux {
         assert!(members.contains(&command.id()));
 
         command.kill().expect("kill the direct child only");
-        command.wait().expect("reap the direct child");
+        crate::reap::reap(&mut command, crate::reap::reap_within())
+            .unwrap_or_else(|e| panic!("reap the direct child: {e}"));
         wait_until("the direct child to leave the cgroup", || {
             !pids_in(&exec_dir).contains(&command.id())
         });
@@ -159,7 +174,10 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &again, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        let _ = command.wait();
+        if let Err(e) = crate::reap::wait_within(&mut command, crate::reap::reap_within()) {
+            crate::reap::reap_or_report(&mut command, crate::reap::reap_within());
+            panic!("stubborn exec child did not exit after its cgroup was removed: {e}");
+        }
         assert!(!container_dir.join(again.as_str()).exists());
 
         // (3) 親（コンテナ cgroup）の pids.max が子 cgroup のプロセスにも掛かり、親の pids.current に計上される。
@@ -217,7 +235,10 @@ mod linux {
             remove_exec_child_cgroup_in(&container_path, &limited, Duration::from_secs(5)).unwrap(),
             ExecCgroupRemoval::Removed
         );
-        let _ = forker.wait();
+        if let Err(e) = crate::reap::wait_within(&mut forker, crate::reap::reap_within()) {
+            crate::reap::reap_or_report(&mut forker, crate::reap::reap_within());
+            panic!("forker did not exit after its cgroup was removed: {e}");
+        }
 
         delegated
             .remove_child(&container)

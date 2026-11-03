@@ -1,8 +1,11 @@
 //! CDI spec（Container Device Interface）の YAML / JSON 読み込み基盤（TASK-126.1・GPU-1・MS-10）。
 //!
-//! NVIDIA Container Toolkit が生成する `/var/run/cdi/nvidia.yaml` 等を型付き構造体 [`CdiSpec`] へ
+//! CDI spec（デバイスの種類を問わない。ベンダーの生成ツールが `/etc/cdi`・`/var/run/cdi` に置くもの。
+//! NVIDIA Container Toolkit の `nvidia.yaml` はその一例）を型付き構造体 [`CdiSpec`] へ
 //! デシリアライズするだけの層で、`fandhe-container-gpu` の他モジュール（TASK-126.2 の集計、
 //! TASK-126.3 の usr-merge パス正規化、TASK-127 以降の edits 適用）から入力として使われる。
+//!
+//! 非 GPU デバイスでの利用は GPU-9（検討中・#571 の判断待ち）の対象で、確定した対応範囲ではない。
 //!
 //! フィールド集合は CDI v1.1.x のもの（GPU-1）。v1.1.0 で `containerEdits.netDevices` と `intelRdt` の
 //! `schemata`・`enableMonitoring` が追加され、`enableCMT`・`enableMBM` が削除された。
@@ -29,10 +32,29 @@
 //! 適用は net crate の責務でありまだ無い。そのため型付きで解析・検証した上で、1 件でもあれば
 //! [`parse_cdi_spec`] が `Unimplemented` で spec 全体を拒否する（要求されないデバイスにだけあっても拒否する）。
 //!
+//! `kind`・デバイス名・`permissions` の形式検査（#2984・GPU-1・SEC-1）: 上流と判定を揃える。対象版は
+//! `cncf-tags/container-device-interface` v1.1.1（commit `cb98bcf66dc68530012483bd56e33e14d815e167`）。
+//! - `kind`: 最初の `/` で `vendor` と `class` に分け（`pkg/parser/parser.go` `ParseQualifier` L106-112）、
+//!   どちらも空でなく、`validateVendorOrClassName`（同 L145-169）を満たすこと。先頭は ASCII 英字、中間は ASCII 英数字と
+//!   `_` `-` `.`、末尾は ASCII 英数字（1 文字なら英字のみで可）。`:` と 2 つ目以降の `/` は不可。
+//!   検査の順は `ValidateVersion` → vendor → class（`pkg/cdi/spec.go` L114, L219-234）。
+//! - デバイス名: `ValidateDeviceName`（`parser.go` L176-214。`pkg/cdi/device.go` L69-72）。先頭は ASCII 英数字、
+//!   中間は ASCII 英数字と `_` `-` `.` `:`、末尾は ASCII 英数字。許可集合が ASCII だけなので、Go のバイト／rune 走査と
+//!   Rust のバイト走査の判定は同じ（非 ASCII はどちらも拒否）。
+//! - `permissions`: 省略・空文字・`none`（完全一致）、または全文字が `r` `w` `m` のいずれか（重複・順序は問わない）
+//!   （`pkg/cdi/container-edits.go` L46-47, L331-355）。`none` は v1.1.1 で入ったが版の要件は無い
+//!   （`SPEC.md` L37）ので `cdiVersion` に関係なく受ける。意味（省略・空は `rwm`、`none` は権限なし。`type` が `b` `c` のときだけ
+//!   cgroup の規則になる。同 L113-121、`SPEC.md` L143）の反映は TASK-129.1（#560）で、ここは値の形だけを見る。
+//! - `SPEC.md`（L195-204, L213-215）の文章（name segment 63 文字以下・prefix 253 文字以下・デバイス名に `:` なし）は
+//!   上流のコードが強制していない、または食い違う。コードに従い、長さの上限は足さず、デバイス名の中間の `:` は受ける。
+//! - 上流にあるが本リポが意図して足さない検査: devices 0 件・同名デバイスの重複・device の edits が空・annotations・
+//!   `hookName` の許可値（本リポの集計設計と食い違うため）。
+//!
 //! 責務境界（将来仕様。REPAIR-3）:
 //! - 本モジュールは構文・型・未知フィールド・重複キー・資源上限の検査までを行う。
-//!   `kind` / `name` の形式検査（最小の版の判定に要る分解だけは行う）、パスの絶対性、`hookName` の許可値などの意味検証は行わない
-//!   （TASK-126.2 以降・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
+//!   `kind` / `name` の形式と `deviceNodes[].permissions` の値は本モジュールが検査する（#2984。下の節）。
+//!   パスの絶対性・正規形（#2978・#2979）、`type` の値（#2979）、`hookName` の許可値などの意味検証は行わない
+//!   （適用層・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
 //! - `/var/run/cdi` の所有者・権限の検証、ディレクトリ走査、名前から spec への解決は後続タスクで扱う。解決済みの
 //!   (spec, 名前) の列の集計は `cdi_edits::aggregate_container_edits_across_specs`（TASK-126.2・GPU-1）が担う。
 //! - 未知フィールドは全構造体で拒否する（fail-closed）。将来の CDI 版で増えたフィールドを受けるには
@@ -52,7 +74,10 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_saphyr::options::{DuplicateKeyPolicy, MergeKeyPolicy};
 
-/// 読み込みを許す CDI spec の最大バイト数（1 MiB）。実際の nvidia.yaml は数十 KiB 程度。
+/// 読み込みを許す CDI spec の最大バイト数（1 MiB）。
+///
+/// spec の種類に依らない入力の資源上限。例として実際の nvidia.yaml は数十 KiB 程度で、デバイス数・edits が
+/// 少ない非 GPU の spec（`crates/gpu/tests/fixtures/cdi-non-gpu-*.yaml` は 1 KiB 未満）にも十分足りる。
 pub const CDI_SPEC_MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 /// YAML の最大ネスト深さ。CDI spec の実際の深さは 7 程度。
@@ -68,7 +93,12 @@ const CDI_SPEC_ERROR_MESSAGE_MAX_BYTES: usize = 512;
 
 /// `CdiSpecError` の機械可読な分類（ERR-1。文字列は他 crate の `code` と揃える）。
 ///
-/// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
+/// `#[non_exhaustive]` のため、他 crate の `match` は網羅にできない。`_` に吸収させず、[`CdiSpecErrorCode::ALL`] 由来の
+/// `const` 表＋`find` と表外への明示の倒し先にし、試験で表の網羅を照合する（REPAIR-1・ERR-1）。
+/// 文字列から戻すときは [`CdiSpecErrorCode::from_name`] の `None` を fail-closed で扱う。
+///
+/// core の `ErrorCode` への写像は持たせない: gpu はワークスペース内の crate に依存せず、消費側（edits の適用。
+/// TASK-127 以降）がまだ無い。写像は消費側を作るときにその crate に `ALL` 由来の表で置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CdiSpecErrorCode {
@@ -86,6 +116,25 @@ pub enum CdiSpecErrorCode {
 }
 
 impl CdiSpecErrorCode {
+    /// 全 variant の一覧（宣言順）。`from_name` の唯一の出所（REPAIR-1・ERR-1）。
+    ///
+    /// variant を足したら単体試験（`ordinal` の網羅 match と件数）が検出する。
+    pub const ALL: [CdiSpecErrorCode; 5] = [
+        CdiSpecErrorCode::InvalidArgument,
+        CdiSpecErrorCode::ResourceExhausted,
+        CdiSpecErrorCode::NotFound,
+        CdiSpecErrorCode::Internal,
+        CdiSpecErrorCode::Unimplemented,
+    ];
+
+    /// `as_str` の逆写像。完全一致だけを受ける（大文字小文字の畳み込み・空白の除去をしない）。
+    ///
+    /// 未知は `None` で、呼び出し側は固定文言で拒否する（fail-closed。既知の variant へ黙って
+    /// 置き換えない）。現時点で製品経路の呼び出し元は無く、往復試験と将来の受信側のために置く。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
+
     /// 機械可読な `code` 文字列を返す（ERR-1）。
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -206,7 +255,7 @@ impl fmt::Debug for EnvList {
 pub struct CdiSpec {
     /// `cdiVersion`（[`parse_cdi_spec`] が既知の版と、使っているフィールドに対する最小の版を検証する。モジュール doc 参照）。
     pub cdi_version: String,
-    /// `kind`（`vendor/class`。形式検査は TASK-126.2 以降）。
+    /// `kind`（`vendor/class`。形式は [`parse_cdi_spec`] が検査する。モジュール doc 参照。#2984）。
     pub kind: String,
     /// 任意の注釈。
     #[serde(default)]
@@ -223,7 +272,7 @@ pub struct CdiSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CdiDevice {
-    /// デバイス名（文字種の検証は TASK-126.2 以降）。
+    /// デバイス名（文字種は [`parse_cdi_spec`] が検査する。モジュール doc 参照。#2984）。
     pub name: String,
     /// 任意の注釈。
     #[serde(default)]
@@ -293,7 +342,8 @@ pub struct DeviceNode {
     /// ファイルモード。
     #[serde(default)]
     pub file_mode: Option<u32>,
-    /// cgroup device の権限（`rwm` の部分集合）。
+    /// cgroup device の権限。省略・空文字・`none`、または `r` `w` `m` だけの文字列を受ける（#2984）。
+    /// 省略・空は `rwm`、`none` は権限なしの意味で、反映は TASK-129.1（#560）。
     #[serde(default)]
     pub permissions: Option<String>,
     /// 所有 UID。
@@ -411,6 +461,7 @@ fn classify(err: &serde_saphyr::Error) -> CdiSpecError {
 /// 構文の検査に続けて、次の順で検査する（#2445・#2597・GPU-1）。
 /// 1. `cdiVersion` が既知の版でない、または使っているフィールドの最小の版（`netDevices` なら 1.1.0）より古ければ
 ///    `InvalidArgument`（モジュール doc 参照）
+///    （続けて）`kind`・デバイス名・`deviceNodes[].permissions` の形式が不正なら `InvalidArgument`（#2984。1 の直後）
 /// 2. 各 `containerEdits` の名前（15 バイト以下・`.` `..` `/` `:` 空白 NUL 不可。`fandhe-container-net` の
 ///    `IfName::new` と同じ規則）と、1 つの edits 内の `hostInterfaceName`・`name` の重複を検査し `InvalidArgument`
 /// 3. 検査を通っても適用が未実装のため `Unimplemented`（spec 単位。REPAIR-3）
@@ -428,6 +479,7 @@ pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
 pub(crate) fn parse_cdi_spec_unchecked(input: &str) -> Result<CdiSpec, CdiSpecError> {
     let spec = parse_structure(input)?;
     validate_cdi_version(&spec)?;
+    validate_kind_names_permissions(&spec)?;
     validate_net_devices(&spec)?;
     Ok(spec)
 }
@@ -609,6 +661,87 @@ fn is_valid_interface_name(name: &str) -> bool {
             .any(|c| c == '/' || c == ':' || c == '\0' || c.is_whitespace())
 }
 
+/// `kind` の `vendor` / `class` 共通の名前規則（上流 `validateVendorOrClassName`）。
+fn is_valid_vendor_or_class(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (Some(first), Some(last)) = (b.first(), b.last()) else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    if !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+}
+
+/// `vendor/class` 形式（最初の `/` で分ける）。
+fn is_valid_kind(kind: &str) -> bool {
+    kind.split_once('/')
+        .is_some_and(|(v, c)| is_valid_vendor_or_class(v) && is_valid_vendor_or_class(c))
+}
+
+/// デバイス名の規則（上流 `ValidateDeviceName`）。
+fn is_valid_device_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (Some(first), Some(last)) = (b.first(), b.last()) else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    if !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':'))
+}
+
+/// `deviceNodes[].permissions` の値の規則（上流 `DeviceNode.Validate`）。
+fn is_valid_device_permissions(p: &str) -> bool {
+    p.is_empty() || p == "none" || p.bytes().all(|b| matches!(b, b'r' | b'w' | b'm'))
+}
+
+fn has_invalid_permissions(edits: &ContainerEdits) -> bool {
+    edits.device_nodes.iter().any(|n| {
+        n.permissions
+            .as_deref()
+            .is_some_and(|p| !is_valid_device_permissions(p))
+    })
+}
+
+/// `kind`・デバイス名・`deviceNodes[].permissions` の形式を検証する（#2984・GPU-1・SEC-1）。
+/// 上流の順（kind → トップレベルの edits → 各デバイスの名前と edits）に見る。メッセージは固定文言で入力の値を載せない。
+/// 逆シリアライズ後の検査のため、エラーの行・列は `None`。`parse_cdi_spec` が呼ぶほか、parse を通らずに作られた
+/// [`CdiSpec`] に備えて `cdi_edits` の集計も呼ぶ。
+pub(crate) fn validate_kind_names_permissions(spec: &CdiSpec) -> Result<(), CdiSpecError> {
+    let bad = |msg: &str| CdiSpecError::new(CdiSpecErrorCode::InvalidArgument, msg);
+    const PERM: &str = "CDI deviceNodes entry has invalid permissions";
+    if !is_valid_kind(&spec.kind) {
+        return Err(bad("CDI kind is not a valid vendor/class"));
+    }
+    if has_invalid_permissions(&spec.container_edits) {
+        return Err(bad(PERM));
+    }
+    for d in &spec.devices {
+        if !is_valid_device_name(&d.name) {
+            return Err(bad("CDI device name is invalid"));
+        }
+        if has_invalid_permissions(&d.container_edits) {
+            return Err(bad(PERM));
+        }
+    }
+    Ok(())
+}
+
 fn validate_net_devices(spec: &CdiSpec) -> Result<(), CdiSpecError> {
     for edits in all_edits(spec) {
         let mut hosts: BTreeSet<&str> = BTreeSet::new();
@@ -767,7 +900,7 @@ fn stat_error() -> CdiSpecError {
 /// 固定済みハンドルの `/proc/self/fd/N` を読み取り用に開き直す。
 ///
 /// 対象ファイルの存在判定とは無関係なため、失敗は `NotFound` にせず常に `Internal` とする
-/// （`/proc` 欠落で実在する spec が不在扱いになり、呼び出し側が GPU 編集を飛ばすのを防ぐ。GPU-1）。
+/// （`/proc` 欠落で実在する spec が不在扱いになり、呼び出し側がそのデバイスの CDI 編集（deviceNodes・mounts・hooks 等）を適用せずに進むのを防ぐ。GPU-1）。
 #[cfg(all(
     target_os = "linux",
     any(
@@ -923,7 +1056,203 @@ fn read_cdi_spec_file_inner(path: &Path) -> Result<CdiSpec, CdiSpecError> {
 mod tests {
     use super::*;
 
+    /// wildcard の無い網羅 match。variant を足すとここでコンパイルが落ちる（`ALL` の件数と対）。
+    fn ordinal(code: CdiSpecErrorCode) -> usize {
+        match code {
+            CdiSpecErrorCode::InvalidArgument => 0,
+            CdiSpecErrorCode::ResourceExhausted => 1,
+            CdiSpecErrorCode::NotFound => 2,
+            CdiSpecErrorCode::Internal => 3,
+            CdiSpecErrorCode::Unimplemented => 4,
+        }
+    }
+
+    /// REPAIR-1・ERR-1: `ALL` が宣言順に全 variant を過不足なく並べている。
+    #[test]
+    fn err1_cdispecerrorcode_all_covers_every_variant() {
+        for (i, c) in CdiSpecErrorCode::ALL.into_iter().enumerate() {
+            assert_eq!(ordinal(c), i);
+        }
+        assert_eq!(CdiSpecErrorCode::ALL.len(), 5);
+        let set: std::collections::HashSet<_> = CdiSpecErrorCode::ALL.into_iter().collect();
+        assert_eq!(set.len(), 5);
+    }
+
+    /// ERR-1: ワイヤーへ出す code 名は固定（変えると互換が壊れる）。`from_name` は完全一致の逆写像。
+    #[test]
+    fn err1_cdispecerrorcode_wire_names_are_fixed_and_roundtrip() {
+        let table = [
+            (CdiSpecErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+            (CdiSpecErrorCode::ResourceExhausted, "RESOURCE_EXHAUSTED"),
+            (CdiSpecErrorCode::NotFound, "NOT_FOUND"),
+            (CdiSpecErrorCode::Internal, "INTERNAL"),
+            (CdiSpecErrorCode::Unimplemented, "UNIMPLEMENTED"),
+        ];
+        assert_eq!(table.len(), CdiSpecErrorCode::ALL.len());
+        for (i, (code, name)) in table.into_iter().enumerate() {
+            assert_eq!(CdiSpecErrorCode::ALL[i], code);
+            assert_eq!(code.as_str(), name);
+            assert_eq!(CdiSpecErrorCode::from_name(name), Some(code));
+        }
+        for bad in [
+            "",
+            "internal",
+            "INTERNAL ",
+            " INTERNAL",
+            "INTERNAL\n",
+            "UNKNOWN",
+        ] {
+            assert_eq!(CdiSpecErrorCode::from_name(bad), None, "{bad:?}");
+        }
+    }
+
     const SECRET: &str = "DUMMY_SECRET_TOKEN_12345";
+
+    /// 受理する spec を `cdiVersion` / kind / 名前 / permissions（YAML 断片）を差し替えて作る。
+    fn spec_with(version: &str, kind: &str, name: &str, perm: Option<&str>) -> String {
+        let p = perm.map_or(String::new(), |p| format!("\n          permissions: {p}"));
+        format!(
+            "cdiVersion: \"{version}\"\nkind: \"{kind}\"\ndevices:\n  - name: \"{name}\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/x{p}\n"
+        )
+    }
+
+    fn expect_msg(input: &str, msg: &str) {
+        let e = parse_cdi_spec(input).expect_err(input);
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument, "{input}");
+        assert_eq!(e.message(), msg, "{input}");
+        assert_eq!((e.line(), e.column()), (None, None), "{input}");
+    }
+
+    const KIND_MSG: &str = "CDI kind is not a valid vendor/class";
+    const NAME_MSG: &str = "CDI device name is invalid";
+    const PERM_MSG: &str = "CDI deviceNodes entry has invalid permissions";
+
+    /// GPU-1・SEC-1・#2984: kind の受理。
+    #[test]
+    fn gpu1_sec1_2984_kind_accepts_valid() {
+        for k in [
+            "v/c",
+            "V/C",
+            "a/b",
+            "a.b/c",
+            "nvidia.com/gpu",
+            "example.com/serial",
+            "vendor.example/gpu",
+            "a1/b2",
+            "v.e/c-d.e_f",
+            "foo.bar.baz/foo-bar123.B_az",
+        ] {
+            parse_cdi_spec(&spec_with("0.6.0", k, "a", None)).expect(k);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: kind の拒否。
+    #[test]
+    fn gpu1_sec1_2984_kind_rejects_invalid() {
+        for k in [
+            "v",
+            "/c",
+            "v/",
+            "/",
+            "v//c",
+            "v/c/d",
+            "vendor.com/foo/",
+            "0v/c",
+            "v/0c",
+            "-v/c",
+            "v./c",
+            "v/c.",
+            "v/c-",
+            "v/c:d",
+            "v:x/c",
+            "v /c",
+            "v/c d",
+            "v=x/c",
+            "é/c",
+            "v/cé",
+        ] {
+            expect_msg(&spec_with("0.6.0", k, "a", None), KIND_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: デバイス名の受理。
+    #[test]
+    fn gpu1_sec1_2984_device_name_accepts_valid() {
+        for n in [
+            "a",
+            "0",
+            "9z",
+            "all",
+            "GPU-00000000-0000-0000-0000-000000000000",
+            "ttyusb0",
+            "bus001-dev002",
+            "a:b",
+            "A-b.c_d:e",
+        ] {
+            parse_cdi_spec(&spec_with("0.6.0", "v/c", n, None)).expect(n);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: デバイス名の拒否。
+    #[test]
+    fn gpu1_sec1_2984_device_name_rejects_invalid() {
+        for n in [
+            "", "-a", "_a", ".a", ":a", "a-", "a.", "a:", "a_", "a b", "a/b", "a=b", "a\\tb", "aé",
+            "é",
+        ] {
+            expect_msg(&spec_with("0.6.0", "v/c", n, None), NAME_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: permissions の受理（`none` は古い版でも受ける）。
+    #[test]
+    fn gpu1_sec1_2984_permissions_accepts_valid() {
+        for p in [
+            "\"\"", "r", "w", "m", "rw", "rwm", "mwr", "rr", "rwmrwm", "none",
+        ] {
+            parse_cdi_spec(&spec_with("0.3.0", "v/c", "a", Some(p))).expect(p);
+        }
+        parse_cdi_spec(&spec_with("0.3.0", "v/c", "a", None)).expect("omitted");
+    }
+
+    /// GPU-1・SEC-1・#2984: permissions の拒否（デバイスの edits とトップレベルの edits の両方）。
+    #[test]
+    fn gpu1_sec1_2984_permissions_rejects_invalid() {
+        for p in [
+            "x", "rwx", "R", "RWM", "None", "NONE", "nonee", " r", "r ", "r w", "r,w", "-", "rw\\n",
+        ] {
+            let q = format!("\"{p}\"");
+            expect_msg(&spec_with("0.3.0", "v/c", "a", Some(&q)), PERM_MSG);
+            let top = format!(
+                "cdiVersion: \"0.3.0\"\nkind: v/c\ncontainerEdits:\n  deviceNodes:\n    - path: /dev/x\n      permissions: {q}\n"
+            );
+            expect_msg(&top, PERM_MSG);
+        }
+    }
+
+    /// GPU-1・SEC-1・#2984: エラーに入力の値を載せない。
+    #[test]
+    fn gpu1_sec1_2984_errors_do_not_leak_values() {
+        let inputs = [
+            spec_with("0.6.0", &format!("{SECRET}/c/d"), "a", None),
+            spec_with("0.6.0", "v/c", &format!("{SECRET} x"), None),
+            spec_with("0.6.0", "v/c", "a", Some(&format!("\"{SECRET}\""))),
+        ];
+        for i in inputs {
+            let e = parse_cdi_spec(&i).expect_err("invalid");
+            assert!(!e.message().contains(SECRET));
+            assert!(!e.to_string().contains(SECRET));
+        }
+    }
+
+    /// GPU-1・#2984: 版の検査が先（既存の版エラーのメッセージを変えない）。
+    #[test]
+    fn gpu1_2984_version_error_takes_precedence() {
+        let e = parse_cdi_spec(&spec_with("9.9.9", "bad", "-a", Some("x"))).expect_err("v");
+        assert!(e.message().contains("cdiVersion"), "{}", e.message());
+        let e = parse_cdi_spec(&spec_with("0.3.0", "v/c", "0a", None)).expect_err("v");
+        assert!(e.message().contains("0.5.0"), "{}", e.message());
+    }
 
     fn sample() -> String {
         format!(
@@ -1128,8 +1457,8 @@ containerEdits:
     #[cfg(unix)]
     #[test]
     fn gpu1_reads_regular_and_rejects_device_via_symlink() {
-        let dir = std::env::temp_dir().join(format!("fandhe-cdi-spec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 前回の残骸（古い symlink 等）の上で進めない（連番・作成前削除・Drop。REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fandhe-cdi-spec", "regular");
         let file = dir.join("spec.yaml");
         std::fs::write(&file, "cdiVersion: '0.5.0'\nkind: a.b/c\n").unwrap();
         let link_ok = dir.join("ok.yaml");

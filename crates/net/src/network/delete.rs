@@ -63,12 +63,32 @@
 //!
 //! 残余リスク（REPAIR-3）: 所有トークンを刻む前に失敗した bridge（`CreateBridge` の結果不明・`ResolveIndex`・
 //! `SetOwnerToken` の失敗）は別名が空のため証明できず、回収は成功しない（手動回収）。他者の同名資源が
-//! 残っている場合も同様。請求書はプロセスのメモリにだけあり、プロセスをまたぐ回収は未実装（担当 Issue 未確定）。
+//! 残っている場合も同様。請求書の永続化は呼び出し側 plugin-cri の責務（#2604）。
+//!
+//! # attach の取り残しの回収（#2681）
+//!
+//! `attach_container` が資源を残して失敗したとき（`ContainerAttachError::rollback` の `leftover`）、
+//! `ContainerAttachError::reclaim_claim` の請求書（[`FailedAttachClaim`]）で `reclaim_failed_attach`
+//! （Linux のみ）を呼ぶと、host 側 veth と netns の pin を回収できる。veth は、別名が endpoint のトークン
+//! （`host_owner_token`）に一致し、master が所有を確かめた bridge（`owned_bridge_index`）の ifindex に一致する
+//! ときだけ、照会で得た ifindex で削除する。bridge が無い・不一致のときは veth の所属を証明できないため
+//! `Unknown` のまま触れない。netns の pin は、請求書に控えた識別子を `netns::unpin_path_expecting` で
+//! 所有記録と照合して外す。再起動後の pin も、置き場の `.owned/<endpoint>` に永続化した所有記録と請求書と
+//! カーネルの実状態の三者が一致すれば外せる（#2824）。所有記録が無い・壊れている・一致しない pin
+//! （旧い請求書・手動回収後に作り直された別世代など）は拒否されて取り残しになり、手動回収に回る。
+//! `detach_container` の失敗の請求書（v2）が DNAT ルールのハンドルを載せているときは、veth より前に、
+//! 専用テーブルの所有（`NFTA_TABLE_USERDATA` がトークンと一致）と実体の同一性（生きたテーブルのハンドルが
+//! 請求書と一致）を確かめてからハンドル指定で消す（#3285。`reclaim_port_rules`）。テーブルが無い・作り直された
+//! 場合はルールも無いので回収済み、所有を証明できない場合は消さずに `Unknown`。一括削除が ENOENT で中止されたら
+//! 1 本ずつ消し直す。残余リスク: 所有の証明と DELRULE の間にテーブルが差し替えられる窓は `unpublish` と同じ水準で残る。
+//! quarantine（アドレス・ポート予約と、ハンドルを持てなかった DNAT ルール）は
+//! プロセス内の保持で、解放は `delete_network` が行う。pin の置き場 `netns_dir` は請求書ではなく呼び出し側の
+//! 固定設定から受ける。
 //!
 //! # veth の所有
 //!
 //! ifindex は削除後に再利用されうるため、ifindex だけでは veth の所有を証明できない。接続時に host 側
-//! veth の `IFLA_IFALIAS` へ所有トークンを刻み（`AttachedContainer::host_token`）、削除の直前に名前から
+//! veth の `IFLA_IFALIAS` へ、接続ごとの世代（再接続で変わる）を含む所有トークンを刻み（`AttachedContainer::host_token`。形式は `host_owner_token`）、削除の直前に名前から
 //! ifindex・別名・所属先 master を引き直して、ifindex が記録と一致し、別名がトークンと一致し、かつ master が
 //! このネットワークの bridge であることを確認する。いずれかを満たさない link は元の veth と証明できないため
 //! 削除せず `Unknown` で報告する。ifindex が記録と異なり別名もトークンと異なる場合は、同名の別 link への
@@ -88,12 +108,18 @@
 //! - テーブルの所有トークンは `NFTA_TABLE_USERDATA` を保持するカーネルを前提とする。保持しない
 //!   カーネルではトークンが読み戻せず、削除は拒否される（手動解放）
 //! - link の dump API が無いため、IPAM に記録されていない孤児 veth は回収しない。担当 Issue 未確定
-//! - コンテナ単体の切り離しと、プロセスをまたぐ残置 pin の清掃は未実装。担当 Issue 未確定
+//! - コンテナ単体の切り離しは `detach_container`（`delete/detach.rs`。#3062）。他のコンテナを残したまま公開 → veth → pin → アドレスの順に解放する。attach の取り残しの veth は #2681、再起動後の pin は #2824 で回収できる
 //! - pin 置き場の記録は IPAM のメモリ上の状態で、永続化（IPAM 状態の永続化と同じく未実装・担当 Issue 未確定）
 //!   されるまでは、復元した払い出しの pin を照合できない（上記のとおりアドレスを保持する）
 
+mod detach;
+// 実機の呼び出しは Linux 限定。他 OS では試験だけがコンパイルする。
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod member_after_reboot;
+pub(crate) mod member_detach;
+
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -105,15 +131,25 @@ use crate::netlink_route::{LinkDelete, NetlinkRouteSocket};
 use crate::netns::{self, ContainerNetns};
 #[cfg(target_os = "linux")]
 use crate::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableDelete, TableGet};
-use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
+use crate::nftables_batch::{NftBatchOutcome, NftName, NftTableHandle, TableInfo};
+use crate::nftables_rules::NftRuleHandle;
+#[cfg(target_os = "linux")]
+use crate::nftables_rules::RuleDelete;
 
+pub use detach::ContainerDetachError;
+#[cfg(target_os = "linux")]
+pub use detach::detach_container;
+
+use super::attach_claim::PinIdentity;
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
-    AttachedContainer, CreatedNetwork, EndpointId, FailedCreateClaim, NetnsDirRecord, NetworkName,
-    NetworkResourceNames, NftApplyFailure, PortRegistry, ResourceState, StaticIpam, UnpinFailure,
-    VethNames, host_owner_token, is_indeterminate, token_names_network,
+    AttachedContainer, CreatedNetwork, EndpointId, FailedAttachClaim, FailedCreateClaim,
+    NetnsDirRecord, NetworkName, NetworkResourceNames, NftApplyFailure, PortPublish, PortRegistry,
+    ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, host_token_is_for,
+    is_indeterminate, is_valid_generation, token_names_network,
 };
+use crate::network_store::member::RecordedPublish;
 
 /// 失敗した手順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +169,8 @@ pub enum DeleteStep {
     DeleteBridge,
     /// IPAM・ポート予約の解放。
     ReleaseReservations,
+    /// コンテナ単体の切り離しでの公開（DNAT ルール）の個別解除（`detach_container`。#3062）。
+    UnpublishPorts,
 }
 
 /// 削除対象のリソース。
@@ -151,6 +189,8 @@ pub enum DeleteResource {
     Address(EndpointId, IpPrefix),
     /// ポート予約（ネットワーク単位）。
     PortReservation(NetworkName),
+    /// コンテナ単体の切り離しで扱った公開 1 件（DNAT ルール 2 本と受け口の予約。#3062）。
+    PortRules(EndpointId, PortPublish),
 }
 
 /// ネットワーク削除の結果。
@@ -204,6 +244,11 @@ impl<N: std::fmt::Debug> std::error::Error for NetworkDeleteError<N> {}
 pub(crate) trait DeleteOps {
     /// netns ハンドル（Linux では fd と pin パス）。
     type Netns;
+    /// 手順全体の期限（REPAIR-5）を過ぎたか。期限を持たない実装（`delete_network` 等）は常に `false`。
+    /// `detach_container_with` が、カーネル要求を出す前に確かめる（#3258）。
+    fn deadline_exceeded(&self) -> bool {
+        false
+    }
     /// 名前から ifindex を引く。
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError>;
     /// 名前から ifindex・所属先 master（bridge）の ifindex・別名（所有トークン）を引く。veth の所有確認に使う。
@@ -214,6 +259,14 @@ pub(crate) trait DeleteOps {
     fn delete_link(&self, link: IfIndex) -> Result<(), NetError>;
     /// pin を外す。失敗時はハンドルを返す。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
+    /// ハンドルを持たない pin をパスで外す（attach の取り残しの回収。#2681）。同じプロセスの所有記録に
+    /// 照合できない pin、および請求書に控えた識別子 `expected` と別の作成の pin（同じ名前に作り直された新しい
+    /// 世代）は `FailedPrecondition` で拒否される（`netns::unpin_path_expecting`）。
+    fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError>;
+    /// ホストの再起動をまたぐ回収用に、マウントの無い空の pin ファイルと所有記録だけを消す。マウントが
+    /// あれば umount せず `FailedPrecondition` で拒否する（`netns::unpin_stale_path_expecting`。#3412）。
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    fn unpin_stale_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError>;
     /// 接続時に記録した置き場 `dir` の直下に `endpoint` 名の pin が残っているか（`NotFound` だけが `Ok(false)`）。
     /// 置き場が記録と同じ実体と確認できなければ [`PinCheckError::Dir`]。何も変更しない。
     fn pin_exists(
@@ -221,10 +274,28 @@ pub(crate) trait DeleteOps {
         dir: &NetnsDirRecord,
         endpoint: &EndpointId,
     ) -> Result<bool, PinCheckError>;
+    /// 固定設定の置き場 `dir` を検査して開き、直下に `endpoint` 名の pin が無いことを確かめる
+    /// （`Ok(true)` が不存在。置き場を検査できない・判定できない場合は `Err`。何も変更しない。#2681）。
+    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError>;
     /// 専用テーブルのハンドルとユーザーデータ（所有トークン）を引く（読み取り専用の照会）。無ければ `NotFound`。
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
     /// 専用テーブルをハンドル指定で削除する（配下の chain・ルールも消える）。名前では消さない。
     fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルの DNAT ルール 2 本（`prerouting`・`output`）をハンドル指定で 1 バッチ（all-or-nothing）で
+    /// 削除する（コンテナ単体の切り離しの公開の個別解除。`unpublish_container_port` と同じ手順。#3062）。
+    fn delete_rules(
+        &self,
+        table: &NftName,
+        handles: (NftRuleHandle, NftRuleHandle),
+    ) -> Result<(), NftApplyFailure>;
+    /// 専用テーブルの指定したチェインの DNAT ルール 1 本をハンドル指定で削除する（1 バッチ）。請求書の
+    /// 回収で、2 本の一括削除が ENOENT で中止された後に、残っている 1 本を確実に消すために使う（#3285）。
+    fn delete_rule(
+        &self,
+        table: &NftName,
+        chain: &'static str,
+        handle: NftRuleHandle,
+    ) -> Result<(), NftApplyFailure>;
 }
 
 /// 渡されていない endpoint の pin の残存確認の失敗。
@@ -310,7 +381,7 @@ fn prove_bridge<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> BridgeProof 
 }
 
 /// 専用 nft テーブルの所有確認の結果。作成時に `NFTA_TABLE_USERDATA` へ載せたトークンの一致で証明する。
-enum TableProof {
+pub(super) enum TableProof {
     /// トークンが一致した。削除に使うハンドル。
     Owned(u64),
     /// テーブルが無い（前回の削除で解放済み）。
@@ -325,7 +396,12 @@ fn prove_table<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> TableProof {
 
 /// `table` の所有を、`token` と `NFTA_TABLE_USERDATA` の一致で証明する（作成失敗の回収でも共用。#2467）。
 fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> TableProof {
-    match ops.table_info(table) {
+    judge_table_info(ops.table_info(table), token)
+}
+
+/// テーブル照会の結果を所有の証明へ写す（`prove_table_token` と、公開の個別解除の所有確認が共用する）。
+pub(super) fn judge_table_info(info: Result<TableInfo, NetError>, token: &str) -> TableProof {
+    match info {
         Err(e) if e.code() == NetErrorCode::NotFound => TableProof::Absent,
         Err(e) => TableProof::Unproven(e),
         Ok(info) => match (info.handle(), info.userdata()) {
@@ -335,6 +411,68 @@ fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> Tab
             )),
         },
     }
+}
+
+/// 公開の個別解除（`network::unpublish`）の事前確認。テーブルの `NFTA_TABLE_USERDATA` が `token` と一致する
+/// ときだけ、生きたテーブルのハンドルを返す。無い・不一致・照会失敗・ハンドル欠落（0 を含む）はすべて `Err`
+/// （何も変えずに断る）。ルールのハンドルはテーブルごとに採番されるため、同名で作り直された別のテーブルで
+/// 古いハンドルが別のルールを消すのを防ぐ。返したハンドルは、記録したテーブルハンドルとの照合に使う
+/// （userdata は退避・復元で作り直されたテーブルでも同じになりうるが、ハンドルは変わる。NET-3・SEC-1・#3068）。
+// 呼び出し元の `unpublish` は OS 非依存の本体だが、実機の呼び出しは Linux 限定。
+pub(super) fn require_table_owned(
+    info: Result<TableInfo, NetError>,
+    token: &str,
+) -> Result<NftTableHandle, NetError> {
+    match judge_table_info(info, token) {
+        TableProof::Owned(handle) => {
+            NftTableHandle::new(handle).map_err(|_| precondition("nft table handle is not usable"))
+        }
+        TableProof::Absent => Err(precondition("nft table is absent")),
+        TableProof::Unproven(e) => Err(e),
+    }
+}
+
+/// ネットワークのハンドルと IPAM の整合を検証する（何も変更しない）。`CreatedNetwork` も公開フィールドの
+/// ため、bridge・テーブル名と所有トークンがネットワーク名から導出したものと食い違っていないこと、IPAM が
+/// そのネットワークのものであることを確かめる。
+fn validate_network(network: &CreatedNetwork, ipam: &StaticIpam) -> Result<(), NetError> {
+    let consistent = NetworkResourceNames::derive(&network.name).is_ok_and(|n| {
+        n.bridge() == &network.bridge
+            && n.table() == &network.table
+            && token_names_network(&network.bridge_token, &network.name)
+    });
+    if !consistent {
+        return Err(precondition("network handle is inconsistent with its name"));
+    }
+    if ipam.network() != &network.name || ipam.gateway() != network.gateway {
+        return Err(precondition("ipam does not belong to the network"));
+    }
+    Ok(())
+}
+
+/// 渡されたコンテナが、このネットワークと IPAM の払い出しに属することを検証する（何も変更しない）。
+///
+/// 公開フィールドは呼び出し側が書き換えうるため、所有の判断に使う値はすべてネットワークと IPAM から
+/// 再導出した値と照合する。veth の所有トークンは bridge のトークンと endpoint から、pin のパスは接続時に
+/// 記録した置き場（記録があれば）から導く。`delete_network_with` と `detach_container_with` が共用する。
+fn validate_container<N>(
+    network: &CreatedNetwork,
+    ipam: &StaticIpam,
+    c: &AttachedContainer<N>,
+) -> Result<(), NetError> {
+    let names = VethNames::derive(&c.endpoint)?;
+    let pin_mismatch = ipam
+        .netns_dir_of(&c.endpoint)
+        .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
+    if ipam.address_of(&c.endpoint) != Some(c.address)
+        || names.host() != &c.host_veth
+        || names.peer() != &c.peer_veth
+        || !host_token_is_for(&network.bridge_token, &c.endpoint, &c.host_token)
+        || pin_mismatch
+    {
+        return Err(precondition("container does not belong to the network"));
+    }
+    Ok(())
 }
 
 /// 削除手順本体（OS 非依存。`ops` を差し替えて 3 OS で単体テストできる）。手順と方針はモジュール doc。
@@ -348,28 +486,9 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
 ) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
     let mut report = NetworkDeleteReport::default();
 
-    // 0. 入力検証（何も変更しない）。`CreatedNetwork` も公開フィールドのため、bridge・テーブル名と
-    //    所有トークンがネットワーク名から導出したものと食い違っていないことを確かめる。
-    let consistent = NetworkResourceNames::derive(&network.name).is_ok_and(|n| {
-        n.bridge() == &network.bridge
-            && n.table() == &network.table
-            && token_names_network(&network.bridge_token, &network.name)
-    });
-    if !consistent {
-        return Err(fail(
-            precondition("network handle is inconsistent with its name"),
-            DeleteStep::Validate,
-            report,
-            containers,
-        ));
-    }
-    if ipam.network() != &network.name || ipam.gateway() != network.gateway {
-        return Err(fail(
-            precondition("ipam does not belong to the network"),
-            DeleteStep::Validate,
-            report,
-            containers,
-        ));
+    // 0. 入力検証（何も変更しない）。
+    if let Err(e) = validate_network(network, ipam) {
+        return Err(fail(e, DeleteStep::Validate, report, containers));
     }
     let mut passed: HashSet<EndpointId> = HashSet::new();
     let mut invalid: Option<NetError> = None;
@@ -381,28 +500,9 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             ));
             break;
         }
-        match VethNames::derive(&c.endpoint) {
-            Err(e) => {
-                invalid = Some(e);
-                break;
-            }
-            Ok(names) => {
-                // 公開フィールドは呼び出し側が書き換えうるため、所有の判断に使う値はすべてネットワークと
-                // IPAM から再導出した値と照合する。veth の所有トークンは bridge のトークンと endpoint から、
-                // pin のパスは接続時に記録した置き場（記録があれば）から導く。
-                let pin_mismatch = ipam
-                    .netns_dir_of(&c.endpoint)
-                    .is_some_and(|d| d.path().join(c.endpoint.as_str()) != c.netns_path);
-                if ipam.address_of(&c.endpoint) != Some(c.address)
-                    || names.host() != &c.host_veth
-                    || names.peer() != &c.peer_veth
-                    || host_owner_token(&network.bridge_token, &c.endpoint) != c.host_token
-                    || pin_mismatch
-                {
-                    invalid = Some(precondition("container does not belong to the network"));
-                    break;
-                }
-            }
+        if let Err(e) = validate_container(network, ipam, c) {
+            invalid = Some(e);
+            break;
         }
     }
     if let Some(error) = invalid {
@@ -496,9 +596,12 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
             host_index,
             host_token,
             peer_veth,
+            container_ifname,
             netns_path,
             address,
             netns,
+            published_ports,
+            pin_identity,
         } = c;
         let veth_gone = delete_veth(
             ops,
@@ -522,9 +625,12 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 host_index,
                 host_token,
                 peer_veth,
+                container_ifname,
                 netns_path,
                 address,
                 netns,
+                published_ports,
+                pin_identity,
             });
             false
         } else {
@@ -546,9 +652,12 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                         host_index,
                         host_token,
                         peer_veth,
+                        container_ifname,
                         netns_path,
                         address,
                         netns,
+                        published_ports,
+                        pin_identity,
                     });
                     false
                 }
@@ -730,6 +839,280 @@ pub(crate) fn reclaim_failed_create_with<O: DeleteOps>(
     }
 }
 
+/// attach の巻き戻しで取り残した veth・netns の pin を、所有を証明してから回収する本体（OS 非依存。#2681）。
+/// 手順と方針はモジュール doc「attach の取り残しの回収」。各資源は独立に扱い、最初のエラーだけを保持する（ERR-1）。
+/// `netns_dir` は呼び出し側の固定設定で、請求書の内容からは受けない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
+    ops: &O,
+    claim: &FailedAttachClaim,
+    netns_dir: &Path,
+) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
+    let mut report = NetworkDeleteReport::default();
+    let mut failures = Failures::default();
+    let token = claim.token();
+
+    // 1. 入力検証（カーネル I/O の前）。名前は請求書から再導出し、トークンがそのネットワークの発行形式で
+    //    なければ何も触れずに拒否する。
+    let validated = NetworkResourceNames::derive(claim.network())
+        .and_then(|n| VethNames::derive(claim.endpoint()).map(|v| (n, v)));
+    let (names, veth_names) = match validated {
+        Ok(p) if token_names_network(token, claim.network()) => p,
+        Ok(_) => {
+            return Err(fail(
+                precondition("reclaim token does not belong to the network"),
+                DeleteStep::Validate,
+                report,
+                Vec::new(),
+            ));
+        }
+        Err(e) => return Err(fail(e, DeleteStep::Validate, report, Vec::new())),
+    };
+
+    // 2. DNAT ルール（請求書が載せたときだけ。v1 の請求書では何もしない）。detach の「公開 → veth → netns」と
+    //    同じ順で、veth より前に置く。ルールの回収の失敗でも、独立した資源の veth・pin の回収は続ける。
+    reclaim_port_rules(ops, claim, names.table(), token, &mut report, &mut failures);
+
+    // 3. host 側 veth。別名が endpoint のトークンと一致し、master が所有を確かめた bridge と一致するときだけ、
+    //    照会で得た ifindex で消す。名前では消さない。
+    if claim.includes_veth() {
+        let host = veth_names.host();
+        let res = DeleteResource::Veth(host.clone());
+        match ops.link_attachment(host) {
+            Err(e) if e.code() == NetErrorCode::NotFound => report.removed.push(res),
+            Err(e) => {
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(e, DeleteStep::DeleteVeth);
+            }
+            Ok(att) => {
+                let want = host_owner_token(token, claim.endpoint(), claim.generation());
+                let bridge = ops.owned_bridge_index(names.bridge(), token);
+                match bridge {
+                    Err(e) => {
+                        // bridge が無い・差し替え・判定不能では veth の所属を証明できない。触れない。
+                        report.leftover.push((res, ResourceState::Unknown));
+                        failures.note(e, DeleteStep::DeleteVeth);
+                    }
+                    Ok(_) if att.alias.as_deref() != Some(want.as_str()) => {
+                        report.leftover.push((res, ResourceState::Unknown));
+                        failures.note(
+                            precondition("veth ownership token mismatch (ownership not proven)"),
+                            DeleteStep::DeleteVeth,
+                        );
+                    }
+                    Ok(b) if att.master != Some(b) => {
+                        report.leftover.push((res, ResourceState::Unknown));
+                        failures.note(
+                            precondition(
+                                "veth is not attached to the network bridge (ownership not proven)",
+                            ),
+                            DeleteStep::DeleteVeth,
+                        );
+                    }
+                    Ok(_) => match ops.delete_link(att.index) {
+                        Ok(()) => report.removed.push(res),
+                        Err(e) if e.code() == NetErrorCode::NotFound => report.removed.push(res),
+                        Err(e) => {
+                            report.leftover.push((res, state_of(e.code())));
+                            failures.note(e, DeleteStep::DeleteVeth);
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    // 4. netns の pin。プロセス内または永続の所有記録（#2824）と請求書の識別子に照合できる pin だけを外せる。
+    //    照合できない pin は拒否されて取り残しになり、手動回収に回る（fail-closed）。
+    //    解除は、請求書に控えた pin の実体の識別子（dev・ino・作成の連番）を解除の直前に所有記録と照合する
+    //    `unpin_path` で行う。同じ endpoint・置き場に作り直された新しい pin は識別子が違うため、古い請求書では
+    //    外れない（veth の不在は pin の世代の証明にならない。fail-closed。#2681）。識別子を控えていない請求書は
+    //    pin に触れない。加えて、同じ endpoint の veth がこの請求書の世代のものと確認できる（または存在しない）
+    //    ときだけ pin へ進む。
+    //    veth を含む請求書は、veth を消せた（消失を確認した）ときだけ。netns のみの請求書は、同じ endpoint の host veth が
+    //    世代を問わず居ないときだけ（居れば請求書を消費させず未回収として拒否する）。
+    if claim.includes_netns() {
+        let pin = netns_dir.join(claim.endpoint().as_str());
+        let res = DeleteResource::Netns(pin.clone());
+        let veth_res = DeleteResource::Veth(veth_names.host().clone());
+        // netns のみの請求書で、請求書が含まない host veth が同じ endpoint に（世代を問わず）居ないかを確かめる。
+        // 居る間は成功を返さない。返すと請求書が消費され、veth が bridge 上に追跡外で残って再 attach が
+        // AlreadyExists になる（NET-1・REPAIR-3）。veth は請求書の対象外のため、ここでは消さず、手動回収または
+        // 別の請求書に委ねる。pin の識別子の有無に関わらず同じ判定を通す（#2681）。
+        let uncovered_veth_absent = || match ops.link_attachment(veth_names.host()) {
+            Err(e) if e.code() == NetErrorCode::NotFound => Ok(()),
+            Err(e) => Err(e),
+            Ok(_) => Err(precondition(
+                "endpoint still has a host veth not covered by the claim; netns pin left in place",
+            )),
+        };
+        // 識別子を控えていない請求書（`create_pinned` のタイムアウト等）は pin を外せない。ただし固定設定の
+        // 置き場で pin の不存在を安全に確認できたら、回収済みとして冪等に扱う（回収側が既に消した場合に
+        // detach / delete_network が永久に未回収扱いになるのを避ける）。存在する・確認できないなら拒否する。
+        if claim.pin().is_none() {
+            match ops.pin_absent(netns_dir, claim.endpoint()) {
+                // veth を含む請求書の veth は手順 2 で判定済み（消せなければ失敗が記録されている）。
+                Ok(true) if claim.includes_veth() => report.removed.push(res),
+                Ok(true) => {
+                    // pin は確かに無い。ただし請求書が含まない veth が残るなら、請求書を消費させない。
+                    report.removed.push(res);
+                    if let Err(e) = uncovered_veth_absent() {
+                        report.leftover.push((veth_res, ResourceState::Unknown));
+                        failures.note(e, DeleteStep::UnpinNetns);
+                    }
+                }
+                Ok(false) => {
+                    report.leftover.push((res, ResourceState::Unknown));
+                    failures.note(
+                        precondition("claim has no pin identity; netns pin left in place"),
+                        DeleteStep::UnpinNetns,
+                    );
+                }
+                Err(e) => {
+                    report.leftover.push((res, ResourceState::Unknown));
+                    failures.note(e, DeleteStep::UnpinNetns);
+                }
+            }
+            return match failures.first {
+                None => Ok(report),
+                Some((error, step)) => Err(fail(error, step, report, Vec::new())),
+            };
+        }
+        let proven: Result<(), NetError> = if claim.includes_veth() {
+            if report.removed.contains(&veth_res) {
+                Ok(())
+            } else {
+                Err(precondition(
+                    "veth ownership not proven; netns pin left in place",
+                ))
+            }
+        } else {
+            // 請求書が含まない host veth が居る間は pin を外さず成功も返さない。
+            uncovered_veth_absent()
+        };
+        match proven {
+            Err(e) => {
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(e, DeleteStep::UnpinNetns);
+            }
+            Ok(()) => match claim.pin().map_or_else(
+                || Err(precondition("claim has no pin identity")),
+                |id| ops.unpin_path(&pin, id),
+            ) {
+                Ok(()) => report.removed.push(res),
+                Err(e) => {
+                    report.leftover.push((res, state_of(e.code())));
+                    failures.note(e, DeleteStep::UnpinNetns);
+                }
+            },
+        }
+    }
+
+    match failures.first {
+        None => Ok(report),
+        Some((error, step)) => Err(fail(error, step, report, Vec::new())),
+    }
+}
+
+/// 請求書（v2）が載せた DNAT ルールを、テーブルの所有と実体の同一性を確かめてから消す（NET-1・NET-3・SEC-1・#3285）。
+///
+/// - テーブルが無い: ルールも無いので、全件を回収済みにする（冪等）
+/// - 所有を証明できない（照会の失敗・userdata の不一致・ハンドル欠落・ハンドル 0）: DELRULE を送らず `Unknown` の取り残し
+/// - 生きたテーブルのハンドルが請求書と違う: 記録した実体はもう無く、記録したルールも無い（同名の作り直し）。
+///   送らずに回収済みにする。アドレスと予約の quarantine は請求書に残り、`delete_network` が解放する
+/// - 一致: 公開ごとにハンドル指定で削除する。ルールハンドルはテーブルの寿命の中で再利用されないため、実体が
+///   同一なら ENOENT は「既に無い」と読める。一括削除が ENOENT で中止されたら 1 本ずつ消し直し、片方だけ
+///   残る場合も残りを消す。それ以外の失敗は取り残し（`Aborted`・`NotSent` は `Present`、不明は `Unknown`）
+fn reclaim_port_rules<O: DeleteOps>(
+    ops: &O,
+    claim: &FailedAttachClaim,
+    table: &NftName,
+    token: &str,
+    report: &mut NetworkDeleteReport,
+    failures: &mut Failures,
+) {
+    let Some(rules) = claim.port_rules() else {
+        return;
+    };
+    let resource =
+        |p: &RecordedPublish| DeleteResource::PortRules(claim.endpoint().clone(), *p.publish());
+    match prove_table_token(ops, table, token) {
+        TableProof::Absent => {
+            report.removed.extend(rules.ports.iter().map(resource));
+        }
+        TableProof::Unproven(e) => {
+            report.leftover.extend(
+                rules
+                    .ports
+                    .iter()
+                    .map(|p| (resource(p), ResourceState::Unknown)),
+            );
+            failures.note(e, DeleteStep::UnpublishPorts);
+        }
+        // ハンドル 0 は実体の同一性を比べられない（`require_table_owned` と同じく使えない値）。作り直しと
+        // 読み替えて回収済みにすると請求書からルールのハンドルが落ちるため、DELRULE を送らず取り残しにする。
+        TableProof::Owned(0) => {
+            report.leftover.extend(
+                rules
+                    .ports
+                    .iter()
+                    .map(|p| (resource(p), ResourceState::Unknown)),
+            );
+            failures.note(
+                precondition("nft table handle is not usable"),
+                DeleteStep::UnpublishPorts,
+            );
+        }
+        TableProof::Owned(live) if live != rules.table.get() => {
+            report.removed.extend(rules.ports.iter().map(resource));
+        }
+        TableProof::Owned(_) => {
+            for p in &rules.ports {
+                match delete_rule_pair(ops, table, p) {
+                    Ok(()) => report.removed.push(resource(p)),
+                    Err(f) => {
+                        let state = if f.outcome == NftBatchOutcome::Unknown {
+                            ResourceState::Unknown
+                        } else {
+                            ResourceState::Present
+                        };
+                        report.leftover.push((resource(p), state));
+                        failures.note(f.error, DeleteStep::UnpublishPorts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 公開 1 件の DNAT ルール 2 本を消す。一括削除が ENOENT（`Aborted` かつ `NotFound`）で中止されたら、
+/// 1 本ずつ消し直す（片方だけ残るとき残りを確実に消す）。1 本ごとの ENOENT は「既に無い」とみなす。
+/// 失敗は最初の 1 件を返す。
+fn delete_rule_pair<O: DeleteOps>(
+    ops: &O,
+    table: &NftName,
+    p: &RecordedPublish,
+) -> Result<(), NftApplyFailure> {
+    let is_absent = |f: &NftApplyFailure| {
+        f.outcome == NftBatchOutcome::Aborted && f.error.code() == NetErrorCode::NotFound
+    };
+    match ops.delete_rules(table, (p.prerouting(), p.output())) {
+        Err(f) if is_absent(&f) => {
+            let mut first = None;
+            for (chain, handle) in [("prerouting", p.prerouting()), ("output", p.output())] {
+                if let Err(f) = ops.delete_rule(table, chain, handle)
+                    && !is_absent(&f)
+                    && first.is_none()
+                {
+                    first = Some(f);
+                }
+            }
+            first.map_or(Ok(()), Err)
+        }
+        other => other,
+    }
+}
+
 /// veth を ifindex 指定で削除する。消えている（または今回消せた）なら `true`。
 fn delete_veth<O: DeleteOps>(
     ops: &O,
@@ -755,6 +1138,24 @@ fn delete_veth<O: DeleteOps>(
         Ok(LinkAttachment {
             index: now, alias, ..
         }) if now != expected => {
+            // 同じ endpoint の別世代のトークン（再接続された新しい veth）。渡された handle は古い世代のもので、
+            // 決定的な pin のパスは新しい接続のものを指すため、消失済みと扱って unpin に進むと現在の pin を
+            // 消してしまう。削除も unpin もしない（fail-closed。#2681・NET-1・NET-6）。
+            let newer_generation = token.rfind("/g/").is_some_and(|i| {
+                let (prefix, generation) = token.split_at(i + 3);
+                is_valid_generation(generation)
+                    && alias
+                        .as_deref()
+                        .is_some_and(|a| a.strip_prefix(prefix).is_some_and(is_valid_generation))
+            });
+            if newer_generation && alias.as_deref() != Some(token) {
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(
+                    precondition("veth belongs to a different attach generation"),
+                    DeleteStep::DeleteVeth,
+                );
+                return false;
+            }
             if alias.as_deref() == Some(token) {
                 // 所有トークンは一致するのに ifindex が記録と異なる。host 側 veth の ifindex は生存中に
                 // 変わらないため、渡された記録（`host_index`）が実体と食い違っている。この link を消失済みと
@@ -841,24 +1242,44 @@ fn delete_bridge<O: DeleteOps>(
     }
 }
 
-/// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。
+/// Linux のカーネル実装。各要求に `timeout` を期限として渡す（REPAIR-5）。`deadline` があれば手順全体の
+/// 期限で、各要求の期限をその残り時間で切り詰める（`detach_container`。#3258）。
 #[cfg(target_os = "linux")]
-struct LinuxDeleteOps<'a> {
-    route: &'a NetlinkRouteSocket,
-    nft: &'a NetlinkNetfilterSocket,
-    timeout: Duration,
+pub(super) struct LinuxDeleteOps<'a> {
+    pub(super) route: &'a NetlinkRouteSocket,
+    pub(super) nft: &'a NetlinkNetfilterSocket,
+    pub(super) timeout: Duration,
+    pub(super) deadline: Option<crate::sys::Deadline>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxDeleteOps<'_> {
+    /// 1 件のカーネル要求に渡す期限（全体の期限があれば残り時間を超えない。残りが 0 なら送信側が `Timeout`）。
+    fn request_timeout(&self) -> Duration {
+        self.deadline
+            .as_ref()
+            .map_or(self.timeout, |d| self.timeout.min(d.remaining()))
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl DeleteOps for LinuxDeleteOps<'_> {
     type Netns = ContainerNetns;
 
+    fn deadline_exceeded(&self) -> bool {
+        self.deadline
+            .as_ref()
+            .is_some_and(|d| d.remaining().is_zero())
+    }
+
     fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
-        self.route.link_index(name, self.timeout)
+        self.route.link_index(name, self.request_timeout())
     }
 
     fn link_attachment(&self, name: &IfName) -> Result<LinkAttachment, NetError> {
-        let (index, master, alias) = self.route.link_index_master_alias(name, self.timeout)?;
+        let (index, master, alias) = self
+            .route
+            .link_index_master_alias(name, self.request_timeout())?;
         Ok(LinkAttachment {
             index,
             master,
@@ -867,17 +1288,26 @@ impl DeleteOps for LinuxDeleteOps<'_> {
     }
 
     fn owned_bridge_index(&self, name: &IfName, token: &str) -> Result<IfIndex, NetError> {
-        self.route.link_index_owned(name, token, self.timeout)
+        self.route
+            .link_index_owned(name, token, self.request_timeout())
     }
 
     fn delete_link(&self, link: IfIndex) -> Result<(), NetError> {
         self.route
-            .delete_link(&LinkDelete::new(link_ref(link)?), self.timeout)
+            .delete_link(&LinkDelete::new(link_ref(link)?), self.request_timeout())
             .map(|_| ())
     }
 
     fn unpin_netns(&self, ns: ContainerNetns) -> Result<(), UnpinFailure<ContainerNetns>> {
         netns::unpin(ns)
+    }
+
+    fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+        netns::unpin_path_expecting(pin, expected)
+    }
+
+    fn unpin_stale_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+        netns::unpin_stale_path_expecting(pin, expected)
     }
 
     fn pin_exists(
@@ -888,14 +1318,20 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         netns::pin_exists_in(dir.path(), dir.dir_id(), endpoint)
     }
 
+    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError> {
+        netns::pin_absent_in(dir, endpoint)
+    }
+
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
-        self.nft
-            .table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), self.timeout)
+        self.nft.table_info(
+            &TableGet::new(NftFamily::Ipv4, table.clone()),
+            self.request_timeout(),
+        )
     }
 
     fn delete_table(&self, table: &NftName, handle: u64) -> Result<(), NftApplyFailure> {
         self.nft
-            .send_batch(self.timeout, |batch| {
+            .send_batch(self.request_timeout(), |batch| {
                 batch.push_with(|seq| {
                     TableDelete::by_handle(NftFamily::Ipv4, table.clone(), handle).build(seq)
                 })?;
@@ -906,6 +1342,46 @@ impl DeleteOps for LinuxDeleteOps<'_> {
                 outcome: e.outcome(),
                 error: e.into(),
             })
+    }
+
+    fn delete_rules(
+        &self,
+        table: &NftName,
+        (prerouting, output): (NftRuleHandle, NftRuleHandle),
+    ) -> Result<(), NftApplyFailure> {
+        self.nft
+            .send_batch(self.request_timeout(), |batch| {
+                for (chain, handle) in [("prerouting", prerouting), ("output", output)] {
+                    let rule = RuleDelete::new(
+                        NftFamily::Ipv4,
+                        table.clone(),
+                        NftName::new(chain)?,
+                        handle,
+                    );
+                    batch.push_with(|seq| rule.build(seq))?;
+                }
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|e| NftApplyFailure {
+                outcome: e.outcome(),
+                error: e.into(),
+            })
+    }
+
+    fn delete_rule(
+        &self,
+        table: &NftName,
+        chain: &'static str,
+        handle: NftRuleHandle,
+    ) -> Result<(), NftApplyFailure> {
+        crate::network::unpublish::linux_delete_rule(
+            self.nft,
+            self.request_timeout(),
+            table,
+            chain,
+            handle,
+        )
     }
 }
 
@@ -934,6 +1410,7 @@ pub fn delete_network(
             route,
             nft,
             timeout,
+            deadline: None,
         },
         network,
         containers,
@@ -961,8 +1438,38 @@ pub fn reclaim_failed_create(
             route,
             nft,
             timeout,
+            deadline: None,
         },
         claim,
+    )
+}
+
+/// attach の巻き戻しで取り残した veth・netns の pin を、所有を証明してから回収する（NET-1・#2681）。
+///
+/// `claim` は `ContainerAttachError::reclaim_claim` か、plugin 自身が書いた記録の復号
+/// （`FailedAttachClaim::from_record`）で得る。host 側 veth は、別名が endpoint のトークンに一致し、
+/// master が所有を確かめた bridge に一致する場合だけ、照会で得た ifindex で削除する。不一致・判定不能は
+/// 触れずに `Unknown` で報告する（fail-closed）。netns の pin は、請求書の識別子とプロセス内または永続の
+/// 所有記録（#2824）に一致するものだけを外せる（照合できない pin は `FailedPrecondition` で取り残しになる）。`netns_dir` は呼び出し側の固定設定で、
+/// 記録からは受けない。取り残しがあれば `Err` で、`report` に解放済みと取り残しを載せる。
+/// `CAP_NET_ADMIN`（と unpin の `CAP_SYS_ADMIN`）は呼び出し側の責務。`timeout` は各カーネル要求の期限（REPAIR-5）。
+#[cfg(target_os = "linux")]
+pub fn reclaim_failed_attach(
+    route: &NetlinkRouteSocket,
+    nft: &NetlinkNetfilterSocket,
+    claim: &FailedAttachClaim,
+    netns_dir: &Path,
+    timeout: Duration,
+) -> Result<NetworkDeleteReport, NetworkDeleteError<ContainerNetns>> {
+    reclaim_failed_attach_with(
+        &LinuxDeleteOps {
+            route,
+            nft,
+            timeout,
+            deadline: None,
+        },
+        claim,
+        netns_dir,
     )
 }
 
@@ -1009,6 +1516,10 @@ mod tests {
         veth_index: Option<u32>,
         veth_delete_err: Option<NetErrorCode>,
         unpin_fails: bool,
+        /// `unpin_path` の失敗。
+        unpin_path_err: Option<NetErrorCode>,
+        /// 現在の pin の識別子。`Some` で請求書のものと違えば別世代の pin とみなして拒否する。
+        pin_now: Option<PinIdentity>,
         /// pin が残っている（`Ok(true)`）とみなす endpoint 名。
         pins_present: Vec<PathBuf>,
         pin_check_err: bool,
@@ -1017,6 +1528,12 @@ mod tests {
         /// 置き場を開けない（消失・検査違反）とみなすときのエラー。
         dir_open_err: Option<NetErrorCode>,
         table_err: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// `delete_rules`（公開の個別解除）の失敗。
+        rules_err: Option<(NetErrorCode, NftBatchOutcome)>,
+        /// `delete_rule`（1 本ずつの削除）の失敗。チェイン名で指定する。
+        rule_errs: Vec<(&'static str, NetErrorCode, NftBatchOutcome)>,
+        /// 照会（`table_info`）が返すテーブルのハンドル。`None` は 99。
+        table_handle_now: Option<u64>,
         /// 照会（`table_info`）で専用テーブルが存在しない（`NotFound`）とみなすか。
         table_absent: bool,
         /// 照会（`table_info`）の失敗。
@@ -1033,6 +1550,8 @@ mod tests {
         bridge_lookup_err: Option<NetErrorCode>,
         bridge_index: Option<u32>,
         bridge_delete_err: Option<NetErrorCode>,
+        /// 記録した呼び出しがこの件数に達したら全体の期限が切れたとみなす（#3258・REPAIR-5）。
+        expire_after_calls: Option<usize>,
     }
 
     impl Fake {
@@ -1055,6 +1574,11 @@ mod tests {
 
     impl DeleteOps for Fake {
         type Netns = ();
+
+        fn deadline_exceeded(&self) -> bool {
+            self.expire_after_calls
+                .is_some_and(|n| self.calls.borrow().len() >= n)
+        }
 
         fn link_index(&self, name: &IfName) -> Result<IfIndex, NetError> {
             self.rec(format!("link_index {}", name.as_str()));
@@ -1092,6 +1616,27 @@ mod tests {
             };
             e.map_or(Ok(()), |c| Err(err(c)))
         }
+        fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+            self.rec(format!("unpin_path {}", pin.display()));
+            // 現在の pin が別世代なら、実装と同じく何も解除せず拒否する。
+            if self.pin_now.is_some_and(|now| now != expected) {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
+            match self.unpin_path_err {
+                Some(c) => Err(err(c)),
+                None => Ok(()),
+            }
+        }
+        fn unpin_stale_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+            self.rec(format!("unpin_stale_path {}", pin.display()));
+            if self.pin_now.is_some_and(|now| now != expected) {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
+            match self.unpin_path_err {
+                Some(c) => Err(err(c)),
+                None => Ok(()),
+            }
+        }
         fn unpin_netns(&self, (): ()) -> Result<(), UnpinFailure<()>> {
             self.rec("unpin_netns");
             if self.unpin_fails {
@@ -1122,6 +1667,14 @@ mod tests {
             }
             Ok(self.pins_present.iter().any(|p| p == &path))
         }
+        fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError> {
+            let path = dir.join(endpoint.as_str());
+            self.rec(format!("pin_absent {}", path.display()));
+            if self.pin_check_err {
+                return Err(err(NetErrorCode::Internal));
+            }
+            Ok(!self.pins_present.iter().any(|p| p == &path))
+        }
         fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
             self.rec(format!("table_info {}", table.as_str()));
             if let Some(c) = self.table_query_err {
@@ -1141,7 +1694,7 @@ mod tests {
                 }
             };
             if !self.table_no_handle {
-                put(4, &99u64.to_be_bytes());
+                put(4, &self.table_handle_now.unwrap_or(99).to_be_bytes());
             }
             put(
                 6,
@@ -1159,15 +1712,58 @@ mod tests {
                 None => Ok(()),
             }
         }
+        fn delete_rule(
+            &self,
+            table: &NftName,
+            chain: &'static str,
+            handle: NftRuleHandle,
+        ) -> Result<(), NftApplyFailure> {
+            self.rec(format!(
+                "delete_rule {} {chain} {}",
+                table.as_str(),
+                handle.get()
+            ));
+            match self.rule_errs.iter().find(|(c, ..)| *c == chain) {
+                Some(&(_, c, outcome)) => Err(NftApplyFailure {
+                    error: err(c),
+                    outcome,
+                }),
+                None => Ok(()),
+            }
+        }
+        fn delete_rules(
+            &self,
+            table: &NftName,
+            handles: (NftRuleHandle, NftRuleHandle),
+        ) -> Result<(), NftApplyFailure> {
+            self.rec(format!(
+                "delete_rules {} {}/{}",
+                table.as_str(),
+                handles.0.get(),
+                handles.1.get()
+            ));
+            match self.rules_err {
+                Some((c, outcome)) => Err(NftApplyFailure {
+                    error: err(c),
+                    outcome,
+                }),
+                None => Ok(()),
+            }
+        }
     }
 
     fn host_of(id: &str) -> IfName {
         VethNames::derive(&eid(id)).unwrap().host().clone()
     }
 
+    /// テストの接続の世代識別子。
+    const GEN: &str = "0123456789abcdef0123456789abcdef";
+    /// 取り残しの請求書が別の（古い）接続のものであることを表す世代識別子。
+    const OLD_GEN: &str = "fedcba9876543210fedcba9876543210";
+
     /// 接続処理と同じ導出の、endpoint `id` の veth 所有トークン。
     fn token_of(id: &str) -> String {
-        host_owner_token(TOKEN, &eid(id))
+        host_owner_token(TOKEN, &eid(id), GEN)
     }
 
     /// fake が名前から引く veth の別名（テストで使う endpoint のうち host 名が一致するもののトークン）。
@@ -1199,9 +1795,12 @@ mod tests {
             host_index: IfIndex::new(21).unwrap(),
             host_token: token_of(id),
             peer_veth: names.peer().clone(),
+            container_ifname: IfName::new("eth0").unwrap(),
             netns_path: pin(id),
             address,
             netns: (),
+            published_ports: Vec::new(),
+            pin_identity: None,
         }
     }
 
@@ -1294,6 +1893,22 @@ mod tests {
         assert_eq!(fake.calls().len(), 1);
     }
 
+    /// NET-1・REPAIR-12・#3456: preflight の照会が復号の `DataLoss` で失敗しても、`Timeout` と同じく
+    /// 有無を判定できないので拒否する（何も消さない）。
+    #[test]
+    fn net1_3456_delete_preflight_dataloss_rejects() {
+        let (net, mut ipam, mut ports) = setup();
+        let _unpassed = attached(&mut ipam, "c1");
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.step, DeleteStep::Preflight);
+        assert_eq!(fake.calls().len(), 1);
+    }
+
     /// NET-1・TASK-139.4: 渡されていない endpoint の veth が無ければ（quarantine 中のアドレス）、
     /// テーブルの削除後に IPAM と予約を解放する。
     #[test]
@@ -1353,9 +1968,12 @@ mod tests {
             host_index: c1.host_index,
             host_token: c1.host_token.clone(),
             peer_veth: c1.peer_veth.clone(),
+            container_ifname: c1.container_ifname.clone(),
             netns_path: c1.netns_path.clone(),
             address: c1.address,
             netns: (),
+            published_ports: Vec::new(),
+            pin_identity: None,
         };
         let e = delete_network_with(&fake, &net, vec![c1, dup], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(
@@ -1390,6 +2008,30 @@ mod tests {
         assert!(!fake.calls().contains(&"delete_link 99".to_owned()));
         assert!(fake.calls().contains(&"delete_link 7".to_owned()));
         assert_eq!(ipam.allocated_count(), 0);
+    }
+
+    /// NET-1・NET-6・#2681: 同じ endpoint の別世代のトークンを持つ veth が居る（古い世代の handle）なら、
+    /// 消失済みと扱わず、現在の pin を外さずにアドレスも保持する。
+    #[test]
+    fn net1_delete_refuses_stale_generation_handle() {
+        let (net, mut ipam, mut ports) = setup();
+        let c1 = attached(&mut ipam, "c1");
+        let newer = host_owner_token(&net.bridge_token, &eid("c1"), OLD_GEN);
+        assert_ne!(newer, c1.host_token);
+        let fake = Fake {
+            veth_index: Some(99),
+            veth_alias: Some(Some(newer)),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(
+            (e.code(), e.step),
+            (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
+        );
+        assert_eq!(e.message(), "veth belongs to a different attach generation");
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c == "unpin_netns"));
+        assert_eq!(ipam.allocated_count(), 1);
     }
 
     /// NET-1・TASK-139.4・P0: 所有トークンが一致するのに ifindex だけが記録と異なる（渡された `host_index` が
@@ -1457,11 +2099,16 @@ mod tests {
             let (net, mut ipam, mut ports) = setup();
             let mut c1 = attached(&mut ipam, "c1");
             match forge {
-                "token" => c1.host_token = "fandhe-net:other:9:9:9/ep/c1".to_owned(),
+                "token" => {
+                    c1.host_token =
+                        "fandhe-net:other:9:9:9/ep/c1/g/0123456789abcdef0123456789abcdef".to_owned()
+                }
                 _ => c1.peer_veth = VethNames::derive(&eid("zzz")).unwrap().peer().clone(),
             }
             let fake = Fake {
-                veth_alias: Some(Some("fandhe-net:other:9:9:9/ep/c1".to_owned())),
+                veth_alias: Some(Some(
+                    "fandhe-net:other:9:9:9/ep/c1/g/0123456789abcdef0123456789abcdef".to_owned(),
+                )),
                 ..Fake::default()
             };
             let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
@@ -1546,6 +2193,63 @@ mod tests {
             );
             assert_eq!(ipam.allocated_count(), 1);
         }
+    }
+
+    /// NET-1・REPAIR-12・#3456: veth の所属照会が復号の `DataLoss`（重複 `IFLA_MASTER` 等。#3419）で
+    /// 失敗したら、所有を証明できないので `Unknown` で報告し、名前でも ifindex でも消さず pin も外さない。
+    /// アドレスと再試行の対象は保持する（fail-closed）。
+    #[test]
+    fn net1_3456_delete_veth_attachment_dataloss_is_unknown() {
+        let (net, mut ipam, mut ports) = setup();
+        let c1 = attached(&mut ipam, "c1");
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Present),
+                (
+                    DeleteResource::Bridge(net.bridge.clone()),
+                    ResourceState::Present
+                )
+            ]
+        );
+        let calls = fake.calls();
+        assert!(calls.contains(&format!("link_attachment {}", host_of("c1").as_str())));
+        assert!(!calls.iter().any(|c| c.starts_with("delete_link")));
+        assert!(!calls.iter().any(|c| c.starts_with("unpin_path")));
+        assert_eq!(ipam.allocated_count(), 1);
+        assert_eq!(e.retry.len(), 1);
+    }
+
+    /// NET-1・REPAIR-12・#3456: attach の取り残しの回収でも、veth の所属照会の `DataLoss` は
+    /// `Unknown` で報告し、veth を消さず、veth の消失を確認できないので netns の pin も外さない。
+    #[test]
+    fn net1_3456_reclaim_veth_attachment_dataloss_is_unknown() {
+        let fake = Fake {
+            veth_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(true, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.error.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Unknown),
+            ]
+        );
+        assert!(e.report.removed.is_empty());
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
     }
 
     /// NET-1・TASK-139.4: unpin の失敗は pin パスを `Present` で報告し、アドレスは保持する。
@@ -1707,6 +2411,50 @@ mod tests {
         let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
         assert_eq!(e.step, DeleteStep::DeleteBridge);
         assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: bridge の照会の復号の DataLoss（重複 IFLA_IFALIAS 等。
+    /// #3309）は NotFound（完了扱い）と混同せず、bridge に触れず Unknown で報告する。
+    #[test]
+    fn net1_3484_delete_bridge_lookup_dataloss_keeps_bridge() {
+        let (net, mut ipam, mut ports) = setup();
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteBridge);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.leftover.contains(&(
+            DeleteResource::Bridge(net.bridge.clone()),
+            ResourceState::Unknown
+        )));
+        assert!(
+            !e.report
+                .removed
+                .contains(&DeleteResource::Bridge(net.bridge))
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3484: 作成失敗の回収でも bridge の照会が DataLoss なら
+    /// bridge に触れず Unknown（テーブルは独立に消える）。
+    #[test]
+    fn net1_3484_reclaim_create_bridge_dataloss_refuses_bridge() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap_err();
+        let net = created();
+        assert_eq!(e.step, DeleteStep::DeleteBridge);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Bridge(net.bridge), ResourceState::Unknown)]
+        );
+        assert_eq!(e.report.removed, vec![DeleteResource::NftTable(net.table)]);
+        assert!(!fake.calls().iter().any(|c| c == "delete_link 7"));
     }
 
     /// NET-1・TASK-139.4・ERR-1: 最初のエラーを後続の失敗で上書きしない。
@@ -2093,8 +2841,8 @@ mod tests {
     /// NET-1・TASK-139.4: 共有予約ファイルの解放に失敗したら `PortReservation` を `Present` で報告する。
     #[test]
     fn net1_delete_reservation_release_failure_is_reported() {
-        let dir = std::env::temp_dir().join(format!("fc-delete-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 前回の残骸の `ports.reg` ディレクトリ等の上で進めない（REPAIR-12・#3375）。
+        let dir = crate::test_root::test_root("fc-delete", "relfail");
         // ファイルの代わりにディレクトリを共有パスに指定し、ロックの open を失敗させる。
         let path = dir.join("ports.reg");
         std::fs::create_dir_all(&path).unwrap();
@@ -2277,4 +3025,827 @@ mod tests {
             assert!(fake.calls().is_empty());
         }
     }
+
+    fn attach_claim(veth: bool, netns: bool, quarantine: bool) -> FailedAttachClaim {
+        FailedAttachClaim::for_test(
+            NetworkName::new("web").unwrap(),
+            eid("c1"),
+            TOKEN,
+            GEN,
+            veth,
+            netns,
+            quarantine,
+        )
+    }
+
+    fn rule_of(host_port: u16, pre: u64, out: u64) -> RecordedPublish {
+        RecordedPublish::new(
+            PortPublish::new(
+                crate::network::PortProtocol::Tcp,
+                Ipv4Addr::new(192, 0, 2, 10),
+                host_port,
+                80,
+            )
+            .unwrap(),
+            NftRuleHandle::new(pre).unwrap(),
+            NftRuleHandle::new(out).unwrap(),
+        )
+    }
+
+    fn rule_port(host_port: u16) -> PortPublish {
+        *rule_of(host_port, 2, 3).publish()
+    }
+
+    /// DNAT ルール 2 件（8080: 2/3、8081: 4/5。テーブルハンドル 99）を持つ請求書。
+    fn rules_claim(veth: bool, netns: bool) -> FailedAttachClaim {
+        attach_claim(veth, netns, true).with_rules_for_test(
+            crate::network::attach_claim::ClaimedRules::new(
+                NftTableHandle::new(99).unwrap(),
+                vec![rule_of(8080, 2, 3), rule_of(8081, 4, 5)],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn port_res(host_port: u16) -> DeleteResource {
+        DeleteResource::PortRules(eid("c1"), rule_port(host_port))
+    }
+
+    /// NET-1・NET-3・#3285: 所有が証明でき、ハンドルが一致するときだけ、請求書のルールをハンドル指定で消す。
+    /// 呼び出し列は 照会 → 2 本の一括削除（公開ごと）の順。
+    #[test]
+    fn net1_3285_reclaim_deletes_rules_by_handle_after_proving_table() {
+        let fake = Fake::default();
+        let tbl = created().table;
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("table_info {}", tbl.as_str()),
+                format!("delete_rules {} 2/3", tbl.as_str()),
+                format!("delete_rules {} 4/5", tbl.as_str()),
+            ]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+        assert!(report.leftover.is_empty());
+    }
+
+    /// NET-1・#3285: テーブルが無ければルールも無い。DELRULE を送らず回収済みにする（冪等）。
+    #[test]
+    fn net1_3285_reclaim_absent_table_means_rules_gone() {
+        let fake = Fake {
+            table_absent: true,
+            ..Fake::default()
+        };
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![format!("table_info {}", created().table.as_str())]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+    }
+
+    /// NET-1・SEC-1・#3285: 所有を証明できない（userdata の不一致・照会の失敗・ハンドル欠落）なら DELRULE を送らず、
+    /// `Unknown` の取り残しにする。
+    #[test]
+    fn net1_3285_reclaim_unproven_table_sends_nothing() {
+        let cases = [
+            Fake {
+                table_userdata: Some(b"someone-else".to_vec()),
+                ..Fake::default()
+            },
+            Fake {
+                table_query_err: Some(NetErrorCode::Timeout),
+                ..Fake::default()
+            },
+            Fake {
+                table_no_handle: true,
+                ..Fake::default()
+            },
+        ];
+        for fake in cases {
+            let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+                .unwrap_err();
+            assert_eq!(e.step, DeleteStep::UnpublishPorts);
+            assert_eq!(
+                e.report.leftover,
+                vec![
+                    (port_res(8080), ResourceState::Unknown),
+                    (port_res(8081), ResourceState::Unknown),
+                ]
+            );
+            assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+        }
+    }
+
+    /// NET-1・SEC-1・#3285: 生きたテーブルのハンドルが請求書と違う（同名で作り直された）なら、記録した実体はもう無い。
+    /// DELRULE を送らず回収済みにし、他の資源（veth・pin）の回収は続ける。
+    #[test]
+    fn net1_3285_reclaim_recreated_table_sends_no_delrule() {
+        let fake = Fake {
+            table_handle_now: Some(100),
+            ..Fake::default()
+        };
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(true, false), &netns_dir()).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_rule")));
+        assert!(report.removed.contains(&port_res(8080)));
+        assert!(report.removed.contains(&port_res(8081)));
+        assert!(
+            report
+                .removed
+                .contains(&DeleteResource::Veth(host_of("c1")))
+        );
+    }
+
+    /// NET-1・SEC-1・#3285: テーブルのハンドルが 0（userdata は一致）でも作り直しと読まない。DELRULE を送らず
+    /// `Unknown` の取り残しにし、請求書のルールのハンドルを保つ（fail-closed）。
+    #[test]
+    fn net1_3285_reclaim_zero_table_handle_is_unverifiable() {
+        let fake = Fake {
+            table_handle_now: Some(0),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (port_res(8080), ResourceState::Unknown),
+                (port_res(8081), ResourceState::Unknown),
+            ]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_rule")));
+        assert!(!e.report.removed.contains(&port_res(8080)));
+    }
+
+    /// NET-1・NET-3・#3285: 2 本の一括削除が ENOENT で中止されたら 1 本ずつ消し直す。片方が既に無く、
+    /// もう片方を消せたなら回収済み。
+    #[test]
+    fn net1_3285_reclaim_enoent_pair_falls_back_to_single_deletes() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
+            rule_errs: vec![(
+                "prerouting",
+                NetErrorCode::NotFound,
+                NftBatchOutcome::Aborted,
+            )],
+            ..Fake::default()
+        };
+        let tbl = created().table;
+        let report =
+            reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir()).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("table_info {}", tbl.as_str()),
+                format!("delete_rules {} 2/3", tbl.as_str()),
+                format!("delete_rule {} prerouting 2", tbl.as_str()),
+                format!("delete_rule {} output 3", tbl.as_str()),
+                format!("delete_rules {} 4/5", tbl.as_str()),
+                format!("delete_rule {} prerouting 4", tbl.as_str()),
+                format!("delete_rule {} output 5", tbl.as_str()),
+            ]
+        );
+        assert_eq!(report.removed, vec![port_res(8080), port_res(8081)]);
+    }
+
+    /// NET-1・#3285: 一括削除が ENOENT で中止された後、残っている 1 本の削除が別の理由で失敗したら、
+    /// 取り残し（`Present`）として報告し、最初のエラーを保持する。
+    #[test]
+    fn net1_3285_reclaim_single_delete_failure_is_left_over() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
+            rule_errs: vec![
+                (
+                    "prerouting",
+                    NetErrorCode::NotFound,
+                    NftBatchOutcome::Aborted,
+                ),
+                ("output", NetErrorCode::Internal, NftBatchOutcome::Aborted),
+            ],
+            ..Fake::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (port_res(8080), ResourceState::Present),
+                (port_res(8081), ResourceState::Present),
+            ]
+        );
+    }
+
+    /// NET-1・REPAIR-5・#3285: 一括削除の確定的な失敗は `Present`、結果不明は `Unknown` の取り残しにする。
+    #[test]
+    fn net1_3285_reclaim_delete_failure_classification() {
+        for (code, outcome, state) in [
+            (
+                NetErrorCode::Internal,
+                NftBatchOutcome::Aborted,
+                ResourceState::Present,
+            ),
+            (
+                NetErrorCode::Timeout,
+                NftBatchOutcome::Unknown,
+                ResourceState::Unknown,
+            ),
+        ] {
+            let fake = Fake {
+                rules_err: Some((code, outcome)),
+                ..Fake::default()
+            };
+            let e = reclaim_failed_attach_with(&fake, &rules_claim(false, false), &netns_dir())
+                .unwrap_err();
+            assert_eq!(e.step, DeleteStep::UnpublishPorts);
+            assert_eq!(
+                e.report.leftover,
+                vec![(port_res(8080), state), (port_res(8081), state)]
+            );
+        }
+    }
+
+    /// NET-1・#3285: ルールの回収は veth より前に行い、失敗しても veth と pin の回収は続ける。pin の識別子が
+    /// 無く早期に戻る請求書でも、ルールの回収は先に済んでいる。
+    #[test]
+    fn net1_3285_reclaim_rules_precede_veth_and_do_not_block_it() {
+        let fake = Fake {
+            rules_err: Some((NetErrorCode::Internal, NftBatchOutcome::Aborted)),
+            ..Fake::default()
+        };
+        let claim = rules_claim(true, true).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpublishPorts);
+        let calls = fake.calls();
+        assert!(calls[0].starts_with("table_info"), "{calls:?}");
+        assert!(calls[1].starts_with("delete_rules"), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("link_attachment")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("pin_absent")),
+            "{calls:?}"
+        );
+    }
+
+    /// NET-1・#3285: ルールを持たない（v1 の）請求書では、テーブルを照会しない。
+    #[test]
+    fn net1_3285_reclaim_v1_claim_never_queries_the_table() {
+        let fake = Fake::default();
+        reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir()).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.starts_with("table_info")));
+    }
+
+    /// NET-1・#2681: 同じ endpoint・置き場に作り直された新しい pin（識別子が請求書と違う）は、veth が無くても
+    /// 旧い請求書では解除されず、取り残しとして保持される。
+    #[test]
+    fn net1_reclaim_attach_keeps_pin_of_a_newer_generation() {
+        let fake = Fake {
+            // veth は既に無い（旧接続の回収後）。現在の pin は新しい世代のもの。
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            pin_now: Some(PinIdentity {
+                dev: 1,
+                ino: 2,
+                serial: 99,
+            }),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(false, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Present)]
+        );
+        assert!(e.report.removed.is_empty());
+    }
+
+    /// NET-1・REPAIR-3・#2681: netns のみの請求書でも、同じ endpoint の host veth が（同世代でも）残っていれば
+    /// pin を外さず、成功も返さない（請求書を消費させない）。
+    #[test]
+    fn net1_reclaim_attach_netns_only_keeps_pin_while_veth_remains() {
+        let fake = Fake::default();
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(false, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(e.report.removed.is_empty());
+    }
+
+    /// NET-1・#2681: pin の識別子を控えていない請求書では、pin が残っていれば触れず拒否する。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_leaves_pin() {
+        let fake = Fake {
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            pins_present: vec![pin("c1")],
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Unknown)]
+        );
+    }
+
+    /// NET-1・#2681: 識別子の無い請求書でも、pin の不存在を確認できたら回収済みとして冪等に成功する。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_succeeds_when_pin_absent() {
+        let fake = Fake {
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let report = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap();
+        assert_eq!(report.removed, vec![DeleteResource::Netns(pin("c1"))]);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・REPAIR-3・#2681: 識別子の無い netns のみの請求書で pin が無くても、請求書が含まない host veth が
+    /// 同じ endpoint に残っていれば成功を返さず（請求書を消費させず）、veth には触れない。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_keeps_claim_while_veth_remains() {
+        let fake = Fake::default();
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(e.report.removed, vec![DeleteResource::Netns(pin("c1"))]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・#2681: 不存在を確認できない（置き場の検査失敗）なら回収済みとせず拒否する。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_unverifiable_is_refused() {
+        let fake = Fake {
+            pin_check_err: true,
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::Internal);
+    }
+
+    /// NET-1・#2681: 別名と master が一致する veth は、照会で得た ifindex で消え、pin はパス指定で外れる。
+    #[test]
+    fn net1_reclaim_attach_removes_owned_veth_and_pin() {
+        let fake = Fake::default();
+        let net = created();
+        let dir = netns_dir();
+        let report =
+            reclaim_failed_attach_with(&fake, &attach_claim(true, true, true), &dir).unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("link_attachment {}", host_of("c1").as_str()),
+                format!("owned_bridge_index {}", net.bridge.as_str()),
+                "delete_link 21".to_owned(),
+                format!("unpin_path {}", pin("c1").display()),
+            ]
+        );
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::Veth(host_of("c1")),
+                DeleteResource::Netns(pin("c1"))
+            ]
+        );
+        assert!(report.leftover.is_empty());
+    }
+
+    /// NET-1・#2681: veth が既に無ければ回収済みとして成功し、削除は呼ばない（冪等）。
+    #[test]
+    fn net1_reclaim_attach_gone_veth_is_idempotent() {
+        let fake = Fake {
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            ..Default::default()
+        };
+        let report =
+            reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir())
+                .unwrap();
+        assert_eq!(report.removed, vec![DeleteResource::Veth(host_of("c1"))]);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・#2681: 別名の不一致・master の不一致・bridge 無しは Unknown で、削除しない。
+    /// エラーコードも照合する（NET-1・REPAIR-12・#3559。#3536 の残り）。bridge の不存在（`NotFound`）は
+    /// そのまま運ばれ、所有の不一致は `FailedPrecondition` になる（ERR-1: 最初の原因を保つ）。
+    #[test]
+    fn net1_reclaim_attach_refuses_unproven_veth() {
+        let cases = [
+            (
+                Fake {
+                    veth_alias: Some(Some("forged".to_owned())),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_alias: Some(None),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_master: Some(Some(8)),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    veth_master: Some(None),
+                    ..Default::default()
+                },
+                NetErrorCode::FailedPrecondition,
+            ),
+            (
+                Fake {
+                    bridge_lookup_err: Some(NetErrorCode::NotFound),
+                    ..Default::default()
+                },
+                NetErrorCode::NotFound,
+            ),
+        ];
+        for (i, (fake, want)) in cases.into_iter().enumerate() {
+            let e =
+                reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir())
+                    .unwrap_err();
+            assert_eq!(e.step, DeleteStep::DeleteVeth, "case {i}");
+            assert_eq!(e.code(), want, "case {i}");
+            assert!(e.report.removed.is_empty(), "case {i}");
+            assert_eq!(
+                e.report.leftover,
+                vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)],
+                "case {i}"
+            );
+            assert!(
+                !fake.calls().iter().any(|c| c.starts_with("delete_link")),
+                "case {i}"
+            );
+        }
+    }
+
+    /// attach の回収で bridge の照会が復号の失敗（重複 `IFLA_IFALIAS` 等。#3309）の `DataLoss` になる場合の
+    /// 期待される呼び出し列。bridge の照会は veth の所有証明の中だけで行うため 2 件で止まり、削除へ進まない。
+    fn dataloss_probe_calls() -> Vec<String> {
+        vec![
+            format!("link_attachment {}", host_of("c1").as_str()),
+            format!("owned_bridge_index {}", created().bridge.as_str()),
+        ]
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510（#3484 の残り）: attach の回収で bridge の照会が `DataLoss` になっても、
+    /// `NotFound`（bridge 無し）と混同せず、所有未証明の veth を `Unknown` で取り残して消さない。
+    /// この経路では bridge の `NotFound` も `Unknown` になるため、区別はエラーコードの照合で固定する。
+    /// attach の回収の bridge 照会は veth の所有証明の中で行うので、失敗した手順は `DeleteVeth`。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_keeps_veth() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.removed.is_empty());
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert_eq!(fake.calls(), dataloss_probe_calls());
+
+        // 対照: NotFound でも取り残しは同じ Unknown だが、コードは NotFound のまま運ばれ DataLoss と区別できる。
+        let nf = Fake {
+            bridge_lookup_err: Some(NetErrorCode::NotFound),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&nf, &attach_claim(true, false, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::NotFound);
+        assert_eq!(nf.calls(), dataloss_probe_calls());
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510: bridge の照会が `DataLoss` のとき、veth・netns の pin・IPAM のいずれにも
+    /// 触れない。最初のエラー（DataLoss・DeleteVeth）は後続の pin 側の前提違反で上書きされない（ERR-1）。
+    /// 本関数は IPAM を受け取らず、アドレス・ポート予約の quarantine は請求書に残って `delete_network` が解放する。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_touches_nothing() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let claim = attach_claim(true, true, true);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert!(e.report.removed.is_empty());
+        assert_eq!(
+            e.report.leftover,
+            vec![
+                (DeleteResource::Veth(host_of("c1")), ResourceState::Unknown),
+                (DeleteResource::Netns(pin("c1")), ResourceState::Unknown),
+            ]
+        );
+        // カーネル操作は照会 2 件だけ（delete_link・unpin_path・pin_absent を呼ばない）。
+        assert_eq!(fake.calls(), dataloss_probe_calls());
+        assert!(!e.report.leftover.iter().any(|(r, _)| matches!(
+            r,
+            DeleteResource::Address(..) | DeleteResource::PortReservation(..)
+        )));
+        assert!(claim.quarantine_only().is_some());
+    }
+
+    /// NET-1・REPAIR-4・REPAIR-12・#3510: DNAT ルールの回収は bridge の照会と独立で、照会が `DataLoss` でも
+    /// ルールは消え、veth だけが `Unknown` で残る。
+    #[test]
+    fn net1_3510_reclaim_attach_bridge_lookup_dataloss_rules_still_reclaimed() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::DataLoss),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &rules_claim(true, false), &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(e.code(), NetErrorCode::DataLoss);
+        assert_eq!(e.report.removed, vec![port_res(8080), port_res(8081)]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・#2681: トークンが別ネットワークのものなら、ops を呼ばずに Validate で拒否する。
+    #[test]
+    fn net1_reclaim_attach_rejects_foreign_token_before_io() {
+        let fake = Fake::default();
+        let claim = FailedAttachClaim::for_test(
+            NetworkName::new("web").unwrap(),
+            eid("c1"),
+            "fandhe-net:other:1:2:3",
+            GEN,
+            true,
+            true,
+            false,
+        );
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::Validate);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert!(fake.calls().is_empty());
+    }
+
+    /// 故障注入（attach_fault）が作る請求書の記録を復号する。記録の文字列は attach 側の試験が実際の
+    /// 失敗から作った請求書と一致することを照合済み（`attach_tests::net1_attach_fault_leftover_matrix`）。
+    fn injected_claim(veth: bool, netns: bool, quarantine: bool) -> FailedAttachClaim {
+        let record = super::super::attach_fault::expected_record("c1", veth, netns, quarantine);
+        FailedAttachClaim::from_record(&record).unwrap()
+    }
+
+    /// NET-1・REPAIR-3・#2971: 所有トークンを刻む前（`SetOwnerToken` の失敗）に巻き戻しも失敗して残った veth は、
+    /// 別名が無く所有を証明できないため消さず、`DeleteVeth` の `Unknown` で取り残す（fail-closed）。
+    /// 別名の有無は実カーネルの `network_attach_privileged` の S4 で裏付ける。
+    #[test]
+    fn net1_reclaim_injected_set_owner_token_veth_without_alias_is_kept() {
+        let fake = Fake {
+            veth_alias: Some(None),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &injected_claim(true, false, false), &netns_dir())
+                .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(e.report.removed.is_empty());
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `SetMaster` の失敗後に残った veth は、別名はあるが bridge に繋がっていないため
+    /// 所有を証明できず、消さずに取り残す。
+    #[test]
+    fn net1_reclaim_injected_set_master_veth_without_master_is_kept() {
+        let fake = Fake {
+            veth_master: Some(None),
+            ..Default::default()
+        };
+        let e =
+            reclaim_failed_attach_with(&fake, &injected_claim(true, false, false), &netns_dir())
+                .unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `SetUp` の失敗後に veth と pin の両方が残った請求書（pin の識別子なし）は、
+    /// 所有を証明できる veth を消し、pin が実在しなければ回収済みとして成功する。
+    /// pin が実在するなら識別子なしでは外さず、`UnpinNetns` の `Unknown` で取り残す。
+    #[test]
+    fn net1_reclaim_injected_set_up_veth_and_pin() {
+        let claim = injected_claim(true, true, false);
+        let report = reclaim_failed_attach_with(&Fake::default(), &claim, &netns_dir()).unwrap();
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::Veth(host_of("c1")),
+                DeleteResource::Netns(pin("c1"))
+            ]
+        );
+        assert!(report.leftover.is_empty());
+
+        let fake = Fake {
+            pins_present: vec![pin("c1")],
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.report.removed, vec![DeleteResource::Veth(host_of("c1"))]);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Unknown)]
+        );
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・REPAIR-3・#2971: `AddAddress` の失敗後（quarantine つき）は veth と pin だけを回収し、プロセス内の
+    /// 保持（アドレス・予約）には触れない。quarantine は `quarantine_only` の請求書で `delete_network` の解放を待つ。
+    #[test]
+    fn net1_reclaim_injected_add_address_keeps_quarantine() {
+        let claim = injected_claim(true, true, true);
+        assert!(claim.quarantine_only().is_some());
+        let report = reclaim_failed_attach_with(&Fake::default(), &claim, &netns_dir()).unwrap();
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::Veth(host_of("c1")),
+                DeleteResource::Netns(pin("c1"))
+            ]
+        );
+        assert!(report.leftover.is_empty());
+    }
+
+    /// NET-1・REPAIR-3・#3040: 事前作成 netns の経路の失敗が作る請求書（`netns=0`・`pin=-`）は、呼び出し側が
+    /// 持つ pin が実在していても触れない。回収は veth だけを消し、pin の確認・unpin の呼び出しを一切しない
+    /// （pin の解放は呼び出し側の `release_container_netns` の責務。fail-closed）。quarantine つきでも同じ。
+    #[test]
+    fn net1_reclaim_injected_prepared_claim_keeps_caller_pin() {
+        for quarantine in [false, true] {
+            let fake = Fake {
+                pins_present: vec![pin("c1")],
+                ..Default::default()
+            };
+            let report = reclaim_failed_attach_with(
+                &fake,
+                &injected_claim(true, false, quarantine),
+                &netns_dir(),
+            )
+            .unwrap();
+            assert_eq!(
+                report.removed,
+                vec![DeleteResource::Veth(host_of("c1"))],
+                "quarantine={quarantine}"
+            );
+            assert!(report.leftover.is_empty());
+            let calls = fake.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("unpin") || c.starts_with("pin_")),
+                "{calls:?}"
+            );
+        }
+    }
+
+    /// NET-1・#2681: pin の解除に失敗したら Netns の取り残しで、veth の回収は続ける。最初のエラーを保持する。
+    #[test]
+    fn net1_reclaim_attach_unpin_failure_is_leftover() {
+        let fake = Fake {
+            unpin_path_err: Some(NetErrorCode::FailedPrecondition),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(true, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Present)]
+        );
+        assert_eq!(e.report.removed, vec![DeleteResource::Veth(host_of("c1"))]);
+
+        let fake = Fake {
+            unpin_path_err: Some(NetErrorCode::Timeout),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(false, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Unknown)]
+        );
+    }
+
+    /// NET-1・#2681: quarantine だけの請求書は、カーネルに触れずに成功する。
+    #[test]
+    fn net1_reclaim_attach_quarantine_only_touches_nothing() {
+        let fake = Fake::default();
+        let report =
+            reclaim_failed_attach_with(&fake, &attach_claim(false, false, true), &netns_dir())
+                .unwrap();
+        assert!(fake.calls().is_empty());
+        assert_eq!(report, NetworkDeleteReport::default());
+    }
+
+    /// NET-1・#2681: 回収 → 同じ endpoint の再接続 → 古い請求書での回収で、新しい接続の veth は消えない。
+    /// 再接続した veth の別名は別の世代のトークンになるため、古い請求書では所有を証明できない。
+    #[test]
+    fn net1_reclaim_attach_stale_claim_keeps_reconnected_veth() {
+        // fake の veth は現在の世代（GEN）のトークンを持つ。請求書は古い接続（OLD_GEN）のもの。
+        let fake = Fake::default();
+        let stale = FailedAttachClaim::for_test(
+            NetworkName::new("web").unwrap(),
+            eid("c1"),
+            TOKEN,
+            OLD_GEN,
+            true,
+            true,
+            false,
+        );
+        let e = reclaim_failed_attach_with(&fake, &stale, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert_eq!(
+            e.report.leftover.first(),
+            Some(&(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown))
+        );
+        // 世代が合わない請求書は、同じ endpoint の新しい pin も外さない（fail-closed）。
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        assert_eq!(
+            e.report.leftover.last(),
+            Some(&(DeleteResource::Netns(pin("c1")), ResourceState::Unknown))
+        );
+        // netns のみの請求書でも、他の世代の veth が居れば pin を外さない。
+        let fake = Fake::default();
+        let stale_netns = FailedAttachClaim::for_test(
+            NetworkName::new("web").unwrap(),
+            eid("c1"),
+            TOKEN,
+            OLD_GEN,
+            false,
+            true,
+            false,
+        );
+        let e = reclaim_failed_attach_with(&fake, &stale_netns, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        // 同じ世代の請求書なら消える（対照）。
+        let fake = Fake::default();
+        reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir()).unwrap();
+        assert!(fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・#2681: `delete_network` は、世代の形式が正しくない `host_token` を持つ記録を拒否する。
+    #[test]
+    fn net1_host_token_requires_generation_form() {
+        let ep = eid("c1");
+        assert!(host_token_is_for(TOKEN, &ep, &token_of("c1")));
+        for bad in [
+            format!("{TOKEN}/ep/c1"),
+            format!("{TOKEN}/ep/c1/g/"),
+            format!("{TOKEN}/ep/c1/g/ZZ"),
+            format!("{TOKEN}/ep/c1/g/{GEN}0"),
+            format!("{TOKEN}/ep/c2/g/{GEN}"),
+        ] {
+            assert!(!host_token_is_for(TOKEN, &ep, &bad), "{bad}");
+        }
+    }
+
+    mod detach_tests;
+    mod member_after_reboot_tests;
+    mod member_detach_tests;
 }

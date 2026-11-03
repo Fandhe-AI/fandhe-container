@@ -44,7 +44,14 @@
 //! launch の失敗は、起動した全プロセス(中間プロセス I と PID 1)の消滅を確かめられたかを、コンテナ ID ごとの
 //! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
 //! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
-//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
+//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。
+//! ハンドルを drop したときも、同じ世代の項目だけを戻す(#3432)。回収済みなら `Clean`、未回収なら `Pending`(子の
+//! ハンドルを台帳へ移す)。drop はシグナルも待ちも伴わず、kill と回収は後続の `confirm_no_process` と再 launch の
+//! `admit` が期限つきで行う(`terminate` に失敗した pasta ラッパーが捨てたハンドルでも、同じ launcher の確認つき回復が
+//! `Handed` で詰まらない)。別の世代の `Handed`・`Clean`・`Pending`・`Settling` には触れず、項目が追い出されて
+//! いれば未回収の場合に限り `Pending` を入れる。生存中のハンドルを捨てると後続の確認・再 launch がその子を止める
+//! (所有者のいない子を残したまま二重に起動しないための意図した挙動)。記録済みの cgroup で確かめる経路へ回す案は、
+//! 台帳優先(#2011)と矛盾し、`recorded` が無い構成で詰まりが残るため採らなかった。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
 //! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID は
 //! `confirm_no_process` では確かめられない(`FailedPrecondition`)が、記録された cgroup の配置を受け取る
 //! `confirm_no_process_recorded` が別プロセスの残存を確かめる(下の「別プロセスの残存」)。回収前の `Handed`・
@@ -67,10 +74,16 @@
 //! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
 //!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
-//!   補助グループ(`additionalGids`)・名前形式の `User` の解決・exec 経路の非 root は未対応
+//!   補助グループ(`additionalGids`)は uid・gid と同様に fork の前に gid の写像と照合し
+//!   (`check_additional_gids_mapped`。単一 ID 写像では指定を拒否)、同じ削減段が `setgroups(list)` で適用して読み戻す(#2667)。
+//!   名前形式の `User` の解決は未対応(exec 経路の非 root は #2770 で対応済み)
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
 //!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
+//! - **network のモード(NET-6・NET-9・CORE-6・#1939)**: `Host`・`Loopback`・`Attachable` は exec 直前の同期点を通す
+//!   (`exec::netns_sync`)。`Attachable`(rootless の pasta 構成)は netns と user namespace の fd を子が C へこの順で渡し、
+//!   `ProductionLauncherBuilder::netns_attach_hook` のフックが成功したときだけ C が合図を送る。フックの失敗・期限切れでは
+//!   子を exec させずに回収する。`build` が `Attachable`・フック・権限モデル(rootless のみ)の組を fork の前に検査する
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、#2240 で判断待ち。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
@@ -88,17 +101,35 @@
 //!   #2011)。残余は、記録が無い場合(`FailedPrecondition`)と、コンテナ内のプロセスが cgroup の外へ移った場合
 //!   (検出できない。delete と同じ限界)。成功の内訳の観測記録は未実装(REPAIR-4)
 //! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存は記録済みの cgroup で確かめる)
+//! - **ハンドル drop の引き継ぎ(#3432)の残余**: 再 launch の後に古い世代のハンドルを未回収のまま drop した子は台帳へ
+//!   戻せない。launcher がハンドルより先に drop された場合も戻せない。契約外の回収者に回収された子(`Lost`)は確かめ
+//!   ようがなく `Pending` のまま残る(fail-closed)。`Pending` は追い出されないため、生存中のハンドルを大量に捨てると
+//!   `LEDGER_MAX_ENTRIES` に達して新しい launch が拒否される
 //! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
-//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
-//! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に既定 tmpfs との重なりを検査して
-//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
-//!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
+//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043 で入った（supervisor が常駐スレッドを止めてから呼ぶ）
+//! - **pod の namespace への join(CRI-2・CORE-3・SEC-1・SEC-5。#2674)**: `LaunchSpec::namespace_join`(config の
+//!   `linux.namespaces[].path` の user と ipc の組。start が fd に固定し、親子関係・作成者 uid・種別を検証済み)があると、
+//!   中間プロセスは user namespace と ipc namespace を作らずに `setns` で参加し(`exec::isolate_join`)、参加先の
+//!   `/proc/self/{uid,gid}_map` が権限モデルの期待する写像と完全一致することを確かめてから、残り(pid・mount・uts)を
+//!   `unshare` する。`--ipc=host` との併用は `InvalidArgument`。pid の共有・`/dev/shm` の共有・片方だけの join は未対応
+//!   (pid は init が PID 1 であることを制限適用の証跡の前提にしているため。保持役〔供給元〕の設計は後続 issue)
+//! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
+//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は、Landlock のルール生成へ
+//!   `spec.bind_mounts()`（検証済みの集合）を渡すため、root が書き込み可能でも受ける（書き込みの禁止は載せた bind の VFS の
+//!   読み取り専用属性が担い、Landlock の側は `ShadowBacking::ReadOnlyBind` として記録するだけ。CORE-5・#1917・#1910 の決定 B）。
+//!   `root.readonly=true`（#2767）なら root に書き込み権が無いため記録も要らず、`ro` で適用される
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
-//! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
+//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625・#2713)の tmpfs・注入ファイル・IPC・rlimit(16 種へ補完して `Rlimits` 段と状態記録へ)・env の上書きは載せる。`--read-only`(`root_readonly`)は config の `root.readonly` と OR を 1 回だけ取り、mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(#2828)。
+//!   未指定なら既定の `/dev/shm`(64 MiB)のみ・注入なし・専用 IPC namespace。`Host` は IPC namespace を作らず `/dev/shm` を載せず、
+//!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
+//!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
+//!   範囲写像の holder が継承するメモリから secret を外す方式(封印 memfd。#2628)は `InjectedContent` の doc を参照。
+//!   CLI から supervisor への受け渡しは未結線
+//! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
@@ -118,6 +149,11 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
+use super::launch_options::{LaunchIpcMode, LaunchOptions};
+#[cfg(target_os = "linux")]
+use super::network_mode::EffectiveNetwork;
+use super::network_mode::LaunchNetworkMode;
+#[cfg(target_os = "linux")]
 use super::resources::LinuxResourceLimits;
 #[cfg(target_os = "linux")]
 use super::sysfs_mount::SysfsMountSpec;
@@ -127,13 +163,17 @@ use crate::audit_log::AuditedRejection;
 #[cfg(target_os = "linux")]
 use crate::cgroups::{CgroupError, CgroupJoin, RecordedCgroupOutcome};
 #[cfg(target_os = "linux")]
+use crate::dev_mounts::ImplicitDevMounts;
+#[cfg(target_os = "linux")]
 use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
     IntermediatePlan, IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage,
-    LaunchAudit, LaunchTag, Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan,
-    StageKind, StagePipeline, plan, plan_rootless_subordinate, rescan_unreported_init,
-    spawn_container_via_intermediate,
+    LaunchAudit, LaunchTag, Namespace, NamespaceSet, NormalizedGroups, PrePivotSetup,
+    PreparedLaunchFailure, Rescan, StageKind, StagePipeline, SysctlPlan, plan,
+    plan_rootless_subordinate, rescan_unreported_init, spawn_container_via_intermediate,
 };
+#[cfg(target_os = "linux")]
+use crate::injected_files::InjectedFileSet;
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
 #[cfg(target_os = "linux")]
@@ -209,9 +249,17 @@ pub struct ProductionLauncherBuilder {
     #[cfg(target_os = "linux")]
     applied_resources: Option<LinuxResourceLimits>,
     #[cfg(target_os = "linux")]
+    launch_options: Option<LaunchOptions>,
+    #[cfg(target_os = "linux")]
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     #[cfg(target_os = "linux")]
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// `Attachable` の起動で同期点の中で呼ぶ準備処理(NET-9・CORE-6・#1939)。
+    #[cfg(target_os = "linux")]
+    netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
+    /// 試験用: netns の素性の照合の基準を差し替える(dev, ino)。拒否の場面を実機で作るための差し込み口で、本番ビルドには無い。
+    #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+    netns_baseline_override: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -296,6 +344,18 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// 起動オプション(`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・CORE-5・#2625)。
+    ///
+    /// 呼び出し元は supervisor の start 経路(`ContainerOptions::launch_options` の結果)。launcher は launch のたびに
+    /// (restart の再 launch を含む)同じ指定を使う。未指定なら既定の `/dev/shm`(64 MiB)1 件・注入なし・
+    /// 専用の IPC namespace で、従来の動作と同じ。`LaunchIpcMode::Host` だけが IPC namespace を外す緩和で、
+    /// `config.json` からは外せない(SEC-1)。
+    #[must_use]
+    pub fn launch_options(mut self, options: LaunchOptions) -> Self {
+        self.launch_options = Some(options);
+        self
+    }
+
     /// ERRNO 側の拒否の届け方(SEC-4・#2025)。既定は [`crate::seccomp::ErrnoDelivery::Errno`](通知なし。listener を
     /// 受け取っても応答者がいなくてよい)。`UserNotif` は **launch で得た listener に応答する者がいる呼び出し元だけ**が
     /// 指定する(supervisor の start 経路が `LaunchedProcess::take_seccomp_listener` で受け取って応答する)。
@@ -304,6 +364,28 @@ impl ProductionLauncherBuilder {
     #[must_use]
     pub fn seccomp_errno_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
         self.seccomp_delivery = delivery;
+        self
+    }
+
+    /// 試験用: exec 直前の netns の素性の照合で、supervisor の netns の代わりに使う基準 `(dev, ino)` を差し替える
+    /// (`network_mode=host` の拒否の場面を実機で作るため。NET-6・SEC-1・#3206)。`exec-test-support` feature の下のみ
+    /// 存在し、本番ビルドからは差し替えられない。
+    #[cfg(feature = "exec-test-support")]
+    #[must_use]
+    pub fn netns_baseline_override_for_test(mut self, dev: u64, ino: u64) -> Self {
+        self.netns_baseline_override = Some((dev, ino));
+        self
+    }
+
+    /// `LaunchNetworkMode::Attachable` の起動で、exec 直前の同期点の中で呼ぶ準備処理(NET-9・CORE-6・SEC-1・REPAIR-5・#1939)。
+    ///
+    /// 呼び出し元は supervisor の start 経路(holder の保持と pasta の起動を行うフックを注入する。実装は #1940)。
+    /// `Attachable` の起動オプションと対で渡す: `Attachable` なのに無い、`Attachable` でないのにある、`Attachable` が
+    /// rootless 以外の権限モデルである、のいずれも `build` が fork の前に拒否する(取り違えを黙って無視しない)。
+    /// restart の再 launch でも同じフックを使う。契約は [`super::NetnsAttachHook`] を参照。
+    #[must_use]
+    pub fn netns_attach_hook(mut self, hook: Arc<dyn super::NetnsAttachHook>) -> Self {
+        self.netns_attach_hook = Some(hook);
         self
     }
 
@@ -342,7 +424,16 @@ impl ProductionLauncherBuilder {
             let audit_sink = self
                 .audit_sink
                 .ok_or_else(|| missing("the launcher requires an audit sink"))?;
-            // 写像の解決と検証は subreaper 化(プロセス属性の変更)より前に行い、拒否で副作用を残さない。
+            // 写像の解決と検証・注入との併用の拒否は subreaper 化(プロセス属性の変更)より前に行い、
+            // 拒否で副作用を残さない(失敗した build の後に孤児を回収し続けない)。
+            if let Some(options) = &self.launch_options {
+                refuse_inject_with_subordinate(privilege, options)?;
+            }
+            check_attach_hook_pairing(
+                privilege,
+                self.launch_options.as_ref(),
+                self.netns_attach_hook.is_some(),
+            )?;
             let subordinate = resolve_privilege(
                 privilege,
                 self.subordinate_ids,
@@ -363,10 +454,16 @@ impl ProductionLauncherBuilder {
                 self.cgroup_join_source,
             );
             inner.applied_resources = self.applied_resources;
+            inner.launch_options = self.launch_options;
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
+            inner.netns_attach_hook = self.netns_attach_hook;
             inner.rejection_audit_sink = self.rejection_audit_sink;
+            #[cfg(feature = "exec-test-support")]
+            {
+                inner.netns_baseline_override = self.netns_baseline_override;
+            }
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -377,6 +474,142 @@ impl ProductionLauncherBuilder {
             ))
         }
     }
+}
+
+/// `Attachable` の起動オプションと、`NetnsAttachHook` と、権限モデルの組を `build` で検査する(fork の前・副作用なし。
+/// NET-9・CORE-6・SEC-1・#1939)。
+///
+/// - `Attachable` でフックが無い: `InvalidArgument`
+/// - フックがあるのに `Attachable` でない: `InvalidArgument`(取り違えを黙って無視しない)
+/// - `Attachable` が rootless 以外の権限モデル: `Unimplemented`(rootful の経路は D12〔#3069〕で別に扱う。挙動を変えない)
+#[cfg(target_os = "linux")]
+fn check_attach_hook_pairing(
+    privilege: IsolationPrivilege,
+    options: Option<&LaunchOptions>,
+    has_hook: bool,
+) -> Result<(), TraitError> {
+    let attachable = options.is_some_and(|o| o.network() == LaunchNetworkMode::Attachable);
+    if attachable && !has_hook {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the attachable network mode requires a netns attach hook",
+        ));
+    }
+    if !attachable && has_hook {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a netns attach hook is only valid for the attachable network mode",
+        ));
+    }
+    if attachable
+        && !matches!(
+            privilege,
+            IsolationPrivilege::RootlessSingleId | IsolationPrivilege::RootlessSubordinateIds
+        )
+    {
+        return Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "the attachable network mode requires a rootless privilege model",
+        ));
+    }
+    Ok(())
+}
+
+/// exec 直前の netns の素性の同期点の要求を、起動モードと実効の扱いの組から決める(NET-6・SEC-1・#3206。
+/// `docs/design/network-wiring.md` D8)。
+///
+/// `Host` かつ `HostShared` は基準と同じ、`Loopback` / `Attachable` かつ `NewLoopback` は基準と異なる(`Attachable` は
+/// netns と user namespace の 2 本を渡す。NET-9・#1939)。`FromConfig`(既定・CRI の経路)は
+/// 同期点を通さない(D7: 既定を変えても CRI の経路の挙動を変えない。pod の netns の join〔#2838〕で見直す)。
+/// 上の組以外は start の突き合わせ(`reconcile_network`)と食い違う不整合で、fork の前に `Internal` で拒否する。
+/// `baseline` は試験用の差し替え(通常は `None`で、launch の入口で C が自分の netns から取る)。
+#[cfg(target_os = "linux")]
+fn netns_sync_request(
+    mode: LaunchNetworkMode,
+    effective: EffectiveNetwork,
+    baseline: Option<crate::exec::NetnsIdentity>,
+) -> Result<Option<crate::exec::NetnsSyncRequest>, TraitError> {
+    use crate::exec::{NetnsExpectation, NetnsHandover, NetnsSyncRequest};
+    let (expectation, handover) = match (mode, effective) {
+        (LaunchNetworkMode::FromConfig, _) => return Ok(None),
+        (LaunchNetworkMode::Host, EffectiveNetwork::HostShared) => {
+            (NetnsExpectation::SameAsBaseline, NetnsHandover::NetOnly)
+        }
+        (LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback) => (
+            NetnsExpectation::DiffersFromBaseline,
+            NetnsHandover::NetOnly,
+        ),
+        (LaunchNetworkMode::Attachable, EffectiveNetwork::NewLoopback) => (
+            NetnsExpectation::DiffersFromBaseline,
+            NetnsHandover::NetAndUser,
+        ),
+        _ => {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the network mode does not match the reconciled network namespace plan",
+            ));
+        }
+    };
+    Ok(Some(NetnsSyncRequest {
+        expectation,
+        baseline,
+        handover,
+    }))
+}
+
+/// 利用者指定の tmpfs と注入ディレクトリ(いずれも pivot 前段で載せる tmpfs)が、config の
+/// `linux.readonlyPaths` の厳密な子孫のとき拒否する(fail-closed。SEC-2・CORE-5・#2625)。
+///
+/// `apply_readonly_paths` は readonlyPaths のマウント上端だけを読み取り専用にし、子マウント（`/sys` を除く）は
+/// 検査しないため、`readonlyPaths=["/data"]` の配下に書き込み可能な tmpfs `/data/cache` を置くと書き込み可能のまま残る。
+/// 同一の宛先は上端が読み取り専用になるため対象外。fork 前に呼び、子を作らず拒否する。
+#[cfg(target_os = "linux")]
+fn check_tmpfs_against_readonly_paths(
+    readonly: &[crate::path_masks::ProtectedPath],
+    tmpfs: &TmpfsMountSet,
+    inject: Option<&InjectedFileSet>,
+) -> Result<(), TraitError> {
+    use crate::injected_files::within;
+    let inside = |dest: &str| readonly.iter().any(|r| within(dest, r.as_str()));
+    let tmpfs_hit = tmpfs
+        .mounts()
+        .iter()
+        .any(|t| inside(t.destination.as_str()));
+    let inject_hit = inject.is_some_and(|i| i.groups().iter().any(|g| inside(g.directory)));
+    if tmpfs_hit || inject_hit {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a tmpfs mount or injected file directory lies under a read-only path",
+        ));
+    }
+    Ok(())
+}
+
+/// 範囲写像(`RootlessSubordinateIds`)と、呼び出し元のメモリにある注入内容の併用を拒否する(fail-closed)。
+///
+/// 範囲写像の ID 写像 holder は中間プロセスのメモリを fork で継承し、`run_userns_holder` で dumpable になるため、
+/// Yama=0 では同一 UID の別プロセスから継承したメモリを読める。注入内容が封印 memfd
+/// (`InjectedContent::from_file`)にあれば内容はユーザー空間のメモリに載らず holder も fd を持たないので通す。
+/// `InjectedContent::from_bytes` の内容(呼び出し元のヒープに残る)だけを拒否する(#2628・SEC-1・SEC-5・CORE-6・
+/// SUP-12。方式は `docs/design/rootless-id-map-holder.md`)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
+#[cfg(target_os = "linux")]
+fn refuse_inject_with_subordinate(
+    privilege: IsolationPrivilege,
+    options: &LaunchOptions,
+) -> Result<(), TraitError> {
+    if privilege == IsolationPrivilege::RootlessSubordinateIds
+        && options
+            .inject()
+            .files()
+            .iter()
+            .any(|f| f.content().is_caller_memory())
+    {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "injected file content held in process memory cannot be combined with the subordinate id privilege model",
+        ));
+    }
+    Ok(())
 }
 
 /// `RootlessSubordinateIds` の写像の入力元(`/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap` のパス。
@@ -622,6 +855,22 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
+    /// 起動オプションの network モード(start が予約前に config と突き合わせる。NET-6・SEC-1・#3058)。
+    /// launch で使う値と同じ `launch_options` から取る(未指定は `FromConfig`)。
+    fn network_mode(&self) -> LaunchNetworkMode {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .launch_options
+                .as_ref()
+                .map_or(LaunchNetworkMode::FromConfig, LaunchOptions::network)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
     /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
@@ -714,9 +963,17 @@ trait LaunchOps: Send + Sync {
     /// 呼び出しプロセスのスレッドが 1 つか(fork の前提)。
     fn is_single_threaded(&self) -> bool;
     /// `config` から Landlock の ruleset を作る(ABI 検出を含む。6 未満は拒否)。
+    ///
+    /// `user_tmpfs` は利用者指定の tmpfs(暗黙の `/dev/shm` を除く。`mounts[]` とは別枠で `RuleOrigin::UserTmpfs` になる)。
+    /// `implicit` は暗黙の `/dev` 系マウントのルールの含め方(起動オプションの tmpfs 集合から導く。SUP-12・#2625)。
+    /// `binds` は start が検証した bind の集合(`spec.bind_mounts()`)。書き込み可能な root の下の `ro` の bind は、
+    /// これと一致するときだけ Landlock のルール生成が受ける(CORE-5・#1917)。
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
+        implicit: ImplicitDevMounts,
+        binds: &super::bind_mounts::BindMountSet,
     ) -> Result<LandlockRuleset, ExecError>;
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
     /// SUP-6・#2007）。
@@ -751,14 +1008,28 @@ struct SpawnInput<'a> {
     stages: StagePipeline,
     audit: LaunchAudit<'a>,
     timeout: Duration,
-    /// 暗黙の既定 tmpfs(`/dev/shm`)。launcher が fork 前に構築し、bind との重なりも検査済み。
+    /// pivot 前段で載せる tmpfs(既定の `/dev/shm` か起動オプション由来の集合)。launcher が fork 前に確定し、
+    /// bind との重なりも検査済み。
     tmpfs: &'a TmpfsMountSet,
+    /// 注入するファイル(secrets / configs。空なら `None`。SUP-12・#2625)。bind との重なりは検査済み。
+    inject: Option<&'a InjectedFileSet>,
+    /// 管理ルートの `/etc/hosts`・`/etc/resolv.conf` の bind(`LaunchOptions::etc_files` が空なら `None`)。fork 前に
+    /// `EtcFileMounts::verify` で検証し、bind・tmpfs・注入との重なりも検査済み(NET-12・#1872)。
+    etc_files: Option<&'a crate::exec::EtcFileMounts>,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
     /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
     sysfs: Option<&'a SysfsMountSpec>,
+    /// 実効の名前空間と照合済みの sysctl の適用計画(`linux.sysctl` が空なら `None`。#2670)。
+    sysctls: Option<&'a SysctlPlan<'a>>,
     /// 範囲写像で起動するときの解決済み写像(`None` なら単一 ID 写像。CORE-6・#2009)。
     subordinate: Option<&'a SubordinateIds>,
+    /// `root.readonly` の実効値（config と `--read-only` の OR。Landlock・分離の記録と同じ値。#2828）。
+    root_readonly: bool,
+    /// exec 直前の netns の素性の同期点(`Host` と `Loopback` の起動だけ `Some`。`FromConfig` は `None`。NET-6・SEC-1・#3206)。
+    netns_sync: Option<crate::exec::NetnsSyncRequest>,
+    /// `Attachable` の同期点で呼ぶ準備処理(他のモードは `None`。NET-9・CORE-6・#1939)。
+    netns_attach: Option<&'a dyn super::NetnsAttachHook>,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -769,6 +1040,9 @@ struct Spawned {
     stderr: std::io::PipeReader,
     /// PID 1 から受け取った seccomp の listener(SEC-4・#2024)。本番の入口は必ず `Some`。偽の launcher は `None`。
     listener: Option<crate::exec::SeccompListener>,
+    /// 子が返した Mount 由来のルールの launch 時の識別子(`(ルール位置, 識別子)`。SEC-1・SEC-4・#3201)。本番の入口は
+    /// 必ず `Some`(空もあり得る)。`None` は識別子を持たない偽の launcher だけで、分離の記録は識別子なしのまま残る。
+    mount_identities: Option<Vec<(usize, crate::launch_isolation::RecordedMountIdentity)>>,
 }
 
 /// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
@@ -784,6 +1058,7 @@ enum LaunchRecord {
     Settling,
     /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
     /// 値は launch ごとの世代。そのハンドルの `terminate` が成功したら、同じ世代の項目だけを `Clean` へ進める
+    /// (ハンドルの drop でも同じ世代だけを、回収済みなら `Clean`、未回収なら `Pending` へ進める。#3432)
     /// (回収の証跡を台帳へ引き継ぐ。再 launch 後の古いハンドルが新しい項目を書き換えない。CORE-2)。
     Handed(u64),
 }
@@ -794,7 +1069,7 @@ enum LaunchRecord {
 struct Pending {
     /// 回収できなかった子。順序は中間プロセス → PID 1(PID 1 は中間プロセスの回収後でないと C の子にならず、
     /// `waitpid` が `ECHILD` になるため、この順で再回収する)。
-    children: Vec<ContainerChild>,
+    children: Vec<Arc<ContainerChild>>,
     /// 報告前の PID 1 の再探索が要る起動識別子。
     rescans: Vec<LaunchTag>,
 }
@@ -822,6 +1097,42 @@ struct Ledger {
 impl Ledger {
     fn position(&self, id: &ContainerId) -> Option<usize> {
         self.entries.iter().position(|(k, _)| k == id)
+    }
+
+    /// `Handed(generation)` のハンドルが drop されたとき、その子を台帳へ戻す(CORE-2・NET-9・REPAIR-5・#3432)。
+    ///
+    /// - 同じ世代の `Handed`: 回収済みなら `Clean`、未回収なら `Pending`(後続の確認が kill・回収する)
+    /// - 項目が無い(`Handed` は満杯時に追い出される): 未回収なら `Pending` を入れる。回収済みなら何もしない
+    /// - それ以外(別の世代の `Handed`・`Clean`・`Pending`・`Settling`)には触れない。再 launch が新しい項目を
+    ///   作った後に古いハンドルが drop されても、新しい項目を書き換えない
+    fn take_back_dropped(
+        &mut self,
+        id: &ContainerId,
+        generation: u64,
+        child: Arc<ContainerChild>,
+        reaped: bool,
+    ) {
+        let pending = |child| {
+            LaunchRecord::Pending(Pending {
+                children: vec![child],
+                rescans: Vec::new(),
+            })
+        };
+        match self.position(id) {
+            Some(i) => {
+                if let Some((_, record)) = self.entries.get_mut(i)
+                    && matches!(record, LaunchRecord::Handed(g) if *g == generation)
+                {
+                    *record = if reaped {
+                        LaunchRecord::Clean
+                    } else {
+                        pending(child)
+                    };
+                }
+            }
+            None if !reaped => self.set(id, pending(child)),
+            None => {}
+        }
     }
 
     fn has_pending(&self) -> bool {
@@ -872,6 +1183,39 @@ impl Ledger {
             return;
         }
         self.entries.push((id.clone(), record));
+    }
+}
+
+/// `process.user.additionalGids` が user namespace の gid 写像に含まれることを fork の前に確かめる(純関数。
+/// 副作用なし。OCI-1・SEC-5・CORE-6・#2667)。
+///
+/// 空なら常に `Ok`。`RootlessSingleId` の写像は `setgroups` を `deny` にするため、非空の指定は適用できず
+/// 黙って落とさずに拒否する。`RootlessSubordinateIds` は全 gid が `gid_map` に含まれる場合だけ許す
+/// (写像外の gid は子の `setgroups` が `EINVAL` になり構造化されない)。メッセージは固定文言で、値を含めない(ERR-1)。
+#[cfg(target_os = "linux")]
+fn check_additional_gids_mapped(
+    privilege: IsolationPrivilege,
+    gid_map: Option<&IdMapSet>,
+    gids: &[u32],
+) -> Result<(), TraitError> {
+    if gids.is_empty() {
+        return Ok(());
+    }
+    match (privilege, gid_map) {
+        (IsolationPrivilege::RootlessSubordinateIds, Some(g)) => {
+            if gids.iter().all(|gid| g.host_id_of(*gid).is_some()) {
+                Ok(())
+            } else {
+                Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "process.user.additionalGids is not mapped in the user namespace (SEC-5)",
+                ))
+            }
+        }
+        _ => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "process.user.additionalGids requires a subordinate id mapping (SEC-5)",
+        )),
     }
 }
 
@@ -966,10 +1310,17 @@ struct Inner {
     cgroup_join_source: Option<JoinSource>,
     /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
     applied_resources: Option<LinuxResourceLimits>,
+    /// 起動オプション(`ProductionLauncherBuilder::launch_options`。`None` は従来どおりの既定。SUP-12・#2625)。
+    launch_options: Option<LaunchOptions>,
     /// ERRNO 側の拒否の届け方(`ProductionLauncherBuilder::seccomp_errno_delivery`。既定 `Errno`。SEC-4・#2025)。
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     /// 監査の網羅を満たせない環境への方針(`ProductionLauncherBuilder::audit_coverage_policy`。既定 `BestEffort`。SEC-4・#2027)。
     audit_policy: crate::audit_log::AuditCoveragePolicy,
+    /// `Attachable` の同期点で呼ぶ準備処理(`ProductionLauncherBuilder::netns_attach_hook`。NET-9・#1939)。
+    netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
+    /// 試験用の netns 基準の差し替え(`ProductionLauncherBuilder::netns_baseline_override_for_test`。#3206)。
+    #[cfg(feature = "exec-test-support")]
+    netns_baseline_override: Option<(u64, u64)>,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -997,11 +1348,28 @@ impl Inner {
             rejection_audit_sink: None,
             cgroup_join_source,
             applied_resources: None,
+            launch_options: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
+            netns_attach_hook: None,
+            #[cfg(feature = "exec-test-support")]
+            netns_baseline_override: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
+        }
+    }
+
+    /// 試験用の基準の差し替え(本番ビルドでは常に `None`)。
+    fn netns_baseline_override(&self) -> Option<crate::exec::NetnsIdentity> {
+        #[cfg(feature = "exec-test-support")]
+        {
+            self.netns_baseline_override
+                .map(|(dev, ino)| crate::exec::NetnsIdentity::from_parts_for_test(dev, ino))
+        }
+        #[cfg(not(feature = "exec-test-support"))]
+        {
+            None
         }
     }
 
@@ -1025,6 +1393,11 @@ impl Inner {
             self.privilege,
             self.subordinate.as_ref().map(|s| (&s.uid, &s.gid)),
             spec.user(),
+        )?;
+        check_additional_gids_mapped(
+            self.privilege,
+            self.subordinate.as_ref().map(|s| &s.gid),
+            spec.additional_gids(),
         )?;
         let means = if self.cgroup_join_source.is_some() {
             CgroupJoinMeans::Provided
@@ -1087,10 +1460,56 @@ impl Inner {
                 "launch requires a single-threaded process",
             ));
         }
+        // 起動オプション(未指定なら既定の `/dev/shm` 1 件・注入なし・専用 IPC)。暗黙の `/dev` 系の Landlock ルールは
+        // 実際に載せる tmpfs 集合から導き、実マウントとの食い違いを作らない(SUP-12・CORE-5・#2625)。
+        let default_options;
+        let options = match &self.launch_options {
+            Some(options) => options,
+            None => {
+                default_options = LaunchOptions::try_default()?;
+                &default_options
+            }
+        };
+        // network: spec は start が `launch_options` と同じモードで突き合わせ済みのはず。ラッパーが `network_mode` を
+        // 転送しないと `FromConfig` で判定され、`Loopback` 指定がホスト共有へ黙って縮退する(fail-closed。NET-6・SEC-1・#3058)。
+        if spec.network_mode() != options.network() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launch spec was reconciled with a different network mode",
+            ));
+        }
+        // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
+        refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
+        // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は `mounts[]` とは別枠で Landlock のルールにも載せる。載せないと
+        // 読み取り専用 root 配下の `--tmpfs /run` が EACCES になる。`ro` の tmpfs はルール生成側が除外する
+        // (SUP-12・#2625)。
+        let user_tmpfs: Vec<super::config::OciMount> = options
+            .tmpfs()
+            .mounts()
+            .iter()
+            .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
+            .map(super::config::OciMount::from_user_tmpfs)
+            .collect();
+        // `root.readonly` の実効値は config と `--read-only` の OR を 1 回だけ計算し、Landlock の root 規則・分離の記録・
+        // pivot 後の mount の RDONLY の 3 つへ同じ値を渡す(食い違うと mount だけ ro で Landlock が rw のままになる。
+        // 狭める方向のみ。CLI-1・SUP-12・CORE-5・SEC-1・#2828)。
+        let effective_root_readonly = spec.config().root().readonly() || options.root_readonly();
+        let landlock_config: std::borrow::Cow<'_, super::config::OciConfig> =
+            if effective_root_readonly && !spec.config().root().readonly() {
+                std::borrow::Cow::Owned(spec.config().with_root_readonly_forced())
+            } else {
+                std::borrow::Cow::Borrowed(spec.config())
+            };
         let ruleset = self
             .ops
-            .landlock_ruleset(spec.config())
+            .landlock_ruleset(
+                &landlock_config,
+                &user_tmpfs,
+                options.implicit_dev_mounts(),
+                // `--read-only` で config を複製しても `mounts()` は同じなので、bind の `index` はずれない。
+                spec.bind_mounts(),
+            )
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -1110,10 +1529,25 @@ impl Inner {
             euid,
             egid,
         )?);
+        // `process.capabilities` の drop を解釈した許可集合（OCI 既定の部分集合）。launch の削減段へ渡し、同じ値を
+        // 分離の記録へ添えて exec の再適用が launch より広い集合を与えないようにする(SEC-1・CRI-2・#2666)。
+        // 起動オプションの `--cap-drop` はここで重ねる(CLI-1・#2775)。狭めた同じ値を段と記録の両方へ渡す。
+        let capabilities = spec
+            .config()
+            .capabilities()
+            .without(options.capability_drop());
+        let isolation_record = isolation_record
+            .with_capabilities(capabilities)
+            .with_root_readonly(effective_root_readonly);
         let (uid, gid) = spec.user();
+        // 補助グループの正規化(確保・整列・重複除去)は fork の前に済ませる(#2770)。
+        let additional_gids =
+            NormalizedGroups::new(spec.additional_gids()).map_err(|e| to_trait_error(&e))?;
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
             .with_process_ids(uid, gid)
+            .with_supplementary_groups(additional_gids)
+            .with_capabilities(capabilities)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
         if let Some(source) = &self.cgroup_join_source {
@@ -1127,17 +1561,38 @@ impl Inner {
                 .with_hook(StageKind::CgroupJoin, join)
                 .map_err(|e| to_trait_error(&e))?;
         }
-        let entry = entrypoint_of(spec)?;
-        let isolation = isolation_config_of(spec)?;
-        // 暗黙の `/dev/shm` を fork 前に構築し、bind の宛先との重なりをここで検査する(両方の集合が揃う場所。
-        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・#1654・#1915)。
-        let mut default_tmpfs = TmpfsMountSet::new();
-        default_tmpfs.ensure_default_dev_shm().map_err(|e| {
-            TraitError::new(e.code(), "failed to prepare the default /dev/shm mount")
-        })?;
+        // `--ulimit` の指定を 16 種へ補完し、`Rlimits` 段と `state.json` の記録の両方へ同じ集合を渡す(exec の再適用が
+        // launch と一致する。fork 前に 1 回だけ読む。SUP-12・SEC-1・#2713)。
+        let launch_rlimits = crate::exec::launch_rlimits_from_self(options.rlimits())
+            .map_err(|e| to_trait_error(&e))?;
+        stages = stages
+            .with_rlimits(launch_rlimits.clone())
+            .map_err(|e| to_trait_error(&e))?;
+        let merged_env = options.merged_env(spec.env());
+        let entry = entrypoint_of(spec, &merged_env)?;
+        let isolation = isolation_config_of(spec, options.ipc())?;
+        // `linux.sysctl` は子が実際に作る名前空間と照合してから子へ渡す(`--ipc=host` で IPC namespace を外した構成で
+        // ホストの IPC の値を書かせない。計画は照合を通らないと作れない型。CRI-2・CORE-3・SEC-1・#2670)。
+        let sysctls =
+            SysctlPlan::new(spec.config().sysctls(), isolation.namespaces).map_err(|_| {
+                TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "linux.sysctl requires a namespace the container does not have",
+                )
+            })?;
+        // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
+        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
+        let tmpfs = options.tmpfs();
+        let inject = (!options.inject().is_empty()).then(|| options.inject());
         let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
+        check_tmpfs_against_readonly_paths(spec.config().readonly_paths(), tmpfs, inject)?;
         if let Some(binds) = binds
-            && let Err(err) = binds.check_against_tmpfs(&default_tmpfs)
+            && let Err(err) = binds
+                .check_against_tmpfs(tmpfs)
+                .and_then(|()| match inject {
+                    Some(inject) => binds.check_against_injected(inject),
+                    None => Ok(()),
+                })
         {
             let (code, message) = (err.code(), err.message());
             let _ = audit_bind_mount_error(
@@ -1148,6 +1603,41 @@ impl Inner {
             );
             return Err(TraitError::new(code, message));
         }
+        // 管理ルートの `/etc/hosts`・`/etc/resolv.conf`(指定時のみ)。宛先の重なりを検査し(bind との重なりは他の bind の
+        // 拒否と同じく監査 sink へ記録する)、元を fork 前に fd で検証する。restart の再 launch でも毎回やり直す
+        // (NET-12・SEC-1・REPAIR-5・#1872)。
+        let etc_mounts = if options.etc_files().is_empty() {
+            None
+        } else {
+            if let Some(binds) = binds
+                && let Err(err) = binds.check_against_etc_files(options.etc_files())
+            {
+                let (code, message) = (err.code(), err.message());
+                let _ = audit_bind_mount_error(
+                    err,
+                    spec.config().mounts(),
+                    Some(id),
+                    self.audit_sink.as_ref(),
+                );
+                return Err(TraitError::new(code, message));
+            }
+            crate::etc_files::check_etc_overlaps(options.etc_files(), tmpfs, inject, None)?;
+            let Some(state_root) = spec.state_root() else {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container etc files require a state store root",
+                ));
+            };
+            Some(
+                crate::exec::EtcFileMounts::verify(
+                    state_root,
+                    id,
+                    options.etc_files(),
+                    effective_root_readonly,
+                )
+                .map_err(|e| to_trait_error(&e))?,
+            )
+        };
         let audit = LaunchAudit {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
@@ -1160,6 +1650,22 @@ impl Inner {
                 "container launch did not complete within the timeout",
             ));
         }
+        // exec 直前の netns の素性の同期点の要求を fork の前に確定する。モードと実効の扱いの組が不整合なら拒否する
+        // (突き合わせ済みの start の結果と食い違う多重防御。NET-6・SEC-1・#3206)。
+        let netns_sync = netns_sync_request(
+            options.network(),
+            spec.network(),
+            self.netns_baseline_override(),
+        )?;
+        // `Attachable` はフックが要る。無いまま fork して合図を送れない子を作らない(build の組の検査の多重防御。fail-closed)。
+        if netns_sync.is_some_and(|r| r.handover == crate::exec::NetnsHandover::NetAndUser)
+            && self.netns_attach_hook.is_none()
+        {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "the attachable network mode has no attach hook",
+            ));
+        }
         let spawned = self
             .ops
             .spawn(SpawnInput {
@@ -1169,10 +1675,16 @@ impl Inner {
                 stages,
                 audit,
                 timeout,
-                tmpfs: &default_tmpfs,
+                tmpfs,
+                inject,
+                etc_files: etc_mounts.as_ref(),
                 binds,
                 sysfs: spec.sysfs_mount(),
+                sysctls: sysctls.as_ref(),
                 subordinate: self.subordinate.as_ref(),
+                root_readonly: effective_root_readonly,
+                netns_sync,
+                netns_attach: self.netns_attach_hook.as_deref(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -1180,6 +1692,7 @@ impl Inner {
             stdout,
             stderr,
             listener,
+            mount_identities,
         } = spawned;
         // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
         if child.pid() == 0 {
@@ -1193,15 +1706,36 @@ impl Inner {
         if child.pidfd().is_none() {
             return Err(self.reject_unusable_child(id, child));
         }
+        // 子が返した Mount 由来のルールの識別子を分離の記録へ添える(exec の再適用の照合の元。start の Running 更新と
+        // restart の Running(新 pid)更新が `state.json` へ書く。SEC-1・SEC-4・#3201)。添えられない(不整合)なら、
+        // 識別子なしの記録で走らせず PID 1 を回収して拒否する(握りつぶさない。CORE-2)。
+        let isolation_record = match mount_identities {
+            Some(entries) => match isolation_record.with_mount_identities(entries) {
+                Ok(record) => record,
+                Err(e) => {
+                    return Err(self.reject_child_with(
+                        id,
+                        child,
+                        ErrorCode::Internal,
+                        e.message(),
+                    ));
+                }
+            },
+            None => isolation_record,
+        };
         let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         // ハンドルの terminate が成功した（PID 1 の消滅を回収で確かめた）ら、同じ世代の Handed を Clean へ進める。
         // 遅れて成功した状態更新の後始末が confirm_no_process で回収済みを確かめられるようにする（CORE-2）。
         let ledger = Arc::downgrade(&self.ledger);
         let owner = id.clone();
+        // ハンドルを drop したときの引き継ぎ用(#3432)。上の回収通知とは別の所有権を持たせる。
+        let drop_ledger = Arc::downgrade(&self.ledger);
+        let drop_owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
             .with_seccomp_listener(listener)
             .with_launch_isolation(isolation_record)
+            .with_launch_rlimits(launch_rlimits)
             .with_exit_audit(self.exit_audit_sink(), id.clone())
             .with_reap_notice(Box::new(move || {
                 let Some(ledger) = ledger.upgrade() else {
@@ -1216,6 +1750,13 @@ impl Inner {
                 {
                     *record = LaunchRecord::Clean;
                 }
+            }))
+            .with_drop_notice(Box::new(move |child, reaped| {
+                let Some(ledger) = drop_ledger.upgrade() else {
+                    return;
+                };
+                let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                ledger.take_back_dropped(&drop_owner, generation, child, reaped);
             }));
         self.ledger().set(id, LaunchRecord::Handed(generation));
         Ok(Box::new(process))
@@ -1331,27 +1872,38 @@ impl Inner {
 
     /// pidfd の無い子を回収して拒否する(回収できなければ台帳に `Pending` で残す)。
     fn reject_unusable_child(&self, id: &ContainerId, child: ContainerChild) -> TraitError {
+        self.reject_child_with(
+            id,
+            child,
+            ErrorCode::FailedPrecondition,
+            "the launched process has no pidfd",
+        )
+    }
+
+    /// 使えない子(`what` が理由の固定文言)を回収して `code` で拒否する。回収できなければ台帳に `Pending` で残し、
+    /// 文言に未確認の注記を足す(握りつぶさない。CORE-2)。
+    fn reject_child_with(
+        &self,
+        id: &ContainerId,
+        child: ContainerChild,
+        code: ErrorCode,
+        what: &str,
+    ) -> TraitError {
         match child.kill_and_reap(POST_SPAWN_REAP_TIMEOUT) {
             Ok(_) => {
                 self.ledger().set(id, LaunchRecord::Clean);
-                TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "the launched process has no pidfd and was terminated",
-                )
+                TraitError::new(code, format!("{what} and was terminated"))
             }
             Err(_) => {
                 self.left_process.store(true, Ordering::SeqCst);
                 self.ledger().set(
                     id,
                     LaunchRecord::Pending(Pending {
-                        children: vec![child],
+                        children: vec![Arc::new(child)],
                         rescans: Vec::new(),
                     }),
                 );
-                TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    format!("the launched process has no pidfd{UNCONFIRMED_SUFFIX}"),
-                )
+                TraitError::new(code, format!("{what}{UNCONFIRMED_SUFFIX}"))
             }
         }
     }
@@ -1373,7 +1925,7 @@ impl Inner {
             self.ledger().set(
                 id,
                 LaunchRecord::Pending(Pending {
-                    children: unreaped,
+                    children: unreaped.into_iter().map(Arc::new).collect(),
                     rescans,
                 }),
             );
@@ -1407,7 +1959,9 @@ impl Inner {
                 if found.error.is_some() {
                     failed = true;
                 }
-                pending.children.extend(found.unreaped);
+                pending
+                    .children
+                    .extend(found.unreaped.into_iter().map(Arc::new));
             }
         }
         if !failed {
@@ -1542,7 +2096,7 @@ fn to_trait_error(e: &ExecError) -> TraitError {
 
 /// `process.args` から exec するエントリポイントを作る(シェルを介さず配列のまま渡す。インジェクション防止)。
 #[cfg(target_os = "linux")]
-fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
+fn entrypoint_of(spec: &LaunchSpec, env: &[String]) -> Result<Entrypoint, TraitError> {
     let first = spec.args().first().ok_or_else(|| {
         TraitError::new(ErrorCode::InvalidArgument, "process.args must not be empty")
     })?;
@@ -1550,21 +2104,49 @@ fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
     // runtime-spec は `args[0]` を `execvp` の file と同じ意味とする)。`/` を含む相対パスは `PATH` を引かず、
     // pivot と cwd の適用後に cwd 起点で解決する(OCI-1・OCI-4・#2432。`..` は `cwd_relative` が拒否)。
     let built = if first.starts_with('/') {
-        Entrypoint::new(first, spec.args(), spec.env())
+        Entrypoint::new(first, spec.args(), env)
     } else if first.contains('/') {
-        Entrypoint::cwd_relative(first, spec.args(), spec.env())
+        Entrypoint::cwd_relative(first, spec.args(), env)
     } else {
-        Entrypoint::search_path(first, spec.args(), spec.env())
+        Entrypoint::search_path(first, spec.args(), env)
     };
     built.map_err(|e| to_trait_error(&e))
 }
 
 /// `LaunchSpec` の namespace・hostname から分離の設定を作る(`start` が検証済み。未対応の種別は拒否)。
 #[cfg(target_os = "linux")]
-fn isolation_config_of(spec: &LaunchSpec) -> Result<IsolationConfig, TraitError> {
+fn isolation_config_of(
+    spec: &LaunchSpec,
+    ipc: LaunchIpcMode,
+) -> Result<IsolationConfig, TraitError> {
+    // pod の ipc namespace へ join する起動と `--ipc=host` は同時に成り立たない(join を黙って捨てると、指定より
+    // 弱い分離になる。fail-closed。CRI-2・CORE-3・SEC-1。#2674)。
+    if spec.namespace_join().is_some() && ipc == LaunchIpcMode::Host {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with --ipc=host",
+        ));
+    }
+    // Loopback の netns は pod の join と組み合わせない。`isolate_join` が `Net` を unshare すると、pod の中で共有されない
+    // netns で黙って動くため(fail-closed。NET-6・CRI-2・SEC-1。#3064・#2675)。
+    if spec.namespace_join().is_some() && spec.network() == EffectiveNetwork::NewLoopback {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with the loopback network mode",
+        ));
+    }
+    // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
+    // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
     for kind in spec.namespaces() {
         let ns = match kind {
+            // `--ipc=host` のときだけ IPC namespace を作らない(config.json からは外せない。SEC-1・SUP-12・#2625)。
+            NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
+            // `Host`(path 無しの network エントリ)は start が `HostShared` と判定済み。新しい netns は作らない(NET-6・#3058)。
+            NamespaceKind::Network if spec.network() == EffectiveNetwork::HostShared => continue,
+            // path 無しの network エントリで実効が `NewLoopback` なら、新しい netns を作る(中間プロセスが `lo` を up にする。
+            // NET-6・#3064)。
+            NamespaceKind::Network => Namespace::Net,
             NamespaceKind::Pid => Namespace::Pid,
             NamespaceKind::Mount => Namespace::Mount,
             NamespaceKind::Uts => Namespace::Uts,
@@ -1578,6 +2160,11 @@ fn isolation_config_of(spec: &LaunchSpec) -> Result<IsolationConfig, TraitError>
             }
         };
         namespaces = namespaces.with(ns);
+    }
+    // config に network エントリが無くても、実効が `NewLoopback`(CLI の既定の `none`)なら netns を作る。落とすと最も
+    // 一般的な起動でホストの netns のまま動く(NET-6・SEC-1・#3064)。
+    if spec.network() == EffectiveNetwork::NewLoopback {
+        namespaces = namespaces.with(Namespace::Net);
     }
     let hostname = spec
         .hostname()
@@ -1606,8 +2193,13 @@ impl LaunchOps for RealOps {
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
+        implicit: ImplicitDevMounts,
+        binds: &super::bind_mounts::BindMountSet,
     ) -> Result<LandlockRuleset, ExecError> {
-        let ruleset = crate::exec::landlock_ruleset_from_config(config)?;
+        let ruleset = crate::exec::landlock_ruleset_from_config_with_dev(
+            config, user_tmpfs, implicit, binds,
+        )?;
         // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026）。
         // 縮退の拒否(厳格モード)と 3 か所への表示は `Inner::assess_audit_coverage`（#2027）。送れなくても起動の可否は変えない。
         if let Some(line) = ruleset.audit_mode().log_line() {
@@ -1642,12 +2234,16 @@ impl LaunchOps for RealOps {
         // euid 0 の写像は計画の段階で拒否される(`HostRootIdentityMapping`。SEC-5)。
         // 単一 ID は自 egid をコンテナ内 0 へ写す写像、範囲写像は解決済みの subuid / subgid 写像(CORE-6・#2009)。
         // どちらも devpts の gid= の決定元になる gid 写像を併せて得る。
+        // `rslave` の bind を求める起動だけ、中間プロセス側の `/` を slave にして master 関係を残す(OCI-4・CRI-2・#2669)。
+        let host_slave = input.spec.bind_mounts().has_host_slave();
         let single_plan;
         let single_gid;
         let subordinate_plan;
         let (isolation_plan, gid_map): (IntermediatePlan<'_>, &IdMapSet) = match input.subordinate {
             None => {
-                single_plan = plan(&input.isolation).map_err(not_started)?;
+                single_plan = plan(&input.isolation)
+                    .map_err(|e| plan_rejected(e, input.audit))?
+                    .with_host_slave_root(host_slave);
                 // 計画が euid / egid 0 を拒否した後に作る。
                 single_gid = crate::rootless::single_id_mapping(crate::sys::effective_gid())
                     .map_err(|_| {
@@ -1667,7 +2263,8 @@ impl LaunchOps for RealOps {
                     ids.writer.clone(),
                     ids.timeout,
                 )
-                .map_err(not_started)?;
+                .map_err(|e| plan_rejected(e, input.audit))?
+                .with_host_slave_root(host_slave);
                 (
                     IntermediatePlan::Subordinate(&subordinate_plan),
                     subordinate_plan.gid_map(),
@@ -1678,9 +2275,11 @@ impl LaunchOps for RealOps {
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
-            inject: None,
+            inject: input.inject,
+            etc_files: input.etc_files,
             binds: input.binds,
             sysfs: input.sysfs,
+            sysctls: input.sysctls,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             config_paths: ConfigPaths {
                 readonly: input.spec.config().readonly_paths(),
@@ -1688,13 +2287,19 @@ impl LaunchOps for RealOps {
             },
             status: None,
             working_dir: Some(input.spec.working_dir()),
+            // config の `root.readonly` と `--read-only` の OR（launcher が 1 回だけ計算した実効値。外す・緩める入口ではない。
+            // #2767・#2828）。
+            root_readonly: input.root_readonly,
         };
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {
                 plan: isolation_plan,
+                join: input.spec.namespace_join(),
                 rootfs: input.spec.rootfs(),
                 entry: input.entry,
                 setup,
+                netns_sync: input.netns_sync,
+                netns_attach: input.netns_attach,
             },
             input.stages,
             stdio,
@@ -1707,6 +2312,7 @@ impl LaunchOps for RealOps {
             stdout,
             stderr,
             listener: launched.listener,
+            mount_identities: Some(launched.mount_identities),
         })
     }
 
@@ -1725,6 +2331,17 @@ impl LaunchOps for RealOps {
     }
 }
 
+/// 計画の拒否 `e` を、親の監査へ 1 件記録した起動失敗にする(SEC-1・SEC-4・#2130)。
+///
+/// `spawn` の `plan()` / `plan_rootless_subordinate()` の失敗だけが使う。fork 前の拒否のため回収する子は無い
+/// (`clean`)。違反なしのエラー・`PlanRejected` 以外は記録せず `not_applicable`(従来どおり)。
+#[cfg(target_os = "linux")]
+fn plan_rejected(e: ExecError, audit: LaunchAudit<'_>) -> Box<PreparedLaunchFailure> {
+    Box::new(PreparedLaunchFailure::clean(
+        crate::exec::record_launch_plan_rejection(e, audit.container, audit.sink),
+    ))
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1733,6 +2350,26 @@ mod tests {
     use crate::oci_runtime::parse_config_bytes;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// SEC-4・CORE-5・ERR-1・#2716: `R` の後の `execveat` の失敗（`Exec` 段）は、errno の分類を `code` に、固定文言を
+    /// `message` に写す（パス・errno を含めない）。supervisor / CLI / CRI はこの `code` で表示を決める。
+    #[test]
+    fn sec4_2716_execveat_failure_maps_to_fixed_message_with_errno_class() {
+        for code in [
+            ErrorCode::NotFound,
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+        ] {
+            let e = ExecError::new(
+                code,
+                IsolationStage::Exec,
+                "the entrypoint execveat failed in the container child",
+            );
+            let t = launch_error(&e, false);
+            assert_eq!(t.code(), code);
+            assert_eq!(t.message(), "container launch failed in the Exec stage");
+        }
+    }
 
     struct NullSink;
 
@@ -1777,6 +2414,9 @@ mod tests {
     /// spawn に渡った (bind の宛先列, 既定 tmpfs の宛先列)。
     type SeenSpawn = (Option<Vec<String>>, Vec<String>);
 
+    /// spawn に渡った (注入の宛先列, namespace に IPC があるか)。
+    type SeenOptions = (Option<Vec<String>>, bool);
+
     /// 偽の実体が返す実効 uid / gid(試験を実行ユーザーに依存させない)。
     const FAKE_EUID: u32 = 1000;
     const FAKE_EGID: u32 = 1001;
@@ -1799,6 +2439,12 @@ mod tests {
         run_stages: bool,
         /// spawn に渡った bind mount の宛先列と既定 tmpfs の宛先列の記録(spawn ごとに 1 件。bind 無しは `None`)。
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
+        /// spawn に渡った起動オプション由来の値(注入の宛先列・namespace に IPC があるか。SUP-12・#2625)。
+        seen_options: Arc<Mutex<Vec<SeenOptions>>>,
+        /// spawn に渡った entrypoint の env(launch ごとに 1 件。#2713)。
+        seen_env: Arc<Mutex<Vec<Vec<String>>>>,
+        /// `landlock_ruleset` に渡った暗黙マウントの含め方(launch ごとに 1 件)。
+        seen_implicit: Arc<Mutex<Vec<ImplicitDevMounts>>>,
         /// `root_identity` が `None`(rootfs を fstat できない)を返すか。
         fail_root_identity: bool,
         /// `ensure_no_process_in_recorded` が順に返す結果(尽きたら `AlreadyAbsent`)と、受け取った配置の記録(#2011)。
@@ -1823,6 +2469,9 @@ mod tests {
                 rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                seen_options: Arc::new(Mutex::new(Vec::new())),
+                seen_env: Arc::new(Mutex::new(Vec::new())),
+                seen_implicit: Arc::new(Mutex::new(Vec::new())),
                 fail_root_identity: false,
                 recorded_script: Mutex::new(VecDeque::new()),
                 recorded_calls: Arc::new(Mutex::new(Vec::new())),
@@ -1845,10 +2494,16 @@ mod tests {
         fn landlock_ruleset(
             &self,
             config: &super::super::config::OciConfig,
+            user_tmpfs: &[super::super::config::OciMount],
+            implicit: ImplicitDevMounts,
+            binds: &super::super::bind_mounts::BindMountSet,
         ) -> Result<LandlockRuleset, ExecError> {
             push(&self.events, "landlock");
+            self.seen_implicit.lock().unwrap().push(implicit);
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
-            crate::exec::ruleset_from_detection(detected, config)
+            crate::exec::ruleset_from_detection_with_dev(
+                detected, config, user_tmpfs, implicit, binds,
+            )
         }
 
         fn effective_ids(&self) -> (u32, u32) {
@@ -1886,6 +2541,19 @@ mod tests {
                     .iter()
                     .map(|m| m.destination.as_str().to_owned())
                     .collect(),
+            ));
+            self.seen_env
+                .lock()
+                .unwrap()
+                .push(input.entry.env_for_test());
+            self.seen_options.lock().unwrap().push((
+                input.inject.map(|set| {
+                    set.files()
+                        .iter()
+                        .map(|f| f.destination().as_str().to_owned())
+                        .collect()
+                }),
+                input.isolation.namespaces.contains(Namespace::Ipc),
             ));
             // 範囲写像で起動する場合だけ、渡された写像の内容を記録する(単一 ID の起動の記録は増やさない)。
             if let Some(ids) = input.subordinate {
@@ -1941,6 +2609,7 @@ mod tests {
                 stdout,
                 stderr,
                 listener: None,
+                mount_identities: None,
             })
         }
 
@@ -2051,12 +2720,27 @@ mod tests {
         env: &[&str],
         user: (u32, u32),
     ) -> LaunchSpec {
+        spec_with_root_readonly(name, false, linux_extra, mounts, args, env, user)
+    }
+
+    /// `root.readonly` を選べる組み立て(#2714)。`start` は #2767 から `root.readonly=true` を受けるため、
+    /// `start` を通しても同じ spec になる。Landlock のルールが読み取り専用 root でどうなるかの単体照合に使う。
+    fn spec_with_root_readonly(
+        name: &str,
+        root_readonly: bool,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+        args: &[&str],
+        env: &[&str],
+        user: (u32, u32),
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-launcher-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う。fd で pin した後は関数の終わりで消える
+        // （従来も終わりで消していた）。#3434・REPAIR-12。
+        let (_scratch, dir) =
+            crate::test_support::scratch_child(&format!("fandhe-launcher-{name}"), "d");
         std::fs::create_dir_all(dir.join("rootfs")).unwrap();
         let mut linux = serde_json::json!({"namespaces": [
             {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"}
@@ -2068,7 +2752,7 @@ mod tests {
         }
         let cfg = serde_json::json!({
             "ociVersion": "1.2.0",
-            "root": {"path": "rootfs"},
+            "root": {"path": "rootfs", "readonly": root_readonly},
             "hostname": "box",
             "process": {"user": {"uid": user.0, "gid": user.1}, "args": ["/bin/echo", "hi"],
                         "env": ["PATH=/bin"], "cwd": "/"},
@@ -2081,7 +2765,7 @@ mod tests {
         let namespaces = config.namespaces().iter().map(|n| n.kind()).collect();
         let binds = super::super::bind_mounts::BindMountSet::from_mounts(config.mounts())
             .expect("valid binds");
-        let spec = LaunchSpec::new(
+        LaunchSpec::new(
             rootfs,
             rootfs_dir,
             args.iter().map(|a| (*a).to_owned()).collect(),
@@ -2094,9 +2778,7 @@ mod tests {
             binds,
             super::super::working_dir::ContainerWorkingDir::root(),
             user,
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        spec
+        )
     }
 
     /// OCI-1（#2314）: `entrypoint_of` は名前だけの `args[0]` を `PATH` 探索の対象にし、絶対パスは従来どおり、
@@ -2105,13 +2787,14 @@ mod tests {
     #[test]
     fn oci1_entrypoint_of_bare_name_search_and_rejections() {
         let ok = |args: &[&str], env: &[&str]| {
-            entrypoint_of(&spec_with_process(
+            let spec = spec_with_process(
                 "ep",
                 serde_json::json!({}),
                 serde_json::json!([]),
                 args,
                 env,
-            ))
+            );
+            entrypoint_of(&spec, spec.env())
         };
         let e = ok(
             &["docker-entrypoint.sh", "redis-server"],
@@ -2174,6 +2857,48 @@ mod tests {
         }
         for bad in [(65536, 1), (1, 65536), (65536, 65536), (u32::MAX, 0)] {
             assert!(check_user_mapped(sub, r, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: 補助グループは範囲写像で全件が gid 写像内なら許し、1 件でも外れれば拒否する。
+    /// 単一 ID 写像では非空を固定文言で拒否し、空は常に許す。
+    #[test]
+    fn oci1_check_additional_gids_mapped_boundaries() {
+        use crate::exec::IdMapping;
+        use crate::rootless::IdMapSet;
+        let gid_map = IdMapSet::new(vec![
+            IdMapping {
+                container_id: 0,
+                host_id: 1000,
+                count: 1,
+            },
+            IdMapping {
+                container_id: 1,
+                host_id: 200_000,
+                count: 65535,
+            },
+        ])
+        .unwrap();
+        let single = IsolationPrivilege::RootlessSingleId;
+        let sub = IsolationPrivilege::RootlessSubordinateIds;
+        assert!(check_additional_gids_mapped(single, None, &[]).is_ok());
+        assert!(check_additional_gids_mapped(sub, Some(&gid_map), &[]).is_ok());
+        assert!(check_additional_gids_mapped(sub, Some(&gid_map), &[0, 1, 65535]).is_ok());
+        for bad in [&[65536][..], &[1, 65536], &[u32::MAX]] {
+            let e = check_additional_gids_mapped(sub, Some(&gid_map), bad).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{bad:?}");
+            assert_eq!(
+                e.message(),
+                "process.user.additionalGids is not mapped in the user namespace (SEC-5)"
+            );
+        }
+        for gids in [&[0][..], &[5, 6]] {
+            let e = check_additional_gids_mapped(single, None, gids).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{gids:?}");
+            assert_eq!(
+                e.message(),
+                "process.user.additionalGids requires a subordinate id mapping (SEC-5)"
+            );
         }
     }
 
@@ -2265,7 +2990,9 @@ mod tests {
             .with_audit_coverage(crate::audit_log::AuditCoveragePolicy::BestEffort, coverage)
             .with_id_mapping(
                 recorded_id_mapping(rootless(), None, FAKE_EUID, FAKE_EGID).expect("id mapping"),
-            );
+            )
+            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default())
+            .with_root_readonly(false);
         assert!(
             record == expected,
             "record must come from the applied ruleset"
@@ -2276,6 +3003,7 @@ mod tests {
             .iter()
             .map(|r| r.target().as_str())
             .collect();
+        assert_eq!(record.root_readonly(), Some(false));
         assert_eq!(targets.first().copied(), Some("/"));
         assert!(matches!(
             record.landlock().rules().first().map(|r| r.target()),
@@ -2286,6 +3014,27 @@ mod tests {
         assert!(pos("landlock") < pos("root_identity"));
         assert!(pos("root_identity") < pos("spawn"));
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-6・CORE-5(#2829): `root.readonly=true` の start では分離の記録の `root_readonly` が `Some(true)`、
+    /// 既定（書き込み可能）では `Some(false)` になる。
+    #[test]
+    fn sup6_core5_2829_readonly_root_is_recorded() {
+        for (ro, want) in [(true, Some(true)), (false, Some(false))] {
+            let spec = spec_with_root_readonly(
+                "iso-record-ro",
+                ro,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let l = launcher(FakeOps::new(&events()), rootless(), None);
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            assert_eq!(p.launch_isolation().expect("record").root_readonly(), want);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
     }
 
     /// SUP-6・OCI-4(#2007・#1915): bind mount の分も同じ ruleset から記録に入る。
@@ -2312,6 +3061,34 @@ mod tests {
             mounts,
             vec![("/data".to_owned(), 0), ("/cache".to_owned(), 1)]
         );
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CORE-5・OCI-4(#1917): `ro` の bind は、launcher が `spec.bind_mounts()` を Landlock のルール生成へ渡すため、
+    /// 書き込み可能な root でも fork 前に拒否されず、記録に `/data` の Mount 由来のルールが入る。
+    #[test]
+    fn core5_1917_launch_accepts_readonly_bind_under_writable_root() {
+        use crate::launch_isolation::RecordedTarget;
+        let mounts = serde_json::json!([
+            {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["bind", "ro"]}
+        ]);
+        let spec = spec_with_mounts("ro-bind", serde_json::json!({}), mounts);
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let mounts: Vec<(String, usize)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, index } => {
+                    Some((destination.as_str().to_owned(), *index))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mounts, vec![("/data".to_owned(), 0)]);
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
@@ -2762,13 +3539,19 @@ mod tests {
     }
 
     /// 試験用の subuid / subgid と helper(root 所有の実在ファイルで代用)の入力元を作る。
-    fn source_in(name: &str, subuid: &str, subgid: &str, helper: &str) -> SubordinateIdSource {
-        let dir = std::env::temp_dir().join(format!("fandhe-subids-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    ///
+    /// 入力元のファイルは遅延して読まれるため、guard を返して試験の終わりまで保つ（#3434・REPAIR-12）。
+    fn source_in(
+        name: &str,
+        subuid: &str,
+        subgid: &str,
+        helper: &str,
+    ) -> (crate::scratch_root::ScratchDir, SubordinateIdSource) {
+        let (scratch, dir) =
+            crate::test_support::scratch_child(&format!("fandhe-subids-{name}"), "d");
         std::fs::write(dir.join("subuid"), subuid).unwrap();
         std::fs::write(dir.join("subgid"), subgid).unwrap();
-        SubordinateIdSource::with_paths(
+        let source = SubordinateIdSource::with_paths(
             Some("tester".to_owned()),
             &dir.join("subuid"),
             &dir.join("subgid"),
@@ -2776,7 +3559,8 @@ mod tests {
             Path::new(helper),
             Duration::from_secs(5),
         )
-        .unwrap()
+        .unwrap();
+        (scratch, source)
     }
 
     /// root 所有で祖先も root のみ書き込み可の実在の通常ファイル(`HelperPaths` の検証を通す代用)。
@@ -2803,7 +3587,7 @@ mod tests {
     /// SEC-5(#2009): ホスト ID 0 を含む範囲は、構築(副作用なし)で `PermissionDenied` になる。
     #[test]
     fn sec5_subordinate_ids_reject_host_root_range_before_fork() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "hostroot",
             "tester:0:65536\n",
             "tester:100000:65536\n",
@@ -2826,7 +3610,7 @@ mod tests {
     /// CORE-6(#2009): helper が無ければ構築が拒否し、文言にパスを含めない。
     #[test]
     fn core6_subordinate_ids_reject_missing_helper_before_fork() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "nohelper",
             "tester:100000:65536\n",
             "tester:100000:65536\n",
@@ -2851,14 +3635,13 @@ mod tests {
     #[test]
     fn core6_subordinate_ids_reject_empty_range_root_and_mismatched_source() {
         let sub = IsolationPrivilege::RootlessSubordinateIds;
-        let src = || {
-            source_in(
-                "misc",
-                "other:100000:65536\n",
-                "tester:100000:65536\n",
-                helper_stand_in(),
-            )
-        };
+        let (_scratch, misc) = source_in(
+            "misc",
+            "other:100000:65536\n",
+            "tester:100000:65536\n",
+            helper_stand_in(),
+        );
+        let src = || misc.clone();
         let e = resolve_privilege(sub, Some(src()), 1000, 1000).expect_err("empty");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         let e = resolve_privilege(sub, Some(src()), 0, 1000).expect_err("root");
@@ -2878,7 +3661,7 @@ mod tests {
     /// CORE-6・SEC-5(#2389): `resolve_privilege` が返す写像は `resolve_id_maps` の結果と同じ行になる(具体値)。
     #[test]
     fn core6_resolve_id_maps_matches_resolve_privilege() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "idmaps",
             "tester:100000:65536\n",
             "tester:200000:65536\n",
@@ -2934,7 +3717,7 @@ mod tests {
     /// → subuid の範囲の具体的な写像が渡る(順序は 単一スレッド確認 → Landlock → spawn)。
     #[test]
     fn core6_subordinate_ids_launch_reaches_spawn_with_ranged_maps() {
-        let src = source_in(
+        let (_scratch, src) = source_in(
             "launch",
             "tester:100000:65536\n",
             "tester:200000:65536\n",
@@ -3340,6 +4123,118 @@ mod tests {
             .expect("confirm after reap");
     }
 
+    /// 子の `/proc/<pid>` が無い(回収済み)ことの確認。
+    fn proc_gone(pid: u32) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// CORE-2・NET-9・REPAIR-5・#3432: `terminate` に失敗した(または呼ばれなかった)まま未回収のハンドルを
+    /// drop しても、同じ launcher の `confirm_no_process` が子を kill・回収して `Ok` になる(`Handed` で詰まらない)。
+    #[test]
+    fn core2_issue3432_confirm_succeeds_after_unreaped_handle_is_dropped() {
+        let spec = spec_for("dropped-live", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        // 子が生きたままハンドルを捨てる(terminate が失敗した pasta ラッパーと同じ状態)。
+        drop(handle);
+        assert!(!proc_gone(pid), "drop must not kill or reap the child");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("confirm after drop");
+        assert!(proc_gone(pid), "confirm must reap the dropped child");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("second confirm sees Clean");
+    }
+
+    /// #3432: 台帳に ID がある限り、記録済みの配置があっても台帳で判定する(cgroup の継ぎ目は呼ばない。#2011)。
+    #[test]
+    fn core2_issue3432_recorded_confirm_uses_ledger_after_drop() {
+        let spec = spec_for("dropped-recorded", serde_json::json!({}));
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let calls = Arc::clone(&ops.recorded_calls);
+        let l = launcher(ops, rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        drop(handle);
+        l.confirm_no_process_recorded(
+            spec.container_id(),
+            Some(&placement()),
+            Duration::from_secs(5),
+        )
+        .expect("confirm after drop");
+        assert!(proc_gone(pid));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the recorded-cgroup seam must not be used"
+        );
+    }
+
+    /// #3432: terminate を期限 0 で呼んだ(成否は問わない)後に drop しても、確認は `Ok` になる。
+    #[test]
+    fn core2_issue3432_confirm_succeeds_after_failed_terminate_and_drop() {
+        let spec = spec_for("dropped-after-terminate", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let pid = handle.pid().get();
+        let _ = handle.terminate(Duration::ZERO);
+        drop(handle);
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(5))
+            .expect("confirm after failed terminate and drop");
+        assert!(proc_gone(pid));
+    }
+
+    /// #3432: 回収済みのハンドルを drop すると台帳は `Clean` へ進む(これまでは `Handed` のまま残った)。
+    #[test]
+    fn core2_issue3432_reaped_handle_drop_makes_ledger_clean() {
+        let spec = spec_for("dropped-reaped", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        handle
+            .signal(
+                crate::traits::Signal::SIGKILL,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("kill");
+        assert_eq!(
+            handle.wait(Duration::from_secs(5)).expect("wait"),
+            Some(crate::oci_runtime::ProcessExit::Signaled(9))
+        );
+        drop(handle);
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after reaped drop");
+    }
+
+    /// #3432: 世代の照合。古いハンドルの drop は、再 launch が作った新しい `Handed` を書き換えない。
+    #[test]
+    fn core2_issue3432_stale_handle_drop_does_not_touch_newer_record() {
+        let spec = spec_for("dropped-stale", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let first = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let first_pid = first.pid().get();
+        let second = l.launch(&spec, Duration::from_secs(1)).expect("relaunch");
+        drop(first);
+        let err = l
+            .confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect_err("newer handed record must not be confirmed");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launched process is owned by its handle holder; cannot confirm"
+        );
+        second.terminate(Duration::from_secs(5)).expect("terminate");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after second reaped");
+        // 世代違いで台帳へ戻せなかった古い子は残る(doc の残余)。試験の後始末として直接止める。
+        let reaper = ContainerChild::from_pid_for_test(first_pid);
+        let _ = reaper.kill_and_reap(Duration::from_secs(5));
+        assert!(proc_gone(first_pid));
+    }
+
     /// CORE-2: 確かめられていない起動が残る ID への再 launch は、spawn を呼ばずに拒否する(二重起動の防止)。
     /// 子を回収できるようになれば(`Live`)再回収して通る。
     #[test]
@@ -3495,6 +4390,882 @@ mod tests {
         );
     }
 
+    fn options_with(
+        tmpfs_dests: &[&str],
+        shm: bool,
+        inject: &[(&str, &[u8])],
+        ipc: LaunchIpcMode,
+    ) -> LaunchOptions {
+        use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
+        use crate::tmpfs::TmpfsMountSpec;
+        let mut tmpfs = TmpfsMountSet::new();
+        if shm {
+            tmpfs.ensure_default_dev_shm().expect("shm");
+        }
+        for d in tmpfs_dests {
+            tmpfs
+                .push(TmpfsMountSpec::new(d, None).expect("spec"))
+                .expect("push");
+        }
+        let mut set = InjectedFileSet::new();
+        for (dest, bytes) in inject {
+            set.push(
+                InjectedFileSpec::new(
+                    dest,
+                    InjectedContent::from_bytes(bytes.to_vec()).expect("content"),
+                    InjectedFileMode::new(0o444).expect("mode"),
+                )
+                .expect("file"),
+            )
+            .expect("push");
+        }
+        LaunchOptions::new(tmpfs, set, ipc).expect("options")
+    }
+
+    /// 封印 memfd の注入内容 1 件だけを持つ起動オプション(#2628)。
+    fn options_sealed(bytes: &[u8]) -> LaunchOptions {
+        use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
+        use std::io::Write as _;
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-sealed-opts", "d");
+        let path = dir.join("secret");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(bytes))
+            .expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        let content = InjectedContent::from_file(&file).expect("sealed");
+        assert!(!content.is_caller_memory());
+        let mut set = InjectedFileSet::new();
+        set.push(
+            InjectedFileSpec::new("/etc/secret-token", content, InjectedFileMode::DEFAULT)
+                .expect("file"),
+        )
+        .expect("push");
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("shm");
+        LaunchOptions::new(tmpfs, set, LaunchIpcMode::Private).expect("options")
+    }
+
+    /// SUP-12・CORE-5(#2625): 起動オプション未指定は従来どおり(`/dev/shm` のみ・注入なし・IPC あり・All)。
+    #[test]
+    fn sup12_default_launch_keeps_current_behavior() {
+        let spec = spec_for("opts-default", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (opts, implicit) = (
+            Arc::clone(&ops.seen_options),
+            Arc::clone(&ops.seen_implicit),
+        );
+        let l = launcher(ops, rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(opts.lock().unwrap().clone(), vec![(None, true)]);
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::All]
+        );
+    }
+
+    /// SUP-12・CORE-5・SEC-1(#2625): `--ipc=host` + `--tmpfs /run` + 注入。IPC namespace を外し、tmpfs は
+    /// 指定どおり(`/dev/shm` なし)、Landlock は `WithoutShm`。他の namespace は保つ。再 launch でも同じ。
+    #[test]
+    fn sup12_host_ipc_options_reach_spawn_and_landlock_on_every_launch() {
+        let spec = spec_for("opts-host", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (seen, opts, implicit) = (
+            Arc::clone(&ops.seen),
+            Arc::clone(&ops.seen_options),
+            Arc::clone(&ops.seen_implicit),
+        );
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(
+            &["/run"],
+            false,
+            &[("/etc/secret-token", b"v")],
+            LaunchIpcMode::Host,
+        ));
+        for _ in 0..2 {
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/run".to_owned()]); 2]
+        );
+        assert_eq!(
+            opts.lock().unwrap().clone(),
+            vec![(Some(vec!["/etc/secret-token".to_owned()]), false); 2]
+        );
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::WithoutShm; 2]
+        );
+    }
+
+    /// SUP-12・CLI-1(#2713): `--ulimit nofile=1024:2048` は 16 種へ補完されて `launch_rlimits` に残り、
+    /// `--env` の上書きは `process.env` の位置を保って重なり、新しいキーは末尾へ付く。
+    #[test]
+    fn sup12_ulimit_and_env_options_reach_spawn_and_record() {
+        use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
+        let spec = spec_for("opts-env", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let seen_env = Arc::clone(&ops.seen_env);
+        let mut l = launcher(ops, rootless(), None);
+        let specified = Rlimits::new(vec![
+            Rlimit::new(RlimitKind::Nofile, 1024, 2048).expect("rlimit"),
+        ])
+        .expect("rlimits");
+        let base = options_with(&[], true, &[], LaunchIpcMode::Private);
+        let base_env = spec.env().to_vec();
+        let first_key = base_env
+            .first()
+            .and_then(|e| e.split_once('=').map(|(k, _)| k.to_owned()));
+        let mut overrides = vec!["FANDHE_NEW=3".to_owned()];
+        if let Some(k) = &first_key {
+            overrides.insert(0, format!("{k}=overridden"));
+        }
+        l.inner.launch_options = Some(
+            base.with_rlimits(specified)
+                .with_env(overrides.clone())
+                .expect("env"),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let recorded = p.launch_rlimits().expect("rlimits recorded").clone();
+        assert!(recorded.is_complete());
+        let nofile = recorded
+            .iter()
+            .find(|r| r.kind() == RlimitKind::Nofile)
+            .expect("nofile");
+        assert_eq!((nofile.soft(), nofile.hard()), (1024, 2048));
+        let mut expected = base_env.clone();
+        if first_key.is_some() {
+            expected[0] = overrides[0].clone();
+        }
+        expected.push("FANDHE_NEW=3".to_owned());
+        assert_eq!(seen_env.lock().unwrap().clone(), vec![expected]);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CLI-1・SEC-1(#2775): `--cap-drop` は config.json 由来の許可集合から除かれ、分離の記録に狭めた値が残る。
+    #[test]
+    fn cli1_cap_drop_option_narrows_the_recorded_capabilities() {
+        use crate::capabilities::{Capability, parse_drop_list};
+        let spec = spec_for("opts-capdrop", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let mut l = launcher(ops, rootless(), None);
+        let base = options_with(&[], true, &[], LaunchIpcMode::Private);
+        l.inner.launch_options = Some(
+            base.with_capability_drop(parse_drop_list(&["chown", "CAP_NET_RAW"]).expect("drop")),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let caps = p
+            .launch_isolation()
+            .expect("record")
+            .capabilities()
+            .expect("capabilities recorded");
+        assert_eq!(caps.iter().count(), 12);
+        assert!(!caps.bounding().contains(Capability::Chown));
+        assert!(!caps.bounding().contains(Capability::NetRaw));
+        assert!(caps.bounding().contains(Capability::Kill));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CLI-1・SUP-12・CORE-5・SEC-1(#2828): `--read-only` は config の `root.readonly` と OR で効き、Landlock の root 規則
+    /// (書き込みビットなし)と分離の記録の実効値へ同じ値が載る。option が無ければ config に従い、config が true なら
+    /// option が無くても true のまま(緩める経路は無い)。
+    #[test]
+    fn cli1_core5_read_only_option_makes_recorded_root_rule_read_only() {
+        use crate::launch_isolation::RecordedTarget;
+        // (config の readonly, option, 期待する実効値)
+        for (cfg_ro, opt, want) in [
+            (false, true, true),
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let spec = spec_with_root_readonly(
+                "opts-read-only",
+                cfg_ro,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options =
+                Some(options_with(&[], true, &[], LaunchIpcMode::Private).with_root_readonly(opt));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            let record = p.launch_isolation().expect("record");
+            assert_eq!(record.root_readonly(), Some(want));
+            let root = record
+                .landlock()
+                .rules()
+                .iter()
+                .find(|r| matches!(r.target(), RecordedTarget::Root))
+                .expect("root rule");
+            let write = crate::landlock::AccessFs::WRITE.bits();
+            if want {
+                assert_eq!(root.allowed(), 0x000D);
+            } else {
+                assert_eq!(root.allowed() & write, write);
+            }
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+    }
+
+    /// NET-6・SEC-1(#3206): 同期点の要求はモードと実効の組で決まる。Host は基準と同じ、Loopback は基準と異なる、
+    /// `FromConfig` は通さず、不整合な組は fork の前に `Internal` で拒否する。
+    #[test]
+    fn net6_sec1_3206_netns_sync_request_follows_mode_and_effective_network() {
+        use crate::exec::NetnsExpectation;
+        let req = |m, e| netns_sync_request(m, e, None);
+        assert_eq!(
+            req(LaunchNetworkMode::Host, EffectiveNetwork::HostShared)
+                .unwrap()
+                .map(|r| r.expectation),
+            Some(NetnsExpectation::SameAsBaseline)
+        );
+        assert_eq!(
+            req(LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback)
+                .unwrap()
+                .map(|r| r.expectation),
+            Some(NetnsExpectation::DiffersFromBaseline)
+        );
+        // NET-9(#1939): Attachable も基準と異なる新しい netns で、netns と user namespace の 2 本を渡す。
+        let attachable = req(LaunchNetworkMode::Attachable, EffectiveNetwork::NewLoopback)
+            .unwrap()
+            .expect("attachable passes the sync point");
+        assert_eq!(
+            attachable.expectation,
+            NetnsExpectation::DiffersFromBaseline
+        );
+        assert_eq!(attachable.handover, crate::exec::NetnsHandover::NetAndUser);
+        let loopback = req(LaunchNetworkMode::Loopback, EffectiveNetwork::NewLoopback)
+            .unwrap()
+            .expect("loopback passes the sync point");
+        assert_eq!(loopback.handover, crate::exec::NetnsHandover::NetOnly);
+        for e in [EffectiveNetwork::HostShared, EffectiveNetwork::NewLoopback] {
+            assert!(req(LaunchNetworkMode::FromConfig, e).unwrap().is_none());
+        }
+        for (m, e) in [
+            (LaunchNetworkMode::Host, EffectiveNetwork::NewLoopback),
+            (LaunchNetworkMode::Loopback, EffectiveNetwork::HostShared),
+            (LaunchNetworkMode::Attachable, EffectiveNetwork::HostShared),
+        ] {
+            let err = req(m, e).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert_eq!(
+                err.message(),
+                "the network mode does not match the reconciled network namespace plan"
+            );
+        }
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に
+    /// `InvalidArgument` で拒否する(join を黙って捨てて弱い分離で起動しない)。
+    #[test]
+    fn cri2_pod_join_with_host_ipc_is_rejected_before_spawn() {
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let spec = spec_for("opts-join-host", serde_json::json!({}))
+            .with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let ops = FakeOps::new(&events());
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(&[], false, &[], LaunchIpcMode::Host));
+        let Err(err) = l.launch(&spec, Duration::from_secs(1)) else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
+    fn net_namespaces() -> serde_json::Value {
+        serde_json::json!({"namespaces": [
+            {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"},
+            {"type": "network"}
+        ]})
+    }
+
+    /// NET-6・SEC-1(#3058): `Host` で突き合わせ済みの spec は network namespace を作らず、launch が通る。
+    #[test]
+    fn net6_host_mode_skips_the_network_namespace() {
+        let spec = spec_for("net-host", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::HostShared,
+            LaunchNetworkMode::Host,
+        );
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Host),
+        );
+        assert_eq!(l.network_mode(), LaunchNetworkMode::Host);
+        isolation_config_of(&spec, LaunchIpcMode::Private).expect("network entry is skipped");
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// NET-6(#3064): `Loopback` は fork 前に拒否されず spawn まで届く。config に network エントリが無くても
+    /// 分離の集合に `Net` が入る(エントリ無し・path 無しの両方)。`HostShared` では入らない。
+    #[test]
+    fn net6_loopback_mode_reaches_spawn_and_adds_net() {
+        let spec = spec_for("net-loop", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let host = spec_for("net-host", serde_json::json!({}));
+        let cfg = isolation_config_of(&host, LaunchIpcMode::Private).expect("config");
+        assert!(!cfg.namespaces.contains(Namespace::Net));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert!(ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3064): path 無しの network エントリ + `NewLoopback` でも `Net` が集合に入る。
+    /// pod の join との組は spawn の前に `InvalidArgument`(固定文言)。
+    #[test]
+    fn net6_loopback_with_entry_adds_net_and_rejects_pod_join() {
+        let spec = spec_for("net-loop-entry", net_namespaces()).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Loopback,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined =
+            spec.with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let err = isolation_config_of(&joined, LaunchIpcMode::Private).expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with the loopback network mode"
+        );
+    }
+
+    /// 何もしないフック(組の検査と launch の配線の試験用)。
+    struct NoopAttachHook;
+
+    impl super::super::NetnsAttachHook for NoopAttachHook {
+        fn attach(
+            &self,
+            _namespaces: super::super::AttachableNamespaces,
+            _deadline: Instant,
+        ) -> Result<(), TraitError> {
+            Ok(())
+        }
+    }
+
+    /// NET-9・CORE-6・SEC-1(#1939): `build` の組の検査。`Attachable` でフック無し・フックだけ・rootful の `Attachable` は
+    /// fork の前に固定文言で拒否し、rootless の `Attachable` とフックの組・どちらも無い組は通る。
+    #[test]
+    fn net9_core6_1939_attach_hook_pairing_is_checked_before_fork() {
+        let attachable = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Attachable);
+        let loopback = options_with(&[], true, &[], LaunchIpcMode::Private)
+            .with_network(LaunchNetworkMode::Loopback);
+        let rootless_models = [
+            IsolationPrivilege::RootlessSingleId,
+            IsolationPrivilege::RootlessSubordinateIds,
+        ];
+        for p in rootless_models {
+            let e = check_attach_hook_pairing(p, Some(&attachable), false).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "the attachable network mode requires a netns attach hook"
+            );
+            let e = check_attach_hook_pairing(p, Some(&loopback), true).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "a netns attach hook is only valid for the attachable network mode"
+            );
+            let e = check_attach_hook_pairing(p, None, true).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert!(check_attach_hook_pairing(p, Some(&attachable), true).is_ok());
+            assert!(check_attach_hook_pairing(p, Some(&loopback), false).is_ok());
+            assert!(check_attach_hook_pairing(p, None, false).is_ok());
+        }
+        let e =
+            check_attach_hook_pairing(IsolationPrivilege::RootfulHostRoot, Some(&attachable), true)
+                .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "the attachable network mode requires a rootless privilege model"
+        );
+        // rootful の Attachable 以外の挙動は変えない(この検査は通す)。
+        assert!(
+            check_attach_hook_pairing(IsolationPrivilege::RootfulHostRoot, Some(&loopback), false)
+                .is_ok()
+        );
+    }
+
+    /// NET-9・CORE-6(#1939): `Attachable` は分離の集合に `Net` を足し(エントリ無し)、pod の join との組は
+    /// spawn の前に固定文言で拒否する。
+    #[test]
+    fn net9_attachable_adds_net_and_rejects_pod_join() {
+        let spec = spec_for("net-attach", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Attachable,
+        );
+        let cfg = isolation_config_of(&spec, LaunchIpcMode::Private).expect("config");
+        assert!(cfg.namespaces.contains(Namespace::Net));
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let joined =
+            spec.with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let err = isolation_config_of(&joined, LaunchIpcMode::Private).expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "a pod namespace join cannot be combined with the loopback network mode"
+        );
+    }
+
+    /// NET-9・SEC-1(#1939): `Attachable` の launch は、フックが無ければ spawn の前に `Internal` で拒否し(多重防御)、
+    /// フックがあれば spawn まで届く。
+    #[test]
+    fn net9_sec1_1939_attachable_launch_requires_the_hook_before_spawn() {
+        let spec = spec_for("net-attach-launch", serde_json::json!({})).with_network(
+            super::super::EffectiveNetwork::NewLoopback,
+            LaunchNetworkMode::Attachable,
+        );
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Attachable),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "the attachable network mode has no attach hook"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+        l.inner.netns_attach_hook = Some(Arc::new(NoopAttachHook));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert!(ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// SEC-1(#3058): spec のモードと launcher のモードが食い違う(ラッパーの転送漏れ等)なら `FailedPrecondition`。
+    #[test]
+    fn sec1_network_mode_mismatch_is_refused_before_spawn() {
+        let spec = spec_for("net-mismatch", serde_json::json!({}));
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(
+            options_with(&[], true, &[], LaunchIpcMode::Private)
+                .with_network(LaunchNetworkMode::Loopback),
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launch spec was reconciled with a different network mode"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// NET-6(#3058): 起動オプション未指定の `network_mode` は `FromConfig`。
+    #[test]
+    fn net6_default_network_mode_is_from_config() {
+        let l = launcher(FakeOps::new(&events()), rootless(), None);
+        assert_eq!(l.network_mode(), LaunchNetworkMode::FromConfig);
+    }
+
+    /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。
+    #[test]
+    fn sup12_user_tmpfs_is_writable_in_landlock_rules_and_record() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let rules: Vec<(String, u64)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Tmpfs { destination } => {
+                    Some((destination.as_str().to_owned(), r.allowed()))
+                }
+                _ => None,
+            })
+            .collect();
+        let run = rules.iter().find(|(d, _)| d == "/run").expect("/run rule");
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        assert_eq!(run.1 & write, write);
+        assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12・CORE-5・SEC-2(#2714): 読み取り専用 root では、分離の記録で WRITE を持つ宛先が利用者 tmpfs(`/run`)と
+    /// 暗黙の `/dev` 系だけになり、root は READ(0x000D)のまま。`--ipc=host` では `/dev/shm` が外れる。
+    #[test]
+    fn sup12_readonly_root_user_tmpfs_is_writable_only_at_destination() {
+        use crate::launch_isolation::RecordedTarget;
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        for (shm, ipc, want) in [
+            (
+                true,
+                LaunchIpcMode::Private,
+                vec!["/dev", "/dev/pts", "/dev/shm", "/run"],
+            ),
+            (false, LaunchIpcMode::Host, vec!["/dev", "/dev/pts", "/run"]),
+        ] {
+            let spec = spec_with_root_readonly(
+                "opts-ro-root-tmpfs",
+                true,
+                serde_json::json!({}),
+                serde_json::json!([]),
+                &["/bin/echo", "hi"],
+                &["PATH=/bin"],
+                (0, 0),
+            );
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&["/run"], shm, &[], ipc));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            let record = p.launch_isolation().expect("record");
+            let rules = record.landlock().rules();
+            let root = rules
+                .iter()
+                .find(|r| matches!(r.target(), RecordedTarget::Root))
+                .expect("root rule");
+            assert_eq!(root.allowed(), 0x000D);
+            let run = rules
+                .iter()
+                .find(|r| {
+                    matches!(r.target(), RecordedTarget::Tmpfs { destination }
+                        if destination.as_str() == "/run")
+                })
+                .expect("/run rule");
+            assert_eq!(run.allowed() & write, write);
+            let mut writable: Vec<&str> = rules
+                .iter()
+                .filter(|r| r.allowed() & write != 0)
+                .map(|r| r.target().as_str())
+                .collect();
+            writable.sort();
+            assert_eq!(writable, want);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+    }
+
+    /// SUP-12・CORE-5(#2625): `ro` の利用者 tmpfs は書き込み可能な root の下でも起動でき、Landlock のルールには載らない。
+    #[test]
+    fn sup12_read_only_user_tmpfs_launches_without_a_landlock_rule() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-ro-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        let mut opts = options_with(&["/ro"], true, &[], LaunchIpcMode::Private);
+        let mut tmpfs = TmpfsMountSet::new();
+        for m in opts.tmpfs().mounts() {
+            let mut m = m.clone();
+            m.read_only = m.destination.as_str() == "/ro";
+            tmpfs.push(m).expect("push");
+        }
+        opts = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("options");
+        l.inner.launch_options = Some(opts);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let tmpfs_rules = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter(|r| matches!(r.target(), RecordedTarget::Tmpfs { .. }))
+            .count();
+        assert_eq!(tmpfs_rules, 0);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12(#2625): `/dev/shm` と `/run` を指定順で渡し、IPC namespace は保つ。
+    #[test]
+    fn sup12_private_ipc_tmpfs_set_is_passed_in_order() {
+        let spec = spec_for("opts-private", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (seen, opts) = (Arc::clone(&ops.seen), Arc::clone(&ops.seen_options));
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/dev/shm".to_owned(), "/run".to_owned()])]
+        );
+        assert_eq!(opts.lock().unwrap().clone(), vec![(None, true)]);
+    }
+
+    /// SUP-12・CORE-5(#2625): bind が利用者 tmpfs・注入ディレクトリと重なるときは spawn の前に拒否する。
+    #[test]
+    fn sup12_bind_overlapping_user_tmpfs_or_injected_is_rejected_before_spawn() {
+        let binds = |dest: &str| {
+            serde_json::json!([
+                {"destination": dest, "type": "bind", "source": "/srv/data", "options": ["rbind"]}
+            ])
+        };
+        let cases: [(&str, LaunchOptions); 2] = [
+            (
+                "/run/cache",
+                options_with(&["/run"], true, &[], LaunchIpcMode::Private),
+            ),
+            (
+                "/run/secrets",
+                options_with(
+                    &[],
+                    true,
+                    &[("/run/secrets/db", b"v")],
+                    LaunchIpcMode::Private,
+                ),
+            ),
+        ];
+        for (i, (dest, options)) in cases.into_iter().enumerate() {
+            let spec = spec_with_mounts(
+                &format!("opts-overlap-{i}"),
+                serde_json::json!({}),
+                binds(dest),
+            );
+            let ops = FakeOps::new(&events());
+            let mut l = launcher(ops, rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l
+                .launch(&spec, Duration::from_secs(1))
+                .map(|_| ())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+        }
+    }
+
+    /// NET-12・SEC-1(#1872): `etc_files` の指定は、状態ルートが無い・生成物が無い・`/etc` の bind と重なる構成を
+    /// spawn の前に拒否し、生成済みなら通る。指定しない launch は従来どおり(A6)。
+    #[test]
+    fn net12_etc_files_are_verified_before_spawn() {
+        use crate::etc_files::{EtcFileKind, EtcFileSelection, create_etc_files};
+        let sel = EtcFileSelection::default()
+            .with(EtcFileKind::Hosts)
+            .with(EtcFileKind::ResolvConf);
+        let with_etc = || {
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_etc_files(sel)
+                .expect("etc files")
+        };
+        let launch = |spec: &LaunchSpec, options: LaunchOptions| {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let r = l.launch(spec, Duration::from_secs(1));
+            let spawned = ev
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn "))
+                .count();
+            (r, spawned)
+        };
+
+        // 状態ルートが無い。
+        let spec = spec_for("etc-no-root", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("no state root");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // 状態ルートはあるが生成していない。
+        let dir = crate::test_support::TestTempDir::new("etc-launch").expect("tmp");
+        let spec = spec_for("etc-missing", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("not created");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(spawned, 0);
+
+        // `/etc` の bind と重なる。
+        let spec = spec_with_mounts(
+            "etc-bind",
+            serde_json::json!({}),
+            serde_json::json!([
+                {"destination": "/etc", "type": "bind", "source": "/srv/data", "options": ["rbind"]}
+            ]),
+        )
+        .with_state_root(Some(dir.path().to_path_buf()));
+        let (r, spawned) = launch(&spec, with_etc());
+        let err = r.map(|_| ()).expect_err("overlap");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(spawned, 0);
+
+        // 生成済みなら通る。
+        let spec = spec_for("etc-ok", serde_json::json!({}))
+            .with_state_root(Some(dir.path().to_path_buf()));
+        create_etc_files(dir.path(), spec.container_id(), sel).expect("create");
+        let (r, spawned) = launch(&spec, with_etc());
+        let p = r.expect("launched");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+
+        // 指定しない launch は状態ルートの有無に関わらず従来どおり。
+        let spec = spec_for("etc-none", serde_json::json!({}));
+        let (r, spawned) = launch(&spec, LaunchOptions::try_default().expect("default"));
+        let p = r.expect("launched without etc files");
+        assert_eq!(spawned, 1);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SEC-2・CORE-5(#2625): readonlyPaths の厳密な子孫への tmpfs・注入ディレクトリは spawn の前に拒否する。
+    /// 同一の宛先と無関係な宛先(`/datax`)は通る。
+    #[test]
+    fn sec2_tmpfs_under_readonly_path_is_rejected_before_spawn() {
+        let linux = serde_json::json!({"readonlyPaths": ["/data"]});
+        let rejected: [(&str, LaunchOptions); 2] = [
+            (
+                "tmpfs",
+                options_with(&["/data/cache"], true, &[], LaunchIpcMode::Private),
+            ),
+            (
+                "inject",
+                options_with(&[], true, &[("/data/sec/db", b"v")], LaunchIpcMode::Private),
+            ),
+        ];
+        for (name, options) in rejected {
+            let spec = spec_for(&format!("opts-ro-{name}"), linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l
+                .launch(&spec, Duration::from_secs(1))
+                .map(|_| ())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+        }
+        for dest in ["/data", "/datax"] {
+            let spec = spec_for("opts-ro-ok", linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&[dest], true, &[], LaunchIpcMode::Private));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect(dest);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+    }
+
+    /// SEC-1・SEC-5・CORE-6(#2628): 範囲写像と、呼び出し元のメモリにある注入内容の併用は launch で fork 前に拒否する。
+    #[test]
+    fn sec1_subordinate_privilege_with_inject_is_refused_before_fork() {
+        let spec = spec_for("opts-sub-inject", serde_json::json!({}));
+        let ev = events();
+        let (_scratch, src) = source_in(
+            "inject-refused",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        let mut l = launcher_with(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(ids),
+            None,
+        );
+        l.inner.launch_options = Some(options_with(
+            &["/run"],
+            false,
+            &[("/etc/secret-token", b"v")],
+            LaunchIpcMode::Host,
+        ));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "injected file content held in process memory cannot be combined with the subordinate id privilege model"
+        );
+        assert!(
+            !ev.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("spawn") || e.starts_with("landlock")),
+            "{:?}",
+            ev.lock().unwrap()
+        );
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#2670): IPC 系の sysctl は、`--ipc=host`(IPC namespace を外す)と併用すると fork の前に
+    /// `InvalidArgument` で拒否する(ホストの IPC の値を書かせない)。専用の IPC namespace なら起動できる。
+    #[test]
+    fn cri2_ipc_sysctl_with_host_ipc_is_refused_before_fork() {
+        let linux = serde_json::json!({"sysctl": {"kernel.shmmax": "16384"}});
+        let spec = spec_for("sysctl-host-ipc", linux.clone());
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], false, &[], LaunchIpcMode::Host));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl requires a namespace the container does not have"
+        );
+        assert!(
+            !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
+            "{:?}",
+            ev.lock().unwrap()
+        );
+
+        let spec = spec_for("sysctl-private-ipc", linux);
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(options_with(&[], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SEC-1・CORE-6(#2628): 判定関数は範囲写像 + 呼び出し元のメモリの注入内容だけを拒否し、注入なしの範囲写像・
+    /// 封印 memfd の注入・単一 ID + 注入は通す。
+    #[test]
+    fn sec1_refuse_inject_with_subordinate_only_rejects_the_combination() {
+        let with = options_with(&[], true, &[("/etc/t", b"v")], LaunchIpcMode::Private);
+        let without = options_with(&[], true, &[], LaunchIpcMode::Private);
+        let sealed = options_sealed(b"sealed-secret-value");
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &sealed)
+                .is_ok()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &with)
+                .is_err()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &without)
+                .is_ok()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSingleId, &with).is_ok()
+        );
+    }
+
     /// SEC-4(#1915): `rejection_audit_sink` は構築時の sink を返す。
     #[test]
     fn sec4_rejection_audit_sink_is_the_launcher_sink() {
@@ -3530,6 +5301,104 @@ mod tests {
         assert!(!std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
         assert!(Arc::ptr_eq(&l.inner.audit_sink, &main));
         assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
+    }
+
+    /// 記録を溜める試験用 sink(`fail` なら記録に失敗する)。
+    struct CollectSink {
+        records: std::sync::Mutex<Vec<AuditRecord>>,
+        fail: bool,
+    }
+
+    impl AuditSink for CollectSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            if self.fail {
+                return Err(TraitError::new(ErrorCode::Internal, "sink failed"));
+            }
+            self.records.lock().expect("lock").push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// SEC-1・SEC-4・#2130: 計画の拒否(名前空間が空)は、層 `mount`・パスなし・理由コード `no_namespaces`・
+    /// 段 `validate`・container_id つきで 1 件記録され、返す `ExecError` は元のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_is_recorded_once() {
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        let id = ContainerId::new("c2130").expect("id");
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("empty namespaces are rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let failure = plan_rejected(original.clone(), audit);
+        assert_eq!(failure.rejection.delivery, AuditDelivery::Recorded);
+        assert_eq!(failure.rejection.error, original);
+        assert!(failure.unreaped.is_empty());
+        let recs = sink.records.lock().expect("lock");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].reason().map(|r| r.as_str()), Some("no_namespaces"));
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c2130"));
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("validate"));
+    }
+
+    /// SEC-4・#2130: 記録先が失敗しても拒否は覆らず、失敗は `SinkFailed` として残る(黙って捨てない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_plan_rejection_survives_sink_failure() {
+        use crate::audit_log::AuditDelivery;
+        let config = crate::exec::IsolationConfig {
+            namespaces: crate::exec::NamespaceSet::empty(),
+            hostname: None,
+        };
+        let original = plan(&config).expect_err("rejected");
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let failure = plan_rejected(
+            original.clone(),
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert!(matches!(
+            failure.rejection.delivery,
+            AuditDelivery::SinkFailed(_)
+        ));
+        assert_eq!(failure.rejection.error, original);
+    }
+
+    /// SEC-4・#2130: 違反でないエラー(システムエラー)は記録せず `NotApplicable`(従来どおり)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2130_non_violation_plan_error_is_not_recorded() {
+        use crate::audit_log::AuditDelivery;
+        let sink = CollectSink {
+            records: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let e = ExecError::new(ErrorCode::Internal, IsolationStage::Validate, "boom");
+        let failure = plan_rejected(
+            e,
+            LaunchAudit {
+                sink: &sink,
+                container: None,
+            },
+        );
+        assert_eq!(failure.rejection.delivery, AuditDelivery::NotApplicable);
+        assert!(sink.records.lock().expect("lock").is_empty());
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

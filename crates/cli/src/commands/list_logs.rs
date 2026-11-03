@@ -10,7 +10,7 @@
 //! `<id>\t<status>\t<pid または ->`。並びは状態ストアが返す順（ID 昇順）、0 件はヘッダのみで終了コード 0。
 //! 値は core が検証済みの ID（`[A-Za-z0-9._-]`）・固定語の状態（`creating/created/running/stopped`）・
 //! 10 進の PID だけで、エスケープ不要。`bundle` や annotations は任意の UTF-8（タブ・改行・端末制御文字を含み得る）
-//! ため出力しない（インジェクション回避。SEC-1）。
+//! ため出力しない（インジェクション回避。SEC-1。エスケープして読める出力は `inspect` / `state` が持つ）。
 //!
 //! # 状態ルートの開き方と失敗時の文言（#1607 E1〜E3・ERR-1・OCI-5）
 //!
@@ -87,12 +87,13 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - logs: 利用者向けの期限フラグ（`--until` 等）の要否と構文、`--follow` の期限（24 時間）・`--tail` の件数（1,000,000）の
 //!   上限の値はオーナー確認待ち（#2605）。追従の遅延の短縮（inotify / kqueue）は行わない。非 Linux の読み出しは plugin 経由
-//!   （TASK-114・TASK-125）。
-//! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
+//!   （#1869 の設計・TASK-125。承認と実装 issue の起票は #2232）。
+//! - 再起動をまたぐ出力の捕捉: 再 launch は #2043 で成り立つ（実機での確認は `supervisor_bin_real` のシナリオ C）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では状態ストアを開けず core 側が
-//!   `Unimplemented` を返す（fail-closed）。
+//!   失敗を返す（fail-closed）。`plugin_backend` の固定文言表の失敗
+//!   （候補なし 5・検証の拒否 6・Windows でホストが検証しない場合 8・起動未実装 8）がそのまま届く。
 
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -111,7 +112,7 @@ use fandhe_container_supervisor::logs::{
 };
 
 use super::CliExit;
-use super::args::{GlobalArgs, ListArgs, LogStreamArg, LogsArgs};
+use super::args::{GlobalArgs, InspectArgs, ListArgs, LogStreamArg, LogsArgs, StateArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime};
 
 /// list の固定ヘッダ行（LF 終端）。
@@ -353,6 +354,74 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Wr
     exit
 }
 
+/// `inspect` の本体(CLI-1・SUP-11・#2775)。supervisor の `inspect::inspect` が整形した 1 行の JSON(末尾 LF)を
+/// stdout へそのまま書く(2 つ目の整形を持たない。REPAIR-1)。状態は書き換えない。
+///
+/// 失敗は構造化エラー(不在は `NOT_FOUND`、書き込み失敗は `INTERNAL`)。出力は部分的に作らない(整形は書き込み前に完了する)。
+pub(super) fn run_inspect(
+    global: &GlobalArgs,
+    args: &InspectArgs,
+    stdout: &mut dyn Write,
+) -> CliExit {
+    let started = Instant::now();
+    let prepared = production_runtime(global, OpRecorder::new(), "inspect", started, || {
+        ContainerId::new(args.id.as_str())
+    });
+    let (rt, id) = match prepared {
+        Ok(v) => v,
+        Err(e) => return store_open_failure(&e),
+    };
+    let exit = match fandhe_container_supervisor::inspect::inspect(rt.store.as_ref(), &id) {
+        Err(e) => CliExit::failed(e.code()),
+        Ok(report) => match report.write_json(stdout).and_then(|()| stdout.flush()) {
+            Ok(()) => CliExit::Success,
+            Err(_) => CliExit::failed(ErrorCode::Internal),
+        },
+    };
+    record_op(
+        &rt.recorder,
+        "inspect",
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
+}
+
+/// `state` の本体(CLI-1・SUP-11・#1903)。`inspect` と同じ読み口で、supervisor の
+/// `InspectReport::write_oci_state_json` が整形した OCI state の 1 行 JSON(末尾 LF)を stdout へ書く
+/// (整形は supervisor に 1 つだけ。cli に JSON を組まない。REPAIR-1・REPAIR-2)。状態は書き換えない。
+///
+/// 失敗は `inspect` と同じ(不在は `NOT_FOUND`、書き込み失敗は `INTERNAL`)。出力は部分的に作らない。
+pub(super) fn run_state(global: &GlobalArgs, args: &StateArgs, stdout: &mut dyn Write) -> CliExit {
+    let started = Instant::now();
+    let prepared = production_runtime(global, OpRecorder::new(), "state", started, || {
+        ContainerId::new(args.id.as_str())
+    });
+    let (rt, id) = match prepared {
+        Ok(v) => v,
+        Err(e) => return store_open_failure(&e),
+    };
+    let exit = match fandhe_container_supervisor::inspect::inspect(rt.store.as_ref(), &id) {
+        Err(e) => CliExit::failed(e.code()),
+        Ok(report) => match report
+            .write_oci_state_json(stdout)
+            .and_then(|()| stdout.flush())
+        {
+            Ok(()) => CliExit::Success,
+            Err(_) => CliExit::failed(ErrorCode::Internal),
+        },
+    };
+    record_op(
+        &rt.recorder,
+        "state",
+        matches!(exit, CliExit::Success),
+        started,
+    );
+    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    exit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,7 +474,7 @@ mod tests {
         );
     }
 
-    /// C1: 非 Linux の plugin 解決失敗は「未導入」と「検証未実装」で別の固定文言になる。
+    /// C1: 非 Linux の plugin 解決失敗は「未導入」「検証の拒否」「ホストが検証しない」で別の固定文言になる。
     /// 表に無い失敗（任意文言）は汎用文言のまま。
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -417,11 +486,17 @@ mod tests {
             stderr_line(&e),
             "{\"code\":\"FAILED_PRECONDITION\",\"message\":\"platform backend plugin is not installed\"}\n"
         );
-        let e = store_open_failure(&BackendFailure::TrustUnsupported.into_error());
+        let e = store_open_failure(&BackendFailure::TrustNotPerformedOnHost.into_error());
         assert_eq!(e.exit_code(), 8);
         assert_eq!(
             stderr_line(&e),
-            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not implemented on this platform\"}\n"
+            "{\"code\":\"UNIMPLEMENTED\",\"message\":\"plugin trust verification is not performed on this host\"}\n"
+        );
+        let e = store_open_failure(&BackendFailure::Untrusted.into_error());
+        assert_eq!(e.exit_code(), 6);
+        assert_eq!(
+            stderr_line(&e),
+            "{\"code\":\"PERMISSION_DENIED\",\"message\":\"platform backend plugin failed trust verification\"}\n"
         );
         let e = store_open_failure(&TraitError::new(ErrorCode::FailedPrecondition, "detail"));
         assert_eq!(
@@ -441,21 +516,27 @@ mod tests {
         use fandhe_container_core::traits::CreateRequest;
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-ll-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-ll",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
         }
 

@@ -26,7 +26,7 @@
 //!
 //! パースの成功（`Ok`）は「形式が正しく上限内である」ことだけを意味し、「そのまま実行してよい」
 //! ことは意味しない。OCI Runtime Spec が定義するプロパティのうち本パーサが解釈しないもの
-//! （`process.capabilities`・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
+//! （`process.capabilities` の `inheritable` / `ambient` と OCI 既定の部分集合でない指定〔drop だけを解釈済み。#2666〕・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
 //! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources` のうち setter が無い項目〔#2019。memory / cpu / pids /
 //! blockIO の weight・throttle は解釈済みで、`resources.rs` の型に正規化する〕、
 //! `mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
@@ -80,7 +80,12 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::mount_destination::MountDestination;
 use super::resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
+use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::path_masks::ProtectedPath;
+use crate::sysctl::{
+    SYSCTL_MAX_ENTRIES, SYSCTL_MAX_KEY_BYTES, SYSCTL_MAX_VALUE_BYTES, SysctlError, SysctlKey,
+    SysctlSet, SysctlValue,
+};
 use crate::traits::ErrorCode;
 
 /// `config.json` 全体の最大バイト長（4 MiB）。`args` / `env` の合計上限（1 MiB。
@@ -91,6 +96,10 @@ pub const CONFIG_MAX_BYTES: usize = 4 << 20;
 pub const CONFIG_MAX_ARGS: usize = 4096;
 /// `process.env` の最大件数（`exec::ENTRYPOINT_MAX_ENV` と同値）。
 pub const CONFIG_MAX_ENV: usize = 4096;
+/// `process.capabilities` の各集合の最大件数（既知の capability は 41 個。重複を許すため余裕を持たせる）。
+pub const CONFIG_MAX_CAPABILITIES: usize = 64;
+/// `process.capabilities` の名前 1 件の最大バイト数（最長の `CAP_CHECKPOINT_RESTORE` は 22）。
+pub const CONFIG_MAX_CAPABILITY_NAME_BYTES: usize = 32;
 /// `args` / `env` の 1 要素の最大バイト長（NUL 終端を含まない。131071）。
 ///
 /// `exec::ENTRYPOINT_MAX_STRING_BYTES`（Linux の `MAX_ARG_STRLEN` = 131072）は NUL 終端を含めた
@@ -348,6 +357,8 @@ limits! {
     EnvItemLimit => ("process.env[]", CONFIG_MAX_STRING_BYTES),
     CwdLimit => ("process.cwd", CONFIG_MAX_PATH_BYTES),
     GidsLimit => ("process.user.additionalGids", CONFIG_MAX_ADDITIONAL_GIDS),
+    CapsLimit => ("process.capabilities.*", CONFIG_MAX_CAPABILITIES),
+    CapNameLimit => ("process.capabilities.*[]", CONFIG_MAX_CAPABILITY_NAME_BYTES),
     HostnameLimit => ("hostname", CONFIG_MAX_HOSTNAME_BYTES),
     MountsLimit => ("mounts", CONFIG_MAX_MOUNTS),
     MountDestLimit => ("mounts[].destination", CONFIG_MAX_PATH_BYTES),
@@ -364,6 +375,9 @@ limits! {
     ReadonlyPathsLimit => ("linux.readonlyPaths", CONFIG_MAX_READONLY_PATHS),
     ReadonlyPathLimit => ("linux.readonlyPaths[]", CONFIG_MAX_PATH_BYTES),
     CgroupsPathLimit => ("linux.cgroupsPath", CONFIG_MAX_PATH_BYTES),
+    SysctlsLimit => ("linux.sysctl", SYSCTL_MAX_ENTRIES),
+    SysctlKeyLimit => ("linux.sysctl{key}", SYSCTL_MAX_KEY_BYTES),
+    SysctlValueLimit => ("linux.sysctl{value}", SYSCTL_MAX_VALUE_BYTES),
     ThrottleReadBpsLimit => (
         "linux.resources.blockIO.throttleReadBpsDevice",
         CONFIG_MAX_THROTTLE_DEVICES
@@ -456,6 +470,72 @@ impl<'de, L: Limit> Deserialize<'de> for BoundedStr<L> {
         }
 
         deserializer.deserialize_str(StrVisitor(PhantomData))
+    }
+}
+
+/// 件数・キー長・値長に上限を持つ `linux.sysctl`（キー順は入力順。重複の検出は `SysctlSet` への変換で行う）。
+///
+/// 件数は次の要素を `IgnoredAny` で読み飛ばして判定し、上限超過の要素を確保しない（`Bounded` と同じ流儀。
+/// 入力由来の値で事前確保しない）。値は文字列のみ受け、`null`・数値は型不一致で拒否する。
+struct RawSysctls(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for RawSysctls {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MapVisitor;
+
+        impl<'de> Visitor<'de> for MapVisitor {
+            type Value = RawSysctls;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an object of strings")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                loop {
+                    if items.len() >= SysctlsLimit::MAX {
+                        return match map.next_key::<de::IgnoredAny>()? {
+                            Some(_) => Err(limit_error::<SysctlsLimit, A::Error>()),
+                            None => Ok(RawSysctls(items)),
+                        };
+                    }
+                    match map.next_key::<BoundedStr<SysctlKeyLimit>>()? {
+                        Some(key) => {
+                            let value = map.next_value::<BoundedStr<SysctlValueLimit>>()?;
+                            items.push((key.0, value.0));
+                        }
+                        None => return Ok(RawSysctls(items)),
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_map(MapVisitor)
+    }
+}
+
+/// `linux.sysctl` を検証済みの [`SysctlSet`] へ変える。文法違反・重複・名前空間を持たないキーは
+/// `InvalidArgument`、UTS 系は `Unimplemented`（hostname 欄との競合と domainname の未適用。fail-closed）。
+fn convert_sysctls(raw: Option<RawSysctls>) -> Result<SysctlSet, OciConfigError> {
+    let mut set = SysctlSet::new();
+    for (key, value) in raw.map(|r| r.0).unwrap_or_default() {
+        let key = SysctlKey::parse(&key).map_err(sysctl_error)?;
+        let value = SysctlValue::parse(&value).map_err(sysctl_error)?;
+        set.insert(key, value).map_err(sysctl_error)?;
+    }
+    Ok(set)
+}
+
+fn sysctl_error(err: SysctlError) -> OciConfigError {
+    match err {
+        SysctlError::Uts => OciConfigError::new(
+            ErrorCode::Unimplemented,
+            OciConfigErrorKind::Invalid {
+                field: "linux.sysctl",
+            },
+            "config.json linux.sysctl names a UTS namespace key, which is not supported",
+        ),
+        _ => OciConfigError::invalid("linux.sysctl"),
     }
 }
 
@@ -591,7 +671,6 @@ unapplied_fields! {
     LinuxResourcesDevices => "linux.resources.devices",
     LinuxRootfsPropagation => "linux.rootfsPropagation",
     LinuxSeccomp => "linux.seccomp",
-    LinuxSysctl => "linux.sysctl",
     LinuxMountLabel => "linux.mountLabel",
     LinuxIntelRdt => "linux.intelRdt",
     LinuxMemoryPolicy => "linux.memoryPolicy",
@@ -673,8 +752,8 @@ struct RawProcess {
     command_line: Seen,
     #[serde(default)]
     console_size: Seen,
-    #[serde(default)]
-    capabilities: Seen,
+    #[serde(default, deserialize_with = "present")]
+    capabilities: Option<Obj<RawCapabilities>>,
     #[serde(default)]
     apparmor_profile: Seen,
     #[serde(default)]
@@ -691,6 +770,61 @@ struct RawProcess {
     rlimits: Seen,
     #[serde(default, rename = "execCPUAffinity")]
     exec_cpu_affinity: Seen,
+}
+
+/// `process.capabilities`（OCI Runtime Spec の 5 集合。未知キーは fail-closed に拒否する）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilities {
+    #[serde(default, deserialize_with = "present")]
+    bounding: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    effective: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    inheritable: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    permitted: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    ambient: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+}
+
+type RawCapList = Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>;
+
+/// 名前の配列を集合へ変換する。未知名・`CAP_` なし・小文字は `InvalidArgument`（値は載せない）。
+/// キーが無い配列は空集合（runc の nil と同じ）。重複は集合として吸収する。
+fn parse_cap_list(list: &RawCapList) -> Result<CapabilitySet, OciConfigError> {
+    let mut set = CapabilitySet::empty();
+    for name in list.iter().flat_map(|b| b.0.iter()) {
+        let cap = Capability::from_name(&name.0)
+            .ok_or_else(|| OciConfigError::invalid("process.capabilities"))?;
+        set = set.with(cap);
+    }
+    Ok(set)
+}
+
+/// `process.capabilities` を許可集合へ解釈する（SEC-1・CRI-2・#2666）。
+///
+/// 返す真偽値は「解釈できなかった指定がある」（`UnappliedField::ProcessCapabilities` を記録する）。
+/// 解釈済みにするのは、bounding / permitted / effective の 3 集合が互いに等しく、かつ OCI 既定集合の
+/// 部分集合（drop だけ）の場合に限る。`inheritable` / `ambient` が空でない指定、集合ごとに違う指定、
+/// 既定外を含む指定（add）は未適用として拒否側へ倒す。オブジェクトが無ければ OCI 既定集合。
+fn convert_capabilities(
+    raw: Option<&Obj<RawCapabilities>>,
+) -> Result<(ContainerCapabilities, bool), OciConfigError> {
+    let Some(Obj(c)) = raw else {
+        return Ok((ContainerCapabilities::oci_default(), false));
+    };
+    let bounding = parse_cap_list(&c.bounding)?;
+    let effective = parse_cap_list(&c.effective)?;
+    let permitted = parse_cap_list(&c.permitted)?;
+    let inheritable = parse_cap_list(&c.inheritable)?;
+    let ambient = parse_cap_list(&c.ambient)?;
+    let uniform = bounding == effective && bounding == permitted;
+    let extra = !inheritable.is_empty() || !ambient.is_empty();
+    match ContainerCapabilities::restrict(bounding) {
+        Ok(caps) if uniform && !extra => Ok((caps, false)),
+        _ => Ok((ContainerCapabilities::oci_default(), true)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -742,8 +876,8 @@ struct RawLinux {
     rootfs_propagation: Seen,
     #[serde(default)]
     seccomp: Seen,
-    #[serde(default)]
-    sysctl: Seen,
+    #[serde(default, deserialize_with = "present")]
+    sysctl: Option<RawSysctls>,
     #[serde(default, deserialize_with = "present")]
     masked_paths: Option<Bounded<BoundedStr<MaskedPathLimit>, MaskedPathsLimit>>,
     #[serde(default, deserialize_with = "present")]
@@ -1112,6 +1246,26 @@ impl OciMount {
         self.destination.as_path()
     }
 
+    /// 利用者指定の tmpfs(検証済み)を Landlock のルール生成へ渡すための `mounts[]` 相当の 1 件にする
+    /// (SUP-12・CORE-5・#2625)。`nosuid`・`nodev` を常に付け、`ro` / `rw`・`noexec` は型付きの属性から導く。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_user_tmpfs(spec: &crate::tmpfs::TmpfsMountSpec) -> Self {
+        let mut options = vec![
+            if spec.read_only { "ro" } else { "rw" }.to_owned(),
+            "nosuid".to_owned(),
+            "nodev".to_owned(),
+        ];
+        if !spec.exec {
+            options.push("noexec".to_owned());
+        }
+        Self {
+            destination: spec.destination.clone(),
+            fs_type: Some("tmpfs".to_owned()),
+            source: None,
+            options,
+        }
+    }
+
     /// 検証済みのマウント先型。
     pub fn mount_destination(&self) -> &MountDestination {
         &self.destination
@@ -1223,18 +1377,38 @@ pub struct OciConfig {
     gid_mappings: Vec<OciIdMapping>,
     masked_paths: Vec<ProtectedPath>,
     readonly_paths: Vec<ProtectedPath>,
+    sysctls: SysctlSet,
     resources: Option<LinuxResourceLimits>,
     cgroups_path: Option<CgroupsPath>,
+    capabilities: ContainerCapabilities,
     unapplied: Vec<UnappliedField>,
 }
 
 impl OciConfig {
+    /// `root.readonly` を true にした複製を返す(狭める方向だけ。`readonly:true` を false に戻す経路は無い)。
+    ///
+    /// 呼び出し元は launcher の `Inner::launch`。起動オプションの `--read-only`(CLI-1・SUP-12・#2828)があるとき、
+    /// Landlock の root 規則・分離の記録・mount の RDONLY が同じ実効値になるよう、この複製を Landlock 側へ渡す。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_root_readonly_forced(&self) -> Self {
+        let mut forced = self.clone();
+        forced.root.readonly = true;
+        forced
+    }
+
     /// 指定されているが本パーサが解釈・適用しないプロパティ（[`UnappliedField`] の宣言順・重複なし）。
     ///
     /// 空でない場合、その指定は `OciConfig` のどのアクセサにも反映されていない。create（TASK-29.2）は
     /// これを確認せずに起動してはならず、実際に `Unimplemented` で拒否する（fail-closed。SEC-1・CORE-5）。
     pub fn unapplied_fields(&self) -> &[UnappliedField] {
         &self.unapplied
+    }
+
+    /// `process.capabilities` から解釈した許可集合（無指定は OCI 既定集合。OCI 既定の部分集合、つまり
+    /// drop だけを受ける。add・`inheritable`・`ambient` は [`UnappliedField::ProcessCapabilities`]
+    /// として拒否側へ倒すため、ここには反映されない。SEC-1・CRI-2・#2666）。
+    pub fn capabilities(&self) -> ContainerCapabilities {
+        self.capabilities
     }
 
     /// `linux.maskedPaths`（検証済み。固定集合に**追加**する指定で、固定集合を外す・緩める手段ではない。
@@ -1247,6 +1421,12 @@ impl OciConfig {
     /// SEC-2・TASK-29 追補・#1852）。
     pub fn readonly_paths(&self) -> &[ProtectedPath] {
         &self.readonly_paths
+    }
+
+    /// `linux.sysctl`（検証済み。namespaced のキー〔IPC 系・net 系〕だけ。適用は pivot 前の `apply_sysctls` 段で、
+    /// 要る名前空間との整合は start と launcher が確かめる。CRI-2・CORE-3・SEC-1・#2670）。
+    pub fn sysctls(&self) -> &SysctlSet {
+        &self.sysctls
     }
 
     /// `linux.resources`（解釈済みの項目のみ。キーが無ければ `None`、`{}` は全項目 `None` の `Some`。
@@ -1553,7 +1733,14 @@ impl RawConfig {
             path: checked_path(self.root.0.path.0, "root.path")?,
             readonly: self.root.0.readonly,
         };
+        let (capabilities, caps_unapplied) = match &self.process {
+            Some(Obj(p)) => convert_capabilities(p.capabilities.as_ref())?,
+            None => (ContainerCapabilities::oci_default(), false),
+        };
         let mut unapplied = Vec::new();
+        if caps_unapplied {
+            unapplied.push(UnappliedField::ProcessCapabilities);
+        }
         let mut mark = |seen: Seen, field: UnappliedField| {
             if seen.0 {
                 unapplied.push(field);
@@ -1569,7 +1756,6 @@ impl RawConfig {
         if let Some(Obj(p)) = &self.process {
             mark(p.command_line, UnappliedField::ProcessCommandLine);
             mark(p.console_size, UnappliedField::ProcessConsoleSize);
-            mark(p.capabilities, UnappliedField::ProcessCapabilities);
             mark(p.apparmor_profile, UnappliedField::ProcessApparmorProfile);
             mark(p.oom_score_adj, UnappliedField::ProcessOomScoreAdj);
             mark(p.selinux_label, UnappliedField::ProcessSelinuxLabel);
@@ -1593,7 +1779,6 @@ impl RawConfig {
             }
             mark(l.rootfs_propagation, UnappliedField::LinuxRootfsPropagation);
             mark(l.seccomp, UnappliedField::LinuxSeccomp);
-            mark(l.sysctl, UnappliedField::LinuxSysctl);
             mark(l.mount_label, UnappliedField::LinuxMountLabel);
             mark(l.intel_rdt, UnappliedField::LinuxIntelRdt);
             mark(l.memory_policy, UnappliedField::LinuxMemoryPolicy);
@@ -1616,6 +1801,7 @@ impl RawConfig {
         let (mut namespaces, mut uid_mappings, mut gid_mappings) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut masked_paths, mut readonly_paths) = (Vec::new(), Vec::new());
+        let mut sysctls = SysctlSet::new();
         let (mut resources, mut cgroups_path) = (None, None);
         if let Some(Obj(linux)) = self.linux {
             for Obj(ns) in linux.namespaces.map(|b| b.0).unwrap_or_default() {
@@ -1645,6 +1831,7 @@ impl RawConfig {
             masked_paths = convert_protected_paths(linux.masked_paths, "linux.maskedPaths[]")?;
             readonly_paths =
                 convert_protected_paths(linux.readonly_paths, "linux.readonlyPaths[]")?;
+            sysctls = convert_sysctls(linux.sysctl)?;
         }
 
         Ok(OciConfig {
@@ -1658,8 +1845,10 @@ impl RawConfig {
             gid_mappings,
             masked_paths,
             readonly_paths,
+            sysctls,
             resources,
             cgroups_path,
+            capabilities,
             unapplied,
         })
     }
@@ -1980,13 +2169,10 @@ mod tests {
         }
     }
 
-    /// 書き手のいない FIFO でブロックせず、非通常ファイルとして拒否する（REPAIR-5・ERR-1）。
-    /// Linux / macOS の双方で実行する（`mkfifo` の失敗は skip せずテスト失敗にする）。
+    /// `dir` の下に書き手のいない FIFO `config.json` を作り、ブロックせず非通常ファイルとして拒否されることを照合する。
+    /// 一時領域の確保は呼び出し側（`ScratchDir` の子）が担う。
     #[cfg(unix)]
-    #[test]
-    fn repair5_load_config_rejects_fifo_without_blocking() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    fn fifo_config_rejected_in(dir: &std::path::Path) {
         let fifo = dir.join("config.json");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -2001,7 +2187,54 @@ mod tests {
                 field: "config.json"
             }
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 書き手のいない FIFO でブロックせず、非通常ファイルとして拒否する（REPAIR-5・ERR-1）。
+    /// Linux / macOS の双方で実行する（`mkfifo` の失敗は skip せずテスト失敗にする）。
+    /// 一時領域は pid だけの名前にせず `ScratchDir` の下に置く（残骸との衝突を避ける。#3373・REPAIR-12）。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_load_config_rejects_fifo_without_blocking() {
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        fifo_config_rejected_in(scratch.path());
+    }
+
+    /// 旧方式の pid だけの名前の残骸（FIFO）が残っていても、`ScratchDir` 上の FIFO 試験が通る（#3373・REPAIR-12）。
+    /// 残骸は排他作成できた場合だけ自分で消す（既にあれば本物の残骸として使い、消さない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair12_3373_fifo_config_test_survives_legacy_residue() {
+        let legacy = std::env::temp_dir().join(format!("fandhe-oci-fifo-{}", std::process::id()));
+        let created = std::fs::create_dir(&legacy).is_ok();
+        let status = std::process::Command::new("mkfifo")
+            .arg(legacy.join("config.json"))
+            .status()
+            .expect("run mkfifo");
+        // 本物の残骸なら FIFO が既にあるため失敗してよい。ここでは存在だけを要求する。
+        let _ = status;
+        assert!(
+            std::fs::symlink_metadata(legacy.join("config.json")).is_ok(),
+            "legacy residue must exist"
+        );
+        struct Cleanup(std::path::PathBuf, bool);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+        }
+        let _cleanup = Cleanup(legacy.clone(), created);
+
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        assert_ne!(scratch.path(), legacy.as_path());
+        fifo_config_rejected_in(scratch.path());
     }
 
     /// 既知フィールドが存在して `null` の場合は省略とみなさず `Data` で拒否する（OCI-4）。
@@ -2060,8 +2293,11 @@ mod tests {
     /// 非通常ファイル（ディレクトリ）は 3 OS で同じ分類になる（ERR-1・REPAIR-5）。
     #[test]
     fn err1_directory_config_is_invalid_on_all_os() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-dir-{}", std::process::id()));
-        let target = dir.join("config.json");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-dir",
+            std::time::Duration::from_secs(10),
+        );
+        let target = scratch.path().join("config.json");
         std::fs::create_dir_all(&target).expect("mkdir");
         let e = load_config(&target).expect_err("directory");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
@@ -2075,20 +2311,20 @@ mod tests {
             e.message(),
             "config.json has an invalid value for `config.json`"
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// 途中の要素が通常ファイルのパス（`<file>/config.json`）は 3 OS で `NotFound` になる（ERR-1）。
     #[test]
     fn err1_path_through_regular_file_is_not_found_on_all_os() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-notdir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let file = dir.join("bundle");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-notdir",
+            std::time::Duration::from_secs(10),
+        );
+        let file = scratch.path().join("bundle");
         std::fs::write(&file, b"{}").expect("write");
         let e = load_config(&file.join("config.json")).expect_err("not a directory");
         assert_eq!(e.code(), ErrorCode::NotFound);
         assert_eq!(*e.kind(), OciConfigErrorKind::Io);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
@@ -2229,17 +2465,27 @@ mod tests {
     }
 
     /// OCI 既知だが解釈しないプロパティは、種別ごとに指定の有無を記録する（SEC-1・CORE-5・OCI-4）。
-    /// 値が `null` でも「指定あり」とみなす（fail-closed 側）。未指定なら空。
+    /// 値が `null` でも「指定あり」とみなす（fail-closed 側。型付きで解釈する `process.capabilities` を除く）。未指定なら空。
     #[test]
     fn sec1_each_unapplied_field_is_reported() {
-        assert_eq!(UNAPPLIED_FIELDS.len(), 54);
+        assert_eq!(UNAPPLIED_FIELDS.len(), 53);
         let none: [UnappliedField; 0] = [];
         assert_eq!(parse(&base()).expect("valid").unapplied_fields(), none);
         for &field in UNAPPLIED_FIELDS {
             let path = field.as_str().replace("mounts[]", "mounts.0");
             let keys: Vec<&str> = path.split('.').collect();
             let (last, parent) = keys.split_last().expect("non-empty path");
-            for value in [json!({"any": [1]}), Value::Null] {
+            // `process.capabilities` だけは型付きで解釈する（`null`・未知キーは `Data`）。拒否側になる指定
+            // （集合ごとに違う・`inheritable` あり）で未適用の記録を確かめる（#2666）。
+            let values = if field == UnappliedField::ProcessCapabilities {
+                vec![
+                    json!({"bounding": ["CAP_KILL"]}),
+                    json!({"bounding": [], "effective": [], "permitted": [], "inheritable": ["CAP_KILL"]}),
+                ]
+            } else {
+                vec![json!({"any": [1]}), Value::Null]
+            };
+            for value in values {
                 let mut v = base();
                 // `linux.resources.memory` のように base に無い中間 object は作る。
                 for depth in 1..=parent.len() {
@@ -2256,6 +2502,120 @@ mod tests {
                 assert_eq!(cfg.unapplied_fields(), [field], "{path}");
             }
         }
+    }
+
+    fn caps_cfg(caps: Value) -> Result<OciConfig, OciConfigError> {
+        let mut v = base();
+        v["process"]["capabilities"] = caps;
+        parse(&v)
+    }
+
+    fn names(c: ContainerCapabilities) -> Vec<&'static str> {
+        c.iter().map(Capability::as_str).collect()
+    }
+
+    fn default_names() -> Vec<&'static str> {
+        crate::capabilities::OCI_DEFAULT_CAPABILITIES
+            .iter()
+            .map(|c| c.as_str())
+            .collect()
+    }
+
+    /// SEC-1・CRI-2・#2666: 無指定は OCI 既定 14 個、既定の部分集合（drop）は解釈済みで未適用に残らない。
+    #[test]
+    fn sec1_cri2_capabilities_drop_is_interpreted() {
+        let cfg = parse(&base()).expect("valid");
+        assert!(cfg.capabilities().is_default());
+        assert_eq!(cfg.capabilities().iter().count(), 14);
+        let none: [UnappliedField; 0] = [];
+        // 3 集合とも既定から CAP_NET_RAW を除いた 13 個（重複は集合として吸収する）。
+        let set: Vec<&str> = default_names()
+            .into_iter()
+            .filter(|c| *c != "CAP_NET_RAW")
+            .collect();
+        let mut dup = set.clone();
+        dup.push("CAP_KILL");
+        let cfg = caps_cfg(json!({"bounding": dup, "effective": set, "permitted": set})).unwrap();
+        assert_eq!(cfg.unapplied_fields(), none);
+        assert_eq!(
+            names(cfg.capabilities()),
+            [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_SETGID",
+                "CAP_SETUID",
+                "CAP_SETPCAP",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SYS_CHROOT",
+                "CAP_MKNOD",
+                "CAP_AUDIT_WRITE",
+                "CAP_SETFCAP"
+            ]
+        );
+        // 空配列 3 つは全 drop。キーが無い配列は空集合（`{}` も全 drop）。
+        let all_drop = caps_cfg(json!({"bounding": [], "effective": [], "permitted": []})).unwrap();
+        assert_eq!(all_drop.unapplied_fields(), none);
+        assert!(all_drop.capabilities().iter().next().is_none());
+        assert!(
+            caps_cfg(json!({}))
+                .unwrap()
+                .capabilities()
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// SEC-1・CRI-2・#2666: add（既定外）・集合ごとの違い・`inheritable` / `ambient` は未適用として拒否側に倒す。
+    #[test]
+    fn sec1_cri2_capabilities_non_drop_is_unapplied() {
+        let d = default_names();
+        let mut wide = d.clone();
+        wide.push("CAP_SYS_ADMIN");
+        for caps in [
+            json!({"bounding": wide, "effective": wide, "permitted": wide}),
+            json!({"bounding": d, "effective": ["CAP_KILL"], "permitted": d}),
+            json!({"bounding": d, "effective": d, "permitted": d, "inheritable": ["CAP_KILL"]}),
+            json!({"bounding": d, "effective": d, "permitted": d, "ambient": ["CAP_KILL"]}),
+        ] {
+            let cfg = caps_cfg(caps.clone()).unwrap();
+            assert_eq!(
+                cfg.unapplied_fields(),
+                [UnappliedField::ProcessCapabilities],
+                "{caps}"
+            );
+        }
+        // 空の inheritable / ambient は指定なしと同じ。
+        let cfg = caps_cfg(json!({
+            "bounding": d, "effective": d, "permitted": d, "inheritable": [], "ambient": []
+        }))
+        .unwrap();
+        assert!(cfg.unapplied_fields().is_empty());
+    }
+
+    /// SEC-1・CRI-2・#2666: 未知名・小文字・接頭辞なし・`null`・未知キー・件数超過・名前の長さ超過は拒否する。
+    #[test]
+    fn sec1_cri2_capabilities_invalid_inputs_are_rejected() {
+        for caps in [
+            json!({"bounding": ["CAP_NOPE"]}),
+            json!({"bounding": ["cap_kill"]}),
+            json!({"bounding": ["KILL"]}),
+            json!({"bounding": [1]}),
+            json!({"bounding": null}),
+            json!({"unknown": []}),
+            Value::Null,
+            json!([]),
+            json!({"bounding": vec!["CAP_KILL"; CONFIG_MAX_CAPABILITIES + 1]}),
+            json!({"bounding": ["CAP_".to_owned() + &"A".repeat(CONFIG_MAX_CAPABILITY_NAME_BYTES)]}),
+        ] {
+            let e = caps_cfg(caps.clone()).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{caps}");
+        }
+        // 件数の上限ちょうどは受理する。
+        assert!(caps_cfg(json!({"bounding": vec!["CAP_KILL"; CONFIG_MAX_CAPABILITIES]})).is_ok());
     }
 
     /// SEC-2・OCI-4（#1852）: `maskedPaths` / `readonlyPaths` は解釈済みで、未適用に残らない。
@@ -2582,6 +2942,102 @@ mod tests {
         }
     }
 
+    /// CRI-2・CORE-3（#2670）: namespaced な `linux.sysctl` は解釈済みで、未適用に残らない。
+    #[test]
+    fn cri2_sysctl_namespaced_keys_are_interpreted() {
+        let mut v = base();
+        v["linux"] = json!({"sysctl": {
+            "kernel.shmmax": "68719476736",
+            "kernel.sem": "250 32000 32 128",
+            "fs.mqueue.msg_max": "20"
+        }});
+        let cfg = parse(&v).expect("valid");
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(cfg.unapplied_fields(), none);
+        let got: Vec<(&str, &str)> = cfg
+            .sysctls()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("fs.mqueue.msg_max", "20"),
+                ("kernel.sem", "250 32000 32 128"),
+                ("kernel.shmmax", "68719476736"),
+            ]
+        );
+        assert!(parse(&base()).expect("valid").sysctls().is_empty());
+    }
+
+    /// CRI-2・SEC-1（#2670）: 名前空間を持たない・文法違反・値の型不一致は `InvalidArgument`、UTS 系は `Unimplemented`。
+    #[test]
+    fn cri2_sysctl_rejections() {
+        for (sysctl, code) in [
+            (json!({"kernel.panic": "1"}), ErrorCode::InvalidArgument),
+            (json!({"kernel/shmmax": "1"}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": ""}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": "1\n2"}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": 1}), ErrorCode::InvalidArgument),
+            (json!({"kernel.shmmax": null}), ErrorCode::InvalidArgument),
+            (json!(["kernel.shmmax"]), ErrorCode::InvalidArgument),
+            (json!({"kernel.hostname": "x"}), ErrorCode::Unimplemented),
+            (json!({"kernel.domainname": "x"}), ErrorCode::Unimplemented),
+        ] {
+            let mut v = base();
+            v["linux"] = json!({"sysctl": sysctl.clone()});
+            let err = err_of(&v);
+            assert_eq!(err.code(), code, "{sysctl}: {err:?}");
+            assert!(!err.message().contains("shmmax"), "{}", err.message());
+        }
+        // null は省略として受理しない。
+        let mut v = base();
+        v["linux"] = json!({"sysctl": null});
+        assert!(parse(&v).is_err());
+    }
+
+    /// CRI-2（#2670）: 重複キーは拒否し、件数・キー長・値長の上限はちょうどが受理、超過は `LimitExceeded`。
+    #[test]
+    fn cri2_sysctl_duplicates_and_limits() {
+        let dup = br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"linux":{"sysctl":{"kernel.shmmax":"1","kernel.shmmax":"2"}}}"#;
+        assert!(parse_config_bytes(dup).is_err());
+
+        let entries = |n: usize| {
+            (0..n)
+                .map(|i| (format!("net.k{i}"), json!("1")))
+                .collect::<serde_json::Map<_, _>>()
+        };
+        let mut v = base();
+        v["linux"] = json!({"sysctl": entries(SYSCTL_MAX_ENTRIES)});
+        // net.* の文法は通る（start が名前空間の整合を検査する）。
+        assert_eq!(
+            parse(&v).expect("at limit").sysctls().len(),
+            SYSCTL_MAX_ENTRIES
+        );
+        v["linux"] = json!({"sysctl": entries(SYSCTL_MAX_ENTRIES + 1)});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                if *field == "linux.sysctl" && *limit == SYSCTL_MAX_ENTRIES),
+            "{err:?}"
+        );
+        v["linux"] = json!({"sysctl": {"net.a": "1".repeat(SYSCTL_MAX_VALUE_BYTES + 1)}});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, limit }
+                if *field == "linux.sysctl{value}" && *limit == SYSCTL_MAX_VALUE_BYTES),
+            "{err:?}"
+        );
+        let long_key = format!("net.{}", "a".repeat(SYSCTL_MAX_KEY_BYTES));
+        v["linux"] = json!({"sysctl": {long_key: "1"}});
+        let err = err_of(&v);
+        assert!(
+            matches!(err.kind(), OciConfigErrorKind::LimitExceeded { field, .. }
+                if *field == "linux.sysctl{key}"),
+            "{err:?}"
+        );
+    }
+
     /// `as_str` は JSON 上のパスで、種別ごとに一意（SEC-1）。
     #[test]
     fn sec1_unapplied_field_paths_are_unique() {
@@ -2853,8 +3309,11 @@ mod tests {
 
     #[test]
     fn oci4_load_config_reads_file_and_reports_errors() {
-        let dir = std::env::temp_dir().join(format!("fandhe-oci-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-oci-config",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().to_path_buf();
 
         let ok = dir.join("config.json");
         std::fs::write(&ok, serde_json::to_vec(&base()).expect("ser")).expect("write");
@@ -2873,8 +3332,6 @@ mod tests {
         let missing = load_config(&dir.join("missing.json")).expect_err("missing");
         assert_eq!(missing.code(), ErrorCode::NotFound);
         assert_eq!(*missing.kind(), OciConfigErrorKind::Io);
-
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// `args` / `env` の 1 要素は上限ちょうどを受理し、1 バイト超過を拒否する（OCI-4・CORE-2）。

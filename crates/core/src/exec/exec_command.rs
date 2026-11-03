@@ -68,13 +68,18 @@
 //!   実体・ランタイム自身のバイナリ（本体に加えて、シェバンの連鎖・`PT_INTERP` の解決先。`#!/proc/self/exe` 等。
 //!   #1458）を拒否し、シェバンを検証し、標準入出力を新 root の `/dev/null`（開く前に 1:3 を検証し、`O_NOCTTY`
 //!   つきで開き直す。#1459）へ置換して `execveat` する（`process::exec_checked_entrypoint`）。エントリポイントは絶対パスのみで PATH
-//!   探索はしない。子の失敗は stderr の英語 1 行・終了コード（125 / 126 / 127）・親への pipe（下記）で伝える
+//!   探索はしない。子の失敗は stderr の英語 1 行・終了コード（125 / 126 / 127）・親への pipe（下記。失敗した段も
+//!   固定語彙 [`ExecChildStep`] で運ぶ）で伝える
 //! - **親の待ちには必ずタイムアウトを設ける**（REPAIR-5）: 戻り値の [`ExecChild`] は
 //!   `wait_timeout` のみを提供する。`Drop` では kill / wait しない
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: 子の終了コード 125 / 126 /
 //!   127 は実行されたコマンド自身も返し得るため、終了コードでは区別できない。親は fork の前に close-on-exec の
-//!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コードと
-//!   違反の理由）」を 1 行で書く。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
+//!   pipe を作り、子は fd の後始末でその書き込み側だけを残して、「手順を終えた（`R`）」「失敗した（終了コード・
+//!   ERR-1 コード・違反の理由）」を 1 行で書く（失敗の行は `<終了コード> <step> <ERR-1 コード> <理由|->` の 4 語で、`step` は子の手順の段を表す固定語彙
+//!   [`ExecChildStep`]。親は長さと語彙を検証して静的な値に引き直し、`SetupFailed { step }` に持たせる。メッセージは子から運ばず、親が
+//!   段から固定の英文を引く（`ExecChildStep::message`）。`bind_to_parent_lifetime` / `join_exec_cgroup` の失敗も同じ行を書く。段 `parent_lifetime` の CODE は親の消失なら `FAILED_PRECONDITION`、syscall の予期しない失敗なら `INTERNAL`。#2895）。`R` の後の `execveat` の失敗（`ENOENT` → `NotFound`・`EACCES` →
+//!   `PermissionDenied`・`ENOEXEC` → `InvalidArgument` 等。launch の `X <CODE>` と同じ写像）も同じ失敗の行で、
+//!   `SetupFailed { code }` として「起動していない」と ErrorCode つきで返る（#2763）。`execveat` が成功すれば pipe は閉じるので、親は子の終了後に「`R` だけ」=
 //!   起動した、「失敗の行」または「何も無い」= 起動していない、と判定する（[`ExecExit`]）。**限界**: `R` を
 //!   書いた後・`execveat` の完了前にシグナルで終了した子は「起動した」と判定される（窓は syscall 1 回ぶん）。
 //!   pipe の書き込み側はコンテナ内の PID namespace から見える子が持つが、子は non-dumpable で、`execveat` の後は
@@ -82,26 +87,30 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
-//!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
+//! - 標準入出力の受け渡しのうち、CLI の exec と stdin。healthcheck の出力取得は実装済み
+//!   （[`spawn_exec_command_with_stdio`]。stdout・stderr を呼び出し側が渡した 1 本の fd へ付け替える。#2441）。
+//!   [`spawn_exec_command`] の既定は launch と同じく `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ
+//!   渡さない。fail-closed）
 //! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定（launch の `process.cwd` は pivot 直後に適用済みだが、exec 経路は未対応 = REPAIR-3）。環境変数は
 //!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
 //!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
-//! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
-use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
+use super::process::{
+    EXIT_SETUP_FAILED, ExecChildStep, exec_child_main, exec_status_pipe, read_exec_status,
+    report_exec_child_failure,
+};
 use super::reapply::ExecReadyParts;
 use super::seccomp_listener::{
     ExecListenerReceiver, ExecListenerSender, exec_listener_pair, exec_sender_from,
 };
 use super::{
-    ChildExit, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
-    IsolationStage,
+    ChildExit, ChildStdio, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit,
+    ExecReady, IsolationStage,
 };
 
 /// [`spawn_exec_command`] が fork した、稼働中コンテナ内のコマンドの子（SUP-6・TASK-163 追補・#1460）。
@@ -203,6 +212,22 @@ pub fn spawn_exec_command(
     command: &ExecCommand,
     cgroup: &ExecChildCgroup,
 ) -> Result<ExecChild, ExecError> {
+    spawn_exec_command_with_stdio(ready, command, cgroup, ChildStdio::none())
+}
+
+/// [`spawn_exec_command`] に、コマンドの stdout / stderr の付け替え先（[`ChildStdio`]）を足した入口
+/// （healthcheck の出力取得。SUP-4・SUP-6・#2441）。
+///
+/// `stdio` が [`ChildStdio::none`] なら [`spawn_exec_command`] と同じ（3 本とも `/dev/null`）。[`ChildStdio::from_output`]
+/// で作った指定なら、子は `close_range` の前に fd 1・2 を出力用 fd へ付け替え、fd 0 だけを `/dev/null` へ置換し、
+/// `SIGPIPE` を `SIG_IGN` にして exec する（読み手が閉じても `EPIPE` で済み、`SIGPIPE` では落ちない）。親（呼び出し側）が
+/// 持つ `stdio` の複製は fork 後にこの関数が閉じる。付け替えの失敗は段 `prepare_fds` の `SetupFailed` で報告する。
+pub fn spawn_exec_command_with_stdio(
+    ready: ExecReady,
+    command: &ExecCommand,
+    cgroup: &ExecChildCgroup,
+    stdio: ChildStdio,
+) -> Result<ExecChild, ExecError> {
     let entry = command.entrypoint();
     let ExecReadyParts {
         root,
@@ -226,10 +251,24 @@ pub fn spawn_exec_command(
     let (status_read, status_write) = exec_status_pipe()?;
     let pid = sys::fork_single_threaded_with(
         || threads.count() == Some(1),
-        || match bind_to_parent_lifetime(own.as_fd()).and_then(|()| join_exec_cgroup(cgroup)) {
-            Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy),
-            // 何も書かずに終わる（親は「手順の途中で終了した」= コマンドは起動していない、と判定する）。
-            Err(code) => code,
+        || match bind_to_parent_lifetime(own.as_fd()) {
+            // 失敗の行は best-effort で書く（書けなければ何も書かずに終わり、親は「手順の途中で終了した」=
+            // コマンドは起動していない・段なし、と判定する。#2822）。この時点では状態 pipe の書き込み側が開いている。
+            Err(e) => {
+                report_exec_child_failure(
+                    &status_write,
+                    ExecChildStep::ParentLifetime,
+                    e.error_code(),
+                );
+                e.exit_code()
+            }
+            Ok(()) => match join_exec_cgroup(cgroup) {
+                Err((code, error_code)) => {
+                    report_exec_child_failure(&status_write, ExecChildStep::CgroupJoin, error_code);
+                    code
+                }
+                Ok(()) => exec_child_main(entry, &status_write, deferred_fsize, seal_policy, stdio),
+            },
         },
         EXIT_SETUP_FAILED,
     )
@@ -248,14 +287,14 @@ pub fn spawn_exec_command(
 /// `bind_to_parent_lifetime` の後・`close_range` の前（cgroup の書き込み fd が残っている間）に呼ぶ。この時点で
 /// 子孫は存在しないため、移した後に作られる子孫はすべて子 cgroup に入る。失敗したら stderr に英語 1 行を出し
 /// `EXIT_SETUP_FAILED` を返す（何も書かずに終了 = 親は「コマンドは起動していない」と判定する。fail-closed）。
-fn join_exec_cgroup(cgroup: &ExecChildCgroup) -> Result<(), i32> {
+fn join_exec_cgroup(cgroup: &ExecChildCgroup) -> Result<(), (i32, ErrorCode)> {
     use std::io::Write as _;
-    cgroup.join_self().map_err(|_| {
+    cgroup.join_self().map_err(|e| {
         let _ = writeln!(
             std::io::stderr(),
             "fandhe-container: the exec command could not join its child cgroup; refusing to continue"
         );
-        EXIT_SETUP_FAILED
+        (EXIT_SETUP_FAILED, e.code)
     })
 }
 
@@ -268,24 +307,87 @@ fn own_pidfd() -> Result<OwnedFd, ExecError> {
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "pidfd_open(self)"))
 }
 
+/// 子を親の生存に結び付けられなかった理由（#2895・SUP-6・REPAIR-4・REPAIR-5）。
+///
+/// `bind_to_parent_lifetime` の失敗を「親が既に終了していた」と「syscall が予期せず失敗した」に分け、
+/// 状態 pipe の段 `parent_lifetime` の CODE と `rebind_worker_after_credential_switch` の `ErrorCode` を
+/// 出し分ける（運用時の切り分けのため。errno の生値はワイヤーへ出さない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentLifetimeError {
+    /// 親が既に終了していた（親の pidfd が読み取り可能）。`ErrorCode::FailedPrecondition`。
+    ParentGone,
+    /// 親死亡シグナルの設定か親の pidfd の確認の syscall が予期せず失敗した。`ErrorCode::Internal`。
+    Syscall(sys::SysError),
+}
+
+impl ParentLifetimeError {
+    /// 失敗の行・呼び出し側のエラーへ載せる分類。
+    fn error_code(self) -> ErrorCode {
+        match self {
+            Self::ParentGone => ErrorCode::FailedPrecondition,
+            Self::Syscall(_) => ErrorCode::Internal,
+        }
+    }
+
+    /// 子（worker）の終了コード。理由によらず fail-closed の同じ値を返す。
+    fn exit_code(self) -> i32 {
+        EXIT_SETUP_FAILED
+    }
+
+    /// stderr へ出す英語 1 行（理由ごとの固定文）。
+    fn stderr_message(self) -> &'static str {
+        match self {
+            Self::ParentGone => {
+                "fandhe-container: the parent of the exec process is gone; refusing to continue"
+            }
+            Self::Syscall(_) => {
+                "fandhe-container: the parent of the exec process cannot be watched; refusing to continue"
+            }
+        }
+    }
+}
+
+/// `poll` が `EINTR` を返したときの再試行回数の上限（タイムアウト 0 なので待ちは延びない。REPAIR-5）。
+const PARENT_POLL_EINTR_RETRIES: usize = 3;
+
+/// `EINTR`（Linux の errno 4）。
+const EINTR: i32 = 4;
+
+/// [`bind_to_parent_lifetime`] の syscall を差し替えられる版（試験用。#2895）。
+///
+/// `set` は親死亡シグナルの設定、`poll` は親の pidfd が読み取り可能（= 親が終了）かの確認。
+fn bind_to_parent_lifetime_with(
+    set: impl FnOnce() -> Result<(), sys::SysError>,
+    mut poll: impl FnMut() -> Result<bool, sys::SysError>,
+) -> Result<(), ParentLifetimeError> {
+    set().map_err(ParentLifetimeError::Syscall)?;
+    let mut retries = 0;
+    loop {
+        match poll() {
+            Ok(false) => return Ok(()),
+            Ok(true) => return Err(ParentLifetimeError::ParentGone),
+            Err(sys::SysError::Os(EINTR)) if retries < PARENT_POLL_EINTR_RETRIES => {
+                retries += 1;
+            }
+            Err(e) => return Err(ParentLifetimeError::Syscall(e)),
+        }
+    }
+}
+
 /// fork した子を親の生存に結び付ける（REPAIR-5。契約はモジュール doc「子を親の生存に結び付ける」）。
 ///
 /// 親死亡シグナル（`SIGKILL`）を設定してから、`parent`（親が fork の前に開いた親自身の pidfd）で親が終了して
-/// いないことを確かめる。設定・確認に失敗した場合と、親が既に終了していた場合は、stderr に英語 1 行を出して
-/// 子の終了コード（`EXIT_SETUP_FAILED`）を返す（呼び出し側は以降の処理を実行しない。fail-closed）。
-fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), i32> {
+/// いないことを確かめる。設定・確認に失敗した場合と、親が既に終了していた場合は、stderr に理由別の英語 1 行を
+/// 出して [`ParentLifetimeError`] を返す（呼び出し側は以降の処理を実行しない。fail-closed）。
+fn bind_to_parent_lifetime(parent: BorrowedFd<'_>) -> Result<(), ParentLifetimeError> {
     use std::io::Write as _;
     // pidfd は対象の終了で読み取り可能になる（タイムアウト 0 で現在の状態だけを見る）。
-    let parent_exited =
-        sys::set_parent_death_sigkill().and_then(|()| sys::poll_readable(parent, 0));
-    if parent_exited == Ok(false) {
-        return Ok(());
-    }
-    let _ = writeln!(
-        std::io::stderr(),
-        "fandhe-container: the parent of the exec process is gone or cannot be watched; refusing to continue"
-    );
-    Err(EXIT_SETUP_FAILED)
+    bind_to_parent_lifetime_with(sys::set_parent_death_sigkill, || {
+        sys::poll_readable(parent, 0)
+    })
+    .inspect_err(|e| {
+        let _ = writeln!(std::io::stderr(), "{}", e.stderr_message());
+    })
 }
 
 /// 「exec 専用の使い捨て worker の中にいる」ことの証跡（ゼロサイズ。#1532・SUP-6・SEC-1）。
@@ -365,7 +467,9 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
     let own = own_pidfd()?;
     let pid = sys::fork_single_threaded(
         || match keep_parent_pidfd(&own)
-            .and_then(|()| bind_to_parent_lifetime(own.as_fd()))
+            .and_then(|()| {
+                bind_to_parent_lifetime(own.as_fd()).map_err(ParentLifetimeError::exit_code)
+            })
             .and_then(|()| make_worker_non_dumpable())
         {
             // 上の 2 つが成功した後にだけ証跡を作る（証跡の意味を「親の生存に結合済みで non-dumpable な
@@ -461,11 +565,20 @@ pub(super) fn rebind_worker_after_credential_switch() -> Result<(), ExecError> {
     let parent = slot.as_ref().ok_or_else(|| {
         fail("the exec worker has no parent handle to re-bind to after the credential switch")
     })?;
-    bind_to_parent_lifetime(parent.as_fd())
-        .and_then(|()| make_worker_non_dumpable())
-        .map_err(|_| {
-            fail("the exec worker could not be re-bound to its parent after the credential switch")
-        })
+    bind_to_parent_lifetime(parent.as_fd()).map_err(|e| {
+        let what = match e {
+            ParentLifetimeError::ParentGone => {
+                "the parent of the exec worker is gone after the credential switch"
+            }
+            ParentLifetimeError::Syscall(_) => {
+                "the exec worker could not be re-bound to its parent after the credential switch"
+            }
+        };
+        ExecError::new(e.error_code(), IsolationStage::CapabilityDrop, what)
+    })?;
+    make_worker_non_dumpable().map_err(|_| {
+        fail("the exec worker could not be re-bound to its parent after the credential switch")
+    })
 }
 
 /// launch 経路（コンテナの PID 1）で、資格情報の切り替え後に non-dumpable を落とし直して読み戻す（OCI-1・SEC-5）。
@@ -583,6 +696,66 @@ mod tests {
         assert_eq!(e.code, ErrorCode::FailedPrecondition);
     }
 
+    /// SUP-6・REPAIR-4・#2895: 親の生存への結び付けの失敗を「親の消失」と「syscall の失敗」に分類する。
+    #[test]
+    fn sup6_2895_bind_to_parent_lifetime_classifies_failures() {
+        use crate::sys::SysError;
+        assert_eq!(
+            bind_to_parent_lifetime_with(|| Ok(()), || Ok(false)),
+            Ok(())
+        );
+        let gone = bind_to_parent_lifetime_with(|| Ok(()), || Ok(true)).unwrap_err();
+        assert_eq!(gone, ParentLifetimeError::ParentGone);
+        assert_eq!(gone.error_code(), ErrorCode::FailedPrecondition);
+        assert_eq!(gone.exit_code(), EXIT_SETUP_FAILED);
+        // 設定の失敗は Internal で、poll は呼ばれない。
+        let mut polled = false;
+        let e = bind_to_parent_lifetime_with(
+            || Err(SysError::Os(1)),
+            || {
+                polled = true;
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e, ParentLifetimeError::Syscall(SysError::Os(1)));
+        assert_eq!(e.error_code(), ErrorCode::Internal);
+        assert!(!polled);
+        // poll の予期しない失敗は Internal。
+        let e = bind_to_parent_lifetime_with(|| Ok(()), || Err(SysError::Os(9))).unwrap_err();
+        assert_eq!(e.error_code(), ErrorCode::Internal);
+        // EINTR は上限回まで再試行し、尽きたら Internal。
+        let mut n = 0;
+        let e = bind_to_parent_lifetime_with(
+            || Ok(()),
+            || {
+                n += 1;
+                Err(SysError::Os(EINTR))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.error_code(), ErrorCode::Internal);
+        assert_eq!(n, PARENT_POLL_EINTR_RETRIES + 1);
+        // EINTR の後に成功すれば Ok。
+        let mut n = 0;
+        let r = bind_to_parent_lifetime_with(
+            || Ok(()),
+            || {
+                n += 1;
+                if n == 1 {
+                    Err(SysError::Os(EINTR))
+                } else {
+                    Ok(false)
+                }
+            },
+        );
+        assert_eq!(r, Ok(()));
+        assert_ne!(
+            ParentLifetimeError::ParentGone.stderr_message(),
+            ParentLifetimeError::Syscall(SysError::Os(1)).stderr_message()
+        );
+    }
+
     fn take_calls() -> Vec<&'static str> {
         CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
@@ -593,16 +766,13 @@ mod tests {
 
     /// `Threads:` を固定した使い捨ての status 相当ファイル（名前を残さない）。
     fn status_with_threads(n: u64) -> ThreadCountSource {
-        let path = std::env::temp_dir().join(format!(
-            "fandhe-exec-command-{}-{n}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        // 予測できる名前を作成・切り詰めせず、排他作成の `ScratchDir` の子へ `create_new` する（#3434・REPAIR-12）。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-exec-command", "d");
+        let path = dir.join(format!("status-{n}"));
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)
             .expect("create");
         std::fs::remove_file(&path).expect("unlink");
@@ -613,19 +783,12 @@ mod tests {
 
     /// `cgroup.procs` / `cgroup.kill` を置いた使い捨てのディレクトリから作った子 cgroup（fork 前に失敗する試験用）。
     fn child_cgroup() -> ExecChildCgroup {
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-exec-command-cg-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 呼び出しの終わりで `ScratchDir` が消える（開いた fd は削除後も有効。従来と同じ）。#3434・REPAIR-12。
+        let (_scratch, dir) = crate::test_support::scratch_child("fandhe-exec-command-cg", "d");
         std::fs::write(dir.join("cgroup.procs"), "").expect("procs");
         std::fs::write(dir.join("cgroup.kill"), "").expect("kill");
         let fd = OwnedFd::from(std::fs::File::open(&dir).expect("open dir"));
-        let cgroup = ExecChildCgroup::from_dir_for_test(fd);
-        let _ = std::fs::remove_dir_all(&dir);
-        cgroup
+        ExecChildCgroup::from_dir_for_test(fd)
     }
 
     fn entry() -> ExecCommand {

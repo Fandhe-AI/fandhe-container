@@ -86,9 +86,9 @@
 //! （root / 非 root）で前提が成立しないケース（`LauncherRequirement`）は、そのケースだけを合格ではなく
 //! 「対象外」（`verdict=not-applicable`）として理由とビヘイビア ID を出力し、他のケースは実行する。分離方式（TASK-42.6・#204）は
 //! `harness = false` ＋ `--ignored` 引数ゲートで確定（CLONE_NEWUSER は単一スレッド前提で libtest と相容れないため
-//! `#[ignore]` や feature flag は使わない）。既定の集合では自己テストのみ走る。CI の `platform-ci` への
-//! 組み込みは ESC-06 の解消と Landlock ABI 6+ runner の確保後に別 PR で行う。実行条件は AGENTS.md
-//! 「実機前提テスト」節を参照。
+//! `#[ignore]` や feature flag は使わない）。既定の集合では自己テストのみ走る。既定の `--ignored` の段
+//! （非 root）は `platform-ci`（ubuntu）で実行する（#2016）。root の分岐とカーネル監査の opt-in の段は
+//! CI 外（#206・#2483）。実行条件は AGENTS.md「実機前提テスト」節を参照。
 //!
 //! # ESC-04〜ESC-06（TASK-42.3・#201・MS-2）
 //! - ESC-04（cgroup の `release_agent` 書き込み）・ESC-05（`/proc/sys`・`/proc/sysrq-trigger` 書き込み）は、
@@ -147,8 +147,8 @@
 //! - ESC-03: USER_NOTIF の listener の受け渡しと応答ループ・`@audit.log` の照合を ESC-01〜10 の 1 つのハーネスで扱っており、
 //!   exec 後の対応物は `supervisor_bin_real` のシナリオ E（本番の `SeccompNotifyHub` 経由）と `production_launcher` のシナリオ J
 //! - ESC-06: exec 後の対応物は `seccomp.rs` の `kill-<名前>` と `production_launcher` のシナリオ K
-//! - 移す条件（後続）: 本 suite の `platform-ci` への組み込み（ESC-06 の監査の解消〔#2236・#2237〕と Landlock ABI 6 以上の
-//!   runner の確保の後）と同時に、移行後の観測を CI で確かめる
+//! - 移す条件（後続）: 本 suite の `platform-ci` への組み込みは済んだ（#2016）が、移行は ESC-06 の監査の解消
+//!   （#2236・#2237）の結論待ちで、移行時に観測の同等性を CI で確かめる
 
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]

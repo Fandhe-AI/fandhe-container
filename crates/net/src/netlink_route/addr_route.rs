@@ -84,6 +84,7 @@ pub const NEW_ADDR_ROUTE_FLAGS: u16 = NLM_F_CREATE | NLM_F_EXCL;
 /// `struct ifaddrmsg` の長さ（バイト）。
 pub const IFADDRMSG_LEN: usize = 8;
 /// `struct rtmsg` の長さ（バイト）。
+/// （出典: `include/uapi/linux/rtnetlink.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const RTMSG_LEN: usize = 12;
 
 fn invalid(msg: &str) -> NetError {
@@ -850,4 +851,43 @@ mod tests {
     fn request_flags_are_create_excl() {
         assert_eq!(NEW_ADDR_ROUTE_FLAGS, 0x600);
     }
+}
+
+/// rtnetlink の address / route 系定数の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は
+/// `docs/design/ffi-libc-check.md`）。
+///
+/// 宣言と同じく Linux の試験ビルド限定。`libc` に無い `RTMSG_LEN`（`struct rtmsg`）は定義の横に出典を書いた。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use core::ffi::{c_int, c_uchar, c_ushort};
+    use core::mem::size_of;
+
+    const _: () = {
+        libc_const_eq!(RTM_NEWADDR, u16, u16);
+        libc_const_eq!(RTM_GETADDR, u16, u16);
+        libc_const_eq!(RTM_NEWROUTE, u16, u16);
+        libc_const_eq!(RTM_GETROUTE, u16, u16);
+        libc_const_eq!(AF_INET, u8, c_int);
+        libc_const_eq!(AF_INET6, u8, c_int);
+        libc_const_eq!(IFA_ADDRESS, u16, c_ushort);
+        libc_const_eq!(IFA_LOCAL, u16, c_ushort);
+        libc_const_eq!(IFA_F_NODAD, u8, u32);
+        libc_const_eq!(RT_SCOPE_UNIVERSE, u8, c_uchar);
+        libc_const_eq!(RT_SCOPE_SITE, u8, c_uchar);
+        libc_const_eq!(RT_SCOPE_LINK, u8, c_uchar);
+        libc_const_eq!(RT_SCOPE_HOST, u8, c_uchar);
+        libc_const_eq!(RTA_DST, u16, c_ushort);
+        libc_const_eq!(RTA_OIF, u16, c_ushort);
+        libc_const_eq!(RTA_GATEWAY, u16, c_ushort);
+        libc_const_eq!(RT_TABLE_MAIN, u8, c_uchar);
+        libc_const_eq!(RTPROT_STATIC, u8, c_uchar);
+        libc_const_eq!(RTN_UNICAST, u8, c_uchar);
+        libc_const_eq!(
+            super::NEW_ADDR_ROUTE_FLAGS,
+            u16,
+            libc::NLM_F_CREATE | libc::NLM_F_EXCL,
+            c_int
+        );
+        assert!(super::IFADDRMSG_LEN == size_of::<libc::ifaddrmsg>());
+    };
 }

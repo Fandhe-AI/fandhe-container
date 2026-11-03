@@ -10,8 +10,10 @@
 //! トランスポートの具象実装のうち、UDS のサーバー側（Linux / macOS）は
 //! TASK-13.2.1（#820）で実装済み（[`server::UdsServer`]・
 //! [`server::UdsConnection`]。accept・送受信のイベントは
-//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` と
-//! [`client::PipelineClient`] との本番結合・named pipe はまだない
+//! [`observe::ServerObserver`] へ通知する）。クライアント側の UDS `connect` は
+//! [`uds_client::UdsClientConnection`]（#3165。期限つき connect と接続先 uid の照合）で実装済み。
+//! [`client::PipelineClient`] の型つき API との本番の UDS 上での結合（#3162・#3165）は
+//! `tests/crash_safety.rs`・`tests/break_detection.rs`（#3167）と整合性スイート（`tests/consistency/uds_file_ops.rs`。#3166）で確かめている。named pipe はまだない
 //! （REPAIR-3。スタブの明示）。vsock は Linux（x86_64 / aarch64）のサーバー側・クライアント側を
 //! [`vsock`] が実装済み（#1119。macOS の Virtualization.framework・Windows の hvsock は
 //! 未実装で `Unimplemented`）。1 本の接続を送信側・受信側へ分けて並行に使う API は
@@ -53,14 +55,18 @@
 //! 衝突を検出する（[`fs_normalize::CaseCollisionSet`]・
 //! [`fs_normalize::check_case_collisions`]・TASK-19.1・IO-5・#99）。ファイル
 //! 作成経路への組み込みは [`guest_files::GuestFileCreator`]（TASK-19.2・#100。
-//! ワイヤー形式は変えないサーバー側 API で、ワイヤー上の作成要求は未実装〔REPAIR-3〕）
-//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。パス長 260 超の検証関数は
-//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102。作成経路への組み込みは未実装）。NFC / NFD の別表記も、名前は
-//! 書き換えず同じ衝突として検出する（TASK-21.1・#103）。
+//! ワイヤー形式は変えないサーバー側 API。ワイヤー上の作成要求は v2 の符号化と復号
+//! [`payload::encode_create`] 等が #3161 で、クライアント API
+//! 〔[`client::PipelineClient::create`]〕が #3162 で、サーバーの処理
+//! [`file_serve::serve_file_connection`] が #3163 で、FLUSH の多ファイル化と IO-10 の自動フラッシュが #3164 で実装済み）
+//! が担い、検査済みの [`writeback::AppendFileSink`] を返す。ゲスト相対パスの構文規則は
+//! [`guest_path::GuestPath`]（IO-5・REPAIR-2・#3159）に集約する。パス長 260 超の検証関数は
+//! [`fs_normalize::check_host_path_length`]（TASK-20.1・#102）で、作成経路へは #3160 で組み込み済み
+//! （Windows ホストはエラー、その他の OS は警告だけで作成を続ける。警告は [`file_serve::FileServeStats`] の件数、拒否理由は Nack と統計へ流す。#3163）。NFC / NFD の別表記も、名前は書き換えず同じ衝突として検出する（TASK-21.1・#103）。
 //!
 //! read / write 操作の計装連携点（[`instrument::IoOpRecorder`]。TASK-84.5・REPAIR-4）は
-//! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は上位 crate の
-//! アダプタが担う。write 経路の実計装は TASK-84.7 で組み込み済みで、入口は
+//! core を参照しない io 内のトレイトで、core の `OpRecorder` への接続は
+//! `docs/architecture.md` の「計装アダプタの配置」の原則に従い、io の操作を本番で呼ぶ crate のアダプタが担う。write 経路の実計装は TASK-84.7 で組み込み済みで、入口は
 //! [`writeback::serve_connection_with_recorder`] / [`settings::BoundConnection::serve_with_recorder`]
 //! （既存の `serve_*` は計装しない版）。read は現状 io にファイル読み出し経路がなく未計装（REPAIR-3）。
 //!
@@ -76,9 +82,12 @@ mod checksum;
 pub mod client;
 mod display_sanitize;
 pub mod error;
+pub mod file_serve;
 pub mod fs_normalize;
 pub mod guest_files;
+pub mod guest_path;
 pub mod instrument;
+mod nack_reason;
 pub mod observe;
 pub mod payload;
 pub mod protocol;
@@ -92,29 +101,40 @@ mod sys;
 #[path = "sys/windows.rs"]
 mod sys_windows;
 pub mod transport;
+pub mod uds_client;
 pub mod vsock;
 pub mod writeback;
 
 pub use barrier::{
     AckReceipt, DEFAULT_UNFLUSHED_MAX_BYTES, DEFAULT_UNFLUSHED_MAX_FRAMES, FlushAck, FlushBarrier,
     MAX_UNFLUSHED_MAX_BYTES, MAX_UNFLUSHED_MAX_FRAMES, MaxConcurrentPersist, PersistSupport,
-    UnflushedBacklog, UnflushedLimit, WriteAck, max_concurrent_persist, persist_support,
-    set_max_concurrent_persist,
+    RejectedRequest, UnflushedBacklog, UnflushedLimit, WriteAck, max_concurrent_persist,
+    persist_support, set_max_concurrent_persist,
 };
 pub use batch::{
     Batch, BatchBuffer, BatchConfig, BatchTrigger, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, PushOutcome,
 };
 pub use client::{
-    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, InFlightLimit, InFlightRequest,
+    AckMetrics, AckOutcome, DEFAULT_IN_FLIGHT_LIMIT, FileHandle, InFlightLimit, InFlightRequest,
     LATENCY_HISTOGRAM_BUCKETS, LatencyStats, MAX_IN_FLIGHT_LIMIT, PipelineClient, RequestId,
     SendMetrics, SendOutcome, SendQueue,
 };
 pub use error::{IoError, IoErrorCode, MAX_IO_ERROR_MESSAGE_BYTES};
+pub use file_serve::{
+    DEFAULT_MAX_OPEN_FILES, DEFAULT_MAX_RETAINED_DIRTY_FILES, FileServeLimits, FileServeReport,
+    FileServeStats, MAX_MAX_OPEN_FILES, MAX_MAX_RETAINED_DIRTY_FILES, MaxOpenFiles,
+    MaxRetainedDirtyFiles, NackReasonCounts, serve_file_connection,
+    serve_file_connection_with_limit, serve_file_connection_with_recorder,
+};
 pub use fs_normalize::{
     CaseCollisionSet, HostPathLength, MAX_COLLISION_MESSAGE_PATH_CHARS, MAX_HOST_PATH_CHARS,
     check_case_collisions, check_host_path_length, measure_host_path_length,
 };
-pub use guest_files::{GuestFileCreator, MAX_GUEST_PATH_BYTES, MAX_TRACKED_GUEST_PATHS};
+pub use guest_files::{GuestFileCreator, MAX_TRACKED_GUEST_PATHS};
+pub use guest_path::{
+    GuestPath, GuestPathError, MAX_GUEST_NAME_BYTES, MAX_GUEST_PATH_BYTES,
+    MAX_GUEST_PATH_COMPONENTS,
+};
 pub use instrument::{
     IoOpKind, IoOpOutcome, IoOpRecorder, IoOpSample, IoOpTimer, NoopIoOpRecorder, record_io_op,
 };
@@ -126,15 +146,21 @@ pub use observe::{
     SendObserver, ServerEvent, ServerObserver, ServerOp, ServerOutcome,
 };
 pub use payload::{
-    ACK_PAYLOAD_LEN, AckEnvelope, MAX_WRITE_BODY_LEN, REQUEST_ID_WIRE_LEN, RequestEnvelope,
-    WireRequestId, decode_ack, decode_request, encode_ack, encode_request,
+    ACK_PAYLOAD_LEN, AckEnvelope, CLOSE_PAYLOAD_LEN, CREATE_FIXED_LEN, CloseEnvelope,
+    CreateEnvelope, FILE_HANDLE_WIRE_LEN, MAX_CREATE_PAYLOAD_LEN, MAX_WRITE_BODY_LEN,
+    MAX_WRITE_FILE_BODY_LEN, NACK_PAYLOAD_LEN, NackCode, NackEnvelope, NackReason,
+    REQUEST_ID_WIRE_LEN, RequestEnvelope, UnknownNackReason, WRITE_FILE_FIXED_LEN, WireRequestId,
+    WriteFileEnvelope, decode_ack, decode_close, decode_create, decode_nack, decode_request,
+    decode_write_file, encode_ack, encode_close, encode_create, encode_nack, encode_request,
+    encode_write_file,
 };
 pub use protocol::{
     CHECKSUM_LEN, FRAME_HEADER_LEN, Frame, FrameChecksum, FrameHeader, FrameKind, MAX_FRAME_LEN,
     MAX_PAYLOAD_LEN, PROTOCOL_VERSION, PayloadLen,
 };
 pub use recv_limits::{
-    AdmittedHeader, MAX_CONTROL_PAYLOAD_LEN, MAX_RECV_PENDING_FRAMES, ReceiveLimits,
+    AdmittedHeader, MAX_CLIENT_RESPONSE_PAYLOAD_LEN, MAX_CONTROL_PAYLOAD_LEN,
+    MAX_RECV_PENDING_FRAMES, ReceiveLimits,
 };
 pub use server::{UdsConnection, UdsRecvHalf, UdsSendHalf, UdsServer};
 pub use settings::{
@@ -147,6 +173,7 @@ pub use transport::{
     FrameReceiver, FrameSender, FrameTransport, IoTimeout, MAX_IO_TIMEOUT, SplitTransport,
     WireFrame,
 };
+pub use uds_client::{UdsClientConnection, UdsServerPolicy};
 pub use vsock::{
     VsockAddr, VsockConnection, VsockPeerPolicy, VsockRecvHalf, VsockSendHalf, VsockServer,
 };
@@ -155,3 +182,13 @@ pub use writeback::{
     WritebackStats, WritebackTimeouts, serve_connection, serve_connection_with_limit,
     serve_connection_with_recorder,
 };
+
+// pid だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3375）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;
+
+// 試験用の一時ファイルを先行削除・上書きなしで排他作成する補助（REPAIR-12・#3479）。
+#[cfg(test)]
+mod test_temp_file;

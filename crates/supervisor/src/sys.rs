@@ -4,7 +4,7 @@
 //!
 //! OS ごとの子モジュールへ振り分け、公開は `pub(crate)` の安全な関数だけにする（`unsafe fn` を外へ出さない）。
 //! - `windows`: ローテーション sink のロックファイル同一性照合（`logs::rotating`。SUP-7・TASK-164 追補・#1470）
-//! - `linux`: 権限昇格の縮退に使う capability / credential の syscall ラッパー
+//! - `linux`: 権限昇格の縮退に使う capability / credential の syscall ラッパー（`syscall(2)` 系は LP64 の x86_64・aarch64 に限る。#3100）
 //!   （`privilege::elevate`。SUP-14・TASK-171.1.3・#1475。方式は #1454 のオーナー判断 2026-10-10）。特権ランチャー
 //!   （`launcher`。#1719）向けに、検証済み fd の `execveat`・継承 fd の整理（`close_range`）・fd 開閉の確認・
 //!   `PR_SET_DUMPABLE`・セッションの切り離し（`setsid`。#537）も持つ。制御チャネル（`control`。SUP-1・SEC-1・#2058）向けに、接続相手の資格情報の取得

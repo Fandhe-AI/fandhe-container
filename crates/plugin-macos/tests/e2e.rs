@@ -13,10 +13,13 @@
 //! - 層 B（`#[ignore]`・macOS のみ）: 実バイナリを spawn し、実 VM を plugin 経由で起動・停止する。
 //!   必要環境と実行コマンドは `AGENTS.md`「実機前提テスト」節。
 //!
-//! 待ちはすべて期限つきで、裸の `join()` は使わない（REPAIR-5）。暫定ワイヤー契約（型つき本体は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕 待ち）:
+//! 待ちはすべて期限つきで、裸の `join()` は使わない（REPAIR-5）。暫定ワイヤー契約（型つき本体は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕 待ち）:
 //! create `["create", id, kernel, initrd|"", cmdline, console_log|"", (tag, host_dir, "ro"|"rw", guest_mount|"")*]` → `["created"]`、
 //! start → `["running"]`、stop → `["stopped"]`、ping → `["pong"]`。
 #![cfg(unix)]
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -614,7 +617,7 @@ mod real_vm {
     impl Drop for Child {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            crate::reap::reap_on_drop(&mut self.0);
         }
     }
 

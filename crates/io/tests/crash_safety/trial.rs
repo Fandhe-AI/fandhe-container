@@ -8,7 +8,7 @@
 //! codex P1 指摘を受けて採った方式に揃えるため（IO-3）。
 //!
 //! さらに #95（TASK-18.2）で、kill 後にディスク上の `data.bin` を読んだレコード列を期待値
-//! （seq 0..n）と照合する純粋関数（[`check_disk_records`]）と、有効試行の損失集計
+//! （seq 0..n）と照合する純粋関数（`disk_check::check_disk_records`）と、有効試行の損失集計
 //! （[`loss_summary`]）を追加した。
 //!
 //! 呼び出し元: `crash_safety.rs` の `unix` モジュール（実プロセスを使う 1 試行の実行と、
@@ -20,6 +20,8 @@
 //! 判断は TASK-18 の人間担当であり、ここでは扱わない（REPAIR-3）。
 
 use fandhe_container_io::IoErrorCode;
+
+use crate::disk_check::DiskCheck;
 
 /// 損失集計に必要な有効試行数の目標（IO-3: 最低 10 回）。
 pub const TARGET_VALID_TRIALS: usize = 10;
@@ -60,39 +62,6 @@ pub struct TrialObservation {
     pub disk: Option<DiskObservation>,
 }
 
-/// `data.bin` の 1 レコードのバイト長（Write の body は seq の u64 LE。`drive_client` 参照）。
-pub const RECORD_LEN: usize = 8;
-
-/// ディスク上のレコード列と期待値（seq 0..expected）の照合結果（IO-3・TASK-18.2）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiskCheck {
-    /// 期待した件数（ACK 目標数）。
-    pub expected: u64,
-    /// ディスク上にあった完全レコードの seq（ファイル順）。
-    pub found: Vec<u64>,
-    /// 期待集合にあるのにディスクに無かった seq（昇順）。損失件数はこの長さ。
-    pub missing: Vec<u64>,
-    /// 期待集合の範囲外の値、または重複して現れた seq（ファイル順）。
-    pub unexpected: Vec<u64>,
-    /// 末尾の `RECORD_LEN` に満たない半端なバイト数。
-    pub trailing_partial_bytes: usize,
-}
-
-impl DiskCheck {
-    /// 損失件数（ACK 済みなのにディスクに無い件数）。
-    pub fn lost(&self) -> u64 {
-        u64::try_from(self.missing.len()).unwrap_or(u64::MAX)
-    }
-
-    /// 0..expected がこの順にちょうど並び、想定外も半端バイトも無い。
-    pub fn is_exact(&self) -> bool {
-        self.missing.is_empty()
-            && self.unexpected.is_empty()
-            && self.trailing_partial_bytes == 0
-            && self.found.iter().copied().eq(0..self.expected)
-    }
-}
-
 /// ディスク照合の結果。読めなかった場合も試行の記録に残す（黙って損失 0 扱いにしない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskObservation {
@@ -112,28 +81,6 @@ pub enum DiskObservation {
         len: u64,
         cap: u64,
     },
-}
-
-/// `data.bin` の内容を seq 0..expected と照合する。外部入力扱いのため添字を使わない。
-pub fn check_disk_records(bytes: &[u8], expected: u64) -> DiskCheck {
-    let (chunks, remainder) = bytes.as_chunks::<RECORD_LEN>();
-    let trailing_partial_bytes = remainder.len();
-    let found: Vec<u64> = chunks.iter().map(|c| u64::from_le_bytes(*c)).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut unexpected = Vec::new();
-    for &seq in &found {
-        if seq >= expected || !seen.insert(seq) {
-            unexpected.push(seq);
-        }
-    }
-    let missing = (0..expected).filter(|s| !seen.contains(s)).collect();
-    DiskCheck {
-        expected,
-        found,
-        missing,
-        unexpected,
-        trailing_partial_bytes,
-    }
 }
 
 /// 無効試行の理由（機械可読）。
@@ -329,6 +276,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_check::check_disk_records;
 
     const KILLED: ServerExit = ServerExit {
         code: None,

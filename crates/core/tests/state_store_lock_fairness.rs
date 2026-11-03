@@ -3,7 +3,7 @@
 //!
 //! 連続側（子プロセス。CLI が間を空けず操作し続ける役）が自分の ID の `update` を sleep なしで回し続け、
 //! 待ち側（親。supervisor の役）が別の ID の `update` を一定間隔で行う。待ち側の各操作の所要時間と
-//! `TIMEOUT` 件数を測り、`--nocapture` で読める形で stderr に出す。判定は百分位ではなく緩い上限
+//! `TIMEOUT` 件数を測り、`--no-capture` で読める形で stderr に出す。判定は百分位ではなく緩い上限
 //! （全操作成功・最大待ちが `STATE_LOCK_TIMEOUT` の半分未満）に留め、間欠失敗を避ける（#2214 の轍）。
 //!
 //! 別プロセスはこのテストバイナリ自身を `--exact` で再実行して用意する（追加依存なし）。子の待機には
@@ -11,6 +11,13 @@
 //! `FileStateStore` は Linux 限定のため、全体を Linux 限定にする（他 OS の `open` は `Unimplemented`。
 //! `state_store` のモジュール doc「対応プラットフォーム」）。root 不要で既定のテスト集合で動く。
 //! 計測結果は `docs/design/measurements/state-lock-contention.md` に記録する。
+
+#[path = "support/reap.rs"]
+mod reap;
+
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -104,13 +111,11 @@ mod linux {
     /// （`TIMEOUT` 0 件）、最大待ちが `STATE_LOCK_TIMEOUT` の半分未満に収まる。連続側も進む。
     #[test]
     fn sup1_repair5_2229_tight_loop_writer_does_not_starve_other_process() {
-        let dir = std::env::temp_dir().join(format!("fandhe-lock-fair-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir`（0700）を使う。状態ルートはその子 `state`
+        // （親は共有 flock を持つため親を渡さない）。#3434・REPAIR-12。
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-lock-fair", Duration::from_secs(10));
+        let dir = scratch.path().to_path_buf();
         let root = dir.join("state");
         fs::create_dir(&root).unwrap();
         {
@@ -129,7 +134,7 @@ mod linux {
         let out = fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+            .args(["--exact", CHILD_TEST, "--test-threads=1", "--no-capture"])
             .env(ROOT_ENV, &root)
             .env(GO_ENV, &go)
             .env(STOP_ENV, &stop)
@@ -164,8 +169,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                 let mut buf = String::new();
                 let _ = fs::File::open(&log)
                     .unwrap()
@@ -195,7 +199,6 @@ mod linux {
             pct(50),
             pct(99)
         );
-        let _ = fs::remove_dir_all(&dir);
 
         assert!(
             other_failures.is_empty(),

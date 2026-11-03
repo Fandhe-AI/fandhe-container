@@ -12,13 +12,24 @@
 # `--mode docker` / `--mode report` として追加した（下記「モード」）。
 #
 # 現状の制約（REPAIR-3: 実装済みを装わない）:
-#   - CLI の fandhe-container は提供済みで create / start / stop / delete / list / logs を持つ。
-#     start は supervisor を user scope で起動し `FCSUP1 OK` を受けて復帰する（#1718・#2122）。
-#     本番 ProcessLauncher（#1715）とファイルベース StateStore（TASK-31）も提供済み。
-#   - 本スクリプトの契約が使う `state`・`kill` は CLI にまだ無く（#1903・#1902）、stop も未結線
-#     （#2059）。このため `--runtime <fandhe-container>` での own の実測は、ランタイム呼び出し部
-#     （rt_create / rt_start / rt_delete / rt_kill / rt_state / rt_is_not_found の 6 関数）を
-#     差し替える #1890 の後になる。
+#   - CLI の fandhe-container は create / start / stop / kill / delete / list / logs / inspect / state を
+#     持つ（#1903・#1902・#2059 は提供済み）。start は supervisor を user scope で起動し
+#     `FCSUP1 OK` を受けて復帰する（#1718・#2122）。本番 ProcessLauncher（#1715）とファイルベース
+#     StateStore（TASK-31）も提供済み。ランタイム呼び出し部（rt_create / rt_start / rt_delete /
+#     rt_kill / rt_state / rt_is_not_found の 6 関数）は CLI の契約（`state` の 1 行 JSON・不存在は
+#     stderr の `NOT_FOUND` で終了コード 3・実行中でない kill は `FAILED_PRECONDITION` で 5）に
+#     照合済み（#3123・CLI-1）。
+#   - 状態ルートは毎回作る専用ディレクトリ（/tmp/fcsl.*・0700）を全呼び出しの `--root` に渡し、
+#     利用者の既定の状態ルートに計測のコンテナを残さない。/tmp に固定するのは制御ソケット
+#     （<root>/<id>/supervisor.sock.tmp-<pid>）を sun_path の 108 バイトに収めるため。後始末で
+#     残存があれば消さずに残し、パスを stderr に出す。
+#   - start は rootless のみ（rootful は UNIMPLEMENTED）。delete は委譲スコープの外から実行すると
+#     cgroup を消せず exit 4 になるため、`systemd-run --user --scope -p Delegate=yes` の中で
+#     本スクリプトを実行する（手順の全文は AGENTS.md「実機前提テスト」の `startup_latency.sh`
+#     の項目。要点は下記「実機での実行手順」）。delete は状態を消した後にログのロックを最大でおよそ
+#     20 秒待つため、--timeout で打ち切られても NOT_FOUND と state で削除済みと確定する。
+#   - CLI を経由する誤差は下記「CLI 経由の誤差（#3124）」を参照。method は
+#     "cli-create-to-exec-observed"（CLI 経由であることを値で示す）。
 #   - create から `FCSUP1 OK` までの p95 回帰ベンチは別に benches/benches/startup_latency.rs
 #     （TASK-190・docs/design/startup-latency-bench.md）がある。区間は CORE-10 の中央値
 #     （create からプロセス実行開始まで）と異なる。
@@ -34,6 +45,7 @@
 # 実機前提のため `make ci` には含めない（.claude/rules/ci.md「実機前提テスト」）。
 #
 # 計測対象の起動契約（opencontainers/runtime-tools の command-line-interface・runc 互換）:
+#   （oci モードは全呼び出しの先頭に専用の状態ルートの `--root <state_root>` を付ける）
 #   <runtime> state <id>                       # create 前の ID 未使用確認（計測対象外）と実行開始の観測
 #   <runtime> create --bundle <bundle> <id>    # 計測対象
 #   <runtime> start <id>                       # 計測対象
@@ -44,10 +56,71 @@
 #   ないため、start 復帰後に state を照会し、status が running（プログラム実行済み・未終了）
 #   または stopped（終了済み）を初めて返した時点を実行開始の観測点とする。計測値 total は
 #   create 呼び出し直前からその state 復帰直後まで（実行開始時刻の上側推定。内訳として
-#   create・start・観測待ち observe と state 照会回数を記録する）。
+#   create・start・観測待ち observe と state 照会回数を記録する）。ただし own 実装の観測点は
+#   厳密には「Running の記録の観測」である。supervisor は Running を記録してから `FCSUP1 OK` を
+#   報告するが、ワークロードの execve の完了は保証しない（launch 経路に exec 成功の通知が無い）。
+#   execve は観測点より後にずれ込み得る（docs/design/startup-latency-bench.md
+#   「CORE-10 の『プロセス実行開始』との差」・REPAIR-3）。
+#
+# 期限の関係（#3203）:
+#   --timeout（既定 10 秒・1〜120）は start 1 呼び出しの上限でもある。本番 CLI の start の受信期限は
+#   58.9 秒（CLI_START_RECEIVE_DEADLINE_MS）で、既定の 10 秒はそれより短い。start が遅いと CLI が構造化
+#   TIMEOUT を返す前に本スクリプトが打ち切る（runtime-start-failed・exit 1。この場合は stderr に hint を出す）。
+#   CLI 自身の TIMEOUT を観測したいときは --timeout 60 以上を渡す。健全なホストの start は 1 秒未満なので
+#   既定は変えない。後始末の最悪時間は 2 x --timeout のまま有界（REPAIR-5）。
+#
+# --runtime の検査（#3203・PLUG-11 に準ずる）:
+#   symlink は解決し、解決先が通常ファイル・実行可能・所有者が実行ユーザーか root・group / other 書き込み不可で、
+#   解決先の祖先が --output と同じ基準（所有者が自分か root・g/o 書き込み不可。sticky は可）であること。
+#   以降は解決後のパスを exec する。PLUG-11 と揃えない点: 祖先の sticky ディレクトリを可にする。理由は
+#   (a) 本スクリプトは計測ハーネスで plugin の登録ではない、(b) 祖先は全て自分か root の所有を要求するため
+#   sticky な /tmp 配下でも他人は自分のエントリを rename / unlink できない、(c) --output の既存の基準と揃い
+#   自己テストの mktemp -d（/tmp 配下）が使える。残余: bash は fd で exec できないので plugin_trust のような
+#   TOCTOU 耐性は無い（検査は開始時の前提条件で、残余は祖先の検査で抑える。--output と同じ議論）。
+#   所有者が他 uid の場面は root の無い自己テストでは照合できない。
+#
+# 実機での実行手順（#213 向け・#3125。全文は AGENTS.md。未検証: 実機での通しは人間が行う）:
+#   - 計測全体を `systemd-run --user --scope -p Delegate=yes -- bash scripts/bench/startup_latency.sh ...`
+#     で包み、リポジトリのルートから実行する（rootless・非 root。sudo は使わない）。
+#   - CLI（fandhe-container）と supervisor だけを利用者所有の専用ディレクトリへ置く（docs/setup/linux.md
+#     「rootless」）。fandhe-container-launcher を CLI の隣に置かない（置くと rootful のランチャー経路が
+#     選ばれる。#2442・SUP-14）。置き場所とその祖先は g/o 書き込み不可にする。rootless の supervisor は
+#     CLI が検証しない運用規則である（REPAIR-3）。
+#   - 結果ファイルは `make startup-latency ... OUTPUT=<新規ファイル>`（または本スクリプトを `--output` 付きで
+#     直接実行）で作る。make は実行コマンド行（絶対パス入り）を stdout に出すため、その stdout ではなく
+#     OUTPUT のファイルを report モードの入力にする。WARMUP・TIMEOUT も make で渡せる。
+#   - 終了後に /tmp/fcsl.*・user scope・/sys/fs/cgroup の fc-* の残骸が無いことを確かめる。
+#
+# CLI 経由の誤差（#3124・CORE-10。数値は書かない。実測と合否判定は #213・#230 で人間が行う）:
+#   oci モードは CLI を呼び出しごとに別プロセスで起動する（runc 等でも同じ）。区間内の呼び出しは
+#   create・start・state × state_polls の 2 + state_polls 回で、docker モード（run 1 回）より多い。
+#   - create_us: CLI プロセス 1 回分（timeout と収集の fork・exec と動的リンク・状態ストアの
+#     open）＋ create 本体。ハーネス上は create 本体と分離できない。
+#   - start_us: 次の 2 つを含む。製品の起動経路そのもの（誤差ではない）は、user scope の取得
+#     （systemd-run）・supervisor の手順（launcher・Landlock・Running の記録）・`FCSUP1 OK` の報告で、
+#     benches/benches/startup_latency.rs（TASK-190）の区間とほぼ同じ。CLI 経由の上乗せは CLI
+#     プロセス 1 回分（起動・状態ストアの open・存在確認の読み取り）と OK 受信後の終了。同じホストで
+#     本スクリプトの start_us と TASK-190 の区間を並べた差が上乗せの目安になる。
+#   - observe_us: start は Running の記録の後に OK を返すため、本番 CLI の通常経路では start 復帰直後の
+#     最初の state が running / stopped を返し state_polls=1 になる。このとき observe_us は CLI の
+#     state 1 往復（プロセス起動＋状態ストアの open と読み取り＋ JSON 出力）の所要そのもので、
+#     samples_us[].observe_us（state_polls=1 の回）から直接読める。上限は
+#     observe_us <= n x (state 1 回の所要) + (n-1) x (STATE_POLL_INTERVAL + sleep の起動)
+#     （n = state_polls）。ポーリング間隔が値に入るのは start 成功後も created が返る例外時だけで、
+#     観測期限 --timeout 秒で打ち切る（REPAIR-5）。
+#   - CLI 1 回分の固定費の目安は上記 observe_us（n=1）。上乗せの合計は目安として
+#     CLI 1 回分 x (2 + state_polls) だが、create・start の CLI 側の仕事は state より多いため
+#     厳密な上限ではない。
+#   - ハーネス側の上乗せ: 呼び出しごとの timeout と収集プロセス 1〜2 個の fork、時刻取得
+#     （wall_us・mono_us）のサブシェル。呼び出し回数分だけ oci の方が多く払う。
+#   - 偏りの向き: 上記の上乗せはすべて値を大きくする（own に不利）。一方、観測点が Running の記録の
+#     観測であり execve は後にずれ込み得るため、execve までを含む保証はない（own に有利になり得る）。
+#     両者は相殺せず別々に扱う。
+#   method の変更: 旧値 "create-to-exec-observed" は report モードで受けない（fail-closed。
+#   旧値の実測結果はまだ無い）。
 #
 # モード（--mode。既定 oci。TASK-46.2・CORE-10）:
-#   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "create-to-exec-observed"。
+#   oci:    上記の own（OCI Runtime CLI 契約）計測。method = "cli-create-to-exec-observed"（CLI 経由）。
 #   docker: `docker run --rm --pull never ... --entrypoint true <image>` 全体の壁時計時間を計測する
 #           （イメージの ENTRYPOINT は `--entrypoint true` で明示的に上書きし、固定ワークロードを保つ）
 #           （spec の Docker ベースライン 0.290〜0.298 秒と同じ手法）。method = "docker-run-rm-total"。
@@ -76,7 +149,7 @@
 #   1: ランタイムの create / start / state（docker モードは image inspect / run）の失敗・タイムアウト、実行開始を観測できない、
 #      ID が既に使用中、計測中の時計の変更を検出した
 #   2: 入力エラー（引数・bundle・output の検証失敗）
-#   3: 前提ツール欠如（Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・mktemp・sleep 等）
+#   3: 前提ツール欠如（状態ルートのパスが制御ソケットの長さの上限を超える場合を含む。Linux の /proc/uptime・bash 5 以上・jq・GNU timeout・GNU dd〔oflag=nofollow,nonblock〕・GNU ln〔-T〕・GNU readlink〔-f〕・mktemp・sleep 等）
 #   4: 後始末失敗（作成済みコンテナを delete できない〔docker モードは cidfile の ID で rm -f できない、
 #      ラベル一覧を取得できない・所有を証明できないコンテナが残っている〕、create 失敗後に未作成を確定できない等。
 #      残存の可能性がある ID を stderr に出す。最優先）
@@ -130,6 +203,8 @@ readonly LOG_REAP_WAIT_US=500000
 # start 復帰後に state で実行開始（running / stopped）を観測する照会の間隔（秒）。
 # 打ち切りは --timeout 秒の観測期限だけで判定し（REPAIR-5）、照会回数は間隔により
 # 期限 / 間隔 程度に収まる。観測点の上側推定は最大でこの間隔＋state 1 回分だけ遅れる。
+# 本番 CLI の通常経路では start 復帰時点で Running が記録済みのため初回の state で観測でき、
+# この間隔は値に入らない（入るのは start 成功後も created が返る例外時だけ。#3124）。
 readonly STATE_POLL_INTERVAL=0.01
 readonly STATE_POLL_INTERVAL_US=10000
 # kill 後に delete を再試行する最大回数と間隔（秒）。時間上限は --timeout 秒。
@@ -145,6 +220,15 @@ readonly MIN_CALL_BUDGET_US=100000
 readonly CLOCK_TOLERANCE_US=30000
 # --output の祖先ディレクトリ検査でたどる段数の上限。
 readonly PATH_DEPTH_MAX=256
+# --timeout の上限（秒）。本番 CLI の start の受信期限（下の CLI_START_RECEIVE_DEADLINE_MS = 58.9 秒）に
+# CLI の起動・事前検査・終了の余裕と KILL_AFTER_SECS を足してもなお収まる値にして、CLI 自身の構造化
+# TIMEOUT を観測できるようにする（旧上限 60 秒は差が 1.1 秒しかなかった。#3203）。後始末の最悪時間は
+# 2 x --timeout のまま有界（REPAIR-5）。
+readonly TIMEOUT_MAX_SECS=120
+# 本番 CLI の start の受信期限（ミリ秒）。出典は crates/supervisor/src/start_client.rs の
+# production_deadline()。値が変わったらここも直す（Rust ソースとの機械照合は結合が脆いので置かない）。
+# --timeout がこれより短いと、start が遅いとき CLI の TIMEOUT より先に本スクリプトが打ち切る。
+readonly CLI_START_RECEIVE_DEADLINE_MS=58900
 # report モードで読む入力 JSON の最大サイズ（バイト。jq に渡す前に検査する）。
 readonly RESULT_MAX_BYTES=1048576
 
@@ -160,7 +244,7 @@ usage: startup_latency.sh [--mode oci|docker|report] [options]
   --target <name>      name of the measured runtime recorded as "target" (required except report mode, e.g. own, docker)
   --iterations <1-1000> measured iterations (default: 10)
   --warmup <0-100>     warmup iterations excluded from statistics (default: 1)
-  --timeout <1-60>     per runtime command timeout in seconds (default: 10)
+  --timeout <1-120>    per runtime command timeout in seconds (default: 10)
   --label <name>       label recorded in the output (default: same as --target)
   --output <file>      also write the JSON result to a new file (must not exist)
   -h, --help           show this help
@@ -333,7 +417,7 @@ if [ "$mode" = "report" ]; then
 fi
 check_int iterations "$iterations" 1 1000
 check_int warmup "$warmup" 0 100
-check_int timeout "$timeout_secs" 1 60
+check_int timeout "$timeout_secs" 1 "$TIMEOUT_MAX_SECS"
 # ラベルの既定値は計測対象名（target と label が食い違って取り違えないように）。
 if [ -z "$label" ]; then
   label="$target"
@@ -382,6 +466,20 @@ output_path_is_safe() {
   return 0
 }
 
+# --runtime の実体が信頼できるか（#3203・CORE-10・PLUG-11 の基準に準ずる）。symlink は解決して、
+# 解決先が通常ファイル・実行可能・所有者が実行ユーザーか root・group / other 書き込み不可であり、
+# その親から / までが output_path_is_safe を満たすこと。通れば解決後のパスを stdout に出す。
+runtime_is_trusted() {
+  local real uid
+  real="$(readlink -f -- "$1" 2>/dev/null)" || return 1
+  [ -n "$real" ] || return 1
+  uid="$(id -u)"
+  [ -n "$(find -P "$real" -maxdepth 0 -type f \( -user "$uid" -o -user 0 \) ! -perm /022 -print 2>/dev/null)" ] || return 1
+  [ -x "$real" ] || return 1
+  output_path_is_safe "$(dirname -- "$real")" || return 1
+  printf '%s\n' "$real"
+}
+
 if [ -n "$output" ]; then
   if [ -e "$output" ] || [ -L "$output" ]; then
     err "invalid-output" "--output must not already exist"
@@ -399,7 +497,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
   err "missing-prerequisite" "bash 5 or later is required (EPOCHREALTIME)"
   exit "$EXIT_PREREQ"
 fi
-for tool in jq timeout mktemp tail rm sleep dd ln chmod find id wc; do
+for tool in jq timeout mktemp tail rm sleep dd ln chmod find id wc readlink; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     err "missing-prerequisite" "required tool not found: $tool"
     exit "$EXIT_PREREQ"
@@ -416,6 +514,15 @@ if [ -n "$output" ] && ! output_path_is_safe "$output_dir"; then
   exit "$EXIT_INPUT"
 fi
 
+# 検査に通ったら、以降は解決後のパスを exec する（検査後の symlink の差し替えを受けない）。
+# CLI は自身の実体のパスから supervisor を探すため、解決後のパスで exec しても振る舞いは変わらない。
+if [ "$mode" != "report" ]; then
+  if ! runtime="$(runtime_is_trusted "$runtime")"; then
+    err "invalid-runtime" "--runtime must resolve (following symlinks) to an executable regular file owned by you or root and not writable by group/other, and every directory above it must be owned by you or root and not writable by others (unless sticky)"
+    exit "$EXIT_INPUT"
+  fi
+fi
+
 tmpdir="$(mktemp -d)"
 # コンテナ ID の実行固有部。PID だけでは過去の実行で残ったコンテナと再利用時に衝突し、
 # create 失敗時の後始末が無関係な既存コンテナを delete / kill し得るため、mktemp が返す
@@ -427,6 +534,26 @@ if [ -z "$run_tag" ]; then
   rm -rf -- "$tmpdir"
   err "missing-prerequisite" "could not derive a unique run id from mktemp"
   exit "$EXIT_PREREQ"
+fi
+# oci モードの専用の状態ルート（CLI の --root。mktemp -d で排他作成・0700・所有者は自分）。
+# TMPDIR を使わず /tmp に固定するのは、制御ソケットのパス
+# <root>/<id>/supervisor.sock.tmp-<pid> を sun_path（108 バイト、NUL 込みで 107）に確実に収めるため。
+# tmpdir とは別にするのは、残存時に手動確認できるよう状態ルートだけを残せるようにするため。
+state_root=""
+if [ "$mode" = "oci" ]; then
+  if ! state_root="$(mktemp -d -p /tmp fcsl.XXXXXXXXXX)"; then
+    rm -rf -- "$tmpdir"
+    err "missing-prerequisite" "could not create the state root under /tmp"
+    exit "$EXIT_PREREQ"
+  fi
+  id_prefix="fandhe-startup-$run_tag-$$-"
+  # root + '/' + id + '/' + "supervisor.sock.tmp-" + pid の最大 7 桁
+  sock_len=$((${#state_root} + 1 + ${#id_prefix} + ${#warmup} + ${#iterations} + 1 + 20 + 7))
+  if [ "$sock_len" -gt 107 ]; then
+    rm -rf -- "$tmpdir" "$state_root"
+    err "missing-prerequisite" "the control socket path under the state root could be $sock_len bytes, over the 107-byte sun_path limit"
+    exit "$EXIT_PREREQ"
+  fi
 fi
 seq_no=0
 # 現在の試行で後始末対象のコンテナ ID（1 試行につき 1 つ）と、削除できなかった ID の一覧。
@@ -578,8 +705,9 @@ flush_last_call() {
 # rt_deadline_us が設定されている間（実行開始の観測中・後始末中）は、TERM までの時間と KILL 猶予の合計が
 # 期限までの残り時間に収まるよう配分し、残りが MIN_CALL_BUDGET_US 未満なら呼ばずに
 # 124（timeout と同じ値）を返す。収集プロセスは cleanup が回収する（collector_pids）。
-# 計測区間への影響: 収集プロセスの fork は計時点の内側で行われ、oci・docker の両モードに
-# 一律に上乗せされる（process substitution の fork 1〜2 回分）。
+# 計測区間への影響: 収集プロセスの fork は計時点の内側で行われ、呼び出しごとに上乗せされる
+# （process substitution の fork 1〜2 回分）。区間内の呼び出しは oci が 2 + state_polls 回、
+# docker が 1 回なので、一律ではなく呼び出し回数の分だけ oci の方が多い（#3124）。
 run_rt() {
   local out="$1" errf="$2"
   shift 2
@@ -622,21 +750,25 @@ us_to_secs() {
   printf '%d.%06d' $(($1 / 1000000)) $(($1 % 1000000))
 }
 
-# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える。差し替えは #1890） ---
-rt_create() { run_rt "$1" "$1" create --bundle "$bundle" "$2"; }
-rt_start() { run_rt "$1" "$1" start "$2"; }
-rt_delete() { run_rt "$1" "$1" delete "$2"; }
-rt_kill() { run_rt "$1" "$1" kill "$2" KILL; }
+# --- ランタイム呼び出し部（CLI 契約が変わった場合はこの 6 関数のみ差し替える。CLI の契約〔#1903・#1902〕に照合済み。#3123） ---
+# グローバル --root（専用の状態ルート）はサブコマンドの前に置く（runc / crun と同じ位置）。
+rt_create() { run_rt "$1" "$1" --root "$state_root" create --bundle "$bundle" "$2"; }
+rt_start() { run_rt "$1" "$1" --root "$state_root" start "$2"; }
+rt_delete() { run_rt "$1" "$1" --root "$state_root" delete "$2"; }
+rt_kill() { run_rt "$1" "$1" --root "$state_root" kill "$2" KILL; }
 # state は stdout（OCI state JSON）と stderr を分けて受け取る。引数: <stdout> <stderr> <id>
-rt_state() { run_rt "$1" "$2" state "$3"; }
+rt_state() { run_rt "$1" "$2" --root "$state_root" state "$3"; }
 # state の stderr（引数のファイル）が「コンテナが存在しない」ことを明確に示すか。OCI の CLI
 # 契約には不存在専用の応答がないため、fandhe-container の CLI のエラー形式（ERR-1: stderr へ
 # 機械可読な code / message の構造化エラー。不存在は ERR-3 / ERR-5 と同じ NOT_FOUND）に
 # 合わせる。空行を除く全行が「code・message が文字列の JSON オブジェクト」で、code がすべて
 # NOT_FOUND（1 行以上）の場合だけ真にする。自由文・不正な JSON・code が文字列でない行・
 # 別の code が 1 行でも混ざれば判定不能として偽にする（runc 等の構造化エラーを持たない
-# ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。CLI の state の
-# 不存在応答（#1903）への照合は #1890 で行う。
+# ランタイムは常に偽＝不明扱い）。ERR-1 の構造化エラーは確定済み（TASK-95.2）。
+# CLI の state の不存在応答は `{"code":"NOT_FOUND","message":"container not found"}`・終了コード 3
+# （#1903・#3123 で照合）。ただし状態ルートの親が無いときも同じ NOT_FOUND（message が
+# "parent of the state root not found"）で終了コード 3 になり、これはコンテナの不存在を示さない
+# ため、その行が 1 行でもあれば偽にする（fail-closed）。
 rt_is_not_found() {
   jq -Rse '
     [split("\n")[] | select(length > 0)] as $lines
@@ -645,7 +777,8 @@ rt_is_not_found() {
         (try fromjson catch null) as $o
         | ($o | type) == "object"
           and ($o.code | type) == "string" and ($o.message | type) == "string"
-          and $o.code == "NOT_FOUND")' <"$1" >/dev/null 2>&1
+          and $o.code == "NOT_FOUND"
+          and $o.message != "parent of the state root not found")' <"$1" >/dev/null 2>&1
 }
 # ---------------------------------------------------------------------------
 
@@ -749,6 +882,8 @@ create_not_made() {
 #              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
+# 例外: created=1 の delete が NOT_FOUND のときの削除済み確認（delete_reported_not_found）も
+# 収集待ち（≦ --timeout）と state（収集待ち込みで ≦ 2 × --timeout）を 1 回だけ足す。
 # 例外: created=0 の照会（query_state）の収集待ちは期限で切り詰めないため、その経路の最悪時間は
 # state 呼び出し（≦ --timeout）＋収集待ち（≦ --timeout）の 2 × --timeout になる（有界。#2548・REPAIR-5）。
 finish_container() {
@@ -759,10 +894,29 @@ finish_container() {
   return "$status"
 }
 
+# created=1 の delete が NOT_FOUND を返した場合に、削除済みと確定できるか。CLI の delete は
+# 状態を消した後にログのロック解放を待つため（最大でおよそ 20 秒）、その間に期限で打ち切ると
+# 以後の delete はすべて NOT_FOUND になる。created=1 の ID は今回の create が作ったものなので、
+# delete の NOT_FOUND と state の不存在応答がそろえば削除済みとみなす。確認は 1 試行 1 回まで
+# （delete_gone_checked）で、最悪時間を有界に保つ（REPAIR-5）。引数: <delete のログ> <id> <delete の終了コード>
+delete_gone_checked=0
+delete_reported_not_found() {
+  [ "$delete_gone_checked" = "0" ] || return 1
+  is_runtime_error "$3" || return 1
+  flush_last_call $((timeout_secs * 1000000)) || return 1
+  ! log_truncated "$1" || return 1
+  ! log_incomplete "$1" || return 1
+  rt_is_not_found "$1" || return 1
+  delete_gone_checked=1
+  query_state "$2"
+  state_not_found
+}
+
 # finish_container の本体（rt_deadline_us が設定された状態で呼ばれる）。
 finish_container_within_deadline() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
+  delete_gone_checked=0
   if [ "$created" = "0" ]; then
     # 収集待ちは後始末の期限で切り詰めない（上限は --timeout 秒のまま。#2548・REPAIR-12）。
     # state が期限の大半を使っても、収集が上限内に終わるなら collector-timeout にしない。
@@ -774,14 +928,26 @@ finish_container_within_deadline() {
     leftover_ids+=("$id")
     return 1
   fi
-  if rt_delete "$log" "$id"; then
+  local del_rc=0
+  rt_delete "$log" "$id" || del_rc=$?
+  if [ "$del_rc" -eq 0 ]; then
+    return 0
+  fi
+  # 初回の delete が NOT_FOUND なら（直前の delete が状態を消した後に打ち切られた場合は起きない
+  # ため）削除済みの確認を 1 回だけ行う。確定できなければ従来どおり kill と再試行へ進む。
+  if delete_reported_not_found "$log" "$id" "$del_rc"; then
     return 0
   fi
   rt_kill "$log" "$id" || true
   local tries=0
   while [ "$tries" -lt "$DELETE_RETRY_MAX" ] && [ $((rt_deadline_us - $(mono_us))) -ge "$MIN_CALL_BUDGET_US" ]; do
     tries=$((tries + 1))
-    if rt_delete "$log" "$id"; then
+    del_rc=0
+    rt_delete "$log" "$id" || del_rc=$?
+    if [ "$del_rc" -eq 0 ]; then
+      return 0
+    fi
+    if delete_reported_not_found "$log" "$id" "$del_rc"; then
       return 0
     fi
     # 待機後に呼び出せる残り時間がなければ期限を越えて待たずに打ち切る。
@@ -1023,6 +1189,15 @@ cleanup() {
     echo "error: cleanup-failed: could not remove temporary directory" >&2
     final="$EXIT_CLEANUP"
   fi
+  if [ -n "$state_root" ]; then
+    if [ "${#leftover_ids[@]}" -gt 0 ]; then
+      # 残存の確認と手動回収に使えるよう状態ルートを消さずに残す。
+      echo "error: state root kept for manual inspection: $state_root (check with: <runtime> --root $state_root state <id>)" >&2
+    elif ! rm -rf -- "$state_root"; then
+      echo "error: cleanup-failed: could not remove the state root $state_root" >&2
+      final="$EXIT_CLEANUP"
+    fi
+  fi
   if [ "${#leftover_ids[@]}" -gt 0 ]; then
     echo "error: cleanup-failed: containers left behind: ${leftover_ids[*]}" >&2
     final="$EXIT_CLEANUP"
@@ -1051,6 +1226,7 @@ trap 'on_signal 129' HUP
 #       「ユーザー指定プログラムを実行済みで未終了」、stopped を「プロセスが終了済み」と
 #       定義する）。start の復帰はプロセスの実行開始を保証しないため、実行開始を state で
 #       観測する。t2 は state 呼び出しの復帰後に取るため、実行開始時刻の上側推定になる
+#       （own 実装では Running の記録の観測で、execve のずれ込みは別。冒頭の CLI 経由の誤差を参照）
 #       （state 1 回分の所要時間を含み、Docker 比では own に不利な側へ偏る）。
 measure_once() {
   local id="$1" t0 t1 ts t2 m0 m2 deadline wall_total mono_total diff
@@ -1085,9 +1261,14 @@ measure_once() {
   fi
   live_created=1
   t1="$(wall_us)"
-  if ! rt_start "$tmpdir/start-$seq_no.log" "$id"; then
+  start_rc=0
+  rt_start "$tmpdir/start-$seq_no.log" "$id" || start_rc=$?
+  if [ "$start_rc" -ne 0 ]; then
     err "runtime-start-failed" "start failed or timed out for $id"
     show_log "$tmpdir/start-$seq_no.log"
+    if [ "$start_rc" -eq 124 ] && [ $((timeout_secs * 1000)) -lt $((CLI_START_RECEIVE_DEADLINE_MS + 1000)) ]; then
+      echo "hint: start was cut off by --timeout ${timeout_secs}s, shorter than the CLI's own start receive deadline (58.9s); rerun with --timeout 60 or more to see the CLI's structured error" >&2
+    fi
     return 1
   fi
   ts="$(wall_us)"
@@ -1226,7 +1407,7 @@ load_result_file() {
   local opt="$1" f="$2" want="$3" size obj want_method
   # mode ごとの計測区間（method）は固定値で検証する。入力の自己申告で methods_differ を偽装させない。
   case "$want" in
-    oci) want_method="create-to-exec-observed" ;;
+    oci) want_method="cli-create-to-exec-observed" ;;
     docker) want_method="docker-run-rm-total" ;;
     *) err "invalid-result" "unsupported mode $want"; exit "$EXIT_INPUT" ;;
   esac
@@ -1306,7 +1487,7 @@ if [ "$mode" = "report" ]; then
 fi
 
 if [ "$mode" = "oci" ]; then
-  method="create-to-exec-observed"
+  method="cli-create-to-exec-observed"
 else
   method="docker-run-rm-total"
   # 計測区間外の事前確認。イメージが無ければ自動 pull せず（ネットワーク副作用・計測の歪み）

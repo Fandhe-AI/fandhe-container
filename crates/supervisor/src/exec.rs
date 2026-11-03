@@ -77,14 +77,23 @@
 //!   コンテナの所有者自身の場合に限り、参加前の消去は参加後へ回る（初期 user namespace で `CAP_SETGID` を持たないため。
 //!   core の `exec/reapply.rs`。#1462）。別の user namespace へ参加したときは、補助グループの後・capability 削減の
 //!   前に gid → uid を `process.user` の値へ揃えて読み戻す（rootless の exec。同じ user namespace では uid / gid を
-//!   変更しない。launch は `uid_map` の結果として既に root）
+//!   変更しない。launch は `uid_map` の結果として既に root）。`process.user` の非 root と `additionalGids` は
+//!   対象の写像と照合して受け（core の `exec_user_from_config`。写像の外は `InvalidArgument`。#2770）、指定した
+//!   補助グループを持たせた場合は結果が `applied`。`process.user` の非 root と `additionalGids` は
+//!   対象の写像と照合して受け（core の `exec_user_from_config`。写像の外は `InvalidArgument`。#2770）、指定した
+//!   補助グループを持たせた場合は結果が `applied`
 //! - **`execve` 前の失敗とコマンドの終了を区別する**（REPAIR-3・TASK-163 追補・#1460）: [`ExecOutcome`] の `exit` は
 //!   core の `ExecExit` で、`Command`（コマンドが起動して終了した）と `SetupFailed`（コマンドは起動していない。
 //!   子が `execve` より前の手順か `execve` 自体で失敗した）を分ける。子の終了コード 125 / 126 / 127 は実行された
 //!   コマンド自身も返し得るため、終了コードでは判定しない。子が close-on-exec の pipe で親へ知らせた内容で
 //!   判定する（core の `exec/exec_command.rs`）。分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・
 //!   `/dev/null` の差し替え）は理由コードを持ち、呼び出し側が違反として記録できる（SEC-4。監査ログへの保存は
-//!   下記「未実装」）
+//!   下記「未実装」）。`SetupFailed` は子が報告した失敗の分類 `code`（ERR-1 コード。`execve` の後の失敗は errno を
+//!   launch と同じ写像で分類したもの）も持つ。違反でない失敗（`violation: None`）は監査に記録しない（#2763）。
+//!   子が失敗した手順の段 `step`（core の `ExecChildStep`。固定語彙）も持ち、worker の結果行では core の語彙で
+//!   引き直す（未知の段は壊れた行）。段が分からない場合は `None`。メッセージは子から運ばず、段から固定の英文を引く
+//!   （`ExecChildStep::message`）。fork の前の失敗（worker 側の `setns`・制限の再適用など）は `err` 行の
+//!   `TraitError`（`exec stage {:?}: <message>`）で届き、`SetupFailed` には載らない（#2822）
 //! - **rlimit は launch 時の記録を適用し、記録が無ければ拒否する**（SUP-12・SUP-6・TASK-169 追補・#1467・#1455）:
 //!   launch は `--ulimit` の指定値に、指定の無い種別は launch 時点の実効値を足した全 16 種を `state.json` へ記録する
 //!   （`StateRecord::rlimits`。トレイト契約 11。作る関数は core の `launch_rlimits_from_self`）。[`identify_pid1`] 系は
@@ -164,10 +173,11 @@
 //!   記録する。worker の制限の準備で生じる rootfs の拒否（種別 `rootfs_pivot` の `rootfs_is_host_root`。worker 自身の
 //!   `/` が bundle の rootfs と同じディレクトリ。SEC-1）も、core の `IsolationViolation::mount_audit_event` と同じ写像で
 //!   層 `mount` のレコード（パスなし・理由コード `rootfs_is_host_root` つき。#1701）として
-//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 13 種（core の
+//!   1 拒否につき 1 件記録する（#1614 の事後監査の P2）。worker の `err` 行が運ぶ理由はこの 16 種（core の
 //!   `ViolationReason::EXEC_WORKER_REASONS`）だけで、一覧と worker の経路のソースの一致は core の単体テストが固定する。
 //!   `execve` 前の子の拒否（`ExecExit::SetupFailed` の `violation`。種別 `entrypoint` の 8 理由）も
-//!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595）、結果は [`AuditedOutcome::audit`] で返す
+//!   層 `entrypoint` のレコードとして 1 拒否につき 1 件記録し（#1595。worker の結果行で届いた `step` があれば
+//!   `ExecChildStep::stage` で写した拒否の段を `stage` に載せる。無ければ載せない。#3209）、結果は [`AuditedOutcome::audit`] で返す
 //!   （`SetupFailed` は `Err` ではなく `Ok` のまま返り、拒否は変わらない）。監査なしで通す入口は無い。記録点は worker の結果を復号した直後の **親プロセス（exec を起動したプロセス）** の 1 箇所で、
 //!   worker の中では記録しない（worker は `setns` 後にコンテナの mount namespace と cgroup に入っており、そこで
 //!   sink の I/O やロックを走らせると、ホストの監査ファイルのロックをコンテナの cgroup 内のプロセスが保持し得る
@@ -203,7 +213,7 @@
 //! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
 //!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
 //!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
-//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計の担当は #2688（REPAIR-3）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
+//!   場合の exec は現状拒否される（fail-closed）。この場合の方式の判断記録は `docs/design/exec-without-supervisor.md`（#2688・REPAIR-3。オーナー承認待ち。推奨は re-adopt で起動時の同一性の証跡と照合して pidfd を取り直し、それまでは拒否）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441。`healthcheck::ExecHealthProbe` が exec 専用 helper 経由で呼ぶ）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
@@ -214,22 +224,24 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目のうち、外部 CLI への `SCM_RIGHTS` は
+//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目は、2 つの呼び出し元とも実装済み。healthcheck は
+//!   execve 越しの継承（helper の stdin へ pidfd の複製を渡す）で実装済み（#2441）。外部 CLI への `SCM_RIGHTS` も
 //!   実装済み（#2626）: CLI の `exec` が supervisor の制御チャネルの ExecHandoverRequest（`control::protocol` の kind 6。
 //!   接続元の uid の照合つき）で起動時 pidfd の複製を受け取り、単一スレッドの CLI プロセス自身が
-//!   [`run_command_with_pidfd`] を呼ぶ（判断記録は `docs/design/exec-pidfd-handover.md`。オーナー承認待ち）。**未実装**:
-//!   execve 越しの継承（専用の exec プロセスを supervisor が起動する方式）は採らない。fork 継承
+//!   [`run_command_with_pidfd`] を呼ぶ（判断記録は `docs/design/exec-pidfd-handover.md`。案 A を 2026-11-03 にオーナーが承認）。
+//!   CLI の exec では execve 越しの継承（専用の exec プロセスを supervisor が起動する方式）は採らない。fork 継承
 //!   （[`run_command_with_pidfd`]）は pidfd を保持する単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ
-//!   supervisor 本体は直接呼べない（`setns` が拒否する）。supervisor 自身を呼び出し元にする healthcheck の配線は #2441
+//!   supervisor 本体は直接呼べない（`setns` が拒否する）。**未実装**: 非 Linux の exec（plugin 経由。#1869 の設計・TASK-125）と、
+//!   受け渡しの経路を実 pidfd・実コンテナで通す試験の実機での記録（人間担当。#1621 の系列）
 //! - rootless の exec の通しの確認。user namespace への参加（[`enter_namespaces`] が、対象が別の user namespace に
 //!   いるときだけ 5 種に先立って参加する。#1462）と参加後の資格情報は `tests/exec_setns_join.rs` が非特権の
 //!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
 //!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（#1621）で
 //!   行う（記録が済むまで rootless での通しは未確認）
-//! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
-//!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
-//!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
-//!   常に空）
+//! - コマンドの標準入出力の受け渡しのうち CLI の exec と stdin。healthcheck の出力取得は実装済み（[`run_command_with_pidfd_output`]。
+//!   stdout / stderr を結合した 1 本の fd へ付け替える。#2441）。それ以外は launch と同じく `/dev/null` へ固定し、cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
+//!   `process.user`（非 root と `additionalGids` を含む）を対象の写像と照合して受ける（#2770）。exec 要求ごとの
+//!   ユーザーの上書き（CLI の `--user`・CRI の Exec。#2712・#680）は未対応
 //! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
 //!   （`ExecExit::Command(Signaled(31))`）と worker が回収して結果行で返したとき、親プロセスが層 `exit_signal` の
 //!   レコードを 1 件記録し、結果を [`AuditedOutcome::exit_audit`] で返す（`audit` とは別の欄。結果は覆らない）。
@@ -238,8 +250,8 @@
 //!   コマンド内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない。**未実装（REPAIR-3）**: コマンドの
 //!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
 //!   （`docs/design/audit-delivery.md` 9.1）
-//! - 違反記録（SEC-4）の監査ログへの保存のうち、TASK-161 の healthcheck（#492）から
-//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）で、CLI の `exec` コマンドからも配線済み（#2626。`default_audit_sink` で作れなければ exec しない）。本番の
+//! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492）から
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（healthcheck は #2441 で実装済み〔exec 専用 helper が `FileAuditSink` を直接使う〕、CLI の exec も #2626 で配線済み〔`default_audit_sink` で作れなければ exec しない〕）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。launch 経路（本番 launcher の子）で
@@ -253,7 +265,7 @@
 //!   `rootfs_pivot` のうち `rootfs_is_host_root` 以外（`rootfs_moved` 等）は launch の `prepare_rootfs` / `pivot_root`
 //!   だけで生じる（どちらも worker の結果行に載らず、載っても許可リスト外として拒否し記録しない）。worker の
 //!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs_audited`）は、検証後の差し替えによる
-//!   `path_symlink_or_not_directory`・`path_missing` を `RootfsPinError` で運び、`from_pin_error` が末尾の目印つきの
+//!   `path_symlink_or_not_directory`・`path_missing` を `RootfsPinError` で運び、`from_pin_error_staged` が末尾の目印つきの
 //!   `TraitError`（`code`・文言は従来どおり）にして、他の worker の違反と同じ経路で層 `mount` に記録する（#1702）。
 //!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は、
 //!   `build_spec` が launcher の拒否の記録先（relay の閉じた表の理由として運ぶ）へ記録する（#2623。試験 `tests/start_rootfs_pin_audit_relay.rs`）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
@@ -264,7 +276,7 @@
 //! - launch 時の分離の記録の書き込みは、本番 launcher が `StagePipeline::with_landlock` へ渡す ruleset そのものから作り
 //!   （`LaunchedProcess::launch_isolation`）、start の Running 更新と restart の Running(新 pid) 更新で書く結線済み
 //!   （#2007）。記録を持たない launcher（偽の実装）では exec が記録なしで拒否する。本番 launcher による restart の
-//!   再 launch は #2043 まで拒否される。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
+//!   再 launch は #2043 で成立する。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
@@ -278,16 +290,17 @@ use fandhe_container_core::audit_log::{
     record_exit_signal_until,
 };
 use fandhe_container_core::exec::{
-    ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
-    ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
-    ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError,
-    ExecExit, ExecListenerSender, ExecReady, ExecRestrictionReport, ExecRestrictions,
-    ExecWorkerProof, ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable,
-    SupplementaryGroups, ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup,
-    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
+    ChildExit, ChildStdio, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS,
+    ENTRYPOINT_MAX_ENV, ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES,
+    EntrypointExecMode, ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep,
+    ExecChildCgroup, ExecChildStep, ExecCommand, ExecError, ExecExit, ExecListenerSender,
+    ExecReady, ExecRestrictionReport, ExecRestrictions, ExecWorkerProof, IsolationStage,
+    ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable, SupplementaryGroups,
+    ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
+    prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
-    reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
-    record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command,
+    reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection_at,
+    record_exec_worker_rejection_at, remove_exec_child_cgroup, spawn_exec_command_with_stdio,
     spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
 };
 // `None` の入口（試験専用）だけが使う。無効の単独ビルドの unused_imports を避ける（#2640）。
@@ -321,9 +334,22 @@ pub struct ExecTarget {
     /// pid1 の特定に使った記録の launch 時の分離（`/` の同一性と Landlock ルール。
     /// [`require_recorded_launch_isolation`] が存在を確かめた）。[`prepare_restrictions`] が core へ渡す。
     launch_isolation: LaunchIsolationRecord,
+    /// launch 時に適用した起動オプションの env 上書き(`KEY=VALUE`。SUP-12・#2713)。`config.json` の `process.env` の上に、
+    /// exec 固有の指定([`ExecRequest::with_env`])より前に重ねる。launch と exec で同じ env を共有するため。
+    /// 既定は空(従来どおり)。[`ExecTarget::with_launch_env`] で足す。
+    launch_env: Vec<String>,
 }
 
 impl ExecTarget {
+    /// launch 時の起動オプションの env 上書きを持たせる(検証済みの文書から取り出した `KEY=VALUE` の列。#2713)。
+    ///
+    /// 各要素の形式は実行時に [`ContainerEnv::with_var`] が改めて検証する(件数・長さ・形式)。
+    #[must_use]
+    pub fn with_launch_env(mut self, launch_env: Vec<String>) -> Self {
+        self.launch_env = launch_env;
+        self
+    }
+
     /// 対象のコンテナ ID。
     pub fn id(&self) -> &ContainerId {
         &self.id
@@ -384,6 +410,11 @@ fn require_recorded_launch_isolation(
 /// 採用する。期待 cgroup パスは core が記録の型（コンテナ ID・cgroup 配置）から組み立て、ここでは文字列を
 /// 扱わない。
 pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
+    identify_pid1_staged(record).map_err(|e| e.error)
+}
+
+/// [`identify_pid1`] の本体。worker の経路から呼ばれ、違反の拒否には段を付ける（#3294）。
+fn identify_pid1_staged(record: &StateRecord) -> Result<ExecTarget, WorkerError> {
     let pid = running_pid(record)?;
     // 記録 pid が別コンテナの PID 1 に再利用されていないことを、コンテナ固有の cgroup で確かめる
     // （pidfd だけでは記録上の元プロセスとの同一性を証明できない。SEC-1）。cgroup 配置の記録がなければ
@@ -392,18 +423,20 @@ pub fn identify_pid1(record: &StateRecord) -> Result<ExecTarget, TraitError> {
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,
             "container has no recorded cgroup placement; cannot verify pid1 identity",
-        ));
+        )
+        .into());
     };
     let rlimits = require_recorded_rlimits(record)?;
     let launch_isolation = require_recorded_launch_isolation(record)?;
     let id = record.status().id();
-    let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error)?;
+    let pid1 = Pid1Target::open(pid, id, placement).map_err(from_exec_error_staged)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
@@ -420,12 +453,21 @@ pub fn identify_pid1_with_pidfd(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
 ) -> Result<ExecTarget, TraitError> {
+    identify_pid1_with_pidfd_staged(record, pidfd).map_err(|e| e.error)
+}
+
+/// [`identify_pid1_with_pidfd`] の本体。worker の経路から呼ばれ、違反の拒否には段を付ける（#3294）。
+fn identify_pid1_with_pidfd_staged(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+) -> Result<ExecTarget, WorkerError> {
     let pid = running_pid(record)?;
     let Some(placement) = record.cgroup() else {
         return Err(TraitError::new(
             ErrorCode::FailedPrecondition,
             "container has no recorded cgroup placement; cannot verify pid1 identity",
-        ));
+        )
+        .into());
     };
     let rlimits = require_recorded_rlimits(record)?;
     let launch_isolation = require_recorded_launch_isolation(record)?;
@@ -436,14 +478,15 @@ pub fn identify_pid1_with_pidfd(
         )
     })?;
     let id = record.status().id();
-    let pid1 =
-        Pid1Target::open_with_launch_pidfd(owned, pid, id, placement).map_err(from_exec_error)?;
+    let pid1 = Pid1Target::open_with_launch_pidfd(owned, pid, id, placement)
+        .map_err(from_exec_error_staged)?;
     Ok(ExecTarget {
         id: id.clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
@@ -458,35 +501,60 @@ pub fn identify_pid1_in(
     record: &StateRecord,
     expected_cgroup_path: &str,
 ) -> Result<ExecTarget, TraitError> {
+    identify_pid1_in_staged(record, expected_cgroup_path).map_err(|e| e.error)
+}
+
+/// [`identify_pid1_in`] の本体（試験専用。段つき。#3294）。
+#[cfg(feature = "exec-test-support")]
+fn identify_pid1_in_staged(
+    record: &StateRecord,
+    expected_cgroup_path: &str,
+) -> Result<ExecTarget, WorkerError> {
     let pid = running_pid(record)?;
     let rlimits = require_recorded_rlimits(record)?;
     let launch_isolation = require_recorded_launch_isolation(record)?;
-    let pid1 =
-        Pid1Target::open_with_cgroup_path(pid, expected_cgroup_path).map_err(from_exec_error)?;
+    let pid1 = Pid1Target::open_with_cgroup_path(pid, expected_cgroup_path)
+        .map_err(from_exec_error_staged)?;
     Ok(ExecTarget {
         id: record.status().id().clone(),
         pid1,
         bundle: record.bundle().to_path_buf(),
         rlimits,
         launch_isolation,
+        launch_env: Vec::new(),
     })
 }
 
 /// SUP-6 の 5 種（pid / mnt / uts / ipc / net）の namespace へ参加する。対象が呼び出し側と別の user namespace に
 /// いるとき（rootless）は、5 種に先立って user namespace にも参加する（#1462）。単一スレッドからのみ呼ぶこと。
 pub fn enter_namespaces(target: &ExecTarget) -> Result<NamespaceJoinReport, TraitError> {
-    join_namespaces(&target.pid1).map_err(from_exec_error)
+    enter_namespaces_staged(target).map_err(|e| e.error)
+}
+
+/// [`enter_namespaces`] の本体（段つき。#3294）。
+fn enter_namespaces_staged(target: &ExecTarget) -> Result<NamespaceJoinReport, WorkerError> {
+    join_namespaces(&target.pid1).map_err(from_exec_error_staged)
 }
 
 /// 対象のコンテナ cgroup を開き、参加に必要な fd を確保する。[`enter_namespaces`] の **前** に呼ぶ（SUP-6・#501）。
 pub fn prepare_cgroup_join(target: &ExecTarget) -> Result<ExecCgroupJoin, TraitError> {
-    core_prepare_cgroup_join(&target.pid1).map_err(from_exec_error)
+    prepare_cgroup_join_staged(target).map_err(|e| e.error)
+}
+
+/// [`prepare_cgroup_join`] の本体（段つき。#3294）。
+fn prepare_cgroup_join_staged(target: &ExecTarget) -> Result<ExecCgroupJoin, WorkerError> {
+    core_prepare_cgroup_join(&target.pid1).map_err(from_exec_error_staged)
 }
 
 /// 自プロセスをコンテナの cgroup へ参加させ、所属を確認する。exec 専用プロセスからのみ呼ぶこと
 /// （契約はモジュール doc）。失敗時は続行せず終了すること。
 pub fn join_cgroup(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, TraitError> {
-    core_join_cgroup(join).map_err(from_exec_error)
+    join_cgroup_staged(join).map_err(|e| e.error)
+}
+
+/// [`join_cgroup`] の本体（段つき。#3294）。
+fn join_cgroup_staged(join: ExecCgroupJoin) -> Result<ExecCgroupJoinReport, WorkerError> {
+    core_join_cgroup(join).map_err(from_exec_error_staged)
 }
 
 /// コンテナの `config.json` から Landlock ruleset を作り、コンテナの rootfs を固定し、自プロセスの status fd・
@@ -505,7 +573,7 @@ pub fn prepare_restrictions(
     worker: &ExecWorkerProof,
     target: &ExecTarget,
 ) -> Result<ExecRestrictions, TraitError> {
-    let (config, rootfs) = load_exec_bundle(&target.bundle)?;
+    let (config, rootfs) = load_exec_bundle(&target.bundle).map_err(|e| e.error)?;
     core_prepare_exec_restrictions(
         worker,
         &target.pid1,
@@ -523,7 +591,7 @@ pub fn prepare_restrictions(
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
 /// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
-/// 配線済み（#1717・#2481）で、CLI の `exec`（#2626）も配線済み。healthcheck（#2441）からは未配線。
+/// 配線済み（#1717・#2481）。healthcheck の exec 専用 helper（#2441）と CLI の `exec`（#2626）からも配線済み。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
@@ -647,7 +715,14 @@ impl ExecRequest {
 pub fn reapply_restrictions(
     restrictions: ExecRestrictions,
 ) -> Result<ExecRestrictionReport, TraitError> {
-    core_reapply_restrictions(restrictions).map_err(from_exec_error)
+    reapply_restrictions_staged(restrictions).map_err(|e| e.error)
+}
+
+/// [`reapply_restrictions`] の本体（段つき。#3294）。
+fn reapply_restrictions_staged(
+    restrictions: ExecRestrictions,
+) -> Result<ExecRestrictionReport, WorkerError> {
+    core_reapply_restrictions(restrictions).map_err(from_exec_error_staged)
 }
 
 /// 再適用の結果を、exec へ進んでよいことの証跡 `ExecReady` に変える（SUP-6・SEC-1・#502）。
@@ -656,7 +731,12 @@ pub fn reapply_restrictions(
 /// rlimit 適用を実装したため、通常の再適用の結果は成功する。fork / execve の入口（[`run_command_with_pidfd`] が呼ぶ
 /// core の `spawn_exec_command`）は、この関数が返す `ExecReady` を値で受け取る（契約はモジュール doc）。
 pub fn require_exec_ready(report: ExecRestrictionReport) -> Result<ExecReady, TraitError> {
-    report.into_complete().map_err(from_exec_error)
+    require_exec_ready_staged(report).map_err(|e| e.error)
+}
+
+/// [`require_exec_ready`] の本体（段つき。#3294）。
+fn require_exec_ready_staged(report: ExecRestrictionReport) -> Result<ExecReady, WorkerError> {
+    report.into_complete().map_err(from_exec_error_staged)
 }
 
 /// [`run_command_with_pidfd`] の結果（将来拡張できる構造。REPAIR-3）。
@@ -687,8 +767,8 @@ pub struct ExecOutcome {
     pub landlock_rules: usize,
     /// 適用した seccomp の BPF 命令数。
     pub seccomp_instructions: usize,
-    /// 補助グループの扱いの結果（launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
-    /// 記録する。TASK-163 追補・#1457）。
+    /// 補助グループの扱いの結果（既定は launch と同じく空にする。`setgroups` が `deny` の user namespace では残して
+    /// 記録する。TASK-163 追補・#1457。`process.user.additionalGids` が非空なら適用して `Applied`。#2770）。
     pub supplementary_groups: SupplementaryGroups,
     /// エントリポイントの実行方式（封印した複製か現行方式と、現行方式を選んだ理由。オーナー判断 2026-10-09
     /// 「条件付き切り替え」・#1531・REPAIR-4）。同じ値を worker が構造化ログ（`supervisor.exec` の `entrypoint_mode`）に出す
@@ -841,8 +921,8 @@ pub fn run_command(
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
-            let target = identify_pid1(record)?;
-            run_with_target(proof, &target, request, deadline, child, sender)
+            let target = identify_pid1_staged(record)?;
+            run_with_target(proof, &target, request, deadline, child, sender, None)
         },
     );
     audit_worker_result(
@@ -880,9 +960,13 @@ fn audit_worker_result(
         Ok(outcome) => match outcome.exit {
             ExecExit::SetupFailed {
                 violation: Some(reason),
+                step,
                 ..
             } => {
-                let rejected = record_entrypoint_rejection(outcome, reason, container, audit);
+                // 段は worker の結果行で届いた `ExecChildStep` を launch と同じ語彙へ写す（届かなければ載せない。#3209）。
+                let stage = step.map(ExecChildStep::stage);
+                let rejected =
+                    record_entrypoint_rejection_at(outcome, reason, stage, container, audit);
                 Ok(AuditedOutcome {
                     outcome: rejected.error,
                     audit: rejected.delivery,
@@ -915,7 +999,13 @@ fn audit_worker_result(
             }),
         },
         Err(failure) => Err(match failure.violation {
-            Some(reason) => record_exec_worker_rejection(failure.error, reason, container, audit),
+            Some(reason) => record_exec_worker_rejection_at(
+                failure.error,
+                reason,
+                failure.stage,
+                container,
+                audit,
+            ),
             None => AuditedRejection::not_applicable(failure.error),
         }),
     }
@@ -927,7 +1017,7 @@ fn audit_worker_result(
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
 /// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（担当は #2688。#514 は re-adopt・終了ポリシーのみ）と
-/// 本番の呼び出し元のうち、CLI の exec は配線済み（#2626。制御チャネルで受け取った pidfd を渡す）で、healthcheck（#2441）は未実装（モジュール doc）。
+/// 本番の呼び出し元のうち healthcheck は #2441 で実装済み（exec 専用 helper が [`run_command_with_pidfd_output`] を呼ぶ）、CLI の exec は #2626 で配線済み（制御チャネルで受け取った pidfd を渡す。モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
 /// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
@@ -965,6 +1055,113 @@ pub fn run_command_with_pidfd(
     timeout: Duration,
     audit: &dyn AuditSink,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_env(record, pidfd, request, timeout, audit, &[])
+}
+
+/// [`run_command_with_pidfd`] に、launch 時の起動オプションの env 上書き(`launch_env`。`KEY=VALUE`)を足した入口
+/// (SUP-12・SUP-6・#2713)。
+///
+/// `config.json` の `process.env` の上に `launch_env` を重ね、その上に `request` の明示の指定を重ねる。launch の
+/// Entrypoint が使う env と exec(healthcheck を含む)の env を揃えるため。`launch_env` は信頼済みの保存文書
+/// (`container_options::store::read_launch_env`)から取り出した値だけを渡すこと(呼び出し側が任意に足す口ではない)。
+/// 空なら [`run_command_with_pidfd`] と同じ。呼び出し元は healthcheck の exec 専用 helper（[`run_command_with_pidfd_output`] 経由。#2441）で、CLI の exec #2626 の配線は未実装。
+pub fn run_command_with_pidfd_env(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    launch_env: &[String],
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_inner(
+        record,
+        pidfd,
+        request,
+        timeout,
+        audit,
+        ExecLaunchIo {
+            launch_env,
+            output: None,
+            on_created: None,
+        },
+    )
+}
+
+/// [`run_command_with_pidfd_env`] に、コマンドの stdout / stderr の取得先 `output` を足した入口
+/// （healthcheck の出力取得。SUP-4・SUP-6・SEC-4・#2441）。
+///
+/// `output` は呼び出しプロセスが持つ書き込み可能な fd（ソケットの子側等）で、コマンドの fd 1・2 の両方へ付け替わる
+/// （結合した 1 本。fd 0 は `/dev/null`）。worker が fork で継承した fd を複製して core の
+/// `spawn_exec_command_with_stdio` へ渡し、コマンドの子が `close_range` の前に付け替える。コマンドへ渡る host の
+/// fd はこの 1 本だけで、読み手（呼び出しプロセスの外側）は読み取りしかしない前提。コマンドが `SIGPIPE` を無視して
+/// 起動するため、読み手が閉じても `EPIPE` で済む。他の契約（順序・単一スレッド・`timeout`・`audit`）は
+/// [`run_command_with_pidfd`] と同じ。
+pub fn run_command_with_pidfd_output(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    launch_env: &[String],
+    output: BorrowedFd<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_output_notify(
+        record,
+        pidfd,
+        request,
+        timeout,
+        audit,
+        ExecLaunchIo {
+            launch_env,
+            output: Some(output),
+            on_created: None,
+        },
+    )
+}
+
+/// exec の入出力・env・作成通知の束（引数の数を抑えるための要求型。SUP-4・SUP-6・#2441）。
+pub struct ExecLaunchIo<'a> {
+    /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
+    pub launch_env: &'a [String],
+    /// コマンドの stdout / stderr の取得先。`None` なら標準入出力は 3 本とも `/dev/null`。
+    pub output: Option<BorrowedFd<'a>>,
+    /// exec 子 cgroup の排他作成に成功した直後に 1 回呼ばれる通知（healthcheck の exec 専用 helper 用）。
+    pub on_created: Option<&'a dyn Fn(&ExecCgroupName)>,
+}
+
+/// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
+/// （healthcheck の exec 専用 helper 用。SUP-4・SUP-6・REPAIR-5・#2441）。
+///
+/// `on_created` は `mkdirat` の排他作成（既存の同名は `EEXIST` で失敗し採用しない）に成功した直後、worker を fork する
+/// 前に 1 回だけ呼ばれる。呼び出しプロセスの外側（supervisor）は、この通知を受けた cgroup だけを「今回の作成物」として
+/// 停止してよい。pid から名前を推定すると、再利用された pid の以前の exec の同名 cgroup を誤停止し得るため。
+/// 作成に失敗した・記録に cgroup 配置が無い場合は呼ばれない。他の契約は [`run_command_with_pidfd_output`] と同じ。
+pub fn run_command_with_pidfd_output_notify(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    io: ExecLaunchIo<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    run_command_with_pidfd_inner(record, pidfd, request, timeout, audit, io)
+}
+
+/// [`run_command_with_pidfd_env`] と [`run_command_with_pidfd_output`] の共通本体。`io.output` が `None` なら
+/// コマンドの標準入出力は 3 本とも `/dev/null`。
+fn run_command_with_pidfd_inner(
+    record: &StateRecord,
+    pidfd: BorrowedFd<'_>,
+    request: &ExecRequest,
+    timeout: Duration,
+    audit: &dyn AuditSink,
+    io: ExecLaunchIo<'_>,
+) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
+    let ExecLaunchIo {
+        launch_env,
+        output,
+        on_created,
+    } = io;
     let deadline = Deadline::after(timeout);
     running_pid(record).map_err(AuditedRejection::not_applicable)?;
     let sweep = sweep_before_create(record);
@@ -972,11 +1169,19 @@ pub fn run_command_with_pidfd(
     let result = run_owning_child_cgroup(
         deadline,
         exec_responder(record, audit),
-        || create_child_cgroup(record, &name),
+        || {
+            let created = create_child_cgroup(record, &name)?;
+            // 排他作成に成功した（所有を確定した）直後にだけ通知する。
+            if let (Some(_), Some(notify)) = (&created, on_created) {
+                notify(&name);
+            }
+            Ok(created)
+        },
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
-            let target = identify_pid1_with_pidfd(record, pidfd)?;
-            run_with_target(proof, &target, request, deadline, child, sender)
+            let target = identify_pid1_with_pidfd_staged(record, pidfd)?
+                .with_launch_env(launch_env.to_vec());
+            run_with_target(proof, &target, request, deadline, child, sender, output)
         },
     );
     audit_worker_result(
@@ -1021,8 +1226,8 @@ pub fn run_command_in(
             .map_err(from_exec_error)
         },
         |proof, child, sender| {
-            let target = identify_pid1_in(record, expected_cgroup_path)?;
-            run_with_target(proof, &target, request, deadline, child, sender)
+            let target = identify_pid1_in_staged(record, expected_cgroup_path)?;
+            run_with_target(proof, &target, request, deadline, child, sender, None)
         },
     );
     audit_worker_result(
@@ -1111,6 +1316,9 @@ fn attach_sweep(
 struct WorkerFailure {
     error: TraitError,
     violation: Option<ViolationReason>,
+    /// 違反を拒否した段（`err` 行の段の欄で届いたもの。監査記録の `stage` に載せる。SEC-4・ERR-4・#3294）。
+    /// `violation` が `Some` のときだけ `Some` になり得る。段を運べなかった違反は `None`（推測で捏造しない）。
+    stage: Option<IsolationStage>,
 }
 
 impl From<TraitError> for WorkerFailure {
@@ -1118,7 +1326,26 @@ impl From<TraitError> for WorkerFailure {
         Self {
             error,
             violation: None,
+            stage: None,
         }
+    }
+}
+
+/// worker 側の失敗（段つき）。親へは `err` 行で運ぶ（SEC-4・ERR-4・SUP-6・#3294）。
+///
+/// `TraitError` は拒否した段を構造的に持たず（メッセージの自由文の中だけ）、自由文の解析は採らない
+/// （REPAIR-2）。そのため worker の経路は拒否の段を本型で運び、[`encode_worker_result`] が `err` 行の段の欄へ出す。
+/// `error` のバイト列（ERR-1 のメッセージ）は従来どおりで、段は監査記録だけに足す（#3114 の対象外）。
+#[derive(Debug)]
+struct WorkerError {
+    error: TraitError,
+    /// 違反による拒否の段。違反を伴わない失敗・段が分からない経路は `None`。
+    stage: Option<IsolationStage>,
+}
+
+impl From<TraitError> for WorkerError {
+    fn from(error: TraitError) -> Self {
+        Self { error, stage: None }
     }
 }
 
@@ -1177,7 +1404,7 @@ fn run_in_worker_with(
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     listener: ListenerPolicy<'_>,
-    work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, TraitError>,
+    work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
     deadline.remaining("starting the exec worker")?;
@@ -1274,6 +1501,7 @@ fn run_in_worker_with(
                 ),
             ),
             violation: err.violation,
+            stage: err.stage,
         }),
     }
 }
@@ -1316,6 +1544,7 @@ fn listener_failure(error: TraitError, reaped: Result<ChildExit, TraitError>) ->
     WorkerFailure {
         error,
         violation: None,
+        stage: None,
     }
 }
 
@@ -1453,7 +1682,7 @@ fn run_owning_child_cgroup(
         &ExecWorkerProof,
         Option<&ExecChildCgroup>,
         ExecListenerSender,
-    ) -> Result<ExecOutcome, TraitError>,
+    ) -> Result<ExecOutcome, WorkerError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     let child = create()?;
     let owned = child.is_some();
@@ -1472,7 +1701,8 @@ fn run_owning_child_cgroup(
             None => Err(TraitError::new(
                 ErrorCode::Internal,
                 "exec stage Seccomp: the seccomp listener channel was not provided",
-            )),
+            )
+            .into()),
         },
     );
     let mut result = result;
@@ -1491,6 +1721,7 @@ fn run_owning_child_cgroup(
                         ),
                     ),
                     violation: f.violation,
+                    stage: f.stage,
                 }),
             };
         }
@@ -1567,7 +1798,7 @@ pub fn run_in_worker_for_test(
         grace,
         cleanup,
         ListenerPolicy::None,
-        |_, _| work(),
+        |_, _| work().map_err(WorkerError::from),
     )
     .map_err(|f| f.error)
 }
@@ -1615,9 +1846,9 @@ pub fn run_in_worker_with_listener_for_test(
             })?;
             work(sender)?;
             decode_worker_result(
-                b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
             )
-            .map_err(|f| f.error)
+            .map_err(|f| WorkerError::from(f.error))
         },
     )
     .map_err(|f| f.error)
@@ -1668,10 +1899,10 @@ pub fn run_in_worker_with_user_notif_for_test(
             })?;
             work(sender)?;
             decode_worker_result(
-                b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321
+                b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321
 ",
             )
-            .map_err(|f| f.error)
+            .map_err(|f| WorkerError::from(f.error))
         },
     )
     .map_err(|f| f.error)
@@ -1736,7 +1967,7 @@ pub fn run_in_worker_audited_for_test(
         WORKER_GRACE,
         || Ok(()),
         ListenerPolicy::None,
-        |_, _| work().map_err(from_exec_error),
+        |_, _| work().map_err(from_exec_error_staged),
     );
     audit_worker_result(result, container, audit)
 }
@@ -1747,7 +1978,7 @@ pub fn run_in_worker_audited_for_test(
 #[doc(hidden)]
 pub fn run_in_worker_trait_audited_for_test(
     timeout: Duration,
-    work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
+    work: impl FnOnce() -> Result<ExecOutcome, TestWorkerError>,
     container: Option<&ContainerId>,
     audit: &dyn AuditSink,
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
@@ -1756,13 +1987,29 @@ pub fn run_in_worker_trait_audited_for_test(
         WORKER_GRACE,
         || Ok(()),
         ListenerPolicy::None,
-        |_, _| work(),
+        |_, _| work().map_err(|e| e.0),
     );
     audit_worker_result(result, container, audit)
 }
 
+/// 結合試験専用: worker の失敗（段つき）を試験側へ運ぶ不透明な型（SEC-4・ERR-4・#3294）。
+///
+/// 内部の `WorkerError` を公開しないための包み。`TraitError` から `?` で変換でき（段なし）、
+/// [`pin_exec_bundle_with_swap_for_test`] は本番と同じ写像（`from_pin_error_staged`）で段つきの値を返す。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TestWorkerError(WorkerError);
+
+#[cfg(feature = "exec-test-support")]
+impl From<TraitError> for TestWorkerError {
+    fn from(error: TraitError) -> Self {
+        Self(WorkerError::from(error))
+    }
+}
+
 /// 結合試験専用の入口: `load_exec_bundle` と同じ経路（`config.json` の読み込み → 検証 → rootfs の固定 →
-/// [`from_pin_error`] の写像）で、検証と固定の間に `swap` を挟む（「検証後の差し替え」の再現。#1702）。
+/// [`from_pin_error_staged`] の写像）で、検証と固定の間に `swap` を挟む（「検証後の差し替え」の再現。#1702）。
 ///
 /// 成功時は `Ok(())`（固定した fd は捨てる）。`exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]
@@ -1770,29 +2017,42 @@ pub fn run_in_worker_trait_audited_for_test(
 pub fn pin_exec_bundle_with_swap_for_test(
     bundle: &std::path::Path,
     swap: impl FnOnce(),
-) -> Result<(), TraitError> {
+) -> Result<(), TestWorkerError> {
     let config = load_config(&bundle.join("config.json"))
         .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))?;
     fandhe_container_core::oci_runtime::pin_bundle_rootfs_with_swap_for_test(bundle, &config, swap)
         .map(|_| ())
-        .map_err(from_pin_error)
+        .map_err(|e| TestWorkerError(from_pin_error_staged(e)))
 }
 
-/// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
+/// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <ERR-1 コード
+/// （`setup` のときの子が報告した失敗の分類。`command` は -。#2763）> <失敗した手順の段（core の `ExecChildStep` のトークン。
+/// `command` と、段を受け取れなかった `setup` は -。#2822）> <exited|signaled>
 /// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
 /// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは -> <コマンドの
 /// 子の PID（10 進。起動していなければ -）>`、失敗は
-/// `err <ERR-1 コード> <worker の経路の違反の 種別/理由コード または -> <メッセージ>`（改行は空白へ置換。違反の欄は
-/// `exec_target/exec_target_not_nested_pid1`・`rootfs_pivot/rootfs_is_host_root` の形）。
-fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
+/// `err <ERR-1 コード> <拒否した段または -> <worker の経路の違反の 種別/理由コード または -> <メッセージ>`（改行は
+/// 空白へ置換。違反の欄は `exec_target/exec_target_not_nested_pid1`・`rootfs_pivot/rootfs_is_host_root` の形。段の欄は
+/// `IsolationStage::as_str` のトークンで、違反を運ぶときだけ出し、違反なしは常に -。段を違反の欄の前に置くのは、欄の無い
+/// 旧形式の行を必ず壊れた行にするため〔旧形式の違反の欄 `exec_target/...` は未知の段、メッセージ先頭の `exec` が段に
+/// 誤受理されない〕。SEC-4・ERR-4・#3294）。
+fn encode_worker_result(result: &Result<ExecOutcome, WorkerError>) -> Vec<u8> {
     let line = match result {
         Ok(o) => {
-            let (started, violation) = match o.exit {
-                ExecExit::Command(_) => ("command", "-"),
-                ExecExit::SetupFailed { violation, .. } => {
-                    ("setup", violation.map_or("-", ViolationReason::as_str))
-                }
-                _ => ("unknown", "-"),
+            let (started, violation, failure_code, step) = match o.exit {
+                ExecExit::Command(_) => ("command", "-", "-", "-"),
+                ExecExit::SetupFailed {
+                    violation,
+                    code,
+                    step,
+                    ..
+                } => (
+                    "setup",
+                    violation.map_or("-", ViolationReason::as_str),
+                    code.as_str(),
+                    step.map_or("-", ExecChildStep::as_str),
+                ),
+                _ => ("unknown", "-", "-", "-"),
             };
             let (kind, value) = match o.exit.child_exit() {
                 ChildExit::Exited(n) => ("exited", n),
@@ -1804,7 +2064,7 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {started} {violation} {kind} {value} {} {} {} {} {} {} {groups} {} {} {}\n",
+                "ok {started} {violation} {failure_code} {step} {kind} {value} {} {} {} {} {} {} {groups} {} {} {}\n",
                 o.rlimits_applied,
                 o.rlimits_deferred,
                 o.capability_bounding_dropped,
@@ -1820,14 +2080,17 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
             )
         }
         Err(e) => {
-            let violation = exec_worker_reason_of(e).map_or_else(
+            let reason = exec_worker_reason_of(&e.error);
+            let violation = reason.map_or_else(
                 || "-".to_owned(),
                 |r| format!("{}/{}", r.kind().as_str(), r.as_str()),
             );
+            // 段は違反に付随する。違反の無い失敗・一覧外の違反では、段があっても出さない（復号側の不変条件）。
+            let stage = reason.and(e.stage).map_or("-", IsolationStage::as_str);
             format!(
-                "err {} {violation} {}\n",
-                e.code().as_str(),
-                e.message().replace(['\n', '\r'], " ")
+                "err {} {stage} {violation} {}\n",
+                e.error.code().as_str(),
+                e.error.message().replace(['\n', '\r'], " ")
             )
         }
     };
@@ -1872,6 +2135,14 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     let text = text.strip_suffix('\n').ok_or_else(malformed)?;
     if let Some(rest) = text.strip_prefix("err ") {
         let (code, rest) = rest.split_once(' ').ok_or_else(malformed)?;
+        // 段の欄（違反の欄の前）。欄の無い旧形式の行は、次の欄が段として未知のトークンになるか違反の欄が
+        // 欠けるため、いずれも壊れた行になる（fail-closed。#3294）。
+        let (stage, rest) = rest.split_once(' ').ok_or_else(malformed)?;
+        let stage = match stage {
+            "-" => None,
+            // 許可リスト（core の `IsolationStage::ALL`）で静的トークンへ引き直す。未知・綴り違いは拒否する。
+            token => Some(IsolationStage::from_token(token).ok_or_else(malformed)?),
+        };
         let (violation, message) = rest.split_once(' ').unwrap_or((rest, ""));
         let violation = match violation {
             "-" => None,
@@ -1886,23 +2157,17 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
                     .ok_or_else(malformed)?,
             ),
         };
-        let code = [
-            ErrorCode::InvalidArgument,
-            ErrorCode::NotFound,
-            ErrorCode::AlreadyExists,
-            ErrorCode::FailedPrecondition,
-            ErrorCode::Unimplemented,
-            ErrorCode::Internal,
-            ErrorCode::PermissionDenied,
-            ErrorCode::Timeout,
-            ErrorCode::Unavailable,
-        ]
-        .into_iter()
-        .find(|c| c.as_str() == code)
-        .unwrap_or(ErrorCode::Internal);
+        // 未知の code は行全体を malformed として拒否する（fail-closed。方針は core の `ErrorCode` の doc。
+        // untrusted な message も出力へ載せない）。
+        let code = ErrorCode::from_name(code).ok_or_else(malformed)?;
+        // 段は違反に付随する。違反なしで段あり（食い違い）は壊れた行として拒否する。
+        if stage.is_some() && violation.is_none() {
+            return Err(malformed());
+        }
         return Err(WorkerFailure {
             error: TraitError::new(code, message),
             violation,
+            stage,
         });
     }
     let rest = text.strip_prefix("ok ").ok_or_else(malformed)?;
@@ -1912,6 +2177,18 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "-" => None,
         // 許可リスト（core の `ENTRYPOINT_REASONS`）で静的トークンへ引き直す。未知の名前は記録せず拒否（#1595）。
         name => Some(ViolationReason::from_entrypoint_token(name).ok_or_else(malformed)?),
+    };
+    // 起動していない（`setup`）ときの子が報告した失敗の分類。`command` には `-` だけを受け、`setup` には
+    // 既知の ERR-1 コード名だけを受ける（未知・食い違いは壊れた行。fail-closed。#2763）。
+    let failure_code = match it.next().ok_or_else(malformed)? {
+        "-" => None,
+        name => Some(ErrorCode::from_name(name).ok_or_else(malformed)?),
+    };
+    // 子が失敗した手順の段。core の固定語彙で静的な値へ引き直す（未知のトークンは壊れた行。fail-closed）。`-` は
+    // 段を受け取れなかった場合（`setup`）と `command`（#2822）。
+    let step = match it.next().ok_or_else(malformed)? {
+        "-" => None,
+        token => Some(ExecChildStep::from_token(token).ok_or_else(malformed)?),
     };
     let kind = it.next().ok_or_else(malformed)?;
     let value: i32 = it
@@ -1923,11 +2200,13 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "signaled" => ChildExit::Signaled(value),
         _ => return Err(malformed()),
     };
-    let exit = match (started, violation) {
-        ("command", None) => ExecExit::Command(child),
-        ("setup", violation) => ExecExit::SetupFailed {
+    let exit = match (started, violation, failure_code, step) {
+        ("command", None, None, None) => ExecExit::Command(child),
+        ("setup", violation, Some(code), step) => ExecExit::SetupFailed {
             exit: child,
             violation,
+            code,
+            step,
         },
         _ => return Err(malformed()),
     };
@@ -1950,6 +2229,8 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         "already_empty" if groups == 0 => SupplementaryGroups::AlreadyEmpty,
         "cleared" => SupplementaryGroups::Cleared { cleared: groups },
         "kept_setgroups_denied" => SupplementaryGroups::KeptSetgroupsDenied { kept: groups },
+        // `process.user.additionalGids` を適用した（写像と照合済みの非空指定。#2770）。件数は 1 以上。
+        "applied" if groups > 0 => SupplementaryGroups::Applied { count: groups },
         _ => return Err(malformed()),
     };
     let mode = it.next().ok_or_else(malformed)?;
@@ -1993,7 +2274,8 @@ fn run_with_target(
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
     listener: ExecListenerSender,
-) -> Result<ExecOutcome, TraitError> {
+    output: Option<BorrowedFd<'_>>,
+) -> Result<ExecOutcome, WorkerError> {
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
     let child_cgroup = child_cgroup.ok_or_else(|| {
@@ -2002,15 +2284,14 @@ fn run_with_target(
             "exec stage CgroupJoin: the exec child cgroup was not created",
         )
     })?;
-    let cgroup = prepare_cgroup_join(target)?;
     let result = run_in_child_cgroup(
         proof,
         target,
         request,
         deadline,
-        cgroup,
         child_cgroup,
         listener,
+        output,
     );
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
@@ -2024,14 +2305,27 @@ fn run_in_child_cgroup(
     target: &ExecTarget,
     request: &ExecRequest,
     deadline: Deadline,
-    cgroup: ExecCgroupJoin,
     child_cgroup: &ExecChildCgroup,
     listener: ExecListenerSender,
-) -> Result<ExecOutcome, TraitError> {
+    output: Option<BorrowedFd<'_>>,
+) -> Result<ExecOutcome, WorkerError> {
+    // 参加する cgroup の準備（参加の前に済ませる。失敗しても呼び出し側が子 cgroup の後始末を行う）。
+    let cgroup = prepare_cgroup_join_staged(target)?;
     // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
     // コマンドの環境はコンテナ定義（`process.env`）が基底で、呼び出しプロセスの環境は使わない（#1457）。
-    let command = request.command(&ContainerEnv::from_config(&config).map_err(from_exec_error)?)?;
+    // launch 時の起動オプションの env 上書きは、exec 固有の指定(`request`)より前に重ねる(SUP-12・#2713)。
+    let mut base = ContainerEnv::from_config(&config).map_err(from_exec_error_staged)?;
+    for entry in &target.launch_env {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::InvalidArgument,
+                "a launch env override is malformed",
+            )
+        })?;
+        base = base.with_var(key, value).map_err(from_exec_error_staged)?;
+    }
+    let command = request.command(&base)?;
     let restrictions = core_prepare_exec_restrictions(
         proof,
         &target.pid1,
@@ -2040,7 +2334,7 @@ fn run_in_child_cgroup(
         &target.rlimits,
         &target.launch_isolation,
     )
-    .map_err(from_exec_error)?
+    .map_err(from_exec_error_staged)?
     // listener の送り手を付ける。ACK 待ちは全体の期限までに縛る（REPAIR-5）。親は worker の終了を待つ前に受信する。
     .with_seccomp_listener(listener.with_ack_deadline(deadline.at));
     // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
@@ -2048,11 +2342,11 @@ fn run_in_child_cgroup(
     // 送信は待たない best-effort で結果は捨てる（#1698）。縮退の事実の確かな観測口は `ExecOutcome::entrypoint_mode`。
     let _ = log_entrypoint_mode(entrypoint_mode);
     deadline.remaining("joining namespaces")?;
-    enter_namespaces(target)?;
+    enter_namespaces_staged(target)?;
     deadline.remaining("joining the cgroup")?;
-    join_cgroup(cgroup)?;
+    join_cgroup_staged(cgroup)?;
     deadline.remaining("reapplying restrictions")?;
-    let report = reapply_restrictions(restrictions)?;
+    let report = reapply_restrictions_staged(restrictions)?;
     let rlimits_deferred = report.rlimits_deferred();
     let (rlimits_applied, capability_bounding_dropped) = (
         report.rlimits_applied(),
@@ -2067,9 +2361,23 @@ fn run_in_child_cgroup(
             "exec stage CapabilityDrop: the supplementary groups were not handled",
         )
     })?;
-    let ready = require_exec_ready(report)?;
+    let ready = require_exec_ready_staged(report)?;
     deadline.remaining("starting the command")?;
-    let child = spawn_exec_command(ready, &command, child_cgroup).map_err(from_exec_error)?;
+    // 出力の取得先があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdout / stderr にする。
+    let stdio = match output {
+        Some(fd) => {
+            let owned = fd.try_clone_to_owned().map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "exec stage Spawn: failed to duplicate the exec output",
+                )
+            })?;
+            ChildStdio::from_output(owned).map_err(from_exec_error_staged)?
+        }
+        None => ChildStdio::none(),
+    };
+    let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
+        .map_err(from_exec_error_staged)?;
     // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。
     let spawned_pid = NonZeroU32::new(child.pid());
     let exit = wait_or_stop(
@@ -2099,6 +2407,22 @@ fn run_in_child_cgroup(
         seccomp_listener: ExecListenerHandover::NotApplicable,
         seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
     })
+}
+
+/// 試験専用: 指定の `exit` を持つ成功側の結果を作る（`healthcheck::exec_helper` の写像の試験が使う。#2441）。
+/// 他のフィールドは worker の結果行の復号結果の既定的な値。
+#[cfg(test)]
+pub(crate) fn audited_outcome_for_test(exit: ExecExit, audit: AuditDelivery) -> AuditedOutcome {
+    let mut outcome = decode_worker_result(
+        b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+    )
+    .expect("decode");
+    outcome.exit = exit;
+    AuditedOutcome {
+        outcome,
+        audit,
+        exit_audit: AuditDelivery::NotApplicable,
+    }
 }
 
 /// エントリポイントの実行方式の構造化ログ 1 行（JSON。値は固定語彙のみ。REPAIR-4・#1531）。
@@ -2167,10 +2491,10 @@ fn wait_or_stop<T>(
 /// `bundle` の `config.json` を読み、その `root.path` が指す rootfs を固定する。
 ///
 /// エラーメッセージに bundle のパスを含めない（core の `OciConfigError`・rootfs の検査は固定文言）。
-fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), TraitError> {
+fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), WorkerError> {
     let config = load_config(&bundle.join("config.json"))
         .map_err(|e| TraitError::new(e.code(), format!("exec stage Landlock: {e}")))?;
-    let rootfs = pin_bundle_rootfs_audited(bundle, &config).map_err(from_pin_error)?;
+    let rootfs = pin_bundle_rootfs_audited(bundle, &config).map_err(from_pin_error_staged)?;
     Ok((config, rootfs))
 }
 
@@ -2181,12 +2505,21 @@ fn load_exec_bundle(bundle: &std::path::Path) -> Result<(OciConfig, RootfsDir), 
 /// （[`violation_marker`]）を付ける。worker の結果行はこの目印から `<種別>/<理由>` を運び
 /// （[`exec_worker_reason_of`]）、親プロセスが層 `mount` へ 1 件記録する。違反を伴わない失敗は目印なし
 /// （記録しない）。メッセージにパスを含めない。
-fn from_pin_error(err: RootfsPinError) -> TraitError {
+///
+/// 段（SEC-4・ERR-4・#3294）:
+/// `RootfsPinError` は段を持たない。違反を伴うとき（検証後の差し替え）だけ、利用者向けメッセージが既に明示している
+/// 呼び出し点の段 `Validate`（`exec stage Validate:`）を段として運ぶ（`from_violation_at` と同じく呼び出した段を記録する）。
+/// 違反を伴わない失敗は段なし（記録しない）。`error` のバイト列は段の追加前と同一。
+fn from_pin_error_staged(err: RootfsPinError) -> WorkerError {
+    let stage = err.violation().map(|_| IsolationStage::Validate);
     let marker = err.violation().map_or_else(String::new, violation_marker);
-    TraitError::new(
-        err.error().code(),
-        format!("exec stage Validate: {}{marker}", err.error().message()),
-    )
+    WorkerError {
+        error: TraitError::new(
+            err.error().code(),
+            format!("exec stage Validate: {}{marker}", err.error().message()),
+        ),
+        stage,
+    }
 }
 
 /// 分離違反の末尾の目印 ` (violation: <種別>/<理由コード>, <ビヘイビア ID>)`（[`exec_worker_reason_of`] が引き直す形）。
@@ -2206,14 +2539,26 @@ fn violation_marker(reason: ViolationReason) -> String {
 /// パス）はメッセージへ含めない。worker の経路の違反の監査記録は通しの入口 [`run_command_with_pidfd`] が親プロセスで行い、
 /// worker は末尾の目印から `<種別>/<理由>` を結果行へ載せる（[`exec_worker_reason_of`]。#1465）。
 fn from_exec_error(err: ExecError) -> TraitError {
+    from_exec_error_staged(err).error
+}
+
+/// [`from_exec_error`] に拒否の段を足した版（SEC-4・ERR-4・SUP-6・#3294）。
+///
+/// 違反による拒否のときだけ `ExecError::stage` を運ぶ（違反を伴わない失敗は段なし。記録しないため）。`error` の
+/// バイト列（`exec stage {:?}: ...` の Debug 綴りと目印）は [`from_exec_error`] と同一で変えない（#3114）。
+fn from_exec_error_staged(err: ExecError) -> WorkerError {
+    let stage = err.violation.as_ref().map(|_| err.stage);
     let violation = err
         .violation
         .as_ref()
         .map_or_else(String::new, |v| violation_marker(v.reason));
-    TraitError::new(
-        err.code,
-        format!("exec stage {:?}: {}{violation}", err.stage, err.message),
-    )
+    WorkerError {
+        error: TraitError::new(
+            err.code,
+            format!("exec stage {:?}: {}{violation}", err.stage, err.message),
+        ),
+        stage,
+    }
 }
 
 #[cfg(test)]
@@ -2411,7 +2756,7 @@ mod tests {
                 "--exact",
                 "exec::tests::rep5_sup6_1698_entrypoint_mode_log_returns_with_full_stderr_pipe",
                 "--test-threads=1",
-                "--nocapture",
+                "--no-capture",
             ])
             .env(FULL_STDERR_CHILD_ENV, "1")
             .stdin(Stdio::null())
@@ -2882,16 +3227,17 @@ mod tests {
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
             line,
-            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
+            b"ok command - - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
         );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
-        // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
+        // 補助グループの扱いは 4 通りとも往復する（TASK-163 追補・#1457）。
         for (groups, text) in [
             (SupplementaryGroups::AlreadyEmpty, "already_empty 0"),
             (
                 SupplementaryGroups::KeptSetgroupsDenied { kept: 7 },
                 "kept_setgroups_denied 7",
             ),
+            (SupplementaryGroups::Applied { count: 2 }, "applied 2"),
         ] {
             let outcome = ExecOutcome {
                 supplementary_groups: groups,
@@ -2900,7 +3246,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 15 1 23 3 120 {text} sealed_copy - 4321\n")
+                format!("ok command - - - signaled 15 15 1 23 3 120 {text} sealed_copy - 4321\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -2927,7 +3273,7 @@ mod tests {
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
                 format!(
-                    "ok command - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code} 4321\n"
+                    "ok command - - - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code} 4321\n"
                 )
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
@@ -2938,77 +3284,125 @@ mod tests {
         for (exit, text) in [
             (
                 ExecExit::Command(ChildExit::Exited(126)),
-                "command - exited 126",
+                "command - - - exited 126",
+            ),
+            // `R` の後の `execveat` の失敗（違反なし）の分類が往復する（#2763）。
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(127),
+                    violation: None,
+                    code: ErrorCode::NotFound,
+                    step: Some(ExecChildStep::Execveat),
+                },
+                "setup - NOT_FOUND execveat exited 127",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::Execveat),
                 },
-                "setup - exited 126",
+                "setup - PERMISSION_DENIED execveat exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                    code: ErrorCode::InvalidArgument,
+                    step: Some(ExecChildStep::Execveat),
+                },
+                "setup - INVALID_ARGUMENT execveat exited 126",
+            ),
+            (
+                ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                    code: ErrorCode::Internal,
+                    step: Some(ExecChildStep::Execveat),
+                },
+                "setup - INTERNAL execveat exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointInterpreterIsRuntimeBinary),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_interpreter_is_runtime_binary exited 126",
+                "setup entrypoint_interpreter_is_runtime_binary PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::StdioNullNotNullDevice),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup stdio_null_not_null_device exited 126",
+                "setup stdio_null_not_null_device PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointCopyTooLarge),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_copy_too_large exited 126",
+                "setup entrypoint_copy_too_large PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointCopySealUnverified),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_copy_seal_unverified exited 126",
+                "setup entrypoint_copy_seal_unverified PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointOnNoexecMount),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_on_noexec_mount exited 126",
+                "setup entrypoint_on_noexec_mount PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::EntrypointIsRuntimeBinary),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup entrypoint_is_runtime_binary exited 126",
+                "setup entrypoint_is_runtime_binary PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::ExecDevNotDirectory),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup exec_dev_not_directory exited 126",
+                "setup exec_dev_not_directory PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Exited(126),
                     violation: Some(ViolationReason::ExecProcNotProcfs),
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(ExecChildStep::OpenEntrypoint),
                 },
-                "setup exec_proc_not_procfs exited 126",
+                "setup exec_proc_not_procfs PERMISSION_DENIED open_entrypoint exited 126",
             ),
             (
                 ExecExit::SetupFailed {
                     exit: ChildExit::Signaled(9),
                     violation: None,
+                    code: ErrorCode::Internal,
+                    step: None,
                 },
-                "setup - signaled 9",
+                "setup - INTERNAL - signaled 9",
             ),
         ] {
             // コマンドの PID は起動したコマンドにだけ載る（`SetupFailed` は `-`）。
@@ -3032,64 +3426,84 @@ mod tests {
             ExecExit::Command(ChildExit::Exited(126)),
             ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
-                violation: None
+                violation: None,
+                code: ErrorCode::Internal,
+                step: None
             }
         );
 
         let err = TraitError::new(ErrorCode::Timeout, "exec timed out\nbefore x");
-        let line = encode_worker_result(&Err(err));
-        assert_eq!(line, b"err TIMEOUT - exec timed out before x\n");
+        let line = encode_worker_result(&Err(err.into()));
+        assert_eq!(line, b"err TIMEOUT - - exec timed out before x\n");
         let back = decode_worker_result(&line).unwrap_err();
         assert_eq!(back.violation, None);
         assert_eq!(back.error.code(), ErrorCode::Timeout);
         assert_eq!(back.error.message(), "exec timed out before x");
 
+        // REPAIR-1・ERR-1: 一覧は core の `ErrorCode::ALL` を共有するため `RESOURCE_EXHAUSTED` も通る。未知は malformed（fail-closed）。
+        let back = decode_worker_result(b"err RESOURCE_EXHAUSTED - - m\n").unwrap_err();
+        assert_eq!(back.error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(back.error.message(), "m");
+        let back = decode_worker_result(b"err BOGUS - - m\n").unwrap_err();
+        assert_eq!(back.error.code(), ErrorCode::Internal);
+        assert_eq!(
+            back.error.message(),
+            "exec stage Spawn: the exec worker returned a malformed result"
+        );
+        assert_eq!(back.violation, None);
+
         // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
         for deferred in [0usize, 1] {
             let line =
-                format!("ok command - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy - 7\n");
+                format!("ok command - - - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy - 7\n");
             let o = decode_worker_result(line.as_bytes()).expect("well-formed");
             assert_eq!((o.rlimits_applied, o.rlimits_deferred), (1, deferred));
         }
         for bad in [
             &b""[..],
-            b"ok command - exited 0 1 0 2 3 4 cleared 1",
-            b"ok command - exited 0 1 2 3\n",
-            b"ok command - exited 0 1 0 2 3 4\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared\n",
-            b"ok command - exited 0 1 0 2 3 4 unknown 1 sealed_copy -\n",
-            b"ok command - exited 0 1 0 2 3 4 already_empty 2 sealed_copy -\n",
-            b"ok command - weird 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1",
+            b"ok command - - - exited 0 1 2 3\n",
+            b"ok command - - - exited 0 1 0 2 3 4\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared\n",
+            b"ok command - - - exited 0 1 0 2 3 4 unknown 1 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 already_empty 2 sealed_copy -\n",
+            b"ok command - - weird 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
             // 実行方式の欄: 欠落・不正な組み合わせ・未知の理由コード。
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7 extra\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7 extra\n",
             // コマンドの PID の欄（#2236）: 欠落・0・負・非数値・符号つき・`u32` 超過・起動していないのに値がある。
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 0\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -5\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 0\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -5\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
             // 起動したコマンドの PID 欠落（`-`）は拒否する（exit_signal の監査が黙って省略されるのを防ぐ）。
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - -\n",
-            b"ok setup - exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command - - - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+            b"ok setup - INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            // 失敗の分類の欄（#2763）: 旧形式（欄なし）・`setup` の `-`・未知のコード・小文字・`command` に付くコード。
+            b"ok setup - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup - - - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup - BOGUS - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup - not_found - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command - NOT_FOUND - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の値域外（契約は 0 か 1。欄はすべて揃っている）。
-            b"ok command - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の欄が無い旧形式（#1579 以前の行。値域の検査で拒否される）。
-            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command - - - exited 0 1 2 3 4 cleared 1 sealed_copy - 7\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
             b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
-            b"ok command entrypoint_is_runtime_binary exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
-            b"ok setup rootfs_is_host_root exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command entrypoint_is_runtime_binary - - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok setup rootfs_is_host_root INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             // launch だけで生じる `target_moved`・exec 対象の理由は ok 行の違反に載らない（許可リスト外。記録しない。#1595）。
-            b"ok setup target_moved exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup exec_target_cgroup_mismatch exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
-            b"ok setup bogus exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup target_moved INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup exec_target_cgroup_mismatch INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup bogus INTERNAL - exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             b"hello\n",
             // 失敗行: 理由の欄が無い旧形式・未知の理由・種別の無い旧形式の理由・worker の経路で生じない理由・
             // 種別の食い違い（どれも記録せず `Internal`。#1614 の事後監査）。
@@ -3158,9 +3572,69 @@ mod tests {
         }
     }
 
+    /// SUP-6・REPAIR-3・REPAIR-4（#2822）: 子が失敗した手順の段は、core の全段が worker の結果行で往復する。
+    /// `command` に段があるもの・未知の段・段の欄が欠けた行は壊れた行（fail-closed）。
+    #[test]
+    fn sup6_2822_worker_result_carries_every_exec_child_step() {
+        let base = sample_outcome();
+        assert_eq!(fandhe_container_core::exec::exec_child_steps().len(), 15);
+        for step in fandhe_container_core::exec::exec_child_steps() {
+            let outcome = ExecOutcome {
+                exit: ExecExit::SetupFailed {
+                    exit: ChildExit::Exited(126),
+                    violation: None,
+                    code: ErrorCode::PermissionDenied,
+                    step: Some(*step),
+                },
+                command_pid: None,
+                ..base
+            };
+            let line = encode_worker_result(&Ok(outcome));
+            assert_eq!(
+                String::from_utf8(line.clone()).unwrap(),
+                format!(
+                    "ok setup - PERMISSION_DENIED {} exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+                    step.as_str()
+                )
+            );
+            assert_eq!(decode_worker_result(&line).unwrap(), outcome);
+            assert_eq!(
+                decode_worker_result(&line).unwrap().exit.failure_step(),
+                Some(*step)
+            );
+            // コマンドが起動したのに段がある行は壊れた行。
+            let bad = format!(
+                "ok command - - {} exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+                step.as_str()
+            );
+            assert!(decode_worker_result(bad.as_bytes()).is_err(), "{bad}");
+        }
+        for bad in [
+            &b"ok setup - PERMISSION_DENIED bogus_step exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n"[..],
+            b"ok setup - PERMISSION_DENIED EXECVEAT exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+            // 段の欄が無い（旧形式）。
+            b"ok setup - PERMISSION_DENIED exited 126 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+        ] {
+            assert!(decode_worker_result(bad).is_err(), "{bad:?}");
+        }
+        // 段が分からない `setup` は `-` で往復し、`None` に戻る。
+        let none = decode_worker_result(
+            b"ok setup - INTERNAL - exited 125 15 1 23 3 120 cleared 4 sealed_copy - -\n",
+        )
+        .unwrap();
+        assert_eq!(none.exit.failure_step(), None);
+        // 最長の行（最長の段・理由・コード）が上限に収まる。
+        assert!(
+            "ok setup entrypoint_copy_seal_unverified RESOURCE_EXHAUSTED select_executable signaled 2147483647 18446744073709551615 1 18446744073709551615 18446744073709551615 18446744073709551615 kept_setgroups_denied 18446744073709551615 pinned_inode lsm_apparmor -\n".len()
+                < WORKER_LINE_MAX
+        );
+    }
+
     fn sample_outcome() -> ExecOutcome {
-        decode_worker_result(b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n")
-            .expect("decode")
+        decode_worker_result(
+            b"ok command - - - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+        )
+        .expect("decode")
     }
 
     /// SEC-4・SUP-6（#2385）: worker の結果行の復号直後は受け渡しの証跡を持たない（親が受信の結果として載せる）。
@@ -3180,11 +3654,13 @@ mod tests {
         let failure = WorkerFailure {
             error: TraitError::new(ErrorCode::FailedPrecondition, "exec stage Validate: boom"),
             violation: Some(reason),
+            stage: Some(IsolationStage::Validate),
         };
         let got = reject_unacknowledged_exit(Err(failure)).unwrap_err();
         assert_eq!(got.error.code(), ErrorCode::FailedPrecondition);
         assert_eq!(got.error.message(), "exec stage Validate: boom");
         assert_eq!(got.violation, Some(reason));
+        assert_eq!(got.stage, Some(IsolationStage::Validate));
 
         let got = reject_unacknowledged_exit(Ok(sample_outcome())).unwrap_err();
         assert_eq!(got.error.code(), ErrorCode::Internal);
@@ -3218,7 +3694,7 @@ mod tests {
     #[test]
     fn sup6_task163_4_oversized_worker_message_is_truncated() {
         let err = TraitError::new(ErrorCode::Internal, "あ".repeat(100_000));
-        let line = encode_worker_result(&Err(err));
+        let line = encode_worker_result(&Err(err.into()));
         assert!(line.len() <= WORKER_LINE_MAX);
         assert_eq!(line.last(), Some(&b'\n'));
         let back = decode_worker_result(&line).unwrap_err().error;
@@ -3274,8 +3750,8 @@ mod tests {
 
     /// worker の経路の実際の拒否（core の `ExecError::from_violation` を `from_exec_error` で写したもの）。
     /// subject にホスト側パスを持たせ、結果行・メッセージ・記録のどこにも載らないことを確かめるために使う。
-    fn worker_violation_failure(reason: ViolationReason) -> TraitError {
-        from_exec_error(fandhe_container_core::exec::path_violation_error_for_test(
+    fn worker_violation_failure(reason: ViolationReason) -> WorkerError {
+        from_exec_error_staged(fandhe_container_core::exec::path_violation_error_for_test(
             reason,
             std::path::Path::new(HOST_SUBJECT),
         ))
@@ -3284,23 +3760,28 @@ mod tests {
     /// 違反の subject に持たせるホスト側パス（結果行・記録に現れてはならない）。
     const HOST_SUBJECT: &str = "/srv/fandhe/bundles/c1/rootfs";
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 13 理由すべてが結果行へ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: worker の経路の 16 理由すべてが結果行へ
     /// `<種別>/<理由>` として載り、往復で同じ理由に戻る。期待 cgroup パス・rootfs のパスはメッセージにも結果行にも載らない。
     #[test]
     fn sec4_sup6_task163_worker_line_carries_worker_violation_reason() {
-        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 13);
+        assert_eq!(ViolationReason::EXEC_WORKER_REASONS.len(), 16);
         for reason in ViolationReason::EXEC_WORKER_REASONS {
-            for err in [
-                exec_target_failure(reason),
-                worker_violation_failure(reason),
+            // 手組みの `TraitError` だけ（段なし）と、実経路の写像（段つき。16 理由すべてで `ExecError::stage` を運ぶ）。
+            for (staged, has_stage) in [
+                (WorkerError::from(exec_target_failure(reason)), false),
+                (worker_violation_failure(reason), true),
             ] {
+                let err = staged.error.clone();
+                let stage = staged.stage;
+                assert_eq!(stage.is_some(), has_stage, "{reason:?}");
                 assert_eq!(exec_worker_reason_of(&err), Some(reason), "{err:?}");
-                let line = encode_worker_result(&Err(err.clone()));
+                let line = encode_worker_result(&Err(staged));
                 let text = String::from_utf8(line.clone()).unwrap();
                 assert!(
                     text.starts_with(&format!(
-                        "err {} {}/{} ",
+                        "err {} {} {}/{} ",
                         err.code().as_str(),
+                        stage.map_or("-", IsolationStage::as_str),
                         reason.kind().as_str(),
                         reason.as_str()
                     )),
@@ -3309,15 +3790,18 @@ mod tests {
                 assert!(!text.contains(HOST_SUBJECT), "{text}");
                 let back = decode_worker_result(&line).unwrap_err();
                 assert_eq!(back.violation, Some(reason));
+                assert_eq!(back.stage, stage);
                 assert_eq!(back.error, err);
             }
         }
         // 実際の拒否の形: `reject_own_root` の `rootfs_is_host_root` は `InvalidArgument`・種別 `rootfs_pivot`。
         let err = worker_violation_failure(ViolationReason::RootfsIsHostRoot);
-        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, Some(IsolationStage::PrepareRootfs));
+        // ERR-4・#3294: 段の欄を足しても、メッセージ部分（ERR-1 の利用者向けの綴り）は従来のバイト列のまま。
         assert_eq!(
             String::from_utf8(encode_worker_result(&Err(err))).unwrap(),
-            "err INVALID_ARGUMENT rootfs_pivot/rootfs_is_host_root exec stage PrepareRootfs: \
+            "err INVALID_ARGUMENT prepare_rootfs rootfs_pivot/rootfs_is_host_root exec stage PrepareRootfs: \
              rootfs must not be the host root '/' (violation: rootfs_pivot/rootfs_is_host_root, CORE-1)\n"
         );
         // worker の経路で生じない違反（exec の子の entrypoint・launch だけの rootfs_pivot / mount_target）・
@@ -3334,29 +3818,38 @@ mod tests {
         ] {
             let err = TraitError::new(ErrorCode::FailedPrecondition, message);
             assert_eq!(exec_worker_reason_of(&err), None, "{message}");
-            let line = encode_worker_result(&Err(err));
+            // 違反を運ばない失敗は、段を持っていても段の欄は `-`（段は違反に付随する）。
+            let line = encode_worker_result(&Err(WorkerError {
+                error: err,
+                stage: Some(IsolationStage::SetNs),
+            }));
             let text = String::from_utf8(line.clone()).unwrap();
-            assert!(text.starts_with("err FAILED_PRECONDITION - "), "{text}");
+            assert!(text.starts_with("err FAILED_PRECONDITION - - "), "{text}");
             assert_eq!(decode_worker_result(&line).unwrap_err().violation, None);
         }
         assert_eq!(
-            worker_violation_failure(ViolationReason::ExecTargetCgroupMismatch).message(),
+            worker_violation_failure(ViolationReason::ExecTargetCgroupMismatch)
+                .error
+                .message(),
             "exec stage SetNs: the exec target does not belong to the recorded container cgroup \
              (violation: exec_target/exec_target_cgroup_mismatch, SEC-1)"
         );
     }
 
-    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 13 理由それぞれ
+    /// SEC-4・SUP-6・SEC-1・TASK-163 追補（#1465）・#1614 の事後監査: 親側の記録は worker の経路の 16 理由それぞれ
     /// 1 件・パスなし・自 PID。種別 `exec_target` は層 `exec_target` と理由コード、`rootfs_is_host_root` は層 `mount`
     /// （理由コード `rootfs_is_host_root` つき）。違反なしの失敗は 0 件で `NotApplicable`、失敗する sink でも拒否は元のまま。
     #[test]
     fn sec4_sup6_task163_parent_records_one_audit_per_worker_rejection() {
         for reason in ViolationReason::EXEC_WORKER_REASONS {
-            let err = worker_violation_failure(reason);
+            let staged = worker_violation_failure(reason);
+            let err = staged.error.clone();
+            let expected_stage = staged.stage;
+            assert!(expected_stage.is_some(), "{reason:?}");
             let sink = RecordingSink::new(false);
-            let failure =
-                decode_worker_result(&encode_worker_result(&Err(err.clone()))).unwrap_err();
+            let failure = decode_worker_result(&encode_worker_result(&Err(staged))).unwrap_err();
             assert_eq!(failure.violation, Some(reason));
+            assert_eq!(failure.stage, expected_stage);
             let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
             assert_eq!(rejected.error, err);
             assert_eq!(rejected.delivery, AuditDelivery::Recorded);
@@ -3377,11 +3870,18 @@ mod tests {
             assert_eq!(recs[0].syscall(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
             assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+            // #3294: worker の `err` 行の段が記録の `stage` に載る（`ExecError::stage` 由来）。
+            assert_eq!(
+                recs[0].stage().map(|s| s.as_str()),
+                expected_stage.map(IsolationStage::as_str),
+                "{reason:?}"
+            );
 
             let failing = RecordingSink::new(true);
             let failure = WorkerFailure {
                 error: err.clone(),
                 violation: Some(reason),
+                stage: expected_stage,
             };
             let rejected = audit_worker_result(Err(failure), Some(&cid()), &failing).unwrap_err();
             assert_eq!(rejected.error, err);
@@ -3401,10 +3901,19 @@ mod tests {
 
     /// `SetupFailed` の結果（違反の理由は `violation`）。
     fn setup_failed(violation: Option<ViolationReason>) -> ExecOutcome {
+        setup_failed_at(violation, None)
+    }
+
+    fn setup_failed_at(
+        violation: Option<ViolationReason>,
+        step: Option<ExecChildStep>,
+    ) -> ExecOutcome {
         ExecOutcome {
             exit: ExecExit::SetupFailed {
                 exit: ChildExit::Exited(126),
                 violation,
+                code: ErrorCode::PermissionDenied,
+                step,
             },
             command_pid: None,
             rlimits_applied: 15,
@@ -3425,6 +3934,21 @@ mod tests {
     /// 失敗する sink でも結果は不変で `SinkFailed` を返す。
     #[test]
     fn sec4_sup6_task163_parent_records_one_audit_per_setup_violation() {
+        // #3209: 段が届いていれば launch と同じ語彙（entrypoint の違反は exec）で載り、無ければ載せない。
+        for reason in exec_child_violation_reasons() {
+            for (step, want) in [
+                (Some(ExecChildStep::OpenEntrypoint), Some("exec")),
+                (Some(ExecChildStep::CgroupJoin), Some("cgroup_join")),
+                (None, None),
+            ] {
+                let sink = RecordingSink::new(false);
+                let outcome = setup_failed_at(Some(*reason), step);
+                audit_worker_result(Ok(outcome), Some(&cid()), &sink).unwrap();
+                let recs = sink.snapshot();
+                assert_eq!(recs.len(), 1, "{reason:?}");
+                assert_eq!(recs[0].stage().map(|s| s.as_str()), want, "{reason:?}");
+            }
+        }
         for reason in exec_child_violation_reasons() {
             let outcome = setup_failed(Some(*reason));
             let sink = RecordingSink::new(false);
@@ -3502,6 +4026,8 @@ mod tests {
             ExecExit::SetupFailed {
                 exit: ChildExit::Signaled(31),
                 violation: None,
+                code: ErrorCode::Internal,
+                step: None,
             },
         ] {
             let outcome = ExecOutcome { exit, ..sigsys };
@@ -3541,7 +4067,7 @@ mod tests {
     #[test]
     fn sup6_task163_3_missing_config_is_not_found_without_path() {
         let dir = bundle_dir("missing");
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(
@@ -3555,7 +4081,7 @@ mod tests {
     fn sup6_task163_3_invalid_config_is_invalid_argument() {
         let dir = bundle_dir("invalid");
         std::fs::write(dir.join("config.json"), b"{not json").unwrap();
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert!(
@@ -3589,7 +4115,7 @@ mod tests {
     fn sup6_task163_3_unpinnable_rootfs_is_rejected() {
         let dir = bundle_dir("norootfs");
         std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(
             err.message(),
@@ -3598,7 +4124,7 @@ mod tests {
 
         std::fs::create_dir(dir.join("real")).unwrap();
         std::os::unix::fs::symlink(dir.join("real"), dir.join("rootfs")).unwrap();
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
@@ -3610,7 +4136,7 @@ mod tests {
             br#"{"ociVersion":"1.2.0","root":{"path":"/"}}"#,
         )
         .unwrap();
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
@@ -3619,7 +4145,7 @@ mod tests {
         );
     }
 
-    /// 検証後の差し替えを模した pin の失敗を、本番と同じ連鎖（`from_pin_error` → 結果行の符号化・復号 →
+    /// 検証後の差し替えを模した pin の失敗を、本番と同じ連鎖（`from_pin_error_staged` → 結果行の符号化・復号 →
     /// `audit_worker_result`）で親側の記録まで通す。
     fn pin_rejection_recorded(
         name: &str,
@@ -3632,16 +4158,20 @@ mod tests {
         std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
         std::fs::create_dir(dir.join("rootfs")).unwrap();
         let config = load_config(&dir.join("config.json")).unwrap();
-        let err = fandhe_container_core::oci_runtime::pin_bundle_rootfs_with_swap_for_test(
+        let staged = fandhe_container_core::oci_runtime::pin_bundle_rootfs_with_swap_for_test(
             &dir,
             &config,
             || swap(&dir),
         )
         .map(|_| ())
-        .map_err(from_pin_error)
+        .map_err(from_pin_error_staged)
         .unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
-        let failure = decode_worker_result(&encode_worker_result(&Err(err.clone()))).unwrap_err();
+        // 検証後の差し替えは呼び出し点の段 `Validate` を運び、記録の `stage` に載る（#3294）。
+        assert_eq!(staged.stage, Some(IsolationStage::Validate));
+        let err = staged.error.clone();
+        let failure = decode_worker_result(&encode_worker_result(&Err(staged))).unwrap_err();
+        assert_eq!(failure.stage, Some(IsolationStage::Validate));
         let sink = RecordingSink::new(false);
         let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
         assert_eq!(rejected.error, err);
@@ -3674,6 +4204,11 @@ mod tests {
             assert_eq!(recs[0].path(), None);
             assert_eq!(recs[0].pid().get(), std::process::id());
             assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+            assert_eq!(
+                recs[0].stage().map(|s| s.as_str()),
+                Some("validate"),
+                "{name}"
+            );
         }
     }
 
@@ -3683,7 +4218,7 @@ mod tests {
         // 検証前の失敗（rootfs 不在）。
         let dir = bundle_dir("novio");
         std::fs::write(dir.join("config.json"), MINIMAL_CONFIG).unwrap();
-        let err = load_exec_bundle(&dir).unwrap_err();
+        let err = load_exec_bundle(&dir).unwrap_err().error;
         assert_eq!(
             err.message(),
             "exec stage Validate: rootfs directory not found"
@@ -3695,9 +4230,12 @@ mod tests {
         std::fs::remove_dir(&link).unwrap();
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         std::fs::create_dir(dir.join("rootfs")).unwrap();
-        let err = load_exec_bundle(&link).unwrap_err();
+        let staged = load_exec_bundle(&link).unwrap_err();
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
+        // 違反を伴わない失敗は段も運ばない（記録しないため）。
+        assert_eq!(staged.stage, None);
+        let err = staged.error.clone();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
@@ -3705,9 +4243,76 @@ mod tests {
         );
         assert_eq!(exec_worker_reason_of(&err), None);
         let sink = RecordingSink::new(false);
-        let failure = decode_worker_result(&encode_worker_result(&Err(err))).unwrap_err();
+        let failure = decode_worker_result(&encode_worker_result(&Err(staged))).unwrap_err();
         let rejected = audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
         assert_eq!(rejected.delivery, AuditDelivery::NotApplicable);
         assert_eq!(sink.snapshot().len(), 0);
+    }
+
+    /// ERR-4・SEC-4・#3294: 欄の無い旧形式の `err` 行は壊れた行として拒否し（`Internal`・違反も段も運ばない）、記録しない
+    /// （fail-closed）。段を違反の欄の前に置くため、旧形式の違反の欄・メッセージ先頭の語は段として受理されない。
+    #[test]
+    fn sec4_err4_3294_err_line_without_stage_field_is_malformed() {
+        for line in [
+            // 旧形式・違反あり（違反の欄が段の欄に入り、未知のトークンになる）。
+            &b"err FAILED_PRECONDITION exec_target/exec_target_not_nested_pid1 exec stage SetNs: x (violation: exec_target/exec_target_not_nested_pid1, SUP-6)\n"[..],
+            // 旧形式・違反なし（違反の欄が欠け、メッセージ先頭の `exec` は有効な段トークンだが違反の欄が壊れている）。
+            b"err INTERNAL - exec stage Spawn: x\n",
+            b"err INTERNAL -\n",
+            // 不正な段の欄: Debug 綴り・未知・違反なしで段あり・違反の欄の欠け。
+            b"err INTERNAL SetNs exec_target/exec_target_not_nested_pid1 m\n",
+            b"err INTERNAL bogus exec_target/exec_target_not_nested_pid1 m\n",
+            b"err INTERNAL set_ns - m\n",
+            b"err INTERNAL set_ns\n",
+        ] {
+            let failure = decode_worker_result(line).unwrap_err();
+            assert_eq!(failure.error.code(), ErrorCode::Internal, "{line:?}");
+            assert_eq!(
+                failure.error.message(),
+                "exec stage Spawn: the exec worker returned a malformed result",
+                "{line:?}"
+            );
+            assert_eq!(failure.violation, None, "{line:?}");
+            assert_eq!(failure.stage, None, "{line:?}");
+        }
+    }
+
+    /// ERR-4・SEC-4・#3294: core の全段が `err` 行の段の欄を往復し、親の記録の `stage` に載る（語彙は監査と同一）。
+    /// 段が無い違反は段なしで記録される（推測で捏造しない）。
+    #[test]
+    fn sec4_err4_3294_every_stage_round_trips_into_the_audit_record() {
+        let reason = ViolationReason::ExecTargetNotNestedPid1;
+        for stage in IsolationStage::ALL {
+            let staged = WorkerError {
+                error: exec_target_failure(reason),
+                stage: Some(stage),
+            };
+            let line = encode_worker_result(&Err(staged));
+            let text = String::from_utf8(line.clone()).unwrap();
+            assert!(
+                text.starts_with(&format!(
+                    "err FAILED_PRECONDITION {} exec_target/exec_target_not_nested_pid1 ",
+                    stage.as_str()
+                )),
+                "{text}"
+            );
+            let failure = decode_worker_result(&line).unwrap_err();
+            assert_eq!(failure.stage, Some(stage));
+            let sink = RecordingSink::new(false);
+            audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].stage().map(|s| s.as_str()), Some(stage.as_str()));
+        }
+        let sink = RecordingSink::new(false);
+        let failure = WorkerFailure {
+            error: exec_target_failure(reason),
+            violation: Some(reason),
+            stage: None,
+        };
+        audit_worker_result(Err(failure), Some(&cid()), &sink).unwrap_err();
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].stage(), None);
     }
 }

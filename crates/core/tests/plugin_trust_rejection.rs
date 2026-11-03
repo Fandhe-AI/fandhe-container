@@ -4,13 +4,13 @@
 //! 他ユーザー書き込み可能ディレクトリ・許可一覧に無いハッシュ・symlink 経由の信頼できない実体の
 //! 3 種の拒否を具体値（kind・target・path・reason・ErrorCode）で照合する。
 //!
-//! - fixture は `/` からの全祖先検証を通すため `$HOME` 直下に作る（`/tmp` は sticky の
-//!   world-writable で祖先として拒否される）。ディレクトリのモードは `set_permissions` で明示し
+//! - fixture は `/` からの全祖先検証を通すため、Linux は `$HOME` 直下、macOS は正規化した
+//!   `temp_dir()` 直下に作る（`/tmp` は sticky の world-writable で祖先として拒否される）。ディレクトリのモードは `set_permissions` で明示し
 //!   umask に依存させない。`$HOME` 自体のモードは変更しない。
 //! - 別 UID（非 root）所有の実体を使う試験だけは chown（root）が要るため `#[ignore]` の
 //!   実機前提テストとして分離する（AGENTS.md「実機前提テスト」・`.claude/rules/ci.md`）。
-//! - 検証本体は Linux のみ実装（非 Linux は fail-closed。`plugin_trust.rs` の結合試験が担保）。
-//!   実ファイル系は `cfg(target_os = "linux")`。
+//! - 検証本体は Linux・macOS（#1865）で実装（Windows は fail-closed。`plugin_trust.rs` の結合試験が担保）。
+//!   実ファイル系は `cfg(any(target_os = "linux", target_os = "macos"))`。
 
 use fandhe_container_core::plugin_trust::{AllowedPluginHashes, Sha256Digest};
 
@@ -24,7 +24,7 @@ fn plug11_task122_6_unlisted_digest_is_not_contained() {
     assert!(!list.contains(&other));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod rejection {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -45,12 +45,30 @@ mod rejection {
     /// `PAYLOAD_SHA` と一致しない任意の sha256 値。
     const OTHER_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
-    /// `$HOME` 直下の一意なディレクトリ。Drop で（panic 時も）削除して残骸を残さない。
+    /// fixture の置き場所。Linux は `$HOME`、macOS は正規化した `temp_dir()`（`$HOME` 配下の
+    /// 既定の拡張 ACL を避ける。#1865）。全祖先検証を通ることを前提として明示的に確かめる。
+    fn fixture_base() -> PathBuf {
+        #[cfg(target_os = "linux")]
+        let base = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        #[cfg(target_os = "macos")]
+        let base = fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        if let Err(e) = verify_plugin_dir(&base) {
+            panic!(
+                "fixture base {} is not trusted: kind={:?} path={}",
+                base.display(),
+                e.kind(),
+                e.path().display()
+            );
+        }
+        base
+    }
+
+    /// 基底直下の一意なディレクトリ。Drop で（panic 時も）削除して残骸を残さない。
     struct Fixture(PathBuf);
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+            let home = fixture_base();
             // 既存ディレクトリを削除しない: 名前に時刻 ns・カウンタを混ぜ、`create_dir`
             // （既存なら AlreadyExists で失敗するアトミックな新規作成）に成功したものだけを
             // 自分の所有物として Drop で削除する。衝突時は別名で再試行する。

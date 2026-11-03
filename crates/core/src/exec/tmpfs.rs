@@ -684,15 +684,23 @@ pub(super) mod tests {
         CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
-    pub(in crate::exec) struct Tmp(pub(in crate::exec) PathBuf);
+    /// 排他作成した `ScratchDir` の子（pid だけの名前を先に消す旧方式の置き換え。#3434・REPAIR-12）。
+    pub(in crate::exec) struct Tmp(
+        pub(in crate::exec) PathBuf,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        crate::scratch_root::ScratchDir,
+    );
     impl Tmp {
         pub(in crate::exec) fn new(tag: &str) -> Self {
-            let p = std::fs::canonicalize(std::env::temp_dir())
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-tmpfs-{tag}"),
+                std::time::Duration::from_secs(10),
+            );
+            let p = std::fs::canonicalize(scratch.path())
                 .expect("tmp")
-                .join(format!("fandhe-tmpfs-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).expect("mkdir");
-            Self(p)
+                .join("d");
+            std::fs::create_dir(&p).expect("mkdir");
+            Self(p, scratch)
         }
         pub(in crate::exec) fn fd(&self) -> OwnedFd {
             sys::open_dir_path_nofollow(
@@ -702,12 +710,6 @@ pub(super) mod tests {
             .expect("open")
         }
     }
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn set(specs: &[(&str, Option<u64>)]) -> TmpfsMountSet {
         let mut s = TmpfsMountSet::new();
         for (d, size) in specs {

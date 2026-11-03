@@ -49,6 +49,8 @@ fn main() {
     )
 ))]
 fn main() {
+    // 分類の自己照合（既定のテスト集合でも常に走る。出力はしない）。
+    precondition::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
         println!("cgroups: CORE-3 cgroup limits and join verified");
@@ -56,6 +58,17 @@ fn main() {
         println!("cgroups: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)");
     }
 }
+
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・#2956・REPAIR-12）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/precondition.rs"]
+mod precondition;
 
 #[cfg(all(
     target_os = "linux",
@@ -70,8 +83,8 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::cgroups::{
-        CgroupJoin, CgroupName, Controller, ControllerSet, CpuMax, CpuQuota, DelegatedCgroup,
-        MemoryLimit, MemoryLimits,
+        CgroupJoin, CgroupName, Controller, ControllerSet, CpuMax, CpuQuota, MemoryLimit,
+        MemoryLimits,
     };
     use fandhe_container_core::exec::{
         ChildExit, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace, NamespaceSet,
@@ -159,7 +172,7 @@ mod linux {
     }
 
     pub fn run() {
-        let delegated = DelegatedCgroup::detect().expect("detect delegated cgroup v2");
+        let delegated = crate::precondition::delegated_cgroup();
         let id = ContainerId::new(format!("s{}", std::process::id())).expect("container id");
         let name = CgroupName::new(&id).expect("cgroup name");
         // detect / prepare / 制限設定 / join_hook は isolate より前（pivot 後はホストの cgroupfs が見えない）。

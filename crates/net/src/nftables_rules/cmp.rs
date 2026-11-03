@@ -35,10 +35,13 @@ use super::{NftDataValue, NftExpr, NftExprAttr, NftExprName, NftRegister, data_l
 use crate::error::NetError;
 
 /// 比較元レジスタ（`NFTA_CMP_SREG`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CMP_SREG: u16 = 1;
 /// 比較演算子（`NFTA_CMP_OP`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CMP_OP: u16 = 2;
 /// 比較対象データ（ネスト。`NFTA_CMP_DATA`）。
+/// （出典: `include/uapi/linux/netfilter/nf_tables.h`。Linux 7.0.14 の uapi〔linux-libc-dev 7.0.0-38.38〕で値を確認。libc 0.2.189 に無い）
 pub const NFTA_CMP_DATA: u16 = 3;
 
 const CMP_EXPR_NAME: &str = "cmp";
@@ -305,6 +308,40 @@ mod tests {
         for (i, c) in cases.iter().enumerate() {
             let e = NftCmp::from_expr(c).expect_err("reject");
             assert_eq!(e.code(), NetErrorCode::DataLoss, "case {i}");
+        }
+    }
+}
+
+/// cmp expr の演算子の `libc` 照合（NET-1・MVM-4・REPAIR-12。#3102。方式は `docs/design/ffi-libc-check.md`）。
+/// 宣言と同じく Linux の試験ビルド限定。`wire_value`（`const fn`）を評価で照合する。
+/// `libc` に無い `NFTA_CMP_*` は定義の横に出典を書いた。
+#[cfg(all(test, target_os = "linux"))]
+mod libc_abi {
+    use super::NftCmpOp;
+    use core::ffi::c_int;
+
+    const _: () = {
+        libc_const_eq!(NftCmpOp::Eq.wire_value(), u32, libc::NFT_CMP_EQ, c_int);
+        libc_const_eq!(NftCmpOp::Neq.wire_value(), u32, libc::NFT_CMP_NEQ, c_int);
+        libc_const_eq!(NftCmpOp::Lt.wire_value(), u32, libc::NFT_CMP_LT, c_int);
+        libc_const_eq!(NftCmpOp::Lte.wire_value(), u32, libc::NFT_CMP_LTE, c_int);
+        libc_const_eq!(NftCmpOp::Gt.wire_value(), u32, libc::NFT_CMP_GT, c_int);
+        libc_const_eq!(NftCmpOp::Gte.wire_value(), u32, libc::NFT_CMP_GTE, c_int);
+    };
+
+    /// 逆変換 `from_wire` が `libc` の値から全演算子を復元できること。
+    #[test]
+    fn from_wire_accepts_every_libc_cmp_op() {
+        let ops = [
+            (libc::NFT_CMP_EQ, NftCmpOp::Eq),
+            (libc::NFT_CMP_NEQ, NftCmpOp::Neq),
+            (libc::NFT_CMP_LT, NftCmpOp::Lt),
+            (libc::NFT_CMP_LTE, NftCmpOp::Lte),
+            (libc::NFT_CMP_GT, NftCmpOp::Gt),
+            (libc::NFT_CMP_GTE, NftCmpOp::Gte),
+        ];
+        for (raw, expected) in ops {
+            assert_eq!(NftCmpOp::from_wire(raw as u32).unwrap(), expected);
         }
     }
 }

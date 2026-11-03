@@ -13,7 +13,7 @@
 //!
 //! manifest の在庫と構成・タグ・pull リースは、別ファイル `@image-inventory.json` に永続化する（#2380。
 //! `inventory_persist`）。各操作が書き換えるのはどちらか一方のファイルだけで、
-//! 両方を同じ排他区間で読み直す。在庫ファイルが無い（本番で在庫を埋める経路は未実装）場合などは、
+//! 両方を同じ排他区間で読み直す。在庫ファイルが無い（`PullImage` への到達前など、在庫がまだ空）場合などは、
 //! 読み直した直後のエントリがテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
 //! 一覧・照合・`remove_manifest` の参照確認は manifest の在庫が無くても正しく動く。一方 blob の参照は
 //! manifest の構成から数えるため、在庫に無い manifest への参照は構成が分からず、その manifest だけが
@@ -45,7 +45,7 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use super::root_handle::RootHandle;
+use super::root_handle::{RootHandle, map_root_io};
 use super::{ContainerRefEntry, ContainerRefGeneration, ContainerRefId, ReferenceTable};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::Digest;
@@ -182,11 +182,13 @@ fn load_with_limits(
     let pre = match root.stat_name(CONTAINER_REFS_FILE_NAME) {
         Ok(Some(m)) => m,
         Ok(None) => return Ok(None),
-        Err(_) => {
-            return Err(e(
-                OciErrorCode::Internal,
-                "failed to inspect the container refs file",
-            ));
+        Err(err) => {
+            return Err(map_root_io(&err, || {
+                e(
+                    OciErrorCode::Internal,
+                    "failed to inspect the container refs file",
+                )
+            }));
         }
     };
     check_trust(&pre)?;
@@ -198,7 +200,7 @@ fn load_with_limits(
     };
     let file = root
         .open_read(CONTAINER_REFS_FILE_NAME)
-        .map_err(|_| open_failed())?
+        .map_err(|err| map_root_io(&err, open_failed))?
         .ok_or_else(open_failed)?;
     let post = file.metadata().map_err(|_| {
         e(
@@ -467,16 +469,18 @@ fn save_with_limits(
 /// 一時ファイルを書いて固定名へ公開し、root を fsync する。すべて検査済み root の fd 起点（#2638）。
 fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), OciError> {
     let fail = |msg: &'static str| e(OciErrorCode::Internal, msg);
+    // root 配下の別マウント（EXDEV）は対応外として原因を示す（#2701）。
+    let fail_io = |err: &std::io::Error, msg: &'static str| map_root_io(err, || fail(msg));
     let mut f = root
         .create_new(tmp)
-        .map_err(|_| fail("failed to create the container refs temp file"))?;
+        .map_err(|err| fail_io(&err, "failed to create the container refs temp file"))?;
     f.write_all(bytes)
         .map_err(|_| fail("failed to write the container refs temp file"))?;
     f.sync_all()
         .map_err(|_| fail("failed to sync the container refs temp file"))?;
     drop(f);
     root.rename(tmp, CONTAINER_REFS_FILE_NAME)
-        .map_err(|_| fail("failed to replace the container refs file"))?;
+        .map_err(|err| fail_io(&err, "failed to replace the container refs file"))?;
     // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。
     root.sync()
         .map_err(|_| fail("failed to sync the image store directory"))?;
@@ -508,6 +512,8 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        // PID の再利用で前回の実行の残骸と名前が衝突しうるため、作る前に消す（#3237）。
+        let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).expect("mkdir");
         #[cfg(unix)]
         {

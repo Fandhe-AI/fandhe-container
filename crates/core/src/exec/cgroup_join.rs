@@ -425,11 +425,9 @@ mod tests {
     use std::fs::File;
     use std::os::fd::OwnedFd;
 
-    fn tmp(label: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("fandhe-execcg-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp(label: &str) -> (crate::scratch_root::ScratchDir, std::path::PathBuf) {
+        // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        crate::test_support::scratch_child(&format!("fandhe-execcg-{label}"), "d")
     }
 
     fn join_with(d: &Path, self_cgroup: &str, expected: &str) -> ExecCgroupJoin {
@@ -445,7 +443,7 @@ mod tests {
     /// SUP-6・TASK-163.2: `cgroup.procs` へ自 PID が書かれ、自プロセスの cgroup が期待パスと一致すれば成功する。
     #[test]
     fn sup6_task163_2_join_writes_own_pid_to_cgroup_procs() {
-        let d = tmp("ok");
+        let (_scratch, d) = tmp("ok");
         let j = join_with(&d, "0::/s/fc-c1@7\n", "/s/fc-c1@7");
         let report = join_cgroup(j).unwrap();
         assert_eq!(report.pid.get(), std::process::id());
@@ -454,7 +452,6 @@ mod tests {
             std::fs::read_to_string(d.join("cgroup.procs")).unwrap(),
             std::process::id().to_string()
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// SUP-6・SEC-1・TASK-163.2: 参加後の自プロセスの cgroup が期待と違えば（別・配下・v1・改行なし・複数行）
@@ -471,7 +468,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let d = tmp(&format!("mismatch{i}"));
+            let (_scratch, d) = tmp(&format!("mismatch{i}"));
             let err = join_cgroup(join_with(&d, own, "/s/fc-c1@7")).unwrap_err();
             assert_eq!(err.code, ErrorCode::FailedPrecondition, "{own:?}");
             assert_eq!(err.stage, IsolationStage::CgroupJoin);
@@ -480,7 +477,6 @@ mod tests {
                 "own cgroup does not match the container cgroup after the join"
             );
             assert!(err.violation.is_none());
-            let _ = std::fs::remove_dir_all(&d);
         }
     }
 

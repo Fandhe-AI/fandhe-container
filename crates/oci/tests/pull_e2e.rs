@@ -5,8 +5,10 @@
 //! （REPAIR-4。トークン・URL は出さない）と要約行で報告する。1 件でも失敗すれば非 0 で終了する（fail-closed）。
 //!
 //! 1. 匿名認証 → manifest 取得（image index は host の linux platform へ解決）→ config と全レイヤーの取得
-//! 2. 全 blob の digest 検証（`layer::verify_fetched_blob`。検証前のファイルは展開・パースしない）
-//! 3. レイヤーの展開（`layer::extract::extract_layer_blobs`。whiteout 統合済み。パス検証・hardlink 制限は
+//! 2. 全 blob の digest 検証（`PullSession::verify_staged_blob` の後、`open_verified_staged_blob` が fd 起点で開いたハンドルを、レイヤーは `layer::VerifiedLayerBlob::from_file` で
+//!    信頼条件と digest を同じハンドルで確かめる。検証前のファイルは展開・パースしない）
+//! 3. レイヤーの展開（`layer::extract::extract_image_layers`。検証済みハンドルだけを受け、展開後 tar の sha256 を
+//!    image config の `rootfs.diff_ids` と突合する。whiteout 統合済み。パス検証・hardlink 制限は
 //!    oci 側に任せ、ハーネスで緩めない）→ `proc`/`dev`/`sys` の補完 → image config から `config.json` を生成
 //! 4. TASK-29 の `create` → `start`（本番 `ProductionLauncher`）で実行し、終了コード 0 を確認
 //!
@@ -40,7 +42,13 @@
 //! - registry-1.docker.io への外向き HTTPS（匿名 pull。Docker Hub のレート制限で失敗しうる）
 //! - exec 可能で十分な空きのある作業ディレクトリ
 //!
-//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。GitHub ホステッド runner では
+//! 前提が満たされない場合も失敗として扱い、検証せずに成功する分岐は持たない。Landlock ABI 6 以上の欠如・委譲 cgroup の欠如と、
+//! opt-in 時の範囲写像の前提欠如（`uidmap`・subuid / subgid）は、1 行目が
+//! `pull_e2e: PRECONDITION FAILED (test environment, not a <landlock|cgroup delegation|...> regression): ...` になる
+//! （Landlock は事前検出が無かったころ、全イメージの pull・展開の後に run 段の `FAILED_PRECONDITION` で落ちていた。
+//! 今は通信の前に失敗する。#3144）（分類は core の
+//! `tests/support/precondition.rs`。#3028・REPAIR-12）。非 root の要求（root での実行の拒否）は従来どおり
+//! `pull_e2e: FAILED setup: ...` のままで、前提欠如の新種別にするかはオーナー判断待ち。GitHub ホステッド runner では
 //! 保証できないため CI には組み込まない（ci.md「実機前提テスト」）。
 //!
 //! ```text
@@ -60,7 +68,6 @@
 //!   `FANDHE_CONTAINER_TEST_ID_HELPER=1`（`production_launcher` のシナリオ I と同じ opt-in）を指定する
 //! - `process.user.additionalGids`・cwd の symlink の追従・setuid ビットの保持は未実装（cwd に symlink を含む image は
 //!   start が拒否する）
-//! - manifest の `diff_id` の検証は未実装（config blob と各レイヤーの digest のみ）
 //! - gzip 以外（zstd・無圧縮）のレイヤーは `UNIMPLEMENTED` として失敗にする
 //! - stdin は `/dev/null` に置き換わるため、対話シェルを Cmd にしたイメージは EOF で終了する
 //! - 展開時にデバイス・FIFO・hardlink 制限等で失敗するイメージは、ハーネスで回避せず #421 の所見として記録する
@@ -95,6 +102,18 @@ fn main() {
     linux::main();
 }
 
+/// 前提欠如（Landlock・委譲 cgroup・opt-in 時の範囲写像）を `PRECONDITION FAILED` の 1 行目で報告する共有部品
+/// （core の `tests/support/precondition.rs` の正本を取り込む。`#[path]` は `mod linux` の外に置く。#3028）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "../../core/tests/support/precondition.rs"]
+mod precondition;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -112,7 +131,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
-    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup};
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
@@ -121,11 +140,14 @@ mod linux {
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerId, CreateRequest, StartRequest, TraitError};
+    use fandhe_container_oci::config::parse_image_config_rootfs;
     use fandhe_container_oci::error::{OciError, OciErrorCode};
-    use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blobs};
+    use fandhe_container_oci::image_management::{ImageStore, PullSession};
+    use fandhe_container_oci::layer::extract::{
+        ExtractLimits, ImageLayer, extract_image_layers, image_layers_from,
+    };
     use fandhe_container_oci::layer::{
-        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, verify_blob_digest,
-        verify_fetched_blob,
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, VerifiedLayerBlob, verify_blob_digest,
     };
     use fandhe_container_oci::manifest::Platform;
     use fandhe_container_oci::reference::ImageReference;
@@ -246,7 +268,7 @@ mod linux {
         let mut i = 0usize;
         while let Some(arg) = argv.get(i) {
             match arg.as_str() {
-                "--ignored" | "--nocapture" => i += 1,
+                "--ignored" | "--nocapture" | "--no-capture" => i += 1,
                 "--work-dir" => {
                     let v = argv.get(i + 1).ok_or("--work-dir needs a value")?;
                     check_arg(v)?;
@@ -265,7 +287,11 @@ mod linux {
                         while let Some(a) = argv.get(i) {
                             if matches!(
                                 a.as_str(),
-                                "--image" | "--work-dir" | "--ignored" | "--nocapture"
+                                "--image"
+                                    | "--work-dir"
+                                    | "--ignored"
+                                    | "--nocapture"
+                                    | "--no-capture"
                             ) {
                                 break;
                             }
@@ -484,18 +510,18 @@ mod linux {
             .map_err(|_| Failure::new("config", "INTERNAL"))
     }
 
-    /// 検証済みレイヤー blob（下位から順）を `bundle/rootfs` へ展開し、マウント先の補完と `config.json` を作る。
-    /// 実 pull と、ローカルのレイヤーによる自己検証が共有する。戻り値は (展開所要, 落とした特殊ビット数)。
+    /// 検証済みレイヤー（下位から順。`rootfs.diff_ids` との突合つき）を `bundle/rootfs` へ展開し、マウント先の補完と
+    /// `config.json` を作る。実 pull と、ローカルのレイヤーによる自己検証が共有する。
+    /// 戻り値は (展開所要, 落とした特殊ビット数)。
     fn extract_and_finalize(
-        blobs: &[PathBuf],
+        layers: &[ImageLayer<'_>],
         bundle: &Path,
         process: &Process,
     ) -> Result<(Duration, u64), Failure> {
         let rootfs = bundle.join("rootfs");
         let t = Instant::now();
-        let refs: Vec<&Path> = blobs.iter().map(PathBuf::as_path).collect();
-        let layers = extract_layer_blobs(
-            &refs,
+        let layers = extract_image_layers(
+            layers,
             &rootfs,
             DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
             ExtractLimits::default(),
@@ -618,11 +644,23 @@ mod linux {
             .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
     }
 
-    fn is_root() -> bool {
+    fn effective_uid() -> Option<u32> {
         status_field("/proc/self/status", "Uid:")
-            .and_then(|v| v.split_whitespace().nth(1).map(str::to_string))
-            .as_deref()
-            == Some("0")
+            .and_then(|v| v.split_whitespace().nth(1).and_then(|u| u.parse().ok()))
+    }
+
+    fn is_root() -> bool {
+        effective_uid() == Some(0)
+    }
+
+    /// 実機モードの前提の失敗を標準エラーへ出して終了コード 1 を返す。前提欠如は `PRECONDITION FAILED` の
+    /// 1 行目つきの文面をそのまま、回帰の可能性がある失敗は従来どおり `pull_e2e: FAILED setup: ...`（#3028）。
+    fn report_setup_failure(f: crate::precondition::Failure) -> i32 {
+        match f {
+            crate::precondition::Failure::Precondition(m) => eprintln!("{m}"),
+            crate::precondition::Failure::Other(e) => eprintln!("pull_e2e: FAILED setup: {e}"),
+        }
+        1
     }
 
     fn children_of_self() -> Vec<String> {
@@ -923,6 +961,13 @@ mod linux {
             .map_err(|e| Failure::oci("auth", &e))?;
         let endpoint = RegistryEndpoint::new(reference.registry().clone());
 
+        // 取得先は検査済み root の fd 起点の writer（`PullSession::open_staged_blob`。#2765）。root は blobs_dir
+        // （このハーネスが 0700 で作った自分の領域）。パスで書き込み先を渡す入口は無い。
+        let store = ImageStore::open(blobs_dir).map_err(|e| Failure::oci("blobs", &e))?;
+        let mut session = store
+            .begin_pull_generated()
+            .map_err(|e| Failure::oci("blobs", &e))?;
+
         let t = Instant::now();
         let auth = client
             .authenticate_anonymous(&endpoint, reference.repository())
@@ -943,9 +988,9 @@ mod linux {
         r.manifest_digest = Some(resolved.manifest_digest.as_str().to_string());
         r.from_index = Some(resolved.from_index);
         r.layers = resolved.manifest.layers.len();
-        // 通常は fetch_manifest の事前拒否（layer::LAYER_MEDIA_TYPES の pull 列）が先に効く。ここは、この
-        // harness の展開器が gzip 固定であることに対する防御で、将来 pull の受理集合が広がっても
-        // 非圧縮 tar が gzip デコーダへ届く前に止める（実装済みを装わない。REPAIR-3）。
+        // 通常は fetch_manifest の事前拒否（layer::LAYER_MEDIA_TYPES の pull 列）が先に効く。展開器（`extract_image_layers`）は
+        // mediaType で入口を選べるが、このハーネスは pull の受理集合を広げず gzip だけを扱う。将来 pull の受理集合が
+        // 広がっても、ハーネスの確認範囲外の形式を黙って通さないための防御（実装済みを装わない。REPAIR-3）。
         if resolved.manifest.layers.iter().any(|l| {
             !matches!(
                 LayerMediaType::parse(&l.media_type),
@@ -965,40 +1010,85 @@ mod linux {
             ));
         }
 
-        // config → 各レイヤーの順に取得し、取得ごとに digest を検証する（検証前のファイルは読まない）。
-        let fetch_verify = |desc: &fandhe_container_oci::manifest::Descriptor,
-                            name: String,
-                            r: &mut Report|
-         -> Result<PathBuf, Failure> {
-            let dest = blobs_dir.join(name);
-            let t = Instant::now();
-            let blob = client
-                .fetch_blob(&endpoint, reference.repository(), desc, &auth, &dest)
+        // config → 各レイヤーの順に取得し、config は取得ごとに digest を検証する（検証前のファイルは読まない）。
+        let fetch_staged = |desc: &fandhe_container_oci::manifest::Descriptor,
+                            session: &mut PullSession<'_>|
+         -> Result<(), Failure> {
+            let mut w = session
+                .open_staged_blob(&desc.digest)
                 .map_err(|e| Failure::oci("blobs", &e))?;
+            client
+                .fetch_blob(&endpoint, reference.repository(), desc, &auth, &mut w)
+                .map_err(|e| Failure::oci("blobs", &e))?;
+            w.commit().map_err(|e| Failure::oci("blobs", &e))
+        };
+        let t = Instant::now();
+        fetch_staged(config_desc, &mut session)?;
+        r.blobs_ms += ms(t.elapsed());
+        let t = Instant::now();
+        session
+            .verify_staged_blob(&config_desc.digest, config_desc.size)
+            .map_err(|e| Failure::oci("verify", &e))?;
+        r.verify_ms += ms(t.elapsed());
+        let config_file = session
+            .open_verified_staged_blob(&config_desc.digest)
+            .map_err(|e| Failure::oci("verify", &e))?;
+        r.config_bytes = config_desc.size;
+        // レイヤーは取得後に `verify_staged_blob` で検証し、`open_verified_staged_blob`（pull ディレクトリの fd 起点。
+        // #2893）で開いたハンドルを `VerifiedLayerBlob::from_file` で信頼条件（通常ファイル・自分の uid・リンク数 1・0600）と
+        // digest を同じハンドルで確かめる。同じ digest のレイヤーは 1 回だけ取得する（writer は同名の宛先を拒否する）。
+        let owner = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(blobs_dir)
+                .map_err(|_| Failure::new("verify", "INTERNAL"))?
+                .uid()
+        };
+        let mut verified_layers = Vec::new();
+        let mut fetched_layers = std::collections::HashSet::new();
+        for d in resolved.manifest.layers.iter() {
+            let hex = d.digest.as_str().trim_start_matches("sha256:");
+            let t = Instant::now();
+            let first = !fetched_layers.contains(hex);
+            if first {
+                fetch_staged(d, &mut session)?;
+                fetched_layers.insert(hex.to_string());
+            }
             r.blobs_ms += ms(t.elapsed());
             let t = Instant::now();
-            verify_fetched_blob(&blob, desc.size).map_err(|e| Failure::oci("verify", &e))?;
+            if first {
+                session
+                    .verify_staged_blob(&d.digest, d.size)
+                    .map_err(|e| Failure::oci("verify", &e))?;
+            }
+            // 重複 digest でも呼ぶたびに別のハンドルを開く（読み取り位置を共有しない）。
+            let file = session
+                .open_verified_staged_blob(&d.digest)
+                .map_err(|e| Failure::oci("verify", &e))?;
+            let blob = VerifiedLayerBlob::from_file(file, &d.digest, d.size, owner)
+                .map_err(|e| Failure::oci("verify", &e))?;
             r.verify_ms += ms(t.elapsed());
-            Ok(dest)
-        };
-        let config_path = fetch_verify(config_desc, "config.json".to_string(), r)?;
-        r.config_bytes = config_desc.size;
-        let mut layer_paths = Vec::new();
-        for (i, d) in resolved.manifest.layers.iter().enumerate() {
-            layer_paths.push(fetch_verify(d, format!("layer-{i}.tar.gz"), r)?);
+            verified_layers.push(blob);
             r.layer_bytes = r.layer_bytes.saturating_add(d.size);
         }
         drop(client);
 
         let mut config_bytes = Vec::new();
-        std::fs::File::open(&config_path)
-            .and_then(|f| f.take(CONFIG_MAX_BYTES + 1).read_to_end(&mut config_bytes))
+        config_file
+            .take(CONFIG_MAX_BYTES + 1)
+            .read_to_end(&mut config_bytes)
             .map_err(|_| Failure::new("config", "INTERNAL"))?;
         let cfg = parse_image_config(&config_bytes)?;
         let process = derive_process(&cfg, spec.cmd_override.as_deref())?;
-        let (took, stripped) = extract_and_finalize(&layer_paths, bundle, &process)?;
+        // config の `rootfs.diff_ids` と manifest の layers・検証済み blob の件数と対応を照合し、展開時に突合する。
+        let rootfs_ids =
+            parse_image_config_rootfs(&config_bytes).map_err(|e| Failure::oci("extract", &e))?;
+        let blob_refs: Vec<&VerifiedLayerBlob> = verified_layers.iter().collect();
+        let image_layers = image_layers_from(&resolved.manifest.layers, &blob_refs, &rootfs_ids)
+            .map_err(|e| Failure::oci("extract", &e))?;
+        let (took, stripped) = extract_and_finalize(&image_layers, bundle, &process)?;
         r.extract_ms = ms(took);
         r.stripped = stripped;
+        let _ = session.abort();
         Ok(())
     }
 
@@ -1050,15 +1140,13 @@ mod linux {
             );
             return 1;
         }
-        let delegated = match DelegatedCgroup::detect() {
+        // Landlock が無いとどのイメージも run 段で落ちるため、通信・展開の前に分類する（#3144）。
+        if let Err(f) = crate::precondition::try_landlock_support() {
+            return report_setup_failure(f);
+        }
+        let delegated = match crate::precondition::try_delegated_cgroup() {
             Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "pull_e2e: FAILED setup: no delegated cgroup v2 ({:?})",
-                    e.code
-                );
-                return 1;
-            }
+            Err(f) => return report_setup_failure(f),
         };
         let tag = std::process::id();
         let Ok(cg_id) = ContainerId::new(format!("pe{tag}")) else {
@@ -1126,6 +1214,13 @@ mod linux {
             .cgroup_join_source(move || join_container.join_hook());
         // 非 root の `User` を効かせる範囲写像は opt-in（`production_launcher` のシナリオ I と同じ環境変数）。
         let builder = if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            let Some(euid) = effective_uid() else {
+                eprintln!("pull_e2e: FAILED setup: effective uid");
+                return 1;
+            };
+            if let Err(f) = crate::precondition::try_require_subordinate_ids(euid) {
+                return report_setup_failure(f);
+            }
             match SubordinateIdSource::system(std::env::var("USER").ok()) {
                 Ok(source) => builder
                     .privilege(IsolationPrivilege::RootlessSubordinateIds)
@@ -1261,23 +1356,42 @@ mod linux {
             let both = parse_args(&strs(&["--image", "busybox"]), Some("alpine")).expect("both");
             assert_eq!(both.images.len(), 1);
             // 不正入力。
-            // --cmd の後ろの --ignored / --nocapture は区切りで、コンテナの引数にしない。
-            let t = parse_args(
-                &strs(&[
-                    "--image",
-                    "x",
-                    "--cmd",
-                    "/bin/true",
-                    "--ignored",
-                    "--nocapture",
-                ]),
-                None,
-            )
-            .expect("args");
-            assert_eq!(
-                t.images.first().and_then(|i| i.cmd_override.clone()),
-                Some(strs(&["/bin/true"]))
-            );
+            // --cmd の後ろの --ignored / --no-capture（旧綴り --nocapture も同じ）は区切りで、
+            // コンテナの引数にしない。
+            for flag in ["--no-capture", "--nocapture"] {
+                let t = parse_args(
+                    &strs(&["--image", "x", "--cmd", "/bin/true", "--ignored", flag]),
+                    None,
+                )
+                .expect("args");
+                assert_eq!(
+                    t.images.first().and_then(|i| i.cmd_override.clone()),
+                    Some(strs(&["/bin/true"]))
+                );
+                // 先頭に置いても読み飛ばされる。
+                let h = parse_args(&strs(&[flag, "--image", "alpine"]), None).expect("head");
+                assert_eq!(h.images.len(), 1);
+                assert_eq!(h.images.first().and_then(|i| i.cmd_override.clone()), None);
+                // 区切りの後ろの --image は 2 件目として読まれる。
+                let two = parse_args(
+                    &strs(&[
+                        "--image",
+                        "x",
+                        "--cmd",
+                        "/bin/true",
+                        flag,
+                        "--image",
+                        "busybox",
+                    ]),
+                    None,
+                )
+                .expect("two");
+                assert_eq!(two.images.len(), 2);
+                assert_eq!(
+                    two.images.first().and_then(|i| i.cmd_override.clone()),
+                    Some(strs(&["/bin/true"]))
+                );
+            }
             assert!(parse_args(&strs(&["--cmd", "x"]), None).is_err());
             assert!(parse_args(&strs(&["--image", "alpine", "--cmd"]), None).is_err());
             assert!(parse_args(&strs(&["--image"]), None).is_err());
@@ -1412,7 +1526,8 @@ mod linux {
             File(&'a str, &'a [u8], u32),
         }
 
-        fn make_layer(entries: &[Ent<'_>]) -> Vec<u8> {
+        /// 戻り値は (非圧縮 tar, gzip)。tar の sha256 が diff_id になる。
+        fn make_layer(entries: &[Ent<'_>]) -> (Vec<u8>, Vec<u8>) {
             let mut b = tar::Builder::new(Vec::new());
             for e in entries {
                 let mut h = tar::Header::new_gnu();
@@ -1437,7 +1552,7 @@ mod linux {
             let tar_bytes = b.into_inner().expect("finish tar");
             let mut gz = GzEncoder::new(Vec::new(), Compression::default());
             gz.write_all(&tar_bytes).expect("gzip");
-            gz.finish().expect("gzip finish")
+            (tar_bytes, gz.finish().expect("gzip finish"))
         }
 
         fn digest_of(bytes: &[u8]) -> Digest {
@@ -1473,18 +1588,36 @@ mod linux {
                 Ent::Dir("app"),
                 Ent::File("app/run.txt", b"layer 2\n", 0o644),
             ]);
+            let owner = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(&blobs).expect("blobs dir").uid()
+            };
             let mut paths = Vec::new();
-            for (i, bytes) in [&l1, &l2].into_iter().enumerate() {
+            let mut opened = Vec::new();
+            for (i, (tar_bytes, bytes)) in [&l1, &l2].into_iter().enumerate() {
                 let p = blobs.join(format!("layer-{i}.tar.gz"));
                 std::fs::write(&p, bytes).expect("write blob");
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                        .expect("chmod blob");
+                }
                 let d = digest_of(bytes);
                 let v = verify_blob_digest(&p, &d, bytes.len() as u64).expect("verify");
                 assert_eq!(v.size, bytes.len() as u64);
+                opened.push((
+                    VerifiedLayerBlob::open(&p, &d, bytes.len() as u64, owner).expect("open"),
+                    digest_of(tar_bytes),
+                ));
                 paths.push(p);
             }
             // 別の digest は DataLoss で拒否される（検証前の blob を展開しない）。
             let wrong = digest_of(b"other");
-            let err = verify_blob_digest(&paths[0], &wrong, l1.len() as u64).expect_err("mismatch");
+            let err =
+                verify_blob_digest(&paths[0], &wrong, l1.1.len() as u64).expect_err("mismatch");
+            assert_eq!(err.code(), OciErrorCode::DataLoss);
+            let err = VerifiedLayerBlob::open(&paths[0], &wrong, l1.1.len() as u64, owner)
+                .expect_err("handle mismatch");
             assert_eq!(err.code(), OciErrorCode::DataLoss);
 
             let cfg = parse_image_config(
@@ -1493,8 +1626,24 @@ mod linux {
             )
             .expect("cfg");
             let process = derive_process(&cfg, Some(&strs(&["y"]))).expect("process");
+            const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+            // diff_id の不一致は "extract" 段の DATA_LOSS で拒否される（2 層目の diff_id に 1 層目の値を渡す）。
+            let swapped = [
+                ImageLayer::new(&opened[0].0, TAR_GZIP, &opened[0].1),
+                ImageLayer::new(&opened[1].0, TAR_GZIP, &opened[0].1),
+            ];
+            let bad_bundle = work.dir.join("bundle-bad");
+            mkdir_mode(&bad_bundle, 0o700).expect("mkdir");
+            mkdir_mode(&bad_bundle.join("rootfs"), 0o755).expect("mkdir");
+            let f = extract_and_finalize(&swapped, &bad_bundle, &process).expect_err("diff_id");
+            assert_eq!(f, Failure::new("extract", "DATA_LOSS"));
+
+            let layers = [
+                ImageLayer::new(&opened[0].0, TAR_GZIP, &opened[0].1),
+                ImageLayer::new(&opened[1].0, TAR_GZIP, &opened[1].1),
+            ];
             let (_took, stripped) =
-                extract_and_finalize(&paths, &bundle, &process).expect("extract");
+                extract_and_finalize(&layers, &bundle, &process).expect("extract");
             assert_eq!(stripped, 0);
 
             let rootfs = bundle.join("rootfs");
@@ -1534,6 +1683,7 @@ mod linux {
     }
 
     pub fn main() {
+        crate::precondition::self_check();
         selfcheck::run();
         let argv: Vec<String> = std::env::args().skip(1).collect();
         if !argv.iter().any(|a| a == "--ignored") {

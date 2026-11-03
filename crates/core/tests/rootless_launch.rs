@@ -48,8 +48,15 @@ fn main() {
 #[path = "support/leftover_children.rs"]
 mod leftover_children;
 
+// 前提欠如を `PRECONDITION FAILED` の 1 行目で失敗させる共有部品（#2888・REPAIR-12）。
+#[cfg(target_os = "linux")]
+#[path = "support/precondition.rs"]
+mod precondition;
+
 #[cfg(target_os = "linux")]
 fn main() {
+    // 分類の自己照合（既定のテスト集合でも常に走る。出力はしない）。
+    precondition::self_check();
     if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
         linux::run();
     } else {
@@ -221,6 +228,9 @@ mod linux {
         }
         let mut names = vec!["direct"];
         if helper_requested() {
+            // helper ケースの前提（`USER`・`uidmap`・subuid / subgid の自ユーザー行）の欠如は、子の scenario へ進む前に
+            // 回帰と見分けられる 1 行目で失敗させる（#2888）。
+            crate::precondition::require_subordinate_ids(own_ids().0);
             names.push("helper");
         } else {
             println!(
@@ -286,6 +296,7 @@ mod linux {
     }
 
     fn helper_mappings(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
+        crate::precondition::require_subordinate_ids(euid);
         let name = std::env::var("USER").ok();
         let uowner = SubIdOwner::new(euid, name.clone()).expect("uid owner");
         // shadow は subgid の数値の行も gid ではなく uid で照合する（#2390）。

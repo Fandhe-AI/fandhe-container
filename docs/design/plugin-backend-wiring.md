@@ -51,7 +51,7 @@ doc は本配線を「TASK-114」と書いているが、TASK-114 の open issue
 ### 4.2 起動対象の受け渡し
 
 - 推奨: #1320 のとおり、`HashVerifiedPluginFile` → `PluginLaunchTarget::from_verified_file`（#1856・PR #2195）の変換を 4.1 の入口の中の 1 か所でだけ行う（#1857 の機械判定の対象もこの 1 か所）。検証から起動まで保持した fd だけを使い、パスを開き直さない。`path()` / `resolved_path()` は表示と監査にだけ使う
-- macOS は実体のパスで起動し、直前に dev / ino で同一性を確かめる（#1866）。同じ UID または root による差し替えは残余として書く
+- macOS は実体のパスで起動し、spawn の直前（再起動のたびも）に `lstat` の dev / ino を保持 fd と照合する（#1866 で実装済み）。残余は、確認から exec までの窓での同じ UID または root による差し替えで、PLUG-11 の脅威の外
 - `PluginLaunchTarget` は入口の外へ出さない
 
 ### 4.3 型つき proxy

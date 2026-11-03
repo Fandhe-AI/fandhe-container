@@ -1,13 +1,16 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs / image / system）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs / inspect / state / image / system）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
 //! ただし `start` は core を呼ばず、CLI と同じディレクトリの supervisor の bin を起動して結果の 1 行を期限付きで受け取る
 //! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715・#1819）でコンテナのプロセスを起動する（rootless のみ。
 //! rootful は `UNIMPLEMENTED`（8）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
-//! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
+//! `kill <id> [<signal>]`（#1902）は同じ core の `kill` を意図なしの `production_signaler` で呼び、シグナルを 1 回送るだけ（`stop_delete` module）。
+//! `stop` / `delete` は core の `oci_runtime::kill`（既定 SIGTERM。`--signal` で上書き。#2775）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
 //! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
+//! `inspect <id>` は supervisor の `inspect::inspect` が整形した 1 行 JSON（起動時に適用した capability 集合を含む。#2775）を
+//! stdout へ出す（`list_logs` module）。`create --cap-drop <CAP>`・`create --read-only` は起動オプション文書（`create_options`）経由で launch に届く。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は存在確認の後に supervisor の
 //! `logs::read_container_log_with` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
 //! （`--follow` / `--tail` / `--stream` / `--escape` つき。TASK-79.3・#640・#1543・#2447。`list_logs` module）。
@@ -32,12 +35,14 @@
 //!
 //! 将来仕様（本実装の範囲外）:
 //! - start: uid 0 の起動（`RootfulHostRoot`。現状は `UNIMPLEMENTED`。#2241 のオーナー判断待ち）。
-//! - stop の猶予 → SIGKILL（#1545）・stop の意図の伝達（SUP-9）・`kill` コマンド（#1902。`production_signaler` を共用）。
+//! - stop の猶予 → SIGKILL（#1545）。stop の意図の伝達（SUP-9）は `stop_delete` で結線済み（#2162・#2440）。
 //! - list の JSON 出力: serde 系の配線か core の公開ライタが前提（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
-//!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
-//!   起動と RPC（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125）は未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
-//!   候補ありでも `UNIMPLEMENTED`（8）か `PERMISSION_DENIED`（6）で fail-closed に失敗する。plugin 解決の失敗の
+//!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。信頼性検証（PLUG-11）は macOS が実装済み（拒否は
+//!   `PERMISSION_DENIED`（6））、Windows はホストで検証しない（`--plugin-path-search` で候補があると `UNIMPLEMENTED`（8））。
+//!   許可済みハッシュ一覧（設計は #1868、承認と実装 issue の起票は #2231）と plugin の起動と RPC（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-125）は
+//!   未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
+//!   候補ありでも `PERMISSION_DENIED`（6）か `UNIMPLEMENTED`（8）で fail-closed に失敗する。plugin 解決の失敗の
 //!   `message` は `plugin_backend` の固定文言表で、「未導入」と「信頼性検証の拒否」を区別できる。create 系はそのまま、
 //!   `list` / `logs` は `list_logs::store_open_failure` が表との完全一致で拾って出す（setup は plugin 解決を通らず対象外。C1）。
 //! - エラー形式: 全コマンドの失敗は [`CliExit`] 経由で構造化エラー（`code` / `message`・非ゼロ終了コード）に統一済み（TASK-95.2・ERR-1）。
@@ -57,11 +62,19 @@ use crate::doctor::DoctorExitStatus;
 use crate::error::CliError;
 
 mod args;
+mod create_network;
+mod create_options;
+mod create_pasta;
 mod create_start;
 mod exec;
 mod image;
 mod image_refs;
+mod kill_signal;
 mod list_logs;
+mod net_recorder;
+mod network;
+mod network_refs;
+mod oci_recorder;
 mod ref_reconcile;
 // Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。
 #[cfg(any(not(target_os = "linux"), test))]
@@ -72,14 +85,15 @@ mod stop_delete;
 mod supervisor_start;
 
 use args::{
-    parse_create, parse_delete, parse_doctor, parse_exec, parse_global, parse_image, parse_list,
-    parse_logs, parse_setup, parse_start, parse_stop, parse_system,
+    parse_create, parse_delete, parse_doctor, parse_exec, parse_global, parse_image, parse_inspect,
+    parse_kill, parse_list, parse_logs, parse_network, parse_setup, parse_start, parse_state,
+    parse_stop, parse_system,
 };
 
 /// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
-    /// 日常操作（create / start / stop / delete / list / logs / image / system）。`crate::setup` を参照しない。
+    /// 日常操作（create / start / stop / kill / delete / list / logs / image / system）。`crate::setup` を参照しない。
     Daily,
     /// OS 固有設定のセットアップ（`setup`）。
     Setup,
@@ -93,16 +107,26 @@ pub enum Command {
     Create,
     Start,
     Stop,
+    /// 指定シグナルを 1 回送る（`kill <id> [<signal>]`。終了は待たず状態も変えない。#1902・CLI-1）。
+    Kill,
     Delete,
     List,
     Logs,
     /// 稼働中コンテナの中でコマンドを実行する（SUP-6・SEC-4・CLI-1・#2626。`exec` module。Linux は supervisor の
     /// 制御チャネルから起動時 pidfd を受け取り、監査 sink を渡して `run_command_with_pidfd` を呼ぶ）。
     Exec,
+    /// コンテナ状態の機械可読な出力(`inspect <id>`。supervisor の `inspect::InspectReport` を 1 行 JSON で出す。
+    /// 起動時に適用した capability 集合を含む。#2775・CLI-1・SUP-11・SEC-1)。
+    Inspect,
+    /// OCI Runtime Spec の state の項目へ寄せた機械可読な状態(`state <id>`。supervisor の `inspect::InspectReport` を
+    /// `ociVersion`・`id`・`status`・`pid`・`bundle`・`annotations` の 1 行 JSON で出す。SUP-11 の拡張項目は `inspect` だけ。#1903・CLI-1・SUP-11)。
+    State,
     /// イメージ管理（`image ls` / `image rm` / `image tag`。#2221・#2316・CLI-1・OCI-7。サブコマンドは `args::ImageArgs`）。
     Image,
     /// システム情報（`system df`。#2221・CLI-1・OCI-7。サブコマンドは `args::SystemArgs`）。
     System,
+    /// ユーザー定義ネットワークの定義管理（`network create|rm|ls`。#3066・NET-6・CLI-1。サブコマンドは `args::NetworkArgs`）。
+    Network,
     /// OS 固有設定のセットアップ（TASK-80.1・CLI-2。日常操作ではない）。
     Setup,
     /// 読み取り専用の診断（NET-10・CORE-3。#2133。状態ルートを開かず plugin も解決しない）。
@@ -111,31 +135,39 @@ pub enum Command {
 
 impl Command {
     /// 全コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 11] = [
+    pub const ALL: [Command; 15] = [
         Command::Create,
         Command::Start,
         Command::Stop,
+        Command::Kill,
         Command::Delete,
         Command::List,
         Command::Logs,
         Command::Exec,
+        Command::Inspect,
+        Command::State,
         Command::Image,
         Command::System,
+        Command::Network,
         Command::Setup,
         Command::Doctor,
     ];
 
     /// 日常操作コマンドのみ（`ALL` から `Setup` と `Doctor` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
-    pub const DAILY: [Command; 9] = [
+    pub const DAILY: [Command; 13] = [
         Command::Create,
         Command::Start,
         Command::Stop,
+        Command::Kill,
         Command::Delete,
         Command::List,
         Command::Logs,
         Command::Exec,
+        Command::Inspect,
+        Command::State,
         Command::Image,
         Command::System,
+        Command::Network,
     ];
 
     /// コマンドの区分。ワイルドカードを使わず、コマンド追加時に分類漏れをコンパイルエラーにする。
@@ -144,12 +176,16 @@ impl Command {
             Command::Create
             | Command::Start
             | Command::Stop
+            | Command::Kill
             | Command::Delete
             | Command::List
             | Command::Logs
             | Command::Exec
+            | Command::Inspect
+            | Command::State
             | Command::Image
-            | Command::System => CommandKind::Daily,
+            | Command::System
+            | Command::Network => CommandKind::Daily,
             Command::Setup => CommandKind::Setup,
             Command::Doctor => CommandKind::Diagnostic,
         }
@@ -161,12 +197,16 @@ impl Command {
             Command::Create => "create",
             Command::Start => "start",
             Command::Stop => "stop",
+            Command::Kill => "kill",
             Command::Delete => "delete",
             Command::List => "list",
             Command::Logs => "logs",
             Command::Exec => "exec",
+            Command::Inspect => "inspect",
+            Command::State => "state",
             Command::Image => "image",
             Command::System => "system",
+            Command::Network => "network",
             Command::Setup => "setup",
             Command::Doctor => "doctor",
         }
@@ -310,8 +350,7 @@ impl CliExit {
     }
 }
 
-const USAGE_MESSAGE: &str =
-    "usage: fandhe-container <create|start|stop|delete|list|logs|exec|image|system|setup|doctor>";
+const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
@@ -321,21 +360,28 @@ const CONTAINER_LOG_ROTATING_MESSAGE: &str = "container log is rotating; retry";
 const CONTAINER_LOG_LIMIT_MESSAGE: &str = "container log exceeds the read limit";
 const CONTAINER_LOG_OUTRAN_MESSAGE: &str = "container log rotated faster than it could be followed";
 
-/// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
-/// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。
+/// [`CliExit::failed`] の固定文言表（`ErrorCode::ALL` と同数。`Internal` も明示。試験が網羅と
+/// 重複なしを照合する。REPAIR-1・ERR-1）。引用符・バックスラッシュ・制御文字を含まない定数のみ。
+const FAILURE_MESSAGES: [(ErrorCode, &str); 10] = [
+    (ErrorCode::InvalidArgument, "invalid argument"),
+    (ErrorCode::NotFound, "container not found"),
+    (ErrorCode::AlreadyExists, "already exists"),
+    (ErrorCode::FailedPrecondition, "failed precondition"),
+    (ErrorCode::Unimplemented, "not implemented on this platform"),
+    (ErrorCode::Internal, "operation failed"),
+    (ErrorCode::PermissionDenied, "permission denied"),
+    (ErrorCode::Timeout, "operation timed out"),
+    (ErrorCode::Unavailable, "unavailable"),
+    (ErrorCode::ResourceExhausted, "resource exhausted"),
+];
+
+/// [`CliExit::failed`] の固定文言を表から引く。`ErrorCode` は `#[non_exhaustive]` のため、
+/// 表に無い将来の code は汎用文言（`Internal` と同じ）に落とす。
 fn failure_message(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "invalid argument",
-        ErrorCode::NotFound => "container not found",
-        ErrorCode::AlreadyExists => "already exists",
-        ErrorCode::FailedPrecondition => "failed precondition",
-        ErrorCode::Unimplemented => "not implemented on this platform",
-        ErrorCode::PermissionDenied => "permission denied",
-        ErrorCode::Timeout => "operation timed out",
-        ErrorCode::Unavailable => "unavailable",
-        ErrorCode::ResourceExhausted => "resource exhausted",
-        _ => "operation failed",
-    }
+    FAILURE_MESSAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or("operation failed", |(_, m)| m)
 }
 
 fn usage() -> CliExit {
@@ -363,6 +409,14 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
         return usage();
     };
     let tail: Vec<OsString> = it.collect();
+    // `--pasta-path` / `--pasta-path-search` は create だけに効く。他のサブコマンド（setup・doctor を含む）では
+    // 黙って受けずに拒否する（rootless-network.md 12.4・NET-9・CLI-1・#3199）。
+    if global.pasta.is_some() && !matches!(command, Command::Create) {
+        return CliExit::Error(CliError::new(
+            ErrorCode::InvalidArgument,
+            create_pasta::MSG_FLAG_NOT_CREATE,
+        ));
+    }
     match command {
         Command::Create => match parse_create(tail) {
             Ok(a) => create_start::run_create(&global, &a),
@@ -374,6 +428,10 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
         },
         Command::Stop => match parse_stop(tail) {
             Ok(a) => stop_delete::run_stop(&global, &a),
+            Err(_) => usage(),
+        },
+        Command::Kill => match parse_kill(tail) {
+            Ok(a) => stop_delete::run_kill(&global, &a),
             Err(_) => usage(),
         },
         Command::Delete => match parse_delete(tail) {
@@ -392,12 +450,24 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => exec::run_exec(&global, &a),
             Err(_) => usage(),
         },
+        Command::Inspect => match parse_inspect(tail) {
+            Ok(a) => list_logs::run_inspect(&global, &a, stdout),
+            Err(_) => usage(),
+        },
+        Command::State => match parse_state(tail) {
+            Ok(a) => list_logs::run_state(&global, &a, stdout),
+            Err(_) => usage(),
+        },
         Command::Image => match parse_image(tail) {
             Ok(a) => image::run_image(&global, &a, stdout),
             Err(_) => usage(),
         },
         Command::System => match parse_system(tail) {
             Ok(a) => image::run_system(&global, &a, stdout),
+            Err(_) => usage(),
+        },
+        Command::Network => match parse_network(tail) {
+            Ok(a) => network::run_network(&global, &a, stdout),
             Err(_) => usage(),
         },
         Command::Setup => run_setup(tail, stdout),
@@ -444,16 +514,20 @@ mod tests {
         assert_eq!(Command::parse("create"), Some(Command::Create));
         assert_eq!(Command::parse("start"), Some(Command::Start));
         assert_eq!(Command::parse("stop"), Some(Command::Stop));
+        assert_eq!(Command::parse("kill"), Some(Command::Kill));
         assert_eq!(Command::parse("delete"), Some(Command::Delete));
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
+        assert_eq!(Command::parse("inspect"), Some(Command::Inspect));
+        assert_eq!(Command::parse("state"), Some(Command::State));
         assert_eq!(Command::parse("image"), Some(Command::Image));
         assert_eq!(Command::parse("system"), Some(Command::System));
+        assert_eq!(Command::parse("network"), Some(Command::Network));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
         assert_eq!(Command::parse("doctor"), Some(Command::Doctor));
     }
 
-    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 8 件は日常操作。
+    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 13 件は日常操作。
     #[test]
     fn cli2_command_kind_classification() {
         let daily: Vec<&str> = Command::ALL
@@ -464,7 +538,8 @@ mod tests {
         assert_eq!(
             daily,
             [
-                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                "state", "image", "system", "network"
             ]
         );
         assert_eq!(Command::Setup.kind(), CommandKind::Setup);
@@ -478,7 +553,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                "state", "image", "system", "network"
             ]
         );
         let rest: Vec<Command> = Command::ALL
@@ -495,8 +571,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system",
-                "setup", "doctor"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                "state", "image", "system", "network", "setup", "doctor"
             ]
         );
     }
@@ -520,6 +596,10 @@ mod tests {
             args(&["create"]),
             args(&["start"]),
             args(&["stop"]),
+            args(&["kill"]),
+            args(&["kill", "a", "b", "c"]),
+            args(&["kill", "--x", "c1"]),
+            args(&["kill", "-9", "c1"]),
             args(&["delete"]),
             args(&["stop", "a", "b"]),
             args(&["delete", "--x", "a"]),
@@ -567,7 +647,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|exec|image|system|setup|doctor>\"}\n";
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -575,12 +655,16 @@ mod tests {
                 Command::Create => vec!["create"],
                 Command::Start => vec!["start"],
                 Command::Stop => vec!["stop", "a", "b"],
+                Command::Kill => vec!["kill"],
                 Command::Delete => vec!["delete", "--x", "a"],
                 Command::List => vec!["list", "x"],
                 Command::Logs => vec!["logs"],
                 Command::Exec => vec!["exec"],
+                Command::Inspect => vec!["inspect"],
+                Command::State => vec!["state"],
                 Command::Image => vec!["image", "bogus"],
                 Command::System => vec!["system", "bogus"],
+                Command::Network => vec!["network", "bogus"],
                 Command::Setup => vec!["setup", "x"],
                 Command::Doctor => vec!["doctor", "x"],
             };
@@ -593,8 +677,8 @@ mod tests {
         assert_eq!(
             covered,
             [
-                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system",
-                "setup", "doctor"
+                "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                "state", "image", "system", "network", "setup", "doctor"
             ]
         );
     }
@@ -624,6 +708,13 @@ mod tests {
             (ErrorCode::Unavailable, 9),
             (ErrorCode::ResourceExhausted, 10),
         ];
+        assert_eq!(codes.len(), ErrorCode::ALL.len());
+        assert_eq!(FAILURE_MESSAGES.len(), ErrorCode::ALL.len());
+        for c in ErrorCode::ALL {
+            assert!(codes.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+            let hits = FAILURE_MESSAGES.iter().filter(|(k, _)| *k == c).count();
+            assert_eq!(hits, 1, "{}", c.as_str());
+        }
         for (code, exit) in codes {
             let m = failure_message(code);
             assert!(!m.is_empty());
@@ -652,7 +743,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|exec|image|system|setup|doctor>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|kill|delete|list|logs|exec|inspect|state|image|system|network|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
@@ -714,21 +805,27 @@ mod tests {
         /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
         const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
 
-        struct TmpDir(PathBuf);
+        struct TmpDir(
+            PathBuf,
+            #[allow(dead_code)] crate::scratch_root::ScratchDir, // 保持が目的（drop で親を消す）
+        );
 
         impl TmpDir {
             fn new(tag: &str) -> Self {
                 static SEQ: AtomicUsize = AtomicUsize::new(0);
                 let n = SEQ.fetch_add(1, Ordering::SeqCst);
-                let p = std::env::temp_dir()
-                    .join(format!("fc-cli-cmd-{tag}-{}-{n}", std::process::id()));
-                std::fs::create_dir_all(&p).expect("mkdir");
+                let scratch = crate::scratch_root::ScratchDir::new(
+                    "fc-cli-cmd",
+                    std::time::Duration::from_secs(10),
+                );
+                let p = scratch.path().join(format!("{tag}-{n}"));
+                std::fs::create_dir(&p).expect("mkdir");
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
                         .expect("chmod");
                 }
-                Self(p)
+                Self(p, scratch)
             }
 
             fn state_root(&self) -> PathBuf {
@@ -808,6 +905,70 @@ mod tests {
             (op.to_owned(), code.to_owned())
         }
 
+        /// CLI-1・SUP-11(#2775): created のコンテナの inspect は 1 行の JSON(末尾 LF)で、キー順は固定、
+        /// start 前なので capabilities は null。不在は NOT_FOUND(3)。
+        #[test]
+        fn cli1_inspect_prints_one_line_json_on_linux() {
+            let base = TmpDir::new("inspect");
+            let root = base.state_root();
+            create_ok(&base, "i1");
+            let o = invoke(&root, &["inspect", "i1"]);
+            assert_eq!((o.exit, o.stderr.as_str()), (0, ""), "{}", o.stderr);
+            assert!(o.stdout.ends_with("}\n"), "{:?}", o.stdout);
+            assert_eq!(o.stdout.matches('\n').count(), 1, "{:?}", o.stdout);
+            assert!(
+                o.stdout
+                    .starts_with("{\"id\":\"i1\",\"status\":\"created\",\"pid\":null,"),
+                "{:?}",
+                o.stdout
+            );
+            assert!(
+                o.stdout
+                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}\n"),
+                "{:?}",
+                o.stdout
+            );
+            let o = invoke(&root, &["inspect", "none"]);
+            assert_eq!((o.exit, o.code), (3, Some("NOT_FOUND")));
+            assert_eq!(o.stdout, "");
+        }
+
+        /// CLI-1・SUP-11(#1903): created のコンテナの state は OCI の項目だけの 1 行 JSON(末尾 LF)。
+        /// start 前なので pid は省かれる。不在は NOT_FOUND(3)、不正 ID は INVALID_ARGUMENT(2)。状態は書き換えない。
+        #[test]
+        fn cli1_state_prints_oci_state_on_linux() {
+            let base = TmpDir::new("state");
+            let root = base.state_root();
+            create_ok(&base, "s1");
+            let o = invoke(&root, &["state", "s1"]);
+            assert_eq!((o.exit, o.stderr.as_str()), (0, ""), "{}", o.stderr);
+            assert_eq!(o.stdout.matches('\n').count(), 1, "{:?}", o.stdout);
+            assert!(
+                o.stdout.starts_with(
+                    "{\"ociVersion\":\"1.3.0\",\"id\":\"s1\",\"status\":\"created\",\"bundle\":\"/"
+                ),
+                "{:?}",
+                o.stdout
+            );
+            // Linux の create は既定の `network none` を文書に書くため、作成世代の注釈だけを持つ(#1873・D4)。
+            assert!(
+                o.stdout
+                    .contains(",\"annotations\":{\"io.fandhe.container.options-generation\":\""),
+                "{:?}",
+                o.stdout
+            );
+            assert!(o.stdout.ends_with("\"}}\n"), "{:?}", o.stdout);
+            assert!(!o.stdout.contains("\"pid\""), "{:?}", o.stdout);
+            // 読み取りだけなので 2 回目も同じ出力(revision を進めない)。
+            let again = invoke(&root, &["state", "s1"]);
+            assert_eq!(again.stdout, o.stdout);
+            let o = invoke(&root, &["state", "none"]);
+            assert_eq!((o.exit, o.code), (3, Some("NOT_FOUND")));
+            assert_eq!(o.stdout, "");
+            let o = invoke(&root, &["state", "bad/id"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+        }
+
         /// CLI-1・OCI-4・ERR-2: create は成功で無出力、重複は ALREADY_EXISTS（4）、不正 ID は使い方エラー（2）。
         #[test]
         fn cli1_run_create_on_linux() {
@@ -881,6 +1042,34 @@ mod tests {
             assert!(root.join("c1").join("state.json").is_file());
 
             let o = invoke(&root, &["stop", "a/b"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+        }
+
+        /// CLI-1・ERR-2・#1902: kill は未作成で NOT_FOUND（3）、pid なしの Created は FAILED_PRECONDITION（5）、
+        /// 不正な ID・シグナルは INVALID_ARGUMENT（2）。失敗 JSON の op は `kill`。
+        #[test]
+        fn cli1_run_kill_on_linux() {
+            let base = TmpDir::new("kill");
+            let root = base.state_root();
+
+            let o = invoke(&root, &["kill", "c1"]);
+            assert_eq!(o.exit, 3);
+            assert_eq!(op_and_code(&o.stderr), failure("kill", "NOT_FOUND"));
+
+            create_ok(&base, "c1");
+            for argv in [&["kill", "c1"][..], &["kill", "c1", "KILL"]] {
+                let o = invoke(&root, argv);
+                assert_eq!(o.exit, 5, "{argv:?}");
+                assert_eq!(
+                    op_and_code(&o.stderr),
+                    failure("kill", "FAILED_PRECONDITION")
+                );
+            }
+            assert!(root.join("c1").join("state.json").is_file());
+
+            let o = invoke(&root, &["kill", "a/b"]);
+            assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
+            let o = invoke(&root, &["kill", "c1", "BOGUS"]);
             assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
         }
 
@@ -1004,10 +1193,11 @@ mod tests {
                 );
             }
 
-            let cases: [(&[&str], &str); 4] = [
+            let cases: [(&[&str], &str); 5] = [
                 (&["create", "--bundle", b, "c1"], "create"),
                 (&["start", "c1"], "start"),
                 (&["stop", "c1"], "kill"),
+                (&["kill", "c1"], "kill"),
                 (&["delete", "c1"], "delete"),
             ];
             for (argv, op) in cases {
@@ -1082,6 +1272,8 @@ mod tests {
             for argv in [
                 vec!["start", evil],
                 vec!["stop", evil],
+                vec!["kill", evil],
+                vec!["kill", "c1", evil],
                 vec!["delete", evil],
                 vec!["logs", evil],
                 vec![evil],
@@ -1126,6 +1318,7 @@ mod tests {
             for argv in [
                 &["start", "none"][..],
                 &["stop", "none"],
+                &["kill", "none"],
                 &["delete", "none"],
             ] {
                 check(&invoke(&root, argv), 3, "NOT_FOUND");
@@ -1180,10 +1373,13 @@ mod tests {
                     Command::Create => (vec!["create", "--bundle", &b, "m1"], 0, None, ""),
                     Command::Start => (vec!["start", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Stop => (vec!["stop", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Kill => (vec!["kill", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Delete => (vec!["delete", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
                     Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Exec => (vec!["exec", "none", "/bin/true"], 3, Some("NOT_FOUND"), ""),
+                    Command::Inspect => (vec!["inspect", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::State => (vec!["state", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Image => (
                         vec!["image", "ls", "--image-root", &ir],
                         0,
@@ -1196,6 +1392,7 @@ mod tests {
                         None,
                         SYSTEM_DF_EMPTY,
                     ),
+                    Command::Network => (vec!["network", "ls"], 0, None, "NAME\tMODE\tSUBNET\n"),
                     Command::Setup => (
                         vec!["setup"],
                         0,
@@ -1222,10 +1419,275 @@ mod tests {
             assert_eq!(
                 covered,
                 [
-                    "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system",
-                    "setup", "doctor"
+                    "create", "start", "stop", "kill", "delete", "list", "logs", "exec", "inspect",
+                    "state", "image", "system", "network", "setup", "doctor"
                 ]
             );
         }
+    }
+}
+/// `create` の `--network`・`--add-host`・`--dns` を argv から通す試験(NET-12・CLI-1・ERR-1・#1871)。
+///
+/// cfg で絞らず 3 OS で走る。存在しない `--root` を渡し、拒否が状態ルートの作成より前であることも照合する。
+#[cfg(test)]
+mod net12_argv_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 存在しない状態ルートと、それを内包する私有の親。親は排他作成(unix は 0700)し Drop で消す。
+    /// 状態ルートはその子の未存在の名前なので、共有の `temp_dir()` 直下の名前を先に消す必要がない
+    /// (消してから使う方式の TOCTOU を避ける。REPAIR-12・#3435・#3506)。
+    struct FreshRoot {
+        _parent: crate::test_root::TestRoot,
+        root: std::path::PathBuf,
+    }
+
+    /// 存在しない状態ルートを返す(作られていないことを後で照合する)。
+    fn fresh_root() -> FreshRoot {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let parent = crate::test_root::test_root("fc-cli-net12", &n.to_string());
+        let root = parent.join("root");
+        FreshRoot {
+            _parent: parent,
+            root,
+        }
+    }
+
+    /// NET-12・REPAIR-12・#3506: `fresh_root` は未存在の状態ルートを返し、呼び出しごとに別の私有の親を使う。
+    /// 同じ位置の残骸(ディレクトリ・symlink)は消さず・辿らない。
+    #[test]
+    fn net12_repair12_3506_fresh_root_leaves_stale_residue_untouched() {
+        let a = fresh_root();
+        let b = fresh_root();
+        assert!(!a.root.exists());
+        assert!(!b.root.exists());
+        assert_ne!(a.root, b.root);
+        assert!(a.root.parent().expect("parent").is_dir());
+
+        let stale = a.root.parent().expect("parent").join("stale");
+        std::fs::create_dir_all(stale.join("sub")).expect("mkdir");
+        std::fs::write(stale.join("sub").join("old"), b"stale").expect("write");
+        let fresh = crate::test_root::test_root_at(stale.clone());
+        assert_ne!(&*fresh, stale.as_path());
+        assert_eq!(std::fs::read_dir(&*fresh).expect("read_dir").count(), 0);
+        assert_eq!(
+            std::fs::read(stale.join("sub").join("old")).expect("read"),
+            b"stale"
+        );
+    }
+
+    /// NET-12・REPAIR-12・#3506: 残骸の symlink(実在ディレクトリ・宛先なし)を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn net12_repair12_3506_fresh_root_does_not_follow_symlink_residue() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let holder = fresh_root();
+        let parent = holder.root.parent().expect("parent").to_path_buf();
+        let victim = parent.join("victim");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&victim)
+            .expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("keep");
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        let target = parent.join("nowhere");
+        let dangling = parent.join("dangling");
+        std::os::unix::fs::symlink(&target, &dangling).expect("dangling");
+
+        let r1 = crate::test_root::test_root_at(link.clone());
+        let r2 = crate::test_root::test_root_at(dangling.clone());
+        assert_ne!(&*r1, link.as_path());
+        assert_ne!(&*r2, dangling.as_path());
+        assert_eq!(std::fs::read_dir(&*r1).expect("read_dir").count(), 0);
+        assert_eq!(std::fs::read_dir(&victim).expect("victim dir").count(), 1);
+        assert_eq!(std::fs::read(victim.join("keep")).expect("keep"), b"keep");
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(!target.exists());
+    }
+
+    /// `create` を実行し (終了コード, code, stderr) を返す。状態ルートが作られていないことも確かめる。
+    fn create(extra: &[&str]) -> (u8, Option<&'static str>, String) {
+        create_checked(extra, true)
+    }
+
+    /// `create` の本体。`root_must_be_absent` が偽なら状態ルートの有無を問わない(検証を通った指定は後段で作られ得る)。
+    fn create_checked(
+        extra: &[&str],
+        root_must_be_absent: bool,
+    ) -> (u8, Option<&'static str>, String) {
+        let fresh = fresh_root();
+        let root = fresh.root.clone();
+        let mut full: Vec<OsString> = vec!["--root".into(), root.clone().into(), "create".into()];
+        full.extend(extra.iter().map(OsString::from));
+        full.extend(["--bundle", "/nonexistent-bundle", "c1"].map(OsString::from));
+        let mut out = Vec::new();
+        let r = run_to(full, &mut out);
+        let mut buf = Vec::new();
+        r.write_stderr(&mut buf).expect("write");
+        let stderr = String::from_utf8(buf).expect("utf8");
+        if root_must_be_absent {
+            assert!(!root.exists(), "state root must not be created: {extra:?}");
+        } else {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        (r.exit_code(), r.code(), stderr)
+    }
+
+    fn assert_invalid(extra: &[&str], leak: &str) {
+        let (exit, code, stderr) = create(extra);
+        assert_eq!(exit, 2, "{extra:?}: {stderr}");
+        assert_eq!(code, Some("INVALID_ARGUMENT"), "{extra:?}");
+        assert!(stderr.ends_with('\n'), "{stderr:?}");
+        assert_eq!(stderr.matches('\n').count(), 1, "{stderr:?}");
+        if !leak.is_empty() {
+            assert!(!stderr.contains(leak), "{extra:?} leaked: {stderr}");
+        }
+    }
+
+    fn assert_unimplemented(extra: &[&str]) {
+        let (exit, code, stderr) = create(extra);
+        assert_eq!(exit, 8, "{extra:?}: {stderr}");
+        assert_eq!(code, Some("UNIMPLEMENTED"), "{extra:?}");
+    }
+
+    /// 形式の検証と結線の拒否を通ったこと。Linux は後段(存在しない bundle)で止まり `UNIMPLEMENTED` ではない。
+    /// 非 Linux は network 系の指定を固定文言で `UNIMPLEMENTED` にする(状態ルートは作られない)。
+    fn assert_past_network_validation(extra: &[&str]) {
+        let (exit, code, stderr) = create_checked(extra, !cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            assert_ne!(code, Some("UNIMPLEMENTED"), "{extra:?}: {stderr}");
+            assert_ne!(code, Some("INVALID_ARGUMENT"), "{extra:?}: {stderr}");
+        } else {
+            assert_eq!((exit, code), (8, Some("UNIMPLEMENTED")), "{extra:?}");
+        }
+    }
+
+    /// TASK-186 の不正入力 8 種(空値・IP でない・空白・ハイフン・ラベル長・総長・改行・制御文字)。
+    #[test]
+    fn net12_invalid_inputs_rejected_before_any_side_effect() {
+        let l63 = "a".repeat(63);
+        let l64 = "a".repeat(64);
+        let l62 = "a".repeat(62);
+        let l61 = "a".repeat(61);
+        let host254 = format!("{l63}.{l63}.{l63}.{l62}:192.0.2.1");
+        let host253 = format!("{l63}.{l63}.{l63}.{l61}:192.0.2.1");
+        let label64 = format!("{l64}:192.0.2.1");
+        assert_invalid(&["--add-host", ":192.0.2.1"], "");
+        assert_invalid(&["--dns", ""], "");
+        assert_invalid(&["--add-host", "web:999.1.1.1"], "999");
+        assert_invalid(&["--dns", "example.com"], "example");
+        assert_invalid(&["--add-host", "my host:192.0.2.1"], "my host");
+        assert_invalid(&["--dns", " 192.0.2.1"], "192.0.2.1");
+        assert_invalid(&["--add-host", "-web:192.0.2.1"], "-web");
+        assert_invalid(&["--add-host", "web-:192.0.2.1"], "web-");
+        assert_invalid(&["--add-host", &label64], &l64);
+        assert_invalid(&["--add-host", &host254], &l63);
+        assert_past_network_validation(&["--add-host", &host253]);
+        assert_invalid(&["--add-host", "web:192.0.2.1\n10.0.0.9 evil"], "evil");
+        assert_invalid(&["--dns", "127.0.0.1\nnameserver 8.8.8.8"], "8.8.8.8");
+        assert_invalid(&["--add-host", "web\t:192.0.2.1"], "web");
+        assert_invalid(&["--add-host", "we\u{1b}b:192.0.2.1"], "we");
+    }
+
+    /// `name:::1` は最初の `:` で分割され IPv6 として受理される(検証後に UNIMPLEMENTED)。
+    #[test]
+    fn net12_add_host_splits_at_first_colon() {
+        assert_past_network_validation(&["--add-host", "name:::1"]);
+        assert_invalid(&["--add-host", "name::::1"], "");
+    }
+
+    /// none では loopback 以外の `--dns` を作成前に拒否する。
+    #[test]
+    fn net12_none_rejects_non_loopback_dns() {
+        assert_invalid(&["--network", "none", "--dns", "192.0.2.1"], "192.0.2.1");
+        assert_past_network_validation(&["--network", "none", "--dns", "127.0.0.1"]);
+        // 省略は none 扱い(D4)。非 loopback の `--dns` は create の時点で拒否する。
+        assert_invalid(&["--dns", "192.0.2.1"], "192.0.2.1");
+    }
+
+    /// `--network` の判定と使い方エラー、値が正しくても UNIMPLEMENTED。
+    #[test]
+    fn net12_network_flag_cases() {
+        assert_invalid(&["--network", "bridge"], "");
+        assert_unimplemented(&["--network", "container:x"]);
+        assert_past_network_validation(&["--network", "host"]);
+        assert_past_network_validation(&["--network", "none"]);
+        // 使い方エラーは exit 2 の INVALID_ARGUMENT(状態ルートは作られない)。
+        assert_invalid(&["--network", "a", "--network", "b"], "");
+        assert_invalid(&["--add-host"], "");
+    }
+
+    /// NET-9・NET-3(#3200): 不正な `-p` は作成前に INVALID_ARGUMENT(状態ルートは作られず、入力値は出ない)。
+    #[test]
+    fn net9_publish_invalid_specs_rejected() {
+        let n = ["--network", "mynet"];
+        for bad in ["[::1]:80:80", "::1:80:80", "80:80/sctp", "0:80", "1-2:80"] {
+            let leak = bad.split(':').next().unwrap_or("");
+            let argv = [n[0], n[1], "-p", bad];
+            assert_invalid(&argv, if leak.len() > 2 { leak } else { "sctp" });
+        }
+    }
+
+    /// NET-9(#3200): ユーザー定義名と組でない `-p` は INVALID_ARGUMENT(none / host / 指定なし)。
+    #[test]
+    fn net9_publish_requires_user_defined_network() {
+        assert_invalid(&["-p", "8080:80"], "");
+        assert_invalid(&["--network", "none", "-p", "8080:80"], "");
+        assert_invalid(&["--network", "host", "--publish", "8080:80"], "");
+    }
+
+    /// NET-9(#3200・#3329): 正しい `-p` + ユーザー定義名は pasta の判定まで進む(rootful は UNIMPLEMENTED、rootless で pasta 未指定は FAILED_PRECONDITION)。
+    #[test]
+    fn net9_publish_valid_reaches_pasta_decision() {
+        // 判定順は `check_network_options`(権限モデルの解決: publish が使えない場合の拒否)→ pasta の場所 →
+        // 定義の照合。組み合わせごとに具体値で期待する(NET-9・#3199・#3200)。
+        // 非 Linux は権限モデルが `Unavailable` で、pasta の判定より前に `UNIMPLEMENTED` になる。
+        // Linux の root は rootful で `UNIMPLEMENTED`、非 root は rootless で pasta 未指定の `FAILED_PRECONDITION`。
+        #[cfg(not(target_os = "linux"))]
+        let want = (
+            "UNIMPLEMENTED",
+            "port publishing is not supported on this platform yet",
+        );
+        #[cfg(target_os = "linux")]
+        let want = if std::fs::read_to_string("/proc/self/status")
+            .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")))
+        {
+            (
+                "UNIMPLEMENTED",
+                super::create_network::PUBLISH_ROOTFUL_MESSAGE,
+            )
+        } else {
+            ("FAILED_PRECONDITION", "pasta path is not configured")
+        };
+        for extra in [
+            ["--network", "mynet", "-p", "8080:80"],
+            ["--network", "mynet", "--publish", "127.0.0.1:8080:80/udp"],
+        ] {
+            let (exit, code, stderr) = create(&extra);
+            assert_eq!(code, Some(want.0), "{extra:?}: {stderr}");
+            assert_ne!(exit, 0, "{extra:?}");
+            assert!(stderr.contains(want.1), "{extra:?}: {stderr}");
+        }
+    }
+
+    /// NET-9(#3200): 件数と 1 件の長さの超過は使い方エラー。
+    #[test]
+    fn net9_publish_usage_limits() {
+        let long = "1".repeat(65);
+        assert_invalid(&["--network", "mynet", "-p", long.as_str()], "");
+        let mut many: Vec<&str> = vec!["--network", "mynet"];
+        for _ in 0..65 {
+            many.extend(["-p", "8080:80"]);
+        }
+        assert_invalid(&many, "");
     }
 }

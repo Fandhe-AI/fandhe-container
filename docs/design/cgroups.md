@@ -119,7 +119,7 @@ setter が無い既知の項目は未適用として記録し、create / start �
 
 ### `linux.cgroupsPath`
 
-型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使わない方針とする（#2010 の判断）。状態記録・記録済みスコープの検証つき削除（#2060）がこの配置を前提にしており、systemd cgroup driver は対象外（TASK-32）で `slice:prefix:name` 形式を解釈する必要も無いため。指定があれば値に関わらず（`..`・絶対パス・別表記を含め）`cgroup_requirement::check_cgroups_path` が create / start で fork 前に `UNIMPLEMENTED` として拒否する。受理に開く場合は、委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合を前提とし、オーナー判断を経て別 issue で扱う。
+型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使わない方針とする（#2010 の判断）。状態記録・記録済みスコープの検証つき削除（#2060）がこの配置を前提にしており、systemd cgroup driver は対象外（TASK-32）で `slice:prefix:name` 形式を解釈する必要も無いため。指定があれば値に関わらず（`..`・絶対パス・別表記を含め）`cgroup_requirement::check_cgroups_path` が create / start で fork 前に `UNIMPLEMENTED` として拒否する。受理に開く場合は、委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合を前提とし、オーナー判断を経て別 issue で扱う。CRI の `cgroup_parent` の受け入れ方針は判断記録 [cri-cgroup-parent.md](cri-cgroup-parent.md)（#2672・CRI-2・CORE-4）にまとめている。
 
 ## 前提環境（委譲スコープの作り手。#2081・CORE-3・CORE-4・SUP-1・CLI-1）
 
@@ -140,7 +140,7 @@ supervisor の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自
 
 - 簡易実装（REPAIR-3）: 結果の 1 行が無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない（`INTERNAL`）。制御チャネル（#2058）の後の課題とする
 - 上記の「systemd cgroup driver 非対応」との関係: CLI は systemd-run を起動して scope を 1 つ作らせるだけで、D-Bus を自分では話さない。scope の中の cgroup 操作はすべて cgroupfs へ直接行う。CORE-4 の言い回しとの整合は spec 側の判断事項として報告する
-- 実機での実行は人間担当で、結果は #2062 に記録する（手順は [rootless-start-cgroup.md](../verification/rootless-start-cgroup.md)。`AGENTS.md`「実機前提テスト」の `start_scope_real`・`supervisor_bin_real`）
+- CI では platform-ci の ubuntu が `start_scope_real` も回す（#3105）。実機の OS・カーネル版での実行は人間担当で、結果は #2062 に記録する（手順は [rootless-start-cgroup.md](../verification/rootless-start-cgroup.md)。`AGENTS.md`「実機前提テスト」の `start_scope_real`・`supervisor_bin_real`）
 
 ## 関連・後続
 

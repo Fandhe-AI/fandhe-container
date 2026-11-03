@@ -1,0 +1,212 @@
+# production_launcher の create の間欠失敗（tmpfiles の aging 走査との flock 競合）
+
+Issue #2840。ビヘイビア: CORE-1・CORE-2・CORE-5・CORE-6・SEC-1・REPAIR-4・REPAIR-5・REPAIR-12。
+
+## 現象
+
+main の CI（run 40298579586・commit 3ebc80ce）の `platform-ci (ubuntu-latest)`「production_launcher の実行」で、
+シナリオ F の成功行の直後、シナリオ G の 1 周目（`bind`）の `do_create` が
+`FailedPrecondition`・`container start is in progress in another process` で失敗した。次の run は通っており間欠失敗である。
+
+## 否定した仮説
+
+- ID の重なり: エラーは状態ストアではなく bundle の flock（`BundleLock::acquire`）から出る。全シナリオの ID は重ならない
+- start のロックの解放漏れ・別 start の残り: G の bundle は直前に `create_dir` で排他作成した新しい inode で、
+  前のシナリオのロックは別 inode に掛かる。F の start は fork 前の検査で拒否され `lock_owner` に届かない。
+  本番 launcher は `LaunchMode::SelfBounded` で、残るスレッドも無い
+
+したがって、新しい bundle の作成から create までの間に、試験プロセス以外が flock を掛けたことになる。
+
+## 原因（有力。runner 上の直接観測は未取得）
+
+- Ubuntu noble の `tmpfiles.d/tmp.conf` は `D /tmp 1777 root root 30d` で /tmp は aging 対象
+- systemd の `dir_cleanup` は、サブディレクトリごとに `flock(LOCK_EX|LOCK_NB)` を取ってから再帰する（age に関係なく走査中は保持）
+- `systemd-tmpfiles-clean.timer` は `OnBootSec=15min`
+- 失敗した run だけが、ジョブ開始から production_launcher の実行までが約 14 分 37 秒で、起動後 15 分前後の走査に重なる
+  （成功した 3 run は約 16 分 04 秒〜16 分 38 秒）。直近 40 件の失敗 run で同じ文言は 1 件のみ
+
+## 修正
+
+`crates/core/tests/production_launcher.rs` の一時領域を、`create_dir` で排他作成し 0700 にした親ディレクトリ
+（`fandhe-prodlaunch-<pid>-<nanos>`）の下へまとめ、親に共有 flock を期限つきで取って試験の終わりまで保持する。
+tmpfiles は LOCK_EX を取れないディレクトリを丸ごと飛ばす（tmpfiles.d(5)）。製品のロックは子の inode で親と干渉しない。
+あわせて create の失敗時に `/proc/locks` から保持者を stderr に出す診断を足した（判定は変えない。REPAIR-4）。
+
+採らなかった案: create の再試行（本物のロック漏れを隠す）、`target/tmp` への移動（祖先の権限への影響）、
+ci.yml の `TMPDIR` 指定（CI でしか効かない）。
+
+## 繰り返し実行の結果
+
+修正前後の繰り返し（注入あり・なし）の件数は未取得である（作成環境では Unshare 段が AppArmor 制限で `PermissionDenied` になり、本番試験を最後まで回せなかったため）。
+`make repeat-test` は #2886 で `USER_SCOPE=1`（委譲 scope での直接実行）・`TEST_ENV`・512 文字までで `;` を含む成功行の完全一致に対応した。実行例は `AGENTS.md` の repeat-test の項を参照。
+
+### 修正後の 300 回（workflow_dispatch・ubuntu。#2960）
+
+| 項目 | 値 |
+| ---- | -- |
+| 日付 | 2026-10-27 |
+| run | <https://github.com/Fandhe-AI/fandhe-container/actions/runs/40459687356> |
+| commit | `7d9a378f3a7a7e0e98937e2be68aacc154682c77`（main。#2840・#2887 の保護を含む）。dispatch 先は `ci-probe/2960-production-launcher-7d9a378f` |
+| 入力 | `repeat-test-bin=production_launcher`・`repeat-test-ignored=true`・`repeat-user-scope=true`・`repeat-os=ubuntu-latest`・`repeat-linux-only=true`・`repeat-count=300`・`repeat-run-timeout=600` |
+| 環境変数（名前のみ） | `FANDHE_CONTAINER_TEST_ID_HELPER` |
+| 結果 | `passed=300 failed=0 count=300 test_bin=production_launcher` |
+| ステップの所要 | 06:29:38Z から 06:44:24Z（約 15 分。1 回あたり約 3 秒） |
+| run 全体 | success（全ジョブ success） |
+
+照合は最終行の完全一致のみ（CI の通常ステップが行う部分行・禁止行の照合より弱い）。
+
+tmpfiles の走査との関係: ステップ終了時点の `uptime=2162.39` から boot は約 06:08:22Z。`ExecMainStartTimestamp`（systemd-tmpfiles-clean.service）は
+06:23:22 UTC で boot の約 15 分後であり、繰り返しの開始（06:29:38Z）より前に終わっている。したがってこの 300 回は初回走査との重なりを含まず、
+競合を再現する条件の下での修正の直接の実証ではない。修正後に失敗 0 であり、ほかの間欠失敗も出なかったことの確認として位置づける。
+
+修正前の再現頻度は、boot から約 15 分の走査との重なりに依存するため繰り返しでは再測定できない。
+
+## 残余（製品側）
+
+`BundleLock` は待たない設計（#1316・#1854・#2378 で確定）のため、aging 対象の場所に bundle を置く利用者でも
+create・start・delete が稀に同じ文言で失敗しうる。`launch.rs` の doc に既知の制約として記した。
+待たない取得を期限つきの再試行にする案・文言の改善などはオーナー判断として追跡する。
+
+## 他の実機前提試験への展開（#2887・CORE-5・REPAIR-12）
+
+`production_launcher` の保護（排他作成した 0700 の親ディレクトリ＋その親への共有 flock の保持）を共通補助
+`crates/core/tests/support/scratch_root.rs` にまとめ、同じ競合を受ける他の `--ignored` 実機試験へ広げた。
+`production_launcher` 自身の挙動（名前 `fandhe-prodlaunch-<pid>-<nanos>`・0700・期限・削除位置）は変えていない。
+
+### 判定基準
+
+失敗は「製品がディレクトリに待たない flock を取る経路」でだけ起きる（tmpfiles はディレクトリだけを flock する。
+状態ストアの `@lock` はファイルで無関係）。該当は `oci_runtime::{create,start,delete,create_with_image}` の
+`BundleLock` と image rootfs の `try_lock` で、これらを通る試験だけを対象にした。通らない試験は、作成直後の木を
+aging（30d）が消さないため対象外。
+
+### 適用した試験
+
+| 試験 | crate | CI |
+| ---- | ----- | -- |
+| `production_launcher`（共通補助へ移行） | core | platform-ci |
+| `rootless`・`rootless_uid_mapping`・`rootless_file_owner`・`rootless_image_rootfs_remove` | core | platform-ci |
+| `exec_subordinate_e2e`・`supervisor_bin_real` | supervisor | platform-ci |
+| `start_stop_delete_real` | cli | platform-ci |
+| `start_scope_real`・`delete_cgroup_real`・`start_recover_real` | cli | `platform-ci`（#3105） |
+
+### 対象外
+
+- `rootless_launch`・`seccomp`・`exec_setns_join`・`sysfs_mount`・`config_paths_implicit_dev`・`inject_files`・`tmpfs_mount`・
+  `readonly_paths`・`landlock_implicit_dev`・`unshare_isolation`・`container_options_ipc`・`rootless_holder_*`:
+  `ProcessLauncher::launch` 等を直接呼び、製品のディレクトリ flock を通らない
+- `userns_extract`・`image_store_xdev`（oci）: image store の `@lock` はファイルで、ディレクトリ flock を通らない
+- plugin-cri の `production_binary_full_lifecycle_real`・cri の `runtime_service_namespaces`: bundle を temp_dir 直下に実体で置かない
+
+### 置き場所の決定
+
+正本は core の試験補助（`crates/core/tests/support/scratch_root.rs`）で、supervisor・cli の試験は
+`#[path = "../../core/tests/support/scratch_root.rs"]` で同じファイルを取り込む（複製しない。保護条件の修正を
+1 箇所に保つため。試験専用で製品コード・rlib に影響しない）。代替は、各 crate の `tests/support/` へ複製し
+正本を指すヘッダを付ける方式。rootfs の組み立て部品も当初は複製だったが、#2963 で core の `tests/support/`
+（`minimal_rootfs.rs`・`loader_deps.rs`・`file_copy.rs`）へ集約し、同じく `#[path]` で共有している（複製の乖離を避けるため）。
+
+### 残余
+
+- 既定のテスト集合の core の試験は #2958、supervisor・cli の既定集合と `#[ignore]` の `cgroup_*`・
+  `confirm_recorded_cgroup` は #3026 で対応済み（下の節）。両 crate の `src` の単体試験は #3141 で判定・対応済み（下の節）
+- `linux-env-probe.yml` への tmpfiles 設定・timer の観測ステップ（任意項目）は未実施
+- CI 外の 3 件（cli）はビルドと clippy までの確認で、実機実行は人手
+
+## 既定のテスト集合への展開（#2958・CORE-5・REPAIR-12）
+
+`--ignored` 不要の core の試験にも同じ競合が起きうるため、試験ごとの保護済み親 `ScratchDir`
+（`crates/core/tests/support/scratch_root.rs`。排他作成した 0700 の親に共有 flock を持ち、drop で親を消す）を
+適用した。プロセスで 1 つの `scratch_root` は harness = false の 1 本向け、`ScratchDir` は libtest の並列試験と
+複数 fixture 向け。bundle・状態ルートは親の **子** に作る（親自体は製品がロックしない）。Linux 以外は
+`BundleLock` が無いため保護せず、排他作成だけ行う。挙動は `scratch_root_guard` で固定した。
+
+適用（判定基準: 製品の `BundleLock` / image rootfs の `try_lock` を通るか）:
+
+| 試験 | 当たる経路 |
+| ---- | ---------- |
+| `oci_create`・`oci_start`（`MemStateStore` の状態ルートを含む）・`oci_delete`・`oci_lifecycle`・`oci_runtime_error` | create・start・delete |
+| `oci_create_with_image`・`oci_create_crash_reclaim` | `create_with_image`（BundleLock と rootfs の `try_lock`） |
+| `state_store`・`daemonless`・`create_mount_audit_delivery` | create・start・delete（子は親が保持するロックの下で動く） |
+
+対象外: `oci_kill`・`state_store_*`・`oci_runtime_error` の `temp_dir().join("bundle")` はパス文字列のみでディレクトリを作らない。
+`oci_config`・`exec_diagnostic_output`・`audit_file_writer*`・`plugin_*` はディレクトリ flock を通らない。
+
+## cgroup 系の実機前提試験と supervisor・cli の既定集合への展開（#3026・CORE-5・REPAIR-12）
+
+issue #2958 の残余だった 2 群を、同じ `ScratchDir`（`#[path]` で取り込み、状態ルート・bundle は親の **子** に作る）で保護した。
+照合内容（成功行・具体値）は変えていない。tmpfiles の走査との重なりは再現できないため、直接の実証ではない（#2958 と同じ扱い）。
+
+判定基準: 製品がディレクトリへ待たない flock を取る経路（`BundleLock::acquire`。create・start・`recover_interrupted_start`・
+image rootfs を持つ delete）に、`temp_dir()` 直下の **実在する** bundle ディレクトリを通すか。パス文字列だけの bundle、
+状態ストアの `@lock`（ファイル）、exec 系の `pin_bundle_rootfs`（flock を取らない）は対象外。
+
+### 群 1: core の `#[ignore]` の cgroup 系 5 本
+
+| 試験 | 当たる経路 |
+| ---- | ---------- |
+| `confirm_recorded_cgroup` | 実在の `root/bundle` を `recover_interrupted_start` → `BundleLock::acquire` へ通す（厳密に該当） |
+| `cgroup_delete`・`cgroup_delete_recorded`・`cgroup_resources_apply`・`cgroup_start_chain` | bundle はパスのみで現状は flock を通らない。受け入れ条件に従い、delete が将来ロックを取っても壊れない予防として移した |
+
+5 本は CI の `platform-ci` の `--ignored` 一覧に入っておらず、`--ignored` の実機実行（委譲 cgroup が要る）は人手。
+ビルドと既定集合の self_check までを確認した。
+
+### 群 2: supervisor・cli の既定集合（`tests/` の結合試験）
+
+| crate | 試験 | 当たる経路 |
+| ----- | ---- | ---------- |
+| supervisor | `start_entry`・`start_tiocsti_wiring`・`start_entry_audit_record_failed`・`seccomp_notify_wiring`・`log_pipeline` | 実在の bundle の create → `run_start`（claim_start → BundleLock） |
+| supervisor | `start_bind_audit_relay`・`start_destination_audit_relay`・`start_rootfs_pin_audit_relay`（harness = false） | 同上（`ScratchDir` は親プロセスだけが作る） |
+| supervisor | `supervisor_bin` | 実在の bundle の create と bin の `start` |
+| cli | `binary_entry`・`create_slot_wait`・`stop_control_channel`・`start_signal_interrupt` | CLI の create・start・delete |
+
+対象外: bundle がパス文字列だけの `run`・`restart_latency`・`daemonless`・`container_options*`・`healthcheck_sync`・
+`state_store_wiring`・`stop_intent`、ディレクトリ flock を通らない `inherited_fds`・`inspect_output`・`health_hook`・
+`healthcheck_periodic`・`control_channel`・`control_audit_delivery`・`bounded_slot_busy`・`log_rotation`・`privilege*`・`exec*`・
+`seccomp_notify_audit`、cli の `image_ownership_parity`・`sigchld_reset`・`signal_forward`。
+
+### 残余
+
+- `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験は #3141 で判定・対応済み（下の節）
+
+## supervisor・cli の src の単体試験への展開（#3141・CORE-5・REPAIR-12）
+
+issue #3026 の残余だった `crates/supervisor/src`・`crates/cli/src` の `#[cfg(test)]` 単体試験の `temp_dir()` 使用を判定し、
+保護が要る箇所を試験ごとの `ScratchDir` へ移した。照合内容（アサーション）は変えていない。tmpfiles の走査との重なりは
+再現できないため、直接の実証ではない（#2958・#3026 と同じ扱い）。
+
+判定基準は #3026 と同じ。製品がディレクトリへ待たない flock を取る経路（`oci_runtime::{create,start,delete,create_with_image}`・
+`recover_interrupted_start` の `BundleLock`、image rootfs の `try_lock`）に、`temp_dir()` 直下の **実在する** ディレクトリ
+（またはその子孫）を bundle・rootfs として通すか。aging による削除（30d。atime・mtime・ctime がすべて古い場合だけ）は、
+作成直後のエントリの ctime が新しく、単体試験は数秒〜数十秒で終わるため、どの箇所でも起きない（長時間保持もしない）。
+
+取り込み方: 各 crate の `src/lib.rs` に `#[cfg(all(test, target_os = "linux"))]` の
+`#[path = "../../core/tests/support/scratch_root.rs"] mod scratch_root;` を置き、同じ正本を参照する（複製しない）。
+利用者が Linux 限定であり、`cross-target-check` の macOS・Windows 向け `clippy --all-targets` へ利用者 0 の補助を
+持ち込まないため Linux に絞る。bundle・状態ルート・image root は `ScratchDir` の **子** に作る。
+
+### 適用（保護が要る 6 fixture）
+
+| crate | ファイル・fixture | 当たる経路 |
+| ----- | ----------------- | ---------- |
+| cli | `commands.rs` の `tests::linux::TmpDir` | `invoke` → create・start・delete（`BundleLock`） |
+| cli | `commands/create_start.rs` の `tests::linux::TmpDir` | `create_container*`（`BundleLock` と image rootfs の `try_lock`） |
+| cli | `commands/list_logs.rs` の `tests::linux::TmpDir` | `oci_runtime::create` |
+| cli | `commands/stop_delete.rs` の `tests::linux::TmpDir` | create・start・delete・`create_with_image` |
+| cli | `setup.rs` の `tests::TmpDir`（`cli2_daily_commands_do_not_request_os_setup`。Linux のみ `ScratchDir` の子） | `invoke` → create・delete（`BundleLock`） |
+| supervisor | `start_client.rs` の `tests::TmpDir`（`Fixture`） | `Fixture::new` の `oci_runtime::create` |
+
+### 対象外
+
+- パス文字列だけでディレクトリを作らない: cli の `commands/args.rs`・`image_refs.rs` の引数解析系、`net12_argv_tests`、
+  supervisor の `exec`・`health`・`healthcheck/periodic`・`inspect`・`restart`・`run`・`state`・`start_entry` の大半
+- ロックがファイル（tmpfiles はディレクトリしか flock しない）: 状態ストアの `@lock`、container options の `@locks/<id>`、
+  ログの `.log.lock`・CRI ログ、image store の `@lock`・create gate、pull の `@pull.lock`
+  （cli の `create_start.rs` の op log 系と `reclaim_tests`、`image*`・`ref_reconcile`・`stop_delete.rs` の状態ストア系、
+  supervisor の `container_options/*`・`logs/*`・`deadline_store`・`supervisor_log`）
+- flock を取らない経路: `pin_bundle_rootfs`（`exec.rs`）、config の読み取りのみ（`start_entry.rs`）、UDS の bind
+  （`control/listener.rs`）、xattr（`sys/linux.rs`）、`doctor*`・`setup` の出力系（`setup.rs` の `tests::TmpDir` は上表）・`plugin_backend`・`create_options` の設定ファイル系
+
+### 残余
+
+- 製品の `BundleLock` を待つ設計へ変える案と `linux-env-probe.yml` への観測ステップは本 issue に含めない（既存の追跡のまま）

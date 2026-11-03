@@ -1,5 +1,5 @@
 //! DNS ヘルパーのオンデマンド起動・終了を実ネットワーク（bridge・gateway:53）上で確かめる実機結合試験
-//! （NET-7・TASK-144.2・#330・MS-8）。
+//! （NET-7・TASK-144.2・#330・MS-8。停止後の再参加の段は #1883・#2042）。
 //!
 //! 参照カウント本体（`dns_helper::refcount::DnsHelperRefCounts`。TASK-144.1・#329）はユニットテスト（偽ランチャ）と
 //! ループバックの `dns_helper_process` で検証済みで、本テストは「コンテナ参加で実プロセスが起動し、最後の
@@ -26,9 +26,18 @@
 //!   終了後は (1) `is_running` / `members` / `bound_addr` の状態、(2) 自分の子で `--listen` を持つプロセスが 0 件、
 //!   (3) `/proc/self/net/udp` に gateway:53 の待受が 0 件、(4) コンテナ netns からの正常クエリに応答が無いこと、を
 //!   具体値で確認する
+//! - 続けて同じ c1 が再参加し（停止でエントリは消えているので `Restarted` ではなく `Started`）、停止前と別 pid の
+//!   ヘルパーがちょうど 1 件・待受ちょうど 1 件で再起動して同じ NOTIMP の応答を返し、c1 の離脱でもう一度
+//!   `Stopped`（0 件・応答なし）になることを確かめる。#331（TASK-145）の条件 1（停止後に残らない）と
+//!   条件 2（再参加で再起動する）の証跡が、1 回の実行の成功行に出る
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提を満たさない
 //! 場合は skip せず失敗する。
+
+#[path = "support/exclusive_dir.rs"]
+mod exclusive_dir;
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -139,13 +148,15 @@ mod linux {
             == Some("0");
         assert!(uid_root, "this test requires root (euid 0); see AGENTS.md");
         for tool in ["unshare", "nsenter", "mount"] {
-            let ok = Command::new(tool)
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = crate::reap::run_within(
+                Command::new(tool)
+                    .arg("--help")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+                crate::reap::reap_within(),
+            )
+            .inspect_err(|e| eprintln!("precondition probe: {e}"))
+            .is_ok_and(|s| s.success());
             assert!(ok, "util-linux `{tool}` is required; see AGENTS.md");
         }
     }
@@ -176,8 +187,7 @@ mod linux {
             {
                 Some(st) => break st,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     return Err(NetError::new(
                         NetErrorCode::Timeout,
                         format!("{program} did not finish before the deadline"),
@@ -194,8 +204,7 @@ mod linux {
     pub fn launcher() {
         require_root_and_tools();
         let dir =
-            std::env::temp_dir().join(format!("fandhe-dns-ondemand-test-{}", std::process::id()));
-        fs::create_dir(&dir).expect("create temp dir");
+            crate::exclusive_dir::create("fandhe-dns-ondemand-test").expect("create temp dir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod temp dir");
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new("unshare")
@@ -206,13 +215,18 @@ mod linux {
             .env(DIR_ENV, &dir)
             .spawn()
             .expect("spawn unshare --net --mount");
-        let deadline = Instant::now() + timeout() * 6;
+        // 内側の待ちの上限の和: 外部コマンド 11 回分（create・mount ×2・attach ×2・client ×3・silent ×2・delete の
+        // 各 `timeout()`。2 サイクル目の client と silent を含む）に、ヘルパーの READY / REAP 期限を 2 サイクル分
+        // 足し、余裕 10 秒を持たせる。新しい待ちは作らず、既存の個別期限の合計を全体の上限にする（REPAIR-5）。
+        let overall = timeout() * 11
+            + (READY_TIMEOUT_DEFAULT + REAP_TIMEOUT_DEFAULT) * 2
+            + Duration::from_secs(10);
+        let deadline = Instant::now() + overall;
         let code = loop {
             match child.try_wait().expect("wait inner") {
                 Some(st) => break st.code().unwrap_or(1),
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::reap::reap_or_report(&mut child, crate::reap::reap_within());
                     println!(
                         "dns_helper_ondemand_privileged: inner did not finish before deadline"
                     );
@@ -402,7 +416,7 @@ mod linux {
         }
     }
 
-    /// 成功時に計測つきの 1 行（TASK-145 が機械で読む）を返す。
+    /// 成功時に計測つきの 1 行（TASK-145 が機械で読む。2 サイクル分の証跡を含む）を返す。
     fn inner_checked() -> Result<String, NetError> {
         let expected = std::env::var(LAUNCHER_PID_ENV)
             .ok()
@@ -591,7 +605,7 @@ mod linux {
                 return Err(fail(format!("helper still answers after stop: {out}")));
             }
 
-            // 起動・停止の計測は各ちょうど 1 回の成功。
+            // 1 サイクル目の計測は起動・停止が各ちょうど 1 回の成功。
             let starts = collector.samples(NetOpKind::DnsHelperStart);
             let stops = collector.samples(NetOpKind::DnsHelperStop);
             expect_eq("start sample count", starts.len(), 1)?;
@@ -607,8 +621,100 @@ mod linux {
                 Some(NetOpOutcome::Success),
             )?;
             let stop_ms = stops.first().map_or(0, |s| s.latency().as_millis());
+
+            // 2 サイクル目（#331 の条件 2）: 停止後に c1 が同じネットワークへ再参加すると、別プロセスとして
+            // 再起動する。停止で参照カウントのエントリは消えているため、結果は `Restarted`（異常終了した
+            // ヘルパーの復旧）ではなく 0→1 の `Started` になる。c1 の netns の pin は delete_network まで残る。
+            expect_eq(
+                "rejoin: rejoin outcome",
+                rc.join(&name, listen, &c1)?,
+                JoinOutcome::Started,
+            )?;
+            expect_eq("running after rejoin", rc.is_running(&name), true)?;
+            expect_eq(
+                "bound address after rejoin",
+                rc.bound_addr(&name),
+                Some(addr),
+            )?;
+            let rejoin_pids = helper_children(&listen_str)?;
+            expect_eq("helper processes after rejoin", rejoin_pids.len(), 1)?;
+            let rejoin_pid = *rejoin_pids
+                .first()
+                .ok_or_else(|| fail("restarted helper pid missing"))?;
+            if rejoin_pid == helper_pid {
+                return Err(fail("restarted helper has the same pid as the stopped one"));
+            }
+            let rejoin_ns = fs::read_link(format!("/proc/{rejoin_pid}/ns/net"))
+                .map_err(|e| fail(format!("readlink restarted helper netns: {e}")))?;
+            if rejoin_ns != own || rejoin_ns == parent {
+                return Err(fail(
+                    "restarted helper is not in the network's own netns (or shares the launcher's)",
+                ));
+            }
+            let rejoin_udp = count_udp(addr)?;
+            expect_eq("udp sockets after rejoin", rejoin_udp, 1)?;
+            let (ok, out) = run_cmd(
+                "nsenter",
+                &[
+                    &format!("--net={pin1}"),
+                    exe_str,
+                    "--dns-client",
+                    &listen_str,
+                ],
+            )?;
+            if !ok {
+                return Err(fail(format!("dns client after rejoin failed: {out}")));
+            }
+
+            // 再参加した c1 の離脱 -> もう一度停止。
+            expect_eq(
+                "leave after rejoin",
+                rc.leave(&name, &c1)?,
+                LeaveOutcome::Stopped,
+            )?;
+            expect_eq("running after second stop", rc.is_running(&name), false)?;
+            expect_eq("members after second stop", rc.members(&name), 0)?;
+            expect_eq(
+                "bound address after second stop",
+                rc.bound_addr(&name),
+                None,
+            )?;
+            let procs_after2 = helper_children(&listen_str)?.len();
+            expect_eq("helper processes after second stop", procs_after2, 0)?;
+            let udp_after2 = count_udp(addr)?;
+            expect_eq("udp sockets after second stop", udp_after2, 0)?;
+            let (ok, out) = run_cmd(
+                "nsenter",
+                &[
+                    &format!("--net={pin1}"),
+                    exe_str,
+                    "--dns-expect-silent",
+                    &listen_str,
+                ],
+            )?;
+            if !ok {
+                return Err(fail(format!(
+                    "helper still answers after second stop: {out}"
+                )));
+            }
+
+            // 2 サイクル通算の計測は起動・停止が各ちょうど 2 回の成功。
+            let starts = collector.samples(NetOpKind::DnsHelperStart);
+            let stops = collector.samples(NetOpKind::DnsHelperStop);
+            expect_eq("total start sample count", starts.len(), 2)?;
+            expect_eq("total stop sample count", stops.len(), 2)?;
+            for (what, samples) in [("start", &starts), ("stop", &stops)] {
+                for s in samples {
+                    expect_eq(
+                        &format!("{what} outcome (all cycles)"),
+                        s.outcome(),
+                        NetOpOutcome::Success,
+                    )?;
+                }
+            }
+            let stop2_ms = stops.get(1).map_or(0, |s| s.latency().as_millis());
             Ok(format!(
-                "dns_helper_ondemand_privileged: ok start=1 stop=1 helper_pid={helper_pid} stop_ms={stop_ms} procs_after={procs_after} udp53_after={udp_after} reply_after=none (NET-7)"
+                "dns_helper_ondemand_privileged: ok start=2 stop=2 helper_pid={helper_pid} stop_ms={stop_ms} procs_after={procs_after} udp53_after={udp_after} reply_after=none rejoin=Started rejoin_helper_pid={rejoin_pid} rejoin_procs=1 rejoin_udp53={rejoin_udp} rejoin_reply=notimp stop2_ms={stop2_ms} procs_after2={procs_after2} udp53_after2={udp_after2} reply_after2=none (NET-7)"
             ))
         })();
 

@@ -8,6 +8,28 @@
 //!
 //! mountinfo の読み取りは [`read_mountinfo_bounded`] が上限つきで行い、解析は [`parse_mountinfo`] が行数を制限する
 //! （無制限確保による DoS を防ぐ）。
+//!
+//! # mountinfo のパス文字列による行選択の点検（#2823・SEC-1・CORE-2・NET-1）
+//!
+//! 同じパスに別のマウントが重なる・祖先の overmount で隠れるマウントがあると、mount point や root の文字列で
+//! 行を選ぶ判定は取り違える（crates/net の `unpin_in_dir` は #2764 で fd の `mnt_id` 照合へ変更済み）。
+//! crates/core の箇所ごとの判定は次のとおり。
+//!
+//! | 箇所 | 判定 |
+//! | ---- | ---- |
+//! | `fs_identity`・`reaches_by`・`exposed_devs`・`mounts_under` の降り方 | 変更不要。`mnt_id` で行を引き、配下は parent ID で降りる。文字列は引いた後の絞り込みか、隠れた行も含める保守側のみ |
+//! | `exec` の `mount_is_shared_in`・`mount_is_read_only_in`、`masked_paths`・`inject`・`devices`・`tmpfs` の before / after 照合 | 変更不要。`mnt_id` のみで判定 |
+//! | `exec/bind_mounts` の `subtree_members`・`check_bind_subtree_with`・overlay 層・`fresh_state_identity` | 変更不要。ID・parent ID・dev で引く |
+//! | `exec/rootfs` の `check_no_submounts`・`bind_lineage_ok`・pivot 後の検査 | 変更不要。ID の親子関係 |
+//! | `landlock/apply`・`image_rootfs`・`start` の状態ルート / rootfs / bundle | 変更不要。fd の `mnt_id` で照合 |
+//! | `exec/sysfs::check_sysfs_tree`・`exec/path_masks::check_subtree_read_only`（部分木の事後検証） | 変更済み。配下を前方一致で集めると隠れた行まで数え誤拒否していたため、top の `mnt_id` から parent ID で降りる |
+//! | `start::build_protected_roots`（状態ルートの子マウントのハードリンク走査） | 変更済み。隠れた子を見えているマウントの中身に帰属させ、走査の枝刈りで同じ FS の一部を走査し損ねうるため、start の時点で point を fd で辿った `mnt_id` と子の ID を照合し、見えていない子は「リンクあり」に固定して枝刈りから外す |
+//! | `sys.rs` 試験の devpts 実機試験 | 変更済み。返された fd の `mnt_id` で行を引く |
+//! | `sys.rs` 試験の `is_mount_point`・`mount_options_of`、`sealed_copy` 試験の `/proc` 検索、`bind_mounts` 試験の `point == merged` | 据え置き。自作の一時マウントを引く実機前提の試験で、重なりの有無で意味が変わらない |
+//!
+//! 残余: 子マウントの可視判定は start の時点のトポロジーに基づく。restart までの間に構成が変わった場合は、従来の
+//! 走査根・枝刈りと同じく start の時点の値を使う。別 crate（platform-macos・platform-windows）の
+//! 独自のパス照合は本点検の範囲外。cli の `doctor` は #2909 で点検済み（`crates/cli/src/doctor.rs` のモジュール doc 参照）。
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -40,13 +62,95 @@ pub(crate) fn read_mountinfo_bounded(path: &str) -> Result<String, MountinfoRead
     Ok(text)
 }
 
-/// `/proc/<...>/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
+/// fdinfo として読むバイト数の上限（超過は拒否）。`O_PATH` の fd の fdinfo は数十バイトで、crates/net の
+/// `MAX_FDINFO_READ` と同じ値にそろえる。landlock の旧上限（4096 での黙った切り捨て）はこの拒否に統一した（#2762）。
 #[cfg(target_os = "linux")]
-pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
-    fdinfo
-        .lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
+pub(crate) const FDINFO_MAX_BYTES: u64 = 64 * 1024;
+
+/// fdinfo の `mnt_id` の読み取り・解析の失敗。呼び出し側が自分の段・エラー型へ写す（REPAIR-1・CORE-2・#2762）。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum FdinfoMountIdError {
+    /// 読めない（open・read の失敗、または UTF-8 でない）。
+    Read(std::io::Error),
+    /// [`FDINFO_MAX_BYTES`] を超える。
+    TooLarge,
+    /// 行頭が `mnt_id:` の行が無い。
+    Missing,
+    /// 行頭が `mnt_id:` の行が 2 つ以上ある（値が同じでも拒否する。fail-closed）。
+    Duplicate,
+    /// 値が `u64` として解釈できない（空・非数値・負数・桁あふれ）。
+    Invalid,
+}
+
+/// fdinfo の本文から行頭が `mnt_id:` の行の値（fd が属するマウントの ID）を取り出す純関数。
+/// 重複行は拒否する（`setns::parse_fdinfo_pid` と同じ。カーネルは 1 行しか出さない）。
+/// 呼び出しは [`read_fd_mnt_id`] 経由が基本で、crates/core で fdinfo の `mnt_id` を解析する唯一の実装（REPAIR-1）。
+/// crates/net・crates/gpu に同じ規則の別実装がある（依存方向のため共有しない。判断は
+/// `docs/design/fdinfo-mnt-id-parsing.md`・#3140）。規則を変えるときは `testdata/fdinfo_mnt_id_cases.txt` と
+/// 3 か所を同じ PR で直す（一致は 3 crate の `*_fdinfo_mnt_id_shared_cases` 試験が機械照合する）。
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Result<u64, FdinfoMountIdError> {
+    let mut found: Option<&str> = None;
+    for value in fdinfo.lines().filter_map(|l| l.strip_prefix("mnt_id:")) {
+        if found.replace(value).is_some() {
+            return Err(FdinfoMountIdError::Duplicate);
+        }
+    }
+    let value = found.ok_or(FdinfoMountIdError::Missing)?;
+    value
+        .trim()
+        .parse()
+        .map_err(|_| FdinfoMountIdError::Invalid)
+}
+
+/// `r` を [`FDINFO_MAX_BYTES`] までだけ読む。超過は `TooLarge`（fail-closed）。
+#[cfg(target_os = "linux")]
+fn read_fdinfo_bounded(r: impl std::io::Read) -> Result<String, FdinfoMountIdError> {
+    let mut text = String::new();
+    // 上限 + 1 バイトまで読み、超えたら拒否する（確保量は上限で頭打ち）。
+    r.take(FDINFO_MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(FdinfoMountIdError::Read)?;
+    if u64::try_from(text.len()).map_or(true, |n| n > FDINFO_MAX_BYTES) {
+        return Err(FdinfoMountIdError::TooLarge);
+    }
+    Ok(text)
+}
+
+/// `fd` の属するマウント ID を `/proc/thread-self/fdinfo/<fd>` から上限つきで読む。
+/// `/proc/self` ではなく `thread-self` を使う（`establish` 後の別スレッドでは `/proc/self` が別の mount namespace を
+/// 指し得るため）。exec・bind mount・landlock・image rootfs の各段が使う（REPAIR-1・CORE-2・#2762）。
+#[cfg(target_os = "linux")]
+pub(crate) fn read_fd_mnt_id(fd: std::os::fd::BorrowedFd<'_>) -> Result<u64, FdinfoMountIdError> {
+    use std::os::fd::AsRawFd as _;
+    let file = std::fs::File::open(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
+        .map_err(FdinfoMountIdError::Read)?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(file)?)
+}
+
+/// [`read_fd_mnt_id`] の、保持した自プロセスの procfs ディレクトリ `proc_dir`（`/proc/<自分の pid>` を `setns` の前に
+/// 開いた fd）起点版（SEC-1・SEC-4・#3201）。
+///
+/// exec の再適用の worker は `setns(CLONE_NEWNS)` の後、コンテナの procfs が見えるが、その PID namespace に居ないため
+/// `/proc/thread-self` が解決できない。そこで `setns` の前に開いて procfs と確かめた `proc_dir` から `fdinfo/<N>` を
+/// 相対で開く（パスの再解決をしない）。解析は [`parse_fdinfo_mnt_id`] を唯一の実装として共有する。
+#[cfg(target_os = "linux")]
+pub(crate) fn read_fd_mnt_id_at(
+    proc_dir: std::os::fd::BorrowedFd<'_>,
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> Result<u64, FdinfoMountIdError> {
+    use std::os::fd::AsRawFd as _;
+    let name = std::ffi::CString::new(format!("fdinfo/{}", fd.as_raw_fd())).map_err(|_| {
+        FdinfoMountIdError::Read(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    })?;
+    let opened = crate::sys::open_read_at(proc_dir, &name).map_err(|e| {
+        FdinfoMountIdError::Read(match e {
+            crate::sys::SysError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+            _ => std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    })?;
+    parse_fdinfo_mnt_id(&read_fdinfo_bounded(std::fs::File::from(opened))?)
 }
 
 /// `path` を `O_PATH` で開いた fd の属するマウント ID（`/proc/thread-self/fdinfo/N`）。start の段が使う。
@@ -55,7 +159,6 @@ pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
 #[cfg(target_os = "linux")]
 pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     use std::os::fd::AsFd as _;
-    use std::os::fd::AsRawFd as _;
     let c = std::ffi::CString::new(path).ok()?;
     // 絶対パスのため dirfd は解決に影響しない（`/` の fd を渡す）。
     let root = crate::sys::open_dir_path_nofollow(None, c"/").ok()?;
@@ -66,9 +169,7 @@ pub(crate) fn path_mount_id(path: &str) -> Option<u64> {
     if !meta.is_dir() && !meta.is_file() {
         return None;
     }
-    let fdinfo =
-        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
-    parse_fdinfo_mnt_id(&fdinfo)
+    read_fd_mnt_id(fd.as_fd()).ok()
 }
 
 /// Linux 以外では `/proc` と `crate::sys` が無いため特定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
@@ -96,11 +197,9 @@ pub(crate) fn dir_identity_chain(path: &str) -> Option<Vec<(u64, u64)>> {
 /// （SEC-1・#2166）。末端の fd を固定したまま `mnt_id` を読むため、辿り直しによる差し替えの余地が無い。
 #[cfg(target_os = "linux")]
 pub(crate) fn dir_identity_chain_with_mnt_id(path: &str) -> Option<(Vec<(u64, u64)>, u64)> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::AsFd as _;
     let (chain, leaf) = walk_dir_chain(path)?;
-    let fdinfo =
-        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", leaf.as_raw_fd())).ok()?;
-    Some((chain, parse_fdinfo_mnt_id(&fdinfo)?))
+    Some((chain, read_fd_mnt_id(leaf.as_fd()).ok()?))
 }
 
 /// `dir_identity_chain` の本体。鎖と末端のディレクトリの fd を返す。
@@ -371,8 +470,12 @@ pub(crate) fn exposed_devs(
 
 /// `state_root`（正規化済みの絶対パス）の配下に載るマウントの実体（状態ルート自身のマウントは含まない）。
 /// 状態ルート配下の子 bind mount 経由でも状態ファイルを公開させないため、保護対象に加える（SEC-1・#1915）。
-/// 覆い隠されたマウントも保守的に含める。各要素は FS 内の実体と、ホスト側のマウントポイント（走査・枝刈りに使う）。
-pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<(FsIdentity, String)> {
+/// 覆い隠されたマウントも保守的に含める。各要素は FS 内の実体と、ホスト側のマウントポイント（走査・枝刈りに使う）と mount ID
+/// （そのマウントが見えているかの fd 照合に使う。#2823）。
+pub(crate) fn mounts_under(
+    mounts: &[MountRow],
+    state_root: &str,
+) -> Vec<(FsIdentity, String, u64)> {
     mounts
         .iter()
         .filter(|m| m.point != state_root && under(state_root, &m.point).is_some())
@@ -383,6 +486,7 @@ pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<(FsIden
                     path: m.root.clone(),
                 },
                 m.point.clone(),
+                m.id,
             )
         })
         .collect()
@@ -495,8 +599,9 @@ mod tests {
     /// バイト数の上限を超えるファイルは `TooLarge`、上限ちょうどは読める。
     #[test]
     fn read_mountinfo_bounded_enforces_byte_limit() {
-        let dir = std::env::temp_dir().join(format!("fandhe-mi-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch =
+            crate::scratch_root::ScratchDir::new("fandhe-mi", std::time::Duration::from_secs(10));
+        let dir = scratch.path().to_path_buf();
         let path = dir.join("mountinfo");
         let at_cap = usize::try_from(MOUNTINFO_MAX_BYTES).expect("cap");
         std::fs::write(&path, "a".repeat(at_cap)).expect("write");
@@ -508,15 +613,17 @@ mod tests {
             read_mountinfo_bounded(dir.join("none").to_str().expect("utf8")),
             Err(MountinfoReadError::Unreadable)
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// REPAIR-5（#1915）: `path_mount_id` は FIFO を開かず（ブロックせず）`None` を返す。通常ファイルは特定できる。
     #[cfg(target_os = "linux")]
     #[test]
     fn repair5_path_mount_id_does_not_block_on_fifo() {
-        let dir = std::env::temp_dir().join(format!("fandhe-mi-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-mi-fifo",
+            std::time::Duration::from_secs(10),
+        );
+        let dir = scratch.path().to_path_buf();
         let fifo = dir.join("f");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -528,7 +635,6 @@ mod tests {
         assert_eq!(path_mount_id(fifo.to_str().expect("utf8")), None);
         assert!(path_mount_id(file.to_str().expect("utf8")).is_some());
         assert!(path_mount_id(dir.to_str().expect("utf8")).is_some());
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// SEC-1（#1915）: 再帰 bind の公開範囲のデバイスに子マウントも含み、rbind でなければ含まない。
@@ -560,16 +666,160 @@ mod tests {
         assert_eq!(v[0].0.dev, "8:2");
         assert_eq!(v[0].0.path, "/container-state");
         assert_eq!(v[0].1, "/state/c1");
+        assert_eq!(v[0].2, 30);
     }
 
+    /// SEC-1・CORE-2（#2823）: 祖先の overmount で隠れた子も、mount ID つきで保守的に含める（見えているかは呼び出し側が fd で判定）。
+    #[test]
+    fn sec1_2823_mounts_under_includes_hidden_children_with_ids() {
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
+                    30 20 8:3 / /state/x/y rw - ext4 /dev/sda3 rw\n\
+                    35 20 8:1 /srv/state/x /state/x rw - ext4 /dev/sda1 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let v = mounts_under(&mounts, "/state");
+        let got: Vec<(&str, &str, u64)> = v
+            .iter()
+            .map(|(i, p, id)| (i.dev.as_str(), p.as_str(), *id))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("8:3", "/state/x/y", 30), ("8:1", "/state/x", 35)]
+        );
+    }
+
+    /// REPAIR-1・SEC-1・#3140: 共有 fixture（`testdata/fdinfo_mnt_id_cases.txt`）の全事例で、解析結果が期待と完全一致する。net・gpu の同名の照合試験と同じ fixture を読む。
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_fdinfo_mnt_id_reads_the_field() {
-        assert_eq!(
-            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012\nmnt_id:\t42\n"),
-            Some(42)
-        );
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
+    fn repair1_fdinfo_mnt_id_shared_cases() {
+        use std::io::Cursor;
+        const CASES: &str = include_str!("../../testdata/fdinfo_mnt_id_cases.txt");
+
+        fn hex(s: &str) -> Vec<u8> {
+            if s == "-" {
+                return Vec::new();
+            }
+            assert!(s.len().is_multiple_of(2), "odd hex: {s}");
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        let classify = |bytes: &[u8]| -> String {
+            match read_fdinfo_bounded(Cursor::new(bytes)).and_then(|t| parse_fdinfo_mnt_id(&t)) {
+                Ok(n) => format!("ok:{n}"),
+                Err(FdinfoMountIdError::Read(_)) => "read".into(),
+                Err(FdinfoMountIdError::TooLarge) => "too_large".into(),
+                Err(FdinfoMountIdError::Missing) => "missing".into(),
+                Err(FdinfoMountIdError::Duplicate) => "duplicate".into(),
+                Err(FdinfoMountIdError::Invalid) => "invalid".into(),
+            }
+        };
+        let mut max_bytes = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut count = 0usize;
+        for line in CASES
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f[0] == "max_bytes" {
+                max_bytes = Some(f[1].parse::<u64>().expect("max_bytes"));
+                continue;
+            }
+            let bytes = hex(f[1]);
+            let shared = f[2];
+            // 第 4 列の `net=` は net 側だけの上書き期待なので、この試験では読み飛ばす。
+            // 解析部・fixture の形式は crates/core・net・gpu の 3 か所の試験で同じ形に保つ（変更時は 3 か所を同期する。REPAIR-1）。
+            let want = shared;
+            let got = classify(&bytes);
+            assert_eq!(
+                got,
+                want,
+                "case {}: input {:?}",
+                f[0],
+                String::from_utf8_lossy(&bytes)
+            );
+            seen.insert(shared.split(':').next().unwrap().to_string());
+            count += 1;
+        }
+        assert!(count >= 16, "fixture is too small: {count}");
+        for k in ["ok", "missing", "duplicate", "invalid", "read"] {
+            assert!(seen.contains(k), "fixture has no {k} case");
+        }
+        let max = max_bytes.expect("max_bytes line");
+        assert_eq!(max, FDINFO_MAX_BYTES, "limit constant differs from fixture");
+        let n = usize::try_from(max).unwrap();
+        assert_eq!(classify(&vec![b'a'; n]), "missing");
+        assert_eq!(classify(&vec![b'a'; n + 1]), "too_large");
+    }
+
+    /// REPAIR-1・CORE-2（#2762）: fdinfo の `mnt_id` 解析の正常系と、欠落・重複・非数値・上限超えの拒否。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_parse_fdinfo_mnt_id_cases() {
+        let ok = |s: &str| parse_fdinfo_mnt_id(s).unwrap();
+        assert_eq!(ok("pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n"), 52);
+        // 行頭が `mnt_id:` でない行は対象にならない。
+        assert_eq!(ok("fanotify mnt_id:\t9\nmnt_id:\t7\n"), 7);
+        assert_eq!(ok("mnt_id:\t18446744073709551615\n"), u64::MAX);
+        assert!(matches!(
+            parse_fdinfo_mnt_id("pos:\t0\nflags:\t0\n"),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id(""),
+            Err(FdinfoMountIdError::Missing)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id("mnt_id:\t52\nmnt_id:\t53\n"),
+            Err(FdinfoMountIdError::Duplicate)
+        ));
+        assert!(matches!(
+            parse_fdinfo_mnt_id("mnt_id:\t52\nmnt_id:\t52\n"),
+            Err(FdinfoMountIdError::Duplicate)
+        ));
+        for bad in [
+            "mnt_id:\tx\n",
+            "mnt_id:\t-1\n",
+            "mnt_id:\t\n",
+            "mnt_id:\t18446744073709551616\n",
+        ] {
+            assert!(
+                matches!(parse_fdinfo_mnt_id(bad), Err(FdinfoMountIdError::Invalid)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// REPAIR-1・REPAIR-5（#2762）: 読み取りの上限ちょうどは通り、1 バイト超えは `TooLarge`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_read_fdinfo_bounded_limit() {
+        let n = usize::try_from(FDINFO_MAX_BYTES).unwrap();
+        let at = read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; n])).unwrap();
+        assert_eq!(at.len(), n);
+        assert!(matches!(
+            read_fdinfo_bounded(std::io::Cursor::new(vec![b'a'; n + 1])),
+            Err(FdinfoMountIdError::TooLarge)
+        ));
+    }
+
+    /// REPAIR-1・CORE-2（#2762）: 実 fd の `mnt_id` が `/proc/thread-self/mountinfo` にちょうど 1 行ある。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair1_read_fd_mnt_id_matches_mountinfo() {
+        use std::os::fd::AsFd as _;
+        let f = std::fs::File::open("/").unwrap();
+        let id = read_fd_mnt_id(f.as_fd()).unwrap();
+        let info = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
+        let n = info
+            .lines()
+            .filter(|l| l.split(' ').next().and_then(|v| v.parse::<u64>().ok()) == Some(id))
+            .count();
+        assert_eq!(n, 1);
     }
 
     /// SEC-1（#2066）: 鎖は自身が先頭・`/` が末尾で、各要素は実ディレクトリの (dev, ino)。symlink・存在しない・相対は `None`。

@@ -1,0 +1,294 @@
+//! ネットワークのディレクトリに置く DNS ヘルパーの制御 UDS（`dns.ctl`）の置き場の検査・削除と、ロックを取らない
+//! メンバー記録の読み取り口（NET-5・PLUG-12・SEC-1・REPAIR-5・#3071）。
+//!
+//! # 役割と契約
+//! `dns_helper::control` が使う。形式（フレーム）は `dns_helper::control::frame`、ここは置き場の検査だけを担う。
+//! - 経路は検査済みのネットワークのディレクトリの fd 起点（`/proc/self/fd/<fd>/dns.ctl`）で組む。`sun_path` の
+//!   108 バイト制限を避け、状態ルートの途中の差し替えを受けない
+//! - 送り手は connect の前に lstat で検査する（socket・所有者・0600・nlink 1。[`check_socket_meta`]）
+//! - ソケットファイルの削除は排他ロックを持つ側（停止・起動・回収・`network rm`）だけが行う。ヘルパー自身は
+//!   消さない（新しいヘルパーの socket を古いヘルパーの終了処理が誤って消さないため）。socket でないもの・
+//!   他の所有者のものは消さず `FailedPrecondition` / `PermissionDenied`
+//!
+//! # ロックを取らない読み取り（NetworkDir）
+//! `attach_recorded_with` は排他ロックを持ったまま記録を書き、`spawn_inner` も排他ロックを持ったまま `READY` を
+//! 待つ。ヘルパーがネットワークの共有ロックを取ると 5 秒待ち、2 秒の `Loaded` の期限（D15）を必ず超える。
+//! そこでヘルパーは [`NetworkStore::open_network_dir`] の [`NetworkDir`] でロックを取らずに読む。読む記録は
+//! rename か link で原子的に公開された完全なファイルだけで、書き手は排他ロックの保持者だけ、読み込みはその保持者からの
+//! `Reload` の後（と起動時の初回）に限る。食い違えば（`DataLoss` 等）呼び出し側が前のレジストリを保って
+//! `Error` を返す。
+
+use std::fs;
+use std::os::fd::{AsFd as _, BorrowedFd};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+
+use super::{Dir, NetworkLockGuard, NetworkStore, err, map_io};
+use crate::error::{NetError, NetErrorCode};
+use crate::network::NetworkName;
+use crate::network_store::member::MemberRecord;
+use crate::network_store::{FILE_MODE, check_socket_meta};
+use crate::sys::{self, SysError, holder};
+
+/// `SO_PEERCRED` の取得口の型（本番は `holder::peer_cred`。取得失敗の経路を試験で再現するため差し替えられる）。
+pub(crate) type PeerCredFn = for<'a> fn(BorrowedFd<'a>) -> Result<(u32, u32), SysError>;
+
+/// 監査行に載せる errno の語（`Os(n)` は数値、`Unsupported` は `unsupported`、他は `other`。`{:?}` は使わず、
+/// 外部の文字列を行に入れない。送り手側・ヘルパー側・掃除経路の取得失敗の行が共有する。SEC-4・#3551）。
+pub(crate) fn peer_cred_errno_word(e: &SysError) -> String {
+    match e {
+        SysError::Os(n) => n.to_string(),
+        SysError::Unsupported => "unsupported".to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+/// 掃除経路: 生きた listener の uid が自分と違うときの監査行（値は数値だけ。SEC-4・PLUG-12・#3551）。
+fn cleanup_peer_uid_mismatch_line(peer_uid: u32, expected_uid: u32) -> String {
+    format!(
+        "event=dns_control_cleanup_peer_uid_mismatch peer_uid={peer_uid} expected_uid={expected_uid}"
+    )
+}
+
+/// 掃除経路: listener の `SO_PEERCRED` の取得失敗の監査行（SEC-4・#3551）。
+fn cleanup_peer_cred_unavailable_line(e: &SysError) -> String {
+    format!(
+        "event=dns_control_cleanup_peer_cred_unavailable errno={}",
+        peer_cred_errno_word(e)
+    )
+}
+
+/// 制御 UDS のファイル名（ネットワークのディレクトリ直下）。
+pub const CONTROL_SOCKET_FILE: &str = crate::dns_helper::control::CONTROL_SOCKET_NAME;
+
+/// 認証拒否の監査記録のファイル名（ネットワークのディレクトリ直下）。
+pub(crate) const CONTROL_AUDIT_FILE: &str = "dns.audit";
+/// 監査記録ファイルの上限（超えたら追記しない）。
+pub(crate) const CONTROL_AUDIT_MAX_BYTES: u64 = 64 * 1024;
+
+impl Dir {
+    /// 制御ソケットの経路（この `Dir` の fd 起点）。
+    fn control_path(&self) -> PathBuf {
+        self.path(CONTROL_SOCKET_FILE)
+    }
+
+    /// 制御 UDS の認証・照合の失敗（ヘルパー側の別 uid の接続・`SO_PEERCRED` の取得失敗、送り手側の uid / pid
+    /// の不一致・`SO_PEERCRED` の取得失敗、掃除経路の生きた listener の別 uid・取得失敗。#3551）を、ネットワークのディレクトリの `dns.audit`（0600・追記・上限 [`CONTROL_AUDIT_MAX_BYTES`]）へ
+    /// 1 行の構造化記録として残す（SEC-4・PLUG-12・#3534）。detach 起動のヘルパーは stderr が捨てられ、`Stop` の
+    /// 失敗は `Unavailable` に潰れるため、これだけが痕跡になる。
+    ///
+    /// 書き手は 2 つ（ヘルパーはロックなし、送り手は排他ロックの下）なので `O_APPEND` で開き、1 行を 1 回の
+    /// write で書く（行どうしが上書きされない）。上限に達したら書かない（無制限の増加を防ぐ）。記録の失敗は
+    /// 拒否を妨げない（呼び出し側は結果を無視してよい）。上位の監査経路（core の `@audit.log`）への中継は
+    /// 依存方向（net は core に依存しない）のため行わない。
+    fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        use std::io::Write as _;
+        let mut f = self.open_regular_append(CONTROL_AUDIT_FILE, CONTROL_AUDIT_MAX_BYTES * 2)?;
+        let len = f
+            .metadata()
+            .map_err(|e| map_io(&e, "failed to stat dns control audit"))?
+            .len();
+        if len >= CONTROL_AUDIT_MAX_BYTES {
+            return Ok(());
+        }
+        let mut rec = line.trim_end().replace(['\n', '\r'], " ");
+        rec.truncate(512);
+        rec.push('\n');
+        f.write_all(rec.as_bytes())
+            .map_err(|e| map_io(&e, "failed to write dns control audit"))
+    }
+
+    /// 制御ソケットを lstat で検査する（socket・所有者・0600・nlink 1）。無ければ `NotFound`。
+    fn check_control_socket(&self) -> Result<(), NetError> {
+        let m = fs::symlink_metadata(self.control_path())
+            .map_err(|e| map_io(&e, "failed to stat dns control socket"))?;
+        check_socket_meta(
+            m.file_type().is_socket(),
+            m.uid(),
+            m.mode(),
+            m.nlink(),
+            sys::effective_uid(),
+        )
+    }
+}
+
+/// 検査済みのネットワークのディレクトリ（ロックを取らない読み取り口。ヘルパー側が使う）。
+#[derive(Debug)]
+pub(crate) struct NetworkDir {
+    dir: Dir,
+}
+
+impl NetworkStore {
+    /// `open` に渡された状態ルート。
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// ネットワークのディレクトリを **ロックを取らずに** 開く（ヘルパー側の読み取り口。理由はモジュール doc）。
+    /// 無ければ `NotFound`。権限・所有者・symlink は通常どおり検査する。
+    pub(crate) fn open_network_dir(&self, name: &NetworkName) -> Result<NetworkDir, NetError> {
+        Ok(NetworkDir {
+            dir: self.dir.open_subdir(name.as_str())?,
+        })
+    }
+}
+
+impl NetworkDir {
+    /// 制御ソケットの経路。
+    pub(crate) fn control_socket_path(&self) -> PathBuf {
+        self.dir.control_path()
+    }
+
+    /// bind 直後のソケットを 0600 にし、socket・所有者・0600 を検査し直す。
+    pub(crate) fn secure_control_socket(&self) -> Result<(), NetError> {
+        fs::set_permissions(
+            self.dir.control_path(),
+            fs::Permissions::from_mode(FILE_MODE),
+        )
+        .map_err(|e| map_io(&e, "failed to set dns control socket mode"))?;
+        self.dir.check_control_socket()
+    }
+
+    /// 制御 UDS の認証・照合の失敗の監査記録を追記する。実体は [`Dir::append_control_audit`]（記録先・上限・
+    /// 書き手の契約はそちらの doc）。ヘルパー側（ロックなし）が呼ぶ。
+    pub(crate) fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        self.dir.append_control_audit(line)
+    }
+
+    /// 確定したメンバー記録を ID 順に読む（ロックを取らない。モジュール doc の前提を満たす呼び出し元に限る）。
+    pub(crate) fn members(&self) -> Result<Vec<MemberRecord>, NetError> {
+        self.dir.read_members()
+    }
+}
+
+impl NetworkLockGuard<'_> {
+    /// ストアの状態ルート（絶対パスに限る。ヘルパーが `NetworkStore::open` で開き直すために引数で渡す）。
+    pub(crate) fn state_root(&self) -> Result<&Path, NetError> {
+        if self.state_root.is_absolute() {
+            Ok(&self.state_root)
+        } else {
+            Err(err(
+                NetErrorCode::InvalidArgument,
+                "network store state root must be absolute to start a dns helper",
+            ))
+        }
+    }
+
+    /// 制御ソケットの経路。
+    pub(crate) fn control_socket_path(&self) -> PathBuf {
+        self.dir.control_path()
+    }
+
+    /// 送り手側の照合失敗の監査記録を追記する（排他ロックの下。契約は [`Dir::append_control_audit`]）。
+    pub(crate) fn append_control_audit(&self, line: &str) -> Result<(), NetError> {
+        self.dir.append_control_audit(line)
+    }
+
+    /// 送り手が connect の前に行う検査（socket・所有者・0600・nlink 1）。無ければ `NotFound`。
+    pub(crate) fn check_control_socket(&self) -> Result<(), NetError> {
+        self.dir.check_control_socket()
+    }
+
+    /// 残っている制御ソケットを消す（排他ロックの下だけ）。消したら true、無ければ false。
+    ///
+    /// socket でない・他の所有者のものは消さず `FailedPrecondition` / `PermissionDenied`（フルパスに署名を残さない
+    /// 固定文言）。消したら親ディレクトリを fsync する。
+    pub(crate) fn remove_dns_control_socket(&self) -> Result<bool, NetError> {
+        self.require_exclusive()?;
+        let path = self.dir.control_path();
+        let m = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(map_io(&e, "failed to stat dns control socket")),
+        };
+        if !m.file_type().is_socket() {
+            return Err(err(
+                NetErrorCode::FailedPrecondition,
+                "dns control socket path is not a socket",
+            ));
+        }
+        if m.uid() != sys::effective_uid() {
+            return Err(err(
+                NetErrorCode::PermissionDenied,
+                "dns control socket owner mismatch",
+            ));
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(map_io(&e, "failed to remove dns control socket")),
+        }
+        self.dir.sync()?;
+        Ok(true)
+    }
+
+    /// 制御ソケットの listener が居ないと確認できたときだけ、残った制御ソケットを消す（排他ロックの下だけ）。
+    ///
+    /// 記録が無いことは listener の死亡の根拠にならない（`StaleRecord` の停止は記録だけを消し、生きたヘルパーの
+    /// socket を残す）。そこで connect を試み、`ECONNREFUSED` / `ENOENT`（listener 不在）のときだけ消す。接続できた
+    /// （生存）・backlog 満杯・その他（判定不能）は消さず `FailedPrecondition` を返す（fail-closed。NET-5・SEC-1・
+    /// REPAIR-5）。接続は即座に閉じ、フレームは送らない（相手は読めず切断するだけ）。
+    ///
+    /// 接続できた相手は `SO_PEERCRED` の uid だけを自分の実効 uid と照合し、違う場合と取得に失敗した場合は
+    /// `dns.audit` へ 1 行残す（`event=dns_control_cleanup_peer_uid_mismatch`・
+    /// `event=dns_control_cleanup_peer_cred_unavailable`。SEC-4・PLUG-12・#3551）。**照合は削除の判断を変えない**:
+    /// 生きた listener は相手が誰でも消さない（fail-closed）。pid は照合しない（呼び出し元の `spawn_inner` と
+    /// `discard_orphan_dns_control_socket` は記録が無い状態で呼ぶため、比べる pid が無い）。uid が一致する正常系
+    /// （自分のヘルパーが生きている）では何も書かない。
+    pub(crate) fn remove_dns_control_socket_if_no_listener(&self) -> Result<bool, NetError> {
+        self.remove_dns_control_socket_if_no_listener_with(holder::peer_cred)
+    }
+
+    /// [`Self::remove_dns_control_socket_if_no_listener`] の本体。`peer_cred` の取得口を注入できる（試験用）。
+    pub(crate) fn remove_dns_control_socket_if_no_listener_with(
+        &self,
+        peer_cred: PeerCredFn,
+    ) -> Result<bool, NetError> {
+        self.require_exclusive()?;
+        match sys::unix_socket::connect_unix_nonblocking(&self.control_socket_path()) {
+            Ok(fd) => {
+                let expected_uid = sys::effective_uid();
+                // 記録の失敗は拒否を妨げない。
+                let _ = match peer_cred(fd.as_fd()) {
+                    Ok((_, uid)) if uid == expected_uid => Ok(()),
+                    Ok((_, uid)) => self
+                        .dir
+                        .append_control_audit(&cleanup_peer_uid_mismatch_line(uid, expected_uid)),
+                    Err(e) => self
+                        .dir
+                        .append_control_audit(&cleanup_peer_cred_unavailable_line(&e)),
+                };
+                drop(fd);
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "dns control socket has a live listener; not removed",
+                ));
+            }
+            Err(sys::SysError::Os(c))
+                if matches!(
+                    std::io::Error::from_raw_os_error(c).kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(_) => {
+                return Err(err(
+                    NetErrorCode::FailedPrecondition,
+                    "cannot confirm dns control socket has no listener; not removed",
+                ));
+            }
+        }
+        self.remove_dns_control_socket()
+    }
+
+    /// `network rm` の前に、記録（`dns-helper`・`dns-helper.intent`）が両方無いときだけ、残った制御ソケットを消す
+    /// （死んだヘルパーの残骸が削除を止めない。ベストエフォート。消せないものは既知項目の検査が拒否する）。
+    pub(super) fn discard_orphan_dns_control_socket(&self) {
+        let exists = |name: &str| fs::symlink_metadata(self.dir.path(name)).is_ok();
+        if exists(super::dns_helper_store::DNS_HELPER_FILE)
+            || exists(super::dns_helper_store::DNS_HELPER_INTENT_FILE)
+        {
+            return;
+        }
+        // listener の不在を確認できたときだけ消す（生存・判定不能なら残す。`network rm` の既知項目検査が拒否する）。
+        let _ = self.remove_dns_control_socket_if_no_listener();
+    }
+}

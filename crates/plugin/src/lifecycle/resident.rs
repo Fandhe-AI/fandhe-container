@@ -1,7 +1,7 @@
 //! plugin プロセスの常駐モード（PLUG-7・TASK-110.2・#259）。
 //!
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
-//! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
+//! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
 //! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`PluginLaunchSpec`] を受け取る。
 //! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。共用する終了待ち等の定数・型は中立な名前〔`PLUGIN_EXIT_TIMEOUT`・`PluginStderr`・`PluginTermination` など。#2608〕）。
 //!
@@ -47,14 +47,15 @@
 //!   記すが、本実装は起動後に接続を保持する形である（spec 側の表現との差は PR で報告）。
 //! - 起動対象の信頼性検証そのもの（TASK-122・PLUG-11。core 側の責務で、本 API は検証済みの起動対象
 //!   [`super::PluginLaunchTarget`] の fd を受け取るだけ）。検証から spawn までの差し替え（TOCTOU）は、Linux は
-//!   fd の実体を実行して防ぐ。macOS は実体のパスで起動し、直前の同一性確認は未実装（#1866）。
+//!   fd の実体を実行して防ぐ。macOS は実体のパスで起動し、起動・再起動のたびに spawn 直前の `lstat`（dev / ino）で保持 fd と
+//!   照合する（#1866。残余は確認から exec までの窓での同じ UID / root による差し替えで、PLUG-11 の脅威の外）。
 //!   要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 use super::{
     ChildGuard, PLUGIN_EXIT_TIMEOUT, PLUGIN_STDERR_DRAIN_TIMEOUT, PluginLaunchSpec, PluginStderr,
     PluginTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error,
     launch_spawn_error, plugin_command, rpc_timeout, spawn_registered, stderr_channel,
-    unreaped_error, with_group_kill_failure,
+    stderr_prepare_error, unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -337,31 +338,33 @@ impl ResidentPlugin {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let listener = UdsListener::bind(&plugin.socket_dir.join(name))?;
+        let listener = UdsListener::bind_before(&plugin.socket_dir.join(name), deadline)?;
 
-        let (child_stderr, reader) = stderr_channel().map_err(|_| {
-            PluginError::new(
-                PluginErrorCode::Internal,
+        let (child_stderr, reader) = stderr_channel(deadline).map_err(|e| {
+            stderr_prepare_error(
+                &e,
                 "failed to prepare capturing plugin stderr",
+                start_timeout_error,
             )
         })?;
         // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
         let mut guard = {
             // spawn 前の失敗なので子は存在しない。
             let mut cmd = plugin_command(plugin, listener.path(), child_stderr)?;
-            spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)?
+            spawn_registered(&mut cmd, registry, deadline).map_err(launch_spawn_error)?
         };
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
-        let capture = match StderrCapture::attach(reader) {
+        let capture = match StderrCapture::attach(reader, deadline) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
                 drop(listener);
                 return Err(reap_after_failure(
                     &mut guard,
-                    PluginError::new(
-                        PluginErrorCode::Internal,
+                    stderr_prepare_error(
+                        &e,
                         "failed to start capturing plugin stderr",
+                        start_timeout_error,
                     ),
                 ));
             }

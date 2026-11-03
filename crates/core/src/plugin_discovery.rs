@@ -22,9 +22,9 @@
 //!   ごとに警告ログ 1 行を出す（[`PathSearchWarning`]）。**`PATH` 上の名前一致のみでは登録しない**
 //!   （`PluginDirKind::Path` の候補は未検証。レジストリ〔#255〕は origin を区別せずに登録するが、優先度は
 //!   最も低い〔System < User < Path〕ため管理ディレクトリの同名を shadow しない。現状は許可済みハッシュ
-//!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-122）は、`PATH` 由来も
+//!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕・TASK-122）は、`PATH` 由来も
 //!   ハッシュ一致で採用され得るため、**登録前に除外するか採用するかを配線時に再評価し、明示的に決める**。設計案は
-//!   `docs/design/plugin-hash-allowlist.md` の 3.5。#1868・承認待ち）
+//!   `docs/design/plugin-hash-allowlist.md` の 3.5。設計は #1868、承認の追跡は #2231）
 //! - CLI フラグ（opt-in の CLI 側入口）の配線は CLI 実装（TASK-79）で行う。未実装（REPAIR-3）。
 //!   CLI は `PathSearchPolicy::Enabled` を [`DiscoveryOptions`] 経由で渡す想定
 //! - 探索先ディレクトリが存在しない場合はエラーにせず候補なしとする。それ以外の I/O エラーは
@@ -33,10 +33,22 @@
 //!
 //! # 対応 OS
 //!
-//! 既定探索先の定義は Linux のみ（system は `/usr/libexec/fandhe-container/plugins`、user は
-//! XDG Base Directory の `<XDG_DATA_HOME>/fandhe-container/plugins`、未設定なら
-//! `<HOME>/.local/share/fandhe-container/plugins`）。macOS / Windows の「相当」パスは spec で
-//! 未確定のため空の探索先一覧を返す（エラーにしない。PLUG-11）。走査関数自体は 3 OS で動く。
+//! - Linux: system は `/usr/libexec/fandhe-container/plugins`、user は XDG Base Directory の
+//!   `<XDG_DATA_HOME>/fandhe-container/plugins`、未設定なら
+//!   `<HOME>/.local/share/fandhe-container/plugins`
+//! - macOS（#1539 のオーナー判断 2026-10-12・#1863）: system は
+//!   `/usr/local/libexec/fandhe-container/plugins`、user は絶対パスの `XDG_DATA_HOME` があれば
+//!   `<XDG_DATA_HOME>/fandhe-container/plugins`、無ければ絶対パスの `HOME` から
+//!   `<HOME>/Library/Application Support/fandhe-container/plugins`。信頼性検証は実装済み
+//!   （#1865。所有者・モード・全祖先・symlink 実体・拡張 ACL。`plugin_trust`）。ただし許可済みハッシュ一覧が
+//!   未配線で空のため全件拒否となり（#2231）、探索先を返しても現状は plugin が登録されない（fail-closed）。
+//!   `/usr/local` がグループ書き込み可の環境（古い Homebrew 等）では祖先検査で `GroupOrOtherWritable` により
+//!   拒否される。実機での権限の実態は未確認で、確認先は #1628 の環境。PLUG-11 の macOS の規則は
+//!   2026-10-12 の決定（#1539）で spec に入っている
+//! - Windows（#1415・#1539）: Windows ホストでは plugin の発見も信頼性検証も行わないため空の
+//!   探索先一覧を返す（エラーにしない。PLUG-11）
+//!
+//! 走査関数自体は 3 OS で動く。
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -101,7 +113,7 @@ pub enum PluginDirKind {
     User,
     /// `PATH` 由来（opt-in 時のみ）。未検証で、名前一致のみでは登録しない（PLUG-11・TASK-122）。
     /// 許可一覧の配線時に採否を再評価する（モジュール doc の契約を参照。#1869 の設計。
-    /// 設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・#1868）。
+    /// 設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・設計は #1868、承認の追跡は #2231）。
     Path,
 }
 
@@ -246,8 +258,45 @@ fn resolve_default_dirs(
     dirs
 }
 
-/// 非 Linux では既定探索先が未確定のため空を返す（PLUG-11。モジュール doc 参照）。
-#[cfg(not(target_os = "linux"))]
+/// macOS の既定探索先を組み立てる純粋関数（#1539 の決定 2026-10-12・#1863・PLUG-11）。
+///
+/// `resolve_default_dirs`（macOS 版）から呼ばれる。試験で Linux・Windows でも具体値を照合できるよう
+/// `test` でもコンパイルする。user の基点は `XDG_DATA_HOME` を優先する（#1539 の決定）。相対パス・
+/// 空文字の環境値は採用しない（カレントディレクトリ依存の探索を作らない）。
+#[cfg(any(target_os = "macos", test))]
+fn resolve_default_dirs_macos(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Vec<PluginSearchDir> {
+    let mut dirs = vec![PluginSearchDir::new(
+        PluginDirKind::System,
+        Path::new("/usr/local/libexec")
+            .join("fandhe-container")
+            .join("plugins"),
+    )];
+    let absolute = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let data_home = absolute(xdg_data_home)
+        .or_else(|| absolute(home).map(|h| h.join("Library").join("Application Support")));
+    if let Some(base) = data_home {
+        dirs.push(PluginSearchDir::new(
+            PluginDirKind::User,
+            base.join("fandhe-container").join("plugins"),
+        ));
+    }
+    dirs
+}
+
+/// macOS の既定探索先（`resolve_default_dirs_macos` へ委ねる。PLUG-11）。
+#[cfg(target_os = "macos")]
+fn resolve_default_dirs(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Vec<PluginSearchDir> {
+    resolve_default_dirs_macos(xdg_data_home, home)
+}
+
+/// Windows ホストでは plugin の発見も信頼性検証も行わないため空を返す（#1415・#1539 の決定。PLUG-11）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_default_dirs(
     _xdg_data_home: Option<OsString>,
     _home: Option<OsString>,
@@ -621,7 +670,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     fn dirs_of(v: Vec<PluginSearchDir>) -> Vec<(PluginDirKind, PathBuf)> {
         v.into_iter().map(|d| (d.kind, d.path)).collect()
     }
@@ -677,18 +725,94 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    fn macos_system() -> (PluginDirKind, PathBuf) {
+        (
+            PluginDirKind::System,
+            PathBuf::from("/usr/local/libexec/fandhe-container/plugins"),
+        )
+    }
+
+    /// 絶対パスの判定が OS で異なる（Windows はドライブ無しの `/xxx` を相対扱いにする）ため unix に限る。
+    #[cfg(unix)]
     #[test]
-    fn plug11_default_dirs_are_empty_outside_linux() {
-        assert!(resolve_default_dirs(Some("/xdg".into()), Some("/h".into())).is_empty());
+    fn plug11_macos_default_dirs_use_xdg_data_home() {
+        let got = resolve_default_dirs_macos(Some("/xdg".into()), Some("/Users/u".into()));
+        assert_eq!(
+            dirs_of(got),
+            vec![
+                macos_system(),
+                (
+                    PluginDirKind::User,
+                    PathBuf::from("/xdg/fandhe-container/plugins")
+                )
+            ]
+        );
+    }
+
+    /// 絶対パスの判定が OS で異なる（Windows はドライブ無しの `/xxx` を相対扱いにする）ため unix に限る。
+    #[cfg(unix)]
+    #[test]
+    fn plug11_macos_default_dirs_fall_back_to_home() {
+        for xdg in [None, Some(OsString::new()), Some("relative".into())] {
+            let got = resolve_default_dirs_macos(xdg, Some("/Users/u".into()));
+            assert_eq!(
+                dirs_of(got),
+                vec![
+                    macos_system(),
+                    (
+                        PluginDirKind::User,
+                        PathBuf::from(
+                            "/Users/u/Library/Application Support/fandhe-container/plugins"
+                        )
+                    )
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn plug11_macos_default_dirs_skip_user_when_env_unusable() {
+        for home in [None, Some(OsString::new()), Some("rel".into())] {
+            let got = resolve_default_dirs_macos(None, home);
+            assert_eq!(dirs_of(got), vec![macos_system()]);
+        }
+        let got = resolve_default_dirs_macos(Some("rel-xdg".into()), Some("rel-home".into()));
+        assert_eq!(dirs_of(got), vec![macos_system()]);
+    }
+
+    /// macOS では `resolve_default_dirs` が macOS 版へ委ねる（main の platform-ci と dispatch の
+    /// macOS leg でだけ走る）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plug11_default_dirs_on_macos_delegate_to_macos_resolver() {
+        let got = resolve_default_dirs(Some("/xdg".into()), Some("/Users/u".into()));
+        assert_eq!(
+            dirs_of(got),
+            vec![
+                macos_system(),
+                (
+                    PluginDirKind::User,
+                    PathBuf::from("/xdg/fandhe-container/plugins")
+                )
+            ]
+        );
+    }
+
+    /// Windows ホストでは plugin を発見しないため空（#1415・#1539。PLUG-11）。PR の CI では走らず、
+    /// main の platform-ci と dispatch の Windows leg で走る。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn plug11_default_dirs_are_empty_on_windows() {
+        assert_eq!(
+            dirs_of(resolve_default_dirs(Some("/xdg".into()), Some("/h".into()))),
+            vec![]
+        );
     }
 
     #[test]
     fn plug11_env_opt_in_enables_path_search_in_default_api() {
         use std::ffi::OsString;
-        let tmp = std::env::temp_dir().join(format!("fc-plug11-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let (_scratch, tmp) = crate::test_support::scratch_child("fc-plug11-env", "d");
         let fixture = format!(
             "fandhe-container-plugin-envtest{}",
             std::env::consts::EXE_SUFFIX
@@ -711,7 +835,6 @@ mod tests {
         let on = DiscoveryOptions::new().with_path_search(PathSearchPolicy::Enabled);
         let r = discover_default_with_env(&on, None, &[], get).unwrap();
         assert_eq!(r.candidates().len(), 1);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -785,9 +908,8 @@ mod tests {
 
     #[test]
     fn plug11_total_candidates_are_capped() {
-        let root = std::env::temp_dir().join(format!("fandhe-cap-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        // 排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+        let (_scratch, root) = crate::test_support::scratch_child("fandhe-cap", "d");
         let mut out = Vec::new();
         let dir = PluginSearchDir::new(PluginDirKind::Path, root.clone());
         let ext = std::env::consts::EXE_SUFFIX;
@@ -798,7 +920,6 @@ mod tests {
         let err = scan_dir(&dir, MAX_SCANNED_ENTRIES_PER_PATH_DIR, &mut out).unwrap_err();
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(out.len(), MAX_TOTAL_CANDIDATES);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -94,6 +94,8 @@
 //!   削除が失敗してロックファイルが残る（排他は保たれる）。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。コンテナのログは
 //!   `<root>/@container-logs`、supervisor 自身の構造化ログは `<root>/@supervisor-logs`（`supervisor_log` モジュール。#2067）。
+//! - platform-macos のコンソールログ回転（`crates/platform-macos/src/console_log.rs`）は同じ値と番号規則の別実装で、
+//!   コードは共有しない（#2172・REPAIR-1。理由と再評価条件は `docs/design/rotating-log-sharing.md`）。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -268,6 +270,101 @@ fn is_reserved_device_name(s: &str) -> bool {
         [a, b, c, d] => matches!(&[*a, *b, *c], b"com" | b"lpt") && d.is_ascii_digit(),
         _ => false,
     }
+}
+
+/// [`encode_file_stem`] の逆変換。ファイル名の stem から ID の文字列を復元する（#2760・SUP-7・CRI-2）。
+///
+/// 起動時の走査（[`list_stale_log_ids`]）が、ディレクトリ内の名前から「どの ID のログか」を求めるために使う。
+/// 復元した文字列を `encode_file_stem` で符号化し直して元の stem と一致すること、`ContainerId` として妥当なことを
+/// 照合する。どれかに失敗した名前は `None`（帰属を確定できない名前は呼び出し側が消さない。fail-closed）。
+fn decode_file_stem(stem: &str) -> Option<ContainerId> {
+    // 先頭の `_0` は予約デバイス名の印。照合（往復）が予約名かどうかを確かめるので、ここでは機械的に外す。
+    let body = stem.strip_prefix("_0").unwrap_or(stem);
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '_' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '_' => out.push('_'),
+            x if x.is_ascii_lowercase() => out.push(x.to_ascii_uppercase()),
+            _ => return None,
+        }
+    }
+    let id = ContainerId::new(out.as_str()).ok()?;
+    (encode_file_stem(id.as_str()) == stem).then_some(id)
+}
+
+/// ディレクトリ内のファイル名（`<stem>.log`・`<stem>.log.lock`・`<stem>.log.<n>`）から stem を取り出す。
+/// 3 形式のどれでもなければ `None`。ID は `.` を含み得るため、右端の接尾辞から判定する。
+fn stem_of_log_name(name: &str) -> Option<&str> {
+    if let Some(s) = name.strip_suffix(".log.lock") {
+        return Some(s);
+    }
+    if let Some(s) = name.strip_suffix(".log") {
+        return Some(s);
+    }
+    let (head, num) = name.rsplit_once('.')?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    head.strip_suffix(".log")
+}
+
+/// [`list_stale_log_ids`] の結果。
+#[derive(Debug, Default)]
+pub(crate) struct StaleLogScan {
+    /// 走査したエントリ数。
+    pub(crate) scanned: usize,
+    /// 帰属を確定できた ID（重複なし・出現順）。
+    pub(crate) ids: Vec<ContainerId>,
+    /// ログらしい名前だが ID に戻せなかった（または非 UTF-8 の）名前の数。消さずに見送る。
+    pub(crate) undecodable: usize,
+    /// `max_ids` に達して打ち切った。
+    pub(crate) truncated: bool,
+}
+
+/// コンテナログのディレクトリ内の名前を走査し、ログを持つ ID を列挙する（起動時の残りログの走査用。#2760・SUP-7・CRI-2）。
+///
+/// 列挙だけで、何も消さない（削除は ID ごとに既存の `remove_all_quiet_guarded` が、ロックと名前空間の検査の下で行う）。
+/// `dir` は [`check_dir`] を通す（祖先の symlink・他者書き込み可を拒否）。エントリ数は [`MAX_SCAN_ENTRIES`] で、
+/// ID 数は `max_ids` で打ち切る。ログの形式でない名前（無関係なファイル）は数えない。
+pub(crate) fn list_stale_log_ids(dir: &Path, max_ids: usize) -> Result<StaleLogScan, TraitError> {
+    let dir = check_dir(dir)?;
+    let rd = fs::read_dir(&dir).map_err(|_| internal("log directory scan failed"))?;
+    let mut scan = StaleLogScan::default();
+    let mut seen = std::collections::HashSet::new();
+    for entry in rd {
+        scan.scanned = scan.scanned.saturating_add(1);
+        if scan.scanned > MAX_SCAN_ENTRIES {
+            scan.truncated = true;
+            break;
+        }
+        let entry = entry.map_err(|_| internal("log directory scan failed"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            scan.undecodable = scan.undecodable.saturating_add(1);
+            continue;
+        };
+        let Some(stem) = stem_of_log_name(name) else {
+            continue;
+        };
+        let Some(id) = decode_file_stem(stem) else {
+            scan.undecodable = scan.undecodable.saturating_add(1);
+            continue;
+        };
+        if !seen.insert(id.as_str().to_owned()) {
+            continue;
+        }
+        if scan.ids.len() >= max_ids {
+            scan.truncated = true;
+            break;
+        }
+        scan.ids.push(id);
+    }
+    Ok(scan)
 }
 
 /// 名前空間の別名検査用に、名前を ASCII 小文字へ畳み込む（IO-5）。
@@ -448,7 +545,8 @@ impl RotatingFileSink {
             Err(e) => return (0, Err(e)),
         };
         // ロック保持中に確認する（削除待ちの間に同じ ID が再作成されていたら、新しいインスタンスのログを消さない）。
-        let (removed, log_result) = if guard() {
+        let guard_ok = guard();
+        let (removed, log_result) = if guard_ok {
             remove_log_files(&dir, &base)
         } else {
             (0, Ok(()))
@@ -461,7 +559,13 @@ impl RotatingFileSink {
         if lock_removed.is_err() {
             return (removed, Err(internal("log lock removal failed")));
         }
-        (removed, Ok(RemovedLogs { log_files: removed }))
+        (
+            removed,
+            Ok(RemovedLogs {
+                log_files: removed,
+                guard_declined: !guard_ok,
+            }),
+        )
     }
 
     /// これまでのローテーション回数（観測用。REPAIR-4）。open 時の退避は数えない。
@@ -665,6 +769,22 @@ const LOCK_SUFFIX: &str = ".lock";
 /// 既存は通常ファイル（symlink・FIFO 等は拒否）のときだけ読み取りで開く。開いた実体が検査したものと同じ通常ファイルであることを開いた後にも確かめる
 /// （検査と open の間の差し替え対策。unix は dev / inode も照合する）。
 fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
+    acquire_lock_with(dir, base, LOCK_RETRY, || {
+        std::thread::sleep(LOCK_RETRY.interval)
+    })
+}
+
+/// [`acquire_lock`] の本体。再試行方針 `retry` と、再試行の待ち `sleep` を差し込めるようにしたもの。
+///
+/// 本番は [`acquire_lock`] が [`LOCK_RETRY`] と実時間の sleep を渡す（待ちの総量は従来どおり有界。REPAIR-5）。
+/// 注入口は、共有ロックの解放を「1 回目の `WouldBlock` の直後」に同期させて試験を実時間の競争に
+/// 依存させないために設けた（macOS の間欠失敗の是正。#2911・CLI-1・SUP-7・REPAIR-12）。
+fn acquire_lock_with(
+    dir: &Path,
+    base: &str,
+    retry: RenameRetry,
+    mut sleep: impl FnMut(),
+) -> Result<File, TraitError> {
     let path = lock_path(dir, base);
     let mut create = OpenOptions::new();
     create.write(true).create_new(true);
@@ -694,12 +814,12 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
     };
     // 読み手の稼働検査（[`sink_is_active`]）が一瞬だけ共有ロックを持つことがあるため、`WouldBlock` は
     // 有界で再試行して吸収する（合計 40ms 程度。REPAIR-5）。本物の sink が使用中なら、尽きたあと従来どおり拒否する。
-    let mut sleeps_left = LOCK_RETRY.max_sleeps;
+    let mut sleeps_left = retry.max_sleeps;
     let locked = loop {
         match file.try_lock() {
             Err(std::fs::TryLockError::WouldBlock) if sleeps_left > 0 => {
                 sleeps_left -= 1;
-                std::thread::sleep(LOCK_RETRY.interval);
+                sleep();
             }
             r => break r,
         }
@@ -854,7 +974,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
         target_arch = "loongarch64"
     )
 ))]
-const O_NOFOLLOW: i32 = 0o400000;
+pub(super) const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
@@ -864,7 +984,7 @@ const O_NOFOLLOW: i32 = 0o400000;
         target_arch = "powerpc64"
     )
 ))]
-const O_NOFOLLOW: i32 = 0o100000;
+pub(super) const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -873,7 +993,7 @@ const O_NOFOLLOW: i32 = 0o100000;
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-const O_NOFOLLOW: i32 = 0x100;
+pub(super) const O_NOFOLLOW: i32 = 0x100;
 #[cfg(all(
     unix,
     not(any(
@@ -900,13 +1020,17 @@ const O_NOFOLLOW: i32 = 0x100;
         target_os = "dragonfly"
     ))
 ))]
-const O_NOFOLLOW: i32 = 0;
+pub(super) const O_NOFOLLOW: i32 = 0;
 
 /// ログ読み取り open の `custom_flags`（非ブロッキング・symlink 非追従・`O_NOCTTY`。SUP-14・#2426）。
 #[cfg(unix)]
 const LOG_READ_FLAGS: i32 = crate::container_options::env::O_NONBLOCK
     | O_NOFOLLOW
     | crate::container_options::env::O_NOCTTY;
+
+/// symlink 非追従の `open` フラグ(`O_NOFOLLOW`。起動オプション文書の新規作成が使う。#2713)。
+#[cfg(target_os = "linux")]
+pub(crate) const NOFOLLOW_FLAG: i32 = O_NOFOLLOW;
 
 /// 読み取り専用・非ブロッキング・symlink 非追従（`O_NOFOLLOW`）・`O_NOCTTY` でログを開く（unix。SUP-7・IO-5）。
 ///
@@ -1158,12 +1282,21 @@ fn collect_log_names(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RemovedLogs {
     log_files: u32,
+    guard_declined: bool,
 }
 
 impl RemovedLogs {
     /// 消した現在ログ + 世代ファイルの数（ロックファイルは含まない）。
     pub fn log_files(&self) -> u32 {
         self.log_files
+    }
+
+    /// guard が偽で何も消さずに成功した（同じ ID が再作成済みで、新しいインスタンスのログとして残した）とき `true`。
+    ///
+    /// ファイルが無くて 0 件だった成功とは区別される。呼び出し側は `CleanupOutcome::Superseded` へ写す
+    /// （SUP-7・REPAIR-4・#3143）。
+    pub fn guard_declined(&self) -> bool {
+        self.guard_declined
     }
 }
 
@@ -1221,7 +1354,7 @@ pub(crate) fn current_log_path(dir: &Path, id: &ContainerId) -> Result<PathBuf, 
 /// 相対パスは拒否する（CWD より上の要素を検査できない）。検査の前に要素から組み直して、末尾の区切り文字と
 /// `.` を除く（`link/` のような末尾の区切り文字があると `lstat` が最終要素の symlink を辿り、symlink 検査を
 /// すり抜けるため。core の `StateRoot::from_override` と同じ扱い）。
-fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
+pub(super) fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
     if !dir.is_absolute() {
         return Err(invalid("log directory must be an absolute path"));
     }
@@ -1371,3 +1504,6 @@ fn sync_dir(_dir: &Path) -> Result<(), TraitError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stem_tests;

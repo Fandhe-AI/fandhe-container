@@ -3,7 +3,7 @@
 //! 現状は namespace 分離（[`isolate`]・[`mount_proc`]。#134・TASK-27.2）と、`pivot_root` による
 //! rootfs 切替（[`prepare_rootfs`]・[`pivot_root`]。#135・TASK-27.3）、基本デバイスノード作成
 //! （[`create_default_devices`]。#834・TASK-27.6）、fork / exec による子プロセス
-//! 起動（[`spawn_container`]・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
+//! 起動（`spawn_container`・[`exec_entrypoint`]。#831・TASK-27.4.1）と、順序固定のステージ列の枠
 //! （[`StagePipeline`]。#832・TASK-27.4.2。`exec/stages.rs`）まで実装済み。各段の実体
 //! のうち `PR_SET_NO_NEW_PRIVS` は組み込みの固定ステージとして実装済み（#833・TASK-27.4.3。
 //! `exec/no_new_privs.rs`）、capability 削減（#173）と seccomp（#178・TASK-38.3）も同様に組み込み済み。
@@ -42,10 +42,10 @@
 //!    差し込む）。
 //!    `NO_NEW_PRIVS` を Landlock / seccomp より前に固定する順序は fail-closed の前提で、
 //!    後続実装はこの順序を崩さない
-//! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。[`spawn_container`] が分離済みの
+//! 5. `fork` / `exec`（#831・TASK-27.4.1。**最小構成のみ実装済み**。`spawn_container` が分離済みの
 //!    親から子を fork し、子が `establish` → [`prepare_rootfs`] → [`pivot_root`] →
 //!    [`exec_entrypoint`] を行う。上の第 3・4 段〔デバイスノード・ステージ列・`NO_NEW_PRIVS`〕のうち
-//!    Landlock を載せない**この最小構成（[`spawn_container`]）は `LaunchReady` が作られず exec を許可せず、
+//!    Landlock を載せない**この最小構成（`spawn_container`）は `LaunchReady` が作られず exec を許可せず、
 //!    ステージ列を通さない [`exec_entrypoint`] は rootful・rootless を問わず常に `PermissionDenied` で exec を拒否する**
 //!    （SEC-1・CORE-5。fail-closed）。親子間の同期・構造化エラーパイプも未実装で、子の失敗は
 //!    終了コードと stderr で伝える〔TASK-29/30 で扱う〕）
@@ -56,8 +56,8 @@
 //!   macOS / Windows ではコンテナはゲスト VM（Linux）内で実行されるため、ホスト側から
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
-//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と supervisor（TASK-157）を想定し、fork 段は
-//!   [`spawn_container`]（#831）が担う
+//! - 製品コードの呼び出し元は本番 launcher（`ProductionLauncher`。`spawn_container_via_intermediate`）で、
+//!   fork 段の最小入口 `spawn_container`（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、
@@ -65,7 +65,7 @@
 //!   （層 `exec_target`）は [`audit_exec_violation`]・[`record_exec_target_rejection`]（#1465）、
 //!   エントリポイント検証の拒否（層 `entrypoint`）は [`audit_entrypoint_violation`]・
 //!   [`record_entrypoint_rejection`]（#1595）、supervisor の exec の worker の経路の拒否（層 `exec_target`、
-//!   または種別 `rootfs_pivot` の `rootfs_is_host_root` を層 `mount` のパスなし）は [`record_exec_worker_rejection`] が担う。
+//!   または種別 `rootfs_pivot` の `rootfs_is_host_root` を層 `mount` のパスなし）は [`record_exec_worker_rejection_at`] が担う（段つき。#3294）。
 //!   ファイルへの保存は `audit_log::AuditFileWriter`（#839）で実装済みで、本番経路への sink の配線は未実装
 //!   （REPAIR-3）。システムエラーには付かない
 //!
@@ -117,6 +117,7 @@ mod device_probe;
 mod devices;
 mod diagnostic;
 mod entrypoint_mode;
+mod etc_mounts;
 mod exec_command;
 mod inject;
 mod interpreter;
@@ -124,6 +125,7 @@ mod landlock;
 mod launch_intermediate;
 mod launch_status;
 mod masked_paths;
+mod netns_sync;
 mod no_new_privs;
 mod overlay_layers;
 mod path_lookup;
@@ -138,6 +140,7 @@ mod seccomp_listener;
 mod setns;
 mod stages;
 mod subreaper;
+mod sysctls;
 mod sysfs;
 mod tmpfs;
 mod violation;
@@ -150,12 +153,15 @@ mod violation_scan;
 #[doc(hidden)]
 pub use bind_mounts::mount_binds_with_attach_hook;
 pub use bind_mounts::{BindMountOutcome, BindMountReport, BindSourceType, mount_binds};
+pub(crate) use capabilities::NormalizedGroups;
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
-pub use capabilities::{apply_join_credentials_for_test, clear_supplementary_groups_for_test};
+pub use capabilities::{
+    apply_join_credentials_for_test, apply_join_user_for_test, clear_supplementary_groups_for_test,
+};
 pub use cgroup_join::{
     ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
     ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
@@ -180,14 +186,13 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
+pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
-    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
-    spawn_exec_worker_with_listener,
+    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_command_with_stdio,
+    spawn_exec_worker, spawn_exec_worker_with_listener,
 };
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
-#[cfg(test)]
-pub(crate) use landlock::ruleset_from_detection;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -195,7 +200,9 @@ pub use landlock::{
     LandlockAccessProbe, observe_landlock_path_access,
 };
 /// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
-pub(crate) use landlock::{landlock_ruleset_from_config, launch_isolation_from_ruleset};
+pub(crate) use landlock::{landlock_ruleset_from_config_with_dev, launch_isolation_from_ruleset};
+#[cfg(test)]
+pub(crate) use landlock::{ruleset_from_detection, ruleset_from_detection_with_dev};
 pub(crate) use launch_intermediate::{
     IntermediatePlan, IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init,
     spawn_container_via_intermediate,
@@ -205,13 +212,20 @@ pub(crate) use launch_status::LaunchAudit;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_entrypoint_violation_for_test;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・#2716。`R` の後の `execveat` の失敗の往復。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_exec_returned_for_test;
+/// 結合試験 `tests/launch_landlock_audit.rs` 専用の再公開（SEC-1・SEC-4・CORE-5・#2130。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_landlock_failure_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch_status::relay_mount_binds_failure_for_test;
-/// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
-#[doc(hidden)]
-pub use process::exec_child_violation_reasons;
+/// netns の素性の照合（#3206・NET-6・SEC-1）。launcher と `launch_intermediate` が使う crate 内の再公開。
+pub(crate) use netns_sync::{NetnsExpectation, NetnsHandover, NetnsIdentity, NetnsSyncRequest};
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -223,9 +237,8 @@ pub use process::spawn_container_with_stages_reporting_for_test;
 pub use process::{
     ChildExit, ChildStdio, ContainerChild, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EXIT_EXEC_NOT_EXECUTABLE,
-    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecExit, LaunchPidfdUnavailable,
-    SignalDelivery, exec_entrypoint, spawn_container, spawn_container_with_stages,
-    spawn_container_with_stages_and_stdio,
+    EXIT_EXEC_NOT_FOUND, EXIT_SETUP_FAILED, Entrypoint, ExecChildStep, ExecExit,
+    LaunchPidfdUnavailable, SignalDelivery, exec_entrypoint,
 };
 pub(crate) use process::{ConfigPaths, PrePivotSetup, PreparedLaunchFailure};
 /// 結合試験 `tests/exec_child_setup.rs` 専用の再公開（SUP-6・TASK-163 追補・#1456。通常の利用者は呼ばない。詳細は定義側）。
@@ -242,6 +255,14 @@ pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]
 pub use process::{StandardFd, close_standard_fds_for_test};
+/// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
+#[doc(hidden)]
+pub use process::{exec_child_steps, exec_child_violation_reasons};
+/// 最小入口の再公開（結合試験専用。製品コードの呼び出し元は無く、本番の起動は launcher の `spawn_container_via_intermediate`。
+/// release ビルドでは `exec-test-support` を有効にできないため製品バイナリからは呼べない。REPAIR-3・CORE-2・#2762）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use process::{spawn_container, spawn_container_with_stages};
 /// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.1・#199。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
@@ -250,6 +271,10 @@ pub use process::{
     spawn_container_probe_with_devices, spawn_container_probe_with_seccomp_listener,
     spawn_container_probe_with_sysfs, spawn_container_probe_with_tmpfs_and_config_paths,
 };
+/// 結合試験 `tests/exec_setns_join.rs` 専用の再公開（SEC-5・CORE-6・#2770。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub use reapply::exec_user_check_for_test;
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
 #[cfg(feature = "exec-test-support")]
@@ -267,7 +292,10 @@ pub use reapply::{
 /// `exec-test-support` feature を付けたビルドにだけ存在する（TASK-163 追補・#1460）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
-pub use reapply::{ExecReapplyObservation, observe_exec_restriction_reapply};
+pub use reapply::{
+    ExecReapplyObservation, ObservedMountRecording, observe_exec_restriction_reapply,
+    observe_exec_restriction_reapply_recorded,
+};
 pub use rlimits::launch_rlimits_from_self;
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use sealed_copy::MAX_SEALED_COPY_BYTES;
@@ -303,6 +331,7 @@ pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_
 pub use seccomp_listener::{
     apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test, open_socket_ids_for_test,
 };
+pub(crate) use sysctls::SysctlPlan;
 /// 試験用プローブが `SIGTERM` で終わるときの終了コード（[`exit_on_sigterm_for_test`] のハンドラが使う）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -377,7 +406,7 @@ pub use violation::{
 ///
 /// launch 経路（fork 後の子）は sink に触らない。子が失敗した段と理由を状態 pipe で親へ返し、親が
 /// [`record_launch_mount_rejection`] で記録する（#1815）。その親側の入口は実装済みで、本番 launcher
-/// （`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。supervisor への結線は未実装（#1819。REPAIR-3）。
+/// （`oci_runtime::ProductionLauncher`。#1816）が呼ぶ。supervisor の start 経路も結線済みで、`default_audit_sink` の sink を本番 launcher の `audit_sink` へ渡す（#1819。SEC-4）。
 /// ファイル永続化は `audit_log::AuditFileWriter`（#839）で実装済み。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
@@ -394,7 +423,13 @@ pub fn audit_mount_violation(
         .and_then(IsolationViolation::mount_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -425,7 +460,13 @@ pub fn audit_exec_violation(
         .and_then(IsolationViolation::exec_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -472,15 +513,40 @@ pub fn record_exec_target_rejection<E>(
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
 /// プロセスのもので、違反したプロセスや pid1 ではない。
+///
+/// 段は載せない版（出力は従来どおり）。段を持つ呼び出し側は [`record_exec_worker_rejection_at`] を使う（#3294）。
 pub fn record_exec_worker_rejection<E>(
     error: E,
     reason: ViolationReason,
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_exec_worker_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_exec_worker_rejection`] に拒否した段 `stage` を載せる版（SEC-4・ERR-4・SUP-6・#3294。#3209 の残り）。
+///
+/// 呼び出し元は supervisor の exec の親（`audit_worker_result`）で、worker の `err` 行の段の欄を
+/// [`IsolationStage::from_token`] で引き直した値を渡す。段は worker が `ExecError::stage` から運んだもので
+/// （bundle の rootfs の固定の拒否だけは呼び出した段 `Validate`）、理由から段を引く表は使わない
+/// （`from_violation_at` が上書きする段と食い違い誤るため）。`stage` が `None`（段を運べなかった）のときは
+/// 段を載せない（推測で捏造しない）。それ以外は [`record_exec_worker_rejection`] と同じ。
+pub fn record_exec_worker_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.exec_worker_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -505,9 +571,62 @@ pub fn record_launch_mount_rejection<E>(
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_launch_mount_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_launch_mount_rejection`] に拒否した段を足した版（SEC-4・ERR-4・#3121）。
+///
+/// 呼び出し元: `launch_status::resolve_pre_pivot_status`。親が組み立てた `ExecError::stage` の段を
+/// 記録の `stage` に載せる（経路検査の拒否は理由が汎用トークンのため、段でどの保護の失敗かが分かる）。
+/// 公開版は段を持たない呼び出し側向けに `None` で委ねる（出力は従来どおり）。
+pub(crate) fn record_launch_mount_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.launch_mount_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
+            crate::audit_log::AuditedRejection { error, delivery }
+        }
+        None => crate::audit_log::AuditedRejection::not_applicable(error),
+    }
+}
+
+/// launcher の `plan()` / `plan_rootless_subordinate()` が子を fork する前に拒否した計画の違反（種別 `PlanRejected`。
+/// `no_namespaces`・`user_namespace_required`・`host_root_identity_mapping` 等）を、層 `mount` のパスなし・理由コードつきの
+/// レコードとして 1 件記録して返す（SEC-1・SEC-4・#2130）。
+///
+/// 呼び出し元は本番 launcher（`oci_runtime::ProductionLauncher` の `spawn`）だけで、`plan` の呼び出しはそこの 1 か所に
+/// 限る（二重記録を避けるため、共有の写像 `mount_layer_audit_event` は `PlanRejected` を記録しないまま専用の
+/// `launch_plan_audit_event` を使う）。`PlanRejected` 以外・違反なしのエラーは記録せず `NotApplicable`。時刻と PID は
+/// 記録を行った親のもの。記録の成否で `error` は変わらない（fail-closed）。
+pub(crate) fn record_launch_plan_rejection(
+    error: ExecError,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<ExecError> {
+    let event = error
+        .violation
+        .as_ref()
+        .and_then(|v| v.reason.launch_plan_audit_event());
+    match event {
+        Some(event) => {
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(error.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -521,8 +640,9 @@ pub fn record_launch_mount_rejection<E>(
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
 /// [`record_entrypoint_rejection`] を使う。本番 launcher の launch 経路は配線済み（#2624。`launch_intermediate` が
 /// 状態 pipe の exec 前の 2 行目〔`R`/`E`〕から違反を引き直し、親〔C〕でこの関数を呼んで 1 拒否 1 件を記録する）。
-/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。何も報告しない）と、`R` の後の `execveat`
-/// 自体の失敗（errno 由来で違反ではないため記録しない）。TASK-29 / TASK-157 系。
+/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。製品コードからの呼び出し元が無いため配線しない
+/// と決定〔#2716〕。製品の入口を足すときは状態 pipe 付きの経路を通すこと）。`R` の後の `execveat` 自体の失敗は
+/// `X` 行で起動失敗になるが、違反ではないため記録しない（#2716）。TASK-29 / TASK-157 系。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
@@ -538,7 +658,13 @@ pub fn audit_entrypoint_violation(
         .and_then(IsolationViolation::entrypoint_audit_event);
     match event {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                Some(err.stage.into()),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection {
                 error: err,
                 delivery,
@@ -563,9 +689,31 @@ pub fn record_entrypoint_rejection<E>(
     container: Option<&crate::traits::ContainerId>,
     sink: &dyn crate::audit_log::AuditSink,
 ) -> crate::audit_log::AuditedRejection<E> {
+    record_entrypoint_rejection_at(error, reason, None, container, sink)
+}
+
+/// [`record_entrypoint_rejection`] に拒否した段 `stage` を載せる版（SEC-4・ERR-4・SUP-6・#3209）。
+///
+/// 呼び出し元は supervisor の exec の親（`audit_worker_result`）で、worker の結果行で既に届いている
+/// `ExecChildStep` を `ExecChildStep::stage` で写して渡す。launch 側の同じ違反が `IsolationStage::Exec`
+/// 固定で `stage:"exec"` と記録されるのと、語彙が揃う。`stage` が `None`（子が段を報告できなかった）の
+/// ときは段を載せない（推測で捏造しない）。それ以外は [`record_entrypoint_rejection`] と同じ。
+pub fn record_entrypoint_rejection_at<E>(
+    error: E,
+    reason: ViolationReason,
+    stage: Option<IsolationStage>,
+    container: Option<&crate::traits::ContainerId>,
+    sink: &dyn crate::audit_log::AuditSink,
+) -> crate::audit_log::AuditedRejection<E> {
     match reason.entrypoint_audit_event() {
         Some(event) => {
-            let delivery = crate::audit_log::mount::deliver(event, container, sink);
+            let delivery = crate::audit_log::mount::deliver_with_stage_until(
+                event,
+                container,
+                stage.map(Into::into),
+                sink,
+                None,
+            );
             crate::audit_log::AuditedRejection { error, delivery }
         }
         None => crate::audit_log::AuditedRejection::not_applicable(error),
@@ -586,15 +734,18 @@ pub enum Namespace {
     Ipc,
     /// user namespace。
     User,
+    /// network namespace（Loopback モードと Attachable モード。新しい netns に入り `lo` だけを up にする。NET-6・NET-9・CORE-6・#3064・#1939）。
+    Net,
 }
 
 impl Namespace {
-    const ALL: [Namespace; 5] = [
+    const ALL: [Namespace; 6] = [
         Namespace::Pid,
         Namespace::Mount,
         Namespace::Uts,
         Namespace::Ipc,
         Namespace::User,
+        Namespace::Net,
     ];
 
     fn flag(self) -> NsFlag {
@@ -604,6 +755,7 @@ impl Namespace {
             Self::Uts => NsFlag::Uts,
             Self::Ipc => NsFlag::Ipc,
             Self::User => NsFlag::User,
+            Self::Net => NsFlag::Net,
         }
     }
 
@@ -614,6 +766,7 @@ impl Namespace {
             Self::Uts => 2,
             Self::Ipc => 3,
             Self::User => 4,
+            Self::Net => 5,
         }
     }
 }
@@ -628,7 +781,7 @@ impl NamespaceSet {
         Self(0)
     }
 
-    /// 5 種すべて。
+    /// 6 種すべて（`Net` を含む）。
     pub fn all() -> Self {
         Namespace::ALL
             .iter()
@@ -816,6 +969,120 @@ pub enum IsolationStage {
     MountSysfs,
     /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。fd 起点で 1 要素ずつ symlink 非追従に辿る。OCI-1・TASK-29）。
     WorkingDir,
+    /// namespaced な sysctl の適用（`linux.sysctl`。`rootfs/proc/sys` へ fd 起点で書く。CRI-2・CORE-3・SEC-1・#2670）。
+    ApplySysctls,
+    /// pivot 直後の rootfs の読み取り専用化（`root.readonly=true`。`mount_setattr(MOUNT_ATTR_RDONLY)`。CORE-5・SEC-1・#2767）。
+    RootReadOnly,
+    /// 管理ルートに生成した `/etc/hosts`・`/etc/resolv.conf` の rootfs への bind mount（NET-12・SEC-1・TASK-185 追補・#1872）。
+    MountEtcFiles,
+    /// 新しい network namespace の `lo` を up にする `ioctl(SIOCSIFFLAGS)`（NET-6・CORE-6・#3064）。
+    LoopbackUp,
+    /// entrypoint の exec 直前の同期点での network namespace の素性の照合（子が自分の `/proc/thread-self/ns/net` を
+    /// `SCM_RIGHTS` で渡し、親が (dev, ino) を期待と比べる。NET-6・SEC-1・SEC-4・#3206。`network-wiring.md` D8）。
+    NetnsVerify,
+    /// 同期点の中で呼び出し側の準備処理（`NetnsAttachHook`。pasta 構成の holder 保持と外部ヘルパー〔pasta〕の起動）が
+    /// 失敗・期限切れになった段（NET-9・CORE-6・SEC-1・REPAIR-5・#1939）。照合の失敗〔`NetnsVerify`〕と見分けるための段。
+    NetnsAttach,
+}
+
+impl IsolationStage {
+    /// トークンから静的な値へ引き直す（`ALL` と `as_str` の照合。未知・綴り違い〔Debug 綴り等〕は `None`）。
+    ///
+    /// 呼び出し元: supervisor の exec の親が worker の `err` 行の段の欄を復号するとき。外部（worker の pipe）から
+    /// 届いた文字列を静的トークンへ変える唯一の入口で、記録へは引き直した静的値だけを入れる（SEC-4・#3294）。
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == token)
+    }
+
+    /// 全変種（監査の `stage` 語彙との機械照合用。変種を足したら必ずここと `as_str` を更新する。#3121）。
+    pub const ALL: [Self; 35] = [
+        Self::Validate,
+        Self::Unshare,
+        Self::SetGroups,
+        Self::UidMap,
+        Self::GidMap,
+        Self::MountPrivate,
+        Self::SetHostname,
+        Self::MountProc,
+        Self::PrepareRootfs,
+        Self::PivotRoot,
+        Self::Spawn,
+        Self::UserNamespaceMap,
+        Self::Exec,
+        Self::Wait,
+        Self::CreateDevices,
+        Self::CgroupJoin,
+        Self::Rlimits,
+        Self::CapabilityDrop,
+        Self::NoNewPrivs,
+        Self::Landlock,
+        Self::Seccomp,
+        Self::SetNs,
+        Self::MountTmpfs,
+        Self::InjectFiles,
+        Self::MountReadonlyPaths,
+        Self::MountMaskedPaths,
+        Self::MountBinds,
+        Self::MountSysfs,
+        Self::WorkingDir,
+        Self::ApplySysctls,
+        Self::RootReadOnly,
+        Self::MountEtcFiles,
+        Self::LoopbackUp,
+        Self::NetnsVerify,
+        Self::NetnsAttach,
+    ];
+
+    /// 監査レコードの `stage` キーの値（変種名の snake_case の固定語彙。SEC-4・ERR-4・#3121）。
+    ///
+    /// 呼び出し元: `AuditStage` への写像（`From<IsolationStage>`）と `ExecError` の `Display`（子の stderr の診断行の
+    /// `at <段>`。#3209）。外部入力は混ざらない静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::Unshare => "unshare",
+            Self::SetGroups => "set_groups",
+            Self::UidMap => "uid_map",
+            Self::GidMap => "gid_map",
+            Self::MountPrivate => "mount_private",
+            Self::SetHostname => "set_hostname",
+            Self::MountProc => "mount_proc",
+            Self::PrepareRootfs => "prepare_rootfs",
+            Self::PivotRoot => "pivot_root",
+            Self::Spawn => "spawn",
+            Self::UserNamespaceMap => "user_namespace_map",
+            Self::Exec => "exec",
+            Self::Wait => "wait",
+            Self::CreateDevices => "create_devices",
+            Self::CgroupJoin => "cgroup_join",
+            Self::Rlimits => "rlimits",
+            Self::CapabilityDrop => "capability_drop",
+            Self::NoNewPrivs => "no_new_privs",
+            Self::Landlock => "landlock",
+            Self::Seccomp => "seccomp",
+            Self::SetNs => "set_ns",
+            Self::MountTmpfs => "mount_tmpfs",
+            Self::InjectFiles => "inject_files",
+            Self::MountReadonlyPaths => "mount_readonly_paths",
+            Self::MountMaskedPaths => "mount_masked_paths",
+            Self::MountBinds => "mount_binds",
+            Self::MountEtcFiles => "mount_etc_files",
+            Self::MountSysfs => "mount_sysfs",
+            Self::WorkingDir => "working_dir",
+            Self::ApplySysctls => "apply_sysctls",
+            Self::RootReadOnly => "root_read_only",
+            Self::LoopbackUp => "loopback_up",
+            Self::NetnsVerify => "netns_verify",
+            Self::NetnsAttach => "netns_attach",
+        }
+    }
+}
+
+impl From<IsolationStage> for crate::audit_log::AuditStage {
+    /// 監査の段トークンを作る唯一の経路（`ExecError::stage` と同じ語彙。SEC-4・ERR-4・#3121）。
+    fn from(stage: IsolationStage) -> Self {
+        Self::new(stage.as_str())
+    }
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -927,9 +1194,9 @@ impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} at {:?}: {}",
+            "{} at {}: {}",
             self.code.as_str(),
-            self.stage,
+            self.stage.as_str(),
             self.message
         )?;
         if let Some(v) = &self.violation {
@@ -1041,6 +1308,9 @@ pub struct MountIsolation {
     /// プロセス自身の PID namespace（`ns/pid`）を映すため、子向けの `pid_for_children`
     /// ではなくこちらを束縛する。
     pid_ns: String,
+    /// `rslave` の bind について、`/` の再帰 private 化の前に複製した元（`establish_with` が作り、`mount_binds` が取り出す。
+    /// 無ければ空。#2669・OCI-4・CRI-2）。
+    host_slave_clones: bind_mounts::HostSlaveClones,
     /// `!Send`・`!Sync` にするための印（生ポインタは Send / Sync でない）。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1200,7 +1470,8 @@ impl MountIsolation {
     ///    （判定は `check_establish_preconditions`）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
-    ///    外へ伝播させない）
+    ///    外へ伝播させない）。ただし `establish_with` に `rslave` の bind があれば、private 化の前に
+    ///    その元を複製する（#2669）
     /// 3. `unshare` の前後で `/proc/thread-self/ns/mnt` が変わったことを確かめ、作成直後の
     ///    mount namespace と PID namespace を証跡に記録する
     ///
@@ -1222,6 +1493,19 @@ impl MountIsolation {
     /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
     /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
+        Self::establish_with(None)
+    }
+
+    /// [`Self::establish`] の本体。`binds` に `rslave` の bind があれば、`unshare(CLONE_NEWNS)` の直後・`/` の再帰 private 化の前に、
+    /// その元を固定してホスト側が shared か slave であることを確かめ、複製する（#2669・OCI-4・CRI-2・SEC-1）。
+    ///
+    /// 再帰 private 化は接続済みの木の `master` 関係をすべて消すため、`rslave` は private 化の前に複製しておかないと表現できない
+    /// （複製は匿名 namespace にあり、private 化の対象にならない）。`/` 自体は従来どおり再帰 private のままで、複製を `mount_binds` が
+    /// 付け替えるまでの間も、ホストへの伝播は起きない（slave は受けるだけ）。元がホスト側で private なら、rootfs に触れる前に
+    /// `FAILED_PRECONDITION` で失敗する。`binds` が `None` か `rslave` を含まなければ [`Self::establish`] と同じ。
+    pub(crate) fn establish_with(
+        binds: Option<&crate::oci_runtime::BindMountSet>,
+    ) -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -1247,6 +1531,10 @@ impl MountIsolation {
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare(CLONE_NEWNS)"))?;
+        let host_slave_clones = match binds {
+            Some(set) if set.has_host_slave() => bind_mounts::clone_host_slave_sources(set)?,
+            _ => bind_mounts::HostSlaveClones::default(),
+        };
         sys::mount_root_private_recursive().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
         })?;
@@ -1258,8 +1546,14 @@ impl MountIsolation {
         Ok(Self {
             mnt_ns,
             pid_ns,
+            host_slave_clones,
             _not_send: std::marker::PhantomData,
         })
+    }
+
+    /// `establish_with` が複製した `rslave` の元の置き場（`mount_binds` が取り出す）。
+    fn host_slave_clones(&self) -> &bind_mounts::HostSlaveClones {
+        &self.host_slave_clones
     }
 
     /// 呼び出し元の現在の状態（PID・スレッドの mount / PID namespace）が証跡と一致するか。
@@ -1299,6 +1593,28 @@ pub struct IsolationPlan {
     hostname: Option<Hostname>,
     uid_mapping: IdMapping,
     gid_mapping: IdMapping,
+    /// `Mount` を含むときの `/` の再帰的な伝播（既定は private。`rslave` の bind を求める起動だけ slave。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl IsolationPlan {
+    /// `rslave` の bind mount を求める起動のとき、`/` を `MS_REC|MS_SLAVE` にする（既定は `MS_REC|MS_PRIVATE`）。
+    ///
+    /// ホストの peer group との master 関係を、PID 1 側の `MountIsolation::establish_with` が元を複製するまで残すための
+    /// 選択で、外へは伝播しない（slave は受けるだけ）。launcher が `BindMountSet::has_host_slave` で決める（OCI-4・CRI-2・SEC-1）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
+}
+
+/// `rslave` を求めるかから `/` の伝播を決める。
+const fn root_propagation_of(host_slave: bool) -> sys::RootPropagation {
+    if host_slave {
+        sys::RootPropagation::Slave
+    } else {
+        sys::RootPropagation::Private
+    }
 }
 
 /// rootful 経路の検証済み計画。[`plan_rootful_host_root`] だけが作り、
@@ -1361,6 +1677,7 @@ fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationP
         hostname: config.hostname.clone(),
         uid_mapping: IdMapping::single(euid),
         gid_mapping: IdMapping::single(egid),
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1429,6 +1746,7 @@ pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
         plan.namespaces,
         plan.hostname.as_ref(),
         Some((plan.uid_mapping, plan.gid_mapping)),
+        plan.root_propagation,
     )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootlessSingleId,
@@ -1451,7 +1769,12 @@ pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<Isolation
             None,
         ));
     }
-    unshare_and_configure(plan.namespaces, plan.hostname.as_ref(), None)?;
+    unshare_and_configure(
+        plan.namespaces,
+        plan.hostname.as_ref(),
+        None,
+        sys::RootPropagation::Private,
+    )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootfulHostRoot,
         namespaces: plan.namespaces,
@@ -1477,6 +1800,16 @@ pub struct SubordinateIsolationPlan {
     timeout: Duration,
     euid: u32,
     egid: u32,
+    /// `Mount` を含むときの `/` の再帰的な伝播（[`IsolationPlan`] の同名の項目と同じ。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl SubordinateIsolationPlan {
+    /// [`IsolationPlan::with_host_slave_root`] と同じ（範囲写像の経路）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
 }
 
 /// [`isolate_rootless_subordinate`] の成功結果。[`IsolationReport`] は拡張できない型のため、
@@ -1547,6 +1880,7 @@ fn plan_subordinate_for(
         timeout,
         euid,
         egid,
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1572,6 +1906,109 @@ pub fn plan_rootless_subordinate(
         sys::effective_uid(),
         sys::effective_gid(),
     )
+}
+
+/// 中間プロセス I が、pod の user・ipc namespace へ join して残りを分離する(CRI-2・CORE-3・SEC-1・SEC-5。#2674)。
+///
+/// 本番 launcher の中間プロセス(`launch_intermediate`)だけが、`NamespaceJoin` があるときに [`isolate`] /
+/// [`isolate_rootless_subordinate`] の代わりに呼ぶ。`plan` は通常どおり検証済みの計画(`User`・`Ipc` を含む。
+/// 権限モデルの写像と hostname を持つ)で、join では `User`・`Ipc` を作らず参加する。
+///
+/// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
+/// 写像と **完全一致** することを確かめる(不一致は `FailedPrecondition`。コンテナ内 root をホストの非特権 UID へ
+/// 写す SEC-5 と `process.user` の照合の前提を、参加先の userns でも保つ) → 残りの namespace(pid・mount・uts)を
+/// `unshare` → `/` を再帰 private 化 → hostname。
+///
+/// 前提: 単一スレッドで `fs_struct` を共有しない fork 子から呼ぶ(`setns(CLONE_NEWUSER)` の条件。満たさなければ
+/// カーネルが `EINVAL`)。mapper・holder・`newuidmap` は使わない(写像は参加先に書き込み済み)。失敗したら
+/// プロセスを破棄すること([`isolate`] と同じ)。
+pub(crate) fn isolate_join(
+    plan: IntermediatePlan<'_>,
+    join: &crate::oci_runtime::NamespaceJoin,
+) -> Result<(), ExecError> {
+    let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+    let (identity_ok, namespaces, hostname, uid, gid, root_propagation): (
+        _,
+        _,
+        _,
+        Vec<IdMapping>,
+        Vec<IdMapping>,
+        _,
+    ) = match plan {
+        IntermediatePlan::SingleId(p) => (
+            euid == p.uid_mapping.host_id && egid == p.gid_mapping.host_id,
+            p.namespaces,
+            p.hostname.as_ref(),
+            vec![p.uid_mapping],
+            vec![p.gid_mapping],
+            p.root_propagation,
+        ),
+        IntermediatePlan::Subordinate(p) => (
+            euid == p.euid && egid == p.egid,
+            p.namespaces,
+            p.hostname.as_ref(),
+            p.uid.entries().to_vec(),
+            p.gid.entries().to_vec(),
+            p.root_propagation,
+        ),
+    };
+    if !identity_ok {
+        return Err(ExecError::from_violation(
+            ViolationReason::IdentityChanged,
+            None,
+        ));
+    }
+    // 呼び出し元が non-dumpable だった場合は、参加後も保つ(範囲写像の経路と同じ。資格情報の更新で dumpable が変わる環境でも
+    // 戻す方向にだけ動かす。同じ uid のホスト側プロセスが ptrace・`/proc/<pid>/fd` で触れる窓を作らない)。
+    let was_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    sys::setns_fd(join.user_fd(), NsFlag::User)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(user)"))?;
+    if was_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
+    sys::setns_fd(join.ipc_fd(), NsFlag::Ipc)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(ipc)"))?;
+    verify_joined_id_maps(
+        |kind| {
+            let target = rootless::TargetPid::new(std::process::id())?;
+            rootless::read_id_map_of(&rootless::ProcHandle::open(target)?, kind)
+        },
+        &uid,
+        &gid,
+    )?;
+    let rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
+    if !rest.is_empty() {
+        unshare_and_configure(rest, hostname, None, root_propagation)?;
+    }
+    Ok(())
+}
+
+/// 参加した user namespace の写像(`read` が返す `/proc/self/{uid,gid}_map` の内容)が、計画の期待値と完全一致する
+/// ことを確かめる(SEC-5。pod の userns が別の権限モデル・別の範囲で作られていれば起動しない)。
+fn verify_joined_id_maps(
+    read: impl Fn(rootless::IdKind) -> Result<Vec<IdMapping>, RootlessError>,
+    uid: &[IdMapping],
+    gid: &[IdMapping],
+) -> Result<(), ExecError> {
+    for (kind, expected) in [(rootless::IdKind::Uid, uid), (rootless::IdKind::Gid, gid)] {
+        let got = read(kind).map_err(|e| {
+            ExecError::new(
+                e.code,
+                IsolationStage::UserNamespaceMap,
+                "read the joined id map",
+            )
+        })?;
+        if got != expected {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::UserNamespaceMap,
+                "the pod user namespace id mapping does not match the expected mapping",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 呼び出し元が `sys::fork_single_threaded` で fork した子 `pid` を、期限つきで待って回収する(REPAIR-5)。
@@ -1770,7 +2207,7 @@ fn isolate_rootless_subordinate_with(
 
     let rest = plan.namespaces.without(Namespace::User);
     if !rest.is_empty() {
-        unshare_and_configure(rest, plan.hostname.as_ref(), None)?;
+        unshare_and_configure(rest, plan.hostname.as_ref(), None, plan.root_propagation)?;
     }
     let container_root = |host_id| IdMapping {
         container_id: 0,
@@ -2084,6 +2521,7 @@ fn unshare_and_configure(
     namespaces: NamespaceSet,
     hostname: Option<&Hostname>,
     mappings: Option<(IdMapping, IdMapping)>,
+    root_propagation: sys::RootPropagation,
 ) -> Result<(), ExecError> {
     sys::unshare_namespaces(&namespaces.flags())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare"))?;
@@ -2095,9 +2533,27 @@ fn unshare_and_configure(
         write_proc_self("gid_map", &gid.to_map_line(), IsolationStage::GidMap)?;
     }
 
+    // Loopback モード（NET-6・#3064）: 新しい netns は `lo` が down で生まれ、down のままだと自己宛て配送が
+    // 落ちる（#1927・#2077）。netns を所有する user namespace の全 capability が使える今のうちに up にする。
+    // 範囲写像の経路では holder の user namespace へ `setns` した後の `rest` の unshare で来るため、この 1 か所で
+    // 両経路を満たす。pin はしない（netns は PID 1 と一緒に消える）。
+    if namespaces.contains(Namespace::Net) {
+        sys::set_loopback_up().map_err(|e| {
+            ExecError::from_sys(
+                e,
+                IsolationStage::LoopbackUp,
+                "bring the loopback interface up",
+            )
+        })?;
+    }
+
     if namespaces.contains(Namespace::Mount) {
-        sys::mount_root_private_recursive().map_err(|e| {
-            ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
+        sys::mount_root_recursive(root_propagation).map_err(|e| {
+            let what = match root_propagation {
+                sys::RootPropagation::Private => "mount(MS_PRIVATE)",
+                sys::RootPropagation::Slave => "mount(MS_SLAVE)",
+            };
+            ExecError::from_sys(e, IsolationStage::MountPrivate, what)
         })?;
     }
 
@@ -2318,6 +2774,109 @@ pub(crate) fn enter_working_dir(
     sys::change_dir_fd(cur.as_fd()).map_err(|e| map_err(e, "cannot change to process.cwd"))
 }
 
+/// [`make_root_read_only`] の結果。将来の拡張（ステージ列・監査ログ）に備えて非網羅の構造体にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct RootReadOnlyReport {
+    /// `/` のマウントが `ST_RDONLY` であることを `fstatfs(2)` で事後検証済みか。成功時は常に真。
+    pub(crate) verified_read_only: bool,
+    /// 属性を足しただけで `nodev`（#1676）が落ちていないことを同じ `fstatfs(2)` で確認済みか。成功時は常に真。
+    pub(crate) nodev_kept: bool,
+}
+
+/// `root.readonly=true` の適用: pivot 直後の `/`（新 root の mount top）を読み取り専用にする
+/// （OCI の `root.readonly`。CORE-5・SEC-1・SUP-12・#2767）。
+///
+/// `process::run_pre_pivot` が `pivot_root` の直後・`enter_working_dir` の前に、`PrePivotSetup::root_readonly`
+/// が真のときだけ呼ぶ（pivot 前の段は rootfs へ書き込むため、これらより後でなければならない）。ステージ列
+/// （capability 削減・Landlock・seccomp）より前に走るので、既定の seccomp が拒否する `mount_setattr(2)` を
+/// 許可する必要はない。手順:
+///
+/// 1. `/` を `O_PATH|O_NOFOLLOW` で開き、マウント ID が `report.new_root_mnt_id` と一致することを確かめる
+/// 2. その fd へ `mount_setattr(MOUNT_ATTR_RDONLY)` を非再帰で足す。`MS_REMOUNT|MS_BIND` ではなく属性の
+///    追加だけにするのは、`nodev`（#1676）を言い直さずに済み、user namespace 内でロックされた
+///    `nosuid`/`nodev`/`noexec` を落とそうとして `EPERM` になる事態を避けるため（rootless でも成り立つ）
+/// 3. `fstatfs(2)` で `ST_RDONLY` と `ST_NODEV` の両方が立っていることを事後検証する
+///
+/// 非再帰のため `/proc`・`/dev` 系・tmpfs・注入・bind・保護パスの各マウントは自分の属性のまま（OCI の意味論）。
+/// `ENOSYS`（5.12 未満）を含むあらゆる失敗は fail-closed で起動を失敗させ、`mount(2)` への縮退や
+/// 「ro なしで起動」の分岐は作らない。エラーの message は固定文言でパス・errno を含めない。
+pub(crate) fn make_root_read_only(report: &PivotReport) -> Result<RootReadOnlyReport, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::RootReadOnly;
+    let root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
+    if fd_mount_id(&root, STAGE)? != report.new_root_mnt_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "/ is not the root prepared by pivot_root",
+        ));
+    }
+    root_read_only_syscall(root.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "mount_setattr(MOUNT_ATTR_RDONLY)"))?;
+    // dry-run（`cfg(test)`）では実マウントが無く、ホストの `/` の属性で結果が揺れるため検証しない。
+    if !cfg!(test) {
+        let flags = sys::mount_flags(root.as_fd())
+            .map_err(|e| ExecError::from_sys(e, STAGE, "fstatfs(/)"))?;
+        check_root_read_only_flags(flags)?;
+    }
+    Ok(RootReadOnlyReport {
+        verified_read_only: true,
+        nodev_kept: true,
+    })
+}
+
+/// 読み取り専用化の事後検証（純関数。fail-closed）。`ST_RDONLY` と `ST_NODEV` の両方が要る
+/// （`ST_VALID` が無い値は判定不能として拒否）。
+fn check_root_read_only_flags(flags: sys::MountFlags) -> Result<(), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::RootReadOnly;
+    if !flags.is_valid() {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            STAGE,
+            "cannot verify the root mount flags",
+        ));
+    }
+    if !flags.is_read_only() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "the root mount is not read-only after mount_setattr",
+        ));
+    }
+    if !flags.is_nodev() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "the root mount lost nodev while becoming read-only",
+        ));
+    }
+    Ok(())
+}
+
+/// `/` の mount top を fd 起点で読み取り専用にする。本番ビルドでは [`sys::set_mount_read_only`]。
+#[cfg(not(test))]
+fn root_read_only_syscall(root: std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> {
+    sys::set_mount_read_only(root)
+}
+
+/// dry-run: `mount_setattr(2)` を呼ばず、呼ばれた回数と本番と同じ引数の組を記録する。
+#[cfg(test)]
+fn root_read_only_syscall(_root: std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> {
+    ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().push(sys::read_only_call_params()));
+    Ok(())
+}
+
+/// dry-run が記録する `mount_setattr(2)` の引数の組（[`sys::read_only_call_params`] と同形）。
+#[cfg(test)]
+type ReadOnlyCallParams = (u64, u64, u64, u64, u32, usize);
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_READ_ONLY_CALLS: std::cell::RefCell<Vec<ReadOnlyCallParams>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// [`pin_rootfs`] の結果。
 struct PinnedRootfs {
     /// rootfs の親ディレクトリの fd（rootfs が `/` のときは `None`）。bind mount 後に同じ
@@ -2418,14 +2977,6 @@ fn fd_still_at(dir: &OwnedFd, expected: &Path) -> bool {
         .is_ok_and(|now| now.components().eq(expected.components()))
 }
 
-/// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
-pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
-    fdinfo
-        .lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
-}
-
 /// `dir` が属するマウントが shared propagation か判定する。fdinfo の `mnt_id` と
 /// 呼び出しスレッドの `/proc/thread-self/mountinfo` の先頭フィールド（mount ID）を
 /// 突き合わせる（`/proc/self/mountinfo` はスレッドグループの代表の mount namespace を映し、
@@ -2448,10 +2999,16 @@ fn mount_is_shared(dir: &OwnedFd, stage: IsolationStage) -> Result<bool, ExecErr
 /// `dir` が属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。読めなければ
 /// システムエラー（fail-closed）。
 fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
-    let err = |msg: &str| mountinfo_error(msg).at_stage(stage);
-    let fdinfo = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
-        .map_err(|_| err("cannot read fdinfo of the pinned directory"))?;
-    parse_fdinfo_mnt_id(&fdinfo).ok_or_else(|| err("no mnt_id in fdinfo of the pinned directory"))
+    use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
+    read_fd_mnt_id(dir.as_fd()).map_err(|e| {
+        let msg = match e {
+            FdinfoMountIdError::Read(_) | FdinfoMountIdError::TooLarge => {
+                "cannot read fdinfo of the pinned directory"
+            }
+            _ => "no mnt_id in fdinfo of the pinned directory",
+        };
+        mountinfo_error(msg).at_stage(stage)
+    })
 }
 
 /// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
@@ -2554,8 +3111,214 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 
 #[cfg(test)]
 mod tests {
+    /// SEC-4・ERR-4・#3294: `IsolationStage::from_token` は `as_str` と往復し、綴り違い（Debug 綴り・空・空白つき）は拒否する。
+    #[test]
+    fn sec4_err4_isolation_stage_from_token_round_trips() {
+        for stage in IsolationStage::ALL {
+            assert_eq!(IsolationStage::from_token(stage.as_str()), Some(stage));
+        }
+        for bad in ["", "Exec", "SetNs", "exec ", " exec", "bogus", "set-ns"] {
+            assert_eq!(IsolationStage::from_token(bad), None, "{bad:?}");
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
+
+    /// 全変種を列挙する序数（変種を足すとコンパイルエラーになり、`ALL` の更新漏れを防ぐ）。
+    fn stage_ordinal(s: IsolationStage) -> usize {
+        match s {
+            IsolationStage::Validate => 0,
+            IsolationStage::Unshare => 1,
+            IsolationStage::SetGroups => 2,
+            IsolationStage::UidMap => 3,
+            IsolationStage::GidMap => 4,
+            IsolationStage::MountPrivate => 5,
+            IsolationStage::SetHostname => 6,
+            IsolationStage::MountProc => 7,
+            IsolationStage::PrepareRootfs => 8,
+            IsolationStage::PivotRoot => 9,
+            IsolationStage::Spawn => 10,
+            IsolationStage::UserNamespaceMap => 11,
+            IsolationStage::Exec => 12,
+            IsolationStage::Wait => 13,
+            IsolationStage::CreateDevices => 14,
+            IsolationStage::CgroupJoin => 15,
+            IsolationStage::Rlimits => 16,
+            IsolationStage::CapabilityDrop => 17,
+            IsolationStage::NoNewPrivs => 18,
+            IsolationStage::Landlock => 19,
+            IsolationStage::Seccomp => 20,
+            IsolationStage::SetNs => 21,
+            IsolationStage::MountTmpfs => 22,
+            IsolationStage::InjectFiles => 23,
+            IsolationStage::MountReadonlyPaths => 24,
+            IsolationStage::MountMaskedPaths => 25,
+            IsolationStage::MountBinds => 26,
+            IsolationStage::MountSysfs => 27,
+            IsolationStage::WorkingDir => 28,
+            IsolationStage::ApplySysctls => 29,
+            IsolationStage::RootReadOnly => 30,
+            IsolationStage::MountEtcFiles => 31,
+            IsolationStage::LoopbackUp => 32,
+            IsolationStage::NetnsVerify => 33,
+            IsolationStage::NetnsAttach => 34,
+        }
+    }
+
+    /// SEC-4・ERR-4（#3121）: 監査の `stage` 語彙は `IsolationStage` と一致し、全変種を網羅して一意な `[a-z_]` のトークンになる。
+    #[test]
+    fn sec4_err4_3121_stage_vocabulary_matches_isolation_stage() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, s) in IsolationStage::ALL.into_iter().enumerate() {
+            assert_eq!(stage_ordinal(s), i);
+            let token = crate::audit_log::AuditStage::from(s).as_str();
+            assert_eq!(token, s.as_str());
+            assert!(
+                !token.is_empty() && token.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+            );
+            assert!(seen.insert(token), "duplicate {token}");
+        }
+        assert_eq!(IsolationStage::ALL.len(), 35);
+        assert_eq!(IsolationStage::NetnsAttach.as_str(), "netns_attach");
+        assert_eq!(
+            IsolationStage::MountReadonlyPaths.as_str(),
+            "mount_readonly_paths"
+        );
+        assert_eq!(
+            IsolationStage::MountMaskedPaths.as_str(),
+            "mount_masked_paths"
+        );
+    }
+
+    /// SEC-4・ERR-4（#3121）: 違反を記録する公開入口は、返す `ExecError::stage` と同じ段を記録に載せる。
+    #[test]
+    fn sec4_err4_3121_violation_audits_carry_error_stage() {
+        use crate::audit_log::mount::tests::VecSink;
+        let sink = VecSink::new(false);
+        let err = ExecError::from_violation_at(
+            ViolationReason::RootfsIsHostRoot,
+            None,
+            IsolationStage::PivotRoot,
+        );
+        let out = audit_mount_violation(err, None, &sink);
+        assert_eq!(out.delivery, crate::audit_log::AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].stage().map(|s| s.as_str()), Some("pivot_root"));
+    }
+
+    fn pivot_report_with(mnt_id: u64) -> PivotReport {
+        PivotReport {
+            new_root_mnt_id: mnt_id,
+            old_root_detached: true,
+            proc_mounted: true,
+            rootfs_nodev: true,
+        }
+    }
+
+    /// CORE-5・SEC-1（#2767）: `/` のマウント ID が pivot の結果と食い違えば、属性を足す前に拒否する。
+    #[test]
+    fn core5_sec1_make_root_read_only_rejects_foreign_root_before_syscall() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let real = fd_mount_id(&root, IsolationStage::RootReadOnly).expect("mnt_id");
+        ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().clear());
+        let err = make_root_read_only(&pivot_report_with(real.wrapping_add(1))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(err.stage, IsolationStage::RootReadOnly);
+        assert_eq!(err.message, "/ is not the root prepared by pivot_root");
+        assert!(ROOT_READ_ONLY_CALLS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// CORE-5・SEC-1（#2767）: 一致すれば `mount_setattr` を属性の追加のみ（`attr_clr=0`・非再帰）で 1 回だけ呼ぶ。
+    #[test]
+    fn core5_sec1_make_root_read_only_adds_the_attribute_once() {
+        let root = sys::open_dir_path_nofollow(None, c"/").expect("open /");
+        let real = fd_mount_id(&root, IsolationStage::RootReadOnly).expect("mnt_id");
+        ROOT_READ_ONLY_CALLS.with(|c| c.borrow_mut().clear());
+        let report = make_root_read_only(&pivot_report_with(real)).expect("read-only");
+        assert!(report.verified_read_only && report.nodev_kept);
+        let calls = ROOT_READ_ONLY_CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, [sys::read_only_call_params()]);
+        let (attr_set, attr_clr, ..) = calls[0];
+        assert_eq!((attr_set, attr_clr), (1, 0));
+    }
+
+    /// SEC-1（#2767）: 事後検証は `ST_VALID`・`ST_RDONLY`・`ST_NODEV` の全部を要求する（fail-closed）。
+    #[test]
+    fn sec1_root_read_only_flags_require_rdonly_and_nodev() {
+        const VALID: i64 = 0x20;
+        const RDONLY: i64 = 0x1;
+        const NODEV: i64 = 0x4;
+        let check = |bits| check_root_read_only_flags(sys::MountFlags::from_bits(bits));
+        assert!(check(VALID | RDONLY | NODEV).is_ok());
+        let no_ro = check(VALID | NODEV).unwrap_err();
+        assert_eq!(no_ro.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            no_ro.message,
+            "the root mount is not read-only after mount_setattr"
+        );
+        let no_dev = check(VALID | RDONLY).unwrap_err();
+        assert_eq!(
+            no_dev.message,
+            "the root mount lost nodev while becoming read-only"
+        );
+        let invalid = check(RDONLY | NODEV).unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::Internal);
+    }
+
+    /// SEC-5・CORE-3（#2674）: 参加した user namespace の写像は、計画の期待値と完全一致するときだけ受ける。
+    #[test]
+    fn sec5_joined_id_maps_must_match_the_plan_exactly() {
+        let single = |host| IdMapping {
+            container_id: 0,
+            host_id: host,
+            count: 1,
+        };
+        let read_ok = |kind: rootless::IdKind| {
+            rootless::parse_id_map(match kind {
+                rootless::IdKind::Uid => b"         0       1000          1\n",
+                rootless::IdKind::Gid => b"         0       1001          1\n",
+            })
+        };
+        verify_joined_id_maps(read_ok, &[single(1000)], &[single(1001)]).expect("exact match");
+        // uid が違う・gid が違う・行が足りない / 余る はいずれも FailedPrecondition。
+        for (uid, gid) in [
+            (vec![single(1002)], vec![single(1001)]),
+            (vec![single(1000)], vec![single(1000)]),
+            (
+                vec![
+                    single(1000),
+                    IdMapping {
+                        container_id: 1,
+                        host_id: 100_000,
+                        count: 65_536,
+                    },
+                ],
+                vec![single(1001)],
+            ),
+            (vec![], vec![single(1001)]),
+        ] {
+            let err = verify_joined_id_maps(read_ok, &uid, &gid).expect_err("mismatch");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::UserNamespaceMap);
+        }
+        // 範囲写像(subuid)の複数行も順序つきで一致を要する。
+        let range = [
+            single(1000),
+            IdMapping {
+                container_id: 1,
+                host_id: 100_000,
+                count: 65_536,
+            },
+        ];
+        let read_range =
+            |_: rootless::IdKind| rootless::parse_id_map(b"0 1000 1\n1 100000 65536\n");
+        verify_joined_id_maps(read_range, &range, &range).expect("range match");
+        // 読み取りの失敗はそのままエラー(通過させない)。
+        let failing = |_: rootless::IdKind| rootless::parse_id_map(b"x y z");
+        assert!(verify_joined_id_maps(failing, &range, &range).is_err());
+    }
 
     fn cfg(namespaces: NamespaceSet, hostname: Option<&str>) -> IsolationConfig {
         IsolationConfig {
@@ -2653,15 +3416,17 @@ mod tests {
             return;
         }
         // 期限なしの `output()` は子が止まると試験ごと止まる(REPAIR-5)。出力は一時ファイルへ向け、期限つきで待つ。
-        let dir = std::env::temp_dir().join(format!("fandhe-nondumpable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("child.log");
+        let scratch = crate::scratch_root::ScratchDir::new(
+            "fandhe-nondumpable",
+            std::time::Duration::from_secs(10),
+        );
+        let log = scratch.path().join("child.log");
         let file = std::fs::File::create(&log).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "exec::tests::core6_sec5_standalone_keeps_non_dumpable_caller",
-                "--nocapture",
+                "--no-capture",
                 "--test-threads=1",
             ])
             .env(MARK, "1")
@@ -2683,12 +3448,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         let output = std::fs::read_to_string(&log).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&dir);
         let status = status.unwrap_or_else(|| panic!("child timed out (killed)\n{output}"));
         assert!(status.success(), "{output}");
     }
 
-    /// CORE-1: 5 種の集合と単体の所属判定。
+    /// CORE-1: 6 種の集合と単体の所属判定。
     #[test]
     fn core1_namespace_set_membership() {
         let all = NamespaceSet::all();
@@ -2699,7 +3463,7 @@ mod tests {
         assert!(NamespaceSet::empty().is_empty());
         // 単体フラグの合成値（sys の具体値と一致）
         let bits = all.flags().iter().fold(0i32, |a, f| a | f.bits());
-        assert_eq!(bits, 0x3C02_0000);
+        assert_eq!(bits, 0x7C02_0000);
     }
 
     /// CORE-1: hostname の受理例。
@@ -2893,6 +3657,21 @@ mod tests {
         );
     }
 
+    /// OCI-4・CRI-2（#2669）: `/` の伝播は既定が private で、`rslave` の bind を求める起動だけ slave にできる。
+    #[test]
+    fn oci4_plan_root_propagation_defaults_to_private_and_opts_into_slave() {
+        let p = plan_for(&cfg(NamespaceSet::all(), None), 4242, 4242).unwrap();
+        assert_eq!(p.root_propagation, sys::RootPropagation::Private);
+        let slave = p.clone().with_host_slave_root(true);
+        assert_eq!(slave.root_propagation, sys::RootPropagation::Slave);
+        assert_eq!(
+            slave.with_host_slave_root(false).root_propagation,
+            sys::RootPropagation::Private
+        );
+        assert_eq!(root_propagation_of(true), sys::RootPropagation::Slave);
+        assert_eq!(root_propagation_of(false), sys::RootPropagation::Private);
+    }
+
     const STATUS_PID1: &str = "Name:\tx\nNSpid:\t4321\t1\nThreads:\t1\n";
 
     /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
@@ -3081,6 +3860,7 @@ mod tests {
         MountIsolation {
             mnt_ns: mnt_ns.to_string(),
             pid_ns: pid_ns.to_string(),
+            host_slave_clones: Default::default(),
             _not_send: std::marker::PhantomData,
         }
     }
@@ -3200,21 +3980,28 @@ mod tests {
     /// テスト用の一時ディレクトリ（`chmod` で絞ったディレクトリを戻してから削除する）。
     /// `TMPDIR` に symlink があると rootfs の正規化検査が先に失敗して各ケースが意図と
     /// 違う理由で通るため、正規化したパスを起点にする。
+    ///
+    /// 根は排他作成した `ScratchDir` の子にする（pid だけの名前を先に消す旧方式の置き換え。#3434・REPAIR-12）。
+    /// `Drop` は権限を戻してから消し、その後 guard が親を消す。
     struct TempTree {
         base: std::path::PathBuf,
         restore: Vec<std::path::PathBuf>,
+        #[allow(dead_code)] // drop で後始末するための guard（#3434・REPAIR-12）。
+        scratch: crate::scratch_root::ScratchDir,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!("fandhe-exec-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
+            let scratch = crate::scratch_root::ScratchDir::new(
+                &format!("fandhe-exec-{label}"),
+                std::time::Duration::from_secs(10),
+            );
+            let base = std::fs::canonicalize(scratch.path()).unwrap().join("d");
+            std::fs::create_dir(&base).unwrap();
             Self {
                 base,
                 restore: Vec::new(),
+                scratch,
             }
         }
     }
@@ -3308,17 +4095,6 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::MountProc);
     }
 
-    /// fdinfo の `mnt_id:` を取り出す（無い・数値でない場合は None）。
-    #[test]
-    fn fdinfo_mnt_id_parsing() {
-        assert_eq!(
-            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n"),
-            Some(52)
-        );
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nflags:\t0\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tx\n"), None);
-    }
-
     /// 走査で固定した `/` の fd の mnt_id は、mountinfo で最後に現れる（最上位の）
     /// マウントポイント `/` の mount ID と一致し、その行の shared 判定を返す。
     #[test]
@@ -3343,10 +4119,7 @@ mod tests {
     #[test]
     fn mount_is_shared_uses_mount_id_of_fd() {
         let fd = open_dir_beneath(Path::new("/"), &[]).unwrap();
-        let fdinfo =
-            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
-                .unwrap();
-        let mnt_id = parse_fdinfo_mnt_id(&fdinfo).unwrap();
+        let mnt_id = crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(fd.as_fd()).unwrap();
         let info = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
         let root_line = info
             .lines()
@@ -3445,6 +4218,22 @@ mod tests {
             err.to_string()
                 .ends_with("(violation: plan_rejected/identity_changed, SEC-5)")
         );
+    }
+
+    /// ERR-4・REPAIR-4・#3209: `ExecError` の `Display` は段を `IsolationStage::as_str` の語彙で出す
+    /// （旧: `{:?}` の CamelCase）。
+    #[test]
+    fn err4_3209_exec_error_display_uses_as_str_vocabulary() {
+        let e = ExecError::new(ErrorCode::NotFound, IsolationStage::MountReadonlyPaths, "x");
+        assert_eq!(e.to_string(), "NOT_FOUND at mount_readonly_paths: x");
+        for stage in IsolationStage::ALL {
+            let e = ExecError::new(ErrorCode::Internal, stage, "m");
+            assert_eq!(
+                e.to_string(),
+                format!("INTERNAL at {}: m", stage.as_str()),
+                "{stage:?}"
+            );
+        }
     }
 
     /// SEC-4（記録経路）: establish の前提違反と証跡不一致に違反記録が付く（対象なし。

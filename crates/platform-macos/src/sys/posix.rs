@@ -6,8 +6,8 @@
 //! 呼び出し文脈: `config` のコンソールログ open が、open 済み fd の所有者を自プロセスの実効 uid と
 //! 照合する（他ユーザーが事前作成したファイルへの追記を拒否する。MAC-1・TASK-64.3）。Virtualization.framework
 //! 層（macOS 限定）と違い OS 非依存の検証ロジックから使うため、macOS 以外の unix でもビルドし、3 OS CI の
-//! Linux でも所有者検査を実行できるようにする。`libc` / `nix` は依存追加が禁止（dependency-policy）のため、
-//! `crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言を自前で持つ。
+//! Linux でも所有者検査を実行できるようにする。`libc` / `nix` は製品の依存に入れない（dependency-policy。`libc` は dev-dependencies で照合にだけ使う。#1318）ため、
+//! `crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言を自前で持つ。`libc` との機械照合は子 `libc_abi` で行う（#1844）。
 //!
 //! 不変条件: `unsafe fn` を公開しない。公開するのは安全な [`effective_uid`]（`pub(crate)`）のみ。
 
@@ -38,4 +38,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(effective_uid(), owner);
     }
+}
+
+#[cfg(test)]
+mod libc_abi {
+    //! `geteuid` の宣言を `libc` 0.2.189 と型で照合する（#1844・MAC-1・MVM-4・REPAIR-12）。関数は呼ばない。
+    //! macOS と Linux の両方でコンパイルされるため、PR の ubuntu CI でもネイティブに評価される。
+    use super::*;
+
+    const _: unsafe extern "C" fn() -> libc::uid_t = geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
 }

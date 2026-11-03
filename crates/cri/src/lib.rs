@@ -6,6 +6,8 @@
 //! 全ライフサイクルの結合試験は TASK-59.4（#440。`tests/adapter_integration.rs`）。
 //! CRI の設定から OCI bundle（`config.json` と bundle の寿命）を作る層は `bundle`（#2395。image 展開は #2433 の `ImageRootfsSource`）。
 //! 統一エラー型 `error`（ERR-3・TASK-97.1）をハンドラへ適用済み（TASK-97.2・#450）。
+//! shim v2 の ttrpc サーバーの骨格と空の Task サービスと Create / Start は `shim_v2`（TASK-62.1・TASK-62.2・CRI-5・MS-7。ワイヤー形式は自作）。
+//! `Exec`・`Attach`・`PortForward` は `streaming`（TASK-63.1・#679・CRI-6）のストリーミングサーバー基盤と URL 発行まで実装済みで、`CriRuntimeService::with_streaming` で注入したときだけ URL を返す。Exec（#680）・Attach（#681）・PortForward（#682）のプロトコル本体（SPDY/3.1）は共通の codec で実装済み。Exec の stdio を持つ起動役・Attach の backend・PortForward の転送先接続の本番の実装と plugin-cri への注入は後続。
 //! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! RPC の結果と所要時間は `instrument` の記録先へ渡す（REPAIR-4。core の記録器への接続は plugin-cri。TASK-108）。
 //! 本体は G4（TASK-56〜63）で実装する。実行時は `fandhe-container-plugin-cri`（TASK-114）が
@@ -20,7 +22,13 @@ pub mod error;
 pub mod image_pull;
 pub mod image_service;
 pub mod instrument;
+pub mod port_mapping;
 pub mod runtime_service;
+pub mod shim_v2;
+pub mod stop_signal;
+pub mod streaming;
+#[cfg(unix)]
+mod sys;
 
 /// cri-api の proto package `runtime` に対応するモジュール階層（CRI-3・TASK-56.4）。
 pub mod runtime {
@@ -39,3 +47,9 @@ pub mod runtime {
         include!(concat!(env!("OUT_DIR"), "/runtime.v1.rs"));
     }
 }
+
+// 先に消してから作る試験補助を排他作成へ揃えるための共有部品（oci の結合試験の補助を取り込む。
+// REPAIR-12・#3506）。試験専用で製品・rlib に影響しない。
+#[cfg(test)]
+#[path = "../../oci/tests/support/test_root.rs"]
+mod test_root;

@@ -1,0 +1,23 @@
+# STACK-7・TASK-154.1・#614 の合成フィクスチャ。build: と Docker ソケット bind（short / long）を含む。
+# 識別子はダミー値だけ。
+services:
+  buildsvcmarker:
+    build: ./ctxmarker
+  buildmap:
+    image: example.invalid/app:1
+    build:
+      context: ./ctxmarker2
+      dockerfile: Dockerfile
+  shortsock:
+    image: example.invalid/ci:1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  longsock:
+    image: example.invalid/ci:1
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+  priv:
+    image: example.invalid/p:1
+    privileged: true

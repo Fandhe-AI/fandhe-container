@@ -14,6 +14,9 @@ use fandhe_container_core::audit_log::{
     AuditWriteErrorKind,
 };
 
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 fn rec(n: i32) -> AuditRecord {
     AuditRecord::new(
         AuditTimestamp::from_unix_duration(Duration::new(1, 2)),
@@ -29,9 +32,10 @@ fn rec(n: i32) -> AuditRecord {
 /// なり行を残さない。解放後の後続書き込みは成功し、期限切れの待ち手が後続を塞がない。
 #[test]
 fn repair5_1703_lock_timeout_then_later_write_succeeds() {
-    let d = std::env::temp_dir().join(format!("afw-timeout-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
+    // pid だけの名前を先に消さず、排他作成の `ScratchDir` の子を使う（#3434・REPAIR-12）。
+    let scratch = scratch_root::ScratchDir::new("afw-timeout", Duration::from_secs(10));
+    let d = scratch.path().join("d");
+    fs::create_dir(&d).unwrap();
     fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
     let p = d.join("audit.log");
     let mut w = AuditFileWriter::open(&p).unwrap();
@@ -53,5 +57,4 @@ fn repair5_1703_lock_timeout_then_later_write_succeeds() {
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("\"pid\":1,"));
     assert!(lines[1].contains("\"pid\":3,"));
-    fs::remove_dir_all(&d).unwrap();
 }

@@ -1,0 +1,6 @@
+# STACK-5・TASK-152.1・#605 の陰性対照。ホストパス形の devices は CDI 完全修飾名でなく value_drops に載る
+# ため、往復検証の対象（前提を満たすファイル）から外れる。
+services:
+  gpu:
+    image: example.invalid/gpu:1
+    devices: ["/dev/dri:/dev/dri"]

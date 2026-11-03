@@ -1,0 +1,84 @@
+//! `fandhe-container-plugin-microvm` バイナリの入口（TASK-117.1・#710。PLUG-1・PLUG-12・MVM-1）。
+//!
+//! 呼び出し元: core 側 plugin proxy（#1869 の設計）が検証済みの起動対象経由で spawn し、`env_clear()` 後に
+//! `PLUGIN_SOCKET_ENV` のみ渡す想定（起動経路は未結線。lib の doc 参照）。役割は argv / 環境変数を lib の
+//! `resolve_startup` へ渡し、core が bind 済みの UDS へ `UdsStream::connect`（peer credential 検証つき。PLUG-12）で
+//! 接続して `frame_loop::serve` で要求を `adapter::MicrovmRuntimeAdapter` へ渡し、結果を終了コードへ写すこと。
+//! plugin 側に bind / listen は持たない。
+//!
+//! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（機械可読な code と固定文言。REPAIR-4）を出す。
+//! 終了コード: 0 = 相手の正常切断、1 = その他の起動失敗、2 = `InvalidArgument`（起動引数・パス）、
+//! 3 = 接続失敗（別 UID の listener による `PERMISSION_DENIED` を含む）、4 = フレームループの異常終了。
+//! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データ・peer 拒否イベント行を含めない。
+//! 終了時は実行中の microVM を `stop_all` で期限つきに止める（TASK-117.2・#711）。
+//! SIGTERM でのグレースフルシャットダウンは未実装（REPAIR-3）。
+
+use std::process::ExitCode;
+use std::time::Duration;
+
+use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode, UdsStream};
+use fandhe_container_plugin_microvm::adapter::{
+    MicrovmRuntimeAdapter, STOP_ALL_BUDGET, default_backend,
+};
+use fandhe_container_plugin_microvm::frame_loop::{LoopExit, serve};
+use fandhe_container_plugin_microvm::{PLUGIN_SOCKET_ENV, default_socket_path, resolve_startup};
+
+/// `InvalidArgument` の終了コード。
+const EXIT_INVALID_ARGUMENT: u8 = 2;
+/// その他の起動失敗の終了コード。
+const EXIT_FAILURE: u8 = 1;
+/// 接続失敗の終了コード。
+const EXIT_CONNECT_FAILED: u8 = 3;
+/// フレームループ異常終了の終了コード。
+const EXIT_LOOP_FAILED: u8 = 4;
+
+/// 接続期限（core の常駐起動期限より短くする。REPAIR-5）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn report(e: &PluginError) {
+    eprintln!("error: {}: {}", e.code().as_str(), e.message());
+}
+
+fn main() -> ExitCode {
+    let args = std::env::args_os().skip(1);
+    let env_socket = std::env::var_os(PLUGIN_SOCKET_ENV);
+    let cfg = match resolve_startup(args, env_socket, default_socket_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            report(&e);
+            return if e.code() == PluginErrorCode::InvalidArgument {
+                ExitCode::from(EXIT_INVALID_ARGUMENT)
+            } else {
+                ExitCode::from(EXIT_FAILURE)
+            };
+        }
+    };
+    let mut observer = JsonLinesPeerAuthObserver::new();
+    let mut stream = match UdsStream::connect(cfg.socket_path(), CONNECT_TIMEOUT, &mut observer) {
+        Ok(s) => s,
+        Err(e) => {
+            // 拒否イベント行は socket パスを含むため転記しない。
+            report(&e);
+            return ExitCode::from(EXIT_CONNECT_FAILED);
+        }
+    };
+    let mut adapter = MicrovmRuntimeAdapter::new(default_backend());
+    let outcome = serve(&mut stream, &mut adapter);
+    // 接続終了時に実行中 VM を期限つきで止める（drop 任せだと 1 台あたり最大 5 秒待つため。REPAIR-5）。
+    let stop_report = adapter.stop_all(STOP_ALL_BUDGET);
+    if stop_report.remaining > 0 || stop_report.failed > 0 {
+        eprintln!(
+            "level=warn op=plugin.microvm.stop_all stopped={} failed={} remaining={}",
+            stop_report.stopped, stop_report.failed, stop_report.remaining
+        );
+    }
+    match outcome {
+        Ok(LoopExit::PeerClosed) => ExitCode::SUCCESS,
+        Err(e) => {
+            report(&e);
+            ExitCode::from(EXIT_LOOP_FAILED)
+        }
+        // `LoopExit` は non_exhaustive のため将来の要因は成功扱いにせず異常終了にする。
+        Ok(_) => ExitCode::from(EXIT_LOOP_FAILED),
+    }
+}

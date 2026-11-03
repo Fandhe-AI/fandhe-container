@@ -4,7 +4,7 @@ crate 境界・依存方向・実装コードを持たない確定済み設計�
 
 - 作成日: 2026-09-27
 - 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）・#707（TASK-78.2）・#4（microVM のバックエンドの配置。2026-11-03 オーナー決定。TASK-192 の配置の前提）
-- ステータス: #24（TASK-6.h1）で内容レビュー承認待ち
+- ステータス: 初版（crate 境界・依存関係グラフ・core/plugin 境界表）は #24（TASK-6.h1）でオーナーの内容レビューの承認を得た（2026-09-27 close）。以降に追記した節（WIN-6・MVM-5 等）は、各節に記した issue・PR のレビューに従う
 - 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6・MVM-5
 - 対象マイルストーン: MS-0（「microVM の 3 OS 展開方針（MVM-5）」節は MS-7・TASK-78）
 
@@ -287,6 +287,7 @@ microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）
 | WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
 | MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-shared-vm.md](design/macos-shared-vm.md)（TASK-191 の未決事項の設計案。承認待ち #1906）・[macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。#370〔TASK-66.h1〕で確認済み・2026-10-12。既定方式の実装は TASK-191〔#1905・#1906〕） |
 | REPAIR-1・REPAIR-4・MAC-1 のログ回転の共通化 | supervisor の `RotatingFileSink` と platform-macos のコンソールログ回転は共通化せず 2 か所に置く（オーナー決定ではなく現状維持の判断。再評価条件あり） | REPAIR 系・MAC-1・SUP-7 の各ビヘイビア | [rotating-log-sharing.md](design/rotating-log-sharing.md)（#2172） |
+| REPAIR-1・PLUG-4 の frame_loop の置き場所 | plugin-macos・plugin-windows・plugin-microvm の受信ループは既存の `crates/plugin` に共通化する（案 a。2026-11-03 オーナー決定。共通化できない部分は案 c） | REPAIR-1・PLUG-1・PLUG-4・OSS-3 | [plugin-frame-loop-sharing.md](design/plugin-frame-loop-sharing.md)（#3772・[#3773](https://github.com/Fandhe-AI/fandhe-container/issues/3773#issuecomment-6595749900)） |
 | MVM-1・MVM-4 のゲスト物理メモリアクセス型の所有先 | アクセス型は TASK-74.1 側（OS 非依存・コピー API・heap backing で試験）、mmap と KVM 登録は TASK-75.1 側（オーナー決定ではなく Agent の記録した判断。再評価条件あり） | MVM-1・MVM-4 | [microvm-memory-ownership.md](design/microvm-memory-ownership.md)（#876） |
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書「microVM の 3 OS 展開方針（MVM-5）」節を参照（TASK-78・#705・#706・#707） |
 | MVM-5・WIN-6 のバックエンドの配置 | microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）は `crates/microvm` の中に `cfg` で置き、`plugin-microvm` が動かす。FFI は `sys`。新しい crate は作らない | `api-microvm.md`・`api-platform-windows.md` | 本書「バックエンドの配置（2026-11-03 決定）」節と [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)（2026-11-03 オーナー決定。Hypervisor.framework への適用は Agent の判断） |

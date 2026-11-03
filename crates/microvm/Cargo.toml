@@ -6,6 +6,7 @@
 # TASK-75.4.1 で microvm に start / stop（vCPU 実行ループ）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.4.2 で起動失敗時の後始末の検証と ERR-1 の TIMEOUT 表記を追加（依存・feature は変えない。unsafe なし）。
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
+# TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # TASK-74.2.1 で virtio_mmio（OS 非依存の共通トランスポート）を追加（依存は増やさない。unsafe なし）。
@@ -20,9 +21,14 @@
 # TASK-75.3.1 で boot_x86（カーネル・initrd のゲストメモリへのロード）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.5 の #3739 で uart（8250 / 16550 互換の UART のレジスタモデル）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.3.2 で vCPU のレジスタ初期化（KVM_GET/SET_REGS・KVM_GET/SET_SREGS・boot_x86 の GDT・ページテーブル）を追加（依存は増やさない。unsafe は sys.rs のみ）。
+# #3734 で x86_64 の起動用 MSR・FPU の設定（boot_x86 の表と VcpuFd の set_msrs / msrs / set_fpu / fpu）を追加（依存は増やさない。unsafe 追加なし）。
 # #3769 で RunRecord に値つき exit の記録（opt-in・上限つき）と BoundedRunLog を追加（依存は増やさない。unsafe なし）。
 # #3731 で x86_64 の CPUID・MSR・FPU・LAPIC・TSS / identity map の ioctl ラッパーを追加（依存は増やさない。unsafe は sys.rs のみ）。
 # #3732 で TSS / identity map のアドレス選択と assemble での重なり検証を追加（依存は増やさない。unsafe なし）。
+# TASK-192.5・#3784 で fdt（FDT の組み立て器。OS 非依存）を追加（依存は増やさない。unsafe なし）。
+# #3783（TASK-192.1）で src/sys/hvf.rs・hvf_abi・hvf を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3787（TASK-192.4）で hvf/memory.rs とゲスト RAM のコピー API を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

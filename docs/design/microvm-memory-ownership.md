@@ -31,7 +31,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 ### backing は TASK-75.1（#696）が持つ
 
 - 匿名 mmap（フラグの選択は #696 で決める）・`KVM_SET_USER_MEMORY_REGION` による登録・munmap と Drop の後始末
-- `unsafe` は `crates/microvm/src/sys.rs` に閉じる（coding-rust の事前承認の範囲。SAFETY コメントと security-auditor 観点のレビューは #696 の PR で行う）
+- `unsafe` は `crates/microvm/src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS。TASK-192.1・#3783）に閉じる（coding-rust の事前承認の範囲。SAFETY コメントと security-auditor 観点のレビューは #696 の PR で行う）
 - アクセス型へは安全なコンストラクタ経由で渡し、アクセス型の API は変えない
 
 ## 理由
@@ -91,3 +91,13 @@ backing（匿名 mmap・`KVM_SET_USER_MEMORY_REGION` 登録・munmap と Drop �
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。性能（ブロック I/O のバッチ化）は後続の課題
 - 置き換えなかったもの: #882 の自己診断用 `GuestPage` / `RegisteredPage` と `probe_*` は残している（置き換えは任意の後続作業）
 - 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会・hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`
+
+## TASK-192.4（#3787）での macOS の実装記録
+
+backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な API。`HvfGuestRam`・`RegisteredHvfRam`）と `src/sys/hvf.rs`（`HostMapping`・`GuestMapping` の mmap・`hv_vm_map` / `hv_vm_unmap`・volatile のコピー）。アクセス型（`guest_memory.rs`）の API は変えていない（MVM-5・MVM-1）。
+
+- mmap のフラグ: `MAP_ANON | MAP_PRIVATE`（`MAP_NORESERVE`・`MADV_DONTFORK` は使わない）。RWX で `hv_vm_map` する
+- 寿命: `RegisteredHvfRam<'vm>` は `&'vm HvVm` を借用するため `HvVm` より先に drop される。drop は `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。構成体（#3797）が `HvVm` をどう持つかはその issue の担当
+- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ
+- IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は暫定で、レイアウトの確定は #3788、SDK・実機での照合は #3803
+- 範囲外: 複数領域・`hv_vm_protect` の利用・`Send` / `Sync`（#3797・#3798）・解除失敗の構造化ログ

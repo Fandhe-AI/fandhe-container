@@ -44,7 +44,7 @@ fandhe-container/
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
-│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin）
+│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin。plugin 側の共通受信ループ `frame_loop` を含む。#3774・#3773。plugin-microvm・plugin-windows が利用済み〔#3776〕）
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp
@@ -131,6 +131,7 @@ fandhe-container/
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-options-delivery.md  # 起動オプション（ulimit・env・label ほか）の CLI から supervisor への受け渡し（状態ルート配下の 0600 の文書 `FCOPT1`・経路・却下案・残余。#2713・SUP-12・CLI-1・SEC-1）
 │   │   ├── rotating-log-sharing.md  # supervisor の RotatingFileSink と platform-macos のコンソールログ回転を共通化しない判断の記録（置き場所の候補・依存方向・検査の差・再評価条件。#2172・REPAIR-1・REPAIR-4・MAC-1）
+│   │   ├── plugin-frame-loop-sharing.md  # plugin-macos・plugin-windows・plugin-microvm の frame_loop の差分表と置き場所の判断記録（案 a: crates/plugin を採用。2026-11-03 オーナー決定・#3773。共通化できない部分は案 c。#3772・REPAIR-1・PLUG-4）
 │   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測・`RemoveContainer` の全体の上限と kubelet の期限（#2634・#3027・#3142・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）

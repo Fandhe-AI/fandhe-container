@@ -19,7 +19,8 @@
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
-//! 観測用の [`VcpuFd::regs`] を足した（CPUID・MSR・FPU・LAPIC の設定は未実装。REPAIR-3）。
+//! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
+//! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する [`VcpuFd::set_boot_lints`] と観測用の [`VcpuFd::lapic_lints`] を足した。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
@@ -44,7 +45,10 @@ use std::time::{Duration, Instant};
 
 use crate::boot_x86::BootCpuState;
 #[cfg(target_arch = "x86_64")]
-use crate::boot_x86::{SegmentDescriptor, X86Regs};
+use crate::boot_x86::{SegmentDescriptor, X86FpuState, X86MsrEntry, X86Regs};
+use crate::cpuid_x86::CpuidTable;
+#[cfg(target_arch = "x86_64")]
+use crate::cpuid_x86::{CpuidEntry, MAX_CPUID_ENTRIES};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, ExitValue, VcpuExit};
@@ -63,6 +67,7 @@ const ENOEXEC: i32 = 8;
 const EAGAIN: i32 = 11;
 const EINTR: i32 = 4;
 const EINVAL: i32 = 22;
+const E2BIG: i32 = 7;
 const EACCES: i32 = 13;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
@@ -413,7 +418,8 @@ impl VcpuFd {
     /// だけを `state` で上書きして `KVM_SET_SREGS`、続けて `KVM_SET_REGS` で汎用レジスタを設定する。`tr`・`ldt`・`cr2`・`cr8`・
     /// `apic_base`・`interrupt_bitmap` は読んだ値のまま保つ。最初の [`VcpuFd::run_once`] より前に、BSP（vCPU 0）にだけ呼ぶ。
     /// GDT・ページテーブルなど `state` が指すゲストメモリの内容は呼び出し側が先に書く（`boot_x86::write_boot_tables`）。
-    /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID・MSR・FPU の設定は範囲外（REPAIR-3）。
+    /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID は [`VcpuFd::set_cpuid`]、MSR・FPU は [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`]
+    /// （`MicroVm::setup_boot_vcpu` が続けて呼ぶ）で別に設定する。LAPIC の LINT は [`VcpuFd::set_boot_lints`]（#3735）。
     #[cfg(target_arch = "x86_64")]
     pub fn set_boot_state(&mut self, state: &BootCpuState) -> Result<(), MicrovmError> {
         let fd = self.fd.as_fd();
@@ -479,6 +485,113 @@ impl VcpuFd {
         sys::kvm_set_regs(fd, &regs).map_err(|e| classify_vcpu_error(VcpuStage::SetRegs, e))
     }
 
+    /// MSR を `KVM_SET_MSRS` で書く（#3734・MVM-1。x86_64 のみ）。`MicroVm::setup_boot_vcpu` が [`crate::boot_x86::boot_msrs`] を渡す。
+    ///
+    /// 255 件超は確保の前に `InvalidArgument`。カーネルは途中の MSR で止まると処理できた件数だけを返し errno を出さないため、
+    /// 件数が要求と食い違えば `FailedPrecondition` にする（一部だけ設定された状態を成功にしない）。message に MSR の値は載せない（ERR-1）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_msrs(&mut self, entries: &[X86MsrEntry]) -> Result<(), MicrovmError> {
+        check_msr_count(entries.len())?;
+        let raw: Vec<sys::KvmMsrEntry> = entries
+            .iter()
+            .map(|e| sys::KvmMsrEntry {
+                index: e.index,
+                reserved: 0,
+                data: e.data,
+            })
+            .collect();
+        let n = sys::kvm_set_msrs(self.fd.as_fd(), &raw)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetMsrs, e))?;
+        check_msr_done("KVM_SET_MSRS", n, raw.len())
+    }
+
+    /// `indices` の MSR を `KVM_GET_MSRS` で読む（観測用。#3734・MVM-1。x86_64 のみ）。件数の扱いは [`VcpuFd::set_msrs`] と同じ。
+    #[cfg(target_arch = "x86_64")]
+    pub fn msrs(&self, indices: &[u32]) -> Result<Vec<X86MsrEntry>, MicrovmError> {
+        check_msr_count(indices.len())?;
+        let mut raw: Vec<sys::KvmMsrEntry> = indices
+            .iter()
+            .map(|&index| sys::KvmMsrEntry {
+                index,
+                reserved: 0,
+                data: 0,
+            })
+            .collect();
+        let n = sys::kvm_get_msrs(self.fd.as_fd(), &mut raw)
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetMsrs, e))?;
+        check_msr_done("KVM_GET_MSRS", n, raw.len())?;
+        Ok(raw
+            .iter()
+            .map(|e| X86MsrEntry::new(e.index, e.data))
+            .collect())
+    }
+
+    /// FPU 状態を `KVM_SET_FPU` で書く（#3734・MVM-1。x86_64 のみ）。`fpr`・`xmm` は 0。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_fpu(&mut self, fpu: &X86FpuState) -> Result<(), MicrovmError> {
+        let raw = sys::KvmFpu {
+            fcw: fpu.fcw,
+            fsw: fpu.fsw,
+            ftwx: fpu.ftwx,
+            last_opcode: fpu.last_opcode,
+            last_ip: fpu.last_ip,
+            last_dp: fpu.last_dp,
+            mxcsr: fpu.mxcsr,
+            ..sys::KvmFpu::default()
+        };
+        sys::kvm_set_fpu(self.fd.as_fd(), &raw)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetFpu, e))
+    }
+
+    /// FPU 状態を `KVM_GET_FPU` で読む（観測用。#3734・MVM-1。x86_64 のみ）。`fpr`・`xmm` は捨てる。
+    #[cfg(target_arch = "x86_64")]
+    pub fn fpu(&self) -> Result<X86FpuState, MicrovmError> {
+        let r = sys::kvm_get_fpu(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetFpu, e))?;
+        Ok(X86FpuState {
+            fcw: r.fcw,
+            fsw: r.fsw,
+            ftwx: r.ftwx,
+            last_opcode: r.last_opcode,
+            last_ip: r.last_ip,
+            last_dp: r.last_dp,
+            mxcsr: r.mxcsr,
+        })
+    }
+
+    /// vCPU の CPUID を設定する（`KVM_SET_CPUID2`。#3733・MVM-1。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// 最初の [`VcpuFd::run_once`] と `set_boot_state` より前に呼ぶ（`microvm::MicroVm::assemble` が vCPU 作成直後に呼ぶ）。
+    /// 表は `CpuidTable::for_vcpu` で vCPU ごとに調整したものを渡す。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_cpuid(&mut self, table: &CpuidTable) -> Result<(), MicrovmError> {
+        let entries: Vec<sys::KvmCpuidEntry2> = table
+            .entries()
+            .iter()
+            .map(|e| sys::KvmCpuidEntry2 {
+                function: e.function,
+                index: e.index,
+                flags: e.flags,
+                eax: e.eax,
+                ebx: e.ebx,
+                ecx: e.ecx,
+                edx: e.edx,
+                padding: [0; 3],
+            })
+            .collect();
+        sys::kvm_set_cpuid2(self.fd.as_fd(), &entries)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetCpuid, e))
+    }
+
+    /// x86_64 以外では CPUID の設定は未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn set_cpuid(&mut self, _table: &CpuidTable) -> Result<(), MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "CPUID setup is only implemented for x86_64",
+        ))
+    }
+
     /// x86_64 以外では起動時のレジスタ初期化は未実装（aarch64 は FDT・PSTATE・X0 が要る。REPAIR-3）。
     #[cfg(not(target_arch = "x86_64"))]
     pub fn set_boot_state(&mut self, _state: &BootCpuState) -> Result<(), MicrovmError> {
@@ -516,6 +629,71 @@ impl VcpuFd {
             rip: r.rip,
             rflags: r.rflags,
         })
+    }
+
+    /// BSP の LAPIC の LVT LINT0 を ExtINT、LINT1 を NMI（ともにマスク解除）にして `KVM_SET_LAPIC` で書き戻す（#3735・MVM-1。
+    /// x86_64 のみ）。設定後の LINT の値を返す。
+    ///
+    /// `MicroVm::setup_boot_vcpu` が全 vCPU に呼ぶ（BSP と同じ経路。#3737）。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
+    /// マスクも解除する理由は `lapic_x86` モジュールを参照。in-kernel irqchip が前提で、無い VM では `FailedPrecondition`。
+    /// AP にも同じ値を書けるが、INIT で LVT がマスクへ戻るため設定が残るのは INIT までである（#3737）。
+    /// エラー message にレジスタ値は載せない（ERR-1）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_boot_lints(&mut self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
+        let fd = self.fd.as_fd();
+        let mut state =
+            sys::kvm_get_lapic(fd).map_err(|e| classify_vcpu_error(VcpuStage::GetLapic, e))?;
+        let lints = crate::lapic_x86::apply_boot_lints(&mut state.regs)?;
+        sys::kvm_set_lapic(fd, &state).map_err(|e| classify_vcpu_error(VcpuStage::SetLapic, e))?;
+        Ok(lints)
+    }
+
+    /// LAPIC の LVT LINT0 / LINT1 の現在値を読む（観測用。#3735。x86_64 のみ）。
+    ///
+    /// [`VcpuFd::regs`] と同じく `&self` で、`run_once`（`&mut self`）とは借用規則で排他される。
+    #[cfg(target_arch = "x86_64")]
+    pub fn lapic_lints(&self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
+        let state = sys::kvm_get_lapic(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetLapic, e))?;
+        crate::lapic_x86::LapicLints::from_regs(&state.regs).ok_or_else(|| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "LAPIC register page is too short for LVT LINT0/LINT1",
+            )
+        })
+    }
+
+    /// vCPU の MP 状態を読む（`KVM_GET_MP_STATE`。#3737・MVM-1。x86_64 のみ）。AP は作成直後 `Uninitialized`。
+    ///
+    /// `&self` のため `run_once`（`&mut self`）とは借用規則で排他される。in-kernel LAPIC では保留中の INIT/SIPI を先に処理する。
+    #[cfg(target_arch = "x86_64")]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        let st = sys::kvm_get_mp_state(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetMpState, e))?;
+        Ok(crate::smp_x86::MpState::from_raw(st.mp_state))
+    }
+
+    /// vCPU の MP 状態を設定する（`KVM_SET_MP_STATE`。#3737。x86_64 のみ）。`MicroVm::assemble` が AP を明示的に
+    /// `Uninitialized` にするために呼ぶ。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_mp_state(
+        &mut self,
+        state: crate::smp_x86::MpState,
+    ) -> Result<(), MicrovmError> {
+        let st = sys::KvmMpState {
+            mp_state: state.as_raw(),
+        };
+        sys::kvm_set_mp_state(self.fd.as_fd(), &st)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetMpState, e))
+    }
+
+    /// x86_64 以外では MP 状態の読み取りは未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "MP state is only implemented for x86_64",
+        ))
     }
 
     /// 累積の実行統計。
@@ -721,7 +899,7 @@ impl VcpuFd {
 /// `run_bounded` の `with_current_thread` の中で生きている監視スレッドだけで、そのスレッドは `KVM_RUN` 1 回分の間だけ生き、
 /// join されてから `with_current_thread` が戻る。したがって vCPU スレッドが終わった後に `request` が呼ばれても
 /// `pthread_kill` は発行されず、終了したスレッドへの送信も tid の再利用も構造上起きない。
-/// 複数の vCPU が同じ信号を共有できる（run ごとの完了状態は共有せず、`run_bounded` のローカルに置く。#3738 向け）。
+/// 全 vCPU スレッドが同じ信号を共有する（#3738。run ごとの完了状態は共有せず、`run_bounded` のローカルに置く）。
 #[derive(Debug, Default)]
 pub(crate) struct StopSignal {
     requested: Mutex<bool>,
@@ -814,6 +992,30 @@ impl AsFd for VcpuFd {
     }
 }
 
+/// MSR の件数を確保の前に検証する（`sys::consts::MAX_MSR_ENTRIES` と同じ 255 件が上限）。
+#[cfg(target_arch = "x86_64")]
+fn check_msr_count(len: usize) -> Result<(), MicrovmError> {
+    if len > sys::consts::MAX_MSR_ENTRIES {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "too many MSR entries",
+        ));
+    }
+    Ok(())
+}
+
+/// カーネルが処理できた MSR の件数が要求と一致するかを確かめる（一部だけ受理された場合は失敗）。
+#[cfg(target_arch = "x86_64")]
+fn check_msr_done(name: &str, done: usize, requested: usize) -> Result<(), MicrovmError> {
+    if done == requested {
+        return Ok(());
+    }
+    Err(MicrovmError::new(
+        MicrovmErrorCode::FailedPrecondition,
+        format!("{name} accepted {done} of {requested} entries"),
+    ))
+}
+
 /// vCPU 作成の段（errno 分類のメッセージ切り替え用）。`PreferredTarget`・`VcpuInit` は aarch64 だけが使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -827,6 +1029,24 @@ enum VcpuStage {
     GetSregs,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetSregs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetMsrs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetMsrs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetFpu,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetFpu,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetLapic,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetLapic,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetCpuid,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetMpState,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetMpState,
     PreferredTarget,
     VcpuInit,
     Mmap,
@@ -842,11 +1062,29 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::SetRegs => "KVM_SET_REGS",
         VcpuStage::GetSregs => "KVM_GET_SREGS",
         VcpuStage::SetSregs => "KVM_SET_SREGS",
+        VcpuStage::GetMsrs => "KVM_GET_MSRS",
+        VcpuStage::SetMsrs => "KVM_SET_MSRS",
+        VcpuStage::GetFpu => "KVM_GET_FPU",
+        VcpuStage::SetFpu => "KVM_SET_FPU",
+        VcpuStage::GetLapic => "KVM_GET_LAPIC",
+        VcpuStage::SetLapic => "KVM_SET_LAPIC",
+        VcpuStage::SetCpuid => "KVM_SET_CPUID2",
+        VcpuStage::GetMpState => "KVM_GET_MP_STATE",
+        VcpuStage::SetMpState => "KVM_SET_MP_STATE",
     };
     let registers = matches!(
         stage,
-        VcpuStage::GetRegs | VcpuStage::SetRegs | VcpuStage::GetSregs | VcpuStage::SetSregs
+        VcpuStage::GetRegs
+            | VcpuStage::SetRegs
+            | VcpuStage::GetSregs
+            | VcpuStage::SetSregs
+            | VcpuStage::GetMsrs
+            | VcpuStage::SetMsrs
+            | VcpuStage::GetFpu
+            | VcpuStage::SetFpu
+            | VcpuStage::SetLapic
     );
+    let msrs = matches!(stage, VcpuStage::GetMsrs | VcpuStage::SetMsrs);
     match e {
         SysError::Unsupported => MicrovmError::new(
             MicrovmErrorCode::Unimplemented,
@@ -855,11 +1093,27 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         SysError::Os(EINVAL) if stage == VcpuStage::Create => {
             MicrovmError::new(MicrovmErrorCode::InvalidArgument, "invalid vCPU id")
         }
+        // in-kernel irqchip が無い VM の LAPIC 読み取り（BSP の LINT 設定の前提違反）。
+        SysError::Os(EINVAL) if stage == VcpuStage::GetLapic => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_GET_LAPIC requires an in-kernel irqchip",
+        ),
         // レジスタ値の拒否。値・アドレスは message に載せない（ERR-1）。
         SysError::Os(EINVAL) if registers => MicrovmError::new(
             MicrovmErrorCode::InvalidArgument,
             "KVM rejected the vCPU registers",
         ),
+        SysError::Os(E2BIG) if msrs => {
+            MicrovmError::new(MicrovmErrorCode::InvalidArgument, "too many MSR entries")
+        }
+        // CPUID の拒否（実行開始後の変更を含む）。値は message に載せない（ERR-1）。
+        SysError::Os(EINVAL) if stage == VcpuStage::SetCpuid => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM rejected the CPUID table (it must be set before the vCPU runs)",
+        ),
+        SysError::Os(E2BIG) if stage == VcpuStage::SetCpuid => {
+            MicrovmError::new(MicrovmErrorCode::InvalidArgument, "too many CPUID entries")
+        }
         SysError::Os(EEXIST) => {
             MicrovmError::new(MicrovmErrorCode::AlreadyExists, "vCPU id already exists")
         }
@@ -1168,6 +1422,64 @@ fn classify_create_vm_error(e: SysError) -> MicrovmError {
 }
 
 impl KvmDevice {
+    /// ホストが提供できる CPUID の表を読む（`KVM_GET_SUPPORTED_CPUID`。#3733・MVM-1。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// 件数の上限は `KVM_MAX_CPUID_ENTRIES`（256）で 1 回だけ要求し、E2BIG でも広げて再試行しない（fail-closed。
+    /// バッファは約 10 KB でカーネル側の上限も同じ 256 のため、ループを持たない）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_cpuid(&self) -> Result<CpuidTable, MicrovmError> {
+        const _: () = assert!(MAX_CPUID_ENTRIES == sys::consts::MAX_CPUID_ENTRIES);
+        let raw = sys::kvm_get_supported_cpuid(self.fd.as_fd(), MAX_CPUID_ENTRIES).map_err(
+            |e| match e {
+                SysError::Unsupported => MicrovmError::new(
+                    MicrovmErrorCode::Unimplemented,
+                    "KVM is not supported on this architecture",
+                ),
+                SysError::Os(ENOTTY) => {
+                    MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM system fd")
+                }
+                SysError::Os(E2BIG) => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_GET_SUPPORTED_CPUID exceeds the 256 entry limit",
+                ),
+                SysError::Os(ENOMEM) => MicrovmError::new(
+                    MicrovmErrorCode::ResourceExhausted,
+                    "resource exhausted reading supported CPUID",
+                ),
+                SysError::NullMapping => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_GET_SUPPORTED_CPUID failed (unexpected null mapping)",
+                ),
+                SysError::Os(n) => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    format!("KVM_GET_SUPPORTED_CPUID failed (os error {n})"),
+                ),
+            },
+        )?;
+        CpuidTable::new(
+            raw.iter()
+                .map(|e| CpuidEntry {
+                    function: e.function,
+                    index: e.index,
+                    flags: e.flags,
+                    eax: e.eax,
+                    ebx: e.ebx,
+                    ecx: e.ecx,
+                    edx: e.edx,
+                })
+                .collect(),
+        )
+    }
+
+    /// x86_64 以外では CPUID の取得は未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn supported_cpuid(&self) -> Result<CpuidTable, MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "CPUID setup is only implemented for x86_64",
+        ))
+    }
+
     /// `/dev/kvm` を開き、KVM API 版数が 12 であることを確かめる。
     pub fn open() -> Result<KvmDevice, MicrovmError> {
         Self::open_at(Path::new(KVM_PATH))
@@ -2355,5 +2667,40 @@ mod tests {
         assert_eq!(m.message(), "KVM_ARM_VCPU_INIT failed (os error 5)");
         let m = c(VcpuStage::Create, SysError::Os(5));
         assert_eq!(m.message(), "KVM_CREATE_VCPU failed (os error 5)");
+    }
+
+    /// MVM-1・#3734: MSR・FPU 系の errno 分類と件数照合。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_3734_msr_fpu_classify_and_count() {
+        let c = classify_vcpu_error;
+        for st in [VcpuStage::GetMsrs, VcpuStage::SetMsrs] {
+            let m = c(st, SysError::Os(E2BIG));
+            assert_eq!(m.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(m.message(), "too many MSR entries");
+        }
+        for st in [
+            VcpuStage::GetMsrs,
+            VcpuStage::SetMsrs,
+            VcpuStage::GetFpu,
+            VcpuStage::SetFpu,
+        ] {
+            let m = c(st, SysError::Os(EINVAL));
+            assert_eq!(m.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(m.message(), "KVM rejected the vCPU registers");
+        }
+        assert_eq!(
+            c(VcpuStage::SetFpu, SysError::Os(5)).message(),
+            "KVM_SET_FPU failed (os error 5)"
+        );
+        assert!(check_msr_count(255).is_ok());
+        assert_eq!(
+            check_msr_count(256).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        assert!(check_msr_done("KVM_SET_MSRS", 3, 3).is_ok());
+        let e = check_msr_done("KVM_SET_MSRS", 2, 3).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "KVM_SET_MSRS accepted 2 of 3 entries");
     }
 }

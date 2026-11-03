@@ -1,5 +1,9 @@
 //! fandhe-container-microvm: KVM 直接制御・最小 virtio デバイスモデル（Linux オプション）。
 //!
+//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM だけで、先行して進める。macOS（Hypervisor.framework。TASK-192）と
+//! Windows（WHP。将来オプションで MVP には実装しない）の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
+//! 2026-11-03 決定）は、`docs/architecture.md` の「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
+//!
 //! 実装済み（TASK-74.1.1・MVM-1。Linux のみ）: `/dev/kvm` のオープン・API 版数 12 の確認・`KVM_CREATE_VM` による
 //! VM fd の取得（`error` は OS 非依存、`device` は Linux 限定）、TASK-74.1.2・MVM-1: `KVM_CREATE_VCPU` による
 //! vCPU fd の取得（x86_64・aarch64。aarch64 は初期化 ioctl も発行するが型検査のみで実行は未検証）。
@@ -30,10 +34,20 @@
 //! TASK-75.4.2・#887・MVM-1・ERR-1: 起動途中の失敗でも取得済みの fd・mmap・irqfd を解放し、エラーは `error::MicrovmError`（`<CODE>: <message>`）で返す（期限切れの文字列表現は `TIMEOUT`。`unsafe` 追加なし）。
 //! #3744・MVM-1・REPAIR-5: 停止の期限切れで切り離した vCPU スレッドの終了を期限つきで観測する `microvm::VcpuExitWatch`（`RunningMicroVm::exit_watch`。`unsafe` なし）。
 //! TASK-75.5・#3739・MVM-1: 8250 / 16550 互換の最小 UART のレジスタモデル（`uart`。OS 非依存・`unsafe` なし。IRQ は出さない）。
+//! #3734・MVM-1: 起動用の MSR・FPU の設定（`boot_x86::boot_msrs`・`X86FpuState`・`device::VcpuFd::{set_msrs, msrs, set_fpu, fpu}`。`unsafe` 追加なし）。
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
+//! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
+//! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
+//! TASK-192.8・#3785・MVM-5: arm64 の ESR（例外 syndrome）の復号（`esr`。OS 非依存・`unsafe` なし）。
+//! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
+//! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
+//! TASK-192.2・#3786・MVM-5: vCPU・レジスタ・exit・vtimer（`hvf_abi` の `HvReg`・`HvSysReg`・`HvVcpuExit`・`decode_exit`。
+//! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
+//! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
+//! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・CPUID / MSR / FPU / LAPIC の設定と AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動（#3738。REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）
@@ -43,25 +57,38 @@
 //!   （`KVM_RUN` の期限切れで vCPU スレッドを中断するため）。組み込むプロセスは `SIGUSR2` を他の用途に使わないこと。
 //!   既に別の handler や SIG_IGN があるときは上書きせず `FailedPrecondition`（EBUSY）で失敗する。
 //!
-//! `unsafe` は `src/sys.rs` に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
+//! `unsafe` は `src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS）に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
 //! 機械的に担保する（REPAIR-9・TASK-74.5）。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
+//! TASK-192.4・#3787・MVM-5・MVM-1: macOS のゲスト RAM（`hvf::memory`。匿名 mmap と `hv_vm_map` による対応付け。unsafe は sys/hvf.rs のみ）。
 
 #![deny(unsafe_code)]
 
 pub mod boot_x86;
+pub mod cpuid_x86;
 #[cfg(target_os = "linux")]
 pub mod device;
 pub mod dispatch;
 pub mod error;
+pub mod esr;
 pub mod exit;
+pub mod fdt;
 pub mod guest_memory;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf;
+pub mod hvf_abi;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
+pub mod lapic_x86;
 #[cfg(target_os = "linux")]
 pub mod microvm;
+pub mod smp_x86;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
+mod sys;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+#[path = "sys/hvf.rs"]
 mod sys;
 pub mod uart;
 pub mod virtio_block;

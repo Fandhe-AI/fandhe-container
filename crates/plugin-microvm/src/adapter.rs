@@ -23,6 +23,7 @@
 //! # 入力検証と資源
 //! 要素数 → id → 重複・上限 → 数値 → パス → イメージ読み込み → backend の順で fail-closed に検証する。エラー文言は固定で、
 //! id・パス・cmdline・I/O エラー文言を反射しない。イメージは symlink・非通常ファイルを拒否し、上限を読む前に判定する。
+//! unix では `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、祖先の symlink も拒否する（SEC-1。#3748）。
 //! 同時 VM 数は [`MAX_VMS`] で抑える。停止は [`STOP_DEADLINE`]（RPC 期限より短い。REPAIR-5）。
 //!
 //! # 注意・残余（REPAIR-3）
@@ -38,7 +39,9 @@
 //! - イメージ読み込みは別スレッドで走らせ [`IMAGE_READ_DEADLINE`] で `TIMEOUT` にする（REPAIR-5）。期限切れのスレッドは取り消せず、
 //!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
 //!   `RESOURCE_EXHAUSTED` になる。
-//! - 祖先ディレクトリの symlink は検査しない（最終要素のみ）。
+//! - 呼び出し側は symlink を含まないパスを渡す
+//!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
+//!   Windows は祖先を検査しない（reparse point は未検査。非 Linux の backend は `start` が `UNIMPLEMENTED` で VM は起動しない）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
 
 use std::collections::BTreeMap;
@@ -109,6 +112,20 @@ const MSG_NOT_FOUND: &str = "microVM not found";
 const MSG_NOT_REGULAR: &str = "image must be a regular file";
 const MSG_TOO_LARGE: &str = "image too large";
 const MSG_READ_FAILED: &str = "failed to read image";
+/// 祖先が symlink または非ディレクトリ（SEC-1。#3748）。パスは載せない。
+#[cfg(unix)]
+const MSG_BAD_ANCESTOR: &str = "image path ancestor must be a real directory";
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))
+))]
+const MSG_UNSUPPORTED_VERIFY: &str = "image path verification is not supported on this platform";
 
 /// 起動に必要な検証済みの値（読み込み済みイメージを持ち、パスは含まない）。
 #[derive(Debug)]
@@ -350,7 +367,8 @@ enum ImageKind {
 
 /// イメージを読む。symlink・非通常ファイルを拒否し、上限は読む前（metadata）と読み込み中（`take`）で二重に判定する。
 ///
-/// lstat と open の間の差し替えは unix で dev / ino の照合により検出する。祖先ディレクトリの symlink は検査しない（残余）。
+/// lstat と open の間の差し替えは unix で dev / ino の照合により検出する。unix では `/` から要素ごとに
+/// `O_NOFOLLOW` で辿って祖先の symlink を拒否し（`sys::open_regular_nofollow`。#3748）、Windows は祖先を検査しない（残余）。
 ///
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
@@ -410,12 +428,6 @@ impl Drop for ReadSlot {
     }
 }
 
-/// `open` が FIFO 等で止まらないよう付ける `O_NONBLOCK`（Linux 0o4000・macOS 0x4）。通常ファイルの読み取りには影響しない。
-#[cfg(target_os = "linux")]
-const OPEN_NONBLOCK: i32 = 0o4000;
-#[cfg(all(unix, not(target_os = "linux")))]
-const OPEN_NONBLOCK: i32 = 0x4;
-
 fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
     let map_io = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::NotFound => match kind {
@@ -435,14 +447,35 @@ fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>
     if lmeta.len() > cap {
         return Err(invalid(MSG_TOO_LARGE));
     }
-    let mut oo = std::fs::OpenOptions::new();
-    oo.read(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        oo.custom_flags(OPEN_NONBLOCK);
-    }
-    let file = oo.open(path).map_err(map_io)?;
+    let file = {
+        use crate::sys::NoFollowOpenError as E;
+        crate::sys::open_regular_nofollow(path).map_err(|e| match e {
+            E::InvalidPath => invalid(MSG_BAD_PATH),
+            #[cfg(not(any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )))]
+            E::Unsupported => perr(PluginErrorCode::Unimplemented, MSG_UNSUPPORTED_VERIFY),
+            E::Ancestor(io) => match io.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => map_io(io),
+                _ => invalid(MSG_BAD_ANCESTOR),
+            },
+            E::Leaf(io) => match io.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => map_io(io),
+                _ => invalid(MSG_NOT_REGULAR),
+            },
+        })?
+    };
+    // Windows: 祖先は検査しない（残余。モジュール doc 参照）。
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(map_io)?;
     let fmeta = file.metadata().map_err(map_io)?;
     if !fmeta.file_type().is_file() {
         return Err(invalid(MSG_NOT_REGULAR));
@@ -745,7 +778,8 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-pm-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).expect("mkdir");
-            Self(p)
+            // 祖先の symlink を拒否するため正規化する（macOS の `/var` → `/private/var`。#3748）。
+            Self(std::fs::canonicalize(&p).expect("canonicalize"))
         }
         fn file(&self, name: &str, data: &[u8]) -> String {
             let p = self.0.join(name);
@@ -1084,6 +1118,49 @@ mod tests {
             let e = read_image(&link, 4, ImageKind::Kernel).unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         }
+    }
+
+    /// SEC-1・PLUG-1（#3748）: 祖先が symlink のイメージパスは `INVALID_ARGUMENT` で拒否し、応答にパスを含めない。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_3748_start_rejects_symlinked_ancestor_without_path() {
+        let t = Tmp::new("anc");
+        std::fs::create_dir(t.0.join("real")).expect("mkdir");
+        let real = t.file("real/kernel", b"K");
+        std::os::unix::fs::symlink(t.0.join("real"), t.0.join("link")).expect("symlink");
+        let via_link = format!("{}/link/kernel", t.0.display());
+        let mut a = adapter();
+        let e = a.handle(&start_req("a", &via_link)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_BAD_ANCESTOR);
+        assert!(!e.message().contains(&*t.0.to_string_lossy()));
+        assert!(!e.message().contains("link/kernel"));
+        assert_eq!(a.backend.starts, 0);
+        assert!(a.is_empty());
+        // 陽性対照: 同じ実体を実パスで渡せば従来どおり起動する。
+        assert_eq!(
+            a.handle(&start_req("a", &real)).expect("ok"),
+            s(&["running"])
+        );
+        assert_eq!(a.backend.starts, 1);
+    }
+
+    /// SEC-1（#3748）: initrd だけ祖先が symlink でも拒否し、VM は起動しない。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_3748_start_rejects_symlinked_ancestor_in_initrd() {
+        let t = Tmp::new("ancinit");
+        std::fs::create_dir(t.0.join("real")).expect("mkdir");
+        t.file("real/initrd", b"I");
+        let k = t.file("kernel", b"K");
+        std::os::unix::fs::symlink(t.0.join("real"), t.0.join("link")).expect("symlink");
+        let via_link = format!("{}/link/initrd", t.0.display());
+        let mut a = adapter();
+        let req = s(&["start", "a", &k, &via_link, "console=ttyS0", "1", "64"]);
+        let e = a.handle(&req).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_BAD_ANCESTOR);
+        assert_eq!(a.backend.starts, 0);
     }
 
     /// to_plugin_error: 全分類の写像（DeadlineExceeded は TIMEOUT）。

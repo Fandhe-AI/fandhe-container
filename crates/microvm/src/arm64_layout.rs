@@ -9,11 +9,13 @@
 //! 契約（TASK-192.6・#3788・MVM-5・MVM-1・REPAIR-2）:
 //! - 消費側は [`Arm64Layout::validate`] を先に呼ぶ。[`build_guest_fdt`] も内部で再実行する（fail-closed）。
 //! - 違反は `InvalidArgument`。メッセージは固定の英語で入力をエコーしない。演算はすべて checked。
-//! - GICD / GICR の基底は候補値である。アライン・大きさは #3792 が
-//!   `hv_gic_get_distributor_base_alignment` 等で実行時に検証する。
+//! - GICD / GICR の基底は候補値である。アライン・大きさは [`Arm64Layout::check_gic_geometry`] が
+//!   `hv_gic_get_distributor_base_alignment` 等の実値（[`GicGeometry`]）に対して検証する（#3792）。
+//!   virtual timer の PPI は [`check_virtual_timer_intid`] が API の INTID と照合する。FDT を API の値から
+//!   組み直さず照合で fail-closed にするのは、`build_guest_fdt` の署名変更を #3790・#3797 へ波及させないため。
 //!
 //! 未実装（REPAIR-3）: SMP（vCPU 2 以上は `Unimplemented`。#3797）・シリアルと `stdout-path`（chosen に付けない）・
-//! PCI・`hv_gic_*` による実値の取得（#3792）・virtio の通知方式と trigger の整合（#3795）・IPA 上限の確定（#3803）。
+//! PCI・virtio の通知方式と trigger の整合（#3795）・IPA 上限の確定（#3803）。
 //!
 //! # 出典（Linux `Documentation/devicetree/bindings`）
 //! `arm/psci.yaml`・`interrupt-controller/arm,gic-v3.yaml`・`timer/arm,arch_timer.yaml`・`virtio/mmio.yaml`・`arm/cpus.yaml`。
@@ -58,9 +60,24 @@ const GIC_PPI: u32 = 1;
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
 /// GICv3 ドライバーが受理するのは LEVEL_HIGH か EDGE_RISING のみ（LEVEL_LOW は拒否される）。
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
-/// timer の PPI 番号（arm,arch_timer の並び順。INTID = 16 + PPI で virt は 27）。
-/// `hv_gic_get_intid(EL1_VIRTUAL_TIMER)` との一致は #3792 の実機試験で照合する。
-const TIMER_PPIS: [u32; 4] = [13, 14, 11, 10];
+/// PPI 番号を GIC の INTID へ直す加算値（INTID = 16 + PPI 番号）。
+pub const ARM64_PPI_INTID_BASE: u32 = 16;
+/// secure physical timer の PPI 番号（DT の `interrupts` 第 2 セル）。
+pub const ARM64_TIMER_SEC_PHYS_PPI: u32 = 13;
+/// non-secure physical timer の PPI 番号。
+pub const ARM64_TIMER_PHYS_PPI: u32 = 14;
+/// virtual timer の PPI 番号（INTID は 27）。`hv_gic_get_intid(EL1_VIRTUAL_TIMER)` と一致させる。
+pub const ARM64_TIMER_VIRT_PPI: u32 = 11;
+/// hypervisor timer の PPI 番号。
+pub const ARM64_TIMER_HYP_PPI: u32 = 10;
+/// timer の PPI 番号（arm,arch_timer の並び順。値と順序は変えない）。
+/// virtual timer の一致は [`check_virtual_timer_intid`] が照合する（#3792）。
+const TIMER_PPIS: [u32; 4] = [
+    ARM64_TIMER_SEC_PHYS_PPI,
+    ARM64_TIMER_PHYS_PPI,
+    ARM64_TIMER_VIRT_PPI,
+    ARM64_TIMER_HYP_PPI,
+];
 /// virtio の trigger。`hv_gic_set_spi(intid, level)` は level 形の API のため、
 /// #3795 の通知方式（パルスか保持か）とこの定数を一致させる必要がある（未決・#3795 で確定）。
 const VIRTIO_IRQ_TRIGGER: u32 = IRQ_TYPE_EDGE_RISING;
@@ -245,7 +262,106 @@ impl Arm64Layout {
         }
         Ok(())
     }
+}
 
+/// フレームワークが返す GIC の大きさとアライン（`hv_gic_get_*` の値。usize から u64 へ直したもの）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GicGeometry {
+    /// distributor の大きさ。
+    pub dist_size: u64,
+    /// distributor の base のアライン。
+    pub dist_align: u64,
+    /// vCPU 1 台分の redistributor の大きさ（Apple のドキュメントからの読み。全体の値でも現状は vCPU = 1 で判定が同じ。確定は #3803）。
+    pub redist_size_per_cpu: u64,
+    /// redistributor の base のアライン。
+    pub redist_align: u64,
+}
+
+/// [`check_gic_region`] が出すメッセージの出し分け。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GicRegionKind {
+    /// distributor。
+    Distributor,
+    /// redistributor。
+    Redistributor,
+}
+
+/// 窓 `region` が、API の要求（`required` バイト・`align` アライン）を満たすか検査する（純関数）。
+///
+/// アライン 0・2 の冪でない・要求 0 はフレームワークの異常値として `Internal`。
+/// base のずれ・窓の不足・桁あふれは配置の違反として `InvalidArgument`。メッセージは固定で入力をエコーしない。
+pub fn check_gic_region(
+    region: MmioRegion,
+    required: u64,
+    align: u64,
+    kind: GicRegionKind,
+) -> Result<(), MicrovmError> {
+    let internal = |m: &'static str| MicrovmError::new(MicrovmErrorCode::Internal, m);
+    if align == 0 || !align.is_power_of_two() {
+        return Err(internal(
+            "gic alignment reported by the hypervisor is invalid",
+        ));
+    }
+    if required == 0 {
+        return Err(internal("gic size reported by the hypervisor is zero"));
+    }
+    if region.end().is_none() {
+        return Err(invalid("guest layout size overflow"));
+    }
+    if !region.base.raw().is_multiple_of(align) {
+        return Err(invalid(match kind {
+            GicRegionKind::Distributor => "gic distributor base is not aligned",
+            GicRegionKind::Redistributor => "gic redistributor base is not aligned",
+        }));
+    }
+    if required > region.size {
+        return Err(invalid(match kind {
+            GicRegionKind::Distributor => "gic distributor region is too small",
+            GicRegionKind::Redistributor => "gic redistributor region is too small",
+        }));
+    }
+    Ok(())
+}
+
+/// `intid`（`hv_gic_get_intid(EL1_VIRTUAL_TIMER)` の値）が FDT の virtual timer の PPI と一致するか照合する。
+/// 不一致は `Internal`（ゲストを起動させない）。
+pub fn check_virtual_timer_intid(intid: u32) -> Result<(), MicrovmError> {
+    if intid != ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "virtual timer intid does not match the guest fdt",
+        ));
+    }
+    Ok(())
+}
+
+impl Arm64Layout {
+    /// 配置が GIC の実値 `g` を満たすか検査する（VM 作成の前に呼ぶ。#3792・MVM-5）。
+    ///
+    /// 先に [`Self::validate`] を通す。窓の重なりと IPA 上限は `validate` が窓の大きさで検査済みで、
+    /// ここで「API の要求 <= 窓」を確かめるため、要求範囲も窓の内側に収まる。
+    pub fn check_gic_geometry(&self, g: &GicGeometry) -> Result<(), MicrovmError> {
+        self.validate()?;
+        check_gic_region(
+            self.gic_dist,
+            g.dist_size,
+            g.dist_align,
+            GicRegionKind::Distributor,
+        )?;
+        let required = g
+            .redist_size_per_cpu
+            .checked_mul(u64::from(self.vcpus))
+            .ok_or_else(|| invalid("guest layout size overflow"))?;
+        check_gic_region(
+            self.gic_redist,
+            required,
+            g.redist_align,
+            GicRegionKind::Redistributor,
+        )
+    }
+}
+
+impl Arm64Layout {
     /// `index` 番目の virtio-mmio の窓（#3797 のディスパッチャ登録が同じ値を使う）。
     pub fn virtio_mmio_window(&self, index: u32) -> Result<MmioRegion, MicrovmError> {
         if index >= self.virtio_mmio_count {
@@ -533,5 +649,102 @@ mod tests {
                 MicrovmErrorCode::InvalidArgument
             );
         }
+    }
+
+    fn geom() -> GicGeometry {
+        GicGeometry {
+            dist_size: 0x1_0000,
+            dist_align: 0x1_0000,
+            redist_size_per_cpu: 0x2_0000,
+            redist_align: 0x2_0000,
+        }
+    }
+
+    /// MVM-5: 既定配置と想定の実値の組は通る。
+    #[test]
+    fn mvm5_3792_default_layout_accepts_expected_geometry() {
+        let l = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+        assert!(l.check_gic_geometry(&geom()).is_ok());
+    }
+
+    fn region(base: u64, size: u64) -> MmioRegion {
+        MmioRegion::new(base, size)
+    }
+
+    /// MVM-5: アラインの境界（base ±1）。
+    #[test]
+    fn mvm5_3792_region_alignment_boundaries() {
+        use GicRegionKind::Distributor as D;
+        assert!(check_gic_region(region(0x0800_0000, 0x1_0000), 0x1_0000, 0x1_0000, D).is_ok());
+        for base in [0x0800_0001, 0x07ff_ffff] {
+            let e = check_gic_region(region(base, 0x1_0000), 0x1_0000, 0x1_0000, D).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "gic distributor base is not aligned");
+        }
+        let e = check_gic_region(
+            region(0x0820_0001, 0x2_0000),
+            0x2_0000,
+            0x2_0000,
+            GicRegionKind::Redistributor,
+        )
+        .unwrap_err();
+        assert_eq!(e.message(), "gic redistributor base is not aligned");
+    }
+
+    /// MVM-5: 大きさの境界（窓の末尾ちょうど・1 バイト超）。
+    #[test]
+    fn mvm5_3792_region_size_boundaries() {
+        use GicRegionKind::Distributor as D;
+        let r = region(0x0800_0000, 0x1_0000);
+        assert!(check_gic_region(r, 0x1_0000, 0x1_0000, D).is_ok());
+        let e = check_gic_region(r, 0x1_0001, 0x1_0000, D).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "gic distributor region is too small");
+        let e = check_gic_region(region(u64::MAX - 0xf, 0x20), 0x10, 1, D).unwrap_err();
+        assert_eq!(e.message(), "guest layout size overflow");
+    }
+
+    /// MVM-5: フレームワークの異常値は Internal。
+    #[test]
+    fn mvm5_3792_region_rejects_abnormal_reports_as_internal() {
+        use GicRegionKind::Distributor as D;
+        let r = region(0x0800_0000, 0x1_0000);
+        for (req, align) in [(0x1_0000, 0), (0x1_0000, 3), (0, 0x1_0000)] {
+            let e = check_gic_region(r, req, align, D).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        }
+    }
+
+    /// MVM-5: redistributor は vCPU 数を掛けた要求で検査し、桁あふれは拒否する。
+    #[test]
+    fn mvm5_3792_redistributor_per_cpu_requirement() {
+        let l = Arm64Layout::new(256 * MIB, 1, 0).unwrap();
+        let mut g = geom();
+        g.redist_size_per_cpu = 0x2_0001;
+        let e = l.check_gic_geometry(&g).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "gic redistributor region is too small");
+        let two = Arm64Layout::new(256 * MIB, 2, 0).unwrap();
+        g.redist_size_per_cpu = u64::MAX;
+        let e = two.check_gic_geometry(&g).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "guest layout size overflow");
+    }
+
+    /// MVM-5: virtual timer の intid は 27 だけが通り、FDT の timer の 3 組目と同じ PPI を指す。
+    #[test]
+    fn mvm5_3792_virtual_timer_intid_matches_fdt() {
+        assert!(check_virtual_timer_intid(27).is_ok());
+        for bad in [26, 28] {
+            let e = check_virtual_timer_intid(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::Internal);
+            assert_eq!(
+                e.message(),
+                "virtual timer intid does not match the guest fdt"
+            );
+        }
+        assert_eq!(TIMER_PPIS, [13, 14, 11, 10]);
+        assert_eq!(TIMER_PPIS[2], ARM64_TIMER_VIRT_PPI);
+        assert_eq!(ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI, 27);
     }
 }

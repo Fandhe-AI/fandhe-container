@@ -56,9 +56,9 @@
 //! # libc との機械照合（未導入）
 //! 本 crate は dev-dependencies に `libc` を持たないため照合は入れていない。dev-dependency の追加は crate ごとの
 //! オーナー承認事項で、#1837 の子として扱う（判断のまとめは #3290。`docs/design/ffi-libc-check.md`「適用状況」）。
-//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`）を具体値で固定する試験を置く。出典は
+//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`・`ELOOP`・`ENOTDIR`）を具体値で固定する試験を置く。出典は
 //! `O_*` / `AT_FDCWD` が Linux の `include/uapi/asm-generic/fcntl.h`・`arch/arm64/include/uapi/asm/fcntl.h`・
-//! macOS の `sys/fcntl.h`。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
+//! macOS の `sys/fcntl.h`。`ELOOP` / `ENOTDIR` は Linux の `include/uapi/asm-generic/errno.h`・`errno-base.h` と macOS の `sys/errno.h`（#3841）。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
 //! （SIGTERM=15。x86_64・aarch64 とも同じ）と macOS `sys/signal.h`（同値）、`SIG_ERR` は `(sighandler_t)-1`
 //! で、手作業で突き合わせた値である。
 
@@ -173,7 +173,8 @@ fn register() -> Result<(), PluginError> {
 // イメージパスの symlink 非追従 open（SEC-1・PLUG-1・REPAIR-3。#3748）
 // ---------------------------------------------------------------------------------------------
 
-/// [`open_regular_nofollow`] の失敗。errno の数値は持たず、段（祖先 / 最終要素）と `io::ErrorKind` だけで分類する。
+/// [`open_regular_nofollow`] の失敗。`io::Error` を保持し、分類は呼び出し側が [`is_not_real_entry`]
+/// （ELOOP / ENOTDIR）と `io::ErrorKind`（NotFound / PermissionDenied）で行う（ERR-1・#3841）。
 /// 呼び出し側（`adapter::read_image_blocking`）が固定文言へ写し、パスも OS のエラー文言も応答に載せない。
 #[cfg(unix)]
 #[derive(Debug)]
@@ -181,9 +182,10 @@ pub(crate) enum NoFollowOpenError {
     /// 絶対パスの `RootDir` + `Normal` 要素だけの形ではない（相対・最終要素なし・NUL を含む）。
     InvalidPath,
     /// 祖先の 1 要素を `O_DIRECTORY | O_NOFOLLOW` で開けなかった。祖先が symlink のとき Linux は `ENOTDIR`、
-    /// macOS は `ELOOP` を返すため、`NotFound` と `PermissionDenied` 以外は「祖先が実ディレクトリではない」と扱う。
+    /// macOS は `ELOOP` を返し、どちらも「祖先が実ディレクトリではない」と扱う。それ以外の errno は内部エラー。
     Ancestor(std::io::Error),
-    /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む）。
+    /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む。
+    /// `ELOOP` / `ENOTDIR` は「実体ではない」、それ以外の errno は内部エラー）。
     Leaf(std::io::Error),
     /// 定数を確認済みの組（macOS・Linux の x86_64 / aarch64）ではない。検査を省いて読まず拒否する（fail-closed）。
     #[cfg(not(any(
@@ -230,8 +232,17 @@ mod nofollow {
     pub(super) const O_CLOEXEC: i32 = 0o2000000;
     #[cfg(target_os = "linux")]
     pub(super) const O_NONBLOCK: i32 = 0o4000;
+    /// 最終要素が lstat の後に tty 等の文字デバイスへ差し替えられても、制御端末を持たないセッションリーダーの
+    /// plugin が制御端末を取得しないようにする（SEC-1・#3841）。x86_64 / aarch64 とも同値。
+    #[cfg(target_os = "linux")]
+    pub(super) const O_NOCTTY: i32 = 0o400;
     #[cfg(target_os = "linux")]
     pub(super) const AT_FDCWD: i32 = -100;
+    /// `ELOOP`（symlink の追従拒否）。Linux は 40、macOS は 62（`errno.h` / `sys/errno.h`）。
+    #[cfg(target_os = "linux")]
+    pub(super) const ELOOP: i32 = 40;
+    /// `ENOTDIR`（祖先が実ディレクトリではない）。Linux・macOS とも 20。
+    pub(super) const ENOTDIR: i32 = 20;
     /// 祖先の走査は検索（x）権限だけで通す（読み取り権限は要らない。symlink の拒否に一覧の読み取りは不要）。
     /// `O_PATH` は x86_64 / aarch64 とも同値（`0o10000000`）。macOS には `O_PATH` が無く `O_RDONLY` のまま。
     #[cfg(target_os = "linux")]
@@ -247,7 +258,16 @@ mod nofollow {
     #[cfg(target_os = "macos")]
     pub(super) const O_NONBLOCK: i32 = 0x4;
     #[cfg(target_os = "macos")]
+    pub(super) const O_NOCTTY: i32 = 0x0002_0000;
+    #[cfg(target_os = "macos")]
+    pub(super) const ELOOP: i32 = 62;
+    #[cfg(target_os = "macos")]
     pub(super) const AT_FDCWD: i32 = -2;
+
+    /// 祖先の open フラグ。macOS は `O_PATH` が無く実際に開くため `O_NOCTTY` が効く（Linux では `O_PATH` が無視する）。
+    pub(super) const DIR_FLAGS: i32 = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY;
+    /// 最終要素の open フラグ。`O_NONBLOCK` は FIFO で止まらないため、`O_NOCTTY` は制御端末の取得を避けるため。
+    pub(super) const LEAF_FLAGS: i32 = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)`。
@@ -259,7 +279,7 @@ mod nofollow {
     /// `dirfd` 基準で `name`（1 要素）を `flags` で開く。
     fn openat_raw(dirfd: i32, name: &CString, flags: i32) -> io::Result<File> {
         // SAFETY: `name` は NUL 終端の `CString` で、呼び出しの間生きている。`dirfd` は呼び出し側が保持する
-        // 開いた fd（または `AT_FDCWD`）で、本関数は閉じない。mode を取らないフラグだけを渡す。
+        // 開いた fd（または `AT_FDCWD`）で、本関数は閉じない。mode を取らないフラグだけを渡す（`O_NOCTTY` も mode を取らない）。
         let fd = unsafe { c_openat(dirfd, name.as_ptr(), flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -284,7 +304,7 @@ mod nofollow {
         let Some((leaf, ancestors)) = names.split_last() else {
             return Err(NoFollowOpenError::InvalidPath);
         };
-        let dir_flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        let dir_flags = DIR_FLAGS;
         // `/` は信頼する起点。以降は検証済みの親 fd を基準に 1 要素ずつ辿る（前の fd は代入で閉じる）。
         let root = CString::new("/").map_err(|_| NoFollowOpenError::InvalidPath)?;
         let mut cur =
@@ -293,14 +313,41 @@ mod nofollow {
             cur = openat_raw(cur.as_raw_fd(), name, dir_flags)
                 .map_err(NoFollowOpenError::Ancestor)?;
         }
-        openat_raw(cur.as_raw_fd(), leaf, O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-            .map_err(NoFollowOpenError::Leaf)
+        openat_raw(cur.as_raw_fd(), leaf, LEAF_FLAGS).map_err(NoFollowOpenError::Leaf)
+    }
+}
+
+/// open の失敗が「実体ではない」（`ELOOP` / `ENOTDIR`）か。`adapter::map_nofollow_error` が入力不正
+/// （`INVALID_ARGUMENT`）と内部エラー（`INTERNAL`）の分けに使う（ERR-1・SEC-1・#3841）。
+/// 定数を確認済みでない unix の組は常に `false`（fail-closed。そもそも `Unsupported` で読まない）。
+#[cfg(unix)]
+pub(crate) fn is_not_real_entry(e: &std::io::Error) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        matches!(e.raw_os_error(), Some(n) if n == nofollow::ELOOP || n == nofollow::ENOTDIR)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = e;
+        false
     }
 }
 
 /// 絶対パスを `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、最終要素を読み取りで開く。
 /// 祖先に symlink があれば [`NoFollowOpenError::Ancestor`]、最終要素が symlink なら `Leaf` で拒否する。
-/// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらない（通常ファイルの読み取りには影響しない）。
+/// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらず、`O_NOCTTY` 付きで制御端末も取得しない（通常ファイルの読み取りには影響しない）。
 /// ディレクトリや FIFO は開いて返す（種別の拒否は呼び出し側の fstat。#3842）。
 /// 区切りの重複・末尾 `/`・途中の `.` は `Path::components` の正規化で受理される（安全性は `O_NOFOLLOW` が担う）。
 /// 呼び出し元は `adapter::read_image_blocking`（`start` のイメージ読み込み）。
@@ -510,6 +557,13 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o200000, 0o400000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_NOCTTY, 0o400);
+        assert_eq!(LEAF_FLAGS, 0o400000 | 0o2000000 | 0o4000 | 0o400);
+        assert_eq!(
+            DIR_FLAGS,
+            0o10000000 | 0o200000 | 0o400000 | 0o2000000 | 0o400
+        );
+        assert_eq!((ELOOP, ENOTDIR), (40, 20));
         assert_eq!(O_PATH, 0o10000000);
     }
 
@@ -521,6 +575,13 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o40000, 0o100000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_NOCTTY, 0o400);
+        assert_eq!(LEAF_FLAGS, 0o100000 | 0o2000000 | 0o4000 | 0o400);
+        assert_eq!(
+            DIR_FLAGS,
+            0o10000000 | 0o40000 | 0o100000 | 0o2000000 | 0o400
+        );
+        assert_eq!((ELOOP, ENOTDIR), (40, 20));
         assert_eq!(O_PATH, 0o10000000);
     }
 
@@ -532,6 +593,34 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0x0010_0000, 0x0100, 0x0100_0000, 0x4, -2)
         );
+        assert_eq!(O_NOCTTY, 0x0002_0000);
+        assert_eq!(LEAF_FLAGS, 0x0100 | 0x0100_0000 | 0x4 | 0x0002_0000);
+        assert_eq!(DIR_FLAGS, 0x0010_0000 | 0x0100 | 0x0100_0000 | 0x0002_0000);
+        assert_eq!((ELOOP, ENOTDIR), (62, 20));
+    }
+
+    /// errno の分類（ERR-1・SEC-1・#3841）。ELOOP / ENOTDIR だけが「実体ではない」。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn sec1_3841_is_not_real_entry_by_errno() {
+        use std::io::Error;
+        #[cfg(target_os = "linux")]
+        let (eloop, enametoolong, etimedout) = (40, 36, 110);
+        #[cfg(target_os = "macos")]
+        let (eloop, enametoolong, etimedout) = (62, 63, 60);
+        for n in [eloop, 20] {
+            assert!(is_not_real_entry(&Error::from_raw_os_error(n)), "{n}");
+        }
+        for n in [24, 5, 2, 13, 1, enametoolong, etimedout] {
+            assert!(!is_not_real_entry(&Error::from_raw_os_error(n)), "{n}");
+        }
+        assert!(!is_not_real_entry(&Error::other("no errno")));
     }
 
     #[cfg(all(

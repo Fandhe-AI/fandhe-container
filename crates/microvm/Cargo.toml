@@ -6,6 +6,7 @@
 # TASK-75.4.1 で microvm に start / stop（vCPU 実行ループ）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.4.2 で起動失敗時の後始末の検証と ERR-1 の TIMEOUT 表記を追加（依存・feature は変えない。unsafe なし）。
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
+# TASK-192.7・#3790 で boot_arm64 を追加（依存は増やさない。unsafe なし）。
 # TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
@@ -30,6 +31,7 @@
 # #3783（TASK-192.1）で src/sys/hvf.rs・hvf_abi・hvf を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3787（TASK-192.4）で hvf/memory.rs とゲスト RAM のコピー API を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3844 で hvf_abi に check_vm_map（map の IPA 上限の検査）と HvVcpu の !Send / !Sync の const 判定を追加（依存は増やさない。unsafe 追加なし）。
 # #3789（TASK-192.3）で sys/hvf.rs に GICv3（hv_gic_*）の実行時解決と macOS 15 の版判定を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3771 で tests/kernel_boot.rs（実カーネルの起動完走の実機前提試験）を追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。

@@ -2,12 +2,12 @@
 
 CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要な「起動時 pidfd」を、どの経路で CLI プロセスへ渡すかを記録する。
 
-> 位置づけ: **判断記録（オーナー承認待ち）**。#2626 の実装で案 A を採用した（自動運転のため、既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側を選んだ）。オーナー承認は未取得で、承認されたとは書かない。承認されない場合は案 B / C へ差し替える。
+> 位置づけ: **判断記録（案 A はオーナー承認済み）**。#2626 の実装で案 A を採用し（既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側）、2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項。SUP-6・SEC-4）。同じコメントで、CRI の exec（#3726 の分解、#3752〜#3761）の設計記録 #3752 は、この経路を再利用できるかを先に確かめることとされた。§6 の 2 点目（観測名の語彙）は未決定のまま残る。
 
 - 対象ビヘイビア: SUP-6・SEC-4・CLI-1（関連: SEC-1・CORE-1・REPAIR-2・REPAIR-5・REPAIR-3）
 - タスク: TASK-163 追補（exec の入口。#1461・#1617・#1465・#1594）
 - 関連 issue: #2626（本件）・#2441（healthcheck の配線）・#2688（supervisor 不在時の exec）・#1869（非 Linux の plugin 経路）
-- 作成日: 2026-10-24
+- 作成日: 2026-10-24（2026-11-03 にオーナー承認を反映）
 
 ## 1. 背景
 
@@ -51,10 +51,10 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 ### 3.3 CLI 側の順序（`commands/exec.rs`）
 
 1. 要求の構築（`ExecRequest`: 絶対パス・argv・`--env` の上限検証）
-2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる
+2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる。続けて create の起動オプション文書の launch 時 env を状態記録の世代と照合して読む（`container_options::store::launch_env_for`。SUP-12・#2713。欠落・世代不一致は exec しない）
 3. 監査の記録先を `default_audit_sink(Some(host_state_root))` で作る。**作れなければ exec しない**（監査なしで実行する経路は無い）。supervisor へ接続する前に作るのは、監査できない exec のために pidfd を複製させないため
 4. 制御チャネルから pidfd の複製を受け取る（`SCM_RIGHTS`。受け取る fd はちょうど 1 本で、`MSG_CTRUNC`・2 本以上・Ok なのに 0 本はすべて閉じて失敗）
-5. `run_command_with_pidfd` を呼ぶ。受け取った fd は信用せず、`identify_pid1_with_pidfd` が fdinfo の `Pid:` を記録 pid と照合する
+5. `run_command_with_pidfd_env` を呼ぶ（env は `config.json` の `process.env` の上に launch 時 env、その上に `--env` を重ねる。healthcheck と同じ規則）。受け取った fd は信用せず、`identify_pid1_with_pidfd` が fdinfo の `Pid:` を記録 pid と照合する
 
 ### 3.4 終了コードと期限
 
@@ -76,12 +76,12 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 | ---- | ---- |
 | コマンドの標準入出力の受け渡し（現状 `/dev/null` 固定）・cwd・ユーザーの指定 | 未起票（`exec.rs` のモジュール doc「未実装」） |
 | supervisor 不在（孤児化・再起動後）の exec | #2688 |
-| healthcheck の `run_command_with_pidfd` への sink の配線 | #2441 |
+| healthcheck の sink の配線 | #2441 で実装済み（exec 専用 helper が `FileAuditSink` を直接使い、pidfd の複製は helper の stdin へ execve 越しに渡す） |
 | 非 Linux の exec（plugin 経由） | #1869 の設計・TASK-125 |
-| execve 越しの継承（supervisor が専用の exec プロセスを起動する方式） | 採らない |
+| CLI の exec での execve 越しの継承（supervisor が専用の exec プロセスを起動する方式） | 採らない（healthcheck は supervisor 自身が呼び出し元のため、この方式で #2441 が実装済み） |
 | 実 pidfd・実コンテナでの通し試験（root 不要の rootless 環境での実行と記録） | 人間担当（実機前提。#1621 の系列） |
 
 ## 6. 確認が必要な点（オーナー判断）
 
-- 案 A の採否（不採用なら案 B の可変長プロトコルと helper bin の設計から）。
-- 制御チャネルの観測名 `control_signal` を exec の受け渡しにも使っている点（集計の語彙を分けるか）。
+- ~~案 A の採否（不採用なら案 B の可変長プロトコルと helper bin の設計から）。~~ **決定済み**: 2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項）。
+- 制御チャネルの観測名 `control_signal` を exec の受け渡しにも使っている点（集計の語彙を分けるか）。**未決定**。

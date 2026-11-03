@@ -1085,6 +1085,136 @@ fn kvm_device_boot_lapic_lints_read_back() {
     );
 }
 
+/// MVM-1・#3733・TASK-75.3.2: `MicroVm::assemble` が設定した `KVM_SET_CPUID2` がゲストから見える。vCPU 0 のゲストが
+/// leaf 0 の vendor（EBX・EDX・ECX）と leaf 1 の APIC ID（EBX\[31:24\]）・hypervisor ビット（ECX\[31\]）を `out 0x10` で返し、
+/// ホスト側の期待値（`KVM_GET_SUPPORTED_CPUID` の leaf 0 と、設定した APIC ID = 0）と具体値で照合する。
+/// AP（vCPU 1 以上）は in-kernel irqchip の VM では INIT/SIPI 待ちで実行できないため、0 以外の APIC ID と x2APIC leaf の
+/// 調整は KVM 不要の単体試験 `mvm1_3733_*`（`cpuid_x86`）が照合する。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let host = dev.supported_cpuid().unwrap();
+    let leaf0 = *host.get(0, 0).unwrap();
+
+    // 合成 bzImage（kvm_device_boot_vcpu_starts_at_kernel_entry と同じ header）。
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+    put(0x1F1, &[4]);
+    put(0x1FE, &0xAA55u16.to_le_bytes());
+    put(0x201, &[0x62]);
+    put(0x202, b"HdrS");
+    put(0x206, &0x020Fu16.to_le_bytes());
+    put(0x211, &[1]);
+    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+    put(0x230, &0x20_0000u32.to_le_bytes());
+    put(0x234, &[1]);
+    put(0x236, &1u16.to_le_bytes());
+    put(0x238, &2047u32.to_le_bytes());
+    put(0x258, &0x100_0000u64.to_le_bytes());
+    put(0x260, &0x40_0000u32.to_le_bytes());
+    let payload = 5 * 512;
+    for (i, b) in img[payload..].iter_mut().enumerate() {
+        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
+    }
+    let code: Vec<u8> = vec![
+        0x31, 0xC0, 0x0F, 0xA2, // xor eax,eax ; cpuid
+        0x89, 0xD8, 0xE7, 0x10, // mov eax,ebx ; out 0x10,eax
+        0x89, 0xD0, 0xE7, 0x10, // mov eax,edx ; out
+        0x89, 0xC8, 0xE7, 0x10, // mov eax,ecx ; out
+        0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, // mov eax,1 ; cpuid
+        0x89, 0xD8, 0xC1, 0xE8, 0x18, 0xE7, 0x10, // mov eax,ebx ; shr eax,24 ; out
+        0x89, 0xC8, 0xC1, 0xE8, 0x1F, 0xE7, 0x10, // mov eax,ecx ; shr eax,31 ; out
+    ];
+    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap();
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        vm.setup_boot_vcpu(&loaded).unwrap();
+        let vcpu = vm.vcpu_mut(0).unwrap();
+        let mut exits = Vec::new();
+        while exits.len() < 5 {
+            match vcpu.run_once(Duration::from_secs(10)).unwrap() {
+                VcpuExit::Interrupted => continue,
+                e => exits.push(e),
+            }
+        }
+        let _ = tx.send(exits);
+    });
+    let exits = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("guest did not finish within 60s");
+    let out = |v: u32| VcpuExit::Io {
+        direction: IoDirection::Out,
+        port: 0x10,
+        size: 4,
+        count: 1,
+        data: v.to_le_bytes().to_vec(),
+    };
+    // vendor（EBX・EDX・ECX）、APIC ID 0、hypervisor ビット 1。
+    assert_eq!(
+        exits,
+        vec![
+            out(leaf0.ebx),
+            out(leaf0.edx),
+            out(leaf0.ecx),
+            out(0),
+            out(1)
+        ]
+    );
+}
+
+/// MVM-1・#3733: x86_64 以外では CPUID の設定も組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
 /// MVM-1・TASK-75.4.1・#886: `MicroVm::start` / `RunningMicroVm::stop`。(a) 自己ループするゲストを停止要求で止め、
 /// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台は拒否される。
 /// 資源の解放は、観測器 `Arc` の参照数が 1 に戻ること（`VcpuFd`、つまり `MicroVm` 全体が drop 済み）で決定的に確かめる

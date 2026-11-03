@@ -54,7 +54,7 @@
 
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1027,6 +1027,7 @@ fn vcpu_loop<T: VcpuLoopBody>(
     stop: Arc<AtomicBool>,
     done: mpsc::Sender<StopReport>,
     started: Instant,
+    exit: &ExitGuard,
 ) {
     let reason = loop {
         if stop.load(Ordering::SeqCst) {
@@ -1058,12 +1059,16 @@ fn vcpu_loop<T: VcpuLoopBody>(
         stats.errors,
         elapsed.as_micros()
     ));
-    // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
-    let _ = done.send(StopReport {
+    let report = StopReport {
         reason,
         stats,
         elapsed,
-    });
+    };
+    // 解放（`drop(body)`）の完了後にだけ「終了済み」を記録する（#3744）。stop が期限切れで切り離した後も、
+    // `VcpuExitWatch` の観測者はこの記録で資源の解放完了を知る。
+    exit.complete(report);
+    // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
+    let _ = done.send(report);
 }
 
 /// スレッド生成の失敗を分類する（EAGAIN・ENOMEM は資源枯渇、それ以外は内部エラー。メッセージは固定文言と errno だけ）。
@@ -1088,11 +1093,19 @@ fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicro
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let flag = Arc::clone(&stop);
+    let exit = Arc::new(ExitCell::new());
+    let thread_exit = Arc::clone(&exit);
     let handle = std::thread::Builder::new()
         .name("microvm-vcpu-0".into())
-        .spawn(move || vcpu_loop(body, flag, tx, started))
+        .spawn(move || {
+            // panic の unwind でも「終了済み」を残す。`body` は `vcpu_loop` のフレームが所有するため、unwind では
+            // `body` の drop がこの guard の drop より先に走り、「解放後に記録」の順序が正常・panic の両経路で成り立つ。
+            let guard = ExitGuard(thread_exit);
+            vcpu_loop(body, flag, tx, started, &guard);
+        })
         .map_err(|e| classify_spawn_error(&e))?;
     Ok(RunningMicroVm {
+        exit,
         stop,
         done_rx: rx,
         handle: Some(handle),
@@ -1108,6 +1121,7 @@ fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicro
 /// 範囲外（REPAIR-3）: 他スレッドからの `immediate_exit` と kick による即時停止（`sys` の拡張、つまり新規 unsafe が要る）。
 #[derive(Debug)]
 pub struct RunningMicroVm {
+    exit: Arc<ExitCell>,
     stop: Arc<AtomicBool>,
     done_rx: mpsc::Receiver<StopReport>,
     handle: Option<JoinHandle<()>>,
@@ -1193,6 +1207,17 @@ impl RunningMicroVm {
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
+
+    /// vCPU スレッドの終了を観測するハンドルの複製を返す（#3744・MVM-1・REPAIR-5）。
+    ///
+    /// [`RunningMicroVm::stop`] は `self` を消費し、期限切れ（`DeadlineExceeded`）ではスレッドを切り離すため、
+    /// 期限切れの後に終了を知る手段は無い。`stop` や drop の**前**に取得しておけば、ハンドルはそれらの後も有効で、
+    /// plugin-microvm の adapter が切り離した VM の計数枠を返してよいかの判定に使う（#3745）。
+    pub fn exit_watch(&self) -> VcpuExitWatch {
+        VcpuExitWatch {
+            cell: Arc::clone(&self.exit),
+        }
+    }
 }
 
 impl Drop for RunningMicroVm {
@@ -1214,6 +1239,133 @@ impl Drop for RunningMicroVm {
                 MicrovmErrorCode::DeadlineExceeded.as_str()
             ));
         }
+    }
+}
+
+/// [`VcpuExitWatch`] が返す vCPU ループの終了状態（真偽値で返さない。拡張できる）。
+///
+/// 呼び出し側は `Running` 以外を「資源を解放済み」とみなしてよい（例外は [`VcpuExitWatch`] の doc を参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VcpuExitState {
+    /// vCPU ループはまだ `MicroVm` を解放していない（未終了）。
+    Running,
+    /// `MicroVm` の解放（vCPU fd → デバイスの dispatcher・irqfd → メモリの memslot 削除と munmap → VM fd）を終えた。
+    Exited(StopReport),
+    /// vCPU スレッドが panic で unwind した。`MicroVm` は unwind で解放済みで、終了済みとして扱える。
+    ExitedAbnormally,
+}
+
+/// 終了状態の共有セル。vCPU スレッドが書き、[`VcpuExitWatch`] が期限つきで待つ。
+#[derive(Debug)]
+struct ExitCell {
+    state: Mutex<VcpuExitState>,
+    changed: Condvar,
+}
+
+impl ExitCell {
+    fn new() -> Self {
+        ExitCell {
+            state: Mutex::new(VcpuExitState::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// 状態は単純な値で、panic 中に壊れる不変条件が無い。poison でも中身を読む（`Running` 扱いで枠を返さないより正確）。
+    fn lock(&self) -> std::sync::MutexGuard<'_, VcpuExitState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_if_running(&self, next: VcpuExitState) {
+        let mut st = self.lock();
+        if *st == VcpuExitState::Running {
+            *st = next;
+            self.changed.notify_all();
+        }
+    }
+
+    /// 正常経路の記録。既に記録済みなら上書きしない。
+    fn complete(&self, report: StopReport) {
+        self.set_if_running(VcpuExitState::Exited(report));
+    }
+
+    /// 未記録なら異常終了として記録する（`Exited` は上書きしない）。
+    fn mark_abnormal_if_running(&self) {
+        self.set_if_running(VcpuExitState::ExitedAbnormally);
+    }
+
+    fn state(&self) -> VcpuExitState {
+        *self.lock()
+    }
+
+    /// `limit` まで状態の変化を待つ（spurious wakeup は残り時間を再計算して吸収する）。期限切れは `Running`。
+    fn wait_until(&self, limit: Instant) -> VcpuExitState {
+        let mut st = self.lock();
+        while *st == VcpuExitState::Running {
+            let now = Instant::now();
+            if now >= limit {
+                break;
+            }
+            st = self
+                .changed
+                .wait_timeout(st, limit - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *st
+    }
+}
+
+/// vCPU スレッドのクロージャが持つ guard。drop で未記録なら `ExitedAbnormally` を残す（panic の unwind 対策）。
+struct ExitGuard(Arc<ExitCell>);
+
+impl ExitGuard {
+    fn complete(&self, report: StopReport) {
+        self.0.complete(report);
+    }
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_abnormal_if_running();
+    }
+}
+
+/// 切り離した vCPU スレッドの終了を期限つきで観測するハンドル（#3744・MVM-1・REPAIR-5。[`RunningMicroVm::exit_watch`]）。
+///
+/// `Arc` の複製で、[`RunningMicroVm`] の `stop`・drop の後も独立に生きる。`stop` が `DeadlineExceeded` で戻ったあと
+/// スレッドが後で終わったかを [`VcpuExitWatch::wait`] で知る。plugin-microvm の adapter が期限切れ VM の計数枠を返す判定に使う（#3745）。
+///
+/// # 観測できる範囲（REPAIR-3）
+/// - `Exited` は `MicroVm` の解放完了（vCPU fd と kvm_run の mmap、dispatcher と irqfd の解除、memslot の削除と munmap、VM fd の close）
+///   の直後に記録される。スレッドローカルの destructor の完了や OS スレッドの回収より前。
+/// - `stop` が報告を受けた後の join だけが期限切れになった `DeadlineExceeded` では、資源は解放済みで `Exited` を返す。
+/// - 例外（fail-closed の既存仕様）: memslot の削除に失敗した場合ゲスト RAM の mapping は意図的に残され、`Exited` でも残りうる。
+///
+/// # 観測できないもの
+/// - `KVM_RUN` や ioctl の中で D 状態のまま戻らないスレッドは `Running` のまま。期限で `Running` を返すだけで、強制回収する手段は無い。
+/// - カーネルが実際にページを解放したか。
+#[derive(Debug, Clone)]
+pub struct VcpuExitWatch {
+    cell: Arc<ExitCell>,
+}
+
+impl VcpuExitWatch {
+    /// 待たずに現在の状態を返す。
+    pub fn state(&self) -> VcpuExitState {
+        self.cell.state()
+    }
+
+    /// `deadline` まで終了を待つ。期限内に終わらなければ `Ok(Running)`。`deadline` が 0 または [`STOP_DEADLINE_MAX`] 超なら
+    /// `InvalidArgument`（待たない照会は [`VcpuExitWatch::state`]）。
+    pub fn wait(&self, deadline: Duration) -> Result<VcpuExitState, MicrovmError> {
+        if deadline.is_zero() || deadline > STOP_DEADLINE_MAX {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "exit wait deadline out of range",
+            ));
+        }
+        Ok(self.cell.wait_until(Instant::now() + deadline))
     }
 }
 
@@ -1296,6 +1448,7 @@ mod lifecycle_tests {
         finish_after: Option<u32>,
         gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
         entered: Arc<AtomicBool>,
+        panic_after_gate: bool,
     }
 
     impl FakeBody {
@@ -1306,6 +1459,7 @@ mod lifecycle_tests {
                 finish_after: None,
                 gate: None,
                 entered: Arc::new(AtomicBool::new(false)),
+                panic_after_gate: false,
             }
         }
     }
@@ -1326,6 +1480,7 @@ mod lifecycle_tests {
                     open = cv.wait(open).unwrap();
                 }
             }
+            assert!(!self.panic_after_gate, "fake body panic");
             std::thread::sleep(Duration::from_millis(2));
             self.steps += 1;
             match self.finish_after {
@@ -1516,6 +1671,158 @@ mod lifecycle_tests {
         let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
         drop(running);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn gated_body(dropped: &Arc<AtomicBool>) -> (FakeBody, Arc<(Mutex<bool>, Condvar)>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut body = FakeBody::new(dropped);
+        body.gate = Some(Arc::clone(&gate));
+        (body, gate)
+    }
+
+    fn open(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    /// MVM-1・REPAIR-5・#3744: 期限切れの stop の後、未終了なら期限で `Running`、終了後は `Exited`（解放後に記録）。
+    #[test]
+    fn mvm1_3744_watch_reports_exit_after_stop_timeout() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (body, gate) = gated_body(&dropped);
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        let e = running.stop(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(watch.state(), VcpuExitState::Running);
+        let t = Instant::now();
+        assert_eq!(
+            watch.wait(Duration::from_millis(50)).unwrap(),
+            VcpuExitState::Running
+        );
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        open(&gate);
+        let t = Instant::now();
+        let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(5)).unwrap() else {
+            panic!("expected Exited");
+        };
+        assert_eq!(r.reason, StopReason::Requested);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// MVM-1・#3744: 正常な stop の後は、事前に取った watch が stop の戻り値と同じ報告を返す。
+    #[test]
+    fn mvm1_3744_watch_exited_after_successful_stop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let watch = running.exit_watch();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(watch.state(), VcpuExitState::Exited(report));
+    }
+
+    /// MVM-1・#3744: ゲスト起因の終了も `Exited` で報告される。
+    #[test]
+    fn mvm1_3744_watch_reports_guest_shutdown() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut body = FakeBody::new(&dropped);
+        body.finish_after = Some(3);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        let watch = running.exit_watch();
+        let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(5)).unwrap() else {
+            panic!("expected Exited");
+        };
+        assert_eq!(r.reason, StopReason::GuestShutdown);
+        assert_eq!(r.stats.runs, 3);
+        drop(running);
+    }
+
+    /// MVM-1・#3744: `RunningMicroVm` を drop した後も watch は生きて終了を報告する。
+    #[test]
+    fn mvm1_3744_watch_survives_drop_of_running() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (body, gate) = gated_body(&dropped);
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        let opener = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                open(&gate);
+            }
+        });
+        drop(running);
+        assert!(matches!(
+            watch.wait(Duration::from_secs(5)).unwrap(),
+            VcpuExitState::Exited(_)
+        ));
+        opener.join().unwrap();
+    }
+
+    /// MVM-1・REPAIR-5・#3744: panic で unwind しても、解放後に `ExitedAbnormally` が記録される。
+    #[test]
+    fn mvm1_3744_watch_reports_abnormal_exit_on_panic() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (mut body, gate) = gated_body(&dropped);
+        body.panic_after_gate = true;
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        assert!(running.stop(Duration::from_millis(50)).is_err());
+        open(&gate);
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)).unwrap(),
+            VcpuExitState::ExitedAbnormally
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5・#3744: 待ちの期限は 0 と上限超を即時に拒否する。
+    #[test]
+    fn mvm1_3744_watch_wait_deadline_validated() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let watch = running.exit_watch();
+        for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
+            let t = Instant::now();
+            let e = watch.wait(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "exit wait deadline out of range");
+            assert!(t.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    /// #3744: `ExitCell` の記録は先勝ちで、異常終了の記録は `Exited` を上書きしない。
+    #[test]
+    fn mvm1_3744_exit_cell_first_write_wins() {
+        let cell = ExitCell::new();
+        assert_eq!(cell.state(), VcpuExitState::Running);
+        let report = StopReport {
+            reason: StopReason::Requested,
+            stats: RunStats::default(),
+            elapsed: Duration::from_millis(1),
+        };
+        cell.complete(report);
+        cell.mark_abnormal_if_running();
+        let other = StopReport {
+            reason: StopReason::GuestShutdown,
+            ..report
+        };
+        cell.complete(other);
+        assert_eq!(cell.state(), VcpuExitState::Exited(report));
+    }
+
+    /// #3744: 観測ハンドルはスレッド間で共有できる。
+    #[test]
+    fn mvm1_3744_exit_watch_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VcpuExitWatch>();
     }
 
     /// MVM-1: 起動中ハンドルはスレッド間で移動できる。

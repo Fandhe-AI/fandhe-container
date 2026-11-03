@@ -1795,7 +1795,238 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
     );
 }
 
+/// MVM-1・REPAIR-5・#3742・#3743: virtio-net 1 台の構成の `start` が成功し、`start` の後に backend へ積んだフレームが、
+/// ゲストの kick（QueueNotify を含む MMIO）なしに受信ポーラー（`microvm-net-rx`）で受信バッファへ届く。
+/// `start` の後はホストからゲストメモリを読めないため、ゲスト自身に used ring と受信バッファを読ませて COM1 へ出させ、
+/// 完全一致で照合する。ドライバの初期化（DRIVER_OK・キュー 0/1 の ready）はホスト側が `start` の前に行い、ゲストは
+/// MMIO を一切出さない（記録に MMIO の exit が 0 件）。後半はフレームを積まない負の対照で、出力が空のまま `stop` が
+/// 期限内に `Requested` で戻り、net-rx スレッドを含めて backend と観測器の参照が解放される。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_rx_reaches_guest_without_kick() {
+    use fandhe_container_microvm::device::{BoundedRunLog, ValueCapture};
+    use fandhe_container_microvm::error::MicrovmError;
+    use fandhe_container_microvm::exit::{ExitValue, IoDirection};
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_mmio::{DeviceStatus, reg};
+    use fandhe_container_microvm::virtio_net::NetBackend;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// `start` の後にフレームを積むため、試験側にも共有ハンドルを残す backend。
+    #[derive(Debug, Clone, Default)]
+    struct SharedNetBackend {
+        inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+    impl NetBackend for SharedNetBackend {
+        fn send(&mut self, _frame: &[u8]) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+        fn recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
+            let mut q = self.inbound.lock().unwrap();
+            let Some(frame) = q.front() else {
+                return Ok(None);
+            };
+            let dst = buf.get_mut(..frame.len()).expect("rx buffer large enough");
+            dst.copy_from_slice(frame);
+            let n = frame.len();
+            q.pop_front();
+            Ok(Some(n))
+        }
+    }
+
+    // 64 MiB の VM の内側。ブート用の配置（zero page 0x7000・テーブル 0xF000 未満・cmdline 0x20000・bzImage 0x100000）と重ならない。
+    const RX_DESC: u64 = 0x0200_0000;
+    const RX_AVAIL: u64 = 0x0200_1000;
+    const RX_USED: u64 = 0x0200_2000;
+    const TX_DESC: u64 = 0x0200_3000;
+    const TX_AVAIL: u64 = 0x0200_4000;
+    const TX_USED: u64 = 0x0200_5000;
+    const RX_BUF: u64 = 0x0201_0000;
+    const FRAME_LEN: usize = 60;
+    const NET_HDR_LEN: usize = 12;
+    const SENTINEL: usize = 4;
+    const USED_HEAD: usize = 10; // used.idx(2) + used 要素 0 の id(4) + len(4)
+
+    /// poll: used.idx が 0 の間 `pause` で待つ → used 先頭とバッファを COM1 へ 1 バイトずつ出力 → ud2。
+    fn guest_code() -> Vec<u8> {
+        let mut c: Vec<u8> = vec![0x0F, 0xB7, 0x04, 0x25]; // movzx eax, word [disp32]
+        c.extend_from_slice(&((RX_USED + 2) as u32).to_le_bytes());
+        c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        c.extend_from_slice(&[0x75, 0x04]); // jnz out（pause + jmp の 4 バイトを飛ばす）
+        c.extend_from_slice(&[0xF3, 0x90]); // pause
+        let back = -(i32::try_from(c.len()).unwrap() + 2);
+        assert!(back >= -128);
+        c.extend_from_slice(&[0xEB, back as i8 as u8]); // jmp poll
+        let out = |c: &mut Vec<u8>, src: u32, n: u32| {
+            c.push(0xBE);
+            c.extend_from_slice(&src.to_le_bytes()); // mov esi, src
+            c.push(0xB9);
+            c.extend_from_slice(&n.to_le_bytes()); // mov ecx, n
+            c.extend_from_slice(&[0x66, 0xBA, 0xF8, 0x03]); // mov dx, 0x3f8
+            c.extend_from_slice(&[0xAC, 0xEE, 0xE2, 0xFC]); // l: lodsb; out dx, al; loop l
+        };
+        out(&mut c, (RX_USED + 2) as u32, USED_HEAD as u32);
+        out(
+            &mut c,
+            RX_BUF as u32,
+            (NET_HDR_LEN + FRAME_LEN + SENTINEL) as u32,
+        );
+        c.extend_from_slice(&[0x0F, 0x0B]); // ud2
+        c
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+
+    // 準備: ゲストコードのロード → 受信バッファ・記述子・avail → ホスト側のドライバ初期化 → 観測器。
+    let build = |backend: &SharedNetBackend| {
+        let mut img = bzimage::header_only();
+        bzimage::put_entry_code(&mut img, &guest_code());
+        let mut vm: MicroVm<MemoryBlockBackend, SharedNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![NetDeviceConfig {
+                    backend: backend.clone(),
+                    mac: [2, 0, 0, 0, 0, 1],
+                }],
+            },
+        )
+        .unwrap();
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let ga = GuestAddress::new;
+        {
+            let mem = vm.memory_mut();
+            mem.write_at(ga(RX_BUF), &[0xEE; 2048]).unwrap();
+            mem.write_at(ga(RX_DESC), &RX_BUF.to_le_bytes()).unwrap();
+            mem.write_u32_le(ga(RX_DESC + 8), 2048).unwrap();
+            mem.write_u16_le(ga(RX_DESC + 12), 2).unwrap(); // WRITE
+            mem.write_u16_le(ga(RX_DESC + 14), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL + 4), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL + 2), 1).unwrap();
+        }
+        vm.with_net(0, |t| {
+            let mut wr = |off: u64, v: u32| t.write(off, &v.to_le_bytes());
+            wr(reg::STATUS, 1);
+            wr(reg::STATUS, 3);
+            wr(reg::DRIVER_FEATURES_SEL, 0);
+            wr(reg::DRIVER_FEATURES, 1 << 5); // MAC
+            wr(reg::DRIVER_FEATURES_SEL, 1);
+            wr(reg::DRIVER_FEATURES, 1); // VERSION_1
+            wr(reg::STATUS, 11);
+            for (q, d, a, u) in [
+                (0, RX_DESC, RX_AVAIL, RX_USED),
+                (1, TX_DESC, TX_AVAIL, TX_USED),
+            ] {
+                wr(reg::QUEUE_SEL, q);
+                wr(reg::QUEUE_NUM, 16);
+                wr(reg::QUEUE_DESC_LOW, d as u32);
+                wr(reg::QUEUE_DRIVER_LOW, a as u32);
+                wr(reg::QUEUE_DEVICE_LOW, u as u32);
+                wr(reg::QUEUE_READY, 1);
+            }
+            wr(reg::STATUS, 15);
+            assert!(t.status().contains(DeviceStatus::DRIVER_OK));
+        })
+        .unwrap();
+        let log = Arc::new(BoundedRunLog::new(1024, ValueCapture::Record).unwrap());
+        vm.vcpu_mut(0).unwrap().set_observer(log.clone());
+        (vm, loaded, log)
+    };
+    let wait = |limit: Duration, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let end = Instant::now() + limit;
+        while !cond() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    };
+
+    // 本体: start の後にフレームを積み、kick なしで届く。
+    let backend = SharedNetBackend::default();
+    let (vm, loaded, log) = build(&backend);
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| !log.records().is_empty())
+    ));
+    assert_eq!(running.serial_console().stats().unwrap().written_bytes, 0);
+    let frame: Vec<u8> = (0..FRAME_LEN).map(|i| ((i + 7) % 241) as u8).collect();
+    backend.inbound.lock().unwrap().push_back(frame.clone());
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| running.is_finished())
+    ));
+    let console = running.serial_console();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.origin_vcpu, Some(0));
+    assert_eq!(report.vcpu_count, 1);
+    assert_eq!(report.stats.errors, 0);
+
+    let mut expected: Vec<u8> = vec![1, 0]; // used.idx
+    expected.extend_from_slice(&0u32.to_le_bytes()); // used[0].id
+    expected.extend_from_slice(&((NET_HDR_LEN + FRAME_LEN) as u32).to_le_bytes()); // used[0].len
+    expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]); // virtio_net_hdr（num_buffers = 1）
+    expected.extend_from_slice(&frame);
+    expected.extend_from_slice(&[0xEE; SENTINEL]);
+    assert_eq!(console.take_output().unwrap(), expected);
+    assert!(backend.inbound.lock().unwrap().is_empty());
+
+    // ゲストの kick なし: MMIO の exit が 0 件で、PIO は port 0x3f8 への 1 バイトの OUT だけ（10 + 76 = 86 件）。
+    assert_eq!(log.dropped(), 0);
+    let values: Vec<ExitValue> = log.records().iter().filter_map(|r| r.value).collect();
+    assert!(
+        values.iter().all(|v| matches!(
+            v,
+            ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x3f8,
+                size: 1,
+                ..
+            }
+        )),
+        "{values:?}"
+    );
+    assert_eq!(values.len(), USED_HEAD + NET_HDR_LEN + FRAME_LEN + SENTINEL);
+    assert_eq!(Arc::strong_count(&log), 1);
+    assert_eq!(Arc::strong_count(&backend.inbound), 1);
+
+    // 負の対照: フレームなしなら出力は空のまま、stop が期限内に Requested で戻り、net-rx スレッドを含めて解放される。
+    let backend = SharedNetBackend::default();
+    let (vm, loaded, log) = build(&backend);
+    let running = vm.start(&loaded).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!running.is_finished());
+    assert_eq!(running.serial_console().stats().unwrap().written_bytes, 0);
+    let t0 = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(Arc::strong_count(&log), 1);
+    assert_eq!(Arc::strong_count(&backend.inbound), 1);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_rx_reaches_guest_without_kick() {
+    assert_unimplemented_assemble();
+}
+
 /// MVM-1・TASK-75.4.2・#887: 起動の途中で失敗しても fd・mmap が解放され、エラーは ERR-1 の形（`<CODE>: <message>`）で返る。
+/// net を含む構成の起動途中の失敗（解放）と、net を含む構成の `start` の成功と停止も確認する（#3743）。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -1850,13 +2081,27 @@ fn kvm_device_start_failure_releases_resources() {
     assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
     assert_eq!(Arc::strong_count(&obs), 1);
 
-    // (b) net デバイスを含む構成の start は Unimplemented で、解放される。
+    // (b1) net を含む構成でも、起動途中の失敗（小さいメモリ）で解放される。
+    let mut small = assemble(2 << 20, 1);
+    let obs = Arc::new(Nop);
+    small.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let e = small.start(&loaded).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (b2) net を含む構成の start は Unimplemented ではなく成功し、停止で解放される（#3743）。
+    let spin = bzimage::synthetic_bzimage(&[0xEB, 0xFE]);
     let mut vm = assemble(64 << 20, 1);
-    let loaded = vm.load_kernel(&image, None, "console=ttyS0").unwrap();
+    let loaded = vm.load_kernel(&spin, None, "console=ttyS0").unwrap();
     let obs = Arc::new(Nop);
     vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
-    let e = vm.start(&loaded).unwrap_err();
-    assert!(e.to_string().starts_with("UNIMPLEMENTED: "), "{e}");
+    let running = vm.start(&loaded).unwrap();
+    let report = running.stop(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        report.reason,
+        fandhe_container_microvm::microvm::StopReason::Requested
+    );
     assert_eq!(Arc::strong_count(&obs), 1);
 
     // (c) load_kernel に不正なイメージを渡すと InvalidArgument。MicroVm は残り、drop で解放される。

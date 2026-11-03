@@ -113,7 +113,7 @@ fn mvm5_3788_blob_roundtrip_values() {
     assert_eq!(p.cells("/intc@8000000", "#interrupt-cells"), vec![3]);
     assert_eq!(
         p.cells("/timer", "interrupts"),
-        vec![1, 13, 8, 1, 14, 8, 1, 11, 8, 1, 10, 8]
+        vec![1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4]
     );
     assert_eq!(
         p.cells("/virtio_mmio@a000000", "reg"),

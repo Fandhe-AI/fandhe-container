@@ -56,7 +56,8 @@ pub const ARM64_MAX_BOOTARGS: usize = 2047;
 const GIC_SPI: u32 = 0;
 const GIC_PPI: u32 = 1;
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
-const IRQ_TYPE_LEVEL_LOW: u32 = 8;
+/// GICv3 ドライバーが受理するのは LEVEL_HIGH か EDGE_RISING のみ（LEVEL_LOW は拒否される）。
+const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 /// timer の PPI 番号（arm,arch_timer の並び順。INTID = 16 + PPI で virt は 27）。
 /// `hv_gic_get_intid(EL1_VIRTUAL_TIMER)` との一致は #3792 の実機試験で照合する。
 const TIMER_PPIS: [u32; 4] = [13, 14, 11, 10];
@@ -388,7 +389,7 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
     // timer/arm,arch_timer.yaml。GICv3 は CPU マスクのビットを持たない。
     let mut irq = Vec::with_capacity(12);
     for ppi in TIMER_PPIS {
-        irq.extend_from_slice(&[GIC_PPI, ppi, IRQ_TYPE_LEVEL_LOW]);
+        irq.extend_from_slice(&[GIC_PPI, ppi, IRQ_TYPE_LEVEL_HIGH]);
     }
     b.begin_node("timer")?;
     b.property_string("compatible", "arm,armv8-timer")?;

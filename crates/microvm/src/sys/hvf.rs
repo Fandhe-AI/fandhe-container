@@ -41,6 +41,20 @@
 //! 不透明なポインタで NULL を渡す。`hv_*` と `HvVcpuExitRaw`（Hypervisor.framework の構造体）は `libc` に
 //! 対応物が無く、レイアウトは `hvf_abi` の const assert で固定する。
 //!
+//! # GICv3 の契約（TASK-192.3・#3789・MVM-5・MVM-4）
+//! - `hv_gic_*` は macOS 15.0 で入った。Rust の既定の deployment target（11.0）で `extern` に直接宣言すると、
+//!   macOS 14 では dyld がシンボルを解決できずプロセスが起動しない。そこで **どの `extern` ブロックにも宣言せず**、
+//!   `dlsym(RTLD_DEFAULT, ..)` で実行時に探す。deployment target を 15 に上げる案は 14 で起動できなくなるため採らない。
+//! - `dlopen` は使わない。探すのは起動時に `#[link]` で読み込み済みの image（Hypervisor.framework と libSystem）だけで、
+//!   新しいライブラリを実行時に読み込まない（security.md「動的ライブラリの実行時ロードを行わない」）。`dlclose` もしない
+//!   ため、解決した関数ポインタはプロセスの寿命の間有効。
+//! - 手順は「`kern.osproductversion` の版判定（15 未満は `Unimplemented`）→ 11 個のシンボル解決」の順。1 つでも見つから
+//!   なければ GIC の関数を何も返さない。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
+//! - 関数ポインタは `GicApi` の private フィールドに閉じ、`sys` の外へ出さない。`hv_gic_*` は `libc` に対応物が無いため
+//!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.12 以降なので直接リンクしてよい）
+//!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
+//! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK ヘッダとの照合は #3803。
+//!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
 //! SDK ヘッダとの最終照合は人間担当の #3803 で行う。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
@@ -48,15 +62,16 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw,
-    MemoryFlags, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
-    decode_exit, finish_run,
+    GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg,
+    HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
+    check_gic_supported, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
+    decode_exit, finish_run, parse_macos_product_version,
 };
-use std::ffi::{c_int, c_long, c_void};
+use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[link(name = "Hypervisor", kind = "framework")]
@@ -112,6 +127,24 @@ unsafe extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn sysconf(name: c_int) -> c_long;
 }
+
+// SAFETY: 宣言は macOS（LP64）の libSystem の C ABI に一致させている（`dlsym` は `<dlfcn.h>`、
+// `sysctlbyname` は `<sys/sysctl.h>`、`os_release` は `<os/object.h>` の宣言。`size_t` = usize）。
+// `dlsym`・`sysctlbyname` は libc に対応物があり #3664 で照合する。`os_release` は libc に無い。
+unsafe extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn sysctlbyname(
+        name: *const c_char,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> c_int;
+    fn os_release(object: *mut c_void);
+}
+
+// macOS の `RTLD_DEFAULT`（`(void *)-2`。libc 0.2.189 の bsd に一致）。Linux の値（0）を流用しない。
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
 // macOS の値（libc 0.2.189 の bsd/apple に一致）。Linux の値を流用しない。
 const PROT_READ: c_int = 1;
@@ -750,5 +783,240 @@ impl Drop for HvVcpu<'_> {
             // SAFETY: id は生存中の vCPU で、drop は作成スレッド（!Send）。結果は後始末のため捨てる。
             let _ = unsafe { hv_vcpu_destroy(id) };
         }
+    }
+}
+// ---- GICv3（TASK-192.3・#3789）。`hv_gic_*` は直接リンクせず `dlsym` で解決する（モジュール doc） ----
+
+// `hv_gic_*` の関数ポインタ型。`hv_gic_config_t` は OS オブジェクト（不透明ポインタ）、`hv_gic_intid_t` は
+// `uint16_t`、`bool` は C の `_Bool`、`size_t` = usize。
+type GicConfigCreateFn = unsafe extern "C" fn() -> *mut c_void;
+type GicConfigSetBaseFn = unsafe extern "C" fn(*mut c_void, u64) -> c_int;
+type GicCreateFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type GicSetSpiFn = unsafe extern "C" fn(u32, bool) -> c_int;
+type GicGetSizeFn = unsafe extern "C" fn(*mut usize) -> c_int;
+type GicGetRangeFn = unsafe extern "C" fn(*mut u32, *mut u32) -> c_int;
+type GicGetIntidFn = unsafe extern "C" fn(u16, *mut u32) -> c_int;
+
+/// シンボル解決の失敗の固定文（シンボル名は載せない。ERR-1）。
+fn gic_symbol_missing() -> MicrovmError {
+    MicrovmError::new(
+        MicrovmErrorCode::Unimplemented,
+        "hypervisor GIC symbol is not available",
+    )
+}
+
+/// `kern.osproductversion` を読んで分解する。応答は上限つきのスタックバッファで受け、切り詰めは拒否する。
+fn macos_version() -> Result<MacosVersion, MicrovmError> {
+    let mut buf = [0u8; MACOS_PRODUCT_VERSION_MAX_LEN + 1];
+    let mut len = buf.len();
+    // SAFETY: 名前は NUL 終端の `c""` 定数。`oldp` は `buf`（`len` バイト）を指し、`oldlenp` は `len` を指す
+    // ローカル変数で、どちらも呼び出しの間生きている。`newp` は NULL・`newlen` は 0（読み取りのみ）。
+    let rc = unsafe {
+        sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len > buf.len() {
+        return Err(internal("sysctl kern.osproductversion failed"));
+    }
+    parse_macos_product_version(buf.get(..len).ok_or_else(|| internal("sysctl length"))?)
+}
+
+/// 読み込み済みの image から `name` を探す。見つからなければ `None`（NULL）。
+fn lookup(name: &CStr) -> Option<*mut c_void> {
+    // SAFETY: `RTLD_DEFAULT` は読み込み済み image の検索を表す疑似ハンドル。`name` は NUL 終端で呼び出しの間生きている。
+    // `dlsym` は新しい image を読み込まない。
+    let p = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+    (!p.is_null()).then_some(p)
+}
+
+/// シンボルを関数ポインタ型 `$ty` として解決する（NULL 検査の後でだけ変換する）。
+macro_rules! resolve {
+    ($name:expr, $ty:ty) => {{
+        let p = lookup($name).ok_or_else(gic_symbol_missing)?;
+        // SAFETY: `p` は NULL でない `dlsym` の戻り値で、`$ty` は Apple のドキュメントのシグネチャに一致させた
+        // `extern "C"` の関数ポインタ（データポインタと同じ幅）。image は `dlclose` しないので寿命はプロセスと同じ。
+        unsafe { std::mem::transmute::<*mut c_void, $ty>(p) }
+    }};
+}
+
+/// 実行時に解決した `hv_gic_*` の関数表（macOS 15 以降）。関数ポインタは private で `sys` の外へ出さない。
+/// `Copy` な関数ポインタだけを持つので `Send + Sync`。取得は [`GicApi::get`]。
+pub struct GicApi {
+    config_create: GicConfigCreateFn,
+    config_set_distributor_base: GicConfigSetBaseFn,
+    config_set_redistributor_base: GicConfigSetBaseFn,
+    create: GicCreateFn,
+    set_spi: GicSetSpiFn,
+    get_distributor_size: GicGetSizeFn,
+    get_distributor_base_alignment: GicGetSizeFn,
+    get_redistributor_size: GicGetSizeFn,
+    get_redistributor_base_alignment: GicGetSizeFn,
+    get_spi_interrupt_range: GicGetRangeFn,
+    get_intid: GicGetIntidFn,
+}
+
+impl std::fmt::Debug for GicApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GicApi").finish_non_exhaustive()
+    }
+}
+
+static GIC_API: OnceLock<Result<GicApi, MicrovmError>> = OnceLock::new();
+
+impl GicApi {
+    /// 版判定（15 未満は `Unimplemented`）の後に 11 シンボルを解決する。結果（エラーを含む）はプロセスで 1 回だけ作る。
+    pub fn get() -> Result<&'static GicApi, MicrovmError> {
+        GIC_API
+            .get_or_init(|| {
+                check_gic_supported(macos_version()?)?;
+                GicApi::resolve_all()
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn resolve_all() -> Result<GicApi, MicrovmError> {
+        Ok(GicApi {
+            config_create: resolve!(c"hv_gic_config_create", GicConfigCreateFn),
+            config_set_distributor_base: resolve!(
+                c"hv_gic_config_set_distributor_base",
+                GicConfigSetBaseFn
+            ),
+            config_set_redistributor_base: resolve!(
+                c"hv_gic_config_set_redistributor_base",
+                GicConfigSetBaseFn
+            ),
+            create: resolve!(c"hv_gic_create", GicCreateFn),
+            set_spi: resolve!(c"hv_gic_set_spi", GicSetSpiFn),
+            get_distributor_size: resolve!(c"hv_gic_get_distributor_size", GicGetSizeFn),
+            get_distributor_base_alignment: resolve!(
+                c"hv_gic_get_distributor_base_alignment",
+                GicGetSizeFn
+            ),
+            get_redistributor_size: resolve!(c"hv_gic_get_redistributor_size", GicGetSizeFn),
+            get_redistributor_base_alignment: resolve!(
+                c"hv_gic_get_redistributor_base_alignment",
+                GicGetSizeFn
+            ),
+            get_spi_interrupt_range: resolve!(c"hv_gic_get_spi_interrupt_range", GicGetRangeFn),
+            get_intid: resolve!(c"hv_gic_get_intid", GicGetIntidFn),
+        })
+    }
+
+    fn query_size(f: GicGetSizeFn, op: HvOp) -> Result<usize, MicrovmError> {
+        let mut out = 0usize;
+        // SAFETY: `f` は `get` の版判定を通った後に解決した関数で、出力先はローカル変数 `out` だけ（呼び出しの間生きている）。
+        let rc = unsafe { f(&mut out) };
+        classify_hv_return(op, rc)?;
+        Ok(out)
+    }
+
+    /// distributor の大きさ（バイト）。
+    pub fn distributor_size(&self) -> Result<usize, MicrovmError> {
+        Self::query_size(self.get_distributor_size, HvOp::GicGetDistributorSize)
+    }
+
+    /// distributor の base に要求されるアラインメント（バイト）。
+    pub fn distributor_base_alignment(&self) -> Result<usize, MicrovmError> {
+        Self::query_size(
+            self.get_distributor_base_alignment,
+            HvOp::GicGetDistributorBaseAlignment,
+        )
+    }
+
+    /// redistributor 領域の大きさ（バイト）。
+    pub fn redistributor_size(&self) -> Result<usize, MicrovmError> {
+        Self::query_size(self.get_redistributor_size, HvOp::GicGetRedistributorSize)
+    }
+
+    /// redistributor の base に要求されるアラインメント（バイト）。
+    pub fn redistributor_base_alignment(&self) -> Result<usize, MicrovmError> {
+        Self::query_size(
+            self.get_redistributor_base_alignment,
+            HvOp::GicGetRedistributorBaseAlignment,
+        )
+    }
+
+    /// SPI の割り込み番号の範囲 `(base, count)`。
+    pub fn spi_interrupt_range(&self) -> Result<(u32, u32), MicrovmError> {
+        let (mut base, mut count) = (0u32, 0u32);
+        // SAFETY: 出力先はローカル変数 2 つで、呼び出しの間生きている。
+        let rc = unsafe { (self.get_spi_interrupt_range)(&mut base, &mut count) };
+        classify_hv_return(HvOp::GicGetSpiInterruptRange, rc)?;
+        Ok((base, count))
+    }
+
+    /// 予約済みの割り込み `id` の割り込み番号（INTID）。
+    pub fn intid(&self, id: HvGicIntid) -> Result<GicIntid, MicrovmError> {
+        let mut out = 0u32;
+        // SAFETY: 出力先はローカル変数 `out` だけ。`id.bits()` は `uint16_t` の値。
+        let rc = unsafe { (self.get_intid)(id.bits(), &mut out) };
+        classify_hv_return(HvOp::GicGetIntid, rc)?;
+        Ok(GicIntid::new(out))
+    }
+
+    /// SPI の入力レベルを設定する。
+    pub fn set_spi(&self, intid: u32, level: bool) -> Result<(), MicrovmError> {
+        // SAFETY: 引数は整数と bool だけで、ポインタを取らない。
+        let rc = unsafe { (self.set_spi)(intid, level) };
+        classify_hv_return(HvOp::GicSetSpi, rc)
+    }
+
+    /// GIC の設定オブジェクトを作る（NULL は `ResourceExhausted`）。
+    pub fn config_create(&'static self) -> Result<GicConfig, MicrovmError> {
+        // SAFETY: 引数なしで OS オブジェクトを返す。戻り値は NULL 検査の後で `GicConfig` が所有する。
+        let raw = unsafe { (self.config_create)() };
+        if raw.is_null() {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::ResourceExhausted,
+                "hv_gic_config_create returned NULL",
+            ));
+        }
+        Ok(GicConfig { raw, api: self })
+    }
+
+    /// VM に GIC を作る。VM が存在する間（`&HvVm`）だけ呼べ、`config` は消費する。
+    /// 作成順序（vCPU より前）を型で強制するのは #3792 の担当。
+    pub fn create(&self, _vm: &HvVm, config: GicConfig) -> Result<(), MicrovmError> {
+        // SAFETY: `config.raw` は `GicConfig` が所有する有効な OS オブジェクトで、呼び出しの間生きている
+        // （解放は `GicConfig` の drop で 1 回だけ）。VM は `_vm` の借用で存在が保証される。
+        let rc = unsafe { (self.create)(config.raw) };
+        classify_hv_return(HvOp::GicCreate, rc)
+    }
+}
+
+/// `hv_gic_config_t`（OS オブジェクト）の所有者。drop で `os_release` を 1 回だけ呼ぶ。生ポインタ入りで `!Send`・`!Sync`。
+#[derive(Debug)]
+pub struct GicConfig {
+    raw: *mut c_void,
+    api: &'static GicApi,
+}
+
+impl GicConfig {
+    /// distributor の base の IPA を設定する。
+    pub fn set_distributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
+        // SAFETY: `raw` は有効な OS オブジェクトで、`&mut self` により排他。
+        let rc = unsafe { (self.api.config_set_distributor_base)(self.raw, ipa) };
+        classify_hv_return(HvOp::GicConfigSetDistributorBase, rc)
+    }
+
+    /// redistributor の base の IPA を設定する。
+    pub fn set_redistributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
+        // SAFETY: `raw` は有効な OS オブジェクトで、`&mut self` により排他。
+        let rc = unsafe { (self.api.config_set_redistributor_base)(self.raw, ipa) };
+        classify_hv_return(HvOp::GicConfigSetRedistributorBase, rc)
+    }
+}
+
+impl Drop for GicConfig {
+    fn drop(&mut self) {
+        // SAFETY: `raw` は `config_create` が返した NULL でない OS オブジェクトで、ここ以外で解放されない
+        // （`create` は config を消費するが解放しない）。`hv_gic_create` が retain するかは #3803 で確認する。
+        unsafe { os_release(self.raw) };
     }
 }

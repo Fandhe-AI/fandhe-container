@@ -4,7 +4,7 @@
 //! （`tests/hvf_device.rs`）と、後続の子 issue（#3786 vCPU・#3789 GIC・#3787 ゲスト RAM = `memory`）が
 //! ここへ追記する。引数の検査と戻り値の写像は OS 非依存の `crate::hvf_abi`。
 
-pub use crate::sys::{GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
+pub use crate::sys::{GicApi, GicConfig, GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
 
 pub mod memory;
 pub use memory::{HvfGuestRam, RegisteredHvfRam};

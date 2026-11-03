@@ -33,7 +33,8 @@
 //! spawn 失敗の後始末と「`stop` が `Ok` で戻れば解放済み」の契約を vCPU と共有できる。却下: backend の到着通知（`NetBackend` に
 //! API が無く実 backend も未定。TASK-75・TASK-117 で TAP を導入したら置き換えを検討する。REPAIR-3）。ロックは共有部 →
 //! トランスポートの順で vCPU の `dispatch_exit` と揃える。待ちは停止要求で即座に起き、リング破損・lock の poison は fail-closed で全台を止める。
-//! `start` の virtio-net の拒否の撤去と実機前提試験は #3743。
+//! `start` は virtio-net を含む構成でもこのポーラーつきで起動する（#3743）。実機での確認は `tests/kvm_device.rs` の
+//! `kvm_device_net_rx_reaches_guest_without_kick`。
 //!
 //! # シリアル（TASK-75.5・#3740・MVM-1）
 //! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
@@ -2220,8 +2221,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// カーネルのエントリへ vCPU 0 を初期化し（[`MicroVm::setup_boot_vcpu`]）、vCPU ごとの専用スレッドで実行ループを始める（TASK-75.4.1・MVM-1）。
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU は 1 台につき 1 スレッドで、
-    /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成は、受信ポーラー（`NetRxPoller`。期限ごとの
-    /// `process_rx`。#3742）を配線済みだが、`Unimplemented` の拒否は #3743（実機前提試験と同時）で撤去するまで残す（backend の到着通知は将来仕様。MVM-1・TASK-117）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成では、ゲストの kick なしで受信を処理する専用スレッド `microvm-net-rx`（`NetRxPoller`。期限ごとの
+    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -2246,14 +2247,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ) -> Result<RunningMicroVm, MicrovmError> {
         // スレッドと管理領域を確保する前に台数を検証する（#3738・REPAIR-5）。
         validate_vcpu_threads(self.vcpus.len())?;
-        // 受信ポーラー（`NetRxPoller`。#3742）の配線は済んでいるが、拒否の撤去と実機前提試験は #3743 の担当のため、
-        // それまでは virtio-net を含む構成を黙って許さず拒否する（fail-closed。REPAIR-3・MVM-1。TASK-117）。
-        if !self.devices.net.is_empty() {
-            return Err(MicrovmError::new(
-                MicrovmErrorCode::Unimplemented,
-                "starting with a virtio-net device is not implemented (rx polling is missing)",
-            ));
-        }
         self.setup_boot_vcpu(loaded)?;
         let serial = self.devices.serial.clone();
         // 共有部（デバイス・メモリ・VM fd）を 1 つの Arc に移し、vCPU ごとに worker を作る。呼び出し元が持つ参照は

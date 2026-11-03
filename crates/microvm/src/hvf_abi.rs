@@ -24,6 +24,10 @@
 //! `hv_vcpu_exit_t` のレイアウト、[`decode_exit`] は exit reason の復号（未知の値は `Unknown` で fail-closed）。
 //! syndrome の解釈は #3785 の担当で、ここでは生値のまま運ぶ。
 //!
+//! # GICv3 の版判定（TASK-192.3・#3789）
+//! [`parse_macos_product_version`]・[`check_gic_supported`] は `kern.osproductversion` の分解と macOS 15 未満の拒否。
+//! [`HvGicIntid`] の値は Arm BSA の推奨 PPI 番号に由来する暫定値で、SDK ヘッダとの照合は #3803。
+//!
 //! # 出典
 //! 数値の一部と 3 つの名前は第三者バインディング由来で、SDK ヘッダ（`Hypervisor/hv_error.h`）との
 //! 最終照合は人間担当の #3803 で行う。それまでは暫定値として扱う。
@@ -101,6 +105,26 @@ pub enum HvOp {
     VcpuSetVtimerOffset,
     /// `hv_vcpu_set_pending_interrupt`。
     VcpuSetPendingInterrupt,
+    /// `hv_gic_config_set_distributor_base`（macOS 15 以降。TASK-192.3・#3789）。
+    GicConfigSetDistributorBase,
+    /// `hv_gic_config_set_redistributor_base`（macOS 15 以降。TASK-192.3・#3789）。
+    GicConfigSetRedistributorBase,
+    /// `hv_gic_create`（macOS 15 以降。TASK-192.3・#3789）。
+    GicCreate,
+    /// `hv_gic_set_spi`（macOS 15 以降。TASK-192.3・#3789）。
+    GicSetSpi,
+    /// `hv_gic_get_distributor_size`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetDistributorSize,
+    /// `hv_gic_get_distributor_base_alignment`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetDistributorBaseAlignment,
+    /// `hv_gic_get_redistributor_size`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetRedistributorSize,
+    /// `hv_gic_get_redistributor_base_alignment`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetRedistributorBaseAlignment,
+    /// `hv_gic_get_spi_interrupt_range`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetSpiInterruptRange,
+    /// `hv_gic_get_intid`（macOS 15 以降。TASK-192.3・#3789）。
+    GicGetIntid,
 }
 
 impl HvOp {
@@ -124,6 +148,16 @@ impl HvOp {
             HvOp::VcpuGetVtimerOffset => "hv_vcpu_get_vtimer_offset",
             HvOp::VcpuSetVtimerOffset => "hv_vcpu_set_vtimer_offset",
             HvOp::VcpuSetPendingInterrupt => "hv_vcpu_set_pending_interrupt",
+            HvOp::GicConfigSetDistributorBase => "hv_gic_config_set_distributor_base",
+            HvOp::GicConfigSetRedistributorBase => "hv_gic_config_set_redistributor_base",
+            HvOp::GicCreate => "hv_gic_create",
+            HvOp::GicSetSpi => "hv_gic_set_spi",
+            HvOp::GicGetDistributorSize => "hv_gic_get_distributor_size",
+            HvOp::GicGetDistributorBaseAlignment => "hv_gic_get_distributor_base_alignment",
+            HvOp::GicGetRedistributorSize => "hv_gic_get_redistributor_size",
+            HvOp::GicGetRedistributorBaseAlignment => "hv_gic_get_redistributor_base_alignment",
+            HvOp::GicGetSpiInterruptRange => "hv_gic_get_spi_interrupt_range",
+            HvOp::GicGetIntid => "hv_gic_get_intid",
         }
     }
 }
@@ -490,6 +524,113 @@ pub fn finish_run(
     (result, HvRunRecord { outcome, elapsed })
 }
 
+// ---- GICv3（TASK-192.3・#3789・MVM-5・MVM-4） ----
+
+/// `kern.osproductversion` を受ける上限（NUL を除く）。これを超える応答は分解の前に拒否する。
+pub const MACOS_PRODUCT_VERSION_MAX_LEN: usize = 32;
+
+/// `hv_gic_*` が入った macOS のメジャー版（15.0）。
+pub const GIC_MIN_MACOS_MAJOR: u32 = 15;
+
+/// macOS の版（`kern.osproductversion`。`major.minor[.patch]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacosVersion {
+    /// メジャー版。
+    pub major: u32,
+    /// マイナー版（無ければ 0）。
+    pub minor: u32,
+    /// パッチ版（無ければ 0）。
+    pub patch: u32,
+}
+
+fn bad_version() -> MicrovmError {
+    MicrovmError::new(
+        MicrovmErrorCode::Internal,
+        "unexpected kern.osproductversion format",
+    )
+}
+
+/// `kern.osproductversion` の生バイト列を分解する（sysctl 由来の外部入力。末尾の NUL は 1 個まで許す）。
+///
+/// 長さの上限と文字種を検査し、不正なら `Internal`（固定文・fail-closed）。`hv_*` は呼ばない純関数。
+pub fn parse_macos_product_version(raw: &[u8]) -> Result<MacosVersion, MicrovmError> {
+    let body = raw.strip_suffix(&[0]).unwrap_or(raw);
+    if body.is_empty() || body.len() > MACOS_PRODUCT_VERSION_MAX_LEN {
+        return Err(bad_version());
+    }
+    let mut parts = [0u32; 3];
+    for (count, piece) in body.split(|b| *b == b'.').enumerate() {
+        let slot = parts.get_mut(count).ok_or_else(bad_version)?;
+        if piece.is_empty() {
+            return Err(bad_version());
+        }
+        let mut value = 0u32;
+        for b in piece {
+            if !b.is_ascii_digit() {
+                return Err(bad_version());
+            }
+            value = value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(u32::from(b - b'0')))
+                .ok_or_else(bad_version)?;
+        }
+        *slot = value;
+    }
+    let [major, minor, patch] = parts;
+    Ok(MacosVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+/// GICv3 の API を使える版か。15 より前は `Unimplemented`（構造化エラーで起動を拒否する。TASK-192）。
+pub fn check_gic_supported(v: MacosVersion) -> Result<(), MicrovmError> {
+    if v.major < GIC_MIN_MACOS_MAJOR {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "hypervisor GIC requires macOS 15 or later",
+        ));
+    }
+    Ok(())
+}
+
+/// `hv_gic_intid_t`（`uint16_t` の列挙）の識別値。`hv_gic_get_intid` へ渡す「割り込みの種類」の選択子で、
+/// ゲスト側の PPI 番号（INTID）そのものではない。INTID は [`GicIntid`] として戻り値から得る。
+///
+/// 列挙値の数値は SDK ヘッダ（`hv_gic_types.h`）との照合が人間担当の #3803 で未了の暫定値（実機未確認）。
+/// PPI 番号（EL1 仮想タイマーの推奨 27 など）は列挙識別値ではなく戻り値の INTID 側の値で、混同しない。
+/// 呼び出し側は数値を直接書かず定数だけを使う（REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvGicIntid(u16);
+
+impl HvGicIntid {
+    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` の列挙識別値（暫定。#3803 で照合）。
+    pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(3);
+
+    /// FFI へ渡す列挙識別値。
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// `hv_gic_get_intid` が返すゲスト側の割り込み番号（INTID）。列挙識別値 [`HvGicIntid`] とは別の型にして
+/// 取り違えを防ぐ。FDT の割り込み指定などはこの値から組み立て、ハードコードしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GicIntid(u32);
+
+impl GicIntid {
+    /// FFI の戻り値から作る。
+    pub const fn new(raw: u32) -> Self {
+        GicIntid(raw)
+    }
+
+    /// 生の INTID。
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +925,78 @@ mod tests {
                 total_elapsed: Duration::from_millis(20),
             }
         );
+    }
+
+    #[test]
+    fn mvm5_3789_parse_version_accepts_valid() {
+        let v = |major, minor, patch| MacosVersion {
+            major,
+            minor,
+            patch,
+        };
+        assert_eq!(parse_macos_product_version(b"15.0").unwrap(), v(15, 0, 0));
+        assert_eq!(parse_macos_product_version(b"15.1.1").unwrap(), v(15, 1, 1));
+        assert_eq!(parse_macos_product_version(b"26.0").unwrap(), v(26, 0, 0));
+        assert_eq!(parse_macos_product_version(b"15.0\0").unwrap(), v(15, 0, 0));
+        assert_eq!(parse_macos_product_version(b"14").unwrap(), v(14, 0, 0));
+    }
+
+    #[test]
+    fn mvm5_3789_parse_version_rejects_malformed() {
+        let mut long_ok = b"15.".to_vec();
+        long_ok.extend(std::iter::repeat_n(b'0', 29));
+        assert_eq!(long_ok.len(), MACOS_PRODUCT_VERSION_MAX_LEN);
+        // 32 バイトちょうどは長さの検査を通って受理される（minor は 0）。
+        assert_eq!(
+            parse_macos_product_version(&long_ok).unwrap(),
+            MacosVersion {
+                major: 15,
+                minor: 0,
+                patch: 0
+            }
+        );
+        let mut long_ng = long_ok.clone();
+        long_ng.push(b'0');
+        let cases: [&[u8]; 9] = [
+            b"",
+            b"\0",
+            b"x.y",
+            b"15.",
+            b".1",
+            b"1.2.3.4",
+            b"99999999999.0",
+            b"15.0\0\0",
+            &long_ng,
+        ];
+        for raw in cases {
+            let e = parse_macos_product_version(raw).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::Internal, "{raw:?}");
+            assert_eq!(e.message(), "unexpected kern.osproductversion format");
+        }
+    }
+
+    #[test]
+    fn mvm5_3789_gic_requires_macos_15() {
+        let v14 = parse_macos_product_version(b"14.7").unwrap();
+        let e = check_gic_supported(v14).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+        assert_eq!(e.message(), "hypervisor GIC requires macOS 15 or later");
+        for raw in [&b"15.0"[..], b"15.1.1", b"26.0"] {
+            assert!(check_gic_supported(parse_macos_product_version(raw).unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn mvm5_3789_gic_op_names_match_c_symbols() {
+        let e = classify_hv_return(HvOp::GicCreate, HV_NO_RESOURCES).unwrap_err();
+        assert_eq!(e.message(), "hv_gic_create returned HV_NO_RESOURCES");
+        let e = classify_hv_return(HvOp::GicGetSpiInterruptRange, HV_UNSUPPORTED).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "hv_gic_get_spi_interrupt_range returned HV_UNSUPPORTED"
+        );
+        assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 3);
+        assert_ne!(u32::from(HvGicIntid::EL1_VIRTUAL_TIMER.bits()), 27);
+        assert_eq!(GicIntid::new(27).get(), 27);
     }
 }

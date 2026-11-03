@@ -540,6 +540,120 @@ fn task117_4_plug1_backend_start_failure_maps_to_error_frame_and_keeps_connectio
     let _ = e.finish();
 }
 
+/// イメージパスの読み取り失敗が、実際の UDS 経路で固定文言のエラー応答へ写る（ERR-1・SEC-1・PLUG-1・#3841）。
+/// 最終要素の open は `O_NOCTTY` 付き（フラグ定数は sys の単体試験が具体値で固定）。lstat 後の tty 差し替えは
+/// 公開 API からは作れないため、ここでは通常ファイルの読み取りが `O_NOCTTY` 付きでも成功すること（既存試験）と、
+/// 実体でない・存在しない・権限なしの各入力が分類どおりに応答され、パス・OS 文言を漏らさないことを確かめる。
+#[test]
+fn sec1_err1_3841_image_open_failures_map_to_fixed_error_frames_via_uds() {
+    use fandhe_container_plugin::PluginErrorCode;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut e = mock_core::E2e::start();
+    let base = e.dir.0.clone();
+    let good = e.dir.file("k.bin", KERNEL);
+    let real_dir = std::fs::canonicalize(&base).expect("canonicalize");
+
+    // 存在しない kernel / initrd は NOT_FOUND（文言は種別ごとの固定文）。
+    let missing = real_dir
+        .join("absent.bin")
+        .to_str()
+        .expect("utf8")
+        .to_string();
+    let mut id = 10u64;
+    let mut expect_err = |e: &mut mock_core::E2e, body: Vec<String>| {
+        id += 1;
+        match call(&mut e.stream, id, body) {
+            ControlMessage::Error { id: got, error } => {
+                assert_eq!(got.get(), id);
+                (error.code(), error.message().to_string())
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    let r = expect_err(&mut e, s(&["start", "v1", &missing, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::NotFound,
+            "kernel image not found".to_string()
+        )
+    );
+    let r = expect_err(&mut e, s(&["start", "v1", &good, &missing, "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::NotFound,
+            "initrd image not found".to_string()
+        )
+    );
+
+    // 最終要素が symlink / FIFO（通常ファイルではない）は INVALID_ARGUMENT。
+    let link = real_dir.join("link.bin");
+    std::os::unix::fs::symlink(&good, &link).expect("symlink");
+    let link_s = link.to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &link_s, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image must be a regular file".to_string()
+        )
+    );
+    let fifo = real_dir.join("fifo.bin");
+    if std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        let fifo_s = fifo.to_str().expect("utf8").to_string();
+        let r = expect_err(&mut e, s(&["start", "v1", &fifo_s, "", "", "1", "64"]));
+        assert_eq!(
+            r,
+            (
+                PluginErrorCode::InvalidArgument,
+                "image must be a regular file".to_string()
+            )
+        );
+    }
+
+    // 祖先が symlink のディレクトリは INVALID_ARGUMENT（祖先の文言）。
+    let dir_link = real_dir.join("dlink");
+    std::os::unix::fs::symlink(&real_dir, &dir_link).expect("symlink dir");
+    let via = dir_link.join("k.bin").to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &via, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image path ancestor must be a real directory".to_string()
+        )
+    );
+
+    // 読み取り権限が無い通常ファイルは PERMISSION_DENIED（root では権限が効かないため確認して飛ばす）。
+    let secret = e.dir.file("noperm.bin", KERNEL);
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::File::open(&secret).is_err() {
+        let r = expect_err(&mut e, s(&["start", "v1", &secret, "", "", "1", "64"]));
+        assert_eq!(
+            r,
+            (
+                PluginErrorCode::PermissionDenied,
+                "permission denied reading image".to_string()
+            )
+        );
+    }
+
+    // 失敗後も接続は維持され、VM は登録されていない。
+    assert_eq!(
+        expect_ok(call(&mut e.stream, 99, s(&["ping"])), 99),
+        s(&["pong"])
+    );
+    assert!(e.record.lock().expect("lock").starts.is_empty());
+    let _ = e.finish();
+}
+
 /// 停止期限切れで切り離した VM は、終了を観測するまで枠を返さず、観測後の start で枠が回収される（#3745・PLUG-1・REPAIR-5）。
 #[test]
 fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_uds() {

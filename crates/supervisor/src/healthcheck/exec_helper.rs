@@ -372,11 +372,18 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
     let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
     // 排他作成に成功した exec 子 cgroup の名前を、結果行より先に fd 2 へ通知する（supervisor はこれを受けた
     // cgroup だけを停止する。pid からの推定はしない）。
+    // 通知を書けないと supervisor は止める対象を知れない（結果行も同じ fd 2 に書けない）ため、失敗は exec を中止する
+    // （fail-closed。作成した cgroup は `on_created` の失敗経路で消える）。
     let notify = |name: &fandhe_container_core::exec::ExecCgroupName| {
         let mut err = std::io::stderr();
-        let _ = err
-            .write_all(&super::exec_wire::encode_cgroup_created(name))
-            .and_then(|()| err.flush());
+        err.write_all(&super::exec_wire::encode_cgroup_created(name))
+            .and_then(|()| err.flush())
+            .map_err(|_| {
+                fandhe_container_core::traits::TraitError::new(
+                    fandhe_container_core::traits::ErrorCode::Unavailable,
+                    "failed to notify the supervisor of the exec cgroup",
+                )
+            })
     };
     let result = crate::exec::run_command_with_pidfd_output_notify(
         &record,

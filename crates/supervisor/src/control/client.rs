@@ -80,6 +80,34 @@ impl PendingRestartCanceller for ControlRestartCanceller {
     }
 }
 
+/// supervisor の制御チャネルから、稼働中コンテナの起動時 pidfd の複製を受け取る [`super::ExecPidfdSource`]
+/// （CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ（pidfd と `SCM_RIGHTS` は Linux の機能）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct ControlExecHandover {
+    state_root: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ControlExecHandover {
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::ExecPidfdSource for ControlExecHandover {
+    fn obtain(
+        &self,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<super::ExecHandover, TraitError> {
+        linux::exec_handover(&self.state_root, id, pid, deadline)
+    }
+}
+
 /// supervisor の制御チャネルへシグナル送信を依頼する `ProcessSignaler`。
 #[derive(Debug, Clone)]
 pub struct ControlSignaler {
@@ -140,11 +168,13 @@ impl ProcessSignaler for ControlSignaler {
 mod linux {
     use std::io::{self, Write as _};
     use std::num::NonZeroU32;
-    use std::os::fd::AsFd as _;
+    use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::exec::ExecCgroupName;
     use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
     use super::CancelOutcome;
@@ -152,10 +182,12 @@ mod linux {
         CONTROL_SOCKET_NAME, effective_uid, open_state_dir, path_via_fd,
     };
     use crate::control::protocol::{
-        CancelRestartRequestFrame, ControlReason, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET,
+        CancelRestartRequestFrame, ControlReason, ExecCgroupNotifyFrame, ExecHandoverRequestFrame,
+        FrameHeader, HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_SIGNAL_BUDGET, RESPONSE_LEN,
         RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
+    use crate::control::{ExecCreatedNotifier, ExecHandover};
 
     /// 1 回の交換で送る要求。
     #[derive(Clone, Copy)]
@@ -166,6 +198,10 @@ mod linux {
             signal: Signal,
         },
         CancelRestart,
+        /// exec 用 pidfd の受け渡し（#2626）。応答に fd が添えられる。
+        ExecHandover {
+            pid: NonZeroU32,
+        },
     }
 
     /// connect の再試行の間隔と、`ENOENT`・`ECONNREFUSED` を再試行する窓。
@@ -293,6 +329,17 @@ mod linux {
         id: &ContainerId,
         deadline: Instant,
     ) -> Result<ControlReason, TraitError> {
+        exchange_with_fds(state_root, request, id, deadline).map(|(reason, _fds, _stream)| reason)
+    }
+
+    /// [`exchange`] と同じだが、応答に添えられた fd と接続も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
+    /// 他の要求では `fds` は常に空で、通常の `read` 経路のまま）。受け取った fd は呼び出し側が検証し、想定外なら drop で閉じる。
+    fn exchange_with_fds(
+        state_root: &Path,
+        request: Request,
+        id: &ContainerId,
+        deadline: Instant,
+    ) -> Result<(ControlReason, Vec<OwnedFd>, UnixStream), TraitError> {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
@@ -352,15 +399,176 @@ mod linux {
                 }
                 .encode(),
             ),
+            Request::ExecHandover { pid } => stream.write_all(
+                &ExecHandoverRequestFrame {
+                    pid,
+                    deadline: deadline_frame,
+                }
+                .encode(),
+            ),
         };
         sent.map_err(|e| io_error(&e))?;
 
+        if matches!(request, Request::ExecHandover { .. }) {
+            // 接続は呼び出し側へ返す（exec の間保持して作成通知に使う。閉じることが supervisor への回収の合図）。
+            let (reason, fds) = read_response_with_fds(&mut stream, deadline)?;
+            return Ok((reason, fds, stream));
+        }
         read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
             .and_then(FrameHeader::expect_response)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
         let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
         read_exact_until(&mut stream, &mut payload, deadline).map_err(|e| io_error(&e))?;
-        Ok(ResponseFrame::decode_payload(&payload).reason)
+        Ok((
+            ResponseFrame::decode_payload(&payload).reason,
+            Vec::new(),
+            stream,
+        ))
+    }
+
+    /// 応答（Response frame 9 バイト）を、添えられた fd とともに受ける。fd は応答の最初のバイトに付いて届くので、
+    /// 最初の読み取りを `recvmsg` で行い、足りない残りだけを通常の読み取りで補う（通常の `read` は fd を捨てる）。
+    /// 読み取りごとに残り時間を受信タイムアウトへ設定し直す（REPAIR-5）。
+    fn read_response_with_fds(
+        stream: &mut UnixStream,
+        deadline: Instant,
+    ) -> Result<(ControlReason, Vec<OwnedFd>), TraitError> {
+        let mut frame = [0u8; RESPONSE_LEN];
+        // `EINTR` は sys が返すので、再試行のたびに残り時間を受信タイムアウトへ設定し直す（割り込みが続いても
+        // 絶対期限を超えない。REPAIR-5）。`EAGAIN`（受信タイムアウト）は期限切れ。
+        let received = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timeout());
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| unavailable())?;
+            match crate::sys::recv_with_fds(stream.as_fd(), &mut frame) {
+                Ok(r) => break r,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(timeout()),
+                Err(e) => return Err(io_error(&e)),
+            }
+        };
+        // 切り詰められた（想定外の本数）制御データは、受け切れなかった分をカーネルが閉じている。受け取った分は drop で閉じる。
+        if received.truncated {
+            return Err(unavailable());
+        }
+        if received.len == 0 {
+            return Err(unavailable());
+        }
+        if let Some(rest) = frame.get_mut(received.len..)
+            && !rest.is_empty()
+        {
+            read_exact_until(stream, rest, deadline).map_err(|e| io_error(&e))?;
+        }
+        let (head, payload) = frame
+            .split_first_chunk::<HEADER_LEN>()
+            .ok_or_else(unavailable)?;
+        FrameHeader::decode(head)
+            .and_then(FrameHeader::expect_response)
+            .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
+        let payload: [u8; RESPONSE_PAYLOAD_LEN] = payload.try_into().map_err(|_| unavailable())?;
+        Ok((ResponseFrame::decode_payload(&payload).reason, received.fds))
+    }
+
+    /// 稼働中コンテナの起動時 pidfd の複製を supervisor から受け取る（SUP-6・SEC-1・#2626）。
+    ///
+    /// 成功は「`Response(Ok)` と fd がちょうど 1 本」のときだけ。拒否（理由コード）に fd が添えられていても、Ok に
+    /// fd が無い・2 本以上でも、受け取った fd はすべて閉じて失敗にする（fail-closed。fd を漏らさない）。届いた fd が
+    /// 本当に記録 pid の pidfd かは、呼び出し側が `identify_pid1_with_pidfd` で確かめる（この関数は fd を信用しない）。
+    /// 接続は閉じずに [`ExecHandover`] へ持たせる（exec 子 cgroup の作成通知と、消滅の検出に使う）。
+    pub(super) fn exec_handover(
+        state_root: &Path,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<ExecHandover, TraitError> {
+        let usable = deadline.saturating_duration_since(Instant::now());
+        if usable <= DEADLINE_MARGIN {
+            return Err(timeout());
+        }
+        let (reason, fds, stream) =
+            exchange_with_fds(state_root, Request::ExecHandover { pid }, id, deadline)?;
+        if let Some(e) = reason.to_error() {
+            return Err(e);
+        }
+        let mut fds = fds.into_iter();
+        match (fds.next(), fds.next()) {
+            (Some(fd), None) => Ok(ExecHandover::new(
+                fd,
+                Box::new(StreamNotifier {
+                    stream: Mutex::new(stream),
+                }),
+            )),
+            // fd が無い・2 本以上: 契約違反の応答。受け取った fd と接続は drop で閉じる。
+            _ => Err(TraitError::new(
+                ErrorCode::Internal,
+                "the supervisor control channel returned an unexpected descriptor set",
+            )),
+        }
+    }
+
+    /// ack を待つ上限（全体の期限の内側でさらに絞る。REPAIR-5）。
+    const NOTIFY_ACK_BUDGET: Duration = Duration::from_secs(5);
+
+    /// pidfd を受け取った接続で、exec 子 cgroup の作成を通知する本番の実装。
+    struct StreamNotifier {
+        stream: Mutex<UnixStream>,
+    }
+
+    impl ExecCreatedNotifier for StreamNotifier {
+        fn notify_created(
+            &self,
+            name: &ExecCgroupName,
+            hold_until: Instant,
+        ) -> Result<(), TraitError> {
+            let mut stream = self.stream.lock().map_err(|_| unavailable())?;
+            // 単調時計を `Instant` より先に読む。間で止まっても、残り時間は後の `now` で短く測られ、
+            // 先の `now_ns` へ足すため、載せる絶対期限は早まる側にだけずれる（`hold_until` を越えない）。
+            let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
+            let now = Instant::now();
+            let hold = hold_until
+                .saturating_duration_since(now)
+                .min(Duration::from_secs(MAX_EXEC_HOLD_SECS));
+            if hold.is_zero() {
+                return Err(timeout());
+            }
+            let abs_ns = u64::try_from(hold.as_nanos())
+                .ok()
+                .and_then(|n| now_ns.checked_add(n))
+                .ok_or_else(unavailable)?;
+            let frame = ExecCgroupNotifyFrame {
+                name: name.clone(),
+                hold: HoldDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?,
+            };
+            let bytes = frame.encode().map_err(|_| unavailable())?;
+            let ack_deadline = now
+                .checked_add(NOTIFY_ACK_BUDGET)
+                .unwrap_or(now)
+                .min(hold_until);
+            let write_limit = ack_deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            stream
+                .set_write_timeout(Some(write_limit))
+                .map_err(|_| unavailable())?;
+            stream
+                .write_all(bytes.as_slice())
+                .map_err(|e| io_error(&e))?;
+            let mut head = [0u8; HEADER_LEN];
+            read_exact_until(&mut stream, &mut head, ack_deadline).map_err(|e| io_error(&e))?;
+            FrameHeader::decode(&head)
+                .and_then(FrameHeader::expect_response)
+                .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
+            let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
+            read_exact_until(&mut stream, &mut payload, ack_deadline).map_err(|e| io_error(&e))?;
+            match ResponseFrame::decode_payload(&payload).reason.to_error() {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
+        }
     }
 }

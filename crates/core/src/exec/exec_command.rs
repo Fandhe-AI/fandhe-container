@@ -45,7 +45,9 @@
 //!   親が既に終了していれば子は何もせず終了する。これで「呼び出しプロセスの終了 → worker の停止 →
 //!   コマンドの停止」が連鎖する。設定は資格情報の変わらない `execve` を越えて保持されるが、実行された
 //!   コマンド自身は `prctl` で解除できる（解除したコマンドと、コマンドがコンテナ内で作った子孫は、コンテナの
-//!   cgroup と制限の内側に残る。確実に止めるのは次項の exec 用の子 cgroup と `cgroup.kill`）
+//!   cgroup と制限の内側に残る。確実に止めるのは次項の exec 用の子 cgroup と `cgroup.kill`。呼び出しプロセス自身が SIGKILL
+//!   されたときの回収は、本番の CLI の exec では supervisor のガードが担う〔pidfd を渡した接続の切断で、通知済みの
+//!   子 cgroup を止める。`docs/design/exec-pidfd-handover.md` 3.5〕）
 //! - **exec 用の子 cgroup と `cgroup.kill`**（SUP-6・SUP-4・REPAIR-5・CORE-4・TASK-163 追補・#1466）: コマンドだけを
 //!   コンテナ cgroup 直下の子 cgroup（[`ExecChildCgroup`]。`exec-<nonce>`）へ入れて実行する。fork した子は
 //!   `execve` の前（`close_range` の前）に自分を `cgroup.procs` へ `0` で移す。この時点で子孫は存在しないため、

@@ -107,6 +107,7 @@ fandhe-container/
 │   │   ├── runtime-self-sealed-copy.md  # ランタイム自身の封印複製（memfd + seal。方式 B）を組み込むかの判断記録（#2686・CORE-5・REPAIR-3。オーナー承認待ち）
 │   │   ├── healthcheck-exec-helper.md  # healthcheck コマンドを exec する HealthProbe の本番アダプタ（exec 専用 helper プロセスの方式・fd の割り当て・結果行・出力の扱い・タイムアウトの層・ambient・残余。#2441・SUP-4・SUP-6・SEC-1・SEC-4）
 │   │   ├── healthcheck-argv-timeout.md  # healthcheck の argv[0] の解決方式と timeout の上限の判断記録（#2439・SUP-4・TASK-161 追補。オーナー承認待ち）
+│   │   ├── exec-pidfd-handover.md # CLI の exec へ起動時 pidfd を supervisor の制御チャネル（kind 6・SCM_RIGHTS）で渡す方式の判断記録と、CLI の exec の配線・終了コード（#2626・SUP-6・SEC-4・CLI-1。案 A は 2026-11-03 にオーナー承認）
 │   │   ├── subid-owner-resolution.md  # rootless の subuid / subgid の所有者名を passwd 優先・無ければ `getent`（NSS）で解決する方針の判断記録（#2390・SEC-5・CORE-6。shadow 4.13 の `newuidmap` の照合に合わせる）
 │   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
 │   │   ├── volume-provider-implementation.md  # VolumeProvider の core 側実装（named volume の実体化）の担当 TASK と時期の判断記録（#2451・CRI-7・PLUG-1・IO-7。オーナー承認待ち）

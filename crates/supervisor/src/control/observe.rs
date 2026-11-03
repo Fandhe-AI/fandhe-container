@@ -63,6 +63,28 @@ impl ControlObserver {
         }
     }
 
+    /// exec 子 cgroup の回収（ガードが切断・不正データ・期限のいずれかで実行したもの）の結果を集計し、構造化ログを 1 行出す
+    /// （SUP-6・REPAIR-4）。`trigger` と結果は固定語彙のみ。`Failed` 以外は成功として数える（`Absent` は通常終了）。
+    pub fn record_exec_reclaim(
+        &self,
+        trigger: &'static str,
+        outcome: super::exec_guard::ReclaimOutcome,
+    ) {
+        if let Ok(name) = OpName::new("exec_cgroup_reclaim") {
+            let o = if outcome == super::exec_guard::ReclaimOutcome::Failed {
+                OpOutcome::Failure
+            } else {
+                OpOutcome::Success
+            };
+            let _ = self.recorder.record(&name, o, Duration::ZERO);
+        }
+        let line = format!(
+            "{{\"component\":\"supervisor\",\"event\":\"exec_cgroup_reclaim\",\"trigger\":\"{trigger}\",\"outcome\":\"{}\"}}\n",
+            outcome.name()
+        );
+        let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+    }
+
     /// 1 要求の結果とレイテンシを集計し、構造化ログを 1 行出す。
     pub fn record_request(&self, success: bool, elapsed: Duration) {
         let Ok(name) = OpName::new(OP_NAME) else {

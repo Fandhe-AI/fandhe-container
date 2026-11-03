@@ -12,11 +12,26 @@
 //!
 //! | モジュール | 役割 |
 //! | ---------- | ---- |
-//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・Response）と理由コード。全 OS |
-//! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`）。全 OS |
+//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・ExecHandoverRequest・Response）と理由コード。全 OS |
+//! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`。exec 用に起動時 pidfd の複製も保持する）。全 OS |
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
-//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`） |
+//! | `exec_guard` | exec 子 cgroup の回収の見張り（pidfd を渡した接続を預かり、切断か期限で回収役を呼ぶ。Linux。#2626） |
+//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`）、Linux のみ `ControlExecHandover`（CLI の `exec` 用に起動時 pidfd の複製を `SCM_RIGHTS` で受け取る。#2626） |
+//!
+//! # exec 用 pidfd の受け渡し（SUP-6・SEC-1・#2626）
+//!
+//! CLI の `exec` は `run_command_with_pidfd` に起動時の pidfd を要する（記録 pid からの `pidfd_open` は pid 再利用に弱く、
+//! 本番では使わない）。pidfd を持つのは supervisor の監視スレッドだけなので、ExecHandoverRequest（kind 6）で複製を
+//! `SCM_RIGHTS` の fd 1 本として返す。`Active` で記録 pid が一致するときだけ渡し（拒否には fd を添えない）、複製は
+//! `Exited`・`Empty` へ遷移したら落とす。受け取った CLI は fd を信用せず、`identify_pid1_with_pidfd` が記録 pid との
+//! 一致を確かめる。信頼境界は他の要求と同じ（同じ uid・コンテナごとの 0600 のソケット・`SO_PEERCRED` の照合）。
+//! 判断記録は `docs/design/exec-pidfd-handover.md`。
+//!
+//! pidfd を渡した接続は閉じずに専用の「ガード」スレッドが預かる（`exec_guard`）。CLI は exec 子 cgroup の排他作成の直後に
+//! ExecCgroupNotify（kind 7）でその名前を通知し、ガードは ack の後、接続の切断（CLI の消滅を含む）か保持期限で、
+//! その cgroup を `cgroup.kill` と削除で回収する。PDEATHSIG の届かない子孫（`--timeout` を超えた残留）を、生存する
+//! supervisor が回収する（SUP-6・REPAIR-5）。回収役が結線されていない構成は pidfd を渡さない（fail-closed）。
 //!
 //! # 寿命
 //!
@@ -49,13 +64,21 @@ pub mod protocol;
 pub mod target;
 
 #[cfg(target_os = "linux")]
+pub mod exec_guard;
+#[cfg(target_os = "linux")]
 pub mod listener;
 #[cfg(target_os = "linux")]
 pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod server;
 
+#[cfg(target_os = "linux")]
+pub use client::ControlExecHandover;
 pub use client::{CancelOutcome, ControlRestartCanceller, ControlSignaler};
+#[cfg(target_os = "linux")]
+pub use exec_guard::{
+    ExecCgroupReclaimer, ExecGuardLimits, ExecGuardPool, ReclaimOutcome, StoreExecReclaimer,
+};
 
 /// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
 ///
@@ -144,6 +167,109 @@ pub fn production_restart_canceller(
     }
 }
 
+/// 稼働中コンテナの起動時 pidfd の複製を取得する注入点（CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ。
+///
+/// 本番は [`ControlExecHandover`]（supervisor の制御チャネルの ExecHandoverRequest）、CLI の試験は差し替える。
+/// 取得した fd を信用しない: 呼び出し側が `exec::identify_pid1_with_pidfd`（`run_command_with_pidfd`）で記録 pid との一致を
+/// 確かめる。`state.json` の pid からの `pidfd_open` への縮退は持たない（pid 再利用。SEC-1）。
+#[cfg(target_os = "linux")]
+pub trait ExecPidfdSource: Send + Sync {
+    /// `deadline` までに、`pid`（記録上の pid1）の起動時 pidfd の複製を受け取る。supervisor に届かない・保持していない・
+    /// pid 不一致・古い版の supervisor・回収役の無い supervisor・ガードの上限などは構造化エラー（fd は渡らない）。
+    /// 返す [`ExecHandover`] は supervisor との接続を保持する。呼び出し側は exec が終わり後始末を済ませるまで
+    /// 生かし、その後に drop する（drop が切断で、supervisor の回収の合図になる）。
+    fn obtain(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        pid: std::num::NonZeroU32,
+        deadline: std::time::Instant,
+    ) -> Result<ExecHandover, fandhe_container_core::traits::TraitError>;
+}
+
+/// exec 子 cgroup の作成を、pidfd を渡した supervisor へ通知する口（SUP-6・REPAIR-5・#2626）。
+///
+/// 本番は制御チャネルの接続（ExecCgroupNotify）、CLI の試験は記録する偽の実装に差し替える。
+#[cfg(target_os = "linux")]
+pub trait ExecCreatedNotifier: Send {
+    /// 排他作成に成功した exec 子 cgroup `name` を通知し、supervisor の ack を待つ。`hold_until` は exec 全体の期限
+    /// （supervisor はこの期限 + 猶予まで接続を見張る）。失敗したら呼び出し側は worker を fork せず exec を中止する。
+    fn notify_created(
+        &self,
+        name: &fandhe_container_core::exec::ExecCgroupName,
+        hold_until: std::time::Instant,
+    ) -> Result<(), fandhe_container_core::traits::TraitError>;
+}
+
+/// [`ExecPidfdSource::obtain`] の結果: 起動時 pidfd の複製と、supervisor との接続（作成通知の口）。
+///
+/// drop でこの接続が閉じる。supervisor は通知済みの cgroup を、接続が閉じた時点で回収する（通常終了では CLI が先に
+/// 消していて何も起きない）。
+#[cfg(target_os = "linux")]
+pub struct ExecHandover {
+    pidfd: std::os::fd::OwnedFd,
+    notifier: Box<dyn ExecCreatedNotifier>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ExecHandover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecHandover").finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExecHandover {
+    /// pidfd と通知の口から作る。
+    pub fn new(pidfd: std::os::fd::OwnedFd, notifier: Box<dyn ExecCreatedNotifier>) -> Self {
+        Self { pidfd, notifier }
+    }
+
+    /// 受け取った pidfd（信用せず、呼び出し側が記録 pid との一致を確かめる）。
+    pub fn pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.pidfd)
+    }
+
+    /// exec 子 cgroup の作成を supervisor へ通知する（[`ExecCreatedNotifier::notify_created`]）。
+    pub fn notify_created(
+        &self,
+        name: &fandhe_container_core::exec::ExecCgroupName,
+        hold_until: std::time::Instant,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        self.notifier.notify_created(name, hold_until)
+    }
+}
+
+/// 状態ルートを公開しないストア用の fail-closed の取得元。常に `Unimplemented` で失敗する（REPAIR-3）。
+#[cfg(target_os = "linux")]
+pub struct UnavailableExecPidfdSource;
+
+#[cfg(target_os = "linux")]
+impl ExecPidfdSource for UnavailableExecPidfdSource {
+    fn obtain(
+        &self,
+        _id: &fandhe_container_core::traits::ContainerId,
+        _pid: std::num::NonZeroU32,
+        _deadline: std::time::Instant,
+    ) -> Result<ExecHandover, fandhe_container_core::traits::TraitError> {
+        Err(fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "exec pidfd source is not available yet",
+        ))
+    }
+}
+
+/// 本番の exec 用 pidfd 取得元。[`production_stop_signaler`] と同じ到達先の規則で、`host_state_root()` の無いストアには
+/// fail-closed の実装を返す（縮退しない。SEC-1・CORE-1）。
+#[cfg(target_os = "linux")]
+pub fn production_exec_pidfd_source(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn ExecPidfdSource> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlExecHandover::new(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableExecPidfdSource),
+    }
+}
+
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・uid・パス・errno は載せない。REPAIR-4）。
 ///
 /// 待たない出力経路（`stderr_sink`）へ渡すだけで、キューが満杯なら捨てる（REPAIR-5）。
@@ -156,7 +282,7 @@ pub(crate) fn log_control_event(event: &'static str, reason: Option<&'static str
 }
 
 #[cfg(target_os = "linux")]
-pub use install::{ControlHandle, install};
+pub use install::{ControlHandle, install, install_with_exec_reclaimer};
 
 #[cfg(target_os = "linux")]
 mod install {
@@ -167,6 +293,7 @@ mod install {
     use fandhe_container_core::oci_runtime::exit_code_for;
     use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
+    use super::exec_guard::{ExecCgroupReclaimer, ExecGuardLimits, ExecGuardPool};
     use super::listener::{ControlListener, effective_uid};
     use super::observe::ControlObserver;
     use super::server::{PausableServer, ServeConfig};
@@ -241,6 +368,20 @@ mod install {
         stop: &StopToken,
         audit: Option<Arc<dyn AuditSink>>,
     ) -> (Running, ControlHandle) {
+        install_with_exec_reclaimer(state_root, id, running, stop, audit, None)
+    }
+
+    /// [`install`] に、exec 子 cgroup の回収役を足した版（SUP-6・REPAIR-5・#2626）。本番の入口
+    /// （`start_entry`）はこちらを使う。`reclaimer` が `None` なら、制御チャネルは ExecHandoverRequest を断る
+    /// （子孫を回収できない exec に pidfd を渡さない。fail-closed）。
+    pub fn install_with_exec_reclaimer(
+        state_root: &Path,
+        id: &ContainerId,
+        running: Running,
+        stop: &StopToken,
+        audit: Option<Arc<dyn AuditSink>>,
+        reclaimer: Option<Arc<dyn ExecCgroupReclaimer>>,
+    ) -> (Running, ControlHandle) {
         let bound = effective_uid()
             .and_then(|uid| ControlListener::bind_as(state_root, id, uid).map(|l| (uid, l)));
         let (uid, listener) = match bound {
@@ -259,8 +400,17 @@ mod install {
             seccomp,
         } = running;
         let observer = Arc::new(ControlObserver::new(audit, Some(id.clone())));
+        let guards = reclaimer
+            .map(|r| ExecGuardPool::new(r, Arc::clone(&observer), ExecGuardLimits::default()));
         let server = listener.try_clone_listener().and_then(|l| {
-            PausableServer::spawn(l, slot.clone(), uid, ServeConfig::default(), observer)
+            PausableServer::spawn_with_exec_guard(
+                l,
+                slot.clone(),
+                uid,
+                ServeConfig::default(),
+                observer,
+                guards,
+            )
         });
         match server {
             Ok(s) => {

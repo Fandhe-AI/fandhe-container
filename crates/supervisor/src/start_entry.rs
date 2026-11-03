@@ -3681,8 +3681,18 @@ mod linux {
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
         // 記録先が無い構成は手順 4 で拒否済み(起動していない)ので、ここへ届くときは `Some`。
-        let (running, control) =
-            crate::control::install(&args.root, &args.id, running, &stop, audit);
+        // exec 子 cgroup の回収役（pidfd を渡した CLI が消えたとき、その exec の子孫ごと cgroup を回収する。SUP-6・#2626）。
+        let exec_reclaimer: Arc<dyn crate::control::ExecCgroupReclaimer> = Arc::new(
+            crate::control::StoreExecReclaimer::new(Arc::clone(&store), args.id.clone()),
+        );
+        let (running, control) = crate::control::install_with_exec_reclaimer(
+            &args.root,
+            &args.id,
+            running,
+            &stop,
+            audit,
+            Some(exec_reclaimer),
+        );
         let code = run_supervised_with_health(
             store,
             args.id,

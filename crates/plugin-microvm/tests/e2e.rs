@@ -540,6 +540,27 @@ fn task117_4_plug1_backend_start_failure_maps_to_error_frame_and_keeps_connectio
     let _ = e.finish();
 }
 
+/// `mkfifo` で FIFO を作る。起動失敗・非ゼロ終了・期限切れはすべて panic で失敗させる（REPAIR-5・REPAIR-12）。
+fn make_fifo(path: &std::path::Path) {
+    let mut child = std::process::Command::new("mkfifo")
+        .arg(path)
+        .spawn()
+        .expect("spawn mkfifo");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("try_wait mkfifo") {
+            Some(st) => break st,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mkfifo did not exit within 10s");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
 /// イメージパスの読み取り失敗が、実際の UDS 経路で固定文言のエラー応答へ写る（ERR-1・SEC-1・PLUG-1・#3841）。
 /// 最終要素の open は `O_NOCTTY` 付き（フラグ定数は sys の単体試験が具体値で固定）。lstat 後の tty 差し替えは
 /// 公開 API からは作れないため、ここでは通常ファイルの読み取りが `O_NOCTTY` 付きでも成功すること（既存試験）と、
@@ -601,22 +622,16 @@ fn sec1_err1_3841_image_open_failures_map_to_fixed_error_frames_via_uds() {
         )
     );
     let fifo = real_dir.join("fifo.bin");
-    if std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        let fifo_s = fifo.to_str().expect("utf8").to_string();
-        let r = expect_err(&mut e, s(&["start", "v1", &fifo_s, "", "", "1", "64"]));
-        assert_eq!(
-            r,
-            (
-                PluginErrorCode::InvalidArgument,
-                "image must be a regular file".to_string()
-            )
-        );
-    }
+    make_fifo(&fifo);
+    let fifo_s = fifo.to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &fifo_s, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image must be a regular file".to_string()
+        )
+    );
 
     // 祖先が symlink のディレクトリは INVALID_ARGUMENT（祖先の文言）。
     let dir_link = real_dir.join("dlink");
@@ -631,19 +646,22 @@ fn sec1_err1_3841_image_open_failures_map_to_fixed_error_frames_via_uds() {
         )
     );
 
-    // 読み取り権限が無い通常ファイルは PERMISSION_DENIED（root では権限が効かないため確認して飛ばす）。
+    // 読み取り権限が無い通常ファイルは PERMISSION_DENIED。root では権限が効かず検証できないため、
+    // 前提の不成立は省略せず明示的に失敗させる（非特権で実行する。REPAIR-12）。
     let secret = e.dir.file("noperm.bin", KERNEL);
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    if std::fs::File::open(&secret).is_err() {
-        let r = expect_err(&mut e, s(&["start", "v1", &secret, "", "", "1", "64"]));
-        assert_eq!(
-            r,
-            (
-                PluginErrorCode::PermissionDenied,
-                "permission denied reading image".to_string()
-            )
-        );
-    }
+    assert!(
+        std::fs::File::open(&secret).is_err(),
+        "precondition failed: mode 000 file is readable (run as a non-root user)"
+    );
+    let r = expect_err(&mut e, s(&["start", "v1", &secret, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::PermissionDenied,
+            "permission denied reading image".to_string()
+        )
+    );
 
     // 失敗後も接続は維持され、VM は登録されていない。
     assert_eq!(

@@ -138,6 +138,10 @@ mod mock_core {
         pub starts: Vec<StartRecord>,
         pub stops: Vec<(u32, Duration)>,
         pub start_err: Option<MicrovmErrorCode>,
+        /// 設定すると stop がそのコードで失敗する（`DeadlineExceeded` で期限切れの切り離しを模擬。#3745）。
+        pub stop_err: Option<MicrovmErrorCode>,
+        /// 終了を観測済みにした VM の id（後から vCPU スレッドが終わった模擬。#3745）。
+        pub exited: std::collections::BTreeSet<u32>,
     }
 
     /// 起動・停止の引数を記録する偽バックエンド（adapter の `#[cfg(test)]` 版は非公開のため独自に持つ）。
@@ -163,16 +167,24 @@ mod mock_core {
         }
 
         fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
-            self.0.lock().expect("lock").stops.push((vm, deadline));
-            Ok("requested")
+            let mut r = self.0.lock().expect("lock");
+            r.stops.push((vm, deadline));
+            match r.stop_err {
+                Some(code) => Err(MicrovmError::new(code, "fake stop")),
+                None => Ok("requested"),
+            }
         }
 
         fn exit_watch(&self, vm: &u32) -> u32 {
             *vm
         }
 
-        fn exit_state(&self, _watch: &u32) -> DetachedState {
-            DetachedState::Pending
+        fn exit_state(&self, watch: &u32) -> DetachedState {
+            if self.0.lock().expect("lock").exited.contains(watch) {
+                DetachedState::Released
+            } else {
+                DetachedState::Pending
+            }
         }
     }
 
@@ -355,6 +367,66 @@ fn task117_4_plug1_backend_start_failure_maps_to_error_frame_and_keeps_connectio
         }
         other => panic!("unexpected {other:?}"),
     }
+    let _ = e.finish();
+}
+
+/// 停止期限切れで切り離した VM は、終了を観測するまで枠を返さず、観測後の start で枠が回収される（#3745・PLUG-1・REPAIR-5）。
+#[test]
+fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_uds() {
+    use fandhe_container_microvm::error::MicrovmErrorCode;
+    use fandhe_container_plugin::PluginErrorCode;
+    use fandhe_container_plugin_microvm::adapter::MAX_VMS;
+
+    let mut e = mock_core::E2e::start();
+    let kernel = e.dir.file("k.bin", KERNEL);
+    e.record.lock().expect("lock").stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+    let mut id = 1u64;
+    for i in 0..MAX_VMS {
+        let name = format!("vm{i}");
+        let start = s(&["start", &name, &kernel, "", "", "1", "64"]);
+        assert_eq!(
+            expect_ok(call(&mut e.stream, id, start), id),
+            s(&["running"])
+        );
+        id += 1;
+        match call(&mut e.stream, id, s(&["stop", &name])) {
+            ControlMessage::Error { error, .. } => {
+                assert_eq!(error.code(), PluginErrorCode::Timeout);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        id += 1;
+    }
+    // 終了未観測の間は上限で拒否され続け、backend は追加で起動されない。
+    for _ in 0..2 {
+        let over = s(&["start", "over", &kernel, "", "", "1", "64"]);
+        match call(&mut e.stream, id, over) {
+            ControlMessage::Error { error, .. } => {
+                assert_eq!(error.code(), PluginErrorCode::ResourceExhausted);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        id += 1;
+        assert_eq!(e.record.lock().expect("lock").starts.len(), MAX_VMS);
+    }
+    // vCPU スレッドの終了を観測できたら、次の start で枠が回収されて通る。
+    e.record.lock().expect("lock").exited.insert(1);
+    let again = s(&["start", "new", &kernel, "", "", "1", "64"]);
+    assert_eq!(
+        expect_ok(call(&mut e.stream, id, again), id),
+        s(&["running"])
+    );
+    id += 1;
+    assert_eq!(e.record.lock().expect("lock").starts.len(), MAX_VMS + 1);
+    // 回収は観測した 1 件だけで、残りは再び上限に当たる。
+    let over = s(&["start", "over2", &kernel, "", "", "1", "64"]);
+    match call(&mut e.stream, id, over) {
+        ControlMessage::Error { error, .. } => {
+            assert_eq!(error.code(), PluginErrorCode::ResourceExhausted);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    e.record.lock().expect("lock").stop_err = None;
     let _ = e.finish();
 }
 

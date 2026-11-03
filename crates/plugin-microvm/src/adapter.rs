@@ -36,7 +36,10 @@
 //! - 残余: `KVM_RUN` や ioctl の中で D 状態のまま戻らない vCPU スレッドは `Pending` のままで枠は返らない（回復は plugin の再起動）。
 //!   microvm 側で memslot の削除に失敗した場合は、`Released` でもゲスト RAM の mapping が残りうる（microvm 側の fail-closed の既存仕様）。
 //!   非 Linux では VM を作れないため `detached` は生じない。
-//! - 応答しないファイルシステム上のイメージ読み込みは期限で打ち切れない。呼び出し側は symlink を含まないパスを渡す
+//! - イメージ読み込みは別スレッドで走らせ [`IMAGE_READ_DEADLINE`] で `TIMEOUT` にする（REPAIR-5）。期限切れのスレッドは取り消せず、
+//!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
+//!   `RESOURCE_EXHAUSTED` になる。
+//! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
 //!   Windows は祖先を検査しない（reparse point は未検査。非 Linux の backend は `start` が `UNIMPLEMENTED` で VM は起動しない）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
@@ -369,6 +372,7 @@ enum ImageKind {
 ///
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
+/// 枠は I/O が戻るまで保持し、生存中の読み込みが `MAX_INFLIGHT_READS` に達すると `RESOURCE_EXHAUSTED` になる。
 fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
     let slot = ReadSlot::acquire()?;
     let (tx, rx) = std::sync::mpsc::channel();

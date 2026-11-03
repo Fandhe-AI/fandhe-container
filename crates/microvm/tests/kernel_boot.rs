@@ -29,6 +29,7 @@ mod x86 {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -52,7 +53,13 @@ mod x86 {
 
     /// 上限つきでファイルを読む。空・上限超過・通常ファイルでないものは拒否する。
     fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-        let file = std::fs::File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
+        // REPAIR-5: 書き手のいない FIFO で open が無期限に止まらないよう O_NONBLOCK（Linux: 0o4000）で開く。
+        // 通常ファイルには影響せず、FIFO・デバイス等は下の通常ファイル検査で拒否する。
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o4000)
+            .open(path)
+            .map_err(|e| format!("cannot open file: {e}"))?;
         let meta = file
             .metadata()
             .map_err(|e| format!("cannot stat file: {e}"))?;
@@ -325,6 +332,22 @@ mod x86 {
         assert!(read_bounded(&empty, 8).is_err());
         assert!(read_bounded(&dir, 8).is_err());
         assert!(read_bounded(&dir.join("missing"), 8).is_err());
+        // 書き手のいない FIFO は期限内に明示的に拒否される（REPAIR-5）。
+        let fifo = dir.join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (tx, rx) = mpsc::channel();
+        let f = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_bounded(&f, 8));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("read_bounded blocked on FIFO");
+        assert_eq!(r.unwrap_err(), "not a regular file");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

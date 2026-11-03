@@ -32,10 +32,16 @@ fn hvf_device_create_map_unmap_vm() {
     let page = HostMapping::page_size().unwrap();
     let host = HostMapping::new(page).unwrap();
     let mapping = vm
-        .map(&host, 0, 0x4000_0000, page, MemoryFlags::RWX)
+        .map(host, 0, 0x4000_0000, page, MemoryFlags::RWX)
         .unwrap();
     mapping.unmap().unwrap();
-    drop(host);
+
+    // forget しても backing は所有されたままリークするだけで、VM の破棄後も munmap されない（寿命契約）。
+    let host2 = HostMapping::new(page).unwrap();
+    let leaked = vm
+        .map(host2, 0, 0x5000_0000, page, MemoryFlags::RWX)
+        .unwrap();
+    std::mem::forget(leaked);
 
     // drop 後は作り直せる。
     drop(vm);

@@ -11,8 +11,11 @@
 //! # 契約（事前承認の条件を満たす設計）
 //! - `unsafe fn` はこのモジュールの外へ公開しない
 //! - すべての `unsafe` ブロック・`unsafe extern "C"` 宣言に `// SAFETY:` で理由と維持すべき不変条件を明記する
-//! - ホストメモリは `mmap` で確保する（Apple の制約。`malloc` は不可）。`GuestMapping` が `HvVm` と
-//!   `HostMapping` を借用するため、対応付けが生きている間は munmap も `hv_vm_destroy` も起きない
+//! - ホストメモリは `mmap` で確保する（Apple の制約。`malloc` は不可）。`HvVm::map` は
+//!   `HostMapping` を値で受け取り `GuestMapping` が所有する。ゲストへの対応付けの解除（`hv_vm_unmap`）が成功
+//!   するまで munmap しない。解除に失敗したら backing は解放せず意図的にリークする（fail-closed）。
+//!   `mem::forget` で `GuestMapping` を捨てても backing はリークするだけで、解放されない（安全）。
+//!   `GuestMapping` は `&HvVm` を借用するため、対応付けが生きている間は `hv_vm_destroy` も起きない
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
 //!
@@ -29,7 +32,6 @@
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{HvOp, MemoryFlags, check_map_range, classify_hv_return};
 use std::ffi::{c_int, c_long, c_void};
-use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -117,10 +119,11 @@ impl HvVm {
     /// `host` の `offset` から `size` バイトを、ゲスト物理アドレス `ipa` に `flags` で対応付ける。
     ///
     /// `hv_vm_map` の前に、範囲（`offset + size <= host.len()`）・ページ境界・桁あふれを検査する。
-    /// 戻り値の `GuestMapping` が `self` と `host` を借用するため、対応付けの間は munmap も destroy も起きない。
+    /// `host` は値で受け取り、戻り値の `GuestMapping` が所有する（解除成功まで munmap しない）。
+    /// 失敗時は対応付けが作られていないため `host` を drop して安全。
     pub fn map<'a>(
         &'a self,
-        host: &'a HostMapping,
+        host: HostMapping,
         offset: usize,
         ipa: u64,
         size: usize,
@@ -137,8 +140,8 @@ impl HvVm {
             .ok_or_else(|| invalid_arg("range overflows the address space"))?;
         check_map_range(addr as u64, ipa, size as u64, host.page_size as u64)?;
         // SAFETY: addr は `host`（生存中の mmap 領域）の内側で、offset + size <= host.len を検査済み。
-        // ipa・size はページ境界・倍数を検査済み。`GuestMapping` が `host` を借用するため、
-        // unmap されるまで領域は munmap されない。
+        // ipa・size はページ境界・倍数を検査済み。`GuestMapping` が `host` を所有し、
+        // unmap の成功まで munmap しない（失敗時はリーク）。
         let rc = unsafe { hv_vm_map(addr as *mut c_void, ipa, size, flags.bits()) };
         classify_hv_return(HvOp::VmMap, rc)?;
         Ok(GuestMapping {
@@ -147,7 +150,7 @@ impl HvVm {
             size,
             page_size: host.page_size,
             active: true,
-            _host: PhantomData,
+            host: Some(host),
         })
     }
 }
@@ -236,7 +239,9 @@ impl Drop for HostMapping {
     }
 }
 
-/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` と `HostMapping` を借用して寿命を縛る。
+/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` を借用し、`HostMapping` を所有する。
+///
+/// 解除（`hv_vm_unmap`）が成功するまで backing を munmap しない。失敗時は backing をリークする（fail-closed）。
 #[derive(Debug)]
 pub struct GuestMapping<'a> {
     _vm: &'a HvVm,
@@ -244,16 +249,33 @@ pub struct GuestMapping<'a> {
     size: usize,
     page_size: usize,
     active: bool,
-    _host: PhantomData<&'a HostMapping>,
+    /// 登録済みの backing。解除成功時のみ drop し、失敗時は `leak_host` でリークする。
+    host: Option<HostMapping>,
 }
 
 impl GuestMapping<'_> {
     /// 明示的に unmap し、結果を観測する（二重 unmap はしない）。
+    ///
+    /// 失敗時はゲストへの対応付けが残りうるため backing を解放せずリークする（fail-closed）。
     pub fn unmap(mut self) -> Result<(), MicrovmError> {
+        let r = self.release();
         self.active = false;
-        // SAFETY: ipa・size は `map` で検査・対応付け済みの範囲。`active` を下ろしたので drop は再度呼ばない。
+        r
+    }
+
+    /// `hv_vm_unmap` を呼び、成功なら backing を drop、失敗ならリークする。
+    fn release(&mut self) -> Result<(), MicrovmError> {
+        if !self.active {
+            return Ok(());
+        }
+        // SAFETY: ipa・size は `map` で検査・対応付け済みの範囲。成功しない限り backing は解放しない。
         let rc = unsafe { hv_vm_unmap(self.ipa, self.size) };
-        classify_hv_return(HvOp::VmUnmap, rc)
+        let r = classify_hv_return(HvOp::VmUnmap, rc);
+        match (&r, self.host.take()) {
+            (Ok(()), host) => drop(host),
+            (Err(_), host) => std::mem::forget(host),
+        }
+        r
     }
 
     /// 対応付けの保護を `flags` に変える。
@@ -267,9 +289,8 @@ impl GuestMapping<'_> {
 
 impl Drop for GuestMapping<'_> {
     fn drop(&mut self) {
-        if self.active {
-            // SAFETY: `unmap` 済みでない対応付けの範囲。失敗は後始末のため無視する。
-            let _ = unsafe { hv_vm_unmap(self.ipa, self.size) };
-        }
+        // 失敗時は backing をリークし、munmap しない（対応付けが残りうるため）。エラーは後始末のため捨てる。
+        let _ = self.release();
+        self.active = false;
     }
 }

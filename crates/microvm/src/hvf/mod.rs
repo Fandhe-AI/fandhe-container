@@ -5,7 +5,7 @@
 //! ここへ追記する。引数の検査と戻り値の写像は OS 非依存の `crate::hvf_abi`。
 //! TASK-192.9・#3791: vCPU 専用スレッド（`vcpu`）と exit ごとのスタブ（`mmio`・`hvc`・`timer`）。ループ本体は OS 非依存の `crate::hvf_loop`。
 
-pub use crate::sys::{GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
+pub use crate::sys::{GicApi, GicConfig, GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
 
 pub mod memory;
 pub use memory::{HvfGuestRam, RegisteredHvfRam};

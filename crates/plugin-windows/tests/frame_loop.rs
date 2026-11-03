@@ -4,6 +4,8 @@
 //! 既存契約（core が bind・plugin が connect）どおりに往復させる。待ちはすべて期限つきで、超過時は
 //! kill して失敗にする（REPAIR-5）。実行環境は unix のみ（plugin 境界機構の UDS が unix 限定のため）。
 //! 本番の実行場所（Windows ホスト側か WSL2 内か）は未確定で、#1415 でオーナー判断待ち（WIN-1）。
+//! 受信ループ本体の単体・結合試験は共有側 `crates/plugin`（#3776）に置き、本ファイルは実バイナリの
+//! 終了コード・stderr・SIGTERM・アダプタ結線の契約を固定する。
 //! 対応 ID: TASK-116・PLUG-1・PLUG-12・WIN-1・REPAIR-5。
 #![cfg(unix)]
 

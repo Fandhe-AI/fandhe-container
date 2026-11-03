@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TASK-192.1・MVM-5: tests/hvf_device.rs の実機試験専用の entitlements。
+  Hypervisor.framework で VM を作るバイナリに必要な com.apple.security.hypervisor のみを付与する。
+  ad-hoc 署名（codesign --sign -）で使う。配布物には同梱しない。手順は AGENTS.md「実機前提テスト」節を参照。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+</dict>
+</plist>

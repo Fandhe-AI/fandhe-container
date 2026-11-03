@@ -32,7 +32,8 @@
 //! # 未実装範囲（REPAIR-3）
 //! - kill / delete / state、create と start の分離、block / net の指定、2 台以上の vCPU は `UNIMPLEMENTED`
 //!   （型つき本体と合わせて #1869 の設計）。実 Linux カーネルの起動完走は保証しない（microvm 側の未実装）。
-//! - SIGTERM でのグレースフルシャットダウン（実行中 VM の停止）は未実装。終了は相手の切断（EOF）のみ。
+//! - SIGTERM でのグレースフルシャットダウン（実行中 VM の停止）は未実装。受信フラグの登録は [`sys`]（#3746）にあるが、
+//!   受付の停止・`stop_all` との結線は #3747 で、それまで終了は相手の切断（EOF）のみ。
 //! - 要求本体 `Vec<String>` は暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。
 //! - core 側からの plugin-microvm 起動経路（`BackendKind` への追加）は #1869 の設計の 4.9 で扱う。
 //! - 非 unix ビルドでは既定パス解決・接続が `Unimplemented` となり fail-closed になる。
@@ -40,10 +41,11 @@
 //! # 暫定契約（spec 未規定）
 //! 引数構文 `--socket <path>` / `--socket=<path>` と既定 socket 名 [`DEFAULT_SOCKET_NAME`] は本リポ独自の暫定値。
 //!
-//! 対応 ID: TASK-117・PLUG-1・PLUG-4・PLUG-11・PLUG-12・MVM-1・REPAIR-3。
+//! 対応 ID: TASK-117・PLUG-1・PLUG-4・PLUG-11・PLUG-12・MVM-1・REPAIR-3・REPAIR-5。
 
 pub mod adapter;
 pub mod frame_loop;
+pub mod sys;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};

@@ -273,9 +273,12 @@ mod mock_core {
             *vm
         }
 
-        /// 停止の待ちを観測する試験のため、終了は常に未観測（枠を返さない）として扱う。
-        fn exit_state(&self, _watch: &u32) -> DetachedState {
-            DetachedState::Pending
+        fn exit_state(&self, watch: &u32) -> DetachedState {
+            if self.rec.lock().expect("lock").exited.contains(watch) {
+                DetachedState::Released
+            } else {
+                DetachedState::Pending
+            }
         }
     }
 

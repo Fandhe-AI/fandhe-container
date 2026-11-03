@@ -225,11 +225,10 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目は、2 つの呼び出し元とも実装済み。healthcheck は
-//!   execve 越しの継承（helper の stdin へ pidfd の複製を渡す）で実装済み（#2441）。外部 CLI への `SCM_RIGHTS` は
-//!   supervisor 側が実装済み（#2626）: supervisor の制御チャネルの ExecHandoverRequest（`control::protocol` の kind 6。
-//!   接続元の uid の照合つき）で起動時 pidfd の複製を返し、受け取り口 `ControlExecHandover` も用意した。CLI の `exec`
-//!   コマンドがこれで受け取り、単一スレッドの CLI プロセス自身が [`run_command_with_pidfd`] を呼ぶ配線は #2626 の CLI 側
-//!   （PR #2708）で入り、本 PR の時点では未配線（判断記録は `docs/design/exec-pidfd-handover.md`。案 A を 2026-11-03 にオーナーが承認）。
+//!   execve 越しの継承（helper の stdin へ pidfd の複製を渡す）で実装済み（#2441）。外部 CLI への `SCM_RIGHTS` も
+//!   実装済み（#2626）: CLI の `exec` が supervisor の制御チャネルの ExecHandoverRequest（`control::protocol` の kind 6。
+//!   接続元の uid の照合つき）で起動時 pidfd の複製を受け取り、単一スレッドの CLI プロセス自身が
+//!   [`run_command_with_pidfd`] を呼ぶ（判断記録は `docs/design/exec-pidfd-handover.md`。案 A を 2026-11-03 にオーナーが承認）。
 //!   CLI の exec では execve 越しの継承（専用の exec プロセスを supervisor が起動する方式）は採らない。fork 継承
 //!   （[`run_command_with_pidfd`]）は pidfd を保持する単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ
 //!   supervisor 本体は直接呼べない（`setns` が拒否する）。**未実装**: 非 Linux の exec（plugin 経由。#1869 の設計・TASK-125）と、
@@ -252,7 +251,7 @@
 //!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
 //!   （`docs/design/audit-delivery.md` 9.1）
 //! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492）から
-//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（healthcheck は #2441 で実装済み〔exec 専用 helper が `FileAuditSink` を直接使う〕、CLI の exec は #2626 の CLI 側〔PR #2708〕で配線する予定で、本 PR の時点では未配線）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（healthcheck は #2441 で実装済み〔exec 専用 helper が `FileAuditSink` を直接使う〕、CLI の exec も #2626 で配線済み〔`default_audit_sink` で作れなければ exec しない〕）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。launch 経路（本番 launcher の子）で
@@ -592,7 +591,7 @@ pub fn prepare_restrictions(
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
 /// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
-/// 配線済み（#1717・#2481）。healthcheck の exec 専用 helper（#2441）からも配線済み。CLI の `exec`（#2626）からの配線は CLI 側（PR #2708）で入り、本 PR の時点では未配線。
+/// 配線済み（#1717・#2481）。healthcheck の exec 専用 helper（#2441）と CLI の `exec`（#2626）からも配線済み。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
@@ -1018,7 +1017,7 @@ fn audit_worker_result(
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
 /// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（担当は #2688。#514 は re-adopt・終了ポリシーのみ）と
-/// 本番の呼び出し元のうち healthcheck は #2441 で実装済み（exec 専用 helper が [`run_command_with_pidfd_output`] を呼ぶ）、CLI の exec は supervisor 側の受け渡しが #2626 で実装済みで、CLI からの呼び出しは #2708 で入る（本 PR の時点では未配線。モジュール doc）。
+/// 本番の呼び出し元のうち healthcheck は #2441 で実装済み（exec 専用 helper が [`run_command_with_pidfd_output`] を呼ぶ）、CLI の exec は #2626 で配線済み（制御チャネルで受け取った pidfd を渡す。モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
 /// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
@@ -1030,7 +1029,7 @@ fn audit_worker_result(
 ///
 /// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
 /// （追加の syscall なし）。pidfd はコンテナ内コマンドへ渡らない（core が `execveat` の前に `close_range` で閉じ、
-/// 複製は close-on-exec）。別プロセスの CLI へ渡す 1 段目は制御チャネルの `SCM_RIGHTS`（#2626）の supervisor 側が実装済み（CLI 側の呼び出しは #2708）、execve 越しの継承は未実装
+/// 複製は close-on-exec）。別プロセスの CLI へ渡す 1 段目は制御チャネルの `SCM_RIGHTS`（#2626）で実装済み、execve 越しの継承は未実装
 /// （モジュール doc）。
 ///
 /// `timeout` は準備から終了待ちまでの全体の上限（REPAIR-5）。段の間で期限を確かめ、fork 後は残り時間で

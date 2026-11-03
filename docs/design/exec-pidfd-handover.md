@@ -2,8 +2,6 @@
 
 CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要な「起動時 pidfd」を、どの経路で CLI プロセスへ渡すかを記録する。
 
-> 実装状況: supervisor 側の受け渡し（制御チャネルの kind 6・7、ガード、受け取り口 `ControlExecHandover`）は実装済み（PR #3809）。**CLI 側（`commands/exec.rs`、3.3 の順序、終了コードの配線）は #2708 で実装する（本 PR 時点では未実装）**。以下の CLI 側の記述は、#2708 で実装する設計であって、現時点で配線済みの挙動ではない。
->
 > 位置づけ: **判断記録（案 A はオーナー承認済み）**。#2626 の実装で案 A を採用し（既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側）、2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項。SUP-6・SEC-4）。同じコメントで、CRI の exec（#3726 の分解、#3752〜#3761）の設計記録 #3752 は、この経路を再利用できるかを先に確かめることとされた。§6 の 2 点目（観測名の語彙）は未決定のまま残る。
 
 - 対象ビヘイビア: SUP-6・SEC-4・CLI-1（関連: SEC-1・CORE-1・REPAIR-2・REPAIR-5・REPAIR-3）
@@ -50,7 +48,7 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 
 複製は `ControlledProcess::new` が `launch_pidfd` から `F_DUPFD_CLOEXEC` で作り（std の `try_clone_to_owned`）、`Exited` / `Empty` への遷移や再起動による世代交代で落ちる。古い世代の複製は新しい世代の pid では渡らない。
 
-### 3.3 CLI 側の順序（`commands/exec.rs`。#2708 で実装予定・本 PR 時点では未実装）
+### 3.3 CLI 側の順序（`commands/exec.rs`）
 
 1. 要求の構築（`ExecRequest`: 絶対パス・argv・`--env` の上限検証）
 2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる。続けて create の起動オプション文書の launch 時 env を状態記録の世代と照合して読む（`container_options::store::launch_env_for`。SUP-12・#2713。欠落・世代不一致は exec しない）

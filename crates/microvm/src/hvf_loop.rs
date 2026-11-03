@@ -377,6 +377,13 @@ where
             "vcpu create deadline must be in (0, 60s]",
         ));
     }
+    // `Builder::spawn` は NUL を含む名前で呼び出し元スレッドが panic する（MVM-5・REPAIR-5）ため、先に検査する。
+    if name.contains('\0') {
+        return Err(err(
+            MicrovmErrorCode::InvalidArgument,
+            "vcpu thread name must not contain NUL",
+        ));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<K, MicrovmError>>(1);
     let (report_tx, report_rx) = mpsc::sync_channel::<VcpuStopReport>(1);
@@ -902,6 +909,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::PermissionDenied);
         assert_eq!(e.message(), "denied");
+    }
+
+    /// NUL を含むスレッド名は panic せず `InvalidArgument`（MVM-5・REPAIR-5）。
+    #[test]
+    fn mvm5_3791_nul_in_thread_name_is_rejected_without_panic() {
+        let e = spawn_loop::<FakeKick, _>("hvf\0test", LONG, |_| {
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "vcpu thread name must not contain NUL");
     }
 
     #[test]

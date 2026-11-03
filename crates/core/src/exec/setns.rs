@@ -46,8 +46,9 @@
 //!   多層防御として残るが、同一性の根拠ではない。pidfd を得られない場合は縮退せず拒否する。supervisor 不在
 //!   （孤児化・再起動後で起動時の pidfd を失った）の場合の明示された縮退経路が [`Pid1Target::open`] で、
 //!   上記の前提が成り立つ間だけ使う（本番の通しの入口はこの縮退経路を使わず拒否する。supervisor 不在時の方式は `docs/design/exec-without-supervisor.md`〔#2688。承認待ち〕）。supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目
-//!   は実装済み（execve 越しの継承は supervisor の healthcheck の exec 専用 helper〔#2441〕、`SCM_RIGHTS` は supervisor の
-//!   制御チャネルから CLI の `exec` へ〔#2626〕。いずれも受け取った側が [`Pid1Target::open_with_launch_pidfd`] で照合する）
+//!   は supervisor 側まで実装済み（execve 越しの継承は supervisor の healthcheck の exec 専用 helper〔#2441〕、`SCM_RIGHTS` は
+//!   supervisor の制御チャネルの送出側と受け取り口〔#2626〕。いずれも受け取った側が [`Pid1Target::open_with_launch_pidfd`] で
+//!   照合する）。CLI の `exec` からの呼び出しは #2626 の CLI 側〔PR #2708〕で入り、本 PR の時点では未配線
 //! - **対象の限定**: 対象は、呼び出し側の PID namespace に **直接** 入れ子になった PID namespace の PID 1
 //!   （`NSpid:` がちょうど 2 要素で末尾が 1）に限り、呼び出し側と同じ pid / mnt namespace へは参加しない。
 //!   任意プロセスの namespace へ入る汎用手段にしない。入れ子の PID namespace の取り違え（コンテナの中で
@@ -114,8 +115,9 @@
 //!   カーネルの `EPERM` で塞がれているため必要になるまで足さない）
 //! - 違反記録の監査ログ（SEC-4）への保存は、この段関数単体では行わず、`ExecError::violation` に載せて返すところまで。
 //!   記録の層 `AuditLayer::ExecTarget` と、通しの入口 supervisor `run_command` が親プロセス側で 1 拒否 1 件を記録する
-//!   経路（#1465）、本番の sink の実体（supervisor `exec::default_audit_sink`。#1594）、CLI の `exec`（#2626）と
-//!   healthcheck（#2441）からの受け渡しは supervisor 側で実装済み
+//!   経路（#1465）、本番の sink の実体（supervisor `exec::default_audit_sink`。#1594）、healthcheck（#2441）からの受け渡しは
+//!   supervisor 側で実装済み。CLI の `exec`（#2626）からの受け渡しは supervisor 側の受け口までで、CLI 側は #2708 で入る
+//!   （本 PR の時点では未配線）
 //! - 本番 launcher（`ProductionLauncher`）が起動した PID 1 の pidfd は `LaunchedProcess::launch_pidfd` で呼び出し側へ返す
 //!   （実装済み。#1816）。別プロセスの supervisor へ渡す手段（`SCM_RIGHTS` 等）と subreaper のもとで回収前に
 //!   `pidfd_open` する経路の結線は未実装。subreaper による pid 指定の回収経路自体は `ChildSubreaper`

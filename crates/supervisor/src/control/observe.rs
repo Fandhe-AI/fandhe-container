@@ -65,10 +65,12 @@ impl ControlObserver {
 
     /// exec 子 cgroup の回収（ガードが切断・不正データ・期限のいずれかで実行したもの）の結果を集計し、構造化ログを 1 行出す
     /// （SUP-6・REPAIR-4）。`trigger` と結果は固定語彙のみ。`Failed` 以外は成功として数える（`Absent` は通常終了）。
+    /// `elapsed` は回収役の呼び出しに実際に掛かった時間で、集計器とログの `latency_us` に載せる。
     pub fn record_exec_reclaim(
         &self,
         trigger: &'static str,
         outcome: super::exec_guard::ReclaimOutcome,
+        elapsed: Duration,
     ) {
         if let Ok(name) = OpName::new("exec_cgroup_reclaim") {
             let o = if outcome == super::exec_guard::ReclaimOutcome::Failed {
@@ -76,11 +78,12 @@ impl ControlObserver {
             } else {
                 OpOutcome::Success
             };
-            let _ = self.recorder.record(&name, o, Duration::ZERO);
+            let _ = self.recorder.record(&name, o, elapsed);
         }
         let line = format!(
-            "{{\"component\":\"supervisor\",\"event\":\"exec_cgroup_reclaim\",\"trigger\":\"{trigger}\",\"outcome\":\"{}\"}}\n",
-            outcome.name()
+            "{{\"component\":\"supervisor\",\"event\":\"exec_cgroup_reclaim\",\"trigger\":\"{trigger}\",\"outcome\":\"{}\",\"latency_us\":{}}}\n",
+            outcome.name(),
+            elapsed.as_micros()
         );
         let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
     }

@@ -377,8 +377,11 @@ fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<
     if trigger == "disconnect" && pool.is_stopping() {
         trigger = "relaunch";
     }
+    // 回収に実際に掛かった時間を計測して観測へ渡す（REPAIR-4）。
+    let started = Instant::now();
     let outcome = pool.reclaimer.reclaim(&frame.name);
-    pool.observer.record_exec_reclaim(trigger, outcome);
+    pool.observer
+        .record_exec_reclaim(trigger, outcome, started.elapsed());
 }
 
 /// ExecCgroupNotify を期限内に読んで検証し、ack を返す。通知が来ない・壊れている場合は `None`（回収しない）。

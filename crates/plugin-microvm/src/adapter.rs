@@ -27,7 +27,8 @@
 //!
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
-//! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源が残る。同じ id は再 start できるが解放が済んでいないことがある。
+//! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
+//!   期限切れで切り離した VM は [`MAX_VMS`] の計数に残し続け（`detached`）、枠を空けない（資源上限。REPAIR-5）。枠が尽きたら plugin の再起動で回復する。
 //! - 応答しないファイルシステム上のイメージ読み込みは期限で打ち切れない。祖先ディレクトリの symlink は検査しない（最終要素のみ）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは #713。
 
@@ -425,6 +426,8 @@ pub struct StopAllReport {
 pub struct MicrovmRuntimeAdapter<B: MicrovmBackend> {
     backend: B,
     vms: BTreeMap<String, B::Running>,
+    /// 停止が期限切れで切り離された（終了未確認の）VM 数。[`MAX_VMS`] の計数に含める。
+    detached: usize,
 }
 
 impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
@@ -433,7 +436,13 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         Self {
             backend,
             vms: BTreeMap::new(),
+            detached: 0,
         }
+    }
+
+    /// 停止期限切れで切り離したまま終了未確認の VM 数。
+    pub fn detached(&self) -> usize {
+        self.detached
     }
 
     /// 登録中の VM 数。
@@ -462,16 +471,28 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             };
             if left.is_zero() {
                 // 予算切れ: Drop に任せると 1 台ごとに最大 5 秒待つため、停止要求だけ出して切り離す（1ms で打ち切る。REPAIR-5）。
-                let _ = self.backend.stop(vm, Duration::from_millis(1));
+                if let Err(e) = self.backend.stop(vm, Duration::from_millis(1)) {
+                    self.note_stop_error(&e);
+                }
                 report.remaining += 1;
                 continue;
             }
             match self.backend.stop(vm, left.min(STOP_DEADLINE)) {
                 Ok(_) => report.stopped += 1,
-                Err(_) => report.failed += 1,
+                Err(e) => {
+                    self.note_stop_error(&e);
+                    report.failed += 1;
+                }
             }
         }
         report
+    }
+
+    /// 停止が期限切れなら VM は切り離されただけで資源が残るため、計数に残す。
+    fn note_stop_error(&mut self, e: &MicrovmError) {
+        if e.code() == MicrovmErrorCode::DeadlineExceeded {
+            self.detached = self.detached.saturating_add(1);
+        }
     }
 
     fn do_start(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
@@ -482,7 +503,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         if self.vms.contains_key(id.as_str()) {
             return Err(perr(PluginErrorCode::AlreadyExists, MSG_EXISTS));
         }
-        if self.vms.len() >= MAX_VMS {
+        if self.vms.len().saturating_add(self.detached) >= MAX_VMS {
             return Err(perr(PluginErrorCode::ResourceExhausted, MSG_LIMIT));
         }
         let vcpus = parse_digits(vcpus, VCPUS_MAX_DIGITS)?;
@@ -536,10 +557,13 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             .vms
             .remove(id.as_str())
             .ok_or_else(|| perr(PluginErrorCode::NotFound, MSG_NOT_FOUND))?;
-        let reason = self
-            .backend
-            .stop(vm, STOP_DEADLINE)
-            .map_err(|e| to_plugin_error(&e))?;
+        let reason = match self.backend.stop(vm, STOP_DEADLINE) {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_stop_error(&e);
+                return Err(to_plugin_error(&e));
+            }
+        };
         Ok(vec![REPLY_STOPPED.to_string(), reason.to_string()])
     }
 
@@ -750,6 +774,26 @@ mod tests {
         let e = a.handle(&s(&["stop", "a"])).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Timeout);
         assert!(a.is_empty());
+        assert_eq!(a.detached(), 1);
+    }
+
+    /// 停止期限切れの VM は終了未確認のため MAX_VMS の枠を空けない（資源上限。REPAIR-5）。
+    #[test]
+    fn task117_2_mvm1_timed_out_stop_keeps_slot() {
+        let t = Tmp::new("detached");
+        let k = t.file("k", b"K");
+        let mut a = adapter();
+        a.backend.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+        for i in 0..MAX_VMS {
+            a.handle(&start_req(&format!("v{i}"), &k)).expect("start");
+            let e = a.handle(&s(&["stop", &format!("v{i}")])).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Timeout);
+        }
+        assert!(a.is_empty());
+        assert_eq!(a.detached(), MAX_VMS);
+        let e = a.handle(&start_req("over", &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(a.backend.starts, MAX_VMS);
     }
 
     /// backend の start 失敗は登録されず、code が写される。

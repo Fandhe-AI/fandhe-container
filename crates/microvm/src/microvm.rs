@@ -9,7 +9,7 @@
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・他スレッドからの即時停止（kick。新規 unsafe が要る）・
+//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
 //!
@@ -17,7 +17,7 @@
 //! [`MicroVm::start`] が vCPU 0 を初期化して専用スレッドで実行ループを始め、[`RunningMicroVm`] を返す。停止は
 //! [`RunningMicroVm::stop`]（期限つき。`Ok` で戻った時点でスレッド join 済み・fd・mmap・irqfd 解放済み）で、
 //! 呼び忘れても drop が回収する。ゲスト起因の終了（シャットダウン・失敗）も [`StopReason`] で報告し、同じ後始末を通る。
-//! 停止要求は `run_once`（[`VCPU_POLL_INTERVAL`]）の合間のポーリングで見る。
+//! 停止要求は `immediate_exit` と kick（`SIGUSR2`）で実行中の `KVM_RUN` を即時に中断する（#3736・REPAIR-5。`VCPU_POLL_INTERVAL` を待たない）。
 //!
 //! # シリアル（TASK-75.5・#3740・MVM-1）
 //! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
@@ -60,7 +60,6 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -70,7 +69,7 @@ use crate::boot_x86::LoadedKernel;
 use crate::boot_x86::{
     BootCpuState, KernelCmdline, VirtioMmioParam, load_linux, write_boot_tables,
 };
-use crate::device::{KvmDevice, RunStats, VcpuFd, VmFd};
+use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
@@ -894,7 +893,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 
 // ---- 起動と停止（TASK-75.4.1・#886・MVM-1） ----
 
-/// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求を見る間隔の上限でもある。
+/// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
 pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// [`RunningMicroVm::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。
@@ -990,7 +989,8 @@ enum LoopStep {
 /// vCPU スレッドが駆動する対象。実体は [`MicroVm`]。KVM なしでループの契約（停止・後始末の順序）を試験するための継ぎ目。
 trait VcpuLoopBody: Send + 'static {
     /// 最大 `slice` だけ実行し、exit を処理して次の動作を返す。
-    fn step(&mut self, slice: Duration) -> LoopStep;
+    /// `stop` は `RunningMicroVm` からの停止信号で、実行中の `KVM_RUN` を中断するために `run_once_with_stop` へ渡す。
+    fn step(&mut self, slice: Duration, stop: &StopSignal) -> LoopStep;
     /// vCPU 0 の累積統計。
     fn stats(&self) -> RunStats;
 }
@@ -998,11 +998,11 @@ trait VcpuLoopBody: Send + 'static {
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> VcpuLoopBody
     for MicroVm<B, N>
 {
-    fn step(&mut self, slice: Duration) -> LoopStep {
+    fn step(&mut self, slice: Duration, stop: &StopSignal) -> LoopStep {
         let Some(vcpu) = self.vcpus.first_mut() else {
             return LoopStep::Finish(StopReason::Failed(MicrovmErrorCode::FailedPrecondition));
         };
-        let result = vcpu.run_once(slice);
+        let result = vcpu.run_once_with_stop(slice, stop);
         match classify_run(&result) {
             RunClass::Continue => LoopStep::Continue,
             RunClass::Finish(reason) => LoopStep::Finish(reason),
@@ -1047,15 +1047,15 @@ fn log_line(args: std::fmt::Arguments<'_>) {
 /// 解放してから報告を送る。この順序が「`stop` が `Ok` で戻った時点で解放済み」という契約の根拠。
 fn vcpu_loop<T: VcpuLoopBody>(
     mut body: T,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     done: mpsc::Sender<StopReport>,
     started: Instant,
 ) {
     let reason = loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop.is_requested() {
             break StopReason::Requested;
         }
-        match body.step(VCPU_POLL_INTERVAL) {
+        match body.step(VCPU_POLL_INTERVAL, &stop) {
             LoopStep::Continue => {}
             LoopStep::Finish(r) => break r,
         }
@@ -1112,7 +1112,7 @@ fn spawn_loop<T: VcpuLoopBody>(
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(StopSignal::new());
     let (tx, rx) = mpsc::channel();
     let flag = Arc::clone(&stop);
     let handle = std::thread::Builder::new()
@@ -1130,13 +1130,15 @@ fn spawn_loop<T: VcpuLoopBody>(
 /// 起動中の microVM（vCPU 0 のスレッドを持つ）。[`MicroVm::start`] が返す。
 ///
 /// 停止は [`RunningMicroVm::stop`]。呼び忘れても drop が期限つきで停止を要求して回収する（fd のリークを防ぐ）。
-/// 停止要求は vCPU スレッドが `run_once` の合間にポーリングするため、停止の遅延の上限は
-/// 「[`VCPU_POLL_INTERVAL`] + exit 処理 1 回分」。
+/// 停止要求は `StopSignal` を立て、実行中の `KVM_RUN` の監視スレッドが `immediate_exit` と kick で即時に中断する
+/// （#3736・MVM-1・REPAIR-5）。停止の遅延の上限は exit 処理 1 回分で、[`VCPU_POLL_INTERVAL`] には依らない。
+/// 所有関係: 本型が持つのは `Arc<StopSignal>` だけでスレッド識別子は持たず、kick を出すのは `KVM_RUN` 1 回分の間だけ
+/// 生きる監視スレッドのみ。vCPU スレッドが終わった後の停止要求はシグナルを送らない。
 ///
-/// 範囲外（REPAIR-3）: 他スレッドからの `immediate_exit` と kick による即時停止（`sys` の拡張、つまり新規 unsafe が要る）。
+/// 範囲外（REPAIR-3）: 一時停止（pause）。
 #[derive(Debug)]
 pub struct RunningMicroVm {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     done_rx: mpsc::Receiver<StopReport>,
     handle: Option<JoinHandle<()>>,
     serial: SerialConsole,
@@ -1182,7 +1184,7 @@ impl RunningMicroVm {
             ));
         }
         let limit = Instant::now() + deadline;
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop.request();
         match self.done_rx.recv_timeout(deadline) {
             Ok(report) => {
                 // 報告後もスレッドローカルの destructor が未完了でありうるため、join にも同じ期限を適用する。
@@ -1238,7 +1240,7 @@ impl Drop for RunningMicroVm {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop.request();
         let limit = Instant::now() + DROP_STOP_WAIT;
         let expired = match self.done_rx.recv_timeout(DROP_STOP_WAIT) {
             Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1327,6 +1329,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// 偽の body。step ごとに短く眠り、`finish_after` 回目で `Finish(GuestShutdown)` を返す。drop で `dropped` を立てる。
     struct FakeBody {
@@ -1356,13 +1359,19 @@ mod lifecycle_tests {
     }
 
     impl VcpuLoopBody for FakeBody {
-        fn step(&mut self, _slice: Duration) -> LoopStep {
+        fn step(&mut self, _slice: Duration, _stop: &StopSignal) -> LoopStep {
             self.entered.store(true, Ordering::SeqCst);
             if let Some(gate) = &self.gate {
                 let (m, cv) = &**gate;
                 let mut open = m.lock().unwrap();
+                let start = Instant::now();
                 while !*open {
-                    open = cv.wait(open).unwrap();
+                    // 解放されない回帰でも無期限に待たない（REPAIR-5）。
+                    assert!(
+                        start.elapsed() < Duration::from_secs(30),
+                        "gate was not opened within 30s"
+                    );
+                    open = cv.wait_timeout(open, Duration::from_millis(100)).unwrap().0;
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -1516,6 +1525,55 @@ mod lifecycle_tests {
         assert_eq!(report.reason, StopReason::Requested);
         assert!(report.stats.runs >= 1);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// MVM-1・REPAIR-5（#3736）: 停止要求は `VCPU_POLL_INTERVAL` のポーリングに依らず、信号で body まで即時に届く。
+    #[test]
+    fn mvm1_3736_stop_wakes_body_waiting_on_signal() {
+        struct Waiter(Arc<AtomicBool>);
+        impl VcpuLoopBody for Waiter {
+            fn step(&mut self, _slice: Duration, stop: &StopSignal) -> LoopStep {
+                self.0.store(true, Ordering::SeqCst);
+                let start = Instant::now();
+                while !stop.is_requested() && start.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                LoopStep::Continue
+            }
+            fn stats(&self) -> RunStats {
+                RunStats::default()
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(
+            Waiter(Arc::clone(&entered)),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || entered.load(Ordering::SeqCst)),
+            "body did not enter step within 10s"
+        );
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    /// MVM-1・REPAIR-5（#3736）: ゲスト起因で終わったスレッドへの停止要求は安全に戻り、その理由を返す。
+    #[test]
+    fn mvm1_3736_stop_after_loop_finished_is_harmless() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut body = FakeBody::new(&dropped);
+        body.finish_after = Some(1);
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || dropped.load(Ordering::SeqCst)),
+            "loop thread did not exit within the deadline"
+        );
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::GuestShutdown);
     }
 
     /// MVM-1: ゲスト起因の終了は stop より前に観測でき、stop がその理由を返す。

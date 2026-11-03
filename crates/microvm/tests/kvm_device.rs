@@ -1240,6 +1240,122 @@ fn kvm_device_serial_output_reaches_host() {
     );
 }
 
+/// MVM-1・REPAIR-5・TASK-75.4・#3736: 自己ループするゲスト（`jmp $`）に対し、`RunningMicroVm::stop` が
+/// `VCPU_POLL_INTERVAL`（100ms）のポーリングを待たず、`StopSignal` の kick で即時に戻る。
+/// 停止要求は run の開始直後に揃えるため、ポーリング方式なら毎回約 90ms 待ち 50ms 未満にならず、kick を外すと必ず失敗する。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_stop_kicks_spinning_guest_immediately() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::{
+        MicroVm, MicroVmConfig, StopReason, VCPU_POLL_INTERVAL,
+    };
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Count(AtomicU64);
+    impl RunObserver for Count {
+        fn record(&self, _record: &RunRecord) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    {
+        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+        put(0x1F1, &[4]);
+        put(0x1FE, &0xAA55u16.to_le_bytes());
+        put(0x201, &[0x62]);
+        put(0x202, b"HdrS");
+        put(0x206, &0x020Fu16.to_le_bytes());
+        put(0x211, &[1]);
+        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+        put(0x230, &0x20_0000u32.to_le_bytes());
+        put(0x234, &[1]);
+        put(0x236, &1u16.to_le_bytes());
+        put(0x238, &2047u32.to_le_bytes());
+        put(0x258, &0x100_0000u64.to_le_bytes());
+        put(0x260, &0x40_0000u32.to_le_bytes());
+    }
+    let payload = 5 * 512;
+    for (i, b) in img[payload..].iter_mut().enumerate() {
+        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
+    }
+    img[payload + 0x200..payload + 0x202].copy_from_slice(&[0xEB, 0xFE]);
+
+    for attempt in 0..5 {
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap();
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let obs = Arc::new(Count::default());
+        vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+        let running = vm.start(&loaded).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while obs.0.load(Ordering::SeqCst) < 1 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(obs.0.load(Ordering::SeqCst) >= 1);
+        // 観測器の通知は 1 回の run が戻った直後（次の run の開始直前）に来る。そこから短い固定
+        // 待ちだけ置いて停止を要求し、次の run の先頭付近（ポーリング方式なら残り約 90ms）に揃える。
+        std::thread::sleep(Duration::from_millis(5 + attempt));
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < VCPU_POLL_INTERVAL / 2,
+            "attempt {attempt}: stop took {elapsed:?}"
+        );
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.stats.errors, 0);
+        assert_eq!(Arc::strong_count(&obs), 1);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_stop_kicks_spinning_guest_immediately() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
 /// MVM-1・TASK-75.4.2・#887: 起動の途中で失敗しても fd・mmap が解放され、エラーは ERR-1 の形（`<CODE>: <message>`）で返る。
 #[cfg(target_arch = "x86_64")]
 #[test]

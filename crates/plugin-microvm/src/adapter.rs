@@ -1,6 +1,6 @@
 //! 要求ハンドラ（`frame_loop::RequestHandler` の実装）。TASK-117.1・#710、TASK-117.2・#711。PLUG-1・MVM-1・REPAIR-3。
 //!
-//! 呼び出し元: `main.rs` が `frame_loop::serve` へ渡す。core 側 proxy（#1869 の設計）が送る要求の先頭要素
+//! 呼び出し元: `main.rs` が `frame_loop::serve_until` へ渡す。core 側 proxy（#1869 の設計）が送る要求の先頭要素
 //! （操作名）で分岐する暫定契約（本体 `Vec<String>`。型つき本体への置換は #1869 の設計・承認と実装 issue の起票は #2232）。
 //! microVM 本体の操作は [`MicrovmBackend`] 越しに `fandhe-container-microvm` へ委譲する（Linux は `KvmBackend`、他 OS は
 //! 常に `UNIMPLEMENTED` の `UnsupportedBackend`）。

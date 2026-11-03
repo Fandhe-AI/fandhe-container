@@ -76,6 +76,32 @@ impl Harness {
         decode_message(&r).expect("decode")
     }
 
+    /// 接続を開いたまま子の自発的な終了を期限つきで待ち、終了コードを返す（stderr は `take_stderr` で読む）。
+    fn wait_exit(&mut self) -> i32 {
+        let start = Instant::now();
+        loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                return s.code().expect("exit code");
+            }
+            if start.elapsed() > WAIT {
+                let _ = self.child.kill();
+                crate::reap::reap_or_report(&mut self.child, crate::reap::reap_within());
+                panic!("plugin binary did not exit within deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 終了済みの子の stderr を読み切る。
+    fn take_stderr(&mut self) -> String {
+        let mut err = String::new();
+        if let Some(mut s) = self.child.stderr.take() {
+            let _ = s.read_to_string(&mut err);
+        }
+        assert!(!err.contains(&self.sock), "stderr leaks socket path: {err}");
+        err
+    }
+
     /// 接続を閉じて子の終了を待ち、(終了コード, stderr) を返す。
     fn finish(self) -> (i32, String) {
         self.finish_with(true)
@@ -442,4 +468,88 @@ fn task117_1_plug12_relative_socket_exits_2_without_value() {
     let (code, err) = run_startup_failure(&[], Some("rel/SECRETREL.sock"));
     assert_eq!(code, 2, "{err}");
     assert!(!err.contains("SECRETREL"), "{err}");
+}
+
+/// 子へ SIGTERM を送る（テスト側に FFI・依存を足さないため `kill` コマンドを使う。引数は pid の数値のみ）。
+fn sigterm(h: &Harness) {
+    let mut cmd = Command::new("kill");
+    cmd.args(["-TERM", &h.child.id().to_string()]);
+    let st = crate::reap::run_within(&mut cmd, crate::reap::reap_within())
+        .unwrap_or_else(|e| panic!("sigterm to plugin child: {e}"));
+    assert!(st.success());
+}
+
+/// SIGTERM 後の終了コード 0・shutdown 行・VM 無しの結果行・時間の上限を照合する。
+fn expect_clean_sigterm_exit(mut h: Harness, sent: Instant) {
+    let code = h.wait_exit();
+    let elapsed = sent.elapsed();
+    let err = h.take_stderr();
+    assert_eq!(code, 0, "{err}");
+    // IDLE_POLL(1s) + STOP_ALL_BUDGET(4s) + 余裕。
+    assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    let lines: Vec<&str> = err.lines().collect();
+    assert!(
+        lines.contains(&"level=info op=plugin.microvm.shutdown reason=signal"),
+        "{err}"
+    );
+    assert!(
+        lines.contains(&"level=info op=plugin.microvm.stop_all stopped=0 failed=0 remaining=0"),
+        "{err}"
+    );
+}
+
+/// PLUG-1・REPAIR-5: アイドル中の SIGTERM で受付をやめ、VM が無くても結果行を出して終了コード 0 で終わる。
+#[test]
+fn task117_plug1_repair5_sigterm_idle_exits_zero_with_stop_all_line() {
+    let h = Harness::start();
+    let sent = Instant::now();
+    sigterm(&h);
+    expect_clean_sigterm_exit(h, sent);
+}
+
+/// PLUG-1・REPAIR-5: 要求を 1 往復した後の SIGTERM でも同じ。
+#[test]
+fn task117_plug1_repair5_sigterm_after_request_exits_zero() {
+    let mut h = Harness::start();
+    match h.call(1, &["ping"]) {
+        ControlMessage::Response { id, body } => {
+            assert_eq!(id.get(), 1);
+            assert_eq!(body, vec!["pong".to_string()]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let sent = Instant::now();
+    sigterm(&h);
+    expect_clean_sigterm_exit(h, sent);
+}
+
+/// PLUG-1・REPAIR-5: SIGTERM を続けて 2 回送ってもプロセスは殺されず、終了コード 0 で終わる。
+#[test]
+fn task117_plug1_repair5_double_sigterm_exits_zero() {
+    let h = Harness::start();
+    let sent = Instant::now();
+    sigterm(&h);
+    sigterm(&h);
+    expect_clean_sigterm_exit(h, sent);
+}
+
+/// PLUG-1・REPAIR-5: SIGTERM 後に届いた要求は処理されない（応答も Error も返らず、start は実行されない）。
+#[test]
+fn task117_plug1_repair5_request_after_sigterm_is_not_processed() {
+    let mut h = Harness::start();
+    sigterm(&h);
+    // 接続を開いたまま子の終了を待つ（待ちは期限つき）。
+    let code = h.wait_exit();
+    let f = request(2, &["start", "vm1", "/nonexistent", "", "", "1", "64"]);
+    let wrote = h.stream().write_frame(&f, RpcTimeout::default());
+    if wrote.is_ok() {
+        let e = h
+            .stream()
+            .read_frame(RpcTimeout::new(Duration::from_secs(2)).expect("timeout"))
+            .expect_err("no response may arrive after SIGTERM");
+        assert_eq!(e.code(), PluginErrorCode::Unavailable);
+    }
+    let err = h.take_stderr();
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("op=plugin.microvm.start"), "{err}");
 }

@@ -350,6 +350,9 @@ pub struct ControlServer {
     handle: Option<JoinHandle<()>>,
 }
 
+/// 再 launch の `pause` が exec のガードの停止に確保する予算の上限（回収の待ち 2 秒 + 余裕。REPAIR-5）。
+pub const GUARD_STOP_BUDGET: Duration = Duration::from_secs(3);
+
 /// スレッドの停止を待つ上限（超えたら切り離す。REPAIR-5）。
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -514,31 +517,39 @@ impl PausableServer {
         })
     }
 
-    /// accept ループを止める（`timeout` 内に止まらなければ `Err`）。止まっていれば何もしない。
+    /// accept ループと exec のガードを止める（`timeout` 内に止まらなければ `Err`）。
+    ///
+    /// 予算は 2 つに分ける（片方が使い切っても他方に残す。SUP-3・REPAIR-5・#2043）: ガードの停止に
+    /// `min(GUARD_STOP_BUDGET, timeout / 2)`（回収の待ち 2 秒 + 余裕）、accept の停止にその残り。accept が止まっていても
+    /// （`server` が無くても）ガードの停止は必ず試みる。`Err` のとき、止まらなかったガードはプールに残り、次の `pause` が
+    /// 再び join する。
     pub fn pause(
         &self,
         timeout: Duration,
     ) -> Result<(), fandhe_container_core::traits::TraitError> {
         use fandhe_container_core::traits::{ErrorCode, TraitError};
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(server) = inner.server.as_mut() else {
-            return Ok(());
-        };
-        let started = Instant::now();
-        if server.stop_confirmed(timeout) {
-            inner.server = None;
-            // accept ループが止まった後に、預かっている exec のガードのスレッドも止める（単一スレッドの再 launch のため。
-            // 通知済みの旧世代の exec 子 cgroup はここで回収される）。止まらなければ launch させない（fail-closed）。
-            if let Some(guards) = &inner.guards {
-                guards.shutdown_all(timeout.saturating_sub(started.elapsed()))?;
+        let guard_budget = GUARD_STOP_BUDGET.min(timeout / 2);
+        let accept_budget = timeout.saturating_sub(guard_budget);
+        if let Some(server) = inner.server.as_mut() {
+            if !server.stop_confirmed(accept_budget) {
+                log_control_event("relaunch_pause_failed", Some("accept_timeout"));
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "control channel thread did not stop in time",
+                ));
             }
-            Ok(())
-        } else {
-            Err(TraitError::new(
-                ErrorCode::Timeout,
-                "control channel thread did not stop in time",
-            ))
+            inner.server = None;
         }
+        // accept ループが止まった後に、預かっている exec のガードのスレッドも止める（単一スレッドの再 launch のため。
+        // 通知済みの旧世代の exec 子 cgroup はここで回収される）。止まらなければ launch させない（fail-closed）。
+        if let Some(guards) = &inner.guards
+            && let Err(e) = guards.shutdown_all(guard_budget)
+        {
+            log_control_event("relaunch_pause_failed", Some("guard_timeout"));
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// [`Self::pause`] で止めた accept ループを、保持していた listener で作り直す。動いていれば何もしない。

@@ -11,6 +11,7 @@
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,11 +60,18 @@ impl LaunchedProcess for Fake {
 #[derive(Default)]
 struct FakeReclaimer {
     calls: Mutex<Vec<String>>,
+    /// 回収を遅らせる時間（ミリ秒）。`release` で打ち切れる。
+    delay_ms: AtomicU64,
+    release: AtomicBool,
 }
 
 impl ExecCgroupReclaimer for FakeReclaimer {
     fn reclaim(&self, name: &ExecCgroupName) -> ReclaimOutcome {
         self.calls.lock().unwrap().push(name.as_str().to_owned());
+        let end = Instant::now() + Duration::from_millis(self.delay_ms.load(Ordering::SeqCst));
+        while Instant::now() < end && !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         ReclaimOutcome::Removed
     }
 }
@@ -94,6 +102,10 @@ struct Rig {
 
 impl Rig {
     fn start(tag: &str) -> Self {
+        Self::start_with(tag, ServeConfig::default())
+    }
+
+    fn start_with(tag: &str, config: ServeConfig) -> Self {
         use std::os::unix::fs::DirBuilderExt as _;
         let root = std::env::temp_dir().join(format!("fc-guardrl-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -125,7 +137,7 @@ impl Rig {
                 listener.try_clone_listener().unwrap(),
                 slot.clone(),
                 effective_uid().unwrap(),
-                ServeConfig::default(),
+                config,
                 observer,
                 Some(Arc::clone(&pool)),
             )
@@ -168,6 +180,7 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        self.reclaimer.release.store(true, Ordering::SeqCst);
         self.server.shutdown();
         let _ = self.pool.shutdown_all(Duration::from_secs(3));
         let _ = std::fs::remove_dir_all(&self.root);
@@ -285,4 +298,81 @@ fn sup3_sup6_repair12_relaunch_sees_no_guard_threads_and_resume_reopens() {
     again.notify_created(&name("exec-9-10"), hold()).unwrap();
     drop(again);
     assert_eq!(rig.wait_calls(2).len(), 2);
+}
+
+/// SUP-3・SUP-6・REPAIR-5・#2043: ガードの回収が期限を過ぎると pause は `Timeout` で失敗するが、止まらなかったガードは
+/// プールに残り、次の pause（accept が既に止まっていても）が再び join して 0 本にする。
+#[test]
+fn sup3_sup6_repair5_pause_timeout_keeps_stuck_guard_and_next_pause_joins_it() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rig = Rig::start("stuck");
+    rig.reclaimer.delay_ms.store(30_000, Ordering::SeqCst);
+    let handover = rig.obtain();
+    handover.notify_created(&name("exec-5-5"), hold()).unwrap();
+    // 合計 1.5 秒 → ガードの予算は 0.75 秒。回収が終わらないので Timeout。
+    let e = rig.server.pause(Duration::from_millis(1500)).unwrap_err();
+    assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
+    assert_eq!(e.message(), "exec guards did not stop in time");
+    assert_eq!(rig.calls(), vec!["exec-5-5".to_owned()]);
+    assert_eq!(threads_named(GUARD_COMM), 1);
+    assert_eq!(threads_named(ACCEPT_COMM), 0);
+    // 回収が終われば、accept が止まったままでも次の pause が残ったガードを join する。
+    rig.reclaimer.release.store(true, Ordering::SeqCst);
+    rig.server.pause(Duration::from_secs(5)).unwrap();
+    assert_eq!(threads_named(GUARD_COMM), 0);
+    assert_eq!(rig.pool.active(), 0);
+    drop(handover);
+}
+
+/// SUP-3・REPAIR-5・#2043: 再 launch の pause が失敗しても launch はせず、制御チャネル（accept）は復旧する
+/// （止めたままだと稼働中のコンテナを stop できないため）。復旧後は新しい handover を受けられる。
+#[test]
+fn sup3_repair5_failed_pause_does_not_relaunch_and_restores_control_channel() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rig = Rig::start("restore");
+    rig.reclaimer.delay_ms.store(30_000, Ordering::SeqCst);
+    let handover = rig.obtain();
+    handover.notify_created(&name("exec-6-6"), hold()).unwrap();
+    let probe = Arc::new(Probe {
+        seen: Mutex::new(Vec::new()),
+    });
+    let relauncher =
+        ControlledRelauncher::new(Arc::clone(&probe) as Arc<dyn Relauncher>, rig.slot.clone())
+            .with_pause(Arc::clone(&rig.server) as Arc<_>);
+    // relaunch の timeout 2 秒 → pause の予算 2 秒（ガード 1 秒）。回収が終わらず失敗する。
+    assert!(relauncher.relaunch(Duration::from_secs(2)).is_err());
+    assert_eq!(*probe.seen.lock().unwrap(), Vec::<(usize, usize)>::new());
+    assert_eq!(threads_named(ACCEPT_COMM), 1);
+    // 復旧した accept が新しい handover を受ける。
+    rig.reclaimer.release.store(true, Ordering::SeqCst);
+    let again = rig.obtain();
+    again.notify_created(&name("exec-6-7"), hold()).unwrap();
+    drop((again, handover));
+}
+
+/// SUP-3・REPAIR-5・#2043: accept の停止に時間がかかっても、ガードの停止の予算は削られない
+/// （合計 2 秒 → ガード 1 秒・accept 1 秒。accept の poll が 600ms で、0.3 秒かかる回収が収まる）。
+#[test]
+fn sup3_repair5_guard_budget_survives_slow_accept_stop() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rig = Rig::start_with(
+        "split",
+        ServeConfig {
+            poll_interval: Duration::from_millis(600),
+            ..ServeConfig::default()
+        },
+    );
+    rig.reclaimer.delay_ms.store(300, Ordering::SeqCst);
+    let handover = rig.obtain();
+    handover.notify_created(&name("exec-7-7"), hold()).unwrap();
+    let started = Instant::now();
+    rig.server.pause(Duration::from_secs(2)).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(rig.calls(), vec!["exec-7-7".to_owned()]);
+    assert_eq!(threads_named(GUARD_COMM), 0);
+    drop(handover);
 }

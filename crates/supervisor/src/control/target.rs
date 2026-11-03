@@ -474,8 +474,9 @@ pub struct ControlledRelauncher {
     stranded: Mutex<Vec<LateOrphan>>,
 }
 
-/// accept スレッドとexec のガードの停止を待つ上限（接続の読み取り期限 1 秒 + ガードの回収の待ち 2 秒 + 余裕。REPAIR-5）。
-const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// accept スレッドと exec のガードの停止を待つ上限の合計。内訳は `PausableServer::pause` が分ける: ガードに 3 秒
+/// （回収の待ち 2 秒 + 余裕）、accept に残りの 3 秒（接続の読み取り期限 1 秒 + 余裕）。REPAIR-5。
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(6);
 
 impl ControlledRelauncher {
     /// `inner` の再 launch の結果を `slot` に登録して返す relauncher を作る。
@@ -509,7 +510,13 @@ impl Relauncher for ControlledRelauncher {
             let process = self.inner.relaunch(timeout)?;
             return Ok(Box::new(ControlledProcess::new(process, self.slot.clone())));
         };
-        server.pause(PAUSE_TIMEOUT.min(timeout))?;
+        if let Err(e) = server.pause(PAUSE_TIMEOUT.min(timeout)) {
+            // launch しない。ただし制御チャネルは復旧を試みる（止めたままだと稼働中のコンテナを stop できない）。
+            // 止まらなかったガードはプールに残り、次の pause が再び join する。失敗は fail-closed のまま
+            // （再 launch の失敗として Stopped へ向かう）。
+            let _ = server.resume();
+            return Err(e);
+        }
         // 停止に使った時間を差し引いた残りを内側へ渡す。残りが無ければ launch しない。
         let remaining = timeout.saturating_sub(started.elapsed());
         let result = if remaining.is_zero() {
@@ -1246,7 +1253,7 @@ mod tests {
         assert!(passed > Duration::ZERO && passed <= Duration::from_secs(5));
     }
 
-    /// SUP-3・REPAIR-5・#2043: 止められなければ内側を呼ばずに失敗する(fail-closed。再開もしない)。
+    /// SUP-3・REPAIR-5・#2043: 止められなければ内側を呼ばずに失敗する(fail-closed)。制御チャネルの復旧(resume)は試みる。
     #[test]
     fn sup3_2043_pause_failure_does_not_relaunch() {
         let fake = order_fake(true, false);
@@ -1254,7 +1261,7 @@ mod tests {
             .with_pause(fake.clone() as Arc<dyn RelaunchPause>);
         let err = r.relaunch(Duration::from_secs(5)).err().expect("fails");
         assert_eq!(err.code(), ErrorCode::Timeout);
-        assert_eq!(*fake.events.lock().unwrap(), vec!["pause"]);
+        assert_eq!(*fake.events.lock().unwrap(), vec!["pause", "resume"]);
     }
 
     /// SUP-3・#2043: 内側の relaunch が失敗しても制御チャネルを再開する。

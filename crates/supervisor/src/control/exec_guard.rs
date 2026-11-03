@@ -194,7 +194,7 @@ impl ExecGuardPool {
     /// [`Self::reopen`] まで新しいガードを受けない。期限内に終わらなければ `Timeout`（呼び出し側は launch しない。
     /// fail-closed。単一スレッド検査を迂回しない）。
     pub fn shutdown_all(&self, timeout: Duration) -> Result<(), TraitError> {
-        let mut handles: Vec<JoinHandle<()>> = {
+        let mut entries: Vec<GuardEntry> = {
             let mut st = self.lock_state();
             st.stopping = true;
             for e in &st.entries {
@@ -203,34 +203,24 @@ impl ExecGuardPool {
                 }
             }
             std::mem::take(&mut st.entries)
-                .into_iter()
-                .map(|e| e.handle)
-                .collect()
         };
         let until = Instant::now().checked_add(timeout);
         loop {
             let mut rest = Vec::new();
-            for h in handles {
-                if h.is_finished() {
-                    let _ = h.join();
+            for e in entries {
+                if e.handle.is_finished() {
+                    let _ = e.handle.join();
                 } else {
-                    rest.push(h);
+                    rest.push(e);
                 }
             }
-            handles = rest;
-            if handles.is_empty() {
+            entries = rest;
+            if entries.is_empty() {
                 return Ok(());
             }
             if until.is_none_or(|u| Instant::now() >= u) {
-                // 終わらなかったスレッドは追跡に戻す（次の停止要求・prune で回収する）。
-                let mut st = self.lock_state();
-                for handle in handles {
-                    st.entries.push(GuardEntry {
-                        id: u64::MAX,
-                        stream: None,
-                        handle,
-                    });
-                }
+                // 終わらなかったガード（JoinHandle と接続の複製）は追跡に戻す。次の停止要求が再び起こして join する。
+                self.lock_state().entries.append(&mut entries);
                 return Err(TraitError::new(
                     ErrorCode::Timeout,
                     "exec guards did not stop in time",

@@ -503,9 +503,10 @@ impl VcpuFd {
     /// BSP の LAPIC の LVT LINT0 を ExtINT、LINT1 を NMI（ともにマスク解除）にして `KVM_SET_LAPIC` で書き戻す（#3735・MVM-1。
     /// x86_64 のみ）。設定後の LINT の値を返す。
     ///
-    /// `MicroVm::setup_boot_vcpu` が BSP（vCPU 0）にだけ呼ぶ。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
+    /// `MicroVm::setup_boot_vcpu` が全 vCPU に呼ぶ（BSP と同じ経路。#3737）。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
     /// マスクも解除する理由は `lapic_x86` モジュールを参照。in-kernel irqchip が前提で、無い VM では `FailedPrecondition`。
-    /// AP は INIT/SIPI を待つため触らない。エラー message にレジスタ値は載せない（ERR-1）。
+    /// AP にも同じ値を書けるが、INIT で LVT がマスクへ戻るため設定が残るのは INIT までである（#3737）。
+    /// エラー message にレジスタ値は載せない（ERR-1）。
     #[cfg(target_arch = "x86_64")]
     pub fn set_boot_lints(&mut self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
         let fd = self.fd.as_fd();
@@ -529,6 +530,39 @@ impl VcpuFd {
                 "LAPIC register page is too short for LVT LINT0/LINT1",
             )
         })
+    }
+
+    /// vCPU の MP 状態を読む（`KVM_GET_MP_STATE`。#3737・MVM-1。x86_64 のみ）。AP は作成直後 `Uninitialized`。
+    ///
+    /// `&self` のため `run_once`（`&mut self`）とは借用規則で排他される。in-kernel LAPIC では保留中の INIT/SIPI を先に処理する。
+    #[cfg(target_arch = "x86_64")]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        let st = sys::kvm_get_mp_state(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetMpState, e))?;
+        Ok(crate::smp_x86::MpState::from_raw(st.mp_state))
+    }
+
+    /// vCPU の MP 状態を設定する（`KVM_SET_MP_STATE`。#3737。x86_64 のみ）。`MicroVm::assemble` が AP を明示的に
+    /// `Uninitialized` にするために呼ぶ。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_mp_state(
+        &mut self,
+        state: crate::smp_x86::MpState,
+    ) -> Result<(), MicrovmError> {
+        let st = sys::KvmMpState {
+            mp_state: state.as_raw(),
+        };
+        sys::kvm_set_mp_state(self.fd.as_fd(), &st)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetMpState, e))
+    }
+
+    /// x86_64 以外では MP 状態の読み取りは未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "MP state is only implemented for x86_64",
+        ))
     }
 
     /// 累積の実行統計。
@@ -888,6 +922,10 @@ enum VcpuStage {
     SetLapic,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetCpuid,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetMpState,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetMpState,
     PreferredTarget,
     VcpuInit,
     Mmap,
@@ -910,6 +948,8 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::GetLapic => "KVM_GET_LAPIC",
         VcpuStage::SetLapic => "KVM_SET_LAPIC",
         VcpuStage::SetCpuid => "KVM_SET_CPUID2",
+        VcpuStage::GetMpState => "KVM_GET_MP_STATE",
+        VcpuStage::SetMpState => "KVM_SET_MP_STATE",
     };
     let registers = matches!(
         stage,

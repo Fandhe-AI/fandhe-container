@@ -33,8 +33,10 @@
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
+//! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
+//! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・CPUID / MSR / FPU の設定と AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・MSR / FPU の設定と AP のスレッド駆動（#3738。REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）
@@ -63,6 +65,7 @@ pub mod irq;
 pub mod lapic_x86;
 #[cfg(target_os = "linux")]
 pub mod microvm;
+pub mod smp_x86;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod sys;

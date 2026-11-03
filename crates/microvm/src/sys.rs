@@ -38,7 +38,8 @@
 //! 対応物が無く、サイズ・オフセットを const assert で固定する。
 //! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
 //! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
-//! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。上限の `KVM_MAX_CPUID_ENTRIES`・
+//! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。#3737 で足した `kvm_mp_state`
+//! （`linux/kvm.h` v6.12。`KVM_{GET,SET}_MP_STATE`）も同様に対応物が無く、サイズ・アラインを const assert で固定する。上限の `KVM_MAX_CPUID_ENTRIES`・
 //! `MAX_IO_MSRS` はカーネル内部の値で uapi にも無い。
 //! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
 //! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
@@ -166,6 +167,10 @@ pub(crate) mod consts {
     /// `_IOW(KVMIO, 0x8d, struct kvm_fpu)`。
     #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_FPU: u64 = super::iow(super::KVMIO, 0x8d, 416);
+    /// `_IOR(KVMIO, 0x98, struct kvm_mp_state)`（4 バイト。vCPU fd。#3737）。
+    pub const KVM_GET_MP_STATE: u64 = super::ior(super::KVMIO, 0x98, 4);
+    /// `_IOW(KVMIO, 0x99, struct kvm_mp_state)`。
+    pub const KVM_SET_MP_STATE: u64 = super::iow(super::KVMIO, 0x99, 4);
     /// `_IOR(KVMIO, 0x8e, struct kvm_lapic_state)`（1024 バイト）。
     pub const KVM_GET_LAPIC: u64 = super::ior(super::KVMIO, 0x8e, 1024);
     /// `_IOW(KVMIO, 0x8f, struct kvm_lapic_state)`。
@@ -439,6 +444,14 @@ pub(crate) struct KvmMsrEntry {
     pub data: u64,
 }
 
+/// `struct kvm_mp_state`（`linux/kvm.h`。4 バイト。x86_64 の AP の INIT/SIPI 待ち状態の読み書き。#3737・MVM-1）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KvmMpState {
+    pub mp_state: u32,
+}
+
 /// x86_64 の `struct kvm_fpu`（`asm/kvm.h`。416 バイト）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
@@ -498,6 +511,10 @@ const _: () = {
     assert!(offset_of!(KvmFpu, pad2) == 412);
     assert!(size_of::<KvmLapicState>() == 1024);
     assert!(align_of::<KvmLapicState>() == 1);
+    assert!(size_of::<KvmMpState>() == 4);
+    assert!(align_of::<KvmMpState>() == 4);
+    assert!(consts::KVM_GET_MP_STATE == 0x8004_AE98);
+    assert!(consts::KVM_SET_MP_STATE == 0x4004_AE99);
     assert!(consts::KVM_GET_SUPPORTED_CPUID == 0xC008_AE05);
     assert!(consts::KVM_SET_CPUID2 == 0x4008_AE90);
     assert!(consts::KVM_GET_MSRS == 0xC008_AE88);
@@ -1784,6 +1801,46 @@ pub(crate) fn kvm_set_fpu(vcpu: BorrowedFd<'_>, fpu: &KvmFpu) -> Result<(), SysE
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `KVM_GET_MP_STATE`（vCPU fd）で MP 状態を読む（x86_64 のみ。#3737）。in-kernel LAPIC では保留中の
+/// INIT/SIPI をカーネルが先に処理してから返す。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_get_mp_state(vcpu: BorrowedFd<'_>) -> Result<KvmMpState, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut st = KvmMpState::default();
+    // SAFETY: `vcpu` は借用中の生存 fd。`st` は `repr(C)` で 4 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）のゼロ初期化済みローカルで、呼び出し中は排他的に生存する。カーネルはこの 4 バイトだけを
+    // 書き、呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_MP_STATE,
+            &mut st as *mut KvmMpState,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(st) }
+}
+
+/// `KVM_SET_MP_STATE`（vCPU fd）で MP 状態を書く（x86_64 のみ。#3737）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+pub(crate) fn kvm_set_mp_state(vcpu: BorrowedFd<'_>, st: &KvmMpState) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `vcpu` は借用中の生存 fd。`st` は `repr(C)` で 4 バイト（const assert 済み・ioctl 番号の
+    // サイズ符号と一致）の借用で、呼び出し中は生存する。カーネルはこの 4 バイトを読むだけで書かず、
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_SET_MP_STATE,
+            st as *const KvmMpState,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
 /// `KVM_GET_LAPIC`（vCPU fd）で LAPIC レジスタ面を読む（x86_64 のみ）。in-kernel irqchip
 /// （`KVM_CREATE_IRQCHIP`）が無いと EINVAL になる。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -2147,6 +2204,8 @@ mod tests {
         assert_eq!(consts::KVM_SET_MSRS, 0x4008_AE89);
         assert_eq!(consts::KVM_GET_FPU, 0x81A0_AE8C);
         assert_eq!(consts::KVM_SET_FPU, 0x41A0_AE8D);
+        assert_eq!(consts::KVM_GET_MP_STATE, 0x8004_AE98);
+        assert_eq!(consts::KVM_SET_MP_STATE, 0x4004_AE99);
         assert_eq!(consts::KVM_GET_LAPIC, 0x8400_AE8E);
         assert_eq!(consts::KVM_SET_LAPIC, 0x4400_AE8F);
         assert_eq!(consts::KVM_SET_TSS_ADDR, 0xAE47);
@@ -2191,6 +2250,8 @@ mod tests {
         assert_eq!(kvm_set_msrs(fd, &m), Err(enotty));
         assert_eq!(kvm_get_fpu(fd), Err(enotty));
         assert_eq!(kvm_set_fpu(fd, &KvmFpu::default()), Err(enotty));
+        assert_eq!(kvm_get_mp_state(fd), Err(enotty));
+        assert_eq!(kvm_set_mp_state(fd, &KvmMpState::default()), Err(enotty));
         assert_eq!(kvm_get_lapic(fd), Err(enotty));
         assert_eq!(kvm_set_lapic(fd, &KvmLapicState::default()), Err(enotty));
         assert_eq!(kvm_set_tss_addr(fd, 0xFFFB_D000), Err(enotty));

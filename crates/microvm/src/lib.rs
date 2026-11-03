@@ -59,6 +59,7 @@
 //!
 //! `unsafe` は `src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS）に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
 //! 機械的に担保する（REPAIR-9・TASK-74.5）。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
+//! TASK-192.12・#3792・MVM-5・MVM-1: GICv3 の作成順序の型による強制と配置・timer の照合（macOS の `hvf::gic`・OS 非依存の `arm64_layout::check_gic_geometry`）。
 //! TASK-192.4・#3787・MVM-5・MVM-1: macOS のゲスト RAM（`hvf::memory`。匿名 mmap と `hv_vm_map` による対応付け。unsafe は sys/hvf.rs のみ）。
 
 #![deny(unsafe_code)]

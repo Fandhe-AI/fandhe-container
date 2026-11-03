@@ -243,7 +243,8 @@ impl HvVm {
     /// 呼び出しスレッドに束縛された vCPU を作る（config は NULL）。
     ///
     /// 同じスレッドで 2 個目を作ったときの挙動は未確認（#3803 で観測）。
-    pub fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
+    /// GIC は vCPU より前に作る必要があるため、外部には `crate::hvf::gic::VmWithGic::create_vcpu` だけが公開される（#3792）。
+    pub(crate) fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
         let mut id: u64 = 0;
         let mut exit: *const HvVcpuExitRaw = ptr::null();
         // SAFETY: id・exit はこのスタック上の有効なローカル変数への書き込み先。config は NULL（既定）。
@@ -956,8 +957,9 @@ impl GicApi {
     }
 
     /// VM に GIC を作る。VM が存在する間（`&HvVm`）だけ呼べ、`config` は消費する。
-    /// 作成順序（vCPU より前）を型で強制するのは #3792 の担当。
-    pub fn create(&self, _vm: &HvVm, config: GicConfig) -> Result<(), MicrovmError> {
+    /// 作成順序（vCPU より前・VM につき 1 回）は `crate::hvf::gic::HvfGic::create` が型で強制する（#3792）ため、
+    /// crate の外へは公開しない。
+    pub(crate) fn create(&self, _vm: &HvVm, config: GicConfig) -> Result<(), MicrovmError> {
         // SAFETY: `config.raw` は `GicConfig` が所有する有効な OS オブジェクトで、呼び出しの間生きている
         // （解放は `GicConfig` の drop で 1 回だけ）。VM は `_vm` の借用で存在が保証される。
         let rc = unsafe { (self.create)(config.raw) };

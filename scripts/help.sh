@@ -99,6 +99,10 @@ cat <<'EOF'
                                         macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
   guest-initrd-build-selftest         scripts/build-guest-initrd-selftest.sh
                                         ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
+  microvm-test-initrd-build           scripts/build-microvm-test-initrd.sh
+                                        microVM の実カーネル試験用の最小 initrd（x86_64 の /init だけの newc）の作成（#3770・MVM-1。ネットワーク・ビルドなし。make ci には含めない）
+  microvm-test-initrd-build-selftest  scripts/build-microvm-test-initrd-selftest.sh
+                                        最小 initrd 生成スクリプトの自己テスト（#3770・MVM-1・REPAIR-12。一時ディレクトリ・スタブのみ）
   dev-fd-perm-probe                   scripts/probe-dev-fd-perm.sh
                                         /dev/fd/N 経由の権限検査が macOS で効かない原因の観測（#2088・MAC-1。実機前提。make ci には含めない）
   dev-fd-perm-probe-selftest          scripts/probe-dev-fd-perm-selftest.sh

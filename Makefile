@@ -31,7 +31,7 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest microvm-test-initrd-build microvm-test-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
@@ -187,6 +187,12 @@ guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /i
 
 guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
 	@scripts/build-guest-initrd-selftest.sh
+
+microvm-test-initrd-build: ## microVM の実カーネル試験用の最小 initrd（x86_64 の /init だけの newc）を作る（#3770・MVM-1。ネットワーク・ビルドなし。make ci には含めない）
+	@scripts/build-microvm-test-initrd.sh
+
+microvm-test-initrd-build-selftest: ## 最小 initrd 生成スクリプトの自己テスト（#3770・MVM-1・REPAIR-12。一時ディレクトリ・スタブのみ）
+	@scripts/build-microvm-test-initrd-selftest.sh
 
 dev-fd-perm-probe: ## /dev/fd/N 経由の権限検査が macOS で効かない原因の観測（#2088・MAC-1。実機前提。make ci には含めない。--foreign は scripts/probe-dev-fd-perm.sh を直接実行）
 	@scripts/probe-dev-fd-perm.sh

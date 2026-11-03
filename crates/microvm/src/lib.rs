@@ -28,6 +28,7 @@
 //! TASK-75.4.1・MVM-1: `microvm::MicroVm::start` / `RunningMicroVm::stop`（vCPU 0 の実行ループ・停止要求のポーリング・
 //! 停止時の fd・mmap・irqfd の後始末。ゲスト起因の終了は `microvm::StopReason` で報告。`unsafe` なし）。
 //! TASK-75.4.2・#887・MVM-1・ERR-1: 起動途中の失敗でも取得済みの fd・mmap・irqfd を解放し、エラーは `error::MicrovmError`（`<CODE>: <message>`）で返す（期限切れの文字列表現は `TIMEOUT`。`unsafe` 追加なし）。
+//! #3744・MVM-1・REPAIR-5: 停止の期限切れで切り離した vCPU スレッドの終了を期限つきで観測する `microvm::VcpuExitWatch`（`RunningMicroVm::exit_watch`。`unsafe` なし）。
 //! TASK-75.5・#3739・MVM-1: 8250 / 16550 互換の最小 UART のレジスタモデル（`uart`。OS 非依存・`unsafe` なし。IRQ は出さない）。
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。

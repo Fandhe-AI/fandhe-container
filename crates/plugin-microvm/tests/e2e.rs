@@ -551,9 +551,19 @@ fn make_fifo(path: &std::path::Path) {
         match child.try_wait().expect("try_wait mkfifo") {
             Some(st) => break st,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("mkfifo did not exit within 10s");
+                let killed = child.kill();
+                // kill 後の回収も有限期限で待つ（割り込み不能な待ちの子で無期限に止まらない）。
+                let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let reaped = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Ok(None) if std::time::Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => break false,
+                    }
+                };
+                panic!("mkfifo did not exit within 10s (kill={killed:?}, reaped={reaped})");
             }
             None => std::thread::sleep(Duration::from_millis(20)),
         }

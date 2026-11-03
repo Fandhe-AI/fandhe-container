@@ -938,7 +938,7 @@ mod tests {
     /// `stop_all` の予算内の経路と予算切れの経路の両方で、期限切れの VM の観測ハンドルを残す（#3745）。
     #[test]
     fn mvm1_3745_stop_all_timeout_tracks_watch() {
-        let t = Tmp::new("stopall");
+        let t = Tmp::new("stopall3745");
         let k = t.file("k", b"K");
         for budget in [Duration::from_secs(10), Duration::ZERO] {
             let mut a = adapter();

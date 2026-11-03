@@ -28,9 +28,30 @@
 //! RSI = boot_params・割り込み禁止（IF=0）・GPA 0..4 GiB の 2 MiB ページによる恒等写像（カーネルの確保域・zero page・cmdline を覆う）。
 //! GDT のバイト列と `kvm_segment` の値は同じ記述子から導き、食い違いを型と試験で防ぐ（REPAIR-2）。
 //!
+//! # MSR・FPU の初期値（#3734・MVM-1）
+//! [`boot_msrs`] が vCPU 0 の `KVM_SET_MSRS` に渡す表、[`X86FpuState::boot`] が `KVM_SET_FPU` に渡す値を KVM から切り離して組み立てる
+//! （既定のテスト集合で具体値を照合するため。適用は `device::VcpuFd::{set_msrs, set_fpu}`、呼び出しは `MicroVm::setup_boot_vcpu`）。
+//!
+//! | MSR | index | 値 | 根拠 |
+//! | --- | ----- | -- | ---- |
+//! | IA32_TSC | 0x10 | 0 | 起動時の TSC を 0 にそろえる |
+//! | IA32_SYSENTER_CS / ESP / EIP | 0x174 / 0x175 / 0x176 | 0 | カーネルが `syscall_init`（`arch/x86/kernel/cpu/common.c`）で自分で書く。起動時は既知の 0 |
+//! | IA32_MISC_ENABLE | 0x1A0 | 0x1801 | bit0 FAST_STRING を立てる。落ちていると `early_init_intel`（`arch/x86/kernel/cpu/intel.c`）が REP_GOOD / ERMS を落とす。bit11 BTS_UNAVAIL・bit12 PEBS_UNAVAIL は KVM の vCPU 作成時の既定を保つ |
+//! | STAR / LSTAR / CSTAR / SFMASK | 0xC000_0081..0084 | 0 | `syscall_init` が書く。0 は canonical 検査に通る |
+//! | KERNEL_GS_BASE | 0xC000_0102 | 0 | 同上（`swapgs` 用。カーネルが設定） |
+//!
+//! 外したもの: MTRRdefType（0x2FF）など CPUID の機能ビットに依存する MSR は、CPUID の設定（#3733）に依存するため今回は入れない。
+//! 一次情報は Linux v6.12 の `arch/x86/include/asm/msr-index.h`・`arch/x86/kvm/x86.c`、`Documentation/virt/kvm/api.rst`
+//! （KVM_SET_MSRS / KVM_SET_FPU）、Intel SDM Vol.1（FNINIT 後の FCW = 0x37F・MXCSR = 0x1F80）・Vol.4（MSR 番号）。実機での受理と
+//! 読み戻しは `tests/kvm_device.rs` で照合する（MXCSR は Linux 7.0.0-34 の `KVM_GET_FPU` が常に 0 を返し照合できない。観測は後続。REPAIR-3）。Firecracker・rust-vmm のコードは参照しない（MVM-4）。
+//!
+//! FPU は `KVM_SET_FPU`（レガシー領域）だけを設定し、XSAVE / XCRS は設定しない。KVM の vCPU リセットで XCR0 は x87 のみ・xsave ヘッダは
+//! 既知の状態になり、ゲストカーネルは CPUID（#3733）を見て自分で XSETBV する。`KVM_SET_XSAVE` / `KVM_SET_XCRS` が要るのは
+//! スナップショットと復元の用途で、その用途は未実装（REPAIR-3）。
+//!
 //! # 範囲外（REPAIR-3）
 //! ELF vmlinux・PVH エントリ・aarch64 の FDT / Image・`setup_data`・ACPI / MP テーブル・EFI・4 GiB 超への配置（`ext_*`）・
-//! 複数の RAM 領域・`min_alignment`・CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・start / stop（#886）・
+//! 複数の RAM 領域・`min_alignment`・CPUID / LAPIC の設定（実カーネルの起動完走に必要。#3733・#3735 の追跡事項）・start / stop（#886）・
 //! ファイルからの読み込み（呼び出し元が上限つきで読んで渡す）は未実装。
 //!
 //! # 外部入力の扱い
@@ -919,6 +940,120 @@ fn put_u64(buf: &mut [u8], off: usize, v: u64) -> Result<(), MicrovmError> {
         .copy_from_slice(&v.to_le_bytes());
     Ok(())
 }
+// ---- vCPU の MSR・FPU の初期値（#3734・MVM-1） ----
+
+/// IA32_TSC。
+pub const MSR_IA32_TSC: u32 = 0x10;
+/// IA32_SYSENTER_CS。
+pub const MSR_IA32_SYSENTER_CS: u32 = 0x174;
+/// IA32_SYSENTER_ESP。
+pub const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
+/// IA32_SYSENTER_EIP。
+pub const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
+/// IA32_MISC_ENABLE。
+pub const MSR_IA32_MISC_ENABLE: u32 = 0x1A0;
+/// IA32_STAR。
+pub const MSR_STAR: u32 = 0xC000_0081;
+/// IA32_LSTAR。
+pub const MSR_LSTAR: u32 = 0xC000_0082;
+/// IA32_CSTAR。
+pub const MSR_CSTAR: u32 = 0xC000_0083;
+/// IA32_FMASK（SFMASK）。
+pub const MSR_SYSCALL_MASK: u32 = 0xC000_0084;
+/// IA32_KERNEL_GS_BASE。
+pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+/// IA32_MISC_ENABLE の bit0（Fast-Strings）。
+pub const MISC_ENABLE_FAST_STRING: u64 = 1 << 0;
+/// IA32_MISC_ENABLE の bit11（BTS unavailable）。
+pub const MISC_ENABLE_BTS_UNAVAIL: u64 = 1 << 11;
+/// IA32_MISC_ENABLE の bit12（PEBS unavailable）。
+pub const MISC_ENABLE_PEBS_UNAVAIL: u64 = 1 << 12;
+
+/// 起動時の FCW（FNINIT 後の値。Intel SDM Vol.1）。
+pub const BOOT_FPU_FCW: u16 = 0x37F;
+/// 起動時の MXCSR（リセット値。Intel SDM Vol.1）。
+pub const BOOT_FPU_MXCSR: u32 = 0x1F80;
+
+/// `KVM_SET_MSRS` に渡す 1 件（MSR 番号と値。`kvm_msr_entry` の予約領域は公開しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct X86MsrEntry {
+    /// MSR 番号。
+    pub index: u32,
+    /// 値。
+    pub data: u64,
+}
+
+impl X86MsrEntry {
+    /// 番号と値から作る。
+    pub const fn new(index: u32, data: u64) -> Self {
+        Self { index, data }
+    }
+}
+
+/// [`boot_msrs`] の件数。
+pub const BOOT_MSR_COUNT: usize = 10;
+
+// KVM の 1 回の ioctl の上限（sys の MAX_MSR_ENTRIES = 255）を超えない。
+const _: () = assert!(BOOT_MSR_COUNT <= 255);
+
+/// vCPU 0 の起動用 MSR 表（根拠はモジュール doc「MSR・FPU の初期値」）。index は重複しない。
+pub const fn boot_msrs() -> [X86MsrEntry; BOOT_MSR_COUNT] {
+    [
+        X86MsrEntry::new(MSR_IA32_TSC, 0),
+        X86MsrEntry::new(MSR_IA32_SYSENTER_CS, 0),
+        X86MsrEntry::new(MSR_IA32_SYSENTER_ESP, 0),
+        X86MsrEntry::new(MSR_IA32_SYSENTER_EIP, 0),
+        X86MsrEntry::new(
+            MSR_IA32_MISC_ENABLE,
+            MISC_ENABLE_FAST_STRING | MISC_ENABLE_BTS_UNAVAIL | MISC_ENABLE_PEBS_UNAVAIL,
+        ),
+        X86MsrEntry::new(MSR_STAR, 0),
+        X86MsrEntry::new(MSR_LSTAR, 0),
+        X86MsrEntry::new(MSR_CSTAR, 0),
+        X86MsrEntry::new(MSR_SYSCALL_MASK, 0),
+        X86MsrEntry::new(MSR_KERNEL_GS_BASE, 0),
+    ]
+}
+
+/// vCPU の FPU 状態のうち公開する部分（`kvm_fpu` の x87 制御系と MXCSR）。
+///
+/// `fpr`（x87 レジスタ）と `xmm` は公開しない。設定時は 0 を書き、読み戻しでは捨てる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct X86FpuState {
+    /// x87 コントロールワード。
+    pub fcw: u16,
+    /// x87 ステータスワード。
+    pub fsw: u16,
+    /// 抽象タグワード（FXSAVE 形式の 8 ビット）。
+    pub ftwx: u8,
+    /// 最後の x87 命令のオペコード。
+    pub last_opcode: u16,
+    /// 最後の x87 命令の IP。
+    pub last_ip: u64,
+    /// 最後の x87 オペランドのアドレス。
+    pub last_dp: u64,
+    /// MXCSR。
+    pub mxcsr: u32,
+}
+
+impl X86FpuState {
+    /// 起動時の値（fcw = 0x37F・mxcsr = 0x1F80・他は 0）。
+    pub const fn boot() -> Self {
+        Self {
+            fcw: BOOT_FPU_FCW,
+            fsw: 0,
+            ftwx: 0,
+            last_opcode: 0,
+            last_ip: 0,
+            last_dp: 0,
+            mxcsr: BOOT_FPU_MXCSR,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1680,5 +1815,54 @@ mod tests {
         .unwrap();
         let e = write_boot_tables(&mut shifted).unwrap_err();
         assert_eq!(e.message(), "guest memory must start at GPA 0");
+    }
+
+    /// MVM-1・#3734: 起動用 MSR 表を具体値で照合する。
+    #[test]
+    fn mvm1_3734_boot_msrs_table() {
+        let expect: [(u32, u64); 10] = [
+            (0x10, 0),
+            (0x174, 0),
+            (0x175, 0),
+            (0x176, 0),
+            (0x1A0, 0x1801),
+            (0xC000_0081, 0),
+            (0xC000_0082, 0),
+            (0xC000_0083, 0),
+            (0xC000_0084, 0),
+            (0xC000_0102, 0),
+        ];
+        let got: Vec<(u32, u64)> = boot_msrs().iter().map(|e| (e.index, e.data)).collect();
+        assert_eq!(got, expect.to_vec());
+    }
+
+    /// MVM-1・#3734: index は重複せず、件数は ioctl の上限以下。
+    #[test]
+    fn mvm1_3734_boot_msrs_unique_and_bounded() {
+        let t = boot_msrs();
+        assert_eq!(t.len(), BOOT_MSR_COUNT);
+        assert!(t.len() <= 255);
+        let mut idx: Vec<u32> = t.iter().map(|e| e.index).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        assert_eq!(idx.len(), t.len());
+    }
+
+    /// MVM-1・#3734: 起動時の FPU の値。
+    #[test]
+    fn mvm1_3734_boot_fpu_values() {
+        let f = X86FpuState::boot();
+        assert_eq!(
+            (
+                f.fcw,
+                f.fsw,
+                f.ftwx,
+                f.last_opcode,
+                f.last_ip,
+                f.last_dp,
+                f.mxcsr
+            ),
+            (0x37F, 0, 0, 0, 0, 0, 0x1F80)
+        );
     }
 }

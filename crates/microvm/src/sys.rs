@@ -173,10 +173,8 @@ pub(crate) mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_LAPIC: u64 = super::iow(super::KVMIO, 0x8f, 1024);
     /// `_IO(KVMIO, 0x47)`（引数は `unsigned long` の値渡し。VM fd）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_TSS_ADDR: u64 = super::io(super::KVMIO, 0x47);
     /// `_IOW(KVMIO, 0x48, __u64)`（引数は `u64` へのポインタ。VM fd）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_IDENTITY_MAP_ADDR: u64 = super::iow(super::KVMIO, 0x48, 8);
     /// `KVM_MAX_CPUID_ENTRIES`（`arch/x86/include/asm/kvm_host.h`。カーネル内部の値で uapi に無い）。
     /// `KVM_SET_CPUID2` は `nent` がこれを超えると E2BIG、`KVM_GET_SUPPORTED_CPUID` はこの件数に丸める。
@@ -1836,9 +1834,8 @@ pub(crate) fn kvm_set_lapic(vcpu: BorrowedFd<'_>, lapic: &KvmLapicState) -> Resu
 }
 
 /// `KVM_SET_TSS_ADDR`（VM fd）で TSS 用の 3 ページ（12 KiB）の置き場を指定する（x86_64 のみ）。
-/// vCPU 作成前に発行する。引数は `unsigned long` の値渡し。値の選定と他領域との重なり検証は呼び出し側（#3732）。
+/// vCPU 作成前に発行する。引数は `unsigned long` の値渡し。呼び出しは `VmFd::set_tss_addr` 経由の `MicroVm::assemble` のみ（値の選定と他領域との重なり検証は `microvm.rs`。#3732）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_tss_addr(vm: BorrowedFd<'_>, addr: u64) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -1851,7 +1848,6 @@ pub(crate) fn kvm_set_tss_addr(vm: BorrowedFd<'_>, addr: u64) -> Result<(), SysE
 /// `KVM_SET_IDENTITY_MAP_ADDR`（VM fd）で identity map 用の 1 ページの置き場を指定する（x86_64 のみ）。
 /// vCPU 作成前に発行する。引数は `u64` へのポインタ（`KVM_SET_TSS_ADDR` の値渡しとは形が違う）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_identity_map_addr(vm: BorrowedFd<'_>, addr: u64) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

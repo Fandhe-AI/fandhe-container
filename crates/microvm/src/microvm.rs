@@ -8,6 +8,9 @@
 //! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。vCPU 0 のレジスタ初期化（long mode・エントリへの RIP）は [`MicroVm::setup_boot_vcpu`]（TASK-75.3.2・#885）。
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
+//! KVM 内部領域（#3732）: identity map（[`IDENTITY_MAP_ADDR`]）と TSS（[`TSS_ADDR`]）は vCPU の作成前に置き、RAM・MMIO の窓と
+//! 重ならないことを `plan_layout` が検証する。e820 への予約領域としての記載は範囲外（REPAIR-3。現状の e820 は RAM のみ）。
+//!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
@@ -93,6 +96,39 @@ pub const MAX_VCPUS: u32 = 32;
 
 const _: () = assert!(VIRTIO_MMIO_WINDOW.is_multiple_of(4096));
 const _: () = assert!(VIRTIO_MMIO_WINDOW >= 0x100 + CONFIG_SPACE_SIZE);
+
+/// KVM の identity map ページ（EPT 用。`KVM_SET_IDENTITY_MAP_ADDR`）の置き場（GPA。1 ページ）。KVM の既定値と同じで、
+/// TSS の直前に置く。ゲストのページテーブルが作る恒等写像の範囲（`boot_x86::IDENTITY_MAP_LIMIT`）とは別物。
+/// KVM API 文書は、この領域と [`TSS_ADDR`] を最初の 4 GiB に置き、どの memslot・MMIO とも衝突させないことを要求する。
+/// RAM は GPA 0 から [`VIRTIO_MMIO_BASE`] 以下、virtio-mmio の窓は最大 `0xd000_8000` まで、IOAPIC / LAPIC は
+/// `0xfec0_0000` 以降なので、この位置はどれとも重ならない（`assemble` が `check_reserved_regions` で検証する。MVM-1・#3732）。
+pub const IDENTITY_MAP_ADDR: u64 = 0xfffb_c000;
+/// [`IDENTITY_MAP_ADDR`] の大きさ（1 ページ）。
+pub const IDENTITY_MAP_LEN: u64 = 0x1000;
+/// TSS 用の置き場（GPA。3 ページ）。identity map の直後。`KVM_SET_TSS_ADDR` は先頭から 3 ページを使い、
+/// カーネルは `addr` が `(unsigned int)(-3 * PAGE_SIZE)` を超えると拒否する（上限は下の const assert で固定）。
+pub const TSS_ADDR: u64 = 0xfffb_d000;
+/// [`TSS_ADDR`] の大きさ（3 ページ）。
+pub const TSS_LEN: u64 = 0x3000;
+/// in-kernel IOAPIC の MMIO の窓（既定の物理アドレス。実体は 0x20 バイトだがページ単位で確保する）。
+const IOAPIC_MMIO_BASE: u64 = 0xfec0_0000;
+const IOAPIC_MMIO_LEN: u64 = 0x1000;
+/// LAPIC の MMIO の窓（既定の物理アドレス）。
+const LAPIC_MMIO_BASE: u64 = 0xfee0_0000;
+const LAPIC_MMIO_LEN: u64 = 0x1000;
+/// 4 GiB（TSS・identity map はここまでに収める）。
+const GPA_4GIB: u64 = 1 << 32;
+
+const _: () = assert!(TSS_ADDR.is_multiple_of(4096) && IDENTITY_MAP_ADDR.is_multiple_of(4096));
+const _: () = assert!(TSS_LEN == 3 * 4096 && IDENTITY_MAP_LEN == 4096);
+const _: () = assert!(IDENTITY_MAP_ADDR + IDENTITY_MAP_LEN <= TSS_ADDR);
+const _: () = assert!(TSS_ADDR + TSS_LEN <= GPA_4GIB);
+// カーネルの上限 `addr <= (unsigned int)(-3 * PAGE_SIZE)` = 0xffff_d000。
+const _: () = assert!(TSS_ADDR <= 0xffff_d000);
+const _: () =
+    assert!(VIRTIO_MMIO_BASE + MAX_VIRTIO_DEVICES as u64 * VIRTIO_MMIO_WINDOW <= IOAPIC_MMIO_BASE);
+const _: () = assert!(IOAPIC_MMIO_BASE + IOAPIC_MMIO_LEN <= LAPIC_MMIO_BASE);
+const _: () = assert!(LAPIC_MMIO_BASE + LAPIC_MMIO_LEN <= IDENTITY_MAP_ADDR);
 
 /// ゲスト RAM の確保上限（16 GiB。無制限確保による DoS を防ぐ。`MAP_NORESERVE` でも上限で抑える）。
 pub const MAX_GUEST_RAM_BYTES: u64 = 1 << 34;
@@ -391,7 +427,111 @@ fn plan_layout(
     if mem_size > VIRTIO_MMIO_BASE {
         return Err(invalid("guest memory overlaps the virtio-mmio window"));
     }
-    layout_slots(block_count, net_count)
+    let slots = layout_slots(block_count, net_count)?;
+    let (reserved, occupied) = system_regions(mem_size, &slots)?;
+    check_reserved_regions(&reserved, &occupied)?;
+    Ok(slots)
+}
+
+/// GPA の半開区間 `[start, end)`（重なり検証用。`end` の溢れと空区間は作れない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestRange {
+    start: u64,
+    end: u64,
+}
+
+impl GuestRange {
+    /// `[start, start + len)`。`len == 0` と加算の溢れは `InvalidArgument`（panic しない）。
+    fn new(start: u64, len: u64) -> Result<Self, MicrovmError> {
+        let end = start
+            .checked_add(len)
+            .filter(|_| len != 0)
+            .ok_or_else(|| invalid("guest range is empty or overflows"))?;
+        Ok(Self { start, end })
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+/// 重なり検証の領域の種別（エラー文言用。値・アドレスは載せない。ERR-1・REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    GuestMemory,
+    VirtioMmio,
+    Ioapic,
+    Lapic,
+    Tss,
+    IdentityMap,
+}
+
+impl RegionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GuestMemory => "guest memory",
+            Self::VirtioMmio => "a virtio-mmio window",
+            Self::Ioapic => "the IOAPIC window",
+            Self::Lapic => "the LAPIC window",
+            Self::Tss => "the TSS region",
+            Self::IdentityMap => "the identity map page",
+        }
+    }
+}
+
+type Region = (RegionKind, GuestRange);
+
+/// KVM 内部領域（`reserved`: TSS・identity map）が 4 GiB 以内に収まり、互いに、また使用中の領域（`occupied`:
+/// RAM・MMIO の窓）と重ならないことを確かめる（KVM 不要の純粋関数。`plan_layout` が ioctl の前に呼ぶ。MVM-1・#3732）。
+/// 違反は `InvalidArgument`（fail-closed）。範囲を引数で受けるのは、定数の組では境界の 1 バイトを試験できないため。
+fn check_reserved_regions(reserved: &[Region], occupied: &[Region]) -> Result<(), MicrovmError> {
+    for (i, (kind, range)) in reserved.iter().enumerate() {
+        if range.end > GPA_4GIB {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                format!("{} must lie below 4 GiB", kind.as_str()),
+            ));
+        }
+        for (other_kind, other) in reserved.iter().take(i).chain(occupied.iter()) {
+            if range.overlaps(*other) {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    format!("{} overlaps {}", kind.as_str(), other_kind.as_str()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 実際の構成から `check_reserved_regions` へ渡す `(reserved, occupied)` を組む。
+fn system_regions(
+    mem_size: u64,
+    slots: &[DeviceSlot],
+) -> Result<(Vec<Region>, Vec<Region>), MicrovmError> {
+    let mut occupied = vec![(RegionKind::GuestMemory, GuestRange::new(0, mem_size)?)];
+    for s in slots {
+        occupied.push((
+            RegionKind::VirtioMmio,
+            GuestRange::new(s.mmio_base, s.mmio_len)?,
+        ));
+    }
+    occupied.push((
+        RegionKind::Ioapic,
+        GuestRange::new(IOAPIC_MMIO_BASE, IOAPIC_MMIO_LEN)?,
+    ));
+    occupied.push((
+        RegionKind::Lapic,
+        GuestRange::new(LAPIC_MMIO_BASE, LAPIC_MMIO_LEN)?,
+    ));
+    let reserved = vec![
+        (
+            RegionKind::IdentityMap,
+            GuestRange::new(IDENTITY_MAP_ADDR, IDENTITY_MAP_LEN)?,
+        ),
+        (RegionKind::Tss, GuestRange::new(TSS_ADDR, TSS_LEN)?),
+    ];
+    Ok((reserved, occupied))
 }
 
 /// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
@@ -610,7 +750,7 @@ impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for MicroVm<B, N> {
 }
 
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B, N> {
-    /// 構成を検証し、VM → irqchip → ゲストメモリ → デバイス → vCPU の順に組み立てる。
+    /// 構成を検証し、VM → irqchip → identity map / TSS（x86_64）→ ゲストメモリ → デバイス → vCPU の順に組み立てる。
     ///
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
     /// （段ごとの確認は `mvm1_887_*`・#887）。aarch64 は最初の ioctl より前に `Unimplemented`。
@@ -647,6 +787,12 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         )?;
         let vm = kvm.create_vm()?;
         vm.create_irqchip()?;
+        // KVM 内部領域（identity map・TSS）は vCPU の作成前に置く。位置の重なりは plan_layout で検証済み（#3732）。
+        #[cfg(target_arch = "x86_64")]
+        {
+            vm.set_identity_map_addr(IDENTITY_MAP_ADDR)?;
+            vm.set_tss_addr(TSS_ADDR)?;
+        }
         let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, GuestAddress::new(0))?;
         let devices = DeviceBus::new(&slots, config.block, config.net, |s| {
             vm.register_irqfd(s.gsi)
@@ -1690,6 +1836,122 @@ mod assemble_tests {
             plan_layout(1, 4096 + 1, 0, 0),
             "guest memory size must be a multiple of the host page size (at least 4096)",
         );
+    }
+
+    fn gr(start: u64, len: u64) -> GuestRange {
+        GuestRange::new(start, len).unwrap()
+    }
+
+    fn tss_at(start: u64) -> Vec<Region> {
+        vec![(RegionKind::Tss, gr(start, 0x3000))]
+    }
+
+    fn overlap_msg(r: Result<(), MicrovmError>) -> String {
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        e.message().to_string()
+    }
+
+    /// MVM-1・#3732: RAM との境界（1 バイト手前は通り、1 バイト食い込むと拒否）。
+    #[test]
+    fn mvm1_3732_reserved_region_ram_boundary() {
+        let res = tss_at(0x10_0000);
+        let ram = |len| vec![(RegionKind::GuestMemory, gr(0, len))];
+        assert!(check_reserved_regions(&res, &ram(0x10_0000)).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &ram(0x10_0001))),
+            "the TSS region overlaps guest memory"
+        );
+    }
+
+    /// MVM-1・#3732: MMIO の窓の直前・直後は通り、1 バイトでも食い込むと拒否。内包も拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_mmio_window_before_and_after() {
+        let base = 0x20_0000;
+        let res = tss_at(base);
+        let end = base + 0x3000;
+        let win = |s, l| vec![(RegionKind::VirtioMmio, gr(s, l))];
+        assert!(check_reserved_regions(&res, &win(base - 0x1000, 0x1000)).is_ok());
+        assert!(check_reserved_regions(&res, &win(end, 0x1000)).is_ok());
+        let msg = "the TSS region overlaps a virtio-mmio window";
+        for (s, l) in [
+            (base - 0xfff, 0x1000),
+            (end - 1, 0x1000),
+            (base + 0x1000, 0x100),
+        ] {
+            assert_eq!(overlap_msg(check_reserved_regions(&res, &win(s, l))), msg);
+        }
+    }
+
+    /// MVM-1・#3732: IOAPIC / LAPIC の窓との重なりは種別ごとの文言で拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_ioapic_lapic() {
+        let res = vec![(RegionKind::IdentityMap, gr(IOAPIC_MMIO_BASE, 0x1000))];
+        let io = vec![(RegionKind::Ioapic, gr(IOAPIC_MMIO_BASE, IOAPIC_MMIO_LEN))];
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &io)),
+            "the identity map page overlaps the IOAPIC window"
+        );
+        let res = tss_at(LAPIC_MMIO_BASE - 0x1000);
+        let lapic = vec![(RegionKind::Lapic, gr(LAPIC_MMIO_BASE, LAPIC_MMIO_LEN))];
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &lapic)),
+            "the TSS region overlaps the LAPIC window"
+        );
+    }
+
+    /// MVM-1・#3732: TSS と identity map が 1 バイトでも重なると拒否、隣接は通る。
+    #[test]
+    fn mvm1_3732_reserved_regions_must_not_overlap_each_other() {
+        let mk = |tss| {
+            vec![
+                (RegionKind::IdentityMap, gr(0x10_0000, 0x1000)),
+                (RegionKind::Tss, gr(tss, 0x3000)),
+            ]
+        };
+        assert!(check_reserved_regions(&mk(0x10_1000), &[]).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&mk(0x10_0fff), &[])),
+            "the TSS region overlaps the identity map page"
+        );
+    }
+
+    /// MVM-1・#3732: 終端がちょうど 4 GiB は通り、1 バイト超えると拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_below_4gib() {
+        assert!(check_reserved_regions(&tss_at((1 << 32) - 0x3000), &[]).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&tss_at((1 << 32) - 0x3000 + 1), &[])),
+            "the TSS region must lie below 4 GiB"
+        );
+    }
+
+    /// MVM-1・#3732: 空区間と加算の溢れは panic せず `InvalidArgument`。
+    #[test]
+    fn mvm1_3732_guest_range_rejects_overflow_and_empty() {
+        for (s, l) in [(u64::MAX, 2), (0x1000, 0)] {
+            let e = GuestRange::new(s, l).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert_eq!(GuestRange::new(u64::MAX - 1, 1).unwrap().end, u64::MAX);
+    }
+
+    /// MVM-1・#3732: 既定・最大構成は通り、渡される予約領域は `assemble` が設定する定数と一致する。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_3732_default_layout_passes() {
+        assert!(plan_layout(32, VIRTIO_MMIO_BASE, 8, 0).is_ok());
+        assert!(plan_layout(1, 1 << 28, 1, 1).is_ok());
+        let (reserved, _) = system_regions(4096, &[]).unwrap();
+        assert_eq!(
+            reserved,
+            vec![
+                (RegionKind::IdentityMap, gr(0xfffb_c000, 0x1000)),
+                (RegionKind::Tss, gr(0xfffb_d000, 0x3000)),
+            ]
+        );
+        assert_eq!(IDENTITY_MAP_ADDR, 0xfffb_c000);
+        assert_eq!(TSS_ADDR, 0xfffb_d000);
     }
 
     /// MVM-1・TASK-75.2: x86_64 以外は最初の ioctl の前に `Unimplemented`。

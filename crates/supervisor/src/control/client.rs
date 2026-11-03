@@ -103,7 +103,7 @@ impl super::ExecPidfdSource for ControlExecHandover {
         id: &ContainerId,
         pid: NonZeroU32,
         deadline: Instant,
-    ) -> Result<std::os::fd::OwnedFd, TraitError> {
+    ) -> Result<super::ExecHandover, TraitError> {
         linux::exec_handover(&self.state_root, id, pid, deadline)
     }
 }
@@ -171,8 +171,10 @@ mod linux {
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::exec::ExecCgroupName;
     use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
     use super::CancelOutcome;
@@ -180,11 +182,12 @@ mod linux {
         CONTROL_SOCKET_NAME, effective_uid, open_state_dir, path_via_fd,
     };
     use crate::control::protocol::{
-        CancelRestartRequestFrame, ControlReason, ExecHandoverRequestFrame, FrameHeader,
-        HEADER_LEN, MAX_SIGNAL_BUDGET, RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind,
-        ResponseFrame, SignalDeadline, SignalRequestFrame,
+        CancelRestartRequestFrame, ControlReason, ExecCgroupNotifyFrame, ExecHandoverRequestFrame,
+        FrameHeader, HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_SIGNAL_BUDGET, RESPONSE_LEN,
+        RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
+    use crate::control::{ExecCreatedNotifier, ExecHandover};
 
     /// 1 回の交換で送る要求。
     #[derive(Clone, Copy)]
@@ -326,17 +329,17 @@ mod linux {
         id: &ContainerId,
         deadline: Instant,
     ) -> Result<ControlReason, TraitError> {
-        exchange_with_fds(state_root, request, id, deadline).map(|(reason, _fds)| reason)
+        exchange_with_fds(state_root, request, id, deadline).map(|(reason, _fds, _stream)| reason)
     }
 
-    /// [`exchange`] と同じだが、応答に添えられた fd も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
+    /// [`exchange`] と同じだが、応答に添えられた fd と接続も受け取る（ExecHandoverRequest だけが fd つきの応答を受ける。
     /// 他の要求では `fds` は常に空で、通常の `read` 経路のまま）。受け取った fd は呼び出し側が検証し、想定外なら drop で閉じる。
     fn exchange_with_fds(
         state_root: &Path,
         request: Request,
         id: &ContainerId,
         deadline: Instant,
-    ) -> Result<(ControlReason, Vec<OwnedFd>), TraitError> {
+    ) -> Result<(ControlReason, Vec<OwnedFd>, UnixStream), TraitError> {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
@@ -407,7 +410,9 @@ mod linux {
         sent.map_err(|e| io_error(&e))?;
 
         if matches!(request, Request::ExecHandover { .. }) {
-            return read_response_with_fds(&mut stream, deadline);
+            // 接続は呼び出し側へ返す（exec の間保持して作成通知に使う。閉じることが supervisor への回収の合図）。
+            let (reason, fds) = read_response_with_fds(&mut stream, deadline)?;
+            return Ok((reason, fds, stream));
         }
         read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
@@ -415,7 +420,11 @@ mod linux {
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
         let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
         read_exact_until(&mut stream, &mut payload, deadline).map_err(|e| io_error(&e))?;
-        Ok((ResponseFrame::decode_payload(&payload).reason, Vec::new()))
+        Ok((
+            ResponseFrame::decode_payload(&payload).reason,
+            Vec::new(),
+            stream,
+        ))
     }
 
     /// 応答（Response frame 9 バイト）を、添えられた fd とともに受ける。fd は応答の最初のバイトに付いて届くので、
@@ -470,29 +479,95 @@ mod linux {
     /// 成功は「`Response(Ok)` と fd がちょうど 1 本」のときだけ。拒否（理由コード）に fd が添えられていても、Ok に
     /// fd が無い・2 本以上でも、受け取った fd はすべて閉じて失敗にする（fail-closed。fd を漏らさない）。届いた fd が
     /// 本当に記録 pid の pidfd かは、呼び出し側が `identify_pid1_with_pidfd` で確かめる（この関数は fd を信用しない）。
+    /// 接続は閉じずに [`ExecHandover`] へ持たせる（exec 子 cgroup の作成通知と、消滅の検出に使う）。
     pub(super) fn exec_handover(
         state_root: &Path,
         id: &ContainerId,
         pid: NonZeroU32,
         deadline: Instant,
-    ) -> Result<OwnedFd, TraitError> {
+    ) -> Result<ExecHandover, TraitError> {
         let usable = deadline.saturating_duration_since(Instant::now());
         if usable <= DEADLINE_MARGIN {
             return Err(timeout());
         }
-        let (reason, fds) =
+        let (reason, fds, stream) =
             exchange_with_fds(state_root, Request::ExecHandover { pid }, id, deadline)?;
         if let Some(e) = reason.to_error() {
             return Err(e);
         }
         let mut fds = fds.into_iter();
         match (fds.next(), fds.next()) {
-            (Some(fd), None) => Ok(fd),
-            // fd が無い・2 本以上: 契約違反の応答。受け取った fd は drop で閉じる。
+            (Some(fd), None) => Ok(ExecHandover::new(
+                fd,
+                Box::new(StreamNotifier {
+                    stream: Mutex::new(stream),
+                }),
+            )),
+            // fd が無い・2 本以上: 契約違反の応答。受け取った fd と接続は drop で閉じる。
             _ => Err(TraitError::new(
                 ErrorCode::Internal,
                 "the supervisor control channel returned an unexpected descriptor set",
             )),
+        }
+    }
+
+    /// ack を待つ上限（全体の期限の内側でさらに絞る。REPAIR-5）。
+    const NOTIFY_ACK_BUDGET: Duration = Duration::from_secs(5);
+
+    /// pidfd を受け取った接続で、exec 子 cgroup の作成を通知する本番の実装。
+    struct StreamNotifier {
+        stream: Mutex<UnixStream>,
+    }
+
+    impl ExecCreatedNotifier for StreamNotifier {
+        fn notify_created(
+            &self,
+            name: &ExecCgroupName,
+            hold_until: Instant,
+        ) -> Result<(), TraitError> {
+            let mut stream = self.stream.lock().map_err(|_| unavailable())?;
+            let now = Instant::now();
+            // 単調時計を `Instant` より先に読む（載せる絶対期限が早まる側にずれる）。
+            let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
+            let hold = hold_until
+                .saturating_duration_since(now)
+                .min(Duration::from_secs(MAX_EXEC_HOLD_SECS));
+            if hold.is_zero() {
+                return Err(timeout());
+            }
+            let abs_ns = u64::try_from(hold.as_nanos())
+                .ok()
+                .and_then(|n| now_ns.checked_add(n))
+                .ok_or_else(unavailable)?;
+            let frame = ExecCgroupNotifyFrame {
+                name: name.clone(),
+                hold: HoldDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?,
+            };
+            let bytes = frame.encode().map_err(|_| unavailable())?;
+            let ack_deadline = now
+                .checked_add(NOTIFY_ACK_BUDGET)
+                .unwrap_or(now)
+                .min(hold_until);
+            let write_limit = ack_deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            stream
+                .set_write_timeout(Some(write_limit))
+                .map_err(|_| unavailable())?;
+            stream
+                .write_all(bytes.as_slice())
+                .map_err(|e| io_error(&e))?;
+            let mut head = [0u8; HEADER_LEN];
+            read_exact_until(&mut stream, &mut head, ack_deadline).map_err(|e| io_error(&e))?;
+            FrameHeader::decode(&head)
+                .and_then(FrameHeader::expect_response)
+                .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
+            let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
+            read_exact_until(&mut stream, &mut payload, ack_deadline).map_err(|e| io_error(&e))?;
+            match ResponseFrame::decode_payload(&payload).reason.to_error() {
+                None => Ok(()),
+                Some(e) => Err(e),
+            }
         }
     }
 }

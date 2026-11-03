@@ -1064,7 +1064,7 @@ pub fn run_command_with_pidfd(
 /// `config.json` の `process.env` の上に `launch_env` を重ね、その上に `request` の明示の指定を重ねる。launch の
 /// Entrypoint が使う env と exec(healthcheck を含む)の env を揃えるため。`launch_env` は信頼済みの保存文書
 /// (`container_options::store::read_launch_env`)から取り出した値だけを渡すこと(呼び出し側が任意に足す口ではない)。
-/// 空なら [`run_command_with_pidfd`] と同じ。呼び出し元は healthcheck の exec 専用 helper（[`run_command_with_pidfd_output`] 経由。#2441）で、CLI の exec #2626 の配線は未実装。
+/// 空なら [`run_command_with_pidfd`] と同じ。
 pub fn run_command_with_pidfd_env(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
@@ -1119,14 +1119,19 @@ pub fn run_command_with_pidfd_output(
     )
 }
 
+/// exec 子 cgroup の作成通知のフック型（[`ExecLaunchIo::on_created`]）。
+pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError> + 'a;
+
 /// exec の入出力・env・作成通知の束（引数の数を抑えるための要求型。SUP-4・SUP-6・#2441）。
 pub struct ExecLaunchIo<'a> {
     /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
     pub launch_env: &'a [String],
     /// コマンドの stdout / stderr の取得先。`None` なら標準入出力は 3 本とも `/dev/null`。
     pub output: Option<BorrowedFd<'a>>,
-    /// exec 子 cgroup の排他作成に成功した直後に 1 回呼ばれる通知（healthcheck の exec 専用 helper 用）。
-    pub on_created: Option<&'a dyn Fn(&ExecCgroupName)>,
+    /// exec 子 cgroup の排他作成に成功した直後に 1 回呼ばれる通知（healthcheck の exec 専用 helper と CLI の exec 用）。
+    /// `Err` を返したら worker を fork せず、作成した cgroup を消してその構造化エラーで失敗する（fail-closed。
+    /// 回収役へ名前を渡せない exec を走らせない。SUP-6・REPAIR-5・#2626）。
+    pub on_created: Option<&'a ExecCreatedHook<'a>>,
 }
 
 /// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
@@ -1171,9 +1176,14 @@ fn run_command_with_pidfd_inner(
         exec_responder(record, audit),
         || {
             let created = create_child_cgroup(record, &name)?;
-            // 排他作成に成功した（所有を確定した）直後にだけ通知する。
-            if let (Some(_), Some(notify)) = (&created, on_created) {
-                notify(&name);
+            // 排他作成に成功した（所有を確定した）直後にだけ通知する。通知に失敗したら、所有している cgroup を
+            // ここで消して失敗する（`create` が `Err` のときは呼び出し側が後始末を呼ばないため。fail-closed）。
+            if let (Some(_), Some(notify)) = (&created, on_created)
+                && let Err(e) = notify(&name)
+            {
+                drop(created);
+                let _ = cleanup_child_cgroup(record, &name);
+                return Err(e);
             }
             Ok(created)
         },

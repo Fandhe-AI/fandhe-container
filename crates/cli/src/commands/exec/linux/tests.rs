@@ -19,6 +19,7 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_supervisor::container_options::document::ContainerOptionsDocument;
 use fandhe_container_supervisor::container_options::store::{GENERATION_ANNOTATION, write_new};
+use fandhe_container_supervisor::control::{ExecCreatedNotifier, ExecHandover};
 
 use super::*;
 
@@ -123,10 +124,42 @@ impl Probe {
     }
 }
 
-/// 偽の取得元: 呼ばれた pid を記録し、`/dev/null` を開いた fd を返す（または失敗する）。
+/// 偽の作成通知の口: 通知された名前と保持期限（全体の期限）を記録し、設定があれば失敗する。
+#[derive(Default)]
+struct NotifyLog {
+    names: Mutex<Vec<(String, Instant)>>,
+    fail: Option<ErrorCode>,
+    /// 接続（`ExecHandover`）が drop された回数。
+    dropped: AtomicUsize,
+}
+
+struct FakeNotifier(Arc<NotifyLog>);
+
+impl ExecCreatedNotifier for FakeNotifier {
+    fn notify_created(&self, name: &ExecCgroupName, hold_until: Instant) -> Result<(), TraitError> {
+        self.0
+            .names
+            .lock()
+            .expect("lock")
+            .push((name.as_str().to_owned(), hold_until));
+        match self.0.fail {
+            Some(code) => Err(TraitError::new(code, "fake notify failure")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for FakeNotifier {
+    fn drop(&mut self) {
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 偽の取得元: 呼ばれた pid を記録し、`/dev/null` を開いた fd と偽の通知の口を返す（または失敗する）。
 struct FakeSource {
     calls: Mutex<Vec<u32>>,
     fail: Option<ErrorCode>,
+    notify: Arc<NotifyLog>,
 }
 
 impl FakeSource {
@@ -134,6 +167,19 @@ impl FakeSource {
         Self {
             calls: Mutex::new(Vec::new()),
             fail: None,
+            notify: Arc::new(NotifyLog::default()),
+        }
+    }
+
+    /// 通知が失敗する取得元。
+    fn notify_fails(code: ErrorCode) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            fail: None,
+            notify: Arc::new(NotifyLog {
+                fail: Some(code),
+                ..NotifyLog::default()
+            }),
         }
     }
 }
@@ -144,12 +190,13 @@ impl ExecPidfdSource for FakeSource {
         _id: &ContainerId,
         pid: NonZeroU32,
         _deadline: Instant,
-    ) -> Result<OwnedFd, TraitError> {
+    ) -> Result<ExecHandover, TraitError> {
         self.calls.lock().expect("lock").push(pid.get());
         match self.fail {
             Some(code) => Err(TraitError::new(code, "fake handover failure")),
-            None => Ok(OwnedFd::from(
-                std::fs::File::open("/dev/null").expect("open /dev/null"),
+            None => Ok(ExecHandover::new(
+                OwnedFd::from(std::fs::File::open("/dev/null").expect("open /dev/null")),
+                Box::new(FakeNotifier(Arc::clone(&self.notify))),
             )),
         }
     }
@@ -185,19 +232,23 @@ impl FakeRun {
         record: &StateRecord,
         pidfd: BorrowedFd<'_>,
         request: &ExecRequest,
-        launch_env: &[String],
+        ctx: &RunContext<'_>,
         _timeout: Duration,
         audit: &dyn AuditSink,
     ) -> Result<ExecExit, AuditedRejection<TraitError>> {
         self.launch_envs
             .lock()
             .expect("lock")
-            .push(launch_env.to_vec());
+            .push(ctx.launch_env.to_vec());
         self.seen.lock().expect("lock").push((
             record.status().pid().map_or(0, NonZeroU32::get),
             pidfd.as_raw_fd() >= 0,
         ));
         assert_eq!(request.path(), Path::new("/bin/true"));
+        // 本番の実行役と同じく、cgroup の作成直後に通知する。失敗は worker の fork 前の中止（fail-closed）。
+        if let Err(e) = (ctx.on_created)(&ExecCgroupName::new("exec-4242-0").expect("name")) {
+            return Err(AuditedRejection::not_applicable(e));
+        }
         // 配線の検証: 実行役へ渡った sink へ記録すると、生成口が作った sink の件数が増える。
         let delivery = record_exit_signal(31, 1234, Some(record.status().id()), audit);
         assert_eq!(delivery, AuditDelivery::Recorded);
@@ -214,12 +265,12 @@ fn runner(
     &StateRecord,
     BorrowedFd<'_>,
     &ExecRequest,
-    &[String],
+    &RunContext<'_>,
     Duration,
     &dyn AuditSink,
 ) -> RunResult
 + '_ {
-    move |r, fd, req, env, t, a| fake.run(r, fd, req, env, t, a)
+    move |r, fd, req, ctx, t, a| fake.run(r, fd, req, ctx, t, a)
 }
 
 fn req() -> ExecRequest {
@@ -392,8 +443,8 @@ fn sec1_handover_failure_stops_before_run() {
     seed(&base, &store, "c1", true);
     let probe = Probe::default();
     let source = FakeSource {
-        calls: Mutex::new(Vec::new()),
         fail: Some(ErrorCode::Unavailable),
+        ..FakeSource::ok()
     };
     let fake = FakeRun::must_not_run();
     let e = run_with(&store, &probe, &fake, &source, "c1").unwrap_err();
@@ -711,4 +762,52 @@ fn sup6_cli1_child_stops_when_parent_dies() {
             assert!(!alive, "leaf {leaf_pid} must stop when its parent dies");
         }
     }
+}
+
+/// SUP-6・REPAIR-5・#2626: 実行役は cgroup の作成直後に通知し、その名前と全体の期限が supervisor 側の口へ渡る。
+/// 接続は run が戻るまで保持され、exec_in_container が戻ったときに drop される（切断が回収の合図）。
+#[test]
+fn sup6_repair5_created_cgroup_is_notified_and_connection_outlives_run() {
+    let base = TmpDir::new("notify");
+    let store = open(&base);
+    seed(&base, &store, "c1", true);
+    let (probe, source) = (Probe::default(), FakeSource::ok());
+    let fake = FakeRun::returning(Ok(ExecExit::Command(ChildExit::Exited(0))));
+    let before = Instant::now();
+    assert_eq!(run_with(&store, &probe, &fake, &source, "c1"), Ok(0));
+    let names = source.notify.names.lock().unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].0, "exec-4242-0");
+    // 保持期限は exec 全体の期限（呼び出し時刻 + 30 秒）で、それより長くならない。
+    assert!(names[0].1 > before + Duration::from_secs(29));
+    assert!(names[0].1 <= Instant::now() + Duration::from_secs(30));
+    // 戻った後は接続（通知の口）が drop されている。
+    assert_eq!(source.notify.dropped.load(Ordering::SeqCst), 1);
+}
+
+/// SUP-6・REPAIR-5・#2626: 通知（ack）に失敗したら exec は成立せず、その構造化エラーを返す（fail-closed）。接続も drop される。
+#[test]
+fn sup6_repair5_notify_failure_fails_closed() {
+    let base = TmpDir::new("notifyfail");
+    let store = open(&base);
+    seed(&base, &store, "c1", true);
+    let (probe, source) = (
+        Probe::default(),
+        FakeSource::notify_fails(ErrorCode::Unavailable),
+    );
+    // 通知の失敗は実行役の中止になる。成功の戻り値は使われない。
+    let fake = FakeRun::returning(Ok(ExecExit::Command(ChildExit::Exited(0))));
+    let e = run_with(&store, &probe, &fake, &source, "c1").unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Unavailable);
+    assert_eq!(e.message(), "fake notify failure");
+    assert_eq!(source.notify.names.lock().unwrap().len(), 1);
+    assert_eq!(source.notify.dropped.load(Ordering::SeqCst), 1);
+}
+
+/// REPAIR-5・SUP-6・#2626: 制御チャネルの保持期限の上限（supervisor の `MAX_EXEC_HOLD_SECS`）は、`exec --timeout` の
+/// 上限以上である（上限を超える exec の通知が拒否されない）。
+#[test]
+fn repair5_hold_cap_covers_exec_max_timeout() {
+    use fandhe_container_supervisor::control::protocol::MAX_EXEC_HOLD_SECS;
+    const { assert!(super::super::super::args::EXEC_MAX_TIMEOUT_SECS <= MAX_EXEC_HOLD_SECS) };
 }

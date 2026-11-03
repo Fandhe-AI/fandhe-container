@@ -16,14 +16,25 @@
 //!    複製させないため
 //! 4. supervisor の制御チャネルから起動時 pidfd の複製を受け取る（`ExecPidfdSource`。`state.json` の pid から
 //!    `pidfd_open` する縮退はしない。SEC-1）
-//! 5. `run_command_with_pidfd_env` を呼ぶ（監査 sink を必須引数として渡す。env は `config.json` の `process.env` の上に
-//!    2 で読んだ launch 時 env、その上に `--env` を重ねる）
+//! 5. `run_command_with_pidfd_output_notify` を呼ぶ（監査 sink を必須引数として渡す。env は `config.json` の `process.env` の上に
+//!    2 で読んだ launch 時 env、その上に `--env` を重ねる）。exec 子 cgroup の排他作成の直後（worker の fork 前）に、4 の
+//!    接続で supervisor へ cgroup の名前を通知し ack を待つ。通知に失敗したら cgroup を消して exec しない（fail-closed）
 //!
 //! 委譲スコープ（#2626 の review 対応）: core の cgroup 参加は移動元と移動先の共通祖先への書き込み権を要するため、
 //! ログインセッションの cgroup からでは `PermissionDenied` になる。`run_exec` は 1 の検査と「稼働中か」の確認の後、
 //! 自分自身を `systemd-run --user --scope -p Delegate=yes --` で再実行し（目印の環境変数で再帰を止める）、
 //! スコープ内の実行が 2〜5 を行う。親は子の終了コードを引き継ぐ。計測（`OpRecorder`、操作名 `exec`）は
 //! 実行した側が 1 回だけ行う（REPAIR-4）。
+//!
+//! # 子孫の回収（SUP-6・REPAIR-5・#2626 の codex P1）
+//!
+//! `PR_SET_PDEATHSIG` は「この内側の CLI → worker → 直接のコマンド」の 1 段にしか効かず、コマンドが作った子孫へは継承
+//! されない。子孫は既にコンテナ側の cgroup（`exec-*`）へ移っており、cgroup を掃除する CLI 自身も SIGKILL され得るため、
+//! CLI の側だけでは `--timeout` を超えて残る子孫を止められない。そこで 4 で pidfd を受け取った **接続を閉じずに** 5 の
+//! 終わり（後始末の後）まで保持し、作成した cgroup の名前を通知する。生存する supervisor のガード（`control::exec_guard`）が、
+//! 接続の切断（外側・内側の CLI が SIGKILL されても、この接続は閉じる）か保持期限（`--timeout` + 猶予）で、その cgroup を
+//! `cgroup.kill` と削除で回収する。通知の ack より前に消えた窓（作成から通知までの一瞬）は、次回の exec 開始時の掃除・
+//! delete 前の掃除が回収する。supervisor 自身が消えたときは、コンテナ cgroup ごと delete 前の掃除が回収する。
 //!
 //! 5 の呼び出しプロセスは **単一スレッド** でなければならない（`setns` は多スレッドを拒否する。core の
 //! `fork_single_threaded` が実行時にも強制する）。本 module は 1〜4 でスレッドを起こさない（`plugin_backend` を通る
@@ -73,14 +84,14 @@ pub(super) fn run_exec(
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::{OsStr, OsString};
-    use std::os::fd::{AsFd as _, BorrowedFd};
+    use std::os::fd::BorrowedFd;
     use std::os::unix::process::ExitStatusExt as _;
     use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
-    use fandhe_container_core::exec::{ChildExit, ExecExit};
+    use fandhe_container_core::exec::{ChildExit, ExecCgroupName, ExecExit};
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::OCI_EXIT_INTERNAL;
     use fandhe_container_core::traits::{
@@ -91,7 +102,8 @@ mod linux {
     use fandhe_container_supervisor::control::listener::effective_uid;
     use fandhe_container_supervisor::control::{ExecPidfdSource, production_exec_pidfd_source};
     use fandhe_container_supervisor::exec::{
-        AuditedOutcome, ExecRequest, default_audit_sink, run_command_with_pidfd_env,
+        AuditedOutcome, ExecLaunchIo, ExecRequest, default_audit_sink,
+        run_command_with_pidfd_output_notify,
     };
     use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
     use fandhe_container_supervisor::user_scope::user_manager_env;
@@ -109,15 +121,26 @@ mod linux {
     /// 監査の記録先を作る注入点（本番は [`production_sink`]）。引数は検査済みの状態ルート。
     type SinkFactory<'a> = dyn Fn(&Path) -> Result<Box<dyn AuditSink>, TraitError> + 'a;
 
-    /// `run_command_with_pidfd_env` の注入点（本番は [`production_runner`]。試験は偽の実行役を渡す）。
-    /// 4 番目の引数は launch 時の env 上書き（`KEY=VALUE`。状態記録の世代と照合済みの文書から読んだもの）。
+    /// exec 子 cgroup の排他作成の直後に呼ぶ通知（pidfd を渡した supervisor へ名前を伝え、ack を待つ。失敗は exec の中止）。
+    type OnCreated<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError> + 'a;
+
+    /// 実行役へ渡す、exec の入出力以外の文脈（引数の数を抑えるための束）。
+    pub(super) struct RunContext<'a> {
+        /// launch 時の env 上書き（`KEY=VALUE`。状態記録の世代と照合済みの文書から読んだもの）。
+        pub(super) launch_env: &'a [String],
+        /// exec 子 cgroup の作成通知（実行役は作成の直後、worker の fork 前に 1 回呼ぶ。SUP-6・REPAIR-5・#2626）。
+        pub(super) on_created: &'a OnCreated<'a>,
+    }
+
+    /// `run_command_with_pidfd_output_notify` の注入点（本番は [`production_runner`]。試験は偽の実行役を渡す）。
+    /// 4 番目の引数は launch 時の env 上書きと作成通知（[`RunContext`]）。
     /// 成功側は終了状態（`ExecExit`）だけを返す。`AuditedOutcome` の他の欄（適用件数・監査配送の結果）は CLI の
     /// 終了コードに影響せず、`ExecOutcome` は外から構築できないため、注入点は `ExecExit` に絞る。
     type Runner<'a> = dyn Fn(
             &StateRecord,
             BorrowedFd<'_>,
             &ExecRequest,
-            &[String],
+            &RunContext<'_>,
             Duration,
             &dyn AuditSink,
         ) -> Result<ExecExit, AuditedRejection<TraitError>>
@@ -129,16 +152,28 @@ mod linux {
     }
 
     /// 本番の実行役: supervisor の通しの入口（launch 時 env を重ねる版。healthcheck と同じ env の規則。#2713）。
+    /// 作成通知つきの入口を使い、標準入出力は従来どおり `/dev/null`（`output` なし）のまま。
     fn production_runner(
         record: &StateRecord,
         pidfd: BorrowedFd<'_>,
         request: &ExecRequest,
-        launch_env: &[String],
+        ctx: &RunContext<'_>,
         timeout: Duration,
         audit: &dyn AuditSink,
     ) -> Result<ExecExit, AuditedRejection<TraitError>> {
-        run_command_with_pidfd_env(record, pidfd, request, timeout, audit, launch_env)
-            .map(|AuditedOutcome { outcome, .. }| outcome.exit)
+        run_command_with_pidfd_output_notify(
+            record,
+            pidfd,
+            request,
+            timeout,
+            audit,
+            ExecLaunchIo {
+                launch_env: ctx.launch_env,
+                output: None,
+                on_created: Some(ctx.on_created),
+            },
+        )
+        .map(|AuditedOutcome { outcome, .. }| outcome.exit)
     }
 
     /// 要求を構築する（`ExecRequest::new` が絶対パス・argv・件数・長さ・NUL を検証する。`--env` は上限を検証して足す）。
@@ -197,7 +232,9 @@ mod linux {
 
         // pidfd の受け渡しは全体の期限の内側で、さらに上限を設ける。
         let handover_deadline = total_deadline.min(started + HANDOVER_BUDGET);
-        let pidfd = source.obtain(id, pid, handover_deadline)?;
+        // 接続（`handover`）は run が戻って後始末が終わるまで保持する。drop が切断で、supervisor はそのとき通知済みの
+        // exec 子 cgroup を回収する（この CLI が SIGKILL されても同じ。通常終了では先に消していて何も起きない）。
+        let handover = source.obtain(id, pid, handover_deadline)?;
 
         // 残りの時間が `run_command_with_pidfd_env` の全体の上限になる（準備から終了待ちまで）。
         let remaining = total_deadline.saturating_duration_since(Instant::now());
@@ -207,11 +244,16 @@ mod linux {
                 "exec timed out before the command started",
             ));
         }
+        let on_created = |name: &ExecCgroupName| handover.notify_created(name, total_deadline);
+        let ctx = RunContext {
+            launch_env: &launch_env,
+            on_created: &on_created,
+        };
         match run(
             &record,
-            pidfd.as_fd(),
+            handover.pidfd(),
             request,
-            &launch_env,
+            &ctx,
             remaining,
             sink.as_ref(),
         ) {
@@ -339,7 +381,9 @@ mod linux {
 
     /// 委譲スコープ内の子が、親 CLI の終了に追従して止まるようにする（親の SIGTERM・SIGHUP・SIGKILL を含む。#2626・SUP-6）。
     /// `PR_SET_PDEATHSIG` を設定した後で実際の親が親 CLI であることを照合する（設定前に親が終わっていた競合を閉じる）。
-    /// 子の worker とコマンドは core が同じ設定を持つため、子が止まれば連鎖して止まる。設定できない・親が居ないときは
+    /// 子の worker とコマンドは core が同じ設定を持つため、子が止まれば連鎖して止まる。ただし停止するのは直接の
+    /// 1 段（この子 → worker → 直接のコマンド）だけで、コマンドが作った子孫には継承されない。子孫は supervisor が
+    /// pidfd の接続の切断を検出して exec 子 cgroup ごと回収する（モジュール doc「子孫の回収」）。設定できない・親が居ないときは
     /// 実行せず失敗する（fail-closed。親へ中断が届かない実行を残さない）。
     fn bind_to_parent_lifetime() -> Result<(), TraitError> {
         let fail = || TraitError::new(ErrorCode::Unavailable, "the exec parent is gone");

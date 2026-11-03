@@ -54,13 +54,30 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる。続けて create の起動オプション文書の launch 時 env を状態記録の世代と照合して読む（`container_options::store::launch_env_for`。SUP-12・#2713。欠落・世代不一致は exec しない）
 3. 監査の記録先を `default_audit_sink(Some(host_state_root))` で作る。**作れなければ exec しない**（監査なしで実行する経路は無い）。supervisor へ接続する前に作るのは、監査できない exec のために pidfd を複製させないため
 4. 制御チャネルから pidfd の複製を受け取る（`SCM_RIGHTS`。受け取る fd はちょうど 1 本で、`MSG_CTRUNC`・2 本以上・Ok なのに 0 本はすべて閉じて失敗）
-5. `run_command_with_pidfd_env` を呼ぶ（env は `config.json` の `process.env` の上に launch 時 env、その上に `--env` を重ねる。healthcheck と同じ規則）。受け取った fd は信用せず、`identify_pid1_with_pidfd` が fdinfo の `Pid:` を記録 pid と照合する
+5. `run_command_with_pidfd_output_notify` を呼ぶ（cgroup の作成直後の通知は 3.5。env は `config.json` の `process.env` の上に launch 時 env、その上に `--env` を重ねる。healthcheck と同じ規則）。受け取った fd は信用せず、`identify_pid1_with_pidfd` が fdinfo の `Pid:` を記録 pid と照合する
 
 ### 3.4 終了コードと期限
 
 - コマンドが起動した場合は子の終了状態（`Exited(n)` は `n`、`Signaled(s)` は `128 + s`）。起動前に子が失敗した場合（`SetupFailed`）も子の終了状態（通常 125 / 126 / 127）。
 - 拒否・期限超過・到達不能は ERR-2 の `OCI_EXIT_*`（1〜10）と stderr の構造化エラー 1 行。コマンド自身の 1〜10 と重なるため、見分けは stderr の行の有無（docker exec と同じ考え方）。
 - 全体の既定は 60 秒、`--timeout` で上書き（1〜3600 秒）。pidfd の受け渡しは全体の期限の内側で 5 秒を上限にする。残りが `run_command_with_pidfd` の `timeout` になる（REPAIR-5）。
+
+### 3.5 子孫の回収（接続の保持と作成通知。codex P1・SUP-6・REPAIR-5・#2626）
+
+**問題**: `PR_SET_PDEATHSIG` は「内側の CLI → worker → 直接のコマンド」の 1 段にしか効かず、コマンドが作った子孫へは継承されない（core の `exec_command.rs` に明記の制限）。子孫は既にコンテナ側の `exec-*` cgroup にいて、cgroup を掃除する CLI 自身も SIGKILL され得るため、CLI 側だけでは `--timeout` を超えた残留を止められない。systemd の委譲スコープの停止でも回収できない（子孫はコンテナ側 cgroup）。
+
+**方式**: 回収役を、生存する supervisor 側に置く。healthcheck の前例（helper が `FCHC1 <name>` を通知し、supervisor が `remove_exec_child_cgroup` で止める）と同じ考え方を、制御チャネルの接続に載せる。
+
+1. pidfd を渡した接続を supervisor は **閉じずに** 専用の「ガード」スレッドへ預ける（accept ループは先へ進むため、Signal・Stop の処理を止めない）。クライアント（`ExecHandover`）も接続を保持し、`run` が戻って CLI の後始末が済むまで drop しない
+2. CLI は exec 子 cgroup の排他作成に成功した直後（worker の fork 前）に、同じ接続で **ExecCgroupNotify**（kind 7: 保持期限 `u64` + `ExecCgroupName`）を送り、ack（`Response(Ok)`）を待つ。ack を受けてから worker を fork する＝登録が先に確定する。通知に失敗したら cgroup を消して exec しない（`on_created` が `Result` を返す fail-closed）
+3. ガードは名前を `ExecCgroupName::new` で検証して保持し、接続の切断（CLI の正常終了・SIGKILL を含む消滅）か保持期限（通知の期限 + 猶予 30 秒。上限 `MAX_EXEC_HOLD_SECS` = 3600 = `--timeout` の上限）まで待ち、`ExecCgroupReclaimer`（本番は `StoreExecReclaimer`: 回収の時点で自分のコンテナの状態記録を読み、記録の cgroup 配置から `remove_exec_child_cgroup` を呼ぶ）で `cgroup.kill` と削除を行う。冪等で、通常終了では CLI が先に消していて `Absent`
+4. 資源は固定: 同時のガードは 16（`ExecGuardLimits::max_guards`）。超えたら **pidfd を渡す前** に `ExecGuardExhausted`（`RESOURCE_EXHAUSTED`）で断る。通知の待ちは 10 秒。回収役が結線されていない supervisor は `ExecReclaimUnavailable` で断る（fail-closed。本番の `start_entry` は必ず配線する）
+5. 結果は構造化ログ `exec_cgroup_reclaim`（`trigger`: disconnect / deadline / protocol、`outcome`: removed / absent / failed）と `OpRecorder` へ集計する（REPAIR-4）
+6. ガードのプールは `PausableServer` が保持するので、restart の再 launch での accept ループの pause / resume（#2043）の影響を受けない
+
+**残る窓**: (a) 通知の ack より前に CLI が消えた窓（作成から通知まで）は回収されない。cgroup は空なので exec 開始時の掃除（`sweep_before_create`）・delete 前の掃除（KillAll）が回収する。(b) supervisor 自身が消えた場合は回収されない（コンテナ cgroup ごと delete 前の掃除が回収する）。(c) 通知から回収までの間にコンテナが再 launch されて配置（instance）が変わった場合、旧 instance の cgroup は旧コンテナとともに消えるため `Absent` / `Failed` になる。(d) 新しい CLI と古い supervisor の組は、kind 6 の応答で pidfd が渡る一方、kind 7 を `Malformed` として閉じるため通知に失敗し、exec しない（fail-closed）。古い CLI と新しい supervisor の組は、通知なしで接続が切れるだけで何も回収せず従来どおり動く。(e) ガードスレッドは accept ループとは別のスレッドで、cgroup の `cgroup.kill` の待ち（最大 2 秒）は他の要求を止めない。
+
+**却下案**: `PR_SET_PDEATHSIG` を `SIGTERM` に替えて内側の CLI が捕捉し子孫を止める案は、内側の CLI 自身が SIGKILL されると救えず、codex の要求（CLI 消滅時の回収）を満たさないため採らない。CLI が systemd のスコープを使って子孫ごと止める案は、子孫が既にコンテナ側の cgroup へ移っているため回収できない。supervisor が定期的に `exec-*` を走査して持ち主の無い cgroup を止める案は、持ち主の判定（pid の再利用）が曖昧で、走査間隔の分だけ `--timeout` を超えるため採らない。
 
 ## 4. 信頼境界の評価
 

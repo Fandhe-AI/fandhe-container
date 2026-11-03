@@ -1508,9 +1508,10 @@ mod lifecycle_tests {
         let mut body = FakeBody::new(&dropped);
         body.finish_after = Some(1);
         let running = spawn_loop(body, Instant::now()).unwrap();
-        while !dropped.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(
+            wait_until(Duration::from_secs(5), || dropped.load(Ordering::SeqCst)),
+            "loop thread did not exit within the deadline"
+        );
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::GuestShutdown);
     }

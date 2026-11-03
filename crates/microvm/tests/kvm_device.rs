@@ -1138,7 +1138,7 @@ fn kvm_device_start_stop_microvm() {
 }
 /// MVM-1・REPAIR-5・TASK-75.4・#3736: 自己ループするゲスト（`jmp $`）に対し、`RunningMicroVm::stop` が
 /// `VCPU_POLL_INTERVAL`（100ms）のポーリングを待たず、`StopSignal` の kick で即時に戻る。
-/// ポーリング方式なら遅延は 0〜100ms に一様に分布し、5 回とも 50ms 未満になる確率は約 3% のため退行を検出できる。
+/// 停止要求は run の開始直後に揃えるため、ポーリング方式なら毎回約 90ms 待ち 50ms 未満にならず、kick を外すと必ず失敗する。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -1210,8 +1210,9 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(obs.0.load(Ordering::SeqCst) >= 1);
-        // run の途中にいる状態を作る（試行ごとにずらして位相を散らす）。
-        std::thread::sleep(VCPU_POLL_INTERVAL / 2 + Duration::from_millis(7 * attempt));
+        // 観測器の通知は 1 回の run が戻った直後（次の run の開始直前）に来る。そこから短い固定
+        // 待ちだけ置いて停止を要求し、次の run の先頭付近（ポーリング方式なら残り約 90ms）に揃える。
+        std::thread::sleep(Duration::from_millis(5 + attempt));
         let t = Instant::now();
         let report = running.stop(Duration::from_secs(5)).unwrap();
         let elapsed = t.elapsed();

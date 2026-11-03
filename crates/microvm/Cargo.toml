@@ -6,6 +6,7 @@
 # TASK-75.4.1 で microvm に start / stop（vCPU 実行ループ）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.4.2 で起動失敗時の後始末の検証と ERR-1 の TIMEOUT 表記を追加（依存・feature は変えない。unsafe なし）。
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
+# TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # TASK-74.2.1 で virtio_mmio（OS 非依存の共通トランスポート）を追加（依存は増やさない。unsafe なし）。

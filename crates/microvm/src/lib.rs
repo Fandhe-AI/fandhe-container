@@ -48,7 +48,7 @@
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動・他スレッドからの即時停止（kick）は #3738・#3736 で実装済み。virtio-net の受信は期限ごとのポーラー（#3742）で処理し、`start` の拒否の撤去は #3743（backend の到着通知は将来仕様。REPAIR-3）。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動・他スレッドからの即時停止（kick）は #3738・#3736 で実装済み。virtio-net の受信は期限ごとのポーラー（#3742）で処理し、`start` は virtio-net を含む構成でも起動する（#3743。backend の到着通知は将来仕様。REPAIR-3）。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）

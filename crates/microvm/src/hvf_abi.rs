@@ -566,10 +566,11 @@ pub fn parse_macos_product_version(raw: &[u8]) -> Result<MacosVersion, MicrovmEr
         }
         *slot = value;
     }
+    let [major, minor, patch] = parts;
     Ok(MacosVersion {
-        major: parts[0],
-        minor: parts[1],
-        patch: parts[2],
+        major,
+        minor,
+        patch,
     })
 }
 
@@ -588,13 +589,14 @@ pub fn check_gic_supported(v: MacosVersion) -> Result<(), MicrovmError> {
 /// ゲスト側の PPI 番号（INTID）そのものではない。INTID は [`GicIntid`] として戻り値から得る。
 ///
 /// 列挙値の数値は SDK ヘッダ（`hv_gic_types.h`）との照合が人間担当の #3803 で未了の暫定値（実機未確認）。
+/// PPI 番号（EL1 仮想タイマーの推奨 27 など）は列挙識別値ではなく戻り値の INTID 側の値で、混同しない。
 /// 呼び出し側は数値を直接書かず定数だけを使う（REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvGicIntid(u16);
 
 impl HvGicIntid {
     /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` の列挙識別値（暫定。#3803 で照合）。
-    pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(27);
+    pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(3);
 
     /// FFI へ渡す列挙識別値。
     pub const fn bits(self) -> u16 {
@@ -959,7 +961,8 @@ mod tests {
             e.message(),
             "hv_gic_get_spi_interrupt_range returned HV_UNSUPPORTED"
         );
-        assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 27);
+        assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 3);
+        assert_ne!(u32::from(HvGicIntid::EL1_VIRTUAL_TIMER.bits()), 27);
         assert_eq!(GicIntid::new(27).get(), 27);
     }
 }

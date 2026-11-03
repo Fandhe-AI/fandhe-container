@@ -49,6 +49,7 @@
 #![deny(unsafe_code)]
 
 pub mod boot_x86;
+pub mod cpuid_x86;
 #[cfg(target_os = "linux")]
 pub mod device;
 pub mod dispatch;

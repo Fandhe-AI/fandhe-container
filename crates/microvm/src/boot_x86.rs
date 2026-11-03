@@ -30,7 +30,7 @@
 //!
 //! # 範囲外（REPAIR-3）
 //! ELF vmlinux・PVH エントリ・aarch64 の FDT / Image・`setup_data`・ACPI / MP テーブル・EFI・4 GiB 超への配置（`ext_*`）・
-//! 複数の RAM 領域・`min_alignment`・CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・start / stop（#886）・
+//! 複数の RAM 領域・`min_alignment`・MSR / FPU / LAPIC の設定（CPUID は `cpuid_x86`・#3733。実カーネルの起動完走に必要。#886 以降の追跡事項）・start / stop（#886）・
 //! ファイルからの読み込み（呼び出し元が上限つきで読んで渡す）は未実装。
 //!
 //! # 外部入力の扱い

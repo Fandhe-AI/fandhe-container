@@ -14,7 +14,7 @@
 //! （x86_64 のみ。`KvmRegs`・`KvmSregs` ほか。`device::VcpuFd::set_boot_state` / `regs` が呼ぶ）を足した。
 //! #3731（TASK-75.3.2・MVM-1・MVM-4）で x86_64 の `KVM_GET_SUPPORTED_CPUID`・`KVM_SET_CPUID2`・`KVM_{GET,SET}_MSRS`・
 //! `KVM_{GET,SET}_FPU`・`KVM_{GET,SET}_LAPIC`・`KVM_SET_TSS_ADDR`・`KVM_SET_IDENTITY_MAP_ADDR` を足した
-//! （呼び出し側は #3732〜#3735 で足す。それまでは試験からだけ呼ぶ）。
+//! （CPUID は #3733 で `device` が呼ぶ。他は呼び出し側を #3732・#3734・#3735 で足す。それまでは試験からだけ呼ぶ）。
 //! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
 //! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
@@ -412,14 +412,13 @@ const _: () = {
 };
 
 // ---- #3731（TASK-75.3.2・MVM-1・MVM-4）: x86_64 起動用の構造体 ----
-// 呼び出し側（`device` / `microvm`）は #3732〜#3735 で足す。それまでは試験からだけ使うため `dead_code` を許可し、
-// 呼び出しが入ったら外す。
+// CPUID 系は #3733 で `device` が呼ぶ。他の呼び出し側（`device` / `microvm`）は #3732・#3734・#3735 で足す。それまでは
+// 試験からだけ使うため `dead_code` を許可し、呼び出しが入ったら外す。
 
 /// x86_64 の `struct kvm_cpuid_entry2`（`asm/kvm.h`。40 バイト）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct KvmCpuidEntry2 {
     pub function: u32,
     pub index: u32,
@@ -1648,9 +1647,8 @@ impl<E: Copy> Drop for FlexBuf<E> {
 /// `KVM_GET_SUPPORTED_CPUID`（system fd = `/dev/kvm`）でホストの CPUID 候補を最大 `max_entries` 件読む（x86_64 のみ）。
 ///
 /// `max_entries` が 0 または 256 超なら確保前に E2BIG。容量不足でカーネルが E2BIG を返したときもそのまま返す
-/// （再試行の方針は #3733 が決める）。書き戻された件数は非信頼として容量以下を検証する。
+/// （呼び出し側 `device::KvmDevice::supported_cpuid` は 256 件で 1 回だけ要求し、E2BIG でも再試行しない。#3733）。書き戻された件数は非信頼として容量以下を検証する。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_get_supported_cpuid(
     kvm: BorrowedFd<'_>,
     max_entries: usize,
@@ -1680,7 +1678,6 @@ pub(crate) fn kvm_get_supported_cpuid(
 
 /// `KVM_SET_CPUID2`（vCPU fd）で CPUID を設定する（x86_64 のみ）。256 件超は確保前に E2BIG。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_cpuid2(
     vcpu: BorrowedFd<'_>,
     entries: &[KvmCpuidEntry2],

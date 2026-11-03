@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -1136,6 +1136,110 @@ fn kvm_device_start_stop_microvm() {
         MicrovmErrorCode::Unimplemented
     );
 }
+
+/// MVM-1・TASK-75.5・#3740: ゲストが COM1（0x3f8）の THR へ書いた固定文字列を、ホストが `SerialConsole` から
+/// 完全一致で取り出せる。ゲストは LSR（0x3fd）の THRE を確かめてから 1 文字ずつ OUT し、ud2 で終わる。
+/// 停止（`RunningMicroVm::stop` は自身を消費）の後でも、事前に clone したハンドルから出力が欠けず取り出せる。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_serial_output_reaches_host() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::time::{Duration, Instant};
+
+    const MSG: &[u8] = b"fandhe-microvm-uart-ok\r\n";
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    // mov dx,0x3fd; in al,dx; test al,0x20; jz ud2; mov dx,0x3f8; (mov al,c; out dx,al)*; ud2
+    let mut code: Vec<u8> = vec![0x66, 0xBA, 0xFD, 0x03, 0xEC, 0xA8, 0x20];
+    let skip = 4 + 3 * MSG.len();
+    assert!(skip <= 127);
+    code.extend_from_slice(&[0x74, skip as u8]);
+    code.extend_from_slice(&[0x66, 0xBA, 0xF8, 0x03]);
+    for c in MSG {
+        code.extend_from_slice(&[0xB0, *c, 0xEE]);
+    }
+    code.extend_from_slice(&[0x0F, 0x0B]);
+
+    let mut img = vec![0u8; 5 * 512 + 0x1000];
+    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
+    put(0x1F1, &[4]);
+    put(0x1FE, &0xAA55u16.to_le_bytes());
+    put(0x201, &[0x62]);
+    put(0x202, b"HdrS");
+    put(0x206, &0x020Fu16.to_le_bytes());
+    put(0x211, &[1]);
+    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
+    put(0x230, &0x20_0000u32.to_le_bytes());
+    put(0x234, &[1]);
+    put(0x236, &1u16.to_le_bytes());
+    put(0x238, &2047u32.to_le_bytes());
+    put(0x258, &0x100_0000u64.to_le_bytes());
+    put(0x260, &0x40_0000u32.to_le_bytes());
+    let payload = 5 * 512;
+    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+
+    let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![],
+        },
+    )
+    .unwrap();
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    let console = vm.serial_console();
+    let running = vm.start(&loaded).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !running.is_finished() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(running.is_finished());
+    let stats = running.serial_console().stats().unwrap();
+    assert_eq!(stats.written_bytes, MSG.len() as u64);
+    assert_eq!(stats.dropped_bytes, 0);
+    assert_eq!(stats.loopback_discarded, 0);
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(console.take_output().unwrap(), MSG);
+    assert!(console.take_output().unwrap().is_empty());
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_serial_output_reaches_host() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
 /// MVM-1・REPAIR-5・TASK-75.4・#3736: 自己ループするゲスト（`jmp $`）に対し、`RunningMicroVm::stop` が
 /// `VCPU_POLL_INTERVAL`（100ms）のポーリングを待たず、`StopSignal` の kick で即時に戻る。
 /// 停止要求は run の開始直後に揃えるため、ポーリング方式なら毎回約 90ms 待ち 50ms 未満にならず、kick を外すと必ず失敗する。

@@ -948,6 +948,62 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
     }
 }
 
+/// VM 設定（TSS・identity map）の段（errno 分類のメッセージ切り替え用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+enum VmSetupStage {
+    SetTssAddr,
+    SetIdentityMapAddr,
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn classify_vm_setup_error(stage: VmSetupStage, e: SysError) -> MicrovmError {
+    let name = match stage {
+        VmSetupStage::SetTssAddr => "KVM_SET_TSS_ADDR",
+        VmSetupStage::SetIdentityMapAddr => "KVM_SET_IDENTITY_MAP_ADDR",
+    };
+    match e {
+        SysError::Unsupported => MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "KVM is not supported on this architecture",
+        ),
+        SysError::Os(ENOTTY) => {
+            MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM VM fd")
+        }
+        // identity map は vCPU の作成後に設定できない。
+        SysError::Os(EINVAL) if stage == VmSetupStage::SetIdentityMapAddr => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_SET_IDENTITY_MAP_ADDR must run before any vCPU is created",
+        ),
+        SysError::Os(EINVAL) => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM_SET_TSS_ADDR rejected the address",
+        ),
+        SysError::Os(EEXIST) => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            format!("{name}: already set or overlaps an existing memory slot"),
+        ),
+        SysError::Os(n) if n == EACCES || n == EPERM => MicrovmError::new(
+            MicrovmErrorCode::PermissionDenied,
+            format!("permission denied ({name})"),
+        ),
+        SysError::Os(n) if n == ENOSPC || n == ENOMEM || n == EMFILE || n == ENFILE => {
+            MicrovmError::new(
+                MicrovmErrorCode::ResourceExhausted,
+                format!("resource exhausted ({name}, os error {n})"),
+            )
+        }
+        SysError::NullMapping => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("{name} failed (unexpected null mapping)"),
+        ),
+        SysError::Os(n) => MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("{name} failed (os error {n})"),
+        ),
+    }
+}
+
 impl VmFd {
     /// 拡張 `cap` に対応しているかを確かめ、非対応なら `FailedPrecondition`。
     fn require_extension(&self, cap: u64, what: &'static str) -> Result<(), MicrovmError> {
@@ -971,6 +1027,21 @@ impl VmFd {
         self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
         sys::kvm_create_irqchip(self.fd.as_fd())
             .map_err(|e| classify_irq_error(IrqStage::CreateIrqchip, e))
+    }
+
+    /// KVM の identity map ページ（1 ページ）の置き場を設定する（x86_64 のみ。MVM-1・#3732）。
+    /// vCPU の作成前に呼ぶ。検証を経ない任意アドレスを crate の外へ公開しないため `pub(crate)`（呼び出しは `assemble` のみ）。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_identity_map_addr(&self, addr: u64) -> Result<(), MicrovmError> {
+        sys::kvm_set_identity_map_addr(self.fd.as_fd(), addr)
+            .map_err(|e| classify_vm_setup_error(VmSetupStage::SetIdentityMapAddr, e))
+    }
+
+    /// KVM の TSS 用 3 ページの置き場を設定する（x86_64 のみ。MVM-1・#3732）。vCPU の作成前に呼ぶ。`pub(crate)` の理由は上と同じ。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_tss_addr(&self, addr: u64) -> Result<(), MicrovmError> {
+        sys::kvm_set_tss_addr(self.fd.as_fd(), addr)
+            .map_err(|e| classify_vm_setup_error(VmSetupStage::SetTssAddr, e))
     }
 
     /// eventfd を GSI `gsi` に結ぶ（`KVM_IRQFD`）。返った [`IrqFd`] の `trigger` でゲストへ割り込みが入る。
@@ -2155,6 +2226,40 @@ mod tests {
         }
         let m = classify_irq_error(IrqStage::Irqfd, SysError::Os(5));
         assert_eq!(m.message(), "KVM_IRQFD failed (os error 5)");
+    }
+
+    /// MVM-1・#3732: TSS / identity map の ioctl のエラー分類表。
+    #[test]
+    fn classify_vm_setup_error_table() {
+        use MicrovmErrorCode as C;
+        use VmSetupStage::{SetIdentityMapAddr as I, SetTssAddr as T};
+        let cases = [
+            (T, SysError::Unsupported, C::Unimplemented),
+            (T, SysError::Os(ENOTTY), C::FailedPrecondition),
+            (I, SysError::Os(EINVAL), C::FailedPrecondition),
+            (T, SysError::Os(EINVAL), C::InvalidArgument),
+            (T, SysError::Os(EEXIST), C::FailedPrecondition),
+            (I, SysError::Os(EEXIST), C::FailedPrecondition),
+            (T, SysError::Os(EACCES), C::PermissionDenied),
+            (I, SysError::Os(EPERM), C::PermissionDenied),
+            (T, SysError::Os(ENOMEM), C::ResourceExhausted),
+            (I, SysError::Os(ENOSPC), C::ResourceExhausted),
+            (T, SysError::Os(EMFILE), C::ResourceExhausted),
+            (I, SysError::Os(ENFILE), C::ResourceExhausted),
+            (T, SysError::NullMapping, C::Internal),
+            (I, SysError::Os(5), C::Internal),
+        ];
+        for (stage, e, code) in cases {
+            assert_eq!(
+                classify_vm_setup_error(stage, e).code(),
+                code,
+                "{stage:?} {e:?}"
+            );
+        }
+        assert_eq!(
+            classify_vm_setup_error(T, SysError::Os(5)).message(),
+            "KVM_SET_TSS_ADDR failed (os error 5)"
+        );
     }
 
     /// MVM-1・TASK-74.2.3: KVM の VM fd でない fd への登録は FailedPrecondition（KVM 無しで unsafe 経路を通す）。

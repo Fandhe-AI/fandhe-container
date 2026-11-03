@@ -1571,12 +1571,32 @@ impl StartGate {
     }
 }
 
-/// drop で必ずゲートを開ける（spawn の panic でも待機中のスレッドを残さない）。
-struct GateRelease(Arc<StartGate>);
+/// drop で必ずゲートを開ける。生成済みの `handles` もここが持ち、spawn ループ中の panic（unwind）では
+/// ゲートを開く前に停止を要求し、生成済みスレッドが 1 step も実行せず終わるのを期限つきで回収する
+/// （detach して誰も止めないゲスト実行を残さない。REPAIR-5・MVM-1・#3738）。
+struct GateRelease {
+    gate: Arc<StartGate>,
+    stop: Arc<StopSignal>,
+    handles: Vec<JoinHandle<()>>,
+}
 
 impl Drop for GateRelease {
     fn drop(&mut self) {
-        self.0.release();
+        let unwinding = thread::panicking();
+        if unwinding {
+            // 停止要求を先に立ててからゲートを開ける（Err 経路と同じ順序）。
+            self.stop.request();
+        }
+        self.gate.release();
+        if unwinding {
+            let limit = Instant::now() + DROP_STOP_WAIT;
+            if join_all(std::mem::take(&mut self.handles), limit).timed_out {
+                log_line(format_args!(
+                    "level=error op=microvm.spawn_unwind outcome=error code={}",
+                    MicrovmErrorCode::DeadlineExceeded.as_str()
+                ));
+            }
+        }
     }
 }
 
@@ -1641,9 +1661,12 @@ where
         started,
         vcpu_count: count,
     });
-    let mut handles = Vec::with_capacity(bodies.len());
     let gate = Arc::new(StartGate::new(gate_wait));
-    let release = GateRelease(Arc::clone(&gate));
+    let mut release = GateRelease {
+        gate: Arc::clone(&gate),
+        stop: Arc::clone(&stop),
+        handles: Vec::with_capacity(bodies.len()),
+    };
     for (i, body) in bodies.into_iter().enumerate() {
         let thread_gate = Arc::clone(&gate);
         let index = u32::try_from(i).unwrap_or(u32::MAX);
@@ -1666,10 +1689,11 @@ where
             }
         });
         match spawn(format!("microvm-vcpu-{index}"), job) {
-            Ok(h) => handles.push(h),
+            Ok(h) => release.handles.push(h),
             Err(e) => {
                 // 停止要求を先に立ててからゲートを開ける。生成済みスレッドは 1 step も実行せず body を drop して終わる。
                 stop.request();
+                let handles = std::mem::take(&mut release.handles);
                 drop(release);
                 let limit = Instant::now() + DROP_STOP_WAIT;
                 if join_all(handles, limit).timed_out {
@@ -1682,6 +1706,7 @@ where
             }
         }
     }
+    let handles = std::mem::take(&mut release.handles);
     drop(release);
     Ok(RunningMicroVm {
         exit,
@@ -2811,6 +2836,28 @@ mod lifecycle_tests {
         assert_eq!(Arc::strong_count(&p.hold), 1);
         // 起動ゲートにより、生成済みスレッドもゲストを一度も実行していない（回収が 5 秒を超える窓が無い）。
         assert_eq!(p.total_steps.load(Ordering::SeqCst), 0);
+    }
+
+    /// REPAIR-5・MVM-1・#3738: spawn ループ中の panic でも、生成済みスレッドは 1 step も実行せず回収され、body が解放される。
+    #[test]
+    fn mvm1_3738_spawn_panic_stops_and_joins_started_threads() {
+        let p = Probe::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = spawn_loops_with(
+                p.bodies(3),
+                Instant::now(),
+                SerialConsole::new(),
+                |name: String, job: VcpuJob| {
+                    assert!(name != "microvm-vcpu-2", "injected spawn panic");
+                    thread::Builder::new().name(name).spawn(job)
+                },
+            );
+        }));
+        assert!(r.is_err());
+        // unwind が戻った時点で、生成済み 2 台は join 済みで、3 台とも解放されている。
+        assert_eq!(p.drops(), 3);
+        assert_eq!(p.total_steps.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&p.hold), 1);
     }
 
     /// REPAIR-4・REPAIR-5・#3738: ゲートが期限切れになったスレッドはゲスト実行へ進まず、全台が停止して body が解放される。

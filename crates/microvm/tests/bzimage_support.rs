@@ -80,7 +80,7 @@ fn bzimage_constants_match_layout() {
     assert_eq!(IMAGE_LEN, 0x1A00);
     assert_eq!(ENTRY_64_OFFSET, 0x200);
     assert_eq!(EXPECTED_ENTRY, 0x100_0200);
-    assert_eq!(HEADER_MAGIC, *b"HdrS");
+    assert_eq!(HEADER_MAGIC, [0x48, 0x64, 0x72, 0x53]);
 }
 
 /// MVM-1: 本物の `SetupHeader::parse` が合成イメージを解釈し、ローダとのずれがない。

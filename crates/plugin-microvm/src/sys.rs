@@ -613,16 +613,17 @@ mod tests {
         }
 
         /// 祖先が mode 0111（検索のみ）・最終要素が 0400 でも開ける（Linux）。
-        /// root（euid 0）は権限ビットを無視して確認の意味を持たないため、固定行を出して早く抜ける（#3842）。
+        /// root（euid 0）は権限ビットを無視して確認の意味を持たないため、成功扱いで抜けず明示的に失敗させる（#3842）。
         /// 非 root では `read_dir` が `PermissionDenied` になることを陰性対照に、O_PATH なら検索権限だけで辿れることを示す。
         #[cfg(target_os = "linux")]
         #[test]
         fn sec1_3748_opens_under_search_only_ancestor() {
             use std::os::unix::fs::PermissionsExt;
-            if euid_from_proc() == 0 {
-                eprintln!("skip: running as root (euid 0); mode bits are not enforced");
-                return;
-            }
+            assert_ne!(
+                euid_from_proc(),
+                0,
+                "this test needs a non-root euid (mode bits are not enforced for root); run as a non-root user"
+            );
             let d = Dir::new("x-only");
             let sub = d.0.join("xonly");
             std::fs::create_dir(&sub).expect("mkdir");
@@ -694,15 +695,16 @@ mod tests {
         }
 
         /// 祖先を mode 0o000 にすると、祖先自体は `O_PATH` で開けるが、その下の最終要素の open が検索権限なしで
-        /// `Leaf` の `PermissionDenied`（EACCES=13）になる。root は除く（#3842・SEC-1）。
+        /// `Leaf` の `PermissionDenied`（EACCES=13）になる。root では成功扱いにせず失敗させる（#3842・SEC-1）。
         #[cfg(target_os = "linux")]
         #[test]
         fn sec1_3842_unsearchable_ancestor_denies_leaf() {
             use std::os::unix::fs::PermissionsExt;
-            if euid_from_proc() == 0 {
-                eprintln!("skip: running as root (euid 0); mode bits are not enforced");
-                return;
-            }
+            assert_ne!(
+                euid_from_proc(),
+                0,
+                "this test needs a non-root euid (mode bits are not enforced for root); run as a non-root user"
+            );
             let d = Dir::new("anc000");
             let sub = d.0.join("noperm");
             std::fs::create_dir(&sub).expect("mkdir");
@@ -799,7 +801,7 @@ mod tests {
         }
 
         /// 最終要素が FIFO（書き手なし）でも `O_NONBLOCK` で止まらず開く（#3842・SEC-1・REPAIR-5）。
-        /// 止まった場合は FIFO を書き込みで開いて open を解放してから期限切れで失敗にする。
+        /// 止まった場合は O_NONBLOCK の書き手で open を解放し、期限つきで待ってから失敗にする。
         #[test]
         fn sec1_3842_leaf_fifo_does_not_block() {
             use std::os::unix::fs::FileTypeExt;
@@ -824,9 +826,17 @@ mod tests {
                     assert!(ft.is_fifo());
                 }
                 Err(_) => {
-                    // 救出: 書き手として開いてスレッドの open を戻してから失敗にする。
-                    let _w = std::fs::OpenOptions::new().write(true).open(&fifo);
-                    let _ = h.join();
+                    // 救出: O_NONBLOCK の書き手で開いて、ブロック中の読み手の open を戻す（自身はブロックしない）。
+                    // 読み手が既に閉じていれば ENXIO で失敗するだけで止まらない。join も期限つきで、超えたらスレッドを放置して失敗にする。
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _w = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(super::super::nofollow::O_NONBLOCK)
+                        .open(&fifo);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !h.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     panic!("open on FIFO blocked >5s; O_NONBLOCK missing?");
                 }
             }

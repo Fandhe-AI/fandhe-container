@@ -1567,31 +1567,6 @@ fn kvm_device_start_failure_releases_resources() {
     assert_eq!(e.code(), MicrovmErrorCode::NotFound);
     assert!(e.to_string().starts_with("NOT_FOUND: "), "{e}");
 }
-/// #3734 の試験用: エントリ（payload + 0x200）に `entry_code` を置いた合成 bzImage。残りは ud2。
-#[cfg(target_arch = "x86_64")]
-fn synthetic_bzimage(entry_code: &[u8]) -> Vec<u8> {
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
-    img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-    img
-}
 
 /// MVM-1・#3734: `KVM_SET_FPU` の設定経路が効くこと（番兵の FCW の読み戻し）と、`setup_boot_vcpu` 後の FPU が
 /// fcw = 0x37F・fsw = 0・ftwx = 0 であること（`KVM_GET_FPU` の読み戻し）。
@@ -1615,7 +1590,7 @@ fn kvm_device_boot_fpu_reads_back() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let img = synthetic_bzimage(&[0x0F, 0x0B]);
+    let img = bzimage::synthetic_bzimage(&[0x0F, 0x0B]);
     let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
         &dev,
         MicroVmConfig {
@@ -1667,7 +1642,7 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
         0xB9, 0xA0, 0x01, 0x00, 0x00, 0x0F, 0x32, 0xE7, 0x10, 0x89, 0xD0, 0xE7, 0x10, 0xB9, 0x81,
         0x00, 0x00, 0xC0, 0x0F, 0x32, 0xE7, 0x10, 0x89, 0xD0, 0xE7, 0x10,
     ];
-    let img = synthetic_bzimage(&code);
+    let img = bzimage::synthetic_bzimage(&code);
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

@@ -28,7 +28,13 @@
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
-//!   期限切れで切り離した VM は [`MAX_VMS`] の計数に残し続け（`detached`）、枠を空けない（資源上限。REPAIR-5）。枠が尽きたら plugin の再起動で回復する。
+//!   期限切れで切り離した VM は、終了を観測するまで [`MAX_VMS`] の計数に残す（`detached`。資源上限。REPAIR-5）。
+//!   終了の観測は `stop` の前に取った [`MicrovmBackend::ExitWatch`] への待たない照会（`VcpuExitWatch::state`。待ちの期限は 0）で行い、
+//!   契機は `start` 要求の上限判定の直前と [`MicrovmRuntimeAdapter::reclaim_detached`] の明示呼び出しだけ（監視スレッドは持たない。#3745）。
+//!   終了（`Released`）を観測したものだけ枠を返し、観測できない間は返さない（fail-closed）。
+//! - 残余: `KVM_RUN` や ioctl の中で D 状態のまま戻らない vCPU スレッドは `Pending` のままで枠は返らない（回復は plugin の再起動）。
+//!   microvm 側で memslot の削除に失敗した場合は、`Released` でもゲスト RAM の mapping が残りうる（microvm 側の fail-closed の既存仕様）。
+//!   非 Linux では VM を作れないため `detached` は生じない。
 //! - 応答しないファイルシステム上のイメージ読み込みは期限で打ち切れない。祖先ディレクトリの symlink は検査しない（最終要素のみ）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
 
@@ -116,15 +122,41 @@ pub struct BootSpec {
     pub cmdline: String,
 }
 
+/// 切り離した VM の終了観測の結果（PLUG-1・REPAIR-5・#3745）。真偽値にせず、将来の状態を足せる形にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DetachedState {
+    /// 終了を観測できていない（資源が残っている可能性。枠を返さない）。
+    Pending,
+    /// vCPU スレッドが VM の資源を解放済み（枠を返してよい）。
+    Released,
+}
+
 /// microVM 本体への委譲境界。3 OS でビルドでき、KVM なしの試験で差し替えられる。
 pub trait MicrovmBackend {
     /// 実行中 VM のハンドル。
     type Running;
+    /// `stop` の後も有効な終了観測ハンドル。期限切れで切り離した VM の枠を返してよいかの判定に使う（#3745）。
+    type ExitWatch;
     /// 起動する。失敗時は資源が解放済みであること（microvm 側の保証）。
     fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError>;
     /// `deadline` 以内に停止し、理由の固定名を返す。`vm` は成否に関わらず消費される。
     fn stop(&mut self, vm: Self::Running, deadline: Duration)
     -> Result<&'static str, MicrovmError>;
+    /// 終了観測ハンドルを取る。`stop` が `vm` を消費するため、**`stop` に渡す前**に取ること。
+    fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch;
+    /// 終了を待たずに照会する（ブロックしない契約。RPC 期限を消費しない）。未知の状態は `Pending` に倒す（fail-closed）。
+    fn exit_state(&self, watch: &Self::ExitWatch) -> DetachedState;
+}
+
+/// `VcpuExitState` を adapter の状態へ写す。`Running` と将来追加される未知の状態は `Pending`（fail-closed）。
+#[cfg(target_os = "linux")]
+fn classify_exit_state(s: fandhe_container_microvm::microvm::VcpuExitState) -> DetachedState {
+    use fandhe_container_microvm::microvm::VcpuExitState;
+    match s {
+        VcpuExitState::Exited(_) | VcpuExitState::ExitedAbnormally => DetachedState::Released,
+        _ => DetachedState::Pending,
+    }
 }
 
 /// Linux の KVM backend。`/dev/kvm` は初回 start で 1 回だけ開く。
@@ -137,6 +169,7 @@ pub struct KvmBackend {
 #[cfg(target_os = "linux")]
 impl MicrovmBackend for KvmBackend {
     type Running = fandhe_container_microvm::microvm::RunningMicroVm;
+    type ExitWatch = fandhe_container_microvm::microvm::VcpuExitWatch;
 
     fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError> {
         use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
@@ -169,6 +202,14 @@ impl MicrovmBackend for KvmBackend {
     ) -> Result<&'static str, MicrovmError> {
         vm.stop(deadline).map(|r| r.reason.as_str())
     }
+
+    fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch {
+        vm.exit_watch()
+    }
+
+    fn exit_state(&self, watch: &Self::ExitWatch) -> DetachedState {
+        classify_exit_state(watch.state())
+    }
 }
 
 /// 非 Linux の backend。start は常に `UNIMPLEMENTED`（fail-closed）。
@@ -184,6 +225,7 @@ pub enum NeverRunning {}
 #[cfg(not(target_os = "linux"))]
 impl MicrovmBackend for UnsupportedBackend {
     type Running = NeverRunning;
+    type ExitWatch = NeverRunning;
 
     fn start(&mut self, _spec: BootSpec) -> Result<Self::Running, MicrovmError> {
         Err(MicrovmError::new(
@@ -198,6 +240,14 @@ impl MicrovmBackend for UnsupportedBackend {
         _deadline: Duration,
     ) -> Result<&'static str, MicrovmError> {
         match vm {}
+    }
+
+    fn exit_watch(&self, vm: &Self::Running) -> Self::ExitWatch {
+        match *vm {}
+    }
+
+    fn exit_state(&self, watch: &Self::ExitWatch) -> DetachedState {
+        match *watch {}
     }
 }
 
@@ -426,8 +476,9 @@ pub struct StopAllReport {
 pub struct MicrovmRuntimeAdapter<B: MicrovmBackend> {
     backend: B,
     vms: BTreeMap<String, B::Running>,
-    /// 停止が期限切れで切り離された（終了未確認の）VM 数。[`MAX_VMS`] の計数に含める。
-    detached: usize,
+    /// 停止が期限切れで切り離された（終了未観測の）VM の観測ハンドル。件数を [`MAX_VMS`] の計数に含める。
+    /// `vms.len() + detached.len() <= MAX_VMS` が保たれるため、長さは上限で抑えられる。
+    detached: Vec<B::ExitWatch>,
 }
 
 impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
@@ -436,13 +487,23 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         Self {
             backend,
             vms: BTreeMap::new(),
-            detached: 0,
+            detached: Vec::new(),
         }
     }
 
-    /// 停止期限切れで切り離したまま終了未確認の VM 数。
+    /// 停止期限切れで切り離したまま終了未観測の VM 数。
     pub fn detached(&self) -> usize {
+        self.detached.len()
+    }
+
+    /// 終了を観測できた切り離し VM の枠を返し、返した件数を返す。待たない照会のみ（O(MAX_VMS)。冪等）。
+    /// `start` の上限判定の直前から呼ばれる（#3745・REPAIR-5）。
+    pub fn reclaim_detached(&mut self) -> usize {
+        let before = self.detached.len();
+        let backend = &self.backend;
         self.detached
+            .retain(|w| backend.exit_state(w) == DetachedState::Pending);
+        before - self.detached.len()
     }
 
     /// 登録中の VM 数。
@@ -471,16 +532,18 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             };
             if left.is_zero() {
                 // 予算切れ: Drop に任せると 1 台ごとに最大 5 秒待つため、停止要求だけ出して切り離す（1ms で打ち切る。REPAIR-5）。
+                let watch = self.backend.exit_watch(&vm);
                 if let Err(e) = self.backend.stop(vm, Duration::from_millis(1)) {
-                    self.note_stop_error(&e);
+                    self.note_stop_error(&e, watch);
                 }
                 report.remaining += 1;
                 continue;
             }
+            let watch = self.backend.exit_watch(&vm);
             match self.backend.stop(vm, left.min(STOP_DEADLINE)) {
                 Ok(_) => report.stopped += 1,
                 Err(e) => {
-                    self.note_stop_error(&e);
+                    self.note_stop_error(&e, watch);
                     report.failed += 1;
                 }
             }
@@ -488,10 +551,10 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         report
     }
 
-    /// 停止が期限切れなら VM は切り離されただけで資源が残るため、計数に残す。
-    fn note_stop_error(&mut self, e: &MicrovmError) {
+    /// 停止が期限切れなら VM は切り離されただけで資源が残るため、観測ハンドルを計数に残す。それ以外のエラーでは捨てる。
+    fn note_stop_error(&mut self, e: &MicrovmError, watch: B::ExitWatch) {
         if e.code() == MicrovmErrorCode::DeadlineExceeded {
-            self.detached = self.detached.saturating_add(1);
+            self.detached.push(watch);
         }
     }
 
@@ -503,7 +566,8 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         if self.vms.contains_key(id.as_str()) {
             return Err(perr(PluginErrorCode::AlreadyExists, MSG_EXISTS));
         }
-        if self.vms.len().saturating_add(self.detached) >= MAX_VMS {
+        self.reclaim_detached();
+        if self.vms.len().saturating_add(self.detached.len()) >= MAX_VMS {
             return Err(perr(PluginErrorCode::ResourceExhausted, MSG_LIMIT));
         }
         let vcpus = parse_digits(vcpus, VCPUS_MAX_DIGITS)?;
@@ -557,10 +621,11 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             .vms
             .remove(id.as_str())
             .ok_or_else(|| perr(PluginErrorCode::NotFound, MSG_NOT_FOUND))?;
+        let watch = self.backend.exit_watch(&vm);
         let reason = match self.backend.stop(vm, STOP_DEADLINE) {
             Ok(r) => r,
             Err(e) => {
-                self.note_stop_error(&e);
+                self.note_stop_error(&e, watch);
                 return Err(to_plugin_error(&e));
             }
         };
@@ -629,6 +694,8 @@ mod tests {
     /// KVM に触れない試験用 backend。
     #[derive(Default)]
     struct FakeBackend {
+        /// 終了を観測済みにした VM の id（後から vCPU スレッドが終わった模擬。#3745）。
+        exited: std::collections::BTreeSet<u32>,
         starts: usize,
         start_err: Option<MicrovmErrorCode>,
         stop_err: Option<MicrovmErrorCode>,
@@ -637,11 +704,22 @@ mod tests {
 
     impl MicrovmBackend for FakeBackend {
         type Running = u32;
+        type ExitWatch = u32;
         fn start(&mut self, _spec: BootSpec) -> Result<u32, MicrovmError> {
             self.starts += 1;
             match self.start_err {
                 Some(c) => Err(MicrovmError::new(c, "fake")),
-                None => Ok(7),
+                None => Ok(u32::try_from(self.starts).expect("small")),
+            }
+        }
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+        fn exit_state(&self, watch: &u32) -> DetachedState {
+            if self.exited.contains(watch) {
+                DetachedState::Released
+            } else {
+                DetachedState::Pending
             }
         }
         fn stop(&mut self, _vm: u32, _d: Duration) -> Result<&'static str, MicrovmError> {
@@ -794,6 +872,114 @@ mod tests {
         let e = a.handle(&start_req("over", &k)).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
         assert_eq!(a.backend.starts, MAX_VMS);
+    }
+
+    /// 切り離した VM の終了を観測したら枠が返り、同じ枠で新しい start が通る。返る枠は観測した分だけ（#3745・PLUG-1・REPAIR-5）。
+    #[test]
+    fn mvm1_repair5_3745_detached_slot_returned_after_exit_observed() {
+        let t = Tmp::new("reclaim");
+        let k = t.file("k", b"K");
+        let mut a = adapter();
+        a.backend.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+        for i in 0..MAX_VMS {
+            a.handle(&start_req(&format!("v{i}"), &k)).expect("start");
+            a.handle(&s(&["stop", &format!("v{i}")])).unwrap_err();
+        }
+        assert_eq!(a.detached(), MAX_VMS);
+        let e = a.handle(&start_req("over", &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(a.backend.starts, MAX_VMS);
+        a.backend.exited.insert(1);
+        a.handle(&start_req("new", &k)).expect("slot returned");
+        assert_eq!(a.detached(), MAX_VMS - 1);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a.backend.starts, MAX_VMS + 1);
+        let e = a.handle(&start_req("again", &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+    }
+
+    /// 終了を観測できない間は枠を返さず、MAX_VMS を超える start を拒否し続ける（fail-closed。#3745）。
+    #[test]
+    fn mvm1_repair5_3745_pending_detached_keeps_slot() {
+        let t = Tmp::new("pending");
+        let k = t.file("k", b"K");
+        let mut a = adapter();
+        a.backend.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+        for i in 0..MAX_VMS {
+            a.handle(&start_req(&format!("v{i}"), &k)).expect("start");
+            a.handle(&s(&["stop", &format!("v{i}")])).unwrap_err();
+        }
+        for _ in 0..2 {
+            let e = a.handle(&start_req("over", &k)).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+            assert_eq!(a.detached(), MAX_VMS);
+            assert_eq!(a.backend.starts, MAX_VMS);
+        }
+    }
+
+    /// `reclaim_detached` は観測できた件数を返し、冪等（#3745）。
+    #[test]
+    fn mvm1_3745_reclaim_detached_returns_count() {
+        let t = Tmp::new("reclaimcount");
+        let k = t.file("k", b"K");
+        let mut a = adapter();
+        a.backend.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+        for i in 0..3 {
+            a.handle(&start_req(&format!("v{i}"), &k)).expect("start");
+            a.handle(&s(&["stop", &format!("v{i}")])).unwrap_err();
+        }
+        assert_eq!(a.reclaim_detached(), 0);
+        a.backend.exited.extend([1, 2]);
+        assert_eq!(a.reclaim_detached(), 2);
+        assert_eq!(a.detached(), 1);
+        assert_eq!(a.reclaim_detached(), 0);
+    }
+
+    /// `stop_all` の予算内の経路と予算切れの経路の両方で、期限切れの VM の観測ハンドルを残す（#3745）。
+    #[test]
+    fn mvm1_3745_stop_all_timeout_tracks_watch() {
+        let t = Tmp::new("stopall");
+        let k = t.file("k", b"K");
+        for budget in [Duration::from_secs(10), Duration::ZERO] {
+            let mut a = adapter();
+            for i in 0..2 {
+                a.handle(&start_req(&format!("v{i}"), &k)).expect("start");
+            }
+            a.backend.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+            a.stop_all(budget);
+            assert_eq!(a.detached(), 2);
+            a.backend.exited.extend([1, 2]);
+            assert_eq!(a.reclaim_detached(), 2);
+            assert_eq!(a.detached(), 0);
+        }
+    }
+
+    /// 期限切れ以外の停止エラーは切り離しにならない（#3745）。
+    #[test]
+    fn mvm1_3745_non_timeout_stop_error_not_detached() {
+        let t = Tmp::new("nontimeout");
+        let k = t.file("k", b"K");
+        let mut a = adapter();
+        a.handle(&start_req("a", &k)).expect("start");
+        a.backend.stop_err = Some(MicrovmErrorCode::Internal);
+        a.handle(&s(&["stop", "a"])).unwrap_err();
+        assert_eq!(a.detached(), 0);
+    }
+
+    /// `VcpuExitState` の写像。`Exited(StopReport)` は `StopReport` が `#[non_exhaustive]` で crate 外から組めないため扱えない
+    /// （microvm 側の #3744 の試験が `Exited` の記録を照合済み）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mvm1_3745_classify_exit_state() {
+        use fandhe_container_microvm::microvm::VcpuExitState;
+        assert_eq!(
+            classify_exit_state(VcpuExitState::Running),
+            DetachedState::Pending
+        );
+        assert_eq!(
+            classify_exit_state(VcpuExitState::ExitedAbnormally),
+            DetachedState::Released
+        );
     }
 
     /// backend の start 失敗は登録されず、code が写される。

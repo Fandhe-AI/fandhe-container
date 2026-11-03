@@ -114,7 +114,8 @@ mod mock_core {
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsListener};
     use fandhe_container_plugin_microvm::adapter::{
-        BootSpec, MicrovmBackend, MicrovmRuntimeAdapter, STOP_ALL_BUDGET, StopAllReport,
+        BootSpec, DetachedState, MicrovmBackend, MicrovmRuntimeAdapter, STOP_ALL_BUDGET,
+        StopAllReport,
     };
     use fandhe_container_plugin_microvm::frame_loop::{LoopExit, serve};
 
@@ -144,6 +145,7 @@ mod mock_core {
 
     impl MicrovmBackend for FakeBackend {
         type Running = u32;
+        type ExitWatch = u32;
 
         fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
             let mut r = self.0.lock().expect("lock");
@@ -163,6 +165,14 @@ mod mock_core {
         fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
             self.0.lock().expect("lock").stops.push((vm, deadline));
             Ok("requested")
+        }
+
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+
+        fn exit_state(&self, _watch: &u32) -> DetachedState {
+            DetachedState::Pending
         }
     }
 

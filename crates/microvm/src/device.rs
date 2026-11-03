@@ -150,14 +150,13 @@ pub enum ValueCapture {
 
 /// 件数上限つきの観測器（試験・診断用。#3769・MVM-1・REPAIR-12）。
 ///
-/// 上限を超えたレコードは捨てて [`BoundedRunLog::dropped`] に数える。`record` は割り当てもブロックもしない
-/// （`new` で確保済み）。`Debug` は記録した値を出さない。
+/// 上限を超えたレコードは捨てて [`BoundedRunLog::dropped`] に数える。`record` は割り当てしない（`new` で確保済み）。
+/// 読み取り側（`records` 等）はロックを短時間（複製の間だけ）しか持たないため、`record` は競合しても
+/// 短い待ちで必ず記録する（競合で exit を捨てると並びの照合が不安定になる。REPAIR-12）。`Debug` は記録した値を出さない。
 pub struct BoundedRunLog {
     capacity: usize,
     capture: ValueCapture,
     inner: std::sync::Mutex<BoundedRunLogInner>,
-    /// ロック競合で待たずに捨てた件数（`record` は vCPU スレッドから呼ばれるためブロックしない）。
-    contended: std::sync::atomic::AtomicU64,
 }
 
 struct BoundedRunLogInner {
@@ -181,7 +180,6 @@ impl BoundedRunLog {
                 records: Vec::with_capacity(capacity),
                 dropped: 0,
             }),
-            contended: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -200,11 +198,6 @@ impl BoundedRunLog {
     pub fn dropped(&self) -> u64 {
         self.lock().dropped
     }
-
-    /// ロック競合で待たずに捨てたレコード数（`records()` 等と `record` が重なった場合）。
-    pub fn contended_dropped(&self) -> u64 {
-        self.contended.load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 impl std::fmt::Debug for BoundedRunLog {
@@ -219,23 +212,14 @@ impl std::fmt::Debug for BoundedRunLog {
             .field("capture", &self.capture)
             .field("len", &len)
             .field("dropped", &dropped)
-            .field("contended_dropped", &self.contended_dropped())
             .finish()
     }
 }
 
 impl RunObserver for BoundedRunLog {
     fn record(&self, record: &RunRecord) {
-        // vCPU スレッドから呼ばれるためブロックしない。競合時は待たずに捨てて数える。
-        let mut g = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.contended
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        };
+        // 読み取り側の保持は複製の間だけで有界。競合しても待って必ず記録する。
+        let mut g = self.lock();
         if g.records.len() < self.capacity {
             g.records.push(*record);
         } else {
@@ -1590,21 +1574,26 @@ mod tests {
         assert_eq!(log.dropped(), 3);
     }
 
-    /// #3769・MVM-1・REPAIR-5: ロック競合時は待たずに捨て、件数を数える。
+    /// #3769・MVM-1・REPAIR-12: 読み取りと `record` が重なっても記録を捨てない。
     #[test]
-    fn mvm1_3769_bounded_run_log_record_does_not_block_on_contention() {
-        let log = BoundedRunLog::new(4, ValueCapture::Record).unwrap();
-        log.record(&rec(0, b'a'));
-        {
-            let _held = log.lock();
-            log.record(&rec(1, b'b'));
-            log.record(&rec(2, b'c'));
-            assert_eq!(log.contended_dropped(), 2);
+    fn mvm1_3769_bounded_run_log_record_survives_concurrent_reads() {
+        let log = std::sync::Arc::new(BoundedRunLog::new(256, ValueCapture::Record).unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (log, stop) = (log.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = log.records();
+                }
+            })
+        };
+        for i in 0..200u32 {
+            log.record(&rec(i, 1));
         }
-        log.record(&rec(3, b'd'));
-        assert_eq!(log.records(), vec![rec(0, b'a'), rec(3, b'd')]);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(log.records().len(), 200);
         assert_eq!(log.dropped(), 0);
-        assert_eq!(log.contended_dropped(), 2);
     }
 
     /// #3769・MVM-1: 容量の範囲外は `InvalidArgument`。

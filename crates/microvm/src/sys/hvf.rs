@@ -16,6 +16,7 @@
 //!   するまで munmap しない。解除に失敗したら backing は解放せず意図的にリークする（fail-closed）。
 //!   `mem::forget` で `GuestMapping` を捨てても backing はリークするだけで、解放されない（安全）。
 //!   `GuestMapping` は `&HvVm` を借用するため、対応付けが生きている間は `hv_vm_destroy` も起きない
+//! - `HvVm::map` は範囲・ページ境界に加えて既定の IPA 上限（`HVF_DEFAULT_IPA_LIMIT`）も FFI の前に検査する（#3844）
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
 //!
@@ -63,8 +64,8 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
     GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg,
     HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
-    check_gic_supported, check_map_range, check_run_deadline, classify_hv_return, decode_exit,
-    finish_run, parse_macos_product_version,
+    check_gic_supported, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
+    decode_exit, finish_run, parse_macos_product_version,
 };
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
@@ -201,7 +202,9 @@ impl HvVm {
 
     /// `host` の `offset` から `size` バイトを、ゲスト物理アドレス `ipa` に `flags` で対応付ける。
     ///
-    /// `hv_vm_map` の前に、範囲（`offset + size <= host.len()`）・ページ境界・桁あふれを検査する。
+    /// `hv_vm_map` の前に、範囲（`offset + size <= host.len()`）・ページ境界・桁あふれと、ゲスト範囲
+    /// `[ipa, ipa + size)` が既定の IPA 上限（`HVF_DEFAULT_IPA_LIMIT`）の内側であることを検査し、
+    /// 違反は `hv_vm_map` を呼ばずに `InvalidArgument` にする（#3844）。
     /// `host` は値で受け取り、戻り値の `GuestMapping` が所有する（解除成功まで munmap しない）。
     /// 失敗時は対応付けが作られていないため `host` を drop して安全。
     pub fn map<'a>(
@@ -221,9 +224,9 @@ impl HvVm {
         let addr = (host.ptr as usize)
             .checked_add(offset)
             .ok_or_else(|| invalid_arg("range overflows the address space"))?;
-        check_map_range(addr as u64, ipa, size as u64, host.page_size as u64)?;
+        check_vm_map(addr as u64, ipa, size as u64, host.page_size as u64)?;
         // SAFETY: addr は `host`（生存中の mmap 領域）の内側で、offset + size <= host.len を検査済み。
-        // ipa・size はページ境界・倍数を検査済み。`GuestMapping` が `host` を所有し、
+        // ipa・size はページ境界・倍数と、ipa + size が既定 IPA 上限の内側であること（`check_vm_map`）を検査済み。`GuestMapping` が `host` を所有し、
         // unmap の成功まで munmap しない（失敗時はリーク）。
         let rc = unsafe { hv_vm_map(addr as *mut c_void, ipa, size, flags.bits()) };
         classify_hv_return(HvOp::VmMap, rc)?;
@@ -402,8 +405,11 @@ impl HostMapping {
 
 impl Drop for HostMapping {
     fn drop(&mut self) {
-        // SAFETY: ptr・len は `new` で得た mmap 領域そのもの。`GuestMapping` が借用している間は到達しない。
-        // 二重 munmap は起きない（drop は 1 回）。失敗は後始末のため無視する。
+        // SAFETY: ptr・len は `new` で得た mmap 領域そのもの。二重 munmap は起きない（drop は 1 回）。
+        // ゲストへ対応付けた `HostMapping` は `GuestMapping` が `Option` で所有し、`release()` が `take()` して
+        // `hv_vm_unmap` が成功したときだけここへ来る（失敗時は `mem::forget` でリークし、ここへは来ない）。
+        // それ以外にここへ来るのは対応付けていない backing（`map` の前、または検査か `hv_vm_map` の失敗で
+        // 対応付けができなかったとき）だけなので、ゲストから見えている領域は munmap しない。失敗は後始末のため無視する。
         let _ = unsafe { munmap(self.ptr, self.len) };
     }
 }
@@ -520,6 +526,24 @@ const _: () = {
     assert_send_sync::<VcpuCanceller>();
 };
 
+// `HvVcpu` が `Send` でも `Sync` でもないことをコンパイル時に固定する（#3844）。実装すると 2 つの impl が
+// 両方当てはまって型推論が曖昧になり（E0283）、cross-target-check の `cargo check` で落ちる。
+// 下の doctest は stable の rustdoc がエラー番号を照合しないため、stable の CI ではこちらが担う。
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    let _ = <HvVcpu<'static> as AmbiguousIfSend<_>>::some_item;
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    let _ = <HvVcpu<'static> as AmbiguousIfSync<_>>::some_item;
+};
+
 impl VcpuCanceller {
     /// `hv_vcpus_exit` で実行中の `hv_vcpu_run` を `Canceled` で戻させる。vCPU 破棄後は `FailedPrecondition`。
     ///
@@ -551,9 +575,10 @@ impl VcpuCanceller {
 /// assert_send::<VcpuCanceller>();
 /// ```
 ///
-/// `Send` でないこと（スレッド間の移動を型で禁じる）:
+/// `Send` でないこと（スレッド間の移動を型で禁じる。エラー番号 E0277 を照合するのは nightly の rustdoc だけで、
+/// stable では上の const の判定が担う。#3844）:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use fandhe_container_microvm::hvf::HvVcpu;
 /// fn assert_send<T: Send>() {}
 /// assert_send::<HvVcpu<'static>>();
@@ -561,7 +586,7 @@ impl VcpuCanceller {
 ///
 /// `Sync` でないこと:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use fandhe_container_microvm::hvf::HvVcpu;
 /// fn assert_sync<T: Sync>() {}
 /// assert_sync::<HvVcpu<'static>>();

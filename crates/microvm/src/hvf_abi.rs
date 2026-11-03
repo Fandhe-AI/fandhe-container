@@ -1,7 +1,7 @@
 //! Hypervisor.framework（macOS・Apple Silicon）の ABI 値と純粋な検査（TASK-192.1・#3783・MVM-5・MVM-4）。
 //!
 //! 呼び出し文脈: macOS バックエンドの `sys`（`src/sys/hvf.rs`）の安全なラッパーが、`hv_*` を呼ぶ前の
-//! 引数検査（[`check_map_range`]）と、呼んだ後の戻り値の写像（[`classify_hv_return`]）にここを使う。
+//! 引数検査（[`check_map_range`]・[`check_vm_map`]）と、呼んだ後の戻り値の写像（[`classify_hv_return`]）にここを使う。
 //! `hv_*` を呼ばず `unsafe` も持たないため OS 非依存で、Linux の PR CI の単体テストでも走る。
 //!
 //! # `hv_return_t` の写像（`message` には数値を載せない。ERR-1）
@@ -410,6 +410,16 @@ pub fn check_ipa_limit(ipa: u64, size: u64, ipa_limit: u64) -> Result<(), Microv
     Ok(())
 }
 
+/// `HvVm::map`（`sys/hvf.rs`）が `hv_vm_map` の前に通す検査（#3844・MVM-5）。
+///
+/// [`check_map_range`] の後に、[`HVF_DEFAULT_IPA_LIMIT`] に対する [`check_ipa_limit`] を行う（この順序）。
+/// `config = NULL` で作る VM の IPA 幅は既定値なので、既定の上限が FFI に渡せる範囲の天井になる。
+/// 上限の値は暫定（#3788・#3803）。レイアウトごとの、より厳しい上限は `HvfGuestRam::register` が検査する。
+pub fn check_vm_map(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result<(), MicrovmError> {
+    check_map_range(addr, ipa, size, page_size)?;
+    check_ipa_limit(ipa, size, HVF_DEFAULT_IPA_LIMIT)
+}
+
 /// `HvVcpu::run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5・KVM 側の `RUN_DEADLINE_MAX` と同値）。
 pub const HV_RUN_DEADLINE_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -750,6 +760,30 @@ mod tests {
             let e = check_map_range(0, 0, MAX_MAP_BYTES + page, page).unwrap_err();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "size exceeds the maximum mapping size");
+        }
+    }
+
+    /// MVM-5・#3844: `HvVm::map` の検査は既定の IPA 上限を超える範囲を拒否する。
+    #[test]
+    fn mvm5_3844_check_vm_map_enforces_default_ipa_limit() {
+        let exceeds = "guest range exceeds the ipa limit";
+        for page in [4096_u64, 16384] {
+            assert!(check_vm_map(0, 0x4000_0000, 4 << 20, page).is_ok());
+            assert!(check_vm_map(0, HVF_DEFAULT_IPA_LIMIT - page, page, page).is_ok());
+            for (ipa, size) in [
+                (HVF_DEFAULT_IPA_LIMIT, page),
+                (HVF_DEFAULT_IPA_LIMIT - page, 2 * page),
+                (1_u64 << 40, page),
+            ] {
+                let e = check_vm_map(0, ipa, size, page).unwrap_err();
+                assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+                assert_eq!(e.message(), exceeds);
+            }
+            // 範囲検査が IPA 上限より先に効く。
+            let e = check_vm_map(0, HVF_DEFAULT_IPA_LIMIT + 1, page, page).unwrap_err();
+            assert_eq!(e.message(), "guest address is not page aligned");
+            let e = check_vm_map(0, 0, 0, page).unwrap_err();
+            assert_eq!(e.message(), "size is zero");
         }
     }
 

@@ -205,6 +205,9 @@ impl FakeRun {
     }
 }
 
+/// 実行役の戻り値（`Runner` と同じ）。
+type RunResult = Result<ExecExit, AuditedRejection<TraitError>>;
+
 fn runner(
     fake: &FakeRun,
 ) -> impl Fn(
@@ -214,7 +217,7 @@ fn runner(
     &[String],
     Duration,
     &dyn AuditSink,
-) -> Result<ExecExit, AuditedRejection<TraitError>>
+) -> RunResult
 + '_ {
     move |r, fd, req, env, t, a| fake.run(r, fd, req, env, t, a)
 }

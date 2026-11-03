@@ -7,17 +7,17 @@
 //! # 配線（なぜこの順か）
 //!
 //! 1. 要求の構築（`ExecRequest`: 絶対パス・argv・`--env` の上限検証。状態ルートを触る前に不正入力を断る）
-//! 2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる
-//! 2a. launch 時の env 上書き（create の起動オプション文書。supervisor の `container_options::store::launch_env_for`）を
-//!    状態記録の世代と照合して読む（SUP-12・#2713）。launch の Entrypoint と exec の env を揃えるため（healthcheck と同じ）。
-//!    文書が欠けている・世代が合わない場合は **exec しない**（`FailedPrecondition`。オプションを黙って落とさない）
+//! 2. 状態ストアを開き、記録が `Running` で pid を持つことを確かめる。続けて launch 時の env 上書き（create の起動
+//!    オプション文書。supervisor の `container_options::store::launch_env_for`）を状態記録の世代と照合して読む
+//!    （SUP-12・#2713）。launch の Entrypoint と exec の env を揃えるため（healthcheck と同じ）。文書が欠けている・
+//!    世代が合わない場合は **exec しない**（`FailedPrecondition`。オプションを黙って落とさない）
 //! 3. 監査の記録先を作る（[`default_audit_sink`]。`<状態ルート>/@audit.log`）。**作れなければ exec しない**（fail-closed。
 //!    監査なしで実行する経路は無い。SEC-4）。supervisor へ接続する前に作るのは、監査できない exec のために pidfd を
 //!    複製させないため
 //! 4. supervisor の制御チャネルから起動時 pidfd の複製を受け取る（`ExecPidfdSource`。`state.json` の pid から
 //!    `pidfd_open` する縮退はしない。SEC-1）
 //! 5. `run_command_with_pidfd_env` を呼ぶ（監査 sink を必須引数として渡す。env は `config.json` の `process.env` の上に
-//!    2a の launch 時 env、その上に `--env` を重ねる）
+//!    2 で読んだ launch 時 env、その上に `--env` を重ねる）
 //!
 //! 委譲スコープ（#2626 の review 対応）: core の cgroup 参加は移動元と移動先の共通祖先への書き込み権を要するため、
 //! ログインセッションの cgroup からでは `PermissionDenied` になる。`run_exec` は 1 の検査と「稼働中か」の確認の後、
@@ -48,7 +48,7 @@
 //! - supervisor 不在（孤児化・supervisor の再起動後）の exec は拒否される（起動時 pidfd を失うため。担当は #2688）。
 //! - rootful の起動（`start` が `UNIMPLEMENTED`）は対象外。healthcheck の配線は #2441。
 //! - 非 Linux は plugin 経由（#1869 の設計・TASK-125）。現状は他のコマンドと同じく fail-closed で失敗する。
-//! - 2a の文書の読み取りは期限つきの作業スレッドで包まない（5 の単一スレッドの前提を保つため。healthcheck の exec 専用
+//! - 2 の起動オプション文書の読み取りは期限つきの作業スレッドで包まない（5 の単一スレッドの前提を保つため。healthcheck の exec 専用
 //!   helper と同じ残余。REPAIR-5）。全体の期限は委譲スコープの親が `--timeout` と猶予で縛る。
 
 #[cfg(target_os = "linux")]

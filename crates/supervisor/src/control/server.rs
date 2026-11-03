@@ -8,7 +8,8 @@
 //!
 //! - accept の直後に `SO_PEERCRED` で接続元の uid を取り、実効 uid と違えば何も書かずに切断する
 //!   （多層防御。ソケットは 0600・0700 の `<id>/` の中にあり、別 uid は通常 connect 自体ができない）。
-//! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイトの固定長）で、kind ごとの payload 長と
+//! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイト、ExecHandoverRequest〔#2626〕は
+//!   20 バイトの固定長。ExecCgroupNotify〔kind 7〕は保持期限 8 バイト + 名前 1〜56 バイトの可変長で、ガードだけが読む）で、kind ごとの payload 長と
 //!   一致しない・ヘッダの payload_len が上限（64）を超える場合は payload を読まずに拒否する。
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。
@@ -16,11 +17,14 @@
 //!   認証境界の拒否（別 uid・資格情報の取得失敗）は [`ControlObserver`] 経由で SEC-4 の `AuditSink` にも記録する。
 //! - 各要求の成功・失敗とレイテンシは [`ControlObserver`] が集計して構造化ログに出す（REPAIR-4）。
 //!
+//! ExecHandoverRequest が成功した接続だけは例外で、`exec_guard` のガードスレッドが閉じずに預かり（accept ループは先へ進む）、
+//! 2 つ目の要求（ExecCgroupNotify）と切断を監視する。ガードの数と待ちには上限がある（SUP-6・REPAIR-5・#2626）。
+//!
 //! サーバスレッドは停止可能（`accept` の non-blocking ポーリング）。restart の再 launch の再構成（#2043）で
 //! スレッドを止める必要が出たときの口である。
 
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,12 +34,13 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::ControlPeerRejection;
 
+use super::exec_guard::ExecGuardPool;
 use super::log_control_event;
 use super::observe::ControlObserver;
 use super::protocol::{
-    CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason, FrameHeader, HEADER_LEN,
-    RequestHeader, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame,
-    encode_hello,
+    CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason,
+    EXEC_HANDOVER_PAYLOAD_LEN, ExecHandoverRequestFrame, FrameHeader, HEADER_LEN, RequestHeader,
+    ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
 };
 use super::target::{SignalSlot, wait_reply};
 
@@ -130,13 +135,27 @@ pub fn serve_connection(
     config: &ServeConfig,
     observer: &ControlObserver,
 ) {
+    serve_connection_with_guards(stream, peer, expected_uid, slot, config, observer, None);
+}
+
+/// [`serve_connection`] に、exec 子 cgroup の回収の見張り（`guards`）を足した版。`None` なら ExecHandoverRequest は
+/// `ExecReclaimUnavailable` で断る（fail-closed。SUP-6・#2626）。
+pub fn serve_connection_with_guards(
+    stream: UnixStream,
+    peer: PeerCred,
+    expected_uid: u32,
+    slot: &SignalSlot,
+    config: &ServeConfig,
+    observer: &ControlObserver,
+    guards: Option<&Arc<ExecGuardPool>>,
+) {
     if !peer_allowed(peer.uid, expected_uid) {
         // 何も書かずに切断する（uid の値はログにも監査にも出さない）。
         observer.record_peer_rejection(ControlPeerRejection::PeerUidMismatch);
         return;
     }
     let started = Instant::now();
-    let reason = handle_request(stream, slot, config);
+    let reason = handle_request(stream, slot, config, guards);
     observer.record_request(reason == ControlReason::Ok, started.elapsed());
 }
 
@@ -145,6 +164,7 @@ fn handle_request(
     mut stream: UnixStream,
     slot: &SignalSlot,
     config: &ServeConfig,
+    guards: Option<&Arc<ExecGuardPool>>,
 ) -> ControlReason {
     if stream
         .set_write_timeout(Some(config.write_timeout))
@@ -165,6 +185,9 @@ fn handle_request(
         Ok(RequestHeader::Signal(kind)) => kind,
         Ok(RequestHeader::CancelRestart) => {
             return handle_cancel_restart(stream, slot, read_deadline);
+        }
+        Ok(RequestHeader::ExecHandover) => {
+            return handle_exec_handover(stream, slot, read_deadline, guards);
         }
         Err(reason) => return respond(&mut stream, reason),
     };
@@ -211,6 +234,103 @@ fn handle_cancel_restart(
     respond(&mut stream, reason)
 }
 
+/// ExecHandoverRequest（kind 6）の payload を読んで、起動時 pidfd の複製を `SCM_RIGHTS` で返す（SUP-6・SEC-1・#2626）。
+///
+/// uid の照合は `serve_connection` が済ませている。スロットの状態判定は [`SignalSlot::handover_pidfd`]（受け箱は経由せず、
+/// シグナルも送らない）。成功は `Response(Ok)` と pidfd 1 本を 1 回の `sendmsg` で送り、拒否は fd なしの通常の応答。
+fn handle_exec_handover(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+    guards: Option<&Arc<ExecGuardPool>>,
+) -> ControlReason {
+    let mut payload = [0u8; EXEC_HANDOVER_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match ExecHandoverRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let deadline = match absolute_deadline(request.deadline) {
+        Ok(d) => d,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    // 回収役が結線されていない supervisor は pidfd を渡さない（子孫を回収できない exec を許さない。fail-closed）。
+    let Some(guards) = guards else {
+        return respond(&mut stream, ControlReason::ExecReclaimUnavailable);
+    };
+    let pidfd = match slot.handover_pidfd(request.pid) {
+        Ok(fd) => fd,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    // ガードの枠とスレッドは pidfd を渡す前に確保する（上限超過・生成失敗なら fd を渡さず断る）。
+    let guard = match guards.reserve() {
+        Ok(g) => g,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    // 期限を過ぎていたら fd を渡さない（クライアントはもう Timeout を返している。REPAIR-5）。
+    if Instant::now() >= deadline {
+        return respond(&mut stream, ControlReason::Timeout);
+    }
+    let reason = respond_with_fd(&mut stream, pidfd.as_fd(), deadline);
+    if reason == ControlReason::Ok {
+        // 接続を閉じずにガードへ預ける。以後の通知・切断の監視は専用スレッドが行い、accept ループは先へ進む。
+        guard.start(stream);
+    }
+    reason
+}
+
+/// `EINTR` のときだけ、期限内なら再試行して `send_with_fd` を呼ぶ。期限切れは `TimedOut`。
+fn send_with_fd_until(
+    stream: &UnixStream,
+    frame: &[u8],
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match crate::sys::send_with_fd(stream.as_fd(), frame, fd) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
+/// `Response(Ok)` に `fd` を 1 本添えて送る。送れなかったら（相手が閉じた・期限）`Internal` を返す
+/// （fd は添付されていない、または相手が受け取り済みで、こちらに残る資源は無い）。
+fn respond_with_fd(
+    stream: &mut UnixStream,
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+) -> ControlReason {
+    let frame = ResponseFrame {
+        reason: ControlReason::Ok,
+    }
+    .encode();
+    // `EINTR` は sys が返すので、再試行のたびに絶対期限を確かめる（割り込みが続いても期限を超えない。REPAIR-5）。
+    let sent = match send_with_fd_until(stream, &frame, fd, deadline) {
+        Ok(n) => n,
+        Err(_) => {
+            log_control_event(
+                "control_request_rejected",
+                Some(ControlReason::Internal.name()),
+            );
+            return ControlReason::Internal;
+        }
+    };
+    // ストリームの短い書き込み: fd は最初のバイトに付いて届いているので、残りは通常の書き込みで送る。
+    if let Some(rest) = frame.get(sent..)
+        && !rest.is_empty()
+        && stream.write_all(rest).is_err()
+    {
+        return ControlReason::Internal;
+    }
+    ControlReason::Ok
+}
+
 /// 要求が載せた絶対期限（`CLOCK_MONOTONIC`）を、サーバ側の `Instant` に写す。
 ///
 /// 受信までの遅れの分だけ残りが縮むので、サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。
@@ -230,17 +350,35 @@ pub struct ControlServer {
     handle: Option<JoinHandle<()>>,
 }
 
+/// 再 launch の `pause` が exec のガードの停止に確保する予算の上限（回収の待ち 2 秒 + 余裕。REPAIR-5）。
+pub const GUARD_STOP_BUDGET: Duration = Duration::from_secs(3);
+
 /// スレッドの停止を待つ上限（超えたら切り離す。REPAIR-5）。
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl ControlServer {
     /// accept ループのスレッドを起動する。`listener` は non-blocking であること。
+    ///
+    /// exec 子 cgroup の回収役を持たない構成で、ExecHandoverRequest は `ExecReclaimUnavailable` で断る（fail-closed。
+    /// 子孫を回収できない exec に pidfd を渡さない）。回収役つきは [`Self::spawn_with_exec_guard`]。
     pub fn spawn(
         listener: UnixListener,
         slot: SignalSlot,
         expected_uid: u32,
         config: ServeConfig,
         observer: Arc<ControlObserver>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_exec_guard(listener, slot, expected_uid, config, observer, None)
+    }
+
+    /// [`Self::spawn`] に、exec 子 cgroup の回収の見張り（`guards`）を足した版（SUP-6・REPAIR-5・#2626）。
+    pub fn spawn_with_exec_guard(
+        listener: UnixListener,
+        slot: SignalSlot,
+        expected_uid: u32,
+        config: ServeConfig,
+        observer: Arc<ControlObserver>,
+        guards: Option<Arc<ExecGuardPool>>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -256,6 +394,7 @@ impl ControlServer {
                     &config,
                     &thread_stop,
                     &observer,
+                    guards.as_ref(),
                 );
                 let _ = done_tx.send(());
             })?;
@@ -330,10 +469,12 @@ struct PausableInner {
     expected_uid: u32,
     config: ServeConfig,
     observer: Arc<ControlObserver>,
+    guards: Option<Arc<ExecGuardPool>>,
 }
 
 impl PausableServer {
-    /// accept ループのスレッドを起動する。`listener` は non-blocking にされる。
+    /// accept ループのスレッドを起動する。`listener` は non-blocking にされる。回収役は持たない
+    /// （ExecHandoverRequest は断る。回収役つきは [`Self::spawn_with_exec_guard`]）。
     pub fn spawn(
         listener: UnixListener,
         slot: SignalSlot,
@@ -341,13 +482,27 @@ impl PausableServer {
         config: ServeConfig,
         observer: Arc<ControlObserver>,
     ) -> io::Result<Self> {
+        Self::spawn_with_exec_guard(listener, slot, expected_uid, config, observer, None)
+    }
+
+    /// [`Self::spawn`] に exec 子 cgroup の回収の見張りを足した版。ガードのプールは pause / resume をまたいで保持する
+    /// （再 launch の間も、預かった接続の見張りは続く。#2043）。
+    pub fn spawn_with_exec_guard(
+        listener: UnixListener,
+        slot: SignalSlot,
+        expected_uid: u32,
+        config: ServeConfig,
+        observer: Arc<ControlObserver>,
+        guards: Option<Arc<ExecGuardPool>>,
+    ) -> io::Result<Self> {
         let keep = listener.try_clone()?;
-        let server = ControlServer::spawn(
+        let server = ControlServer::spawn_with_exec_guard(
             listener,
             slot.clone(),
             expected_uid,
             config,
             Arc::clone(&observer),
+            guards.clone(),
         )?;
         Ok(Self {
             inner: std::sync::Mutex::new(PausableInner {
@@ -357,29 +512,44 @@ impl PausableServer {
                 expected_uid,
                 config,
                 observer,
+                guards,
             }),
         })
     }
 
-    /// accept ループを止める（`timeout` 内に止まらなければ `Err`）。止まっていれば何もしない。
+    /// accept ループと exec のガードを止める（`timeout` 内に止まらなければ `Err`）。
+    ///
+    /// 予算は 2 つに分ける（片方が使い切っても他方に残す。SUP-3・REPAIR-5・#2043）: ガードの停止に
+    /// `min(GUARD_STOP_BUDGET, timeout / 2)`（回収の待ち 2 秒 + 余裕）、accept の停止にその残り。accept が止まっていても
+    /// （`server` が無くても）ガードの停止は必ず試みる。`Err` のとき、止まらなかったガードはプールに残り、次の `pause` が
+    /// 再び join する。
     pub fn pause(
         &self,
         timeout: Duration,
     ) -> Result<(), fandhe_container_core::traits::TraitError> {
         use fandhe_container_core::traits::{ErrorCode, TraitError};
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(server) = inner.server.as_mut() else {
-            return Ok(());
-        };
-        if server.stop_confirmed(timeout) {
+        let guard_budget = GUARD_STOP_BUDGET.min(timeout / 2);
+        let accept_budget = timeout.saturating_sub(guard_budget);
+        if let Some(server) = inner.server.as_mut() {
+            if !server.stop_confirmed(accept_budget) {
+                log_control_event("relaunch_pause_failed", Some("accept_timeout"));
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "control channel thread did not stop in time",
+                ));
+            }
             inner.server = None;
-            Ok(())
-        } else {
-            Err(TraitError::new(
-                ErrorCode::Timeout,
-                "control channel thread did not stop in time",
-            ))
         }
+        // accept ループが止まった後に、預かっている exec のガードのスレッドも止める（単一スレッドの再 launch のため。
+        // 通知済みの旧世代の exec 子 cgroup はここで回収される）。止まらなければ launch させない（fail-closed）。
+        if let Some(guards) = &inner.guards
+            && let Err(e) = guards.shutdown_all(guard_budget)
+        {
+            log_control_event("relaunch_pause_failed", Some("guard_timeout"));
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// [`Self::pause`] で止めた accept ループを、保持していた listener で作り直す。動いていれば何もしない。
@@ -389,13 +559,18 @@ impl PausableServer {
         if inner.server.is_some() {
             return Ok(());
         }
+        // 停止要求の後は、新しいガードを受けられるように戻す。
+        if let Some(guards) = &inner.guards {
+            guards.reopen();
+        }
         let spawned = inner.listener.try_clone().and_then(|l| {
-            ControlServer::spawn(
+            ControlServer::spawn_with_exec_guard(
                 l,
                 inner.slot.clone(),
                 inner.expected_uid,
                 inner.config,
                 Arc::clone(&inner.observer),
+                inner.guards.clone(),
             )
         });
         match spawned {
@@ -436,6 +611,7 @@ fn accept_loop(
     config: &ServeConfig,
     stop: &AtomicBool,
     observer: &ControlObserver,
+    guards: Option<&Arc<ExecGuardPool>>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -454,7 +630,15 @@ fn accept_loop(
                     uid: cred.uid,
                     gid: cred.gid,
                 };
-                serve_connection(stream, peer, expected_uid, slot, config, observer);
+                serve_connection_with_guards(
+                    stream,
+                    peer,
+                    expected_uid,
+                    slot,
+                    config,
+                    observer,
+                    guards,
+                );
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(config.poll_interval);

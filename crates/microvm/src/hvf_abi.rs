@@ -26,6 +26,10 @@
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use std::ops::BitOr;
 
+/// ゲスト RAM のマップ確保上限（16 GiB）。Linux 側の `MAX_GUEST_RAM_BYTES` と同値で、
+/// mmap の前に超過を拒否して無制限確保を防ぐ（リソース上限・MVM-5・MVM-4）。
+pub const MAX_MAP_BYTES: u64 = 1 << 34;
+
 /// `HV_SUCCESS`。
 pub const HV_SUCCESS: i32 = 0;
 /// `HV_ERROR`（0xfae94001）。
@@ -139,7 +143,7 @@ fn invalid(msg: &'static str) -> MicrovmError {
 
 /// `hv_vm_map` / `hv_vm_protect` に渡す範囲の検査（FFI の前に必ず通す）。
 ///
-/// `page_size` が 0 か 2 の冪でない、`size` が 0 かページ倍数でない、`addr`・`ipa` がページ境界でない、
+/// `page_size` が 0 か 2 の冪でない、`size` が 0 か [`MAX_MAP_BYTES`] 超かページ倍数でない、`addr`・`ipa` がページ境界でない、
 /// `addr + size`・`ipa + size` が桁あふれする、のいずれかを `InvalidArgument` にする。
 pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result<(), MicrovmError> {
     if !page_size.is_power_of_two() {
@@ -147,6 +151,9 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
     }
     if size == 0 {
         return Err(invalid("size is zero"));
+    }
+    if size > MAX_MAP_BYTES {
+        return Err(invalid("size exceeds the maximum mapping size"));
     }
     if !size.is_multiple_of(page_size) {
         return Err(invalid("size is not a multiple of the page size"));
@@ -281,6 +288,17 @@ mod tests {
             let e = check_map_range(0, 0, 4096, page).unwrap_err();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "page size is not a power of two");
+        }
+    }
+
+    #[test]
+    fn mvm5_3783_check_map_range_rejects_size_over_limit() {
+        for page in [4096_u64, 16384] {
+            assert_eq!(MAX_MAP_BYTES, 17_179_869_184);
+            assert!(check_map_range(0, 0, MAX_MAP_BYTES, page).is_ok());
+            let e = check_map_range(0, 0, MAX_MAP_BYTES + page, page).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "size exceeds the maximum mapping size");
         }
     }
 }

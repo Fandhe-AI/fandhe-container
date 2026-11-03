@@ -34,6 +34,8 @@
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
+//! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
+//! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
 //! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
@@ -45,7 +47,7 @@
 //!   （`KVM_RUN` の期限切れで vCPU スレッドを中断するため）。組み込むプロセスは `SIGUSR2` を他の用途に使わないこと。
 //!   既に別の handler や SIG_IGN があるときは上書きせず `FailedPrecondition`（EBUSY）で失敗する。
 //!
-//! `unsafe` は `src/sys.rs` に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
+//! `unsafe` は `src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS）に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
 //! 機械的に担保する（REPAIR-9・TASK-74.5）。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 #![deny(unsafe_code)]
@@ -58,6 +60,9 @@ pub mod dispatch;
 pub mod error;
 pub mod exit;
 pub mod guest_memory;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf;
+pub mod hvf_abi;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
@@ -66,6 +71,10 @@ pub mod lapic_x86;
 pub mod microvm;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
+mod sys;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+#[path = "sys/hvf.rs"]
 mod sys;
 pub mod uart;
 pub mod virtio_block;

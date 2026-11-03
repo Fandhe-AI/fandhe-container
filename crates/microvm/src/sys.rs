@@ -437,7 +437,6 @@ pub(crate) struct KvmCpuidEntry2 {
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct KvmMsrEntry {
     pub index: u32,
     pub reserved: u32,
@@ -456,7 +455,6 @@ pub(crate) struct KvmMpState {
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct KvmFpu {
     pub fpr: [[u8; 16]; 8],
     pub fcw: u16,
@@ -1713,7 +1711,6 @@ pub(crate) fn kvm_set_cpuid2(
 /// 呼び出し側が `== entries.len()` を確かめること。先頭の戻り値件数だけを `entries` へ書き戻す。
 /// 255 件超は確保前に E2BIG。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_get_msrs(
     vcpu: BorrowedFd<'_>,
     entries: &mut [KvmMsrEntry],
@@ -1736,7 +1733,6 @@ pub(crate) fn kvm_get_msrs(
 /// `KVM_SET_MSRS`（vCPU fd）で MSR を書く（x86_64 のみ）。戻り値の意味は [`kvm_get_msrs`] と同じ
 /// （設定できた件数。呼び出し側が `== entries.len()` を確かめる）。255 件超は確保前に E2BIG。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_msrs(
     vcpu: BorrowedFd<'_>,
     entries: &[KvmMsrEntry],
@@ -1754,7 +1750,6 @@ pub(crate) fn kvm_set_msrs(
 
 /// MSR 系 ioctl の戻り値を検証する。負は errno、要求件数超はカーネル応答の不整合として EINVAL（22）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 fn msr_result(r: i32, requested: usize) -> Result<usize, SysError> {
     if r < 0 {
         return Err(last_error());
@@ -1768,7 +1763,6 @@ fn msr_result(r: i32, requested: usize) -> Result<usize, SysError> {
 
 /// `KVM_GET_FPU`（vCPU fd）で FPU 状態を読む（x86_64 のみ）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_get_fpu(vcpu: BorrowedFd<'_>) -> Result<KvmFpu, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -1789,7 +1783,6 @@ pub(crate) fn kvm_get_fpu(vcpu: BorrowedFd<'_>) -> Result<KvmFpu, SysError> {
 
 /// `KVM_SET_FPU`（vCPU fd）で FPU 状態を書く（x86_64 のみ）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_fpu(vcpu: BorrowedFd<'_>, fpu: &KvmFpu) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

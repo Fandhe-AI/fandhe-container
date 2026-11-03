@@ -70,7 +70,8 @@ use std::time::{Duration, Instant};
 use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{
-    BootCpuState, KernelCmdline, VirtioMmioParam, load_linux, write_boot_tables,
+    BootCpuState, KernelCmdline, VirtioMmioParam, X86FpuState, boot_msrs, load_linux,
+    write_boot_tables,
 };
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice};
@@ -943,11 +944,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// x86_64 のみ、他 arch は `Unimplemented`）。
     ///
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
-    /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state`。最初の `VcpuFd::run_once` より前に、
+    /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state` → 起動用 MSR（`set_msrs`）→ FPU（`set_fpu`。#3734）。最初の `VcpuFd::run_once` より前に、
     /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）はレジスタを触らず（INIT/SIPI で起動する。#3737）、
     /// LAPIC の LINT だけを BSP と同じ経路で設定する。
-    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、MSR・FPU の設定は（CPUID は assemble が設定済み）
-    /// 未実装（REPAIR-3）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
+    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、MSR・FPU は本メソッドが設定し（CPUID は assemble が設定済み）、BSP の LAPIC の LINT は `VcpuFd::set_boot_lints`（#3735）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
     pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         let started = std::time::Instant::now();
         let result = self.setup_boot_vcpu_inner(loaded);
@@ -982,6 +982,9 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             })?;
             write_boot_tables(&mut self.memory)?;
             vcpu.set_boot_state(&state)?;
+            // CPUID（#3733）はこの MSR の設定より前に入れる（CPUID の機能ビットで受理される MSR が変わるため）。
+            vcpu.set_msrs(&boot_msrs())?;
+            vcpu.set_fpu(&X86FpuState::boot())?;
             vcpu.set_boot_lints()?;
             // AP は BSP と同じ経路で LINT を設定する。INIT が LVT をマスクへ戻すので、この設定が残るのは INIT までで、
             // LINT はゲストのカーネルが AP ごとに設定し直す（レジスタは INIT/SIPI で決まるため触らない。#3737）。

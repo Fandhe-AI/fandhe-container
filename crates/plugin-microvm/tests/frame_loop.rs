@@ -493,7 +493,9 @@ fn expect_clean_sigterm_exit(mut h: Harness, sent: Instant) {
         "{err}"
     );
     assert!(
-        lines.contains(&"level=info op=plugin.microvm.stop_all stopped=0 failed=0 remaining=0"),
+        lines.contains(
+            &"level=info op=plugin.microvm.stop_all stopped=0 failed=0 remaining=0 detached=0"
+        ),
         "{err}"
     );
 }

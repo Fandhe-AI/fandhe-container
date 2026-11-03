@@ -1960,7 +1960,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let (body, gate) = gated_body(&dropped);
         let entered = Arc::clone(&body.entered);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
         let watch = running.exit_watch();
         let e = running.stop(Duration::from_millis(50)).unwrap_err();
@@ -1987,7 +1987,12 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_3744_watch_exited_after_successful_stop() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         let watch = running.exit_watch();
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(watch.state(), VcpuExitState::Exited(report));
@@ -1999,7 +2004,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = FakeBody::new(&dropped);
         body.finish_after = Some(3);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         let watch = running.exit_watch();
         let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(5)).unwrap() else {
             panic!("expected Exited");
@@ -2015,7 +2020,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let (body, gate) = gated_body(&dropped);
         let entered = Arc::clone(&body.entered);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
         let watch = running.exit_watch();
         let opener = std::thread::spawn({
@@ -2040,7 +2045,7 @@ mod lifecycle_tests {
         let (mut body, gate) = gated_body(&dropped);
         body.panic_after_gate = true;
         let entered = Arc::clone(&body.entered);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
         let watch = running.exit_watch();
         assert!(running.stop(Duration::from_millis(50)).is_err());
@@ -2056,7 +2061,12 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_3744_watch_wait_deadline_validated() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         let watch = running.exit_watch();
         for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
             let t = Instant::now();

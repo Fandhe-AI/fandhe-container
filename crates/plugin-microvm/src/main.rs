@@ -9,7 +9,7 @@
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（機械可読な code と固定文言。REPAIR-4）を出す。
 //! 終了コード: 0 = 相手の正常切断、1 = その他の起動失敗、2 = `InvalidArgument`（起動引数・パス）、
 //! 3 = 接続失敗（別 UID の listener による `PERMISSION_DENIED` を含む）、4 = フレームループの異常終了、
-//! 5 = 正常終了要因（切断・SIGTERM）だったが VM の停止が回収しきれなかった（`failed` または `remaining` が 0 超）。
+//! 5 = 正常終了要因（切断・SIGTERM）だったが VM の停止が回収しきれなかった（`failed`・`remaining`・`detached` のいずれかが 0 超）。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データ・peer 拒否イベント行を含めない。
 //! 終了時は実行中の microVM を `stop_all` で期限つきに止める（TASK-117.2・#711）。
 //!
@@ -17,8 +17,11 @@
 //! 接続前に `sys::install_sigterm_flag` でフラグを登録する（失敗は終了コード 1 の fail-closed。VM を止められない
 //! 状態で動かさない）。SIGTERM を受けると `serve_until` が次の受信境界で抜け、stderr に
 //! `level=info op=plugin.microvm.shutdown reason=signal` を出し、`stop_all` で止めて結果行
-//! （`stopped=` / `failed=` / `remaining=`）を出して終わる。終了までの時間は最大で
-//! `IDLE_POLL`（1 秒）と `STOP_ALL_BUDGET`（4 秒）の和。SIGKILL や猶予の超過では VM が残りうる（残余）。
+//! （`stopped=` / `failed=` / `remaining=` / `detached=`）を出して終わる。終了までの時間が最大で
+//! `IDLE_POLL`（1 秒）と `STOP_ALL_BUDGET`（4 秒）の和になるのはアイドル時だけ。`serve_until` は受信途中の
+//! フレームを中断せず（`FRAME_DEADLINE` 10 秒）、処理中の要求とその応答送信の待ちも加わるため、処理中に
+//! SIGTERM を受けると 5 秒を超えうる。呼び出し側（core）の猶予を超えた場合は SIGKILL され VM が残りうる（残余）。
+//! 通常 stop が期限切れで切り離された VM（`detached`）は回収未確認なので、結果行に出し終了コード 5 にする。
 //! SIGINT・SIGHUP は対象外。core 自身の終了要求は SIGTERM ではなく接続切断（EOF）で伝わる。
 //! Linux・macOS 以外（Windows 等）では `install_sigterm_flag` が何も登録せず、決して立たないフラグを `Ok` で返すので、
 //! `serve_until` は `serve` と同じく EOF でだけ終わる。Windows には SIGTERM の経路が無く（コンソール制御ハンドラは
@@ -92,15 +95,17 @@ fn main() -> ExitCode {
     }
     // 終了時に実行中 VM を期限つきで止める（drop 任せだと 1 台あたり最大 5 秒待つため。REPAIR-5）。
     let stop_report = adapter.stop_all(STOP_ALL_BUDGET);
-    let incomplete = stop_report.remaining > 0 || stop_report.failed > 0;
+    let detached = adapter.detached();
+    let incomplete = stop_report.remaining > 0 || stop_report.failed > 0 || detached > 0;
     // シャットダウンでは結果を常に出す。切断・異常終了では回収しきれないときだけ出す。
     if shutdown || incomplete {
         eprintln!(
-            "level={} op=plugin.microvm.stop_all stopped={} failed={} remaining={}",
+            "level={} op=plugin.microvm.stop_all stopped={} failed={} remaining={} detached={}",
             if incomplete { "warn" } else { "info" },
             stop_report.stopped,
             stop_report.failed,
-            stop_report.remaining
+            stop_report.remaining,
+            detached
         );
     }
     match outcome {

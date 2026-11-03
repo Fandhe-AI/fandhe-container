@@ -31,7 +31,7 @@
 //!
 //! # 実装済み（#3747。PLUG-1・REPAIR-3・REPAIR-5）
 //! SIGTERM で新しい要求の受付をやめ（[`frame_loop::serve_until`]）、`stop_all` で実行中の VM を期限つきに止め、
-//! 結果行（`stopped=` / `failed=` / `remaining=`）を出して終わる。回収しきれなければ終了コード 5。
+//! 結果行（`stopped=` / `failed=` / `remaining=` / `detached=`）を出して終わる。回収しきれなければ終了コード 5。
 //! 詳細は `main.rs` の doc。受信フラグの登録は [`sys`]（#3746）。
 //!
 //! # 未実装範囲（REPAIR-3）

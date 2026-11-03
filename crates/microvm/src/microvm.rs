@@ -12,7 +12,7 @@
 //! 重ならないことを `plan_layout` が検証する。e820 への予約領域としての記載は範囲外（REPAIR-3。現状の e820 は RAM のみ）。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
+//! MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・AP のスレッド駆動（#3738。AP の作成・INIT/SIPI 待ち・起動コードの配置は #3737 で実装済み）・一時停止（pause）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
 //!
@@ -82,6 +82,9 @@ use crate::interrupt::{
     BlockNotifyReport, InterruptLine, NetNotifyReport, complete_block_notify, complete_net_notify,
 };
 use crate::irq::IrqFd;
+use crate::smp_x86::SipiVector;
+#[cfg(target_arch = "x86_64")]
+use crate::smp_x86::{MpState, plan_vcpus, sipi_startup_range};
 use crate::sys::{self, GuestRamMap, SysError};
 use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
@@ -102,6 +105,8 @@ pub const VIRTIO_GSI_BASE: u32 = 5;
 pub const MAX_VIRTIO_DEVICES: usize = 8;
 /// 構成の検証上限としての vCPU 数（これより上の実際の上限はカーネルの EINVAL に任せる）。
 pub const MAX_VCPUS: u32 = 32;
+// xAPIC の APIC ID（8 bit）に収まること（#3737。`smp_x86::plan_vcpus` の上限）。
+const _: () = assert!(MAX_VCPUS <= crate::smp_x86::MAX_XAPIC_VCPUS);
 
 const _: () = assert!(VIRTIO_MMIO_WINDOW.is_multiple_of(4096));
 const _: () = assert!(VIRTIO_MMIO_WINDOW >= 0x100 + CONFIG_SPACE_SIZE);
@@ -818,6 +823,17 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
         let cpuid = kvm.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
+        #[cfg(target_arch = "x86_64")]
+        for plan in plan_vcpus(config.vcpu_count)? {
+            let mut v = vm.create_vcpu(plan.index)?;
+            v.set_cpuid(&cpuid.for_vcpu(plan.apic_id)?)?;
+            // AP は INIT/SIPI を待つ状態へ、カーネルの既定に頼らず明示的に置く（#3737）。
+            if plan.initial_mp_state == MpState::Uninitialized {
+                v.set_mp_state(MpState::Uninitialized)?;
+            }
+            vcpus.push(v);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         for i in 0..config.vcpu_count {
             let mut v = vm.create_vcpu(i)?;
             v.set_cpuid(&cpuid.for_vcpu(i)?)?;
@@ -929,7 +945,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ///
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state` → 起動用 MSR（`set_msrs`）→ FPU（`set_fpu`。#3734）。最初の `VcpuFd::run_once` より前に、
-    /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つ状態のため触らない。
+    /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）はレジスタを触らず（INIT/SIPI で起動する。#3737）、
+    /// LAPIC の LINT だけを BSP と同じ経路で設定する。
     /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、MSR・FPU は本メソッドが設定し（CPUID は assemble が設定済み）、BSP の LAPIC の LINT は `VcpuFd::set_boot_lints`（#3735）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
     pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         let started = std::time::Instant::now();
@@ -968,7 +985,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             // CPUID（#3733）はこの MSR の設定より前に入れる（CPUID の機能ビットで受理される MSR が変わるため）。
             vcpu.set_msrs(&boot_msrs())?;
             vcpu.set_fpu(&X86FpuState::boot())?;
-            vcpu.set_boot_lints().map(|_| ())
+            vcpu.set_boot_lints()?;
+            // AP は BSP と同じ経路で LINT を設定する。INIT が LVT をマスクへ戻すので、この設定が残るのは INIT までで、
+            // LINT はゲストのカーネルが AP ごとに設定し直す（レジスタは INIT/SIPI で決まるため触らない。#3737）。
+            for ap in self.vcpus.iter_mut().skip(1) {
+                ap.set_boot_lints()?;
+            }
+            Ok(())
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -976,6 +999,60 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
                 "boot register setup is only implemented for x86_64",
+            ))
+        }
+    }
+
+    /// AP の起動コードを SIPI のベクタが指すページへ書く（#3737・MVM-1・TASK-75.4。x86_64 のみ、他 arch は `Unimplemented`）。
+    ///
+    /// BSP のゲストコードが送る STARTUP IPI のベクタと同じ `vector` を渡す。置き場所は [`sipi_startup_range`] で検証してから書く
+    /// （ブート用領域・RAM の外との重なりは書く前に `InvalidArgument`）。戻り値は書いた先頭の GPA。Linux ゲストは自分で
+    /// trampoline を置くため、本メソッドはファームウェアの無い起動コードと試験のためのもの（e820 への予約は範囲外。REPAIR-3）。
+    pub fn write_ap_startup_code(
+        &mut self,
+        vector: SipiVector,
+        code: &[u8],
+    ) -> Result<GuestAddress, MicrovmError> {
+        // REPAIR-4: 成功・失敗と所要時間を固定の操作名とエラーコードだけで 1 行出す。コードの内容は記録しない。
+        let started = std::time::Instant::now();
+        let result = self.write_ap_startup_code_inner(vector, code);
+        let elapsed_us = started.elapsed().as_micros();
+        use std::io::Write as _;
+        match &result {
+            Ok(_) => drop(writeln!(
+                std::io::stderr(),
+                "level=info op=microvm.write_ap_startup_code outcome=ok elapsed_us={elapsed_us} code_len={}",
+                code.len()
+            )),
+            Err(e) => drop(writeln!(
+                std::io::stderr(),
+                "level=error op=microvm.write_ap_startup_code outcome=error code={} elapsed_us={elapsed_us} code_len={}",
+                e.code().as_str(),
+                code.len()
+            )),
+        }
+        result
+    }
+
+    /// [`MicroVm::write_ap_startup_code`] の本体（計装を含まない）。
+    fn write_ap_startup_code_inner(
+        &mut self,
+        vector: SipiVector,
+        code: &[u8],
+    ) -> Result<GuestAddress, MicrovmError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (start, _end) = sipi_startup_range(vector, code.len(), self.memory.len())?;
+            let addr = GuestAddress::new(start);
+            self.memory.write_at(addr, code)?;
+            Ok(addr)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (vector, code);
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "AP startup is only implemented for x86_64",
             ))
         }
     }

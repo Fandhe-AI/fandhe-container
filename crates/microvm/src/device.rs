@@ -47,7 +47,7 @@ use crate::boot_x86::BootCpuState;
 use crate::boot_x86::{SegmentDescriptor, X86Regs};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::exit::{self, VcpuExit};
+use crate::exit::{self, ExitValue, VcpuExit};
 use crate::interrupt::{InterruptLine, IoEventSpec};
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
 use crate::sys::{self, SysError};
@@ -117,6 +117,9 @@ pub struct RunRecord {
     pub outcome: RunOutcome,
     /// `KVM_RUN` の発行から戻るまでの時間。
     pub elapsed: Duration,
+    /// exit の値（PIO・MMIO）。観測器が [`RunObserver::wants_values`] で求めたときだけ `Some`。
+    /// ゲストが制御する値で untrusted（#3769・MVM-1・REPAIR-12）。
+    pub value: Option<ExitValue>,
 }
 
 /// 実行結果の記録器。呼び出し側（将来の plugin-microvm・TASK-117 等）が構造化ログやメトリクスへ接続する。
@@ -124,6 +127,128 @@ pub struct RunRecord {
 pub trait RunObserver: Send + Sync + std::fmt::Debug {
     /// 1 回の `KVM_RUN` の記録を受け取る。
     fn record(&self, record: &RunRecord);
+
+    /// `RunRecord::value` を求めるか。既定は false（opt-in）。値はゲスト由来の秘密を含みうるため、
+    /// 製品の構造化ログ・メトリクスへ接続する観測器は true にしない（試験・診断用。#3769）。
+    fn wants_values(&self) -> bool {
+        false
+    }
+}
+
+/// [`BoundedRunLog`] の記録件数の上限（割り当て上限の検証用。#3769）。
+pub const RUN_LOG_CAPACITY_MAX: usize = 4096;
+
+/// [`BoundedRunLog`] が exit の値を記録するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueCapture {
+    /// 値を記録しない（種別と時間のみ）。
+    Omit,
+    /// PIO・MMIO の値を記録する（データ長は `EXIT_VALUE_DATA_MAX` で上限）。
+    Record,
+}
+
+/// 件数上限つきの観測器（試験・診断用。#3769・MVM-1・REPAIR-12）。
+///
+/// 上限を超えたレコードは捨てて [`BoundedRunLog::dropped`] に数える。`record` は割り当てもブロックもしない
+/// （`new` で確保済み）。`Debug` は記録した値を出さない。
+pub struct BoundedRunLog {
+    capacity: usize,
+    capture: ValueCapture,
+    inner: std::sync::Mutex<BoundedRunLogInner>,
+}
+
+struct BoundedRunLogInner {
+    records: Vec<RunRecord>,
+    dropped: u64,
+}
+
+impl BoundedRunLog {
+    /// `capacity` は 1 以上 [`RUN_LOG_CAPACITY_MAX`] 以下。範囲外は `InvalidArgument`。
+    pub fn new(capacity: usize, capture: ValueCapture) -> Result<BoundedRunLog, MicrovmError> {
+        if capacity == 0 || capacity > RUN_LOG_CAPACITY_MAX {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "run log capacity must be in 1..=4096",
+            ));
+        }
+        Ok(BoundedRunLog {
+            capacity,
+            capture,
+            inner: std::sync::Mutex::new(BoundedRunLogInner {
+                records: Vec::with_capacity(capacity),
+                dropped: 0,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BoundedRunLogInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 記録済みのレコード（起きた順）。
+    pub fn records(&self) -> Vec<RunRecord> {
+        self.lock().records.clone()
+    }
+
+    /// 件数上限で捨てたレコード数。
+    pub fn dropped(&self) -> u64 {
+        self.lock().dropped
+    }
+}
+
+impl std::fmt::Debug for BoundedRunLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.lock();
+        f.debug_struct("BoundedRunLog")
+            .field("capacity", &self.capacity)
+            .field("capture", &self.capture)
+            .field("len", &g.records.len())
+            .field("dropped", &g.dropped)
+            .finish()
+    }
+}
+
+impl RunObserver for BoundedRunLog {
+    fn record(&self, record: &RunRecord) {
+        let mut g = self.lock();
+        if g.records.len() < self.capacity {
+            g.records.push(*record);
+        } else {
+            g.dropped = g.dropped.saturating_add(1);
+        }
+    }
+
+    fn wants_values(&self) -> bool {
+        self.capture == ValueCapture::Record
+    }
+}
+
+/// `run_once` の結果から記録を作る。`capture` のときだけ exit の値を載せる。
+fn build_record(
+    vcpu_id: u32,
+    result: &Result<VcpuExit, MicrovmError>,
+    elapsed: Duration,
+    capture: bool,
+) -> RunRecord {
+    let outcome = match result {
+        Ok(VcpuExit::Interrupted) => RunOutcome::Interrupted,
+        Ok(e) => RunOutcome::Exit(exit_kind(e)),
+        Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => RunOutcome::DeadlineExceeded,
+        Err(e) => RunOutcome::Error(e.code()),
+    };
+    let value = match result {
+        Ok(e) if capture => ExitValue::from_exit(e),
+        _ => None,
+    };
+    RunRecord {
+        vcpu_id,
+        outcome,
+        elapsed,
+        value,
+    }
 }
 
 /// [`VcpuFd`] ごとの累積の実行統計（観測器が無くても取れる。REPAIR-4）。
@@ -414,28 +539,18 @@ impl VcpuFd {
         let start = Instant::now();
         let result = self.run_bounded(timeout);
         let elapsed = start.elapsed();
-        let outcome = match &result {
-            Ok(VcpuExit::Interrupted) => RunOutcome::Interrupted,
-            Ok(e) => RunOutcome::Exit(exit_kind(e)),
-            Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => {
-                RunOutcome::DeadlineExceeded
-            }
-            Err(e) => RunOutcome::Error(e.code()),
-        };
+        let capture = self.observer.as_ref().is_some_and(|o| o.wants_values());
+        let rec = build_record(self.id, &result, elapsed, capture);
         self.stats.runs += 1;
         self.stats.total_elapsed = self.stats.total_elapsed.saturating_add(elapsed);
-        match outcome {
+        match rec.outcome {
             RunOutcome::Exit(_) => self.stats.exits += 1,
             RunOutcome::Interrupted => self.stats.interrupted += 1,
             RunOutcome::DeadlineExceeded => self.stats.deadline_exceeded += 1,
             RunOutcome::Error(_) => self.stats.errors += 1,
         }
         if let Some(o) = &self.observer {
-            o.record(&RunRecord {
-                vcpu_id: self.id,
-                outcome,
-                elapsed,
-            });
+            o.record(&rec);
         }
         result
     }
@@ -1399,6 +1514,104 @@ fn run_probe_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit::{ExitData, IoDirection};
+
+    fn io_out(b: u8) -> VcpuExit {
+        VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: vec![b],
+        }
+    }
+
+    fn rec(id: u32, b: u8) -> RunRecord {
+        build_record(id, &Ok(io_out(b)), Duration::ZERO, true)
+    }
+
+    /// #3769・MVM-1: 値は求められたときだけ載り、非アクセス exit・エラーには載らない。
+    #[test]
+    fn mvm1_3769_build_record_captures_value_only_when_requested() {
+        let on = build_record(0, &Ok(io_out(b'O')), Duration::ZERO, true);
+        assert_eq!(on.outcome, RunOutcome::Exit("io"));
+        assert_eq!(
+            on.value,
+            Some(ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x10,
+                size: 1,
+                count: 1,
+                data: ExitData::from_slice(b"O"),
+            })
+        );
+        let off = build_record(0, &Ok(io_out(b'O')), Duration::ZERO, false);
+        assert_eq!(off.value, None);
+        let int = build_record(0, &Ok(VcpuExit::Interrupted), Duration::ZERO, true);
+        assert_eq!((int.outcome, int.value), (RunOutcome::Interrupted, None));
+        let err = Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "deadline",
+        ));
+        let d = build_record(0, &err, Duration::ZERO, true);
+        assert_eq!((d.outcome, d.value), (RunOutcome::DeadlineExceeded, None));
+    }
+
+    /// #3769・MVM-1: 件数上限を超えたレコードは捨てて数える。
+    #[test]
+    fn mvm1_3769_bounded_run_log_drops_and_counts_overflow() {
+        let log = BoundedRunLog::new(2, ValueCapture::Record).unwrap();
+        for i in 0..5u8 {
+            log.record(&rec(u32::from(i), b'a' + i));
+        }
+        assert_eq!(log.records(), vec![rec(0, b'a'), rec(1, b'b')]);
+        assert_eq!(log.dropped(), 3);
+    }
+
+    /// #3769・MVM-1: 容量の範囲外は `InvalidArgument`。
+    #[test]
+    fn mvm1_3769_bounded_run_log_rejects_out_of_range_capacity() {
+        for c in [0, RUN_LOG_CAPACITY_MAX + 1] {
+            let e = BoundedRunLog::new(c, ValueCapture::Omit).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert!(BoundedRunLog::new(RUN_LOG_CAPACITY_MAX, ValueCapture::Omit).is_ok());
+    }
+
+    /// #3769・MVM-1: `wants_values` は既定 false で、`Record` のときだけ true。
+    #[test]
+    fn mvm1_3769_wants_values_defaults_to_false() {
+        #[derive(Debug)]
+        struct Plain;
+        impl RunObserver for Plain {
+            fn record(&self, _: &RunRecord) {}
+        }
+        assert!(!Plain.wants_values());
+        assert!(
+            !BoundedRunLog::new(1, ValueCapture::Omit)
+                .unwrap()
+                .wants_values()
+        );
+        assert!(
+            BoundedRunLog::new(1, ValueCapture::Record)
+                .unwrap()
+                .wants_values()
+        );
+    }
+
+    /// #3769・MVM-1: `Debug` は記録した値を出さず、件数だけ出す。
+    #[test]
+    fn mvm1_3769_bounded_run_log_debug_omits_values() {
+        let log = BoundedRunLog::new(1, ValueCapture::Record).unwrap();
+        log.record(&rec(0, 0xAB));
+        log.record(&rec(0, 0xCD));
+        let s = format!("{log:?}");
+        assert!(
+            !s.contains("171") && !s.to_lowercase().contains("0xab"),
+            "{s}"
+        );
+        assert!(s.contains("dropped: 1") && s.contains("len: 1"), "{s}");
+    }
 
     /// MVM-1: 上限まで `Interrupted` だけ、または `Hlt` 以外だけなら完了扱いにせず `Internal` で失敗する。
     #[cfg(target_arch = "x86_64")]

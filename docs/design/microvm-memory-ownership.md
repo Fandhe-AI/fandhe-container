@@ -31,7 +31,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 ### backing は TASK-75.1（#696）が持つ
 
 - 匿名 mmap（フラグの選択は #696 で決める）・`KVM_SET_USER_MEMORY_REGION` による登録・munmap と Drop の後始末
-- `unsafe` は `crates/microvm/src/sys.rs` に閉じる（coding-rust の事前承認の範囲。SAFETY コメントと security-auditor 観点のレビューは #696 の PR で行う）
+- `unsafe` は `crates/microvm/src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS。TASK-192.1・#3783）に閉じる（coding-rust の事前承認の範囲。SAFETY コメントと security-auditor 観点のレビューは #696 の PR で行う）
 - アクセス型へは安全なコンストラクタ経由で渡し、アクセス型の API は変えない
 
 ## 理由

@@ -79,3 +79,15 @@ crate ごとに残してよいもの: `sys.rs`（SIGTERM の登録・自前の F
 - 実装の途中で共通化できない差が見つかったとき（その部分を (c) に回して本記録に追記する）
 - PLUG-4 の判定対象（[crate-naming.md](crate-naming.md) 決定 3）が変わったとき
 - `crates/plugin` のライセンスの方針が変わったとき
+
+## #3776 の結果（plugin-windows の切り替え）
+
+- 案 c に回した部分は無かった。windows 固有の差はすべて「引数 1 つ」と「既定実装つきメソッド 1 つ」で表せた
+- 共通側に足したもの（いずれも既存の `serve`・`serve_until`・`handle_frame` の署名と挙動は変えない非破壊の追加）:
+  - `ShutdownPolicy`（`CompleteFrame` が既定、`DiscardInProgress` が windows）。受信途中の停止確認・停止フラグで中断できる送信（`send_frame_until`）・`IDLE_POLL` 期限の代替受信（`fallback_outcome`）の 3 つは `DiscardInProgress` のときだけ有効
+  - `serve_until_with(stream, handler, stop, policy)`。`serve_until` は `CompleteFrame` 固定でこれへ委譲する
+  - `RequestHandler::handle_with_stop`（既定は `handle` へ委譲）。macos・microvm の adapter は無変更
+- plugin-windows の `frame_loop.rs` は再 export と、`DiscardInProgress` を固定した薄い `serve` / `serve_until` だけになった（共有側の `serve_until` をそのまま再 export すると `CompleteFrame` になり WIN-2 の猶予を守れないため）
+- windows の挙動が変わるのは、macos 系の堅牢化（作業バッファ `chunk` による本体読み、最後の read の後と `decode_body` の後の合計期限の再確認。REPAIR-5）が入る点だけ。確認試験: `task116_5_repair5_discard_policy_deadline_exceeded_by_last_read_is_timeout`（共有側）。方針の対比は `task3776_policy_contrast_flag_mid_frame`
+- 単体試験の移設: windows の単体 22 件のうち、停止まわりの 11 件（`task116_5_win1_*` 7 件・`task116_5_win2_*` 4 件）は名前を保って共有側へ移した。残り 11 件（`task116_2_*`）は共有側の `plug1_frame_loop_*`（アサーションが同一）と重複するため移さない。windows の結合試験 14・peer_auth 2・e2e 7 は不変
+- PLUG-4: 共有 crate の変更であり plugin の追加ではないため `make plug4-core-invariance` の判定対象外

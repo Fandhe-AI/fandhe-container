@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -1331,7 +1331,8 @@ fn kvm_device_ap_starts_on_init_sipi() {
 }
 
 /// MVM-1・TASK-75.4.1・#886: `MicroVm::start` / `RunningMicroVm::stop`。(a) 自己ループするゲストを停止要求で止め、
-/// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台は拒否される。
+/// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台でも BSP の
+/// ゲスト起因の終了が全台を止め、きっかけの vCPU 番号（0）と台数（2）が報告されて両 vCPU の資源が解放される（#3738）。
 /// 資源の解放は、観測器 `Arc` の参照数が 1 に戻ること（`VcpuFd`、つまり `MicroVm` 全体が drop 済み）で決定的に確かめる
 /// （`/proc/self/fd` の件数は他の試験の並列スレッドで揺れるため使わない）。
 #[cfg(target_arch = "x86_64")]
@@ -1418,13 +1419,25 @@ fn kvm_device_start_stop_microvm() {
     assert_eq!(report.reason, StopReason::GuestShutdown);
     assert_eq!(Arc::strong_count(&obs), 1);
 
-    // (c) vCPU 2 台は未実装として拒否される。
+    // (c) vCPU 2 台（#3738）: BSP の ud2 によるゲスト起因の終了が全台を止める。AP は UNINITIALIZED のまま
+    // `KVM_RUN` の中にいて、kick で止まる。両 vCPU の観測器の参照数が 1 に戻る（全台の解放済み）まで確かめる。
     let mut vm = assemble(2);
     let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
-    assert_eq!(
-        vm.start(&loaded).unwrap_err().code(),
-        MicrovmErrorCode::Unimplemented
-    );
+    let obs0 = Arc::new(Count::default());
+    let obs1 = Arc::new(Count::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| running.is_finished())
+    ));
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.origin_vcpu, Some(0));
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -1443,6 +1456,171 @@ fn kvm_device_start_stop_microvm() {
     };
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+/// MVM-1・REPAIR-5・#3738: vCPU 2 台の `start` で AP が自分のスレッドで INIT/SIPI により起動し、COM1 の THR へ自分の
+/// APIC ID（1）を出す。ホストは `SerialConsole` の累積が `[0x01]` と完全一致するのを期限つきで待つ。`stop` は両スレッドを回収し
+/// （観測器の参照数が 1 に戻る）、観測器の記録に vcpu_id 1 の `KVM_RUN` がある。続けて、BSP が INIT/SIPI を送らず AP が
+/// UNINITIALIZED のまま `KVM_RUN` に居る状態でも、`stop` が kick で期限内（2 秒未満）に戻ることを確かめる。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::smp_x86::SipiVector;
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Ids {
+        total: AtomicU64,
+        ids: Mutex<Vec<u32>>,
+    }
+    impl RunObserver for Ids {
+        fn record(&self, record: &RunRecord) {
+            self.total.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut v) = self.ids.lock()
+                && !v.contains(&record.vcpu_id)
+            {
+                v.push(record.vcpu_id);
+            }
+        }
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
+    let assemble = || -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
+        MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 2,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap()
+    };
+    let wait = |limit: Duration, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    };
+
+    // (a) BSP が INIT/SIPI を送り、AP が COM1 へ APIC ID を出す。
+    let bsp_sipi: Vec<u8> = vec![
+        0xBF, 0x10, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00310
+        0xC7, 0x07, 0x00, 0x00, 0x00, 0x01, // mov dword [rdi],0x01000000
+        0xBF, 0x00, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00300
+        0xC7, 0x07, 0x00, 0x45, 0x00, 0x00, // mov dword [rdi],0x00004500 (INIT)
+        0xC7, 0x07, 0x01, 0x46, 0x00, 0x00, // mov dword [rdi],0x00004601 (SIPI, vector 1)
+        0xEB, 0xFE, // jmp $
+    ];
+    let ap: Vec<u8> = vec![
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x0F, 0xA2, // cpuid
+        0x66, 0xC1, 0xEB, 0x18, // shr ebx,24
+        0x88, 0xD8, // mov al,bl
+        0xBA, 0xF8, 0x03, // mov dx,0x3F8
+        0xEE, // out dx,al
+        0xEB, 0xFE, // jmp $
+    ];
+    let mut vm = assemble();
+    let loaded = vm
+        .load_kernel(&image(&bsp_sipi), None, "console=ttyS0")
+        .unwrap();
+    vm.write_ap_startup_code(SipiVector::new(0x01).unwrap(), &ap)
+        .unwrap();
+    let obs0 = Arc::new(Ids::default());
+    let obs1 = Arc::new(Ids::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let console = vm.serial_console();
+    let running = vm.start(&loaded).unwrap();
+    let mut seen: Vec<u8> = Vec::new();
+    let arrived = wait(
+        Duration::from_secs(10),
+        Box::new(|| {
+            seen.extend(console.take_output().unwrap());
+            seen.as_slice() == [0x01]
+        }),
+    );
+    assert!(arrived, "AP output was {seen:?}, expected [1]");
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(report.origin_vcpu, None);
+    assert_eq!(report.stats.errors, 0);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
+    assert!(obs1.ids.lock().unwrap().contains(&1));
+    assert!(obs1.total.load(Ordering::SeqCst) >= 1);
+    assert!(obs0.ids.lock().unwrap().contains(&0));
+
+    // (b) SIPI の前の停止: AP は UNINITIALIZED のまま `KVM_RUN` に居て、kick で止まる。
+    let mut vm = assemble();
+    let loaded = vm
+        .load_kernel(&image(&[0xEB, 0xFE]), None, "console=ttyS0")
+        .unwrap();
+    let obs0 = Arc::new(Ids::default());
+    let obs1 = Arc::new(Ids::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| obs0.total.load(Ordering::SeqCst) >= 1)
+    ));
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
+}
+
+/// MVM-1・#3738: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 2,
         mem_size: 1 << 20,
         block: vec![],
         net: vec![],

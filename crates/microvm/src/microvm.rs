@@ -8,6 +8,9 @@
 //! （TASK-75.3.1・#884。実体は `crate::boot_x86`）。vCPU 0 のレジスタ初期化（long mode・エントリへの RIP）は [`MicroVm::setup_boot_vcpu`]（TASK-75.3.2・#885）。
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
+//! KVM 内部領域（#3732）: identity map（[`IDENTITY_MAP_ADDR`]）と TSS（[`TSS_ADDR`]）は vCPU の作成前に置き、RAM・MMIO の窓と
+//! 重ならないことを `plan_layout` が検証する。e820 への予約領域としての記載は範囲外（REPAIR-3。現状の e820 は RAM のみ）。
+//!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! MSR / FPU / LAPIC の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
@@ -18,6 +21,13 @@
 //! [`RunningMicroVm::stop`]（期限つき。`Ok` で戻った時点でスレッド join 済み・fd・mmap・irqfd 解放済み）で、
 //! 呼び忘れても drop が回収する。ゲスト起因の終了（シャットダウン・失敗）も [`StopReason`] で報告し、同じ後始末を通る。
 //! 停止要求は `immediate_exit` と kick（`SIGUSR2`）で実行中の `KVM_RUN` を即時に中断する（#3736・REPAIR-5。`VCPU_POLL_INTERVAL` を待たない）。
+//!
+//! # シリアル（TASK-75.5・#3740・MVM-1）
+//! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
+//! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
+//! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
+//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。未実装（REPAIR-3）: IRQ 4・ゲスト入力。
+//! aarch64 には PIO が無く、組み立ての入口が `Unimplemented`。
 //!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
 //! 失敗はすべて `Result` の [`MicrovmError`]（機械可読な `code` と英語の `message`）で返し、panic しない。
@@ -53,7 +63,7 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -72,6 +82,7 @@ use crate::interrupt::{
 };
 use crate::irq::IrqFd;
 use crate::sys::{self, GuestRamMap, SysError};
+use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{
     CONFIG_SPACE_SIZE, IgnoredAccess, MmioReadOutcome, MmioWriteOutcome, VirtioDevice,
@@ -93,6 +104,39 @@ pub const MAX_VCPUS: u32 = 32;
 
 const _: () = assert!(VIRTIO_MMIO_WINDOW.is_multiple_of(4096));
 const _: () = assert!(VIRTIO_MMIO_WINDOW >= 0x100 + CONFIG_SPACE_SIZE);
+
+/// KVM の identity map ページ（EPT 用。`KVM_SET_IDENTITY_MAP_ADDR`）の置き場（GPA。1 ページ）。KVM の既定値と同じで、
+/// TSS の直前に置く。ゲストのページテーブルが作る恒等写像の範囲（`boot_x86::IDENTITY_MAP_LIMIT`）とは別物。
+/// KVM API 文書は、この領域と [`TSS_ADDR`] を最初の 4 GiB に置き、どの memslot・MMIO とも衝突させないことを要求する。
+/// RAM は GPA 0 から [`VIRTIO_MMIO_BASE`] 以下、virtio-mmio の窓は最大 `0xd000_8000` まで、IOAPIC / LAPIC は
+/// `0xfec0_0000` 以降なので、この位置はどれとも重ならない（`assemble` が `check_reserved_regions` で検証する。MVM-1・#3732）。
+pub const IDENTITY_MAP_ADDR: u64 = 0xfffb_c000;
+/// [`IDENTITY_MAP_ADDR`] の大きさ（1 ページ）。
+pub const IDENTITY_MAP_LEN: u64 = 0x1000;
+/// TSS 用の置き場（GPA。3 ページ）。identity map の直後。`KVM_SET_TSS_ADDR` は先頭から 3 ページを使い、
+/// カーネルは `addr` が `(unsigned int)(-3 * PAGE_SIZE)` を超えると拒否する（上限は下の const assert で固定）。
+pub const TSS_ADDR: u64 = 0xfffb_d000;
+/// [`TSS_ADDR`] の大きさ（3 ページ）。
+pub const TSS_LEN: u64 = 0x3000;
+/// in-kernel IOAPIC の MMIO の窓（既定の物理アドレス。実体は 0x20 バイトだがページ単位で確保する）。
+const IOAPIC_MMIO_BASE: u64 = 0xfec0_0000;
+const IOAPIC_MMIO_LEN: u64 = 0x1000;
+/// LAPIC の MMIO の窓（既定の物理アドレス）。
+const LAPIC_MMIO_BASE: u64 = 0xfee0_0000;
+const LAPIC_MMIO_LEN: u64 = 0x1000;
+/// 4 GiB（TSS・identity map はここまでに収める）。
+const GPA_4GIB: u64 = 1 << 32;
+
+const _: () = assert!(TSS_ADDR.is_multiple_of(4096) && IDENTITY_MAP_ADDR.is_multiple_of(4096));
+const _: () = assert!(TSS_LEN == 3 * 4096 && IDENTITY_MAP_LEN == 4096);
+const _: () = assert!(IDENTITY_MAP_ADDR + IDENTITY_MAP_LEN <= TSS_ADDR);
+const _: () = assert!(TSS_ADDR + TSS_LEN <= GPA_4GIB);
+// カーネルの上限 `addr <= (unsigned int)(-3 * PAGE_SIZE)` = 0xffff_d000。
+const _: () = assert!(TSS_ADDR <= 0xffff_d000);
+const _: () =
+    assert!(VIRTIO_MMIO_BASE + MAX_VIRTIO_DEVICES as u64 * VIRTIO_MMIO_WINDOW <= IOAPIC_MMIO_BASE);
+const _: () = assert!(IOAPIC_MMIO_BASE + IOAPIC_MMIO_LEN <= LAPIC_MMIO_BASE);
+const _: () = assert!(LAPIC_MMIO_BASE + LAPIC_MMIO_LEN <= IDENTITY_MAP_ADDR);
 
 /// ゲスト RAM の確保上限（16 GiB。無制限確保による DoS を防ぐ。`MAP_NORESERVE` でも上限で抑える）。
 pub const MAX_GUEST_RAM_BYTES: u64 = 1 << 34;
@@ -391,7 +435,111 @@ fn plan_layout(
     if mem_size > VIRTIO_MMIO_BASE {
         return Err(invalid("guest memory overlaps the virtio-mmio window"));
     }
-    layout_slots(block_count, net_count)
+    let slots = layout_slots(block_count, net_count)?;
+    let (reserved, occupied) = system_regions(mem_size, &slots)?;
+    check_reserved_regions(&reserved, &occupied)?;
+    Ok(slots)
+}
+
+/// GPA の半開区間 `[start, end)`（重なり検証用。`end` の溢れと空区間は作れない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestRange {
+    start: u64,
+    end: u64,
+}
+
+impl GuestRange {
+    /// `[start, start + len)`。`len == 0` と加算の溢れは `InvalidArgument`（panic しない）。
+    fn new(start: u64, len: u64) -> Result<Self, MicrovmError> {
+        let end = start
+            .checked_add(len)
+            .filter(|_| len != 0)
+            .ok_or_else(|| invalid("guest range is empty or overflows"))?;
+        Ok(Self { start, end })
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+/// 重なり検証の領域の種別（エラー文言用。値・アドレスは載せない。ERR-1・REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    GuestMemory,
+    VirtioMmio,
+    Ioapic,
+    Lapic,
+    Tss,
+    IdentityMap,
+}
+
+impl RegionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GuestMemory => "guest memory",
+            Self::VirtioMmio => "a virtio-mmio window",
+            Self::Ioapic => "the IOAPIC window",
+            Self::Lapic => "the LAPIC window",
+            Self::Tss => "the TSS region",
+            Self::IdentityMap => "the identity map page",
+        }
+    }
+}
+
+type Region = (RegionKind, GuestRange);
+
+/// KVM 内部領域（`reserved`: TSS・identity map）が 4 GiB 以内に収まり、互いに、また使用中の領域（`occupied`:
+/// RAM・MMIO の窓）と重ならないことを確かめる（KVM 不要の純粋関数。`plan_layout` が ioctl の前に呼ぶ。MVM-1・#3732）。
+/// 違反は `InvalidArgument`（fail-closed）。範囲を引数で受けるのは、定数の組では境界の 1 バイトを試験できないため。
+fn check_reserved_regions(reserved: &[Region], occupied: &[Region]) -> Result<(), MicrovmError> {
+    for (i, (kind, range)) in reserved.iter().enumerate() {
+        if range.end > GPA_4GIB {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                format!("{} must lie below 4 GiB", kind.as_str()),
+            ));
+        }
+        for (other_kind, other) in reserved.iter().take(i).chain(occupied.iter()) {
+            if range.overlaps(*other) {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    format!("{} overlaps {}", kind.as_str(), other_kind.as_str()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 実際の構成から `check_reserved_regions` へ渡す `(reserved, occupied)` を組む。
+fn system_regions(
+    mem_size: u64,
+    slots: &[DeviceSlot],
+) -> Result<(Vec<Region>, Vec<Region>), MicrovmError> {
+    let mut occupied = vec![(RegionKind::GuestMemory, GuestRange::new(0, mem_size)?)];
+    for s in slots {
+        occupied.push((
+            RegionKind::VirtioMmio,
+            GuestRange::new(s.mmio_base, s.mmio_len)?,
+        ));
+    }
+    occupied.push((
+        RegionKind::Ioapic,
+        GuestRange::new(IOAPIC_MMIO_BASE, IOAPIC_MMIO_LEN)?,
+    ));
+    occupied.push((
+        RegionKind::Lapic,
+        GuestRange::new(LAPIC_MMIO_BASE, LAPIC_MMIO_LEN)?,
+    ));
+    let reserved = vec![
+        (
+            RegionKind::IdentityMap,
+            GuestRange::new(IDENTITY_MAP_ADDR, IDENTITY_MAP_LEN)?,
+        ),
+        (RegionKind::Tss, GuestRange::new(TSS_ADDR, TSS_LEN)?),
+    ];
+    Ok((reserved, occupied))
 }
 
 /// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
@@ -482,11 +630,14 @@ impl QueueNotifyReport {
     }
 }
 
-/// MMIO dispatcher と block / net デバイス群。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
+/// MMIO / PIO dispatcher と block / net デバイス群と COM1 の UART。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
+///
+/// UART（#3740・MVM-1）は常に COM1 へ登録し、`serial` はホストへ出力を渡す共有ハンドル。
 struct DeviceBus<B: BlockBackend, N: NetBackend, L> {
     dispatcher: ExitDispatcher,
     block: Vec<BoundDevice<VirtioBlock<B>, L>>,
     net: Vec<BoundDevice<VirtioNet<N>, L>>,
+    serial: SerialConsole,
 }
 
 impl<B: BlockBackend, N: NetBackend, L> DeviceBus<B, N, L> {
@@ -518,7 +669,11 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
             dispatcher: ExitDispatcher::new(),
             block: Vec::with_capacity(block.len()),
             net: Vec::with_capacity(net.len()),
+            serial: SerialConsole::new(),
         };
+        // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
+        bus.dispatcher
+            .register_pio(COM1_BASE, UART_PORT_LEN, bus.serial.port_device())?;
         let mut slots_iter = slots.iter();
         for backend in block {
             let slot = *slots_iter
@@ -610,7 +765,7 @@ impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for MicroVm<B, N> {
 }
 
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B, N> {
-    /// 構成を検証し、VM → irqchip → ゲストメモリ → デバイス → vCPU の順に組み立てる。
+    /// 構成を検証し、VM → irqchip → identity map / TSS（x86_64）→ ゲストメモリ → デバイス → vCPU の順に組み立てる。
     ///
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
     /// （段ごとの確認は `mvm1_887_*`・#887）。aarch64 は最初の ioctl より前に `Unimplemented`。
@@ -649,6 +804,12 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         )?;
         let vm = kvm.create_vm()?;
         vm.create_irqchip()?;
+        // KVM 内部領域（identity map・TSS）は vCPU の作成前に置く。位置の重なりは plan_layout で検証済み（#3732）。
+        #[cfg(target_arch = "x86_64")]
+        {
+            vm.set_identity_map_addr(IDENTITY_MAP_ADDR)?;
+            vm.set_tss_addr(TSS_ADDR)?;
+        }
         let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, GuestAddress::new(0))?;
         let devices = DeviceBus::new(&slots, config.block, config.net, |s| {
             vm.register_irqfd(s.gsi)
@@ -850,7 +1011,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         Ok(f(&mut t))
     }
 
-    /// `vcpu_index` の vCPU が返した `Io` / `Mmio` exit を MMIO dispatcher へ振り分ける。範囲外の index は `InvalidArgument`。
+    /// COM1 の UART の出力をホストが取り出すハンドル（clone）。ゲストの THR 出力（`console=ttyS0`）が溜まる。
+    ///
+    /// 上限つき（[`crate::uart::MAX_OUTPUT_BYTES`]）。中身は非信頼のゲスト出力なので、表示・記録時はエスケープすること。
+    /// 未実装（REPAIR-3）: IRQ 4 とゲスト入力。
+    pub fn serial_console(&self) -> SerialConsole {
+        self.devices.serial.clone()
+    }
+
+    /// `vcpu_index` の vCPU が返した `Io` / `Mmio` exit を MMIO / PIO dispatcher（COM1 の UART を含む）へ振り分ける。範囲外の index は `InvalidArgument`。
     pub fn handle_exit(
         &mut self,
         vcpu_index: usize,
@@ -1033,6 +1202,7 @@ fn vcpu_loop<T: VcpuLoopBody>(
     stop: Arc<StopSignal>,
     done: mpsc::Sender<StopReport>,
     started: Instant,
+    exit: &ExitGuard,
 ) {
     let reason = loop {
         if stop.is_requested() {
@@ -1064,12 +1234,16 @@ fn vcpu_loop<T: VcpuLoopBody>(
         stats.errors,
         elapsed.as_micros()
     ));
-    // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
-    let _ = done.send(StopReport {
+    let report = StopReport {
         reason,
         stats,
         elapsed,
-    });
+    };
+    // 解放（`drop(body)`）の完了後にだけ「終了済み」を記録する（#3744）。stop が期限切れで切り離した後も、
+    // `VcpuExitWatch` の観測者はこの記録で資源の解放完了を知る。
+    exit.complete(report);
+    // 受け手（RunningMicroVm）が既に無ければ送信は失敗するが、解放は済んでいるので捨てる。
+    let _ = done.send(report);
 }
 
 /// スレッド生成の失敗を分類する（EAGAIN・ENOMEM は資源枯渇、それ以外は内部エラー。メッセージは固定文言と errno だけ）。
@@ -1090,18 +1264,31 @@ fn classify_spawn_error(e: &std::io::Error) -> MicrovmError {
 }
 
 /// `body` を専用スレッドで駆動して [`RunningMicroVm`] を返す。
-fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicroVm, MicrovmError> {
+fn spawn_loop<T: VcpuLoopBody>(
+    body: T,
+    started: Instant,
+    serial: SerialConsole,
+) -> Result<RunningMicroVm, MicrovmError> {
     let stop = Arc::new(StopSignal::new());
     let (tx, rx) = mpsc::channel();
     let flag = Arc::clone(&stop);
+    let exit = Arc::new(ExitCell::new());
+    let thread_exit = Arc::clone(&exit);
     let handle = std::thread::Builder::new()
         .name("microvm-vcpu-0".into())
-        .spawn(move || vcpu_loop(body, flag, tx, started))
+        .spawn(move || {
+            // panic の unwind でも「終了済み」を残す。`body` は `vcpu_loop` のフレームが所有するため、unwind では
+            // `body` の drop がこの guard の drop より先に走り、「解放後に記録」の順序が正常・panic の両経路で成り立つ。
+            let guard = ExitGuard(thread_exit);
+            vcpu_loop(body, flag, tx, started, &guard);
+        })
         .map_err(|e| classify_spawn_error(&e))?;
     Ok(RunningMicroVm {
+        exit,
         stop,
         done_rx: rx,
         handle: Some(handle),
+        serial,
     })
 }
 
@@ -1116,12 +1303,23 @@ fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicro
 /// 範囲外（REPAIR-3）: 一時停止（pause）。
 #[derive(Debug)]
 pub struct RunningMicroVm {
+    exit: Arc<ExitCell>,
     stop: Arc<StopSignal>,
     done_rx: mpsc::Receiver<StopReport>,
     handle: Option<JoinHandle<()>>,
+    serial: SerialConsole,
 }
 
 impl RunningMicroVm {
+    /// COM1 の UART の出力を取り出すハンドル（clone）。
+    ///
+    /// vCPU スレッドが `MicroVm` を drop した後も clone がバッファを保持する。[`RunningMicroVm::stop`] は自身を
+    /// 消費するので、停止後に取り出したい呼び出し元は事前にこのハンドルを取っておくこと。停止の報告は vCPU スレッドの
+    /// 送信完了後なので、`stop` が `Ok` で戻れば停止までの出力は欠けない。中身は非信頼のゲスト出力（表示・記録時はエスケープ）。
+    pub fn serial_console(&self) -> SerialConsole {
+        self.serial.clone()
+    }
+
     /// 停止を要求し、`deadline` 以内に vCPU スレッドが終わって資源（VM fd・vCPU fd・memslot・mmap・irqfd）が解放されるのを待つ。
     ///
     /// `Ok` で戻った時点で、スレッドは join 済みで `MicroVm` は drop 済み。ゲスト起因で既に終わっていた場合は
@@ -1201,6 +1399,17 @@ impl RunningMicroVm {
     pub fn is_finished(&self) -> bool {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
+
+    /// vCPU スレッドの終了を観測するハンドルの複製を返す（#3744・MVM-1・REPAIR-5）。
+    ///
+    /// [`RunningMicroVm::stop`] は `self` を消費し、期限切れ（`DeadlineExceeded`）ではスレッドを切り離すため、
+    /// 期限切れの後に終了を知る手段は無い。`stop` や drop の**前**に取得しておけば、ハンドルはそれらの後も有効で、
+    /// plugin-microvm の adapter が切り離した VM の計数枠を返してよいかの判定に使う（#3745）。
+    pub fn exit_watch(&self) -> VcpuExitWatch {
+        VcpuExitWatch {
+            cell: Arc::clone(&self.exit),
+        }
+    }
 }
 
 impl Drop for RunningMicroVm {
@@ -1222,6 +1431,133 @@ impl Drop for RunningMicroVm {
                 MicrovmErrorCode::DeadlineExceeded.as_str()
             ));
         }
+    }
+}
+
+/// [`VcpuExitWatch`] が返す vCPU ループの終了状態（真偽値で返さない。拡張できる）。
+///
+/// 呼び出し側は `Running` 以外を「資源を解放済み」とみなしてよい（例外は [`VcpuExitWatch`] の doc を参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VcpuExitState {
+    /// vCPU ループはまだ `MicroVm` を解放していない（未終了）。
+    Running,
+    /// `MicroVm` の解放（vCPU fd → デバイスの dispatcher・irqfd → メモリの memslot 削除と munmap → VM fd）を終えた。
+    Exited(StopReport),
+    /// vCPU スレッドが panic で unwind した。`MicroVm` は unwind で解放済みで、終了済みとして扱える。
+    ExitedAbnormally,
+}
+
+/// 終了状態の共有セル。vCPU スレッドが書き、[`VcpuExitWatch`] が期限つきで待つ。
+#[derive(Debug)]
+struct ExitCell {
+    state: Mutex<VcpuExitState>,
+    changed: Condvar,
+}
+
+impl ExitCell {
+    fn new() -> Self {
+        ExitCell {
+            state: Mutex::new(VcpuExitState::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// 状態は単純な値で、panic 中に壊れる不変条件が無い。poison でも中身を読む（`Running` 扱いで枠を返さないより正確）。
+    fn lock(&self) -> std::sync::MutexGuard<'_, VcpuExitState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_if_running(&self, next: VcpuExitState) {
+        let mut st = self.lock();
+        if *st == VcpuExitState::Running {
+            *st = next;
+            self.changed.notify_all();
+        }
+    }
+
+    /// 正常経路の記録。既に記録済みなら上書きしない。
+    fn complete(&self, report: StopReport) {
+        self.set_if_running(VcpuExitState::Exited(report));
+    }
+
+    /// 未記録なら異常終了として記録する（`Exited` は上書きしない）。
+    fn mark_abnormal_if_running(&self) {
+        self.set_if_running(VcpuExitState::ExitedAbnormally);
+    }
+
+    fn state(&self) -> VcpuExitState {
+        *self.lock()
+    }
+
+    /// `limit` まで状態の変化を待つ（spurious wakeup は残り時間を再計算して吸収する）。期限切れは `Running`。
+    fn wait_until(&self, limit: Instant) -> VcpuExitState {
+        let mut st = self.lock();
+        while *st == VcpuExitState::Running {
+            let now = Instant::now();
+            if now >= limit {
+                break;
+            }
+            st = self
+                .changed
+                .wait_timeout(st, limit - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *st
+    }
+}
+
+/// vCPU スレッドのクロージャが持つ guard。drop で未記録なら `ExitedAbnormally` を残す（panic の unwind 対策）。
+struct ExitGuard(Arc<ExitCell>);
+
+impl ExitGuard {
+    fn complete(&self, report: StopReport) {
+        self.0.complete(report);
+    }
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.mark_abnormal_if_running();
+    }
+}
+
+/// 切り離した vCPU スレッドの終了を期限つきで観測するハンドル（#3744・MVM-1・REPAIR-5。[`RunningMicroVm::exit_watch`]）。
+///
+/// `Arc` の複製で、[`RunningMicroVm`] の `stop`・drop の後も独立に生きる。`stop` が `DeadlineExceeded` で戻ったあと
+/// スレッドが後で終わったかを [`VcpuExitWatch::wait`] で知る。plugin-microvm の adapter が期限切れ VM の計数枠を返す判定に使う（#3745）。
+///
+/// # 観測できる範囲（REPAIR-3）
+/// - `Exited` は `MicroVm` の解放完了（vCPU fd と kvm_run の mmap、dispatcher と irqfd の解除、memslot の削除と munmap、VM fd の close）
+///   の直後に記録される。スレッドローカルの destructor の完了や OS スレッドの回収より前。
+/// - `stop` が報告を受けた後の join だけが期限切れになった `DeadlineExceeded` では、資源は解放済みで `Exited` を返す。
+/// - 例外（fail-closed の既存仕様）: memslot の削除に失敗した場合ゲスト RAM の mapping は意図的に残され、`Exited` でも残りうる。
+///
+/// # 観測できないもの
+/// - `KVM_RUN` や ioctl の中で D 状態のまま戻らないスレッドは `Running` のまま。期限で `Running` を返すだけで、強制回収する手段は無い。
+/// - カーネルが実際にページを解放したか。
+#[derive(Debug, Clone)]
+pub struct VcpuExitWatch {
+    cell: Arc<ExitCell>,
+}
+
+impl VcpuExitWatch {
+    /// 待たずに現在の状態を返す。
+    pub fn state(&self) -> VcpuExitState {
+        self.cell.state()
+    }
+
+    /// `deadline` まで終了を待つ。期限内に終わらなければ `Ok(Running)`。`deadline` が 0 または [`STOP_DEADLINE_MAX`] 超なら
+    /// `InvalidArgument`（待たない照会は [`VcpuExitWatch::state`]）。
+    pub fn wait(&self, deadline: Duration) -> Result<VcpuExitState, MicrovmError> {
+        if deadline.is_zero() || deadline > STOP_DEADLINE_MAX {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "exit wait deadline out of range",
+            ));
+        }
+        Ok(self.cell.wait_until(Instant::now() + deadline))
     }
 }
 
@@ -1289,7 +1625,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             ));
         }
         self.setup_boot_vcpu(loaded)?;
-        spawn_loop(self, started)
+        let serial = self.devices.serial.clone();
+        spawn_loop(self, started, serial)
     }
 }
 
@@ -1305,6 +1642,7 @@ mod lifecycle_tests {
         finish_after: Option<u32>,
         gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
         entered: Arc<AtomicBool>,
+        panic_after_gate: bool,
     }
 
     impl FakeBody {
@@ -1315,6 +1653,7 @@ mod lifecycle_tests {
                 finish_after: None,
                 gate: None,
                 entered: Arc::new(AtomicBool::new(false)),
+                panic_after_gate: false,
             }
         }
     }
@@ -1341,6 +1680,7 @@ mod lifecycle_tests {
                     open = cv.wait_timeout(open, Duration::from_millis(100)).unwrap().0;
                 }
             }
+            assert!(!self.panic_after_gate, "fake body panic");
             std::thread::sleep(Duration::from_millis(2));
             self.steps += 1;
             match self.finish_after {
@@ -1466,11 +1806,27 @@ mod lifecycle_tests {
         assert_eq!(queue_notify_of(&other_write), None);
     }
 
+    /// MVM-1・#3740: `RunningMicroVm::serial_console` は spawn_loop に渡したハンドルと同じバッファを指す。
+    #[test]
+    fn mvm1_3740_running_serial_console_shares_buffer() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let console = SerialConsole::new();
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now(), console.clone()).unwrap();
+        let mut dev = running.serial_console().port_device();
+        assert_eq!(dev.write(0, b"z"), crate::dispatch::PortIoOutcome::Handled);
+        assert_eq!(console.take_output().unwrap(), b"z");
+    }
+
     /// MVM-1・TASK-75.4.1: 停止要求で body が drop されてから報告が届く。
     #[test]
     fn mvm1_886_stop_requested_drops_body_before_return() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::Requested);
@@ -1496,7 +1852,12 @@ mod lifecycle_tests {
             }
         }
         let entered = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(Waiter(Arc::clone(&entered)), Instant::now()).unwrap();
+        let running = spawn_loop(
+            Waiter(Arc::clone(&entered)),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         assert!(
             wait_until(Duration::from_secs(10), || entered.load(Ordering::SeqCst)),
             "body did not enter step within 10s"
@@ -1513,7 +1874,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = FakeBody::new(&dropped);
         body.finish_after = Some(1);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(
             wait_until(Duration::from_secs(5), || dropped.load(Ordering::SeqCst)),
             "loop thread did not exit within the deadline"
@@ -1528,7 +1889,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = FakeBody::new(&dropped);
         body.finish_after = Some(3);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(wait_until(Duration::from_secs(5), || running.is_finished()));
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::GuestShutdown);
@@ -1541,7 +1902,12 @@ mod lifecycle_tests {
     fn mvm1_886_stop_deadline_validated() {
         for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
             let dropped = Arc::new(AtomicBool::new(false));
-            let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+            let running = spawn_loop(
+                FakeBody::new(&dropped),
+                Instant::now(),
+                SerialConsole::new(),
+            )
+            .unwrap();
             let e = running.stop(bad).unwrap_err();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "stop deadline out of range");
@@ -1557,7 +1923,7 @@ mod lifecycle_tests {
         let mut body = FakeBody::new(&dropped);
         body.gate = Some(Arc::clone(&gate));
         let entered = Arc::clone(&body.entered);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         // body が step の中（gate 待ち）に入ってから停止を要求する。
         assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
         let e = running.stop(Duration::from_millis(50)).unwrap_err();
@@ -1572,9 +1938,176 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_886_drop_without_stop_joins() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         drop(running);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn gated_body(dropped: &Arc<AtomicBool>) -> (FakeBody, Arc<(Mutex<bool>, Condvar)>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut body = FakeBody::new(dropped);
+        body.gate = Some(Arc::clone(&gate));
+        (body, gate)
+    }
+
+    fn open(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    /// MVM-1・REPAIR-5・#3744: 期限切れの stop の後、未終了なら期限で `Running`、終了後は `Exited`（解放後に記録）。
+    #[test]
+    fn mvm1_3744_watch_reports_exit_after_stop_timeout() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (body, gate) = gated_body(&dropped);
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        let e = running.stop(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(watch.state(), VcpuExitState::Running);
+        let t = Instant::now();
+        assert_eq!(
+            watch.wait(Duration::from_millis(50)).unwrap(),
+            VcpuExitState::Running
+        );
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        open(&gate);
+        let t = Instant::now();
+        let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(5)).unwrap() else {
+            panic!("expected Exited");
+        };
+        assert_eq!(r.reason, StopReason::Requested);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// MVM-1・#3744: 正常な stop の後は、事前に取った watch が stop の戻り値と同じ報告を返す。
+    #[test]
+    fn mvm1_3744_watch_exited_after_successful_stop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        let watch = running.exit_watch();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(watch.state(), VcpuExitState::Exited(report));
+    }
+
+    /// MVM-1・#3744: ゲスト起因の終了も `Exited` で報告される。
+    #[test]
+    fn mvm1_3744_watch_reports_guest_shutdown() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut body = FakeBody::new(&dropped);
+        body.finish_after = Some(3);
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
+        let watch = running.exit_watch();
+        let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(5)).unwrap() else {
+            panic!("expected Exited");
+        };
+        assert_eq!(r.reason, StopReason::GuestShutdown);
+        assert_eq!(r.stats.runs, 3);
+        drop(running);
+    }
+
+    /// MVM-1・#3744: `RunningMicroVm` を drop した後も watch は生きて終了を報告する。
+    #[test]
+    fn mvm1_3744_watch_survives_drop_of_running() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (body, gate) = gated_body(&dropped);
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        let opener = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                open(&gate);
+            }
+        });
+        drop(running);
+        assert!(matches!(
+            watch.wait(Duration::from_secs(5)).unwrap(),
+            VcpuExitState::Exited(_)
+        ));
+        opener.join().unwrap();
+    }
+
+    /// MVM-1・REPAIR-5・#3744: panic で unwind しても、解放後に `ExitedAbnormally` が記録される。
+    #[test]
+    fn mvm1_3744_watch_reports_abnormal_exit_on_panic() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (mut body, gate) = gated_body(&dropped);
+        body.panic_after_gate = true;
+        let entered = Arc::clone(&body.entered);
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
+        let watch = running.exit_watch();
+        assert!(running.stop(Duration::from_millis(50)).is_err());
+        open(&gate);
+        assert_eq!(
+            watch.wait(Duration::from_secs(5)).unwrap(),
+            VcpuExitState::ExitedAbnormally
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// REPAIR-5・#3744: 待ちの期限は 0 と上限超を即時に拒否する。
+    #[test]
+    fn mvm1_3744_watch_wait_deadline_validated() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        let watch = running.exit_watch();
+        for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
+            let t = Instant::now();
+            let e = watch.wait(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "exit wait deadline out of range");
+            assert!(t.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    /// #3744: `ExitCell` の記録は先勝ちで、異常終了の記録は `Exited` を上書きしない。
+    #[test]
+    fn mvm1_3744_exit_cell_first_write_wins() {
+        let cell = ExitCell::new();
+        assert_eq!(cell.state(), VcpuExitState::Running);
+        let report = StopReport {
+            reason: StopReason::Requested,
+            stats: RunStats::default(),
+            elapsed: Duration::from_millis(1),
+        };
+        cell.complete(report);
+        cell.mark_abnormal_if_running();
+        let other = StopReport {
+            reason: StopReason::GuestShutdown,
+            ..report
+        };
+        cell.complete(other);
+        assert_eq!(cell.state(), VcpuExitState::Exited(report));
+    }
+
+    /// #3744: 観測ハンドルはスレッド間で共有できる。
+    #[test]
+    fn mvm1_3744_exit_watch_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VcpuExitWatch>();
     }
 
     /// MVM-1: 起動中ハンドルはスレッド間で移動できる。
@@ -1644,6 +2177,36 @@ mod assemble_tests {
 
     type Mem = GuestMemory<HeapBacking>;
 
+    /// MVM-1・#3740: COM1 の PIO exit が UART に届き、範囲外は 0xFF のまま。
+    #[test]
+    fn mvm1_3740_device_bus_routes_com1_to_serial() {
+        use crate::exit::IoDirection;
+        let (mut b, _mem) = bus(1, 0);
+        let out = VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: COM1_BASE,
+            size: 1,
+            count: 3,
+            data: b"abc".to_vec(),
+        };
+        assert!(matches!(
+            b.dispatcher.dispatch(&out).unwrap(),
+            DispatchOutcome::Pio { .. }
+        ));
+        assert_eq!(b.serial.take_output().unwrap(), b"abc");
+        let far = VcpuExit::Io {
+            direction: IoDirection::In,
+            port: 0x400,
+            size: 1,
+            count: 1,
+            data: vec![],
+        };
+        match b.dispatcher.dispatch(&far).unwrap() {
+            DispatchOutcome::Unhandled { response, .. } => assert_eq!(response, vec![0xFF]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     fn read32(b: &mut Bus, addr: u64) -> DispatchOutcome {
         let exit = VcpuExit::Mmio {
             phys_addr: addr,
@@ -1696,6 +2259,122 @@ mod assemble_tests {
             plan_layout(1, 4096 + 1, 0, 0),
             "guest memory size must be a multiple of the host page size (at least 4096)",
         );
+    }
+
+    fn gr(start: u64, len: u64) -> GuestRange {
+        GuestRange::new(start, len).unwrap()
+    }
+
+    fn tss_at(start: u64) -> Vec<Region> {
+        vec![(RegionKind::Tss, gr(start, 0x3000))]
+    }
+
+    fn overlap_msg(r: Result<(), MicrovmError>) -> String {
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        e.message().to_string()
+    }
+
+    /// MVM-1・#3732: RAM との境界（1 バイト手前は通り、1 バイト食い込むと拒否）。
+    #[test]
+    fn mvm1_3732_reserved_region_ram_boundary() {
+        let res = tss_at(0x10_0000);
+        let ram = |len| vec![(RegionKind::GuestMemory, gr(0, len))];
+        assert!(check_reserved_regions(&res, &ram(0x10_0000)).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &ram(0x10_0001))),
+            "the TSS region overlaps guest memory"
+        );
+    }
+
+    /// MVM-1・#3732: MMIO の窓の直前・直後は通り、1 バイトでも食い込むと拒否。内包も拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_mmio_window_before_and_after() {
+        let base = 0x20_0000;
+        let res = tss_at(base);
+        let end = base + 0x3000;
+        let win = |s, l| vec![(RegionKind::VirtioMmio, gr(s, l))];
+        assert!(check_reserved_regions(&res, &win(base - 0x1000, 0x1000)).is_ok());
+        assert!(check_reserved_regions(&res, &win(end, 0x1000)).is_ok());
+        let msg = "the TSS region overlaps a virtio-mmio window";
+        for (s, l) in [
+            (base - 0xfff, 0x1000),
+            (end - 1, 0x1000),
+            (base + 0x1000, 0x100),
+        ] {
+            assert_eq!(overlap_msg(check_reserved_regions(&res, &win(s, l))), msg);
+        }
+    }
+
+    /// MVM-1・#3732: IOAPIC / LAPIC の窓との重なりは種別ごとの文言で拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_ioapic_lapic() {
+        let res = vec![(RegionKind::IdentityMap, gr(IOAPIC_MMIO_BASE, 0x1000))];
+        let io = vec![(RegionKind::Ioapic, gr(IOAPIC_MMIO_BASE, IOAPIC_MMIO_LEN))];
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &io)),
+            "the identity map page overlaps the IOAPIC window"
+        );
+        let res = tss_at(LAPIC_MMIO_BASE - 0x1000);
+        let lapic = vec![(RegionKind::Lapic, gr(LAPIC_MMIO_BASE, LAPIC_MMIO_LEN))];
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&res, &lapic)),
+            "the TSS region overlaps the LAPIC window"
+        );
+    }
+
+    /// MVM-1・#3732: TSS と identity map が 1 バイトでも重なると拒否、隣接は通る。
+    #[test]
+    fn mvm1_3732_reserved_regions_must_not_overlap_each_other() {
+        let mk = |tss| {
+            vec![
+                (RegionKind::IdentityMap, gr(0x10_0000, 0x1000)),
+                (RegionKind::Tss, gr(tss, 0x3000)),
+            ]
+        };
+        assert!(check_reserved_regions(&mk(0x10_1000), &[]).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&mk(0x10_0fff), &[])),
+            "the TSS region overlaps the identity map page"
+        );
+    }
+
+    /// MVM-1・#3732: 終端がちょうど 4 GiB は通り、1 バイト超えると拒否。
+    #[test]
+    fn mvm1_3732_reserved_region_below_4gib() {
+        assert!(check_reserved_regions(&tss_at((1 << 32) - 0x3000), &[]).is_ok());
+        assert_eq!(
+            overlap_msg(check_reserved_regions(&tss_at((1 << 32) - 0x3000 + 1), &[])),
+            "the TSS region must lie below 4 GiB"
+        );
+    }
+
+    /// MVM-1・#3732: 空区間と加算の溢れは panic せず `InvalidArgument`。
+    #[test]
+    fn mvm1_3732_guest_range_rejects_overflow_and_empty() {
+        for (s, l) in [(u64::MAX, 2), (0x1000, 0)] {
+            let e = GuestRange::new(s, l).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert_eq!(GuestRange::new(u64::MAX - 1, 1).unwrap().end, u64::MAX);
+    }
+
+    /// MVM-1・#3732: 既定・最大構成は通り、渡される予約領域は `assemble` が設定する定数と一致する。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_3732_default_layout_passes() {
+        assert!(plan_layout(32, VIRTIO_MMIO_BASE, 8, 0).is_ok());
+        assert!(plan_layout(1, 1 << 28, 1, 1).is_ok());
+        let (reserved, _) = system_regions(4096, &[]).unwrap();
+        assert_eq!(
+            reserved,
+            vec![
+                (RegionKind::IdentityMap, gr(0xfffb_c000, 0x1000)),
+                (RegionKind::Tss, gr(0xfffb_d000, 0x3000)),
+            ]
+        );
+        assert_eq!(IDENTITY_MAP_ADDR, 0xfffb_c000);
+        assert_eq!(TSS_ADDR, 0xfffb_d000);
     }
 
     /// MVM-1・TASK-75.2: x86_64 以外は最初の ioctl の前に `Unimplemented`。

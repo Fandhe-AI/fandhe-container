@@ -1,6 +1,6 @@
 //! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 6 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 7 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -37,7 +37,7 @@
 //! （SUP-9・SUP-3・#2440）。シグナルは送らない。稼働中のプロセスがあるときは `ContainerRunning` で拒否し、
 //! 同じ uid の別プロセスが稼働中コンテナの restart を黙って外せないようにする。
 //!
-//! 1 接続 1 要求。Hello はサーバが接続元の uid を検証した後に送る。クライアントは Hello を受けてから
+//! 原則 1 接続 1 要求（例外は上の ExecHandoverRequest が成功した接続の ExecCgroupNotify）。Hello はサーバが接続元の uid を検証した後に送る。クライアントは Hello を受けてから
 //! 「自分の期限 − 余裕」を `CLOCK_MONOTONIC` のナノ秒（同一ホストの別プロセスと比較できる絶対時刻）で要求に載せ、
 //! サーバは受信の遅れを含めてその絶対期限を送信期限にする（サーバの処理が遅れても期限は延びず、クライアントが
 //! `Timeout` を返した後にシグナルを届けない。REPAIR-5）。

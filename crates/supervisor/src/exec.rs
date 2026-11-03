@@ -1135,7 +1135,7 @@ pub struct ExecLaunchIo<'a> {
 }
 
 /// [`run_command_with_pidfd_output`] に、exec 子 cgroup の **作成成功の通知** `on_created` を足した入口
-/// （healthcheck の exec 専用 helper 用。SUP-4・SUP-6・REPAIR-5・#2441）。
+/// （healthcheck の exec 専用 helper と CLI の `exec` 用。SUP-4・SUP-6・REPAIR-5・#2441・#2626）。
 ///
 /// `on_created` は `mkdirat` の排他作成（既存の同名は `EEXIST` で失敗し採用しない）に成功した直後、worker を fork する
 /// 前に 1 回だけ呼ばれる。呼び出しプロセスの外側（supervisor）は、この通知を受けた cgroup だけを「今回の作成物」として

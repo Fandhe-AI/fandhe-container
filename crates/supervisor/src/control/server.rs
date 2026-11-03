@@ -9,7 +9,7 @@
 //! - accept の直後に `SO_PEERCRED` で接続元の uid を取り、実効 uid と違えば何も書かずに切断する
 //!   （多層防御。ソケットは 0600・0700 の `<id>/` の中にあり、別 uid は通常 connect 自体ができない）。
 //! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイト、ExecHandoverRequest〔#2626〕は
-//!   20 バイトの固定長）で、kind ごとの payload 長と
+//!   20 バイトの固定長。ExecCgroupNotify〔kind 7〕は保持期限 8 バイト + 名前 1〜56 バイトの可変長で、ガードだけが読む）で、kind ごとの payload 長と
 //!   一致しない・ヘッダの payload_len が上限（64）を超える場合は payload を読まずに拒否する。
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。

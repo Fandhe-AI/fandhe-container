@@ -77,6 +77,8 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 
 **残る窓**: (a) 通知の ack より前に CLI が消えた窓（作成から通知まで）は回収されない。cgroup は空なので exec 開始時の掃除（`sweep_before_create`）・delete 前の掃除（KillAll）が回収する。(b) supervisor 自身が消えた場合は回収されない（コンテナ cgroup ごと delete 前の掃除が回収する）。(c) 通知から回収までの間にコンテナが再 launch されて配置（instance）が変わった場合、旧 instance の cgroup は旧コンテナとともに消えるため `Absent` / `Failed` になる。(d) 新しい CLI と古い supervisor の組は、kind 6 の応答で pidfd が渡る一方、kind 7 を `Malformed` として閉じるため通知に失敗し、exec しない（fail-closed）。古い CLI と新しい supervisor の組は、通知なしで接続が切れるだけで何も回収せず従来どおり動く。(e) ガードスレッドは accept ループとは別のスレッドで、cgroup の `cgroup.kill` の待ち（最大 2 秒）は他の要求を止めない。
 
+**接続の複製が残らないことの確認**: 接続は `SOCK_CLOEXEC` で作られ（`sys` の `connect_bytes`）、CLI が fork する監査 sink の子と exec のコマンドの子は `close_range` で fd 3 以上を閉じる。fork のみで exec しない worker は接続の複製を持つが、PDEATHSIG で CLI と同時に終わる。したがって CLI の消滅後に複製が残って切断の検出を遅らせることは通常無い。万一残っても検出は保持期限（`--timeout` + 猶予）で有界。
+
 **却下案**: `PR_SET_PDEATHSIG` を `SIGTERM` に替えて内側の CLI が捕捉し子孫を止める案は、内側の CLI 自身が SIGKILL されると救えず、codex の要求（CLI 消滅時の回収）を満たさないため採らない。CLI が systemd のスコープを使って子孫ごと止める案は、子孫が既にコンテナ側の cgroup へ移っているため回収できない。supervisor が定期的に `exec-*` を走査して持ち主の無い cgroup を止める案は、持ち主の判定（pid の再利用）が曖昧で、走査間隔の分だけ `--timeout` を超えるため採らない。
 
 ## 4. 信頼境界の評価

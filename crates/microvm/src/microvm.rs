@@ -19,6 +19,13 @@
 //! 呼び忘れても drop が回収する。ゲスト起因の終了（シャットダウン・失敗）も [`StopReason`] で報告し、同じ後始末を通る。
 //! 停止要求は `run_once`（[`VCPU_POLL_INTERVAL`]）の合間のポーリングで見る。
 //!
+//! # シリアル（TASK-75.5・#3740・MVM-1）
+//! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
+//! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
+//! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
+//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。未実装（REPAIR-3）: IRQ 4・ゲスト入力。
+//! aarch64 には PIO が無く、組み立ての入口が `Unimplemented`。
+//!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
 //! 失敗はすべて `Result` の [`MicrovmError`]（機械可読な `code` と英語の `message`）で返し、panic しない。
 //! 解放は RAII で成り立つ: `assemble` の `Err` は戻る前に VM fd・irqchip・memslot と mmap・irqfd・vCPU fd と
@@ -73,6 +80,7 @@ use crate::interrupt::{
 };
 use crate::irq::IrqFd;
 use crate::sys::{self, GuestRamMap, SysError};
+use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{
     CONFIG_SPACE_SIZE, IgnoredAccess, MmioReadOutcome, MmioWriteOutcome, VirtioDevice,
@@ -483,11 +491,14 @@ impl QueueNotifyReport {
     }
 }
 
-/// MMIO dispatcher と block / net デバイス群。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
+/// MMIO / PIO dispatcher と block / net デバイス群と COM1 の UART。KVM に依存しない（`L` は割り込み線で、本番は [`IrqFd`]）。
+///
+/// UART（#3740・MVM-1）は常に COM1 へ登録し、`serial` はホストへ出力を渡す共有ハンドル。
 struct DeviceBus<B: BlockBackend, N: NetBackend, L> {
     dispatcher: ExitDispatcher,
     block: Vec<BoundDevice<VirtioBlock<B>, L>>,
     net: Vec<BoundDevice<VirtioNet<N>, L>>,
+    serial: SerialConsole,
 }
 
 impl<B: BlockBackend, N: NetBackend, L> DeviceBus<B, N, L> {
@@ -519,7 +530,11 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
             dispatcher: ExitDispatcher::new(),
             block: Vec::with_capacity(block.len()),
             net: Vec::with_capacity(net.len()),
+            serial: SerialConsole::new(),
         };
+        // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
+        bus.dispatcher
+            .register_pio(COM1_BASE, UART_PORT_LEN, bus.serial.port_device())?;
         let mut slots_iter = slots.iter();
         for backend in block {
             let slot = *slots_iter
@@ -845,7 +860,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         Ok(f(&mut t))
     }
 
-    /// `vcpu_index` の vCPU が返した `Io` / `Mmio` exit を MMIO dispatcher へ振り分ける。範囲外の index は `InvalidArgument`。
+    /// COM1 の UART の出力をホストが取り出すハンドル（clone）。ゲストの THR 出力（`console=ttyS0`）が溜まる。
+    ///
+    /// 上限つき（[`crate::uart::MAX_OUTPUT_BYTES`]）。中身は非信頼のゲスト出力なので、表示・記録時はエスケープすること。
+    /// 未実装（REPAIR-3）: IRQ 4 とゲスト入力。
+    pub fn serial_console(&self) -> SerialConsole {
+        self.devices.serial.clone()
+    }
+
+    /// `vcpu_index` の vCPU が返した `Io` / `Mmio` exit を MMIO / PIO dispatcher（COM1 の UART を含む）へ振り分ける。範囲外の index は `InvalidArgument`。
     pub fn handle_exit(
         &mut self,
         vcpu_index: usize,
@@ -1084,7 +1107,11 @@ fn classify_spawn_error(e: &std::io::Error) -> MicrovmError {
 }
 
 /// `body` を専用スレッドで駆動して [`RunningMicroVm`] を返す。
-fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicroVm, MicrovmError> {
+fn spawn_loop<T: VcpuLoopBody>(
+    body: T,
+    started: Instant,
+    serial: SerialConsole,
+) -> Result<RunningMicroVm, MicrovmError> {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let flag = Arc::clone(&stop);
@@ -1096,6 +1123,7 @@ fn spawn_loop<T: VcpuLoopBody>(body: T, started: Instant) -> Result<RunningMicro
         stop,
         done_rx: rx,
         handle: Some(handle),
+        serial,
     })
 }
 
@@ -1111,9 +1139,19 @@ pub struct RunningMicroVm {
     stop: Arc<AtomicBool>,
     done_rx: mpsc::Receiver<StopReport>,
     handle: Option<JoinHandle<()>>,
+    serial: SerialConsole,
 }
 
 impl RunningMicroVm {
+    /// COM1 の UART の出力を取り出すハンドル（clone）。
+    ///
+    /// vCPU スレッドが `MicroVm` を drop した後も clone がバッファを保持する。[`RunningMicroVm::stop`] は自身を
+    /// 消費するので、停止後に取り出したい呼び出し元は事前にこのハンドルを取っておくこと。停止の報告は vCPU スレッドの
+    /// 送信完了後なので、`stop` が `Ok` で戻れば停止までの出力は欠けない。中身は非信頼のゲスト出力（表示・記録時はエスケープ）。
+    pub fn serial_console(&self) -> SerialConsole {
+        self.serial.clone()
+    }
+
     /// 停止を要求し、`deadline` 以内に vCPU スレッドが終わって資源（VM fd・vCPU fd・memslot・mmap・irqfd）が解放されるのを待つ。
     ///
     /// `Ok` で戻った時点で、スレッドは join 済みで `MicroVm` は drop 済み。ゲスト起因で既に終わっていた場合は
@@ -1281,7 +1319,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             ));
         }
         self.setup_boot_vcpu(loaded)?;
-        spawn_loop(self, started)
+        let serial = self.devices.serial.clone();
+        spawn_loop(self, started, serial)
     }
 }
 
@@ -1451,11 +1490,27 @@ mod lifecycle_tests {
         assert_eq!(queue_notify_of(&other_write), None);
     }
 
+    /// MVM-1・#3740: `RunningMicroVm::serial_console` は spawn_loop に渡したハンドルと同じバッファを指す。
+    #[test]
+    fn mvm1_3740_running_serial_console_shares_buffer() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let console = SerialConsole::new();
+        let running = spawn_loop(FakeBody::new(&dropped), Instant::now(), console.clone()).unwrap();
+        let mut dev = running.serial_console().port_device();
+        assert_eq!(dev.write(0, b"z"), crate::dispatch::PortIoOutcome::Handled);
+        assert_eq!(console.take_output().unwrap(), b"z");
+    }
+
     /// MVM-1・TASK-75.4.1: 停止要求で body が drop されてから報告が届く。
     #[test]
     fn mvm1_886_stop_requested_drops_body_before_return() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::Requested);
@@ -1469,7 +1524,7 @@ mod lifecycle_tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = FakeBody::new(&dropped);
         body.finish_after = Some(3);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         assert!(wait_until(Duration::from_secs(5), || running.is_finished()));
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::GuestShutdown);
@@ -1482,7 +1537,12 @@ mod lifecycle_tests {
     fn mvm1_886_stop_deadline_validated() {
         for bad in [Duration::ZERO, STOP_DEADLINE_MAX + Duration::from_nanos(1)] {
             let dropped = Arc::new(AtomicBool::new(false));
-            let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+            let running = spawn_loop(
+                FakeBody::new(&dropped),
+                Instant::now(),
+                SerialConsole::new(),
+            )
+            .unwrap();
             let e = running.stop(bad).unwrap_err();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "stop deadline out of range");
@@ -1498,7 +1558,7 @@ mod lifecycle_tests {
         let mut body = FakeBody::new(&dropped);
         body.gate = Some(Arc::clone(&gate));
         let entered = Arc::clone(&body.entered);
-        let running = spawn_loop(body, Instant::now()).unwrap();
+        let running = spawn_loop(body, Instant::now(), SerialConsole::new()).unwrap();
         // body が step の中（gate 待ち）に入ってから停止を要求する。
         assert!(wait_until(Duration::from_secs(5), || entered.load(Ordering::SeqCst)));
         let e = running.stop(Duration::from_millis(50)).unwrap_err();
@@ -1513,7 +1573,12 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_886_drop_without_stop_joins() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let running = spawn_loop(FakeBody::new(&dropped), Instant::now()).unwrap();
+        let running = spawn_loop(
+            FakeBody::new(&dropped),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         drop(running);
         assert!(dropped.load(Ordering::SeqCst));
     }
@@ -1584,6 +1649,36 @@ mod assemble_tests {
     }
 
     type Mem = GuestMemory<HeapBacking>;
+
+    /// MVM-1・#3740: COM1 の PIO exit が UART に届き、範囲外は 0xFF のまま。
+    #[test]
+    fn mvm1_3740_device_bus_routes_com1_to_serial() {
+        use crate::exit::IoDirection;
+        let (mut b, _mem) = bus(1, 0);
+        let out = VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: COM1_BASE,
+            size: 1,
+            count: 3,
+            data: b"abc".to_vec(),
+        };
+        assert!(matches!(
+            b.dispatcher.dispatch(&out).unwrap(),
+            DispatchOutcome::Pio { .. }
+        ));
+        assert_eq!(b.serial.take_output().unwrap(), b"abc");
+        let far = VcpuExit::Io {
+            direction: IoDirection::In,
+            port: 0x400,
+            size: 1,
+            count: 1,
+            data: vec![],
+        };
+        match b.dispatcher.dispatch(&far).unwrap() {
+            DispatchOutcome::Unhandled { response, .. } => assert_eq!(response, vec![0xFF]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     fn read32(b: &mut Bus, addr: u64) -> DispatchOutcome {
         let exit = VcpuExit::Mmio {

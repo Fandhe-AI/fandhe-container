@@ -1,9 +1,11 @@
 //! 8250 / 16550 互換の最小 UART（COM1）のレジスタモデル（TASK-75.5・#3739・MVM-1・REPAIR-3。OS 非依存・`unsafe` なし）。
 //!
 //! ゲストカーネルのコンソール（`console=ttyS0`）の出力をホストが受け取るためのデバイスモデル。
-//! `crate::dispatch::ExitDispatcher::register_pio` に `(COM1_BASE, UART_PORT_LEN, ..)` で登録される予定で、
-//! 結線・ホストへの取り出し API の公開・実機前提試験は #3740 が担う。本モジュールはレジスタモデルと、
-//! KVM 不要の単体試験までを受け持つ。
+//! レジスタモデル（[`Uart16550`]）と、PIO バス・ホストで共有するハンドル（[`SerialConsole`]）を持つ。
+//! `microvm::DeviceBus`（Linux のみ）が [`SerialConsole::port_device`] を
+//! `crate::dispatch::ExitDispatcher::register_pio` に `(COM1_BASE, UART_PORT_LEN, ..)` で常に登録し、
+//! ホストは `microvm::MicroVm::serial_console` / `microvm::RunningMicroVm::serial_console` で得た
+//! [`SerialConsole`] から出力を取り出す（#3740）。実機前提試験は `tests/kvm_device.rs`。
 //!
 //! # レジスタ
 //! offset 0..8 の 8 ビットデバイス。THR / RBR・IER・IIR / FCR・LCR・MCR・LSR・MSR・SCR。LCR の DLAB（bit7）が
@@ -15,7 +17,9 @@
 //! # 出力バッファ
 //! THR への書き込みは上限（既定 [`MAX_OUTPUT_BYTES`]）つきのバッファへ溜める。溢れたら古いものから捨て、
 //! 捨てた数を [`UartStats::dropped_bytes`] に数える（ゲストが無限に書いてもホストの確保は上限で頭打ち。CORE-7）。
-//! [`Uart16550::take_output`] で取り出す。共有の持ち方（`Arc<Mutex<..>>` 等）は #3740 が決める。
+//! [`Uart16550::take_output`] / [`SerialConsole::take_output`] で取り出す。共有は `Arc<Mutex<..>>`（[`SerialConsole`]）で、
+//! vCPU スレッドが `MicroVm` を drop した後も clone したハンドルがバッファを保持する。バッファの中身はゲスト由来の
+//! 非信頼バイト列なので、呼び出し元が表示・記録するときはエスケープすること（ログへは出さない。`Debug` にも出さない）。
 //!
 //! # 外部入力の扱い
 //! offset・幅・値はゲストが決める非信頼入力。`offset >= 8` と 1 バイト以外の幅は `PortIoOutcome::Ignored`
@@ -29,6 +33,8 @@
 //! - ゲスト入力（RBR・DR・受信 FIFO）は対象外。RBR は常に 0。
 
 use std::collections::VecDeque;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use crate::dispatch::{PortIoDevice, PortIoOutcome};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -37,7 +43,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 pub const COM1_BASE: u16 = 0x3f8;
 /// UART が占めるポート数（offset 0..8）。
 pub const UART_PORT_LEN: u16 = 8;
-/// COM1 の IRQ 番号。本モジュールは割り込みを出さないため、将来仕様の記述用（#3740 以降）。
+/// COM1 の IRQ 番号。割り込みは出さない（#3740 の結線は PIO のみ）ため、将来仕様の記述用。
 pub const COM1_IRQ: u32 = 4;
 /// 出力バッファの上限バイト数（64 KiB）。
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -244,6 +250,85 @@ impl PortIoDevice for Uart16550 {
     }
 }
 
+fn poisoned() -> MicrovmError {
+    MicrovmError::new(MicrovmErrorCode::Internal, "uart lock poisoned")
+}
+
+/// [`Uart16550`] の共有ハンドル（PIO バス側とホスト側で同じバッファを見る。#3740・MVM-1）。
+///
+/// `microvm::DeviceBus` が [`SerialConsole::port_device`] を COM1 に登録し、ホストは clone を持って
+/// [`SerialConsole::take_output`] で THR 出力を取り出す。fd を持たないので VM の drop 順序に影響しない。
+/// lock が poison したら fail-closed（ホスト API は `Internal`、ゲスト側は `Ignored`）で、panic しない。
+#[derive(Clone)]
+pub struct SerialConsole {
+    inner: Arc<Mutex<Uart16550>>,
+}
+
+impl fmt::Debug for SerialConsole {
+    // ゲスト由来のバイト列（最大 64 KiB）を出さない。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SerialConsole").finish_non_exhaustive()
+    }
+}
+
+impl Default for SerialConsole {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SerialConsole {
+    /// 上限 [`MAX_OUTPUT_BYTES`] のコンソールを作る。
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Uart16550::new())),
+        }
+    }
+
+    /// 出力バッファの上限を指定して作る。範囲外は `InvalidArgument`。
+    pub fn with_output_capacity(capacity: usize) -> Result<Self, MicrovmError> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Uart16550::with_output_capacity(capacity)?)),
+        })
+    }
+
+    /// バッファのバイト列を全部取り出して空にする（長さは上限以下）。中身は非信頼のゲスト出力。
+    pub fn take_output(&self) -> Result<Vec<u8>, MicrovmError> {
+        let mut u = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(u.take_output())
+    }
+
+    /// 計数の写しを返す。
+    pub fn stats(&self) -> Result<UartStats, MicrovmError> {
+        let u = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(u.stats())
+    }
+
+    /// `ExitDispatcher::register_pio` へ渡すデバイス（同じバッファを共有する）を作る。
+    pub fn port_device(&self) -> Box<dyn PortIoDevice> {
+        Box::new(SharedUart(Arc::clone(&self.inner)))
+    }
+}
+
+/// dispatcher に登録する共有ラッパー。lock の poison には応答しない（read は dispatcher が 0xFF 埋め）。
+struct SharedUart(Arc<Mutex<Uart16550>>);
+
+impl PortIoDevice for SharedUart {
+    fn read(&mut self, offset: u16, data: &mut [u8]) -> PortIoOutcome {
+        match self.0.lock() {
+            Ok(mut u) => u.read(offset, data),
+            Err(_) => PortIoOutcome::Ignored,
+        }
+    }
+
+    fn write(&mut self, offset: u16, data: &[u8]) -> PortIoOutcome {
+        match self.0.lock() {
+            Ok(mut u) => u.write(offset, data),
+            Err(_) => PortIoOutcome::Ignored,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +447,29 @@ mod tests {
         }
         assert_eq!(u.stats().dropped_bytes, 2);
         assert_eq!(u.take_output().len(), MAX_OUTPUT_BYTES);
+    }
+
+    /// MVM-1・REPAIR-5・#3740: lock が poison したらホスト API は `Internal`、ゲスト側は応答しない。
+    #[test]
+    fn mvm1_3740_serial_console_poison_fails_closed() {
+        let console = SerialConsole::new();
+        let inner = Arc::clone(&console.inner);
+        let _ = std::thread::spawn(move || {
+            let _g = inner.lock().unwrap();
+            panic!("poison the uart lock");
+        })
+        .join();
+        assert_eq!(
+            console.take_output().unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+        assert_eq!(
+            console.stats().unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+        let mut dev = console.port_device();
+        let mut buf = [0u8; 1];
+        assert_eq!(dev.read(5, &mut buf), PortIoOutcome::Ignored);
+        assert_eq!(dev.write(0, b"a"), PortIoOutcome::Ignored);
     }
 }

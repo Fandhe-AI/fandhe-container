@@ -93,7 +93,6 @@ mod linux {
     use fandhe_container_supervisor::exec::{
         AuditedOutcome, ExecRequest, default_audit_sink, run_command_with_pidfd_env,
     };
-    use fandhe_container_supervisor::start_client::locate_systemd_run;
     use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
     use fandhe_container_supervisor::user_scope::user_manager_env;
 
@@ -101,6 +100,7 @@ mod linux {
     use super::super::args::{ExecArgs, GlobalArgs};
     use super::super::create_start::open_store;
     use super::super::list_logs::{record_op, store_open_failure};
+    use super::super::supervisor_start::locate as locate_systemd_run;
     use crate::error::CliError;
 
     /// pidfd の受け渡しに割り当てる上限（全体の期限の内側で打ち切る。REPAIR-5）。
@@ -275,6 +275,24 @@ mod linux {
     /// 子 cgroup の後始末（同 `CHILD_CGROUP_CLEANUP_TIMEOUT` 5 秒）の合計以上にし、通常の期限切れでは
     /// 子が自前の構造化 Timeout を出して cgroup を回収し終えてから親が待ち終えるようにする（REPAIR-5・SUP-6）。
     const PARENT_GRACE: Duration = Duration::from_secs(14);
+
+    /// 試験専用: 親の猶予を差し替える環境変数（10 進ミリ秒。feature `start-test-support` のときだけ読む）。
+    /// 期限超過の試験（SUP-6・REPAIR-5）が 14 秒待たずに済むようにするためで、本番のビルドにはこの環境変数を読む
+    /// コードが存在せず、最適化ビルドで feature を有効にするとコンパイルが止まる（`lib.rs`）。
+    #[cfg(feature = "start-test-support")]
+    const TEST_PARENT_GRACE_MS_ENV: &str = "FANDHE_CONTAINER_TEST_EXEC_PARENT_GRACE_MS";
+
+    /// 親が子の自前の Timeout 報告を待つ猶予（本番は [`PARENT_GRACE`] 固定）。
+    fn parent_grace() -> Duration {
+        #[cfg(feature = "start-test-support")]
+        if let Some(ms) = std::env::var(TEST_PARENT_GRACE_MS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_millis(ms);
+        }
+        PARENT_GRACE
+    }
     /// 親が子を `SIGKILL` した後の回収待ちの上限（無期限に待たない。REPAIR-5）。
     const REAP_BOUND: Duration = Duration::from_secs(2);
     /// systemd-run の stderr を一度に読む量と、捕捉を終えるのを待つ上限。
@@ -522,7 +540,7 @@ mod linux {
         }
         let deadline = started
             .checked_add(timeout)
-            .and_then(|d| d.checked_add(PARENT_GRACE))
+            .and_then(|d| d.checked_add(parent_grace()))
             .unwrap_or(started);
         let mut waited = loop {
             match child.try_wait() {

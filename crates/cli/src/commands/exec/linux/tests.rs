@@ -597,3 +597,118 @@ fn sup12_sup6_missing_options_document_rejects_before_handover() {
     assert!(source.calls.lock().unwrap().is_empty());
     assert!(fake.seen.lock().unwrap().is_empty());
 }
+
+/// 親追従の試験で、試験バイナリ自身を別の役で起動するための環境変数（`mid` / `leaf`）。
+const PDEATH_ROLE_ENV: &str = "FANDHE_CONTAINER_TEST_PDEATH_ROLE";
+/// 役が自分の pid を書き出すファイルの環境変数。
+const PDEATH_PIDFILE_ENV: &str = "FANDHE_CONTAINER_TEST_PDEATH_PIDFILE";
+
+/// プロセスが生きているか（`/proc/<pid>/stat` の状態が無い・ゾンビ・死亡なら生きていない）。
+fn pid_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+        })
+        .is_some_and(|state| !matches!(state, 'Z' | 'X'))
+}
+
+/// 期限つきで `path` の pid を読む（REPAIR-5）。
+fn wait_pid_file(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("pid file {} was not written", path.display());
+}
+
+/// SUP-6・CLI-1・REPAIR-5・REPAIR-12: 委譲スコープ内の子が `bind_to_parent_lifetime`（`PR_SET_PDEATHSIG` と親 pid の照合）を
+/// 通ったあとは、親が SIGKILL で死ぬと子も止まる。試験バイナリを 3 世代（orchestrator → mid → leaf）で起動し、
+/// leaf が本物の `bind_to_parent_lifetime` を呼んで待つ。mid を殺して leaf の消滅を期限つきで確かめる。
+/// 併せて、親 pid の環境変数が実際の親と違えば fail-closed で `Unavailable`（"the exec parent is gone"）になる。
+#[test]
+fn sup6_cli1_child_stops_when_parent_dies() {
+    let role = std::env::var(PDEATH_ROLE_ENV).ok();
+    let test_name = format!("{}::sup6_cli1_child_stops_when_parent_dies", module_path!());
+    let test_name = test_name
+        .split_once("::")
+        .map_or(test_name.as_str(), |(_, rest)| rest)
+        .to_owned();
+    let pidfile = std::env::var_os(PDEATH_PIDFILE_ENV).map(PathBuf::from);
+    let spawn_role = |role: &str, pidfile: &Path, parent_env: Option<String>| {
+        let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+            .env(PDEATH_ROLE_ENV, role)
+            .env(PDEATH_PIDFILE_ENV, pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(p) = parent_env {
+            cmd.env(PARENT_PID_ENV, p);
+        }
+        cmd.spawn().expect("spawn role")
+    };
+    match (role.as_deref(), pidfile) {
+        (Some("leaf"), Some(pidfile)) => {
+            // 本物の入口。親 pid の環境変数は mid が自分の pid を渡している。
+            bind_to_parent_lifetime().expect("bind to parent");
+            std::fs::write(&pidfile, std::process::id().to_string()).expect("write pid");
+            std::thread::sleep(Duration::from_secs(120));
+        }
+        (Some("mid"), Some(pidfile)) => {
+            let leaf_pid_file = pidfile.with_extension("leaf");
+            let mut leaf = spawn_role("leaf", &leaf_pid_file, Some(std::process::id().to_string()));
+            // leaf の pid を orchestrator へ転記してから待つ（leaf は mid の子）。
+            let pid = wait_pid_file(&leaf_pid_file);
+            std::fs::write(&pidfile, pid.to_string()).expect("write leaf pid");
+            let _ = leaf.wait();
+        }
+        (Some("mismatch"), _) => {
+            // 親 pid の環境変数が実際の親と違えば、設定後の照合で失敗する。
+            let err = bind_to_parent_lifetime().expect_err("must fail");
+            assert_eq!(err.code(), ErrorCode::Unavailable);
+            assert_eq!(err.message(), "the exec parent is gone");
+        }
+        _ => {
+            let base = TmpDir::new("pdeath");
+            let pidfile = base.0.join("leaf.pid");
+            // 実際の親と違う親 pid を渡した子は、確認で失敗して成功終了する（役の中の assert が通る）。
+            let mut mismatch =
+                spawn_role("mismatch", &pidfile.with_extension("mm"), Some("1".into()));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Some(st) = mismatch.try_wait().expect("try_wait") {
+                    break st;
+                }
+                assert!(Instant::now() < deadline, "mismatch role did not exit");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(status.success(), "mismatch role failed: {status:?}");
+            let mut mid = spawn_role("mid", &pidfile, None);
+            let leaf_pid = wait_pid_file(&pidfile);
+            assert!(pid_alive(leaf_pid), "leaf must be running before the kill");
+            mid.kill().expect("kill mid");
+            let _ = mid.wait();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pid_alive(leaf_pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let alive = pid_alive(leaf_pid);
+            if alive {
+                // 失敗しても孤児を残さない。
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(leaf_pid.to_string())
+                    .status();
+            }
+            assert!(!alive, "leaf {leaf_pid} must stop when its parent dies");
+        }
+    }
+}

@@ -36,7 +36,8 @@ use fandhe_container_supervisor::start_client::{
 const TEST_SYSTEMD_RUN_ENV: &str = "FANDHE_CONTAINER_TEST_SYSTEMD_RUN";
 
 /// systemd-run の解決。本番は固定候補だけで、試験専用 feature のときだけ環境変数で差し替えられる。
-fn locate(euid: u32) -> Result<PathBuf, OciRuntimeError> {
+/// `start` と `exec` の委譲スコープでの再実行（SUP-6）が共有する唯一の解決口。
+pub(super) fn locate(euid: u32) -> Result<PathBuf, OciRuntimeError> {
     #[cfg(feature = "start-test-support")]
     if let Some(p) = std::env::var_os(TEST_SYSTEMD_RUN_ENV) {
         let p = PathBuf::from(p);

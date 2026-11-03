@@ -396,6 +396,189 @@ fn cli1_exec_rejections_on_linux() {
     assert!(line.starts_with("{\"code\":\"INVALID_ARGUMENT\""), "{line}");
 }
 
+/// exec の再実行経路の結合試験が使う、偽の systemd-run の本体（SUP-6・REPAIR-12）。先頭 6 引数（`USER_SCOPE_WRAPPER_ARGS`）を
+/// 落として、同じディレクトリの `scenario`（sh）を source する。シナリオは再実行された子の代役で、残りの引数
+/// （自分の実行ファイルと元の argv）を `"$@"` として受け取る。
+#[cfg(target_os = "linux")]
+const FAKE_EXEC_WRAPPER_BODY: &str = r#"d=$(dirname "$0")
+[ "$1 $2 $3 $4 $5 $6" = "--user --scope --quiet -p Delegate=yes --" ] || exit 99
+shift 6
+start() { printf '\036fandhe-exec-start:%s\n' "$FANDHE_CONTAINER_EXEC_START_NONCE" >&2; }
+marker() { : > "$FANDHE_CONTAINER_EXEC_RESULT_FILE"; }
+noise() { echo 'Failed to connect to bus: No medium found' >&2; }
+. "$d/scenario""#;
+
+/// 親の猶予を短くする（試験専用 feature `start-test-support` の環境変数。期限超過の試験が 14 秒待たないため）。
+#[cfg(target_os = "linux")]
+const FAST_GRACE: (&str, &str) = ("FANDHE_CONTAINER_TEST_EXEC_PARENT_GRACE_MS", "300");
+
+/// 再実行経路の試験の土台: Running のコンテナ `c1` を持つ状態ルート、偽の systemd-run（シナリオ差し替え式）。
+#[cfg(target_os = "linux")]
+struct ExecRerun {
+    _tmp: TmpDir,
+    dir: std::path::PathBuf,
+    cli: std::path::PathBuf,
+    root_s: String,
+    scope: FakeScope,
+}
+
+#[cfg(target_os = "linux")]
+impl ExecRerun {
+    fn new(tag: &str) -> Self {
+        use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+        use fandhe_container_core::traits::{
+            ContainerId, ContainerStatus, GetStateRequest, StateStore as _, UpdateStateRequest,
+        };
+        let tmp = TmpDir::new(tag);
+        let dir = isolated_cli_dir(tag);
+        let cli = dir.join("fandhe-container");
+        let (root, root_s) = prepare_c1(&tmp, &cli);
+        // 再実行の前の検査（記録が Running）を通すため、CLI の create が作った記録を Running へ進める。
+        let store =
+            FileStateStore::open(StateRoot::from_override(root).expect("root")).expect("open");
+        let id = ContainerId::new("c1").expect("id");
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id, std::num::NonZeroU32::new(4242)),
+                rec.revision(),
+            ))
+            .expect("running");
+        let scope = FakeScope::new(&dir, &tmp);
+        install_fake_exe(&dir, "fake-systemd-run", FAKE_EXEC_WRAPPER_BODY);
+        Self {
+            _tmp: tmp,
+            dir,
+            cli,
+            root_s,
+            scope,
+        }
+    }
+
+    /// シナリオ（子の代役）を差し替えて `exec c1 /bin/true` を実行する。
+    fn run(&self, scenario: &str, timeout_secs: &str) -> Output {
+        std::fs::write(self.dir.join("scenario"), scenario).expect("scenario");
+        self.scope.run(
+            &self.cli,
+            &[
+                "--root",
+                &self.root_s,
+                "exec",
+                "--timeout",
+                timeout_secs,
+                "c1",
+                "/bin/true",
+            ],
+            &[(FAST_GRACE.0, std::ffi::OsStr::new(FAST_GRACE.1))],
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ExecRerun {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// SUP-6・CLI-1・REPAIR-12: 再実行した子がコマンドを走らせ終えたとき、親 CLI は子の終了コードをそのまま返す（0 と 3）。
+/// wrapper（systemd-run）が開始行の前に出した診断は捨て、stdout / stderr は空のまま。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup6_cli1_rerun_passes_through_child_exit_code() {
+    let t = ExecRerun::new("rr-exit");
+    for code in [0, 3] {
+        let out = t.run(&format!("noise; start; marker; exit {code}"), "30");
+        assert_eq!(out.status.code(), Some(code));
+        assert!(out.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    }
+}
+
+/// SUP-6・ERR-1・ERR-2・REPAIR-12: 子が出した構造化エラー（stderr の JSON 1 行）は開始行の後ろだけを一字一句転送し、
+/// 終了コードは子のもの。wrapper の診断は混ざらない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup6_err1_rerun_forwards_structured_error_after_start_line() {
+    let t = ExecRerun::new("rr-json");
+    let line = "{\"code\":\"NOT_FOUND\",\"message\":\"gone\"}";
+    let out = t.run(
+        &format!("noise; start; printf '%s\\n' '{line}' >&2; marker; exit 3"),
+        "30",
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{line}\n"));
+    assert!(out.stdout.is_empty());
+}
+
+/// SUP-6・ERR-2・REPAIR-12: wrapper 自身の失敗（開始行も目印も無いまま終了）は、終了コードがコマンドの失敗と重なる
+/// 7 でも UNAVAILABLE（9）の固定文言になり、wrapper の診断は漏れない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup6_err2_rerun_distinguishes_wrapper_failure_from_command_exit() {
+    let t = ExecRerun::new("rr-wrap");
+    let out = t.run("noise; exit 7", "30");
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"code\":\"UNAVAILABLE\",\"message\":\"the user scope wrapper failed before running the command\"}\n"
+    );
+    assert!(out.stdout.is_empty());
+    // 開始行はあるが目印が無い（子が最後まで走っていない）場合も wrapper の失敗として扱う。
+    let out = t.run("start; exit 7", "30");
+    assert_eq!(out.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the user scope wrapper failed"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// SUP-6・REPAIR-5・REPAIR-12: 期限（`--timeout 1` + 猶予 300ms）を超えて止まっている子は、親が SIGKILL して回収し、
+/// TIMEOUT（7）の構造化エラーで終わる。子の pid が残っていないことを `/proc` で確かめる。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup6_repair5_rerun_kills_and_reaps_child_after_deadline() {
+    let t = ExecRerun::new("rr-timeout");
+    let pidfile = t.dir.join("child.pid");
+    let started = Instant::now();
+    let out = t.run(
+        &format!("echo $$ > '{}'; exec sleep 300", pidfile.display()),
+        "1",
+    );
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"code\":\"TIMEOUT\",\"message\":\"exec timed out waiting for the user scope command\"}\n"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20), "bounded wait");
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pidfile")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child {pid} must be killed and reaped"
+    );
+}
+
+/// SUP-6・CLI-1・SEC-4・REPAIR-12: 偽の wrapper が本物の CLI を子として exec する（親 pid の環境変数だけ偽の値にする）と、
+/// 子は親の追従の確認で fail-closed に失敗し（UNAVAILABLE・9）、その構造化エラーを親が転送する。
+/// wrapper の失敗の固定文言ではなく子自身の文言であることで、子の経路を通ったことを照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup6_cli1_rerun_real_child_fails_closed_when_parent_pid_mismatches() {
+    let t = ExecRerun::new("rr-real");
+    let out = t.run("FANDHE_CONTAINER_EXEC_PARENT_PID=1 exec \"$@\"", "30");
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"code\":\"UNAVAILABLE\",\"message\":\"the exec parent is gone\"}\n"
+    );
+    assert!(out.stdout.is_empty());
+}
+
 /// CLI-1・NET-6（#3066）: network は引数の過不足・未知のサブコマンド・未知オプションで使い方エラー（2）。
 /// グローバルの `--pasta-path` は create 以外では使い方エラーのまま。
 #[test]

@@ -1505,29 +1505,7 @@ fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let image = |entry_code: &[u8]| {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        let payload = 5 * 512;
-        for (i, b) in img[payload..].iter_mut().enumerate() {
-            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-        }
-        img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-        img
-    };
+    let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
     let assemble = || -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
         MicroVm::assemble(
             &dev,

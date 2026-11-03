@@ -29,11 +29,15 @@
 //! 「core」役は共有境界 crate の `UdsListener` を試験本体が担う（core 側の起動経路 `BackendKind` は #1869 の設計の 4.9 で未結線）。
 //! 層 A は偽バックエンドで既定集合（unix・KVM 不要）、層 B は実バイナリ + 実 KVM で `#[ignore]`（Linux x86_64・`/dev/kvm`）。
 //!
+//! # 実装済み（#3747。PLUG-1・REPAIR-3・REPAIR-5）
+//! SIGTERM で新しい要求の受付をやめ（[`frame_loop::serve_until`]）、`stop_all` で実行中の VM を期限つきに止め、
+//! 結果行（`stopped=` / `failed=` / `remaining=` / `detached=`）を出して終わる。回収しきれなければ終了コード 5。
+//! 詳細は `main.rs` の doc。受信フラグの登録は [`sys`]（#3746）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //! - kill / delete / state、create と start の分離、block / net の指定、2 台以上の vCPU は `UNIMPLEMENTED`
 //!   （型つき本体と合わせて #1869 の設計）。実 Linux カーネルの起動完走は保証しない（microvm 側の未実装）。
-//! - SIGTERM でのグレースフルシャットダウン（実行中 VM の停止）は未実装。受信フラグの登録は [`sys`]（#3746）にあるが、
-//!   受付の停止・`stop_all` との結線は #3747 で、それまで終了は相手の切断（EOF）のみ。
+//! - SIGKILL では後始末が効かない。Windows には SIGTERM の経路が無い（SIGINT・SIGHUP も対象外）。
 //! - 要求本体 `Vec<String>` は暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。
 //! - core 側からの plugin-microvm 起動経路（`BackendKind` への追加）は #1869 の設計の 4.9 で扱う。
 //! - 非 unix ビルドでは既定パス解決・接続が `Unimplemented` となり fail-closed になる。

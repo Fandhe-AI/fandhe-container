@@ -6,13 +6,10 @@
 //! 方式は `fandhe-container-plugin-macos` の `sys.rs`（TASK-115.5・#389）を写したもの。
 //!
 //! # 呼び出し文脈
+//! `main.rs` が接続前に [`install_sigterm_flag`] を 1 回呼び、得たフラグを `frame_loop::serve_until` へ渡す
+//! （#3747）。フラグが立つと受付をやめ、`stop_all` で起動中の VM を止めてから終了する。
 //! `open_regular_nofollow` は `adapter::read_image_blocking`（`start` のイメージ読み込み）から呼ばれ、
 //! 祖先の symlink を `openat(O_NOFOLLOW)` の要素ごとの解決で拒否する（SEC-1。#3748）。
-//!
-//! SIGTERM 側:
-//! 現時点では結線されていない（受信フラグを登録する部品だけを置く）。#3747 で `main.rs` が接続前に
-//! [`install_sigterm_flag`] を 1 回呼び、得たフラグを `frame_loop` の受信ループ（`serve_until`。#3747 で追加予定）へ
-//! 渡し、フラグが立ったら `stop_all` で起動中の VM を止めてから終了する予定である。
 //! core 自身の終了要求は SIGTERM ではなく接続切断（EOF）で伝わる。
 //!
 //! 製品の依存に `libc` は入れず、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
@@ -46,7 +43,7 @@
 //!
 //! # 限界（残存リスク）
 //! SIGKILL は捕捉できない。`stop_all` が送信側の猶予内に終わらず SIGKILL された場合、VM は残留しうる
-//! （#3747・#3722 の範囲）。SIGINT / SIGHUP は対象外。結線前（#3747 まで）はフラグが立っても誰も見ない。
+//! （#3722 の範囲）。SIGINT / SIGHUP は対象外。
 //!
 //! # 共有ではなく写した理由（#3748）
 //! 要素ごとの `openat` の辿り方は `fandhe-container-plugin` の `open_dir_nofollow`（#1309）と同じ方式を写した。

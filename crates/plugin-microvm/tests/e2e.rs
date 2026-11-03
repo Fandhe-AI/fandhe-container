@@ -7,7 +7,8 @@
 //!
 //! - 層 A（既定集合・unix・KVM 不要）: plugin 役のスレッドが `main.rs` と同じ順
 //!   （peer 認証つき connect → `MicrovmRuntimeAdapter` → `serve` → `stop_all`）を偽バックエンドで実行し、実 UDS 上で
-//!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。
+//!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。あわせて `serve_until` と停止フラグ
+//!   （SIGTERM 相当。#3747）で、実行中 VM の停止と、停止に入った後に届いた要求が処理されないことを照合する。
 //! - 層 B（`#[ignore]`・Linux x86_64・`/dev/kvm` が要る実機前提）: 実バイナリを spawn し、本物の `KvmBackend` で合成
 //!   bzImage を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
 //!
@@ -112,6 +113,7 @@ fn expect_ok(msg: ControlMessage<Vec<String>>, id: u64) -> Vec<String> {
 mod mock_core {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -119,9 +121,10 @@ mod mock_core {
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, UdsListener};
     use fandhe_container_plugin_microvm::adapter::{
-        BootSpec, MicrovmBackend, MicrovmRuntimeAdapter, STOP_ALL_BUDGET, StopAllReport,
+        BootSpec, DetachedState, MicrovmBackend, MicrovmRuntimeAdapter, STOP_ALL_BUDGET,
+        StopAllReport,
     };
-    use fandhe_container_plugin_microvm::frame_loop::{LoopExit, serve};
+    use fandhe_container_plugin_microvm::frame_loop::{LoopExit, serve, serve_until};
 
     const ACCEPT_WAIT: Duration = Duration::from_secs(20);
     const OUTCOME_WAIT: Duration = Duration::from_secs(30);
@@ -142,6 +145,10 @@ mod mock_core {
         pub starts: Vec<StartRecord>,
         pub stops: Vec<(u32, Duration)>,
         pub start_err: Option<MicrovmErrorCode>,
+        /// 設定すると stop がそのコードで失敗する（`DeadlineExceeded` で期限切れの切り離しを模擬。#3745）。
+        pub stop_err: Option<MicrovmErrorCode>,
+        /// 終了を観測済みにした VM の id（後から vCPU スレッドが終わった模擬。#3745）。
+        pub exited: std::collections::BTreeSet<u32>,
     }
 
     /// 起動・停止の引数を記録する偽バックエンド（adapter の `#[cfg(test)]` 版は非公開のため独自に持つ）。
@@ -149,6 +156,7 @@ mod mock_core {
 
     impl MicrovmBackend for FakeBackend {
         type Running = u32;
+        type ExitWatch = u32;
 
         fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
             let mut r = self.0.lock().expect("lock");
@@ -166,8 +174,24 @@ mod mock_core {
         }
 
         fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
-            self.0.lock().expect("lock").stops.push((vm, deadline));
-            Ok("requested")
+            let mut r = self.0.lock().expect("lock");
+            r.stops.push((vm, deadline));
+            match r.stop_err {
+                Some(code) => Err(MicrovmError::new(code, "fake stop")),
+                None => Ok("requested"),
+            }
+        }
+
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+
+        fn exit_state(&self, watch: &u32) -> DetachedState {
+            if self.0.lock().expect("lock").exited.contains(watch) {
+                DetachedState::Released
+            } else {
+                DetachedState::Pending
+            }
         }
     }
 
@@ -218,6 +242,117 @@ mod mock_core {
         }
     }
 
+    /// 停止（`stop`）を試験が解放するまで待たせる偽バックエンド（#3747）。
+    /// `start` は連番を返して記録し、`stop` は呼ばれたことを `stopping` で知らせ、`release` を期限つきで待つ。
+    struct GatedBackend {
+        rec: Arc<Mutex<Record>>,
+        stopping: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl MicrovmBackend for GatedBackend {
+        type Running = u32;
+        type ExitWatch = u32;
+
+        fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
+            let mut r = self.rec.lock().expect("lock");
+            r.starts.push(StartRecord {
+                vcpus: spec.vcpus,
+                mem_bytes: spec.mem_bytes,
+                kernel: spec.kernel,
+                initrd: spec.initrd,
+                cmdline: spec.cmdline,
+            });
+            Ok(u32::try_from(r.starts.len()).expect("small"))
+        }
+
+        fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
+            self.rec.lock().expect("lock").stops.push((vm, deadline));
+            let _ = self.stopping.send(());
+            // STOP_ALL_BUDGET（4 秒）より短い期限で待つ（REPAIR-5）。
+            let _ = self.release.recv_timeout(Duration::from_secs(3));
+            Ok("requested")
+        }
+
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+
+        fn exit_state(&self, _watch: &u32) -> DetachedState {
+            DetachedState::Pending
+        }
+    }
+
+    /// 停止フラグつきの層 A（`serve_until`）。
+    pub struct Shutdown {
+        pub dir: TempDir,
+        pub stream: UdsStream,
+        pub record: Arc<Mutex<Record>>,
+        pub flag: Arc<AtomicBool>,
+        /// `stop` に入ったことの通知。
+        pub stopping: Receiver<()>,
+        /// `stop` の解放。
+        pub release: Sender<()>,
+        rx: Receiver<Outcome>,
+        plugin: JoinHandle<()>,
+    }
+
+    impl Shutdown {
+        pub fn start() -> Self {
+            let dir = TempDir::new();
+            let sock = dir.0.join("p.sock");
+            let listener = UdsListener::bind(&sock).expect("bind");
+            let record = Arc::new(Mutex::new(Record::default()));
+            let flag = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = channel();
+            let (stopping_tx, stopping) = channel();
+            let (release, release_rx) = channel();
+            let backend = GatedBackend {
+                rec: Arc::clone(&record),
+                stopping: stopping_tx,
+                release: release_rx,
+            };
+            let fl = Arc::clone(&flag);
+            let plugin = std::thread::spawn(move || {
+                let mut obs = JsonLinesPeerAuthObserver::new();
+                let mut stream =
+                    UdsStream::connect(&sock, Duration::from_secs(5), &mut obs).expect("connect");
+                let mut adapter = MicrovmRuntimeAdapter::new(backend);
+                let outcome = serve_until(&mut stream, &mut adapter, &fl);
+                let report = adapter.stop_all(STOP_ALL_BUDGET);
+                let _ = tx.send((outcome, report));
+            });
+            let mut obs = JsonLinesPeerAuthObserver::new();
+            let stream = listener.accept(ACCEPT_WAIT, &mut obs).expect("accept");
+            Self {
+                dir,
+                stream,
+                record,
+                flag,
+                stopping,
+                release,
+                rx,
+                plugin,
+            }
+        }
+
+        /// plugin 役の終了結果を期限つきで受け取る（裸の join は使わない。REPAIR-5）。
+        pub fn outcome(self) -> Outcome {
+            let Self {
+                dir: _dir,
+                stream: _stream,
+                rx,
+                plugin,
+                ..
+            } = self;
+            let out = rx
+                .recv_timeout(OUTCOME_WAIT)
+                .expect("plugin role did not finish within deadline");
+            plugin.join().expect("plugin thread");
+            out
+        }
+    }
+
     /// `main.rs` と同じ順序（connect → adapter → serve → stop_all）。
     fn run_plugin(sock: &Path, record: Arc<Mutex<Record>>, tx: &Sender<Outcome>) {
         let mut obs = JsonLinesPeerAuthObserver::new();
@@ -231,6 +366,54 @@ mod mock_core {
 }
 
 const KERNEL: &[u8] = b"synthetic-kernel-bytes";
+
+/// PLUG-1・REPAIR-5: 停止フラグ（SIGTERM 相当）が立つと実行中 VM を `stop_all` で止めて抜け、
+/// 停止に入った後に届いた要求は処理されない（応答なし・start は 1 回のまま）。
+#[test]
+fn task117_plug1_repair5_shutdown_flag_stops_running_vm_and_ignores_later_requests() {
+    use fandhe_container_plugin::PluginErrorCode;
+    use fandhe_container_plugin_microvm::adapter::StopAllReport;
+    use fandhe_container_plugin_microvm::frame_loop::{IDLE_POLL, LoopExit};
+    use std::sync::atomic::Ordering;
+
+    let mut e = mock_core::Shutdown::start();
+    let kernel = e.dir.file("k.bin", KERNEL);
+    let start = s(&["start", "vm1", &kernel, "", "", "1", "64"]);
+    assert_eq!(expect_ok(call(&mut e.stream, 1, start), 1), s(&["running"]));
+
+    e.flag.store(true, Ordering::SeqCst);
+    // 受信ループを抜けて stop_all が stop に入ったことを待つ（検知の遅れは最大 IDLE_POLL）。
+    e.stopping
+        .recv_timeout(IDLE_POLL + Duration::from_secs(3))
+        .expect("stop_all did not start after the flag was set");
+
+    // stop の中で止まっている間に 2 台目の start を送る。処理されないので応答は来ない。
+    let second = s(&["start", "vm2", &kernel, "", "", "1", "64"]);
+    e.stream
+        .write_frame(&request(2, second), RpcTimeout::default())
+        .expect("write");
+    let err = e
+        .stream
+        .read_frame(RpcTimeout::new(Duration::from_millis(1500)).expect("timeout"))
+        .expect_err("no response may arrive after shutdown");
+    assert_eq!(err.code(), PluginErrorCode::Timeout);
+
+    e.release.send(()).expect("release stop");
+    let record = std::sync::Arc::clone(&e.record);
+    let (exit, report) = e.outcome();
+    assert!(matches!(exit, Ok(LoopExit::ShutdownRequested)), "{exit:?}");
+    assert_eq!(
+        report,
+        StopAllReport {
+            stopped: 1,
+            failed: 0,
+            remaining: 0
+        }
+    );
+    let r = record.lock().expect("lock");
+    assert_eq!(r.starts.len(), 1, "second start must not be processed");
+    assert_eq!(r.stops.len(), 1);
+}
 
 #[test]
 fn task117_4_plug1_mvm1_ping_start_stop_roundtrip_via_uds() {
@@ -350,6 +533,66 @@ fn task117_4_plug1_backend_start_failure_maps_to_error_frame_and_keeps_connectio
         }
         other => panic!("unexpected {other:?}"),
     }
+    let _ = e.finish();
+}
+
+/// 停止期限切れで切り離した VM は、終了を観測するまで枠を返さず、観測後の start で枠が回収される（#3745・PLUG-1・REPAIR-5）。
+#[test]
+fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_uds() {
+    use fandhe_container_microvm::error::MicrovmErrorCode;
+    use fandhe_container_plugin::PluginErrorCode;
+    use fandhe_container_plugin_microvm::adapter::MAX_VMS;
+
+    let mut e = mock_core::E2e::start();
+    let kernel = e.dir.file("k.bin", KERNEL);
+    e.record.lock().expect("lock").stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+    let mut id = 1u64;
+    for i in 0..MAX_VMS {
+        let name = format!("vm{i}");
+        let start = s(&["start", &name, &kernel, "", "", "1", "64"]);
+        assert_eq!(
+            expect_ok(call(&mut e.stream, id, start), id),
+            s(&["running"])
+        );
+        id += 1;
+        match call(&mut e.stream, id, s(&["stop", &name])) {
+            ControlMessage::Error { error, .. } => {
+                assert_eq!(error.code(), PluginErrorCode::Timeout);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        id += 1;
+    }
+    // 終了未観測の間は上限で拒否され続け、backend は追加で起動されない。
+    for _ in 0..2 {
+        let over = s(&["start", "over", &kernel, "", "", "1", "64"]);
+        match call(&mut e.stream, id, over) {
+            ControlMessage::Error { error, .. } => {
+                assert_eq!(error.code(), PluginErrorCode::ResourceExhausted);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        id += 1;
+        assert_eq!(e.record.lock().expect("lock").starts.len(), MAX_VMS);
+    }
+    // vCPU スレッドの終了を観測できたら、次の start で枠が回収されて通る。
+    e.record.lock().expect("lock").exited.insert(1);
+    let again = s(&["start", "new", &kernel, "", "", "1", "64"]);
+    assert_eq!(
+        expect_ok(call(&mut e.stream, id, again), id),
+        s(&["running"])
+    );
+    id += 1;
+    assert_eq!(e.record.lock().expect("lock").starts.len(), MAX_VMS + 1);
+    // 回収は観測した 1 件だけで、残りは再び上限に当たる。
+    let over = s(&["start", "over2", &kernel, "", "", "1", "64"]);
+    match call(&mut e.stream, id, over) {
+        ControlMessage::Error { error, .. } => {
+            assert_eq!(error.code(), PluginErrorCode::ResourceExhausted);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    e.record.lock().expect("lock").stop_err = None;
     let _ = e.finish();
 }
 

@@ -377,8 +377,11 @@ fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<
     if trigger == "disconnect" && pool.is_stopping() {
         trigger = "relaunch";
     }
+    // 回収に実際に掛かった時間を計測して観測へ渡す（REPAIR-4）。
+    let started = Instant::now();
     let outcome = pool.reclaimer.reclaim(&frame.name);
-    pool.observer.record_exec_reclaim(trigger, outcome);
+    pool.observer
+        .record_exec_reclaim(trigger, outcome, started.elapsed());
 }
 
 /// ExecCgroupNotify を期限内に読んで検証し、ack を返す。通知が来ない・壊れている場合は `None`（回収しない）。
@@ -429,11 +432,14 @@ fn hold(
     frame: &ExecCgroupNotifyFrame,
     limits: &ExecGuardLimits,
 ) -> &'static str {
+    // `Instant` を単調時計より先に読む（`server::absolute_deadline` と同じ順）。間で止まっても
+    // 残り時間は後の時刻で短く測られ、先の基準へ足すので、期限は早まる側にだけずれる。
+    let base = Instant::now();
     let remaining = crate::sys::monotonic_now_ns()
         .ok()
         .and_then(|now| frame.hold.remaining_from(now).ok())
         .unwrap_or(Duration::ZERO);
-    let until = Instant::now()
+    let until = base
         .checked_add(remaining)
         .and_then(|t| t.checked_add(limits.hold_grace));
     let Some(until) = until else {

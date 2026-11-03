@@ -98,10 +98,14 @@ impl Drop for TempRoot {
 #[derive(Default)]
 struct FakeReclaimer {
     calls: Mutex<Vec<String>>,
+    /// 回収に掛かる時間の模擬（既定は 0）。
+    delay: Mutex<Duration>,
 }
 
 impl ExecCgroupReclaimer for FakeReclaimer {
     fn reclaim(&self, name: &ExecCgroupName) -> ReclaimOutcome {
+        let delay = *self.delay.lock().unwrap();
+        std::thread::sleep(delay);
         self.calls.lock().unwrap().push(name.as_str().to_owned());
         ReclaimOutcome::Removed
     }
@@ -141,6 +145,7 @@ struct Rig {
     process: Option<ControlledProcess>,
     server: Option<ControlServer>,
     reclaimer: Arc<FakeReclaimer>,
+    observer: Arc<ControlObserver>,
     pool: Option<Arc<ExecGuardPool>>,
     _listener: ControlListener,
 }
@@ -186,7 +191,7 @@ impl Rig {
             slot,
             effective_uid().unwrap(),
             ServeConfig::default(),
-            observer,
+            Arc::clone(&observer),
             pool.clone(),
         )
         .unwrap();
@@ -196,6 +201,7 @@ impl Rig {
             process,
             server: Some(server),
             reclaimer,
+            observer,
             pool,
             _listener: listener,
         }
@@ -313,6 +319,37 @@ fn sup6_repair5_guard_reclaims_notified_name_when_connection_drops() {
     // 追加の呼び出しは起きない（1 回だけ）。
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(rig.reclaimer.calls().len(), 1);
+}
+
+/// REPAIR-4・SUP-6・#2626: 回収に 50ms 掛かる回収役のとき、観測へ記録される `exec_cgroup_reclaim` のレイテンシは
+/// 0 でなく遅延以上になる（実測した経過時間を渡す。固定の 0 を渡さない）。
+#[test]
+fn repair4_sup6_guard_records_actual_reclaim_latency() {
+    let rig = Rig::start("latency", true, true);
+    let delay = Duration::from_millis(50);
+    *rig.reclaimer.delay.lock().unwrap() = delay;
+    let handover = rig.obtain(PID, Duration::from_secs(2)).unwrap();
+    handover
+        .notify_created(&name("exec-1234-0"), hold_in(60.0))
+        .unwrap();
+    drop(handover);
+    assert_eq!(rig.reclaimer.wait_for(1, Duration::from_secs(3)).len(), 1);
+    let op = fandhe_container_core::observability::OpName::new("exec_cgroup_reclaim").unwrap();
+    // 記録は回収役の戻りの直後に行われるため、現れるまで短く待つ。
+    let until = Instant::now() + Duration::from_secs(3);
+    let stats = loop {
+        if let Some(s) = rig.observer.recorder().snapshot_op(&op) {
+            break s;
+        }
+        assert!(Instant::now() < until, "reclaim was not recorded");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(stats.success(), 1);
+    let max = stats.latency().expect("latency summary").max();
+    assert!(
+        max >= delay && max < Duration::from_secs(3),
+        "recorded latency {max:?} must cover the {delay:?} reclaim"
+    );
 }
 
 /// SUP-6・#2626: 通知しないまま接続を drop した場合は何も回収しない（cgroup の作成前に死んだ。残骸は既存の掃除が担う）。

@@ -1177,26 +1177,6 @@ fn kvm_device_ap_starts_on_init_sipi() {
         }
     };
 
-    // 合成 bzImage（kvm_device_boot_vcpu_starts_at_kernel_entry と同じ header）。
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
     // BSP（long mode）: ICR_HIGH に宛先 APIC ID 1、ICR_LOW に INIT（assert）と SIPI（ベクタ 1）を書き、port 0x10 へ 0xAA。
     let bsp: Vec<u8> = vec![
         0xBF, 0x10, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00310
@@ -1207,7 +1187,8 @@ fn kvm_device_ap_starts_on_init_sipi() {
         0xB0, 0xAA, 0xE6, 0x10, // mov al,0xAA ; out 0x10,al
         0xEB, 0xFE, // jmp $
     ];
-    img[payload + 0x200..payload + 0x200 + bsp.len()].copy_from_slice(&bsp);
+    // 合成 bzImage（正本 support/bzimage.rs の synthetic_bzimage。BSP のコードを 64-bit エントリへ置く）。
+    let img = bzimage::synthetic_bzimage(&bsp);
     // AP（real mode・CS=0x0100・IP=0）: CPUID.1 の EBX[31:24]（初期 APIC ID）を port 0x11 へ出す。
     let ap: Vec<u8> = vec![
         0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1

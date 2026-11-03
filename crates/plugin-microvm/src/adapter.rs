@@ -30,7 +30,7 @@
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
 //!   期限切れで切り離した VM は [`MAX_VMS`] の計数に残し続け（`detached`）、枠を空けない（資源上限。REPAIR-5）。枠が尽きたら plugin の再起動で回復する。
 //! - 応答しないファイルシステム上のイメージ読み込みは期限で打ち切れない。祖先ディレクトリの symlink は検査しない（最終要素のみ）。
-//! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは #713。
+//! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
 
 use std::collections::BTreeMap;
 use std::io::Read;

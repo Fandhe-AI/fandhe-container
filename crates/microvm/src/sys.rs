@@ -167,10 +167,8 @@ pub(crate) mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_FPU: u64 = super::iow(super::KVMIO, 0x8d, 416);
     /// `_IOR(KVMIO, 0x8e, struct kvm_lapic_state)`（1024 バイト）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_GET_LAPIC: u64 = super::ior(super::KVMIO, 0x8e, 1024);
     /// `_IOW(KVMIO, 0x8f, struct kvm_lapic_state)`。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub const KVM_SET_LAPIC: u64 = super::iow(super::KVMIO, 0x8f, 1024);
     /// `_IO(KVMIO, 0x47)`（引数は `unsigned long` の値渡し。VM fd）。
     pub const KVM_SET_TSS_ADDR: u64 = super::io(super::KVMIO, 0x47);
@@ -466,13 +464,11 @@ pub(crate) struct KvmFpu {
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct KvmLapicState {
     pub regs: [u8; 1024],
 }
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for KvmLapicState {
     fn default() -> Self {
         KvmLapicState { regs: [0; 1024] }
@@ -1794,7 +1790,6 @@ pub(crate) fn kvm_set_fpu(vcpu: BorrowedFd<'_>, fpu: &KvmFpu) -> Result<(), SysE
 /// `KVM_GET_LAPIC`（vCPU fd）で LAPIC レジスタ面を読む（x86_64 のみ）。in-kernel irqchip
 /// （`KVM_CREATE_IRQCHIP`）が無いと EINVAL になる。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_get_lapic(vcpu: BorrowedFd<'_>) -> Result<KvmLapicState, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -1815,7 +1810,6 @@ pub(crate) fn kvm_get_lapic(vcpu: BorrowedFd<'_>) -> Result<KvmLapicState, SysEr
 
 /// `KVM_SET_LAPIC`（vCPU fd）で LAPIC レジスタ面を書く（x86_64 のみ。in-kernel irqchip が前提）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn kvm_set_lapic(vcpu: BorrowedFd<'_>, lapic: &KvmLapicState) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

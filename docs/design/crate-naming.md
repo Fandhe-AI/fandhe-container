@@ -55,6 +55,8 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 
 〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で core と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ（2026-10-15 に「推奨」から確定。#4 のコメント）。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
 
+追補（2026-11-03・[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)）: microvm（#8）は OS ごとのバックエンド（Linux の KVM、macOS の Hypervisor.framework〔TASK-192〕、将来の Windows の WHP）を `cfg(target_os)` で同じ crate に置く。新しい crate は作らない。実行時の plugin は plugin-microvm（#18）が動かす。表の #8 の説明は決定時点の記述のまま残す。確定一覧（19 crate）は変えない。
+
 ## plugin crate の配置（決定）
 
 plugin crate（#15〜19）の開発時のソース配置は、**案 A（workspace 内の独立 crate として配置）を採用する**（決定 2）。`crates/plugin-cri/`・`crates/plugin-macos/` 等を workspace メンバーとする。

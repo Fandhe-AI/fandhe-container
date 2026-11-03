@@ -5,8 +5,11 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use fandhe_container_microvm::error::MicrovmErrorCode;
-use fandhe_container_microvm::hvf::{HostMapping, HvVm};
-use fandhe_container_microvm::hvf_abi::{HvReg, HvSysReg, HvVcpuExit, MemoryFlags};
+use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
+use fandhe_container_microvm::hvf::{HostMapping, HvVm, HvfGuestRam};
+use fandhe_container_microvm::hvf_abi::{
+    HVF_DEFAULT_IPA_LIMIT, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -122,4 +125,56 @@ fn hvf_device_vcpu_regs_roundtrip() {
         MicrovmErrorCode::FailedPrecondition
     );
     mapping.unmap().unwrap();
+}
+
+/// ゲスト RAM（4 MiB）を IPA 0x4000_0000 に登録し、`GuestMemory` 越しのコピーと範囲外の拒否、
+/// drop 後の再登録を確かめる（TASK-192.4・#3787・MVM-5・MVM-1）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_guest_ram_map_and_copy() {
+    const BASE: u64 = 0x4000_0000;
+    const SIZE: u64 = 4 << 20;
+    let vm = create_vm_or_precondition();
+    let base = GuestAddress::new(BASE);
+
+    let mut ram = HvfGuestRam::new(SIZE).unwrap();
+    // 登録前に書いた内容が登録後も見える。
+    ram.write(0, &[0xaa, 0xbb]).unwrap();
+    let mut mem = ram.register(&vm, base, HVF_DEFAULT_IPA_LIMIT).unwrap();
+    let mut head = [0u8; 2];
+    mem.read_at(base, &mut head).unwrap();
+    assert_eq!(head, [0xaa, 0xbb]);
+
+    let mid = GuestAddress::new(BASE + 0x1234);
+    mem.write_at(mid, &[1, 2, 3, 4, 5]).unwrap();
+    let mut got = [0u8; 5];
+    mem.read_at(mid, &mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4, 5]);
+
+    let u = GuestAddress::new(BASE + 0x2000);
+    mem.write_u64_le(u, 0x1122_3344_5566_7788).unwrap();
+    assert_eq!(mem.read_u64_le(u).unwrap(), 0x1122_3344_5566_7788);
+
+    // 範囲外（末尾をはみ出す・base より下）は拒否される。
+    let mut four = [0u8; 4];
+    let tail = GuestAddress::new(BASE + SIZE - 2);
+    assert_eq!(
+        mem.read_at(tail, &mut four).unwrap_err().code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        mem.read_at(GuestAddress::new(BASE - 1), &mut four)
+            .unwrap_err()
+            .code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+
+    // drop で unmap されるため、同じ IPA へ再登録できる。
+    drop(mem);
+    let again = HvfGuestRam::new(SIZE)
+        .unwrap()
+        .register(&vm, base, HVF_DEFAULT_IPA_LIMIT)
+        .unwrap();
+    drop(again);
+    drop(vm);
 }

@@ -199,6 +199,7 @@ impl HvVm {
             size,
             page_size: host.page_size,
             active: true,
+            host_offset: offset,
             host: Some(host),
         })
     }
@@ -328,6 +329,41 @@ impl HostMapping {
         }
         Ok(())
     }
+
+    /// `[offset, offset + len)` が領域に収まるか検査する（桁あふれは範囲外）。
+    fn check_span(&self, offset: usize, len: usize) -> Result<(), MicrovmError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?;
+        if end > self.len {
+            return Err(invalid_arg("guest memory access out of range"));
+        }
+        Ok(())
+    }
+
+    /// `offset` から `buf.len()` バイトを 1 バイトずつ volatile で読む（TASK-192.4・#3787・MVM-5・MVM-1）。
+    ///
+    /// 登録後はゲストが並行して書き換えうるため、参照（`&[u8]`）を作らない。範囲外は `InvalidArgument`。
+    pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<(), MicrovmError> {
+        self.check_span(offset, buf.len())?;
+        for (i, b) in buf.iter_mut().enumerate() {
+            // SAFETY: `check_span` で offset + buf.len() <= self.len を検査済みで、i < buf.len()。
+            // 領域は self の生存中有効。ゲストが並行して書き換えうるため参照を作らず volatile で 1 バイトだけ読む。
+            *b = unsafe { ((self.ptr as *const u8).add(offset + i)).read_volatile() };
+        }
+        Ok(())
+    }
+
+    /// `offset` へ `data` を 1 バイトずつ volatile で書く（TASK-192.4・#3787・MVM-5・MVM-1）。範囲外は `InvalidArgument`。
+    pub fn write_from(&mut self, offset: usize, data: &[u8]) -> Result<(), MicrovmError> {
+        self.check_span(offset, data.len())?;
+        for (i, b) in data.iter().enumerate() {
+            // SAFETY: `check_span` で offset + data.len() <= self.len を検査済みで、i < data.len()。
+            // 領域は self の生存中有効で、&mut self により Rust 側の同時アクセスはない。参照を作らず volatile で書く。
+            unsafe { ((self.ptr as *mut u8).add(offset + i)).write_volatile(*b) };
+        }
+        Ok(())
+    }
 }
 
 impl Drop for HostMapping {
@@ -348,6 +384,8 @@ pub struct GuestMapping<'a> {
     size: usize,
     page_size: usize,
     active: bool,
+    /// backing 内で対応付けを始めた位置（`HvVm::map` の `offset`）。
+    host_offset: usize,
     /// 登録済みの backing。解除成功時のみ drop し、失敗時は `leak_host` でリークする。
     host: Option<HostMapping>,
 }
@@ -375,6 +413,47 @@ impl GuestMapping<'_> {
             (Err(_), host) => std::mem::forget(host),
         }
         r
+    }
+
+    /// 対応付けたゲスト物理アドレスの先頭。
+    pub fn ipa(&self) -> u64 {
+        self.ipa
+    }
+
+    /// 対応付けたバイト数。
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// `[offset, offset + len)` が対応付けの範囲に収まるか検査し、backing 内の位置を返す。
+    fn host_span(&self, offset: usize, len: usize) -> Result<usize, MicrovmError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?;
+        if end > self.size {
+            return Err(invalid_arg("guest memory access out of range"));
+        }
+        self.host_offset
+            .checked_add(offset)
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))
+    }
+
+    /// 対応付けの先頭から `offset` の位置を `buf.len()` バイト読む（volatile のコピー。TASK-192.4・#3787）。
+    pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<(), MicrovmError> {
+        let pos = self.host_span(offset, buf.len())?;
+        self.host
+            .as_ref()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .read_into(pos, buf)
+    }
+
+    /// 対応付けの先頭から `offset` の位置へ `data` を書く（volatile のコピー。TASK-192.4・#3787）。
+    pub fn write_from(&mut self, offset: usize, data: &[u8]) -> Result<(), MicrovmError> {
+        let pos = self.host_span(offset, data.len())?;
+        self.host
+            .as_mut()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .write_from(pos, data)
     }
 
     /// 対応付けの保護を `flags` に変える。

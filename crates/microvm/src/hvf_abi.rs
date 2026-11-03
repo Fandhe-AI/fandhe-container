@@ -355,6 +355,27 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
     Ok(())
 }
 
+/// 既定の IPA 幅（36 ビット = 64 GiB）に基づくゲスト物理アドレスの上限（暫定値。TASK-192.4・#3787・MVM-5）。
+///
+/// Apple の公開情報からの読みで、SDK と実機での照合は #3803、レイアウトの確定は #3788。確定するまで上げない。
+pub const HVF_DEFAULT_IPA_LIMIT: u64 = 1 << 36;
+
+/// ゲスト RAM を `[ipa, ipa + size)` に置けるか、IPA の上限に対して検査する（`hv_vm_map` の前に通す）。
+///
+/// `ipa_limit` が 0 か [`HVF_DEFAULT_IPA_LIMIT`] 超、`ipa + size` の桁あふれ、`ipa_limit` 超過を `InvalidArgument` にする。
+pub fn check_ipa_limit(ipa: u64, size: u64, ipa_limit: u64) -> Result<(), MicrovmError> {
+    if ipa_limit == 0 || ipa_limit > HVF_DEFAULT_IPA_LIMIT {
+        return Err(invalid("ipa limit is out of range"));
+    }
+    let end = ipa
+        .checked_add(size)
+        .ok_or_else(|| invalid("guest range overflows the address space"))?;
+    if end > ipa_limit {
+        return Err(invalid("guest range exceeds the ipa limit"));
+    }
+    Ok(())
+}
+
 /// `HvVcpu::run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5・KVM 側の `RUN_DEADLINE_MAX` と同値）。
 pub const HV_RUN_DEADLINE_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -588,6 +609,24 @@ mod tests {
             let e = check_map_range(0, 0, MAX_MAP_BYTES + page, page).unwrap_err();
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "size exceeds the maximum mapping size");
+        }
+    }
+
+    #[test]
+    fn mvm5_3787_check_ipa_limit_boundaries() {
+        assert_eq!(HVF_DEFAULT_IPA_LIMIT, 68_719_476_736);
+        let lim = HVF_DEFAULT_IPA_LIMIT;
+        assert!(check_ipa_limit(0x4000_0000, 4 << 20, lim).is_ok());
+        assert!(check_ipa_limit(lim - 4096, 4096, lim).is_ok());
+        let e = check_ipa_limit(lim - 4096, 4097, lim).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "guest range exceeds the ipa limit");
+        let e = check_ipa_limit(u64::MAX - 4096, 8192, lim).unwrap_err();
+        assert_eq!(e.message(), "guest range overflows the address space");
+        for bad in [0, lim + 1] {
+            let e = check_ipa_limit(0, 4096, bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "ipa limit is out of range");
         }
     }
 

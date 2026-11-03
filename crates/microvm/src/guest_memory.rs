@@ -7,7 +7,7 @@
 //!
 //! # 範囲外（REPAIR-3）
 //! 領域は 1 つだけ（MMIO hole などを含む複数領域は未対応。判断記録の再評価条件）。
-//! 本モジュールが提供する backing は [`HeapBacking`]（`Vec<u8>`。試験と KVM を使わない用途）だけで、mmap の backing は `crate::microvm` が提供する。
+//! 本モジュールが提供する backing は [`HeapBacking`]（`Vec<u8>`。試験と KVM を使わない用途）だけで、mmap の backing は `crate::microvm`（Linux）と `crate::hvf::memory`（macOS。TASK-192.4）が提供する。
 //!
 //! # 外部入力の扱い
 //! アドレス・長さはゲストが決める非信頼入力。範囲検査はすべて checked 演算で行い、panic しない。

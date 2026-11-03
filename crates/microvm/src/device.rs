@@ -778,7 +778,7 @@ impl VcpuFd {
 /// `run_bounded` の `with_current_thread` の中で生きている監視スレッドだけで、そのスレッドは `KVM_RUN` 1 回分の間だけ生き、
 /// join されてから `with_current_thread` が戻る。したがって vCPU スレッドが終わった後に `request` が呼ばれても
 /// `pthread_kill` は発行されず、終了したスレッドへの送信も tid の再利用も構造上起きない。
-/// 複数の vCPU が同じ信号を共有できる（run ごとの完了状態は共有せず、`run_bounded` のローカルに置く。#3738 向け）。
+/// 全 vCPU スレッドが同じ信号を共有する（#3738。run ごとの完了状態は共有せず、`run_bounded` のローカルに置く）。
 #[derive(Debug, Default)]
 pub(crate) struct StopSignal {
     requested: Mutex<bool>,

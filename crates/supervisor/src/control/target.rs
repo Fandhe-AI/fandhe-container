@@ -474,8 +474,8 @@ pub struct ControlledRelauncher {
     stranded: Mutex<Vec<LateOrphan>>,
 }
 
-/// accept スレッドの停止を待つ上限（接続の読み取り期限 1 秒 + 余裕。REPAIR-5）。
-const PAUSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// accept スレッドとexec のガードの停止を待つ上限（接続の読み取り期限 1 秒 + ガードの回収の待ち 2 秒 + 余裕。REPAIR-5）。
+const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ControlledRelauncher {
     /// `inner` の再 launch の結果を `slot` に登録して返す relauncher を作る。

@@ -524,8 +524,14 @@ impl PausableServer {
         let Some(server) = inner.server.as_mut() else {
             return Ok(());
         };
+        let started = Instant::now();
         if server.stop_confirmed(timeout) {
             inner.server = None;
+            // accept ループが止まった後に、預かっている exec のガードのスレッドも止める（単一スレッドの再 launch のため。
+            // 通知済みの旧世代の exec 子 cgroup はここで回収される）。止まらなければ launch させない（fail-closed）。
+            if let Some(guards) = &inner.guards {
+                guards.shutdown_all(timeout.saturating_sub(started.elapsed()))?;
+            }
             Ok(())
         } else {
             Err(TraitError::new(
@@ -541,6 +547,10 @@ impl PausableServer {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.server.is_some() {
             return Ok(());
+        }
+        // 停止要求の後は、新しいガードを受けられるように戻す。
+        if let Some(guards) = &inner.guards {
+            guards.reopen();
         }
         let spawned = inner.listener.try_clone().and_then(|l| {
             ControlServer::spawn_with_exec_guard(

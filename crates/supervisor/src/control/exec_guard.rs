@@ -19,7 +19,9 @@
 //!   （保持期限の上限は [`super::protocol::MAX_EXEC_HOLD_SECS`]）。無期限に待たない（REPAIR-5）
 //! - 通知が来ないまま接続が切れたら何もしない（cgroup の作成前に死んだ場合。残骸は exec 開始時の掃除・delete 前の掃除が回収する）
 //! - 回収は冪等（通常終了では CLI が先に消していて `Absent`）。結果は [`ControlObserver`] が構造化ログへ出す（REPAIR-4）
-//! - ガードは accept ループの pause / resume（restart の再 launch。#2043）の影響を受けない（プールは [`super::server::PausableServer`] が保持する）
+//! - ガードのスレッドは再 launch の前に停止する（[`ExecGuardPool::shutdown_all`]。core の本番 launcher の `Threads: 1` 検査のため。SUP-3・#2043）。
+//!   通知済みのガードは旧世代の exec 子 cgroup を回収してから終わり、resume の後に [`ExecGuardPool::reopen`] で新しいガードを受ける。
+//!   プールは [`super::server::PausableServer`] が保持する
 //!
 //! # 残余
 //!
@@ -29,12 +31,14 @@
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::exec::{ExecCgroupName, ExecCgroupRemoval, remove_exec_child_cgroup};
-use fandhe_container_core::traits::{ContainerId, StateStore};
+use fandhe_container_core::traits::{ContainerId, ErrorCode, StateStore, TraitError};
 
 use super::observe::ControlObserver;
 use super::protocol::{
@@ -139,6 +143,22 @@ pub struct ExecGuardPool {
     observer: Arc<ControlObserver>,
     limits: ExecGuardLimits,
     active: AtomicUsize,
+    next_id: AtomicU64,
+    state: Mutex<PoolState>,
+}
+
+/// プールが追跡するガード（停止要求で起こして join するための控え）。
+struct PoolState {
+    /// 停止要求の後は新しいガードを受けない（[`ExecGuardPool::reopen`] まで）。
+    stopping: bool,
+    entries: Vec<GuardEntry>,
+}
+
+struct GuardEntry {
+    id: u64,
+    /// 接続の複製（close-on-exec）。停止要求で `shutdown(Both)` して、待機中の読み取りを EOF で起こす。
+    stream: Option<UnixStream>,
+    handle: JoinHandle<()>,
 }
 
 impl ExecGuardPool {
@@ -153,7 +173,80 @@ impl ExecGuardPool {
             observer,
             limits,
             active: AtomicUsize::new(0),
+            next_id: AtomicU64::new(0),
+            state: Mutex::new(PoolState {
+                stopping: false,
+                entries: Vec::new(),
+            }),
         })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 全ガードに停止を要求し、`timeout` 内に全スレッドが終わる（join できる）のを待つ（SUP-3・SUP-6・REPAIR-5・#2043）。
+    ///
+    /// restart の再 launch は core の本番 launcher が単一スレッド（`Threads: 1`）を要求するため、
+    /// [`super::server::PausableServer::pause`] が accept ループを止めた後にこれを呼ぶ。各ガードの接続を `shutdown` して
+    /// 読み取りを起こし、通知済みのガードは旧世代の exec 子 cgroup を回収（`trigger=relaunch`）してから終わる
+    /// （PID 1 が終わった旧世代の exec は意味を失う）。通知前のガードは何も回収せず終わる。停止要求の後は
+    /// [`Self::reopen`] まで新しいガードを受けない。期限内に終わらなければ `Timeout`（呼び出し側は launch しない。
+    /// fail-closed。単一スレッド検査を迂回しない）。
+    pub fn shutdown_all(&self, timeout: Duration) -> Result<(), TraitError> {
+        let mut handles: Vec<JoinHandle<()>> = {
+            let mut st = self.lock_state();
+            st.stopping = true;
+            for e in &st.entries {
+                if let Some(stream) = &e.stream {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            std::mem::take(&mut st.entries)
+                .into_iter()
+                .map(|e| e.handle)
+                .collect()
+        };
+        let until = Instant::now().checked_add(timeout);
+        loop {
+            let mut rest = Vec::new();
+            for h in handles {
+                if h.is_finished() {
+                    let _ = h.join();
+                } else {
+                    rest.push(h);
+                }
+            }
+            handles = rest;
+            if handles.is_empty() {
+                return Ok(());
+            }
+            if until.is_none_or(|u| Instant::now() >= u) {
+                // 終わらなかったスレッドは追跡に戻す（次の停止要求・prune で回収する）。
+                let mut st = self.lock_state();
+                for handle in handles {
+                    st.entries.push(GuardEntry {
+                        id: u64::MAX,
+                        stream: None,
+                        handle,
+                    });
+                }
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "exec guards did not stop in time",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// [`Self::shutdown_all`] の後、再 launch が済んで新しいガードを受けられるようにする。
+    pub fn reopen(&self) {
+        self.lock_state().stopping = false;
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.lock_state().stopping
     }
 
     /// 現在のガード数（試験と観測用）。
@@ -191,13 +284,37 @@ impl ExecGuardPool {
         let permit = self
             .try_acquire()
             .ok_or(ControlReason::ExecGuardExhausted)?;
+        if self.is_stopping() {
+            return Err(ControlReason::ExecGuardExhausted);
+        }
         let (tx, rx) = channel::<UnixStream>();
         let pool = Arc::clone(self);
-        std::thread::Builder::new()
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let handle = std::thread::Builder::new()
             .name("control-exec-guard".to_owned())
-            .spawn(move || run_guard(&pool, permit, &rx))
+            .spawn(move || run_guard(&pool, id, permit, &rx))
             .map_err(|_| ControlReason::ExecGuardExhausted)?;
-        Ok(GuardSlot { tx })
+        {
+            let mut st = self.lock_state();
+            // 終わったスレッドは回収して追跡を軽く保つ。
+            let (done, live): (Vec<_>, Vec<_>) = std::mem::take(&mut st.entries)
+                .into_iter()
+                .partition(|e| e.handle.is_finished());
+            st.entries = live;
+            for e in done {
+                let _ = e.handle.join();
+            }
+            st.entries.push(GuardEntry {
+                id,
+                stream: None,
+                handle,
+            });
+        }
+        Ok(GuardSlot {
+            tx,
+            pool: Arc::clone(self),
+            id,
+        })
     }
 }
 
@@ -216,24 +333,60 @@ impl Drop for GuardPermit {
 /// 渡さずに drop するとスレッドは終了し、枠が戻る。
 pub(super) struct GuardSlot {
     tx: std::sync::mpsc::Sender<UnixStream>,
+    pool: Arc<ExecGuardPool>,
+    id: u64,
 }
 
 impl GuardSlot {
-    /// pidfd を送り終えた接続をガードへ渡す。
+    /// pidfd を送り終えた接続をガードへ渡す。停止要求の後・複製できないときは渡さずに終える（ガードは接続を持たずに
+    /// 終わり、クライアントの作成通知は失敗する。fail-closed）。
     pub(super) fn start(self, stream: UnixStream) {
+        let Ok(copy) = stream.try_clone() else {
+            return;
+        };
+        {
+            let mut st = self.pool.lock_state();
+            if st.stopping {
+                return;
+            }
+            match st.entries.iter_mut().find(|e| e.id == self.id) {
+                Some(e) => e.stream = Some(copy),
+                None => return,
+            }
+        }
         let _ = self.tx.send(stream);
     }
 }
 
 /// ガードのスレッド本体: 通知 → ack → 切断か期限まで待つ → 回収。
-fn run_guard(pool: &ExecGuardPool, _permit: GuardPermit, rx: &Receiver<UnixStream>) {
+fn run_guard(pool: &ExecGuardPool, id: u64, _permit: GuardPermit, rx: &Receiver<UnixStream>) {
+    // 終わるとき（どの経路でも）停止用の接続の複製を手放す（複製が残ると fd が閉じない）。
+    struct Release<'a>(&'a ExecGuardPool, u64);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            if let Some(e) = self
+                .0
+                .lock_state()
+                .entries
+                .iter_mut()
+                .find(|e| e.id == self.1)
+            {
+                e.stream = None;
+            }
+        }
+    }
+    let _release = Release(pool, id);
     let Ok(mut stream) = rx.recv() else {
         return;
     };
     let Some(frame) = await_notify(&mut stream, &pool.limits) else {
         return;
     };
-    let trigger = hold(&mut stream, &frame, &pool.limits);
+    let mut trigger = hold(&mut stream, &frame, &pool.limits);
+    // 再 launch の停止要求で起こされたときは、切断と区別して記録する。
+    if trigger == "disconnect" && pool.is_stopping() {
+        trigger = "relaunch";
+    }
     let outcome = pool.reclaimer.reclaim(&frame.name);
     pool.observer.record_exec_reclaim(trigger, outcome);
 }

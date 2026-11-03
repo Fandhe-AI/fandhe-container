@@ -921,6 +921,25 @@ impl StopSignal {
         *self.requested.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// 停止が要求されるか `timeout` が経つまで待つ。要求済み（待ちの途中での要求を含む）なら `true`、期限切れなら `false`。
+    /// 受信ポーラーの周期待ちが使う（#3742・REPAIR-5）。spurious wakeup は残り時間を計算し直して吸収する。
+    pub(crate) fn wait_requested(&self, timeout: Duration) -> bool {
+        let limit = Instant::now() + timeout;
+        let mut g = self.requested.lock().unwrap_or_else(|p| p.into_inner());
+        while !*g {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            g = self
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        true
+    }
+
     /// run の完了を待ち手へ知らせる。ロックを一度取って放すことで、待ち手の条件確認と待ち入りの間の通知の取りこぼしを防ぐ。
     fn notify(&self) {
         drop(self.requested.lock().unwrap_or_else(|p| p.into_inner()));
@@ -2702,5 +2721,26 @@ mod tests {
         let e = check_msr_done("KVM_SET_MSRS", 2, 3).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
         assert_eq!(e.message(), "KVM_SET_MSRS accepted 2 of 3 entries");
+    }
+
+    /// MVM-1・REPAIR-5・#3742: `wait_requested` は要求済みなら即 `true`、要求が無ければ期限後に `false`、待ちの途中の要求で期限前に `true`。
+    #[test]
+    fn mvm1_3742_stop_signal_wait_requested() {
+        let sig = Arc::new(StopSignal::new());
+        let t = Instant::now();
+        assert!(!sig.wait_requested(Duration::from_millis(20)));
+        assert!(t.elapsed() >= Duration::from_millis(20));
+        let s2 = Arc::clone(&sig);
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            s2.request();
+        });
+        let t = Instant::now();
+        assert!(sig.wait_requested(Duration::from_secs(10)));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        h.join().unwrap();
+        let t = Instant::now();
+        assert!(sig.wait_requested(Duration::from_secs(10)));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }

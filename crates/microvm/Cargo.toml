@@ -30,6 +30,7 @@
 # #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3787（TASK-192.4）で hvf/memory.rs とゲスト RAM のコピー API を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3840 で sys の FlexBuf の要素型を sealed な unsafe trait（FlexEntry）で限定（依存・feature は変えない。unsafe は sys.rs のみ）。
+# #3771 で tests/kernel_boot.rs（実カーネルの起動完走の実機前提試験）を追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

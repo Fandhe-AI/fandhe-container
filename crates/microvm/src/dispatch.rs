@@ -15,8 +15,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //! virtqueue の処理（TASK-74.2.2・74.3.1）・割り込み配送（virtio-block は `crate::interrupt`・TASK-74.2.3、virtio-net は `crate::interrupt::complete_net_notify`・TASK-74.3.2）は、
-//! [`MmioAccess::Write`] の `QueueNotify` 等を受けた呼び出し元が後続 TASK で行う。UART のレジスタモデルは `crate::uart`（バスへの結線は #3740）。他の PIO の具体デバイス
-//! （シリアル等）も未実装。
+//! [`MmioAccess::Write`] の `QueueNotify` 等を受けた呼び出し元が後続 TASK で行う。COM1 の UART（`crate::uart`）は `microvm::DeviceBus` が登録済み（#3740）。他の PIO の具体デバイス
+//! （PIT・RTC 等）は未実装。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{IoDirection, VcpuExit};

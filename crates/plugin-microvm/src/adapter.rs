@@ -93,6 +93,8 @@ const MSG_BAD_CMDLINE: &str = "invalid kernel cmdline";
 const MSG_MULTI_VCPU: &str = "multiple vCPUs are not implemented";
 const MSG_EXISTS: &str = "microVM already exists";
 const MSG_LIMIT: &str = "too many microVMs";
+/// 画像読み込みスレッドの上限到達（VM 数の上限 `MSG_LIMIT` とは別物）。
+const MSG_READ_LIMIT: &str = "too many in-flight image reads";
 const MSG_NOT_FOUND: &str = "microVM not found";
 const MSG_NOT_REGULAR: &str = "image must be a regular file";
 const MSG_TOO_LARGE: &str = "image too large";
@@ -325,23 +327,31 @@ const MAX_INFLIGHT_READS: usize = 8;
 static INFLIGHT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 読み込みスレッドの枠。Drop で返す。上限到達時は `RESOURCE_EXHAUSTED`。
-struct ReadSlot;
+struct ReadSlot(&'static std::sync::atomic::AtomicUsize);
 
 impl ReadSlot {
     fn acquire() -> Result<Self, PluginError> {
+        Self::acquire_from(&INFLIGHT_READS, MAX_INFLIGHT_READS)
+    }
+
+    /// 計数器と上限を指定して枠を取る。上限到達時のメッセージは VM 数の上限（`MSG_LIMIT`）と区別する。
+    fn acquire_from(
+        counter: &'static std::sync::atomic::AtomicUsize,
+        max: usize,
+    ) -> Result<Self, PluginError> {
         use std::sync::atomic::Ordering;
-        INFLIGHT_READS
+        counter
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_INFLIGHT_READS).then_some(n + 1)
+                (n < max).then_some(n + 1)
             })
-            .map(|_| ReadSlot)
-            .map_err(|_| perr(PluginErrorCode::ResourceExhausted, MSG_LIMIT))
+            .map(|_| ReadSlot(counter))
+            .map_err(|_| perr(PluginErrorCode::ResourceExhausted, MSG_READ_LIMIT))
     }
 }
 
 impl Drop for ReadSlot {
     fn drop(&mut self) {
-        INFLIGHT_READS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -575,6 +585,18 @@ impl<B: MicrovmBackend> RequestHandler for MicrovmRuntimeAdapter<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 画像読み込みの枠が尽きたとき、VM 数上限と区別できる文言で RESOURCE_EXHAUSTED になる（REPAIR-5・MVM-5）。
+    #[test]
+    fn read_slot_limit_uses_distinct_message() {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let held = ReadSlot::acquire_from(&COUNTER, 1).expect("first slot");
+        let e = ReadSlot::acquire_from(&COUNTER, 1).err().expect("limit");
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "too many in-flight image reads");
+        assert_ne!(e.message(), MSG_LIMIT);
+        drop(held);
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

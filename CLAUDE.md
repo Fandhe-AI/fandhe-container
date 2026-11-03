@@ -44,7 +44,7 @@ fandhe-container/
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
 │   ├── gpu/ / net/                #   GPU パススルー（CDI）/ network
-│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin）
+│   ├── plugin/                    #   plugin 境界機構（UDS＋長さ接頭辞フレーム。fandhe-container-plugin。plugin 側の共通受信ループ `frame_loop` を含む。#3774・#3773）
 │   ├── cli/ / stack/              #   統一 CLI / 複数コンテナ定義（TOML スキーマ・起動順）
 │   ├── compose-convert/           #   compose.yaml → TOML 片方向変換ツール（fandhe-container-compose-convert）
 │   └── plugin-*/                  #   fandhe-container-plugin-cri / -macos / -windows / -microvm / -mcp

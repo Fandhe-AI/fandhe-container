@@ -232,6 +232,12 @@ mod nofollow {
     pub(super) const O_NONBLOCK: i32 = 0o4000;
     #[cfg(target_os = "linux")]
     pub(super) const AT_FDCWD: i32 = -100;
+    /// 祖先の走査は検索（x）権限だけで通す（読み取り権限は要らない。symlink の拒否に一覧の読み取りは不要）。
+    /// `O_PATH` は x86_64 / aarch64 とも同値（`0o10000000`）。macOS には `O_PATH` が無く `O_RDONLY` のまま。
+    #[cfg(target_os = "linux")]
+    pub(super) const O_PATH: i32 = 0o10000000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_PATH: i32 = 0;
     #[cfg(target_os = "macos")]
     pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
     #[cfg(target_os = "macos")]
@@ -278,7 +284,7 @@ mod nofollow {
         let Some((leaf, ancestors)) = names.split_last() else {
             return Err(NoFollowOpenError::InvalidPath);
         };
-        let dir_flags = O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        let dir_flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
         // `/` は信頼する起点。以降は検証済みの親 fd を基準に 1 要素ずつ辿る（前の fd は代入で閉じる）。
         let root = CString::new("/").map_err(|_| NoFollowOpenError::InvalidPath)?;
         let mut cur =
@@ -423,6 +429,7 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o200000, 0o400000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_PATH, 0o10000000);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -433,6 +440,7 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o40000, 0o100000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_PATH, 0o10000000);
     }
 
     #[cfg(target_os = "macos")]
@@ -483,6 +491,29 @@ mod tests {
             std::fs::create_dir(d.0.join("real")).expect("mkdir");
             std::fs::write(d.0.join("real/k"), b"abc").expect("write");
             let mut f = open_regular_nofollow(&d.0.join("real/k")).expect("open");
+            let mut v = Vec::new();
+            f.read_to_end(&mut v).expect("read");
+            assert_eq!(v, b"abc");
+        }
+
+        /// 祖先が mode 0111（検索のみ）・最終要素が 0400 でも開ける（Linux。root は権限を無視するため除く）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_3748_opens_under_search_only_ancestor() {
+            use std::os::unix::fs::PermissionsExt;
+            let d = Dir::new("x-only");
+            let sub = d.0.join("xonly");
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("k"), b"abc").expect("write");
+            std::fs::set_permissions(sub.join("k"), std::fs::Permissions::from_mode(0o400))
+                .expect("chmod file");
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111))
+                .expect("chmod dir");
+            let r = open_regular_nofollow(&sub.join("k"));
+            // 後始末のため先に権限を戻す。
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))
+                .expect("restore");
+            let mut f = r.expect("open under mode 0111 ancestor");
             let mut v = Vec::new();
             f.read_to_end(&mut v).expect("read");
             assert_eq!(v, b"abc");

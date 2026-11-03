@@ -156,6 +156,8 @@ pub struct BoundedRunLog {
     capacity: usize,
     capture: ValueCapture,
     inner: std::sync::Mutex<BoundedRunLogInner>,
+    /// ロック競合で待たずに捨てた件数（`record` は vCPU スレッドから呼ばれるためブロックしない）。
+    contended: std::sync::atomic::AtomicU64,
 }
 
 struct BoundedRunLogInner {
@@ -179,6 +181,7 @@ impl BoundedRunLog {
                 records: Vec::with_capacity(capacity),
                 dropped: 0,
             }),
+            contended: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -197,23 +200,42 @@ impl BoundedRunLog {
     pub fn dropped(&self) -> u64 {
         self.lock().dropped
     }
+
+    /// ロック競合で待たずに捨てたレコード数（`records()` 等と `record` が重なった場合）。
+    pub fn contended_dropped(&self) -> u64 {
+        self.contended.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for BoundedRunLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let g = self.lock();
+        // 出力先が詰まってもロックを持ち続けないよう、値を複製して解放してから出す。
+        let (len, dropped) = {
+            let g = self.lock();
+            (g.records.len(), g.dropped)
+        };
         f.debug_struct("BoundedRunLog")
             .field("capacity", &self.capacity)
             .field("capture", &self.capture)
-            .field("len", &g.records.len())
-            .field("dropped", &g.dropped)
+            .field("len", &len)
+            .field("dropped", &dropped)
+            .field("contended_dropped", &self.contended_dropped())
             .finish()
     }
 }
 
 impl RunObserver for BoundedRunLog {
     fn record(&self, record: &RunRecord) {
-        let mut g = self.lock();
+        // vCPU スレッドから呼ばれるためブロックしない。競合時は待たずに捨てて数える。
+        let mut g = match self.inner.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contended
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
         if g.records.len() < self.capacity {
             g.records.push(*record);
         } else {
@@ -1566,6 +1588,23 @@ mod tests {
         }
         assert_eq!(log.records(), vec![rec(0, b'a'), rec(1, b'b')]);
         assert_eq!(log.dropped(), 3);
+    }
+
+    /// #3769・MVM-1・REPAIR-5: ロック競合時は待たずに捨て、件数を数える。
+    #[test]
+    fn mvm1_3769_bounded_run_log_record_does_not_block_on_contention() {
+        let log = BoundedRunLog::new(4, ValueCapture::Record).unwrap();
+        log.record(&rec(0, b'a'));
+        {
+            let _held = log.lock();
+            log.record(&rec(1, b'b'));
+            log.record(&rec(2, b'c'));
+            assert_eq!(log.contended_dropped(), 2);
+        }
+        log.record(&rec(3, b'd'));
+        assert_eq!(log.records(), vec![rec(0, b'a'), rec(3, b'd')]);
+        assert_eq!(log.dropped(), 0);
+        assert_eq!(log.contended_dropped(), 2);
     }
 
     /// #3769・MVM-1: 容量の範囲外は `InvalidArgument`。

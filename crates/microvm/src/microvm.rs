@@ -1137,31 +1137,7 @@ pub const STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
 /// [`RunningMicroVm`] が `stop` を経ずに drop されたときに、vCPU スレッドの終了を待つ上限。
 const DROP_STOP_WAIT: Duration = Duration::from_secs(5);
 
-/// vCPU ループが終わった理由（真偽値・文字列で返さない。拡張できる）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StopReason {
-    /// [`RunningMicroVm::stop`] または drop による停止要求。
-    Requested,
-    /// ゲストのシャットダウン（トリプルフォールト等。`VcpuExit::Shutdown`）。
-    GuestShutdown,
-    /// ユーザー空間へ出た `HLT`（in-kernel irqchip のある現構成では起きない想定。busy loop を避けるため終了として扱う）。
-    GuestHalted,
-    /// 実行・exit の処理・通知の完了が失敗した（fail-closed で VM を止める）。
-    Failed(MicrovmErrorCode),
-}
-
-impl StopReason {
-    /// 構造化ログ用の固定名。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            StopReason::Requested => "requested",
-            StopReason::GuestShutdown => "guest_shutdown",
-            StopReason::GuestHalted => "guest_halted",
-            StopReason::Failed(_) => "failed",
-        }
-    }
-}
+pub use crate::stop::StopReason;
 
 /// 全 vCPU ループの終了報告。最後の vCPU スレッドが `MicroVm` の部品（fd・mmap・irqfd）を解放し終えた後に送られる（#3738）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

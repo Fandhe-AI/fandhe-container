@@ -178,3 +178,102 @@ fn hvf_device_guest_ram_map_and_copy() {
     drop(again);
     drop(vm);
 }
+/// `hvf_device_vcpu_thread_runs_and_cancels` の全体期限。ハングを失敗として残す（REPAIR-5）。
+const VCPU_THREAD_DEADLINE: Duration = Duration::from_secs(20);
+
+/// vCPU 専用スレッドの実行ループ（TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5）。
+/// (A) `b .` のゲストが別スレッドからの停止要求で 1 秒以内に `Requested` で終わる。
+/// (B) `hvc #0` のゲストは HVC のスタブが `Unimplemented` を返し、`Failed(Unimplemented)` で終わって分類が HVC だったと観測される。
+/// 1 プロセス 1 VM のため、VM は 1 回だけ作って 2 場面を順に走らせる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_vcpu_thread_runs_and_cancels() {
+    use fandhe_container_microvm::hvf::hvc::HvcHandler;
+    use fandhe_container_microvm::hvf::mmio::MmioHandler;
+    use fandhe_container_microvm::hvf::timer::TimerHandler;
+    use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
+    use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
+    use fandhe_container_microvm::stop::StopReason;
+    use std::time::Instant;
+
+    const BASE: u64 = 0x4000_0000;
+    let finished = Arc::new(AtomicBool::new(false));
+    {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < VCPU_THREAD_DEADLINE {
+                if finished.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+    }
+
+    let vm = Arc::new(create_vm_or_precondition());
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    // オフセット 0: `b .`。オフセット 0x100: `hvc #0` の後に `b .`。
+    host.write_bytes(0, &0x1400_0000u32.to_le_bytes()).unwrap();
+    host.write_bytes(0x100, &0xD400_0002u32.to_le_bytes())
+        .unwrap();
+    host.write_bytes(0x104, &0x1400_0000u32.to_le_bytes())
+        .unwrap();
+    let mapping = vm.map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+
+    let handlers = || ExitHandlers {
+        mmio: MmioHandler::new(),
+        hvc: HvcHandler::new(),
+        timer: TimerHandler::new(),
+    };
+    let setup = |pc: u64| {
+        move |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
+            vcpu.set_reg(HvReg::PC, pc)?;
+            // EL1h と DAIF のマスク。
+            vcpu.set_reg(HvReg::CPSR, 0x3c5)
+        }
+    };
+
+    // 場面 A: 停止要求で 1 秒以内に Requested。
+    let counts = Arc::new(ExitCounts::new());
+    let config = VcpuThreadConfig {
+        observer: Some(counts.clone()),
+        ..VcpuThreadConfig::default()
+    };
+    let handle = VcpuThread::spawn(Arc::clone(&vm), setup(BASE), handlers(), config).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!handle.is_finished());
+    let t = Instant::now();
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(counts.count(ExitKind::Hvc), 0);
+
+    // 場面 B: HVC のスタブで Failed(Unimplemented)。
+    let counts = Arc::new(ExitCounts::new());
+    let config = VcpuThreadConfig {
+        observer: Some(counts.clone()),
+        ..VcpuThreadConfig::default()
+    };
+    let handle =
+        VcpuThread::spawn(Arc::clone(&vm), setup(BASE + 0x100), handlers(), config).unwrap();
+    let start = Instant::now();
+    while !handle.is_finished() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished());
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        report.reason,
+        StopReason::Failed(MicrovmErrorCode::Unimplemented)
+    );
+    assert_eq!(counts.count(ExitKind::Hvc), 1);
+
+    // スレッドが持っていた Arc は stop の Ok で解放済み。
+    mapping.unmap().unwrap();
+    finished.store(true, Ordering::Release);
+    drop(vm);
+}

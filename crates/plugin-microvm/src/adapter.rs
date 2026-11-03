@@ -29,7 +29,10 @@
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
 //!   期限切れで切り離した VM は [`MAX_VMS`] の計数に残し続け（`detached`）、枠を空けない（資源上限。REPAIR-5）。枠が尽きたら plugin の再起動で回復する。
-//! - 応答しないファイルシステム上のイメージ読み込みは期限で打ち切れない。祖先ディレクトリの symlink は検査しない（最終要素のみ）。
+//! - イメージ読み込みは別スレッドで走らせ [`IMAGE_READ_DEADLINE`] で `TIMEOUT` にする（REPAIR-5）。期限切れのスレッドは取り消せず、
+//!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
+//!   `RESOURCE_EXHAUSTED` になる。
+//! - 祖先ディレクトリの symlink は検査しない（最終要素のみ）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
 
 use std::collections::BTreeMap;
@@ -301,6 +304,7 @@ enum ImageKind {
 ///
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
+/// 枠は I/O が戻るまで保持し、生存中の読み込みが `MAX_INFLIGHT_READS` に達すると `RESOURCE_EXHAUSTED` になる。
 fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
     let slot = ReadSlot::acquire()?;
     let (tx, rx) = std::sync::mpsc::channel();

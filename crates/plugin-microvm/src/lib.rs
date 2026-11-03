@@ -24,10 +24,14 @@
 //! socket 0600 とディレクトリ 0700・既定パスが検証済みの runtime directory 配下で connector が socket を作らないことは
 //! 既定集合、別 UID の listener の拒否は `#[ignore]` の実機前提試験（PLUG-12）。
 //!
+//! # 実装済み（TASK-117.4・#713）
+//! core 役 → plugin-microvm（UDS 境界）→ microVM の起動 → 停止の結合試験を `tests/e2e.rs` に置いた（製品コードの変更なし）。
+//! 「core」役は共有境界 crate の `UdsListener` を試験本体が担う（core 側の起動経路 `BackendKind` は #1869 の設計の 4.9 で未結線）。
+//! 層 A は偽バックエンドで既定集合（unix・KVM 不要）、層 B は実バイナリ + 実 KVM で `#[ignore]`（Linux x86_64・`/dev/kvm`）。
+//!
 //! # 未実装範囲（REPAIR-3）
 //! - kill / delete / state、create と start の分離、block / net の指定、2 台以上の vCPU は `UNIMPLEMENTED`
 //!   （型つき本体と合わせて #1869 の設計）。実 Linux カーネルの起動完走は保証しない（microvm 側の未実装）。
-//! - core 経由の起動・停止の結合試験は TASK-117.4（#713）。
 //! - SIGTERM でのグレースフルシャットダウン（実行中 VM の停止）は未実装。終了は相手の切断（EOF）のみ。
 //! - 要求本体 `Vec<String>` は暫定契約で、型つき本体への置換は #1869 の設計（承認と実装 issue の起票は #2232）で確定する。
 //! - core 側からの plugin-microvm 起動経路（`BackendKind` への追加）は #1869 の設計の 4.9 で扱う。

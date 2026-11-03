@@ -1,12 +1,16 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+use fandhe_container_microvm::arm64_layout::{
+    ARM64_BOOT_CPU_MPIDR, ARM64_PPI_INTID_BASE, ARM64_TIMER_VIRT_PPI, Arm64Layout,
+    check_virtual_timer_intid,
+};
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
-use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGuestRam};
+use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGic, HvfGuestRam, VmWithGic};
 use fandhe_container_microvm::hvf_abi::{
     HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
 };
@@ -18,6 +22,18 @@ use std::time::Duration;
 fn create_vm_or_precondition() -> HvVm {
     match HvVm::create() {
         Ok(vm) => vm,
+        Err(e) => {
+            panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    }
+}
+
+/// GIC つきの VM を作る。前提欠如（権限不足など）は決まった 1 行目で失敗させる。
+/// macOS 14 の `Unimplemented` は前提欠如ではなく、そのままの失敗として出す。
+fn create_vm_with_gic_or_precondition(layout: &Arm64Layout) -> VmWithGic {
+    match VmWithGic::create(layout) {
+        Ok(vm) => vm,
+        Err(e) if e.code() == MicrovmErrorCode::Unimplemented => panic!("hvf_device: gic: {e}"),
         Err(e) => {
             panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
@@ -61,7 +77,9 @@ const VCPU_DEADLINE: Duration = Duration::from_secs(10);
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
 fn hvf_device_vcpu_regs_roundtrip() {
-    let vm = create_vm_or_precondition();
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let vm = vgic.vm();
     let page = HostMapping::page_size().unwrap();
     let mut host = HostMapping::new(page).unwrap();
     // `b .`（自分自身への無条件分岐）: ゲストは永久に回り続け、停止は canceller だけが担う。
@@ -70,7 +88,7 @@ fn hvf_device_vcpu_regs_roundtrip() {
         .map(host, 0, 0x4000_0000, page, MemoryFlags::RWX)
         .unwrap();
 
-    let mut vcpu = vm.create_vcpu().unwrap();
+    let mut vcpu = vgic.create_vcpu().unwrap();
     let x0 = HvReg::x(0).unwrap();
     vcpu.set_reg(x0, 0x1122_3344_5566_7788).unwrap();
     assert_eq!(vcpu.get_reg(x0).unwrap(), 0x1122_3344_5566_7788);
@@ -303,4 +321,54 @@ fn hvf_device_gic_symbols_resolve() {
     let timer = api.intid(HvGicIntid::EL1_VIRTUAL_TIMER).unwrap().get();
     eprintln!("hvf_device: EL1_VIRTUAL_TIMER intid={timer}");
     assert!((16..=31).contains(&timer));
+}
+
+/// GIC を vCPU より前に作れること、virtual timer の intid が FDT と一致すること、アラインの違反が
+/// VM を作る前に `InvalidArgument` で拒否されることを確かめる（TASK-192.12・#3792・MVM-5・MVM-1）。
+/// 同期呼び出しのみでゲストを走らせないため watchdog は不要。1 プロセス 1 VM のため VM は常に 1 個ずつ。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_gic_create_before_vcpu() {
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+
+    let gic = match HvfGic::probe(&layout) {
+        Ok(g) => g,
+        Err(e) => panic!("hvf_device: gic: {e}"),
+    };
+    let g = gic.geometry();
+    eprintln!(
+        "hvf_device: gic create: distributor size={} align={}, redistributor size={} align={}, virtual timer intid={}",
+        g.dist_size,
+        g.dist_align,
+        g.redist_size_per_cpu,
+        g.redist_align,
+        gic.virtual_timer_intid()
+    );
+    check_virtual_timer_intid(gic.virtual_timer_intid()).unwrap();
+    assert_eq!(
+        gic.virtual_timer_intid(),
+        ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI
+    );
+
+    // アラインの違反は VM を作る前に拒否される（直後に VM を作れる = 取り残しがない）。
+    let mut bad = layout.clone();
+    bad.gic_dist.base =
+        fandhe_container_microvm::guest_memory::GuestAddress::new(bad.gic_dist.base.raw() + 1);
+    assert_eq!(
+        VmWithGic::create(&bad).unwrap_err().code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+    drop(create_vm_or_precondition());
+
+    // 正しい配置: GIC を作ってから vCPU を作れる。
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let mut vcpu = vgic.create_vcpu().unwrap();
+    vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))
+        .unwrap();
+    let mpidr = vcpu.get_sys_reg(HvSysReg::MPIDR_EL1).unwrap();
+    eprintln!("hvf_device: gic create: MPIDR_EL1 readback={mpidr:#x}");
+    // affinity（Aff0..Aff2 = bit 0..23）が FDT の cpu@0 の reg と一致する。
+    assert_eq!(mpidr & 0x00ff_ffff, u64::from(ARM64_BOOT_CPU_MPIDR));
+    drop(vcpu);
+    drop(vgic);
 }

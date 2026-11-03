@@ -40,6 +40,8 @@
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
+//! TASK-192.2・#3786・MVM-5: vCPU・レジスタ・exit・vtimer（`hvf_abi` の `HvReg`・`HvSysReg`・`HvVcpuExit`・`decode_exit`。
+//! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・

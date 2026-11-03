@@ -355,6 +355,110 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
     Ok(())
 }
 
+/// `HvVcpu::run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5・KVM 側の `RUN_DEADLINE_MAX` と同値）。
+pub const HV_RUN_DEADLINE_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `run_once` の期限の検査（FFI の前に必ず通す）。0 と上限超過は `InvalidArgument`。
+pub fn check_run_deadline(timeout: std::time::Duration) -> Result<(), MicrovmError> {
+    if timeout.is_zero() {
+        return Err(invalid("run deadline must be non-zero"));
+    }
+    if timeout > HV_RUN_DEADLINE_MAX {
+        return Err(invalid("run deadline exceeds the maximum"));
+    }
+    Ok(())
+}
+
+/// `hv_vcpu_run` 1 回の結果の分類（計装用。REPAIR-4。KVM 側の `RunOutcome` に対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvRunOutcome {
+    /// VM exit で戻った。値は exit の種別名（`exception` / `vtimer` / `canceled` / `unknown`）。
+    Exit(&'static str),
+    /// 期限を超えて `hv_vcpus_exit` で中断した（REPAIR-5）。
+    DeadlineExceeded,
+    /// FFI または復号の失敗。
+    Error(MicrovmErrorCode),
+}
+
+/// `run_once` 1 回の記録（結果と所要時間。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvRunRecord {
+    /// 結果。
+    pub outcome: HvRunOutcome,
+    /// `hv_vcpu_run` の発行から戻るまでの時間。
+    pub elapsed: std::time::Duration,
+}
+
+/// 実行結果の記録器。呼び出し側が構造化ログやメトリクスへ接続する。`record` は vCPU スレッドから同期で
+/// 呼ばれるため、ブロックしないこと。
+pub trait HvRunObserver: Send + Sync + std::fmt::Debug {
+    /// 1 回の `run_once` の記録を受け取る。
+    fn record(&self, record: &HvRunRecord);
+}
+
+/// vCPU ごとの累積の実行統計（観測器が無くても取れる。REPAIR-4）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HvRunStats {
+    /// 発行回数。
+    pub runs: u64,
+    /// VM exit で戻った回数。
+    pub exits: u64,
+    /// 期限超過の回数。
+    pub deadline_exceeded: u64,
+    /// 失敗の回数。
+    pub errors: u64,
+    /// 所要時間の合計。
+    pub total_elapsed: std::time::Duration,
+}
+
+impl HvRunStats {
+    /// 記録 1 件を累積へ加える。
+    pub fn add(&mut self, record: &HvRunRecord) {
+        self.runs = self.runs.saturating_add(1);
+        self.total_elapsed = self.total_elapsed.saturating_add(record.elapsed);
+        match record.outcome {
+            HvRunOutcome::Exit(_) => self.exits = self.exits.saturating_add(1),
+            HvRunOutcome::DeadlineExceeded => {
+                self.deadline_exceeded = self.deadline_exceeded.saturating_add(1);
+            }
+            HvRunOutcome::Error(_) => self.errors = self.errors.saturating_add(1),
+        }
+    }
+}
+
+fn exit_kind(e: &HvVcpuExit) -> &'static str {
+    match e {
+        HvVcpuExit::Canceled => "canceled",
+        HvVcpuExit::Exception(_) => "exception",
+        HvVcpuExit::VtimerActivated => "vtimer",
+        HvVcpuExit::Unknown(_) => "unknown",
+    }
+}
+
+/// `hv_vcpu_run` の戻りを期限の発火の有無と合わせて確定する（純関数）。
+///
+/// 期限が発火して `Canceled` で戻ったときだけ `DeadlineExceeded`（外部からの `cancel` による `Canceled` は
+/// そのまま `Ok(Canceled)`）。分類した記録も返す。
+pub fn finish_run(
+    result: Result<HvVcpuExit, MicrovmError>,
+    deadline_fired: bool,
+    elapsed: std::time::Duration,
+) -> (Result<HvVcpuExit, MicrovmError>, HvRunRecord) {
+    let result = match result {
+        Ok(HvVcpuExit::Canceled) if deadline_fired => Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "vcpu run exceeded its deadline",
+        )),
+        other => other,
+    };
+    let outcome = match &result {
+        Ok(e) => HvRunOutcome::Exit(exit_kind(e)),
+        Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => HvRunOutcome::DeadlineExceeded,
+        Err(e) => HvRunOutcome::Error(e.code()),
+    };
+    (result, HvRunRecord { outcome, elapsed })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +656,60 @@ mod tests {
         assert_eq!(
             e.message(),
             "hv_vcpu_set_pending_interrupt returned HV_BUSY"
+        );
+    }
+
+    #[test]
+    fn mvm5_3786_check_run_deadline_bounds() {
+        use std::time::Duration;
+        assert!(check_run_deadline(Duration::from_millis(1)).is_ok());
+        assert!(check_run_deadline(HV_RUN_DEADLINE_MAX).is_ok());
+        for t in [
+            Duration::ZERO,
+            HV_RUN_DEADLINE_MAX + Duration::from_nanos(1),
+        ] {
+            assert_eq!(
+                check_run_deadline(t).unwrap_err().code(),
+                MicrovmErrorCode::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn mvm5_3786_finish_run_classifies_and_accumulates() {
+        use std::time::Duration;
+        let d = Duration::from_millis(5);
+        let (r, rec1) = finish_run(Ok(HvVcpuExit::Canceled), true, d);
+        assert_eq!(r.unwrap_err().code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(rec1.outcome, HvRunOutcome::DeadlineExceeded);
+        let (r, rec2) = finish_run(Ok(HvVcpuExit::Canceled), false, d);
+        assert_eq!(r.unwrap(), HvVcpuExit::Canceled);
+        assert_eq!(rec2.outcome, HvRunOutcome::Exit("canceled"));
+        let (_, rec3) = finish_run(Ok(HvVcpuExit::VtimerActivated), true, d);
+        assert_eq!(rec3.outcome, HvRunOutcome::Exit("vtimer"));
+        let (r, rec4) = finish_run(
+            Err(MicrovmError::new(MicrovmErrorCode::Internal, "x")),
+            false,
+            d,
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            rec4.outcome,
+            HvRunOutcome::Error(MicrovmErrorCode::Internal)
+        );
+        let mut st = HvRunStats::default();
+        for rec in [rec1, rec2, rec3, rec4] {
+            st.add(&rec);
+        }
+        assert_eq!(
+            st,
+            HvRunStats {
+                runs: 4,
+                exits: 2,
+                deadline_exceeded: 1,
+                errors: 1,
+                total_elapsed: Duration::from_millis(20),
+            }
         );
     }
 }

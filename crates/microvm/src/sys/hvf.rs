@@ -26,6 +26,8 @@
 //!   destroy は同じロックを持って id を `None` にしてから呼ぶため、破棄済み（番号が再利用されうる）の id へ
 //!   `hv_vcpus_exit` を送らない。他スレッドからの `hv_vcpus_exit` は `HV_EXIT_REASON_CANCELED` の説明からの
 //!   読みで、実機前提の試験で観測する。
+//! - `run_once` は期限つき（監視スレッドが `hv_vcpus_exit` で中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
+//!   `HvRunStats`・`HvRunObserver` へ残す（REPAIR-4）。期限なしの `hv_vcpu_run` は公開しない。
 //! - exit 領域は `HvVcpu` の寿命内だけ有効で、`run` の戻りの時点でコピーして値を返す（参照を外へ出さない）。
 //! - `HvVcpu` は `&HvVm` を借用し、vCPU が残ったまま `hv_vm_destroy` が走らない。vCPU スレッドで使うときは
 //!   `HvVm` を `Arc` で共有するか `std::thread::scope` を使う（#3791 の担当）。
@@ -45,14 +47,15 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    HvInterruptType, HvOp, HvReg, HvSysReg, HvVcpuExit, HvVcpuExitRaw, MemoryFlags,
-    check_map_range, classify_hv_return, decode_exit,
+    HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw,
+    MemoryFlags, check_map_range, check_run_deadline, classify_hv_return, decode_exit, finish_run,
 };
 use std::ffi::{c_int, c_long, c_void};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[link(name = "Hypervisor", kind = "framework")]
 // SAFETY: 宣言は Hypervisor.framework（macOS 11 以降・Apple Silicon）の C ABI に一致させている
@@ -222,6 +225,8 @@ impl HvVm {
             id,
             exit,
             cancel: Arc::new(Mutex::new(Some(id))),
+            stats: HvRunStats::default(),
+            observer: None,
             _thread: PhantomData,
         })
     }
@@ -455,7 +460,22 @@ pub struct HvVcpu<'a> {
     /// フレームワークが返す exit 領域。vCPU の寿命内だけ有効。
     exit: *const HvVcpuExitRaw,
     cancel: Arc<Mutex<Option<u64>>>,
+    stats: HvRunStats,
+    observer: Option<Arc<dyn HvRunObserver>>,
     _thread: PhantomData<*const ()>,
+}
+
+/// 期限監視スレッドが超過後に `hv_vcpus_exit` を繰り返す間隔（`cancel` が `run` より先に届いたときの取りこぼし対策）。
+const KICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 監視スレッドへ「実行が戻った」ことを知らせる。drop でも立てるため、panic でも監視が残らない。
+struct DoneGuard<'a>(&'a (Mutex<bool>, Condvar));
+
+impl Drop for DoneGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.1.notify_all();
+    }
 }
 
 impl HvVcpu<'_> {
@@ -466,8 +486,72 @@ impl HvVcpu<'_> {
         }
     }
 
-    /// ゲストを走らせ、戻った理由を返す。未知の理由は `Unknown` で、呼び出し側は VM を止める（fail-closed）。
-    pub fn run(&mut self) -> Result<HvVcpuExit, MicrovmError> {
+    /// ゲストを走らせ、戻った理由を返す。`timeout` を超えると監視スレッドが `hv_vcpus_exit` を送り
+    /// `DeadlineExceeded` で戻る（REPAIR-5）。`timeout` は 0 不可・上限 `HV_RUN_DEADLINE_MAX`（`InvalidArgument`）。
+    ///
+    /// 外部の `VcpuCanceller::cancel` による停止は `Ok(Canceled)`。未知の理由は `Unknown` で、呼び出し側は
+    /// VM を止める（fail-closed）。結果と所要時間は `stats` と観測器（`set_observer`）へ、エラー経路も含めて残す
+    /// （REPAIR-4）。期限の入力検査の失敗は発行前のため記録しない。
+    pub fn run_once(&mut self, timeout: Duration) -> Result<HvVcpuExit, MicrovmError> {
+        check_run_deadline(timeout)?;
+        let canceller = self.canceller();
+        let done = (Mutex::new(false), Condvar::new());
+        let fired = AtomicBool::new(false);
+        let start = Instant::now();
+        let result = std::thread::scope(|scope| {
+            let watchdog = std::thread::Builder::new()
+                .name("hvf-run-deadline".to_string())
+                .spawn_scoped(scope, || {
+                    let (lock, cv) = &done;
+                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (guard, res) = cv
+                        .wait_timeout_while(guard, timeout, |d| !*d)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if !res.timed_out() || *guard {
+                        return;
+                    }
+                    drop(guard);
+                    fired.store(true, Ordering::SeqCst);
+                    loop {
+                        // 失敗（vCPU 破棄済み等）は戻りの側が結果を持つため無視する。
+                        let _ = canceller.cancel();
+                        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let (guard, _) = cv
+                            .wait_timeout_while(guard, KICK_INTERVAL, |d| !*d)
+                            .unwrap_or_else(|e| e.into_inner());
+                        if *guard {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|_| internal("failed to spawn the run deadline thread"))?;
+            let run_result = {
+                let _guard = DoneGuard(&done);
+                self.run_unbounded()
+            };
+            let _ = watchdog.join();
+            run_result
+        });
+        let (result, record) = finish_run(result, fired.load(Ordering::SeqCst), start.elapsed());
+        self.stats.add(&record);
+        if let Some(o) = &self.observer {
+            o.record(&record);
+        }
+        result
+    }
+
+    /// 累積の実行統計（REPAIR-4）。
+    pub fn stats(&self) -> HvRunStats {
+        self.stats
+    }
+
+    /// 実行結果の観測器を設定する（構造化ログ・メトリクスへの接続口。REPAIR-4）。
+    pub fn set_observer(&mut self, observer: Arc<dyn HvRunObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// 期限なしの `hv_vcpu_run`。公開しない（`run_once` の監視下でだけ呼ぶ。REPAIR-5）。
+    fn run_unbounded(&mut self) -> Result<HvVcpuExit, MicrovmError> {
         // SAFETY: id は生存中の vCPU で、呼び出しは作成スレッド（!Send）。
         let rc = unsafe { hv_vcpu_run(self.id) };
         classify_hv_return(HvOp::VcpuRun, rc)?;

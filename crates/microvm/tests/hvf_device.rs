@@ -109,7 +109,7 @@ fn hvf_device_vcpu_regs_roundtrip() {
         std::process::exit(124);
     });
 
-    let exit = vcpu.run();
+    let exit = vcpu.run_once(VCPU_DEADLINE);
     done.store(true, Ordering::Release);
     stopper.join().unwrap();
     watchdog.join().unwrap();

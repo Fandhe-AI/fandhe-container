@@ -1530,16 +1530,20 @@ fn validate_vcpu_threads(n: usize) -> Result<u32, MicrovmError> {
 struct StartGate {
     open: Mutex<bool>,
     cv: Condvar,
+    /// 待ちの上限（本番は [`START_GATE_WAIT`]。試験で短くする）。
+    wait_limit: Duration,
 }
 
-/// ゲート待ちの上限（呼び出し側が必ず開けるので通常は到達しない。到達しても停止要求の確認へ進むだけで無限待ちを作らない）。
+/// ゲート待ちの上限（呼び出し側が必ず開けるので通常は到達しない。到達したスレッドは全台へ停止を要求し、
+/// ゲスト実行へ進まず body を drop して異常終了として計上する。無限待ちも未生成のままの実行も作らない）。
 const START_GATE_WAIT: Duration = Duration::from_secs(30);
 
 impl StartGate {
-    fn new() -> Self {
+    fn new(wait_limit: Duration) -> Self {
         StartGate {
             open: Mutex::new(false),
             cv: Condvar::new(),
+            wait_limit,
         }
     }
 
@@ -1548,13 +1552,14 @@ impl StartGate {
         self.cv.notify_all();
     }
 
-    fn wait(&self) {
-        let limit = Instant::now() + START_GATE_WAIT;
+    /// ゲートが開いたら `true`、期限切れなら `false`（期限切れのスレッドはゲスト実行へ進んではならない）。
+    fn wait(&self) -> bool {
+        let limit = Instant::now() + self.wait_limit;
         let mut g = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         while !*g {
             let left = limit.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                return false;
             }
             g = self
                 .cv
@@ -1562,6 +1567,7 @@ impl StartGate {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+        true
     }
 }
 
@@ -1583,19 +1589,35 @@ fn spawn_loops<T: VcpuLoopBody>(
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
-    spawn_loops_with(bodies, started, serial, |name, job| {
+    spawn_loops_gated(bodies, started, serial, START_GATE_WAIT, |name, job| {
         thread::Builder::new().name(name).spawn(job)
     })
 }
 
-/// [`spawn_loops`] の本体。`spawn` はスレッド生成（試験でだけ失敗を注入する）。
-///
-/// 数を検証してから確保する。k 本目の生成が失敗したら、全台へ停止を要求し、生成済みを 1 つの期限（[`DROP_STOP_WAIT`]）で
-/// 回収してから失敗を返す。未生成の `body` と失敗した job は drop される（fd・mmap は解放される。#887）。
+/// [`spawn_loops_gated`] を本番のゲート待ち上限で呼ぶ（試験で生成を差し替える入口）。
+#[cfg(test)]
 fn spawn_loops_with<T, S>(
     bodies: Vec<T>,
     started: Instant,
     serial: SerialConsole,
+    spawn: S,
+) -> Result<RunningMicroVm, MicrovmError>
+where
+    T: VcpuLoopBody,
+    S: FnMut(String, VcpuJob) -> std::io::Result<JoinHandle<()>>,
+{
+    spawn_loops_gated(bodies, started, serial, START_GATE_WAIT, spawn)
+}
+
+/// [`spawn_loops`] の本体。`spawn` はスレッド生成（試験でだけ失敗を注入する）。`gate_wait` は起動ゲートの待ち上限。
+///
+/// 数を検証してから確保する。k 本目の生成が失敗したら、全台へ停止を要求し、生成済みを 1 つの期限（[`DROP_STOP_WAIT`]）で
+/// 回収してから失敗を返す。未生成の `body` と失敗した job は drop される（fd・mmap は解放される。#887）。
+fn spawn_loops_gated<T, S>(
+    bodies: Vec<T>,
+    started: Instant,
+    serial: SerialConsole,
+    gate_wait: Duration,
     mut spawn: S,
 ) -> Result<RunningMicroVm, MicrovmError>
 where
@@ -1620,7 +1642,7 @@ where
         vcpu_count: count,
     });
     let mut handles = Vec::with_capacity(bodies.len());
-    let gate = Arc::new(StartGate::new());
+    let gate = Arc::new(StartGate::new(gate_wait));
     let release = GateRelease(Arc::clone(&gate));
     for (i, body) in bodies.into_iter().enumerate() {
         let thread_gate = Arc::clone(&gate);
@@ -1630,8 +1652,18 @@ where
         // `body` の drop がこの guard の drop より先に走り、「解放後に計上」の順序が正常・panic の両経路で成り立つ。
         let job: VcpuJob = Box::new(move || {
             let guard = guard;
-            thread_gate.wait();
-            vcpu_loop(body, &guard);
+            if thread_gate.wait() {
+                vcpu_loop(body, &guard);
+            } else {
+                // 期限切れ: 全台の生成完了前にゲストを実行しない。全台へ停止を要求し、body を先に解放してから
+                // guard の drop が異常終了として計上する（REPAIR-4・REPAIR-5）。
+                guard.agg.stop.request();
+                drop(body);
+                log_line(format_args!(
+                    "level=error op=microvm.start_gate outcome=error code={}",
+                    MicrovmErrorCode::DeadlineExceeded.as_str()
+                ));
+            }
         });
         match spawn(format!("microvm-vcpu-{index}"), job) {
             Ok(h) => handles.push(h),
@@ -2779,6 +2811,36 @@ mod lifecycle_tests {
         assert_eq!(Arc::strong_count(&p.hold), 1);
         // 起動ゲートにより、生成済みスレッドもゲストを一度も実行していない（回収が 5 秒を超える窓が無い）。
         assert_eq!(p.total_steps.load(Ordering::SeqCst), 0);
+    }
+
+    /// REPAIR-4・REPAIR-5・#3738: ゲートが期限切れになったスレッドはゲスト実行へ進まず、全台が停止して body が解放される。
+    #[test]
+    fn mvm1_3738_gate_expiry_does_not_run_guest() {
+        let p = Probe::new();
+        let running = spawn_loops_gated(
+            p.bodies(2),
+            Instant::now(),
+            SerialConsole::new(),
+            Duration::from_millis(100),
+            |name: String, job: VcpuJob| {
+                if name == "microvm-vcpu-1" {
+                    // 後続の生成が遅延し、先に生成した vCPU 0 のゲート待ちが期限切れになる。
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                thread::Builder::new().name(name).spawn(job)
+            },
+        )
+        .unwrap();
+        let watch = running.exit_watch();
+        // 期限切れの vCPU は異常終了として計上され、全台が止まる。
+        assert_eq!(
+            watch.wait(Duration::from_secs(10)).unwrap(),
+            VcpuExitState::ExitedAbnormally
+        );
+        let _ = running.stop(Duration::from_secs(5));
+        assert_eq!(p.total_steps.load(Ordering::SeqCst), 0);
+        assert_eq!(p.drops(), 2);
+        assert_eq!(Arc::strong_count(&p.hold), 1);
     }
 }
 #[cfg(test)]

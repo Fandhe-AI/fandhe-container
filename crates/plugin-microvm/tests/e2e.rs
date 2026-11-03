@@ -63,7 +63,12 @@ impl TempDir {
             .open(&p)
             .expect("create file");
         f.write_all(data).expect("write file");
-        p.to_str().expect("utf8 path").to_string()
+        // adapter は祖先の symlink も拒否するため正規化して返す（macOS の `/tmp` → `/private/tmp`。#3748）。
+        std::fs::canonicalize(&p)
+            .expect("canonicalize")
+            .to_str()
+            .expect("utf8 path")
+            .to_string()
     }
 }
 

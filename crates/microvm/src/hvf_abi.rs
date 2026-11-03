@@ -584,19 +584,37 @@ pub fn check_gic_supported(v: MacosVersion) -> Result<(), MicrovmError> {
     Ok(())
 }
 
-/// `hv_gic_intid_t`（`uint16_t` の列挙。生の数値を渡し回さない。REPAIR-2）。
+/// `hv_gic_intid_t`（`uint16_t` の列挙）の識別値。`hv_gic_get_intid` へ渡す「割り込みの種類」の選択子で、
+/// ゲスト側の PPI 番号（INTID）そのものではない。INTID は [`GicIntid`] として戻り値から得る。
 ///
-/// 値は Arm BSA が推奨する PPI 番号に由来する暫定値で、SDK ヘッダ（`hv_gic_types.h`）との照合は
-/// 人間担当の #3803 で行う。出力側の intid はハードコードせず `hv_gic_get_intid` の戻り値を使う。
+/// 列挙値の数値は SDK ヘッダ（`hv_gic_types.h`）との照合が人間担当の #3803 で未了の暫定値（実機未確認）。
+/// 呼び出し側は数値を直接書かず定数だけを使う（REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvGicIntid(u16);
 
 impl HvGicIntid {
-    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER`（暫定値 27）。
+    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` の列挙識別値（暫定。#3803 で照合）。
     pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(27);
 
-    /// FFI へ渡す値。
+    /// FFI へ渡す列挙識別値。
     pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// `hv_gic_get_intid` が返すゲスト側の割り込み番号（INTID）。列挙識別値 [`HvGicIntid`] とは別の型にして
+/// 取り違えを防ぐ。FDT の割り込み指定などはこの値から組み立て、ハードコードしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GicIntid(u32);
+
+impl GicIntid {
+    /// FFI の戻り値から作る。
+    pub const fn new(raw: u32) -> Self {
+        GicIntid(raw)
+    }
+
+    /// 生の INTID。
+    pub const fn get(self) -> u32 {
         self.0
     }
 }
@@ -942,5 +960,6 @@ mod tests {
             "hv_gic_get_spi_interrupt_range returned HV_UNSUPPORTED"
         );
         assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 27);
+        assert_eq!(GicIntid::new(27).get(), 27);
     }
 }

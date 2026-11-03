@@ -61,10 +61,10 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit,
-    HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags, check_gic_supported,
-    check_map_range, check_run_deadline, classify_hv_return, decode_exit, finish_run,
-    parse_macos_product_version,
+    GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg,
+    HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
+    check_gic_supported, check_map_range, check_run_deadline, classify_hv_return, decode_exit,
+    finish_run, parse_macos_product_version,
 };
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
@@ -927,12 +927,12 @@ impl GicApi {
     }
 
     /// 予約済みの割り込み `id` の割り込み番号（INTID）。
-    pub fn intid(&self, id: HvGicIntid) -> Result<u32, MicrovmError> {
+    pub fn intid(&self, id: HvGicIntid) -> Result<GicIntid, MicrovmError> {
         let mut out = 0u32;
         // SAFETY: 出力先はローカル変数 `out` だけ。`id.bits()` は `uint16_t` の値。
         let rc = unsafe { (self.get_intid)(id.bits(), &mut out) };
         classify_hv_return(HvOp::GicGetIntid, rc)?;
-        Ok(out)
+        Ok(GicIntid::new(out))
     }
 
     /// SPI の入力レベルを設定する。

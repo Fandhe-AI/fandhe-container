@@ -201,7 +201,7 @@ fn hvf_device_gic_symbols_resolve() {
     assert!(dist_align.is_power_of_two() && redist_align.is_power_of_two());
     assert!(spi_base >= 32 && spi_count > 0);
 
-    let timer = api.intid(HvGicIntid::EL1_VIRTUAL_TIMER).unwrap();
+    let timer = api.intid(HvGicIntid::EL1_VIRTUAL_TIMER).unwrap().get();
     eprintln!("hvf_device: EL1_VIRTUAL_TIMER intid={timer}");
     assert!((16..=31).contains(&timer));
 }

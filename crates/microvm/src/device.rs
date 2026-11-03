@@ -8,8 +8,8 @@
 //! TASK-74.4.2（#883）で exit のデバイスへの振り分けと IN・MMIO read の応答の書き戻し（[`VcpuFd::handle_exit`]。
 //! 振り分け先は `crate::dispatch`）と、実機で確かめる自己診断 [`KvmDevice::probe_exit_dispatch`] を足した。
 //! ゲストメモリ（アクセス型は TASK-74.1 配下の後続 sub-issue、mmap と KVM 登録は TASK-75.1。docs/design/microvm-memory-ownership.md）・
-//! 停止は `microvm::RunningMicroVm::stop` が期限つき `run_once` のポーリングで行う（TASK-75.4.1・#886）。
-//! 他スレッドからの即時の kick・一時停止は未実装で、後続が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
+//! 停止は `microvm::RunningMicroVm::stop` が `StopSignal` を立て、実行中の `KVM_RUN` を `immediate_exit` と kick で即時に中断する（TASK-75.4.1・#886・#3736）。
+//! 一時停止は未実装で、後続が [`VmFd`]・[`VcpuFd`]（いずれも `AsFd`）を使って足す（REPAIR-3）。
 //! `run_once` は期限つき（`immediate_exit` とシグナルで中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //! [`RunStats`]・[`RunObserver`] へ残す（REPAIR-4）。
 //! TASK-74.2.3（#879）で割り込み通知を足した: [`VmFd::create_irqchip`]（x86_64。vCPU より前に作る）・
@@ -39,7 +39,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::boot_x86::BootCpuState;
@@ -411,8 +411,27 @@ impl VcpuFd {
     /// EINTR / EAGAIN は [`VcpuExit::Interrupted`]（再実行できる）。exit のデバイスへの振り分けと
     /// IN・MMIO 読み出しの応答の書き戻しは [`VcpuFd::handle_exit`] が担う（次の `run_once` の前に呼ぶ）。結果と所要時間は統計と記録器へ残す（REPAIR-4）。
     pub fn run_once(&mut self, timeout: Duration) -> Result<VcpuExit, MicrovmError> {
+        // 公開 API には停止要求の経路が無い（要求されることのないローカルの信号を渡す）。
+        self.run_once_inner(timeout, &StopSignal::new())
+    }
+
+    /// [`VcpuFd::run_once`] に外部からの停止要求（[`StopSignal`]）を加えたもの。`RunningMicroVm` の vCPU ループが使う
+    /// （#3736・MVM-1・REPAIR-5）。要求されると `KVM_RUN` を中断して `Interrupted` で戻る（呼び出し側が信号を確認する）。
+    pub(crate) fn run_once_with_stop(
+        &mut self,
+        timeout: Duration,
+        signal: &StopSignal,
+    ) -> Result<VcpuExit, MicrovmError> {
+        self.run_once_inner(timeout, signal)
+    }
+
+    fn run_once_inner(
+        &mut self,
+        timeout: Duration,
+        signal: &StopSignal,
+    ) -> Result<VcpuExit, MicrovmError> {
         let start = Instant::now();
-        let result = self.run_bounded(timeout);
+        let result = self.run_bounded(timeout, signal);
         let elapsed = start.elapsed();
         let outcome = match &result {
             Ok(VcpuExit::Interrupted) => RunOutcome::Interrupted,
@@ -464,7 +483,11 @@ impl VcpuFd {
         Ok(outcome)
     }
 
-    fn run_bounded(&mut self, timeout: Duration) -> Result<VcpuExit, MicrovmError> {
+    fn run_bounded(
+        &mut self,
+        timeout: Duration,
+        signal: &StopSignal,
+    ) -> Result<VcpuExit, MicrovmError> {
         if timeout.is_zero() || timeout > RUN_DEADLINE_MAX {
             return Err(MicrovmError::new(
                 MicrovmErrorCode::InvalidArgument,
@@ -500,30 +523,43 @@ impl VcpuFd {
                 format!("cannot unblock vCPU kick signal (os error {n})"),
             ),
         })?;
+        // 要求済みなら `KVM_RUN` を発行せず戻る（ループ先頭の確認と run の開始の間に来た要求を即時に処理する）。
+        if signal.is_requested() {
+            return Ok(VcpuExit::Interrupted);
+        }
         // `target` は closure の中でだけ使え、vCPU スレッドが生存中であることを型が保証する（sys::KickTarget）。
+        // kick を出すのはこの scope の監視スレッドだけで、`KVM_RUN` 1 回分の間しか生きない。
         let timed_out = AtomicBool::new(false);
-        let (tx, rx) = mpsc::channel::<()>();
+        let fired = AtomicBool::new(false);
+        let run_done = AtomicBool::new(false);
         let run = &self.run;
         let fd = self.fd.as_fd();
         let timed_out_ref = &timed_out;
+        let fired_ref = &fired;
+        let run_done_ref = &run_done;
         let outcome = sys::with_current_thread(|target| {
             std::thread::scope(|scope| {
                 let watchdog = std::thread::Builder::new()
                     .name("kvm-run-deadline".into())
                     .spawn_scoped(scope, move || {
-                        if let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
-                            timed_out_ref.store(true, Ordering::SeqCst);
-                            let _ = run.set_immediate_exit(true);
-                            // シグナルが ioctl 突入前に届いても immediate_exit が効くが、取りこぼしに備えて繰り返す。
-                            loop {
+                        let o = watch_run(
+                            signal,
+                            run_done_ref,
+                            timeout,
+                            |on| {
+                                let _ = run.set_immediate_exit(on);
+                            },
+                            || {
                                 let _ = target.kick();
-                                if !matches!(
-                                    rx.recv_timeout(KICK_INTERVAL),
-                                    Err(RecvTimeoutError::Timeout)
-                                ) {
-                                    break;
-                                }
+                            },
+                        );
+                        match o {
+                            WatchOutcome::Finished => {}
+                            WatchOutcome::TimedOut => {
+                                timed_out_ref.store(true, Ordering::SeqCst);
+                                fired_ref.store(true, Ordering::SeqCst);
                             }
+                            WatchOutcome::Stopped => fired_ref.store(true, Ordering::SeqCst),
                         }
                     })
                     .map_err(|_| {
@@ -533,14 +569,15 @@ impl VcpuFd {
                         )
                     })?;
                 let r = sys::kvm_run(fd);
-                drop(tx);
+                run_done.store(true, Ordering::SeqCst);
+                signal.notify();
                 let _ = watchdog.join();
                 Ok::<_, MicrovmError>(r)
             })
         })?;
         let expired = timed_out.load(Ordering::SeqCst);
-        if expired {
-            // 監視スレッドは join 済み。次回の実行を妨げないよう下ろす。
+        if fired.load(Ordering::SeqCst) {
+            // 監視スレッドは join 済み。次回の実行を妨げないよう下ろす（期限切れ・停止要求のどちらでも）。
             let _ = self.run.set_immediate_exit(false);
         }
         match outcome {
@@ -554,6 +591,100 @@ impl VcpuFd {
             },
         }
     }
+}
+
+/// 外部（`RunningMicroVm::stop` / drop）から vCPU の `KVM_RUN` へ停止を伝える信号（#3736・MVM-1・REPAIR-5）。
+///
+/// 所有関係: `RunningMicroVm` と vCPU ループが持つのはこの `Arc<StopSignal>` だけで、スレッド識別子は持たない。
+/// [`StopSignal::request`] は状態の更新と condvar の通知だけを行い、シグナルは送らない。kick（`SIGUSR2`）を出すのは
+/// `run_bounded` の `with_current_thread` の中で生きている監視スレッドだけで、そのスレッドは `KVM_RUN` 1 回分の間だけ生き、
+/// join されてから `with_current_thread` が戻る。したがって vCPU スレッドが終わった後に `request` が呼ばれても
+/// `pthread_kill` は発行されず、終了したスレッドへの送信も tid の再利用も構造上起きない。
+/// 複数の vCPU が同じ信号を共有できる（run ごとの完了状態は共有せず、`run_bounded` のローカルに置く。#3738 向け）。
+#[derive(Debug, Default)]
+pub(crate) struct StopSignal {
+    requested: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl StopSignal {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 停止を要求して待ち手をすべて起こす。何度呼んでもよい。
+    pub(crate) fn request(&self) {
+        *self.requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        *self.requested.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// run の完了を待ち手へ知らせる。ロックを一度取って放すことで、待ち手の条件確認と待ち入りの間の通知の取りこぼしを防ぐ。
+    fn notify(&self) {
+        drop(self.requested.lock().unwrap_or_else(|p| p.into_inner()));
+        self.cv.notify_all();
+    }
+}
+
+/// 監視スレッドの結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchOutcome {
+    /// run が先に終わった（kick も `immediate_exit` も使っていない）。
+    Finished,
+    /// 期限に達した。
+    TimedOut,
+    /// 外部から停止が要求された。
+    Stopped,
+}
+
+/// `run_bounded` の監視スレッドの本体。KVM なしで試験できるよう、副作用（`immediate_exit` の設定と kick）は
+/// クロージャで受ける。run の完了（`run_done`）を観測した後は一度も kick しない（#3736・REPAIR-5）。
+fn watch_run(
+    signal: &StopSignal,
+    run_done: &AtomicBool,
+    timeout: Duration,
+    set_exit: impl Fn(bool),
+    mut kick: impl FnMut(),
+) -> WatchOutcome {
+    let deadline = Instant::now() + timeout;
+    let mut guard = signal.requested.lock().unwrap_or_else(|p| p.into_inner());
+    let outcome = loop {
+        if run_done.load(Ordering::SeqCst) {
+            return WatchOutcome::Finished;
+        }
+        if *guard {
+            break WatchOutcome::Stopped;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break WatchOutcome::TimedOut;
+        }
+        guard = signal
+            .cv
+            .wait_timeout(guard, deadline - now)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+    };
+    drop(guard);
+    set_exit(true);
+    // シグナルが ioctl 突入前に届いても immediate_exit が効くが、取りこぼしに備えて run の完了まで繰り返す。
+    while !run_done.load(Ordering::SeqCst) {
+        kick();
+        let mut g = signal.requested.lock().unwrap_or_else(|p| p.into_inner());
+        if run_done.load(Ordering::SeqCst) {
+            break;
+        }
+        g = signal
+            .cv
+            .wait_timeout(g, KICK_INTERVAL)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+        drop(g);
+    }
+    outcome
 }
 
 impl AsFd for VcpuFd {
@@ -1399,6 +1530,145 @@ fn run_probe_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    fn watch_in_thread(
+        signal: &StopSignal,
+        run_done: &AtomicBool,
+        timeout: Duration,
+        exits: &Mutex<Vec<bool>>,
+        kicks: &AtomicU32,
+        body: impl FnOnce() + Send,
+    ) -> WatchOutcome {
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                watch_run(
+                    signal,
+                    run_done,
+                    timeout,
+                    |on| exits.lock().unwrap().push(on),
+                    || {
+                        kicks.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            // body が panic / assert 失敗しても run_done を立てて通知し、scope の暗黙 join で停止しないようにする。
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            run_done.store(true, Ordering::SeqCst);
+            signal.notify();
+            let o = h.join().unwrap();
+            if let Err(e) = r {
+                std::panic::resume_unwind(e);
+            }
+            o
+        })
+    }
+
+    /// 条件成立を期限つき（10 秒）で待つ。超えたら panic で失敗させ、無期限に待たない（REPAIR-5）。
+    fn wait_kicked(kicks: &AtomicU32) {
+        let start = Instant::now();
+        while kicks.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "kick was not observed within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// REPAIR-5・MVM-1（#3736）: 停止要求なしで run が完了すれば kick も immediate_exit も使わない。
+    #[test]
+    fn mvm1_3736_watch_finished_run_never_kicks() {
+        let (sig, done) = (StopSignal::new(), AtomicBool::new(false));
+        let (exits, kicks) = (Mutex::new(vec![]), AtomicU32::new(0));
+        let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {
+            std::thread::sleep(Duration::from_millis(20));
+            done.store(true, Ordering::SeqCst);
+            sig.notify();
+        });
+        assert_eq!(o, WatchOutcome::Finished);
+        assert_eq!(kicks.load(Ordering::SeqCst), 0);
+        assert!(exits.lock().unwrap().is_empty());
+    }
+
+    /// MVM-1・REPAIR-5（#3736）: 停止要求で immediate_exit を立てて kick し、run の完了後は kick を止める。
+    #[test]
+    fn mvm1_3736_watch_stop_request_sets_exit_then_kicks_until_run_done() {
+        let (sig, done) = (StopSignal::new(), AtomicBool::new(false));
+        let (exits, kicks) = (Mutex::new(vec![]), AtomicU32::new(0));
+        let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {
+            std::thread::sleep(Duration::from_millis(10));
+            sig.request();
+            wait_kicked(&kicks);
+            done.store(true, Ordering::SeqCst);
+            sig.notify();
+        });
+        assert_eq!(o, WatchOutcome::Stopped);
+        assert_eq!(*exits.lock().unwrap(), vec![true]);
+        let after = kicks.load(Ordering::SeqCst);
+        assert!(after >= 1);
+        std::thread::sleep(KICK_INTERVAL * 3);
+        assert_eq!(kicks.load(Ordering::SeqCst), after);
+    }
+
+    /// REPAIR-5・MVM-1（#3736）: run の完了後に停止が要求されても kick を出さない（停止済みスレッドへ送らない）。
+    #[test]
+    fn mvm1_3736_watch_no_kick_after_run_done_even_if_stop_requested() {
+        let (sig, done) = (StopSignal::new(), AtomicBool::new(true));
+        let (exits, kicks) = (Mutex::new(vec![]), AtomicU32::new(0));
+        sig.request();
+        let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {});
+        assert_eq!(o, WatchOutcome::Finished);
+        assert_eq!(kicks.load(Ordering::SeqCst), 0);
+        assert!(exits.lock().unwrap().is_empty());
+    }
+
+    /// MVM-1・REPAIR-5（#3736）: 監視の開始前に要求済みなら、期限を待たず即座に Stopped になる。
+    #[test]
+    fn mvm1_3736_watch_stop_requested_before_start_fires_immediately() {
+        let (sig, done) = (StopSignal::new(), AtomicBool::new(false));
+        let (exits, kicks) = (Mutex::new(vec![]), AtomicU32::new(0));
+        sig.request();
+        let t = Instant::now();
+        let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {
+            wait_kicked(&kicks);
+            done.store(true, Ordering::SeqCst);
+            sig.notify();
+        });
+        assert_eq!(o, WatchOutcome::Stopped);
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    /// REPAIR-5（#3736）: 期限に達したら TimedOut で immediate_exit を立てる。
+    #[test]
+    fn mvm1_3736_watch_deadline_reports_timed_out() {
+        let (sig, done) = (StopSignal::new(), AtomicBool::new(false));
+        let (exits, kicks) = (Mutex::new(vec![]), AtomicU32::new(0));
+        let o = watch_in_thread(
+            &sig,
+            &done,
+            Duration::from_millis(20),
+            &exits,
+            &kicks,
+            || {
+                wait_kicked(&kicks);
+                done.store(true, Ordering::SeqCst);
+                sig.notify();
+            },
+        );
+        assert_eq!(o, WatchOutcome::TimedOut);
+        assert_eq!(*exits.lock().unwrap(), vec![true]);
+    }
+
+    /// MVM-1（#3736）: request は冪等で、後から見える。
+    #[test]
+    fn mvm1_3736_stop_signal_request_is_idempotent_and_visible() {
+        let sig = StopSignal::new();
+        assert!(!sig.is_requested());
+        sig.request();
+        sig.request();
+        assert!(sig.is_requested());
+    }
 
     /// MVM-1: 上限まで `Interrupted` だけ、または `Hlt` 以外だけなら完了扱いにせず `Internal` で失敗する。
     #[cfg(target_arch = "x86_64")]

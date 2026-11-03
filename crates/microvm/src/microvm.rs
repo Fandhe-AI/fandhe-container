@@ -25,6 +25,16 @@
 //! 終了は [`StopReason`] で 1 つの [`StopReport`]（全台の統計の合計・きっかけの vCPU 番号）に集約し、同じ後始末を通る。
 //! 停止要求は `immediate_exit` と kick（`SIGUSR2`）で実行中の `KVM_RUN` を即時に中断する（#3736・REPAIR-5。`VCPU_POLL_INTERVAL` を待たない）。
 //!
+//! # virtio-net の受信ポーラー（#3742・MVM-1・REPAIR-5）
+//! ゲストの kick なしで backend のフレームを受信キューへ配送するため、virtio-net を含む VM には専用スレッド `microvm-net-rx`
+//! （`NetRxPoller`。1 VM に 1 本で全 net デバイスを担当）を足す。[`NET_RX_POLL_INTERVAL`] ごとに `interrupt::poll_net_rx` を呼ぶ。
+//! 選択の理由: vCPU ループ内のポーリングは、in-kernel irqchip で HLT が `KVM_RUN` の中で待たれるため受信遅延が最大
+//! `VCPU_POLL_INTERVAL` になる。別スレッドなら irqfd の注入で vCPU を起こせ、`StopAggregate` の参加者にすれば停止・panic・drop・
+//! spawn 失敗の後始末と「`stop` が `Ok` で戻れば解放済み」の契約を vCPU と共有できる。却下: backend の到着通知（`NetBackend` に
+//! API が無く実 backend も未定。TASK-75・TASK-117 で TAP を導入したら置き換えを検討する。REPAIR-3）。ロックは共有部 →
+//! トランスポートの順で vCPU の `dispatch_exit` と揃える。待ちは停止要求で即座に起き、リング破損・lock の poison は fail-closed で全台を止める。
+//! `start` の virtio-net の拒否の撤去と実機前提試験は #3743。
+//!
 //! # シリアル（TASK-75.5・#3740・MVM-1）
 //! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
 //! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
@@ -82,7 +92,8 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
 use crate::interrupt::{
-    BlockNotifyReport, InterruptLine, NetNotifyReport, complete_block_notify, complete_net_notify,
+    BlockNotifyReport, InterruptLine, NetNotifyReport, NetRxPollOutcome, complete_block_notify,
+    complete_net_notify, poll_net_rx,
 };
 use crate::irq::IrqFd;
 use crate::smp_x86::SipiVector;
@@ -751,6 +762,59 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         }
         Err(invalid("unknown virtio device"))
     }
+
+    /// 全 virtio-net の受信をゲストの kick なしで 1 回ずつ処理する（#3742・MVM-1・REPAIR-5）。
+    ///
+    /// 受信ポーラーが期限ごとに呼ぶ。各トランスポートの lock を順に取り（呼び出し元が共有部の lock を持つ前提で、
+    /// vCPU の `dispatch_exit` と同じ「共有部 → トランスポート」の順）、[`poll_net_rx`] を呼ぶ。リング破損は最初の 1 件を
+    /// `queue_error` に保持してそこで打ち切る（fail-closed。呼び出し元が VM を止める）。lock の poison と割り込み線の失敗は `Err`。
+    fn poll_net_rx<M: GuestMemoryBacking>(
+        &mut self,
+        mem: &mut GuestMemory<M>,
+    ) -> Result<NetRxPollReport, MicrovmError>
+    where
+        L: InterruptLine,
+    {
+        let mut report = NetRxPollReport::default();
+        for dev in &self.net {
+            let mut t = dev.transport.lock().map_err(|_| poisoned())?;
+            match poll_net_rx(&mut t, mem, &dev.line)? {
+                NetRxPollOutcome::Skipped(_) => report.skipped += 1,
+                NetRxPollOutcome::Polled(r) => {
+                    report.polled += 1;
+                    if let crate::interrupt::NetQueueStats::Rx(s) = r.stats {
+                        report.delivered = report.delivered.saturating_add(s.delivered);
+                    }
+                    report.completed = report.completed.saturating_add(r.stats.completed());
+                    if r.delivery == crate::interrupt::InterruptDelivery::Triggered {
+                        report.interrupts += 1;
+                    }
+                    if let Some(e) = r.queue_error {
+                        report.queue_error = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// [`DeviceBus::poll_net_rx`] の集計（crate 内。REPAIR-4）。
+#[derive(Debug, Default)]
+struct NetRxPollReport {
+    /// `process_rx` を呼んだデバイス数。
+    polled: u32,
+    /// 状態（未 activate・FAILED・キュー停止）で飛ばしたデバイス数。
+    skipped: u32,
+    /// used へ返した数の合計。
+    completed: u32,
+    /// ゲストのバッファへ配送したフレーム数の合計。
+    delivered: u32,
+    /// 注入した割り込みの回数。
+    interrupts: u32,
+    /// 最初に見つかったリング破損など（ゲスト起因）。
+    queue_error: Option<MicrovmError>,
 }
 
 /// 組み立て済みの microVM（VM fd・vCPU 群・登録済みゲストメモリ・virtio デバイス群）。
@@ -1132,6 +1196,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 /// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
 pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 受信ポーラー（`NetRxPoller`）が backend のフレームを確かめる周期（#3742・MVM-1・REPAIR-5）。値は暫定。
+///
+/// `NetBackend::recv` は待たない API で到着通知を持たないため、周期で取り出す。受信遅延の上限になるので
+/// [`VCPU_POLL_INTERVAL`] より短くし、busy loop にしないため下限は 1ms（`NET_RX_POLL_INTERVAL_MIN`）。待ちは停止要求で即座に起きる。
+pub const NET_RX_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// 受信ポーラーの周期の下限（0 による busy loop を防ぐ）。
+const NET_RX_POLL_INTERVAL_MIN: Duration = Duration::from_millis(1);
+/// 受信ポーラーの周期の上限（無期限に近い周期で受信が止まるのを防ぐ）。
+const NET_RX_POLL_INTERVAL_MAX: Duration = Duration::from_secs(1);
 /// [`RunningMicroVm::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。
 pub const STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
 /// [`RunningMicroVm`] が `stop` を経ずに drop されたときに、vCPU スレッドの終了を待つ上限。
@@ -1175,7 +1248,7 @@ pub struct StopReport {
     pub elapsed: Duration,
     /// 動かした vCPU スレッドの数。
     pub vcpu_count: u32,
-    /// 終了のきっかけになった vCPU の番号（`Requested` なら `None`）。
+    /// 終了のきっかけになった vCPU の番号（`Requested` なら `None`）。`None` で理由が `Requested` 以外なら、vCPU 以外（virtio-net の受信ポーラー。#3742）がきっかけ。
     pub origin_vcpu: Option<u32>,
 }
 
@@ -1238,7 +1311,7 @@ trait VcpuLoopBody: Send + 'static {
 /// `start` 後に全 vCPU スレッドが共有する VM の部品（#3738・MVM-1）。`Arc<Mutex<_>>` で持ち、exit 処理（デバイスの dispatch と
 /// 通知の完了）を 1 つの lock で直列にする。デバイス単位の並行は範囲外（REPAIR-3）。
 ///
-/// フィールドの宣言順が drop 順（デバイス → メモリ → VM fd）。最後の vCPU スレッドが `Arc` を落としたときに、
+/// フィールドの宣言順が drop 順（デバイス → メモリ → VM fd）。最後のスレッド（vCPU か受信ポーラー）が `Arc` を落としたときに、
 /// 全 `VcpuFd` が解放済みの状態でこの順に解放される（モジュール doc の「vCPU → デバイス → メモリ → VM fd」を保つ）。
 struct VmShared<B: BlockBackend, N: NetBackend> {
     devices: DeviceBus<B, N, IrqFd>,
@@ -1306,6 +1379,95 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> VcpuLoopB
     }
 }
 
+/// 受信ポーラーの対象（継ぎ目）。実体は [`VmShared`]。KVM なしでポーラーの契約を試験するためのトレイト。
+trait NetRxPollTarget: Send + 'static {
+    /// 全 virtio-net の受信を 1 回処理する（[`DeviceBus::poll_net_rx`]）。
+    fn poll_net_rx(&mut self) -> Result<NetRxPollReport, MicrovmError>;
+}
+
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> NetRxPollTarget
+    for VmShared<B, N>
+{
+    fn poll_net_rx(&mut self) -> Result<NetRxPollReport, MicrovmError> {
+        self.devices.poll_net_rx(&mut self.memory)
+    }
+}
+
+/// ゲストの kick なしで virtio-net の受信を処理する専用スレッド `microvm-net-rx` の本体（#3742・MVM-1・REPAIR-5）。
+///
+/// # 経路の選択と理由
+/// vCPU ループの中ではなく**専用スレッド**にした。
+/// - in-kernel irqchip ではゲストの HLT が `KVM_RUN` の中で待たれ [`VCPU_POLL_INTERVAL`] まで戻らない。vCPU ループ内でポーリングすると
+///   受信遅延が最大でその間隔になり、vCPU 0 のスケジューリングにも縛られる。別スレッドなら irqfd の注入で HLT 中の vCPU を起こせる。
+/// - 「`stop` が `Ok` で戻った時点で fd・mmap・irqfd 解放済み」の契約は、共有部の最後の `Arc` を持つスレッドが [`StopAggregate`] に
+///   数えられていることに依る。ポーラーも同じ機構（`spawn_loops_gated` の補助スレッド）の参加者にして、停止・panic・drop・spawn 失敗の
+///   後始末を共有する。
+/// - 却下: backend の到着通知（fd の poll）。`NetBackend` にその API が無く実 backend（TAP）も未定のため将来仕様（TASK-75・TASK-117。
+///   REPAIR-3）。TAP を導入したら通知へ置き換えを検討する。
+///
+/// # 契約
+/// 1 周期ごとに [`StopSignal::wait_requested`] で期限つきに待ち（停止要求で即起きる。REPAIR-5）、共有部の lock → トランスポートの
+/// lock の順（vCPU の `dispatch_exit` と同じ）で [`NetRxPollTarget::poll_net_rx`] を呼ぶ。1 回の処理量はデバイス数 × キュー長で頭打ち。
+/// リング破損・lock の poison・割り込み線の失敗は fail-closed で `Finish(Failed)` にし、全スレッドを止める。
+struct NetRxPoller<S: NetRxPollTarget> {
+    shared: Arc<Mutex<S>>,
+    interval: Duration,
+}
+
+impl<S: NetRxPollTarget> NetRxPoller<S> {
+    /// `interval` を `[NET_RX_POLL_INTERVAL_MIN, NET_RX_POLL_INTERVAL_MAX]` に検証して作る（範囲外は `InvalidArgument`）。
+    fn new(shared: Arc<Mutex<S>>, interval: Duration) -> Result<Self, MicrovmError> {
+        if !(NET_RX_POLL_INTERVAL_MIN..=NET_RX_POLL_INTERVAL_MAX).contains(&interval) {
+            return Err(invalid("net rx poll interval out of range"));
+        }
+        Ok(Self { shared, interval })
+    }
+}
+
+impl<S: NetRxPollTarget> VcpuLoopBody for NetRxPoller<S> {
+    fn step(&mut self, _slice: Duration, stop: &StopSignal) -> LoopStep {
+        if stop.wait_requested(self.interval) {
+            return LoopStep::Continue;
+        }
+        let result = match self.shared.lock() {
+            Ok(mut g) => g.poll_net_rx(),
+            Err(_) => Err(poisoned()),
+        };
+        let err = match result {
+            Ok(report) => match report.queue_error {
+                None => return LoopStep::Continue,
+                Some(e) => e,
+            },
+            Err(e) => e,
+        };
+        log_line(format_args!(
+            "level=error op=microvm.net_rx_poll outcome=error code={}",
+            err.code().as_str()
+        ));
+        LoopStep::Finish(StopReason::Failed(err.code()))
+    }
+
+    fn stats(&self) -> RunStats {
+        RunStats::default()
+    }
+}
+
+impl VcpuLoopBody for Box<dyn VcpuLoopBody> {
+    fn step(&mut self, slice: Duration, stop: &StopSignal) -> LoopStep {
+        (**self).step(slice, stop)
+    }
+
+    fn stats(&self) -> RunStats {
+        (**self).stats()
+    }
+}
+
+/// vCPU 以外の補助スレッド（受信ポーラー）。集約（[`StopAggregate`]）の参加者として vCPU と同じ機構で起動・停止・回収する。
+struct AuxThread {
+    name: &'static str,
+    body: Box<dyn VcpuLoopBody>,
+}
+
 /// 構造化ログを 1 行 stderr へ出す（書き込みの失敗は捨てる。REPAIR-4）。
 fn log_line(args: std::fmt::Arguments<'_>) {
     use std::io::Write as _;
@@ -1318,7 +1480,7 @@ struct AggState {
     /// まだ終わっていないスレッド数。0 になったスレッドが確定処理をする。
     remaining: usize,
     /// 最初に記録された `Requested` 以外の終了理由と、そのきっかけの vCPU 番号。
-    reason: Option<(StopReason, u32)>,
+    reason: Option<(StopReason, Option<u32>)>,
     /// 終わったスレッドの統計の合計。
     stats: RunStats,
     /// panic の unwind などで正常に終われなかったスレッドがあった。
@@ -1355,7 +1517,7 @@ impl StopAggregate {
     }
 
     /// `Requested` 以外の終了を記録し（先勝ち）、全台へ停止を要求する。body の解放より前に呼ぶ。
-    fn note_finish(&self, reason: StopReason, index: u32) {
+    fn note_finish(&self, reason: StopReason, index: Option<u32>) {
         if reason == StopReason::Requested {
             return;
         }
@@ -1395,7 +1557,7 @@ impl StopAggregate {
             return;
         }
         let (stop_reason, origin_vcpu) = match reason {
-            Some((r, i)) => (r, Some(i)),
+            Some((r, i)) => (r, i),
             None => (StopReason::Requested, None),
         };
         // dispatch・通知完了・割り込み配送の失敗は vCPU の統計に載らないため、失敗終了なら最低 1 件を計上する。
@@ -1434,12 +1596,13 @@ impl StopAggregate {
 /// vCPU スレッドのクロージャが持つ guard。正常に `finish` せず drop された（panic の unwind）ら、全台を止めて異常終了として計上する。
 struct VcpuThreadGuard {
     agg: Arc<StopAggregate>,
-    index: u32,
+    /// vCPU 番号。補助スレッド（受信ポーラー）は `None`。
+    index: Option<u32>,
     done: std::cell::Cell<bool>,
 }
 
 impl VcpuThreadGuard {
-    fn new(agg: Arc<StopAggregate>, index: u32) -> Self {
+    fn new(agg: Arc<StopAggregate>, index: Option<u32>) -> Self {
         VcpuThreadGuard {
             agg,
             index,
@@ -1485,9 +1648,12 @@ fn vcpu_loop<T: VcpuLoopBody>(mut body: T, guard: &VcpuThreadGuard) {
         StopReason::Failed(c) => ("error", "error", format!(" code={}", c.as_str())),
         _ => ("info", "ok", String::new()),
     };
+    let who = match guard.index {
+        Some(i) => format!("op=microvm.vcpu_loop outcome={outcome} vcpu={i}"),
+        None => format!("op=microvm.net_rx_loop outcome={outcome}"),
+    };
     log_line(format_args!(
-        "level={level} op=microvm.vcpu_loop outcome={outcome} vcpu={} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
-        guard.index,
+        "level={level} {who} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
         reason.as_str(),
         stats.runs,
         stats.exits,
@@ -1606,12 +1772,18 @@ type VcpuJob = Box<dyn FnOnce() + Send + 'static>;
 /// 各 `body` を専用スレッド（`microvm-vcpu-<index>`）で駆動して [`RunningMicroVm`] を返す。
 fn spawn_loops<T: VcpuLoopBody>(
     bodies: Vec<T>,
+    aux: Vec<AuxThread>,
     started: Instant,
     serial: SerialConsole,
 ) -> Result<RunningMicroVm, MicrovmError> {
-    spawn_loops_gated(bodies, started, serial, START_GATE_WAIT, |name, job| {
-        thread::Builder::new().name(name).spawn(job)
-    })
+    spawn_loops_gated(
+        bodies,
+        aux,
+        started,
+        serial,
+        START_GATE_WAIT,
+        |name, job| thread::Builder::new().name(name).spawn(job),
+    )
 }
 
 /// [`spawn_loops_gated`] を本番のゲート待ち上限で呼ぶ（試験で生成を差し替える入口）。
@@ -1626,15 +1798,35 @@ where
     T: VcpuLoopBody,
     S: FnMut(String, VcpuJob) -> std::io::Result<JoinHandle<()>>,
 {
-    spawn_loops_gated(bodies, started, serial, START_GATE_WAIT, spawn)
+    spawn_loops_gated(bodies, Vec::new(), started, serial, START_GATE_WAIT, spawn)
+}
+
+/// [`spawn_loops_with`] の補助スレッドつき版（受信ポーラーの試験用）。
+#[cfg(test)]
+fn spawn_loops_with_aux<T, S>(
+    bodies: Vec<T>,
+    aux: Vec<AuxThread>,
+    started: Instant,
+    serial: SerialConsole,
+    spawn: S,
+) -> Result<RunningMicroVm, MicrovmError>
+where
+    T: VcpuLoopBody,
+    S: FnMut(String, VcpuJob) -> std::io::Result<JoinHandle<()>>,
+{
+    spawn_loops_gated(bodies, aux, started, serial, START_GATE_WAIT, spawn)
 }
 
 /// [`spawn_loops`] の本体。`spawn` はスレッド生成（試験でだけ失敗を注入する）。`gate_wait` は起動ゲートの待ち上限。
+///
+/// `aux`（受信ポーラー等）は vCPU の後に生成し、vCPU と同じ集約・起動ゲート・ロールバックに参加する。台数の検証と
+/// [`StopReport::vcpu_count`] は vCPU 数だけを数える（#3742）。
 ///
 /// 数を検証してから確保する。k 本目の生成が失敗したら、全台へ停止を要求し、生成済みを 1 つの期限（[`DROP_STOP_WAIT`]）で
 /// 回収してから失敗を返す。未生成の `body` と失敗した job は drop される（fd・mmap は解放される。#887）。
 fn spawn_loops_gated<T, S>(
     bodies: Vec<T>,
+    aux: Vec<AuxThread>,
     started: Instant,
     serial: SerialConsole,
     gate_wait: Duration,
@@ -1650,7 +1842,7 @@ where
     let (tx, rx) = mpsc::channel();
     let agg = Arc::new(StopAggregate {
         state: Mutex::new(AggState {
-            remaining: bodies.len(),
+            remaining: bodies.len() + aux.len(),
             reason: None,
             stats: RunStats::default(),
             abnormal: false,
@@ -1665,11 +1857,17 @@ where
     let mut release = GateRelease {
         gate: Arc::clone(&gate),
         stop: Arc::clone(&stop),
-        handles: Vec::with_capacity(bodies.len()),
+        handles: Vec::with_capacity(bodies.len() + aux.len()),
     };
-    for (i, body) in bodies.into_iter().enumerate() {
-        let thread_gate = Arc::clone(&gate);
+    // vCPU → 補助の順に、(スレッド名, vCPU 番号, body) を遅延して作る（未生成の body は失敗時にまとめて drop される）。
+    let vcpu_entries = bodies.into_iter().enumerate().map(|(i, body)| {
         let index = u32::try_from(i).unwrap_or(u32::MAX);
+        let boxed: Box<dyn VcpuLoopBody> = Box::new(body);
+        (format!("microvm-vcpu-{index}"), Some(index), boxed)
+    });
+    let aux_entries = aux.into_iter().map(|a| (a.name.to_string(), None, a.body));
+    for (name, index, body) in vcpu_entries.chain(aux_entries) {
+        let thread_gate = Arc::clone(&gate);
         let guard = VcpuThreadGuard::new(Arc::clone(&agg), index);
         // panic の unwind でも計上を残す。`body` は `vcpu_loop` のフレームが所有するため、unwind では
         // `body` の drop がこの guard の drop より先に走り、「解放後に計上」の順序が正常・panic の両経路で成り立つ。
@@ -1688,7 +1886,7 @@ where
                 ));
             }
         });
-        match spawn(format!("microvm-vcpu-{index}"), job) {
+        match spawn(name, job) {
             Ok(h) => release.handles.push(h),
             Err(e) => {
                 // 停止要求を先に立ててからゲートを開ける。生成済みスレッドは 1 step も実行せず body を drop して終わる。
@@ -2022,8 +2220,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// カーネルのエントリへ vCPU 0 を初期化し（[`MicroVm::setup_boot_vcpu`]）、vCPU ごとの専用スレッドで実行ループを始める（TASK-75.4.1・MVM-1）。
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU は 1 台につき 1 スレッドで、
-    /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成も、ゲストの kick なしで受信を処理する経路が
-    /// 未実装のため `Unimplemented`（将来仕様: 期限ごとの `process_rx` または backend 到着通知。MVM-1・TASK-117）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成は、受信ポーラー（`NetRxPoller`。期限ごとの
+    /// `process_rx`。#3742）を配線済みだが、`Unimplemented` の拒否は #3743（実機前提試験と同時）で撤去するまで残す（backend の到着通知は将来仕様。MVM-1・TASK-117）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -2048,8 +2246,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ) -> Result<RunningMicroVm, MicrovmError> {
         // スレッドと管理領域を確保する前に台数を検証する（#3738・REPAIR-5）。
         validate_vcpu_threads(self.vcpus.len())?;
-        // virtio-net の受信はゲストの kick が無くても backend のフレームを取り出す経路（期限ごとのポーリングか
-        // 到着通知）が要るが未実装のため、受信が止まる構成を黙って許さず拒否する（fail-closed。REPAIR-3・MVM-1。TASK-117）。
+        // 受信ポーラー（`NetRxPoller`。#3742）の配線は済んでいるが、拒否の撤去と実機前提試験は #3743 の担当のため、
+        // それまでは virtio-net を含む構成を黙って許さず拒否する（fail-closed。REPAIR-3・MVM-1。TASK-117）。
         if !self.devices.net.is_empty() {
             return Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
@@ -2066,6 +2264,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             memory,
             vm,
         } = self;
+        let has_net = !devices.net.is_empty();
         let shared = Arc::new(Mutex::new(VmShared {
             devices,
             memory,
@@ -2078,8 +2277,17 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
                 shared: Arc::clone(&shared),
             })
             .collect();
+        // virtio-net があるときだけ、ゲストの kick なしで受信を処理する専用スレッドを足す（#3742）。
+        let mut aux = Vec::new();
+        if has_net {
+            let poller = NetRxPoller::new(Arc::clone(&shared), NET_RX_POLL_INTERVAL)?;
+            aux.push(AuxThread {
+                name: "microvm-net-rx",
+                body: Box::new(poller),
+            });
+        }
         drop(shared);
-        spawn_loops(workers, started, serial)
+        spawn_loops(workers, aux, started, serial)
     }
 }
 
@@ -2094,7 +2302,7 @@ mod lifecycle_tests {
         started: Instant,
         serial: SerialConsole,
     ) -> Result<RunningMicroVm, MicrovmError> {
-        spawn_loops(vec![body], started, serial)
+        spawn_loops(vec![body], Vec::new(), started, serial)
     }
 
     /// 偽の body。step ごとに短く眠り、`finish_after` 回目で `Finish(GuestShutdown)` を返す。drop で `dropped` を立てる。
@@ -2706,7 +2914,13 @@ mod lifecycle_tests {
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
         assert_eq!(spawned, 0);
         assert_eq!(p.drops(), MAX_VCPUS as usize + 1);
-        let e = spawn_loops(p.bodies(0), Instant::now(), SerialConsole::new()).unwrap_err();
+        let e = spawn_loops(
+            p.bodies(0),
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
     }
 
@@ -2714,7 +2928,13 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_3738_stop_joins_all_vcpu_threads() {
         let p = Probe::new();
-        let running = spawn_loops(p.bodies(3), Instant::now(), SerialConsole::new()).unwrap();
+        let running = spawn_loops(
+            p.bodies(3),
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(30));
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::Requested);
@@ -2735,7 +2955,8 @@ mod lifecycle_tests {
             let p = Probe::new();
             let mut bodies = p.bodies(3);
             bodies[1].finish_at = Some((3, reason));
-            let running = spawn_loops(bodies, Instant::now(), SerialConsole::new()).unwrap();
+            let running =
+                spawn_loops(bodies, Vec::new(), Instant::now(), SerialConsole::new()).unwrap();
             let watch = running.exit_watch();
             let VcpuExitState::Exited(r) = watch.wait(Duration::from_secs(10)).unwrap() else {
                 panic!("expected Exited");
@@ -2758,7 +2979,8 @@ mod lifecycle_tests {
         let p = Probe::new();
         let mut bodies = p.bodies(3);
         bodies[2].panic_at = Some(2);
-        let running = spawn_loops(bodies, Instant::now(), SerialConsole::new()).unwrap();
+        let running =
+            spawn_loops(bodies, Vec::new(), Instant::now(), SerialConsole::new()).unwrap();
         let watch = running.exit_watch();
         assert_eq!(
             watch.wait(Duration::from_secs(10)).unwrap(),
@@ -2773,7 +2995,13 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_3738_shared_released_after_last_vcpu() {
         let p = Probe::new();
-        let running = spawn_loops(p.bodies(4), Instant::now(), SerialConsole::new()).unwrap();
+        let running = spawn_loops(
+            p.bodies(4),
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         assert_eq!(Arc::strong_count(&p.hold), 5);
         running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(Arc::strong_count(&p.hold), 1);
@@ -2786,7 +3014,8 @@ mod lifecycle_tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut bodies = p.bodies(3);
         bodies[1].gate = Some(Arc::clone(&gate));
-        let running = spawn_loops(bodies, Instant::now(), SerialConsole::new()).unwrap();
+        let running =
+            spawn_loops(bodies, Vec::new(), Instant::now(), SerialConsole::new()).unwrap();
         let watch = running.exit_watch();
         std::thread::sleep(Duration::from_millis(30));
         let t = Instant::now();
@@ -2806,7 +3035,13 @@ mod lifecycle_tests {
     #[test]
     fn mvm1_3738_drop_without_stop_joins_all() {
         let p = Probe::new();
-        let running = spawn_loops(p.bodies(3), Instant::now(), SerialConsole::new()).unwrap();
+        let running = spawn_loops(
+            p.bodies(3),
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
         drop(running);
         assert_eq!(p.drops(), 3);
     }
@@ -2866,6 +3101,7 @@ mod lifecycle_tests {
         let p = Probe::new();
         let running = spawn_loops_gated(
             p.bodies(2),
+            Vec::new(),
             Instant::now(),
             SerialConsole::new(),
             Duration::from_millis(100),
@@ -3396,6 +3632,419 @@ mod tests {
     }
 }
 /// 起動途中の失敗で取得済みの資源が解放されること（TASK-75.4.2・#887・MVM-1・ERR-1）。KVM は使わない。
+/// 受信ポーラー（#3742・MVM-1・REPAIR-5）の試験。KVM 不要（`HeapBacking` のゲストメモリと `MemoryNetBackend`）。
+#[cfg(test)]
+mod net_rx_tests {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::guest_memory::{GuestAddress, HeapBacking};
+    use crate::virtio_block::MemoryBlockBackend;
+    use crate::virtio_mmio::{DeviceStatus, VirtioMmioTransport, reg};
+    use crate::virtio_net::MemoryNetBackend;
+
+    const RX_DESC: u64 = 0x1000;
+    const RX_AVAIL: u64 = 0x2000;
+    const RX_USED: u64 = 0x3000;
+    const TX_DESC: u64 = 0x4000;
+    const TX_AVAIL: u64 = 0x5000;
+    const TX_USED: u64 = 0x6000;
+    const RX_BUF: u64 = 0x11000;
+
+    /// 回数を数える割り込み線（スレッド間で共有できるよう atomic）。
+    struct AtomicLine(Arc<AtomicU32>);
+
+    impl InterruptLine for AtomicLine {
+        fn trigger(&self) -> Result<(), MicrovmError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    type Bus = DeviceBus<MemoryBlockBackend, MemoryNetBackend, AtomicLine>;
+
+    /// virtio-net 1 台のバスとゲストメモリを束ねた試験用の対象。
+    struct Target {
+        bus: Bus,
+        mem: GuestMemory<HeapBacking>,
+    }
+
+    impl NetRxPollTarget for Target {
+        fn poll_net_rx(&mut self) -> Result<NetRxPollReport, MicrovmError> {
+            self.bus.poll_net_rx(&mut self.mem)
+        }
+    }
+
+    fn ga(a: u64) -> GuestAddress {
+        GuestAddress::new(a)
+    }
+
+    fn target() -> (Target, Arc<AtomicU32>) {
+        let slots = layout_slots(0, 1).unwrap();
+        let nets = vec![NetDeviceConfig {
+            backend: MemoryNetBackend::new(),
+            mac: [2, 0, 0, 0, 0, 1],
+        }];
+        let irqs = Arc::new(AtomicU32::new(0));
+        let line_irqs = Arc::clone(&irqs);
+        let bus = DeviceBus::new(&slots, Vec::new(), nets, move |_| {
+            Ok(AtomicLine(Arc::clone(&line_irqs)))
+        })
+        .unwrap();
+        let mem =
+            GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
+        (Target { bus, mem }, irqs)
+    }
+
+    fn wr(t: &mut VirtioMmioTransport<VirtioNet<MemoryNetBackend>>, off: u64, v: u32) {
+        t.write(off, &v.to_le_bytes());
+    }
+
+    /// ゲストのドライバ相当の初期化（STATUS 1→3→feature→11→キュー 0/1 の設定→15）。
+    fn activate(t: &mut Target) {
+        let mut tr = t.bus.net[0].transport.lock().unwrap();
+        let tr = &mut *tr;
+        wr(tr, reg::STATUS, 1);
+        wr(tr, reg::STATUS, 3);
+        wr(tr, reg::DRIVER_FEATURES_SEL, 0);
+        wr(tr, reg::DRIVER_FEATURES, 1 << 5);
+        wr(tr, reg::DRIVER_FEATURES_SEL, 1);
+        wr(tr, reg::DRIVER_FEATURES, 1);
+        wr(tr, reg::STATUS, 11);
+        for (q, d, a, u) in [
+            (0, RX_DESC, RX_AVAIL, RX_USED),
+            (1, TX_DESC, TX_AVAIL, TX_USED),
+        ] {
+            wr(tr, reg::QUEUE_SEL, q);
+            wr(tr, reg::QUEUE_NUM, 16);
+            wr(tr, reg::QUEUE_DESC_LOW, d as u32);
+            wr(tr, reg::QUEUE_DRIVER_LOW, a as u32);
+            wr(tr, reg::QUEUE_DEVICE_LOW, u as u32);
+            wr(tr, reg::QUEUE_READY, 1);
+        }
+        wr(tr, reg::STATUS, 15);
+        assert!(tr.status().contains(DeviceStatus::DRIVER_OK));
+    }
+
+    /// receiveq の `slot` へ 2048 バイトの writable バッファ（0xee で埋める）を積む。
+    fn post_rx_buffer(mem: &mut GuestMemory<HeapBacking>, slot: u16) {
+        let buf = RX_BUF + u64::from(slot) * 0x1000;
+        mem.write_at(ga(buf), &[0xee; 2048]).unwrap();
+        let at = RX_DESC + u64::from(slot) * 16;
+        mem.write_at(ga(at), &buf.to_le_bytes()).unwrap();
+        mem.write_u32_le(ga(at + 8), 2048).unwrap();
+        mem.write_u16_le(ga(at + 12), 2).unwrap();
+        mem.write_u16_le(ga(at + 14), 0).unwrap();
+        mem.write_u16_le(ga(RX_AVAIL + 4 + 2 * u64::from(slot)), slot)
+            .unwrap();
+        mem.write_u16_le(ga(RX_AVAIL + 2), slot + 1).unwrap();
+    }
+
+    fn frame(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i + seed) % 241) as u8).collect()
+    }
+
+    fn push(t: &mut Target, f: &[u8]) {
+        t.bus.net[0]
+            .transport
+            .lock()
+            .unwrap()
+            .device_mut()
+            .backend_mut()
+            .push_inbound(f)
+            .unwrap();
+    }
+
+    fn inbound_len(t: &Target) -> usize {
+        t.bus.net[0]
+            .transport
+            .lock()
+            .unwrap()
+            .device()
+            .backend()
+            .inbound_len()
+    }
+
+    fn used_idx(t: &Target) -> u16 {
+        t.mem.read_u16_le(ga(RX_USED + 2)).unwrap()
+    }
+
+    /// MVM-1・REPAIR-5・#3742: ゲストの kick なしの 1 回のポーリングで、backend のフレームが used ring へ届く。
+    #[test]
+    fn mvm1_3742_poll_delivers_frame_without_kick() {
+        let (mut t, irqs) = target();
+        activate(&mut t);
+        post_rx_buffer(&mut t.mem, 0);
+        let f = frame(60, 7);
+        push(&mut t, &f);
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!(
+            (r.polled, r.skipped, r.completed, r.delivered),
+            (1, 0, 1, 1)
+        );
+        assert_eq!(r.interrupts, 1);
+        assert!(r.queue_error.is_none());
+        assert_eq!(used_idx(&t), 1);
+        assert_eq!(t.mem.read_u32_le(ga(RX_USED + 4)).unwrap(), 0);
+        assert_eq!(t.mem.read_u32_le(ga(RX_USED + 8)).unwrap(), 12 + 60);
+        let mut got = vec![0u8; 72];
+        t.mem.read_at(ga(RX_BUF), &mut got).unwrap();
+        assert_eq!(&got[..12], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(&got[12..], &f[..]);
+        assert_eq!(irqs.load(Ordering::SeqCst), 1);
+        assert_eq!(inbound_len(&t), 0);
+        // 続けて呼んでも、フレームが無ければ何も増えない。
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!((r.completed, r.interrupts), (0, 0));
+        assert_eq!(used_idx(&t), 1);
+        assert_eq!(irqs.load(Ordering::SeqCst), 1);
+    }
+
+    /// MVM-1・#3742: activate 前と FAILED のデバイスは処理せず、フレームは backend に残る（異常として扱わない）。
+    #[test]
+    fn mvm1_3742_poll_skips_inactive_and_failed_device() {
+        let (mut t, irqs) = target();
+        push(&mut t, &frame(40, 1));
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!((r.polled, r.skipped, r.interrupts), (0, 1, 0));
+        assert!(r.queue_error.is_none());
+        assert_eq!(inbound_len(&t), 1);
+        activate(&mut t);
+        post_rx_buffer(&mut t.mem, 0);
+        {
+            let mut tr = t.bus.net[0].transport.lock().unwrap();
+            wr(&mut tr, reg::STATUS, 15 | 128);
+        }
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!((r.polled, r.skipped), (0, 1));
+        assert_eq!(inbound_len(&t), 1);
+        assert_eq!(used_idx(&t), 0);
+        assert_eq!(irqs.load(Ordering::SeqCst), 0);
+    }
+
+    /// MVM-1・#3742: 受信バッファが無い間は何も配送せず、バッファが積まれた次のポーリング（kick なし）で届く。
+    #[test]
+    fn mvm1_3742_poll_waits_for_buffer_then_delivers() {
+        let (mut t, irqs) = target();
+        activate(&mut t);
+        let f = frame(100, 3);
+        push(&mut t, &f);
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!((r.completed, r.interrupts), (0, 0));
+        assert_eq!(used_idx(&t), 0);
+        assert_eq!(irqs.load(Ordering::SeqCst), 0);
+        post_rx_buffer(&mut t.mem, 0);
+        let r = t.poll_net_rx().unwrap();
+        assert_eq!((r.completed, r.delivered, r.interrupts), (1, 1, 1));
+        assert_eq!(used_idx(&t), 1);
+        let mut got = vec![0u8; 112];
+        t.mem.read_at(ga(RX_BUF), &mut got).unwrap();
+        assert_eq!(&got[12..], &f[..]);
+        assert_eq!(irqs.load(Ordering::SeqCst), 1);
+    }
+
+    /// MVM-1・#3742: リング破損は `queue_error`（`InvalidArgument`）で報告される。
+    #[test]
+    fn mvm1_3742_poll_ring_corruption_is_reported() {
+        let (mut t, _irqs) = target();
+        activate(&mut t);
+        push(&mut t, &frame(60, 0));
+        // avail ring の先頭が範囲外の記述子番号（キュー長 16）を指す。
+        t.mem.write_u16_le(ga(RX_AVAIL + 4), 99).unwrap();
+        t.mem.write_u16_le(ga(RX_AVAIL + 2), 1).unwrap();
+        let r = t.poll_net_rx().unwrap();
+        let e = r.queue_error.expect("corruption must be reported");
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    }
+
+    /// 停止要求を待つだけの vCPU の代役。drop を数える。
+    struct IdleBody(Arc<AtomicUsize>);
+
+    impl Drop for IdleBody {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl VcpuLoopBody for IdleBody {
+        fn step(&mut self, _slice: Duration, stop: &StopSignal) -> LoopStep {
+            stop.wait_requested(Duration::from_millis(20));
+            LoopStep::Continue
+        }
+
+        fn stats(&self) -> RunStats {
+            RunStats::default()
+        }
+    }
+
+    fn poller_aux<S: NetRxPollTarget>(
+        shared: &Arc<Mutex<S>>,
+        interval: Duration,
+    ) -> Vec<AuxThread> {
+        let p = NetRxPoller::new(Arc::clone(shared), interval).unwrap();
+        vec![AuxThread {
+            name: "microvm-net-rx",
+            body: Box::new(p),
+        }]
+    }
+
+    fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// MVM-1・REPAIR-5・#3742: ポーラーのスレッドが kick なしにフレームを配送し、`stop` で共有部ごと回収される。
+    #[test]
+    fn mvm1_3742_rx_poller_thread_delivers_frame() {
+        let (mut t, irqs) = target();
+        activate(&mut t);
+        post_rx_buffer(&mut t.mem, 0);
+        let shared = Arc::new(Mutex::new(t));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let running = spawn_loops_with_aux(
+            vec![IdleBody(Arc::clone(&drops))],
+            poller_aux(&shared, Duration::from_millis(5)),
+            Instant::now(),
+            SerialConsole::new(),
+            |name, job| thread::Builder::new().name(name).spawn(job),
+        )
+        .unwrap();
+        let f = frame(60, 9);
+        push(&mut shared.lock().unwrap(), &f);
+        assert!(wait_for(Duration::from_secs(5), || used_idx(
+            &shared.lock().unwrap()
+        ) == 1));
+        {
+            let g = shared.lock().unwrap();
+            assert_eq!(g.mem.read_u32_le(ga(RX_USED + 8)).unwrap(), 72);
+            let mut got = vec![0u8; 72];
+            g.mem.read_at(ga(RX_BUF), &mut got).unwrap();
+            assert_eq!(&got[12..], &f[..]);
+        }
+        assert_eq!(irqs.load(Ordering::SeqCst), 1);
+        let report = running.stop(Duration::from_secs(2)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.vcpu_count, 1);
+        assert_eq!(report.origin_vcpu, None);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// MVM-1・REPAIR-5・#3742: 周期が長くても、停止要求で待ちが起き、期限内に止まる。
+    #[test]
+    fn mvm1_3742_rx_poller_stops_within_deadline() {
+        let (t, _irqs) = target();
+        let shared = Arc::new(Mutex::new(t));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let running = spawn_loops_with_aux(
+            vec![IdleBody(Arc::clone(&drops))],
+            poller_aux(&shared, NET_RX_POLL_INTERVAL_MAX),
+            Instant::now(),
+            SerialConsole::new(),
+            |name, job| thread::Builder::new().name(name).spawn(job),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let report = running.stop(Duration::from_millis(500)).unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// 周期の検証。範囲外は `InvalidArgument`。
+    #[test]
+    fn mvm1_3742_rx_poller_interval_is_validated() {
+        let (t, _irqs) = target();
+        let shared = Arc::new(Mutex::new(t));
+        for bad in [
+            Duration::ZERO,
+            NET_RX_POLL_INTERVAL_MIN - Duration::from_nanos(1),
+            NET_RX_POLL_INTERVAL_MAX + Duration::from_nanos(1),
+        ] {
+            let e = NetRxPoller::new(Arc::clone(&shared), bad).err().unwrap();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert!(NetRxPoller::new(Arc::clone(&shared), NET_RX_POLL_INTERVAL).is_ok());
+    }
+
+    /// 常に `queue_error` を返す対象。
+    struct FailTarget;
+
+    impl NetRxPollTarget for FailTarget {
+        fn poll_net_rx(&mut self) -> Result<NetRxPollReport, MicrovmError> {
+            Ok(NetRxPollReport {
+                queue_error: Some(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    "corrupt",
+                )),
+                ..NetRxPollReport::default()
+            })
+        }
+    }
+
+    /// MVM-1・REPAIR-5・#3742: ポーラーの失敗は全スレッドを止め、きっかけは vCPU 以外（`origin_vcpu == None`）で報告される。
+    #[test]
+    fn mvm1_3742_rx_poller_failure_stops_all() {
+        let shared = Arc::new(Mutex::new(FailTarget));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let running = spawn_loops_with_aux(
+            vec![IdleBody(Arc::clone(&drops))],
+            poller_aux(&shared, Duration::from_millis(2)),
+            Instant::now(),
+            SerialConsole::new(),
+            |name, job| thread::Builder::new().name(name).spawn(job),
+        )
+        .unwrap();
+        // ポーラーが先に失敗して全台が止まるのを待ってから stop する（stop が先だと Requested になる）。
+        let state = running.exit_watch().wait(Duration::from_secs(5)).unwrap();
+        assert!(matches!(state, VcpuExitState::Exited(_)), "{state:?}");
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            report.reason,
+            StopReason::Failed(MicrovmErrorCode::InvalidArgument)
+        );
+        assert_eq!(report.origin_vcpu, None);
+        assert_eq!(report.vcpu_count, 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// REPAIR-5・#887・#3742: 補助スレッドの生成に失敗したら、生成済みの vCPU スレッドを回収して `ResourceExhausted` を返す。
+    #[test]
+    fn mvm1_3742_aux_spawn_failure_rolls_back() {
+        let shared = Arc::new(Mutex::new(FailTarget));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let e = spawn_loops_with_aux(
+            vec![IdleBody(Arc::clone(&drops))],
+            poller_aux(&shared, Duration::from_millis(2)),
+            Instant::now(),
+            SerialConsole::new(),
+            |name: String, job: VcpuJob| {
+                if name == "microvm-net-rx" {
+                    drop(job);
+                    return Err(std::io::Error::from_raw_os_error(EAGAIN));
+                }
+                thread::Builder::new().name(name).spawn(job)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::ResourceExhausted);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+}
+
 #[cfg(test)]
 mod failure_tests {
     use std::cell::Cell;

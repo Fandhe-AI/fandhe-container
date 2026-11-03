@@ -249,15 +249,6 @@ mod mock_core {
         type Running = u32;
         type ExitWatch = u32;
 
-        fn exit_watch(&self, vm: &u32) -> u32 {
-            *vm
-        }
-
-        /// 本偽バックエンドは終了を観測しない（`stop` は常に `Ok`。detached 経路を通らない）。
-        fn exit_state(&self, _watch: &u32) -> DetachedState {
-            DetachedState::Pending
-        }
-
         fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
             let mut r = self.rec.lock().expect("lock");
             r.starts.push(StartRecord {
@@ -276,6 +267,18 @@ mod mock_core {
             // STOP_ALL_BUDGET（4 秒）より短い期限で待つ（REPAIR-5）。
             let _ = self.release.recv_timeout(Duration::from_secs(3));
             Ok("requested")
+        }
+
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+
+        fn exit_state(&self, watch: &u32) -> DetachedState {
+            if self.rec.lock().expect("lock").exited.contains(watch) {
+                DetachedState::Released
+            } else {
+                DetachedState::Pending
+            }
         }
     }
 

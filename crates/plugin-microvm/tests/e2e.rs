@@ -247,6 +247,16 @@ mod mock_core {
 
     impl MicrovmBackend for GatedBackend {
         type Running = u32;
+        type ExitWatch = u32;
+
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            *vm
+        }
+
+        /// 本偽バックエンドは終了を観測しない（`stop` は常に `Ok`。detached 経路を通らない）。
+        fn exit_state(&self, _watch: &u32) -> DetachedState {
+            DetachedState::Pending
+        }
 
         fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
             let mut r = self.rec.lock().expect("lock");

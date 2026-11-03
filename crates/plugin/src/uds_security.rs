@@ -2329,24 +2329,46 @@ mod imp {
 
         /// PLUG-7（#1310）: 削除した回は開始位置から走査し直すため、削除で並びが詰まっても未処理の残骸を
         /// 飛ばさない。候補上限 2 件でロック 6 件を掃除すると、ちょうど 3 回ですべて消える。
+        ///
+        /// 並行する試験の子が継承したロックで 3 回のどれかがヒントを使えない（`NoHandle`）と、保存・削除の
+        /// 検査がすり抜けるか残骸が残る（#3148・#3701 と同じ現象。REPAIR-12）。そのため 3 回すべてが
+        /// ヒントを使えた（`Used`）試行でだけ判定し、そうでない試行は捨てて新しい `Tmp` でやり直す。
         #[test]
         fn plug7_cursor_restarts_pass_after_removal() {
-            let t = Tmp::new();
             let euid = crate::sys::effective_uid();
-            let locks: Vec<_> = (0..6)
-                .map(|i| t.0.join(format!("oneshot-1-{i}.sock.lock")))
-                .collect();
-            for l in &locks {
-                std::fs::write(l, b"").unwrap();
+            let mut fallbacks = 0;
+            loop {
+                let t = Tmp::new();
+                let locks: Vec<_> = (0..6)
+                    .map(|i| t.0.join(format!("oneshot-1-{i}.sock.lock")))
+                    .collect();
+                for l in &locks {
+                    std::fs::write(l, b"").unwrap();
+                }
+                let mut results = Vec::new();
+                let mut unused = None;
+                for _ in 0..3 {
+                    let _ = sweep_trace_test_hook::take();
+                    let r = sweep_one_shot_limited(&t.0, euid, 1024, 2).unwrap();
+                    let hint =
+                        sweep_trace_test_hook::take().expect("sweep_dir must record hint use");
+                    results.push((r.examined, r.truncated));
+                    if hint != sweep_trace_test_hook::HintUse::Used {
+                        unused = Some(hint);
+                        break;
+                    }
+                }
+                if let Some(hint) = unused {
+                    assert_expected_fallback(hint);
+                    fallbacks += 1;
+                    assert!(fallbacks <= MAX_FALLBACKS, "fallbacks={fallbacks}");
+                    continue;
+                }
+                assert_eq!(results, [(2, true), (2, true), (2, false)]);
+                assert_eq!(locks.iter().filter(|l| l.exists()).count(), 0);
+                assert_eq!(stored_pos(&t.0), None);
+                break;
             }
-            let mut results = Vec::new();
-            for _ in 0..3 {
-                let r = sweep_one_shot_limited(&t.0, euid, 1024, 2).unwrap();
-                results.push((r.examined, r.truncated));
-            }
-            assert_eq!(results, [(2, true), (2, true), (2, false)]);
-            assert_eq!(locks.iter().filter(|l| l.exists()).count(), 0);
-            assert_eq!(stored_pos(&t.0), None);
         }
 
         /// PLUG-12（#1310）: 削除を拒否する socket（symlink・記録なしの socket 以外）のロックファイルは、

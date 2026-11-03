@@ -63,6 +63,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod arm64_layout;
 pub mod boot_x86;
 pub mod cpuid_x86;
 #[cfg(target_os = "linux")]

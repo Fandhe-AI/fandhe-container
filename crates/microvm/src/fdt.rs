@@ -3,7 +3,7 @@
 //! 役割: Devicetree Specification v0.4「Flattened Devicetree (DTB) Format」（version 17・last_comp_version 16）の
 //! バイナリを、ノードとプロパティの追加呼び出しから組み立てる。arm64 のゲストは起動時に x0 = FDT の物理アドレスで
 //! 機器構成を受け取るため、macOS の Hypervisor.framework バックエンド（TASK-192・MVM-5）と将来の KVM aarch64
-//! （MVM-1）の両方が使う共有部品である。現状は呼び出し元が無い（起動経路への結線は後続）。
+//! （MVM-1）の両方が使う共有部品である。呼び出し元は `arm64_layout::build_guest_fdt`（#3788）。起動経路への結線は #3790・#3797。
 //!
 //! 契約（TASK-192.5・#3784・MVM-5・MVM-1・REPAIR-2）:
 //! - header と予約ブロックは固定長の型（`FdtHeader`・`FdtReserveEntry`）、structure block はトークン型つきの

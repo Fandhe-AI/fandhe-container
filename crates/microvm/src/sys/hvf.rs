@@ -4,7 +4,7 @@
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
 //!
 //! # 呼び出し文脈
-//! `crate::hvf` が `HvVm`・`HostMapping`・`GuestMapping` を再公開し、macOS バックエンド（TASK-192 配下の
+//! `crate::hvf` が `HvVm`・`HostMapping`・`GuestMapping`・`HvVcpu`・`VcpuCanceller` を再公開し、macOS バックエンド（TASK-192 配下の
 //! vCPU・GIC・ゲスト RAM の各子 issue）がここへ追記する。`hv_*` は同期呼び出しでゲストを走らせない。
 //! 引数の検査と戻り値の写像は OS 非依存の純関数 `crate::hvf_abi` が受け持ち、ここは FFI と RAII だけを持つ。
 //!
@@ -19,21 +19,43 @@
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
 //!
+//! # vCPU の契約（TASK-192.2・#3786）
+//! - `HvVcpu` は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は owning thread から呼ぶ）。
+//!   生ポインタ入りの `PhantomData` で `!Send`・`!Sync` にして型で強制する。
+//! - 他スレッドからの停止は `VcpuCanceller`（id と排他ロックだけを持つ `Send + Sync`）が `hv_vcpus_exit` で行う。
+//!   destroy は同じロックを持って id を `None` にしてから呼ぶため、破棄済み（番号が再利用されうる）の id へ
+//!   `hv_vcpus_exit` を送らない。他スレッドからの `hv_vcpus_exit` は `HV_EXIT_REASON_CANCELED` の説明からの
+//!   読みで、実機前提の試験で観測する。
+//! - `run_once` は期限つき（監視スレッドが `hv_vcpus_exit` で中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
+//!   `HvRunStats`・`HvRunObserver` へ残す（REPAIR-4）。期限なしの `hv_vcpu_run` は公開しない。
+//! - exit 領域は `HvVcpu` の寿命内だけ有効で、`run` の戻りの時点でコピーして値を返す（参照を外へ出さない）。
+//! - `HvVcpu` は `&HvVm` を借用し、vCPU が残ったまま `hv_vm_destroy` が走らない。vCPU スレッドで使うときは
+//!   `HvVm` を `Arc` で共有するか `std::thread::scope` を使う（#3791 の担当）。
+//! - `hv_vcpu_set_pending_interrupt` は GIC（#3789）を使う本ツリーの既定経路では使わない（GIC 無しとの比較用）。
+//!
 //! # `libc` との機械照合について
 //! `hv_*` は Hypervisor.framework の宣言で `libc` の範囲外。`mmap`・`munmap`・`sysconf` と下の定数は
 //! `libc` に対応物があり、本 crate は dev-dependency に `libc` を持たず照合は未導入（#3664 の導入後に
-//! 照合の対象）。定数は macOS の値で、Linux の値を流用しない。構造体は宣言しない（`hv_vm_config_t` は
-//! 不透明なポインタで NULL を渡す）。
+//! 照合の対象）。定数は macOS の値で、Linux の値を流用しない。`hv_vm_config_t`・`hv_vcpu_config_t` は
+//! 不透明なポインタで NULL を渡す。`hv_*` と `HvVcpuExitRaw`（Hypervisor.framework の構造体）は `libc` に
+//! 対応物が無く、レイアウトは `hvf_abi` の const assert で固定する。
 //!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
-//! SDK ヘッダとの最終照合は人間担当の #3803 で行う。
+//! SDK ヘッダとの最終照合は人間担当の #3803 で行う。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
+//! `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・`hv_vcpu_set_vtimer_offset` は対の形からの推定で、#3803 で照合する。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::hvf_abi::{HvOp, MemoryFlags, check_map_range, classify_hv_return};
+use crate::hvf_abi::{
+    HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw,
+    MemoryFlags, check_map_range, check_run_deadline, classify_hv_return, decode_exit, finish_run,
+};
 use std::ffi::{c_int, c_long, c_void};
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[link(name = "Hypervisor", kind = "framework")]
 // SAFETY: 宣言は Hypervisor.framework（macOS 11 以降・Apple Silicon）の C ABI に一致させている
@@ -45,6 +67,33 @@ unsafe extern "C" {
     fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> c_int;
     fn hv_vm_unmap(ipa: u64, size: usize) -> c_int;
     fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> c_int;
+}
+
+#[link(name = "Hypervisor", kind = "framework")]
+// SAFETY: 宣言は Hypervisor.framework（macOS 11 以降・Apple Silicon）の C ABI に一致させている
+// （`hv_vcpu_t` = u64、`hv_reg_t` = u32、`hv_sys_reg_t` = u16、`hv_interrupt_type_t` = u32、
+// bool = C の `_Bool`、`hv_vcpu_config_t` は不透明ポインタで NULL を渡す）。
+// `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` / `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・
+// `hv_vcpu_set_vtimer_offset` は対の形からの推定で、#3803 で SDK ヘッダと照合する。
+// 呼び出しはすべて下の安全なラッパー（`HvVcpu`・`VcpuCanceller`）経由で、出力引数はローカル変数だけを渡す。
+unsafe extern "C" {
+    fn hv_vcpu_create(
+        vcpu: *mut u64,
+        exit: *mut *const HvVcpuExitRaw,
+        config: *mut c_void,
+    ) -> c_int;
+    fn hv_vcpu_destroy(vcpu: u64) -> c_int;
+    fn hv_vcpu_run(vcpu: u64) -> c_int;
+    fn hv_vcpus_exit(vcpus: *mut u64, vcpu_count: u32) -> c_int;
+    fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *mut u64) -> c_int;
+    fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> c_int;
+    fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> c_int;
+    fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> c_int;
+    fn hv_vcpu_get_vtimer_mask(vcpu: u64, masked: *mut bool) -> c_int;
+    fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> c_int;
+    fn hv_vcpu_get_vtimer_offset(vcpu: u64, offset: *mut u64) -> c_int;
+    fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> c_int;
+    fn hv_vcpu_set_pending_interrupt(vcpu: u64, kind: u32, pending: bool) -> c_int;
 }
 
 // SAFETY: 宣言は macOS（LP64）の libSystem の C ABI に一致させている
@@ -155,6 +204,34 @@ impl HvVm {
     }
 }
 
+impl HvVm {
+    /// 呼び出しスレッドに束縛された vCPU を作る（config は NULL）。
+    ///
+    /// 同じスレッドで 2 個目を作ったときの挙動は未確認（#3803 で観測）。
+    pub fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
+        let mut id: u64 = 0;
+        let mut exit: *const HvVcpuExitRaw = ptr::null();
+        // SAFETY: id・exit はこのスタック上の有効なローカル変数への書き込み先。config は NULL（既定）。
+        // `&self` により VM は生存している。
+        let rc = unsafe { hv_vcpu_create(&mut id, &mut exit, ptr::null_mut()) };
+        classify_hv_return(HvOp::VcpuCreate, rc)?;
+        if exit.is_null() {
+            // SAFETY: 直前の create で得た id を 1 回だけ破棄する（exit 領域が無い vCPU は使えない）。
+            let _ = unsafe { hv_vcpu_destroy(id) };
+            return Err(internal("hv_vcpu_create returned a null exit area"));
+        }
+        Ok(HvVcpu {
+            _vm: self,
+            id,
+            exit,
+            cancel: Arc::new(Mutex::new(Some(id))),
+            stats: HvRunStats::default(),
+            observer: None,
+            _thread: PhantomData,
+        })
+    }
+}
+
 fn invalid_arg(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, msg)
 }
@@ -229,6 +306,28 @@ impl HostMapping {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// `offset` から `bytes` を書く（`map` の前にゲストの初期内容を置くための最小 API。TASK-192.2）。
+    ///
+    /// 範囲外（桁あふれを含む）は `InvalidArgument`。対応付け後のゲスト RAM のアクセスは #3787 の担当。
+    pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MicrovmError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| invalid_arg("write range overflows"))?;
+        if end > self.len {
+            return Err(invalid_arg("write range exceeds the host mapping"));
+        }
+        // SAFETY: [offset, end) は生存中の mmap 領域（長さ self.len）の内側で検査済み。bytes は別の Rust の
+        // 借用で mmap 領域と重ならず、&mut self により同時アクセスもない。
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (self.ptr as *mut u8).add(offset),
+                bytes.len(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for HostMapping {
@@ -292,5 +391,259 @@ impl Drop for GuestMapping<'_> {
         // 失敗時は backing をリークし、munmap しない（対応付けが残りうるため）。エラーは後始末のため捨てる。
         let _ = self.release();
         self.active = false;
+    }
+}
+
+/// 他スレッドから vCPU の実行を止める手段。id と排他ロックだけを持つため `Send + Sync`。
+///
+/// `HvVcpu` の破棄と同じロックを共有し、破棄済みの id（再利用されうる）へ `hv_vcpus_exit` を送らない。
+#[derive(Debug, Clone)]
+pub struct VcpuCanceller {
+    id: Arc<Mutex<Option<u64>>>,
+}
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<VcpuCanceller>();
+};
+
+impl VcpuCanceller {
+    /// `hv_vcpus_exit` で実行中の `hv_vcpu_run` を `Canceled` で戻させる。vCPU 破棄後は `FailedPrecondition`。
+    ///
+    /// `run` の前に呼んだときに次の `run` が即戻るかは未確認（#3803）。
+    pub fn cancel(&self) -> Result<(), MicrovmError> {
+        let guard = self.id.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(id) = *guard else {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "vcpu already destroyed",
+            ));
+        };
+        let mut ids = [id];
+        // SAFETY: ids はローカル配列で件数 1。ロックを持っている間は vCPU が破棄されないため、id は生存中。
+        let rc = unsafe { hv_vcpus_exit(ids.as_mut_ptr(), 1) };
+        classify_hv_return(HvOp::VcpusExit, rc)
+    }
+}
+
+/// 作成スレッドに束縛された vCPU（drop で `hv_vcpu_destroy`）。`!Send`・`!Sync`。
+///
+/// `HvVm` を借用するため、vCPU が残ったまま VM は破棄されない。
+///
+/// ```no_run
+/// use fandhe_container_microvm::hvf::{HvVcpu, VcpuCanceller};
+/// fn assert_sized<T: Sized>() {}
+/// fn assert_send<T: Send>() {}
+/// assert_sized::<HvVcpu<'static>>();
+/// assert_send::<VcpuCanceller>();
+/// ```
+///
+/// `Send` でないこと（スレッド間の移動を型で禁じる）:
+///
+/// ```compile_fail
+/// use fandhe_container_microvm::hvf::HvVcpu;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<HvVcpu<'static>>();
+/// ```
+///
+/// `Sync` でないこと:
+///
+/// ```compile_fail
+/// use fandhe_container_microvm::hvf::HvVcpu;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<HvVcpu<'static>>();
+/// ```
+#[derive(Debug)]
+pub struct HvVcpu<'a> {
+    _vm: &'a HvVm,
+    id: u64,
+    /// フレームワークが返す exit 領域。vCPU の寿命内だけ有効。
+    exit: *const HvVcpuExitRaw,
+    cancel: Arc<Mutex<Option<u64>>>,
+    stats: HvRunStats,
+    observer: Option<Arc<dyn HvRunObserver>>,
+    _thread: PhantomData<*const ()>,
+}
+
+/// 期限監視スレッドが超過後に `hv_vcpus_exit` を繰り返す間隔（`cancel` が `run` より先に届いたときの取りこぼし対策）。
+const KICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 監視スレッドへ「実行が戻った」ことを知らせる。drop でも立てるため、panic でも監視が残らない。
+struct DoneGuard<'a>(&'a (Mutex<bool>, Condvar));
+
+impl Drop for DoneGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.1.notify_all();
+    }
+}
+
+impl HvVcpu<'_> {
+    /// 他スレッドから停止するための `VcpuCanceller`。
+    pub fn canceller(&self) -> VcpuCanceller {
+        VcpuCanceller {
+            id: Arc::clone(&self.cancel),
+        }
+    }
+
+    /// ゲストを走らせ、戻った理由を返す。`timeout` を超えると監視スレッドが `hv_vcpus_exit` を送り
+    /// `DeadlineExceeded` で戻る（REPAIR-5）。`timeout` は 0 不可・上限 `HV_RUN_DEADLINE_MAX`（`InvalidArgument`）。
+    ///
+    /// 外部の `VcpuCanceller::cancel` による停止は `Ok(Canceled)`。未知の理由は `Unknown` で、呼び出し側は
+    /// VM を止める（fail-closed）。結果と所要時間は `stats` と観測器（`set_observer`）へ、エラー経路も含めて残す
+    /// （REPAIR-4）。期限の入力検査の失敗は発行前のため記録しない。
+    pub fn run_once(&mut self, timeout: Duration) -> Result<HvVcpuExit, MicrovmError> {
+        check_run_deadline(timeout)?;
+        let canceller = self.canceller();
+        let done = (Mutex::new(false), Condvar::new());
+        let fired = AtomicBool::new(false);
+        let start = Instant::now();
+        let result = std::thread::scope(|scope| {
+            let watchdog = std::thread::Builder::new()
+                .name("hvf-run-deadline".to_string())
+                .spawn_scoped(scope, || {
+                    let (lock, cv) = &done;
+                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (guard, res) = cv
+                        .wait_timeout_while(guard, timeout, |d| !*d)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if !res.timed_out() || *guard {
+                        return;
+                    }
+                    drop(guard);
+                    fired.store(true, Ordering::SeqCst);
+                    loop {
+                        // 失敗（vCPU 破棄済み等）は戻りの側が結果を持つため無視する。
+                        let _ = canceller.cancel();
+                        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let (guard, _) = cv
+                            .wait_timeout_while(guard, KICK_INTERVAL, |d| !*d)
+                            .unwrap_or_else(|e| e.into_inner());
+                        if *guard {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|_| internal("failed to spawn the run deadline thread"))?;
+            let run_result = {
+                let _guard = DoneGuard(&done);
+                self.run_unbounded()
+            };
+            let _ = watchdog.join();
+            run_result
+        });
+        let (result, record) = finish_run(result, fired.load(Ordering::SeqCst), start.elapsed());
+        self.stats.add(&record);
+        if let Some(o) = &self.observer {
+            o.record(&record);
+        }
+        result
+    }
+
+    /// 累積の実行統計（REPAIR-4）。
+    pub fn stats(&self) -> HvRunStats {
+        self.stats
+    }
+
+    /// 実行結果の観測器を設定する（構造化ログ・メトリクスへの接続口。REPAIR-4）。
+    pub fn set_observer(&mut self, observer: Arc<dyn HvRunObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// 期限なしの `hv_vcpu_run`。公開しない（`run_once` の監視下でだけ呼ぶ。REPAIR-5）。
+    fn run_unbounded(&mut self) -> Result<HvVcpuExit, MicrovmError> {
+        // SAFETY: id は生存中の vCPU で、呼び出しは作成スレッド（!Send）。
+        let rc = unsafe { hv_vcpu_run(self.id) };
+        classify_hv_return(HvOp::VcpuRun, rc)?;
+        // SAFETY: exit は作成時にフレームワークが返した非 NULL の領域で vCPU の寿命内は有効。
+        // run の戻りの直後に値をコピーし、参照は外へ出さない。
+        let raw = unsafe { ptr::read(self.exit) };
+        Ok(decode_exit(&raw))
+    }
+
+    /// 汎用・特殊レジスタを読む。
+    pub fn get_reg(&self, reg: HvReg) -> Result<u64, MicrovmError> {
+        let mut v: u64 = 0;
+        // SAFETY: v はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_get_reg(self.id, reg.bits(), &mut v) };
+        classify_hv_return(HvOp::VcpuGetReg, rc)?;
+        Ok(v)
+    }
+
+    /// 汎用・特殊レジスタを書く。
+    pub fn set_reg(&mut self, reg: HvReg, value: u64) -> Result<(), MicrovmError> {
+        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_set_reg(self.id, reg.bits(), value) };
+        classify_hv_return(HvOp::VcpuSetReg, rc)
+    }
+
+    /// システムレジスタを読む。
+    pub fn get_sys_reg(&self, reg: HvSysReg) -> Result<u64, MicrovmError> {
+        let mut v: u64 = 0;
+        // SAFETY: v はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_get_sys_reg(self.id, reg.bits(), &mut v) };
+        classify_hv_return(HvOp::VcpuGetSysReg, rc)?;
+        Ok(v)
+    }
+
+    /// システムレジスタを書く。
+    pub fn set_sys_reg(&mut self, reg: HvSysReg, value: u64) -> Result<(), MicrovmError> {
+        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_set_sys_reg(self.id, reg.bits(), value) };
+        classify_hv_return(HvOp::VcpuSetSysReg, rc)
+    }
+
+    /// vtimer のマスク状態を読む。
+    pub fn vtimer_mask(&self) -> Result<bool, MicrovmError> {
+        let mut m = false;
+        // SAFETY: m はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_get_vtimer_mask(self.id, &mut m) };
+        classify_hv_return(HvOp::VcpuGetVtimerMask, rc)?;
+        Ok(m)
+    }
+
+    /// vtimer のマスクを設定する（`VtimerActivated` の後に解除する用途）。
+    pub fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), MicrovmError> {
+        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_set_vtimer_mask(self.id, masked) };
+        classify_hv_return(HvOp::VcpuSetVtimerMask, rc)
+    }
+
+    /// vtimer のオフセットを読む。
+    pub fn vtimer_offset(&self) -> Result<u64, MicrovmError> {
+        let mut o: u64 = 0;
+        // SAFETY: o はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut o) };
+        classify_hv_return(HvOp::VcpuGetVtimerOffset, rc)?;
+        Ok(o)
+    }
+
+    /// vtimer のオフセットを設定する。
+    pub fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), MicrovmError> {
+        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
+        classify_hv_return(HvOp::VcpuSetVtimerOffset, rc)
+    }
+
+    /// 保留中の割り込みを設定する。GIC（#3789）を使う既定経路では使わない（GIC 無しとの比較用）。
+    pub fn set_pending_interrupt(
+        &mut self,
+        kind: HvInterruptType,
+        pending: bool,
+    ) -> Result<(), MicrovmError> {
+        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
+        let rc = unsafe { hv_vcpu_set_pending_interrupt(self.id, kind.bits(), pending) };
+        classify_hv_return(HvOp::VcpuSetPendingInterrupt, rc)
+    }
+}
+
+impl Drop for HvVcpu<'_> {
+    fn drop(&mut self) {
+        // canceller と同じロックを持ったまま id を無効化して破棄する（破棄済み id への cancel を防ぐ）。
+        let mut guard = self.cancel.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = guard.take() {
+            // SAFETY: id は生存中の vCPU で、drop は作成スレッド（!Send）。結果は後始末のため捨てる。
+            let _ = unsafe { hv_vcpu_destroy(id) };
+        }
     }
 }

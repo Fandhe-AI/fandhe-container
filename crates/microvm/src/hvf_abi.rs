@@ -19,9 +19,19 @@
 //! | `HV_UNSUPPORTED` | `Unimplemented` |
 //! | 未知の値 | `Internal`（fail-closed） |
 //!
+//! # vCPU 側の値（TASK-192.2・#3786）
+//! [`HvReg`]・[`HvSysReg`]・[`HvInterruptType`] は FFI へ渡す値の newtype / enum、[`HvVcpuExitRaw`] は
+//! `hv_vcpu_exit_t` のレイアウト、[`decode_exit`] は exit reason の復号（未知の値は `Unknown` で fail-closed）。
+//! syndrome の解釈は #3785 の担当で、ここでは生値のまま運ぶ。
+//!
 //! # 出典
 //! 数値の一部と 3 つの名前は第三者バインディング由来で、SDK ヘッダ（`Hypervisor/hv_error.h`）との
 //! 最終照合は人間担当の #3803 で行う。それまでは暫定値として扱う。
+//! vCPU 側の暫定値（`hv_reg_t` の連番、exit reason 0〜3、`HV_INTERRUPT_TYPE_*` の 0 / 1、`hv_reg_t` /
+//! `hv_exit_reason_t` / `hv_interrupt_type_t` の幅 u32、`hv_sys_reg_t` の幅 u16、`hv_vcpu_exit_t` の
+//! レイアウト）も Apple の公開ドキュメントに基づく暫定値で、SDK ヘッダ（`hv_vcpu_types.h` ほか）との
+//! 照合は #3803 で行う。`hv_sys_reg_t` の値は Arm ARM の (op0, op1, CRn, CRm, op2) から導出した
+//! （第三者リポジトリの一覧は写していない）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use std::ops::BitOr;
@@ -65,6 +75,32 @@ pub enum HvOp {
     VmUnmap,
     /// `hv_vm_protect`。
     VmProtect,
+    /// `hv_vcpu_create`。
+    VcpuCreate,
+    /// `hv_vcpu_destroy`。
+    VcpuDestroy,
+    /// `hv_vcpu_run`。
+    VcpuRun,
+    /// `hv_vcpus_exit`。
+    VcpusExit,
+    /// `hv_vcpu_get_reg`。
+    VcpuGetReg,
+    /// `hv_vcpu_set_reg`。
+    VcpuSetReg,
+    /// `hv_vcpu_get_sys_reg`。
+    VcpuGetSysReg,
+    /// `hv_vcpu_set_sys_reg`。
+    VcpuSetSysReg,
+    /// `hv_vcpu_get_vtimer_mask`。
+    VcpuGetVtimerMask,
+    /// `hv_vcpu_set_vtimer_mask`。
+    VcpuSetVtimerMask,
+    /// `hv_vcpu_get_vtimer_offset`。
+    VcpuGetVtimerOffset,
+    /// `hv_vcpu_set_vtimer_offset`。
+    VcpuSetVtimerOffset,
+    /// `hv_vcpu_set_pending_interrupt`。
+    VcpuSetPendingInterrupt,
 }
 
 impl HvOp {
@@ -75,6 +111,19 @@ impl HvOp {
             HvOp::VmMap => "hv_vm_map",
             HvOp::VmUnmap => "hv_vm_unmap",
             HvOp::VmProtect => "hv_vm_protect",
+            HvOp::VcpuCreate => "hv_vcpu_create",
+            HvOp::VcpuDestroy => "hv_vcpu_destroy",
+            HvOp::VcpuRun => "hv_vcpu_run",
+            HvOp::VcpusExit => "hv_vcpus_exit",
+            HvOp::VcpuGetReg => "hv_vcpu_get_reg",
+            HvOp::VcpuSetReg => "hv_vcpu_set_reg",
+            HvOp::VcpuGetSysReg => "hv_vcpu_get_sys_reg",
+            HvOp::VcpuSetSysReg => "hv_vcpu_set_sys_reg",
+            HvOp::VcpuGetVtimerMask => "hv_vcpu_get_vtimer_mask",
+            HvOp::VcpuSetVtimerMask => "hv_vcpu_set_vtimer_mask",
+            HvOp::VcpuGetVtimerOffset => "hv_vcpu_get_vtimer_offset",
+            HvOp::VcpuSetVtimerOffset => "hv_vcpu_set_vtimer_offset",
+            HvOp::VcpuSetPendingInterrupt => "hv_vcpu_set_pending_interrupt",
         }
     }
 }
@@ -137,6 +186,142 @@ impl BitOr for MemoryFlags {
     }
 }
 
+/// `hv_reg_t`（u32）の newtype。X0〜X30 は [`HvReg::x`] で作り、範囲外は作れない（REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvReg(u32);
+
+impl HvReg {
+    /// `HV_REG_PC`。
+    pub const PC: HvReg = HvReg(31);
+    /// `HV_REG_FPCR`。
+    pub const FPCR: HvReg = HvReg(32);
+    /// `HV_REG_FPSR`。
+    pub const FPSR: HvReg = HvReg(33);
+    /// `HV_REG_CPSR`。
+    pub const CPSR: HvReg = HvReg(34);
+
+    /// 汎用レジスタ `Xn`（0..=30）。31 以上は `None`。
+    pub const fn x(n: u8) -> Option<HvReg> {
+        if n <= 30 { Some(HvReg(n as u32)) } else { None }
+    }
+
+    /// FFI に渡す生の値。
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// `hv_sys_reg_t`（u16）の newtype。本ツリーで使う 4 つに限る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvSysReg(u16);
+
+impl HvSysReg {
+    /// MRS / MSR のオペランドの符号化（op0:op1:CRn:CRm:op2 = 2:3:4:4:3 ビット）。
+    const fn encode(op0: u16, op1: u16, crn: u16, crm: u16, op2: u16) -> u16 {
+        (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+    }
+
+    /// `HV_SYS_REG_MPIDR_EL1`。
+    pub const MPIDR_EL1: HvSysReg = HvSysReg(Self::encode(3, 0, 0, 0, 5));
+    /// `HV_SYS_REG_SCTLR_EL1`。
+    pub const SCTLR_EL1: HvSysReg = HvSysReg(Self::encode(3, 0, 1, 0, 0));
+    /// `HV_SYS_REG_CNTV_CTL_EL0`。
+    pub const CNTV_CTL_EL0: HvSysReg = HvSysReg(Self::encode(3, 3, 14, 3, 1));
+    /// `HV_SYS_REG_CNTV_CVAL_EL0`。
+    pub const CNTV_CVAL_EL0: HvSysReg = HvSysReg(Self::encode(3, 3, 14, 3, 2));
+
+    /// FFI に渡す生の値。
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// `hv_interrupt_type_t`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvInterruptType {
+    /// `HV_INTERRUPT_TYPE_IRQ`。
+    Irq,
+    /// `HV_INTERRUPT_TYPE_FIQ`。
+    Fiq,
+}
+
+impl HvInterruptType {
+    /// FFI に渡す生の値。
+    pub const fn bits(self) -> u32 {
+        match self {
+            HvInterruptType::Irq => 0,
+            HvInterruptType::Fiq => 1,
+        }
+    }
+}
+
+/// `HV_EXIT_REASON_CANCELED`。
+pub const HV_EXIT_REASON_CANCELED: u32 = 0;
+/// `HV_EXIT_REASON_EXCEPTION`。
+pub const HV_EXIT_REASON_EXCEPTION: u32 = 1;
+/// `HV_EXIT_REASON_VTIMER_ACTIVATED`。
+pub const HV_EXIT_REASON_VTIMER_ACTIVATED: u32 = 2;
+/// `HV_EXIT_REASON_UNKNOWN`。
+pub const HV_EXIT_REASON_UNKNOWN: u32 = 3;
+
+/// `hv_vcpu_exit_exception_t`（syndrome・仮想アドレス・物理アドレス）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvVcpuExitException {
+    /// ESR_EL2 相当の syndrome（解釈は #3785）。
+    pub syndrome: u64,
+    /// フォールトした仮想アドレス。
+    pub virtual_address: u64,
+    /// フォールトしたゲスト物理アドレス（IPA）。
+    pub physical_address: u64,
+}
+
+/// `hv_vcpu_exit_t`（reason の後ろに 4 バイトのパディング）。フレームワークが vCPU ごとに持つ領域のレイアウト。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HvVcpuExitRaw {
+    /// `hv_exit_reason_t`。
+    pub reason: u32,
+    /// reason が EXCEPTION のときだけ意味を持つ。
+    pub exception: HvVcpuExitException,
+}
+
+// レイアウトの固定（LP64 の全ターゲットで成り立つ。SDK との照合は #3803）。
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<HvVcpuExitException>() == 24);
+    assert!(offset_of!(HvVcpuExitException, syndrome) == 0);
+    assert!(offset_of!(HvVcpuExitException, virtual_address) == 8);
+    assert!(offset_of!(HvVcpuExitException, physical_address) == 16);
+    assert!(size_of::<HvVcpuExitRaw>() == 32);
+    assert!(offset_of!(HvVcpuExitRaw, reason) == 0);
+    assert!(offset_of!(HvVcpuExitRaw, exception) == 8);
+    assert!(align_of::<HvVcpuExitRaw>() == 8);
+};
+
+/// `hv_vcpu_run` が戻った理由。未知の値は `Unknown`（呼び出し側は VM を止める。fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvVcpuExit {
+    /// `hv_vcpus_exit` による停止要求。
+    Canceled,
+    /// ゲストの例外（syndrome は生値）。
+    Exception(HvVcpuExitException),
+    /// vtimer の発火（マスクされて戻った）。
+    VtimerActivated,
+    /// `HV_EXIT_REASON_UNKNOWN` と未定義の値（生値を保持）。
+    Unknown(u32),
+}
+
+/// exit 領域の写しを復号する（純関数）。
+pub fn decode_exit(raw: &HvVcpuExitRaw) -> HvVcpuExit {
+    match raw.reason {
+        HV_EXIT_REASON_CANCELED => HvVcpuExit::Canceled,
+        HV_EXIT_REASON_EXCEPTION => HvVcpuExit::Exception(raw.exception),
+        HV_EXIT_REASON_VTIMER_ACTIVATED => HvVcpuExit::VtimerActivated,
+        other => HvVcpuExit::Unknown(other),
+    }
+}
+
 fn invalid(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, msg)
 }
@@ -168,6 +353,110 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
         return Err(invalid("range overflows the address space"));
     }
     Ok(())
+}
+
+/// `HvVcpu::run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5・KVM 側の `RUN_DEADLINE_MAX` と同値）。
+pub const HV_RUN_DEADLINE_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `run_once` の期限の検査（FFI の前に必ず通す）。0 と上限超過は `InvalidArgument`。
+pub fn check_run_deadline(timeout: std::time::Duration) -> Result<(), MicrovmError> {
+    if timeout.is_zero() {
+        return Err(invalid("run deadline must be non-zero"));
+    }
+    if timeout > HV_RUN_DEADLINE_MAX {
+        return Err(invalid("run deadline exceeds the maximum"));
+    }
+    Ok(())
+}
+
+/// `hv_vcpu_run` 1 回の結果の分類（計装用。REPAIR-4。KVM 側の `RunOutcome` に対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvRunOutcome {
+    /// VM exit で戻った。値は exit の種別名（`exception` / `vtimer` / `canceled` / `unknown`）。
+    Exit(&'static str),
+    /// 期限を超えて `hv_vcpus_exit` で中断した（REPAIR-5）。
+    DeadlineExceeded,
+    /// FFI または復号の失敗。
+    Error(MicrovmErrorCode),
+}
+
+/// `run_once` 1 回の記録（結果と所要時間。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvRunRecord {
+    /// 結果。
+    pub outcome: HvRunOutcome,
+    /// `hv_vcpu_run` の発行から戻るまでの時間。
+    pub elapsed: std::time::Duration,
+}
+
+/// 実行結果の記録器。呼び出し側が構造化ログやメトリクスへ接続する。`record` は vCPU スレッドから同期で
+/// 呼ばれるため、ブロックしないこと。
+pub trait HvRunObserver: Send + Sync + std::fmt::Debug {
+    /// 1 回の `run_once` の記録を受け取る。
+    fn record(&self, record: &HvRunRecord);
+}
+
+/// vCPU ごとの累積の実行統計（観測器が無くても取れる。REPAIR-4）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HvRunStats {
+    /// 発行回数。
+    pub runs: u64,
+    /// VM exit で戻った回数。
+    pub exits: u64,
+    /// 期限超過の回数。
+    pub deadline_exceeded: u64,
+    /// 失敗の回数。
+    pub errors: u64,
+    /// 所要時間の合計。
+    pub total_elapsed: std::time::Duration,
+}
+
+impl HvRunStats {
+    /// 記録 1 件を累積へ加える。
+    pub fn add(&mut self, record: &HvRunRecord) {
+        self.runs = self.runs.saturating_add(1);
+        self.total_elapsed = self.total_elapsed.saturating_add(record.elapsed);
+        match record.outcome {
+            HvRunOutcome::Exit(_) => self.exits = self.exits.saturating_add(1),
+            HvRunOutcome::DeadlineExceeded => {
+                self.deadline_exceeded = self.deadline_exceeded.saturating_add(1);
+            }
+            HvRunOutcome::Error(_) => self.errors = self.errors.saturating_add(1),
+        }
+    }
+}
+
+fn exit_kind(e: &HvVcpuExit) -> &'static str {
+    match e {
+        HvVcpuExit::Canceled => "canceled",
+        HvVcpuExit::Exception(_) => "exception",
+        HvVcpuExit::VtimerActivated => "vtimer",
+        HvVcpuExit::Unknown(_) => "unknown",
+    }
+}
+
+/// `hv_vcpu_run` の戻りを期限の発火の有無と合わせて確定する（純関数）。
+///
+/// 期限が発火して `Canceled` で戻ったときだけ `DeadlineExceeded`（外部からの `cancel` による `Canceled` は
+/// そのまま `Ok(Canceled)`）。分類した記録も返す。
+pub fn finish_run(
+    result: Result<HvVcpuExit, MicrovmError>,
+    deadline_fired: bool,
+    elapsed: std::time::Duration,
+) -> (Result<HvVcpuExit, MicrovmError>, HvRunRecord) {
+    let result = match result {
+        Ok(HvVcpuExit::Canceled) if deadline_fired => Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "vcpu run exceeded its deadline",
+        )),
+        other => other,
+    };
+    let outcome = match &result {
+        Ok(e) => HvRunOutcome::Exit(exit_kind(e)),
+        Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => HvRunOutcome::DeadlineExceeded,
+        Err(e) => HvRunOutcome::Error(e.code()),
+    };
+    (result, HvRunRecord { outcome, elapsed })
 }
 
 #[cfg(test)]
@@ -300,5 +589,127 @@ mod tests {
             assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
             assert_eq!(e.message(), "size exceeds the maximum mapping size");
         }
+    }
+
+    fn raw_exit(reason: u32) -> HvVcpuExitRaw {
+        HvVcpuExitRaw {
+            reason,
+            exception: HvVcpuExitException {
+                syndrome: 0x9200_0046,
+                virtual_address: 0x1000,
+                physical_address: 0x0900_0000,
+            },
+        }
+    }
+
+    #[test]
+    fn mvm5_3786_decode_exit_known_reasons() {
+        assert_eq!(decode_exit(&raw_exit(0)), HvVcpuExit::Canceled);
+        assert_eq!(
+            decode_exit(&raw_exit(1)),
+            HvVcpuExit::Exception(HvVcpuExitException {
+                syndrome: 0x9200_0046,
+                virtual_address: 0x1000,
+                physical_address: 0x0900_0000,
+            })
+        );
+        assert_eq!(decode_exit(&raw_exit(2)), HvVcpuExit::VtimerActivated);
+        assert_eq!(decode_exit(&raw_exit(3)), HvVcpuExit::Unknown(3));
+    }
+
+    #[test]
+    fn mvm5_3786_decode_exit_unrecognized_values_are_kept() {
+        for v in [4_u32, 0xdead_beef, u32::MAX] {
+            assert_eq!(decode_exit(&raw_exit(v)), HvVcpuExit::Unknown(v));
+        }
+    }
+
+    #[test]
+    fn mvm5_3786_reg_values() {
+        assert_eq!(HvReg::x(0).map(HvReg::bits), Some(0));
+        assert_eq!(HvReg::x(30).map(HvReg::bits), Some(30));
+        assert_eq!(HvReg::x(31), None);
+        assert_eq!(HvReg::x(255), None);
+        assert_eq!(HvReg::PC.bits(), 31);
+        assert_eq!(HvReg::FPCR.bits(), 32);
+        assert_eq!(HvReg::FPSR.bits(), 33);
+        assert_eq!(HvReg::CPSR.bits(), 34);
+    }
+
+    #[test]
+    fn mvm5_3786_sys_reg_encoding() {
+        assert_eq!(HvSysReg::MPIDR_EL1.bits(), 0xc005);
+        assert_eq!(HvSysReg::SCTLR_EL1.bits(), 0xc080);
+        assert_eq!(HvSysReg::CNTV_CTL_EL0.bits(), 0xdf19);
+        assert_eq!(HvSysReg::CNTV_CVAL_EL0.bits(), 0xdf1a);
+    }
+
+    #[test]
+    fn mvm5_3786_interrupt_type_and_op_names() {
+        assert_eq!(HvInterruptType::Irq.bits(), 0);
+        assert_eq!(HvInterruptType::Fiq.bits(), 1);
+        let e = classify_hv_return(HvOp::VcpuRun, HV_BAD_ARGUMENT).unwrap_err();
+        assert_eq!(e.message(), "hv_vcpu_run returned HV_BAD_ARGUMENT");
+        let e = classify_hv_return(HvOp::VcpusExit, HV_BUSY).unwrap_err();
+        assert_eq!(e.message(), "hv_vcpus_exit returned HV_BUSY");
+        let e = classify_hv_return(HvOp::VcpuSetPendingInterrupt, HV_BUSY).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "hv_vcpu_set_pending_interrupt returned HV_BUSY"
+        );
+    }
+
+    #[test]
+    fn mvm5_3786_check_run_deadline_bounds() {
+        use std::time::Duration;
+        assert!(check_run_deadline(Duration::from_millis(1)).is_ok());
+        assert!(check_run_deadline(HV_RUN_DEADLINE_MAX).is_ok());
+        for t in [
+            Duration::ZERO,
+            HV_RUN_DEADLINE_MAX + Duration::from_nanos(1),
+        ] {
+            assert_eq!(
+                check_run_deadline(t).unwrap_err().code(),
+                MicrovmErrorCode::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn mvm5_3786_finish_run_classifies_and_accumulates() {
+        use std::time::Duration;
+        let d = Duration::from_millis(5);
+        let (r, rec1) = finish_run(Ok(HvVcpuExit::Canceled), true, d);
+        assert_eq!(r.unwrap_err().code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(rec1.outcome, HvRunOutcome::DeadlineExceeded);
+        let (r, rec2) = finish_run(Ok(HvVcpuExit::Canceled), false, d);
+        assert_eq!(r.unwrap(), HvVcpuExit::Canceled);
+        assert_eq!(rec2.outcome, HvRunOutcome::Exit("canceled"));
+        let (_, rec3) = finish_run(Ok(HvVcpuExit::VtimerActivated), true, d);
+        assert_eq!(rec3.outcome, HvRunOutcome::Exit("vtimer"));
+        let (r, rec4) = finish_run(
+            Err(MicrovmError::new(MicrovmErrorCode::Internal, "x")),
+            false,
+            d,
+        );
+        assert!(r.is_err());
+        assert_eq!(
+            rec4.outcome,
+            HvRunOutcome::Error(MicrovmErrorCode::Internal)
+        );
+        let mut st = HvRunStats::default();
+        for rec in [rec1, rec2, rec3, rec4] {
+            st.add(&rec);
+        }
+        assert_eq!(
+            st,
+            HvRunStats {
+                runs: 4,
+                exits: 2,
+                deadline_exceeded: 1,
+                errors: 1,
+                total_elapsed: Duration::from_millis(20),
+            }
+        );
     }
 }

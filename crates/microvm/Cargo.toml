@@ -24,7 +24,9 @@
 # #3734 で x86_64 の起動用 MSR・FPU の設定（boot_x86 の表と VcpuFd の set_msrs / msrs / set_fpu / fpu）を追加（依存は増やさない。unsafe 追加なし）。
 # #3731 で x86_64 の CPUID・MSR・FPU・LAPIC・TSS / identity map の ioctl ラッパーを追加（依存は増やさない。unsafe は sys.rs のみ）。
 # #3732 で TSS / identity map のアドレス選択と assemble での重なり検証を追加（依存は増やさない。unsafe なし）。
+# TASK-192.5・#3784 で fdt（FDT の組み立て器。OS 非依存）を追加（依存は増やさない。unsafe なし）。
 # #3783（TASK-192.1）で src/sys/hvf.rs・hvf_abi・hvf を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

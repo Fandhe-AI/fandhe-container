@@ -19,6 +19,7 @@
 # TASK-75.3.1 で boot_x86（カーネル・initrd のゲストメモリへのロード）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.5 の #3739 で uart（8250 / 16550 互換の UART のレジスタモデル）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.3.2 で vCPU のレジスタ初期化（KVM_GET/SET_REGS・KVM_GET/SET_SREGS・boot_x86 の GDT・ページテーブル）を追加（依存は増やさない。unsafe は sys.rs のみ）。
+# #3731 で x86_64 の CPUID・MSR・FPU・LAPIC・TSS / identity map の ioctl ラッパーを追加（依存は増やさない。unsafe は sys.rs のみ）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 [package]

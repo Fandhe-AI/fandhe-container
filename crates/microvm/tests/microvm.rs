@@ -4,11 +4,12 @@
 //! 「最小デバイスモデルの microVM」とは vCPU 1 台・virtio-block 1 台・合成ペイロードの構成を指す。
 //! 実 Linux カーネルの起動完走・AP・virtio-net を含む `start` は未実装で本試験の範囲外。
 //!
-//! 起動の観測手段: `RunRecord` は exit の種別名しか運ばず、停止後はホストからゲストの状態を読めない。
-//! そこで合成ペイロード自身に起動状態を検証させ、結果を exit の種別の並びと停止理由へ写す。
+//! 起動の観測手段: 停止後はホストからゲストの状態を読めない。そこで合成ペイロード自身に起動状態を
+//! 検証させ、結果を exit の種別の並び・exit の値（opt-in・上限つきの `BoundedRunLog`）・停止理由へ写す。
 //! ゲストは (1) RSI の boot_params の `HdrS` と `cmd_line_ptr`、(2) virtio-mmio の MagicValue と
 //! DeviceID（virtio-block）を読んで照合し、すべて一致したときだけ PIO の write を 3 回出す。
-//! ホストは `RunObserver` が記録した exit の並び（`mmio, mmio, io, io, io`）と `StopReason` で判定する。
+//! ホストは `BoundedRunLog` が記録した exit の並び（`mmio, mmio, io, io, io`）、MMIO 読み出しの
+//! アドレスと長さ、PIO の port とデータ（`O`・`K`・`\n`）、`StopReason` で判定する（#3769）。
 //! 不一致は `ud2` で `GuestShutdown` になるため、「シャットダウン＝成功」とはみなさない。
 //! 負の対照は block 無しの同じペイロードで、未登録 MMIO が 0xFF 埋めとなり照合に失敗することを確かめる。
 #![cfg(target_os = "linux")]
@@ -21,28 +22,59 @@ mod bzimage;
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::bzimage;
-    use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
+    use fandhe_container_microvm::device::{BoundedRunLog, KvmDevice, RunOutcome, ValueCapture};
+    use fandhe_container_microvm::exit::{ExitData, ExitValue, IoDirection};
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// 記録された VM exit の種別名だけを並べる（中断・期限切れは捨てる）。
-    #[derive(Debug, Default)]
-    struct ExitKinds(Mutex<Vec<&'static str>>);
-    impl RunObserver for ExitKinds {
-        fn record(&self, record: &RunRecord) {
-            if let RunOutcome::Exit(kind) = record.outcome {
-                self.0.lock().unwrap().push(kind);
-            }
-        }
+    /// 記録件数の上限。10 秒の待ち / 100ms のポーリング + 停止までの記録を十分に上回る。
+    const LOG_CAPACITY: usize = 256;
+
+    fn new_log() -> BoundedRunLog {
+        BoundedRunLog::new(LOG_CAPACITY, ValueCapture::Record).unwrap()
     }
-    impl ExitKinds {
-        fn kinds(&self) -> Vec<&'static str> {
-            self.0.lock().unwrap().clone()
-        }
+
+    /// 記録された VM exit の種別名だけを並べる（中断・期限切れは捨てる）。
+    fn kinds_of(log: &BoundedRunLog) -> Vec<&'static str> {
+        log.records()
+            .iter()
+            .filter_map(|r| match r.outcome {
+                RunOutcome::Exit(k) => Some(k),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Exit の記録の値（中断・期限切れは捨てる）。
+    fn values_of(log: &BoundedRunLog) -> Vec<Option<ExitValue>> {
+        log.records()
+            .iter()
+            .filter(|r| matches!(r.outcome, RunOutcome::Exit(_)))
+            .map(|r| r.value)
+            .collect()
+    }
+
+    fn mmio_read(phys_addr: u64) -> Option<ExitValue> {
+        Some(ExitValue::Mmio {
+            phys_addr,
+            len: 4,
+            is_write: false,
+            data: ExitData::empty(),
+        })
+    }
+
+    fn pio_out(byte: u8) -> Option<ExitValue> {
+        Some(ExitValue::Pio {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: ExitData::from_slice(&[byte]),
+        })
     }
 
     fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -98,6 +130,8 @@ mod x86 {
     struct Outcome {
         reason: StopReason,
         kinds: Vec<&'static str>,
+        values: Vec<Option<ExitValue>>,
+        dropped: u64,
         exits: u64,
         errors: u64,
         elapsed: Duration,
@@ -137,22 +171,22 @@ mod x86 {
         let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
         assert_eq!(loaded.entry.raw(), 0x100_0200);
         assert_eq!(loaded.boot_params.raw(), 0x7000);
-        let obs = Arc::new(ExitKinds::default());
+        let obs = Arc::new(new_log());
         vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
         let running = vm.start(&loaded).unwrap();
         if with_block {
             assert!(
                 wait_until(Duration::from_secs(10), || {
-                    obs.kinds().iter().filter(|k| **k == "io").count() >= 3
+                    kinds_of(&obs).iter().filter(|k| **k == "io").count() >= 3
                 }),
                 "guest did not reach PIO writes: {:?}",
-                obs.kinds()
+                kinds_of(&obs)
             );
         } else {
             assert!(
                 wait_until(Duration::from_secs(10), || running.is_finished()),
                 "guest did not shut down: {:?}",
-                obs.kinds()
+                kinds_of(&obs)
             );
         }
         let t = Instant::now();
@@ -160,7 +194,9 @@ mod x86 {
         let elapsed = t.elapsed();
         Outcome {
             reason: report.reason,
-            kinds: obs.kinds(),
+            kinds: kinds_of(&obs),
+            values: values_of(&obs),
+            dropped: obs.dropped(),
             exits: report.stats.exits,
             errors: report.stats.errors,
             elapsed,
@@ -184,6 +220,18 @@ mod x86 {
     fn microvm_boots_minimal_device_model_and_stops() {
         let o = bounded(true);
         assert_eq!(o.kinds, vec!["mmio", "mmio", "io", "io", "io"]);
+        // ペイロードが出す固定値（MagicValue / DeviceID の読み出しと 'O' 'K' '\n' の PIO write）。
+        assert_eq!(
+            o.values,
+            vec![
+                mmio_read(0xd000_0000),
+                mmio_read(0xd000_0008),
+                pio_out(b'O'),
+                pio_out(b'K'),
+                pio_out(b'\n'),
+            ]
+        );
+        assert_eq!(o.dropped, 0);
         assert_eq!(o.reason, StopReason::Requested);
         assert_eq!(o.exits, 5);
         assert_eq!(o.errors, 0);
@@ -197,6 +245,7 @@ mod x86 {
     fn microvm_boot_check_fails_without_block_device() {
         let o = bounded(false);
         assert_eq!(o.kinds, vec!["mmio", "shutdown"]);
+        assert_eq!(o.values.first(), Some(&mmio_read(0xd000_0000)));
         assert_eq!(o.reason, StopReason::GuestShutdown);
         assert_eq!(o.obs_refs, 1);
     }

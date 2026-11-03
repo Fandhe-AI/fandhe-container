@@ -90,6 +90,118 @@ pub enum VcpuExit {
     Other { exit_reason: u32 },
 }
 
+/// 1 レコードに保持する exit データの上限バイト数（#3769・MVM-1・REPAIR-12）。
+///
+/// MMIO は最大 8 バイトで必ず収まる。PIO は `rep outs` で `size * count` が大きくなりうるため、
+/// 超過分は捨てて [`ExitData::truncated`] に数える。固定長にして `Copy` を保ち、vCPU スレッドで割り当てない。
+pub const EXIT_VALUE_DATA_MAX: usize = 16;
+
+/// 上限つきの exit データ（ゲストが書いた値。untrusted）。未使用部分は 0 埋めで、`PartialEq` は長さも見る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitData {
+    bytes: [u8; EXIT_VALUE_DATA_MAX],
+    len: u8,
+    truncated: u32,
+}
+
+impl ExitData {
+    /// データなし（読み出し系の exit）。
+    pub const fn empty() -> ExitData {
+        ExitData {
+            bytes: [0; EXIT_VALUE_DATA_MAX],
+            len: 0,
+            truncated: 0,
+        }
+    }
+
+    /// 先頭 [`EXIT_VALUE_DATA_MAX`] バイトを保持し、超過分の長さを数える（panic しない）。
+    pub fn from_slice(data: &[u8]) -> ExitData {
+        let keep = data.len().min(EXIT_VALUE_DATA_MAX);
+        let mut out = ExitData::empty();
+        if let (Some(src), Some(dst)) = (data.get(..keep), out.bytes.get_mut(..keep)) {
+            dst.copy_from_slice(src);
+        }
+        // keep <= 16 のため u8 に収まる。
+        out.len = u8::try_from(keep).unwrap_or(u8::MAX);
+        out.truncated = u32::try_from(data.len().saturating_sub(keep)).unwrap_or(u32::MAX);
+        out
+    }
+
+    /// 保持しているバイト列。
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+
+    /// 上限を超えて捨てたバイト数（飽和）。
+    pub fn truncated(&self) -> u32 {
+        self.truncated
+    }
+}
+
+/// `RunRecord` に載せる exit の値（試験・診断用。opt-in。#3769・MVM-1・REPAIR-12）。
+///
+/// IN と MMIO 読み出しの応答値は `run_once` の時点で未確定（`handle_exit` が後で書き戻す）ため記録しない。
+/// 向き・アドレス / ポート・幅だけを載せる（応答の記録は未実装。REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExitValue {
+    /// ポート I/O。`In` のとき `data` は空。
+    Pio {
+        direction: IoDirection,
+        port: u16,
+        size: u8,
+        count: u32,
+        data: ExitData,
+    },
+    /// MMIO。読み出しのとき `data` は空、書き込みのとき `data[..len]`。
+    Mmio {
+        phys_addr: u64,
+        len: u32,
+        is_write: bool,
+        data: ExitData,
+    },
+}
+
+impl ExitValue {
+    /// `Io` / `Mmio` の exit だけ値を作る。それ以外は `None`。
+    pub fn from_exit(exit: &VcpuExit) -> Option<ExitValue> {
+        match exit {
+            VcpuExit::Io {
+                direction,
+                port,
+                size,
+                count,
+                data,
+            } => Some(ExitValue::Pio {
+                direction: *direction,
+                port: *port,
+                size: *size,
+                count: *count,
+                data: ExitData::from_slice(data),
+            }),
+            VcpuExit::Mmio {
+                phys_addr,
+                data,
+                len,
+                is_write,
+            } => {
+                let n = usize::try_from(*len).unwrap_or(0).min(data.len());
+                let payload = if *is_write {
+                    data.get(..n).unwrap_or(&[])
+                } else {
+                    &[]
+                };
+                Some(ExitValue::Mmio {
+                    phys_addr: *phys_addr,
+                    len: *len,
+                    is_write: *is_write,
+                    data: ExitData::from_slice(payload),
+                })
+            }
+            _ => None,
+        }
+    }
+}
 /// `kvm_run` 領域の読み口。`KvmRunMap` が実装し、試験は `Vec<u8>` の実装を使う。
 pub(crate) trait RunArea {
     /// 領域の長さ。
@@ -370,6 +482,112 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3769・MVM-1: PIO out の値（port・向き・データ）を記録する。
+    #[test]
+    fn mvm1_3769_exit_value_pio_out_records_port_direction_and_data() {
+        let v = ExitValue::from_exit(&VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: vec![0x4F],
+        });
+        assert_eq!(
+            v,
+            Some(ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x10,
+                size: 1,
+                count: 1,
+                data: ExitData::from_slice(&[0x4F]),
+            })
+        );
+    }
+
+    /// #3769・MVM-1: 上限超過のデータは先頭だけ保持し、超過分を数える。
+    #[test]
+    fn mvm1_3769_exit_value_pio_data_is_truncated_and_counted() {
+        let data: Vec<u8> = (0..64).collect();
+        let Some(ExitValue::Pio { data: d, .. }) = ExitValue::from_exit(&VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x3F8,
+            size: 1,
+            count: 64,
+            data,
+        }) else {
+            panic!("expected Pio");
+        };
+        let expect: Vec<u8> = (0..16).collect();
+        assert_eq!(d.as_bytes(), expect.as_slice());
+        assert_eq!(d.truncated(), 48);
+    }
+
+    /// #3769・MVM-1: IN と MMIO 読み出しは応答前のためデータなし。
+    #[test]
+    fn mvm1_3769_exit_value_reads_have_no_data() {
+        let Some(ExitValue::Pio { data, .. }) = ExitValue::from_exit(&VcpuExit::Io {
+            direction: IoDirection::In,
+            port: 0x20,
+            size: 1,
+            count: 1,
+            data: vec![],
+        }) else {
+            panic!("expected Pio");
+        };
+        assert_eq!(data, ExitData::empty());
+        let v = ExitValue::from_exit(&VcpuExit::Mmio {
+            phys_addr: 0xd000_0000,
+            data: [9; 8],
+            len: 4,
+            is_write: false,
+        });
+        assert_eq!(
+            v,
+            Some(ExitValue::Mmio {
+                phys_addr: 0xd000_0000,
+                len: 4,
+                is_write: false,
+                data: ExitData::empty(),
+            })
+        );
+    }
+
+    /// #3769・MVM-1: MMIO 書き込みは `data[..len]` だけ保持する。
+    #[test]
+    fn mvm1_3769_exit_value_mmio_write_keeps_len_bytes() {
+        let Some(ExitValue::Mmio { data, len, .. }) = ExitValue::from_exit(&VcpuExit::Mmio {
+            phys_addr: 0xd000_0070,
+            data: [1, 2, 3, 4, 9, 9, 9, 9],
+            len: 4,
+            is_write: true,
+        }) else {
+            panic!("expected Mmio");
+        };
+        assert_eq!(len, 4);
+        assert_eq!(data.as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(data.truncated(), 0);
+    }
+
+    /// #3769・MVM-1: アクセス以外の exit は値を持たない。
+    #[test]
+    fn mvm1_3769_exit_value_is_none_for_non_access_exits() {
+        for e in [
+            VcpuExit::Hlt,
+            VcpuExit::Shutdown,
+            VcpuExit::Interrupted,
+            VcpuExit::Other { exit_reason: 99 },
+        ] {
+            assert_eq!(ExitValue::from_exit(&e), None);
+        }
+    }
+
+    /// #3769・MVM-1: 0 埋めでも長さの違うデータは区別される。
+    #[test]
+    fn mvm1_3769_exit_data_distinguishes_length() {
+        assert_eq!(ExitData::from_slice(&[7]), ExitData::from_slice(&[7]));
+        assert_ne!(ExitData::from_slice(&[7]), ExitData::from_slice(&[7, 0]));
+    }
 
     fn area(reason: u32) -> Vec<u8> {
         let mut v = vec![0u8; 4096 + 64];

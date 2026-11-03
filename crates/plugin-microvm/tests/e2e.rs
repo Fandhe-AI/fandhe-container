@@ -422,7 +422,30 @@ mod real_kvm {
         }
     }
 
-    fn spawn(sock: &Path) -> Child {
+    /// 実バイナリの子プロセスを保持する RAII ガード。assert 失敗・panic で drop されても
+    /// 期限つきで kill と回収を行い、plugin を残さない（REPAIR-5）。
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn child(&mut self) -> &mut Child {
+            self.0.as_mut().expect("child already taken")
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                reap::reap_or_report(&mut child, reap::reap_within());
+            }
+        }
+    }
+
+    fn spawn(sock: &Path) -> ChildGuard {
+        ChildGuard(Some(spawn_raw(sock)))
+    }
+
+    fn spawn_raw(sock: &Path) -> Child {
         Command::new(BIN)
             .env_clear()
             .env(PLUGIN_SOCKET_ENV, sock)
@@ -434,15 +457,15 @@ mod real_kvm {
     }
 
     /// 期限内に子の終了を待ち (終了コード, stderr) を返す。超過時は kill して失敗にする。
-    fn wait_exit(mut child: Child) -> (i32, String) {
+    fn wait_exit(mut guard: ChildGuard) -> (i32, String) {
+        let child = guard.child();
         let start = Instant::now();
         let status = loop {
             if let Some(st) = child.try_wait().expect("try_wait") {
                 break st;
             }
             if start.elapsed() > WAIT {
-                let _ = child.kill();
-                reap::reap_or_report(&mut child, reap::reap_within());
+                // 以降の kill と回収はガードの drop が行う。
                 panic!("plugin binary did not exit within deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -451,11 +474,13 @@ mod real_kvm {
         if let Some(mut s) = child.stderr.take() {
             let _ = s.read_to_string(&mut err);
         }
+        // 正常終了済みなのでガードの drop は kill しない（回収済みの子へ kill は失敗を無視）。
+        guard.0 = None;
         (status.code().expect("exit code"), err)
     }
 
     /// listener を立てて実バイナリを繋ぎ、ping と start（合成カーネル）まで進めた状態を返す。
-    fn boot() -> (TempDir, Child, UdsStream, String) {
+    fn boot() -> (TempDir, ChildGuard, UdsStream, String) {
         precondition();
         let dir = TempDir::new();
         let sock = dir.0.join("p.sock");

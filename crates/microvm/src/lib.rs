@@ -39,6 +39,7 @@
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
+//! TASK-192.7・#3790・MVM-5・MVM-1: arm64 の Image・initrd・FDT の配置と起動レジスタの値（`boot_arm64`。OS 非依存・`unsafe` なし）。
 //! TASK-192.8・#3785・MVM-5: arm64 の ESR（例外 syndrome）の復号（`esr`。OS 非依存・`unsafe` なし）。
 //! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
@@ -64,6 +65,7 @@
 #![deny(unsafe_code)]
 
 pub mod arm64_layout;
+pub mod boot_arm64;
 pub mod boot_x86;
 pub mod cpuid_x86;
 #[cfg(target_os = "linux")]

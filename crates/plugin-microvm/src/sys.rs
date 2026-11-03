@@ -5,9 +5,8 @@
 //! 方式は `fandhe-container-plugin-macos` の `sys.rs`（TASK-115.5・#389）を写したもの。
 //!
 //! # 呼び出し文脈
-//! 現時点では結線されていない（受信フラグを登録する部品だけを置く）。#3747 で `main.rs` が接続前に
-//! [`install_sigterm_flag`] を 1 回呼び、得たフラグを `frame_loop` の受信ループ（`serve_until`。#3747 で追加予定）へ
-//! 渡し、フラグが立ったら `stop_all` で起動中の VM を止めてから終了する予定である。
+//! `main.rs` が接続前に [`install_sigterm_flag`] を 1 回呼び、得たフラグを `frame_loop::serve_until` へ渡す
+//! （#3747）。フラグが立つと受付をやめ、`stop_all` で起動中の VM を止めてから終了する。
 //! core 自身の終了要求は SIGTERM ではなく接続切断（EOF）で伝わる。
 //!
 //! 製品の依存に `libc` は入れず、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
@@ -40,7 +39,7 @@
 //!
 //! # 限界（残存リスク）
 //! SIGKILL は捕捉できない。`stop_all` が送信側の猶予内に終わらず SIGKILL された場合、VM は残留しうる
-//! （#3747・#3722 の範囲）。SIGINT / SIGHUP は対象外。結線前（#3747 まで）はフラグが立っても誰も見ない。
+//! （#3722 の範囲）。SIGINT / SIGHUP は対象外。
 //!
 //! # libc との機械照合（未導入）
 //! 本 crate は dev-dependencies に `libc` を持たないため照合は入れていない。dev-dependency の追加は crate ごとの

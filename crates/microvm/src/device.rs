@@ -1552,9 +1552,28 @@ mod tests {
                     },
                 )
             });
-            body();
-            h.join().unwrap()
+            // body が panic / assert 失敗しても run_done を立てて通知し、scope の暗黙 join で停止しないようにする。
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            run_done.store(true, Ordering::SeqCst);
+            signal.notify();
+            let o = h.join().unwrap();
+            if let Err(e) = r {
+                std::panic::resume_unwind(e);
+            }
+            o
         })
+    }
+
+    /// 条件成立を期限つき（10 秒）で待つ。超えたら panic で失敗させ、無期限に待たない（REPAIR-5）。
+    fn wait_kicked(kicks: &AtomicU32) {
+        let start = Instant::now();
+        while kicks.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "kick was not observed within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// REPAIR-5・MVM-1（#3736）: 停止要求なしで run が完了すれば kick も immediate_exit も使わない。
@@ -1580,9 +1599,7 @@ mod tests {
         let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {
             std::thread::sleep(Duration::from_millis(10));
             sig.request();
-            while kicks.load(Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_kicked(&kicks);
             done.store(true, Ordering::SeqCst);
             sig.notify();
         });
@@ -1614,9 +1631,7 @@ mod tests {
         sig.request();
         let t = Instant::now();
         let o = watch_in_thread(&sig, &done, Duration::from_secs(10), &exits, &kicks, || {
-            while kicks.load(Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_kicked(&kicks);
             done.store(true, Ordering::SeqCst);
             sig.notify();
         });
@@ -1636,9 +1651,7 @@ mod tests {
             &exits,
             &kicks,
             || {
-                while kicks.load(Ordering::SeqCst) == 0 {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                wait_kicked(&kicks);
                 done.store(true, Ordering::SeqCst);
                 sig.notify();
             },

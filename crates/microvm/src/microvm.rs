@@ -1325,8 +1325,14 @@ mod lifecycle_tests {
             if let Some(gate) = &self.gate {
                 let (m, cv) = &**gate;
                 let mut open = m.lock().unwrap();
+                let start = Instant::now();
                 while !*open {
-                    open = cv.wait(open).unwrap();
+                    // 解放されない回帰でも無期限に待たない（REPAIR-5）。
+                    assert!(
+                        start.elapsed() < Duration::from_secs(30),
+                        "gate was not opened within 30s"
+                    );
+                    open = cv.wait_timeout(open, Duration::from_millis(100)).unwrap().0;
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -1485,9 +1491,10 @@ mod lifecycle_tests {
         }
         let entered = Arc::new(AtomicBool::new(false));
         let running = spawn_loop(Waiter(Arc::clone(&entered)), Instant::now()).unwrap();
-        while !entered.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || entered.load(Ordering::SeqCst)),
+            "body did not enter step within 10s"
+        );
         let t = Instant::now();
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::Requested);

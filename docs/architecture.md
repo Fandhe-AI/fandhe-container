@@ -3,7 +3,7 @@
 crate 境界・依存方向・実装コードを持たない確定済み設計判断への索引となる文書（REPAIR-3）。個々の crate の責務・PLUG-1 区分の確定一覧は [crate-naming.md](design/crate-naming.md) を正とし、本書ではそれを層構造・依存方向の観点で要約する。
 
 - 作成日: 2026-09-27
-- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）・#707（TASK-78.2）
+- 関連 issue: #21（TASK-6）・#22（TASK-6.1・本書）・#23（TASK-6.2）・#24（TASK-6.h1）・#30（TASK-72）・#705（TASK-78）・#706（TASK-78.1）・#707（TASK-78.2）・#4（microVM のバックエンドの配置。2026-11-03 オーナー決定。TASK-192 の配置の前提）
 - ステータス: #24（TASK-6.h1）で内容レビュー承認待ち
 - 対象ビヘイビア: REPAIR-3・PLUG-1（crate 分割の前提として REPAIR-1 も参照）・WIN-6・MVM-5
 - 対象マイルストーン: MS-0（「microVM の 3 OS 展開方針（MVM-5）」節は MS-7・TASK-78）
@@ -240,7 +240,7 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である。その上で、以下の 2 方式については MVP スコープを次のとおり判断する。
 
 - **Windows ネイティブコンテナ**（Windows Server ベースイメージ専用のコンテナ実行）は、本プロジェクトの主目的である「OCI 準拠 Linux コンテナ実行基盤」とは別カテゴリの技術であり、**MVP の射程外**とする
-- **Hyper-V 直接方式**（WHP〔Windows Hypervisor Platform〕API 経由で VMM をフルスクラッチ実装する経路）は、将来の強い分離オプションとして**設計上は残すが MVP には実装しない**。これは microVM の 3 OS 展開方針（`api-microvm.md` MVM-5。本書「microVM の 3 OS 展開方針（MVM-5）」節を参照）で Windows（WHP）を将来オプションと位置づけているのと同系統の扱いである。ただし、この方式を実装する場合の crate 配置（`microvm` 系統に含めるか等）は [crate-naming.md](design/crate-naming.md) に現時点で明示判定がなく、未決である。実装の計画時に判断する事項であり、本節では断定しない
+- **Hyper-V 直接方式**（WHP〔Windows Hypervisor Platform〕API 経由で VMM をフルスクラッチ実装する経路）は、将来の強い分離オプションとして**設計上は残すが MVP には実装しない**。これは microVM の 3 OS 展開方針（`api-microvm.md` MVM-5。本書「microVM の 3 OS 展開方針（MVM-5）」節を参照）で Windows（WHP）を将来オプションと位置づけているのと同系統の扱いである。この方式を実装する場合の crate 配置は 2026-11-03 に決定した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)）。新しい crate は作らず、`crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`）に置き、`plugin-microvm` が動かす。`plugin-windows` には載せない。詳細は本書「microVM の 3 OS 展開方針（MVM-5）」節の「バックエンドの配置（2026-11-03 決定）」を参照する。WHP は引き続き将来オプションで、MVP には実装しない
 
 根拠は PoC-4 の机上検証であり、実機性能計測ではない点に注意する（`README.md` 記載の PoC 位置づけと同様）。
 
@@ -253,21 +253,31 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 | 優先順位 | OS | バックエンド | 位置づけ | 現状 |
 | -------- | -- | ------------ | -------- | ---- |
 | 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75（#688・#695）で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc） |
-| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装（コードなし）。spec の `05-tasks.md` にこのバックエンドの実装 TASK はなく、TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
-| 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装・計画なし |
+| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装。実装は TASK-192（spec リポジトリの #27 で新設。`crates/microvm` の macOS バックエンド。対応 OS は macOS 15 以降、MS-7）。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
+| 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装。配置は `crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`。2026-11-03 決定。下の「バックエンドの配置」を参照）。実装の計画は無い |
 
 実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進める。Windows（WHP）は優先順位の外に置く。
+
+### バックエンドの配置（2026-11-03 決定）
+
+microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）は、新しい crate を作らず `crates/microvm` の中に `cfg(target_os = ...)` で置き、`fandhe-container-plugin-microvm` が別プロセスで動かす（PLUG-1）。FFI は各バックエンドの `sys` モジュールに置く。
+
+- 決定: [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)（2026-11-03 オーナー決定）
+- 理由: `crates/microvm` の責務は OS ではなく VMM の実装ライブラリで、virtio のデバイスモデル・ゲストメモリ・起動フローを OS 間で共有する。`platform-windows` は WSL2 の主経路（WIN-1・WIN-2）を担うため、microVM のバックエンドを載せない
+- 採らなかった案: `crates/microvm-windows` の新設、`crates/platform-windows` への配置。いずれも [crate-naming.md](design/crate-naming.md) の確定一覧（REPAIR-1）を変えることになるため採らない
+- WHP の FFI の宣言方法（既存の `windows-sys`〔=0.61.2〕へ feature `Win32_System_Hypervisor` を足すか、自前宣言か）は実装の計画時に決める。feature の追加はユーザー承認を経る（[dependency-policy](../.claude/rules/dependency-policy.md)）
+- Hypervisor.framework の FFI は `sys` の自前宣言（`#[link(name = "Hypervisor", kind = "framework")]`）とし、新しい依存を足さない。これは Agent の判断であり、オーナーの承認対象は WHP のみとする。異論があれば TASK-192 の着手前に見直す
+- microVM の FFI は各 crate の `sys` の自前宣言とし、`libc` は dev-dependencies の機械照合のみに使う。`nix` は採用しない（MVM-4）
+- WHP は引き続き将来オプションで、MVP には実装しない（MVM-5・WIN-6）
 
 本書で断定しない事項:
 
 - macOS の microVM オプションと macOS バックエンド（MAC-1 の Virtualization.framework、TASK-64 の `Vm`）との関係、TASK-65（MAC-1）の virtiofs 共有と I/O 共有プロトコルを microVM の I/O パスが再利用するか、MAC-4 の「1 コンテナ = 1 VM」オプションの実現経路は、[macos-vm-strategy.md](design/macos-vm-strategy.md) が未定としているのに合わせて決めない
 - GPU-6・MAC-5 の VMM 統合先は TASK-172 の 3 段目の判定（#1057。TASK-172.h5）で分岐し、統合は TASK-180 が担い、不可の場合に限り Hypervisor.framework 上の自前 VMM（MVM-5 の macOS 展開と共通化）へ切り替える。本節はその判定を先取りしない
-- Hypervisor.framework・WHP の FFI の置き場所と依存は未決。新しい依存が要る場合はユーザー承認を経る（[dependency-policy](../.claude/rules/dependency-policy.md)）
-- WHP 方式を実装する場合の crate 配置は未決（[crate-naming.md](design/crate-naming.md) に明示判定がない）。実装の計画時にオーナーが判断する
 
 根拠は PoC-6（microvm-isolation-cost）と PoC-4（windows-support-path）の机上検証であり、実機計測ではない。PoC-6 の「Linux は rust-vmm 活用」の記述は MVM-1・MVM-4（rust-vmm 不使用）とフルスクラッチ方針で上書きされている。
 
-出典: `docs/spec/04-behavior/api-microvm.md`（submodule リビジョン `fe33bef`）の `MVM-5`、`docs/spec/05-tasks.md` の TASK-78（整合確認の参照: TASK-64・TASK-65・TASK-67・TASK-180）、`docs/spec/06-roadmap.md` の MS-7。
+出典: `docs/spec/04-behavior/api-microvm.md`（submodule リビジョン `644661b`）の `MVM-5`、`docs/spec/05-tasks.md` の TASK-78（整合確認の参照: TASK-64・TASK-65・TASK-67・TASK-180）と TASK-192（macOS 展開。前提 TASK-75・TASK-78・TASK-117。spec リポジトリの #27 で新設）、`docs/spec/06-roadmap.md` の MS-7。
 
 ## 確定済み設計判断（実装コードを持たないもの）
 
@@ -279,6 +289,7 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 | REPAIR-1・REPAIR-4・MAC-1 のログ回転の共通化 | supervisor の `RotatingFileSink` と platform-macos のコンソールログ回転は共通化せず 2 か所に置く（オーナー決定ではなく現状維持の判断。再評価条件あり） | REPAIR 系・MAC-1・SUP-7 の各ビヘイビア | [rotating-log-sharing.md](design/rotating-log-sharing.md)（#2172） |
 | MVM-1・MVM-4 のゲスト物理メモリアクセス型の所有先 | アクセス型は TASK-74.1 側（OS 非依存・コピー API・heap backing で試験）、mmap と KVM 登録は TASK-75.1 側（オーナー決定ではなく Agent の記録した判断。再評価条件あり） | MVM-1・MVM-4 | [microvm-memory-ownership.md](design/microvm-memory-ownership.md)（#876） |
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書「microVM の 3 OS 展開方針（MVM-5）」節を参照（TASK-78・#705・#706・#707） |
+| MVM-5・WIN-6 のバックエンドの配置 | microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）は `crates/microvm` の中に `cfg` で置き、`plugin-microvm` が動かす。FFI は `sys`。新しい crate は作らない | `api-microvm.md`・`api-platform-windows.md` | 本書「バックエンドの配置（2026-11-03 決定）」節と [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595003343)（2026-11-03 オーナー決定。Hypervisor.framework への適用は Agent の判断） |
 | NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340。起動点・同期・入口・版の固定は 12 章・#1935） |
 | NET-5 | DNS ヘルパーを D-14 の原則の例外として認める | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6128207567)（2026-10-12 オーナー決定） |
 | NET-5・NET-9 の配置 | pasta は core 側（コンテナごとの supervisor が起動・監視・回収）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止）、`crates/net` は core 側のライブラリ（プロセスの寿命を持つ側に置く） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)（2026-10-12 オーナー決定） |

@@ -109,7 +109,7 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 ## 項目 4: オプション方式（1 コンテナ = 1 VM）の実現経路と選択の UI
 
 - 経路の推奨: 現行の `Vm::launch`（Virtualization.framework）をコンテナごとに使う。項目 1 の保持役を「容量 1 の VM」として使い、ゲスト内の構成（項目 3）も同じにする。両方式の違いを「VM に入れるコンテナ数の上限」と「共有ルートを他コンテナと共有しないこと」に限定でき、コードの経路を分けずに済む
-- MVM-5（Hypervisor.framework 上の自前 VMM）の系統は、Linux の KVM 実装が TASK-74・TASK-75（#688・#695）で最小起動フローまで完了、macOS の自前 VMM は spec に実装 TASK がなく未着手。方針は TASK-78（#705）で [architecture.md](../architecture.md) の「microVM の 3 OS 展開方針（MVM-5）」節に記載。将来の別バックエンドとして扱い、TASK-191 の範囲に入れない
+- MVM-5（Hypervisor.framework 上の自前 VMM）の系統は、Linux の KVM 実装が TASK-74・TASK-75（#688・#695）で最小起動フローまで完了、macOS の自前 VMM は TASK-192（spec リポジトリの #27 で 2026-11-03 に新設。`crates/microvm` の macOS バックエンド。MS-7）で実装するが未着手。方針は TASK-78（#705）で [architecture.md](../architecture.md) の「microVM の 3 OS 展開方針（MVM-5）」節に記載。将来の別バックエンドとして扱い、TASK-191 の範囲に入れない
 - 選択の UI は spec に定義が無いため本リポでは決めない。文言の案のみ: CLI は `create --isolation=<shared-vm|vm>`、TOML は `isolation = "vm"`。CLI-1（3 OS 同一構文）により、Linux では MVM-1 の microVM、Windows では未定義（`UNIMPLEMENTED`）の意味を持たせる必要があるため、spec 側の課題とする
 - MVM-3（切り替えしきい値）は「検討中」のまま。確定扱いしない
 

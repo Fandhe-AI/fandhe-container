@@ -526,9 +526,10 @@ mod linux {
             hold_until: Instant,
         ) -> Result<(), TraitError> {
             let mut stream = self.stream.lock().map_err(|_| unavailable())?;
-            let now = Instant::now();
-            // 単調時計を `Instant` より先に読む（載せる絶対期限が早まる側にずれる）。
+            // 単調時計を `Instant` より先に読む。間で止まっても、残り時間は後の `now` で短く測られ、
+            // 先の `now_ns` へ足すため、載せる絶対期限は早まる側にだけずれる（`hold_until` を越えない）。
             let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
+            let now = Instant::now();
             let hold = hold_until
                 .saturating_duration_since(now)
                 .min(Duration::from_secs(MAX_EXEC_HOLD_SECS));

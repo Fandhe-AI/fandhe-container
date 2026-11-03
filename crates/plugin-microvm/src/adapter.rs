@@ -256,14 +256,23 @@ fn validate_path(p: &str) -> Result<&Path, PluginError> {
     }
     let path = Path::new(p);
     // `components()` は中間の `.` を畳むため、生の区切りでも `.`・`..` を拒否する。
-    if p.split('/').any(|seg| seg == "." || seg == "..") {
+    let dotted = |seg: &str| seg == "." || seg == "..";
+    if p.split('/').any(dotted) {
         return Err(invalid(MSG_BAD_PATH));
     }
-    if !path.is_absolute()
-        || !path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-    {
+    // Windows の区切りは バックスラッシュ。ここでも `.`・`..` を拒否する。
+    #[cfg(windows)]
+    if p.split('\\').any(dotted) {
+        return Err(invalid(MSG_BAD_PATH));
+    }
+    // Windows の絶対パスはドライブ prefix や UNC を伴うため、その OS でだけ `Prefix` を許す。
+    let component_ok = |c: Component<'_>| match c {
+        Component::RootDir | Component::Normal(_) => true,
+        #[cfg(windows)]
+        Component::Prefix(_) => true,
+        _ => false,
+    };
+    if !path.is_absolute() || !path.components().all(component_ok) {
         return Err(invalid(MSG_BAD_PATH));
     }
     Ok(path)
@@ -290,19 +299,49 @@ enum ImageKind {
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
 fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
+    let slot = ReadSlot::acquire()?;
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = path.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("microvm-read-image".into())
         .spawn(move || {
-            let _ = tx.send(read_image_blocking(&owned, cap, kind));
+            let r = read_image_blocking(&owned, cap, kind);
+            // 読み込みが実際に終わってから枠を返す（期限切れ後も止まった I/O は枠を保持し続ける）。
+            drop(slot);
+            let _ = tx.send(r);
         });
     if spawned.is_err() {
+        // spawn 失敗時はクロージャごと slot が破棄され、枠は Drop で返る。
         return Err(perr(PluginErrorCode::Internal, MSG_READ_FAILED));
     }
     match rx.recv_timeout(IMAGE_READ_DEADLINE) {
         Ok(r) => r,
         Err(_) => Err(perr(PluginErrorCode::Timeout, "image read timed out")),
+    }
+}
+
+/// 実行中（期限切れで detach 済みを含む）の読み込みスレッド数の上限（REPAIR-5・リソース上限）。
+const MAX_INFLIGHT_READS: usize = 8;
+static INFLIGHT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 読み込みスレッドの枠。Drop で返す。上限到達時は `RESOURCE_EXHAUSTED`。
+struct ReadSlot;
+
+impl ReadSlot {
+    fn acquire() -> Result<Self, PluginError> {
+        use std::sync::atomic::Ordering;
+        INFLIGHT_READS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_INFLIGHT_READS).then_some(n + 1)
+            })
+            .map(|_| ReadSlot)
+            .map_err(|_| perr(PluginErrorCode::ResourceExhausted, MSG_LIMIT))
+    }
+}
+
+impl Drop for ReadSlot {
+    fn drop(&mut self) {
+        INFLIGHT_READS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

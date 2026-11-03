@@ -643,7 +643,7 @@ mod linux {
         let recorder = OpRecorder::new();
         // 委譲スコープ内の子は、最初の出力として開始行を stderr へ書く（wrapper の診断と pipe 内の順序で見分ける）。
         write_start_line();
-        let (exit, delegated) = run_exec_inner(global, args);
+        let (exit, delegated) = run_exec_inner(global, args, started);
         // 委譲スコープ内の子は、最後まで走ったことを親へ伝える（systemd-run 自身の失敗と見分ける）。
         write_result_marker();
         // 委譲スコープでの再実行の親は、子が自分の分を記録するため記録しない（二重計上を避ける）。
@@ -657,8 +657,23 @@ mod linux {
         matches!(exit, CliExit::Success | CliExit::Executed(0))
     }
 
-    /// 戻り値の後ろは「計測を委譲スコープの子が行った」かどうか。
-    fn run_exec_inner(global: &GlobalArgs, args: &ExecArgs) -> (CliExit, bool) {
+    /// 入口からの経過 `elapsed` を差し引いた `--timeout` の残り。使い切っていれば `None`（事前確認で期限を過ぎた
+    /// 実行を始めず、さらに全量の予算を与え直さない。丸めは行わず、延長もしない。REPAIR-5・CLI-1）。
+    fn remaining_budget(timeout: Duration, elapsed: Duration) -> Option<Duration> {
+        timeout.checked_sub(elapsed).filter(|r| !r.is_zero())
+    }
+
+    /// 期限切れの固定の構造化エラー（準備段で `--timeout` を使い切った場合）。
+    fn budget_exhausted() -> CliExit {
+        CliExit::Error(CliError::new(
+            ErrorCode::Timeout,
+            "exec timed out before the command started",
+        ))
+    }
+
+    /// 戻り値の後ろは「計測を委譲スコープの子が行った」かどうか。`started` は exec の入口の時刻で、`--timeout` は
+    /// ここを起点の全体期限として扱う（ストアのロック待ち等の準備も含める。REPAIR-5・CLI-1）。
+    fn run_exec_inner(global: &GlobalArgs, args: &ExecArgs, started: Instant) -> (CliExit, bool) {
         let prepared = ContainerId::new(args.id.as_str())
             .and_then(|id| build_request(args).map(|request| (id, request)));
         let (id, request) = match prepared {
@@ -684,12 +699,20 @@ mod linux {
                 }
                 Ok(_) => {}
             }
-            return rerun_in_user_scope(args.timeout);
+            // 事前確認に使った時間を差し引いた残りだけを渡す。使い切っていれば再実行しない。
+            let Some(remaining) = remaining_budget(args.timeout, started.elapsed()) else {
+                return (budget_exhausted(), false);
+            };
+            return rerun_in_user_scope(remaining);
         }
         // 親 CLI の終了に追従して止まる（親へ届いた中断を無視して最長 `--timeout` 走り続けない。#2626）。
         if let Err(e) = bind_to_parent_lifetime() {
             return (failure(&e), false);
         }
+        // 親の絶対期限が読めない場合に備え、入口からの残りを上限にする（`scoped_timeout` はさらに小さい方を採る）。
+        let Some(remaining) = remaining_budget(args.timeout, started.elapsed()) else {
+            return (budget_exhausted(), false);
+        };
         let source = production_exec_pidfd_source(&store);
         let result = exec_in_container(
             &store,
@@ -698,7 +721,7 @@ mod linux {
             &production_runner,
             &id,
             &request,
-            scoped_timeout(args.timeout),
+            scoped_timeout(remaining),
         );
         match result {
             Ok(code) => (CliExit::Executed(code), false),

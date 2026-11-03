@@ -580,6 +580,27 @@ fn repair5_remaining_is_derived_from_absolute_deadline() {
     assert_eq!(remaining_until(100_000, 200_000), Duration::from_millis(1));
 }
 
+/// REPAIR-5・CLI-1: 準備段（ストアのロック待ち等）に使った時間は `--timeout` から差し引かれ、使い切ったら
+/// 再実行せず期限切れにする（全量の予算を与え直さない）。
+#[test]
+fn repair5_cli1_preparation_time_is_deducted_from_timeout() {
+    let one = Duration::from_secs(1);
+    assert_eq!(
+        remaining_budget(one, Duration::from_millis(250)),
+        Some(Duration::from_millis(750))
+    );
+    assert_eq!(remaining_budget(one, one), None);
+    assert_eq!(remaining_budget(one, Duration::from_secs(4)), None);
+    assert_eq!(remaining_budget(one, Duration::ZERO), Some(one));
+    match budget_exhausted() {
+        CliExit::Error(e) => {
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert_eq!(e.message(), "exec timed out before the command started");
+        }
+        _ => panic!("expected a structured timeout error"),
+    }
+}
+
 /// #2626: `/proc/uptime` の本文の解釈（10ms 刻み。壊れていれば None）。
 #[test]
 fn sup6_parse_uptime_ms() {

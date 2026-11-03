@@ -897,10 +897,23 @@ mod tests {
             use std::time::Duration;
             let d = Dir::new("fifo");
             let fifo = d.0.join("ff");
-            let st = std::process::Command::new("mkfifo")
+            // mkfifo の待ちにも期限を付ける（REPAIR-5）。超えたら kill して回収し、有限時間で失敗にする。
+            let mut child = std::process::Command::new("mkfifo")
                 .arg(&fifo)
-                .status()
+                .spawn()
                 .expect("spawn mkfifo");
+            let mk_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let st = loop {
+                if let Some(st) = child.try_wait().expect("try_wait mkfifo") {
+                    break st;
+                }
+                if std::time::Instant::now() >= mk_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mkfifo did not exit within 10s (REPAIR-5)");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
             assert!(st.success(), "mkfifo failed: {st:?}");
             let (tx, rx) = std::sync::mpsc::channel();
             let p = fifo.clone();

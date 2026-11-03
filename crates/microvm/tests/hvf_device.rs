@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -6,9 +6,9 @@
 
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
-use fandhe_container_microvm::hvf::{HostMapping, HvVm, HvfGuestRam};
+use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGuestRam};
 use fandhe_container_microvm::hvf_abi::{
-    HVF_DEFAULT_IPA_LIMIT, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
+    HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,4 +177,31 @@ fn hvf_device_guest_ram_map_and_copy() {
         .unwrap();
     drop(again);
     drop(vm);
+}
+
+/// `hv_gic_*` の実行時解決（`dlsym`）と照会 API を確かめる（TASK-192.3・#3789・MVM-5・MVM-4）。
+/// macOS 14 では `UNIMPLEMENTED: hypervisor GIC requires macOS 15 or later` で落ちる（dyld のエラーは出ない）。
+/// 待ちを持たない同期の照会だけなので watchdog は不要。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_gic_symbols_resolve() {
+    let api = match GicApi::get() {
+        Ok(api) => api,
+        Err(e) => panic!("hvf_device: gic: {e}"),
+    };
+    let dist = api.distributor_size().unwrap();
+    let dist_align = api.distributor_base_alignment().unwrap();
+    let redist = api.redistributor_size().unwrap();
+    let redist_align = api.redistributor_base_alignment().unwrap();
+    let (spi_base, spi_count) = api.spi_interrupt_range().unwrap();
+    eprintln!(
+        "hvf_device: gic: distributor size={dist} align={dist_align}, redistributor size={redist} align={redist_align}, spi base={spi_base} count={spi_count}"
+    );
+    assert!(dist > 0 && redist > 0);
+    assert!(dist_align.is_power_of_two() && redist_align.is_power_of_two());
+    assert!(spi_base >= 32 && spi_count > 0);
+
+    let timer = api.intid(HvGicIntid::EL1_VIRTUAL_TIMER).unwrap();
+    eprintln!("hvf_device: EL1_VIRTUAL_TIMER intid={timer}");
+    assert!((16..=31).contains(&timer));
 }

@@ -246,9 +246,23 @@ impl FdtBuilder {
     }
 
     /// 現在の内容に `extra_struct` と `extra_strings` を足したときの出力全体の大きさが上限内か確かめる。
-    fn check_size(&self, extra_struct: usize, extra_strings: usize) -> Result<(), MicrovmError> {
+    /// 開いたままのノードごとの `FDT_END_NODE`（4 バイト）も予約し、上限付近でも全ノードを閉じて `finish` できるようにする。
+    /// `extra_open` はこの呼び出しで新たに開くノードの数。
+    fn check_size(
+        &self,
+        extra_struct: usize,
+        extra_strings: usize,
+        extra_open: usize,
+    ) -> Result<(), MicrovmError> {
+        let reserved_end_nodes = self
+            .stack
+            .len()
+            .checked_add(extra_open)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| invalid("fdt size limit exceeded"))?;
         let total = HEADER_SIZE
-            .checked_add(RSVMAP_ENTRY_SIZE)
+            .checked_add(reserved_end_nodes)
+            .and_then(|v| v.checked_add(RSVMAP_ENTRY_SIZE))
             .and_then(|v| v.checked_add(self.structure.0.len()))
             .and_then(|v| v.checked_add(extra_struct))
             .and_then(|v| v.checked_add(END_TOKEN_SIZE))
@@ -282,7 +296,7 @@ impl FdtBuilder {
         let added = name_len
             .checked_add(4)
             .ok_or_else(|| invalid("fdt size limit exceeded"))?;
-        self.check_size(added, 0)?;
+        self.check_size(added, 0, 1)?;
 
         if let Some(parent) = self.stack.last_mut() {
             parent.has_child = true;
@@ -301,7 +315,7 @@ impl FdtBuilder {
         if self.stack.is_empty() {
             return Err(invalid("fdt node nesting underflow"));
         }
-        self.check_size(4, 0)?;
+        self.check_size(0, 0, 0)?;
         self.structure.token(FdtToken::EndNode);
         self.stack.pop();
         if self.stack.is_empty() {
@@ -332,7 +346,7 @@ impl FdtBuilder {
         } else {
             name.len() + 1
         };
-        self.check_size(added, extra_strings)?;
+        self.check_size(added, extra_strings, 0)?;
 
         let nameoff = self.strings.intern(name)?;
         if let Some(node) = self.stack.last_mut() {
@@ -412,7 +426,7 @@ impl FdtBuilder {
         if !self.root_done {
             return Err(invalid("fdt root node missing at finish"));
         }
-        self.check_size(0, 0)?;
+        self.check_size(0, 0, 0)?;
         self.structure.token(FdtToken::End);
 
         let too_big = || invalid("fdt size limit exceeded");
@@ -757,5 +771,25 @@ mod tests {
             b.end_node().unwrap();
         }
         assert_eq!(x.finish().unwrap(), y.finish().unwrap());
+    }
+
+    /// 上限付近まで深いノードと property を積んでも、成功した分は必ず閉じて `finish` できること。
+    #[test]
+    fn mvm5_3784_near_limit_still_finishable() {
+        let mut b = FdtBuilder::new();
+        b.begin_node("").unwrap();
+        let mut depth = 1;
+        while b.begin_node("n").is_ok() {
+            depth += 1;
+        }
+        let mut i = 0u32;
+        while b.property_u32(&format!("p{i}"), i).is_ok() {
+            i += 1;
+        }
+        for _ in 0..depth {
+            b.end_node().unwrap();
+        }
+        let blob = b.finish().unwrap();
+        assert!(blob.len() <= MAX_FDT_BYTES);
     }
 }

@@ -13,8 +13,14 @@
 //! 負の対照は block 無しの同じペイロードで、未登録 MMIO が 0xFF 埋めとなり照合に失敗することを確かめる。
 #![cfg(target_os = "linux")]
 
+/// 合成 bzImage の正本（複製しない・#3750）。インライン module 内では `#[path]` の基準が変わるため、ここで宣言する。
+#[cfg(target_arch = "x86_64")]
+#[path = "support/bzimage.rs"]
+mod bzimage;
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
+    use super::bzimage;
     use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
@@ -48,31 +54,6 @@ mod x86 {
             std::thread::sleep(Duration::from_millis(10));
         }
         cond()
-    }
-
-    /// 合成 bzImage（64-bit エントリは payload + 0x200）。残りの payload は `ud2`（0F 0B）で埋める。
-    fn synthetic_bzimage(entry_code: &[u8]) -> Vec<u8> {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        let payload = 5 * 512;
-        for (i, b) in img[payload..].iter_mut().enumerate() {
-            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-        }
-        img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-        img
     }
 
     /// 起動状態を検証するゲストの機械語。成功時だけ PIO 0x10 へ 3 回 write して自己ループする。
@@ -152,7 +133,7 @@ mod x86 {
                 "payload MMIO address"
             );
         }
-        let img = synthetic_bzimage(&boot_check_payload());
+        let img = bzimage::synthetic_bzimage(&boot_check_payload());
         let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
         assert_eq!(loaded.entry.raw(), 0x100_0200);
         assert_eq!(loaded.boot_params.raw(), 0x7000);

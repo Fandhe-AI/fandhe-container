@@ -605,6 +605,11 @@ fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_u
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
+/// 合成 bzImage の正本（`crates/microvm/tests/support/bzimage.rs`。複製しない・#3750）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "../../microvm/tests/support/bzimage.rs"]
+mod bzimage;
+
 /// 層 B: 実バイナリ + 実 KVM（x86_64 Linux・`/dev/kvm` が要る実機前提）。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod real_kvm {
@@ -616,36 +621,10 @@ mod real_kvm {
 
     use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PLUGIN_SOCKET_ENV, UdsListener};
 
-    use super::reap;
+    use super::{bzimage, reap};
 
     const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-microvm");
     const WAIT: Duration = Duration::from_secs(30);
-
-    /// 合成 bzImage（`crates/microvm/tests/microvm.rs` の同名関数と同じ組み立て。64-bit エントリは payload + 0x200）。
-    /// 別 crate の試験との共通化は 1 PR・1 関心事の範囲外のため写している。残りの payload は `ud2` で埋める。
-    fn synthetic_bzimage(entry_code: &[u8]) -> Vec<u8> {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        let payload = 5 * 512;
-        for (i, b) in img[payload..].iter_mut().enumerate() {
-            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-        }
-        img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-        img
-    }
 
     /// boot_params の `HdrS` と cmd_line_ptr（0x20000）だけを確かめ、一致すれば自己ループする。不一致は `ud2`。
     fn guest_payload() -> Vec<u8> {
@@ -736,7 +715,7 @@ mod real_kvm {
         precondition();
         let dir = TempDir::new();
         let sock = dir.0.join("p.sock");
-        let kernel = dir.file("k.bin", &synthetic_bzimage(&guest_payload()));
+        let kernel = dir.file("k.bin", &bzimage::synthetic_bzimage(&guest_payload()));
         let listener = UdsListener::bind(&sock).expect("bind");
         let child = spawn(&sock);
         let mut obs = JsonLinesPeerAuthObserver::new();

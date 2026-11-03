@@ -16,6 +16,8 @@ publish = false
 [dependencies]
 # workspace 内の path 依存（外部クレートの追加ではない。PLUG-1: 境界機構 plugin crate を使う側）。
 fandhe-container-plugin = { workspace = true }
+# TASK-117.2（#711）: microVM 本体（start / stop の委譲先）。外部クレートの追加ではない。
+fandhe-container-microvm = { path = "../microvm" }
 
 [[bin]]
 name = "fandhe-container-plugin-microvm"

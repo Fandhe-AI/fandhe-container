@@ -152,6 +152,22 @@ fn expect_unimplemented(msg: ControlMessage<Vec<String>>, want_id: u64) {
     }
 }
 
+fn expect_error(
+    msg: ControlMessage<Vec<String>>,
+    want_id: u64,
+    want_code: PluginErrorCode,
+    want_msg: &str,
+) {
+    match msg {
+        ControlMessage::Error { id, error } => {
+            assert_eq!(id.get(), want_id);
+            assert_eq!(error.code(), want_code);
+            assert_eq!(error.message(), want_msg);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 /// 切断後に読み取りが EOF（`Unavailable`）になることを確かめる。
 fn expect_disconnected(h: &mut Harness) {
     let e = h
@@ -305,10 +321,51 @@ fn task117_1_mvm1_ping_roundtrip_keeps_connection() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    expect_unimplemented(h.call(12, &["start", "a"]), 12);
+    // start は引数不足で INVALID_ARGUMENT（TASK-117.2）。接続は継続する。
+    expect_error(
+        h.call(12, &["start", "a"]),
+        12,
+        PluginErrorCode::InvalidArgument,
+        "malformed request",
+    );
     let (code, err) = h.finish();
     assert_eq!(code, 0, "{err}");
-    assert_eq!(err, "");
+    // start は構造化ログ 1 行を stderr に出す（id・パスは載せない。REPAIR-4）。
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(
+        err.contains("op=plugin.microvm.start outcome=error code=INVALID_ARGUMENT"),
+        "{err}"
+    );
+}
+
+/// TASK-117.2・MVM-1: 存在しない kernel の start は NOT_FOUND、相対パスは INVALID_ARGUMENT、
+/// 未登録 id の stop は NOT_FOUND。KVM には触れず、接続は継続して終了コード 0 になる。
+#[test]
+fn task117_2_mvm1_start_stop_errors_keep_connection() {
+    let mut h = Harness::start();
+    expect_error(
+        h.call(
+            1,
+            &["start", "vm1", "/nonexistent/fc-kernel", "", "", "1", "64"],
+        ),
+        1,
+        PluginErrorCode::NotFound,
+        "kernel image not found",
+    );
+    expect_error(
+        h.call(2, &["start", "vm1", "relative/kernel", "", "", "1", "64"]),
+        2,
+        PluginErrorCode::InvalidArgument,
+        "invalid image path",
+    );
+    expect_error(
+        h.call(3, &["stop", "vm1"]),
+        3,
+        PluginErrorCode::NotFound,
+        "microVM not found",
+    );
+    let (code, _) = h.finish();
+    assert_eq!(code, 0);
 }
 
 /// 余分な要素つきの ping は固定文言の INVALID_ARGUMENT で、接続は継続する。

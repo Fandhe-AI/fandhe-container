@@ -1,4 +1,5 @@
-//! SIGTERM 受信フラグの登録（`unsafe` 事前承認の範囲。#3746。PLUG-1・REPAIR-3・REPAIR-5。
+//! SIGTERM 受信フラグの登録と、イメージパスの symlink 非追従での要素ごとの open
+//! （`unsafe` 事前承認の範囲。#3746・#3748。PLUG-1・REPAIR-3・REPAIR-5。
 //! coding-rust.md「unsafe・FFI・syscall」節・オーナー決定 2026-09-27
 //! 〔[#4](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856057084)・
 //! [範囲限定](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-5856167174)〕）。
@@ -7,6 +8,8 @@
 //! # 呼び出し文脈
 //! `main.rs` が接続前に [`install_sigterm_flag`] を 1 回呼び、得たフラグを `frame_loop::serve_until` へ渡す
 //! （#3747）。フラグが立つと受付をやめ、`stop_all` で起動中の VM を止めてから終了する。
+//! `open_regular_nofollow` は `adapter::read_image_blocking`（`start` のイメージ読み込み）から呼ばれ、
+//! 祖先の symlink を `openat(O_NOFOLLOW)` の要素ごとの解決で拒否する（SEC-1。#3748）。
 //! core 自身の終了要求は SIGTERM ではなく接続切断（EOF）で伝わる。
 //!
 //! 製品の依存に `libc` は入れず、`nix` は不採用（dependency-policy）で、std にシグナル API が無いため、
@@ -25,7 +28,8 @@
 //! 呼び出し側の規約として、本 crate を組み込むプロセスは SIGUSR2 を他の用途に使わない（`lib.rs` の注意と同じ）。
 //!
 //! # 契約
-//! - `unsafe fn` は公開しない。公開するのは安全な [`install_sigterm_flag`] のみ。
+//! - `unsafe fn` は公開しない。公開する安全な API は [`install_sigterm_flag`] と `open_regular_nofollow`
+//!   （`pub(crate)`）のみ。
 //! - ハンドラは `static AtomicBool` への `store` だけを行う（async-signal-safe。確保・ロック・I/O をしない）。
 //! - 登録するのは `SIGTERM` の番号を確認済みの組（Linux の x86_64 / aarch64・macOS）だけ。
 //! - Linux の他アーキテクチャは番号が未確認のため登録を試みず、`UNIMPLEMENTED` を返す（fail-closed）。
@@ -41,10 +45,20 @@
 //! SIGKILL は捕捉できない。`stop_all` が送信側の猶予内に終わらず SIGKILL された場合、VM は残留しうる
 //! （#3722 の範囲）。SIGINT / SIGHUP は対象外。
 //!
+//! # 共有ではなく写した理由（#3748）
+//! 要素ごとの `openat` の辿り方は `fandhe-container-plugin` の `open_dir_nofollow`（#1309）と同じ方式を写した。
+//! plugin 側は `pub(crate)` で、外部 plugin 作者もリンクする境界 crate（`MIT OR Apache-2.0`）にファイルシステムの
+//! 補助を公開 API として足すと面が広がる。io の `guest_files`（#3352）は共有ルートの意味づけと結びつき、
+//! core は本 crate の依存ではない（足すと PLUG-1・PLUG-4 の層構造に反する）。再評価条件: 同じ辿り方の写しが
+//! 3 つ目になったら共有の下位 crate を検討する（`docs/design/fdinfo-mnt-id-parsing.md` と同じ形）。
+//! 対象は macOS と Linux の x86_64 / aarch64 で、他の unix は `Unsupported`、Windows は対象外（未検査）。
+//!
 //! # libc との機械照合（未導入）
 //! 本 crate は dev-dependencies に `libc` を持たないため照合は入れていない。dev-dependency の追加は crate ごとの
 //! オーナー承認事項で、#1837 の子として扱う（判断のまとめは #3290。`docs/design/ffi-libc-check.md`「適用状況」）。
-//! 代わりに番号を具体値で固定する試験を置く。番号の出典は Linux `include/uapi/asm-generic/signal.h`
+//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`）を具体値で固定する試験を置く。出典は
+//! `O_*` / `AT_FDCWD` が Linux の `include/uapi/asm-generic/fcntl.h`・`arch/arm64/include/uapi/asm/fcntl.h`・
+//! macOS の `sys/fcntl.h`。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
 //! （SIGTERM=15。x86_64・aarch64 とも同じ）と macOS `sys/signal.h`（同値）、`SIG_ERR` は `(sighandler_t)-1`
 //! で、手作業で突き合わせた値である。
 
@@ -155,6 +169,166 @@ fn register() -> Result<(), PluginError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// イメージパスの symlink 非追従 open（SEC-1・PLUG-1・REPAIR-3。#3748）
+// ---------------------------------------------------------------------------------------------
+
+/// [`open_regular_nofollow`] の失敗。errno の数値は持たず、段（祖先 / 最終要素）と `io::ErrorKind` だけで分類する。
+/// 呼び出し側（`adapter::read_image_blocking`）が固定文言へ写し、パスも OS のエラー文言も応答に載せない。
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum NoFollowOpenError {
+    /// 絶対パスの `RootDir` + `Normal` 要素だけの形ではない（相対・最終要素なし・NUL を含む）。
+    InvalidPath,
+    /// 祖先の 1 要素を `O_DIRECTORY | O_NOFOLLOW` で開けなかった。祖先が symlink のとき Linux は `ENOTDIR`、
+    /// macOS は `ELOOP` を返すため、`NotFound` と `PermissionDenied` 以外は「祖先が実ディレクトリではない」と扱う。
+    Ancestor(std::io::Error),
+    /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む）。
+    Leaf(std::io::Error),
+    /// 定数を確認済みの組（macOS・Linux の x86_64 / aarch64）ではない。検査を省いて読まず拒否する（fail-closed）。
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    Unsupported,
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod nofollow {
+    use std::ffi::{CString, c_char};
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::{Component, Path};
+
+    use super::NoFollowOpenError;
+
+    // アーキテクチャ差の流用を避けるため、組ごとに個別に定義する（aarch64 に x86_64 の値を使うと
+    // `O_DIRECT` / `O_LARGEFILE` になる）。
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const O_DIRECTORY: i32 = 0o200000;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub(super) const O_DIRECTORY: i32 = 0o40000;
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub(super) const O_NOFOLLOW: i32 = 0o100000;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_CLOEXEC: i32 = 0o2000000;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(target_os = "linux")]
+    pub(super) const AT_FDCWD: i32 = -100;
+    /// 祖先の走査は検索（x）権限だけで通す（読み取り権限は要らない。symlink の拒否に一覧の読み取りは不要）。
+    /// `O_PATH` は x86_64 / aarch64 とも同値（`0o10000000`）。macOS には `O_PATH` が無く `O_RDONLY` のまま。
+    #[cfg(target_os = "linux")]
+    pub(super) const O_PATH: i32 = 0o10000000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_PATH: i32 = 0;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_DIRECTORY: i32 = 0x0010_0000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_CLOEXEC: i32 = 0x0100_0000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NONBLOCK: i32 = 0x4;
+    #[cfg(target_os = "macos")]
+    pub(super) const AT_FDCWD: i32 = -2;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)`。
+        // `O_CREAT` / `O_TMPFILE` を使わないため mode（可変長引数）は渡さない。
+        #[link_name = "openat"]
+        fn c_openat(dirfd: i32, path: *const c_char, flags: i32, ...) -> i32;
+    }
+
+    /// `dirfd` 基準で `name`（1 要素）を `flags` で開く。
+    fn openat_raw(dirfd: i32, name: &CString, flags: i32) -> io::Result<File> {
+        // SAFETY: `name` は NUL 終端の `CString` で、呼び出しの間生きている。`dirfd` は呼び出し側が保持する
+        // 開いた fd（または `AT_FDCWD`）で、本関数は閉じない。mode を取らないフラグだけを渡す。
+        let fd = unsafe { c_openat(dirfd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` が返した非負の新しい fd で、他に所有者がいない。`File` が唯一の所有者になる。
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn open(abs: &Path) -> Result<File, NoFollowOpenError> {
+        let mut comps = abs.components();
+        if comps.next() != Some(Component::RootDir) {
+            return Err(NoFollowOpenError::InvalidPath);
+        }
+        let mut names = Vec::new();
+        for c in comps {
+            match c {
+                Component::Normal(n) => names
+                    .push(CString::new(n.as_bytes()).map_err(|_| NoFollowOpenError::InvalidPath)?),
+                _ => return Err(NoFollowOpenError::InvalidPath),
+            }
+        }
+        let Some((leaf, ancestors)) = names.split_last() else {
+            return Err(NoFollowOpenError::InvalidPath);
+        };
+        let dir_flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        // `/` は信頼する起点。以降は検証済みの親 fd を基準に 1 要素ずつ辿る（前の fd は代入で閉じる）。
+        let root = CString::new("/").map_err(|_| NoFollowOpenError::InvalidPath)?;
+        let mut cur =
+            openat_raw(AT_FDCWD, &root, dir_flags).map_err(NoFollowOpenError::Ancestor)?;
+        for name in ancestors {
+            cur = openat_raw(cur.as_raw_fd(), name, dir_flags)
+                .map_err(NoFollowOpenError::Ancestor)?;
+        }
+        openat_raw(cur.as_raw_fd(), leaf, O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            .map_err(NoFollowOpenError::Leaf)
+    }
+}
+
+/// 絶対パスを `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、最終要素を読み取りで開く。
+/// 祖先に symlink があれば [`NoFollowOpenError::Ancestor`]、最終要素が symlink なら `Leaf` で拒否する。
+/// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらない（通常ファイルの読み取りには影響しない）。
+/// 呼び出し元は `adapter::read_image_blocking`（`start` のイメージ読み込み）。
+#[cfg(unix)]
+pub(crate) fn open_regular_nofollow(
+    abs: &std::path::Path,
+) -> Result<std::fs::File, NoFollowOpenError> {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        nofollow::open(abs)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = abs;
+        Err(NoFollowOpenError::Unsupported)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +418,151 @@ mod tests {
         use std::sync::atomic::Ordering;
         let flag = install_sigterm_flag().expect("ok");
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    /// 定数を具体値で固定する（libc 照合の代わり。SEC-1）。
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn sec1_3748_constants_linux_x86_64() {
+        use super::nofollow::*;
+        assert_eq!(
+            (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
+            (0o200000, 0o400000, 0o2000000, 0o4000, -100)
+        );
+        assert_eq!(O_PATH, 0o10000000);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_3748_constants_linux_aarch64() {
+        use super::nofollow::*;
+        assert_eq!(
+            (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
+            (0o40000, 0o100000, 0o2000000, 0o4000, -100)
+        );
+        assert_eq!(O_PATH, 0o10000000);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sec1_3748_constants_macos() {
+        use super::nofollow::*;
+        assert_eq!(
+            (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
+            (0x0010_0000, 0x0100, 0x0100_0000, 0x4, -2)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    mod nofollow_cases {
+        use super::super::{NoFollowOpenError, open_regular_nofollow};
+        use std::io::Read;
+        use std::path::PathBuf;
+
+        /// 正規化済みの一時ディレクトリ（macOS の `/var` → `/private/var` を避ける）。
+        struct Dir(PathBuf);
+        impl Dir {
+            fn new(tag: &str) -> Self {
+                let p = std::env::temp_dir().join(format!("fc-pmsys-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).expect("mkdir");
+                Self(std::fs::canonicalize(&p).expect("canonicalize"))
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// 陽性対照: 実ディレクトリ配下の通常ファイルは開けて読める。
+        #[test]
+        fn sec1_3748_opens_real_file() {
+            let d = Dir::new("pos");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::fs::write(d.0.join("real/k"), b"abc").expect("write");
+            let mut f = open_regular_nofollow(&d.0.join("real/k")).expect("open");
+            let mut v = Vec::new();
+            f.read_to_end(&mut v).expect("read");
+            assert_eq!(v, b"abc");
+        }
+
+        /// 祖先が mode 0111（検索のみ）・最終要素が 0400 でも開ける（Linux。root は権限を無視するため除く）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_3748_opens_under_search_only_ancestor() {
+            use std::os::unix::fs::PermissionsExt;
+            let d = Dir::new("x-only");
+            let sub = d.0.join("xonly");
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("k"), b"abc").expect("write");
+            std::fs::set_permissions(sub.join("k"), std::fs::Permissions::from_mode(0o400))
+                .expect("chmod file");
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111))
+                .expect("chmod dir");
+            let r = open_regular_nofollow(&sub.join("k"));
+            // 後始末のため先に権限を戻す。
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))
+                .expect("restore");
+            let mut f = r.expect("open under mode 0111 ancestor");
+            let mut v = Vec::new();
+            f.read_to_end(&mut v).expect("read");
+            assert_eq!(v, b"abc");
+        }
+
+        /// 祖先が symlink なら `Ancestor`。
+        #[test]
+        fn sec1_3748_rejects_symlinked_ancestor() {
+            let d = Dir::new("anc");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::fs::write(d.0.join("real/k"), b"abc").expect("write");
+            std::os::unix::fs::symlink(d.0.join("real"), d.0.join("link")).expect("symlink");
+            let e = open_regular_nofollow(&d.0.join("link/k")).unwrap_err();
+            assert!(matches!(e, NoFollowOpenError::Ancestor(_)), "{e:?}");
+        }
+
+        /// 最終要素が symlink なら `Leaf`。
+        #[test]
+        fn sec1_3748_rejects_symlinked_leaf() {
+            let d = Dir::new("leaf");
+            std::fs::write(d.0.join("k"), b"abc").expect("write");
+            std::os::unix::fs::symlink(d.0.join("k"), d.0.join("l")).expect("symlink");
+            let e = open_regular_nofollow(&d.0.join("l")).unwrap_err();
+            assert!(matches!(e, NoFollowOpenError::Leaf(_)), "{e:?}");
+        }
+
+        /// 祖先が無ければ `Ancestor` の `NotFound`、最終要素が無ければ `Leaf` の `NotFound`。
+        #[test]
+        fn sec1_3748_missing_components() {
+            let d = Dir::new("miss");
+            match open_regular_nofollow(&d.0.join("nodir/k")).unwrap_err() {
+                NoFollowOpenError::Ancestor(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound)
+                }
+                e => panic!("unexpected {e:?}"),
+            }
+            match open_regular_nofollow(&d.0.join("k")).unwrap_err() {
+                NoFollowOpenError::Leaf(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+                e => panic!("unexpected {e:?}"),
+            }
+        }
+
+        /// 相対パス・`/` だけ・`..` を含むパスは `InvalidPath`。
+        #[test]
+        fn sec1_3748_invalid_paths() {
+            for p in ["rel/k", "/", "/a/../b"] {
+                let e = open_regular_nofollow(std::path::Path::new(p)).unwrap_err();
+                assert!(matches!(e, NoFollowOpenError::InvalidPath), "{p}: {e:?}");
+            }
+        }
     }
 }

@@ -4,6 +4,8 @@
 //! バイナリ名 `fandhe-container-plugin-microvm` は発見規約の接頭辞に一致する（PLUG-4・PLUG-11）。
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //! 対象は制御面のみで、VM 内部の I/O パスは plugin 境界の外に置く（PLUG-1・MVM-1）。
+//! 3 OS 展開方針（MVM-5）: 動かすバックエンドは現状 Linux の KVM だけで、macOS / Windows の扱いは `docs/architecture.md` の
+//! 「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
 //!
 //! # 接続方向（PLUG-12）
 //! core が `UdsListener::bind` し、plugin は peer 認証つきの `UdsStream::connect`（接続直後に server の peer UID を
@@ -30,7 +32,7 @@
 //! 層 A は偽バックエンドで既定集合（unix・KVM 不要）、層 B は実バイナリ + 実 KVM で `#[ignore]`（Linux x86_64・`/dev/kvm`）。
 //!
 //! # 実装済み（#3747。PLUG-1・REPAIR-3・REPAIR-5）
-//! SIGTERM で新しい要求の受付をやめ（[`frame_loop::serve_until`]）、`stop_all` で実行中の VM を期限つきに止め、
+//! SIGTERM で新しい要求の受付をやめ（[`frame_loop::serve_until`]。本体は共有 crate にある。#3774）、`stop_all` で実行中の VM を期限つきに止め、
 //! 結果行（`stopped=` / `failed=` / `remaining=` / `detached=`）を出して終わる。回収しきれなければ終了コード 5。
 //! 詳細は `main.rs` の doc。受信フラグの登録は [`sys`]（#3746）。
 //!

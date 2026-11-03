@@ -1,5 +1,9 @@
 //! fandhe-container-microvm: KVM 直接制御・最小 virtio デバイスモデル（Linux オプション）。
 //!
+//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM だけで、先行して進める。macOS（Hypervisor.framework。TASK-192）と
+//! Windows（WHP。将来オプションで MVP には実装しない）の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
+//! 2026-11-03 決定）は、`docs/architecture.md` の「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
+//!
 //! 実装済み（TASK-74.1.1・MVM-1。Linux のみ）: `/dev/kvm` のオープン・API 版数 12 の確認・`KVM_CREATE_VM` による
 //! VM fd の取得（`error` は OS 非依存、`device` は Linux 限定）、TASK-74.1.2・MVM-1: `KVM_CREATE_VCPU` による
 //! vCPU fd の取得（x86_64・aarch64。aarch64 は初期化 ioctl も発行するが型検査のみで実行は未検証）。
@@ -36,8 +40,10 @@
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
+//! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
+//! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
-//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP の起動（REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
+//! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動（#3738。REPAIR-3。実カーネルの起動完走に必要）。他スレッドからの即時停止（kick）も未実装。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!
 //! # 組み込む側への注意（REPAIR-5・MVM-4）
@@ -69,6 +75,7 @@ pub mod irq;
 pub mod lapic_x86;
 #[cfg(target_os = "linux")]
 pub mod microvm;
+pub mod smp_x86;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod sys;

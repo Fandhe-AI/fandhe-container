@@ -293,7 +293,7 @@ const SPI_GUEST_CODE: [u32; 36] = [
     0x121E_7884, // and  w4, w4, #~2                 ; ProcessorSleep = 0
     0xB900_1444, // str  w4, [x2, #0x14]
     0xB940_1444, // ldr  w4, [x2, #0x14]
-    0x371F_FFE4, // tbnz w4, #2, .-4                 ; ChildrenAsleep が 0 になるまで
+    0x3717_FFE4, // tbnz w4, #2, .-4                 ; ChildrenAsleep が 0 になるまで
     0x5280_0264, // movz w4, #0x13                   ; ARE_NS | EnableGrp1A | EnableGrp1
     0xB900_0024, // str  w4, [x1]                    ; GICD_CTLR
     0xB940_0024, // ldr  w4, [x1]
@@ -402,7 +402,8 @@ fn hvf_device_spi_reaches_guest() {
             EsrClass::Wfx(WfxKind::Wfi) => {
                 if off_thread.is_none() {
                     // vCPU スレッド以外からの注入(スレッドの制約の観測)。
-                    let r = std::thread::spawn(move || line.trigger()).join().unwrap();
+                    let l2 = line.clone();
+                    let r = std::thread::spawn(move || l2.trigger()).join().unwrap();
                     eprintln!("hvf_device: spi: set_spi from non-vcpu thread: {r:?}");
                     let failed = r.is_err();
                     off_thread = Some(r.map_err(|e| e.to_string()));

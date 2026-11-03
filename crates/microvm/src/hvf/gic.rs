@@ -32,12 +32,17 @@
 //! - スレッド: `hv_gic_set_spi` を vCPU の owning thread 以外から呼べるかは Apple のドキュメントに記述が無い。
 //!   引数が整数と bool だけで失敗は戻り値で返るため [`GicSpiLine`] は `Send + Sync` とし、
 //!   `hvf_device_spi_reaches_guest` が非 vCPU スレッドから呼んで観測する（結果の記録は #3803。未観測）。
-//! - 残余: VM の破棄後に呼ぶとフレームワークのエラーが返る。MSI の範囲は GIC の config に MSI を設定しないため対象外。
+//! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
+//!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
+//!   `trigger` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後の `trigger` は `Internal` で拒否する。
+//! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
 //! `MPIDR_EL1` の実際の設定と SMP（#3797）・MSI・
 //! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・SDK ヘッダとの値の照合（#3803）・
 //! vCPU の個別 drop と「破棄は VM 破棄時のみ」の整合（#3797・#3791）。`unsafe` は持たない。
+
+use std::sync::{Arc, RwLock};
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -114,7 +119,11 @@ impl HvfGic {
         config.set_distributor_base(layout.gic_dist.base.raw())?;
         config.set_redistributor_base(layout.gic_redist.base.raw())?;
         api.create(&vm, config)?;
-        Ok(VmWithGic { gic, vm })
+        Ok(VmWithGic {
+            gic,
+            vm,
+            alive: Arc::new(RwLock::new(true)),
+        })
     }
 }
 
@@ -123,6 +132,16 @@ impl HvfGic {
 pub struct VmWithGic {
     gic: HvfGic,
     vm: HvVm,
+    /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
+    alive: Arc<RwLock<bool>>,
+}
+
+impl Drop for VmWithGic {
+    fn drop(&mut self) {
+        // `vm` はこの後に drop される。進行中の `trigger`（読み取りロック）を待ってから閉じる。
+        let mut g = self.alive.write().unwrap_or_else(|e| e.into_inner());
+        *g = false;
+    }
 }
 
 const _: () = {
@@ -165,7 +184,7 @@ impl VmWithGic {
 
     /// `index` 番目の virtio-mmio の SPI を注入する [`GicSpiLine`] を作る（#3795）。
     ///
-    /// `&self` を要求して「GIC 作成済み」を型で担保するが、借用は返さない（デバイスのスレッドへ move できる）。
+    /// 借用は返さない（デバイスのスレッドへ move できる）。代わりに生存フラグを共有し、VM の破棄後の `trigger` は拒否する。
     /// INTID は GIC 作成時に照会した範囲で検証する。`index` が配置の台数以上なら `InvalidArgument`。
     pub fn spi_line(&self, layout: &Arm64Layout, index: u32) -> Result<GicSpiLine, MicrovmError> {
         let (base, count) = self.gic.spi_range();
@@ -173,15 +192,17 @@ impl VmWithGic {
         Ok(GicSpiLine {
             api: GicApi::get()?,
             intid,
+            alive: Arc::clone(&self.alive),
         })
     }
 }
 
 /// virtio-mmio 1 台分の SPI を `hv_gic_set_spi` で注入する [`InterruptLine`]（#3795）。契約はモジュール doc の「SPI の注入」。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GicSpiLine {
     api: &'static GicApi,
     intid: u32,
+    alive: Arc<RwLock<bool>>,
 }
 
 const _: () = {
@@ -199,6 +220,15 @@ impl GicSpiLine {
 impl InterruptLine for GicSpiLine {
     /// edge を 1 回起こす（`set_spi(intid, true)` を 1 回。`false` は呼ばない）。
     fn trigger(&self) -> Result<(), MicrovmError> {
+        let guard = self.alive.read().map_err(|_| {
+            MicrovmError::new(MicrovmErrorCode::Internal, "gic liveness lock is poisoned")
+        })?;
+        if !*guard {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "spi line outlived its vm; refusing to inject",
+            ));
+        }
         self.api.set_spi(self.intid, true)
     }
 }

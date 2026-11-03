@@ -49,8 +49,9 @@ pub const ARM64_DEFAULT_IPA_LIMIT: u64 = HVF_DEFAULT_IPA_LIMIT;
 pub const ARM64_BOOT_CPU_MPIDR: u32 = 0;
 /// `intc` の phandle（`fdt` は採番しないため固定。0 と 0xffffffff は使わない）。
 pub const ARM64_INTC_PHANDLE: u32 = 1;
-/// bootargs の最大バイト数（arm64 の `COMMAND_LINE_SIZE`。NUL を含めない長さの上限）。
-pub const ARM64_MAX_BOOTARGS: usize = 2048;
+/// bootargs 本文の最大バイト数。arm64 Linux の `COMMAND_LINE_SIZE`（2048）は NUL 終端を含む
+/// バッファの大きさのため、保持できる本文は 2047 バイトまで（超えると末尾が切り捨てられる）。
+pub const ARM64_MAX_BOOTARGS: usize = 2047;
 
 const GIC_SPI: u32 = 0;
 const GIC_PPI: u32 = 1;
@@ -497,7 +498,16 @@ mod tests {
             MicrovmErrorCode::Unimplemented
         );
         let one = Arm64Layout::new(256 * MIB, 1, 0).unwrap();
-        let long = "a".repeat(ARM64_MAX_BOOTARGS + 1);
+        // 境界値: 2047 バイトは受理し、2048 バイト（NUL 終端を含めると 2049）は拒否する。
+        assert_eq!(ARM64_MAX_BOOTARGS, 2047);
+        let ok = "a".repeat(2047);
+        let cfg = GuestFdtConfig {
+            layout: &one,
+            bootargs: &ok,
+            initrd: None,
+        };
+        assert!(build_guest_fdt(&cfg).is_ok());
+        let long = "a".repeat(2048);
         let cfg = GuestFdtConfig {
             layout: &one,
             bootargs: &long,

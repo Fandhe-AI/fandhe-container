@@ -9,7 +9,7 @@
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
-//! CPUID / MSR / FPU / LAPIC の設定（実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
+//! MSR / FPU / LAPIC の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・AP（vCPU 1 以上）の起動・一時停止（pause）・
 //! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。デバイスの lock は vCPU 0 だけの現状では競合しない（複数 vCPU の並行は #886 以降）。
 //!
@@ -615,6 +615,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
     /// （段ごとの確認は `mvm1_887_*`・#887）。aarch64 は最初の ioctl より前に `Unimplemented`。
     ///
+    /// vCPU ごとに `KVM_SET_CPUID2`（APIC ID = vCPU id。`cpuid_x86`・#3733）も設定する。
+    ///
     /// `Err` のとき、それまでに取った fd・mmap・irqfd はすべて戻る前に解放済み。構成値・パスはログに載せない（REPAIR-4）。
     pub fn assemble(
         kvm: &KvmDevice,
@@ -651,9 +653,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         let devices = DeviceBus::new(&slots, config.block, config.net, |s| {
             vm.register_irqfd(s.gsi)
         })?;
+        // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
+        let cpuid = kvm.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
         for i in 0..config.vcpu_count {
-            vcpus.push(vm.create_vcpu(i)?);
+            let mut v = vm.create_vcpu(i)?;
+            v.set_cpuid(&cpuid.for_vcpu(i)?)?;
+            vcpus.push(v);
         }
         Ok(MicroVm {
             vcpus,
@@ -762,7 +768,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state`。最初の `VcpuFd::run_once` より前に、
     /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つ状態のため触らない。
-    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、CPUID・MSR・FPU・LAPIC の設定は
+    /// 実行ループは [`MicroVm::start`]（TASK-75.4.1・#886）。失敗時の解放はモジュール doc（#887）、MSR・FPU・LAPIC の設定は（CPUID は assemble が設定済み）
     /// 未実装（REPAIR-3）。成功・失敗と所要時間は 1 行の構造化ログへ出す（REPAIR-4。入力値は載せない）。
     pub fn setup_boot_vcpu(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         let started = std::time::Instant::now();

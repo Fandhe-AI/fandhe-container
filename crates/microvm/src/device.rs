@@ -19,7 +19,7 @@
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
-//! 観測用の [`VcpuFd::regs`] を足した（CPUID・MSR・FPU・LAPIC の設定は未実装。REPAIR-3）。
+//! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。MSR・FPU・LAPIC の設定は未実装で #3734・#3735。REPAIR-3）。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成
@@ -45,6 +45,9 @@ use std::time::{Duration, Instant};
 use crate::boot_x86::BootCpuState;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{SegmentDescriptor, X86Regs};
+use crate::cpuid_x86::CpuidTable;
+#[cfg(target_arch = "x86_64")]
+use crate::cpuid_x86::{CpuidEntry, MAX_CPUID_ENTRIES};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, VcpuExit};
@@ -57,6 +60,7 @@ const KVM_PATH: &str = "/dev/kvm";
 
 // errno（Linux 共通。x86_64・aarch64 で同値）。`io::ErrorKind` で分類できないものだけ使う。
 const EPERM: i32 = 1;
+const E2BIG: i32 = 7;
 const ENOMEM: i32 = 12;
 const EEXIST: i32 = 17;
 const ENOEXEC: i32 = 8;
@@ -282,7 +286,7 @@ impl VcpuFd {
     /// だけを `state` で上書きして `KVM_SET_SREGS`、続けて `KVM_SET_REGS` で汎用レジスタを設定する。`tr`・`ldt`・`cr2`・`cr8`・
     /// `apic_base`・`interrupt_bitmap` は読んだ値のまま保つ。最初の [`VcpuFd::run_once`] より前に、BSP（vCPU 0）にだけ呼ぶ。
     /// GDT・ページテーブルなど `state` が指すゲストメモリの内容は呼び出し側が先に書く（`boot_x86::write_boot_tables`）。
-    /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID・MSR・FPU の設定は範囲外（REPAIR-3）。
+    /// in-kernel irqchip のある VM の AP（vCPU 1 以上）は INIT/SIPI を待つため触らない。CPUID は [`VcpuFd::set_cpuid`] で別に設定する。MSR・FPU の設定は範囲外（REPAIR-3）。
     #[cfg(target_arch = "x86_64")]
     pub fn set_boot_state(&mut self, state: &BootCpuState) -> Result<(), MicrovmError> {
         let fd = self.fd.as_fd();
@@ -346,6 +350,39 @@ impl VcpuFd {
             rflags: r.rflags,
         };
         sys::kvm_set_regs(fd, &regs).map_err(|e| classify_vcpu_error(VcpuStage::SetRegs, e))
+    }
+
+    /// vCPU の CPUID を設定する（`KVM_SET_CPUID2`。#3733・MVM-1。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// 最初の [`VcpuFd::run_once`] と `set_boot_state` より前に呼ぶ（`microvm::MicroVm::assemble` が vCPU 作成直後に呼ぶ）。
+    /// 表は `CpuidTable::for_vcpu` で vCPU ごとに調整したものを渡す。
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_cpuid(&mut self, table: &CpuidTable) -> Result<(), MicrovmError> {
+        let entries: Vec<sys::KvmCpuidEntry2> = table
+            .entries()
+            .iter()
+            .map(|e| sys::KvmCpuidEntry2 {
+                function: e.function,
+                index: e.index,
+                flags: e.flags,
+                eax: e.eax,
+                ebx: e.ebx,
+                ecx: e.ecx,
+                edx: e.edx,
+                padding: [0; 3],
+            })
+            .collect();
+        sys::kvm_set_cpuid2(self.fd.as_fd(), &entries)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetCpuid, e))
+    }
+
+    /// x86_64 以外では CPUID の設定は未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn set_cpuid(&mut self, _table: &CpuidTable) -> Result<(), MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "CPUID setup is only implemented for x86_64",
+        ))
     }
 
     /// x86_64 以外では起動時のレジスタ初期化は未実装（aarch64 は FDT・PSTATE・X0 が要る。REPAIR-3）。
@@ -706,6 +743,8 @@ enum VcpuStage {
     GetSregs,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetSregs,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetCpuid,
     PreferredTarget,
     VcpuInit,
     Mmap,
@@ -721,6 +760,7 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::SetRegs => "KVM_SET_REGS",
         VcpuStage::GetSregs => "KVM_GET_SREGS",
         VcpuStage::SetSregs => "KVM_SET_SREGS",
+        VcpuStage::SetCpuid => "KVM_SET_CPUID2",
     };
     let registers = matches!(
         stage,
@@ -739,6 +779,14 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
             MicrovmErrorCode::InvalidArgument,
             "KVM rejected the vCPU registers",
         ),
+        // CPUID の拒否（実行開始後の変更を含む）。値は message に載せない（ERR-1）。
+        SysError::Os(EINVAL) if stage == VcpuStage::SetCpuid => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM rejected the CPUID table (it must be set before the vCPU runs)",
+        ),
+        SysError::Os(E2BIG) if stage == VcpuStage::SetCpuid => {
+            MicrovmError::new(MicrovmErrorCode::InvalidArgument, "too many CPUID entries")
+        }
         SysError::Os(EEXIST) => {
             MicrovmError::new(MicrovmErrorCode::AlreadyExists, "vCPU id already exists")
         }
@@ -976,6 +1024,64 @@ fn classify_create_vm_error(e: SysError) -> MicrovmError {
 }
 
 impl KvmDevice {
+    /// ホストが提供できる CPUID の表を読む（`KVM_GET_SUPPORTED_CPUID`。#3733・MVM-1。x86_64 のみ。他 arch は `Unimplemented`）。
+    ///
+    /// 件数の上限は `KVM_MAX_CPUID_ENTRIES`（256）で 1 回だけ要求し、E2BIG でも広げて再試行しない（fail-closed。
+    /// バッファは約 10 KB でカーネル側の上限も同じ 256 のため、ループを持たない）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn supported_cpuid(&self) -> Result<CpuidTable, MicrovmError> {
+        const _: () = assert!(MAX_CPUID_ENTRIES == sys::consts::MAX_CPUID_ENTRIES);
+        let raw = sys::kvm_get_supported_cpuid(self.fd.as_fd(), MAX_CPUID_ENTRIES).map_err(
+            |e| match e {
+                SysError::Unsupported => MicrovmError::new(
+                    MicrovmErrorCode::Unimplemented,
+                    "KVM is not supported on this architecture",
+                ),
+                SysError::Os(ENOTTY) => {
+                    MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM system fd")
+                }
+                SysError::Os(E2BIG) => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_GET_SUPPORTED_CPUID exceeds the 256 entry limit",
+                ),
+                SysError::Os(ENOMEM) => MicrovmError::new(
+                    MicrovmErrorCode::ResourceExhausted,
+                    "resource exhausted reading supported CPUID",
+                ),
+                SysError::NullMapping => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "KVM_GET_SUPPORTED_CPUID failed (unexpected null mapping)",
+                ),
+                SysError::Os(n) => MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    format!("KVM_GET_SUPPORTED_CPUID failed (os error {n})"),
+                ),
+            },
+        )?;
+        CpuidTable::new(
+            raw.iter()
+                .map(|e| CpuidEntry {
+                    function: e.function,
+                    index: e.index,
+                    flags: e.flags,
+                    eax: e.eax,
+                    ebx: e.ebx,
+                    ecx: e.ecx,
+                    edx: e.edx,
+                })
+                .collect(),
+        )
+    }
+
+    /// x86_64 以外では CPUID の取得は未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn supported_cpuid(&self) -> Result<CpuidTable, MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "CPUID setup is only implemented for x86_64",
+        ))
+    }
+
     /// `/dev/kvm` を開き、KVM API 版数が 12 であることを確かめる。
     pub fn open() -> Result<KvmDevice, MicrovmError> {
         Self::open_at(Path::new(KVM_PATH))

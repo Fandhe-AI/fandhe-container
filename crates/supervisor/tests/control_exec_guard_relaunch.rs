@@ -86,6 +86,19 @@ fn threads_named(prefix: &str) -> usize {
         .count()
 }
 
+/// `threads_named(prefix)` が `want` になるまで最大 5 秒待ち、最後に数えた値を返す。スレッドの名前は生成後に
+/// そのスレッド自身が付けるため、生成直後の 1 回の数え上げでは負荷時に名前の付く前を数えてしまう（REPAIR-12）。
+fn wait_threads_named(prefix: &str, want: usize) -> usize {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = threads_named(prefix);
+        if n == want || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 const GUARD_COMM: &str = "control-exec-gu";
 const ACCEPT_COMM: &str = "control-channel";
 
@@ -205,7 +218,7 @@ fn sup3_sup6_repair5_pause_reclaims_notified_guard_and_joins_threads() {
     handover
         .notify_created(&name("exec-100-0"), hold())
         .unwrap();
-    assert_eq!(threads_named(GUARD_COMM), 1);
+    assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     assert_eq!(rig.pool.active(), 1);
     let started = Instant::now();
     rig.server.pause(Duration::from_secs(5)).unwrap();
@@ -228,7 +241,7 @@ fn sup3_sup6_pause_ends_unnotified_guard_without_reclaim() {
     let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let rig = Rig::start("unnotified");
     let handover = rig.obtain();
-    assert_eq!(threads_named(GUARD_COMM), 1);
+    assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     rig.server.pause(Duration::from_secs(5)).unwrap();
     assert_eq!(rig.calls(), Vec::<String>::new());
     assert_eq!(threads_named(GUARD_COMM), 0);
@@ -250,7 +263,7 @@ fn sup3_sup6_resume_accepts_new_guards_after_pause() {
     rig.server.resume().unwrap();
     let fresh = rig.obtain();
     fresh.notify_created(&name("exec-2-2"), hold()).unwrap();
-    assert_eq!(threads_named(GUARD_COMM), 1);
+    assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     drop(fresh);
     assert_eq!(
         rig.wait_calls(2),
@@ -314,7 +327,7 @@ fn sup3_sup6_repair5_pause_timeout_keeps_stuck_guard_and_next_pause_joins_it() {
     assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
     assert_eq!(e.message(), "exec guards did not stop in time");
     assert_eq!(rig.calls(), vec!["exec-5-5".to_owned()]);
-    assert_eq!(threads_named(GUARD_COMM), 1);
+    assert_eq!(wait_threads_named(GUARD_COMM, 1), 1);
     assert_eq!(threads_named(ACCEPT_COMM), 0);
     // 回収が終われば、accept が止まったままでも次の pause が残ったガードを join する。
     rig.reclaimer.release.store(true, Ordering::SeqCst);
@@ -342,7 +355,7 @@ fn sup3_repair5_failed_pause_does_not_relaunch_and_restores_control_channel() {
     // relaunch の timeout 2 秒 → pause の予算 2 秒（ガード 1 秒）。回収が終わらず失敗する。
     assert!(relauncher.relaunch(Duration::from_secs(2)).is_err());
     assert_eq!(*probe.seen.lock().unwrap(), Vec::<(usize, usize)>::new());
-    assert_eq!(threads_named(ACCEPT_COMM), 1);
+    assert_eq!(wait_threads_named(ACCEPT_COMM, 1), 1);
     // 復旧した accept が新しい handover を受ける。
     rig.reclaimer.release.store(true, Ordering::SeqCst);
     let again = rig.obtain();

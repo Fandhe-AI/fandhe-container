@@ -1056,6 +1056,76 @@ mod control_ffi {
             clock_gettime;
         const _: unsafe extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
             libc::clock_gettime;
+
+        // ---- exec 用 pidfd の受け渡し（`SCM_RIGHTS`。#2626・SUP-6・SEC-1）の宣言 ----
+        // 定数（`SOL_SOCKET`・`SCM_RIGHTS`・`MSG_*`）。いずれも `libc` は `c_int`。
+        const _: () = {
+            assert!(SOL_SOCKET == libc::SOL_SOCKET);
+            assert!(SCM_RIGHTS == libc::SCM_RIGHTS);
+            assert!(MSG_NOSIGNAL == libc::MSG_NOSIGNAL);
+            assert!(MSG_CMSG_CLOEXEC == libc::MSG_CMSG_CLOEXEC);
+            assert!(MSG_CTRUNC == libc::MSG_CTRUNC);
+            // `CMSG_HDR_LEN`（`CMSG_LEN(0)`）は LP64 で `cmsghdr` の大きさと同じ（8 バイト整列の 16 バイト）。
+            assert!(CMSG_HDR_LEN == size_of::<libc::cmsghdr>());
+            assert!(size_of::<isize>() == size_of::<libc::ssize_t>());
+        };
+
+        // `Iovec`: `libc::iovec`（全ターゲット共通。フィールド名も同じ）。
+        const _: () = {
+            assert!(size_of::<Iovec>() == size_of::<libc::iovec>());
+            assert!(align_of::<Iovec>() == align_of::<libc::iovec>());
+            assert!(offset_of!(Iovec, iov_base) == offset_of!(libc::iovec, iov_base));
+            assert!(offset_of!(Iovec, iov_len) == offset_of!(libc::iovec, iov_len));
+        };
+
+        // `Msghdr`・`Cmsghdr`: `libc::msghdr`・`libc::cmsghdr`。gnu に限る（core の `seccomp_notify` と同じ理由。musl は
+        // `msg_iovlen`・`msg_controllen`・`cmsg_len` を `int` / `socklen_t` と非公開のパディングで持つ一方、自前はカーネルの
+        // `user_msghdr` に合わせた `size_t` のため、フィールドが公開されている gnu でだけオフセットまで照合する）。
+        #[cfg(target_env = "gnu")]
+        const _: () = {
+            assert!(size_of::<Msghdr>() == size_of::<libc::msghdr>());
+            assert!(align_of::<Msghdr>() == align_of::<libc::msghdr>());
+            assert!(offset_of!(Msghdr, msg_name) == offset_of!(libc::msghdr, msg_name));
+            assert!(offset_of!(Msghdr, msg_namelen) == offset_of!(libc::msghdr, msg_namelen));
+            assert!(offset_of!(Msghdr, msg_iov) == offset_of!(libc::msghdr, msg_iov));
+            assert!(offset_of!(Msghdr, msg_iovlen) == offset_of!(libc::msghdr, msg_iovlen));
+            assert!(offset_of!(Msghdr, msg_control) == offset_of!(libc::msghdr, msg_control));
+            assert!(offset_of!(Msghdr, msg_controllen) == offset_of!(libc::msghdr, msg_controllen));
+            assert!(offset_of!(Msghdr, msg_flags) == offset_of!(libc::msghdr, msg_flags));
+
+            assert!(size_of::<Cmsghdr>() == size_of::<libc::cmsghdr>());
+            assert!(align_of::<Cmsghdr>() == align_of::<libc::cmsghdr>());
+            assert!(offset_of!(Cmsghdr, cmsg_len) == offset_of!(libc::cmsghdr, cmsg_len));
+            assert!(offset_of!(Cmsghdr, cmsg_level) == offset_of!(libc::cmsghdr, cmsg_level));
+            assert!(offset_of!(Cmsghdr, cmsg_type) == offset_of!(libc::cmsghdr, cmsg_type));
+        };
+
+        // 対象外: `ControlOne`・`ControlBuf`・`RECV_CONTROL_LEN` は制御メッセージの入れ物と本実装の上限で、`libc` に
+        // 対応物が無い（`libc::CMSG_SPACE` は `const unsafe fn` で、照合のために `unsafe` を足さない）。`cmsghdr` に対する
+        // 整列と、`ControlOne` のデータ部が `CMSG_DATA`（ヘッダの直後。LP64 で 16 バイト目）に来ることだけを確かめる。
+        const _: () = {
+            assert!(align_of::<ControlOne>() >= align_of::<libc::cmsghdr>());
+            assert!(align_of::<ControlBuf>() >= align_of::<libc::cmsghdr>());
+            assert!(offset_of!(ControlOne, hdr) == 0);
+            assert!(offset_of!(ControlOne, fd) == size_of::<libc::cmsghdr>());
+        };
+
+        // `sendmsg`・`recvmsg`。自前は `Msghdr` を指すため、ポインタ先の型を別々に書く（`Msghdr` の同一性は上の構造体の
+        // 照合が保証する）。
+        const _: unsafe extern "C" fn(libc::c_int, *const Msghdr, libc::c_int) -> libc::ssize_t =
+            sendmsg;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::msghdr,
+            libc::c_int,
+        ) -> libc::ssize_t = libc::sendmsg;
+        const _: unsafe extern "C" fn(libc::c_int, *mut Msghdr, libc::c_int) -> libc::ssize_t =
+            recvmsg;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *mut libc::msghdr,
+            libc::c_int,
+        ) -> libc::ssize_t = libc::recvmsg;
     }
 }
 

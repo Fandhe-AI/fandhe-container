@@ -2,7 +2,7 @@
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 //!
 //! 「最小デバイスモデルの microVM」とは vCPU 1 台・virtio-block 1 台・合成ペイロードの構成を指す。
-//! 実 Linux カーネルの起動完走・AP は未実装で本試験の範囲外。virtio-net を含む `start` と受信は
+//! 実 Linux カーネルの起動完走は `tests/kernel_boot.rs`（#3771）が受け持つ。AP は本試験の範囲外。virtio-net を含む `start` と受信は
 //! `kvm_device.rs` の `kvm_device_net_rx_reaches_guest_without_kick` が受け持つ。
 //!
 //! 起動の観測手段: 停止後はホストからゲストの状態を読めない。そこで合成ペイロード自身に起動状態を

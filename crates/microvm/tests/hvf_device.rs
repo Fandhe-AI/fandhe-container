@@ -216,12 +216,22 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
 
     const BASE: u64 = 0x4000_0000;
     let finished = Arc::new(AtomicBool::new(false));
-    {
-        let finished = Arc::clone(&finished);
-        std::thread::spawn(move || {
+    // アサーションが失敗（panic）しても watchdog を止めて join する RAII ガード。
+    struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = {
+        let flag = Arc::clone(&finished);
+        let h = std::thread::spawn(move || {
             let start = Instant::now();
             while start.elapsed() < VCPU_THREAD_DEADLINE {
-                if finished.load(Ordering::Acquire) {
+                if flag.load(Ordering::Acquire) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -229,9 +239,11 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
             eprintln!("hvf_device: WATCHDOG EXPIRED");
             std::process::exit(124);
         });
-    }
+        WatchdogGuard(Arc::clone(&finished), Some(h))
+    };
 
-    let vm = Arc::new(create_vm_or_precondition());
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vm = Arc::new(create_vm_with_gic_or_precondition(&layout));
     let page = HostMapping::page_size().unwrap();
     let mut host = HostMapping::new(page).unwrap();
     // オフセット 0: `b .`。オフセット 0x100: `hvc #0` の後に `b .`。
@@ -240,7 +252,7 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
         .unwrap();
     host.write_bytes(0x104, &0x1400_0000u32.to_le_bytes())
         .unwrap();
-    let mapping = vm.map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+    let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
 
     let handlers = || ExitHandlers {
         mmio: MmioHandler::new(),
@@ -292,7 +304,6 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
 
     // スレッドが持っていた Arc は stop の Ok で解放済み。
     mapping.unmap().unwrap();
-    finished.store(true, Ordering::Release);
     drop(vm);
 }
 

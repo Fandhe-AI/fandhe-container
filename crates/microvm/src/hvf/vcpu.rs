@@ -10,7 +10,7 @@
 //! `mmio`・`hvc`・`timer` の関数シグネチャは担当 issue（#3793・#3794・#3796）との契約で、各自が自分のファイルだけを差し替える。
 //!
 //! # 寿命の契約
-//! スレッドは `Arc<HvVm>` の複製を持ち、vCPU が生きている間は VM が破棄されない。呼び出し元は自分の `Arc` とゲスト RAM
+//! スレッドは `Arc<VmWithGic>` の複製を持ち、vCPU が生きている間は VM が破棄されない。呼び出し元は自分の `Arc` とゲスト RAM
 //! （`GuestMapping` は `&HvVm` を借用する）を、[`VcpuHandle::stop`] が戻るまで保つこと。`stop` が期限切れになったら、
 //! スレッドが自力で終わるまで VM は残る（無期限の `join` はしない）。
 //!
@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
+use crate::hvf::VmWithGic;
 use crate::hvf::{hvc, mmio, timer};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, check_run_deadline};
 use crate::hvf_loop::{
@@ -29,12 +30,12 @@ use crate::hvf_loop::{
     VcpuExec, VcpuExitObserver, VcpuKick, VcpuStopReport, run_loop, spawn_loop,
 };
 use crate::stop::StopReason;
-use crate::sys::{HvVcpu, HvVm, VcpuCanceller};
+use crate::sys::{HvVcpu, VcpuCanceller};
 
-// `Arc<HvVm>` を vCPU スレッドへ渡す前提（1 プロセス 1 VM の VM を Arc で共有する）。
+// `Arc<VmWithGic>` を vCPU スレッドへ渡す前提（1 プロセス 1 VM の VM を Arc で共有する）。
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<HvVm>();
+    assert_send_sync::<VmWithGic>();
 };
 
 /// exit の種別ごとのハンドラ状態。スレッドへ move するため各状態は `Send` であること。
@@ -142,11 +143,13 @@ fn dispatch(
 impl VcpuThread {
     /// 専用スレッド `hvf-vcpu-0` で vCPU を作り、`setup` を実行してから実行ループを回す。
     ///
+    /// vCPU は `VmWithGic::create_vcpu` で作る（GIC を vCPU より先に作る契約を迂回しない。MVM-5・TASK-192.12）。
+    ///
     /// 作成と `setup` の成否は `config.create_deadline` まで待って返す（失敗は `setup` のエラーのまま）。`setup` は PC・CPSR・
     /// 引数レジスタ等の初期化で、#3797 が渡す。ゲストが `Unimplemented` の exit（スタブ）に達するとループは `Failed(Unimplemented)` で
     /// 終わり、[`VcpuHandle::is_finished`] で観測できる。寿命の契約はモジュールの doc を参照。
     pub fn spawn<S>(
-        vm: Arc<HvVm>,
+        vm: Arc<VmWithGic>,
         setup: S,
         handlers: ExitHandlers,
         config: VcpuThreadConfig,

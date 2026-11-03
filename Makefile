@@ -31,7 +31,7 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest microvm-test-initrd-build microvm-test-initrd-build-selftestdev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest microvm-test-initrd-build microvm-test-initrd-build-selftest dev-fd-perm-probe dev-fd-perm-probe-selftest third-party-licenses-selftest deny-license-fail-closed-selftest deny-bans-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest net-throughput-rtt-selftest small-files-compare-selftest mac-small-files-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \

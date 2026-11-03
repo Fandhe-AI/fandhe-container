@@ -39,6 +39,8 @@
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.8・#3785・MVM-5: arm64 の ESR（例外 syndrome）の復号（`esr`。OS 非依存・`unsafe` なし）。
+//! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
+//! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
@@ -52,7 +54,7 @@
 //!   （`KVM_RUN` の期限切れで vCPU スレッドを中断するため）。組み込むプロセスは `SIGUSR2` を他の用途に使わないこと。
 //!   既に別の handler や SIG_IGN があるときは上書きせず `FailedPrecondition`（EBUSY）で失敗する。
 //!
-//! `unsafe` は `src/sys.rs` に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
+//! `unsafe` は `src/sys.rs`（Linux）・`src/sys/hvf.rs`（macOS）に限り、crate 全体の `#![deny(unsafe_code)]` と `sys` だけへの `allow` で
 //! 機械的に担保する（REPAIR-9・TASK-74.5）。rust-vmm 系クレートへの依存は禁止（MVM-4・.claude/rules/dependency-policy.md）。
 
 #![deny(unsafe_code)]
@@ -66,6 +68,9 @@ pub mod error;
 pub mod esr;
 pub mod exit;
 pub mod guest_memory;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf;
+pub mod hvf_abi;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
@@ -75,6 +80,10 @@ pub mod microvm;
 pub mod smp_x86;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
+mod sys;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+#[path = "sys/hvf.rs"]
 mod sys;
 pub mod uart;
 pub mod virtio_block;

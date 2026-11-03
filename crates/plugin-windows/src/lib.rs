@@ -6,7 +6,7 @@
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393。[`frame_loop`]）で実装済み。
+//! 起動設定の解決は TASK-116.1（#392）、UDS 接続後のフレーム送受信ループは TASK-116.2（#393）で実装し、本体は #3776 で共有 crate `fandhe-container-plugin::frame_loop` へ移した（[`frame_loop`] は再 export と停止方針の固定のみ）。
 //! `ContainerRuntime` アダプタ（#394。[`adapter`]）は create / start / stop を platform-windows へ委譲済みで、
 //! ゲスト内ランタイム起動・kill / delete / state・型つき本体は未実装。
 //! SIGTERM でのグレースフルシャットダウン（[`sys`]・`frame_loop::serve_until`）と `ping` 応答（[`adapter`]）は実装済み（TASK-116.5・#396）。

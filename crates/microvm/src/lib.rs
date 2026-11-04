@@ -48,7 +48,7 @@
 //! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
 //! TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5: macOS の vCPU 専用スレッドと実行ループ・exit の分類・期限つきの停止（`hvf_loop` は OS 非依存の
 //! コアで、偽の実行体の単体テストが全 OS で走る。macOS かつ aarch64 のみ `hvf::{VcpuThread, VcpuHandle}`。exit ごとの処理
-//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::mmio` は #3793 で実装済み。`hvf::timer` はスタブで実処理は #3796）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
+//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::mmio` は #3793、`hvf::timer` は #3796 で WFI / WFE と vtimer を実装済み。残る制限は各ファイルの「未実装」節）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! #3888・MVM-1: x86_64 の MP テーブルの生成（`mptable_x86`。OS 非依存・`unsafe` なし。`microvm::MicroVm::load_kernel` が `[639 KiB, 640 KiB)` へ書き e820 で予約し、AP を Linux にオンラインにする）。

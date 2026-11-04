@@ -30,13 +30,15 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 
 ## `fandhe-container setup` の表示
 
-macOS で `fandhe-container setup` を実行すると、次の 2 ステップを 1 行 1 JSON で表示する（CLI-1・CLI-2。#2452）。各行の `instructions` は本書の該当節と同じ手順の固定文言（英語）で、CLI は表示するだけで実行しない。
+macOS で `fandhe-container setup` を実行すると、次の 3 ステップを 1 行 1 JSON で表示する（CLI-1・CLI-2。#2452）。各行の `instructions` は本書の該当節と同じ手順の固定文言（英語）で、CLI は表示するだけで実行しない。
 
 | ステップ ID | 本書の節 | 管理者権限 |
 | ----------- | -------- | ---------- |
 | `virtualization-entitlement` | entitlement とコード署名 | 不要 |
 | `macos-min-version` | macOS の版 | 不要 |
+| `hypervisor-entitlement` | microVM（Hypervisor.framework）の entitlement とコード署名 | 不要 |
 
+- `hypervisor-entitlement` は条件 `microvm`（出力の `condition` フィールド。microVM バックエンドを使うときだけ要る。MVM-5）つきで、macOS の既定（Virtualization.framework）には不要。条件つきのため終了コードには影響しない
 - `setup` は macOS の版も署名も検出・変更しない。ステップが残るため終了コードは 8（`UNIMPLEMENTED`）になる
 - ステップの検出・適用は `setup` の範囲外で、plugin 経由の将来仕様（TASK-125。#1869 の設計）である（REPAIR-3）
 
@@ -86,7 +88,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 
 ## microVM（Hypervisor.framework）の entitlement とコード署名
 
-対象: MVM-5・MAC-1。`fandhe-container setup` は本節の手順を表示しない（ステップ ID なし）。
+ステップ ID: `hypervisor-entitlement`（条件 `microvm`）。対象: MVM-5・MAC-1。
 
 - 署名の対象は microVM の backend plugin `fandhe-container-plugin-microvm` である。手元で実機前提テスト（`hvf_device`・`hvf_microvm`・plugin-microvm の E2E。手順は `AGENTS.md`「実機前提テスト」）を回す場合は、その試験バイナリにも同じ署名が要る。CLI やほかのバイナリではない
 - 必要な entitlement は `com.apple.security.hypervisor` のみ（[Apple の entitlement のページ](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.hypervisor)）。`com.apple.vm.hypervisor` は macOS 10.15 以前向けで、本バックエンドは macOS 15 以降が対象のため不要

@@ -6,7 +6,7 @@
 //! [`IoEventFd`] はゲストの `QueueNotify` 書き込み（VM exit なし）で発火する eventfd を持ち、
 //! [`IoEventFd::consume`] で回数を読む。[`IrqFd`] は VM fd を dup して所有する（VM 構成体が VM fd と一緒に保持できる。TASK-75.2）。
 //! [`IoEventFd`] は `'vm` の借用。どちらも drop で登録を解く。
-//! #3918 で x86_64 の COM1 用に `KVM_IRQ_LINE` の level 線 [`IrqLevelLine`] を足した（`VmFd::register_irq_line` が返す）。
+//! #3918 で x86_64 の COM1 用に `KVM_IRQ_LINE` の level 線 `IrqLevelLine`（x86_64 のみ）を足した（`VmFd::register_irq_line` が返す）。
 //!
 //! # 待ちを持たない設計（REPAIR-5）
 //! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で

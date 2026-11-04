@@ -862,7 +862,7 @@ enum SerialAttach {
     Com1Pio {
         line: Option<Arc<dyn LevelInterruptLine>>,
     },
-    /// aarch64 の MMIO（FDT の `ns16550a`。#3898）。線なし（ポーリング。割り込みの結線は後続 issue・REPAIR-3）。
+    /// aarch64 の MMIO（FDT の `ns16550a`。#3898）。線なし（ポーリング。割り込みの結線は #3943・REPAIR-3）。
     /// virtio の登録の後に登録し、virtio の `DeviceId` を変えない。
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     Mmio { base: u64, len: u64 },
@@ -1249,8 +1249,9 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// カーネル・initrd・cmdline をゲストメモリへロードする（TASK-75.3.1・MVM-1。x86_64 は bzImage、aarch64 は Image と FDT〔#3696〕。他 arch は `Unimplemented`）。
     ///
     /// cmdline は `user_cmdline` の後ろに、組み立て済みの各デバイスの `virtio_mmio.device=<size>@<base>:<irq>` を
-    /// block → net の順で足す。戻り値の [`LoadedKernel`] を [`MicroVm::setup_boot_vcpu`]（#885）に渡す。
-    /// 検証と配置の詳細は `crate::boot_x86`。
+    /// block → net の順で足す（x86_64 の場合。aarch64 は virtio を FDT のノードで渡すので cmdline には足さず、bootargs は 2047 バイトまで。
+    /// 超過は `InvalidArgument`。詳細は `crate::boot_arm64`）。戻り値の [`LoadedKernel`] を [`MicroVm::setup_boot_vcpu`]（#885）に渡す。
+    /// x86_64 の検証と配置の詳細は `crate::boot_x86`。
     pub fn load_kernel(
         &mut self,
         kernel: &[u8],
@@ -1335,7 +1336,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// vCPU 0（BSP）を、ロード済みカーネルのエントリから実行を始める状態に初期化する（TASK-75.3.2・MVM-1。
     /// x86_64 は long mode、aarch64 は X0 = FDT・PC = Image・EL1h〔#3696〕。他 arch は `Unimplemented`）。
     ///
-    /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
+    /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ `boot_x86::BootCpuState::for_kernel`（x86_64 の場合の手順。aarch64 は `VcpuFd::set_arm64_boot_state`〔`KVM_SET_ONE_REG`。#3696〕で、AP は POWER_OFF で作って PSCI CPU_ON で起こす〔#3899〕）→
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state` → 起動用 MSR（`set_msrs`）→ FPU（`set_fpu`。#3734）。最初の `VcpuFd::run_once` より前に、
     /// [`MicroVm::load_kernel`] の後で 1 回呼ぶ。in-kernel irqchip のある VM の AP（vCPU 1 以上）はレジスタを触らず（INIT/SIPI で起動する。#3737）、
     /// LAPIC の LINT だけを BSP と同じ経路で設定する。
@@ -1417,7 +1418,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 
     /// AP の起動コードを SIPI のベクタが指すページへ書く（#3737・MVM-1・TASK-75.4。x86_64 のみ、他 arch は `Unimplemented`）。
     ///
-    /// BSP のゲストコードが送る STARTUP IPI のベクタと同じ `vector` を渡す。置き場所は [`sipi_startup_range`] で検証してから書く
+    /// BSP のゲストコードが送る STARTUP IPI のベクタと同じ `vector` を渡す。置き場所は `sipi_startup_range` で検証してから書く
     /// （ブート用領域・RAM の外との重なりは書く前に `InvalidArgument`）。戻り値は書いた先頭の GPA。Linux ゲストは自分で
     /// trampoline を置くため、本メソッドはファームウェアの無い起動コードと試験のためのもの（AP の起動コードの e820 への予約は範囲外。REPAIR-3。MP テーブルは `MP_TABLE_START` で別領域）。
     pub fn write_ap_startup_code(
@@ -1508,7 +1509,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// ゲストの THR 出力（`console=ttyS0`）が溜まる。
     ///
     /// 上限つき（[`crate::uart::MAX_OUTPUT_BYTES`]）。中身は非信頼のゲスト出力なので、表示・記録時はエスケープすること。
-    /// 未実装（REPAIR-3）: aarch64 の割り込み線（線が無く、受信は Linux がポーリングで読む。後続 issue）。
+    /// 未実装（REPAIR-3）: aarch64 の割り込み線（線が無く、受信は Linux がポーリングで読む。#3943）。
     pub fn serial_console(&self) -> SerialConsole {
         self.devices.serial.clone()
     }

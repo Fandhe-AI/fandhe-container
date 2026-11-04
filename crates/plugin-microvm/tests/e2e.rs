@@ -10,14 +10,15 @@
 //!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。あわせて `serve_until` と停止フラグ
 //!   （SIGTERM 相当。#3747）で、実行中 VM の停止と、停止に入った後に届いた要求が処理されないことを照合する。
 //! - 層 B（`#[ignore]`・実機前提）: 実バイナリを spawn し、Linux x86_64 では本物の `KvmBackend`（`/dev/kvm` が要る）、
-//!   macOS aarch64 では本物の `HvfBackend`（Apple Silicon の macOS 15 以降と entitlement つきの署名が要る。TASK-192.18・#3800）で合成
-//!   bzImage を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
+//!   macOS aarch64 では本物の `HvfBackend`（Apple Silicon の macOS 15 以降と entitlement つきの署名が要る。TASK-192.18・#3800）で、
+//!   合成ゲスト（Linux x86_64 は合成 bzImage、macOS aarch64 は合成 arm64 Image）を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
 //!
 //! 層 B の合成ゲストは boot_params（`HdrS` と cmd_line_ptr）を確かめて自己ループする。`KvmBackend` は block / net を付けない
 //! ため、`crates/microvm/tests/microvm.rs` の virtio-mmio 照合ペイロードは使えない。ホスト側からゲストの exit の種別は
 //! 観測できないので、停止理由 `requested`（停止要求の割り込みで止まった）が「正しいエントリで動き続けた」ことの判別材料になる。
 //! ud2 だけのゲストで `guest_shutdown` を期待する負の対照は、停止要求と shutdown exit のどちらが先に観測されるかが競合し、
-//! 寛容な assert になるため置かない。非 x86_64 では microvm の start が x86 専用のため層 B は置かない。
+//! 寛容な assert になるため置かない。Linux aarch64 の `KvmBackend` は起動まで実装済み（#3696）だが、ネイティブ arm64 の CI が無く実機での実行は人間担当の #3781 のため、
+//! Linux aarch64 の層 B はまだ置いていない。
 //! 待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
 #![cfg(unix)]
 

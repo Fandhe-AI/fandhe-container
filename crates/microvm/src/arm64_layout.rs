@@ -26,7 +26,7 @@
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
 //!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
-//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・PSCI CPU_ON・`HVF_MAX_VCPUS` の引き上げ。バックエンドは 1 vCPU のまま。
+//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・`HVF_MAX_VCPUS` の引き上げ・PSCI の実起動の結線〔状態機械は `psci.rs`。#3883・結線は #3884 / #3891〕。バックエンドは 1 vCPU のまま。
 //! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
 //! PCI・IPA 上限の確定（#3803）。
 //!

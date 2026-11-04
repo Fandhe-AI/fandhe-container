@@ -37,7 +37,7 @@
 //!   microvm 側で memslot の削除に失敗した場合は、`Released` でもゲスト RAM の mapping が残りうる（microvm 側の fail-closed の既存仕様）。
 //!   非 Linux では VM を作れないため `detached` は生じない。
 //! - イメージ読み込みは別スレッドで走らせ [`IMAGE_READ_DEADLINE`] で `TIMEOUT` にする（REPAIR-5）。期限切れのスレッドは取り消せず、
-//!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
+//!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`。adapter ごとの計数器で、本番は 1 adapter のためプロセス全体の上限と等価。#3900）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
 //!   `RESOURCE_EXHAUSTED` になる。
 //! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
@@ -372,9 +372,14 @@ enum ImageKind {
 ///
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
-/// 枠は I/O が戻るまで保持し、生存中の読み込みが `MAX_INFLIGHT_READS` に達すると `RESOURCE_EXHAUSTED` になる。
-fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
-    let slot = ReadSlot::acquire()?;
+/// 枠は I/O が戻るまで保持し、`limiter`（adapter ごと）で生存中の読み込みが `MAX_INFLIGHT_READS` に達すると `RESOURCE_EXHAUSTED` になる。
+fn read_image(
+    limiter: &ReadLimiter,
+    path: &Path,
+    cap: u64,
+    kind: ImageKind,
+) -> Result<Vec<u8>, PluginError> {
+    let slot = limiter.acquire()?;
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = path.to_path_buf();
     let spawned = std::thread::Builder::new()
@@ -396,31 +401,43 @@ fn read_image(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginE
 }
 
 /// 実行中（期限切れで detach 済みを含む）の読み込みスレッド数の上限（REPAIR-5・リソース上限）。
+/// 枠は adapter ごとに持つ（本番は 1 プロセス 1 adapter のためプロセス全体の上限と等価。#3900）。
 const MAX_INFLIGHT_READS: usize = 8;
-static INFLIGHT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 読み込みスレッドの枠。Drop で返す。上限到達時は `RESOURCE_EXHAUSTED`。
-struct ReadSlot(&'static std::sync::atomic::AtomicUsize);
+/// 読み込みスレッドの枠の計数器。adapter が所有し、`read_image` へ渡す（#3900）。
+///
+/// 以前はプロセス全体の static だったため、同じ試験バイナリ内で並列に走る別 adapter の読み込みと枠を取り合い、
+/// 並列度が高いと `start` が `RESOURCE_EXHAUSTED` になる間欠失敗の原因になっていた。
+/// 計数器は `Arc` で reader スレッドにも渡すため、期限切れで detach したスレッドが adapter より長生きしても有効。
+#[derive(Clone, Debug)]
+struct ReadLimiter {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max: usize,
+}
 
-impl ReadSlot {
-    fn acquire() -> Result<Self, PluginError> {
-        Self::acquire_from(&INFLIGHT_READS, MAX_INFLIGHT_READS)
+impl ReadLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max,
+        }
     }
 
-    /// 計数器と上限を指定して枠を取る。上限到達時のメッセージは VM 数の上限（`MSG_LIMIT`）と区別する。
-    fn acquire_from(
-        counter: &'static std::sync::atomic::AtomicUsize,
-        max: usize,
-    ) -> Result<Self, PluginError> {
+    /// 枠を取る。上限到達時のメッセージは VM 数の上限（`MSG_LIMIT`）と区別する。
+    fn acquire(&self) -> Result<ReadSlot, PluginError> {
         use std::sync::atomic::Ordering;
-        counter
+        let max = self.max;
+        self.counter
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max).then_some(n + 1)
             })
-            .map(|_| ReadSlot(counter))
+            .map(|_| ReadSlot(std::sync::Arc::clone(&self.counter)))
             .map_err(|_| perr(PluginErrorCode::ResourceExhausted, MSG_READ_LIMIT))
     }
 }
+
+/// 読み込みスレッドの枠。Drop で返す。
+struct ReadSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for ReadSlot {
     fn drop(&mut self) {
@@ -560,6 +577,8 @@ pub struct MicrovmRuntimeAdapter<B: MicrovmBackend> {
     /// 停止が期限切れで切り離された（終了未観測の）VM の観測ハンドル。件数を [`MAX_VMS`] の計数に含める。
     /// `vms.len() + detached.len() <= MAX_VMS` が保たれるため、長さは上限で抑えられる。
     detached: Vec<B::ExitWatch>,
+    /// イメージ読み込みスレッドの枠（adapter ごと。#3900）。
+    reads: ReadLimiter,
 }
 
 impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
@@ -569,6 +588,16 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             backend,
             vms: BTreeMap::new(),
             detached: Vec::new(),
+            reads: ReadLimiter::new(MAX_INFLIGHT_READS),
+        }
+    }
+
+    /// 読み込み枠の上限を指定して作る（試験用。#3900）。
+    #[cfg(test)]
+    fn with_read_limiter(backend: B, reads: ReadLimiter) -> Self {
+        Self {
+            reads,
+            ..Self::new(backend)
         }
     }
 
@@ -672,9 +701,15 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         } else {
             Some(validate_path(initrd)?)
         };
-        let kernel_bytes = read_image(kernel_path, MAX_KERNEL_IMAGE_BYTES, ImageKind::Kernel)?;
+        let kernel_bytes = read_image(
+            &self.reads,
+            kernel_path,
+            MAX_KERNEL_IMAGE_BYTES,
+            ImageKind::Kernel,
+        )?;
         let initrd_bytes = match initrd_path {
             Some(p) => Some(read_image(
+                &self.reads,
                 p,
                 MAX_INITRD_BYTES.min(mem_bytes),
                 ImageKind::Initrd,
@@ -847,13 +882,51 @@ mod tests {
     /// 画像読み込みの枠が尽きたとき、VM 数上限と区別できる文言で RESOURCE_EXHAUSTED になる（REPAIR-5・MVM-5）。
     #[test]
     fn read_slot_limit_uses_distinct_message() {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let held = ReadSlot::acquire_from(&COUNTER, 1).expect("first slot");
-        let e = ReadSlot::acquire_from(&COUNTER, 1).err().expect("limit");
+        let limiter = ReadLimiter::new(1);
+        let held = limiter.acquire().expect("first slot");
+        let e = limiter.acquire().err().expect("limit");
         assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
         assert_eq!(e.message(), "too many in-flight image reads");
         assert_ne!(e.message(), MSG_LIMIT);
         drop(held);
+        drop(limiter.acquire().expect("slot returned"));
+    }
+
+    /// #3900・REPAIR-5・REPAIR-12: 読み込み枠は adapter ごと。枠を使い切った adapter の start は失敗し、
+    /// 別の adapter は影響を受けず、枠を返せば元の adapter も成功する。既定の上限は 8。
+    #[test]
+    fn repair5_repair12_3900_read_slots_are_per_adapter() {
+        assert_eq!(MAX_INFLIGHT_READS, 8);
+        let t = Tmp::new("slots3900");
+        let k = t.file("k", b"KERNEL");
+        let limiter = ReadLimiter::new(MAX_INFLIGHT_READS);
+        let mut a =
+            MicrovmRuntimeAdapter::with_read_limiter(FakeBackend::default(), limiter.clone());
+        let held: Vec<ReadSlot> = (0..MAX_INFLIGHT_READS)
+            .map(|_| limiter.acquire().expect("slot"))
+            .collect();
+        let e = a.handle(&start_req("vm1", &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "too many in-flight image reads");
+        assert_ne!(e.message(), MSG_LIMIT);
+        assert_eq!(a.backend.starts, 0);
+        assert!(a.is_empty());
+        // 別 adapter（既定の new）は影響を受けない。
+        let mut b = adapter();
+        assert_eq!(b.handle(&start_req("vm1", &k)).expect("b"), s(&["running"]));
+        assert_eq!(b.backend.starts, 1);
+        assert_eq!(b.len(), 1);
+        // 枠を返せば元の adapter も成功する。
+        drop(held);
+        assert_eq!(a.handle(&start_req("vm1", &k)).expect("a"), s(&["running"]));
+        assert_eq!(a.backend.starts, 1);
+        // 既定の new の上限は 8（9 個目で RESOURCE_EXHAUSTED）。
+        let d = ReadLimiter::new(MAX_INFLIGHT_READS);
+        let _h: Vec<ReadSlot> = (0..8).map(|_| d.acquire().expect("slot")).collect();
+        assert_eq!(
+            d.acquire().err().expect("9th").code(),
+            PluginErrorCode::ResourceExhausted
+        );
     }
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1220,22 +1293,52 @@ mod tests {
         let f = t.file("ok", b"abcd");
         let p = Path::new(&f);
         assert_eq!(
-            read_image(p, 4, ImageKind::Kernel).expect("ok"),
+            read_image(
+                &ReadLimiter::new(MAX_INFLIGHT_READS),
+                p,
+                4,
+                ImageKind::Kernel
+            )
+            .expect("ok"),
             b"abcd".to_vec()
         );
-        let e = read_image(p, 3, ImageKind::Kernel).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            p,
+            3,
+            ImageKind::Kernel,
+        )
+        .unwrap_err();
         assert_eq!(
             (e.code(), e.message()),
             (PluginErrorCode::InvalidArgument, "image too large")
         );
-        let e = read_image(&t.0.join("missing"), 4, ImageKind::Kernel).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            &t.0.join("missing"),
+            4,
+            ImageKind::Kernel,
+        )
+        .unwrap_err();
         assert_eq!(
             (e.code(), e.message()),
             (PluginErrorCode::NotFound, "kernel image not found")
         );
-        let e = read_image(&t.0.join("missing"), 4, ImageKind::Initrd).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            &t.0.join("missing"),
+            4,
+            ImageKind::Initrd,
+        )
+        .unwrap_err();
         assert_eq!(e.message(), "initrd image not found");
-        let e = read_image(&t.0, 4, ImageKind::Kernel).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            &t.0,
+            4,
+            ImageKind::Kernel,
+        )
+        .unwrap_err();
         assert_eq!(
             (e.code(), e.message()),
             (
@@ -1247,7 +1350,13 @@ mod tests {
         {
             let link = t.0.join("link");
             std::os::unix::fs::symlink(&f, &link).expect("symlink");
-            let e = read_image(&link, 4, ImageKind::Kernel).unwrap_err();
+            let e = read_image(
+                &ReadLimiter::new(MAX_INFLIGHT_READS),
+                &link,
+                4,
+                ImageKind::Kernel,
+            )
+            .unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         }
     }
@@ -1347,7 +1456,13 @@ mod tests {
     fn err1_sec1_3890_read_image_trailing_slash_on_file_is_not_regular() {
         let t = Tmp::new("tslash");
         let f = t.file("kernel", b"K");
-        let e = read_image(Path::new(&format!("{f}/")), 4, ImageKind::Kernel).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            Path::new(&format!("{f}/")),
+            4,
+            ImageKind::Kernel,
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         assert_eq!(e.message(), MSG_NOT_REGULAR);
         assert!(!e.message().contains(&*t.0.to_string_lossy()));
@@ -1378,7 +1493,13 @@ mod tests {
         let t = Tmp::new("fileanc");
         let f = t.file("file", b"K");
         for kind in [ImageKind::Kernel, ImageKind::Initrd] {
-            let e = read_image(Path::new(&format!("{f}/x")), 4, kind).unwrap_err();
+            let e = read_image(
+                &ReadLimiter::new(MAX_INFLIGHT_READS),
+                Path::new(&format!("{f}/x")),
+                4,
+                kind,
+            )
+            .unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
             assert_eq!(e.message(), MSG_BAD_ANCESTOR);
             assert!(!e.message().contains(&*t.0.to_string_lossy()));
@@ -1393,7 +1514,13 @@ mod tests {
         std::os::unix::fs::symlink(t.0.join("b"), t.0.join("a")).expect("symlink");
         std::os::unix::fs::symlink(t.0.join("a"), t.0.join("b")).expect("symlink");
         let p = t.0.join("a").join("k");
-        let e = read_image(&p, 4, ImageKind::Kernel).unwrap_err();
+        let e = read_image(
+            &ReadLimiter::new(MAX_INFLIGHT_READS),
+            &p,
+            4,
+            ImageKind::Kernel,
+        )
+        .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         assert_eq!(e.message(), MSG_BAD_ANCESTOR);
         assert!(!e.message().contains(&*t.0.to_string_lossy()));

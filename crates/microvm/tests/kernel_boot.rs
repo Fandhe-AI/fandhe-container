@@ -27,13 +27,20 @@
 //!   （不一致・失敗は `BLOCK_MISMATCH_MARKER`）。backend の offset 0 に sentinel を置いた構成で一致 marker 1 回・不一致 0 回、
 //!   0 埋めの構成（陰性対照）で不一致 marker 1 回・一致 0 回を照合し、ゲストに中身が届いたことを end-to-end で示す。
 //!   カーネルには `CONFIG_DEVTMPFS=y` が要る（init が `/dev` に devtmpfs をマウントする）。
-//! - virtio-net 1 台: STATUS の DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2（receiveq・transmitq）。RX・TX は
-//!   interface を上げる userspace が無いので照合しない。
+//! - virtio-net 1 台: STATUS の DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2（receiveq・transmitq）。既定の initrd
+//!   には interface を上げる userspace が無いので、この試験では RX・TX を照合しない。
+//! - virtio-net の TX の照合（#3894・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_VARIANT=net-tx make microvm-test-initrd-build`
+//!   の initrd（`FANDHE_CONTAINER_MICROVM_NET_TX_INITRD`。既定 `target/microvm-test-initrd/x86_64-net-tx/initrd.cpio`）は、
+//!   AF_PACKET で `eth0` を上げて固定フレーム（`NET_TX_FRAME`・60 バイト）を 1 回送り、`sendto` が 60 を返したときだけ
+//!   `NET_TX_OK_MARKER` を出す（失敗は `NET_TX_FAILED_MARKER`）。backend が受けたフレームの中に `NET_TX_FRAME` と完全一致する
+//!   ものが 1 件以上あることを照合する（カーネルが IPv6 の RS 等を出すことがあるため、一致以外のフレームは許す）。
+//!   net 0 台の陰性対照では `SIOCGIFINDEX` が失敗し、失敗 marker が出ることを照合する。RX は別 issue。
+//!   カーネルには `CONFIG_PACKET=y` が要る。
 //!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。止まる場合は `_CMDLINE` で
 //! `tsc=reliable no_timer_check` 等を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
-//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・RX/TX。
+//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・RX。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -47,12 +54,12 @@ mod x86 {
     };
     use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
     use fandhe_container_microvm::virtio_mmio::reg;
-    use fandhe_container_microvm::virtio_net::{MemoryNetBackend, NetBackend};
+    use fandhe_container_microvm::virtio_net::{MAX_MEMORY_FRAMES, MemoryNetBackend, NetBackend};
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     /// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
@@ -60,6 +67,19 @@ mod x86 {
     /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
     /// `block_sentinel`（単体テストで照合）。
     const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
+    /// net-tx の initrd が成功時・失敗時に出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の
+    /// `net_tx_ok_message`・`net_tx_failed_message`（単体テストで照合）。
+    const NET_TX_OK_MARKER: &str = "fandhe-microvm-test: net tx ok v1";
+    const NET_TX_FAILED_MARKER: &str = "fandhe-microvm-test: net tx failed v1";
+    /// net-tx の initrd が送る固定の Ethernet フレーム（60 バイト）。宛先 02:fc:00:00:38:66・送信元は `NET_MAC`・
+    /// EtherType 0x88B5（IEEE 802 Local Experimental）・ペイロード 46 バイト。正本はスクリプトの `net_tx_frame_header_hex`
+    /// と `net_tx_payload`（単体テストで照合）。
+    const NET_TX_FRAME: [u8; 60] = [
+        0x02, 0xfc, 0x00, 0x00, 0x38, 0x66, 0x02, 0xfc, 0x00, 0x00, 0x38, 0x65, 0x88, 0xb5, b'f',
+        b'a', b'n', b'd', b'h', b'e', b'-', b'm', b'i', b'c', b'r', b'o', b'v', b'm', b'-', b'n',
+        b'e', b't', b'-', b't', b'x', b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'-', b'0',
+        b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e', b'f',
+    ];
     /// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
     const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
     /// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
@@ -388,11 +408,31 @@ mod x86 {
         }
     }
 
-    /// 送信件数・受信試行回数（診断用。フレームは積まない）。
+    /// 送信件数・受信試行回数と、受けたフレームの写し（#3894。保持は `MAX_MEMORY_FRAMES` 件まで）。
     #[derive(Debug, Default)]
     struct NetCounters {
         sent: AtomicU64,
         recv_calls: AtomicU64,
+        frames: Mutex<Vec<Vec<u8>>>,
+        dropped: AtomicU64,
+    }
+
+    impl NetCounters {
+        /// フレームを写す。上限を超えた分は保持せず `dropped` だけ数える（無制限の確保をしない）。
+        fn capture(&self, frame: &[u8]) {
+            let mut g = self.frames.lock().unwrap_or_else(|e| e.into_inner());
+            if g.len() >= MAX_MEMORY_FRAMES {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            } else {
+                g.push(frame.to_vec());
+            }
+        }
+        fn snapshot(&self) -> Vec<Vec<u8>> {
+            self.frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
     }
 
     #[derive(Debug)]
@@ -417,6 +457,7 @@ mod x86 {
     impl NetBackend for CountingNetBackend {
         fn send(&mut self, frame: &[u8]) -> Result<(), MicrovmError> {
             self.counters.sent.fetch_add(1, Ordering::Relaxed);
+            self.counters.capture(frame);
             self.inner.send(frame)
         }
         fn recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
@@ -441,6 +482,8 @@ mod x86 {
         Default,
         /// `/dev/vda` の先頭を sentinel と比べる版（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。#3889）。
         BlockRead,
+        /// `eth0` を上げて固定フレームを 1 回送る版（`FANDHE_CONTAINER_MICROVM_NET_TX_INITRD`。#3894）。
+        NetTx,
     }
 
     fn inputs() -> Inputs {
@@ -459,6 +502,11 @@ mod x86 {
                 "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD",
                 "../../target/microvm-test-initrd/x86_64-block-read/initrd.cpio",
                 "MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build",
+            ),
+            InitrdKind::NetTx => (
+                "FANDHE_CONTAINER_MICROVM_NET_TX_INITRD",
+                "../../target/microvm-test-initrd/x86_64-net-tx/initrd.cpio",
+                "MICROVM_TEST_INITRD_VARIANT=net-tx make microvm-test-initrd-build",
             ),
         };
         let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
@@ -616,7 +664,7 @@ mod x86 {
         assert!(!o.timed_out, "boot timed out: {diag}");
     }
 
-    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION, CONFIG_DEVTMPFS";
+    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION, CONFIG_DEVTMPFS, CONFIG_PACKET";
 
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -809,6 +857,98 @@ mod x86 {
         );
     }
 
+    /// virtio-net の TX の照合（#3894・MVM-1・REPAIR-12）。net-tx の initrd が `eth0` を上げて送った固定フレームが
+    /// backend まで届いたことを、完全一致するフレームが 1 件以上あることで示す。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_init_sends_frame() {
+        let inp = inputs_for(InitrdKind::NetTx);
+        let (backend, counters) = CountingNetBackend::new();
+        let config: MicroVmConfig<MemoryBlockBackend, CountingNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend,
+                mac: NET_MAC,
+            }],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let frames = counters.snapshot();
+        let matched = frames
+            .iter()
+            .filter(|f| f.as_slice() == NET_TX_FRAME)
+            .count();
+        let others: Vec<String> = frames
+            .iter()
+            .filter(|f| f.as_slice() != NET_TX_FRAME)
+            .take(4)
+            .map(|f| hex_prefix(f, 32))
+            .collect();
+        let extra = format!(
+            "net={s:?} total_frames={} dropped={} matched={matched} other_frames_head={others:?} hint=\"{KCONFIG_HINT}\"",
+            frames.len(),
+            counters.dropped.load(Ordering::Relaxed),
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok_with_marker(&o, NET_TX_OK_MARKER, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, NET_TX_FAILED_MARKER),
+            0,
+            "net tx failed marker must not appear: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default init marker must not appear with the net-tx initrd: {diag}"
+        );
+        assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        assert!(
+            matched >= 1,
+            "backend received no frame equal to NET_TX_FRAME: {diag}"
+        );
+        eprintln!(
+            "kernel_boot: ok case=virtio_net_tx frames={} matched={matched} elapsed_ms={}",
+            frames.len(),
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// 陰性対照（#3894）。net 0 台では `SIOCGIFINDEX` が失敗するので失敗 marker が出て、成功 marker は出ないこと。
+    /// marker の区別と init の失敗経路を実カーネルで確かめる。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_net_tx_init_without_net_device_reports_failure() {
+        let inp = inputs_for(InitrdKind::NetTx);
+        let config: MicroVmConfig<MemoryBlockBackend, CountingNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![],
+        };
+        let o = run_boot(inp, config, None);
+        let diag = o.diag(&format!("hint=\"{KCONFIG_HINT}\""));
+        assert_boot_ok_with_marker(&o, NET_TX_FAILED_MARKER, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, NET_TX_OK_MARKER),
+            0,
+            "net tx ok marker must not appear without a net device: {diag}"
+        );
+        eprintln!(
+            "kernel_boot: ok case=virtio_net_tx_no_device elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// 先頭 `n` バイトの 16 進表記（診断用）。
+    fn hex_prefix(b: &[u8], n: usize) -> String {
+        b.iter().take(n).map(|x| format!("{x:02x}")).collect()
+    }
+
     fn synthetic_mmio_write(vcpu_id: u32, addr: u64, value: u32) -> RunRecord {
         RunRecord {
             vcpu_id,
@@ -913,6 +1053,63 @@ mod x86 {
             vec![BLOCK_MISMATCH_MARKER.to_owned()]
         );
         assert_eq!(BLOCK_SENTINEL.len(), 32);
+    }
+
+    #[test]
+    fn mvm1_3894_net_tx_strings_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        let header = find("net_tx_frame_header_hex=\"");
+        let payload = find("net_tx_payload=\"");
+        assert_eq!(header.len(), 1);
+        assert_eq!(payload.len(), 1);
+        let hdr = header.first().unwrap();
+        let mut frame: Vec<u8> = (0..hdr.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hdr.get(i..i + 2).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(frame.len(), 14);
+        frame.extend_from_slice(payload.first().unwrap().as_bytes());
+        assert_eq!(frame.as_slice(), &NET_TX_FRAME[..]);
+        assert_eq!(NET_TX_FRAME.len(), 60);
+        assert_eq!(frame.get(6..12), Some(&NET_MAC[..]));
+        assert_eq!(frame.get(12..14), Some(&[0x88, 0xb5][..]));
+        assert_eq!(
+            find("net_tx_ok_message=\""),
+            vec![NET_TX_OK_MARKER.to_owned()]
+        );
+        assert_eq!(
+            find("net_tx_failed_message=\""),
+            vec![NET_TX_FAILED_MARKER.to_owned()]
+        );
+    }
+
+    #[test]
+    fn mvm1_3894_frame_capturing_backend() {
+        let (mut b, c) = CountingNetBackend::new();
+        b.send(&NET_TX_FRAME).unwrap();
+        b.send(&[0u8; 14]).unwrap();
+        assert_eq!(c.sent.load(Ordering::Relaxed), 2);
+        let snap = c.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.first().map(Vec::as_slice), Some(&NET_TX_FRAME[..]));
+        assert_eq!(snap.get(1).map(Vec::len), Some(14));
+        let mut buf = [0u8; 64];
+        assert_eq!(b.recv(&mut buf).unwrap(), None);
+        // 上限を超えた分は保持せず dropped だけ増える。
+        for _ in 0..MAX_MEMORY_FRAMES + 3 {
+            c.capture(&[1u8; 14]);
+        }
+        assert_eq!(c.snapshot().len(), MAX_MEMORY_FRAMES);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -1095,6 +1292,31 @@ mod other {
             vcpu_count: 1,
             mem_size: 1 << 20,
             block: vec![MemoryBlockBackend::new(1 << 20, true).unwrap()],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_init_sends_frame() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65],
+            }],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_net_tx_init_without_net_device_reports_failure() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
             net: vec![],
         });
     }

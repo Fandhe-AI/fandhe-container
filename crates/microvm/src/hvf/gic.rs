@@ -55,8 +55,8 @@ use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtu
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvGicIntid;
 use crate::hvf_lifecycle::TeardownMark;
-use crate::interrupt::{InterruptLine, IrqTrigger, LineResample};
-use crate::spi::{SpiLine, SpiSink};
+use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
+use crate::spi::{SpiLevelLine, SpiLine, SpiSink};
 use crate::sys::{GicApi, HvVcpu, HvVm};
 
 fn to_u64(v: usize) -> Result<u64, MicrovmError> {
@@ -110,6 +110,7 @@ impl HvfGic {
         check_virtual_timer_intid(virtual_timer_intid)?;
         let (spi_base, spi_count) = api.spi_interrupt_range()?;
         layout.check_virtio_spi_range(spi_base, spi_count)?;
+        layout.check_serial_spi_range(spi_base, spi_count)?;
         Ok(HvfGic {
             geometry,
             virtual_timer_intid,
@@ -234,6 +235,39 @@ impl VmWithGic {
         };
         Ok(GicSpiLine(SpiLine::new(sink, intid, injection)))
     }
+
+    /// シリアルの SPI を level 形で駆動する [`GicSerialLine`] を作る（#3892・MVM-5・MVM-1）。
+    ///
+    /// `layout.serial` が無ければ `InvalidArgument`。INTID は GIC 作成時に照会した範囲で検証する。
+    /// 生存フラグを共有するので、ホスト側の `SerialConsole` の clone が VM より長生きしても、VM の破棄後の注入は
+    /// `Internal` で拒否される。呼び出しは MMIO exit を処理する vCPU スレッドから UART の lock の下で行い、待ちは持たない
+    /// （REPAIR-5 不要）。ロック順は dispatcher → UART → 生存フラグ（読み取り）で、`Drop` の書き込みロックは vCPU 停止後に取られる。
+    /// ホストスレッドの `SerialConsole::push_input`（#3893）も UART の lock の下で呼ぶ（ロック順は同じ）。`hv_gic_set_spi` を
+    /// vCPU 以外のスレッドから呼べるかは未確認（#3803）。
+    pub fn serial_line(&self, layout: &Arm64Layout) -> Result<GicSerialLine, MicrovmError> {
+        let spi = layout.serial_spi().ok_or_else(|| {
+            MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "serial is not configured",
+            )
+        })?;
+        let (base, count) = self.gic.spi_range();
+        let intid = check_spi_intid(spi, base, count).map_err(|e| {
+            if e.code() == MicrovmErrorCode::InvalidArgument {
+                MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    "serial spi intid is outside the gic spi range",
+                )
+            } else {
+                e
+            }
+        })?;
+        let sink = HvfGicSink {
+            api: GicApi::get()?,
+            alive: Arc::clone(&self.alive),
+        };
+        Ok(GicSerialLine(SpiLevelLine::new(sink, intid)))
+    }
 }
 
 /// `hv_gic_set_spi` を呼ぶ [`SpiSink`]。VM の生存フラグの読み取りロックを呼び出しの間保持する。
@@ -287,5 +321,28 @@ impl InterruptLine for GicSpiLine {
 
     fn resample(&self, pending: bool) -> Result<LineResample, MicrovmError> {
         self.0.resample(pending)
+    }
+}
+
+/// シリアル（UART）の SPI を `hv_gic_set_spi` で level 駆動する [`LevelInterruptLine`]（#3892・MVM-5・MVM-1）。
+/// 呼び出し元は `crate::uart` の MMIO ラッパー（`SerialConsole::mmio_device_with_irq`）。
+#[derive(Debug, Clone)]
+pub struct GicSerialLine(SpiLevelLine<HvfGicSink>);
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<GicSerialLine>();
+};
+
+impl GicSerialLine {
+    /// 駆動する INTID（検証済み）。
+    pub fn intid(&self) -> u32 {
+        self.0.intid()
+    }
+}
+
+impl LevelInterruptLine for GicSerialLine {
+    fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+        self.0.set_level(level)
     }
 }

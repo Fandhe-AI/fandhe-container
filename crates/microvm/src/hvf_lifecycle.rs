@@ -383,6 +383,43 @@ mod tests {
         let _ = release_tx.send(());
     }
 
+    /// 渡された期限いっぱいまで待ってから失敗するデバイス（別スレッドが dispatcher をロックし続けている状況の模擬）。
+    struct LockedDevices;
+
+    impl ReleaseDevices for LockedDevices {
+        fn release_devices(&mut self, deadline: Duration) -> Result<(), MicrovmError> {
+            std::thread::sleep(deadline);
+            Err(MicrovmError::new(
+                MicrovmErrorCode::DeadlineExceeded,
+                "locked",
+            ))
+        }
+    }
+
+    /// REPAIR-5・REPAIR-12・TASK-192.16: dispatcher がロックされたままでも `stop(10ms)` は期限の近くで `TIMEOUT` を返し、
+    /// デバイス解放に固定の 1 秒（`DEVICE_RELEASE_DEADLINE`）を別枠で与えない。
+    #[test]
+    fn repair5_3798_stop_with_locked_devices_returns_near_deadline() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let r = Resources {
+            devices: LockedDevices,
+            memory: Rec("memory", Arc::clone(&log)),
+            vm: Rec("vm", Arc::clone(&log)),
+        };
+        let deadline = Duration::from_millis(10);
+        let t = std::time::Instant::now();
+        let e = stop_and_release("hvf.microvm.stop", responsive(), deadline, r).unwrap_err();
+        let took = t.elapsed();
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        assert!(
+            took < deadline + Duration::from_millis(400),
+            "took {took:?} for deadline {deadline:?}"
+        );
+        assert!(took < DEVICE_RELEASE_DEADLINE, "took {took:?}");
+        // memory は解放されずリークする。
+        assert_eq!(*log.lock().unwrap(), vec!["vm"]);
+    }
+
     /// REPAIR-5・MVM-5・TASK-192.16: デバイスの解放に失敗したら成功扱いにせず、RAM を解放しない。
     #[test]
     fn repair5_mvm5_3798_device_release_failure_is_error_and_keeps_memory() {

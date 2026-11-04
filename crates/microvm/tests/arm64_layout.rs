@@ -297,7 +297,7 @@ fn mvm5_3882_fdt_stdout_path_resolves_to_ns16550a() {
     assert_eq!(p.cells(path, "reg")[..2], [0, 0x0900_0000]);
 }
 
-/// MVM-5・MVM-1・#3864: シリアルのノードと stdout-path。
+/// MVM-5・MVM-1・#3864・#3892: シリアルのノードと stdout-path と interrupts。
 #[test]
 fn mvm5_3864_fdt_serial_and_stdout_path() {
     let l = Arm64Layout::new(256 * MIB, 1, 2)
@@ -311,7 +311,8 @@ fn mvm5_3864_fdt_serial_and_stdout_path() {
     assert_eq!(p.cells(s, "reg-shift"), vec![0]);
     assert_eq!(p.cells(s, "reg-io-width"), vec![1]);
     assert_eq!(p.cells(s, "clock-frequency"), vec![1_843_200]);
-    assert!(!p.has(s, "interrupts"));
+    // #3892: level-high の SPI 1（GIC_SPI=0・番号 1・LEVEL_HIGH=4）。
+    assert_eq!(p.cells(s, "interrupts"), vec![0, 1, 4]);
     assert_eq!(p.get("/chosen", "stdout-path"), b"/serial@9000000\0");
     assert_eq!(
         p.cells("/virtio_mmio@a000000", "reg"),
@@ -321,6 +322,27 @@ fn mvm5_3864_fdt_serial_and_stdout_path() {
         p.cells("/virtio_mmio@a000000", "interrupts"),
         vec![0, 16, 1]
     );
+}
+
+/// MVM-5・MVM-1・#3892: シリアルの SPI は virtio の SPI（16, 17, 18）と重ならない。
+#[test]
+fn mvm5_3892_fdt_serial_interrupts_disjoint_from_virtio() {
+    let l = Arm64Layout::new(256 * MIB, 1, 3)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    let p = fdt_for(&l);
+    let serial = p.cells("/serial@9000000", "interrupts");
+    assert_eq!(serial.get(1), Some(&1));
+    for (path, spi) in [
+        ("/virtio_mmio@a000000", 16),
+        ("/virtio_mmio@a000200", 17),
+        ("/virtio_mmio@a000400", 18),
+    ] {
+        let v = p.cells(path, "interrupts");
+        assert_eq!(v.get(1), Some(&spi));
+        assert_ne!(v.get(1), serial.get(1));
+    }
 }
 
 /// MVM-5・#3864: 既定ではシリアルを載せない。

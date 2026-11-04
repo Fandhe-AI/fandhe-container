@@ -92,6 +92,30 @@ pub fn read_register_value(
     Ok(Some(value))
 }
 
+/// data abort を MMIO として扱ってよいか検査する（MVM-5・MVM-1・fail-closed）。
+///
+/// MMIO 窓は stage-2 に未マップなので、正当な MMIO の abort は translation fault（DFSC 0b0001LL、
+/// level 0..=3）だけである。S1PTW 付き、および permission fault・access flag fault 等
+/// （例: 読み取り専用で登録した RAM への書き込み）は MMIO として握りつぶさず `FailedPrecondition` で止める。
+pub fn ensure_mmio_fault(abort: &DataAbort) -> Result<(), MicrovmError> {
+    if abort.s1ptw {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "data abort during stage-1 page table walk is not emulated",
+        ));
+    }
+    if !(0x04..=0x07).contains(&abort.dfsc) {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            format!(
+                "data abort is not a stage-2 translation fault (dfsc=0x{:02x}); not emulated as mmio",
+                abort.dfsc
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// faulting 命令の次の PC。命令長は ESR の IL。桁あふれは `Internal`（wrap しない）。
 pub fn next_pc(pc: u64, syndrome: u64) -> Result<u64, MicrovmError> {
     pc.checked_add(esr::instruction_length(syndrome).bytes())
@@ -114,6 +138,25 @@ mod tests {
             EsrClass::DataAbort(d) => d,
             other => panic!("expected DataAbort, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mvm5_mmio_fault_allows_translation_faults_only() {
+        // DFSC 0x04..=0x07（translation fault level 0..=3）は MMIO として許可する。
+        for dfsc in 0x04..=0x07u64 {
+            assert!(ensure_mmio_fault(&dabt(0x9300_0000 | dfsc)).is_ok());
+        }
+        // permission fault（level 3 = 0x0f。READ のみ登録の RAM への書き込み）は拒否する。
+        let e = ensure_mmio_fault(&dabt(0x9300_004f)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+        // access flag fault（0x09）・alignment（0x21）・synchronous external abort（0x10）も拒否する。
+        for dfsc in [0x09u64, 0x10, 0x21, 0x00, 0x08, 0x0c] {
+            let e = ensure_mmio_fault(&dabt(0x9300_0000 | dfsc)).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+        }
+        // S1PTW（bit 7）付きは translation fault でも拒否する。
+        let e = ensure_mmio_fault(&dabt(0x9300_0086)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
     }
 
     #[test]

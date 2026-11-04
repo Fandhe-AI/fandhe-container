@@ -31,7 +31,7 @@
 //! exit は fail-closed の `Failed(Unimplemented / Internal)`）で、[`HvfStopReport`] に載せる。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
-//! 1. 停止要求 → kick（`hv_vcpus_exit`。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
+//! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを起こす `WfiWaker` の通知。#3887。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
 //! 2. owning thread が自分の vCPU を `hv_vcpu_destroy` し（vCPU はスレッドに束縛され、他スレッドからは破棄できない）、捕捉していた
 //!    `Arc<VmWithGic>` を落として報告を送る。報告を受けた時点で vCPU の破棄は済んでいる。
 //! 3. 報告が `Ok` のときだけ、デバイス → ゲスト RAM（`hv_vm_unmap` に成功したら munmap。失敗ならリーク）→ VM（最後の `Arc` の drop が
@@ -531,7 +531,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes()),
                 hvc: HvcHandler::new(),
-                timer: TimerHandler::new(),
+                timer: TimerHandler::with_waker(vm.wfi_waker()),
             },
             vcpu,
         )?;

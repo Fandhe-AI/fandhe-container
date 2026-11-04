@@ -6,8 +6,9 @@
 //!
 //! # 契約
 //! - WFI: ゲストの次のタイマー期限（`CNTV_CVAL_EL0`・vtimer offset・ホストのカウンタから計算）まで
-//!   ホスト側で待つ。1 回の待ちは `WFI_WAIT_MAX`（10 ms）で頭打ちで、**これが停止要求の応答時間を決める唯一の値**
-//!   （本ハンドラは停止フラグにも kick にも触れられず、kick はホストの sleep を起こさない。REPAIR-5）。
+//!   ホスト側で待つ。待ちは `WfiWaker`（`hvf_wake`）で、SPI の注入成功（`hvf::gic` の sink）と停止要求の kick
+//!   （`WakingKick`）が即座に起こす（#3887）。1 回の待ちは `WFI_WAIT_MAX`（10 ms）で頭打ちで、これは通知されない
+//!   起床要因（framework 側で pending になる PPI 等）の安全網である（REPAIR-5）。
 //! - WFE / WFIT / WFET: 待たずに戻る。WFIT は期限レジスタ（Rt）を読まず CNTV の状態だけで待つと、
 //!   CNTV 無効かつ期限超過でも sleep して契約を破るため、期限の取得に対応するまで即時再開する
 //!   （WFIT の spurious な早期再開はアーキテクチャ上許される）。
@@ -21,8 +22,8 @@
 //!   根拠は `GicApi` に PPI を操作する API が無いことと `hv_gic_get_intid(EL1_VIRTUAL_TIMER)` が存在すること。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
-//! (a) 待っている最中の SPI の注入（`GicSpiLine::trigger`）では起きず、最大で `WFI_WAIT_MAX` 遅れる。
-//! (b) 停止要求でも直接は起きず、上限で戻ってから実行ループの先頭で `Requested` になる。
+//! (a)(b) 待ち中の SPI の注入と停止要求で起きない問題は #3887 で解消済み。残余: 走行中に届いた通知は 1 回の早期再開を
+//!     起こす（許される範囲）。1 つの waker は vCPU 1 台前提で、SMP は vCPU ごとの waker が要る（#3864 の後続）。
 //! (c) mask の解除は `hv_vcpu_run` の再入直前（`sync_before_run`）にも確認する。ただし線が立っている間は外せず、
 //!     ゲストが CVAL を進める等で線が下がった後の次の再入（exit か実行期限）で外れる。
 //! (d) #3803 で確定させる観測事項: GIC あり構成で PPI が自動で pending になるか、`VTIMER_ACTIVATED` が起きるか、
@@ -35,6 +36,7 @@ use crate::hvf_abi::{
     wfi_wait_plan,
 };
 use crate::hvf_loop::ExitAction;
+use crate::hvf_wake::{WakeOutcome, WfiWaker};
 use crate::sys::HvVcpu;
 use crate::sys::{host_absolute_time, host_timebase};
 
@@ -43,6 +45,8 @@ use crate::sys::{host_absolute_time, host_timebase};
 pub struct TimerStats {
     /// WFI で実際に sleep した回数。
     pub wfi_waits: u64,
+    /// 待ちのうち通知（SPI の注入・停止要求）で起きた回数（#3887。REPAIR-4）。
+    pub wfi_woken: u64,
     /// WFI で待たずに戻った回数。
     pub wfi_immediate: u64,
     /// `VTIMER_ACTIVATED` の回数。
@@ -56,6 +60,8 @@ pub struct TimerStats {
 pub struct TimerHandler {
     vtimer_masked: bool,
     stats: TimerStats,
+    /// WFI の待ちを起こす通知口。`new()` では誰からも通知されない専用のもの（従来の sleep と同じ挙動）。
+    waker: WfiWaker,
 }
 
 const _: () = {
@@ -67,6 +73,19 @@ impl TimerHandler {
     /// 空のハンドラを作る（失敗しない）。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 通知口を指定して作る（VM の `VmWithGic::wfi_waker` を渡す。#3887）。
+    pub fn with_waker(waker: WfiWaker) -> Self {
+        Self {
+            waker,
+            ..Self::default()
+        }
+    }
+
+    /// 通知口を差し替える（`hvf::vcpu` が VM の通知口へ結ぶ）。
+    pub(crate) fn set_waker(&mut self, waker: WfiWaker) {
+        self.waker = waker;
     }
 
     /// 観測用の計数。
@@ -129,7 +148,9 @@ pub fn handle_wfx(
             handler.stats.wfi_immediate = handler.stats.wfi_immediate.saturating_add(1);
         } else {
             handler.stats.wfi_waits = handler.stats.wfi_waits.saturating_add(1);
-            std::thread::sleep(plan.wait);
+            if handler.waker.wait(plan.wait) == WakeOutcome::Notified {
+                handler.stats.wfi_woken = handler.stats.wfi_woken.saturating_add(1);
+            }
         }
     }
     let pc = vcpu.get_reg(HvReg::PC)?;

@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -1584,8 +1584,196 @@ fn hvf_device_vtimer_wakes_wfi() {
     let t = Instant::now();
     let report = handle.stop(Duration::from_secs(1)).unwrap();
     assert_eq!(report.reason, StopReason::Requested);
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let stop_elapsed = t.elapsed();
+    // 停止要求が WFI の待ちを起こす(#3887)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら #3803 で切り分けて緩める。
+    eprintln!(
+        "hvf_device: vtimer: stop_elapsed_us={}",
+        stop_elapsed.as_micros()
+    );
+    assert!(stop_elapsed < Duration::from_secs(1), "{stop_elapsed:?}");
+    assert!(
+        stop_elapsed < fandhe_container_microvm::hvf_abi::WFI_WAIT_MAX,
+        "{stop_elapsed:?}"
+    );
     assert_eq!(counts.count(ExitKind::Vtimer), 0);
+
+    mapping.unmap().unwrap();
+    drop(vm);
+}
+/// `hvf_device_spi_wakes_wfi` の標本数と全体期限。
+const SPI_WAKE_SAMPLES: usize = 12;
+const SPI_WAKE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// WFI の待ちが SPI の注入で起きること（#3887・MVM-5・MVM-1・REPAIR-5）。
+/// `SPI_GUEST_CODE` の末尾（EOIR）の後ろへ「`wfi` へ戻る `b`」を足し、INTID 48 を繰り返し受けられるゲストにする。
+/// CNTV は無効のままなので、各 WFI の待ちは `WFI_WAIT_MAX`（10 ms）の上限になる。非 vCPU スレッドから `GicSpiLine::trigger` を
+/// 呼び、その時刻からゲストが INTID を MMIO 窓へ書くまでの遅れを測る。修正前は 0〜10 ms の一様分布のため、
+/// 全標本が `WFI_WAIT_MAX` 未満に加えて中央値が `WFI_WAIT_MAX / 2` 未満であることも照合する（判別力のため。
+/// 実機で不安定なら #3803 で緩める）。`VcpuThread` と本物のハンドラを使う（`TimerHandler::new()` でも VM の通知口へ結ばれる）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_spi_wakes_wfi() {
+    use fandhe_container_microvm::dispatch::{ExitDispatcher, MmioDevice};
+    use fandhe_container_microvm::hvf::hvc::HvcHandler;
+    use fandhe_container_microvm::hvf::mmio::MmioHandler;
+    use fandhe_container_microvm::hvf::timer::TimerHandler;
+    use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
+    use fandhe_container_microvm::hvf_abi::WFI_WAIT_MAX;
+    use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
+    use fandhe_container_microvm::stop::StopReason;
+    use fandhe_container_microvm::virtio_mmio::{MmioReadOutcome, MmioWriteOutcome};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const BASE: u64 = 0x4000_0000;
+    const WINDOW: u64 = 0x0a00_0000;
+
+    /// 書き込みの時刻と値を記録する観測器（件数の上限つき）。
+    struct Recorder(Arc<Mutex<Vec<(Instant, u32)>>>);
+    impl MmioDevice for Recorder {
+        fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+            data.fill(0);
+            MmioReadOutcome::Handled
+        }
+        fn write(&mut self, _offset: u64, data: &[u8]) -> MmioWriteOutcome {
+            let now = Instant::now();
+            let mut v = [0u8; 4];
+            for (d, s) in v.iter_mut().zip(data.iter()) {
+                *d = *s;
+            }
+            let mut g = self.0.lock().unwrap();
+            if g.len() < SPI_WAKE_SAMPLES + 4 {
+                g.push((now, u32::from_le_bytes(v)));
+            }
+            MmioWriteOutcome::Handled
+        }
+    }
+
+    let finished = Arc::new(AtomicBool::new(false));
+    struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = {
+        let flag = Arc::clone(&finished);
+        let h = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < SPI_WAKE_DEADLINE {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+        WatchdogGuard(Arc::clone(&finished), Some(h))
+    };
+
+    let layout = Arm64Layout::new(4 << 20, 1, 1).unwrap();
+    // ゲストコードに固定した値と配置の一致。
+    assert_eq!(layout.gic_dist.base.raw(), 0x0800_0000);
+    assert_eq!(layout.gic_redist.base.raw(), 0x0820_0000);
+    assert_eq!(layout.virtio_mmio_window(0).unwrap().base.raw(), WINDOW);
+    assert_eq!(layout.ram.base.raw(), BASE);
+    let vm = Arc::new(create_vm_with_gic_or_precondition(&layout));
+    let line = vm.spi_line(&layout, 0).unwrap();
+    assert_eq!(line.intid(), 48);
+
+    // ゲスト = SPI_GUEST_CODE + `b loop`。`b` の imm26 は (loop の命令番号 - `b` の命令番号)（命令数単位、負は 26 ビットの 2 の補数）。
+    const WFI: u32 = 0xD503_207F;
+    let loop_idx = SPI_GUEST_CODE.iter().position(|w| *w == WFI).unwrap() as i64;
+    let b_idx = SPI_GUEST_CODE.len() as i64;
+    let b_word = 0x1400_0000u32 | (((loop_idx - b_idx) as u32) & 0x03ff_ffff);
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in SPI_GUEST_CODE.iter().chain([&b_word]).enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut dispatcher = ExitDispatcher::new();
+    dispatcher
+        .register_mmio(WINDOW, 0x200, Box::new(Recorder(Arc::clone(&records))))
+        .unwrap();
+    let handlers = ExitHandlers {
+        mmio: MmioHandler::with_dispatcher(dispatcher),
+        hvc: HvcHandler::new(),
+        timer: TimerHandler::new(),
+    };
+    let counts = Arc::new(ExitCounts::new());
+    let config = VcpuThreadConfig {
+        observer: Some(counts.clone()),
+        ..VcpuThreadConfig::default()
+    };
+    let setup = |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
+        vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))?;
+        vcpu.set_reg(HvReg::PC, BASE)?;
+        vcpu.set_reg(HvReg::CPSR, 0x3c5)
+    };
+    let handle = VcpuThread::spawn(Arc::clone(&vm), setup, handlers, config).unwrap();
+
+    // 次の WFI の exit を待つ（observer は dispatch の前に呼ばれ、待ちの開始の直前に当たる）。
+    let wait_wfx_after = |prev: u64| {
+        let t = Instant::now();
+        while counts.count(ExitKind::Wfx) <= prev && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        assert!(
+            counts.count(ExitKind::Wfx) > prev,
+            "guest never reached wfi"
+        );
+    };
+    let mut delays: Vec<Duration> = Vec::new();
+    let mut prev_wfx = 0;
+    for i in 0..SPI_WAKE_SAMPLES {
+        wait_wfx_after(prev_wfx);
+        let l2 = line.clone();
+        let sent = std::thread::spawn(move || {
+            let at = Instant::now();
+            l2.trigger().unwrap();
+            at
+        })
+        .join()
+        .unwrap();
+        let t = Instant::now();
+        let got = loop {
+            if let Some(&(at, v)) = records.lock().unwrap().get(i) {
+                break (at, v);
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "hvf_device: spi_wake: guest did not take sample {i}"
+            );
+            std::thread::sleep(Duration::from_micros(100));
+        };
+        assert_eq!(got.1, 48, "spurious or wrong intid at sample {i}");
+        delays.push(got.0.saturating_duration_since(sent));
+        prev_wfx = counts.count(ExitKind::Wfx);
+    }
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+
+    delays.sort();
+    let p50 = delays[delays.len() / 2];
+    let max = *delays.last().unwrap();
+    eprintln!(
+        "hvf_device: spi_wake: samples={} p50_us={} max_us={}",
+        delays.len(),
+        p50.as_micros(),
+        max.as_micros()
+    );
+    assert!(max < WFI_WAIT_MAX, "max delay {max:?} >= WFI_WAIT_MAX");
+    assert!(
+        p50 < WFI_WAIT_MAX / 2,
+        "p50 delay {p50:?} >= WFI_WAIT_MAX / 2 (spi did not wake the wfi wait)"
+    );
 
     mapping.unmap().unwrap();
     drop(vm);

@@ -358,7 +358,7 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
 /// MP テーブルでゲストが IOAPIC モードになると Linux は IRQ 0 の `check_timer` を走らせるが、この VM には PIT も
 /// タイマー割り込みの注入経路も無く検査に失敗して起動できない。そのため `microvm.rs` の `load_kernel` が
 /// 常に付ける。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
-pub fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
+pub(crate) fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
     // 公開 API の直接呼び出しでも、複製の前に上限を超える入力を拒否する（確保の無制限化を防ぐ）。
     if user.len() as u64 >= CMDLINE_CAPACITY {
         return Err(invalid("kernel command line too long"));

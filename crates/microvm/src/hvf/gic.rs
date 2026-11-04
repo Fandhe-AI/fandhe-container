@@ -41,7 +41,8 @@
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
-//! SMP（AP の起動。`MPIDR_EL1` の実設定は #3797 の `HvfMicroVm::assemble` が vCPU 0 の `setup` で行う）・MSI・
+//! SMP の AP の起動（CPU_ON。#3891。AP の作成と `MPIDR_EL1` の設定・照合は #3884 の `VcpuThread::spawn_parked_ap`、vCPU 0 は
+//! #3797 の `HvfMicroVm::assemble`）・MSI・
 //! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・SDK ヘッダとの値の照合（#3803）・
 //! vCPU の個別 drop（本 crate では持たない。破棄は teardown の一部としてだけ起き、`mark_teardown` の後の再作成を拒否する。#3798）。`unsafe` は持たない。
 //!

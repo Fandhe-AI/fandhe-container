@@ -16,7 +16,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! FDT は `method = "hvc"` のため SMC はゲストの誤りで NOT_SUPPORTED を返す。HVF が SMC で exit するか（HCR_EL2.TSC の扱い）は
-//! 未確認で #3803 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。
+//! 未確認で #3803 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。N 台構成（#3884）では BSP のハンドラが `PsciCpus::new(N)` と `BootCpuOnly` を持つため、CPU_ON(1..N) は `power_on` に届いて `Failed(Unimplemented)`（状態は OFF へ戻り、ゲストへは INTERNAL_FAILURE が返る。推測で成功にしない）。
 //! AP の実起動と CPU_OFF 後の parked への戻しは #3891 で結ぶ（CPU_OFF 成功の `PsciAction::CpuOff` は現状 `Err` で fail-closed。`crate::psci` の doc 参照）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};

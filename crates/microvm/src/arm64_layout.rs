@@ -16,7 +16,7 @@
 //!
 //! SMP とシリアル（#3864・MVM-5・MVM-1）:
 //! - `cpus` には vCPU 数ぶんの `cpu@N` を出す。`reg` は [`arm64_vcpu_mpidr_affinity`]（Aff0 = n % 16、Aff1 = n / 16）。
-//!   将来 HVF で SMP を作るときは、vCPU n の `MPIDR_EL1` にこの値を書く（GICv3 は redistributor を `GICR_TYPER` の
+//!   HVF は vCPU n の `MPIDR_EL1` にこの値を書いて読み戻し照合する（#3884。GICv3 は redistributor を `GICR_TYPER` の
 //!   affinity で引くため、FDT の値と一致している必要がある）。上限は [`ARM64_MAX_VCPUS`]。
 //! - シリアルは `layout.serial` が `Some` のときだけ、8250 互換（`ns16550a`・`reg-shift = 0`・`reg-io-width = 1`）の
 //!   MMIO ノードと `/chosen/stdout-path` を出す（実体の無いデバイスを FDT に載せない）。モデルは
@@ -26,8 +26,9 @@
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
 //!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
-//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・`HVF_MAX_VCPUS` の引き上げ・PSCI の実起動の結線〔状態機械は `psci.rs`。#3883・結線は #3884 / #3891〕。バックエンドは 1 vCPU のまま。
-//! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
+//! 未実装（REPAIR-3）: HVF の AP の実起動（PSCI の結線〔状態機械は `psci.rs`。#3883・結線は #3891〕）。vCPU 1..N のスレッドと
+//! `HVF_MAX_VCPUS` の引き上げは #3884 で実装済みで、AP は parked のまま起動されない。N 個の cpu を持つ FDT が実ゲストに届くと
+//! Linux は CPU_ON(n) の失敗で「failed to boot CPUn」を出して 1 CPU で動き続ける。
 //! PCI・IPA 上限の確定（#3803）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
@@ -600,7 +601,7 @@ fn reg_cells(regions: &[(u64, u64)]) -> Vec<u32> {
 /// arm64 ゲスト向けの FDT を組み立てる（ルート・chosen・memory・cpus・psci・GICv3・timer・シリアル・virtio-mmio）。
 ///
 /// `InvalidArgument`: 配置の違反（vCPU 数の上限超過を含む）・bootargs 超過・initrd が RAM の外。
-/// `cpu@N` は vCPU 数ぶん出す（HVF のバックエンドは 1 vCPU のまま。REPAIR-3）。
+/// `cpu@N` は vCPU 数ぶん出す（HVF の AP は parked で、起動は #3891。REPAIR-3）。
 /// `layout.serial` が `Some` のときだけ、シリアルのノードと `/chosen/stdout-path` を出す（`None` は従来と同じ出力）。
 pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmError> {
     let l = config.layout;

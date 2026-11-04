@@ -6,14 +6,18 @@
 //! 呼び出し元は plugin-microvm（#3800）。start / stop の API は #3798（モジュール doc の「start / stop と解放順序」）。
 //!
 //! # 組み立ての順序（[`HvfMicroVm::assemble`]）
-//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。`config.serial` と `layout.serial` を突き合わせ（#3882）、virtio + シリアルが MMIO 表の上限（`MAX_BUS_DEVICES`）を超える構成もここで拒否する。vcpus 2 以上は `Unimplemented`（FDT 側は N 個を出せる。backend は 1。#3864）。
+//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。`config.serial` と `layout.serial` を突き合わせ（#3882）、virtio + シリアルが MMIO 表の上限（`MAX_BUS_DEVICES`）を超える構成もここで拒否する。vcpus は 1 以上 `HVF_MAX_VCPUS`（32）以下で、構成の `vcpus` と `layout.vcpus` の一致も検査する（#3884）。
 //! 2. VM + GIC（`VmWithGic::create`。GIC の配置違反は VM を作る前に拒否される）。
 //! 3. ゲスト RAM の登録（`HvfGuestRam::register_shared`。対応付けが `Arc<HvVm>` を保持する）。
 //! 4. Image・initrd・FDT の配置（`load_arm64`。Image ヘッダの検証はここ）。
 //! 5. virtio-mmio のデバイス群を `ExitDispatcher` に登録し、各デバイスの割り込みを `GicSpiLine` に結ぶ（block → net → シリアルの順。シリアルは `layout.serial` があるときだけ。THRE 割り込みは level の SPI で結ぶ。#3882・#3892）。
 //!    線の注入方式が FDT の trigger と一致するかをここで照合し（不一致は `InvalidArgument`）、`InterruptACK` の後処理
 //!    （level 扱いの deassert / resample。#3863）の route を `MmioHandler` へ結ぶ。
-//! 6. vCPU スレッドの作成。vCPU 0 の `setup` で X0 = FDT の GPA・X1〜X3 = 0・PC = カーネルのエントリ・CPSR = `0x3c5`・
+//! 6. vCPU スレッドの作成（#3884）。まず vCPU 0 を `spawn_gated` で作り、続けて vCPU 1..N（AP）を `spawn_parked_ap` で順に作る。
+//!    全 vCPU の作成は start より前に終わる（vCPU が走り出すとトポロジーは確定する、に反しない）。途中の失敗は、作成済みの全台を
+//!    `stop_all` で回収してから返す。AP は `MPIDR_EL1` に `arm64_vcpu_mpidr_affinity(n)` を書いて照合し、起動要求まで parked で待つ
+//!    （CPU_ON による実起動は #3891。それまでゲストの CPU_ON(1..N) は `BootCpuOnly` により失敗の戻り値になる）。
+//!    vCPU 0 の `setup` で X0 = FDT の GPA・X1〜X3 = 0・PC = カーネルのエントリ・CPSR = `0x3c5`・
 //!    MPIDR_EL1 = FDT の `cpu@0` の `reg` を書き、読み戻して照合する。`SCTLR_EL1` は書かず、既定値で MMU・D-cache が off
 //!    （M = 0・C = 0）であることだけを確かめる（違反は `FailedPrecondition`）。
 //!
@@ -34,6 +38,7 @@
 //! 1. 停止要求 → kick（`hv_vcpus_exit`。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
 //! 2. owning thread が自分の vCPU を `hv_vcpu_destroy` し（vCPU はスレッドに束縛され、他スレッドからは破棄できない）、捕捉していた
 //!    `Arc<VmWithGic>` を落として報告を送る。報告を受けた時点で vCPU の破棄は済んでいる。
+//!    vCPU は N 台あり、parked の AP も同じく owning thread が破棄する。報告は「N 台すべてが破棄済み」のときだけ `Ok`（`stop_all`）。
 //! 3. 報告が `Ok` のときだけ、デバイス → ゲスト RAM（`hv_vm_unmap` に成功したら munmap。失敗ならリーク）→ VM（最後の `Arc` の drop が
 //!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
 //!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
@@ -61,7 +66,8 @@
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当は
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
-//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。vCPU 1..N の停止の集約を含む。#3864 の後続）、シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
+//!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止は #3891。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
@@ -82,13 +88,14 @@ use crate::hvf::hvc::HvcHandler;
 use crate::hvf::memory::{HvfGuestRam, RegisteredHvfRam};
 use crate::hvf::mmio::MmioHandler;
 use crate::hvf::timer::TimerHandler;
-use crate::hvf::vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
+use crate::hvf::vcpu::{ExitHandlers, VcpuSet, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
 use crate::hvf_lifecycle::{
-    DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, stop_and_release,
+    DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, VcpuStopper, stop_and_release,
 };
 use crate::hvf_loop::log_line;
 use crate::interrupt::{BoundAckRoute, InterruptAckRoute, InterruptLine};
+use crate::psci::{BootCpuOnly, PsciCpus};
 use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
@@ -112,6 +119,8 @@ pub struct HvfNetDeviceConfig<N> {
 pub struct HvfMicroVmConfig<B, N> {
     /// ゲストの物理アドレス配置（vCPU 数・RAM の大きさ・virtio-mmio の個数）。
     pub layout: Arm64Layout,
+    /// vCPU 数（1 以上 `HVF_MAX_VCPUS` 以下）。`layout.vcpus`（FDT の `cpu@N` の個数）と一致すること（#3884）。
+    pub vcpus: u32,
     /// カーネル Image（arm64 Linux Image 形式）。
     pub kernel: Vec<u8>,
     /// initrd。
@@ -367,7 +376,13 @@ impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
 /// 組み立て済みの microVM が持つ資源と観測用の値。`Drop` が [`stop_and_release`] を drop 用の期限で呼ぶ（`HvfMicroVm` と
 /// `RunningHvfMicroVm` が共有する。モジュール doc の「解放順序」）。資源は `Option` で、`release` が 1 回だけ取り出す。
 struct HvfVmParts<B: BlockBackend, N: NetBackend> {
-    vcpu: Option<VcpuHandle>,
+    /// vCPU 0（BSP）と parked の AP（#3884）。
+    vcpus: Option<VcpuSet>,
+    /// PSCI の電源状態の表。BSP のハンドラが持つのと同じ実体で、AP の起動（#3891）が共有する。
+    #[allow(dead_code)]
+    psci: Arc<PsciCpus>,
+    /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
+    mpidrs: Vec<u64>,
     devices: Option<HvfDeviceBus<B, N>>,
     memory: Option<GuestMemory<RegisteredHvfRam<'static>>>,
     vm: Option<Arc<VmWithGic>>,
@@ -387,8 +402,8 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
         op: &'static str,
         deadline: Duration,
     ) -> Result<HvfStopReport, MicrovmError> {
-        let (Some(vcpu), Some(devices), Some(memory), Some(vm)) = (
-            self.vcpu.take(),
+        let (Some(vcpus), Some(devices), Some(memory), Some(vm)) = (
+            self.vcpus.take(),
             self.devices.take(),
             self.memory.take(),
             self.vm.take(),
@@ -400,7 +415,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
         };
         stop_and_release(
             op,
-            vcpu,
+            vcpus,
             deadline,
             Resources {
                 devices,
@@ -419,14 +434,14 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
     }
 
     fn is_finished(&self) -> bool {
-        self.vcpu.as_ref().is_none_or(VcpuHandle::is_finished)
+        self.vcpus.as_ref().is_none_or(VcpuSet::is_finished)
     }
 }
 
 impl<B: BlockBackend, N: NetBackend> Drop for HvfVmParts<B, N> {
     /// stop を経ない drop も同じ手順を期限つき（[`DROP_STOP_DEADLINE`]）で行う。期限切れは `level=error` で記録される。
     fn drop(&mut self) {
-        if self.vcpu.is_some() {
+        if self.vcpus.is_some() {
             let _ = self.release("hvf.microvm.drop", DROP_STOP_DEADLINE);
         }
     }
@@ -463,6 +478,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
     pub fn assemble(config: HvfMicroVmConfig<B, N>) -> Result<Self, MicrovmError> {
         let HvfMicroVmConfig {
             layout,
+            vcpus,
             kernel,
             initrd,
             cmdline,
@@ -477,7 +493,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             layout.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
         }
         check_assemble_input(&HvfAssembleInput {
-            vcpus: layout.vcpus,
+            vcpus,
+            layout_vcpus: layout.vcpus,
             ram_size: layout.ram.size,
             layout_virtio_count: layout.virtio_mmio_count,
             device_count: block.len().saturating_add(net.len()),
@@ -500,6 +517,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             load_arm64(&mut memory, &kernel, initrd.as_deref(), &cmdline, &layout)?;
         let devices = HvfDeviceBus::new(&layout, &vm, block, net)?;
 
+        let psci = Arc::new(PsciCpus::new(layout.vcpus)?);
+        let ap_config = vcpu.clone();
         let readback: Arc<OnceLock<ArmBootReadback>> = Arc::new(OnceLock::new());
         let slot = Arc::clone(&readback);
         let handle = VcpuThread::spawn_gated(
@@ -530,25 +549,42 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             ExitHandlers {
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes()),
-                hvc: HvcHandler::new(),
+                hvc: HvcHandler::with_cpus(Arc::clone(&psci), Arc::new(BootCpuOnly), 0)?,
                 timer: TimerHandler::new(),
             },
             vcpu,
         )?;
+        let mut vcpu_set = VcpuSet::new(handle);
         let boot = match readback.get() {
             Some(b) => *b,
             None => {
                 // 想定外（setup は成功で戻った）。ゲートを開けずに止める（ゲストは走らない）。
-                let _ = handle.stop(DROP_STOP_DEADLINE);
+                let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
                 return Err(internal("boot readback was not recorded"));
             }
         };
+        // AP（vCPU 1..N）を parked で作る。途中で失敗したら、作成済みの全台を回収してから返す（残りの資源は逆順 drop）。
+        let mut mpidrs = vec![boot.mpidr];
+        for index in 1..layout.vcpus {
+            match VcpuThread::spawn_parked_ap(Arc::clone(&vm), index, &ap_config) {
+                Ok((ap, raw)) => {
+                    vcpu_set.push_ap(ap);
+                    mpidrs.push(raw);
+                }
+                Err(e) => {
+                    let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+                    return Err(e);
+                }
+            }
+        }
         let dispatcher = Arc::clone(&devices.dispatcher);
         let infos = devices.infos();
         let serial = devices.serial.as_ref().map(|s| s.console.clone());
         Ok(HvfMicroVm {
             parts: HvfVmParts {
-                vcpu: Some(handle),
+                vcpus: Some(vcpu_set),
+                psci,
+                mpidrs,
                 devices: Some(devices),
                 memory: Some(memory),
                 vm: Some(vm),
@@ -570,7 +606,8 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
     /// ある。その場合も `start` は成功し、終了理由（`Failed(DeadlineExceeded)`）は `stop` の報告に出る。
     pub fn start(self) -> Result<RunningHvfMicroVm<B, N>, MicrovmError> {
         let started = Instant::now();
-        match &self.parts.vcpu {
+        // 開けるのは vCPU 0 の gate だけ。AP は CPU_ON（#3891）まで parked のまま。
+        match &self.parts.vcpus {
             Some(v) => v.open_start(),
             None => {
                 return Err(MicrovmError::new(
@@ -599,6 +636,11 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
     /// vCPU 0 の `setup` で書いて読み戻した起動レジスタ（MPIDR_EL1・SCTLR_EL1 は生の値。記録は #3803）。
     pub fn boot_registers(&self) -> &ArmBootReadback {
         &self.parts.boot
+    }
+
+    /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順。`[0]` は `boot_registers().mpidr` と同じ。記録は #3803）。
+    pub fn vcpu_mpidrs(&self) -> &[u64] {
+        &self.parts.mpidrs
     }
 
     /// 登録済みの virtio デバイスの配置（block → net の順）。シリアルは含まない（`serial_console` を参照）。
@@ -677,6 +719,11 @@ impl<B: BlockBackend, N: NetBackend> RunningHvfMicroVm<B, N> {
     /// vCPU 0 の起動レジスタの読み戻し値。
     pub fn boot_registers(&self) -> &ArmBootReadback {
         &self.parts.boot
+    }
+
+    /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
+    pub fn vcpu_mpidrs(&self) -> &[u64] {
+        &self.parts.mpidrs
     }
 
     /// 登録済みデバイスの配置（block → net の順）。

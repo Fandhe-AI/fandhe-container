@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_microvm::dispatch::{
     DispatchOutcome, ExitDispatcher, PortIoDevice, PortIoOutcome,
 };
+use fandhe_container_microvm::error::MicrovmError;
 use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+use fandhe_container_microvm::interrupt::{IrqLevel, LevelInterruptLine};
 use fandhe_container_microvm::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN, Uart16550};
 
 struct Shared(Arc<Mutex<Uart16550>>);
@@ -119,4 +121,65 @@ fn mvm1_3740_serial_console_clone_shares_buffer() {
     assert_eq!(a.take_output().unwrap(), b"xy");
     assert!(b.take_output().unwrap().is_empty());
     assert_eq!(format!("{a:?}"), "SerialConsole { .. }");
+}
+
+#[derive(Debug, Default)]
+struct RecordingLine(Mutex<Vec<IrqLevel>>);
+
+impl LevelInterruptLine for RecordingLine {
+    fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+        self.0.lock().unwrap().push(level);
+        Ok(())
+    }
+}
+
+/// ExitDispatcher 経由の MMIO で 1 バイト読む / 書く。
+fn mmio(d: &mut ExitDispatcher, base: u64, off: u64, write: Option<u8>) -> Option<u8> {
+    let mut data = [0u8; 8];
+    if let Some(v) = write {
+        data[0] = v;
+    }
+    let exit = VcpuExit::Mmio {
+        phys_addr: base + off,
+        data,
+        len: 1,
+        is_write: write.is_some(),
+    };
+    let out = d.dispatch(&exit).unwrap();
+    if write.is_some() {
+        None
+    } else {
+        Some(out.read_response().unwrap()[0])
+    }
+}
+
+/// MVM-5・MVM-1・REPAIR-12・#3893: 公開 API の push_input で入れた入力を、ディスパッチャ経由で
+/// IIR・LSR・RBR として読め、受信割り込み線が立ち、読み切りで下がる（偽の線。実機不要）。
+#[test]
+fn mvm5_3893_push_input_via_dispatcher_raises_and_clears_line() {
+    const BASE: u64 = 0x0900_0000;
+    let console = SerialConsole::new();
+    let line = Arc::new(RecordingLine::default());
+    let mut d = ExitDispatcher::new();
+    d.register_mmio(BASE, 8, console.mmio_device_with_irq(line.clone()))
+        .unwrap();
+    let calls = || line.0.lock().unwrap().clone();
+
+    mmio(&mut d, BASE, 1, Some(0x01));
+    assert!(calls().is_empty());
+    assert_eq!(mmio(&mut d, BASE, 5, None), Some(0x60));
+
+    let report = console.push_input(b"ok").unwrap();
+    assert_eq!(report.accepted, 2);
+    assert_eq!(calls(), vec![IrqLevel::High]);
+    assert_eq!(mmio(&mut d, BASE, 2, None), Some(0x04));
+    assert_eq!(mmio(&mut d, BASE, 5, None), Some(0x61));
+
+    assert_eq!(mmio(&mut d, BASE, 0, None), Some(b'o'));
+    assert_eq!(calls(), vec![IrqLevel::High]);
+    assert_eq!(mmio(&mut d, BASE, 0, None), Some(b'k'));
+    assert_eq!(calls(), vec![IrqLevel::High, IrqLevel::Low]);
+    assert_eq!(mmio(&mut d, BASE, 5, None), Some(0x60));
+    assert_eq!(mmio(&mut d, BASE, 2, None), Some(0x01));
+    assert_eq!(console.stats().unwrap().input_read_bytes, 2);
 }

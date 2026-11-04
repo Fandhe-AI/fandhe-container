@@ -28,7 +28,7 @@
 //!
 //! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・`HVF_MAX_VCPUS` の引き上げ・PSCI の実起動の結線〔状態機械は `psci.rs`。#3883・結線は #3884 / #3891〕。バックエンドは 1 vCPU のまま。
 //! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
-//! シリアルのゲスト入力（#3893）・PCI・IPA 上限の確定（#3803）。
+//! PCI・IPA 上限の確定（#3803）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を

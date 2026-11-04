@@ -1348,6 +1348,8 @@ impl Drop for RegisteredPage<'_> {
 /// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` のゼロ埋め私有メモリで、`MADV_DONTFORK` により fork 先へ
 /// 引き継がない（ゲストメモリの内容を子プロセスへ漏らさない）。KVM へ登録した後はゲスト（vCPU）がいつでも
 /// 書き換えるため、`&[u8]` / `&mut [u8]` は作らず、範囲検査つきのバイト単位の volatile 読み書きだけで触る。
+/// 例外は virtqueue の共有 index（`avail.idx`・`used.idx`）用の整列した u16 の単一命令 volatile アクセス
+/// （`read_u16_le_aligned` / `write_u16_le_aligned`。#3862・MVM-1・MVM-5。tear を避けるため）。
 #[derive(Debug)]
 pub(crate) struct GuestRamMap {
     ptr: NonNull<u8>,
@@ -1433,6 +1435,42 @@ impl GuestRamMap {
             // `self` の生存中有効で PROT_WRITE。ゲストが並行して読み書きしうるため、参照を作らず volatile で 1 バイトだけ書く。
             unsafe { self.ptr.as_ptr().add(off + i).write_volatile(*b) };
         }
+        Ok(())
+    }
+
+    /// `off` の 2 バイトを整列した単一の volatile 読みで取り、LE の u16 として返す（`avail.idx` 用。#3862）。
+    ///
+    /// 範囲外・桁あふれ・ホストポインタが 2 バイト整列でない場合は `Err`（unsafe の前に検査する）。
+    /// 「単一命令」は Rust の言語仕様の保証ではなく、自然整列した 2 バイトの volatile が x86_64（`mov`）・
+    /// aarch64（`ldrh`）で 1 命令に下りることに依る（Linux の `READ_ONCE` と同じ前提。対象アーキテクチャは `SUPPORTED` の範囲）。
+    pub(crate) fn read_u16_le_aligned(&self, off: usize) -> Result<u16, ()> {
+        let end = off.checked_add(2).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        let p = self.ptr.as_ptr().wrapping_add(off);
+        if !(p as usize).is_multiple_of(core::mem::align_of::<u16>()) {
+            return Err(());
+        }
+        // SAFETY: `off + 2 <= len` を上で検査済みで、`p` は `u16` に整列している（未整列の volatile 読みは UB のため
+        // 検査した）。マッピングは `self` の生存中有効。ゲストが並行して書きうるため参照（`&u16`）を作らず volatile で読む。
+        let raw = unsafe { p.cast::<u16>().read_volatile() };
+        Ok(u16::from_le(raw))
+    }
+
+    /// `v` を LE で `off` の 2 バイトへ整列した単一の volatile 書きで置く（`used.idx` 用。契約は読みと同じ。#3862）。
+    pub(crate) fn write_u16_le_aligned(&mut self, off: usize, v: u16) -> Result<(), ()> {
+        let end = off.checked_add(2).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        let p = self.ptr.as_ptr().wrapping_add(off);
+        if !(p as usize).is_multiple_of(core::mem::align_of::<u16>()) {
+            return Err(());
+        }
+        // SAFETY: `off + 2 <= len` を上で検査済みで、`p` は `u16` に整列している。マッピングは `self` の生存中有効で
+        // PROT_WRITE、`&mut self` で Rust 側は排他的。ゲストが並行して読みうるため参照を作らず volatile で書く。
+        unsafe { p.cast::<u16>().write_volatile(v.to_le()) };
         Ok(())
     }
 }
@@ -2178,6 +2216,34 @@ mod tests {
         assert!(m.read_into(usize::MAX, &mut [0; 4]).is_err());
         assert!(m.write_from(8192, &[]).is_ok());
         assert_eq!(GuestRamMap::map(0).unwrap_err(), SysError::Os(22));
+    }
+
+    /// MVM-1・MVM-5・#3862: 整列 u16 の単一命令アクセスは幅 2 で LE、奇数オフセットと範囲外を拒否する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn guest_ram_map_aligned_u16_width_and_alignment() {
+        let mut m = GuestRamMap::map(8192).unwrap();
+        m.write_from(2, &[0x34, 0x12]).unwrap();
+        assert_eq!(m.read_u16_le_aligned(2), Ok(0x1234));
+        m.write_u16_le_aligned(4, 0xBEEF).unwrap();
+        let mut r = [0u8; 2];
+        m.read_into(4, &mut r).unwrap();
+        assert_eq!(r, [0xEF, 0xBE]);
+        // 隣接バイトは書き換わっていない（幅 2）。
+        let mut n = [0xFFu8; 1];
+        m.read_into(3, &mut n).unwrap();
+        assert_eq!(n, [0x12]);
+        m.read_into(6, &mut n).unwrap();
+        assert_eq!(n, [0]);
+        assert_eq!(m.read_u16_le_aligned(1), Err(()));
+        assert_eq!(m.write_u16_le_aligned(8191, 1), Err(()));
+        assert_eq!(m.read_u16_le_aligned(8191), Err(()));
+        assert_eq!(m.read_u16_le_aligned(8190), Ok(0));
+        assert!(m.write_u16_le_aligned(8190, 7).is_ok());
+        for off in [8192, usize::MAX - 1, usize::MAX] {
+            assert_eq!(m.read_u16_le_aligned(off), Err(()));
+            assert_eq!(m.write_u16_le_aligned(off, 1), Err(()));
+        }
     }
 
     /// MVM-1・TASK-75.1: drop で munmap され、`/proc/self/maps` から範囲が消える。

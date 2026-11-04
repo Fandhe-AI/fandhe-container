@@ -10,16 +10,19 @@
 //! 登録済みの RAM は `&'vm HvVm` を借用するため、`HvVm`（`hv_vm_destroy`）より先に drop される。drop は
 //! `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。
 //!
-//! # volatile アクセスの前提（デバイス側の責務。MVM-1・MVM-5・#3844）
-//! - `read` / `write`（とその上の `GuestMemory` の多バイトの読み書き）は 1 バイト単位の volatile コピーで、
-//!   2 / 4 / 8 バイトの値を 1 命令でも原子的にも読み書きしない。vCPU が並行して書く値は途中の状態（tear）で
-//!   読めることがあり、ホストが書く多バイト値もゲストから途中の状態で見えることがある。
+//! # volatile アクセスの前提（MVM-1・MVM-5・#3844・#3862）
+//! - `read` / `write`（とその上の `GuestMemory` の `read_u16_le` などの多バイトの読み書き）は 1 バイト単位の
+//!   volatile コピーで、2 / 4 / 8 バイトの値を 1 命令でも原子的にも読み書きしない。vCPU が並行して書く値は
+//!   途中の状態（tear）で読めることがある。
+//! - 例外は virtqueue の共有 index（`avail.idx`・`used.idx`）専用の `read_u16_le_aligned` /
+//!   `write_u16_le_aligned`（#3862）。2 バイト整列した u16 を単一の volatile で読み書きし、tear しない。
+//!   「単一命令」は Rust の言語仕様の保証ではなく、aarch64 の `ldrh` / `strh` に下りる前提（Linux の
+//!   `READ_ONCE` / `WRITE_ONCE` と同じ）。ring の要素・記述子・u32 以上には適用しない（理由は `virtqueue` のモジュール doc）。
 //! - volatile はバイト同士の順序もゲストとの順序も保証せず、Rust のメモリモデルの上では `fence` も非 atomic の
 //!   アクセスを順序づけない。順序は arm64 の実機のバリア命令に頼る（`virtqueue.rs` のモジュール doc と同じ前提）。
-//! - デバイス側（virtqueue とその上の virtio デバイス）の責務: 共有の index（avail.idx・used.idx）と記述子は
-//!   1 回だけコピーして同じ値で検査して使う（TOCTOU 防止）。読む順序と書く順序は fence で表す（`SplitQueue::pop` の
-//!   Acquire・`add_used` の Release）。tear した値も非信頼入力として範囲検査で受け止め、リング破損として扱う。
-//!   多バイトのアクセスの原子性に頼る設計を足すときは、この backing の側を先に変える。
+//! - デバイス側（virtqueue とその上の virtio デバイス）の責務: 記述子は 1 回だけコピーして同じ値で検査して使う
+//!   （TOCTOU 防止）。読む順序と書く順序は fence で表す（`SplitQueue::pop` の Acquire・`add_used` の Release）。
+//!   tear しうる値（記述子など）も非信頼入力として範囲検査で受け止め、リング破損として扱う。
 //!
 //! # 範囲外（REPAIR-3）
 //! 複数領域・`hv_vm_protect`・`Send` / `Sync`（#3797・#3798）。IPA の上限の値は暫定（#3788・#3803）。
@@ -89,6 +92,12 @@ impl GuestMemoryBacking for HvfGuestRam {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         self.host.write_from(to_usize(offset)?, data)
     }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        self.host.read_u16_le_aligned(to_usize(offset)?)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        self.host.write_u16_le_aligned(to_usize(offset)?, v)
+    }
 }
 
 /// `HvVm` に対応付け済みのゲスト RAM。drop で `hv_vm_unmap` → munmap。
@@ -113,6 +122,12 @@ impl GuestMemoryBacking for RegisteredHvfRam<'_> {
     }
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         self.mapping.write_from(to_usize(offset)?, data)
+    }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        self.mapping.read_u16_le_aligned(to_usize(offset)?)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        self.mapping.write_u16_le_aligned(to_usize(offset)?, v)
     }
 }
 
@@ -155,6 +170,37 @@ mod tests {
             MAX_MAP_BYTES + page(),
             "size exceeds the maximum mapping size",
         );
+    }
+
+    /// MVM-5・MVM-1・#3862: 整列 u16 の往復（バイト列と一致）、奇数アドレス・範囲外の拒否。
+    #[test]
+    fn mvm5_aligned_u16_roundtrip_and_rejects_unaligned() {
+        let p = page();
+        let base = 0x4000_0000u64;
+        let mut mem =
+            GuestMemory::new(GuestAddress::new(base), HvfGuestRam::new(p * 2).unwrap()).unwrap();
+        mem.write_u16_le_aligned(GuestAddress::new(base + 2), 0xBEEF)
+            .unwrap();
+        let mut b = [0u8; 2];
+        mem.read_at(GuestAddress::new(base + 2), &mut b).unwrap();
+        assert_eq!(b, [0xEF, 0xBE]);
+        mem.write_at(GuestAddress::new(base + 4), &[0x34, 0x12])
+            .unwrap();
+        assert_eq!(
+            mem.read_u16_le_aligned(GuestAddress::new(base + 4))
+                .unwrap(),
+            0x1234
+        );
+        let last = GuestAddress::new(base + p * 2 - 2);
+        assert!(mem.read_u16_le_aligned(last).is_ok());
+        let e = mem
+            .read_u16_le_aligned(GuestAddress::new(base + 3))
+            .unwrap_err();
+        assert_eq!(e.message(), "unaligned guest memory access");
+        let e = mem
+            .write_u16_le_aligned(GuestAddress::new(base + p * 2), 1)
+            .unwrap_err();
+        assert_eq!(e.message(), "guest memory access out of range");
     }
 
     #[test]

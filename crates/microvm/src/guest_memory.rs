@@ -25,6 +25,13 @@ fn out_of_range() -> MicrovmError {
     )
 }
 
+fn unaligned() -> MicrovmError {
+    MicrovmError::new(
+        MicrovmErrorCode::InvalidArgument,
+        "unaligned guest memory access",
+    )
+}
+
 /// ゲスト物理アドレス。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddress(u64);
@@ -57,6 +64,14 @@ pub trait GuestMemoryBacking {
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), MicrovmError>;
     /// `offset` へ `data` を書く。
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError>;
+    /// `offset` の 2 バイトを、整列した単一命令の volatile アクセスで読み、リトルエンディアンの u16 として返す。
+    ///
+    /// virtqueue の共有 index（`avail.idx`）専用（MVM-1・MVM-5・REPAIR-3・#3862）。`read` は 1 バイトずつのコピーなので、
+    /// ゲストが同時に書くと tear した値が見える。この関数は tear しない読みを 1 回で行う。`offset` が奇数、または
+    /// 範囲外なら `InvalidArgument`。意図的に既定実装を置かない（バイトコピーへ黙って退化して tear する実装を継承させないため）。
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError>;
+    /// `offset` へ u16 をリトルエンディアンで、整列した単一命令の volatile アクセスで書く（`used.idx` 専用。契約は読みと同じ）。
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError>;
     /// 空か。
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -110,6 +125,22 @@ impl GuestMemoryBacking for HeapBacking {
             .ok_or_else(out_of_range)?
             .copy_from_slice(data);
         Ok(())
+    }
+    // 並行する書き手がいないので、バイト列の変換で足りる（tear しうる並行アクセスが無い）。奇数 offset は
+    // 実機の backing と同じく拒否し、試験で整列の契約を確かめられるようにする。
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        if !offset.is_multiple_of(2) {
+            return Err(unaligned());
+        }
+        let mut b = [0u8; 2];
+        self.read(offset, &mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        if !offset.is_multiple_of(2) {
+            return Err(unaligned());
+        }
+        self.write(offset, &v.to_le_bytes())
     }
 }
 
@@ -193,6 +224,27 @@ impl<B: GuestMemoryBacking> GuestMemory<B> {
         self.write_at(addr, &v.to_le_bytes())
     }
 
+    /// 共有 index 用: 2 バイト整列した u16 を単一命令の volatile で読む（MVM-1・MVM-5・REPAIR-3・#3862）。
+    ///
+    /// virtqueue の `avail.idx` 専用。`addr` が奇数なら `InvalidArgument`（"unaligned guest memory access"）。
+    /// 範囲外は `read_u16_le` と同じ。ring の要素・記述子はこの関数を使わない（理由は `virtqueue` のモジュール doc）。
+    pub fn read_u16_le_aligned(&self, addr: GuestAddress) -> Result<u16, MicrovmError> {
+        if !addr.raw().is_multiple_of(2) {
+            return Err(unaligned());
+        }
+        let off = self.check_range(addr, 2)?;
+        self.backing.read_u16_le_aligned(off)
+    }
+
+    /// 共有 index 用: 2 バイト整列した u16 を単一命令の volatile で書く（`used.idx` 専用。契約は読みと同じ）。
+    pub fn write_u16_le_aligned(&mut self, addr: GuestAddress, v: u16) -> Result<(), MicrovmError> {
+        if !addr.raw().is_multiple_of(2) {
+            return Err(unaligned());
+        }
+        let off = self.check_range(addr, 2)?;
+        self.backing.write_u16_le_aligned(off, v)
+    }
+
     /// リトルエンディアンの u32 を書く。
     pub fn write_u32_le(&mut self, addr: GuestAddress, v: u32) -> Result<(), MicrovmError> {
         self.write_at(addr, &v.to_le_bytes())
@@ -266,6 +318,53 @@ mod tests {
         assert!(m.write_at(GuestAddress::new(0x10ff), &[0, 0]).is_err());
         assert!(m.check_range(GuestAddress::new(0x1000), u64::MAX).is_err());
         assert_eq!(m.check_range(GuestAddress::new(0x1000), 0x100).unwrap(), 0);
+    }
+
+    /// MVM-1・MVM-5・#3862: 整列 u16 の往復（バイト列と一致）、奇数アドレス・範囲外の拒否。
+    #[test]
+    fn mvm1_aligned_u16_roundtrip_and_rejects_unaligned() {
+        let mut m = mem(0x1000, 0x100);
+        m.write_u16_le_aligned(GuestAddress::new(0x1002), 0xBEEF)
+            .unwrap();
+        let mut b = [0u8; 2];
+        m.read_at(GuestAddress::new(0x1002), &mut b).unwrap();
+        assert_eq!(b, [0xEF, 0xBE]);
+        m.write_at(GuestAddress::new(0x1004), &[0x34, 0x12])
+            .unwrap();
+        assert_eq!(
+            m.read_u16_le_aligned(GuestAddress::new(0x1004)).unwrap(),
+            0x1234
+        );
+        // 末尾の 2 バイトは可。
+        assert!(m.read_u16_le_aligned(GuestAddress::new(0x10fe)).is_ok());
+        let e = m
+            .read_u16_le_aligned(GuestAddress::new(0x1003))
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "unaligned guest memory access");
+        let e = m
+            .write_u16_le_aligned(GuestAddress::new(0x1003), 1)
+            .unwrap_err();
+        assert_eq!(e.message(), "unaligned guest memory access");
+        for addr in [0x1100u64, 0x1102, 0xffe, 0, u64::MAX - 1] {
+            let e = m.read_u16_le_aligned(GuestAddress::new(addr)).unwrap_err();
+            assert_eq!(e.message(), "guest memory access out of range");
+            let e = m
+                .write_u16_le_aligned(GuestAddress::new(addr), 1)
+                .unwrap_err();
+            assert_eq!(e.message(), "guest memory access out of range");
+        }
+    }
+
+    /// MVM-1・#3862: base が奇数で、アドレスは偶数でも backing の offset が奇数になる場合は backing が拒否する。
+    #[test]
+    fn mvm1_aligned_u16_rejects_odd_backing_offset() {
+        let m = mem(0x1001, 0x100);
+        let e = m
+            .read_u16_le_aligned(GuestAddress::new(0x1002))
+            .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "unaligned guest memory access");
     }
 
     /// MVM-1: 上限超えの確保と、末尾が桁あふれする base を拒否する。

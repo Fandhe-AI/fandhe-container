@@ -9,7 +9,8 @@
 //!   （peer 認証つき connect → `MicrovmRuntimeAdapter` → `serve` → `stop_all`）を偽バックエンドで実行し、実 UDS 上で
 //!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。あわせて `serve_until` と停止フラグ
 //!   （SIGTERM 相当。#3747）で、実行中 VM の停止と、停止に入った後に届いた要求が処理されないことを照合する。
-//! - 層 B（`#[ignore]`・Linux x86_64・`/dev/kvm` が要る実機前提）: 実バイナリを spawn し、本物の `KvmBackend` で合成
+//! - 層 B（`#[ignore]`・実機前提）: 実バイナリを spawn し、Linux x86_64 では本物の `KvmBackend`（`/dev/kvm` が要る）、
+//!   macOS aarch64 では本物の `HvfBackend`（Apple Silicon の macOS 15 以降と entitlement つきの署名が要る。TASK-192.18・#3800）で合成
 //!   bzImage を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
 //!
 //! 層 B の合成ゲストは boot_params（`HdrS` と cmd_line_ptr）を確かめて自己ループする。`KvmBackend` は block / net を付けない
@@ -743,7 +744,10 @@ fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_u
 }
 
 /// 期限つき回収の共有補助（層 B のみ。取り込みは cfg の内側に限る）。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
@@ -752,21 +756,98 @@ mod reap;
 #[path = "../../microvm/tests/support/bzimage.rs"]
 mod bzimage;
 
-/// 層 B: 実バイナリ + 実 KVM（x86_64 Linux・`/dev/kvm` が要る実機前提）。
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod real_kvm {
+/// 層 B の共有補助（実バイナリの spawn・期限つき回収・反射検査）。Linux x86_64 の KVM と macOS aarch64 の HVF が使う。
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod real_bin {
     use super::*;
     use std::io::Read;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::time::Instant;
 
-    use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PLUGIN_SOCKET_ENV, UdsListener};
+    use fandhe_container_plugin::PLUGIN_SOCKET_ENV;
 
-    use super::{bzimage, reap};
+    use super::reap;
 
-    const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-microvm");
-    const WAIT: Duration = Duration::from_secs(30);
+    pub const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-microvm");
+    pub const WAIT: Duration = Duration::from_secs(30);
+
+    /// 実バイナリの子プロセスを保持する RAII ガード。assert 失敗・panic で drop されても
+    /// 期限つきで kill と回収を行い、plugin を残さない（REPAIR-5）。
+    pub struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn child(&mut self) -> &mut Child {
+            self.0.as_mut().expect("child already taken")
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                reap::reap_or_report(&mut child, reap::reap_within());
+            }
+        }
+    }
+
+    pub fn spawn(sock: &Path) -> ChildGuard {
+        ChildGuard(Some(spawn_raw(sock)))
+    }
+
+    fn spawn_raw(sock: &Path) -> Child {
+        Command::new(BIN)
+            .env_clear()
+            .env(PLUGIN_SOCKET_ENV, sock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn")
+    }
+
+    /// 期限内に子の終了を待ち (終了コード, stderr) を返す。超過時は kill して失敗にする。
+    pub fn wait_exit(mut guard: ChildGuard) -> (i32, String) {
+        let child = guard.child();
+        let start = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if start.elapsed() > WAIT {
+                // 以降の kill と回収はガードの drop が行う。
+                panic!("plugin binary did not exit within deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut err = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut err);
+        }
+        // 正常終了済みなのでガードの drop は kill しない（回収済みの子へ kill は失敗を無視）。
+        guard.0 = None;
+        (status.code().expect("exit code"), err)
+    }
+
+    pub fn assert_no_leak(err: &str, dir: &TempDir, kernel: &str) {
+        assert!(!err.contains(dir.0.to_str().expect("utf8")), "{err}");
+        assert!(!err.contains(kernel), "{err}");
+        assert!(!err.contains("vm1"), "{err}");
+    }
+}
+
+/// 層 B: 実バイナリ + 実 KVM（x86_64 Linux・`/dev/kvm` が要る実機前提）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod real_kvm {
+    use super::*;
+
+    use fandhe_container_plugin::{JsonLinesPeerAuthObserver, UdsListener};
+
+    use super::bzimage;
+    use super::real_bin::{ChildGuard, assert_no_leak, spawn, wait_exit};
 
     /// boot_params の `HdrS` と cmd_line_ptr（0x20000）だけを確かめ、一致すれば自己ループする。不一致は `ud2`。
     fn guest_payload() -> Vec<u8> {
@@ -795,63 +876,6 @@ mod real_kvm {
         }
     }
 
-    /// 実バイナリの子プロセスを保持する RAII ガード。assert 失敗・panic で drop されても
-    /// 期限つきで kill と回収を行い、plugin を残さない（REPAIR-5）。
-    struct ChildGuard(Option<Child>);
-
-    impl ChildGuard {
-        fn child(&mut self) -> &mut Child {
-            self.0.as_mut().expect("child already taken")
-        }
-    }
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                reap::reap_or_report(&mut child, reap::reap_within());
-            }
-        }
-    }
-
-    fn spawn(sock: &Path) -> ChildGuard {
-        ChildGuard(Some(spawn_raw(sock)))
-    }
-
-    fn spawn_raw(sock: &Path) -> Child {
-        Command::new(BIN)
-            .env_clear()
-            .env(PLUGIN_SOCKET_ENV, sock)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn")
-    }
-
-    /// 期限内に子の終了を待ち (終了コード, stderr) を返す。超過時は kill して失敗にする。
-    fn wait_exit(mut guard: ChildGuard) -> (i32, String) {
-        let child = guard.child();
-        let start = Instant::now();
-        let status = loop {
-            if let Some(st) = child.try_wait().expect("try_wait") {
-                break st;
-            }
-            if start.elapsed() > WAIT {
-                // 以降の kill と回収はガードの drop が行う。
-                panic!("plugin binary did not exit within deadline");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut err = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut err);
-        }
-        // 正常終了済みなのでガードの drop は kill しない（回収済みの子へ kill は失敗を無視）。
-        guard.0 = None;
-        (status.code().expect("exit code"), err)
-    }
-
     /// listener を立てて実バイナリを繋ぎ、ping と start（合成カーネル）まで進めた状態を返す。
     fn boot() -> (TempDir, ChildGuard, UdsStream, String) {
         precondition();
@@ -874,12 +898,6 @@ mod real_kvm {
         // ゲストを走らせる時間を取る（不正なエントリなら ud2 で止まる）。
         std::thread::sleep(Duration::from_millis(200));
         (dir, child, stream, kernel)
-    }
-
-    fn assert_no_leak(err: &str, dir: &TempDir, kernel: &str) {
-        assert!(!err.contains(dir.0.to_str().expect("utf8")), "{err}");
-        assert!(!err.contains(kernel), "{err}");
-        assert!(!err.contains("vm1"), "{err}");
     }
 
     #[test]
@@ -911,6 +929,122 @@ mod real_kvm {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn task117_4_mvm1_real_kvm_disconnect_reclaims_running_vm() {
+        let (dir, child, stream, kernel) = boot();
+        drop(stream); // stop を送らずに切断する。
+        let (code, err) = wait_exit(child);
+        assert_eq!(code, 0, "{err}");
+        // stop_all が残った VM を failed=0 remaining=0 で止めたなら warn 行は出ない。
+        assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
+        assert!(!err.contains("outcome=error"), "{err}");
+        assert_no_leak(&err, &dir, &kernel);
+    }
+}
+
+/// 合成 arm64 Image の正本（`crates/microvm/tests/support/arm64_image.rs`。複製しない・#3800）。
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "../../microvm/tests/support/arm64_image.rs"]
+mod arm64_image;
+
+/// 層 B: 実バイナリ + 実 Hypervisor.framework（macOS aarch64・Apple Silicon の macOS 15 以降・entitlement つきの署名が要る
+/// 実機前提。TASK-192.18・#3800・MVM-5・MVM-1・PLUG-1）。
+///
+/// Hypervisor.framework は 1 プロセスに 1 VM のため、前提確認で試験プロセス内に作る VM は直ちに drop し、`--test-threads=1` で
+/// 実行する（並列だと 2 件の前提確認がぶつかる）。待ちはすべて期限つき（REPAIR-5）。
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod real_hvf {
+    use super::*;
+    use std::process::Command;
+
+    use fandhe_container_microvm::arm64_layout::Arm64Layout;
+    use fandhe_container_microvm::hvf::VmWithGic;
+    use fandhe_container_plugin::{JsonLinesPeerAuthObserver, UdsListener};
+
+    use super::real_bin::{BIN, ChildGuard, assert_no_leak, spawn, wait_exit};
+    use super::{arm64_image, reap};
+
+    const ENTITLEMENT: &str = "com.apple.security.hypervisor";
+
+    /// 前提を確かめる。欠けていれば決まった 1 行目で失敗させる（skip しない）。
+    /// 試験バイナリ自身（VM を作れること）と plugin バイナリ（entitlement つきの署名）の両方に署名が要る。
+    fn precondition() {
+        let layout = Arm64Layout::new(64 << 20, 1, 0).expect("layout");
+        match VmWithGic::create(&layout) {
+            Ok(vm) => drop(vm),
+            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
+        }
+        let mut cmd = Command::new("codesign");
+        cmd.args(["-d", "--entitlements", "-", BIN]);
+        let signed = match reap::output_within(&mut cmd, Duration::from_secs(30)) {
+            Ok(o) => {
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                text.contains(ENTITLEMENT)
+            }
+            Err(_) => false,
+        };
+        if !signed {
+            panic!(
+                "e2e: PRECONDITION FAILED (test environment, not a regression): plugin binary is not signed with {ENTITLEMENT}"
+            );
+        }
+    }
+
+    /// listener を立てて実バイナリを繋ぎ、ping と start（合成 arm64 Image）まで進めた状態を返す。
+    fn boot() -> (TempDir, ChildGuard, UdsStream, String) {
+        precondition();
+        let dir = TempDir::new();
+        let sock = dir.0.join("p.sock");
+        let kernel = dir.file("k.img", &arm64_image::synthetic_image(true));
+        let listener = UdsListener::bind(&sock).expect("bind");
+        let child = spawn(&sock);
+        let mut obs = JsonLinesPeerAuthObserver::new();
+        let mut stream = listener
+            .accept(Duration::from_secs(20), &mut obs)
+            .expect("accept");
+        assert_eq!(obs.len(), 0);
+        assert_eq!(
+            expect_ok(call(&mut stream, 1, s(&["ping"])), 1),
+            s(&["pong"])
+        );
+        let start = s(&["start", "vm1", &kernel, "", "console=ttyAMA0", "1", "64"]);
+        assert_eq!(expect_ok(call(&mut stream, 2, start), 2), s(&["running"]));
+        // ゲストを走らせる時間を取る（自己ループなので走り続ける）。
+        std::thread::sleep(Duration::from_millis(200));
+        (dir, child, stream, kernel)
+    }
+
+    #[test]
+    #[ignore = "requires Apple silicon macOS 15+ and binaries signed with com.apple.security.hypervisor (MVM-5)"]
+    fn task192_18_plug1_mvm5_real_hvf_start_stop_via_plugin_binary() {
+        let (dir, child, mut stream, kernel) = boot();
+        assert_eq!(
+            expect_ok(call(&mut stream, 3, s(&["stop", "vm1"])), 3),
+            s(&["stopped", "requested"])
+        );
+        drop(stream);
+        let (code, err) = wait_exit(child);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            err.matches("op=plugin.microvm.start outcome=ok").count(),
+            1,
+            "{err}"
+        );
+        assert_eq!(
+            err.matches("op=plugin.microvm.stop outcome=ok").count(),
+            1,
+            "{err}"
+        );
+        assert!(!err.contains("outcome=error"), "{err}");
+        assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
+        assert_no_leak(&err, &dir, &kernel);
+    }
+
+    #[test]
+    #[ignore = "requires Apple silicon macOS 15+ and binaries signed with com.apple.security.hypervisor (MVM-5)"]
+    fn task192_18_mvm5_real_hvf_disconnect_reclaims_running_vm() {
         let (dir, child, stream, kernel) = boot();
         drop(stream); // stop を送らずに切断する。
         let (code, err) = wait_exit(child);

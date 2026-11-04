@@ -30,11 +30,12 @@ use crate::hvf_loop::ExitAction;
 use crate::mmio_abort;
 use crate::sys::HvVcpu;
 use crate::virtio_mmio::MmioWriteOutcome;
+use std::sync::{Arc, Mutex};
 
 /// MMIO ハンドラの状態（デバイスバスと観測用の計数）。
 #[derive(Debug, Default)]
 pub struct MmioHandler {
-    dispatcher: ExitDispatcher,
+    dispatcher: Arc<Mutex<ExitDispatcher>>,
     unhandled: u64,
     queue_notifies: u64,
     last_queue_notify: Option<(DeviceId, u16)>,
@@ -48,15 +49,20 @@ impl MmioHandler {
 
     /// 登録済みの dispatcher を持つハンドラを作る。
     pub fn with_dispatcher(dispatcher: ExitDispatcher) -> Self {
+        Self::with_shared_dispatcher(Arc::new(Mutex::new(dispatcher)))
+    }
+
+    /// 組み立て済み VM が持つ共有 dispatcher（`HvfMicroVm::dispatcher`）を使うハンドラを作る（#3793）。
+    pub fn with_shared_dispatcher(dispatcher: Arc<Mutex<ExitDispatcher>>) -> Self {
         Self {
             dispatcher,
             ..Self::default()
         }
     }
 
-    /// デバイスの登録用に dispatcher を借りる。
-    pub fn dispatcher_mut(&mut self) -> &mut ExitDispatcher {
-        &mut self.dispatcher
+    /// 共有 dispatcher のハンドル（デバイスの追加登録用）。
+    pub fn dispatcher(&self) -> &Arc<Mutex<ExitDispatcher>> {
+        &self.dispatcher
     }
 
     /// どのデバイスにも当たらなかったアクセスの回数（REPAIR-4）。
@@ -100,7 +106,11 @@ pub fn handle_data_abort(
     };
 
     let exit = mmio_abort::mmio_exit_from_abort(abort, exception.physical_address, write_value);
-    let outcome = handler.dispatcher.dispatch(&exit)?;
+    let outcome = handler
+        .dispatcher
+        .lock()
+        .map_err(|_| internal("mmio dispatcher lock poisoned"))?
+        .dispatch(&exit)?;
     match &outcome {
         DispatchOutcome::Mmio {
             device,

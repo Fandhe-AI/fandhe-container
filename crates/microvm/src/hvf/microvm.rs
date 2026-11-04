@@ -30,7 +30,7 @@
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - 実行開始の制御（start gate）: `spawn` は ready の後すぐ実行ループに入るため、assemble の時点でゲストは走り始める。現状は
 //!   exit のスタブ（#3793・#3794・#3796）が `Unimplemented` を返すので、実カーネルは最初の exit で `Failed(Unimplemented)` になる（#3798）。
-//! - `MmioHandler` への dispatcher とゲスト RAM の受け渡し（[`HvfMicroVm::dispatcher`] を渡す）と `HostMapping` の `Send`（#3793・#3798）。
+//! - `MmioHandler` へは共有 dispatcher を接続済み（#3793）。ゲスト RAM の受け渡しと `HostMapping` の `Send` は #3798。
 //! - PSCI・WFI / vtimer（#3794・#3796）、SMP、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
@@ -305,7 +305,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .map_err(|_| internal("boot readback was recorded twice"))
             },
             ExitHandlers {
-                mmio: MmioHandler::new(),
+                mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher)),
                 hvc: HvcHandler::new(),
                 timer: TimerHandler::new(),
             },
@@ -352,7 +352,7 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
         self.devices.infos()
     }
 
-    /// MMIO dispatcher の共有ハンドル。`MmioHandler` への受け渡しは #3793。
+    /// MMIO dispatcher の共有ハンドル（vCPU の `MmioHandler` と同じ実体。#3793）。
     pub fn dispatcher(&self) -> &Arc<Mutex<ExitDispatcher>> {
         &self.devices.dispatcher
     }

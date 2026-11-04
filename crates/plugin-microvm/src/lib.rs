@@ -4,7 +4,7 @@
 //! バイナリ名 `fandhe-container-plugin-microvm` は発見規約の接頭辞に一致する（PLUG-4・PLUG-11）。
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //! 対象は制御面のみで、VM 内部の I/O パスは plugin 境界の外に置く（PLUG-1・MVM-1）。
-//! 3 OS 展開方針（MVM-5）: 動かすバックエンドは現状 Linux の KVM だけで、macOS / Windows の扱いは `docs/architecture.md` の
+//! 3 OS 展開方針（MVM-5）: 動かすバックエンドは Linux の KVM と macOS（aarch64）の Hypervisor.framework（#3927。実機未確認）で、Windows の扱いは `docs/architecture.md` の
 //! 「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
 //!
 //! # 接続方向（PLUG-12）

@@ -1,6 +1,6 @@
 # rust-vmm 禁止クレートの判定結果の記録
 
-MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めない）の機械判定を、`crates/microvm` 本体の実装前（雛形のみ）のワークスペースで実行した結果と、TASK-74・TASK-75 の後に同じ判定を再実行する手順を記録する。TASK-74 完了後の再実行結果（TASK-74.6・#694）も追記した（TASK-73.3・#687・MS-7。関連: REPAIR-9・REPAIR-12・OSS-3・OSS-5）。判定の仕組みは TASK-73.1（#685）と TASK-73.2（#686）で導入済み。
+MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めない）の機械判定を、`crates/microvm` 本体の実装前（雛形のみ）のワークスペースで実行した結果と、TASK-74・TASK-75 の後に同じ判定を再実行する手順を記録する。TASK-74 完了後の再実行結果（TASK-74.6・#694）と、TASK-192 の実装 sub-issue 完了後の再実行結果（TASK-192.20・#3802）も追記した（TASK-73.3・#687・MS-7。関連: REPAIR-9・REPAIR-12・OSS-3・OSS-5）。判定の仕組みは TASK-73.1（#685）と TASK-73.2（#686）で導入済み。
 
 この記録は判定の代わりではない。PR ごとの継続的な検出は CI（`platform-ci` の `make check-microvm-deps`、rust-ci の `cargo deny`、`make deny-bans-fail-closed-selftest`）が担う。
 
@@ -20,6 +20,7 @@ MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めな
 - workspace メンバー（21 件）: `fandhe-container-` に続く `benches`・`cli`・`compose-convert`・`core`・`cri`・`gpu`・`guest-init`・`io`・`microvm`・`net`・`oci`・`platform-macos`・`platform-windows`・`plugin`・`plugin-cri`・`plugin-macos`・`plugin-mcp`・`plugin-microvm`・`plugin-windows`・`stack`・`supervisor`
 - `crates/microvm`・`crates/plugin-microvm` は TASK-1.3 の雛形で `[dependencies]` を持たない。`cargo tree -p <名前> -e normal,build,dev --target all --all-features --locked` は自分自身の 1 行だけを返した
 - TASK-74 完了後（TASK-74.6・#694）: ルート workspace は 502 packages・治具は 41 packages、workspace メンバーは 21 件のまま。`crates/microvm` は TASK-74.1〜74.5 の本体実装後も `[dependencies]`・`[dev-dependencies]`・`[build-dependencies]` を持たず、`cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked` は自分自身の 1 行だけを返した。`crates/plugin-microvm` は雛形のまま
+- TASK-192 の実装 sub-issue（TASK-192.1〜192.18・#3783〜#3800）の完了後（TASK-192.20・#3802）: ルート workspace は 505 packages・治具は 41 packages、workspace メンバーは 21 件のまま。`crates/microvm` は macOS バックエンド追加後も `[dependencies]`・`[dev-dependencies]`・`[build-dependencies]` を持たず（TASK-74 完了時点からの `Cargo.toml` の差分はコメント行のみ）、Hypervisor.framework の FFI は `src/sys/hvf.rs` の自前宣言（`#[link(name = "Hypervisor", kind = "framework")]`）。`cargo tree -p fandhe-container-microvm ...` は自分自身の 1 行だけを返した。`crates/plugin-microvm` は workspace 内の path 依存 2 件（`fandhe-container-plugin`・`fandhe-container-microvm`。TASK-117.2・#711）だけを直接依存に持ち、外部の新規依存は無い
 
 ## 実行結果
 
@@ -34,6 +35,12 @@ MVM-4（rust-vmm の低レベル基盤クレートを依存ツリーに含めな
 | 同上 | `1ca2767a` | 同上 | 同上 | `cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked` | 自分自身の 1 行のみ（依存なし） |
 | 同上 | `1ca2767a` | 同上 | 同上 | `make deny-bans-fail-closed-selftest` | 全ケース合格（禁止クレートは終了コード 2 で拒否、対照は 0） |
 | 同上 | `1ca2767a` | 同上 | 同上 | `make check-microvm-deps-selftest` | 17 passed, 0 failed |
+| 2026-11-04 14:13 UTC | `bf5067b7` | TASK-192 の実装 sub-issue 完了後（TASK-192.1〜192.18・#3783〜#3800。TASK-192.20・#3802。TASK-75 完了後の最初の記録を兼ねる。#3782 は未完了のため TASK-192 全体の完了ではない） | Linux x86_64・cargo 1.99.0・cargo-deny 0.20.2 | `make check-microvm-deps` | 終了コード 0。ルート 505 packages・治具 41 packages ともに `OK: no rust-vmm crate` |
+| 同上 | `bf5067b7` | 同上 | 同上 | `cargo deny --locked check bans licenses`（ルート）と、治具に対する `--manifest-path poc/venus-decoder/jig/Cargo.toml --config deny.toml` 付きの同検査 | 両方 終了コード 0。`bans ok, licenses ok` |
+| 同上 | `bf5067b7` | 同上 | 同上 | `cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked` | 自分自身の 1 行のみ（依存なし）。増えていない |
+| 同上 | `bf5067b7` | 同上 | 同上 | `cargo tree -p fandhe-container-plugin-microvm -e normal,build,dev --target all --all-features --locked` | 終了コード 0。直接依存は path 依存の `fandhe-container-microvm`・`fandhe-container-plugin` の 2 件。全体 21 行で rust-vmm 系なし・外部の新規依存なし |
+| 同上 | `bf5067b7` | 同上 | 同上 | `make deny-bans-fail-closed-selftest` | 全ケース合格（禁止クレートは終了コード 2 で拒否、対照は 0） |
+| 同上 | `bf5067b7` | 同上 | 同上 | `make check-microvm-deps-selftest` | 17 passed, 0 failed |
 
 advisories は外部 DB に依存して時点で変わるため、この記録の対象外とし、CI の `make deny` が担う。
 
@@ -43,8 +50,8 @@ advisories は外部 DB に依存して時点で変わるため、この記録�
 - youki・Firecracker・Cloud Hypervisor 由来のクレートは機械判定の範囲外で、AGENTS.md の観点で見る
 - 10 種以外の rust-vmm クレートは照合 B（repository URL）が補うのみ
 
-## TASK-74・TASK-75 の後の再実行手順
+## TASK-74・TASK-75・TASK-192 の後の再実行手順
 
-1. `crates/microvm` に依存を追加する PR（依存の追加はユーザー承認制。[dependency-policy](../../.claude/rules/dependency-policy.md)）と、TASK-74・TASK-75 の完了時に次を実行する: `make check-microvm-deps`・`cargo deny --locked check bans licenses`・治具の `cargo deny --manifest-path poc/venus-decoder/jig/Cargo.toml --config deny.toml --locked check bans licenses`・`cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked`
-2. 結果は既存の行を上書きせず、「実行結果」の表へ日時・commit・契機（TASK-74 / TASK-75 / 依存追加 PR）の行を追記する
+1. `crates/microvm` に依存を追加する PR（依存の追加はユーザー承認制。[dependency-policy](../../.claude/rules/dependency-policy.md)）と、TASK-74・TASK-75・TASK-192 の完了時に次を実行する: `make check-microvm-deps`・`cargo deny --locked check bans licenses`・治具の `cargo deny --manifest-path poc/venus-decoder/jig/Cargo.toml --config deny.toml --locked check bans licenses`・`cargo tree -p fandhe-container-microvm -e normal,build,dev --target all --all-features --locked`・同 `-p fandhe-container-plugin-microvm`・`make deny-bans-fail-closed-selftest`・`make check-microvm-deps-selftest`
+2. 結果は既存の行を上書きせず、「実行結果」の表へ日時・commit・契機（TASK-74 / TASK-75 / TASK-192 / 依存追加 PR）の行を追記する
 3. NG なら依存を入れずに止める。`deny.toml` の例外追加や禁止リストの変更は、ユーザー承認とセットでのみ行う

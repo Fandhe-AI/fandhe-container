@@ -253,10 +253,10 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 | 優先順位 | OS | バックエンド | 位置づけ | 現状 |
 | -------- | -- | ------------ | -------- | ---- |
 | 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75（#688・#695）で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc） |
-| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 未実装。実装は TASK-192（spec リポジトリの #27 で新設。`crates/microvm` の macOS バックエンド。対応 OS は macOS 15 以降、MS-7）。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
+| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 実装済み（実機未確認。実機の記録は #3803）。TASK-192（`crates/microvm` の `cfg(target_os = "macos")`〔aarch64〕のバックエンド。`fandhe-container-plugin-microvm` の start / stop から動かす。#3927）。対応は macOS 15 以降（GICv3 の API の版。15 未満は `UNIMPLEMENTED`）・Apple Silicon のみ。SMP（#3884・#3891）などの未実装事項の正は crate の doc。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
 | 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装。配置は `crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`。2026-11-03 決定。下の「バックエンドの配置」を参照）。実装の計画は無い |
 
-実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進める。Windows（WHP）は優先順位の外に置く。
+実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、両方とも実装済みである（macOS は実機未確認）。Windows（WHP）は優先順位の外に置く。
 
 ### バックエンドの配置（2026-11-03 決定）
 
@@ -266,7 +266,7 @@ microVM の OS ごとのバックエンド（KVM・Hypervisor.framework・WHP）
 - 理由: `crates/microvm` の責務は OS ではなく VMM の実装ライブラリで、virtio のデバイスモデル・ゲストメモリ・起動フローを OS 間で共有する。`platform-windows` は WSL2 の主経路（WIN-1・WIN-2）を担うため、microVM のバックエンドを載せない
 - 採らなかった案: `crates/microvm-windows` の新設、`crates/platform-windows` への配置。いずれも [crate-naming.md](design/crate-naming.md) の確定一覧（REPAIR-1）を変えることになるため採らない
 - WHP の FFI の宣言方法（既存の `windows-sys`〔=0.61.2〕へ feature `Win32_System_Hypervisor` を足すか、自前宣言か）は実装の計画時に決める。feature の追加はユーザー承認を経る（[dependency-policy](../.claude/rules/dependency-policy.md)）
-- Hypervisor.framework の FFI は `sys` の自前宣言（`#[link(name = "Hypervisor", kind = "framework")]`）とし、新しい依存を足さない。これは Agent の判断であり、オーナーの承認対象は WHP のみとする。異論があれば TASK-192 の着手前に見直す
+- Hypervisor.framework の FFI は `sys` の自前宣言（`#[link(name = "Hypervisor", kind = "framework")]`）とし、新しい依存を足さない。TASK-192 は #4 の決定どおり `src/sys/hvf.rs` の自前宣言で実装し、新しい依存は足していない（TASK-192.20・#3802 の再実行で確認。[microvm-dependencies.md](design/microvm-dependencies.md)）。これは Agent の判断であり、オーナーの承認対象は WHP のみとする
 - microVM の FFI は各 crate の `sys` の自前宣言とし、`libc` は dev-dependencies の機械照合のみに使う。`nix` は採用しない（MVM-4）
 - WHP は引き続き将来オプションで、MVP には実装しない（MVM-5・WIN-6）
 

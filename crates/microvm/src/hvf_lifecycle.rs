@@ -108,9 +108,11 @@ where
         memory,
         vm,
     } = resources;
+    // 処理開始時に終了時刻の基準を 1 回だけ取り、vCPU の停止待ちとデバイス解放待ちで同じ期限を共有する（REPAIR-5）。
+    let started = std::time::Instant::now();
     let result = stopper.stop(effective);
     let outcome = match result {
-        Ok(report) => match devices.release_devices(DEVICE_RELEASE_DEADLINE) {
+        Ok(report) => match release_within(&mut devices, effective, started) {
             Ok(()) => {
                 drop(devices);
                 drop(memory);
@@ -193,6 +195,23 @@ impl TeardownMark {
     }
 }
 
+/// 期限の残り（`effective - started.elapsed()`）と [`DEVICE_RELEASE_DEADLINE`] の小さい方でデバイスを手放す。
+/// 残りが 0 なら解放を試みず `DeadlineExceeded` を返す（REPAIR-5）。
+fn release_within<D: ReleaseDevices>(
+    devices: &mut D,
+    effective: Duration,
+    started: std::time::Instant,
+) -> Result<(), MicrovmError> {
+    let remaining = effective.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "stop deadline exhausted before devices were released",
+        ));
+    }
+    devices.release_devices(remaining.min(DEVICE_RELEASE_DEADLINE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +277,36 @@ mod tests {
             (StopReason::Requested, HvRunStats::default())
         })
         .unwrap()
+    }
+
+    /// 渡された期限を記録するデバイス。
+    struct RecordDeadline(Arc<Mutex<Option<Duration>>>);
+
+    impl ReleaseDevices for RecordDeadline {
+        fn release_devices(&mut self, deadline: Duration) -> Result<(), MicrovmError> {
+            *self.0.lock().unwrap() = Some(deadline);
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5・REPAIR-12・TASK-192.16: 短い停止期限ではデバイス解放へ渡す期限が残り時間以下に絞られ、
+    /// 期限を使い切っていれば解放を試みず `DeadlineExceeded` になる。
+    #[test]
+    fn repair5_3798_device_release_shares_stop_deadline() {
+        let seen = Arc::new(Mutex::new(None));
+        let mut d = RecordDeadline(Arc::clone(&seen));
+        release_within(&mut d, Duration::from_millis(10), std::time::Instant::now()).unwrap();
+        let got = seen.lock().unwrap().unwrap();
+        assert!(got <= Duration::from_millis(10), "got {got:?}");
+        // 長い期限では DEVICE_RELEASE_DEADLINE で頭打ち。
+        release_within(&mut d, LONG, std::time::Instant::now()).unwrap();
+        assert_eq!(seen.lock().unwrap().unwrap(), DEVICE_RELEASE_DEADLINE);
+        // 期限を使い切った場合は解放を呼ばない。
+        *seen.lock().unwrap() = None;
+        let past = std::time::Instant::now() - Duration::from_millis(50);
+        let e = release_within(&mut d, Duration::from_millis(10), past).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert!(seen.lock().unwrap().is_none());
     }
 
     /// MVM-5・TASK-192.16: 成功時の解放順は devices → memory → vm で、報告の理由は `Requested`。

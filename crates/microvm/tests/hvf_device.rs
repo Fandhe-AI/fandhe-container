@@ -707,6 +707,78 @@ fn hvf_device_psci_version_then_system_off() {
     drop(vm);
 }
 
+/// PSCI の CPU_ON・CPU_OFF・AFFINITY_INFO のゲストコード（IPA 0x4000_0000 から。`llvm-mc -triple=aarch64 -show-encoding` で符号化）。
+/// CPU_ON(0) → CPU_ON(1) → CPU_OFF → AFFINITY_INFO(0) → VERSION の順に `hvc #0` を呼ぶ。最後の VERSION は継続の証跡。
+const PSCI_CPU_GUEST_CODE: [u32; 20] = [
+    0xd2b0_8000, // 0x00: movz x0,#0x8400,lsl16
+    0xf280_0060, // 0x04: movk x0,#3 ; CPU_ON
+    0xd280_0001, // 0x08: movz x1,#0
+    0xd280_0002, // 0x0c: movz x2,#0
+    0xd400_0002, // 0x10: hvc
+    0xd2b0_8000, // 0x14: movz x0,#0x8400,lsl16
+    0xf280_0060, // 0x18: movk x0,#3 ; CPU_ON
+    0xd280_0021, // 0x1c: movz x1,#1
+    0xd400_0002, // 0x20: hvc
+    0xd2b0_8000, // 0x24: movz x0,#0x8400,lsl16
+    0xf280_0040, // 0x28: movk x0,#2 ; CPU_OFF
+    0xd400_0002, // 0x2c: hvc
+    0xd2b0_8000, // 0x30: movz x0,#0x8400,lsl16
+    0xf280_0080, // 0x34: movk x0,#4 ; AFFINITY_INFO
+    0xd280_0001, // 0x38: movz x1,#0
+    0xd280_0002, // 0x3c: movz x2,#0
+    0xd400_0002, // 0x40: hvc
+    0xd2b0_8000, // 0x44: movz x0,#0x8400,lsl16 ; VERSION
+    0xd400_0002, // 0x48: hvc
+    0x1400_0000, // 0x4c: b .
+];
+
+/// 1 vCPU 構成の既定ハンドラで、CPU_ON・CPU_OFF・AFFINITY_INFO の応答がゲストの X0 へ戻り、実行が継続することを確かめる。
+/// CPU_ON(0)=ALREADY_ON(-4)、CPU_ON(存在しない対象)=INVALID_PARAMETERS(-2)、CPU_OFF=DENIED(-3)、AFFINITY_INFO(0)=ON(0)。
+/// 各呼び出しの後に次の HVC へ到達すること（最後は VERSION=1.0）で継続を確認する。MVM-5・MVM-1・REPAIR-12・#3883。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_psci_cpu_power_responses() {
+    use fandhe_container_microvm::hvf::hvc::{HvcHandler, handle_hvc};
+    use fandhe_container_microvm::hvf_loop::ExitAction;
+
+    const BASE: u64 = 0x4000_0000;
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vm = create_vm_with_gic_or_precondition(&layout);
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in PSCI_CPU_GUEST_CODE.iter().enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+
+    let mut vcpu = vm.create_vcpu().unwrap();
+    vcpu.set_reg(HvReg::PC, BASE).unwrap();
+    vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+    let mut handler = HvcHandler::new();
+    // (期待する X0 の下位 32 ビット, 呼び出しの名前)
+    let expected: [(u32, &str); 5] = [
+        (0xFFFF_FFFC, "CPU_ON(0) ALREADY_ON"),
+        (0xFFFF_FFFE, "CPU_ON(1) INVALID_PARAMETERS"),
+        (0xFFFF_FFFD, "CPU_OFF DENIED"),
+        (0, "AFFINITY_INFO(0) ON"),
+        (0x0001_0000, "VERSION 1.0 (continuation)"),
+    ];
+    for (want, name) in expected {
+        let exit = vcpu.run_once(PSCI_DEADLINE).unwrap();
+        let HvVcpuExit::Exception(ex) = exit else {
+            panic!("hvf_device: psci_cpu: unexpected exit {exit:?} before {name}");
+        };
+        assert_eq!(decode_esr(ex.syndrome), EsrClass::Hvc { imm16: 0 });
+        let action = handle_hvc(&mut vcpu, &mut handler, 0, &ex).unwrap();
+        assert!(matches!(action, ExitAction::Continue), "{name}");
+        let x0 = vcpu.get_reg(HvReg::x(0).unwrap()).unwrap();
+        assert_eq!(x0 as u32, want, "{name}: x0 = {x0:#x}");
+    }
+
+    drop(vcpu);
+    mapping.unmap().unwrap();
+}
+
 /// `hvf_device_mmio_reaches_virtio_mmio` のゲストプログラム（arm64。`llvm-mc -triple=aarch64 -show-encoding` で符号化）。
 ///
 /// MagicValue（offset 0）と Version（offset 4）を `ldr w` で読み、期待値（0x7472_6976）と比べる。一致なら窓 1 の offset 0 へ

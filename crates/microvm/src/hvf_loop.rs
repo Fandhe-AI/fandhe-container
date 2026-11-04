@@ -453,6 +453,10 @@ impl<K> LoopStart<K> {
     fn ready_gated_within(self, kick: K, limit: Duration) -> Result<Arc<AtomicBool>, StopReason> {
         let gate = Arc::clone(&self.gate);
         let stop = self.ready(kick);
+        // 作成待ちの期限切れで既に停止フラグが立っている（受け手は去り、kick は誰にも渡らない）なら、ゲートを待たず直ちに終える。
+        if stop.load(Ordering::Acquire) {
+            return Err(StopReason::Requested);
+        }
         match gate.wait(limit) {
             GateOutcome::Opened => Ok(stop),
             GateOutcome::Cancelled => Err(StopReason::Requested),
@@ -570,6 +574,8 @@ where
         }
         Err(RecvTimeoutError::Timeout) => {
             stop.store(true, Ordering::Release);
+            // 遅れて ready_gated に来たスレッドがゲートを待たずに終わるよう取り消す（REPAIR-5）。
+            gate.cancel();
             log_line(format_args!(
                 "level=error op=hvf.vcpu_create outcome=error code={}",
                 MicrovmErrorCode::DeadlineExceeded.as_str()
@@ -1090,6 +1096,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
         let _ = release_tx.send(());
+    }
+
+    /// REPAIR-5・TASK-192.16: 作成期限切れの後に遅れて ready_gated へ来ても、ゲートを待たず直ちに終わる。
+    #[test]
+    fn mvm5_3798_late_ready_gated_after_create_timeout_ends_immediately() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<(StopReason, Duration)>();
+        let e = spawn_loop::<FakeKick, _>("hvf-test", Duration::from_millis(50), move |start| {
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            let t = Instant::now();
+            let r = start.ready_gated_within(
+                FakeKick(Arc::new(AtomicUsize::new(0))),
+                Duration::from_secs(30),
+            );
+            let reason = r
+                .err()
+                .unwrap_or(StopReason::Failed(MicrovmErrorCode::Internal));
+            let _ = done_tx.send((reason, t.elapsed()));
+            (reason, HvRunStats::default())
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        let _ = release_tx.send(());
+        let (reason, took) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(reason, StopReason::Requested);
+        assert!(took < Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

@@ -54,11 +54,11 @@
 //! fail-closed）。残る資源は vCPU スレッド・vCPU・VM（GIC を含む）・ゲスト RAM の mmap と map。リークした対応付けが `Arc<HvVm>` を
 //! 握るため、スレッドが後で自力で終わっても `hv_vm_destroy` は走らず、同じプロセスでの再 assemble は `FailedPrecondition` になる。
 //! 回収の方法はプロセスの終了だけ（plugin-microvm による再起動。#3800）。後から終わったスレッドの資源を回収する案は、`HostMapping`
-//! を `Send` にして回収スレッドへ渡す必要があり、`sys` に新しい `unsafe` が要るため本 issue の範囲外（追跡事項）。
+//! を `Send` にして回収スレッドへ渡す必要があり、`sys` に新しい `unsafe` が要るため本 issue の範囲外（追跡は #3908）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当の
-//!   issue は未確定（`HvfBoundDevice::transport` が将来使う）。
+//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当は
+//!   #3908（`HvfBoundDevice::transport` が将来使う）。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。vCPU 1..N の停止の集約を含む。#3864 の後続）、シリアルの結線（`layout.serial`・バス上限の調整）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
@@ -146,7 +146,7 @@ pub struct HvfDeviceInfo {
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・窓・割り込み線）。
 struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
-    /// QueueNotify の処理が型つきで触る（担当 issue は未確定。モジュール doc の範囲外）。dispatcher と共有する。
+    /// QueueNotify の処理が型つきで触る（担当は #3908。モジュール doc の範囲外）。dispatcher と共有する。
     #[allow(dead_code)]
     transport: Arc<Mutex<VirtioMmioTransport<D>>>,
     id: DeviceId,
@@ -159,6 +159,20 @@ struct HvfDeviceBus<B: BlockBackend, N: NetBackend> {
     dispatcher: Arc<Mutex<ExitDispatcher>>,
     block: Vec<HvfBoundDevice<VirtioBlock<B>>>,
     net: Vec<HvfBoundDevice<VirtioNet<N>>>,
+}
+
+impl<B: BlockBackend, N: NetBackend> Drop for HvfDeviceBus<B, N> {
+    /// dispatcher の `Arc` は vCPU の `MmioHandler` や `HvfVmParts` も持ち、バスを drop してもデバイス（と backend）は
+    /// dispatcher の範囲表に残る。RAM と VM の解放より前にデバイスを手放すため、ここで範囲表を空にする（MVM-5・REPAIR-5）。
+    /// vCPU スレッドがロックを持ったまま止まっている（期限切れ）場合に待たないよう `try_lock` を使い、
+    /// 取れなければ空にしない（そのときは RAM もリークされ、解放順序の違反は起きない）。
+    fn drop(&mut self) {
+        match self.dispatcher.try_lock() {
+            Ok(mut d) => d.clear(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clear(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+    }
 }
 
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDeviceBus<B, N> {

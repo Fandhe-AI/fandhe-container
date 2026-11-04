@@ -265,6 +265,17 @@ fn write_map(map: &mut GuestRamMap, offset: u64, data: &[u8]) -> Result<(), Micr
     map.write_from(off, data).map_err(|()| out_of_range())
 }
 
+fn read_u16_map(map: &GuestRamMap, offset: u64) -> Result<u16, MicrovmError> {
+    let off = usize::try_from(offset).map_err(|_| out_of_range())?;
+    map.read_u16_le_aligned(off).map_err(|()| out_of_range())
+}
+
+fn write_u16_map(map: &mut GuestRamMap, offset: u64, v: u16) -> Result<(), MicrovmError> {
+    let off = usize::try_from(offset).map_err(|_| out_of_range())?;
+    map.write_u16_le_aligned(off, v)
+        .map_err(|()| out_of_range())
+}
+
 /// まだ KVM に登録していない、mmap 済みのゲスト RAM。
 ///
 /// [`GuestMemoryBacking`] を実装するので、登録前のゲストメモリ（カーネル・initrd の書き込み）にも使える。
@@ -335,6 +346,12 @@ impl GuestMemoryBacking for GuestRam {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         write_map(&mut self.map, offset, data)
     }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        read_u16_map(&self.map, offset)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        write_u16_map(&mut self.map, offset, v)
+    }
 }
 
 /// KVM の memslot に登録済みのゲスト RAM。
@@ -359,6 +376,14 @@ impl GuestMemoryBacking for RegisteredGuestRam {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         let map = self.map.as_mut().ok_or_else(out_of_range)?;
         write_map(map, offset, data)
+    }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        let map = self.map.as_ref().ok_or_else(out_of_range)?;
+        read_u16_map(map, offset)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        let map = self.map.as_mut().ok_or_else(out_of_range)?;
+        write_u16_map(map, offset, v)
     }
 }
 

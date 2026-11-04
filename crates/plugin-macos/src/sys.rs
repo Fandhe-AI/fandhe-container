@@ -187,6 +187,15 @@ fn register() -> Result<(), PluginError> {
 /// `custom_flags` だけで済むため `unsafe` は使わない。フラグ値は OS・アーキテクチャで異なるため
 /// `cfg` で分け、値を確認済みの組（Linux x86_64 / aarch64・macOS）以外では通常の open にフォールバックする
 /// （その場合の保護は呼び出し側の事前検査と事後検証のみで、TOCTOU は塞がらない）。
+///
+/// パスは正規化せずそのまま `open(2)` へ渡す。通常ファイルに末尾 `/` を付けるとカーネルが `ENOTDIR` で拒否する
+/// （試験 `sec1_3866_open_nofollow_nonblock_rejects_trailing_slash_on_regular_file`）。一方 Linux では、
+/// 末尾 `/` があると `O_NOFOLLOW` があっても最終要素のディレクトリへの symlink を辿るため、
+/// 「ディレクトリへの symlink + 末尾 `/`」は open が成功しうる（`plugin-microvm` の `open_regular_nofollow` は
+/// components の正規化で `/` を落とし `ELOOP` で拒否するので、ここは既知の差）。挙動は変えない: 呼び出し元の
+/// `gpu::venus::replay::player` が先に `symlink_metadata` で通常ファイルかを確かめ（`lstat("link/")` は辿った先の
+/// ディレクトリを返すので拒否される）、open の後にも `metadata` で再検証するため、通常ファイル以外は読まない
+/// （SEC-1・#3866）。
 pub fn open_nofollow_nonblock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -269,14 +278,136 @@ mod tests {
 
     use super::*;
 
-    /// TASK-115.5・MAC-1: 登録に成功し（Linux 以外の非対応 OS では何もせず `Ok`）、初期値は偽。
-    #[cfg(not(all(
-        target_os = "linux",
-        not(any(target_arch = "x86_64", target_arch = "aarch64"))
-    )))]
+    /// 子プロセス（自己再実行）の役を示す環境変数。値 `1` のときだけ、下の試験が登録と送信を行う。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    const SIGTERM_CHILD_ENV: &str = "FANDHE_CONTAINER_PLUGIN_MACOS_SIGTERM_CHILD";
+
+    /// TASK-115.5・MAC-1・PLUG-1・REPAIR-5・REPAIR-12・#3866: 登録に成功してフラグが立つこと、
+    /// 子は落ちず 2 回目でも立ったままであること。送信は `kill` コマンドで行い、`unsafe` の面を `signal` 1 箇所に保つ。
+    ///
+    /// `install_sigterm_flag` はプロセス全体の SIGTERM の disposition を変え解除しないため、試験バイナリ自身で
+    /// 呼ぶと同じバイナリの他の試験や、外からの SIGTERM による停止（CI の watchdog・ステップ期限）が効かなくなる。
+    /// そこで自己再実行した子プロセスの中でだけ登録と送信を行い、親は登録せず子の固定行と `1 passed` を
+    /// 期限つきで照合する（子のハングは kill して失敗にする。REPAIR-5）。plugin-microvm の同名方式（#3842）と同じ。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn task115_5_mac1_install_succeeds_and_flag_starts_false() {
+        use std::time::{Duration, Instant};
+
+        if std::env::var(SIGTERM_CHILD_ENV).as_deref() == Ok("1") {
+            fn send_term() {
+                let status = std::process::Command::new("kill")
+                    .args(["-TERM", &std::process::id().to_string()])
+                    .status()
+                    .expect("spawn kill");
+                assert!(status.success(), "kill -TERM failed: {status:?}");
+            }
+
+            assert!(!SIGTERM_RECEIVED.load(Ordering::SeqCst));
+            let flag = install_sigterm_flag().expect("install");
+            assert!(std::ptr::eq(flag, &SIGTERM_RECEIVED));
+            assert!(!flag.load(Ordering::SeqCst));
+
+            send_term();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "SIGTERM flag not set within 5s of kill -TERM"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            println!("sigterm-child: flag_set=1");
+
+            // BSD セマンティクスでハンドラが残ること: 2 回目でもプロセスが生きていて、フラグは立ったまま。
+            send_term();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(flag.load(Ordering::SeqCst));
+            println!("sigterm-child: survived_second=1");
+            return;
+        }
+
+        // 親: 試験バイナリ本体は登録しない（SIGTERM の disposition を変えない）。初期値は偽。
+        assert!(!SIGTERM_RECEIVED.load(Ordering::SeqCst));
+        // `module_path!()` は `<crate>::sys::tests`。libtest の試験名は crate 名を含まない。
+        let module = module_path!();
+        let name = format!(
+            "{}::task115_5_mac1_install_succeeds_and_flag_starts_false",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(SIGTERM_CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        // 出力は別スレッドで読み切る（パイプ詰まりで子が止まるのを避ける）。
+        let mut out = child.stdout.take().expect("stdout");
+        let mut err = child.stderr.take().expect("stderr");
+        let t_out = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut out, &mut s);
+            s
+        });
+        let t_err = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+            s
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("sigterm child did not finish within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stdout = t_out.join().expect("join stdout");
+        let stderr = t_err.join().expect("join stderr");
+        assert!(
+            status.success(),
+            "child failed: {status:?}\n{stdout}\n{stderr}"
+        );
+        for want in [
+            "sigterm-child: flag_set=1",
+            "sigterm-child: survived_second=1",
+        ] {
+            let n = stdout.lines().filter(|l| l.contains(want)).count();
+            assert_eq!(n, 1, "expected exactly one `{want}`:\n{stdout}");
+        }
+        // 名前の誤りで 0 件実行になった場合は固定行が欠けて上で失敗する。要約行も具体値で確認する。
+        assert!(
+            stdout.lines().any(|l| l.contains("1 passed")),
+            "libtest summary missing:\n{stdout}"
+        );
+    }
+
+    /// TASK-115.5・MAC-1・REPAIR-3: Linux 以外の非対応 OS（Windows・他の unix）は何も登録せず、
+    /// 決して立たないフラグを `Ok` で返す。登録しないのでプロセス内で実行してよい。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn task115_5_mac1_install_succeeds_and_flag_starts_false() {
         let flag = install_sigterm_flag().expect("install");
+        assert!(std::ptr::eq(flag, &SIGTERM_RECEIVED));
         assert!(!flag.load(Ordering::SeqCst));
     }
 
@@ -309,5 +440,49 @@ mod tests {
     #[test]
     fn task115_5_mac1_sigterm_number_is_15() {
         assert_eq!(imp::SIGTERM, 15);
+    }
+
+    /// 試験専用の一時ディレクトリ（`Drop` で消す）。
+    #[cfg(unix)]
+    struct TmpDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("fandhe-plugin-macos-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create tmp dir");
+            Self(p)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// SEC-1・#3866: 通常ファイルに末尾 `/` を付けたパスは、正規化せず `open(2)` へ渡すためカーネルが
+    /// `ENOTDIR` で拒否する。末尾 `/` なしでは同じファイルが読める（陽性対照）。
+    #[cfg(unix)]
+    #[test]
+    fn sec1_3866_open_nofollow_nonblock_rejects_trailing_slash_on_regular_file() {
+        use std::io::Read;
+        let dir = TmpDir::new("trailing-slash");
+        let file = dir.0.join("k");
+        std::fs::write(&file, b"payload").expect("write");
+
+        let mut s = String::new();
+        open_nofollow_nonblock(&file)
+            .expect("open without slash")
+            .read_to_string(&mut s)
+            .expect("read");
+        assert_eq!(s, "payload");
+
+        let with_slash = std::path::PathBuf::from(format!("{}/", file.display()));
+        let err = open_nofollow_nonblock(&with_slash).expect_err("trailing slash must be rejected");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
     }
 }

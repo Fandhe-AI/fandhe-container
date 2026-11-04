@@ -538,6 +538,9 @@ struct WorkDir {
     guard: Option<std::fs::File>,
 }
 
+/// [`WorkDir`] の名前に足す、プロセス内で一意な連番。
+static WORKDIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl WorkDir {
     fn create(root: &Path) -> Result<Self, SmallFilesError> {
         Self::create_with_prefix(root, "fandhe-small-files")
@@ -555,7 +558,11 @@ impl WorkDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = root.join(format!("{prefix}-{}-{nanos:x}", std::process::id()));
+        // macOS の SystemTime はマイクロ秒刻みのため、同一プロセスの並列スレッドが同じ値を得て
+        // 名前が衝突し `AlreadyExists` になりうる。プロセス内で単調増加する連番を足して一意にする
+        // （IO-6・REPAIR-12・#3901）。
+        let seq = WORKDIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = root.join(format!("{prefix}-{}-{nanos:x}-{seq}", std::process::id()));
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]

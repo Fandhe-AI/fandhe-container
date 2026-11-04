@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 /// テスト専用の一意なルート。Drop で消す。
 struct TestRoot(PathBuf);
 
+/// テスト root の名前に足す、プロセス内で一意な連番（macOS の時計の粗さによる衝突の回避。#3901）。
+static ROOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl TestRoot {
     fn new(tag: &str) -> Self {
         let nanos = std::time::SystemTime::now()
@@ -19,8 +22,9 @@ impl TestRoot {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let p = std::env::temp_dir().join(format!(
-            "fandhe-sf-test-{tag}-{}-{nanos:x}",
-            std::process::id()
+            "fandhe-sf-test-{tag}-{}-{nanos:x}-{}",
+            std::process::id(),
+            ROOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&p).expect("create test root");
         Self(p)
@@ -39,9 +43,10 @@ impl TestRoot {
             std::env::temp_dir()
         };
         let p = base.join(format!(
-            "fsp-{}-{:x}",
+            "fsp-{}-{:x}-{}",
             std::process::id(),
-            nanos & 0xffff_ffff
+            nanos & 0xffff_ffff,
+            ROOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&p).expect("create short test root");
         Self(p)

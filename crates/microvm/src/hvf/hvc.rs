@@ -16,25 +16,63 @@
 //!
 //! # 未実装（REPAIR-3）
 //! FDT は `method = "hvc"` のため SMC はゲストの誤りで NOT_SUPPORTED を返す。HVF が SMC で exit するか（HCR_EL2.TSC の扱い）は
-//! 未確認で #3803 で記録する。CPU_ON 等の電源管理と SMP は対象外（`crate::psci` の doc 参照）。
+//! 未確認で #3803 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。
+//! AP の実起動と CPU_OFF 後の parked への戻しは #3891 で結ぶ（CPU_OFF 成功の `PsciAction::CpuOff` は現状 `Err` で fail-closed。`crate::psci` の doc 参照）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
 use crate::hvf_loop::ExitAction;
-use crate::psci::{self, PsciAction};
+use crate::psci::{self, BootCpuOnly, CpuPowerControl, PsciAction, PsciArgs, PsciCpus};
 use crate::stop::StopReason;
 use crate::sys::HvVcpu;
+use std::fmt;
+use std::sync::Arc;
 
-/// HVC / SMC ハンドラの状態。現状は状態を持たない（将来 SMP の電源状態を持たせる）。
-#[derive(Debug, Default)]
+/// HVC / SMC ハンドラの状態。vCPU の電源状態の表（vCPU スレッド間で共有）・起動停止の境界・自 vCPU の index を持つ。
 pub struct HvcHandler {
-    _private: (),
+    cpus: Arc<PsciCpus>,
+    power: Arc<dyn CpuPowerControl>,
+    index: u32,
+}
+
+impl fmt::Debug for HvcHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvcHandler")
+            .field("cpus", &self.cpus)
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for HvcHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HvcHandler {
-    /// 空のハンドラを作る。
+    /// 1 vCPU 構成の既定のハンドラを作る（CPU_ON(0) は ALREADY_ON・他は INVALID_PARAMETERS・CPU_OFF は DENIED）。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cpus: Arc::new(PsciCpus::single()),
+            power: Arc::new(BootCpuOnly),
+            index: 0,
+        }
+    }
+
+    /// 共有の電源状態表と起動停止の境界から作る（#3891 が AP のスレッドごとに使う）。`index` が表の範囲外なら `InvalidArgument`。
+    pub fn with_cpus(
+        cpus: Arc<PsciCpus>,
+        power: Arc<dyn CpuPowerControl>,
+        index: u32,
+    ) -> Result<Self, MicrovmError> {
+        if cpus.state(index).is_none() {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "vcpu index out of range",
+            ));
+        }
+        Ok(Self { cpus, power, index })
     }
 }
 
@@ -45,14 +83,23 @@ fn gpr(n: u8) -> Result<HvReg, MicrovmError> {
 /// HVC（PSCI）を処理する。`vcpu.rs` の dispatch から呼ばれる。
 pub fn handle_hvc(
     vcpu: &mut HvVcpu<'_>,
-    _handler: &mut HvcHandler,
+    handler: &mut HvcHandler,
     imm16: u16,
     _exception: &HvVcpuExitException,
 ) -> Result<ExitAction, MicrovmError> {
     let x0_reg = gpr(0)?;
     let x0 = vcpu.get_reg(x0_reg)?;
     let x1 = vcpu.get_reg(gpr(1)?)?;
-    match psci::handle_call(imm16, x0, x1) {
+    let x2 = vcpu.get_reg(gpr(2)?)?;
+    let x3 = vcpu.get_reg(gpr(3)?)?;
+    let args = PsciArgs {
+        imm16,
+        x0,
+        x1,
+        x2,
+        x3,
+    };
+    match psci::handle_call(&handler.cpus, handler.power.as_ref(), handler.index, args)? {
         PsciAction::Return(r) => {
             vcpu.set_reg(x0_reg, r.to_x0())?;
             // PC は進めない（モジュール doc「PC の扱い」。仮定を変えるときはこの 1 箇所だけを直す）。
@@ -61,6 +108,11 @@ pub fn handle_hvc(
         PsciAction::SystemOff | PsciAction::SystemReset => {
             Ok(ExitAction::Stop(StopReason::GuestShutdown))
         }
+        // parked へ戻す機構は #3891 まで無い。既定構成の power_off は DENIED を返すのでここには届かない（fail-closed）。
+        PsciAction::CpuOff { .. } => Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "cpu_off parking is not implemented",
+        )),
     }
 }
 

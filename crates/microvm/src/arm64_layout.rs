@@ -25,7 +25,7 @@
 //!   （Linux `drivers/tty/serial/8250/8250_of.c` の `of_platform_serial_setup` の理解。`serial/8250.yaml` の
 //!   `required` からは逸脱する。実ゲストでの確認は後続）。
 //!
-//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・PSCI CPU_ON・`HVF_MAX_VCPUS` の引き上げ。バックエンドは 1 vCPU のまま。
+//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・`HVF_MAX_VCPUS` の引き上げ・PSCI の実起動の結線〔状態機械は `psci.rs`。#3883・結線は #3884 / #3891〕。バックエンドは 1 vCPU のまま。
 //! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
 //! HvfMicroVm へのシリアル結線とバス上限の調整・シリアルの割り込みとゲスト入力・PCI・IPA 上限の確定（#3803）。
 //!

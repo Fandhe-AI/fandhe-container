@@ -538,6 +538,9 @@ struct WorkDir {
     guard: Option<std::fs::File>,
 }
 
+/// [`WorkDir`] の名前に足す、プロセス内で一意な連番。
+static WORKDIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl WorkDir {
     fn create(root: &Path) -> Result<Self, SmallFilesError> {
         Self::create_with_prefix(root, "fandhe-small-files")
@@ -555,7 +558,22 @@ impl WorkDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = root.join(format!("{prefix}-{}-{nanos:x}", std::process::id()));
+        Self::create_at(root, prefix, std::process::id(), nanos)
+    }
+
+    /// 時刻値 `nanos` と `pid` を明示して作る（同じ時刻値でも名前が衝突しないことの試験用に切り出し。
+    /// `root` の検査は呼び出し元が済ませている）。
+    fn create_at(
+        root: &Path,
+        prefix: &str,
+        pid: u32,
+        nanos: u128,
+    ) -> Result<Self, SmallFilesError> {
+        // macOS の SystemTime はマイクロ秒刻みのため、同一プロセスの並列スレッドが同じ値を得て
+        // 名前が衝突し `AlreadyExists` になりうる。プロセス内で単調増加する連番を足して一意にする
+        // （IO-6・REPAIR-12・#3901）。
+        let seq = WORKDIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = root.join(format!("{prefix}-{pid}-{nanos:x}-{seq}"));
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -883,6 +901,33 @@ pub fn execute(command: Command) -> Result<Execution, SmallFilesError> {
 
 #[cfg(test)]
 mod tests {
+    /// REPAIR-12・IO-6（#3901）: 同じ root・prefix・pid・時刻値でも、連番により名前がすべて異なり
+    /// 作成も成功する（macOS の粗い時計の再現）。
+    #[test]
+    fn repair12_io6_workdir_names_are_unique_for_identical_clock_value() {
+        let root = std::env::temp_dir().join(format!("fsf-uniq-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut dirs = Vec::new();
+        for _ in 0..8 {
+            dirs.push(
+                super::WorkDir::create_at(&root, "fcsf", 4242, 0x1234)
+                    .expect("same clock value must not collide"),
+            );
+        }
+        let mut names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 8);
+        for n in &names {
+            assert!(n.starts_with("fcsf-4242-1234-"), "{n}");
+        }
+        drop(dirs);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {

@@ -4,8 +4,10 @@
 //! 本物の `KvmBackend` は使わない。`start` が最初に `/dev/kvm` を開くため、KVM の無い機では `Unimplemented` ではなく
 //! NotFound / PermissionDenied になり、KVM を開かずに確かめる目的に合わないため。そこで microvm の `Unimplemented` を返す
 //! 偽の `MicrovmBackend` を adapter（`MicrovmRuntimeAdapter`）へ差し、`RequestHandler::handle`（frame_loop が呼ぶ入口）から
-//! 写像 `to_plugin_error` までを通す。KVM のある aarch64 機で本物の `plan_layout` の `Unimplemented` を通しで確かめる照合は、
-//! ネイティブ arm64 の CI ができた後の課題（#2274。REPAIR-3: 未実施を装わない）。
+//! 写像 `to_plugin_error` までを通す。aarch64 の本物の `KvmBackend` は `plan_layout_arm64` と
+//! `assemble` の aarch64 分岐（#3696・#3899）を通って起動まで実装済みで、`Unimplemented` を返さない（実機での通しは未検証。#3781・#2274。
+//! REPAIR-3: 未実施を装わない）。このため本物の backend で `Unimplemented` の写像を通しで確かめられる arch は現状無く、
+//! 本試験は偽 backend による写像の照合に徹する（x86_64・aarch64 以外では `sys` の fail-closed の `Unsupported` が先に効きうる）。
 //!
 //! 実行の扱い: ネイティブ arm64 の CI が無いため、現状は `cross-target-check` の `aarch64-unknown-linux-gnu` の
 //! 型検査・clippy（`--all-targets --all-features`）に留まり、実行はされない。x86_64 では cfg により空になる。

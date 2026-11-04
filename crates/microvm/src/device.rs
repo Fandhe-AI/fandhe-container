@@ -21,8 +21,8 @@
 //! #3696（MVM-1）で aarch64 の vGICv3（`KVM_CREATE_DEVICE`。`VgicV3`）と起動レジスタ（`KVM_SET_ONE_REG`。`VcpuFd::set_arm64_boot_state`）を足した。
 //! resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
-//! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
-//! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する [`VcpuFd::set_boot_lints`] と観測用の [`VcpuFd::lapic_lints`] を足した。
+//! 観測用の `VcpuFd::regs`（x86_64 のみ）を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の `VcpuFd::set_msrs`・`VcpuFd::set_fpu` と観測用の `VcpuFd::msrs`・`VcpuFd::fpu`（いずれも x86_64 のみ） を足した。
+//! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する `VcpuFd::set_boot_lints` と観測用の `VcpuFd::lapic_lints`（x86_64 のみ） を足した。
 //! 失敗は panic せず [`MicrovmError`]（ERR-1）で返す。`unsafe` は `crate::sys` に閉じる。
 //!
 //! # アーキテクチャ別の vCPU 作成

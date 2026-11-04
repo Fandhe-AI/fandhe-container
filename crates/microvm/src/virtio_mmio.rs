@@ -21,7 +21,39 @@
 //! 不正なアクセスは [`IgnoredAccess`] つきで無視して呼び出し元へ返す（ホストのエラーにはしない）。
 //! `unsafe` は使わない。
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+use std::sync::{Arc, Mutex};
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+use crate::dispatch::MmioDevice;
 use crate::error::{MicrovmError, MicrovmErrorCode};
+
+/// （Linux の `microvm` と macOS の `hvf::microvm`〔#3797〕が共有するため OS 非依存のここに置く。挙動は元のまま。）
+///
+/// dispatcher（所有を要求する）と VM 構成体（型つきで触る）がトランスポートを共有するためのラッパー。
+///
+/// lock が poison していたらデバイスは応答をやめる（fail-closed。`MmioDevice` は `Result` を返せない）。
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) struct SharedTransport<D: VirtioDevice>(pub(crate) Arc<Mutex<VirtioMmioTransport<D>>>);
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<D: VirtioDevice + Send> MmioDevice for SharedTransport<D> {
+    fn read(&self, offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+        match self.0.lock() {
+            Ok(t) => t.read(offset, data),
+            Err(_) => {
+                data.fill(0);
+                MmioReadOutcome::Ignored(IgnoredAccess::WrongDeviceState)
+            }
+        }
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
+        match self.0.lock() {
+            Ok(mut t) => t.write(offset, data),
+            Err(_) => MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState),
+        }
+    }
+}
 
 /// 設定空間の先頭オフセット（仕様 4.2.2。0x100 以降がデバイス固有）。
 const CONFIG_BASE: u64 = 0x100;

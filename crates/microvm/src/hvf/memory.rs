@@ -31,6 +31,7 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
+use crate::hvf::gic::VmWithGic;
 use crate::hvf_abi::{MemoryFlags, check_ipa_limit};
 use crate::sys::{GuestMapping, HostMapping, HvVm};
 
@@ -78,6 +79,25 @@ impl HvfGuestRam {
         let len = self.host.len();
         check_ipa_limit(base.raw(), len as u64, ipa_limit)?;
         let mapping = vm.map(self.host, 0, base.raw(), len, MemoryFlags::RWX)?;
+        GuestMemory::new(base, RegisteredHvfRam { mapping })
+    }
+
+    /// [`Self::register`] の `Arc` 版。対応付けが VM を `Arc` で保持するため `'static` になり、`VmWithGic` を `Arc` で共有する構成体
+    /// （`HvfMicroVm`。#3797）が自己参照なしに RAM を持てる。検査の順序と失敗時の解放は `register` と同じ。
+    ///
+    /// 契約: 対応付けが残る間は `Arc<HvVm>` も残るので、VM の破棄（`hv_vm_destroy`）は必ず unmap の後になる。
+    /// `GuestMapping` は生ポインタを持つため `Send` ではない（vCPU スレッドからゲスト RAM を触る必要が出たら #3793・#3798 が判断する。REPAIR-3）。
+    pub fn register_shared(
+        self,
+        vm: &VmWithGic,
+        base: GuestAddress,
+        ipa_limit: u64,
+    ) -> Result<GuestMemory<RegisteredHvfRam<'static>>, MicrovmError> {
+        let len = self.host.len();
+        check_ipa_limit(base.raw(), len as u64, ipa_limit)?;
+        let mapping = vm
+            .shared_vm()
+            .map_shared(self.host, 0, base.raw(), len, MemoryFlags::RWX)?;
         GuestMemory::new(base, RegisteredHvfRam { mapping })
     }
 }

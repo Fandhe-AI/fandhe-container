@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -889,4 +889,190 @@ fn hvf_device_mmio_reaches_virtio_mmio() {
     map_a.unmap().unwrap();
     map_b.unmap().unwrap();
     drop(vm);
+}
+
+/// 組み立ての試験の全体期限。ハングを失敗として残す（REPAIR-5）。
+const ASSEMBLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// 期限 watchdog（超過は `hvf_device: WATCHDOG EXPIRED` と終了コード 124）。panic しても止めて join する RAII ガード。
+struct Watchdog(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+
+impl Watchdog {
+    fn start(deadline: Duration) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&flag);
+        let h = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < deadline {
+                if f.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+        Watchdog(flag, Some(h))
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        if let Some(h) = self.1.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// 合成の arm64 Image。先頭の命令は `b .`（自分自身への分岐）で、ゲストはその場で走り続ける。
+/// ヘッダ（64 バイト）: offset 0 = code0、8 = text_offset、16 = image_size、24 = flags、56 = magic（`ARM\x64`）。
+fn synthetic_image(magic_ok: bool) -> Vec<u8> {
+    use fandhe_container_microvm::boot_arm64::ARM64_IMAGE_MAGIC;
+    let mut img = vec![0u8; 4096];
+    img[0..4].copy_from_slice(&0x1400_0000u32.to_le_bytes());
+    img[8..16].copy_from_slice(&0x8_0000u64.to_le_bytes());
+    img[16..24].copy_from_slice(&4096u64.to_le_bytes());
+    // flags = 0（リトルエンディアン・ページサイズ未指定）のまま。
+    let magic = if magic_ok { ARM64_IMAGE_MAGIC } else { 0 };
+    img[56..60].copy_from_slice(&magic.to_le_bytes());
+    img
+}
+
+fn assemble_config(
+    layout: Arm64Layout,
+    kernel: Vec<u8>,
+    block: usize,
+) -> fandhe_container_microvm::hvf::HvfMicroVmConfig<
+    fandhe_container_microvm::virtio_block::MemoryBlockBackend,
+    fandhe_container_microvm::virtio_net::MemoryNetBackend,
+> {
+    use fandhe_container_microvm::hvf::{HvfMicroVmConfig, VcpuThreadConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    HvfMicroVmConfig {
+        layout,
+        kernel,
+        initrd: None,
+        cmdline: "console=ttyAMA0".to_string(),
+        block: (0..block)
+            .map(|_| MemoryBlockBackend::new(512 * 1024, false).unwrap())
+            .collect(),
+        net: Vec::new(),
+        vcpu: VcpuThreadConfig::default(),
+    }
+}
+
+/// 環境の前提（権限・macOS 15 以降）を、組み立てとは別に先に確かめる。
+fn require_vm_with_gic(layout: &Arm64Layout) {
+    drop(create_vm_with_gic_or_precondition(layout));
+}
+
+/// microVM 構成体の組み立て（TASK-192.15・#3797・MVM-5・MVM-1）。
+/// vcpus = 2 が `Unimplemented`（資源を作る前）、正しい構成の組み立てで vCPU 0 の X0・PC・CPSR・MPIDR_EL1 の読み戻しが期待値と
+/// 一致し、SCTLR_EL1 の M・C が 0、ゲスト RAM の FDT の位置に BE の `0xd00dfeed`、デバイスの窓と SPI が期待どおりであること、
+/// drop の後に VM を作り直せること（解放の観測）を確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_assemble_sets_boot_registers() {
+    use fandhe_container_microvm::arm64_layout::ARM64_VIRTIO_MMIO_BASE;
+    use fandhe_container_microvm::boot_arm64::{
+        ARM64_BOOT_CPSR, ARM64_MPIDR_AFFINITY_MASK, SCTLR_EL1_C, SCTLR_EL1_M,
+    };
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    require_vm_with_gic(&layout);
+
+    // 1. vcpus = 2 は資源を作る前に Unimplemented。直後に VM を作れる = 何も作っていない。
+    let mut two = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    two.vcpus = 2;
+    let e = HvfMicroVm::assemble(assemble_config(two, synthetic_image(true), 1)).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    drop(create_vm_or_precondition());
+
+    // 2. 正しい構成。
+    let vm = HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1)).unwrap();
+
+    // 3. 起動レジスタ（生の値は #3803 の記録用に出す）。
+    let boot = *vm.boot_registers();
+    eprintln!(
+        "hvf_device: boot x0={:#x} pc={:#x} cpsr={:#x} mpidr_el1={:#x} sctlr_el1={:#x}",
+        boot.x0, boot.pc, boot.cpsr, boot.mpidr, boot.sctlr
+    );
+    assert_eq!(boot.x0, vm.loaded().fdt.base.raw());
+    assert_eq!(boot.pc, vm.loaded().kernel.base.raw());
+    assert_eq!(boot.pc, 0x4000_0000 + 0x8_0000);
+    assert_eq!(boot.cpsr, ARM64_BOOT_CPSR);
+    assert_eq!(boot.cpsr, 0x3c5);
+    assert_eq!(
+        boot.mpidr & ARM64_MPIDR_AFFINITY_MASK,
+        u64::from(ARM64_BOOT_CPU_MPIDR)
+    );
+    assert_eq!(boot.sctlr & (SCTLR_EL1_M | SCTLR_EL1_C), 0);
+
+    // 4. FDT の先頭は BE の 0xd00dfeed。
+    let mut magic = [0u8; 4];
+    vm.read_guest(vm.loaded().fdt.base.raw(), &mut magic)
+        .unwrap();
+    assert_eq!(magic, 0xd00d_feedu32.to_be_bytes());
+
+    // 5. デバイス: block 1 台。窓 0x0a00_0000、SPI 16 -> INTID 48。
+    let devices = vm.devices();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].window.base.raw(), ARM64_VIRTIO_MMIO_BASE);
+    assert_eq!(devices[0].window.base.raw(), 0x0a00_0000);
+    assert_eq!(devices[0].spi_intid, 48);
+
+    // 6. `b .` のゲストは走り続ける。
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!vm.is_vcpu_finished());
+
+    // 7. drop（vCPU の停止 -> RAM の unmap -> VM の破棄）の後に VM を作り直せる。
+    drop(vm);
+    drop(create_vm_or_precondition());
+}
+
+/// 途中失敗の後の再 assemble（TASK-192.15・#3797・MVM-5・REPAIR-3）。
+/// GIC の配置違反（VM を作る前）と不正 Image（VM・GIC・RAM を作った後）の失敗が資源を残さず、同じプロセスで正常な assemble が
+/// 成功すること、`map_shared` の対応付けが VM を生かしておくこと（所有側の `Arc` を落としても作り直せない）を確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_assemble_retries_after_failure() {
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    require_vm_with_gic(&layout);
+
+    // 1. GIC の配置違反: VM を作る前に InvalidArgument。
+    let mut bad_gic = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    bad_gic.gic_dist.base = GuestAddress::new(bad_gic.gic_dist.base.raw() + 1);
+    let e = HvfMicroVm::assemble(assemble_config(bad_gic, synthetic_image(true), 1)).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+
+    // 2. 不正 Image（magic 違反）: VM・GIC・RAM を作った後の失敗。
+    let e = HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(false), 1))
+        .unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+
+    // 3. 解放済みなので正常な assemble が成功する（解放漏れなら 2 回目の HvVm::create が FailedPrecondition）。
+    let vm = HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1)).unwrap();
+    drop(vm);
+    drop(create_vm_or_precondition());
+
+    // 4. map_shared の対応付けは Arc<HvVm> を保持する: 所有側の Arc を落としても VM は残り、作り直せない。
+    let vm = Arc::new(create_vm_or_precondition());
+    let page = HostMapping::page_size().unwrap();
+    let host = HostMapping::new(page).unwrap();
+    let mapping = vm
+        .map_shared(host, 0, 0x4000_0000, page, MemoryFlags::RWX)
+        .unwrap();
+    drop(vm);
+    assert_eq!(
+        HvVm::create().unwrap_err().code(),
+        MicrovmErrorCode::FailedPrecondition
+    );
+    mapping.unmap().unwrap();
+    drop(create_vm_or_precondition());
 }

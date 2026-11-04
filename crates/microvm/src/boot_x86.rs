@@ -359,9 +359,13 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
 /// タイマー割り込みの注入経路も無く検査に失敗して起動できない。そのため `microvm.rs` の `load_kernel` が
 /// 常に付ける。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
 pub fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
+    // 公開 API の直接呼び出しでも、複製の前に上限を超える入力を拒否する（確保の無制限化を防ぐ）。
+    if user.len() as u64 >= CMDLINE_CAPACITY {
+        return Err(invalid("kernel command line too long"));
+    }
     let (head, tail) = split_at_init_args(user)?;
     let mut text = head.to_owned();
-    if !head.split(' ').any(|t| t == "no_timer_check") {
+    if !has_standalone_token(head, "no_timer_check") {
         if !text.is_empty() {
             text.push(' ');
         }
@@ -371,7 +375,30 @@ pub fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
         text.push(' ');
         text.push_str(tail);
     }
+    if text.len() as u64 >= CMDLINE_CAPACITY {
+        return Err(invalid("kernel command line too long"));
+    }
     Ok(text)
+}
+
+/// 引用符の外の空白で区切った独立トークンに `name` が完全一致で含まれるか。
+/// `foo="x no_timer_check y"` のように引用符内にある文字列は独立した引数とみなさない。
+fn has_standalone_token(text: &str, name: &str) -> bool {
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    for i in 0..=bytes.len() {
+        let c = bytes.get(i).copied();
+        if c == Some(b'"') {
+            in_quote = !in_quote;
+        } else if !in_quote && (c.is_none() || c == Some(b' ')) {
+            if text.get(start..i) == Some(name) {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    false
 }
 
 /// 検証済みの cmdline（印字可能な ASCII のみ。virtio-mmio の項目はコードが型つきの値から生成して足す）。
@@ -1345,6 +1372,14 @@ mod tests {
             "console=ttyS0 reboot=t no_timer_check"
         );
         assert_eq!(with_no_timer_check("").unwrap(), "no_timer_check");
+        // 引用符内の no_timer_check は独立した引数ではないので、別途足す。
+        assert_eq!(
+            with_no_timer_check("foo=\"x no_timer_check y\"").unwrap(),
+            "foo=\"x no_timer_check y\" no_timer_check"
+        );
+        // 上限超過は複製前に拒否する。
+        let big = "a".repeat(CMDLINE_CAPACITY as usize);
+        assert!(with_no_timer_check(&big).is_err());
         assert_eq!(
             with_no_timer_check("console=ttyS0 no_timer_check").unwrap(),
             "console=ttyS0 no_timer_check"

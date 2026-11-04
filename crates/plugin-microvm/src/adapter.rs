@@ -428,8 +428,9 @@ impl Drop for ReadSlot {
     }
 }
 
-fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
-    let map_io = |e: std::io::Error| match e.kind() {
+/// イメージ読み取りの `io::Error` を固定文言の `PluginError` へ写す（パス・OS の文言は載せない。ERR-1）。
+fn map_io(e: std::io::Error, kind: ImageKind) -> PluginError {
+    match e.kind() {
         std::io::ErrorKind::NotFound => match kind {
             ImageKind::Kernel => perr(PluginErrorCode::NotFound, "kernel image not found"),
             ImageKind::Initrd => perr(PluginErrorCode::NotFound, "initrd image not found"),
@@ -439,7 +440,33 @@ fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>
             "permission denied reading image",
         ),
         _ => perr(PluginErrorCode::Internal, MSG_READ_FAILED),
-    };
+    }
+}
+
+/// `sys::open_regular_nofollow` の失敗を写す。入力不正（`INVALID_ARGUMENT`）にするのは「実体ではない」
+/// （ELOOP / ENOTDIR。`sys::is_not_real_entry`）だけで、EMFILE・EIO・ENAMETOOLONG 等は `INTERNAL`
+/// （NotFound / PermissionDenied は従来どおり）。`read_image_blocking` から呼ぶ（ERR-1・SEC-1・#3841）。
+#[cfg(unix)]
+fn map_nofollow_error(e: crate::sys::NoFollowOpenError, kind: ImageKind) -> PluginError {
+    use crate::sys::{NoFollowOpenError as E, is_not_real_entry};
+    match e {
+        E::InvalidPath => invalid(MSG_BAD_PATH),
+        #[cfg(not(any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )))]
+        E::Unsupported => perr(PluginErrorCode::Unimplemented, MSG_UNSUPPORTED_VERIFY),
+        E::Ancestor(io) if is_not_real_entry(&io) => invalid(MSG_BAD_ANCESTOR),
+        E::Leaf(io) if is_not_real_entry(&io) => invalid(MSG_NOT_REGULAR),
+        E::Ancestor(io) | E::Leaf(io) => map_io(io, kind),
+    }
+}
+
+fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
+    let map_io = |e: std::io::Error| map_io(e, kind);
     let lmeta = std::fs::symlink_metadata(path).map_err(map_io)?;
     if !lmeta.file_type().is_file() {
         return Err(invalid(MSG_NOT_REGULAR));
@@ -448,28 +475,8 @@ fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>
         return Err(invalid(MSG_TOO_LARGE));
     }
     #[cfg(unix)]
-    let file = {
-        use crate::sys::NoFollowOpenError as E;
-        crate::sys::open_regular_nofollow(path).map_err(|e| match e {
-            E::InvalidPath => invalid(MSG_BAD_PATH),
-            #[cfg(not(any(
-                target_os = "macos",
-                all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                )
-            )))]
-            E::Unsupported => perr(PluginErrorCode::Unimplemented, MSG_UNSUPPORTED_VERIFY),
-            E::Ancestor(io) => match io.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => map_io(io),
-                _ => invalid(MSG_BAD_ANCESTOR),
-            },
-            E::Leaf(io) => match io.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => map_io(io),
-                _ => invalid(MSG_NOT_REGULAR),
-            },
-        })?
-    };
+    let file =
+        { crate::sys::open_regular_nofollow(path).map_err(|e| map_nofollow_error(e, kind))? };
     // Windows: 祖先は検査しない（残余。モジュール doc 参照）。
     #[cfg(not(unix))]
     let file = std::fs::OpenOptions::new()
@@ -711,6 +718,94 @@ impl<B: MicrovmBackend> RequestHandler for MicrovmRuntimeAdapter<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `open_regular_nofollow` の errno を固定文言へ写す（ERR-1・SEC-1・#3841）。ELOOP / ENOTDIR だけが入力不正。
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
+    #[test]
+    fn sec1_err1_3841_nofollow_errno_mapping() {
+        use crate::sys::NoFollowOpenError as E;
+        use std::io::Error;
+        #[cfg(target_os = "linux")]
+        let (eloop, enametoolong, etimedout) = (40, 36, 110);
+        #[cfg(target_os = "macos")]
+        let (eloop, enametoolong, etimedout) = (62, 63, 60);
+        let k = ImageKind::Kernel;
+        let got = |e: PluginError| (e.code(), e.message().to_string());
+        for n in [eloop, 20] {
+            assert_eq!(
+                got(map_nofollow_error(
+                    E::Ancestor(Error::from_raw_os_error(n)),
+                    k
+                )),
+                (
+                    PluginErrorCode::InvalidArgument,
+                    MSG_BAD_ANCESTOR.to_string()
+                )
+            );
+            assert_eq!(
+                got(map_nofollow_error(E::Leaf(Error::from_raw_os_error(n)), k)),
+                (
+                    PluginErrorCode::InvalidArgument,
+                    MSG_NOT_REGULAR.to_string()
+                )
+            );
+        }
+        for (n, code, msg) in [
+            (2, PluginErrorCode::NotFound, "kernel image not found"),
+            (
+                13,
+                PluginErrorCode::PermissionDenied,
+                "permission denied reading image",
+            ),
+            (
+                1,
+                PluginErrorCode::PermissionDenied,
+                "permission denied reading image",
+            ),
+            (24, PluginErrorCode::Internal, MSG_READ_FAILED),
+            (5, PluginErrorCode::Internal, MSG_READ_FAILED),
+            (enametoolong, PluginErrorCode::Internal, MSG_READ_FAILED),
+            (etimedout, PluginErrorCode::Internal, MSG_READ_FAILED),
+        ] {
+            let want = (code, msg.to_string());
+            assert_eq!(
+                got(map_nofollow_error(
+                    E::Ancestor(Error::from_raw_os_error(n)),
+                    k
+                )),
+                want,
+                "ancestor {n}"
+            );
+            assert_eq!(
+                got(map_nofollow_error(E::Leaf(Error::from_raw_os_error(n)), k)),
+                want,
+                "leaf {n}"
+            );
+        }
+        assert_eq!(
+            got(map_nofollow_error(
+                E::Leaf(Error::from_raw_os_error(2)),
+                ImageKind::Initrd
+            )),
+            (
+                PluginErrorCode::NotFound,
+                "initrd image not found".to_string()
+            )
+        );
+        assert_eq!(
+            got(map_nofollow_error(E::InvalidPath, k)),
+            (PluginErrorCode::InvalidArgument, MSG_BAD_PATH.to_string())
+        );
+    }
 
     /// 画像読み込みの枠が尽きたとき、VM 数上限と区別できる文言で RESOURCE_EXHAUSTED になる（REPAIR-5・MVM-5）。
     #[test]

@@ -56,9 +56,9 @@
 //! # libc との機械照合（未導入）
 //! 本 crate は dev-dependencies に `libc` を持たないため照合は入れていない。dev-dependency の追加は crate ごとの
 //! オーナー承認事項で、#1837 の子として扱う（判断のまとめは #3290。`docs/design/ffi-libc-check.md`「適用状況」）。
-//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`）を具体値で固定する試験を置く。出典は
+//! 代わりに番号（`SIGTERM`・`O_*`・`AT_FDCWD`・`ELOOP`・`ENOTDIR`）を具体値で固定する試験を置く。出典は
 //! `O_*` / `AT_FDCWD` が Linux の `include/uapi/asm-generic/fcntl.h`・`arch/arm64/include/uapi/asm/fcntl.h`・
-//! macOS の `sys/fcntl.h`。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
+//! macOS の `sys/fcntl.h`。`ELOOP` / `ENOTDIR` は Linux の `include/uapi/asm-generic/errno.h`・`errno-base.h` と macOS の `sys/errno.h`（#3841）。`SIGTERM` の出典は Linux `include/uapi/asm-generic/signal.h`
 //! （SIGTERM=15。x86_64・aarch64 とも同じ）と macOS `sys/signal.h`（同値）、`SIG_ERR` は `(sighandler_t)-1`
 //! で、手作業で突き合わせた値である。
 
@@ -173,7 +173,8 @@ fn register() -> Result<(), PluginError> {
 // イメージパスの symlink 非追従 open（SEC-1・PLUG-1・REPAIR-3。#3748）
 // ---------------------------------------------------------------------------------------------
 
-/// [`open_regular_nofollow`] の失敗。errno の数値は持たず、段（祖先 / 最終要素）と `io::ErrorKind` だけで分類する。
+/// [`open_regular_nofollow`] の失敗。`io::Error` を保持し、分類は呼び出し側が [`is_not_real_entry`]
+/// （ELOOP / ENOTDIR）と `io::ErrorKind`（NotFound / PermissionDenied）で行う（ERR-1・#3841）。
 /// 呼び出し側（`adapter::read_image_blocking`）が固定文言へ写し、パスも OS のエラー文言も応答に載せない。
 #[cfg(unix)]
 #[derive(Debug)]
@@ -181,9 +182,10 @@ pub(crate) enum NoFollowOpenError {
     /// 絶対パスの `RootDir` + `Normal` 要素だけの形ではない（相対・最終要素なし・NUL を含む）。
     InvalidPath,
     /// 祖先の 1 要素を `O_DIRECTORY | O_NOFOLLOW` で開けなかった。祖先が symlink のとき Linux は `ENOTDIR`、
-    /// macOS は `ELOOP` を返すため、`NotFound` と `PermissionDenied` 以外は「祖先が実ディレクトリではない」と扱う。
+    /// macOS は `ELOOP` を返し、どちらも「祖先が実ディレクトリではない」と扱う。それ以外の errno は内部エラー。
     Ancestor(std::io::Error),
-    /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む）。
+    /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む。
+    /// `ELOOP` / `ENOTDIR` は「実体ではない」、それ以外の errno は内部エラー）。
     Leaf(std::io::Error),
     /// 定数を確認済みの組（macOS・Linux の x86_64 / aarch64）ではない。検査を省いて読まず拒否する（fail-closed）。
     #[cfg(not(any(
@@ -230,8 +232,17 @@ mod nofollow {
     pub(super) const O_CLOEXEC: i32 = 0o2000000;
     #[cfg(target_os = "linux")]
     pub(super) const O_NONBLOCK: i32 = 0o4000;
+    /// 最終要素が lstat の後に tty 等の文字デバイスへ差し替えられても、制御端末を持たないセッションリーダーの
+    /// plugin が制御端末を取得しないようにする（SEC-1・#3841）。x86_64 / aarch64 とも同値。
+    #[cfg(target_os = "linux")]
+    pub(super) const O_NOCTTY: i32 = 0o400;
     #[cfg(target_os = "linux")]
     pub(super) const AT_FDCWD: i32 = -100;
+    /// `ELOOP`（symlink の追従拒否）。Linux は 40、macOS は 62（`errno.h` / `sys/errno.h`）。
+    #[cfg(target_os = "linux")]
+    pub(super) const ELOOP: i32 = 40;
+    /// `ENOTDIR`（祖先が実ディレクトリではない）。Linux・macOS とも 20。
+    pub(super) const ENOTDIR: i32 = 20;
     /// 祖先の走査は検索（x）権限だけで通す（読み取り権限は要らない。symlink の拒否に一覧の読み取りは不要）。
     /// `O_PATH` は x86_64 / aarch64 とも同値（`0o10000000`）。macOS には `O_PATH` が無く `O_RDONLY` のまま。
     #[cfg(target_os = "linux")]
@@ -247,7 +258,16 @@ mod nofollow {
     #[cfg(target_os = "macos")]
     pub(super) const O_NONBLOCK: i32 = 0x4;
     #[cfg(target_os = "macos")]
+    pub(super) const O_NOCTTY: i32 = 0x0002_0000;
+    #[cfg(target_os = "macos")]
+    pub(super) const ELOOP: i32 = 62;
+    #[cfg(target_os = "macos")]
     pub(super) const AT_FDCWD: i32 = -2;
+
+    /// 祖先の open フラグ。macOS は `O_PATH` が無く実際に開くため `O_NOCTTY` が効く（Linux では `O_PATH` が無視する）。
+    pub(super) const DIR_FLAGS: i32 = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY;
+    /// 最終要素の open フラグ。`O_NONBLOCK` は FIFO で止まらないため、`O_NOCTTY` は制御端末の取得を避けるため。
+    pub(super) const LEAF_FLAGS: i32 = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
 
     unsafe extern "C" {
         // SAFETY（宣言そのものの妥当性）: POSIX の `int openat(int, const char *, int, ...)`。
@@ -259,7 +279,7 @@ mod nofollow {
     /// `dirfd` 基準で `name`（1 要素）を `flags` で開く。
     fn openat_raw(dirfd: i32, name: &CString, flags: i32) -> io::Result<File> {
         // SAFETY: `name` は NUL 終端の `CString` で、呼び出しの間生きている。`dirfd` は呼び出し側が保持する
-        // 開いた fd（または `AT_FDCWD`）で、本関数は閉じない。mode を取らないフラグだけを渡す。
+        // 開いた fd（または `AT_FDCWD`）で、本関数は閉じない。mode を取らないフラグだけを渡す（`O_NOCTTY` も mode を取らない）。
         let fd = unsafe { c_openat(dirfd, name.as_ptr(), flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -284,7 +304,7 @@ mod nofollow {
         let Some((leaf, ancestors)) = names.split_last() else {
             return Err(NoFollowOpenError::InvalidPath);
         };
-        let dir_flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+        let dir_flags = DIR_FLAGS;
         // `/` は信頼する起点。以降は検証済みの親 fd を基準に 1 要素ずつ辿る（前の fd は代入で閉じる）。
         let root = CString::new("/").map_err(|_| NoFollowOpenError::InvalidPath)?;
         let mut cur =
@@ -293,14 +313,43 @@ mod nofollow {
             cur = openat_raw(cur.as_raw_fd(), name, dir_flags)
                 .map_err(NoFollowOpenError::Ancestor)?;
         }
-        openat_raw(cur.as_raw_fd(), leaf, O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-            .map_err(NoFollowOpenError::Leaf)
+        openat_raw(cur.as_raw_fd(), leaf, LEAF_FLAGS).map_err(NoFollowOpenError::Leaf)
+    }
+}
+
+/// open の失敗が「実体ではない」（`ELOOP` / `ENOTDIR`）か。`adapter::map_nofollow_error` が入力不正
+/// （`INVALID_ARGUMENT`）と内部エラー（`INTERNAL`）の分けに使う（ERR-1・SEC-1・#3841）。
+/// 定数を確認済みでない unix の組は常に `false`（fail-closed。そもそも `Unsupported` で読まない）。
+#[cfg(unix)]
+pub(crate) fn is_not_real_entry(e: &std::io::Error) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    {
+        matches!(e.raw_os_error(), Some(n) if n == nofollow::ELOOP || n == nofollow::ENOTDIR)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        let _ = e;
+        false
     }
 }
 
 /// 絶対パスを `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、最終要素を読み取りで開く。
 /// 祖先に symlink があれば [`NoFollowOpenError::Ancestor`]、最終要素が symlink なら `Leaf` で拒否する。
-/// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらない（通常ファイルの読み取りには影響しない）。
+/// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらず、`O_NOCTTY` 付きで制御端末も取得しない（通常ファイルの読み取りには影響しない）。
+/// ディレクトリや FIFO は開いて返す（種別の拒否は呼び出し側の fstat。#3842）。
+/// 区切りの重複・末尾 `/`・途中の `.` は `Path::components` の正規化で受理される（安全性は `O_NOFOLLOW` が担う）。
 /// 呼び出し元は `adapter::read_image_blocking`（`start` のイメージ読み込み）。
 #[cfg(unix)]
 pub(crate) fn open_regular_nofollow(
@@ -346,9 +395,23 @@ mod tests {
         assert_eq!(imp::SIGTERM, 15);
     }
 
-    /// 自プロセスへ SIGTERM を送るとフラグが立ち、プロセスは落ちず、2 回目でも立ったままである
-    /// （PLUG-1・REPAIR-5）。送信は `kill` コマンドで行い、unsafe の面を `signal` 1 箇所に保つ。
-    /// 静的なフラグを共有するため、立つことの確認は本試験 1 件にまとめる。
+    /// 子プロセス（自己再実行）の役を示す環境変数。値 `1` のときだけ、下の試験が登録と送信を行う。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    const SIGTERM_CHILD_ENV: &str = "FANDHE_CONTAINER_PLUGIN_MICROVM_SIGTERM_CHILD";
+
+    /// 子プロセスへ SIGTERM を送るとフラグが立ち、子は落ちず、2 回目でも立ったままである
+    /// （PLUG-1・REPAIR-5・#3842）。送信は `kill` コマンドで行い、unsafe の面を `signal` 1 箇所に保つ。
+    ///
+    /// `install_sigterm_flag` はプロセス全体の SIGTERM の disposition を変えるため、試験バイナリ自身で
+    /// 呼ぶと外からの SIGTERM による停止が効かなくなる。そこで自己再実行した子プロセスの中でだけ登録と
+    /// 送信を行い、親（試験バイナリ本体）の SIGTERM の挙動は変えない。親は子の固定行と `1 passed` を
+    /// 期限つきで照合する（子のハングは kill して失敗にする。REPAIR-5）。
     #[cfg(any(
         target_os = "macos",
         all(
@@ -361,34 +424,99 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
 
-        fn send_term() {
-            let status = std::process::Command::new("kill")
-                .args(["-TERM", &std::process::id().to_string()])
-                .status()
-                .expect("spawn kill");
-            assert!(status.success(), "kill -TERM failed: {status:?}");
+        if std::env::var(SIGTERM_CHILD_ENV).as_deref() == Ok("1") {
+            fn send_term() {
+                let status = std::process::Command::new("kill")
+                    .args(["-TERM", &std::process::id().to_string()])
+                    .status()
+                    .expect("spawn kill");
+                assert!(status.success(), "kill -TERM failed: {status:?}");
+            }
+
+            assert!(!SIGTERM_RECEIVED.load(Ordering::SeqCst));
+            let flag = install_sigterm_flag().expect("install");
+            assert!(std::ptr::eq(flag, &SIGTERM_RECEIVED));
+            assert!(!flag.load(Ordering::SeqCst));
+
+            send_term();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !flag.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "SIGTERM flag not set within 5s of kill -TERM"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            println!("sigterm-child: flag_set=1");
+
+            // BSD セマンティクスでハンドラが残ること: 2 回目でもプロセスが生きていて、フラグは立ったまま。
+            send_term();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(flag.load(Ordering::SeqCst));
+            println!("sigterm-child: survived_second=1");
+            return;
         }
 
+        // 親: 試験バイナリ本体は登録しない（SIGTERM の disposition を変えない）。
         assert!(!SIGTERM_RECEIVED.load(Ordering::SeqCst));
-        let flag = install_sigterm_flag().expect("install");
-        assert!(std::ptr::eq(flag, &SIGTERM_RECEIVED));
-        assert!(!flag.load(Ordering::SeqCst));
-
-        send_term();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !flag.load(Ordering::SeqCst) {
-            assert!(
-                Instant::now() < deadline,
-                "SIGTERM flag not set within 5s of kill -TERM"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        // `module_path!()` は `<crate>::sys::tests`。libtest の試験名は crate 名を含まない。
+        let module = module_path!();
+        let name = format!(
+            "{}::task117_plug1_repair5_sigterm_to_self_sets_flag",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(SIGTERM_CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        // 出力は別スレッドで読み切る（パイプ詰まりで子が止まるのを避ける）。
+        let mut out = child.stdout.take().expect("stdout");
+        let mut err = child.stderr.take().expect("stderr");
+        let t_out = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut out, &mut s);
+            s
+        });
+        let t_err = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+            s
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("sigterm child did not finish within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stdout = t_out.join().expect("join stdout");
+        let stderr = t_err.join().expect("join stderr");
+        assert!(
+            status.success(),
+            "child failed: {status:?}\n{stdout}\n{stderr}"
+        );
+        for want in [
+            "sigterm-child: flag_set=1",
+            "sigterm-child: survived_second=1",
+        ] {
+            let n = stdout.lines().filter(|l| l.contains(want)).count();
+            assert_eq!(n, 1, "expected exactly one `{want}`:\n{stdout}");
         }
-        assert!(flag.load(Ordering::SeqCst));
-
-        // BSD セマンティクスでハンドラが残ること: 2 回目でもプロセスが生きていて、フラグは立ったまま。
-        send_term();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(flag.load(Ordering::SeqCst));
+        // 名前の誤りで 0 件実行になった場合は固定行が欠けて上で失敗する。要約行も具体値で確認する。
+        assert!(
+            stdout.lines().any(|l| l.contains("1 passed")),
+            "libtest summary missing:\n{stdout}"
+        );
     }
 
     /// Linux の未確認アーキテクチャは `UNIMPLEMENTED` で拒否し、フラグは立たない。
@@ -429,6 +557,13 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o200000, 0o400000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_NOCTTY, 0o400);
+        assert_eq!(LEAF_FLAGS, 0o400000 | 0o2000000 | 0o4000 | 0o400);
+        assert_eq!(
+            DIR_FLAGS,
+            0o10000000 | 0o200000 | 0o400000 | 0o2000000 | 0o400
+        );
+        assert_eq!((ELOOP, ENOTDIR), (40, 20));
         assert_eq!(O_PATH, 0o10000000);
     }
 
@@ -440,6 +575,13 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0o40000, 0o100000, 0o2000000, 0o4000, -100)
         );
+        assert_eq!(O_NOCTTY, 0o400);
+        assert_eq!(LEAF_FLAGS, 0o100000 | 0o2000000 | 0o4000 | 0o400);
+        assert_eq!(
+            DIR_FLAGS,
+            0o10000000 | 0o40000 | 0o100000 | 0o2000000 | 0o400
+        );
+        assert_eq!((ELOOP, ENOTDIR), (40, 20));
         assert_eq!(O_PATH, 0o10000000);
     }
 
@@ -451,6 +593,34 @@ mod tests {
             (O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, O_NONBLOCK, AT_FDCWD),
             (0x0010_0000, 0x0100, 0x0100_0000, 0x4, -2)
         );
+        assert_eq!(O_NOCTTY, 0x0002_0000);
+        assert_eq!(LEAF_FLAGS, 0x0100 | 0x0100_0000 | 0x4 | 0x0002_0000);
+        assert_eq!(DIR_FLAGS, 0x0010_0000 | 0x0100 | 0x0100_0000 | 0x0002_0000);
+        assert_eq!((ELOOP, ENOTDIR), (62, 20));
+    }
+
+    /// errno の分類（ERR-1・SEC-1・#3841）。ELOOP / ENOTDIR だけが「実体ではない」。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn sec1_3841_is_not_real_entry_by_errno() {
+        use std::io::Error;
+        #[cfg(target_os = "linux")]
+        let (eloop, enametoolong, etimedout) = (40, 36, 110);
+        #[cfg(target_os = "macos")]
+        let (eloop, enametoolong, etimedout) = (62, 63, 60);
+        for n in [eloop, 20] {
+            assert!(is_not_real_entry(&Error::from_raw_os_error(n)), "{n}");
+        }
+        for n in [24, 5, 2, 13, 1, enametoolong, etimedout] {
+            assert!(!is_not_real_entry(&Error::from_raw_os_error(n)), "{n}");
+        }
+        assert!(!is_not_real_entry(&Error::other("no errno")));
     }
 
     #[cfg(all(
@@ -484,6 +654,41 @@ mod tests {
             }
         }
 
+        /// errno の期待値（#3842。`io::ErrorKind::FilesystemLoop` は unstable のため `raw_os_error` で照合する）。
+        /// 出典: Linux `include/uapi/asm-generic/errno-base.h`・`errno.h`、macOS `sys/errno.h`。
+        /// macOS の値は CI（PR は ubuntu のみ）では実行されない。
+        const EXP_ENOENT: i32 = 2;
+        const EXP_ENOTDIR: i32 = 20;
+        /// 最終要素が symlink（`O_NOFOLLOW`）のときの errno。Linux 40（ELOOP）、macOS 62（ELOOP）。
+        #[cfg(target_os = "linux")]
+        const EXP_ELOOP: i32 = 40;
+        #[cfg(target_os = "macos")]
+        const EXP_ELOOP: i32 = 62;
+        /// 祖先が symlink（`O_PATH | O_DIRECTORY | O_NOFOLLOW`）のときの errno。Linux は ENOTDIR、macOS は ELOOP。
+        #[cfg(target_os = "linux")]
+        const EXP_ANCESTOR_SYMLINK: i32 = EXP_ENOTDIR;
+        #[cfg(target_os = "macos")]
+        const EXP_ANCESTOR_SYMLINK: i32 = 62;
+
+        fn assert_raw(e: &std::io::Error, want: i32, ctx: &str) {
+            assert_eq!(e.raw_os_error(), Some(want), "{ctx}: {e:?}");
+        }
+
+        /// `/proc/self/status` の `Uid:` 行の 2 番目（euid）。読めなければ panic（fail-closed）。
+        #[cfg(target_os = "linux")]
+        fn euid_from_proc() -> u32 {
+            let s = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+            let line = s
+                .lines()
+                .find(|l| l.starts_with("Uid:"))
+                .expect("Uid: line");
+            line.split_whitespace()
+                .nth(2)
+                .expect("euid field")
+                .parse()
+                .expect("euid number")
+        }
+
         /// 陽性対照: 実ディレクトリ配下の通常ファイルは開けて読める。
         #[test]
         fn sec1_3748_opens_real_file() {
@@ -496,11 +701,18 @@ mod tests {
             assert_eq!(v, b"abc");
         }
 
-        /// 祖先が mode 0111（検索のみ）・最終要素が 0400 でも開ける（Linux。root は権限を無視するため除く）。
+        /// 祖先が mode 0111（検索のみ）・最終要素が 0400 でも開ける（Linux）。
+        /// root（euid 0）は権限ビットを無視して確認の意味を持たないため、成功扱いで抜けず明示的に失敗させる（#3842）。
+        /// 非 root では `read_dir` が `PermissionDenied` になることを陰性対照に、O_PATH なら検索権限だけで辿れることを示す。
         #[cfg(target_os = "linux")]
         #[test]
         fn sec1_3748_opens_under_search_only_ancestor() {
             use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                euid_from_proc(),
+                0,
+                "this test needs a non-root euid (mode bits are not enforced for root); run as a non-root user"
+            );
             let d = Dir::new("x-only");
             let sub = d.0.join("xonly");
             std::fs::create_dir(&sub).expect("mkdir");
@@ -509,10 +721,15 @@ mod tests {
                 .expect("chmod file");
             std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111))
                 .expect("chmod dir");
+            let neg = std::fs::read_dir(&sub).map(|_| ());
             let r = open_regular_nofollow(&sub.join("k"));
             // 後始末のため先に権限を戻す。
             std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))
                 .expect("restore");
+            assert_eq!(
+                neg.expect_err("read_dir must be denied").kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
             let mut f = r.expect("open under mode 0111 ancestor");
             let mut v = Vec::new();
             f.read_to_end(&mut v).expect("read");
@@ -526,8 +743,12 @@ mod tests {
             std::fs::create_dir(d.0.join("real")).expect("mkdir");
             std::fs::write(d.0.join("real/k"), b"abc").expect("write");
             std::os::unix::fs::symlink(d.0.join("real"), d.0.join("link")).expect("symlink");
-            let e = open_regular_nofollow(&d.0.join("link/k")).unwrap_err();
-            assert!(matches!(e, NoFollowOpenError::Ancestor(_)), "{e:?}");
+            match open_regular_nofollow(&d.0.join("link/k")).unwrap_err() {
+                NoFollowOpenError::Ancestor(e) => {
+                    assert_raw(&e, EXP_ANCESTOR_SYMLINK, "ancestor symlink")
+                }
+                e => panic!("unexpected {e:?}"),
+            }
         }
 
         /// 最終要素が symlink なら `Leaf`。
@@ -536,8 +757,10 @@ mod tests {
             let d = Dir::new("leaf");
             std::fs::write(d.0.join("k"), b"abc").expect("write");
             std::os::unix::fs::symlink(d.0.join("k"), d.0.join("l")).expect("symlink");
-            let e = open_regular_nofollow(&d.0.join("l")).unwrap_err();
-            assert!(matches!(e, NoFollowOpenError::Leaf(_)), "{e:?}");
+            match open_regular_nofollow(&d.0.join("l")).unwrap_err() {
+                NoFollowOpenError::Leaf(e) => assert_raw(&e, EXP_ELOOP, "leaf symlink"),
+                e => panic!("unexpected {e:?}"),
+            }
         }
 
         /// 祖先が無ければ `Ancestor` の `NotFound`、最終要素が無ければ `Leaf` の `NotFound`。
@@ -546,12 +769,189 @@ mod tests {
             let d = Dir::new("miss");
             match open_regular_nofollow(&d.0.join("nodir/k")).unwrap_err() {
                 NoFollowOpenError::Ancestor(e) => {
-                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound)
+                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+                    assert_raw(&e, EXP_ENOENT, "missing ancestor");
                 }
                 e => panic!("unexpected {e:?}"),
             }
             match open_regular_nofollow(&d.0.join("k")).unwrap_err() {
-                NoFollowOpenError::Leaf(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+                NoFollowOpenError::Leaf(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+                    assert_raw(&e, EXP_ENOENT, "missing leaf");
+                }
+                e => panic!("unexpected {e:?}"),
+            }
+        }
+
+        /// 祖先を mode 0o000 にすると、祖先自体は `O_PATH` で開けるが、その下の最終要素の open が検索権限なしで
+        /// `Leaf` の `PermissionDenied`（EACCES=13）になる。root では成功扱いにせず失敗させる（#3842・SEC-1）。
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn sec1_3842_unsearchable_ancestor_denies_leaf() {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                euid_from_proc(),
+                0,
+                "this test needs a non-root euid (mode bits are not enforced for root); run as a non-root user"
+            );
+            let d = Dir::new("anc000");
+            let sub = d.0.join("noperm");
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("k"), b"abc").expect("write");
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod dir");
+            let r = open_regular_nofollow(&sub.join("k"));
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))
+                .expect("restore");
+            match r.unwrap_err() {
+                NoFollowOpenError::Leaf(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_raw(&e, 13, "search-denied ancestor");
+                }
+                e => panic!("unexpected {e:?}"),
+            }
+        }
+
+        /// NUL を含むパスは open より前に `InvalidPath`（C 文字列が途中で切れて別パスを開かない。#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_nul_is_invalid_path() {
+            use std::os::unix::ffi::OsStrExt;
+            let d = Dir::new("nul");
+            std::fs::write(d.0.join("a"), b"abc").expect("write");
+            let mut leaf = d.0.as_os_str().as_bytes().to_vec();
+            leaf.extend_from_slice(b"/a\0b");
+            let mut anc = d.0.as_os_str().as_bytes().to_vec();
+            anc.extend_from_slice(b"\0x/a");
+            for p in [leaf, anc, b"/tmp/a\0b".to_vec(), b"/tmp\0x/k".to_vec()] {
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&p));
+                let e = open_regular_nofollow(path).unwrap_err();
+                assert!(matches!(e, NoFollowOpenError::InvalidPath), "{p:?}: {e:?}");
+            }
+        }
+
+        /// `//`・途中の `//`・末尾 `/`・途中の `.` は `Path::components` が落とすため受理され、実ファイルが開く。
+        /// 末尾 `/` は POSIX では ENOTDIR だが、adapter の `symlink_metadata` が先に失敗させ、
+        /// 安全性は `O_NOFOLLOW` で保たれる（#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_redundant_separators_are_normalized() {
+            let d = Dir::new("slashes");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::fs::write(d.0.join("real/k"), b"abc").expect("write");
+            let base = d.0.to_str().expect("utf8").to_string();
+            for p in [
+                format!("/{base}/real/k"),
+                format!("{base}//real//k"),
+                format!("{base}/real/k/"),
+                format!("{base}/real/./k"),
+            ] {
+                let mut f = open_regular_nofollow(std::path::Path::new(&p))
+                    .unwrap_or_else(|e| panic!("{p}: {e:?}"));
+                let mut v = Vec::new();
+                f.read_to_end(&mut v).expect("read");
+                assert_eq!(v, b"abc", "{p}");
+            }
+        }
+
+        /// 末尾 `/` 付きでもディレクトリへの symlink は追従しない（`Leaf` の ELOOP。#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_trailing_slash_does_not_follow_leaf_symlink() {
+            let d = Dir::new("tslink");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::os::unix::fs::symlink(d.0.join("real"), d.0.join("dl")).expect("symlink");
+            let p = format!("{}/dl/", d.0.to_str().expect("utf8"));
+            match open_regular_nofollow(std::path::Path::new(&p)).unwrap_err() {
+                NoFollowOpenError::Leaf(e) => assert_raw(&e, EXP_ELOOP, "trailing slash symlink"),
+                e => panic!("unexpected {e:?}"),
+            }
+        }
+
+        /// 最終要素がディレクトリなら sys は開く（種別の拒否は `adapter::read_image_blocking` の `is_file` 検査。
+        /// 関数名の regular は呼び出し側との組で成り立つ。#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_leaf_directory_opens_as_dir() {
+            let d = Dir::new("leafdir");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            let f = open_regular_nofollow(&d.0.join("real")).expect("open dir");
+            let ft = f.metadata().expect("fstat").file_type();
+            assert!(ft.is_dir());
+            assert!(!ft.is_file());
+        }
+
+        /// 最終要素がディレクトリへの symlink は `Leaf` の ELOOP（#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_leaf_symlink_to_dir_is_rejected() {
+            let d = Dir::new("leafdirlink");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::os::unix::fs::symlink(d.0.join("real"), d.0.join("dl")).expect("symlink");
+            match open_regular_nofollow(&d.0.join("dl")).unwrap_err() {
+                NoFollowOpenError::Leaf(e) => assert_raw(&e, EXP_ELOOP, "leaf symlink to dir"),
+                e => panic!("unexpected {e:?}"),
+            }
+        }
+
+        /// 最終要素が FIFO（書き手なし）でも `O_NONBLOCK` で止まらず開く（#3842・SEC-1・REPAIR-5）。
+        /// 止まった場合は O_NONBLOCK の書き手で open を解放し、期限つきで待ってから失敗にする。
+        #[test]
+        fn sec1_3842_leaf_fifo_does_not_block() {
+            use std::os::unix::fs::FileTypeExt;
+            use std::time::Duration;
+            let d = Dir::new("fifo");
+            let fifo = d.0.join("ff");
+            // mkfifo の待ちにも期限を付ける（REPAIR-5）。超えたら kill して回収し、有限時間で失敗にする。
+            let mut child = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .spawn()
+                .expect("spawn mkfifo");
+            let mk_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let st = loop {
+                if let Some(st) = child.try_wait().expect("try_wait mkfifo") {
+                    break st;
+                }
+                if std::time::Instant::now() >= mk_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mkfifo did not exit within 10s (REPAIR-5)");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(st.success(), "mkfifo failed: {st:?}");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = fifo.clone();
+            let h = std::thread::spawn(move || {
+                let _ =
+                    tx.send(open_regular_nofollow(&p).map(|f| f.metadata().map(|m| m.file_type())));
+            });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(r) => {
+                    h.join().expect("join");
+                    let ft = r.expect("open fifo").expect("fstat");
+                    assert!(ft.is_fifo());
+                }
+                Err(_) => {
+                    // 救出: O_NONBLOCK の書き手で開いて、ブロック中の読み手の open を戻す（自身はブロックしない）。
+                    // 読み手が既に閉じていれば ENXIO で失敗するだけで止まらない。join も期限つきで、超えたらスレッドを放置して失敗にする。
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _w = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(super::super::nofollow::O_NONBLOCK)
+                        .open(&fifo);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !h.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    panic!("open on FIFO blocked >5s; O_NONBLOCK missing?");
+                }
+            }
+        }
+
+        /// 祖先が通常ファイルなら `Ancestor` の ENOTDIR（#3842・SEC-1）。
+        #[test]
+        fn sec1_3842_regular_file_ancestor_is_rejected() {
+            let d = Dir::new("ancfile");
+            std::fs::create_dir(d.0.join("real")).expect("mkdir");
+            std::fs::write(d.0.join("real/k"), b"abc").expect("write");
+            match open_regular_nofollow(&d.0.join("real/k/x")).unwrap_err() {
+                NoFollowOpenError::Ancestor(e) => assert_raw(&e, EXP_ENOTDIR, "file ancestor"),
                 e => panic!("unexpected {e:?}"),
             }
         }

@@ -51,7 +51,7 @@ use crate::cpuid_x86::CpuidTable;
 use crate::cpuid_x86::{CpuidEntry, MAX_CPUID_ENTRIES};
 use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::exit::{self, VcpuExit};
+use crate::exit::{self, ExitValue, VcpuExit};
 use crate::interrupt::{InterruptLine, IoEventSpec};
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
 use crate::sys::{self, SysError};
@@ -122,6 +122,9 @@ pub struct RunRecord {
     pub outcome: RunOutcome,
     /// `KVM_RUN` の発行から戻るまでの時間。
     pub elapsed: Duration,
+    /// exit の値（PIO・MMIO）。観測器が [`RunObserver::wants_values`] で求めたときだけ `Some`。
+    /// ゲストが制御する値で untrusted（#3769・MVM-1・REPAIR-12）。
+    pub value: Option<ExitValue>,
 }
 
 /// 実行結果の記録器。呼び出し側（将来の plugin-microvm・TASK-117 等）が構造化ログやメトリクスへ接続する。
@@ -129,6 +132,134 @@ pub struct RunRecord {
 pub trait RunObserver: Send + Sync + std::fmt::Debug {
     /// 1 回の `KVM_RUN` の記録を受け取る。
     fn record(&self, record: &RunRecord);
+
+    /// `RunRecord::value` を求めるか。既定は false（opt-in）。値はゲスト由来の秘密を含みうるため、
+    /// 製品の構造化ログ・メトリクスへ接続する観測器は true にしない（試験・診断用。#3769）。
+    fn wants_values(&self) -> bool {
+        false
+    }
+}
+
+/// [`BoundedRunLog`] の記録件数の上限（割り当て上限の検証用。#3769）。
+pub const RUN_LOG_CAPACITY_MAX: usize = 4096;
+
+/// [`BoundedRunLog`] が exit の値を記録するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueCapture {
+    /// 値を記録しない（種別と時間のみ）。
+    Omit,
+    /// PIO・MMIO の値を記録する（データ長は `EXIT_VALUE_DATA_MAX` で上限）。
+    Record,
+}
+
+/// 件数上限つきの観測器（試験・診断用。#3769・MVM-1・REPAIR-12）。
+///
+/// 上限を超えたレコードは捨てて [`BoundedRunLog::dropped`] に数える。`record` は割り当てしない（`new` で確保済み）。
+/// 読み取り側（`records` 等）はロックを短時間（複製の間だけ）しか持たないため、`record` は競合しても
+/// 短い待ちで必ず記録する（競合で exit を捨てると並びの照合が不安定になる。REPAIR-12）。`Debug` は記録した値を出さない。
+pub struct BoundedRunLog {
+    capacity: usize,
+    capture: ValueCapture,
+    inner: std::sync::Mutex<BoundedRunLogInner>,
+}
+
+struct BoundedRunLogInner {
+    records: Vec<RunRecord>,
+    dropped: u64,
+}
+
+impl BoundedRunLog {
+    /// `capacity` は 1 以上 [`RUN_LOG_CAPACITY_MAX`] 以下。範囲外は `InvalidArgument`。
+    pub fn new(capacity: usize, capture: ValueCapture) -> Result<BoundedRunLog, MicrovmError> {
+        if capacity == 0 || capacity > RUN_LOG_CAPACITY_MAX {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "run log capacity must be in 1..=4096",
+            ));
+        }
+        Ok(BoundedRunLog {
+            capacity,
+            capture,
+            inner: std::sync::Mutex::new(BoundedRunLogInner {
+                records: Vec::with_capacity(capacity),
+                dropped: 0,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BoundedRunLogInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 記録済みのレコード（起きた順）。
+    pub fn records(&self) -> Vec<RunRecord> {
+        self.lock().records.clone()
+    }
+
+    /// 件数上限で捨てたレコード数。
+    pub fn dropped(&self) -> u64 {
+        self.lock().dropped
+    }
+}
+
+impl std::fmt::Debug for BoundedRunLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 出力先が詰まってもロックを持ち続けないよう、値を複製して解放してから出す。
+        let (len, dropped) = {
+            let g = self.lock();
+            (g.records.len(), g.dropped)
+        };
+        f.debug_struct("BoundedRunLog")
+            .field("capacity", &self.capacity)
+            .field("capture", &self.capture)
+            .field("len", &len)
+            .field("dropped", &dropped)
+            .finish()
+    }
+}
+
+impl RunObserver for BoundedRunLog {
+    fn record(&self, record: &RunRecord) {
+        // 読み取り側の保持は複製の間だけで有界。競合しても待って必ず記録する。
+        let mut g = self.lock();
+        if g.records.len() < self.capacity {
+            g.records.push(*record);
+        } else {
+            g.dropped = g.dropped.saturating_add(1);
+        }
+    }
+
+    fn wants_values(&self) -> bool {
+        self.capture == ValueCapture::Record
+    }
+}
+
+/// `run_once` の結果から記録を作る。`capture` のときだけ exit の値を載せる。
+fn build_record(
+    vcpu_id: u32,
+    result: &Result<VcpuExit, MicrovmError>,
+    elapsed: Duration,
+    capture: bool,
+) -> RunRecord {
+    let outcome = match result {
+        Ok(VcpuExit::Interrupted) => RunOutcome::Interrupted,
+        Ok(e) => RunOutcome::Exit(exit_kind(e)),
+        Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => RunOutcome::DeadlineExceeded,
+        Err(e) => RunOutcome::Error(e.code()),
+    };
+    let value = match result {
+        Ok(e) if capture => ExitValue::from_exit(e),
+        _ => None,
+    };
+    RunRecord {
+        vcpu_id,
+        outcome,
+        elapsed,
+        value,
+    }
 }
 
 /// [`VcpuFd`] ごとの累積の実行統計（観測器が無くても取れる。REPAIR-4）。
@@ -503,9 +634,10 @@ impl VcpuFd {
     /// BSP の LAPIC の LVT LINT0 を ExtINT、LINT1 を NMI（ともにマスク解除）にして `KVM_SET_LAPIC` で書き戻す（#3735・MVM-1。
     /// x86_64 のみ）。設定後の LINT の値を返す。
     ///
-    /// `MicroVm::setup_boot_vcpu` が BSP（vCPU 0）にだけ呼ぶ。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
+    /// `MicroVm::setup_boot_vcpu` が全 vCPU に呼ぶ（BSP と同じ経路。#3737）。PIC 経由の virtual wire mode（MP 仕様 1.4）でカーネルを起動する前提で、
     /// マスクも解除する理由は `lapic_x86` モジュールを参照。in-kernel irqchip が前提で、無い VM では `FailedPrecondition`。
-    /// AP は INIT/SIPI を待つため触らない。エラー message にレジスタ値は載せない（ERR-1）。
+    /// AP にも同じ値を書けるが、INIT で LVT がマスクへ戻るため設定が残るのは INIT までである（#3737）。
+    /// エラー message にレジスタ値は載せない（ERR-1）。
     #[cfg(target_arch = "x86_64")]
     pub fn set_boot_lints(&mut self) -> Result<crate::lapic_x86::LapicLints, MicrovmError> {
         let fd = self.fd.as_fd();
@@ -529,6 +661,39 @@ impl VcpuFd {
                 "LAPIC register page is too short for LVT LINT0/LINT1",
             )
         })
+    }
+
+    /// vCPU の MP 状態を読む（`KVM_GET_MP_STATE`。#3737・MVM-1。x86_64 のみ）。AP は作成直後 `Uninitialized`。
+    ///
+    /// `&self` のため `run_once`（`&mut self`）とは借用規則で排他される。in-kernel LAPIC では保留中の INIT/SIPI を先に処理する。
+    #[cfg(target_arch = "x86_64")]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        let st = sys::kvm_get_mp_state(self.fd.as_fd())
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetMpState, e))?;
+        Ok(crate::smp_x86::MpState::from_raw(st.mp_state))
+    }
+
+    /// vCPU の MP 状態を設定する（`KVM_SET_MP_STATE`。#3737。x86_64 のみ）。`MicroVm::assemble` が AP を明示的に
+    /// `Uninitialized` にするために呼ぶ。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_mp_state(
+        &mut self,
+        state: crate::smp_x86::MpState,
+    ) -> Result<(), MicrovmError> {
+        let st = sys::KvmMpState {
+            mp_state: state.as_raw(),
+        };
+        sys::kvm_set_mp_state(self.fd.as_fd(), &st)
+            .map_err(|e| classify_vcpu_error(VcpuStage::SetMpState, e))
+    }
+
+    /// x86_64 以外では MP 状態の読み取りは未実装（REPAIR-3）。
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn mp_state(&self) -> Result<crate::smp_x86::MpState, MicrovmError> {
+        Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "MP state is only implemented for x86_64",
+        ))
     }
 
     /// 累積の実行統計。
@@ -577,28 +742,18 @@ impl VcpuFd {
         let start = Instant::now();
         let result = self.run_bounded(timeout, signal);
         let elapsed = start.elapsed();
-        let outcome = match &result {
-            Ok(VcpuExit::Interrupted) => RunOutcome::Interrupted,
-            Ok(e) => RunOutcome::Exit(exit_kind(e)),
-            Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => {
-                RunOutcome::DeadlineExceeded
-            }
-            Err(e) => RunOutcome::Error(e.code()),
-        };
+        let capture = self.observer.as_ref().is_some_and(|o| o.wants_values());
+        let rec = build_record(self.id, &result, elapsed, capture);
         self.stats.runs += 1;
         self.stats.total_elapsed = self.stats.total_elapsed.saturating_add(elapsed);
-        match outcome {
+        match rec.outcome {
             RunOutcome::Exit(_) => self.stats.exits += 1,
             RunOutcome::Interrupted => self.stats.interrupted += 1,
             RunOutcome::DeadlineExceeded => self.stats.deadline_exceeded += 1,
             RunOutcome::Error(_) => self.stats.errors += 1,
         }
         if let Some(o) = &self.observer {
-            o.record(&RunRecord {
-                vcpu_id: self.id,
-                outcome,
-                elapsed,
-            });
+            o.record(&rec);
         }
         result
     }
@@ -744,7 +899,7 @@ impl VcpuFd {
 /// `run_bounded` の `with_current_thread` の中で生きている監視スレッドだけで、そのスレッドは `KVM_RUN` 1 回分の間だけ生き、
 /// join されてから `with_current_thread` が戻る。したがって vCPU スレッドが終わった後に `request` が呼ばれても
 /// `pthread_kill` は発行されず、終了したスレッドへの送信も tid の再利用も構造上起きない。
-/// 複数の vCPU が同じ信号を共有できる（run ごとの完了状態は共有せず、`run_bounded` のローカルに置く。#3738 向け）。
+/// 全 vCPU スレッドが同じ信号を共有する（#3738。run ごとの完了状態は共有せず、`run_bounded` のローカルに置く）。
 #[derive(Debug, Default)]
 pub(crate) struct StopSignal {
     requested: Mutex<bool>,
@@ -764,6 +919,25 @@ impl StopSignal {
 
     pub(crate) fn is_requested(&self) -> bool {
         *self.requested.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 停止が要求されるか `timeout` が経つまで待つ。要求済み（待ちの途中での要求を含む）なら `true`、期限切れなら `false`。
+    /// 受信ポーラーの周期待ちが使う（#3742・REPAIR-5）。spurious wakeup は残り時間を計算し直して吸収する。
+    pub(crate) fn wait_requested(&self, timeout: Duration) -> bool {
+        let limit = Instant::now() + timeout;
+        let mut g = self.requested.lock().unwrap_or_else(|p| p.into_inner());
+        while !*g {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            g = self
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        true
     }
 
     /// run の完了を待ち手へ知らせる。ロックを一度取って放すことで、待ち手の条件確認と待ち入りの間の通知の取りこぼしを防ぐ。
@@ -888,6 +1062,10 @@ enum VcpuStage {
     SetLapic,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     SetCpuid,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    GetMpState,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    SetMpState,
     PreferredTarget,
     VcpuInit,
     Mmap,
@@ -910,6 +1088,8 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::GetLapic => "KVM_GET_LAPIC",
         VcpuStage::SetLapic => "KVM_SET_LAPIC",
         VcpuStage::SetCpuid => "KVM_SET_CPUID2",
+        VcpuStage::GetMpState => "KVM_GET_MP_STATE",
+        VcpuStage::SetMpState => "KVM_SET_MP_STATE",
     };
     let registers = matches!(
         stage,
@@ -1873,6 +2053,127 @@ fn run_probe_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit::{ExitData, IoDirection};
+
+    fn io_out(b: u8) -> VcpuExit {
+        VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: vec![b],
+        }
+    }
+
+    fn rec(id: u32, b: u8) -> RunRecord {
+        build_record(id, &Ok(io_out(b)), Duration::ZERO, true)
+    }
+
+    /// #3769・MVM-1: 値は求められたときだけ載り、非アクセス exit・エラーには載らない。
+    #[test]
+    fn mvm1_3769_build_record_captures_value_only_when_requested() {
+        let on = build_record(0, &Ok(io_out(b'O')), Duration::ZERO, true);
+        assert_eq!(on.outcome, RunOutcome::Exit("io"));
+        assert_eq!(
+            on.value,
+            Some(ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x10,
+                size: 1,
+                count: 1,
+                data: ExitData::from_slice(b"O"),
+            })
+        );
+        let off = build_record(0, &Ok(io_out(b'O')), Duration::ZERO, false);
+        assert_eq!(off.value, None);
+        let int = build_record(0, &Ok(VcpuExit::Interrupted), Duration::ZERO, true);
+        assert_eq!((int.outcome, int.value), (RunOutcome::Interrupted, None));
+        let err = Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "deadline",
+        ));
+        let d = build_record(0, &err, Duration::ZERO, true);
+        assert_eq!((d.outcome, d.value), (RunOutcome::DeadlineExceeded, None));
+    }
+
+    /// #3769・MVM-1: 件数上限を超えたレコードは捨てて数える。
+    #[test]
+    fn mvm1_3769_bounded_run_log_drops_and_counts_overflow() {
+        let log = BoundedRunLog::new(2, ValueCapture::Record).unwrap();
+        for i in 0..5u8 {
+            log.record(&rec(u32::from(i), b'a' + i));
+        }
+        assert_eq!(log.records(), vec![rec(0, b'a'), rec(1, b'b')]);
+        assert_eq!(log.dropped(), 3);
+    }
+
+    /// #3769・MVM-1・REPAIR-12: 読み取りと `record` が重なっても記録を捨てない。
+    #[test]
+    fn mvm1_3769_bounded_run_log_record_survives_concurrent_reads() {
+        let log = std::sync::Arc::new(BoundedRunLog::new(256, ValueCapture::Record).unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (log, stop) = (log.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = log.records();
+                }
+            })
+        };
+        for i in 0..200u32 {
+            log.record(&rec(i, 1));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(log.records().len(), 200);
+        assert_eq!(log.dropped(), 0);
+    }
+
+    /// #3769・MVM-1: 容量の範囲外は `InvalidArgument`。
+    #[test]
+    fn mvm1_3769_bounded_run_log_rejects_out_of_range_capacity() {
+        for c in [0, RUN_LOG_CAPACITY_MAX + 1] {
+            let e = BoundedRunLog::new(c, ValueCapture::Omit).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert!(BoundedRunLog::new(RUN_LOG_CAPACITY_MAX, ValueCapture::Omit).is_ok());
+    }
+
+    /// #3769・MVM-1: `wants_values` は既定 false で、`Record` のときだけ true。
+    #[test]
+    fn mvm1_3769_wants_values_defaults_to_false() {
+        #[derive(Debug)]
+        struct Plain;
+        impl RunObserver for Plain {
+            fn record(&self, _: &RunRecord) {}
+        }
+        assert!(!Plain.wants_values());
+        assert!(
+            !BoundedRunLog::new(1, ValueCapture::Omit)
+                .unwrap()
+                .wants_values()
+        );
+        assert!(
+            BoundedRunLog::new(1, ValueCapture::Record)
+                .unwrap()
+                .wants_values()
+        );
+    }
+
+    /// #3769・MVM-1: `Debug` は記録した値を出さず、件数だけ出す。
+    #[test]
+    fn mvm1_3769_bounded_run_log_debug_omits_values() {
+        let log = BoundedRunLog::new(1, ValueCapture::Record).unwrap();
+        log.record(&rec(0, 0xAB));
+        log.record(&rec(0, 0xCD));
+        let s = format!("{log:?}");
+        assert!(
+            !s.contains("171") && !s.to_lowercase().contains("0xab"),
+            "{s}"
+        );
+        assert!(s.contains("dropped: 1") && s.contains("len: 1"), "{s}");
+    }
+
     use std::sync::atomic::AtomicU32;
 
     fn watch_in_thread(
@@ -2420,5 +2721,26 @@ mod tests {
         let e = check_msr_done("KVM_SET_MSRS", 2, 3).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
         assert_eq!(e.message(), "KVM_SET_MSRS accepted 2 of 3 entries");
+    }
+
+    /// MVM-1・REPAIR-5・#3742: `wait_requested` は要求済みなら即 `true`、要求が無ければ期限後に `false`、待ちの途中の要求で期限前に `true`。
+    #[test]
+    fn mvm1_3742_stop_signal_wait_requested() {
+        let sig = Arc::new(StopSignal::new());
+        let t = Instant::now();
+        assert!(!sig.wait_requested(Duration::from_millis(20)));
+        assert!(t.elapsed() >= Duration::from_millis(20));
+        let s2 = Arc::clone(&sig);
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            s2.request();
+        });
+        let t = Instant::now();
+        assert!(sig.wait_requested(Duration::from_secs(10)));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        h.join().unwrap();
+        let t = Instant::now();
+        assert!(sig.wait_requested(Duration::from_secs(10)));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }

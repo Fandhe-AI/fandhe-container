@@ -1,7 +1,7 @@
 //! x86_64 の BSP の LAPIC の LVT LINT0 / LINT1 を virtual wire mode 用に組み立てる純粋な論理（#3735・MVM-1・MS-7。
 //! OS・arch 非依存・`unsafe` なし）。
 //!
-//! 呼び出し元は `device::VcpuFd::set_boot_lints`（`MicroVm::setup_boot_vcpu` から BSP にだけ呼ばれる）。`KVM_GET_LAPIC` で読んだ
+//! 呼び出し元は `device::VcpuFd::set_boot_lints`（`MicroVm::setup_boot_vcpu` から全 vCPU に呼ばれる）。`KVM_GET_LAPIC` で読んだ
 //! 1024 バイトのレジスタ面（xAPIC の MMIO レイアウトで、各レジスタは little-endian の u32）を受け取り、LINT0 を ExtINT
 //! （マスク解除）、LINT1 を NMI にして返す。ioctl 自体は `device` / `sys` 側にあり、本モジュールは KVM なしで具体値を試験できる。
 //!
@@ -13,7 +13,7 @@
 //! - Linux の `arch/x86/kernel/apic/apic.c` の `setup_local_APIC` は、BSP の LINT0 がマスク解除の ExtINT のときに virtual wire を
 //!   保つ。そのため delivery mode だけでなくマスクビットも 0 にする（`KVM_X86_QUIRK_LINT0_REENABLED` が無効のホスト対策）。
 //!
-//! Firecracker・rust-vmm のコードは参照も流用もしない（MVM-4）。AP（vCPU 1 以上）は対象外（INIT でリセットされ、起動は #3720）。
+//! Firecracker・rust-vmm のコードは参照も流用もしない（MVM-4）。AP（vCPU 1 以上）にも同じ値を書く（#3737）が、INIT で LVT がマスクへ戻るため設定が残るのは INIT までで、AP の LINT はゲストのカーネルが設定し直す。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 

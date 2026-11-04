@@ -1,10 +1,15 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
 use fandhe_container_microvm::device::KvmDevice;
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use std::os::fd::{AsFd as _, AsRawFd as _};
+
+/// 合成 bzImage の正本（x86_64 の実機前提試験だけが使う。複製しない・#3750）。
+#[cfg(target_arch = "x86_64")]
+#[path = "support/bzimage.rs"]
+mod bzimage;
 
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -772,25 +777,9 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
     )
     .unwrap();
 
-    // 合成 bzImage: setup_sects=4・version 2.15・LOADED_HIGH・XLF_KERNEL_64・relocatable・pref 0x100_0000。
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    for (i, b) in img[5 * 512..].iter_mut().enumerate() {
-        *b = (i % 251) as u8 | 1;
-    }
+    // 合成 bzImage（`support/bzimage.rs`）。payload は添字依存の非ゼロ値で埋め、ロード後の内容照合に使う。
+    let mut img = bzimage::header_only();
+    bzimage::fill_payload(&mut img, |i| (i % 251) as u8 | 1);
     let initrd: Vec<u8> = (0..0x2000u32).map(|i| (i % 241) as u8).collect();
 
     let l = vm
@@ -876,33 +865,13 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
         }
     };
 
-    // 合成 bzImage（kvm_device_load_kernel_into_assembled_microvm と同じ header）。payload の 0x200 が 64-bit エントリ。
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    // payload の残りは ud2（0F 0B）。エントリ（payload + 0x200）にテストコードを置く。
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
+    // 合成 bzImage（`support/bzimage.rs`）。payload の 0x200 が 64-bit エントリで、残りは ud2。
     let mut code: Vec<u8> = vec![0x89, 0xF0, 0xE7, 0x10]; // mov eax,esi ; out 0x10,eax
     code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, imm64
     code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xA3]); // movabs [moffs64], rax
     code.extend_from_slice(&0x1000_0000u64.to_le_bytes());
-    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+    let img = bzimage::synthetic_bzimage(&code);
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -1009,22 +978,8 @@ fn kvm_device_boot_lapic_lints_read_back() {
         }
     };
 
-    // 合成 bzImage（kvm_device_boot_vcpu_starts_at_kernel_entry と同じ header）。コードは使わない（実行しない）。
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
+    // 合成 bzImage（ヘッダのみ。コードは使わない・実行しない。`support/bzimage.rs`）。
+    let img = bzimage::header_only();
 
     let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
         &dev,
@@ -1088,8 +1043,8 @@ fn kvm_device_boot_lapic_lints_read_back() {
 /// MVM-1・#3733・TASK-75.3.2: `MicroVm::assemble` が設定した `KVM_SET_CPUID2` がゲストから見える。vCPU 0 のゲストが
 /// leaf 0 の vendor（EBX・EDX・ECX）と leaf 1 の APIC ID（EBX\[31:24\]）・hypervisor ビット（ECX\[31\]）を `out 0x10` で返し、
 /// ホスト側の期待値（`KVM_GET_SUPPORTED_CPUID` の leaf 0 と、設定した APIC ID = 0）と具体値で照合する。
-/// AP（vCPU 1 以上）は in-kernel irqchip の VM では INIT/SIPI 待ちで実行できないため、0 以外の APIC ID と x2APIC leaf の
-/// 調整は KVM 不要の単体試験 `mvm1_3733_*`（`cpuid_x86`）が照合する。
+/// AP（vCPU 1 以上）の APIC ID 1 は `kvm_device_ap_starts_on_init_sipi`（#3737）が、x2APIC leaf の調整は
+/// KVM 不要の単体試験 `mvm1_3733_*`（`cpuid_x86`）が照合する。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -1110,26 +1065,7 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
     let host = dev.supported_cpuid().unwrap();
     let leaf0 = *host.get(0, 0).unwrap();
 
-    // 合成 bzImage（kvm_device_boot_vcpu_starts_at_kernel_entry と同じ header）。
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
+    // 合成 bzImage（ud2 埋め・エントリにテストコード。`support/bzimage.rs`）。
     let code: Vec<u8> = vec![
         0x31, 0xC0, 0x0F, 0xA2, // xor eax,eax ; cpuid
         0x89, 0xD8, 0xE7, 0x10, // mov eax,ebx ; out 0x10,eax
@@ -1139,7 +1075,7 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
         0x89, 0xD8, 0xC1, 0xE8, 0x18, 0xE7, 0x10, // mov eax,ebx ; shr eax,24 ; out
         0x89, 0xC8, 0xC1, 0xE8, 0x1F, 0xE7, 0x10, // mov eax,ecx ; shr eax,31 ; out
     ];
-    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+    let img = bzimage::synthetic_bzimage(&code);
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -1215,8 +1151,169 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
     );
 }
 
+/// MVM-1・#3737: AP は `KVM_MP_STATE_UNINITIALIZED` で作られ、BSP のゲストコードが送る INIT/SIPI で起動して
+/// 自分の APIC ID（1）を PIO で出す。(a) 作成直後の MP 状態、(b) setup_boot_vcpu 後の AP の LINT（BSP と同じ値）、
+/// (c) 起動コードの配置先、(d) BSP が INIT/SIPI を送った印（port 0x10 に 0xAA）、(f) AP の出力を具体値で照合する。
+/// INIT 後の AP の LINT は quirk と版に依るため照合しない。AP は INIT/SIPI を送る前には実行しない（UNINITIALIZED の
+/// `KVM_RUN` は期限まで戻らないため）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_ap_starts_on_init_sipi() {
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::lapic_x86::LvtDeliveryMode;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::smp_x86::{MpState, SipiVector};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+
+    // BSP（long mode）: ICR_HIGH に宛先 APIC ID 1、ICR_LOW に INIT（assert）と SIPI（ベクタ 1）を書き、port 0x10 へ 0xAA。
+    let bsp: Vec<u8> = vec![
+        0xBF, 0x10, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00310
+        0xC7, 0x07, 0x00, 0x00, 0x00, 0x01, // mov dword [rdi],0x01000000
+        0xBF, 0x00, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00300
+        0xC7, 0x07, 0x00, 0x45, 0x00, 0x00, // mov dword [rdi],0x00004500 (INIT)
+        0xC7, 0x07, 0x01, 0x46, 0x00, 0x00, // mov dword [rdi],0x00004601 (SIPI, vector 1)
+        0xB0, 0xAA, 0xE6, 0x10, // mov al,0xAA ; out 0x10,al
+        0xEB, 0xFE, // jmp $
+    ];
+    // 合成 bzImage（正本 support/bzimage.rs の synthetic_bzimage。BSP のコードを 64-bit エントリへ置く）。
+    let img = bzimage::synthetic_bzimage(&bsp);
+    // AP（real mode・CS=0x0100・IP=0）: CPUID.1 の EBX[31:24]（初期 APIC ID）を port 0x11 へ出す。
+    let ap: Vec<u8> = vec![
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x0F, 0xA2, // cpuid
+        0x66, 0xC1, 0xEB, 0x18, // shr ebx,24
+        0x88, 0xD8, // mov al,bl
+        0xE6, 0x11, // out 0x11,al
+        0xEB, 0xFE, // jmp $
+    ];
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 2,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap();
+        // (a) 作成直後の MP 状態。
+        let created = (
+            vm.vcpus()[0].mp_state().unwrap(),
+            vm.vcpus()[1].mp_state().unwrap(),
+        );
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        vm.setup_boot_vcpu(&loaded).unwrap();
+        // (b) AP の LINT は BSP と同じ値で、INIT 前なので MP 状態は UNINITIALIZED のまま。
+        let bsp_lints = vm.vcpus()[0].lapic_lints().unwrap();
+        let ap_lints = vm.vcpus()[1].lapic_lints().unwrap();
+        let ap_state_before = vm.vcpus()[1].mp_state().unwrap();
+        // (c) 起動コードの配置。
+        let placed = vm
+            .write_ap_startup_code(SipiVector::new(0x01).unwrap(), &ap)
+            .unwrap();
+        // (d) BSP が INIT/SIPI を送る。
+        let mut bsp_exit = None;
+        while bsp_exit.is_none() {
+            match vm
+                .vcpu_mut(0)
+                .unwrap()
+                .run_once(Duration::from_secs(10))
+                .unwrap()
+            {
+                VcpuExit::Interrupted => continue,
+                e => bsp_exit = Some(e),
+            }
+        }
+        // (f) AP の出力。
+        let mut ap_exit = None;
+        while ap_exit.is_none() {
+            match vm
+                .vcpu_mut(1)
+                .unwrap()
+                .run_once(Duration::from_secs(10))
+                .unwrap()
+            {
+                VcpuExit::Interrupted => continue,
+                e => ap_exit = Some(e),
+            }
+        }
+        let _ = tx.send((
+            created,
+            bsp_lints,
+            ap_lints,
+            ap_state_before,
+            placed,
+            bsp_exit.unwrap(),
+            ap_exit.unwrap(),
+        ));
+    });
+    let (created, bsp_lints, ap_lints, ap_state_before, placed, bsp_exit, ap_exit) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("guest did not finish within 60s");
+
+    assert_eq!(created, (MpState::Runnable, MpState::Uninitialized));
+    assert_eq!(ap_lints, bsp_lints);
+    assert_eq!(ap_lints.lint1, 0x0000_0400);
+    assert_eq!(ap_lints.lint0_mode(), LvtDeliveryMode::ExtInt);
+    assert!(!ap_lints.lint0_masked());
+    assert_eq!(ap_state_before, MpState::Uninitialized);
+    assert_eq!(placed, GuestAddress::new(0x1000));
+    let out = |port: u16, v: u8| VcpuExit::Io {
+        direction: IoDirection::Out,
+        port,
+        size: 1,
+        count: 1,
+        data: vec![v],
+    };
+    assert_eq!(bsp_exit, out(0x10, 0xAA));
+    assert_eq!(ap_exit, out(0x11, 1));
+}
+
+/// MVM-1・#3737: x86_64 以外では AP の起動も組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_ap_starts_on_init_sipi() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 2,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
 /// MVM-1・TASK-75.4.1・#886: `MicroVm::start` / `RunningMicroVm::stop`。(a) 自己ループするゲストを停止要求で止め、
-/// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台は拒否される。
+/// (b) ud2（#UD → 未設定の IDT でトリプルフォールト）のゲストはゲスト起因の終了として報告され、(c) vCPU 2 台でも BSP の
+/// ゲスト起因の終了が全台を止め、きっかけの vCPU 番号（0）と台数（2）が報告されて両 vCPU の資源が解放される（#3738）。
 /// 資源の解放は、観測器 `Arc` の参照数が 1 に戻ること（`VcpuFd`、つまり `MicroVm` 全体が drop 済み）で決定的に確かめる
 /// （`/proc/self/fd` の件数は他の試験の並列スレッドで揺れるため使わない）。
 #[cfg(target_arch = "x86_64")]
@@ -1245,31 +1342,7 @@ fn kvm_device_start_stop_microvm() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let image = |entry_code: &[u8]| {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        let payload = 5 * 512;
-        for (i, b) in img[payload..].iter_mut().enumerate() {
-            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-        }
-        if !entry_code.is_empty() {
-            img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-        }
-        img
-    };
+    let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
     let assemble = |vcpu_count: u32| -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
         MicroVm::assemble(
             &dev,
@@ -1327,13 +1400,25 @@ fn kvm_device_start_stop_microvm() {
     assert_eq!(report.reason, StopReason::GuestShutdown);
     assert_eq!(Arc::strong_count(&obs), 1);
 
-    // (c) vCPU 2 台は未実装として拒否される。
+    // (c) vCPU 2 台（#3738）: BSP の ud2 によるゲスト起因の終了が全台を止める。AP は UNINITIALIZED のまま
+    // `KVM_RUN` の中にいて、kick で止まる。両 vCPU の観測器の参照数が 1 に戻る（全台の解放済み）まで確かめる。
     let mut vm = assemble(2);
     let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
-    assert_eq!(
-        vm.start(&loaded).unwrap_err().code(),
-        MicrovmErrorCode::Unimplemented
-    );
+    let obs0 = Arc::new(Count::default());
+    let obs1 = Arc::new(Count::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| running.is_finished())
+    ));
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.origin_vcpu, Some(0));
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -1352,6 +1437,171 @@ fn kvm_device_start_stop_microvm() {
     };
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
+        mem_size: 1 << 20,
+        block: vec![],
+        net: vec![],
+    };
+    assert_eq!(
+        MicroVm::assemble(&dev, config).unwrap_err().code(),
+        MicrovmErrorCode::Unimplemented
+    );
+}
+
+/// MVM-1・REPAIR-5・#3738: vCPU 2 台の `start` で AP が自分のスレッドで INIT/SIPI により起動し、COM1 の THR へ自分の
+/// APIC ID（1）を出す。ホストは `SerialConsole` の累積が `[0x01]` と完全一致するのを期限つきで待つ。`stop` は両スレッドを回収し
+/// （観測器の参照数が 1 に戻る）、観測器の記録に vcpu_id 1 の `KVM_RUN` がある。続けて、BSP が INIT/SIPI を送らず AP が
+/// UNINITIALIZED のまま `KVM_RUN` に居る状態でも、`stop` が kick で期限内（2 秒未満）に戻ることを確かめる。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::smp_x86::SipiVector;
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Ids {
+        total: AtomicU64,
+        ids: Mutex<Vec<u32>>,
+    }
+    impl RunObserver for Ids {
+        fn record(&self, record: &RunRecord) {
+            self.total.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut v) = self.ids.lock()
+                && !v.contains(&record.vcpu_id)
+            {
+                v.push(record.vcpu_id);
+            }
+        }
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
+    let assemble = || -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
+        MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 2,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![],
+            },
+        )
+        .unwrap()
+    };
+    let wait = |limit: Duration, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    };
+
+    // (a) BSP が INIT/SIPI を送り、AP が COM1 へ APIC ID を出す。
+    let bsp_sipi: Vec<u8> = vec![
+        0xBF, 0x10, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00310
+        0xC7, 0x07, 0x00, 0x00, 0x00, 0x01, // mov dword [rdi],0x01000000
+        0xBF, 0x00, 0x03, 0xE0, 0xFE, // mov edi,0xFEE00300
+        0xC7, 0x07, 0x00, 0x45, 0x00, 0x00, // mov dword [rdi],0x00004500 (INIT)
+        0xC7, 0x07, 0x01, 0x46, 0x00, 0x00, // mov dword [rdi],0x00004601 (SIPI, vector 1)
+        0xEB, 0xFE, // jmp $
+    ];
+    let ap: Vec<u8> = vec![
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+        0x0F, 0xA2, // cpuid
+        0x66, 0xC1, 0xEB, 0x18, // shr ebx,24
+        0x88, 0xD8, // mov al,bl
+        0xBA, 0xF8, 0x03, // mov dx,0x3F8
+        0xEE, // out dx,al
+        0xEB, 0xFE, // jmp $
+    ];
+    let mut vm = assemble();
+    let loaded = vm
+        .load_kernel(&image(&bsp_sipi), None, "console=ttyS0")
+        .unwrap();
+    vm.write_ap_startup_code(SipiVector::new(0x01).unwrap(), &ap)
+        .unwrap();
+    let obs0 = Arc::new(Ids::default());
+    let obs1 = Arc::new(Ids::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let console = vm.serial_console();
+    let running = vm.start(&loaded).unwrap();
+    let mut seen: Vec<u8> = Vec::new();
+    let arrived = wait(
+        Duration::from_secs(10),
+        Box::new(|| {
+            seen.extend(console.take_output().unwrap());
+            seen.as_slice() == [0x01]
+        }),
+    );
+    assert!(arrived, "AP output was {seen:?}, expected [1]");
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(report.origin_vcpu, None);
+    assert_eq!(report.stats.errors, 0);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
+    assert!(obs1.ids.lock().unwrap().contains(&1));
+    assert!(obs1.total.load(Ordering::SeqCst) >= 1);
+    assert!(obs0.ids.lock().unwrap().contains(&0));
+
+    // (b) SIPI の前の停止: AP は UNINITIALIZED のまま `KVM_RUN` に居て、kick で止まる。
+    let mut vm = assemble();
+    let loaded = vm
+        .load_kernel(&image(&[0xEB, 0xFE]), None, "console=ttyS0")
+        .unwrap();
+    let obs0 = Arc::new(Ids::default());
+    let obs1 = Arc::new(Ids::default());
+    vm.vcpu_mut(0).unwrap().set_observer(obs0.clone());
+    vm.vcpu_mut(1).unwrap().set_observer(obs1.clone());
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| obs0.total.load(Ordering::SeqCst) >= 1)
+    ));
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(Arc::strong_count(&obs0), 1);
+    assert_eq!(Arc::strong_count(&obs1), 1);
+}
+
+/// MVM-1・#3738: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+        vcpu_count: 2,
         mem_size: 1 << 20,
         block: vec![],
         net: vec![],
@@ -1393,23 +1643,8 @@ fn kvm_device_serial_output_reaches_host() {
     }
     code.extend_from_slice(&[0x0F, 0x0B]);
 
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    img[payload + 0x200..payload + 0x200 + code.len()].copy_from_slice(&code);
+    let mut img = bzimage::header_only();
+    bzimage::put_entry_code(&mut img, &code);
 
     let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
         &dev,
@@ -1496,28 +1731,7 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    {
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-    }
-    let payload = 5 * 512;
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
-    img[payload + 0x200..payload + 0x202].copy_from_slice(&[0xEB, 0xFE]);
+    let img = bzimage::synthetic_bzimage(&[0xEB, 0xFE]);
 
     for attempt in 0..5 {
         let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
@@ -1581,7 +1795,238 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
     );
 }
 
+/// MVM-1・REPAIR-5・#3742・#3743: virtio-net 1 台の構成の `start` が成功し、`start` の後に backend へ積んだフレームが、
+/// ゲストの kick（QueueNotify を含む MMIO）なしに受信ポーラー（`microvm-net-rx`）で受信バッファへ届く。
+/// `start` の後はホストからゲストメモリを読めないため、ゲスト自身に used ring と受信バッファを読ませて COM1 へ出させ、
+/// 完全一致で照合する。ドライバの初期化（DRIVER_OK・キュー 0/1 の ready）はホスト側が `start` の前に行い、ゲストは
+/// MMIO を一切出さない（記録に MMIO の exit が 0 件）。後半はフレームを積まない負の対照で、出力が空のまま `stop` が
+/// 期限内に `Requested` で戻り、net-rx スレッドを含めて backend と観測器の参照が解放される。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_rx_reaches_guest_without_kick() {
+    use fandhe_container_microvm::device::{BoundedRunLog, ValueCapture};
+    use fandhe_container_microvm::error::MicrovmError;
+    use fandhe_container_microvm::exit::{ExitValue, IoDirection};
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_mmio::{DeviceStatus, reg};
+    use fandhe_container_microvm::virtio_net::NetBackend;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// `start` の後にフレームを積むため、試験側にも共有ハンドルを残す backend。
+    #[derive(Debug, Clone, Default)]
+    struct SharedNetBackend {
+        inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+    impl NetBackend for SharedNetBackend {
+        fn send(&mut self, _frame: &[u8]) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+        fn recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
+            let mut q = self.inbound.lock().unwrap();
+            let Some(frame) = q.front() else {
+                return Ok(None);
+            };
+            let dst = buf.get_mut(..frame.len()).expect("rx buffer large enough");
+            dst.copy_from_slice(frame);
+            let n = frame.len();
+            q.pop_front();
+            Ok(Some(n))
+        }
+    }
+
+    // 64 MiB の VM の内側。ブート用の配置（zero page 0x7000・テーブル 0xF000 未満・cmdline 0x20000・bzImage 0x100000）と重ならない。
+    const RX_DESC: u64 = 0x0200_0000;
+    const RX_AVAIL: u64 = 0x0200_1000;
+    const RX_USED: u64 = 0x0200_2000;
+    const TX_DESC: u64 = 0x0200_3000;
+    const TX_AVAIL: u64 = 0x0200_4000;
+    const TX_USED: u64 = 0x0200_5000;
+    const RX_BUF: u64 = 0x0201_0000;
+    const FRAME_LEN: usize = 60;
+    const NET_HDR_LEN: usize = 12;
+    const SENTINEL: usize = 4;
+    const USED_HEAD: usize = 10; // used.idx(2) + used 要素 0 の id(4) + len(4)
+
+    /// poll: used.idx が 0 の間 `pause` で待つ → used 先頭とバッファを COM1 へ 1 バイトずつ出力 → ud2。
+    fn guest_code() -> Vec<u8> {
+        let mut c: Vec<u8> = vec![0x0F, 0xB7, 0x04, 0x25]; // movzx eax, word [disp32]
+        c.extend_from_slice(&((RX_USED + 2) as u32).to_le_bytes());
+        c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        c.extend_from_slice(&[0x75, 0x04]); // jnz out（pause + jmp の 4 バイトを飛ばす）
+        c.extend_from_slice(&[0xF3, 0x90]); // pause
+        let back = -(i32::try_from(c.len()).unwrap() + 2);
+        assert!(back >= -128);
+        c.extend_from_slice(&[0xEB, back as i8 as u8]); // jmp poll
+        let out = |c: &mut Vec<u8>, src: u32, n: u32| {
+            c.push(0xBE);
+            c.extend_from_slice(&src.to_le_bytes()); // mov esi, src
+            c.push(0xB9);
+            c.extend_from_slice(&n.to_le_bytes()); // mov ecx, n
+            c.extend_from_slice(&[0x66, 0xBA, 0xF8, 0x03]); // mov dx, 0x3f8
+            c.extend_from_slice(&[0xAC, 0xEE, 0xE2, 0xFC]); // l: lodsb; out dx, al; loop l
+        };
+        out(&mut c, (RX_USED + 2) as u32, USED_HEAD as u32);
+        out(
+            &mut c,
+            RX_BUF as u32,
+            (NET_HDR_LEN + FRAME_LEN + SENTINEL) as u32,
+        );
+        c.extend_from_slice(&[0x0F, 0x0B]); // ud2
+        c
+    }
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+
+    // 準備: ゲストコードのロード → 受信バッファ・記述子・avail → ホスト側のドライバ初期化 → 観測器。
+    let build = |backend: &SharedNetBackend| {
+        let mut img = bzimage::header_only();
+        bzimage::put_entry_code(&mut img, &guest_code());
+        let mut vm: MicroVm<MemoryBlockBackend, SharedNetBackend> = MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: vec![],
+                net: vec![NetDeviceConfig {
+                    backend: backend.clone(),
+                    mac: [2, 0, 0, 0, 0, 1],
+                }],
+            },
+        )
+        .unwrap();
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let ga = GuestAddress::new;
+        {
+            let mem = vm.memory_mut();
+            mem.write_at(ga(RX_BUF), &[0xEE; 2048]).unwrap();
+            mem.write_at(ga(RX_DESC), &RX_BUF.to_le_bytes()).unwrap();
+            mem.write_u32_le(ga(RX_DESC + 8), 2048).unwrap();
+            mem.write_u16_le(ga(RX_DESC + 12), 2).unwrap(); // WRITE
+            mem.write_u16_le(ga(RX_DESC + 14), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL + 4), 0).unwrap();
+            mem.write_u16_le(ga(RX_AVAIL + 2), 1).unwrap();
+        }
+        vm.with_net(0, |t| {
+            let mut wr = |off: u64, v: u32| t.write(off, &v.to_le_bytes());
+            wr(reg::STATUS, 1);
+            wr(reg::STATUS, 3);
+            wr(reg::DRIVER_FEATURES_SEL, 0);
+            wr(reg::DRIVER_FEATURES, 1 << 5); // MAC
+            wr(reg::DRIVER_FEATURES_SEL, 1);
+            wr(reg::DRIVER_FEATURES, 1); // VERSION_1
+            wr(reg::STATUS, 11);
+            for (q, d, a, u) in [
+                (0, RX_DESC, RX_AVAIL, RX_USED),
+                (1, TX_DESC, TX_AVAIL, TX_USED),
+            ] {
+                wr(reg::QUEUE_SEL, q);
+                wr(reg::QUEUE_NUM, 16);
+                wr(reg::QUEUE_DESC_LOW, d as u32);
+                wr(reg::QUEUE_DRIVER_LOW, a as u32);
+                wr(reg::QUEUE_DEVICE_LOW, u as u32);
+                wr(reg::QUEUE_READY, 1);
+            }
+            wr(reg::STATUS, 15);
+            assert!(t.status().contains(DeviceStatus::DRIVER_OK));
+        })
+        .unwrap();
+        let log = Arc::new(BoundedRunLog::new(1024, ValueCapture::Record).unwrap());
+        vm.vcpu_mut(0).unwrap().set_observer(log.clone());
+        (vm, loaded, log)
+    };
+    let wait = |limit: Duration, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let end = Instant::now() + limit;
+        while !cond() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    };
+
+    // 本体: start の後にフレームを積み、kick なしで届く。
+    let backend = SharedNetBackend::default();
+    let (vm, loaded, log) = build(&backend);
+    let running = vm.start(&loaded).unwrap();
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| !log.records().is_empty())
+    ));
+    assert_eq!(running.serial_console().stats().unwrap().written_bytes, 0);
+    let frame: Vec<u8> = (0..FRAME_LEN).map(|i| ((i + 7) % 241) as u8).collect();
+    backend.inbound.lock().unwrap().push_back(frame.clone());
+    assert!(wait(
+        Duration::from_secs(10),
+        Box::new(|| running.is_finished())
+    ));
+    let console = running.serial_console();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.origin_vcpu, Some(0));
+    assert_eq!(report.vcpu_count, 1);
+    assert_eq!(report.stats.errors, 0);
+
+    let mut expected: Vec<u8> = vec![1, 0]; // used.idx
+    expected.extend_from_slice(&0u32.to_le_bytes()); // used[0].id
+    expected.extend_from_slice(&((NET_HDR_LEN + FRAME_LEN) as u32).to_le_bytes()); // used[0].len
+    expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]); // virtio_net_hdr（num_buffers = 1）
+    expected.extend_from_slice(&frame);
+    expected.extend_from_slice(&[0xEE; SENTINEL]);
+    assert_eq!(console.take_output().unwrap(), expected);
+    assert!(backend.inbound.lock().unwrap().is_empty());
+
+    // ゲストの kick なし: MMIO の exit が 0 件で、PIO は port 0x3f8 への 1 バイトの OUT だけ（10 + 76 = 86 件）。
+    assert_eq!(log.dropped(), 0);
+    let values: Vec<ExitValue> = log.records().iter().filter_map(|r| r.value).collect();
+    assert!(
+        values.iter().all(|v| matches!(
+            v,
+            ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x3f8,
+                size: 1,
+                ..
+            }
+        )),
+        "{values:?}"
+    );
+    assert_eq!(values.len(), USED_HEAD + NET_HDR_LEN + FRAME_LEN + SENTINEL);
+    assert_eq!(Arc::strong_count(&log), 1);
+    assert_eq!(Arc::strong_count(&backend.inbound), 1);
+
+    // 負の対照: フレームなしなら出力は空のまま、stop が期限内に Requested で戻り、net-rx スレッドを含めて解放される。
+    let backend = SharedNetBackend::default();
+    let (vm, loaded, log) = build(&backend);
+    let running = vm.start(&loaded).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!running.is_finished());
+    assert_eq!(running.serial_console().stats().unwrap().written_bytes, 0);
+    let t0 = Instant::now();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(Arc::strong_count(&log), 1);
+    assert_eq!(Arc::strong_count(&backend.inbound), 1);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_net_rx_reaches_guest_without_kick() {
+    assert_unimplemented_assemble();
+}
+
 /// MVM-1・TASK-75.4.2・#887: 起動の途中で失敗しても fd・mmap が解放され、エラーは ERR-1 の形（`<CODE>: <message>`）で返る。
+/// net を含む構成の起動途中の失敗（解放）と、net を含む構成の `start` の成功と停止も確認する（#3743）。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -1606,24 +2051,7 @@ fn kvm_device_start_failure_releases_resources() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let image = {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        img
-    };
+    let image = bzimage::header_only();
     let assemble = |mem_size: u64, net: usize| -> Vm {
         MicroVm::assemble(
             &dev,
@@ -1653,13 +2081,27 @@ fn kvm_device_start_failure_releases_resources() {
     assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
     assert_eq!(Arc::strong_count(&obs), 1);
 
-    // (b) net デバイスを含む構成の start は Unimplemented で、解放される。
+    // (b1) net を含む構成でも、起動途中の失敗（小さいメモリ）で解放される。
+    let mut small = assemble(2 << 20, 1);
+    let obs = Arc::new(Nop);
+    small.vcpu_mut(0).unwrap().set_observer(obs.clone());
+    let e = small.start(&loaded).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
+    assert_eq!(Arc::strong_count(&obs), 1);
+
+    // (b2) net を含む構成の start は Unimplemented ではなく成功し、停止で解放される（#3743）。
+    let spin = bzimage::synthetic_bzimage(&[0xEB, 0xFE]);
     let mut vm = assemble(64 << 20, 1);
-    let loaded = vm.load_kernel(&image, None, "console=ttyS0").unwrap();
+    let loaded = vm.load_kernel(&spin, None, "console=ttyS0").unwrap();
     let obs = Arc::new(Nop);
     vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
-    let e = vm.start(&loaded).unwrap_err();
-    assert!(e.to_string().starts_with("UNIMPLEMENTED: "), "{e}");
+    let running = vm.start(&loaded).unwrap();
+    let report = running.stop(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        report.reason,
+        fandhe_container_microvm::microvm::StopReason::Requested
+    );
     assert_eq!(Arc::strong_count(&obs), 1);
 
     // (c) load_kernel に不正なイメージを渡すと InvalidArgument。MicroVm は残り、drop で解放される。
@@ -1708,31 +2150,6 @@ fn kvm_device_start_failure_releases_resources() {
     assert_eq!(e.code(), MicrovmErrorCode::NotFound);
     assert!(e.to_string().starts_with("NOT_FOUND: "), "{e}");
 }
-/// #3734 の試験用: エントリ（payload + 0x200）に `entry_code` を置いた合成 bzImage。残りは ud2。
-#[cfg(target_arch = "x86_64")]
-fn synthetic_bzimage(entry_code: &[u8]) -> Vec<u8> {
-    let mut img = vec![0u8; 5 * 512 + 0x1000];
-    let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-    put(0x1F1, &[4]);
-    put(0x1FE, &0xAA55u16.to_le_bytes());
-    put(0x201, &[0x62]);
-    put(0x202, b"HdrS");
-    put(0x206, &0x020Fu16.to_le_bytes());
-    put(0x211, &[1]);
-    put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-    put(0x230, &0x20_0000u32.to_le_bytes());
-    put(0x234, &[1]);
-    put(0x236, &1u16.to_le_bytes());
-    put(0x238, &2047u32.to_le_bytes());
-    put(0x258, &0x100_0000u64.to_le_bytes());
-    put(0x260, &0x40_0000u32.to_le_bytes());
-    let payload = 5 * 512;
-    for (i, b) in img[payload..].iter_mut().enumerate() {
-        *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-    }
-    img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-    img
-}
 
 /// MVM-1・#3734: `KVM_SET_FPU` の設定経路が効くこと（番兵の FCW の読み戻し）と、`setup_boot_vcpu` 後の FPU が
 /// fcw = 0x37F・fsw = 0・ftwx = 0 であること（`KVM_GET_FPU` の読み戻し）。
@@ -1756,7 +2173,7 @@ fn kvm_device_boot_fpu_reads_back() {
             panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
     };
-    let img = synthetic_bzimage(&[0x0F, 0x0B]);
+    let img = bzimage::synthetic_bzimage(&[0x0F, 0x0B]);
     let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
         &dev,
         MicroVmConfig {
@@ -1808,7 +2225,7 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
         0xB9, 0xA0, 0x01, 0x00, 0x00, 0x0F, 0x32, 0xE7, 0x10, 0x89, 0xD0, 0xE7, 0x10, 0xB9, 0x81,
         0x00, 0x00, 0xC0, 0x0F, 0x32, 0xE7, 0x10, 0x89, 0xD0, 0xE7, 0x10,
     ];
-    let img = synthetic_bzimage(&code);
+    let img = bzimage::synthetic_bzimage(&code);
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

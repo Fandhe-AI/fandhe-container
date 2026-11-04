@@ -15,9 +15,10 @@
 //! `completed` が 1 以上なら `Err` でも `UsedBuffer` を上げる。壊れたチェーンは `last_avail` を進めないため、
 //! 以後の呼び出しも同じ `Err` になる（停止・リセットの判断は呼び出し元が行う）。
 //!
-//! backend にフレームが届いたことを知らせるホスト側のイベントループ（ポーリング・eventfd）はまだ無い。
-//! 呼び出し元は、ゲストの kick が無くても backend にフレームがあるときに `process_rx` を呼ぶ必要がある
-//! （REPAIR-3。TASK-75 / TASK-117 で決める）。
+//! backend にフレームが届いたことを知らせる通知（eventfd 等）は無い。ゲストの kick が無くても受信を進めるため、
+//! 呼び出し元は期限ごとに `process_rx` を呼ぶ。その経路が `crate::interrupt::poll_net_rx`（状態の確認つき）と、
+//! Linux の `microvm` の受信ポーラー専用スレッド（#3742・MVM-1・REPAIR-5）。backend の到着通知への置き換えは
+//! 将来仕様（REPAIR-3。TASK-75 / TASK-117 で TAP を導入するときに検討する）。
 //!
 //! # 受信の保持と取りこぼし
 //! 受信用のゲストバッファが無いとき、取り出したフレームは device が固定長の staging buffer に 1 フレームだけ保持し

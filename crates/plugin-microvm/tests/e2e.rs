@@ -540,6 +540,148 @@ fn task117_4_plug1_backend_start_failure_maps_to_error_frame_and_keeps_connectio
     let _ = e.finish();
 }
 
+/// `mkfifo` で FIFO を作る。起動失敗・非ゼロ終了・期限切れはすべて panic で失敗させる（REPAIR-5・REPAIR-12）。
+fn make_fifo(path: &std::path::Path) {
+    let mut child = std::process::Command::new("mkfifo")
+        .arg(path)
+        .spawn()
+        .expect("spawn mkfifo");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("try_wait mkfifo") {
+            Some(st) => break st,
+            None if std::time::Instant::now() >= deadline => {
+                let killed = child.kill();
+                // kill 後の回収も有限期限で待つ（割り込み不能な待ちの子で無期限に止まらない）。
+                let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let reaped = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Ok(None) if std::time::Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => break false,
+                    }
+                };
+                panic!("mkfifo did not exit within 10s (kill={killed:?}, reaped={reaped})");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
+/// イメージパスの読み取り失敗が、実際の UDS 経路で固定文言のエラー応答へ写る（ERR-1・SEC-1・PLUG-1・#3841）。
+/// 最終要素の open は `O_NOCTTY` 付き（フラグ定数は sys の単体試験が具体値で固定）。lstat 後の tty 差し替えは
+/// 公開 API からは作れないため、ここでは通常ファイルの読み取りが `O_NOCTTY` 付きでも成功すること（既存試験）と、
+/// 実体でない・存在しない・権限なしの各入力が分類どおりに応答され、パス・OS 文言を漏らさないことを確かめる。
+#[test]
+fn sec1_err1_3841_image_open_failures_map_to_fixed_error_frames_via_uds() {
+    use fandhe_container_plugin::PluginErrorCode;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut e = mock_core::E2e::start();
+    let base = e.dir.0.clone();
+    let good = e.dir.file("k.bin", KERNEL);
+    let real_dir = std::fs::canonicalize(&base).expect("canonicalize");
+
+    // 存在しない kernel / initrd は NOT_FOUND（文言は種別ごとの固定文）。
+    let missing = real_dir
+        .join("absent.bin")
+        .to_str()
+        .expect("utf8")
+        .to_string();
+    let mut id = 10u64;
+    let mut expect_err = |e: &mut mock_core::E2e, body: Vec<String>| {
+        id += 1;
+        match call(&mut e.stream, id, body) {
+            ControlMessage::Error { id: got, error } => {
+                assert_eq!(got.get(), id);
+                (error.code(), error.message().to_string())
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    let r = expect_err(&mut e, s(&["start", "v1", &missing, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::NotFound,
+            "kernel image not found".to_string()
+        )
+    );
+    let r = expect_err(&mut e, s(&["start", "v1", &good, &missing, "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::NotFound,
+            "initrd image not found".to_string()
+        )
+    );
+
+    // 最終要素が symlink / FIFO（通常ファイルではない）は INVALID_ARGUMENT。
+    let link = real_dir.join("link.bin");
+    std::os::unix::fs::symlink(&good, &link).expect("symlink");
+    let link_s = link.to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &link_s, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image must be a regular file".to_string()
+        )
+    );
+    let fifo = real_dir.join("fifo.bin");
+    make_fifo(&fifo);
+    let fifo_s = fifo.to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &fifo_s, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image must be a regular file".to_string()
+        )
+    );
+
+    // 祖先が symlink のディレクトリは INVALID_ARGUMENT（祖先の文言）。
+    let dir_link = real_dir.join("dlink");
+    std::os::unix::fs::symlink(&real_dir, &dir_link).expect("symlink dir");
+    let via = dir_link.join("k.bin").to_str().expect("utf8").to_string();
+    let r = expect_err(&mut e, s(&["start", "v1", &via, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::InvalidArgument,
+            "image path ancestor must be a real directory".to_string()
+        )
+    );
+
+    // 読み取り権限が無い通常ファイルは PERMISSION_DENIED。root では権限が効かず検証できないため、
+    // 前提の不成立は省略せず明示的に失敗させる（非特権で実行する。REPAIR-12）。
+    let secret = e.dir.file("noperm.bin", KERNEL);
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    assert!(
+        std::fs::File::open(&secret).is_err(),
+        "precondition failed: mode 000 file is readable (run as a non-root user)"
+    );
+    let r = expect_err(&mut e, s(&["start", "v1", &secret, "", "", "1", "64"]));
+    assert_eq!(
+        r,
+        (
+            PluginErrorCode::PermissionDenied,
+            "permission denied reading image".to_string()
+        )
+    );
+
+    // 失敗後も接続は維持され、VM は登録されていない。
+    assert_eq!(
+        expect_ok(call(&mut e.stream, 99, s(&["ping"])), 99),
+        s(&["pong"])
+    );
+    assert!(e.record.lock().expect("lock").starts.is_empty());
+    let _ = e.finish();
+}
+
 /// 停止期限切れで切り離した VM は、終了を観測するまで枠を返さず、観測後の start で枠が回収される（#3745・PLUG-1・REPAIR-5）。
 #[test]
 fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_uds() {
@@ -605,6 +747,11 @@ fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_u
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 
+/// 合成 bzImage の正本（`crates/microvm/tests/support/bzimage.rs`。複製しない・#3750）。
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "../../microvm/tests/support/bzimage.rs"]
+mod bzimage;
+
 /// 層 B: 実バイナリ + 実 KVM（x86_64 Linux・`/dev/kvm` が要る実機前提）。
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod real_kvm {
@@ -616,36 +763,10 @@ mod real_kvm {
 
     use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PLUGIN_SOCKET_ENV, UdsListener};
 
-    use super::reap;
+    use super::{bzimage, reap};
 
     const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-microvm");
     const WAIT: Duration = Duration::from_secs(30);
-
-    /// 合成 bzImage（`crates/microvm/tests/microvm.rs` の同名関数と同じ組み立て。64-bit エントリは payload + 0x200）。
-    /// 別 crate の試験との共通化は 1 PR・1 関心事の範囲外のため写している。残りの payload は `ud2` で埋める。
-    fn synthetic_bzimage(entry_code: &[u8]) -> Vec<u8> {
-        let mut img = vec![0u8; 5 * 512 + 0x1000];
-        let mut put = |off: usize, d: &[u8]| img[off..off + d.len()].copy_from_slice(d);
-        put(0x1F1, &[4]);
-        put(0x1FE, &0xAA55u16.to_le_bytes());
-        put(0x201, &[0x62]);
-        put(0x202, b"HdrS");
-        put(0x206, &0x020Fu16.to_le_bytes());
-        put(0x211, &[1]);
-        put(0x22C, &0x3FF_FFFFu32.to_le_bytes());
-        put(0x230, &0x20_0000u32.to_le_bytes());
-        put(0x234, &[1]);
-        put(0x236, &1u16.to_le_bytes());
-        put(0x238, &2047u32.to_le_bytes());
-        put(0x258, &0x100_0000u64.to_le_bytes());
-        put(0x260, &0x40_0000u32.to_le_bytes());
-        let payload = 5 * 512;
-        for (i, b) in img[payload..].iter_mut().enumerate() {
-            *b = if i % 2 == 0 { 0x0F } else { 0x0B };
-        }
-        img[payload + 0x200..payload + 0x200 + entry_code.len()].copy_from_slice(entry_code);
-        img
-    }
 
     /// boot_params の `HdrS` と cmd_line_ptr（0x20000）だけを確かめ、一致すれば自己ループする。不一致は `ud2`。
     fn guest_payload() -> Vec<u8> {
@@ -736,7 +857,7 @@ mod real_kvm {
         precondition();
         let dir = TempDir::new();
         let sock = dir.0.join("p.sock");
-        let kernel = dir.file("k.bin", &synthetic_bzimage(&guest_payload()));
+        let kernel = dir.file("k.bin", &bzimage::synthetic_bzimage(&guest_payload()));
         let listener = UdsListener::bind(&sock).expect("bind");
         let child = spawn(&sock);
         let mut obs = JsonLinesPeerAuthObserver::new();

@@ -3,7 +3,7 @@
 //! 呼び出し文脈: ゲストの `QueueNotify` を受けた側（Linux では `crate::irq` の ioeventfd、それ以外では
 //! `crate::dispatch` の MMIO exit）が [`complete_block_notify`]（virtio-net は [`complete_net_notify`]）を呼び、virtqueue の処理結果に応じて
 //! [`InterruptLine::trigger`] でゲストへ割り込みを 1 回注入する。Linux の [`InterruptLine`] 実装は
-//! `crate::irq::IrqFd`（`KVM_IRQFD`）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
+//! `crate::irq::IrqFd`（`KVM_IRQFD`）、macOS は `crate::hvf::gic::GicSpiLine`（`hv_gic_set_spi`。#3795）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
 //! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
 //! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みは edge 扱いで、
@@ -12,7 +12,7 @@
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestMemory, GuestMemoryBacking};
 use crate::virtio_block::{BlockBackend, BlockQueueStats, VirtioBlock};
-use crate::virtio_mmio::{InterruptReason, VirtioMmioTransport, reg};
+use crate::virtio_mmio::{DeviceStatus, InterruptReason, VirtioMmioTransport, reg};
 use crate::virtio_net::{NetBackend, NetRxStats, NetTxStats, VirtioNet};
 
 /// ゲストへの割り込み 1 回分の注入口。
@@ -250,6 +250,54 @@ pub fn complete_net_notify<B: NetBackend, M: GuestMemoryBacking>(
         delivery,
         queue_error,
     })
+}
+
+/// [`poll_net_rx`] が `process_rx` を呼ばなかった理由（REPAIR-4: 真偽値にしない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NetRxPollSkip {
+    /// `DRIVER_OK` が立っていない（ゲストのドライバが未初期化。activate 前）。
+    NotActive,
+    /// `FAILED` か `DEVICE_NEEDS_RESET` が立っている。異常状態のデバイスへは書き込まない。
+    DeviceFailed,
+    /// receiveq（キュー 0）が無いか、`ready` でない（ゲストが止めた）。
+    QueueNotReady,
+}
+
+/// [`poll_net_rx`] の結果（REPAIR-4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NetRxPollOutcome {
+    /// 処理しなかった。ゲストの状態が整うまで backend のフレームは backend 側に残る。
+    Skipped(NetRxPollSkip),
+    /// `process_rx` を呼んだ。内訳は [`complete_net_notify`] と同じ。
+    Polled(NetNotifyReport),
+}
+
+/// ゲストの kick なしで virtio-net の受信を 1 回処理する（#3742・MVM-1・REPAIR-5）。
+///
+/// 呼び出し元は受信ポーラー（Linux では `microvm` の `NetRxPoller`。期限ごとに呼ぶ）。kick 経路と同じ lock の下で直列に呼ぶ前提。
+/// 先にトランスポートの状態を確かめ、ドライバ未初期化（`DRIVER_OK` なし）・`FAILED` / `DEVICE_NEEDS_RESET`・receiveq が
+/// ready でないときは `process_rx` を呼ばず [`NetRxPollOutcome::Skipped`] を返す。activate 前の `process_rx` は
+/// `FailedPrecondition` を返し、ポーラーがそれを異常として拾うとゲストが virtio_net を読み込む前に VM が止まるため。
+/// 有効なら [`complete_net_notify`] を `queue = 0` で呼ぶ（完了が 1 件以上のときだけ割り込みを 1 回注入する）。
+/// リング破損は内訳の `queue_error`、割り込み線の失敗は外側の `Err` に入る。待ちは持たない。
+pub fn poll_net_rx<B: NetBackend, M: GuestMemoryBacking>(
+    transport: &mut VirtioMmioTransport<VirtioNet<B>>,
+    mem: &mut GuestMemory<M>,
+    line: &dyn InterruptLine,
+) -> Result<NetRxPollOutcome, MicrovmError> {
+    let status = transport.status();
+    if status.contains(DeviceStatus::FAILED) || status.contains(DeviceStatus::DEVICE_NEEDS_RESET) {
+        return Ok(NetRxPollOutcome::Skipped(NetRxPollSkip::DeviceFailed));
+    }
+    if !status.contains(DeviceStatus::DRIVER_OK) {
+        return Ok(NetRxPollOutcome::Skipped(NetRxPollSkip::NotActive));
+    }
+    if !transport.queue(0).is_some_and(|q| q.ready()) {
+        return Ok(NetRxPollOutcome::Skipped(NetRxPollSkip::QueueNotReady));
+    }
+    complete_net_notify(transport, mem, 0, line).map(NetRxPollOutcome::Polled)
 }
 
 #[cfg(test)]

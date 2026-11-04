@@ -1,0 +1,449 @@
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795）。`--ignored` 指定時だけ走る。
+//! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
+//! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
+//! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+use fandhe_container_microvm::arm64_layout::{
+    ARM64_BOOT_CPU_MPIDR, ARM64_PPI_INTID_BASE, ARM64_TIMER_VIRT_PPI, Arm64Layout,
+    check_virtual_timer_intid,
+};
+use fandhe_container_microvm::error::MicrovmErrorCode;
+use fandhe_container_microvm::esr::{
+    AccessDirection, EsrClass, WfxKind, decode_esr, instruction_length,
+};
+use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
+use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGic, HvfGuestRam, VmWithGic};
+use fandhe_container_microvm::hvf_abi::{
+    HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
+};
+use fandhe_container_microvm::interrupt::InterruptLine;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// VM を作る。権限不足・hypervisor 不可は環境の問題として、決まった 1 行目で失敗させる。
+fn create_vm_or_precondition() -> HvVm {
+    match HvVm::create() {
+        Ok(vm) => vm,
+        Err(e) => {
+            panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    }
+}
+
+/// GIC つきの VM を作る。前提欠如（権限不足など）は決まった 1 行目で失敗させる。
+/// macOS 14 の `Unimplemented` は前提欠如ではなく、そのままの失敗として出す。
+fn create_vm_with_gic_or_precondition(layout: &Arm64Layout) -> VmWithGic {
+    match VmWithGic::create(layout) {
+        Ok(vm) => vm,
+        Err(e) if e.code() == MicrovmErrorCode::Unimplemented => panic!("hvf_device: gic: {e}"),
+        Err(e) => {
+            panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_create_map_unmap_vm() {
+    let vm = create_vm_or_precondition();
+
+    // 1 プロセス 1 VM: 2 個目は拒否される。
+    assert_eq!(
+        HvVm::create().unwrap_err().code(),
+        MicrovmErrorCode::FailedPrecondition
+    );
+
+    let page = HostMapping::page_size().unwrap();
+    let host = HostMapping::new(page).unwrap();
+    let mapping = vm
+        .map(host, 0, 0x4000_0000, page, MemoryFlags::RWX)
+        .unwrap();
+    mapping.unmap().unwrap();
+
+    // forget しても backing は所有されたままリークするだけで、VM の破棄後も munmap されない（寿命契約）。
+    let host2 = HostMapping::new(page).unwrap();
+    let leaked = vm
+        .map(host2, 0, 0x5000_0000, page, MemoryFlags::RWX)
+        .unwrap();
+    std::mem::forget(leaked);
+
+    // drop 後は作り直せる。
+    drop(vm);
+    let again = HvVm::create().unwrap();
+    drop(again);
+}
+
+/// `hvf_device_vcpu_regs_roundtrip` の全体期限。`run` が戻らないハングを失敗として残す（REPAIR-5）。
+const VCPU_DEADLINE: Duration = Duration::from_secs(10);
+
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_vcpu_regs_roundtrip() {
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let vm = vgic.vm();
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    // `b .`（自分自身への無条件分岐）: ゲストは永久に回り続け、停止は canceller だけが担う。
+    host.write_bytes(0, &0x1400_0000u32.to_le_bytes()).unwrap();
+    let mapping = vm
+        .map(host, 0, 0x4000_0000, page, MemoryFlags::RWX)
+        .unwrap();
+
+    let mut vcpu = vgic.create_vcpu().unwrap();
+    let x0 = HvReg::x(0).unwrap();
+    vcpu.set_reg(x0, 0x1122_3344_5566_7788).unwrap();
+    assert_eq!(vcpu.get_reg(x0).unwrap(), 0x1122_3344_5566_7788);
+    vcpu.set_reg(HvReg::PC, 0x4000_0000).unwrap();
+    assert_eq!(vcpu.get_reg(HvReg::PC).unwrap(), 0x4000_0000);
+    // 0x3c5: M[3:0] = 0b0101（EL1h）と DAIF の 4 ビット（0x3c0）。
+    vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+    assert_eq!(vcpu.get_reg(HvReg::CPSR).unwrap(), 0x3c5);
+    // bit 31 は RES1、Aff0 = 1。フレームワークがゲストに見せる値を加工する可能性は #3803 で観測する。
+    vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, 0x8000_0001).unwrap();
+    assert_eq!(vcpu.get_sys_reg(HvSysReg::MPIDR_EL1).unwrap(), 0x8000_0001);
+
+    // 別スレッドから停止する。run の前の cancel が次の run を即戻すかは未確認のため、
+    // run 中に届く再送で競合に依存しない形にする。
+    let done = Arc::new(AtomicBool::new(false));
+    let canceller = vcpu.canceller();
+    let stopper = {
+        let done = Arc::clone(&done);
+        let canceller = canceller.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            while !done.load(Ordering::Acquire) {
+                canceller.cancel().unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    // run が戻らないハングの歯止め（REPAIR-5）。
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < VCPU_DEADLINE {
+            if watchdog_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("hvf_device: WATCHDOG EXPIRED");
+        std::process::exit(124);
+    });
+
+    let exit = vcpu.run_once(VCPU_DEADLINE);
+    done.store(true, Ordering::Release);
+    stopper.join().unwrap();
+    watchdog.join().unwrap();
+    assert_eq!(exit.unwrap(), HvVcpuExit::Canceled);
+
+    // 破棄後の cancel は破棄済みの id へ送らず拒否される。
+    drop(vcpu);
+    assert_eq!(
+        canceller.cancel().unwrap_err().code(),
+        MicrovmErrorCode::FailedPrecondition
+    );
+    mapping.unmap().unwrap();
+}
+
+/// ゲスト RAM（4 MiB）を IPA 0x4000_0000 に登録し、`GuestMemory` 越しのコピーと範囲外の拒否、
+/// drop 後の再登録を確かめる（TASK-192.4・#3787・MVM-5・MVM-1）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_guest_ram_map_and_copy() {
+    const BASE: u64 = 0x4000_0000;
+    const SIZE: u64 = 4 << 20;
+    let vm = create_vm_or_precondition();
+    let base = GuestAddress::new(BASE);
+
+    let mut ram = HvfGuestRam::new(SIZE).unwrap();
+    // 登録前に書いた内容が登録後も見える。
+    ram.write(0, &[0xaa, 0xbb]).unwrap();
+    let mut mem = ram.register(&vm, base, HVF_DEFAULT_IPA_LIMIT).unwrap();
+    let mut head = [0u8; 2];
+    mem.read_at(base, &mut head).unwrap();
+    assert_eq!(head, [0xaa, 0xbb]);
+
+    let mid = GuestAddress::new(BASE + 0x1234);
+    mem.write_at(mid, &[1, 2, 3, 4, 5]).unwrap();
+    let mut got = [0u8; 5];
+    mem.read_at(mid, &mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4, 5]);
+
+    let u = GuestAddress::new(BASE + 0x2000);
+    mem.write_u64_le(u, 0x1122_3344_5566_7788).unwrap();
+    assert_eq!(mem.read_u64_le(u).unwrap(), 0x1122_3344_5566_7788);
+
+    // 範囲外（末尾をはみ出す・base より下）は拒否される。
+    let mut four = [0u8; 4];
+    let tail = GuestAddress::new(BASE + SIZE - 2);
+    assert_eq!(
+        mem.read_at(tail, &mut four).unwrap_err().code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        mem.read_at(GuestAddress::new(BASE - 1), &mut four)
+            .unwrap_err()
+            .code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+
+    // drop で unmap されるため、同じ IPA へ再登録できる。
+    drop(mem);
+    let again = HvfGuestRam::new(SIZE)
+        .unwrap()
+        .register(&vm, base, HVF_DEFAULT_IPA_LIMIT)
+        .unwrap();
+    drop(again);
+    drop(vm);
+}
+
+/// `hv_gic_*` の実行時解決（`dlsym`）と照会 API を確かめる（TASK-192.3・#3789・MVM-5・MVM-4）。
+/// macOS 14 では `UNIMPLEMENTED: hypervisor GIC requires macOS 15 or later` で落ちる（dyld のエラーは出ない）。
+/// 待ちを持たない同期の照会だけなので watchdog は不要。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_gic_symbols_resolve() {
+    let api = match GicApi::get() {
+        Ok(api) => api,
+        Err(e) => panic!("hvf_device: gic: {e}"),
+    };
+    let dist = api.distributor_size().unwrap();
+    let dist_align = api.distributor_base_alignment().unwrap();
+    let redist = api.redistributor_size().unwrap();
+    let redist_align = api.redistributor_base_alignment().unwrap();
+    let (spi_base, spi_count) = api.spi_interrupt_range().unwrap();
+    eprintln!(
+        "hvf_device: gic: distributor size={dist} align={dist_align}, redistributor size={redist} align={redist_align}, spi base={spi_base} count={spi_count}"
+    );
+    assert!(dist > 0 && redist > 0);
+    assert!(dist_align.is_power_of_two() && redist_align.is_power_of_two());
+    assert!(spi_base >= 32 && spi_count > 0);
+
+    let timer = api.intid(HvGicIntid::EL1_VIRTUAL_TIMER).unwrap().get();
+    eprintln!("hvf_device: EL1_VIRTUAL_TIMER intid={timer}");
+    assert!((16..=31).contains(&timer));
+}
+
+/// GIC を vCPU より前に作れること、virtual timer の intid が FDT と一致すること、アラインの違反が
+/// VM を作る前に `InvalidArgument` で拒否されることを確かめる（TASK-192.12・#3792・MVM-5・MVM-1）。
+/// 同期呼び出しのみでゲストを走らせないため watchdog は不要。1 プロセス 1 VM のため VM は常に 1 個ずつ。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_gic_create_before_vcpu() {
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+
+    let gic = match HvfGic::probe(&layout) {
+        Ok(g) => g,
+        Err(e) => panic!("hvf_device: gic: {e}"),
+    };
+    let g = gic.geometry();
+    eprintln!(
+        "hvf_device: gic create: distributor size={} align={}, redistributor size={} align={}, virtual timer intid={}",
+        g.dist_size,
+        g.dist_align,
+        g.redist_size_per_cpu,
+        g.redist_align,
+        gic.virtual_timer_intid()
+    );
+    check_virtual_timer_intid(gic.virtual_timer_intid()).unwrap();
+    assert_eq!(
+        gic.virtual_timer_intid(),
+        ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI
+    );
+
+    // アラインの違反は VM を作る前に拒否される（直後に VM を作れる = 取り残しがない）。
+    let mut bad = layout.clone();
+    bad.gic_dist.base =
+        fandhe_container_microvm::guest_memory::GuestAddress::new(bad.gic_dist.base.raw() + 1);
+    assert_eq!(
+        VmWithGic::create(&bad).unwrap_err().code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+    drop(create_vm_or_precondition());
+
+    // 正しい配置: GIC を作ってから vCPU を作れる。
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let mut vcpu = vgic.create_vcpu().unwrap();
+    vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))
+        .unwrap();
+    let mpidr = vcpu.get_sys_reg(HvSysReg::MPIDR_EL1).unwrap();
+    eprintln!("hvf_device: gic create: MPIDR_EL1 readback={mpidr:#x}");
+    // affinity（Aff0..Aff2 = bit 0..23）が FDT の cpu@0 の reg と一致する。
+    assert_eq!(mpidr & 0x00ff_ffff, u64::from(ARM64_BOOT_CPU_MPIDR));
+    drop(vcpu);
+    drop(vgic);
+}
+
+/// `hvf_device_spi_reaches_guest` のゲストプログラム（arm64。`llvm-mc -triple=aarch64` で符号化した命令語）。
+///
+/// 手順: GICR_WAKER の ProcessorSleep を下ろす → GICD_CTLR(ARE_NS|EnableGrp1) → INTID 48 を group 1・edge・
+/// 優先度 0x80・affinity 0 にして有効化 → CPU interface(SRE・PMR・IGRPEN1) → `wfi` → `ICC_IAR1_EL1` を読み、
+/// 1023(spurious) なら `wfi` へ戻る → 読んだ INTID を virtio-mmio の窓(0x0a00_0000。未 map)へ書く → EOIR → `b .`。
+/// 基底アドレス(GICD 0x0800_0000・GICR 0x0820_0000・窓 0x0a00_0000)と INTID 48 はコード中に固定してあり、
+/// 試験本体が `Arm64Layout` の値と一致することを先に assert する。PSTATE.I はマスクのまま(CPSR 0x3c5)。
+const SPI_GUEST_CODE: [u32; 36] = [
+    0xD2A1_0001, // movz x1, #0x0800, lsl #16        ; GICD
+    0xD2A1_0402, // movz x2, #0x0820, lsl #16        ; GICR RD_base
+    0xD2A1_4003, // movz x3, #0x0a00, lsl #16        ; virtio-mmio の窓
+    0xB940_1444, // ldr  w4, [x2, #0x14]             ; GICR_WAKER
+    0x121E_7884, // and  w4, w4, #~2                 ; ProcessorSleep = 0
+    0xB900_1444, // str  w4, [x2, #0x14]
+    0xB940_1444, // ldr  w4, [x2, #0x14]
+    0x3717_FFE4, // tbnz w4, #2, .-4                 ; ChildrenAsleep が 0 になるまで
+    0x5280_0264, // movz w4, #0x13                   ; ARE_NS | EnableGrp1A | EnableGrp1
+    0xB900_0024, // str  w4, [x1]                    ; GICD_CTLR
+    0xB940_0024, // ldr  w4, [x1]
+    0x37FF_FFE4, // tbnz w4, #31, .-4                ; RWP が 0 になるまで
+    0x52A0_0024, // movz w4, #1, lsl #16             ; INTID 48 = bit 16
+    0xB900_8424, // str  w4, [x1, #0x84]             ; GICD_IGROUPR1: group 1
+    0x5280_0044, // movz w4, #2
+    0xB90C_0C24, // str  w4, [x1, #0xc0c]            ; GICD_ICFGR3 の INTID 48: edge
+    0x5280_1004, // movz w4, #0x80
+    0x3910_C024, // strb w4, [x1, #0x430]            ; GICD_IPRIORITYR48
+    0xF930_C03F, // str  xzr, [x1, #0x6180]          ; GICD_IROUTER48 = affinity 0
+    0x52A0_0024, // movz w4, #1, lsl #16
+    0xB901_0424, // str  w4, [x1, #0x104]            ; GICD_ISENABLER1
+    0xD538_CCA4, // mrs  x4, ICC_SRE_EL1
+    0xB240_0084, // orr  x4, x4, #1                  ; SRE
+    0xD518_CCA4, // msr  ICC_SRE_EL1, x4
+    0xD503_3FDF, // isb
+    0xD280_1FE4, // movz x4, #0xff
+    0xD518_4604, // msr  ICC_PMR_EL1, x4
+    0xD280_0024, // movz x4, #1
+    0xD518_CCE4, // msr  ICC_IGRPEN1_EL1, x4
+    0xD503_3FDF, // isb
+    0xD503_207F, // wfi                              ; loop:
+    0xD538_CC00, // mrs  x0, ICC_IAR1_EL1
+    0xF10F_FC1F, // cmp  x0, #1023
+    0x54FF_FFA0, // b.eq loop                        ; spurious なら待ち直す
+    0xB900_0060, // str  w0, [x3]                    ; MMIO exit: 読んだ INTID を書く
+    0xD518_CC20, // msr  ICC_EOIR1_EL1, x0
+];
+
+/// 末尾の `b .`（`SPI_GUEST_CODE` の後ろへ置く）。
+const SPI_GUEST_HALT: u32 = 0x1400_0000;
+
+/// 全体期限（`hvf_device_spi_reaches_guest`）。
+const SPI_DEADLINE: Duration = Duration::from_secs(20);
+/// vCPU の exit 回数の上限（無限ループの歯止め）。
+const SPI_MAX_EXITS: u32 = 256;
+
+/// ホストの `GicSpiLine::trigger`（edge の SPI）が、ゲストの `ICC_IAR1_EL1` で設定した INTID として読めることを確かめる。
+/// あわせて `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかを観測する（結果の記録は人間担当の #3803）。
+/// TASK-192.13・#3795・MVM-5・MVM-1。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_spi_reaches_guest() {
+    const BASE: u64 = 0x4000_0000;
+    const WINDOW: u64 = 0x0a00_0000;
+    let layout = Arm64Layout::new(4 << 20, 1, 1).unwrap();
+    // ゲストコードに固定した値と配置の一致。
+    assert_eq!(layout.gic_dist.base.raw(), 0x0800_0000);
+    assert_eq!(layout.gic_redist.base.raw(), 0x0820_0000);
+    assert_eq!(layout.virtio_mmio_window(0).unwrap().base.raw(), WINDOW);
+    assert_eq!(layout.ram.base.raw(), BASE);
+
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let line = vgic.spi_line(&layout, 0).unwrap();
+    assert_eq!(line.intid(), 48);
+    let (spi_base, spi_count) = vgic.gic().spi_range();
+    eprintln!(
+        "hvf_device: spi: range base={spi_base} count={spi_count} intid={}",
+        line.intid()
+    );
+
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in SPI_GUEST_CODE.iter().chain([&SPI_GUEST_HALT]).enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vgic
+        .vm()
+        .map(host, 0, BASE, page, MemoryFlags::RWX)
+        .unwrap();
+
+    let mut vcpu = vgic.create_vcpu().unwrap();
+    vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))
+        .unwrap();
+    vcpu.set_reg(HvReg::PC, BASE).unwrap();
+    // 0x3c5: EL1h・DAIF マスク（例外ベクタ不要。ICC_IAR1_EL1 はマスク中でも読める）。
+    vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+
+    // 実行が戻らないハングの歯止め（REPAIR-5）。
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    let watchdog = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < SPI_DEADLINE {
+            if watchdog_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("hvf_device: WATCHDOG EXPIRED");
+        std::process::exit(124);
+    });
+
+    let mut delivered: Option<u64> = None;
+    let mut off_thread: Option<Result<(), String>> = None;
+    for _ in 0..SPI_MAX_EXITS {
+        let exit = match vcpu.run_once(SPI_DEADLINE) {
+            Ok(e) => e,
+            Err(e) => panic!("hvf_device: spi: run failed: {e}"),
+        };
+        let HvVcpuExit::Exception(ex) = exit else {
+            panic!("hvf_device: spi: unexpected exit {exit:?}");
+        };
+        match decode_esr(ex.syndrome) {
+            EsrClass::Wfx(WfxKind::Wfi) => {
+                if off_thread.is_none() {
+                    // vCPU スレッド以外からの注入(スレッドの制約の観測)。
+                    let l2 = line.clone();
+                    let r = std::thread::spawn(move || l2.trigger()).join().unwrap();
+                    eprintln!("hvf_device: spi: set_spi from non-vcpu thread: {r:?}");
+                    let failed = r.is_err();
+                    off_thread = Some(r.map_err(|e| e.to_string()));
+                    if failed {
+                        // 到達の確認は vCPU スレッドからの注入で続ける。
+                        line.trigger().unwrap();
+                    }
+                }
+                let pc = vcpu.get_reg(HvReg::PC).unwrap();
+                let len = instruction_length(ex.syndrome).bytes();
+                vcpu.set_reg(HvReg::PC, pc + len).unwrap();
+            }
+            EsrClass::DataAbort(da)
+                if ex.physical_address == WINDOW && da.direction == AccessDirection::Write =>
+            {
+                let reg = HvReg::x(da.register.get()).unwrap();
+                delivered = Some(vcpu.get_reg(reg).unwrap() & 0xffff_ffff);
+                break;
+            }
+            other => panic!(
+                "hvf_device: spi: unexpected guest exit {other:?} pa={:#x} syndrome={:#x}",
+                ex.physical_address, ex.syndrome
+            ),
+        }
+    }
+    done.store(true, Ordering::Release);
+    watchdog.join().unwrap();
+
+    let Some(value) = delivered else {
+        panic!("hvf_device: spi: did not reach the guest within {SPI_MAX_EXITS} exits");
+    };
+    eprintln!("hvf_device: spi: guest read intid={value}");
+    assert_ne!(value, 1023, "spurious intid: spi did not reach the guest");
+    assert_eq!(value, 48);
+    assert_eq!(value, u64::from(line.intid()));
+    if let Some(Err(e)) = off_thread {
+        panic!("hvf_device: spi: set_spi from a non-vcpu thread failed: {e}");
+    }
+
+    drop(vcpu);
+    mapping.unmap().unwrap();
+    drop(vgic);
+}

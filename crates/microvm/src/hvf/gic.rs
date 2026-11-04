@@ -38,9 +38,11 @@
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
 //!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
-//! - WFI の起床（#3887）: `set_spi(intid, true)` が成功したら `WfiWaker` に通知し、WFI で待つ全 vCPU を即座に起こす（宛先は見ない。#3933）
-//!   （edge の trigger・level の上げ直し・シリアル入力の `High` を覆う。deassert では通知しない）。ロック順は
-//!   UART → 生存フラグ（読み取り。通知の前に外す）→ waker の mutex で、waker の mutex を持つ間は他の lock を取らない。
+//! - WFI の起床（#3887・#3948）: `set_spi(intid, true)` が成功したら `WfiWakeSet::notify_spi` で WFI の待ちを起こす
+//!   （edge の trigger・level の上げ直し・シリアル入力の `High` を覆う。deassert では通知しない）。virtio の線は
+//!   `InterruptACK` を処理した vCPU を学習した宛先の 1 台だけを起こし、未学習の線とシリアルは全台を起こす（#3948。
+//!   学習の方式と残余は `crate::hvf_wake`）。ロック順は UART → 生存フラグ（読み取り。通知の前に外す）→ waker のスロットの
+//!   mutex で、スロットの mutex は 1 個ずつ取り持つ間は他の lock を取らない。宛先のヒントは atomic で lock ではない。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
@@ -55,7 +57,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::hvf_smp::VmShutdown;
-use crate::hvf_wake::WfiWaker;
+use crate::hvf_wake::{SpiRouteHint, WfiWakeSet, WfiWaker};
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -139,7 +141,7 @@ impl HvfGic {
             gic,
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
-            waker: WfiWaker::default(),
+            wake: WfiWakeSet::new(layout.vcpus)?,
             shutdown: Arc::new(VmShutdown::new()),
             teardown: TeardownMark::new(),
         })
@@ -154,8 +156,8 @@ pub struct VmWithGic {
     vm: Arc<HvVm>,
     /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
     alive: Arc<RwLock<bool>>,
-    /// WFI の待ちを起こす通知口。SPI の sink と vCPU スレッドが共有する（#3887）。
-    waker: WfiWaker,
+    /// vCPU ごとの WFI の待ちを起こす通知口の束。SPI の sink と vCPU スレッドが共有する（#3887・#3948）。
+    wake: WfiWakeSet,
     /// VM 全体の終了通知（SYSTEM_OFF・失敗・BSP の終了で全 vCPU を止める。MVM-5・MVM-1・REPAIR-5）。
     shutdown: Arc<VmShutdown>,
     /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
@@ -192,9 +194,14 @@ impl VmWithGic {
         &self.vm
     }
 
-    /// WFI の待ちを起こす通知口の clone（#3887）。`hvf::vcpu` が `TimerHandler` と kick へ結ぶ。
-    pub fn wfi_waker(&self) -> WfiWaker {
-        self.waker.clone()
+    /// vCPU `index` 専用の WFI の待ち手（#3887・#3948）。`hvf::vcpu` が `TimerHandler` へ結ぶ。範囲外は `InvalidArgument`。
+    pub fn wfi_waker_for_vcpu(&self, index: u32) -> Result<WfiWaker, MicrovmError> {
+        self.wake.handle(index)
+    }
+
+    /// 全 vCPU の通知口の束の clone。停止要求の kick と VM の終了通知が全台を起こすのに使う（#3948）。
+    pub fn wake_set(&self) -> WfiWakeSet {
+        self.wake.clone()
     }
 
     /// VM 全体の終了通知（全 vCPU スレッドが共有する）。
@@ -251,12 +258,15 @@ impl VmWithGic {
         layout.check_virtio_injection(injection)?;
         let (base, count) = self.gic.spi_range();
         let intid = check_spi_intid(layout.virtio_spi(index)?, base, count)?;
+        // 宛先は `InterruptACK` を処理した vCPU から学習する（#3948）。学習するまでは全台を起こす。
+        let route = SpiRouteHint::unknown();
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
-            waker: self.waker.clone(),
+            wake: self.wake.clone(),
+            route: route.clone(),
         };
-        Ok(GicSpiLine(SpiLine::new(sink, intid, injection)))
+        Ok(GicSpiLine(SpiLine::new(sink, intid, injection), route))
     }
 
     /// シリアルの SPI を level 形で駆動する [`GicSerialLine`] を作る（#3892・MVM-5・MVM-1）。
@@ -288,7 +298,9 @@ impl VmWithGic {
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
-            waker: self.waker.clone(),
+            wake: self.wake.clone(),
+            // UART の ACK は IIR の読み出しで経路が違うため学習せず、常に全台を起こす（#3948 の残余）。
+            route: SpiRouteHint::unknown(),
         };
         Ok(GicSerialLine(SpiLevelLine::new(sink, intid)))
     }
@@ -299,7 +311,9 @@ impl VmWithGic {
 pub(crate) struct HvfGicSink {
     api: &'static GicApi,
     alive: Arc<RwLock<bool>>,
-    waker: WfiWaker,
+    wake: WfiWakeSet,
+    /// この線の宛先 vCPU のヒント（#3948）。未学習なら全台を起こす。
+    route: SpiRouteHint,
 }
 
 impl SpiSink for HvfGicSink {
@@ -315,9 +329,10 @@ impl SpiSink for HvfGicSink {
         }
         let r = self.api.set_spi(intid, level);
         // 読み取りロックを外してから、assert が成功したときだけ WFI の待ちを起こす（waker の mutex を持つ間は他の lock を取らない）。
+        // 宛先が学習済みならその vCPU だけ、未学習なら全台（#3948）。
         drop(guard);
         if r.is_ok() && level {
-            self.waker.notify();
+            self.wake.notify_spi(&self.route);
         }
         r
     }
@@ -326,7 +341,7 @@ impl SpiSink for HvfGicSink {
 /// virtio-mmio 1 台分の SPI を `hv_gic_set_spi` で注入する [`InterruptLine`]（#3795・#3863）。
 /// 契約はモジュール doc の「SPI の注入」。
 #[derive(Debug, Clone)]
-pub struct GicSpiLine(SpiLine<HvfGicSink>);
+pub struct GicSpiLine(SpiLine<HvfGicSink>, SpiRouteHint);
 
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -337,6 +352,11 @@ impl GicSpiLine {
     /// 注入する INTID（検証済み）。
     pub fn intid(&self) -> u32 {
         self.0.intid()
+    }
+
+    /// この線の宛先 vCPU のヒント（`hvf::mmio` の `InterruptACK` の学習が書く。#3948）。
+    pub(crate) fn route_hint(&self) -> SpiRouteHint {
+        self.1.clone()
     }
 }
 

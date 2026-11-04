@@ -139,3 +139,43 @@ pub fn handle_data_abort(
     vcpu.set_reg(HvReg::PC, mmio_abort::next_pc(pc, exception.syndrome)?)?;
     Ok(ExitAction::Continue)
 }
+
+#[cfg(test)]
+mod tests {
+    //! macOS かつ aarch64 のネイティブでだけ走る（`hv_*` は呼ばない）。MVM-5・MVM-1・REPAIR-3・REPAIR-12。
+    use super::*;
+    use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
+    use crate::virtio_mmio::VirtioMmioTransport;
+
+    /// 共有の dispatcher へ後から登録したデバイスが、ハンドラ側から見える（同じ実体を指す）。
+    #[test]
+    fn mvm5_shared_dispatcher_is_same_instance() {
+        let shared = Arc::new(Mutex::new(ExitDispatcher::new()));
+        let handler = MmioHandler::with_shared_dispatcher(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(handler.dispatcher(), &shared));
+        assert_eq!(Arc::strong_count(&shared), 2);
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .register_mmio(0x0a00_0000, 0x200, Box::new(block))
+            .unwrap();
+        // MagicValue（offset 0）がハンドラ経由の dispatcher から 0x7472_6976 で読める。
+        let exit = crate::exit::VcpuExit::Mmio {
+            phys_addr: 0x0a00_0000,
+            data: [0; 8],
+            len: 4,
+            is_write: false,
+        };
+        let out = handler
+            .dispatcher()
+            .lock()
+            .unwrap()
+            .dispatch(&exit)
+            .unwrap();
+        assert_eq!(out.read_response(), Some(&0x7472_6976u32.to_le_bytes()[..]));
+    }
+}

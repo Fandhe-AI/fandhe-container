@@ -59,7 +59,7 @@
 # restart handler が無く machine_restart は止まる。有効化と KVM_EXIT_SYSTEM_EVENT の停止理由への分類は #3896 の担当。
 # (b) reboot_mode が既定（cold）なら SYSTEM_RESET。warm で SYSTEM_RESET2 を持つ場合は RESET2 になりうる（未確認）。
 # (c) arm64 には x86 の `reboot=t` に当たるものが無く、上の x86_64 の cmdline の説明は流用しない。
-# aarch64 の cmdline は #3897（実カーネル起動試験）の担当。
+# aarch64 の結合試験と cmdline は crates/microvm/tests/kernel_boot.rs の arm64 モジュール（#3897）が持つ。
 #
 # POWER_OFF ではなく RESTART を使う理由: ACPI の無い x86 では POWER_OFF が止まらず PID 1 が終わって panic する。
 # cmdline の `reboot=t` と組み合わせると triple fault になり、KVM_EXIT_SHUTDOWN から
@@ -184,7 +184,7 @@
 # 安全性: root・sudo・ネットワークを使わない。外部入力のファイルは無い。出力先は不可分に `mkdir -m 0700` で
 # 作り、既存（空・symlink を含む）は上書きせず拒否する。出力先の祖先が他者に書き換え可能なら拒否する
 # （build-guest-initrd.sh の検査を簡略化して写した）。生成した ELF はホストでは実行しない。
-# 範囲: x86_64 と aarch64 の生成。aarch64 の microVM ブートは #3896・#3897 の担当で未実装（REPAIR-3）。
+# 範囲: x86_64 と aarch64 の生成。aarch64 の microVM ブートの結合試験は kernel_boot.rs の arm64 モジュール（#3897。シリアルは #3898）。
 # 実カーネルでの起動は未確認（Agent は実行していない）で、実機での確認は #3781（人間担当）。
 #
 # 終了コード: 0 成功（stdout に initrd の絶対パスを 1 行）/ 1 内部エラー・gzip 失敗 / 2 引数・環境・出力先不正、

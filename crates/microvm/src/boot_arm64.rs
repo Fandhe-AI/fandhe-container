@@ -377,11 +377,16 @@ pub const SCTLR_EL1_EE: u64 = 1 << 25;
 
 /// CPU_ON で起動する AP（vCPU `index`）へ入れるレジスタの値（#3891・MVM-5・MVM-1。HVF の AP と将来の KVM aarch64〔#3899〕が共有する）。
 ///
-/// PSCI の CPU_ON は entry を PC に、context_id を X0 に入れて AP を起動する（DEN0022 §5.1.4 の引数。2026-11-04 に F.b で確認した
-/// のは `psci.rs` の「一次情報の確認状況」の範囲）。起動時の状態（MMU off・D-cache off・EL は呼び出し元と同じ・PSTATE の DAIF マスク）を
-/// 述べる小節の番号は本層では未確認とし、確かめるまで推測の番号は書かない（REPAIR-3）。ここで固定する値は Linux の
-/// `booting.rst` の BSP の契約に揃えた選択である: X1〜X3 = 0・CPSR = [`ARM64_BOOT_CPSR`]（EL1h・DAIF マスク）。
-/// I-cache の扱いは IMPLEMENTATION DEFINED のため触らない。実書き込みは owning thread が行う。
+/// PSCI の CPU_ON は entry を PC に、context_id を X0 に入れて AP を起動する（DEN0022 §5.1.4 の引数、§5.6.1・§6.4.3.7）。
+/// 起動時の状態は DEN0022 F.b（PSCI 1.3・REL。2026-11-04 に確認。版と取得元は `psci.rs` の「一次情報の確認状況」と同じ）の
+/// §6.4「Initial state after CPU_ON, CPU_SUSPEND」が述べる。戻る EL は §6.4.1（Table 14）の最上位の実装済み Non-secure EL
+/// （ハイパーバイザ無効なら EL1h）、Execution state は呼び出し時と一致（§6.4.3.1）、`SPSR_ELx.{D,A,I,F}` = {1,1,1,1}（§6.4.3.3）、
+/// stage 1 の MMU とキャッシュは無効で `SCTLR_ELx.{I, C, M}` = {0, 0, 0}（§6.4.3.4）、エンディアンは呼び出し元のものの復元
+/// （§6.4.3.2。本層はリトルエンディアンのゲストだけを対象にする）。CPSR = [`ARM64_BOOT_CPSR`] は §6.4.1・§6.4.3.3 に一致する。
+/// X1〜X3 = 0 は DEN0022 §6.4 が定めない値で、Linux の `booting.rst` の BSP の契約に揃えた選択である。
+/// MMU off・D-cache off は初回起動では #3797、再 CPU_ON では [`sctlr_for_cpu_on`] が担い、キャッシュが呼び出し元から見て
+/// clean かつ coherent であること（§6.4.3.4）はホスト側の責務である。逸脱: §6.4.3.4 は `SCTLR_ELx.I` = 0 も求めるが、
+/// [`sctlr_for_cpu_on`] は I を落とさない（#3936 で扱う。REPAIR-3）。実書き込みは owning thread が行う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApBootRegs {
     /// 起動アドレス（CPU_ON の entry）。
@@ -417,8 +422,9 @@ pub fn ap_boot_registers(
     })
 }
 
-/// CPU_OFF の後の再 CPU_ON では、前回ゲストが有効にした MMU・D-cache が `SCTLR_EL1` に残る。M・C を落とし、
-/// リトルエンディアンだけを対象にするため EE も落とした値を返す（他のビットは保つ。ビッグエンディアンのゲストは対象外）。
+/// CPU_OFF の後の再 CPU_ON では、前回ゲストが有効にした MMU・D-cache が `SCTLR_EL1` に残る。M・C を落とし（DEN0022 F.b §6.4.3.4）、
+/// リトルエンディアンだけを対象にするため EE も落とした値を返す（§6.4.3.2。他のビットは保つ。ビッグエンディアンのゲストは対象外）。
+/// §6.4.3.4 が求める I（bit 12）= 0 は未対応の逸脱で、#3936 で扱う（REPAIR-3）。
 pub fn sctlr_for_cpu_on(prev: u64) -> u64 {
     prev & !(SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_EE)
 }

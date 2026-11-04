@@ -285,6 +285,9 @@ impl CpuPowerControl for HvfPowerControl {
 /// 停止要求・ゲスト起因の終了・失敗で終わり、終了理由を返す（戻る前にメールボックスを閉じる）。
 ///
 /// `boot` は owning thread で呼ばれ、失敗は `Failed(code)` で終える（推測で走らせない）。`confirm_on` は `boot` の成功後、実行ループに入る直前。
+// 抑止の理由: 引数は呼び出し元（AP 起動経路）が owning thread へ渡す独立した資源・コールバックで、
+// 1 つの構成体にまとめると thread へ move する値の所有の単位が曖昧になるため、
+// 現在のシグネチャを維持する（MVM-5・MVM-1）。
 #[allow(clippy::too_many_arguments)]
 pub fn run_parked_ap<E, B, D>(
     mailbox: &ApMailbox,

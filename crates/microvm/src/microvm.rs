@@ -40,7 +40,8 @@
 //! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
 //! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
 //! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
-//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。未実装（REPAIR-3）: IRQ 4（x86 の Linux は入力を読まない。受信 FIFO は #3893 で実装済み）。
+//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。x86_64 では COM1 の IRQ 4 を `KVM_IRQ_LINE` の level 線
+//! （`crate::irq::IrqLevelLine`）で UART に結ぶ（#3918。THRE・受信データの割り込み。実機確認は #3781）。aarch64（KVM）の線は未実装（#3696・#3898。REPAIR-3）。
 //! aarch64 には PIO が無く、組み立ての入口が `Unimplemented`。
 //!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
@@ -93,8 +94,8 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
 use crate::interrupt::{
-    BlockNotifyReport, InterruptLine, NetNotifyReport, NetRxPollOutcome, complete_block_notify,
-    complete_net_notify, poll_net_rx,
+    BlockNotifyReport, InterruptLine, LevelInterruptLine, NetNotifyReport, NetRxPollOutcome,
+    complete_block_notify, complete_net_notify, poll_net_rx,
 };
 use crate::irq::IrqFd;
 #[cfg(target_arch = "x86_64")]
@@ -748,6 +749,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         slots: &[DeviceSlot],
         block: Vec<B>,
         net: Vec<NetDeviceConfig<N>>,
+        com1_line: Option<Arc<dyn LevelInterruptLine>>,
         mut make_line: impl FnMut(&DeviceSlot) -> Result<L, MicrovmError>,
     ) -> Result<Self, MicrovmError> {
         if slots.len() != block.len() + net.len() {
@@ -760,8 +762,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
             serial: SerialConsole::new(),
         };
         // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
+        // 線ありは x86_64 の KVM（`KVM_IRQ_LINE` の GSI 4。#3918）。線なしは IIR が常に「保留なし」の従来の経路。
+        let com1 = match com1_line {
+            Some(line) => bus.serial.port_device_with_irq(line),
+            None => bus.serial.port_device(),
+        };
         bus.dispatcher
-            .register_pio(COM1_BASE, UART_PORT_LEN, bus.serial.port_device())?;
+            .register_pio(COM1_BASE, UART_PORT_LEN, com1)?;
         let mut slots_iter = slots.iter();
         for backend in block {
             let slot = *slots_iter
@@ -952,7 +959,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             vm.set_tss_addr(TSS_ADDR)?;
         }
         let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, GuestAddress::new(0))?;
-        let devices = DeviceBus::new(&slots, config.block, config.net, |s| {
+        // COM1（IRQ 4）の UART の割り込みは KVM_IRQ_LINE の level 線で結ぶ（x86_64。irqchip の後。#3918）。
+        #[cfg(target_arch = "x86_64")]
+        let com1_line: Option<Arc<dyn LevelInterruptLine>> =
+            Some(Arc::new(vm.register_irq_line(crate::uart::COM1_IRQ)?));
+        #[cfg(not(target_arch = "x86_64"))]
+        let com1_line: Option<Arc<dyn LevelInterruptLine>> = None;
+        let devices = DeviceBus::new(&slots, config.block, config.net, com1_line, |s| {
             vm.register_irqfd(s.gsi)
         })?;
         // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
@@ -3224,7 +3237,7 @@ mod assemble_tests {
                 mac: [2, 0, 0, 0, 0, 1],
             })
             .collect();
-        let bus = DeviceBus::new(&slots, blocks, nets, |_| Ok(CountLine::default())).unwrap();
+        let bus = DeviceBus::new(&slots, blocks, nets, None, |_| Ok(CountLine::default())).unwrap();
         let mem =
             GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
         (bus, mem)
@@ -3260,6 +3273,52 @@ mod assemble_tests {
             DispatchOutcome::Unhandled { response, .. } => assert_eq!(response, vec![0xFF]),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// MVM-1・REPAIR-3・#3918: COM1 に線を渡すと PIO の Out / In exit で線の値が変わり、IIR が THRE を返す。
+    #[test]
+    fn mvm1_3918_device_bus_com1_irq_line() {
+        use crate::exit::IoDirection;
+        use crate::interrupt::IrqLevel;
+        #[derive(Debug, Default)]
+        struct Rec(Mutex<Vec<IrqLevel>>);
+        impl LevelInterruptLine for Rec {
+            fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+                self.0.lock().unwrap().push(level);
+                Ok(())
+            }
+        }
+        let slots = plan_layout(1, 64 << 20, 0, 0).unwrap();
+        let rec = Arc::new(Rec::default());
+        let mut b = DeviceBus::<MemoryBlockBackend, MemoryNetBackend, CountLine>::new(
+            &slots,
+            Vec::new(),
+            Vec::new(),
+            Some(rec.clone()),
+            |_| Ok(CountLine::default()),
+        )
+        .unwrap();
+        let out = VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: COM1_BASE + 1,
+            size: 1,
+            count: 1,
+            data: vec![0x02],
+        };
+        b.dispatcher.dispatch(&out).unwrap();
+        assert_eq!(*rec.0.lock().unwrap(), vec![IrqLevel::High]);
+        let iir = VcpuExit::Io {
+            direction: IoDirection::In,
+            port: COM1_BASE + 2,
+            size: 1,
+            count: 1,
+            data: vec![],
+        };
+        match b.dispatcher.dispatch(&iir).unwrap() {
+            DispatchOutcome::Pio { response, .. } => assert_eq!(response, vec![0x02]),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(*rec.0.lock().unwrap(), vec![IrqLevel::High, IrqLevel::Low]);
     }
 
     fn read32(b: &mut Bus, addr: u64) -> DispatchOutcome {
@@ -3733,7 +3792,7 @@ mod net_rx_tests {
         }];
         let irqs = Arc::new(AtomicU32::new(0));
         let line_irqs = Arc::clone(&irqs);
-        let bus = DeviceBus::new(&slots, Vec::new(), nets, move |_| {
+        let bus = DeviceBus::new(&slots, Vec::new(), nets, None, move |_| {
             Ok(AtomicLine(Arc::clone(&line_irqs)))
         })
         .unwrap();
@@ -4128,7 +4187,7 @@ mod failure_tests {
         }];
         let dropped = Rc::new(Cell::new(0u32));
         let made = Cell::new(0u32);
-        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, |_| {
+        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, None, |_| {
             if made.get() == 2 {
                 return Err(MicrovmError::new(
                     MicrovmErrorCode::ResourceExhausted,
@@ -4155,9 +4214,10 @@ mod failure_tests {
             .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
             .collect();
         let dropped = Rc::new(Cell::new(0u32));
-        let r = DeviceBus::<_, MemoryNetBackend, DropLine>::new(&slots, blocks, vec![], |_| {
-            Ok(DropLine(Rc::clone(&dropped)))
-        });
+        let r =
+            DeviceBus::<_, MemoryNetBackend, DropLine>::new(&slots, blocks, vec![], None, |_| {
+                Ok(DropLine(Rc::clone(&dropped)))
+            });
         assert!(r.is_err());
         assert_eq!(dropped.get(), 1);
         assert_eq!(Rc::strong_count(&dropped), 1);

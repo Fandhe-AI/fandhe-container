@@ -151,12 +151,33 @@
 #  213: reboot の末尾（既定の版と同じ並び）、235: pause ; jmp 235
 #  239: データ: フレーム(60) 成功メッセージ+改行(34) 失敗メッセージ+改行(38)
 #
+# variant `net-rx`（#3919・MVM-1・REPAIR-12）: virtio-net の RX（ホストからゲストへの受信）を照合する版。
+# AF_PACKET の raw socket（protocol は htons(0x88B6)）を開き、`eth0` を IFF_UP にして、SO_RCVTIMEO（5 秒）を設定し、
+# `recvfrom` で受ける。受けたフレームが固定の 60 バイトと完全一致なら成功メッセージ、期限切れ・syscall の失敗・
+# 不一致が 16 回続いたときは失敗メッセージを fd 1 へ書いてから reboot する。ホスト側は backend に積んだフレームを
+# 受信ポーラー（NetRxPoller）が DRIVER_OK の後に渡す（試験側 kernel_boot.rs）。`eth0` という名前に依存する。
+# 待ちの上限（REPAIR-5）: 期限切れ（EAGAIN）は 1 回で失敗にする。ループ回数が数えるのは、EtherType は一致したが
+# 内容が違うフレームだけ。期限切れでも続けると 16 x 5 秒で試験の期限（60 秒）を超え、陰性対照が毎回落ちるため。
+# bind はしない（protocol の指定で EtherType は絞られ、SIOCGIFINDEX は不要）。宛先 MAC は eth0 の MAC（kernel_boot.rs の
+# NET_MAC）なので PACKET_HOST で届く。構造体: ifreq は 40 バイト（+16 に ifr_flags）、timeval は 16 バイト。
+# 定数: socket=41・ioctl=16・setsockopt=54・recvfrom=45、SIOCSIFFLAGS=0x8914、SOL_SOCKET=1・SO_RCVTIMEO=20。
+# 作業域（スタック 192 バイト）: [0..40) ifreq / [48..64) timeval / [64..192) 受信バッファ 128（先頭 64 バイトを 0 埋め）。
+# 機械語（x86_64。ELF ヘッダ・program header は既定の版と同じ 120 バイト。全体は 120 + 272 + 132 = 524 バイト。
+# GNU as で組んだ逆アセンブルと一致することを確認済み。表のオフセットはコード先頭から）:
+#    0: socket(17, 3, 0xb688) ; test ; js fail（near）; mov r12d,eax
+#   34: sub rsp,192 ; rep stosb（64 バイト 0 埋め）; "eth0" ; ifr_flags = 1 ; ioctl(SIOCSIFFLAGS) ; js fail
+#   92: tv_sec = 5 ; setsockopt(fd, 1, 20, rsp+48, 16) ; js fail ; r14d = 16
+#  142: recv: recvfrom(fd, rsp+64, 128, 0, 0, 0) ; js fail ; cmp rax,60 ; jne next ; repe cmpsb（frame）; je ok
+#  203: next: dec r14d ; jnz recv ; 208: fail（lea rsi,failmsg ; edx=38）; 222: ok（edx=34）; 234: write
+#  246: reboot の末尾（既定の版と同じ並び）、268: pause ; jmp 268
+#  272: データ: フレーム(60) 成功メッセージ+改行(34) 失敗メッセージ+改行(38)
+#
 # 使い方:
-#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 #   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx（上記。block-read と net-tx は x86_64 のみ）
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read・net-tx・net-rx は x86_64 のみ）
 #   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は default の variant のみ）
-#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx）（存在しない新規ディレクトリのみ。既存は拒否）
+#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
 #
@@ -172,7 +193,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 USAGE
 }
 
@@ -203,6 +224,15 @@ net_tx_frame_header_hex="02fc0000386602fc0000386588b5"
 net_tx_payload="fandhe-microvm-net-tx-payload-0123456789abcdef"
 net_tx_ok_message="fandhe-microvm-test: net tx ok v1"
 net_tx_failed_message="fandhe-microvm-test: net tx failed v1"
+# net-rx の文字列定数（正本。kernel_boot.rs の単体テストが行頭の名前で抜き出して照合する。
+# フレームは宛先 02:fc:00:00:38:65（ゲストの NET_MAC）・送信元 02:fc:00:00:38:66・EtherType 0x88B6
+# （IEEE 802 Local Experimental 2。net-tx の 0x88B5 と分け、TX のフレームが socket に入らないようにする）・
+# ペイロード 46 バイトで 60 バイト。機械語の socket の protocol の即値 0xb688 は htons(0x88B6) で、
+# ヘッダ hex の 25〜28 文字目 88b6 と結びつく）
+net_rx_frame_header_hex="02fc0000386502fc0000386688b6"
+net_rx_payload="fandhe-microvm-net-rx-payload-0123456789abcdef"
+net_rx_ok_message="fandhe-microvm-test: net rx ok v1"
+net_rx_failed_message="fandhe-microvm-test: net rx failed v1"
 
 need_value() {
     [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
@@ -225,8 +255,8 @@ case "$arch" in
     *) err_code bad-argument "--arch must be x86_64 or aarch64"; usage; exit 2 ;;
 esac
 case "$variant" in
-    default | block-read | net-tx) ;;
-    *) err_code bad-argument "--variant must be default, block-read or net-tx"; usage; exit 2 ;;
+    default | block-read | net-tx | net-rx) ;;
+    *) err_code bad-argument "--variant must be default, block-read, net-tx or net-rx"; usage; exit 2 ;;
 esac
 case "$compress" in
     none | gzip) ;;
@@ -266,7 +296,7 @@ if [ "$variant" != "default" ] && [ "$arch" != "x86_64" ]; then
 fi
 if [ -z "$output_dir" ]; then
     case "$variant" in
-        block-read | net-tx) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
+        block-read | net-tx | net-rx) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
         *) output_dir="$root/target/microvm-test-initrd/$arch" ;;
     esac
 fi
@@ -443,7 +473,90 @@ emit_reboot_tail() {
     bytes f3 90 eb fc
 }
 
-if [ "$variant" = "net-tx" ]; then
+if [ "$variant" = "net-rx" ]; then
+    # 機械語に固定された長さ・サイズ・EtherType を文字列定数と突き合わせる（fail-closed）
+    expected_size=524
+    if [ "${#net_rx_frame_header_hex}" -ne 28 ] || [ "${#net_rx_payload}" -ne 46 ] ||
+        [ "$((${#net_rx_ok_message} + 1))" -ne 34 ] || [ "$((${#net_rx_failed_message} + 1))" -ne 38 ] ||
+        [ "${net_rx_frame_header_hex:24:4}" != "88b6" ]; then
+        err_code internal-error "net-rx string lengths do not match the encoded instructions"
+        exit 1
+    fi
+    total_size=$expected_size
+    {
+        emit_elf_headers "$total_size"
+        # コード 272 バイト（先頭コメントの表と同じ並び）
+        bytes b8; le 41 4                                  # mov eax, 41 (socket)
+        bytes bf; le 17 4                                  # mov edi, 17 (AF_PACKET)
+        bytes be; le 3 4                                   # mov esi, 3 (SOCK_RAW)
+        bytes ba; le $((0xb688)) 4                         # mov edx, htons(0x88B6)
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 0f 88; le 177 4                              # js fail (near)
+        bytes 41 89 c4                                     # mov r12d, eax
+        bytes 48 81 ec; le 192 4                           # sub rsp, 192
+        bytes 48 89 e7                                     # mov rdi, rsp
+        bytes 31 c0                                        # xor eax, eax
+        bytes b9; le 64 4                                  # mov ecx, 64
+        bytes fc                                           # cld
+        bytes f3 aa                                        # rep stosb
+        bytes c7 04 24; le $((0x30687465)) 4               # mov dword [rsp], "eth0"
+        bytes c7 44 24 10; le 1 4                          # mov dword [rsp+16], 1 (IFF_UP)
+        bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
+        bytes 44 89 e7                                     # mov edi, r12d
+        bytes be; le $((0x8914)) 4                         # mov esi, SIOCSIFFLAGS
+        bytes 48 89 e2                                     # mov rdx, rsp
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 78 74                                        # js fail
+        bytes c7 44 24 30; le 5 4                          # mov dword [rsp+48], 5 (tv_sec)
+        bytes b8; le 54 4                                  # mov eax, 54 (setsockopt)
+        bytes 44 89 e7                                     # mov edi, r12d
+        bytes be; le 1 4                                   # mov esi, 1 (SOL_SOCKET)
+        bytes ba; le 20 4                                  # mov edx, 20 (SO_RCVTIMEO)
+        bytes 4c 8d 54 24 30                               # lea r10, [rsp+48]
+        bytes 41 b8; le 16 4                               # mov r8d, 16
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 78 48                                        # js fail
+        bytes 41 be; le 16 4                               # mov r14d, 16
+        bytes b8; le 45 4                                  # recv: mov eax, 45 (recvfrom)
+        bytes 44 89 e7                                     # mov edi, r12d
+        bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
+        bytes ba; le 128 4                                 # mov edx, 128
+        bytes 45 31 d2                                     # xor r10d, r10d
+        bytes 45 31 c0                                     # xor r8d, r8d
+        bytes 45 31 c9                                     # xor r9d, r9d
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 78 20                                        # js fail (期限切れを含む負値)
+        bytes 48 83 f8 3c                                  # cmp rax, 60
+        bytes 75 15                                        # jne next
+        bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
+        bytes 48 8d 3d; le 78 4                            # lea rdi, [rip+0x4e] -> frame
+        bytes b9; le 60 4                                  # mov ecx, 60
+        bytes f3 a6                                        # repe cmpsb
+        bytes 74 13                                        # je ok
+        bytes 41 ff ce                                     # next: dec r14d
+        bytes 75 be                                        # jnz recv
+        bytes 48 8d 35; le 151 4                           # fail: lea rsi, [rip+0x97] -> failed message
+        bytes ba; le 38 4                                  # mov edx, 38
+        bytes eb 0c                                        # jmp write
+        bytes 48 8d 35; le 103 4                           # ok: lea rsi, [rip+0x67] -> ok message
+        bytes ba; le 34 4                                  # mov edx, 34
+        bytes b8; le 1 4                                   # write: mov eax, 1
+        bytes bf; le 1 4                                   # mov edi, 1
+        bytes 0f 05                                        # syscall
+        emit_reboot_tail
+        # データ: フレーム 60 バイト（ヘッダ 14 + ペイロード 46）、成功・失敗メッセージ
+        for ((i = 0; i < ${#net_rx_frame_header_hex}; i += 2)); do
+            bytes "${net_rx_frame_header_hex:i:2}"
+        done
+        printf '%s' "$net_rx_payload"
+        printf '%s\n' "$net_rx_ok_message"
+        printf '%s\n' "$net_rx_failed_message"
+    } >"$elf_file"
+elif [ "$variant" = "net-tx" ]; then
     # 機械語に固定された長さ・サイズ・EtherType を文字列定数と突き合わせる（fail-closed）
     expected_size=491
     if [ "${#net_tx_frame_header_hex}" -ne 28 ] || [ "${#net_tx_payload}" -ne 46 ] ||
@@ -691,6 +804,13 @@ cp "$final_file" "$output_dir/$final_name" 2>/dev/null || { err_code output-fail
             printf 'frame_hex=%s%s\n' "$net_tx_frame_header_hex" "$(printf '%s' "$net_tx_payload" | od -An -tx1 -v | tr -d ' \n')"
             printf 'message_ok=%s\n' "$net_tx_ok_message"
             printf 'message_failed=%s\n' "$net_tx_failed_message"
+            ;;
+        net-rx)
+            printf 'frame_hex=%s%s\n' "$net_rx_frame_header_hex" "$(printf '%s' "$net_rx_payload" | od -An -tx1 -v | tr -d ' \n')"
+            printf 'message_ok=%s\n' "$net_rx_ok_message"
+            printf 'message_failed=%s\n' "$net_rx_failed_message"
+            printf 'recv_timeout_secs=5\n'
+            printf 'recv_attempts=16\n'
             ;;
         *) printf 'message=%s\n' "$init_message" ;;
     esac

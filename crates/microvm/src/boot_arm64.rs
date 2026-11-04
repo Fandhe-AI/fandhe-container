@@ -30,8 +30,9 @@
 //! イメージの署名・digest の検証は本層の責務ではない（plugin-microvm 側の経路）。
 //!
 //! # 範囲外（REPAIR-3）
-//! 圧縮 Image（`Image.gz`）・EFI stub 起動・BE カーネル・SMP（`build_guest_fdt` が vCPU 2 以上を `Unimplemented` にする）・
-//! `stdout-path`・複数の RAM 領域・ファイルからの読み込み（呼び出し側が上限つきで読む）・キャッシュの保守（#3797）。
+//! 圧縮 Image（`Image.gz`。将来は展開後の Image を渡す前処理を足す）・EFI stub 起動（将来は PE/COFF 経由の起動）・
+//! BE カーネル（将来は SCTLR の EE ビットと FDT のエンディアンを合わせる）・複数の RAM 領域・ファイルからの読み込み（呼び出し側が上限つきで読む）・キャッシュの保守（#3797）。
+//! vCPU 数は `Arm64Layout::validate` の上限に従い（#3864）、シリアルと `stdout-path` は `layout.serial` が `Some` のときだけ出す。
 //! 新しいゲスト RAM はゼロなので BSS のゼロ化はカーネル自身の起動処理に任せる。
 //!
 //! ビヘイビア: MVM-5・MVM-1・MVM-4・ERR-1・REPAIR-2・REPAIR-3。
@@ -334,10 +335,65 @@ impl ArmBootState {
     }
 }
 
+/// MPIDR_EL1 のうち affinity（Aff0..Aff2 = bit 0..23、Aff3 = bit 32..39）だけを取るマスク。
+/// bit 31（RES1）と U ビットはフレームワークが立てうるため起動の照合には含めない（#3797）。
+pub const ARM64_MPIDR_AFFINITY_MASK: u64 = 0x00ff_00ff_ffff;
+/// SCTLR_EL1.M（bit 0。MMU 有効）。
+pub const SCTLR_EL1_M: u64 = 1;
+/// SCTLR_EL1.C（bit 2。D-cache 有効）。
+pub const SCTLR_EL1_C: u64 = 1 << 2;
+
+/// vCPU 0 へ起動レジスタを書いた直後の読み戻し値（#3797）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArmBootReadback {
+    /// X0。
+    pub x0: u64,
+    /// PC。
+    pub pc: u64,
+    /// CPSR。
+    pub cpsr: u64,
+    /// MPIDR_EL1（生の値）。
+    pub mpidr: u64,
+    /// SCTLR_EL1（生の値。書き込まず読むだけ）。
+    pub sctlr: u64,
+}
+
+/// 書いた起動状態と読み戻し値を照合する（OS 非依存の純関数。macOS の `HvfMicroVm` が vCPU スレッド内で呼ぶ。MVM-5・MVM-1）。
+///
+/// X0・PC・CPSR は完全一致、MPIDR_EL1 は affinity のみ（[`ARM64_MPIDR_AFFINITY_MASK`]）を `ARM64_BOOT_CPU_MPIDR` と比べる。
+/// 不一致は `Internal`。SCTLR_EL1 の M か C が 1 なら MMU・D-cache が有効で arm64 の boot 契約を満たさないため
+/// `FailedPrecondition`（値は書き換えない）。
+pub fn check_boot_readback(
+    expected: &ArmBootState,
+    got: &ArmBootReadback,
+) -> Result<(), MicrovmError> {
+    let internal = |msg: &'static str| MicrovmError::new(MicrovmErrorCode::Internal, msg);
+    if got.x0 != expected.x0 {
+        return Err(internal("x0 readback does not match the boot state"));
+    }
+    if got.pc != expected.pc {
+        return Err(internal("pc readback does not match the boot state"));
+    }
+    if got.cpsr != expected.cpsr {
+        return Err(internal("cpsr readback does not match the boot state"));
+    }
+    if got.mpidr & ARM64_MPIDR_AFFINITY_MASK != u64::from(crate::arm64_layout::ARM64_BOOT_CPU_MPIDR)
+    {
+        return Err(internal("mpidr_el1 affinity does not match the fdt"));
+    }
+    if got.sctlr & (SCTLR_EL1_M | SCTLR_EL1_C) != 0 {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "sctlr_el1 has mmu or d-cache enabled at boot",
+        ));
+    }
+    Ok(())
+}
+
 /// Image・initrd・FDT をゲストメモリへ配置し、起動レジスタの値を返す。
 ///
 /// 検証と計画がすべて通るまで何も書かない。`build_guest_fdt` の挙動を引き継ぐ:
-/// vCPU が 1 以外なら `Unimplemented`、cmdline の超過・NUL は `InvalidArgument`。
+/// vCPU 数の上限超過は `Arm64Layout` の検査で `InvalidArgument`、cmdline の超過・NUL は `InvalidArgument`。
 pub fn load_arm64<B: GuestMemoryBacking>(
     memory: &mut GuestMemory<B>,
     image: &[u8],
@@ -470,5 +526,69 @@ mod tests {
         assert_eq!(ARM64_BOOT_CPSR, 0x3c5);
         assert_eq!(ARM64_BOOT_CPSR & 0xf, 0b0101);
         assert_eq!((ARM64_BOOT_CPSR >> 6) & 0xf, 0xf);
+    }
+
+    // ---- check_boot_readback（TASK-192.15・#3797） ----
+
+    fn boot_expected() -> ArmBootState {
+        ArmBootState {
+            pc: 0x4008_0000,
+            x0: 0x43e0_0000,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            cpsr: ARM64_BOOT_CPSR,
+        }
+    }
+
+    fn boot_got() -> ArmBootReadback {
+        ArmBootReadback {
+            x0: 0x43e0_0000,
+            pc: 0x4008_0000,
+            cpsr: ARM64_BOOT_CPSR,
+            mpidr: 0x8000_0000,
+            sctlr: 0x30d0_0800,
+        }
+    }
+
+    #[test]
+    fn mvm5_3797_readback_matches() {
+        assert!(check_boot_readback(&boot_expected(), &boot_got()).is_ok());
+    }
+
+    #[test]
+    fn mvm5_3797_readback_x0_pc_cpsr_mismatch_is_internal() {
+        let mutators: [fn(&mut ArmBootReadback); 3] =
+            [|g| g.x0 += 1, |g| g.pc += 4, |g| g.cpsr ^= 1];
+        for f in mutators {
+            let mut g = boot_got();
+            f(&mut g);
+            let e = check_boot_readback(&boot_expected(), &g).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        }
+    }
+
+    #[test]
+    fn mvm5_3797_readback_mpidr_compares_affinity_only() {
+        let mut g = boot_got();
+        g.mpidr = 0x8000_0000;
+        assert!(check_boot_readback(&boot_expected(), &g).is_ok());
+        for bad in [0x1u64, 0x1_0000_0000] {
+            g.mpidr = bad;
+            let e = check_boot_readback(&boot_expected(), &g).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::Internal);
+            assert_eq!(e.message(), "mpidr_el1 affinity does not match the fdt");
+        }
+    }
+
+    #[test]
+    fn mvm5_3797_readback_sctlr_mmu_or_dcache_on_is_precondition() {
+        let mut g = boot_got();
+        for bad in [g.sctlr | 1, g.sctlr | 4] {
+            g.sctlr = bad;
+            let e = check_boot_readback(&boot_expected(), &g).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "sctlr_el1 has mmu or d-cache enabled at boot");
+        }
     }
 }

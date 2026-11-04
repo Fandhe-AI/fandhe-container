@@ -15,7 +15,7 @@
 //!   `HostMapping` を値で受け取り `GuestMapping` が所有する。ゲストへの対応付けの解除（`hv_vm_unmap`）が成功
 //!   するまで munmap しない。解除に失敗したら backing は解放せず意図的にリークする（fail-closed）。
 //!   `mem::forget` で `GuestMapping` を捨てても backing はリークするだけで、解放されない（安全）。
-//!   `GuestMapping` は `&HvVm` を借用するため、対応付けが生きている間は `hv_vm_destroy` も起きない
+//!   `GuestMapping` は `&HvVm` を借用するか（`map`）`Arc<HvVm>` を保持する（`map_shared`、#3797）ため、対応付けが生きている間は `hv_vm_destroy` も起きない
 //! - `HvVm::map` は範囲・ページ境界に加えて既定の IPA 上限（`HVF_DEFAULT_IPA_LIMIT`）も FFI の前に検査する（#3844）
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
@@ -55,6 +55,10 @@
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
 //! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK ヘッダとの照合は #3803。
 //!
+//! # ホストの時刻（TASK-192.14・#3796）
+//! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
+//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3803。
+//!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
 //! SDK ヘッダとの最終照合は人間担当の #3803 で行う。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
@@ -62,8 +66,8 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg,
-    HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
+    GicIntid, HostTimebase, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats,
+    HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
     check_gic_supported, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
     decode_exit, finish_run, parse_macos_product_version,
 };
@@ -154,6 +158,53 @@ const MAP_ANON: c_int = 0x1000;
 const SC_PAGESIZE: c_int = 29;
 const ENOMEM: i32 = 12;
 
+// SAFETY: 宣言は macOS（LP64）の libSystem（`<mach/mach_time.h>`）の C ABI に一致させている
+// （`mach_absolute_time` は `uint64_t` を返し引数なし、`mach_timebase_info` は `kern_return_t` = int を返し
+// `struct mach_timebase_info { uint32_t numer; uint32_t denom; }` へのポインタを取る）。
+// 両関数は libc に対応物があり #3664 で照合する（本 crate は dev-dependency に libc を持たない）。
+// 呼び出しは下の安全なラッパー（`host_absolute_time`・`host_timebase`）経由だけ。
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
+}
+
+/// `struct mach_timebase_info`（`<mach/mach_time.h>`）。`sys` の外へ出さない。
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<MachTimebaseInfo>() == 8);
+    assert!(std::mem::align_of::<MachTimebaseInfo>() == 4);
+};
+
+/// ホストの絶対時間カウンタを読む（`mach_absolute_time`）。引数なし・常に成功する。
+/// `hvf::timer` が WFI の待ち時間の計算の直前に呼ぶ（TASK-192.14・#3796）。
+pub(crate) fn host_absolute_time() -> u64 {
+    // SAFETY: 引数もポインタも取らず、メモリを触らない。常に成功する libSystem の関数。
+    unsafe { mach_absolute_time() }
+}
+
+static HOST_TIMEBASE: OnceLock<Result<HostTimebase, MicrovmError>> = OnceLock::new();
+
+/// ホストの絶対時間カウンタの ns への換算比を返す（プロセスで 1 回だけ取得して保つ）。
+/// 失敗や 0 の値は `Internal`（推測の値で続けない。fail-closed）。
+pub(crate) fn host_timebase() -> Result<HostTimebase, MicrovmError> {
+    HOST_TIMEBASE
+        .get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+            // SAFETY: `info` は初期化済みのローカル変数で、呼び出しの間は有効な書き込み先（8 バイト・4 アライン）。
+            let rc = unsafe { mach_timebase_info(&mut info) };
+            if rc != 0 {
+                return Err(internal("mach_timebase_info failed"));
+            }
+            HostTimebase::new(info.numer, info.denom)
+        })
+        .clone()
+}
+
 /// プロセス内に `HvVm` が存在するか（1 プロセス 1 VM の排他）。
 static VM_EXISTS: AtomicBool = AtomicBool::new(false);
 
@@ -215,6 +266,43 @@ impl HvVm {
         size: usize,
         flags: MemoryFlags,
     ) -> Result<GuestMapping<'a>, MicrovmError> {
+        self.map_with(VmRef::Borrowed(self), host, offset, ipa, size, flags)
+    }
+
+    /// [`HvVm::map`] の `Arc` 版。戻り値の対応付けが `Arc<HvVm>` を保持するため `'static` で、`VmWithGic` を `Arc` で
+    /// 共有する構成体（#3797）が自己参照なしにゲスト RAM を持てる。
+    ///
+    /// 対応付けが生きている間は `Arc` の参照が残るので `hv_vm_destroy`（`HvVm::drop`）は必ず `hv_vm_unmap` の後になる
+    /// （unmap を VM 破棄の後に回さない。破棄後に作り直した別 VM の IPA を誤って unmap する危険を型で断つ）。
+    /// 検査と失敗時の扱いは [`HvVm::map`] と同じ。
+    pub fn map_shared(
+        self: &Arc<Self>,
+        host: HostMapping,
+        offset: usize,
+        ipa: u64,
+        size: usize,
+        flags: MemoryFlags,
+    ) -> Result<GuestMapping<'static>, MicrovmError> {
+        self.map_with(
+            VmRef::Shared(Arc::clone(self)),
+            host,
+            offset,
+            ipa,
+            size,
+            flags,
+        )
+    }
+
+    /// `map`・`map_shared` の共通本体。`keep` は戻り値の対応付けが保持する VM への参照（借用か `Arc`）。
+    fn map_with<'a>(
+        &self,
+        keep: VmRef<'a>,
+        host: HostMapping,
+        offset: usize,
+        ipa: u64,
+        size: usize,
+        flags: MemoryFlags,
+    ) -> Result<GuestMapping<'a>, MicrovmError> {
         let end = offset
             .checked_add(size)
             .ok_or_else(|| invalid_arg("range overflows the host mapping"))?;
@@ -231,7 +319,7 @@ impl HvVm {
         let rc = unsafe { hv_vm_map(addr as *mut c_void, ipa, size, flags.bits()) };
         classify_hv_return(HvOp::VmMap, rc)?;
         Ok(GuestMapping {
-            _vm: self,
+            _vm: keep,
             ipa,
             size,
             page_size: host.page_size,
@@ -277,7 +365,7 @@ fn invalid_arg(msg: &'static str) -> MicrovmError {
 
 impl Drop for HvVm {
     fn drop(&mut self) {
-        // SAFETY: 引数なし。`GuestMapping` が `&HvVm` を借用しているため、対応付けが残った状態では到達しない。
+        // SAFETY: 引数なし。`GuestMapping` が `&HvVm` を借用するか `Arc<HvVm>` を保持するため、対応付けが残った状態では到達しない。
         let rc = unsafe { hv_vm_destroy() };
         // 失敗（例: HV_BUSY）ではプロセス内に VM が残るので、排他のフラグは true のままにする（fail-closed）。
         if rc == crate::hvf_abi::HV_SUCCESS {
@@ -402,6 +490,36 @@ impl HostMapping {
         }
         Ok(())
     }
+
+    /// 範囲と、実際のホストポインタの 2 バイト整列を検査してポインタを返す（整列 u16 アクセスの共通部。#3862）。
+    fn aligned_u16_ptr(&self, offset: usize) -> Result<*mut u16, MicrovmError> {
+        self.check_span(offset, 2)?;
+        let p = (self.ptr as *mut u8).wrapping_add(offset);
+        if !(p as usize).is_multiple_of(core::mem::align_of::<u16>()) {
+            return Err(invalid_arg("unaligned guest memory access"));
+        }
+        Ok(p.cast::<u16>())
+    }
+
+    /// `offset` の 2 バイトを整列した単一の volatile 読みで取り LE の u16 として返す（`avail.idx` 用。#3862・MVM-5・MVM-1）。
+    ///
+    /// 範囲外・未整列は `InvalidArgument`（unsafe の前に検査）。「単一命令」は aarch64 の `ldrh` に下りる前提で、
+    /// Rust の言語仕様の保証ではない（Linux の `READ_ONCE` と同じ前提）。
+    pub fn read_u16_le_aligned(&self, offset: usize) -> Result<u16, MicrovmError> {
+        let p = self.aligned_u16_ptr(offset)?;
+        // SAFETY: `aligned_u16_ptr` が範囲（offset + 2 <= len）と u16 の整列を検査済み。領域は self の生存中有効。
+        // ゲストが並行して書きうるため参照（`&u16`）を作らず volatile で読む。
+        Ok(u16::from_le(unsafe { p.read_volatile() }))
+    }
+
+    /// `v` を LE で `offset` へ整列した単一の volatile 書きで置く（`used.idx` 用。契約は読みと同じ。#3862）。
+    pub fn write_u16_le_aligned(&mut self, offset: usize, v: u16) -> Result<(), MicrovmError> {
+        let p = self.aligned_u16_ptr(offset)?;
+        // SAFETY: `aligned_u16_ptr` が範囲と整列を検査済み。領域は self の生存中有効で、&mut self により Rust 側の
+        // 同時アクセスはない。ゲストが並行して読みうるため参照を作らず volatile で書く。
+        unsafe { p.write_volatile(v.to_le()) };
+        Ok(())
+    }
 }
 
 impl Drop for HostMapping {
@@ -415,12 +533,22 @@ impl Drop for HostMapping {
     }
 }
 
-/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` を借用し、`HostMapping` を所有する。
+/// 対応付けが VM を生かしておくための参照。借用（`HvVm::map`）か `Arc`（`HvVm::map_shared`、#3797）。
+/// どちらも対応付けが残る間 `hv_vm_destroy` が走らないことを保証する。
+// 中身は読まない（保持して寿命を延ばすだけ）ため dead_code を許す。
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmRef<'a> {
+    Borrowed(&'a HvVm),
+    Shared(Arc<HvVm>),
+}
+
+/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` を借用するか `Arc<HvVm>` を保持し、`HostMapping` を所有する。
 ///
 /// 解除（`hv_vm_unmap`）が成功するまで backing を munmap しない。失敗時は backing をリークする（fail-closed）。
 #[derive(Debug)]
 pub struct GuestMapping<'a> {
-    _vm: &'a HvVm,
+    _vm: VmRef<'a>,
     ipa: u64,
     size: usize,
     page_size: usize,
@@ -495,6 +623,26 @@ impl GuestMapping<'_> {
             .as_mut()
             .ok_or_else(|| invalid_arg("guest memory access out of range"))?
             .write_from(pos, data)
+    }
+
+    /// 対応付けの先頭から `offset` の位置の整列した u16 を単一命令の volatile で読む（#3862）。
+    ///
+    /// `host_offset` がページ境界でも、backing 側がホストポインタで整列を再検査する。
+    pub fn read_u16_le_aligned(&self, offset: usize) -> Result<u16, MicrovmError> {
+        let pos = self.host_span(offset, 2)?;
+        self.host
+            .as_ref()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .read_u16_le_aligned(pos)
+    }
+
+    /// 対応付けの先頭から `offset` の位置へ整列した u16 を単一命令の volatile で書く（#3862）。
+    pub fn write_u16_le_aligned(&mut self, offset: usize, v: u16) -> Result<(), MicrovmError> {
+        let pos = self.host_span(offset, 2)?;
+        self.host
+            .as_mut()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .write_u16_le_aligned(pos, v)
     }
 
     /// 対応付けの保護を `flags` に変える。

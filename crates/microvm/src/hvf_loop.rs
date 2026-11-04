@@ -17,7 +17,7 @@
 //! - fail-closed: 未知の exit・未対応の例外クラスは推測で続行せず VM を止める（[`run_loop`] の表）。
 //!
 //! # 未実装（REPAIR-3）
-//! 複数 vCPU・AP の起動・SysReg trap の処理。exit ごとの実処理は MMIO が #3793、PSCI / HVC が #3794、WFI / vtimer が #3796。
+//! 複数 vCPU・AP の起動・SysReg trap の処理。exit ごとの実処理は MMIO が #3793、PSCI / HVC は #3794 で実装済み、WFI / vtimer が #3796。
 
 use std::fmt;
 use std::sync::Arc;

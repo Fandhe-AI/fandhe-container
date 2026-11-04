@@ -352,6 +352,8 @@ pub(crate) fn is_not_real_entry(e: &std::io::Error) -> bool {
 /// 最終要素は `O_NONBLOCK` 付きで開くため FIFO 等で止まらず、`O_NOCTTY` 付きで制御端末も取得しない（通常ファイルの読み取りには影響しない）。
 /// ディレクトリや FIFO は開いて返す（種別の拒否は呼び出し側の fstat。#3842）。
 /// 区切りの重複・末尾 `/`・途中の `.` は `Path::components` の正規化で受理される（安全性は `O_NOFOLLOW` が担う）。
+/// 末尾 `/` の受理が経路全体で観測されないのは、呼び出し元 `adapter::read_image_blocking` が先に生のパスを
+/// `symlink_metadata` するため、通常ファイル + 末尾 `/` はそこで `ENOTDIR` で失敗するから（#3866・SEC-1）。
 /// 呼び出し元は `adapter::read_image_blocking`（`start` のイメージ読み込み）。
 #[cfg(unix)]
 pub(crate) fn open_regular_nofollow(

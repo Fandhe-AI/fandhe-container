@@ -1,7 +1,7 @@
 //! arm64 の Image・initrd・FDT の配置と起動レジスタの値の結合試験（MVM-5・MVM-1。KVM 不要・OS 非依存・heap backing）。
 
 use fandhe_container_microvm::arm64_layout::{
-    Arm64Layout, GuestFdtConfig, MmioRegion, build_guest_fdt,
+    ARM64_MAX_VCPUS, Arm64Layout, GuestFdtConfig, MmioRegion, build_guest_fdt,
 };
 use fandhe_container_microvm::boot_arm64::{
     ARM64_IMAGE_MAGIC, Arm64PageSize, ArmBootState, load_arm64,
@@ -161,8 +161,14 @@ fn mvm5_load_arm64_bootargs_and_vcpu_errors() {
         let e = load_arm64(&mut m, &image(4096, 0), None, cmd, &layout).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
     }
+    let e = Arm64Layout::new(RAM, ARM64_MAX_VCPUS + 1, 1).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    // vCPU 2 は FDT 側で受理される（#3864。HVF のバックエンドは 1 vCPU のまま）。
     let smp = Arm64Layout::new(RAM, 2, 1).unwrap();
     let mut m = mem(RAM);
-    let e = load_arm64(&mut m, &image(4096, 0), None, CMDLINE, &smp).unwrap_err();
-    assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    let (loaded, _) = load_arm64(&mut m, &image(4096, 0), None, CMDLINE, &smp).unwrap();
+    assert_eq!(
+        read(&m, loaded.fdt.base.raw(), 4),
+        0xd00d_feedu32.to_be_bytes()
+    );
 }

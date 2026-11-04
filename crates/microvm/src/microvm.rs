@@ -88,7 +88,7 @@ use crate::boot_x86::{
     write_boot_tables,
 };
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
-use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice};
+use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
@@ -104,10 +104,15 @@ use crate::sys::{self, GuestRamMap, SysError};
 use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{
-    CONFIG_SPACE_SIZE, IgnoredAccess, MmioReadOutcome, MmioWriteOutcome, VirtioDevice,
-    VirtioMmioTransport,
+    CONFIG_SPACE_SIZE, MmioWriteOutcome, SharedTransport, VirtioDevice, VirtioMmioTransport,
 };
 use crate::virtio_net::{NetBackend, VirtioNet};
+// SharedTransport を virtio_mmio へ移したため、試験（`use super::*`）が使う型だけ cfg(test) で残す。
+#[cfg(test)]
+use crate::{
+    dispatch::MmioDevice,
+    virtio_mmio::{IgnoredAccess, MmioReadOutcome},
+};
 
 /// virtio-mmio の窓の先頭（GPA）。ゲスト RAM（GPA 0 からの単一領域）はこれより下に収まる。
 /// cmdline の `virtio_mmio.device=<size>@<base>:<irq>`（[`MicroVm::load_kernel`]。#884）が使う。
@@ -265,6 +270,17 @@ fn write_map(map: &mut GuestRamMap, offset: u64, data: &[u8]) -> Result<(), Micr
     map.write_from(off, data).map_err(|()| out_of_range())
 }
 
+fn read_u16_map(map: &GuestRamMap, offset: u64) -> Result<u16, MicrovmError> {
+    let off = usize::try_from(offset).map_err(|_| out_of_range())?;
+    map.read_u16_le_aligned(off).map_err(|()| out_of_range())
+}
+
+fn write_u16_map(map: &mut GuestRamMap, offset: u64, v: u16) -> Result<(), MicrovmError> {
+    let off = usize::try_from(offset).map_err(|_| out_of_range())?;
+    map.write_u16_le_aligned(off, v)
+        .map_err(|()| out_of_range())
+}
+
 /// まだ KVM に登録していない、mmap 済みのゲスト RAM。
 ///
 /// [`GuestMemoryBacking`] を実装するので、登録前のゲストメモリ（カーネル・initrd の書き込み）にも使える。
@@ -335,6 +351,12 @@ impl GuestMemoryBacking for GuestRam {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         write_map(&mut self.map, offset, data)
     }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        read_u16_map(&self.map, offset)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        write_u16_map(&mut self.map, offset, v)
+    }
 }
 
 /// KVM の memslot に登録済みのゲスト RAM。
@@ -359,6 +381,14 @@ impl GuestMemoryBacking for RegisteredGuestRam {
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
         let map = self.map.as_mut().ok_or_else(out_of_range)?;
         write_map(map, offset, data)
+    }
+    fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+        let map = self.map.as_ref().ok_or_else(out_of_range)?;
+        read_u16_map(map, offset)
+    }
+    fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+        let map = self.map.as_mut().ok_or_else(out_of_range)?;
+        write_u16_map(map, offset, v)
     }
 }
 
@@ -598,29 +628,6 @@ fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>,
 
 fn poisoned() -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, "virtio device lock poisoned")
-}
-
-/// dispatcher（所有を要求する）と VM 構成体（型つきで触る）がトランスポートを共有するためのラッパー。
-///
-/// lock が poison していたらデバイスは応答をやめる（fail-closed。`MmioDevice` は `Result` を返せない）。
-struct SharedTransport<D: VirtioDevice>(Arc<Mutex<VirtioMmioTransport<D>>>);
-
-impl<D: VirtioDevice + Send> MmioDevice for SharedTransport<D> {
-    fn read(&self, offset: u64, data: &mut [u8]) -> MmioReadOutcome {
-        match self.0.lock() {
-            Ok(t) => t.read(offset, data),
-            Err(_) => {
-                data.fill(0);
-                MmioReadOutcome::Ignored(IgnoredAccess::WrongDeviceState)
-            }
-        }
-    }
-    fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
-        match self.0.lock() {
-            Ok(mut t) => t.write(offset, data),
-            Err(_) => MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState),
-        }
-    }
 }
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・配置・割り込み線）。

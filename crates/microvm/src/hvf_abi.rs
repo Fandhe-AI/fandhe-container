@@ -360,6 +360,70 @@ fn invalid(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, msg)
 }
 
+/// macOS バックエンドが受ける vCPU 数の上限（SMP は未実装。TASK-192.15・#3797・MVM-5・REPAIR-3）。
+pub const HVF_MAX_VCPUS: u32 = 1;
+/// macOS バックエンドが受けるゲスト RAM の上限（[`MAX_MAP_BYTES`] と同値。mmap の前に超過を拒否する）。
+pub const HVF_MAX_GUEST_RAM_BYTES: u64 = MAX_MAP_BYTES;
+
+/// `HvfMicroVm::assemble` が資源（VM・GIC・mmap）を作る前に検査する構成値（#3797）。
+///
+/// 循環依存を避けるためプリミティブだけで受ける。呼び出し元は plugin-microvm 側から来る非信頼の VM 構成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfAssembleInput {
+    /// vCPU 数。
+    pub vcpus: u32,
+    /// ゲスト RAM の大きさ（バイト）。
+    pub ram_size: u64,
+    /// レイアウトの virtio-mmio の個数。
+    pub layout_virtio_count: u32,
+    /// 実際に登録するデバイス数（block + net）。
+    pub device_count: usize,
+    /// カーネル Image の長さ。
+    pub image_len: u64,
+    /// initrd の長さ（無ければ `None`）。
+    pub initrd_len: Option<u64>,
+    /// カーネル cmdline の長さ。
+    pub cmdline_len: usize,
+}
+
+/// 構成値の上限検査（資源を作る前。ERR-1: メッセージは固定で入力値をエコーしない）。
+///
+/// 順序: vcpus（0 は `InvalidArgument`、2 以上は `Unimplemented`。他の不正に隠れないよう最初）→ RAM → デバイス数 →
+/// Image・initrd・cmdline の長さ。Image ヘッダの中身はここでは見ない（RAM 登録後の `load_arm64` が検証する）。
+pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError> {
+    use crate::arm64_layout::{ARM64_MAX_BOOTARGS, ARM64_VIRTIO_MMIO_MAX};
+    use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
+
+    if input.vcpus == 0 {
+        return Err(invalid("vcpus is zero"));
+    }
+    if input.vcpus > HVF_MAX_VCPUS {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "hvf backend supports a single vcpu",
+        ));
+    }
+    if input.ram_size == 0 || input.ram_size > HVF_MAX_GUEST_RAM_BYTES {
+        return Err(invalid("guest ram size is out of range"));
+    }
+    if input.device_count > ARM64_VIRTIO_MMIO_MAX as usize {
+        return Err(invalid("too many virtio devices"));
+    }
+    if u32::try_from(input.device_count).ok() != Some(input.layout_virtio_count) {
+        return Err(invalid("device layout does not match the configuration"));
+    }
+    if input.image_len == 0 || input.image_len > MAX_KERNEL_IMAGE_BYTES {
+        return Err(invalid("kernel image length is out of range"));
+    }
+    if input.initrd_len.is_some_and(|n| n > MAX_INITRD_BYTES) {
+        return Err(invalid("initrd length is out of range"));
+    }
+    if input.cmdline_len > ARM64_MAX_BOOTARGS {
+        return Err(invalid("kernel cmdline is too long"));
+    }
+    Ok(())
+}
+
 /// `hv_vm_map` / `hv_vm_protect` に渡す範囲の検査（FFI の前に必ず通す）。
 ///
 /// `page_size` が 0 か 2 の冪でない、`size` が 0 か [`MAX_MAP_BYTES`] 超かページ倍数でない、`addr`・`ipa` がページ境界でない、
@@ -631,9 +695,258 @@ impl GicIntid {
     }
 }
 
+// ---- WFI の待ち時間の計算（TASK-192.14・#3796・MVM-5・MVM-1・REPAIR-5）----
+//
+// `hvf::timer` の `handle_wfx` が呼ぶ純関数群。`hv_*` も `mach_*` も呼ばず、時刻とレジスタ値は引数で受けるため
+// OS 非依存で、Linux の既定集合の単体テストで具体値を検証できる。CTL・CVAL・offset はゲストが書き換えられる
+// untrusted な値として扱い、桁あふれは checked 演算で処理する。
+
+/// `CNTV_CTL_EL0.ENABLE`（bit 0）。タイマーが有効。
+pub const CNTV_CTL_ENABLE: u64 = 1;
+/// `CNTV_CTL_EL0.IMASK`（bit 1）。タイマー割り込みの mask。
+pub const CNTV_CTL_IMASK: u64 = 1 << 1;
+/// `CNTV_CTL_EL0.ISTATUS`（bit 2）。タイマー条件が成立している（読み取り専用）。
+pub const CNTV_CTL_ISTATUS: u64 = 1 << 2;
+
+/// WFI 1 回の待ちの上限（10 ms）。停止要求への応答時間の上限を決める唯一の値。
+///
+/// `handle_wfx` は停止フラグにも kick（`hv_vcpus_exit`）にも触れられず、ホスト側の sleep は kick で起きない。
+/// そのため停止要求は、この上限で待ちが戻ってから実行ループの先頭で見つかる（REPAIR-5）。
+pub const WFI_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(10);
+
+const _: () = assert!(WFI_WAIT_MAX.as_millis() > 0 && WFI_WAIT_MAX.as_millis() < 1000);
+
+/// ホストの絶対時間カウンタ（`mach_absolute_time`）を ns へ換算する比（`mach_timebase_info` の値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTimebase {
+    numer: u32,
+    denom: u32,
+}
+
+impl HostTimebase {
+    /// 換算比を作る。どちらかが 0 なら 0 除算か常に 0 の換算になるため `Internal` で拒否する（fail-closed）。
+    pub fn new(numer: u32, denom: u32) -> Result<Self, MicrovmError> {
+        if numer == 0 || denom == 0 {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "host timebase has a zero component",
+            ));
+        }
+        Ok(Self { numer, denom })
+    }
+
+    /// `ticks` を ns へ換算する（切り上げ）。u128 の checked 演算で、桁あふれは `None`。
+    fn ticks_to_nanos_ceil(self, ticks: u64) -> Option<u128> {
+        u128::from(ticks)
+            .checked_mul(u128::from(self.numer))
+            .map(|v| v.div_ceil(u128::from(self.denom)))
+    }
+}
+
+/// ゲストの仮想カウンタ値（`CNTVCT_EL0` 相当）を、ホストのカウンタと vtimer offset から求める。
+///
+/// アーキテクチャ上カウンタは 2^64 を法とする値のため、ここだけは `wrapping_sub` を使う。
+pub const fn guest_virtual_count(host_now: u64, vtimer_offset: u64) -> u64 {
+    host_now.wrapping_sub(vtimer_offset)
+}
+
+/// vtimer の割り込み線が立っているか（ENABLE=1・ISTATUS=1・IMASK=0）。
+pub const fn vtimer_level(ctl: u64) -> bool {
+    ctl & CNTV_CTL_ENABLE != 0 && ctl & CNTV_CTL_ISTATUS != 0 && ctl & CNTV_CTL_IMASK == 0
+}
+
+/// WFI の待ちが何で決まったか（観測・試験用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WfiWakeSource {
+    /// タイマー無効。起床の契機にならないため上限まで待つ（空回りを避ける）。
+    TimerDisabled,
+    /// IMASK=1。待たない（一過性で、割り込みが既に pending の可能性があるため）。
+    TimerMasked,
+    /// 条件が既に成立。待たない。
+    TimerFired,
+    /// 次の期限まで待つ（上限未満）。
+    TimerDeadline,
+    /// 期限が上限より先。上限で頭打ち。
+    Capped,
+}
+
+/// `wfi_wait_plan` の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WfiWaitPlan {
+    /// ホスト側で待つ時間（`cap` 以下）。
+    pub wait: std::time::Duration,
+    /// 待ち時間の決まり方。
+    pub source: WfiWakeSource,
+}
+
+/// WFI で待つ時間を決める純関数。
+///
+/// 判定順: (1) `cap` が 0 または `WFI_WAIT_MAX` 超は `InvalidArgument` (2) ENABLE=0 は `cap` (3) IMASK=1 は 0
+/// (4) ISTATUS=1 または `guest_now >= cval`（符号なし比較）は 0 (5) それ以外は `cval - guest_now` tick を ns へ
+/// 切り上げ換算（早すぎる戻りでの空回りを避ける）し `cap` で頭打ち。換算の桁あふれは `cap` 扱い。
+///
+/// IMASK=1 を 0 待ちにするのは、Linux の arch_timer がハンドラ中に IMASK を立てて次の期限で外す一過性の状態で、
+/// 割り込みが既に pending の可能性があるため。空回りが実測で問題になれば上限まで待つ方式へ変える（再評価条件）。
+pub fn wfi_wait_plan(
+    ctl: u64,
+    cval: u64,
+    guest_now: u64,
+    timebase: HostTimebase,
+    cap: std::time::Duration,
+) -> Result<WfiWaitPlan, MicrovmError> {
+    if cap.is_zero() || cap > WFI_WAIT_MAX {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "wfi wait cap must be in (0, WFI_WAIT_MAX]",
+        ));
+    }
+    let plan = |wait, source| Ok(WfiWaitPlan { wait, source });
+    if ctl & CNTV_CTL_ENABLE == 0 {
+        return plan(cap, WfiWakeSource::TimerDisabled);
+    }
+    if ctl & CNTV_CTL_IMASK != 0 {
+        return plan(std::time::Duration::ZERO, WfiWakeSource::TimerMasked);
+    }
+    if ctl & CNTV_CTL_ISTATUS != 0 || guest_now >= cval {
+        return plan(std::time::Duration::ZERO, WfiWakeSource::TimerFired);
+    }
+    let ticks = cval.saturating_sub(guest_now);
+    match timebase.ticks_to_nanos_ceil(ticks) {
+        Some(ns) if ns < cap.as_nanos() => {
+            // ns < cap（10 ms 以下）なので u64 に収まる。
+            let ns = u64::try_from(ns).unwrap_or(u64::MAX);
+            plan(
+                std::time::Duration::from_nanos(ns),
+                WfiWakeSource::TimerDeadline,
+            )
+        }
+        _ => plan(cap, WfiWakeSource::Capped),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- WFI の待ち時間（TASK-192.14・#3796・MVM-5・REPAIR-5）----
+
+    fn tb_24mhz() -> HostTimebase {
+        HostTimebase::new(125, 3).unwrap()
+    }
+
+    fn tb_1() -> HostTimebase {
+        HostTimebase::new(1, 1).unwrap()
+    }
+
+    const CAP: std::time::Duration = WFI_WAIT_MAX;
+
+    #[test]
+    fn mvm5_3796_wait_max_is_10ms() {
+        assert_eq!(WFI_WAIT_MAX, std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn mvm5_3796_past_or_equal_cval_does_not_wait() {
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, 100, 200, tb_24mhz(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::ZERO);
+        assert_eq!(p.source, WfiWakeSource::TimerFired);
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, 200, 200, tb_24mhz(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::ZERO);
+        assert_eq!(p.source, WfiWakeSource::TimerFired);
+    }
+
+    #[test]
+    fn mvm5_3796_future_cval_waits_until_deadline() {
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, 120_000, 0, tb_24mhz(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_millis(5));
+        assert_eq!(p.source, WfiWakeSource::TimerDeadline);
+        // 1 tick = 125/3 ns = 41.67 ns を切り上げて 42 ns。
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, 1, 0, tb_24mhz(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_nanos(42));
+        assert_eq!(p.source, WfiWakeSource::TimerDeadline);
+    }
+
+    #[test]
+    fn mvm5_3796_far_future_is_capped() {
+        // 24 MHz で約 1 秒分（24_000_000 tick）。
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, 24_000_000, 0, tb_24mhz(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_millis(10));
+        assert_eq!(p.source, WfiWakeSource::Capped);
+    }
+
+    #[test]
+    fn mvm5_3796_overflow_boundaries_do_not_panic() {
+        let huge = HostTimebase::new(u32::MAX, 1).unwrap();
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, u64::MAX, 0, huge, CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_millis(10));
+        assert_eq!(p.source, WfiWakeSource::Capped);
+        // ホストのカウンタが offset より小さい場合は 2^64 を法として回り込む。
+        let now = guest_virtual_count(5, 10);
+        assert_eq!(now, u64::MAX - 4);
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE, u64::MAX, now, tb_1(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_nanos(4));
+        assert_eq!(p.source, WfiWakeSource::TimerDeadline);
+    }
+
+    #[test]
+    fn mvm5_3796_masked_disabled_and_istatus_cases() {
+        let p = wfi_wait_plan(CNTV_CTL_ENABLE | CNTV_CTL_IMASK, 1_000_000, 0, tb_1(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::ZERO);
+        assert_eq!(p.source, WfiWakeSource::TimerMasked);
+        let p = wfi_wait_plan(0, 1_000_000, 0, tb_1(), CAP).unwrap();
+        assert_eq!(p.wait, std::time::Duration::from_millis(10));
+        assert_eq!(p.source, WfiWakeSource::TimerDisabled);
+        let p = wfi_wait_plan(
+            CNTV_CTL_ENABLE | CNTV_CTL_ISTATUS,
+            1_000_000,
+            0,
+            tb_1(),
+            CAP,
+        )
+        .unwrap();
+        assert_eq!(p.wait, std::time::Duration::ZERO);
+        assert_eq!(p.source, WfiWakeSource::TimerFired);
+    }
+
+    #[test]
+    fn mvm5_3796_vtimer_level_truth_table() {
+        for ctl in 0u64..8 {
+            let enable = ctl & 1 != 0;
+            let imask = ctl & 2 != 0;
+            let istatus = ctl & 4 != 0;
+            assert_eq!(
+                vtimer_level(ctl),
+                enable && istatus && !imask,
+                "ctl={ctl:#b}"
+            );
+        }
+        assert!(vtimer_level(0b101));
+        assert!(!vtimer_level(0b111));
+    }
+
+    #[test]
+    fn mvm5_3796_invalid_timebase_and_cap_are_rejected() {
+        assert_eq!(
+            HostTimebase::new(0, 1).unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+        assert_eq!(
+            HostTimebase::new(1, 0).unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+        let zero = wfi_wait_plan(CNTV_CTL_ENABLE, 1, 0, tb_1(), std::time::Duration::ZERO);
+        assert_eq!(zero.unwrap_err().code(), MicrovmErrorCode::InvalidArgument);
+        let big = wfi_wait_plan(
+            CNTV_CTL_ENABLE,
+            1,
+            0,
+            tb_1(),
+            std::time::Duration::from_millis(11),
+        );
+        assert_eq!(big.unwrap_err().code(), MicrovmErrorCode::InvalidArgument);
+    }
 
     #[test]
     fn mvm5_3783_constants_have_expected_values() {
@@ -998,5 +1311,132 @@ mod tests {
         assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 3);
         assert_ne!(u32::from(HvGicIntid::EL1_VIRTUAL_TIMER.bits()), 27);
         assert_eq!(GicIntid::new(27).get(), 27);
+    }
+
+    // ---- check_assemble_input（TASK-192.15・#3797・MVM-5） ----
+
+    fn ok_input() -> HvfAssembleInput {
+        HvfAssembleInput {
+            vcpus: 1,
+            ram_size: 64 << 20,
+            layout_virtio_count: 1,
+            device_count: 1,
+            image_len: 4096,
+            initrd_len: None,
+            cmdline_len: 0,
+        }
+    }
+
+    fn assemble_err(i: HvfAssembleInput) -> (MicrovmErrorCode, &'static str) {
+        let e = check_assemble_input(&i).unwrap_err();
+        // 試験用に寿命を延ばす（リークは試験プロセスの終了で回収される）。
+        (
+            e.code(),
+            Box::leak(e.message().to_string().into_boxed_str()),
+        )
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_input_accepts_baseline() {
+        assert!(check_assemble_input(&ok_input()).is_ok());
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_vcpus_zero_invalid_and_two_unimplemented() {
+        let mut i = ok_input();
+        i.vcpus = 0;
+        assert_eq!(
+            assemble_err(i),
+            (MicrovmErrorCode::InvalidArgument, "vcpus is zero")
+        );
+        i.vcpus = 2;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::Unimplemented,
+                "hvf backend supports a single vcpu"
+            )
+        );
+        // 他の値も不正でも vcpus = 2 の Unimplemented が優先される。
+        i.ram_size = 0;
+        i.image_len = 0;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::Unimplemented);
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_ram_bounds() {
+        let mut i = ok_input();
+        i.ram_size = 0;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "guest ram size is out of range"
+            )
+        );
+        i.ram_size = HVF_MAX_GUEST_RAM_BYTES;
+        assert!(check_assemble_input(&i).is_ok());
+        i.ram_size = HVF_MAX_GUEST_RAM_BYTES + 64 * 1024;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_device_counts() {
+        let mut i = ok_input();
+        i.device_count = 33;
+        i.layout_virtio_count = 33;
+        assert_eq!(
+            assemble_err(i),
+            (MicrovmErrorCode::InvalidArgument, "too many virtio devices")
+        );
+        i.device_count = 32;
+        i.layout_virtio_count = 32;
+        assert!(check_assemble_input(&i).is_ok());
+        i.layout_virtio_count = 1;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "device layout does not match the configuration"
+            )
+        );
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_image_initrd_cmdline_bounds() {
+        use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
+        let mut i = ok_input();
+        i.image_len = 0;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "kernel image length is out of range"
+            )
+        );
+        i.image_len = MAX_KERNEL_IMAGE_BYTES + 1;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::InvalidArgument);
+        i.image_len = MAX_KERNEL_IMAGE_BYTES;
+        assert!(check_assemble_input(&i).is_ok());
+        i.initrd_len = Some(MAX_INITRD_BYTES + 1);
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "initrd length is out of range"
+            )
+        );
+        i.initrd_len = Some(MAX_INITRD_BYTES);
+        assert!(check_assemble_input(&i).is_ok());
+        i.cmdline_len = 2047;
+        assert!(check_assemble_input(&i).is_ok());
+        i.cmdline_len = 2048;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "kernel cmdline is too long"
+            )
+        );
     }
 }

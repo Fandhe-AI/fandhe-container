@@ -11,7 +11,7 @@ pub mod memory;
 pub use memory::{HvfGuestRam, RegisteredHvfRam};
 
 // TASK-192.9・#3791: vCPU 専用スレッドと実行ループの外殻（論理は OS 非依存の `crate::hvf_loop`）。
-// exit ごとの処理 `mmio`（#3793）・`hvc`（#3794）・`timer`（#3796）はスタブで、担当 issue が各ファイルだけを差し替える。
+// exit ごとの処理は `mmio`（#3793 で実装済み）・`hvc`（#3794 で実装済み。`crate::psci`）・`timer`（#3796）で、`timer` はスタブのまま担当 issue がファイルだけを差し替える。
 pub mod hvc;
 pub mod mmio;
 pub mod timer;
@@ -19,3 +19,7 @@ pub mod vcpu;
 pub use vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
 pub mod gic;
 pub use gic::{GicSpiLine, HvfGic, VmWithGic};
+
+// TASK-192.15・#3797: microVM 構成体（VM・GIC・ゲスト RAM・virtio-mmio・vCPU 0 の起動レジスタの組み立て）。
+pub mod microvm;
+pub use microvm::{HvfDeviceInfo, HvfDeviceKind, HvfMicroVm, HvfMicroVmConfig, HvfNetDeviceConfig};

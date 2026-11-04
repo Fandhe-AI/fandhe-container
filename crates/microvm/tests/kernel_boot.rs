@@ -57,6 +57,12 @@
 //! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。vCPU 2 台の陽性 1 件を #3899 で足し、3 件。2 台は `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001` を照合する）。シリアルはポーリング（FDT に `interrupts` 無し。
 //! Linux の 8250 は irq = 0 で timer ポーリング）で、送信は timer の周期ごとに進む。`/init` は write の直後に reboot するため、
 //! marker が出切る前に `GuestShutdown` になり marker 0 回で落ちた場合は、試験の欠陥ではなく割り込み未結線の帰結で、#3943 で直す。
+//! aarch64 の virtio-block（#3947・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=block-read
+//! make microvm-test-initrd-build` の initrd（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。既定
+//! `target/microvm-test-initrd/aarch64-block-read/initrd.cpio`）で、陽性（sentinel あり）・負の対照（block デバイス無し）・
+//! 陰性対照（0 埋め）の 3 件を足す。割り込みは FDT の既定の edge-rising の SPI。カーネルは `CONFIG_VIRTIO_MMIO`（DT 経由で
+//! `_CMDLINE_DEVICES` は不要）・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS` が要る。marker が出切る前に
+//! `GuestShutdown` になる #3943 のリスクは同じ。virtio-net の aarch64 版は範囲外。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -64,6 +70,17 @@
 /// x86_64 と aarch64 の試験が共有する（#3898。複製しない・REPAIR-1）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const MARKER: &str = "fandhe-microvm-test: init ok v1";
+
+/// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
+/// `block_sentinel`（x86 の単体テストで照合）。x86_64 と aarch64（#3947）の試験が共有する（複製しない・REPAIR-1）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
+/// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
+/// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
 
 /// 行単位の完全一致の件数（tty の ONLCR による `\r\n` を許容。部分一致・混入は数えない）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -101,7 +118,10 @@ fn escape_tail(output: &[u8], n: usize) -> String {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
+    use super::{
+        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, count_lines_ending_with,
+        count_marker_lines, escape_tail,
+    };
     use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_microvm::exit::{ExitData, ExitValue};
@@ -118,9 +138,6 @@ mod x86 {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
-    /// `block_sentinel`（単体テストで照合）。
-    const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
     /// net-tx の initrd が成功時・失敗時に出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の
     /// `net_tx_ok_message`・`net_tx_failed_message`（単体テストで照合）。
     const NET_TX_OK_MARKER: &str = "fandhe-microvm-test: net tx ok v1";
@@ -147,10 +164,6 @@ mod x86 {
         b'e', b't', b'-', b'r', b'x', b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'-', b'0',
         b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e', b'f',
     ];
-    /// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
-    const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
-    /// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
-    const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
     const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t";
     const DEFAULT_TIMEOUT_SECS: u64 = 60;
     const KERNEL_CAP: u64 = fandhe_container_microvm::boot_x86::MAX_KERNEL_IMAGE_BYTES;
@@ -1481,11 +1494,14 @@ mod x86 {
 /// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
-    use super::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
+    use super::{
+        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, count_lines_ending_with,
+        count_marker_lines, escape_tail,
+    };
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
-    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -1573,8 +1589,36 @@ mod arm64 {
         secs: u64,
     }
 
+    /// 使う initrd の種類（`scripts/build-microvm-test-initrd.sh` の variant に対応。`--arch aarch64`）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitrdKind {
+        /// initrd 無し（負の対照）。
+        None,
+        /// 固定文字列を書いて reboot するだけの版（`FANDHE_CONTAINER_MICROVM_INITRD`）。
+        Default,
+        /// `/dev/vda` の先頭を sentinel と比べる版（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。#3947）。
+        BlockRead,
+    }
+
+    /// initrd の種類ごとの（環境変数名・既定の相対パス・生成コマンドのヒント）。`None` には initrd が無い。
+    fn initrd_spec(kind: InitrdKind) -> Option<(&'static str, &'static str, &'static str)> {
+        match kind {
+            InitrdKind::None => None,
+            InitrdKind::Default => Some((
+                "FANDHE_CONTAINER_MICROVM_INITRD",
+                "../../target/microvm-test-initrd/aarch64/initrd.cpio",
+                "MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build",
+            )),
+            InitrdKind::BlockRead => Some((
+                "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD",
+                "../../target/microvm-test-initrd/aarch64-block-read/initrd.cpio",
+                "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build",
+            )),
+        }
+    }
+
     /// 前提の検査はすべてテストスレッドで行う（x86 と同じ方針）。
-    fn inputs(with_initrd: bool) -> Inputs {
+    fn inputs(kind: InitrdKind) -> Inputs {
         let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
             Ok(p) if !p.is_empty() => p,
             _ => {
@@ -1588,20 +1632,14 @@ mod arm64 {
                 "kernel image is not an uncompressed arm64 Image: {e}"
             ));
         }
-        let initrd = if with_initrd {
-            let path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
+        let initrd = initrd_spec(kind).map(|(env_name, default_rel, hint)| {
+            let path = match std::env::var(env_name) {
                 Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-                _ => Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/microvm-test-initrd/aarch64/initrd.cpio"),
+                _ => Path::new(env!("CARGO_MANIFEST_DIR")).join(default_rel),
             };
-            Some(read_bounded(&path, INITRD_CAP).unwrap_or_else(|e| {
-                precondition(&format!(
-                    "initrd (run `MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build`): {e}"
-                ))
-            }))
-        } else {
-            None
-        };
+            read_bounded(&path, INITRD_CAP)
+                .unwrap_or_else(|e| precondition(&format!("initrd (run `{hint}`): {e}")))
+        });
         let cmdline = validate_cmdline(
             std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
                 .ok()
@@ -1659,12 +1697,13 @@ mod arm64 {
         cmdline: String,
         boot_timeout: Duration,
         vcpus: u32,
+        block: Vec<MemoryBlockBackend>,
     ) -> Result<Outcome, String> {
         let started = Instant::now();
         let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
             vcpu_count: vcpus,
             mem_size: RAM_SIZE,
-            block: vec![],
+            block,
             net: vec![],
         };
         let mut vm =
@@ -1723,12 +1762,17 @@ mod arm64 {
     }
 
     /// 別スレッドで `boot` を回し、全体期限で必ず戻る（watchdog は `--ignored` を素通しするため唯一の層）。
-    fn run_boot(inp: Inputs, cmdline: String, vcpus: u32) -> (Outcome, Duration) {
+    fn run_boot(
+        inp: Inputs,
+        cmdline: String,
+        vcpus: u32,
+        block: Vec<MemoryBlockBackend>,
+    ) -> (Outcome, Duration) {
         let secs = inp.secs;
         let boot_timeout = Duration::from_secs(secs);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(boot(inp, cmdline, boot_timeout, vcpus));
+            let _ = tx.send(boot(inp, cmdline, boot_timeout, vcpus, block));
         });
         match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
             Ok(Ok(o)) => (o, boot_timeout),
@@ -1741,9 +1785,9 @@ mod arm64 {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
-        let inp = inputs(true);
+        let inp = inputs(InitrdKind::Default);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline, 1);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1, vec![]);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
@@ -1770,9 +1814,9 @@ mod arm64 {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_without_initrd_does_not_shut_down() {
-        let inp = inputs(false);
+        let inp = inputs(InitrdKind::None);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, _) = run_boot(inp, cmdline, 1);
+        let (o, _) = run_boot(inp, cmdline, 1, vec![]);
         let diag = o.diag();
         assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
@@ -1786,6 +1830,125 @@ mod arm64 {
             "init marker must not appear without an initrd: {diag}"
         );
         assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    }
+
+    /// virtio-block 用の backend（1 MiB）。`sentinel` があれば offset 0 に書く。試験の欠陥（容量・書き込みの失敗）は panic にする。
+    fn block_backend(sentinel: Option<&[u8]>) -> MemoryBlockBackend {
+        let mut b = MemoryBlockBackend::new(1 << 20, false).expect("valid block capacity");
+        if let Some(s) = sentinel {
+            b.write_at(0, s).expect("sentinel fits in capacity");
+        }
+        b
+    }
+
+    /// block-read の 3 件に共通の本体（#3947・MVM-1・REPAIR-12）。`block` の台数（0 または 1）で起動し、`expect`（期待する
+    /// marker）がちょうど 1 回、`other`（もう一方の marker）と既定の `MARKER` が 0 回、`GuestShutdown`・起点 vCPU 0・
+    /// エラー 0・UART の取りこぼし 0・期限内であることを照合する。割り込みは FDT の既定の edge-rising の SPI を使う。
+    /// 届いた証跡は marker で取る（page cache の都合で init の read が backend に届かない場合があるため read 回数は見ない）。
+    fn run_block_read(block: Vec<MemoryBlockBackend>, expect: &str, other: &str, case: &str) {
+        let inp = inputs(InitrdKind::BlockRead);
+        let cmdline = force_panic_zero(&inp.cmdline);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1, block);
+        let diag = o.diag();
+        assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+        assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
+        assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+        assert_eq!(o.errors, 0, "run errors: {diag}");
+        assert!(!o.timed_out, "boot timed out: {diag}");
+        assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+        assert_eq!(
+            count_marker_lines(&o.output, expect),
+            1,
+            "marker {expect:?} must appear exactly once: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, other),
+            0,
+            "opposite marker {other:?} must not appear: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default init marker must not appear with the block-read initrd: {diag}"
+        );
+        assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+        eprintln!(
+            "kernel_boot: ok arch=aarch64 case={case} marker={expect:?} elapsed_ms={} exits={}",
+            o.elapsed.as_millis(),
+            o.exits
+        );
+    }
+
+    /// 陽性（#3947）。virtio-block 1 台（offset 0 に sentinel）を block-read の initrd で読ませ、`/dev/vda` の先頭が
+    /// ゲストに届いたときだけ出る一致 marker をちょうど 1 回数える。device は FDT の `virtio,mmio` ノードで見つかる
+    /// （カーネルは `CONFIG_VIRTIO_MMIO`・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS`）。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_reads_sentinel() {
+        run_block_read(
+            vec![block_backend(Some(BLOCK_SENTINEL))],
+            BLOCK_OK_MARKER,
+            BLOCK_MISMATCH_MARKER,
+            "virtio_block_sentinel",
+        );
+    }
+
+    /// 負の対照（#3947）。同じ initrd で block デバイスが無いと `openat("/dev/vda")` が失敗して不一致 marker が出る。
+    /// 期限を使い切らず `GuestShutdown` で速く決定的に終わる。陽性と同じ実行で回すこと。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_block_read_init_without_block_device_reports_mismatch() {
+        run_block_read(
+            vec![],
+            BLOCK_MISMATCH_MARKER,
+            BLOCK_OK_MARKER,
+            "virtio_block_absent",
+        );
+    }
+
+    /// 陰性対照（#3947）。backend が 0 埋めのとき不一致 marker が出て一致 marker が出ない（比較が素通しでないことを示す）。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_detects_mismatch() {
+        run_block_read(
+            vec![block_backend(None)],
+            BLOCK_MISMATCH_MARKER,
+            BLOCK_OK_MARKER,
+            "virtio_block_mismatch",
+        );
+    }
+
+    /// MVM-1・#3947: virtio の SPI は既定で edge-rising（試験の前提。level の構成は `Unimplemented` で拒否される）。
+    #[test]
+    fn mvm1_3947_arm64_virtio_spi_default_is_edge_rising() {
+        use fandhe_container_microvm::arm64_layout::Arm64Layout;
+        use fandhe_container_microvm::interrupt::IrqTrigger;
+        let l = Arm64Layout::new(RAM_SIZE, 1, 1).expect("valid layout");
+        assert_eq!(l.virtio_spi_trigger, IrqTrigger::EdgeRising);
+    }
+
+    /// MVM-1・#3947: initrd の種類ごとの環境変数名・既定パス、sentinel つき backend の読み戻し。
+    #[test]
+    fn mvm1_3947_arm64_block_initrd_paths_and_backend() {
+        assert_eq!(initrd_spec(InitrdKind::None), None);
+        let (env, rel, hint) =
+            initrd_spec(InitrdKind::BlockRead).expect("block-read has an initrd");
+        assert_eq!(env, "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD");
+        assert!(rel.ends_with("aarch64-block-read/initrd.cpio"), "{rel}");
+        assert!(
+            hint.contains("MICROVM_TEST_INITRD_VARIANT=block-read"),
+            "{hint}"
+        );
+        let (env, rel, _) = initrd_spec(InitrdKind::Default).expect("default has an initrd");
+        assert_eq!(env, "FANDHE_CONTAINER_MICROVM_INITRD");
+        assert!(rel.ends_with("aarch64/initrd.cpio"), "{rel}");
+        let mut buf = [0u8; 32];
+        let mut with = block_backend(Some(BLOCK_SENTINEL));
+        with.read_at(0, &mut buf).expect("read sentinel");
+        assert_eq!(&buf, BLOCK_SENTINEL);
+        let mut zero = block_backend(None);
+        zero.read_at(0, &mut buf).expect("read zeros");
+        assert_eq!(buf, [0u8; 32]);
     }
 
     /// 2 CPU がオンラインになった行（Linux v6.12 `arch/arm64/kernel/smp.c` の `smp_cpus_done()`。arm64 固有）。行末一致。
@@ -1818,14 +1981,14 @@ mod arm64 {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm and a kernel with CONFIG_SMP (MVM-1)"]
     fn kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
-        let inp = inputs(true);
+        let inp = inputs(InitrdKind::Default);
         if let Some(p) = smp_disabling_param(&inp.cmdline) {
             precondition(&format!(
                 "cmdline disables SMP (`{p}`); remove it for the two-vCPU case"
             ));
         }
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline, 2);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 2, vec![]);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         // reboot は CPU 0 から行われる（`migrate_to_reboot_cpu`）。

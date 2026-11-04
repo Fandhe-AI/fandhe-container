@@ -20,6 +20,8 @@
 //! # 未実装（REPAIR-3）
 //! - `InterruptACK` の後処理（level 扱いの SPI の deassert / resample。#3863）は [`MmioHandler::with_ack_routes`] で結ぶ。
 //!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。
+//! - `InterruptACK` を処理した vCPU はその線の SPI の宛先として [`MmioHandler::with_ack_learner`] で記録し、WFI の待ちを
+//!   宛先の vCPU だけ起こすのに使う（#3948・MVM-5・REPAIR-5。方式と残余は `crate::hvf_wake`）。
 //! - virtqueue の処理と割り込みへの結線（`QueueNotify` の後続）は #3797（macOS の構成体の組み立て）の担当。
 //!   ここでは通知を捨てず [`MmioHandler::last_queue_notify`] に残すだけで、実際のキュー処理は行わない。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
@@ -29,6 +31,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{AccessDirection, DataAbort};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
 use crate::hvf_loop::ExitAction;
+use crate::hvf_wake::AckRouteLearner;
 use crate::interrupt::InterruptAckRoute;
 use crate::mmio_abort;
 use crate::sys::HvVcpu;
@@ -45,6 +48,8 @@ pub struct MmioHandler {
     /// `InterruptACK` の後処理（level 扱いの線の deassert / resample。#3863）。route の無いデバイスは計数だけ。
     ack_routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>,
     interrupt_acks: u64,
+    /// `InterruptACK` を処理したこの vCPU を、その線の SPI の宛先として記録する（WFI の宛先指定の起床。#3948）。無ければ学習しない。
+    learner: Option<AckRouteLearner<DeviceId>>,
 }
 
 impl MmioHandler {
@@ -69,6 +74,13 @@ impl MmioHandler {
     /// デバイスごとの `InterruptACK` の後処理を足す（#3863・MVM-5）。
     pub fn with_ack_routes(mut self, routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>) -> Self {
         self.ack_routes = routes;
+        self
+    }
+
+    /// `InterruptACK` を処理した vCPU を宛先として学習する部品を足す（#3948・MVM-5・REPAIR-5）。
+    /// 学習は `InterruptAcknowledged` だけで、`DeviceReset` では行わない。
+    pub fn with_ack_learner(mut self, learner: AckRouteLearner<DeviceId>) -> Self {
+        self.learner = Some(learner);
         self
     }
 
@@ -135,6 +147,10 @@ pub fn handle_data_abort(
             access: MmioAccess::Write(MmioWriteOutcome::InterruptAcknowledged),
         } => {
             handler.interrupt_acks = handler.interrupt_acks.saturating_add(1);
+            // この vCPU がその線の割り込みを処理した = 宛先のヒント（#3948）。後処理の失敗とは独立に記録する。
+            if let Some(l) = &handler.learner {
+                l.on_interrupt_ack(device);
+            }
             // 失敗は VM を止める（fail-closed。trigger の失敗と同じ扱い）。
             if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
                 route.on_interrupt_ack()?;

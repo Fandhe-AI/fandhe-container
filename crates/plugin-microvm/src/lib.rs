@@ -29,7 +29,7 @@
 //! # 実装済み（TASK-117.4・#713）
 //! core 役 → plugin-microvm（UDS 境界）→ microVM の起動 → 停止の結合試験を `tests/e2e.rs` に置いた（製品コードの変更なし）。
 //! 「core」役は共有境界 crate の `UdsListener` を試験本体が担う（core 側の起動経路 `BackendKind` は #1869 の設計の 4.9 で未結線）。
-//! 層 A は偽バックエンドで既定集合（unix・KVM 不要）、層 B は実バイナリ + 実 KVM で `#[ignore]`（Linux x86_64・`/dev/kvm`）。
+//! 層 A は偽バックエンドで既定集合（unix・KVM 不要）、層 B は実バイナリ + 実 KVM で `#[ignore]`（Linux x86_64・`/dev/kvm`。macOS aarch64 は実 HVF。#3800）。
 //!
 //! # 実装済み（#3747。PLUG-1・REPAIR-3・REPAIR-5）
 //! SIGTERM で新しい要求の受付をやめ（[`frame_loop::serve_until`]。本体は共有 crate にある。#3774）、`stop_all` で実行中の VM を期限つきに止め、

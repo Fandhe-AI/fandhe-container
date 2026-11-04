@@ -3,7 +3,7 @@
 //! 呼び出し元: `main.rs` が `frame_loop::serve_until` へ渡す。core 側 proxy（#1869 の設計）が送る要求の先頭要素
 //! （操作名）で分岐する暫定契約（本体 `Vec<String>`。型つき本体への置換は #1869 の設計・承認と実装 issue の起票は #2232）。
 //! microVM 本体の操作は [`MicrovmBackend`] 越しに `fandhe-container-microvm` へ委譲する。backend は OS で分かれる:
-//! Linux は `KvmBackend`（同時 4 台・x86 bzImage）、macOS の aarch64 は `HvfBackend`（Hypervisor.framework。同時 1 台・
+//! Linux は `KvmBackend`（同時 4 台。x86_64 は bzImage、aarch64 は arm64 Image と FDT〔#3696〕）、macOS の aarch64 は `HvfBackend`（Hypervisor.framework。同時 1 台・
 //! arm64 Image・cmdline は 2047 バイトまで。TASK-192.18・#3800・MVM-5）、それ以外（macOS x86_64・Windows）は常に
 //! `UNIMPLEMENTED` の `UnsupportedBackend`。上限（同時台数・cmdline）は OS ではなく backend の性質として
 //! [`MicrovmBackend::VM_LIMIT`]・[`MicrovmBackend::CMDLINE_MAX_BYTES`] が持つ。
@@ -49,7 +49,7 @@
 //! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
 //!   Windows は祖先を検査せず、lstat の失敗の分類（`map_lstat_error`）も best-effort（reparse point は未検査。Windows の backend は `UnsupportedBackend` で `start` が `UNIMPLEMENTED` のため VM は起動しない）。
-//! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）、実 Hypervisor.framework の通しは同じ `tests/e2e.rs` の macOS aarch64 の `#[ignore]` 試験（TASK-192.18・#3800）。
+//! - 実 Linux カーネルの起動完走は保証しない（実機での通しの記録は #3781 等で、KVM aarch64 のシリアル割り込みは #3943 で未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）、実 Hypervisor.framework の通しは同じ `tests/e2e.rs` の macOS aarch64 の `#[ignore]` 試験（TASK-192.18・#3800）。
 
 use std::collections::BTreeMap;
 use std::io::Read;

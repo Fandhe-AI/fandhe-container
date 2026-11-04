@@ -24,9 +24,12 @@
 //! # SPI の注入（TASK-192.13・#3795・MVM-5・MVM-1）
 //! [`GicSpiLine`] は `crate::interrupt::InterruptLine` の macOS 実装で、virtio-mmio 1 台分の SPI に対応する。
 //! 呼び出し元は virtio デバイスの完了通知（`complete_block_notify` 等。Linux の `IrqFd` と同じ位置）。
-//! - 通知方式は edge-rising（FDT の `IRQ_TYPE_EDGE_RISING` と一致）。`trigger` は `hv_gic_set_spi(intid, true)` を
-//!   1 回呼ぶだけで、edge の `false` は framework が無視するため呼ばない。ゲストの driver が ICFGR を edge に
-//!   設定している前提で、level 扱いにした場合の deassert（InterruptACK の後の `set_spi(intid, false)`）は対象外。
+//! - 通知方式は FDT の trigger と一致させる（#3863）。既定は edge-rising で、`trigger` は `hv_gic_set_spi(intid, true)` を
+//!   1 回呼ぶだけ（edge の `false` は framework が無視するため呼ばない）。`Arm64Layout::virtio_spi_trigger` を `LevelHigh`
+//!   にした構成では、InterruptACK の後に `crate::interrupt::complete_interrupt_ack` が `resample` を呼び、要因が無ければ
+//!   `set_spi(intid, false)`（deassert）、残っていれば `set_spi(intid, true)`（上げ直し）にする。線の作成
+//!   （[`VmWithGic::spi_line_with_injection`]）で FDT の trigger と注入方式の食い違いを `InvalidArgument` で拒否する。
+//!   呼び出しは data abort の exit 1 回につき高々 1 回で増幅せず、待ちも持たない（REPAIR-5 不要）。
 //! - INTID は `Arm64Layout` の SPI 番号 + 32 で、作成時に `hv_gic_get_spi_interrupt_range` の範囲内か検証する
 //!   （範囲外は `InvalidArgument`。[`HvfGic::probe`] が全 virtio の SPI を VM 作成前に先に検査する）。
 //! - スレッド: `hv_gic_set_spi` を vCPU の owning thread 以外から呼べるかは Apple のドキュメントに記述が無い。
@@ -34,7 +37,7 @@
 //!   `hvf_device_spi_reaches_guest` が非 vCPU スレッドから呼んで観測する（結果の記録は #3803。未観測）。
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
-//!   `trigger` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後の `trigger` は `Internal` で拒否する。
+//!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
@@ -51,7 +54,8 @@ use std::sync::{Arc, RwLock};
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvGicIntid;
-use crate::interrupt::InterruptLine;
+use crate::interrupt::{InterruptLine, IrqTrigger, LineResample};
+use crate::spi::{SpiLine, SpiSink};
 use crate::sys::{GicApi, HvVcpu, HvVm};
 
 fn to_u64(v: usize) -> Result<u64, MicrovmError> {
@@ -192,44 +196,41 @@ impl VmWithGic {
         self.vm.create_vcpu()
     }
 
-    /// `index` 番目の virtio-mmio の SPI を注入する [`GicSpiLine`] を作る（#3795）。
+    /// `index` 番目の virtio-mmio の SPI を注入する [`GicSpiLine`] を作る（#3795）。注入方式は `layout.virtio_spi_trigger`。
     ///
-    /// 借用は返さない（デバイスのスレッドへ move できる）。代わりに生存フラグを共有し、VM の破棄後の `trigger` は拒否する。
+    /// 借用は返さない（デバイスのスレッドへ move できる）。代わりに生存フラグを共有し、VM の破棄後の注入は拒否する。
     /// INTID は GIC 作成時に照会した範囲で検証する。`index` が配置の台数以上なら `InvalidArgument`。
     pub fn spi_line(&self, layout: &Arm64Layout, index: u32) -> Result<GicSpiLine, MicrovmError> {
+        self.spi_line_with_injection(layout, index, layout.virtio_spi_trigger)
+    }
+
+    /// [`Self::spi_line`] の注入方式を明示する版（#3863）。FDT の trigger と食い違えば線を作らず `InvalidArgument`。
+    pub fn spi_line_with_injection(
+        &self,
+        layout: &Arm64Layout,
+        index: u32,
+        injection: IrqTrigger,
+    ) -> Result<GicSpiLine, MicrovmError> {
+        layout.check_virtio_injection(injection)?;
         let (base, count) = self.gic.spi_range();
         let intid = check_spi_intid(layout.virtio_spi(index)?, base, count)?;
-        Ok(GicSpiLine {
+        let sink = HvfGicSink {
             api: GicApi::get()?,
-            intid,
             alive: Arc::clone(&self.alive),
-        })
+        };
+        Ok(GicSpiLine(SpiLine::new(sink, intid, injection)))
     }
 }
 
-/// virtio-mmio 1 台分の SPI を `hv_gic_set_spi` で注入する [`InterruptLine`]（#3795）。契約はモジュール doc の「SPI の注入」。
+/// `hv_gic_set_spi` を呼ぶ [`SpiSink`]。VM の生存フラグの読み取りロックを呼び出しの間保持する。
 #[derive(Debug, Clone)]
-pub struct GicSpiLine {
+pub(crate) struct HvfGicSink {
     api: &'static GicApi,
-    intid: u32,
     alive: Arc<RwLock<bool>>,
 }
 
-const _: () = {
-    const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<GicSpiLine>();
-};
-
-impl GicSpiLine {
-    /// 注入する INTID（検証済み）。
-    pub fn intid(&self) -> u32 {
-        self.intid
-    }
-}
-
-impl InterruptLine for GicSpiLine {
-    /// edge を 1 回起こす（`set_spi(intid, true)` を 1 回。`false` は呼ばない）。
-    fn trigger(&self) -> Result<(), MicrovmError> {
+impl SpiSink for HvfGicSink {
+    fn set_spi(&self, intid: u32, level: bool) -> Result<(), MicrovmError> {
         let guard = self.alive.read().map_err(|_| {
             MicrovmError::new(MicrovmErrorCode::Internal, "gic liveness lock is poisoned")
         })?;
@@ -239,6 +240,38 @@ impl InterruptLine for GicSpiLine {
                 "spi line outlived its vm; refusing to inject",
             ));
         }
-        self.api.set_spi(self.intid, true)
+        self.api.set_spi(intid, level)
+    }
+}
+
+/// virtio-mmio 1 台分の SPI を `hv_gic_set_spi` で注入する [`InterruptLine`]（#3795・#3863）。
+/// 契約はモジュール doc の「SPI の注入」。
+#[derive(Debug, Clone)]
+pub struct GicSpiLine(SpiLine<HvfGicSink>);
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<GicSpiLine>();
+};
+
+impl GicSpiLine {
+    /// 注入する INTID（検証済み）。
+    pub fn intid(&self) -> u32 {
+        self.0.intid()
+    }
+}
+
+impl InterruptLine for GicSpiLine {
+    /// `set_spi(intid, true)` を 1 回呼ぶ（edge は立ち上がり、level は線を上げる）。
+    fn trigger(&self) -> Result<(), MicrovmError> {
+        self.0.trigger()
+    }
+
+    fn injection(&self) -> IrqTrigger {
+        self.0.injection()
+    }
+
+    fn resample(&self, pending: bool) -> Result<LineResample, MicrovmError> {
+        self.0.resample(pending)
     }
 }

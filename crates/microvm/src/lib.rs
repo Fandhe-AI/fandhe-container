@@ -95,6 +95,7 @@ pub mod microvm;
 pub mod mmio_abort;
 pub mod psci;
 pub mod smp_x86;
+pub mod spi;
 pub mod stop;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]

@@ -82,6 +82,28 @@ impl Parsed {
     }
 }
 
+/// MVM-5・MVM-1（#3863）: `virtio_spi_trigger = LevelHigh` の FDT は virtio の第 3 セルが 4（level-high）になる。
+#[test]
+fn mvm5_3863_fdt_level_high_virtio_trigger() {
+    use fandhe_container_microvm::interrupt::IrqTrigger;
+    let mut l = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+    l.virtio_spi_trigger = IrqTrigger::LevelHigh;
+    let cfg = GuestFdtConfig {
+        layout: &l,
+        bootargs: "console=hvc0",
+        initrd: None,
+    };
+    let p = parse(&build_guest_fdt(&cfg).unwrap());
+    assert_eq!(
+        p.cells("/virtio_mmio@a000000", "interrupts"),
+        vec![0, 16, 4]
+    );
+    assert_eq!(
+        p.cells("/virtio_mmio@a000200", "interrupts"),
+        vec![0, 17, 4]
+    );
+}
+
 /// MVM-5・MVM-1: 代表構成の blob を読み戻し、各ノードの値を具体値で照合する。
 #[test]
 fn mvm5_3788_blob_roundtrip_values() {
@@ -258,6 +280,21 @@ fn mvm5_3864_fdt_seventeen_vcpus_affinity() {
     assert_eq!(cpu_nodes(&p).len(), 17);
     assert_eq!(p.cells("/cpus/cpu@100", "reg"), vec![0x100]);
     assert_eq!(p.cells("/cpus/cpu@f", "reg"), vec![0xf]);
+}
+
+/// MVM-5・MVM-1・#3882: `stdout-path` の指す先が ns16550a のノードで、`reg` の base がシリアルの窓であること。
+/// ノード名とパスを別々にハードコードせず、`stdout-path` の値をそのままノードのパスとして引く。
+#[test]
+fn mvm5_3882_fdt_stdout_path_resolves_to_ns16550a() {
+    let l = Arm64Layout::new(256 * MIB, 1, 1)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    let p = fdt_for(&l);
+    let raw = p.get("/chosen", "stdout-path");
+    let path = std::str::from_utf8(raw.strip_suffix(&[0]).unwrap()).unwrap();
+    assert_eq!(p.get(path, "compatible"), b"ns16550a\0");
+    assert_eq!(p.cells(path, "reg")[..2], [0, 0x0900_0000]);
 }
 
 /// MVM-5・MVM-1・#3864: シリアルのノードと stdout-path。

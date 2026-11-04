@@ -35,14 +35,24 @@
 //!   AF_PACKET で `eth0` を上げて固定フレーム（`NET_TX_FRAME`・60 バイト）を 1 回送り、`sendto` が 60 を返したときだけ
 //!   `NET_TX_OK_MARKER` を出す（失敗は `NET_TX_FAILED_MARKER`）。backend が受けたフレームの中に `NET_TX_FRAME` と完全一致する
 //!   ものが 1 件以上あることを照合する（カーネルが IPv6 の RS 等を出すことがあるため、一致以外のフレームは許す）。
-//!   net 0 台の陰性対照では `SIOCGIFINDEX` が失敗し、失敗 marker が出ることを照合する。RX は別 issue。
+//!   net 0 台の陰性対照では `SIOCGIFINDEX` が失敗し、失敗 marker が出ることを照合する。
 //!   カーネルには `CONFIG_PACKET=y` が要る。
+//! - virtio-net の RX の照合（#3919・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_VARIANT=net-rx make microvm-test-initrd-build`
+//!   の initrd（`FANDHE_CONTAINER_MICROVM_NET_RX_INITRD`。既定 `target/microvm-test-initrd/x86_64-net-rx/initrd.cpio`）は、
+//!   AF_PACKET（protocol 0x88B6）で `eth0` を上げ、`SO_RCVTIMEO` 5 秒で `recvfrom` し、`NET_RX_FRAME`（60 バイト）と完全一致
+//!   したときだけ `NET_RX_OK_MARKER` を出す（期限切れ・失敗・不一致 16 回は `NET_RX_FAILED_MARKER`）。陽性は backend に
+//!   フレームを 1 件積んでおく構成で、ok marker 1 回・failed 0 回・`delivered == 1` を照合する。積むのは起動前だが、
+//!   受信ポーラー（`interrupt::poll_net_rx`）は DRIVER_OK と receiveq の ready が揃うまで `recv` を呼ばないので、渡るのは
+//!   DRIVER_OK の後になる（ゲストの受信バッファがまだ無ければ device が 1 件を保持して次の poll で配送する）。Linux の NAPI は
+//!   IFF_UP で有効になり、`/init` は IFF_UP より前に socket を作る。陰性対照は virtio-net はあるがフレームを積まない構成で、
+//!   failed marker 1 回・ok 0 回・`delivered == 0` を照合する（ゲストの待ちは約 5 秒 1 回）。この陰性対照だけでは
+//!   「AF_PACKET が使えず早く失敗した」場合と区別できないため、陽性と同じ実行（`--test-threads=1`）で回すこと。
 //!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。MP テーブル（#3888）でゲストは
 //! IOAPIC モードになり、Linux の `check_timer` が PIT 無しで失敗して止まる可能性が高い。止まる場合は `_CMDLINE` で
 //! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
-//! device model 側の別 issue として扱う。範囲外: aarch64・RX/TX。
+//! device model 側の別 issue として扱う。範囲外: aarch64。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -80,6 +90,19 @@ mod x86 {
         0x02, 0xfc, 0x00, 0x00, 0x38, 0x66, 0x02, 0xfc, 0x00, 0x00, 0x38, 0x65, 0x88, 0xb5, b'f',
         b'a', b'n', b'd', b'h', b'e', b'-', b'm', b'i', b'c', b'r', b'o', b'v', b'm', b'-', b'n',
         b'e', b't', b'-', b't', b'x', b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'-', b'0',
+        b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e', b'f',
+    ];
+    /// net-rx の initrd が成功時・失敗時に出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の
+    /// `net_rx_ok_message`・`net_rx_failed_message`（単体テストで照合）。
+    const NET_RX_OK_MARKER: &str = "fandhe-microvm-test: net rx ok v1";
+    const NET_RX_FAILED_MARKER: &str = "fandhe-microvm-test: net rx failed v1";
+    /// net-rx の initrd が待ち受ける固定の Ethernet フレーム（60 バイト）。宛先は `NET_MAC`（eth0 の MAC）・
+    /// 送信元 02:fc:00:00:38:66・EtherType 0x88B6・ペイロード 46 バイト。正本はスクリプトの `net_rx_frame_header_hex`
+    /// と `net_rx_payload`（単体テストで照合）。
+    const NET_RX_FRAME: [u8; 60] = [
+        0x02, 0xfc, 0x00, 0x00, 0x38, 0x65, 0x02, 0xfc, 0x00, 0x00, 0x38, 0x66, 0x88, 0xb6, b'f',
+        b'a', b'n', b'd', b'h', b'e', b'-', b'm', b'i', b'c', b'r', b'o', b'v', b'm', b'-', b'n',
+        b'e', b't', b'-', b'r', b'x', b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'-', b'0',
         b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd', b'e', b'f',
     ];
     /// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
@@ -431,6 +454,8 @@ mod x86 {
     struct NetCounters {
         sent: AtomicU64,
         recv_calls: AtomicU64,
+        /// `recv` がフレームを返した回数（#3919。ホストからゲストへ渡した件数）。
+        delivered: AtomicU64,
         frames: Mutex<Vec<Vec<u8>>>,
         dropped: AtomicU64,
     }
@@ -472,6 +497,17 @@ mod x86 {
         }
     }
 
+    impl CountingNetBackend {
+        /// 起動前にフレームを 1 件積んだ backend（#3919。net-rx の陽性）。配送は受信ポーラーが DRIVER_OK の後に行う。
+        fn with_inbound(frame: &[u8]) -> (Self, Arc<NetCounters>) {
+            let (mut b, c) = Self::new();
+            b.inner
+                .push_inbound(frame)
+                .expect("push a fixed 60-byte frame");
+            (b, c)
+        }
+    }
+
     impl NetBackend for CountingNetBackend {
         fn send(&mut self, frame: &[u8]) -> Result<(), MicrovmError> {
             self.counters.sent.fetch_add(1, Ordering::Relaxed);
@@ -480,7 +516,11 @@ mod x86 {
         }
         fn recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
             self.counters.recv_calls.fetch_add(1, Ordering::Relaxed);
-            self.inner.recv(buf)
+            let r = self.inner.recv(buf);
+            if matches!(r, Ok(Some(_))) {
+                self.counters.delivered.fetch_add(1, Ordering::Relaxed);
+            }
+            r
         }
     }
 
@@ -502,6 +542,8 @@ mod x86 {
         BlockRead,
         /// `eth0` を上げて固定フレームを 1 回送る版（`FANDHE_CONTAINER_MICROVM_NET_TX_INITRD`。#3894）。
         NetTx,
+        /// `eth0` を上げて固定フレームを受ける版（`FANDHE_CONTAINER_MICROVM_NET_RX_INITRD`。#3919）。
+        NetRx,
     }
 
     fn inputs() -> Inputs {
@@ -525,6 +567,11 @@ mod x86 {
                 "FANDHE_CONTAINER_MICROVM_NET_TX_INITRD",
                 "../../target/microvm-test-initrd/x86_64-net-tx/initrd.cpio",
                 "MICROVM_TEST_INITRD_VARIANT=net-tx make microvm-test-initrd-build",
+            ),
+            InitrdKind::NetRx => (
+                "FANDHE_CONTAINER_MICROVM_NET_RX_INITRD",
+                "../../target/microvm-test-initrd/x86_64-net-rx/initrd.cpio",
+                "MICROVM_TEST_INITRD_VARIANT=net-rx make microvm-test-initrd-build",
             ),
         };
         let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
@@ -966,6 +1013,102 @@ mod x86 {
         );
     }
 
+    /// virtio-net の RX の照合（#3919・MVM-1・REPAIR-12）。backend に積んだ固定フレームが、受信ポーラー経由で
+    /// 実 Linux の virtio_net から AF_PACKET まで届き、initrd が完全一致を確かめて ok marker を出すこと。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_init_receives_frame() {
+        let inp = inputs_for(InitrdKind::NetRx);
+        let (backend, counters) = CountingNetBackend::with_inbound(&NET_RX_FRAME);
+        let config: MicroVmConfig<MemoryBlockBackend, CountingNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend,
+                mac: NET_MAC,
+            }],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let delivered = counters.delivered.load(Ordering::Relaxed);
+        let extra = format!(
+            "net={s:?} frames_sent={} recv_calls={} delivered={delivered} hint=\"{KCONFIG_HINT}\"",
+            counters.sent.load(Ordering::Relaxed),
+            counters.recv_calls.load(Ordering::Relaxed),
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok_with_marker(&o, NET_RX_OK_MARKER, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, NET_RX_FAILED_MARKER),
+            0,
+            "net rx failed marker must not appear: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default init marker must not appear with the net-rx initrd: {diag}"
+        );
+        assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        assert_eq!(delivered, 1, "frames delivered to the guest: {diag}");
+        eprintln!(
+            "kernel_boot: ok case=virtio_net_rx delivered={delivered} elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// 陰性対照（#3919）。virtio-net はあるがフレームを渡さないと、ゲストは期限（約 5 秒）で failed marker を出し、
+    /// ok marker は出ないこと。net 0 台にすると `SIOCSIFFLAGS` で失敗して受信の経路を通らないため、net は 1 台つける。
+    /// 限界: これだけでは「AF_PACKET が使えず早く失敗した」場合と区別できない。経路が使えることは
+    /// 陽性（`kernel_boot_with_virtio_net_init_receives_frame`）が示すので、同じ実行で回す。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_net_rx_init_without_frame_reports_failure() {
+        let inp = inputs_for(InitrdKind::NetRx);
+        let (backend, counters) = CountingNetBackend::new();
+        let config: MicroVmConfig<MemoryBlockBackend, CountingNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend,
+                mac: NET_MAC,
+            }],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let delivered = counters.delivered.load(Ordering::Relaxed);
+        let recv_calls = counters.recv_calls.load(Ordering::Relaxed);
+        let extra = format!(
+            "net={s:?} recv_calls={recv_calls} delivered={delivered} hint=\"{KCONFIG_HINT}\""
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok_with_marker(&o, NET_RX_FAILED_MARKER, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, NET_RX_OK_MARKER),
+            0,
+            "net rx ok marker must not appear without a frame: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default init marker must not appear with the net-rx initrd: {diag}"
+        );
+        assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        assert!(recv_calls >= 1, "rx poller never ran: {diag}");
+        assert_eq!(delivered, 0, "no frame must be delivered: {diag}");
+        eprintln!(
+            "kernel_boot: ok case=virtio_net_rx_no_frame elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
     /// 先頭 `n` バイトの 16 進表記（診断用）。
     fn hex_prefix(b: &[u8], n: usize) -> String {
         b.iter().take(n).map(|x| format!("{x:02x}")).collect()
@@ -1112,6 +1255,59 @@ mod x86 {
             find("net_tx_failed_message=\""),
             vec![NET_TX_FAILED_MARKER.to_owned()]
         );
+    }
+
+    #[test]
+    fn mvm1_3919_net_rx_strings_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        let header = find("net_rx_frame_header_hex=\"");
+        let payload = find("net_rx_payload=\"");
+        assert_eq!(header.len(), 1);
+        assert_eq!(payload.len(), 1);
+        let hdr = header.first().unwrap();
+        let mut frame: Vec<u8> = (0..hdr.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hdr.get(i..i + 2).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(frame.len(), 14);
+        frame.extend_from_slice(payload.first().unwrap().as_bytes());
+        assert_eq!(frame.as_slice(), &NET_RX_FRAME[..]);
+        assert_eq!(NET_RX_FRAME.len(), 60);
+        assert_eq!(frame.get(0..6), Some(&NET_MAC[..]));
+        assert_eq!(
+            frame.get(6..12),
+            Some(&[0x02, 0xfc, 0x00, 0x00, 0x38, 0x66][..])
+        );
+        assert_eq!(frame.get(12..14), Some(&[0x88, 0xb6][..]));
+        assert_ne!(NET_RX_FRAME, NET_TX_FRAME);
+        assert_eq!(
+            find("net_rx_ok_message=\""),
+            vec![NET_RX_OK_MARKER.to_owned()]
+        );
+        assert_eq!(
+            find("net_rx_failed_message=\""),
+            vec![NET_RX_FAILED_MARKER.to_owned()]
+        );
+    }
+
+    #[test]
+    fn mvm1_3919_inbound_backend_delivers_once() {
+        let (mut b, c) = CountingNetBackend::with_inbound(&NET_RX_FRAME);
+        let mut buf = [0u8; 128];
+        assert_eq!(b.recv(&mut buf).unwrap(), Some(60));
+        assert_eq!(buf.get(..60), Some(&NET_RX_FRAME[..]));
+        assert_eq!(b.recv(&mut buf).unwrap(), None);
+        assert_eq!(c.delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(c.recv_calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1363,6 +1559,34 @@ mod other {
             mem_size: 1 << 20,
             block: vec![],
             net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_init_receives_frame() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65],
+            }],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_net_rx_init_without_frame_reports_failure() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65],
+            }],
         });
     }
 

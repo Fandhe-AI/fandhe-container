@@ -134,6 +134,8 @@ pub(crate) mod consts {
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IO(KVMIO, 0x60)`（x86_64 のみ定義。vCPU を作る前に発行する）。
     pub const KVM_CREATE_IRQCHIP: u64 = super::io(super::KVMIO, 0x60);
+    /// `_IOW(KVMIO, 0x61, struct kvm_irq_level)`（8 バイト。x86_64 のみ。in-kernel irqchip の線を駆動する。#3918）。
+    pub const KVM_IRQ_LINE: u64 = super::iow(super::KVMIO, 0x61, 8);
     /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
     pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
     /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
@@ -597,6 +599,24 @@ struct KvmIoeventfd {
     pad: [u8; 36],
 }
 
+/// `struct kvm_irq_level`（`linux/kvm.h`。8 バイト。#3918・MVM-1）。`irq` は共用体 `{ __u32 irq; __s32 status; }`
+/// の `irq` 側（`KVM_IRQ_LINE` では入力のみ。結果の書き戻しは `KVM_IRQ_LINE_STATUS`〔番号 0x67〕だけ）。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KvmIrqLevel {
+    irq: u32,
+    level: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<KvmIrqLevel>() == 8);
+    assert!(std::mem::align_of::<KvmIrqLevel>() == 4);
+    assert!(std::mem::offset_of!(KvmIrqLevel, irq) == 0);
+    assert!(std::mem::offset_of!(KvmIrqLevel, level) == 4);
+};
+
 const _: () = {
     assert!(std::mem::size_of::<KvmIrqfd>() == 32);
     assert!(std::mem::align_of::<KvmIrqfd>() == 4);
@@ -625,6 +645,9 @@ const _: () = {
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = assert!(consts::KVM_CREATE_IRQCHIP == 0xAE60);
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = assert!(consts::KVM_IRQ_LINE == 0x4008_AE61);
 
 /// `kvm_run.immediate_exit` のオフセット（`linux/kvm.h`）。
 const IMMEDIATE_EXIT_OFFSET: usize = 1;
@@ -997,6 +1020,39 @@ pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
     #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
     {
         let _ = vm;
+        Err(SysError::Unsupported)
+    }
+}
+
+/// `KVM_IRQ_LINE`（VM fd。x86_64 のみ。in-kernel irqchip が前提）。GSI `irq` の線を `level` に駆動する。
+/// edge 注入の `KVM_IRQFD` と違い、線の値そのものを持つので level 線（`LevelInterruptLine`）に使える（#3918・MVM-1）。
+/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式。#3696・#3898）。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn kvm_irq_line(vm: BorrowedFd<'_>, irq: u32, level: bool) -> Result<(), SysError> {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if !consts::SUPPORTED {
+            return Err(SysError::Unsupported);
+        }
+        let arg = KvmIrqLevel {
+            irq,
+            level: u32::from(level),
+        };
+        // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 8 バイト（const assert 済み・ioctl 番号のサイズ符号と一致）の
+        // ローカルの借用で、カーネルはこの 8 バイトを読むだけで書かず（結果の書き戻しは `KVM_IRQ_LINE_STATUS` だけ）、
+        // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+        let r = unsafe {
+            ioctl(
+                vm.as_raw_fd(),
+                consts::KVM_IRQ_LINE,
+                &arg as *const KvmIrqLevel,
+            )
+        };
+        if r < 0 { Err(last_error()) } else { Ok(()) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    {
+        let _ = (vm, irq, level);
         Err(SysError::Unsupported)
     }
 }
@@ -2136,6 +2192,16 @@ mod tests {
         assert_eq!(consts::KVM_CREATE_IRQCHIP, 0xAE60);
     }
 
+    /// MVM-1・#3918: `KVM_IRQ_LINE` の番号と `kvm_irq_level` のレイアウトの具体値（`linux/kvm.h`）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kvm_irq_line_constant_matches_kernel_abi() {
+        assert_eq!(consts::KVM_IRQ_LINE, 0x4008_AE61);
+        assert_eq!(std::mem::size_of::<KvmIrqLevel>(), 8);
+        assert_eq!(std::mem::offset_of!(KvmIrqLevel, irq), 0);
+        assert_eq!(std::mem::offset_of!(KvmIrqLevel, level), 4);
+    }
+
     /// MVM-1・TASK-74.2.3: KVM でない fd への ioctl は ENOTTY（unsafe 経路を KVM 無しで通す）。
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
@@ -2157,6 +2223,10 @@ mod tests {
         );
         #[cfg(target_arch = "x86_64")]
         assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Os(25)));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(kvm_irq_line(f.as_fd(), 4, true), Err(SysError::Os(25)));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(kvm_irq_line(f.as_fd(), 4, true), Err(SysError::Unsupported));
         #[cfg(target_arch = "aarch64")]
         assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Unsupported));
     }

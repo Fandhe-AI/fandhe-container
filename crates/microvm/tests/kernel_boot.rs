@@ -54,9 +54,9 @@
 //! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
 //! device model 側の別 issue として扱う。
 //! aarch64 は `mod arm64`（#3897・#3898。陽性と initrd 無しの負の対照の 2 件。`console=ttyS0` で FDT の `ns16550a` を選び、
-//! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。vCPU 2 台の陽性 1 件を #3899 で足し、3 件。2 台は `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001` を照合する）。シリアルはポーリング（FDT に `interrupts` 無し。
-//! Linux の 8250 は irq = 0 で timer ポーリング）で、送信は timer の周期ごとに進む。`/init` は write の直後に reboot するため、
-//! marker が出切る前に `GuestShutdown` になり marker 0 回で落ちた場合は、試験の欠陥ではなく割り込み未結線の帰結で、#3943 で直す。
+//! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。vCPU 2 台の陽性 1 件を #3899 で足し、3 件。2 台は `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001` を照合する）。シリアルは SPI 1（INTID 33）の level 割り込み
+//! （FDT は `interrupts = <0 1 4>`。`KVM_IRQ_LINE` で結線。#3943）で、送信は THRE 割り込みで進む（以前の割り込みなしのポーリングでは
+//! 送信が timer の周期にしか進まず、reboot 直前の marker が出切らず 0 回になりえた）。それでも marker 0 回で落ちた場合は #3781 で観測する。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -1475,7 +1475,7 @@ mod x86 {
 /// write の後に `reboot(RESTART)`）で `assemble` → `load_kernel` → `start` を通し、PSCI SYSTEM_RESET が
 /// `KVM_EXIT_SYSTEM_EVENT` として `StopReason::GuestShutdown` に分類されること（#3896）を照合する。
 /// ホスト要件: Linux aarch64・`/dev/kvm` の読み書き（root 不要）・in-kernel vGICv3（GICv2 のみのホストは `assemble` で失敗）・
-/// `KVM_CAP_ARM_PSCI_0_2`。シリアルは MMIO の ns16550a をポーリングで結線済み（#3898。割り込みは #3943）で、停止理由・起点 vCPU・
+/// `KVM_CAP_ARM_PSCI_0_2`。シリアルは MMIO の ns16550a を SPI 1 の level 割り込みで結線済み（#3898・#3943）で、停止理由・起点 vCPU・
 /// エラー件数・期限に加え、marker の回数と UART の取りこぼし 0 を照合する。範囲外: SMP（#3899）・virtio。
 /// x86 の同名ヘルパーと同じ契約の入力検査を複製している（x86 側の件数・挙動を変えないため）。
 /// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。

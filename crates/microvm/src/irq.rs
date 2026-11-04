@@ -7,6 +7,7 @@
 //! [`IoEventFd::consume`] で回数を読む。[`IrqFd`] は VM fd を dup して所有する（VM 構成体が VM fd と一緒に保持できる。TASK-75.2）。
 //! [`IoEventFd`] は `'vm` の借用。どちらも drop で登録を解く。
 //! #3918 で x86_64 の COM1 用に `KVM_IRQ_LINE` の level 線 [`IrqLevelLine`] を足した（`VmFd::register_irq_line` が返す）。
+//! #3943 で aarch64 のシリアルの SPI（INTID 33）にも同じ線を広げた（`VmFd::register_spi_line`。`irq` は `Arm64SpiIrqLine` のエンコード）。
 //!
 //! # 待ちを持たない設計（REPAIR-5）
 //! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で
@@ -24,7 +25,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::interrupt::{IrqLevel, LevelInterruptLine};
 use crate::sys::{self, SysError};
 
@@ -125,7 +126,7 @@ impl Drop for IrqFd {
     }
 }
 
-/// `KVM_IRQ_LINE` で GSI を駆動する level 線（x86_64 のみ。#3918・MVM-1・REPAIR-3）。
+/// `KVM_IRQ_LINE` で割り込み線を駆動する level 線（x86_64 は GSI、aarch64 は vGIC の SPI。#3918・#3943・MVM-1・REPAIR-3）。
 ///
 /// 呼び出し元は `SerialConsole::port_device_with_irq`（UART のモデルが線の値を決めて `set_level` で伝える。
 /// `crate::microvm::assemble` が COM1 = IRQ 4 に結ぶ）。edge 注入の [`IrqFd`] と違い線の値を持つので level 線に使える。
@@ -138,29 +139,35 @@ impl Drop for IrqFd {
 /// 新しい要因ごとに立ち上がりが 1 回起きる。ISR が最後の IIR 読み出しの後 `iret` の前に入力が届くと余分な配送が 1 回起きるが、
 /// そのときの IIR は 0x01（`IRQ_NONE`）で無害。
 ///
+/// # aarch64（#3943）
+/// `irq` フィールドは `Arm64SpiIrqLine` のエンコード（種別 SPI = 1 を 24 ビット目、INTID を下位 16 ビット。INTID 33 で `0x0100_0021`）。
+/// irqfd の GSI は SPI 番号（`GuestSpi::dt_cell()` = 1）だが、`KVM_IRQ_LINE` は INTID（`GuestSpi::intid()` = 33）を取る。
+/// 取り違えるとカーネルは `EINVAL`（INTID < 32）か別の SPI を駆動する。vGIC が level の SPI の `line_level` を保持するので
+/// resamplefd は要らない（`reject_level_spi` が irqfd / virtio の level を拒否するのとは別の話で、ここは「直さない」こと）。
+///
 /// VM fd の dup を所有する。drop では何もしない（VM fd が全部 close されると irqchip ごと破棄され、線の deassert は不要）。
 /// カーネルの一次情報は v6.12 の `include/uapi/linux/kvm.h`（`struct kvm_irq_level`・`KVM_IRQ_LINE`）と `arch/x86/kvm/x86.c` の
 /// `kvm_vm_ioctl_irq_line`（irqchip が無いと `-ENXIO`。結果の書き戻しは `KVM_IRQ_LINE_STATUS` だけ）。
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub struct IrqLevelLine {
     vm: OwnedFd,
     irq: u32,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl IrqLevelLine {
     pub(crate) fn new(vm: OwnedFd, irq: u32) -> Self {
         Self { vm, irq }
     }
 
-    /// 駆動する GSI。
+    /// `kvm_irq_level.irq` に入れる値（x86_64 は GSI、aarch64 は SPI のエンコード済みの値）。
     pub fn irq(&self) -> u32 {
         self.irq
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl LevelInterruptLine for IrqLevelLine {
     fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
         sys::kvm_irq_line(self.vm.as_fd(), self.irq, level == IrqLevel::High).map_err(|e| {
@@ -169,6 +176,36 @@ impl LevelInterruptLine for IrqLevelLine {
                 format!("KVM_IRQ_LINE failed ({e:?})"),
             )
         })
+    }
+}
+
+/// aarch64 の `KVM_IRQ_LINE` に渡す SPI の `irq` フィールド（種別 SPI + INTID）。壊れた値を表せない型（#3943・REPAIR-2）。
+///
+/// INTID は SPI の範囲 32..=1019 に限る（範囲外は `InvalidArgument`。1020 以上は特殊 INTID、31 以下は SGI / PPI で
+/// カーネルも `EINVAL`）。`crate::arm64_layout::GuestSpi::intid` の値から作る。x86_64 でも単体試験が走るよう arch で外さない。
+/// 一次情報は Linux v6.12 の `arch/arm64/include/uapi/asm/kvm.h`（`KVM_ARM_IRQ_*`）と `arch/arm64/kvm/arm.c` の `kvm_vm_ioctl_irq_line`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) struct Arm64SpiIrqLine(u32);
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+impl Arm64SpiIrqLine {
+    /// SPI の INTID（32..=1019）から作る。
+    pub(crate) fn from_intid(intid: u32) -> Result<Self, MicrovmError> {
+        if !(32..=1019).contains(&intid) {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "spi intid is outside 32..=1019",
+            ));
+        }
+        sys::arm64_spi_irq_field(intid).map(Self).ok_or_else(|| {
+            MicrovmError::new(MicrovmErrorCode::InvalidArgument, "spi intid does not fit")
+        })
+    }
+
+    /// `kvm_irq_level.irq` にそのまま入れる値。
+    pub(crate) fn raw(self) -> u32 {
+        self.0
     }
 }
 
@@ -228,6 +265,21 @@ impl Drop for IoEventFd<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MVM-1・#3943: SPI の `irq` フィールドは INTID 33 で `0x0100_0021`、範囲外は `InvalidArgument`（全 arch で走る）。
+    #[test]
+    fn mvm1_3943_arm64_spi_irq_line_encoding() {
+        assert_eq!(Arm64SpiIrqLine::from_intid(33).unwrap().raw(), 0x0100_0021);
+        assert_eq!(Arm64SpiIrqLine::from_intid(32).unwrap().raw(), 0x0100_0020);
+        assert_eq!(
+            Arm64SpiIrqLine::from_intid(1019).unwrap().raw(),
+            0x0100_03fb
+        );
+        for bad in [0, 1, 31, 1020, 0x1_0000, u32::MAX] {
+            let e = Arm64SpiIrqLine::from_intid(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument, "intid {bad}");
+        }
+    }
 
     /// MVM-1・TASK-74.2.3: eventfd の signal / consume は回数を合算し、空なら待たずに 0。
     #[test]

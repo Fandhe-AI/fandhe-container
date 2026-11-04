@@ -134,7 +134,8 @@ pub(crate) mod consts {
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IO(KVMIO, 0x60)`（x86_64 のみ定義。vCPU を作る前に発行する）。
     pub const KVM_CREATE_IRQCHIP: u64 = super::io(super::KVMIO, 0x60);
-    /// `_IOW(KVMIO, 0x61, struct kvm_irq_level)`（8 バイト。x86_64 のみ。in-kernel irqchip の線を駆動する。#3918）。
+    /// `_IOW(KVMIO, 0x61, struct kvm_irq_level)`（8 バイト。x86_64 と aarch64。in-kernel irqchip の線を駆動する。#3918・#3943）。
+    /// x86_64 は GSI、aarch64 は vGIC の SPI / PPI（`irq` の配置は [`arm64_spi_irq_field`]）。
     pub const KVM_IRQ_LINE: u64 = super::iow(super::KVMIO, 0x61, 8);
     /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
     pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
@@ -260,9 +261,13 @@ pub(crate) mod consts {
     /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
+    /// `_IOW(KVMIO, 0x61, struct kvm_irq_level)`（8 バイト。vGIC の SPI / PPI を駆動する。#3943）。
+    pub const KVM_IRQ_LINE: u64 = super::iow(super::KVMIO, 0x61, 8);
     pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
     /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
     pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);
+    /// `KVM_CAP_IRQCHIP`（0。arm64 のカーネルは in-kernel vGIC を持てるとき 1 を返す。#3943）。
+    pub const KVM_CAP_IRQCHIP: u64 = 0;
     pub const KVM_CAP_IRQFD: u64 = 32;
     pub const KVM_CAP_IOEVENTFD: u64 = 36;
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
@@ -760,7 +765,10 @@ struct KvmIoeventfd {
 
 /// `struct kvm_irq_level`（`linux/kvm.h`。8 バイト。#3918・MVM-1）。`irq` は共用体 `{ __u32 irq; __s32 status; }`
 /// の `irq` 側（`KVM_IRQ_LINE` では入力のみ。結果の書き戻しは `KVM_IRQ_LINE_STATUS`〔番号 0x67〕だけ）。
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct KvmIrqLevel {
@@ -768,7 +776,10 @@ struct KvmIrqLevel {
     level: u32,
 }
 
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+))]
 const _: () = {
     assert!(std::mem::size_of::<KvmIrqLevel>() == 8);
     assert!(std::mem::align_of::<KvmIrqLevel>() == 4);
@@ -805,8 +816,26 @@ const _: () = {
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = assert!(consts::KVM_CREATE_IRQCHIP == 0xAE60);
 
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+))]
 const _: () = assert!(consts::KVM_IRQ_LINE == 0x4008_AE61);
+
+/// arm64 の `KVM_IRQ_LINE` の `irq` フィールドの配置（`arch/arm64/include/uapi/asm/kvm.h`。Linux v6.12）。
+/// `KVM_ARM_IRQ_TYPE_SHIFT`(24) に種別（SPI = 1）、`KVM_ARM_IRQ_NUM_SHIFT`(0) に INTID（16 ビット）を置く。
+/// SPI では vcpu_index は無視されるので 0。`libc` に対応物が無い（カーネルの uapi 定数のみ）ため、機械照合ではなく
+/// 値の const assert で固定する（#3943）。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+const _: () = {
+    assert!(KVM_ARM_IRQ_TYPE_SHIFT == 24);
+    assert!(KVM_ARM_IRQ_TYPE_SPI == 1);
+    assert!(KVM_ARM_IRQ_NUM_MASK == 0xffff);
+    assert!(match arm64_spi_irq_field(33) {
+        Some(v) => v == 0x0100_0021,
+        None => false,
+    });
+};
 
 /// `kvm_run.immediate_exit` のオフセット（`linux/kvm.h`）。
 const IMMEDIATE_EXIT_OFFSET: usize = 1;
@@ -1183,12 +1212,36 @@ pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
     }
 }
 
-/// `KVM_IRQ_LINE`（VM fd。x86_64 のみ。in-kernel irqchip が前提）。GSI `irq` の線を `level` に駆動する。
-/// edge 注入の `KVM_IRQFD` と違い、線の値そのものを持つので level 線（`LevelInterruptLine`）に使える（#3918・MVM-1）。
-/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式で、vGIC の irqfd〔#3696〕。シリアルの割り込みは #3943）。
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+/// arm64 の `KVM_IRQ_LINE` の `irq` フィールドの種別の位置（`KVM_ARM_IRQ_TYPE_SHIFT`。#3943）。
+pub(crate) const KVM_ARM_IRQ_TYPE_SHIFT: u32 = 24;
+/// arm64 の種別 SPI（`KVM_ARM_IRQ_TYPE_SPI`。#3943）。
+pub(crate) const KVM_ARM_IRQ_TYPE_SPI: u32 = 1;
+/// arm64 の `irq` フィールドの INTID 部のマスク（`KVM_ARM_IRQ_NUM_MASK`。#3943）。
+pub(crate) const KVM_ARM_IRQ_NUM_MASK: u32 = 0xffff;
+
+/// arm64 の `KVM_IRQ_LINE` の `irq` フィールドを SPI の INTID から作る（#3943・MVM-1）。
+/// `(KVM_ARM_IRQ_TYPE_SPI << 24) | intid`。INTID が 16 ビットに収まらないときは `None`（呼び出し側が範囲を先に検査する）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const fn arm64_spi_irq_field(intid: u32) -> Option<u32> {
+    if intid > KVM_ARM_IRQ_NUM_MASK {
+        return None;
+    }
+    Some((KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | intid)
+}
+
+/// `KVM_IRQ_LINE`（VM fd。x86_64 と aarch64。in-kernel irqchip が前提）。`irq` の線を `level` に駆動する。
+/// `irq` は `kvm_irq_level.irq` にそのまま入る値で、x86_64 は GSI、aarch64 は `arm64_spi_irq_field` のエンコード済みの値。
+/// edge 注入の `KVM_IRQFD` と違い、線の値そのものを持つので level 線（`LevelInterruptLine`）に使える（#3918・#3943・MVM-1）。
+/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`。
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 pub(crate) fn kvm_irq_line(vm: BorrowedFd<'_>, irq: u32, level: bool) -> Result<(), SysError> {
-    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_pointer_width = "64"
+    ))]
     {
         if !consts::SUPPORTED {
             return Err(SysError::Unsupported);
@@ -1209,7 +1262,10 @@ pub(crate) fn kvm_irq_line(vm: BorrowedFd<'_>, irq: u32, level: bool) -> Result<
         };
         if r < 0 { Err(last_error()) } else { Ok(()) }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+    #[cfg(not(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_pointer_width = "64"
+    )))]
     {
         let _ = (vm, irq, level);
         Err(SysError::Unsupported)
@@ -2495,13 +2551,22 @@ mod tests {
     }
 
     /// MVM-1・#3918: `KVM_IRQ_LINE` の番号と `kvm_irq_level` のレイアウトの具体値（`linux/kvm.h`）。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn kvm_irq_line_constant_matches_kernel_abi() {
         assert_eq!(consts::KVM_IRQ_LINE, 0x4008_AE61);
         assert_eq!(std::mem::size_of::<KvmIrqLevel>(), 8);
         assert_eq!(std::mem::offset_of!(KvmIrqLevel, irq), 0);
         assert_eq!(std::mem::offset_of!(KvmIrqLevel, level), 4);
+    }
+
+    /// MVM-1・#3943: arm64 の `irq` フィールドの合成（INTID 33 は `0x0100_0021`、16 ビット超は `None`）。全 arch で走る。
+    #[test]
+    fn mvm1_3943_arm64_spi_irq_field_values() {
+        assert_eq!(arm64_spi_irq_field(33), Some(0x0100_0021));
+        assert_eq!(arm64_spi_irq_field(32), Some(0x0100_0020));
+        assert_eq!(arm64_spi_irq_field(0xffff), Some(0x0100_ffff));
+        assert_eq!(arm64_spi_irq_field(0x1_0000), None);
     }
 
     /// MVM-1・TASK-74.2.3: KVM でない fd への ioctl は ENOTTY（unsafe 経路を KVM 無しで通す）。
@@ -2528,7 +2593,10 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(kvm_irq_line(f.as_fd(), 4, true), Err(SysError::Os(25)));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(kvm_irq_line(f.as_fd(), 4, true), Err(SysError::Unsupported));
+        assert_eq!(
+            kvm_irq_line(f.as_fd(), 0x0100_0021, true),
+            Err(SysError::Os(25))
+        );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Unsupported));
     }

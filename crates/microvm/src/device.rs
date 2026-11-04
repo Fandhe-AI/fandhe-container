@@ -18,6 +18,7 @@
 //! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 `VmFd::register_irq_line`（`KVM_IRQ_LINE`）を足した。
+//! #3943（MVM-1）で aarch64 のシリアルの SPI（INTID 33）も同じ `KVM_IRQ_LINE` の level 線にした（`VmFd::register_spi_line`。vGIC の `init()` の後）。
 //! #3696（MVM-1）で aarch64 の vGICv3（`KVM_CREATE_DEVICE`。`VgicV3`）と起動レジスタ（`KVM_SET_ONE_REG`。`VcpuFd::set_arm64_boot_state`）を足した。
 //! resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
@@ -65,7 +66,7 @@ use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, ExitValue, VcpuExit};
 use crate::interrupt::{InterruptLine, IoEventSpec};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::irq::IrqLevelLine;
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
 use crate::sys::{self, SysError};
@@ -1357,8 +1358,11 @@ enum IrqStage {
     GetDeviceAttr,
     Irqfd,
     Ioeventfd,
-    /// `KVM_IRQ_LINE`（#3918）。x86_64 の COM1 の level 線。
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    /// `KVM_IRQ_LINE`（#3918・#3943）。x86_64 の COM1 と aarch64 のシリアルの SPI の level 線。
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     IrqLine,
 }
 
@@ -1412,6 +1416,18 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
                 "KVM_GET_DEVICE_ATTR rejected the attribute (vGIC not ready or unsupported)",
             )
         }
+        // aarch64 の `KVM_IRQ_LINE`（SPI）は vGICv3 の `CTRL_INIT` 前だと `-EBUSY`（`kvm_vgic_inject_irq` の `vgic_lazy_init`。
+        // GICv3 は遅延初期化しない）、INTID の範囲外は `-EINVAL`（#3943）。EBUSY は汎用の AlreadyExists より前で拾う。
+        SysError::Os(EBUSY) | SysError::Os(ENODEV) if stage == IrqStage::IrqLine => {
+            MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "KVM_IRQ_LINE requires an initialized interrupt controller (vGIC)",
+            )
+        }
+        SysError::Os(EINVAL) if stage == IrqStage::IrqLine => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM_IRQ_LINE rejected the interrupt number",
+        ),
         SysError::Os(EEXIST) | SysError::Os(EBUSY) => MicrovmError::new(
             MicrovmErrorCode::AlreadyExists,
             format!("{name}: already registered"),
@@ -1617,12 +1633,13 @@ impl VmFd {
         Ok(IrqFd::registered(vm_fd, event, gsi))
     }
 
-    /// GSI `irq` を `KVM_IRQ_LINE` で駆動する level 線を作る（x86_64 のみ。#3918・MVM-1）。
+    /// `irq`（`kvm_irq_level.irq` にそのまま入れる値）を `KVM_IRQ_LINE` で駆動する level 線を作る（x86_64 と aarch64。#3918・#3943・MVM-1）。
+    /// x86_64 は GSI、aarch64 は SPI のエンコード済みの値（aarch64 の `register_spi_line` が作る）。
     ///
     /// UART の割り込み（`crate::interrupt::LevelInterruptLine`）の結線に使う。`KVM_IRQFD` は edge 注入で線の値を持てないため
     /// 別に持つ。irqchip を先に作ること。作成時に `level = 0` を 1 回発行して irqchip の有無をここで検証する
     /// （無ければ `FailedPrecondition`。fail-closed）。VM fd の dup を所有するので借用を持たない。
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn register_irq_line(&self, irq: u32) -> Result<IrqLevelLine, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
         let vm_fd = self.fd.as_fd().try_clone_to_owned().map_err(|e| {
@@ -1642,6 +1659,17 @@ impl VmFd {
         sys::kvm_irq_line(self.fd.as_fd(), irq, false)
             .map_err(|e| classify_irq_error(IrqStage::IrqLine, e))?;
         Ok(IrqLevelLine::new(vm_fd, irq))
+    }
+
+    /// SPI の INTID（`GuestSpi::intid()`。例: シリアルの 33）を `KVM_IRQ_LINE` で駆動する level 線を作る（aarch64 のみ。#3943・MVM-1）。
+    ///
+    /// vGIC の `init()` の**後**に呼ぶこと（前は `FailedPrecondition`）。irqfd の GSI（SPI 番号）ではなく INTID を取る。
+    /// INTID が 32..=1019 の外なら `InvalidArgument`。作成時に `level = 0` を 1 回発行して irqchip の状態を検証する（fail-closed）。
+    /// `KVM_IRQ_LINE` は同期・非ブロックの ioctl で待ちを持たないため REPAIR-5 のタイムアウトは要らない。
+    #[cfg(target_arch = "aarch64")]
+    pub fn register_spi_line(&self, intid: u32) -> Result<IrqLevelLine, MicrovmError> {
+        let irq = crate::irq::Arm64SpiIrqLine::from_intid(intid)?;
+        self.register_irq_line(irq.raw())
     }
 
     /// ゲストの `spec` への書き込みを VM exit なしで eventfd へ通す（`KVM_IOEVENTFD`）。
@@ -2894,6 +2922,13 @@ mod tests {
                 C::FailedPrecondition,
             ),
             (IrqStage::IrqLine, SysError::Os(5), C::Internal),
+            // #3943: aarch64 の SPI。EINVAL は番号の拒否、vGIC の初期化前は EBUSY。
+            (IrqStage::IrqLine, SysError::Os(EINVAL), C::InvalidArgument),
+            (
+                IrqStage::IrqLine,
+                SysError::Os(EBUSY),
+                C::FailedPrecondition,
+            ),
             (IrqStage::Ioeventfd, SysError::Os(EEXIST), C::AlreadyExists),
             (
                 IrqStage::CreateIrqchip,
@@ -2925,6 +2960,14 @@ mod tests {
         }
         let m = classify_irq_error(IrqStage::Irqfd, SysError::Os(5));
         assert_eq!(m.message(), "KVM_IRQFD failed (os error 5)");
+        assert_eq!(
+            classify_irq_error(IrqStage::IrqLine, SysError::Os(EBUSY)).message(),
+            "KVM_IRQ_LINE requires an initialized interrupt controller (vGIC)"
+        );
+        assert_eq!(
+            classify_irq_error(IrqStage::IrqLine, SysError::Os(EINVAL)).message(),
+            "KVM_IRQ_LINE rejected the interrupt number"
+        );
     }
 
     /// MVM-1・#3696: aarch64 の vGIC（`KVM_CREATE_DEVICE` / `KVM_SET_DEVICE_ATTR` / `KVM_GET_DEVICE_ATTR`）と

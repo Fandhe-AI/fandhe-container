@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.11・#3794）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -205,7 +205,7 @@ const VCPU_THREAD_DEADLINE: Duration = Duration::from_secs(20);
 
 /// vCPU 専用スレッドの実行ループ（TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5）。
 /// (A) `b .` のゲストが別スレッドからの停止要求で 1 秒以内に `Requested` で終わる。
-/// (B) `hvc #0` のゲストは HVC のスタブが `Unimplemented` を返し、`Failed(Unimplemented)` で終わって分類が HVC だったと観測される。
+/// (B) X0 = 未知の関数 ID（0x8400_00ff）の `hvc #0` は PSCI が NOT_SUPPORTED を返して再開し、VM は止まらず、停止要求で `Requested` になる（観測器の HVC は 1 件）。
 /// 1 プロセス 1 VM のため、VM は 1 回だけ作って 2 場面を順に走らせる。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
@@ -263,9 +263,10 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
         hvc: HvcHandler::new(),
         timer: TimerHandler::new(),
     };
-    let setup = |pc: u64| {
+    let setup = |pc: u64, x0: u64| {
         move |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
             vcpu.set_reg(HvReg::PC, pc)?;
+            vcpu.set_reg(HvReg::x(0).unwrap(), x0)?;
             // EL1h と DAIF のマスク。
             vcpu.set_reg(HvReg::CPSR, 0x3c5)
         }
@@ -277,7 +278,7 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
         observer: Some(counts.clone()),
         ..VcpuThreadConfig::default()
     };
-    let handle = VcpuThread::spawn(Arc::clone(&vm), setup(BASE), handlers(), config).unwrap();
+    let handle = VcpuThread::spawn(Arc::clone(&vm), setup(BASE, 0), handlers(), config).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     assert!(!handle.is_finished());
     let t = Instant::now();
@@ -286,24 +287,31 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     assert_eq!(counts.count(ExitKind::Hvc), 0);
 
-    // 場面 B: HVC のスタブで Failed(Unimplemented)。
+    // 場面 B: 未知の関数 ID の HVC は NOT_SUPPORTED で再開し、VM は止まらない。
     let counts = Arc::new(ExitCounts::new());
     let config = VcpuThreadConfig {
         observer: Some(counts.clone()),
         ..VcpuThreadConfig::default()
     };
-    let handle =
-        VcpuThread::spawn(Arc::clone(&vm), setup(BASE + 0x100), handlers(), config).unwrap();
+    let handle = VcpuThread::spawn(
+        Arc::clone(&vm),
+        setup(BASE + 0x100, 0x8400_00ff),
+        handlers(),
+        config,
+    )
+    .unwrap();
     let start = Instant::now();
-    while !handle.is_finished() && start.elapsed() < Duration::from_secs(5) {
+    while counts.count(ExitKind::Hvc) < 1 && start.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(handle.is_finished());
-    let report = handle.stop(Duration::from_secs(1)).unwrap();
-    assert_eq!(
-        report.reason,
-        StopReason::Failed(MicrovmErrorCode::Unimplemented)
+    assert_eq!(counts.count(ExitKind::Hvc), 1);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !handle.is_finished(),
+        "unknown psci id must not stop the vm"
     );
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
     assert_eq!(counts.count(ExitKind::Hvc), 1);
 
     // スレッドが持っていた Arc は stop の Ok で解放済み。
@@ -556,4 +564,145 @@ fn hvf_device_spi_reaches_guest() {
     drop(vcpu);
     mapping.unmap().unwrap();
     drop(vgic);
+}
+/// PSCI のゲストコード（IPA 0x4000_0000 から）。VERSION を呼び、1.0 なら SYSTEM_OFF を呼ぶ。不一致・続行時は `b .`。
+const PSCI_GUEST_CODE: [u32; 9] = [
+    0xD2B0_8000, // 0x00: movz x0, #0x8400, lsl #16   ; PSCI_VERSION
+    0xD400_0002, // 0x04: hvc  #0
+    0xD2A0_0021, // 0x08: movz x1, #0x1, lsl #16      ; 0x0001_0000
+    0xEB01_001F, // 0x0c: cmp  x0, x1
+    0x5400_0081, // 0x10: b.ne 0x20
+    0xD2B0_8000, // 0x14: movz x0, #0x8400, lsl #16
+    0xF280_0100, // 0x18: movk x0, #0x8               ; SYSTEM_OFF
+    0xD400_0002, // 0x1c: hvc  #0
+    0x1400_0000, // 0x20: b    .
+];
+
+/// `hvf_device_psci_version_then_system_off` の全体期限。
+const PSCI_DEADLINE: Duration = Duration::from_secs(20);
+
+/// PSCI（HVC）の最小実装（TASK-192.11・#3794・MVM-5・MVM-1・REPAIR-5）。
+/// 段 1: HVC の exit 時点の PC が HVC の次の命令であること（`handle_hvc` の仮定）を観測し、VERSION の応答を直接確かめる。
+/// 段 2: 専用スレッドの実行ループで VERSION → SYSTEM_OFF を通し、`GuestShutdown` と exit の並び `[hvc, hvc]` を確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_psci_version_then_system_off() {
+    use fandhe_container_microvm::hvf::hvc::{HvcHandler, handle_hvc};
+    use fandhe_container_microvm::hvf::mmio::MmioHandler;
+    use fandhe_container_microvm::hvf::timer::TimerHandler;
+    use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
+    use fandhe_container_microvm::hvf_loop::{ExitAction, ExitKind, VcpuExitObserver};
+    use fandhe_container_microvm::stop::StopReason;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const BASE: u64 = 0x4000_0000;
+
+    // exit の並びを記録する観測器（上限つき。ブロックしない）。
+    #[derive(Debug, Default)]
+    struct ExitSeq(Mutex<Vec<ExitKind>>);
+    impl VcpuExitObserver for ExitSeq {
+        fn on_exit(&self, kind: ExitKind) {
+            if let Ok(mut v) = self.0.lock()
+                && v.len() < 64
+            {
+                v.push(kind);
+            }
+        }
+    }
+
+    let finished = Arc::new(AtomicBool::new(false));
+    struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = {
+        let flag = Arc::clone(&finished);
+        let h = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < PSCI_DEADLINE {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+        WatchdogGuard(Arc::clone(&finished), Some(h))
+    };
+
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vm = Arc::new(create_vm_with_gic_or_precondition(&layout));
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in PSCI_GUEST_CODE.iter().enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+
+    // 段 1: PC の観測と VERSION の応答。
+    {
+        let mut vcpu = vm.create_vcpu().unwrap();
+        vcpu.set_reg(HvReg::PC, BASE).unwrap();
+        vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+        let exit = vcpu.run_once(PSCI_DEADLINE).unwrap();
+        let HvVcpuExit::Exception(ex) = exit else {
+            panic!("hvf_device: psci: unexpected exit {exit:?}");
+        };
+        assert_eq!(decode_esr(ex.syndrome), EsrClass::Hvc { imm16: 0 });
+        let pc = vcpu.get_reg(HvReg::PC).unwrap();
+        eprintln!(
+            "hvf_device: psci: pc at hvc exit = {pc:#x} (hvc at {:#x})",
+            BASE + 4
+        );
+        assert_eq!(
+            pc,
+            BASE + 8,
+            "hvc exit pc must point past the hvc instruction; handle_hvc assumes it"
+        );
+        let action = handle_hvc(&mut vcpu, &mut HvcHandler::new(), 0, &ex).unwrap();
+        assert!(matches!(action, ExitAction::Continue));
+        assert_eq!(vcpu.get_reg(HvReg::x(0).unwrap()).unwrap(), 0x0001_0000);
+        assert_eq!(vcpu.get_reg(HvReg::PC).unwrap(), BASE + 8);
+    }
+
+    // 段 2: 実行ループで VERSION → SYSTEM_OFF。
+    let seq = Arc::new(ExitSeq::default());
+    let config = VcpuThreadConfig {
+        observer: Some(seq.clone()),
+        ..VcpuThreadConfig::default()
+    };
+    let handlers = ExitHandlers {
+        mmio: MmioHandler::new(),
+        hvc: HvcHandler::new(),
+        timer: TimerHandler::new(),
+    };
+    let handle = VcpuThread::spawn(
+        Arc::clone(&vm),
+        |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
+            vcpu.set_reg(HvReg::PC, BASE)?;
+            vcpu.set_reg(HvReg::CPSR, 0x3c5)
+        },
+        handlers,
+        config,
+    )
+    .unwrap();
+    let start = Instant::now();
+    while !handle.is_finished() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "guest did not shut down within 5s");
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    let seen = seq.0.lock().unwrap().clone();
+    assert_eq!(seen, vec![ExitKind::Hvc, ExitKind::Hvc]);
+
+    mapping.unmap().unwrap();
+    drop(vm);
 }

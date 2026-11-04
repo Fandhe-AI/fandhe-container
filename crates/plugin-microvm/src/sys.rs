@@ -181,8 +181,10 @@ fn register() -> Result<(), PluginError> {
 pub(crate) enum NoFollowOpenError {
     /// 絶対パスの `RootDir` + `Normal` 要素だけの形ではない（相対・最終要素なし・NUL を含む）。
     InvalidPath,
-    /// 祖先の 1 要素を `O_DIRECTORY | O_NOFOLLOW` で開けなかった。祖先が symlink のとき Linux は `ENOTDIR`、
-    /// macOS は `ELOOP` を返し、どちらも「祖先が実ディレクトリではない」と扱う。それ以外の errno は内部エラー。
+    /// 祖先の 1 要素を `O_DIRECTORY | O_NOFOLLOW` で開けなかった。祖先が symlink のとき Linux・macOS とも
+    /// `ENOTDIR` を返す（macOS は run 41746560647 で実測。#3870）。祖先が通常ファイルのときも同じ `ENOTDIR` のため、
+    /// errno だけでは「祖先が symlink」と「祖先がディレクトリでない」を区別できず、どちらも「祖先が実ディレクトリでは
+    /// ない」（`MSG_BAD_ANCESTOR`）として拒否する。区別する分類は未実装（REPAIR-3）。それ以外の errno は内部エラー。
     Ancestor(std::io::Error),
     /// 最終要素を `O_NOFOLLOW` で開けなかった（lstat の後に symlink へ差し替えられた場合の `ELOOP` を含む。
     /// `ELOOP` / `ENOTDIR` は「実体ではない」、それ以外の errno は内部エラー）。
@@ -664,11 +666,10 @@ mod tests {
         const EXP_ELOOP: i32 = 40;
         #[cfg(target_os = "macos")]
         const EXP_ELOOP: i32 = 62;
-        /// 祖先が symlink（`O_PATH | O_DIRECTORY | O_NOFOLLOW`）のときの errno。Linux は ENOTDIR、macOS は ELOOP。
-        #[cfg(target_os = "linux")]
+        /// 祖先が symlink（`O_PATH | O_DIRECTORY | O_NOFOLLOW`）のときの errno。Linux・macOS とも ENOTDIR。
+        /// macOS の値は dispatch の run 41746560647（`platform-ci (macos-latest)`）で実測した（ELOOP ではない。#3870）。
+        /// 祖先が通常ファイルのときと同じ errno のため、両者は errno では区別できない（REPAIR-3）。
         const EXP_ANCESTOR_SYMLINK: i32 = EXP_ENOTDIR;
-        #[cfg(target_os = "macos")]
-        const EXP_ANCESTOR_SYMLINK: i32 = 62;
 
         fn assert_raw(e: &std::io::Error, want: i32, ctx: &str) {
             assert_eq!(e.raw_os_error(), Some(want), "{ctx}: {e:?}");

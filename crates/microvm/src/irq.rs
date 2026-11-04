@@ -6,6 +6,7 @@
 //! [`IoEventFd`] はゲストの `QueueNotify` 書き込み（VM exit なし）で発火する eventfd を持ち、
 //! [`IoEventFd::consume`] で回数を読む。[`IrqFd`] は VM fd を dup して所有する（VM 構成体が VM fd と一緒に保持できる。TASK-75.2）。
 //! [`IoEventFd`] は `'vm` の借用。どちらも drop で登録を解く。
+//! #3918 で x86_64 の COM1 用に `KVM_IRQ_LINE` の level 線 [`IrqLevelLine`] を足した（`VmFd::register_irq_line` が返す）。
 //!
 //! # 待ちを持たない設計（REPAIR-5）
 //! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で
@@ -23,6 +24,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec};
+#[cfg(target_arch = "x86_64")]
+use crate::interrupt::{IrqLevel, LevelInterruptLine};
 use crate::sys::{self, SysError};
 
 fn io_error(what: &str, e: &io::Error) -> MicrovmError {
@@ -119,6 +122,53 @@ impl InterruptLine for IrqFd {
 impl Drop for IrqFd {
     fn drop(&mut self) {
         let _ = sys::kvm_irqfd(self.vm.as_fd(), self.event.as_fd(), self.gsi, true);
+    }
+}
+
+/// `KVM_IRQ_LINE` で GSI を駆動する level 線（x86_64 のみ。#3918・MVM-1・REPAIR-3）。
+///
+/// 呼び出し元は `SerialConsole::port_device_with_irq`（UART のモデルが線の値を決めて `set_level` で伝える。
+/// `crate::microvm::assemble` が COM1 = IRQ 4 に結ぶ）。edge 注入の [`IrqFd`] と違い線の値を持つので level 線に使える。
+///
+/// # 設計
+/// resamplefd（`KVM_IRQFD_FLAG_RESAMPLE`）は level に設定された pin の EOI でだけ働く。Linux は MP テーブル
+/// （ISA の既定 = edge・active high）に従い IRQ 4 を edge に設定するため使えない。`KVM_IRQ_LINE` は pin が edge でも level でも
+/// 働く同期・非ブロックの ioctl 1 回で済み、スレッドも要らない（待ちを持たないので REPAIR-5 のタイムアウトは不要）。
+/// edge の pin では 0 から 1 の遷移でだけ配送されるが、モデルは要因が消えたときに線を下げ変化時だけ伝えるので、
+/// 新しい要因ごとに立ち上がりが 1 回起きる。ISR が最後の IIR 読み出しの後 `iret` の前に入力が届くと余分な配送が 1 回起きるが、
+/// そのときの IIR は 0x01（`IRQ_NONE`）で無害。
+///
+/// VM fd の dup を所有する。drop では何もしない（VM fd が全部 close されると irqchip ごと破棄され、線の deassert は不要）。
+/// カーネルの一次情報は v6.12 の `include/uapi/linux/kvm.h`（`struct kvm_irq_level`・`KVM_IRQ_LINE`）と `arch/x86/kvm/x86.c` の
+/// `kvm_vm_ioctl_irq_line`（irqchip が無いと `-ENXIO`。結果の書き戻しは `KVM_IRQ_LINE_STATUS` だけ）。
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+pub struct IrqLevelLine {
+    vm: OwnedFd,
+    irq: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl IrqLevelLine {
+    pub(crate) fn new(vm: OwnedFd, irq: u32) -> Self {
+        Self { vm, irq }
+    }
+
+    /// 駆動する GSI。
+    pub fn irq(&self) -> u32 {
+        self.irq
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl LevelInterruptLine for IrqLevelLine {
+    fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+        sys::kvm_irq_line(self.vm.as_fd(), self.irq, level == IrqLevel::High).map_err(|e| {
+            MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                format!("KVM_IRQ_LINE failed ({e:?})"),
+            )
+        })
     }
 }
 

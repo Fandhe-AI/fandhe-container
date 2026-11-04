@@ -260,9 +260,9 @@ pub(crate) mod consts {
     pub const KVM_VGIC_V3_ADDR_TYPE_REDIST: u64 = 3;
     /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
-    /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
     /// `_IOW(KVMIO, 0x61, struct kvm_irq_level)`（8 バイト。vGIC の SPI / PPI を駆動する。#3943）。
     pub const KVM_IRQ_LINE: u64 = super::iow(super::KVMIO, 0x61, 8);
+    /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
     pub const KVM_IRQFD: u64 = super::iow(super::KVMIO, 0x76, 32);
     /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
     pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);

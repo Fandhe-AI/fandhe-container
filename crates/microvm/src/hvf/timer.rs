@@ -5,10 +5,12 @@
 //! `hv_*` を呼ばない純関数（`hvf_abi::wfi_wait_plan`）に置き、ここは vCPU のレジスタ読み書きと sleep だけを持つ。
 //!
 //! # 契約
-//! - WFI / WFIT: ゲストの次のタイマー期限（`CNTV_CVAL_EL0`・vtimer offset・ホストのカウンタから計算）まで
+//! - WFI: ゲストの次のタイマー期限（`CNTV_CVAL_EL0`・vtimer offset・ホストのカウンタから計算）まで
 //!   ホスト側で待つ。1 回の待ちは `WFI_WAIT_MAX`（10 ms）で頭打ちで、**これが停止要求の応答時間を決める唯一の値**
 //!   （本ハンドラは停止フラグにも kick にも触れられず、kick はホストの sleep を起こさない。REPAIR-5）。
-//! - WFE / WFET: 待たずに戻る。
+//! - WFE / WFIT / WFET: 待たずに戻る。WFIT は期限レジスタ（Rt）を読まず CNTV の状態だけで待つと、
+//!   CNTV 無効かつ期限超過でも sleep して契約を破るため、期限の取得に対応するまで即時再開する
+//!   （WFIT の spurious な早期再開はアーキテクチャ上許される）。
 //! - PC: WF* の trap の優先戻り先は命令自身のため、常に `esr::instruction_length` の分だけ進める
 //!   （進めないと、割り込みを mask したまま `wfi` する Linux の idle が WFI の trap を繰り返して起きられない）。
 //! - vtimer: `hv_vcpu_run` が `VTIMER_ACTIVATED` で戻ると vtimer は自動で mask され、mask を外すまで再 exit しない。
@@ -39,9 +41,9 @@ use crate::sys::{host_absolute_time, host_timebase};
 /// 観測用の計数（REPAIR-4）。加算は `saturating_add`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TimerStats {
-    /// WFI / WFIT で実際に sleep した回数。
+    /// WFI で実際に sleep した回数。
     pub wfi_waits: u64,
-    /// WFI / WFIT で待たずに戻った回数。
+    /// WFI で待たずに戻った回数。
     pub wfi_immediate: u64,
     /// `VTIMER_ACTIVATED` の回数。
     pub vtimer_activations: u64,
@@ -108,7 +110,7 @@ fn sync_vtimer_mask(vcpu: &mut HvVcpu<'_>, handler: &mut TimerHandler) -> Result
     Ok(())
 }
 
-/// WFI / WFE 系を処理する。WFI / WFIT は期限つきで待ち、PC を命令長だけ進めて `Continue` を返す。
+/// WFI / WFE 系を処理する。WFI は期限つきで待ち（WFIT は期限未対応のため即時再開）、PC を命令長だけ進めて `Continue` を返す。
 pub fn handle_wfx(
     vcpu: &mut HvVcpu<'_>,
     handler: &mut TimerHandler,
@@ -116,7 +118,7 @@ pub fn handle_wfx(
     exception: &HvVcpuExitException,
 ) -> Result<ExitAction, MicrovmError> {
     sync_vtimer_mask(vcpu, handler)?;
-    if matches!(kind, WfxKind::Wfi | WfxKind::Wfit) {
+    if matches!(kind, WfxKind::Wfi) {
         let ctl = vcpu.get_sys_reg(HvSysReg::CNTV_CTL_EL0)?;
         let cval = vcpu.get_sys_reg(HvSysReg::CNTV_CVAL_EL0)?;
         let offset = vcpu.vtimer_offset()?;

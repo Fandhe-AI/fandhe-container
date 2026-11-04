@@ -515,6 +515,52 @@ mod tests {
         assert_eq!(gic.calls(), vec![(48, true), (48, false)]);
     }
 
+    /// level 線が assert されたままゲストが Status=0 でリセットすると、`DeviceReset` の後処理で deassert される。
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn mvm5_3863_reset_deasserts_level_line() {
+        use crate::dispatch::{DispatchOutcome, ExitDispatcher, MmioAccess};
+        use crate::exit::VcpuExit;
+        use crate::virtio_mmio::SharedTransport;
+        use std::sync::{Arc, Mutex};
+
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let transport = Arc::new(Mutex::new(block_transport()));
+        let mut d = ExitDispatcher::new();
+        d.register_mmio(
+            0x0a00_0000,
+            0x200,
+            Box::new(SharedTransport(Arc::clone(&transport))),
+        )
+        .unwrap();
+        transport
+            .lock()
+            .unwrap()
+            .raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger().unwrap();
+        let out = d
+            .dispatch(&VcpuExit::Mmio {
+                phys_addr: 0x0a00_0000 + reg::STATUS,
+                data: [0u8; 8],
+                len: 4,
+                is_write: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            out,
+            DispatchOutcome::Mmio {
+                access: MmioAccess::Write(MmioWriteOutcome::DeviceReset),
+                ..
+            }
+        ));
+        let route = BoundAckRoute { transport, line };
+        let r = route.on_interrupt_ack().unwrap();
+        assert_eq!(r.remaining, 0);
+        assert_eq!(r.resample, LineResample::Deasserted);
+        assert_eq!(gic.calls(), vec![(48, true), (48, false)]);
+    }
+
     #[test]
     fn mvm1_879_io_event_spec_table() {
         let mmio = IoEventAddress::Mmio(0x2050);

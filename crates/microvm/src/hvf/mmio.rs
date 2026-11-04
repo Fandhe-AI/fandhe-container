@@ -140,6 +140,16 @@ pub fn handle_data_abort(
                 route.on_interrupt_ack()?;
             }
         }
+        // Status=0 のリセットは `interrupt_status` を 0 にするため、level 線が上がったままにならないよう
+        // ACK と同じ後処理（resample）を呼ぶ（MVM-5。ACK 数の計数には含めない）。
+        DispatchOutcome::Mmio {
+            device,
+            access: MmioAccess::Write(MmioWriteOutcome::DeviceReset),
+        } => {
+            if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
+                route.on_interrupt_ack()?;
+            }
+        }
         DispatchOutcome::Mmio {
             device,
             access: MmioAccess::Write(MmioWriteOutcome::QueueNotify(q)),

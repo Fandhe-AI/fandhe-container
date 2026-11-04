@@ -2597,6 +2597,22 @@ mod arm64 {
         assert!(!vm.vgic().spi_pending(48).unwrap());
     }
 
+    /// MVM-1・#3696: vGIC の初期化前の irqfd は `FailedPrecondition`（EAGAIN）で拒否され、初期化後は通る
+    /// （順序の根拠は `device` のモジュール doc。構成 API は公開せず診断口 `probe_irqfd_vgic_order` を使う）。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_irqfd_requires_initialized_vgic() {
+        let p = open().probe_irqfd_vgic_order().unwrap();
+        assert_eq!(
+            p.before_init,
+            Some((
+                MicrovmErrorCode::FailedPrecondition,
+                "KVM_IRQFD requires an initialized interrupt controller (vGIC)".to_string()
+            ))
+        );
+        assert!(p.after_init_ok);
+    }
+
     /// MVM-1・#3696: gsi 16 の irqfd を発火すると INTID 48（= 16 + 32）だけが pending になる（GSI と SPI の写像）。
     /// 注入は eventfd のワーカー経由で非同期のため、期限つきで待つ。
     #[test]

@@ -395,6 +395,15 @@ const KICK_INTERVAL: Duration = Duration::from_millis(10);
 /// `run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ）。
 pub const RUN_DEADLINE_MAX: Duration = Duration::from_secs(3600);
 
+/// [`KvmDevice::probe_irqfd_vgic_order`] の結果（MVM-1・#3696）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqfdVgicOrderProbe {
+    /// vGIC の初期化前の irqfd 登録の失敗（コードとメッセージ）。成功してしまった場合は `None`。
+    pub before_init: Option<(MicrovmErrorCode, String)>,
+    /// vGIC の初期化後の irqfd 登録が成功したか。
+    pub after_init_ok: bool,
+}
+
 /// [`KvmDevice::probe_guest_execution`] の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestExecutionProbe {
@@ -1837,6 +1846,39 @@ impl KvmDevice {
     }
 
     /// 自己診断: 固定の 5 バイトのゲストコード（`mov al,0x42; out 0x10,al; hlt`）を 1 ページに置いて
+    /// 自己診断: vGICv3 の初期化前の irqfd 登録が `FailedPrecondition` で拒否され、初期化後は通ることを確かめる
+    /// （MVM-1・#3696。aarch64 のみ。他 arch は `Unimplemented`）。VM・vCPU・vGIC の寿命は関数内で完結する。
+    /// `tests/` の結合試験から呼ぶための口で、vGIC の構成 API（`create_vgic_v3`・`init`）は公開しない。
+    /// 順序の根拠はモジュール doc。ホストが GICv3 を持たない場合は `create_vgic_v3` の `FailedPrecondition` を返す。
+    pub fn probe_irqfd_vgic_order(&self) -> Result<IrqfdVgicOrderProbe, MicrovmError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let vm = self.create_vm()?;
+            let _vcpu = vm.create_vcpu(0)?;
+            let vgic = vm.create_vgic_v3(
+                crate::arm64_layout::ARM64_GIC_DIST_BASE,
+                crate::arm64_layout::ARM64_GIC_REDIST_BASE,
+            )?;
+            let before_init = match vm.register_irqfd(16) {
+                Ok(_) => None,
+                Err(e) => Some((e.code(), e.message().to_string())),
+            };
+            vgic.init()?;
+            let after_init_ok = vm.register_irqfd(16).is_ok();
+            Ok(IrqfdVgicOrderProbe {
+                before_init,
+                after_init_ok,
+            })
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "irqfd vGIC order probe is only implemented for aarch64",
+            ))
+        }
+    }
+
     /// 実際に `KVM_RUN` し、観測した VM exit を返す（TASK-74.4.1・MVM-1。x86_64 のみ）。
     ///
     /// x86_64 のリセット状態（CS:IP = F000:FFF0、線形 0xFFFFFFF0）のまま GPA `0xFFFFF000` に置いた 1 ページから
@@ -2914,36 +2956,6 @@ mod tests {
             classify_irq_error(IrqStage::CreateDevice, SysError::Os(ENODEV)).message(),
             "the host does not provide an in-kernel GICv3"
         );
-    }
-
-    /// MVM-1・#3696: aarch64 の実機前提。vGIC の初期化前の irqfd は `FailedPrecondition`（EAGAIN）で拒否され、
-    /// 初期化後は通る（順序の根拠はモジュール doc。`create_vgic_v3` は `pub(crate)` のため crate 内の試験で確かめる）。
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
-    fn mvm1_3696_irqfd_requires_initialized_vgic() {
-        let dev = match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("device: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        };
-        let vm = dev.create_vm().unwrap();
-        let _vcpu = vm.create_vcpu(0).unwrap();
-        let vgic = vm
-            .create_vgic_v3(
-                crate::arm64_layout::ARM64_GIC_DIST_BASE,
-                crate::arm64_layout::ARM64_GIC_REDIST_BASE,
-            )
-            .unwrap();
-        let e = vm.register_irqfd(16).unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
-        assert_eq!(
-            e.message(),
-            "KVM_IRQFD requires an initialized interrupt controller (vGIC)"
-        );
-        vgic.init().unwrap();
-        assert!(vm.register_irqfd(16).is_ok());
     }
 
     /// MVM-1・#3696: SPI の pending 読み出しの offset（`GICD_ISPENDR<n>` = `0x200 + 4 * (intid / 32)`）と範囲検査。

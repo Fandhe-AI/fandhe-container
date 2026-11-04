@@ -8,6 +8,7 @@
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
 # TASK-192.7・#3790 で boot_arm64 を追加（依存は増やさない。unsafe なし）。
 # TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
+# TASK-192.15（#3797）で hvf/microvm.rs（macOS の microVM 構成体）と SharedTransport の virtio_mmio への移動を追加（依存は増やさない。unsafe は増やさない）。
 # TASK-192.9（#3791）で hvf_loop・stop・hvf/vcpu.rs とスタブ（mmio・hvc・timer）を追加（依存は増やさない。unsafe なし）。
 # TASK-192.14（#3796）で hvf_abi に WFI の待ち時間の純関数、hvf/timer.rs の実装、sys/hvf.rs に mach_absolute_time / mach_timebase_info を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。

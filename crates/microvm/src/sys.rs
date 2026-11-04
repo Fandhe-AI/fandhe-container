@@ -229,6 +229,10 @@ pub(crate) mod consts {
     pub const KVM_ARM_VCPU_INIT: u64 = super::iow(super::KVMIO, 0xAE, 32);
     /// `_IOR(KVMIO, 0xaf, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_PREFERRED_TARGET: u64 = super::ior(super::KVMIO, 0xAF, 32);
+    /// `KVM_CAP_ARM_PSCI_0_2`（v6.12 `linux/kvm.h`。#3896）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_ARM_PSCI_0_2: u64 = 102;
+    /// `KVM_ARM_VCPU_PSCI_0_2`（v6.12 `asm/kvm.h`）。features の**ビット番号**でマスクではない（`1 << 値` で立てる）。
+    pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
     // 以下は #3696（vGIC・起動レジスタ）。値は Linux v6.12 の `include/uapi/linux/kvm.h` /
     // `arch/arm64/include/uapi/asm/kvm.h` で照合した（`libc` に対応物が無いカーネル ABI のため、機械照合は適用外）。
     /// `_IOWR(KVMIO, 0xe0, struct kvm_create_device)`（12 バイト）。
@@ -317,7 +321,17 @@ const _: () = {
     assert!(std::mem::align_of::<KvmVcpuInit>() == 4);
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
+    assert!(consts::KVM_CAP_ARM_PSCI_0_2 == 102);
+    assert!(consts::KVM_ARM_VCPU_PSCI_0_2 == 2);
 };
+
+/// features[0] に `KVM_ARM_VCPU_PSCI_0_2` のビットを立てる（他の語・ビットは不変。#3896）。
+/// `device::VmFd::create_vcpu` が `KVM_ARM_VCPU_INIT` の前に呼ぶ。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn with_psci_0_2(mut init: KvmVcpuInit) -> KvmVcpuInit {
+    init.features[0] |= 1u32 << consts::KVM_ARM_VCPU_PSCI_0_2;
+    init
+}
 
 /// aarch64 の `struct kvm_create_device`（`linux/kvm.h`。`type`・`fd`・`flags` の 12 バイト。#3696）。
 /// `fd` はカーネルが書く出力で、入力時は 0 にしておく。
@@ -2607,6 +2621,20 @@ mod tests {
     fn arm_vcpu_constants_match_kernel_abi() {
         assert_eq!(consts::KVM_ARM_VCPU_INIT, 0x4020_AEAE);
         assert_eq!(consts::KVM_ARM_PREFERRED_TARGET, 0x8020_AEAF);
+    }
+
+    /// MVM-1・#3896: PSCI 0.2 の capability・feature ビット番号と、ビットを立てる純関数。
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn mvm1_3896_psci_0_2_constants_and_features() {
+        assert_eq!(consts::KVM_CAP_ARM_PSCI_0_2, 102);
+        assert_eq!(consts::KVM_ARM_VCPU_PSCI_0_2, 2);
+        let init = with_psci_0_2(KvmVcpuInit {
+            target: 5,
+            features: [0, 1, 2, 3, 4, 5, 6],
+        });
+        assert_eq!(init.target, 5);
+        assert_eq!(init.features, [0b100, 1, 2, 3, 4, 5, 6]);
     }
 
     /// MVM-1・#3696: aarch64 の core レジスタ id（`KVM_REG_ARM_CORE_REG` の u32 換算）。arch に依らず計算式を固定する。

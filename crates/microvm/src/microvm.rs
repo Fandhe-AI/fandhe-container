@@ -8,8 +8,7 @@
 //! FDT の `interrupts` のセル値と一致させる（virtio は SPI 16 から連番）。`load_kernel` は Image・initrd・FDT を `boot_arm64::load_arm64` で置き、
 //! `setup_boot_vcpu` は X0 = FDT・PC = Image の先頭・PSTATE = EL1h を `KVM_SET_ONE_REG` で書いて読み戻す。
 //! drop の順序は vCPU → デバイス（irqfd の解除）→ vGIC → メモリ → VM fd。
-//! **範囲外（REPAIR-3）**: vCPU は 1 台だけ（2 台以上は資源を作る前に `Unimplemented`。AP の起動は #3899）・PSCI 0.2 と
-//! `KVM_EXIT_SYSTEM_EVENT` の分類（#3896）・実カーネルの起動試験（#3897）・シリアル（#3898）・level の virtio SPI（resamplefd が未実装のため
+//! **範囲外（REPAIR-3）**: vCPU は 1 台だけ（2 台以上は資源を作る前に `Unimplemented`。AP の起動は #3899）・実カーネルの起動試験（#3897）・シリアル（#3898）・level の virtio SPI（resamplefd が未実装のため
 //! `Unimplemented`）・`SCTLR_EL1` の確認。実機（KVM aarch64）での実行は未検証（実機前提試験は `tests/kvm_device.rs` の `kvm_device_arm64_*`）。
 //!
 //! # VM 構成体（TASK-75.2）
@@ -1531,6 +1530,9 @@ fn classify_run(r: &Result<VcpuExit, MicrovmError>) -> RunClass {
         Ok(VcpuExit::Io { .. } | VcpuExit::Mmio { .. }) => RunClass::Dispatch,
         Ok(VcpuExit::Shutdown) => RunClass::Finish(StopReason::GuestShutdown),
         Ok(VcpuExit::Hlt) => RunClass::Finish(StopReason::GuestHalted),
+        Ok(VcpuExit::SystemEvent { event_type, .. }) => {
+            RunClass::Finish(crate::exit::system_event_stop_reason(*event_type))
+        }
         Ok(VcpuExit::FailEntry { .. } | VcpuExit::InternalError { .. }) => {
             RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Internal))
         }
@@ -2485,7 +2487,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU は 1 台につき 1 スレッドで、
     /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成では、ゲストの kick なしで受信を処理する専用スレッド `microvm-net-rx`（`NetRxPoller`。期限ごとの
-    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。aarch64 は vCPU 1 台（PSCI による終了の分類は #3896。それまで停止は `stop` の要求による）。他 arch は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。aarch64 は vCPU 1 台（PSCI の SYSTEM_OFF / SYSTEM_RESET は `GuestShutdown` に分類される。#3896）。他 arch は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -2700,6 +2702,20 @@ mod lifecycle_tests {
             classify_run(&Ok(VcpuExit::InternalError { suberror: 1 })),
             internal
         );
+        for (t, want) in [
+            (1, StopReason::GuestShutdown),
+            (2, StopReason::GuestShutdown),
+            (3, StopReason::Failed(MicrovmErrorCode::Unimplemented)),
+        ] {
+            assert_eq!(
+                classify_run(&Ok(VcpuExit::SystemEvent {
+                    event_type: t,
+                    ndata: 0,
+                    data: [0; crate::exit::SYSTEM_EVENT_DATA_MAX],
+                })),
+                RunClass::Finish(want)
+            );
+        }
         assert_eq!(
             classify_run(&Ok(VcpuExit::Other { exit_reason: 999 })),
             RunClass::Finish(StopReason::Failed(MicrovmErrorCode::Unimplemented))

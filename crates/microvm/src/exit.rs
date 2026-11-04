@@ -19,6 +19,7 @@
 //! 防御の深さ）、MMIO の `len` は 1..=8。違反は [`MicrovmErrorCode::Internal`] の `malformed KVM exit` で返す。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
+use crate::stop::StopReason;
 
 /// `struct kvm_run` の `exit_reason` のオフセット（`linux/kvm.h`）。
 pub(crate) const RUN_EXIT_REASON: usize = 8;
@@ -39,6 +40,36 @@ const KVM_EXIT_MMIO: u32 = 6;
 const KVM_EXIT_SHUTDOWN: u32 = 8;
 const KVM_EXIT_FAIL_ENTRY: u32 = 9;
 const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
+/// `KVM_EXIT_SYSTEM_EVENT`（Linux v6.12 `include/uapi/linux/kvm.h`。arch 共通の値）。aarch64 では in-kernel PSCI の
+/// SYSTEM_OFF / SYSTEM_RESET がこの exit で戻る（#3896・MVM-1）。`libc` に対応物が無く、具体値の試験で固定する（照合の追跡は #3664）。
+pub(crate) const KVM_EXIT_SYSTEM_EVENT: u32 = 24;
+/// `KVM_SYSTEM_EVENT_SHUTDOWN`（ゲストの電源断要求。PSCI SYSTEM_OFF）。v6.12 `linux/kvm.h`。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
+/// `KVM_SYSTEM_EVENT_RESET`（ゲストの再起動要求。PSCI SYSTEM_RESET）。v6.12 `linux/kvm.h`。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const KVM_SYSTEM_EVENT_RESET: u32 = 2;
+/// `KVM_SYSTEM_EVENT_CRASH`。v6.12 `linux/kvm.h`。分類は `Failed`（試験で固定）。
+#[cfg(test)]
+pub(crate) const KVM_SYSTEM_EVENT_CRASH: u32 = 3;
+/// `KVM_SYSTEM_EVENT_WAKEUP`。v6.12 `linux/kvm.h`。
+#[cfg(test)]
+pub(crate) const KVM_SYSTEM_EVENT_WAKEUP: u32 = 4;
+/// `KVM_SYSTEM_EVENT_SUSPEND`。v6.12 `linux/kvm.h`。
+#[cfg(test)]
+pub(crate) const KVM_SYSTEM_EVENT_SUSPEND: u32 = 5;
+/// `struct kvm_run` の `system_event.type` のオフセット（exit union の先頭）。
+const RUN_SYSTEM_EVENT_TYPE: usize = RUN_UNION;
+/// `system_event.ndata` のオフセット（`type` の直後。`ndata` 追加前のカーネルでは padding だった領域）。
+const RUN_SYSTEM_EVENT_NDATA: usize = RUN_UNION + 4;
+/// `system_event.data[]`（`flags` と union）のオフセット。
+const RUN_SYSTEM_EVENT_DATA: usize = RUN_UNION + 8;
+/// `system_event.data` の要素数の上限（v6.12 の `__u64 data[16]`）。
+pub const SYSTEM_EVENT_DATA_MAX: usize = 16;
+const _: () = assert!(
+    RUN_SYSTEM_EVENT_DATA + SYSTEM_EVENT_DATA_MAX * 8 <= RUN_UNION + 256
+        && RUN_SYSTEM_EVENT_DATA + SYSTEM_EVENT_DATA_MAX * 8 - RUN_UNION == 136
+);
 const KVM_EXIT_IO_IN: u8 = 0;
 const KVM_EXIT_IO_OUT: u8 = 1;
 
@@ -84,6 +115,13 @@ pub enum VcpuExit {
     },
     /// KVM の内部エラー。
     InternalError { suberror: u32 },
+    /// `KVM_EXIT_SYSTEM_EVENT`（aarch64 の PSCI SYSTEM_OFF / SYSTEM_RESET 等。#3896・MVM-1）。
+    /// `data` は先頭 `ndata` 件だけ有効で残りは 0（カーネル由来の値。ゲストが間接的に影響しうる）。
+    SystemEvent {
+        event_type: u32,
+        ndata: u32,
+        data: [u64; SYSTEM_EVENT_DATA_MAX],
+    },
     /// `KVM_RUN` がシグナル等で中断された（EINTR / EAGAIN。正常系。再実行できる）。
     Interrupted,
     /// 上記以外の exit（番号のみ保持。必要になれば型を足す）。
@@ -283,7 +321,44 @@ pub(crate) fn decode_exit(area: &impl RunArea) -> Result<VcpuExit, MicrovmError>
         KVM_EXIT_INTERNAL_ERROR => Ok(VcpuExit::InternalError {
             suberror: read_u32(area, RUN_UNION)?,
         }),
+        KVM_EXIT_SYSTEM_EVENT => decode_system_event(area),
         other => Ok(VcpuExit::Other { exit_reason: other }),
+    }
+}
+
+/// `KVM_EXIT_SYSTEM_EVENT` を復号する。`ndata` が上限を超えれば `malformed`（fail-closed）。
+fn decode_system_event(area: &impl RunArea) -> Result<VcpuExit, MicrovmError> {
+    let event_type = read_u32(area, RUN_SYSTEM_EVENT_TYPE)?;
+    let ndata = read_u32(area, RUN_SYSTEM_EVENT_NDATA)?;
+    let n = usize::try_from(ndata).map_err(|_| malformed("system_event ndata"))?;
+    if n > SYSTEM_EVENT_DATA_MAX {
+        return Err(malformed("system_event ndata"));
+    }
+    let mut data = [0u64; SYSTEM_EVENT_DATA_MAX];
+    for (i, slot) in data.iter_mut().take(n).enumerate() {
+        let off = i
+            .checked_mul(8)
+            .and_then(|o| o.checked_add(RUN_SYSTEM_EVENT_DATA))
+            .ok_or_else(|| malformed("system_event ndata"))?;
+        *slot = read_u64(area, off)?;
+    }
+    Ok(VcpuExit::SystemEvent {
+        event_type,
+        ndata,
+        data,
+    })
+}
+
+/// `KVM_EXIT_SYSTEM_EVENT` の種別を停止理由へ分類する（`microvm::classify_run` から呼ばれる。MVM-1・#3896）。
+///
+/// SHUTDOWN と RESET は `GuestShutdown`（HVF 側 `psci.rs` と同じく再起動は対象外で電源断に写す。区別が要るなら
+/// `StopReason` に variant を足す。REPAIR-3）。それ以外（CRASH・SUSPEND 等）は fail-closed で `Unimplemented` の失敗。
+/// 復号と分類は arch 共通。現構成の x86_64 はこの exit を出さないため、x86_64 の観測できる挙動は変わらない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn system_event_stop_reason(event_type: u32) -> StopReason {
+    match event_type {
+        KVM_SYSTEM_EVENT_SHUTDOWN | KVM_SYSTEM_EVENT_RESET => StopReason::GuestShutdown,
+        _ => StopReason::Failed(MicrovmErrorCode::Unimplemented),
     }
 }
 
@@ -650,9 +725,76 @@ mod tests {
             VcpuExit::Shutdown
         );
         assert_eq!(
-            decode_exit(&area(24)).unwrap(),
-            VcpuExit::Other { exit_reason: 24 }
+            decode_exit(&area(999)).unwrap(),
+            VcpuExit::Other { exit_reason: 999 }
         );
+    }
+
+    /// MVM-1・#3896: system_event の定数とレイアウトを具体値で固定する。
+    #[test]
+    fn mvm1_3896_system_event_constants_match_kernel_abi() {
+        assert_eq!(KVM_EXIT_SYSTEM_EVENT, 24);
+        assert_eq!(KVM_SYSTEM_EVENT_SHUTDOWN, 1);
+        assert_eq!(KVM_SYSTEM_EVENT_RESET, 2);
+        assert_eq!(KVM_SYSTEM_EVENT_CRASH, 3);
+        assert_eq!(KVM_SYSTEM_EVENT_WAKEUP, 4);
+        assert_eq!(KVM_SYSTEM_EVENT_SUSPEND, 5);
+        assert_eq!(RUN_SYSTEM_EVENT_TYPE, 32);
+        assert_eq!(RUN_SYSTEM_EVENT_NDATA, 36);
+        assert_eq!(RUN_SYSTEM_EVENT_DATA, 40);
+        assert_eq!(SYSTEM_EVENT_DATA_MAX * 8, 128);
+    }
+
+    /// MVM-1・#3896: SHUTDOWN / RESET の system_event を復号する。
+    #[test]
+    fn mvm1_3896_decodes_system_event_shutdown_and_reset() {
+        let mut v = area(KVM_EXIT_SYSTEM_EVENT);
+        put(&mut v, RUN_UNION, &KVM_SYSTEM_EVENT_SHUTDOWN.to_ne_bytes());
+        put(&mut v, RUN_UNION + 4, &1u32.to_ne_bytes());
+        put(&mut v, RUN_UNION + 8, &0x8400_0008u64.to_ne_bytes());
+        let mut data = [0u64; SYSTEM_EVENT_DATA_MAX];
+        data[0] = 0x8400_0008;
+        assert_eq!(
+            decode_exit(&v).unwrap(),
+            VcpuExit::SystemEvent {
+                event_type: 1,
+                ndata: 1,
+                data
+            }
+        );
+        let mut r = area(KVM_EXIT_SYSTEM_EVENT);
+        put(&mut r, RUN_UNION, &KVM_SYSTEM_EVENT_RESET.to_ne_bytes());
+        assert_eq!(
+            decode_exit(&r).unwrap(),
+            VcpuExit::SystemEvent {
+                event_type: 2,
+                ndata: 0,
+                data: [0; SYSTEM_EVENT_DATA_MAX]
+            }
+        );
+    }
+
+    /// MVM-1・#3896: `ndata` が上限を超える system_event は `Internal` で拒否する。
+    #[test]
+    fn mvm1_3896_rejects_system_event_ndata_over_max() {
+        let mut v = area(KVM_EXIT_SYSTEM_EVENT);
+        put(&mut v, RUN_UNION + 4, &17u32.to_ne_bytes());
+        let e = decode_exit(&v).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(e.message(), "malformed KVM exit (system_event ndata)");
+    }
+
+    /// MVM-1・#3896: system_event の種別の分類。
+    #[test]
+    fn mvm1_3896_system_event_stop_reason() {
+        assert_eq!(system_event_stop_reason(1), StopReason::GuestShutdown);
+        assert_eq!(system_event_stop_reason(2), StopReason::GuestShutdown);
+        for t in [0, 3, 4, 5, u32::MAX] {
+            assert_eq!(
+                system_event_stop_reason(t),
+                StopReason::Failed(MicrovmErrorCode::Unimplemented)
+            );
+        }
     }
 
     /// MVM-1: MMIO の read / write exit を復号する。

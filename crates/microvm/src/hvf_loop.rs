@@ -817,6 +817,18 @@ pub fn stop_all<K: VcpuKick>(
     deadline: Duration,
 ) -> Result<VcpuSetStopReport, MicrovmError> {
     if deadline.is_zero() || deadline > VCPU_STOP_DEADLINE_MAX {
+        // 早期 return すると各 `LoopHandle::drop` が直列に最大 `DROP_STOP_WAIT` ずつ待つ（N 台で N 倍）。
+        // 全台へ先に停止を要求し、共通の後始末期限で回収してからエラーを返す（REPAIR-5）。
+        let end = Instant::now() + DROP_STOP_WAIT;
+        for h in &handles {
+            h.request_stop();
+            let _ = h.kick.kick();
+        }
+        for h in &mut handles {
+            let result = h.wait_report(end);
+            h.settle(&result, end);
+        }
+        drop(handles);
         return Err(err(
             MicrovmErrorCode::InvalidArgument,
             "vcpu stop deadline must be in (0, 60s]",

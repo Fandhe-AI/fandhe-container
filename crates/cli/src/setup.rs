@@ -15,6 +15,8 @@
 //! OS 設定の検出・適用は行わない（TASK-125 の範囲。実装済みを装わない。REPAIR-3・#2452・CLI-1）。
 //! Windows の文言は `docs/setup/windows.md` と食い違わない（単体テスト `win5_instructions_match_windows_setup_doc` で照合）。
 //! macOS の文言は `docs/setup/macos.md` と食い違わない（単体テスト `mac1_cli2_instructions_match_macos_setup_doc` で照合。#2602）。
+//! macOS には、条件 `microvm` つきで microVM バックエンド向けの `hypervisor-entitlement`（`com.apple.security.hypervisor` の署名手順。MVM-5・#3935）も並ぶ。
+//! 条件つきなので終了コードの判定には影響しない（条件なしの 2 段が残る限り 8）。
 //! - cli は platform-* へ依存できない（CLI-1・PLUG-4・`make check-cli-backend-deps`）ため、検出・適用は将来 plugin 境界経由になる。
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
@@ -49,6 +51,11 @@ const VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS: &str = "The macOS backend plugin 
 /// macOS: 最低版数の手順の固定文言（13 以上は `MacosMinVersion` の暫定要件。spec 未定義。`docs/setup/macos.md`「macOS の版」と同じ。MAC-1・#2452・#2602）。
 const MACOS_MIN_VERSION_INSTRUCTIONS: &str = "Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS. See docs/setup/macos.md";
 
+/// macOS: microVM バックエンド（Hypervisor.framework）の entitlement と署名の手順の固定文言（`fandhe-container-plugin-microvm` の前提。
+/// `docs/setup/macos.md`「microVM（Hypervisor.framework）の entitlement とコード署名」と同じ手順。MVM-5・MAC-1・CLI-2・#3935）。
+/// ad-hoc 署名で受理されるかは実機未確認（#3803）のため、受理されるとは書かず、コマンドの例として示すだけにする（REPAIR-3）。
+const HYPERVISOR_ENTITLEMENT_INSTRUCTIONS: &str = "Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm> (whether ad-hoc signing is accepted is unverified). Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md";
+
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {
@@ -62,6 +69,9 @@ pub enum SetupStep {
     VirtualizationEntitlement,
     /// macOS: macOS 13 以上であること（CLI-2・MAC-1。spec は最小 macOS 版数を定義していないため、13 以上は本実装の暫定要件で、版数が確定した時点で spec 側の更新をユーザーへ報告する）。
     MacosMinVersion,
+    /// macOS の microVM バックエンドだけ: `com.apple.security.hypervisor` entitlement とコード署名（MVM-5・MAC-1・CLI-2・#3935。
+    /// 署名の対象は `fandhe-container-plugin-microvm` のみ。CLI は署名しない）。
+    HypervisorEntitlement,
     /// Linux の rootful だけ: `scripts/install-privileged-launcher.sh` を root で実行する手順の表示（CLI は実行しない。
     /// #1721・#1722・SUP-14・CORE-6・CLI-2・#1454）。
     PrivilegedLauncherInstall,
@@ -72,6 +82,8 @@ pub enum SetupStep {
 pub enum SetupCondition {
     /// rootful で使うときだけ要る（CORE-6 の既定は rootless）。
     Rootful,
+    /// microVM バックエンド（`fandhe-container-plugin-microvm`。macOS は Hypervisor.framework）を使うときだけ要る（MVM-5。macOS の既定は Virtualization.framework）。
+    Microvm,
 }
 
 impl SetupCondition {
@@ -79,6 +91,7 @@ impl SetupCondition {
     pub fn id(self) -> &'static str {
         match self {
             SetupCondition::Rootful => "rootful",
+            SetupCondition::Microvm => "microvm",
         }
     }
 }
@@ -92,6 +105,7 @@ impl SetupStep {
             SetupStep::WslconfigVirtiofs => "wslconfig-virtiofs",
             SetupStep::VirtualizationEntitlement => "virtualization-entitlement",
             SetupStep::MacosMinVersion => "macos-min-version",
+            SetupStep::HypervisorEntitlement => "hypervisor-entitlement",
             SetupStep::PrivilegedLauncherInstall => "privileged-launcher-install",
         }
     }
@@ -105,6 +119,7 @@ impl SetupStep {
             | SetupStep::VirtualizationEntitlement
             | SetupStep::MacosMinVersion => None,
             SetupStep::PrivilegedLauncherInstall => Some(SetupCondition::Rootful),
+            SetupStep::HypervisorEntitlement => Some(SetupCondition::Microvm),
         }
     }
 
@@ -117,6 +132,7 @@ impl SetupStep {
             SetupStep::WslconfigVirtiofs => Some(WSLCONFIG_VIRTIOFS_INSTRUCTIONS),
             SetupStep::VirtualizationEntitlement => Some(VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS),
             SetupStep::MacosMinVersion => Some(MACOS_MIN_VERSION_INSTRUCTIONS),
+            SetupStep::HypervisorEntitlement => Some(HYPERVISOR_ENTITLEMENT_INSTRUCTIONS),
             SetupStep::PrivilegedLauncherInstall => Some(LAUNCHER_INSTALL_INSTRUCTIONS),
         }
     }
@@ -163,6 +179,7 @@ pub fn required_steps(platform: SetupPlatform) -> &'static [SetupStep] {
         SetupPlatform::Macos => &[
             SetupStep::VirtualizationEntitlement,
             SetupStep::MacosMinVersion,
+            SetupStep::HypervisorEntitlement,
         ],
         SetupPlatform::Linux => &[SetupStep::PrivilegedLauncherInstall],
         SetupPlatform::Other => &[],
@@ -239,6 +256,9 @@ mod tests {
     /// 期待する Linux の出力行（具体値）。
     const LINUX_LINE: &str = "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n";
 
+    /// 期待する macOS の microVM 段の出力行（具体値。MVM-5・#3935）。
+    const MAC_HYPERVISOR_LINE: &str = "{\"step\":\"hypervisor-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"condition\":\"microvm\",\"instructions\":\"Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm> (whether ad-hoc signing is accepted is unverified). Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md\"}\n";
+
     /// CLI-2・SUP-14・CORE-6: Linux は rootful だけ要る特権ランチャーのインストール手順を返し、未対応 OS は空。
     #[test]
     fn cli2_sup14_required_steps_linux_is_launcher_install() {
@@ -281,8 +301,13 @@ mod tests {
             got,
             [
                 ("virtualization-entitlement", false),
-                ("macos-min-version", false)
+                ("macos-min-version", false),
+                ("hypervisor-entitlement", false)
             ]
+        );
+        assert_eq!(
+            SetupStep::HypervisorEntitlement.condition().map(|c| c.id()),
+            Some("microvm")
         );
     }
 
@@ -326,9 +351,14 @@ mod tests {
                 VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
             ),
             test_line("macos-min-version", false, MACOS_MIN_VERSION_INSTRUCTIONS),
+            MAC_HYPERVISOR_LINE.to_owned(),
         ]
         .concat();
         assert_eq!(out_of(SetupPlatform::Macos), (8, mac));
+        let hv = step_line(SetupStep::HypervisorEntitlement);
+        assert!(hv.contains("with the com.apple.security.hypervisor entitlement"));
+        assert!(hv.contains("Apple Silicon with macOS 15 or later"));
+        assert!(hv.contains("\"condition\":\"microvm\""));
         let win = [
             test_line("wsl2-enable", true, WSL2_ENABLE_INSTRUCTIONS),
             test_line("developer-mode", true, DEVELOPER_MODE_INSTRUCTIONS),
@@ -409,6 +439,7 @@ mod tests {
         let all = [
             VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
             MACOS_MIN_VERSION_INSTRUCTIONS,
+            HYPERVISOR_ENTITLEMENT_INSTRUCTIONS,
         ]
         .join(" ");
         for needle in [
@@ -417,16 +448,25 @@ mod tests {
             "fandhe-container-plugin-macos",
             "sw_vers -productVersion",
             "macOS 13",
+            "com.apple.security.hypervisor",
+            "fandhe-container-plugin-microvm",
+            "macOS 15",
+            "Apple Silicon",
         ] {
             assert!(all.contains(needle), "instructions: {needle}");
             assert!(doc.contains(needle), "doc: {needle}");
         }
-        for id in ["virtualization-entitlement", "macos-min-version"] {
+        for id in [
+            "virtualization-entitlement",
+            "macos-min-version",
+            "hypervisor-entitlement",
+        ] {
             assert!(doc.contains(&format!("`{id}`")), "doc id: {id}");
         }
         for t in [
             VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
             MACOS_MIN_VERSION_INSTRUCTIONS,
+            HYPERVISOR_ENTITLEMENT_INSTRUCTIONS,
         ] {
             assert!(t.ends_with(" See docs/setup/macos.md"), "{t}");
         }
@@ -704,6 +744,7 @@ mod tests {
         let (_, mac) = out_of(SetupPlatform::Macos);
         assert!(setup_markers_in(&mac).contains(&"virtualization-entitlement".to_owned()));
         assert!(setup_markers_in(&mac).contains(&"entitlement".to_owned()));
+        assert!(setup_markers_in(&mac).contains(&"hypervisor-entitlement".to_owned()));
         assert!(
             setup_markers_in(&step_line(SetupStep::Wsl2Enable)).contains(&"{\"step\":".to_owned())
         );

@@ -376,8 +376,12 @@ pub struct HvfAssembleInput {
     pub ram_size: u64,
     /// レイアウトの virtio-mmio の個数。
     pub layout_virtio_count: u32,
-    /// 実際に登録するデバイス数（block + net）。
+    /// 実際に登録するデバイス数（block + net。シリアルは含まない）。
     pub device_count: usize,
+    /// シリアル（ns16550a の MMIO）を MMIO 表へ登録するか（`HvfMicroVmConfig::serial`。#3882・MVM-5・MVM-1）。
+    pub serial: bool,
+    /// レイアウトにシリアルの窓があるか（`layout.serial.is_some()`。#3882）。
+    pub layout_serial: bool,
     /// カーネル Image の長さ。
     pub image_len: u64,
     /// initrd の長さ（無ければ `None`）。
@@ -388,11 +392,18 @@ pub struct HvfAssembleInput {
 
 /// 構成値の上限検査（資源を作る前。ERR-1: メッセージは固定で入力値をエコーしない）。
 ///
-/// 順序: vcpus（0 は `InvalidArgument`、2 以上は `Unimplemented`。他の不正に隠れないよう最初）→ RAM → デバイス数 →
+/// 順序: vcpus（0 は `InvalidArgument`、2 以上は `Unimplemented`。他の不正に隠れないよう最初）→ RAM → virtio の台数
+/// （[`crate::arm64_layout::ARM64_VIRTIO_MMIO_MAX`]）→ レイアウトの個数の一致 → シリアルの有無の一致 → MMIO 表の合計 →
 /// Image・initrd・cmdline の長さ。Image ヘッダの中身はここでは見ない（RAM 登録後の `load_arm64` が検証する）。
+///
+/// MMIO 表の合計（#3882）: macOS ではシリアルも virtio と同じ MMIO 表（1 表 [`crate::dispatch::MAX_BUS_DEVICES`] 件）に載るため、
+/// virtio + シリアル（有効なら 1）がその上限を超える構成は、VM・GIC・RAM を作る前に `InvalidArgument` で拒否する
+/// （作った後の段 5 で `ResourceExhausted` になるのを避ける）。virtio は単独なら 32 台まで受けるが、シリアルありでは 31 台まで。
+/// Linux の `MicroVm` は UART が PIO 表（COM1）にあり MMIO 表とは別勘定のため、この制約は macOS 側だけの話。
 pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError> {
     use crate::arm64_layout::{ARM64_MAX_BOOTARGS, ARM64_VIRTIO_MMIO_MAX};
     use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
+    use crate::dispatch::MAX_BUS_DEVICES;
 
     if input.vcpus == 0 {
         return Err(invalid("vcpus is zero"));
@@ -411,6 +422,12 @@ pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError
     }
     if u32::try_from(input.device_count).ok() != Some(input.layout_virtio_count) {
         return Err(invalid("device layout does not match the configuration"));
+    }
+    if input.layout_serial != input.serial {
+        return Err(invalid("serial layout does not match the configuration"));
+    }
+    if input.device_count.saturating_add(usize::from(input.serial)) > MAX_BUS_DEVICES {
+        return Err(invalid("too many mmio bus devices"));
     }
     if input.image_len == 0 || input.image_len > MAX_KERNEL_IMAGE_BYTES {
         return Err(invalid("kernel image length is out of range"));
@@ -1321,6 +1338,8 @@ mod tests {
             ram_size: 64 << 20,
             layout_virtio_count: 1,
             device_count: 1,
+            serial: false,
+            layout_serial: false,
             image_len: 4096,
             initrd_len: None,
             cmdline_len: 0,
@@ -1400,6 +1419,55 @@ mod tests {
                 "device layout does not match the configuration"
             )
         );
+    }
+
+    /// MVM-5・MVM-1・#3882: シリアルは virtio と同じ MMIO 表を 1 枠使う。32 台 + シリアルは資源を作る前に拒否する。
+    #[test]
+    fn mvm5_3882_assemble_bus_limit_with_serial() {
+        let mut i = ok_input();
+        i.device_count = 32;
+        i.layout_virtio_count = 32;
+        i.serial = true;
+        i.layout_serial = true;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "too many mmio bus devices"
+            )
+        );
+        i.device_count = 31;
+        i.layout_virtio_count = 31;
+        assert!(check_assemble_input(&i).is_ok());
+        i.device_count = 32;
+        i.layout_virtio_count = 32;
+        i.serial = false;
+        i.layout_serial = false;
+        assert!(check_assemble_input(&i).is_ok());
+    }
+
+    /// MVM-5・MVM-1・#3882: 設定とレイアウトのシリアルの有無の不一致は fail-closed。
+    #[test]
+    fn mvm5_3882_assemble_serial_layout_mismatch() {
+        let msg = "serial layout does not match the configuration";
+        let mut i = ok_input();
+        i.serial = false;
+        i.layout_serial = true;
+        assert_eq!(assemble_err(i), (MicrovmErrorCode::InvalidArgument, msg));
+        i.serial = true;
+        i.layout_serial = false;
+        assert_eq!(assemble_err(i), (MicrovmErrorCode::InvalidArgument, msg));
+        i.layout_serial = true;
+        assert!(check_assemble_input(&i).is_ok());
+    }
+
+    /// MVM-5・MVM-1・#3882: virtio の上限と MMIO 表の上限が食い違うと新しい検査が死ぬか前提が崩れるため、値を固定する。
+    #[test]
+    fn mvm5_3882_bus_limit_matches_virtio_max() {
+        use crate::arm64_layout::ARM64_VIRTIO_MMIO_MAX;
+        use crate::dispatch::MAX_BUS_DEVICES;
+        assert_eq!(ARM64_VIRTIO_MMIO_MAX as usize, MAX_BUS_DEVICES);
+        assert_eq!(MAX_BUS_DEVICES, 32);
     }
 
     #[test]

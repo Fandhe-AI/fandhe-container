@@ -6,7 +6,7 @@
 //! TASK-192.16・#3798: microVM の start / stop と解放順序（`microvm::{HvfMicroVm, RunningHvfMicroVm}`）。
 //! TASK-192.9・#3791: vCPU 専用スレッド（`vcpu`）と exit ごとのスタブ（`mmio`・`hvc`・`timer`）。ループ本体は OS 非依存の `crate::hvf_loop`。
 
-pub use crate::sys::{GicApi, GicConfig, GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
+pub use crate::sys::{GicApi, GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
 
 pub mod memory;
 pub use memory::{HvfGuestRam, RegisteredHvfRam};

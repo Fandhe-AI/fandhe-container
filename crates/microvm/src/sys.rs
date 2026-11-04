@@ -486,6 +486,39 @@ impl Default for KvmLapicState {
 }
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod sealed {
+    /// `FlexEntry` を sys の外から実装させないための封印（#3840）。この module も private のため名前を書けない。
+    pub trait Sealed {}
+}
+
+/// `FlexBuf` の要素型（#3840・MVM-1・MVM-4・REPAIR-2）。sys 内でだけ実装できる（`sealed::Sealed` が private）。
+///
+/// # Safety
+///
+/// 実装する型は次をすべて満たすこと。
+/// - `#[repr(C)]` で、フィールドは整数（と整数の配列）だけ。どのビットパターンも有効な値になる
+///   （`bool`・enum・`char`・参照・ポインタ・`NonZero*` を含まない）。ゼロ埋めの領域やカーネルが書き戻した
+///   任意のバイト列をこの型として読んでも UB にならない
+/// - `align_of::<Self>() <= 8`（ヘッダ 8 バイトの直後に置くため。各型の const assert で固定する）
+/// - レイアウトが uapi の対応する C 構造体と一致する（const assert で固定する）
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+unsafe trait FlexEntry: sealed::Sealed + Copy {}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl sealed::Sealed for KvmCpuidEntry2 {}
+// SAFETY: repr(C) で u32 のフィールドと [u32; 3] だけ（どのビットパターンも有効）。align 4（<= 8）とサイズ 40 は
+// 下の const assert で固定済み。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+unsafe impl FlexEntry for KvmCpuidEntry2 {}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+impl sealed::Sealed for KvmMsrEntry {}
+// SAFETY: repr(C) で u32・u32・u64 だけ（どのビットパターンも有効）。align 8（<= 8）とサイズ 16 は
+// 下の const assert で固定済み。
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+unsafe impl FlexEntry for KvmMsrEntry {}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
     assert!(size_of::<KvmCpuidEntry2>() == 40);
@@ -1558,11 +1591,11 @@ pub(crate) fn kvm_set_sregs(vcpu: BorrowedFd<'_>, sregs: &KvmSregs) -> Result<()
 /// 先頭 8 バイトのヘッダ（先頭 4 バイトが件数 `u32`、残りは padding）の直後に `E` が `cap` 件続く 1 つの連続領域を
 /// ちょうどの大きさで確保する。不変条件: 作成時にヘッダの件数へ `cap` を書く（ioctl 後はカーネルが書き戻した
 /// 非信頼の値になるため、読むときは `entries` が容量以下を検証する）。
-/// `E` はどのビットパターンも有効な整数だけの `repr(C)` 型（`KvmCpuidEntry2`・`KvmMsrEntry`）に限る。
+/// `E` は [`FlexEntry`] を実装する型（`KvmCpuidEntry2`・`KvmMsrEntry`）に限る。不変条件は trait の `# Safety` にある。
 /// 呼び出し元は下の `kvm_get_supported_cpuid` などの安全なラッパーだけ。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[cfg_attr(not(test), allow(dead_code))]
-struct FlexBuf<E: Copy> {
+struct FlexBuf<E: FlexEntry> {
     ptr: NonNull<u8>,
     layout: Layout,
     cap: usize,
@@ -1571,7 +1604,7 @@ struct FlexBuf<E: Copy> {
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[cfg_attr(not(test), allow(dead_code))]
-impl<E: Copy> FlexBuf<E> {
+impl<E: FlexEntry> FlexBuf<E> {
     const HEADER: usize = 8;
 
     /// `n` 件分を確保する。`n > max` は確保より前に E2BIG（7）で拒否する。
@@ -1620,8 +1653,9 @@ impl<E: Copy> FlexBuf<E> {
         if count > self.cap {
             return Err(SysError::Os(22));
         }
-        // SAFETY: entries は先頭から 8 バイト後で、確保のアラインは `max(4, align_of::<E>())`（<= 8）のため
-        // `E` のアラインに合う。`count <= cap` で範囲内、ゼロ埋め以後は整数だけで有効なビットパターン、
+        // SAFETY: entries は先頭から 8 バイト後で、確保のアラインは `max(4, align_of::<E>())` で、
+        // `E: FlexEntry` の契約により `align_of::<E>() <= 8` のため `E` のアラインに合う。同じ契約によりどのビット
+        // パターンも有効（ゼロ埋め以後・カーネルの書き戻しを含む）。`count <= cap` で範囲内、
         // `&self` の間は他に書き手がいない。
         Ok(unsafe {
             std::slice::from_raw_parts(self.ptr.as_ptr().add(Self::HEADER).cast::<E>(), count)
@@ -1633,7 +1667,7 @@ impl<E: Copy> FlexBuf<E> {
         if src.len() > self.cap {
             return Err(SysError::Os(22));
         }
-        // SAFETY: 範囲は `src.len() <= cap` を検査済みで、アラインは `entries` と同じ。`&mut self` で排他的、
+        // SAFETY: 範囲は `src.len() <= cap` を検査済みで、アラインは `entries` と同じ（`E: FlexEntry` の契約）。`&mut self` で排他的、
         // `src` は別の確保で重ならない。
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1648,7 +1682,7 @@ impl<E: Copy> FlexBuf<E> {
 
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[cfg_attr(not(test), allow(dead_code))]
-impl<E: Copy> Drop for FlexBuf<E> {
+impl<E: FlexEntry> Drop for FlexBuf<E> {
     fn drop(&mut self) {
         // SAFETY: `ptr` は `with_capacity` が同じ `layout` で確保したもので、drop は 1 度だけ。
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
@@ -2282,6 +2316,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     #[test]
     fn flex_buffer_roundtrip_and_untrusted_count() {
+        fn assert_flex_entry<E: FlexEntry>() {}
+        assert_flex_entry::<KvmCpuidEntry2>();
+        assert_flex_entry::<KvmMsrEntry>();
         let mut b = FlexBuf::<KvmCpuidEntry2>::with_capacity(3, 256).unwrap();
         assert_eq!(b.count(), 3);
         let src = [

@@ -15,7 +15,11 @@
 //!   組み直さず照合で fail-closed にするのは、`build_guest_fdt` の署名変更を #3790・#3797 へ波及させないため。
 //!
 //! 未実装（REPAIR-3）: SMP（vCPU 2 以上は `Unimplemented`。#3797）・シリアルと `stdout-path`（chosen に付けない）・
-//! PCI・virtio の通知方式と trigger の整合（#3795）・IPA 上限の確定（#3803）。
+//! PCI・IPA 上限の確定（#3803）。
+//!
+//! virtio の通知方式（#3795）: FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
+//! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。SPI 番号が API の範囲内かは
+//! [`check_spi_intid`] が照合する。level への変更と InterruptACK 後の deassert は対象外。
 //!
 //! # 出典（Linux `Documentation/devicetree/bindings`）
 //! `arm/psci.yaml`・`interrupt-controller/arm,gic-v3.yaml`・`timer/arm,arch_timer.yaml`・`virtio/mmio.yaml`・`arm/cpus.yaml`。
@@ -78,11 +82,14 @@ const TIMER_PPIS: [u32; 4] = [
     ARM64_TIMER_VIRT_PPI,
     ARM64_TIMER_HYP_PPI,
 ];
-/// virtio の trigger。`hv_gic_set_spi(intid, level)` は level 形の API のため、
-/// #3795 の通知方式（パルスか保持か）とこの定数を一致させる必要がある（未決・#3795 で確定）。
+/// virtio の trigger は edge-rising に確定（#3795）。macOS の `hv_gic_set_spi(intid, level)` は level 形の API だが、
+/// edge 割り込みは `true` を 1 回渡せば発生し、edge での `false` は無視される。このため
+/// `GicSpiLine::trigger`（`crate::hvf`）は `set_spi(intid, true)` を 1 回だけ呼ぶ。この定数と一致させること。
 const VIRTIO_IRQ_TRIGGER: u32 = IRQ_TYPE_EDGE_RISING;
 /// GICv3 の SPI 番号の上限（INTID 1019 - 32）。
 const GIC_MAX_SPI_N: u32 = 987;
+/// SPI の最小 INTID（INTID 0..=15 が SGI、16..=31 が PPI）。
+const ARM64_SPI_INTID_BASE: u32 = 32;
 const RAM_BASE_ALIGN: u64 = 2 * 1024 * 1024;
 const RAM_SIZE_ALIGN: u64 = 64 * 1024;
 
@@ -141,7 +148,7 @@ impl GuestSpi {
     }
     /// GIC の INTID（32 + n）。`hv_gic_set_spi` に渡す値（#3795）。
     pub fn intid(self) -> Option<u32> {
-        self.0.checked_add(32)
+        self.0.checked_add(ARM64_SPI_INTID_BASE)
     }
 }
 
@@ -335,7 +342,43 @@ pub fn check_virtual_timer_intid(intid: u32) -> Result<(), MicrovmError> {
     Ok(())
 }
 
+/// `spi` の INTID が `hv_gic_get_spi_interrupt_range` の範囲 `[range_base, range_base + range_count)` に
+/// 収まるか検査し、INTID を返す（純関数。#3795・MVM-5）。
+///
+/// 範囲そのものの異常（0 件・INTID 32 未満・桁あふれ）はフレームワークの異常値として `Internal`、
+/// INTID の桁あふれと範囲外は `InvalidArgument`。メッセージは固定の英語で入力をエコーしない。
+pub fn check_spi_intid(
+    spi: GuestSpi,
+    range_base: u32,
+    range_count: u32,
+) -> Result<u32, MicrovmError> {
+    let internal = |m: &'static str| MicrovmError::new(MicrovmErrorCode::Internal, m);
+    let range_end = range_base
+        .checked_add(range_count)
+        .filter(|_| range_count != 0 && range_base >= ARM64_SPI_INTID_BASE)
+        .ok_or_else(|| internal("gic spi range reported by the hypervisor is invalid"))?;
+    let intid = spi
+        .intid()
+        .ok_or_else(|| invalid("virtio spi intid overflows"))?;
+    if intid < range_base || intid >= range_end {
+        return Err(invalid("virtio spi intid is outside the gic spi range"));
+    }
+    Ok(intid)
+}
+
 impl Arm64Layout {
+    /// 全 virtio-mmio の SPI が API の範囲に収まるか検査する（VM 作成の前に呼ぶ。#3795・MVM-5）。
+    pub fn check_virtio_spi_range(
+        &self,
+        range_base: u32,
+        range_count: u32,
+    ) -> Result<(), MicrovmError> {
+        for index in 0..self.virtio_mmio_count {
+            check_spi_intid(self.virtio_spi(index)?, range_base, range_count)?;
+        }
+        Ok(())
+    }
+
     /// 配置が GIC の実値 `g` を満たすか検査する（VM 作成の前に呼ぶ。#3792・MVM-5）。
     ///
     /// 先に [`Self::validate`] を通す。窓の重なりと IPA 上限は `validate` が窓の大きさで検査済みで、
@@ -533,6 +576,80 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// MVM-5・MVM-1: SPI の INTID が範囲の境界で具体的に判定される（#3795）。
+    #[test]
+    fn mvm5_3795_spi_intid_range_boundaries() {
+        let l = Arm64Layout::new(4 * MIB, 1, 20).unwrap();
+        let spi = |i: u32| l.virtio_spi(i).unwrap();
+        // 既定の SPI 基点 16（INTID 48）。範囲 [48, 52)。
+        assert_eq!(check_spi_intid(spi(0), 48, 4).unwrap(), 48);
+        assert_eq!(check_spi_intid(spi(3), 48, 4).unwrap(), 51);
+        assert_eq!(
+            check_spi_intid(spi(4), 48, 4).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        // 範囲の下側（base=49 のとき INTID 48 は外）。
+        assert_eq!(
+            check_spi_intid(spi(0), 49, 4).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        // 典型の範囲 [32, 1020)。
+        let mut m = l.clone();
+        m.virtio_spi_base = 987 - 1;
+        assert_eq!(
+            check_spi_intid(m.virtio_spi(0).unwrap(), 32, 988).unwrap(),
+            1018
+        );
+        assert_eq!(
+            check_spi_intid(m.virtio_spi(1).unwrap(), 32, 988).unwrap(),
+            1019
+        );
+        assert_eq!(
+            check_spi_intid(m.virtio_spi(2).unwrap(), 32, 988)
+                .unwrap_err()
+                .code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+
+    /// MVM-5: フレームワークの範囲の異常は `Internal`、INTID の桁あふれは `InvalidArgument`（#3795）。
+    #[test]
+    fn mvm5_3795_spi_intid_rejects_abnormal_range_and_overflow() {
+        let l = Arm64Layout::new(4 * MIB, 1, 1).unwrap();
+        let spi = l.virtio_spi(0).unwrap();
+        for (base, count) in [(48, 0), (31, 10), (u32::MAX, 2)] {
+            assert_eq!(
+                check_spi_intid(spi, base, count).unwrap_err().code(),
+                MicrovmErrorCode::Internal,
+                "base={base} count={count}"
+            );
+        }
+        let mut m = l.clone();
+        m.virtio_spi_base = u32::MAX - 31;
+        let huge = m.virtio_spi(0).unwrap();
+        assert_eq!(huge.intid(), None);
+        assert_eq!(
+            check_spi_intid(huge, 32, 988).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+
+    /// MVM-5: 既定配置の最初の virtio は INTID 48 で、範囲外の配置は事前検査で拒否される（#3795）。
+    #[test]
+    fn mvm5_3795_default_layout_virtio_intid_is_48() {
+        let l = Arm64Layout::new(4 * MIB, 1, 4).unwrap();
+        assert_eq!(l.virtio_spi(0).unwrap().intid(), Some(48));
+        assert!(l.check_virtio_spi_range(32, 988).is_ok());
+        assert!(l.check_virtio_spi_range(48, 4).is_ok());
+        assert_eq!(
+            l.check_virtio_spi_range(48, 3).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+        // virtio が 0 台なら範囲の照合は対象が無く成功する。
+        let none = Arm64Layout::new(4 * MIB, 1, 0).unwrap();
+        assert!(none.check_virtio_spi_range(1000, 4).is_ok());
+    }
 
     /// MVM-5: 既定配置の値。
     #[test]

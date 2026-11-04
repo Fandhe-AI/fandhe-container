@@ -3,7 +3,7 @@
 //! 呼び出し文脈: ゲストの `QueueNotify` を受けた側（Linux では `crate::irq` の ioeventfd、それ以外では
 //! `crate::dispatch` の MMIO exit）が [`complete_block_notify`]（virtio-net は [`complete_net_notify`]）を呼び、virtqueue の処理結果に応じて
 //! [`InterruptLine::trigger`] でゲストへ割り込みを 1 回注入する。Linux の [`InterruptLine`] 実装は
-//! `crate::irq::IrqFd`（`KVM_IRQFD`）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
+//! `crate::irq::IrqFd`（`KVM_IRQFD`）、macOS は `crate::hvf::gic::GicSpiLine`（`hv_gic_set_spi`。#3795）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
 //! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
 //! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みは edge 扱いで、

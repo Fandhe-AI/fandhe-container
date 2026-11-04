@@ -565,6 +565,11 @@ pub fn pc_after_trapped_smc(pc: u64, syndrome: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::{Barrier, Mutex};
+
+    const NS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
     /// 戻り値の定数を DEN0022 F.b §5.2.2 Table 5 の具体値で照合する（MVM-5・MVM-1・REPAIR-12・#3920）。
     #[test]
     fn mvm5_3920_return_codes_match_den0022_table5() {
@@ -577,11 +582,6 @@ mod tests {
         assert_eq!(PSCI_RET_INTERNAL_FAILURE, -6);
         assert_eq!(PSCI_RET_INVALID_ADDRESS, -9);
     }
-
-    use super::*;
-    use std::sync::{Barrier, Mutex};
-
-    const NS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
     /// 呼び出しを記録し、結果を差し替えられる偽の電源制御。
     #[derive(Default)]

@@ -13,11 +13,16 @@ target="$script_dir/build-microvm-test-initrd.sh"
 export LC_ALL=C
 
 unset MICROVM_TEST_INITRD_OUTPUT_DIR MICROVM_TEST_INITRD_COMPRESS MICROVM_TEST_INITRD_UNAME_S \
-    MICROVM_TEST_INITRD_GZIP MICROVM_TEST_INITRD_TEST_SANDBOX
+    MICROVM_TEST_INITRD_GZIP MICROVM_TEST_INITRD_TEST_SANDBOX MICROVM_TEST_INITRD_VARIANT
 
 # 初版（#3770）のゴールデン。
 golden_init_sha="c7341f1857b739c9d1ac119fde214592ba12e2f12eaa02409b0f31f1262ccdcf"
 golden_initrd_sha="324915663a384b3f2e253f78bdcfa8526a519544131f887ecfb18232ae7c12a7"
+# variant block-read の初版（#3889）のゴールデン。コードは GNU as で組んだ逆アセンブルと一致を確認済み。
+golden_block_init_sha="8a21ae7ca097222b72ca8b74d6ba6c21b3b2a70d4bea00aa4218fe97f81671aa"
+golden_block_initrd_sha="3d700a7c4b52449c364c7422022c2b7875bf0622565b88f68f8d04abb4051de2"
+# block-read のコード 183 バイト（ファイル先頭から 120 バイト目）
+golden_block_code="b853000000488d3dab000000beed0100000f05b8a5000000488d3d9d000000488d35910000004889fa4531d24531c00f05b802000000488d3d8800000031f60f054885c0783f4881ec0002000089c731c04889e6ba000200000f05483d000200007522488d3d640000004889e6b920000000fcf3a6750e488d3570000000ba2a000000eb0c488d358c000000ba30000000b801000000bf010000000f05b8a9000000bfaddee1febe69191228ba674523010f05f390ebfc"
 
 sb="$(mktemp -d)"
 trap 'rm -rf "$sb"' EXIT
@@ -83,6 +88,9 @@ case "$(uname -s)" in
         run "$target" --output-dir "$out"
         check "win exit code" 2 "$rc"
         check "win error code" unsupported-os "$(errcode)"
+        newout
+        run "$target" --variant block-read --output-dir "$out"
+        check "win block-read refused" "2 unsupported-os" "$rc $(errcode)"
         echo "pass=$pass fail=$fail"
         [ "$fail" -eq 0 ]
         exit $?
@@ -139,6 +147,7 @@ initrd_sha256=$golden_initrd_sha
 compress=none
 arch=x86_64
 format=newc
+variant=default
 message=fandhe-microvm-test: init ok v1" "$(grep -v '^host=' "$out/build-info.txt")"
 
 # --- 5: 決定性 ---
@@ -231,6 +240,82 @@ check "12 output removed" "no" "$([ -e "$out" ] && echo yes || echo no)"
 check "12 lock removed" "no" "$([ -e "$out.lock" ] && echo yes || echo no)"
 sleep 1
 if pgrep -f "$sb/gzip-hang" >/dev/null 2>&1; then ng "12 stub process left behind"; else ok "12 no stub process left"; fi
+
+# --- 13: variant block-read（#3889） ---
+newout
+run "$target" --variant block-read --output-dir "$out"
+check "13 exit code" 0 "$rc"
+check "13 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+bcpio="$out/initrd.cpio"
+check "13 entries" "init 000081ed 00000000 00000000 448
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$bcpio")"
+binit="$sb/init-block.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$bcpio" | head -c 448 >"$binit"
+check "13 init size" 448 "$(wc -c <"$binit" | tr -d ' ')"
+check "13 magic class data" "7f454c460201" "$(hexat "$binit" 0 6)"
+check "13 e_type" 2 "$(leat "$binit" 16 2)"
+check "13 e_machine" 62 "$(leat "$binit" 18 2)"
+check "13 e_entry" $((0x400078)) "$(leat "$binit" 24 8)"
+check "13 e_phoff" 64 "$(leat "$binit" 32 8)"
+check "13 e_phnum" 1 "$(leat "$binit" 56 2)"
+check "13 p_type is PT_LOAD" 1 "$(leat "$binit" 64 4)"
+check "13 p_flags R+X" 5 "$(leat "$binit" 68 4)"
+check "13 p_vaddr" $((0x400000)) "$(leat "$binit" 80 8)"
+check "13 p_filesz" 448 "$(leat "$binit" 96 8)"
+check "13 p_memsz" 448 "$(leat "$binit" 104 8)"
+check "13 code (183 bytes)" "$golden_block_code" "$(hexat "$binit" 120 183)"
+check "13 data /dev" "2f64657600" "$(hexat "$binit" 303 5)"
+check "13 data devtmpfs" "646576746d70667300" "$(hexat "$binit" 308 9)"
+check "13 data /dev/vda" "2f6465762f76646100" "$(hexat "$binit" 317 9)"
+check "13 sentinel" "fandhe-microvm-block-sentinel-01" "$(tail -c +327 "$binit" | head -c 32)"
+check "13 match message" "fandhe-microvm-test: block sentinel ok v1" "$(tail -c +359 "$binit" | head -c 41)"
+check "13 match message newline" "0a" "$(hexat "$binit" 399 1)"
+check "13 mismatch message" "fandhe-microvm-test: block sentinel mismatch v1" "$(tail -c +401 "$binit" | head -c 47)"
+check "13 mismatch message newline" "0a" "$(hexat "$binit" 447 1)"
+check "13 init sha256" "$golden_block_init_sha" "$(sha_of "$binit")"
+check "13 initrd sha256" "$golden_block_initrd_sha" "$(sha_of "$bcpio")"
+check "13 build-info" "init_sha256=$golden_block_init_sha
+init_bytes=448
+initrd_file=initrd.cpio
+initrd_sha256=$golden_block_initrd_sha
+compress=none
+arch=x86_64
+format=newc
+variant=block-read
+sentinel=fandhe-microvm-block-sentinel-01
+message_match=fandhe-microvm-test: block sentinel ok v1
+message_mismatch=fandhe-microvm-test: block sentinel mismatch v1" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant block-read --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$bcpio"; then ok "13 second run is byte-identical"; else ng "13 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant block-read --output-dir "$out" --compress gzip
+    check "13 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$bcpio"; then ok "13 gunzip equals the plain archive"; else ng "13 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 13 gzip)"
+fi
+
+# --- 14: variant の選択（既定の版は不変・環境変数・CLI の優先・不正値） ---
+newout
+run "$target" --variant default --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "14 explicit default is byte-identical to the implicit one"; else ng "14 explicit default differs"; fi
+newout
+run env MICROVM_TEST_INITRD_VARIANT=block-read "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$bcpio"; then ok "14 env variant selects block-read"; else ng "14 env variant ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_VARIANT=block-read "$target" --variant default --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "14 CLI variant wins over env"; else ng "14 CLI variant did not win"; fi
+newout
+run "$target" --variant bogus --output-dir "$out"
+check "14 bad variant" "2 bad-argument" "$rc $(errcode)"
+run env MICROVM_TEST_INITRD_VARIANT=bogus "$target" --output-dir "$out"
+check "14 bad env variant" "2 bad-argument" "$rc $(errcode)"
+check "14 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant block-read --output-dir "$out"
+check "14 windows host refused for block-read" "2 unsupported-os" "$rc $(errcode)"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

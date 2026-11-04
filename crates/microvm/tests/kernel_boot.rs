@@ -52,7 +52,8 @@
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。MP テーブル（#3888）でゲストは
 //! IOAPIC モードになり、Linux の `check_timer` が PIT 無しで失敗して止まる可能性が高い。止まる場合は `_CMDLINE` で
 //! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
-//! device model 側の別 issue として扱う。範囲外: aarch64。
+//! device model 側の別 issue として扱う。
+//! aarch64 は `mod arm64`（#3897。陽性と initrd 無しの負の対照の 2 件。シリアル marker は #3898、SMP は #3899 の後）。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -1457,7 +1458,289 @@ mod x86 {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// aarch64 の実カーネル起動試験（#3897・MVM-1・REPAIR-5・REPAIR-12）。
+///
+/// arm64 の非圧縮 `Image` と `MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build` の initrd（`/init` は
+/// write の後に `reboot(RESTART)`）で `assemble` → `load_kernel` → `start` を通し、PSCI SYSTEM_RESET が
+/// `KVM_EXIT_SYSTEM_EVENT` として `StopReason::GuestShutdown` に分類されること（#3896）を照合する。
+/// ホスト要件: Linux aarch64・`/dev/kvm` の読み書き（root 不要）・in-kernel vGICv3（GICv2 のみのホストは `assemble` で失敗）・
+/// `KVM_CAP_ARM_PSCI_0_2`。シリアルは aarch64 では未結線（#3898）のため marker は照合しない。判定は停止理由・起点 vCPU・
+/// エラー件数・期限内で行う。範囲外: SMP（#3899）・virtio・シリアル marker（#3898）。
+/// x86 の同名ヘルパーと同じ契約の入力検査を複製している（x86 側の件数・挙動を変えないため）。
+/// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
+#[cfg(target_arch = "aarch64")]
+mod arm64 {
+    use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
+    use fandhe_container_microvm::device::KvmDevice;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// `panic=` を含まない無害な既定値。x86 の `console=ttyS0 reboot=t` は arm64 に当たらず、FDT に serial ノードも無い。
+    const DEFAULT_CMDLINE: &str = "rdinit=/init";
+    const DEFAULT_TIMEOUT_SECS: u64 = 60;
+    /// `MicroVmConfig` に既定値が無いため x86 と同じ 256 MiB とする。
+    const RAM_SIZE: u64 = 256 << 20;
+    const KERNEL_CAP: u64 = fandhe_container_microvm::boot_x86::MAX_KERNEL_IMAGE_BYTES;
+    const INITRD_CAP: u64 = 64 << 20;
+    const STOP_DEADLINE: Duration = Duration::from_secs(10);
+    const SLACK: Duration = Duration::from_secs(15);
+
+    fn precondition(reason: &str) -> ! {
+        panic!("kernel_boot: PRECONDITION FAILED (test environment, not a regression): {reason}")
+    }
+
+    /// 上限つきでファイルを読む（x86 の `read_bounded` と同じ契約。O_NONBLOCK で FIFO の無期限待ちを防ぐ）。
+    fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0o4000)
+            .open(path)
+            .map_err(|e| format!("cannot open file: {e}"))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("cannot stat file: {e}"))?;
+        if !meta.is_file() {
+            return Err("not a regular file".into());
+        }
+        if meta.len() == 0 || meta.len() > cap {
+            return Err(format!("file size {} not in 1..={cap}", meta.len()));
+        }
+        let mut buf = Vec::new();
+        file.take(cap + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("cannot read file: {e}"))?;
+        if buf.is_empty() || buf.len() as u64 > cap {
+            return Err("file size changed while reading".into());
+        }
+        Ok(buf)
+    }
+
+    fn parse_boot_timeout(raw: Option<&str>) -> Result<u64, String> {
+        match raw {
+            None => Ok(DEFAULT_TIMEOUT_SECS),
+            Some(s) => match s.parse::<u64>() {
+                Ok(n) if (1..=600).contains(&n) => Ok(n),
+                _ => Err(
+                    "FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS must be an integer in 1..=600"
+                        .into(),
+                ),
+            },
+        }
+    }
+
+    fn validate_cmdline(raw: Option<&str>) -> Result<String, String> {
+        let s = raw.unwrap_or(DEFAULT_CMDLINE);
+        if s.is_empty() || s.bytes().any(|b| !(0x20..=0x7E).contains(&b)) {
+            return Err(
+                "FANDHE_CONTAINER_MICROVM_CMDLINE must be non-empty printable ASCII".into(),
+            );
+        }
+        Ok(s.to_owned())
+    }
+
+    /// 負の対照用の cmdline。Linux の `panic=` は後勝ちなので末尾に `panic=0` を足し、利用者の `panic=N` による
+    /// panic 後の自動 reboot（SYSTEM_RESET → `GuestShutdown`）の偽陽性を抑える。
+    fn negative_cmdline(base: &str) -> String {
+        format!("{base} panic=0")
+    }
+
+    struct Inputs {
+        dev: KvmDevice,
+        kernel: Vec<u8>,
+        initrd: Option<Vec<u8>>,
+        cmdline: String,
+        secs: u64,
+    }
+
+    /// 前提の検査はすべてテストスレッドで行う（x86 と同じ方針）。
+    fn inputs(with_initrd: bool) -> Inputs {
+        let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                precondition("FANDHE_CONTAINER_MICROVM_KERNEL is not set (path to an arm64 Image)")
+            }
+        };
+        let kernel = read_bounded(Path::new(&kernel_path), KERNEL_CAP)
+            .unwrap_or_else(|e| precondition(&format!("kernel image: {e}")));
+        if let Err(e) = Arm64ImageHeader::parse(&kernel) {
+            precondition(&format!(
+                "kernel image is not an uncompressed arm64 Image: {e}"
+            ));
+        }
+        let initrd = if with_initrd {
+            let path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
+                Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                _ => Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/microvm-test-initrd/aarch64/initrd.cpio"),
+            };
+            Some(read_bounded(&path, INITRD_CAP).unwrap_or_else(|e| {
+                precondition(&format!(
+                    "initrd (run `MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build`): {e}"
+                ))
+            }))
+        } else {
+            None
+        };
+        let cmdline = validate_cmdline(
+            std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| precondition(&e));
+        let secs = parse_boot_timeout(
+            std::env::var("FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| precondition(&e));
+        let dev = KvmDevice::open().unwrap_or_else(|e| precondition(&e.to_string()));
+        Inputs {
+            dev,
+            kernel,
+            initrd,
+            cmdline,
+            secs,
+        }
+    }
+
+    struct Outcome {
+        reason: StopReason,
+        origin_vcpu: Option<u32>,
+        vcpu_count: u32,
+        errors: u64,
+        exits: u64,
+        timed_out: bool,
+        elapsed: Duration,
+    }
+
+    impl Outcome {
+        /// 数値だけの診断（ゲスト由来の文字列は載せない）。
+        fn diag(&self) -> String {
+            format!(
+                "reason={:?} origin={:?} errors={} exits={} elapsed={:?} timed_out={}",
+                self.reason,
+                self.origin_vcpu,
+                self.errors,
+                self.exits,
+                self.elapsed,
+                self.timed_out
+            )
+        }
+    }
+
+    fn boot(inp: Inputs, cmdline: String, boot_timeout: Duration) -> Result<Outcome, String> {
+        let started = Instant::now();
+        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: RAM_SIZE,
+            block: vec![],
+            net: vec![],
+        };
+        let mut vm =
+            MicroVm::assemble(&inp.dev, config).map_err(|e| format!("assemble failed: {e}"))?;
+        let loaded = vm
+            .load_kernel(&inp.kernel, inp.initrd.as_deref(), &cmdline)
+            .map_err(|e| format!("load_kernel failed: {e}"))?;
+        let running = vm
+            .start(&loaded)
+            .map_err(|e| format!("start failed: {e}"))?;
+        let mut timed_out = false;
+        loop {
+            if running.is_finished() {
+                break;
+            }
+            if started.elapsed() >= boot_timeout {
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 期限切れでも必ず stop で vCPU を回収する（REPAIR-5）。
+        let report = running
+            .stop(STOP_DEADLINE)
+            .map_err(|e| format!("stop failed: {e}"))?;
+        Ok(Outcome {
+            reason: report.reason,
+            origin_vcpu: report.origin_vcpu,
+            vcpu_count: report.vcpu_count,
+            errors: report.stats.errors,
+            exits: report.stats.exits,
+            timed_out,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    /// 別スレッドで `boot` を回し、全体期限で必ず戻る（watchdog は `--ignored` を素通しするため唯一の層）。
+    fn run_boot(inp: Inputs, cmdline: String) -> (Outcome, Duration) {
+        let secs = inp.secs;
+        let boot_timeout = Duration::from_secs(secs);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(boot(inp, cmdline, boot_timeout));
+        });
+        match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
+            Ok(Ok(o)) => (o, boot_timeout),
+            Ok(Err(e)) => panic!("kernel_boot: boot sequence failed: {e}"),
+            Err(e) => panic!("kernel_boot: DEADLINE EXCEEDED ({e}) after {secs}s boot budget"),
+        }
+    }
+
+    /// 陽性（#3897・MVM-1）。`/init` の reboot（PSCI SYSTEM_RESET）が `GuestShutdown`・起点 vCPU 0 で止まる。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
+        let inp = inputs(true);
+        let cmdline = inp.cmdline.clone();
+        let (o, boot_timeout) = run_boot(inp, cmdline);
+        let diag = o.diag();
+        assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+        assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
+        assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+        assert_eq!(o.errors, 0, "run errors: {diag}");
+        assert!(!o.timed_out, "boot timed out: {diag}");
+        assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+        eprintln!(
+            "kernel_boot: ok arch=aarch64 reason=guest_shutdown elapsed_ms={} exits={}",
+            o.elapsed.as_millis(),
+            o.exits
+        );
+    }
+
+    /// 負の対照（#3897）。initrd が無いと rootfs の mount に失敗して panic し、`panic=0` でループするので期限まで止まらない。
+    /// 既定 60 秒を使い切る。陽性と同じ実行・同じカーネルで回すこと（対照の結果が陽性の `GuestShutdown` の意味を裏づける）。
+    /// `Failed(..)` が出たら device model 側の別 issue。カーネルは `CONFIG_PANIC_TIMEOUT=0` かつ組み込み initramfs 無しが前提。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_without_initrd_does_not_shut_down() {
+        let inp = inputs(false);
+        let cmdline = negative_cmdline(&inp.cmdline);
+        let (o, _) = run_boot(inp, cmdline);
+        let diag = o.diag();
+        assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+        assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
+        assert!(o.timed_out, "expected budget exhaustion: {diag}");
+        assert_eq!(o.origin_vcpu, None, "origin vcpu: {diag}");
+        assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+        assert_eq!(o.errors, 0, "run errors: {diag}");
+    }
+
+    #[test]
+    fn mvm1_3897_negative_cmdline_forces_panic_zero() {
+        assert_eq!(negative_cmdline("rdinit=/init"), "rdinit=/init panic=0");
+        assert_eq!(
+            negative_cmdline("console=x panic=5"),
+            "console=x panic=5 panic=0"
+        );
+    }
+}
+/// x86_64・aarch64 以外では `assemble` が `Unimplemented` であることの確認（aarch64 は `mod arm64`・#3897）。
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod other {
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::error::MicrovmErrorCode;

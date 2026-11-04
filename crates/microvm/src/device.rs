@@ -28,8 +28,8 @@
 //! # アーキテクチャ別の vCPU 作成
 //! - x86_64: `KVM_CREATE_VCPU` だけで vCPU fd が使える。レジスタ設定は TASK-75.3.2 の `VcpuFd::set_boot_state`
 //! - aarch64: `KVM_CREATE_VCPU` の後に VM fd へ `KVM_ARM_PREFERRED_TARGET`、vCPU fd へ `KVM_ARM_VCPU_INIT`
-//!   （features はすべて 0）を発行して初期化済みの vCPU を返す。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。
-//!   features（PSCI 等）の選択は #3896 の担当。aarch64 はネイティブ CI が無く（#2274）型検査のみで実行は未検証
+//!   （features は `KVM_ARM_VCPU_PSCI_0_2` のみ。先に `KVM_CAP_ARM_PSCI_0_2` を確かめ、無ければ `FailedPrecondition`。
+//!   #3896）を発行して初期化済みの vCPU を返す。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。aarch64 はネイティブ CI が無く（#2274）型検査のみで実行は未検証
 //!
 //! # aarch64 の割り込みコントローラー（#3696）
 //! x86_64 の `KVM_CREATE_IRQCHIP` は無く、vGICv3 を `KVM_CREATE_DEVICE`（`KVM_DEV_TYPE_ARM_VGIC_V3`）で作る。順序は
@@ -385,6 +385,7 @@ fn exit_kind(e: &VcpuExit) -> &'static str {
         VcpuExit::Shutdown => "shutdown",
         VcpuExit::FailEntry { .. } => "fail_entry",
         VcpuExit::InternalError { .. } => "internal_error",
+        VcpuExit::SystemEvent { .. } => "system_event",
         VcpuExit::Interrupted => "interrupted",
         VcpuExit::Other { .. } => "other",
     }
@@ -1646,12 +1647,16 @@ impl VmFd {
     /// id の上限は検証せずカーネルの EINVAL（`InvalidArgument`）に任せる。重複は `AlreadyExists`。
     /// 初期化に失敗したときは作成済みの fd を drop で close する。
     pub fn create_vcpu(&self, id: u32) -> Result<VcpuFd, MicrovmError> {
+        // aarch64 は PSCI 0.2 を有効にするため、vCPU を作る前に capability を確かめる（無ければ fd を作らない）。
+        #[cfg(target_arch = "aarch64")]
+        self.require_extension(sys::consts::KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2")?;
         let fd = sys::kvm_create_vcpu(self.fd.as_fd(), u64::from(id))
             .map_err(|e| classify_vcpu_error(VcpuStage::Create, e))?;
         #[cfg(target_arch = "aarch64")]
         {
             let init = sys::kvm_arm_preferred_target(self.fd.as_fd())
                 .map_err(|e| classify_vcpu_error(VcpuStage::PreferredTarget, e))?;
+            let init = sys::with_psci_0_2(init);
             sys::kvm_arm_vcpu_init(fd.as_fd(), &init)
                 .map_err(|e| classify_vcpu_error(VcpuStage::VcpuInit, e))?;
         }

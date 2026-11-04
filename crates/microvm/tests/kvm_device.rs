@@ -2515,7 +2515,7 @@ mod arm64_image;
 
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
-    use super::arm64_image::synthetic_image;
+    use super::arm64_image::{synthetic_image, synthetic_image_with_code};
     use super::*;
     use fandhe_container_microvm::arm64_layout::{
         ARM64_GIC_DIST_BASE, ARM64_GIC_REDIST_BASE, ARM64_RAM_BASE,
@@ -2666,7 +2666,7 @@ mod arm64 {
     }
 
     /// MVM-1・REPAIR-5・#3696: 自分自身へ分岐するゲスト（`b .`）を `start` し、`stop` が期限内に `Requested` で
-    /// 戻り、資源（vGIC・irqfd・vCPU・メモリ）が解放される。PSCI による終了の分類は #3896。
+    /// 戻り、資源（vGIC・irqfd・vCPU・メモリ）が解放される。PSCI による終了は `kvm_device_arm64_psci_system_off_shuts_down`（#3896）。
     #[test]
     #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
     fn kvm_device_arm64_start_stop() {
@@ -2682,5 +2682,23 @@ mod arm64 {
         assert!(report.stats.runs >= 1);
         assert_eq!(report.stats.errors, 0);
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// MVM-1・MVM-4・#3896: PSCI 0.2 の SYSTEM_OFF（`hvc #0`、関数 ID `0x8400_0008`）を呼ぶゲストが
+    /// `KVM_EXIT_SYSTEM_EVENT` 経由で `GuestShutdown` により停止する。負の対照は `kvm_device_arm64_start_stop`
+    /// （`b .` のゲストは `Requested`）。必要環境に `KVM_CAP_ARM_PSCI_0_2` を持つホストを含む（無ければ `FailedPrecondition`）。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn kvm_device_arm64_psci_system_off_shuts_down() {
+        let mut vm = assemble(1, 1);
+        // movz x0, #0x8400, lsl #16 / movk x0, #0x8 / hvc #0 / b .
+        let img =
+            synthetic_image_with_code(true, &[0xD2B0_8000, 0xF280_0100, 0xD400_0002, 0x1400_0000]);
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let running = vm.start(&loaded).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || running.is_finished()));
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::GuestShutdown);
+        assert_eq!(report.stats.errors, 0);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 役割: Hypervisor.framework の `hv_gic_create` は「VM 作成後・vCPU 作成前・VM につき 1 回」しか呼べない。
 //! この順序を型で強制する。流れは `HvVm` → [`VmWithGic`]（GIC 作成済み）→ `HvVcpu` で、vCPU は
-//! [`VmWithGic::create_vcpu`] からだけ作れる（`HvVm::create_vcpu`・`GicApi::create` は crate 外へ公開しない）。
+//! [`VmWithGic::create_vcpu`] からだけ作れる（`HvVm::create_vcpu`・`GicApi::create`・`GicApi::config_create`・`GicApi::set_spi`・`GicConfig` は crate 外へ公開しない）。
 //! 後続の VM 構成体（#3797）が [`VmWithGic`] / [`HvfGic`] を使い、virtio の完了通知は [`GicSpiLine`]（#3795）が担う。
 //!
 //! # 順序の契約

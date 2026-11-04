@@ -830,7 +830,11 @@ fn macos_version() -> Result<MacosVersion, MicrovmError> {
 /// 読み込み済みの image から `name` を探す。見つからなければ `None`（NULL）。
 fn lookup(name: &CStr) -> Option<*mut c_void> {
     // SAFETY: `RTLD_DEFAULT` は読み込み済み image の検索を表す疑似ハンドル。`name` は NUL 終端で呼び出しの間生きている。
-    // `dlsym` は新しい image を読み込まない。
+    // `dlsym` は新しい image を読み込まない。`hv_gic_*` が見つかるのは Hypervisor.framework が読み込み済みのときだけで、
+    // その前提はこのファイルの `hv_vm_*`・`hv_vcpu_*` の `extern` ブロックが `#[link(name = "Hypervisor", kind = "framework")]`
+    // で直接リンクしている（load-time の依存。起動時に dyld が読み込み、プロセスの終わりまで unload しない）ことに依る。
+    // 直接リンクが無くなれば `dlsym` は NULL を返し、呼び出し側は `Unimplemented` で fail-closed する（UB にはならない）。
+    // 退行は実機前提試験 `hvf_device_gic_symbols_resolve` が検出する。
     let p = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
     (!p.is_null()).then_some(p)
 }
@@ -840,13 +844,21 @@ macro_rules! resolve {
     ($name:expr, $ty:ty) => {{
         let p = lookup($name).ok_or_else(gic_symbol_missing)?;
         // SAFETY: `p` は NULL でない `dlsym` の戻り値で、`$ty` は Apple のドキュメントのシグネチャに一致させた
-        // `extern "C"` の関数ポインタ（データポインタと同じ幅）。image は `dlclose` しないので寿命はプロセスと同じ。
+        // `extern "C"` の関数ポインタ（データポインタと同じ幅）。`p` を返した image は Hypervisor.framework（`lookup` の SAFETY の前提）で、
+        // load-time の依存のため unload されず `dlclose` もしないので、関数ポインタの寿命はプロセスと同じ。
         unsafe { std::mem::transmute::<*mut c_void, $ty>(p) }
     }};
 }
 
 /// 実行時に解決した `hv_gic_*` の関数表（macOS 15 以降）。関数ポインタは private で `sys` の外へ出さない。
 /// `Copy` な関数ポインタだけを持つので `Send + Sync`。取得は [`GicApi::get`]。
+///
+/// 公開範囲（#3867・MVM-5・MVM-4）: 構造体・`get`・照会 6 種（`distributor_size`・`distributor_base_alignment`・
+/// `redistributor_size`・`redistributor_base_alignment`・`spi_interrupt_range`・`intid`）は `pub` のまま残す。
+/// 照会は VM・GIC の作成前に呼ぶ前提（`HvfGic::probe` が VM 作成前に呼ぶ）で、副作用が無く失敗は戻り値で返る。
+/// 外部の実機前提試験 `hvf_device_gic_symbols_resolve` が配置検証と切り離してシンボル解決と生の値を観測するのにも使う。
+/// 状態を変える操作（`config_create`・`create`・`set_spi` と `GicConfig`）は `pub(crate)` で、外部からは順序と生存を
+/// 型で強制した `HvfGic::create`・`VmWithGic`・`GicSpiLine` の経路でしか行えない。
 pub struct GicApi {
     config_create: GicConfigCreateFn,
     config_set_distributor_base: GicConfigSetBaseFn,
@@ -911,7 +923,8 @@ impl GicApi {
 
     fn query_size(f: GicGetSizeFn, op: HvOp) -> Result<usize, MicrovmError> {
         let mut out = 0usize;
-        // SAFETY: `f` は `get` の版判定を通った後に解決した関数で、出力先はローカル変数 `out` だけ（呼び出しの間生きている）。
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。
+        // `f` は `get` の版判定を通った後に解決した関数で、出力先はローカル変数 `out` だけ（呼び出しの間生きている）。
         let rc = unsafe { f(&mut out) };
         classify_hv_return(op, rc)?;
         Ok(out)
@@ -946,7 +959,7 @@ impl GicApi {
     /// SPI の割り込み番号の範囲 `(base, count)`。
     pub fn spi_interrupt_range(&self) -> Result<(u32, u32), MicrovmError> {
         let (mut base, mut count) = (0u32, 0u32);
-        // SAFETY: 出力先はローカル変数 2 つで、呼び出しの間生きている。
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。出力先はローカル変数 2 つで、呼び出しの間生きている。
         let rc = unsafe { (self.get_spi_interrupt_range)(&mut base, &mut count) };
         classify_hv_return(HvOp::GicGetSpiInterruptRange, rc)?;
         Ok((base, count))
@@ -955,22 +968,22 @@ impl GicApi {
     /// 予約済みの割り込み `id` の割り込み番号（INTID）。
     pub fn intid(&self, id: HvGicIntid) -> Result<GicIntid, MicrovmError> {
         let mut out = 0u32;
-        // SAFETY: 出力先はローカル変数 `out` だけ。`id.bits()` は `uint16_t` の値。
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。出力先はローカル変数 `out` だけ。`id.bits()` は `uint16_t` の値。
         let rc = unsafe { (self.get_intid)(id.bits(), &mut out) };
         classify_hv_return(HvOp::GicGetIntid, rc)?;
         Ok(GicIntid::new(out))
     }
 
     /// SPI の入力レベルを設定する。
-    pub fn set_spi(&self, intid: u32, level: bool) -> Result<(), MicrovmError> {
-        // SAFETY: 引数は整数と bool だけで、ポインタを取らない。
+    pub(crate) fn set_spi(&self, intid: u32, level: bool) -> Result<(), MicrovmError> {
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。引数は整数と bool だけで、ポインタを取らない。
         let rc = unsafe { (self.set_spi)(intid, level) };
         classify_hv_return(HvOp::GicSetSpi, rc)
     }
 
     /// GIC の設定オブジェクトを作る（NULL は `ResourceExhausted`）。
-    pub fn config_create(&'static self) -> Result<GicConfig, MicrovmError> {
-        // SAFETY: 引数なしで OS オブジェクトを返す。戻り値は NULL 検査の後で `GicConfig` が所有する。
+    pub(crate) fn config_create(&'static self) -> Result<GicConfig, MicrovmError> {
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。引数なしで OS オブジェクトを返す。戻り値は NULL 検査の後で `GicConfig` が所有する。
         let raw = unsafe { (self.config_create)() };
         if raw.is_null() {
             return Err(MicrovmError::new(
@@ -985,7 +998,7 @@ impl GicApi {
     /// 作成順序（vCPU より前・VM につき 1 回）は `crate::hvf::gic::HvfGic::create` が型で強制する（#3792）ため、
     /// crate の外へは公開しない。
     pub(crate) fn create(&self, _vm: &HvVm, config: GicConfig) -> Result<(), MicrovmError> {
-        // SAFETY: `config.raw` は `GicConfig` が所有する有効な OS オブジェクトで、呼び出しの間生きている
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。`config.raw` は `GicConfig` が所有する有効な OS オブジェクトで、呼び出しの間生きている
         // （解放は `GicConfig` の drop で 1 回だけ）。VM は `_vm` の借用で存在が保証される。
         let rc = unsafe { (self.create)(config.raw) };
         classify_hv_return(HvOp::GicCreate, rc)
@@ -994,22 +1007,22 @@ impl GicApi {
 
 /// `hv_gic_config_t`（OS オブジェクト）の所有者。drop で `os_release` を 1 回だけ呼ぶ。生ポインタ入りで `!Send`・`!Sync`。
 #[derive(Debug)]
-pub struct GicConfig {
+pub(crate) struct GicConfig {
     raw: *mut c_void,
     api: &'static GicApi,
 }
 
 impl GicConfig {
     /// distributor の base の IPA を設定する。
-    pub fn set_distributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
-        // SAFETY: `raw` は有効な OS オブジェクトで、`&mut self` により排他。
+    pub(crate) fn set_distributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。`raw` は有効な OS オブジェクトで、`&mut self` により排他。
         let rc = unsafe { (self.api.config_set_distributor_base)(self.raw, ipa) };
         classify_hv_return(HvOp::GicConfigSetDistributorBase, rc)
     }
 
     /// redistributor の base の IPA を設定する。
-    pub fn set_redistributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
-        // SAFETY: `raw` は有効な OS オブジェクトで、`&mut self` により排他。
+    pub(crate) fn set_redistributor_base(&mut self, ipa: u64) -> Result<(), MicrovmError> {
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。`raw` は有効な OS オブジェクトで、`&mut self` により排他。
         let rc = unsafe { (self.api.config_set_redistributor_base)(self.raw, ipa) };
         classify_hv_return(HvOp::GicConfigSetRedistributorBase, rc)
     }

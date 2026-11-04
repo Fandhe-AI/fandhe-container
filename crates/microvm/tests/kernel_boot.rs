@@ -1544,9 +1544,9 @@ mod arm64 {
         Ok(s.to_owned())
     }
 
-    /// 負の対照用の cmdline。Linux の `panic=` は後勝ちなので末尾に `panic=0` を足し、利用者の `panic=N` による
-    /// panic 後の自動 reboot（SYSTEM_RESET → `GuestShutdown`）の偽陽性を抑える。
-    fn negative_cmdline(base: &str) -> String {
+    /// 陽性・負の対照の両方に使う cmdline。Linux の `panic=` は後勝ちなので末尾に `panic=0` を足し、利用者の `panic=N` による
+    /// init 起動失敗後の自動 reboot（SYSTEM_RESET → `GuestShutdown`）を陽性が受理する偽陽性を抑える。
+    fn force_panic_zero(base: &str) -> String {
         format!("{base} panic=0")
     }
 
@@ -1696,7 +1696,7 @@ mod arm64 {
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
         let inp = inputs(true);
-        let cmdline = inp.cmdline.clone();
+        let cmdline = force_panic_zero(&inp.cmdline);
         let (o, boot_timeout) = run_boot(inp, cmdline);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
@@ -1719,7 +1719,7 @@ mod arm64 {
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_without_initrd_does_not_shut_down() {
         let inp = inputs(false);
-        let cmdline = negative_cmdline(&inp.cmdline);
+        let cmdline = force_panic_zero(&inp.cmdline);
         let (o, _) = run_boot(inp, cmdline);
         let diag = o.diag();
         assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
@@ -1731,12 +1731,14 @@ mod arm64 {
     }
 
     #[test]
-    fn mvm1_3897_negative_cmdline_forces_panic_zero() {
-        assert_eq!(negative_cmdline("rdinit=/init"), "rdinit=/init panic=0");
+    fn mvm1_3897_force_panic_zero_appends_last() {
+        assert_eq!(force_panic_zero("rdinit=/init"), "rdinit=/init panic=0");
         assert_eq!(
-            negative_cmdline("console=x panic=5"),
+            force_panic_zero("console=x panic=5"),
             "console=x panic=5 panic=0"
         );
+        // 利用者が `rdinit=/missing panic=1` を渡しても末尾が panic=0 になる（陽性の自動再起動の偽陽性を防ぐ）。
+        assert!(force_panic_zero("rdinit=/missing panic=1").ends_with(" panic=0"));
     }
 }
 /// x86_64・aarch64 以外では `assemble` が `Unimplemented` であることの確認（aarch64 は `mod arm64`・#3897）。

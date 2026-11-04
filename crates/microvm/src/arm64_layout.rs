@@ -21,13 +21,14 @@
 //! - シリアルは `layout.serial` が `Some` のときだけ、8250 互換（`ns16550a`・`reg-shift = 0`・`reg-io-width = 1`）の
 //!   MMIO ノードと `/chosen/stdout-path` を出す（実体の無いデバイスを FDT に載せない）。モデルは
 //!   [`crate::uart::SerialConsole::mmio_device`]。PL011 は clock ノードと phandle が要り、既存モデルを流用できないため採らない。
-//! - `interrupts` は出さない。8250_of は IRQ が解決できないとき irq = 0 で続行しポーリング（タイマ駆動）で動く
-//!   （Linux `drivers/tty/serial/8250/8250_of.c` の `of_platform_serial_setup` の理解。`serial/8250.yaml` の
-//!   `required` からは逸脱する。実ゲストでの確認は後続）。
+//! - `interrupts` は level-high の SPI（[`ARM64_SERIAL_SPI`]）で出す（#3892・MVM-5・MVM-1）。線は `crate::uart` の
+//!   THRE 状態から [`crate::interrupt::LevelInterruptLine`] で駆動する（macOS は `hv_gic_set_spi`）。トリガは
+//!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
+//!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
-//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・PSCI CPU_ON・`HVF_MAX_VCPUS` の引き上げ。バックエンドは 1 vCPU のまま。
+//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・`HVF_MAX_VCPUS` の引き上げ・PSCI の実起動の結線〔状態機械は `psci.rs`。#3883・結線は #3884 / #3891〕。バックエンドは 1 vCPU のまま。
 //! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
-//! HvfMicroVm へのシリアル結線とバス上限の調整・シリアルの割り込みとゲスト入力・PCI・IPA 上限の確定（#3803）。
+//! シリアルのゲスト入力（#3893）・PCI・IPA 上限の確定（#3803）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を
@@ -73,6 +74,9 @@ pub const ARM64_VIRTIO_MMIO_STRIDE: u64 = 0x200;
 pub const ARM64_VIRTIO_MMIO_MAX: u32 = 32;
 /// virtio-mmio の最初の SPI 番号（DT のセル値。GIC の INTID は 32 + n）。
 pub const ARM64_VIRTIO_SPI_BASE: u32 = 16;
+/// シリアルの SPI 番号（DT のセル値。INTID は 33）。virtio の基点（既定 16）より下で重ならない
+/// （QEMU の virt の VIRT_UART と同じ慣行。#3892・MVM-5）。
+pub const ARM64_SERIAL_SPI: u32 = 1;
 /// 既定の IPA 上限（暫定。確定は #3803。KVM 経路は自分の値を `ipa_limit` に渡せる）。
 pub const ARM64_DEFAULT_IPA_LIMIT: u64 = HVF_DEFAULT_IPA_LIMIT;
 /// `cpu@0` の `reg`。#3797 が `MPIDR_EL1` の affinity をこの値から設定する。
@@ -152,6 +156,7 @@ const _: () = {
     );
     assert!(ARM64_SERIAL_BASE + ARM64_SERIAL_SIZE <= ARM64_VIRTIO_MMIO_BASE);
     assert!(ARM64_BOOT_CPU_MPIDR == 0);
+    assert!(ARM64_SERIAL_SPI < ARM64_VIRTIO_SPI_BASE);
 };
 
 fn invalid(msg: &'static str) -> MicrovmError {
@@ -270,6 +275,30 @@ impl Arm64Layout {
         })
     }
 
+    /// シリアルの SPI（`serial` が `Some` のときだけ。#3892）。
+    pub fn serial_spi(&self) -> Option<GuestSpi> {
+        self.serial.map(|_| GuestSpi(ARM64_SERIAL_SPI))
+    }
+
+    /// シリアルの SPI が API の範囲に収まるか検査する（VM 作成の前に呼ぶ。`serial` 無しは常に `Ok`。#3892）。
+    pub fn check_serial_spi_range(
+        &self,
+        range_base: u32,
+        range_count: u32,
+    ) -> Result<(), MicrovmError> {
+        let Some(spi) = self.serial_spi() else {
+            return Ok(());
+        };
+        check_spi_intid(spi, range_base, range_count).map_err(|e| {
+            if e.code() == MicrovmErrorCode::InvalidArgument {
+                invalid("serial spi intid is outside the gic spi range")
+            } else {
+                e
+            }
+        })?;
+        Ok(())
+    }
+
     /// 配置の整合を検査する（0 長・桁あふれ・アライン・IPA 上限・個数・SPI 範囲・領域の重なり）。
     pub fn validate(&self) -> Result<(), MicrovmError> {
         if self.ram.size == 0 {
@@ -317,6 +346,13 @@ impl Arm64Layout {
             .ok_or_else(|| invalid("guest layout size overflow"))?;
         if last_spi > GIC_MAX_SPI_N + 1 {
             return Err(invalid("virtio spi number exceeds the gic range"));
+        }
+        // シリアルの SPI が virtio の範囲と重なると同じ INTID を共有する（#3892）。
+        if self.serial.is_some()
+            && ARM64_SERIAL_SPI >= self.virtio_spi_base
+            && ARM64_SERIAL_SPI < last_spi
+        {
+            return Err(invalid("serial spi overlaps the virtio spi range"));
         }
         if self.ipa_limit == 0 {
             return Err(invalid("ipa limit must be non-zero"));
@@ -657,7 +693,7 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
     b.property_cells("interrupts", &irq)?;
     b.end_node()?;
 
-    // serial/8250.yaml。interrupts は出さずポーリングで動かす（モジュール doc 参照）。
+    // serial/8250.yaml。interrupts は level-high の SPI（モジュール doc 参照）。
     if let Some(serial) = &l.serial {
         b.begin_node(&serial_node_name(serial))?;
         b.property_string("compatible", "ns16550a")?;
@@ -665,6 +701,10 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
         b.property_u32("reg-shift", 0)?;
         b.property_u32("reg-io-width", 1)?;
         b.property_u32("clock-frequency", ARM64_SERIAL_CLOCK_HZ)?;
+        b.property_cells(
+            "interrupts",
+            &[GIC_SPI, ARM64_SERIAL_SPI, IRQ_TYPE_LEVEL_HIGH],
+        )?;
         b.end_node()?;
     }
 
@@ -1053,5 +1093,50 @@ mod tests {
         let mut hi = l.clone();
         hi.serial = Some(MmioRegion::new(hi.ipa_limit, ARM64_SERIAL_SIZE));
         expect_invalid(&hi, "guest layout exceeds the ipa limit");
+    }
+
+    /// MVM-5・#3892: シリアルの SPI 番号と INTID。シリアルが無い配置は `None`。
+    #[test]
+    fn mvm5_3892_serial_spi_values() {
+        assert_eq!(ARM64_SERIAL_SPI, 1);
+        let base = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+        assert_eq!(base.serial_spi(), None);
+        let l = base.with_default_serial().unwrap();
+        let spi = l.serial_spi().unwrap();
+        assert_eq!(spi.dt_cell(), 1);
+        assert_eq!(spi.intid(), Some(33));
+    }
+
+    /// MVM-5・#3892: virtio の SPI 範囲との重なりは拒否する（シリアル無しなら通る）。
+    #[test]
+    fn mvm5_3892_serial_spi_overlap_rejected() {
+        let mut l = Arm64Layout::new(256 * MIB, 1, 2)
+            .unwrap()
+            .with_default_serial()
+            .unwrap();
+        l.virtio_spi_base = 0;
+        expect_invalid(&l, "serial spi overlaps the virtio spi range");
+        l.virtio_spi_base = 2;
+        assert!(l.validate().is_ok());
+        let mut none = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+        none.virtio_spi_base = 0;
+        assert!(none.validate().is_ok());
+    }
+
+    /// MVM-5・#3892: シリアルの SPI は API の範囲で照合する。
+    #[test]
+    fn mvm5_3892_serial_spi_range_check() {
+        let l = Arm64Layout::new(256 * MIB, 1, 2)
+            .unwrap()
+            .with_default_serial()
+            .unwrap();
+        assert!(l.check_serial_spi_range(33, 1).is_ok());
+        let e = l.check_serial_spi_range(34, 10).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "serial spi intid is outside the gic spi range");
+        let e = l.check_serial_spi_range(48, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        let none = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+        assert!(none.check_serial_spi_range(48, 0).is_ok());
     }
 }

@@ -11,7 +11,7 @@
 //! `check_virtio_spi_injection` が組み立て時に照合する。待ちは持たない（REPAIR-5 不要）。`unsafe` は持たない。
 
 use crate::error::MicrovmError;
-use crate::interrupt::{InterruptLine, IrqTrigger, LineResample};
+use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
 
 /// SPI の線の値を設定する口（macOS では `GicApi::set_spi`、試験では偽の GIC）。
 pub trait SpiSink: Send + Sync + std::fmt::Debug {
@@ -66,6 +66,33 @@ impl<S: SpiSink> InterruptLine for SpiLine<S> {
             }
             _ => Ok(LineResample::NotApplicable),
         }
+    }
+}
+
+/// 1 本の SPI の線の値をデバイスモデルの指示どおりに設定する [`LevelInterruptLine`]（UART。#3892・MVM-5・MVM-1）。
+///
+/// 常に level 形で、FDT の trigger は level-high（`arm64_layout::build_guest_fdt` のシリアルノード）。
+#[derive(Debug, Clone)]
+pub struct SpiLevelLine<S: SpiSink> {
+    sink: S,
+    intid: u32,
+}
+
+impl<S: SpiSink> SpiLevelLine<S> {
+    /// 線を作る。INTID の範囲検査は呼び出し元が済ませている前提（[`SpiLine::new`] と同じ契約）。
+    pub fn new(sink: S, intid: u32) -> Self {
+        Self { sink, intid }
+    }
+
+    /// 対象の INTID。
+    pub fn intid(&self) -> u32 {
+        self.intid
+    }
+}
+
+impl<S: SpiSink> LevelInterruptLine for SpiLevelLine<S> {
+    fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+        self.sink.set_spi(self.intid, level == IrqLevel::High)
     }
 }
 
@@ -144,6 +171,30 @@ pub(crate) mod tests {
         );
         assert_eq!(
             line.resample(false).unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn mvm5_3892_level_spi_line_set_level_sequence() {
+        let gic = RecordingGic::default();
+        let line = SpiLevelLine::new(gic.clone(), 33);
+        line.set_level(IrqLevel::High).unwrap();
+        line.set_level(IrqLevel::Low).unwrap();
+        line.set_level(IrqLevel::High).unwrap();
+        assert_eq!(gic.calls(), vec![(33, true), (33, false), (33, true)]);
+        assert_eq!(line.intid(), 33);
+    }
+
+    #[test]
+    fn mvm5_3892_level_spi_line_sink_failure_propagates() {
+        let gic = RecordingGic {
+            fail: true,
+            ..Default::default()
+        };
+        let line = SpiLevelLine::new(gic, 33);
+        assert_eq!(
+            line.set_level(IrqLevel::High).unwrap_err().code(),
             MicrovmErrorCode::Internal
         );
     }

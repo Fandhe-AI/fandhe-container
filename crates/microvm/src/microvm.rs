@@ -88,7 +88,7 @@ use crate::boot_x86::{
     write_boot_tables,
 };
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
-use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess, MmioDevice};
+use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
@@ -104,10 +104,15 @@ use crate::sys::{self, GuestRamMap, SysError};
 use crate::uart::{COM1_BASE, SerialConsole, UART_PORT_LEN};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{
-    CONFIG_SPACE_SIZE, IgnoredAccess, MmioReadOutcome, MmioWriteOutcome, VirtioDevice,
-    VirtioMmioTransport,
+    CONFIG_SPACE_SIZE, MmioWriteOutcome, SharedTransport, VirtioDevice, VirtioMmioTransport,
 };
 use crate::virtio_net::{NetBackend, VirtioNet};
+// SharedTransport を virtio_mmio へ移したため、試験（`use super::*`）が使う型だけ cfg(test) で残す。
+#[cfg(test)]
+use crate::{
+    dispatch::MmioDevice,
+    virtio_mmio::{IgnoredAccess, MmioReadOutcome},
+};
 
 /// virtio-mmio の窓の先頭（GPA）。ゲスト RAM（GPA 0 からの単一領域）はこれより下に収まる。
 /// cmdline の `virtio_mmio.device=<size>@<base>:<irq>`（[`MicroVm::load_kernel`]。#884）が使う。
@@ -623,29 +628,6 @@ fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>,
 
 fn poisoned() -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, "virtio device lock poisoned")
-}
-
-/// dispatcher（所有を要求する）と VM 構成体（型つきで触る）がトランスポートを共有するためのラッパー。
-///
-/// lock が poison していたらデバイスは応答をやめる（fail-closed。`MmioDevice` は `Result` を返せない）。
-struct SharedTransport<D: VirtioDevice>(Arc<Mutex<VirtioMmioTransport<D>>>);
-
-impl<D: VirtioDevice + Send> MmioDevice for SharedTransport<D> {
-    fn read(&self, offset: u64, data: &mut [u8]) -> MmioReadOutcome {
-        match self.0.lock() {
-            Ok(t) => t.read(offset, data),
-            Err(_) => {
-                data.fill(0);
-                MmioReadOutcome::Ignored(IgnoredAccess::WrongDeviceState)
-            }
-        }
-    }
-    fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
-        match self.0.lock() {
-            Ok(mut t) => t.write(offset, data),
-            Err(_) => MmioWriteOutcome::Ignored(IgnoredAccess::WrongDeviceState),
-        }
-    }
 }
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・配置・割り込み線）。

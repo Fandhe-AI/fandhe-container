@@ -578,6 +578,15 @@ jobs:
         run: make check-standalone-clippy
       - name: cargo test（既定 feature）
         run: cargo test --workspace
+      # ディスク使用量の診断（#3868・REPAIR-7）。ubuntu ランナーで cargo test がビルドの段で
+      # `No space left on device` になった再発の監視用。出力するだけで失敗にはしない。
+      # reusable の rust-ci（rust-base-ci）にはステップを差し込めないため、ここでは platform-ci の分だけ採る。
+      - name: ディスク使用量の診断（ubuntu のみ）
+        if: runner.os == 'Linux' && always()
+        timeout-minutes: 5
+        run: |
+          df -h /
+          du -sh target/debug target/debug/deps 2>/dev/null
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
       # rust-base-ci.yml の clippy / test ジョブ〕から移したもの）。コマンドは reusable と同一
       # （`--locked` なし）。Linux は rust-ci (ubuntu-latest) が実行するため重複させない。

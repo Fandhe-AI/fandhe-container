@@ -15,7 +15,7 @@
 //!   `HostMapping` を値で受け取り `GuestMapping` が所有する。ゲストへの対応付けの解除（`hv_vm_unmap`）が成功
 //!   するまで munmap しない。解除に失敗したら backing は解放せず意図的にリークする（fail-closed）。
 //!   `mem::forget` で `GuestMapping` を捨てても backing はリークするだけで、解放されない（安全）。
-//!   `GuestMapping` は `&HvVm` を借用するため、対応付けが生きている間は `hv_vm_destroy` も起きない
+//!   `GuestMapping` は `&HvVm` を借用するか（`map`）`Arc<HvVm>` を保持する（`map_shared`、#3797）ため、対応付けが生きている間は `hv_vm_destroy` も起きない
 //! - `HvVm::map` は範囲・ページ境界に加えて既定の IPA 上限（`HVF_DEFAULT_IPA_LIMIT`）も FFI の前に検査する（#3844）
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
@@ -215,6 +215,43 @@ impl HvVm {
         size: usize,
         flags: MemoryFlags,
     ) -> Result<GuestMapping<'a>, MicrovmError> {
+        self.map_with(VmRef::Borrowed(self), host, offset, ipa, size, flags)
+    }
+
+    /// [`HvVm::map`] の `Arc` 版。戻り値の対応付けが `Arc<HvVm>` を保持するため `'static` で、`VmWithGic` を `Arc` で
+    /// 共有する構成体（#3797）が自己参照なしにゲスト RAM を持てる。
+    ///
+    /// 対応付けが生きている間は `Arc` の参照が残るので `hv_vm_destroy`（`HvVm::drop`）は必ず `hv_vm_unmap` の後になる
+    /// （unmap を VM 破棄の後に回さない。破棄後に作り直した別 VM の IPA を誤って unmap する危険を型で断つ）。
+    /// 検査と失敗時の扱いは [`HvVm::map`] と同じ。
+    pub fn map_shared(
+        self: &Arc<Self>,
+        host: HostMapping,
+        offset: usize,
+        ipa: u64,
+        size: usize,
+        flags: MemoryFlags,
+    ) -> Result<GuestMapping<'static>, MicrovmError> {
+        self.map_with(
+            VmRef::Shared(Arc::clone(self)),
+            host,
+            offset,
+            ipa,
+            size,
+            flags,
+        )
+    }
+
+    /// `map`・`map_shared` の共通本体。`keep` は戻り値の対応付けが保持する VM への参照（借用か `Arc`）。
+    fn map_with<'a>(
+        &self,
+        keep: VmRef<'a>,
+        host: HostMapping,
+        offset: usize,
+        ipa: u64,
+        size: usize,
+        flags: MemoryFlags,
+    ) -> Result<GuestMapping<'a>, MicrovmError> {
         let end = offset
             .checked_add(size)
             .ok_or_else(|| invalid_arg("range overflows the host mapping"))?;
@@ -231,7 +268,7 @@ impl HvVm {
         let rc = unsafe { hv_vm_map(addr as *mut c_void, ipa, size, flags.bits()) };
         classify_hv_return(HvOp::VmMap, rc)?;
         Ok(GuestMapping {
-            _vm: self,
+            _vm: keep,
             ipa,
             size,
             page_size: host.page_size,
@@ -277,7 +314,7 @@ fn invalid_arg(msg: &'static str) -> MicrovmError {
 
 impl Drop for HvVm {
     fn drop(&mut self) {
-        // SAFETY: 引数なし。`GuestMapping` が `&HvVm` を借用しているため、対応付けが残った状態では到達しない。
+        // SAFETY: 引数なし。`GuestMapping` が `&HvVm` を借用するか `Arc<HvVm>` を保持するため、対応付けが残った状態では到達しない。
         let rc = unsafe { hv_vm_destroy() };
         // 失敗（例: HV_BUSY）ではプロセス内に VM が残るので、排他のフラグは true のままにする（fail-closed）。
         if rc == crate::hvf_abi::HV_SUCCESS {
@@ -445,12 +482,22 @@ impl Drop for HostMapping {
     }
 }
 
-/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` を借用し、`HostMapping` を所有する。
+/// 対応付けが VM を生かしておくための参照。借用（`HvVm::map`）か `Arc`（`HvVm::map_shared`、#3797）。
+/// どちらも対応付けが残る間 `hv_vm_destroy` が走らないことを保証する。
+// 中身は読まない（保持して寿命を延ばすだけ）ため dead_code を許す。
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmRef<'a> {
+    Borrowed(&'a HvVm),
+    Shared(Arc<HvVm>),
+}
+
+/// `hv_vm_map` の対応付け（drop で `hv_vm_unmap`）。`HvVm` を借用するか `Arc<HvVm>` を保持し、`HostMapping` を所有する。
 ///
 /// 解除（`hv_vm_unmap`）が成功するまで backing を munmap しない。失敗時は backing をリークする（fail-closed）。
 #[derive(Debug)]
 pub struct GuestMapping<'a> {
-    _vm: &'a HvVm,
+    _vm: VmRef<'a>,
     ipa: u64,
     size: usize,
     page_size: usize,

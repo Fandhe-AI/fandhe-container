@@ -38,9 +38,13 @@
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
-//! `MPIDR_EL1` の実際の設定と SMP（#3797）・MSI・
+//! SMP（AP の起動。`MPIDR_EL1` の実設定は #3797 の `HvfMicroVm::assemble` が vCPU 0 の `setup` で行う）・MSI・
 //! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・SDK ヘッダとの値の照合（#3803）・
-//! vCPU の個別 drop と「破棄は VM 破棄時のみ」の整合（#3797・#3791）。`unsafe` は持たない。
+//! vCPU の個別 drop と「破棄は VM 破棄時のみ」の整合（#3798・#3791）。`unsafe` は持たない。
+//!
+//! # 所有（#3797）
+//! [`VmWithGic`] は内部の VM を `Arc<HvVm>` で持つ。ゲスト RAM の対応付け（`HvVm::map_shared`）が VM への参照を保持し、
+//! 「unmap → `hv_vm_destroy`」の順を参照数で保証するため。`HvfGic::create` が `HvVm` を値で消費する点は変わらない。
 
 use std::sync::{Arc, RwLock};
 
@@ -121,7 +125,7 @@ impl HvfGic {
         api.create(&vm, config)?;
         Ok(VmWithGic {
             gic,
-            vm,
+            vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
         })
     }
@@ -131,7 +135,8 @@ impl HvfGic {
 #[derive(Debug)]
 pub struct VmWithGic {
     gic: HvfGic,
-    vm: HvVm,
+    /// `Arc` なのは、ゲスト RAM の対応付け（`HvVm::map_shared`）が VM を生かしておくため（#3797）。crate の外へは出さない。
+    vm: Arc<HvVm>,
     /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
     alive: Arc<RwLock<bool>>,
 }
@@ -158,6 +163,11 @@ impl VmWithGic {
 
     /// VM への参照（`HvVm::map`・`HvfGuestRam::register` 用）。`Deref` にしないのは `create_vcpu` の見え方を取り違えないため。
     pub fn vm(&self) -> &HvVm {
+        &self.vm
+    }
+
+    /// `Arc<HvVm>`（`HvfGuestRam::register_shared` 用。crate の外へは公開しない。#3797）。
+    pub(crate) fn shared_vm(&self) -> &Arc<HvVm> {
         &self.vm
     }
 

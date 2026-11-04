@@ -228,6 +228,8 @@ impl VmWithGic {
     /// 生存フラグを共有するので、ホスト側の `SerialConsole` の clone が VM より長生きしても、VM の破棄後の注入は
     /// `Internal` で拒否される。呼び出しは MMIO exit を処理する vCPU スレッドから UART の lock の下で行い、待ちは持たない
     /// （REPAIR-5 不要）。ロック順は dispatcher → UART → 生存フラグ（読み取り）で、`Drop` の書き込みロックは vCPU 停止後に取られる。
+    /// ホストスレッドの `SerialConsole::push_input`（#3893）も UART の lock の下で呼ぶ（ロック順は同じ）。`hv_gic_set_spi` を
+    /// vCPU 以外のスレッドから呼べるかは未確認（#3803）。
     pub fn serial_line(&self, layout: &Arm64Layout) -> Result<GicSerialLine, MicrovmError> {
         let spi = layout.serial_spi().ok_or_else(|| {
             MicrovmError::new(

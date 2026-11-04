@@ -33,7 +33,7 @@
 //! - 実行開始の制御（start gate）: `spawn` は ready の後すぐ実行ループに入るため、assemble の時点でゲストは走り始める。現状は
 //!   exit のスタブ（#3793・#3794・#3796）が `Unimplemented` を返すので、実カーネルは最初の exit で `Failed(Unimplemented)` になる（#3798）。
 //! - `MmioHandler` へは共有 dispatcher を接続済み（#3793）。ゲスト RAM の受け渡しと `HostMapping` の `Send` は #3798。
-//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、シリアルの入力（RX。#3893）、`RunningHvfMicroVm::serial_console`（#3798。`HvfMicroVm::serial_console` と同じ語彙で足す）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、`RunningHvfMicroVm::serial_console`（#3798。`HvfMicroVm::serial_console` と同じ語彙で足す）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
@@ -151,7 +151,7 @@ struct HvfSerial {
     #[allow(dead_code)]
     window: MmioRegion,
     /// THRE 割り込みの INTID（level の SPI。#3892）。結線は `SpiLevelLine` が持つため今は読まず、
-    /// 診断用に保持する（将来 `devices()` 相当の一覧へ載せる想定。#3893 の受信側で使う余地）。
+    /// 診断用に保持する（将来 `devices()` 相当の一覧へ載せる想定）。
     #[allow(dead_code)]
     spi_intid: u32,
 }

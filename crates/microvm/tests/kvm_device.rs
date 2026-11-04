@@ -1,5 +1,6 @@
 //! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
+//! aarch64 の試験（`kvm_device_arm64_*`。#3696）は、加えて aarch64 Linux ホストと in-kernel GICv3 が要る（ネイティブ arm64 の CI は無く、実機は人間担当。#2274・#3781）。
 #![cfg(target_os = "linux")]
 
 use fandhe_container_microvm::device::KvmDevice;
@@ -720,7 +721,7 @@ fn kvm_device_assemble_microvm() {
 }
 
 /// MVM-1・TASK-75.2: x86_64 以外では組み立てが最初の ioctl より前に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_assemble_microvm() {
@@ -816,7 +817,7 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
 }
 
 /// MVM-1・TASK-75.3.1: x86_64 以外ではカーネルのロードが `Unimplemented`（組み立てが先に `Unimplemented` で失敗する）。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_load_kernel_into_assembled_microvm() {
@@ -934,7 +935,7 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
 }
 
 /// MVM-1・TASK-75.3.2: x86_64 以外ではレジスタ初期化も組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
@@ -1014,7 +1015,7 @@ fn kvm_device_boot_lapic_lints_read_back() {
 }
 
 /// MVM-1・#3735: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_boot_lapic_lints_read_back() {
@@ -1125,7 +1126,7 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
 }
 
 /// MVM-1・#3733: x86_64 以外では CPUID の設定も組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
@@ -1285,7 +1286,7 @@ fn kvm_device_ap_starts_on_init_sipi() {
 }
 
 /// MVM-1・#3737: x86_64 以外では AP の起動も組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_ap_starts_on_init_sipi() {
@@ -1421,7 +1422,7 @@ fn kvm_device_start_stop_microvm() {
     assert_eq!(Arc::strong_count(&obs1), 1);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_start_stop_microvm() {
@@ -1586,7 +1587,7 @@ fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
 }
 
 /// MVM-1・#3738: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
@@ -1674,7 +1675,7 @@ fn kvm_device_serial_output_reaches_host() {
     assert!(console.take_output().unwrap().is_empty());
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_serial_output_reaches_host() {
@@ -1862,7 +1863,7 @@ fn kvm_device_com1_irq4_reaches_guest() {
 }
 
 /// #3918 の試験用: x86_64 以外では組み立てが先に `Unimplemented` で失敗する（aarch64 の線は #3696・#3898）。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_com1_irq4_reaches_guest() {
@@ -1938,7 +1939,7 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_stop_kicks_spinning_guest_immediately() {
@@ -2187,7 +2188,7 @@ fn kvm_device_net_rx_reaches_guest_without_kick() {
     assert_eq!(Arc::strong_count(&backend.inbound), 1);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_net_rx_reaches_guest_without_kick() {
@@ -2311,7 +2312,7 @@ fn kvm_device_start_failure_releases_resources() {
     assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_start_failure_releases_resources() {
@@ -2463,14 +2464,14 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
     );
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_boot_fpu_reads_back() {
     assert_unimplemented_assemble();
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
@@ -2478,7 +2479,7 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
 }
 
 /// #3734 の試験用: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn assert_unimplemented_assemble() {
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
@@ -2500,4 +2501,170 @@ fn assert_unimplemented_assemble() {
         MicroVm::assemble(&dev, config).unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
     );
+}
+
+// ---- aarch64（KVM）の vGIC・irqfd・組み立て・起動レジスタ（MVM-1・#3696）-------------------------------------
+//
+// ネイティブ arm64 の CI が無いため `--ignored` の実機前提試験として置く（型検査は cross-target-check の
+// aarch64-unknown-linux-gnu）。実行手順は AGENTS.md「実機前提テスト」の `kvm_device` の項。
+
+/// 合成 arm64 Image の正本（aarch64 の実機前提試験だけが使う。複製しない）。
+#[cfg(target_arch = "aarch64")]
+#[path = "support/arm64_image.rs"]
+mod arm64_image;
+
+#[cfg(target_arch = "aarch64")]
+mod arm64 {
+    use super::arm64_image::synthetic_image;
+    use super::*;
+    use fandhe_container_microvm::arm64_layout::{
+        ARM64_GIC_DIST_BASE, ARM64_GIC_REDIST_BASE, ARM64_RAM_BASE,
+    };
+    use fandhe_container_microvm::boot_arm64::ARM64_BOOT_CPSR;
+    use fandhe_container_microvm::interrupt::InterruptLine as _;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::time::{Duration, Instant};
+
+    type Vm = MicroVm<MemoryBlockBackend, MemoryNetBackend>;
+
+    fn open() -> KvmDevice {
+        match KvmDevice::open() {
+            Ok(d) => d,
+            Err(e) => {
+                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+            }
+        }
+    }
+
+    fn config(
+        vcpus: u32,
+        block: usize,
+        net: usize,
+    ) -> MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> {
+        MicroVmConfig {
+            vcpu_count: vcpus,
+            mem_size: 64 << 20,
+            block: (0..block)
+                .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
+                .collect(),
+            net: (0..net)
+                .map(|_| NetDeviceConfig {
+                    backend: MemoryNetBackend::new(),
+                    mac: [2, 0, 0, 0, 0, 1],
+                })
+                .collect(),
+        }
+    }
+
+    fn assemble(block: usize, net: usize) -> Vm {
+        match MicroVm::assemble(&open(), config(1, block, net)) {
+            Ok(vm) => vm,
+            Err(e) => {
+                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+            }
+        }
+    }
+
+    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cond()
+    }
+
+    /// MVM-1・#3696: vGICv3 が作られ、distributor・redistributor の GPA が `Arm64Layout` の値で読み戻せ、
+    /// virtio の割り込みは SPI 16 から連番（gsi = SPI 番号）になる。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_vgic_assemble() {
+        let vm = assemble(1, 1);
+        assert_eq!(vm.vgic().dist_base().unwrap(), ARM64_GIC_DIST_BASE);
+        assert_eq!(vm.vgic().redist_base().unwrap(), ARM64_GIC_REDIST_BASE);
+        let devs = vm.devices();
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].slot.mmio_base, 0x0a00_0000);
+        assert_eq!(devs[0].slot.gsi, 16);
+        assert_eq!(devs[1].slot.mmio_base, 0x0a00_0200);
+        assert_eq!(devs[1].slot.gsi, 17);
+        assert_eq!(vm.memory().base().raw(), ARM64_RAM_BASE);
+        // 未発火の SPI は pending でない。
+        assert!(!vm.vgic().spi_pending(48).unwrap());
+    }
+
+    /// MVM-1・#3696: gsi 16 の irqfd を発火すると INTID 48（= 16 + 32）だけが pending になる（GSI と SPI の写像）。
+    /// 注入は eventfd のワーカー経由で非同期のため、期限つきで待つ。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_irqfd_sets_spi_pending() {
+        let vm = assemble(1, 1);
+        let extra = vm.vm().register_irqfd(16).unwrap();
+        extra.trigger().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(1), || vm
+                .vgic()
+                .spi_pending(48)
+                .unwrap_or(false)),
+            "SPI 16 (INTID 48) did not become pending"
+        );
+        assert!(
+            !vm.vgic().spi_pending(49).unwrap(),
+            "INTID 49 must stay clear"
+        );
+    }
+
+    /// MVM-1・#3696・REPAIR-3: 2 台以上の vCPU は AP の起動が無いので、資源を作る前に `Unimplemented`。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_assemble_rejects_smp() {
+        let e = MicroVm::assemble(&open(), config(2, 0, 0)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    }
+
+    /// MVM-1・#3696: `load_kernel`（Image・FDT の配置）と `setup_boot_vcpu` の後、X0 = FDT・PC = Image の先頭・
+    /// X1〜X3 = 0・PSTATE = EL1h（DAIF マスク）が読み戻せ、FDT の magic がゲストメモリにある。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_boot_vcpu_regs() {
+        use fandhe_container_microvm::guest_memory::GuestAddress;
+        let mut vm = assemble(1, 0);
+        let img = synthetic_image(true);
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        vm.setup_boot_vcpu(&loaded).unwrap();
+        let regs = vm.vcpus()[0].arm64_boot_regs().unwrap();
+        assert_eq!(regs.pc, ARM64_RAM_BASE + 0x8_0000);
+        assert_eq!(regs.x0, loaded.loaded().fdt.base.raw());
+        assert_eq!((regs.x1, regs.x2, regs.x3), (0, 0, 0));
+        assert_eq!(regs.cpsr, ARM64_BOOT_CPSR);
+        assert_eq!(regs.cpsr, 0x3c5);
+        let mut magic = [0u8; 4];
+        vm.memory()
+            .read_at(GuestAddress::new(regs.x0), &mut magic)
+            .unwrap();
+        assert_eq!(magic, [0xd0, 0x0d, 0xfe, 0xed]);
+    }
+
+    /// MVM-1・REPAIR-5・#3696: 自分自身へ分岐するゲスト（`b .`）を `start` し、`stop` が期限内に `Requested` で
+    /// 戻り、資源（vGIC・irqfd・vCPU・メモリ）が解放される。PSCI による終了の分類は #3896。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_start_stop() {
+        let mut vm = assemble(1, 1);
+        let img = synthetic_image(true);
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let running = vm.start(&loaded).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!running.is_finished());
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert!(report.stats.runs >= 1);
+        assert_eq!(report.stats.errors, 0);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
 }

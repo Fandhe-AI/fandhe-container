@@ -229,6 +229,27 @@ pub(crate) mod consts {
     pub const KVM_ARM_VCPU_INIT: u64 = super::iow(super::KVMIO, 0xAE, 32);
     /// `_IOR(KVMIO, 0xaf, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_PREFERRED_TARGET: u64 = super::ior(super::KVMIO, 0xAF, 32);
+    // 以下は #3696（vGIC・起動レジスタ）。値は Linux v6.12 の `include/uapi/linux/kvm.h` /
+    // `arch/arm64/include/uapi/asm/kvm.h` で照合した（`libc` に対応物が無いカーネル ABI のため、機械照合は適用外）。
+    /// `_IOWR(KVMIO, 0xe0, struct kvm_create_device)`（12 バイト）。
+    pub const KVM_CREATE_DEVICE: u64 = super::iowr(super::KVMIO, 0xE0, 12);
+    /// `_IOW(KVMIO, 0xe1, struct kvm_device_attr)`（24 バイト）。
+    pub const KVM_SET_DEVICE_ATTR: u64 = super::iow(super::KVMIO, 0xE1, 24);
+    /// `_IOW(KVMIO, 0xe2, struct kvm_device_attr)`（24 バイト。`_IOW` だがカーネルは `addr` の先へ書く）。
+    pub const KVM_GET_DEVICE_ATTR: u64 = super::iow(super::KVMIO, 0xE2, 24);
+    /// `_IOW(KVMIO, 0xab, struct kvm_one_reg)`（16 バイト。`_IOW` だがカーネルは `addr` の先へ書く）。
+    pub const KVM_GET_ONE_REG: u64 = super::iow(super::KVMIO, 0xAB, 16);
+    /// `_IOW(KVMIO, 0xac, struct kvm_one_reg)`（16 バイト）。
+    pub const KVM_SET_ONE_REG: u64 = super::iow(super::KVMIO, 0xAC, 16);
+    pub const KVM_CAP_DEVICE_CTRL: u64 = 89;
+    /// `enum kvm_device_type` の `KVM_DEV_TYPE_ARM_VGIC_V3`（FSL_MPIC_20 = 1 から数えて 7）。
+    pub const KVM_DEV_TYPE_ARM_VGIC_V3: u32 = 7;
+    pub const KVM_DEV_ARM_VGIC_GRP_ADDR: u32 = 0;
+    pub const KVM_DEV_ARM_VGIC_GRP_DIST_REGS: u32 = 1;
+    pub const KVM_DEV_ARM_VGIC_GRP_CTRL: u32 = 4;
+    pub const KVM_DEV_ARM_VGIC_CTRL_INIT: u64 = 0;
+    pub const KVM_VGIC_V3_ADDR_TYPE_DIST: u64 = 2;
+    pub const KVM_VGIC_V3_ADDR_TYPE_REDIST: u64 = 3;
     /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IOW(KVMIO, 0x76, struct kvm_irqfd)`（32 バイト）。
@@ -297,6 +318,95 @@ const _: () = {
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
 };
+
+/// aarch64 の `struct kvm_create_device`（`linux/kvm.h`。`type`・`fd`・`flags` の 12 バイト。#3696）。
+/// `fd` はカーネルが書く出力で、入力時は 0 にしておく。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct KvmCreateDevice {
+    type_: u32,
+    fd: u32,
+    flags: u32,
+}
+
+/// aarch64 の `struct kvm_device_attr`（`linux/kvm.h`。24 バイト。#3696）。`addr` はユーザー空間の値のアドレス。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct KvmDeviceAttr {
+    flags: u32,
+    group: u32,
+    attr: u64,
+    addr: u64,
+}
+
+/// aarch64 の `struct kvm_one_reg`（`linux/kvm.h`。16 バイト。#3696）。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct KvmOneReg {
+    id: u64,
+    addr: u64,
+}
+
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<KvmCreateDevice>() == 12);
+    assert!(align_of::<KvmCreateDevice>() == 4);
+    assert!(offset_of!(KvmCreateDevice, fd) == 4);
+    assert!(offset_of!(KvmCreateDevice, flags) == 8);
+    assert!(size_of::<KvmDeviceAttr>() == 24);
+    assert!(align_of::<KvmDeviceAttr>() == 8);
+    assert!(offset_of!(KvmDeviceAttr, group) == 4);
+    assert!(offset_of!(KvmDeviceAttr, attr) == 8);
+    assert!(offset_of!(KvmDeviceAttr, addr) == 16);
+    assert!(size_of::<KvmOneReg>() == 16);
+    assert!(align_of::<KvmOneReg>() == 8);
+    assert!(offset_of!(KvmOneReg, addr) == 8);
+    assert!(consts::KVM_CREATE_DEVICE == 0xC00C_AEE0);
+    assert!(consts::KVM_SET_DEVICE_ATTR == 0x4018_AEE1);
+    assert!(consts::KVM_GET_DEVICE_ATTR == 0x4018_AEE2);
+    assert!(consts::KVM_GET_ONE_REG == 0x4010_AEAB);
+    assert!(consts::KVM_SET_ONE_REG == 0x4010_AEAC);
+};
+
+/// `KVM_REG_ARM64`（`linux/kvm.h`）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+/// `KVM_REG_SIZE_U64`（`linux/kvm.h`）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+/// `KVM_REG_ARM_CORE`（`0x0010 << KVM_REG_ARM_COPROC_SHIFT(16)`。`asm/kvm.h`）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const KVM_REG_ARM_CORE: u64 = 0x0010 << 16;
+
+/// aarch64 の core レジスタ（`struct kvm_regs` の先頭の `user_pt_regs`）の ONE_REG id を組む（#3696・純関数）。
+///
+/// `word_index` は `KVM_REG_ARM_CORE_REG(name)` = `offsetof(struct kvm_regs, name) / sizeof(__u32)`
+/// （`user_pt_regs` は `regs[31]`・`sp`・`pc`・`pstate` の u64 を並べたものなので、u64 の番号 × 2）。
+/// すべて 64 bit レジスタ（`KVM_REG_SIZE_U64`）として扱う。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const fn arm64_core_reg_id(word_index: u64) -> u64 {
+    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | word_index
+}
+
+/// 汎用レジスタ `x<n>`（`n <= 30`）の ONE_REG id。範囲外は `None`。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const fn arm64_reg_x(n: u64) -> Option<u64> {
+    if n > 30 {
+        return None;
+    }
+    Some(arm64_core_reg_id(n * 2))
+}
+
+/// `pc` の ONE_REG id（`regs[31]`・`sp` の次の u64 = 32 番目 → u32 換算で 64）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const ARM64_REG_PC: u64 = arm64_core_reg_id(64);
+/// `pstate` の ONE_REG id（u64 の 33 番目 → u32 換算で 66）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const ARM64_REG_PSTATE: u64 = arm64_core_reg_id(66);
 
 /// x86_64 の `struct kvm_regs`（`asm/kvm.h`。汎用レジスタ 16 本・rip・rflags の 144 バイト。TASK-75.3.2）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -1005,7 +1115,7 @@ pub(crate) fn kvm_check_extension(fd: BorrowedFd<'_>, cap: u64) -> Result<i32, S
 }
 
 /// `KVM_CREATE_IRQCHIP`（VM fd。x86_64 のみ。vCPU を作る前に発行する）。他 arch は `Unsupported`
-/// （aarch64 の vGIC は `KVM_CREATE_DEVICE` で別方式。TASK-75）。
+/// （aarch64 の vGIC は `KVM_CREATE_DEVICE` で別方式。`kvm_create_device`・#3696）。
 pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
     {
@@ -1026,7 +1136,7 @@ pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
 
 /// `KVM_IRQ_LINE`（VM fd。x86_64 のみ。in-kernel irqchip が前提）。GSI `irq` の線を `level` に駆動する。
 /// edge 注入の `KVM_IRQFD` と違い、線の値そのものを持つので level 線（`LevelInterruptLine`）に使える（#3918・MVM-1）。
-/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式。#3696・#3898）。
+/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式で、vGIC の irqfd〔#3696〕。シリアルの割り込みは #3898）。
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn kvm_irq_line(vm: BorrowedFd<'_>, irq: u32, level: bool) -> Result<(), SysError> {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -1602,6 +1712,149 @@ pub(crate) fn kvm_arm_vcpu_init(vcpu: BorrowedFd<'_>, init: &KvmVcpuInit) -> Res
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `KVM_CREATE_DEVICE`（VM fd）で in-kernel デバイス（`ty` は `KVM_DEV_TYPE_*`）を作り、そのデバイス fd を返す（aarch64 のみ。#3696）。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn kvm_create_device(vm: BorrowedFd<'_>, ty: u32) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut arg = KvmCreateDevice {
+        type_: ty,
+        fd: 0,
+        flags: 0,
+    };
+    // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 12 バイト（const assert 済み・ioctl 番号のサイズ符号と
+    // 一致）のローカルで、呼び出し中は排他的に生存する。カーネルはこの 12 バイトを読み、`fd` だけを書く。
+    // 呼び出しは同期で完了して戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vm.as_raw_fd(),
+            consts::KVM_CREATE_DEVICE,
+            &mut arg as *mut KvmCreateDevice,
+        )
+    };
+    if r < 0 {
+        return Err(last_error());
+    }
+    let raw = i32::try_from(arg.fd).map_err(|_| SysError::Os(9))?;
+    // SAFETY: ioctl が成功したので `arg.fd` はカーネルが返した新規のデバイス fd（`O_CLOEXEC` 付き）で、他に所有者が
+    // おらず `OwnedFd` が唯一の所有者になる。`i32::try_from` で負値にならないことを確かめた。
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// `KVM_SET_DEVICE_ATTR`（デバイス fd）で、値 `value`（u64）を属性 `(group, attr)` へ書く（aarch64 のみ。#3696）。
+/// vGIC の `GRP_ADDR`（8 バイトのアドレス）・`GRP_NR_IRQS`（先頭 4 バイトだけ読まれる）・`GRP_CTRL`（`addr` は読まれない）に使う。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn kvm_set_device_attr_u64(
+    dev: BorrowedFd<'_>,
+    group: u32,
+    attr: u64,
+    value: u64,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let arg = KvmDeviceAttr {
+        flags: 0,
+        group,
+        attr,
+        addr: &value as *const u64 as u64,
+    };
+    // SAFETY: `dev` は借用中の生存 fd。`arg` は `repr(C)` で 24 バイト（const assert 済み・ioctl 番号のサイズ符号と
+    // 一致）のローカルの借用。`arg.addr` はこの関数の引数 `value`（u64・8 バイト）のアドレスで、呼び出し中は生存し、
+    // カーネルはそこから最大 8 バイトを読むだけで書かない（`GRP_CTRL` は読まない）。呼び出しは同期で完了し、
+    // 戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            dev.as_raw_fd(),
+            consts::KVM_SET_DEVICE_ATTR,
+            &arg as *const KvmDeviceAttr,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_DEVICE_ATTR`（デバイス fd）で属性 `(group, attr)` を u64 として読む（aarch64 のみ。#3696）。
+/// `GRP_ADDR` は 8 バイトの値を返す。`GRP_DIST_REGS` は 4 バイト（上位は 0 のまま）を返す。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn kvm_get_device_attr_u64(
+    dev: BorrowedFd<'_>,
+    group: u32,
+    attr: u64,
+) -> Result<u64, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut value: u64 = 0;
+    let arg = KvmDeviceAttr {
+        flags: 0,
+        group,
+        attr,
+        addr: &mut value as *mut u64 as u64,
+    };
+    // SAFETY: `dev` は借用中の生存 fd。`arg` は `repr(C)` で 24 バイト（const assert 済み）のローカルの借用。
+    // `arg.addr` はゼロ初期化済みのローカル `value`（u64・8 バイト）のアドレスで、呼び出し中は生存し、他から
+    // 参照されない。カーネルはそこへ最大 8 バイトを書く。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            dev.as_raw_fd(),
+            consts::KVM_GET_DEVICE_ATTR,
+            &arg as *const KvmDeviceAttr,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(value) }
+}
+
+/// `KVM_SET_ONE_REG`（vCPU fd）で 64 bit レジスタ `id` に `value` を書く（aarch64 のみ。#3696）。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn kvm_set_one_reg_u64(
+    vcpu: BorrowedFd<'_>,
+    id: u64,
+    value: u64,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let arg = KvmOneReg {
+        id,
+        addr: &value as *const u64 as u64,
+    };
+    // SAFETY: `vcpu` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み・ioctl 番号のサイズ符号と
+    // 一致）のローカルの借用。`arg.addr` は引数 `value`（u64・8 バイト）のアドレスで、`id` は 64 bit レジスタ
+    // （`KVM_REG_SIZE_U64`）なのでカーネルが読むのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_SET_ONE_REG,
+            &arg as *const KvmOneReg,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_ONE_REG`（vCPU fd）で 64 bit レジスタ `id` を読む（aarch64 のみ。#3696）。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn kvm_get_one_reg_u64(vcpu: BorrowedFd<'_>, id: u64) -> Result<u64, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut value: u64 = 0;
+    let arg = KvmOneReg {
+        id,
+        addr: &mut value as *mut u64 as u64,
+    };
+    // SAFETY: `vcpu` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み）のローカルの借用。
+    // `arg.addr` はゼロ初期化済みのローカル `value`（u64・8 バイト）のアドレスで、呼び出し中は生存し他から参照されない。
+    // `id` は 64 bit レジスタなのでカーネルが書くのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vcpu.as_raw_fd(),
+            consts::KVM_GET_ONE_REG,
+            &arg as *const KvmOneReg,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(value) }
+}
 /// `KVM_GET_REGS`（vCPU fd）で汎用レジスタを読む（x86_64 のみ。TASK-75.3.2）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 pub(crate) fn kvm_get_regs(vcpu: BorrowedFd<'_>) -> Result<KvmRegs, SysError> {
@@ -2354,6 +2607,31 @@ mod tests {
     fn arm_vcpu_constants_match_kernel_abi() {
         assert_eq!(consts::KVM_ARM_VCPU_INIT, 0x4020_AEAE);
         assert_eq!(consts::KVM_ARM_PREFERRED_TARGET, 0x8020_AEAF);
+    }
+
+    /// MVM-1・#3696: aarch64 の core レジスタ id（`KVM_REG_ARM_CORE_REG` の u32 換算）。arch に依らず計算式を固定する。
+    #[test]
+    fn mvm1_3696_arm64_core_reg_ids() {
+        assert_eq!(ARM64_REG_PC, 0x6030_0000_0010_0040);
+        assert_eq!(ARM64_REG_PSTATE, 0x6030_0000_0010_0042);
+        assert_eq!(arm64_reg_x(0), Some(0x6030_0000_0010_0000));
+        assert_eq!(arm64_reg_x(1), Some(0x6030_0000_0010_0002));
+        assert_eq!(arm64_reg_x(3), Some(0x6030_0000_0010_0006));
+        assert_eq!(arm64_reg_x(30), Some(0x6030_0000_0010_003C));
+        assert_eq!(arm64_reg_x(31), None);
+    }
+
+    /// MVM-1・#3696: aarch64 の vGIC・ONE_REG の ioctl 番号と定数。
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn mvm1_3696_arm_vgic_constants_match_kernel_abi() {
+        assert_eq!(consts::KVM_CREATE_DEVICE, 0xC00C_AEE0);
+        assert_eq!(consts::KVM_SET_DEVICE_ATTR, 0x4018_AEE1);
+        assert_eq!(consts::KVM_GET_DEVICE_ATTR, 0x4018_AEE2);
+        assert_eq!(consts::KVM_GET_ONE_REG, 0x4010_AEAB);
+        assert_eq!(consts::KVM_SET_ONE_REG, 0x4010_AEAC);
+        assert_eq!(consts::KVM_DEV_TYPE_ARM_VGIC_V3, 7);
+        assert_eq!(consts::KVM_CAP_DEVICE_CTRL, 89);
     }
 
     /// MVM-1・MVM-4・#3731: x86_64 起動用の ioctl 番号と上限の具体値。

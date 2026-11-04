@@ -3,7 +3,7 @@
 //! 役割: x86_64 の [`crate::boot_x86::load_linux`] に相当する arm64 側の入口。Image ヘッダを検証し、
 //! カーネル・initrd・FDT の置き場所を決めて [`GuestMemory`] へ書き、起動時に vCPU へ入れる値を
 //! [`ArmBootState`] で返す。呼び出し元は macOS の VM 組み立て（#3797・TASK-192.15）と、
-//! 将来の KVM aarch64（#3696）。レジスタへの実書き込み（`hv_vcpu_set_reg`）と `SCTLR_EL1`・キャッシュの保守・
+//! KVM aarch64 の `MicroVm::load_kernel`（#3696）。レジスタへの実書き込み（`hv_vcpu_set_reg`）と `SCTLR_EL1`・キャッシュの保守・
 //! MPIDR は呼び出し側の責務で、本層は「どこに何を置き、各レジスタに何を入れるか」だけを返す
 //! （TASK-192.7・#3790・MVM-5・MVM-1・MVM-4）。
 //!
@@ -298,6 +298,35 @@ pub struct LoadedArm64 {
     pub fdt: MmioRegion,
     /// 検証済みの Image ヘッダ。
     pub header: Arm64ImageHeader,
+}
+
+/// KVM aarch64 の `MicroVm::load_kernel` が返す、配置結果と起動レジスタの値の組（MVM-1・#3696）。
+///
+/// x86_64 の `boot_x86::LoadedKernel` に相当する arch 別の型で、`microvm::LoadedKernel` の名で再公開される。
+/// 起動レジスタは [`ArmBootState::for_loaded`] で配置結果から導くので、呼び出し側が食い違う値を組めない
+/// （REPAIR-2。フィールドは非公開）。`setup_boot_vcpu` が各領域をこの VM の RAM と照合してから vCPU へ書く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64LoadedKernel {
+    loaded: LoadedArm64,
+    state: ArmBootState,
+}
+
+impl Arm64LoadedKernel {
+    /// 配置結果から作る（起動レジスタは [`ArmBootState::for_loaded`] で導く）。
+    pub fn from_loaded(loaded: LoadedArm64) -> Self {
+        let state = ArmBootState::for_loaded(&loaded);
+        Self { loaded, state }
+    }
+
+    /// 配置結果（カーネル・initrd・FDT の領域）。
+    pub fn loaded(&self) -> &LoadedArm64 {
+        &self.loaded
+    }
+
+    /// 起動時に vCPU 0 へ入れるレジスタの値。
+    pub fn boot_state(&self) -> &ArmBootState {
+        &self.state
+    }
 }
 
 /// 起動時に vCPU へ入れるレジスタの値（実書き込みは #3797。macOS では `HvReg` に対応する）。

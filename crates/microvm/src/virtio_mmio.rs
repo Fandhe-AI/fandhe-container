@@ -21,8 +21,10 @@
 //! 不正なアクセスは [`IgnoredAccess`] つきで無視して呼び出し元へ返す（ホストのエラーにはしない）。
 //! `unsafe` は使わない。
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 use crate::dispatch::MmioDevice;
 use crate::error::{MicrovmError, MicrovmErrorCode};
 
@@ -31,8 +33,10 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 /// dispatcher（所有を要求する）と VM 構成体（型つきで触る）がトランスポートを共有するためのラッパー。
 ///
 /// lock が poison していたらデバイスは応答をやめる（fail-closed。`MmioDevice` は `Result` を返せない）。
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) struct SharedTransport<D: VirtioDevice>(pub(crate) Arc<Mutex<VirtioMmioTransport<D>>>);
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 impl<D: VirtioDevice + Send> MmioDevice for SharedTransport<D> {
     fn read(&self, offset: u64, data: &mut [u8]) -> MmioReadOutcome {
         match self.0.lock() {

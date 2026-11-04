@@ -28,8 +28,8 @@
 //! （読み出しは dispatcher が 0xFF 埋め）。添字アクセス・`unwrap` は使わず、計数は saturating で行う。
 //!
 //! # THRE 割り込み（#3892・MVM-5・MVM-1）
-//! 線が結線されている（[`SerialConsole::mmio_device_with_irq`] を呼んだ）ときだけ有効で、線の無い経路（x86 の PIO・
-//! [`SerialConsole::mmio_device`]）は従来どおり IIR が常に「保留なし」（0x01）を返す。
+//! 線が結線されている（[`SerialConsole::mmio_device_with_irq`]・x86 は [`SerialConsole::port_device_with_irq`] を呼んだ）
+//! ときだけ有効で、線の無い経路（[`SerialConsole::port_device`]・[`SerialConsole::mmio_device`]）は従来どおり IIR が常に「保留なし」（0x01）を返す。
 //! IER.ETBEI（bit1）が 1 で THRE 保留があるとき、IIR は 0x02（FIFO 有効時は 0xC2）を返し、[`Uart16550::irq_level`] が
 //! `High` になる。保留は ETBEI を 0 から 1 にしたとき・THR 書き込み（ループバック中も含む）・FCR の送信 FIFO リセット
 //! （bit2）で立ち、IIR の読み出し（THRE を返したとき）と ETBEI を 0 にしたときに下がる（QEMU の `hw/char/serial.c` と
@@ -37,7 +37,9 @@
 //! 優先度は RLS > RDA > CTI > THRE > MSR（PC16550D / TL16C550 のデータシートの IIR 表。QEMU の `hw/char/serial.c` も同じ）。
 //! 線の更新はモデルが自分の線（[`SerialConsole::mmio_device_with_irq`] が設定）へ値の変化だけを伝える。ゲストの MMIO
 //! アクセスの後と、ホストの [`SerialConsole::push_input`] の後に、UART の lock を持ったまま行う
-//! （arm64 は macOS の level SPI。`crate::spi::SpiLevelLine`）。
+//! （arm64 は macOS の level SPI〔`crate::spi::SpiLevelLine`〕、x86 は KVM の `KVM_IRQ_LINE`〔`crate::irq::IrqLevelLine`。#3918〕）。
+//! x86 の Linux の `serial8250_do_startup` の THRE 試験（IER=THRI → IIR、IER=0 → IER=THRI → IIR）は、ETBEI の 0 から 1 のたびに
+//! 保留を立てるため 2 回とも 0x02 を返し BUG_THRE を立てない（`drivers/tty/serial/8250/8250_port.c`）。
 //!
 //! # ゲスト入力（#3893・MVM-5・MVM-1・CORE-7）
 //! ホストは [`SerialConsole::push_input`] でゲストへ文字を渡す。入力は上限（既定 [`MAX_INPUT_BYTES`]）つきの受信 FIFO に
@@ -53,11 +55,9 @@
 //! ロック順は「UART → 線（GIC の生存フラグ）」で、vCPU 側と同じ。WFI で待つゲストへは最大 `WFI_WAIT_MAX`（10 ms）遅れて届く。
 //!
 //! # 未実装（REPAIR-3）
-//! - x86 の IRQ 4（[`COM1_IRQ`]）は出さない。PIO の [`SerialConsole::port_device`] は線を持たず、IIR は従来どおり常に
-//!   「保留なし」を返す（届かない THRE を報告すると Linux の `serial8250_do_startup` の THRE 試験が BUG_THRE を立てず、
-//!   ドライバが来ない割り込みを待つため）。将来は irqfd の GSI 4 へ結線する。KVM の `IrqFd` は edge のため、level には
-//!   `KVM_IRQ_LINE` か resamplefd が要る（MVM-1）。
-//! - ゲスト入力は x86 の PIO では線が無いため、Linux ゲストは入力を読みに来ない（LSR.DR と RBR のポーリングは動く）。
+//! - x86 の線なしの PIO（[`SerialConsole::port_device`]）は IIR が従来どおり常に「保留なし」を返す（届かない THRE を報告すると
+//!   ドライバが来ない割り込みを待つため）。`microvm::assemble` は x86_64 で [`SerialConsole::port_device_with_irq`] を使い、
+//!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。aarch64 の KVM の線は #3696・#3898。
 //! - 受信トリガ（FCR bit7:6）・CTI（IIR 0x0C）・LSR.OE と RLS 割り込みは未実装。ループバック中の THR 書き込みは RX へ回さない。
 //! - `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかは未確認（#3803 の実機確認項目）。
 
@@ -74,7 +74,8 @@ use crate::virtio_mmio::{IgnoredAccess, MmioReadOutcome, MmioWriteOutcome};
 pub const COM1_BASE: u16 = 0x3f8;
 /// UART が占めるポート数（offset 0..8）。
 pub const UART_PORT_LEN: u16 = 8;
-/// COM1 の IRQ 番号。x86 の PIO は線を持たず割り込みは出さない（REPAIR-3）ため、将来仕様の記述用。
+/// COM1 の IRQ 番号（ISA IRQ 4 = GSI 4。MP テーブルでは IOAPIC pin 4・edge・active high）。x86_64 の KVM では
+/// `microvm::assemble` が `KVM_IRQ_LINE` の線をこの番号に結ぶ（#3918）。線なしの [`SerialConsole::port_device`] は割り込みを出さない。
 pub const COM1_IRQ: u32 = 4;
 /// 出力バッファの上限バイト数（64 KiB）。
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -534,6 +535,19 @@ impl SerialConsole {
     pub fn port_device(&self) -> Box<dyn PortIoDevice> {
         Box::new(SharedUart(Arc::clone(&self.inner)))
     }
+
+    /// [`Self::port_device`] に割り込みの線をつけたもの（x86 の COM1 = IRQ 4。#3918・MVM-1・REPAIR-3）。
+    ///
+    /// 線は `crate::irq::IrqLevelLine`（`KVM_IRQ_LINE`）。各 PIO アクセスの後と [`Self::push_input`] の後に、UART の lock を
+    /// 持ったまま線の値の変化だけを伝える。`line` の失敗でもアクセスは `Handled` のまま返し、
+    /// [`UartStats::irq_line_errors`] に数える。この時点から THRE・受信データを IIR に出す。
+    pub fn port_device_with_irq(&self, line: Arc<dyn LevelInterruptLine>) -> Box<dyn PortIoDevice> {
+        if let Ok(mut u) = self.inner.lock() {
+            u.irq_wired = true;
+            u.line = Some(line);
+        }
+        self.port_device()
+    }
 }
 
 impl SerialConsole {
@@ -627,14 +641,27 @@ struct SharedUart(Arc<Mutex<Uart16550>>);
 impl PortIoDevice for SharedUart {
     fn read(&mut self, offset: u16, data: &mut [u8]) -> PortIoOutcome {
         match self.0.lock() {
-            Ok(mut u) => u.read(offset, data),
+            Ok(mut u) => {
+                let out = u.read(offset, data);
+                if out == PortIoOutcome::Handled {
+                    // 線なし（`port_device`）では何もしない。線あり（#3918）は変化を UART の lock の下で伝える。
+                    u.sync_line();
+                }
+                out
+            }
             Err(_) => PortIoOutcome::Ignored,
         }
     }
 
     fn write(&mut self, offset: u16, data: &[u8]) -> PortIoOutcome {
         match self.0.lock() {
-            Ok(mut u) => u.write(offset, data),
+            Ok(mut u) => {
+                let out = u.write(offset, data);
+                if out == PortIoOutcome::Handled {
+                    u.sync_line();
+                }
+                out
+            }
             Err(_) => PortIoOutcome::Ignored,
         }
     }
@@ -982,6 +1009,50 @@ mod tests {
         assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
         assert_eq!(console.stats().unwrap().irq_line_errors, 1);
         assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(console.stats().unwrap().irq_line_errors, 2);
+    }
+
+    /// MVM-5・MVM-1・#3918: PIO ラッパー経由でも値が変わったときだけ線へ伝わる（THRE・受信データ）。
+    #[test]
+    fn mvm5_3918_pio_irq_line_sequence() {
+        let console = SerialConsole::new();
+        let line = FakeLine::default();
+        let mut dev = console.port_device_with_irq(Arc::new(line.clone()));
+        let calls = || line.calls.lock().unwrap().clone();
+        let (h, l) = (IrqLevel::High, IrqLevel::Low);
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
+        assert_eq!(calls(), vec![h]);
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
+        assert_eq!(calls(), vec![h]);
+        let mut b = [0u8; 1];
+        assert_eq!(dev.read(2, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [0x02]);
+        assert_eq!(calls(), vec![h, l]);
+        // ETBEI を下げてから ERBFI だけにし、ホストの入力で上がる。
+        assert_eq!(dev.write(1, &[0x01]), PortIoOutcome::Handled);
+        assert_eq!(calls(), vec![h, l]);
+        console.push_input(b"k").unwrap();
+        assert_eq!(calls(), vec![h, l, h]);
+        assert_eq!(dev.read(2, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [0x04]);
+        assert_eq!(calls(), vec![h, l, h]);
+        assert_eq!(dev.read(0, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [b'k']);
+        assert_eq!(calls(), vec![h, l, h, l]);
+    }
+
+    /// MVM-5・REPAIR-4・#3918: PIO の線の失敗でもアクセスは成立し、計数して次のアクセスで再試行する。
+    #[test]
+    fn mvm5_3918_pio_irq_line_failure_counted() {
+        let console = SerialConsole::new();
+        let line = FakeLine {
+            fail: true,
+            ..Default::default()
+        };
+        let mut dev = console.port_device_with_irq(Arc::new(line));
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
+        assert_eq!(console.stats().unwrap().irq_line_errors, 1);
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
         assert_eq!(console.stats().unwrap().irq_line_errors, 2);
     }
 

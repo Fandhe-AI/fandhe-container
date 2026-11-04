@@ -74,8 +74,8 @@ pub enum IrqLevel {
 ///
 /// [`InterruptLine`]（trigger と ACK 後の resample。virtio の ACK 駆動）とは別物で、UART の「ACK」は IIR の読み出しのため、
 /// デバイスモデル側が線の値を決めて [`LevelInterruptLine::set_level`] で伝える。macOS は `hv_gic_set_spi`
-/// （`crate::spi::SpiLevelLine`）。x86 の COM1（IRQ 4）も同じトレイトで結べるが、KVM の `IrqFd` は edge で
-/// level には `KVM_IRQ_LINE` か resamplefd が要るため未結線（REPAIR-3）。待ちは持たない（REPAIR-5 不要）。
+/// （`crate::spi::SpiLevelLine`）。x86 の COM1（IRQ 4）は `crate::irq::IrqLevelLine`（`KVM_IRQ_LINE`。#3918）で
+/// 結線済み（KVM の `IrqFd` は edge で線の値を持てないため別に持つ）。virtio の level 化（resamplefd）は未実装（REPAIR-3）。待ちは持たない（REPAIR-5 不要）。
 pub trait LevelInterruptLine: Send + Sync + std::fmt::Debug {
     /// 線を `level` にする。失敗はホスト側の問題（ゲストの入力では起きない）。
     fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError>;

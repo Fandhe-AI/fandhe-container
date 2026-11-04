@@ -24,6 +24,14 @@ golden_block_initrd_sha="3d700a7c4b52449c364c7422022c2b7875bf0622565b88f68f8d04a
 # block-read のコード 183 バイト（ファイル先頭から 120 バイト目）
 golden_block_code="b853000000488d3dab000000beed0100000f05b8a5000000488d3d9d000000488d35910000004889fa4531d24531c00f05b802000000488d3d8800000031f60f054885c0783f4881ec0002000089c731c04889e6ba000200000f05483d000200007522488d3d640000004889e6b920000000fcf3a6750e488d3570000000ba2a000000eb0c488d358c000000ba30000000b801000000bf010000000f05b8a9000000bfaddee1febe69191228ba674523010f05f390ebfc"
 
+# variant net-tx の初版（#3894）のゴールデン。コードは GNU as 2.46 で組んだ逆アセンブルと一致を確認済み。
+golden_net_tx_init_sha="751575eaa3b4feaf421b422e0f93ad2e9060cec964d22a7ea13ea8c3e83502de"
+golden_net_tx_initrd_sha="482003aae76b19e9cb401b51372644f0db25783df1614d33df60183bbf654a48"
+# net-tx のコード 239 バイト（ファイル先頭から 120 バイト目）
+golden_net_tx_code="b829000000bf11000000be0300000031d20f054885c00f88a10000004189c44883ec404889e731c0b940000000fcf3aac7042465746830b8100000004489e7be338900004889e20f054885c0786f448b6c2410c744241001000000b8100000004489e7be148900004889e20f054885c0784b66c7442428110066c744242a88b544896c242cb82c0000004489e7488d355b000000ba3c0000004531d24c8d44242841b9140000000f054883f83c750e488d3575000000ba22000000eb0c488d3589000000ba26000000b801000000bf010000000f05b8a9000000bfaddee1febe69191228ba674523010f05f390ebfc"
+# net-tx のフレーム 60 バイト（ヘッダ 14 + ペイロード 46）
+golden_net_tx_frame="02fc0000386602fc0000386588b566616e6468652d6d6963726f766d2d6e65742d74782d7061796c6f61642d30313233343536373839616263646566"
+
 sb="$(mktemp -d)"
 trap 'rm -rf "$sb"' EXIT
 touch "$sb/.microvm-test-initrd-selftest"
@@ -91,6 +99,9 @@ case "$(uname -s)" in
         newout
         run "$target" --variant block-read --output-dir "$out"
         check "win block-read refused" "2 unsupported-os" "$rc $(errcode)"
+        newout
+        run "$target" --variant net-tx --output-dir "$out"
+        check "win net-tx refused" "2 unsupported-os" "$rc $(errcode)"
         echo "pass=$pass fail=$fail"
         [ "$fail" -eq 0 ]
         exit $?
@@ -420,6 +431,77 @@ newout
 run "$target" --variant block-read --arch aarch64 --output-dir "$out"
 check "21 block-read with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
 check "21 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
+
+# --- 22: variant net-tx（#3894） ---
+newout
+run "$target" --variant net-tx --output-dir "$out"
+check "22 exit code" 0 "$rc"
+check "22 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+ncpio="$out/initrd.cpio"
+check "22 entries" "init 000081ed 00000000 00000000 491
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$ncpio")"
+ninit="$sb/init-net-tx.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$ncpio" | head -c 491 >"$ninit"
+check "22 init size" 491 "$(wc -c <"$ninit" | tr -d ' ')"
+check "22 magic class data" "7f454c460201" "$(hexat "$ninit" 0 6)"
+check "22 e_type" 2 "$(leat "$ninit" 16 2)"
+check "22 e_machine" 62 "$(leat "$ninit" 18 2)"
+check "22 e_entry" $((0x400078)) "$(leat "$ninit" 24 8)"
+check "22 e_phoff" 64 "$(leat "$ninit" 32 8)"
+check "22 e_phnum" 1 "$(leat "$ninit" 56 2)"
+check "22 p_type is PT_LOAD" 1 "$(leat "$ninit" 64 4)"
+check "22 p_flags R+X" 5 "$(leat "$ninit" 68 4)"
+check "22 p_vaddr" $((0x400000)) "$(leat "$ninit" 80 8)"
+check "22 p_filesz" 491 "$(leat "$ninit" 96 8)"
+check "22 p_memsz" 491 "$(leat "$ninit" 104 8)"
+check "22 code (239 bytes)" "$golden_net_tx_code" "$(hexat "$ninit" 120 239)"
+check "22 sockaddr_ll protocol htons(0x88B5)" "66c7442428110066c744242a88b5" "$(hexat "$ninit" 234 14)"
+check "22 frame (60 bytes)" "$golden_net_tx_frame" "$(hexat "$ninit" 359 60)"
+check "22 ok message" "fandhe-microvm-test: net tx ok v1" "$(tail -c +420 "$ninit" | head -c 33)"
+check "22 ok message newline" "0a" "$(hexat "$ninit" 452 1)"
+check "22 failed message" "fandhe-microvm-test: net tx failed v1" "$(tail -c +454 "$ninit" | head -c 37)"
+check "22 failed message newline" "0a" "$(hexat "$ninit" 490 1)"
+check "22 init sha256" "$golden_net_tx_init_sha" "$(sha_of "$ninit")"
+check "22 initrd sha256" "$golden_net_tx_initrd_sha" "$(sha_of "$ncpio")"
+check "22 build-info" "init_sha256=$golden_net_tx_init_sha
+init_bytes=491
+initrd_file=initrd.cpio
+initrd_sha256=$golden_net_tx_initrd_sha
+compress=none
+arch=x86_64
+format=newc
+variant=net-tx
+frame_hex=$golden_net_tx_frame
+message_ok=fandhe-microvm-test: net tx ok v1
+message_failed=fandhe-microvm-test: net tx failed v1" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant net-tx --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "22 second run is byte-identical"; else ng "22 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant net-tx --output-dir "$out" --compress gzip
+    check "22 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$ncpio"; then ok "22 gunzip equals the plain archive"; else ng "22 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 22 gzip)"
+fi
+
+# --- 23: net-tx の選択（環境変数・CLI の優先・Windows の拒否） ---
+newout
+run env MICROVM_TEST_INITRD_VARIANT=net-tx "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "23 env variant selects net-tx"; else ng "23 env variant ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_VARIANT=net-tx "$target" --variant default --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "23 CLI variant wins over env"; else ng "23 CLI variant did not win"; fi
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-tx --output-dir "$out"
+check "23 windows host refused for net-tx" "2 unsupported-os" "$rc $(errcode)"
+
+# --- 24: net-tx は aarch64 では拒否する ---
+newout
+run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+check "24 net-tx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
+check "24 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

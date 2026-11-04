@@ -38,6 +38,7 @@
 # #3783（TASK-192.1）で src/sys/hvf.rs・hvf_abi・hvf を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3786（TASK-192.2）で sys/hvf.rs に vCPU・レジスタ・exit・vtimer の宣言と HvVcpu・VcpuCanceller を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3787（TASK-192.4）で hvf/memory.rs とゲスト RAM のコピー API を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3949 で KVM aarch64 の ONE_REG ラッパーに id のサイズ種別（U64）の検査を追加（依存は増やさない。unsafe 追加なし）。
 # #3840 で sys の FlexBuf の要素型を sealed な unsafe trait（FlexEntry）で限定（依存・feature は変えない。unsafe は sys.rs のみ）。
 # #3844 で hvf_abi に check_vm_map（map の IPA 上限の検査）と HvVcpu の !Send / !Sync の const 判定を追加（依存は増やさない。unsafe 追加なし）。
 # #3789（TASK-192.3）で sys/hvf.rs に GICv3（hv_gic_*）の実行時解決と macOS 15 の版判定を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
@@ -49,6 +50,7 @@
 # #3892 で uart の THRE 割り込みと level 線のトレイト・arm64 のシリアルの SPI と FDT の interrupts・HVF の level SPI への結線を追加（依存は増やさない。unsafe なし）。
 # #3862 でゲスト RAM の backing に virtqueue の index 用の整列した u16 の単一命令 volatile アクセスを追加（依存は増やさない。unsafe は sys.rs・sys/hvf.rs のみ）。
 # #3899 で KVM aarch64 の AP の POWER_OFF 初期化と MPIDR の照合を追加（依存は増やさない。unsafe 追加なし）。
+# #3947 で kernel_boot の arm64 に virtio-block の 3 件を追加（依存は増やさない。unsafe 追加なし）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

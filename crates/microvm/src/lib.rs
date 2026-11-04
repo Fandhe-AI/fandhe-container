@@ -23,11 +23,11 @@
 //! TASK-75.1・MVM-1: ゲストメモリの初期化（`microvm`。匿名 mmap の backing と `KVM_SET_USER_MEMORY_REGION` による登録。Linux のみ。
 //! docs/design/microvm-memory-ownership.md）。
 //! TASK-75.2・MVM-1: VM 構成体の組み立て（`microvm::MicroVm::assemble`。VM・irqchip・ゲストメモリ・virtio デバイス群の MMIO 窓と
-//! GSI・vCPU 群を 1 つに束ねる。x86_64 のみ。ioeventfd の結線は後続）。
+//! GSI・vCPU 群を 1 つに束ねる。ここは x86_64 の分岐で、aarch64 は #3696 の段落。ioeventfd の結線は後続）。
 //! TASK-75.3.1・MVM-1: x86_64 のカーネル・initrd・cmdline のゲストメモリへのロード（`boot_x86`。OS 非依存・unsafe なし。
 //! Linux x86 Boot Protocol の bzImage と boot_params・e820。`microvm::MicroVm::load_kernel` が入口）。
 //! TASK-75.3.2・MVM-1: vCPU 0 のレジスタ初期化とカーネルのエントリからの実行開始（`boot_x86::BootCpuState`・`write_boot_tables`・
-//! `device::VcpuFd::set_boot_state` / `regs`・`microvm::MicroVm::setup_boot_vcpu`。x86_64 のみ。long mode・GPA 0..4 GiB の恒等写像・
+//! `device::VcpuFd::set_boot_state` / `regs`・`microvm::MicroVm::setup_boot_vcpu`。ここは x86_64 の分岐で、aarch64 は #3696 の段落。long mode・GPA 0..4 GiB の恒等写像・
 //! RSI = boot_params。`unsafe` は `sys` の `KVM_{GET,SET}_{REGS,SREGS}` のみ）。
 //! TASK-75.4.1・MVM-1: `microvm::MicroVm::start` / `RunningMicroVm::stop`（vCPU 0 の実行ループ・停止要求のポーリング・
 //! 停止時の fd・mmap・irqfd の後始末。ゲスト起因の終了は `microvm::StopReason` で報告。`unsafe` なし）。

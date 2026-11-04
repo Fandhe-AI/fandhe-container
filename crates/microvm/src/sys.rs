@@ -409,6 +409,23 @@ const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
 /// `KVM_REG_SIZE_U64`（`linux/kvm.h`）。
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+/// `KVM_REG_SIZE_MASK`（`linux/kvm.h`）。ONE_REG の id のうちレジスタのサイズ種別を表すビット。
+/// カーネル ABI の定数で `libc` に対応物が無いため、具体値の試験（`mvm1_3949_*`）で固定する。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
+
+/// ONE_REG の id のサイズ種別が `KVM_REG_SIZE_U64` であることを確かめる（#3949・MVM-1・純関数）。
+///
+/// `kvm_get_one_reg_u64` / `kvm_set_one_reg_u64` が ioctl の前に呼ぶ。8 バイトのバッファで足りることを保証し、
+/// U128 以上の id でカーネルがバッファを超えて書く（get）・読む（set）経路を閉じる。不一致は `Os(EINVAL)`。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const fn check_one_reg_id_u64(id: u64) -> Result<(), SysError> {
+    if id & KVM_REG_SIZE_MASK == KVM_REG_SIZE_U64 {
+        Ok(())
+    } else {
+        Err(SysError::Os(22))
+    }
+}
 /// `KVM_REG_ARM_CORE`（`0x0010 << KVM_REG_ARM_COPROC_SHIFT(16)`。`asm/kvm.h`）。
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 const KVM_REG_ARM_CORE: u64 = 0x0010 << 16;
@@ -1849,6 +1866,9 @@ pub(crate) fn kvm_create_device(vm: BorrowedFd<'_>, ty: u32) -> Result<OwnedFd, 
 
 /// `KVM_SET_DEVICE_ATTR`（デバイス fd）で、値 `value`（u64）を属性 `(group, attr)` へ書く（aarch64 のみ。#3696）。
 /// vGIC の `GRP_ADDR`（8 バイトのアドレス）・`GRP_NR_IRQS`（先頭 4 バイトだけ読まれる）・`GRP_CTRL`（`addr` は読まれない）に使う。
+///
+/// 前提（#3949）: 呼べる `(group, attr)` は、カーネルが `addr` の先から読む値が 8 バイト以下のものに限る。
+/// 8 バイトを超える属性は専用のラッパーを足すこと（組ごとのサイズはカーネル実装依存で、実行時検査の表は持たない）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_set_device_attr_u64(
     dev: BorrowedFd<'_>,
@@ -1881,6 +1901,10 @@ pub(crate) fn kvm_set_device_attr_u64(
 
 /// `KVM_GET_DEVICE_ATTR`（デバイス fd）で属性 `(group, attr)` を u64 として読む（aarch64 のみ。#3696）。
 /// `GRP_ADDR` は 8 バイトの値を返す。`GRP_DIST_REGS` は 4 バイト（上位は 0 のまま）を返す。
+///
+/// 前提（#3949）: 呼べる `(group, attr)` は、カーネルが `addr` の先へ書く値が 8 バイト以下のものに限る
+/// （現状の呼び出し元は `GRP_ADDR`・`GRP_DIST_REGS` だけ）。8 バイトを超える属性は本関数を使わず専用のラッパーを足すこと。
+/// 組ごとのサイズはカーネル実装依存のため実行時検査はしない。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_get_device_attr_u64(
     dev: BorrowedFd<'_>,
@@ -1899,7 +1923,8 @@ pub(crate) fn kvm_get_device_attr_u64(
     };
     // SAFETY: `dev` は借用中の生存 fd。`arg` は `repr(C)` で 24 バイト（const assert 済み）のローカルの借用。
     // `arg.addr` はゼロ初期化済みのローカル `value`（u64・8 バイト）のアドレスで、呼び出し中は生存し、他から
-    // 参照されない。カーネルはそこへ最大 8 バイトを書く。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    // 参照されない。カーネルはそこへ最大 8 バイトを書く（上記 doc の前提どおり、呼び出し元が 8 バイト以下の属性に限る）。
+    // 呼び出しは同期で完了し、戻り後にポインタを保持しない。
     let r = unsafe {
         ioctl(
             dev.as_raw_fd(),
@@ -1911,6 +1936,7 @@ pub(crate) fn kvm_get_device_attr_u64(
 }
 
 /// `KVM_SET_ONE_REG`（vCPU fd）で 64 bit レジスタ `id` に `value` を書く（aarch64 のみ。#3696）。
+/// `id` のサイズ種別が U64 でなければ ioctl を呼ばず `SysError::Os(EINVAL)`（#3949・MVM-1）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_set_one_reg_u64(
     vcpu: BorrowedFd<'_>,
@@ -1920,13 +1946,14 @@ pub(crate) fn kvm_set_one_reg_u64(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    check_one_reg_id_u64(id)?;
     let arg = KvmOneReg {
         id,
         addr: &value as *const u64 as u64,
     };
     // SAFETY: `vcpu` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み・ioctl 番号のサイズ符号と
     // 一致）のローカルの借用。`arg.addr` は引数 `value`（u64・8 バイト）のアドレスで、`id` は 64 bit レジスタ
-    // （`KVM_REG_SIZE_U64`）なのでカーネルが読むのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    // （直前の `check_one_reg_id_u64` でサイズ種別が `KVM_REG_SIZE_U64` と確かめ済み）なのでカーネルが読むのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
     let r = unsafe {
         ioctl(
             vcpu.as_raw_fd(),
@@ -1938,11 +1965,13 @@ pub(crate) fn kvm_set_one_reg_u64(
 }
 
 /// `KVM_GET_ONE_REG`（vCPU fd）で 64 bit レジスタ `id` を読む（aarch64 のみ。#3696）。
+/// `id` のサイズ種別が U64 でなければ ioctl を呼ばず `SysError::Os(EINVAL)`（#3949・MVM-1）。
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 pub(crate) fn kvm_get_one_reg_u64(vcpu: BorrowedFd<'_>, id: u64) -> Result<u64, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    check_one_reg_id_u64(id)?;
     let mut value: u64 = 0;
     let arg = KvmOneReg {
         id,
@@ -1950,7 +1979,7 @@ pub(crate) fn kvm_get_one_reg_u64(vcpu: BorrowedFd<'_>, id: u64) -> Result<u64, 
     };
     // SAFETY: `vcpu` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み）のローカルの借用。
     // `arg.addr` はゼロ初期化済みのローカル `value`（u64・8 バイト）のアドレスで、呼び出し中は生存し他から参照されない。
-    // `id` は 64 bit レジスタなのでカーネルが書くのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
+    // `id` は直前の `check_one_reg_id_u64` でサイズ種別が `KVM_REG_SIZE_U64` と確かめ済みなのでカーネルが書くのは 8 バイトだけ。呼び出しは同期で完了し、戻り後にポインタを保持しない。
     let r = unsafe {
         ioctl(
             vcpu.as_raw_fd(),
@@ -2465,6 +2494,60 @@ mod tests {
         assert_eq!(consts::KVM_RUN, 0xAE80);
         assert_eq!(consts::KVM_SET_USER_MEMORY_REGION, 0x4020_AE46);
         assert_eq!(std::mem::size_of::<KvmUserspaceMemoryRegion>(), 32);
+    }
+
+    /// MVM-1・#3949: ONE_REG の id は U64 のサイズ種別だけを受ける（ioctl の前の検査の具体値）。
+    #[test]
+    fn mvm1_3949_one_reg_id_size_must_be_u64() {
+        assert_eq!(KVM_REG_SIZE_MASK, 0x00f0_0000_0000_0000);
+        for id in [
+            0x6030_0000_0010_0040_u64,
+            0x6030_0000_0013_C005,
+            0x6030_0000_0010_0000,
+            0x6030_0000_0010_003C,
+        ] {
+            assert_eq!(check_one_reg_id_u64(id), Ok(()), "id={id:#x}");
+        }
+        for id in [
+            0x6000_0000_0010_0040_u64, // U8
+            0x6010_0000_0010_0040,     // U16
+            0x6020_0000_0010_0040,     // U32
+            0x6040_0000_0010_0040,     // U128
+            0x6050_0000_0010_0040,     // U256
+            0x6080_0000_0010_0040,     // U2048
+            0x60f0_0000_0010_0040,     // マスク全ビット
+        ] {
+            assert_eq!(
+                check_one_reg_id_u64(id),
+                Err(SysError::Os(22)),
+                "id={id:#x}"
+            );
+        }
+    }
+
+    /// MVM-1・#3949: U64 以外の id は ioctl を呼ばずに EINVAL（届けば /dev/null は ENOTTY=25）。
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn mvm1_3949_one_reg_rejects_non_u64_before_ioctl() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        let u128_id = 0x6040_0000_0010_0040_u64;
+        assert_eq!(
+            kvm_get_one_reg_u64(f.as_fd(), u128_id),
+            Err(SysError::Os(22))
+        );
+        assert_eq!(
+            kvm_set_one_reg_u64(f.as_fd(), u128_id, 0),
+            Err(SysError::Os(22))
+        );
+        assert_eq!(
+            kvm_get_one_reg_u64(f.as_fd(), ARM64_REG_PC),
+            Err(SysError::Os(25))
+        );
+        assert_eq!(
+            kvm_set_one_reg_u64(f.as_fd(), ARM64_REG_PC, 0),
+            Err(SysError::Os(25))
+        );
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

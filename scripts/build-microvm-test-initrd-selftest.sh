@@ -24,6 +24,13 @@ golden_block_initrd_sha="3d700a7c4b52449c364c7422022c2b7875bf0622565b88f68f8d04a
 # block-read のコード 183 バイト（ファイル先頭から 120 バイト目）
 golden_block_code="b853000000488d3dab000000beed0100000f05b8a5000000488d3d9d000000488d35910000004889fa4531d24531c00f05b802000000488d3d8800000031f60f054885c0783f4881ec0002000089c731c04889e6ba000200000f05483d000200007522488d3d640000004889e6b920000000fcf3a6750e488d3570000000ba2a000000eb0c488d358c000000ba30000000b801000000bf010000000f05b8a9000000bfaddee1febe69191228ba674523010f05f390ebfc"
 
+# variant block-read の aarch64 版（#3947）のゴールデン。コードは llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。
+# 初版であり、更新理由は「aarch64 の block-read を新設したため」。
+golden_block_a64_init_sha="046395234f7192f8373497861d6cf2faa1428e118bb5e2a4ecc0a46a6a88459c"
+golden_block_a64_initrd_sha="7d8cadeff5a14446692872b9fab65da33c0304465ed7cba9f82cc62619ecde99"
+# aarch64 の block-read のコード 224 バイト（ファイル先頭から 120 バイト目）
+golden_block_a64_code="600c8092e1070010a23d80d2480480d2010000d48007003041070010e20300aae3031faae4031faa080580d2010000d4600c8092c1060050e2031faa080780d2010000d40003f8b7ff0308d1e1030091024080d2e80780d2010000d41f0008f121020054e3030010e41740a9661c40a99f0006eb81010054bf0007eb41010054e41741a9661c41a99f0006ebc1000054bf0007eb81000054e1030070420580d203000014e1040030020680d2200080d2080880d2010000d4a0d59b5220dcbf72212d83524102a572e2ac88526224a072c81180d2010000d43f2003d5ffffff17"
+
 # variant net-tx の初版（#3894）のゴールデン。コードは GNU as 2.46 で組んだ逆アセンブルと一致を確認済み。
 golden_net_tx_init_sha="751575eaa3b4feaf421b422e0f93ad2e9060cec964d22a7ea13ea8c3e83502de"
 golden_net_tx_initrd_sha="482003aae76b19e9cb401b51372644f0db25783df1614d33df60183bbf654a48"
@@ -437,10 +444,59 @@ check "20 missing value" "2 bad-argument" "$rc $(errcode)"
 run env MICROVM_TEST_INITRD_ARCH=bogus "$target" --output-dir "$out"
 check "20 bad env value" "2 bad-argument" "$rc $(errcode)"
 
-# --- 21: block-read は aarch64 では拒否する ---
+# --- 21: variant block-read の aarch64 版（#3947）。net-tx・net-rx の aarch64 は拒否のまま ---
 newout
 run "$target" --variant block-read --arch aarch64 --output-dir "$out"
-check "21 block-read with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
+check "21 exit code" 0 "$rc"
+check "21 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+acpio="$out/initrd.cpio"
+check "21 entries" "init 000081ed 00000000 00000000 489
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$acpio")"
+ainit="$sb/init-block-a64.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$acpio" | head -c 489 >"$ainit"
+check "21 init size" 489 "$(wc -c <"$ainit" | tr -d ' ')"
+check "21 magic class data" "7f454c460201" "$(hexat "$ainit" 0 6)"
+check "21 e_machine" 183 "$(leat "$ainit" 18 2)"
+check "21 e_entry" $((0x400078)) "$(leat "$ainit" 24 8)"
+check "21 p_flags R+X" 5 "$(leat "$ainit" 68 4)"
+check "21 p_filesz" 489 "$(leat "$ainit" 96 8)"
+check "21 p_memsz" 489 "$(leat "$ainit" 104 8)"
+check "21 code (224 bytes)" "$golden_block_a64_code" "$(hexat "$ainit" 120 224)"
+check "21 sentinel (8-byte aligned at 344)" "fandhe-microvm-block-sentinel-01" "$(tail -c +345 "$ainit" | head -c 32)"
+check "21 data /dev" "2f64657600" "$(hexat "$ainit" 376 5)"
+check "21 data devtmpfs" "646576746d70667300" "$(hexat "$ainit" 381 9)"
+check "21 data /dev/vda" "2f6465762f76646100" "$(hexat "$ainit" 390 9)"
+check "21 match message" "fandhe-microvm-test: block sentinel ok v1" "$(tail -c +400 "$ainit" | head -c 41)"
+check "21 match message newline" "0a" "$(hexat "$ainit" 440 1)"
+check "21 mismatch message" "fandhe-microvm-test: block sentinel mismatch v1" "$(tail -c +442 "$ainit" | head -c 47)"
+check "21 mismatch message newline" "0a" "$(hexat "$ainit" 488 1)"
+check "21 init sha256" "$golden_block_a64_init_sha" "$(sha_of "$ainit")"
+check "21 initrd sha256" "$golden_block_a64_initrd_sha" "$(sha_of "$acpio")"
+check "21 build-info" "init_sha256=$golden_block_a64_init_sha
+init_bytes=489
+initrd_file=initrd.cpio
+initrd_sha256=$golden_block_a64_initrd_sha
+compress=none
+arch=aarch64
+format=newc
+variant=block-read
+sentinel=fandhe-microvm-block-sentinel-01
+message_match=fandhe-microvm-test: block sentinel ok v1
+message_mismatch=fandhe-microvm-test: block sentinel mismatch v1" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant block-read --arch aarch64 --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$acpio"; then ok "21 second run is byte-identical"; else ng "21 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant block-read --arch aarch64 --output-dir "$out" --compress gzip
+    check "21 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$acpio"; then ok "21 gunzip equals the plain archive"; else ng "21 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 21 gzip)"
+fi
+newout
+run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+check "21 net-tx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
 check "21 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
 
 # --- 22: variant net-tx（#3894） ---

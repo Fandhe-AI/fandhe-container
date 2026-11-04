@@ -115,6 +115,7 @@ type Config = HvfMicroVmConfig<MemoryBlockBackend, MemoryNetBackend>;
 /// 起動確認ゲストを載せた構成（vCPU 1・シリアルあり・net なし）。`block` は virtio-block の台数。
 fn config(layout: Arm64Layout, block: usize, observer: Arc<ExitSeq>) -> Config {
     HvfMicroVmConfig {
+        vcpus: layout.vcpus,
         layout,
         kernel: image_with_code(&BOOT_CHECK_CODE),
         initrd: None,

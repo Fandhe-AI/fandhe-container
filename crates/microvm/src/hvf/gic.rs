@@ -38,7 +38,7 @@
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
 //!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
-//! - WFI の起床（#3887）: `set_spi(intid, true)` が成功したら `WfiWaker` に通知し、WFI で待つ vCPU を即座に起こす
+//! - WFI の起床（#3887）: `set_spi(intid, true)` が成功したら `WfiWaker` に通知し、WFI で待つ全 vCPU を即座に起こす（宛先は見ない。#3933）
 //!   （edge の trigger・level の上げ直し・シリアル入力の `High` を覆う。deassert では通知しない）。ロック順は
 //!   UART → 生存フラグ（読み取り。通知の前に外す）→ waker の mutex で、waker の mutex を持つ間は他の lock を取らない。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。

@@ -183,3 +183,55 @@ fn mvm5_3893_push_input_via_dispatcher_raises_and_clears_line() {
     assert_eq!(mmio(&mut d, BASE, 2, None), Some(0x01));
     assert_eq!(console.stats().unwrap().input_read_bytes, 2);
 }
+
+/// PIO の 1 バイト In / Out を ExitDispatcher 経由で行う。
+fn pio(d: &mut ExitDispatcher, off: u16, write: Option<u8>) -> Option<u8> {
+    let exit = VcpuExit::Io {
+        direction: if write.is_some() {
+            IoDirection::Out
+        } else {
+            IoDirection::In
+        },
+        port: COM1_BASE + off,
+        size: 1,
+        count: 1,
+        data: write.map(|v| vec![v]).unwrap_or_default(),
+    };
+    match d.dispatch(&exit).unwrap() {
+        DispatchOutcome::Pio { response, .. } => response.first().copied(),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// MVM-5・MVM-1・REPAIR-12・#3918: x86 の PIO（`port_device_with_irq`）でも THRE と受信データの線が
+/// ディスパッチャ経由で立ち下がる（偽の線。実機不要）。
+#[test]
+fn mvm5_3918_pio_irq_line_via_dispatcher() {
+    let console = SerialConsole::new();
+    let line = Arc::new(RecordingLine::default());
+    let mut d = ExitDispatcher::new();
+    d.register_pio(
+        COM1_BASE,
+        UART_PORT_LEN,
+        console.port_device_with_irq(line.clone()),
+    )
+    .unwrap();
+    let calls = || line.0.lock().unwrap().clone();
+    let (h, l) = (IrqLevel::High, IrqLevel::Low);
+
+    pio(&mut d, 1, Some(0x02));
+    assert_eq!(calls(), vec![h]);
+    assert_eq!(pio(&mut d, 2, None), Some(0x02));
+    assert_eq!(calls(), vec![h, l]);
+
+    pio(&mut d, 1, Some(0x01));
+    assert_eq!(console.push_input(b"ok").unwrap().accepted, 2);
+    assert_eq!(calls(), vec![h, l, h]);
+    assert_eq!(pio(&mut d, 2, None), Some(0x04));
+    assert_eq!(pio(&mut d, 5, None), Some(0x61));
+    assert_eq!(pio(&mut d, 0, None), Some(b'o'));
+    assert_eq!(calls(), vec![h, l, h]);
+    assert_eq!(pio(&mut d, 0, None), Some(b'k'));
+    assert_eq!(calls(), vec![h, l, h, l]);
+    assert_eq!(pio(&mut d, 2, None), Some(0x01));
+}

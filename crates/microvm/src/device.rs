@@ -17,6 +17,7 @@
 //! [`VmFd::register_ioeventfd`]（`KVM_IOEVENTFD`。ゲストの `QueueNotify` を VM exit なしで eventfd へ）と、
 //! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
+//! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 `VmFd::register_irq_line`（`KVM_IRQ_LINE`）を足した。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
 //! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
@@ -53,6 +54,8 @@ use crate::dispatch::{DispatchOutcome, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::{self, ExitValue, VcpuExit};
 use crate::interrupt::{InterruptLine, IoEventSpec};
+#[cfg(target_arch = "x86_64")]
+use crate::irq::IrqLevelLine;
 use crate::irq::{self, EventFd, IoEventFd, IrqFd};
 use crate::sys::{self, SysError};
 
@@ -73,6 +76,8 @@ const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOTTY: i32 = 25;
 const EBUSY: i32 = 16;
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+const ENXIO: i32 = 6;
 const ENOSPC: i32 = 28;
 
 /// 開いた `/dev/kvm`。
@@ -1166,6 +1171,9 @@ enum IrqStage {
     CreateIrqchip,
     Irqfd,
     Ioeventfd,
+    /// `KVM_IRQ_LINE`（#3918）。x86_64 の COM1 の level 線。
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    IrqLine,
 }
 
 fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
@@ -1174,6 +1182,7 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
         IrqStage::CreateIrqchip => "KVM_CREATE_IRQCHIP",
         IrqStage::Irqfd => "KVM_IRQFD",
         IrqStage::Ioeventfd => "KVM_IOEVENTFD",
+        IrqStage::IrqLine => "KVM_IRQ_LINE",
     };
     match e {
         SysError::Unsupported => MicrovmError::new(
@@ -1191,6 +1200,11 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
         SysError::Os(EINVAL) if stage == IrqStage::CreateIrqchip => MicrovmError::new(
             MicrovmErrorCode::FailedPrecondition,
             "KVM_CREATE_IRQCHIP must run before any vCPU is created",
+        ),
+        // irqchip が無い VM fd への KVM_IRQ_LINE は ENXIO（`kvm_vm_ioctl_irq_line` 前の `irqchip_in_kernel` 検査）。
+        SysError::Os(ENXIO) if stage == IrqStage::IrqLine => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_IRQ_LINE requires an in-kernel irqchip",
         ),
         SysError::Os(EINVAL) if stage == IrqStage::Irqfd => MicrovmError::new(
             MicrovmErrorCode::FailedPrecondition,
@@ -1342,6 +1356,33 @@ impl VmFd {
         sys::kvm_irqfd(self.fd.as_fd(), event.as_fd(), gsi, false)
             .map_err(|e| classify_irq_error(IrqStage::Irqfd, e))?;
         Ok(IrqFd::registered(vm_fd, event, gsi))
+    }
+
+    /// GSI `irq` を `KVM_IRQ_LINE` で駆動する level 線を作る（x86_64 のみ。#3918・MVM-1）。
+    ///
+    /// UART の割り込み（`crate::interrupt::LevelInterruptLine`）の結線に使う。`KVM_IRQFD` は edge 注入で線の値を持てないため
+    /// 別に持つ。irqchip を先に作ること。作成時に `level = 0` を 1 回発行して irqchip の有無をここで検証する
+    /// （無ければ `FailedPrecondition`。fail-closed）。VM fd の dup を所有するので借用を持たない。
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn register_irq_line(&self, irq: u32) -> Result<IrqLevelLine, MicrovmError> {
+        self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
+        let vm_fd = self.fd.as_fd().try_clone_to_owned().map_err(|e| {
+            let n = e.raw_os_error().unwrap_or(0);
+            if n == EMFILE || n == ENFILE {
+                MicrovmError::new(
+                    MicrovmErrorCode::ResourceExhausted,
+                    format!("resource exhausted duplicating VM fd for irq line (os error {n})"),
+                )
+            } else {
+                MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    format!("duplicating VM fd for irq line failed (os error {n})"),
+                )
+            }
+        })?;
+        sys::kvm_irq_line(self.fd.as_fd(), irq, false)
+            .map_err(|e| classify_irq_error(IrqStage::IrqLine, e))?;
+        Ok(IrqLevelLine::new(vm_fd, irq))
     }
 
     /// ゲストの `spec` への書き込みを VM exit なしで eventfd へ通す（`KVM_IOEVENTFD`）。
@@ -2526,6 +2567,12 @@ mod tests {
                 C::AlreadyExists,
             ),
             (IrqStage::Irqfd, SysError::Os(EBUSY), C::AlreadyExists),
+            (
+                IrqStage::IrqLine,
+                SysError::Os(ENXIO),
+                C::FailedPrecondition,
+            ),
+            (IrqStage::IrqLine, SysError::Os(5), C::Internal),
             (IrqStage::Ioeventfd, SysError::Os(EEXIST), C::AlreadyExists),
             (
                 IrqStage::CreateIrqchip,

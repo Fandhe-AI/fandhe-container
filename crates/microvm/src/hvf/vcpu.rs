@@ -73,10 +73,12 @@ impl Default for VcpuThreadConfig {
 }
 
 /// `HvVcpu` を [`VcpuExec`] として扱う薄い包み（スレッド内でだけ作る。`!Send`）。
-struct HvfExec<'a>(HvVcpu<'a>);
+/// vtimer の mask 同期を `hv_vcpu_run` の再入直前に行うため `TimerHandler` もここで持つ（MVM-5・#3796）。
+struct HvfExec<'a>(HvVcpu<'a>, timer::TimerHandler);
 
 impl VcpuExec for HvfExec<'_> {
     fn run(&mut self, slice: Duration) -> Result<HvVcpuExit, MicrovmError> {
+        timer::sync_before_run(&mut self.0, &mut self.1)?;
         self.0.run_once(slice)
     }
 
@@ -123,6 +125,7 @@ fn dispatch(
     exit: &HvExit,
 ) -> Result<ExitAction, MicrovmError> {
     let vcpu = &mut exec.0;
+    let timer_handler = &mut exec.1;
     match exit {
         HvExit::Exception { class, exception } => match class {
             EsrClass::DataAbort(da) => {
@@ -130,12 +133,12 @@ fn dispatch(
             }
             EsrClass::Hvc { imm16 } => hvc::handle_hvc(vcpu, &mut handlers.hvc, *imm16, exception),
             EsrClass::Smc { imm16 } => hvc::handle_smc(vcpu, &mut handlers.hvc, *imm16, exception),
-            EsrClass::Wfx(kind) => timer::handle_wfx(vcpu, &mut handlers.timer, *kind, exception),
+            EsrClass::Wfx(kind) => timer::handle_wfx(vcpu, timer_handler, *kind, exception),
             _ => Err(internal(
                 "unexpected exception class reached the dispatcher",
             )),
         },
-        HvExit::VtimerActivated => timer::handle_vtimer(vcpu, &mut handlers.timer),
+        HvExit::VtimerActivated => timer::handle_vtimer(vcpu, timer_handler),
         _ => Err(internal("unexpected exit reached the dispatcher")),
     }
 }
@@ -179,7 +182,7 @@ impl VcpuThread {
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
                 let stop = start.ready(vcpu.canceller());
-                let mut exec = HvfExec(vcpu);
+                let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
                 let reason = run_loop(&mut exec, &stop, slice, observer.as_deref(), |e, x| {
                     dispatch(e, &mut handlers, x)
                 });

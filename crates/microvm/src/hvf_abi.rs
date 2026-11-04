@@ -360,8 +360,15 @@ fn invalid(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, msg)
 }
 
-/// macOS バックエンドが受ける vCPU 数の上限（SMP は未実装。TASK-192.15・#3797・MVM-5・REPAIR-3）。
-pub const HVF_MAX_VCPUS: u32 = 1;
+/// macOS バックエンドが受ける vCPU 数の上限（#3884・MVM-5・MVM-1・REPAIR-5）。
+///
+/// 固定値 32。根拠: (1) Linux（KVM）バックエンドの `microvm::MAX_VCPUS`（32）と揃え、plugin-microvm から見た上限を 2 つの
+/// バックエンドで同じにする。(2) GICR の窓と FDT の `cpu@N` が受ける `ARM64_MAX_VCPUS`（64）以内（下の const assert で固定）。
+/// フレームワーク側の実際の上限（`hv_vm_get_max_vcpu_count`）は照会しない。照会は新しい FFI 宣言が要り、macOS 14 での
+/// dyld の解決と SDK ヘッダとの照合が未確認のため。32 台を受けない機種では `hv_vcpu_create` が失敗し、`assemble` 全体が
+/// 作成済みの資源を回収して失敗する（fail-closed）。照会の要否と実機での値の記録は #3803。
+pub const HVF_MAX_VCPUS: u32 = 32;
+const _: () = assert!(HVF_MAX_VCPUS <= crate::arm64_layout::ARM64_MAX_VCPUS);
 /// macOS バックエンドが受けるゲスト RAM の上限（[`MAX_MAP_BYTES`] と同値。mmap の前に超過を拒否する）。
 pub const HVF_MAX_GUEST_RAM_BYTES: u64 = MAX_MAP_BYTES;
 
@@ -370,8 +377,10 @@ pub const HVF_MAX_GUEST_RAM_BYTES: u64 = MAX_MAP_BYTES;
 /// 循環依存を避けるためプリミティブだけで受ける。呼び出し元は plugin-microvm 側から来る非信頼の VM 構成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfAssembleInput {
-    /// vCPU 数。
+    /// 構成（`HvfMicroVmConfig::vcpus`）の vCPU 数。
     pub vcpus: u32,
+    /// レイアウトの vCPU 数（`layout.vcpus`。FDT の `cpu@N` の個数。`vcpus` と一致すること。#3884）。
+    pub layout_vcpus: u32,
     /// ゲスト RAM の大きさ（バイト）。
     pub ram_size: u64,
     /// レイアウトの virtio-mmio の個数。
@@ -392,7 +401,8 @@ pub struct HvfAssembleInput {
 
 /// 構成値の上限検査（資源を作る前。ERR-1: メッセージは固定で入力値をエコーしない）。
 ///
-/// 順序: vcpus（0 は `InvalidArgument`、2 以上は `Unimplemented`。他の不正に隠れないよう最初）→ RAM → virtio の台数
+/// 順序: vcpus（0 と [`HVF_MAX_VCPUS`] 超は `InvalidArgument`。他の不正に隠れないよう最初）→ レイアウトの vcpus との一致 →
+/// RAM → virtio の台数
 /// （[`crate::arm64_layout::ARM64_VIRTIO_MMIO_MAX`]）→ レイアウトの個数の一致 → シリアルの有無の一致 → MMIO 表の合計 →
 /// Image・initrd・cmdline の長さ。Image ヘッダの中身はここでは見ない（RAM 登録後の `load_arm64` が検証する）。
 ///
@@ -409,10 +419,10 @@ pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError
         return Err(invalid("vcpus is zero"));
     }
     if input.vcpus > HVF_MAX_VCPUS {
-        return Err(MicrovmError::new(
-            MicrovmErrorCode::Unimplemented,
-            "hvf backend supports a single vcpu",
-        ));
+        return Err(invalid("too many vcpus for the hvf backend"));
+    }
+    if input.layout_vcpus != input.vcpus {
+        return Err(invalid("vcpu layout does not match the configuration"));
     }
     if input.ram_size == 0 || input.ram_size > HVF_MAX_GUEST_RAM_BYTES {
         return Err(invalid("guest ram size is out of range"));
@@ -1354,6 +1364,7 @@ mod tests {
     fn ok_input() -> HvfAssembleInput {
         HvfAssembleInput {
             vcpus: 1,
+            layout_vcpus: 1,
             ram_size: 64 << 20,
             layout_virtio_count: 1,
             device_count: 1,
@@ -1379,26 +1390,59 @@ mod tests {
         assert!(check_assemble_input(&ok_input()).is_ok());
     }
 
+    /// MVM-5・MVM-1・#3884: 上限ちょうどは受理、上限 + 1 と 0 は `InvalidArgument`。他の不正に隠れず最初に検査される。
     #[test]
-    fn mvm5_3797_assemble_vcpus_zero_invalid_and_two_unimplemented() {
+    fn mvm5_3884_assemble_vcpus_bounds() {
+        assert_eq!(HVF_MAX_VCPUS, 32);
         let mut i = ok_input();
+        i.vcpus = HVF_MAX_VCPUS;
+        i.layout_vcpus = HVF_MAX_VCPUS;
+        assert!(check_assemble_input(&i).is_ok());
+        i.vcpus = HVF_MAX_VCPUS + 1;
+        i.layout_vcpus = HVF_MAX_VCPUS + 1;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "too many vcpus for the hvf backend"
+            )
+        );
         i.vcpus = 0;
+        i.layout_vcpus = 0;
         assert_eq!(
             assemble_err(i),
             (MicrovmErrorCode::InvalidArgument, "vcpus is zero")
         );
-        i.vcpus = 2;
+        // 他の値も不正でも vcpus の拒否が優先される。
+        i.vcpus = HVF_MAX_VCPUS + 1;
+        i.ram_size = 0;
+        i.image_len = 0;
         assert_eq!(
             assemble_err(i),
             (
-                MicrovmErrorCode::Unimplemented,
-                "hvf backend supports a single vcpu"
+                MicrovmErrorCode::InvalidArgument,
+                "too many vcpus for the hvf backend"
             )
         );
-        // 他の値も不正でも vcpus = 2 の Unimplemented が優先される。
-        i.ram_size = 0;
-        i.image_len = 0;
-        assert_eq!(assemble_err(i).0, MicrovmErrorCode::Unimplemented);
+    }
+
+    /// MVM-5・MVM-1・#3884: 構成の vcpus と layout の vcpus が違えば、どちら向きでも `InvalidArgument`。
+    #[test]
+    fn mvm5_3884_assemble_vcpus_layout_mismatch() {
+        let expected = (
+            MicrovmErrorCode::InvalidArgument,
+            "vcpu layout does not match the configuration",
+        );
+        let mut i = ok_input();
+        i.vcpus = 2;
+        i.layout_vcpus = 1;
+        assert_eq!(assemble_err(i), expected);
+        i.vcpus = 1;
+        i.layout_vcpus = 2;
+        assert_eq!(assemble_err(i), expected);
+        i.vcpus = 2;
+        i.layout_vcpus = 2;
+        assert!(check_assemble_input(&i).is_ok());
     }
 
     #[test]

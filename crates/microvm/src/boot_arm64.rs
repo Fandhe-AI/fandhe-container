@@ -358,6 +358,20 @@ pub struct ArmBootReadback {
     pub sctlr: u64,
 }
 
+/// AP（vCPU `index`）の `MPIDR_EL1` の読み戻しが FDT の `cpu@index` の `reg`（`arm64_vcpu_mpidr_affinity`）と一致するか確かめる
+/// （#3884・MVM-5・MVM-1）。affinity のみ比べ、bit 31（RES1）と U ビットはマスクで除く（BSP の照合と同じ理由）。
+/// 不一致は `Internal`、`index` が範囲外なら `InvalidArgument`。
+pub fn check_vcpu_mpidr_readback(index: u32, raw: u64) -> Result<(), MicrovmError> {
+    let want = u64::from(crate::arm64_layout::arm64_vcpu_mpidr_affinity(index)?);
+    if raw & ARM64_MPIDR_AFFINITY_MASK != want {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "mpidr_el1 affinity does not match the fdt",
+        ));
+    }
+    Ok(())
+}
+
 /// 書いた起動状態と読み戻し値を照合する（OS 非依存の純関数。macOS の `HvfMicroVm` が vCPU スレッド内で呼ぶ。MVM-5・MVM-1）。
 ///
 /// X0・PC・CPSR は完全一致、MPIDR_EL1 は affinity のみ（[`ARM64_MPIDR_AFFINITY_MASK`]）を `ARM64_BOOT_CPU_MPIDR` と比べる。
@@ -590,5 +604,17 @@ mod tests {
             assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
             assert_eq!(e.message(), "sctlr_el1 has mmu or d-cache enabled at boot");
         }
+    }
+
+    /// MVM-5・MVM-1・#3884: AP の MPIDR_EL1 の照合は affinity だけを見る（bit 31 は無視）。
+    #[test]
+    fn mvm5_3884_vcpu_mpidr_readback() {
+        assert!(check_vcpu_mpidr_readback(1, 0x8000_0001).is_ok());
+        assert!(check_vcpu_mpidr_readback(17, 0x0000_0101).is_ok());
+        let e = check_vcpu_mpidr_readback(1, 0x0000_0002).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(e.message(), "mpidr_el1 affinity does not match the fdt");
+        let e = check_vcpu_mpidr_readback(64, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
     }
 }

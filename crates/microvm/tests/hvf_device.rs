@@ -1016,6 +1016,7 @@ fn assemble_config(
     use fandhe_container_microvm::hvf::{HvfMicroVmConfig, VcpuThreadConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     HvfMicroVmConfig {
+        vcpus: layout.vcpus,
         layout,
         kernel,
         initrd: None,
@@ -1035,7 +1036,7 @@ fn require_vm_with_gic(layout: &Arm64Layout) {
 }
 
 /// microVM 構成体の組み立て（TASK-192.15・#3797・MVM-5・MVM-1）。
-/// vcpus = 2 が `Unimplemented`（資源を作る前）、正しい構成の組み立てで vCPU 0 の X0・PC・CPSR・MPIDR_EL1 の読み戻しが期待値と
+/// vcpus が上限 + 1 と構成・layout の不一致で `InvalidArgument`（資源を作る前）、正しい構成の組み立てで vCPU 0 の X0・PC・CPSR・MPIDR_EL1 の読み戻しが期待値と
 /// 一致し、SCTLR_EL1 の M・C が 0、ゲスト RAM の FDT の位置に BE の `0xd00dfeed`、デバイスの窓と SPI が期待どおりであること、
 /// drop の後に VM を作り直せること（解放の観測）を確かめる。
 #[test]
@@ -1051,12 +1052,26 @@ fn hvf_device_assemble_sets_boot_registers() {
     let layout = Arm64Layout::new(64 << 20, 1, 1).unwrap();
     require_vm_with_gic(&layout);
 
-    // 1. vcpus = 2 は資源を作る前に Unimplemented。直後に VM を作れる = 何も作っていない。
-    let mut two = Arm64Layout::new(64 << 20, 1, 1).unwrap();
-    two.vcpus = 2;
-    let e =
-        HvfMicroVm::assemble(assemble_config(two, synthetic_image(true), 1, false)).unwrap_err();
-    assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    // 1. vcpus が上限 + 1、構成と layout の不一致は、資源を作る前に InvalidArgument（#3884）。直後に VM を作れる = 何も作っていない。
+    let over = fandhe_container_microvm::hvf_abi::HVF_MAX_VCPUS + 1;
+    let mut too_many = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    too_many.vcpus = over;
+    let mut cfg = assemble_config(too_many, synthetic_image(true), 1, false);
+    cfg.vcpus = over;
+    let e = HvfMicroVm::assemble(cfg).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "too many vcpus for the hvf backend");
+    drop(create_vm_or_precondition());
+    let mut cfg = assemble_config(
+        Arm64Layout::new(64 << 20, 1, 1).unwrap(),
+        synthetic_image(true),
+        1,
+        false,
+    );
+    cfg.vcpus = 2;
+    let e = HvfMicroVm::assemble(cfg).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "vcpu layout does not match the configuration");
     drop(create_vm_or_precondition());
 
     // 2. 正しい構成。
@@ -1107,6 +1122,81 @@ fn hvf_device_assemble_sets_boot_registers() {
 
     // 7. stop（vCPU の破棄 -> デバイス -> RAM の unmap -> VM の破棄）の後に VM を作り直せる。
     drop(create_vm_or_precondition());
+}
+
+/// vCPU 1..N（AP）を parked で作る（#3884・MVM-5・MVM-1・REPAIR-5）。vcpus = 2 の assemble が成功し、vCPU 1 の `MPIDR_EL1` の
+/// affinity が `arm64_vcpu_mpidr_affinity(1)` に一致し、start の後も AP は exit 0 件のまま走らず、stop で 2 台とも回収される。
+/// 同じプロセスで、vcpus = 2 を start せず drop した後にも、vcpus = 1 の再 assemble → start → stop ができる。
+/// 期限 watchdog 30 秒つき（超過は `hvf_device: WATCHDOG EXPIRED` と終了コード 124）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_smp_parked_ap_assemble_and_stop() {
+    use fandhe_container_microvm::arm64_layout::arm64_vcpu_mpidr_affinity;
+    use fandhe_container_microvm::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+    use fandhe_container_microvm::stop::StopReason;
+    use std::time::Instant;
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout2 = Arm64Layout::new(64 << 20, 2, 1).unwrap();
+    require_vm_with_gic(&layout2);
+
+    // 1. vcpus = 2 の assemble が成功し、各 vCPU の MPIDR_EL1 の affinity が FDT の cpu@N の reg と一致する。
+    let vm = HvfMicroVm::assemble(assemble_config(
+        layout2.clone(),
+        synthetic_image(true),
+        1,
+        false,
+    ))
+    .unwrap();
+    let mpidrs = vm.vcpu_mpidrs().to_vec();
+    eprintln!(
+        "hvf_device: smp: mpidr vcpu0={:#x} vcpu1={:#x}",
+        mpidrs[0], mpidrs[1]
+    );
+    assert_eq!(mpidrs.len(), 2);
+    assert_eq!(mpidrs[0], vm.boot_registers().mpidr);
+    assert_eq!(
+        mpidrs[0] & ARM64_MPIDR_AFFINITY_MASK,
+        u64::from(ARM64_BOOT_CPU_MPIDR)
+    );
+    assert_eq!(
+        mpidrs[1] & ARM64_MPIDR_AFFINITY_MASK,
+        u64::from(arm64_vcpu_mpidr_affinity(1).unwrap())
+    );
+
+    // 2. start の後、BSP は `b .` で走り続け、AP は parked のまま（exit 0 件）。stop は 2 台とも回収する。
+    let running = vm.start().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!running.is_finished());
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    eprintln!(
+        "hvf_device: smp: stop elapsed_us={} vcpus={} per_vcpu={:?}",
+        t.elapsed().as_micros(),
+        report.vcpu_count,
+        report.per_vcpu
+    );
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 2);
+    assert_eq!(report.per_vcpu.len(), 2);
+    assert!(report.per_vcpu[0].runs >= 1);
+    assert_eq!(report.per_vcpu[1].runs, 0);
+    assert_eq!(report.per_vcpu[1].exits, 0);
+
+    // 3. start しないまま drop（AP は parked のまま回収される）→ 同じプロセスで vcpus = 1 を組み立て直して stop まで通る。
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout2, synthetic_image(true), 1, false)).unwrap();
+    drop(vm);
+    let layout1 = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout1, synthetic_image(true), 1, false)).unwrap();
+    assert_eq!(vm.vcpu_mpidrs().len(), 1);
+    let running = vm.start().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.vcpu_count, 1);
 }
 
 /// microVM の start / stop と停止・drop 時の資源の解放（TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5）。

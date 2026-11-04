@@ -20,15 +20,16 @@
 //! 3. 期限切れ（`TIMEOUT`）などで止まりが確かめられなかったときは、ゲスト RAM の対応付けを `mem::forget` でリークする
 //!    （fail-closed）。残る資源と回収の方法は `hvf::microvm` のモジュール doc。
 //!
-//! # 範囲外（REPAIR-3）
-//! SMP（vCPU 1..N の停止の集約。Linux の `StopAggregate` 相当）は #3864 の後続。
+//! # 複数 vCPU（#3884）
+//! 止まりの確認は「N 台すべてが報告した」こと（`hvf_loop::stop_all`。parked の AP を含む）。1 台でも確かめられなければ RAM を
+//! リークする。範囲外（REPAIR-3）: AP の exit をきっかけにした全台の停止は #3891。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvRunStats;
-use crate::hvf_loop::{LoopHandle, VCPU_STOP_DEADLINE_MAX, VcpuKick, VcpuStopReport, log_line};
+use crate::hvf_loop::{LoopHandle, VCPU_STOP_DEADLINE_MAX, VcpuKick, VcpuSetStopReport, log_line};
 use crate::stop::StopReason;
 
 /// stop を経ない drop が vCPU スレッドの停止を待つ期限（REPAIR-5。Linux の `DROP_STOP_WAIT` と同値）。
@@ -37,12 +38,12 @@ pub const DROP_STOP_DEADLINE: Duration = Duration::from_secs(5);
 /// 期限つきで止められる vCPU スレッドの操作口（`LoopHandle` の抽象。単体試験で差し替えるため）。
 pub trait VcpuStopper {
     /// 停止を要求し、`deadline` まで終了報告を待つ。`Ok` で戻った時点で vCPU は破棄済みであること。
-    fn stop(self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError>;
+    fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError>;
 }
 
 impl<K: VcpuKick> VcpuStopper for LoopHandle<K> {
-    fn stop(self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError> {
-        LoopHandle::stop(self, deadline)
+    fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+        LoopHandle::stop(self, deadline).map(VcpuSetStopReport::single)
     }
 }
 
@@ -59,15 +60,20 @@ pub trait ReleaseDevices {
 pub const DEVICE_RELEASE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// 停止の終了報告（拡張できる構造。真偽値・文字列で返さない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HvfStopReport {
     /// 終了理由（Linux と共有の語彙）。ゲスト起因（`GuestShutdown`・`Failed(..)`）で先に終わっていた場合もその理由。
+    /// 複数 vCPU では vCPU 0 から順に見て最初の `Requested` 以外（`VcpuSetStopReport::reason`）。
     pub reason: StopReason,
-    /// vCPU の累積の実行統計。
+    /// 全 vCPU の累積の実行統計の合計。
     pub stats: HvRunStats,
-    /// vCPU スレッドの開始から終了までの時間。
+    /// 最長の vCPU スレッドの開始から終了までの時間。
     pub elapsed: Duration,
+    /// 回収した vCPU の台数（AP の parked スレッドを含む。#3884）。
+    pub vcpu_count: u32,
+    /// vCPU ごとの実行統計（index 順。`[0]` が BSP。#3884）。
+    pub per_vcpu: Vec<HvRunStats>,
 }
 
 /// 解放の対象。drop 順は [`stop_and_release`] が決める（フィールドの宣言順には依らない）。
@@ -121,6 +127,8 @@ where
                     reason: report.reason,
                     stats: report.stats,
                     elapsed: report.elapsed,
+                    vcpu_count: u32::try_from(report.per_vcpu.len()).unwrap_or(u32::MAX),
+                    per_vcpu: report.per_vcpu.iter().map(|r| r.stats).collect(),
                 })
             }
             Err(e) => {
@@ -454,5 +462,66 @@ mod tests {
         m.begin();
         let e = m.check_can_create_vcpu().unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+    }
+
+    /// 停止要求で終わる parked の AP の模擬。
+    fn parked() -> LoopHandle<FakeKick> {
+        spawn_loop::<FakeKick, _>("hvf-vcpu-1", LONG, |start: LoopStart<FakeKick>| {
+            let stop = start.ready(FakeKick);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap()
+    }
+
+    /// 停止要求を無視して `release_rx` が解かれるまで返らない vCPU の模擬。
+    fn stuck(release_rx: mpsc::Receiver<()>) -> LoopHandle<FakeKick> {
+        spawn_loop::<FakeKick, _>("hvf-vcpu-2", LONG, move |start: LoopStart<FakeKick>| {
+            let _stop = start.ready(FakeKick);
+            let _ = release_rx.recv();
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap()
+    }
+
+    /// `LoopHandle` の集合を 1 つの `VcpuStopper` として扱う試験用の包み。
+    struct Set(Vec<LoopHandle<FakeKick>>);
+
+    impl VcpuStopper for Set {
+        fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+            crate::hvf_loop::stop_all(self.0, deadline)
+        }
+    }
+
+    /// MVM-5・MVM-1・#3884: N 台が全部止まれば devices → memory → vm の順で解放し、台数と vCPU ごとの統計を報告する。
+    #[test]
+    fn mvm5_3884_stop_and_release_waits_for_all_vcpus() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let set = Set(vec![responsive(), parked(), parked()]);
+        let report = stop_and_release("hvf.microvm.stop", set, LONG, resources(&log)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.vcpu_count, 3);
+        assert_eq!(report.per_vcpu.len(), 3);
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
+    }
+
+    /// REPAIR-5・MVM-5・#3884: 1 台でも止まりを確かめられなければ RAM をリークする（devices と vm の手放しだけ）。
+    #[test]
+    fn repair5_mvm5_3884_one_stuck_vcpu_keeps_memory() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let set = Set(vec![responsive(), parked(), stuck(release_rx)]);
+        let e = stop_and_release(
+            "hvf.microvm.stop",
+            set,
+            Duration::from_millis(100),
+            resources(&log),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
+        let _ = release_tx.send(());
     }
 }

@@ -21,21 +21,31 @@
 //! owning thread での vCPU の破棄 → `Arc<VmWithGic>` の解放、の順で戻る（`hvf::microvm` の解放順序）。`spawn`（従来の形）は
 //! 印を立てない（同じ VM に vCPU を作り直す既存の結合試験があるため）。
 //!
+//! # AP（vCPU 1..N）の parked スレッド（#3884・MVM-5・MVM-1・REPAIR-5）
+//! [`VcpuThread::spawn_parked_ap`] は index 1 以上の vCPU を専用スレッド `hvf-vcpu-{index}` で作り、`MPIDR_EL1` に
+//! `arm64_vcpu_mpidr_affinity(index)`（FDT の `cpu@index` の `reg`）を書いて読み戻し、起動要求（CPU_ON。#3891）まで止めておく。
+//! parked の間は `hv_vcpu_run` を呼ばず、待ちに壁時計の上限は持たない（`LoopStart::ready_parked`）。vCPU の破棄は停止要求で
+//! 待ちが解けたときだけ、owning thread が `mark_teardown` の後に行う。N 台の停止は [`VcpuSet`] が `hvf_loop::stop_all` で集約する。
+//!
 //! # 未実装（REPAIR-3）
-//! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
+//! AP の起動（CPU_ON。AP ごとの `ExitHandlers`〔`MmioHandler::with_shared_dispatcher`・`TimerHandler`・`HvcHandler::with_cpus(.., index)`〕の
+//! 用意を含む）と CPU_OFF 後の parked への戻しは #3891。exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::arm64_layout::arm64_vcpu_mpidr_affinity;
+use crate::boot_arm64::check_vcpu_mpidr_readback;
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
 use crate::hvf::VmWithGic;
 use crate::hvf::{hvc, mmio, timer};
-use crate::hvf_abi::{HvRunStats, HvVcpuExit, check_run_deadline};
+use crate::hvf_abi::{HVF_MAX_VCPUS, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
 use crate::hvf_lifecycle::VcpuStopper;
 use crate::hvf_loop::{
-    ExitAction, HvExit, LoopHandle, LoopStart, VCPU_CREATE_DEADLINE_DEFAULT, VCPU_RUN_SLICE,
-    VcpuExec, VcpuExitObserver, VcpuKick, VcpuStopReport, run_loop, spawn_loop,
+    ExitAction, HvExit, LoopHandle, LoopStart, ParkOutcome, VCPU_CREATE_DEADLINE_DEFAULT,
+    VCPU_RUN_SLICE, VcpuExec, VcpuExitObserver, VcpuKick, VcpuSetStopReport, VcpuStopReport,
+    run_loop, spawn_loop, stop_all,
 };
 use crate::hvf_wake::WakingKick;
 use crate::stop::StopReason;
@@ -125,8 +135,43 @@ impl VcpuHandle {
 }
 
 impl VcpuStopper for VcpuHandle {
-    fn stop(self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError> {
-        VcpuHandle::stop(self, deadline)
+    fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+        VcpuHandle::stop(self, deadline).map(VcpuSetStopReport::single)
+    }
+}
+
+/// N 台の vCPU スレッドの集合（index 0 = BSP、1.. = parked の AP。#3884）。停止は全台をまとめて期限つきで回収する。
+#[derive(Debug)]
+pub struct VcpuSet(Vec<VcpuHandle>);
+
+impl VcpuSet {
+    /// BSP だけの集合を作る。
+    pub fn new(bsp: VcpuHandle) -> Self {
+        Self(vec![bsp])
+    }
+
+    /// AP を末尾へ足す（index 順に呼ぶこと）。
+    pub fn push_ap(&mut self, ap: VcpuHandle) {
+        self.0.push(ap);
+    }
+
+    /// vCPU 0（BSP）のスレッドが終わったか。ゲスト起因の終了は今は BSP でだけ起きる（AP の exit をきっかけにした全台の停止は #3891）。
+    pub fn is_finished(&self) -> bool {
+        self.0.first().is_none_or(VcpuHandle::is_finished)
+    }
+
+    /// 実行開始の合図を BSP にだけ出す。AP の gate は開けない（CPU_ON は #3891）。
+    pub fn open_start(&self) {
+        if let Some(bsp) = self.0.first() {
+            bsp.open_start();
+        }
+    }
+}
+
+impl VcpuStopper for VcpuSet {
+    /// 全台へ先に停止を要求し、共有の期限で回収する（`hvf_loop::stop_all`）。`Ok` は N 台すべてが破棄済みのとき。
+    fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+        stop_all(self.0.into_iter().map(|h| h.0).collect(), deadline)
     }
 }
 
@@ -198,6 +243,76 @@ impl VcpuThread {
         S: FnOnce(&mut HvVcpu<'_>) -> Result<(), MicrovmError> + Send + 'static,
     {
         Self::spawn_inner(vm, setup, handlers, config, true)
+    }
+
+    /// AP（vCPU `index`。1 以上 [`HVF_MAX_VCPUS`] 未満）の専用スレッド `hvf-vcpu-{index}` を作り、起動要求まで parked で待たせる
+    /// （#3884・MVM-5・MVM-1・REPAIR-5）。戻り値の `u64` は読み戻した `MPIDR_EL1` の生の値（観測用。記録は #3803）。
+    ///
+    /// スレッド内で `VmWithGic::create_vcpu` → `MPIDR_EL1` の書き込み → 読み戻し → `check_vcpu_mpidr_readback` で照合し、成功したら
+    /// `ready_parked` で待つ。作成・照合の失敗は呼び出し元へ返す（`mark_teardown` は立てない。BSP の作成失敗と同じ）。停止要求で
+    /// 待ちが解けたら `mark_teardown` → owning thread での vCPU の破棄 → 戻る（`hv_vcpu_run` は呼ばないので exit は 0 件）。
+    /// 残余: `Err` の直後は、失敗したスレッドの終了処理中に VM の `Arc` が一瞬残りうる（BSP と同じ）。
+    pub fn spawn_parked_ap(
+        vm: Arc<VmWithGic>,
+        index: u32,
+        config: &VcpuThreadConfig,
+    ) -> Result<(VcpuHandle, u64), MicrovmError> {
+        if index == 0 || index >= HVF_MAX_VCPUS {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "ap vcpu index out of range",
+            ));
+        }
+        let affinity = u64::from(arm64_vcpu_mpidr_affinity(index)?);
+        let slot: Arc<OnceLock<u64>> = Arc::new(OnceLock::new());
+        let slot_in = Arc::clone(&slot);
+        let name = format!("hvf-vcpu-{index}");
+        // BSP と同じく kick を `WakingKick` で包む（AP は WFI を実行しないが、`VcpuHandle` の型を揃える。#3887）。
+        let waker = vm.wfi_waker();
+        let handle = spawn_loop(
+            &name,
+            config.create_deadline,
+            move |start: LoopStart<WakingKick<VcpuCanceller>>| {
+                let mut vcpu = match vm.create_vcpu() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let code = e.code();
+                        start.fail(e);
+                        return (StopReason::Failed(code), HvRunStats::default());
+                    }
+                };
+                let prepared = vcpu
+                    .set_sys_reg(HvSysReg::MPIDR_EL1, affinity)
+                    .and_then(|()| vcpu.get_sys_reg(HvSysReg::MPIDR_EL1))
+                    .and_then(|raw| check_vcpu_mpidr_readback(index, raw).map(|()| raw))
+                    .and_then(|raw| {
+                        slot_in
+                            .set(raw)
+                            .map_err(|_| internal("mpidr readback was recorded twice"))
+                    });
+                if let Err(e) = prepared {
+                    let code = e.code();
+                    start.fail(e);
+                    return (StopReason::Failed(code), HvRunStats::default());
+                }
+                let reason = match start.ready_parked(WakingKick::new(vcpu.canceller(), waker)) {
+                    ParkOutcome::Stopped => StopReason::Requested,
+                    // #3884 では AP の gate を誰も開けない。想定外の起動要求は推測で走らせず fail-closed で終える。
+                    _ => StopReason::Failed(MicrovmErrorCode::Unimplemented),
+                };
+                // 破棄は teardown のときだけ（以後の vCPU 作成を拒否してから owning thread で破棄する）。
+                vm.mark_teardown();
+                drop(vcpu);
+                (reason, HvRunStats::default())
+            },
+        )?;
+        match slot.get() {
+            Some(raw) => Ok((VcpuHandle(handle), *raw)),
+            None => {
+                let _ = handle.stop(crate::hvf_lifecycle::DROP_STOP_DEADLINE);
+                Err(internal("mpidr readback was not recorded"))
+            }
+        }
     }
 
     fn spawn_inner<S>(

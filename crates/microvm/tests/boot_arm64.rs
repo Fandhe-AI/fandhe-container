@@ -163,7 +163,7 @@ fn mvm5_load_arm64_bootargs_and_vcpu_errors() {
     }
     let e = Arm64Layout::new(RAM, ARM64_MAX_VCPUS + 1, 1).unwrap_err();
     assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
-    // vCPU 2 は FDT 側で受理される（#3864。HVF のバックエンドは 1 vCPU のまま）。
+    // vCPU 2 は FDT 側で受理される（#3864。HVF の AP は #3884 で parked まで実装済み）。
     let smp = Arm64Layout::new(RAM, 2, 1).unwrap();
     let mut m = mem(RAM);
     let (loaded, _) = load_arm64(&mut m, &image(4096, 0), None, CMDLINE, &smp).unwrap();

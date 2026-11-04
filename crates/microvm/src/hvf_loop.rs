@@ -17,13 +17,17 @@
 //!   （表記 `TIMEOUT`）で返す。無期限の `join` はしない。
 //! - fail-closed: 未知の exit・未対応の例外クラスは推測で続行せず VM を止める（[`run_loop`] の表）。
 //!
+//! # 複数 vCPU（#3884・MVM-5・MVM-1・REPAIR-5）
+//! AP（vCPU 1..N）のスレッドは [`LoopStart::ready_parked`] で起動要求まで止めておく（待ちに壁時計の上限は持たせない）。
+//! N 台の停止は [`stop_all`] が集約する（全台へ先に停止を要求し、共有の期限で待つ）。
+//!
 //! # 未実装（REPAIR-3）
-//! 複数 vCPU・AP の起動・SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
+//! AP の起動（CPU_ON。#3891）・SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -45,6 +49,8 @@ const DROP_STOP_WAIT: Duration = Duration::from_secs(5);
 /// 実行開始の合図（start gate）を待つ上限。`start` が呼ばれないまま放置された vCPU スレッドを残さないため（REPAIR-5。Linux の
 /// start 待ちと同値）。超えたらゲストを走らせずに `Failed(DeadlineExceeded)` で終える。
 pub const START_GATE_WAIT: Duration = Duration::from_secs(30);
+/// parked の AP が停止フラグを見直す間隔（通知の取りこぼし対策。待ちの上限ではない。#3884）。
+const PARK_POLL: Duration = Duration::from_millis(100);
 /// 停止待ちの間に kick を打ち直す間隔（実行より先に届いた kick の取りこぼし対策）。
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
 /// 報告を送った後のスレッドの終了を待つ上限（報告が最後の動作のため通常は即時）。
@@ -426,6 +432,16 @@ impl StartGate {
     }
 }
 
+/// [`LoopStart::ready_parked`] の待ちが解けた理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParkOutcome {
+    /// stop / drop / `stop_all` による停止要求。
+    Stopped,
+    /// 起動要求（CPU_ON。#3891 が `open_start` で送る。#3884 では誰も送らない）。
+    StartRequested,
+}
+
 /// スレッド内の `body` へ渡す開始の合図。`ready` か `fail` のどちらかで作成結果を呼び出し元へ返す。
 pub struct LoopStart<K> {
     tx: SyncSender<Result<K, MicrovmError>>,
@@ -464,6 +480,32 @@ impl<K> LoopStart<K> {
             GateOutcome::TimedOut => {
                 stop.store(true, Ordering::Release);
                 Err(StopReason::Failed(MicrovmErrorCode::DeadlineExceeded))
+            }
+        }
+    }
+
+    /// AP（vCPU 1..N）用の待機（#3884・MVM-5・MVM-1・REPAIR-5）。作成結果を返したあと、起動要求か停止要求まで待つ。
+    ///
+    /// [`Self::ready_gated`] と違い、待ちに壁時計の上限を持たせない。ゲストが AP を起動しないのは正常な構成（`maxcpus=1` 等）で、
+    /// 期限切れで終えると「vCPU の破棄は teardown のときだけ」の契約（`hv_gic_create` の記述）に反するため。待ちを解くのは
+    /// `LoopHandle::stop` / `Drop` / [`stop_all`] で、いずれも期限つきのため、待ちの長さはそれらの期限で抑えられる。
+    /// 停止フラグは 100 ms ごとに見直す（通知の取りこぼし対策。刻みは上限ではない）。
+    pub fn ready_parked(self, kick: K) -> ParkOutcome {
+        self.ready_parked_with_poll(kick, PARK_POLL)
+    }
+
+    /// [`Self::ready_parked`] の見直し間隔を指定する版（単体試験用に分けてある）。
+    fn ready_parked_with_poll(self, kick: K, poll: Duration) -> ParkOutcome {
+        let gate = Arc::clone(&self.gate);
+        let stop = self.ready(kick);
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return ParkOutcome::Stopped;
+            }
+            match gate.wait(poll) {
+                GateOutcome::Opened => return ParkOutcome::StartRequested,
+                GateOutcome::Cancelled => return ParkOutcome::Stopped,
+                GateOutcome::TimedOut => {}
             }
         }
     }
@@ -528,15 +570,17 @@ where
         stop: Arc::clone(&stop),
         gate: Arc::clone(&gate),
     };
+    let thread_name = name.to_string();
     let join = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            let name = thread_name;
             let started = Instant::now();
             let (reason, stats) = body(start);
             let elapsed = started.elapsed();
             let (level, outcome, code) = outcome_fields(reason);
             log_line(format_args!(
-                "level={level} op=hvf.vcpu_loop outcome={outcome} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
+                "level={level} op=hvf.vcpu_loop outcome={outcome} thread={name} reason={}{code} runs={} exits={} deadline_exceeded={} errors={} elapsed_us={}",
                 reason.as_str(),
                 stats.runs,
                 stats.exits,
@@ -640,39 +684,9 @@ impl<K: VcpuKick> LoopHandle<K> {
         }
         let started = Instant::now();
         let end = started + deadline;
-        // 開く前の stop ではゲストを走らせない（ゲート待ちのスレッドを起こす）。
-        self.gate.cancel();
-        self.stop.store(true, Ordering::Release);
-        let result = loop {
-            // 破棄後の FailedPrecondition 等は終了の途中経過であり、報告の側が結果を持つため無視する。
-            let _ = self.kick.kick();
-            let now = Instant::now();
-            if now >= end {
-                break Err(err(
-                    MicrovmErrorCode::DeadlineExceeded,
-                    "vcpu thread did not stop within deadline",
-                ));
-            }
-            match self.rx.recv_timeout((end - now).min(KICK_INTERVAL)) {
-                Ok(report) => break Ok(report),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    break Err(err(
-                        MicrovmErrorCode::Internal,
-                        "vcpu thread ended without a report",
-                    ));
-                }
-            }
-        };
-        // 切り離す場合も含め、Drop の待ちを二重に走らせない。
-        if let Some(join) = self.join.take() {
-            if result.is_ok() || matches!(&result, Err(e) if e.code() == MicrovmErrorCode::Internal)
-            {
-                reap(join, end);
-            } else {
-                drop(join);
-            }
-        }
+        self.request_stop();
+        let result = self.wait_report(end);
+        self.settle(&result, end);
         let elapsed_us = started.elapsed().as_micros();
         match &result {
             Ok(r) => {
@@ -689,6 +703,185 @@ impl<K: VcpuKick> LoopHandle<K> {
         }
         result
     }
+
+    /// 停止を要求する（開く前の stop ではゲストを走らせない。parked / ゲート待ちのスレッドを起こす）。
+    fn request_stop(&self) {
+        self.gate.cancel();
+        self.stop.store(true, Ordering::Release);
+    }
+
+    /// `end` まで終了報告を待つ（待つ間も kick し直す）。期限を過ぎていても、既に届いた報告は拾う。
+    fn wait_report(&self, end: Instant) -> Result<VcpuStopReport, MicrovmError> {
+        loop {
+            // 破棄後の FailedPrecondition 等は終了の途中経過であり、報告の側が結果を持つため無視する。
+            let _ = self.kick.kick();
+            let now = Instant::now();
+            if now >= end {
+                return match self.rx.try_recv() {
+                    Ok(report) => Ok(report),
+                    Err(TryRecvError::Empty) => Err(err(
+                        MicrovmErrorCode::DeadlineExceeded,
+                        "vcpu thread did not stop within deadline",
+                    )),
+                    Err(TryRecvError::Disconnected) => Err(err(
+                        MicrovmErrorCode::Internal,
+                        "vcpu thread ended without a report",
+                    )),
+                };
+            }
+            match self.rx.recv_timeout((end - now).min(KICK_INTERVAL)) {
+                Ok(report) => return Ok(report),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(err(
+                        MicrovmErrorCode::Internal,
+                        "vcpu thread ended without a report",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// 待ちの結果に応じてスレッドを回収するか切り離す（Drop の待ちを二重に走らせない）。
+    fn settle(&mut self, result: &Result<VcpuStopReport, MicrovmError>, end: Instant) {
+        if let Some(join) = self.join.take() {
+            if result.is_ok() || matches!(result, Err(e) if e.code() == MicrovmErrorCode::Internal)
+            {
+                reap(join, end);
+            } else {
+                drop(join);
+            }
+        }
+    }
+}
+
+/// N 台の vCPU の停止報告の集約（#3884・MVM-5・MVM-1。Linux の `StopAggregate` 相当）。
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct VcpuSetStopReport {
+    /// 集約した終了理由（vCPU 0 から順に見て、最初の `Requested` 以外。全台 `Requested` なら `Requested`）。
+    pub reason: StopReason,
+    /// 全台の実行統計の合計。
+    pub stats: HvRunStats,
+    /// 最長の個別のスレッドの寿命（開始から終了まで）。
+    pub elapsed: Duration,
+    /// vCPU ごとの報告（index 順。`[0]` が BSP）。
+    pub per_vcpu: Vec<VcpuStopReport>,
+}
+
+impl VcpuSetStopReport {
+    /// 1 台の報告を 1 台の集合として包む。
+    pub fn single(r: VcpuStopReport) -> Self {
+        Self {
+            reason: r.reason,
+            stats: r.stats,
+            elapsed: r.elapsed,
+            per_vcpu: vec![r],
+        }
+    }
+
+    fn aggregate(per_vcpu: Vec<VcpuStopReport>) -> Self {
+        let reason = per_vcpu
+            .iter()
+            .map(|r| r.reason)
+            .find(|r| *r != StopReason::Requested)
+            .unwrap_or(StopReason::Requested);
+        let mut stats = HvRunStats::default();
+        let mut elapsed = Duration::ZERO;
+        for r in &per_vcpu {
+            stats.runs = stats.runs.saturating_add(r.stats.runs);
+            stats.exits = stats.exits.saturating_add(r.stats.exits);
+            stats.deadline_exceeded = stats
+                .deadline_exceeded
+                .saturating_add(r.stats.deadline_exceeded);
+            stats.errors = stats.errors.saturating_add(r.stats.errors);
+            stats.total_elapsed = stats.total_elapsed.saturating_add(r.stats.total_elapsed);
+            elapsed = elapsed.max(r.elapsed);
+        }
+        Self {
+            reason,
+            stats,
+            elapsed,
+            per_vcpu,
+        }
+    }
+}
+
+/// N 台の vCPU スレッドを共有の期限で止める（#3884・MVM-5・MVM-1・REPAIR-5）。
+///
+/// 全台へ先に停止を要求してから、1 回だけ取った終了時刻で各台の報告を待つ（待ちは N 台の合計ではなくほぼ 1 台分）。
+/// 期限切れの台は切り離し、`handles` は全部この関数の中で消費する（`Drop` の待ちを N 回直列に走らせない）。
+/// `Ok` は全台が報告したときだけ。1 台でも期限切れなら `DeadlineExceeded`、報告なしの切断があれば `Internal`。
+/// `deadline` は 0 超 [`VCPU_STOP_DEADLINE_MAX`] 以下、`handles` は 1 台以上（`InvalidArgument` / `Internal`）。
+pub fn stop_all<K: VcpuKick>(
+    mut handles: Vec<LoopHandle<K>>,
+    deadline: Duration,
+) -> Result<VcpuSetStopReport, MicrovmError> {
+    if deadline.is_zero() || deadline > VCPU_STOP_DEADLINE_MAX {
+        // 早期 return すると各 `LoopHandle::drop` が直列に最大 `DROP_STOP_WAIT` ずつ待つ（N 台で N 倍）。
+        // 全台へ先に停止を要求し、共通の後始末期限で回収してからエラーを返す（REPAIR-5）。
+        let end = Instant::now() + DROP_STOP_WAIT;
+        for h in &handles {
+            h.request_stop();
+            let _ = h.kick.kick();
+        }
+        for h in &mut handles {
+            let result = h.wait_report(end);
+            h.settle(&result, end);
+        }
+        drop(handles);
+        return Err(err(
+            MicrovmErrorCode::InvalidArgument,
+            "vcpu stop deadline must be in (0, 60s]",
+        ));
+    }
+    if handles.is_empty() {
+        return Err(err(MicrovmErrorCode::Internal, "no vcpu to stop"));
+    }
+    let started = Instant::now();
+    let end = started + deadline;
+    for h in &handles {
+        h.request_stop();
+        let _ = h.kick.kick();
+    }
+    let count = handles.len();
+    let mut reports = Vec::with_capacity(count);
+    let mut failure: Option<MicrovmError> = None;
+    for h in &mut handles {
+        let result = h.wait_report(end);
+        h.settle(&result, end);
+        match result {
+            Ok(r) => reports.push(r),
+            Err(e) => {
+                // DeadlineExceeded を優先して報告する（止まりを確かめられなかった台がある）。
+                let keep = failure
+                    .as_ref()
+                    .is_some_and(|f| f.code() == MicrovmErrorCode::DeadlineExceeded);
+                if !keep {
+                    failure = Some(e);
+                }
+            }
+        }
+    }
+    drop(handles);
+    let elapsed_us = started.elapsed().as_micros();
+    if let Some(e) = failure {
+        log_line(format_args!(
+            "level=error op=hvf.vcpus_stopped outcome=error code={} vcpus={count} reported={} elapsed_us={elapsed_us}",
+            e.code().as_str(),
+            reports.len()
+        ));
+        return Err(e);
+    }
+    let report = VcpuSetStopReport::aggregate(reports);
+    let (level, outcome, code) = outcome_fields(report.reason);
+    log_line(format_args!(
+        "level={level} op=hvf.vcpus_stopped outcome={outcome} reason={}{code} vcpus={count} runs={} exits={} elapsed_us={elapsed_us}",
+        report.reason.as_str(),
+        report.stats.runs,
+        report.stats.exits
+    ));
+    Ok(report)
 }
 
 impl<K: VcpuKick> Drop for LoopHandle<K> {
@@ -1318,5 +1511,174 @@ mod tests {
         g.cancel();
         g.open();
         assert_eq!(g.wait(Duration::from_millis(10)), GateOutcome::Cancelled);
+    }
+
+    /// parked の AP 用の body。停止要求で `Requested`、起動要求なら `Failed(Unimplemented)` で終わる。
+    fn parked_body(
+        poll: Duration,
+    ) -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
+        move |start| match start.ready_parked_with_poll(FakeKick(Arc::default()), poll) {
+            ParkOutcome::Stopped => (StopReason::Requested, HvRunStats::default()),
+            _ => (
+                StopReason::Failed(MicrovmErrorCode::Unimplemented),
+                HvRunStats::default(),
+            ),
+        }
+    }
+
+    /// 実行中の BSP を模す body（停止フラグを見て `Requested`、統計は runs = 3・exits = 2）。
+    fn bsp_body() -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
+        move |start| {
+            let stop = start.ready(FakeKick(Arc::default()));
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let stats = HvRunStats {
+                runs: 3,
+                exits: 2,
+                ..HvRunStats::default()
+            };
+            (StopReason::Requested, stats)
+        }
+    }
+
+    /// 与えた理由で即終わる body（ゲスト起因の終了の模擬）。
+    fn finish_body(
+        reason: StopReason,
+    ) -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
+        move |start| {
+            let _stop = start.ready(FakeKick(Arc::default()));
+            (reason, HvRunStats::default())
+        }
+    }
+
+    /// MVM-5・MVM-1・#3884: parked の AP は待ちの見直し間隔を何回過ぎても自力で終わらず、stop で `Requested`（runs・exits は 0）。
+    #[test]
+    fn mvm5_3884_parked_ap_stays_until_stop() {
+        let h = spawn_loop("hvf-vcpu-1", LONG, parked_body(Duration::from_millis(10))).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!h.is_finished());
+        let r = h.stop(LONG).unwrap();
+        assert_eq!(r.reason, StopReason::Requested);
+        assert_eq!((r.stats.runs, r.stats.exits), (0, 0));
+    }
+
+    /// REPAIR-5・MVM-5・#3884: parked は gated 型の壁時計の期限で終わらない（`Failed(DeadlineExceeded)` にならない）。
+    #[test]
+    fn repair5_mvm5_3884_parked_ap_has_no_wall_clock_limit() {
+        // 見直し間隔 1ms で 300ms 経っても終わらない（gated の待ちなら 30ms の上限で終わる長さ）。
+        let h = spawn_loop("hvf-vcpu-1", LONG, parked_body(Duration::from_millis(1))).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!h.is_finished());
+        assert_eq!(h.stop(LONG).unwrap().reason, StopReason::Requested);
+    }
+
+    /// 起動要求（gate を開く）は `StartRequested` として観測できる（#3891 が使う口。#3884 では誰も開けない）。
+    #[test]
+    fn mvm5_3884_parked_ap_start_request_is_observed() {
+        let h = spawn_loop("hvf-vcpu-1", LONG, parked_body(Duration::from_millis(10))).unwrap();
+        h.open_start();
+        let t = Instant::now();
+        while !h.is_finished() && t.elapsed() < LONG {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let r = h.stop(LONG).unwrap();
+        assert_eq!(
+            r.reason,
+            StopReason::Failed(MicrovmErrorCode::Unimplemented)
+        );
+    }
+
+    /// MVM-5・MVM-1・#3884: 3 台（BSP + parked の AP 2 台）を `stop_all` で止める。合計の統計は各台の和で、index 順に並ぶ。
+    #[test]
+    fn mvm5_3884_stop_all_collects_every_vcpu() {
+        let handles = vec![
+            spawn_loop("hvf-vcpu-0", LONG, bsp_body()).unwrap(),
+            spawn_loop("hvf-vcpu-1", LONG, parked_body(Duration::from_millis(10))).unwrap(),
+            spawn_loop("hvf-vcpu-2", LONG, parked_body(Duration::from_millis(10))).unwrap(),
+        ];
+        let r = stop_all(handles, LONG).unwrap();
+        assert_eq!(r.reason, StopReason::Requested);
+        assert_eq!(r.per_vcpu.len(), 3);
+        assert_eq!(
+            (r.per_vcpu[0].stats.runs, r.per_vcpu[0].stats.exits),
+            (3, 2)
+        );
+        assert_eq!(r.per_vcpu[1].stats.runs, 0);
+        assert_eq!(r.per_vcpu[2].stats.exits, 0);
+        assert_eq!((r.stats.runs, r.stats.exits), (3, 2));
+    }
+
+    /// REPAIR-5・MVM-5・#3884: 1 台が報告しなくても `stop_all(200ms)` は期限の近くで `TIMEOUT` を返す（N 台ぶんの直列待ちにならない）。
+    #[test]
+    fn repair5_mvm5_3884_stop_all_one_stuck_is_timeout_within_deadline() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let stuck = spawn_loop("hvf-vcpu-1", LONG, move |start: LoopStart<FakeKick>| {
+            let _stop = start.ready(FakeKick(Arc::default()));
+            let _ = release_rx.recv();
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap();
+        let handles = vec![
+            spawn_loop("hvf-vcpu-0", LONG, bsp_body()).unwrap(),
+            stuck,
+            spawn_loop("hvf-vcpu-2", LONG, parked_body(Duration::from_millis(10))).unwrap(),
+            spawn_loop("hvf-vcpu-3", LONG, parked_body(Duration::from_millis(10))).unwrap(),
+        ];
+        let t = Instant::now();
+        let e = stop_all(handles, Duration::from_millis(200)).unwrap_err();
+        let took = t.elapsed();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        let _ = release_tx.send(());
+    }
+
+    /// MVM-5・MVM-1・#3884: 終了理由は vCPU 0 から順に見て最初の `Requested` 以外（先勝ち）。
+    #[test]
+    fn mvm5_3884_stop_all_reason_priority() {
+        let fail = StopReason::Failed(MicrovmErrorCode::Internal);
+        let h = vec![
+            spawn_loop("hvf-vcpu-0", LONG, finish_body(StopReason::GuestShutdown)).unwrap(),
+            spawn_loop("hvf-vcpu-1", LONG, finish_body(fail)).unwrap(),
+        ];
+        assert_eq!(stop_all(h, LONG).unwrap().reason, StopReason::GuestShutdown);
+        let h = vec![
+            spawn_loop("hvf-vcpu-0", LONG, finish_body(StopReason::Requested)).unwrap(),
+            spawn_loop("hvf-vcpu-1", LONG, finish_body(fail)).unwrap(),
+        ];
+        assert_eq!(stop_all(h, LONG).unwrap().reason, fail);
+    }
+
+    /// REPAIR-5・#3884: 0 と 60 秒超の期限、空の集合は拒否する。
+    #[test]
+    fn mvm5_3884_stop_all_rejects_invalid_deadline_and_empty() {
+        for d in [Duration::ZERO, Duration::from_secs(61)] {
+            let h = vec![spawn_loop("hvf-vcpu-0", LONG, bsp_body()).unwrap()];
+            let e = stop_all(h, d).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        let e = stop_all::<FakeKick>(Vec::new(), LONG).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+    }
+
+    /// #3884: vCPU スレッドの名前は呼び出し元が指定する（`hvf-vcpu-{index}`）。
+    #[test]
+    fn mvm5_3884_thread_name_follows_index() {
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let h = spawn_loop("hvf-vcpu-3", LONG, move |start: LoopStart<FakeKick>| {
+            let stop = start.ready(FakeKick(Arc::default()));
+            let _ = tx.send(std::thread::current().name().map(str::to_string));
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap();
+        assert_eq!(
+            rx.recv_timeout(LONG).unwrap().as_deref(),
+            Some("hvf-vcpu-3")
+        );
+        h.stop(LONG).unwrap();
     }
 }

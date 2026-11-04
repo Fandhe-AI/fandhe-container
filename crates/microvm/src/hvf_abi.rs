@@ -409,11 +409,10 @@ pub struct HvfAssembleInput {
 /// MMIO 表の合計（#3882）: macOS ではシリアルも virtio と同じ MMIO 表（1 表 [`crate::dispatch::MAX_BUS_DEVICES`] 件）に載るため、
 /// virtio + シリアル（有効なら 1）がその上限を超える構成は、VM・GIC・RAM を作る前に `InvalidArgument` で拒否する
 /// （作った後の段 5 で `ResourceExhausted` になるのを避ける）。virtio は単独なら 32 台まで受けるが、シリアルありでは 31 台まで。
-/// Linux の `MicroVm` は UART が PIO 表（COM1）にあり MMIO 表とは別勘定のため、この制約は macOS 側だけの話。
+/// Linux の x86_64 `MicroVm` は UART が PIO 表（COM1）にあり別勘定。KVM aarch64 は同じ MMIO 表に載せ、同じ検査を共有する（#3898）。
 pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError> {
     use crate::arm64_layout::{ARM64_MAX_BOOTARGS, ARM64_VIRTIO_MMIO_MAX};
     use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
-    use crate::dispatch::MAX_BUS_DEVICES;
 
     if input.vcpus == 0 {
         return Err(invalid("vcpus is zero"));
@@ -436,9 +435,7 @@ pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError
     if input.layout_serial != input.serial {
         return Err(invalid("serial layout does not match the configuration"));
     }
-    if input.device_count.saturating_add(usize::from(input.serial)) > MAX_BUS_DEVICES {
-        return Err(invalid("too many mmio bus devices"));
-    }
+    crate::dispatch::check_mmio_bus_capacity(input.device_count, input.serial)?;
     if input.image_len == 0 || input.image_len > MAX_KERNEL_IMAGE_BYTES {
         return Err(invalid("kernel image length is out of range"));
     }

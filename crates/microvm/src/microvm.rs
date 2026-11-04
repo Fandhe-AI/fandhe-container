@@ -52,8 +52,11 @@
 //! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
 //! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
 //! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。x86_64 では COM1 の IRQ 4 を `KVM_IRQ_LINE` の level 線
-//! （`crate::irq::IrqLevelLine`）で UART に結ぶ（#3918。THRE・受信データの割り込み。実機確認は #3781）。aarch64（KVM）には PIO が無く、シリアルは MMIO の ns16550a と SPI で #3898 の担当（REPAIR-3。組み立ては COM1 の PIO を登録せず、
-//! `serial_console()` は空のまま）。
+//! （`crate::irq::IrqLevelLine`）で UART に結ぶ（#3918。THRE・受信データの割り込み。実機確認は #3781）。
+//! aarch64（KVM）には PIO が無く、同じモデルを MMIO（FDT の `ns16550a`・既定の窓 `0x0900_0000`）へ virtio の後に登録する
+//! （#3898。`serial_console()` は x86_64 と同じバッファを返す）。割り込みは未結線のポーリングで、FDT にも `interrupts` を
+//! 出さない（`Arm64Layout::with_default_serial_polled`。届かない割り込みを広告しない）。
+//! 未実装（REPAIR-3）: KVM aarch64 のシリアル割り込み（`KVM_IRQ_LINE` の SPI 結線と FDT の `LevelSpi` への復帰。#3943）。
 //!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
 //! 失敗はすべて `Result` の [`MicrovmError`]（機械可読な `code` と英語の `message`）で返し、panic しない。
@@ -110,7 +113,9 @@ use crate::boot_x86::{
 #[cfg(target_arch = "aarch64")]
 use crate::device::VgicV3;
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
-use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
+use crate::dispatch::{
+    DeviceId, DispatchOutcome, ExitDispatcher, MAX_BUS_DEVICES, MmioAccess, check_mmio_bus_capacity,
+};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
@@ -524,6 +529,9 @@ const VGIC_SPI_INTID_BASE: u32 = 32;
 /// 組み立てはこの既定のまま使い、virtio の SPI が範囲に収まることを `plan_layout_arm64` が確かめる（#3696）。
 const VGIC_DEFAULT_NR_SPIS: u32 = 224;
 
+// aarch64 のシリアルは virtio と同じ MMIO 表の 1 枠を使う。virtio の上限だけではバス上限に届かない前提を固定する（#3898）。
+const _: () = assert!(MAX_VIRTIO_DEVICES < MAX_BUS_DEVICES);
+
 /// aarch64（KVM）の構成を検証して配置とデバイスの割り当てを計算する（ioctl 前の純粋な処理。MVM-1・#3696）。
 ///
 /// x86_64 の CI でも単体試験が走るよう arch で外さない（aarch64 以外では `assemble` から呼ばれない）。検査:
@@ -559,7 +567,10 @@ fn plan_layout_arm64(
         .filter(|n| *n <= MAX_VIRTIO_DEVICES)
         .ok_or_else(|| invalid("too many virtio devices"))?;
     let total_u32 = u32::try_from(total).map_err(|_| invalid("too many virtio devices"))?;
-    let layout = Arm64Layout::new(mem_size, vcpu_count, total_u32)?;
+    // シリアルも同じ MMIO 表に載る。VM fd を作る前に合計を検査する（#3898）。
+    check_mmio_bus_capacity(total, true)?;
+    // シリアルは線なしのポーリング（FDT に interrupts を出さない）。結線は後続 issue（REPAIR-3）。
+    let layout = Arm64Layout::new(mem_size, vcpu_count, total_u32)?.with_default_serial_polled()?;
     reject_level_spi(&layout)?;
     layout.check_virtio_spi_range(VGIC_SPI_INTID_BASE, VGIC_DEFAULT_NR_SPIS)?;
     let mut slots = Vec::with_capacity(total);
@@ -841,6 +852,19 @@ struct DeviceBus<B: BlockBackend, N: NetBackend, L> {
     serial: SerialConsole,
 }
 
+/// UART をどの表へ登録するか（`DeviceBus::new` の引数。MVM-1）。
+enum SerialAttach {
+    /// x86_64 の COM1（PIO 0x3f8）。`line` ありは `KVM_IRQ_LINE` の level 線（#3918）、無しは IIR が常に「保留なし」。
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    Com1Pio {
+        line: Option<Arc<dyn LevelInterruptLine>>,
+    },
+    /// aarch64 の MMIO（FDT の `ns16550a`。#3898）。線なし（ポーリング。割り込みの結線は後続 issue・REPAIR-3）。
+    /// virtio の登録の後に登録し、virtio の `DeviceId` を変えない。
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Mmio { base: u64, len: u64 },
+}
+
 impl<B: BlockBackend, N: NetBackend, L> DeviceBus<B, N, L> {
     fn infos(&self) -> Vec<DeviceInfo> {
         let b = self.block.iter().map(|d| DeviceInfo {
@@ -861,8 +885,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         slots: &[DeviceSlot],
         block: Vec<B>,
         net: Vec<NetDeviceConfig<N>>,
-        com1_line: Option<Arc<dyn LevelInterruptLine>>,
-        register_com1_pio: bool,
+        serial: SerialAttach,
         mut make_line: impl FnMut(&DeviceSlot) -> Result<L, MicrovmError>,
     ) -> Result<Self, MicrovmError> {
         if slots.len() != block.len() + net.len() {
@@ -876,15 +899,19 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         };
         // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
         // 線ありは x86_64 の KVM（`KVM_IRQ_LINE` の GSI 4。#3918）。線なしは IIR が常に「保留なし」の従来の経路。
-        // aarch64 には PIO が無く、シリアルは MMIO（ns16550a）で #3898 の担当のため登録しない（`register_com1_pio = false`）。
-        if register_com1_pio {
-            let com1 = match com1_line {
-                Some(line) => bus.serial.port_device_with_irq(line),
-                None => bus.serial.port_device(),
-            };
-            bus.dispatcher
-                .register_pio(COM1_BASE, UART_PORT_LEN, com1)?;
-        }
+        // aarch64 には PIO が無く、シリアルは MMIO（ns16550a）で virtio の後に登録する（#3898）。
+        let mmio_serial = match serial {
+            SerialAttach::Com1Pio { line } => {
+                let com1 = match line {
+                    Some(line) => bus.serial.port_device_with_irq(line),
+                    None => bus.serial.port_device(),
+                };
+                bus.dispatcher
+                    .register_pio(COM1_BASE, UART_PORT_LEN, com1)?;
+                None
+            }
+            SerialAttach::Mmio { base, len } => Some((base, len)),
+        };
         let mut slots_iter = slots.iter();
         for backend in block {
             let slot = *slots_iter
@@ -926,6 +953,10 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
                 slot,
                 line,
             });
+        }
+        if let Some((base, len)) = mmio_serial {
+            bus.dispatcher
+                .register_mmio(base, len, bus.serial.mmio_device())?;
         }
         Ok(bus)
     }
@@ -1065,7 +1096,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// aarch64（KVM）の組み立て（MVM-1・#3696）。順序は 構成検証 → VM → ゲスト RAM（GPA `ARM64_RAM_BASE`）→ **vCPU** →
     /// vGICv3 の作成とアドレス設定 → `CTRL_INIT` → デバイス（irqfd）。x86_64 と違い irqchip は vCPU の**後**で、irqfd は
     /// vGIC の初期化後でないと `EAGAIN` で拒否される（根拠は `crate::device` のモジュール doc）。
-    /// シリアル（MMIO の ns16550a と割り込み）は #3898 で、本層は COM1 の PIO を登録しない。
+    /// シリアルは MMIO の ns16550a を virtio の後に登録する（#3898。COM1 の PIO は登録しない。割り込みは未結線のポーリング）。
     #[cfg(target_arch = "aarch64")]
     fn assemble_inner(
         kvm: &KvmDevice,
@@ -1085,7 +1116,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         }
         let vgic = vm.create_vgic_v3(layout.gic_dist.base.raw(), layout.gic_redist.base.raw())?;
         vgic.init()?;
-        let devices = DeviceBus::new(&slots, config.block, config.net, None, false, |s| {
+        // シリアルは MMIO（ns16550a）。layout が窓を持たないのは内部矛盾なので fail-closed（#3898）。
+        let serial_region = layout.serial.ok_or_else(|| {
+            MicrovmError::new(MicrovmErrorCode::Internal, "serial window is not planned")
+        })?;
+        let serial = SerialAttach::Mmio {
+            base: serial_region.base.raw(),
+            len: serial_region.size,
+        };
+        let devices = DeviceBus::new(&slots, config.block, config.net, serial, |s| {
             vm.register_irqfd(s.gsi)
         })?;
         Ok(MicroVm {
@@ -1124,9 +1163,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Some(Arc::new(vm.register_irq_line(crate::uart::COM1_IRQ)?));
         #[cfg(not(target_arch = "x86_64"))]
         let com1_line: Option<Arc<dyn LevelInterruptLine>> = None;
-        let devices = DeviceBus::new(&slots, config.block, config.net, com1_line, true, |s| {
-            vm.register_irqfd(s.gsi)
-        })?;
+        let devices = DeviceBus::new(
+            &slots,
+            config.block,
+            config.net,
+            SerialAttach::Com1Pio { line: com1_line },
+            |s| vm.register_irqfd(s.gsi),
+        )?;
         // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
         let cpuid = kvm.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
@@ -1443,10 +1486,11 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         Ok(f(&mut t))
     }
 
-    /// COM1 の UART の出力をホストが取り出すハンドル（clone）。ゲストの THR 出力（`console=ttyS0`）が溜まる。
+    /// UART（x86_64 は COM1 の PIO、aarch64 は MMIO の ns16550a）の出力をホストが取り出すハンドル（clone）。
+    /// ゲストの THR 出力（`console=ttyS0`）が溜まる。
     ///
     /// 上限つき（[`crate::uart::MAX_OUTPUT_BYTES`]）。中身は非信頼のゲスト出力なので、表示・記録時はエスケープすること。
-    /// 未実装（REPAIR-3）: IRQ 4（受信 FIFO は #3893 で実装済みだが線が無く Linux は入力を読まない）。
+    /// 未実装（REPAIR-3）: aarch64 の割り込み線（線が無く、受信は Linux がポーリングで読む。後続 issue）。
     pub fn serial_console(&self) -> SerialConsole {
         self.devices.serial.clone()
     }
@@ -3455,9 +3499,13 @@ mod assemble_tests {
                 mac: [2, 0, 0, 0, 0, 1],
             })
             .collect();
-        let bus = DeviceBus::new(&slots, blocks, nets, None, true, |_| {
-            Ok(CountLine::default())
-        })
+        let bus = DeviceBus::new(
+            &slots,
+            blocks,
+            nets,
+            SerialAttach::Com1Pio { line: None },
+            |_| Ok(CountLine::default()),
+        )
         .unwrap();
         let mem =
             GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
@@ -3515,8 +3563,9 @@ mod assemble_tests {
             &slots,
             Vec::new(),
             Vec::new(),
-            Some(rec.clone()),
-            true,
+            SerialAttach::Com1Pio {
+                line: Some(rec.clone()),
+            },
             |_| Ok(CountLine::default()),
         )
         .unwrap();
@@ -3748,6 +3797,87 @@ mod assemble_tests {
             assert_eq!(spi.intid(), Some(intid));
             assert_eq!(slot.gsi + VGIC_SPI_INTID_BASE, intid);
         }
+    }
+
+    /// MVM-1・#3898: aarch64 の配置はシリアルの窓を既定の位置に持ち、ポーリング（SPI 無し）で、virtio の割り当ては不変。
+    /// バス上限は VM を作る前の段で `InvalidArgument` になる。
+    #[test]
+    fn mvm1_3898_plan_layout_arm64_enables_polled_serial() {
+        use crate::arm64_layout::{MmioRegion, SerialInterrupt};
+        let (layout, slots) = plan_layout_arm64(1, 64 << 20, 2, 1).unwrap();
+        assert_eq!(layout.serial, Some(MmioRegion::new(0x0900_0000, 0x1000)));
+        assert_eq!(layout.serial_interrupt, SerialInterrupt::Polled);
+        assert_eq!(layout.serial_spi(), None);
+        let got: Vec<(u64, u32)> = slots.iter().map(|s| (s.mmio_base, s.gsi)).collect();
+        assert_eq!(
+            got,
+            vec![(0x0a00_0000, 16), (0x0a00_0200, 17), (0x0a00_0400, 18)]
+        );
+        // virtio の台数の上限が先に効く（バス上限 32 には届かない）。
+        let e = plan_layout_arm64(1, 64 << 20, MAX_VIRTIO_DEVICES + 1, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "too many virtio devices");
+    }
+
+    /// MVM-1・#3898: MMIO のシリアルは virtio の後に登録され、THR の書き込みが出力に溜まり、COM1 の PIO は未登録。
+    #[test]
+    fn mvm1_3898_device_bus_routes_mmio_serial() {
+        use crate::exit::IoDirection;
+        let (_, slots) = plan_layout_arm64(1, 64 << 20, 1, 0).unwrap();
+        let mut b = DeviceBus::<MemoryBlockBackend, MemoryNetBackend, CountLine>::new(
+            &slots,
+            vec![MemoryBlockBackend::new(16 * 512, false).unwrap()],
+            Vec::new(),
+            SerialAttach::Mmio {
+                base: 0x0900_0000,
+                len: 0x1000,
+            },
+            |_| Ok(CountLine::default()),
+        )
+        .unwrap();
+        // シリアルは infos() に載らない（virtio の台数と一致）。
+        assert_eq!(b.infos().len(), 1);
+        let mmio = |addr: u64, len: u32, is_write: bool, byte: u8| {
+            let mut data = [0u8; 8];
+            data[0] = byte;
+            VcpuExit::Mmio {
+                phys_addr: addr,
+                data,
+                len,
+                is_write,
+            }
+        };
+        let w = b
+            .dispatcher
+            .dispatch(&mmio(0x0900_0000, 1, true, b'A'))
+            .unwrap();
+        assert!(matches!(w, DispatchOutcome::Mmio { .. }));
+        assert_eq!(b.serial.take_output().unwrap(), b"A");
+        // LSR（+5）は THRE | TEMT。
+        let r = b
+            .dispatcher
+            .dispatch(&mmio(0x0900_0005, 1, false, 0))
+            .unwrap();
+        assert_eq!(r.read_response(), Some(&[0x60u8][..]));
+        // 2 バイト幅は出力に入らない。
+        let _ = b
+            .dispatcher
+            .dispatch(&mmio(0x0900_0000, 2, true, b'B'))
+            .unwrap();
+        assert!(b.serial.take_output().unwrap().is_empty());
+        // COM1 の PIO は登録されていない。
+        let out = VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: COM1_BASE,
+            size: 1,
+            count: 1,
+            data: b"x".to_vec(),
+        };
+        assert!(matches!(
+            b.dispatcher.dispatch(&out).unwrap(),
+            DispatchOutcome::Unhandled { .. }
+        ));
+        assert!(b.serial.take_output().unwrap().is_empty());
     }
 
     /// MVM-1・#3696・REPAIR-3: aarch64 の 2 台以上の vCPU は AP の起動（#3899）が無いので資源を作る前に `Unimplemented`。
@@ -4168,9 +4298,13 @@ mod net_rx_tests {
         }];
         let irqs = Arc::new(AtomicU32::new(0));
         let line_irqs = Arc::clone(&irqs);
-        let bus = DeviceBus::new(&slots, Vec::new(), nets, None, true, move |_| {
-            Ok(AtomicLine(Arc::clone(&line_irqs)))
-        })
+        let bus = DeviceBus::new(
+            &slots,
+            Vec::new(),
+            nets,
+            SerialAttach::Com1Pio { line: None },
+            move |_| Ok(AtomicLine(Arc::clone(&line_irqs))),
+        )
         .unwrap();
         let mem =
             GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
@@ -4563,16 +4697,22 @@ mod failure_tests {
         }];
         let dropped = Rc::new(Cell::new(0u32));
         let made = Cell::new(0u32);
-        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, None, true, |_| {
-            if made.get() == 2 {
-                return Err(MicrovmError::new(
-                    MicrovmErrorCode::ResourceExhausted,
-                    "no irqfd",
-                ));
-            }
-            made.set(made.get() + 1);
-            Ok(DropLine(Rc::clone(&dropped)))
-        });
+        let r = DeviceBus::<_, _, DropLine>::new(
+            &slots,
+            blocks,
+            nets,
+            SerialAttach::Com1Pio { line: None },
+            |_| {
+                if made.get() == 2 {
+                    return Err(MicrovmError::new(
+                        MicrovmErrorCode::ResourceExhausted,
+                        "no irqfd",
+                    ));
+                }
+                made.set(made.get() + 1);
+                Ok(DropLine(Rc::clone(&dropped)))
+            },
+        );
         let Err(e) = r else { panic!("must fail") };
         assert_eq!(e.code(), MicrovmErrorCode::ResourceExhausted);
         assert_eq!(e.to_string(), "RESOURCE_EXHAUSTED: no irqfd");
@@ -4594,8 +4734,7 @@ mod failure_tests {
             &slots,
             blocks,
             vec![],
-            None,
-            true,
+            SerialAttach::Com1Pio { line: None },
             |_| Ok(DropLine(Rc::clone(&dropped))),
         );
         assert!(r.is_err());

@@ -57,7 +57,7 @@
 //! # 未実装（REPAIR-3）
 //! - x86 の線なしの PIO（[`SerialConsole::port_device`]）は IIR が従来どおり常に「保留なし」を返す（届かない THRE を報告すると
 //!   ドライバが来ない割り込みを待つため）。`microvm::assemble` は x86_64 で [`SerialConsole::port_device_with_irq`] を使い、
-//!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。aarch64 の KVM の線は #3898（vGIC・irqfd の土台は #3696 で実装済み）。
+//!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。KVM aarch64 は線なしの `mmio_device`（ポーリング）で結線済み（#3898）。線は #3943（vGIC・irqfd の土台は #3696 で実装済み）。
 //! - 受信トリガ（FCR bit7:6）・CTI（IIR 0x0C）・LSR.OE と RLS 割り込みは未実装。ループバック中の THR 書き込みは RX へ回さない。
 //! - `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかは未確認（#3803 の実機確認項目）。
 
@@ -157,6 +157,9 @@ pub struct Uart16550 {
     irq_line_errors: u64,
     /// 割り込み線が結線済みか（[`SerialConsole::mmio_device_with_irq`] が立てる）。線が無い経路では THRE を IIR に出さない。
     irq_wired: bool,
+    /// IIR に RDA・THRE の保留を出すか。線ありの経路に加え、ポーリング用 MMIO（[`SerialConsole::mmio_device`]）でも立てる。
+    /// Linux 8250 は irq=0 のタイマーポーリングでも IIR を見て送受信を進めるため、線の駆動（`irq_wired`）とは分ける（MVM-1）。
+    iir_reports: bool,
     /// 線の実体（[`SerialConsole::mmio_device_with_irq`] が設定する）。ホストの `push_input` からも更新するため UART が持つ。
     line: Option<Weak<dyn LevelInterruptLine>>,
     rx: VecDeque<u8>,
@@ -243,6 +246,7 @@ impl Uart16550 {
             irq_reported: IrqLevel::Low,
             irq_line_errors: 0,
             irq_wired: false,
+            iir_reports: false,
             line: None,
             rx: VecDeque::new(),
             rx_capacity: MAX_INPUT_BYTES,
@@ -275,16 +279,16 @@ impl Uart16550 {
     }
 
     fn rda_pending(&self) -> bool {
-        self.irq_wired && self.ier & IER_ERBFI != 0 && !self.rx.is_empty()
+        self.iir_reports && self.ier & IER_ERBFI != 0 && !self.rx.is_empty()
     }
 
     fn thre_pending(&self) -> bool {
-        self.irq_wired && self.ier & IER_ETBEI != 0 && self.int_pending & INT_THRE != 0
+        self.iir_reports && self.ier & IER_ETBEI != 0 && self.int_pending & INT_THRE != 0
     }
 
     /// 割り込み線が今あるべき値。受信データ（ERBFI=1 で FIFO が空でない）か THRE（ETBEI=1 で保留）があれば `High`（#3892・#3893）。
     pub fn irq_level(&self) -> IrqLevel {
-        if self.rda_pending() || self.thre_pending() {
+        if self.irq_wired && (self.rda_pending() || self.thre_pending()) {
             IrqLevel::High
         } else {
             IrqLevel::Low
@@ -544,6 +548,8 @@ impl SerialConsole {
     pub fn port_device_with_irq(&self, line: Arc<dyn LevelInterruptLine>) -> Box<dyn PortIoDevice> {
         if let Ok(mut u) = self.inner.lock() {
             u.irq_wired = true;
+            u.iir_reports = true;
+            u.iir_reports = true;
             u.line = Some(Arc::downgrade(&line));
         }
         // 線の強参照はデバイス（= DeviceBus・VM 側）が持つ。UART（SerialConsole の clone と共有）は Weak のみで、
@@ -557,6 +563,10 @@ impl SerialConsole {
     ///
     /// FDT の `reg-shift = 0`・`reg-io-width = 1` に合わせ、受けるのは 1 バイト幅・offset 0..8 のみ。
     pub fn mmio_device(&self) -> Box<dyn MmioDevice> {
+        // 線は駆動しないが、ポーリングするゲストのため IIR には RDA・THRE の保留を出す（MVM-1）。
+        if let Ok(mut u) = self.inner.lock() {
+            u.iir_reports = true;
+        }
         Box::new(SharedUartMmio {
             inner: Arc::clone(&self.inner),
             _line: None,
@@ -571,6 +581,8 @@ impl SerialConsole {
         // 線ができたこの時点から THRE を IIR に出す（lock の poison は各アクセスが fail-closed に扱う）。
         if let Ok(mut u) = self.inner.lock() {
             u.irq_wired = true;
+            u.iir_reports = true;
+            u.iir_reports = true;
             u.line = Some(Arc::downgrade(&line));
         }
         Box::new(SharedUartMmio {
@@ -905,6 +917,7 @@ mod tests {
     fn mvm5_3892_uart_etbei_raises_thre() {
         let mut u = Uart16550::new();
         u.irq_wired = true;
+        u.iir_reports = true;
         assert_eq!(u.irq_level(), IrqLevel::Low);
         wr(&mut u, 1, 0x02);
         assert_eq!(u.irq_level(), IrqLevel::High);
@@ -925,11 +938,30 @@ mod tests {
         assert_eq!(console.inner.lock().unwrap().irq_level(), IrqLevel::Low);
     }
 
+    /// MVM-1・#3898: ポーリング用 MMIO（線なし）でも IER に応じて IIR に THRE・RDA を返し、線は Low のまま。
+    #[test]
+    fn mvm1_3898_polling_mmio_reports_iir_pending() {
+        let console = SerialConsole::new();
+        let mut dev = console.mmio_device();
+        let mut buf = [0u8; 1];
+        assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(dev.read(2, &mut buf), MmioReadOutcome::Handled);
+        assert_eq!(buf, [0x02]);
+        assert_eq!(dev.read(2, &mut buf), MmioReadOutcome::Handled);
+        assert_eq!(buf, [0x01]);
+        assert_eq!(dev.write(1, &[0x01]), MmioWriteOutcome::Handled);
+        console.push_input(b"a").unwrap();
+        assert_eq!(dev.read(2, &mut buf), MmioReadOutcome::Handled);
+        assert_eq!(buf, [0x04]);
+        assert_eq!(console.inner.lock().unwrap().irq_level(), IrqLevel::Low);
+    }
+
     /// MVM-5・MVM-1・#3892: THR 書き込みで再び立つ。
     #[test]
     fn mvm5_3892_uart_thr_write_reasserts() {
         let mut u = Uart16550::new();
         u.irq_wired = true;
+        u.iir_reports = true;
         wr(&mut u, 1, 0x02);
         assert_eq!(rd(&mut u, 2), 0x02);
         wr(&mut u, 0, b'x');
@@ -954,6 +986,7 @@ mod tests {
     fn mvm5_3892_uart_fifo_iir_values() {
         let mut u = Uart16550::new();
         u.irq_wired = true;
+        u.iir_reports = true;
         wr(&mut u, 2, 0x01);
         wr(&mut u, 1, 0x02);
         assert_eq!(rd(&mut u, 2), 0xC2);
@@ -965,6 +998,7 @@ mod tests {
     fn mvm5_3892_uart_etbei_clear_drops_line() {
         let mut u = Uart16550::new();
         u.irq_wired = true;
+        u.iir_reports = true;
         wr(&mut u, 1, 0x02);
         assert_eq!(u.irq_level(), IrqLevel::High);
         wr(&mut u, 1, 0x00);
@@ -1086,6 +1120,7 @@ mod tests {
 
     fn wired(u: &mut Uart16550) {
         u.irq_wired = true;
+        u.iir_reports = true;
     }
 
     /// MVM-5・CORE-7・#3893: 入力は先頭から順に RBR で読め、LSR.DR が追従する。

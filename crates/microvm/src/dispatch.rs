@@ -403,6 +403,28 @@ impl ExitDispatcher {
     }
 }
 
+/// MMIO 表の合計（virtio + シリアル）が [`MAX_BUS_DEVICES`] に収まるか、資源（VM fd 等）を作る前に検査する
+/// （MVM-1・MVM-5・#3898・#3882）。aarch64 はシリアルも virtio と同じ MMIO 表に載るため、有効なら 1 枠使う。
+/// 超過は `InvalidArgument`。macOS（`hvf_abi::check_assemble_input`）と KVM aarch64（`plan_layout_arm64`）が共有する。
+pub fn check_mmio_bus_capacity(virtio_count: usize, serial: bool) -> Result<(), MicrovmError> {
+    check_mmio_bus_capacity_with_limit(virtio_count, serial, MAX_BUS_DEVICES)
+}
+
+fn check_mmio_bus_capacity_with_limit(
+    virtio_count: usize,
+    serial: bool,
+    limit: usize,
+) -> Result<(), MicrovmError> {
+    let total = virtio_count.checked_add(usize::from(serial));
+    match total {
+        Some(n) if n <= limit => Ok(()),
+        _ => Err(MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "too many mmio bus devices",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +747,19 @@ mod tests {
         // 空になった範囲は同じ範囲を再登録できる。
         d.register_mmio(0x1000, 0x100, Box::new(FakeMmio(Arc::clone(&log))))
             .unwrap();
+    }
+
+    /// MVM-1・#3898: MMIO 表の合計の境界（上限ちょうどは受理、超過とあふれは `InvalidArgument`）。
+    #[test]
+    fn mvm1_3898_mmio_bus_capacity() {
+        assert!(check_mmio_bus_capacity_with_limit(31, true, 32).is_ok());
+        assert!(check_mmio_bus_capacity_with_limit(32, false, 32).is_ok());
+        for (n, serial) in [(32, true), (33, false), (usize::MAX, true)] {
+            let e = check_mmio_bus_capacity_with_limit(n, serial, 32).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "too many mmio bus devices");
+        }
+        assert!(check_mmio_bus_capacity(8, true).is_ok());
+        assert!(check_mmio_bus_capacity(MAX_BUS_DEVICES, true).is_err());
     }
 }

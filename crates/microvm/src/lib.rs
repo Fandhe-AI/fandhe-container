@@ -1,7 +1,7 @@
-//! fandhe-container-microvm: KVM 直接制御・最小 virtio デバイスモデル（Linux オプション）。
+//! fandhe-container-microvm: KVM・Hypervisor.framework の直接制御と最小 virtio デバイスモデル（microVM オプション）。
 //!
-//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM だけで、先行して進める。macOS（Hypervisor.framework。TASK-192）と
-//! Windows（WHP。将来オプションで MVP には実装しない）の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
+//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM と macOS の Hypervisor.framework（TASK-192。aarch64。実機未確認。
+//! 下の「macOS バックエンド」節）。Windows（WHP）は将来オプションで MVP には実装しない。Windows の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
 //! 2026-11-03 決定）は、`docs/architecture.md` の「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
 //!
 //! 実装済み（TASK-74.1.1・MVM-1。Linux のみ）: `/dev/kvm` のオープン・API 版数 12 の確認・`KVM_CREATE_VM` による
@@ -69,6 +69,25 @@
 //! TASK-192.15・#3797・MVM-5・MVM-1: macOS の microVM 構成体（`hvf::microvm::HvfMicroVm`。OS 非依存の `hvf_abi::check_assemble_input`・`boot_arm64::check_boot_readback`、`HvfGuestRam::register_shared`）。unsafe は増やさない（sys/hvf.rs は借用か `Arc<HvVm>` を保持する対応付けの追加のみ）。
 //! TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5: macOS の microVM の start / stop と停止・drop 時の資源の解放順序（OS 非依存コアは `hvf_lifecycle`。`hvf_loop` の start gate。macOS かつ aarch64 のみ `hvf::{RunningHvfMicroVm, HvfStopReport}`。unsafe は増やさない）。
 //! TASK-192.4・#3787・MVM-5・MVM-1: macOS のゲスト RAM（`hvf::memory`。匿名 mmap と `hv_vm_map` による対応付け。unsafe は sys/hvf.rs のみ）。
+//!
+//! # macOS バックエンド（TASK-192・MVM-5）
+//! 対象は `cfg(all(target_os = "macos", target_arch = "aarch64"))`（macOS 15 以降・Apple Silicon。GICv3 の API の版による）。
+//! `hvf` は macOS かつ aarch64 のときだけ存在するため、ここでは rustdoc のリンクにしない。実機（macOS）での観測記録は #3803 で、
+//! 現状は実機未確認（型検査と OS 非依存コアの単体試験まで）。FFI は `sys/hvf.rs` の自前宣言で、新しい依存は足していない（MVM-4）。
+//!
+//! 実装済み:
+//! - VM・ゲスト RAM・vCPU・GICv3 の実行時解決（`sys/hvf.rs`・`hvf::memory`・`hvf::gic`。#3783・#3786・#3787・#3789・#3792・#3795）
+//! - vCPU 専用スレッドと実行ループ・exit の分類（`hvf_loop`・`hvf::vcpu`。#3791）と、MMIO・HVC（PSCI）・WFI / vtimer の処理
+//!   （`hvf::mmio`・`hvf::hvc`・`hvf::timer`。#3793・#3794・#3883・#3796・#3887）
+//! - microVM 構成体と start / stop・停止時の資源の解放順序（`hvf::microvm`・`hvf_lifecycle`。#3797・#3798・#3882）
+//! - UART の SPI 割り込みと入力（#3892・#3893）
+//! - `fandhe-container-plugin-microvm` の start / stop への結線（#3800・#3927）
+//!
+//! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
+//! - SMP（vCPU 1 以上の作成と PSCI `CPU_ON` による AP の起動。#3884・#3891）
+//! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
+//! - virtqueue の処理と QueueNotify の配線、TIMEOUT 後のゲスト RAM の回収（#3908）
+//! - big-endian ゲスト・entitlement 署名の手順（#3801）・実機での観測記録（#3803）
 
 #![deny(unsafe_code)]
 

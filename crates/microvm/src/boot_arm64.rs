@@ -371,6 +371,8 @@ pub const ARM64_MPIDR_AFFINITY_MASK: u64 = 0x00ff_00ff_ffff;
 pub const SCTLR_EL1_M: u64 = 1;
 /// SCTLR_EL1.C（bit 2。D-cache 有効）。
 pub const SCTLR_EL1_C: u64 = 1 << 2;
+/// SCTLR_EL1.I（bit 12。EL0/EL1 の命令キャッシュ有効）。
+pub const SCTLR_EL1_I: u64 = 1 << 12;
 
 /// vCPU 0 へ起動レジスタを書いた直後の読み戻し値（#3797）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,9 +415,8 @@ pub const SCTLR_EL1_EE: u64 = 1 << 25;
 /// stage 1 の MMU とキャッシュは無効で `SCTLR_ELx.{I, C, M}` = {0, 0, 0}（§6.4.3.4）、エンディアンは呼び出し元のものの復元
 /// （§6.4.3.2。本層はリトルエンディアンのゲストだけを対象にする）。CPSR = [`ARM64_BOOT_CPSR`] は §6.4.1・§6.4.3.3 に一致する。
 /// X1〜X3 = 0 は DEN0022 §6.4 が定めない値で、Linux の `booting.rst` の BSP の契約に揃えた選択である。
-/// MMU off・D-cache off は初回起動では #3797、再 CPU_ON では [`sctlr_for_cpu_on`] が担い、キャッシュが呼び出し元から見て
-/// clean かつ coherent であること（§6.4.3.4）はホスト側の責務である。逸脱: §6.4.3.4 は `SCTLR_ELx.I` = 0 も求めるが、
-/// [`sctlr_for_cpu_on`] は I を落とさない（#3936 で扱う。REPAIR-3）。実書き込みは owning thread が行う。
+/// MMU off・D-cache off は初回起動では #3797、再 CPU_ON では [`sctlr_for_cpu_on`]（I-cache off も含む。#3936）が担い、
+/// キャッシュが呼び出し元から見て clean かつ coherent であること（§6.4.3.4）はホスト側の責務である。実書き込みは owning thread が行う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApBootRegs {
     /// 起動アドレス（CPU_ON の entry）。
@@ -451,11 +452,10 @@ pub fn ap_boot_registers(
     })
 }
 
-/// CPU_OFF の後の再 CPU_ON では、前回ゲストが有効にした MMU・D-cache が `SCTLR_EL1` に残る。M・C を落とし（DEN0022 F.b §6.4.3.4）、
+/// CPU_OFF の後の再 CPU_ON では、前回ゲストが有効にした MMU・キャッシュが `SCTLR_EL1` に残る。M・C・I を落とし（DEN0022 F.b §6.4.3.4。I は #3936）、
 /// リトルエンディアンだけを対象にするため EE も落とした値を返す（§6.4.3.2。他のビットは保つ。ビッグエンディアンのゲストは対象外）。
-/// §6.4.3.4 が求める I（bit 12）= 0 は未対応の逸脱で、#3936 で扱う（REPAIR-3）。
 pub fn sctlr_for_cpu_on(prev: u64) -> u64 {
-    prev & !(SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_EE)
+    prev & !(SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I | SCTLR_EL1_EE)
 }
 
 /// CPU_ON の entry がゲスト RAM の範囲内で 4 バイトに整列しているか確かめる（`[ram_base, ram_base + ram_size)`。checked 演算）。
@@ -735,13 +735,15 @@ mod tests {
         );
     }
 
-    /// MVM-5・#3891: SCTLR_EL1 の M・C・EE だけが落ち、他のビットは保たれる。
+    /// MVM-5・#3891・#3936: SCTLR_EL1 の M・C・I・EE だけが落ち、他のビットは保たれる（DEN0022 F.b §6.4.3.4・§6.4.3.2）。
     #[test]
-    fn mvm5_3891_sctlr_for_cpu_on_clears_only_m_c_ee() {
-        assert_eq!(sctlr_for_cpu_on(0x30d0_199d), 0x30d0_199d & !5);
-        assert_eq!(sctlr_for_cpu_on(0x30d0_199d | (1 << 25)), 0x30d0_199d & !5);
+    fn mvm5_3891_sctlr_for_cpu_on_clears_only_m_c_i_ee() {
+        assert_eq!(SCTLR_EL1_I, 0x1000);
+        assert_eq!(sctlr_for_cpu_on(0x30d0_199d), 0x30d0_0998);
+        assert_eq!(sctlr_for_cpu_on(0x30d0_199d | (1 << 25)), 0x30d0_0998);
+        assert_eq!(sctlr_for_cpu_on(SCTLR_EL1_I), 0);
         assert_eq!(sctlr_for_cpu_on(0), 0);
-        assert_eq!(sctlr_for_cpu_on(u64::MAX), !(1 | 4 | (1 << 25)));
+        assert_eq!(sctlr_for_cpu_on(u64::MAX), 0xffff_ffff_fdff_effa);
     }
 
     /// MVM-5・SEC-1・#3891: CPU_ON の entry の範囲（境界）と整列、桁あふれ。

@@ -1385,6 +1385,120 @@ fn hvf_device_smp_cpu_on_boots_ap() {
     drop(create_vm_or_precondition());
 }
 
+/// AP の CPU_OFF → 再 CPU_ON の往復で SCTLR_EL1.I が落ちることを観測するゲスト（#3936・MVM-5・MVM-1。コードの符号は
+/// `clang --target=aarch64-linux-gnu -c` で組んだ 76 語。命令を足すときは再生成する）。
+///
+/// BSP（vCPU 0）: CPU_ON(1) → 結果を窓 1 の offset 0x00 へ → RAM の `cnt` が 1 になるまで待つ（上限つき）→ AFFINITY_INFO が OFF（1）に
+/// なるまで待つ → 再 CPU_ON の結果を 0x08 へ → `cnt` が 2 → OFF を待つ → SYSTEM_OFF。上限超過は 0xbad を 0xf8 へ書いて `b .`。
+/// AP（vCPU 1）: 1 回目の entry で SCTLR_EL1 を 0x100 へ書き、I（bit 12）を立てて読み戻した値を 0x110 へ、`cnt` = 1 にして CPU_OFF。
+/// 2 回目の entry（`cnt` != 0）で entry 時点の SCTLR_EL1 を 0x108 へ書き、`cnt` = 2 にして CPU_OFF。戻ったら 0xbad を 0x1f8 へ。
+const SMP_CPU_ON_ICACHE_GUEST_CODE: [u32; 76] = [
+    0x10000634, 0xD2A14015, 0x10000905, 0x94000011, 0xF90102A0, 0xD2800028, 0x94000015, 0x9400001D,
+    0x9400000C, 0xF90106A0, 0xD2800048, 0x94000010, 0x94000018, 0xD2B08000, 0xF2800100, 0xD4000002,
+    0x14000000, 0xD28175A6, 0xF9017EA6, 0x14000000, 0xD2B88000, 0xF2800060, 0xD2800021, 0xAA1403E2,
+    0xD2800003, 0xD4000002, 0xD65F03C0, 0xD288480A, 0xF2A001EA, 0xF94000A7, 0xEB0800FF, 0x54000080,
+    0xF100054A, 0x54FFFF81, 0x17FFFFEF, 0xD65F03C0, 0xD288480A, 0xF2A001EA, 0xD2B88000, 0xF2800080,
+    0xD2800021, 0xD2800002, 0xD4000002, 0xF100041F, 0x54000080, 0xF100054A, 0x54FFFF01, 0x17FFFFE2,
+    0xD65F03C0, 0xD2A14015, 0x10000305, 0xD5381001, 0xF94000A7, 0xB5000147, 0xF90182A1, 0xB2740021,
+    0xD5181001, 0xD5033FDF, 0xD5381002, 0xF9018AA2, 0xD2800027, 0xF90000A7, 0x14000004, 0xF90186A1,
+    0xD2800047, 0xF90000A7, 0xD2B08000, 0xF2800040, 0xD4000002, 0xD28175A6, 0xF901FEA6, 0x14000000,
+    0xD503201F, 0xD503201F, 0x00000000, 0x00000000,
+];
+
+/// HVF の SMP: I-cache を有効にして CPU_OFF した AP を再 CPU_ON すると、entry 時点の SCTLR_EL1.I が 0 になる
+/// （#3936・MVM-5・MVM-1。DEN0022 の CPU_ON 後の状態。`sctlr_for_cpu_on` の HVF への書き込みと読み戻しを通した照合）。
+///
+/// 照合（具体値）: 1 回目の entry の I = 0・ゲストが立てた直後の I = 1・再 CPU_ON の結果 0・2 回目の entry の I = 0（M・C・EE も 0）・
+/// 停止理由 `GuestShutdown`・失敗の目印（0xbad）が無いこと。生の値は `hvf_device: smp_icache:` の行に出す（記録は #3803）。
+/// 期限 watchdog 30 秒つき。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_smp_cpu_on_clears_icache() {
+    use fandhe_container_microvm::dispatch::MmioDevice;
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+    use fandhe_container_microvm::stop::StopReason;
+    use fandhe_container_microvm::virtio_mmio::{MmioReadOutcome, MmioWriteOutcome};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const WINDOW: u64 = 0x0a00_0200;
+    const MAX_RECORDS: usize = 16;
+    /// SCTLR_EL1 の M・C・I・EE。
+    const SCTLR_M: u64 = 1;
+    const SCTLR_C: u64 = 1 << 2;
+    const SCTLR_I: u64 = 1 << 12;
+    const SCTLR_EE: u64 = 1 << 25;
+
+    /// 窓 1 の観測器。書き込みを `(offset, 最大 8 バイトの値)` で記録し、読み出しは 0。
+    struct Recorder(Arc<Mutex<Vec<(u64, u64)>>>);
+    impl MmioDevice for Recorder {
+        fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+            data.fill(0);
+            MmioReadOutcome::Handled
+        }
+        fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
+            let mut v = [0u8; 8];
+            for (d, s) in v.iter_mut().zip(data.iter()) {
+                *d = *s;
+            }
+            let mut g = self.0.lock().unwrap();
+            if g.len() < MAX_RECORDS {
+                g.push((offset, u64::from_le_bytes(v)));
+            }
+            MmioWriteOutcome::Handled
+        }
+    }
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 2, 1).unwrap();
+    require_vm_with_gic(&layout);
+    let vm = HvfMicroVm::assemble(assemble_config(
+        layout,
+        synthetic_image_with_code(true, &SMP_CPU_ON_ICACHE_GUEST_CODE),
+        1,
+        false,
+    ))
+    .unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    vm.dispatcher()
+        .lock()
+        .unwrap()
+        .register_mmio(WINDOW, 0x200, Box::new(Recorder(Arc::clone(&records))))
+        .unwrap();
+
+    let running = vm.start().unwrap();
+    let begin = Instant::now();
+    while !running.is_finished() && begin.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(running.is_finished(), "guest did not reach SYSTEM_OFF");
+    let report = running.stop(Duration::from_secs(2)).unwrap();
+    let got = records.lock().unwrap().clone();
+    eprintln!(
+        "hvf_device: smp_icache: records={got:x?} reason={:?} per_vcpu={:?}",
+        report.reason, report.per_vcpu
+    );
+    let at = |offset: u64| got.iter().find(|(o, _)| *o == offset).map(|(_, v)| *v);
+
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(at(0xf8), None, "vcpu 0 hit a loop limit");
+    assert_eq!(at(0x1f8), None, "vcpu 1 returned from CPU_OFF");
+    assert_eq!(at(0x00), Some(0), "first CPU_ON result");
+    assert_eq!(at(0x08), Some(0), "second CPU_ON result");
+    let first = at(0x100).expect("first entry SCTLR_EL1");
+    let after_set = at(0x110).expect("SCTLR_EL1 after the guest set I");
+    let second = at(0x108).expect("second entry SCTLR_EL1");
+    assert_eq!(first & SCTLR_I, 0, "I set at the first CPU_ON");
+    assert_eq!(after_set & SCTLR_I, SCTLR_I, "guest could not set I");
+    assert_eq!(
+        second & (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE),
+        0,
+        "M/C/I/EE not cleared at re-CPU_ON"
+    );
+
+    drop(create_vm_or_precondition());
+}
+
 /// microVM の start / stop と停止・drop 時の資源の解放（TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5）。
 /// (A) 自己ループのゲストの start → stop が `Requested`、(B) その直後に同じプロセスで再 assemble → start → stop ができる
 /// （資源の解放の観測。解放漏れなら 2 回目の `HvVm::create` が `FailedPrecondition`）、(C) PSCI SYSTEM_OFF のゲストが

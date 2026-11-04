@@ -219,6 +219,15 @@ impl ExitDispatcher {
         Self::default()
     }
 
+    /// 登録済みの MMIO・PIO デバイスをすべて手放す（範囲表を空にする）。
+    ///
+    /// dispatcher を `Arc` で共有する側（vCPU の `MmioHandler` 等）が残っていても、デバイスと backend の保持だけを
+    /// 確実に解く。microVM の停止・drop でデバイス → RAM → VM の解放順序（MVM-5・REPAIR-5）を保つために使う。
+    pub fn clear(&mut self) {
+        self.mmio.clear();
+        self.pio.clear();
+    }
+
     /// MMIO デバイスを `[base, base + len)` に登録する。`len == 0`・桁あふれは `InvalidArgument`、
     /// 既存範囲との重なりは `AlreadyExists`、上限（[`MAX_BUS_DEVICES`]）超過は `ResourceExhausted`。
     pub fn register_mmio(
@@ -701,5 +710,20 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    /// MVM-5・REPAIR-5: `clear` は登録済みデバイスの保持を解き、範囲表を空にする（解放順序の「デバイスを先に手放す」の基礎）。
+    #[test]
+    fn clear_releases_registered_devices() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut d = ExitDispatcher::new();
+        d.register_mmio(0x1000, 0x100, Box::new(FakeMmio(Arc::clone(&log))))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&log), 2);
+        d.clear();
+        assert_eq!(Arc::strong_count(&log), 1);
+        // 空になった範囲は同じ範囲を再登録できる。
+        d.register_mmio(0x1000, 0x100, Box::new(FakeMmio(Arc::clone(&log))))
+            .unwrap();
     }
 }

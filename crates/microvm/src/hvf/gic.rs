@@ -43,7 +43,7 @@
 //! # 範囲外（REPAIR-3）
 //! SMP（AP の起動。`MPIDR_EL1` の実設定は #3797 の `HvfMicroVm::assemble` が vCPU 0 の `setup` で行う）・MSI・
 //! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・SDK ヘッダとの値の照合（#3803）・
-//! vCPU の個別 drop と「破棄は VM 破棄時のみ」の整合（#3798・#3791）。`unsafe` は持たない。
+//! vCPU の個別 drop（本 crate では持たない。破棄は teardown の一部としてだけ起き、`mark_teardown` の後の再作成を拒否する。#3798）。`unsafe` は持たない。
 //!
 //! # 所有（#3797）
 //! [`VmWithGic`] は内部の VM を `Arc<HvVm>` で持つ。ゲスト RAM の対応付け（`HvVm::map_shared`）が VM への参照を保持し、
@@ -54,6 +54,7 @@ use std::sync::{Arc, RwLock};
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::HvGicIntid;
+use crate::hvf_lifecycle::TeardownMark;
 use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
 use crate::spi::{SpiLevelLine, SpiLine, SpiSink};
 use crate::sys::{GicApi, HvVcpu, HvVm};
@@ -132,6 +133,7 @@ impl HvfGic {
             gic,
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
+            teardown: TeardownMark::new(),
         })
     }
 }
@@ -144,6 +146,8 @@ pub struct VmWithGic {
     vm: Arc<HvVm>,
     /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
     alive: Arc<RwLock<bool>>,
+    /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
+    teardown: TeardownMark,
 }
 
 impl Drop for VmWithGic {
@@ -194,7 +198,17 @@ impl VmWithGic {
     /// let _ = vm.create_vcpu();
     /// ```
     pub fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
+        self.teardown.check_can_create_vcpu()?;
         self.vm.create_vcpu()
+    }
+
+    /// teardown の開始を記録する（vCPU スレッドが、自分の vCPU を `hv_vcpu_destroy` する直前に呼ぶ。TASK-192.16・#3798）。
+    ///
+    /// Apple の `hv_gic_create` の記述（vCPU が走り出すとトポロジーは確定する／vCPU を破棄するのは VM を teardown するときだけ）に
+    /// 従い、以後の [`Self::create_vcpu`] は `FailedPrecondition` で拒否する。本 crate は pause・vCPU の再作成を持たないため、
+    /// vCPU の破棄は常に teardown の一部である。
+    pub(crate) fn mark_teardown(&self) {
+        self.teardown.begin();
     }
 
     /// `index` 番目の virtio-mmio の SPI を注入する [`GicSpiLine`] を作る（#3795）。注入方式は `layout.virtio_spi_trigger`。

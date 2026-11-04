@@ -82,6 +82,28 @@ impl Parsed {
     }
 }
 
+/// MVM-5・MVM-1（#3863）: `virtio_spi_trigger = LevelHigh` の FDT は virtio の第 3 セルが 4（level-high）になる。
+#[test]
+fn mvm5_3863_fdt_level_high_virtio_trigger() {
+    use fandhe_container_microvm::interrupt::IrqTrigger;
+    let mut l = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+    l.virtio_spi_trigger = IrqTrigger::LevelHigh;
+    let cfg = GuestFdtConfig {
+        layout: &l,
+        bootargs: "console=hvc0",
+        initrd: None,
+    };
+    let p = parse(&build_guest_fdt(&cfg).unwrap());
+    assert_eq!(
+        p.cells("/virtio_mmio@a000000", "interrupts"),
+        vec![0, 16, 4]
+    );
+    assert_eq!(
+        p.cells("/virtio_mmio@a000200", "interrupts"),
+        vec![0, 17, 4]
+    );
+}
+
 /// MVM-5・MVM-1: 代表構成の blob を読み戻し、各ノードの値を具体値で照合する。
 #[test]
 fn mvm5_3788_blob_roundtrip_values() {

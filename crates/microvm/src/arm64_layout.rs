@@ -29,9 +29,11 @@
 //! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
 //! HvfMicroVm へのシリアル結線とバス上限の調整・シリアルの割り込みとゲスト入力・PCI・IPA 上限の確定（#3803）。
 //!
-//! virtio の通知方式（#3795）: FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
-//! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。SPI 番号が API の範囲内かは
-//! [`check_spi_intid`] が照合する。level への変更と InterruptACK 後の deassert は対象外。
+//! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
+//! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を
+//! `LevelHigh` にすると FDT が level-high になり、InterruptACK の後に線を下げる / 上げ直す必要がある
+//! （`crate::interrupt::complete_interrupt_ack`）。FDT の trigger と線の注入方式の食い違いは
+//! [`check_virtio_spi_injection`] が組み立て時に拒否する。SPI 番号が API の範囲内かは [`check_spi_intid`] が照合する。
 //!
 //! # 出典（Linux `Documentation/devicetree/bindings`）
 //! `arm/psci.yaml`・`serial/8250.yaml`・`interrupt-controller/arm,gic-v3.yaml`・`timer/arm,arch_timer.yaml`・`virtio/mmio.yaml`・`arm/cpus.yaml`。
@@ -41,6 +43,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::fdt::FdtBuilder;
 use crate::guest_memory::GuestAddress;
 use crate::hvf_abi::HVF_DEFAULT_IPA_LIMIT;
+use crate::interrupt::IrqTrigger;
 use crate::virtio_mmio::CONFIG_SPACE_SIZE;
 
 /// RAM の基底（2 MiB 境界。arm64 の booting.rst のカーネル配置が依存する。配置は #3790）。
@@ -102,10 +105,30 @@ const TIMER_PPIS: [u32; 4] = [
     ARM64_TIMER_VIRT_PPI,
     ARM64_TIMER_HYP_PPI,
 ];
-/// virtio の trigger は edge-rising に確定（#3795）。macOS の `hv_gic_set_spi(intid, level)` は level 形の API だが、
-/// edge 割り込みは `true` を 1 回渡せば発生し、edge での `false` は無視される。このため
-/// `GicSpiLine::trigger`（`crate::hvf`）は `set_spi(intid, true)` を 1 回だけ呼ぶ。この定数と一致させること。
-const VIRTIO_IRQ_TRIGGER: u32 = IRQ_TYPE_EDGE_RISING;
+/// 注入方式を FDT の `interrupts` 第 3 セルへ写す（#3795・#3863）。既定は edge-rising で、macOS の
+/// `hv_gic_set_spi(intid, level)` は edge なら `true` を 1 回渡せば発生する。level-high は opt-in
+/// （[`Arm64Layout::virtio_spi_trigger`]）で、ACK 後の deassert / resample が要る（`crate::interrupt::complete_interrupt_ack`）。
+const fn dt_irq_type(t: IrqTrigger) -> u32 {
+    match t {
+        IrqTrigger::EdgeRising => IRQ_TYPE_EDGE_RISING,
+        IrqTrigger::LevelHigh => IRQ_TYPE_LEVEL_HIGH,
+    }
+}
+
+/// FDT の trigger と線の注入方式が一致するか照合する（#3863・MVM-5）。不一致はゲストが ICFGR で選ぶ方式と
+/// ホストの注入が食い違い、割り込みが失われる / 張り付くため、組み立て時に `InvalidArgument` で拒否する。
+pub fn check_virtio_spi_injection(
+    fdt: IrqTrigger,
+    injection: IrqTrigger,
+) -> Result<(), MicrovmError> {
+    if fdt == injection {
+        Ok(())
+    } else {
+        Err(invalid(
+            "virtio spi injection does not match the guest fdt trigger",
+        ))
+    }
+}
 /// GICv3 の SPI 番号の上限（INTID 1019 - 32）。
 const GIC_MAX_SPI_N: u32 = 987;
 /// SPI の最小 INTID（INTID 0..=15 が SGI、16..=31 が PPI）。
@@ -195,6 +218,8 @@ pub struct Arm64Layout {
     pub virtio_mmio_count: u32,
     /// 最初の SPI 番号。
     pub virtio_spi_base: u32,
+    /// virtio の割り込みの trigger（FDT に書く値。既定は edge-rising。level は opt-in。#3863）。
+    pub virtio_spi_trigger: IrqTrigger,
     /// vCPU 数。
     pub vcpus: u32,
     /// IPA 上限（排他的）。
@@ -217,6 +242,7 @@ impl Arm64Layout {
             virtio_mmio_stride: ARM64_VIRTIO_MMIO_STRIDE,
             virtio_mmio_count,
             virtio_spi_base: ARM64_VIRTIO_SPI_BASE,
+            virtio_spi_trigger: IrqTrigger::EdgeRising,
             vcpus,
             ipa_limit: ARM64_DEFAULT_IPA_LIMIT,
             serial: None,
@@ -418,6 +444,11 @@ pub fn check_spi_intid(
 }
 
 impl Arm64Layout {
+    /// 線の注入方式が FDT の trigger（[`Self::virtio_spi_trigger`]）と一致するか照合する（#3863）。
+    pub fn check_virtio_injection(&self, injection: IrqTrigger) -> Result<(), MicrovmError> {
+        check_virtio_spi_injection(self.virtio_spi_trigger, injection)
+    }
+
     /// 全 virtio-mmio の SPI が API の範囲に収まるか検査する（VM 作成の前に呼ぶ。#3795・MVM-5）。
     pub fn check_virtio_spi_range(
         &self,
@@ -643,7 +674,10 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
         b.begin_node(&format!("virtio_mmio@{:x}", w.base.raw()))?;
         b.property_string("compatible", "virtio,mmio")?;
         b.property_cells("reg", &reg_cells(&[(w.base.raw(), w.size)]))?;
-        b.property_cells("interrupts", &[GIC_SPI, spi.dt_cell(), VIRTIO_IRQ_TRIGGER])?;
+        b.property_cells(
+            "interrupts",
+            &[GIC_SPI, spi.dt_cell(), dt_irq_type(l.virtio_spi_trigger)],
+        )?;
         b.property_empty("dma-coherent")?;
         b.end_node()?;
     }
@@ -657,6 +691,23 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// MVM-5・MVM-1: FDT の trigger と注入方式が食い違うと `InvalidArgument`、一致なら通る（#3863）。
+    #[test]
+    fn mvm5_3863_injection_mismatch_rejected() {
+        use IrqTrigger::{EdgeRising, LevelHigh};
+        for (fdt, inj) in [(LevelHigh, EdgeRising), (EdgeRising, LevelHigh)] {
+            let e = check_virtio_spi_injection(fdt, inj).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert!(check_virtio_spi_injection(EdgeRising, EdgeRising).is_ok());
+        assert!(check_virtio_spi_injection(LevelHigh, LevelHigh).is_ok());
+        let mut l = Arm64Layout::new(4 * MIB, 1, 1).unwrap();
+        assert!(l.check_virtio_injection(EdgeRising).is_ok());
+        assert!(l.check_virtio_injection(LevelHigh).is_err());
+        l.virtio_spi_trigger = LevelHigh;
+        assert!(l.check_virtio_injection(LevelHigh).is_ok());
+    }
 
     /// MVM-5・MVM-1: SPI の INTID が範囲の境界で具体的に判定される（#3795）。
     #[test]

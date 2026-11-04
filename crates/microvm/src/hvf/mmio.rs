@@ -18,6 +18,8 @@
 //! - `HvVcpuExitException.physical_address` は下位ビットを含む完全な IPA である、という前提を置いている。
 //!
 //! # 未実装（REPAIR-3）
+//! - `InterruptACK` の後処理（level 扱いの SPI の deassert / resample。#3863）は [`MmioHandler::with_ack_routes`] で結ぶ。
+//!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。
 //! - virtqueue の処理と割り込みへの結線（`QueueNotify` の後続）は #3797（macOS の構成体の組み立て）の担当。
 //!   ここでは通知を捨てず [`MmioHandler::last_queue_notify`] に残すだけで、実際のキュー処理は行わない。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
@@ -27,6 +29,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{AccessDirection, DataAbort};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
 use crate::hvf_loop::ExitAction;
+use crate::interrupt::InterruptAckRoute;
 use crate::mmio_abort;
 use crate::sys::HvVcpu;
 use crate::virtio_mmio::MmioWriteOutcome;
@@ -39,6 +42,9 @@ pub struct MmioHandler {
     unhandled: u64,
     queue_notifies: u64,
     last_queue_notify: Option<(DeviceId, u16)>,
+    /// `InterruptACK` の後処理（level 扱いの線の deassert / resample。#3863）。route の無いデバイスは計数だけ。
+    ack_routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>,
+    interrupt_acks: u64,
 }
 
 impl MmioHandler {
@@ -58,6 +64,17 @@ impl MmioHandler {
             dispatcher,
             ..Self::default()
         }
+    }
+
+    /// デバイスごとの `InterruptACK` の後処理を足す（#3863・MVM-5）。
+    pub fn with_ack_routes(mut self, routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>) -> Self {
+        self.ack_routes = routes;
+        self
+    }
+
+    /// `InterruptACK` を受けた回数（#3863）。
+    pub fn interrupt_ack_count(&self) -> u64 {
+        self.interrupt_acks
     }
 
     /// 共有 dispatcher のハンドル（デバイスの追加登録用）。
@@ -106,12 +123,23 @@ pub fn handle_data_abort(
     };
 
     let exit = mmio_abort::mmio_exit_from_abort(abort, exception.physical_address, write_value);
+    // dispatcher の lock はこの式の終わりで解放する（ACK の後処理でトランスポートの lock を取るため、同時保持しない）。
     let outcome = handler
         .dispatcher
         .lock()
         .map_err(|_| internal("mmio dispatcher lock poisoned"))?
         .dispatch(&exit)?;
     match &outcome {
+        DispatchOutcome::Mmio {
+            device,
+            access: MmioAccess::Write(MmioWriteOutcome::InterruptAcknowledged),
+        } => {
+            handler.interrupt_acks = handler.interrupt_acks.saturating_add(1);
+            // 失敗は VM を止める（fail-closed。trigger の失敗と同じ扱い）。
+            if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
+                route.on_interrupt_ack()?;
+            }
+        }
         DispatchOutcome::Mmio {
             device,
             access: MmioAccess::Write(MmioWriteOutcome::QueueNotify(q)),
@@ -146,6 +174,33 @@ mod tests {
     use super::*;
     use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
     use crate::virtio_mmio::VirtioMmioTransport;
+
+    /// ACK の route はデバイスの識別子で引かれ、保持される（#3863）。`hv_*` を呼ばないため vCPU の経路は別途実機で確かめる（#3803）。
+    #[test]
+    fn mvm5_3863_ack_routes_are_kept() {
+        use crate::interrupt::{InterruptAckReport, LineResample};
+        #[derive(Debug)]
+        struct Fake;
+        impl InterruptAckRoute for Fake {
+            fn on_interrupt_ack(&self) -> Result<InterruptAckReport, MicrovmError> {
+                Ok(InterruptAckReport {
+                    remaining: 0,
+                    resample: LineResample::Deasserted,
+                })
+            }
+        }
+        let mut d = ExitDispatcher::new();
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let id = d
+            .register_mmio(0x0a00_0000, 0x200, Box::new(block))
+            .unwrap();
+        let h = MmioHandler::with_dispatcher(d).with_ack_routes(vec![(id, Arc::new(Fake))]);
+        assert_eq!(h.interrupt_ack_count(), 0);
+        assert_eq!(h.ack_routes.len(), 1);
+    }
 
     /// 共有の dispatcher へ後から登録したデバイスが、ハンドラ側から見える（同じ実体を指す）。
     #[test]

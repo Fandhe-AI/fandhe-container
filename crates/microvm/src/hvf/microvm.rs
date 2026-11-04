@@ -11,6 +11,8 @@
 //! 3. ゲスト RAM の登録（`HvfGuestRam::register_shared`。対応付けが `Arc<HvVm>` を保持する）。
 //! 4. Image・initrd・FDT の配置（`load_arm64`。Image ヘッダの検証はここ）。
 //! 5. virtio-mmio のデバイス群を `ExitDispatcher` に登録し、各デバイスの割り込みを `GicSpiLine` に結ぶ（block → net の順）。
+//!    線の注入方式が FDT の trigger と一致するかをここで照合し（不一致は `InvalidArgument`）、`InterruptACK` の後処理
+//!    （level 扱いの deassert / resample。#3863）の route を `MmioHandler` へ結ぶ。
 //! 6. vCPU スレッドの作成。vCPU 0 の `setup` で X0 = FDT の GPA・X1〜X3 = 0・PC = カーネルのエントリ・CPSR = `0x3c5`・
 //!    MPIDR_EL1 = FDT の `cpu@0` の `reg` を書き、読み戻して照合する。`SCTLR_EL1` は書かず、既定値で MMU・D-cache が off
 //!    （M = 0・C = 0）であることだけを確かめる（違反は `FailedPrecondition`）。
@@ -52,6 +54,7 @@ use crate::hvf::mmio::MmioHandler;
 use crate::hvf::timer::TimerHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
+use crate::interrupt::{BoundAckRoute, InterruptAckRoute, InterruptLine};
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
 use crate::virtio_net::{NetBackend, VirtioNet};
@@ -119,7 +122,7 @@ pub struct HvfDeviceInfo {
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・窓・割り込み線）。
 struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
-    /// QueueNotify の処理（#3798）が型つきで触る。dispatcher と共有する。
+    /// QueueNotify の処理（#3798）と ACK の route（#3863）が型つきで触る。dispatcher と共有する。
     #[allow(dead_code)]
     transport: Arc<Mutex<VirtioMmioTransport<D>>>,
     id: DeviceId,
@@ -178,6 +181,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
     ) -> Result<HvfBoundDevice<D>, MicrovmError> {
         let window = layout.virtio_mmio_window(index)?;
         let line = vm.spi_line(layout, index)?;
+        layout.check_virtio_injection(line.injection())?;
         let id = self
             .dispatcher
             .lock()
@@ -193,6 +197,26 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             window,
             line,
         })
+    }
+}
+
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDeviceBus<B, N> {
+    /// 全デバイスの `InterruptACK` の後処理（#3863）。
+    fn ack_routes(&self) -> Vec<(DeviceId, Arc<dyn InterruptAckRoute>)> {
+        fn route<D: crate::virtio_mmio::VirtioDevice + Send + 'static>(
+            d: &HvfBoundDevice<D>,
+        ) -> (DeviceId, Arc<dyn InterruptAckRoute>) {
+            (
+                d.id,
+                Arc::new(BoundAckRoute {
+                    transport: Arc::clone(&d.transport),
+                    line: d.line.clone(),
+                }),
+            )
+        }
+        let b = self.block.iter().map(route);
+        let n = self.net.iter().map(route);
+        b.chain(n).collect()
     }
 }
 
@@ -305,7 +329,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .map_err(|_| internal("boot readback was recorded twice"))
             },
             ExitHandlers {
-                mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher)),
+                mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
+                    .with_ack_routes(devices.ack_routes()),
                 hvc: HvcHandler::new(),
                 timer: TimerHandler::new(),
             },

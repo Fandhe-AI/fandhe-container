@@ -2,6 +2,8 @@
 //!
 //! ゲストカーネルのコンソール（`console=ttyS0`）の出力をホストが受け取るためのデバイスモデル。
 //! レジスタモデル（[`Uart16550`]）と、PIO バス・ホストで共有するハンドル（[`SerialConsole`]）を持つ。
+//! arm64 ゲストは MMIO（FDT の `ns16550a`・`reg-shift = 0`・`reg-io-width = 1`）でも同じモデルを使う
+//! ([`SerialConsole::mmio_device`]。#3864・MVM-5)。HvfMicroVm への結線は後続（REPAIR-3）。
 //! `microvm::DeviceBus`（Linux のみ）が [`SerialConsole::port_device`] を
 //! `crate::dispatch::ExitDispatcher::register_pio` に `(COM1_BASE, UART_PORT_LEN, ..)` で常に登録し、
 //! ホストは `microvm::MicroVm::serial_console` / `microvm::RunningMicroVm::serial_console` で得た
@@ -36,8 +38,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::dispatch::{PortIoDevice, PortIoOutcome};
+use crate::dispatch::{MmioDevice, PortIoDevice, PortIoOutcome};
 use crate::error::{MicrovmError, MicrovmErrorCode};
+use crate::virtio_mmio::{IgnoredAccess, MmioReadOutcome, MmioWriteOutcome};
 
 /// COM1 の基底ポート。
 pub const COM1_BASE: u16 = 0x3f8;
@@ -310,6 +313,62 @@ impl SerialConsole {
     }
 }
 
+impl SerialConsole {
+    /// arm64 の MMIO バス用デバイス（同じバッファを共有する。#3864・MVM-5）を作る。
+    ///
+    /// FDT の `reg-shift = 0`・`reg-io-width = 1` に合わせ、受けるのは 1 バイト幅・offset 0..8 のみ。
+    pub fn mmio_device(&self) -> Box<dyn MmioDevice> {
+        Box::new(SharedUartMmio(Arc::clone(&self.inner)))
+    }
+}
+
+/// MMIO 用の共有ラッパー。幅・offset を検査してから [`Uart16550`] へ委ね、lock の poison は `Ignored`（fail-closed）。
+struct SharedUartMmio(Arc<Mutex<Uart16550>>);
+
+impl SharedUartMmio {
+    fn reg(offset: u64, width: usize) -> Option<u16> {
+        if width != 1 {
+            return None;
+        }
+        u16::try_from(offset).ok().filter(|o| *o < UART_PORT_LEN)
+    }
+}
+
+impl MmioDevice for SharedUartMmio {
+    fn read(&self, offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+        let Some(reg) = Self::reg(offset, data.len()) else {
+            data.fill(0);
+            return MmioReadOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth);
+        };
+        match self.0.lock() {
+            Ok(mut u) => match PortIoDevice::read(&mut *u, reg, data) {
+                PortIoOutcome::Handled => MmioReadOutcome::Handled,
+                _ => {
+                    data.fill(0);
+                    MmioReadOutcome::Ignored(IgnoredAccess::UnknownRegister)
+                }
+            },
+            Err(_) => {
+                data.fill(0);
+                MmioReadOutcome::Ignored(IgnoredAccess::UnknownRegister)
+            }
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
+        let Some(reg) = Self::reg(offset, data.len()) else {
+            return MmioWriteOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth);
+        };
+        match self.0.lock() {
+            Ok(mut u) => match PortIoDevice::write(&mut *u, reg, data) {
+                PortIoOutcome::Handled => MmioWriteOutcome::Handled,
+                _ => MmioWriteOutcome::Ignored(IgnoredAccess::UnknownRegister),
+            },
+            Err(_) => MmioWriteOutcome::Ignored(IgnoredAccess::UnknownRegister),
+        }
+    }
+}
+
 /// dispatcher に登録する共有ラッパー。lock の poison には応答しない（read は dispatcher が 0xFF 埋め）。
 struct SharedUart(Arc<Mutex<Uart16550>>);
 
@@ -471,5 +530,64 @@ mod tests {
         let mut buf = [0u8; 1];
         assert_eq!(dev.read(5, &mut buf), PortIoOutcome::Ignored);
         assert_eq!(dev.write(0, b"a"), PortIoOutcome::Ignored);
+    }
+
+    /// MVM-5・#3864: MMIO アダプタ経由の THR 書き込みがコンソールの出力に届く。
+    #[test]
+    fn mvm5_3864_mmio_adapter_writes_reach_console() {
+        let console = SerialConsole::new();
+        let mut dev = console.mmio_device();
+        assert_eq!(dev.write(0, b"h"), MmioWriteOutcome::Handled);
+        assert_eq!(dev.write(0, b"i"), MmioWriteOutcome::Handled);
+        assert_eq!(console.take_output().unwrap(), b"hi".to_vec());
+    }
+
+    /// MVM-5・#3864: LSR（offset 5）は 0x60。
+    #[test]
+    fn mvm5_3864_mmio_adapter_reads_lsr() {
+        let console = SerialConsole::new();
+        let dev = console.mmio_device();
+        let mut buf = [0xffu8; 1];
+        assert_eq!(dev.read(5, &mut buf), MmioReadOutcome::Handled);
+        assert_eq!(buf, [0x60]);
+    }
+
+    /// MVM-5・#3864: 幅違い・範囲外 offset は無視し、読み出しは 0 埋め。
+    #[test]
+    fn mvm5_3864_mmio_adapter_rejects_bad_access() {
+        let console = SerialConsole::new();
+        let mut dev = console.mmio_device();
+        let mut wide = [0xffu8; 4];
+        assert_eq!(
+            dev.read(0, &mut wide),
+            MmioReadOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth)
+        );
+        assert_eq!(wide, [0; 4]);
+        let mut one = [0xffu8; 1];
+        assert!(matches!(dev.read(8, &mut one), MmioReadOutcome::Ignored(_)));
+        assert_eq!(one, [0]);
+        assert!(matches!(dev.write(8, b"x"), MmioWriteOutcome::Ignored(_)));
+        assert!(matches!(
+            dev.write(0, b"abcd"),
+            MmioWriteOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth)
+        ));
+        assert_eq!(console.take_output().unwrap(), Vec::<u8>::new());
+    }
+
+    /// MVM-5・REPAIR-5・#3864: lock が poison しても panic せず `Ignored`。
+    #[test]
+    fn mvm5_3864_mmio_adapter_poison_fails_closed() {
+        let console = SerialConsole::new();
+        let inner = Arc::clone(&console.inner);
+        let _ = std::thread::spawn(move || {
+            let _g = inner.lock().unwrap();
+            panic!("poison the uart lock");
+        })
+        .join();
+        let mut dev = console.mmio_device();
+        let mut buf = [0xffu8; 1];
+        assert!(matches!(dev.read(5, &mut buf), MmioReadOutcome::Ignored(_)));
+        assert_eq!(buf, [0]);
+        assert!(matches!(dev.write(0, b"a"), MmioWriteOutcome::Ignored(_)));
     }
 }

@@ -14,7 +14,8 @@
 //! - [`PsciAction::SystemOff`] と [`PsciAction::SystemReset`] は区別して返す。ただし `hvf::hvc` はどちらも
 //!   `StopReason::GuestShutdown` に写す（再起動は対象外。区別が要る時は `StopReason` へ足し、plugin-microvm の固定名と揃える）。
 //! - PSCI_FEATURES は [`is_implemented`] の単一の表から導くため、実処理との不一致は起きない（試験で機械照合する）。
-//! - CPU_ON（32 / 64 bit）は NOT_SUPPORTED。vCPU は 1 つだけで、FEATURES も NOT_SUPPORTED を返し一致させる。
+//! - CPU_ON（32 / 64 bit）は NOT_SUPPORTED。HVF のバックエンドは vCPU 1 つだけ（FDT は `cpu@N` を複数出せる。#3864）で、FEATURES も NOT_SUPPORTED を返し一致させる。
+//!   vCPU 1..N のスレッドと CPU_ON の実装は後続（REPAIR-3）。
 //!   DEN0022 の CPU_ON の戻り値は SUCCESS・INVALID_PARAMETERS・INVALID_ADDRESS・ALREADY_ON・ON_PENDING・INTERNAL_FAILURE・DENIED の認識で、
 //!   NOT_SUPPORTED は列挙に無い。これは DEN0022 からの逸脱で、SMP を入れるときに見直す（一次情報での再確認は #3803 の実機記録と合わせて行う）。
 //!

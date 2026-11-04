@@ -6,8 +6,15 @@
 //! `crate::irq::IrqFd`（`KVM_IRQFD`）、macOS は `crate::hvf::gic::GicSpiLine`（`hv_gic_set_spi`。#3795）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
 //! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
-//! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みは edge 扱いで、
-//! resamplefd による level の再注入は未実装（TASK-75 で再検討。REPAIR-3）。
+//! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みの既定は edge 扱い。
+//!
+//! # level 扱いの SPI（#3863・MVM-5・MVM-1）
+//! macOS の `hv_gic_set_spi(intid, level)` は level 形の API のため、FDT の trigger を level-high にする構成では
+//! ゲストの `InterruptACK` の書き込み（virtio-mmio の `InterruptStatus` は読み取りで消えない。VIRTIO 1.2 4.2.2）の後に
+//! 線を下げる（deassert）か、要因が残っていれば上げ直す（resample）必要がある。その判断を [`InterruptLine::resample`] と
+//! [`complete_interrupt_ack`] に置く。ACK 後の線の値は、トランスポートの lock の下で読んだ `interrupt_status != 0` で決める
+//! （線ごとの状態は持たない）。Linux の KVM の resamplefd（`KVM_IRQFD_FLAG_RESAMPLE`）による level の再注入は未実装
+//! （`IrqFd` は edge のまま。REPAIR-3）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestMemory, GuestMemoryBacking};
@@ -15,10 +22,105 @@ use crate::virtio_block::{BlockBackend, BlockQueueStats, VirtioBlock};
 use crate::virtio_mmio::{DeviceStatus, InterruptReason, VirtioMmioTransport, reg};
 use crate::virtio_net::{NetBackend, NetRxStats, NetTxStats, VirtioNet};
 
+/// 割り込み線の注入方式（FDT の `interrupts` の trigger 種別と一致させる。照合は `arm64_layout` の `check_virtio_spi_injection`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IrqTrigger {
+    /// edge-rising。`trigger` で 1 回起こすだけで、ACK 後の操作は要らない。
+    EdgeRising,
+    /// level-high。`trigger` で線を上げ、ACK 後に [`InterruptLine::resample`] で下げる（要因が残れば上げ直す）。
+    LevelHigh,
+}
+
+/// [`InterruptLine::resample`] が線に対して行ったこと（REPAIR-4: 真偽値にしない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LineResample {
+    /// edge 扱いの線、または resample を持たない線。何もしていない。
+    NotApplicable,
+    /// 要因が無くなったため線を下げた（deassert）。
+    Deasserted,
+    /// 要因が残っているため線を上げたままにした（上げ直した）。
+    Reasserted,
+}
+
 /// ゲストへの割り込み 1 回分の注入口。
 pub trait InterruptLine {
-    /// 割り込みを 1 回注入する。失敗はホスト側の問題（ゲストの入力では起きない）。
+    /// 割り込みを 1 回注入する（level 扱いでは線を上げる）。失敗はホスト側の問題（ゲストの入力では起きない）。
     fn trigger(&self) -> Result<(), MicrovmError>;
+
+    /// この線の注入方式。既定は edge（Linux の `IrqFd` と試験の偽物）。
+    fn injection(&self) -> IrqTrigger {
+        IrqTrigger::EdgeRising
+    }
+
+    /// `InterruptACK` の後に線の値を要因の残りに合わせる。`pending` は ACK 後に `interrupt_status != 0` か。
+    /// 既定は何もしない（edge）。level 扱いの実装は `pending == false` で下げ、`true` で上げ直す。
+    fn resample(&self, _pending: bool) -> Result<LineResample, MicrovmError> {
+        Ok(LineResample::NotApplicable)
+    }
+}
+
+/// [`complete_interrupt_ack`] の結果（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptAckReport {
+    /// ACK 後に残っている `interrupt_status`。
+    pub remaining: u32,
+    /// 線に対して行ったこと。
+    pub resample: LineResample,
+}
+
+/// ゲストの `InterruptACK` を処理した後に、線の値を `interrupt_status` に合わせる（#3863・MVM-5・MVM-1）。
+///
+/// 呼び出し元は MMIO exit が `MmioWriteOutcome::InterruptAcknowledged` を返したとき（macOS では `hvf::mmio`）で、
+/// `transport` の lock を持った状態で呼ぶ（デバイスの完了通知と ACK の競合で割り込みを取りこぼさないため）。
+/// [`complete_block_notify`] と対になる。待ちは持たない（REPAIR-5 不要）。失敗は線の失敗だけ。
+pub fn complete_interrupt_ack<D: crate::virtio_mmio::VirtioDevice>(
+    transport: &VirtioMmioTransport<D>,
+    line: &dyn InterruptLine,
+) -> Result<InterruptAckReport, MicrovmError> {
+    let remaining = transport.interrupt_status();
+    let resample = line.resample(remaining != 0)?;
+    Ok(InterruptAckReport {
+        remaining,
+        resample,
+    })
+}
+
+/// `InterruptACK` の後処理の口（MMIO exit 側が dispatcher の lock を解放した後に呼ぶ）。
+pub trait InterruptAckRoute: Send + Sync + std::fmt::Debug {
+    /// トランスポートの lock を取って [`complete_interrupt_ack`] を呼ぶ。
+    fn on_interrupt_ack(&self) -> Result<InterruptAckReport, MicrovmError>;
+}
+
+/// 共有トランスポートと割り込み線を束ねた [`InterruptAckRoute`]（macOS の `HvfDeviceBus` が 1 台ごとに作る）。
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+// Linux の本番経路（edge の `IrqFd`）は ACK の後処理を持たず、使うのは macOS と試験だけ。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) struct BoundAckRoute<D: crate::virtio_mmio::VirtioDevice, L> {
+    pub(crate) transport: std::sync::Arc<std::sync::Mutex<VirtioMmioTransport<D>>>,
+    pub(crate) line: L,
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<D: crate::virtio_mmio::VirtioDevice, L> std::fmt::Debug for BoundAckRoute<D, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundAckRoute").finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<D, L> InterruptAckRoute for BoundAckRoute<D, L>
+where
+    D: crate::virtio_mmio::VirtioDevice + Send,
+    L: InterruptLine + Send + Sync,
+{
+    fn on_interrupt_ack(&self) -> Result<InterruptAckReport, MicrovmError> {
+        let t = self.transport.lock().map_err(|_| {
+            MicrovmError::new(MicrovmErrorCode::Internal, "virtio transport lock poisoned")
+        })?;
+        complete_interrupt_ack(&t, &self.line)
+    }
 }
 
 /// ioeventfd で監視するゲストの書き込み先。
@@ -303,6 +405,161 @@ pub fn poll_net_rx<B: NetBackend, M: GuestMemoryBacking>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spi::SpiLine;
+    use crate::spi::tests::RecordingGic;
+    use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
+    use crate::virtio_mmio::MmioWriteOutcome;
+
+    fn block_transport() -> VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>> {
+        VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap()
+    }
+
+    /// MVM-5・MVM-1（#3863）: assert → ACK → deassert の呼び出し列が `(intid, level)` で具体値になる。
+    #[test]
+    fn mvm5_3863_transport_ack_drives_level_deassert() {
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let mut t = block_transport();
+        t.raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger().unwrap();
+        let out = t.write(reg::INTERRUPT_ACK, &1u32.to_le_bytes());
+        assert_eq!(out, MmioWriteOutcome::InterruptAcknowledged);
+        let r = complete_interrupt_ack(&t, &line).unwrap();
+        assert_eq!(
+            r,
+            InterruptAckReport {
+                remaining: 0,
+                resample: LineResample::Deasserted
+            }
+        );
+        assert_eq!(gic.calls(), vec![(48, true), (48, false)]);
+    }
+
+    /// 部分 ACK で要因が残れば線を上げ直す。
+    #[test]
+    fn mvm5_3863_transport_partial_ack_reasserts() {
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let mut t = block_transport();
+        t.raise_interrupt(InterruptReason::UsedBuffer);
+        t.raise_interrupt(InterruptReason::ConfigChange);
+        line.trigger().unwrap();
+        t.write(reg::INTERRUPT_ACK, &1u32.to_le_bytes());
+        let r = complete_interrupt_ack(&t, &line).unwrap();
+        assert_eq!(r.remaining, 2);
+        assert_eq!(r.resample, LineResample::Reasserted);
+        assert_eq!(gic.calls(), vec![(48, true), (48, true)]);
+    }
+
+    /// edge の線は ACK で何も呼ばない。
+    #[test]
+    fn mvm5_3863_edge_line_ack_is_noop() {
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::EdgeRising);
+        let mut t = block_transport();
+        t.raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger().unwrap();
+        t.write(reg::INTERRUPT_ACK, &1u32.to_le_bytes());
+        let r = complete_interrupt_ack(&t, &line).unwrap();
+        assert_eq!(r.resample, LineResample::NotApplicable);
+        assert_eq!(gic.calls(), vec![(48, true)]);
+    }
+
+    /// dispatcher 経由の ACK exit が `InterruptAcknowledged` を返し、`BoundAckRoute` で deassert される。
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn mvm5_3863_bound_ack_route_deasserts() {
+        use crate::dispatch::{DispatchOutcome, ExitDispatcher, MmioAccess};
+        use crate::exit::VcpuExit;
+        use crate::virtio_mmio::SharedTransport;
+        use std::sync::{Arc, Mutex};
+
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let transport = Arc::new(Mutex::new(block_transport()));
+        let mut d = ExitDispatcher::new();
+        d.register_mmio(
+            0x0a00_0000,
+            0x200,
+            Box::new(SharedTransport(Arc::clone(&transport))),
+        )
+        .unwrap();
+        transport
+            .lock()
+            .unwrap()
+            .raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger().unwrap();
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&1u32.to_le_bytes());
+        let out = d
+            .dispatch(&VcpuExit::Mmio {
+                phys_addr: 0x0a00_0000 + reg::INTERRUPT_ACK,
+                data,
+                len: 4,
+                is_write: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            out,
+            DispatchOutcome::Mmio {
+                access: MmioAccess::Write(MmioWriteOutcome::InterruptAcknowledged),
+                ..
+            }
+        ));
+        let route = BoundAckRoute { transport, line };
+        let r = route.on_interrupt_ack().unwrap();
+        assert_eq!(r.resample, LineResample::Deasserted);
+        assert_eq!(gic.calls(), vec![(48, true), (48, false)]);
+    }
+
+    /// level 線が assert されたままゲストが Status=0 でリセットすると、`DeviceReset` の後処理で deassert される。
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn mvm5_3863_reset_deasserts_level_line() {
+        use crate::dispatch::{DispatchOutcome, ExitDispatcher, MmioAccess};
+        use crate::exit::VcpuExit;
+        use crate::virtio_mmio::SharedTransport;
+        use std::sync::{Arc, Mutex};
+
+        let gic = RecordingGic::default();
+        let line = SpiLine::new(gic.clone(), 48, IrqTrigger::LevelHigh);
+        let transport = Arc::new(Mutex::new(block_transport()));
+        let mut d = ExitDispatcher::new();
+        d.register_mmio(
+            0x0a00_0000,
+            0x200,
+            Box::new(SharedTransport(Arc::clone(&transport))),
+        )
+        .unwrap();
+        transport
+            .lock()
+            .unwrap()
+            .raise_interrupt(InterruptReason::UsedBuffer);
+        line.trigger().unwrap();
+        let out = d
+            .dispatch(&VcpuExit::Mmio {
+                phys_addr: 0x0a00_0000 + reg::STATUS,
+                data: [0u8; 8],
+                len: 4,
+                is_write: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            out,
+            DispatchOutcome::Mmio {
+                access: MmioAccess::Write(MmioWriteOutcome::DeviceReset),
+                ..
+            }
+        ));
+        let route = BoundAckRoute { transport, line };
+        let r = route.on_interrupt_ack().unwrap();
+        assert_eq!(r.remaining, 0);
+        assert_eq!(r.resample, LineResample::Deasserted);
+        assert_eq!(gic.calls(), vec![(48, true), (48, false)]);
+    }
 
     #[test]
     fn mvm1_879_io_event_spec_table() {

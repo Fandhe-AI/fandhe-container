@@ -304,6 +304,9 @@ pub enum MmioWriteOutcome {
     Ignored(IgnoredAccess),
     /// 指定キューが kick された。
     QueueNotify(u16),
+    /// `InterruptACK` を受け、`interrupt_status` を更新した。level 扱いの割り込み線は呼び出し元が
+    /// `crate::interrupt::complete_interrupt_ack` で deassert / resample する（#3863・MVM-5）。Status=0 のリセット（`DeviceReset`）も `interrupt_status` を 0 にするため同じ後処理を要する。
+    InterruptAcknowledged,
     /// ready だったキューが QueueReady=0 で停止された（動作開始後も受理する。呼び出し元はデバイス側の
     /// キュー処理をこの通知と同期して止める）。
     QueueStopped(u16),
@@ -634,7 +637,7 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             }
             reg::INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
-                Ok(MmioWriteOutcome::Handled)
+                Ok(MmioWriteOutcome::InterruptAcknowledged)
             }
             reg::STATUS => Ok(self.write_status(value)),
             reg::MAGIC

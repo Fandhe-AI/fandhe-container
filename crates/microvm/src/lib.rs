@@ -40,6 +40,7 @@
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
 //! TASK-192.7・#3790・MVM-5・MVM-1: arm64 の Image・initrd・FDT の配置と起動レジスタの値（`boot_arm64`。OS 非依存・`unsafe` なし）。
+//! TASK-192.10・#3793・MVM-5・MVM-1: macOS の MMIO の data abort を `VcpuExit::Mmio` へ写す純関数群（`mmio_abort`。OS 非依存・`unsafe` なし）。
 //! TASK-192.8・#3785・MVM-5: arm64 の ESR（例外 syndrome）の復号（`esr`。OS 非依存・`unsafe` なし）。
 //! TASK-192.1・#3783・MVM-5: macOS（Apple Silicon）の Hypervisor.framework の VM・ゲストメモリ（`hvf`・`hvf_abi`。
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
@@ -47,7 +48,7 @@
 //! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
 //! TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5: macOS の vCPU 専用スレッドと実行ループ・exit の分類・期限つきの停止（`hvf_loop` は OS 非依存の
 //! コアで、偽の実行体の単体テストが全 OS で走る。macOS かつ aarch64 のみ `hvf::{VcpuThread, VcpuHandle}`。exit ごとの処理
-//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::{mmio, timer}` はスタブで実処理は #3793・#3796）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
+//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::mmio` は #3793 で実装済み。`hvf::timer` はスタブで実処理は #3796）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
@@ -91,6 +92,7 @@ pub mod irq;
 pub mod lapic_x86;
 #[cfg(target_os = "linux")]
 pub mod microvm;
+pub mod mmio_abort;
 pub mod psci;
 pub mod smp_x86;
 pub mod stop;

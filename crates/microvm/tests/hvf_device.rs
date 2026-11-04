@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.11・#3794・TASK-192.15・#3797）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -706,6 +706,191 @@ fn hvf_device_psci_version_then_system_off() {
     mapping.unmap().unwrap();
     drop(vm);
 }
+
+/// `hvf_device_mmio_reaches_virtio_mmio` のゲストプログラム（arm64。`llvm-mc -triple=aarch64 -show-encoding` で符号化）。
+///
+/// MagicValue（offset 0）と Version（offset 4）を `ldr w` で読み、期待値（0x7472_6976）と比べる。一致なら窓 1 の offset 0 へ
+/// 目印 0x600d と Version を続けて書き、不一致なら 0xbad を書く。Version の書き込みが 2 回目の書き込みとして届くことで、
+/// 「PC が二重に進んで命令が飛ぶ」「IPA の下位ビットが落ちて Version が MagicValue に化ける」を判別できる。
+const MMIO_GUEST_CODE: [u32; 14] = [
+    0xD2A1_4000, // movz x0, #0x0a00, lsl #16        ; 窓 0（virtio-block）
+    0xB940_0001, // ldr  w1, [x0]                    ; MagicValue
+    0x528D_2EC2, // movz w2, #0x6976                 ; 期待値の下位（負の対照は 0x6977 に差し替える）
+    0x72AE_8E42, // movk w2, #0x7472, lsl #16
+    0xB940_0404, // ldr  w4, [x0, #4]                ; Version
+    0x6B02_003F, // cmp  w1, w2
+    0x5400_00A1, // b.ne bad
+    0x528C_01A3, // movz w3, #0x600d
+    0xB902_0003, // str  w3, [x0, #0x200]            ; 窓 1 の offset 0
+    0xB902_0004, // str  w4, [x0, #0x200]
+    0x1400_0000, // b .
+    0x5281_75A3, // bad: movz w3, #0xbad
+    0xB902_0003, // str  w3, [x0, #0x200]
+    0x1400_0000, // b .
+];
+/// 負の対照用に差し替える `movz w2, #0x6977`（期待値を 0x7472_6977 にする）。
+const MMIO_GUEST_MOVZ_WRONG: u32 = 0x528D_2EE2;
+
+/// MMIO の data abort がデバイスモデルへ届き、読み出し値がレジスタへ戻り、PC が進むことを確かめる。
+/// virtio-block（窓 0）の MagicValue / Version を読み、窓 1 の観測器へゲストが書いた値を具体値で照合する。
+/// 不一致の負の対照（期待値を 1 ずらした同じゲスト）も回す。実機で未観測の前提（PC の自動前進の有無・IPA の下位ビット）は
+/// 値の食い違いとして失敗する（記録は人間担当の #3803）。TASK-192.10・#3793・MVM-5・MVM-1。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_mmio_reaches_virtio_mmio() {
+    use fandhe_container_microvm::dispatch::{ExitDispatcher, MmioDevice};
+    use fandhe_container_microvm::hvf::hvc::HvcHandler;
+    use fandhe_container_microvm::hvf::mmio::MmioHandler;
+    use fandhe_container_microvm::hvf::timer::TimerHandler;
+    use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
+    use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
+    use fandhe_container_microvm::stop::StopReason;
+    use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
+    use fandhe_container_microvm::virtio_mmio::{
+        MmioReadOutcome, MmioWriteOutcome, VirtioMmioTransport,
+    };
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const BASE: u64 = 0x4000_0000;
+    /// 観測器の記録の上限（ゲストが連打してもホストのメモリを増やさない）。
+    const MAX_RECORDS: usize = 16;
+
+    /// 窓 1 に置く観測器。書き込みを `(offset, 4 バイトの値)` で記録し、読み出しは 0。
+    struct Recorder(Arc<Mutex<Vec<(u64, u32)>>>);
+    impl MmioDevice for Recorder {
+        fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+            data.fill(0);
+            MmioReadOutcome::Handled
+        }
+        fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
+            let mut v = [0u8; 4];
+            for (d, s) in v.iter_mut().zip(data.iter()) {
+                *d = *s;
+            }
+            let mut g = self.0.lock().unwrap();
+            if g.len() < MAX_RECORDS {
+                g.push((offset, u32::from_le_bytes(v)));
+            }
+            MmioWriteOutcome::Handled
+        }
+    }
+
+    // 全体期限の watchdog（REPAIR-5）。
+    let finished = Arc::new(AtomicBool::new(false));
+    struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = {
+        let flag = Arc::clone(&finished);
+        let h = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < VCPU_THREAD_DEADLINE {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+        WatchdogGuard(Arc::clone(&finished), Some(h))
+    };
+
+    let layout = Arm64Layout::new(4 << 20, 1, 2).unwrap();
+    let win0 = layout.virtio_mmio_window(0).unwrap().base.raw();
+    let win1 = layout.virtio_mmio_window(1).unwrap().base.raw();
+    // ゲストコードに固定した値と配置の一致。
+    assert_eq!(win0, 0x0a00_0000);
+    assert_eq!(win1, 0x0a00_0200);
+    assert_eq!(layout.ram.base.raw(), BASE);
+
+    let vm = Arc::new(create_vm_with_gic_or_precondition(&layout));
+    let page = HostMapping::page_size().unwrap();
+    // 場面 A のコードは BASE、場面 B（期待値を差し替えた同じゲスト）は BASE + page。
+    let mut host_a = HostMapping::new(page).unwrap();
+    let mut host_b = HostMapping::new(page).unwrap();
+    for (i, w) in MMIO_GUEST_CODE.iter().enumerate() {
+        host_a.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+        let w_b = if i == 2 { MMIO_GUEST_MOVZ_WRONG } else { *w };
+        host_b.write_bytes(i * 4, &w_b.to_le_bytes()).unwrap();
+    }
+    let map_a = vm
+        .vm()
+        .map(host_a, 0, BASE, page, MemoryFlags::RWX)
+        .unwrap();
+    let map_b = vm
+        .vm()
+        .map(host_b, 0, BASE + page as u64, page, MemoryFlags::RWX)
+        .unwrap();
+
+    // 1 場面を走らせ、観測器の記録が `expect.len()` 件になるまで待って停止する。
+    let run = |pc: u64, expect: &[(u64, u32)]| -> u64 {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = ExitDispatcher::new();
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        dispatcher
+            .register_mmio(win0, 0x200, Box::new(block))
+            .unwrap();
+        dispatcher
+            .register_mmio(win1, 0x200, Box::new(Recorder(Arc::clone(&records))))
+            .unwrap();
+        let handlers = ExitHandlers {
+            mmio: MmioHandler::with_dispatcher(dispatcher),
+            hvc: HvcHandler::new(),
+            timer: TimerHandler::new(),
+        };
+        let counts = Arc::new(ExitCounts::new());
+        let config = VcpuThreadConfig {
+            observer: Some(counts.clone()),
+            ..VcpuThreadConfig::default()
+        };
+        let setup = move |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
+            vcpu.set_reg(HvReg::PC, pc)?;
+            // EL1h と DAIF のマスク。
+            vcpu.set_reg(HvReg::CPSR, 0x3c5)
+        };
+        let handle = VcpuThread::spawn(Arc::clone(&vm), setup, handlers, config).unwrap();
+        let start = Instant::now();
+        while records.lock().unwrap().len() < expect.len()
+            && !handle.is_finished()
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 余計な書き込みが続いていないことを見るため少し待つ。
+        std::thread::sleep(Duration::from_millis(100));
+        let got = records.lock().unwrap().clone();
+        eprintln!("hvf_device: mmio: pc={pc:#x} records={got:x?}");
+        let report = handle.stop(Duration::from_secs(1)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(got.as_slice(), expect);
+        counts.count(ExitKind::DataAbort)
+    };
+
+    // 場面 A（正）: MagicValue が一致 → 0x600d、続けて Version(2)。data abort は読み 2 + 書き 2。
+    let aborts = run(BASE, &[(0, 0x600d), (0, 2)]);
+    eprintln!("hvf_device: mmio: scenario A data aborts={aborts}");
+    assert_eq!(aborts, 4);
+    // 場面 B（負の対照）: 期待値を 0x7472_6977 にしたゲストは不一致の目印 0xbad だけを書く。
+    let aborts = run(BASE + page as u64, &[(0, 0xbad)]);
+    eprintln!("hvf_device: mmio: scenario B data aborts={aborts}");
+    assert_eq!(aborts, 3);
+
+    map_a.unmap().unwrap();
+    map_b.unmap().unwrap();
+    drop(vm);
+}
+
 /// 組み立ての試験の全体期限。ハングを失敗として残す（REPAIR-5）。
 const ASSEMBLE_DEADLINE: Duration = Duration::from_secs(30);
 

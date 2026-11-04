@@ -16,7 +16,8 @@
 //! 6. vCPU スレッドの作成（#3884）。まず vCPU 0 を `spawn_gated` で作り、続けて vCPU 1..N（AP）を `spawn_parked_ap` で順に作る。
 //!    全 vCPU の作成は start より前に終わる（vCPU が走り出すとトポロジーは確定する、に反しない）。途中の失敗は、作成済みの全台を
 //!    `stop_all` で回収してから返す。AP は `MPIDR_EL1` に `arm64_vcpu_mpidr_affinity(n)` を書いて照合し、起動要求まで parked で待つ
-//!    （CPU_ON による実起動は #3891。それまでゲストの CPU_ON(1..N) は `BootCpuOnly` により失敗の戻り値になる）。
+//!    （CPU_ON は `hvf_smp::HvfPowerControl` が entry を検査して AP のメールボックスへ積み、AP の owning thread がレジスタを書いて起動する。#3891。
+//!    `HvfPowerControl` は BSP を先に spawn する順序を保つため空のスロットで作り、AP の spawn ごとに `attach` で結ぶ。全スロットは start より前に埋まる）。
 //!    vCPU 0 の `setup` で X0 = FDT の GPA・X1〜X3 = 0・PC = カーネルのエントリ・CPSR = `0x3c5`・
 //!    MPIDR_EL1 = FDT の `cpu@0` の `reg` を書き、読み戻して照合する。`SCTLR_EL1` は書かず、既定値で MMU・D-cache が off
 //!    （M = 0・C = 0）であることだけを確かめる（違反は `FailedPrecondition`）。
@@ -68,7 +69,7 @@
 //! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当は
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
-//!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止は #3891。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
@@ -95,8 +96,9 @@ use crate::hvf_lifecycle::{
     DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, VcpuStopper, stop_and_release,
 };
 use crate::hvf_loop::log_line;
+use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::interrupt::{BoundAckRoute, InterruptAckRoute, InterruptLine};
-use crate::psci::{BootCpuOnly, PsciCpus};
+use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
@@ -379,9 +381,6 @@ impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
 struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// vCPU 0（BSP）と parked の AP（#3884）。
     vcpus: Option<VcpuSet>,
-    /// PSCI の電源状態の表。BSP のハンドラが持つのと同じ実体で、AP の起動（#3891）が共有する。
-    #[allow(dead_code)]
-    psci: Arc<PsciCpus>,
     /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
     mpidrs: Vec<u64>,
     devices: Option<HvfDeviceBus<B, N>>,
@@ -519,6 +518,11 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         let devices = HvfDeviceBus::new(&layout, &vm, block, net)?;
 
         let psci = Arc::new(PsciCpus::new(layout.vcpus)?);
+        let power = Arc::new(HvfPowerControl::new(
+            layout.vcpus,
+            layout.ram.base.raw(),
+            layout.ram.size,
+        ));
         let ap_config = vcpu.clone();
         let readback: Arc<OnceLock<ArmBootReadback>> = Arc::new(OnceLock::new());
         let slot = Arc::clone(&readback);
@@ -550,7 +554,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             ExitHandlers {
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes()),
-                hvc: HvcHandler::with_cpus(Arc::clone(&psci), Arc::new(BootCpuOnly), 0)?,
+                hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
                 timer: TimerHandler::with_waker(vm.wfi_waker()),
             },
             vcpu,
@@ -567,10 +571,33 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         // AP（vCPU 1..N）を parked で作る。途中で失敗したら、作成済みの全台を回収してから返す（残りの資源は逆順 drop）。
         let mut mpidrs = vec![boot.mpidr];
         for index in 1..layout.vcpus {
-            match VcpuThread::spawn_parked_ap(Arc::clone(&vm), index, &ap_config) {
+            let mailbox = Arc::new(ApMailbox::new());
+            let spawned =
+                HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), index).and_then(|hvc| {
+                    let handlers = ExitHandlers {
+                        mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
+                            .with_ack_routes(devices.ack_routes()),
+                        hvc,
+                        timer: TimerHandler::with_waker(vm.wfi_waker()),
+                    };
+                    VcpuThread::spawn_parked_ap(
+                        Arc::clone(&vm),
+                        index,
+                        handlers,
+                        Arc::clone(&mailbox),
+                        Arc::clone(&psci),
+                        &ap_config,
+                    )
+                });
+            match spawned {
                 Ok((ap, raw)) => {
                     vcpu_set.push_ap(ap);
                     mpidrs.push(raw);
+                    // AP が起きてから結ぶ。結べなければ（不変条件違反）全台を回収して返す。
+                    if let Err(e) = power.attach(index, mailbox) {
+                        let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+                        return Err(e);
+                    }
                 }
                 Err(e) => {
                     let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
@@ -584,7 +611,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         Ok(HvfMicroVm {
             parts: HvfVmParts {
                 vcpus: Some(vcpu_set),
-                psci,
                 mpidrs,
                 devices: Some(devices),
                 memory: Some(memory),
@@ -607,7 +633,7 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
     /// ある。その場合も `start` は成功し、終了理由（`Failed(DeadlineExceeded)`）は `stop` の報告に出る。
     pub fn start(self) -> Result<RunningHvfMicroVm<B, N>, MicrovmError> {
         let started = Instant::now();
-        // 開けるのは vCPU 0 の gate だけ。AP は CPU_ON（#3891）まで parked のまま。
+        // 開けるのは vCPU 0 の gate だけ。AP は CPU_ON（#3891。メールボックス）まで parked のまま。
         match &self.parts.vcpus {
             Some(v) => v.open_start(),
             None => {

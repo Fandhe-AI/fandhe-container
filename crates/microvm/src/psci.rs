@@ -30,9 +30,10 @@
 //! vCPU 0 は ON、他は OFF で始まる。CPU_ON は compare_exchange で OFF→ON_PENDING に進めた呼び出しだけが [`CpuPowerControl::power_on`] を呼ぶ
 //! （同じ対象への二重起動を防ぐ）。DEN0022 §6.6 Figure 9 の遷移に合わせ、ON の対象への CPU_ON は ALREADY_ON、
 //! ON_PENDING の対象への CPU_ON は ON_PENDING を返す（§5.1.4・§5.6.2）。起動が失敗したら OFF へ戻す。
-//! ON_PENDING→ON は対象 vCPU が実行を始めた時点で後続 #3891 の AP スレッドが [`PsciCpus::confirm_on`] で刻む。
+//! ON_PENDING→ON は対象 vCPU がレジスタを書き終えて実行に入る直前に `hvf_smp::run_parked_ap`（#3891）が [`PsciCpus::confirm_on`] で刻む。
 //! CPU_OFF は呼び出し元自身にしか効かず、成功したら OFF にして [`PsciAction::CpuOff`] を返す。
-//! OFF にしてから実際に parked になるまでの窓（§6.6 の「処理済みで OFF」との差）の扱いは #3891 の責務。
+//! OFF にしてから実際に parked になるまでの窓（§6.6 の「処理済みで OFF」との差）では、その vCPU はゲストの命令をもう実行せず、
+//! この間の CPU_ON は AP のメールボックスに残って park に戻った時点で処理される（`hvf_smp` の「CPU_OFF の窓」）。
 //! 対象の指定（target_cpu）は MPIDR の affinity 形式（DEN0022 §5.1.4・§5.1.5。Aff3 は bit 39:32、Aff2 は bit 23:16、
 //! Aff1 は bit 15:8、Aff0 は bit 7:0。bit 63:40 と bit 31:24 は MBZ）。MBZ ビットが立つ値と存在しない vCPU は INVALID_PARAMETERS
 //! （§5.6.2 の「不正な MPIDR」・§5.7.2 の「存在しない affinity instance」の読みで、MBZ の違反を名指しする規定ではない）。
@@ -57,7 +58,7 @@
 //! 電源管理を入れるときに見直す。MIGRATE は NOT_SUPPORTED（MIGRATE_INFO_TYPE が 2 のとき DEN0022 §5.1.7 に合う）。
 //! SMCCC_VERSION に応答しない（NOT_SUPPORTED）のは、PSCI 1.0 以降で報告すべき（should。DEN0022 §5.16.2）との差で、
 //! 呼び出し元は SMCCC v1.0 の実装と解釈する（DEN0028 §7.2・§7.2.3）。NOT_PRESENT・DISABLED も返さない。
-//! HVF での AP の実起動と CPU_OFF 後の parked への戻しは #3891。
+//! HVF での AP の実起動と CPU_OFF 後の parked への戻しは `hvf_smp`（#3891）で結んだ。BSP の CPU_OFF は DENIED のまま。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -219,7 +220,7 @@ pub enum PsciAction {
     SystemOff,
     /// SYSTEM_RESET。再起動は対象外のため呼び出し側が停止に写す。
     SystemReset,
-    /// CPU_OFF が成功した。呼び出し元には戻らないので、呼び出し側は vCPU `index` を parked へ戻す（#3891）。
+    /// CPU_OFF が成功した。呼び出し元には戻らないので、呼び出し側は vCPU `index` を parked へ戻す（HVF は `ExitAction::Park`。#3891）。
     CpuOff {
         /// 停止する vCPU の index。
         index: u32,
@@ -290,7 +291,7 @@ pub enum PowerControlError {
 /// vCPU の実際の起動・停止の境界。純粋層はゲストのアドレスを知らないため、entry の妥当性もここで判断する。
 ///
 /// 契約: 呼び出し元 vCPU のスレッドから呼ばれる。実装は他の vCPU への通知だけを行い、長く待たない。
-/// 呼び出し側（[`handle_call`]）はロックを握らずに呼ぶ。HVF の実装は #3891。
+/// 呼び出し側（[`handle_call`]）はロックを握らずに呼ぶ。HVF の実装は [`crate::hvf_smp::HvfPowerControl`]（#3891）。
 pub trait CpuPowerControl: Send + Sync {
     /// vCPU `index` を `entry` から `context_id` を X0 に入れて起動する。
     fn power_on(&self, index: u32, entry: u64, context_id: u64) -> Result<(), PowerControlError>;
@@ -377,7 +378,7 @@ impl PsciCpus {
         CpuPowerState::from_raw(s.load(Ordering::SeqCst))
     }
 
-    /// ON_PENDING→ON を刻む。対象 vCPU が実行を始めた時点で #3891 の AP スレッドが呼ぶ。他の状態は `FailedPrecondition`。
+    /// ON_PENDING→ON を刻む。対象 vCPU が実行に入る直前に `hvf_smp::run_parked_ap`（#3891）が呼ぶ。他の状態は `FailedPrecondition`。
     pub fn confirm_on(&self, index: u32) -> Result<(), MicrovmError> {
         let s = self.slot(index)?;
         s.compare_exchange(

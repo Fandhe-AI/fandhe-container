@@ -23,31 +23,37 @@
 //!
 //! # AP（vCPU 1..N）の parked スレッド（#3884・MVM-5・MVM-1・REPAIR-5）
 //! [`VcpuThread::spawn_parked_ap`] は index 1 以上の vCPU を専用スレッド `hvf-vcpu-{index}` で作り、`MPIDR_EL1` に
-//! `arm64_vcpu_mpidr_affinity(index)`（FDT の `cpu@index` の `reg`）を書いて読み戻し、起動要求（CPU_ON。#3891）まで止めておく。
-//! parked の間は `hv_vcpu_run` を呼ばず、待ちに壁時計の上限は持たない（`LoopStart::ready_parked`）。vCPU の破棄は停止要求で
-//! 待ちが解けたときだけ、owning thread が `mark_teardown` の後に行う。N 台の停止は [`VcpuSet`] が `hvf_loop::stop_all` で集約する。
+//! `arm64_vcpu_mpidr_affinity(index)`（FDT の `cpu@index` の `reg`）を書いて読み戻し、起動要求（PSCI CPU_ON）まで止めておく。
+//! parked の間は `hv_vcpu_run` を呼ばず、待ちに壁時計の上限は持たない（`hvf_smp::ApMailbox::wait`）。CPU_ON は
+//! `hvf_smp::HvfPowerControl` がメールボックスへ積み、owning thread がレジスタ（X0〜X3・PC・CPSR・SCTLR_EL1）を書いて ON を確定し
+//! （`PsciCpus::confirm_on`）実行ループに入る。CPU_OFF は `ExitAction::Park` で実行ループを抜けて park に戻る（#3891）。vCPU の破棄は
+//! 停止要求（kick がメールボックスも起こす）で待ちが解けたときだけ、owning thread が `mark_teardown` の後に行う。
+//! N 台の停止は [`VcpuSet`] が `hvf_loop::stop_all` で集約し、どれか 1 台が終われば [`VcpuSet::is_finished`] が真になる。
 //!
 //! # 未実装（REPAIR-3）
-//! AP の起動（CPU_ON。AP ごとの `ExitHandlers`〔`MmioHandler::with_shared_dispatcher`・`TimerHandler`・`HvcHandler::with_cpus(.., index)`〕の
-//! 用意を含む）と CPU_OFF 後の parked への戻しは #3891。exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
+//! exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::arm64_layout::arm64_vcpu_mpidr_affinity;
-use crate::boot_arm64::check_vcpu_mpidr_readback;
+use crate::boot_arm64::{
+    ApBootRegs, SCTLR_EL1_C, SCTLR_EL1_EE, SCTLR_EL1_M, check_vcpu_mpidr_readback, sctlr_for_cpu_on,
+};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
 use crate::hvf::VmWithGic;
 use crate::hvf::{hvc, mmio, timer};
-use crate::hvf_abi::{HVF_MAX_VCPUS, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
+use crate::hvf_abi::{HVF_MAX_VCPUS, HvReg, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
 use crate::hvf_lifecycle::VcpuStopper;
 use crate::hvf_loop::{
-    ExitAction, HvExit, LoopHandle, LoopStart, ParkOutcome, VCPU_CREATE_DEADLINE_DEFAULT,
-    VCPU_RUN_SLICE, VcpuExec, VcpuExitObserver, VcpuKick, VcpuSetStopReport, VcpuStopReport,
-    run_loop, spawn_loop, stop_all,
+    ExitAction, HvExit, LoopHandle, LoopStart, VCPU_CREATE_DEADLINE_DEFAULT, VCPU_RUN_SLICE,
+    VcpuExec, VcpuExitObserver, VcpuKick, VcpuSetStopReport, VcpuStopReport, run_loop, spawn_loop,
+    stop_all,
 };
+use crate::hvf_smp::{ApMailbox, run_parked_ap};
 use crate::hvf_wake::WakingKick;
+use crate::psci::PsciCpus;
 use crate::stop::StopReason;
 use crate::sys::{HvVcpu, VcpuCanceller};
 
@@ -106,15 +112,27 @@ impl VcpuExec for HvfExec<'_> {
     }
 }
 
-impl VcpuKick for VcpuCanceller {
+/// vCPU スレッドの kick。`hv_vcpus_exit` に加え、AP ではメールボックスの待ちも起こす（parked の AP が停止要求に即応する。#3891）。
+/// BSP は `mailbox = None`。
+#[derive(Debug)]
+pub struct HvfKick {
+    canceller: VcpuCanceller,
+    mailbox: Option<Arc<ApMailbox>>,
+}
+
+impl VcpuKick for HvfKick {
     fn kick(&self) -> Result<(), MicrovmError> {
-        self.cancel()
+        let r = self.canceller.cancel();
+        if let Some(m) = &self.mailbox {
+            m.notify();
+        }
+        r
     }
 }
 
 /// 起動済みの vCPU スレッドの操作口。
 #[derive(Debug)]
-pub struct VcpuHandle(LoopHandle<WakingKick<VcpuCanceller>>);
+pub struct VcpuHandle(LoopHandle<WakingKick<HvfKick>>);
 
 impl VcpuHandle {
     /// スレッドが既に終わったか（ゲスト起因の終了を含む）。
@@ -155,12 +173,13 @@ impl VcpuSet {
         self.0.push(ap);
     }
 
-    /// vCPU 0（BSP）のスレッドが終わったか。ゲスト起因の終了は今は BSP でだけ起きる（AP の exit をきっかけにした全台の停止は #3891）。
+    /// どれか 1 台のスレッドが終わったか（空なら真）。parked の AP は停止要求か、ゲスト起因の終了（SYSTEM_OFF・fail-closed の停止）でしか
+    /// 終わらないため、AP の終了も VM 全体の終了として呼び出し元に伝わる（#3891）。理由は停止時の集約（`VcpuSetStopReport`）に出る。
     pub fn is_finished(&self) -> bool {
-        self.0.first().is_none_or(VcpuHandle::is_finished)
+        self.0.is_empty() || self.0.iter().any(VcpuHandle::is_finished)
     }
 
-    /// 実行開始の合図を BSP にだけ出す。AP の gate は開けない（CPU_ON は #3891）。
+    /// 実行開始の合図を BSP にだけ出す。AP は gate を使わず、CPU_ON のメールボックスで起きる（#3891）。
     pub fn open_start(&self) {
         if let Some(bsp) = self.0.first() {
             bsp.open_start();
@@ -208,6 +227,41 @@ fn dispatch(
     }
 }
 
+fn gpr_reg(n: u8) -> Result<HvReg, MicrovmError> {
+    HvReg::x(n).ok_or_else(|| internal("invalid general register"))
+}
+
+/// CPU_ON で起動する AP のレジスタを owning thread で書き、読み戻して照合する（#3891・MVM-5）。
+///
+/// X0〜X3・PC・CPSR は `regs` の値。`SCTLR_EL1` は CPU_OFF の前にゲストが有効にした MMU・D-cache・EE が残りうるため、
+/// 毎回 `sctlr_for_cpu_on` で M・C・EE を落とした値にする（変わらないときは書かない）。照合の不一致は fail-closed
+/// （`Internal` / `FailedPrecondition`）で、走らせない。MPIDR は spawn 時に書いて照合済みのため書き直さない。
+fn boot_ap(vcpu: &mut HvVcpu<'_>, regs: &ApBootRegs) -> Result<(), MicrovmError> {
+    for (n, value) in [(0u8, regs.x0), (1, regs.x1), (2, regs.x2), (3, regs.x3)] {
+        vcpu.set_reg(gpr_reg(n)?, value)?;
+    }
+    vcpu.set_reg(HvReg::PC, regs.pc)?;
+    vcpu.set_reg(HvReg::CPSR, regs.cpsr)?;
+    let prev = vcpu.get_sys_reg(HvSysReg::SCTLR_EL1)?;
+    let want = sctlr_for_cpu_on(prev);
+    if want != prev {
+        vcpu.set_sys_reg(HvSysReg::SCTLR_EL1, want)?;
+    }
+    if vcpu.get_reg(gpr_reg(0)?)? != regs.x0
+        || vcpu.get_reg(HvReg::PC)? != regs.pc
+        || vcpu.get_reg(HvReg::CPSR)? != regs.cpsr
+    {
+        return Err(internal("ap boot register readback does not match"));
+    }
+    if vcpu.get_sys_reg(HvSysReg::SCTLR_EL1)? & (SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_EE) != 0 {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "sctlr_el1 has mmu, d-cache or big-endian enabled at ap boot",
+        ));
+    }
+    Ok(())
+}
+
 impl VcpuThread {
     /// 専用スレッド `hvf-vcpu-0` で vCPU を作り、`setup` を実行してから実行ループを回す。
     ///
@@ -245,16 +299,20 @@ impl VcpuThread {
         Self::spawn_inner(vm, setup, handlers, config, true)
     }
 
-    /// AP（vCPU `index`。1 以上 [`HVF_MAX_VCPUS`] 未満）の専用スレッド `hvf-vcpu-{index}` を作り、起動要求まで parked で待たせる
-    /// （#3884・MVM-5・MVM-1・REPAIR-5）。戻り値の `u64` は読み戻した `MPIDR_EL1` の生の値（観測用。記録は #3803）。
+    /// AP（vCPU `index`。1 以上 [`HVF_MAX_VCPUS`] 未満）の専用スレッド `hvf-vcpu-{index}` を作り、CPU_ON まで parked で待たせる
+    /// （#3884・#3891・MVM-5・MVM-1・REPAIR-5）。戻り値の `u64` は読み戻した `MPIDR_EL1` の生の値（観測用。記録は #3803）。
     ///
     /// スレッド内で `VmWithGic::create_vcpu` → `MPIDR_EL1` の書き込み → 読み戻し → `check_vcpu_mpidr_readback` で照合し、成功したら
-    /// `ready_parked` で待つ。作成・照合の失敗は呼び出し元へ返す（`mark_teardown` は立てない。BSP の作成失敗と同じ）。停止要求で
-    /// 待ちが解けたら `mark_teardown` → owning thread での vCPU の破棄 → 戻る（`hv_vcpu_run` は呼ばないので exit は 0 件）。
-    /// 残余: `Err` の直後は、失敗したスレッドの終了処理中に VM の `Arc` が一瞬残りうる（BSP と同じ）。
+    /// `hvf_smp::run_parked_ap` に入る。`mailbox` は呼び出し元が `HvfPowerControl::attach` で結ぶものと同じ実体で、`cpus` は BSP のハンドラと
+    /// 共有する電源状態の表。`handlers` は AP 専用の exit ハンドラ（`hvc` は `HvcHandler::with_cpus(.., index)`）。作成・照合の失敗は
+    /// 呼び出し元へ返す（`mark_teardown` は立てない。BSP の作成失敗と同じ）。停止要求で待ちが解けたら `mark_teardown` → owning thread での
+    /// vCPU の破棄 → 戻る。残余: `Err` の直後は、失敗したスレッドの終了処理中に VM の `Arc` が一瞬残りうる（BSP と同じ）。
     pub fn spawn_parked_ap(
         vm: Arc<VmWithGic>,
         index: u32,
+        handlers: ExitHandlers,
+        mailbox: Arc<ApMailbox>,
+        cpus: Arc<PsciCpus>,
         config: &VcpuThreadConfig,
     ) -> Result<(VcpuHandle, u64), MicrovmError> {
         if index == 0 || index >= HVF_MAX_VCPUS {
@@ -263,16 +321,21 @@ impl VcpuThread {
                 "ap vcpu index out of range",
             ));
         }
+        check_run_deadline(config.run_slice)?;
+        let slice = config.run_slice;
+        let observer = config.observer.clone();
         let affinity = u64::from(arm64_vcpu_mpidr_affinity(index)?);
         let slot: Arc<OnceLock<u64>> = Arc::new(OnceLock::new());
         let slot_in = Arc::clone(&slot);
         let name = format!("hvf-vcpu-{index}");
-        // BSP と同じく kick を `WakingKick` で包む（AP は WFI を実行しないが、`VcpuHandle` の型を揃える。#3887）。
         let waker = vm.wfi_waker();
+        let mut handlers = handlers;
+        handlers.timer.set_waker(waker.clone());
+        let kick_mailbox = Arc::clone(&mailbox);
         let handle = spawn_loop(
             &name,
             config.create_deadline,
-            move |start: LoopStart<WakingKick<VcpuCanceller>>| {
+            move |start: LoopStart<WakingKick<HvfKick>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -295,15 +358,28 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let reason = match start.ready_parked(WakingKick::new(vcpu.canceller(), waker)) {
-                    ParkOutcome::Stopped => StopReason::Requested,
-                    // #3884 では AP の gate を誰も開けない。想定外の起動要求は推測で走らせず fail-closed で終える。
-                    _ => StopReason::Failed(MicrovmErrorCode::Unimplemented),
+                let kick = HvfKick {
+                    canceller: vcpu.canceller(),
+                    mailbox: Some(kick_mailbox),
                 };
+                let stop = start.ready(WakingKick::new(kick, waker));
+                let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
+                let reason = run_parked_ap(
+                    &mailbox,
+                    &stop,
+                    &cpus,
+                    index,
+                    &mut exec,
+                    slice,
+                    observer.as_deref(),
+                    |e, regs| boot_ap(&mut e.0, regs),
+                    |e, x| dispatch(e, &mut handlers, x),
+                );
+                let stats = exec.stats();
                 // 破棄は teardown のときだけ（以後の vCPU 作成を拒否してから owning thread で破棄する）。
                 vm.mark_teardown();
-                drop(vcpu);
-                (reason, HvRunStats::default())
+                drop(exec);
+                (reason, stats)
             },
         )?;
         match slot.get() {
@@ -335,7 +411,7 @@ impl VcpuThread {
         let handle = spawn_loop(
             "hvf-vcpu-0",
             config.create_deadline,
-            move |start: LoopStart<WakingKick<VcpuCanceller>>| {
+            move |start: LoopStart<WakingKick<HvfKick>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -349,7 +425,13 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let kick = WakingKick::new(vcpu.canceller(), waker);
+                let kick = WakingKick::new(
+                    HvfKick {
+                        canceller: vcpu.canceller(),
+                        mailbox: None,
+                    },
+                    waker,
+                );
                 let stop = if gated {
                     match start.ready_gated(kick) {
                         Ok(stop) => stop,

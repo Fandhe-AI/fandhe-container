@@ -16,8 +16,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //! FDT は `method = "hvc"` のため SMC はゲストの誤りで NOT_SUPPORTED を返す。HVF が SMC で exit するか（HCR_EL2.TSC の扱い）は
-//! 未確認で #3803 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。N 台構成（#3884）では BSP のハンドラが `PsciCpus::new(N)` と `BootCpuOnly` を持つため、CPU_ON(1..N) は `power_on` に届いて `Failed(Unimplemented)`（状態は OFF へ戻り、ゲストへは INTERNAL_FAILURE が返る。推測で成功にしない）。
-//! AP の実起動と CPU_OFF 後の parked への戻しは #3891 で結ぶ（CPU_OFF 成功の `PsciAction::CpuOff` は現状 `Err` で fail-closed。`crate::psci` の doc 参照）。
+//! 未確認で #3803 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。
+//! N 台構成（#3891）では全 vCPU のハンドラが共有の `PsciCpus` と `hvf_smp::HvfPowerControl` を持つ。CPU_ON(1..N) は entry を検査して AP のメールボックスへ積み、
+//! CPU_OFF は AP では `ExitAction::Park`（呼び出し元の vCPU を parked に戻す）、BSP では DENIED。`PsciAction::CpuOff` の index が自分と違う場合は不変条件違反で `Err`（fail-closed）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
@@ -60,7 +61,7 @@ impl HvcHandler {
         }
     }
 
-    /// 共有の電源状態表と起動停止の境界から作る（#3891 が AP のスレッドごとに使う）。`index` が表の範囲外なら `InvalidArgument`。
+    /// 共有の電源状態表と起動停止の境界から作る（BSP と AP のスレッドごとに使う。#3891）。`index` が表の範囲外なら `InvalidArgument`。
     pub fn with_cpus(
         cpus: Arc<PsciCpus>,
         power: Arc<dyn CpuPowerControl>,
@@ -108,10 +109,12 @@ pub fn handle_hvc(
         PsciAction::SystemOff | PsciAction::SystemReset => {
             Ok(ExitAction::Stop(StopReason::GuestShutdown))
         }
-        // parked へ戻す機構は #3891 まで無い。既定構成の power_off は DENIED を返すのでここには届かない（fail-closed）。
+        // CPU_OFF の成功: 呼び出し元の vCPU を parked に戻す（X0 は書かない。成功した CPU_OFF は戻らない）。
+        // 別の vCPU の index が来るのは不変条件違反なので推測で続けず止める（fail-closed）。
+        PsciAction::CpuOff { index } if index == handler.index => Ok(ExitAction::Park),
         PsciAction::CpuOff { .. } => Err(MicrovmError::new(
             MicrovmErrorCode::Internal,
-            "cpu_off parking is not implemented",
+            "cpu_off index does not match the calling vcpu",
         )),
     }
 }

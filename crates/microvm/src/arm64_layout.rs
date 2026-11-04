@@ -266,6 +266,12 @@ impl Arm64Layout {
         if matches!(self.serial, Some(r) if r.size == 0) {
             return Err(invalid("serial region size must be non-zero"));
         }
+        // UART モデルは offset 0..UART_PORT_LEN を使う。窓が短いと LSR 等が広告領域の外になる（MVM-5・REPAIR-2）。
+        if matches!(self.serial, Some(r) if r.size < u64::from(crate::uart::UART_PORT_LEN)) {
+            return Err(invalid(
+                "serial region is smaller than the uart register window",
+            ));
+        }
         let need = ARM64_GIC_REDIST_SIZE_PER_CPU
             .checked_mul(u64::from(self.vcpus))
             .ok_or_else(|| invalid("guest layout size overflow"))?;
@@ -978,6 +984,15 @@ mod tests {
         let mut z = l.clone();
         z.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, 0));
         expect_invalid(&z, "serial region size must be non-zero");
+        let len = u64::from(crate::uart::UART_PORT_LEN);
+        for size in [1, len - 1] {
+            let mut s = l.clone();
+            s.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, size));
+            expect_invalid(&s, "serial region is smaller than the uart register window");
+        }
+        let mut ok = l.clone();
+        ok.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, len));
+        assert!(ok.validate().is_ok());
         for b in [0x0800_0000u64, 0x0820_0000, 0x0a00_0000, 0x4000_0000] {
             let mut o = l.clone();
             o.serial = Some(MmioRegion::new(b, ARM64_SERIAL_SIZE));

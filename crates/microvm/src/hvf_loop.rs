@@ -306,9 +306,45 @@ pub struct VcpuStopReport {
     pub elapsed: Duration,
 }
 
+/// ログ配送キューの上限（行数）。満杯のときは行を捨てる（REPAIR-5）。
+const LOG_QUEUE_CAP: usize = 256;
+
+/// 上限つきの非ブロッキングなログ配送。
+///
+/// 期限つき操作（`spawn_loop`・`stop`）や終了報告の経路が、書き込み先（stderr が満杯の pipe 等）の応答に
+/// 左右されないよう、専用スレッドへ `try_send` するだけにする。満杯・スレッド不在のときは行を捨てる
+/// （REPAIR-5・MVM-1）。
+struct LogSink {
+    tx: SyncSender<String>,
+}
+
+impl LogSink {
+    /// `out` へ 1 行ずつ書く配送スレッドを起動する。起動できなければ `None`。
+    fn start<W: std::io::Write + Send + 'static>(mut out: W, cap: usize) -> Option<Self> {
+        let (tx, rx) = mpsc::sync_channel::<String>(cap);
+        std::thread::Builder::new()
+            .name("hvf-log".to_string())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    drop(writeln!(out, "{line}"));
+                }
+            })
+            .ok()?;
+        Some(Self { tx })
+    }
+
+    /// 待たずに積む。満杯・切断なら捨てて `false`。
+    fn emit(&self, line: String) -> bool {
+        self.tx.try_send(line).is_ok()
+    }
+}
+
 fn log_line(args: fmt::Arguments<'_>) {
-    use std::io::Write as _;
-    drop(writeln!(std::io::stderr(), "{args}"));
+    static SINK: std::sync::OnceLock<Option<LogSink>> = std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| LogSink::start(std::io::stderr(), LOG_QUEUE_CAP));
+    if let Some(sink) = sink {
+        let _ = sink.emit(args.to_string());
+    }
 }
 
 /// 構造化ログ 1 行分の (level, outcome, code 付記) を終了理由から作る。
@@ -461,9 +497,10 @@ where
     }
 }
 
-/// 終わったスレッドを `JOIN_WAIT` まで待って回収する（間に合わなければ切り離す）。
-fn reap(join: JoinHandle<()>) {
-    let end = Instant::now() + JOIN_WAIT;
+/// 終わったスレッドを、`JOIN_WAIT` と停止期限 `deadline_end` の早い方まで待って回収する
+/// （残り時間が無ければ待たずに切り離す。REPAIR-5・MVM-1）。
+fn reap(join: JoinHandle<()>, deadline_end: Instant) {
+    let end = (Instant::now() + JOIN_WAIT).min(deadline_end);
     while !join.is_finished() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -519,7 +556,7 @@ impl<K: VcpuKick> LoopHandle<K> {
         if let Some(join) = self.join.take() {
             if result.is_ok() || matches!(&result, Err(e) if e.code() == MicrovmErrorCode::Internal)
             {
-                reap(join);
+                reap(join, end);
             } else {
                 drop(join);
             }
@@ -583,6 +620,58 @@ mod tests {
     const DABT_ISV1: u64 = 0x9300_0000;
     const DABT_ISV0: u64 = 0x9200_0000;
     const OTHER_EC: u64 = 0x8200_0000;
+
+    /// 永久にブロックする書き込み先。
+    struct BlockedWriter(Arc<std::sync::Barrier>);
+
+    impl std::io::Write for BlockedWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            // 解放されない Barrier（2 者待ちに 1 者のみ）で永久に待つ。
+            self.0.wait();
+            Ok(0)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// REPAIR-5・MVM-1: 書き込み先が止まっていても emit は待たず、上限を超えた行は捨てる。
+    #[test]
+    fn repair5_mvm1_3791_log_sink_never_blocks_on_stuck_writer() {
+        let sink = LogSink::start(BlockedWriter(Arc::new(std::sync::Barrier::new(2))), 4)
+            .expect("log thread starts");
+        let t = Instant::now();
+        let accepted = (0..1000).filter(|i| sink.emit(format!("line {i}"))).count();
+        assert!(t.elapsed() < Duration::from_secs(1), "emit blocked");
+        // 配送スレッドが 1 行を持ったまま止まり、キュー 4 行が埋まる。残りは捨てられる。
+        assert!((4..=5).contains(&accepted), "accepted={accepted}");
+    }
+
+    /// REPAIR-5・MVM-1: 停止期限の残りが無ければ、終わっていないスレッドを待たずに切り離す。
+    #[test]
+    fn repair5_mvm1_3791_reap_detaches_immediately_when_deadline_passed() {
+        let join = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3)));
+        let t = Instant::now();
+        reap(join, Instant::now());
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// REPAIR-5・MVM-1: 残り時間が JOIN_WAIT より短ければ、その残りまでしか待たない。
+    #[test]
+    fn repair5_mvm1_3791_reap_waits_only_remaining_deadline() {
+        let join = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3)));
+        let t = Instant::now();
+        reap(join, Instant::now() + Duration::from_millis(100));
+        let e = t.elapsed();
+        assert!(
+            e >= Duration::from_millis(100) && e < Duration::from_millis(700),
+            "{e:?}"
+        );
+    }
 
     /// MVM-5: syndrome と reason の分類。
     #[test]

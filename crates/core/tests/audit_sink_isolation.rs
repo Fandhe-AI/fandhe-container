@@ -282,14 +282,21 @@ mod imp {
         Arc::new(|_, _| AuditFileWriter::open(Path::new("relative/audit.log")).map(|_| ()))
     }
 
-    /// スレッド（出し直しのスレッド・試験の helper）を join した後、`/proc/self/status` の `Threads:` が 1 に戻るまで
-    /// 待つ（join の完了からスレッドの解放までの短い間は 2 と読める）。戻らなければ失敗する。
+    /// スレッド（出し直しのスレッド・試験の helper）を join した後、スレッド数が 1 に戻るまで待つ（REPAIR-5・REPAIR-12・
+    /// #3653）。join の完了からカーネルがスレッドを解放するまでの短い間は 2 と読め、特に macOS の `proc_pidinfo` は
+    /// 反映が遅れて間欠的に 2 を返す。一度だけ数える照合は間欠失敗するため、`record()` の直後の「スレッドが残らない」
+    /// 確認もこの関数で行う。待ちの上限は 5 秒で、超えたら「残ったスレッド数」を具体値で示して失敗する
+    /// （期待値は常に 1 のまま。緩めない）。
     fn wait_single_threaded() {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while threads() != 1 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = threads();
+            if n == 1 {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "a notifier thread was left behind"
+                "a notifier thread was left behind: threads={n}, expected 1"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -367,7 +374,7 @@ mod imp {
         record_expect_ok(&sink, &seen);
         assert_eq!(std::fs::read(&marker).unwrap(), b"persisted-by-child");
         assert_eq!(*seen.lock().unwrap(), vec![]);
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
         let _ = std::fs::remove_file(&marker);
     }
 
@@ -390,7 +397,7 @@ mod imp {
             *seen.lock().unwrap(),
             vec![AuditWriteErrorKind::IsolationTimeout]
         );
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
     }
 
     /// REPAIR-5・SEC-4: 主経路が止まり通知先も詰まっていても、`record_until` は絶対期限 + 許容差以内に
@@ -406,7 +413,7 @@ mod imp {
         assert!(took >= budget, "{took:?}");
         assert!(took < budget + Duration::from_millis(400), "{took:?}");
         wait_unreaped_cleared();
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
     }
 
     /// SEC-4・TASK-163: 子の失敗種別が終了コード越しに代替経路へ届く。
@@ -421,7 +428,7 @@ mod imp {
             *seen.lock().unwrap(),
             vec![AuditWriteErrorKind::RelativePath]
         );
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
     }
 
     /// 番号 `fd` が開いているか。Linux は `/proc/self/fd/N`、macOS は `/dev/fd/N`（fdescfs。閉じていれば参照に
@@ -853,7 +860,7 @@ mod imp {
             b"persisted-with-sigchld-ignored"
         );
         assert_eq!(*seen.lock().unwrap(), vec![]);
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
         let _ = std::fs::remove_file(&marker);
 
         // 失敗種別が代替経路へ届く。
@@ -899,7 +906,7 @@ mod imp {
         let e = sink_fail.record(&record()).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
         assert_eq!(std::fs::read_to_string(&notice).unwrap(), RELATIVE_NOTICE);
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
         let _ = std::fs::remove_file(&notice);
     }
 
@@ -962,7 +969,7 @@ mod imp {
         );
         assert_eq!(FileAuditSink::unreaped_children_for_test(), 0);
         assert!(!has_child_process(), "a timed-out child was left behind");
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
     }
 
     /// SEC-4・CORE-1・#2429: macOS では `SIGCHLD` が `SIG_IGN`（子が自動回収されて pid が再利用され得る）のプロセスで
@@ -984,7 +991,7 @@ mod imp {
         );
         assert!(!marker.exists());
         assert!(!has_child_process());
-        assert_eq!(threads(), 1);
+        wait_single_threaded();
 
         let notice = tmp_marker("mac-ign-notice");
         let (sink_fail, _) = sink(

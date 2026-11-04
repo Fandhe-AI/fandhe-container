@@ -88,7 +88,7 @@ backing（匿名 mmap・`KVM_SET_USER_MEMORY_REGION` 登録・munmap と Drop �
 
 - mmap のフラグ: `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`（疎に使われるゲスト RAM が swap を予約しない。上限 `MAX_GUEST_RAM_BYTES` = 16 GiB で抑える）と `madvise(MADV_DONTFORK)`（fork 先へゲストメモリの内容を引き継がない）
 - 寿命: `RegisteredGuestRam` は VM fd を dup して持つ（`'vm` の借用を持たない。後続の VM 構成体 #697 が自己参照にならないため）。drop は slot を削除してから munmap し、削除に失敗したら mapping を漏らす（fail-closed）
-- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。性能（ブロック I/O のバッチ化）は後続の課題
+- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る。性能（ブロック I/O のバッチ化）は後続の課題
 - 置き換えなかったもの: #882 の自己診断用 `GuestPage` / `RegisteredPage` と `probe_*` は残している（置き換えは任意の後続作業）
 - 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会・hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`
 
@@ -98,6 +98,6 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 
 - mmap のフラグ: `MAP_ANON | MAP_PRIVATE`（`MAP_NORESERVE`・`MADV_DONTFORK` は使わない）。RWX で `hv_vm_map` する
 - 寿命: `RegisteredHvfRam<'vm>` は `&'vm HvVm` を借用するため `HvVm` より先に drop される。drop は `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。構成体（#3797）が `HvVm` をどう持つかはその issue の担当
-- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ
+- 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る
 - IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は暫定で、レイアウトの確定は #3788、SDK・実機での照合は #3803
 - 範囲外: 複数領域・`hv_vm_protect` の利用・`Send` / `Sync`（#3797・#3798）・解除失敗の構造化ログ

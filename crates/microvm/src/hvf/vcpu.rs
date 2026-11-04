@@ -15,7 +15,7 @@
 //! スレッドが自力で終わるまで VM は残る（無期限の `join` はしない）。
 //!
 //! # 未実装（REPAIR-3）
-//! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの実処理はスタブ（`Unimplemented` で VM を止める）。
+//! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの実処理は hvc 以外スタブ（`Unimplemented` で VM を止める）。
 
 use std::sync::Arc;
 use std::time::Duration;

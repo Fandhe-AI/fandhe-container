@@ -38,7 +38,8 @@ use std::time::Duration;
 
 use crate::arm64_layout::arm64_vcpu_mpidr_affinity;
 use crate::boot_arm64::{
-    ApBootRegs, SCTLR_EL1_C, SCTLR_EL1_EE, SCTLR_EL1_M, check_vcpu_mpidr_readback, sctlr_for_cpu_on,
+    ApBootRegs, SCTLR_EL1_C, SCTLR_EL1_EE, SCTLR_EL1_I, SCTLR_EL1_M, check_vcpu_mpidr_readback,
+    sctlr_for_cpu_on,
 };
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
@@ -233,8 +234,8 @@ fn gpr_reg(n: u8) -> Result<HvReg, MicrovmError> {
 
 /// CPU_ON で起動する AP のレジスタを owning thread で書き、読み戻して照合する（#3891・MVM-5）。
 ///
-/// X0〜X3・PC・CPSR は `regs` の値。`SCTLR_EL1` は CPU_OFF の前にゲストが有効にした MMU・D-cache・EE が残りうるため、
-/// 毎回 `sctlr_for_cpu_on` で M・C・EE を落とした値にする（変わらないときは書かない）。照合の不一致は fail-closed
+/// X0〜X3・PC・CPSR は `regs` の値。`SCTLR_EL1` は CPU_OFF の前にゲストが有効にした MMU・D-cache・I-cache・EE が残りうるため、
+/// 毎回 `sctlr_for_cpu_on` で M・C・I・EE を落とした値にする（変わらないときは書かない）。照合の不一致は fail-closed
 /// （`Internal` / `FailedPrecondition`）で、走らせない。MPIDR は spawn 時に書いて照合済みのため書き直さない。
 fn boot_ap(vcpu: &mut HvVcpu<'_>, regs: &ApBootRegs) -> Result<(), MicrovmError> {
     for (n, value) in [(0u8, regs.x0), (1, regs.x1), (2, regs.x2), (3, regs.x3)] {
@@ -253,10 +254,13 @@ fn boot_ap(vcpu: &mut HvVcpu<'_>, regs: &ApBootRegs) -> Result<(), MicrovmError>
     {
         return Err(internal("ap boot register readback does not match"));
     }
-    if vcpu.get_sys_reg(HvSysReg::SCTLR_EL1)? & (SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_EE) != 0 {
+    if vcpu.get_sys_reg(HvSysReg::SCTLR_EL1)?
+        & (SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I | SCTLR_EL1_EE)
+        != 0
+    {
         return Err(MicrovmError::new(
             MicrovmErrorCode::FailedPrecondition,
-            "sctlr_el1 has mmu, d-cache or big-endian enabled at ap boot",
+            "sctlr_el1 has mmu, d-cache, i-cache or big-endian enabled at ap boot",
         ));
     }
     Ok(())

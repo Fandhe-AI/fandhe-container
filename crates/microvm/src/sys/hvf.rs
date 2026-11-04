@@ -58,6 +58,7 @@
 //! # ホストの時刻（TASK-192.14・#3796）
 //! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
 //! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3803。
+//! 2 関数は本ファイル末尾の単体試験（#3885）で直接確かめる（entitlement 不要のため既定の試験集合で走る）。
 //!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
@@ -1181,5 +1182,36 @@ impl Drop for GicConfig {
         // SAFETY: `raw` は `config_create` が返した NULL でない OS オブジェクトで、ここ以外で解放されない
         // （`create` は config を消費するが解放しない）。`hv_gic_create` が retain するかは #3803 で確認する。
         unsafe { os_release(self.raw) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 換算比の numer・denom が 0 以外で、`OnceLock` のキャッシュにより毎回同じ値を返す。
+    /// entitlement 不要で既定の試験集合で走る（MVM-5・#3796・#3885）。
+    #[test]
+    fn mvm5_3796_host_timebase_is_nonzero_and_cached() {
+        let first = host_timebase().expect("mach_timebase_info must succeed");
+        assert_ne!(first.numer(), 0);
+        assert_ne!(first.denom(), 0);
+        let second = host_timebase().expect("cached timebase must be Ok");
+        assert_eq!(first, second);
+    }
+
+    /// 連続 2 回は減らず、1 ms の sleep を挟むと厳密に増える。Apple Silicon のカウンタは 24 MHz 程度で
+    /// 1 ms は数万 tick のため厳密増加が成り立つ（MVM-5・#3796・#3885）。
+    #[test]
+    fn mvm5_3796_host_absolute_time_is_monotonic() {
+        let a = host_absolute_time();
+        let b = host_absolute_time();
+        assert!(b >= a, "counter went backwards: a={a} b={b}");
+        std::thread::sleep(Duration::from_millis(1));
+        let c = host_absolute_time();
+        assert!(
+            c > b,
+            "counter did not advance across 1ms sleep: b={b} c={c}"
+        );
     }
 }

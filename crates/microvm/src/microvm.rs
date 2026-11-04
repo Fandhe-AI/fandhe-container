@@ -594,7 +594,6 @@ fn system_regions(
     Ok((reserved, occupied))
 }
 
-/// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
 /// MP テーブルの IOAPIC の ID（LAPIC ID `0..MAX_VCPUS` と衝突しない値）。
 #[cfg(target_arch = "x86_64")]
 const MP_IOAPIC_ID: u8 = MAX_VCPUS as u8;
@@ -654,6 +653,7 @@ fn mp_table_config(vcpu_count: u32, routes: &[IsaIrqRoute]) -> MpTableConfig<'_>
     }
 }
 
+/// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
 fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>, MicrovmError> {
     let total = block_count
         .checked_add(net_count)

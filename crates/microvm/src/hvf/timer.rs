@@ -21,8 +21,8 @@
 //! # 未実装・簡易実装（REPAIR-3）
 //! (a) 待っている最中の SPI の注入（`GicSpiLine::trigger`）では起きず、最大で `WFI_WAIT_MAX` 遅れる。
 //! (b) 停止要求でも直接は起きず、上限で戻ってから実行ループの先頭で `Requested` になる。
-//! (c) WFI を出さずに回り続けるゲストでは mask の解除の確認が次の WF* / vtimer の exit まで遅れる
-//!     （実行前の同期の口が `hvf_loop` / `vcpu` に要る）。
+//! (c) mask の解除は `hv_vcpu_run` の再入直前（`sync_before_run`）にも確認する。ただし線が立っている間は外せず、
+//!     ゲストが CVAL を進める等で線が下がった後の次の再入（exit か実行期限）で外れる。
 //! (d) #3803 で確定させる観測事項: GIC あり構成で PPI が自動で pending になるか、`VTIMER_ACTIVATED` が起きるか、
 //!     WFI の exit 時点の PC、mach の 2 関数の SDK ヘッダとの照合。
 
@@ -78,13 +78,29 @@ impl TimerHandler {
     }
 }
 
+/// mask 中で、かつ割り込み線が下がっているとき mask を外すべきか（`hv_*` を呼ばない純関数）。
+fn should_unmask(masked: bool, ctl: u64) -> bool {
+    masked && !vtimer_level(ctl)
+}
+
+/// `hv_vcpu_run` へ入る直前の同期口。`hvf::vcpu` の `HvfExec::run` が再入のたびに呼ぶ。
+///
+/// WF* を出さずに計算を続けるゲストでも mask が残らないようにする（実行期限・kick による復帰後の再入を含む。MVM-5）。
+/// mask 中でなければ `hv_*` を呼ばない。
+pub fn sync_before_run(
+    vcpu: &mut HvVcpu<'_>,
+    handler: &mut TimerHandler,
+) -> Result<(), MicrovmError> {
+    sync_vtimer_mask(vcpu, handler)
+}
+
 /// mask 中なら `CNTV_CTL_EL0` を読み、割り込み線が下がっていれば mask を外す。
 fn sync_vtimer_mask(vcpu: &mut HvVcpu<'_>, handler: &mut TimerHandler) -> Result<(), MicrovmError> {
     if !handler.vtimer_masked {
         return Ok(());
     }
     let ctl = vcpu.get_sys_reg(HvSysReg::CNTV_CTL_EL0)?;
-    if !vtimer_level(ctl) {
+    if should_unmask(handler.vtimer_masked, ctl) {
         vcpu.set_vtimer_mask(false)?;
         handler.vtimer_masked = false;
         handler.stats.vtimer_unmasks = handler.stats.vtimer_unmasks.saturating_add(1);
@@ -131,4 +147,20 @@ pub fn handle_vtimer(
     handler.stats.vtimer_activations = handler.stats.vtimer_activations.saturating_add(1);
     sync_vtimer_mask(vcpu, handler)?;
     Ok(ExitAction::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hvf_abi::{CNTV_CTL_ENABLE, CNTV_CTL_ISTATUS};
+
+    /// MVM-5・#3796: 線が立っている間は外さず、CVAL 更新で ISTATUS が落ちたら外す（WF* を経由しない再入前の同期）。
+    #[test]
+    fn mvm5_3796_should_unmask_follows_line_level() {
+        let asserted = CNTV_CTL_ENABLE | CNTV_CTL_ISTATUS;
+        assert!(!should_unmask(true, asserted));
+        assert!(should_unmask(true, CNTV_CTL_ENABLE));
+        assert!(should_unmask(true, 0));
+        assert!(!should_unmask(false, CNTV_CTL_ENABLE));
+    }
 }

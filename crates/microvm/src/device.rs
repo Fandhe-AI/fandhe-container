@@ -17,7 +17,7 @@
 //! [`VmFd::register_ioeventfd`]（`KVM_IOEVENTFD`。ゲストの `QueueNotify` を VM exit なしで eventfd へ）と、
 //! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
-//! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 [`VmFd::register_irq_line`]（`KVM_IRQ_LINE`）を足した。
+//! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 `VmFd::register_irq_line`（`KVM_IRQ_LINE`）を足した。
 //! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
 //! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。

@@ -63,7 +63,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::dispatch::{MmioDevice, PortIoDevice, PortIoOutcome};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -158,7 +158,7 @@ pub struct Uart16550 {
     /// 割り込み線が結線済みか（[`SerialConsole::mmio_device_with_irq`] が立てる）。線が無い経路では THRE を IIR に出さない。
     irq_wired: bool,
     /// 線の実体（[`SerialConsole::mmio_device_with_irq`] が設定する）。ホストの `push_input` からも更新するため UART が持つ。
-    line: Option<Arc<dyn LevelInterruptLine>>,
+    line: Option<Weak<dyn LevelInterruptLine>>,
     rx: VecDeque<u8>,
     rx_capacity: usize,
     input_received_bytes: u64,
@@ -305,7 +305,7 @@ impl Uart16550 {
 
     /// 自分の線（あれば）へ値の変化を伝える。
     pub(crate) fn sync_line(&mut self) {
-        if let Some(line) = self.line.clone() {
+        if let Some(line) = self.line.as_ref().and_then(Weak::upgrade) {
             self.sync_irq_line(line.as_ref());
         }
     }
@@ -533,7 +533,7 @@ impl SerialConsole {
 
     /// `ExitDispatcher::register_pio` へ渡すデバイス（同じバッファを共有する）を作る。
     pub fn port_device(&self) -> Box<dyn PortIoDevice> {
-        Box::new(SharedUart(Arc::clone(&self.inner)))
+        Box::new(SharedUart(Arc::clone(&self.inner), None))
     }
 
     /// [`Self::port_device`] に割り込みの線をつけたもの（x86 の COM1 = IRQ 4。#3918・MVM-1・REPAIR-3）。
@@ -544,9 +544,11 @@ impl SerialConsole {
     pub fn port_device_with_irq(&self, line: Arc<dyn LevelInterruptLine>) -> Box<dyn PortIoDevice> {
         if let Ok(mut u) = self.inner.lock() {
             u.irq_wired = true;
-            u.line = Some(line);
+            u.line = Some(Arc::downgrade(&line));
         }
-        self.port_device()
+        // 線の強参照はデバイス（= DeviceBus・VM 側）が持つ。UART（SerialConsole の clone と共有）は Weak のみで、
+        // 停止後に console を保持しても VM fd を延長しない（#3922）。
+        Box::new(SharedUart(Arc::clone(&self.inner), Some(line)))
     }
 }
 
@@ -557,6 +559,7 @@ impl SerialConsole {
     pub fn mmio_device(&self) -> Box<dyn MmioDevice> {
         Box::new(SharedUartMmio {
             inner: Arc::clone(&self.inner),
+            _line: None,
         })
     }
 
@@ -568,10 +571,11 @@ impl SerialConsole {
         // 線ができたこの時点から THRE を IIR に出す（lock の poison は各アクセスが fail-closed に扱う）。
         if let Ok(mut u) = self.inner.lock() {
             u.irq_wired = true;
-            u.line = Some(line);
+            u.line = Some(Arc::downgrade(&line));
         }
         Box::new(SharedUartMmio {
             inner: Arc::clone(&self.inner),
+            _line: Some(line),
         })
     }
 }
@@ -579,6 +583,8 @@ impl SerialConsole {
 /// MMIO 用の共有ラッパー。幅・offset を検査してから [`Uart16550`] へ委ね、lock の poison は `Ignored`（fail-closed）。
 struct SharedUartMmio {
     inner: Arc<Mutex<Uart16550>>,
+    /// 線の強参照（VM 側の寿命に揃える。UART 本体は Weak のみ。#3922）。
+    _line: Option<Arc<dyn LevelInterruptLine>>,
 }
 
 impl SharedUartMmio {
@@ -636,7 +642,11 @@ impl MmioDevice for SharedUartMmio {
 }
 
 /// dispatcher に登録する共有ラッパー。lock の poison には応答しない（read は dispatcher が 0xFF 埋め）。
-struct SharedUart(Arc<Mutex<Uart16550>>);
+struct SharedUart(
+    Arc<Mutex<Uart16550>>,
+    // 線の強参照（VM 側の寿命に揃える。UART 本体は Weak のみ）。
+    #[allow(dead_code)] Option<Arc<dyn LevelInterruptLine>>,
+);
 
 impl PortIoDevice for SharedUart {
     fn read(&mut self, offset: u16, data: &mut [u8]) -> PortIoOutcome {
@@ -1010,6 +1020,24 @@ mod tests {
         assert_eq!(console.stats().unwrap().irq_line_errors, 1);
         assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
         assert_eq!(console.stats().unwrap().irq_line_errors, 2);
+    }
+
+    /// MVM-1・REPAIR-5・#3922: console の clone を保持したままデバイスを drop すると線の強参照が解放され、出力は読める。
+    #[test]
+    fn mvm1_3922_device_drop_releases_line_keeps_output() {
+        let console = SerialConsole::new();
+        let line: Arc<dyn LevelInterruptLine> = Arc::new(FakeLine::default());
+        let weak = Arc::downgrade(&line);
+        let mut dev = console.port_device_with_irq(line);
+        assert_eq!(dev.write(0, b"A"), PortIoOutcome::Handled);
+        assert_eq!(weak.strong_count(), 1);
+        drop(dev);
+        assert_eq!(weak.strong_count(), 0);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(console.take_output().unwrap(), b"A".to_vec());
+        // 線が無くなっても push_input は失敗せず受理される。
+        assert!(console.push_input(b"k").is_ok());
+        assert_eq!(console.stats().unwrap().irq_line_errors, 0);
     }
 
     /// MVM-5・MVM-1・#3918: PIO ラッパー経由でも値が変わったときだけ線へ伝わる（THRE・受信データ）。

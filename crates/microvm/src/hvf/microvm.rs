@@ -6,11 +6,11 @@
 //! 呼び出し元は start / stop の API（#3798）と plugin-microvm（#3800）。
 //!
 //! # 組み立ての順序（[`HvfMicroVm::assemble`]）
-//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。vcpus 2 以上は `Unimplemented`（FDT 側は N 個を出せる。backend は 1。#3864）。
+//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。`config.serial` と `layout.serial` を突き合わせ（#3882）、virtio + シリアルが MMIO 表の上限（`MAX_BUS_DEVICES`）を超える構成もここで拒否する。vcpus 2 以上は `Unimplemented`（FDT 側は N 個を出せる。backend は 1。#3864）。
 //! 2. VM + GIC（`VmWithGic::create`。GIC の配置違反は VM を作る前に拒否される）。
 //! 3. ゲスト RAM の登録（`HvfGuestRam::register_shared`。対応付けが `Arc<HvVm>` を保持する）。
 //! 4. Image・initrd・FDT の配置（`load_arm64`。Image ヘッダの検証はここ）。
-//! 5. virtio-mmio のデバイス群を `ExitDispatcher` に登録し、各デバイスの割り込みを `GicSpiLine` に結ぶ（block → net の順）。
+//! 5. virtio-mmio のデバイス群を `ExitDispatcher` に登録し、各デバイスの割り込みを `GicSpiLine` に結ぶ（block → net → シリアルの順。シリアルは `layout.serial` があるときだけ。割り込みは結ばずポーリング。#3882）。
 //! 6. vCPU スレッドの作成。vCPU 0 の `setup` で X0 = FDT の GPA・X1〜X3 = 0・PC = カーネルのエントリ・CPSR = `0x3c5`・
 //!    MPIDR_EL1 = FDT の `cpu@0` の `reg` を書き、読み戻して照合する。`SCTLR_EL1` は書かず、既定値で MMU・D-cache が off
 //!    （M = 0・C = 0）であることだけを確かめる（違反は `FailedPrecondition`）。
@@ -31,7 +31,7 @@
 //! - 実行開始の制御（start gate）: `spawn` は ready の後すぐ実行ループに入るため、assemble の時点でゲストは走り始める。現状は
 //!   exit のスタブ（#3793・#3794・#3796）が `Unimplemented` を返すので、実カーネルは最初の exit で `Failed(Unimplemented)` になる（#3798）。
 //! - `MmioHandler` へは共有 dispatcher を接続済み（#3793）。ゲスト RAM の受け渡しと `HostMapping` の `Send` は #3798。
-//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、シリアルの結線（`layout.serial`・バス上限の調整）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、シリアルの割り込み（`interrupts`・SPI）と入力（RX）、`RunningHvfMicroVm::serial_console`（#3798。`HvfMicroVm::serial_console` と同じ語彙で足す）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
@@ -40,7 +40,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::arm64_layout::{ARM64_BOOT_CPU_MPIDR, Arm64Layout, MmioRegion};
+use crate::arm64_layout::{
+    ARM64_BOOT_CPU_MPIDR, ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE, Arm64Layout, MmioRegion,
+};
 use crate::boot_arm64::{ArmBootReadback, LoadedArm64, check_boot_readback, load_arm64};
 use crate::dispatch::{DeviceId, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -52,6 +54,7 @@ use crate::hvf::mmio::MmioHandler;
 use crate::hvf::timer::TimerHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
+use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
 use crate::virtio_net::{NetBackend, VirtioNet};
@@ -89,6 +92,14 @@ pub struct HvfMicroVmConfig<B, N> {
     pub net: Vec<HvfNetDeviceConfig<N>>,
     /// vCPU スレッドの設定。
     pub vcpu: VcpuThreadConfig,
+    /// シリアル（ns16550a の MMIO。`HvfMicroVm::serial_console` で出力を得る）を有効にするか（#3882・MVM-5・MVM-1）。
+    ///
+    /// - `true` で `layout.serial` が `None`: 既定の窓（`ARM64_SERIAL_BASE`・`ARM64_SERIAL_SIZE`）を設定する。
+    /// - `true` で `layout.serial` が `Some`: 呼び出し元の窓を使う（大きさ・重なりは `Arm64Layout::validate` が検査）。
+    /// - `false` で `layout.serial` が `Some`: `InvalidArgument`（実体の無いデバイスを FDT に載せない）。
+    ///
+    /// シリアルは virtio と同じ MMIO 表を 1 枠使うため、有効なら virtio は 31 台まで（資源を作る前に検査する）。
+    pub serial: bool,
 }
 
 /// デバイスの種別。
@@ -128,14 +139,25 @@ struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
 }
 
 /// virtio-mmio のデバイス群と、それを引く `ExitDispatcher`。macOS には PIO・UART は無い（arm64）。
+/// 登録済みのシリアル（ホストが出力を取り出すハンドル・識別子・窓。割り込み線は無い）。
+struct HvfSerial {
+    console: SerialConsole,
+    /// 登録の識別子（観測・将来の登録解除用）。
+    #[allow(dead_code)]
+    id: DeviceId,
+    #[allow(dead_code)]
+    window: MmioRegion,
+}
+
 struct HvfDeviceBus<B: BlockBackend, N: NetBackend> {
     dispatcher: Arc<Mutex<ExitDispatcher>>,
+    serial: Option<HvfSerial>,
     block: Vec<HvfBoundDevice<VirtioBlock<B>>>,
     net: Vec<HvfBoundDevice<VirtioNet<N>>>,
 }
 
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDeviceBus<B, N> {
-    /// block → net の順に窓（`layout.virtio_mmio_window(i)`）と SPI（`vm.spi_line(layout, i)`）を割り当てて登録する。
+    /// block → net → シリアルの順に窓（`layout.virtio_mmio_window(i)`）と SPI（`vm.spi_line(layout, i)`）を割り当てて登録する。
     fn new(
         layout: &Arm64Layout,
         vm: &VmWithGic,
@@ -146,6 +168,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             dispatcher: Arc::new(Mutex::new(ExitDispatcher::new())),
             block: Vec::with_capacity(block.len()),
             net: Vec::with_capacity(net.len()),
+            serial: None,
         };
         let mut index: u32 = 0;
         for backend in block {
@@ -164,6 +187,20 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             let dev = bus.bind(layout, vm, index, transport)?;
             bus.net.push(dev);
             index += 1;
+        }
+        // シリアルは virtio の後に登録する（virtio の DeviceId を変えない）。割り込みは結ばない（FDT に interrupts を出さない）。
+        if let Some(window) = layout.serial {
+            let console = SerialConsole::new();
+            let id = bus
+                .dispatcher
+                .lock()
+                .map_err(|_| internal("device dispatcher lock poisoned"))?
+                .register_mmio(window.base.raw(), window.size, console.mmio_device())?;
+            bus.serial = Some(HvfSerial {
+                console,
+                id,
+                window,
+            });
         }
         Ok(bus)
     }
@@ -254,12 +291,20 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             block,
             net,
             vcpu,
+            serial,
         } = config;
+        // serial = true で窓が無ければ既定の窓を入れる。検査順序を崩さないよう validate() は呼ばず直接代入する。
+        let mut layout = layout;
+        if serial && layout.serial.is_none() {
+            layout.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
+        }
         check_assemble_input(&HvfAssembleInput {
             vcpus: layout.vcpus,
             ram_size: layout.ram.size,
             layout_virtio_count: layout.virtio_mmio_count,
             device_count: block.len().saturating_add(net.len()),
+            serial,
+            layout_serial: layout.serial.is_some(),
             image_len: kernel.len() as u64,
             initrd_len: initrd.as_ref().map(|i| i.len() as u64),
             cmdline_len: cmdline.len(),
@@ -347,9 +392,17 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
         &self.boot
     }
 
-    /// 登録済みデバイスの配置（block → net の順）。
+    /// 登録済みの virtio デバイスの配置（block → net の順）。シリアルは含まない（割り込みが無いため。`serial_console` を参照）。
     pub fn devices(&self) -> Vec<HvfDeviceInfo> {
         self.devices.infos()
+    }
+
+    /// シリアルの出力を取り出すハンドル（clone）。`config.serial` が `false` なら `None`（#3882・MVM-5・MVM-1）。
+    ///
+    /// Linux の `MicroVm::serial_console` と同じ語彙だが、こちらは任意なので `Option`。fd を持たず drop 順序に影響しない。
+    /// 中身は非信頼のゲスト出力で、上限は `uart::MAX_OUTPUT_BYTES`。
+    pub fn serial_console(&self) -> Option<SerialConsole> {
+        self.devices.serial.as_ref().map(|s| s.console.clone())
     }
 
     /// MMIO dispatcher の共有ハンドル（vCPU の `MmioHandler` と同じ実体。#3793）。

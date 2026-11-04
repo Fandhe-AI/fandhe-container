@@ -2,11 +2,11 @@
 
 macOS 利用者が fandhe-container を使う前に整えておく前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネルと initrd の用意）を定める。実装済みのものと未実装・判断待ちのものを分けて書く。
 
-- 対象ビヘイビア: MAC-1・CLI-2（関連: CLI-1・MAC-4・PLUG-11・OCI-5・REPAIR-3）
-- タスク: TASK-80 追補・TASK-64
-- 関連 issue: #2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
+- 対象ビヘイビア: MAC-1・CLI-2・MVM-5（関連: CLI-1・MAC-4・PLUG-11・OCI-5・MVM-1・MVM-4・REPAIR-3）
+- タスク: TASK-80 追補・TASK-64・TASK-192.19
+- 関連 issue: #3801・#3800・#3803・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
 
-> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `AGENTS.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
+> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `AGENTS.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `AGENTS.md` の実機前提テストの項に合わせたもので、実機確認は #3803（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
 
 ## 現状（実装済みと未実装）
 
@@ -14,6 +14,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 | ---- | ---- | ---- |
 | VM の設定・起動・停止、virtiofs のデバイス構成、ゲスト内 mount の指示と報告の検証（`crates/platform-macos`） | 実装済み（実機未確認） | 実行前提は entitlement とコード署名（下記）。実機確認は #1628 |
 | macOS backend plugin（`fandhe-container-plugin-macos`）の UDS 越しの create / start / stop | 実装済み（実機未確認） | create 要求ごとに kernel・initrd のパスを受け取る |
+| microVM（Hypervisor.framework。`crates/microvm` の `hvf`・`fandhe-container-plugin-microvm` の start / stop） | 実装済み（実機未確認） | 実行前提は `com.apple.security.hypervisor` の署名と Apple Silicon の macOS 15 以降（「microVM（Hypervisor.framework）の entitlement とコード署名」節）。実機確認は #3803 |
 | ゲストカーネル・initrd のビルドスクリプト | 実装済み（macOS ホストでのビルド・リンクと VM での起動は未確認） | `make guest-kernel-build`・`make guest-initrd-build` |
 | `fandhe-container setup` の手順表示 | 実装済み | 表示のみ。検出も適用もしない |
 | CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 の承認と実装 issue の起票は #2232） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
@@ -50,6 +51,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
   sw_vers -productVersion
   ```
 
+- 上の暫定最低版は Virtualization.framework の分である。microVM（Hypervisor.framework）のバックエンドは macOS 15 以降を要する（「microVM（Hypervisor.framework）の entitlement とコード署名」節）
 - fandhe-container は macOS の版を確認も更新もしない
 - ゲストカーネルは arm64 のみのため、実質的な対象は Apple Silicon である（#1823）
 
@@ -82,6 +84,37 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 - 署名の確認方法（例: `codesign --display --entitlements - <パス>`）は一次資料で確かめていないため要確認
 - 注意: この entitlement は、署名したバイナリに VM の作成を許す。`fandhe-container-plugin-macos` 以外に付けない。sudo も SIP の変更も要らない。fandhe-container はバイナリへの署名を行わない
 
+## microVM（Hypervisor.framework）の entitlement とコード署名
+
+対象: MVM-5・MAC-1。`fandhe-container setup` は本節の手順を表示しない（ステップ ID なし）。
+
+- 署名の対象は microVM の backend plugin `fandhe-container-plugin-microvm` である。手元で実機前提テスト（`hvf_device`・`hvf_microvm`・plugin-microvm の E2E。手順は `AGENTS.md`「実機前提テスト」）を回す場合は、その試験バイナリにも同じ署名が要る。CLI やほかのバイナリではない
+- 必要な entitlement は `com.apple.security.hypervisor` のみ（[Apple の entitlement のページ](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.hypervisor)）。`com.apple.vm.hypervisor` は macOS 10.15 以前向けで、本バックエンドは macOS 15 以降が対象のため不要
+- entitlements の plist は次のとおり（`crates/microvm/tests/hvf.entitlements` と同じ内容。同ファイルを流用してよい）:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+      <key>com.apple.security.hypervisor</key>
+      <true/>
+  </dict>
+  </plist>
+  ```
+
+- 署名コマンド（`<...>` は環境に合わせて置き換える）:
+
+  ```sh
+  codesign --sign - --force --entitlements <plist のパス> <fandhe-container-plugin-microvm のパス>
+  ```
+
+- 再ビルドすると署名が外れるため、ビルドのたびに署名し直す。`CARGO_TARGET_DIR` を変えるとバイナリの場所も変わる
+- 許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539。一覧自体は未配線で、追跡は #1868・#2231）
+- 対応環境: Apple Silicon の macOS 15 以降のみ。macOS 15 未満は `UNIMPLEMENTED`（`hypervisor GIC requires macOS 15 or later`。GICv3 の `hv_gic_*` API の版による）、Intel Mac（macOS の x86_64）でも plugin-microvm は `UNIMPLEMENTED` になる
+- 要確認: ad-hoc 署名（`--sign -`）で `hv_vm_create` が成功するか、entitlement が無いときの戻り値が `HV_DENIED` か。Apple のページに記述が無く、#3803 の実機記録で確定する。実装は `HV_DENIED` を `PermissionDenied`（CLI では `PERMISSION_DENIED`）に写す（`crates/microvm/src/hvf_abi.rs`）
+- 注意: この entitlement は、署名したバイナリに VM の作成を許す。`fandhe-container-plugin-microvm`（と手元の実機前提試験バイナリ）以外に付けない。試験バイナリの署名は手元の確認用で配布しない。sudo も SIP の変更も要らない。fandhe-container はバイナリへの署名を行わない
+
 ## ゲストカーネルと initrd の用意と配置
 
 - カーネル: `make guest-kernel-build` で作る。出力は `target/guest-kernel/<guest/kernel/source.lock の版>/arm64/Image`（ほかに `config`・`build-info.txt`）。GPL-2.0 で、ソース提供の材料と取得物の sha256 照合は `guest/kernel/README.md` にある。tarball の署名検証は未確認
@@ -101,7 +134,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 - 所有者・モード: ファイル、探索先、`/` までの全祖先が、root か実行ユーザーの所有で、group と other に書き込み権限が無いこと（sticky ビットも例外にしない）。symlink の plugin は実体とその祖先で判定する。探索先と祖先が symlink の場合は拒否する（`/tmp`・`/var` を通るパスは使えない）
 - 拡張 ACL: ディレクトリやファイルに拡張 ACL があれば、中身を解釈せずに拒否する。`~/Library` 配下は既定の ACL（`group:everyone deny delete`）で拒否されうる（実機未確認。要確認。確認例: `ls -le <パス>`）
 - `/usr/local` が group 書き込み可の環境（古い Homebrew など）では、system の探索先が祖先の検査で拒否される
-- 署名後のハッシュ: plugin-macos は Virtualization.framework の entitlement のために署名が要り（上の「entitlement とコード署名」と `AGENTS.md` の `codesign` の手順を参照）、署名でバイナリが変わる。許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539）
+- 署名後のハッシュ: plugin-macos は Virtualization.framework の entitlement のために署名が要り（上の「entitlement とコード署名」と `AGENTS.md` の `codesign` の手順を参照）、署名でバイナリが変わる。許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539）。plugin-microvm も署名が要るため同様に署名後の sha256 を使う（「microVM（Hypervisor.framework）の entitlement とコード署名」節）
 - CLI の失敗: 拒否は `PERMISSION_DENIED`（6）、候補なしは `FAILED_PRECONDITION`（5）。どちらもパス・plugin 名を出力しない固定文言（#1867）
 - 未確定・未確認: 許可済みハッシュ一覧の置き場所と指定方法は未確定（設計は #1868、承認の追跡は #2231）。plugin の起動と RPC は未実装（設計は #1869、追跡は #2232）。権限の実態は実機で未確認（#1628・#1923）
 
@@ -115,6 +148,7 @@ macOS で `fandhe-container setup` を実行すると、次の 2 ステップを
 | ----- | ---- | ---------- |
 | #1906 | 既定方式（常駐 VM の共用）の未決事項 | ゲストカーネルと initrd の用意と配置 |
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
+| #3803 | Apple Silicon 実機での Hypervisor.framework の実機前提試験と ad-hoc 署名・`HV_DENIED` の確認（人間担当） | 現状、microVM（Hypervisor.framework）の entitlement とコード署名 |
 | #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868・#2231 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
 | #1869・#2232 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |

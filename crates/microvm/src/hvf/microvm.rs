@@ -6,7 +6,7 @@
 //! 呼び出し元は start / stop の API（#3798）と plugin-microvm（#3800）。
 //!
 //! # 組み立ての順序（[`HvfMicroVm::assemble`]）
-//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。vcpus 2 以上は `Unimplemented`。
+//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。vcpus 2 以上は `Unimplemented`（FDT 側は N 個を出せる。backend は 1。#3864）。
 //! 2. VM + GIC（`VmWithGic::create`。GIC の配置違反は VM を作る前に拒否される）。
 //! 3. ゲスト RAM の登録（`HvfGuestRam::register_shared`。対応付けが `Arc<HvVm>` を保持する）。
 //! 4. Image・initrd・FDT の配置（`load_arm64`。Image ヘッダの検証はここ）。
@@ -31,7 +31,7 @@
 //! - 実行開始の制御（start gate）: `spawn` は ready の後すぐ実行ループに入るため、assemble の時点でゲストは走り始める。現状は
 //!   exit のスタブ（#3793・#3794・#3796）が `Unimplemented` を返すので、実カーネルは最初の exit で `Failed(Unimplemented)` になる（#3798）。
 //! - `MmioHandler` への dispatcher とゲスト RAM の受け渡し（[`HvfMicroVm::dispatcher`] を渡す）と `HostMapping` の `Send`（#3793・#3798）。
-//! - PSCI・WFI / vtimer（#3794・#3796）、SMP、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、シリアルの結線（`layout.serial`・バス上限の調整）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!

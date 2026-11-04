@@ -30,8 +30,9 @@
 //! イメージの署名・digest の検証は本層の責務ではない（plugin-microvm 側の経路）。
 //!
 //! # 範囲外（REPAIR-3）
-//! 圧縮 Image（`Image.gz`）・EFI stub 起動・BE カーネル・SMP（`build_guest_fdt` が vCPU 2 以上を `Unimplemented` にする）・
-//! `stdout-path`・複数の RAM 領域・ファイルからの読み込み（呼び出し側が上限つきで読む）・キャッシュの保守（#3797）。
+//! 圧縮 Image（`Image.gz`。将来は展開後の Image を渡す前処理を足す）・EFI stub 起動（将来は PE/COFF 経由の起動）・
+//! BE カーネル（将来は SCTLR の EE ビットと FDT のエンディアンを合わせる）・複数の RAM 領域・ファイルからの読み込み（呼び出し側が上限つきで読む）・キャッシュの保守（#3797）。
+//! vCPU 数は `Arm64Layout::validate` の上限に従い（#3864）、シリアルと `stdout-path` は `layout.serial` が `Some` のときだけ出す。
 //! 新しいゲスト RAM はゼロなので BSS のゼロ化はカーネル自身の起動処理に任せる。
 //!
 //! ビヘイビア: MVM-5・MVM-1・MVM-4・ERR-1・REPAIR-2・REPAIR-3。
@@ -392,7 +393,7 @@ pub fn check_boot_readback(
 /// Image・initrd・FDT をゲストメモリへ配置し、起動レジスタの値を返す。
 ///
 /// 検証と計画がすべて通るまで何も書かない。`build_guest_fdt` の挙動を引き継ぐ:
-/// vCPU が 1 以外なら `Unimplemented`、cmdline の超過・NUL は `InvalidArgument`。
+/// vCPU 数の上限超過は `Arm64Layout` の検査で `InvalidArgument`、cmdline の超過・NUL は `InvalidArgument`。
 pub fn load_arm64<B: GuestMemoryBacking>(
     memory: &mut GuestMemory<B>,
     image: &[u8],

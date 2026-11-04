@@ -16,22 +16,37 @@
 //! ポーリング期限・`stop` の期限・外側の `recv_timeout` が唯一の層になる。前提欠如は skip せず
 //! `kernel_boot: PRECONDITION FAILED (test environment, not a regression)` で落とす。
 //!
+//! 追加の構成（#3865・MVM-1・REPAIR-12。いずれも同じ実機前提の形）:
+//! - vCPU 2 台: MP テーブル・MADT が未実装のため AP は Linux にオンラインにならない。照合は「2 台構成で最後まで起動し、
+//!   BSP 起因の停止で 2 台とも回収される（`vcpu_count` = 2・起点 vCPU 0）」まで。「2 CPU がオンライン」とは主張しない。
+//! - virtio-block 1 台（1 MiB・読み取り専用）: 起動元は initrd のまま。観測器が STATUS への書き込みで DRIVER_OK を含む
+//!   最初の値 `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 1 を、backend が `read_at` 1 回以上かつ offset 0 を読んだ回 1 回以上を照合する。
+//! - virtio-net 1 台: STATUS の DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2（receiveq・transmitq）。RX・TX は
+//!   interface を上げる userspace が無いので照合しない。
+//!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。止まる場合は `_CMDLINE` で
-//! `tsc=reliable no_timer_check` 等を試し、原因ごとに別 issue にする。範囲外: virtio デバイス付きの起動・AP・aarch64。
+//! `tsc=reliable no_timer_check` 等を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
+//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・init にブロックを読ませること・RX/TX。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use fandhe_container_microvm::device::KvmDevice;
-    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
-    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
-    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
+    use fandhe_container_microvm::error::MicrovmError;
+    use fandhe_container_microvm::exit::{ExitData, ExitValue};
+    use fandhe_container_microvm::microvm::{
+        MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VirtioDeviceKind,
+    };
+    use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
+    use fandhe_container_microvm::virtio_mmio::reg;
+    use fandhe_container_microvm::virtio_net::{MemoryNetBackend, NetBackend};
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     /// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
@@ -132,26 +147,328 @@ mod x86 {
         elapsed: Duration,
     }
 
-    fn boot(
+    impl Outcome {
+        /// 失敗時の診断文字列。`extra` に観測器・backend のカウンタを載せる。
+        fn diag(&self, extra: &str) -> String {
+            format!(
+                "reason={:?} exits={} elapsed={:?} timed_out={} {extra} serial_tail={}",
+                self.reason,
+                self.exits,
+                self.elapsed,
+                self.timed_out,
+                escape_tail(&self.output, TAIL_BYTES)
+            )
+        }
+    }
+
+    /// MMIO の窓 1 つ分の観測値（virtio-mmio の STATUS・QUEUE_READY への書き込み）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WindowStats {
+        /// DRIVER_OK を含む最初の STATUS 書き込みの値。
+        driver_ok_first: Option<u32>,
+        /// FAILED を含む STATUS 書き込みの件数。
+        failed_writes: u64,
+        /// STATUS への 4 バイト書き込みの総数。
+        status_writes: u64,
+        /// QUEUE_READY へ値 1 を書いた回数。
+        queue_ready_one: u64,
+    }
+
+    /// 窓 1 つ分の atomic カウンタ（`len == 0` は未設定）。
+    #[derive(Debug, Default)]
+    struct Window {
+        base: AtomicU64,
+        len: AtomicU64,
+        driver_ok_first: AtomicU64,
+        failed_writes: AtomicU64,
+        status_writes: AtomicU64,
+        queue_ready_one: AtomicU64,
+    }
+
+    const NO_VALUE: u64 = u64::MAX;
+    /// virtio 仕様 2.1 の Device Status ビット（DRIVER_OK = 4・FAILED = 128）。
+    const STATUS_DRIVER_OK: u32 = 4;
+    const STATUS_FAILED: u32 = 128;
+    /// virtio-net に見せる固定の locally administered なダミー MAC。
+    const NET_MAC: [u8; 6] = [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65];
+
+    fn window_index(kind: VirtioDeviceKind) -> usize {
+        match kind {
+            VirtioDeviceKind::Block => 0,
+            _ => 1,
+        }
+    }
+
+    /// vCPU スレッドから同期で呼ばれ、virtio-mmio の窓への書き込みを atomic で数える観測器（#3865・MVM-1）。
+    /// `record` では割り当ても待ちもしない。値はゲスト由来（untrusted）で、範囲外は数えるだけにする。
+    #[derive(Debug)]
+    struct VirtioWindowObserver {
+        /// 0 = virtio-block、1 = virtio-net。
+        windows: [Window; 2],
+        exits: AtomicU64,
+        /// vCPU 0 以外（AP）の exit 件数（診断用）。
+        ap_exits: AtomicU64,
+    }
+
+    impl VirtioWindowObserver {
+        fn new() -> Self {
+            let obs = Self {
+                windows: [Window::default(), Window::default()],
+                exits: AtomicU64::new(0),
+                ap_exits: AtomicU64::new(0),
+            };
+            for w in &obs.windows {
+                w.driver_ok_first.store(NO_VALUE, Ordering::Relaxed);
+            }
+            obs
+        }
+
+        fn bind(&self, kind: VirtioDeviceKind, base: u64, len: u64) {
+            if let Some(w) = self.windows.get(window_index(kind)) {
+                w.base.store(base, Ordering::Relaxed);
+                w.len.store(len, Ordering::Relaxed);
+            }
+        }
+
+        fn stats(&self, kind: VirtioDeviceKind) -> WindowStats {
+            let w = &self.windows[window_index(kind)];
+            let first = w.driver_ok_first.load(Ordering::Relaxed);
+            WindowStats {
+                driver_ok_first: u32::try_from(first).ok(),
+                failed_writes: w.failed_writes.load(Ordering::Relaxed),
+                status_writes: w.status_writes.load(Ordering::Relaxed),
+                queue_ready_one: w.queue_ready_one.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl RunObserver for VirtioWindowObserver {
+        fn record(&self, record: &RunRecord) {
+            if let RunOutcome::Exit(_) = record.outcome {
+                self.exits.fetch_add(1, Ordering::Relaxed);
+                if record.vcpu_id != 0 {
+                    self.ap_exits.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let Some(ExitValue::Mmio {
+                phys_addr,
+                is_write: true,
+                data,
+                ..
+            }) = record.value
+            else {
+                return;
+            };
+            let Ok(bytes) = <[u8; 4]>::try_from(data.as_bytes()) else {
+                return;
+            };
+            let value = u32::from_le_bytes(bytes);
+            for w in &self.windows {
+                let len = w.len.load(Ordering::Relaxed);
+                let Some(off) = phys_addr.checked_sub(w.base.load(Ordering::Relaxed)) else {
+                    continue;
+                };
+                if len == 0 || off >= len {
+                    continue;
+                }
+                if off == reg::STATUS {
+                    w.status_writes.fetch_add(1, Ordering::Relaxed);
+                    if value & STATUS_FAILED != 0 {
+                        w.failed_writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if value & STATUS_DRIVER_OK != 0 {
+                        let _ = w.driver_ok_first.compare_exchange(
+                            NO_VALUE,
+                            u64::from(value),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
+                } else if off == reg::QUEUE_READY && value == 1 {
+                    w.queue_ready_one.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        fn wants_values(&self) -> bool {
+            true
+        }
+    }
+
+    /// `read_at` の回数・offset 0 を読んだ回数・読んだバイト数・書き込み・flush の件数。
+    #[derive(Debug, Default)]
+    struct BlockCounters {
+        reads: AtomicU64,
+        offset0_reads: AtomicU64,
+        read_bytes: AtomicU64,
+        writes: AtomicU64,
+        flushes: AtomicU64,
+    }
+
+    /// 呼び出しを数える block backend（読み取り専用）。`start` の後も試験側がカウンタを見られるよう `Arc` で共有する。
+    #[derive(Debug)]
+    struct CountingBlockBackend {
+        inner: MemoryBlockBackend,
+        counters: Arc<BlockCounters>,
+    }
+
+    impl CountingBlockBackend {
+        fn new(capacity: u64) -> (Self, Arc<BlockCounters>) {
+            let counters = Arc::new(BlockCounters::default());
+            let inner = MemoryBlockBackend::new(capacity, true).expect("valid capacity");
+            (
+                Self {
+                    inner,
+                    counters: counters.clone(),
+                },
+                counters,
+            )
+        }
+    }
+
+    impl BlockBackend for CountingBlockBackend {
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.capacity_bytes()
+        }
+        fn read_only(&self) -> bool {
+            self.inner.read_only()
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
+            self.counters.reads.fetch_add(1, Ordering::Relaxed);
+            if offset == 0 {
+                self.counters.offset0_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.counters
+                .read_bytes
+                .fetch_add(buf.len() as u64, Ordering::Relaxed);
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
+            self.counters.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_at(offset, data)
+        }
+        fn flush(&mut self) -> Result<(), MicrovmError> {
+            self.counters.flushes.fetch_add(1, Ordering::Relaxed);
+            self.inner.flush()
+        }
+    }
+
+    /// 送信件数・受信試行回数（診断用。フレームは積まない）。
+    #[derive(Debug, Default)]
+    struct NetCounters {
+        sent: AtomicU64,
+        recv_calls: AtomicU64,
+    }
+
+    #[derive(Debug)]
+    struct CountingNetBackend {
+        inner: MemoryNetBackend,
+        counters: Arc<NetCounters>,
+    }
+
+    impl CountingNetBackend {
+        fn new() -> (Self, Arc<NetCounters>) {
+            let counters = Arc::new(NetCounters::default());
+            (
+                Self {
+                    inner: MemoryNetBackend::new(),
+                    counters: counters.clone(),
+                },
+                counters,
+            )
+        }
+    }
+
+    impl NetBackend for CountingNetBackend {
+        fn send(&mut self, frame: &[u8]) -> Result<(), MicrovmError> {
+            self.counters.sent.fetch_add(1, Ordering::Relaxed);
+            self.inner.send(frame)
+        }
+        fn recv(&mut self, buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
+            self.counters.recv_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.recv(buf)
+        }
+    }
+
+    /// 前提の検査済みの入力（カーネル・initrd・cmdline・期限・KVM）。
+    struct Inputs {
         dev: KvmDevice,
         kernel: Vec<u8>,
         initrd: Vec<u8>,
         cmdline: String,
-        boot_timeout: Duration,
-    ) -> Result<Outcome, String> {
-        let started = Instant::now();
-        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
-            &dev,
-            MicroVmConfig {
-                vcpu_count: 1,
-                mem_size: 256 << 20,
-                block: vec![],
-                net: vec![],
-            },
+        secs: u64,
+    }
+
+    /// 前提の検査はすべてテストスレッドで行う（worker 内 panic では 1 行目が PRECONDITION FAILED にならない）。
+    fn inputs() -> Inputs {
+        let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
+            Ok(p) if !p.is_empty() => p,
+            _ => precondition(
+                "FANDHE_CONTAINER_MICROVM_KERNEL is not set (path to an x86_64 bzImage)",
+            ),
+        };
+        let kernel = read_bounded(Path::new(&kernel_path), KERNEL_CAP)
+            .unwrap_or_else(|e| precondition(&format!("kernel image: {e}")));
+        let initrd_path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
+            Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/microvm-test-initrd/x86_64/initrd.cpio"),
+        };
+        let initrd = read_bounded(&initrd_path, INITRD_CAP).unwrap_or_else(|e| {
+            precondition(&format!(
+                "initrd (run `make microvm-test-initrd-build`): {e}"
+            ))
+        });
+        let cmdline = validate_cmdline(
+            std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
+                .ok()
+                .as_deref(),
         )
-        .map_err(|e| format!("assemble failed: {e}"))?;
+        .unwrap_or_else(|e| precondition(&e));
+        let secs = parse_boot_timeout(
+            std::env::var("FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|e| precondition(&e));
+        let dev = KvmDevice::open().unwrap_or_else(|e| precondition(&e.to_string()));
+        Inputs {
+            dev,
+            kernel,
+            initrd,
+            cmdline,
+            secs,
+        }
+    }
+
+    fn boot<B, N>(
+        inp: Inputs,
+        config: MicroVmConfig<B, N>,
+        observer: Option<Arc<VirtioWindowObserver>>,
+        boot_timeout: Duration,
+    ) -> Result<Outcome, String>
+    where
+        B: BlockBackend + Send + 'static,
+        N: NetBackend + Send + 'static,
+    {
+        let started = Instant::now();
+        let vcpus = usize::try_from(config.vcpu_count).unwrap_or(0);
+        let mut vm: MicroVm<B, N> =
+            MicroVm::assemble(&inp.dev, config).map_err(|e| format!("assemble failed: {e}"))?;
+        if let Some(obs) = &observer {
+            // アドレスは直書きせず、組み立て済みの配置から取る。start は MicroVm を消費するので観測は start の前に付ける。
+            for info in vm.devices() {
+                obs.bind(info.slot.kind, info.slot.mmio_base, info.slot.mmio_len);
+            }
+            let dynobs: Arc<dyn RunObserver> = obs.clone();
+            for i in 0..vcpus {
+                if let Some(v) = vm.vcpu_mut(i) {
+                    v.set_observer(dynobs.clone());
+                }
+            }
+        }
         let loaded = vm
-            .load_kernel(&kernel, Some(&initrd), &cmdline)
+            .load_kernel(&inp.kernel, Some(&inp.initrd), &inp.cmdline)
             .map_err(|e| format!("load_kernel failed: {e}"))?;
         let console = vm.serial_console();
         let running = vm
@@ -199,61 +516,32 @@ mod x86 {
         })
     }
 
-    #[test]
-    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
-    fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
-        // 前提の検査はすべてテストスレッドで行う（worker 内 panic では 1 行目が PRECONDITION FAILED にならない）。
-        let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
-            Ok(p) if !p.is_empty() => p,
-            _ => precondition(
-                "FANDHE_CONTAINER_MICROVM_KERNEL is not set (path to an x86_64 bzImage)",
-            ),
-        };
-        let kernel = read_bounded(Path::new(&kernel_path), KERNEL_CAP)
-            .unwrap_or_else(|e| precondition(&format!("kernel image: {e}")));
-        let initrd_path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
-            Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/microvm-test-initrd/x86_64/initrd.cpio"),
-        };
-        let initrd = read_bounded(&initrd_path, INITRD_CAP).unwrap_or_else(|e| {
-            precondition(&format!(
-                "initrd (run `make microvm-test-initrd-build`): {e}"
-            ))
-        });
-        let cmdline = validate_cmdline(
-            std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or_else(|e| precondition(&e));
-        let secs = parse_boot_timeout(
-            std::env::var("FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or_else(|e| precondition(&e));
-        let dev = KvmDevice::open().unwrap_or_else(|e| precondition(&e.to_string()));
-
+    /// 別スレッドで `boot` を回し、全体期限で必ず戻る（REPAIR-5）。
+    fn run_boot<B, N>(
+        inp: Inputs,
+        config: MicroVmConfig<B, N>,
+        observer: Option<Arc<VirtioWindowObserver>>,
+    ) -> Outcome
+    where
+        B: BlockBackend + Send + 'static,
+        N: NetBackend + Send + 'static,
+    {
+        let secs = inp.secs;
         let boot_timeout = Duration::from_secs(secs);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(boot(dev, kernel, initrd, cmdline, boot_timeout));
+            let _ = tx.send(boot(inp, config, observer, boot_timeout));
         });
         // REPAIR-5: 止まった vCPU スレッドが残っても、全体期限で必ず試験を終える。
-        let o = match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
+        match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => panic!("kernel_boot: boot sequence failed: {e}"),
             Err(e) => panic!("kernel_boot: DEADLINE EXCEEDED ({e}) after {secs}s boot budget"),
-        };
-        let diag = format!(
-            "reason={:?} exits={} elapsed={:?} timed_out={} serial_tail={}",
-            o.reason,
-            o.exits,
-            o.elapsed,
-            o.timed_out,
-            escape_tail(&o.output, TAIL_BYTES)
-        );
+        }
+    }
+
+    /// 全構成で共通の起動の照合（marker 1 回・GuestShutdown・起点 vCPU 0・エラー 0・取りこぼし 0・期限内）。
+    fn assert_boot_ok(o: &Outcome, vcpus: u32, diag: &str) {
         assert_eq!(
             count_marker_lines(&o.output, MARKER),
             1,
@@ -261,10 +549,27 @@ mod x86 {
         );
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
-        assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+        assert_eq!(o.vcpu_count, vcpus, "vcpu count: {diag}");
         assert_eq!(o.errors, 0, "run errors: {diag}");
         assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
         assert!(!o.timed_out, "boot timed out: {diag}");
+    }
+
+    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION";
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
+        let inp = inputs();
+        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![],
+        };
+        let o = run_boot(inp, config, None);
+        let diag = o.diag("");
+        assert_boot_ok(&o, 1, &diag);
         eprintln!(
             "kernel_boot: ok reason=guest_shutdown elapsed_ms={} serial_bytes={} exits={}",
             o.elapsed.as_millis(),
@@ -273,6 +578,184 @@ mod x86 {
         );
     }
 
+    /// vCPU 2 台（#3865・MVM-1）。MP テーブル・MADT が未実装のため AP は Linux にオンラインにならず、BSP だけで
+    /// `/init` に届く。2 台構成の VM が実カーネルで最後まで起動し、BSP 起因の停止で 2 台とも回収されることを照合する。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
+        let inp = inputs();
+        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 2,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let smp_line = String::from_utf8_lossy(&o.output).contains("smp:");
+        let extra = format!(
+            "ap_exits={} smp_line={smp_line}",
+            obs.ap_exits.load(Ordering::Relaxed)
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok(&o, 2, &diag);
+        eprintln!(
+            "kernel_boot: ok case=two_vcpus reason=guest_shutdown vcpu_count=2 elapsed_ms={} {extra}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// virtio-block 1 台（1 MiB・読み取り専用。#3865・MVM-1）。起動元は initrd のまま、カーネルの virtio_blk の
+    /// probe とパーティション走査でブロックが読まれることをホスト側で観測する。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_reads_disk() {
+        let inp = inputs();
+        let (backend, counters) = CountingBlockBackend::new(1 << 20);
+        let config: MicroVmConfig<CountingBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![backend],
+            net: vec![],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Block);
+        let reads = counters.reads.load(Ordering::Relaxed);
+        let off0 = counters.offset0_reads.load(Ordering::Relaxed);
+        let extra = format!(
+            "block={s:?} reads={reads} offset0_reads={off0} read_bytes={} writes={} flushes={} hint=\"{KCONFIG_HINT}\"",
+            counters.read_bytes.load(Ordering::Relaxed),
+            counters.writes.load(Ordering::Relaxed),
+            counters.flushes.load(Ordering::Relaxed),
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok(&o, 1, &diag);
+        assert_eq!(s.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "block FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
+        assert!(reads >= 1, "block read_at count: {diag}");
+        assert!(off0 >= 1, "block offset-0 reads: {diag}");
+        eprintln!(
+            "kernel_boot: ok case=virtio_block driver_ok=0x0f queue_ready=1 reads={reads} offset0_reads={off0} elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// virtio-net 1 台（#3865・MVM-1）。ドライバの probe が DRIVER_OK まで進み、receiveq・transmitq の 2 本が
+    /// QUEUE_READY になることを照合する（RX・TX は interface を上げる userspace が無いので照合しない）。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_reaches_driver_ok() {
+        let inp = inputs();
+        let (backend, counters) = CountingNetBackend::new();
+        let config: MicroVmConfig<MemoryBlockBackend, CountingNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend,
+                mac: NET_MAC,
+            }],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let extra = format!(
+            "net={s:?} sent={} recv_calls={} hint=\"{KCONFIG_HINT}\"",
+            counters.sent.load(Ordering::Relaxed),
+            counters.recv_calls.load(Ordering::Relaxed),
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok(&o, 1, &diag);
+        assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        eprintln!(
+            "kernel_boot: ok case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    fn synthetic_mmio_write(vcpu_id: u32, addr: u64, value: u32) -> RunRecord {
+        RunRecord {
+            vcpu_id,
+            outcome: RunOutcome::Exit("mmio"),
+            elapsed: Duration::ZERO,
+            value: Some(ExitValue::Mmio {
+                phys_addr: addr,
+                len: 4,
+                is_write: true,
+                data: ExitData::from_slice(&value.to_le_bytes()),
+            }),
+        }
+    }
+
+    #[test]
+    fn mvm1_3865_observer_counts_status_and_queue_ready() {
+        let obs = VirtioWindowObserver::new();
+        let (blk, net) = (0xd000_0000u64, 0xd000_1000u64);
+        obs.bind(VirtioDeviceKind::Block, blk, 0x1000);
+        obs.bind(VirtioDeviceKind::Net, net, 0x1000);
+        // 窓の外・読み出し・値なしは数えない。
+        obs.record(&synthetic_mmio_write(0, 0xd000_2000 + reg::STATUS, 0x0F));
+        obs.record(&synthetic_mmio_write(0, 0xcfff_f000, 0x0F));
+        let mut read = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
+        if let Some(ExitValue::Mmio { is_write, .. }) = read.value.as_mut() {
+            *is_write = false;
+        }
+        obs.record(&read);
+        let mut none = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
+        none.value = None;
+        obs.record(&none);
+        let zero = WindowStats {
+            driver_ok_first: None,
+            failed_writes: 0,
+            status_writes: 0,
+            queue_ready_one: 0,
+        };
+        assert_eq!(obs.stats(VirtioDeviceKind::Block), zero);
+        assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
+        // block: ACK→DRIVER→FEATURES_OK→DRIVER_OK の順。DRIVER_OK を含む最初の値が残る。
+        for v in [0u32, 1, 3, 11, 15, 0x8F] {
+            obs.record(&synthetic_mmio_write(0, blk + reg::STATUS, v));
+        }
+        obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 1));
+        obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 0));
+        assert_eq!(
+            obs.stats(VirtioDeviceKind::Block),
+            WindowStats {
+                driver_ok_first: Some(0x0F),
+                failed_writes: 1,
+                status_writes: 6,
+                queue_ready_one: 1,
+            }
+        );
+        // net の窓は取り違えない。
+        assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
+        obs.record(&synthetic_mmio_write(1, net + reg::QUEUE_READY, 1));
+        obs.record(&synthetic_mmio_write(0, net + reg::QUEUE_READY, 1));
+        assert_eq!(obs.stats(VirtioDeviceKind::Net).queue_ready_one, 2);
+        assert_eq!(obs.stats(VirtioDeviceKind::Block).queue_ready_one, 1);
+        assert_eq!(obs.ap_exits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mvm1_3865_counting_block_backend() {
+        let (mut b, c) = CountingBlockBackend::new(4096);
+        assert!(b.read_only());
+        assert_eq!(b.capacity_bytes(), 4096);
+        let mut buf = [0u8; 512];
+        b.read_at(0, &mut buf).unwrap();
+        b.read_at(512, &mut buf).unwrap();
+        assert!(b.write_at(0, &buf).is_err());
+        b.flush().unwrap();
+        assert_eq!(c.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(c.offset0_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(c.read_bytes.load(Ordering::Relaxed), 1024);
+        assert_eq!(c.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(c.flushes.load(Ordering::Relaxed), 1);
+    }
     #[test]
     fn mvm1_3771_marker_matches_initrd_script() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -363,28 +846,71 @@ mod x86 {
 mod other {
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::error::MicrovmErrorCode;
-    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    #[test]
-    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
-    fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
-        let dev = match KvmDevice::open() {
+    fn open_kvm() -> KvmDevice {
+        match KvmDevice::open() {
             Ok(d) => d,
             Err(e) => {
                 panic!("kernel_boot: PRECONDITION FAILED (test environment, not a regression): {e}")
             }
-        };
-        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
-            vcpu_count: 1,
-            mem_size: 1 << 20,
-            block: vec![],
-            net: vec![],
-        };
+        }
+    }
+
+    fn assert_unimplemented(config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend>) {
+        let dev = open_kvm();
         assert_eq!(
             MicroVm::assemble(&dev, config).unwrap_err().code(),
             MicrovmErrorCode::Unimplemented
         );
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 2,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_reads_disk() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![MemoryBlockBackend::new(1 << 20, true).unwrap()],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_reaches_driver_ok() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65],
+            }],
+        });
     }
 }

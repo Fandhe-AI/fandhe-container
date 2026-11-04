@@ -198,3 +198,98 @@ fn mvm5_3788_invalid_layouts_rejected() {
         );
     }
 }
+
+fn fdt_for(layout: &Arm64Layout) -> Parsed {
+    let cfg = GuestFdtConfig {
+        layout,
+        bootargs: "console=ttyS0",
+        initrd: None,
+    };
+    parse(&build_guest_fdt(&cfg).unwrap())
+}
+
+fn cpu_nodes(p: &Parsed) -> Vec<&String> {
+    p.nodes
+        .iter()
+        .filter(|n| n.starts_with("/cpus/cpu@"))
+        .collect()
+}
+
+/// MVM-5・MVM-1・#3864: vCPU 2 の cpu ノードと GICR の大きさ。
+#[test]
+fn mvm5_3864_fdt_two_vcpus() {
+    let p = fdt_for(&Arm64Layout::new(256 * MIB, 2, 1).unwrap());
+    assert_eq!(cpu_nodes(&p), ["/cpus/cpu@0", "/cpus/cpu@1"]);
+    for (path, reg) in [("/cpus/cpu@0", 0u32), ("/cpus/cpu@1", 1)] {
+        assert_eq!(p.cells(path, "reg"), vec![reg]);
+        assert_eq!(p.get(path, "device_type"), b"cpu\0");
+        assert_eq!(p.get(path, "compatible"), b"arm,arm-v8\0");
+        assert_eq!(p.get(path, "enable-method"), b"psci\0");
+    }
+    assert_eq!(
+        p.cells("/intc@8000000", "reg"),
+        vec![0, 0x0800_0000, 0, 0x1_0000, 0, 0x0820_0000, 0, 0x4_0000]
+    );
+}
+
+/// MVM-5・MVM-1・#3864: vCPU 4。
+#[test]
+fn mvm5_3864_fdt_four_vcpus() {
+    let p = fdt_for(&Arm64Layout::new(256 * MIB, 4, 1).unwrap());
+    assert_eq!(
+        cpu_nodes(&p),
+        ["/cpus/cpu@0", "/cpus/cpu@1", "/cpus/cpu@2", "/cpus/cpu@3"]
+    );
+    for n in 0..4u32 {
+        assert_eq!(p.cells(&format!("/cpus/cpu@{n}"), "reg"), vec![n]);
+    }
+    assert_eq!(
+        p.cells("/intc@8000000", "reg"),
+        vec![0, 0x0800_0000, 0, 0x1_0000, 0, 0x0820_0000, 0, 0x8_0000]
+    );
+    assert_eq!(p.cells("/cpus", "#address-cells"), vec![1]);
+    assert_eq!(p.cells("/cpus", "#size-cells"), vec![0]);
+}
+
+/// MVM-5・MVM-1・#3864: 17 vCPU で affinity が繰り上がる。
+#[test]
+fn mvm5_3864_fdt_seventeen_vcpus_affinity() {
+    let p = fdt_for(&Arm64Layout::new(256 * MIB, 17, 0).unwrap());
+    assert_eq!(cpu_nodes(&p).len(), 17);
+    assert_eq!(p.cells("/cpus/cpu@100", "reg"), vec![0x100]);
+    assert_eq!(p.cells("/cpus/cpu@f", "reg"), vec![0xf]);
+}
+
+/// MVM-5・MVM-1・#3864: シリアルのノードと stdout-path。
+#[test]
+fn mvm5_3864_fdt_serial_and_stdout_path() {
+    let l = Arm64Layout::new(256 * MIB, 1, 2)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    let p = fdt_for(&l);
+    let s = "/serial@9000000";
+    assert_eq!(p.get(s, "compatible"), b"ns16550a\0");
+    assert_eq!(p.cells(s, "reg"), vec![0, 0x0900_0000, 0, 0x1000]);
+    assert_eq!(p.cells(s, "reg-shift"), vec![0]);
+    assert_eq!(p.cells(s, "reg-io-width"), vec![1]);
+    assert_eq!(p.cells(s, "clock-frequency"), vec![1_843_200]);
+    assert!(!p.has(s, "interrupts"));
+    assert_eq!(p.get("/chosen", "stdout-path"), b"/serial@9000000\0");
+    assert_eq!(
+        p.cells("/virtio_mmio@a000000", "reg"),
+        vec![0, 0x0a00_0000, 0, 0x200]
+    );
+    assert_eq!(
+        p.cells("/virtio_mmio@a000000", "interrupts"),
+        vec![0, 16, 1]
+    );
+}
+
+/// MVM-5・#3864: 既定ではシリアルを載せない。
+#[test]
+fn mvm5_3864_fdt_no_serial_by_default() {
+    let p = fdt_for(&Arm64Layout::new(256 * MIB, 1, 1).unwrap());
+    assert_eq!(p.nodes.iter().filter(|n| n.contains("serial@")).count(), 0);
+    assert!(!p.has("/chosen", "stdout-path"));
+}

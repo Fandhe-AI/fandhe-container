@@ -14,15 +14,27 @@
 //!   virtual timer の PPI は [`check_virtual_timer_intid`] が API の INTID と照合する。FDT を API の値から
 //!   組み直さず照合で fail-closed にするのは、`build_guest_fdt` の署名変更を #3790・#3797 へ波及させないため。
 //!
-//! 未実装（REPAIR-3）: SMP（vCPU 2 以上は `Unimplemented`。#3797）・シリアルと `stdout-path`（chosen に付けない）・
-//! PCI・IPA 上限の確定（#3803）。
+//! SMP とシリアル（#3864・MVM-5・MVM-1）:
+//! - `cpus` には vCPU 数ぶんの `cpu@N` を出す。`reg` は [`arm64_vcpu_mpidr_affinity`]（Aff0 = n % 16、Aff1 = n / 16）。
+//!   将来 HVF で SMP を作るときは、vCPU n の `MPIDR_EL1` にこの値を書く（GICv3 は redistributor を `GICR_TYPER` の
+//!   affinity で引くため、FDT の値と一致している必要がある）。上限は [`ARM64_MAX_VCPUS`]。
+//! - シリアルは `layout.serial` が `Some` のときだけ、8250 互換（`ns16550a`・`reg-shift = 0`・`reg-io-width = 1`）の
+//!   MMIO ノードと `/chosen/stdout-path` を出す（実体の無いデバイスを FDT に載せない）。モデルは
+//!   [`crate::uart::SerialConsole::mmio_device`]。PL011 は clock ノードと phandle が要り、既存モデルを流用できないため採らない。
+//! - `interrupts` は出さない。8250_of は IRQ が解決できないとき irq = 0 で続行しポーリング（タイマ駆動）で動く
+//!   （Linux `drivers/tty/serial/8250/8250_of.c` の `of_platform_serial_setup` の理解。`serial/8250.yaml` の
+//!   `required` からは逸脱する。実ゲストでの確認は後続）。
+//!
+//! 未実装（REPAIR-3）: HVF の SMP（vCPU 1..N のスレッド・PSCI CPU_ON・`HVF_MAX_VCPUS` の引き上げ。バックエンドは 1 vCPU のまま。
+//! N 個の cpu を持つ FDT が実ゲストに届くと Linux は「failed to boot CPUn」を出して 1 CPU で動き続ける）・
+//! HvfMicroVm へのシリアル結線とバス上限の調整・シリアルの割り込みとゲスト入力・PCI・IPA 上限の確定（#3803）。
 //!
 //! virtio の通知方式（#3795）: FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。SPI 番号が API の範囲内かは
 //! [`check_spi_intid`] が照合する。level への変更と InterruptACK 後の deassert は対象外。
 //!
 //! # 出典（Linux `Documentation/devicetree/bindings`）
-//! `arm/psci.yaml`・`interrupt-controller/arm,gic-v3.yaml`・`timer/arm,arch_timer.yaml`・`virtio/mmio.yaml`・`arm/cpus.yaml`。
+//! `arm/psci.yaml`・`serial/8250.yaml`・`interrupt-controller/arm,gic-v3.yaml`・`timer/arm,arch_timer.yaml`・`virtio/mmio.yaml`・`arm/cpus.yaml`。
 //! 割り込みセルの値は `include/dt-bindings/interrupt-controller/{arm-gic.h,irq.h}`。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -43,6 +55,14 @@ pub const ARM64_GIC_REDIST_BASE: u64 = 0x0820_0000;
 pub const ARM64_GIC_REDIST_SIZE_PER_CPU: u64 = 0x2_0000;
 /// virtio-mmio の窓の先頭。
 pub const ARM64_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+/// 8250 互換シリアルの MMIO 基底（GICR の最大終端の後ろ、virtio の窓の前。#3864）。
+pub const ARM64_SERIAL_BASE: u64 = 0x0900_0000;
+/// シリアルの窓の大きさ。
+pub const ARM64_SERIAL_SIZE: u64 = 0x1000;
+/// FDT の `clock-frequency`（標準の 8250 の 1.8432 MHz。ボーレートの除数計算用で、出力には影響しない）。
+pub const ARM64_SERIAL_CLOCK_HZ: u32 = 1_843_200;
+/// vCPU 数の上限。redistributor の窓が [`ARM64_SERIAL_BASE`] に収まる範囲で決める。
+pub const ARM64_MAX_VCPUS: u32 = 64;
 /// virtio-mmio の窓の刻み（設定空間 0x100 とレジスタ 0x100 を収める）。
 pub const ARM64_VIRTIO_MMIO_STRIDE: u64 = 0x200;
 /// virtio-mmio の個数の上限。
@@ -102,6 +122,12 @@ const _: () = {
             <= ARM64_RAM_BASE
     );
     assert!(ARM64_VIRTIO_MMIO_STRIDE >= CONFIG_SPACE_SIZE + 0x100);
+    assert!(
+        ARM64_GIC_REDIST_BASE + ARM64_GIC_REDIST_SIZE_PER_CPU * ARM64_MAX_VCPUS as u64
+            <= ARM64_SERIAL_BASE
+    );
+    assert!(ARM64_SERIAL_BASE + ARM64_SERIAL_SIZE <= ARM64_VIRTIO_MMIO_BASE);
+    assert!(ARM64_BOOT_CPU_MPIDR == 0);
 };
 
 fn invalid(msg: &'static str) -> MicrovmError {
@@ -173,6 +199,8 @@ pub struct Arm64Layout {
     pub vcpus: u32,
     /// IPA 上限（排他的）。
     pub ipa_limit: u64,
+    /// 8250 互換シリアルの MMIO 窓。`Some` のときだけ FDT に載せる（#3864）。
+    pub serial: Option<MmioRegion>,
 }
 
 impl Arm64Layout {
@@ -191,9 +219,17 @@ impl Arm64Layout {
             virtio_spi_base: ARM64_VIRTIO_SPI_BASE,
             vcpus,
             ipa_limit: ARM64_DEFAULT_IPA_LIMIT,
+            serial: None,
         };
         layout.validate()?;
         Ok(layout)
+    }
+
+    /// 既定の窓（[`ARM64_SERIAL_BASE`]・[`ARM64_SERIAL_SIZE`]）でシリアルを有効にし、[`Self::validate`] を通して返す。
+    pub fn with_default_serial(mut self) -> Result<Self, MicrovmError> {
+        self.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
+        self.validate()?;
+        Ok(self)
     }
 
     fn virtio_window_all(&self) -> Result<MmioRegion, MicrovmError> {
@@ -224,6 +260,12 @@ impl Arm64Layout {
         if self.vcpus == 0 {
             return Err(invalid("vcpu count must be non-zero"));
         }
+        if self.vcpus > ARM64_MAX_VCPUS {
+            return Err(invalid("too many vcpus"));
+        }
+        if matches!(self.serial, Some(r) if r.size == 0) {
+            return Err(invalid("serial region size must be non-zero"));
+        }
         let need = ARM64_GIC_REDIST_SIZE_PER_CPU
             .checked_mul(u64::from(self.vcpus))
             .ok_or_else(|| invalid("guest layout size overflow"))?;
@@ -250,6 +292,9 @@ impl Arm64Layout {
         let mut regions = vec![self.ram, self.gic_dist, self.gic_redist];
         if self.virtio_mmio_count > 0 {
             regions.push(virtio);
+        }
+        if let Some(serial) = self.serial {
+            regions.push(serial);
         }
         for r in &regions {
             match r.end() {
@@ -448,6 +493,23 @@ pub struct GuestFdtConfig<'a> {
     pub initrd: Option<MmioRegion>,
 }
 
+/// vCPU `index` の MPIDR affinity（`MPIDR` の下位 24 ビット。Aff0 = index % 16、Aff1 = index / 16）。
+///
+/// GICv3 の SGI の TargetList は 16 ビットで、1 クラスタの Aff0 は 0..15 に限る（KVM の既定の割り当てと同形）。
+/// FDT の `cpu@N` の `reg` と、将来の vCPU の `MPIDR_EL1` はこの値で一致させる（#3864・MVM-5）。
+/// `index >= ARM64_MAX_VCPUS` は `InvalidArgument`。
+pub fn arm64_vcpu_mpidr_affinity(index: u32) -> Result<u32, MicrovmError> {
+    if index >= ARM64_MAX_VCPUS {
+        return Err(invalid("vcpu index out of range"));
+    }
+    Ok(((index / 16) << 8) | (index % 16))
+}
+
+/// シリアルのノード名（`serial@<base>`）。`stdout-path` と同じ値から作り、食い違わせない。
+fn serial_node_name(r: &MmioRegion) -> String {
+    format!("serial@{:x}", r.base.raw())
+}
+
 fn hi_lo(v: u64) -> [u32; 2] {
     [(v >> 32) as u32, v as u32]
 }
@@ -461,19 +523,14 @@ fn reg_cells(regions: &[(u64, u64)]) -> Vec<u32> {
     cells
 }
 
-/// arm64 ゲスト向けの FDT を組み立てる（ルート・chosen・memory・cpus・psci・GICv3・timer・virtio-mmio）。
+/// arm64 ゲスト向けの FDT を組み立てる（ルート・chosen・memory・cpus・psci・GICv3・timer・シリアル・virtio-mmio）。
 ///
-/// `Unimplemented`: vCPU が 1 以外（#3797）。`InvalidArgument`: 配置の違反・bootargs 超過・initrd が RAM の外。
-/// `stdout-path` は付けない（シリアル未実装。REPAIR-3）。
+/// `InvalidArgument`: 配置の違反（vCPU 数の上限超過を含む）・bootargs 超過・initrd が RAM の外。
+/// `cpu@N` は vCPU 数ぶん出す（HVF のバックエンドは 1 vCPU のまま。REPAIR-3）。
+/// `layout.serial` が `Some` のときだけ、シリアルのノードと `/chosen/stdout-path` を出す（`None` は従来と同じ出力）。
 pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmError> {
     let l = config.layout;
     l.validate()?;
-    if l.vcpus != 1 {
-        return Err(MicrovmError::new(
-            MicrovmErrorCode::Unimplemented,
-            "only one vcpu is supported",
-        ));
-    }
     if config.bootargs.len() > ARM64_MAX_BOOTARGS {
         return Err(invalid("bootargs too long"));
     }
@@ -505,6 +562,10 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
         b.property_u64("linux,initrd-start", start)?;
         b.property_u64("linux,initrd-end", end)?;
     }
+    if let Some(serial) = &l.serial {
+        // aliases は作らない。of_console_check は 8250 の最初の line（ttyS0）で照合が成り立つ。
+        b.property_string("stdout-path", &format!("/{}", serial_node_name(serial)))?;
+    }
     b.end_node()?;
 
     b.begin_node(&format!("memory@{:x}", l.ram.base.raw()))?;
@@ -516,12 +577,15 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
     b.begin_node("cpus")?;
     b.property_u32("#address-cells", 1)?;
     b.property_u32("#size-cells", 0)?;
-    b.begin_node("cpu@0")?;
-    b.property_string("device_type", "cpu")?;
-    b.property_string("compatible", "arm,arm-v8")?;
-    b.property_string("enable-method", "psci")?;
-    b.property_cells("reg", &[ARM64_BOOT_CPU_MPIDR])?;
-    b.end_node()?;
+    for n in 0..l.vcpus {
+        let mpidr = arm64_vcpu_mpidr_affinity(n)?;
+        b.begin_node(&format!("cpu@{mpidr:x}"))?;
+        b.property_string("device_type", "cpu")?;
+        b.property_string("compatible", "arm,arm-v8")?;
+        b.property_string("enable-method", "psci")?;
+        b.property_cells("reg", &[mpidr])?;
+        b.end_node()?;
+    }
     b.end_node()?;
 
     // arm/psci.yaml: method = "hvc"。HVC の exit は VMM（vCPU ループ）が処理する。
@@ -554,6 +618,17 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
     b.property_string("compatible", "arm,armv8-timer")?;
     b.property_cells("interrupts", &irq)?;
     b.end_node()?;
+
+    // serial/8250.yaml。interrupts は出さずポーリングで動かす（モジュール doc 参照）。
+    if let Some(serial) = &l.serial {
+        b.begin_node(&serial_node_name(serial))?;
+        b.property_string("compatible", "ns16550a")?;
+        b.property_cells("reg", &reg_cells(&[(serial.base.raw(), serial.size)]))?;
+        b.property_u32("reg-shift", 0)?;
+        b.property_u32("reg-io-width", 1)?;
+        b.property_u32("clock-frequency", ARM64_SERIAL_CLOCK_HZ)?;
+        b.end_node()?;
+    }
 
     // virtio/mmio.yaml。
     for i in 0..l.virtio_mmio_count {
@@ -718,7 +793,7 @@ mod tests {
         expect_invalid(&l, "virtio-mmio stride is too small");
     }
 
-    /// MVM-5: SMP と bootargs・initrd の検査。
+    /// MVM-5: SMP（2 vCPU は受理）と bootargs・initrd の検査。
     #[test]
     fn mvm5_3788_fdt_input_checks() {
         let two = Arm64Layout::new(256 * MIB, 2, 0).unwrap();
@@ -727,10 +802,7 @@ mod tests {
             bootargs: "",
             initrd: None,
         };
-        assert_eq!(
-            build_guest_fdt(&cfg).unwrap_err().code(),
-            MicrovmErrorCode::Unimplemented
-        );
+        assert!(build_guest_fdt(&cfg).is_ok());
         let one = Arm64Layout::new(256 * MIB, 1, 0).unwrap();
         // 境界値: 2047 バイトは受理し、2048 バイト（NUL 終端を含めると 2049）は拒否する。
         assert_eq!(ARM64_MAX_BOOTARGS, 2047);
@@ -863,5 +935,56 @@ mod tests {
         assert_eq!(TIMER_PPIS, [13, 14, 11, 10]);
         assert_eq!(TIMER_PPIS[2], ARM64_TIMER_VIRT_PPI);
         assert_eq!(ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI, 27);
+    }
+
+    /// MVM-5・MVM-1・#3864: MPIDR affinity の具体値。
+    #[test]
+    fn mvm5_3864_vcpu_mpidr_affinity_values() {
+        for (idx, want) in [
+            (0, 0),
+            (1, 1),
+            (15, 0xf),
+            (16, 0x100),
+            (17, 0x101),
+            (63, 0x30f),
+        ] {
+            assert_eq!(arm64_vcpu_mpidr_affinity(idx).unwrap(), want, "idx={idx}");
+        }
+        assert_eq!(
+            arm64_vcpu_mpidr_affinity(64).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+
+    /// MVM-5・#3864: vCPU 数の上限。
+    #[test]
+    fn mvm5_3864_validate_vcpu_cap() {
+        assert!(Arm64Layout::new(4 * MIB, ARM64_MAX_VCPUS, 0).is_ok());
+        let e = Arm64Layout::new(4 * MIB, ARM64_MAX_VCPUS + 1, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "too many vcpus");
+        assert!(
+            ARM64_GIC_REDIST_BASE + ARM64_GIC_REDIST_SIZE_PER_CPU * u64::from(ARM64_MAX_VCPUS)
+                <= ARM64_SERIAL_BASE
+        );
+    }
+
+    /// MVM-5・#3864: シリアル窓の検査。
+    #[test]
+    fn mvm5_3864_validate_serial_region() {
+        let base = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
+        let l = base.clone().with_default_serial().unwrap();
+        assert_eq!(l.serial, Some(MmioRegion::new(0x0900_0000, 0x1000)));
+        let mut z = l.clone();
+        z.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, 0));
+        expect_invalid(&z, "serial region size must be non-zero");
+        for b in [0x0800_0000u64, 0x0820_0000, 0x0a00_0000, 0x4000_0000] {
+            let mut o = l.clone();
+            o.serial = Some(MmioRegion::new(b, ARM64_SERIAL_SIZE));
+            expect_invalid(&o, "guest layout regions overlap");
+        }
+        let mut hi = l.clone();
+        hi.serial = Some(MmioRegion::new(hi.ipa_limit, ARM64_SERIAL_SIZE));
+        expect_invalid(&hi, "guest layout exceeds the ipa limit");
     }
 }

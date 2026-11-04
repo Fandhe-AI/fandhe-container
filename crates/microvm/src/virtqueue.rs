@@ -11,6 +11,22 @@
 //! packed は広告しないので扱わない（REPAIR-3）。順序（avail.idx を読んでから ring を読む・used 要素を書いてから
 //! used.idx を書く）は fence で表す。コピー API は非アトミックなので、実機のバリアになることに依存する。
 //!
+//! # 共有 index の単一命令アクセス（#3862・MVM-1・MVM-5・REPAIR-3）
+//! `avail.idx`（ゲストが書く）の読みと `used.idx`（デバイスが書く）の書きだけは、2 バイト整列した単一の
+//! volatile アクセス（`GuestMemory::read_u16_le_aligned` / `write_u16_le_aligned`）で行い、相手が書く途中の値
+//! （tear）を見せない・見ない。「単一命令」は Rust の言語仕様の保証ではなく、x86_64・aarch64 で自然整列した
+//! 2 バイトの volatile が 1 命令に下りる前提（Linux の `READ_ONCE` / `WRITE_ONCE` と同じ）。順序は従来どおり
+//! fence と実機のバリア命令に頼り、Rust のメモリモデル上の正式な同期ではない。
+//!
+//! index 以外には適用しない（使われない unsafe を増やさないため）。
+//! - `avail.ring[slot]` の要素: ドライバは要素を書いてから `avail.idx` を進める（仕様 2.7.13）。デバイスは idx を読み
+//!   Acquire の fence を置いてから要素を読むので、順序を守るドライバでは書き換え中の要素を読まない。
+//! - `used.ring[]` の要素: デバイスが要素を書き Release の fence を置いてから `used.idx` を進めるため、
+//!   ドライバが idx を見た時点で要素は書き終えている。
+//! - 記述子（16 バイト）: 1 回だけコピーして同じ値で検査・使用する。規約違反のドライバが書き換え中の値を見せても、
+//!   非信頼入力として範囲検査で受け止める。
+//! - 4 バイト以上の単一命令アクセスは、index を持つ利用者がいないため足していない。
+//!
 //! # 外部入力の扱い
 //! avail の idx・ring・記述子の内容はすべてゲストが書く非信頼入力。共有メモリから 1 回だけコピーし、検査と使用を
 //! 同じ値で行う（TOCTOU 防止）。チェーン長・合計バイト数に上限を置く。失敗した `pop` は `last_avail` を進めず、
@@ -228,7 +244,10 @@ impl SplitQueue {
         &mut self,
         mem: &GuestMemory<B>,
     ) -> Result<Option<DescriptorChain>, VirtqueueError> {
-        let avail_idx = mem.read_u16_le(Self::at(self.avail, 2)?).map_err(mem_err)?;
+        // 共有 index は tear しない単一命令の volatile で 1 回だけ読む（#3862）。
+        let avail_idx = mem
+            .read_u16_le_aligned(Self::at(self.avail, 2)?)
+            .map_err(mem_err)?;
         // avail.idx を読んだ後でなければ ring の要素を読んではならない（仕様 2.7.13）。
         fence(Ordering::Acquire);
         let pending = avail_idx.wrapping_sub(self.last_avail);
@@ -343,7 +362,8 @@ impl SplitQueue {
         // 要素を書いた後でなければ used.idx を進めてはならない（仕様 2.7.13）。
         fence(Ordering::Release);
         self.next_used = self.next_used.wrapping_add(1);
-        mem.write_u16_le(Self::at(self.used, 2)?, self.next_used)
+        // 共有 index は tear しない単一命令の volatile で書く（#3862）。
+        mem.write_u16_le_aligned(Self::at(self.used, 2)?, self.next_used)
             .map_err(mem_err)?;
         Ok(())
     }
@@ -502,6 +522,134 @@ mod tests {
         assert_eq!(m.read_u32_le(GuestAddress::new(USED + 8)).unwrap(), 513);
         let e = q.add_used(&mut m, &c, 514).unwrap_err();
         assert_eq!(e.code(), VirtqueueErrorCode::UsedLenExceedsWritable);
+    }
+
+    /// 試験用: アクセス幅を記録する backing（HeapBacking を包む）。
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    enum Access {
+        Read { offset: u64, len: usize },
+        Write { offset: u64, len: usize },
+        ReadU16Aligned { offset: u64 },
+        WriteU16Aligned { offset: u64, value: u16 },
+    }
+
+    struct RecordingBacking {
+        inner: crate::guest_memory::HeapBacking,
+        log: std::rc::Rc<std::cell::RefCell<Vec<Access>>>,
+    }
+
+    impl GuestMemoryBacking for RecordingBacking {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
+            self.log.borrow_mut().push(Access::Read {
+                offset,
+                len: buf.len(),
+            });
+            self.inner.read(offset, buf)
+        }
+        fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
+            self.log.borrow_mut().push(Access::Write {
+                offset,
+                len: data.len(),
+            });
+            self.inner.write(offset, data)
+        }
+        fn read_u16_le_aligned(&self, offset: u64) -> Result<u16, MicrovmError> {
+            self.log
+                .borrow_mut()
+                .push(Access::ReadU16Aligned { offset });
+            self.inner.read_u16_le_aligned(offset)
+        }
+        fn write_u16_le_aligned(&mut self, offset: u64, v: u16) -> Result<(), MicrovmError> {
+            self.log
+                .borrow_mut()
+                .push(Access::WriteU16Aligned { offset, value: v });
+            self.inner.write_u16_le_aligned(offset, v)
+        }
+    }
+
+    fn overlaps(a: &Access, lo: u64, hi: u64, want_write: bool) -> bool {
+        match a {
+            Access::Read { offset, len } if !want_write => {
+                *offset < hi && offset + *len as u64 > lo
+            }
+            Access::Write { offset, len } if want_write => {
+                *offset < hi && offset + *len as u64 > lo
+            }
+            _ => false,
+        }
+    }
+
+    /// MVM-1・MVM-5・#3862: avail.idx の読みと used.idx の書きは整列 u16 の単一アクセスで、
+    /// バイト単位のコピーでは触らない。要素の書きは used.idx の書きより前。
+    #[test]
+    fn mvm1_ring_indices_use_aligned_u16_access() {
+        let heap = crate::guest_memory::HeapBacking::new(4 << 20).unwrap();
+        let shared: std::rc::Rc<std::cell::RefCell<Vec<Access>>> = Default::default();
+        let mut m = GuestMemory::new(
+            GuestAddress::new(0),
+            RecordingBacking {
+                inner: heap,
+                log: shared.clone(),
+            },
+        )
+        .unwrap();
+        // 記述子 0 を書き、avail ring[0]=0、avail.idx=1 を公開する（準備のアクセスは後で捨てる）。
+        let mut d = [0u8; 16];
+        d[0..8].copy_from_slice(&BUF.to_le_bytes());
+        d[8..12].copy_from_slice(&8u32.to_le_bytes());
+        d[12..14].copy_from_slice(&VRING_DESC_F_WRITE.to_le_bytes());
+        m.write_at(GuestAddress::new(DESC), &d).unwrap();
+        m.write_u16_le(GuestAddress::new(AVAIL + 4), 0).unwrap();
+        m.write_u16_le(GuestAddress::new(AVAIL + 2), 1).unwrap();
+        let mut q = SplitQueue::new(&queue_cfg(DESC, AVAIL, USED), &m).unwrap();
+        shared.borrow_mut().clear();
+
+        let c = q.pop(&m).unwrap().unwrap();
+        let log = shared.borrow().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|a| **a == Access::ReadU16Aligned { offset: AVAIL + 2 })
+                .count(),
+            1
+        );
+        assert!(!log.iter().any(|a| overlaps(a, AVAIL + 2, AVAIL + 4, false)));
+
+        shared.borrow_mut().clear();
+        q.add_used(&mut m, &c, 8).unwrap();
+        let log = shared.borrow().clone();
+        let idx_pos = log
+            .iter()
+            .position(|a| {
+                *a == Access::WriteU16Aligned {
+                    offset: USED + 2,
+                    value: 1,
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            log.iter()
+                .filter(|a| matches!(a, Access::WriteU16Aligned { .. }))
+                .count(),
+            1
+        );
+        assert!(!log.iter().any(|a| overlaps(a, USED + 2, USED + 4, true)));
+        // 要素（id・len）の書きは used.idx の書きより前に完了している。
+        assert_eq!(
+            log[..idx_pos],
+            [
+                Access::Write {
+                    offset: USED + 4,
+                    len: 4
+                },
+                Access::Write {
+                    offset: USED + 8,
+                    len: 4
+                },
+            ]
+        );
     }
 
     /// MVM-1: avail.idx が 65535 から 0 へ折り返しても取り出せる。

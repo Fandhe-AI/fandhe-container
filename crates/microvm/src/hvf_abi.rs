@@ -752,6 +752,16 @@ impl HostTimebase {
         Ok(Self { numer, denom })
     }
 
+    /// 換算比の分子（`mach_timebase_info` の numer）。`sys/hvf.rs` の試験が 0 でないことを照合する（#3885・MVM-5）。
+    pub const fn numer(self) -> u32 {
+        self.numer
+    }
+
+    /// 換算比の分母（`mach_timebase_info` の denom）。`sys/hvf.rs` の試験が 0 でないことを照合する（#3885・MVM-5）。
+    pub const fn denom(self) -> u32 {
+        self.denom
+    }
+
     /// `ticks` を ns へ換算する（切り上げ）。u128 の checked 演算で、桁あふれは `None`。
     fn ticks_to_nanos_ceil(self, ticks: u64) -> Option<u128> {
         u128::from(ticks)
@@ -846,6 +856,15 @@ pub fn wfi_wait_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// numer / denom の読み出しが `new` に渡した値をそのまま返す（#3885・MVM-5）。
+    #[test]
+    fn mvm5_3885_host_timebase_accessors_return_given_values() {
+        let a = HostTimebase::new(125, 3).unwrap();
+        assert_eq!((a.numer(), a.denom()), (125, 3));
+        let b = HostTimebase::new(1, 1).unwrap();
+        assert_eq!((b.numer(), b.denom()), (1, 1));
+    }
 
     // ---- WFI の待ち時間（TASK-192.14・#3796・MVM-5・REPAIR-5）----
 

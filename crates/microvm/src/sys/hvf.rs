@@ -453,6 +453,36 @@ impl HostMapping {
         }
         Ok(())
     }
+
+    /// 範囲と、実際のホストポインタの 2 バイト整列を検査してポインタを返す（整列 u16 アクセスの共通部。#3862）。
+    fn aligned_u16_ptr(&self, offset: usize) -> Result<*mut u16, MicrovmError> {
+        self.check_span(offset, 2)?;
+        let p = (self.ptr as *mut u8).wrapping_add(offset);
+        if !(p as usize).is_multiple_of(core::mem::align_of::<u16>()) {
+            return Err(invalid_arg("unaligned guest memory access"));
+        }
+        Ok(p.cast::<u16>())
+    }
+
+    /// `offset` の 2 バイトを整列した単一の volatile 読みで取り LE の u16 として返す（`avail.idx` 用。#3862・MVM-5・MVM-1）。
+    ///
+    /// 範囲外・未整列は `InvalidArgument`（unsafe の前に検査）。「単一命令」は aarch64 の `ldrh` に下りる前提で、
+    /// Rust の言語仕様の保証ではない（Linux の `READ_ONCE` と同じ前提）。
+    pub fn read_u16_le_aligned(&self, offset: usize) -> Result<u16, MicrovmError> {
+        let p = self.aligned_u16_ptr(offset)?;
+        // SAFETY: `aligned_u16_ptr` が範囲（offset + 2 <= len）と u16 の整列を検査済み。領域は self の生存中有効。
+        // ゲストが並行して書きうるため参照（`&u16`）を作らず volatile で読む。
+        Ok(u16::from_le(unsafe { p.read_volatile() }))
+    }
+
+    /// `v` を LE で `offset` へ整列した単一の volatile 書きで置く（`used.idx` 用。契約は読みと同じ。#3862）。
+    pub fn write_u16_le_aligned(&mut self, offset: usize, v: u16) -> Result<(), MicrovmError> {
+        let p = self.aligned_u16_ptr(offset)?;
+        // SAFETY: `aligned_u16_ptr` が範囲と整列を検査済み。領域は self の生存中有効で、&mut self により Rust 側の
+        // 同時アクセスはない。ゲストが並行して読みうるため参照を作らず volatile で書く。
+        unsafe { p.write_volatile(v.to_le()) };
+        Ok(())
+    }
 }
 
 impl Drop for HostMapping {
@@ -546,6 +576,26 @@ impl GuestMapping<'_> {
             .as_mut()
             .ok_or_else(|| invalid_arg("guest memory access out of range"))?
             .write_from(pos, data)
+    }
+
+    /// 対応付けの先頭から `offset` の位置の整列した u16 を単一命令の volatile で読む（#3862）。
+    ///
+    /// `host_offset` がページ境界でも、backing 側がホストポインタで整列を再検査する。
+    pub fn read_u16_le_aligned(&self, offset: usize) -> Result<u16, MicrovmError> {
+        let pos = self.host_span(offset, 2)?;
+        self.host
+            .as_ref()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .read_u16_le_aligned(pos)
+    }
+
+    /// 対応付けの先頭から `offset` の位置へ整列した u16 を単一命令の volatile で書く（#3862）。
+    pub fn write_u16_le_aligned(&mut self, offset: usize, v: u16) -> Result<(), MicrovmError> {
+        let pos = self.host_span(offset, 2)?;
+        self.host
+            .as_mut()
+            .ok_or_else(|| invalid_arg("guest memory access out of range"))?
+            .write_u16_le_aligned(pos, v)
     }
 
     /// 対応付けの保護を `flags` に変える。

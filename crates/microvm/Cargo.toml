@@ -40,6 +40,7 @@
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 # #3795（TASK-192.13）で hvf/gic.rs に GicSpiLine と arm64_layout に check_spi_intid を追加（依存は増やさない。unsafe なし）。
 
+# #3862 でゲスト RAM の backing に virtqueue の index 用の整列した u16 の単一命令 volatile アクセスを追加（依存は増やさない。unsafe は sys.rs・sys/hvf.rs のみ）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

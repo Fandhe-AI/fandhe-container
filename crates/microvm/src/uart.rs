@@ -28,6 +28,8 @@
 //! （読み出しは dispatcher が 0xFF 埋め）。添字アクセス・`unwrap` は使わず、計数は saturating で行う。
 //!
 //! # THRE 割り込み（#3892・MVM-5・MVM-1）
+//! 線が結線されている（[`SerialConsole::mmio_device_with_irq`] を呼んだ）ときだけ有効で、線の無い経路（x86 の PIO・
+//! [`SerialConsole::mmio_device`]）は従来どおり IIR が常に「保留なし」（0x01）を返す。
 //! IER.ETBEI（bit1）が 1 で THRE 保留があるとき、IIR は 0x02（FIFO 有効時は 0xC2）を返し、[`Uart16550::irq_level`] が
 //! `High` になる。保留は ETBEI を 0 から 1 にしたとき・THR 書き込み（ループバック中も含む）・FCR の送信 FIFO リセット
 //! （bit2）で立ち、IIR の読み出し（THRE を返したとき）と ETBEI を 0 にしたときに下がる（QEMU の `hw/char/serial.c` と
@@ -37,9 +39,9 @@
 //! （[`SerialConsole::mmio_device_with_irq`]。arm64 は macOS の level SPI。`crate::spi::SpiLevelLine`）。
 //!
 //! # 未実装（REPAIR-3）
-//! - x86 の IRQ 4（[`COM1_IRQ`]）は出さない。PIO の [`SerialConsole::port_device`] は線を持たず、ETBEI=1 のとき IIR が
-//!   0x02 を返すだけで割り込みは届かない（Linux の `serial8250_do_startup` の THRE 試験は従来どおり BUG_THRE を立てず、
-//!   送信の振る舞いは変わらない）。将来は irqfd の GSI 4 へ結線する。KVM の `IrqFd` は edge のため、level には
+//! - x86 の IRQ 4（[`COM1_IRQ`]）は出さない。PIO の [`SerialConsole::port_device`] は線を持たず、IIR は従来どおり常に
+//!   「保留なし」を返す（届かない THRE を報告すると Linux の `serial8250_do_startup` の THRE 試験が BUG_THRE を立てず、
+//!   ドライバが来ない割り込みを待つため）。将来は irqfd の GSI 4 へ結線する。KVM の `IrqFd` は edge のため、level には
 //!   `KVM_IRQ_LINE` か resamplefd が要る（MVM-1）。
 //! - ゲスト入力（RBR・DR・受信 FIFO・受信データの割り込み）は対象外（#3893）。RBR は常に 0。
 
@@ -110,6 +112,8 @@ pub struct Uart16550 {
     int_pending: u8,
     irq_reported: IrqLevel,
     irq_line_errors: u64,
+    /// 割り込み線が結線済みか（[`SerialConsole::mmio_device_with_irq`] が立てる）。線が無い経路では THRE を IIR に出さない。
+    irq_wired: bool,
 }
 
 impl Default for Uart16550 {
@@ -152,6 +156,7 @@ impl Uart16550 {
             int_pending: 0,
             irq_reported: IrqLevel::Low,
             irq_line_errors: 0,
+            irq_wired: false,
         }
     }
 
@@ -173,7 +178,7 @@ impl Uart16550 {
 
     /// 割り込み線が今あるべき値。THRE が有効（ETBEI=1）で保留なら `High`（#3892）。
     pub fn irq_level(&self) -> IrqLevel {
-        if self.ier & IER_ETBEI != 0 && self.int_pending & INT_THRE != 0 {
+        if self.irq_wired && self.ier & IER_ETBEI != 0 && self.int_pending & INT_THRE != 0 {
             IrqLevel::High
         } else {
             IrqLevel::Low
@@ -404,6 +409,10 @@ impl SerialConsole {
     /// 各アクセスの後、UART の lock を持ったまま線の値の変化だけを `line` へ伝える（線の更新順を UART の状態の順に揃える）。
     /// `line` の失敗でもアクセスは `Handled` のまま返し、[`UartStats::irq_line_errors`] に数える。
     pub fn mmio_device_with_irq(&self, line: Arc<dyn LevelInterruptLine>) -> Box<dyn MmioDevice> {
+        // 線ができたこの時点から THRE を IIR に出す（lock の poison は各アクセスが fail-closed に扱う）。
+        if let Ok(mut u) = self.inner.lock() {
+            u.irq_wired = true;
+        }
         Box::new(SharedUartMmio {
             inner: Arc::clone(&self.inner),
             line: Some(line),
@@ -719,6 +728,7 @@ mod tests {
     #[test]
     fn mvm5_3892_uart_etbei_raises_thre() {
         let mut u = Uart16550::new();
+        u.irq_wired = true;
         assert_eq!(u.irq_level(), IrqLevel::Low);
         wr(&mut u, 1, 0x02);
         assert_eq!(u.irq_level(), IrqLevel::High);
@@ -727,10 +737,23 @@ mod tests {
         assert_eq!(rd(&mut u, 2), 0x01);
     }
 
+    /// MVM-5・MVM-1・#3892: 線の無い経路（x86 の PIO・線なしの MMIO）は ETBEI=1 でも IIR が常に 0x01 で線も Low。
+    #[test]
+    fn mvm5_3892_uart_unwired_iir_stays_no_int() {
+        let console = SerialConsole::new();
+        let mut dev = console.port_device();
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
+        let mut buf = [0u8; 1];
+        assert_eq!(dev.read(2, &mut buf), PortIoOutcome::Handled);
+        assert_eq!(buf, [0x01]);
+        assert_eq!(console.inner.lock().unwrap().irq_level(), IrqLevel::Low);
+    }
+
     /// MVM-5・MVM-1・#3892: THR 書き込みで再び立つ。
     #[test]
     fn mvm5_3892_uart_thr_write_reasserts() {
         let mut u = Uart16550::new();
+        u.irq_wired = true;
         wr(&mut u, 1, 0x02);
         assert_eq!(rd(&mut u, 2), 0x02);
         wr(&mut u, 0, b'x');
@@ -754,6 +777,7 @@ mod tests {
     #[test]
     fn mvm5_3892_uart_fifo_iir_values() {
         let mut u = Uart16550::new();
+        u.irq_wired = true;
         wr(&mut u, 2, 0x01);
         wr(&mut u, 1, 0x02);
         assert_eq!(rd(&mut u, 2), 0xC2);
@@ -764,6 +788,7 @@ mod tests {
     #[test]
     fn mvm5_3892_uart_etbei_clear_drops_line() {
         let mut u = Uart16550::new();
+        u.irq_wired = true;
         wr(&mut u, 1, 0x02);
         assert_eq!(u.irq_level(), IrqLevel::High);
         wr(&mut u, 1, 0x00);

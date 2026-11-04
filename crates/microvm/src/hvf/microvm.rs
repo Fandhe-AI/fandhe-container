@@ -150,7 +150,8 @@ struct HvfSerial {
     id: DeviceId,
     #[allow(dead_code)]
     window: MmioRegion,
-    /// THRE 割り込みの INTID（level の SPI。#3892）。
+    /// THRE 割り込みの INTID（level の SPI。#3892）。結線は `SpiLevelLine` が持つため今は読まず、
+    /// 診断用に保持する（将来 `devices()` 相当の一覧へ載せる想定。#3893 の受信側で使う余地）。
     #[allow(dead_code)]
     spi_intid: u32,
 }

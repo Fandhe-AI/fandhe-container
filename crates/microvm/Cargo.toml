@@ -12,6 +12,7 @@
 # TASK-192.15（#3797）で hvf/microvm.rs（macOS の microVM 構成体）と SharedTransport の virtio_mmio への移動を追加（依存は増やさない。unsafe は増やさない）。
 # TASK-192.9（#3791）で hvf_loop・stop・hvf/vcpu.rs とスタブ（mmio・hvc・timer）を追加（依存は増やさない。unsafe なし）。
 # TASK-192.14（#3796）で hvf_abi に WFI の待ち時間の純関数、hvf/timer.rs の実装、sys/hvf.rs に mach_absolute_time / mach_timebase_info を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
+# #3885 で sys/hvf.rs に host_timebase・host_absolute_time の単体試験と hvf_abi の HostTimebase の numer / denom を追加（依存は増やさない。unsafe 追加なし）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # TASK-74.2.1 で virtio_mmio（OS 非依存の共通トランスポート）を追加（依存は増やさない。unsafe なし）。

@@ -358,11 +358,6 @@ pub struct ArmBootReadback {
     pub sctlr: u64,
 }
 
-/// 書いた起動状態と読み戻し値を照合する（OS 非依存の純関数。macOS の `HvfMicroVm` が vCPU スレッド内で呼ぶ。MVM-5・MVM-1）。
-///
-/// X0・PC・CPSR は完全一致、MPIDR_EL1 は affinity のみ（[`ARM64_MPIDR_AFFINITY_MASK`]）を `ARM64_BOOT_CPU_MPIDR` と比べる。
-/// 不一致は `Internal`。SCTLR_EL1 の M か C が 1 なら MMU・D-cache が有効で arm64 の boot 契約を満たさないため
-/// `FailedPrecondition`（値は書き換えない）。
 /// AP（vCPU `index`）の `MPIDR_EL1` の読み戻しが FDT の `cpu@index` の `reg`（`arm64_vcpu_mpidr_affinity`）と一致するか確かめる
 /// （#3884・MVM-5・MVM-1）。affinity のみ比べ、bit 31（RES1）と U ビットはマスクで除く（BSP の照合と同じ理由）。
 /// 不一致は `Internal`、`index` が範囲外なら `InvalidArgument`。
@@ -377,6 +372,11 @@ pub fn check_vcpu_mpidr_readback(index: u32, raw: u64) -> Result<(), MicrovmErro
     Ok(())
 }
 
+/// 書いた起動状態と読み戻し値を照合する（OS 非依存の純関数。macOS の `HvfMicroVm` が vCPU スレッド内で呼ぶ。MVM-5・MVM-1）。
+///
+/// X0・PC・CPSR は完全一致、MPIDR_EL1 は affinity のみ（[`ARM64_MPIDR_AFFINITY_MASK`]）を `ARM64_BOOT_CPU_MPIDR` と比べる。
+/// 不一致は `Internal`。SCTLR_EL1 の M か C が 1 なら MMU・D-cache が有効で arm64 の boot 契約を満たさないため
+/// `FailedPrecondition`（値は書き換えない）。
 pub fn check_boot_readback(
     expected: &ArmBootState,
     got: &ArmBootReadback,

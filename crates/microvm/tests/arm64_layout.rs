@@ -1,86 +1,17 @@
 //! `arm64_layout::build_guest_fdt` を公開 API だけで呼び、試験内の最小 FDT パーサで読み戻して具体値で照合する
 //! 結合試験（#3788・MVM-5・MVM-1。KVM 不要・OS 非依存）。
 
-use std::collections::HashMap;
-
 use fandhe_container_microvm::arm64_layout::{
     Arm64Layout, GuestFdtConfig, MmioRegion, build_guest_fdt,
 };
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::guest_memory::GuestAddress;
 
+#[path = "support/fdt_parse.rs"]
+mod fdt_parse;
+use fdt_parse::{Parsed, parse};
+
 const MIB: u64 = 1024 * 1024;
-
-fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
-}
-
-/// `(パス, プロパティ名) -> 値` と、存在するノードのパスの一覧。
-struct Parsed {
-    props: HashMap<(String, String), Vec<u8>>,
-    nodes: Vec<String>,
-}
-
-fn parse(blob: &[u8]) -> Parsed {
-    assert_eq!(be32(blob, 0), 0xd00d_feed);
-    let off_struct = be32(blob, 8) as usize;
-    let off_strings = be32(blob, 12) as usize;
-    let mut pos = off_struct;
-    let mut stack: Vec<String> = Vec::new();
-    let mut props = HashMap::new();
-    let mut nodes = Vec::new();
-    loop {
-        let tok = be32(blob, pos);
-        pos += 4;
-        match tok {
-            1 => {
-                let end = pos + blob[pos..].iter().position(|&c| c == 0).unwrap();
-                let name = String::from_utf8(blob[pos..end].to_vec()).unwrap();
-                pos = (end + 1 + 3) & !3;
-                stack.push(name);
-                let path = format!("/{}", stack[1..].join("/"));
-                nodes.push(path);
-            }
-            2 => {
-                stack.pop();
-            }
-            3 => {
-                let len = be32(blob, pos) as usize;
-                let nameoff = be32(blob, pos + 4) as usize;
-                pos += 8;
-                let v = blob[pos..pos + len].to_vec();
-                pos = (pos + len + 3) & !3;
-                let s = off_strings + nameoff;
-                let e = s + blob[s..].iter().position(|&c| c == 0).unwrap();
-                let name = String::from_utf8(blob[s..e].to_vec()).unwrap();
-                let path = format!("/{}", stack[1..].join("/"));
-                props.insert((path, name), v);
-            }
-            4 => continue,
-            9 => break,
-            t => panic!("unknown token {t}"),
-        }
-    }
-    Parsed { props, nodes }
-}
-
-impl Parsed {
-    fn get(&self, path: &str, name: &str) -> &Vec<u8> {
-        self.props
-            .get(&(path.to_string(), name.to_string()))
-            .unwrap_or_else(|| panic!("missing {path} {name}"))
-    }
-    fn cells(&self, path: &str, name: &str) -> Vec<u32> {
-        self.get(path, name)
-            .chunks(4)
-            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
-            .collect()
-    }
-    fn has(&self, path: &str, name: &str) -> bool {
-        self.props
-            .contains_key(&(path.to_string(), name.to_string()))
-    }
-}
 
 /// MVM-5・MVM-1（#3863）: `virtio_spi_trigger = LevelHigh` の FDT は virtio の第 3 セルが 4（level-high）になる。
 #[test]

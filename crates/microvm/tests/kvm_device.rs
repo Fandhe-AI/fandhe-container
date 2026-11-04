@@ -2513,6 +2513,11 @@ fn assert_unimplemented_assemble() {
 #[path = "support/arm64_image.rs"]
 mod arm64_image;
 
+/// 最小 FDT パーサの正本（`tests/arm64_layout.rs` と共有。FDT の `cpu@N` の `reg` を読む。#3899）。
+#[cfg(target_arch = "aarch64")]
+#[path = "support/fdt_parse.rs"]
+mod fdt_parse;
+
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::arm64_image::{
@@ -2636,12 +2641,71 @@ mod arm64 {
         );
     }
 
-    /// MVM-1・#3696・REPAIR-3: 2 台以上の vCPU は AP の起動が無いので、資源を作る前に `Unimplemented`。
+    /// FDT（`loaded` の範囲）をゲストメモリから読み、`/cpus/cpu@<hex>` の `reg` の第 2 セル（affinity）を返す。
+    fn fdt_cpu_reg(
+        vm: &Vm,
+        fdt: fandhe_container_microvm::arm64_layout::MmioRegion,
+        node: &str,
+    ) -> u32 {
+        use fandhe_container_microvm::guest_memory::GuestAddress;
+        let mut blob = vec![0u8; fdt.size as usize];
+        vm.memory()
+            .read_at(GuestAddress::new(fdt.base.raw()), &mut blob)
+            .unwrap();
+        let p = super::fdt_parse::parse(&blob);
+        let cells = p.cells(&format!("/cpus/{node}"), "reg");
+        assert_eq!(cells.len(), 1, "{cells:?}");
+        cells[0]
+    }
+
+    /// MVM-1・#3899: AP の `MPIDR_EL1`（KVM の reset 値）の affinity が FDT の `cpu@N` の `reg` と一致する。
+    /// 2 台構成の vCPU 1 は 1、17 台構成の vCPU 16 は 0x100（番号 16 以上）。生の値は #3781 の記録用に出力する。
     #[test]
-    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
-    fn kvm_device_arm64_assemble_rejects_smp() {
-        let e = MicroVm::assemble(&open(), config(2, 0, 0)).unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn kvm_device_arm64_smp_ap_mpidr_matches_fdt() {
+        use fandhe_container_microvm::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
+        for (vcpus, idx, node, want) in [(2u32, 1usize, "cpu@1", 1u32), (17, 16, "cpu@100", 0x100)]
+        {
+            let mut vm = MicroVm::assemble(&open(), config(vcpus, 0, 0)).unwrap_or_else(|e| {
+                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+            });
+            let loaded = vm
+                .load_kernel(&synthetic_image(true), None, "console=ttyS0")
+                .unwrap();
+            let fdt = fdt_cpu_reg(&vm, loaded.loaded().fdt, node);
+            let raw = vm.vcpus()[idx].arm64_mpidr().unwrap();
+            println!(
+                "kvm_device: smp: mpidr vcpus={vcpus} vcpu={idx} raw={raw:#x} fdt_reg={fdt:#x}"
+            );
+            assert_eq!(raw & ARM64_MPIDR_AFFINITY_MASK, u64::from(fdt));
+            assert_eq!(fdt, want);
+            assert_ne!(raw & (1 << 31), 0, "bit 31 (RES1) must be set: {raw:#x}");
+            let boot = vm.vcpus()[0].arm64_mpidr().unwrap();
+            assert_eq!(boot & ARM64_MPIDR_AFFINITY_MASK, 0);
+        }
+    }
+
+    /// MVM-1・REPAIR-5・#3899: 2 台構成で `b .` のゲストを start すると、電源 off の AP が `KVM_RUN` の中で眠っていても
+    /// stop の kick で 2 台とも期限内に回収される。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn kvm_device_arm64_smp_start_stop() {
+        let mut vm = MicroVm::assemble(&open(), config(2, 0, 0)).unwrap_or_else(|e| {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        });
+        let loaded = vm
+            .load_kernel(&synthetic_image(true), None, "console=ttyS0")
+            .unwrap();
+        let running = vm.start(&loaded).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!running.is_finished());
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.vcpu_count, 2);
+        assert_eq!(report.stats.errors, 0);
+        assert!(report.stats.runs >= 1);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     /// MVM-1・#3696: `load_kernel`（Image・FDT の配置）と `setup_boot_vcpu` の後、X0 = FDT・PC = Image の先頭・

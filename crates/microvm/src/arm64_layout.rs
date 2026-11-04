@@ -598,7 +598,9 @@ pub struct GuestFdtConfig<'a> {
 /// vCPU `index` の MPIDR affinity（`MPIDR` の下位 24 ビット。Aff0 = index % 16、Aff1 = index / 16）。
 ///
 /// GICv3 の SGI の TargetList は 16 ビットで、1 クラスタの Aff0 は 0..15 に限る（KVM の既定の割り当てと同形）。
-/// FDT の `cpu@N` の `reg` と、将来の vCPU の `MPIDR_EL1` はこの値で一致させる（#3864・MVM-5）。
+/// FDT の `cpu@N` の `reg` と vCPU の `MPIDR_EL1` はこの値で一致させる（#3864・MVM-5）。KVM が reset で決める値
+/// （Linux v6.12 `reset_mpidr`。Aff0 = id & 0xf・Aff1 = (id >> 4) & 0xff・Aff2 = (id >> 12) & 0xff・bit 31）の affinity と
+/// id < 4096 で同形のため、KVM では書かず読んで照合する（#3899）。
 /// `index >= ARM64_MAX_VCPUS` は `InvalidArgument`。
 pub fn arm64_vcpu_mpidr_affinity(index: u32) -> Result<u32, MicrovmError> {
     if index >= ARM64_MAX_VCPUS {
@@ -760,6 +762,32 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
 
 #[cfg(test)]
 mod tests {
+    /// KVM v6.12 `reset_mpidr` の写し（bit 31 の RES1 込み）。
+    fn kvm_reset_mpidr(id: u64) -> u64 {
+        (id & 0xf) | (((id >> 4) & 0xff) << 8) | (((id >> 12) & 0xff) << 16) | (1 << 31)
+    }
+
+    /// MVM-1・#3899: FDT の `cpu@N` の reg は KVM の reset の `MPIDR_EL1` の affinity と全番号で一致する（番号 16 以上を含む）。
+    #[test]
+    fn mvm1_3899_mpidr_affinity_matches_kvm_reset_mpidr() {
+        let mask = crate::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
+        for id in 0..ARM64_MAX_VCPUS {
+            let want = u64::from(arm64_vcpu_mpidr_affinity(id).unwrap());
+            assert_eq!(kvm_reset_mpidr(u64::from(id)) & mask, want, "id {id}");
+        }
+        for (id, aff, raw) in [
+            (0u32, 0u32, 0x8000_0000u64),
+            (1, 1, 0x8000_0001),
+            (15, 0xf, 0x8000_000f),
+            (16, 0x100, 0x8000_0100),
+            (31, 0x10f, 0x8000_010f),
+            (63, 0x30f, 0x8000_030f),
+        ] {
+            assert_eq!(arm64_vcpu_mpidr_affinity(id).unwrap(), aff);
+            assert_eq!(kvm_reset_mpidr(u64::from(id)), raw);
+        }
+    }
+
     use super::*;
 
     const MIB: u64 = 1024 * 1024;

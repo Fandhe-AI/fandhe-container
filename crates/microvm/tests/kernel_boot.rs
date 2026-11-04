@@ -54,7 +54,7 @@
 //! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
 //! device model 側の別 issue として扱う。
 //! aarch64 は `mod arm64`（#3897・#3898。陽性と initrd 無しの負の対照の 2 件。`console=ttyS0` で FDT の `ns16550a` を選び、
-//! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。SMP は #3899 の後）。シリアルはポーリング（FDT に `interrupts` 無し。
+//! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。vCPU 2 台の陽性 1 件を #3899 で足し、3 件。2 台は `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001` を照合する）。シリアルはポーリング（FDT に `interrupts` 無し。
 //! Linux の 8250 は irq = 0 で timer ポーリング）で、送信は timer の周期ごとに進む。`/init` は write の直後に reboot するため、
 //! marker が出切る前に `GuestShutdown` になり marker 0 回で落ちた場合は、試験の欠陥ではなく割り込み未結線の帰結で、#3943 で直す。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
@@ -74,6 +74,20 @@ fn count_marker_lines(output: &[u8], marker: &str) -> usize {
         .count()
 }
 
+/// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
+/// x86_64 の SMP 照合（#3888）と aarch64 の SMP 照合（#3899）が共有する（複製しない・REPAIR-1）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
+    output
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            line.strip_suffix(b"\r")
+                .unwrap_or(line)
+                .ends_with(suffix.as_bytes())
+        })
+        .count()
+}
+
 /// 非信頼のゲスト出力を、末尾 `n` バイトだけエスケープして診断に載せる（端末制御の注入を防ぐ）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn escape_tail(output: &[u8], n: usize) -> String {
@@ -87,7 +101,7 @@ fn escape_tail(output: &[u8], n: usize) -> String {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{MARKER, count_marker_lines, escape_tail};
+    use super::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
     use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_microvm::exit::{ExitData, ExitValue};
@@ -206,18 +220,6 @@ mod x86 {
     /// 2 CPU がオンラインになった行（Linux v6.12 `kernel/smp.c` の `smp_init()` の `pr_info`。`CONFIG_NUMA=n` で node は 1）。
     /// `CONFIG_PRINTK_TIME` の接頭辞（`[    0.1] `）を許すため、行末一致で数える。
     const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
-
-    /// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
-    fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
-        output
-            .split(|b| *b == b'\n')
-            .filter(|line| {
-                line.strip_suffix(b"\r")
-                    .unwrap_or(line)
-                    .ends_with(suffix.as_bytes())
-            })
-            .count()
-    }
 
     struct Outcome {
         reason: StopReason,
@@ -1479,7 +1481,7 @@ mod x86 {
 /// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
-    use super::{MARKER, count_marker_lines, escape_tail};
+    use super::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
@@ -1652,10 +1654,15 @@ mod arm64 {
         }
     }
 
-    fn boot(inp: Inputs, cmdline: String, boot_timeout: Duration) -> Result<Outcome, String> {
+    fn boot(
+        inp: Inputs,
+        cmdline: String,
+        boot_timeout: Duration,
+        vcpus: u32,
+    ) -> Result<Outcome, String> {
         let started = Instant::now();
         let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
-            vcpu_count: 1,
+            vcpu_count: vcpus,
             mem_size: RAM_SIZE,
             block: vec![],
             net: vec![],
@@ -1716,12 +1723,12 @@ mod arm64 {
     }
 
     /// 別スレッドで `boot` を回し、全体期限で必ず戻る（watchdog は `--ignored` を素通しするため唯一の層）。
-    fn run_boot(inp: Inputs, cmdline: String) -> (Outcome, Duration) {
+    fn run_boot(inp: Inputs, cmdline: String, vcpus: u32) -> (Outcome, Duration) {
         let secs = inp.secs;
         let boot_timeout = Duration::from_secs(secs);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(boot(inp, cmdline, boot_timeout));
+            let _ = tx.send(boot(inp, cmdline, boot_timeout, vcpus));
         });
         match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
             Ok(Ok(o)) => (o, boot_timeout),
@@ -1736,7 +1743,7 @@ mod arm64 {
     fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
         let inp = inputs(true);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
@@ -1765,7 +1772,7 @@ mod arm64 {
     fn kernel_boot_without_initrd_does_not_shut_down() {
         let inp = inputs(false);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, _) = run_boot(inp, cmdline);
+        let (o, _) = run_boot(inp, cmdline, 1);
         let diag = o.diag();
         assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
@@ -1779,6 +1786,101 @@ mod arm64 {
             "init marker must not appear without an initrd: {diag}"
         );
         assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    }
+
+    /// 2 CPU がオンラインになった行（Linux v6.12 `arch/arm64/kernel/smp.c` の `smp_cpus_done()`。arm64 固有）。行末一致。
+    const ARM64_SMP_TOTAL_LINE: &str = "SMP: Total of 2 processors activated.";
+    /// 汎用の `kernel/smp.c` `smp_init()` の行（x86 と同じ書式。`CONFIG_NUMA=n` で node は 1）。行末一致。
+    const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
+    /// AP（vCPU 1）が起きた行の目印。`secondary_start_kernel` の `"CPU%u: Booted secondary processor 0x%010lx [0x%08x]"` のうち
+    /// MPIDR（`MPIDR_HWID_BITMASK` 後の affinity）が FDT の `cpu@1` の reg（1）と一致した値を含む前半。後半（MIDR）はホスト依存のため見ない。
+    const AP_BOOTED_PREFIX: &str = "CPU1: Booted secondary processor 0x0000000001";
+
+    /// `needle` を含む行の件数（`\r` は除く。後ろにホスト依存の値が続く行用）。
+    fn count_lines_containing(output: &[u8], needle: &str) -> usize {
+        output
+            .split(|b| *b == b'\n')
+            .filter(|line| {
+                line.windows(needle.len().max(1))
+                    .any(|w| w == needle.as_bytes())
+            })
+            .count()
+    }
+
+    /// 利用者の cmdline が SMP を無効化する指定（`nosmp`・`maxcpus=`）を含めば、その理由を返す（2 CPU の照合が成り立たないため）。
+    fn smp_disabling_param(cmdline: &str) -> Option<&str> {
+        cmdline
+            .split_ascii_whitespace()
+            .find(|w| *w == "nosmp" || w.starts_with("maxcpus="))
+    }
+
+    /// 2 台構成の陽性（#3899・MVM-1・REPAIR-5・REPAIR-12）。AP が PSCI CPU_ON でオンラインになり、2 台とも回収される。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm and a kernel with CONFIG_SMP (MVM-1)"]
+    fn kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
+        let inp = inputs(true);
+        if let Some(p) = smp_disabling_param(&inp.cmdline) {
+            precondition(&format!(
+                "cmdline disables SMP (`{p}`); remove it for the two-vCPU case"
+            ));
+        }
+        let cmdline = force_panic_zero(&inp.cmdline);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 2);
+        let diag = o.diag();
+        assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+        // reboot は CPU 0 から行われる（`migrate_to_reboot_cpu`）。
+        assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
+        assert_eq!(o.vcpu_count, 2, "vcpu count: {diag}");
+        assert_eq!(o.errors, 0, "run errors: {diag}");
+        assert!(!o.timed_out, "boot timed out: {diag}");
+        assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            1,
+            "init marker must appear exactly once: {diag}"
+        );
+        assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+        for line in [ARM64_SMP_TOTAL_LINE, SMP_ONLINE_LINE] {
+            assert_eq!(
+                count_lines_ending_with(&o.output, line),
+                1,
+                "expected exactly one `{line}` line: {diag}"
+            );
+        }
+        assert_eq!(
+            count_lines_containing(&o.output, AP_BOOTED_PREFIX),
+            1,
+            "expected exactly one `{AP_BOOTED_PREFIX}` line (MPIDR must match the FDT): {diag}"
+        );
+        eprintln!(
+            "kernel_boot: ok arch=aarch64 case=two_vcpus reason=guest_shutdown elapsed_ms={} exits={}",
+            o.elapsed.as_millis(),
+            o.exits
+        );
+    }
+
+    /// MVM-1・#3899: 2 台構成の前提検査。SMP を無効化する cmdline を見分け、既定は通す。
+    #[test]
+    fn mvm1_3899_arm64_smp_cmdline_guard() {
+        assert_eq!(smp_disabling_param(DEFAULT_CMDLINE), None);
+        assert_eq!(smp_disabling_param("console=ttyS0 nosmp"), Some("nosmp"));
+        assert_eq!(smp_disabling_param("maxcpus=1 x"), Some("maxcpus=1"));
+        assert_eq!(smp_disabling_param("nosmpx maxcpu=1"), None);
+        let l = format!(
+            "[    0.5] {ARM64_SMP_TOTAL_LINE}\r\nCPU1: Booted secondary processor 0x0000000001 [0x413fd0c1]\n"
+        );
+        assert_eq!(
+            count_lines_ending_with(l.as_bytes(), ARM64_SMP_TOTAL_LINE),
+            1
+        );
+        assert_eq!(count_lines_containing(l.as_bytes(), AP_BOOTED_PREFIX), 1);
+        assert_eq!(
+            count_lines_containing(
+                b"CPU1: Booted secondary processor 0x0000000101\n",
+                AP_BOOTED_PREFIX
+            ),
+            0
+        );
     }
 
     /// MVM-1・#3898: 既定の cmdline は `console=ttyS0` を含み、`force_panic_zero` 後も `panic=0` が末尾に残る。

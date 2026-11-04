@@ -404,7 +404,7 @@ pub fn check_vcpu_mpidr_readback(index: u32, raw: u64) -> Result<(), MicrovmErro
 /// SCTLR_EL1.EE（bit 25。EL1 のデータアクセスのエンディアン。1 でビッグエンディアン）。
 pub const SCTLR_EL1_EE: u64 = 1 << 25;
 
-/// CPU_ON で起動する AP（vCPU `index`）へ入れるレジスタの値（#3891・MVM-5・MVM-1。HVF の AP と将来の KVM aarch64〔#3899〕が共有する）。
+/// CPU_ON で起動する AP（vCPU `index`）へ入れるレジスタの値（#3891・MVM-5・MVM-1。HVF の AP が使う。KVM aarch64〔#3899〕はカーネル内の PSCI と reset が同じ状態を入れるので本型は使わない）。
 ///
 /// PSCI の CPU_ON は entry を PC に、context_id を X0 に入れて AP を起動する（DEN0022 §5.1.4 の引数、§5.6.1・§6.4.3.7）。
 /// 起動時の状態は DEN0022 F.b（PSCI 1.3・REL。2026-11-04 に確認。版と取得元は `psci.rs` の「一次情報の確認状況」と同じ）の

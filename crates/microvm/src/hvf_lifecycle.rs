@@ -46,6 +46,18 @@ impl<K: VcpuKick> VcpuStopper for LoopHandle<K> {
     }
 }
 
+/// デバイスの解放を期限つきで試み、成否を返す口（`hvf::microvm` のデバイスバスが実装する。REPAIR-5・MVM-5）。
+///
+/// `dispatcher()` の clone を持つ呼び出し元がロックを保持している間は、デバイスを手放せない。その失敗を黙って成功扱いに
+/// せず、[`stop_and_release`] が RAM・VM を解放しない（リークする）判断に使う。
+pub trait ReleaseDevices {
+    /// `deadline` まで再試行してデバイスを手放す。手放せなければ `DeadlineExceeded`。
+    fn release_devices(&mut self, deadline: Duration) -> Result<(), MicrovmError>;
+}
+
+/// デバイスの解放を待つ期限（vCPU は停止済みなので、競合はデバイス操作の保持者だけ）。
+pub const DEVICE_RELEASE_DEADLINE: Duration = Duration::from_secs(1);
+
 /// 停止の終了報告（拡張できる構造。真偽値・文字列で返さない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -83,6 +95,7 @@ pub fn stop_and_release<S, D, M, V>(
 ) -> Result<HvfStopReport, MicrovmError>
 where
     S: VcpuStopper,
+    D: ReleaseDevices,
 {
     let invalid = deadline.is_zero() || deadline > VCPU_STOP_DEADLINE_MAX;
     let effective = if invalid {
@@ -91,22 +104,31 @@ where
         deadline
     };
     let Resources {
-        devices,
+        mut devices,
         memory,
         vm,
     } = resources;
     let result = stopper.stop(effective);
     let outcome = match result {
-        Ok(report) => {
-            drop(devices);
-            drop(memory);
-            drop(vm);
-            Ok(HvfStopReport {
-                reason: report.reason,
-                stats: report.stats,
-                elapsed: report.elapsed,
-            })
-        }
+        Ok(report) => match devices.release_devices(DEVICE_RELEASE_DEADLINE) {
+            Ok(()) => {
+                drop(devices);
+                drop(memory);
+                drop(vm);
+                Ok(HvfStopReport {
+                    reason: report.reason,
+                    stats: report.stats,
+                    elapsed: report.elapsed,
+                })
+            }
+            Err(e) => {
+                // デバイス（backend）が dispatcher に残っている。デバイス → RAM → VM の順を守れないため RAM を解放しない。
+                drop(devices);
+                std::mem::forget(memory);
+                drop(vm);
+                Err(e)
+            }
+        },
         Err(e) => {
             // 止まりを確かめられていない。ゲストがまだ書けうるメモリを解放しない。
             drop(devices);
@@ -188,6 +210,25 @@ mod tests {
 
     /// drop された順を記録する資源。
     struct Rec(&'static str, Arc<Mutex<Vec<&'static str>>>);
+
+    impl ReleaseDevices for Rec {
+        fn release_devices(&mut self, _deadline: Duration) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+    }
+
+    /// 解放に失敗するデバイス。
+    struct StuckDevices(Rec);
+
+    impl ReleaseDevices for StuckDevices {
+        fn release_devices(&mut self, _deadline: Duration) -> Result<(), MicrovmError> {
+            assert_eq!(self.0.0, "devices");
+            Err(MicrovmError::new(
+                MicrovmErrorCode::DeadlineExceeded,
+                "stuck",
+            ))
+        }
+    }
 
     impl Drop for Rec {
         fn drop(&mut self) {
@@ -291,6 +332,20 @@ mod tests {
         // memory は drop されない（リーク）。devices と vm の手放しだけが起きる。
         assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
         let _ = release_tx.send(());
+    }
+
+    /// REPAIR-5・MVM-5・TASK-192.16: デバイスの解放に失敗したら成功扱いにせず、RAM を解放しない。
+    #[test]
+    fn repair5_mvm5_3798_device_release_failure_is_error_and_keeps_memory() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let r = Resources {
+            devices: StuckDevices(Rec("devices", Arc::clone(&log))),
+            memory: Rec("memory", Arc::clone(&log)),
+            vm: Rec("vm", Arc::clone(&log)),
+        };
+        let e = stop_and_release("hvf.microvm.stop", responsive(), LONG, r).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
     }
 
     /// REPAIR-5・TASK-192.16: 0 と 60 秒超は `InvalidArgument`。資源は漏らさず順に解放する。

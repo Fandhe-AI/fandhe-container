@@ -8,7 +8,13 @@
 //! FDT の `interrupts` のセル値と一致させる（virtio は SPI 16 から連番）。`load_kernel` は Image・initrd・FDT を `boot_arm64::load_arm64` で置き、
 //! `setup_boot_vcpu` は X0 = FDT・PC = Image の先頭・PSTATE = EL1h を `KVM_SET_ONE_REG` で書いて読み戻す。
 //! drop の順序は vCPU → デバイス（irqfd の解除）→ vGIC → メモリ → VM fd。
-//! **範囲外（REPAIR-3）**: vCPU は 1 台だけ（2 台以上は資源を作る前に `Unimplemented`。AP の起動は #3899）・実カーネルの起動試験（#3897）・シリアル（#3898）・level の virtio SPI（resamplefd が未実装のため
+//! **SMP（#3899・MVM-1・REPAIR-5）**: vCPU 0 は RUNNABLE、AP（1..N）は `KVM_ARM_VCPU_POWER_OFF` で作り、ゲストの PSCI CPU_ON を
+//! `KVM_ARM_VCPU_PSCI_0_2` によりカーネル内で処理する（userspace へ exit しないので `psci.rs` の状態機械は使わない）。電源 off の AP の
+//! `KVM_RUN` はカーネルの中で眠り（Linux v6.12 `kvm_vcpu_sleep`）、`run_once` の期限ごとの kick（`-EINTR`）で再入するため、stop・drop は
+//! N 台を期限つきで回収できる。`MPIDR_EL1` は KVM が reset で `reset_mpidr`（Aff0 = id & 0xf・Aff1 = (id >> 4) & 0xff・Aff2 = (id >> 12) & 0xff・bit 31）
+//! から決める値で、id < 64 では FDT の `cpu@N` の `reg`（`arm64_vcpu_mpidr_affinity`）と一致する。`assemble` が全台を読んで照合し、
+//! 不一致は書き換えず `Internal` で失敗する。
+//! **範囲外（REPAIR-3）**: level の virtio SPI（resamplefd が未実装のため
 //! `Unimplemented`）・`SCTLR_EL1` の確認。実機（KVM aarch64）での実行は未検証（実機前提試験は `tests/kvm_device.rs` の `kvm_device_arm64_*`）。
 //!
 //! # VM 構成体（TASK-75.2）
@@ -111,6 +117,8 @@ use crate::boot_x86::{
     load_linux, write_boot_tables,
 };
 #[cfg(target_arch = "aarch64")]
+use crate::device::Arm64VcpuPower;
+#[cfg(target_arch = "aarch64")]
 use crate::device::VgicV3;
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
 use crate::dispatch::{
@@ -156,6 +164,8 @@ pub const MAX_VIRTIO_DEVICES: usize = 8;
 pub const MAX_VCPUS: u32 = 32;
 // xAPIC の APIC ID（8 bit）に収まること（#3737。`smp_x86::plan_vcpus` の上限）。
 const _: () = assert!(MAX_VCPUS <= crate::smp_x86::MAX_XAPIC_VCPUS);
+// aarch64 の FDT の `cpu@N`・redistributor の窓・MPIDR の割り当てが受ける上限に収まる（#3899）。
+const _: () = assert!(MAX_VCPUS <= crate::arm64_layout::ARM64_MAX_VCPUS);
 
 const _: () = assert!(VIRTIO_MMIO_WINDOW.is_multiple_of(4096));
 const _: () = assert!(VIRTIO_MMIO_WINDOW >= 0x100 + CONFIG_SPACE_SIZE);
@@ -535,8 +545,7 @@ const _: () = assert!(MAX_VIRTIO_DEVICES < MAX_BUS_DEVICES);
 /// aarch64（KVM）の構成を検証して配置とデバイスの割り当てを計算する（ioctl 前の純粋な処理。MVM-1・#3696）。
 ///
 /// x86_64 の CI でも単体試験が走るよう arch で外さない（aarch64 以外では `assemble` から呼ばれない）。検査:
-/// - vCPU 数は `1..=`[`MAX_VCPUS`]。**2 以上は `Unimplemented`**: `KVM_ARM_VCPU_POWER_OFF` と PSCI CPU_ON による AP の起動が
-///   #3899 で、それまで AP が PC = 0 から走るのを防ぐ（fail-closed。REPAIR-3）。
+/// - vCPU 数は `1..=`[`MAX_VCPUS`]（範囲外は `InvalidArgument`。2 以上は AP を `KVM_ARM_VCPU_POWER_OFF` で作り CPU_ON で起こす。#3899）。
 /// - RAM の大きさ・virtio の台数（[`MAX_VIRTIO_DEVICES`] 以下）・`Arm64Layout::validate`。
 /// - virtio の trigger が level（`LevelHigh`）の構成は `Unimplemented`: level は ACK 後の deassert / resamplefd
 ///   （`KVM_IRQFD_FLAG_RESAMPLE`）が要り、未実装のまま受けると割り込みが張り付く（既定の edge は通す）。
@@ -554,12 +563,6 @@ fn plan_layout_arm64(
 ) -> Result<(Arm64Layout, Vec<DeviceSlot>), MicrovmError> {
     if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
         return Err(invalid("vcpu count out of range"));
-    }
-    if vcpu_count > 1 {
-        return Err(MicrovmError::new(
-            MicrovmErrorCode::Unimplemented,
-            "aarch64 SMP is not implemented (only one vCPU is supported)",
-        ));
     }
     validate_ram_size(mem_size, ram_align()?)?;
     let total = block_count
@@ -1069,7 +1072,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 構成を検証し、VM → irqchip → identity map / TSS（x86_64）→ ゲストメモリ → デバイス → vCPU の順に組み立てる。
     ///
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
-    /// （段ごとの確認は `mvm1_887_*`・#887）。この順序は x86_64 のもので、aarch64 は vCPU の後に vGIC を作る（モジュール doc の「aarch64（KVM）の組み立て」。vCPU 2 台以上・level の SPI は最初の ioctl より前に `Unimplemented`）。
+    /// （段ごとの確認は `mvm1_887_*`・#887）。この順序は x86_64 のもので、aarch64 は vCPU の後に vGIC を作る（モジュール doc の「aarch64（KVM）の組み立て」。level の SPI は最初の ioctl より前に `Unimplemented`）。
     ///
     /// vCPU ごとに `KVM_SET_CPUID2`（APIC ID = vCPU id。`cpuid_x86`・#3733）も設定する。
     ///
@@ -1112,7 +1115,22 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, layout.ram.base)?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
         for i in 0..config.vcpu_count {
-            vcpus.push(vm.create_vcpu(i)?);
+            // vCPU 0 は RUNNABLE、AP は POWER_OFF で作り、ゲストの PSCI CPU_ON（カーネル内で処理）まで眠らせる（#3899）。
+            let power = if i == 0 {
+                Arm64VcpuPower::On
+            } else {
+                Arm64VcpuPower::PoweredOff
+            };
+            vcpus.push(vm.create_arm64_vcpu(i, power)?);
+        }
+        // KVM が reset で決めた MPIDR_EL1（`reset_mpidr`）の affinity と FDT の `cpu@N` の `reg` が一致することを確かめる。
+        // 書き換えず不一致は失敗にする（fail-closed）: `kvm_mpidr_to_vcpu` の参照表との整合を userspace の書き込みに依存させない。
+        // 一致は `arm64_layout` の単体試験が `reset_mpidr` の写しと突き合わせて固定している（id < 4096）。
+        for (i, v) in vcpus.iter().enumerate() {
+            let idx = u32::try_from(i).map_err(|_| {
+                MicrovmError::new(MicrovmErrorCode::Internal, "vcpu index overflow")
+            })?;
+            crate::boot_arm64::check_vcpu_mpidr_readback(idx, v.arm64_mpidr()?)?;
         }
         let vgic = vm.create_vgic_v3(layout.gic_dist.base.raw(), layout.gic_redist.base.raw())?;
         vgic.init()?;
@@ -1368,7 +1386,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Ok(())
         }
         // aarch64: 領域の照合 → X0〜X3・PSTATE・PC の `KVM_SET_ONE_REG` → 読み戻して照合する。
-        // SCTLR_EL1 の確認・AP の起動は範囲外（#3899。REPAIR-3）。
+        // SCTLR_EL1 の確認は範囲外（REPAIR-3）。AP は POWER_OFF で作られており、CPU_ON の reset はカーネルが担う（#3899）。
         #[cfg(target_arch = "aarch64")]
         {
             check_loaded_within_arm64(loaded.loaded(), &self.layout)?;
@@ -2531,7 +2549,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU は 1 台につき 1 スレッドで、
     /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成では、ゲストの kick なしで受信を処理する専用スレッド `microvm-net-rx`（`NetRxPoller`。期限ごとの
-    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。aarch64 は vCPU 1 台（PSCI の SYSTEM_OFF / SYSTEM_RESET は `GuestShutdown` に分類される。#3896）。他 arch は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。aarch64 は SMP 対応（AP は POWER_OFF で作り CPU_ON で起こす。#3899。PSCI の SYSTEM_OFF / SYSTEM_RESET は `GuestShutdown` に分類される。#3896）。他 arch は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -3880,18 +3898,17 @@ mod assemble_tests {
         assert!(b.serial.take_output().unwrap().is_empty());
     }
 
-    /// MVM-1・#3696・REPAIR-3: aarch64 の 2 台以上の vCPU は AP の起動（#3899）が無いので資源を作る前に `Unimplemented`。
+    /// MVM-1・#3899: aarch64 は 2 台と上限（`MAX_VCPUS`）を受け、0 と上限超は `InvalidArgument`。
     #[test]
-    fn mvm1_3696_plan_layout_arm64_rejects_smp() {
-        let e = plan_layout_arm64(2, 64 << 20, 0, 0).unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
-        assert_eq!(
-            e.message(),
-            "aarch64 SMP is not implemented (only one vCPU is supported)"
-        );
-        // 範囲外の台数は SMP の未実装より先に InvalidArgument。
-        let e = plan_layout_arm64(MAX_VCPUS + 1, 64 << 20, 0, 0).unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    fn mvm1_3899_plan_layout_arm64_accepts_smp() {
+        for n in [2, MAX_VCPUS] {
+            let (layout, _) = plan_layout_arm64(n, 64 << 20, 0, 0).unwrap();
+            assert_eq!(layout.vcpus, n);
+        }
+        for n in [0, MAX_VCPUS + 1] {
+            let e = plan_layout_arm64(n, 64 << 20, 0, 0).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
     }
 
     /// MVM-1・#3696・REPAIR-3: level の virtio SPI は resamplefd が未実装なので `Unimplemented`、既定の edge は通る。

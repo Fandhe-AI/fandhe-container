@@ -233,6 +233,9 @@ pub(crate) mod consts {
     pub const KVM_CAP_ARM_PSCI_0_2: u64 = 102;
     /// `KVM_ARM_VCPU_PSCI_0_2`（v6.12 `asm/kvm.h`）。features の**ビット番号**でマスクではない（`1 << 値` で立てる）。
     pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
+    /// `KVM_ARM_VCPU_POWER_OFF`（v6.12 `asm/kvm.h`。#3899）。features の**ビット番号**。立てた vCPU は `KVM_RUN` が
+    /// PSCI CPU_ON を受けるまで眠る（`kvm_arm_vcpu_power_off`）。vCPU 0 に立ててはならない。
+    pub const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
     // 以下は #3696（vGIC・起動レジスタ）。値は Linux v6.12 の `include/uapi/linux/kvm.h` /
     // `arch/arm64/include/uapi/asm/kvm.h` で照合した（`libc` に対応物が無いカーネル ABI のため、機械照合は適用外）。
     /// `_IOWR(KVMIO, 0xe0, struct kvm_create_device)`（12 バイト）。
@@ -323,7 +326,16 @@ const _: () = {
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
     assert!(consts::KVM_CAP_ARM_PSCI_0_2 == 102);
     assert!(consts::KVM_ARM_VCPU_PSCI_0_2 == 2);
+    assert!(consts::KVM_ARM_VCPU_POWER_OFF == 0);
 };
+
+/// features[0] に `KVM_ARM_VCPU_POWER_OFF` のビットを立てる（AP 用。他の語・ビットは不変。#3899）。
+/// `device::VmFd::create_arm64_vcpu` が `PoweredOff` のときだけ呼ぶ。
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+pub(crate) fn with_power_off(mut init: KvmVcpuInit) -> KvmVcpuInit {
+    init.features[0] |= 1u32 << consts::KVM_ARM_VCPU_POWER_OFF;
+    init
+}
 
 /// features[0] に `KVM_ARM_VCPU_PSCI_0_2` のビットを立てる（他の語・ビットは不変。#3896）。
 /// `device::VmFd::create_vcpu` が `KVM_ARM_VCPU_INIT` の前に呼ぶ。
@@ -421,6 +433,29 @@ pub(crate) const ARM64_REG_PC: u64 = arm64_core_reg_id(64);
 /// `pstate` の ONE_REG id（u64 の 33 番目 → u32 換算で 66）。
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const ARM64_REG_PSTATE: u64 = arm64_core_reg_id(66);
+
+/// `KVM_REG_ARM64_SYSREG`（`0x0013 << KVM_REG_ARM_COPROC_SHIFT(16)`。`asm/kvm.h`。#3899）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const KVM_REG_ARM64_SYSREG: u64 = 0x0013 << 16;
+
+/// システムレジスタの ONE_REG id を組む（`ARM64_SYS_REG(op0, op1, crn, crm, op2)`。純関数。#3899）。
+/// 各フィールドの位置は op0=14・op1=11・crn=7・crm=3・op2=0（`KVM_REG_ARM64_SYSREG_*_SHIFT`）で、64 bit として扱う。
+/// `libc` に対応物が無いカーネル ABI のため機械照合は適用外で、具体値の試験で固定する。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const fn arm64_sys_reg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    KVM_REG_ARM64
+        | KVM_REG_SIZE_U64
+        | KVM_REG_ARM64_SYSREG
+        | ((op0 & 0x3) << 14)
+        | ((op1 & 0x7) << 11)
+        | ((crn & 0xf) << 7)
+        | ((crm & 0xf) << 3)
+        | (op2 & 0x7)
+}
+
+/// `MPIDR_EL1`（op0=3・op1=0・crn=0・crm=0・op2=5）の ONE_REG id。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const ARM64_REG_MPIDR_EL1: u64 = arm64_sys_reg_id(3, 0, 0, 0, 5);
 
 /// x86_64 の `struct kvm_regs`（`asm/kvm.h`。汎用レジスタ 16 本・rip・rflags の 144 バイト。TASK-75.3.2）。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -2635,6 +2670,26 @@ mod tests {
         });
         assert_eq!(init.target, 5);
         assert_eq!(init.features, [0b100, 1, 2, 3, 4, 5, 6]);
+    }
+
+    /// MVM-1・#3899: POWER_OFF のビット番号と、ビットを立てる純関数（PSCI_0_2 と合成すると 0b101）。
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn mvm1_3899_power_off_constants_and_features() {
+        assert_eq!(consts::KVM_ARM_VCPU_POWER_OFF, 0);
+        let init = with_power_off(KvmVcpuInit {
+            target: 5,
+            features: [0, 1, 2, 3, 4, 5, 6],
+        });
+        assert_eq!(init.features, [0b1, 1, 2, 3, 4, 5, 6]);
+        let both = with_psci_0_2(with_power_off(KvmVcpuInit::default()));
+        assert_eq!(both.features[0], 0b101);
+    }
+
+    /// MVM-1・#3899: `MPIDR_EL1` の ONE_REG id（arch に依らず計算式を固定する）。
+    #[test]
+    fn mvm1_3899_mpidr_el1_reg_id() {
+        assert_eq!(ARM64_REG_MPIDR_EL1, 0x6030_0000_0013_C005);
     }
 
     /// MVM-1・#3696: aarch64 の core レジスタ id（`KVM_REG_ARM_CORE_REG` の u32 換算）。arch に依らず計算式を固定する。

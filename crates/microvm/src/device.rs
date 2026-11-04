@@ -29,7 +29,8 @@
 //! - x86_64: `KVM_CREATE_VCPU` だけで vCPU fd が使える。レジスタ設定は TASK-75.3.2 の `VcpuFd::set_boot_state`
 //! - aarch64: `KVM_CREATE_VCPU` の後に VM fd へ `KVM_ARM_PREFERRED_TARGET`、vCPU fd へ `KVM_ARM_VCPU_INIT`
 //!   （features は `KVM_ARM_VCPU_PSCI_0_2` のみ。先に `KVM_CAP_ARM_PSCI_0_2` を確かめ、無ければ `FailedPrecondition`。
-//!   #3896）を発行して初期化済みの vCPU を返す。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。aarch64 はネイティブ CI が無く（#2274）型検査のみで実行は未検証
+//!   #3896）を発行して初期化済みの vCPU を返す。AP（vCPU 1..N）は `create_arm64_vcpu` で `KVM_ARM_VCPU_POWER_OFF` 付きにし、
+//!   CPU_ON はカーネル内の PSCI が処理する（`psci.rs` の userspace 状態機械は KVM では使わない。#3899）。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。aarch64 はネイティブ CI が無く（#2274）型検査のみで実行は未検証
 //!
 //! # aarch64 の割り込みコントローラー（#3696）
 //! x86_64 の `KVM_CREATE_IRQCHIP` は無く、vGICv3 を `KVM_CREATE_DEVICE`（`KVM_DEV_TYPE_ARM_VGIC_V3`）で作る。順序は
@@ -185,6 +186,17 @@ fn spi_ispendr_offset(intid: u32) -> Result<u64, MicrovmError> {
         ));
     }
     Ok(GICD_ISPENDR + 4 * u64::from(intid / 32))
+}
+
+/// aarch64 の vCPU の初期の電源状態（MVM-1・#3899）。vCPU 0 は `On`、AP（1..N）は `PoweredOff` で作り、
+/// ゲストの PSCI CPU_ON（カーネル内で処理）で起こす。取り違えを型で防ぐための enum（x86_64 では使わない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub enum Arm64VcpuPower {
+    /// RUNNABLE。
+    On,
+    /// `KVM_ARM_VCPU_POWER_OFF`。CPU_ON まで `KVM_RUN` の中で眠る。
+    PoweredOff,
 }
 
 /// `KVM_CREATE_VCPU` で得た vCPU fd と、その `kvm_run` 領域の mmap。drop で munmap・close される。
@@ -704,7 +716,7 @@ impl VcpuFd {
     ///
     /// 値は `boot_arm64::ArmBootState`（Image のエントリ・FDT の GPA・EL1h で DAIF マスク）。最初の `run_once` より前に
     /// vCPU 0 にだけ呼ぶ。`SCTLR_EL1`（MMU・D-cache off）は `KVM_ARM_VCPU_INIT` のリセット値に依存し、本メソッドは書かない
-    /// （確認は範囲外。REPAIR-3）。AP の起動（PSCI CPU_ON・`KVM_ARM_VCPU_POWER_OFF`）は #3899。
+    /// （確認は範囲外。REPAIR-3）。AP は `create_arm64_vcpu` の `PoweredOff` で作り、CPU_ON はカーネル内の PSCI が処理する（#3899）。
     #[cfg(target_arch = "aarch64")]
     pub fn set_arm64_boot_state(&mut self, s: &ArmBootState) -> Result<(), MicrovmError> {
         let fd = self.fd.as_fd();
@@ -720,6 +732,15 @@ impl VcpuFd {
         }
         set(sys::ARM64_REG_PSTATE, s.cpsr)?;
         set(sys::ARM64_REG_PC, s.pc)
+    }
+
+    /// `MPIDR_EL1`（生の値）を `KVM_GET_ONE_REG` で読む（MVM-1・#3899。aarch64 のみ）。
+    /// KVM が `KVM_ARM_VCPU_INIT` の reset で vCPU 番号から決めた値（Linux v6.12 `reset_mpidr`）で、bit 31 が立つ。
+    /// affinity は FDT の `cpu@N` の `reg` と一致しなければならない（`assemble` が照合する）。
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm64_mpidr(&self) -> Result<u64, MicrovmError> {
+        sys::kvm_get_one_reg_u64(self.fd.as_fd(), sys::ARM64_REG_MPIDR_EL1)
+            .map_err(|e| classify_vcpu_error(VcpuStage::GetOneReg, e))
     }
 
     /// aarch64 の起動レジスタ（X0〜X3・PSTATE・PC）を `KVM_GET_ONE_REG` で読み戻す（観測・照合用。aarch64 のみ）。
@@ -1645,18 +1666,43 @@ impl VmFd {
 
     /// `KVM_CREATE_VCPU` で vCPU を作る（aarch64 は続けて初期化する。モジュール doc 参照）。
     /// id の上限は検証せずカーネルの EINVAL（`InvalidArgument`）に任せる。重複は `AlreadyExists`。
-    /// 初期化に失敗したときは作成済みの fd を drop で close する。
+    /// 初期化に失敗したときは作成済みの fd を drop で close する。aarch64 では常に RUNNABLE（`Arm64VcpuPower::On`）で初期化する
+    /// （AP を CPU_ON まで止める場合は `create_arm64_vcpu`。#3899）。
     pub fn create_vcpu(&self, id: u32) -> Result<VcpuFd, MicrovmError> {
+        self.create_vcpu_inner(id, Arm64VcpuPower::On)
+    }
+
+    /// aarch64 の vCPU を電源状態つきで作る（MVM-1・#3899。aarch64 のみ）。
+    ///
+    /// `PoweredOff` は `KVM_ARM_VCPU_POWER_OFF` を立てて初期化する。その vCPU の `KVM_RUN` はカーネル内の PSCI が
+    /// CPU_ON を処理するまで眠り（Linux v6.12 `kvm_arm_vcpu_power_off` が `KVM_MP_STATE_STOPPED` と `KVM_REQ_SLEEP` を立て、
+    /// `kvm_vcpu_sleep` が待つ）、userspace へは exit しない（`KVM_ARM_VCPU_PSCI_0_2` により CPU_ON はカーネルが処理する）。
+    /// POWER_OFF は一時的なビットで VM 単位の features の一致検査に入らないため、vCPU 0 と features が違っても `EINVAL` にならない。
+    #[cfg(target_arch = "aarch64")]
+    pub fn create_arm64_vcpu(
+        &self,
+        id: u32,
+        power: Arm64VcpuPower,
+    ) -> Result<VcpuFd, MicrovmError> {
+        self.create_vcpu_inner(id, power)
+    }
+
+    fn create_vcpu_inner(&self, id: u32, power: Arm64VcpuPower) -> Result<VcpuFd, MicrovmError> {
         // aarch64 は PSCI 0.2 を有効にするため、vCPU を作る前に capability を確かめる（無ければ fd を作らない）。
         #[cfg(target_arch = "aarch64")]
         self.require_extension(sys::consts::KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2")?;
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = power;
         let fd = sys::kvm_create_vcpu(self.fd.as_fd(), u64::from(id))
             .map_err(|e| classify_vcpu_error(VcpuStage::Create, e))?;
         #[cfg(target_arch = "aarch64")]
         {
             let init = sys::kvm_arm_preferred_target(self.fd.as_fd())
                 .map_err(|e| classify_vcpu_error(VcpuStage::PreferredTarget, e))?;
-            let init = sys::with_psci_0_2(init);
+            let mut init = sys::with_psci_0_2(init);
+            if power == Arm64VcpuPower::PoweredOff {
+                init = sys::with_power_off(init);
+            }
             sys::kvm_arm_vcpu_init(fd.as_fd(), &init)
                 .map_err(|e| classify_vcpu_error(VcpuStage::VcpuInit, e))?;
         }

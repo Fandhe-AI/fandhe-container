@@ -61,6 +61,26 @@ pub trait InterruptLine {
     }
 }
 
+/// 線の値（REPAIR-4: 真偽値にしない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqLevel {
+    /// 線を下げた（要因なし）。
+    Low,
+    /// 線を上げた（要因あり）。
+    High,
+}
+
+/// デバイスモデルが決めた線の値を外へ伝える口（UART の THRE 割り込み。#3892・MVM-5・MVM-1）。
+///
+/// [`InterruptLine`]（trigger と ACK 後の resample。virtio の ACK 駆動）とは別物で、UART の「ACK」は IIR の読み出しのため、
+/// デバイスモデル側が線の値を決めて [`LevelInterruptLine::set_level`] で伝える。macOS は `hv_gic_set_spi`
+/// （`crate::spi::SpiLevelLine`）。x86 の COM1（IRQ 4）も同じトレイトで結べるが、KVM の `IrqFd` は edge で
+/// level には `KVM_IRQ_LINE` か resamplefd が要るため未結線（REPAIR-3）。待ちは持たない（REPAIR-5 不要）。
+pub trait LevelInterruptLine: Send + Sync + std::fmt::Debug {
+    /// 線を `level` にする。失敗はホスト側の問題（ゲストの入力では起きない）。
+    fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError>;
+}
+
 /// [`complete_interrupt_ack`] の結果（REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptAckReport {

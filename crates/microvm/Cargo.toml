@@ -50,6 +50,7 @@
 # #3892 で uart の THRE 割り込みと level 線のトレイト・arm64 のシリアルの SPI と FDT の interrupts・HVF の level SPI への結線を追加（依存は増やさない。unsafe なし）。
 # #3862 でゲスト RAM の backing に virtqueue の index 用の整列した u16 の単一命令 volatile アクセスを追加（依存は増やさない。unsafe は sys.rs・sys/hvf.rs のみ）。
 # #3899 で KVM aarch64 の AP の POWER_OFF 初期化と MPIDR の照合を追加（依存は増やさない。unsafe 追加なし）。
+# #3947 で kernel_boot の arm64 に virtio-block の 3 件を追加（依存は増やさない。unsafe 追加なし）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

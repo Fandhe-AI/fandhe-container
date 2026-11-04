@@ -121,6 +121,14 @@
 # sentinel は先頭 32 バイトだけを比べる。試験側（crates/microvm/tests/kernel_boot.rs）が backend の offset 0 に置く。
 # 510〜511 に 0x55AA を置かないので MBR とは解釈されない。
 #
+# 機械語（aarch64。#3947。全体は 120 + 224 + 145 = 489 バイト。llvm-mc で組んで llvm-objdump の逆アセンブルと
+# 一致することを確認済み。ワードはリトルエンディアンの順でファイルへ書く。x86_64 との違い: mkdir・open が
+# 無いので mkdirat(34)・openat(56) を AT_FDCWD（-100）で呼ぶ。mount 40・read 63・write 64・reboot 142。
+# sp は 16 バイト境界を保つ（sub sp, sp, #512）。sentinel はデータの先頭（ファイルオフセット 344。8 バイト境界）に置き
+# ldp で 16 バイトずつ 2 回比べる）。コードは 120 から 224 バイトで、データは 344 から:
+#   sentinel(32) "/dev\0"(5) "devtmpfs\0"(9) "/dev/vda\0"(9) 一致メッセージ+改行(42) 不一致メッセージ+改行(48)
+# 命令の並びは下の aarch64 の分岐の各 `bytes` 行のコメントを正とする（表の二重管理をしない）。
+#
 # variant `net-tx`（#3894・MVM-1・REPAIR-12）: virtio-net の TX（ゲストからホストへの送信）を照合する版。
 # AF_PACKET の raw socket を開いて `eth0` を IFF_UP にし、固定の Ethernet フレーム（60 バイト）を 1 回 `sendto` する。
 # 戻り値がフレーム長（60）なら成功メッセージ、それ以外（socket・ioctl・sendto の失敗、短い送信）は失敗メッセージを
@@ -175,8 +183,8 @@
 # 使い方:
 #   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 #   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read・net-tx・net-rx は x86_64 のみ）
-#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は default の variant のみ）
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。net-tx・net-rx は x86_64 のみ。block-read は aarch64 も #3947）
+#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は default と block-read の variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read）
 #   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
@@ -291,7 +299,7 @@ case "$host_os" in
 esac
 
 # --- 出力先の検査 ---
-if [ "$variant" != "default" ] && [ "$arch" != "x86_64" ]; then
+if { [ "$variant" = "net-tx" ] || [ "$variant" = "net-rx" ]; } && [ "$arch" != "x86_64" ]; then
     err_code bad-argument "--variant $variant is only available for --arch x86_64"; exit 2
 fi
 if [ -z "$output_dir" ]; then
@@ -632,7 +640,7 @@ elif [ "$variant" = "net-tx" ]; then
     } >"$elf_file"
 elif [ "$variant" = "block-read" ]; then
     # 機械語に固定された長さ・サイズを文字列定数と突き合わせる（fail-closed）
-    expected_size=448
+    if [ "$arch" = "aarch64" ]; then expected_size=489; else expected_size=448; fi
     if [ "${#block_sentinel}" -ne 32 ] || [ "$((${#block_ok_message} + 1))" -ne 42 ] ||
         [ "$((${#block_mismatch_message} + 1))" -ne 48 ]; then
         err_code internal-error "block-read string lengths do not match the encoded instructions"
@@ -641,54 +649,119 @@ elif [ "$variant" = "block-read" ]; then
     total_size=$expected_size
     {
         emit_elf_headers "$total_size"
-        # コード 183 バイト（先頭コメントの表と同じ並び）
-        bytes b8; le 83 4                                  # mov eax, 83 (mkdir)
-        bytes 48 8d 3d; le 171 4                           # lea rdi, [rip+0xab] -> "/dev"
-        bytes be; le $((0755)) 4                           # mov esi, 0755
-        bytes 0f 05                                        # syscall
-        bytes b8; le 165 4                                 # mov eax, 165 (mount)
-        bytes 48 8d 3d; le 157 4                           # lea rdi, [rip+0x9d] -> "devtmpfs"
-        bytes 48 8d 35; le 145 4                           # lea rsi, [rip+0x91] -> "/dev"
-        bytes 48 89 fa                                     # mov rdx, rdi
-        bytes 45 31 d2                                     # xor r10d, r10d
-        bytes 45 31 c0                                     # xor r8d, r8d
-        bytes 0f 05                                        # syscall
-        bytes b8; le 2 4                                   # mov eax, 2 (open)
-        bytes 48 8d 3d; le 136 4                           # lea rdi, [rip+0x88] -> "/dev/vda"
-        bytes 31 f6                                        # xor esi, esi (O_RDONLY)
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 3f                                        # js fail
-        bytes 48 81 ec; le 512 4                           # sub rsp, 512
-        bytes 89 c7                                        # mov edi, eax
-        bytes 31 c0                                        # xor eax, eax (read)
-        bytes 48 89 e6                                     # mov rsi, rsp
-        bytes ba; le 512 4                                 # mov edx, 512
-        bytes 0f 05                                        # syscall
-        bytes 48 3d; le 512 4                              # cmp rax, 512
-        bytes 75 22                                        # jne fail
-        bytes 48 8d 3d; le 100 4                           # lea rdi, [rip+0x64] -> sentinel
-        bytes 48 89 e6                                     # mov rsi, rsp
-        bytes b9; le 32 4                                  # mov ecx, 32
-        bytes fc                                           # cld
-        bytes f3 a6                                        # repe cmpsb
-        bytes 75 0e                                        # jne fail
-        bytes 48 8d 35; le 112 4                           # lea rsi, [rip+0x70] -> ok message
-        bytes ba; le 42 4                                  # mov edx, 42
-        bytes eb 0c                                        # jmp write
-        bytes 48 8d 35; le 140 4                           # fail: lea rsi, [rip+0x8c] -> mismatch message
-        bytes ba; le 48 4                                  # mov edx, 48
-        bytes b8; le 1 4                                   # write: mov eax, 1
-        bytes bf; le 1 4                                   # mov edi, 1
-        bytes 0f 05                                        # syscall
-        emit_reboot_tail
-        # データ
-        printf '/dev\0'
-        printf 'devtmpfs\0'
-        printf '/dev/vda\0'
-        printf '%s' "$block_sentinel"
-        printf '%s\n' "$block_ok_message"
-        printf '%s\n' "$block_mismatch_message"
+        if [ "$arch" = "aarch64" ]; then
+            bytes 60 0c 80 92  # movn x0, #99 (AT_FDCWD)
+            bytes e1 07 00 10  # adr x1, "/dev"
+            bytes a2 3d 80 d2  # mov x2, #0755
+            bytes 48 04 80 d2  # mov x8, #34 (mkdirat)
+            bytes 01 00 00 d4  # svc #0
+            bytes 80 07 00 30  # adr x0, "devtmpfs"
+            bytes 41 07 00 10  # adr x1, "/dev"
+            bytes e2 03 00 aa  # mov x2, x0
+            bytes e3 03 1f aa  # mov x3, xzr
+            bytes e4 03 1f aa  # mov x4, xzr
+            bytes 08 05 80 d2  # mov x8, #40 (mount)
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 0c 80 92  # movn x0, #99
+            bytes c1 06 00 50  # adr x1, "/dev/vda"
+            bytes e2 03 1f aa  # mov x2, xzr (O_RDONLY)
+            bytes 08 07 80 d2  # mov x8, #56 (openat)
+            bytes 01 00 00 d4  # svc #0
+            bytes 00 03 f8 b7  # tbnz x0, #63, fail
+            bytes ff 03 08 d1  # sub sp, sp, #512
+            bytes e1 03 00 91  # mov x1, sp
+            bytes 02 40 80 d2  # mov x2, #512
+            bytes e8 07 80 d2  # mov x8, #63 (read)
+            bytes 01 00 00 d4  # svc #0
+            bytes 1f 00 08 f1  # cmp x0, #512
+            bytes 21 02 00 54  # b.ne fail
+            bytes e3 03 00 10  # adr x3, sentinel
+            bytes e4 17 40 a9  # ldp x4, x5, [sp]
+            bytes 66 1c 40 a9  # ldp x6, x7, [x3]
+            bytes 9f 00 06 eb  # cmp x4, x6
+            bytes 81 01 00 54  # b.ne fail
+            bytes bf 00 07 eb  # cmp x5, x7
+            bytes 41 01 00 54  # b.ne fail
+            bytes e4 17 41 a9  # ldp x4, x5, [sp, #16]
+            bytes 66 1c 41 a9  # ldp x6, x7, [x3, #16]
+            bytes 9f 00 06 eb  # cmp x4, x6
+            bytes c1 00 00 54  # b.ne fail
+            bytes bf 00 07 eb  # cmp x5, x7
+            bytes 81 00 00 54  # b.ne fail
+            bytes e1 03 00 70  # adr x1, ok message
+            bytes 42 05 80 d2  # mov x2, #42
+            bytes 03 00 00 14  # b write
+            bytes e1 04 00 30  # fail: adr x1, mismatch message
+            bytes 02 06 80 d2  # mov x2, #48
+            bytes 20 00 80 d2  # write: mov x0, #1
+            bytes 08 08 80 d2  # mov x8, #64 (write)
+            bytes 01 00 00 d4  # svc #0
+            bytes a0 d5 9b 52  # movz w0, #0xdead
+            bytes 20 dc bf 72  # movk w0, #0xfee1, lsl #16
+            bytes 21 2d 83 52  # movz w1, #0x1969
+            bytes 41 02 a5 72  # movk w1, #0x2812, lsl #16
+            bytes e2 ac 88 52  # movz w2, #0x4567
+            bytes 62 24 a0 72  # movk w2, #0x0123, lsl #16
+            bytes c8 11 80 d2  # mov x8, #142 (reboot)
+            bytes 01 00 00 d4  # svc #0
+            bytes 3f 20 03 d5  # yield
+            bytes ff ff ff 17  # b -4
+            printf '%s' "$block_sentinel"
+            printf '/dev\0'
+            printf 'devtmpfs\0'
+            printf '/dev/vda\0'
+            printf '%s\n' "$block_ok_message"
+            printf '%s\n' "$block_mismatch_message"
+        else
+            # コード 183 バイト（先頭コメントの表と同じ並び）
+            bytes b8; le 83 4                                  # mov eax, 83 (mkdir)
+            bytes 48 8d 3d; le 171 4                           # lea rdi, [rip+0xab] -> "/dev"
+            bytes be; le $((0755)) 4                           # mov esi, 0755
+            bytes 0f 05                                        # syscall
+            bytes b8; le 165 4                                 # mov eax, 165 (mount)
+            bytes 48 8d 3d; le 157 4                           # lea rdi, [rip+0x9d] -> "devtmpfs"
+            bytes 48 8d 35; le 145 4                           # lea rsi, [rip+0x91] -> "/dev"
+            bytes 48 89 fa                                     # mov rdx, rdi
+            bytes 45 31 d2                                     # xor r10d, r10d
+            bytes 45 31 c0                                     # xor r8d, r8d
+            bytes 0f 05                                        # syscall
+            bytes b8; le 2 4                                   # mov eax, 2 (open)
+            bytes 48 8d 3d; le 136 4                           # lea rdi, [rip+0x88] -> "/dev/vda"
+            bytes 31 f6                                        # xor esi, esi (O_RDONLY)
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 3f                                        # js fail
+            bytes 48 81 ec; le 512 4                           # sub rsp, 512
+            bytes 89 c7                                        # mov edi, eax
+            bytes 31 c0                                        # xor eax, eax (read)
+            bytes 48 89 e6                                     # mov rsi, rsp
+            bytes ba; le 512 4                                 # mov edx, 512
+            bytes 0f 05                                        # syscall
+            bytes 48 3d; le 512 4                              # cmp rax, 512
+            bytes 75 22                                        # jne fail
+            bytes 48 8d 3d; le 100 4                           # lea rdi, [rip+0x64] -> sentinel
+            bytes 48 89 e6                                     # mov rsi, rsp
+            bytes b9; le 32 4                                  # mov ecx, 32
+            bytes fc                                           # cld
+            bytes f3 a6                                        # repe cmpsb
+            bytes 75 0e                                        # jne fail
+            bytes 48 8d 35; le 112 4                           # lea rsi, [rip+0x70] -> ok message
+            bytes ba; le 42 4                                  # mov edx, 42
+            bytes eb 0c                                        # jmp write
+            bytes 48 8d 35; le 140 4                           # fail: lea rsi, [rip+0x8c] -> mismatch message
+            bytes ba; le 48 4                                  # mov edx, 48
+            bytes b8; le 1 4                                   # write: mov eax, 1
+            bytes bf; le 1 4                                   # mov edi, 1
+            bytes 0f 05                                        # syscall
+            emit_reboot_tail
+            # データ
+            printf '/dev\0'
+            printf 'devtmpfs\0'
+            printf '/dev/vda\0'
+            printf '%s' "$block_sentinel"
+            printf '%s\n' "$block_ok_message"
+            printf '%s\n' "$block_mismatch_message"
+        fi
     } >"$elf_file"
 else
     msg_len=$((${#init_message} + 1)) # 末尾の改行を含む

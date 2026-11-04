@@ -8,7 +8,7 @@
 //! # 契約
 //! - PC を進める責務はここにある（data abort は faulting 命令自身を指すため、ESR の IL の分だけ進める）。
 //! - どのデバイスにも当たらないアクセスは Linux 版と同じく続行する（読み出しは全バイト 0xFF、書き込みは捨てる）。
-//!   旧スタブの doc の「窓の外は `Failed` で止める」は #3793 の要件で上書きした。回数は [`MmioHandler::unhandled_count`] で観測する。
+//!   実装前（#3791 時点）の doc の「窓の外は `Failed` で止める」は #3793 の要件で上書きした。回数は [`MmioHandler::unhandled_count`] で観測する。
 //! - stage 1 のページテーブル引き中の fault（`s1ptw`）と translation fault 以外（permission fault 等）は MMIO として扱わず
 //!   fail-closed で止める（`mmio_abort::ensure_mmio_fault`）。
 //! - ゲスト由来のアドレス・値は信頼しない。長さは SAS で 1..=8 に限られ、dispatcher も再検査する。

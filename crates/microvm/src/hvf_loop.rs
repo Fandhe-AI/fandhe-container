@@ -12,6 +12,7 @@
 //! # 契約
 //! - 停止: `LoopHandle::stop` は停止フラグ（`Release`）を立ててから kick する。ループは `Canceled` の戻りでフラグ（`Acquire`）を
 //!   確かめて抜ける。kick が実行より先に届いたときの取りこぼしに備え、待つ間も一定間隔で kick し直す。
+//!   WFI の待ちは kick では起きないため、macOS では kick を `hvf_wake::WakingKick` で包んで待ちも起こす（#3887）。
 //! - 期限: 作成待ち・停止待ち・drop の待ちはいずれも期限つき。期限切れは待っていたスレッドを切り離し、`DeadlineExceeded`
 //!   （表記 `TIMEOUT`）で返す。無期限の `join` はしない。
 //! - fail-closed: 未知の exit・未対応の例外クラスは推測で続行せず VM を止める（[`run_loop`] の表）。

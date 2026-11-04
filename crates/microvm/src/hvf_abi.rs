@@ -735,10 +735,10 @@ pub const CNTV_CTL_IMASK: u64 = 1 << 1;
 /// `CNTV_CTL_EL0.ISTATUS`（bit 2）。タイマー条件が成立している（読み取り専用）。
 pub const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 
-/// WFI 1 回の待ちの上限（10 ms）。停止要求への応答時間の上限を決める唯一の値。
+/// WFI 1 回の待ちの上限（10 ms）。通知されない起床要因の安全網。
 ///
-/// `handle_wfx` は停止フラグにも kick（`hv_vcpus_exit`）にも触れられず、ホスト側の sleep は kick で起きない。
-/// そのため停止要求は、この上限で待ちが戻ってから実行ループの先頭で見つかる（REPAIR-5）。
+/// SPI の注入と停止要求の kick は `hvf_wake::WfiWaker` で待ちを即座に起こす（#3887）。framework 側で pending になる
+/// PPI 等、通知の来ない起床要因はこの上限で戻ってから見つかる（REPAIR-5）。
 pub const WFI_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(10);
 
 const _: () = assert!(WFI_WAIT_MAX.as_millis() > 0 && WFI_WAIT_MAX.as_millis() < 1000);

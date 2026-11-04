@@ -38,6 +38,9 @@
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
 //!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
+//! - WFI の起床（#3887）: `set_spi(intid, true)` が成功したら `WfiWaker` に通知し、WFI で待つ vCPU を即座に起こす
+//!   （edge の trigger・level の上げ直し・シリアル入力の `High` を覆う。deassert では通知しない）。ロック順は
+//!   UART → 生存フラグ（読み取り。通知の前に外す）→ waker の mutex で、waker の mutex を持つ間は他の lock を取らない。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
@@ -51,6 +54,8 @@
 //! 「unmap → `hv_vm_destroy`」の順を参照数で保証するため。`HvfGic::create` が `HvVm` を値で消費する点は変わらない。
 
 use std::sync::{Arc, RwLock};
+
+use crate::hvf_wake::WfiWaker;
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -134,6 +139,7 @@ impl HvfGic {
             gic,
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
+            waker: WfiWaker::default(),
             teardown: TeardownMark::new(),
         })
     }
@@ -147,6 +153,8 @@ pub struct VmWithGic {
     vm: Arc<HvVm>,
     /// 生存フラグ。[`GicSpiLine`] と共有し、`Drop` で false にする。
     alive: Arc<RwLock<bool>>,
+    /// WFI の待ちを起こす通知口。SPI の sink と vCPU スレッドが共有する（#3887）。
+    waker: WfiWaker,
     /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
     teardown: TeardownMark,
 }
@@ -179,6 +187,11 @@ impl VmWithGic {
     /// `Arc<HvVm>`（`HvfGuestRam::register_shared` 用。crate の外へは公開しない。#3797）。
     pub(crate) fn shared_vm(&self) -> &Arc<HvVm> {
         &self.vm
+    }
+
+    /// WFI の待ちを起こす通知口の clone（#3887）。`hvf::vcpu` が `TimerHandler` と kick へ結ぶ。
+    pub fn wfi_waker(&self) -> WfiWaker {
+        self.waker.clone()
     }
 
     /// GIC の配置の記録。
@@ -233,6 +246,7 @@ impl VmWithGic {
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
+            waker: self.waker.clone(),
         };
         Ok(GicSpiLine(SpiLine::new(sink, intid, injection)))
     }
@@ -266,6 +280,7 @@ impl VmWithGic {
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
+            waker: self.waker.clone(),
         };
         Ok(GicSerialLine(SpiLevelLine::new(sink, intid)))
     }
@@ -276,6 +291,7 @@ impl VmWithGic {
 pub(crate) struct HvfGicSink {
     api: &'static GicApi,
     alive: Arc<RwLock<bool>>,
+    waker: WfiWaker,
 }
 
 impl SpiSink for HvfGicSink {
@@ -289,7 +305,13 @@ impl SpiSink for HvfGicSink {
                 "spi line outlived its vm; refusing to inject",
             ));
         }
-        self.api.set_spi(intid, level)
+        let r = self.api.set_spi(intid, level);
+        // 読み取りロックを外してから、assert が成功したときだけ WFI の待ちを起こす（waker の mutex を持つ間は他の lock を取らない）。
+        drop(guard);
+        if r.is_ok() && level {
+            self.waker.notify();
+        }
+        r
     }
 }
 

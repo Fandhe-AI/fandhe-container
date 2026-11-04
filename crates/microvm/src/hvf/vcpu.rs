@@ -3,7 +3,7 @@
 //! 役割: Hypervisor.framework の vCPU は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は作成スレッドから
 //! 呼ぶ）。専用スレッドで `HvVcpu` を作って所有し、レジスタ初期化（`setup`）の後に実行ループを回す。ループ・停止・期限・観測の
 //! 論理は OS 非依存の `crate::hvf_loop` にあり（`hv_*` を呼ばない偽の実行体で単体試験できる）、本ファイルは次だけを持つ。
-//! - `HvVcpu` への [`VcpuExec`] と `VcpuCanceller` への [`VcpuKick`] の実装
+//! - `HvVcpu` への [`VcpuExec`] と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包み、WFI の待ちも起こす。#3887）
 //! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, timer}` のハンドラへ振り分ける関数
 //!
 //! 呼び出し元は #3797（構成体の組み立て。`setup` に PC・CPSR・X0（FDT のアドレス）等の初期化を渡し、ハンドラ状態を持たせる）。
@@ -47,6 +47,7 @@ use crate::hvf_loop::{
     VCPU_RUN_SLICE, VcpuExec, VcpuExitObserver, VcpuKick, VcpuSetStopReport, VcpuStopReport,
     run_loop, spawn_loop, stop_all,
 };
+use crate::hvf_wake::WakingKick;
 use crate::stop::StopReason;
 use crate::sys::{HvVcpu, VcpuCanceller};
 
@@ -113,7 +114,7 @@ impl VcpuKick for VcpuCanceller {
 
 /// 起動済みの vCPU スレッドの操作口。
 #[derive(Debug)]
-pub struct VcpuHandle(LoopHandle<VcpuCanceller>);
+pub struct VcpuHandle(LoopHandle<WakingKick<VcpuCanceller>>);
 
 impl VcpuHandle {
     /// スレッドが既に終わったか（ゲスト起因の終了を含む）。
@@ -266,10 +267,12 @@ impl VcpuThread {
         let slot: Arc<OnceLock<u64>> = Arc::new(OnceLock::new());
         let slot_in = Arc::clone(&slot);
         let name = format!("hvf-vcpu-{index}");
+        // BSP と同じく kick を `WakingKick` で包む（AP は WFI を実行しないが、`VcpuHandle` の型を揃える。#3887）。
+        let waker = vm.wfi_waker();
         let handle = spawn_loop(
             &name,
             config.create_deadline,
-            move |start: LoopStart<VcpuCanceller>| {
+            move |start: LoopStart<WakingKick<VcpuCanceller>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -292,7 +295,7 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let reason = match start.ready_parked(vcpu.canceller()) {
+                let reason = match start.ready_parked(WakingKick::new(vcpu.canceller(), waker)) {
                     ParkOutcome::Stopped => StopReason::Requested,
                     // #3884 では AP の gate を誰も開けない。想定外の起動要求は推測で走らせず fail-closed で終える。
                     _ => StopReason::Failed(MicrovmErrorCode::Unimplemented),
@@ -326,10 +329,13 @@ impl VcpuThread {
         let slice = config.run_slice;
         let observer = config.observer;
         let mut handlers = handlers;
+        // WFI の待ちを VM の通知口に結ぶ（SPI の注入と停止要求の kick が起こす。#3887）。呼び出し側がどの `TimerHandler` を渡しても同じ。
+        let waker = vm.wfi_waker();
+        handlers.timer.set_waker(waker.clone());
         let handle = spawn_loop(
             "hvf-vcpu-0",
             config.create_deadline,
-            move |start: LoopStart<VcpuCanceller>| {
+            move |start: LoopStart<WakingKick<VcpuCanceller>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -343,8 +349,9 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
+                let kick = WakingKick::new(vcpu.canceller(), waker);
                 let stop = if gated {
-                    match start.ready_gated(vcpu.canceller()) {
+                    match start.ready_gated(kick) {
                         Ok(stop) => stop,
                         Err(reason) => {
                             // 走らせずに終わる（開く前の stop / drop、またはゲートの待ちの期限切れ）。
@@ -354,7 +361,7 @@ impl VcpuThread {
                         }
                     }
                 } else {
-                    start.ready(vcpu.canceller())
+                    start.ready(kick)
                 };
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
                 let reason = run_loop(&mut exec, &stop, slice, observer.as_deref(), |e, x| {

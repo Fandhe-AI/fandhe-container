@@ -18,7 +18,7 @@ pub mod timer;
 pub mod vcpu;
 pub use vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
 pub mod gic;
-pub use gic::{GicSpiLine, HvfGic, VmWithGic};
+pub use gic::{GicSerialLine, GicSpiLine, HvfGic, VmWithGic};
 
 // TASK-192.15・#3797: microVM 構成体（VM・GIC・ゲスト RAM・virtio-mmio・vCPU 0 の起動レジスタの組み立て）。
 pub mod microvm;

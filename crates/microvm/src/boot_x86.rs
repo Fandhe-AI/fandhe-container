@@ -357,7 +357,8 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
 ///
 /// MP テーブルでゲストが IOAPIC モードになると Linux は IRQ 0 の `check_timer` を走らせるが、この VM には PIT も
 /// タイマー割り込みの注入経路も無く検査に失敗して起動できない。そのため `microvm.rs` の `load_kernel` が
-/// 常に付ける。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
+/// 常に付ける（Linux x86_64 以外では呼び出し元が無いため、試験を除き `cfg` で除外する）。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
 pub(crate) fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
     // 公開 API の直接呼び出しでも、複製の前に上限を超える入力を拒否する（確保の無制限化を防ぐ）。
     if user.len() as u64 >= CMDLINE_CAPACITY {
@@ -383,6 +384,7 @@ pub(crate) fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
 
 /// 引用符の外の空白で区切った独立トークンに `name` が完全一致で含まれるか。
 /// `foo="x no_timer_check y"` のように引用符内にある文字列は独立した引数とみなさない。
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
 fn has_standalone_token(text: &str, name: &str) -> bool {
     let mut in_quote = false;
     let mut start = 0usize;

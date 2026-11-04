@@ -36,7 +36,7 @@
 //! TASK-75.5・#3739・MVM-1: 8250 / 16550 互換の最小 UART のレジスタモデル（`uart`。OS 非依存・`unsafe` なし。IRQ は出さない）。
 //! #3734・MVM-1: 起動用の MSR・FPU の設定（`boot_x86::boot_msrs`・`X86FpuState`・`device::VcpuFd::{set_msrs, msrs, set_fpu, fpu}`。`unsafe` 追加なし）。
 //! #3740・MVM-1: UART を COM1（0x3f8〜0x3ff）の PIO へ結線（`microvm::DeviceBus`）し、THR 出力を上限つきバッファから
-//! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。IRQ 4・ゲスト入力は未実装。
+//! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。ゲスト入力は受信 FIFO あり（#3893）、x86 の IRQ 4 は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
 //! TASK-192.7・#3790・MVM-5・MVM-1: arm64 の Image・initrd・FDT の配置と起動レジスタの値（`boot_arm64`。OS 非依存・`unsafe` なし）。

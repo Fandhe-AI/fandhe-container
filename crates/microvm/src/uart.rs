@@ -3,7 +3,7 @@
 //! ゲストカーネルのコンソール（`console=ttyS0`）の出力をホストが受け取るためのデバイスモデル。
 //! レジスタモデル（[`Uart16550`]）と、PIO バス・ホストで共有するハンドル（[`SerialConsole`]）を持つ。
 //! arm64 ゲストは MMIO（FDT の `ns16550a`・`reg-shift = 0`・`reg-io-width = 1`）でも同じモデルを使う
-//! ([`SerialConsole::mmio_device`]。#3864・MVM-5)。HvfMicroVm への結線は後続（REPAIR-3）。
+//! ([`SerialConsole::mmio_device`]・割り込みつきは [`SerialConsole::mmio_device_with_irq`]。#3864・#3892・MVM-5)。
 //! `microvm::DeviceBus`（Linux のみ）が [`SerialConsole::port_device`] を
 //! `crate::dispatch::ExitDispatcher::register_pio` に `(COM1_BASE, UART_PORT_LEN, ..)` で常に登録し、
 //! ホストは `microvm::MicroVm::serial_console` / `microvm::RunningMicroVm::serial_console`（macOS の MMIO 経路は `hvf::HvfMicroVm::serial_console`。#3882）で得た
@@ -27,12 +27,39 @@
 //! offset・幅・値はゲストが決める非信頼入力。`offset >= 8` と 1 バイト以外の幅は `PortIoOutcome::Ignored`
 //! （読み出しは dispatcher が 0xFF 埋め）。添字アクセス・`unwrap` は使わず、計数は saturating で行う。
 //!
+//! # THRE 割り込み（#3892・MVM-5・MVM-1）
+//! 線が結線されている（[`SerialConsole::mmio_device_with_irq`] を呼んだ）ときだけ有効で、線の無い経路（x86 の PIO・
+//! [`SerialConsole::mmio_device`]）は従来どおり IIR が常に「保留なし」（0x01）を返す。
+//! IER.ETBEI（bit1）が 1 で THRE 保留があるとき、IIR は 0x02（FIFO 有効時は 0xC2）を返し、[`Uart16550::irq_level`] が
+//! `High` になる。保留は ETBEI を 0 から 1 にしたとき・THR 書き込み（ループバック中も含む）・FCR の送信 FIFO リセット
+//! （bit2）で立ち、IIR の読み出し（THRE を返したとき）と ETBEI を 0 にしたときに下がる（QEMU の `hw/char/serial.c` と
+//! 16550 の理解。LSR.THRE は常に 1 で、送信は即時に終わる）。MCR.OUT2 では線を絞らない（QEMU と同じ）。
+//! 優先度は RLS > RDA > CTI > THRE > MSR（PC16550D / TL16C550 のデータシートの IIR 表。QEMU の `hw/char/serial.c` も同じ）。
+//! 線の更新はモデルが自分の線（[`SerialConsole::mmio_device_with_irq`] が設定）へ値の変化だけを伝える。ゲストの MMIO
+//! アクセスの後と、ホストの [`SerialConsole::push_input`] の後に、UART の lock を持ったまま行う
+//! （arm64 は macOS の level SPI。`crate::spi::SpiLevelLine`）。
+//!
+//! # ゲスト入力（#3893・MVM-5・MVM-1・CORE-7）
+//! ホストは [`SerialConsole::push_input`] でゲストへ文字を渡す。入力は上限（既定 [`MAX_INPUT_BYTES`]）つきの受信 FIFO に
+//! 積み、溢れた分は**新しく入ってきた超過分**を捨てて [`UartStats::input_dropped_bytes`] に数える（ハードウェアの overrun と
+//! 同じ向き。送信バッファが古い方から捨てるのとは逆）。RBR の読み出しで先頭を返し（空なら 0）、LSR.DR は FIFO が空でない間 1。
+//! IER.ERBFI（bit0）が 1 で FIFO が空でなければ、線がある経路だけ IIR は 0x04（FIFO 有効時は 0xC4）で線は `High`。
+//! THRE と同時に保留なら受信データが上（データシートの優先度）。IIR の読み出しでは下ろさず、RBR で読み切ると下がる
+//! （THRE の保留は 0x04 を返した IIR 読み出しでは下がらない）。FCR bit1 は受信 FIFO を空にし、捨てた数を
+//! [`UartStats::input_flushed_bytes`] に数える（Linux は起動時に書くので、その前に積んだ入力は消える）。
+//! 受信トリガ（FCR bit7:6）は見ず、空でなければ常に出す（実効トリガ 1）。CTI を実装しないので、トリガを守ると
+//! 1 文字では割り込みが来ない。Linux の 8250 は IIR の種類によらず LSR.DR を見て読み切るので RDA で足りる。
+//! 入力のバイト列は非信頼で、ゲストへ渡すだけ。ログ・`Debug` へは出さない。ホストスレッドから線を更新するので
+//! ロック順は「UART → 線（GIC の生存フラグ）」で、vCPU 側と同じ。WFI で待つゲストへは最大 `WFI_WAIT_MAX`（10 ms）遅れて届く。
+//!
 //! # 未実装（REPAIR-3）
-//! - IRQ 4（[`COM1_IRQ`]）は出さない。IER は読み書きできるが割り込みは起こさず、IIR は常に「保留なし」。
-//!   将来は IER.ETBEI と THR 空きによる THRE 割り込み（IIR=0x02）を、THR 書き込み・IER 書き込みで立て、
-//!   IIR 読み出しと THR 書き込みで解除し、irqfd の GSI 4 へ結線する（MVM-1）。
-//!   現状の制約: tty 層の割り込み駆動の送信（ユーザー空間から `/dev/ttyS0` への書き込み）は進まないことがある。
-//! - ゲスト入力（RBR・DR・受信 FIFO）は対象外。RBR は常に 0。
+//! - x86 の IRQ 4（[`COM1_IRQ`]）は出さない。PIO の [`SerialConsole::port_device`] は線を持たず、IIR は従来どおり常に
+//!   「保留なし」を返す（届かない THRE を報告すると Linux の `serial8250_do_startup` の THRE 試験が BUG_THRE を立てず、
+//!   ドライバが来ない割り込みを待つため）。将来は irqfd の GSI 4 へ結線する。KVM の `IrqFd` は edge のため、level には
+//!   `KVM_IRQ_LINE` か resamplefd が要る（MVM-1）。
+//! - ゲスト入力は x86 の PIO では線が無いため、Linux ゲストは入力を読みに来ない（LSR.DR と RBR のポーリングは動く）。
+//! - 受信トリガ（FCR bit7:6）・CTI（IIR 0x0C）・LSR.OE と RLS 割り込みは未実装。ループバック中の THR 書き込みは RX へ回さない。
+//! - `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかは未確認（#3803 の実機確認項目）。
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -40,16 +67,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::dispatch::{MmioDevice, PortIoDevice, PortIoOutcome};
 use crate::error::{MicrovmError, MicrovmErrorCode};
+use crate::interrupt::{IrqLevel, LevelInterruptLine};
 use crate::virtio_mmio::{IgnoredAccess, MmioReadOutcome, MmioWriteOutcome};
 
 /// COM1 の基底ポート。
 pub const COM1_BASE: u16 = 0x3f8;
 /// UART が占めるポート数（offset 0..8）。
 pub const UART_PORT_LEN: u16 = 8;
-/// COM1 の IRQ 番号。割り込みは出さない（#3740 の結線は PIO のみ）ため、将来仕様の記述用。
+/// COM1 の IRQ 番号。x86 の PIO は線を持たず割り込みは出さない（REPAIR-3）ため、将来仕様の記述用。
 pub const COM1_IRQ: u32 = 4;
 /// 出力バッファの上限バイト数（64 KiB）。
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// 受信 FIFO の既定の上限バイト数（ホスト入力は端末の貼り付け程度で足りる。超過は捨てる。CORE-7・#3893）。
+pub const MAX_INPUT_BYTES: usize = 4 * 1024;
 
 const LSR_THRE_TEMT: u8 = 0x60;
 const LCR_DLAB: u8 = 0x80;
@@ -58,6 +88,15 @@ const MCR_MASK: u8 = 0x1F;
 const IER_MASK: u8 = 0x0F;
 const FCR_ENABLE: u8 = 0x01;
 const IIR_NO_INT: u8 = 0x01;
+const IIR_THRE: u8 = 0x02;
+const IIR_RDA: u8 = 0x04;
+const IER_ERBFI: u8 = 0x01;
+const LSR_DR: u8 = 0x01;
+const FCR_RX_RESET: u8 = 0x02;
+const IER_ETBEI: u8 = 0x02;
+const FCR_TX_RESET: u8 = 0x04;
+/// `int_pending` のビット: 送信保持レジスタ空きの保留。
+const INT_THRE: u8 = 0x01;
 const IIR_FIFO: u8 = 0xC0;
 const MSR_DEFAULT: u8 = 0xB0;
 
@@ -73,10 +112,32 @@ pub struct UartStats {
     pub dropped_bytes: u64,
     /// ループバック中に THR へ書かれ、出力へ送らず捨てたバイト数。
     pub loopback_discarded: u64,
+    /// 割り込み線の更新に失敗した回数（#3892。失敗しても MMIO は処理済みで、次のアクセスで再試行する）。
+    pub irq_line_errors: u64,
+    /// ホストが `push_input` で受理した累計バイト数（#3893）。
+    pub input_received_bytes: u64,
+    /// 受信 FIFO に今あるバイト数。
+    pub input_buffered_bytes: usize,
+    /// 受信 FIFO の上限超過で捨てた累計バイト数。
+    pub input_dropped_bytes: u64,
+    /// FCR の受信 FIFO リセットで捨てた累計バイト数。
+    pub input_flushed_bytes: u64,
+    /// ゲストが RBR から読んだ累計バイト数。
+    pub input_read_bytes: u64,
+}
+
+/// `push_input` の結果（#3893）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct InputReport {
+    /// 受信 FIFO に積んだバイト数。
+    pub accepted: usize,
+    /// 上限超過で捨てたバイト数。
+    pub dropped: usize,
 }
 
 /// 8250 / 16550 互換の最小 UART のレジスタモデル。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Uart16550 {
     dll: u8,
     dlm: u8,
@@ -90,6 +151,26 @@ pub struct Uart16550 {
     written_bytes: u64,
     dropped_bytes: u64,
     loopback_discarded: u64,
+    int_pending: u8,
+    irq_reported: IrqLevel,
+    irq_line_errors: u64,
+    /// 割り込み線が結線済みか（[`SerialConsole::mmio_device_with_irq`] が立てる）。線が無い経路では THRE を IIR に出さない。
+    irq_wired: bool,
+    /// 線の実体（[`SerialConsole::mmio_device_with_irq`] が設定する）。ホストの `push_input` からも更新するため UART が持つ。
+    line: Option<Arc<dyn LevelInterruptLine>>,
+    rx: VecDeque<u8>,
+    rx_capacity: usize,
+    input_received_bytes: u64,
+    input_dropped_bytes: u64,
+    input_flushed_bytes: u64,
+    input_read_bytes: u64,
+}
+
+impl fmt::Debug for Uart16550 {
+    // 送信・受信のバイト列（非信頼）は出さない。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Uart16550").finish_non_exhaustive()
+    }
 }
 
 impl Default for Uart16550 {
@@ -115,6 +196,34 @@ impl Uart16550 {
         Ok(Self::with_capacity_unchecked(capacity))
     }
 
+    /// 出力・入力の上限を指定して作る。それぞれ `1..=MAX_*_BYTES` の外は `InvalidArgument`（#3893）。
+    pub fn with_capacities(output: usize, input: usize) -> Result<Self, MicrovmError> {
+        if input == 0 || input > MAX_INPUT_BYTES {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "uart input capacity out of range",
+            ));
+        }
+        let mut u = Self::with_output_capacity(output)?;
+        u.rx_capacity = input;
+        Ok(u)
+    }
+
+    /// ホストからの入力を受信 FIFO へ積む（#3893）。残り容量を超えた分は捨てて数える。線があれば同期する。
+    pub fn push_input(&mut self, bytes: &[u8]) -> InputReport {
+        let room = self.rx_capacity.saturating_sub(self.rx.len());
+        let take = bytes.len().min(room);
+        let (head, rest) = bytes.split_at(take);
+        self.rx.extend(head.iter().copied());
+        self.input_received_bytes = self.input_received_bytes.saturating_add(take as u64);
+        self.input_dropped_bytes = self.input_dropped_bytes.saturating_add(rest.len() as u64);
+        self.sync_line();
+        InputReport {
+            accepted: take,
+            dropped: rest.len(),
+        }
+    }
+
     fn with_capacity_unchecked(capacity: usize) -> Self {
         Self {
             dll: 0x0C,
@@ -129,6 +238,17 @@ impl Uart16550 {
             written_bytes: 0,
             dropped_bytes: 0,
             loopback_discarded: 0,
+            int_pending: 0,
+            irq_reported: IrqLevel::Low,
+            irq_line_errors: 0,
+            irq_wired: false,
+            line: None,
+            rx: VecDeque::new(),
+            rx_capacity: MAX_INPUT_BYTES,
+            input_received_bytes: 0,
+            input_dropped_bytes: 0,
+            input_flushed_bytes: 0,
+            input_read_bytes: 0,
         }
     }
 
@@ -144,6 +264,60 @@ impl Uart16550 {
             buffered_bytes: self.output.len(),
             dropped_bytes: self.dropped_bytes,
             loopback_discarded: self.loopback_discarded,
+            irq_line_errors: self.irq_line_errors,
+            input_received_bytes: self.input_received_bytes,
+            input_buffered_bytes: self.rx.len(),
+            input_dropped_bytes: self.input_dropped_bytes,
+            input_flushed_bytes: self.input_flushed_bytes,
+            input_read_bytes: self.input_read_bytes,
+        }
+    }
+
+    fn rda_pending(&self) -> bool {
+        self.irq_wired && self.ier & IER_ERBFI != 0 && !self.rx.is_empty()
+    }
+
+    fn thre_pending(&self) -> bool {
+        self.irq_wired && self.ier & IER_ETBEI != 0 && self.int_pending & INT_THRE != 0
+    }
+
+    /// 割り込み線が今あるべき値。受信データ（ERBFI=1 で FIFO が空でない）か THRE（ETBEI=1 で保留）があれば `High`（#3892・#3893）。
+    pub fn irq_level(&self) -> IrqLevel {
+        if self.rda_pending() || self.thre_pending() {
+            IrqLevel::High
+        } else {
+            IrqLevel::Low
+        }
+    }
+
+    /// IIR の値。優先度の高い要因から返す（RDA > THRE。RLS・CTI は未実装）。
+    fn iir(&self) -> u8 {
+        let id = if self.rda_pending() {
+            IIR_RDA
+        } else if self.thre_pending() {
+            IIR_THRE
+        } else {
+            IIR_NO_INT
+        };
+        if self.fifo_enabled { id | IIR_FIFO } else { id }
+    }
+
+    /// 自分の線（あれば）へ値の変化を伝える。
+    pub(crate) fn sync_line(&mut self) {
+        if let Some(line) = self.line.clone() {
+            self.sync_irq_line(line.as_ref());
+        }
+    }
+
+    /// 線の値が最後に伝えた値と違うときだけ `line` へ伝える。失敗は計数して据え置き、次のアクセスで再試行する。
+    pub(crate) fn sync_irq_line(&mut self, line: &dyn LevelInterruptLine) {
+        let level = self.irq_level();
+        if level == self.irq_reported {
+            return;
+        }
+        match line.set_level(level) {
+            Ok(()) => self.irq_reported = level,
+            Err(_) => self.irq_line_errors = self.irq_line_errors.saturating_add(1),
         }
     }
 
@@ -177,23 +351,30 @@ impl Uart16550 {
         v
     }
 
-    fn read_reg(&self, offset: u16) -> Option<u8> {
+    fn read_reg(&mut self, offset: u16) -> Option<u8> {
         let dlab = self.dlab();
         Some(match offset {
             0 if dlab => self.dll,
-            0 => 0,
+            0 => match self.rx.pop_front() {
+                Some(b) => {
+                    self.input_read_bytes = self.input_read_bytes.saturating_add(1);
+                    b
+                }
+                None => 0,
+            },
             1 if dlab => self.dlm,
             1 => self.ier,
             2 => {
-                if self.fifo_enabled {
-                    IIR_NO_INT | IIR_FIFO
-                } else {
-                    IIR_NO_INT
+                let v = self.iir();
+                // THRE を返した読み出しで保留を下ろす（これが IIR の「ACK」）。
+                if v & 0x0F == IIR_THRE {
+                    self.int_pending &= !INT_THRE;
                 }
+                v
             }
             3 => self.lcr,
             4 => self.mcr,
-            5 => LSR_THRE_TEMT,
+            5 => LSR_THRE_TEMT | if self.rx.is_empty() { 0 } else { LSR_DR },
             6 => self.msr(),
             7 => self.scr,
             _ => return None,
@@ -204,10 +385,35 @@ impl Uart16550 {
         let dlab = self.dlab();
         match offset {
             0 if dlab => self.dll = value,
-            0 => self.push_output(value),
+            0 => {
+                self.push_output(value);
+                // 送信は即時に終わり THR はすぐ空になる。
+                self.int_pending |= INT_THRE;
+            }
             1 if dlab => self.dlm = value,
-            1 => self.ier = value & IER_MASK,
-            2 => self.fifo_enabled = value & FCR_ENABLE != 0,
+            1 => {
+                let was = self.ier & IER_ETBEI;
+                self.ier = value & IER_MASK;
+                if self.ier & IER_ETBEI != was {
+                    if self.ier & IER_ETBEI != 0 {
+                        self.int_pending |= INT_THRE;
+                    } else {
+                        self.int_pending &= !INT_THRE;
+                    }
+                }
+            }
+            2 => {
+                self.fifo_enabled = value & FCR_ENABLE != 0;
+                if value & FCR_TX_RESET != 0 {
+                    self.int_pending |= INT_THRE;
+                }
+                if value & FCR_RX_RESET != 0 {
+                    self.input_flushed_bytes = self
+                        .input_flushed_bytes
+                        .saturating_add(self.rx.len() as u64);
+                    self.rx.clear();
+                }
+            }
             3 => self.lcr = value,
             4 => self.mcr = value & MCR_MASK,
             5 | 6 => {}
@@ -295,6 +501,23 @@ impl SerialConsole {
         })
     }
 
+    /// 出力・入力の上限を指定して作る。範囲外は `InvalidArgument`（#3893）。
+    pub fn with_capacities(output: usize, input: usize) -> Result<Self, MicrovmError> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Uart16550::with_capacities(output, input)?)),
+        })
+    }
+
+    /// ホストからゲストへ文字を渡す（#3893・MVM-5）。受信 FIFO の残りを超えた分は捨てて数える。
+    ///
+    /// 線がある経路では、ゲストのアクセスを待たずここで線を更新する（WFI で寝ているゲストは UART に触らないため）。
+    /// 線の失敗は [`UartStats::irq_line_errors`] に数え、入力は受理済みとして `Ok` を返す。lock の poison は `Internal`。
+    /// バイト列は非信頼で、解釈も記録もしない。
+    pub fn push_input(&self, bytes: &[u8]) -> Result<InputReport, MicrovmError> {
+        let mut u = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(u.push_input(bytes))
+    }
+
     /// バッファのバイト列を全部取り出して空にする（長さは上限以下）。中身は非信頼のゲスト出力。
     pub fn take_output(&self) -> Result<Vec<u8>, MicrovmError> {
         let mut u = self.inner.lock().map_err(|_| poisoned())?;
@@ -314,16 +537,35 @@ impl SerialConsole {
 }
 
 impl SerialConsole {
-    /// arm64 の MMIO バス用デバイス（同じバッファを共有する。#3864・MVM-5）を作る。
+    /// arm64 の MMIO バス用デバイス（同じバッファを共有する。割り込みは出さない。#3864・MVM-5）を作る。
     ///
     /// FDT の `reg-shift = 0`・`reg-io-width = 1` に合わせ、受けるのは 1 バイト幅・offset 0..8 のみ。
     pub fn mmio_device(&self) -> Box<dyn MmioDevice> {
-        Box::new(SharedUartMmio(Arc::clone(&self.inner)))
+        Box::new(SharedUartMmio {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// [`Self::mmio_device`] に THRE 割り込みの線をつけたもの（#3892・MVM-5・MVM-1）。
+    ///
+    /// 各アクセスの後、UART の lock を持ったまま線の値の変化だけを `line` へ伝える（線の更新順を UART の状態の順に揃える）。
+    /// `line` の失敗でもアクセスは `Handled` のまま返し、[`UartStats::irq_line_errors`] に数える。
+    pub fn mmio_device_with_irq(&self, line: Arc<dyn LevelInterruptLine>) -> Box<dyn MmioDevice> {
+        // 線ができたこの時点から THRE を IIR に出す（lock の poison は各アクセスが fail-closed に扱う）。
+        if let Ok(mut u) = self.inner.lock() {
+            u.irq_wired = true;
+            u.line = Some(line);
+        }
+        Box::new(SharedUartMmio {
+            inner: Arc::clone(&self.inner),
+        })
     }
 }
 
 /// MMIO 用の共有ラッパー。幅・offset を検査してから [`Uart16550`] へ委ね、lock の poison は `Ignored`（fail-closed）。
-struct SharedUartMmio(Arc<Mutex<Uart16550>>);
+struct SharedUartMmio {
+    inner: Arc<Mutex<Uart16550>>,
+}
 
 impl SharedUartMmio {
     fn reg(offset: u64, width: usize) -> Option<u16> {
@@ -331,6 +573,10 @@ impl SharedUartMmio {
             return None;
         }
         u16::try_from(offset).ok().filter(|o| *o < UART_PORT_LEN)
+    }
+
+    fn sync(&self, u: &mut Uart16550) {
+        u.sync_line();
     }
 }
 
@@ -340,9 +586,12 @@ impl MmioDevice for SharedUartMmio {
             data.fill(0);
             return MmioReadOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth);
         };
-        match self.0.lock() {
+        match self.inner.lock() {
             Ok(mut u) => match PortIoDevice::read(&mut *u, reg, data) {
-                PortIoOutcome::Handled => MmioReadOutcome::Handled,
+                PortIoOutcome::Handled => {
+                    self.sync(&mut u);
+                    MmioReadOutcome::Handled
+                }
                 _ => {
                     data.fill(0);
                     MmioReadOutcome::Ignored(IgnoredAccess::UnknownRegister)
@@ -359,9 +608,12 @@ impl MmioDevice for SharedUartMmio {
         let Some(reg) = Self::reg(offset, data.len()) else {
             return MmioWriteOutcome::Ignored(IgnoredAccess::UnalignedOrBadWidth);
         };
-        match self.0.lock() {
+        match self.inner.lock() {
             Ok(mut u) => match PortIoDevice::write(&mut *u, reg, data) {
-                PortIoOutcome::Handled => MmioWriteOutcome::Handled,
+                PortIoOutcome::Handled => {
+                    self.sync(&mut u);
+                    MmioWriteOutcome::Handled
+                }
                 _ => MmioWriteOutcome::Ignored(IgnoredAccess::UnknownRegister),
             },
             Err(_) => MmioWriteOutcome::Ignored(IgnoredAccess::UnknownRegister),
@@ -589,5 +841,320 @@ mod tests {
         assert!(matches!(dev.read(5, &mut buf), MmioReadOutcome::Ignored(_)));
         assert_eq!(buf, [0]);
         assert!(matches!(dev.write(0, b"a"), MmioWriteOutcome::Ignored(_)));
+    }
+
+    /// 呼び出し列を記録する偽の線。`fail` が真なら失敗する。
+    #[derive(Debug, Clone, Default)]
+    struct FakeLine {
+        calls: Arc<Mutex<Vec<IrqLevel>>>,
+        fail: bool,
+    }
+
+    impl LevelInterruptLine for FakeLine {
+        fn set_level(&self, level: IrqLevel) -> Result<(), MicrovmError> {
+            if self.fail {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "fake failure",
+                ));
+            }
+            self.calls.lock().unwrap().push(level);
+            Ok(())
+        }
+    }
+
+    /// MVM-5・MVM-1・#3892: ETBEI で線が立ち、IIR 読み出しで下がる。
+    #[test]
+    fn mvm5_3892_uart_etbei_raises_thre() {
+        let mut u = Uart16550::new();
+        u.irq_wired = true;
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        wr(&mut u, 1, 0x02);
+        assert_eq!(u.irq_level(), IrqLevel::High);
+        assert_eq!(rd(&mut u, 2), 0x02);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        assert_eq!(rd(&mut u, 2), 0x01);
+    }
+
+    /// MVM-5・MVM-1・#3892: 線の無い経路（x86 の PIO・線なしの MMIO）は ETBEI=1 でも IIR が常に 0x01 で線も Low。
+    #[test]
+    fn mvm5_3892_uart_unwired_iir_stays_no_int() {
+        let console = SerialConsole::new();
+        let mut dev = console.port_device();
+        assert_eq!(dev.write(1, &[0x02]), PortIoOutcome::Handled);
+        let mut buf = [0u8; 1];
+        assert_eq!(dev.read(2, &mut buf), PortIoOutcome::Handled);
+        assert_eq!(buf, [0x01]);
+        assert_eq!(console.inner.lock().unwrap().irq_level(), IrqLevel::Low);
+    }
+
+    /// MVM-5・MVM-1・#3892: THR 書き込みで再び立つ。
+    #[test]
+    fn mvm5_3892_uart_thr_write_reasserts() {
+        let mut u = Uart16550::new();
+        u.irq_wired = true;
+        wr(&mut u, 1, 0x02);
+        assert_eq!(rd(&mut u, 2), 0x02);
+        wr(&mut u, 0, b'x');
+        assert_eq!(u.irq_level(), IrqLevel::High);
+        assert_eq!(rd(&mut u, 2), 0x02);
+    }
+
+    /// MVM-5・MVM-1・#3892: ETBEI=0 では立たない。
+    #[test]
+    fn mvm5_3892_uart_etbei_zero_never_raises() {
+        let mut u = Uart16550::new();
+        wr(&mut u, 0, b'x');
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        wr(&mut u, 2, 0x04);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        assert_eq!(rd(&mut u, 2), 0x01);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+    }
+
+    /// MVM-5・#3892: FIFO 有効時の IIR は上位 0xC0 つき。
+    #[test]
+    fn mvm5_3892_uart_fifo_iir_values() {
+        let mut u = Uart16550::new();
+        u.irq_wired = true;
+        wr(&mut u, 2, 0x01);
+        wr(&mut u, 1, 0x02);
+        assert_eq!(rd(&mut u, 2), 0xC2);
+        assert_eq!(rd(&mut u, 2), 0xC1);
+    }
+
+    /// MVM-5・#3892: ETBEI を落とすと線が下がる。
+    #[test]
+    fn mvm5_3892_uart_etbei_clear_drops_line() {
+        let mut u = Uart16550::new();
+        u.irq_wired = true;
+        wr(&mut u, 1, 0x02);
+        assert_eq!(u.irq_level(), IrqLevel::High);
+        wr(&mut u, 1, 0x00);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+    }
+
+    /// MVM-5・#3892: DLAB=1 の offset 1 は DLM で、割り込み状態を変えない。
+    #[test]
+    fn mvm5_3892_uart_dlab_does_not_touch_irq() {
+        let mut u = Uart16550::new();
+        wr(&mut u, 3, 0x83);
+        wr(&mut u, 1, 0x02);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        wr(&mut u, 3, 0x03);
+        assert_eq!(rd(&mut u, 1), 0x00);
+    }
+
+    /// MVM-5・MVM-1・#3892: MMIO ラッパー経由で値が変わったときだけ線へ伝わる。
+    #[test]
+    fn mvm5_3892_mmio_irq_line_sequence() {
+        let console = SerialConsole::new();
+        let line = FakeLine::default();
+        let mut dev = console.mmio_device_with_irq(Arc::new(line.clone()));
+        let calls = || line.calls.lock().unwrap().clone();
+        assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(calls(), vec![IrqLevel::High]);
+        assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(calls(), vec![IrqLevel::High]);
+        let mut b = [0u8; 1];
+        assert_eq!(dev.read(2, &mut b), MmioReadOutcome::Handled);
+        assert_eq!(b, [0x02]);
+        assert_eq!(calls(), vec![IrqLevel::High, IrqLevel::Low]);
+        assert_eq!(dev.write(0, b"a"), MmioWriteOutcome::Handled);
+        assert_eq!(calls(), vec![IrqLevel::High, IrqLevel::Low, IrqLevel::High]);
+        assert_eq!(dev.write(1, &[0x00]), MmioWriteOutcome::Handled);
+        assert_eq!(
+            calls(),
+            vec![IrqLevel::High, IrqLevel::Low, IrqLevel::High, IrqLevel::Low]
+        );
+        assert_eq!(console.take_output().unwrap(), b"a".to_vec());
+    }
+
+    /// MVM-5・REPAIR-4・#3892: 線の失敗でもアクセスは成立し、計数して次のアクセスで再試行する。
+    #[test]
+    fn mvm5_3892_mmio_irq_line_failure_counted() {
+        let console = SerialConsole::new();
+        let line = FakeLine {
+            fail: true,
+            ..Default::default()
+        };
+        let mut dev = console.mmio_device_with_irq(Arc::new(line));
+        assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(console.stats().unwrap().irq_line_errors, 1);
+        assert_eq!(dev.write(1, &[0x02]), MmioWriteOutcome::Handled);
+        assert_eq!(console.stats().unwrap().irq_line_errors, 2);
+    }
+
+    fn wired(u: &mut Uart16550) {
+        u.irq_wired = true;
+    }
+
+    /// MVM-5・CORE-7・#3893: 入力は先頭から順に RBR で読め、LSR.DR が追従する。
+    #[test]
+    fn mvm5_3893_rx_dr_and_rbr_order() {
+        let mut u = Uart16550::new();
+        assert_eq!(rd(&mut u, 5), 0x60);
+        let r = u.push_input(b"ab");
+        assert_eq!((r.accepted, r.dropped), (2, 0));
+        assert_eq!(rd(&mut u, 5), 0x61);
+        assert_eq!(rd(&mut u, 0), b'a');
+        assert_eq!(rd(&mut u, 0), b'b');
+        assert_eq!(rd(&mut u, 5), 0x60);
+        assert_eq!(rd(&mut u, 0), 0);
+        let st = u.stats();
+        assert_eq!(
+            (
+                st.input_received_bytes,
+                st.input_read_bytes,
+                st.input_buffered_bytes
+            ),
+            (2, 2, 0)
+        );
+    }
+
+    /// MVM-5・CORE-7・#3893: 上限超過は新しい方を捨てて数え、上限の範囲外は拒否する。
+    #[test]
+    fn mvm5_3893_rx_overflow_drops_newest() {
+        let mut u = Uart16550::with_capacities(8, 4).unwrap();
+        let r = u.push_input(b"abcdefg");
+        assert_eq!((r.accepted, r.dropped), (4, 3));
+        let st = u.stats();
+        assert_eq!((st.input_dropped_bytes, st.input_buffered_bytes), (3, 4));
+        let got: Vec<u8> = (0..4).map(|_| rd(&mut u, 0)).collect();
+        assert_eq!(got, b"abcd".to_vec());
+        for bad in [0, MAX_INPUT_BYTES + 1] {
+            assert_eq!(
+                Uart16550::with_capacities(8, bad).unwrap_err().code(),
+                MicrovmErrorCode::InvalidArgument
+            );
+        }
+    }
+
+    /// MVM-5・#3893: ERBFI と入力で IIR=0x04・High、読み切ると解除。
+    #[test]
+    fn mvm5_3893_rx_interrupt_raise_and_clear() {
+        let mut u = Uart16550::new();
+        wired(&mut u);
+        wr(&mut u, 2, 0x01);
+        wr(&mut u, 1, 0x01);
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        u.push_input(b"x");
+        assert_eq!(u.irq_level(), IrqLevel::High);
+        assert_eq!(rd(&mut u, 2), 0xC4);
+        assert_eq!(rd(&mut u, 2), 0xC4);
+        assert_eq!(rd(&mut u, 0), b'x');
+        assert_eq!(u.irq_level(), IrqLevel::Low);
+        assert_eq!(rd(&mut u, 2), 0xC1);
+    }
+
+    /// MVM-5・#3893: THRE と同時保留でも IIR は受信データが先で、読み切ると THRE が出る。
+    #[test]
+    fn mvm5_3893_rx_priority_over_thre() {
+        let mut u = Uart16550::new();
+        wired(&mut u);
+        wr(&mut u, 1, 0x03);
+        u.push_input(b"a");
+        assert_eq!(rd(&mut u, 2), 0x04);
+        assert_eq!(rd(&mut u, 0), b'a');
+        assert_eq!(rd(&mut u, 2), 0x02);
+        assert_eq!(rd(&mut u, 2), 0x01);
+    }
+
+    /// MVM-5・#3893: 偽の線で、ゲストのアクセス無しに push_input が線を立てる。
+    #[test]
+    fn mvm5_3893_push_input_drives_line() {
+        let console = SerialConsole::new();
+        let line = FakeLine::default();
+        let mut dev = console.mmio_device_with_irq(Arc::new(line.clone()));
+        let calls = || line.calls.lock().unwrap().clone();
+        assert_eq!(dev.write(1, &[0x01]), MmioWriteOutcome::Handled);
+        assert!(calls().is_empty());
+        console.push_input(b"x").unwrap();
+        assert_eq!(calls(), vec![IrqLevel::High]);
+        console.push_input(b"y").unwrap();
+        assert_eq!(calls(), vec![IrqLevel::High]);
+        let mut b = [0u8; 1];
+        assert_eq!(dev.read(0, &mut b), MmioReadOutcome::Handled);
+        assert_eq!(b, [b'x']);
+        assert_eq!(calls(), vec![IrqLevel::High]);
+        assert_eq!(dev.read(0, &mut b), MmioReadOutcome::Handled);
+        assert_eq!(b, [b'y']);
+        assert_eq!(calls(), vec![IrqLevel::High, IrqLevel::Low]);
+    }
+
+    /// MVM-5・#3893: 線の無い経路でも DR と RBR は動き、IIR は 0x01 のまま。
+    #[test]
+    fn mvm5_3893_unwired_polling_works() {
+        let console = SerialConsole::new();
+        let mut dev = console.port_device();
+        assert_eq!(dev.write(1, &[0x01]), PortIoOutcome::Handled);
+        console.push_input(b"z").unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(dev.read(2, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [0x01]);
+        assert_eq!(dev.read(5, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [0x61]);
+        assert_eq!(dev.read(0, &mut b), PortIoOutcome::Handled);
+        assert_eq!(b, [b'z']);
+    }
+
+    /// MVM-5・REPAIR-4・#3893: FCR の RX リセットで FIFO が空になり、数えられ、線が下がる。
+    #[test]
+    fn mvm5_3893_fcr_rx_reset_flushes() {
+        let console = SerialConsole::new();
+        let line = FakeLine::default();
+        let mut dev = console.mmio_device_with_irq(Arc::new(line.clone()));
+        assert_eq!(dev.write(1, &[0x01]), MmioWriteOutcome::Handled);
+        console.push_input(b"abc").unwrap();
+        assert_eq!(dev.write(2, &[0x03]), MmioWriteOutcome::Handled);
+        let st = console.stats().unwrap();
+        assert_eq!((st.input_flushed_bytes, st.input_buffered_bytes), (3, 0));
+        assert_eq!(
+            *line.calls.lock().unwrap(),
+            vec![IrqLevel::High, IrqLevel::Low]
+        );
+    }
+
+    /// MVM-5・#3893: DLAB=1 の offset 0 は DLL で、FIFO を消費しない。
+    #[test]
+    fn mvm5_3893_dlab_read_keeps_fifo() {
+        let mut u = Uart16550::new();
+        u.push_input(b"a");
+        wr(&mut u, 3, 0x83);
+        assert_eq!(rd(&mut u, 0), 0x0C);
+        wr(&mut u, 3, 0x03);
+        assert_eq!(rd(&mut u, 5), 0x61);
+    }
+
+    /// MVM-5・#3893: poison で push_input は Internal を返す。
+    #[test]
+    fn mvm5_3893_push_input_poison_fails_closed() {
+        let console = SerialConsole::new();
+        let c2 = console.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.inner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert_eq!(
+            console.push_input(b"a").unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+    }
+
+    /// MVM-5・REPAIR-4・#3893: 線が失敗しても push_input は成功し、数えられる。
+    #[test]
+    fn mvm5_3893_push_input_line_failure_counted() {
+        let console = SerialConsole::new();
+        let line = FakeLine {
+            fail: true,
+            ..Default::default()
+        };
+        let mut dev = console.mmio_device_with_irq(Arc::new(line));
+        assert_eq!(dev.write(1, &[0x01]), MmioWriteOutcome::Handled);
+        let before = console.stats().unwrap().irq_line_errors;
+        let r = console.push_input(b"a").unwrap();
+        assert_eq!(r.accepted, 1);
+        assert_eq!(console.stats().unwrap().irq_line_errors, before + 1);
     }
 }

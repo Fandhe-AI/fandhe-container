@@ -40,7 +40,7 @@
 //! `DeviceBus` が 8250 / 16550 互換の UART を COM1（0x3f8〜0x3ff）の PIO へ常に登録する。ホストは
 //! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
 //! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
-//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。未実装（REPAIR-3）: IRQ 4・ゲスト入力。
+//! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。未実装（REPAIR-3）: IRQ 4（x86 の Linux は入力を読まない。受信 FIFO は #3893 で実装済み）。
 //! aarch64 には PIO が無く、組み立ての入口が `Unimplemented`。
 //!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
@@ -1240,7 +1240,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// COM1 の UART の出力をホストが取り出すハンドル（clone）。ゲストの THR 出力（`console=ttyS0`）が溜まる。
     ///
     /// 上限つき（[`crate::uart::MAX_OUTPUT_BYTES`]）。中身は非信頼のゲスト出力なので、表示・記録時はエスケープすること。
-    /// 未実装（REPAIR-3）: IRQ 4 とゲスト入力。
+    /// 未実装（REPAIR-3）: IRQ 4（受信 FIFO は #3893 で実装済みだが線が無く Linux は入力を読まない）。
     pub fn serial_console(&self) -> SerialConsole {
         self.devices.serial.clone()
     }

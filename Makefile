@@ -188,7 +188,7 @@ guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /i
 guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
 	@scripts/build-guest-initrd-selftest.sh
 
-microvm-test-initrd-build: ## microVM の実カーネル試験用の最小 initrd（x86_64 の /init だけの newc）を作る（#3770・MVM-1。ネットワーク・ビルドなし。make ci には含めない）
+microvm-test-initrd-build: ## microVM の実カーネル試験用の最小 initrd（/init だけの newc。x86_64、MICROVM_TEST_INITRD_ARCH=aarch64 で aarch64）を作る（#3770・#3895・MVM-1。ネットワーク・ビルドなし。make ci には含めない）
 	@scripts/build-microvm-test-initrd.sh
 
 microvm-test-initrd-build-selftest: ## 最小 initrd 生成スクリプトの自己テスト（#3770・MVM-1・REPAIR-12。一時ディレクトリ・スタブのみ）

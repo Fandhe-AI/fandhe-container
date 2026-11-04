@@ -1,5 +1,17 @@
 //! ゲストメモリの初期化（TASK-75.1）と VM 構成体の組み立て（TASK-75.2）（MVM-1・MS-7。Linux のみ・unsafe なし）。
 //!
+//! # aarch64（KVM）の組み立て（#3696・MVM-1）
+//! aarch64 も MVM-1 の対象（spec は Linux〔KVM〕でアーキテクチャを除外しない）。x86_64 の「irqchip は vCPU より前」と違い、順序は
+//! 構成検証（`plan_layout_arm64`）→ VM → ゲスト RAM（GPA `ARM64_RAM_BASE`）→ **vCPU（`KVM_ARM_VCPU_INIT` まで）** → vGICv3 の作成と
+//! アドレス設定 → `CTRL_INIT` → デバイスの irqfd。vGIC の初期化は「全 vCPU の作成後」で、初期化前の irqfd は `EAGAIN` で拒否される
+//! （根拠は `crate::device` のモジュール doc。Linux v6.12）。irqfd の GSI は SPI 番号（INTID = GSI + 32）で、`DeviceSlot::gsi` は
+//! FDT の `interrupts` のセル値と一致させる（virtio は SPI 16 から連番）。`load_kernel` は Image・initrd・FDT を `boot_arm64::load_arm64` で置き、
+//! `setup_boot_vcpu` は X0 = FDT・PC = Image の先頭・PSTATE = EL1h を `KVM_SET_ONE_REG` で書いて読み戻す。
+//! drop の順序は vCPU → デバイス（irqfd の解除）→ vGIC → メモリ → VM fd。
+//! **範囲外（REPAIR-3）**: vCPU は 1 台だけ（2 台以上は資源を作る前に `Unimplemented`。AP の起動は #3899）・PSCI 0.2 と
+//! `KVM_EXIT_SYSTEM_EVENT` の分類（#3896）・実カーネルの起動試験（#3897）・シリアル（#3898）・level の virtio SPI（resamplefd が未実装のため
+//! `Unimplemented`）・`SCTLR_EL1` の確認。実機（KVM aarch64）での実行は未検証（実機前提試験は `tests/kvm_device.rs` の `kvm_device_arm64_*`）。
+//!
 //! # VM 構成体（TASK-75.2）
 //! [`MicroVm::assemble`] が検証済みの [`MicroVmConfig`] から、VM fd・in-kernel irqchip・登録済みゲストメモリ・
 //! virtio デバイス群（MMIO の窓と GSI 割り込み線つき）・vCPU 群を 1 つの [`MicroVm`] に束ねる。配置は
@@ -13,7 +25,7 @@
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・一時停止（pause）・
-//! aarch64（vGIC 未実装のため組み立ての入口で `Unimplemented`）・複数のメモリ領域（RAM は GPA 0 からの単一領域で
+//! 複数のメモリ領域（RAM は GPA 0 からの単一領域で
 //! [`VIRTIO_MMIO_BASE`] 未満に制限）。複数 vCPU の exit 処理は 1 つの Mutex で直列にする簡易実装で、デバイス単位の並行は範囲外。
 //!
 //! # 起動と停止（TASK-75.4.1・#886）
@@ -41,8 +53,8 @@
 //! [`MicroVm::serial_console`] / [`RunningMicroVm::serial_console`] の [`SerialConsole`]（clone。fd を持たない）から
 //! THR 出力を上限つきバッファで取り出す。ハンドルは vCPU スレッドの `MicroVm` の drop 後も生きる。lock が poison したら
 //! ホスト API は `Internal`、ゲスト側は応答しない（fail-closed）。x86_64 では COM1 の IRQ 4 を `KVM_IRQ_LINE` の level 線
-//! （`crate::irq::IrqLevelLine`）で UART に結ぶ（#3918。THRE・受信データの割り込み。実機確認は #3781）。aarch64（KVM）の線は未実装（#3696・#3898。REPAIR-3）。
-//! aarch64 には PIO が無く、組み立ての入口が `Unimplemented`。
+//! （`crate::irq::IrqLevelLine`）で UART に結ぶ（#3918。THRE・受信データの割り込み。実機確認は #3781）。aarch64（KVM）には PIO が無く、シリアルは MMIO の ns16550a と SPI で #3898 の担当（REPAIR-3。組み立ては COM1 の PIO を登録せず、
+//! `serial_console()` は空のまま）。
 //!
 //! # 失敗時の解放（TASK-75.4.2・#887・ERR-1・REPAIR-4）
 //! 失敗はすべて `Result` の [`MicrovmError`]（機械可読な `code` と英語の `message`）で返し、panic しない。
@@ -82,20 +94,30 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::boot_x86::LoadedKernel;
+use crate::arm64_layout::Arm64Layout;
+#[cfg(target_arch = "aarch64")]
+pub use crate::boot_arm64::Arm64LoadedKernel as LoadedKernel;
+#[cfg(target_arch = "aarch64")]
+use crate::boot_arm64::load_arm64;
+/// [`MicroVm::load_kernel`] が返し、[`MicroVm::setup_boot_vcpu`]・[`MicroVm::start`] が受ける、配置結果と起動状態の型。
+/// x86_64 とそれ以外は `boot_x86::LoadedKernel`、aarch64 は `boot_arm64::Arm64LoadedKernel`（FDT の配置と起動レジスタ。#3696）。
+#[cfg(not(target_arch = "aarch64"))]
+pub use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{
     BootCpuState, KernelCmdline, MP_TABLE_START, VirtioMmioParam, X86FpuState, boot_msrs,
     load_linux, write_boot_tables,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::device::VgicV3;
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
 use crate::interrupt::{
-    BlockNotifyReport, InterruptLine, LevelInterruptLine, NetNotifyReport, NetRxPollOutcome,
-    complete_block_notify, complete_net_notify, poll_net_rx,
+    BlockNotifyReport, InterruptLine, IrqTrigger, LevelInterruptLine, NetNotifyReport,
+    NetRxPollOutcome, complete_block_notify, complete_net_notify, poll_net_rx,
 };
 use crate::irq::IrqFd;
 #[cfg(target_arch = "x86_64")]
@@ -469,16 +491,18 @@ pub struct DeviceInfo {
 }
 
 /// 構成を検証してデバイスの配置を計算する（ioctl 前の純粋な処理）。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn plan_layout(
     vcpu_count: u32,
     mem_size: u64,
     block_count: usize,
     net_count: usize,
 ) -> Result<Vec<DeviceSlot>, MicrovmError> {
+    // aarch64 の組み立ては `plan_layout_arm64`（別の配置・割り込み）で、本関数は x86_64 の配置を計算する。
     if cfg!(not(target_arch = "x86_64")) {
         return Err(MicrovmError::new(
             MicrovmErrorCode::Unimplemented,
-            "microvm assembly is only implemented for x86_64 (aarch64 vGIC is not implemented)",
+            "x86_64 layout planning is only available on x86_64 (aarch64 uses plan_layout_arm64)",
         ));
     }
     if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
@@ -494,13 +518,96 @@ fn plan_layout(
     Ok(slots)
 }
 
+/// KVM の vGIC の SPI 範囲の下限 INTID（SPI は INTID 32 から。`GICD` の private 割り込みの次）。
+const VGIC_SPI_INTID_BASE: u32 = 32;
+/// `KVM_DEV_ARM_VGIC_GRP_NR_IRQS` を設定しないときの SPI 数の既定値（224）。Linux v6.12 の `vgic_init`
+/// （`arch/arm64/kvm/vgic/vgic-init.c`）が `dist->nr_spis` が 0 のとき `VGIC_NR_IRQS_LEGACY(256) - VGIC_NR_PRIVATE_IRQS(32)` にする。
+/// 組み立てはこの既定のまま使い、virtio の SPI が範囲に収まることを `plan_layout_arm64` が確かめる（#3696）。
+const VGIC_DEFAULT_NR_SPIS: u32 = 224;
+
+/// aarch64（KVM）の構成を検証して配置とデバイスの割り当てを計算する（ioctl 前の純粋な処理。MVM-1・#3696）。
+///
+/// x86_64 の CI でも単体試験が走るよう arch で外さない（aarch64 以外では `assemble` から呼ばれない）。検査:
+/// - vCPU 数は `1..=`[`MAX_VCPUS`]。**2 以上は `Unimplemented`**: `KVM_ARM_VCPU_POWER_OFF` と PSCI CPU_ON による AP の起動が
+///   #3899 で、それまで AP が PC = 0 から走るのを防ぐ（fail-closed。REPAIR-3）。
+/// - RAM の大きさ・virtio の台数（[`MAX_VIRTIO_DEVICES`] 以下）・`Arm64Layout::validate`。
+/// - virtio の trigger が level（`LevelHigh`）の構成は `Unimplemented`: level は ACK 後の deassert / resamplefd
+///   （`KVM_IRQFD_FLAG_RESAMPLE`）が要り、未実装のまま受けると割り込みが張り付く（既定の edge は通す）。
+/// - 各 virtio の SPI が vGIC の既定の SPI 範囲に収まること。
+///
+/// 割り当て: slot `i` は `mmio_base = layout.virtio_mmio_window(i).base`、`gsi = layout.virtio_spi(i).dt_cell()`
+/// （SPI 番号）。KVM の irqfd の GSI は SPI 番号に等しい（`vgic-irqfd.c` の既定 routing。INTID = GSI + 32）ので、
+/// FDT の `interrupts` の値・irqfd の GSI・INTID が一致する。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn plan_layout_arm64(
+    vcpu_count: u32,
+    mem_size: u64,
+    block_count: usize,
+    net_count: usize,
+) -> Result<(Arm64Layout, Vec<DeviceSlot>), MicrovmError> {
+    if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
+        return Err(invalid("vcpu count out of range"));
+    }
+    if vcpu_count > 1 {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "aarch64 SMP is not implemented (only one vCPU is supported)",
+        ));
+    }
+    validate_ram_size(mem_size, ram_align()?)?;
+    let total = block_count
+        .checked_add(net_count)
+        .filter(|n| *n <= MAX_VIRTIO_DEVICES)
+        .ok_or_else(|| invalid("too many virtio devices"))?;
+    let total_u32 = u32::try_from(total).map_err(|_| invalid("too many virtio devices"))?;
+    let layout = Arm64Layout::new(mem_size, vcpu_count, total_u32)?;
+    reject_level_spi(&layout)?;
+    layout.check_virtio_spi_range(VGIC_SPI_INTID_BASE, VGIC_DEFAULT_NR_SPIS)?;
+    let mut slots = Vec::with_capacity(total);
+    for i in 0..total {
+        let (kind, index) = if i < block_count {
+            (VirtioDeviceKind::Block, i)
+        } else {
+            (VirtioDeviceKind::Net, i - block_count)
+        };
+        let n = u32::try_from(i).map_err(|_| invalid("device range overflows"))?;
+        let window = layout.virtio_mmio_window(n)?;
+        let spi = layout.virtio_spi(n)?;
+        slots.push(DeviceSlot {
+            kind,
+            index,
+            mmio_base: window.base.raw(),
+            mmio_len: window.size,
+            gsi: spi.dt_cell(),
+        });
+    }
+    Ok((layout, slots))
+}
+
+/// virtio の SPI の trigger が level（`LevelHigh`）の構成を `Unimplemented` で拒否する（fail-closed。REPAIR-3・#3696）。
+///
+/// KVM で level の SPI を扱うには、ACK 後に線を下ろして再注入する resamplefd（`KVM_IRQFD_FLAG_RESAMPLE`）が要り、
+/// `sys` の追加面も増える。未実装のまま受けると割り込みが張り付く / 失われるため、組み立て時に拒否する。既定の edge は通す。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn reject_level_spi(layout: &Arm64Layout) -> Result<(), MicrovmError> {
+    if layout.virtio_spi_trigger == IrqTrigger::LevelHigh {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "level-triggered virtio SPI requires irqfd resample, which is not implemented",
+        ));
+    }
+    Ok(())
+}
+
 /// GPA の半開区間 `[start, end)`（重なり検証用。`end` の溢れと空区間は作れない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 struct GuestRange {
     start: u64,
     end: u64,
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 impl GuestRange {
     /// `[start, start + len)`。`len == 0` と加算の溢れは `InvalidArgument`（panic しない）。
     fn new(start: u64, len: u64) -> Result<Self, MicrovmError> {
@@ -518,6 +625,7 @@ impl GuestRange {
 
 /// 重なり検証の領域の種別（エラー文言用。値・アドレスは載せない。ERR-1・REPAIR-4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 enum RegionKind {
     GuestMemory,
     VirtioMmio,
@@ -527,6 +635,7 @@ enum RegionKind {
     IdentityMap,
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 impl RegionKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -540,11 +649,13 @@ impl RegionKind {
     }
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 type Region = (RegionKind, GuestRange);
 
 /// KVM 内部領域（`reserved`: TSS・identity map）が 4 GiB 以内に収まり、互いに、また使用中の領域（`occupied`:
 /// RAM・MMIO の窓）と重ならないことを確かめる（KVM 不要の純粋関数。`plan_layout` が ioctl の前に呼ぶ。MVM-1・#3732）。
 /// 違反は `InvalidArgument`（fail-closed）。範囲を引数で受けるのは、定数の組では境界の 1 バイトを試験できないため。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn check_reserved_regions(reserved: &[Region], occupied: &[Region]) -> Result<(), MicrovmError> {
     for (i, (kind, range)) in reserved.iter().enumerate() {
         if range.end > GPA_4GIB {
@@ -566,6 +677,7 @@ fn check_reserved_regions(reserved: &[Region], occupied: &[Region]) -> Result<()
 }
 
 /// 実際の構成から `check_reserved_regions` へ渡す `(reserved, occupied)` を組む。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn system_regions(
     mem_size: u64,
     slots: &[DeviceSlot],
@@ -655,6 +767,7 @@ fn mp_table_config(vcpu_count: u32, routes: &[IsaIrqRoute]) -> MpTableConfig<'_>
 }
 
 /// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>, MicrovmError> {
     let total = block_count
         .checked_add(net_count)
@@ -750,6 +863,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         block: Vec<B>,
         net: Vec<NetDeviceConfig<N>>,
         com1_line: Option<Arc<dyn LevelInterruptLine>>,
+        register_com1_pio: bool,
         mut make_line: impl FnMut(&DeviceSlot) -> Result<L, MicrovmError>,
     ) -> Result<Self, MicrovmError> {
         if slots.len() != block.len() + net.len() {
@@ -763,12 +877,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L> Device
         };
         // PIO と MMIO は別の表なので virtio の窓とは衝突しない。
         // 線ありは x86_64 の KVM（`KVM_IRQ_LINE` の GSI 4。#3918）。線なしは IIR が常に「保留なし」の従来の経路。
-        let com1 = match com1_line {
-            Some(line) => bus.serial.port_device_with_irq(line),
-            None => bus.serial.port_device(),
-        };
-        bus.dispatcher
-            .register_pio(COM1_BASE, UART_PORT_LEN, com1)?;
+        // aarch64 には PIO が無く、シリアルは MMIO（ns16550a）で #3898 の担当のため登録しない（`register_com1_pio = false`）。
+        if register_com1_pio {
+            let com1 = match com1_line {
+                Some(line) => bus.serial.port_device_with_irq(line),
+                None => bus.serial.port_device(),
+            };
+            bus.dispatcher
+                .register_pio(COM1_BASE, UART_PORT_LEN, com1)?;
+        }
         let mut slots_iter = slots.iter();
         for backend in block {
             let slot = *slots_iter
@@ -898,8 +1015,14 @@ struct NetRxPollReport {
 pub struct MicroVm<B: BlockBackend, N: NetBackend> {
     vcpus: Vec<VcpuFd>,
     devices: DeviceBus<B, N, IrqFd>,
+    /// aarch64 の vGICv3（#3696）。irqfd（`devices`）の解除より後、メモリより前に閉じる。
+    #[cfg(target_arch = "aarch64")]
+    vgic: VgicV3,
     memory: GuestMemory<RegisteredGuestRam>,
     vm: VmFd,
+    /// aarch64 のゲスト物理配置（`load_kernel` が FDT を組むのに使う。#3696）。
+    #[cfg(target_arch = "aarch64")]
+    layout: Arm64Layout,
 }
 
 impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for MicroVm<B, N> {
@@ -916,7 +1039,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     /// 構成を検証し、VM → irqchip → identity map / TSS（x86_64）→ ゲストメモリ → デバイス → vCPU の順に組み立てる。
     ///
     /// irqchip は vCPU より前に作る必要がある。途中で失敗したときはローカル変数の drop が逆順に後始末する
-    /// （段ごとの確認は `mvm1_887_*`・#887）。aarch64 は最初の ioctl より前に `Unimplemented`。
+    /// （段ごとの確認は `mvm1_887_*`・#887）。この順序は x86_64 のもので、aarch64 は vCPU の後に vGIC を作る（モジュール doc の「aarch64（KVM）の組み立て」。vCPU 2 台以上・level の SPI は最初の ioctl より前に `Unimplemented`）。
     ///
     /// vCPU ごとに `KVM_SET_CPUID2`（APIC ID = vCPU id。`cpuid_x86`・#3733）も設定する。
     ///
@@ -940,6 +1063,43 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         result
     }
 
+    /// aarch64（KVM）の組み立て（MVM-1・#3696）。順序は 構成検証 → VM → ゲスト RAM（GPA `ARM64_RAM_BASE`）→ **vCPU** →
+    /// vGICv3 の作成とアドレス設定 → `CTRL_INIT` → デバイス（irqfd）。x86_64 と違い irqchip は vCPU の**後**で、irqfd は
+    /// vGIC の初期化後でないと `EAGAIN` で拒否される（根拠は `crate::device` のモジュール doc）。
+    /// シリアル（MMIO の ns16550a と割り込み）は #3898 で、本層は COM1 の PIO を登録しない。
+    #[cfg(target_arch = "aarch64")]
+    fn assemble_inner(
+        kvm: &KvmDevice,
+        config: MicroVmConfig<B, N>,
+    ) -> Result<MicroVm<B, N>, MicrovmError> {
+        let (layout, slots) = plan_layout_arm64(
+            config.vcpu_count,
+            config.mem_size,
+            config.block.len(),
+            config.net.len(),
+        )?;
+        let vm = kvm.create_vm()?;
+        let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, layout.ram.base)?;
+        let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
+        for i in 0..config.vcpu_count {
+            vcpus.push(vm.create_vcpu(i)?);
+        }
+        let vgic = vm.create_vgic_v3(layout.gic_dist.base.raw(), layout.gic_redist.base.raw())?;
+        vgic.init()?;
+        let devices = DeviceBus::new(&slots, config.block, config.net, None, false, |s| {
+            vm.register_irqfd(s.gsi)
+        })?;
+        Ok(MicroVm {
+            vcpus,
+            devices,
+            vgic,
+            memory,
+            vm,
+            layout,
+        })
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     fn assemble_inner(
         kvm: &KvmDevice,
         config: MicroVmConfig<B, N>,
@@ -965,7 +1125,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             Some(Arc::new(vm.register_irq_line(crate::uart::COM1_IRQ)?));
         #[cfg(not(target_arch = "x86_64"))]
         let com1_line: Option<Arc<dyn LevelInterruptLine>> = None;
-        let devices = DeviceBus::new(&slots, config.block, config.net, com1_line, |s| {
+        let devices = DeviceBus::new(&slots, config.block, config.net, com1_line, true, |s| {
             vm.register_irqfd(s.gsi)
         })?;
         // CPUID は最初の KVM_RUN と KVM_SET_SREGS より前に vCPU ごとに設定する（APIC ID = vCPU id。#3733）。
@@ -1000,6 +1160,12 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         &self.vm
     }
 
+    /// aarch64 の vGICv3（観測用。`dist_base`・`redist_base`・`spi_pending`。MVM-1・#3696）。
+    #[cfg(target_arch = "aarch64")]
+    pub fn vgic(&self) -> &VgicV3 {
+        &self.vgic
+    }
+
     /// vCPU 群（id 順）。
     pub fn vcpus(&self) -> &[VcpuFd] {
         &self.vcpus
@@ -1020,7 +1186,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         &mut self.memory
     }
 
-    /// bzImage・initrd・cmdline をゲストメモリへロードする（TASK-75.3.1・MVM-1。x86_64 のみ、他 arch は `Unimplemented`）。
+    /// カーネル・initrd・cmdline をゲストメモリへロードする（TASK-75.3.1・MVM-1。x86_64 は bzImage、aarch64 は Image と FDT〔#3696〕。他 arch は `Unimplemented`）。
     ///
     /// cmdline は `user_cmdline` の後ろに、組み立て済みの各デバイスの `virtio_mmio.device=<size>@<base>:<irq>` を
     /// block → net の順で足す。戻り値の [`LoadedKernel`] を [`MicroVm::setup_boot_vcpu`]（#885）に渡す。
@@ -1088,18 +1254,26 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             write_mp_table(&mut self.memory, &table)?;
             Ok(loaded)
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        // aarch64: Image・initrd・FDT を `boot_arm64::load_arm64` で配置する。virtio は FDT のノードで渡すので
+        // cmdline に `virtio_mmio.device=` は足さない。cmdline の上限は FDT の bootargs の 2047 バイト（超過は `InvalidArgument`）。
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (loaded, _state) =
+                load_arm64(&mut self.memory, kernel, initrd, user_cmdline, &self.layout)?;
+            Ok(LoadedKernel::from_loaded(loaded))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = (kernel, initrd, user_cmdline);
             Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
-                "kernel loading is only implemented for x86_64 (aarch64 FDT is not implemented)",
+                "kernel loading is only implemented for x86_64 and aarch64",
             ))
         }
     }
 
-    /// vCPU 0（BSP）を、ロード済みカーネルのエントリから long mode で実行を始める状態に初期化する（TASK-75.3.2・MVM-1。
-    /// x86_64 のみ、他 arch は `Unimplemented`）。
+    /// vCPU 0（BSP）を、ロード済みカーネルのエントリから実行を始める状態に初期化する（TASK-75.3.2・MVM-1。
+    /// x86_64 は long mode、aarch64 は X0 = FDT・PC = Image・EL1h〔#3696〕。他 arch は `Unimplemented`）。
     ///
     /// 手順: `loaded` の各アドレスがこの VM のゲストメモリ内かを検証（別 VM の値の取り違えを拒否）→ [`BootCpuState::for_kernel`] →
     /// GDT・IDT・ページテーブル（GPA 0..4 GiB の恒等写像）の書き込み → `VcpuFd::set_boot_state` → 起動用 MSR（`set_msrs`）→ FPU（`set_fpu`。#3734）。最初の `VcpuFd::run_once` より前に、
@@ -1151,12 +1325,32 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             }
             Ok(())
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        // aarch64: 領域の照合 → X0〜X3・PSTATE・PC の `KVM_SET_ONE_REG` → 読み戻して照合する。
+        // SCTLR_EL1 の確認・AP の起動は範囲外（#3899。REPAIR-3）。
+        #[cfg(target_arch = "aarch64")]
+        {
+            check_loaded_within_arm64(loaded.loaded(), &self.layout)?;
+            let vcpu = self.vcpus.first_mut().ok_or_else(|| {
+                MicrovmError::new(
+                    MicrovmErrorCode::FailedPrecondition,
+                    "microVM has no boot vCPU",
+                )
+            })?;
+            vcpu.set_arm64_boot_state(loaded.boot_state())?;
+            if vcpu.arm64_boot_regs()? != *loaded.boot_state() {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "boot registers did not read back as written",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = loaded;
             Err(MicrovmError::new(
                 MicrovmErrorCode::Unimplemented,
-                "boot register setup is only implemented for x86_64",
+                "boot register setup is only implemented for x86_64 and aarch64",
             ))
         }
     }
@@ -1382,6 +1576,9 @@ trait VcpuLoopBody: Send + 'static {
 /// 全 `VcpuFd` が解放済みの状態でこの順に解放される（モジュール doc の「vCPU → デバイス → メモリ → VM fd」を保つ）。
 struct VmShared<B: BlockBackend, N: NetBackend> {
     devices: DeviceBus<B, N, IrqFd>,
+    /// aarch64 の vGICv3。読まない。irqfd（`devices`）の解除より後、memslot より前に閉じる drop 順を保つために持つ（#3696）。
+    #[cfg(target_arch = "aarch64")]
+    _vgic: VgicV3,
     memory: GuestMemory<RegisteredGuestRam>,
     /// 読まない。memslot・irqfd より後に VM fd を閉じる drop 順を保つために持つ。
     _vm: VmFd,
@@ -2288,7 +2485,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ///
     /// `self` はスレッドが所有し、停止時に解放される。[`MicroVm::load_kernel`] の後に呼ぶ。vCPU は 1 台につき 1 スレッドで、
     /// 台数は確保の前に `1..=`[`MAX_VCPUS`] を検証する（範囲外は `InvalidArgument`。#3738）。virtio-net を含む構成では、ゲストの kick なしで受信を処理する専用スレッド `microvm-net-rx`（`NetRxPoller`。期限ごとの
-    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。非 x86_64 は `Unimplemented`。`run_once` の初回に SIGUSR2 の
+    /// `process_rx`。#3742）を vCPU スレッドと一緒に起動し、停止・失敗・drop の後始末を共有する（#3743）。backend の到着通知は将来仕様（MVM-1・TASK-117・REPAIR-3）。aarch64 は vCPU 1 台（PSCI による終了の分類は #3896。それまで停止は `stop` の要求による）。他 arch は `Unimplemented`。`run_once` の初回に SIGUSR2 の
     /// handler が入る注意事項は [`VcpuFd::run_once`] を参照。失敗時の網羅的な後始末の検証は #887。
     pub fn start(self, loaded: &LoadedKernel) -> Result<RunningMicroVm, MicrovmError> {
         let started = Instant::now();
@@ -2320,12 +2517,17 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
         let MicroVm {
             vcpus,
             devices,
+            #[cfg(target_arch = "aarch64")]
+            vgic,
             memory,
             vm,
+            ..
         } = self;
         let has_net = !devices.net.is_empty();
         let shared = Arc::new(Mutex::new(VmShared {
             devices,
+            #[cfg(target_arch = "aarch64")]
+            _vgic: vgic,
             memory,
             _vm: vm,
         }));
@@ -3237,7 +3439,10 @@ mod assemble_tests {
                 mac: [2, 0, 0, 0, 0, 1],
             })
             .collect();
-        let bus = DeviceBus::new(&slots, blocks, nets, None, |_| Ok(CountLine::default())).unwrap();
+        let bus = DeviceBus::new(&slots, blocks, nets, None, true, |_| {
+            Ok(CountLine::default())
+        })
+        .unwrap();
         let mem =
             GuestMemory::new(GuestAddress::new(0), HeapBacking::new(1 << 20).unwrap()).unwrap();
         (bus, mem)
@@ -3295,6 +3500,7 @@ mod assemble_tests {
             Vec::new(),
             Vec::new(),
             Some(rec.clone()),
+            true,
             |_| Ok(CountLine::default()),
         )
         .unwrap();
@@ -3491,12 +3697,138 @@ mod assemble_tests {
         assert_eq!(TSS_ADDR, 0xfffb_d000);
     }
 
-    /// MVM-1・TASK-75.2: x86_64 以外は最初の ioctl の前に `Unimplemented`。
+    /// MVM-1・TASK-75.2: x86_64 以外は `plan_layout`（x86_64 の配置）が最初の ioctl の前に `Unimplemented`。
     #[cfg(not(target_arch = "x86_64"))]
     #[test]
     fn mvm1_697_plan_layout_unimplemented_off_x86_64() {
         let e = plan_layout(1, 4096, 0, 0).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+    }
+
+    /// MVM-1・#3696: aarch64 の配置。slot ごとに mmio_base・len・gsi（= SPI 番号）が具体値で決まり、
+    /// FDT の `interrupts` のセル値・irqfd の GSI・INTID（= GSI + 32）が一致する。
+    #[test]
+    fn mvm1_3696_plan_layout_arm64_slots() {
+        let (layout, slots) = plan_layout_arm64(1, 64 << 20, 2, 1).unwrap();
+        assert_eq!(layout.ram.base.raw(), 0x4000_0000);
+        assert_eq!(layout.ram.size, 64 << 20);
+        assert_eq!(layout.gic_dist.base.raw(), 0x0800_0000);
+        assert_eq!(layout.gic_redist.base.raw(), 0x0820_0000);
+        assert_eq!(layout.gic_redist.size, 0x2_0000);
+        let want = [
+            (VirtioDeviceKind::Block, 0, 0x0a00_0000u64, 16u32, 48u32),
+            (VirtioDeviceKind::Block, 1, 0x0a00_0200, 17, 49),
+            (VirtioDeviceKind::Net, 0, 0x0a00_0400, 18, 50),
+        ];
+        assert_eq!(slots.len(), want.len());
+        for (i, (slot, (kind, index, base, gsi, intid))) in slots.iter().zip(want).enumerate() {
+            assert_eq!(slot.kind, kind);
+            assert_eq!(slot.index, index);
+            assert_eq!(slot.mmio_base, base);
+            assert_eq!(slot.mmio_len, 0x200);
+            assert_eq!(slot.gsi, gsi);
+            let spi = layout.virtio_spi(i as u32).unwrap();
+            assert_eq!(spi.dt_cell(), slot.gsi);
+            assert_eq!(spi.intid(), Some(intid));
+            assert_eq!(slot.gsi + VGIC_SPI_INTID_BASE, intid);
+        }
+    }
+
+    /// MVM-1・#3696・REPAIR-3: aarch64 の 2 台以上の vCPU は AP の起動（#3899）が無いので資源を作る前に `Unimplemented`。
+    #[test]
+    fn mvm1_3696_plan_layout_arm64_rejects_smp() {
+        let e = plan_layout_arm64(2, 64 << 20, 0, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "aarch64 SMP is not implemented (only one vCPU is supported)"
+        );
+        // 範囲外の台数は SMP の未実装より先に InvalidArgument。
+        let e = plan_layout_arm64(MAX_VCPUS + 1, 64 << 20, 0, 0).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    }
+
+    /// MVM-1・#3696・REPAIR-3: level の virtio SPI は resamplefd が未実装なので `Unimplemented`、既定の edge は通る。
+    /// （`plan_layout_arm64` が使う `Arm64Layout` の既定は edge。level はレイアウト側の opt-in。）
+    #[test]
+    fn mvm1_3696_level_spi_is_rejected_edge_is_accepted() {
+        let (layout, _) = plan_layout_arm64(1, 64 << 20, 1, 0).unwrap();
+        assert_eq!(layout.virtio_spi_trigger, IrqTrigger::EdgeRising);
+        // level 判定の分岐そのものは layout の trigger に対する純関数で固定する。
+        let mut level = layout.clone();
+        level.virtio_spi_trigger = IrqTrigger::LevelHigh;
+        let e = reject_level_spi(&level).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+        assert_eq!(
+            e.message(),
+            "level-triggered virtio SPI requires irqfd resample, which is not implemented"
+        );
+        assert!(reject_level_spi(&layout).is_ok());
+    }
+
+    /// MVM-1・#3696: 範囲外の構成は ioctl の前に `InvalidArgument`（固定メッセージ）。
+    #[test]
+    fn mvm1_3696_plan_layout_arm64_bounds() {
+        let code = |r: Result<(Arm64Layout, Vec<DeviceSlot>), MicrovmError>| r.unwrap_err().code();
+        assert_eq!(
+            code(plan_layout_arm64(0, 64 << 20, 0, 0)),
+            MicrovmErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(plan_layout_arm64(1, 0, 0, 0)),
+            MicrovmErrorCode::InvalidArgument
+        );
+        // 64 KiB の倍数でない RAM は Arm64Layout::validate が拒否する（ホストのページが 4 KiB の場合は layout 側）。
+        assert_eq!(
+            code(plan_layout_arm64(1, (64 << 20) + 4096, 0, 0)),
+            MicrovmErrorCode::InvalidArgument
+        );
+        let e = plan_layout_arm64(1, 64 << 20, MAX_VIRTIO_DEVICES, 1).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "too many virtio devices");
+        // 上限ちょうどは通る。
+        let (_, slots) = plan_layout_arm64(1, 64 << 20, MAX_VIRTIO_DEVICES - 1, 1).unwrap();
+        assert_eq!(slots.len(), MAX_VIRTIO_DEVICES);
+        assert_eq!(slots.last().map(|s| s.gsi), Some(16 + 7));
+    }
+
+    /// MVM-1・SEC-1・#3696: `setup_boot_vcpu` の前に、`loaded` の各領域がこの VM の RAM に収まるか照合する。
+    #[test]
+    fn mvm1_3696_check_loaded_within_arm64() {
+        use crate::arm64_layout::MmioRegion;
+        use crate::boot_arm64::{ARM64_IMAGE_MAGIC, load_arm64};
+        use crate::guest_memory::HeapBacking;
+
+        let ram: u64 = 16 << 20;
+        let layout = Arm64Layout::new(ram, 1, 1).unwrap();
+        let mut mem = GuestMemory::new(layout.ram.base, HeapBacking::new(ram).unwrap()).unwrap();
+        let mut image = vec![0u8; 4096];
+        image[16..24].copy_from_slice(&0x20_0000u64.to_le_bytes());
+        image[56..60].copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
+        let (loaded, _) = load_arm64(&mut mem, &image, None, "console=ttyS0", &layout).unwrap();
+        assert!(check_loaded_within_arm64(&loaded, &layout).is_ok());
+
+        // より小さい RAM の VM に、大きい RAM の VM で作った値を渡すと拒否する（取り違え）。
+        let small = Arm64Layout::new(2 << 20, 1, 1).unwrap();
+        let e = check_loaded_within_arm64(&loaded, &small).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "loaded kernel does not fit in this microVM's memory"
+        );
+        // FDT・カーネル・initrd を RAM の外へ改変した値も拒否する。
+        let mut bad = loaded.clone();
+        bad.fdt = MmioRegion::new(layout.ram.base.raw() + ram - 16, 64);
+        assert!(check_loaded_within_arm64(&bad, &layout).is_err());
+        let mut bad = loaded.clone();
+        bad.kernel = MmioRegion::new(0x1000, 4096);
+        assert!(check_loaded_within_arm64(&bad, &layout).is_err());
+        let mut bad = loaded.clone();
+        bad.initrd = Some(MmioRegion::new(layout.ram.base.raw() + ram, 4096));
+        assert!(check_loaded_within_arm64(&bad, &layout).is_err());
+        let mut bad = loaded;
+        bad.fdt = MmioRegion::new(u64::MAX - 8, 64);
+        assert!(check_loaded_within_arm64(&bad, &layout).is_err());
     }
 
     /// MVM-1・TASK-75.2: MMIO exit が共有トランスポートまで届き、窓の外は `Unhandled`。
@@ -3585,6 +3917,34 @@ fn check_loaded_within(loaded: &LoadedKernel, mem_len: u64) -> Result<(), Microv
     if !(inside(loaded.entry) && inside(loaded.boot_params) && inside(loaded.cmdline))
         || loaded.runtime_end > mem_len
     {
+        return Err(invalid(
+            "loaded kernel does not fit in this microVM's memory",
+        ));
+    }
+    Ok(())
+}
+
+/// aarch64 の `loaded` の各領域（カーネル・initrd・FDT）がこの VM の RAM（`layout.ram`）に収まるか確かめる（SEC-1・#3696）。
+///
+/// 別の VM（より小さい RAM・別の基底）で作られた値の取り違えや、改変された値を、レジスタへ書く前に拒否する
+/// （x86_64 の `check_loaded_within` に相当。値は message に載せない）。arch 非依存の純関数。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn check_loaded_within_arm64(
+    loaded: &crate::boot_arm64::LoadedArm64,
+    layout: &Arm64Layout,
+) -> Result<(), MicrovmError> {
+    let Some(ram_end) = layout.ram.end() else {
+        return Err(invalid("guest layout size overflow"));
+    };
+    let within = |r: crate::arm64_layout::MmioRegion| match r.end() {
+        Some(end) => r.base.raw() >= layout.ram.base.raw() && end <= ram_end,
+        None => false,
+    };
+    let ok = within(loaded.kernel)
+        && within(loaded.fdt)
+        && loaded.initrd.is_none_or(within)
+        && loaded.reserved_end <= ram_end;
+    if !ok {
         return Err(invalid(
             "loaded kernel does not fit in this microVM's memory",
         ));
@@ -3792,7 +4152,7 @@ mod net_rx_tests {
         }];
         let irqs = Arc::new(AtomicU32::new(0));
         let line_irqs = Arc::clone(&irqs);
-        let bus = DeviceBus::new(&slots, Vec::new(), nets, None, move |_| {
+        let bus = DeviceBus::new(&slots, Vec::new(), nets, None, true, move |_| {
             Ok(AtomicLine(Arc::clone(&line_irqs)))
         })
         .unwrap();
@@ -4187,7 +4547,7 @@ mod failure_tests {
         }];
         let dropped = Rc::new(Cell::new(0u32));
         let made = Cell::new(0u32);
-        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, None, |_| {
+        let r = DeviceBus::<_, _, DropLine>::new(&slots, blocks, nets, None, true, |_| {
             if made.get() == 2 {
                 return Err(MicrovmError::new(
                     MicrovmErrorCode::ResourceExhausted,
@@ -4214,10 +4574,14 @@ mod failure_tests {
             .map(|_| MemoryBlockBackend::new(16 * 512, false).unwrap())
             .collect();
         let dropped = Rc::new(Cell::new(0u32));
-        let r =
-            DeviceBus::<_, MemoryNetBackend, DropLine>::new(&slots, blocks, vec![], None, |_| {
-                Ok(DropLine(Rc::clone(&dropped)))
-            });
+        let r = DeviceBus::<_, MemoryNetBackend, DropLine>::new(
+            &slots,
+            blocks,
+            vec![],
+            None,
+            true,
+            |_| Ok(DropLine(Rc::clone(&dropped))),
+        );
         assert!(r.is_err());
         assert_eq!(dropped.get(), 1);
         assert_eq!(Rc::strong_count(&dropped), 1);

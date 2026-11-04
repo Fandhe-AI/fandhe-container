@@ -52,7 +52,13 @@
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! #3888・MVM-1: x86_64 の MP テーブルの生成（`mptable_x86`。OS 非依存・`unsafe` なし。`microvm::MicroVm::load_kernel` が `[639 KiB, 640 KiB)` へ書き e820 で予約し、AP を Linux にオンラインにする）。
-//! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
+//! #3696・MVM-1: **aarch64 の KVM も MVM-1 の対象**（spec の MVM-1 は Linux〔KVM〕でアーキテクチャを除外しない。実機の調達先の node4・DGX Spark も aarch64。TASK-151）。
+//! vGICv3（`KVM_CREATE_DEVICE`。`device::VgicV3`）・irqfd の GSI = SPI 番号の写像・`MicroVm::assemble` の aarch64 分岐（vCPU 1 台。FDT の配置は
+//! `load_kernel`、起動レジスタは `setup_boot_vcpu`〔`KVM_SET_ONE_REG`〕）・start / stop を実装済み（`unsafe` は `sys` の `KVM_CREATE_DEVICE`・
+//! `KVM_{SET,GET}_DEVICE_ATTR`・`KVM_{SET,GET}_ONE_REG` のみ。実機〔KVM aarch64〕での実行は未検証で、実機前提試験は `kvm_device_arm64_*`）。
+//! aarch64 の残りは PSCI 0.2 と `KVM_EXIT_SYSTEM_EVENT` の分類（#3896）・実カーネルの起動試験（#3897）・シリアルの MMIO と割り込み（#3898）・
+//! vCPU 1..N の起動（`KVM_ARM_VCPU_POWER_OFF` と CPU_ON。#3899）。それまで aarch64 は vCPU 2 台以上と level の virtio SPI を `Unimplemented` で拒否する（REPAIR-3）。
+//! 未実装: resamplefd による level の再注入・
 //! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動・他スレッドからの即時停止（kick）は #3738・#3736 で実装済み。virtio-net の受信は期限ごとのポーラー（#3742）で処理し、`start` は virtio-net を含む構成でも起動する（#3743。backend の到着通知は将来仕様。REPAIR-3）。実行時は `fandhe-container-plugin-microvm`（TASK-117）が
 //! 本 crate を別プロセスとして動かす。PLUG-1 区分は plugin 境界の外側（バックエンド実装ライブラリ。crate-naming.md）。
 //!

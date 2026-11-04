@@ -18,7 +18,8 @@
 //! 実機で確かめる自己診断 [`KvmDevice::probe_queue_interrupt`]。in-kernel irqchip を作った VM では x86_64 の HLT が
 //! userspace へ exit せず `KVM_RUN` の中で待つ（割り込みが無ければ `run_once` の期限で `DeadlineExceeded`）。
 //! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 `VmFd::register_irq_line`（`KVM_IRQ_LINE`）を足した。
-//! aarch64 の vGIC（`KVM_CREATE_DEVICE`）・resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
+//! #3696（MVM-1）で aarch64 の vGICv3（`KVM_CREATE_DEVICE`。`VgicV3`）と起動レジスタ（`KVM_SET_ONE_REG`。`VcpuFd::set_arm64_boot_state`）を足した。
+//! resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
 //! 観測用の [`VcpuFd::regs`] を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の [`VcpuFd::set_msrs`]・[`VcpuFd::set_fpu`] と観測用の [`VcpuFd::msrs`]・[`VcpuFd::fpu`] を足した。
 //! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する [`VcpuFd::set_boot_lints`] と観測用の [`VcpuFd::lapic_lints`] を足した。
@@ -28,7 +29,14 @@
 //! - x86_64: `KVM_CREATE_VCPU` だけで vCPU fd が使える。レジスタ設定は TASK-75.3.2 の `VcpuFd::set_boot_state`
 //! - aarch64: `KVM_CREATE_VCPU` の後に VM fd へ `KVM_ARM_PREFERRED_TARGET`、vCPU fd へ `KVM_ARM_VCPU_INIT`
 //!   （features はすべて 0）を発行して初期化済みの vCPU を返す。未初期化だと `KVM_RUN` が ENOEXEC で失敗する。
-//!   features（PSCI 等）の選択は TASK-75 で再検討する。aarch64 はネイティブ CI が無く型検査のみで実行は未検証
+//!   features（PSCI 等）の選択は #3896 の担当。aarch64 はネイティブ CI が無く（#2274）型検査のみで実行は未検証
+//!
+//! # aarch64 の割り込みコントローラー（#3696）
+//! x86_64 の `KVM_CREATE_IRQCHIP` は無く、vGICv3 を `KVM_CREATE_DEVICE`（`KVM_DEV_TYPE_ARM_VGIC_V3`）で作る。順序は
+//! 「vCPU を全部作る → vGIC を作ってアドレス（distributor・redistributor）を設定 → `KVM_DEV_ARM_VGIC_CTRL_INIT` → irqfd」。
+//! 根拠（Linux v6.12）: `Documentation/virt/kvm/devices/arm-vgic-v3.rst` は CTRL_INIT を「全 vCPU の作成後」と定め、
+//! `virt/kvm/eventfd.c` の `kvm_irqfd_assign` は `kvm_arch_intc_initialized()` が偽なら `-EAGAIN` を返す（初期化前の irqfd は拒否される）。
+//! irqfd の GSI は SPI 番号に等しい（`arch/arm64/kvm/vgic/vgic-irqfd.c` の既定 routing は pin = GSI で、注入は INTID = pin + 32）。
 //!
 //! aarch64 の machine type（IPA サイズ）は既定の 0 を使う。指定は TASK-75 で再検討する。
 //! [`KvmDevice`]・[`VmFd`]・[`VcpuFd`] は `OwnedFd` を持つため `Send` / `Sync`。
@@ -44,6 +52,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_arch = "aarch64")]
+use crate::boot_arm64::ArmBootState;
 use crate::boot_x86::BootCpuState;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{SegmentDescriptor, X86FpuState, X86MsrEntry, X86Regs};
@@ -76,8 +86,14 @@ const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOTTY: i32 = 25;
 const EBUSY: i32 = 16;
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 const ENXIO: i32 = 6;
+/// `ENODEV`（ホストが要求したデバイス種別を持たない。vGICv3 の作成で使う）。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const ENODEV: i32 = 19;
 const ENOSPC: i32 = 28;
 
 /// 開いた `/dev/kvm`。
@@ -92,6 +108,83 @@ pub struct VmFd {
     fd: OwnedFd,
     /// `KVM_GET_VCPU_MMAP_SIZE` の検証済みの値（`create_vcpu` の `kvm_run` の mmap に使う）。
     vcpu_mmap_size: usize,
+}
+
+/// `KVM_CREATE_DEVICE` で得た aarch64 の vGICv3 の device fd（MVM-1・#3696）。drop で close され、KVM がデバイスを破棄する。
+///
+/// `MicroVm` が保持し、drop 順は「vCPU → デバイス（irqfd の解除）→ vGIC → メモリ → VM fd」。観測用の
+/// `dist_base`・`redist_base`・`spi_pending` だけを公開し、設定系は `pub(crate)`（検証を経ない値を外へ出さない）。
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug)]
+pub struct VgicV3 {
+    fd: OwnedFd,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl VgicV3 {
+    /// vGIC を初期化する（`KVM_DEV_ARM_VGIC_GRP_CTRL` の `CTRL_INIT`）。全 vCPU の作成後、irqfd の登録前に 1 回だけ呼ぶ。
+    ///
+    /// vCPU が実行済みなどでカーネルが拒否したときは `FailedPrecondition`（EBUSY）、アドレスの重なり・redistributor の不足は
+    /// `InvalidArgument`（EINVAL）。二重に呼んだ場合の挙動はカーネルに任せる（本層は 1 回だけ呼ぶ）。
+    pub(crate) fn init(&self) -> Result<(), MicrovmError> {
+        sys::kvm_set_device_attr_u64(
+            self.fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_CTRL,
+            sys::consts::KVM_DEV_ARM_VGIC_CTRL_INIT,
+            0,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::SetDeviceAttr, e))
+    }
+
+    /// distributor の GPA を読み戻す（観測用）。
+    pub fn dist_base(&self) -> Result<u64, MicrovmError> {
+        sys::kvm_get_device_attr_u64(
+            self.fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_ADDR,
+            sys::consts::KVM_VGIC_V3_ADDR_TYPE_DIST,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::GetDeviceAttr, e))
+    }
+
+    /// redistributor の GPA を読み戻す（観測用）。
+    pub fn redist_base(&self) -> Result<u64, MicrovmError> {
+        sys::kvm_get_device_attr_u64(
+            self.fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_ADDR,
+            sys::consts::KVM_VGIC_V3_ADDR_TYPE_REDIST,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::GetDeviceAttr, e))
+    }
+
+    /// SPI `intid`（32..1020）が pending か、distributor の `GICD_ISPENDR<n>` を読んで返す（観測用。試験・診断向け）。
+    ///
+    /// `KVM_DEV_ARM_VGIC_GRP_DIST_REGS`（vCPU 0 の MPIDR = 0 を attr の上位に、レジスタの offset を下位に置く）で読む。
+    /// カーネルは全 vCPU をロックして読むため、**vCPU が `KVM_RUN` 中は `EBUSY`**（`FailedPrecondition`）。vGIC の初期化前も同じ。
+    /// 範囲外の `intid` は `InvalidArgument`。
+    pub fn spi_pending(&self, intid: u32) -> Result<bool, MicrovmError> {
+        let offset = spi_ispendr_offset(intid)?;
+        let v = sys::kvm_get_device_attr_u64(
+            self.fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+            offset,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::GetDeviceAttr, e))?;
+        Ok(v & (1u64 << (intid % 32)) != 0)
+    }
+}
+
+/// SPI の INTID から `GICD_ISPENDR<n>` の distributor 内 offset（`0x200 + 4 * (intid / 32)`）を返す（純関数。#3696）。
+/// SPI は INTID 32..=1019。範囲外は `InvalidArgument`。
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn spi_ispendr_offset(intid: u32) -> Result<u64, MicrovmError> {
+    const GICD_ISPENDR: u64 = 0x200;
+    if !(32..1020).contains(&intid) {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "SPI intid out of range",
+        ));
+    }
+    Ok(GICD_ISPENDR + 4 * u64::from(intid / 32))
 }
 
 /// `KVM_CREATE_VCPU` で得た vCPU fd と、その `kvm_run` 領域の mmap。drop で munmap・close される。
@@ -301,6 +394,15 @@ fn exit_kind(e: &VcpuExit) -> &'static str {
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
 /// `run_once` の期限の上限（異常な値で実質無期限になるのを防ぐ）。
 pub const RUN_DEADLINE_MAX: Duration = Duration::from_secs(3600);
+
+/// [`KvmDevice::probe_irqfd_vgic_order`] の結果（MVM-1・#3696）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrqfdVgicOrderProbe {
+    /// vGIC の初期化前の irqfd 登録の失敗（コードとメッセージ）。成功してしまった場合は `None`。
+    pub before_init: Option<(MicrovmErrorCode, String)>,
+    /// vGIC の初期化後の irqfd 登録が成功したか。
+    pub after_init_ok: bool,
+}
 
 /// [`KvmDevice::probe_guest_execution`] の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,7 +699,52 @@ impl VcpuFd {
         ))
     }
 
-    /// x86_64 以外では起動時のレジスタ初期化は未実装（aarch64 は FDT・PSTATE・X0 が要る。REPAIR-3）。
+    /// aarch64 の起動レジスタ（X0〜X3・PSTATE・PC）を `KVM_SET_ONE_REG` で設定する（MVM-1・#3696。aarch64 のみ）。
+    ///
+    /// 値は `boot_arm64::ArmBootState`（Image のエントリ・FDT の GPA・EL1h で DAIF マスク）。最初の `run_once` より前に
+    /// vCPU 0 にだけ呼ぶ。`SCTLR_EL1`（MMU・D-cache off）は `KVM_ARM_VCPU_INIT` のリセット値に依存し、本メソッドは書かない
+    /// （確認は範囲外。REPAIR-3）。AP の起動（PSCI CPU_ON・`KVM_ARM_VCPU_POWER_OFF`）は #3899。
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_arm64_boot_state(&mut self, s: &ArmBootState) -> Result<(), MicrovmError> {
+        let fd = self.fd.as_fd();
+        let set = |id: u64, v: u64| {
+            sys::kvm_set_one_reg_u64(fd, id, v)
+                .map_err(|e| classify_vcpu_error(VcpuStage::SetOneReg, e))
+        };
+        for (n, v) in [(0u64, s.x0), (1, s.x1), (2, s.x2), (3, s.x3)] {
+            let id = sys::arm64_reg_x(n).ok_or_else(|| {
+                MicrovmError::new(MicrovmErrorCode::Internal, "register index out of range")
+            })?;
+            set(id, v)?;
+        }
+        set(sys::ARM64_REG_PSTATE, s.cpsr)?;
+        set(sys::ARM64_REG_PC, s.pc)
+    }
+
+    /// aarch64 の起動レジスタ（X0〜X3・PSTATE・PC）を `KVM_GET_ONE_REG` で読み戻す（観測・照合用。aarch64 のみ）。
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm64_boot_regs(&self) -> Result<ArmBootState, MicrovmError> {
+        let fd = self.fd.as_fd();
+        let get = |id: u64| {
+            sys::kvm_get_one_reg_u64(fd, id)
+                .map_err(|e| classify_vcpu_error(VcpuStage::GetOneReg, e))
+        };
+        let x = |n: u64| {
+            sys::arm64_reg_x(n).ok_or_else(|| {
+                MicrovmError::new(MicrovmErrorCode::Internal, "register index out of range")
+            })
+        };
+        Ok(ArmBootState {
+            pc: get(sys::ARM64_REG_PC)?,
+            x0: get(x(0)?)?,
+            x1: get(x(1)?)?,
+            x2: get(x(2)?)?,
+            x3: get(x(3)?)?,
+            cpsr: get(sys::ARM64_REG_PSTATE)?,
+        })
+    }
+
+    /// x86_64 以外では x86 の起動レジスタ初期化（`BootCpuState`）は使えない。aarch64 は `set_arm64_boot_state`（#3696）。
     #[cfg(not(target_arch = "x86_64"))]
     pub fn set_boot_state(&mut self, _state: &BootCpuState) -> Result<(), MicrovmError> {
         Err(MicrovmError::new(
@@ -1073,6 +1220,10 @@ enum VcpuStage {
     SetMpState,
     PreferredTarget,
     VcpuInit,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    GetOneReg,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    SetOneReg,
     Mmap,
 }
 
@@ -1081,6 +1232,8 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
         VcpuStage::Create => "KVM_CREATE_VCPU",
         VcpuStage::PreferredTarget => "KVM_ARM_PREFERRED_TARGET",
         VcpuStage::VcpuInit => "KVM_ARM_VCPU_INIT",
+        VcpuStage::GetOneReg => "KVM_GET_ONE_REG",
+        VcpuStage::SetOneReg => "KVM_SET_ONE_REG",
         VcpuStage::Mmap => "mmap of kvm_run",
         VcpuStage::GetRegs => "KVM_GET_REGS",
         VcpuStage::SetRegs => "KVM_SET_REGS",
@@ -1107,6 +1260,8 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
             | VcpuStage::GetFpu
             | VcpuStage::SetFpu
             | VcpuStage::SetLapic
+            | VcpuStage::GetOneReg
+            | VcpuStage::SetOneReg
     );
     let msrs = matches!(stage, VcpuStage::GetMsrs | VcpuStage::SetMsrs);
     match e {
@@ -1169,6 +1324,15 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
 enum IrqStage {
     CheckExtension,
     CreateIrqchip,
+    /// `KVM_CREATE_DEVICE`（aarch64 の vGICv3。#3696）。
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    CreateDevice,
+    /// `KVM_SET_DEVICE_ATTR`（vGIC のアドレス・初期化。#3696）。
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    SetDeviceAttr,
+    /// `KVM_GET_DEVICE_ATTR`（vGIC の観測。#3696）。
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    GetDeviceAttr,
     Irqfd,
     Ioeventfd,
     /// `KVM_IRQ_LINE`（#3918）。x86_64 の COM1 の level 線。
@@ -1180,6 +1344,9 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
     let name = match stage {
         IrqStage::CheckExtension => "KVM_CHECK_EXTENSION",
         IrqStage::CreateIrqchip => "KVM_CREATE_IRQCHIP",
+        IrqStage::CreateDevice => "KVM_CREATE_DEVICE",
+        IrqStage::SetDeviceAttr => "KVM_SET_DEVICE_ATTR",
+        IrqStage::GetDeviceAttr => "KVM_GET_DEVICE_ATTR",
         IrqStage::Irqfd => "KVM_IRQFD",
         IrqStage::Ioeventfd => "KVM_IOEVENTFD",
         IrqStage::IrqLine => "KVM_IRQ_LINE",
@@ -1191,6 +1358,37 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
         ),
         SysError::Os(ENOTTY) => {
             MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM VM fd")
+        }
+        // vGIC（#3696）。ホストが GICv3 を持たない場合は ENODEV（GICv2 のみのホスト等）。
+        SysError::Os(ENODEV) if stage == IrqStage::CreateDevice => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "the host does not provide an in-kernel GICv3",
+        ),
+        // 初期化済み・vCPU が実行済みの vGIC へのアドレス設定や、実行中の vCPU がある状態の観測は EBUSY。
+        SysError::Os(EBUSY)
+            if matches!(stage, IrqStage::SetDeviceAttr | IrqStage::GetDeviceAttr) =>
+        {
+            MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "the vGIC is busy (already initialized, or a vCPU has run)",
+            )
+        }
+        // アドレスの重複設定は EEXIST。
+        SysError::Os(EEXIST) if stage == IrqStage::SetDeviceAttr => MicrovmError::new(
+            MicrovmErrorCode::AlreadyExists,
+            "KVM_SET_DEVICE_ATTR: address already set",
+        ),
+        // アドレス・サイズ・vCPU 数の不整合（重なり・整列違反・redistributor が vCPU 数に足りない等）。
+        SysError::Os(EINVAL) if stage == IrqStage::SetDeviceAttr => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM rejected the vGIC address or state",
+        ),
+        // 未対応の属性（ENXIO）・観測の引数不整合。
+        SysError::Os(n) if (n == ENXIO || n == EINVAL) && stage == IrqStage::GetDeviceAttr => {
+            MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "KVM_GET_DEVICE_ATTR rejected the attribute (vGIC not ready or unsupported)",
+            )
         }
         SysError::Os(EEXIST) | SysError::Os(EBUSY) => MicrovmError::new(
             MicrovmErrorCode::AlreadyExists,
@@ -1209,6 +1407,11 @@ fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
         SysError::Os(EINVAL) if stage == IrqStage::Irqfd => MicrovmError::new(
             MicrovmErrorCode::FailedPrecondition,
             "KVM_IRQFD rejected (no irqchip or invalid GSI)",
+        ),
+        // aarch64 は vGIC の初期化前の irqfd が EAGAIN（`kvm_arch_intc_initialized()` が偽。#3696）。
+        SysError::Os(EAGAIN) if stage == IrqStage::Irqfd => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_IRQFD requires an initialized interrupt controller (vGIC)",
         ),
         SysError::Os(EINVAL) if stage == IrqStage::Ioeventfd => MicrovmError::new(
             MicrovmErrorCode::InvalidArgument,
@@ -1308,12 +1511,45 @@ impl VmFd {
     /// in-kernel irqchip（PIC・IOAPIC・LAPIC）を作る（TASK-74.2.3・MVM-1。x86_64 のみ）。
     ///
     /// vCPU を作る前に呼ぶ（作った後はカーネルが EINVAL を返し `FailedPrecondition`）。二重作成は `AlreadyExists`。
-    /// aarch64 は vGIC が別方式（`KVM_CREATE_DEVICE`）のため `Unimplemented`（TASK-75。REPAIR-3）。
+    /// aarch64 は vGIC が別方式（`KVM_CREATE_DEVICE`。`create_vgic_v3`・#3696）のため本メソッドは `Unimplemented`。
     pub fn create_irqchip(&self) -> Result<(), MicrovmError> {
         #[cfg(target_arch = "x86_64")]
         self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
         sys::kvm_create_irqchip(self.fd.as_fd())
             .map_err(|e| classify_irq_error(IrqStage::CreateIrqchip, e))
+    }
+
+    /// vGICv3 を作り、distributor・redistributor の GPA を設定する（aarch64 のみ。MVM-1・#3696）。
+    ///
+    /// `KVM_CAP_DEVICE_CTRL` を確かめてから `KVM_CREATE_DEVICE`（`KVM_DEV_TYPE_ARM_VGIC_V3`）→
+    /// `KVM_DEV_ARM_VGIC_GRP_ADDR` の DIST・REDIST。**初期化（`VgicV3::init`）は含まない**: 初期化は全 vCPU の作成後で、
+    /// irqfd の登録前に呼ぶ（モジュール doc）。redistributor の領域は vCPU 数 × 128 KiB が必要で、不足は初期化時に拒否される。
+    /// 検証を経ない任意アドレスを crate の外へ公開しないため `pub(crate)`（呼び出しは `assemble` のみ。アドレスは `Arm64Layout` の検証済みの値）。
+    /// ホストが GICv3 を持たなければ `FailedPrecondition`。失敗時は作成済みの device fd を drop で閉じる。
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn create_vgic_v3(
+        &self,
+        dist_base: u64,
+        redist_base: u64,
+    ) -> Result<VgicV3, MicrovmError> {
+        self.require_extension(sys::consts::KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL")?;
+        let fd = sys::kvm_create_device(self.fd.as_fd(), sys::consts::KVM_DEV_TYPE_ARM_VGIC_V3)
+            .map_err(|e| classify_irq_error(IrqStage::CreateDevice, e))?;
+        sys::kvm_set_device_attr_u64(
+            fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_ADDR,
+            sys::consts::KVM_VGIC_V3_ADDR_TYPE_DIST,
+            dist_base,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::SetDeviceAttr, e))?;
+        sys::kvm_set_device_attr_u64(
+            fd.as_fd(),
+            sys::consts::KVM_DEV_ARM_VGIC_GRP_ADDR,
+            sys::consts::KVM_VGIC_V3_ADDR_TYPE_REDIST,
+            redist_base,
+        )
+        .map_err(|e| classify_irq_error(IrqStage::SetDeviceAttr, e))?;
+        Ok(VgicV3 { fd })
     }
 
     /// KVM の identity map ページ（1 ページ）の置き場を設定する（x86_64 のみ。MVM-1・#3732）。
@@ -1333,7 +1569,8 @@ impl VmFd {
 
     /// eventfd を GSI `gsi` に結ぶ（`KVM_IRQFD`）。返った [`IrqFd`] の `trigger` でゲストへ割り込みが入る。
     ///
-    /// irqchip を先に作ること（無いと `FailedPrecondition`）。GSI の範囲はカーネルの検証に任せる。
+    /// irqchip を先に作ること（無いと `FailedPrecondition`）。aarch64 は vGIC の**初期化後**に呼ぶ（前は `EAGAIN` で
+    /// `FailedPrecondition`。順序の根拠はモジュール doc）。aarch64 の GSI は SPI 番号に等しい（INTID = GSI + 32）。GSI の範囲はカーネルの検証に任せる。
     /// 同じ組の二重登録は `AlreadyExists`。割り込みは edge 扱い（level の再注入は未実装）。
     pub fn register_irqfd(&self, gsi: u32) -> Result<IrqFd, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IRQFD, "KVM_CAP_IRQFD")?;
@@ -1609,6 +1846,39 @@ impl KvmDevice {
     }
 
     /// 自己診断: 固定の 5 バイトのゲストコード（`mov al,0x42; out 0x10,al; hlt`）を 1 ページに置いて
+    /// 自己診断: vGICv3 の初期化前の irqfd 登録が `FailedPrecondition` で拒否され、初期化後は通ることを確かめる
+    /// （MVM-1・#3696。aarch64 のみ。他 arch は `Unimplemented`）。VM・vCPU・vGIC の寿命は関数内で完結する。
+    /// `tests/` の結合試験から呼ぶための口で、vGIC の構成 API（`create_vgic_v3`・`init`）は公開しない。
+    /// 順序の根拠はモジュール doc。ホストが GICv3 を持たない場合は `create_vgic_v3` の `FailedPrecondition` を返す。
+    pub fn probe_irqfd_vgic_order(&self) -> Result<IrqfdVgicOrderProbe, MicrovmError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let vm = self.create_vm()?;
+            let _vcpu = vm.create_vcpu(0)?;
+            let vgic = vm.create_vgic_v3(
+                crate::arm64_layout::ARM64_GIC_DIST_BASE,
+                crate::arm64_layout::ARM64_GIC_REDIST_BASE,
+            )?;
+            let before_init = match vm.register_irqfd(16) {
+                Ok(_) => None,
+                Err(e) => Some((e.code(), e.message().to_string())),
+            };
+            vgic.init()?;
+            let after_init_ok = vm.register_irqfd(16).is_ok();
+            Ok(IrqfdVgicOrderProbe {
+                before_init,
+                after_init_ok,
+            })
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "irqfd vGIC order probe is only implemented for aarch64",
+            ))
+        }
+    }
+
     /// 実際に `KVM_RUN` し、観測した VM exit を返す（TASK-74.4.1・MVM-1。x86_64 のみ）。
     ///
     /// x86_64 のリセット状態（CS:IP = F000:FFF0、線形 0xFFFFFFF0）のまま GPA `0xFFFFF000` に置いた 1 ページから
@@ -2604,6 +2874,103 @@ mod tests {
         }
         let m = classify_irq_error(IrqStage::Irqfd, SysError::Os(5));
         assert_eq!(m.message(), "KVM_IRQFD failed (os error 5)");
+    }
+
+    /// MVM-1・#3696: aarch64 の vGIC（`KVM_CREATE_DEVICE` / `KVM_SET_DEVICE_ATTR` / `KVM_GET_DEVICE_ATTR`）と
+    /// 初期化前の irqfd（EAGAIN）のエラー分類表。メッセージは固定の英語で errno 値を載せない（ERR-1）。
+    #[test]
+    fn mvm1_3696_classify_vgic_error_table() {
+        use MicrovmErrorCode as C;
+        let cases = [
+            // ホストが GICv3 を持たない（GICv2 のみ等）。
+            (
+                IrqStage::CreateDevice,
+                SysError::Os(ENODEV),
+                C::FailedPrecondition,
+            ),
+            (
+                IrqStage::CreateDevice,
+                SysError::Os(EEXIST),
+                C::AlreadyExists,
+            ),
+            (
+                IrqStage::CreateDevice,
+                SysError::Os(ENOMEM),
+                C::ResourceExhausted,
+            ),
+            (
+                IrqStage::CreateDevice,
+                SysError::Os(EACCES),
+                C::PermissionDenied,
+            ),
+            (
+                IrqStage::CreateDevice,
+                SysError::Unsupported,
+                C::Unimplemented,
+            ),
+            // 初期化済み・vCPU が実行済みの vGIC は EBUSY。
+            (
+                IrqStage::SetDeviceAttr,
+                SysError::Os(EBUSY),
+                C::FailedPrecondition,
+            ),
+            (
+                IrqStage::SetDeviceAttr,
+                SysError::Os(EEXIST),
+                C::AlreadyExists,
+            ),
+            (
+                IrqStage::SetDeviceAttr,
+                SysError::Os(EINVAL),
+                C::InvalidArgument,
+            ),
+            (
+                IrqStage::GetDeviceAttr,
+                SysError::Os(EBUSY),
+                C::FailedPrecondition,
+            ),
+            (
+                IrqStage::GetDeviceAttr,
+                SysError::Os(ENXIO),
+                C::FailedPrecondition,
+            ),
+            (
+                IrqStage::GetDeviceAttr,
+                SysError::Os(EINVAL),
+                C::FailedPrecondition,
+            ),
+            (IrqStage::GetDeviceAttr, SysError::Os(5), C::Internal),
+            // vGIC の初期化前の irqfd。
+            (IrqStage::Irqfd, SysError::Os(EAGAIN), C::FailedPrecondition),
+        ];
+        for (stage, e, want) in cases {
+            let m = classify_irq_error(stage, e);
+            assert_eq!(m.code(), want, "{stage:?} {e:?}");
+            assert!(!m.message().contains("os error 19"), "errno must not leak");
+        }
+        assert_eq!(
+            classify_irq_error(IrqStage::Irqfd, SysError::Os(EAGAIN)).message(),
+            "KVM_IRQFD requires an initialized interrupt controller (vGIC)"
+        );
+        assert_eq!(
+            classify_irq_error(IrqStage::CreateDevice, SysError::Os(ENODEV)).message(),
+            "the host does not provide an in-kernel GICv3"
+        );
+    }
+
+    /// MVM-1・#3696: SPI の pending 読み出しの offset（`GICD_ISPENDR<n>` = `0x200 + 4 * (intid / 32)`）と範囲検査。
+    #[test]
+    fn mvm1_3696_spi_ispendr_offset() {
+        assert_eq!(spi_ispendr_offset(32).unwrap(), 0x204);
+        assert_eq!(spi_ispendr_offset(48).unwrap(), 0x204);
+        assert_eq!(spi_ispendr_offset(63).unwrap(), 0x204);
+        assert_eq!(spi_ispendr_offset(64).unwrap(), 0x208);
+        assert_eq!(spi_ispendr_offset(1019).unwrap(), 0x200 + 4 * 31);
+        for bad in [0, 31, 1020, u32::MAX] {
+            let e = spi_ispendr_offset(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "SPI intid out of range");
+        }
     }
 
     /// MVM-1・#3732: TSS / identity map の ioctl のエラー分類表。

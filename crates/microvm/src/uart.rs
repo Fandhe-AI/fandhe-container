@@ -57,7 +57,7 @@
 //! # 未実装（REPAIR-3）
 //! - x86 の線なしの PIO（[`SerialConsole::port_device`]）は IIR が従来どおり常に「保留なし」を返す（届かない THRE を報告すると
 //!   ドライバが来ない割り込みを待つため）。`microvm::assemble` は x86_64 で [`SerialConsole::port_device_with_irq`] を使い、
-//!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。aarch64 の KVM の線は #3696・#3898。
+//!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。aarch64 の KVM の線は #3898（vGIC・irqfd の土台は #3696 で実装済み）。
 //! - 受信トリガ（FCR bit7:6）・CTI（IIR 0x0C）・LSR.OE と RLS 割り込みは未実装。ループバック中の THR 書き込みは RX へ回さない。
 //! - `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかは未確認（#3803 の実機確認項目）。
 

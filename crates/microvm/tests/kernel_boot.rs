@@ -17,8 +17,9 @@
 //! `kernel_boot: PRECONDITION FAILED (test environment, not a regression)` で落とす。
 //!
 //! 追加の構成（#3865・MVM-1・REPAIR-12。いずれも同じ実機前提の形）:
-//! - vCPU 2 台: MP テーブル・MADT が未実装のため AP は Linux にオンラインにならない。照合は「2 台構成で最後まで起動し、
-//!   BSP 起因の停止で 2 台とも回収される（`vcpu_count` = 2・起点 vCPU 0）」まで。「2 CPU がオンライン」とは主張しない。
+//! - vCPU 2 台: MP テーブル（#3888。`mptable_x86`）で AP が Linux にオンラインになる。2 台構成で最後まで起動し、
+//!   BSP 起因の停止で 2 台とも回収される（`vcpu_count` = 2・起点 vCPU 0）ことに加え、`smp: Brought up 1 node, 2 CPUs` の行が
+//!   ちょうど 1 回出ることを照合する。
 //! - virtio-block 1 台（1 MiB・読み取り専用）: 起動元は initrd のまま。観測器が STATUS への書き込みで DRIVER_OK を含む
 //!   最初の値 `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 1 を、backend が `read_at` 1 回以上かつ offset 0 を読んだ回 1 回以上を照合する。
 //! - virtio-block の中身の照合（#3889・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build`
@@ -38,9 +39,10 @@
 //!   カーネルには `CONFIG_PACKET=y` が要る。
 //!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
-//! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。止まる場合は `_CMDLINE` で
-//! `tsc=reliable no_timer_check` 等を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
-//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・RX。
+//! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。MP テーブル（#3888）でゲストは
+//! IOAPIC モードになり、Linux の `check_timer` が PIT 無しで失敗して止まる可能性が高い。止まる場合は `_CMDLINE` で
+//! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
+//! device model 側の別 issue として扱う。範囲外: aarch64・RX/TX。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -148,6 +150,22 @@ mod x86 {
             );
         }
         Ok(s.to_owned())
+    }
+
+    /// 2 CPU がオンラインになった行（Linux v6.12 `kernel/smp.c` の `smp_init()` の `pr_info`。`CONFIG_NUMA=n` で node は 1）。
+    /// `CONFIG_PRINTK_TIME` の接頭辞（`[    0.1] `）を許すため、行末一致で数える。
+    const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
+
+    /// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
+    fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
+        output
+            .split(|b| *b == b'\n')
+            .filter(|line| {
+                line.strip_suffix(b"\r")
+                    .unwrap_or(line)
+                    .ends_with(suffix.as_bytes())
+            })
+            .count()
     }
 
     /// 行単位の完全一致の件数（tty の ONLCR による `\r\n` を許容。部分一致・混入は数えない）。
@@ -687,8 +705,8 @@ mod x86 {
         );
     }
 
-    /// vCPU 2 台（#3865・MVM-1）。MP テーブル・MADT が未実装のため AP は Linux にオンラインにならず、BSP だけで
-    /// `/init` に届く。2 台構成の VM が実カーネルで最後まで起動し、BSP 起因の停止で 2 台とも回収されることを照合する。
+    /// vCPU 2 台（#3865・#3888・MVM-1）。MP テーブルで AP が Linux にオンラインになる。2 台構成の VM が実カーネルで最後まで起動し、
+    /// BSP 起因の停止で 2 台とも回収されること、`smp: Brought up 1 node, 2 CPUs` の行がちょうど 1 回出ることを照合する。
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
@@ -701,13 +719,17 @@ mod x86 {
         };
         let obs = Arc::new(VirtioWindowObserver::new());
         let o = run_boot(inp, config, Some(obs.clone()));
-        let smp_line = String::from_utf8_lossy(&o.output).contains("smp:");
+        let smp_online = count_lines_ending_with(&o.output, SMP_ONLINE_LINE);
         let extra = format!(
-            "ap_exits={} smp_line={smp_line}",
+            "ap_exits={} smp_online_lines={smp_online}",
             obs.ap_exits.load(Ordering::Relaxed)
         );
         let diag = o.diag(&extra);
         assert_boot_ok(&o, 2, &diag);
+        assert_eq!(
+            smp_online, 1,
+            "expected exactly one `{SMP_ONLINE_LINE}` line (MP table must bring the AP online)\n{diag}"
+        );
         eprintln!(
             "kernel_boot: ok case=two_vcpus reason=guest_shutdown vcpu_count=2 elapsed_ms={} {extra}",
             o.elapsed.as_millis()
@@ -1154,6 +1176,29 @@ mod x86 {
         assert_eq!(count_marker_lines(format!("{m}y\n").as_bytes(), m), 0);
         assert_eq!(
             count_marker_lines(format!("{m}\nboot\n{m}\n").as_bytes(), m),
+            2
+        );
+    }
+
+    #[test]
+    fn mvm1_3888_count_lines_ending_with() {
+        let l = SMP_ONLINE_LINE;
+        assert_eq!(count_lines_ending_with(b"", l), 0);
+        assert_eq!(count_lines_ending_with(format!("{l}\r\n").as_bytes(), l), 1);
+        assert_eq!(
+            count_lines_ending_with(format!("[    0.123456] {l}\n").as_bytes(), l),
+            1
+        );
+        assert_eq!(count_lines_ending_with(format!("{l}y\n").as_bytes(), l), 0);
+        assert_eq!(
+            count_lines_ending_with(
+                b"smp: Brought up 1 node, 1 CPU\nsmp: Brought up 1 node, 12 CPUs\n",
+                l
+            ),
+            0
+        );
+        assert_eq!(
+            count_lines_ending_with(format!("{l}\nx\n[ 1.0] {l}\n").as_bytes(), l),
             2
         );
     }

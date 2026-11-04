@@ -50,7 +50,7 @@
 //! スナップショットと復元の用途で、その用途は未実装（REPAIR-3）。
 //!
 //! # 範囲外（REPAIR-3）
-//! ELF vmlinux・PVH エントリ・aarch64 の FDT / Image・`setup_data`・ACPI / MP テーブル・EFI・4 GiB 超への配置（`ext_*`）・
+//! ELF vmlinux・PVH エントリ・aarch64 の FDT / Image・`setup_data`・ACPI（MP テーブルは `mptable_x86`・#3888）・EFI・4 GiB 超への配置（`ext_*`）・
 //! 複数の RAM 領域・`min_alignment`・MSR / FPU / LAPIC の設定（CPUID は `cpuid_x86`・#3733。実カーネルの起動完走に必要。#886 以降の追跡事項）・start / stop（#886）・
 //! ファイルからの読み込み（呼び出し元が上限つきで読んで渡す）は未実装。
 //!
@@ -96,6 +96,11 @@ pub const CMDLINE_ADDR: u64 = 0x2_0000;
 pub const CMDLINE_CAPACITY: u64 = 4096;
 /// 低位 RAM の終端（排他。e820 の 1 本目の終わり）。
 pub const LOW_RAM_END: u64 = 0x9_FC00;
+/// MP テーブル（#3888・MVM-1）の置き場所の先頭。基本メモリの最後の 1 KiB（`[LOW_RAM_END, MP_TABLE_END)`）で、
+/// Linux v6.12 の `smp_scan_config` が `_MP_` を探す 4 範囲のひとつ（639 KiB から 640 KiB）。e820 では予約にする。
+pub const MP_TABLE_START: u64 = LOW_RAM_END;
+/// MP テーブルの置き場所の終端（排他。640 KiB）。
+pub const MP_TABLE_END: u64 = 0xA_0000;
 /// カーネルのロード先の下限（1 MiB）。
 pub const HIMEM_START: u64 = 0x10_0000;
 
@@ -113,6 +118,10 @@ const _: () = assert!(BOOT_SCRATCH_START < BOOT_SCRATCH_END);
 const _: () = assert!(BOOT_SCRATCH_END <= CMDLINE_ADDR);
 const _: () = assert!(CMDLINE_ADDR + CMDLINE_CAPACITY <= LOW_RAM_END);
 const _: () = assert!(LOW_RAM_END <= HIMEM_START);
+const _: () = assert!(CMDLINE_ADDR + CMDLINE_CAPACITY <= MP_TABLE_START);
+const _: () = assert!(MP_TABLE_START < MP_TABLE_END);
+const _: () = assert!(MP_TABLE_END <= HIMEM_START);
+const _: () = assert!(MP_TABLE_START.is_multiple_of(16));
 
 const BOOT_GDT_BYTES: usize = 32;
 const BOOT_IDT_BYTES: usize = 8;
@@ -156,6 +165,8 @@ const LOADER_TYPE_UNDEFINED: u8 = 0xFF;
 /// 64-bit エントリのカーネル先頭からのオフセット。
 const ENTRY_64_OFFSET: u64 = 0x200;
 const E820_RAM: u32 = 1;
+/// e820 の予約（type 2）。MP テーブルの範囲に使う。
+const E820_RESERVED: u32 = 2;
 const INITRD_ALIGN: u64 = 4096;
 const MAX_KERNEL_ALIGNMENT: u64 = 1 << 30;
 
@@ -342,6 +353,56 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
     }
 }
 
+/// 利用者の cmdline に、この VM が PIT を持たないために必要な `no_timer_check` を足す（MVM-1・#3888）。
+///
+/// MP テーブルでゲストが IOAPIC モードになると Linux は IRQ 0 の `check_timer` を走らせるが、この VM には PIT も
+/// タイマー割り込みの注入経路も無く検査に失敗して起動できない。そのため `microvm.rs` の `load_kernel` が
+/// 常に付ける（Linux x86_64 以外では呼び出し元が無いため、試験を除き `cfg` で除外する）。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
+pub(crate) fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
+    // 公開 API の直接呼び出しでも、複製の前に上限を超える入力を拒否する（確保の無制限化を防ぐ）。
+    if user.len() as u64 >= CMDLINE_CAPACITY {
+        return Err(invalid("kernel command line too long"));
+    }
+    let (head, tail) = split_at_init_args(user)?;
+    let mut text = head.to_owned();
+    if !has_standalone_token(head, "no_timer_check") {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str("no_timer_check");
+    }
+    if !tail.is_empty() {
+        text.push(' ');
+        text.push_str(tail);
+    }
+    if text.len() as u64 >= CMDLINE_CAPACITY {
+        return Err(invalid("kernel command line too long"));
+    }
+    Ok(text)
+}
+
+/// 引用符の外の空白で区切った独立トークンに `name` が完全一致で含まれるか。
+/// `foo="x no_timer_check y"` のように引用符内にある文字列は独立した引数とみなさない。
+#[cfg(any(all(target_os = "linux", target_arch = "x86_64"), test))]
+fn has_standalone_token(text: &str, name: &str) -> bool {
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    for i in 0..=bytes.len() {
+        let c = bytes.get(i).copied();
+        if c == Some(b'"') {
+            in_quote = !in_quote;
+        } else if !in_quote && (c.is_none() || c == Some(b' ')) {
+            if text.get(start..i) == Some(name) {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    false
+}
+
 /// 検証済みの cmdline（印字可能な ASCII のみ。virtio-mmio の項目はコードが型つきの値から生成して足す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelCmdline {
@@ -408,7 +469,7 @@ pub struct E820Entry {
     pub addr: u64,
     /// 長さ。
     pub size: u64,
-    /// 種別（1 = RAM）。
+    /// 種別（1 = RAM・2 = 予約）。
     pub kind: u32,
 }
 
@@ -422,7 +483,7 @@ pub struct BootPlan {
     /// initrd の GPA と長さ。
     pub initrd: Option<(u64, u64)>,
     /// e820 の表。
-    pub e820: [E820Entry; 2],
+    pub e820: [E820Entry; 3],
 }
 
 /// ロード先・initrd の位置・e820 を決める。ゲストメモリは GPA 0 から `mem_len` バイトの単一領域。
@@ -533,6 +594,11 @@ pub fn plan_boot(
                 addr: 0,
                 size: LOW_RAM_END,
                 kind: E820_RAM,
+            },
+            E820Entry {
+                addr: MP_TABLE_START,
+                size: MP_TABLE_END - MP_TABLE_START,
+                kind: E820_RESERVED,
             },
             E820Entry {
                 addr: HIMEM_START,
@@ -1176,16 +1242,76 @@ mod tests {
             m.read_u32_le(GuestAddress::new(0x7000 + 0x228)).unwrap(),
             0x2_0000
         );
-        assert_eq!(read(&m, 0x7000 + 0x1E8, 1), vec![2]);
+        // e820 は RAM・MP テーブルの予約（#3888）・RAM の 3 本。
+        assert_eq!(read(&m, 0x7000 + 0x1E8, 1), vec![3]);
         let t = 0x7000 + 0x2D0;
         assert_eq!(m.read_u64_le(GuestAddress::new(t)).unwrap(), 0);
         assert_eq!(m.read_u64_le(GuestAddress::new(t + 8)).unwrap(), 0x9_FC00);
         assert_eq!(m.read_u32_le(GuestAddress::new(t + 16)).unwrap(), 1);
-        assert_eq!(m.read_u64_le(GuestAddress::new(t + 20)).unwrap(), 0x10_0000);
-        assert_eq!(m.read_u64_le(GuestAddress::new(t + 28)).unwrap(), 63 * MIB);
-        assert_eq!(m.read_u32_le(GuestAddress::new(t + 36)).unwrap(), 1);
+        assert_eq!(m.read_u64_le(GuestAddress::new(t + 20)).unwrap(), 0x9_FC00);
+        assert_eq!(m.read_u64_le(GuestAddress::new(t + 28)).unwrap(), 0x400);
+        assert_eq!(m.read_u32_le(GuestAddress::new(t + 36)).unwrap(), 2);
+        assert_eq!(m.read_u64_le(GuestAddress::new(t + 40)).unwrap(), 0x10_0000);
+        assert_eq!(m.read_u64_le(GuestAddress::new(t + 48)).unwrap(), 63 * MIB);
+        assert_eq!(m.read_u32_le(GuestAddress::new(t + 56)).unwrap(), 1);
         assert_eq!(read(&m, 0x2_0000, 14), b"console=ttyS0\0".to_vec());
         assert_eq!(l.cmdline_len, 13);
+    }
+
+    /// MVM-1・#3888: MP テーブルの領域はカーネル・initrd・cmdline と重ならず、書いても zero page と cmdline を壊さない。
+    #[test]
+    fn mvm1_3888_mp_table_area_is_disjoint_and_writable() {
+        use crate::mptable_x86::{IsaIrqRoute, MpTableConfig, build_mp_table, write_mp_table};
+        let data = vec![0xA5u8; 0x1801];
+        let img = Img::default().build();
+        let mut m = mem(64 * MIB);
+        let l = load_linux(&mut m, &img, Some(&data), &cmd("console=ttyS0")).unwrap();
+        assert!(l.kernel_addr.raw() >= MP_TABLE_END);
+        let (ird, _) = l.initrd.unwrap();
+        assert!(ird.raw() >= MP_TABLE_END);
+        let routes = [IsaIrqRoute {
+            source_irq: 4,
+            ioapic_pin: 4,
+        }];
+        let cfg = MpTableConfig {
+            vcpu_count: 2,
+            ioapic_id: 32,
+            ioapic_addr: 0xfec0_0000,
+            lapic_addr: 0xfee0_0000,
+            isa_irqs: &routes,
+        };
+        let t = build_mp_table(&cfg, MP_TABLE_START).unwrap();
+        write_mp_table(&mut m, &t).unwrap();
+        assert_eq!(read(&m, MP_TABLE_START, 4), b"_MP_".to_vec());
+        assert_eq!(read(&m, 0x7000 + 0x202, 4), b"HdrS".to_vec());
+        assert_eq!(read(&m, CMDLINE_ADDR, 14), b"console=ttyS0\0".to_vec());
+    }
+
+    /// MVM-1・#3888: plan_boot の e820 は RAM・予約（MP テーブル）・RAM の具体値。
+    #[test]
+    fn mvm1_3888_plan_e820_values() {
+        let h = SetupHeader::parse(&Img::default().build()).unwrap();
+        let p = plan_boot(&h, 0x1000, None, 64 * MIB).unwrap();
+        assert_eq!(
+            p.e820,
+            [
+                E820Entry {
+                    addr: 0,
+                    size: 0x9_FC00,
+                    kind: 1
+                },
+                E820Entry {
+                    addr: 0x9_FC00,
+                    size: 0x400,
+                    kind: 2
+                },
+                E820Entry {
+                    addr: 0x10_0000,
+                    size: 63 * MIB,
+                    kind: 1
+                },
+            ]
+        );
     }
 
     /// MVM-1・TASK-75.3.1: initrd は initrd_addr_max と RAM 終端の低いほうの下、4 KiB 境界に置かれ、ramdisk_* に反映される。
@@ -1237,6 +1363,32 @@ mod tests {
             load_linux(&mut m, &img, Some(&big), &cmd("")),
             MicrovmErrorCode::ResourceExhausted,
             "initrd does not fit in guest memory",
+        );
+    }
+
+    /// MVM-1・#3888: 既定の cmdline に `no_timer_check` が `--` の前へ 1 回だけ入る（PIT が無い VM で check_timer を避ける）。
+    #[test]
+    fn mvm1_3888_with_no_timer_check() {
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 reboot=t").unwrap(),
+            "console=ttyS0 reboot=t no_timer_check"
+        );
+        assert_eq!(with_no_timer_check("").unwrap(), "no_timer_check");
+        // 引用符内の no_timer_check は独立した引数ではないので、別途足す。
+        assert_eq!(
+            with_no_timer_check("foo=\"x no_timer_check y\"").unwrap(),
+            "foo=\"x no_timer_check y\" no_timer_check"
+        );
+        // 上限超過は複製前に拒否する。
+        let big = "a".repeat(CMDLINE_CAPACITY as usize);
+        assert!(with_no_timer_check(&big).is_err());
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 no_timer_check").unwrap(),
+            "console=ttyS0 no_timer_check"
+        );
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 -- rescue").unwrap(),
+            "console=ttyS0 no_timer_check -- rescue"
         );
     }
 

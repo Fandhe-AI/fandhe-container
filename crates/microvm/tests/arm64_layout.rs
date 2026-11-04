@@ -282,6 +282,21 @@ fn mvm5_3864_fdt_seventeen_vcpus_affinity() {
     assert_eq!(p.cells("/cpus/cpu@f", "reg"), vec![0xf]);
 }
 
+/// MVM-5・MVM-1・#3882: `stdout-path` の指す先が ns16550a のノードで、`reg` の base がシリアルの窓であること。
+/// ノード名とパスを別々にハードコードせず、`stdout-path` の値をそのままノードのパスとして引く。
+#[test]
+fn mvm5_3882_fdt_stdout_path_resolves_to_ns16550a() {
+    let l = Arm64Layout::new(256 * MIB, 1, 1)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    let p = fdt_for(&l);
+    let raw = p.get("/chosen", "stdout-path");
+    let path = std::str::from_utf8(raw.strip_suffix(&[0]).unwrap()).unwrap();
+    assert_eq!(p.get(path, "compatible"), b"ns16550a\0");
+    assert_eq!(p.cells(path, "reg")[..2], [0, 0x0900_0000]);
+}
+
 /// MVM-5・MVM-1・#3864: シリアルのノードと stdout-path。
 #[test]
 fn mvm5_3864_fdt_serial_and_stdout_path() {

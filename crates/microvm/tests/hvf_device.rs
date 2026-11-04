@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・#3882）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -943,6 +943,7 @@ fn assemble_config(
     layout: Arm64Layout,
     kernel: Vec<u8>,
     block: usize,
+    serial: bool,
 ) -> fandhe_container_microvm::hvf::HvfMicroVmConfig<
     fandhe_container_microvm::virtio_block::MemoryBlockBackend,
     fandhe_container_microvm::virtio_net::MemoryNetBackend,
@@ -959,6 +960,7 @@ fn assemble_config(
             .collect(),
         net: Vec::new(),
         vcpu: VcpuThreadConfig::default(),
+        serial,
     }
 }
 
@@ -987,12 +989,14 @@ fn hvf_device_assemble_sets_boot_registers() {
     // 1. vcpus = 2 は資源を作る前に Unimplemented。直後に VM を作れる = 何も作っていない。
     let mut two = Arm64Layout::new(64 << 20, 1, 1).unwrap();
     two.vcpus = 2;
-    let e = HvfMicroVm::assemble(assemble_config(two, synthetic_image(true), 1)).unwrap_err();
+    let e =
+        HvfMicroVm::assemble(assemble_config(two, synthetic_image(true), 1, false)).unwrap_err();
     assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
     drop(create_vm_or_precondition());
 
     // 2. 正しい構成。
-    let vm = HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1)).unwrap();
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1, false)).unwrap();
 
     // 3. 起動レジスタ（生の値は #3803 の記録用に出す）。
     let boot = *vm.boot_registers();
@@ -1033,6 +1037,75 @@ fn hvf_device_assemble_sets_boot_registers() {
     drop(create_vm_or_precondition());
 }
 
+/// シリアル出力の確認用ゲスト付き Image。ヘッダの code0 は `b #64`（ヘッダ 64 バイトを飛び越える）、offset 64 から
+/// `movz x0, #0x0900, lsl #16`（0xD2A1_2000）・`movz w1, #0x58`（0x5280_0B01。`'X'`）・`strb w1, [x0]`（0x3900_0001。THR）・
+/// `b .`（0x1400_0000）。`SharedUartMmio` は 1 バイト幅しか受けないので `strb` を使う。符号は
+/// `llvm-mc -triple=aarch64 -show-encoding` が使えない環境では、`MMIO_GUEST_CODE` の `movz x0, #0x0a00, lsl #16 = 0xD2A1_4000`
+/// （imm16 は bit 5 から。0x0900 << 5 = 0x12000）との差分計算で照合した。
+fn serial_guest_image() -> Vec<u8> {
+    let mut img = synthetic_image(true);
+    img[0..4].copy_from_slice(&0x1400_0010u32.to_le_bytes());
+    let code = [0xD2A1_2000u32, 0x5280_0B01, 0x3900_0001, 0x1400_0000];
+    for (i, w) in code.iter().enumerate() {
+        img[64 + i * 4..64 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    img
+}
+
+/// シリアル（ns16550a の MMIO）の結線（#3882・MVM-5・MVM-1）。
+/// `serial = false` で `layout.serial` が `Some` の不一致が資源を作る前に `InvalidArgument` になること、シリアルありの組み立てで
+/// ゲストが `0x0900_0000` の THR へ `strb` で書いた `b'X'` が `serial_console().take_output()` で `b"X"` として得られること、
+/// drop の後に VM を作り直せることを確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_assemble_serial_output() {
+    use fandhe_container_microvm::arm64_layout::MmioRegion;
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 1, 0)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    require_vm_with_gic(&layout);
+
+    // 1. 負の対照: layout.serial = Some なのに serial = false は資源を作る前に拒否される（直後に VM を作れる）。
+    let e = HvfMicroVm::assemble(assemble_config(
+        layout.clone(),
+        serial_guest_image(),
+        0,
+        false,
+    ))
+    .unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    drop(create_vm_or_precondition());
+
+    // 2. シリアルありの組み立て。
+    let vm = HvfMicroVm::assemble(assemble_config(layout, serial_guest_image(), 0, true)).unwrap();
+    assert_eq!(
+        vm.layout().serial,
+        Some(MmioRegion::new(0x0900_0000, 0x1000))
+    );
+    assert_eq!(vm.devices().len(), 0);
+
+    // 3. ゲストの書いた 1 バイトが取り出せる（5 秒を上限に 10 ms 刻みで集め、その後 100 ms で追加が無いことも確かめる）。
+    let console = vm.serial_console().expect("serial console is enabled");
+    let start = std::time::Instant::now();
+    let mut out = Vec::new();
+    while out.is_empty() && start.elapsed() < Duration::from_secs(5) {
+        out.extend(console.take_output().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    out.extend(console.take_output().unwrap());
+    eprintln!("hvf_device: serial: output={out:?}");
+    assert_eq!(out, b"X");
+
+    // 4. drop の後に VM を作り直せる。
+    drop(vm);
+    drop(create_vm_or_precondition());
+}
+
 /// 途中失敗の後の再 assemble（TASK-192.15・#3797・MVM-5・REPAIR-3）。
 /// GIC の配置違反（VM を作る前）と不正 Image（VM・GIC・RAM を作った後）の失敗が資源を残さず、同じプロセスで正常な assemble が
 /// 成功すること、`map_shared` の対応付けが VM を生かしておくこと（所有側の `Arc` を落としても作り直せない）を確かめる。
@@ -1048,16 +1121,23 @@ fn hvf_device_assemble_retries_after_failure() {
     // 1. GIC の配置違反: VM を作る前に InvalidArgument。
     let mut bad_gic = Arm64Layout::new(64 << 20, 1, 1).unwrap();
     bad_gic.gic_dist.base = GuestAddress::new(bad_gic.gic_dist.base.raw() + 1);
-    let e = HvfMicroVm::assemble(assemble_config(bad_gic, synthetic_image(true), 1)).unwrap_err();
-    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
-
-    // 2. 不正 Image（magic 違反）: VM・GIC・RAM を作った後の失敗。
-    let e = HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(false), 1))
+    let e = HvfMicroVm::assemble(assemble_config(bad_gic, synthetic_image(true), 1, false))
         .unwrap_err();
     assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
 
+    // 2. 不正 Image（magic 違反）: VM・GIC・RAM を作った後の失敗。
+    let e = HvfMicroVm::assemble(assemble_config(
+        layout.clone(),
+        synthetic_image(false),
+        1,
+        false,
+    ))
+    .unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+
     // 3. 解放済みなので正常な assemble が成功する（解放漏れなら 2 回目の HvVm::create が FailedPrecondition）。
-    let vm = HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1)).unwrap();
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1, false)).unwrap();
     drop(vm);
     drop(create_vm_or_precondition());
 

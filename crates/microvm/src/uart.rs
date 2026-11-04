@@ -6,7 +6,7 @@
 //! ([`SerialConsole::mmio_device`]。#3864・MVM-5)。HvfMicroVm への結線は後続（REPAIR-3）。
 //! `microvm::DeviceBus`（Linux のみ）が [`SerialConsole::port_device`] を
 //! `crate::dispatch::ExitDispatcher::register_pio` に `(COM1_BASE, UART_PORT_LEN, ..)` で常に登録し、
-//! ホストは `microvm::MicroVm::serial_console` / `microvm::RunningMicroVm::serial_console` で得た
+//! ホストは `microvm::MicroVm::serial_console` / `microvm::RunningMicroVm::serial_console`（macOS の MMIO 経路は `hvf::HvfMicroVm::serial_console`。#3882）で得た
 //! [`SerialConsole`] から出力を取り出す（#3740）。実機前提試験は `tests/kvm_device.rs`。
 //!
 //! # レジスタ

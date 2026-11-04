@@ -6,6 +6,7 @@
 # TASK-75.4.1 で microvm に start / stop（vCPU 実行ループ）を追加（依存は増やさない。unsafe なし）。
 # TASK-75.4.2 で起動失敗時の後始末の検証と ERR-1 の TIMEOUT 表記を追加（依存・feature は変えない。unsafe なし）。
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
+# #3867 で sys/hvf.rs の GICv3 の dlsym の前提を SAFETY に書き、GicApi の set_spi・config_create と GicConfig を pub(crate) に絞る（依存は増やさない。unsafe 追加なし）。
 # TASK-192.7・#3790 で boot_arm64 を追加（依存は増やさない。unsafe なし）。
 # TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
 # TASK-192.15（#3797）で hvf/microvm.rs（macOS の microVM 構成体）と SharedTransport の virtio_mmio への移動を追加（依存は増やさない。unsafe は増やさない）。

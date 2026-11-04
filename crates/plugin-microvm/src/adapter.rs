@@ -2,8 +2,11 @@
 //!
 //! 呼び出し元: `main.rs` が `frame_loop::serve_until` へ渡す。core 側 proxy（#1869 の設計）が送る要求の先頭要素
 //! （操作名）で分岐する暫定契約（本体 `Vec<String>`。型つき本体への置換は #1869 の設計・承認と実装 issue の起票は #2232）。
-//! microVM 本体の操作は [`MicrovmBackend`] 越しに `fandhe-container-microvm` へ委譲する（Linux は `KvmBackend`、他 OS は
-//! 常に `UNIMPLEMENTED` の `UnsupportedBackend`）。
+//! microVM 本体の操作は [`MicrovmBackend`] 越しに `fandhe-container-microvm` へ委譲する。backend は OS で分かれる:
+//! Linux は `KvmBackend`（同時 4 台・x86 bzImage）、macOS の aarch64 は `HvfBackend`（Hypervisor.framework。同時 1 台・
+//! arm64 Image・cmdline は 2047 バイトまで。TASK-192.18・#3800・MVM-5）、それ以外（macOS x86_64・Windows）は常に
+//! `UNIMPLEMENTED` の `UnsupportedBackend`。上限（同時台数・cmdline）は OS ではなく backend の性質として
+//! [`MicrovmBackend::VM_LIMIT`]・[`MicrovmBackend::CMDLINE_MAX_BYTES`] が持つ。
 //!
 //! # 操作（暫定ワイヤー契約・spec 未規定）
 //! | 操作 | 要求 | 応答 |
@@ -24,25 +27,29 @@
 //! 要素数 → id → 重複・上限 → 数値 → パス → イメージ読み込み → backend の順で fail-closed に検証する。エラー文言は固定で、
 //! id・パス・cmdline・I/O エラー文言を反射しない。イメージは symlink・非通常ファイルを拒否し、上限を読む前に判定する。
 //! unix では `/` から要素ごとに `openat(O_NOFOLLOW)` で辿り、祖先の symlink も拒否する（SEC-1。#3748）。
-//! 同時 VM 数は [`MAX_VMS`] で抑える。停止は [`STOP_DEADLINE`]（RPC 期限より短い。REPAIR-5）。
+//! 同時 VM 数は backend ごとの [`MicrovmBackend::VM_LIMIT`]（既定は [`MAX_VMS`]）で抑える。停止は [`STOP_DEADLINE`]（RPC 期限より短い。REPAIR-5）。
 //!
 //! # 注意・残余（REPAIR-3）
 //! - plugin プロセスは SIGUSR2 を使わない（microvm の `run_once` がプロセス全体の handler を入れる）。
 //! - stop が `TIMEOUT` の後、vCPU スレッドが自力で終わるまで資源（ゲスト RAM・fd）が残る。backend から終了を観測できないため、
-//!   期限切れで切り離した VM は、終了を観測するまで [`MAX_VMS`] の計数に残す（`detached`。資源上限。REPAIR-5）。
+//!   期限切れで切り離した VM は、終了を観測するまで [`MicrovmBackend::VM_LIMIT`] の計数に残す（`detached`。資源上限。REPAIR-5）。
 //!   終了の観測は `stop` の前に取った [`MicrovmBackend::ExitWatch`] への待たない照会（`VcpuExitWatch::state`。待ちの期限は 0）で行い、
 //!   契機は `start` 要求の上限判定の直前と [`MicrovmRuntimeAdapter::reclaim_detached`] の明示呼び出しだけ（監視スレッドは持たない。#3745）。
 //!   終了（`Released`）を観測したものだけ枠を返し、観測できない間は返さない（fail-closed）。
 //! - 残余: `KVM_RUN` や ioctl の中で D 状態のまま戻らない vCPU スレッドは `Pending` のままで枠は返らない（回復は plugin の再起動）。
 //!   microvm 側で memslot の削除に失敗した場合は、`Released` でもゲスト RAM の mapping が残りうる（microvm 側の fail-closed の既存仕様）。
-//!   非 Linux では VM を作れないため `detached` は生じない。
+//!   macOS（`HvfBackend`）では TIMEOUT の後に `detached` が生じ、枠は返らない（`Pending` 固定）。microvm が TIMEOUT 時にゲスト RAM の
+//!   対応付けをリークし、プロセスが終わるまで同じプロセスで VM を作り直せないため。回収は plugin の再起動で、後から回収する件は #3908。
+//!   `UnsupportedBackend`（macOS x86_64・Windows）では VM を作れないため `detached` は生じない。
+//! - macOS の Hypervisor.framework は 1 プロセスに 1 VM（#3783）。上限 1 の 2 台目は `RESOURCE_EXHAUSTED`（`too many microVMs`）で拒否する。
+//!   シリアル出力の取り出し・block / net・SMP は未接続。実機の記録は人間担当の #3803。
 //! - イメージ読み込みは別スレッドで走らせ [`IMAGE_READ_DEADLINE`] で `TIMEOUT` にする（REPAIR-5）。期限切れのスレッドは取り消せず、
 //!   I/O が戻るまで読み込みの枠（`MAX_INFLIGHT_READS`。adapter ごとの計数器で、本番は 1 adapter のためプロセス全体の上限と等価。#3900）を保持する。枠が尽きると、I/O が戻るまで（戻らなければ plugin の再起動まで）
 //!   `RESOURCE_EXHAUSTED` になる。
 //! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
-//!   Windows は祖先を検査せず、lstat の失敗の分類（`map_lstat_error`）も best-effort（reparse point は未検査。非 Linux の backend は `start` が `UNIMPLEMENTED` で VM は起動しない）。
-//! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
+//!   Windows は祖先を検査せず、lstat の失敗の分類（`map_lstat_error`）も best-effort（reparse point は未検査。Windows の backend は `UnsupportedBackend` で `start` が `UNIMPLEMENTED` のため VM は起動しない）。
+//! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）、実 Hypervisor.framework の通しは同じ `tests/e2e.rs` の macOS aarch64 の `#[ignore]` 試験（TASK-192.18・#3800）。
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -72,7 +79,7 @@ pub const REPLY_RUNNING: &str = "running";
 /// `stop` 成功の応答の先頭要素。
 pub const REPLY_STOPPED: &str = "stopped";
 
-/// 同時に動かす VM 数の上限（資源枯渇対策）。
+/// 同時に動かす VM 数の既定の上限（資源枯渇対策。Linux の KVM の値）。backend ごとの実効値は [`MicrovmBackend::VM_LIMIT`]。
 pub const MAX_VMS: usize = 4;
 /// RPC 期限から差し引く応答の余裕。
 pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
@@ -82,6 +89,12 @@ pub const STOP_DEADLINE: Duration = Duration::from_secs(5);
 pub const IMAGE_READ_DEADLINE: Duration = Duration::from_secs(3);
 /// 終了時の一括停止の合計予算。
 pub const STOP_ALL_BUDGET: Duration = Duration::from_secs(4);
+
+/// cmdline 本文の最大バイト数の既定（x86 boot protocol の `CMDLINE_CAPACITY` は NUL 込みの容量のため 1 引く）。
+const X86_CMDLINE_MAX_BYTES: usize = CMDLINE_CAPACITY as usize - 1;
+
+const _: () = assert!(MAX_VMS >= 1);
+const _: () = assert!(X86_CMDLINE_MAX_BYTES as u64 + 1 == CMDLINE_CAPACITY);
 
 const _: () = assert!(
     STOP_DEADLINE.as_secs() + RESPONSE_MARGIN.as_secs() < UDS_RPC_TIMEOUT_DEFAULT.as_secs()
@@ -133,7 +146,7 @@ pub struct BootSpec {
     pub vcpus: u32,
     /// ゲスト RAM のバイト数。
     pub mem_bytes: u64,
-    /// bzImage。
+    /// カーネルイメージ（x86 は bzImage、arm64 は Image。形式の検証は backend 側）。
     pub kernel: Vec<u8>,
     /// initrd（無ければ `None`）。
     pub initrd: Option<Vec<u8>>,
@@ -153,6 +166,13 @@ pub enum DetachedState {
 
 /// microVM 本体への委譲境界。3 OS でビルドでき、KVM なしの試験で差し替えられる。
 pub trait MicrovmBackend {
+    /// 同時に動かせる VM 数の上限（切り離し中の VM を含む）。上限は OS ではなく backend の性質で、既定は Linux（KVM）の
+    /// [`MAX_VMS`]。Hypervisor.framework は 1 プロセス 1 VM のため 1 に上書きする（#3783・#3800）。
+    const VM_LIMIT: usize = MAX_VMS;
+    /// cmdline 本文の最大バイト数。既定は x86 の 4095。arm64 は FDT の `bootargs` の上限 2047 に上書きする。
+    /// kernel と initrd の上限は全 backend 共通の `boot_x86::{MAX_KERNEL_IMAGE_BYTES, MAX_INITRD_BYTES}` で、
+    /// arm64 側（`boot_arm64`・`check_assemble_input`）も同じ値を使う（#3790）。
+    const CMDLINE_MAX_BYTES: usize = X86_CMDLINE_MAX_BYTES;
     /// 実行中 VM のハンドル。
     type Running;
     /// `stop` の後も有効な終了観測ハンドル。期限切れで切り離した VM の枠を返してよいかの判定に使う（#3745）。
@@ -231,17 +251,84 @@ impl MicrovmBackend for KvmBackend {
     }
 }
 
-/// 非 Linux の backend。start は常に `UNIMPLEMENTED`（fail-closed）。
-#[cfg(not(target_os = "linux"))]
+/// macOS（Apple Silicon）の Hypervisor.framework backend（TASK-192.18・#3800・MVM-5・PLUG-1）。
+///
+/// 呼び出し元は `main.rs`（`default_backend()`）。`fandhe_container_microvm::hvf::{HvfMicroVm, RunningHvfMicroVm}`（#3797・#3798）へ
+/// 委譲し、arm64 Image のヘッダ検証は microvm の `load_arm64`（#3790）に任せて adapter では重複させない。
+/// block / net / シリアルは付けない（Linux の `KvmBackend` と同じ。シリアル出力の取り出しは範囲外）。vCPU は 1 のみ。
+/// Hypervisor.framework は 1 プロセスに 1 VM のため [`MicrovmBackend::VM_LIMIT`] は 1（#3783）。
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+pub struct HvfBackend;
+
+/// `HvfBackend` の終了観測ハンドル。常に `Pending`（fail-closed）を返す。
+///
+/// microvm は stop が TIMEOUT のときゲスト RAM の対応付けを意図的にリークし、プロセスが終わるまで同じプロセスで VM を
+/// 作り直せない。終了を観測できないうえ枠を返してはいけないため `Pending` 固定とする。回収は plugin の再起動で、
+/// 後から回収する件は #3908。帰結: TIMEOUT の後の start は assemble の `FailedPrecondition` ではなく `RESOURCE_EXHAUSTED`。
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub struct HvfExitWatch(());
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MicrovmBackend for HvfBackend {
+    const VM_LIMIT: usize = 1;
+    const CMDLINE_MAX_BYTES: usize = fandhe_container_microvm::arm64_layout::ARM64_MAX_BOOTARGS;
+
+    type Running = fandhe_container_microvm::hvf::RunningHvfMicroVm<
+        fandhe_container_microvm::virtio_block::MemoryBlockBackend,
+        fandhe_container_microvm::virtio_net::MemoryNetBackend,
+    >;
+    type ExitWatch = HvfExitWatch;
+
+    fn start(&mut self, spec: BootSpec) -> Result<Self::Running, MicrovmError> {
+        use fandhe_container_microvm::arm64_layout::Arm64Layout;
+        use fandhe_container_microvm::hvf::{HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig};
+        use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+        use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+        let layout = Arm64Layout::new(spec.mem_bytes, spec.vcpus, 0)?;
+        let config = HvfMicroVmConfig::<MemoryBlockBackend, MemoryNetBackend> {
+            layout,
+            kernel: spec.kernel,
+            initrd: spec.initrd,
+            cmdline: spec.cmdline,
+            block: Vec::new(),
+            net: Vec::new(),
+            vcpu: VcpuThreadConfig::default(),
+            serial: false,
+        };
+        HvfMicroVm::assemble(config)?.start()
+    }
+
+    fn stop(
+        &mut self,
+        vm: Self::Running,
+        deadline: Duration,
+    ) -> Result<&'static str, MicrovmError> {
+        vm.stop(deadline).map(|r| r.reason.as_str())
+    }
+
+    fn exit_watch(&self, _vm: &Self::Running) -> Self::ExitWatch {
+        HvfExitWatch(())
+    }
+
+    fn exit_state(&self, _watch: &Self::ExitWatch) -> DetachedState {
+        DetachedState::Pending
+    }
+}
+
+/// Linux でも macOS aarch64 でもない OS（macOS x86_64・Windows）の backend。start は常に `UNIMPLEMENTED`（fail-closed）。
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 #[derive(Debug, Default)]
 pub struct UnsupportedBackend;
 
-/// 到達不能な実行中ハンドル（非 Linux では VM を作れない）。
-#[cfg(not(target_os = "linux"))]
+/// 到達不能な実行中ハンドル（`UnsupportedBackend` では VM を作れない）。
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 #[derive(Debug)]
 pub enum NeverRunning {}
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 impl MicrovmBackend for UnsupportedBackend {
     type Running = NeverRunning;
     type ExitWatch = NeverRunning;
@@ -249,7 +336,7 @@ impl MicrovmBackend for UnsupportedBackend {
     fn start(&mut self, _spec: BootSpec) -> Result<Self::Running, MicrovmError> {
         Err(MicrovmError::new(
             MicrovmErrorCode::Unimplemented,
-            "microVM is only supported on Linux",
+            "microVM is not supported on this platform",
         ))
     }
 
@@ -274,7 +361,10 @@ impl MicrovmBackend for UnsupportedBackend {
 #[cfg(target_os = "linux")]
 pub type DefaultBackend = KvmBackend;
 /// `main.rs` が使う OS 既定の backend 型。
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub type DefaultBackend = HvfBackend;
+/// `main.rs` が使う OS 既定の backend 型。
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 pub type DefaultBackend = UnsupportedBackend;
 
 /// OS 既定の backend を作る。
@@ -574,8 +664,8 @@ pub struct StopAllReport {
 pub struct MicrovmRuntimeAdapter<B: MicrovmBackend> {
     backend: B,
     vms: BTreeMap<String, B::Running>,
-    /// 停止が期限切れで切り離された（終了未観測の）VM の観測ハンドル。件数を [`MAX_VMS`] の計数に含める。
-    /// `vms.len() + detached.len() <= MAX_VMS` が保たれるため、長さは上限で抑えられる。
+    /// 停止が期限切れで切り離された（終了未観測の）VM の観測ハンドル。件数を [`MicrovmBackend::VM_LIMIT`] の計数に含める。
+    /// `vms.len() + detached.len() <= B::VM_LIMIT` が保たれるため、長さは上限で抑えられる。
     detached: Vec<B::ExitWatch>,
     /// イメージ読み込みスレッドの枠（adapter ごと。#3900）。
     reads: ReadLimiter,
@@ -606,7 +696,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         self.detached.len()
     }
 
-    /// 終了を観測できた切り離し VM の枠を返し、返した件数を返す。待たない照会のみ（O(MAX_VMS)。冪等）。
+    /// 終了を観測できた切り離し VM の枠を返し、返した件数を返す。待たない照会のみ（O(VM_LIMIT)。冪等）。
     /// `start` の上限判定の直前から呼ばれる（#3745・REPAIR-5）。
     pub fn reclaim_detached(&mut self) -> usize {
         let before = self.detached.len();
@@ -677,7 +767,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
             return Err(perr(PluginErrorCode::AlreadyExists, MSG_EXISTS));
         }
         self.reclaim_detached();
-        if self.vms.len().saturating_add(self.detached.len()) >= MAX_VMS {
+        if self.vms.len().saturating_add(self.detached.len()) >= B::VM_LIMIT {
             return Err(perr(PluginErrorCode::ResourceExhausted, MSG_LIMIT));
         }
         let vcpus = parse_digits(vcpus, VCPUS_MAX_DIGITS)?;
@@ -692,7 +782,7 @@ impl<B: MicrovmBackend> MicrovmRuntimeAdapter<B> {
         if vcpus != 1 {
             return Err(perr(PluginErrorCode::Unimplemented, MSG_MULTI_VCPU));
         }
-        if cmdline.len() as u64 >= CMDLINE_CAPACITY {
+        if cmdline.len() > B::CMDLINE_MAX_BYTES {
             return Err(invalid(MSG_BAD_CMDLINE));
         }
         let kernel_path = validate_path(kernel)?;
@@ -1575,8 +1665,8 @@ mod tests {
         );
     }
 
-    /// 非 Linux: start は UNIMPLEMENTED。
-    #[cfg(not(target_os = "linux"))]
+    /// Linux でも macOS aarch64 でもない OS: start は UNIMPLEMENTED。
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
     #[test]
     fn task117_2_mvm1_unsupported_backend_start_is_unimplemented() {
         let t = Tmp::new("unsupported");
@@ -1584,5 +1674,111 @@ mod tests {
         let mut a = MicrovmRuntimeAdapter::new(default_backend());
         let e = a.handle(&start_req("a", &k)).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Unimplemented);
+    }
+
+    /// 上限 1・arm64 の cmdline 上限（2047）を持つ試験用 backend（`HvfBackend` と同じ定数。実機に触れない。TASK-192.18・#3800）。
+    #[derive(Default)]
+    struct SingleVmArm64(FakeBackend);
+
+    impl MicrovmBackend for SingleVmArm64 {
+        const VM_LIMIT: usize = 1;
+        const CMDLINE_MAX_BYTES: usize = 2047;
+        type Running = u32;
+        type ExitWatch = u32;
+        fn start(&mut self, spec: BootSpec) -> Result<u32, MicrovmError> {
+            self.0.start(spec)
+        }
+        fn stop(&mut self, vm: u32, d: Duration) -> Result<&'static str, MicrovmError> {
+            self.0.stop(vm, d)
+        }
+        fn exit_watch(&self, vm: &u32) -> u32 {
+            self.0.exit_watch(vm)
+        }
+        fn exit_state(&self, w: &u32) -> DetachedState {
+            self.0.exit_state(w)
+        }
+    }
+
+    /// MVM-5・PLUG-1（#3800）: 上限 1 の backend は 2 台目を `too many microVMs` で拒否し、stop すれば再び start できる。
+    /// TIMEOUT で切り離した VM が `Pending` の間は枠が返らず、start は拒否され続ける。
+    #[test]
+    fn mvm5_3800_single_vm_backend_rejects_second_start() {
+        let t = Tmp::new("single3800");
+        let k = t.file("k", b"K");
+        let mut a = MicrovmRuntimeAdapter::new(SingleVmArm64::default());
+        assert_eq!(a.handle(&start_req("a", &k)).expect("1st"), s(&["running"]));
+        let e = a.handle(&start_req("b", &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "too many microVMs");
+        assert_eq!(a.backend.0.starts, 1);
+        assert_eq!(
+            a.handle(&s(&["stop", "a"])).expect("stop"),
+            s(&["stopped", "requested"])
+        );
+        assert_eq!(
+            a.handle(&start_req("b", &k)).expect("again"),
+            s(&["running"])
+        );
+        // TIMEOUT: 切り離され、Pending の間は枠が返らない。
+        a.backend.0.stop_err = Some(MicrovmErrorCode::DeadlineExceeded);
+        let e = a.handle(&s(&["stop", "b"])).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::Timeout);
+        assert_eq!(a.detached(), 1);
+        for _ in 0..2 {
+            let e = a.handle(&start_req("c", &k)).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::ResourceExhausted);
+            assert_eq!(e.message(), "too many microVMs");
+        }
+        assert_eq!(a.backend.0.starts, 2);
+    }
+
+    /// MVM-5・MVM-1（#3800）: cmdline の上限は backend ごと。既定（x86）は 4095 まで、arm64 の backend は 2047 まで。
+    /// 拒否はイメージを読む前（存在しないパスでも `invalid kernel cmdline`）で、backend の start は呼ばれない。
+    #[test]
+    fn mvm5_3800_cmdline_limit_is_per_backend() {
+        let t = Tmp::new("cmdline3800");
+        let k = t.file("k", b"K");
+        let req =
+            |len: usize, kernel: &str| s(&["start", "a", kernel, "", &"x".repeat(len), "1", "64"]);
+        let mut x86 = adapter();
+        let e = x86.handle(&req(4096, &k)).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "invalid kernel cmdline");
+        assert_eq!(x86.handle(&req(4095, &k)).expect("4095"), s(&["running"]));
+
+        let mut arm = MicrovmRuntimeAdapter::new(SingleVmArm64::default());
+        let e = arm.handle(&req(2048, "/nonexistent/kernel")).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "invalid kernel cmdline");
+        assert_eq!(arm.backend.0.starts, 0);
+        assert_eq!(arm.handle(&req(2047, &k)).expect("2047"), s(&["running"]));
+    }
+
+    /// 既定の上限は Linux（KVM）の値のまま（MVM-1。Linux の挙動を変えない回帰）。
+    #[test]
+    fn mvm5_3800_default_limits_are_kvm_values() {
+        assert_eq!(<FakeBackend as MicrovmBackend>::VM_LIMIT, 4);
+        assert_eq!(<FakeBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 4095);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mvm5_3800_kvm_backend_keeps_default_limits() {
+        assert_eq!(<KvmBackend as MicrovmBackend>::VM_LIMIT, 4);
+        assert_eq!(<KvmBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 4095);
+    }
+
+    /// macOS aarch64: `HvfBackend` の上限・既定 backend・終了観測（`hv_*` を呼ばないので署名なしの既定集合で走る）。
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mvm5_3800_hvf_backend_limits_and_default() {
+        assert_eq!(<HvfBackend as MicrovmBackend>::VM_LIMIT, 1);
+        assert_eq!(<HvfBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 2047);
+        assert_eq!(
+            std::any::type_name::<DefaultBackend>(),
+            std::any::type_name::<HvfBackend>()
+        );
+        let b = HvfBackend;
+        assert_eq!(b.exit_state(&HvfExitWatch(())), DetachedState::Pending);
     }
 }

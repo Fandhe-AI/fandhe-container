@@ -22,6 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// 合成 arm64 Image の正本（`tests/support/arm64_image.rs`。plugin-microvm の E2E と共有。複製しない・#3800）。
+#[path = "support/arm64_image.rs"]
+mod arm64_image;
+use arm64_image::{synthetic_image, synthetic_image_with_code};
+
 /// VM を作る。権限不足・hypervisor 不可は環境の問題として、決まった 1 行目で失敗させる。
 fn create_vm_or_precondition() -> HvVm {
     match HvVm::create() {
@@ -997,33 +1002,6 @@ impl Drop for Watchdog {
             let _ = h.join();
         }
     }
-}
-
-/// 合成の arm64 Image。先頭の命令は `b .`（自分自身への分岐）で、ゲストはその場で走り続ける。
-/// ヘッダ（64 バイト）: offset 0 = code0、8 = text_offset、16 = image_size、24 = flags、56 = magic（`ARM\x64`）。
-fn synthetic_image(magic_ok: bool) -> Vec<u8> {
-    synthetic_image_with_code(magic_ok, &[])
-}
-
-/// [`synthetic_image`] の先頭を `b +0x40` にし、ヘッダの直後（offset 0x40）へ `code` を置いたもの（`code` が空なら `b .`）。
-fn synthetic_image_with_code(magic_ok: bool, code: &[u32]) -> Vec<u8> {
-    use fandhe_container_microvm::boot_arm64::ARM64_IMAGE_MAGIC;
-    let mut img = vec![0u8; 4096];
-    let first: u32 = if code.is_empty() {
-        0x1400_0000
-    } else {
-        0x1400_0010
-    };
-    img[0..4].copy_from_slice(&first.to_le_bytes());
-    for (i, w) in code.iter().enumerate() {
-        img[0x40 + i * 4..0x44 + i * 4].copy_from_slice(&w.to_le_bytes());
-    }
-    img[8..16].copy_from_slice(&0x8_0000u64.to_le_bytes());
-    img[16..24].copy_from_slice(&4096u64.to_le_bytes());
-    // flags = 0（リトルエンディアン・ページサイズ未指定）のまま。
-    let magic = if magic_ok { ARM64_IMAGE_MAGIC } else { 0 };
-    img[56..60].copy_from_slice(&magic.to_le_bytes());
-    img
 }
 
 fn assemble_config(

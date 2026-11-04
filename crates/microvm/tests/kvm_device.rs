@@ -811,7 +811,7 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
             .unwrap(),
         0x2000
     );
-    let want = "console=ttyS0 virtio_mmio.device=0x1000@0xd0000000:5 virtio_mmio.device=0x1000@0xd0001000:6\0";
+    let want = "console=ttyS0 no_timer_check virtio_mmio.device=0x1000@0xd0000000:5 virtio_mmio.device=0x1000@0xd0001000:6\0";
     assert_eq!(read(0x2_0000, want.len()), want.as_bytes().to_vec());
 }
 

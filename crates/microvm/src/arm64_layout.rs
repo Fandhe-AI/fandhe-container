@@ -65,7 +65,8 @@ pub const ARM64_SERIAL_CLOCK_HZ: u32 = 1_843_200;
 pub const ARM64_MAX_VCPUS: u32 = 64;
 /// virtio-mmio の窓の刻み（設定空間 0x100 とレジスタ 0x100 を収める）。
 pub const ARM64_VIRTIO_MMIO_STRIDE: u64 = 0x200;
-/// virtio-mmio の個数の上限。
+/// virtio-mmio の個数の上限。macOS バックエンドでシリアルを有効にすると MMIO 表（`dispatch::MAX_BUS_DEVICES` = 32）を
+/// 1 枠使うため、そのときの実効上限は 31（#3882・MVM-5。32 台はシリアルなしのときだけ）。
 pub const ARM64_VIRTIO_MMIO_MAX: u32 = 32;
 /// virtio-mmio の最初の SPI 番号（DT のセル値。GIC の INTID は 32 + n）。
 pub const ARM64_VIRTIO_SPI_BASE: u32 = 16;

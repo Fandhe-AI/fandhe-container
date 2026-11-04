@@ -2515,7 +2515,9 @@ mod arm64_image;
 
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
-    use super::arm64_image::{synthetic_image, synthetic_image_with_code};
+    use super::arm64_image::{
+        BOOT_CHECK_CODE, image_with_code, synthetic_image, synthetic_image_with_code,
+    };
     use super::*;
     use fandhe_container_microvm::arm64_layout::{
         ARM64_GIC_DIST_BASE, ARM64_GIC_REDIST_BASE, ARM64_RAM_BASE,
@@ -2700,5 +2702,49 @@ mod arm64 {
         let report = running.stop(Duration::from_secs(5)).unwrap();
         assert_eq!(report.reason, StopReason::GuestShutdown);
         assert_eq!(report.stats.errors, 0);
+    }
+
+    /// 起動確認ゲスト（FDT の magic・virtio の MagicValue と DeviceID を確かめてから THR へ `OK\n`、続けて SYSTEM_OFF）を
+    /// 走らせ、停止までの UART の出力と取りこぼし数・停止理由・errors を返す。`running` 側のハンドルの出力も同じバッファ。
+    fn run_boot_check(block: usize) -> (Vec<u8>, u64, StopReason, u64) {
+        let mut vm = assemble(block, 0);
+        let serial = vm.serial_console();
+        let img = image_with_code(&BOOT_CHECK_CODE);
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let running = vm.start(&loaded).unwrap();
+        let running_serial = running.serial_console();
+        assert!(wait_until(Duration::from_secs(5), || running.is_finished()));
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        let from_running = running_serial.take_output().unwrap();
+        let dropped = serial.stats().unwrap().dropped_bytes;
+        // running 側で先に取り出したので、MicroVm 側のハンドルは空（同じバッファを指す証拠）。
+        let leftover = serial.take_output().unwrap();
+        assert!(leftover.is_empty(), "serial handles must share one buffer");
+        (from_running, dropped, report.reason, report.stats.errors)
+    }
+
+    /// MVM-1・#3898: MMIO のシリアル（`0x0900_0000`）が結線され、合成ゲストの THR への書き込み `OK\n` が
+    /// `serial_console().take_output()` で具体値のまま取り出せ、取りこぼしは 0。FDT の magic と virtio の MagicValue・
+    /// DeviceID の検査を通ったときだけ出る。実カーネルでの確認は `kernel_boot`。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn kvm_device_arm64_serial_boot_check_writes_thr() {
+        let (out, dropped, reason, errors) = run_boot_check(1);
+        assert_eq!(out, b"OK\n");
+        assert_eq!(dropped, 0);
+        assert_eq!(reason, StopReason::GuestShutdown);
+        assert_eq!(errors, 0);
+    }
+
+    /// MVM-1・#3898: 負の対照。virtio を 0 台にすると窓が未登録（0xFF 埋め）で検査に失敗し、THR に何も書かずに
+    /// SYSTEM_OFF する。出力が空であることで、上の `OK\n` がゲストの検査を経たものだと裏づける。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn kvm_device_arm64_serial_boot_check_fails_without_block() {
+        let (out, dropped, reason, errors) = run_boot_check(0);
+        assert!(out.is_empty());
+        assert_eq!(dropped, 0);
+        assert_eq!(reason, StopReason::GuestShutdown);
+        assert_eq!(errors, 0);
     }
 }

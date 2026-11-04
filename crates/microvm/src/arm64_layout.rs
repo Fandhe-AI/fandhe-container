@@ -26,6 +26,9 @@
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
 //!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
+//! - [`SerialInterrupt::Polled`]（#3898・MVM-1）: KVM aarch64 は線が未結線のため `interrupts` を出さない配置を使う。
+//!   Linux の 8250 は irq = 0 で timer ポーリングになる（一次情報は kernel_boot の doc）。線の結線は #3943（REPAIR-3）。
+//!
 //! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
 //! `hvf_smp`〔#3891〕）で起動する。実ゲストでの確認は #3803。
 //! PCI・IPA 上限の確定（#3803）。
@@ -69,8 +72,8 @@ pub const ARM64_SERIAL_CLOCK_HZ: u32 = 1_843_200;
 pub const ARM64_MAX_VCPUS: u32 = 64;
 /// virtio-mmio の窓の刻み（設定空間 0x100 とレジスタ 0x100 を収める）。
 pub const ARM64_VIRTIO_MMIO_STRIDE: u64 = 0x200;
-/// virtio-mmio の個数の上限。macOS バックエンドでシリアルを有効にすると MMIO 表（`dispatch::MAX_BUS_DEVICES` = 32）を
-/// 1 枠使うため、そのときの実効上限は 31（#3882・MVM-5。32 台はシリアルなしのときだけ）。
+/// virtio-mmio の個数の上限。シリアルを有効にすると MMIO 表（`dispatch::MAX_BUS_DEVICES` = 32）を
+/// 1 枠使うため、そのときの実効上限は 31（#3882・#3898・MVM-5。32 台はシリアルなしのときだけ）。
 pub const ARM64_VIRTIO_MMIO_MAX: u32 = 32;
 /// virtio-mmio の最初の SPI 番号（DT のセル値。GIC の INTID は 32 + n）。
 pub const ARM64_VIRTIO_SPI_BASE: u32 = 16;
@@ -207,6 +210,17 @@ impl GuestSpi {
     }
 }
 
+/// シリアルの割り込みの広告方式（#3898・MVM-1）。FDT は実体のある割り込みだけを広告する（fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialInterrupt {
+    /// level-high の SPI を FDT に出す（#3892。線を駆動できる macOS の HVF 用。既定）。
+    LevelSpi,
+    /// `interrupts` を FDT に出さない（ゲストの 8250 は timer のポーリングで動く）。KVM aarch64 は線が未結線のため
+    /// こちらを使う（結線は後続 issue。REPAIR-3）。`serial_spi()` は `None` になり、HVF の `serial_line` は
+    /// `InvalidArgument("serial is not configured")` で拒否する（HVF にこの配置を渡しても fail-closed）。
+    Polled,
+}
+
 /// arm64 ゲストの物理アドレス配置。フィールドは異常系の試験のため pub。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64Layout {
@@ -232,6 +246,8 @@ pub struct Arm64Layout {
     pub ipa_limit: u64,
     /// 8250 互換シリアルの MMIO 窓。`Some` のときだけ FDT に載せる（#3864）。
     pub serial: Option<MmioRegion>,
+    /// シリアルの割り込みの広告方式。既定は [`SerialInterrupt::LevelSpi`]（#3898）。
+    pub serial_interrupt: SerialInterrupt,
 }
 
 impl Arm64Layout {
@@ -252,6 +268,7 @@ impl Arm64Layout {
             vcpus,
             ipa_limit: ARM64_DEFAULT_IPA_LIMIT,
             serial: None,
+            serial_interrupt: SerialInterrupt::LevelSpi,
         };
         layout.validate()?;
         Ok(layout)
@@ -260,6 +277,14 @@ impl Arm64Layout {
     /// 既定の窓（[`ARM64_SERIAL_BASE`]・[`ARM64_SERIAL_SIZE`]）でシリアルを有効にし、[`Self::validate`] を通して返す。
     pub fn with_default_serial(mut self) -> Result<Self, MicrovmError> {
         self.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// 既定の窓でシリアルを有効にし、割り込みを FDT に出さない（ポーリング）。KVM aarch64 用（#3898・MVM-1）。
+    pub fn with_default_serial_polled(mut self) -> Result<Self, MicrovmError> {
+        self.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
+        self.serial_interrupt = SerialInterrupt::Polled;
         self.validate()?;
         Ok(self)
     }
@@ -275,9 +300,12 @@ impl Arm64Layout {
         })
     }
 
-    /// シリアルの SPI（`serial` が `Some` のときだけ。#3892）。
+    /// シリアルの SPI（`serial` が `Some` で `LevelSpi` のときだけ。`Polled` は `None`。#3892・#3898）。
     pub fn serial_spi(&self) -> Option<GuestSpi> {
-        self.serial.map(|_| GuestSpi(ARM64_SERIAL_SPI))
+        match self.serial_interrupt {
+            SerialInterrupt::LevelSpi => self.serial.map(|_| GuestSpi(ARM64_SERIAL_SPI)),
+            SerialInterrupt::Polled => None,
+        }
     }
 
     /// シリアルの SPI が API の範囲に収まるか検査する（VM 作成の前に呼ぶ。`serial` 無しは常に `Ok`。#3892）。
@@ -348,7 +376,7 @@ impl Arm64Layout {
             return Err(invalid("virtio spi number exceeds the gic range"));
         }
         // シリアルの SPI が virtio の範囲と重なると同じ INTID を共有する（#3892）。
-        if self.serial.is_some()
+        if self.serial_spi().is_some()
             && ARM64_SERIAL_SPI >= self.virtio_spi_base
             && ARM64_SERIAL_SPI < last_spi
         {
@@ -701,10 +729,13 @@ pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmEr
         b.property_u32("reg-shift", 0)?;
         b.property_u32("reg-io-width", 1)?;
         b.property_u32("clock-frequency", ARM64_SERIAL_CLOCK_HZ)?;
-        b.property_cells(
-            "interrupts",
-            &[GIC_SPI, ARM64_SERIAL_SPI, IRQ_TYPE_LEVEL_HIGH],
-        )?;
+        // Polled は interrupts を出さない（届かない割り込みを広告しない。#3898）。
+        if l.serial_interrupt == SerialInterrupt::LevelSpi {
+            b.property_cells(
+                "interrupts",
+                &[GIC_SPI, ARM64_SERIAL_SPI, IRQ_TYPE_LEVEL_HIGH],
+            )?;
+        }
         b.end_node()?;
     }
 
@@ -1138,5 +1169,54 @@ mod tests {
         assert_eq!(e.code(), MicrovmErrorCode::Internal);
         let none = Arm64Layout::new(256 * MIB, 1, 2).unwrap();
         assert!(none.check_serial_spi_range(48, 0).is_ok());
+    }
+
+    /// MVM-1・#3898: Polled のシリアルは FDT に interrupts を出さない（対照の LevelSpi は [0, 1, 4]）。
+    #[test]
+    fn mvm1_3898_fdt_polled_serial_has_no_interrupts() {
+        let polled = Arm64Layout::new(256 * MIB, 1, 2)
+            .unwrap()
+            .with_default_serial_polled()
+            .unwrap();
+        assert_eq!(polled.serial, Some(MmioRegion::new(0x0900_0000, 0x1000)));
+        assert_eq!(polled.serial_interrupt, SerialInterrupt::Polled);
+        let level = Arm64Layout::new(256 * MIB, 1, 2)
+            .unwrap()
+            .with_default_serial()
+            .unwrap();
+        let fdt = |l: &Arm64Layout| {
+            let cfg = GuestFdtConfig {
+                layout: l,
+                bootargs: "console=ttyS0",
+                initrd: None,
+            };
+            build_guest_fdt(&cfg).unwrap()
+        };
+        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        let p = fdt(&polled);
+        let v = fdt(&level);
+        assert!(contains(&p, b"ns16550a"));
+        assert!(contains(&p, b"/serial@9000000"));
+        // serial ノードの interrupts セル [GIC_SPI=0, SPI 1, LEVEL_HIGH=4] の有無で比べる。
+        let cells: Vec<u8> = [0u32, 1, 4].iter().flat_map(|c| c.to_be_bytes()).collect();
+        assert!(contains(&v, &cells));
+        assert!(!contains(&p, &cells));
+        // プロパティ 1 つ分（ヘッダ 12 バイト + 値 12 バイト）だけ短い（名前文字列は他ノードと共有）。
+        assert_eq!(v.len() - p.len(), 24);
+    }
+
+    /// MVM-1・#3898: Polled では SPI を持たず、重なり・範囲の検査は何もしない。
+    #[test]
+    fn mvm1_3898_polled_serial_has_no_spi() {
+        let mut l = Arm64Layout::new(256 * MIB, 1, 2)
+            .unwrap()
+            .with_default_serial_polled()
+            .unwrap();
+        assert_eq!(l.serial_spi(), None);
+        assert!(l.check_serial_spi_range(32, 0).is_ok());
+        l.virtio_spi_base = 0;
+        assert!(l.validate().is_ok());
+        l.serial_interrupt = SerialInterrupt::LevelSpi;
+        expect_invalid(&l, "serial spi overlaps the virtio spi range");
     }
 }

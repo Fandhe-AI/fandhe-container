@@ -1150,7 +1150,7 @@ pub(crate) fn kvm_create_irqchip(vm: BorrowedFd<'_>) -> Result<(), SysError> {
 
 /// `KVM_IRQ_LINE`（VM fd。x86_64 のみ。in-kernel irqchip が前提）。GSI `irq` の線を `level` に駆動する。
 /// edge 注入の `KVM_IRQFD` と違い、線の値そのものを持つので level 線（`LevelInterruptLine`）に使える（#3918・MVM-1）。
-/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式で、vGIC の irqfd〔#3696〕。シリアルの割り込みは #3898）。
+/// irqchip が無い VM fd では `ENXIO`。他 arch は `Unsupported`（aarch64 の線は別方式で、vGIC の irqfd〔#3696〕。シリアルの割り込みは #3943）。
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn kvm_irq_line(vm: BorrowedFd<'_>, irq: u32, level: bool) -> Result<(), SysError> {
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]

@@ -53,12 +53,41 @@
 //! IOAPIC モードになり、Linux の `check_timer` が PIT 無しで失敗して止まる可能性が高い。止まる場合は `_CMDLINE` で
 //! `no_timer_check`（必要なら `tsc=reliable`）を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
 //! device model 側の別 issue として扱う。
-//! aarch64 は `mod arm64`（#3897。陽性と initrd 無しの負の対照の 2 件。シリアル marker は #3898、SMP は #3899 の後）。
+//! aarch64 は `mod arm64`（#3897・#3898。陽性と initrd 無しの負の対照の 2 件。`console=ttyS0` で FDT の `ns16550a` を選び、
+//! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。SMP は #3899 の後）。シリアルはポーリング（FDT に `interrupts` 無し。
+//! Linux の 8250 は irq = 0 で timer ポーリング）で、送信は timer の周期ごとに進む。`/init` は write の直後に reboot するため、
+//! marker が出切る前に `GuestShutdown` になり marker 0 回で落ちた場合は、試験の欠陥ではなく割り込み未結線の帰結で、#3943 で直す。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
+/// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
+/// x86_64 と aarch64 の試験が共有する（#3898。複製しない・REPAIR-1）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const MARKER: &str = "fandhe-microvm-test: init ok v1";
+
+/// 行単位の完全一致の件数（tty の ONLCR による `\r\n` を許容。部分一致・混入は数えない）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn count_marker_lines(output: &[u8], marker: &str) -> usize {
+    output
+        .split(|b| *b == b'\n')
+        .filter(|line| line.strip_suffix(b"\r").unwrap_or(line) == marker.as_bytes())
+        .count()
+}
+
+/// 非信頼のゲスト出力を、末尾 `n` バイトだけエスケープして診断に載せる（端末制御の注入を防ぐ）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn escape_tail(output: &[u8], n: usize) -> String {
+    let start = output.len().saturating_sub(n);
+    output
+        .get(start..)
+        .unwrap_or(&[])
+        .escape_ascii()
+        .to_string()
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
+    use super::{MARKER, count_marker_lines, escape_tail};
     use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_microvm::exit::{ExitData, ExitValue};
@@ -75,8 +104,6 @@ mod x86 {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    /// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
-    const MARKER: &str = "fandhe-microvm-test: init ok v1";
     /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
     /// `block_sentinel`（単体テストで照合）。
     const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
@@ -190,24 +217,6 @@ mod x86 {
                     .ends_with(suffix.as_bytes())
             })
             .count()
-    }
-
-    /// 行単位の完全一致の件数（tty の ONLCR による `\r\n` を許容。部分一致・混入は数えない）。
-    fn count_marker_lines(output: &[u8], marker: &str) -> usize {
-        output
-            .split(|b| *b == b'\n')
-            .filter(|line| line.strip_suffix(b"\r").unwrap_or(line) == marker.as_bytes())
-            .count()
-    }
-
-    /// 非信頼のゲスト出力を、末尾 `n` バイトだけエスケープして診断に載せる（端末制御の注入を防ぐ）。
-    fn escape_tail(output: &[u8], n: usize) -> String {
-        let start = output.len().saturating_sub(n);
-        output
-            .get(start..)
-            .unwrap_or(&[])
-            .escape_ascii()
-            .to_string()
     }
 
     struct Outcome {
@@ -1464,12 +1473,13 @@ mod x86 {
 /// write の後に `reboot(RESTART)`）で `assemble` → `load_kernel` → `start` を通し、PSCI SYSTEM_RESET が
 /// `KVM_EXIT_SYSTEM_EVENT` として `StopReason::GuestShutdown` に分類されること（#3896）を照合する。
 /// ホスト要件: Linux aarch64・`/dev/kvm` の読み書き（root 不要）・in-kernel vGICv3（GICv2 のみのホストは `assemble` で失敗）・
-/// `KVM_CAP_ARM_PSCI_0_2`。シリアルは aarch64 では未結線（#3898）のため marker は照合しない。判定は停止理由・起点 vCPU・
-/// エラー件数・期限内で行う。範囲外: SMP（#3899）・virtio・シリアル marker（#3898）。
+/// `KVM_CAP_ARM_PSCI_0_2`。シリアルは MMIO の ns16550a をポーリングで結線済み（#3898。割り込みは #3943）で、停止理由・起点 vCPU・
+/// エラー件数・期限に加え、marker の回数と UART の取りこぼし 0 を照合する。範囲外: SMP（#3899）・virtio。
 /// x86 の同名ヘルパーと同じ契約の入力検査を複製している（x86 側の件数・挙動を変えないため）。
 /// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
+    use super::{MARKER, count_marker_lines, escape_tail};
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
@@ -1481,8 +1491,11 @@ mod arm64 {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// `panic=` を含まない無害な既定値。x86 の `console=ttyS0 reboot=t` は arm64 に当たらず、FDT に serial ノードも無い。
-    const DEFAULT_CMDLINE: &str = "rdinit=/init";
+    /// `panic=` を含まない無害な既定値。x86 の `reboot=t` は arm64 に当たらない。`console=ttyS0` は FDT の `ns16550a`
+    /// （`/chosen/stdout-path`。#3898）を 8250 のコンソールとして選ぶ。
+    const DEFAULT_CMDLINE: &str = "console=ttyS0 rdinit=/init";
+    /// UART の出力の蓄積の上限（x86 と同じ。超過は Err にして無制限確保を避ける。REPAIR-5）。
+    const OUTPUT_CAP: usize = 4 << 20;
     const DEFAULT_TIMEOUT_SECS: u64 = 60;
     /// `MicroVmConfig` に既定値が無いため x86 と同じ 256 MiB とする。
     const RAM_SIZE: u64 = 256 << 20;
@@ -1615,21 +1628,26 @@ mod arm64 {
         vcpu_count: u32,
         errors: u64,
         exits: u64,
+        output: Vec<u8>,
+        uart_dropped: u64,
         timed_out: bool,
         elapsed: Duration,
     }
 
     impl Outcome {
-        /// 数値だけの診断（ゲスト由来の文字列は載せない）。
+        /// 診断。ゲスト由来の出力は末尾 4096 バイトだけをエスケープして載せる。
         fn diag(&self) -> String {
             format!(
-                "reason={:?} origin={:?} errors={} exits={} elapsed={:?} timed_out={}",
+                "reason={:?} origin={:?} errors={} exits={} elapsed={:?} timed_out={} uart_dropped={} output_len={} tail={}",
                 self.reason,
                 self.origin_vcpu,
                 self.errors,
                 self.exits,
                 self.elapsed,
-                self.timed_out
+                self.timed_out,
+                self.uart_dropped,
+                self.output.len(),
+                escape_tail(&self.output, 4096)
             )
         }
     }
@@ -1647,11 +1665,21 @@ mod arm64 {
         let loaded = vm
             .load_kernel(&inp.kernel, inp.initrd.as_deref(), &cmdline)
             .map_err(|e| format!("load_kernel failed: {e}"))?;
+        // start の前に取っておく（停止後も clone がバッファを保持する）。
+        let serial = vm.serial_console();
         let running = vm
             .start(&loaded)
             .map_err(|e| format!("start failed: {e}"))?;
+        let mut output: Vec<u8> = Vec::new();
         let mut timed_out = false;
         loop {
+            let chunk = serial
+                .take_output()
+                .map_err(|e| format!("take_output failed: {e}"))?;
+            output.extend_from_slice(&chunk);
+            if output.len() > OUTPUT_CAP {
+                return Err("guest serial output exceeded the test cap".into());
+            }
             if running.is_finished() {
                 break;
             }
@@ -1665,12 +1693,23 @@ mod arm64 {
         let report = running
             .stop(STOP_DEADLINE)
             .map_err(|e| format!("stop failed: {e}"))?;
+        // 停止までの出力を取り切る（停止の報告は vCPU スレッドの送信完了後なので欠けない）。
+        let tail = serial
+            .take_output()
+            .map_err(|e| format!("take_output failed: {e}"))?;
+        output.extend_from_slice(&tail);
+        let uart_dropped = serial
+            .stats()
+            .map_err(|e| format!("uart stats failed: {e}"))?
+            .dropped_bytes;
         Ok(Outcome {
             reason: report.reason,
             origin_vcpu: report.origin_vcpu,
             vcpu_count: report.vcpu_count,
             errors: report.stats.errors,
             exits: report.stats.exits,
+            output,
+            uart_dropped,
             timed_out,
             elapsed: started.elapsed(),
         })
@@ -1705,6 +1744,12 @@ mod arm64 {
         assert_eq!(o.errors, 0, "run errors: {diag}");
         assert!(!o.timed_out, "boot timed out: {diag}");
         assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            1,
+            "init marker must appear exactly once: {diag}"
+        );
+        assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
         eprintln!(
             "kernel_boot: ok arch=aarch64 reason=guest_shutdown elapsed_ms={} exits={}",
             o.elapsed.as_millis(),
@@ -1728,6 +1773,22 @@ mod arm64 {
         assert_eq!(o.origin_vcpu, None, "origin vcpu: {diag}");
         assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
         assert_eq!(o.errors, 0, "run errors: {diag}");
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "init marker must not appear without an initrd: {diag}"
+        );
+        assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    }
+
+    /// MVM-1・#3898: 既定の cmdline は `console=ttyS0` を含み、`force_panic_zero` 後も `panic=0` が末尾に残る。
+    #[test]
+    fn mvm1_3898_arm64_default_cmdline_selects_ttys0() {
+        assert_eq!(DEFAULT_CMDLINE, "console=ttyS0 rdinit=/init");
+        assert_eq!(
+            force_panic_zero(DEFAULT_CMDLINE),
+            "console=ttyS0 rdinit=/init panic=0"
+        );
     }
 
     #[test]

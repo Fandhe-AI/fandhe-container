@@ -65,11 +65,68 @@
 # cmdline の `reboot=t` と組み合わせると triple fault になり、KVM_EXIT_SHUTDOWN から
 # StopReason::GuestShutdown に決定的につながる（crates/microvm/src/microvm.rs の classify_run）。
 #
+# variant `block-read`（#3889・MVM-1・REPAIR-12）: virtio-blk の読み出しをゲスト側から照合する版。
+# /dev に devtmpfs をマウントして `/dev/vda` の先頭 512 バイトを読み、先頭 32 バイトが sentinel と
+# 一致したときだけ一致メッセージを、それ以外（open・read の失敗、短い読み、不一致）は不一致メッセージを
+# fd 1 へ書いてから reboot する。virtio-blk の major 番号は固定せず devtmpfs 経由で開く。
+# 機械語（x86_64。ELF ヘッダ・program header は既定の版と同じ 120 バイト。表のオフセットはコード先頭から。
+# 全体は 120 + 328 = 448 バイト。GNU as で組んだ逆アセンブルと一致することを確認済み）:
+#    0: b8 53 00 00 00            mov eax, 83         ; mkdir
+#    5: 48 8d 3d ab 00 00 00      lea rdi, [rip+0xab] ; "/dev"（0xb7）
+#   12: be ed 01 00 00            mov esi, 0755
+#   17: 0f 05                     syscall             ; 戻り値は見ない（組み込み initramfs が /dev を持てば EEXIST）
+#   19: b8 a5 00 00 00            mov eax, 165        ; mount
+#   24: 48 8d 3d 9d 00 00 00      lea rdi, [rip+0x9d] ; source = "devtmpfs"（0xbc）
+#   31: 48 8d 35 91 00 00 00      lea rsi, [rip+0x91] ; target = "/dev"
+#   38: 48 89 fa                  mov rdx, rdi        ; fstype = "devtmpfs"
+#   41: 45 31 d2                  xor r10d, r10d      ; flags 0
+#   44: 45 31 c0                  xor r8d, r8d        ; data NULL
+#   47: 0f 05                     syscall             ; 戻り値は見ない（EBUSY 等でも次の open の成否で判定する）
+#   49: b8 02 00 00 00            mov eax, 2          ; open
+#   54: 48 8d 3d 88 00 00 00      lea rdi, [rip+0x88] ; "/dev/vda"（0xc5）
+#   61: 31 f6                     xor esi, esi        ; O_RDONLY
+#   63: 0f 05                     syscall
+#   65: 48 85 c0                  test rax, rax
+#   68: 78 3f                     js 133              ; open 失敗 → fail
+#   70: 48 81 ec 00 02 00 00      sub rsp, 512        ; 読み込み先はスタック（PT_LOAD は R+X のため）
+#   77: 89 c7                     mov edi, eax        ; fd
+#   79: 31 c0                     xor eax, eax        ; read
+#   81: 48 89 e6                  mov rsi, rsp
+#   84: ba 00 02 00 00            mov edx, 512
+#   89: 0f 05                     syscall
+#   91: 48 3d 00 02 00 00         cmp rax, 512
+#   97: 75 22                     jne 133             ; 短い読み・失敗 → fail
+#   99: 48 8d 3d 64 00 00 00      lea rdi, [rip+0x64] ; sentinel（0xce）
+#  106: 48 89 e6                  mov rsi, rsp
+#  109: b9 20 00 00 00            mov ecx, 32         ; sentinel の長さ
+#  114: fc                        cld
+#  115: f3 a6                     repe cmpsb
+#  117: 75 0e                     jne 133             ; 不一致 → fail
+#  119: 48 8d 35 70 00 00 00      lea rsi, [rip+0x70] ; 一致メッセージ（0xee）
+#  126: ba 2a 00 00 00            mov edx, 42
+#  131: eb 0c                     jmp 145
+#  133: 48 8d 35 8c 00 00 00      lea rsi, [rip+0x8c] ; fail: 不一致メッセージ（0x118）
+#  140: ba 30 00 00 00            mov edx, 48
+#  145: b8 01 00 00 00            mov eax, 1          ; write
+#  150: bf 01 00 00 00            mov edi, 1          ; fd 1（/dev を覆う前にカーネルが開いた /dev/console）
+#  155: 0f 05                     syscall
+#  157: b8 a9 00 00 00            mov eax, 169        ; reboot（既定の版と同じ並び）
+#  162: bf ad de e1 fe            mov edi, 0xfee1dead
+#  167: be 69 19 12 28            mov esi, 0x28121969
+#  172: ba 67 45 23 01            mov edx, 0x01234567
+#  177: 0f 05                     syscall
+#  179: f3 90                     pause
+#  181: eb fc                     jmp 179
+#  183: データ: "/dev\0"(5) "devtmpfs\0"(9) "/dev/vda\0"(9) sentinel(32) 一致メッセージ+改行(42) 不一致メッセージ+改行(48)
+# sentinel は先頭 32 バイトだけを比べる。試験側（crates/microvm/tests/kernel_boot.rs）が backend の offset 0 に置く。
+# 510〜511 に 0x55AA を置かないので MBR とは解釈されない。
+#
 # 使い方:
-#   build-microvm-test-initrd.sh [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
-#   各引数は同名の環境変数（MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない）
-#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（存在しない新規ディレクトリのみ。既存は拒否）
+#   build-microvm-test-initrd.sh [--variant default|block-read] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+#   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）または block-read（上記。x86_64 のみ）
+#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は default の variant のみ）
+#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
 #
@@ -85,7 +142,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-microvm-test-initrd.sh [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+usage: build-microvm-test-initrd.sh [--variant default|block-read] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 USAGE
 }
 
@@ -97,17 +154,24 @@ caller_pwd="$PWD"
 source "$root/scripts/lib.sh"
 cd -- "$caller_pwd" || { err_code bad-environment "cannot return to the working directory"; exit 2; }
 
+variant="${MICROVM_TEST_INITRD_VARIANT:-default}"
 output_dir="${MICROVM_TEST_INITRD_OUTPUT_DIR:-}"
 arch="${MICROVM_TEST_INITRD_ARCH:-x86_64}"
 compress="${MICROVM_TEST_INITRD_COMPRESS:-none}"
 pack_timeout=60
 init_message="fandhe-microvm-test: init ok v1"
+# block-read の文字列定数（正本。crates/microvm/tests/kernel_boot.rs の単体テストが行頭の名前で抜き出して照合する。
+# 長さ 32・41・47 は機械語へ固定されているため、変えるときはコードの長さ・変位も直す）
+block_sentinel="fandhe-microvm-block-sentinel-01"
+block_ok_message="fandhe-microvm-test: block sentinel ok v1"
+block_mismatch_message="fandhe-microvm-test: block sentinel mismatch v1"
 
 need_value() {
     [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
 }
 while [ $# -gt 0 ]; do
     case "$1" in
+        --variant) need_value $# "$1"; variant="$2"; shift 2 ;;
         --output-dir) need_value $# "$1"; output_dir="$2"; shift 2 ;;
         --arch) need_value $# "$1"; arch="$2"; shift 2 ;;
         --compress) need_value $# "$1"; compress="$2"; shift 2 ;;
@@ -121,6 +185,10 @@ done
 case "$arch" in
     x86_64 | aarch64) ;;
     *) err_code bad-argument "--arch must be x86_64 or aarch64"; usage; exit 2 ;;
+esac
+case "$variant" in
+    default | block-read) ;;
+    *) err_code bad-argument "--variant must be default or block-read"; usage; exit 2 ;;
 esac
 case "$compress" in
     none | gzip) ;;
@@ -155,7 +223,16 @@ case "$host_os" in
 esac
 
 # --- 出力先の検査 ---
-[ -n "$output_dir" ] || output_dir="$root/target/microvm-test-initrd/$arch"
+if [ "$variant" = "block-read" ] && [ "$arch" != "x86_64" ]; then
+    err_code bad-argument "--variant block-read is only available for --arch x86_64"; exit 2
+fi
+if [ -z "$output_dir" ]; then
+    if [ "$variant" = "block-read" ]; then
+        output_dir="$root/target/microvm-test-initrd/${arch}-block-read"
+    else
+        output_dir="$root/target/microvm-test-initrd/$arch"
+    fi
+fi
 case "$output_dir" in
     /*) ;;
     *) output_dir="$PWD/$output_dir" ;;
@@ -281,23 +358,18 @@ le() { # $1=値 $2=バイト幅。リトルエンディアンで書く
         n=$((n - 1))
     done
 }
-msg_len=$((${#init_message} + 1)) # 末尾の改行を含む
 code_off=120                      # ELF ヘッダ 64 + program header 56
 load_addr=$((0x400000))
 if [ "$arch" = "aarch64" ]; then
-    code_len=60
-    expected_size=212
     e_machine=183
-    # movz x2, #32 に長さを焼き込んでいるため、メッセージ長が変わったら fail-closed にする
-    [ "$msg_len" -eq 32 ] || { err_code internal-error "init message length must be 32 for aarch64"; exit 1; }
 else
-    code_len=50
-    expected_size=202
     e_machine=62
 fi
-total_size=$((code_off + code_len + msg_len))
 elf_file="$work_dir/init"
-{
+
+# ELF ヘッダ + program header（両 variant 共通。$1=ファイル全体のバイト数）
+emit_elf_headers() {
+    local total_size="$1"
     # ELF ヘッダ: ident（64-bit・LE・version 1・SysV）
     bytes 7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
     le 2 2                          # e_type = ET_EXEC
@@ -322,38 +394,119 @@ elf_file="$work_dir/init"
     le "$total_size" 8              # p_filesz
     le "$total_size" 8              # p_memsz
     le 4096 8                       # p_align
-    # コード（先頭コメントの表と同じ並び）
-    if [ "$arch" = "aarch64" ]; then
-        bytes 20 00 80 d2  # movz x0, #1
-        bytes c1 01 00 10  # adr x1, +56
-        bytes 02 04 80 d2  # movz x2, #32
-        bytes 08 08 80 d2  # movz x8, #64（write）
-        bytes 01 00 00 d4  # svc #0
-        bytes a0 d5 9b 52  # movz w0, #0xdead
-        bytes 20 dc bf 72  # movk w0, #0xfee1, lsl #16
-        bytes 21 2d 83 52  # movz w1, #0x1969
-        bytes 41 02 a5 72  # movk w1, #0x2812, lsl #16
-        bytes e2 ac 88 52  # movz w2, #0x4567
-        bytes 62 24 a0 72  # movk w2, #0x0123, lsl #16
-        bytes c8 11 80 d2  # movz x8, #142（reboot）
-        bytes 01 00 00 d4  # svc #0
-        bytes 3f 20 03 d5  # yield
-        bytes ff ff ff 17  # b -4
-    else
-        bytes b8 01 00 00 00
-        bytes bf 01 00 00 00
-        bytes 48 8d 35; le 33 4
-        bytes ba; le "$msg_len" 4
-        bytes 0f 05
-        bytes b8; le 169 4
-        bytes bf; le $((0xfee1dead)) 4
-        bytes be; le $((0x28121969)) 4
-        bytes ba; le $((0x01234567)) 4
-        bytes 0f 05
-        bytes f3 90 eb fc
+}
+
+# reboot(RESTART) と停止ループ（両 variant 共通の末尾）
+emit_reboot_tail() {
+    bytes b8; le 169 4
+    bytes bf; le $((0xfee1dead)) 4
+    bytes be; le $((0x28121969)) 4
+    bytes ba; le $((0x01234567)) 4
+    bytes 0f 05
+    bytes f3 90 eb fc
+}
+
+if [ "$variant" = "block-read" ]; then
+    # 機械語に固定された長さ・サイズを文字列定数と突き合わせる（fail-closed）
+    expected_size=448
+    if [ "${#block_sentinel}" -ne 32 ] || [ "$((${#block_ok_message} + 1))" -ne 42 ] ||
+        [ "$((${#block_mismatch_message} + 1))" -ne 48 ]; then
+        err_code internal-error "block-read string lengths do not match the encoded instructions"
+        exit 1
     fi
-    printf '%s\n' "$init_message"
-} >"$elf_file"
+    total_size=$expected_size
+    {
+        emit_elf_headers "$total_size"
+        # コード 183 バイト（先頭コメントの表と同じ並び）
+        bytes b8; le 83 4                                  # mov eax, 83 (mkdir)
+        bytes 48 8d 3d; le 171 4                           # lea rdi, [rip+0xab] -> "/dev"
+        bytes be; le $((0755)) 4                           # mov esi, 0755
+        bytes 0f 05                                        # syscall
+        bytes b8; le 165 4                                 # mov eax, 165 (mount)
+        bytes 48 8d 3d; le 157 4                           # lea rdi, [rip+0x9d] -> "devtmpfs"
+        bytes 48 8d 35; le 145 4                           # lea rsi, [rip+0x91] -> "/dev"
+        bytes 48 89 fa                                     # mov rdx, rdi
+        bytes 45 31 d2                                     # xor r10d, r10d
+        bytes 45 31 c0                                     # xor r8d, r8d
+        bytes 0f 05                                        # syscall
+        bytes b8; le 2 4                                   # mov eax, 2 (open)
+        bytes 48 8d 3d; le 136 4                           # lea rdi, [rip+0x88] -> "/dev/vda"
+        bytes 31 f6                                        # xor esi, esi (O_RDONLY)
+        bytes 0f 05                                        # syscall
+        bytes 48 85 c0                                     # test rax, rax
+        bytes 78 3f                                        # js fail
+        bytes 48 81 ec; le 512 4                           # sub rsp, 512
+        bytes 89 c7                                        # mov edi, eax
+        bytes 31 c0                                        # xor eax, eax (read)
+        bytes 48 89 e6                                     # mov rsi, rsp
+        bytes ba; le 512 4                                 # mov edx, 512
+        bytes 0f 05                                        # syscall
+        bytes 48 3d; le 512 4                              # cmp rax, 512
+        bytes 75 22                                        # jne fail
+        bytes 48 8d 3d; le 100 4                           # lea rdi, [rip+0x64] -> sentinel
+        bytes 48 89 e6                                     # mov rsi, rsp
+        bytes b9; le 32 4                                  # mov ecx, 32
+        bytes fc                                           # cld
+        bytes f3 a6                                        # repe cmpsb
+        bytes 75 0e                                        # jne fail
+        bytes 48 8d 35; le 112 4                           # lea rsi, [rip+0x70] -> ok message
+        bytes ba; le 42 4                                  # mov edx, 42
+        bytes eb 0c                                        # jmp write
+        bytes 48 8d 35; le 140 4                           # fail: lea rsi, [rip+0x8c] -> mismatch message
+        bytes ba; le 48 4                                  # mov edx, 48
+        bytes b8; le 1 4                                   # write: mov eax, 1
+        bytes bf; le 1 4                                   # mov edi, 1
+        bytes 0f 05                                        # syscall
+        emit_reboot_tail
+        # データ
+        printf '/dev\0'
+        printf 'devtmpfs\0'
+        printf '/dev/vda\0'
+        printf '%s' "$block_sentinel"
+        printf '%s\n' "$block_ok_message"
+        printf '%s\n' "$block_mismatch_message"
+    } >"$elf_file"
+else
+    msg_len=$((${#init_message} + 1)) # 末尾の改行を含む
+    if [ "$arch" = "aarch64" ]; then
+        # movz x2, #32 に長さを焼き込んでいるため、メッセージ長が変わったら fail-closed にする
+        [ "$msg_len" -eq 32 ] || { err_code internal-error "init message length must be 32 for aarch64"; exit 1; }
+        expected_size=212
+        total_size=$((code_off + 60 + msg_len))
+    else
+        expected_size=202
+        total_size=$((code_off + 50 + msg_len))
+    fi
+    {
+        emit_elf_headers "$total_size"
+        # コード（先頭コメントの表と同じ並び）
+        if [ "$arch" = "aarch64" ]; then
+            bytes 20 00 80 d2  # movz x0, #1
+            bytes c1 01 00 10  # adr x1, +56
+            bytes 02 04 80 d2  # movz x2, #32
+            bytes 08 08 80 d2  # movz x8, #64（write）
+            bytes 01 00 00 d4  # svc #0
+            bytes a0 d5 9b 52  # movz w0, #0xdead
+            bytes 20 dc bf 72  # movk w0, #0xfee1, lsl #16
+            bytes 21 2d 83 52  # movz w1, #0x1969
+            bytes 41 02 a5 72  # movk w1, #0x2812, lsl #16
+            bytes e2 ac 88 52  # movz w2, #0x4567
+            bytes 62 24 a0 72  # movk w2, #0x0123, lsl #16
+            bytes c8 11 80 d2  # movz x8, #142（reboot）
+            bytes 01 00 00 d4  # svc #0
+            bytes 3f 20 03 d5  # yield
+            bytes ff ff ff 17  # b -4
+        else
+            bytes b8 01 00 00 00
+            bytes bf 01 00 00 00
+            bytes 48 8d 35; le 33 4
+            bytes ba; le "$msg_len" 4
+            bytes 0f 05
+            emit_reboot_tail
+        fi
+        printf '%s\n' "$init_message"
+    } >"$elf_file"
+fi
 
 init_size="$(wc -c <"$elf_file" | tr -d ' ')"
 magic="$(od -An -tx1 -v -N 4 "$elf_file" | tr -d ' \n')"
@@ -416,7 +569,14 @@ cp "$final_file" "$output_dir/$final_name" 2>/dev/null || { err_code output-fail
     printf 'compress=%s\n' "$compress"
     printf 'arch=%s\n' "$arch"
     printf 'format=newc\n'
-    printf 'message=%s\n' "$init_message"
+    printf 'variant=%s\n' "$variant"
+    if [ "$variant" = "block-read" ]; then
+        printf 'sentinel=%s\n' "$block_sentinel"
+        printf 'message_match=%s\n' "$block_ok_message"
+        printf 'message_mismatch=%s\n' "$block_mismatch_message"
+    else
+        printf 'message=%s\n' "$init_message"
+    fi
     printf 'host=%s\n' "$host_os $(uname -m)"
 } >"$output_dir/build-info.txt" 2>/dev/null || { err_code output-failed "cannot write build-info.txt"; exit 2; }
 out_created=0

@@ -354,6 +354,7 @@ pub(crate) fn is_not_real_entry(e: &std::io::Error) -> bool {
 /// 区切りの重複・末尾 `/`・途中の `.` は `Path::components` の正規化で受理される（安全性は `O_NOFOLLOW` が担う）。
 /// 末尾 `/` の受理が経路全体で観測されないのは、呼び出し元 `adapter::read_image_blocking` が先に生のパスを
 /// `symlink_metadata` するため、通常ファイル + 末尾 `/` はそこで `ENOTDIR` で失敗するから（#3866・SEC-1）。
+/// その失敗は adapter の `map_lstat_error` が `INVALID_ARGUMENT` / `MSG_NOT_REGULAR` に分類する（#3890）。
 /// 呼び出し元は `adapter::read_image_blocking`（`start` のイメージ読み込み）。
 #[cfg(unix)]
 pub(crate) fn open_regular_nofollow(
@@ -833,7 +834,7 @@ mod tests {
         }
 
         /// `//`・途中の `//`・末尾 `/`・途中の `.` は `Path::components` が落とすため受理され、実ファイルが開く。
-        /// 末尾 `/` は POSIX では ENOTDIR だが、adapter の `symlink_metadata` が先に失敗させ、
+        /// 末尾 `/` は POSIX では ENOTDIR だが、adapter の `symlink_metadata` が先に失敗させ（分類は `INVALID_ARGUMENT` / `MSG_NOT_REGULAR`。#3890）、
         /// 安全性は `O_NOFOLLOW` で保たれる（#3842・SEC-1）。
         #[test]
         fn sec1_3842_redundant_separators_are_normalized() {

@@ -1106,7 +1106,7 @@ mod imp {
                             )
                         })?;
                         let inner = StreamInner { stream };
-                        inner.set_io_timeout(UDS_DEFAULT_IO_TIMEOUT)?;
+                        inner.set_initial_io_timeout()?;
                         return Ok(inner);
                     }
                     Err(e)
@@ -1171,6 +1171,15 @@ mod imp {
         }
     }
 
+    /// `EINVAL`（errno 22。Linux・macOS 共通）かつ peer 切断を観測できたときだけ true。
+    /// 引数の `closed` は `EINVAL` のときだけ評価する（余計な読み取りをしない）。
+    pub(super) fn classify_timeout_setup_failure(
+        e: &io::Error,
+        closed: impl FnOnce() -> bool,
+    ) -> bool {
+        e.raw_os_error() == Some(22) && closed()
+    }
+
     #[derive(Debug)]
     pub(super) struct StreamInner {
         stream: UnixStream,
@@ -1231,8 +1240,53 @@ mod imp {
                 )
             })?;
             let inner = Self { stream };
-            inner.set_io_timeout(UDS_DEFAULT_IO_TIMEOUT)?;
+            inner.set_initial_io_timeout()?;
             Ok(inner)
+        }
+
+        /// 接続直後の既定 I/O 期限の付与。`accept` / `connect` の最後の段で呼ぶ。
+        ///
+        /// macOS は相手が既に close した UNIX socket への `setsockopt(SO_RCVTIMEO / SO_SNDTIMEO)` を
+        /// `EINVAL` で拒む。これは peer の切断であって内部エラーではないため、`EINVAL` のときだけ
+        /// peer の状態を確かめ、EOF / reset を観測できた場合に限り `Unavailable`（接続断）へ写す。
+        /// 観測できない `EINVAL` は握り潰さず従来どおり `Internal`（PLUG-1・PLUG-12・REPAIR-4・#3861）。
+        fn set_initial_io_timeout(&self) -> Result<(), PluginError> {
+            let timeout = UDS_DEFAULT_IO_TIMEOUT;
+            let raw = self
+                .stream
+                .set_read_timeout(Some(timeout))
+                .and_then(|()| self.stream.set_write_timeout(Some(timeout)));
+            match raw {
+                Ok(()) => Ok(()),
+                Err(e) if classify_timeout_setup_failure(&e, || self.peer_has_closed()) => {
+                    Err(PluginError::new(
+                        PluginErrorCode::Unavailable,
+                        "peer closed the connection before io timeout was configured",
+                    ))
+                }
+                Err(_) => Err(PluginError::new(
+                    PluginErrorCode::Internal,
+                    "failed to set io timeout",
+                )),
+            }
+        }
+
+        /// 非ブロッキングで 1 バイト読み、EOF / reset なら peer が閉じていると判定する。
+        /// 読めた場合（未読データあり）や `WouldBlock` は「閉じたと断定できない」として false。
+        /// 呼び出し後の stream は呼び出し側が破棄する前提（読んだ 1 バイトは捨てられる）。
+        pub(super) fn peer_has_closed(&self) -> bool {
+            if self.stream.set_nonblocking(true).is_err() {
+                return false;
+            }
+            let mut one = [0u8; 1];
+            match (&self.stream).read(&mut one) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(e) => matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ),
+            }
         }
 
         pub(super) fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
@@ -1753,6 +1807,38 @@ mod tests {
 
         /// connect 側。server 検証の拒否時は `StreamInner` が作られず、server は 1 バイトも
         /// 受信しない（EOF のみ）。
+        /// #3861: peer の close を EOF で観測でき、開いている peer・未読データありは「閉じた」と断定しない。
+        #[test]
+        fn plug12_peer_has_closed_distinguishes_closed_open_and_pending() {
+            use std::os::unix::net::UnixStream;
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let inner = imp::StreamInner::from_std(ours);
+            assert!(!inner.peer_has_closed(), "open peer must not look closed");
+            drop(theirs);
+            assert!(inner.peer_has_closed(), "EOF must be seen as closed");
+
+            let (ours, mut theirs) = UnixStream::pair().unwrap();
+            theirs.write_all(b"x").unwrap();
+            drop(theirs);
+            let inner = imp::StreamInner::from_std(ours);
+            assert!(
+                !inner.peer_has_closed(),
+                "pending data is not asserted as closed"
+            );
+        }
+
+        /// #3861: EINVAL 以外は peer を調べず false、EINVAL でも peer が閉じていなければ false。
+        #[test]
+        fn plug12_timeout_setup_failure_classification_is_exact() {
+            let einval = io::Error::from_raw_os_error(22);
+            assert!(imp::classify_timeout_setup_failure(&einval, || true));
+            assert!(!imp::classify_timeout_setup_failure(&einval, || false));
+            let other = io::Error::from_raw_os_error(13);
+            assert!(!imp::classify_timeout_setup_failure(&other, || {
+                panic!("peer must not be probed for non-EINVAL")
+            }));
+        }
+
         #[test]
         fn plug12_connect_rejection_sends_no_bytes() {
             let dir = TempDir::new();

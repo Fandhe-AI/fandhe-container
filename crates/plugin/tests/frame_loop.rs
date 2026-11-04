@@ -68,8 +68,13 @@ fn start(
     let l = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
     let path = l.path().to_path_buf();
     let (tx, rx) = mpsc::channel();
+    // サーバー側の accept（peer 照合と io timeout の設定）が終わるまで client を閉じない。
+    // stop が先に立つ場合 `serve_until` が即戻り、macOS では閉じた socket への setsockopt が
+    // EINVAL になるため（#3861）。待ちは有限の期限つき。
+    let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
     let h = std::thread::spawn(move || {
         let mut c = UdsStream::connect(&path, WAIT, &mut JsonLinesPeerAuthObserver::new()).unwrap();
+        let _ = accepted_rx.recv_timeout(WAIT);
         let mut handler = |b: &[String]| -> Result<Vec<String>, PluginError> {
             calls.fetch_add(1, Ordering::SeqCst);
             if b.is_empty() {
@@ -82,6 +87,7 @@ fn start(
     let s = l
         .accept(WAIT, &mut JsonLinesPeerAuthObserver::new())
         .unwrap();
+    accepted_tx.send(()).unwrap();
     (s, rx, h)
 }
 

@@ -741,6 +741,8 @@ fn hvf_device_psci_cpu_power_responses() {
     use fandhe_container_microvm::hvf::hvc::{HvcHandler, handle_hvc};
     use fandhe_container_microvm::hvf_loop::ExitAction;
 
+    // 全体期限の watchdog（REPAIR-5）。run_once の期限が効かない場合も WATCHDOG EXPIRED と終了コード 124 で失敗する。
+    let _wd = Watchdog::start(Duration::from_secs(60));
     const BASE: u64 = 0x4000_0000;
     let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
     let vm = create_vm_with_gic_or_precondition(&layout);

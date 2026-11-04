@@ -9,7 +9,7 @@
 //! 呼び出し元は `fandhe-container-plugin-microvm`（TASK-117）。構成は非信頼の入力として、ioctl の前に上限を検証する。
 //!
 //! KVM 内部領域（#3732）: identity map（[`IDENTITY_MAP_ADDR`]）と TSS（[`TSS_ADDR`]）は vCPU の作成前に置き、RAM・MMIO の窓と
-//! 重ならないことを `plan_layout` が検証する。e820 への予約領域としての記載は範囲外（REPAIR-3。現状の e820 は RAM のみ）。
+//! 重ならないことを `plan_layout` が検証する。AP の起動コードの e820 への予約領域としての記載は範囲外（REPAIR-3。e820 は RAM と MP テーブルの予約〔#3888〕）。
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・一時停止（pause）・
@@ -84,8 +84,8 @@ use std::time::{Duration, Instant};
 use crate::boot_x86::LoadedKernel;
 #[cfg(target_arch = "x86_64")]
 use crate::boot_x86::{
-    BootCpuState, KernelCmdline, VirtioMmioParam, X86FpuState, boot_msrs, load_linux,
-    write_boot_tables,
+    BootCpuState, KernelCmdline, MP_TABLE_START, VirtioMmioParam, X86FpuState, boot_msrs,
+    load_linux, write_boot_tables,
 };
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
@@ -97,6 +97,8 @@ use crate::interrupt::{
     complete_net_notify, poll_net_rx,
 };
 use crate::irq::IrqFd;
+#[cfg(target_arch = "x86_64")]
+use crate::mptable_x86::{IsaIrqRoute, MpTableConfig, build_mp_table, write_mp_table};
 use crate::smp_x86::SipiVector;
 #[cfg(target_arch = "x86_64")]
 use crate::smp_x86::{MpState, plan_vcpus, sipi_startup_range};
@@ -144,11 +146,10 @@ pub const IDENTITY_MAP_LEN: u64 = 0x1000;
 pub const TSS_ADDR: u64 = 0xfffb_d000;
 /// [`TSS_ADDR`] の大きさ（3 ページ）。
 pub const TSS_LEN: u64 = 0x3000;
-/// in-kernel IOAPIC の MMIO の窓（既定の物理アドレス。実体は 0x20 バイトだがページ単位で確保する）。
-const IOAPIC_MMIO_BASE: u64 = 0xfec0_0000;
+// in-kernel IOAPIC / LAPIC の MMIO の窓の先頭は MP テーブル（#3888）と共有するため `mptable_x86` が持つ。
+// IOAPIC の実体は 0x20 バイトだがページ単位で確保する。
+use crate::mptable_x86::{IOAPIC_MMIO_BASE, LAPIC_MMIO_BASE};
 const IOAPIC_MMIO_LEN: u64 = 0x1000;
-/// LAPIC の MMIO の窓（既定の物理アドレス）。
-const LAPIC_MMIO_BASE: u64 = 0xfee0_0000;
 const LAPIC_MMIO_LEN: u64 = 0x1000;
 /// 4 GiB（TSS・identity map はここまでに収める）。
 const GPA_4GIB: u64 = 1 << 32;
@@ -594,6 +595,65 @@ fn system_regions(
 }
 
 /// デバイス数からの配置計算（arch・KVM 非依存の純粋な処理。`plan_layout` が検証後に呼ぶ）。
+/// MP テーブルの IOAPIC の ID（LAPIC ID `0..MAX_VCPUS` と衝突しない値）。
+#[cfg(target_arch = "x86_64")]
+const MP_IOAPIC_ID: u8 = MAX_VCPUS as u8;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(MAX_VCPUS < 255);
+/// 最大構成の MP テーブルが置き場所に収まること（floating pointer + 設定表。IRQ 0・COM1・virtio 最大台数）。
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    (16 + 44 + MAX_VCPUS as usize * 20 + 8 * (2 + 2 + MAX_VIRTIO_DEVICES + 2)) as u64
+        <= crate::boot_x86::MP_TABLE_END - MP_TABLE_START
+);
+
+/// ISA IRQ 0（timer）を接続する IOAPIC の pin。ISA/IOAPIC の標準の配線（IRQ 0 は pin 2）。PIT は未実装のため
+/// 現状ゲストに届く割り込みは無いが、Linux の `check_timer` が探す項として置く。
+#[cfg(target_arch = "x86_64")]
+const MP_TIMER_PIN: u8 = 2;
+
+/// MP テーブルの interrupt source を決める（IRQ 0・COM1 の IRQ 4・各 virtio の GSI。GSI n = IOAPIC pin n。#3888）。
+///
+/// KVM の `KVM_CREATE_IRQCHIP` の既定 routing は GSI 0..15 を PIC と IOAPIC の同じ番号の pin へ送るので、
+/// irqfd の GSI と表の pin が一致する。
+#[cfg(target_arch = "x86_64")]
+fn mp_isa_routes(gsis: &[u32]) -> Result<Vec<IsaIrqRoute>, MicrovmError> {
+    let mut routes = vec![
+        IsaIrqRoute {
+            source_irq: 0,
+            ioapic_pin: MP_TIMER_PIN,
+        },
+        IsaIrqRoute {
+            source_irq: crate::uart::COM1_IRQ as u8,
+            ioapic_pin: crate::uart::COM1_IRQ as u8,
+        },
+    ];
+    for g in gsis {
+        let irq = u8::try_from(*g).map_err(|_| {
+            MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "virtio GSI is out of range",
+            )
+        })?;
+        routes.push(IsaIrqRoute {
+            source_irq: irq,
+            ioapic_pin: irq,
+        });
+    }
+    Ok(routes)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mp_table_config(vcpu_count: u32, routes: &[IsaIrqRoute]) -> MpTableConfig<'_> {
+    MpTableConfig {
+        vcpu_count,
+        ioapic_id: MP_IOAPIC_ID,
+        ioapic_addr: IOAPIC_MMIO_BASE as u32,
+        lapic_addr: LAPIC_MMIO_BASE as u32,
+        isa_irqs: routes,
+    }
+}
+
 fn layout_slots(block_count: usize, net_count: usize) -> Result<Vec<DeviceSlot>, MicrovmError> {
     let total = block_count
         .checked_add(net_count)
@@ -1003,7 +1063,16 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
                 })
                 .collect();
             let cmdline = KernelCmdline::new(user_cmdline, &params)?;
-            load_linux(&mut self.memory, kernel, initrd, &cmdline)
+            // MP テーブル（#3888）は先に組んで検証し、失敗なら何も書かない。AP を Linux にオンラインにする。
+            let gsis: Vec<u32> = params.iter().map(|p| p.gsi).collect();
+            let routes = mp_isa_routes(&gsis)?;
+            let vcpu_count = u32::try_from(self.vcpus.len()).map_err(|_| {
+                MicrovmError::new(MicrovmErrorCode::InvalidArgument, "too many vCPUs")
+            })?;
+            let table = build_mp_table(&mp_table_config(vcpu_count, &routes), MP_TABLE_START)?;
+            let loaded = load_linux(&mut self.memory, kernel, initrd, &cmdline)?;
+            write_mp_table(&mut self.memory, &table)?;
+            Ok(loaded)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -1082,7 +1151,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ///
     /// BSP のゲストコードが送る STARTUP IPI のベクタと同じ `vector` を渡す。置き場所は [`sipi_startup_range`] で検証してから書く
     /// （ブート用領域・RAM の外との重なりは書く前に `InvalidArgument`）。戻り値は書いた先頭の GPA。Linux ゲストは自分で
-    /// trampoline を置くため、本メソッドはファームウェアの無い起動コードと試験のためのもの（e820 への予約は範囲外。REPAIR-3）。
+    /// trampoline を置くため、本メソッドはファームウェアの無い起動コードと試験のためのもの（AP の起動コードの e820 への予約は範囲外。REPAIR-3。MP テーブルは `MP_TABLE_START` で別領域）。
     pub fn write_ap_startup_code(
         &mut self,
         vector: SipiVector,
@@ -4113,5 +4182,53 @@ mod failure_tests {
             c(Error::other("x")).to_string(),
             "INTERNAL: cannot spawn vCPU thread"
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod mp_table_tests {
+    use super::*;
+    use crate::boot_x86::MP_TABLE_END;
+
+    /// MVM-1・#3888: 最大構成（32 vCPU・virtio 8 台）の MP テーブルが置き場所に収まり、IOAPIC のアドレスと pin の集合が具体値どおり。
+    #[test]
+    fn mvm1_3888_max_config_table_fits_and_has_expected_routes() {
+        let gsis: Vec<u32> = (0..MAX_VIRTIO_DEVICES as u32)
+            .map(|i| VIRTIO_GSI_BASE + i)
+            .collect();
+        let routes = mp_isa_routes(&gsis).unwrap();
+        let t = build_mp_table(&mp_table_config(MAX_VCPUS, &routes), MP_TABLE_START).unwrap();
+        assert!(t.len() as u64 <= MP_TABLE_END - MP_TABLE_START);
+        let pins: Vec<u8> = routes.iter().map(|r| r.ioapic_pin).collect();
+        assert_eq!(pins, vec![2, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let b = t.as_bytes();
+        // IOAPIC の項（processor 32 本・bus の次）。
+        let off = 16 + 44 + 32 * 20 + 8;
+        assert_eq!(b[off], 2);
+        assert_eq!(b[off + 1], 32);
+        assert_eq!(
+            u32::from_le_bytes([b[off + 4], b[off + 5], b[off + 6], b[off + 7]]),
+            0xfec0_0000
+        );
+    }
+
+    /// MVM-1・#3888: 2 vCPU・virtio 1 台の構成の interrupt source。
+    #[test]
+    fn mvm1_3888_two_vcpus_one_device_routes() {
+        let routes = mp_isa_routes(&[VIRTIO_GSI_BASE]).unwrap();
+        let src: Vec<(u8, u8)> = routes
+            .iter()
+            .map(|r| (r.source_irq, r.ioapic_pin))
+            .collect();
+        assert_eq!(src, vec![(0, 2), (4, 4), (5, 5)]);
+        assert!(build_mp_table(&mp_table_config(2, &routes), MP_TABLE_START).is_ok());
+    }
+
+    /// MVM-1・#3888・ERR-1: 範囲外の GSI は拒否する。
+    #[test]
+    fn mvm1_3888_out_of_range_gsi_is_rejected() {
+        assert!(mp_isa_routes(&[300]).is_err());
+        let r = mp_isa_routes(&[16]).unwrap();
+        assert!(build_mp_table(&mp_table_config(2, &r), MP_TABLE_START).is_err());
     }
 }

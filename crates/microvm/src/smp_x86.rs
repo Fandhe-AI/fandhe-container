@@ -15,7 +15,7 @@
 //!
 //! # 範囲外（REPAIR-3）
 //! Linux ゲストは自分で AP 用の trampoline を置いて SIPI を送る。本 API はファームウェアの無い起動コードと試験のためのもので、
-//! e820 への予約領域の記載は範囲外。vCPU ごとのスレッドでの実行と `start` の 2 台以上の対応は #3738。
+//! AP の起動コードは e820 へ予約しない。MP テーブル（`boot_x86::MP_TABLE_START`）とは `LOW_RAM_END` の検査で構造的に重ならない（#3888）。vCPU ごとのスレッドでの実行と `start` の 2 台以上の対応は #3738。
 
 use crate::boot_x86::{CMDLINE_ADDR, CMDLINE_CAPACITY, LOW_RAM_END, ZERO_PAGE_ADDR};
 use crate::error::{MicrovmError, MicrovmErrorCode};

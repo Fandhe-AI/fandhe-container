@@ -36,6 +36,7 @@
 # #3844 で hvf_abi に check_vm_map（map の IPA 上限の検査）と HvVcpu の !Send / !Sync の const 判定を追加（依存は増やさない。unsafe 追加なし）。
 # #3789（TASK-192.3）で sys/hvf.rs に GICv3（hv_gic_*）の実行時解決と macOS 15 の版判定を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3771 で tests/kernel_boot.rs（実カーネルの起動完走の実機前提試験）を追加（依存は増やさない。unsafe なし）。
+# #3865 で kernel_boot に AP・virtio-block・virtio-net の 3 件を追加（依存は増やさない。unsafe なし）。
 # rust-vmm 系クレートは禁止（MVM-4・.claude/rules/dependency-policy.md）。
 # #3795（TASK-192.13）で hvf/gic.rs に GicSpiLine と arm64_layout に check_spi_intid を追加（依存は増やさない。unsafe なし）。
 

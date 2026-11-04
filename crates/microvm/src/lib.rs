@@ -56,7 +56,7 @@
 //! vGICv3（`KVM_CREATE_DEVICE`。`device::VgicV3`）・irqfd の GSI = SPI 番号の写像・`MicroVm::assemble` の aarch64 分岐（vCPU 1..N。AP は `KVM_ARM_VCPU_POWER_OFF` で作り PSCI CPU_ON で起こす〔#3899。実機未確認〕。FDT の配置は
 //! `load_kernel`、起動レジスタは `setup_boot_vcpu`〔`KVM_SET_ONE_REG`〕）・start / stop を実装済み（`unsafe` は `sys` の `KVM_CREATE_DEVICE`・
 //! `KVM_{SET,GET}_DEVICE_ATTR`・`KVM_{SET,GET}_ONE_REG` のみ。実機〔KVM aarch64〕での実行は未検証で、実機前提試験は `kvm_device_arm64_*`）。
-//! aarch64 は PSCI 0.2（`KVM_ARM_VCPU_PSCI_0_2`）を有効にし、`KVM_EXIT_SYSTEM_EVENT` の SHUTDOWN / RESET を `GuestShutdown` に分類済み（#3896）。残りはシリアルの割り込み（#3943。MMIO のポーリングは #3898 で結線済み）・
+//! aarch64 は PSCI 0.2（`KVM_ARM_VCPU_PSCI_0_2`）を有効にし、`KVM_EXIT_SYSTEM_EVENT` の SHUTDOWN / RESET を `GuestShutdown` に分類済み（#3896）。シリアルは MMIO（#3898）で、割り込みは SPI 1 の `KVM_IRQ_LINE`（#3943。実機確認は #3781）で結線済み。
 //! level の virtio SPI は `Unimplemented` で拒否する（REPAIR-3）。
 //! 未実装: resamplefd による level の再注入・
 //! ioeventfd 経由の通知ループ（現状は MMIO exit 経由。TASK-75）・TAP などの net 実 backend（TASK-75 / TASK-117）・virtio-net の ctrl vq / MQ / オフロード / MRG_RXBUF・AP のスレッド駆動・他スレッドからの即時停止（kick）は #3738・#3736 で実装済み。virtio-net の受信は期限ごとのポーラー（#3742）で処理し、`start` は virtio-net を含む構成でも起動する（#3743。backend の到着通知は将来仕様。REPAIR-3）。実行時は `fandhe-container-plugin-microvm`（TASK-117）が

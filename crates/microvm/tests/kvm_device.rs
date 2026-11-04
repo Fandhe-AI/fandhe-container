@@ -2641,6 +2641,38 @@ mod arm64 {
         );
     }
 
+    /// MVM-1・#3943: シリアルの SPI（INTID 33）を `KVM_IRQ_LINE` の level 線で High にすると INTID 33 だけが pending になる
+    /// （線の `irq` は SPI のエンコード済みの値。GSI と INTID の取り違えがないことの照合）。vGIC の初期化前の線は拒否される。
+    /// 注入は同期だが、実装に依らないよう期限つきで待つ。Low にしたときの pending の扱いは SPI の config（edge / level）に
+    /// よるためここでは assert しない。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 (MVM-1)"]
+    fn kvm_device_arm64_serial_irq_line_sets_spi_pending() {
+        use fandhe_container_microvm::interrupt::{IrqLevel, LevelInterruptLine as _};
+        let vm = assemble(1, 1);
+        assert!(!vm.vgic().spi_pending(33).unwrap());
+        let line = vm.vm().register_spi_line(33).unwrap();
+        // 範囲外の INTID（SGI / PPI / 特殊 INTID）は InvalidArgument で拒否される。
+        for bad in [31u32, 1020] {
+            assert_eq!(
+                vm.vm().register_spi_line(bad).unwrap_err().code(),
+                MicrovmErrorCode::InvalidArgument
+            );
+        }
+        line.set_level(IrqLevel::High).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(1), || vm
+                .vgic()
+                .spi_pending(33)
+                .unwrap_or(false)),
+            "SPI 1 (INTID 33) did not become pending"
+        );
+        assert!(
+            !vm.vgic().spi_pending(34).unwrap(),
+            "INTID 34 must stay clear"
+        );
+    }
+
     /// FDT（`loaded` の範囲）をゲストメモリから読み、`/cpus/cpu@<hex>` の `reg` の第 2 セル（affinity）を返す。
     fn fdt_cpu_reg(
         vm: &Vm,

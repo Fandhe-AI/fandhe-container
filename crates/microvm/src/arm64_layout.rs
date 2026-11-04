@@ -26,8 +26,8 @@
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
 //!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
-//! - [`SerialInterrupt::Polled`]（#3898・MVM-1）: KVM aarch64 は線が未結線のため `interrupts` を出さない配置を使う。
-//!   Linux の 8250 は irq = 0 で timer ポーリングになる（一次情報は kernel_boot の doc）。線の結線は #3943（REPAIR-3）。
+//! - [`SerialInterrupt::Polled`]（#3898・MVM-1）: `interrupts` を出さない配置。本番の経路（KVM aarch64 は #3943 で `KVM_IRQ_LINE`
+//!   の SPI を結線して `LevelSpi` を使う）では現在使わない。Linux の 8250 は irq = 0 で timer ポーリングになる。
 //!
 //! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
 //! `hvf_smp`〔#3891〕）で起動する。実ゲストでの確認は #3803。
@@ -215,8 +215,8 @@ impl GuestSpi {
 pub enum SerialInterrupt {
     /// level-high の SPI を FDT に出す（#3892。線を駆動できる macOS の HVF 用。既定）。
     LevelSpi,
-    /// `interrupts` を FDT に出さない（ゲストの 8250 は timer のポーリングで動く）。KVM aarch64 は線が未結線のため
-    /// こちらを使う（結線は後続 issue。REPAIR-3）。`serial_spi()` は `None` になり、HVF の `serial_line` は
+    /// `interrupts` を FDT に出さない（ゲストの 8250 は timer のポーリングで動く）。KVM aarch64 は #3943 で線を結線したので
+    /// 本番の経路では使わない（FDT から割り込みを外したい構成向けの選択肢）。`serial_spi()` は `None` になり、HVF の `serial_line` は
     /// `InvalidArgument("serial is not configured")` で拒否する（HVF にこの配置を渡しても fail-closed）。
     Polled,
 }
@@ -281,7 +281,7 @@ impl Arm64Layout {
         Ok(self)
     }
 
-    /// 既定の窓でシリアルを有効にし、割り込みを FDT に出さない（ポーリング）。KVM aarch64 用（#3898・MVM-1）。
+    /// 既定の窓でシリアルを有効にし、割り込みを FDT に出さない（ポーリング）。本番の経路では使わない選択肢（#3898・#3943・MVM-1）。
     pub fn with_default_serial_polled(mut self) -> Result<Self, MicrovmError> {
         self.serial = Some(MmioRegion::new(ARM64_SERIAL_BASE, ARM64_SERIAL_SIZE));
         self.serial_interrupt = SerialInterrupt::Polled;

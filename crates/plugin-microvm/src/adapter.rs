@@ -41,7 +41,7 @@
 //!   `RESOURCE_EXHAUSTED` になる。
 //! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
-//!   Windows は祖先を検査しない（reparse point は未検査。非 Linux の backend は `start` が `UNIMPLEMENTED` で VM は起動しない）。
+//!   Windows は祖先を検査せず、lstat の失敗の分類（`map_lstat_error`）も best-effort（reparse point は未検査。非 Linux の backend は `start` が `UNIMPLEMENTED` で VM は起動しない）。
 //! - 実 Linux カーネルの起動完走は保証しない（CPUID・MSR・LAPIC・virtio-net rx 等は microvm 側の未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）。
 
 use std::collections::BTreeMap;
@@ -113,7 +113,6 @@ const MSG_NOT_REGULAR: &str = "image must be a regular file";
 const MSG_TOO_LARGE: &str = "image too large";
 const MSG_READ_FAILED: &str = "failed to read image";
 /// 祖先が symlink または非ディレクトリ（SEC-1。#3748）。パスは載せない。
-#[cfg(unix)]
 const MSG_BAD_ANCESTOR: &str = "image path ancestor must be a real directory";
 #[cfg(all(
     unix,
@@ -369,6 +368,7 @@ enum ImageKind {
 ///
 /// lstat と open の間の差し替えは unix で dev / ino の照合により検出する。unix では `/` から要素ごとに
 /// `O_NOFOLLOW` で辿って祖先の symlink を拒否し（`sys::open_regular_nofollow`。#3748）、Windows は祖先を検査しない（残余）。
+/// lstat の段の失敗も open の段と同じ分類にする（`map_lstat_error`。#3890）。
 ///
 /// 応答しない FUSE 等で同期 I/O が止まっても RPC ハンドラ全体を止めないよう、実処理は別スレッドで走らせ
 /// [`IMAGE_READ_DEADLINE`] で打ち切る（REPAIR-5）。期限切れのスレッドは detach し、I/O の復帰後に自力で終わる。
@@ -465,9 +465,46 @@ fn map_nofollow_error(e: crate::sys::NoFollowOpenError, kind: ImageKind) -> Plug
     }
 }
 
+/// `symlink_metadata` の失敗を写す。open の段の `map_nofollow_error` と同じ入力不正には同じ
+/// `INVALID_ARGUMENT` と固定文言を返す（ERR-1・SEC-1・#3890。`read_image_blocking` から呼ぶ）。
+///
+/// ENOTDIR は `ErrorKind` で、ELOOP は sys の定数で判定する。lstat の失敗には祖先 / 最終要素の区別が無く、2 つの文言を
+/// 分ける手がかりはパスの形（末尾区切り）だけで、`ErrorKind` は std が OS ごとに errno を写した結果だから。
+/// - `NotADirectory`: 末尾区切りありは最終要素がディレクトリでない（`MSG_NOT_REGULAR`）、なしは
+///   祖先が実ディレクトリでない（`MSG_BAD_ANCESTOR`）。`file/x/` のように両方当てはまる場合は前者になる。
+/// - ELOOP（`sys::is_not_real_entry`。unix のみ）: 祖先の symlink の解決の失敗（`MSG_BAD_ANCESTOR`）。
+/// - それ以外は従来どおり `map_io`（`map_io` 自体は他の失敗にも使うため変えない）。
+///
+/// Windows は祖先を検査せず（残余）、この分類は best-effort（祖先が通常ファイルなら OS が
+/// `NOT_FOUND` 相当を返しうる。Windows では試験していない）。
+fn map_lstat_error(e: std::io::Error, path: &Path, kind: ImageKind) -> PluginError {
+    match e.kind() {
+        std::io::ErrorKind::NotADirectory => {
+            if ends_with_separator(path) {
+                invalid(MSG_NOT_REGULAR)
+            } else {
+                invalid(MSG_BAD_ANCESTOR)
+            }
+        }
+        // `ErrorKind::FilesystemLoop` は固定 toolchain で unstable のため ELOOP は sys の定数で判定する。
+        // ENOTDIR は上で処理済みなので、ここに来る `is_not_real_entry` は ELOOP だけ。
+        #[cfg(unix)]
+        _ if crate::sys::is_not_real_entry(&e) => invalid(MSG_BAD_ANCESTOR),
+        _ => map_io(e, kind),
+    }
+}
+
+/// 生のパスの最後のバイトが区切り文字か（`Path::components()` は末尾の区切りを畳むため使えない）。
+fn ends_with_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|b| std::path::is_separator(char::from(*b)))
+}
+
 fn read_image_blocking(path: &Path, cap: u64, kind: ImageKind) -> Result<Vec<u8>, PluginError> {
     let map_io = |e: std::io::Error| map_io(e, kind);
-    let lmeta = std::fs::symlink_metadata(path).map_err(map_io)?;
+    let lmeta = std::fs::symlink_metadata(path).map_err(|e| map_lstat_error(e, path, kind))?;
     if !lmeta.file_type().is_file() {
         return Err(invalid(MSG_NOT_REGULAR));
     }
@@ -1256,6 +1293,110 @@ mod tests {
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         assert_eq!(e.message(), MSG_BAD_ANCESTOR);
         assert_eq!(a.backend.starts, 0);
+    }
+
+    /// ERR-1・SEC-1（#3890）: lstat の失敗の写像（実 errno 経由で `ErrorKind` への写しも確かめる）。
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn err1_sec1_3890_lstat_error_mapping() {
+        let eloop = if cfg!(target_os = "linux") { 40 } else { 62 };
+        let m = |errno: i32, p: &str, k: ImageKind| {
+            let e = map_lstat_error(std::io::Error::from_raw_os_error(errno), Path::new(p), k);
+            (e.code(), e.message().to_string())
+        };
+        let k = ImageKind::Kernel;
+        let inv = PluginErrorCode::InvalidArgument;
+        assert_eq!(m(20, "/a/f/", k), (inv, MSG_NOT_REGULAR.to_string()));
+        assert_eq!(m(20, "/a/f/x", k), (inv, MSG_BAD_ANCESTOR.to_string()));
+        assert_eq!(m(eloop, "/a/b/k", k), (inv, MSG_BAD_ANCESTOR.to_string()));
+        assert_eq!(m(eloop, "/a/b/k/", k), (inv, MSG_BAD_ANCESTOR.to_string()));
+        assert_eq!(
+            m(2, "/x", k),
+            (
+                PluginErrorCode::NotFound,
+                "kernel image not found".to_string()
+            )
+        );
+        assert_eq!(
+            m(2, "/x", ImageKind::Initrd),
+            (
+                PluginErrorCode::NotFound,
+                "initrd image not found".to_string()
+            )
+        );
+        for errno in [13, 1] {
+            assert_eq!(
+                m(errno, "/x", k),
+                (
+                    PluginErrorCode::PermissionDenied,
+                    "permission denied reading image".to_string()
+                )
+            );
+        }
+        for errno in [24, 5] {
+            assert_eq!(
+                m(errno, "/x", k),
+                (PluginErrorCode::Internal, MSG_READ_FAILED.to_string())
+            );
+        }
+    }
+
+    /// ERR-1・SEC-1（#3890）: 通常ファイルに末尾 `/` を付けると `MSG_NOT_REGULAR`（パスは載らない）。
+    #[cfg(unix)]
+    #[test]
+    fn err1_sec1_3890_read_image_trailing_slash_on_file_is_not_regular() {
+        let t = Tmp::new("tslash");
+        let f = t.file("kernel", b"K");
+        let e = read_image(Path::new(&format!("{f}/")), 4, ImageKind::Kernel).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_NOT_REGULAR);
+        assert!(!e.message().contains(&*t.0.to_string_lossy()));
+    }
+
+    /// ERR-1・SEC-1（#3890）: start の RPC 境界でも末尾 `/` は `MSG_NOT_REGULAR` で拒否し VM を起動しない。
+    #[cfg(unix)]
+    #[test]
+    fn err1_sec1_3890_start_rejects_trailing_slash_without_path() {
+        let t = Tmp::new("tslashstart");
+        let f = t.file("kernel", b"K");
+        let mut a = adapter();
+        let e = a.handle(&start_req("a", &format!("{f}/"))).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_NOT_REGULAR);
+        assert!(!e.message().contains(&*t.0.to_string_lossy()));
+        assert_eq!(a.backend.starts, 0);
+        assert!(a.is_empty());
+        // 陽性対照: 末尾 `/` なしなら起動する。
+        assert_eq!(a.handle(&start_req("a", &f)).expect("ok"), s(&["running"]));
+        assert_eq!(a.backend.starts, 1);
+    }
+
+    /// ERR-1・SEC-1（#3890）: 祖先が通常ファイルのパスは `MSG_BAD_ANCESTOR`。
+    #[cfg(unix)]
+    #[test]
+    fn err1_sec1_3890_read_image_regular_file_ancestor_is_bad_ancestor() {
+        let t = Tmp::new("fileanc");
+        let f = t.file("file", b"K");
+        for kind in [ImageKind::Kernel, ImageKind::Initrd] {
+            let e = read_image(Path::new(&format!("{f}/x")), 4, kind).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+            assert_eq!(e.message(), MSG_BAD_ANCESTOR);
+            assert!(!e.message().contains(&*t.0.to_string_lossy()));
+        }
+    }
+
+    /// ERR-1・SEC-1（#3890）: 祖先の symlink がループするパスは `MSG_BAD_ANCESTOR`。
+    #[cfg(unix)]
+    #[test]
+    fn err1_sec1_3890_read_image_symlink_loop_ancestor_is_bad_ancestor() {
+        let t = Tmp::new("loopanc");
+        std::os::unix::fs::symlink(t.0.join("b"), t.0.join("a")).expect("symlink");
+        std::os::unix::fs::symlink(t.0.join("a"), t.0.join("b")).expect("symlink");
+        let p = t.0.join("a").join("k");
+        let e = read_image(&p, 4, ImageKind::Kernel).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), MSG_BAD_ANCESTOR);
+        assert!(!e.message().contains(&*t.0.to_string_lossy()));
     }
 
     /// to_plugin_error: 全分類の写像（DeadlineExceeded は TIMEOUT）。

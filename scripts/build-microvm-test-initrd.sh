@@ -2,7 +2,7 @@
 # microVM の実カーネル起動試験用の最小 initrd を作るスクリプト（#3770・MVM-1・TASK-75.5・MS-7）。
 #
 # 役割: `/init` 1 個だけの cpio（newc 形式）を作る。`/init` はこのスクリプトが固定のバイト列から組む
-# 約 200 バイトの x86_64 静的 ELF で、固定文字列を fd 1（/dev/console）へ書いてから
+# 約 200 バイトの静的 ELF（x86_64 が既定、`--arch aarch64` で aarch64 #3895）で、固定文字列を fd 1（/dev/console）へ書いてから
 # `reboot(LINUX_REBOOT_CMD_RESTART)` を呼ぶ。busybox 等の GPL ユーザーランド・C コンパイラ・
 # ネットワークは使わない（#362 と同じ方針）。呼び出し元は Makefile の `microvm-test-initrd-build`、
 # 自己テスト（scripts/build-microvm-test-initrd-selftest.sh）、AGENTS.md の手順、および実カーネルの
@@ -28,22 +28,56 @@
 #   46: f3 90                     pause             ; reboot が戻ったら終了せず回り続ける
 #   48: eb fc                     jmp 46            ;（PID 1 の exit は kernel panic になる。止めるのは #3771 の期限つき stop）
 #   50: メッセージ（改行つき 32 バイト）
+#
+# /init の機械語（aarch64。#3895。ELF ヘッダは x86_64 と同じ並びで e_machine だけ 183。
+# コードは code_off 120 から 60 バイト、メッセージが 180 から 32 バイト、計 212 バイト。
+# ファイルに書くのはバイト列の順（ワードの表記ではない）。表のオフセットはコード先頭から）:
+#    0: 20 00 80 d2   movz x0, #1          ; fd 1 = /dev/console
+#    4: c1 01 00 10   adr  x1, +56         ; メッセージ（オフセット 60）
+#    8: 02 04 80 d2   movz x2, #32         ; len
+#   12: 08 08 80 d2   movz x8, #64         ; write
+#   16: 01 00 00 d4   svc  #0
+#   20: a0 d5 9b 52   movz w0, #0xdead
+#   24: 20 dc bf 72   movk w0, #0xfee1, lsl #16   ; LINUX_REBOOT_MAGIC1 = 0xfee1dead
+#   28: 21 2d 83 52   movz w1, #0x1969
+#   32: 41 02 a5 72   movk w1, #0x2812, lsl #16   ; LINUX_REBOOT_MAGIC2 = 0x28121969
+#   36: e2 ac 88 52   movz w2, #0x4567
+#   40: 62 24 a0 72   movk w2, #0x0123, lsl #16   ; LINUX_REBOOT_CMD_RESTART = 0x01234567
+#   44: c8 11 80 d2   movz x8, #142       ; reboot
+#   48: 01 00 00 d4   svc  #0
+#   52: 3f 20 03 d5   yield               ; reboot が戻ったら終了せず回り続ける（PID 1 の exit は panic）
+#   56: ff ff ff 17   b    -4             ; オフセット 52 へ（x86_64 の pause; jmp の対応物。wfi には替えない）
+#   60: メッセージ（x86_64 と同じ変数 init_message。改行つき 32 バイト。長さは movz x2 に焼き込み）
+# p_vaddr 0x400000 は 64 KiB でも割り切れるので、64 KiB ページの arm64 カーネルでも
+# p_vaddr ≡ p_offset (mod PAGE_SIZE) を満たす。p_align は 4096 のまま。
+# aarch64 の RESTART の経路（ソース読解の予定。実カーネルでの確認は未実施で、版を固定した file:function の
+# 照合は未確認）: reboot syscall（kernel/reboot.c）→ kernel_restart → machine_restart
+# （arch/arm64/kernel/process.c）→ do_kernel_restart の restart handler → PSCI の psci_sys_reset
+# （drivers/firmware/psci/psci.c。PSCI SYSTEM_RESET を HVC/SMC で呼ぶ）→ KVM の kvm_psci_system_reset
+# （arch/arm64/kvm/psci.c）→ KVM_SYSTEM_EVENT_RESET → run->exit_reason = KVM_EXIT_SYSTEM_EVENT で VMM へ戻る。
+# 前提: (a) vCPU で PSCI 0.2 以上（KVM_ARM_VCPU_PSCI_0_2）が有効なときだけ成り立つ。PSCI が無いと
+# restart handler が無く machine_restart は止まる。有効化と KVM_EXIT_SYSTEM_EVENT の停止理由への分類は #3896 の担当。
+# (b) reboot_mode が既定（cold）なら SYSTEM_RESET。warm で SYSTEM_RESET2 を持つ場合は RESET2 になりうる（未確認）。
+# (c) arm64 には x86 の `reboot=t` に当たるものが無く、上の x86_64 の cmdline の説明は流用しない。
+# aarch64 の cmdline は #3897（実カーネル起動試験）の担当。
+#
 # POWER_OFF ではなく RESTART を使う理由: ACPI の無い x86 では POWER_OFF が止まらず PID 1 が終わって panic する。
 # cmdline の `reboot=t` と組み合わせると triple fault になり、KVM_EXIT_SHUTDOWN から
 # StopReason::GuestShutdown に決定的につながる（crates/microvm/src/microvm.rs の classify_run）。
 #
 # 使い方:
-#   build-microvm-test-initrd.sh [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
-#   各引数は同名の環境変数（MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --output-dir    既定: <repo>/target/microvm-test-initrd/x86_64（存在しない新規ディレクトリのみ。既存は拒否）
+#   build-microvm-test-initrd.sh [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+#   各引数は同名の環境変数（MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
+#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない）
+#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
 #
 # 安全性: root・sudo・ネットワークを使わない。外部入力のファイルは無い。出力先は不可分に `mkdir -m 0700` で
 # 作り、既存（空・symlink を含む）は上書きせず拒否する。出力先の祖先が他者に書き換え可能なら拒否する
 # （build-guest-initrd.sh の検査を簡略化して写した）。生成した ELF はホストでは実行しない。
-# 範囲: x86_64 のみ（aarch64 の microVM ブートは未実装。REPAIR-3）。実カーネルでの起動は未確認で、
-# 実機での確認は #3781（人間担当）。
+# 範囲: x86_64 と aarch64 の生成。aarch64 の microVM ブートは #3896・#3897 の担当で未実装（REPAIR-3）。
+# 実カーネルでの起動は未確認（Agent は実行していない）で、実機での確認は #3781（人間担当）。
 #
 # 終了コード: 0 成功（stdout に initrd の絶対パスを 1 行）/ 1 内部エラー・gzip 失敗 / 2 引数・環境・出力先不正、
 #   Windows ホスト / 3 gzip の期限切れ。エラーは stderr に `error: code=<code> message=<英語>` の 1 行。
@@ -51,7 +85,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-microvm-test-initrd.sh [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+usage: build-microvm-test-initrd.sh [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 USAGE
 }
 
@@ -64,6 +98,7 @@ source "$root/scripts/lib.sh"
 cd -- "$caller_pwd" || { err_code bad-environment "cannot return to the working directory"; exit 2; }
 
 output_dir="${MICROVM_TEST_INITRD_OUTPUT_DIR:-}"
+arch="${MICROVM_TEST_INITRD_ARCH:-x86_64}"
 compress="${MICROVM_TEST_INITRD_COMPRESS:-none}"
 pack_timeout=60
 init_message="fandhe-microvm-test: init ok v1"
@@ -74,6 +109,7 @@ need_value() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --output-dir) need_value $# "$1"; output_dir="$2"; shift 2 ;;
+        --arch) need_value $# "$1"; arch="$2"; shift 2 ;;
         --compress) need_value $# "$1"; compress="$2"; shift 2 ;;
         --pack-timeout)
             need_value $# "$1"
@@ -82,6 +118,10 @@ while [ $# -gt 0 ]; do
         *) err_code bad-argument "unknown argument: $1"; usage; exit 2 ;;
     esac
 done
+case "$arch" in
+    x86_64 | aarch64) ;;
+    *) err_code bad-argument "--arch must be x86_64 or aarch64"; usage; exit 2 ;;
+esac
 case "$compress" in
     none | gzip) ;;
     *) err_code bad-argument "--compress must be none or gzip"; usage; exit 2 ;;
@@ -115,7 +155,7 @@ case "$host_os" in
 esac
 
 # --- 出力先の検査 ---
-[ -n "$output_dir" ] || output_dir="$root/target/microvm-test-initrd/x86_64"
+[ -n "$output_dir" ] || output_dir="$root/target/microvm-test-initrd/$arch"
 case "$output_dir" in
     /*) ;;
     *) output_dir="$PWD/$output_dir" ;;
@@ -224,7 +264,7 @@ check_output_free
 mkdir -m 0700 "$output_dir" 2>/dev/null || { err_code bad-output "cannot create the output directory"; exit 2; }
 out_created=1
 
-# --- /init（x86_64 静的 ELF）を組み立てる ---
+# --- /init（静的 ELF。arch ごと）を組み立てる ---
 export LC_ALL=C
 bytes() { # 16 進 2 桁の引数を生バイトで書く
     local b
@@ -244,13 +284,24 @@ le() { # $1=値 $2=バイト幅。リトルエンディアンで書く
 msg_len=$((${#init_message} + 1)) # 末尾の改行を含む
 code_off=120                      # ELF ヘッダ 64 + program header 56
 load_addr=$((0x400000))
-total_size=$((code_off + 50 + msg_len))
+if [ "$arch" = "aarch64" ]; then
+    code_len=60
+    expected_size=212
+    e_machine=183
+    # movz x2, #32 に長さを焼き込んでいるため、メッセージ長が変わったら fail-closed にする
+    [ "$msg_len" -eq 32 ] || { err_code internal-error "init message length must be 32 for aarch64"; exit 1; }
+else
+    code_len=50
+    expected_size=202
+    e_machine=62
+fi
+total_size=$((code_off + code_len + msg_len))
 elf_file="$work_dir/init"
 {
     # ELF ヘッダ: ident（64-bit・LE・version 1・SysV）
     bytes 7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
     le 2 2                          # e_type = ET_EXEC
-    le 62 2                         # e_machine = x86_64
+    le "$e_machine" 2               # e_machine（x86_64 = 62・aarch64 = 183）
     le 1 4                          # e_version
     le $((load_addr + code_off)) 8  # e_entry
     le 64 8                         # e_phoff
@@ -272,23 +323,41 @@ elf_file="$work_dir/init"
     le "$total_size" 8              # p_memsz
     le 4096 8                       # p_align
     # コード（先頭コメントの表と同じ並び）
-    bytes b8 01 00 00 00
-    bytes bf 01 00 00 00
-    bytes 48 8d 35; le 33 4
-    bytes ba; le "$msg_len" 4
-    bytes 0f 05
-    bytes b8; le 169 4
-    bytes bf; le $((0xfee1dead)) 4
-    bytes be; le $((0x28121969)) 4
-    bytes ba; le $((0x01234567)) 4
-    bytes 0f 05
-    bytes f3 90 eb fc
+    if [ "$arch" = "aarch64" ]; then
+        bytes 20 00 80 d2  # movz x0, #1
+        bytes c1 01 00 10  # adr x1, +56
+        bytes 02 04 80 d2  # movz x2, #32
+        bytes 08 08 80 d2  # movz x8, #64（write）
+        bytes 01 00 00 d4  # svc #0
+        bytes a0 d5 9b 52  # movz w0, #0xdead
+        bytes 20 dc bf 72  # movk w0, #0xfee1, lsl #16
+        bytes 21 2d 83 52  # movz w1, #0x1969
+        bytes 41 02 a5 72  # movk w1, #0x2812, lsl #16
+        bytes e2 ac 88 52  # movz w2, #0x4567
+        bytes 62 24 a0 72  # movk w2, #0x0123, lsl #16
+        bytes c8 11 80 d2  # movz x8, #142（reboot）
+        bytes 01 00 00 d4  # svc #0
+        bytes 3f 20 03 d5  # yield
+        bytes ff ff ff 17  # b -4
+    else
+        bytes b8 01 00 00 00
+        bytes bf 01 00 00 00
+        bytes 48 8d 35; le 33 4
+        bytes ba; le "$msg_len" 4
+        bytes 0f 05
+        bytes b8; le 169 4
+        bytes bf; le $((0xfee1dead)) 4
+        bytes be; le $((0x28121969)) 4
+        bytes ba; le $((0x01234567)) 4
+        bytes 0f 05
+        bytes f3 90 eb fc
+    fi
     printf '%s\n' "$init_message"
 } >"$elf_file"
 
 init_size="$(wc -c <"$elf_file" | tr -d ' ')"
 magic="$(od -An -tx1 -v -N 4 "$elf_file" | tr -d ' \n')"
-if [ "$init_size" != "$total_size" ] || [ "$magic" != "7f454c46" ] || [ "$init_size" -ne 202 ]; then
+if [ "$init_size" != "$total_size" ] || [ "$magic" != "7f454c46" ] || [ "$init_size" -ne "$expected_size" ]; then
     err_code internal-error "assembled init has an unexpected size or magic"
     exit 1
 fi
@@ -345,7 +414,7 @@ cp "$final_file" "$output_dir/$final_name" 2>/dev/null || { err_code output-fail
     printf 'initrd_file=%s\n' "$final_name"
     printf 'initrd_sha256=%s\n' "$initrd_sha"
     printf 'compress=%s\n' "$compress"
-    printf 'arch=x86_64\n'
+    printf 'arch=%s\n' "$arch"
     printf 'format=newc\n'
     printf 'message=%s\n' "$init_message"
     printf 'host=%s\n' "$host_os $(uname -m)"

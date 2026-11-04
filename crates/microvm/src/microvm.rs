@@ -1062,7 +1062,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
                     gsi: i.slot.gsi,
                 })
                 .collect();
-            let cmdline = KernelCmdline::new(user_cmdline, &params)?;
+            let user_cmdline = crate::boot_x86::with_no_timer_check(user_cmdline)?;
+            let cmdline = KernelCmdline::new(&user_cmdline, &params)?;
             // MP テーブル（#3888）は先に組んで検証し、失敗なら何も書かない。AP を Linux にオンラインにする。
             let gsis: Vec<u32> = params.iter().map(|p| p.gsi).collect();
             let routes = mp_isa_routes(&gsis)?;

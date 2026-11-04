@@ -206,6 +206,10 @@ pub fn build_mp_table(cfg: &MpTableConfig<'_>, base: u64) -> Result<MpTable, Mic
     if total as u64 > capacity {
         return Err(invalid("MP table does not fit in its reserved area"));
     }
+    if base != crate::boot_x86::MP_TABLE_START {
+        // write_mp_table は常に固定の置き場所へ書くため、別の base では floating pointer が誤った設定表を指す。
+        return Err(invalid("MP table base must be MP_TABLE_START"));
+    }
     let physptr = base
         .checked_add(FLOATING_LEN as u64)
         .and_then(|v| u32::try_from(v).ok())
@@ -307,6 +311,13 @@ mod tests {
     }
 
     /// MVM-1・#3888: floating pointer の signature・length・spec・physptr・checksum。
+    /// MVM-1・#3888: 固定の置き場所以外の base は拒否する（floating pointer が別の設定表を指すのを防ぐ）。
+    #[test]
+    fn mvm1_3888_rejects_foreign_base() {
+        let e = build_mp_table(&cfg(2, &IRQS), 0xF_0000).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    }
+
     #[test]
     fn mvm1_3888_floating_pointer_fields() {
         let t = build_mp_table(&cfg(2, &IRQS), MP_TABLE_START).unwrap();

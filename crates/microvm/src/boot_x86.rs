@@ -353,6 +353,27 @@ fn split_at_init_args(user: &str) -> Result<(&str, &str), MicrovmError> {
     }
 }
 
+/// 利用者の cmdline に、この VM が PIT を持たないために必要な `no_timer_check` を足す（MVM-1・#3888）。
+///
+/// MP テーブルでゲストが IOAPIC モードになると Linux は IRQ 0 の `check_timer` を走らせるが、この VM には PIT も
+/// タイマー割り込みの注入経路も無く検査に失敗して起動できない。そのため `microvm.rs` の `load_kernel` が
+/// 常に付ける。init 引数の区切り `--` より前（head の末尾）へ入れ、利用者が既に指定していれば足さない。
+pub fn with_no_timer_check(user: &str) -> Result<String, MicrovmError> {
+    let (head, tail) = split_at_init_args(user)?;
+    let mut text = head.to_owned();
+    if !head.split(' ').any(|t| t == "no_timer_check") {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str("no_timer_check");
+    }
+    if !tail.is_empty() {
+        text.push(' ');
+        text.push_str(tail);
+    }
+    Ok(text)
+}
+
 /// 検証済みの cmdline（印字可能な ASCII のみ。virtio-mmio の項目はコードが型つきの値から生成して足す）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelCmdline {
@@ -1313,6 +1334,24 @@ mod tests {
             load_linux(&mut m, &img, Some(&big), &cmd("")),
             MicrovmErrorCode::ResourceExhausted,
             "initrd does not fit in guest memory",
+        );
+    }
+
+    /// MVM-1・#3888: 既定の cmdline に `no_timer_check` が `--` の前へ 1 回だけ入る（PIT が無い VM で check_timer を避ける）。
+    #[test]
+    fn mvm1_3888_with_no_timer_check() {
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 reboot=t").unwrap(),
+            "console=ttyS0 reboot=t no_timer_check"
+        );
+        assert_eq!(with_no_timer_check("").unwrap(), "no_timer_check");
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 no_timer_check").unwrap(),
+            "console=ttyS0 no_timer_check"
+        );
+        assert_eq!(
+            with_no_timer_check("console=ttyS0 -- rescue").unwrap(),
+            "console=ttyS0 no_timer_check -- rescue"
         );
     }
 

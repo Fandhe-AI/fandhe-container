@@ -4,10 +4,10 @@
 //! 呼ぶ）。専用スレッドで `HvVcpu` を作って所有し、レジスタ初期化（`setup`）の後に実行ループを回す。ループ・停止・期限・観測の
 //! 論理は OS 非依存の `crate::hvf_loop` にあり（`hv_*` を呼ばない偽の実行体で単体試験できる）、本ファイルは次だけを持つ。
 //! - `HvVcpu` への [`VcpuExec`] と `VcpuCanceller` への [`VcpuKick`] の実装
-//! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, timer}` のスタブへ振り分ける関数
+//! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, timer}` のハンドラへ振り分ける関数
 //!
 //! 呼び出し元は #3797（構成体の組み立て。`setup` に PC・CPSR・X0（FDT のアドレス）等の初期化を渡し、ハンドラ状態を持たせる）。
-//! `mmio`・`hvc`・`timer` の関数シグネチャは担当 issue（#3793・#3794・#3796）との契約で、各自が自分のファイルだけを差し替える。
+//! `mmio`・`hvc`・`timer` の関数シグネチャは担当 issue（#3793・#3794・#3796。いずれも実装済み）との契約で、変えるときは振り分ける関数と揃える。
 //!
 //! # 寿命の契約
 //! スレッドは `Arc<VmWithGic>` の複製を持ち、vCPU が生きている間は VM が破棄されない。呼び出し元は自分の `Arc` とゲスト RAM
@@ -22,7 +22,7 @@
 //! 印を立てない（同じ VM に vCPU を作り直す既存の結合試験があるため）。
 //!
 //! # 未実装（REPAIR-3）
-//! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの実処理は hvc 以外スタブ（`Unimplemented` で VM を止める）。
+//! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,7 +168,7 @@ impl VcpuThread {
     /// vCPU は `VmWithGic::create_vcpu` で作る（GIC を vCPU より先に作る契約を迂回しない。MVM-5・TASK-192.12）。
     ///
     /// 作成と `setup` の成否は `config.create_deadline` まで待って返す（失敗は `setup` のエラーのまま）。`setup` は PC・CPSR・
-    /// 引数レジスタ等の初期化で、#3797 が渡す。ゲストが `Unimplemented` の exit（スタブ）に達するとループは `Failed(Unimplemented)` で
+    /// 引数レジスタ等の初期化で、#3797 が渡す。ゲストが未対応の exit（SysReg trap・ISV=0 の data abort・未知の EC。`hvf_loop::run_loop` の表）に達するとループは `Failed(Unimplemented)` で
     /// 終わり、[`VcpuHandle::is_finished`] で観測できる。寿命の契約はモジュールの doc を参照。
     pub fn spawn<S>(
         vm: Arc<VmWithGic>,

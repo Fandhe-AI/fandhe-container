@@ -29,6 +29,7 @@
 //! Linux の `STOP_DEADLINE_MAX` と同じ）つきで止める。start しないまま drop すると、ゲストは一度も走らずに終わる。
 //! 終了理由は Linux と共有の `StopReason`（`stop` の `Requested`、PSCI の SYSTEM_OFF・SYSTEM_RESET は `GuestShutdown`、未対応・未知の
 //! exit は fail-closed の `Failed(Unimplemented / Internal)`）で、[`HvfStopReport`] に載せる。
+//! exit ごとの処理は `hvf::{mmio, hvc, timer}`（#3793・#3794・#3796）が担い、WFI の待ちの上限など残る制限は `hvf::timer` の「未実装・簡易実装」を参照。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
 //! 1. 停止要求 → kick（`hv_vcpus_exit`。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
@@ -61,7 +62,7 @@
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当は
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
-//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。vCPU 1..N の停止の集約を含む。#3864 の後続）、シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。vCPU 1..N の停止の集約を含む。#3864 の後続）、シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!

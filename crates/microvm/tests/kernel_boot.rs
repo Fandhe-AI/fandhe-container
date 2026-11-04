@@ -21,20 +21,26 @@
 //!   BSP 起因の停止で 2 台とも回収される（`vcpu_count` = 2・起点 vCPU 0）」まで。「2 CPU がオンライン」とは主張しない。
 //! - virtio-block 1 台（1 MiB・読み取り専用）: 起動元は initrd のまま。観測器が STATUS への書き込みで DRIVER_OK を含む
 //!   最初の値 `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 1 を、backend が `read_at` 1 回以上かつ offset 0 を読んだ回 1 回以上を照合する。
+//! - virtio-block の中身の照合（#3889・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build`
+//!   の initrd（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。既定 `target/microvm-test-initrd/x86_64-block-read/initrd.cpio`）は、
+//!   `/dev/vda` の先頭 512 バイトを読み、先頭 32 バイトが `BLOCK_SENTINEL` と一致したときだけ `BLOCK_OK_MARKER` を出す
+//!   （不一致・失敗は `BLOCK_MISMATCH_MARKER`）。backend の offset 0 に sentinel を置いた構成で一致 marker 1 回・不一致 0 回、
+//!   0 埋めの構成（陰性対照）で不一致 marker 1 回・一致 0 回を照合し、ゲストに中身が届いたことを end-to-end で示す。
+//!   カーネルには `CONFIG_DEVTMPFS=y` が要る（init が `/dev` に devtmpfs をマウントする）。
 //! - virtio-net 1 台: STATUS の DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2（receiveq・transmitq）。RX・TX は
 //!   interface を上げる userspace が無いので照合しない。
 //!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。止まる場合は `_CMDLINE` で
 //! `tsc=reliable no_timer_check` 等を試し、原因ごとに別 issue にする。virtio の probe が失敗した場合も試験の欠陥ではなく
-//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・init にブロックを読ませること・RX/TX。
+//! device model 側の別 issue として扱う。範囲外: aarch64・AP を Linux に見せること・RX/TX。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
-    use fandhe_container_microvm::error::MicrovmError;
+    use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
     use fandhe_container_microvm::exit::{ExitData, ExitValue};
     use fandhe_container_microvm::microvm::{
         MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VirtioDeviceKind,
@@ -51,6 +57,13 @@ mod x86 {
 
     /// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
     const MARKER: &str = "fandhe-microvm-test: init ok v1";
+    /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
+    /// `block_sentinel`（単体テストで照合）。
+    const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
+    /// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
+    const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
+    /// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
+    const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
     const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t";
     const DEFAULT_TIMEOUT_SECS: u64 = 60;
     const KERNEL_CAP: u64 = fandhe_container_microvm::boot_x86::MAX_KERNEL_IMAGE_BYTES;
@@ -305,7 +318,8 @@ mod x86 {
         flushes: AtomicU64,
     }
 
-    /// 呼び出しを数える block backend（読み取り専用）。`start` の後も試験側がカウンタを見られるよう `Arc` で共有する。
+    /// 呼び出しを数える block backend（ゲストからは読み取り専用）。`start` の後も試験側がカウンタを見られるよう
+    /// `Arc` で共有する。`with_sentinel` は offset 0 に sentinel を置く（ゲストの書き込みは wrapper が拒否する）。
     #[derive(Debug)]
     struct CountingBlockBackend {
         inner: MemoryBlockBackend,
@@ -313,6 +327,23 @@ mod x86 {
     }
 
     impl CountingBlockBackend {
+        /// offset 0 に `sentinel` を置いた backend（`None` は 0 埋め）。置くために内側は書き込み可で作り、
+        /// `read_only()` を true にして `write_at` は wrapper 自身が拒否する（lib は変えない）。
+        fn with_sentinel(capacity: u64, sentinel: Option<&[u8]>) -> (Self, Arc<BlockCounters>) {
+            let counters = Arc::new(BlockCounters::default());
+            let mut inner = MemoryBlockBackend::new(capacity, false).expect("valid capacity");
+            if let Some(s) = sentinel {
+                inner.write_at(0, s).expect("sentinel fits in capacity");
+            }
+            (
+                Self {
+                    inner,
+                    counters: counters.clone(),
+                },
+                counters,
+            )
+        }
+
         fn new(capacity: u64) -> (Self, Arc<BlockCounters>) {
             let counters = Arc::new(BlockCounters::default());
             let inner = MemoryBlockBackend::new(capacity, true).expect("valid capacity");
@@ -331,7 +362,7 @@ mod x86 {
             self.inner.capacity_bytes()
         }
         fn read_only(&self) -> bool {
-            self.inner.read_only()
+            true
         }
         fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
             self.counters.reads.fetch_add(1, Ordering::Relaxed);
@@ -345,7 +376,11 @@ mod x86 {
         }
         fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), MicrovmError> {
             self.counters.writes.fetch_add(1, Ordering::Relaxed);
-            self.inner.write_at(offset, data)
+            let _ = (offset, data);
+            Err(MicrovmError::new(
+                MicrovmErrorCode::PermissionDenied,
+                "test block backend is read-only for the guest",
+            ))
         }
         fn flush(&mut self) -> Result<(), MicrovmError> {
             self.counters.flushes.fetch_add(1, Ordering::Relaxed);
@@ -399,8 +434,33 @@ mod x86 {
         secs: u64,
     }
 
-    /// 前提の検査はすべてテストスレッドで行う（worker 内 panic では 1 行目が PRECONDITION FAILED にならない）。
+    /// 使う initrd の種類（`scripts/build-microvm-test-initrd.sh` の variant に対応）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InitrdKind {
+        /// 固定文字列を書いて reboot するだけの版（`FANDHE_CONTAINER_MICROVM_INITRD`）。
+        Default,
+        /// `/dev/vda` の先頭を sentinel と比べる版（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。#3889）。
+        BlockRead,
+    }
+
     fn inputs() -> Inputs {
+        inputs_for(InitrdKind::Default)
+    }
+
+    /// 前提の検査はすべてテストスレッドで行う（worker 内 panic では 1 行目が PRECONDITION FAILED にならない）。
+    fn inputs_for(kind: InitrdKind) -> Inputs {
+        let (env_name, default_rel, build_hint) = match kind {
+            InitrdKind::Default => (
+                "FANDHE_CONTAINER_MICROVM_INITRD",
+                "../../target/microvm-test-initrd/x86_64/initrd.cpio",
+                "make microvm-test-initrd-build",
+            ),
+            InitrdKind::BlockRead => (
+                "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD",
+                "../../target/microvm-test-initrd/x86_64-block-read/initrd.cpio",
+                "MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build",
+            ),
+        };
         let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
             Ok(p) if !p.is_empty() => p,
             _ => precondition(
@@ -409,16 +469,12 @@ mod x86 {
         };
         let kernel = read_bounded(Path::new(&kernel_path), KERNEL_CAP)
             .unwrap_or_else(|e| precondition(&format!("kernel image: {e}")));
-        let initrd_path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
+        let initrd_path = match std::env::var(env_name) {
             Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/microvm-test-initrd/x86_64/initrd.cpio"),
+            _ => Path::new(env!("CARGO_MANIFEST_DIR")).join(default_rel),
         };
-        let initrd = read_bounded(&initrd_path, INITRD_CAP).unwrap_or_else(|e| {
-            precondition(&format!(
-                "initrd (run `make microvm-test-initrd-build`): {e}"
-            ))
-        });
+        let initrd = read_bounded(&initrd_path, INITRD_CAP)
+            .unwrap_or_else(|e| precondition(&format!("initrd (run `{build_hint}`): {e}")));
         let cmdline = validate_cmdline(
             std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
                 .ok()
@@ -542,10 +598,15 @@ mod x86 {
 
     /// 全構成で共通の起動の照合（marker 1 回・GuestShutdown・起点 vCPU 0・エラー 0・取りこぼし 0・期限内）。
     fn assert_boot_ok(o: &Outcome, vcpus: u32, diag: &str) {
+        assert_boot_ok_with_marker(o, MARKER, vcpus, diag);
+    }
+
+    /// `assert_boot_ok` の marker を差し替えられる版（block-read の initrd 用。#3889）。
+    fn assert_boot_ok_with_marker(o: &Outcome, marker: &str, vcpus: u32, diag: &str) {
         assert_eq!(
-            count_marker_lines(&o.output, MARKER),
+            count_marker_lines(&o.output, marker),
             1,
-            "marker line: {diag}"
+            "marker line {marker:?}: {diag}"
         );
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
@@ -555,7 +616,7 @@ mod x86 {
         assert!(!o.timed_out, "boot timed out: {diag}");
     }
 
-    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION";
+    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION, CONFIG_DEVTMPFS";
 
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -639,6 +700,77 @@ mod x86 {
         eprintln!(
             "kernel_boot: ok case=virtio_block driver_ok=0x0f queue_ready=1 reads={reads} offset0_reads={off0} elapsed_ms={}",
             o.elapsed.as_millis()
+        );
+    }
+
+    /// block-read の 2 件に共通の本体。`sentinel` を backend の offset 0 に置いて起動し、`expect`（期待する marker）が
+    /// ちょうど 1 回・`other`（もう一方の marker）と既定の `MARKER` が 0 回であることを含む共通の照合をする。
+    fn run_block_read(sentinel: Option<&[u8]>, expect: &str, other: &str, case: &str) {
+        let inp = inputs_for(InitrdKind::BlockRead);
+        let (backend, counters) = CountingBlockBackend::with_sentinel(1 << 20, sentinel);
+        let config: MicroVmConfig<CountingBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 256 << 20,
+            block: vec![backend],
+            net: vec![],
+        };
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let o = run_boot(inp, config, Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Block);
+        let reads = counters.reads.load(Ordering::Relaxed);
+        let off0 = counters.offset0_reads.load(Ordering::Relaxed);
+        let extra = format!(
+            "block={s:?} reads={reads} offset0_reads={off0} writes={} hint=\"{KCONFIG_HINT}\"",
+            counters.writes.load(Ordering::Relaxed),
+        );
+        let diag = o.diag(&extra);
+        assert_boot_ok_with_marker(&o, expect, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, other),
+            0,
+            "opposite marker {other:?} must not appear: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default init marker must not appear with the block-read initrd: {diag}"
+        );
+        assert_eq!(s.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "block FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
+        // init の read が backend まで届いた回数は照合しない（パーティション走査で sector 0 が page cache に載り
+        // init の read が backend に届かないことがあるため）。ゲストに中身が届いた証跡は marker である。
+        assert!(reads >= 1, "block read_at count: {diag}");
+        assert!(off0 >= 1, "block offset-0 reads: {diag}");
+        eprintln!(
+            "kernel_boot: ok case={case} marker={expect:?} reads={reads} offset0_reads={off0} elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+    }
+
+    /// virtio-block の中身の照合（#3889・MVM-1・REPAIR-12）。offset 0 に sentinel を置いた backend を block-read の
+    /// initrd で読ませ、`/dev/vda` の先頭がゲストに届いたときだけ出る一致 marker をちょうど 1 回数える。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_reads_sentinel() {
+        run_block_read(
+            Some(BLOCK_SENTINEL),
+            BLOCK_OK_MARKER,
+            BLOCK_MISMATCH_MARKER,
+            "virtio_block_sentinel",
+        );
+    }
+
+    /// 陰性対照（#3889）。同じ initrd で backend が 0 埋めのとき不一致 marker が出て一致 marker が出ないこと。
+    /// 比較が素通しで一致を出していないことを示す。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_detects_mismatch() {
+        run_block_read(
+            None,
+            BLOCK_MISMATCH_MARKER,
+            BLOCK_OK_MARKER,
+            "virtio_block_mismatch",
         );
     }
 
@@ -756,6 +888,51 @@ mod x86 {
         assert_eq!(c.writes.load(Ordering::Relaxed), 1);
         assert_eq!(c.flushes.load(Ordering::Relaxed), 1);
     }
+    #[test]
+    fn mvm1_3889_block_strings_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            find("block_sentinel=\""),
+            vec![String::from_utf8(BLOCK_SENTINEL.to_vec()).unwrap()]
+        );
+        assert_eq!(
+            find("block_ok_message=\""),
+            vec![BLOCK_OK_MARKER.to_owned()]
+        );
+        assert_eq!(
+            find("block_mismatch_message=\""),
+            vec![BLOCK_MISMATCH_MARKER.to_owned()]
+        );
+        assert_eq!(BLOCK_SENTINEL.len(), 32);
+    }
+
+    #[test]
+    fn mvm1_3889_sentinel_backend() {
+        let (mut b, c) = CountingBlockBackend::with_sentinel(4096, Some(BLOCK_SENTINEL));
+        assert!(b.read_only());
+        let mut buf = [0u8; 512];
+        b.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf.get(..32), Some(&BLOCK_SENTINEL[..]));
+        assert!(buf.get(32..).unwrap().iter().all(|x| *x == 0));
+        assert!(b.write_at(0, &[0xFF; 32]).is_err());
+        b.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf.get(..32), Some(&BLOCK_SENTINEL[..]));
+        assert_eq!(c.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(c.writes.load(Ordering::Relaxed), 1);
+        let (mut z, _) = CountingBlockBackend::with_sentinel(4096, None);
+        z.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|x| *x == 0));
+    }
+
     #[test]
     fn mvm1_3771_marker_matches_initrd_script() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -892,6 +1069,28 @@ mod other {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
     fn kernel_boot_with_virtio_block_reads_disk() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![MemoryBlockBackend::new(1 << 20, true).unwrap()],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_reads_sentinel() {
+        assert_unimplemented(MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 1 << 20,
+            block: vec![MemoryBlockBackend::new(1 << 20, true).unwrap()],
+            net: vec![],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_init_detects_mismatch() {
         assert_unimplemented(MicroVmConfig {
             vcpu_count: 1,
             mem_size: 1 << 20,

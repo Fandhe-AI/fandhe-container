@@ -360,6 +360,70 @@ fn invalid(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::InvalidArgument, msg)
 }
 
+/// macOS バックエンドが受ける vCPU 数の上限（SMP は未実装。TASK-192.15・#3797・MVM-5・REPAIR-3）。
+pub const HVF_MAX_VCPUS: u32 = 1;
+/// macOS バックエンドが受けるゲスト RAM の上限（[`MAX_MAP_BYTES`] と同値。mmap の前に超過を拒否する）。
+pub const HVF_MAX_GUEST_RAM_BYTES: u64 = MAX_MAP_BYTES;
+
+/// `HvfMicroVm::assemble` が資源（VM・GIC・mmap）を作る前に検査する構成値（#3797）。
+///
+/// 循環依存を避けるためプリミティブだけで受ける。呼び出し元は plugin-microvm 側から来る非信頼の VM 構成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfAssembleInput {
+    /// vCPU 数。
+    pub vcpus: u32,
+    /// ゲスト RAM の大きさ（バイト）。
+    pub ram_size: u64,
+    /// レイアウトの virtio-mmio の個数。
+    pub layout_virtio_count: u32,
+    /// 実際に登録するデバイス数（block + net）。
+    pub device_count: usize,
+    /// カーネル Image の長さ。
+    pub image_len: u64,
+    /// initrd の長さ（無ければ `None`）。
+    pub initrd_len: Option<u64>,
+    /// カーネル cmdline の長さ。
+    pub cmdline_len: usize,
+}
+
+/// 構成値の上限検査（資源を作る前。ERR-1: メッセージは固定で入力値をエコーしない）。
+///
+/// 順序: vcpus（0 は `InvalidArgument`、2 以上は `Unimplemented`。他の不正に隠れないよう最初）→ RAM → デバイス数 →
+/// Image・initrd・cmdline の長さ。Image ヘッダの中身はここでは見ない（RAM 登録後の `load_arm64` が検証する）。
+pub fn check_assemble_input(input: &HvfAssembleInput) -> Result<(), MicrovmError> {
+    use crate::arm64_layout::{ARM64_MAX_BOOTARGS, ARM64_VIRTIO_MMIO_MAX};
+    use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
+
+    if input.vcpus == 0 {
+        return Err(invalid("vcpus is zero"));
+    }
+    if input.vcpus > HVF_MAX_VCPUS {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "hvf backend supports a single vcpu",
+        ));
+    }
+    if input.ram_size == 0 || input.ram_size > HVF_MAX_GUEST_RAM_BYTES {
+        return Err(invalid("guest ram size is out of range"));
+    }
+    if input.device_count > ARM64_VIRTIO_MMIO_MAX as usize {
+        return Err(invalid("too many virtio devices"));
+    }
+    if u32::try_from(input.device_count).ok() != Some(input.layout_virtio_count) {
+        return Err(invalid("device layout does not match the configuration"));
+    }
+    if input.image_len == 0 || input.image_len > MAX_KERNEL_IMAGE_BYTES {
+        return Err(invalid("kernel image length is out of range"));
+    }
+    if input.initrd_len.is_some_and(|n| n > MAX_INITRD_BYTES) {
+        return Err(invalid("initrd length is out of range"));
+    }
+    if input.cmdline_len > ARM64_MAX_BOOTARGS {
+        return Err(invalid("kernel cmdline is too long"));
+    }
+    Ok(())
+}
+
 /// `hv_vm_map` / `hv_vm_protect` に渡す範囲の検査（FFI の前に必ず通す）。
 ///
 /// `page_size` が 0 か 2 の冪でない、`size` が 0 か [`MAX_MAP_BYTES`] 超かページ倍数でない、`addr`・`ipa` がページ境界でない、
@@ -998,5 +1062,132 @@ mod tests {
         assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 3);
         assert_ne!(u32::from(HvGicIntid::EL1_VIRTUAL_TIMER.bits()), 27);
         assert_eq!(GicIntid::new(27).get(), 27);
+    }
+
+    // ---- check_assemble_input（TASK-192.15・#3797・MVM-5） ----
+
+    fn ok_input() -> HvfAssembleInput {
+        HvfAssembleInput {
+            vcpus: 1,
+            ram_size: 64 << 20,
+            layout_virtio_count: 1,
+            device_count: 1,
+            image_len: 4096,
+            initrd_len: None,
+            cmdline_len: 0,
+        }
+    }
+
+    fn assemble_err(i: HvfAssembleInput) -> (MicrovmErrorCode, &'static str) {
+        let e = check_assemble_input(&i).unwrap_err();
+        // 試験用に寿命を延ばす（リークは試験プロセスの終了で回収される）。
+        (
+            e.code(),
+            Box::leak(e.message().to_string().into_boxed_str()),
+        )
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_input_accepts_baseline() {
+        assert!(check_assemble_input(&ok_input()).is_ok());
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_vcpus_zero_invalid_and_two_unimplemented() {
+        let mut i = ok_input();
+        i.vcpus = 0;
+        assert_eq!(
+            assemble_err(i),
+            (MicrovmErrorCode::InvalidArgument, "vcpus is zero")
+        );
+        i.vcpus = 2;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::Unimplemented,
+                "hvf backend supports a single vcpu"
+            )
+        );
+        // 他の値も不正でも vcpus = 2 の Unimplemented が優先される。
+        i.ram_size = 0;
+        i.image_len = 0;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::Unimplemented);
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_ram_bounds() {
+        let mut i = ok_input();
+        i.ram_size = 0;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "guest ram size is out of range"
+            )
+        );
+        i.ram_size = HVF_MAX_GUEST_RAM_BYTES;
+        assert!(check_assemble_input(&i).is_ok());
+        i.ram_size = HVF_MAX_GUEST_RAM_BYTES + 64 * 1024;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_device_counts() {
+        let mut i = ok_input();
+        i.device_count = 33;
+        i.layout_virtio_count = 33;
+        assert_eq!(
+            assemble_err(i),
+            (MicrovmErrorCode::InvalidArgument, "too many virtio devices")
+        );
+        i.device_count = 32;
+        i.layout_virtio_count = 32;
+        assert!(check_assemble_input(&i).is_ok());
+        i.layout_virtio_count = 1;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "device layout does not match the configuration"
+            )
+        );
+    }
+
+    #[test]
+    fn mvm5_3797_assemble_image_initrd_cmdline_bounds() {
+        use crate::boot_x86::{MAX_INITRD_BYTES, MAX_KERNEL_IMAGE_BYTES};
+        let mut i = ok_input();
+        i.image_len = 0;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "kernel image length is out of range"
+            )
+        );
+        i.image_len = MAX_KERNEL_IMAGE_BYTES + 1;
+        assert_eq!(assemble_err(i).0, MicrovmErrorCode::InvalidArgument);
+        i.image_len = MAX_KERNEL_IMAGE_BYTES;
+        assert!(check_assemble_input(&i).is_ok());
+        i.initrd_len = Some(MAX_INITRD_BYTES + 1);
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "initrd length is out of range"
+            )
+        );
+        i.initrd_len = Some(MAX_INITRD_BYTES);
+        assert!(check_assemble_input(&i).is_ok());
+        i.cmdline_len = 2047;
+        assert!(check_assemble_input(&i).is_ok());
+        i.cmdline_len = 2048;
+        assert_eq!(
+            assemble_err(i),
+            (
+                MicrovmErrorCode::InvalidArgument,
+                "kernel cmdline is too long"
+            )
+        );
     }
 }

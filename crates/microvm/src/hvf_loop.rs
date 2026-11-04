@@ -21,7 +21,7 @@
 //! N 台の停止は [`stop_all`] が集約する（全台へ先に停止を要求し、共有の期限で待つ）。
 //!
 //! # 未実装（REPAIR-3）
-//! AP の起動（CPU_ON。#3891）・SysReg trap の処理。exit ごとの実処理は MMIO が #3793、PSCI / HVC は #3794 で実装済み、WFI / vtimer が #3796。
+//! AP の起動（CPU_ON。#3891）・SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
 
 use std::fmt;
 use std::sync::Arc;

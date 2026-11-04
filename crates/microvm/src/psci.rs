@@ -5,35 +5,58 @@
 //! 呼び出し元は macOS の `hvf::hvc`（レジスタの読み書きと PC の扱いはそちらの責務）。KVM の aarch64 でも再利用できるよう OS 依存を持たない。
 //!
 //! # 契約
-//! - 関数 ID は SMCCC（Arm DEN0028）に従い W0 にある。X0 の上位 32 bit は無視する（[`function_id_from_x0`]）。
-//!   PSCI_FEATURES の引数（照会する関数 ID）も W1 として同様に切り詰める。SMC32 の関数の引数（CPU_ON の W1〜W3 等）も下位 32 bit に切り詰める。
-//! - 戻り値は符号つき 32 bit（SUCCESS 0・NOT_SUPPORTED -1・INVALID_PARAMETERS -2・DENIED -3・ALREADY_ON -4・ON_PENDING -5・
-//!   INTERNAL_FAILURE -6・INVALID_ADDRESS -9）。X0 へは i64 へ符号拡張した値を書く（-1 は `0xFFFF_FFFF_FFFF_FFFF`。[`PsciReturn::to_x0`]）。
-//! - 32 bit / 64 bit の ID は別物として完全一致で引く。存在しない組み合わせ（例: `0xC400_0008`、CPU_OFF の SMC64 版）は NOT_SUPPORTED で、停止しない。
-//! - SMCCC は `HVC #0` だけを使う。imm16 が 0 でない呼び出しは関数 ID を見ず NOT_SUPPORTED で再開する（推測で成功にしない）。
+//! 節・表の番号は「一次情報の確認状況」の版（DEN0022 F.b・DEN0028 H）のもの。
+//! - 関数 ID は W0 にある（DEN0028 §2.5・§2.5.1 Table 2-1）。X0 の上位 32 bit は無視する（DEN0028 §3.1。[`function_id_from_x0`]）。
+//!   PSCI_FEATURES の引数（照会する関数 ID。DEN0022 §5.1.15 で uint32）も W1 として同様に切り詰める。
+//!   SMC32 の関数の引数（CPU_ON の W1〜W3 等。DEN0028 §2.6・DEN0022 §5.2.1）も下位 32 bit に切り詰める。
+//! - 戻り値は DEN0022 §5.2.2 Table 5（SUCCESS 0・NOT_SUPPORTED -1・INVALID_PARAMETERS -2・DENIED -3・ALREADY_ON -4・ON_PENDING -5・
+//!   INTERNAL_FAILURE -6・NOT_PRESENT -7・DISABLED -8・INVALID_ADDRESS -9）。NOT_PRESENT・DISABLED は返さないので定数を持たない。
+//!   X0 へは i64 へ符号拡張した値を書く（-1 は `0xFFFF_FFFF_FFFF_FFFF`。[`PsciReturn::to_x0`]）。SMC64 は X0 の 64 bit 符号つきが必須で、
+//!   SMC32 は W0 の 32 bit 符号つきで X0 の上位 32 bit は UNDEFINED（DEN0028 §5.1）のため、符号拡張は許された選択である。
+//!   DEN0028 §7.1 Table 7-1 の戻り値（-2 NOT_REQUIRED 等）は Arm Architecture Calls（`0x8000_xxxx`）用で PSCI の戻り値ではない。
+//! - 32 bit / 64 bit の ID は別物として完全一致で引く。存在しない組み合わせ（例: `0xC400_0008`、CPU_OFF の SMC64 版）や未知の ID は
+//!   NOT_SUPPORTED（-1）で、停止しない（DEN0028 §5.2。DEN0022 §5.3.2 も未実装の関数は NOT_SUPPORTED）。
+//! - 呼び出しは `HVC #0` だけを扱う。imm16 が 0 でない呼び出しは関数 ID を見ず NOT_SUPPORTED で再開する（推測で成功にしない）。
+//!   DEN0028 §2.10 は準拠した呼び出しの imm を 0 とし、HVC の非 0 をハイパーバイザーベンダー向けに割り当てるため、
+//!   これは仕様の強制ではなく「ベンダー定義の呼び出しを持たない本実装の選択」である。
 //! - [`PsciAction::SystemOff`] と [`PsciAction::SystemReset`] は区別して返す。ただし `hvf::hvc` はどちらも
 //!   `StopReason::GuestShutdown` に写す（再起動は対象外。区別が要る時は `StopReason` へ足し、plugin-microvm の固定名と揃える）。
 //! - PSCI_FEATURES は [`is_implemented`] の単一の表から導くため、実処理との不一致は起きない（試験で機械照合する）。
+//!   実装済みの関数に 0 を返すのは DEN0022 §5.16.2 Table 11（CPU_SUSPEND・SYSTEM_OFF2 以外は Bits 31:0 が予約で 0）と一致する。
+//! - CPU_OFF が返しうる失敗値は DENIED のみ（DEN0022 §5.1.3・§5.2.2）。成功時は戻らない。
 //! - `Err` は VMM 側の不変条件違反（caller の範囲外・状態の符号の破損）だけに使う。ゲスト由来の値の誤りは常に PSCI の戻り値で返す。
 //!
 //! # 電源状態機械（#3883）
 //! vCPU 0 は ON、他は OFF で始まる。CPU_ON は compare_exchange で OFF→ON_PENDING に進めた呼び出しだけが [`CpuPowerControl::power_on`] を呼ぶ
-//! （同じ対象への二重起動を防ぐ）。起動が失敗したら OFF へ戻す。ON_PENDING→ON は対象 vCPU が実行を始めた時点で
-//! 後続 #3891 の AP スレッドが [`PsciCpus::confirm_on`] で刻む。CPU_OFF は呼び出し元自身にしか効かず、成功したら OFF にして
-//! [`PsciAction::CpuOff`] を返す。OFF にしてから実際に parked になるまでの窓の扱いは #3891 の責務。
-//! 対象の指定（target_cpu）は MPIDR の affinity 形式（Aff3 は bit 39:32、Aff2..0 は bit 23:0、他は MBZ）で、
-//! MBZ ビットが立つ値と存在しない vCPU は INVALID_PARAMETERS。entry の妥当性（ゲスト RAM 内か）は純粋層が知らないため
-//! [`CpuPowerControl`] 側が [`PowerControlError::InvalidAddress`] で返す。
+//! （同じ対象への二重起動を防ぐ）。DEN0022 §6.6 Figure 9 の遷移に合わせ、ON の対象への CPU_ON は ALREADY_ON、
+//! ON_PENDING の対象への CPU_ON は ON_PENDING を返す（§5.1.4・§5.6.2）。起動が失敗したら OFF へ戻す。
+//! ON_PENDING→ON は対象 vCPU が実行を始めた時点で後続 #3891 の AP スレッドが [`PsciCpus::confirm_on`] で刻む。
+//! CPU_OFF は呼び出し元自身にしか効かず、成功したら OFF にして [`PsciAction::CpuOff`] を返す。
+//! OFF にしてから実際に parked になるまでの窓（§6.6 の「処理済みで OFF」との差）の扱いは #3891 の責務。
+//! 対象の指定（target_cpu）は MPIDR の affinity 形式（DEN0022 §5.1.4・§5.1.5。Aff3 は bit 39:32、Aff2 は bit 23:16、
+//! Aff1 は bit 15:8、Aff0 は bit 7:0。bit 63:40 と bit 31:24 は MBZ）。MBZ ビットが立つ値と存在しない vCPU は INVALID_PARAMETERS
+//! （§5.6.2 の「不正な MPIDR」・§5.7.2 の「存在しない affinity instance」の読みで、MBZ の違反を名指しする規定ではない）。
+//! AFFINITY_INFO の `lowest_affinity_level` は uint32 で値は 0〜3（§5.1.5）。PSCI 1.0 以降は 0 より上を支援しなくてよく、
+//! 互換の値を返すか INVALID_PARAMETERS を返すかのどちらか（§5.7.1）なので、0 以外は INVALID_PARAMETERS とする。
+//! AFFINITY_INFO の戻り値は ON 0・OFF 1・ON_PENDING 2・INVALID_PARAMETERS・DISABLED（§5.1.5・§5.7.1。DISABLED は返さない）。
+//! CPU_ON の戻り値は SUCCESS・INVALID_PARAMETERS・INVALID_ADDRESS・ALREADY_ON・ON_PENDING・INTERNAL_FAILURE・DENIED（§5.1.4・§5.6.2）。
+//! entry の妥当性（ゲスト RAM 内か）は純粋層が知らないため [`CpuPowerControl`] 側が [`PowerControlError::InvalidAddress`] で返す。
 //!
-//! # 一次情報の確認状況（REPAIR-3）
-//! 数値の戻り値は Linux の `include/uapi/linux/psci.h`（二次情報）と突き合わせた。DEN0022 / DEN0028 の本文（版・節・表の番号）は
-//! 実装時に一次情報へ到達できなかった（Arm の文書ページは本文を取得できない）ため、**版・節・表の番号は未確認**で、
-//! 上記の target_cpu の MBZ と AFFINITY_INFO の `lowest_affinity_level != 0` を INVALID_PARAMETERS とする扱いも一次情報で未照合。
-//! 一次情報で確認したら、ここへ版・節・表の番号を書き、食い違えば直す（#3883 の受け入れ条件 1 の残り）。
+//! # 一次情報の確認状況（REPAIR-3・#3920）
+//! 2026-11-04 に Arm の文書サービス（documentation-service.arm.com）の PDF で確認した。
+//! - DEN0022 F.b（PSCI 1.3・REL。文書名 `DEN0022F.b_Power_State_Coordination_Interface.pdf`）
+//! - DEN0028 H（SMCCC v1.7・品質 EAC。文書名 `DEN0028_SMCCC_1_7_H.pdf`。確認した版 H・G・F・E はいずれも EAC 品質）
 //!
-//! # 未実装（REPAIR-3）
+//! 上記の節・表の番号はこの版のもの。戻り値の数値・target_cpu の MBZ・`lowest_affinity_level` の扱いに実装との食い違いは無かった。
+//! Linux の `include/uapi/linux/psci.h` との突き合わせは補助にとどめる。
+//!
+//! # 未実装・逸脱（REPAIR-3）
 //! CPU_SUSPEND・SYSTEM_SUSPEND・SYSTEM_RESET2・SMCCC_VERSION（FDT に `arm,smccc` を出さない）・再起動。
-//! PSCI 1.0 の mandatory 関数のうち CPU_SUSPEND を返さないのは DEN0022 からの逸脱（表番号は未確認）で、電源管理を入れるときに見直す。
+//! PSCI 1.0 の mandatory 関数（DEN0022 §6.9 Table 17 の PSCI 1.0 列: PSCI_VERSION・CPU_SUSPEND・CPU_OFF・CPU_ON・AFFINITY_INFO・
+//! SYSTEM_OFF・SYSTEM_RESET・PSCI_FEATURES）のうち CPU_SUSPEND を返さない（NOT_SUPPORTED）のは DEN0022 からの逸脱で、
+//! 電源管理を入れるときに見直す。MIGRATE は NOT_SUPPORTED（MIGRATE_INFO_TYPE が 2 のとき DEN0022 §5.1.7 に合う）。
+//! SMCCC_VERSION に応答しない（NOT_SUPPORTED）のは、PSCI 1.0 以降で報告すべき（should。DEN0022 §5.16.2）との差で、
+//! 呼び出し元は SMCCC v1.0 の実装と解釈する（DEN0028 §7.2・§7.2.3）。NOT_PRESENT・DISABLED も返さない。
 //! HVF での AP の実起動と CPU_OFF 後の parked への戻しは #3891。
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -43,30 +66,30 @@ use crate::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::instruction_length;
 
-/// PSCI_VERSION。
+/// PSCI_VERSION（DEN0022 §5.1.1）。
 pub const PSCI_FN_VERSION: u32 = 0x8400_0000;
-/// CPU_OFF（SMC32 のみ。SMC64 版は無い）。
+/// CPU_OFF（SMC32 のみ。SMC64 版は無い。DEN0022 §5.1.3）。
 pub const PSCI_FN_CPU_OFF: u32 = 0x8400_0002;
-/// CPU_ON（SMC32 の呼び出し規約）。
+/// CPU_ON（SMC32 の呼び出し規約。DEN0022 §5.1.4）。
 pub const PSCI_FN_CPU_ON_32: u32 = 0x8400_0003;
 /// CPU_ON（SMC64 の呼び出し規約）。
 pub const PSCI_FN_CPU_ON_64: u32 = 0xC400_0003;
-/// AFFINITY_INFO（SMC32）。
+/// AFFINITY_INFO（SMC32。DEN0022 §5.1.5）。
 pub const PSCI_FN_AFFINITY_INFO_32: u32 = 0x8400_0004;
 /// AFFINITY_INFO（SMC64）。
 pub const PSCI_FN_AFFINITY_INFO_64: u32 = 0xC400_0004;
-/// MIGRATE_INFO_TYPE。
+/// MIGRATE_INFO_TYPE（DEN0022 §5.1.7）。
 pub const PSCI_FN_MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
 /// SYSTEM_OFF。
 pub const PSCI_FN_SYSTEM_OFF: u32 = 0x8400_0008;
 /// SYSTEM_RESET。
 pub const PSCI_FN_SYSTEM_RESET: u32 = 0x8400_0009;
-/// PSCI_FEATURES。
+/// PSCI_FEATURES（DEN0022 §5.1.15）。
 pub const PSCI_FN_FEATURES: u32 = 0x8400_000A;
-/// SMCCC_VERSION（SMCCC 1.1 以降。応答しない）。
+/// SMCCC_VERSION（SMCCC 1.1 以降で必須。DEN0028 §7.2。応答しない）。
 pub const SMCCC_FN_VERSION: u32 = 0x8000_0000;
 
-/// SUCCESS。
+/// SUCCESS（DEN0022 §5.2.2 Table 5。以降の `PSCI_RET_*` も同表）。
 pub const PSCI_RET_SUCCESS: i32 = 0;
 /// NOT_SUPPORTED。
 pub const PSCI_RET_NOT_SUPPORTED: i32 = -1;
@@ -82,15 +105,15 @@ pub const PSCI_RET_ON_PENDING: i32 = -5;
 pub const PSCI_RET_INTERNAL_FAILURE: i32 = -6;
 /// INVALID_ADDRESS。
 pub const PSCI_RET_INVALID_ADDRESS: i32 = -9;
-/// AFFINITY_INFO の ON。
+/// AFFINITY_INFO の ON（DEN0022 §5.1.5・§5.7.1）。
 pub const AFFINITY_INFO_ON: u32 = 0;
 /// AFFINITY_INFO の OFF。
 pub const AFFINITY_INFO_OFF: u32 = 1;
 /// AFFINITY_INFO の ON_PENDING。
 pub const AFFINITY_INFO_ON_PENDING: u32 = 2;
-/// PSCI 1.0（上位 16 bit がメジャー、下位 16 bit がマイナー）。
+/// PSCI 1.0（Bits 31:16 がメジャー、Bits 15:0 がマイナー。DEN0022 §5.1.1）。
 pub const PSCI_VERSION_1_0: u32 = 0x0001_0000;
-/// MIGRATE_INFO_TYPE の「Trusted OS なし（マイグレーション不要）」。
+/// MIGRATE_INFO_TYPE の「Trusted OS なし（マイグレーション不要）」（DEN0022 §5.1.7。このとき MIGRATE は NOT_SUPPORTED）。
 pub const MIGRATE_INFO_TYPE_NOT_PRESENT: u32 = 2;
 
 /// 実装した（NOT_SUPPORTED 以外を返す）関数 ID の唯一の表。PSCI_FEATURES はここから導く。
@@ -180,7 +203,7 @@ impl PsciReturn {
         Self(i64::from(value))
     }
 
-    /// X0 へ書く 64 bit 値（負数は符号拡張）。
+    /// X0 へ書く 64 bit 値（負数は符号拡張。DEN0028 §5.1: SMC64 は必須、SMC32 は X0 上位が UNDEFINED のため許された選択）。
     pub fn to_x0(self) -> u64 {
         self.0 as u64
     }
@@ -276,7 +299,8 @@ pub trait CpuPowerControl: Send + Sync {
 }
 
 /// 1 vCPU 構成の既定の実装。1 台では CPU_ON は対象が自分（ALREADY_ON）か存在しない（INVALID_PARAMETERS）ので
-/// `power_on` に到達しない。CPU_OFF は parked へ戻す機構が無いので DENIED にする。
+/// `power_on` に到達しない。CPU_OFF は parked へ戻す機構が無いので DENIED にする
+/// （DENIED は CPU_OFF が返しうる唯一の失敗値。DEN0022 §5.1.3。Trusted OS 常駐という §5.5.2 の理由ではない）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BootCpuOnly;
 
@@ -371,7 +395,7 @@ impl PsciCpus {
         })
     }
 
-    /// target_cpu（MPIDR の affinity 形式）から vCPU の index を引く。MBZ ビットが立つ値は `None`。
+    /// target_cpu（MPIDR の affinity 形式）から vCPU の index を引く。MBZ ビット（bit 63:40・31:24。DEN0022 §5.1.4）が立つ値は `None`。
     pub fn index_of_target(&self, target: u64) -> Option<u32> {
         if target & !ARM64_MPIDR_AFFINITY_MASK != 0 {
             return None;
@@ -477,7 +501,8 @@ fn cpu_off(
 
 fn affinity_info(cpus: &PsciCpus, args: &PsciArgs, wide: bool) -> Result<PsciAction, MicrovmError> {
     let target = trunc32(args.x1, wide);
-    // lowest_affinity_level は W2。0 以外（クラスタ集約）は扱わない（一次情報で未照合。モジュール doc 参照）。
+    // lowest_affinity_level は W2。0 以外（クラスタ集約）は扱わない。
+    // DEN0022 §5.7.1: PSCI 1.0 以降は 0 より上を支援しなくてよく、INVALID_PARAMETERS を返してよい。
     if args.x2 & 0xFFFF_FFFF != 0 {
         return Ok(ret(PSCI_RET_INVALID_PARAMETERS));
     }
@@ -544,6 +569,19 @@ mod tests {
     use std::sync::{Barrier, Mutex};
 
     const NS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+    /// 戻り値の定数を DEN0022 F.b §5.2.2 Table 5 の具体値で照合する（MVM-5・MVM-1・REPAIR-12・#3920）。
+    #[test]
+    fn mvm5_3920_return_codes_match_den0022_table5() {
+        assert_eq!(PSCI_RET_SUCCESS, 0);
+        assert_eq!(PSCI_RET_NOT_SUPPORTED, -1);
+        assert_eq!(PSCI_RET_INVALID_PARAMETERS, -2);
+        assert_eq!(PSCI_RET_DENIED, -3);
+        assert_eq!(PSCI_RET_ALREADY_ON, -4);
+        assert_eq!(PSCI_RET_ON_PENDING, -5);
+        assert_eq!(PSCI_RET_INTERNAL_FAILURE, -6);
+        assert_eq!(PSCI_RET_INVALID_ADDRESS, -9);
+    }
 
     /// 呼び出しを記録し、結果を差し替えられる偽の電源制御。
     #[derive(Default)]

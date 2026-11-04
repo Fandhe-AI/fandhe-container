@@ -1,4 +1,4 @@
-//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738）。`--ignored` 指定時だけ走る。
+//! `/dev/kvm` 実機前提の試験（MVM-1・TASK-74.1.1・TASK-74.1.2・TASK-74.4.1・TASK-74.4.2・TASK-74.2.3・TASK-74.3.2・TASK-75.1・TASK-75.2・TASK-75.3.1・TASK-75.3.2・TASK-75.4.1・TASK-75.4.2・TASK-75.5・#3733・#3734・#3735・#3738・#3918）。`--ignored` 指定時だけ走る。
 //! 必要環境: Linux・`/dev/kvm` の読み書き権限（`kvm` グループ等）。root は不要。
 #![cfg(target_os = "linux")]
 
@@ -1698,6 +1698,175 @@ fn kvm_device_serial_output_reaches_host() {
         MicroVm::assemble(&dev, config).unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
     );
+}
+
+/// COM1（IRQ 4）の割り込みが IOAPIC pin 4 経由でゲストへ届くことの合成ゲストを組む（#3918）。
+/// IDT はホストが GPA `IDT_BASE` に置く（vector 0x30 の 64-bit 割り込みゲート）。ゲストは lidt → PIC 全マスク
+/// （GSI 4 は PIC にも入り、BSP の LINT0 は ExtINT で解除済みのため、マスクしないと vector 4 で届く）→ LAPIC SVR の
+/// software enable → IOAPIC pin 4 を vector 0x30・fixed・edge・active high・unmask・宛先 APIC ID 0 にする
+/// （Linux と MP テーブルと同じ経路で pin 4 の routing まで確かめる）→ IER に `ier` を書き → sti → hlt ループ。
+/// handler は IIR を読み（線が下がる）、IER = 0 にして IIR の値を THR へ出し、LSR.DR なら RBR も THR へ出して ud2 で終わる。
+/// 戻り値は (エントリのコード, handler のエントリからの offset)。
+#[cfg(target_arch = "x86_64")]
+fn com1_irq_guest_code(ier: u8, idtr_gpa: u32) -> (Vec<u8>, usize) {
+    let mut c: Vec<u8> = Vec::new();
+    // mov eax, idtr_gpa; lidt [rax]
+    c.push(0xB8);
+    c.extend_from_slice(&idtr_gpa.to_le_bytes());
+    c.extend_from_slice(&[0x0F, 0x01, 0x18]);
+    // mov al,0xFF; out 0x21,al; out 0xA1,al
+    c.extend_from_slice(&[0xB0, 0xFF, 0xE6, 0x21, 0xE6, 0xA1]);
+    // mov edi,0xFEE000F0; mov dword [rdi],0x1FF
+    c.extend_from_slice(&[
+        0xBF, 0xF0, 0x00, 0xE0, 0xFE, 0xC7, 0x07, 0xFF, 0x01, 0x00, 0x00,
+    ]);
+    // mov edi,0xFEC00000 (IOREGSEL。IOWIN は +0x10)
+    c.extend_from_slice(&[0xBF, 0x00, 0x00, 0xC0, 0xFE]);
+    // redirection entry の上位（index 0x19）= 0（宛先 APIC ID 0）
+    c.extend_from_slice(&[0xC7, 0x07, 0x19, 0x00, 0x00, 0x00]);
+    c.extend_from_slice(&[0xC7, 0x47, 0x10, 0x00, 0x00, 0x00, 0x00]);
+    // 下位（index 0x18）= vector 0x30・fixed・edge・active high・unmask
+    c.extend_from_slice(&[0xC7, 0x07, 0x18, 0x00, 0x00, 0x00]);
+    c.extend_from_slice(&[0xC7, 0x47, 0x10, 0x30, 0x00, 0x00, 0x00]);
+    // mov dx,0x3F9; mov al,ier; out dx,al; sti; L: hlt; jmp L
+    c.extend_from_slice(&[
+        0x66, 0xBA, 0xF9, 0x03, 0xB0, ier, 0xEE, 0xFB, 0xF4, 0xEB, 0xFD,
+    ]);
+    let handler = c.len();
+    c.extend_from_slice(&[
+        0x66, 0xBA, 0xFA, 0x03, // mov dx,0x3FA
+        0xEC, // in al,dx (IIR)
+        0x88, 0xC3, // mov bl,al
+        0x66, 0xBA, 0xF9, 0x03, // mov dx,0x3F9
+        0x30, 0xC0, // xor al,al
+        0xEE, // out dx,al (IER = 0)
+        0x66, 0xBA, 0xF8, 0x03, // mov dx,0x3F8
+        0x88, 0xD8, // mov al,bl
+        0xEE, // out dx,al (THR <- IIR)
+        0x66, 0xBA, 0xFD, 0x03, // mov dx,0x3FD
+        0xEC, // in al,dx (LSR)
+        0xA8, 0x01, // test al,1
+        0x74, 0x06, // jz ud2
+        0x66, 0xBA, 0xF8, 0x03, // mov dx,0x3F8
+        0xEC, // in al,dx (RBR)
+        0xEE, // out dx,al (THR <- RBR)
+        0x0F, 0x0B, // ud2
+    ]);
+    (c, handler)
+}
+
+/// `com1_irq_guest_code` のゲストを 1 回走らせる。`push` があれば、ゲストが hlt で寝た頃にホストのスレッドから
+/// `push_input` する（別スレッドの `KVM_IRQ_LINE` で寝ているゲストを起こす経路）。`expect_irq` が偽なら割り込みが来ない
+/// 負の対照で、期限（300 ms）内に終わらないことと `Requested` での停止を返す。
+/// 戻り値は (出力, 停止理由, irq_line_errors)。
+#[cfg(target_arch = "x86_64")]
+fn run_com1_irq_scenario(
+    ier: u8,
+    push: Option<&[u8]>,
+    expect_irq: bool,
+) -> (Vec<u8>, fandhe_container_microvm::microvm::StopReason, u64) {
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::time::{Duration, Instant};
+
+    /// ブート配置（0x0100_0000 台・0x0200_0000 台）と重ならない IDT の置き場。
+    const IDT_BASE: u64 = 0x0300_0000;
+    const IDTR_GPA: u64 = IDT_BASE + 0x1000;
+    const VECTOR: u64 = 0x30;
+    const BOOT_CS_SELECTOR: u16 = 0x10;
+
+    let dev = match KvmDevice::open() {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
+        }
+    };
+    let (code, handler) = com1_irq_guest_code(ier, IDTR_GPA as u32);
+    let mut img = bzimage::header_only();
+    bzimage::put_entry_code(&mut img, &code);
+
+    let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![],
+        },
+    )
+    .unwrap();
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    {
+        let handler_addr = bzimage::EXPECTED_ENTRY + handler as u64;
+        let mut gate = [0u8; 16];
+        gate[0..2].copy_from_slice(&((handler_addr & 0xFFFF) as u16).to_le_bytes());
+        gate[2..4].copy_from_slice(&BOOT_CS_SELECTOR.to_le_bytes());
+        gate[5] = 0x8E; // present・DPL 0・64-bit interrupt gate
+        gate[6..8].copy_from_slice(&(((handler_addr >> 16) & 0xFFFF) as u16).to_le_bytes());
+        gate[8..12].copy_from_slice(&((handler_addr >> 32) as u32).to_le_bytes());
+        let mut idtr = [0u8; 10];
+        idtr[0..2].copy_from_slice(&((VECTOR as u16) * 16 + 15).to_le_bytes());
+        idtr[2..10].copy_from_slice(&IDT_BASE.to_le_bytes());
+        let mem = vm.memory_mut();
+        mem.write_at(GuestAddress::new(IDT_BASE + VECTOR * 16), &gate)
+            .unwrap();
+        mem.write_at(GuestAddress::new(IDTR_GPA), &idtr).unwrap();
+    }
+    let console = vm.serial_console();
+    let running = vm.start(&loaded).unwrap();
+    if let Some(data) = push {
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(console.push_input(data).unwrap().accepted, data.len());
+    }
+    if expect_irq {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !running.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(running.is_finished(), "guest did not receive IRQ 4");
+    } else {
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!running.is_finished(), "unexpected IRQ 4 reached the guest");
+    }
+    let errors = console.stats().unwrap().irq_line_errors;
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    (console.take_output().unwrap(), report.reason, errors)
+}
+
+/// MVM-1・MVM-5・REPAIR-3・#3918: COM1（IRQ 4）の UART の割り込み線が `KVM_IRQ_LINE` で IOAPIC pin 4 へ届き、
+/// ゲストが vector 0x30 の handler で IIR を読む。(a) IER = ETBEI（THRE）→ 出力 `[0x02]`、(b) IER = ERBFI で寝ている
+/// ゲストへホストが `push_input` → `[0x04, b'k']`、(c) IER = 0 では届かない（負の対照）。いずれも `irq_line_errors == 0`。
+/// 実機での実行と記録は #3781（人間担当）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_com1_irq4_reaches_guest() {
+    use fandhe_container_microvm::microvm::StopReason;
+
+    let (out, reason, errors) = run_com1_irq_scenario(0x02, None, true);
+    assert_eq!(out, vec![0x02], "THRE scenario");
+    assert_eq!(reason, StopReason::GuestShutdown);
+    assert_eq!(errors, 0);
+
+    let (out, reason, errors) = run_com1_irq_scenario(0x01, Some(b"k"), true);
+    assert_eq!(out, vec![0x04, b'k'], "RDA scenario");
+    assert_eq!(reason, StopReason::GuestShutdown);
+    assert_eq!(errors, 0);
+
+    let (out, reason, errors) = run_com1_irq_scenario(0x00, None, false);
+    assert!(out.is_empty(), "negative control");
+    assert_eq!(reason, StopReason::Requested);
+    assert_eq!(errors, 0);
+}
+
+/// #3918 の試験用: x86_64 以外では組み立てが先に `Unimplemented` で失敗する（aarch64 の線は #3696・#3898）。
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_com1_irq4_reaches_guest() {
+    assert_unimplemented_assemble();
 }
 
 /// MVM-1・REPAIR-5・TASK-75.4・#3736: 自己ループするゲスト（`jmp $`）に対し、`RunningMicroVm::stop` が

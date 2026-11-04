@@ -12,7 +12,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 target="$script_dir/build-microvm-test-initrd.sh"
 export LC_ALL=C
 
-unset MICROVM_TEST_INITRD_OUTPUT_DIR MICROVM_TEST_INITRD_COMPRESS MICROVM_TEST_INITRD_UNAME_S \
+unset MICROVM_TEST_INITRD_OUTPUT_DIR MICROVM_TEST_INITRD_ARCH MICROVM_TEST_INITRD_COMPRESS MICROVM_TEST_INITRD_UNAME_S \
     MICROVM_TEST_INITRD_GZIP MICROVM_TEST_INITRD_TEST_SANDBOX MICROVM_TEST_INITRD_VARIANT
 
 # 初版（#3770）のゴールデン。
@@ -328,38 +328,142 @@ newout
 run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant block-read --output-dir "$out"
 check "14 windows host refused for block-read" "2 unsupported-os" "$rc $(errcode)"
 
-# --- 19: variant net-tx（#3894） ---
+# --- 15: aarch64 の成功（#3895） ---
+newout
+run "$target" --arch aarch64 --output-dir "$out"
+check "15 exit code" 0 "$rc"
+check "15 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+check "15 output files" "build-info.txt initrd.cpio" "$(find "$out" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ' | sed 's/ $//')"
+if [ -n "$(find "$out" -maxdepth 0 -perm 0700 -print)" ]; then ok "15 output dir mode is 0700"; else ng "15 output dir mode is not 0700"; fi
+a64cpio="$out/initrd.cpio"
+a64out="$out"
+
+# --- 16: aarch64 の newc と ELF と命令列 ---
+check "16 entries" "init 000081ed 00000000 00000000 212
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$a64cpio")"
+a64init="$sb/init-aarch64.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$a64cpio" | head -c 212 >"$a64init"
+check "16 init size" 212 "$(wc -c <"$a64init" | tr -d ' ')"
+check "16 magic class data" "7f454c460201" "$(hexat "$a64init" 0 6)"
+check "16 e_type" 2 "$(leat "$a64init" 16 2)"
+check "16 e_machine is aarch64" 183 "$(leat "$a64init" 18 2)"
+check "16 e_entry" $((0x400078)) "$(leat "$a64init" 24 8)"
+check "16 e_phoff" 64 "$(leat "$a64init" 32 8)"
+check "16 e_flags" 0 "$(leat "$a64init" 48 4)"
+check "16 e_phnum" 1 "$(leat "$a64init" 56 2)"
+check "16 p_type is PT_LOAD" 1 "$(leat "$a64init" 64 4)"
+check "16 p_flags R+X" 5 "$(leat "$a64init" 68 4)"
+check "16 p_vaddr" $((0x400000)) "$(leat "$a64init" 80 8)"
+check "16 p_filesz" 212 "$(leat "$a64init" 96 8)"
+check "16 p_memsz" 212 "$(leat "$a64init" 104 8)"
+check "16 write sequence" "200080d2c1010010020480d2080880d2010000d4" "$(hexat "$a64init" 120 20)"
+check "16 movz x8,#64 (write)" "080880d2" "$(hexat "$a64init" 132 4)"
+check "16 reboot args" "a0d59b5220dcbf72212d83524102a572e2ac88526224a072" "$(hexat "$a64init" 140 24)"
+check "16 movz x8,#142 (reboot)" "c81180d2" "$(hexat "$a64init" 164 4)"
+check "16 second svc" "010000d4" "$(hexat "$a64init" 168 4)"
+check "16 yield ; b -4" "3f2003d5ffffff17" "$(hexat "$a64init" 172 8)"
+check "16 message" "fandhe-microvm-test: init ok v1" "$(tail -c +181 "$a64init" | head -c 31)"
+check "16 message newline" "0a" "$(hexat "$a64init" 211 1)"
+
+# --- 17: aarch64 のゴールデンと build-info ---
+# ゴールデンは #3895 の初版（init の機械語・メッセージを意図して変えたときだけ更新する）。
+golden_a64_init_sha="b860ab287796f56bad020e164f88571ccbdaae52f6dfdbbd42928c5b8f4ff093"
+golden_a64_initrd_sha="dfe39d0cc9bb788496c2eb13a72bbe5f3217a7796c866182a2b69dce3a4060cb"
+check "17 init sha256" "$golden_a64_init_sha" "$(sha_of "$a64init")"
+check "17 initrd sha256" "$golden_a64_initrd_sha" "$(sha_of "$a64cpio")"
+check "17 build-info" "init_sha256=$golden_a64_init_sha
+init_bytes=212
+initrd_file=initrd.cpio
+initrd_sha256=$golden_a64_initrd_sha
+compress=none
+arch=aarch64
+format=newc
+variant=default
+message=fandhe-microvm-test: init ok v1" "$(grep -v '^host=' "$a64out/build-info.txt")"
+
+# --- 18: aarch64 の決定性と gzip ---
+newout
+run "$target" --arch aarch64 --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$a64cpio"; then ok "18 second aarch64 run is byte-identical"; else ng "18 second aarch64 run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --arch aarch64 --output-dir "$out" --compress gzip
+    check "18 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$a64cpio"; then ok "18 gunzip equals the plain aarch64 archive"; else ng "18 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 18)"
+fi
+
+# --- 19: x86_64 の既定の生成物が変わらない ---
+newout
+run "$target" --arch x86_64 --output-dir "$out"
+check "19 explicit --arch x86_64 exit code" 0 "$rc"
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "19 --arch x86_64 equals the default"; else ng "19 --arch x86_64 differs from the default"; fi
+check "19 --arch x86_64 sha256" "$golden_initrd_sha" "$(sha_of "$out/initrd.cpio")"
+newout
+run env MICROVM_TEST_INITRD_ARCH=x86_64 "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "19 env x86_64 equals the default"; else ng "19 env x86_64 differs from the default"; fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=bogus "$target" --arch aarch64 --output-dir "$out"
+check "19 CLI wins over env" "0" "$rc"
+if cmp -s "$out/initrd.cpio" "$a64cpio"; then ok "19 CLI aarch64 over env"; else ng "19 CLI aarch64 over env differs"; fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$a64cpio"; then ok "19 env aarch64 equals --arch aarch64"; else ng "19 env aarch64 differs"; fi
+
+# --- 20: 不正な --arch は固定の文言で拒否 ---
+for bad in bogus arm64 amd64 ""; do
+    newout
+    run "$target" --arch "$bad" --output-dir "$out"
+    check "20 --arch '$bad' rejected" "2 bad-argument" "$rc $(errcode)"
+    check "20 --arch '$bad' nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
+done
+newout
+run "$target" --arch bogus --output-dir "$out"
+check "20 message" "error: code=bad-argument message=--arch must be x86_64 or aarch64" "$(grep '^error:' "$sb/o.err" | head -n 1)"
+run "$target" --arch
+check "20 missing value" "2 bad-argument" "$rc $(errcode)"
+run env MICROVM_TEST_INITRD_ARCH=bogus "$target" --output-dir "$out"
+check "20 bad env value" "2 bad-argument" "$rc $(errcode)"
+
+# --- 21: block-read は aarch64 では拒否する ---
+newout
+run "$target" --variant block-read --arch aarch64 --output-dir "$out"
+check "21 block-read with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
+check "21 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
+
+# --- 22: variant net-tx（#3894） ---
 newout
 run "$target" --variant net-tx --output-dir "$out"
-check "19 exit code" 0 "$rc"
-check "19 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+check "22 exit code" 0 "$rc"
+check "22 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
 ncpio="$out/initrd.cpio"
-check "19 entries" "init 000081ed 00000000 00000000 491
+check "22 entries" "init 000081ed 00000000 00000000 491
 TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$ncpio")"
 ninit="$sb/init-net-tx.bin"
 tail -c +$((110 + 5 + 1 + 1)) "$ncpio" | head -c 491 >"$ninit"
-check "19 init size" 491 "$(wc -c <"$ninit" | tr -d ' ')"
-check "19 magic class data" "7f454c460201" "$(hexat "$ninit" 0 6)"
-check "19 e_type" 2 "$(leat "$ninit" 16 2)"
-check "19 e_machine" 62 "$(leat "$ninit" 18 2)"
-check "19 e_entry" $((0x400078)) "$(leat "$ninit" 24 8)"
-check "19 e_phoff" 64 "$(leat "$ninit" 32 8)"
-check "19 e_phnum" 1 "$(leat "$ninit" 56 2)"
-check "19 p_type is PT_LOAD" 1 "$(leat "$ninit" 64 4)"
-check "19 p_flags R+X" 5 "$(leat "$ninit" 68 4)"
-check "19 p_vaddr" $((0x400000)) "$(leat "$ninit" 80 8)"
-check "19 p_filesz" 491 "$(leat "$ninit" 96 8)"
-check "19 p_memsz" 491 "$(leat "$ninit" 104 8)"
-check "19 code (239 bytes)" "$golden_net_tx_code" "$(hexat "$ninit" 120 239)"
-check "19 sockaddr_ll protocol htons(0x88B5)" "66c7442428110066c744242a88b5" "$(hexat "$ninit" 234 14)"
-check "19 frame (60 bytes)" "$golden_net_tx_frame" "$(hexat "$ninit" 359 60)"
-check "19 ok message" "fandhe-microvm-test: net tx ok v1" "$(tail -c +420 "$ninit" | head -c 33)"
-check "19 ok message newline" "0a" "$(hexat "$ninit" 452 1)"
-check "19 failed message" "fandhe-microvm-test: net tx failed v1" "$(tail -c +454 "$ninit" | head -c 37)"
-check "19 failed message newline" "0a" "$(hexat "$ninit" 490 1)"
-check "19 init sha256" "$golden_net_tx_init_sha" "$(sha_of "$ninit")"
-check "19 initrd sha256" "$golden_net_tx_initrd_sha" "$(sha_of "$ncpio")"
-check "19 build-info" "init_sha256=$golden_net_tx_init_sha
+check "22 init size" 491 "$(wc -c <"$ninit" | tr -d ' ')"
+check "22 magic class data" "7f454c460201" "$(hexat "$ninit" 0 6)"
+check "22 e_type" 2 "$(leat "$ninit" 16 2)"
+check "22 e_machine" 62 "$(leat "$ninit" 18 2)"
+check "22 e_entry" $((0x400078)) "$(leat "$ninit" 24 8)"
+check "22 e_phoff" 64 "$(leat "$ninit" 32 8)"
+check "22 e_phnum" 1 "$(leat "$ninit" 56 2)"
+check "22 p_type is PT_LOAD" 1 "$(leat "$ninit" 64 4)"
+check "22 p_flags R+X" 5 "$(leat "$ninit" 68 4)"
+check "22 p_vaddr" $((0x400000)) "$(leat "$ninit" 80 8)"
+check "22 p_filesz" 491 "$(leat "$ninit" 96 8)"
+check "22 p_memsz" 491 "$(leat "$ninit" 104 8)"
+check "22 code (239 bytes)" "$golden_net_tx_code" "$(hexat "$ninit" 120 239)"
+check "22 sockaddr_ll protocol htons(0x88B5)" "66c7442428110066c744242a88b5" "$(hexat "$ninit" 234 14)"
+check "22 frame (60 bytes)" "$golden_net_tx_frame" "$(hexat "$ninit" 359 60)"
+check "22 ok message" "fandhe-microvm-test: net tx ok v1" "$(tail -c +420 "$ninit" | head -c 33)"
+check "22 ok message newline" "0a" "$(hexat "$ninit" 452 1)"
+check "22 failed message" "fandhe-microvm-test: net tx failed v1" "$(tail -c +454 "$ninit" | head -c 37)"
+check "22 failed message newline" "0a" "$(hexat "$ninit" 490 1)"
+check "22 init sha256" "$golden_net_tx_init_sha" "$(sha_of "$ninit")"
+check "22 initrd sha256" "$golden_net_tx_initrd_sha" "$(sha_of "$ncpio")"
+check "22 build-info" "init_sha256=$golden_net_tx_init_sha
 init_bytes=491
 initrd_file=initrd.cpio
 initrd_sha256=$golden_net_tx_initrd_sha
@@ -372,26 +476,32 @@ message_ok=fandhe-microvm-test: net tx ok v1
 message_failed=fandhe-microvm-test: net tx failed v1" "$(grep -v '^host=' "$out/build-info.txt")"
 newout
 run "$target" --variant net-tx --output-dir "$out"
-if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "19 second run is byte-identical"; else ng "19 second run differs"; fi
+if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "22 second run is byte-identical"; else ng "22 second run differs"; fi
 if command -v gzip >/dev/null 2>&1; then
     newout
     run "$target" --variant net-tx --output-dir "$out" --compress gzip
-    check "19 gzip exit code" 0 "$rc"
-    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$ncpio"; then ok "19 gunzip equals the plain archive"; else ng "19 gunzip differs"; fi
+    check "22 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$ncpio"; then ok "22 gunzip equals the plain archive"; else ng "22 gunzip differs"; fi
 else
-    echo "skip: gzip is not available (case 19 gzip)"
+    echo "skip: gzip is not available (case 22 gzip)"
 fi
 
-# --- 20: net-tx の選択（環境変数・CLI の優先・Windows の拒否） ---
+# --- 23: net-tx の選択（環境変数・CLI の優先・Windows の拒否） ---
 newout
 run env MICROVM_TEST_INITRD_VARIANT=net-tx "$target" --output-dir "$out"
-if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "20 env variant selects net-tx"; else ng "20 env variant ignored"; fi
+if cmp -s "$out/initrd.cpio" "$ncpio"; then ok "23 env variant selects net-tx"; else ng "23 env variant ignored"; fi
 newout
 run env MICROVM_TEST_INITRD_VARIANT=net-tx "$target" --variant default --output-dir "$out"
-if cmp -s "$out/initrd.cpio" "$cpio"; then ok "20 CLI variant wins over env"; else ng "20 CLI variant did not win"; fi
+if cmp -s "$out/initrd.cpio" "$cpio"; then ok "23 CLI variant wins over env"; else ng "23 CLI variant did not win"; fi
 newout
 run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-tx --output-dir "$out"
-check "20 windows host refused for net-tx" "2 unsupported-os" "$rc $(errcode)"
+check "23 windows host refused for net-tx" "2 unsupported-os" "$rc $(errcode)"
+
+# --- 24: net-tx は aarch64 では拒否する ---
+newout
+run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+check "24 net-tx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
+check "24 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

@@ -54,6 +54,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::hvf_smp::VmShutdown;
 use crate::hvf_wake::WfiWaker;
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
@@ -139,6 +140,7 @@ impl HvfGic {
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
             waker: WfiWaker::default(),
+            shutdown: Arc::new(VmShutdown::new()),
             teardown: TeardownMark::new(),
         })
     }
@@ -154,6 +156,8 @@ pub struct VmWithGic {
     alive: Arc<RwLock<bool>>,
     /// WFI の待ちを起こす通知口。SPI の sink と vCPU スレッドが共有する（#3887）。
     waker: WfiWaker,
+    /// VM 全体の終了通知（SYSTEM_OFF・失敗・BSP の終了で全 vCPU を止める。MVM-5・MVM-1・REPAIR-5）。
+    shutdown: Arc<VmShutdown>,
     /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
     teardown: TeardownMark,
 }
@@ -191,6 +195,11 @@ impl VmWithGic {
     /// WFI の待ちを起こす通知口の clone（#3887）。`hvf::vcpu` が `TimerHandler` と kick へ結ぶ。
     pub fn wfi_waker(&self) -> WfiWaker {
         self.waker.clone()
+    }
+
+    /// VM 全体の終了通知（全 vCPU スレッドが共有する）。
+    pub fn shutdown(&self) -> Arc<VmShutdown> {
+        Arc::clone(&self.shutdown)
     }
 
     /// GIC の配置の記録。

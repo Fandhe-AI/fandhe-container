@@ -332,6 +332,7 @@ impl VcpuThread {
         let mut handlers = handlers;
         handlers.timer.set_waker(waker.clone());
         let kick_mailbox = Arc::clone(&mailbox);
+        let shutdown = vm.shutdown();
         let handle = spawn_loop(
             &name,
             config.create_deadline,
@@ -362,7 +363,16 @@ impl VcpuThread {
                     canceller: vcpu.canceller(),
                     mailbox: Some(kick_mailbox),
                 };
+                let peer = (vcpu.canceller(), Arc::clone(&mailbox), waker.clone());
                 let stop = start.ready(WakingKick::new(kick, waker));
+                shutdown.register(
+                    Arc::clone(&stop),
+                    Box::new(move || {
+                        let _ = peer.0.cancel();
+                        peer.1.notify();
+                        peer.2.notify();
+                    }),
+                );
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
                 let reason = run_parked_ap(
                     &mailbox,
@@ -375,6 +385,8 @@ impl VcpuThread {
                     |e, regs| boot_ap(&mut e.0, regs),
                     |e, x| dispatch(e, &mut handlers, x),
                 );
+                // VM の終了（SYSTEM_OFF・失敗。CPU_OFF の Park ではない）を他の vCPU へ伝える。
+                shutdown.on_vcpu_end(reason);
                 let stats = exec.stats();
                 // 破棄は teardown のときだけ（以後の vCPU 作成を拒否してから owning thread で破棄する）。
                 vm.mark_teardown();
@@ -408,6 +420,7 @@ impl VcpuThread {
         // WFI の待ちを VM の通知口に結ぶ（SPI の注入と停止要求の kick が起こす。#3887）。呼び出し側がどの `TimerHandler` を渡しても同じ。
         let waker = vm.wfi_waker();
         handlers.timer.set_waker(waker.clone());
+        let shutdown = vm.shutdown();
         let handle = spawn_loop(
             "hvf-vcpu-0",
             config.create_deadline,
@@ -425,6 +438,7 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
+                let peer = (vcpu.canceller(), waker.clone());
                 let kick = WakingKick::new(
                     HvfKick {
                         canceller: vcpu.canceller(),
@@ -445,10 +459,19 @@ impl VcpuThread {
                 } else {
                     start.ready(kick)
                 };
+                shutdown.register(
+                    Arc::clone(&stop),
+                    Box::new(move || {
+                        let _ = peer.0.cancel();
+                        peer.1.notify();
+                    }),
+                );
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
                 let reason = run_loop(&mut exec, &stop, slice, observer.as_deref(), |e, x| {
                     dispatch(e, &mut handlers, x)
                 });
+                // BSP の終了（SYSTEM_OFF・失敗）も VM の終了として AP へ伝える。
+                shutdown.on_vcpu_end(reason);
                 let stats = exec.stats();
                 if gated {
                     // これ以後の vCPU 作成を拒否する。vCPU の破棄は teardown の一部としてだけ起きる。

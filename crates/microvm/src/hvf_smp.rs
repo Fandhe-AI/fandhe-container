@@ -24,8 +24,9 @@
 //! - ビッグエンディアンのゲストは対象外（`SCTLR_EL1.EE` を 0 にして起動する。`boot_arm64::sctlr_for_cpu_on`）。
 //! - `hvf_wake::WfiWaker` は単一の待ち手のため、複数 vCPU が WFI すると通知を取り合う。即時性は保証されず、WFI の待ちの上限が
 //!   安全網になるだけ。
-//! - AP の終了（SYSTEM_OFF・fail-closed の停止）は `VcpuSet::is_finished` で VM 全体の終了として呼び出し元に伝わる。AP 自身のスレッドから
-//!   BSP の実行を直接止める経路は持たない。
+//! - VM の終了（SYSTEM_OFF・SYSTEM_RESET・fail-closed の停止・異常終了。CPU_OFF の Park とは別）は、終わった vCPU のスレッドが
+//!   [`VmShutdown::trigger`] を呼び、全 vCPU の停止フラグを立てて kick する（BSP の実行・AP の parked 待ちを即解除）。
+//!   呼び出し側の `stop` を待たずに他の vCPU が止まる。`VcpuSet::is_finished` は従来どおり状態を調べるだけ。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -142,6 +143,89 @@ impl ApMailbox {
     pub fn close(&self) {
         *self.lock() = MailboxState::Closed;
         self.cv.notify_all();
+    }
+}
+
+/// 他の vCPU を起こす手段（canceller の kick・メールボックスの notify・WFI の waker をまとめた閉包）。
+pub type PeerKick = Box<dyn Fn() + Send + Sync>;
+
+struct ShutdownPeer {
+    stop: Arc<AtomicBool>,
+    kick: PeerKick,
+}
+
+/// VM 全体の終了通知（全 vCPU で共有。VM の終了と CPU_OFF の Park を区別する。MVM-5・MVM-1・REPAIR-5）。
+///
+/// vCPU スレッドは実行体の準備ができたら [`Self::register`] で自分の停止フラグと kick を登録し、停止理由が `Requested`
+/// 以外で終わるとき（SYSTEM_OFF・SYSTEM_RESET・失敗・BSP の終了）に [`Self::on_vcpu_end`] 経由で [`Self::trigger`] を呼ぶ。
+/// `trigger` は登録済みの全 vCPU の停止フラグを立てて kick し、以後の `register` は即座に停止状態で受ける
+/// （登録が `trigger` と競合しても取りこぼさない）。冪等。poison は状態が単純なため `into_inner` で受ける。
+#[derive(Default)]
+pub struct VmShutdown {
+    state: Mutex<ShutdownState>,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    triggered: bool,
+    peers: Vec<ShutdownPeer>,
+}
+
+impl std::fmt::Debug for VmShutdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmShutdown")
+            .field("triggered", &self.is_triggered())
+            .finish()
+    }
+}
+
+impl VmShutdown {
+    /// 未通知の状態で作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ShutdownState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 既に VM の終了が通知されたか。
+    pub fn is_triggered(&self) -> bool {
+        self.lock().triggered
+    }
+
+    /// vCPU の停止フラグと kick を登録する。既に通知済みなら、登録せずその場で停止フラグを立てて kick する。
+    pub fn register(&self, stop: Arc<AtomicBool>, kick: PeerKick) {
+        let mut g = self.lock();
+        if g.triggered {
+            drop(g);
+            stop.store(true, Ordering::Release);
+            kick();
+            return;
+        }
+        g.peers.push(ShutdownPeer { stop, kick });
+    }
+
+    /// VM の終了を通知する。登録済みの全 vCPU の停止フラグを立ててから kick する（フラグが先。kick で起きた側が必ず見える）。
+    pub fn trigger(&self) {
+        let peers = {
+            let mut g = self.lock();
+            g.triggered = true;
+            std::mem::take(&mut g.peers)
+        };
+        for p in &peers {
+            p.stop.store(true, Ordering::Release);
+        }
+        for p in &peers {
+            (p.kick)();
+        }
+    }
+
+    /// vCPU スレッドの終了時に呼ぶ。`Requested` 以外（ゲスト起因の終了・失敗）なら VM の終了を通知する。
+    pub fn on_vcpu_end(&self, reason: StopReason) {
+        if reason != StopReason::Requested {
+            self.trigger();
+        }
     }
 }
 
@@ -564,5 +648,112 @@ mod tests {
         stop.store(true, Ordering::Release);
         m.notify();
         assert_eq!(t.join().unwrap(), ApWake::Stopped);
+    }
+
+    /// 実行中の BSP 役と parked の AP を VM の共有通知に結び、AP の SYSTEM_OFF 相当の終了が BSP を止める。
+    /// MVM-5・MVM-1・REPAIR-5・#3891。
+    #[test]
+    fn mvm5_3891_ap_vm_end_stops_running_bsp() {
+        struct Spin;
+        impl VcpuExec for Spin {
+            fn run(&mut self, _slice: Duration) -> Result<HvVcpuExit, MicrovmError> {
+                std::thread::sleep(Duration::from_millis(1));
+                Err(MicrovmError::new(
+                    MicrovmErrorCode::DeadlineExceeded,
+                    "slice",
+                ))
+            }
+            fn stats(&self) -> HvRunStats {
+                HvRunStats::default()
+            }
+        }
+        let r = rig();
+        let sd = Arc::new(VmShutdown::new());
+        let bsp_stop = Arc::new(AtomicBool::new(false));
+        sd.register(Arc::clone(&bsp_stop), Box::new(|| {}));
+        let m = Arc::clone(&r.mailbox);
+        sd.register(Arc::clone(&r.stop), Box::new(move || m.notify()));
+        let (b2, sd2) = (Arc::clone(&bsp_stop), Arc::clone(&sd));
+        let bsp = std::thread::spawn(move || {
+            let reason = crate::hvf_loop::run_loop(
+                &mut Spin,
+                &b2,
+                Duration::from_millis(1),
+                None,
+                |_, _| Ok(ExitAction::Continue),
+            );
+            sd2.on_vcpu_end(reason);
+            reason
+        });
+        // AP は SYSTEM_OFF 相当（dispatch が GuestShutdown で停止）で終わる。
+        let sd3 = Arc::clone(&sd);
+        let (cpus, mailbox, stop) = (
+            Arc::clone(&r.cpus),
+            Arc::clone(&r.mailbox),
+            Arc::clone(&r.stop),
+        );
+        let ap = std::thread::spawn(move || {
+            let mut exec = FakeExec {
+                log: Arc::default(),
+                cpus: Arc::clone(&cpus),
+                index: 1,
+                stop: Arc::clone(&stop),
+                exits: vec![hvc_exit()],
+            };
+            let reason = run_parked_ap(
+                &mailbox,
+                &stop,
+                &cpus,
+                1,
+                &mut exec,
+                Duration::from_millis(1),
+                None,
+                |_, _| Ok(()),
+                |_, _| Ok(ExitAction::Stop(StopReason::GuestShutdown)),
+            );
+            sd3.on_vcpu_end(reason);
+            reason
+        });
+        psci::handle_call(
+            &r.cpus,
+            r.power.as_ref(),
+            0,
+            args(PSCI_FN_CPU_ON_64, 1, ENTRY, 0),
+        )
+        .unwrap();
+        assert_eq!(ap.join().unwrap(), StopReason::GuestShutdown);
+        // BSP は呼び出し側の stop 無しで止まる。
+        let t = std::time::Instant::now();
+        while !bsp.is_finished() {
+            assert!(t.elapsed() < LONG, "bsp kept running after the vm ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bsp.join().unwrap(), StopReason::Requested);
+        assert!(sd.is_triggered());
+    }
+
+    /// BSP の失敗終了が parked の AP を解く。Requested の終了は通知しない。通知後の登録は即停止状態。
+    #[test]
+    fn mvm5_3891_bsp_end_wakes_parked_ap_and_late_register_is_stopped() {
+        let r = rig();
+        let sd = Arc::new(VmShutdown::new());
+        let m = Arc::clone(&r.mailbox);
+        sd.register(Arc::clone(&r.stop), Box::new(move || m.notify()));
+        sd.on_vcpu_end(StopReason::Requested);
+        assert!(!sd.is_triggered());
+        let h = spawn_ap(&r, Vec::new());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!h.is_finished());
+        sd.on_vcpu_end(StopReason::Failed(MicrovmErrorCode::Internal));
+        assert_eq!(h.join().unwrap(), StopReason::Requested);
+        let late = Arc::new(AtomicBool::new(false));
+        let kicked = Arc::new(AtomicBool::new(false));
+        let k2 = Arc::clone(&kicked);
+        sd.register(
+            Arc::clone(&late),
+            Box::new(move || k2.store(true, Ordering::Release)),
+        );
+        assert!(late.load(Ordering::Acquire));
+        assert!(kicked.load(Ordering::Acquire));
     }
 }

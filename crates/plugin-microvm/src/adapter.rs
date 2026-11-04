@@ -290,6 +290,7 @@ impl MicrovmBackend for HvfBackend {
         let layout = Arm64Layout::new(spec.mem_bytes, spec.vcpus, 0)?;
         let config = HvfMicroVmConfig::<MemoryBlockBackend, MemoryNetBackend> {
             layout,
+            vcpus: spec.vcpus,
             kernel: spec.kernel,
             initrd: spec.initrd,
             cmdline: spec.cmdline,

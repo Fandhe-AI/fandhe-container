@@ -372,6 +372,73 @@ pub fn check_vcpu_mpidr_readback(index: u32, raw: u64) -> Result<(), MicrovmErro
     Ok(())
 }
 
+/// SCTLR_EL1.EE（bit 25。EL1 のデータアクセスのエンディアン。1 でビッグエンディアン）。
+pub const SCTLR_EL1_EE: u64 = 1 << 25;
+
+/// CPU_ON で起動する AP（vCPU `index`）へ入れるレジスタの値（#3891・MVM-5・MVM-1。HVF の AP と将来の KVM aarch64〔#3899〕が共有する）。
+///
+/// PSCI の CPU_ON は entry を PC に、context_id を X0 に入れて AP を起動する（DEN0022 §5.1.4 の引数。2026-11-04 に F.b で確認した
+/// のは `psci.rs` の「一次情報の確認状況」の範囲）。起動時の状態（MMU off・D-cache off・EL は呼び出し元と同じ・PSTATE の DAIF マスク）を
+/// 述べる小節の番号は本層では未確認とし、確かめるまで推測の番号は書かない（REPAIR-3）。ここで固定する値は Linux の
+/// `booting.rst` の BSP の契約に揃えた選択である: X1〜X3 = 0・CPSR = [`ARM64_BOOT_CPSR`]（EL1h・DAIF マスク）。
+/// I-cache の扱いは IMPLEMENTATION DEFINED のため触らない。実書き込みは owning thread が行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApBootRegs {
+    /// 起動アドレス（CPU_ON の entry）。
+    pub pc: u64,
+    /// CPU_ON の context_id（不透明な値。ゲスト由来）。
+    pub x0: u64,
+    /// 0。
+    pub x1: u64,
+    /// 0。
+    pub x2: u64,
+    /// 0。
+    pub x3: u64,
+    /// [`ARM64_BOOT_CPSR`]。
+    pub cpsr: u64,
+    /// `MPIDR_EL1` の affinity（`arm64_vcpu_mpidr_affinity(index)`）。
+    pub mpidr: u64,
+}
+
+/// CPU_ON の AP の起動レジスタの値を決める。`index` が範囲外なら `InvalidArgument`。
+pub fn ap_boot_registers(
+    index: u32,
+    entry: u64,
+    context_id: u64,
+) -> Result<ApBootRegs, MicrovmError> {
+    Ok(ApBootRegs {
+        pc: entry,
+        x0: context_id,
+        x1: 0,
+        x2: 0,
+        x3: 0,
+        cpsr: ARM64_BOOT_CPSR,
+        mpidr: u64::from(crate::arm64_layout::arm64_vcpu_mpidr_affinity(index)?),
+    })
+}
+
+/// CPU_OFF の後の再 CPU_ON では、前回ゲストが有効にした MMU・D-cache が `SCTLR_EL1` に残る。M・C を落とし、
+/// リトルエンディアンだけを対象にするため EE も落とした値を返す（他のビットは保つ。ビッグエンディアンのゲストは対象外）。
+pub fn sctlr_for_cpu_on(prev: u64) -> u64 {
+    prev & !(SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_EE)
+}
+
+/// CPU_ON の entry がゲスト RAM の範囲内で 4 バイトに整列しているか確かめる（`[ram_base, ram_base + ram_size)`。checked 演算）。
+/// ホストからそのアドレスを参照はしない（PC へ書くだけ）。不正は `InvalidArgument`。
+pub fn check_cpu_on_entry(ram_base: u64, ram_size: u64, entry: u64) -> Result<(), MicrovmError> {
+    let bad = || {
+        MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "cpu_on entry is outside guest ram or unaligned",
+        )
+    };
+    let end = ram_base.checked_add(ram_size).ok_or_else(bad)?;
+    if !entry.is_multiple_of(4) || entry < ram_base || entry >= end {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 /// 書いた起動状態と読み戻し値を照合する（OS 非依存の純関数。macOS の `HvfMicroVm` が vCPU スレッド内で呼ぶ。MVM-5・MVM-1）。
 ///
 /// X0・PC・CPSR は完全一致、MPIDR_EL1 は affinity のみ（[`ARM64_MPIDR_AFFINITY_MASK`]）を `ARM64_BOOT_CPU_MPIDR` と比べる。
@@ -616,5 +683,49 @@ mod tests {
         assert_eq!(e.message(), "mpidr_el1 affinity does not match the fdt");
         let e = check_vcpu_mpidr_readback(64, 0).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+    }
+
+    /// MVM-5・MVM-1・#3891: AP の起動レジスタ（PC = entry・X0 = context_id（64 bit のまま）・X1〜X3 = 0・CPSR・MPIDR）。
+    #[test]
+    fn mvm5_3891_ap_boot_registers() {
+        let r = ap_boot_registers(1, 0x4010_0000, 0x0123_4567_89ab_cdef).unwrap();
+        assert_eq!(r.pc, 0x4010_0000);
+        assert_eq!(r.x0, 0x0123_4567_89ab_cdef);
+        assert_eq!((r.x1, r.x2, r.x3), (0, 0, 0));
+        assert_eq!(r.cpsr, 0x3c5);
+        assert_eq!(r.mpidr, 1);
+        assert_eq!(
+            ap_boot_registers(64, 0, 0).unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
+    }
+
+    /// MVM-5・#3891: SCTLR_EL1 の M・C・EE だけが落ち、他のビットは保たれる。
+    #[test]
+    fn mvm5_3891_sctlr_for_cpu_on_clears_only_m_c_ee() {
+        assert_eq!(sctlr_for_cpu_on(0x30d0_199d), 0x30d0_199d & !5);
+        assert_eq!(sctlr_for_cpu_on(0x30d0_199d | (1 << 25)), 0x30d0_199d & !5);
+        assert_eq!(sctlr_for_cpu_on(0), 0);
+        assert_eq!(sctlr_for_cpu_on(u64::MAX), !(1 | 4 | (1 << 25)));
+    }
+
+    /// MVM-5・SEC-1・#3891: CPU_ON の entry の範囲（境界）と整列、桁あふれ。
+    #[test]
+    fn mvm5_3891_check_cpu_on_entry_bounds() {
+        let (base, size) = (0x4000_0000u64, 0x1000u64);
+        assert!(check_cpu_on_entry(base, size, base).is_ok());
+        assert!(check_cpu_on_entry(base, size, base + size - 4).is_ok());
+        for bad in [
+            base + size,
+            base - 4,
+            base + 2,
+            base + size - 2,
+            0,
+            u64::MAX,
+        ] {
+            let e = check_cpu_on_entry(base, size, bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        }
+        assert!(check_cpu_on_entry(u64::MAX - 8, 0x1000, u64::MAX - 8).is_err());
     }
 }

@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887・#3891）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -1197,6 +1197,192 @@ fn hvf_device_smp_parked_ap_assemble_and_stop() {
     let report = running.stop(Duration::from_secs(1)).unwrap();
     assert_eq!(report.reason, StopReason::Requested);
     assert_eq!(report.vcpu_count, 1);
+}
+
+/// CPU_ON で AP を起動するゲスト（コードはヘッダ直後の offset 0x40 から置く。左のコメントはコード先頭からのバイト位置）。
+/// 符号は `llvm-mc -triple=aarch64`（`-filetype=obj` で分岐を解決し `llvm-objdump -d` で確認）。命令を足すときは分岐（`b.ne`・`b.eq`・`cbz`・`b`）と
+/// `adr` の相対オフセットを必ず再計算し、`flag`（8 バイト境界）の位置も保つこと。観測器は窓 1（0x0a00_0200）に置く。
+///
+/// BSP（vCPU 0）: `adr x20, ap_entry` → CPU_ON_64(target=1, entry=ap_entry, ctx=0x0123_4567_89ab_cdef) の結果を窓 1 の offset 0x00 へ書く →
+/// AFFINITY_INFO_64(1, 0) が 0（ON）になるまで回し（上限つき）、値を 0x08 へ → 2 回目の CPU_ON の結果（期待は ALREADY_ON = -4）を 0x10 へ →
+/// RAM の `flag` に 1 を書いて AP を進め → AFFINITY_INFO が 1（OFF）になるまで回し（上限つき）、値を 0x18 へ → SYSTEM_OFF。
+/// 上限超過は 0xbad を 0xf8 へ書いて `b .`。
+/// AP（vCPU 1）: `ap_entry` で `x0`（context_id）を退避し、`MPIDR_EL1` を 0x100、context_id を 0x108 へ書く → `flag` が 1 になるまで回り →
+/// CPU_OFF。戻ってきたら失敗として 0xbad を 0x1f8 へ書く。
+const SMP_CPU_ON_GUEST_CODE: [u32; 72] = [
+    0x1000_06D4, // 0x00 adr  x20, ap_entry (+0xd8)
+    0xD2B8_8000, // 0x04 movz x0, #0xc400, lsl #16
+    0xF280_0060, // 0x08 movk x0, #3                 ; CPU_ON_64 = 0xC400_0003
+    0xD280_0021, // 0x0c mov  x1, #1                 ; target = affinity(1)
+    0xAA14_03E2, // 0x10 mov  x2, x20                ; entry
+    0xD299_BDE3, // 0x14 movz x3, #0xcdef
+    0xF2B1_3563, // 0x18 movk x3, #0x89ab, lsl #16
+    0xF2C8_ACE3, // 0x1c movk x3, #0x4567, lsl #32
+    0xF2E0_2463, // 0x20 movk x3, #0x0123, lsl #48   ; context_id = 0x0123_4567_89ab_cdef
+    0xD400_0002, // 0x24 hvc  #0
+    0xD2A1_4015, // 0x28 movz x21, #0x0a00, lsl #16
+    0xF901_02A0, // 0x2c str  x0, [x21, #0x200]      ; 窓 1 offset 0x00 = CPU_ON の結果
+    0xD288_480A, // 0x30 movz x10, #0x4240
+    0xF2A0_01EA, // 0x34 movk x10, #0xf, lsl #16     ; 回数の上限 1_000_000
+    0xD2B8_8000, // 0x38 wait_on: movz x0, #0xc400, lsl #16
+    0xF280_0080, // 0x3c movk x0, #4                 ; AFFINITY_INFO_64
+    0xD280_0021, // 0x40 mov  x1, #1
+    0xD280_0002, // 0x44 mov  x2, #0
+    0xD400_0002, // 0x48 hvc  #0
+    0xB400_0080, // 0x4c cbz  x0, on_ok (+0x10)
+    0xF100_054A, // 0x50 subs x10, x10, #1
+    0x54FF_FF21, // 0x54 b.ne wait_on (-0x1c)
+    0x1400_001D, // 0x58 b    fail (+0x74)
+    0xF901_06A0, // 0x5c on_ok: str x0, [x21, #0x208] ; offset 0x08 = AFFINITY_INFO（ON = 0）
+    0xD2B8_8000, // 0x60 movz x0, #0xc400, lsl #16
+    0xF280_0060, // 0x64 movk x0, #3
+    0xD280_0021, // 0x68 mov  x1, #1
+    0xAA14_03E2, // 0x6c mov  x2, x20
+    0xD280_0003, // 0x70 mov  x3, #0
+    0xD400_0002, // 0x74 hvc  #0                     ; 2 回目の CPU_ON
+    0xF901_0AA0, // 0x78 str  x0, [x21, #0x210]      ; offset 0x10 = ALREADY_ON（-4）
+    0x1000_04E5, // 0x7c adr  x5, flag (+0x9c)
+    0xD280_0026, // 0x80 mov  x6, #1
+    0xF900_00A6, // 0x84 str  x6, [x5]               ; AP を進める
+    0xD288_480A, // 0x88 movz x10, #0x4240
+    0xF2A0_01EA, // 0x8c movk x10, #0xf, lsl #16
+    0xD2B8_8000, // 0x90 wait_off: movz x0, #0xc400, lsl #16
+    0xF280_0080, // 0x94 movk x0, #4
+    0xD280_0021, // 0x98 mov  x1, #1
+    0xD280_0002, // 0x9c mov  x2, #0
+    0xD400_0002, // 0xa0 hvc  #0
+    0xF100_041F, // 0xa4 cmp  x0, #1
+    0x5400_0080, // 0xa8 b.eq off_ok (+0x10)
+    0xF100_054A, // 0xac subs x10, x10, #1
+    0x54FF_FF01, // 0xb0 b.ne wait_off (-0x20)
+    0x1400_0006, // 0xb4 b    fail (+0x18)
+    0xF901_0EA0, // 0xb8 off_ok: str x0, [x21, #0x218] ; offset 0x18 = AFFINITY_INFO（OFF = 1）
+    0xD2B0_8000, // 0xbc movz x0, #0x8400, lsl #16
+    0xF280_0100, // 0xc0 movk x0, #8                 ; SYSTEM_OFF
+    0xD400_0002, // 0xc4 hvc  #0
+    0x1400_0000, // 0xc8 b    .
+    0xD281_75A6, // 0xcc fail: movz x6, #0xbad
+    0xF901_7EA6, // 0xd0 str  x6, [x21, #0x2f8]      ; offset 0xf8 = 失敗の目印
+    0x1400_0000, // 0xd4 b    .
+    0xAA00_03E9, // 0xd8 ap_entry: mov x9, x0        ; context_id を退避
+    0xD538_00A1, // 0xdc mrs  x1, mpidr_el1
+    0xD2A1_4015, // 0xe0 movz x21, #0x0a00, lsl #16
+    0xF901_82A1, // 0xe4 str  x1, [x21, #0x300]      ; offset 0x100 = MPIDR_EL1
+    0xF901_86A9, // 0xe8 str  x9, [x21, #0x308]      ; offset 0x108 = context_id
+    0x1000_0165, // 0xec adr  x5, flag (+0x2c)
+    0xF940_00A6, // 0xf0 wait_flag: ldr x6, [x5]
+    0xB4FF_FFE6, // 0xf4 cbz  x6, wait_flag (-0x4)
+    0xD2B0_8000, // 0xf8 movz x0, #0x8400, lsl #16
+    0xF280_0040, // 0xfc movk x0, #2                 ; CPU_OFF
+    0xD400_0002, // 0x100 hvc #0
+    0xD281_75A6, // 0x104 movz x6, #0xbad            ; CPU_OFF から戻ったら失敗
+    0xF901_FEA6, // 0x108 str  x6, [x21, #0x3f8]     ; offset 0x1f8 = 失敗の目印
+    0x1400_0000, // 0x10c b    .
+    0xD503_201F, // 0x110 nop
+    0xD503_201F, // 0x114 nop                        ; flag を 8 バイト境界にする
+    0x0000_0000, // 0x118 flag（下位）
+    0x0000_0000, // 0x11c flag（上位）
+];
+
+/// HVF の SMP: ゲストの PSCI CPU_ON で AP（vCPU 1）が起動する（#3891・MVM-5・MVM-1・REPAIR-5）。
+///
+/// 本番の配線（`HvfMicroVm::assemble` → `start`）を通す。vCPU 0 のゲストが CPU_ON で vCPU 1 を起動し、vCPU 1 のゲストが自分の
+/// `MPIDR_EL1` と entry 時の X0（context_id。32 bit に収まらない値）を観測器の MMIO 窓へ書く。照合（具体値）:
+/// CPU_ON の結果 0・AFFINITY_INFO が ON（0）・2 回目の CPU_ON が ALREADY_ON（-4）・CPU_OFF の後の AFFINITY_INFO が OFF（1）・
+/// AP の MPIDR_EL1 の affinity が `arm64_vcpu_mpidr_affinity(1)`・AP の X0 が渡した context_id・失敗の目印（0xbad）が無いこと・
+/// 停止理由が `GuestShutdown`・AP が 1 回以上 run したこと・停止の後に VM を作り直せること。生の値は
+/// `hvf_device: smp_cpu_on:` の行に出す（記録は #3803）。AP の `mrs mpidr_el1` が SysReg の trap になる場合は fail-closed
+/// （`Failed(Unimplemented)`）で落ちる。それ自体が #3803 で記録すべき観測事項。期限 watchdog 30 秒つき。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_smp_cpu_on_boots_ap() {
+    use fandhe_container_microvm::arm64_layout::arm64_vcpu_mpidr_affinity;
+    use fandhe_container_microvm::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
+    use fandhe_container_microvm::dispatch::MmioDevice;
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+    use fandhe_container_microvm::stop::StopReason;
+    use fandhe_container_microvm::virtio_mmio::{MmioReadOutcome, MmioWriteOutcome};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    const WINDOW: u64 = 0x0a00_0200;
+    const CTX: u64 = 0x0123_4567_89ab_cdef;
+    /// 観測器の記録の上限（ゲストが連打してもホストのメモリを増やさない）。
+    const MAX_RECORDS: usize = 16;
+
+    /// 窓 1 の観測器。書き込みを `(offset, 最大 8 バイトの値)` で記録し、読み出しは 0。
+    struct Recorder(Arc<Mutex<Vec<(u64, u64)>>>);
+    impl MmioDevice for Recorder {
+        fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
+            data.fill(0);
+            MmioReadOutcome::Handled
+        }
+        fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
+            let mut v = [0u8; 8];
+            for (d, s) in v.iter_mut().zip(data.iter()) {
+                *d = *s;
+            }
+            let mut g = self.0.lock().unwrap();
+            if g.len() < MAX_RECORDS {
+                g.push((offset, u64::from_le_bytes(v)));
+            }
+            MmioWriteOutcome::Handled
+        }
+    }
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 2, 1).unwrap();
+    require_vm_with_gic(&layout);
+    let vm = HvfMicroVm::assemble(assemble_config(
+        layout,
+        synthetic_image_with_code(true, &SMP_CPU_ON_GUEST_CODE),
+        1,
+        false,
+    ))
+    .unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    vm.dispatcher()
+        .lock()
+        .unwrap()
+        .register_mmio(WINDOW, 0x200, Box::new(Recorder(Arc::clone(&records))))
+        .unwrap();
+
+    let running = vm.start().unwrap();
+    let begin = Instant::now();
+    while !running.is_finished() && begin.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(running.is_finished(), "guest did not reach SYSTEM_OFF");
+    let report = running.stop(Duration::from_secs(2)).unwrap();
+    let got = records.lock().unwrap().clone();
+    eprintln!(
+        "hvf_device: smp_cpu_on: records={got:x?} reason={:?} per_vcpu={:?}",
+        report.reason, report.per_vcpu
+    );
+    let at = |offset: u64| got.iter().find(|(o, _)| *o == offset).map(|(_, v)| *v);
+
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.vcpu_count, 2);
+    assert!(report.per_vcpu[1].runs >= 1, "vcpu 1 never ran");
+    assert_eq!(at(0xf8), None, "vcpu 0 hit a loop limit");
+    assert_eq!(at(0x1f8), None, "vcpu 1 returned from CPU_OFF");
+    assert_eq!(at(0x00), Some(0), "CPU_ON result");
+    assert_eq!(at(0x08), Some(0), "AFFINITY_INFO after CPU_ON (ON)");
+    assert_eq!(
+        at(0x10),
+        Some(0xFFFF_FFFF_FFFF_FFFC),
+        "second CPU_ON (ALREADY_ON)"
+    );
+    assert_eq!(at(0x18), Some(1), "AFFINITY_INFO after CPU_OFF (OFF)");
+    assert_eq!(
+        at(0x100).map(|m| m & ARM64_MPIDR_AFFINITY_MASK),
+        Some(u64::from(arm64_vcpu_mpidr_affinity(1).unwrap())),
+        "MPIDR_EL1 seen by vcpu 1"
+    );
+    assert_eq!(at(0x108), Some(CTX), "context_id seen as X0 by vcpu 1");
+
+    // 停止の後に VM を作り直せる（解放の観測）。
+    drop(create_vm_or_precondition());
 }
 
 /// microVM の start / stop と停止・drop 時の資源の解放（TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5）。

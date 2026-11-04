@@ -18,11 +18,12 @@
 //! - fail-closed: 未知の exit・未対応の例外クラスは推測で続行せず VM を止める（[`run_loop`] の表）。
 //!
 //! # 複数 vCPU（#3884・MVM-5・MVM-1・REPAIR-5）
-//! AP（vCPU 1..N）のスレッドは [`LoopStart::ready_parked`] で起動要求まで止めておく（待ちに壁時計の上限は持たせない）。
+//! AP（vCPU 1..N）のスレッドは `crate::hvf_smp::ApMailbox` で起動要求（PSCI CPU_ON）まで止めておく（待ちに壁時計の上限は持たせない。
+//! #3891）。CPU_OFF は [`ExitAction::Park`] で実行ループを [`LoopExit::Parked`] として抜け、AP のスレッドが park に戻る。
 //! N 台の停止は [`stop_all`] が集約する（全台へ先に停止を要求し、共有の期限で待つ）。
 //!
 //! # 未実装（REPAIR-3）
-//! AP の起動（CPU_ON。#3891）・SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
+//! SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -49,8 +50,6 @@ const DROP_STOP_WAIT: Duration = Duration::from_secs(5);
 /// 実行開始の合図（start gate）を待つ上限。`start` が呼ばれないまま放置された vCPU スレッドを残さないため（REPAIR-5。Linux の
 /// start 待ちと同値）。超えたらゲストを走らせずに `Failed(DeadlineExceeded)` で終える。
 pub const START_GATE_WAIT: Duration = Duration::from_secs(30);
-/// parked の AP が停止フラグを見直す間隔（通知の取りこぼし対策。待ちの上限ではない。#3884）。
-const PARK_POLL: Duration = Duration::from_millis(100);
 /// 停止待ちの間に kick を打ち直す間隔（実行より先に届いた kick の取りこぼし対策）。
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
 /// 報告を送った後のスレッドの終了を待つ上限（報告が最後の動作のため通常は即時）。
@@ -226,6 +225,18 @@ pub enum ExitAction {
     Continue,
     /// ループを抜ける（PSCI SYSTEM_OFF の `GuestShutdown` 等）。
     Stop(StopReason),
+    /// 実行ループを抜けて parked に戻る（PSCI CPU_OFF の成功。#3891）。vCPU は破棄せず、再度の CPU_ON を待つ。
+    Park,
+}
+
+/// [`run_loop_exit`] の抜け方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoopExit {
+    /// VM（または vCPU スレッド）の終了。理由つき。
+    Stopped(StopReason),
+    /// CPU_OFF による parked への復帰（AP だけ。#3891）。
+    Parked,
 }
 
 /// vCPU の実行体（`HvVcpu` の抽象）。スレッドに束縛されるため `Send` は要求しない。
@@ -246,39 +257,58 @@ fn err(code: MicrovmErrorCode, msg: &'static str) -> MicrovmError {
     MicrovmError::new(code, msg)
 }
 
-/// 実行ループ本体。終了理由を返す。
-///
-/// | 状況 | 動作 |
-/// | ---- | ---- |
-/// | 各回の先頭で停止フラグ | `Requested` |
-/// | `Err(DeadlineExceeded)`（1 回分の期限切れ） | 続行（正常系） |
-/// | その他の `Err(e)` | `Failed(e.code())` |
-/// | `Canceled` かつ停止フラグ | `Requested` |
-/// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
-/// | `Unknown` | `Failed(Internal)` |
-/// | SysReg / ISV=0 の data abort / 未知の EC | `Failed(Unimplemented)`（esr の fail-closed 契約。REPAIR-3） |
-/// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Err(e)` → `Failed(e.code())`） |
-///
-/// 分類した exit は、振り分けの前に `observer` へ記録する。
+/// 実行ループ本体。終了理由を返す（`Park` は parked へ戻れない BSP では fail-closed の `Failed(Internal)`）。[`run_loop_exit`] の表を参照。
 pub fn run_loop<E, D>(
     exec: &mut E,
     stop: &AtomicBool,
     slice: Duration,
     observer: Option<&dyn VcpuExitObserver>,
-    mut dispatch: D,
+    dispatch: D,
 ) -> StopReason
+where
+    E: VcpuExec,
+    D: FnMut(&mut E, &HvExit) -> Result<ExitAction, MicrovmError>,
+{
+    match run_loop_exit(exec, stop, slice, observer, dispatch) {
+        LoopExit::Stopped(r) => r,
+        // BSP の CPU_OFF は `power_off(0)` が DENIED で、ここへは来ない。来たら不変条件違反として止める。
+        LoopExit::Parked => StopReason::Failed(MicrovmErrorCode::Internal),
+    }
+}
+
+/// 実行ループ本体。抜け方（停止か parked への復帰か）を返す。
+///
+/// | 状況 | 動作 |
+/// | ---- | ---- |
+/// | 各回の先頭で停止フラグ | `Stopped(Requested)` |
+/// | `Err(DeadlineExceeded)`（1 回分の期限切れ） | 続行（正常系） |
+/// | その他の `Err(e)` | `Stopped(Failed(e.code()))` |
+/// | `Canceled` かつ停止フラグ | `Stopped(Requested)` |
+/// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
+/// | `Unknown` | `Stopped(Failed(Internal))` |
+/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3） |
+/// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`） |
+///
+/// 分類した exit は、振り分けの前に `observer` へ記録する。
+pub fn run_loop_exit<E, D>(
+    exec: &mut E,
+    stop: &AtomicBool,
+    slice: Duration,
+    observer: Option<&dyn VcpuExitObserver>,
+    mut dispatch: D,
+) -> LoopExit
 where
     E: VcpuExec,
     D: FnMut(&mut E, &HvExit) -> Result<ExitAction, MicrovmError>,
 {
     loop {
         if stop.load(Ordering::Acquire) {
-            return StopReason::Requested;
+            return LoopExit::Stopped(StopReason::Requested);
         }
         let raw = match exec.run(slice) {
             Ok(raw) => raw,
             Err(e) if e.code() == MicrovmErrorCode::DeadlineExceeded => continue,
-            Err(e) => return StopReason::Failed(e.code()),
+            Err(e) => return LoopExit::Stopped(StopReason::Failed(e.code())),
         };
         let exit = classify_exit(&raw);
         if let Some(o) = observer {
@@ -287,19 +317,24 @@ where
         match &exit {
             HvExit::Canceled => {
                 if stop.load(Ordering::Acquire) {
-                    return StopReason::Requested;
+                    return LoopExit::Stopped(StopReason::Requested);
                 }
             }
-            HvExit::Unknown(_) => return StopReason::Failed(MicrovmErrorCode::Internal),
+            HvExit::Unknown(_) => {
+                return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Internal));
+            }
             HvExit::Exception {
                 class:
                     EsrClass::SysReg(_) | EsrClass::DataAbortUnsupported { .. } | EsrClass::Other { .. },
                 ..
-            } => return StopReason::Failed(MicrovmErrorCode::Unimplemented),
+            } => {
+                return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Unimplemented));
+            }
             _ => match dispatch(exec, &exit) {
                 Ok(ExitAction::Continue) => {}
-                Ok(ExitAction::Stop(r)) => return r,
-                Err(e) => return StopReason::Failed(e.code()),
+                Ok(ExitAction::Stop(r)) => return LoopExit::Stopped(r),
+                Ok(ExitAction::Park) => return LoopExit::Parked,
+                Err(e) => return LoopExit::Stopped(StopReason::Failed(e.code())),
             },
         }
     }
@@ -432,16 +467,6 @@ impl StartGate {
     }
 }
 
-/// [`LoopStart::ready_parked`] の待ちが解けた理由。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParkOutcome {
-    /// stop / drop / `stop_all` による停止要求。
-    Stopped,
-    /// 起動要求（CPU_ON。#3891 が `open_start` で送る。#3884 では誰も送らない）。
-    StartRequested,
-}
-
 /// スレッド内の `body` へ渡す開始の合図。`ready` か `fail` のどちらかで作成結果を呼び出し元へ返す。
 pub struct LoopStart<K> {
     tx: SyncSender<Result<K, MicrovmError>>,
@@ -480,32 +505,6 @@ impl<K> LoopStart<K> {
             GateOutcome::TimedOut => {
                 stop.store(true, Ordering::Release);
                 Err(StopReason::Failed(MicrovmErrorCode::DeadlineExceeded))
-            }
-        }
-    }
-
-    /// AP（vCPU 1..N）用の待機（#3884・MVM-5・MVM-1・REPAIR-5）。作成結果を返したあと、起動要求か停止要求まで待つ。
-    ///
-    /// [`Self::ready_gated`] と違い、待ちに壁時計の上限を持たせない。ゲストが AP を起動しないのは正常な構成（`maxcpus=1` 等）で、
-    /// 期限切れで終えると「vCPU の破棄は teardown のときだけ」の契約（`hv_gic_create` の記述）に反するため。待ちを解くのは
-    /// `LoopHandle::stop` / `Drop` / [`stop_all`] で、いずれも期限つきのため、待ちの長さはそれらの期限で抑えられる。
-    /// 停止フラグは 100 ms ごとに見直す（通知の取りこぼし対策。刻みは上限ではない）。
-    pub fn ready_parked(self, kick: K) -> ParkOutcome {
-        self.ready_parked_with_poll(kick, PARK_POLL)
-    }
-
-    /// [`Self::ready_parked`] の見直し間隔を指定する版（単体試験用に分けてある）。
-    fn ready_parked_with_poll(self, kick: K, poll: Duration) -> ParkOutcome {
-        let gate = Arc::clone(&self.gate);
-        let stop = self.ready(kick);
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return ParkOutcome::Stopped;
-            }
-            match gate.wait(poll) {
-                GateOutcome::Opened => return ParkOutcome::StartRequested,
-                GateOutcome::Cancelled => return ParkOutcome::Stopped,
-                GateOutcome::TimedOut => {}
             }
         }
     }
@@ -1513,17 +1512,27 @@ mod tests {
         assert_eq!(g.wait(Duration::from_millis(10)), GateOutcome::Cancelled);
     }
 
-    /// parked の AP 用の body。停止要求で `Requested`、起動要求なら `Failed(Unimplemented)` で終わる。
+    /// parked の AP 用の body（`ApMailbox` で待つ）。停止要求で `Requested`、起動要求なら `Failed(Unimplemented)` で終わる。
+    fn parked_body_with(
+        mailbox: Arc<crate::hvf_smp::ApMailbox>,
+        poll: Duration,
+    ) -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
+        move |start| {
+            let stop = start.ready(FakeKick(Arc::default()));
+            match mailbox.wait(&stop, poll) {
+                crate::hvf_smp::ApWake::Stopped => (StopReason::Requested, HvRunStats::default()),
+                crate::hvf_smp::ApWake::Start(_) => (
+                    StopReason::Failed(MicrovmErrorCode::Unimplemented),
+                    HvRunStats::default(),
+                ),
+            }
+        }
+    }
+
     fn parked_body(
         poll: Duration,
     ) -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
-        move |start| match start.ready_parked_with_poll(FakeKick(Arc::default()), poll) {
-            ParkOutcome::Stopped => (StopReason::Requested, HvRunStats::default()),
-            _ => (
-                StopReason::Failed(MicrovmErrorCode::Unimplemented),
-                HvRunStats::default(),
-            ),
-        }
+        parked_body_with(Arc::default(), poll)
     }
 
     /// 実行中の BSP を模す body（停止フラグを見て `Requested`、統計は runs = 3・exits = 2）。
@@ -1573,11 +1582,21 @@ mod tests {
         assert_eq!(h.stop(LONG).unwrap().reason, StopReason::Requested);
     }
 
-    /// 起動要求（gate を開く）は `StartRequested` として観測できる（#3891 が使う口。#3884 では誰も開けない）。
+    /// 起動要求（メールボックスへの post）は AP の待ちに届く（#3891）。
     #[test]
-    fn mvm5_3884_parked_ap_start_request_is_observed() {
-        let h = spawn_loop("hvf-vcpu-1", LONG, parked_body(Duration::from_millis(10))).unwrap();
-        h.open_start();
+    fn mvm5_3891_parked_ap_start_request_is_observed() {
+        let mb = Arc::new(crate::hvf_smp::ApMailbox::new());
+        let h = spawn_loop(
+            "hvf-vcpu-1",
+            LONG,
+            parked_body_with(Arc::clone(&mb), Duration::from_millis(10)),
+        )
+        .unwrap();
+        mb.post(crate::hvf_smp::ApBootRequest {
+            entry: 0x4000_0000,
+            context_id: 1,
+        })
+        .unwrap();
         let t = Instant::now();
         while !h.is_finished() && t.elapsed() < LONG {
             std::thread::sleep(Duration::from_millis(1));
@@ -1587,6 +1606,21 @@ mod tests {
             r.reason,
             StopReason::Failed(MicrovmErrorCode::Unimplemented)
         );
+    }
+
+    /// #3891: `Park` は `run_loop_exit` では `Parked`、`run_loop`（BSP）では fail-closed の `Failed(Internal)`。
+    #[test]
+    fn mvm5_3891_park_action_maps_to_parked_or_internal() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut exec = ScriptedExec::new(&stop, vec![Ok(exc(HVC0))]);
+        let exit = run_loop_exit(&mut exec, &stop, Duration::from_millis(1), None, |_, _| {
+            Ok(ExitAction::Park)
+        });
+        assert_eq!(exit, LoopExit::Parked);
+        let (reason, runs, dispatched, _) =
+            run_script(vec![Ok(exc(HVC0))], None, Ok(ExitAction::Park));
+        assert_eq!(reason, StopReason::Failed(MicrovmErrorCode::Internal));
+        assert_eq!((runs, dispatched), (1, 1));
     }
 
     /// MVM-5・MVM-1・#3884: 3 台（BSP + parked の AP 2 台）を `stop_all` で止める。合計の統計は各台の和で、index 順に並ぶ。

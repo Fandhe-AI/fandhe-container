@@ -22,7 +22,7 @@
 //!
 //! # 複数 vCPU（#3884）
 //! 止まりの確認は「N 台すべてが報告した」こと（`hvf_loop::stop_all`。parked の AP を含む）。1 台でも確かめられなければ RAM を
-//! リークする。範囲外（REPAIR-3）: AP の exit をきっかけにした全台の停止は #3891。
+//! リークする。AP の exit（SYSTEM_OFF・fail-closed の停止）は `VcpuSet::is_finished` が VM 全体の終了として伝え、停止時の集約でその理由を返す（#3891）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

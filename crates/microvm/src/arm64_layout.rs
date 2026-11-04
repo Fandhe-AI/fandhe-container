@@ -26,9 +26,8 @@
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
 //!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
 //!
-//! 未実装（REPAIR-3）: HVF の AP の実起動（PSCI の結線〔状態機械は `psci.rs`。#3883・結線は #3891〕）。vCPU 1..N のスレッドと
-//! `HVF_MAX_VCPUS` の引き上げは #3884 で実装済みで、AP は parked のまま起動されない。N 個の cpu を持つ FDT が実ゲストに届くと
-//! Linux は CPU_ON(n) の失敗で「failed to boot CPUn」を出して 1 CPU で動き続ける。
+//! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
+//! `hvf_smp`〔#3891〕）で起動する。実ゲストでの確認は #3803。
 //! PCI・IPA 上限の確定（#3803）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
@@ -601,7 +600,7 @@ fn reg_cells(regions: &[(u64, u64)]) -> Vec<u32> {
 /// arm64 ゲスト向けの FDT を組み立てる（ルート・chosen・memory・cpus・psci・GICv3・timer・シリアル・virtio-mmio）。
 ///
 /// `InvalidArgument`: 配置の違反（vCPU 数の上限超過を含む）・bootargs 超過・initrd が RAM の外。
-/// `cpu@N` は vCPU 数ぶん出す（HVF の AP は parked で、起動は #3891。REPAIR-3）。
+/// `cpu@N` は vCPU 数ぶん出す（HVF の AP は parked で待ち、ゲストの CPU_ON で起動する。#3891）。
 /// `layout.serial` が `Some` のときだけ、シリアルのノードと `/chosen/stdout-path` を出す（`None` は従来と同じ出力）。
 pub fn build_guest_fdt(config: &GuestFdtConfig<'_>) -> Result<Vec<u8>, MicrovmError> {
     let l = config.layout;

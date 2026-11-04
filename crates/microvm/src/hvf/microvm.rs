@@ -3,7 +3,7 @@
 //! 役割: 既にある部品（GIC つきの VM = `VmWithGic`〔#3792〕、ゲスト RAM = `HvfGuestRam`〔#3787〕、Image・initrd・FDT の配置 =
 //! `boot_arm64::load_arm64`〔#3790〕、virtio-mmio のデバイスモデルと SPI 注入 = `GicSpiLine`〔#3795〕、vCPU スレッド =
 //! `VcpuThread`〔#3791〕）を 1 つにまとめ、vCPU 0 を起動レジスタ込みで走らせる。Linux の `microvm::MicroVm::assemble` の対応物。
-//! 呼び出し元は start / stop の API（#3798）と plugin-microvm（#3800）。
+//! 呼び出し元は plugin-microvm（#3800）。start / stop の API は #3798（モジュール doc の「start / stop と解放順序」）。
 //!
 //! # 組み立ての順序（[`HvfMicroVm::assemble`]）
 //! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。vcpus 2 以上は `Unimplemented`（FDT 側は N 個を出せる。backend は 1。#3864）。
@@ -21,24 +21,52 @@
 //! 残余: `setup` の失敗で `spawn` が `Err` になった直後は、vCPU スレッドの終了処理中に VM の `Arc` が一瞬残りうる。その間の
 //! 再 assemble は `FailedPrecondition` になりうる（`spawn` より前の失敗では起きない）。
 //!
-//! # drop
-//! 宣言順が drop 順（vCPU → デバイス → RAM → VM）。`Drop` はまず vCPU スレッドを期限つき（5 秒）で止める。停止が期限切れ等で
-//! 失敗した（スレッドが VM を持ったまま残る）ときは、RAM の対応付けを `mem::forget` でリークする（ゲストがまだ書けうる
-//! メモリを解放しない fail-closed。VM も残り、後続の `HvVm::create` は `FailedPrecondition` になる）。start / stop の API と
-//! 解放順序の詰めは #3798。この `Drop` は最小の後始末。
+//! # start / stop と解放順序（TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5）
+//! `assemble` は vCPU 0 を作って起動レジスタを書くところまで行い、ゲストは走らせない（start gate。`VcpuThread::spawn_gated`）。
+//! [`HvfMicroVm::start`] がゲートを開いて [`RunningHvfMicroVm`] を返し、[`RunningHvfMicroVm::stop`] が期限（0 超 60 秒以下。
+//! Linux の `STOP_DEADLINE_MAX` と同じ）つきで止める。start しないまま drop すると、ゲストは一度も走らずに終わる。
+//! 終了理由は Linux と共有の `StopReason`（`stop` の `Requested`、PSCI の SYSTEM_OFF・SYSTEM_RESET は `GuestShutdown`、未対応・未知の
+//! exit は fail-closed の `Failed(Unimplemented / Internal)`）で、[`HvfStopReport`] に載せる。
+//!
+//! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
+//! 1. 停止要求 → kick（`hv_vcpus_exit`。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
+//! 2. owning thread が自分の vCPU を `hv_vcpu_destroy` し（vCPU はスレッドに束縛され、他スレッドからは破棄できない）、捕捉していた
+//!    `Arc<VmWithGic>` を落として報告を送る。報告を受けた時点で vCPU の破棄は済んでいる。
+//! 3. 報告が `Ok` のときだけ、デバイス → ゲスト RAM（`hv_vm_unmap` に成功したら munmap。失敗ならリーク）→ VM（最後の `Arc` の drop が
+//!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
+//!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
+//!
+//! ## Apple の記述との関係
+//! `hv_gic_create` のドキュメント（<https://developer.apple.com/documentation/hypervisor/hv_gic_create(_:)> の Discussion。2026-11-04 に
+//! JSON 版で確認）は、vCPU が走り出すとトポロジーは確定するとみなされること、vCPU を破棄するのは VM を teardown するときだけにする
+//! こと、の 2 点を述べる。VM の破棄順序や、走行中の vCPU の破棄時の挙動には触れていない。本 crate は 1 プロセス 1 VM で pause・
+//! vCPU の再作成・hot-unplug を持たないため、停止は常に VM の teardown そのもので、「owning thread が vCPU を破棄し、同じ teardown の
+//! 中で unmap → `hv_vm_destroy` まで進める」ことは「teardown のときだけ破棄する」と矛盾しない。`VmWithGic::mark_teardown` が破棄の直前に
+//! 立つ印で、以後の vCPU 作成は `FailedPrecondition`。
+//! - 採らない案 1「`hv_vcpu_destroy` を呼ばず `hv_vm_destroy` に任せる」: vCPU が残ったままの `hv_vm_destroy` の成功が文書に無い。
+//!   失敗（`HV_BUSY` 等）すると `VM_EXISTS` が立ったままになり、同じプロセスで二度と VM を作れない。
+//! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: `HostMapping` が `!Send` のため RAM を移すのに `sys` へ新しい
+//!   `unsafe impl Send` が要る（事前承認の範囲外）。
+//! - 実機での戻り値・所要時間の観測は #3803（人間担当）。
+//!
+//! ## 期限切れ（`TIMEOUT`）のとき
+//! 解放はデバイスと VM の手放しに留め、ゲスト RAM の対応付けは `mem::forget` でリークする（ゲストがまだ書けうるメモリを再利用させない
+//! fail-closed）。残る資源は vCPU スレッド・vCPU・VM（GIC を含む）・ゲスト RAM の mmap と map。リークした対応付けが `Arc<HvVm>` を
+//! 握るため、スレッドが後で自力で終わっても `hv_vm_destroy` は走らず、同じプロセスでの再 assemble は `FailedPrecondition` になる。
+//! 回収の方法はプロセスの終了だけ（plugin-microvm による再起動。#3800）。後から終わったスレッドの資源を回収する案は、`HostMapping`
+//! を `Send` にして回収スレッドへ渡す必要があり、`sys` に新しい `unsafe` が要るため本 issue の範囲外（追跡事項）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - 実行開始の制御（start gate）: `spawn` は ready の後すぐ実行ループに入るため、assemble の時点でゲストは走り始める。現状は
-//!   exit のスタブ（#3793・#3794・#3796）が `Unimplemented` を返すので、実カーネルは最初の exit で `Failed(Unimplemented)` になる（#3798）。
-//! - `MmioHandler` へは共有 dispatcher を接続済み（#3793）。ゲスト RAM の受け渡しと `HostMapping` の `Send` は #3798。
-//! - PSCI・WFI / vtimer（#3794・#3796）、SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。#3864 の後続）、シリアルの結線（`layout.serial`・バス上限の調整）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
+//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当の
+//!   issue は未確定（`HvfBoundDevice::transport` が将来使う）。
+//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP（vCPU 1..N・CPU_ON・`MPIDR_EL1` は `arm64_vcpu_mpidr_affinity`。vCPU 1..N の停止の集約を含む。#3864 の後続）、シリアルの結線（`layout.serial`・バス上限の調整）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
 //! `unsafe` は持たない（crate の `#![deny(unsafe_code)]` で担保）。
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::arm64_layout::{ARM64_BOOT_CPU_MPIDR, Arm64Layout, MmioRegion};
 use crate::boot_arm64::{ArmBootReadback, LoadedArm64, check_boot_readback, load_arm64};
@@ -52,12 +80,11 @@ use crate::hvf::mmio::MmioHandler;
 use crate::hvf::timer::TimerHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
+use crate::hvf_lifecycle::{DROP_STOP_DEADLINE, HvfStopReport, Resources, stop_and_release};
+use crate::hvf_loop::log_line;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
 use crate::virtio_mmio::{SharedTransport, VirtioMmioTransport};
 use crate::virtio_net::{NetBackend, VirtioNet};
-
-/// drop 時に vCPU スレッドの停止を待つ期限（REPAIR-5）。
-const DROP_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
 fn internal(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, msg)
@@ -119,7 +146,7 @@ pub struct HvfDeviceInfo {
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・窓・割り込み線）。
 struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
-    /// QueueNotify の処理（#3798）が型つきで触る。dispatcher と共有する。
+    /// QueueNotify の処理が型つきで触る（担当 issue は未確定。モジュール doc の範囲外）。dispatcher と共有する。
     #[allow(dead_code)]
     transport: Arc<Mutex<VirtioMmioTransport<D>>>,
     id: DeviceId,
@@ -220,20 +247,75 @@ impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
     }
 }
 
-/// 組み立て済みの macOS microVM。宣言順が drop 順（モジュール doc の「drop」）。
-pub struct HvfMicroVm<B: BlockBackend, N: NetBackend> {
+/// 組み立て済みの microVM が持つ資源と観測用の値。`Drop` が [`stop_and_release`] を drop 用の期限で呼ぶ（`HvfMicroVm` と
+/// `RunningHvfMicroVm` が共有する。モジュール doc の「解放順序」）。資源は `Option` で、`release` が 1 回だけ取り出す。
+struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     vcpu: Option<VcpuHandle>,
-    devices: HvfDeviceBus<B, N>,
+    devices: Option<HvfDeviceBus<B, N>>,
     memory: Option<GuestMemory<RegisteredHvfRam<'static>>>,
-    vm: Arc<VmWithGic>,
+    vm: Option<Arc<VmWithGic>>,
+    dispatcher: Arc<Mutex<ExitDispatcher>>,
+    infos: Vec<HvfDeviceInfo>,
     layout: Arm64Layout,
     loaded: LoadedArm64,
     boot: ArmBootReadback,
 }
 
-impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for HvfMicroVm<B, N> {
+impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
+    /// 資源を取り出し、停止と解放を行う。2 回目以降は `FailedPrecondition`。
+    fn release(
+        &mut self,
+        op: &'static str,
+        deadline: Duration,
+    ) -> Result<HvfStopReport, MicrovmError> {
+        let (Some(vcpu), Some(devices), Some(memory), Some(vm)) = (
+            self.vcpu.take(),
+            self.devices.take(),
+            self.memory.take(),
+            self.vm.take(),
+        ) else {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "microvm resources are already released",
+            ));
+        };
+        stop_and_release(
+            op,
+            vcpu,
+            deadline,
+            Resources {
+                devices,
+                memory,
+                vm,
+            },
+        )
+    }
+
+    fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
+        let mem = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| internal("guest memory is already released"))?;
+        mem.read_at(GuestAddress::new(addr), buf)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.vcpu.as_ref().is_none_or(VcpuHandle::is_finished)
+    }
+}
+
+impl<B: BlockBackend, N: NetBackend> Drop for HvfVmParts<B, N> {
+    /// stop を経ない drop も同じ手順を期限つき（[`DROP_STOP_DEADLINE`]）で行う。期限切れは `level=error` で記録される。
+    fn drop(&mut self) {
+        if self.vcpu.is_some() {
+            let _ = self.release("hvf.microvm.drop", DROP_STOP_DEADLINE);
+        }
+    }
+}
+
+impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for HvfVmParts<B, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HvfMicroVm")
+        f.debug_struct("HvfVmParts")
             .field("layout", &self.layout)
             .field("loaded", &self.loaded)
             .field("boot", &self.boot)
@@ -241,10 +323,24 @@ impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for HvfMicroVm<B, N> {
     }
 }
 
+/// 組み立て済みで、まだ start していない macOS microVM（ゲストは走っていない）。
+/// [`Self::start`] で [`RunningHvfMicroVm`] になる。start しないまま drop してもゲストは走らず、資源を解放する。
+pub struct HvfMicroVm<B: BlockBackend, N: NetBackend> {
+    parts: HvfVmParts<B, N>,
+}
+
+impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for HvfMicroVm<B, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HvfMicroVm")
+            .field("parts", &self.parts)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroVm<B, N> {
     /// 構成を検証し、VM・GIC・RAM・カーネル・デバイス・vCPU 0 を組み立てる（順序と失敗時の解放はモジュール doc）。
     ///
-    /// 戻った時点で vCPU 0 は実行中（start gate は #3798）。
+    /// 戻った時点で vCPU 0 は起動レジスタを書かれて待機中で、ゲストはまだ走らない（[`Self::start`] が走らせる）。
     pub fn assemble(config: HvfMicroVmConfig<B, N>) -> Result<Self, MicrovmError> {
         let HvfMicroVmConfig {
             layout,
@@ -279,7 +375,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
 
         let readback: Arc<OnceLock<ArmBootReadback>> = Arc::new(OnceLock::new());
         let slot = Arc::clone(&readback);
-        let handle = VcpuThread::spawn(
+        let handle = VcpuThread::spawn_gated(
             Arc::clone(&vm),
             move |v| {
                 let regs = [(0u8, state.x0), (1, state.x1), (2, state.x2), (3, state.x3)];
@@ -314,79 +410,149 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         let boot = match readback.get() {
             Some(b) => *b,
             None => {
-                // 想定外（setup は成功で戻った）。スレッドを止めて失敗にする。
+                // 想定外（setup は成功で戻った）。ゲートを開けずに止める（ゲストは走らない）。
                 let _ = handle.stop(DROP_STOP_DEADLINE);
                 return Err(internal("boot readback was not recorded"));
             }
         };
+        let dispatcher = Arc::clone(&devices.dispatcher);
+        let infos = devices.infos();
         Ok(HvfMicroVm {
-            vcpu: Some(handle),
-            devices,
-            memory: Some(memory),
-            vm,
-            layout,
-            loaded,
-            boot,
+            parts: HvfVmParts {
+                vcpu: Some(handle),
+                devices: Some(devices),
+                memory: Some(memory),
+                vm: Some(vm),
+                dispatcher,
+                infos,
+                layout,
+                loaded,
+                boot,
+            },
         })
     }
 }
 
 impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
+    /// ゲストを走らせ始める（start gate を開く）。以後の停止は [`RunningHvfMicroVm::stop`] か drop。
+    ///
+    /// ゲートの待ちは上限つき（`hvf_loop::START_GATE_WAIT`）で、`assemble` から長く放置されたスレッドは走らせずに終わっていることが
+    /// ある。その場合も `start` は成功し、終了理由（`Failed(DeadlineExceeded)`）は `stop` の報告に出る。
+    pub fn start(self) -> Result<RunningHvfMicroVm<B, N>, MicrovmError> {
+        let started = Instant::now();
+        match &self.parts.vcpu {
+            Some(v) => v.open_start(),
+            None => {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::FailedPrecondition,
+                    "microvm resources are already released",
+                ));
+            }
+        }
+        log_line(format_args!("level=info op=hvf.microvm.start outcome=ok"));
+        Ok(RunningHvfMicroVm {
+            parts: self.parts,
+            started,
+        })
+    }
+
     /// 組み立てに使った配置。
     pub fn layout(&self) -> &Arm64Layout {
-        &self.layout
+        &self.parts.layout
     }
 
     /// Image・initrd・FDT の配置結果。
     pub fn loaded(&self) -> &LoadedArm64 {
-        &self.loaded
+        &self.parts.loaded
     }
 
     /// vCPU 0 の `setup` で書いて読み戻した起動レジスタ（MPIDR_EL1・SCTLR_EL1 は生の値。記録は #3803）。
     pub fn boot_registers(&self) -> &ArmBootReadback {
-        &self.boot
+        &self.parts.boot
     }
 
     /// 登録済みデバイスの配置（block → net の順）。
     pub fn devices(&self) -> Vec<HvfDeviceInfo> {
-        self.devices.infos()
+        self.parts.infos.clone()
     }
 
     /// MMIO dispatcher の共有ハンドル（vCPU の `MmioHandler` と同じ実体。#3793）。
     pub fn dispatcher(&self) -> &Arc<Mutex<ExitDispatcher>> {
-        &self.devices.dispatcher
+        &self.parts.dispatcher
     }
 
     /// ゲスト RAM を読む（試験・観測用。参照は外へ出さずコピーして返す）。
     pub fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| internal("guest memory is already released"))?;
-        mem.read_at(GuestAddress::new(addr), buf)
+        self.parts.read_guest(addr, buf)
     }
 
-    /// vCPU スレッドが既に終わったか（ゲスト起因の終了を含む）。
+    /// vCPU スレッドが既に終わったか（start 前に終わるのはゲートの期限切れだけ）。
     pub fn is_vcpu_finished(&self) -> bool {
-        self.vcpu.as_ref().is_none_or(VcpuHandle::is_finished)
-    }
-
-    /// GIC つきの VM（`Arc`）。
-    pub fn vm(&self) -> &Arc<VmWithGic> {
-        &self.vm
+        self.parts.is_finished()
     }
 }
 
-impl<B: BlockBackend, N: NetBackend> Drop for HvfMicroVm<B, N> {
-    fn drop(&mut self) {
-        let Some(handle) = self.vcpu.take() else {
-            return;
-        };
-        if handle.stop(DROP_STOP_DEADLINE).is_err() {
-            // vCPU スレッドが VM を持ったまま残る。対応付けを解放せずリークして、ゲストが書けうるメモリを再利用させない。
-            if let Some(mem) = self.memory.take() {
-                std::mem::forget(mem);
-            }
-        }
+/// start 済みの macOS microVM。[`Self::stop`] か drop で止まる（モジュール doc の「解放順序」）。
+pub struct RunningHvfMicroVm<B: BlockBackend, N: NetBackend> {
+    parts: HvfVmParts<B, N>,
+    started: Instant,
+}
+
+impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for RunningHvfMicroVm<B, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningHvfMicroVm")
+            .field("parts", &self.parts)
+            .field("finished", &self.parts.is_finished())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: BlockBackend, N: NetBackend> RunningHvfMicroVm<B, N> {
+    /// 停止を要求し、`deadline`（0 超 60 秒以下。範囲外は `InvalidArgument`）まで待って資源を解放する。
+    ///
+    /// ゲスト起因で既に終わっていたときはその理由（`GuestShutdown`・`Failed(..)`）を返す。期限切れは `TIMEOUT`
+    /// （`DeadlineExceeded`）で、ゲスト RAM を解放せずリークする（残る資源と回収の方法はモジュール doc）。
+    pub fn stop(mut self, deadline: Duration) -> Result<HvfStopReport, MicrovmError> {
+        let result = self.parts.release("hvf.microvm.stop", deadline);
+        log_line(format_args!(
+            "level=info op=hvf.microvm.lifetime elapsed_us={}",
+            self.started.elapsed().as_micros()
+        ));
+        result
+    }
+
+    /// vCPU スレッドが既に終わったか（ゲスト起因の終了を含む）。
+    pub fn is_finished(&self) -> bool {
+        self.parts.is_finished()
+    }
+
+    /// 組み立てに使った配置。
+    pub fn layout(&self) -> &Arm64Layout {
+        &self.parts.layout
+    }
+
+    /// Image・initrd・FDT の配置結果。
+    pub fn loaded(&self) -> &LoadedArm64 {
+        &self.parts.loaded
+    }
+
+    /// vCPU 0 の起動レジスタの読み戻し値。
+    pub fn boot_registers(&self) -> &ArmBootReadback {
+        &self.parts.boot
+    }
+
+    /// 登録済みデバイスの配置（block → net の順）。
+    pub fn devices(&self) -> Vec<HvfDeviceInfo> {
+        self.parts.infos.clone()
+    }
+
+    /// MMIO dispatcher の共有ハンドル。
+    pub fn dispatcher(&self) -> &Arc<Mutex<ExitDispatcher>> {
+        &self.parts.dispatcher
+    }
+
+    /// ゲスト RAM を読む（試験・観測用。コピーして返す）。
+    pub fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
+        self.parts.read_guest(addr, buf)
     }
 }

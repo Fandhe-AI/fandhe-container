@@ -1,4 +1,4 @@
-//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797）。`--ignored` 指定時だけ走る。
+//! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
 //! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
@@ -928,9 +928,22 @@ impl Drop for Watchdog {
 /// 合成の arm64 Image。先頭の命令は `b .`（自分自身への分岐）で、ゲストはその場で走り続ける。
 /// ヘッダ（64 バイト）: offset 0 = code0、8 = text_offset、16 = image_size、24 = flags、56 = magic（`ARM\x64`）。
 fn synthetic_image(magic_ok: bool) -> Vec<u8> {
+    synthetic_image_with_code(magic_ok, &[])
+}
+
+/// [`synthetic_image`] の先頭を `b +0x40` にし、ヘッダの直後（offset 0x40）へ `code` を置いたもの（`code` が空なら `b .`）。
+fn synthetic_image_with_code(magic_ok: bool, code: &[u32]) -> Vec<u8> {
     use fandhe_container_microvm::boot_arm64::ARM64_IMAGE_MAGIC;
     let mut img = vec![0u8; 4096];
-    img[0..4].copy_from_slice(&0x1400_0000u32.to_le_bytes());
+    let first: u32 = if code.is_empty() {
+        0x1400_0000
+    } else {
+        0x1400_0010
+    };
+    img[0..4].copy_from_slice(&first.to_le_bytes());
+    for (i, w) in code.iter().enumerate() {
+        img[0x40 + i * 4..0x44 + i * 4].copy_from_slice(&w.to_le_bytes());
+    }
     img[8..16].copy_from_slice(&0x8_0000u64.to_le_bytes());
     img[16..24].copy_from_slice(&4096u64.to_le_bytes());
     // flags = 0（リトルエンディアン・ページサイズ未指定）のまま。
@@ -1024,11 +1037,91 @@ fn hvf_device_assemble_sets_boot_registers() {
     assert_eq!(devices[0].window.base.raw(), 0x0a00_0000);
     assert_eq!(devices[0].spi_intid, 48);
 
-    // 6. `b .` のゲストは走り続ける。
+    // 6. start までゲストは走らない（vCPU スレッドはゲートで待機中）。start の後は `b .` のゲストが走り続け、stop は `Requested`。
     std::thread::sleep(Duration::from_millis(200));
     assert!(!vm.is_vcpu_finished());
+    let running = vm.start().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!running.is_finished());
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        report.reason,
+        fandhe_container_microvm::stop::StopReason::Requested
+    );
 
-    // 7. drop（vCPU の停止 -> RAM の unmap -> VM の破棄）の後に VM を作り直せる。
+    // 7. stop（vCPU の破棄 -> デバイス -> RAM の unmap -> VM の破棄）の後に VM を作り直せる。
+    drop(create_vm_or_precondition());
+}
+
+/// microVM の start / stop と停止・drop 時の資源の解放（TASK-192.16・#3798・MVM-5・MVM-1・REPAIR-5）。
+/// (A) 自己ループのゲストの start → stop が `Requested`、(B) その直後に同じプロセスで再 assemble → start → stop ができる
+/// （資源の解放の観測。解放漏れなら 2 回目の `HvVm::create` が `FailedPrecondition`）、(C) PSCI SYSTEM_OFF のゲストが
+/// `GuestShutdown` で終わり stop がその理由を返す、(D) 走行中の `RunningHvfMicroVm` の drop の後、(E) start しない
+/// `HvfMicroVm` の drop の後にも再 assemble できる。期限 watchdog 30 秒つき（超過は `hvf_device: WATCHDOG EXPIRED` と終了コード 124）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_start_stop_microvm() {
+    use fandhe_container_microvm::hvf::HvfMicroVm;
+    use fandhe_container_microvm::stop::StopReason;
+    use std::time::Instant;
+
+    let _wd = Watchdog::start(ASSEMBLE_DEADLINE);
+    let layout = Arm64Layout::new(64 << 20, 1, 1).unwrap();
+    require_vm_with_gic(&layout);
+
+    // (A) 自己ループのゲスト: start → 走り続ける → stop が Requested。
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(true), 1)).unwrap();
+    let running = vm.start().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!running.is_finished());
+    let t = Instant::now();
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    eprintln!(
+        "hvf_device: start_stop: stop reason={:?} stats={:?} stop_elapsed={:?}",
+        report.reason,
+        report.stats,
+        t.elapsed()
+    );
+    assert_eq!(report.reason, StopReason::Requested);
+    assert!(report.stats.runs > 0);
+
+    // (B) 同じプロセスで再 assemble → start → stop。
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(true), 1)).unwrap();
+    let running = vm.start().unwrap();
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+
+    // (C) SYSTEM_OFF のゲスト: x0 = 0x8400_0008（PSCI SYSTEM_OFF）→ hvc #0。
+    let off = [0xD280_0100u32, 0xF2B0_8000, 0xD400_0002];
+    let vm = HvfMicroVm::assemble(assemble_config(
+        layout.clone(),
+        synthetic_image_with_code(true, &off),
+        1,
+    ))
+    .unwrap();
+    let running = vm.start().unwrap();
+    let begin = Instant::now();
+    while !running.is_finished() && begin.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(running.is_finished(), "guest did not reach SYSTEM_OFF");
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+
+    // (D) 走行中の drop の後も作り直せる。
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(true), 1)).unwrap();
+    let running = vm.start().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(running);
+
+    // (E) start しない drop の後も作り直せる（ゲストは走らない）。
+    let vm =
+        HvfMicroVm::assemble(assemble_config(layout.clone(), synthetic_image(true), 1)).unwrap();
+    drop(vm);
+    let vm = HvfMicroVm::assemble(assemble_config(layout, synthetic_image(true), 1)).unwrap();
     drop(vm);
     drop(create_vm_or_precondition());
 }

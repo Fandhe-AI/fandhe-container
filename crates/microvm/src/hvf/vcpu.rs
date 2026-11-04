@@ -14,6 +14,13 @@
 //! （`GuestMapping` は `&HvVm` を借用する）を、[`VcpuHandle::stop`] が戻るまで保つこと。`stop` が期限切れになったら、
 //! スレッドが自力で終わるまで VM は残る（無期限の `join` はしない）。
 //!
+//! # 開始の制御と破棄の順序（TASK-192.16・#3798）
+//! [`VcpuThread::spawn_gated`] は vCPU を作って `setup` を済ませた後、[`VcpuHandle::open_start`] が呼ばれるまでゲストを走らせない
+//! （microVM の組み立てと `start` を分ける。[`VcpuThread::spawn`] は直後に開く従来の形）。ゲートの待ちは上限つきで、開く前の
+//! stop / drop は走らせずに終わる。`spawn_gated` のスレッドは終了時、`VmWithGic::mark_teardown`（以後の vCPU 作成を拒否）→
+//! owning thread での vCPU の破棄 → `Arc<VmWithGic>` の解放、の順で戻る（`hvf::microvm` の解放順序）。`spawn`（従来の形）は
+//! 印を立てない（同じ VM に vCPU を作り直す既存の結合試験があるため）。
+//!
 //! # 未実装（REPAIR-3）
 //! 複数 vCPU（スレッド名は `hvf-vcpu-0` 固定）・AP の起動。exit ごとの実処理は hvc 以外スタブ（`Unimplemented` で VM を止める）。
 
@@ -25,6 +32,7 @@ use crate::esr::EsrClass;
 use crate::hvf::VmWithGic;
 use crate::hvf::{hvc, mmio, timer};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, check_run_deadline};
+use crate::hvf_lifecycle::VcpuStopper;
 use crate::hvf_loop::{
     ExitAction, HvExit, LoopHandle, LoopStart, VCPU_CREATE_DEADLINE_DEFAULT, VCPU_RUN_SLICE,
     VcpuExec, VcpuExitObserver, VcpuKick, VcpuStopReport, run_loop, spawn_loop,
@@ -108,6 +116,17 @@ impl VcpuHandle {
     pub fn stop(self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError> {
         self.0.stop(deadline)
     }
+
+    /// 実行開始の合図を出す（[`VcpuThread::spawn_gated`] で作ったスレッドがゲストを走らせ始める。TASK-192.16・#3798）。
+    pub fn open_start(&self) {
+        self.0.open_start();
+    }
+}
+
+impl VcpuStopper for VcpuHandle {
+    fn stop(self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError> {
+        VcpuHandle::stop(self, deadline)
+    }
 }
 
 /// vCPU 専用スレッドの起動口。
@@ -160,6 +179,36 @@ impl VcpuThread {
     where
         S: FnOnce(&mut HvVcpu<'_>) -> Result<(), MicrovmError> + Send + 'static,
     {
+        let handle = Self::spawn_inner(vm, setup, handlers, config, false)?;
+        handle.open_start();
+        Ok(handle)
+    }
+
+    /// [`Self::spawn`] と同じだが、[`VcpuHandle::open_start`] が呼ばれるまでゲストを走らせない（TASK-192.16・#3798・MVM-5）。
+    ///
+    /// microVM の `assemble`（組み立て）が使い、`start` が開く。終了時は `VmWithGic::mark_teardown` を立ててから vCPU を破棄する。
+    pub fn spawn_gated<S>(
+        vm: Arc<VmWithGic>,
+        setup: S,
+        handlers: ExitHandlers,
+        config: VcpuThreadConfig,
+    ) -> Result<VcpuHandle, MicrovmError>
+    where
+        S: FnOnce(&mut HvVcpu<'_>) -> Result<(), MicrovmError> + Send + 'static,
+    {
+        Self::spawn_inner(vm, setup, handlers, config, true)
+    }
+
+    fn spawn_inner<S>(
+        vm: Arc<VmWithGic>,
+        setup: S,
+        handlers: ExitHandlers,
+        config: VcpuThreadConfig,
+        gated: bool,
+    ) -> Result<VcpuHandle, MicrovmError>
+    where
+        S: FnOnce(&mut HvVcpu<'_>) -> Result<(), MicrovmError> + Send + 'static,
+    {
         check_run_deadline(config.run_slice)?;
         let slice = config.run_slice;
         let observer = config.observer;
@@ -181,12 +230,28 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let stop = start.ready(vcpu.canceller());
+                let stop = if gated {
+                    match start.ready_gated(vcpu.canceller()) {
+                        Ok(stop) => stop,
+                        Err(reason) => {
+                            // 走らせずに終わる（開く前の stop / drop、またはゲートの待ちの期限切れ）。
+                            vm.mark_teardown();
+                            drop(vcpu);
+                            return (reason, HvRunStats::default());
+                        }
+                    }
+                } else {
+                    start.ready(vcpu.canceller())
+                };
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
                 let reason = run_loop(&mut exec, &stop, slice, observer.as_deref(), |e, x| {
                     dispatch(e, &mut handlers, x)
                 });
                 let stats = exec.stats();
+                if gated {
+                    // これ以後の vCPU 作成を拒否する。vCPU の破棄は teardown の一部としてだけ起きる。
+                    vm.mark_teardown();
+                }
                 // vCPU を `vm`（この closure の捕捉値）より先に破棄してから戻る。
                 drop(exec);
                 (reason, stats)

@@ -23,6 +23,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,9 @@ pub const VCPU_STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
 pub const VCPU_CREATE_DEADLINE_DEFAULT: Duration = Duration::from_secs(5);
 /// [`LoopHandle`] が `stop` を経ずに drop されたときに、スレッドの終了を待つ上限。
 const DROP_STOP_WAIT: Duration = Duration::from_secs(5);
+/// 実行開始の合図（start gate）を待つ上限。`start` が呼ばれないまま放置された vCPU スレッドを残さないため（REPAIR-5。Linux の
+/// start 待ちと同値）。超えたらゲストを走らせずに `Failed(DeadlineExceeded)` で終える。
+pub const START_GATE_WAIT: Duration = Duration::from_secs(30);
 /// 停止待ちの間に kick を打ち直す間隔（実行より先に届いた kick の取りこぼし対策）。
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
 /// 報告を送った後のスレッドの終了を待つ上限（報告が最後の動作のため通常は即時）。
@@ -339,7 +343,7 @@ impl LogSink {
     }
 }
 
-fn log_line(args: fmt::Arguments<'_>) {
+pub(crate) fn log_line(args: fmt::Arguments<'_>) {
     static SINK: std::sync::OnceLock<Option<LogSink>> = std::sync::OnceLock::new();
     let sink = SINK.get_or_init(|| LogSink::start(std::io::stderr(), LOG_QUEUE_CAP));
     if let Some(sink) = sink {
@@ -355,10 +359,77 @@ fn outcome_fields(reason: StopReason) -> (&'static str, &'static str, String) {
     }
 }
 
+/// start gate の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    /// 開くのを待っている（組み立て直後）。
+    Closed,
+    /// `start` が呼ばれた。ゲストを走らせてよい。
+    Open,
+    /// 開く前に stop / drop された。ゲストは走らせない。
+    Cancelled,
+}
+
+/// start gate の待ちの結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Opened,
+    Cancelled,
+    TimedOut,
+}
+
+/// 実行開始の合図。組み立て（assemble）と実行開始（start）を分けるための 1 回限りの門で、`Cancelled` は `Open` に戻らない。
+/// `Mutex` の poison は状態が 1 語のため `into_inner` で受ける。
+#[derive(Debug)]
+struct StartGate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+impl StartGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState::Closed),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn set(&self, to: GateState) {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Closed からの遷移だけを許す（Cancelled を Open で上書きしない）。
+        if *g == GateState::Closed {
+            *g = to;
+        }
+        self.cv.notify_all();
+    }
+
+    fn open(&self) {
+        self.set(GateState::Open);
+    }
+
+    fn cancel(&self) {
+        self.set(GateState::Cancelled);
+    }
+
+    fn wait(&self, limit: Duration) -> GateOutcome {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .cv
+            .wait_timeout_while(guard, limit, |s| *s == GateState::Closed)
+            .unwrap_or_else(|e| e.into_inner());
+        match *guard {
+            GateState::Open => GateOutcome::Opened,
+            GateState::Cancelled => GateOutcome::Cancelled,
+            GateState::Closed => GateOutcome::TimedOut,
+        }
+    }
+}
+
 /// スレッド内の `body` へ渡す開始の合図。`ready` か `fail` のどちらかで作成結果を呼び出し元へ返す。
 pub struct LoopStart<K> {
     tx: SyncSender<Result<K, MicrovmError>>,
     stop: Arc<AtomicBool>,
+    gate: Arc<StartGate>,
 }
 
 impl<K> LoopStart<K> {
@@ -370,6 +441,28 @@ impl<K> LoopStart<K> {
         self.stop
     }
 
+    /// [`Self::ready`] の後、`LoopHandle::open_start` が呼ばれるまでゲストを走らせずに待つ（TASK-192.16・#3798・MVM-5）。
+    ///
+    /// 戻り値は `Ok(停止フラグ)`（開いた。[`run_loop`] へ進んでよい）か `Err(終了理由)`（走らせずに `(理由, 既定の統計)` で戻ること）。
+    /// 開く前に stop / drop された場合は `Err(Requested)`、[`START_GATE_WAIT`] を超えた場合は `Err(Failed(DeadlineExceeded))`。
+    pub fn ready_gated(self, kick: K) -> Result<Arc<AtomicBool>, StopReason> {
+        self.ready_gated_within(kick, START_GATE_WAIT)
+    }
+
+    /// [`Self::ready_gated`] の待ちの上限を指定する版（単体試験用に分けてある）。
+    fn ready_gated_within(self, kick: K, limit: Duration) -> Result<Arc<AtomicBool>, StopReason> {
+        let gate = Arc::clone(&self.gate);
+        let stop = self.ready(kick);
+        match gate.wait(limit) {
+            GateOutcome::Opened => Ok(stop),
+            GateOutcome::Cancelled => Err(StopReason::Requested),
+            GateOutcome::TimedOut => {
+                stop.store(true, Ordering::Release);
+                Err(StopReason::Failed(MicrovmErrorCode::DeadlineExceeded))
+            }
+        }
+    }
+
     /// 作成に失敗した。エラーをそのまま呼び出し元へ返す。
     pub fn fail(self, e: MicrovmError) {
         let _ = self.tx.send(Err(e));
@@ -379,6 +472,7 @@ impl<K> LoopStart<K> {
 /// 起動済みの vCPU スレッドの操作口。`stop` で期限つきに止める。
 pub struct LoopHandle<K: VcpuKick> {
     stop: Arc<AtomicBool>,
+    gate: Arc<StartGate>,
     kick: Arc<K>,
     rx: Receiver<VcpuStopReport>,
     join: Option<JoinHandle<()>>,
@@ -423,9 +517,11 @@ where
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<K, MicrovmError>>(1);
     let (report_tx, report_rx) = mpsc::sync_channel::<VcpuStopReport>(1);
+    let gate = Arc::new(StartGate::new());
     let start = LoopStart {
         tx: ready_tx,
         stop: Arc::clone(&stop),
+        gate: Arc::clone(&gate),
     };
     let join = std::thread::Builder::new()
         .name(name.to_string())
@@ -460,6 +556,7 @@ where
     match ready_rx.recv_timeout(create_deadline) {
         Ok(Ok(kick)) => Ok(LoopHandle {
             stop,
+            gate,
             kick: Arc::new(kick),
             rx: report_rx,
             join: Some(join),
@@ -515,6 +612,12 @@ impl<K: VcpuKick> LoopHandle<K> {
         self.join.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
+    /// 実行開始の合図を出す（[`LoopStart::ready_gated`] で待っているスレッドがゲストを走らせ始める）。
+    /// 既に stop / drop で取り消された後は何もしない。[`LoopStart::ready`] で始めたスレッドには影響しない。
+    pub fn open_start(&self) {
+        self.gate.open();
+    }
+
     /// 停止を要求し、`deadline` まで終了報告を待つ。
     ///
     /// `deadline` は 0 超 [`VCPU_STOP_DEADLINE_MAX`] 以下（`InvalidArgument`）。停止フラグを立てて kick し、待つ間も
@@ -530,6 +633,8 @@ impl<K: VcpuKick> LoopHandle<K> {
         }
         let started = Instant::now();
         let end = started + deadline;
+        // 開く前の stop ではゲストを走らせない（ゲート待ちのスレッドを起こす）。
+        self.gate.cancel();
         self.stop.store(true, Ordering::Release);
         let result = loop {
             // 破棄後の FailedPrecondition 等は終了の途中経過であり、報告の側が結果を持つため無視する。
@@ -585,6 +690,7 @@ impl<K: VcpuKick> Drop for LoopHandle<K> {
         let Some(join) = self.join.take() else {
             return;
         };
+        self.gate.cancel();
         self.stop.store(true, Ordering::Release);
         let end = Instant::now() + DROP_STOP_WAIT;
         while !join.is_finished() && Instant::now() < end {
@@ -1093,5 +1199,91 @@ mod tests {
         drop(h);
         assert!(exited.load(Ordering::SeqCst));
         assert!(t.elapsed() < DROP_STOP_WAIT);
+    }
+
+    /// ゲート越しに走る body。`runs` は「ゲストを走らせた回数」の代わり（ゲートを通ったら 1 増やす）。
+    fn gated_body(
+        limit: Duration,
+        runs: Arc<AtomicUsize>,
+    ) -> impl FnOnce(LoopStart<FakeKick>) -> (StopReason, HvRunStats) + Send + 'static {
+        move |start| match start.ready_gated_within(FakeKick(Arc::new(AtomicUsize::new(0))), limit)
+        {
+            Ok(stop) => {
+                runs.fetch_add(1, Ordering::SeqCst);
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (StopReason::Requested, HvRunStats::default())
+            }
+            Err(reason) => (reason, HvRunStats::default()),
+        }
+    }
+
+    /// MVM-5・TASK-192.16: open の前はゲストを走らせず、open の後に走る。
+    #[test]
+    fn mvm5_3798_gate_blocks_run_until_opened() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let h = spawn_loop("hvf-test", LONG, gated_body(LONG, Arc::clone(&runs))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        h.open_start();
+        let t = Instant::now();
+        while runs.load(Ordering::SeqCst) == 0 && t.elapsed() < LONG {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(h.stop(LONG).unwrap().reason, StopReason::Requested);
+    }
+
+    /// MVM-5・TASK-192.16: open せずに stop すると `Requested` で、ゲストは一度も走らない。
+    #[test]
+    fn mvm5_3798_stop_before_open_ends_requested_without_run() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let h = spawn_loop("hvf-test", LONG, gated_body(LONG, Arc::clone(&runs))).unwrap();
+        let report = h.stop(LONG).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// REPAIR-5・TASK-192.16: open せずに drop しても、ゲート待ちのスレッドが期限内に終わる。
+    #[test]
+    fn mvm5_3798_drop_before_open_releases_thread() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let h = spawn_loop("hvf-test", LONG, gated_body(LONG, Arc::clone(&runs))).unwrap();
+        let t = Instant::now();
+        drop(h);
+        assert!(t.elapsed() < DROP_STOP_WAIT);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// REPAIR-5・TASK-192.16: ゲートの待ちの上限を超えたら、走らせずに `Failed(DeadlineExceeded)` で終える。
+    #[test]
+    fn repair5_3798_gate_wait_timeout_fails_without_run() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let h = spawn_loop(
+            "hvf-test",
+            LONG,
+            gated_body(Duration::from_millis(30), Arc::clone(&runs)),
+        )
+        .unwrap();
+        let t = Instant::now();
+        while !h.is_finished() && t.elapsed() < LONG {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let report = h.stop(LONG).unwrap();
+        assert_eq!(
+            report.reason,
+            StopReason::Failed(MicrovmErrorCode::DeadlineExceeded)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// TASK-192.16: 取り消し後の open は効かない（Cancelled は Open に戻らない）。
+    #[test]
+    fn mvm5_3798_cancelled_gate_does_not_reopen() {
+        let g = StartGate::new();
+        g.cancel();
+        g.open();
+        assert_eq!(g.wait(Duration::from_millis(10)), GateOutcome::Cancelled);
     }
 }

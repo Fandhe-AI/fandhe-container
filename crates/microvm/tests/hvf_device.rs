@@ -891,3 +891,245 @@ fn hvf_device_assemble_retries_after_failure() {
     mapping.unmap().unwrap();
     drop(create_vm_or_precondition());
 }
+
+/// `hvf_device_vtimer_wakes_wfi` の場面 A のゲストプログラム（arm64。`llvm-mc -triple=aarch64 -mattr=+v8.4a
+/// -filetype=obj` + `llvm-objdump -d` で符号化・確認した命令語。オフセット 0）。
+///
+/// 手順: GICR_WAKER → GICD_CTLR → 再配置フレームの SGI_base(RD_base + 0x10000) で PPI 27(EL1 仮想タイマー)を
+/// group 1・優先度 0x80 で有効化 → CPU interface → `CNTV_CVAL_EL0 = CNTVCT_EL0 + CNTFRQ_EL0 / 100`（10 ms 後）・
+/// `CNTV_CTL_EL0 = 1` → `wfi`、`ICC_IAR1_EL1` が 1023(spurious) なら `wfi` へ戻る → タイマーを止めて読んだ INTID を
+/// MMIO 窓(0x0a00_0000)へ書く → EOIR → `b .`。基底アドレスはコード中に固定し、試験本体が `Arm64Layout` と一致を先に確かめる。
+const VTIMER_GUEST_CODE: [u32; 44] = [
+    0xD2A1_0001,
+    0xD2A1_0402,
+    0xD2A1_4003,
+    0x9140_4045,
+    0xB940_1444,
+    0x121E_7884,
+    0xB900_1444,
+    0xB940_1444,
+    0x3717_FFE4,
+    0x5280_0264,
+    0xB900_0024,
+    0xB940_0024,
+    0x37FF_FFE4,
+    0x52A1_0004,
+    0xB900_80A4,
+    0x5280_1006,
+    0x3910_6CA6,
+    0xB901_00A4,
+    0xD538_CCA4,
+    0xB240_0084,
+    0xD518_CCA4,
+    0xD503_3FDF,
+    0xD280_1FE4,
+    0xD518_4604,
+    0xD280_0024,
+    0xD518_CCE4,
+    0xD503_3FDF,
+    0xD53B_E006,
+    0xD280_0C87,
+    0x9AC7_08C6,
+    0xD53B_E047,
+    0x8B06_00E7,
+    0xD51B_E347,
+    0xD280_0024,
+    0xD51B_E324,
+    0xD503_3FDF,
+    0xD503_207F,
+    0xD538_CC00,
+    0xF10F_FC1F,
+    0x54FF_FFA0,
+    0xD51B_E33F,
+    0xB900_0060,
+    0xD518_CC20,
+    0x1400_0000,
+];
+
+/// 場面 B のゲスト(オフセット 0x200): `CNTV_CVAL_EL0 = u64::MAX`・`CNTV_CTL_EL0 = 1`(発火しない)にして `wfi` を繰り返す。
+const VTIMER_IDLE_CODE: [u32; 7] = [
+    0x9280_0007,
+    0xD51B_E347,
+    0xD280_0024,
+    0xD51B_E324,
+    0xD503_3FDF,
+    0xD503_207F,
+    0x17FF_FFFF,
+];
+
+/// 場面 A の vCPU の exit 回数の上限（PPI が届かない場合を watchdog と別の行で識別するための歯止め）。
+const VTIMER_MAX_EXITS: u32 = 4096;
+/// `hvf_device_vtimer_wakes_wfi` の全体期限。
+const VTIMER_DEADLINE: Duration = Duration::from_secs(20);
+
+/// WFI の待ちと vtimer の処理（TASK-192.14・#3796・MVM-5・MVM-1・REPAIR-5）。
+/// (A) CNTV に 10 ms 後の期限を設定して `wfi` で待つゲストが、`timer::handle_wfx` / `handle_vtimer` を通して起き、
+/// PPI の INTID を MMIO 窓へ書く（ホストが 1 秒以内に観測する）。ホストが回す手動ループで、MMIO のスタブに依存しない。
+/// (B) 発火しないタイマーで `wfi` を繰り返すゲストを `VcpuThread` + 本物の `TimerHandler` で走らせ、
+/// 待っている最中の停止要求で 1 秒以内に `Requested` で止まる。結果（PC・PPI が自動で pending になるか・
+/// `VTIMER_ACTIVATED` の有無）の記録は人間担当の #3803。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_vtimer_wakes_wfi() {
+    use fandhe_container_microvm::hvf::hvc::HvcHandler;
+    use fandhe_container_microvm::hvf::mmio::MmioHandler;
+    use fandhe_container_microvm::hvf::timer::{self, TimerHandler};
+    use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
+    use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
+    use fandhe_container_microvm::stop::StopReason;
+    use std::time::Instant;
+
+    const BASE: u64 = 0x4000_0000;
+    const WINDOW: u64 = 0x0a00_0000;
+    let finished = Arc::new(AtomicBool::new(false));
+    // アサーションが失敗（panic）しても watchdog を止めて join する RAII ガード。
+    struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _guard = {
+        let flag = Arc::clone(&finished);
+        let h = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < VTIMER_DEADLINE {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("hvf_device: WATCHDOG EXPIRED");
+            std::process::exit(124);
+        });
+        WatchdogGuard(Arc::clone(&finished), Some(h))
+    };
+
+    let layout = Arm64Layout::new(4 << 20, 1, 1).unwrap();
+    // ゲストコードに固定した値と配置の一致。
+    assert_eq!(layout.gic_dist.base.raw(), 0x0800_0000);
+    assert_eq!(layout.gic_redist.base.raw(), 0x0820_0000);
+    assert_eq!(layout.virtio_mmio_window(0).unwrap().base.raw(), WINDOW);
+    assert_eq!(layout.ram.base.raw(), BASE);
+    let vm = Arc::new(create_vm_with_gic_or_precondition(&layout));
+    let ppi = vm.gic().virtual_timer_intid();
+    assert_eq!(ppi, ARM64_PPI_INTID_BASE + ARM64_TIMER_VIRT_PPI);
+
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in VTIMER_GUEST_CODE.iter().enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    for (i, w) in VTIMER_IDLE_CODE.iter().enumerate() {
+        host.write_bytes(0x200 + i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
+
+    // 場面 A: ホストが回すループ。
+    {
+        let mut vcpu = vm.create_vcpu().unwrap();
+        vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))
+            .unwrap();
+        vcpu.set_reg(HvReg::PC, BASE).unwrap();
+        vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+        let mut handler = TimerHandler::new();
+        let (mut wfx, mut vtimer) = (0u32, 0u32);
+        let mut first_wfx_pc: Option<u64> = None;
+        let mut delivered: Option<u64> = None;
+        let start = Instant::now();
+        for _ in 0..VTIMER_MAX_EXITS {
+            let exit = match vcpu.run_once(VTIMER_DEADLINE) {
+                Ok(e) => e,
+                Err(e) => panic!("hvf_device: vtimer: run failed: {e}"),
+            };
+            match exit {
+                HvVcpuExit::VtimerActivated => {
+                    vtimer += 1;
+                    timer::handle_vtimer(&mut vcpu, &mut handler).unwrap();
+                }
+                HvVcpuExit::Exception(ex) => match decode_esr(ex.syndrome) {
+                    EsrClass::Wfx(kind) => {
+                        wfx += 1;
+                        if first_wfx_pc.is_none() {
+                            let pc = vcpu.get_reg(HvReg::PC).unwrap();
+                            first_wfx_pc = Some(pc);
+                            eprintln!("hvf_device: vtimer: pc at wfi exit={pc:#x} kind={kind:?}");
+                        }
+                        timer::handle_wfx(&mut vcpu, &mut handler, kind, &ex).unwrap();
+                    }
+                    EsrClass::DataAbort(da)
+                        if ex.physical_address == WINDOW
+                            && da.direction == AccessDirection::Write =>
+                    {
+                        let reg = HvReg::x(da.register.get()).unwrap();
+                        delivered = Some(vcpu.get_reg(reg).unwrap() & 0xffff_ffff);
+                        break;
+                    }
+                    other => panic!(
+                        "hvf_device: vtimer: unexpected guest exit {other:?} pa={:#x} syndrome={:#x}",
+                        ex.physical_address, ex.syndrome
+                    ),
+                },
+                other => panic!("hvf_device: vtimer: unexpected exit {other:?}"),
+            }
+        }
+        let elapsed = start.elapsed();
+        let stats = handler.stats();
+        let Some(value) = delivered else {
+            panic!(
+                "hvf_device: vtimer: guest did not take the timer interrupt within {VTIMER_MAX_EXITS} exits (wfx={wfx} vtimer={vtimer} stats={stats:?})"
+            );
+        };
+        eprintln!(
+            "hvf_device: vtimer: guest read intid={value} elapsed_ms={} wfx={wfx} vtimer={vtimer} unmasks={} masked={}",
+            elapsed.as_millis(),
+            stats.vtimer_unmasks,
+            handler.vtimer_masked()
+        );
+        assert_eq!(value, u64::from(ppi));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        drop(vcpu);
+    }
+
+    // 場面 B: VcpuThread と本物のハンドラ。待っている最中の停止要求。
+    let counts = Arc::new(ExitCounts::new());
+    let config = VcpuThreadConfig {
+        observer: Some(counts.clone()),
+        ..VcpuThreadConfig::default()
+    };
+    let handlers = ExitHandlers {
+        mmio: MmioHandler::new(),
+        hvc: HvcHandler::new(),
+        timer: TimerHandler::new(),
+    };
+    let setup = |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
+        vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))?;
+        vcpu.set_reg(HvReg::PC, BASE + 0x200)?;
+        vcpu.set_reg(HvReg::CPSR, 0x3c5)
+    };
+    let handle = VcpuThread::spawn(Arc::clone(&vm), setup, handlers, config).unwrap();
+    let t0 = Instant::now();
+    while counts.count(ExitKind::Wfx) < 2 && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(counts.count(ExitKind::Wfx) >= 2, "guest never reached wfi");
+    // 空回りしていない証跡(200 ms あたりの WFI の exit 回数。assert はしない)。
+    let before = counts.count(ExitKind::Wfx);
+    std::thread::sleep(Duration::from_millis(200));
+    eprintln!(
+        "hvf_device: vtimer: idle wfx per 200ms={}",
+        counts.count(ExitKind::Wfx) - before
+    );
+    assert!(!handle.is_finished());
+    let t = Instant::now();
+    let report = handle.stop(Duration::from_secs(1)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(counts.count(ExitKind::Vtimer), 0);
+
+    mapping.unmap().unwrap();
+    drop(vm);
+}

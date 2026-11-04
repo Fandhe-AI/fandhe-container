@@ -55,6 +55,10 @@
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
 //! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK ヘッダとの照合は #3803。
 //!
+//! # ホストの時刻（TASK-192.14・#3796）
+//! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
+//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3803。
+//!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
 //! SDK ヘッダとの最終照合は人間担当の #3803 で行う。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
@@ -62,8 +66,8 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats, HvSysReg,
-    HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
+    GicIntid, HostTimebase, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats,
+    HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
     check_gic_supported, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
     decode_exit, finish_run, parse_macos_product_version,
 };
@@ -153,6 +157,53 @@ const MAP_PRIVATE: c_int = 0x0002;
 const MAP_ANON: c_int = 0x1000;
 const SC_PAGESIZE: c_int = 29;
 const ENOMEM: i32 = 12;
+
+// SAFETY: 宣言は macOS（LP64）の libSystem（`<mach/mach_time.h>`）の C ABI に一致させている
+// （`mach_absolute_time` は `uint64_t` を返し引数なし、`mach_timebase_info` は `kern_return_t` = int を返し
+// `struct mach_timebase_info { uint32_t numer; uint32_t denom; }` へのポインタを取る）。
+// 両関数は libc に対応物があり #3664 で照合する（本 crate は dev-dependency に libc を持たない）。
+// 呼び出しは下の安全なラッパー（`host_absolute_time`・`host_timebase`）経由だけ。
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
+}
+
+/// `struct mach_timebase_info`（`<mach/mach_time.h>`）。`sys` の外へ出さない。
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<MachTimebaseInfo>() == 8);
+    assert!(std::mem::align_of::<MachTimebaseInfo>() == 4);
+};
+
+/// ホストの絶対時間カウンタを読む（`mach_absolute_time`）。引数なし・常に成功する。
+/// `hvf::timer` が WFI の待ち時間の計算の直前に呼ぶ（TASK-192.14・#3796）。
+pub(crate) fn host_absolute_time() -> u64 {
+    // SAFETY: 引数もポインタも取らず、メモリを触らない。常に成功する libSystem の関数。
+    unsafe { mach_absolute_time() }
+}
+
+static HOST_TIMEBASE: OnceLock<Result<HostTimebase, MicrovmError>> = OnceLock::new();
+
+/// ホストの絶対時間カウンタの ns への換算比を返す（プロセスで 1 回だけ取得して保つ）。
+/// 失敗や 0 の値は `Internal`（推測の値で続けない。fail-closed）。
+pub(crate) fn host_timebase() -> Result<HostTimebase, MicrovmError> {
+    HOST_TIMEBASE
+        .get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+            // SAFETY: `info` は初期化済みのローカル変数で、呼び出しの間は有効な書き込み先（8 バイト・4 アライン）。
+            let rc = unsafe { mach_timebase_info(&mut info) };
+            if rc != 0 {
+                return Err(internal("mach_timebase_info failed"));
+            }
+            HostTimebase::new(info.numer, info.denom)
+        })
+        .clone()
+}
 
 /// プロセス内に `HvVm` が存在するか（1 プロセス 1 VM の排他）。
 static VM_EXISTS: AtomicBool = AtomicBool::new(false);

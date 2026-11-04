@@ -22,8 +22,8 @@
 //! - BSP の CPU_OFF は `power_off(0)` が DENIED を返す。DENIED は CPU_OFF が返しうる唯一の失敗値（DEN0022 §5.1.3）で、BSP を
 //!   「VM が生きていることの錨」として保つ判断であり、仕様の強制ではない。
 //! - ビッグエンディアンのゲストは対象外（`SCTLR_EL1.EE` を 0 にして起動する。`boot_arm64::sctlr_for_cpu_on`）。
-//! - WFI の待ちは `hvf_wake::WfiWaker` の世代番号つき共有通知と vCPU ごとの既読位置（#3933）で、1 回の通知が待つ全 vCPU を
-//!   起こす。SPI の宛先 vCPU は見ず全台を起こす（宛先以外の早期再開は WFI の spurious wakeup として許される）。
+//! - WFI の待ちは `hvf_wake::WfiWakeSet` の vCPU ごとに独立したスロット（#3948。各スロットは世代番号と既読位置を持つ #3933 の `WfiWaker`）で、
+//!   SPI は `InterruptACK` から学習した宛先の vCPU だけを起こし、未学習・シリアル・停止要求は全台を起こす（古いヒントでは宛先が最大 `WFI_WAIT_MAX` 遅れる。残余は `hvf_wake`）。
 //! - VM の終了（SYSTEM_OFF・SYSTEM_RESET・fail-closed の停止・異常終了。CPU_OFF の Park とは別）は、終わった vCPU のスレッドが
 //!   [`VmShutdown::trigger`] を呼び、全 vCPU の停止フラグを立てて kick する（BSP の実行・AP の parked 待ちを即解除）。
 //!   呼び出し側の `stop` を待たずに他の vCPU が止まる。`VcpuSet::is_finished` は従来どおり状態を調べるだけ。

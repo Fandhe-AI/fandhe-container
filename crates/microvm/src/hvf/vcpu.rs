@@ -52,7 +52,7 @@ use crate::hvf_loop::{
     stop_all,
 };
 use crate::hvf_smp::{ApMailbox, run_parked_ap};
-use crate::hvf_wake::WakingKick;
+use crate::hvf_wake::{WakingKick, WfiWakeSet};
 use crate::psci::PsciCpus;
 use crate::stop::StopReason;
 use crate::sys::{HvVcpu, VcpuCanceller};
@@ -132,7 +132,7 @@ impl VcpuKick for HvfKick {
 
 /// 起動済みの vCPU スレッドの操作口。
 #[derive(Debug)]
-pub struct VcpuHandle(LoopHandle<WakingKick<HvfKick>>);
+pub struct VcpuHandle(LoopHandle<WakingKick<HvfKick, WfiWakeSet>>);
 
 impl VcpuHandle {
     /// スレッドが既に終わったか（ゲスト起因の終了を含む）。
@@ -328,15 +328,16 @@ impl VcpuThread {
         let slot: Arc<OnceLock<u64>> = Arc::new(OnceLock::new());
         let slot_in = Arc::clone(&slot);
         let name = format!("hvf-vcpu-{index}");
-        let waker = vm.wfi_waker();
+        // WFI の待ちは vCPU 専用のスロットに結び（SPI は宛先のスロットだけを起こす。#3948）、停止要求は全台を起こす。
         let mut handlers = handlers;
-        handlers.timer.set_waker(waker.clone());
+        handlers.timer.set_waker(vm.wfi_waker_for_vcpu(index)?);
+        let wake = vm.wake_set();
         let kick_mailbox = Arc::clone(&mailbox);
         let shutdown = vm.shutdown();
         let handle = spawn_loop(
             &name,
             config.create_deadline,
-            move |start: LoopStart<WakingKick<HvfKick>>| {
+            move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -363,14 +364,14 @@ impl VcpuThread {
                     canceller: vcpu.canceller(),
                     mailbox: Some(kick_mailbox),
                 };
-                let peer = (vcpu.canceller(), Arc::clone(&mailbox), waker.clone());
-                let stop = start.ready(WakingKick::new(kick, waker));
+                let peer = (vcpu.canceller(), Arc::clone(&mailbox), wake.clone());
+                let stop = start.ready(WakingKick::new(kick, wake));
                 shutdown.register(
                     Arc::clone(&stop),
                     Box::new(move || {
                         let _ = peer.0.cancel();
                         peer.1.notify();
-                        peer.2.notify();
+                        peer.2.notify_all();
                     }),
                 );
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
@@ -417,14 +418,15 @@ impl VcpuThread {
         let slice = config.run_slice;
         let observer = config.observer;
         let mut handlers = handlers;
-        // WFI の待ちを VM の通知口に結ぶ（SPI の注入と停止要求の kick が起こす。#3887）。呼び出し側がどの `TimerHandler` を渡しても同じ。
-        let waker = vm.wfi_waker();
-        handlers.timer.set_waker(waker.clone());
+        // WFI の待ちを vCPU 0 専用のスロットに結ぶ（SPI は宛先のスロットだけ、停止要求の kick は全台を起こす。#3887・#3948）。
+        // 呼び出し側がどの `TimerHandler` を渡しても同じ。
+        handlers.timer.set_waker(vm.wfi_waker_for_vcpu(0)?);
+        let wake = vm.wake_set();
         let shutdown = vm.shutdown();
         let handle = spawn_loop(
             "hvf-vcpu-0",
             config.create_deadline,
-            move |start: LoopStart<WakingKick<HvfKick>>| {
+            move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
                 let mut vcpu = match vm.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
@@ -438,13 +440,13 @@ impl VcpuThread {
                     start.fail(e);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let peer = (vcpu.canceller(), waker.clone());
+                let peer = (vcpu.canceller(), wake.clone());
                 let kick = WakingKick::new(
                     HvfKick {
                         canceller: vcpu.canceller(),
                         mailbox: None,
                     },
-                    waker,
+                    wake,
                 );
                 let stop = if gated {
                     match start.ready_gated(kick) {
@@ -463,7 +465,7 @@ impl VcpuThread {
                     Arc::clone(&stop),
                     Box::new(move || {
                         let _ = peer.0.cancel();
-                        peer.1.notify();
+                        peer.1.notify_all();
                     }),
                 );
                 let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));

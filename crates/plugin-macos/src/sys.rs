@@ -442,36 +442,15 @@ mod tests {
         assert_eq!(imp::SIGTERM, 15);
     }
 
-    /// 試験専用の一時ディレクトリ（`Drop` で消す）。
-    #[cfg(unix)]
-    struct TmpDir(std::path::PathBuf);
-
-    #[cfg(unix)]
-    impl TmpDir {
-        fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("fandhe-plugin-macos-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).expect("create tmp dir");
-            Self(p)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// SEC-1・#3866: 通常ファイルに末尾 `/` を付けたパスは、正規化せず `open(2)` へ渡すためカーネルが
     /// `ENOTDIR` で拒否する。末尾 `/` なしでは同じファイルが読める（陽性対照）。
     #[cfg(unix)]
     #[test]
     fn sec1_3866_open_nofollow_nonblock_rejects_trailing_slash_on_regular_file() {
         use std::io::Read;
-        let dir = TmpDir::new("trailing-slash");
-        let file = dir.0.join("k");
+        // 既存の名前は消さず・辿らず排他作成する共有部品（REPAIR-12・#3506）。
+        let dir = crate::test_root::test_root("fandhe-plugin-macos", "trailing-slash");
+        let file = dir.join("k");
         std::fs::write(&file, b"payload").expect("write");
 
         let mut s = String::new();

@@ -8,6 +8,7 @@
 # TASK-75.5 の #3740 で UART の COM1 への結線と取り出し API を追加（依存は増やさない。unsafe なし）。
 # TASK-192.7・#3790 で boot_arm64 を追加（依存は増やさない。unsafe なし）。
 # TASK-192.8（#3785）で esr（arm64 ESR の復号。OS 非依存・unsafe なし）を追加（依存は増やさない）。
+# TASK-192.9（#3791）で hvf_loop・stop・hvf/vcpu.rs とスタブ（mmio・hvc・timer）を追加（依存は増やさない。unsafe なし）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。
 # TASK-74.2.1 で virtio_mmio（OS 非依存の共通トランスポート）を追加（依存は増やさない。unsafe なし）。

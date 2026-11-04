@@ -45,6 +45,9 @@
 //! `hvf_abi` は OS 非依存の純関数。macOS かつ aarch64 のみ `hvf::{HvVm, HostMapping, GuestMapping}`）。
 //! TASK-192.2・#3786・MVM-5: vCPU・レジスタ・exit・vtimer（`hvf_abi` の `HvReg`・`HvSysReg`・`HvVcpuExit`・`decode_exit`。
 //! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
+//! TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5: macOS の vCPU 専用スレッドと実行ループ・exit の分類・期限つきの停止（`hvf_loop` は OS 非依存の
+//! コアで、偽の実行体の単体テストが全 OS で走る。macOS かつ aarch64 のみ `hvf::{VcpuThread, VcpuHandle}`。exit ごとの処理
+//! `hvf::{mmio, hvc, timer}` はスタブで実処理は #3793・#3794・#3796）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! 未実装: aarch64 の vGIC・resamplefd による level の再注入・
@@ -80,6 +83,7 @@ pub mod guest_memory;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 pub mod hvf_abi;
+pub mod hvf_loop;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;
@@ -87,6 +91,7 @@ pub mod lapic_x86;
 #[cfg(target_os = "linux")]
 pub mod microvm;
 pub mod smp_x86;
+pub mod stop;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod sys;

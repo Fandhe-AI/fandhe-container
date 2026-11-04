@@ -89,6 +89,7 @@ pub mod hvf;
 pub mod hvf_abi;
 pub mod hvf_lifecycle;
 pub mod hvf_loop;
+pub mod hvf_wake;
 pub mod interrupt;
 #[cfg(target_os = "linux")]
 pub mod irq;

@@ -20,19 +20,27 @@
 //! # 宛先指定の起床（#3948・MVM-5・REPAIR-5）
 //! #3933 の後は 1 回の SPI で待つ全 vCPU が `hv_vcpu_run` へ再入し、宛先でない vCPU はすぐ WFI へ戻っていた。そこで vCPU ごとに
 //! 独立した [`WfiWaker`]（別々の mutex と condvar）を [`WfiWakeSet`] に束ね、SPI の注入は [`WfiWakeSet::notify_spi`] で
-//! 宛先の 1 台だけを起こす。宛先は [`SpiRouteHint`] が持つ。framework 側の GIC のルーティング（`GICD_IROUTER<n>`）は
-//! 読まず（読む口は新しい `sys` の `unsafe` が要るため本 issue の範囲外）、ホストから見える `InterruptACK` の MMIO 書き込みを
-//! 処理した vCPU を [`AckRouteLearner`] が記録する（virtio-mmio ドライバは割り込みハンドラの中で ACK を書くため、
+//! 宛先の 1 台だけを起こす。宛先は、framework 側の GIC のルーティング（`GICD_IROUTER<n>`。`hv_gic_get_distributor_reg` で読む。
+//! macOS 15.0 以降。#3960）を主とし、読めない・1 台に決まらないときの縮退先を [`SpiRouteHint`] とする（決定規則は
+//! [`spi_wake_target`]、起床は [`WfiWakeSet::notify_spi_routed`]）。ヒントはホストから見える `InterruptACK` の MMIO 書き込みを
+//! 処理した vCPU を [`AckRouteLearner`] が記録した値である（virtio-mmio ドライバは割り込みハンドラの中で ACK を書くため、
 //! ACK した vCPU が宛先である）。
-//! - 未学習（一度も ACK されていない線）・範囲外の index は全台を起こす（取りこぼさない側に倒す）。
+//! - ルーティングが読めて IRM = 0・affinity が割り当て済みの vCPU に当たれば、その 1 台（ヒントが食い違ってもルーティングが勝つ）。
+//!   ゲストが affinity を移した直後も、次の assert から新しい宛先を起こせる。
+//! - 読めない・IRM = 1（1-of-N）・書式違反・該当 vCPU なしのときはヒント。ヒントも無い（未学習）・範囲外の index は全台を起こす
+//!   （取りこぼさない側に倒す）。
 //! - 停止要求の kick（[`WakingKick`]）と VM の終了通知は常に全台を起こす（[`WfiWakeSet::notify_all`]）。
 //! - vCPU 1 台の構成では従来の単一 waker と同じ効果になる。
 //! - スロットの mutex は 1 個ずつ取り入れ子にしない。ヒントは atomic で lock ではない。
 //!
 //! # 残余（REPAIR-3）
-//! - ヒントは学習値のため、ゲストが irq affinity を移した直後・CPU_OFF の直後は古いままになりうる。その 1 回は新しい宛先が
-//!   最大 `WFI_WAIT_MAX`（10 ms）遅れて起きる（待ちは常に期限つきで有界）。新しい宛先が次の ACK を書くとヒントは自己修復する。
-//! - シリアル（UART の level 線）は ACK の経路が違うため学習せず、常に全台を起こす。
+//! - ルーティングが読めないとき（macOS 15 未満の想定外・シンボル欠落・framework の失敗）は従来のヒントに縮退する。ヒントは学習値の
+//!   ため、ゲストが irq affinity を移した直後・CPU_OFF の直後は古いままになりうる。その 1 回は新しい宛先が最大 `WFI_WAIT_MAX`
+//!   （10 ms）遅れて起きる（待ちは常に期限つきで有界）。新しい宛先が次の ACK を書くとヒントは自己修復する。
+//! - シリアル（UART の level 線）は ACK の経路が違うため学習しない。ルーティングが読めれば宛先の 1 台だけを起こし、読めなければ全台。
+//! - `GICD_CTLR.ARE` は確認しない。ARE = 0 の段階の IROUTER は意味を持たないが、その段階では distributor が無効で注入が届かず、
+//!   誤った起床も期限で有界。
+//! - 毎回の assert で IROUTER を 1 回読む。コストが問題になればキャッシュ（affinity の変更検知）を別 issue で検討する（実測は #3803）。
 //! - 通知されない起床要因（PPI 等）は従来どおり `WFI_WAIT_MAX` の期限が安全網である。
 
 use std::fmt;
@@ -40,9 +48,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::arm64_layout::arm64_vcpu_index_from_affinity;
 use crate::error::MicrovmError;
 use crate::error::MicrovmErrorCode;
-use crate::hvf_abi::HVF_MAX_VCPUS;
+use crate::hvf_abi::{HVF_MAX_VCPUS, IrouterRoute, decode_irouter};
 use crate::hvf_loop::VcpuKick;
 
 /// [`WfiWaker::wait`] の戻り。
@@ -194,6 +203,45 @@ impl WfiWakeSet {
             Some(i) => self.notify_vcpu(i),
             None => self.notify_all(),
         }
+    }
+
+    /// SPI の注入後の起床（#3960・MVM-5）。`irouter`（`GICD_IROUTER<n>` の生値。読めなければ `None`）が主、`route`（学習した
+    /// ヒント）が縮退先。宛先の決定は [`spi_wake_target`]。
+    pub fn notify_spi_routed(&self, irouter: Option<u64>, route: &SpiRouteHint) {
+        let vcpus = u32::try_from(self.slots.len()).unwrap_or(0);
+        match spi_wake_target(irouter, route.get(), vcpus) {
+            SpiWakeTarget::Vcpu(i) => self.notify_vcpu(i),
+            SpiWakeTarget::All => self.notify_all(),
+        }
+    }
+}
+
+/// SPI の起床の宛先（#3960）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiWakeTarget {
+    /// この vCPU だけを起こす。
+    Vcpu(u32),
+    /// 全台を起こす（宛先を決められない。取りこぼさない側）。
+    All,
+}
+
+/// SPI の宛先 vCPU を決める純関数（#3960・MVM-5・REPAIR-5）。
+///
+/// 1. `irouter` が読めて、IRM = 0・書式が正しく・affinity が `vcpus` 台の割り当てに当たるなら、その vCPU（ヒントが食い違っても
+///    ルーティングが勝つ）。
+/// 2. 決まらない場合（読めない・IRM = 1・書式違反・該当 vCPU なし）は、ヒントが `vcpus` 未満ならその vCPU。
+/// 3. それ以外は全台。
+///
+/// `irouter` はゲストが書く非信頼値。結果は「どの vCPU を起こすか」だけに効き、誤っても `WFI_WAIT_MAX` で有界。
+pub fn spi_wake_target(irouter: Option<u64>, hint: Option<u32>, vcpus: u32) -> SpiWakeTarget {
+    if let Some(IrouterRoute::Affinity(aff)) = irouter.map(decode_irouter)
+        && let Some(i) = arm64_vcpu_index_from_affinity(aff, vcpus)
+    {
+        return SpiWakeTarget::Vcpu(i);
+    }
+    match hint {
+        Some(i) if i < vcpus => SpiWakeTarget::Vcpu(i),
+        _ => SpiWakeTarget::All,
     }
 }
 
@@ -520,6 +568,44 @@ mod tests {
         for (out, el) in r {
             assert_eq!(out, WakeOutcome::Notified);
             assert!(el < Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn mvm5_3960_spi_wake_target_values() {
+        use SpiWakeTarget::{All, Vcpu};
+        let t = spi_wake_target;
+        assert_eq!(t(Some(0x1), Some(0), 4), Vcpu(1));
+        assert_eq!(t(Some(0x0), None, 4), Vcpu(0));
+        assert_eq!(t(Some(0x8000_0000), Some(2), 4), Vcpu(2));
+        assert_eq!(t(Some(0x8000_0000), None, 4), All);
+        assert_eq!(t(None, Some(1), 4), Vcpu(1));
+        assert_eq!(t(None, None, 4), All);
+        assert_eq!(t(Some(0x5), Some(3), 4), Vcpu(3));
+        assert_eq!(t(Some(0x5), None, 4), All);
+        assert_eq!(t(None, Some(7), 4), All);
+        // 書式違反はヒントへ縮退する。
+        assert_eq!(t(Some(0x0100_0001), Some(2), 4), Vcpu(2));
+    }
+
+    #[test]
+    fn repair5_mvm5_3960_notify_spi_routed_wakes_only_routed_slot() {
+        let set = set4();
+        // ヒントは別の vCPU（3）を指すが、ルーティング（affinity 1）が勝つ。
+        let hint = SpiRouteHint::unknown();
+        hint.record(3);
+        set.notify_spi_routed(Some(0x1), &hint);
+        for i in 0..SLOTS as u32 {
+            let want = if i == 1 {
+                WakeOutcome::Notified
+            } else {
+                WakeOutcome::TimedOut
+            };
+            assert_eq!(
+                set.handle(i).unwrap().wait(Duration::ZERO),
+                want,
+                "slot {i}"
+            );
         }
     }
 

@@ -43,6 +43,16 @@
 //!   `InterruptACK` を処理した vCPU を学習した宛先の 1 台だけを起こし、未学習の線とシリアルは全台を起こす（#3948。
 //!   学習の方式と残余は `crate::hvf_wake`）。ロック順は UART → 生存フラグ（読み取り。通知の前に外す）→ waker のスロットの
 //!   mutex で、スロットの mutex は 1 個ずつ取り持つ間は他の lock を取らない。宛先のヒントは atomic で lock ではない。
+//! - 宛先の決定（#3960・MVM-5）: `hv_gic_get_distributor_reg` は **ある**（macOS 15.0 で導入。`hv_gic_distributor_reg_t` の列挙値は
+//!   ARM GICv3 の distributor のレジスタオフセットに等しく、`HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32` が存在する。一次資料:
+//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・
+//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
+//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>。確認日 2026-11-05。
+//!   SDK ヘッダとの照合は #3803）。assert の成功後に `GICD_IROUTER<intid>` を読み、IRM = 0 で affinity が割り当て済みの vCPU
+//!   に当たればその 1 台を起こす（シリアルの線も同じ。決定規則は `crate::hvf_wake::spi_wake_target`）。読めない・IRM = 1・書式違反
+//!   のときは学習したヒントへ、それも無ければ全台へ縮退する（読み出しの失敗は無視する）。観測用に [`VmWithGic::spi_routing`] を公開する。
+//!   distributor 版の getter に owning thread の注記は無い（redistributor 版にはある）が、非 vCPU スレッドからの読み出しは未観測
+//!   （#3803）。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
@@ -61,7 +71,7 @@ use crate::hvf_wake::{SpiRouteHint, WfiWakeSet, WfiWaker};
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::hvf_abi::HvGicIntid;
+use crate::hvf_abi::{GicDistributorReg, HvGicIntid};
 use crate::hvf_lifecycle::TeardownMark;
 use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
 use crate::spi::{SpiLevelLine, SpiLine, SpiSink};
@@ -204,6 +214,14 @@ impl VmWithGic {
         self.wake.clone()
     }
 
+    /// SPI `intid` の `GICD_IROUTER<intid>` の生値を読む（実機の観測用。#3960・MVM-5）。
+    ///
+    /// `&self` で VM の生存を保証する。`intid` が SPI の範囲（32..=1019）外なら `InvalidArgument`、`hv_gic_get_distributor_reg`
+    /// が使えなければ `Unimplemented`。宛先の決定は `crate::hvf_wake::spi_wake_target`（この値を `decode_irouter` で復号する）。
+    pub fn spi_routing(&self, intid: u32) -> Result<u64, MicrovmError> {
+        GicApi::get()?.distributor_reg(GicDistributorReg::irouter(intid)?)
+    }
+
     /// VM 全体の終了通知（全 vCPU スレッドが共有する）。
     pub fn shutdown(&self) -> Arc<VmShutdown> {
         Arc::clone(&self.shutdown)
@@ -328,11 +346,20 @@ impl SpiSink for HvfGicSink {
             ));
         }
         let r = self.api.set_spi(intid, level);
+        // assert が成功したら、読み取りロックの中で `GICD_IROUTER<intid>` を読む（VM が生きている間だけ framework を呼ぶ。
+        // 同期呼び出しで lock ではない）。読めない（シンボル欠落・framework の失敗・範囲外）ときは `None` で、学習したヒントへ縮退する（#3960）。
+        let irouter = if r.is_ok() && level {
+            GicDistributorReg::irouter(intid)
+                .and_then(|reg| self.api.distributor_reg(reg))
+                .ok()
+        } else {
+            None
+        };
         // 読み取りロックを外してから、assert が成功したときだけ WFI の待ちを起こす（waker の mutex を持つ間は他の lock を取らない）。
-        // 宛先が学習済みならその vCPU だけ、未学習なら全台（#3948）。
+        // 宛先はルーティングが主、ヒントが縮退先、どちらも無ければ全台（#3948・#3960）。
         drop(guard);
         if r.is_ok() && level {
-            self.wake.notify_spi(&self.route);
+            self.wake.notify_spi_routed(irouter, &self.route);
         }
         r
     }

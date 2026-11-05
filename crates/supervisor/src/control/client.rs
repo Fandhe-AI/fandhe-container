@@ -625,29 +625,16 @@ mod linux {
             }
         }
 
-        /// 一時の状態ルート（外部クレートを足さない最小の RAII）。`<root>/c/` は 0700。
-        struct Root(PathBuf);
-
-        impl Root {
-            fn new(tag: &str) -> Self {
-                use std::os::unix::fs::PermissionsExt as _;
-                let n = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let root = std::env::temp_dir()
-                    .join(format!("fc-cancel-{tag}-{}-{n}", std::process::id()));
-                let dir = root.join("c");
-                std::fs::create_dir_all(&dir).unwrap();
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-                Self(root)
-            }
-        }
-
-        impl Drop for Root {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+        /// 排他作成・symlink 非追従・自分が作ったものだけを消す共有部品 `test_root` で状態ルートを作り、
+        /// その直下に 0700 の `c/`（コンテナ ID `c` の状態ディレクトリ）を排他作成する（REPAIR-12・#3435）。
+        fn state_root(tag: &str) -> crate::test_root::TestRoot {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let root = crate::test_root::test_root("fc-cancel", tag);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("c"))
+                .unwrap();
+            root
         }
 
         /// SUP-3・SUP-9・REPAIR-4・REPAIR-5・REPAIR-12・#3973: 実 UDS で accept されない相手（listen backlog に
@@ -655,11 +642,11 @@ mod linux {
         #[test]
         fn sup3_sup9_3973_cancel_times_out_when_hello_never_arrives() {
             use std::os::unix::net::UnixListener;
-            let root = Root::new("nohello");
-            let listener = UnixListener::bind(root.0.join("c").join("supervisor.sock")).unwrap();
+            let root = state_root("nohello");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
             let id = ContainerId::new("c").unwrap();
             let started = Instant::now();
-            let e = ControlRestartCanceller::new(root.0.clone())
+            let e = ControlRestartCanceller::new(root.to_path_buf())
                 .cancel(&id, started + Duration::from_millis(300))
                 .unwrap_err();
             assert_eq!(e.code(), ErrorCode::Timeout);
@@ -676,8 +663,8 @@ mod linux {
             use crate::control::protocol::encode_hello;
             use std::io::Read as _;
             use std::os::unix::net::UnixListener;
-            let root = Root::new("withheld");
-            let listener = UnixListener::bind(root.0.join("c").join("supervisor.sock")).unwrap();
+            let root = state_root("withheld");
+            let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let server = std::thread::spawn(move || {
                 let (mut s, _) = listener.accept().unwrap();
@@ -691,7 +678,7 @@ mod linux {
             });
             let id = ContainerId::new("c").unwrap();
             let started = Instant::now();
-            let e = ControlRestartCanceller::new(root.0.clone())
+            let e = ControlRestartCanceller::new(root.to_path_buf())
                 .cancel(&id, started + Duration::from_millis(500))
                 .unwrap_err();
             let elapsed = started.elapsed();

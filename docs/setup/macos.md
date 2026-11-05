@@ -6,7 +6,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 - タスク: TASK-80 追補・TASK-64・TASK-192.19
 - 関連 issue: #3801・#3800・#3803・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
 
-> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `AGENTS.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `AGENTS.md` の実機前提テストの項に合わせたもので、実機確認は #3803（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
+> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `docs/verification/real-machine-tests.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `AGENTS.md` の実機前提テストの項に合わせたもので、実機確認は #3803（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
 
 ## 現状（実装済みと未実装）
 
@@ -90,7 +90,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 
 ステップ ID: `hypervisor-entitlement`（条件 `microvm`）。対象: MVM-5・MAC-1。
 
-- 署名の対象は microVM の backend plugin `fandhe-container-plugin-microvm` である。手元で実機前提テスト（`hvf_device`・`hvf_microvm`・plugin-microvm の E2E。手順は `AGENTS.md`「実機前提テスト」）を回す場合は、その試験バイナリにも同じ署名が要る。CLI やほかのバイナリではない
+- 署名の対象は microVM の backend plugin `fandhe-container-plugin-microvm` である。手元で実機前提テスト（`hvf_device`・`hvf_microvm`・plugin-microvm の E2E。手順は `docs/verification/real-machine-tests.md`）を回す場合は、その試験バイナリにも同じ署名が要る。CLI やほかのバイナリではない
 - 必要な entitlement は `com.apple.security.hypervisor` のみ（[Apple の entitlement のページ](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.hypervisor)）。`com.apple.vm.hypervisor` は macOS 10.15 以前向けで、本バックエンドは macOS 15 以降が対象のため不要
 - entitlements の plist は次のとおり（`crates/microvm/tests/hvf.entitlements` と同じ内容。同ファイルを流用してよい）:
 
@@ -123,7 +123,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 - initrd: `make guest-initrd-build` で作る（`rustup target add aarch64-unknown-linux-musl` が要る）。出力は `target/guest-initrd/aarch64/initrd.cpio.gz` と `build-info.txt`
 - どちらの成果物もコミットしない。macOS ホストでのビルド・リンクと VM での起動は未確認である（#1628）
 - 配置は判断待ちである。製品として kernel・initrd を置く既定の場所は無い。plugin-macos は create 要求ごとにパスを受け取るが、CLI から渡す経路は未実装（設計は #1869、承認と実装 issue の起票は #2232）。共用 VM の保持役とゲスト向けバイナリの配置は #1906 の判断待ち
-- 実機前提テストでは環境変数 `FANDHE_CONTAINER_MACOS_VM_KERNEL` などで渡す（`AGENTS.md`「実機前提テスト」の「ゲスト資産の用意」を参照）。試験専用で、製品の設定経路ではない
+- 実機前提テストでは環境変数 `FANDHE_CONTAINER_MACOS_VM_KERNEL` などで渡す（`docs/verification/real-machine-tests.md`の「ゲスト資産の用意」を参照）。試験専用で、製品の設定経路ではない
 
 ## plugin の配置と信頼性検証
 
@@ -136,7 +136,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 - 所有者・モード: ファイル、探索先、`/` までの全祖先が、root か実行ユーザーの所有で、group と other に書き込み権限が無いこと（sticky ビットも例外にしない）。symlink の plugin は実体とその祖先で判定する。探索先と祖先が symlink の場合は拒否する（`/tmp`・`/var` を通るパスは使えない）
 - 拡張 ACL: ディレクトリやファイルに拡張 ACL があれば、中身を解釈せずに拒否する。`~/Library` 配下は既定の ACL（`group:everyone deny delete`）で拒否されうる（実機未確認。要確認。確認例: `ls -le <パス>`）
 - `/usr/local` が group 書き込み可の環境（古い Homebrew など）では、system の探索先が祖先の検査で拒否される
-- 署名後のハッシュ: plugin-macos は Virtualization.framework の entitlement のために署名が要り（上の「entitlement とコード署名」と `AGENTS.md` の `codesign` の手順を参照）、署名でバイナリが変わる。許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539）。plugin-microvm も署名が要るため同様に署名後の sha256 を使う（「microVM（Hypervisor.framework）の entitlement とコード署名」節）
+- 署名後のハッシュ: plugin-macos は Virtualization.framework の entitlement のために署名が要り（上の「entitlement とコード署名」と `docs/verification/real-machine-tests.md` の `codesign` の手順を参照）、署名でバイナリが変わる。許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539）。plugin-microvm も署名が要るため同様に署名後の sha256 を使う（「microVM（Hypervisor.framework）の entitlement とコード署名」節）
 - CLI の失敗: 拒否は `PERMISSION_DENIED`（6）、候補なしは `FAILED_PRECONDITION`（5）。どちらもパス・plugin 名を出力しない固定文言（#1867）
 - 未確定・未確認: 許可済みハッシュ一覧の置き場所と指定方法は未確定（設計は #1868、承認の追跡は #2231）。plugin の起動と RPC は未実装（設計は #1869、追跡は #2232）。権限の実態は実機で未確認（#1628・#1923）
 

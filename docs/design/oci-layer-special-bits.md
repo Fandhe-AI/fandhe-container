@@ -230,14 +230,14 @@ chown（#2225）: `extract.rs` の `chown_tests`（`chown` を記録する差し
 非 Linux の `sec5_chown_is_unimplemented_off_linux`・`sec5_non_linux_preserve_policy_strips_everything`（main の 3 OS 実行で確認）、
 `idmap.rs` の単体試験、`tests/idmap_core_parity.rs`（core との照合）、`tests/layer_extract.rs` の
 `sec5_chown_via_public_api_with_real_syscalls`・`sec5_chown_outside_map_and_without_privilege_fail_closed`
-（実 syscall。権限なしで通る）。実機前提（root）の `sec5_chown_subuid_range_as_root` は `#[ignore]`（AGENTS.md「実機前提テスト」）。
+（実 syscall。権限なしで通る）。実機前提（root）の `sec5_chown_subuid_range_as_root` は `#[ignore]`（docs/verification/real-machine-tests.md）。
 
 rootless の user namespace の中での展開（#2382）: `extract.rs` の `chown_tests` の `oci2_userns_*`・
 `oci2_check_user_namespace_cases`・`oci2_parse_status_ids`・`sec5_userns_preserve_if_chowned_end_to_end`・
 `sec5_special_bits_to_keep_in_userns_matrix`（`/proc/self` の見え方の差し替え口で開始前の検証と宛先の値を照合）、
 `idmap.rs` の `sec5_parse_proc_id_map`・`sec5_same_lines_as`、`tests/idmap_core_parity.rs` の
 `oci2_parse_proc_id_map_matches_core`。実機前提の `tests/userns_extract.rs`（`harness = false`。`unshare --user --map-root-user`
-で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。AGENTS.md「実機前提テスト」）。
+で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。docs/verification/real-machine-tests.md）。
 
 PullImage の読み取り（#2534）: cri の `image_pull.rs` の `oci1_sec_config_rewritten_in_place_after_trust_check_is_rejected`
 （config は読んだ本文そのもののハッシュで照合する）・`oci1_unpack_record_worst_case_fits_within_the_limit`・

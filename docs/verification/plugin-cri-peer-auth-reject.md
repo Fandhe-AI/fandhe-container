@@ -26,7 +26,7 @@ plugin-cri のバイナリが、別 UID（root）の connector からの接続�
 
 ## connector の準備
 
-- 実行ユーザー所有の 0700 のディレクトリを `$HOME` 配下に作り、python3 版 connector を 0700 で置く。内容は [AGENTS.md](../../AGENTS.md)「実機前提テスト」の「UDS 境界の別 UID 接続拒否」項の python3 版（`sudo -n /usr/bin/python3 -I` で起動し `settimeout(15)`）を使う。`AGENTS.md` が正で、本書は転記しない
+- 実行ユーザー所有の 0700 のディレクトリを `$HOME` 配下に作り、python3 版 connector を 0700 で置く。内容は [real-machine-tests.md](real-machine-tests.md)の「UDS 境界の別 UID 接続拒否」項の python3 版（`sudo -n /usr/bin/python3 -I` で起動し `settimeout(15)`）を使う。`AGENTS.md` が正で、本書は転記しない
 - connector は root で実行される。自分で作った信頼できるファイルだけを絶対パスで渡す。`/tmp` 直下など共有の場所には置かない
 - `nc`（`nc.openbsd`）は使わない。AppArmor に制限されて 0700 のディレクトリを辿れず、PLUG-12 の検証結果ではなく Timeout で失敗する。AppArmor プロファイルを complain / disable にして回避しない
 

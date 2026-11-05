@@ -92,7 +92,7 @@ OCI の default devices と同じ固定表（`DeviceAllowList::oci_default()`。
 - `mknod`: `vfs_mknod()` が `CAP_MKNOD`（`EPERM`）の後に `devcgroup_inode_mknod()`（`EPERM`）を評価する。試験は root（`CAP_MKNOD` あり）で行うため `EPERM` はデバイス cgroup 由来で、許可リストにある c 1:3 の `mknod` が成功することを対照にする
 - errno で層を区別できるのは Landlock を適用しない構成に限る（Landlock も `EACCES` を返すため）。`tests/device_cgroup_layers.rs` は Landlock・seccomp を適用しない
 - 試験用の major に 120 を使う理由: 当初想定の 240 はカーネルの動的 major 割り当て（`find_dynamic_major()` は 254 から 234 へ向けて割り当てる）と重なり、開発ホストの `/proc/devices` にも `240 ttyDBC` が実在した。devices.txt で char 120-127 は LOCAL/EXPERIMENTAL USE で動的割り当ての範囲の外にある
-- 実機での実行は人間担当で、結果は #1621 に記録する（AGENTS.md「実機前提テスト」）
+- 実機での実行は人間担当で、結果は #1621 に記録する（docs/verification/real-machine-tests.md）
 
 ## OCI `linux.resources` の写像（TASK-29 追補・#2019・CORE-3・CORE-4・SEC-1・SUP-13）
 

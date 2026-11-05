@@ -49,7 +49,9 @@
 //!   新しいライブラリを実行時に読み込まない（security.md「動的ライブラリの実行時ロードを行わない」）。`dlclose` もしない
 //!   ため、解決した関数ポインタはプロセスの寿命の間有効。
 //! - 手順は「`kern.osproductversion` の版判定（15 未満は `Unimplemented`）→ 11 個のシンボル解決」の順。1 つでも見つから
-//!   なければ GIC の関数を何も返さない。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
+//!   なければ GIC の関数を何も返さない。12 個目の `hv_gic_get_distributor_reg`（#3960。macOS 15.0 で導入。
+//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>）だけは任意で、無ければ
+//!   `GicApi::distributor_reg` が `Unimplemented` を返し、呼び出し側が縮退する。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
 //! - 関数ポインタは `GicApi` の private フィールドに閉じ、`sys` の外へ出さない。`hv_gic_*` は `libc` に対応物が無いため
 //!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.12 以降なので直接リンクしてよい）
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
@@ -67,10 +69,10 @@
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    GicIntid, HostTimebase, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver, HvRunStats,
-    HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion, MemoryFlags,
-    check_gic_supported, check_map_range, check_run_deadline, check_vm_map, classify_hv_return,
-    decode_exit, finish_run, parse_macos_product_version,
+    GicDistributorReg, GicIntid, HostTimebase, HvGicIntid, HvInterruptType, HvOp, HvReg,
+    HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN,
+    MacosVersion, MemoryFlags, check_gic_supported, check_map_range, check_run_deadline,
+    check_vm_map, classify_hv_return, decode_exit, finish_run, parse_macos_product_version,
 };
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
@@ -946,6 +948,8 @@ type GicSetSpiFn = unsafe extern "C" fn(u32, bool) -> c_int;
 type GicGetSizeFn = unsafe extern "C" fn(*mut usize) -> c_int;
 type GicGetRangeFn = unsafe extern "C" fn(*mut u32, *mut u32) -> c_int;
 type GicGetIntidFn = unsafe extern "C" fn(u16, *mut u32) -> c_int;
+// `hv_gic_get_distributor_reg(hv_gic_distributor_reg_t reg, uint64_t *value)`。`hv_gic_distributor_reg_t` は `uint16_t`（#3960）。
+type GicGetDistributorRegFn = unsafe extern "C" fn(u16, *mut u64) -> c_int;
 
 /// シンボル解決の失敗の固定文（シンボル名は載せない。ERR-1）。
 fn gic_symbol_missing() -> MicrovmError {
@@ -1020,6 +1024,8 @@ pub struct GicApi {
     get_redistributor_base_alignment: GicGetSizeFn,
     get_spi_interrupt_range: GicGetRangeFn,
     get_intid: GicGetIntidFn,
+    /// 任意のシンボル（#3960）。見つからなければ `None` で、GIC 自体は使える（11 個の必須の規則には含めない）。
+    get_distributor_reg: Option<GicGetDistributorRegFn>,
 }
 
 impl std::fmt::Debug for GicApi {
@@ -1067,6 +1073,12 @@ impl GicApi {
             ),
             get_spi_interrupt_range: resolve!(c"hv_gic_get_spi_interrupt_range", GicGetRangeFn),
             get_intid: resolve!(c"hv_gic_get_intid", GicGetIntidFn),
+            get_distributor_reg: lookup(c"hv_gic_get_distributor_reg").map(|p| {
+                // SAFETY: `p` は NULL でない `dlsym` の戻り値（`lookup`）。型は Apple の文書のシグネチャ
+                // （`hv_gic_distributor_reg_t` は `uint16_t`・出力は `uint64_t *`・戻りは `hv_return_t`）に一致させた
+                // `extern "C"` の関数ポインタ（データポインタと同じ幅）。image は unload されず `dlclose` もしない（`resolve!` と同じ論拠）。
+                unsafe { std::mem::transmute::<*mut c_void, GicGetDistributorRegFn>(p) }
+            }),
         })
     }
 
@@ -1121,6 +1133,27 @@ impl GicApi {
         let rc = unsafe { (self.get_intid)(id.bits(), &mut out) };
         classify_hv_return(HvOp::GicGetIntid, rc)?;
         Ok(GicIntid::new(out))
+    }
+
+    /// distributor のレジスタ `reg` を読む（`hv_gic_get_distributor_reg`。macOS 15.0 以降の任意のシンボル。#3960・MVM-5）。
+    ///
+    /// シンボルが無ければ `Unimplemented`。戻りは [`classify_hv_return`] で写す。`reg` は検証済みの newtype からしか作れない。
+    /// 呼び出し元（`hvf::gic` の SPI sink）は縮退先（学習したヒント）を持つので、失敗は無視してよい。
+    /// 出典: <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>（distributor 版には
+    /// redistributor 版にある「owning thread で呼ぶ」注記が無い。非 vCPU スレッドからの呼び出しの観測は #3803）。
+    pub(crate) fn distributor_reg(&self, reg: GicDistributorReg) -> Result<u64, MicrovmError> {
+        let f = self.get_distributor_reg.ok_or_else(|| {
+            MicrovmError::new(
+                MicrovmErrorCode::Unimplemented,
+                "hypervisor GIC distributor register read is not available",
+            )
+        })?;
+        let mut out = 0u64;
+        // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。出力先はローカル変数
+        // `out` だけで呼び出しの間生きている。`reg.bits()` は検証済みの `GICD_IROUTER<n>` のオフセット（`uint16_t`）。
+        let rc = unsafe { f(reg.bits(), &mut out) };
+        classify_hv_return(HvOp::GicGetDistributorReg, rc)?;
+        Ok(out)
     }
 
     /// SPI の入力レベルを設定する。

@@ -15,8 +15,10 @@ use fandhe_container_microvm::esr::{
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
 use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGic, HvfGuestRam, VmWithGic};
 use fandhe_container_microvm::hvf_abi::{
-    HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, MemoryFlags,
+    HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, IrouterRoute, MemoryFlags,
+    decode_irouter,
 };
+use fandhe_container_microvm::hvf_wake::{SpiWakeTarget, spi_wake_target};
 use fandhe_container_microvm::interrupt::InterruptLine;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -524,6 +526,19 @@ fn hvf_device_spi_reaches_guest() {
         match decode_esr(ex.syndrome) {
             EsrClass::Wfx(WfxKind::Wfi) => {
                 if off_thread.is_none() {
+                    // ゲストが IROUTER48(affinity 0)を書いた後の読み戻し(#3960・MVM-5)。IRM=0・affinity 0 なら宛先は vCPU 0。
+                    match vgic.spi_routing(line.intid()) {
+                        Ok(raw) => {
+                            eprintln!("hvf_device: spi: irouter48={raw:#x}");
+                            assert_eq!(
+                                decode_irouter(raw),
+                                IrouterRoute::Affinity(0),
+                                "hvf_device: spi: irouter48 is not affinity 0"
+                            );
+                            assert_eq!(spi_wake_target(Some(raw), None, 1), SpiWakeTarget::Vcpu(0));
+                        }
+                        Err(e) => eprintln!("hvf_device: spi: irouter48 unavailable: {e}"),
+                    }
                     // vCPU スレッド以外からの注入(スレッドの制約の観測)。
                     let l2 = line.clone();
                     let r = std::thread::spawn(move || l2.trigger()).join().unwrap();

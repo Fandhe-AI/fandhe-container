@@ -609,6 +609,22 @@ pub fn arm64_vcpu_mpidr_affinity(index: u32) -> Result<u32, MicrovmError> {
     Ok(((index / 16) << 8) | (index % 16))
 }
 
+/// [`arm64_vcpu_mpidr_affinity`] の逆写像（#3960・MVM-5）。`GICD_IROUTER<n>` の affinity（Aff3 は bit 24 以降、
+/// [`crate::hvf_abi::IrouterRoute::Affinity`] の形式）から vCPU の index を求める。
+///
+/// Aff0 >= 16・Aff2 != 0・Aff3 != 0・`index >= vcpus`（`vcpus` が [`ARM64_MAX_VCPUS`] を超える分も含む）は `None`。
+/// 入力はゲストが書く非信頼値で、範囲外でも panic せず添字にも使わない。
+pub fn arm64_vcpu_index_from_affinity(aff: u32, vcpus: u32) -> Option<u32> {
+    let aff0 = aff & 0xFF;
+    let aff1 = (aff >> 8) & 0xFF;
+    let upper = aff >> 16;
+    if aff0 >= 16 || upper != 0 {
+        return None;
+    }
+    let index = aff1.checked_mul(16)?.checked_add(aff0)?;
+    (index < vcpus.min(ARM64_MAX_VCPUS)).then_some(index)
+}
+
 /// シリアルのノード名（`serial@<base>`）。`stdout-path` と同じ値から作り、食い違わせない。
 fn serial_node_name(r: &MmioRegion) -> String {
     format!("serial@{:x}", r.base.raw())
@@ -765,6 +781,27 @@ mod tests {
     /// KVM v6.12 `reset_mpidr` の写し（bit 31 の RES1 込み）。
     fn kvm_reset_mpidr(id: u64) -> u64 {
         (id & 0xf) | (((id >> 4) & 0xff) << 8) | (((id >> 12) & 0xff) << 16) | (1 << 31)
+    }
+
+    /// MVM-5・#3960: affinity の逆写像は全 index で往復し、範囲外・上位ビットは `None`。
+    #[test]
+    fn mvm5_3960_affinity_to_vcpu_index() {
+        for i in 0..ARM64_MAX_VCPUS {
+            let aff = arm64_vcpu_mpidr_affinity(i).unwrap();
+            assert_eq!(
+                arm64_vcpu_index_from_affinity(aff, ARM64_MAX_VCPUS),
+                Some(i)
+            );
+        }
+        assert_eq!(arm64_vcpu_index_from_affinity(0x1, 4), Some(1));
+        assert_eq!(arm64_vcpu_index_from_affinity(0x100, 32), Some(16));
+        assert_eq!(arm64_vcpu_index_from_affinity(0x103, 32), Some(19));
+        assert_eq!(arm64_vcpu_index_from_affinity(0x10, 32), None);
+        assert_eq!(arm64_vcpu_index_from_affinity(0x1_0000, 32), None);
+        assert_eq!(arm64_vcpu_index_from_affinity(0x0100_0000, 32), None);
+        assert_eq!(arm64_vcpu_index_from_affinity(0x5, 4), None);
+        assert_eq!(arm64_vcpu_index_from_affinity(0x4, 4), None);
+        assert_eq!(arm64_vcpu_index_from_affinity(0x3, 4), Some(3));
     }
 
     /// MVM-1・#3899: FDT の `cpu@N` の reg は KVM の reset の `MPIDR_EL1` の affinity と全番号で一致する（番号 16 以上を含む）。

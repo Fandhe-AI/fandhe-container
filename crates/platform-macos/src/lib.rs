@@ -76,6 +76,25 @@ mod tests {
         };
         assert_eq!(platform_support(), expected);
     }
+
+    /// entitlements は XML コメントを持たず、キーは virtualization の 1 つだけ（#3803・#3989・MAC-1）。
+    ///
+    /// コメント内の `--` は `codesign` が `AMFIUnserializeXML: syntax error` で拒否し、`plutil -lint` は通すため、
+    /// 内容をここで照合する。
+    #[test]
+    fn mac1_3989_entitlements_have_no_xml_comment() {
+        let plist = include_str!("../tests/vm_boot.entitlements");
+        assert!(
+            !plist.contains("<!--"),
+            "entitlements must not have an XML comment"
+        );
+        assert!(
+            !plist.contains("--"),
+            "entitlements must not contain a double hyphen"
+        );
+        assert_eq!(plist.matches("<key>").count(), 1);
+        assert!(plist.contains("<key>com.apple.security.virtualization</key>"));
+    }
 }
 
 // 先に消してから作る試験補助を排他作成へ揃えるための共有部品（oci の結合試験の補助を取り込む。

@@ -63,7 +63,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 
 - 署名の対象は backend plugin の `fandhe-container-plugin-macos` である。CLI やほかのバイナリではない
 - 必要な entitlement は `com.apple.security.virtualization` のみ。ad-hoc 署名でよい
-- entitlements の plist は次のとおり（`crates/platform-macos/tests/vm_boot.entitlements` と同じ内容。同ファイルを流用してよい）:
+- entitlements の plist は次のとおり（`crates/platform-macos/tests/vm_boot.entitlements` と同じ内容。同ファイルを流用してよい。XML コメントは足さない。コメント内の `--` を `codesign` が構文エラーにし、`plutil -lint` では検出できない）:
 
   ```xml
   <?xml version="1.0" encoding="UTF-8"?>
@@ -92,7 +92,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 
 - 署名の対象は microVM の backend plugin `fandhe-container-plugin-microvm` である。手元で実機前提テスト（`hvf_device`・`hvf_microvm`・plugin-microvm の E2E。手順は `docs/verification/real-machine-tests.md`）を回す場合は、その試験バイナリにも同じ署名が要る。CLI やほかのバイナリではない
 - 必要な entitlement は `com.apple.security.hypervisor` のみ（[Apple の entitlement のページ](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.hypervisor)）。`com.apple.vm.hypervisor` は macOS 10.15 以前向けで、本バックエンドは macOS 15 以降が対象のため不要
-- entitlements の plist は次のとおり（`crates/microvm/tests/hvf.entitlements` と同じ内容。同ファイルを流用してよい）:
+- entitlements の plist は次のとおり（`crates/microvm/tests/hvf.entitlements` と同じ内容。同ファイルを流用してよい。XML コメントは足さない。コメント内の `--` を `codesign` が構文エラーにし、`plutil -lint` では検出できない）:
 
   ```xml
   <?xml version="1.0" encoding="UTF-8"?>

@@ -1084,6 +1084,7 @@ mod real_hvf {
     use std::process::Command;
 
     use fandhe_container_microvm::arm64_layout::Arm64Layout;
+    use fandhe_container_microvm::error::MicrovmErrorCode;
     use fandhe_container_microvm::hvf::VmWithGic;
     use fandhe_container_plugin::{JsonLinesPeerAuthObserver, UdsListener};
 
@@ -1098,7 +1099,11 @@ mod real_hvf {
         let layout = Arm64Layout::new(64 << 20, 1, 0).expect("layout");
         match VmWithGic::create(&layout) {
             Ok(vm) => drop(vm),
-            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
+            // 権限不足だけを環境の問題とする。GIC の呼び出しの失敗は回帰と読めるように別の行で出す（#3989）。
+            Err(e) if e.code() == MicrovmErrorCode::PermissionDenied => {
+                panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}")
+            }
+            Err(e) => panic!("e2e: gic: {e}"),
         }
         let mut cmd = Command::new("codesign");
         cmd.args(["-d", "--entitlements", "-", BIN]);

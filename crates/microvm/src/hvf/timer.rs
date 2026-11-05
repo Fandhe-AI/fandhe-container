@@ -18,16 +18,19 @@
 //!   ゲストが割り込みを処理して CVAL を進める、またはタイマーを止める、または mask すると線が下がる
 //!   （`CNTV_CTL_EL0` の ISTATUS=0・IMASK=1・ENABLE=0）。その検出時に限り `set_vtimer_mask(false)` で外す
 //!   （QEMU の hvf の `hvf_sync_vtimer` と同じ考え方。確定は #3803）。
-//! - GIC あり（#3792）の構成で vtimer の PPI（INTID 27）を pending にするのは framework 側という仮説に立つ。
-//!   根拠は `GicApi` に PPI を操作する API が無いことと `hv_gic_get_intid(EL1_VIRTUAL_TIMER)` が存在すること。
+//!
+//! # GIC つきの構成の実機の挙動（#3803・#3994）
+//! macOS 27.2・Apple M4 Max で、`hv_gic_create` を使う構成（製品の VM はこの構成だけ。#3792）では次のとおり。
+//! - WFI は exit しない。`hv_vcpu_run` の中で待ち、注入・PPI・`hv_vcpus_exit` で起き、戻った PC は `wfi` の次にある。
+//! - `VTIMER_ACTIVATED` は来ない。vtimer の PPI（INTID 27）は framework が pending にする。
+//! - したがって本ファイルの処理はこの環境では通らない。別の版・チップで exit した場合のために残す（要否の判断は #3995）。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //! (a)(b) 待ち中の SPI の注入と停止要求で起きない問題は #3887 で解消済み。残余: 走行中に届いた通知は 1 回の早期再開を
 //!     起こす（許される範囲）。SMP では vCPU ごとに専用のスロット（`WfiWakeSet`）を持ち、SPI は学習した宛先のスロットだけ、宛先不明と停止要求は全台を起こす（#3933・#3948）。
 //! (c) mask の解除は `hv_vcpu_run` の再入直前（`sync_before_run`）にも確認する。ただし線が立っている間は外せず、
 //!     ゲストが CVAL を進める等で線が下がった後の次の再入（exit か実行期限）で外れる。
-//! (d) #3803 で確定させる観測事項: GIC あり構成で PPI が自動で pending になるか、`VTIMER_ACTIVATED` が起きるか、
-//!     WFI の exit 時点の PC、mach の 2 関数の SDK ヘッダとの照合。
+//! (d) #3803 で確定させる観測事項: mach の 2 関数の SDK ヘッダとの照合。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{WfxKind, instruction_length};

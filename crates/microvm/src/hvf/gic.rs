@@ -33,8 +33,8 @@
 //! - INTID は `Arm64Layout` の SPI 番号 + 32 で、作成時に `hv_gic_get_spi_interrupt_range` の範囲内か検証する
 //!   （範囲外は `InvalidArgument`。[`HvfGic::probe`] が全 virtio の SPI を VM 作成前に先に検査する）。
 //! - スレッド: `hv_gic_set_spi` を vCPU の owning thread 以外から呼べるかは Apple のドキュメントに記述が無い。
-//!   引数が整数と bool だけで失敗は戻り値で返るため [`GicSpiLine`] は `Send + Sync` とし、
-//!   `hvf_device_spi_reaches_guest` が非 vCPU スレッドから呼んで観測する（結果の記録は #3803。未観測）。
+//!   引数が整数と bool だけで失敗は戻り値で返るため [`GicSpiLine`] は `Send + Sync` とする。実機では非 vCPU スレッドから
+//!   呼べて、`wfi` で待つゲストへ 1 ms 以内に届いた（macOS 27.2・#3803）。`hvf_device_spi_reaches_guest` が照合する。
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
 //!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
@@ -43,6 +43,8 @@
 //!   `InterruptACK` を処理した vCPU を学習した宛先の 1 台だけを起こし、未学習の線とシリアルは全台を起こす（#3948。
 //!   学習の方式と残余は `crate::hvf_wake`）。ロック順は UART → 生存フラグ（読み取り。通知の前に外す）→ waker のスロットの
 //!   mutex で、スロットの mutex は 1 個ずつ取り持つ間は他の lock を取らない。宛先のヒントは atomic で lock ではない。
+//!   GIC つきの実機では WFI は exit しないため、この通知で起きる待ちは無く、ゲストを起こすのは `set_spi` 自身である
+//!   （macOS 27.2・#3803・#3994。通知の要否の判断は #3995）。
 //! - 宛先の決定（#3960・MVM-5）: `hv_gic_get_distributor_reg` は **ある**（macOS 15.0 で導入。`hv_gic_distributor_reg_t` の列挙値は
 //!   ARM GICv3 の distributor のレジスタオフセットに等しく、`HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32` が存在する。一次資料:
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・

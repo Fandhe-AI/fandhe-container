@@ -5,6 +5,9 @@
 //! (b) 停止要求の kick（[`WakingKick`]。`LoopHandle::stop` / drop が `hv_vcpus_exit` の代わりに呼ぶ）から [`WfiWaker::notify`] で
 //! 即座に起こす（(a) は宛先の vCPU だけ。#3948）。`hv_*` を呼ばないので Linux の CI で単体試験できる。
 //!
+//! GIC つきの構成では WFI は exit せず `hv_vcpu_run` の中で待つため、この待ちは macOS 27.2・Apple M4 Max では通らない
+//! （#3803・#3994）。別の版・チップで exit した場合のために残す（要否の判断は #3995）。
+//!
 //! # 契約
 //! - 通知は VM 全体で共有する世代番号の加算で、待ち手（[`WfiWaker`] の clone 1 個 = vCPU 1 台）は clone ごとに既読位置を持つ。
 //!   1 回の [`WfiWaker::notify`] は、待っている全待ち手を起こす（SMP で最初に起きた 1 台が通知を消費して残りが

@@ -23,7 +23,7 @@ use fandhe_container_microvm::hvf_abi::{
 use fandhe_container_microvm::hvf_wake::{SpiWakeTarget, spi_wake_target};
 use fandhe_container_microvm::interrupt::InterruptLine;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// 合成 arm64 Image の正本（`tests/support/arm64_image.rs`。plugin-microvm の E2E と共有。複製しない・#3800）。
@@ -415,11 +415,13 @@ fn hvf_device_gic_create_before_vcpu() {
 /// `hvf_device_spi_reaches_guest` のゲストプログラム（arm64。`llvm-mc -triple=aarch64` で符号化した命令語）。
 ///
 /// 手順: GICR_WAKER の ProcessorSleep を下ろす → GICD_CTLR(ARE_NS|EnableGrp1) → INTID 48 を group 1・edge・
-/// 優先度 0x80・affinity 0 にして有効化 → CPU interface(SRE・PMR・IGRPEN1) → `wfi` → `ICC_IAR1_EL1` を読み、
-/// 1023(spurious) なら `wfi` へ戻る → 読んだ INTID を virtio-mmio の窓(0x0a00_0000。未 map)へ書く → EOIR → `b .`。
+/// 優先度 0x80・affinity 0 にして有効化 → CPU interface(SRE・PMR・IGRPEN1) → 窓 + `SPI_READY_OFFSET` へ書いて
+/// 準備完了を知らせる → `wfi` → `ICC_IAR1_EL1` を読み、1023(spurious) なら `wfi` へ戻る → 読んだ INTID を
+/// virtio-mmio の窓(0x0a00_0000。未 map)へ書く → EOIR → `b .`。
+/// GIC つきの構成では WFI は exit しない(#3803)。ホストが初期化の完了を知る手段は、この準備完了の書き込みだけである。
 /// 基底アドレス(GICD 0x0800_0000・GICR 0x0820_0000・窓 0x0a00_0000)と INTID 48 はコード中に固定してあり、
 /// 試験本体が `Arm64Layout` の値と一致することを先に assert する。PSTATE.I はマスクのまま(CPSR 0x3c5)。
-const SPI_GUEST_CODE: [u32; 36] = [
+const SPI_GUEST_CODE: [u32; 37] = [
     0xD2A1_0001, // movz x1, #0x0800, lsl #16        ; GICD
     0xD2A1_0402, // movz x2, #0x0820, lsl #16        ; GICR RD_base
     0xD2A1_4003, // movz x3, #0x0a00, lsl #16        ; virtio-mmio の窓
@@ -450,6 +452,7 @@ const SPI_GUEST_CODE: [u32; 36] = [
     0xD280_0024, // movz x4, #1
     0xD518_CCE4, // msr  ICC_IGRPEN1_EL1, x4
     0xD503_3FDF, // isb
+    SPI_READY_STORE,
     0xD503_207F, // wfi                              ; loop:
     0xD538_CC00, // mrs  x0, ICC_IAR1_EL1
     0xF10F_FC1F, // cmp  x0, #1023
@@ -461,8 +464,15 @@ const SPI_GUEST_CODE: [u32; 36] = [
 /// 末尾の `b .`（`SPI_GUEST_CODE` の後ろへ置く）。
 const SPI_GUEST_HALT: u32 = 0x1400_0000;
 
+/// `str w4, [x3, #4]`。ゲストが GIC の初期化を終えたことを窓 + `SPI_READY_OFFSET` への書き込みで知らせる。
+const SPI_READY_STORE: u32 = 0xB900_0464;
+/// 準備完了の書き込みの窓の中のオフセット（INTID の書き込みは 0）。
+const SPI_READY_OFFSET: u64 = 4;
+
 /// 全体期限（`hvf_device_spi_reaches_guest`）。
 const SPI_DEADLINE: Duration = Duration::from_secs(20);
+/// 再開した vCPU が `wfi` で寝るまで注入を待つ幅。早すぎても pending のまま `wfi` を素通りするだけで、失敗にはならない。
+const SPI_INJECT_DELAY: Duration = Duration::from_millis(50);
 /// `run_once` の期限切れの診断を出す時間を残すため、watchdog を遅らせる幅。
 const SPI_WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
 /// vCPU の exit 回数の上限（無限ループの歯止め）。
@@ -482,7 +492,8 @@ fn spi_stuck_stage(pc: u64, base: u64) -> &'static str {
 }
 
 /// ホストの `GicSpiLine::trigger`（edge の SPI）が、ゲストの `ICC_IAR1_EL1` で設定した INTID として読めることを確かめる。
-/// あわせて `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかを観測する（結果の記録は人間担当の #3803）。
+/// 注入は製品の経路と同じく、vCPU が `hv_vcpu_run` の中で `wfi` している間に vCPU 以外のスレッドから行う。
+/// 契機は WFI の exit ではなく準備完了の書き込みである（GIC つきの構成では WFI は exit しない。#3803・#3994）。
 /// TASK-192.13・#3795・MVM-5・MVM-1。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
@@ -527,7 +538,8 @@ fn hvf_device_spi_reaches_guest() {
     let watchdog = Watchdog::start(SPI_DEADLINE + SPI_WATCHDOG_MARGIN);
 
     let mut delivered: Option<u64> = None;
-    let mut off_thread: Option<Result<(), String>> = None;
+    let mut injector: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    let mut wfi_exits = 0u32;
     for _ in 0..SPI_MAX_EXITS {
         let exit = match vcpu.run_once(SPI_DEADLINE) {
             Ok(e) => e,
@@ -546,32 +558,41 @@ fn hvf_device_spi_reaches_guest() {
             panic!("hvf_device: spi: unexpected exit {exit:?}");
         };
         match decode_esr(ex.syndrome) {
+            // GIC つきの構成では来ない(#3803)。exit する環境でも止まらないよう、命令を進めて再開する。
+            // 1 ms 待つのは、`SPI_INJECT_DELAY` の注入より先に `SPI_MAX_EXITS` を使い切らないため。
             EsrClass::Wfx(WfxKind::Wfi) => {
-                if off_thread.is_none() {
-                    // ゲストが IROUTER48(affinity 0)を書いた後の読み戻し(#3960・MVM-5)。IRM=0・affinity 0 なら宛先は vCPU 0。
-                    match vgic.spi_routing(line.intid()) {
-                        Ok(raw) => {
-                            eprintln!("hvf_device: spi: irouter48={raw:#x}");
-                            assert_eq!(
-                                decode_irouter(raw),
-                                IrouterRoute::Affinity(0),
-                                "hvf_device: spi: irouter48 is not affinity 0"
-                            );
-                            assert_eq!(spi_wake_target(Some(raw), None, 1), SpiWakeTarget::Vcpu(0));
-                        }
-                        Err(e) => eprintln!("hvf_device: spi: irouter48 unavailable: {e}"),
+                wfi_exits += 1;
+                std::thread::sleep(Duration::from_millis(1));
+                let pc = vcpu.get_reg(HvReg::PC).unwrap();
+                let len = instruction_length(ex.syndrome).bytes();
+                vcpu.set_reg(HvReg::PC, pc + len).unwrap();
+            }
+            EsrClass::DataAbort(da)
+                if ex.physical_address == WINDOW + SPI_READY_OFFSET
+                    && da.direction == AccessDirection::Write =>
+            {
+                assert!(injector.is_none(), "hvf_device: spi: ready written twice");
+                // ゲストが IROUTER48(affinity 0)を書いた後の読み戻し(#3960・MVM-5)。IRM=0・affinity 0 なら宛先は vCPU 0。
+                match vgic.spi_routing(line.intid()) {
+                    Ok(raw) => {
+                        eprintln!("hvf_device: spi: irouter48={raw:#x}");
+                        assert_eq!(
+                            decode_irouter(raw),
+                            IrouterRoute::Affinity(0),
+                            "hvf_device: spi: irouter48 is not affinity 0"
+                        );
+                        assert_eq!(spi_wake_target(Some(raw), None, 1), SpiWakeTarget::Vcpu(0));
                     }
-                    // vCPU スレッド以外からの注入(スレッドの制約の観測)。
-                    let l2 = line.clone();
-                    let r = std::thread::spawn(move || l2.trigger()).join().unwrap();
-                    eprintln!("hvf_device: spi: set_spi from non-vcpu thread: {r:?}");
-                    let failed = r.is_err();
-                    off_thread = Some(r.map_err(|e| e.to_string()));
-                    if failed {
-                        // 到達の確認は vCPU スレッドからの注入で続ける。
-                        line.trigger().unwrap();
-                    }
+                    Err(e) => eprintln!("hvf_device: spi: irouter48 unavailable: {e}"),
                 }
+                // vCPU スレッド以外からの注入(スレッドの制約の観測)。下の再開で vCPU が `wfi` へ入った後に届く。
+                let l2 = line.clone();
+                injector = Some(std::thread::spawn(move || {
+                    std::thread::sleep(SPI_INJECT_DELAY);
+                    let r = l2.trigger();
+                    eprintln!("hvf_device: spi: set_spi from non-vcpu thread: {r:?}");
+                    r.map_err(|e| e.to_string())
+                }));
                 let pc = vcpu.get_reg(HvReg::PC).unwrap();
                 let len = instruction_length(ex.syndrome).bytes();
                 vcpu.set_reg(HvReg::PC, pc + len).unwrap();
@@ -595,10 +616,12 @@ fn hvf_device_spi_reaches_guest() {
         panic!("hvf_device: spi: did not reach the guest within {SPI_MAX_EXITS} exits");
     };
     eprintln!("hvf_device: spi: guest read intid={value}");
+    eprintln!("hvf_device: spi: wfi exits={wfi_exits}");
     assert_ne!(value, 1023, "spurious intid: spi did not reach the guest");
     assert_eq!(value, 48);
     assert_eq!(value, u64::from(line.intid()));
-    if let Some(Err(e)) = off_thread {
+    let injector = injector.expect("hvf_device: spi: value arrived before the ready write");
+    if let Err(e) = injector.join().unwrap() {
         panic!("hvf_device: spi: set_spi from a non-vcpu thread failed: {e}");
     }
 
@@ -1808,6 +1831,7 @@ const VTIMER_GUEST_CODE: [u32; 44] = [
 ];
 
 /// 場面 B のゲスト(オフセット 0x200): `CNTV_CVAL_EL0 = u64::MAX`・`CNTV_CTL_EL0 = 1`(発火しない)にして `wfi` を繰り返す。
+/// ほかの命令で止まりようがないので、exit せずに走り続けていれば `wfi` で待っている。
 const VTIMER_IDLE_CODE: [u32; 7] = [
     0x9280_0007,
     0xD51B_E347,
@@ -1822,13 +1846,16 @@ const VTIMER_IDLE_CODE: [u32; 7] = [
 const VTIMER_MAX_EXITS: u32 = 4096;
 /// `hvf_device_vtimer_wakes_wfi` の全体期限。
 const VTIMER_DEADLINE: Duration = Duration::from_secs(20);
+/// 場面 B でゲストを待たせる長さ。実行の区切り（`VCPU_RUN_SLICE`。100 ms）の 2 回分を超える。
+const VTIMER_IDLE: Duration = Duration::from_millis(300);
 
 /// WFI の待ちと vtimer の処理（TASK-192.14・#3796・MVM-5・MVM-1・REPAIR-5）。
-/// (A) CNTV に 10 ms 後の期限を設定して `wfi` で待つゲストが、`timer::handle_wfx` / `handle_vtimer` を通して起き、
-/// PPI の INTID を MMIO 窓へ書く（ホストが 1 秒以内に観測する）。ホストが回す手動ループで、MMIO のスタブに依存しない。
+/// GIC つきの構成では WFI も `VTIMER_ACTIVATED` も exit せず、PPI は framework が pending にする（#3803・#3994）。
+/// `timer::handle_wfx` / `handle_vtimer` は exit した場合のために残し、回数は観測の行で出す。
+/// (A) CNTV に 10 ms 後の期限を設定して `wfi` で待つゲストが起き、PPI の INTID を MMIO 窓へ書く
+/// （ホストが 1 秒以内に観測する）。ホストが回す手動ループで、MMIO のスタブに依存しない。
 /// (B) 発火しないタイマーで `wfi` を繰り返すゲストを `VcpuThread` + 本物の `TimerHandler` で走らせ、
-/// 待っている最中の停止要求で 1 秒以内に `Requested` で止まる。結果（PC・PPI が自動で pending になるか・
-/// `VTIMER_ACTIVATED` の有無）の記録は人間担当の #3803。
+/// 実行の区切りを 2 回以上またいで待ち続けることと、待っている最中の停止要求で 1 秒以内に `Requested` で止まることを確かめる。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
 fn hvf_device_vtimer_wakes_wfi() {
@@ -1972,23 +1999,23 @@ fn hvf_device_vtimer_wakes_wfi() {
         vcpu.set_reg(HvReg::CPSR, 0x3c5)
     };
     let handle = VcpuThread::spawn(Arc::clone(&vm), setup, handlers, config).unwrap();
-    let t0 = Instant::now();
-    while counts.count(ExitKind::Wfx) < 2 && t0.elapsed() < Duration::from_secs(5) {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(counts.count(ExitKind::Wfx) >= 2, "guest never reached wfi");
-    // 空回りしていない証跡(200 ms あたりの WFI の exit 回数。assert はしない)。
-    let before = counts.count(ExitKind::Wfx);
-    std::thread::sleep(Duration::from_millis(200));
+    // WFI の exit は同期点にならない(#3803)。待ち続けたことは停止後の実行期限の回数で確かめる。
+    std::thread::sleep(VTIMER_IDLE);
     eprintln!(
-        "hvf_device: vtimer: idle wfx per 200ms={}",
-        counts.count(ExitKind::Wfx) - before
+        "hvf_device: vtimer: idle wfx in {}ms={}",
+        VTIMER_IDLE.as_millis(),
+        counts.count(ExitKind::Wfx)
     );
     assert!(!handle.is_finished());
     let t = Instant::now();
     let report = handle.stop(Duration::from_secs(1)).unwrap();
     assert_eq!(report.reason, StopReason::Requested);
     let stop_elapsed = t.elapsed();
+    assert!(
+        report.stats.deadline_exceeded >= 2,
+        "guest did not stay in wfi: {:?}",
+        report.stats
+    );
     // 停止要求が WFI の待ちを起こす(#3887)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら #3803 で切り分けて緩める。
     eprintln!(
         "hvf_device: vtimer: stop_elapsed_us={}",
@@ -2007,13 +2034,16 @@ fn hvf_device_vtimer_wakes_wfi() {
 /// `hvf_device_spi_wakes_wfi` の標本数と全体期限。
 const SPI_WAKE_SAMPLES: usize = 12;
 const SPI_WAKE_DEADLINE: Duration = Duration::from_secs(20);
+/// 準備完了の後、vCPU が `wfi` で寝るまで注入を待つ幅。早すぎても遅れの標本が小さくなるだけで、失敗にはならない。
+const SPI_WAKE_SETTLE: Duration = Duration::from_millis(5);
 
-/// WFI の待ちが SPI の注入で起きること（#3887・MVM-5・MVM-1・REPAIR-5）。
-/// `SPI_GUEST_CODE` の末尾（EOIR）の後ろへ「`wfi` へ戻る `b`」を足し、INTID 48 を繰り返し受けられるゲストにする。
-/// CNTV は無効のままなので、各 WFI の待ちは `WFI_WAIT_MAX`（10 ms）の上限になる。非 vCPU スレッドから `GicSpiLine::trigger` を
-/// 呼び、その時刻からゲストが INTID を MMIO 窓へ書くまでの遅れを測る。修正前は 0〜10 ms の一様分布のため、
-/// 全標本が `WFI_WAIT_MAX` 未満に加えて中央値が `WFI_WAIT_MAX / 2` 未満であることも照合する（判別力のため。
-/// 実機で不安定なら #3803 で緩める）。`VcpuThread` と本物のハンドラを使う（`TimerHandler::new()` でも VM の通知口へ結ばれる）。
+/// `wfi` で待つゲストへ SPI の注入が速やかに届くこと（#3887・#3994・MVM-5・MVM-1・REPAIR-5）。
+/// `SPI_GUEST_CODE` の末尾（EOIR）の後ろへ「準備完了の書き込みへ戻る `b`」を足し、INTID 48 を繰り返し受けられるゲストにする。
+/// GIC つきの構成では WFI は exit せず `hv_vcpu_run` の中で待つ（#3803）。起こせるのは注入と、`VCPU_RUN_SLICE`（100 ms）の
+/// 区切りの cancel だけである。準備完了を待ってから非 vCPU スレッドで `GicSpiLine::trigger` を呼び、その時刻からゲストが
+/// INTID を MMIO 窓へ書くまでの遅れを測る。注入で起きなければ遅れは区切りまでの 0〜100 ms に散るため、全標本が
+/// `WFI_WAIT_MAX`（10 ms）未満で中央値がその半分未満であることを照合する（実機で不安定なら #3803 で緩める）。
+/// 同じ INTID への `set_spi(true)` の繰り返しがそのつど届くことの観測も兼ねる。`VcpuThread` と本物のハンドラを使う。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
 fn hvf_device_spi_wakes_wfi() {
@@ -2032,20 +2062,27 @@ fn hvf_device_spi_wakes_wfi() {
     const BASE: u64 = 0x4000_0000;
     const WINDOW: u64 = 0x0a00_0000;
 
-    /// 書き込みの時刻と値を記録する観測器（件数の上限つき）。
-    struct Recorder(Arc<Mutex<Vec<(Instant, u32)>>>);
+    /// 準備完了の回数と、INTID の書き込みの時刻と値を記録する観測器（件数の上限つき）。
+    struct Recorder {
+        ready: Arc<AtomicU64>,
+        samples: Arc<Mutex<Vec<(Instant, u32)>>>,
+    }
     impl MmioDevice for Recorder {
         fn read(&self, _offset: u64, data: &mut [u8]) -> MmioReadOutcome {
             data.fill(0);
             MmioReadOutcome::Handled
         }
-        fn write(&mut self, _offset: u64, data: &[u8]) -> MmioWriteOutcome {
+        fn write(&mut self, offset: u64, data: &[u8]) -> MmioWriteOutcome {
             let now = Instant::now();
+            if offset == SPI_READY_OFFSET {
+                self.ready.fetch_add(1, Ordering::AcqRel);
+                return MmioWriteOutcome::Handled;
+            }
             let mut v = [0u8; 4];
             for (d, s) in v.iter_mut().zip(data.iter()) {
                 *d = *s;
             }
-            let mut g = self.0.lock().unwrap();
+            let mut g = self.samples.lock().unwrap();
             if g.len() < SPI_WAKE_SAMPLES + 4 {
                 g.push((now, u32::from_le_bytes(v)));
             }
@@ -2089,9 +2126,11 @@ fn hvf_device_spi_wakes_wfi() {
     let line = vm.spi_line(&layout, 0).unwrap();
     assert_eq!(line.intid(), 48);
 
-    // ゲスト = SPI_GUEST_CODE + `b loop`。`b` の imm26 は (loop の命令番号 - `b` の命令番号)（命令数単位、負は 26 ビットの 2 の補数）。
-    const WFI: u32 = 0xD503_207F;
-    let loop_idx = SPI_GUEST_CODE.iter().position(|w| *w == WFI).unwrap() as i64;
+    // ゲスト = SPI_GUEST_CODE + `b ready`。`b` の imm26 は (ready の命令番号 - `b` の命令番号)（命令数単位、負は 26 ビットの 2 の補数）。
+    let loop_idx = SPI_GUEST_CODE
+        .iter()
+        .position(|w| *w == SPI_READY_STORE)
+        .unwrap() as i64;
     let b_idx = SPI_GUEST_CODE.len() as i64;
     let b_word = 0x1400_0000u32 | (((loop_idx - b_idx) as u32) & 0x03ff_ffff);
     let page = HostMapping::page_size().unwrap();
@@ -2102,9 +2141,17 @@ fn hvf_device_spi_wakes_wfi() {
     let mapping = vm.vm().map(host, 0, BASE, page, MemoryFlags::RWX).unwrap();
 
     let records = Arc::new(Mutex::new(Vec::new()));
+    let ready = Arc::new(AtomicU64::new(0));
     let mut dispatcher = ExitDispatcher::new();
     dispatcher
-        .register_mmio(WINDOW, 0x200, Box::new(Recorder(Arc::clone(&records))))
+        .register_mmio(
+            WINDOW,
+            0x200,
+            Box::new(Recorder {
+                ready: Arc::clone(&ready),
+                samples: Arc::clone(&records),
+            }),
+        )
         .unwrap();
     let handlers = ExitHandlers {
         mmio: MmioHandler::with_dispatcher(dispatcher),
@@ -2123,21 +2170,21 @@ fn hvf_device_spi_wakes_wfi() {
     };
     let handle = VcpuThread::spawn(Arc::clone(&vm), setup, handlers, config).unwrap();
 
-    // 次の WFI の exit を待つ（observer は dispatch の前に呼ばれ、待ちの開始の直前に当たる）。
-    let wait_wfx_after = |prev: u64| {
+    // 標本 i の注入の前に、ゲストの (i + 1) 回目の準備完了を待つ（EOIR の後なので前の標本の処理は終わっている）。
+    let wait_ready = |n: u64| {
         let t = Instant::now();
-        while counts.count(ExitKind::Wfx) <= prev && t.elapsed() < Duration::from_secs(5) {
+        while ready.load(Ordering::Acquire) < n && t.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_micros(200));
         }
         assert!(
-            counts.count(ExitKind::Wfx) > prev,
-            "guest never reached wfi"
+            ready.load(Ordering::Acquire) >= n,
+            "hvf_device: spi_wake: guest never signalled ready ({n})"
         );
     };
     let mut delays: Vec<Duration> = Vec::new();
-    let mut prev_wfx = 0;
     for i in 0..SPI_WAKE_SAMPLES {
-        wait_wfx_after(prev_wfx);
+        wait_ready(i as u64 + 1);
+        std::thread::sleep(SPI_WAKE_SETTLE);
         let l2 = line.clone();
         let sent = std::thread::spawn(move || {
             let at = Instant::now();
@@ -2159,7 +2206,6 @@ fn hvf_device_spi_wakes_wfi() {
         };
         assert_eq!(got.1, 48, "spurious or wrong intid at sample {i}");
         delays.push(got.0.saturating_duration_since(sent));
-        prev_wfx = counts.count(ExitKind::Wfx);
     }
     let report = handle.stop(Duration::from_secs(1)).unwrap();
     assert_eq!(report.reason, StopReason::Requested);
@@ -2168,15 +2214,16 @@ fn hvf_device_spi_wakes_wfi() {
     let p50 = delays[delays.len() / 2];
     let max = *delays.last().unwrap();
     eprintln!(
-        "hvf_device: spi_wake: samples={} p50_us={} max_us={}",
+        "hvf_device: spi_wake: samples={} p50_us={} max_us={} wfx={}",
         delays.len(),
         p50.as_micros(),
-        max.as_micros()
+        max.as_micros(),
+        counts.count(ExitKind::Wfx)
     );
     assert!(max < WFI_WAIT_MAX, "max delay {max:?} >= WFI_WAIT_MAX");
     assert!(
         p50 < WFI_WAIT_MAX / 2,
-        "p50 delay {p50:?} >= WFI_WAIT_MAX / 2 (spi did not wake the wfi wait)"
+        "p50 delay {p50:?} >= WFI_WAIT_MAX / 2 (spi did not wake the guest in wfi)"
     );
 
     mapping.unmap().unwrap();

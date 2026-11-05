@@ -180,11 +180,23 @@
 #  246: reboot の末尾（既定の版と同じ並び）、268: pause ; jmp 268
 #  272: データ: フレーム(60) 成功メッセージ+改行(34) 失敗メッセージ+改行(38)
 #
+# aarch64 の net-tx・net-rx（#3966・MVM-1・REPAIR-12）: 上の x86_64 と同じ意味論を AArch64 の命令で組んだ版。
+# syscall 番号は asm-generic: socket=198・ioctl=29・sendto=206・recvfrom=207・setsockopt=208・write=64・reboot=142。
+# 負の戻り値は `tbnz x0, #63` で判定する（block-read と同じ）。fd は x19、スタックの作業域は sp を 16 バイト境界に保つ
+# （net-tx は 64 バイト、net-rx は 192 バイトで配置は x86_64 と同じ）。`eth0` は movz/movk で w9 に作って書く。
+# net-rx の受信フレームの比較は 1 バイトずつのループ（ldrb x2 / cmp / subs）で、不一致や長さ違いは 16 回まで数える。
+# 期限切れ（EAGAIN）は 1 回で失敗、bind はしない、送信から marker・reboot の間に待ちを入れない点も x86_64 と同じ。
+# 命令の並びは下の各 `bytes` 行のコメントを正とする（表の二重管理をしない）。ファイル全体は
+#   net-tx: 120 + コード 252 + データ 132 = 504 バイト / net-rx: 120 + コード 300 + データ 132 = 552 バイト
+# データ（フレーム 60・成功+改行 34・失敗+改行 38）はコード直後（net-tx はオフセット 372、net-rx は 420）に続く。
+# llvm-mc（aarch64-linux-gnu）で組み、llvm-objdump の逆アセンブルとコード部のバイト列の一致を確認済み。
+# aarch64 の実カーネルでの確認は Agent は未実施（#3781・人間担当）。
+#
 # 使い方:
 #   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 #   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。net-tx・net-rx は x86_64 のみ。block-read は aarch64 も #3947）
-#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は default と block-read の variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read）
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read は aarch64 も #3947、net-tx・net-rx の aarch64 版は #3966）
+#   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は全 variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read 等）
 #   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
@@ -299,9 +311,6 @@ case "$host_os" in
 esac
 
 # --- 出力先の検査 ---
-if { [ "$variant" = "net-tx" ] || [ "$variant" = "net-rx" ]; } && [ "$arch" != "x86_64" ]; then
-    err_code bad-argument "--variant $variant is only available for --arch x86_64"; exit 2
-fi
 if [ -z "$output_dir" ]; then
     case "$variant" in
         block-read | net-tx | net-rx) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
@@ -483,7 +492,7 @@ emit_reboot_tail() {
 
 if [ "$variant" = "net-rx" ]; then
     # 機械語に固定された長さ・サイズ・EtherType を文字列定数と突き合わせる（fail-closed）
-    expected_size=524
+    if [ "$arch" = "aarch64" ]; then expected_size=552; else expected_size=524; fi
     if [ "${#net_rx_frame_header_hex}" -ne 28 ] || [ "${#net_rx_payload}" -ne 46 ] ||
         [ "$((${#net_rx_ok_message} + 1))" -ne 34 ] || [ "$((${#net_rx_failed_message} + 1))" -ne 38 ] ||
         [ "${net_rx_frame_header_hex:24:4}" != "88b6" ]; then
@@ -493,69 +502,148 @@ if [ "$variant" = "net-rx" ]; then
     total_size=$expected_size
     {
         emit_elf_headers "$total_size"
-        # コード 272 バイト（先頭コメントの表と同じ並び）
-        bytes b8; le 41 4                                  # mov eax, 41 (socket)
-        bytes bf; le 17 4                                  # mov edi, 17 (AF_PACKET)
-        bytes be; le 3 4                                   # mov esi, 3 (SOCK_RAW)
-        bytes ba; le $((0xb688)) 4                         # mov edx, htons(0x88B6)
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 0f 88; le 177 4                              # js fail (near)
-        bytes 41 89 c4                                     # mov r12d, eax
-        bytes 48 81 ec; le 192 4                           # sub rsp, 192
-        bytes 48 89 e7                                     # mov rdi, rsp
-        bytes 31 c0                                        # xor eax, eax
-        bytes b9; le 64 4                                  # mov ecx, 64
-        bytes fc                                           # cld
-        bytes f3 aa                                        # rep stosb
-        bytes c7 04 24; le $((0x30687465)) 4               # mov dword [rsp], "eth0"
-        bytes c7 44 24 10; le 1 4                          # mov dword [rsp+16], 1 (IFF_UP)
-        bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes be; le $((0x8914)) 4                         # mov esi, SIOCSIFFLAGS
-        bytes 48 89 e2                                     # mov rdx, rsp
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 74                                        # js fail
-        bytes c7 44 24 30; le 5 4                          # mov dword [rsp+48], 5 (tv_sec)
-        bytes b8; le 54 4                                  # mov eax, 54 (setsockopt)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes be; le 1 4                                   # mov esi, 1 (SOL_SOCKET)
-        bytes ba; le 20 4                                  # mov edx, 20 (SO_RCVTIMEO)
-        bytes 4c 8d 54 24 30                               # lea r10, [rsp+48]
-        bytes 41 b8; le 16 4                               # mov r8d, 16
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 48                                        # js fail
-        bytes 41 be; le 16 4                               # mov r14d, 16
-        bytes b8; le 45 4                                  # recv: mov eax, 45 (recvfrom)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
-        bytes ba; le 128 4                                 # mov edx, 128
-        bytes 45 31 d2                                     # xor r10d, r10d
-        bytes 45 31 c0                                     # xor r8d, r8d
-        bytes 45 31 c9                                     # xor r9d, r9d
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 20                                        # js fail (期限切れを含む負値)
-        bytes 48 83 f8 3c                                  # cmp rax, 60
-        bytes 75 15                                        # jne next
-        bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
-        bytes 48 8d 3d; le 78 4                            # lea rdi, [rip+0x4e] -> frame
-        bytes b9; le 60 4                                  # mov ecx, 60
-        bytes f3 a6                                        # repe cmpsb
-        bytes 74 13                                        # je ok
-        bytes 41 ff ce                                     # next: dec r14d
-        bytes 75 be                                        # jnz recv
-        bytes 48 8d 35; le 151 4                           # fail: lea rsi, [rip+0x97] -> failed message
-        bytes ba; le 38 4                                  # mov edx, 38
-        bytes eb 0c                                        # jmp write
-        bytes 48 8d 35; le 103 4                           # ok: lea rsi, [rip+0x67] -> ok message
-        bytes ba; le 34 4                                  # mov edx, 34
-        bytes b8; le 1 4                                   # write: mov eax, 1
-        bytes bf; le 1 4                                   # mov edi, 1
-        bytes 0f 05                                        # syscall
-        emit_reboot_tail
+        if [ "$arch" = "aarch64" ]; then
+            # コード 300 バイト（先頭コメントの表と同じ並び。llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。#3966）
+            bytes 20 02 80 d2  # _start: mov x0,#17
+            bytes 61 00 80 d2  # mov x1,#3
+            bytes 02 d1 96 d2  # movz x2,#0xb688
+            bytes c8 18 80 d2  # mov x8,#198
+            bytes 01 00 00 d4  # svc #0
+            bytes 80 06 f8 b7  # tbnz x0,#63,fail
+            bytes f3 03 00 aa  # mov x19,x0
+            bytes ff 03 03 d1  # sub sp,sp,#192
+            bytes ff 7f 00 a9  # stp xzr,xzr,[sp]
+            bytes ff 7f 01 a9  # stp xzr,xzr,[sp,#16]
+            bytes ff 7f 02 a9  # stp xzr,xzr,[sp,#32]
+            bytes ff 7f 03 a9  # stp xzr,xzr,[sp,#48]
+            bytes a9 8c 8e 52  # movz w9,#0x7465
+            bytes 09 0d a6 72  # movk w9,#0x3068,lsl #16
+            bytes e9 03 00 b9  # str w9,[sp]
+            bytes 29 00 80 52  # mov w9,#1
+            bytes e9 13 00 b9  # str w9,[sp,#16]
+            bytes e0 03 13 aa  # mov x0,x19
+            bytes 81 22 91 d2  # movz x1,#0x8914
+            bytes e2 03 00 91  # mov x2,sp
+            bytes a8 03 80 d2  # mov x8,#29
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 04 f8 b7  # tbnz x0,#63,fail
+            bytes a9 00 80 d2  # mov x9,#5
+            bytes e9 1b 00 f9  # str x9,[sp,#48]
+            bytes e0 03 13 aa  # mov x0,x19
+            bytes 21 00 80 d2  # mov x1,#1
+            bytes 82 02 80 d2  # mov x2,#20
+            bytes e3 c3 00 91  # add x3,sp,#48
+            bytes 04 02 80 d2  # mov x4,#16
+            bytes 08 1a 80 d2  # mov x8,#208
+            bytes 01 00 00 d4  # svc #0
+            bytes 20 03 f8 b7  # tbnz x0,#63,fail
+            bytes 15 02 80 52  # mov w21,#16
+            bytes e0 03 13 aa  # recv: mov x0,x19
+            bytes e1 03 01 91  # add x1,sp,#64
+            bytes 02 10 80 d2  # mov x2,#128
+            bytes 03 00 80 d2  # mov x3,#0
+            bytes 04 00 80 d2  # mov x4,#0
+            bytes 05 00 80 d2  # mov x5,#0
+            bytes e8 19 80 d2  # mov x8,#207
+            bytes 01 00 00 d4  # svc #0
+            bytes e0 01 f8 b7  # tbnz x0,#63,fail
+            bytes 1f f0 00 f1  # cmp x0,#60
+            bytes 61 01 00 54  # b.ne next
+            bytes ea 03 01 91  # add x10,sp,#64
+            bytes ab 03 00 10  # adr x11,frame
+            bytes 8c 07 80 d2  # mov x12,#60
+            bytes 4d 15 40 38  # cmpl: ldrb w13,[x10],#1
+            bytes 6e 15 40 38  # ldrb w14,[x11],#1
+            bytes bf 01 0e 6b  # cmp w13,w14
+            bytes 81 00 00 54  # b.ne next
+            bytes 8c 05 00 f1  # subs x12,x12,#1
+            bytes 61 ff ff 54  # b.ne cmpl
+            bytes 06 00 00 14  # b ok
+            bytes b5 06 00 71  # next: subs w21,w21,#1
+            bytes 41 fd ff 54  # b.ne recv
+            bytes 21 05 00 50  # fail: adr x1,failmsg
+            bytes c2 04 80 d2  # mov x2,#38
+            bytes 03 00 00 14  # b write
+            bytes c1 03 00 10  # ok: adr x1,okmsg
+            bytes 42 04 80 d2  # mov x2,#34
+            bytes 20 00 80 d2  # write: mov x0,#1
+            bytes 08 08 80 d2  # mov x8,#64
+            bytes 01 00 00 d4  # svc #0
+            bytes a0 d5 9b 52  # movz w0,#0xdead
+            bytes 20 dc bf 72  # movk w0,#0xfee1,lsl #16
+            bytes 21 2d 83 52  # movz w1,#0x1969
+            bytes 41 02 a5 72  # movk w1,#0x2812,lsl #16
+            bytes e2 ac 88 52  # movz w2,#0x4567
+            bytes 62 24 a0 72  # movk w2,#0x0123,lsl #16
+            bytes c8 11 80 d2  # mov x8,#142
+            bytes 01 00 00 d4  # svc #0
+            bytes 3f 20 03 d5  # yield
+            bytes ff ff ff 17  # b .-4
+        else
+            # コード 272 バイト（先頭コメントの表と同じ並び）
+            bytes b8; le 41 4                                  # mov eax, 41 (socket)
+            bytes bf; le 17 4                                  # mov edi, 17 (AF_PACKET)
+            bytes be; le 3 4                                   # mov esi, 3 (SOCK_RAW)
+            bytes ba; le $((0xb688)) 4                         # mov edx, htons(0x88B6)
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 0f 88; le 177 4                              # js fail (near)
+            bytes 41 89 c4                                     # mov r12d, eax
+            bytes 48 81 ec; le 192 4                           # sub rsp, 192
+            bytes 48 89 e7                                     # mov rdi, rsp
+            bytes 31 c0                                        # xor eax, eax
+            bytes b9; le 64 4                                  # mov ecx, 64
+            bytes fc                                           # cld
+            bytes f3 aa                                        # rep stosb
+            bytes c7 04 24; le $((0x30687465)) 4               # mov dword [rsp], "eth0"
+            bytes c7 44 24 10; le 1 4                          # mov dword [rsp+16], 1 (IFF_UP)
+            bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes be; le $((0x8914)) 4                         # mov esi, SIOCSIFFLAGS
+            bytes 48 89 e2                                     # mov rdx, rsp
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 74                                        # js fail
+            bytes c7 44 24 30; le 5 4                          # mov dword [rsp+48], 5 (tv_sec)
+            bytes b8; le 54 4                                  # mov eax, 54 (setsockopt)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes be; le 1 4                                   # mov esi, 1 (SOL_SOCKET)
+            bytes ba; le 20 4                                  # mov edx, 20 (SO_RCVTIMEO)
+            bytes 4c 8d 54 24 30                               # lea r10, [rsp+48]
+            bytes 41 b8; le 16 4                               # mov r8d, 16
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 48                                        # js fail
+            bytes 41 be; le 16 4                               # mov r14d, 16
+            bytes b8; le 45 4                                  # recv: mov eax, 45 (recvfrom)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
+            bytes ba; le 128 4                                 # mov edx, 128
+            bytes 45 31 d2                                     # xor r10d, r10d
+            bytes 45 31 c0                                     # xor r8d, r8d
+            bytes 45 31 c9                                     # xor r9d, r9d
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 20                                        # js fail (期限切れを含む負値)
+            bytes 48 83 f8 3c                                  # cmp rax, 60
+            bytes 75 15                                        # jne next
+            bytes 48 8d 74 24 40                               # lea rsi, [rsp+64]
+            bytes 48 8d 3d; le 78 4                            # lea rdi, [rip+0x4e] -> frame
+            bytes b9; le 60 4                                  # mov ecx, 60
+            bytes f3 a6                                        # repe cmpsb
+            bytes 74 13                                        # je ok
+            bytes 41 ff ce                                     # next: dec r14d
+            bytes 75 be                                        # jnz recv
+            bytes 48 8d 35; le 151 4                           # fail: lea rsi, [rip+0x97] -> failed message
+            bytes ba; le 38 4                                  # mov edx, 38
+            bytes eb 0c                                        # jmp write
+            bytes 48 8d 35; le 103 4                           # ok: lea rsi, [rip+0x67] -> ok message
+            bytes ba; le 34 4                                  # mov edx, 34
+            bytes b8; le 1 4                                   # write: mov eax, 1
+            bytes bf; le 1 4                                   # mov edi, 1
+            bytes 0f 05                                        # syscall
+            emit_reboot_tail
+        fi
         # データ: フレーム 60 バイト（ヘッダ 14 + ペイロード 46）、成功・失敗メッセージ
         for ((i = 0; i < ${#net_rx_frame_header_hex}; i += 2)); do
             bytes "${net_rx_frame_header_hex:i:2}"
@@ -566,7 +654,7 @@ if [ "$variant" = "net-rx" ]; then
     } >"$elf_file"
 elif [ "$variant" = "net-tx" ]; then
     # 機械語に固定された長さ・サイズ・EtherType を文字列定数と突き合わせる（fail-closed）
-    expected_size=491
+    if [ "$arch" = "aarch64" ]; then expected_size=504; else expected_size=491; fi
     if [ "${#net_tx_frame_header_hex}" -ne 28 ] || [ "${#net_tx_payload}" -ne 46 ] ||
         [ "$((${#net_tx_ok_message} + 1))" -ne 34 ] || [ "$((${#net_tx_failed_message} + 1))" -ne 38 ] ||
         [ "${net_tx_frame_header_hex:24:4}" != "88b5" ]; then
@@ -576,60 +664,127 @@ elif [ "$variant" = "net-tx" ]; then
     total_size=$expected_size
     {
         emit_elf_headers "$total_size"
-        # コード 239 バイト（先頭コメントの表と同じ並び）
-        bytes b8; le 41 4                                  # mov eax, 41 (socket)
-        bytes bf; le 17 4                                  # mov edi, 17 (AF_PACKET)
-        bytes be; le 3 4                                   # mov esi, 3 (SOCK_RAW)
-        bytes 31 d2                                        # xor edx, edx
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 0f 88; le 161 4                              # js fail (near)
-        bytes 41 89 c4                                     # mov r12d, eax
-        bytes 48 83 ec 40                                  # sub rsp, 64
-        bytes 48 89 e7                                     # mov rdi, rsp
-        bytes 31 c0                                        # xor eax, eax
-        bytes b9; le 64 4                                  # mov ecx, 64
-        bytes fc                                           # cld
-        bytes f3 aa                                        # rep stosb
-        bytes c7 04 24; le $((0x30687465)) 4               # mov dword [rsp], "eth0"
-        bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes be; le $((0x8933)) 4                         # mov esi, SIOCGIFINDEX
-        bytes 48 89 e2                                     # mov rdx, rsp
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 6f                                        # js fail
-        bytes 44 8b 6c 24 10                               # mov r13d, [rsp+16]
-        bytes c7 44 24 10; le 1 4                          # mov dword [rsp+16], 1 (IFF_UP)
-        bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes be; le $((0x8914)) 4                         # mov esi, SIOCSIFFLAGS
-        bytes 48 89 e2                                     # mov rdx, rsp
-        bytes 0f 05                                        # syscall
-        bytes 48 85 c0                                     # test rax, rax
-        bytes 78 4b                                        # js fail
-        bytes 66 c7 44 24 28; le 17 2                      # mov word [rsp+40], 17 (sll_family)
-        bytes 66 c7 44 24 2a; le $((0xb588)) 2             # mov word [rsp+42], htons(0x88B5)
-        bytes 44 89 6c 24 2c                               # mov [rsp+44], r13d (sll_ifindex)
-        bytes b8; le 44 4                                  # mov eax, 44 (sendto)
-        bytes 44 89 e7                                     # mov edi, r12d
-        bytes 48 8d 35; le 91 4                            # lea rsi, [rip+0x5b] -> frame
-        bytes ba; le 60 4                                  # mov edx, 60
-        bytes 45 31 d2                                     # xor r10d, r10d
-        bytes 4c 8d 44 24 28                               # lea r8, [rsp+40]
-        bytes 41 b9; le 20 4                               # mov r9d, 20
-        bytes 0f 05                                        # syscall
-        bytes 48 83 f8 3c                                  # cmp rax, 60
-        bytes 75 0e                                        # jne fail
-        bytes 48 8d 35; le 117 4                           # lea rsi, [rip+0x75] -> ok message
-        bytes ba; le 34 4                                  # mov edx, 34
-        bytes eb 0c                                        # jmp write
-        bytes 48 8d 35; le 137 4                           # fail: lea rsi, [rip+0x89] -> failed message
-        bytes ba; le 38 4                                  # mov edx, 38
-        bytes b8; le 1 4                                   # write: mov eax, 1
-        bytes bf; le 1 4                                   # mov edi, 1
-        bytes 0f 05                                        # syscall
-        emit_reboot_tail
+        if [ "$arch" = "aarch64" ]; then
+            # コード 252 バイト（先頭コメントの表と同じ並び。llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。#3966）
+            bytes 20 02 80 d2  # _start: mov x0,#17
+            bytes 61 00 80 d2  # mov x1,#3
+            bytes 02 00 80 d2  # mov x2,#0
+            bytes c8 18 80 d2  # mov x8,#198
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 05 f8 b7  # tbnz x0,#63,fail
+            bytes f3 03 00 aa  # mov x19,x0
+            bytes ff 03 01 d1  # sub sp,sp,#64
+            bytes ff 7f 00 a9  # stp xzr,xzr,[sp]
+            bytes ff 7f 01 a9  # stp xzr,xzr,[sp,#16]
+            bytes ff 7f 02 a9  # stp xzr,xzr,[sp,#32]
+            bytes ff 7f 03 a9  # stp xzr,xzr,[sp,#48]
+            bytes a9 8c 8e 52  # movz w9,#0x7465
+            bytes 09 0d a6 72  # movk w9,#0x3068,lsl #16
+            bytes e9 03 00 b9  # str w9,[sp]
+            bytes e0 03 13 aa  # mov x0,x19
+            bytes 61 26 91 d2  # movz x1,#0x8933
+            bytes e2 03 00 91  # mov x2,sp
+            bytes a8 03 80 d2  # mov x8,#29
+            bytes 01 00 00 d4  # svc #0
+            bytes 80 03 f8 b7  # tbnz x0,#63,fail
+            bytes f4 13 40 b9  # ldr w20,[sp,#16]
+            bytes 29 00 80 52  # mov w9,#1
+            bytes e9 13 00 b9  # str w9,[sp,#16]
+            bytes e0 03 13 aa  # mov x0,x19
+            bytes 81 22 91 d2  # movz x1,#0x8914
+            bytes e2 03 00 91  # mov x2,sp
+            bytes a8 03 80 d2  # mov x8,#29
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 02 f8 b7  # tbnz x0,#63,fail
+            bytes 29 02 80 52  # mov w9,#17
+            bytes e9 53 00 79  # strh w9,[sp,#40]
+            bytes 09 b1 96 52  # movz w9,#0xb588
+            bytes e9 57 00 79  # strh w9,[sp,#42]
+            bytes f4 2f 00 b9  # str w20,[sp,#44]
+            bytes e0 03 13 aa  # mov x0,x19
+            bytes 61 03 00 10  # adr x1,frame
+            bytes 82 07 80 d2  # mov x2,#60
+            bytes 03 00 80 d2  # mov x3,#0
+            bytes e4 a3 00 91  # add x4,sp,#40
+            bytes 85 02 80 d2  # mov x5,#20
+            bytes c8 19 80 d2  # mov x8,#206
+            bytes 01 00 00 d4  # svc #0
+            bytes 1f f0 00 f1  # cmp x0,#60
+            bytes 81 00 00 54  # b.ne fail
+            bytes 21 04 00 10  # adr x1,okmsg
+            bytes 42 04 80 d2  # mov x2,#34
+            bytes 03 00 00 14  # b write
+            bytes c1 04 00 50  # fail: adr x1,failmsg
+            bytes c2 04 80 d2  # mov x2,#38
+            bytes 20 00 80 d2  # write: mov x0,#1
+            bytes 08 08 80 d2  # mov x8,#64
+            bytes 01 00 00 d4  # svc #0
+            bytes a0 d5 9b 52  # movz w0,#0xdead
+            bytes 20 dc bf 72  # movk w0,#0xfee1,lsl #16
+            bytes 21 2d 83 52  # movz w1,#0x1969
+            bytes 41 02 a5 72  # movk w1,#0x2812,lsl #16
+            bytes e2 ac 88 52  # movz w2,#0x4567
+            bytes 62 24 a0 72  # movk w2,#0x0123,lsl #16
+            bytes c8 11 80 d2  # mov x8,#142
+            bytes 01 00 00 d4  # svc #0
+            bytes 3f 20 03 d5  # yield
+            bytes ff ff ff 17  # b .-4
+        else
+            # コード 239 バイト（先頭コメントの表と同じ並び）
+            bytes b8; le 41 4                                  # mov eax, 41 (socket)
+            bytes bf; le 17 4                                  # mov edi, 17 (AF_PACKET)
+            bytes be; le 3 4                                   # mov esi, 3 (SOCK_RAW)
+            bytes 31 d2                                        # xor edx, edx
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 0f 88; le 161 4                              # js fail (near)
+            bytes 41 89 c4                                     # mov r12d, eax
+            bytes 48 83 ec 40                                  # sub rsp, 64
+            bytes 48 89 e7                                     # mov rdi, rsp
+            bytes 31 c0                                        # xor eax, eax
+            bytes b9; le 64 4                                  # mov ecx, 64
+            bytes fc                                           # cld
+            bytes f3 aa                                        # rep stosb
+            bytes c7 04 24; le $((0x30687465)) 4               # mov dword [rsp], "eth0"
+            bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes be; le $((0x8933)) 4                         # mov esi, SIOCGIFINDEX
+            bytes 48 89 e2                                     # mov rdx, rsp
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 6f                                        # js fail
+            bytes 44 8b 6c 24 10                               # mov r13d, [rsp+16]
+            bytes c7 44 24 10; le 1 4                          # mov dword [rsp+16], 1 (IFF_UP)
+            bytes b8; le 16 4                                  # mov eax, 16 (ioctl)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes be; le $((0x8914)) 4                         # mov esi, SIOCSIFFLAGS
+            bytes 48 89 e2                                     # mov rdx, rsp
+            bytes 0f 05                                        # syscall
+            bytes 48 85 c0                                     # test rax, rax
+            bytes 78 4b                                        # js fail
+            bytes 66 c7 44 24 28; le 17 2                      # mov word [rsp+40], 17 (sll_family)
+            bytes 66 c7 44 24 2a; le $((0xb588)) 2             # mov word [rsp+42], htons(0x88B5)
+            bytes 44 89 6c 24 2c                               # mov [rsp+44], r13d (sll_ifindex)
+            bytes b8; le 44 4                                  # mov eax, 44 (sendto)
+            bytes 44 89 e7                                     # mov edi, r12d
+            bytes 48 8d 35; le 91 4                            # lea rsi, [rip+0x5b] -> frame
+            bytes ba; le 60 4                                  # mov edx, 60
+            bytes 45 31 d2                                     # xor r10d, r10d
+            bytes 4c 8d 44 24 28                               # lea r8, [rsp+40]
+            bytes 41 b9; le 20 4                               # mov r9d, 20
+            bytes 0f 05                                        # syscall
+            bytes 48 83 f8 3c                                  # cmp rax, 60
+            bytes 75 0e                                        # jne fail
+            bytes 48 8d 35; le 117 4                           # lea rsi, [rip+0x75] -> ok message
+            bytes ba; le 34 4                                  # mov edx, 34
+            bytes eb 0c                                        # jmp write
+            bytes 48 8d 35; le 137 4                           # fail: lea rsi, [rip+0x89] -> failed message
+            bytes ba; le 38 4                                  # mov edx, 38
+            bytes b8; le 1 4                                   # write: mov eax, 1
+            bytes bf; le 1 4                                   # mov edi, 1
+            bytes 0f 05                                        # syscall
+            emit_reboot_tail
+        fi
         # データ: フレーム 60 バイト（ヘッダ 14 + ペイロード 46）、成功・失敗メッセージ
         for ((i = 0; i < ${#net_tx_frame_header_hex}; i += 2)); do
             bytes "${net_tx_frame_header_hex:i:2}"

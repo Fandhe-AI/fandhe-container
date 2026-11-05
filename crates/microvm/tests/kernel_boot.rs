@@ -57,6 +57,7 @@
 //! marker ちょうど 1 回・UART の取りこぼし 0 を照合する。vCPU 2 台の陽性 1 件を #3899 で足し、3 件。2 台は `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001` を照合する）。シリアルは SPI 1（INTID 33）の level 割り込み
 //! （FDT は `interrupts = <0 1 4>`。`KVM_IRQ_LINE` で結線。#3943）で、送信は THRE 割り込みで進む（以前の割り込みなしのポーリングでは
 //! 送信が timer の周期にしか進まず、reboot 直前の marker が出切らず 0 回になりえた）。それでも marker 0 回で落ちた場合は #3781 で観測する。
+//! 陽性は `ttyS0 at MMIO 0x9000000 (irq = N, ...)` の行がちょうど 1 行で `N != 0` であることも照合する（#3958。ポーリングへの退行の検出）。
 //! aarch64 の virtio-block（#3947・MVM-1・REPAIR-12）: `MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=block-read
 //! make microvm-test-initrd-build` の initrd（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。既定
 //! `target/microvm-test-initrd/aarch64-block-read/initrd.cpio`）で、陽性（sentinel あり）・負の対照（block デバイス無し）・
@@ -113,6 +114,183 @@ fn escape_tail(output: &[u8], n: usize) -> String {
         .unwrap_or(&[])
         .escape_ascii()
         .to_string()
+}
+
+/// `uart_report_port` の行から読んだアドレス（Linux v6.12 `drivers/tty/serial/serial_core.c`）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtyAddress {
+    /// `MMIO 0x<hex>`（`UPIO_MEM` 系）。
+    Mmio(u64),
+    /// `I/O 0x<hex>`（`UPIO_PORT`）。
+    Io(u64),
+}
+
+/// `parse_tty_report` の結果。真偽値に潰さず、失敗の種類を診断に残す（MVM-1・REPAIR-12・#3958）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TtyReport {
+    /// `<tty> at ` を含む行が無い（`quiet`・`loglevel=` で KERN_INFO が抑止された場合も含む）。
+    Missing,
+    /// 該当行が 2 行以上ある（件数）。
+    Multiple(usize),
+    /// 該当行はあるが書式が想定と違う（理由）。
+    Malformed(&'static str),
+    /// 1 行だけあり、読めた。`irq` は Linux の virq であり GIC の INTID ではない。
+    Found { address: TtyAddress, irq: u32 },
+}
+
+/// ゲストの出力から 8250 の登録行 `<dev>: ttyS0 at MMIO 0x9000000 (irq = N, base_baud = B) is a 16550A` を読む。
+///
+/// 書式は Linux v6.12 `uart_report_port` の `pr_info("%s%s%s at %s (irq = %d, base_baud = %d) is a %s\n", ...)`。
+/// `irq = 0` は DT に `interrupts` が無い構成（ポーリング）で `8250_of.c` の `of_irq_get` が失敗したときに出る。
+/// 非 0 の値は virq で INTID 33 とは一致しないため、呼び出し側は `== 33` ではなく `!= 0` で照合する。
+/// `base_baud` 以降は UART モデルの autoconfig に依存するので読まない。
+/// 出力はゲスト由来の非信頼入力なので、添字・`unwrap` を使わず、桁数に上限を置いて panic しない。
+/// 呼び出し元: aarch64 の実機前提の陽性（`arm64`）と、既定で走る単体試験（`tty_report_tests`）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn parse_tty_report(output: &[u8], tty: &str) -> TtyReport {
+    let needle = format!("{tty} at ");
+    let needle = needle.as_bytes();
+    let mut lines: Vec<&[u8]> = Vec::new();
+    for raw in output.split(|b| *b == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // 直前が英数字の出現（`xttyS0 at` 等）は別の名前なので数えない。
+        let hit = line
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .filter(|pos| {
+                pos.checked_sub(1)
+                    .and_then(|p| line.get(p))
+                    .is_none_or(|b| !b.is_ascii_alphanumeric())
+            });
+        if let Some(pos) = hit
+            && let Some(rest) = line.get(pos + needle.len()..)
+        {
+            lines.push(rest);
+        }
+    }
+    let rest = match lines.as_slice() {
+        [] => return TtyReport::Missing,
+        [one] => *one,
+        many => return TtyReport::Multiple(many.len()),
+    };
+    let Ok(rest) = std::str::from_utf8(rest) else {
+        return TtyReport::Malformed("non-utf8 report line");
+    };
+    let (is_mmio, rest) = if let Some(r) = rest.strip_prefix("MMIO 0x") {
+        (true, r)
+    } else if let Some(r) = rest.strip_prefix("I/O 0x") {
+        (false, r)
+    } else {
+        return TtyReport::Malformed("unknown address kind");
+    };
+    let hex_len = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+    if hex_len == 0 || hex_len > 16 {
+        return TtyReport::Malformed("address digits out of range");
+    }
+    let (Some(hex), Some(rest)) = (rest.get(..hex_len), rest.get(hex_len..)) else {
+        return TtyReport::Malformed("address split");
+    };
+    let Ok(value) = u64::from_str_radix(hex, 16) else {
+        return TtyReport::Malformed("address not a number");
+    };
+    let Some(rest) = rest.strip_prefix(" (irq = ") else {
+        return TtyReport::Malformed("missing irq field");
+    };
+    let dec_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if dec_len == 0 || dec_len > 10 {
+        return TtyReport::Malformed("irq digits out of range");
+    }
+    let (Some(dec), Some(rest)) = (rest.get(..dec_len), rest.get(dec_len..)) else {
+        return TtyReport::Malformed("irq split");
+    };
+    let Ok(irq) = dec.parse::<u32>() else {
+        return TtyReport::Malformed("irq overflow");
+    };
+    if !rest.starts_with(',') {
+        return TtyReport::Malformed("irq not followed by comma");
+    }
+    let address = if is_mmio {
+        TtyAddress::Mmio(value)
+    } else {
+        TtyAddress::Io(value)
+    };
+    TtyReport::Found { address, irq }
+}
+
+/// `parse_tty_report` の単体試験（KVM 不要。x86_64・aarch64 のどちらでも既定で走る。MVM-1・REPAIR-12・#3958）。
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod tty_report_tests {
+    use super::{TtyAddress, TtyReport, parse_tty_report};
+
+    const LINE: &str =
+        "9000000.serial: ttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 115200) is a 16550A";
+
+    #[test]
+    fn mvm1_3958_parse_tty_report_irq_values() {
+        let found = |s: &str| parse_tty_report(s.as_bytes(), "ttyS0");
+        let expect = TtyReport::Found {
+            address: TtyAddress::Mmio(0x0900_0000),
+            irq: 14,
+        };
+        assert_eq!(found(&format!("{LINE}\n")), expect);
+        assert_eq!(found(&format!("[    0.312345] {LINE}\r\n")), expect);
+        assert_eq!(
+            found(&LINE.replace("irq = 14", "irq = 0")),
+            TtyReport::Found {
+                address: TtyAddress::Mmio(0x0900_0000),
+                irq: 0
+            }
+        );
+        assert_eq!(
+            found("serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A\n"),
+            TtyReport::Found {
+                address: TtyAddress::Io(0x3f8),
+                irq: 4
+            }
+        );
+        let mixed = format!(
+            "earlycon: uart8250 at MMIO 0x0000000009000000 (options '')\n{LINE}\n\
+             9001000.serial: ttyS1 at MMIO 0x9001000 (irq = 15, base_baud = 115200) is a 16550A\n"
+        );
+        match found(&mixed) {
+            TtyReport::Found { address, irq } => {
+                assert_eq!(address, TtyAddress::Mmio(0x0900_0000));
+                assert_eq!(irq, 14);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mvm1_3958_parse_tty_report_missing_and_malformed() {
+        let p = |s: &str| parse_tty_report(s.as_bytes(), "ttyS0");
+        assert_eq!(p(""), TtyReport::Missing);
+        assert_eq!(
+            p("earlycon: uart8250 at MMIO 0x0000000009000000 (options '')\n"),
+            TtyReport::Missing
+        );
+        assert_eq!(
+            p("xttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 1) is a 16550A\n"),
+            TtyReport::Missing
+        );
+        assert_eq!(p(&format!("{LINE}\n{LINE}\n")), TtyReport::Multiple(2));
+        for bad in [
+            "ttyS0 at MMIO 0x9000000 (irq = abc, base_baud = 1)",
+            "ttyS0 at MMIO 0x9000000 (irq = -1, base_baud = 1)",
+            "ttyS0 at MMIO 0x9000000 (irq = 99999999999, base_baud = 1)",
+            "ttyS0 at MMIO 0x9000000 (irq = 4294967296, base_baud = 1)",
+            "ttyS0 at MMIO 0x9000000 (irq = 14 base_baud = 1)",
+            "ttyS0 at MMIO 0x (irq = 14, base_baud = 1)",
+            "ttyS0 at *unknown* (irq = 14, base_baud = 1)",
+        ] {
+            assert!(
+                matches!(p(&format!("{bad}\n")), TtyReport::Malformed(_)),
+                "{bad}"
+            );
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1494,9 +1672,10 @@ mod x86 {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, count_lines_ending_with,
-        count_marker_lines, escape_tail,
+        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, TtyAddress, TtyReport,
+        count_lines_ending_with, count_marker_lines, escape_tail, parse_tty_report,
     };
+    use fandhe_container_microvm::arm64_layout::ARM64_SERIAL_BASE;
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
@@ -1800,8 +1979,23 @@ mod arm64 {
             "init marker must appear exactly once: {diag}"
         );
         assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+        // ポーリングへの退行の検出（#3958）。irq = 0 は DT に interrupts が無い印。値は virq なので != 0 だけを見る。
+        let irq = match parse_tty_report(&o.output, "ttyS0") {
+            TtyReport::Found {
+                address: TtyAddress::Mmio(base),
+                irq,
+            } => {
+                assert_eq!(base, ARM64_SERIAL_BASE, "ttyS0 MMIO base: {diag}");
+                irq
+            }
+            other => panic!("ttyS0 report not found exactly once as MMIO: {other:?}: {diag}"),
+        };
+        assert_ne!(
+            irq, 0,
+            "ttyS0 is polled (irq = 0); serial interrupt wiring regressed: {diag}"
+        );
         eprintln!(
-            "kernel_boot: ok arch=aarch64 reason=guest_shutdown elapsed_ms={} exits={}",
+            "kernel_boot: ok arch=aarch64 reason=guest_shutdown ttys0_irq={irq} elapsed_ms={} exits={}",
             o.elapsed.as_millis(),
             o.exits
         );

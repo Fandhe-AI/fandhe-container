@@ -625,6 +625,85 @@ mod linux {
             }
         }
 
+        /// 一時の状態ルート（外部クレートを足さない最小の RAII）。`<root>/c/` は 0700。
+        struct Root(PathBuf);
+
+        impl Root {
+            fn new(tag: &str) -> Self {
+                use std::os::unix::fs::PermissionsExt as _;
+                let n = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let root = std::env::temp_dir()
+                    .join(format!("fc-cancel-{tag}-{}-{n}", std::process::id()));
+                let dir = root.join("c");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                Self(root)
+            }
+        }
+
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// SUP-3・SUP-9・REPAIR-4・REPAIR-5・REPAIR-12・#3973: 実 UDS で accept されない相手（listen backlog に
+        /// 接続だけ載る。Hello が届かない）に対する期限切れは、取り消し専用の message の `Timeout` になる。
+        #[test]
+        fn sup3_sup9_3973_cancel_times_out_when_hello_never_arrives() {
+            use std::os::unix::net::UnixListener;
+            let root = Root::new("nohello");
+            let listener = UnixListener::bind(root.0.join("c").join("supervisor.sock")).unwrap();
+            let id = ContainerId::new("c").unwrap();
+            let started = Instant::now();
+            let e = ControlRestartCanceller::new(root.0.clone())
+                .cancel(&id, started + Duration::from_millis(300))
+                .unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert_eq!(e.message(), CANCEL_MSG);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            drop(listener);
+        }
+
+        /// SUP-3・SUP-9・REPAIR-4・REPAIR-5・REPAIR-12・#3973: Hello を送り要求を読んだ後に応答を保留する相手
+        /// （再 launch 中に応答が止まるケース）に対する期限切れも、取り消し専用の message の `Timeout` になる。
+        /// `exchange` の `Timeout` を `cancel_timeout` へ変換する分岐を通す。
+        #[test]
+        fn sup3_sup9_3973_cancel_times_out_when_response_is_withheld() {
+            use crate::control::protocol::encode_hello;
+            use std::io::Read as _;
+            use std::os::unix::net::UnixListener;
+            let root = Root::new("withheld");
+            let listener = UnixListener::bind(root.0.join("c").join("supervisor.sock")).unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                s.write_all(&encode_hello()).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap();
+                // 応答は返さず、クライアントの期限切れが済むまで接続を保持する。
+                let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                n
+            });
+            let id = ContainerId::new("c").unwrap();
+            let started = Instant::now();
+            let e = ControlRestartCanceller::new(root.0.clone())
+                .cancel(&id, started + Duration::from_millis(500))
+                .unwrap_err();
+            let elapsed = started.elapsed();
+            done_tx.send(()).unwrap();
+            let requested = server.join().unwrap();
+            assert!(requested > 0, "the request must reach the server");
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert_eq!(e.message(), CANCEL_MSG);
+            assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        }
+
         /// SUP-3・SUP-9: 応答の対応表。サーバの `Timeout` は取り消し専用の文言になる。
         #[test]
         fn sup3_sup9_cancel_outcome_maps_server_timeout_to_cancel_message() {

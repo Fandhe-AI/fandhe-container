@@ -559,8 +559,10 @@ fn hvf_device_spi_reaches_guest() {
         };
         match decode_esr(ex.syndrome) {
             // GIC つきの構成では来ない(#3803)。exit する環境でも止まらないよう、命令を進めて再開する。
+            // 1 ms 待つのは、`SPI_INJECT_DELAY` の注入より先に `SPI_MAX_EXITS` を使い切らないため。
             EsrClass::Wfx(WfxKind::Wfi) => {
                 wfi_exits += 1;
+                std::thread::sleep(Duration::from_millis(1));
                 let pc = vcpu.get_reg(HvReg::PC).unwrap();
                 let len = instruction_length(ex.syndrome).bytes();
                 vcpu.set_reg(HvReg::PC, pc + len).unwrap();

@@ -10,15 +10,18 @@
 //!   起動・停止・切断時の回収・起動失敗後の接続維持を具体値で照合する。あわせて `serve_until` と停止フラグ
 //!   （SIGTERM 相当。#3747）で、実行中 VM の停止と、停止に入った後に届いた要求が処理されないことを照合する。
 //! - 層 B（`#[ignore]`・実機前提）: 実バイナリを spawn し、Linux x86_64 では本物の `KvmBackend`（`/dev/kvm` が要る）、
+//!   Linux aarch64 でも本物の `KvmBackend`（`/dev/kvm` と in-kernel vGICv3・`KVM_CAP_ARM_PSCI_0_2` が要る。#3959）、
 //!   macOS aarch64 では本物の `HvfBackend`（Apple Silicon の macOS 15 以降と entitlement つきの署名が要る。TASK-192.18・#3800）で、
-//!   合成ゲスト（Linux x86_64 は合成 bzImage、macOS aarch64 は合成 arm64 Image）を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
+//!   合成ゲスト（Linux x86_64 は合成 bzImage、aarch64 は合成 arm64 Image）を起動・停止する。UDS ホップを含む完全な通し。手順は `AGENTS.md`「実機前提テスト」節。
 //!
-//! 層 B の合成ゲストは boot_params（`HdrS` と cmd_line_ptr）を確かめて自己ループする。`KvmBackend` は block / net を付けない
+//! 層 B の合成ゲストは起動状態（x86_64 は boot_params の `HdrS` と cmd_line_ptr、Linux aarch64 は x0 が指す FDT の magic）を
+//! 確かめて自己ループする。`KvmBackend` は block / net を付けない
 //! ため、`crates/microvm/tests/microvm.rs` の virtio-mmio 照合ペイロードは使えない。ホスト側からゲストの exit の種別は
 //! 観測できないので、停止理由 `requested`（停止要求の割り込みで止まった）が「正しいエントリで動き続けた」ことの判別材料になる。
-//! ud2 だけのゲストで `guest_shutdown` を期待する負の対照は、停止要求と shutdown exit のどちらが先に観測されるかが競合し、
-//! 寛容な assert になるため置かない。Linux aarch64 の `KvmBackend` は起動まで実装済み（#3696）だが、ネイティブ arm64 の CI が無く実機での実行は人間担当の #3781 のため、
-//! Linux aarch64 の層 B はまだ置いていない。
+//! 不正なら x86_64 は `ud2`、Linux aarch64 は PSCI SYSTEM_OFF で止まる。
+//! shutdown を期待する負の対照は、停止要求と shutdown exit のどちらが先に観測されるかが競合し、
+//! 寛容な assert になるため置かない。Linux aarch64 の層 B は、ネイティブ arm64 の CI が無く（#2274）型検査のみ
+//! `cross-target-check` の `aarch64-unknown-linux-gnu` が担い、実機での実行は人間担当の #3781。
 //! 待ちはすべて期限つきで、超過時は kill して失敗にする（REPAIR-5）。
 #![cfg(unix)]
 
@@ -747,6 +750,7 @@ fn task117_4_mvm1_repair5_3745_detached_slot_reclaimed_after_exit_observed_via_u
 /// 期限つき回収の共有補助（層 B のみ。取り込みは cfg の内側に限る）。
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 #[path = "../../core/tests/support/reap.rs"]
@@ -757,9 +761,10 @@ mod reap;
 #[path = "../../microvm/tests/support/bzimage.rs"]
 mod bzimage;
 
-/// 層 B の共有補助（実バイナリの spawn・期限つき回収・反射検査）。Linux x86_64 の KVM と macOS aarch64 の HVF が使う。
+/// 層 B の共有補助（実バイナリの spawn・期限つき回収・反射検査）。Linux x86_64 / aarch64 の KVM と macOS aarch64 の HVF が使う。
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 mod real_bin {
@@ -942,9 +947,131 @@ mod real_kvm {
 }
 
 /// 合成 arm64 Image の正本（`crates/microvm/tests/support/arm64_image.rs`。複製しない・#3800）。
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// macOS aarch64 の HVF と Linux aarch64 の KVM（#3959）が使う。
+#[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
 #[path = "../../microvm/tests/support/arm64_image.rs"]
 mod arm64_image;
+
+/// 層 B: 実バイナリ + 実 KVM（Linux aarch64・`/dev/kvm` と in-kernel vGICv3・`KVM_CAP_ARM_PSCI_0_2` が要る実機前提。
+/// #3959・MVM-1・PLUG-1・REPAIR-12）。`MicroVm` は arm64 Image + FDT で起動する。ネイティブ arm64 の CI が無く（#2274）、
+/// 実機での実行は人間担当の #3781。KVM は 1 プロセスに複数 VM を作れるため `--test-threads=1` は不要。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod real_kvm_arm64 {
+    use super::*;
+
+    use fandhe_container_microvm::device::KvmDevice;
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use fandhe_container_plugin::{JsonLinesPeerAuthObserver, UdsListener};
+
+    use super::arm64_image;
+    use super::real_bin::{ChildGuard, assert_no_leak, spawn, wait_exit};
+
+    /// x0 が指す FDT の先頭 4 バイト（ビッグエンディアンの magic `0xd00dfeed`）だけを確かめ、一致すれば自己ループする。
+    /// 不一致は PSCI SYSTEM_OFF（`hvc #0`）で止まり、停止理由が `guest_shutdown` になって `requested` の assert が落ちる。
+    /// `b.ne` の即値（imm19 = 2、+8 バイト）は命令を並べ替えるときに再計算が要る。
+    fn guest_payload() -> Vec<u32> {
+        vec![
+            0xB940_0001, // 0x00 ldr  w1, [x0]
+            0x5AC0_0821, // 0x04 rev  w1, w1
+            0x529F_DDA2, // 0x08 movz w2, #0xfeed
+            0x72BA_01A2, // 0x0c movk w2, #0xd00d, lsl #16
+            0x6B02_003F, // 0x10 cmp  w1, w2
+            0x5400_0041, // 0x14 b.ne fail (+0x08)
+            0x1400_0000, // 0x18 b .
+            0xD2B0_8000, // 0x1c fail: movz x0, #0x8400, lsl #16
+            0xF280_0100, // 0x20 movk x0, #0x8 (PSCI SYSTEM_OFF)
+            0xD400_0002, // 0x24 hvc  #0
+            0x1400_0000, // 0x28 b .
+        ]
+    }
+
+    /// 前提を確かめる。`/dev/kvm` が開けても vGICv3 や PSCI 0.2 が無ければ plugin 側の start が Error になり回帰と見分けにくいため、
+    /// 試験プロセス内で VM を組み立てて直ちに drop する。欠けていれば決まった 1 行目で失敗させる（skip しない）。
+    fn precondition() {
+        let dev = match KvmDevice::open() {
+            Ok(d) => d,
+            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
+        };
+        let config = MicroVmConfig::<MemoryBlockBackend, MemoryNetBackend> {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![],
+        };
+        match MicroVm::assemble(&dev, config) {
+            Ok(vm) => drop(vm),
+            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
+        }
+    }
+
+    /// listener を立てて実バイナリを繋ぎ、ping と start（合成 arm64 Image）まで進めた状態を返す。
+    fn boot() -> (TempDir, ChildGuard, UdsStream, String) {
+        precondition();
+        let dir = TempDir::new();
+        let sock = dir.0.join("p.sock");
+        let kernel = dir.file(
+            "k.img",
+            &arm64_image::synthetic_image_with_code(true, &guest_payload()),
+        );
+        let listener = UdsListener::bind(&sock).expect("bind");
+        let child = spawn(&sock);
+        let mut obs = JsonLinesPeerAuthObserver::new();
+        let mut stream = listener
+            .accept(Duration::from_secs(20), &mut obs)
+            .expect("accept");
+        assert_eq!(obs.len(), 0);
+        assert_eq!(
+            expect_ok(call(&mut stream, 1, s(&["ping"])), 1),
+            s(&["pong"])
+        );
+        let start = s(&["start", "vm1", &kernel, "", "console=ttyS0", "1", "64"]);
+        assert_eq!(expect_ok(call(&mut stream, 2, start), 2), s(&["running"]));
+        // ゲストを走らせる時間を取る（不正なエントリ・x0 なら SYSTEM_OFF で止まる）。
+        std::thread::sleep(Duration::from_millis(200));
+        (dir, child, stream, kernel)
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn mvm1_3959_plug1_real_kvm_arm64_start_stop_via_plugin_binary() {
+        let (dir, child, mut stream, kernel) = boot();
+        assert_eq!(
+            expect_ok(call(&mut stream, 3, s(&["stop", "vm1"])), 3),
+            s(&["stopped", "requested"])
+        );
+        drop(stream);
+        let (code, err) = wait_exit(child);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            err.matches("op=plugin.microvm.start outcome=ok").count(),
+            1,
+            "{err}"
+        );
+        assert_eq!(
+            err.matches("op=plugin.microvm.stop outcome=ok").count(),
+            1,
+            "{err}"
+        );
+        assert!(!err.contains("outcome=error"), "{err}");
+        assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
+        assert_no_leak(&err, &dir, &kernel);
+    }
+
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn mvm1_3959_real_kvm_arm64_disconnect_reclaims_running_vm() {
+        let (dir, child, stream, kernel) = boot();
+        drop(stream); // stop を送らずに切断する。
+        let (code, err) = wait_exit(child);
+        assert_eq!(code, 0, "{err}");
+        // stop_all が残った VM を failed=0 remaining=0 で止めたなら warn 行は出ない。
+        assert!(!err.contains("op=plugin.microvm.stop_all"), "{err}");
+        assert!(!err.contains("outcome=error"), "{err}");
+        assert_no_leak(&err, &dir, &kernel);
+    }
+}
 
 /// 層 B: 実バイナリ + 実 Hypervisor.framework（macOS aarch64・Apple Silicon の macOS 15 以降・entitlement つきの署名が要る
 /// 実機前提。TASK-192.18・#3800・MVM-5・MVM-1・PLUG-1）。

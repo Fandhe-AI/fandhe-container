@@ -666,15 +666,33 @@ mod linux {
             let root = state_root("withheld");
             let listener = UnixListener::bind(root.join("c").join("supervisor.sock")).unwrap();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-            let server = std::thread::spawn(move || {
-                let (mut s, _) = listener.accept().unwrap();
-                s.write_all(&encode_hello()).unwrap();
+            // 模擬サーバのすべての待ちに絶対期限を設ける（REPAIR-5）。accept は non-blocking の再試行で、
+            // 期限切れか試験側の完了通知で「接続が来なかった」（`None`）を返して終わる。
+            // 最悪でも accept 10 秒 + 書き込み 5 秒 + 読み取り 5 秒 + 保持 10 秒で必ず終わる。
+            let server = std::thread::spawn(move || -> Option<usize> {
+                listener.set_nonblocking(true).unwrap();
+                let accept_deadline = Instant::now() + Duration::from_secs(10);
+                let mut s = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= accept_deadline || done_rx.try_recv().is_ok() {
+                                return None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
                 s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                s.write_all(&encode_hello()).unwrap();
                 let mut buf = [0u8; 64];
                 let n = s.read(&mut buf).unwrap();
-                // 応答は返さず、クライアントの期限切れが済むまで接続を保持する。
+                // 応答は返さず、クライアントの期限切れが済むまで接続を保持する（期限つき）。
                 let _ = done_rx.recv_timeout(Duration::from_secs(10));
-                n
+                Some(n)
             });
             let id = ContainerId::new("c").unwrap();
             let started = Instant::now();
@@ -684,7 +702,10 @@ mod linux {
             let elapsed = started.elapsed();
             done_tx.send(()).unwrap();
             let requested = server.join().unwrap();
-            assert!(requested > 0, "the request must reach the server");
+            assert!(
+                requested.is_some_and(|n| n > 0),
+                "the request must reach the server: {requested:?}"
+            );
             assert_eq!(e.code(), ErrorCode::Timeout);
             assert_eq!(e.message(), CANCEL_MSG);
             assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");

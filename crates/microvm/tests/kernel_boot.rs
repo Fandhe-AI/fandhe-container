@@ -62,7 +62,11 @@
 //! make microvm-test-initrd-build` の initrd（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。既定
 //! `target/microvm-test-initrd/aarch64-block-read/initrd.cpio`）で、陽性（sentinel あり）・負の対照（block デバイス無し）・
 //! 陰性対照（0 埋め）の 3 件を足す。割り込みは FDT の既定の edge-rising の SPI。カーネルは `CONFIG_VIRTIO_MMIO`（DT 経由で
-//! `_CMDLINE_DEVICES` は不要）・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS` が要る。virtio-net の aarch64 版は範囲外。
+//! `_CMDLINE_DEVICES` は不要）・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS` が要る。
+//! aarch64 の virtio-net（#3957・MVM-1・REPAIR-12）: 既定の initrd と観測器（`VirtioWindowObserver`。x86_64 と共有）で、net 1 台の陽性
+//! （DRIVER_OK `0x0F`・FAILED 0 件・QUEUE_READY=1 の回数 2）・net 0 台の負の対照（組み立て済みの net 0 件・観測値すべて 0）・
+//! block+net の窓の区別（block は QUEUE_READY 1 回・net は 2 回）の 3 件を足す。カーネルには `CONFIG_NET`・`CONFIG_NETDEVICES`・
+//! `CONFIG_VIRTIO_NET` も要る。net-tx・net-rx の aarch64 版（専用 initrd が要る）は #3966 で追う。実機の記録は #3781（Agent は実カーネルで未確認）。
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
@@ -114,6 +118,229 @@ fn escape_tail(output: &[u8], n: usize) -> String {
         .unwrap_or(&[])
         .escape_ascii()
         .to_string()
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use fandhe_container_microvm::device::{RunObserver, RunOutcome, RunRecord};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use fandhe_container_microvm::exit::{ExitData, ExitValue};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use fandhe_container_microvm::microvm::VirtioDeviceKind;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use fandhe_container_microvm::virtio_mmio::reg;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::time::Duration;
+
+// x86_64・aarch64 の virtio-net 試験が共有する観測器（#3957。複製しない・REPAIR-1）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// MMIO の窓 1 つ分の観測値（virtio-mmio の STATUS・QUEUE_READY への書き込み）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowStats {
+    /// DRIVER_OK を含む最初の STATUS 書き込みの値。
+    driver_ok_first: Option<u32>,
+    /// FAILED を含む STATUS 書き込みの件数。
+    failed_writes: u64,
+    /// STATUS への 4 バイト書き込みの総数。
+    status_writes: u64,
+    /// QUEUE_READY へ値 1 を書いた回数。
+    queue_ready_one: u64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// 窓 1 つ分の atomic カウンタ（`len == 0` は未設定）。
+#[derive(Debug, Default)]
+struct Window {
+    base: AtomicU64,
+    len: AtomicU64,
+    driver_ok_first: AtomicU64,
+    failed_writes: AtomicU64,
+    status_writes: AtomicU64,
+    queue_ready_one: AtomicU64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const NO_VALUE: u64 = u64::MAX;
+/// virtio 仕様 2.1 の Device Status ビット（DRIVER_OK = 4・FAILED = 128）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const STATUS_DRIVER_OK: u32 = 4;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const STATUS_FAILED: u32 = 128;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// virtio-net に見せる固定の locally administered なダミー MAC。
+const NET_MAC: [u8; 6] = [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65];
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn window_index(kind: VirtioDeviceKind) -> usize {
+    match kind {
+        VirtioDeviceKind::Block => 0,
+        _ => 1,
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+/// vCPU スレッドから同期で呼ばれ、virtio-mmio の窓への書き込みを atomic で数える観測器（#3865・MVM-1）。
+/// `record` では割り当ても待ちもしない。値はゲスト由来（untrusted）で、範囲外は数えるだけにする。
+#[derive(Debug)]
+struct VirtioWindowObserver {
+    /// 0 = virtio-block、1 = virtio-net。
+    windows: [Window; 2],
+    exits: AtomicU64,
+    /// vCPU 0 以外（AP）の exit 件数（診断用）。
+    ap_exits: AtomicU64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl VirtioWindowObserver {
+    fn new() -> Self {
+        let obs = Self {
+            windows: [Window::default(), Window::default()],
+            exits: AtomicU64::new(0),
+            ap_exits: AtomicU64::new(0),
+        };
+        for w in &obs.windows {
+            w.driver_ok_first.store(NO_VALUE, Ordering::Relaxed);
+        }
+        obs
+    }
+
+    fn bind(&self, kind: VirtioDeviceKind, base: u64, len: u64) {
+        if let Some(w) = self.windows.get(window_index(kind)) {
+            w.base.store(base, Ordering::Relaxed);
+            w.len.store(len, Ordering::Relaxed);
+        }
+    }
+
+    fn stats(&self, kind: VirtioDeviceKind) -> WindowStats {
+        let w = &self.windows[window_index(kind)];
+        let first = w.driver_ok_first.load(Ordering::Relaxed);
+        WindowStats {
+            driver_ok_first: u32::try_from(first).ok(),
+            failed_writes: w.failed_writes.load(Ordering::Relaxed),
+            status_writes: w.status_writes.load(Ordering::Relaxed),
+            queue_ready_one: w.queue_ready_one.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl RunObserver for VirtioWindowObserver {
+    fn record(&self, record: &RunRecord) {
+        if let RunOutcome::Exit(_) = record.outcome {
+            self.exits.fetch_add(1, Ordering::Relaxed);
+            if record.vcpu_id != 0 {
+                self.ap_exits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let Some(ExitValue::Mmio {
+            phys_addr,
+            is_write: true,
+            data,
+            ..
+        }) = record.value
+        else {
+            return;
+        };
+        let Ok(bytes) = <[u8; 4]>::try_from(data.as_bytes()) else {
+            return;
+        };
+        let value = u32::from_le_bytes(bytes);
+        for w in &self.windows {
+            let len = w.len.load(Ordering::Relaxed);
+            let Some(off) = phys_addr.checked_sub(w.base.load(Ordering::Relaxed)) else {
+                continue;
+            };
+            if len == 0 || off >= len {
+                continue;
+            }
+            if off == reg::STATUS {
+                w.status_writes.fetch_add(1, Ordering::Relaxed);
+                if value & STATUS_FAILED != 0 {
+                    w.failed_writes.fetch_add(1, Ordering::Relaxed);
+                }
+                if value & STATUS_DRIVER_OK != 0 {
+                    let _ = w.driver_ok_first.compare_exchange(
+                        NO_VALUE,
+                        u64::from(value),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
+            } else if off == reg::QUEUE_READY && value == 1 {
+                w.queue_ready_one.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn wants_values(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn synthetic_mmio_write(vcpu_id: u32, addr: u64, value: u32) -> RunRecord {
+    RunRecord {
+        vcpu_id,
+        outcome: RunOutcome::Exit("mmio"),
+        elapsed: Duration::ZERO,
+        value: Some(ExitValue::Mmio {
+            phys_addr: addr,
+            len: 4,
+            is_write: true,
+            data: ExitData::from_slice(&value.to_le_bytes()),
+        }),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[test]
+fn mvm1_3865_observer_counts_status_and_queue_ready() {
+    let obs = VirtioWindowObserver::new();
+    let (blk, net) = (0xd000_0000u64, 0xd000_1000u64);
+    obs.bind(VirtioDeviceKind::Block, blk, 0x1000);
+    obs.bind(VirtioDeviceKind::Net, net, 0x1000);
+    // 窓の外・読み出し・値なしは数えない。
+    obs.record(&synthetic_mmio_write(0, 0xd000_2000 + reg::STATUS, 0x0F));
+    obs.record(&synthetic_mmio_write(0, 0xcfff_f000, 0x0F));
+    let mut read = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
+    if let Some(ExitValue::Mmio { is_write, .. }) = read.value.as_mut() {
+        *is_write = false;
+    }
+    obs.record(&read);
+    let mut none = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
+    none.value = None;
+    obs.record(&none);
+    let zero = WindowStats {
+        driver_ok_first: None,
+        failed_writes: 0,
+        status_writes: 0,
+        queue_ready_one: 0,
+    };
+    assert_eq!(obs.stats(VirtioDeviceKind::Block), zero);
+    assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
+    // block: ACK→DRIVER→FEATURES_OK→DRIVER_OK の順。DRIVER_OK を含む最初の値が残る。
+    for v in [0u32, 1, 3, 11, 15, 0x8F] {
+        obs.record(&synthetic_mmio_write(0, blk + reg::STATUS, v));
+    }
+    obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 1));
+    obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 0));
+    assert_eq!(
+        obs.stats(VirtioDeviceKind::Block),
+        WindowStats {
+            driver_ok_first: Some(0x0F),
+            failed_writes: 1,
+            status_writes: 6,
+            queue_ready_one: 1,
+        }
+    );
+    // net の窓は取り違えない。
+    assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
+    obs.record(&synthetic_mmio_write(1, net + reg::QUEUE_READY, 1));
+    obs.record(&synthetic_mmio_write(0, net + reg::QUEUE_READY, 1));
+    assert_eq!(obs.stats(VirtioDeviceKind::Net).queue_ready_one, 2);
+    assert_eq!(obs.stats(VirtioDeviceKind::Block).queue_ready_one, 1);
+    assert_eq!(obs.ap_exits.load(Ordering::Relaxed), 1);
 }
 
 /// `uart_report_port` の行から読んだアドレス（Linux v6.12 `drivers/tty/serial/serial_core.c`）。
@@ -296,17 +523,15 @@ mod tty_report_tests {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::{
-        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, count_lines_ending_with,
-        count_marker_lines, escape_tail,
+        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, NET_MAC,
+        VirtioWindowObserver, count_lines_ending_with, count_marker_lines, escape_tail,
     };
-    use fandhe_container_microvm::device::{KvmDevice, RunObserver, RunOutcome, RunRecord};
+    use fandhe_container_microvm::device::{KvmDevice, RunObserver};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
-    use fandhe_container_microvm::exit::{ExitData, ExitValue};
     use fandhe_container_microvm::microvm::{
         MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VirtioDeviceKind,
     };
     use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
-    use fandhe_container_microvm::virtio_mmio::reg;
     use fandhe_container_microvm::virtio_net::{MAX_MEMORY_FRAMES, MemoryNetBackend, NetBackend};
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -434,140 +659,6 @@ mod x86 {
                 self.timed_out,
                 escape_tail(&self.output, TAIL_BYTES)
             )
-        }
-    }
-
-    /// MMIO の窓 1 つ分の観測値（virtio-mmio の STATUS・QUEUE_READY への書き込み）。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct WindowStats {
-        /// DRIVER_OK を含む最初の STATUS 書き込みの値。
-        driver_ok_first: Option<u32>,
-        /// FAILED を含む STATUS 書き込みの件数。
-        failed_writes: u64,
-        /// STATUS への 4 バイト書き込みの総数。
-        status_writes: u64,
-        /// QUEUE_READY へ値 1 を書いた回数。
-        queue_ready_one: u64,
-    }
-
-    /// 窓 1 つ分の atomic カウンタ（`len == 0` は未設定）。
-    #[derive(Debug, Default)]
-    struct Window {
-        base: AtomicU64,
-        len: AtomicU64,
-        driver_ok_first: AtomicU64,
-        failed_writes: AtomicU64,
-        status_writes: AtomicU64,
-        queue_ready_one: AtomicU64,
-    }
-
-    const NO_VALUE: u64 = u64::MAX;
-    /// virtio 仕様 2.1 の Device Status ビット（DRIVER_OK = 4・FAILED = 128）。
-    const STATUS_DRIVER_OK: u32 = 4;
-    const STATUS_FAILED: u32 = 128;
-    /// virtio-net に見せる固定の locally administered なダミー MAC。
-    const NET_MAC: [u8; 6] = [0x02, 0xfc, 0x00, 0x00, 0x38, 0x65];
-
-    fn window_index(kind: VirtioDeviceKind) -> usize {
-        match kind {
-            VirtioDeviceKind::Block => 0,
-            _ => 1,
-        }
-    }
-
-    /// vCPU スレッドから同期で呼ばれ、virtio-mmio の窓への書き込みを atomic で数える観測器（#3865・MVM-1）。
-    /// `record` では割り当ても待ちもしない。値はゲスト由来（untrusted）で、範囲外は数えるだけにする。
-    #[derive(Debug)]
-    struct VirtioWindowObserver {
-        /// 0 = virtio-block、1 = virtio-net。
-        windows: [Window; 2],
-        exits: AtomicU64,
-        /// vCPU 0 以外（AP）の exit 件数（診断用）。
-        ap_exits: AtomicU64,
-    }
-
-    impl VirtioWindowObserver {
-        fn new() -> Self {
-            let obs = Self {
-                windows: [Window::default(), Window::default()],
-                exits: AtomicU64::new(0),
-                ap_exits: AtomicU64::new(0),
-            };
-            for w in &obs.windows {
-                w.driver_ok_first.store(NO_VALUE, Ordering::Relaxed);
-            }
-            obs
-        }
-
-        fn bind(&self, kind: VirtioDeviceKind, base: u64, len: u64) {
-            if let Some(w) = self.windows.get(window_index(kind)) {
-                w.base.store(base, Ordering::Relaxed);
-                w.len.store(len, Ordering::Relaxed);
-            }
-        }
-
-        fn stats(&self, kind: VirtioDeviceKind) -> WindowStats {
-            let w = &self.windows[window_index(kind)];
-            let first = w.driver_ok_first.load(Ordering::Relaxed);
-            WindowStats {
-                driver_ok_first: u32::try_from(first).ok(),
-                failed_writes: w.failed_writes.load(Ordering::Relaxed),
-                status_writes: w.status_writes.load(Ordering::Relaxed),
-                queue_ready_one: w.queue_ready_one.load(Ordering::Relaxed),
-            }
-        }
-    }
-
-    impl RunObserver for VirtioWindowObserver {
-        fn record(&self, record: &RunRecord) {
-            if let RunOutcome::Exit(_) = record.outcome {
-                self.exits.fetch_add(1, Ordering::Relaxed);
-                if record.vcpu_id != 0 {
-                    self.ap_exits.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            let Some(ExitValue::Mmio {
-                phys_addr,
-                is_write: true,
-                data,
-                ..
-            }) = record.value
-            else {
-                return;
-            };
-            let Ok(bytes) = <[u8; 4]>::try_from(data.as_bytes()) else {
-                return;
-            };
-            let value = u32::from_le_bytes(bytes);
-            for w in &self.windows {
-                let len = w.len.load(Ordering::Relaxed);
-                let Some(off) = phys_addr.checked_sub(w.base.load(Ordering::Relaxed)) else {
-                    continue;
-                };
-                if len == 0 || off >= len {
-                    continue;
-                }
-                if off == reg::STATUS {
-                    w.status_writes.fetch_add(1, Ordering::Relaxed);
-                    if value & STATUS_FAILED != 0 {
-                        w.failed_writes.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if value & STATUS_DRIVER_OK != 0 {
-                        let _ = w.driver_ok_first.compare_exchange(
-                            NO_VALUE,
-                            u64::from(value),
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                    }
-                } else if off == reg::QUEUE_READY && value == 1 {
-                    w.queue_ready_one.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        fn wants_values(&self) -> bool {
-            true
         }
     }
 
@@ -1316,69 +1407,6 @@ mod x86 {
         b.iter().take(n).map(|x| format!("{x:02x}")).collect()
     }
 
-    fn synthetic_mmio_write(vcpu_id: u32, addr: u64, value: u32) -> RunRecord {
-        RunRecord {
-            vcpu_id,
-            outcome: RunOutcome::Exit("mmio"),
-            elapsed: Duration::ZERO,
-            value: Some(ExitValue::Mmio {
-                phys_addr: addr,
-                len: 4,
-                is_write: true,
-                data: ExitData::from_slice(&value.to_le_bytes()),
-            }),
-        }
-    }
-
-    #[test]
-    fn mvm1_3865_observer_counts_status_and_queue_ready() {
-        let obs = VirtioWindowObserver::new();
-        let (blk, net) = (0xd000_0000u64, 0xd000_1000u64);
-        obs.bind(VirtioDeviceKind::Block, blk, 0x1000);
-        obs.bind(VirtioDeviceKind::Net, net, 0x1000);
-        // 窓の外・読み出し・値なしは数えない。
-        obs.record(&synthetic_mmio_write(0, 0xd000_2000 + reg::STATUS, 0x0F));
-        obs.record(&synthetic_mmio_write(0, 0xcfff_f000, 0x0F));
-        let mut read = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
-        if let Some(ExitValue::Mmio { is_write, .. }) = read.value.as_mut() {
-            *is_write = false;
-        }
-        obs.record(&read);
-        let mut none = synthetic_mmio_write(0, blk + reg::STATUS, 0x0F);
-        none.value = None;
-        obs.record(&none);
-        let zero = WindowStats {
-            driver_ok_first: None,
-            failed_writes: 0,
-            status_writes: 0,
-            queue_ready_one: 0,
-        };
-        assert_eq!(obs.stats(VirtioDeviceKind::Block), zero);
-        assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
-        // block: ACK→DRIVER→FEATURES_OK→DRIVER_OK の順。DRIVER_OK を含む最初の値が残る。
-        for v in [0u32, 1, 3, 11, 15, 0x8F] {
-            obs.record(&synthetic_mmio_write(0, blk + reg::STATUS, v));
-        }
-        obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 1));
-        obs.record(&synthetic_mmio_write(0, blk + reg::QUEUE_READY, 0));
-        assert_eq!(
-            obs.stats(VirtioDeviceKind::Block),
-            WindowStats {
-                driver_ok_first: Some(0x0F),
-                failed_writes: 1,
-                status_writes: 6,
-                queue_ready_one: 1,
-            }
-        );
-        // net の窓は取り違えない。
-        assert_eq!(obs.stats(VirtioDeviceKind::Net), zero);
-        obs.record(&synthetic_mmio_write(1, net + reg::QUEUE_READY, 1));
-        obs.record(&synthetic_mmio_write(0, net + reg::QUEUE_READY, 1));
-        assert_eq!(obs.stats(VirtioDeviceKind::Net).queue_ready_one, 2);
-        assert_eq!(obs.stats(VirtioDeviceKind::Block).queue_ready_one, 1);
-        assert_eq!(obs.ap_exits.load(Ordering::Relaxed), 1);
-    }
-
     #[test]
     fn mvm1_3865_counting_block_backend() {
         let (mut b, c) = CountingBlockBackend::new(4096);
@@ -1672,19 +1700,22 @@ mod x86 {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::{
-        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, TtyAddress, TtyReport,
-        count_lines_ending_with, count_marker_lines, escape_tail, parse_tty_report,
+        BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, NET_MAC, TtyAddress,
+        TtyReport, VirtioWindowObserver, count_lines_ending_with, count_marker_lines, escape_tail,
+        parse_tty_report,
     };
     use fandhe_container_microvm::arm64_layout::ARM64_SERIAL_BASE;
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
-    use fandhe_container_microvm::device::KvmDevice;
-    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::device::{KvmDevice, RunObserver};
+    use fandhe_container_microvm::microvm::{
+        MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VirtioDeviceKind,
+    };
     use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     /// `panic=` を含まない無害な既定値。x86 の `reboot=t` は arm64 に当たらない。`console=ttyS0` は FDT の `ns16550a`
@@ -1850,6 +1881,10 @@ mod arm64 {
         uart_dropped: u64,
         timed_out: bool,
         elapsed: Duration,
+        /// 組み立て済みの virtio-net の台数（#3957。負の対照で「net が無い」ことの裏づけ）。
+        net_slots: usize,
+        /// 組み立て済みの virtio-block の台数（#3957）。
+        block_slots: usize,
     }
 
     impl Outcome {
@@ -1876,16 +1911,40 @@ mod arm64 {
         boot_timeout: Duration,
         vcpus: u32,
         block: Vec<MemoryBlockBackend>,
+        net: Vec<NetDeviceConfig<MemoryNetBackend>>,
+        observer: Option<Arc<VirtioWindowObserver>>,
     ) -> Result<Outcome, String> {
         let started = Instant::now();
+        let vcpu_n = usize::try_from(vcpus).unwrap_or(0);
         let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
             vcpu_count: vcpus,
             mem_size: RAM_SIZE,
             block,
-            net: vec![],
+            net,
         };
         let mut vm =
             MicroVm::assemble(&inp.dev, config).map_err(|e| format!("assemble failed: {e}"))?;
+        let devices = vm.devices();
+        let net_slots = devices
+            .iter()
+            .filter(|d| d.slot.kind == VirtioDeviceKind::Net)
+            .count();
+        let block_slots = devices
+            .iter()
+            .filter(|d| d.slot.kind == VirtioDeviceKind::Block)
+            .count();
+        if let Some(obs) = &observer {
+            // アドレスは直書きせず、組み立て済みの配置から取る。start は MicroVm を消費するので観測は start の前に付ける。
+            for info in &devices {
+                obs.bind(info.slot.kind, info.slot.mmio_base, info.slot.mmio_len);
+            }
+            let dynobs: Arc<dyn RunObserver> = obs.clone();
+            for i in 0..vcpu_n {
+                if let Some(v) = vm.vcpu_mut(i) {
+                    v.set_observer(dynobs.clone());
+                }
+            }
+        }
         let loaded = vm
             .load_kernel(&inp.kernel, inp.initrd.as_deref(), &cmdline)
             .map_err(|e| format!("load_kernel failed: {e}"))?;
@@ -1936,6 +1995,8 @@ mod arm64 {
             uart_dropped,
             timed_out,
             elapsed: started.elapsed(),
+            net_slots,
+            block_slots,
         })
     }
 
@@ -1945,12 +2006,22 @@ mod arm64 {
         cmdline: String,
         vcpus: u32,
         block: Vec<MemoryBlockBackend>,
+        net: Vec<NetDeviceConfig<MemoryNetBackend>>,
+        observer: Option<Arc<VirtioWindowObserver>>,
     ) -> (Outcome, Duration) {
         let secs = inp.secs;
         let boot_timeout = Duration::from_secs(secs);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(boot(inp, cmdline, boot_timeout, vcpus, block));
+            let _ = tx.send(boot(
+                inp,
+                cmdline,
+                boot_timeout,
+                vcpus,
+                block,
+                net,
+                observer,
+            ));
         });
         match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
             Ok(Ok(o)) => (o, boot_timeout),
@@ -1965,7 +2036,7 @@ mod arm64 {
     fn kernel_boot_real_kernel_reaches_init_and_shuts_down() {
         let inp = inputs(InitrdKind::Default);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline, 1, vec![]);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1, vec![], vec![], None);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
@@ -2009,7 +2080,7 @@ mod arm64 {
     fn kernel_boot_without_initrd_does_not_shut_down() {
         let inp = inputs(InitrdKind::None);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, _) = run_boot(inp, cmdline, 1, vec![]);
+        let (o, _) = run_boot(inp, cmdline, 1, vec![], vec![], None);
         let diag = o.diag();
         assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
@@ -2041,7 +2112,7 @@ mod arm64 {
     fn run_block_read(block: Vec<MemoryBlockBackend>, expect: &str, other: &str, case: &str) {
         let inp = inputs(InitrdKind::BlockRead);
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline, 1, block);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1, block, vec![], None);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
@@ -2120,6 +2191,128 @@ mod arm64 {
         assert_eq!(l.virtio_spi_trigger, IrqTrigger::EdgeRising);
     }
 
+    /// arm64 の virtio-net 試験の失敗時の切り分け（#3957）。カウンタが 0 のとき guest カーネルの設定を疑う。
+    const KCONFIG_HINT: &str = "if net counters are zero, check the guest kernel config: CONFIG_NET, CONFIG_NETDEVICES, CONFIG_VIRTIO_MMIO, CONFIG_VIRTIO_NET (virtio-mmio is discovered via the FDT, so CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not needed)";
+
+    /// virtio-net 用の backend 1 台分の構成（固定 MAC `NET_MAC`）。
+    fn net_config() -> NetDeviceConfig<MemoryNetBackend> {
+        NetDeviceConfig {
+            backend: MemoryNetBackend::new(),
+            mac: NET_MAC,
+        }
+    }
+
+    /// 既定の initrd（`MARKER` を出して reboot する版）の起動の共通照合（#3957）。
+    fn assert_default_boot_ok(o: &Outcome, boot_timeout: Duration, diag: &str) {
+        assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+        assert_eq!(o.origin_vcpu, Some(0), "origin vcpu: {diag}");
+        assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+        assert_eq!(o.errors, 0, "run errors: {diag}");
+        assert!(!o.timed_out, "boot timed out: {diag}");
+        assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            1,
+            "init marker must appear exactly once: {diag}"
+        );
+        assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    }
+
+    /// virtio-net 1 台の陽性（#3957・MVM-1・REPAIR-12）。ドライバの probe が DRIVER_OK `0x0F` まで進み、receiveq・transmitq の
+    /// 2 本が QUEUE_READY になることを照合する。既定の initrd には interface を上げる userspace が無いので RX・TX は照合しない
+    /// （net-tx・net-rx の aarch64 版は別 issue）。割り込みは FDT の既定の edge-rising の SPI。
+    /// Agent は実カーネルで未確認。実機の記録は #3781。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_net_reaches_driver_ok() {
+        let inp = inputs(InitrdKind::Default);
+        let cmdline = force_panic_zero(&inp.cmdline);
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let (o, boot_timeout) = run_boot(
+            inp,
+            cmdline,
+            1,
+            vec![],
+            vec![net_config()],
+            Some(obs.clone()),
+        );
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let diag = format!(
+            "{} net={s:?} net_slots={} hint=\"{KCONFIG_HINT}\"",
+            o.diag(),
+            o.net_slots
+        );
+        assert_default_boot_ok(&o, boot_timeout, &diag);
+        assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
+        assert_eq!(s.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        eprintln!(
+            "kernel_boot: ok arch=aarch64 case=virtio_net driver_ok=0x0f queue_ready=2 elapsed_ms={} exits={}",
+            o.elapsed.as_millis(),
+            o.exits
+        );
+    }
+
+    /// 負の対照（#3957）。net 0 台で観測器だけ付けると、組み立て済みの net が 0 件で、net の窓の観測値が全部 0 になる。
+    /// 陽性の DRIVER_OK が net デバイス由来であることを裏づけるため、陽性と同じ実行（`--test-threads=1`）で回すこと。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_without_virtio_net_reports_no_driver_ok() {
+        let inp = inputs(InitrdKind::Default);
+        let cmdline = force_panic_zero(&inp.cmdline);
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let (o, boot_timeout) = run_boot(inp, cmdline, 1, vec![], vec![], Some(obs.clone()));
+        let s = obs.stats(VirtioDeviceKind::Net);
+        let diag = format!("{} net={s:?} net_slots={}", o.diag(), o.net_slots);
+        assert_default_boot_ok(&o, boot_timeout, &diag);
+        assert_eq!(o.net_slots, 0, "assembled net devices: {diag}");
+        assert_eq!(s.driver_ok_first, None, "net DRIVER_OK: {diag}");
+        assert_eq!(s.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(s.status_writes, 0, "net STATUS writes: {diag}");
+        assert_eq!(s.queue_ready_one, 0, "net QUEUE_READY=1 count: {diag}");
+    }
+
+    /// block 1 台と net 1 台を同時に付けた窓の区別（#3957）。FDT の block → net の順と SPI の割り当てが窓を取り違えず、
+    /// block は QUEUE_READY 1 回、net は 2 回で、どちらも DRIVER_OK `0x0F`・FAILED 0 件になることを照合する。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_with_virtio_block_and_net_reaches_driver_ok() {
+        let inp = inputs(InitrdKind::Default);
+        let cmdline = force_panic_zero(&inp.cmdline);
+        let obs = Arc::new(VirtioWindowObserver::new());
+        let (o, boot_timeout) = run_boot(
+            inp,
+            cmdline,
+            1,
+            vec![block_backend(None)],
+            vec![net_config()],
+            Some(obs.clone()),
+        );
+        let b = obs.stats(VirtioDeviceKind::Block);
+        let n = obs.stats(VirtioDeviceKind::Net);
+        let diag = format!(
+            "{} block={b:?} net={n:?} block_slots={} net_slots={} hint=\"{KCONFIG_HINT}\"",
+            o.diag(),
+            o.block_slots,
+            o.net_slots
+        );
+        assert_default_boot_ok(&o, boot_timeout, &diag);
+        assert_eq!(o.block_slots, 1, "assembled block devices: {diag}");
+        assert_eq!(o.net_slots, 1, "assembled net devices: {diag}");
+        assert_eq!(b.driver_ok_first, Some(0x0F), "block DRIVER_OK: {diag}");
+        assert_eq!(b.failed_writes, 0, "block FAILED writes: {diag}");
+        assert_eq!(b.queue_ready_one, 1, "block QUEUE_READY=1 count: {diag}");
+        assert_eq!(n.driver_ok_first, Some(0x0F), "net DRIVER_OK: {diag}");
+        assert_eq!(n.failed_writes, 0, "net FAILED writes: {diag}");
+        assert_eq!(n.queue_ready_one, 2, "net QUEUE_READY=1 count: {diag}");
+        eprintln!(
+            "kernel_boot: ok arch=aarch64 case=virtio_block_and_net block_queue_ready=1 net_queue_ready=2 elapsed_ms={} exits={}",
+            o.elapsed.as_millis(),
+            o.exits
+        );
+    }
+
     /// MVM-1・#3947: initrd の種類ごとの環境変数名・既定パス、sentinel つき backend の読み戻し。
     #[test]
     fn mvm1_3947_arm64_block_initrd_paths_and_backend() {
@@ -2181,7 +2374,7 @@ mod arm64 {
             ));
         }
         let cmdline = force_panic_zero(&inp.cmdline);
-        let (o, boot_timeout) = run_boot(inp, cmdline, 2, vec![]);
+        let (o, boot_timeout) = run_boot(inp, cmdline, 2, vec![], vec![], None);
         let diag = o.diag();
         assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
         // reboot は CPU 0 から行われる（`migrate_to_reboot_cpu`）。

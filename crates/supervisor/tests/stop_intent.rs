@@ -6,9 +6,11 @@
 //! 具体値で照合する。対照として、意図を立てない `ControlSignaler::new`（kind 2。将来の `kill`）の SIGTERM では
 //! `always` が再 launch されることも照合する。
 //!
-//! #2440: 明示 stop は state.json の `Stopped` の記録へ残ることを、実 `FileStateStore` で読み直して照合する。バックオフ・再 launch
-//! の保留中は、実 UDS の CancelRestartRequest（`ControlRestartCanceller`）で再起動を取り消せることと、稼働中・届く先の無い
-//! コンテナへの取り消しの結果も照合する。
+//! #2440: 明示 stop は state.json の `Stopped` の記録へ残ることを、実 `FileStateStore` で読み直して照合する。終了の記録の
+//! 直後・再起動の判定より前（[`ExitRecordGate`] で監視スレッドを保留する）に、実 UDS の CancelRestartRequest
+//! （`ControlRestartCanceller`）で再起動を取り消せることと、稼働中・届く先の無いコンテナへの取り消しの結果も照合する。
+//! 再 launch の間は制御チャネルの accept が止まる（#2043）ため、保留を再 launch の中に置くと取り消しは resume まで
+//! backlog で待たされて期限切れになる（#3961）。そのため保留は再 launch ではなく終了記録の直後に置く。
 //!
 //! コンテナ役は SIGTERM を受けたら次の `wait` で `Signaled(15)` を返す模擬の起動ハンドルで、namespace・cgroup は
 //! 含まない。root 不要で既定のテスト集合で動く。`FileStateStore` は Linux 限定のため全体を Linux に限る。
@@ -26,8 +28,9 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit, StartTimeouts};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, CreateStateRequest, ErrorCode, ExplicitStop,
-    Signal, StateStore, SupervisionState, TraitError,
+    ContainerId, ContainerState, ContainerStatus, CreateStateRequest, DeleteStateRequest,
+    DeleteStateResponse, ErrorCode, ExplicitStop, GetStateRequest, ListStateRequest, Signal,
+    StateList, StateRecord, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
 use fandhe_container_supervisor::control::{
     CancelOutcome, ControlRestartCanceller, ControlSignaler, PendingRestartCanceller, install,
@@ -115,26 +118,53 @@ impl Relauncher for CountingRelauncher {
     }
 }
 
-/// 試験側が開けるまで `relaunch` を保留する再 launch（再 launch 中の保留状態を決定的に作る）。
-struct GatedRelauncher {
-    inner: CountingRelauncher,
+/// 終了記録（`Stopped` で明示 stop 未記録）の書き込みが内側のストアで終わった直後に、試験側が開けるまで
+/// 監視スレッドを保留する `StateStore`（#3961・SUP-9・SUP-3・#2440）。
+///
+/// `run_supervised` の restart ループは終了を検知すると `mark_exited` と記録の後にバックオフし、再 launch の間は
+/// 制御チャネルの accept を止める（#2043）。再 launch の中で保留すると取り消し要求が backlog で待たされ期限切れに
+/// なるため、accept が動き、スロットが `Exited` で、バックオフ・再 launch・pause の前である本位置で止める。
+/// 内側の `update` が返った後なので `FileStateStore` のロックは持たない。保留は 1 回限りで、期限つき（REPAIR-5）。
+struct ExitRecordGate {
+    inner: Arc<dyn StateStore>,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    held: AtomicBool,
 }
 
-impl Relauncher for GatedRelauncher {
-    fn relaunch(&self, timeout: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        let (lock, cv) = &*self.gate;
-        let end = Instant::now() + Duration::from_secs(8);
-        let mut open = lock.lock().unwrap();
-        while !*open {
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
+impl StateStore for ExitRecordGate {
+    fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.create(req)
+    }
+    fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+        let rec = self.inner.update(req)?;
+        if rec.status().state() == ContainerState::Stopped
+            && rec.explicit_stop() == ExplicitStop::NotRecorded
+            && !self.held.swap(true, Ordering::SeqCst)
+        {
+            let (lock, cv) = &*self.gate;
+            let end = Instant::now() + Duration::from_secs(8);
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                open = cv.wait_timeout(open, left).unwrap().0;
             }
-            open = cv.wait_timeout(open, left).unwrap().0;
         }
-        drop(open);
-        self.inner.relaunch(timeout)
+        Ok(rec)
+    }
+    fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        self.inner.get(req)
+    }
+    fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+        self.inner.list(req)
+    }
+    fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        self.inner.delete(req)
+    }
+    fn host_state_root(&self) -> Option<&std::path::Path> {
+        self.inner.host_state_root()
     }
 }
 
@@ -156,7 +186,7 @@ fn start(tag: &str, policy: &str) -> Rig {
     start_with(tag, policy, false)
 }
 
-/// `gated` なら再 launch を [`Rig::open_gate`] まで保留する。
+/// `gated` なら終了記録の直後で監視スレッドを [`Rig::open_gate`] まで保留する（[`ExitRecordGate`]）。
 fn start_with(tag: &str, policy: &str, gated: bool) -> Rig {
     let tmp = TmpRoot::new(tag);
     let root = tmp.0.join("state");
@@ -190,12 +220,15 @@ fn start_with(tag: &str, policy: &str, gated: bool) -> Rig {
         signals: Arc::clone(&signals),
     };
     let gate = gated.then(|| Arc::new((Mutex::new(false), Condvar::new())));
-    let relauncher: Arc<dyn Relauncher> = match &gate {
-        Some(gate) => Arc::new(GatedRelauncher {
-            inner: counting,
+    let relauncher: Arc<dyn Relauncher> = Arc::new(counting);
+    // 監視スレッドへ渡す store だけを包む。試験側の読み取り（`Rig.store`）は止めない。
+    let w_store_arc: Arc<dyn StateStore> = match &gate {
+        Some(gate) => Arc::new(ExitRecordGate {
+            inner: Arc::clone(&store),
             gate: Arc::clone(gate),
+            held: AtomicBool::new(false),
         }),
-        None => Arc::new(counting),
+        None => Arc::clone(&store),
     };
     let running = Running {
         process: Box::new(Sim {
@@ -213,7 +246,7 @@ fn start_with(tag: &str, policy: &str, gated: bool) -> Rig {
 
     let policy: RestartPolicy = policy.parse().unwrap();
     let (tx, exit) = channel();
-    let (w_store, w_id, w_stop) = (Arc::clone(&store), id.clone(), stop.clone());
+    let (w_store, w_id, w_stop) = (w_store_arc, id.clone(), stop.clone());
     let worker = std::thread::spawn(move || {
         let code = run_supervised(
             w_store,
@@ -266,7 +299,7 @@ impl Rig {
         }
     }
 
-    /// 保留中の再 launch を進める（`start_with(.., true)` のときだけ意味がある）。
+    /// 保留中の監視スレッドを進める（`start_with(.., true)` のときだけ意味がある）。
     fn open_gate(&self) {
         if let Some(gate) = &self.gate {
             *gate.0.lock().unwrap() = true;
@@ -378,10 +411,11 @@ fn sup9_sec1_pid_mismatch_stop_does_not_mark_intent() {
         .unwrap();
     assert_eq!(rig.exit_code(), 0);
 }
-/// SUP-9・SUP-3・#2440: 終了の検知後（バックオフ中または再 launch の保留中）の stop は、実 UDS の取り消し要求で
-/// 保留中の再起動を取り消し、`always`・`on-failure`・`unless-stopped` のどれでも以後 restart しない。supervisor は 0 で終わり、
-/// 記録は `Stopped`・`restart_count` 0・pid なしで、state.json に「明示 stop 済み」が残る。保留した再 launch が後から
-/// 新しいプロセス（pid 301）を返しても、それは terminate されて記録に載らない。
+/// SUP-9・SUP-3・#2440・#3961: 終了の記録の後・再起動の判定より前（監視スレッドを [`ExitRecordGate`] で保留）の stop は、
+/// 実 UDS の取り消し要求で保留中の再起動を取り消し、`always`・`on-failure`・`unless-stopped` のどれでも以後 restart
+/// しない。supervisor は 0 で終わり、記録は `Stopped`・`restart_count` 0・pid なしで、state.json に「明示 stop 済み」が
+/// 残る。再 launch の最中の取り消し（resume から登録まで）はこの rig では作れず、restart.rs・control/target.rs の
+/// 単体試験が担う。
 #[test]
 fn sup9_sup3_cancel_during_pending_restart_prevents_restart_under_every_policy() {
     for policy in ["always", "on-failure", "unless-stopped"] {
@@ -392,9 +426,14 @@ fn sup9_sup3_cancel_during_pending_restart_prevents_restart_under_every_policy()
         rig.wait_record(|r| r.0 == ContainerState::Stopped && r.1 == Some(143));
         assert_eq!(rig.explicit(), ExplicitStop::NotRecorded, "{policy}");
 
-        assert_eq!(rig.cancel().unwrap(), CancelOutcome::Cancelled, "{policy}");
+        assert_eq!(
+            rig.cancel().unwrap_or_else(|e| panic!("{policy}: {e:?}")),
+            CancelOutcome::Cancelled,
+            "{policy}"
+        );
         rig.open_gate();
         assert_eq!(rig.exit_code(), 0, "{policy}");
+        assert_eq!(rig.relaunches.load(Ordering::SeqCst), 0, "{policy}");
         assert_eq!(
             rig.record(),
             (ContainerState::Stopped, Some(143), 0, None),
@@ -406,7 +445,7 @@ fn sup9_sup3_cancel_during_pending_restart_prevents_restart_under_every_policy()
             ExplicitStopState::Requested,
             "{policy}"
         );
-        // 再 launch に入っていたとしても、新しいプロセス（301）は terminate されるだけで SIGTERM は受けない。
+        // 再 launch に入らないので、SIGTERM は最初の 1 回（pid 100）だけ。
         assert_eq!(*rig.signals.lock().unwrap(), vec![(100, 15)], "{policy}");
         // 再 launch・re-adopt の判定: 記録を読み直して渡すと、unless-stopped は起こさず always は起こす。
         let record = SupervisedState::attach(Arc::clone(&rig.store), rig.id.clone()).unwrap();

@@ -125,6 +125,8 @@ pub enum HvOp {
     GicGetSpiInterruptRange,
     /// `hv_gic_get_intid`（macOS 15 以降。TASK-192.3・#3789）。
     GicGetIntid,
+    /// `hv_gic_get_distributor_reg`（macOS 15 以降。任意のシンボル。#3960・MVM-5）。
+    GicGetDistributorReg,
 }
 
 impl HvOp {
@@ -158,6 +160,7 @@ impl HvOp {
             HvOp::GicGetRedistributorBaseAlignment => "hv_gic_get_redistributor_base_alignment",
             HvOp::GicGetSpiInterruptRange => "hv_gic_get_spi_interrupt_range",
             HvOp::GicGetIntid => "hv_gic_get_intid",
+            HvOp::GicGetDistributorReg => "hv_gic_get_distributor_reg",
         }
     }
 }
@@ -717,6 +720,74 @@ impl GicIntid {
     pub const fn get(self) -> u32 {
         self.0
     }
+}
+
+/// `hv_gic_distributor_reg_t` の列挙値（`GICD_IROUTER<n>` のみ。#3960・MVM-5・REPAIR-2）。
+///
+/// Apple の文書は、列挙値が ARM GICv3 仕様の distributor のレジスタオフセットに等しいと述べる
+/// （`hv_gic_get_distributor_reg`。macOS 15.0）。型の幅は `uint16_t`（`hv_gic_distributor_reg_t` の `rawValue` は `UInt16`）。
+/// 構築口は [`Self::irouter`] だけで、SPI の範囲外の INTID は作れない（壊れた値を表現できない）。
+/// 出典: <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・
+/// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
+/// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>（確認日 2026-11-05）。
+/// SDK ヘッダとの照合は #3803。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GicDistributorReg(u16);
+
+/// `GICD_IROUTER<n>` の先頭オフセット（Arm IHI 0069。IROUTER32 は 0x6100 = 0x6000 + 8 × 32）。
+const GICD_IROUTER_BASE: u32 = 0x6000;
+/// SPI の INTID の最小値（INTID 32 以降）。
+const GIC_SPI_MIN_INTID: u32 = 32;
+/// SPI の INTID の最大値（1019。1020 以降は特殊・LPI 等）。
+const GIC_SPI_MAX_INTID: u32 = 1019;
+
+impl GicDistributorReg {
+    /// `GICD_IROUTER<intid>` のレジスタ。SPI の範囲（32..=1019）の外は `InvalidArgument`。
+    pub fn irouter(intid: u32) -> Result<Self, MicrovmError> {
+        if !(GIC_SPI_MIN_INTID..=GIC_SPI_MAX_INTID).contains(&intid) {
+            return Err(invalid("irouter intid is outside the spi range"));
+        }
+        let off = intid
+            .checked_mul(8)
+            .and_then(|v| v.checked_add(GICD_IROUTER_BASE))
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or_else(|| invalid("irouter offset out of range"))?;
+        Ok(Self(off))
+    }
+
+    /// FFI へ渡す列挙値（distributor のレジスタオフセット）。
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// `GICD_IROUTER<n>` の復号結果（#3960・MVM-5）。値はゲストが書くので非信頼として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrouterRoute {
+    /// IRM = 0 で、宛先は 1 つの PE。値は Aff3:Aff2:Aff1:Aff0 を下位から 8 ビットずつ詰めた 32 ビット値
+    /// （`arm64_vcpu_mpidr_affinity` の形式に Aff3 を bit 24 以降へ足したもの）。
+    Affinity(u32),
+    /// IRM = 1（1-of-N。参加する任意の PE。宛先を 1 台に決められない）。
+    AnyParticipating,
+    /// RES0 が立っている（書式違反）。
+    Malformed,
+}
+
+/// `GICD_IROUTER<n>` の生値を復号する。Aff0 = bit 7:0・Aff1 = 15:8・Aff2 = 23:16・IRM = 31・Aff3 = 39:32（Arm IHI 0069）。
+/// 残りのビットは RES0。IRM = 1 のときの affinity フィールドは無視される（読み出しは 0 とは限らないため見ない）。
+pub fn decode_irouter(raw: u64) -> IrouterRoute {
+    const IRM: u64 = 1 << 31;
+    // 使うのは bit 23:0（Aff2:1:0）・bit 31（IRM）・bit 39:32（Aff3）だけ。
+    const RES0: u64 = !(0x00FF_FFFFu64 | IRM | (0xFFu64 << 32));
+    if raw & RES0 != 0 {
+        return IrouterRoute::Malformed;
+    }
+    if raw & IRM != 0 {
+        return IrouterRoute::AnyParticipating;
+    }
+    let aff012 = (raw & 0x00FF_FFFF) as u32;
+    let aff3 = ((raw >> 32) & 0xFF) as u32;
+    IrouterRoute::Affinity(aff012 | (aff3 << 24))
 }
 
 // ---- WFI の待ち時間の計算（TASK-192.14・#3796・MVM-5・MVM-1・REPAIR-5）----
@@ -1341,6 +1412,33 @@ mod tests {
         for raw in [&b"15.0"[..], b"15.1.1", b"26.0"] {
             assert!(check_gic_supported(parse_macos_product_version(raw).unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn mvm5_3960_irouter_offset_values() {
+        assert_eq!(GicDistributorReg::irouter(32).unwrap().bits(), 0x6100);
+        assert_eq!(GicDistributorReg::irouter(48).unwrap().bits(), 0x6180);
+        assert_eq!(GicDistributorReg::irouter(1019).unwrap().bits(), 0x7FD8);
+        for bad in [0, 31, 1020, u32::MAX] {
+            let e = GicDistributorReg::irouter(bad).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "irouter intid is outside the spi range");
+        }
+    }
+
+    #[test]
+    fn mvm5_3960_decode_irouter_values() {
+        assert_eq!(decode_irouter(0), IrouterRoute::Affinity(0));
+        assert_eq!(decode_irouter(0x103), IrouterRoute::Affinity(0x103));
+        assert_eq!(decode_irouter(0x8000_0000), IrouterRoute::AnyParticipating);
+        assert_eq!(
+            decode_irouter(0x0000_0001_0000_0002),
+            IrouterRoute::Affinity(0x0100_0002)
+        );
+        assert_eq!(decode_irouter(0x0100_0000), IrouterRoute::Malformed);
+        assert_eq!(decode_irouter(0x4000_0000), IrouterRoute::Malformed);
+        assert_eq!(decode_irouter(1 << 40), IrouterRoute::Malformed);
+        assert_eq!(decode_irouter(u64::MAX), IrouterRoute::Malformed);
     }
 
     #[test]

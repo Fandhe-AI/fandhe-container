@@ -606,7 +606,8 @@ jobs:
       # push（main）・workflow_dispatch では 3 OS で実行する: cfg(target_os) 限定の項目へのリンクは
       # OS ごとに解決結果が変わり、Linux では通るが macOS / Windows でだけ壊れる（またはその逆の）
       # リンクがあるため。pull_request では ubuntu のみのため、macOS / Windows でだけ壊れるリンクは
-      # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で検出する
+      # cross-target-check が aarch64-apple-darwin・x86_64-pc-windows-msvc 向けの cargo doc で、
+      # aarch64 Linux でだけ壊れる cfg(target_arch) 限定項目へのリンクは aarch64-unknown-linux-gnu 向けの cargo doc で検出する
       - name: cargo doc（既定 feature・-D warnings）
         if: env.HANG_PROBE != 'true'
         shell: bash
@@ -2770,7 +2771,10 @@ jobs:
   #   - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --target <target>`（make doc と同じ構成。
   #     cfg(target_os) 限定の項目へのリンクが OS ごとに解決結果を変えるため。REPAIR-3・#1300）
   # rustdoc はターゲット向けの型検査のみでリンクしないため、クロス実行でも SDK は不要。
-  # aarch64-unknown-linux-gnu は旧 aarch64-linux-check と同じ --all-features の check / clippy のみとする。
+  # aarch64-unknown-linux-gnu は旧 aarch64-linux-check と同じ --all-features の check / clippy に加え、
+  # 既定 feature の `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` も実行する。
+  # cfg(target_arch) 限定の項目（x86_64 専用の項目など）へのリンクが aarch64 Linux で壊れても PR で
+  # 見つかるようにするため（#3946・#3956・REPAIR-7・MVM-1）。既定 feature の clippy・-p 単独 clippy は未検査。
   # 未検査の範囲（REPAIR-3）: aarch64 Linux の既定 feature の構成・cfg(not(feature = "exec-test-support"))
   # 分岐（supervisor/tests/exec_setns_join.rs・core/tests/exec_child_setup.rs・
   # core/src/exec/reapply.rs の cfg_attr）・plugin を無効にした構成（--no-default-features）は
@@ -2813,6 +2817,10 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
+      - name: cargo doc（aarch64-unknown-linux-gnu・既定 feature・-D warnings）
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --target aarch64-unknown-linux-gnu
       - name: cargo check（aarch64-apple-darwin・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-apple-darwin
       - name: cargo clippy（aarch64-apple-darwin）

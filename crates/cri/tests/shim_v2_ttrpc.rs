@@ -404,6 +404,8 @@ fn cri5_invalid_header_write_failure_is_recorded() {
 
 /// "Slow" は取り消しまで待ち、"Fast" は即座に返す試験用サービス。
 struct BlockingSvc {
+    /// "Slow" が待ちループへ入ったことの印。停止や切断より前に dispatch 済みであることの確認に使う。
+    entered: Arc<std::sync::atomic::AtomicBool>,
     cancelled_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -425,6 +427,8 @@ impl TtrpcService for BlockingSvc {
         if method != "Slow" {
             return self.handle(method, payload);
         }
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let end = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < end {
             if cancelled() {
@@ -438,33 +442,65 @@ impl TtrpcService for BlockingSvc {
     }
 }
 
-fn start_blocking(
-    tag: &str,
-) -> (
-    test_root::TestRoot,
-    std::path::PathBuf,
-    ServerHandle,
-    Arc<std::sync::atomic::AtomicBool>,
-) {
+/// `start_blocking` の戻り値。`_root` は試験ディレクトリの寿命を保つために持つ。
+struct BlockingServer {
+    _root: test_root::TestRoot,
+    path: std::path::PathBuf,
+    handle: ServerHandle,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    cancelled_seen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// ハンドラの開始を待つ上限（REPAIR-5）。accept の刻み（50 ms）に対し遅い macOS ランナーでも
+/// 十分な余裕を持たせた値で、既定 `shutdown_timeout`（5 s）とは別物。CI の試験バイナリ watchdog
+/// （300 s）よりは十分短い。
+const HANDLER_ENTER_LIMIT: Duration = Duration::from_secs(10);
+
+/// `f` が真になるまで 10 ms 刻みで `limit` まで待つ。真になれば true、期限切れで false。
+fn wait_until(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    f()
+}
+
+fn start_blocking(tag: &str) -> BlockingServer {
     let root = test_root::test_root("ttrpc", tag);
     let path = root.join("s.sock");
     let listener = UnixListener::bind(&path).unwrap();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut reg = ServiceRegistry::new();
     reg.register(Arc::new(BlockingSvc {
+        entered: Arc::clone(&entered),
         cancelled_seen: Arc::clone(&seen),
     }))
     .unwrap();
-    let h = TtrpcServer::new(reg, ServerConfig::default())
+    let handle = TtrpcServer::new(reg, ServerConfig::default())
         .serve(listener)
         .unwrap();
-    (root, path, h, seen)
+    BlockingServer {
+        _root: root,
+        path,
+        handle,
+        entered,
+        cancelled_seen: seen,
+    }
 }
 
 /// 同じ接続で待ち中の要求が後続の要求を塞がない（CRI-5・TASK-62.3.2 の Create -> Wait -> Start）。
 #[test]
 fn cri5_pending_request_does_not_block_later_requests_on_same_connection() {
-    let (_root, path, h, _seen) = start_blocking("conc");
+    let BlockingServer {
+        _root,
+        path,
+        handle: h,
+        ..
+    } = start_blocking("conc");
     let mut c = connect(&path);
     send_req(&mut c, 1, "test.Blocking", "Slow");
     send_req(&mut c, 3, "test.Blocking", "Fast");
@@ -474,13 +510,27 @@ fn cri5_pending_request_does_not_block_later_requests_on_same_connection() {
     h.shutdown().unwrap();
 }
 
-/// 待ち中のハンドラへ停止要求が届き、shutdown が期限内に終わる（REPAIR-5）。
+/// 待ち中のハンドラへ停止要求が届き、shutdown が期限内に終わる（CRI-5・REPAIR-5・REPAIR-12・#3670）。
+///
+/// 停止時、未 accept の接続や読み取り途中のフレームの要求は dispatch されず応答なしで閉じる。
+/// 固定の sleep では dispatch 前に shutdown が走りうる（macOS で間欠失敗）ため、ハンドラの開始を
+/// 期限つきで確かめてから shutdown する。
 #[test]
 fn cri5_shutdown_cancels_pending_handler() {
-    let (_root, path, h, seen) = start_blocking("cancel");
+    let BlockingServer {
+        _root,
+        path,
+        handle: h,
+        entered,
+        cancelled_seen: seen,
+    } = start_blocking("cancel");
     let mut c = connect(&path);
     send_req(&mut c, 1, "test.Blocking", "Slow");
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        wait_until(HANDLER_ENTER_LIMIT, || entered
+            .load(std::sync::atomic::Ordering::SeqCst)),
+        "Slow handler did not start within {HANDLER_ENTER_LIMIT:?}"
+    );
     let t = std::time::Instant::now();
     h.shutdown().unwrap();
     assert!(t.elapsed() < Duration::from_secs(3));
@@ -492,18 +542,28 @@ fn cri5_shutdown_cancels_pending_handler() {
     assert_eq!((st.code, st.message.as_str()), (14, "cancelled"));
 }
 
-/// 接続が閉じたら待ち中のハンドラも取り消される。
+/// 接続が閉じたら待ち中のハンドラも取り消される（CRI-5・REPAIR-5・REPAIR-12・#3670）。
 #[test]
 fn cri5_disconnect_cancels_pending_handler() {
-    let (_root, path, h, seen) = start_blocking("disc");
+    let BlockingServer {
+        _root,
+        path,
+        handle: h,
+        entered,
+        cancelled_seen: seen,
+    } = start_blocking("disc");
     let mut c = connect(&path);
     send_req(&mut c, 1, "test.Blocking", "Slow");
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        wait_until(HANDLER_ENTER_LIMIT, || entered
+            .load(std::sync::atomic::Ordering::SeqCst)),
+        "Slow handler did not start within {HANDLER_ENTER_LIMIT:?}"
+    );
     drop(c);
-    let end = std::time::Instant::now() + Duration::from_secs(5);
-    while !seen.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        wait_until(Duration::from_secs(5), || seen
+            .load(std::sync::atomic::Ordering::SeqCst)),
+        "handler was not cancelled within 5s of disconnect"
+    );
     h.shutdown().unwrap();
 }

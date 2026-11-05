@@ -671,7 +671,7 @@ impl<K: VcpuKick> LoopHandle<K> {
     /// 停止を要求し、`deadline` まで終了報告を待つ。
     ///
     /// `deadline` は 0 超 [`VCPU_STOP_DEADLINE_MAX`] 以下（`InvalidArgument`）。停止フラグを立てて kick し、待つ間も
-    /// 10ms ごとに kick し直す（`run` の前の kick が効くかは未確認のため。#3803）。ゲスト起因で既に終わって
+    /// 10ms ごとに kick し直す（期限切れの run の後に保留の kick を捨てるため。#3845）。ゲスト起因で既に終わって
     /// いたときは、その理由を返す。期限切れはスレッドを切り離して `DeadlineExceeded`（`TIMEOUT`）。
     /// `Ok` で戻った時点で vCPU は破棄済み。
     pub fn stop(mut self, deadline: Duration) -> Result<VcpuStopReport, MicrovmError> {

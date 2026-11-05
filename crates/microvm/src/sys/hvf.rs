@@ -29,6 +29,9 @@
 //!   読みで、実機前提の試験で観測する。
 //! - `run_once` は期限つき（監視スレッドが `hv_vcpus_exit` で中断し `DeadlineExceeded`。REPAIR-5）で、結果と所要時間を
 //!   `HvRunStats`・`HvRunObserver` へ残す（REPAIR-4）。期限なしの `hv_vcpu_run` は公開しない。
+//! - run していない vCPU への `hv_vcpus_exit` は保留され、次の `hv_vcpu_run` がゲストへ入らず `Canceled` で戻る。保留はその
+//!   1 回で消える（SDK ヘッダと実機のプローブ。#3803）。`hv_vcpu_run` の戻りから監視スレッドが止まるまでの窓に届いた
+//!   監視スレッドの `cancel` も保留になるため、`run_once` は期限が発火した run の後に保留を捨てる（#3845）。
 //! - exit 領域は `HvVcpu` の寿命内だけ有効で、`run` の戻りの時点でコピーして値を返す（参照を外へ出さない）。
 //! - `HvVcpu` は `&HvVm` を借用し、vCPU が残ったまま `hv_vm_destroy` が走らない。vCPU スレッドで使うときは
 //!   `HvVm` を `Arc` で共有するか `std::thread::scope` を使う（#3791 の担当）。
@@ -699,7 +702,7 @@ const _: fn() = || {
 impl VcpuCanceller {
     /// `hv_vcpus_exit` で実行中の `hv_vcpu_run` を `Canceled` で戻させる。vCPU 破棄後は `FailedPrecondition`。
     ///
-    /// `run` の前に呼んだときに次の `run` が即戻るかは未確認（#3803）。
+    /// `run` の前に呼ぶと保留され、次の `run` がゲストへ入らず `Canceled` で戻る（#3803）。
     pub fn cancel(&self) -> Result<(), MicrovmError> {
         let guard = self.id.lock().unwrap_or_else(|e| e.into_inner());
         let Some(id) = *guard else {
@@ -755,8 +758,12 @@ pub struct HvVcpu<'a> {
     _thread: PhantomData<*const ()>,
 }
 
-/// 期限監視スレッドが超過後に `hv_vcpus_exit` を繰り返す間隔（`cancel` が `run` より先に届いたときの取りこぼし対策）。
+/// 期限監視スレッドが超過後に `hv_vcpus_exit` を繰り返す間隔。`run` の前の `cancel` は保留されるので取りこぼさないが、
+/// 止まらないと `run_once` が戻らないため、再送を歯止めとして残す（REPAIR-5）。
 const KICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 保留の `cancel` を捨てる run の期限。ゲストへ入らず即戻るはずの run で、超えたら異常として扱う。
+const DISCARD_CANCEL_DEADLINE: Duration = Duration::from_secs(1);
 
 /// 監視スレッドへ「実行が戻った」ことを知らせる。drop でも立てるため、panic でも監視が残らない。
 struct DoneGuard<'a>(&'a (Mutex<bool>, Condvar));
@@ -779,15 +786,49 @@ impl HvVcpu<'_> {
     /// ゲストを走らせ、戻った理由を返す。`timeout` を超えると監視スレッドが `hv_vcpus_exit` を送り
     /// `DeadlineExceeded` で戻る（REPAIR-5）。`timeout` は 0 不可・上限 `HV_RUN_DEADLINE_MAX`（`InvalidArgument`）。
     ///
-    /// 外部の `VcpuCanceller::cancel` による停止は `Ok(Canceled)`。未知の理由は `Unknown` で、呼び出し側は
-    /// VM を止める（fail-closed）。結果と所要時間は `stats` と観測器（`set_observer`）へ、エラー経路も含めて残す
-    /// （REPAIR-4）。期限の入力検査の失敗は発行前のため記録しない。
+    /// 外部の `VcpuCanceller::cancel` による停止は `Ok(Canceled)`。run の間に届いた外部の `cancel` も次の run を
+    /// `Ok(Canceled)` で戻すため、呼び出し側は自分の停止条件を確かめる（`hvf_loop` は停止フラグが無ければ続行する）。
+    /// 期限の発火で送った `cancel` は `discard_pending_cancel` で捨て、次の run へ漏らさない（#3845）。
+    /// 未知の理由は `Unknown` で、呼び出し側は VM を止める（fail-closed）。結果と所要時間は `stats` と観測器
+    /// （`set_observer`）へ、エラー経路も含めて残す（REPAIR-4）。期限の入力検査の失敗は発行前のため記録しない。
     pub fn run_once(&mut self, timeout: Duration) -> Result<HvVcpuExit, MicrovmError> {
         check_run_deadline(timeout)?;
+        let start = Instant::now();
+        let (result, fired) = self.run_watched(timeout);
+        let result = if fired {
+            self.discard_pending_cancel().and(result)
+        } else {
+            result
+        };
+        let (result, record) = finish_run(result, fired, start.elapsed());
+        self.stats.add(&record);
+        if let Some(o) = &self.observer {
+            o.record(&record);
+        }
+        result
+    }
+
+    /// 期限の発火で残りうる保留の `cancel` を捨てる（#3845）。
+    ///
+    /// 保留の有無は照会できない。そこで `cancel` を足して保留を確定させ、ゲストへ入らず `Canceled` で戻る run で消費する。
+    /// 同じ理由の `hv_vcpu_run` は PC を動かさない（#3803）。`Canceled` 以外はゲストが走って exit を失ったことになるため
+    /// `Internal` で失敗にする（fail-closed）。呼び出しの前に監視スレッドは止まっており、後から `cancel` は届かない。
+    /// ここで外部の `cancel` を消費しても、`hvf_loop` は期限切れの後に停止フラグを見直し、stop は kick を再送するので、
+    /// 停止は失われない。
+    fn discard_pending_cancel(&mut self) -> Result<(), MicrovmError> {
+        self.canceller().cancel()?;
+        match self.run_watched(DISCARD_CANCEL_DEADLINE) {
+            (Ok(HvVcpuExit::Canceled), false) => Ok(()),
+            (Err(e), _) => Err(e),
+            (Ok(_), _) => Err(internal("vcpu entered the guest while discarding a cancel")),
+        }
+    }
+
+    /// 期限の監視つきで `hv_vcpu_run` を 1 回呼び、結果と期限が発火したかを返す。戻った時点で監視スレッドは止まっている。
+    fn run_watched(&mut self, timeout: Duration) -> (Result<HvVcpuExit, MicrovmError>, bool) {
         let canceller = self.canceller();
         let done = (Mutex::new(false), Condvar::new());
         let fired = AtomicBool::new(false);
-        let start = Instant::now();
         let result = std::thread::scope(|scope| {
             let watchdog = std::thread::Builder::new()
                 .name("hvf-run-deadline".to_string())
@@ -822,12 +863,7 @@ impl HvVcpu<'_> {
             let _ = watchdog.join();
             run_result
         });
-        let (result, record) = finish_run(result, fired.load(Ordering::SeqCst), start.elapsed());
-        self.stats.add(&record);
-        if let Some(o) = &self.observer {
-            o.record(&record);
-        }
-        result
+        (result, fired.load(Ordering::SeqCst))
     }
 
     /// 累積の実行統計（REPAIR-4）。

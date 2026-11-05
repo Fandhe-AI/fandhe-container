@@ -13,7 +13,9 @@ use fandhe_container_microvm::esr::{
     AccessDirection, EsrClass, WfxKind, decode_esr, instruction_length,
 };
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryBacking};
-use fandhe_container_microvm::hvf::{GicApi, HostMapping, HvVm, HvfGic, HvfGuestRam, VmWithGic};
+use fandhe_container_microvm::hvf::{
+    GicApi, HostMapping, HvVcpu, HvVm, HvfGic, HvfGuestRam, VmWithGic,
+};
 use fandhe_container_microvm::hvf_abi::{
     HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, IrouterRoute, MemoryFlags,
     decode_irouter,
@@ -112,8 +114,8 @@ fn hvf_device_vcpu_regs_roundtrip() {
     vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, 0x8000_0001).unwrap();
     assert_eq!(vcpu.get_sys_reg(HvSysReg::MPIDR_EL1).unwrap(), 0x8000_0001);
 
-    // 別スレッドから停止する。run の前の cancel が次の run を即戻すかは未確認のため、
-    // run 中に届く再送で競合に依存しない形にする。
+    // 別スレッドから停止する。run の前の cancel は保留される（#3803）が、run 中に届く停止を確かめるため、
+    // 再送で競合に依存しない形にする。
     let done = Arc::new(AtomicBool::new(false));
     let canceller = vcpu.canceller();
     let stopper = {
@@ -2160,4 +2162,81 @@ fn hvf_device_spi_wakes_wfi() {
 
     mapping.unmap().unwrap();
     drop(vm);
+}
+
+/// `b .`（期限切れ用）・`hvc #0`・`b .` のゲスト。
+const CANCEL_GUEST_CODE: [u32; 3] = [0x1400_0000, 0xD400_0002, 0x1400_0000];
+
+/// 保留の `cancel` の試験の共通部。ゲストを載せた vCPU を `body` へ渡す（`body` の第 2 引数はゲストの先頭の IPA）。
+fn with_cancel_guest(deadline: Duration, body: impl FnOnce(&mut HvVcpu<'_>, u64)) {
+    const BASE: u64 = 0x4000_0000;
+    let _watchdog = Watchdog::start(deadline);
+    let layout = Arm64Layout::new(4 << 20, 1, 0).unwrap();
+    let vgic = create_vm_with_gic_or_precondition(&layout);
+    let page = HostMapping::page_size().unwrap();
+    let mut host = HostMapping::new(page).unwrap();
+    for (i, w) in CANCEL_GUEST_CODE.iter().enumerate() {
+        host.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+    }
+    let mapping = vgic
+        .vm()
+        .map(host, 0, BASE, page, MemoryFlags::RWX)
+        .unwrap();
+    let mut vcpu = vgic.create_vcpu().unwrap();
+    vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
+    body(&mut vcpu, BASE);
+    drop(vcpu);
+    mapping.unmap().unwrap();
+}
+
+/// HVC の exit を 1 回受けることを確かめる（`Canceled` なら保留の `cancel` が漏れている）。
+fn assert_reaches_hvc(vcpu: &mut HvVcpu<'_>, hvc_at: u64) {
+    vcpu.set_reg(HvReg::PC, hvc_at).unwrap();
+    let exit = vcpu.run_once(VCPU_DEADLINE).unwrap();
+    let HvVcpuExit::Exception(ex) = exit else {
+        panic!("hvf_device: pending_cancel: unexpected exit {exit:?}");
+    };
+    assert_eq!(decode_esr(ex.syndrome), EsrClass::Hvc { imm16: 0 });
+    assert_eq!(vcpu.get_reg(HvReg::PC).unwrap(), hvc_at + 4);
+}
+
+/// 期限切れの run の次の通常の run が `Canceled` にならないこと（#3845・MVM-5・REPAIR-5）。
+///
+/// 監視スレッドの `cancel` が run の戻りの直後に届く窓は狙って作れないため、期限切れを繰り返し、
+/// `run_once` が保留を捨てる経路を毎回通して、状態が壊れないことと次の run がゲストへ入ることを確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_deadline_then_normal_run() {
+    const REPEATS: u32 = 20;
+    with_cancel_guest(Duration::from_secs(30), |vcpu, base| {
+        for _ in 0..REPEATS {
+            vcpu.set_reg(HvReg::PC, base).unwrap();
+            let e = vcpu.run_once(Duration::from_millis(20)).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+            assert_reaches_hvc(vcpu, base + 4);
+        }
+        eprintln!("hvf_device: pending_cancel: deadline then normal run x{REPEATS}");
+    });
+}
+
+/// run の前の `cancel` は何回呼んでも 1 回の `Canceled` にまとまること（#3845・MVM-5）。
+///
+/// `run_once` が保留を捨てる処理（`cancel` を足して 1 回 run する）は、保留が数えられないことに依存する。
+/// 数えられるなら 2 回目の run も `Canceled` になり、ここで落ちる。PC が動かないことも確かめる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_device_pending_cancels_collapse() {
+    const CANCELS: u32 = 3;
+    with_cancel_guest(Duration::from_secs(30), |vcpu, base| {
+        let hvc_at = base + 4;
+        vcpu.set_reg(HvReg::PC, hvc_at).unwrap();
+        let canceller = vcpu.canceller();
+        for _ in 0..CANCELS {
+            canceller.cancel().unwrap();
+        }
+        assert_eq!(vcpu.run_once(VCPU_DEADLINE).unwrap(), HvVcpuExit::Canceled);
+        assert_eq!(vcpu.get_reg(HvReg::PC).unwrap(), hvc_at);
+        assert_reaches_hvc(vcpu, hvc_at);
+        eprintln!("hvf_device: pending_cancel: {CANCELS} cancels collapsed into one");
+    });
 }

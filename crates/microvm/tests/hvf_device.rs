@@ -463,8 +463,23 @@ const SPI_GUEST_HALT: u32 = 0x1400_0000;
 
 /// 全体期限（`hvf_device_spi_reaches_guest`）。
 const SPI_DEADLINE: Duration = Duration::from_secs(20);
+/// `run_once` の期限切れの診断を出す時間を残すため、watchdog を遅らせる幅。
+const SPI_WATCHDOG_MARGIN: Duration = Duration::from_secs(5);
 /// vCPU の exit 回数の上限（無限ループの歯止め）。
 const SPI_MAX_EXITS: u32 = 256;
+
+/// `SPI_GUEST_CODE` のどの待ちで止まったかを PC から決める（#3803 の切り分け用）。
+/// 命令の番号は `SPI_GUEST_CODE` の並びに対応する（`GICR_WAKER` の待ち 6〜7、`GICD_CTLR` の RWP の待ち 10〜11）。
+fn spi_stuck_stage(pc: u64, base: u64) -> &'static str {
+    const WFI: u32 = 0xD503_207F;
+    let wfi = SPI_GUEST_CODE.iter().position(|w| *w == WFI).unwrap() as u64;
+    match pc.wrapping_sub(base) / 4 {
+        6 | 7 => "gicr-waker",
+        10 | 11 => "gicd-rwp",
+        i if i == wfi || i == wfi + 1 => "wfi",
+        _ => "other",
+    }
+}
 
 /// ホストの `GicSpiLine::trigger`（edge の SPI）が、ゲストの `ICC_IAR1_EL1` で設定した INTID として読めることを確かめる。
 /// あわせて `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかを観測する（結果の記録は人間担当の #3803）。
@@ -507,27 +522,25 @@ fn hvf_device_spi_reaches_guest() {
     // 0x3c5: EL1h・DAIF マスク（例外ベクタ不要。ICC_IAR1_EL1 はマスク中でも読める）。
     vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
 
-    // 実行が戻らないハングの歯止め（REPAIR-5）。
-    let done = Arc::new(AtomicBool::new(false));
-    let watchdog_done = Arc::clone(&done);
-    let watchdog = std::thread::spawn(move || {
-        let start = std::time::Instant::now();
-        while start.elapsed() < SPI_DEADLINE {
-            if watchdog_done.load(Ordering::Acquire) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        eprintln!("hvf_device: WATCHDOG EXPIRED");
-        std::process::exit(124);
-    });
+    // 実行が戻らないハングの歯止め（REPAIR-5）。panic でも止まる RAII で持ち、`run_once` の期限より後に効かせる。
+    // 手書きの watchdog は panic の後も動き続け、次の試験の途中でプロセスを終わらせていた（#3803）。
+    let watchdog = Watchdog::start(SPI_DEADLINE + SPI_WATCHDOG_MARGIN);
 
     let mut delivered: Option<u64> = None;
     let mut off_thread: Option<Result<(), String>> = None;
     for _ in 0..SPI_MAX_EXITS {
         let exit = match vcpu.run_once(SPI_DEADLINE) {
             Ok(e) => e,
-            Err(e) => panic!("hvf_device: spi: run failed: {e}"),
+            Err(e) => {
+                // 期限切れの後も vCPU は持ち主のスレッドで読める。どの待ちで止まったかを PC で区別する。
+                let pc = vcpu.get_reg(HvReg::PC);
+                let x4 = vcpu.get_reg(HvReg::x(4).unwrap());
+                let stage = pc
+                    .as_ref()
+                    .map_or("unknown", |pc| spi_stuck_stage(*pc, BASE));
+                eprintln!("hvf_device: spi: stuck stage={stage} pc={pc:x?} x4={x4:x?}");
+                panic!("hvf_device: spi: run failed: {e}");
+            }
         };
         let HvVcpuExit::Exception(ex) = exit else {
             panic!("hvf_device: spi: unexpected exit {exit:?}");
@@ -576,8 +589,7 @@ fn hvf_device_spi_reaches_guest() {
             ),
         }
     }
-    done.store(true, Ordering::Release);
-    watchdog.join().unwrap();
+    drop(watchdog);
 
     let Some(value) = delivered else {
         panic!("hvf_device: spi: did not reach the guest within {SPI_MAX_EXITS} exits");

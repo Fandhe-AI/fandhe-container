@@ -47,6 +47,17 @@ golden_net_rx_code="b829000000bf11000000be03000000ba88b600000f054885c00f88b10000
 # net-rx のフレーム 60 バイト（ヘッダ 14 + ペイロード 46）
 golden_net_rx_frame="02fc0000386502fc0000386688b666616e6468652d6d6963726f766d2d6e65742d72782d7061796c6f61642d30313233343536373839616263646566"
 
+# variant net-tx・net-rx の aarch64 版（#3966）のゴールデン。コードは llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。
+# 初版であり、更新理由は「aarch64 の net-tx・net-rx を新設したため」。
+golden_net_tx_a64_init_sha="42cd73372adab46a53739e6111371b5a0ea26beec5e537b125edf5b5c413a102"
+golden_net_tx_a64_initrd_sha="d4c3992af97dd642042687bcc05fefa6b782d68e42d04a1867d9826cfca60789"
+# aarch64 の net-tx のコード 252 バイト（ファイル先頭から 120 バイト目）
+golden_net_tx_a64_code="200280d2610080d2020080d2c81880d2010000d46005f8b7f30300aaff0301d1ff7f00a9ff7f01a9ff7f02a9ff7f03a9a98c8e52090da672e90300b9e00313aa612691d2e2030091a80380d2010000d48003f8b7f41340b929008052e91300b9e00313aa812291d2e2030091a80380d2010000d46002f8b729028052e953007909b19652e9570079f42f00b9e00313aa61030010820780d2030080d2e4a30091850280d2c81980d2010000d41ff000f18100005421040010420480d203000014c1040050c20480d2200080d2080880d2010000d4a0d59b5220dcbf72212d83524102a572e2ac88526224a072c81180d2010000d43f2003d5ffffff17"
+golden_net_rx_a64_init_sha="4817e192ddd7410105838ff035d57e7a1175847c00c3b15ec76b127f6fd53e5f"
+golden_net_rx_a64_initrd_sha="62597393231d00e76fba45f029a212783c386d3a729cd832970a3a96c13de133"
+# aarch64 の net-rx のコード 300 バイト（ファイル先頭から 120 バイト目）
+golden_net_rx_a64_code="200280d2610080d202d196d2c81880d2010000d48006f8b7f30300aaff0303d1ff7f00a9ff7f01a9ff7f02a9ff7f03a9a98c8e52090da672e90300b929008052e91300b9e00313aa812291d2e2030091a80380d2010000d46004f8b7a90080d2e91b00f9e00313aa210080d2820280d2e3c30091040280d2081a80d2010000d42003f8b715028052e00313aae1030191021080d2030080d2040080d2050080d2e81980d2010000d4e001f8b71ff000f161010054ea030191ab0300108c0780d24d1540386e154038bf010e6b810000548c0500f161ffff5406000014b506007141fdff5421050050c20480d203000014c1030010420480d2200080d2080880d2010000d4a0d59b5220dcbf72212d83524102a572e2ac88526224a072c81180d2010000d43f2003d5ffffff17"
+
 sb="$(mktemp -d)"
 trap 'rm -rf "$sb"' EXIT
 touch "$sb/.microvm-test-initrd-selftest"
@@ -444,7 +455,7 @@ check "20 missing value" "2 bad-argument" "$rc $(errcode)"
 run env MICROVM_TEST_INITRD_ARCH=bogus "$target" --output-dir "$out"
 check "20 bad env value" "2 bad-argument" "$rc $(errcode)"
 
-# --- 21: variant block-read の aarch64 版（#3947）。net-tx・net-rx の aarch64 は拒否のまま ---
+# --- 21: variant block-read の aarch64 版（#3947） ---
 newout
 run "$target" --variant block-read --arch aarch64 --output-dir "$out"
 check "21 exit code" 0 "$rc"
@@ -494,10 +505,6 @@ if command -v gzip >/dev/null 2>&1; then
 else
     echo "skip: gzip is not available (case 21 gzip)"
 fi
-newout
-run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
-check "21 net-tx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
-check "21 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
 
 # --- 22: variant net-tx（#3894） ---
 newout
@@ -563,12 +570,6 @@ if cmp -s "$out/initrd.cpio" "$cpio"; then ok "23 CLI variant wins over env"; el
 newout
 run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-tx --output-dir "$out"
 check "23 windows host refused for net-tx" "2 unsupported-os" "$rc $(errcode)"
-
-# --- 24: net-tx は aarch64 では拒否する ---
-newout
-run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
-check "24 net-tx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
-check "24 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
 
 # --- 25: variant net-rx（#3919） ---
 newout
@@ -639,11 +640,123 @@ newout
 run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-rx --output-dir "$out"
 check "27 windows host refused for net-rx" "2 unsupported-os" "$rc $(errcode)"
 
-# --- 28: net-rx は aarch64 では拒否する ---
+# --- 29: variant net-tx の aarch64 版（#3966） ---
+newout
+run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+check "29 exit code" 0 "$rc"
+check "29 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+cpio29="$out/initrd.cpio"
+check "29 entries" "init 000081ed 00000000 00000000 504
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$cpio29")"
+init29="$sb/init-net-tx-a64.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$cpio29" | head -c 504 >"$init29"
+check "29 init size" 504 "$(wc -c <"$init29" | tr -d ' ')"
+check "29 magic class data" "7f454c460201" "$(hexat "$init29" 0 6)"
+check "29 e_machine" 183 "$(leat "$init29" 18 2)"
+check "29 e_entry" $((0x400078)) "$(leat "$init29" 24 8)"
+check "29 p_flags R+X" 5 "$(leat "$init29" 68 4)"
+check "29 p_filesz" 504 "$(leat "$init29" 96 8)"
+check "29 p_memsz" 504 "$(leat "$init29" 104 8)"
+check "29 code (252 bytes)" "$golden_net_tx_a64_code" "$(hexat "$init29" 120 252)"
+check "29 sockaddr_ll protocol movz w9 htons(0x88B5)" "09b19652" "$(hexat "$init29" 248 4)"
+check "29 frame (60 bytes)" "02fc0000386602fc0000386588b566616e6468652d6d6963726f766d2d6e65742d74782d7061796c6f61642d30313233343536373839616263646566" "$(hexat "$init29" 372 60)"
+check "29 ok message" "fandhe-microvm-test: net tx ok v1" "$(tail -c +433 "$init29" | head -c 33)"
+check "29 ok message newline" "0a" "$(hexat "$init29" 465 1)"
+check "29 failed message" "fandhe-microvm-test: net tx failed v1" "$(tail -c +467 "$init29" | head -c 37)"
+check "29 failed message newline" "0a" "$(hexat "$init29" 503 1)"
+check "29 init sha256" "$golden_net_tx_a64_init_sha" "$(sha_of "$init29")"
+check "29 initrd sha256" "$golden_net_tx_a64_initrd_sha" "$(sha_of "$cpio29")"
+check "29 build-info" "init_sha256=$golden_net_tx_a64_init_sha
+init_bytes=504
+initrd_file=initrd.cpio
+initrd_sha256=$golden_net_tx_a64_initrd_sha
+compress=none
+arch=aarch64
+format=newc
+variant=net-tx
+frame_hex=02fc0000386602fc0000386588b566616e6468652d6d6963726f766d2d6e65742d74782d7061796c6f61642d30313233343536373839616263646566
+message_ok=fandhe-microvm-test: net tx ok v1
+message_failed=fandhe-microvm-test: net tx failed v1" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio29"; then ok "29 second run is byte-identical"; else ng "29 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant net-tx --arch aarch64 --output-dir "$out" --compress gzip
+    check "29 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$cpio29"; then ok "29 gunzip equals the plain archive"; else ng "29 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 29 gzip)"
+fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=net-tx "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio29"; then ok "29 env arch and variant select aarch64 net-tx"; else ng "29 env selection ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=bogus "$target" --variant net-tx --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio29"; then ok "29 CLI variant wins over env"; else ng "29 CLI variant did not win"; fi
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-tx --arch aarch64 --output-dir "$out"
+check "29 windows host refused" "2 unsupported-os" "$rc $(errcode)"
+
+# --- 30: variant net-rx の aarch64 版（#3966） ---
 newout
 run "$target" --variant net-rx --arch aarch64 --output-dir "$out"
-check "28 net-rx with aarch64 rejected" "2 bad-argument" "$rc $(errcode)"
-check "28 nothing created" "no" "$([ -e "$out" ] && echo yes || echo no)"
+check "30 exit code" 0 "$rc"
+check "30 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+cpio30="$out/initrd.cpio"
+check "30 entries" "init 000081ed 00000000 00000000 552
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$cpio30")"
+init30="$sb/init-net-rx-a64.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$cpio30" | head -c 552 >"$init30"
+check "30 init size" 552 "$(wc -c <"$init30" | tr -d ' ')"
+check "30 magic class data" "7f454c460201" "$(hexat "$init30" 0 6)"
+check "30 e_machine" 183 "$(leat "$init30" 18 2)"
+check "30 e_entry" $((0x400078)) "$(leat "$init30" 24 8)"
+check "30 p_flags R+X" 5 "$(leat "$init30" 68 4)"
+check "30 p_filesz" 552 "$(leat "$init30" 96 8)"
+check "30 p_memsz" 552 "$(leat "$init30" 104 8)"
+check "30 code (300 bytes)" "$golden_net_rx_a64_code" "$(hexat "$init30" 120 300)"
+check "30 socket protocol movz x2 htons(0x88B6)" "02d196d2" "$(hexat "$init30" 128 4)"
+check "30 frame (60 bytes)" "02fc0000386502fc0000386688b666616e6468652d6d6963726f766d2d6e65742d72782d7061796c6f61642d30313233343536373839616263646566" "$(hexat "$init30" 420 60)"
+check "30 ok message" "fandhe-microvm-test: net rx ok v1" "$(tail -c +481 "$init30" | head -c 33)"
+check "30 ok message newline" "0a" "$(hexat "$init30" 513 1)"
+check "30 failed message" "fandhe-microvm-test: net rx failed v1" "$(tail -c +515 "$init30" | head -c 37)"
+check "30 failed message newline" "0a" "$(hexat "$init30" 551 1)"
+check "30 init sha256" "$golden_net_rx_a64_init_sha" "$(sha_of "$init30")"
+check "30 initrd sha256" "$golden_net_rx_a64_initrd_sha" "$(sha_of "$cpio30")"
+check "30 build-info" "init_sha256=$golden_net_rx_a64_init_sha
+init_bytes=552
+initrd_file=initrd.cpio
+initrd_sha256=$golden_net_rx_a64_initrd_sha
+compress=none
+arch=aarch64
+format=newc
+variant=net-rx
+frame_hex=02fc0000386502fc0000386688b666616e6468652d6d6963726f766d2d6e65742d72782d7061796c6f61642d30313233343536373839616263646566
+message_ok=fandhe-microvm-test: net rx ok v1
+message_failed=fandhe-microvm-test: net rx failed v1
+recv_timeout_secs=5
+recv_attempts=16" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant net-rx --arch aarch64 --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio30"; then ok "30 second run is byte-identical"; else ng "30 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant net-rx --arch aarch64 --output-dir "$out" --compress gzip
+    check "30 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$cpio30"; then ok "30 gunzip equals the plain archive"; else ng "30 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 30 gzip)"
+fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=net-rx "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio30"; then ok "30 env arch and variant select aarch64 net-rx"; else ng "30 env selection ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=bogus "$target" --variant net-rx --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio30"; then ok "30 CLI variant wins over env"; else ng "30 CLI variant did not win"; fi
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-rx --arch aarch64 --output-dir "$out"
+check "30 windows host refused" "2 unsupported-os" "$rc $(errcode)"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

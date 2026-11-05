@@ -56,7 +56,7 @@
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>）だけは任意で、無ければ
 //!   `GicApi::distributor_reg` が `Unimplemented` を返し、呼び出し側が縮退する（読むのは `GICD_CTLR` と `GICD_IROUTER<n>`。#3974）。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
 //! - 関数ポインタは `GicApi` の private フィールドに閉じ、`sys` の外へ出さない。`hv_gic_*` は `libc` に対応物が無いため
-//!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.12 以降なので直接リンクしてよい）
+//!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.10 以降なので直接リンクしてよい）
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
 //! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK ヘッダとの照合は #3803。
 //!
@@ -1249,7 +1249,8 @@ impl GicConfig {
 impl Drop for GicConfig {
     fn drop(&mut self) {
         // SAFETY: `raw` は `config_create` が返した NULL でない OS オブジェクトで、ここ以外で解放されない
-        // （`create` は config を消費するが解放しない）。`hv_gic_create` が retain するかは #3803 で確認する。
+        // （`create` は config を消費するが解放しない）。`hv_gic_create` は retain しないが、`create` の後に解放しても
+        // 以後の `hv_gic_*`・`hv_vcpu_create`・`hv_vm_destroy` は成功した（実機のプローブ。#3803）。
         unsafe { os_release(self.raw) };
     }
 }

@@ -15,7 +15,7 @@
 //! | `HV_NO_RESOURCES` | `ResourceExhausted` |
 //! | `HV_NO_DEVICE` | `Unimplemented`（hypervisor を使えない環境） |
 //! | `HV_DENIED` | `PermissionDenied` |
-//! | `HV_FAULT` | `Internal` |
+//! | `HV_EXISTS` | `AlreadyExists` |
 //! | `HV_UNSUPPORTED` | `Unimplemented` |
 //! | 未知の値 | `Internal`（fail-closed） |
 //!
@@ -26,7 +26,7 @@
 //!
 //! # GICv3 の版判定（TASK-192.3・#3789）
 //! [`parse_macos_product_version`]・[`check_gic_supported`] は `kern.osproductversion` の分解と macOS 15 未満の拒否。
-//! [`HvGicIntid`] の値は Arm BSA の推奨 PPI 番号に由来する暫定値で、SDK ヘッダとの照合は #3803。
+//! [`HvGicIntid`] の値は SDK ヘッダ（`hv_gic_types.h`）の列挙値で、実機でも確かめた（#3803）。
 //!
 //! # 出典
 //! 数値の一部と 3 つの名前は第三者バインディング由来で、SDK ヘッダ（`Hypervisor/hv_error.h`）との
@@ -60,8 +60,8 @@ pub const HV_NO_RESOURCES: i32 = 0xfae9_4005_u32 as i32;
 pub const HV_NO_DEVICE: i32 = 0xfae9_4006_u32 as i32;
 /// `HV_DENIED`（0xfae94007）。
 pub const HV_DENIED: i32 = 0xfae9_4007_u32 as i32;
-/// `HV_FAULT`（0xfae94008）。
-pub const HV_FAULT: i32 = 0xfae9_4008_u32 as i32;
+/// `HV_EXISTS`（0xfae94008）。arm64 のヘッダ（`hv_kern_types.h`）の名前で、`HV_FAULT` は x86_64 のヘッダにだけある（#3803）。
+pub const HV_EXISTS: i32 = 0xfae9_4008_u32 as i32;
 /// `HV_UNSUPPORTED`（0xfae9400f）。
 pub const HV_UNSUPPORTED: i32 = 0xfae9_400f_u32 as i32;
 
@@ -181,7 +181,7 @@ pub fn classify_hv_return(op: HvOp, code: i32) -> Result<(), MicrovmError> {
         HV_NO_RESOURCES => (MicrovmErrorCode::ResourceExhausted, "HV_NO_RESOURCES"),
         HV_NO_DEVICE => (MicrovmErrorCode::Unimplemented, "HV_NO_DEVICE"),
         HV_DENIED => (MicrovmErrorCode::PermissionDenied, "HV_DENIED"),
-        HV_FAULT => (MicrovmErrorCode::Internal, "HV_FAULT"),
+        HV_EXISTS => (MicrovmErrorCode::AlreadyExists, "HV_EXISTS"),
         HV_UNSUPPORTED => (MicrovmErrorCode::Unimplemented, "HV_UNSUPPORTED"),
         _ => {
             return Err(MicrovmError::new(
@@ -686,18 +686,17 @@ pub fn check_gic_supported(v: MacosVersion) -> Result<(), MicrovmError> {
     Ok(())
 }
 
-/// `hv_gic_intid_t`（`uint16_t` の列挙）の識別値。`hv_gic_get_intid` へ渡す「割り込みの種類」の選択子で、
-/// ゲスト側の PPI 番号（INTID）そのものではない。INTID は [`GicIntid`] として戻り値から得る。
+/// `hv_gic_intid_t`（`uint16_t` の列挙）の識別値。`hv_gic_get_intid` へ渡す「割り込みの種類」の選択子。
 ///
-/// 列挙値の数値は SDK ヘッダ（`hv_gic_types.h`）との照合が人間担当の #3803 で未了の暫定値（実機未確認）。
-/// PPI 番号（EL1 仮想タイマーの推奨 27 など）は列挙識別値ではなく戻り値の INTID 側の値で、混同しない。
+/// ゲストに見せる INTID は [`GicIntid`] として戻り値から得る。`EL1_VIRTUAL_TIMER` は SDK（27.2）の列挙値が 27 で、
+/// 実機の戻り値も 27 だった（#3803）が、選択子と戻り値は意味が違うので型を分けたままにする。
 /// 呼び出し側は数値を直接書かず定数だけを使う（REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvGicIntid(u16);
 
 impl HvGicIntid {
-    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` の列挙識別値（暫定。#3803 で照合）。
-    pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(3);
+    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` の列挙識別値（SDK ヘッダと実機で確認。#3803）。
+    pub const EL1_VIRTUAL_TIMER: HvGicIntid = HvGicIntid(27);
 
     /// FFI へ渡す列挙識別値。
     pub const fn bits(self) -> u16 {
@@ -1107,7 +1106,7 @@ mod tests {
         assert_eq!(HV_NO_RESOURCES as u32, 0xfae9_4005);
         assert_eq!(HV_NO_DEVICE as u32, 0xfae9_4006);
         assert_eq!(HV_DENIED as u32, 0xfae9_4007);
-        assert_eq!(HV_FAULT as u32, 0xfae9_4008);
+        assert_eq!(HV_EXISTS as u32, 0xfae9_4008);
         assert_eq!(HV_UNSUPPORTED as u32, 0xfae9_400f);
     }
 
@@ -1138,7 +1137,7 @@ mod tests {
                 "HV_NO_DEVICE",
             ),
             (HV_DENIED, MicrovmErrorCode::PermissionDenied, "HV_DENIED"),
-            (HV_FAULT, MicrovmErrorCode::Internal, "HV_FAULT"),
+            (HV_EXISTS, MicrovmErrorCode::AlreadyExists, "HV_EXISTS"),
             (
                 HV_UNSUPPORTED,
                 MicrovmErrorCode::Unimplemented,
@@ -1496,9 +1495,32 @@ mod tests {
             e.message(),
             "hv_gic_get_spi_interrupt_range returned HV_UNSUPPORTED"
         );
-        assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 3);
-        assert_ne!(u32::from(HvGicIntid::EL1_VIRTUAL_TIMER.bits()), 27);
         assert_eq!(GicIntid::new(27).get(), 27);
+    }
+
+    /// `HV_GIC_INT_EL1_VIRTUAL_TIMER` は SDK で 27。3 を渡すと実機で `HV_BAD_ARGUMENT` になる（#3803・#3989・MVM-5）。
+    #[test]
+    fn mvm5_3989_virtual_timer_selector_matches_sdk() {
+        assert_eq!(HvGicIntid::EL1_VIRTUAL_TIMER.bits(), 27);
+    }
+
+    /// entitlements は XML コメントを持たず、キーは hypervisor の 1 つだけ（#3803・#3989・MVM-5）。
+    ///
+    /// コメント内の `--` は `codesign` が `AMFIUnserializeXML: syntax error` で拒否し、`plutil -lint` は通すため、
+    /// 内容をここで照合する。実機で署名できたのはコメントなしの形なので、説明はコメントで足さない。
+    #[test]
+    fn mvm5_3989_entitlements_have_no_xml_comment() {
+        let plist = include_str!("../tests/hvf.entitlements");
+        assert!(
+            !plist.contains("<!--"),
+            "entitlements must not have an XML comment"
+        );
+        assert!(
+            !plist.contains("--"),
+            "entitlements must not contain a double hyphen"
+        );
+        assert_eq!(plist.matches("<key>").count(), 1);
+        assert!(plist.contains("<key>com.apple.security.hypervisor</key>"));
     }
 
     // ---- check_assemble_input（TASK-192.15・#3797・MVM-5） ----

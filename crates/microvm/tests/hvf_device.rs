@@ -1,6 +1,6 @@
 //! Hypervisor.framework 実機前提の試験（MVM-5・MVM-1・TASK-192.1・#3783・TASK-192.3・#3789・TASK-192.12・#3792・TASK-192.13・#3795・TASK-192.10・#3793・TASK-192.11・#3794・TASK-192.15・#3797・TASK-192.16・#3798・#3882・#3887・#3891）。`--ignored` 指定時だけ走る。
 //! 必要環境: Apple Silicon の macOS 15 以降、`com.apple.security.hypervisor` 付きの ad-hoc 署名。root は不要。
-//! 手順は AGENTS.md「実機前提テスト」の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
+//! 手順は docs/verification/real-machine-tests.md の `hvf_device` の項。ゲストを走らせない試験は待ちがなく、vCPU を
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -32,24 +32,31 @@ mod arm64_image;
 use arm64_image::{synthetic_image, synthetic_image_with_code};
 
 /// VM を作る。権限不足・hypervisor 不可は環境の問題として、決まった 1 行目で失敗させる。
+/// それ以外（解放漏れの `FailedPrecondition` など）は回帰なので、環境の問題と表示しない（#3989）。
 fn create_vm_or_precondition() -> HvVm {
     match HvVm::create() {
         Ok(vm) => vm,
-        Err(e) => {
+        Err(e)
+            if matches!(
+                e.code(),
+                MicrovmErrorCode::PermissionDenied | MicrovmErrorCode::Unimplemented
+            ) =>
+        {
             panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
+        Err(e) => panic!("hvf_device: vm: {e}"),
     }
 }
 
-/// GIC つきの VM を作る。前提欠如（権限不足など）は決まった 1 行目で失敗させる。
-/// macOS 14 の `Unimplemented` は前提欠如ではなく、そのままの失敗として出す。
+/// GIC つきの VM を作る。権限不足だけを環境の問題として決まった 1 行目で失敗させる。
+/// macOS 14 の `Unimplemented` と GIC の呼び出しの失敗（定数の誤りなど）は、そのままの失敗として出す（#3989）。
 fn create_vm_with_gic_or_precondition(layout: &Arm64Layout) -> VmWithGic {
     match VmWithGic::create(layout) {
         Ok(vm) => vm,
-        Err(e) if e.code() == MicrovmErrorCode::Unimplemented => panic!("hvf_device: gic: {e}"),
-        Err(e) => {
+        Err(e) if e.code() == MicrovmErrorCode::PermissionDenied => {
             panic!("hvf_device: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
+        Err(e) => panic!("hvf_device: gic: {e}"),
     }
 }
 

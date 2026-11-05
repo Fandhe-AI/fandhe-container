@@ -38,24 +38,32 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// ゲストが SYSTEM_OFF に達するまでの待ちの上限。
 const FINISH_WAIT: Duration = Duration::from_secs(10);
 
-/// 環境の前提（権限・macOS 15 以降）を、組み立てとは別に先に確かめる。macOS 14 の `Unimplemented` は前提欠如ではない。
+/// 環境の前提（権限）を、組み立てとは別に先に確かめる。権限不足だけを環境の問題とし、macOS 14 の `Unimplemented` と
+/// GIC の呼び出しの失敗（定数の誤りなど）はそのままの失敗として出す（#3989）。
 fn require_vm_with_gic(layout: &Arm64Layout) {
     match VmWithGic::create(layout) {
         Ok(vm) => drop(vm),
-        Err(e) if e.code() == MicrovmErrorCode::Unimplemented => panic!("hvf_microvm: gic: {e}"),
-        Err(e) => {
+        Err(e) if e.code() == MicrovmErrorCode::PermissionDenied => {
             panic!("hvf_microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
+        Err(e) => panic!("hvf_microvm: gic: {e}"),
     }
 }
 
-/// VM を作る。解放の観測（解放漏れなら 2 個目の作成が `FailedPrecondition`）にも使う。
+/// VM を作る。解放の観測（解放漏れなら 2 個目の作成が `FailedPrecondition`）にも使うため、権限不足と hypervisor 不可
+/// だけを環境の問題とする（#3989）。
 fn create_vm_or_precondition() -> HvVm {
     match HvVm::create() {
         Ok(vm) => vm,
-        Err(e) => {
+        Err(e)
+            if matches!(
+                e.code(),
+                MicrovmErrorCode::PermissionDenied | MicrovmErrorCode::Unimplemented
+            ) =>
+        {
             panic!("hvf_microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
         }
+        Err(e) => panic!("hvf_microvm: vm: {e}"),
     }
 }
 

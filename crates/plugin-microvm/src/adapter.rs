@@ -3,7 +3,7 @@
 //! 呼び出し元: `main.rs` が `frame_loop::serve_until` へ渡す。core 側 proxy（#1869 の設計）が送る要求の先頭要素
 //! （操作名）で分岐する暫定契約（本体 `Vec<String>`。型つき本体への置換は #1869 の設計・承認と実装 issue の起票は #2232）。
 //! microVM 本体の操作は [`MicrovmBackend`] 越しに `fandhe-container-microvm` へ委譲する。backend は OS で分かれる:
-//! Linux は `KvmBackend`（同時 4 台。x86_64 は bzImage、aarch64 は arm64 Image と FDT〔#3696〕）、macOS の aarch64 は `HvfBackend`（Hypervisor.framework。同時 1 台・
+//! Linux は `KvmBackend`（同時 4 台。x86_64 は bzImage で cmdline は 4095 バイトまで、aarch64 は arm64 Image と FDT〔#3696〕で cmdline は 2047 バイトまで〔#3971〕）、macOS の aarch64 は `HvfBackend`（Hypervisor.framework。同時 1 台・
 //! arm64 Image・cmdline は 2047 バイトまで。TASK-192.18・#3800・MVM-5）、それ以外（macOS x86_64・Windows）は常に
 //! `UNIMPLEMENTED` の `UnsupportedBackend`。上限（同時台数・cmdline）は OS ではなく backend の性質として
 //! [`MicrovmBackend::VM_LIMIT`]・[`MicrovmBackend::CMDLINE_MAX_BYTES`] が持つ。
@@ -49,7 +49,7 @@
 //! - 呼び出し側は symlink を含まないパスを渡す
 //!   （祖先の symlink は unix で拒否される。macOS の `/tmp`・`/var`、merged-usr の `/lib` なども拒否される。`/` は信頼する起点）。
 //!   Windows は祖先を検査せず、lstat の失敗の分類（`map_lstat_error`）も best-effort（reparse point は未検査。Windows の backend は `UnsupportedBackend` で `start` が `UNIMPLEMENTED` のため VM は起動しない）。
-//! - 実 Linux カーネルの起動完走は保証しない（実機での通しの記録は #3781 等で、KVM aarch64 のシリアル割り込みは #3943 で未実装）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）、実 Hypervisor.framework の通しは同じ `tests/e2e.rs` の macOS aarch64 の `#[ignore]` 試験（TASK-192.18・#3800）。
+//! - 実 Linux カーネルの起動完走は保証しない（実機での通しの記録は #3781 等で、KVM aarch64 のシリアル割り込みは SPI で結線済み〔#3943・#3955〕）。実 KVM の通しは `tests/e2e.rs` の `#[ignore]` 試験（TASK-117.4・#713）、実 Hypervisor.framework の通しは同じ `tests/e2e.rs` の macOS aarch64 の `#[ignore]` 試験（TASK-192.18・#3800）。
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -92,6 +92,14 @@ pub const STOP_ALL_BUDGET: Duration = Duration::from_secs(4);
 
 /// cmdline 本文の最大バイト数の既定（x86 boot protocol の `CMDLINE_CAPACITY` は NUL 込みの容量のため 1 引く）。
 const X86_CMDLINE_MAX_BYTES: usize = CMDLINE_CAPACITY as usize - 1;
+
+/// Linux の KVM backend の cmdline 本文の最大バイト数（MVM-1・#3971）。aarch64 は FDT の `bootargs` の上限
+/// （microvm の `arm64_layout`・`load_arm64` と同じ定数。入口で拒否しないと別の段のエラーになる）、x86_64 は boot protocol の値。
+/// x86_64・aarch64 以外の Linux は従来どおり既定の 4095。
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const KVM_CMDLINE_MAX_BYTES: usize = fandhe_container_microvm::arm64_layout::ARM64_MAX_BOOTARGS;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const KVM_CMDLINE_MAX_BYTES: usize = X86_CMDLINE_MAX_BYTES;
 
 const _: () = assert!(MAX_VMS >= 1);
 const _: () = assert!(X86_CMDLINE_MAX_BYTES as u64 + 1 == CMDLINE_CAPACITY);
@@ -169,7 +177,7 @@ pub trait MicrovmBackend {
     /// 同時に動かせる VM 数の上限（切り離し中の VM を含む）。上限は OS ではなく backend の性質で、既定は Linux（KVM）の
     /// [`MAX_VMS`]。Hypervisor.framework は 1 プロセス 1 VM のため 1 に上書きする（#3783・#3800）。
     const VM_LIMIT: usize = MAX_VMS;
-    /// cmdline 本文の最大バイト数。既定は x86 の 4095。arm64 は FDT の `bootargs` の上限 2047 に上書きする。
+    /// cmdline 本文の最大バイト数。既定は x86 の 4095。arm64（`HvfBackend` と aarch64 Linux の `KvmBackend`）は FDT の `bootargs` の上限 2047 に上書きする。
     /// kernel と initrd の上限は全 backend 共通の `boot_x86::{MAX_KERNEL_IMAGE_BYTES, MAX_INITRD_BYTES}` で、
     /// arm64 側（`boot_arm64`・`check_assemble_input`）も同じ値を使う（#3790）。
     const CMDLINE_MAX_BYTES: usize = X86_CMDLINE_MAX_BYTES;
@@ -207,6 +215,8 @@ pub struct KvmBackend {
 
 #[cfg(target_os = "linux")]
 impl MicrovmBackend for KvmBackend {
+    const CMDLINE_MAX_BYTES: usize = KVM_CMDLINE_MAX_BYTES;
+
     type Running = fandhe_container_microvm::microvm::RunningMicroVm;
     type ExitWatch = fandhe_container_microvm::microvm::VcpuExitWatch;
 
@@ -1755,18 +1765,46 @@ mod tests {
         assert_eq!(arm.handle(&req(2047, &k)).expect("2047"), s(&["running"]));
     }
 
-    /// 既定の上限は Linux（KVM）の値のまま（MVM-1。Linux の挙動を変えない回帰）。
+    /// 既定の上限は x86_64 Linux（KVM）の値（4095・4）のまま（MVM-1。挙動を変えない回帰）。
     #[test]
     fn mvm5_3800_default_limits_are_kvm_values() {
         assert_eq!(<FakeBackend as MicrovmBackend>::VM_LIMIT, 4);
         assert_eq!(<FakeBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 4095);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn mvm5_3800_kvm_backend_keeps_default_limits() {
         assert_eq!(<KvmBackend as MicrovmBackend>::VM_LIMIT, 4);
         assert_eq!(<KvmBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 4095);
+    }
+
+    /// MVM-1（#3971）: aarch64 Linux の `KvmBackend` は cmdline を FDT の bootargs の 2047 で入口拒否する
+    /// （イメージを読む前・`/dev/kvm` を開く前。2047 の受理境界は実 KVM に触れるためここでは見ない）。
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_3971_kvm_aarch64_cmdline_limit_is_bootargs() {
+        assert_eq!(<KvmBackend as MicrovmBackend>::VM_LIMIT, 4);
+        assert_eq!(<KvmBackend as MicrovmBackend>::CMDLINE_MAX_BYTES, 2047);
+        assert_eq!(
+            <KvmBackend as MicrovmBackend>::CMDLINE_MAX_BYTES,
+            fandhe_container_microvm::arm64_layout::ARM64_MAX_BOOTARGS
+        );
+        let mut a = MicrovmRuntimeAdapter::new(KvmBackend::default());
+        let e = a
+            .handle(&s(&[
+                "start",
+                "a",
+                "/nonexistent/kernel",
+                "",
+                &"x".repeat(2048),
+                "1",
+                "64",
+            ]))
+            .unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "invalid kernel cmdline");
+        assert!(a.backend.kvm.is_none());
     }
 
     /// macOS aarch64: `HvfBackend` の上限・既定 backend・終了観測（`hv_*` を呼ばないので署名なしの既定集合で走る）。

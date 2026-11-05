@@ -38,20 +38,26 @@
 //!   ため、ゲストが irq affinity を移した直後・CPU_OFF の直後は古いままになりうる。その 1 回は新しい宛先が最大 `WFI_WAIT_MAX`
 //!   （10 ms）遅れて起きる（待ちは常に期限つきで有界）。新しい宛先が次の ACK を書くとヒントは自己修復する。
 //! - シリアル（UART の level 線）は ACK の経路が違うため学習しない。ルーティングが読めれば宛先の 1 台だけを起こし、読めなければ全台。
-//! - `GICD_CTLR.ARE` は確認しない。ARE = 0 の段階の IROUTER は意味を持たないが、その段階では distributor が無効で注入が届かず、
-//!   誤った起床も期限で有界。
+//! - 縮退は理由別に数え、理由ごとの初回だけ構造化ログを 1 行出す（#3974・REPAIR-4。[`SpiRouting`]）。`GICD_CTLR.ARE` は
+//!   ARE = 1 を観測するまで assert のたびに読み、ARE = 0・読めないときは IROUTER を使わずヒントへ縮退する。ARE = 1 を観測したら
+//!   ラッチして以後は読まない（ARE = 0 を恒久キャッシュすると、最初の assert がゲストの GIC 初期化より前に来た VM は
+//!   寿命の間ずっと IROUTER を使えない。ARE を 1 から 0 へ戻すのは distributor 無効化後でないと UNPREDICTABLE のためラッチは安全）。
+//!   どの view の `GICD_CTLR` が返るかと非 vCPU スレッドからの読み出しの観測は #3803。件数は 2^64 回で巻き戻り、初回ログが再度出うる（実害なし）。
 //! - 毎回の assert で IROUTER を 1 回読む。コストが問題になればキャッシュ（affinity の変更検知）を別 issue で検討する（実測は #3803）。
 //! - 通知されない起床要因（PPI 等）は従来どおり `WFI_WAIT_MAX` の期限が安全網である。
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::arm64_layout::arm64_vcpu_index_from_affinity;
 use crate::error::MicrovmError;
 use crate::error::MicrovmErrorCode;
-use crate::hvf_abi::{HVF_MAX_VCPUS, IrouterRoute, decode_irouter};
+use crate::hvf_abi::{
+    GicDistributorReg, GicdCtlrAre, HVF_MAX_VCPUS, IrouterRoute, decode_gicd_ctlr_are,
+    decode_irouter,
+};
 use crate::hvf_loop::VcpuKick;
 
 /// [`WfiWaker::wait`] の戻り。
@@ -208,11 +214,20 @@ impl WfiWakeSet {
     /// SPI の注入後の起床（#3960・MVM-5）。`irouter`（`GICD_IROUTER<n>` の生値。読めなければ `None`）が主、`route`（学習した
     /// ヒント）が縮退先。宛先の決定は [`spi_wake_target`]。
     pub fn notify_spi_routed(&self, irouter: Option<u64>, route: &SpiRouteHint) {
-        let vcpus = u32::try_from(self.slots.len()).unwrap_or(0);
-        match spi_wake_target(irouter, route.get(), vcpus) {
+        self.notify_target(spi_wake_target(irouter, route.get(), self.vcpus()));
+    }
+
+    /// 決定済みの宛先を起こす（#3974）。
+    pub fn notify_target(&self, target: SpiWakeTarget) {
+        match target {
             SpiWakeTarget::Vcpu(i) => self.notify_vcpu(i),
             SpiWakeTarget::All => self.notify_all(),
         }
+    }
+
+    /// スロットの数（vCPU 数）。
+    pub fn vcpus(&self) -> u32 {
+        u32::try_from(self.slots.len()).unwrap_or(0)
     }
 }
 
@@ -234,15 +249,228 @@ pub enum SpiWakeTarget {
 ///
 /// `irouter` はゲストが書く非信頼値。結果は「どの vCPU を起こすか」だけに効き、誤っても `WFI_WAIT_MAX` で有界。
 pub fn spi_wake_target(irouter: Option<u64>, hint: Option<u32>, vcpus: u32) -> SpiWakeTarget {
-    if let Some(IrouterRoute::Affinity(aff)) = irouter.map(decode_irouter)
-        && let Some(i) = arm64_vcpu_index_from_affinity(aff, vcpus)
+    if let Some(raw) = irouter
+        && let Ok(i) = classify_irouter(raw, vcpus)
     {
         return SpiWakeTarget::Vcpu(i);
     }
+    fallback_target(hint, vcpus)
+}
+
+/// IROUTER の生値から宛先 vCPU を決める。決まらなければ縮退の理由（#3974）。
+fn classify_irouter(raw: u64, vcpus: u32) -> Result<u32, SpiRouteFallback> {
+    match decode_irouter(raw) {
+        IrouterRoute::Affinity(aff) => {
+            arm64_vcpu_index_from_affinity(aff, vcpus).ok_or(SpiRouteFallback::OutOfRange)
+        }
+        IrouterRoute::AnyParticipating => Err(SpiRouteFallback::AnyParticipating),
+        IrouterRoute::Malformed => Err(SpiRouteFallback::Malformed),
+    }
+}
+
+/// 縮退先: ヒントが `vcpus` 未満ならその vCPU、そうでなければ全台。
+fn fallback_target(hint: Option<u32>, vcpus: u32) -> SpiWakeTarget {
     match hint {
         Some(i) if i < vcpus => SpiWakeTarget::Vcpu(i),
         _ => SpiWakeTarget::All,
     }
+}
+
+/// SPI の宛先をルーティングから決められず縮退した理由（#3974・MVM-5・REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiRouteFallback {
+    /// 読み出しが `Unimplemented`（シンボル無し・macOS 15 未満）。
+    Unavailable,
+    /// 読み出しのその他の失敗（framework の失敗・拒否）。
+    Failed,
+    /// IROUTER の RES0 違反、または `GICD_CTLR` の上位 32 ビットが 0 でない。
+    Malformed,
+    /// IRM = 0 の affinity が割り当て済みの vCPU に当たらない。
+    OutOfRange,
+    /// `GICD_CTLR.ARE` = 0。IROUTER は意味を持たないので読まない。
+    AreDisabled,
+    /// IRM = 1（1-of-N）。読み出しの失敗ではなくゲストの正当な選択だが、宛先を 1 台に決められず縮退する。
+    AnyParticipating,
+}
+
+impl SpiRouteFallback {
+    /// 全理由（件数の添字の順）。
+    pub const ALL: [Self; 6] = [
+        Self::Unavailable,
+        Self::Failed,
+        Self::Malformed,
+        Self::OutOfRange,
+        Self::AreDisabled,
+        Self::AnyParticipating,
+    ];
+
+    /// ログ・メトリクス用の固定文字列。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+            Self::Malformed => "malformed",
+            Self::OutOfRange => "out-of-range",
+            Self::AreDisabled => "are-disabled",
+            Self::AnyParticipating => "any-participating",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Unavailable => 0,
+            Self::Failed => 1,
+            Self::Malformed => 2,
+            Self::OutOfRange => 3,
+            Self::AreDisabled => 4,
+            Self::AnyParticipating => 5,
+        }
+    }
+
+    /// 読み出しの失敗を理由と code に分類する。
+    fn from_read_error(e: &MicrovmError) -> (Self, Option<MicrovmErrorCode>) {
+        let reason = if e.code() == MicrovmErrorCode::Unimplemented {
+            Self::Unavailable
+        } else {
+            Self::Failed
+        };
+        (reason, Some(e.code()))
+    }
+}
+
+/// `GICD_*` レジスタの読み手。本番は `hvf::gic` の sink（`hv_gic_get_distributor_reg`）、試験は偽物。
+pub trait GicdRegisterRead {
+    /// レジスタの生値を読む。
+    fn read(&self, reg: GicDistributorReg) -> Result<u64, MicrovmError>;
+}
+
+/// 理由別の縮退件数の写し（#3974）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpiRouteStatsSnapshot {
+    counts: [u64; 6],
+}
+
+impl SpiRouteStatsSnapshot {
+    /// `reason` の件数。
+    pub fn count(&self, reason: SpiRouteFallback) -> u64 {
+        self.counts.get(reason.index()).copied().unwrap_or(0)
+    }
+
+    /// 全理由の合計（飽和加算）。
+    pub fn total(&self) -> u64 {
+        self.counts.iter().fold(0u64, |a, c| a.saturating_add(*c))
+    }
+}
+
+/// [`SpiRouting::resolve`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpiRouteDecision {
+    /// 起こす宛先。
+    pub target: SpiWakeTarget,
+    /// 縮退したときの理由。ルーティングで決まれば `None`。
+    pub fallback: Option<SpiRouteFallback>,
+    /// 読み出しの失敗に由来する縮退のときの失敗コード（ログ用）。
+    pub code: Option<MicrovmErrorCode>,
+    /// 縮退の理由として初回（ログを出す）か。
+    pub first: bool,
+}
+
+#[derive(Debug, Default)]
+struct SpiRoutingInner {
+    counts: [AtomicU64; 6],
+    are_enabled: AtomicBool,
+}
+
+type RouteError = (SpiRouteFallback, Option<MicrovmErrorCode>);
+
+/// VM ごとの SPI ルーティングの共有状態（#3974・MVM-5・REPAIR-4）。縮退の理由別件数と、ARE のラッチを持つ。
+///
+/// `hvf::gic` の sink が clone を共有し、assert 成功のたびに [`Self::resolve`] で宛先を決める。件数はアロケーションしない
+/// 固定長の atomic で、ゲストが不正な値を書き続けてもログは理由ごとの初回しか出ない。`Relaxed` なのは、値で他のデータを
+/// 公開しない統計であり、ARE のラッチも誤っても次の assert で直る（起床先が変わるだけで `WFI_WAIT_MAX` で有界）ため。
+#[derive(Debug, Clone, Default)]
+pub struct SpiRouting(Arc<SpiRoutingInner>);
+
+impl SpiRouting {
+    /// 理由別件数の写し。
+    pub fn snapshot(&self) -> SpiRouteStatsSnapshot {
+        let mut counts = [0u64; 6];
+        for (dst, src) in counts.iter_mut().zip(self.0.counts.iter()) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+        SpiRouteStatsSnapshot { counts }
+    }
+
+    /// 縮退を 1 件数える。その理由で初回なら `true`。
+    fn record(&self, reason: SpiRouteFallback) -> bool {
+        self.0
+            .counts
+            .get(reason.index())
+            .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
+    }
+
+    /// 宛先を決める。ARE が未確認なら `GICD_CTLR` を読み、ARE = 1 のときだけ `GICD_IROUTER<intid>` を読む。
+    /// `hint` は縮退先（学習した宛先）。`hv_*` は `reader` の中だけ。
+    pub fn resolve<R: GicdRegisterRead>(
+        &self,
+        reader: &R,
+        intid: u32,
+        hint: Option<u32>,
+        vcpus: u32,
+    ) -> SpiRouteDecision {
+        match self.route(reader, intid, vcpus) {
+            Ok(i) => SpiRouteDecision {
+                target: SpiWakeTarget::Vcpu(i),
+                fallback: None,
+                code: None,
+                first: false,
+            },
+            Err((reason, code)) => SpiRouteDecision {
+                target: fallback_target(hint, vcpus),
+                fallback: Some(reason),
+                code,
+                first: self.record(reason),
+            },
+        }
+    }
+
+    fn route<R: GicdRegisterRead>(
+        &self,
+        reader: &R,
+        intid: u32,
+        vcpus: u32,
+    ) -> Result<u32, RouteError> {
+        if !self.0.are_enabled.load(Ordering::Relaxed) {
+            let raw = reader
+                .read(GicDistributorReg::ctlr())
+                .map_err(|e| SpiRouteFallback::from_read_error(&e))?;
+            match decode_gicd_ctlr_are(raw) {
+                GicdCtlrAre::Enabled => self.0.are_enabled.store(true, Ordering::Relaxed),
+                GicdCtlrAre::Disabled => return Err((SpiRouteFallback::AreDisabled, None)),
+                GicdCtlrAre::Malformed => return Err((SpiRouteFallback::Malformed, None)),
+            }
+        }
+        let reg = GicDistributorReg::irouter(intid)
+            .map_err(|e| (SpiRouteFallback::Failed, Some(e.code())))?;
+        let raw = reader
+            .read(reg)
+            .map_err(|e| SpiRouteFallback::from_read_error(&e))?;
+        classify_irouter(raw, vcpus).map_err(|r| (r, None))
+    }
+}
+
+/// 縮退の初回ログの 1 行（#3974・REPAIR-4）。ゲスト由来の値は埋め込まない固定文言。`code` は読み出しの失敗の分類。
+pub fn spi_route_fallback_log_line(
+    reason: SpiRouteFallback,
+    code: Option<MicrovmErrorCode>,
+) -> String {
+    let code = code
+        .map(|c| format!(" code={}", c.as_str()))
+        .unwrap_or_default();
+    format!(
+        "level=warn op=hvf.gic.spi_route outcome=fallback reason={}{code} message=\"gic routing is not used; waking the learned hint or all vcpus (logged once per reason)\"",
+        reason.as_str()
+    )
 }
 
 impl WakeAll for WfiWakeSet {
@@ -568,6 +796,207 @@ mod tests {
         for (out, el) in r {
             assert_eq!(out, WakeOutcome::Notified);
             assert!(el < Duration::from_millis(500));
+        }
+    }
+
+    // ---- #3974: 縮退の理由別件数・初回ログ・ARE ----
+
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    struct FakeGicd {
+        ctlr: RefCell<Result<u64, MicrovmErrorCode>>,
+        irouter: RefCell<Result<u64, MicrovmErrorCode>>,
+        ctlr_reads: Cell<u32>,
+        irouter_reads: Cell<u32>,
+    }
+
+    impl FakeGicd {
+        fn new(
+            ctlr: Result<u64, MicrovmErrorCode>,
+            irouter: Result<u64, MicrovmErrorCode>,
+        ) -> Self {
+            Self {
+                ctlr: RefCell::new(ctlr),
+                irouter: RefCell::new(irouter),
+                ctlr_reads: Cell::new(0),
+                irouter_reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl GicdRegisterRead for FakeGicd {
+        fn read(&self, reg: GicDistributorReg) -> Result<u64, MicrovmError> {
+            let (cell, n) = if reg == GicDistributorReg::ctlr() {
+                (&self.ctlr, &self.ctlr_reads)
+            } else {
+                (&self.irouter, &self.irouter_reads)
+            };
+            n.set(n.get() + 1);
+            cell.borrow()
+                .map_err(|c| MicrovmError::new(c, "fake read failed"))
+        }
+    }
+
+    fn counts_of(r: &SpiRouting) -> HashMap<&'static str, u64> {
+        let s = r.snapshot();
+        SpiRouteFallback::ALL
+            .iter()
+            .map(|f| (f.as_str(), s.count(*f)))
+            .collect()
+    }
+
+    #[test]
+    fn mvm5_repair4_3974_unavailable_counts_and_first() {
+        let routing = SpiRouting::default();
+        let g = FakeGicd::new(Err(MicrovmErrorCode::Unimplemented), Ok(0x1));
+        let d1 = routing.resolve(&g, 40, Some(1), 4);
+        let d2 = routing.resolve(&g, 40, Some(1), 4);
+        let d3 = routing.resolve(&g, 40, None, 4);
+        assert_eq!(d1.target, SpiWakeTarget::Vcpu(1));
+        assert_eq!(d3.target, SpiWakeTarget::All);
+        assert_eq!(d1.fallback, Some(SpiRouteFallback::Unavailable));
+        assert_eq!(d1.code, Some(MicrovmErrorCode::Unimplemented));
+        assert_eq!([d1.first, d2.first, d3.first], [true, false, false]);
+        let s = routing.snapshot();
+        assert_eq!(s.count(SpiRouteFallback::Unavailable), 3);
+        assert_eq!(s.total(), 3);
+        // CTLR が読めないとき IROUTER は読まない（二重計上しない）。
+        assert_eq!(g.irouter_reads.get(), 0);
+        assert_eq!(g.ctlr_reads.get(), 3);
+    }
+
+    #[test]
+    fn mvm5_repair4_3974_each_reason_counted() {
+        let r = SpiRouting::default();
+        // Failed: IROUTER の読み出しが Internal。
+        let g = FakeGicd::new(Ok(0x10), Err(MicrovmErrorCode::Internal));
+        let d = r.resolve(&g, 40, None, 4);
+        assert_eq!(d.fallback, Some(SpiRouteFallback::Failed));
+        assert_eq!(d.code, Some(MicrovmErrorCode::Internal));
+        assert!(d.first);
+        // Malformed: IROUTER の RES0。
+        *g.irouter.borrow_mut() = Ok(1 << 40);
+        let d = r.resolve(&g, 40, None, 4);
+        assert_eq!(d.fallback, Some(SpiRouteFallback::Malformed));
+        assert_eq!(d.code, None);
+        // OutOfRange: affinity 5 は 2 台に当たらない。
+        *g.irouter.borrow_mut() = Ok(0x5);
+        let d = r.resolve(&g, 40, Some(1), 2);
+        assert_eq!(d.fallback, Some(SpiRouteFallback::OutOfRange));
+        assert_eq!(d.target, SpiWakeTarget::Vcpu(1));
+        // AnyParticipating。
+        *g.irouter.borrow_mut() = Ok(0x8000_0000);
+        let d = r.resolve(&g, 40, None, 4);
+        assert_eq!(d.fallback, Some(SpiRouteFallback::AnyParticipating));
+        assert_eq!(d.target, SpiWakeTarget::All);
+        // 成功は件数を増やさない。
+        *g.irouter.borrow_mut() = Ok(0x2);
+        let d = r.resolve(&g, 40, None, 4);
+        assert_eq!(d.target, SpiWakeTarget::Vcpu(2));
+        assert_eq!((d.fallback, d.first), (None, false));
+        let c = counts_of(&r);
+        assert_eq!(c["failed"], 1);
+        assert_eq!(c["malformed"], 1);
+        assert_eq!(c["out-of-range"], 1);
+        assert_eq!(c["any-participating"], 1);
+        assert_eq!(c["unavailable"], 0);
+        assert_eq!(c["are-disabled"], 0);
+        // Malformed の CTLR（別の VM）。
+        let r2 = SpiRouting::default();
+        let g2 = FakeGicd::new(Ok(1 << 32), Ok(0x1));
+        let d = r2.resolve(&g2, 40, None, 4);
+        assert_eq!(d.fallback, Some(SpiRouteFallback::Malformed));
+        assert_eq!(g2.irouter_reads.get(), 0);
+    }
+
+    #[test]
+    fn mvm5_repair4_3974_are_disabled_skips_irouter_and_latch() {
+        let r = SpiRouting::default();
+        let g = FakeGicd::new(Ok(0x0), Ok(0x1));
+        let d1 = r.resolve(&g, 40, Some(3), 4);
+        let d2 = r.resolve(&g, 40, Some(3), 4);
+        assert_eq!(d1.fallback, Some(SpiRouteFallback::AreDisabled));
+        assert_eq!(d1.target, SpiWakeTarget::Vcpu(3));
+        assert_eq!((d1.first, d2.first), (true, false));
+        assert_eq!(r.snapshot().count(SpiRouteFallback::AreDisabled), 2);
+        assert_eq!(g.irouter_reads.get(), 0);
+        // ゲストが ARE を立てた。次の assert から IROUTER を使う。
+        *g.ctlr.borrow_mut() = Ok(0x10);
+        let d3 = r.resolve(&g, 40, Some(3), 4);
+        assert_eq!(d3.target, SpiWakeTarget::Vcpu(1));
+        assert_eq!(d3.fallback, None);
+        // ラッチ後は CTLR を読まない。
+        let d4 = r.resolve(&g, 40, Some(3), 4);
+        assert_eq!(d4.target, SpiWakeTarget::Vcpu(1));
+        assert_eq!(g.ctlr_reads.get(), 3);
+        assert_eq!(g.irouter_reads.get(), 2);
+        assert_eq!(r.snapshot().total(), 2);
+    }
+
+    #[test]
+    fn repair4_mvm5_3974_log_line_and_as_str_values() {
+        assert_eq!(
+            spi_route_fallback_log_line(SpiRouteFallback::AreDisabled, None),
+            "level=warn op=hvf.gic.spi_route outcome=fallback reason=are-disabled message=\"gic routing is not used; waking the learned hint or all vcpus (logged once per reason)\""
+        );
+        assert_eq!(
+            spi_route_fallback_log_line(SpiRouteFallback::Failed, Some(MicrovmErrorCode::Internal)),
+            "level=warn op=hvf.gic.spi_route outcome=fallback reason=failed code=INTERNAL message=\"gic routing is not used; waking the learned hint or all vcpus (logged once per reason)\""
+        );
+        let names: Vec<_> = SpiRouteFallback::ALL.iter().map(|f| f.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "unavailable",
+                "failed",
+                "malformed",
+                "out-of-range",
+                "are-disabled",
+                "any-participating"
+            ]
+        );
+    }
+
+    #[test]
+    fn repair5_mvm5_3974_record_is_first_exactly_once_under_contention() {
+        let r = SpiRouting::default();
+        let firsts = Arc::new(AtomicU64::new(0));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let r = r.clone();
+                let f = Arc::clone(&firsts);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        if r.record(SpiRouteFallback::Failed) {
+                            f.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(r.snapshot().count(SpiRouteFallback::Failed), 8000);
+        assert_eq!(firsts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repair5_mvm5_3974_notify_target_wakes_only_target_slot() {
+        let set = set4();
+        set.notify_target(SpiWakeTarget::Vcpu(2));
+        for i in 0..SLOTS as u32 {
+            let want = if i == 2 {
+                WakeOutcome::Notified
+            } else {
+                WakeOutcome::TimedOut
+            };
+            assert_eq!(
+                set.handle(i).unwrap().wait(Duration::ZERO),
+                want,
+                "slot {i}"
+            );
         }
     }
 

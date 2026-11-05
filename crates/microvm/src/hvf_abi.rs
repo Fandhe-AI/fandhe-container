@@ -722,14 +722,15 @@ impl GicIntid {
     }
 }
 
-/// `hv_gic_distributor_reg_t` の列挙値（`GICD_IROUTER<n>` のみ。#3960・MVM-5・REPAIR-2）。
+/// `hv_gic_distributor_reg_t` の列挙値（`GICD_CTLR` と `GICD_IROUTER<n>` のみ。#3960・#3974・MVM-5・REPAIR-2）。
 ///
 /// Apple の文書は、列挙値が ARM GICv3 仕様の distributor のレジスタオフセットに等しいと述べる
 /// （`hv_gic_get_distributor_reg`。macOS 15.0）。型の幅は `uint16_t`（`hv_gic_distributor_reg_t` の `rawValue` は `UInt16`）。
-/// 構築口は [`Self::irouter`] だけで、SPI の範囲外の INTID は作れない（壊れた値を表現できない）。
+/// 構築口は [`Self::ctlr`] と [`Self::irouter`] だけで、SPI の範囲外の INTID は作れない（壊れた値を表現できない）。
 /// 出典: <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・
 /// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
-/// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>（確認日 2026-11-05）。
+/// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>・
+/// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_ctlr>（確認日 2026-11-05）。
 /// SDK ヘッダとの照合は #3803。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GicDistributorReg(u16);
@@ -742,6 +743,11 @@ const GIC_SPI_MIN_INTID: u32 = 32;
 const GIC_SPI_MAX_INTID: u32 = 1019;
 
 impl GicDistributorReg {
+    /// `GICD_CTLR`（オフセット 0x0000。Arm IHI 0069）。ARE の確認に使う（#3974・MVM-5）。
+    pub const fn ctlr() -> Self {
+        Self(0)
+    }
+
     /// `GICD_IROUTER<intid>` のレジスタ。SPI の範囲（32..=1019）の外は `InvalidArgument`。
     pub fn irouter(intid: u32) -> Result<Self, MicrovmError> {
         if !(GIC_SPI_MIN_INTID..=GIC_SPI_MAX_INTID).contains(&intid) {
@@ -758,6 +764,34 @@ impl GicDistributorReg {
     /// FFI へ渡す列挙値（distributor のレジスタオフセット）。
     pub const fn bits(self) -> u16 {
         self.0
+    }
+}
+
+/// `GICD_CTLR.ARE` の復号結果（#3974・MVM-5）。値はゲストが書くので非信頼として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GicdCtlrAre {
+    /// ARE = 1。`GICD_IROUTER<n>` が宛先を表す。
+    Enabled,
+    /// ARE = 0。`GICD_IROUTER<n>` は意味を持たない。
+    Disabled,
+    /// 32 ビットのレジスタの上位が 0 でない（framework の異常値）。
+    Malformed,
+}
+
+/// `GICD_CTLR` の生値から ARE を復号する（#3974・MVM-5）。
+///
+/// ARE は bit 4（単一セキュリティ状態の ARE、Non-secure view の ARE_NS。Linux の `GICD_CTLR_ARE_NS` も `1 << 4`）。
+/// bit 5 が ARE_NS になるのは Secure view だけで、ゲスト（NS EL1）には当たらない。どの view が返るかの実機観測は #3803。
+/// RWP・Enable 等の他のビットは見ない。上位 32 ビットが 0 でなければ `Malformed`。
+pub fn decode_gicd_ctlr_are(raw: u64) -> GicdCtlrAre {
+    const ARE: u64 = 1 << 4;
+    if raw >> 32 != 0 {
+        return GicdCtlrAre::Malformed;
+    }
+    if raw & ARE != 0 {
+        GicdCtlrAre::Enabled
+    } else {
+        GicdCtlrAre::Disabled
     }
 }
 
@@ -1412,6 +1446,18 @@ mod tests {
         for raw in [&b"15.0"[..], b"15.1.1", b"26.0"] {
             assert!(check_gic_supported(parse_macos_product_version(raw).unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn mvm5_3974_ctlr_offset_and_are_values() {
+        assert_eq!(GicDistributorReg::ctlr().bits(), 0);
+        assert_eq!(decode_gicd_ctlr_are(0x0), GicdCtlrAre::Disabled);
+        assert_eq!(decode_gicd_ctlr_are(0x10), GicdCtlrAre::Enabled);
+        assert_eq!(decode_gicd_ctlr_are(0x30), GicdCtlrAre::Enabled);
+        assert_eq!(decode_gicd_ctlr_are(0x20), GicdCtlrAre::Disabled);
+        assert_eq!(decode_gicd_ctlr_are(0x8000_0012), GicdCtlrAre::Enabled);
+        assert_eq!(decode_gicd_ctlr_are(1 << 32), GicdCtlrAre::Malformed);
+        assert_eq!(decode_gicd_ctlr_are(u64::MAX), GicdCtlrAre::Malformed);
     }
 
     #[test]

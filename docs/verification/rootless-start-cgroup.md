@@ -87,7 +87,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 ## シナリオ 2: 実機前提試験の実行
 
-どれも `harness = false` で、`cargo test -p <パッケージ> --test <名前> --no-run` でビルドし、出力された試験バイナリを `cargo` 経由でなく直接実行する。前提が欠けると skip でなく失敗する。起動の仕方の取り違えに注意する。成功時の最終行は [AGENTS.md](../../AGENTS.md)「実機前提テスト」と同じ。
+どれも `harness = false` で、`cargo test -p <パッケージ> --test <名前> --no-run` でビルドし、出力された試験バイナリを `cargo` 経由でなく直接実行する。前提が欠けると skip でなく失敗する。起動の仕方の取り違えに注意する。成功時の最終行は [real-machine-tests.md](real-machine-tests.md)と同じ。
 
 | 試験 | パッケージ | 起動の仕方 | 成功時の最終行 | CI での実行 |
 | ---- | ---------- | ---------- | -------------- | ----------- |
@@ -95,7 +95,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 | `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` | あり（platform-ci の ubuntu。#3105） |
 | `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor` で supervisor をビルドする（試験が専用の `bin/` へ CLI と supervisor だけを複製し、launcher が無いことを確かめるので、`target/debug` の launcher を消す必要は無い）。`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` | あり（platform-ci の ubuntu。#3105） |
 | `start_stop_delete_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored`（CLI の実バイナリだけで create → start → list → logs → stop → delete を通す。#2450） | `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs` | あり（platform-ci の ubuntu。#2596） |
-| `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | AGENTS.md の該当行を参照 | あり（platform-ci の ubuntu。#2596） |
+| `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | real-machine-tests.md の該当行を参照 | あり（platform-ci の ubuntu。#2596） |
 
 ## 結果記録の雛形
 

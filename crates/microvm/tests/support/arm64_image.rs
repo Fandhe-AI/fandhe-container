@@ -9,6 +9,8 @@
 //! - `crates/microvm/tests/hvf_device.rs`: `#[path = "support/arm64_image.rs"] mod arm64_image;`
 //! - `crates/plugin-microvm/tests/e2e.rs`: `#[path = "../../microvm/tests/support/arm64_image.rs"] mod arm64_image;`
 //!
+//! - `crates/microvm/tests/microvm.rs`（aarch64 の起動と停止の通し。#3972）: `BOOT_CHECK_CODE` と `image_with_code`。
+//!
 //! `hvf_microvm.rs`（TASK-192.17・#3799）は `BOOT_CHECK_CODE` と `image_with_code` を使う（同じ正本から取り込む）。
 //!
 //! 対応: MVM-5・MVM-1・TASK-192.18・#3800。ローダ側の解釈は `fandhe_container_microvm::boot_arm64::Arm64ImageHeader`。

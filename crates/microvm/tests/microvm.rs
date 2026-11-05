@@ -13,6 +13,12 @@
 //! アドレスと長さ、PIO の port とデータ（`O`・`K`・`\n`）、`StopReason` で判定する（#3769）。
 //! 不一致は `ud2` で `GuestShutdown` になるため、「シャットダウン＝成功」とはみなさない。
 //! 負の対照は block 無しの同じペイロードで、未登録 MMIO が 0xFF 埋めとなり照合に失敗することを確かめる。
+//!
+//! aarch64（#3972）: 必要環境は aarch64 Linux・`/dev/kvm`・in-kernel GICv3・`KVM_CAP_ARM_PSCI_0_2`。合成 arm64 Image の
+//! ゲスト（`support/arm64_image.rs` の `BOOT_CHECK_CODE`）が FDT の magic と virtio-mmio の MagicValue・DeviceID を
+//! 確かめ、全一致のときだけシリアルの THR へ `OK\n` を書き、成否に関わらず PSCI SYSTEM_OFF で止まる。
+//! ホストは exit の並び（`mmio×5, system_event`）と値・シリアル出力・`GuestShutdown` で判定する。
+//! x86_64・aarch64 以外の arch は組み立てが未実装で、`Unimplemented` を確かめるだけ。
 #![cfg(target_os = "linux")]
 
 /// 合成 bzImage の正本（複製しない・#3750）。インライン module 内では `#[path]` の基準が変わるため、ここで宣言する。
@@ -20,27 +26,22 @@
 #[path = "support/bzimage.rs"]
 mod bzimage;
 
-#[cfg(target_arch = "x86_64")]
-mod x86 {
-    use super::bzimage;
-    use fandhe_container_microvm::device::{BoundedRunLog, KvmDevice, RunOutcome, ValueCapture};
-    use fandhe_container_microvm::exit::{ExitData, ExitValue, IoDirection};
-    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
-    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
-    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
-    use std::sync::Arc;
-    use std::sync::mpsc;
+/// x86_64 と aarch64 の両方の試験が使う補助（観測器の記録の取り出しと期限つき待ち。REPAIR-1）。
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod common {
+    use fandhe_container_microvm::device::{BoundedRunLog, RunOutcome, ValueCapture};
+    use fandhe_container_microvm::exit::{ExitData, ExitValue};
     use std::time::{Duration, Instant};
 
     /// 記録件数の上限。10 秒の待ち / 100ms のポーリング + 停止までの記録を十分に上回る。
     const LOG_CAPACITY: usize = 256;
 
-    fn new_log() -> BoundedRunLog {
+    pub fn new_log() -> BoundedRunLog {
         BoundedRunLog::new(LOG_CAPACITY, ValueCapture::Record).unwrap()
     }
 
     /// 記録された VM exit の種別名だけを並べる（中断・期限切れは捨てる）。
-    fn kinds_of(log: &BoundedRunLog) -> Vec<&'static str> {
+    pub fn kinds_of(log: &BoundedRunLog) -> Vec<&'static str> {
         log.records()
             .iter()
             .filter_map(|r| match r.outcome {
@@ -51,7 +52,7 @@ mod x86 {
     }
 
     /// Exit の記録の値（中断・期限切れは捨てる）。
-    fn values_of(log: &BoundedRunLog) -> Vec<Option<ExitValue>> {
+    pub fn values_of(log: &BoundedRunLog) -> Vec<Option<ExitValue>> {
         log.records()
             .iter()
             .filter(|r| matches!(r.outcome, RunOutcome::Exit(_)))
@@ -59,7 +60,7 @@ mod x86 {
             .collect()
     }
 
-    fn mmio_read(phys_addr: u64) -> Option<ExitValue> {
+    pub fn mmio_read(phys_addr: u64) -> Option<ExitValue> {
         Some(ExitValue::Mmio {
             phys_addr,
             len: 4,
@@ -67,6 +68,32 @@ mod x86 {
             data: ExitData::empty(),
         })
     }
+
+    pub fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::bzimage;
+    use fandhe_container_microvm::device::KvmDevice;
+    use fandhe_container_microvm::exit::{ExitData, ExitValue, IoDirection};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::common::*;
 
     fn pio_out(byte: u8) -> Option<ExitValue> {
         Some(ExitValue::Pio {
@@ -76,17 +103,6 @@ mod x86 {
             count: 1,
             data: ExitData::from_slice(&[byte]),
         })
-    }
-
-    fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
-        let end = Instant::now() + limit;
-        while Instant::now() < end {
-            if cond() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        cond()
     }
 
     /// 起動状態を検証するゲストの機械語。成功時だけ PIO 0x10 へ 3 回 write して自己ループする。
@@ -252,7 +268,167 @@ mod x86 {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// 合成 arm64 Image の正本（`kvm_device.rs`・`hvf_device.rs` と共有。#3972）。
+#[cfg(target_arch = "aarch64")]
+#[path = "support/arm64_image.rs"]
+mod arm64_image;
+
+#[cfg(target_arch = "aarch64")]
+mod arm64 {
+    use super::arm64_image::{BOOT_CHECK_CODE, image_with_code};
+    use super::common::*;
+    use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, ARM64_VIRTIO_MMIO_BASE};
+    use fandhe_container_microvm::device::{BoundedRunLog, KvmDevice};
+    use fandhe_container_microvm::exit::{ExitData, ExitValue};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// シリアル THR への 1 バイト write の exit の値。
+    fn mmio_write(phys_addr: u64, byte: u8) -> Option<ExitValue> {
+        Some(ExitValue::Mmio {
+            phys_addr,
+            len: 1,
+            is_write: true,
+            data: ExitData::from_slice(&[byte]),
+        })
+    }
+
+    struct Outcome {
+        reason: StopReason,
+        kinds: Vec<&'static str>,
+        values: Vec<Option<ExitValue>>,
+        serial: Vec<u8>,
+        dropped: u64,
+        exits: u64,
+        errors: u64,
+        elapsed: Duration,
+        obs_refs: usize,
+    }
+
+    /// 組み立て・ロード・開始・待ち・停止までを通す。`with_block` が偽なら負の対照。
+    /// 正負どちらもゲストが PSCI SYSTEM_OFF で自分から止まるため、`is_finished` を待ってから `stop` する。
+    fn boot_and_stop(with_block: bool) -> Outcome {
+        let dev = match KvmDevice::open() {
+            Ok(d) => d,
+            Err(e) => {
+                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
+            }
+        };
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = match MicroVm::assemble(
+            &dev,
+            MicroVmConfig {
+                vcpu_count: 1,
+                mem_size: 64 << 20,
+                block: if with_block {
+                    vec![MemoryBlockBackend::new(16 * 512, false).unwrap()]
+                } else {
+                    vec![]
+                },
+                net: vec![],
+            },
+        ) {
+            Ok(vm) => vm,
+            Err(e) => {
+                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
+            }
+        };
+        if with_block {
+            assert_eq!(
+                vm.devices()[0].slot.mmio_base,
+                ARM64_VIRTIO_MMIO_BASE,
+                "payload MMIO address"
+            );
+        }
+        let serial = vm.serial_console();
+        let img = image_with_code(&BOOT_CHECK_CODE);
+        let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+        let obs: Arc<BoundedRunLog> = Arc::new(new_log());
+        vm.vcpu_mut(0).unwrap().set_observer(obs.clone());
+        let running = vm.start(&loaded).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || running.is_finished()),
+            "guest did not shut down: {:?}",
+            kinds_of(&obs)
+        );
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        let elapsed = t.elapsed();
+        Outcome {
+            reason: report.reason,
+            kinds: kinds_of(&obs),
+            values: values_of(&obs),
+            serial: serial.take_output().unwrap(),
+            dropped: obs.dropped(),
+            exits: report.stats.exits,
+            errors: report.stats.errors,
+            elapsed,
+            obs_refs: Arc::strong_count(&obs),
+        }
+    }
+
+    /// REPAIR-5: 止まったスレッドが残っても、期限切れで試験ごと失敗にする。
+    fn bounded(with_block: bool) -> Outcome {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(boot_and_stop(with_block));
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("boot_and_stop did not finish within 60s (or panicked)")
+    }
+
+    /// MVM-1・REPAIR-12・#3972: 最小構成の microVM が起動し、起動状態の検証に合格して PSCI SYSTEM_OFF で止まる。
+    /// x86_64 版との違いは、ゲストが自分で止まるため停止理由が `GuestShutdown` になることと、
+    /// 成功の印が PIO ではなくシリアルの THR（MMIO write）で出ること。`kvm_device` の serial 試験と違い、
+    /// ここでは観測器が記録した exit の並びと値を主な判定にし、シリアル出力は補強として照合する。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn microvm_boots_minimal_device_model_and_stops() {
+        let o = bounded(true);
+        assert_eq!(
+            o.kinds,
+            vec!["mmio", "mmio", "mmio", "mmio", "mmio", "system_event"]
+        );
+        // FDT の magic は RAM 上の読みで exit にならない。MagicValue / DeviceID の読みと 'O' 'K' '\n' の THR write。
+        assert_eq!(
+            o.values,
+            vec![
+                mmio_read(ARM64_VIRTIO_MMIO_BASE),
+                mmio_read(ARM64_VIRTIO_MMIO_BASE + 8),
+                mmio_write(ARM64_SERIAL_BASE, b'O'),
+                mmio_write(ARM64_SERIAL_BASE, b'K'),
+                mmio_write(ARM64_SERIAL_BASE, b'\n'),
+                None,
+            ]
+        );
+        assert_eq!(o.serial, b"OK\n");
+        assert_eq!(o.dropped, 0);
+        assert_eq!(o.reason, StopReason::GuestShutdown);
+        assert_eq!(o.exits, 6);
+        assert_eq!(o.errors, 0);
+        assert!(o.elapsed < Duration::from_secs(2), "{:?}", o.elapsed);
+        assert_eq!(o.obs_refs, 1, "MicroVm must be dropped after stop");
+    }
+
+    /// MVM-1・REPAIR-12・#3972: 負の対照。block 無しでは MagicValue の照合に失敗し、THR へ書かずに SYSTEM_OFF する。
+    /// 停止理由は正負とも `GuestShutdown` なので、区別するのは exit の並びとシリアル出力だけ。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
+    fn microvm_boot_check_fails_without_block_device() {
+        let o = bounded(false);
+        assert_eq!(o.kinds, vec!["mmio", "system_event"]);
+        assert_eq!(o.values.first(), Some(&mmio_read(ARM64_VIRTIO_MMIO_BASE)));
+        assert!(o.serial.is_empty(), "{:?}", o.serial);
+        assert_eq!(o.reason, StopReason::GuestShutdown);
+        assert_eq!(o.errors, 0);
+        assert_eq!(o.obs_refs, 1);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod other {
     use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::error::MicrovmErrorCode;

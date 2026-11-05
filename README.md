@@ -56,6 +56,8 @@ target/debug/fandhe-container --root /tmp/fc-state list                         
 
 `start` の終了結果だけでコンテナの状態は決まりません。成功しても、すぐ終わるプロセスなら次の `list` では既に stopped になっていることがあります。CLI が supervisor の報告を待ち切れずにタイムアウトで失敗した場合も、supervisor は止めないので、コンテナが running になっていることがあります。状態は `list` で確かめてください。
 
+`stop` は、再起動の途中だと `Timeout`（`the restart cancellation did not complete within the timeout`）で失敗することがあります。このとき再起動が取り消されたとは限らず、コンテナが running に戻っていることがあります。`list` で状態を確かめて、`stop` をもう一度実行してください。
+
 `make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 
 ## 開発環境構築

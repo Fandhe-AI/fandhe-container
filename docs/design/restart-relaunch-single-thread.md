@@ -49,6 +49,8 @@ core の本番 launcher（`ProductionLauncher`、`LaunchMode::SelfBounded`）は
 - pause の間の接続は backlog に積まれ、resume の後に同じ検証（`SO_PEERCRED`・固定長 frame・期限）で処理される。
 - pause 中に届いた CancelRestartRequest は resume の後に処理されるため、`Active` の状態で `ContainerRunning` になり得る。CLI は
   これを記録の読み直しとして扱う（`stop_delete`）。client は `ECONNREFUSED`・`ENOENT` を再試行する。
+- 再 launch 中に取り消しが期限に達したときは、取り消し専用の文言の `Timeout` を返す（#3973）。`ContainerRunning` にしないのは、
+  期限切れの時点では新しいプロセスが動いているか分からないため（2026-11-05 オーナー判断）。利用者は `list` で確かめて `stop` をやり直す。
 - accept の poll 間隔（100ms）が停止の待ちに載り得る。restart レイテンシ（SUP-3 の中央値 100ms）の実測は #491（人間担当）で、
   短縮や起床の仕組みはその結果を見て判断する。
 

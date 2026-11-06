@@ -30,7 +30,7 @@
 //!     起こす（許される範囲）。SMP では vCPU ごとに専用のスロット（`WfiWakeSet`）を持ち、SPI は学習した宛先のスロットだけ、宛先不明と停止要求は全台を起こす（#3933・#3948）。
 //! (c) mask の解除は `hv_vcpu_run` の再入直前（`sync_before_run`）にも確認する。ただし線が立っている間は外せず、
 //!     ゲストが CVAL を進める等で線が下がった後の次の再入（exit か実行期限）で外れる。
-//! (d) mach の 2 関数の SDK ヘッダとの照合は #3997。
+//! (d) mach の 2 関数の宣言は SDK 27.2 のヘッダと一致した（#3997）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{WfxKind, instruction_length};

@@ -15,8 +15,8 @@
 //! 実機で観測し、外れていればその試験が落ちる（実機では次の命令だった。#3803）。trap した SMC は SMC 自身を指すので命令長だけ進める。
 //!
 //! # 未実装（REPAIR-3）
-//! FDT は `method = "hvc"` のため SMC はゲストの誤りで NOT_SUPPORTED を返す。HVF が SMC で exit するか（HCR_EL2.TSC の扱い）は
-//! 未確認で #3997 で記録する。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。
+//! FDT は `method = "hvc"` のため SMC はゲストの誤りで NOT_SUPPORTED を返す。HVF は SMC で exit する（GIC なしの VM の 20 回すべてで EC 0x17・syndrome 0x5e00_0000・
+//! PC は SMC 自身。macOS 27.2・Apple M4 Max。#3997）。`handle_smc` を実機で通す試験は無い。1 vCPU 構成（`HvcHandler::new()`）の実挙動は CPU_ON(0) が ALREADY_ON・CPU_ON(他) が INVALID_PARAMETERS・CPU_OFF が DENIED・AFFINITY_INFO(0) が ON。
 //! N 台構成（#3891）では全 vCPU のハンドラが共有の `PsciCpus` と `hvf_smp::HvfPowerControl` を持つ。CPU_ON(1..N) は entry を検査して AP のメールボックスへ積み、
 //! CPU_OFF は AP では `ExitAction::Park`（呼び出し元の vCPU を parked に戻す）、BSP では DENIED。`PsciAction::CpuOff` の index が自分と違う場合は不変条件違反で `Err`（fail-closed）。
 

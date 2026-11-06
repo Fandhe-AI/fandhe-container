@@ -761,6 +761,14 @@ mod reap;
 #[path = "../../microvm/tests/support/bzimage.rs"]
 mod bzimage;
 
+/// KVM 側の前提欠如と回帰の振り分けの正本（環境を示すコードだけ前提欠如にする。MVM-1・REPAIR-4・#3992）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "../../microvm/tests/support/kvm_precondition.rs"]
+mod kvm_precondition;
+
 /// 層 B の共有補助（実バイナリの spawn・期限つき回収・反射検査）。Linux x86_64 / aarch64 の KVM と macOS aarch64 の HVF が使う。
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -878,7 +886,7 @@ mod real_kvm {
 
     fn precondition() {
         if let Err(e) = fandhe_container_microvm::device::KvmDevice::open() {
-            panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}");
+            panic!("{}", super::kvm_precondition::open_failure_line("e2e", &e));
         }
     }
 
@@ -990,10 +998,9 @@ mod real_kvm_arm64 {
     /// 前提を確かめる。`/dev/kvm` が開けても vGICv3 や PSCI 0.2 が無ければ plugin 側の start が Error になり回帰と見分けにくいため、
     /// 試験プロセス内で VM を組み立てて直ちに drop する。欠けていれば決まった 1 行目で失敗させる（skip しない）。
     fn precondition() {
-        let dev = match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
-        };
+        let dev = KvmDevice::open().unwrap_or_else(|e| {
+            panic!("{}", super::kvm_precondition::open_failure_line("e2e", &e))
+        });
         let config = MicroVmConfig::<MemoryBlockBackend, MemoryNetBackend> {
             vcpu_count: 1,
             mem_size: 64 << 20,
@@ -1002,7 +1009,10 @@ mod real_kvm_arm64 {
         };
         match MicroVm::assemble(&dev, config) {
             Ok(vm) => drop(vm),
-            Err(e) => panic!("e2e: PRECONDITION FAILED (test environment, not a regression): {e}"),
+            Err(e) => panic!(
+                "{}",
+                super::kvm_precondition::assemble_failure_line("e2e", &e)
+            ),
         }
     }
 

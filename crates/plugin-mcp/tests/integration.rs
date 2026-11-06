@@ -316,6 +316,102 @@ mod uds {
         assert!(!err.contains(sock.to_str().expect("utf8")), "{err}");
     }
 
+    /// MCP-3・MCP-2・PLUG-12 / TASK-119.5: 同一 UID の UDS 上で modern（2026-07-28）の 3 要求
+    /// （`server/discover` → `tools/list` → `tools/call`。`initialize` なし）が正常に応答する。
+    #[test]
+    fn mcp3_modern_requests_over_uds_same_uid() {
+        let dir = TempDir::new();
+        assert_non_root(&dir);
+        let runtime = dir.0.join("run");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&runtime)
+            .unwrap();
+        let sock = dir.0.join("p.sock");
+        let listener = UdsListener::bind(&sock).expect("bind");
+        let child = ChildGuard(Some(spawn_with(
+            listener.path().as_os_str(),
+            Some(&runtime),
+        )));
+        let mut obs = JsonLinesPeerAuthObserver::new();
+        let mut stream = listener
+            .accept(Duration::from_secs(20), &mut obs)
+            .expect("accept");
+        assert_eq!(obs.len(), 0);
+        stream
+            .set_io_timeout(Duration::from_secs(1))
+            .expect("set timeout");
+        let mut reader = BufReader::new(stream);
+
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let send = |reader: &mut BufReader<fandhe_container_plugin::UdsStream>, v: Value| {
+            let mut text = v.to_string();
+            text.push('\n');
+            reader
+                .get_mut()
+                .write_all(text.as_bytes())
+                .expect("write request");
+        };
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}}),
+        );
+        let discover = read_reply(&mut reader);
+        assert_eq!(discover["id"], json!(1));
+        assert_eq!(discover["result"]["resultType"], json!("complete"));
+        assert_eq!(
+            discover["result"]["supportedVersions"],
+            json!(["2026-07-28"])
+        );
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":meta}}),
+        );
+        let list = read_reply(&mut reader);
+        assert_eq!(list["id"], json!(2));
+        assert_eq!(list["result"]["resultType"], json!("complete"));
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, ["list_containers", "start_container"]);
+
+        send(
+            &mut reader,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                   "params":{"_meta":meta,"name":"list_containers","arguments":{}}}),
+        );
+        let call = read_reply(&mut reader);
+        assert_eq!(call["id"], json!(3));
+        assert!(call.get("error").is_none(), "{call}");
+        assert_eq!(call["result"]["resultType"], json!("complete"), "{call}");
+        // Linux 以外は core の状態ストアが UNIMPLEMENTED を返す（fail-closed）ため isError になる。
+        assert_eq!(
+            call["result"]["isError"],
+            json!(cfg!(not(target_os = "linux"))),
+            "{call}"
+        );
+
+        drop(reader);
+        let (code, out, err) = wait_exit(child.into_inner());
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "", "stdout must stay empty in UDS mode");
+        let ops: Vec<String> = err
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == "mcp.request")
+            .map(|v| v["op"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(ops, ["server/discover", "tools/list", "tools/call"]);
+    }
+
     /// MCP-1・REPAIR-5 / TASK-118.4: 要求を送ってすぐ切断した相手でも、受信済みの要求を処理してから
     /// EOF で正常終了する（終了コード 0）。macOS では相手切断後の socket 期限の設定が EINVAL に
     /// なるため、境界基盤の non-blocking 1 回読みで残りデータと EOF を受け取れることを照合する。

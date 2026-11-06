@@ -2386,17 +2386,6 @@ mod tests {
         }
     }
 
-    /// 実 peer credential が取れる OS・アーキテクチャに限定する（`uds_security` のテストと同じ条件）。
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            target_os = "linux",
-            all(
-                target_pointer_width = "64",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            )
-        )
-    ))]
     /// #3981・PLUG-1・PLUG-12・REPAIR-4・REPAIR-5・REPAIR-12: 相手が要求を書いてすぐ閉じた接続で
     /// 既定期限の設定が `EINVAL` になっても、要求を失わず正常に読み切れること。macOS の挙動は
     /// `EINVAL` の注入で Linux でも通す。
@@ -2529,6 +2518,17 @@ mod tests {
         }
     }
 
+    /// 実 peer credential が取れる OS・アーキテクチャに限定する（`uds_security` のテストと同じ条件）。
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
+    ))]
     mod peercred {
         use super::*;
 

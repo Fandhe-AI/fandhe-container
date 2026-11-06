@@ -10,7 +10,7 @@
   - <https://modelcontextprotocol.io/specification/2026-07-28/changelog>（比較元は 2025-11-25）
   - <https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning>
   - <https://modelcontextprotocol.io/specification/2025-11-25/changelog>
-  - 2026-07-28 の stdio 規定・`basic/index`（`_meta` の規則）・`server/discover`・`server/utilities/caching`・schema は、#716 の実装時（2026-11-06）に精読した（4.2。`specification/2026-07-28/basic/index`・`basic/transports/stdio`・`server/discover`・`server/utilities/caching`・`schema/2026-07-28/schema.ts`）。`basic/patterns/mrtr` は #717 の範囲で未精読のため、該当する箇所は「要確認」と記す
+  - 2026-07-28 の stdio 規定・`basic/index`（`_meta` の規則）・`server/discover`・`server/utilities/caching`・schema は、#716 の実装時（2026-11-06）に精読した（4.2。`specification/2026-07-28/basic/index`・`basic/transports/stdio`・`server/discover`・`server/utilities/caching`・`schema/2026-07-28/schema.ts`）。`basic/patterns/mrtr` と schema の `Result` は #717 の実装時（2026-11-06）に精読した（4.4）
 
 ## 1. 背景
 
@@ -38,8 +38,8 @@
 | `UnsupportedProtocolVersionError`（コード -32022、`data.supported`・`data.requested`） | SEP-2575・07-28 | 追加 | `error.rs` に variant と ERR-1 の `data.code` 対応を足す | 要 | `supported` は固定一覧。`requested` を返すなら長さ上限つき（4.2） | #716 |
 | `ping` の廃止 | SEP-2575・07-28 | 破壊的 | `ping` 分岐 | 要（dual-era なら legacy 側に残す） | modern 経路では -32601 とする | #716 |
 | `logging/setLevel`・`notifications/roots/list_changed` の廃止 | SEP-2575・07-28 | 破壊的 | 未実装のため影響なし | 不要（未実装） | なし | 対象外 |
-| 全 result に必須の `resultType: "complete"` | SEP-2322・07-28 | 破壊的（必須化） | `InitializeResult`・`ToolsListResult`・`tools/call` の結果 | 要 | modern の結果に付ける。legacy にも付けるか（4.3）。クライアントは欠落を `complete` と扱う（MUST） | #717 |
-| MRTR（`InputRequiredResult`・`inputRequests`・`requestState`） | SEP-2322・07-28 | 追加 | 追加入力を求めないため該当なし | 不要（追加入力を求めない） | 4.4 | #717 の見直し |
+| 全 result に必須の `resultType: "complete"` | SEP-2322・07-28 | 破壊的（必須化） | `server/discover`・`tools/list`・`tools/call`（`isError: true` を含む）の結果 | 実装済み | modern の全 result に `finish_modern` で付け、legacy には付けない（D3・4.3）。エラー応答は result ではないので付けない。クライアントは欠落を `complete` と扱う（MUST） | #717 |
+| MRTR（`InputRequiredResult`・`inputRequests`・`requestState`） | SEP-2322・07-28 | 追加 | 追加入力を求めないため該当なし | 不要（追加入力を求めない。mrtr の精読で確定） | 4.4 | #717 の見直し |
 | `tools/list` の `ttlMs`・`cacheScope` 必須化（`CacheableResult`） | SEP-2549・07-28 | 破壊的（必須化） | `ToolsListResult` | 要 | `ttlMs: 3600000`（1 時間。一覧は実行ファイルの差し替えでしか変わらない）・`cacheScope: "public"`（全利用者で同一）。modern の `tools/list` と `server/discover` に載せ、legacy には載せない（D6。#716 で実装済み） | #716 |
 | `tools/list` を決まった順で返す（SHOULD） | 07-28 | なし | すでに固定順 | 不要（満たす） | 順序を固定する試験を足す | #719 |
 | 結果の `_meta.io.modelcontextprotocol/serverInfo`（SHOULD） | SEP-2575・07-28 | なし | 結果の組み立て | 要（任意） | 名前と版を載せる | #716 |
@@ -91,7 +91,7 @@ legacy の版の schema が知らないフィールドを足すと、厳格な�
 
 ### 4.4 #717・#718 の受け入れ条件の見直し
 
-- #717（マルチラウンドトリップ）: 本サーバーはクライアントへ追加入力を求めないので `InputRequiredResult` は対象外。必要なのは全 result への `resultType: "complete"` のみ。受け入れ条件（ハンドシェイクが仕様どおりに完了する）は対象が無くなるため、`resultType` のみに縮小した（D4）
+- #717（マルチラウンドトリップ）: 本サーバーはクライアントへ追加入力を求めないので `InputRequiredResult` は対象外。必要なのは全 result への `resultType: "complete"` のみ。受け入れ条件（ハンドシェイクが仕様どおりに完了する）は対象が無くなるため、`resultType` のみに縮小した（D4）。`basic/patterns/mrtr` の精読の結果: `InputRequiredResult` は任意で `prompts/get`・`resources/read`・`tools/call` に限り、未宣言の `inputRequests` は送れない。本サーバーは `requestState` を発行せず読まないので検証の義務も生じない。実装済み（`finish_modern`）
 - #718（ヘッダーベースルーティング）: SEP-2243 は Streamable HTTP の規定で、現行の stdio / UDS には header layer が無い。現行トランスポートでは対象外で、HTTP を足すときにだけ必要になる。対象外として閉じた（D5）
 
 ## 5. 決定表

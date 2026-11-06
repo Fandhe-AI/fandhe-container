@@ -23,7 +23,7 @@
 //!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。
 //! - `InterruptACK` を処理した vCPU はその線の SPI の宛先として [`MmioHandler::with_ack_learner`] で記録し、WFI の待ちを
 //!   宛先の vCPU だけ起こすのに使う（#3948・MVM-5・REPAIR-5。方式と残余は `crate::hvf_wake`）。
-//! - virtqueue の処理と割り込みへの結線（`QueueNotify` の後続）は #3797（macOS の構成体の組み立て）の担当。
+//! - virtqueue の処理と割り込みへの結線（`QueueNotify` の後続）は #3908 の担当。
 //!   ここでは通知を捨てず [`MmioHandler::last_queue_notify`] に残すだけで、実際のキュー処理は行わない。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
 
@@ -100,7 +100,7 @@ impl MmioHandler {
         self.unhandled
     }
 
-    /// `QueueNotify` を受けた回数（処理は #3797 の担当。REPAIR-3）。
+    /// `QueueNotify` を受けた回数（処理は #3908 の担当。REPAIR-3）。
     pub fn queue_notify_count(&self) -> u64 {
         self.queue_notifies
     }
@@ -202,7 +202,7 @@ mod tests {
     use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
     use crate::virtio_mmio::VirtioMmioTransport;
 
-    /// ACK の route はデバイスの識別子で引かれ、保持される（#3863）。`hv_*` を呼ばないため vCPU の経路は別途実機で確かめる（#3988）。
+    /// ACK の route はデバイスの識別子で引かれ、保持される（#3863）。`hv_*` を呼ばないため vCPU の経路は別途実機で確かめる（#4015）。
     #[test]
     fn mvm5_3863_ack_routes_are_kept() {
         use crate::interrupt::{InterruptAckReport, LineResample};

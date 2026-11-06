@@ -4,7 +4,7 @@
 //! （`tests/hvf_device.rs`）と、後続の子 issue（#3786 vCPU・#3789 GIC・#3787 ゲスト RAM = `memory`・#3792 GIC の作成順序 = `gic`・#3795 SPI の注入 = `gic::GicSpiLine`）が
 //! ここへ追記する。引数の検査と戻り値の写像は OS 非依存の `crate::hvf_abi`。
 //! TASK-192.16・#3798: microVM の start / stop と解放順序（`microvm::{HvfMicroVm, RunningHvfMicroVm}`）。
-//! TASK-192.9・#3791: vCPU 専用スレッド（`vcpu`）と exit ごとの処理（`mmio` は #3793、`hvc` は #3794、`timer` は #3796 で実装済み）。ループ本体は OS 非依存の `crate::hvf_loop`。
+//! TASK-192.9・#3791: vCPU 専用スレッド（`vcpu`）と exit ごとの処理（`mmio` は #3793、`hvc` は #3794、`timer` は #3796、`sysreg` の OS Lock は #4037 で実装済み）。ループ本体は OS 非依存の `crate::hvf_loop`。
 
 pub use crate::sys::{GicApi, GuestMapping, HostMapping, HvVcpu, HvVm, VcpuCanceller};
 
@@ -15,6 +15,7 @@ pub use memory::{HvfGuestRam, RegisteredHvfRam};
 // exit ごとの処理は `mmio`（#3793 で実装済み）・`hvc`（#3794 で実装済み。`crate::psci`）・`timer`（#3796。WFI / WFE と vtimer）で、いずれも実装済み。残る制限は各ファイルの「未実装」節を参照。
 pub mod hvc;
 pub mod mmio;
+pub mod sysreg;
 pub mod timer;
 pub mod vcpu;
 pub use vcpu::{ExitHandlers, VcpuHandle, VcpuThread, VcpuThreadConfig};

@@ -31,7 +31,7 @@
 //! N 台の停止は [`VcpuSet`] が `hvf_loop::stop_all` で集約し、どれか 1 台が終われば [`VcpuSet::is_finished`] が真になる。
 //!
 //! # 未実装（REPAIR-3）
-//! exit ごとの処理は mmio・hvc・timer とも実装済み。SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
+//! exit ごとの処理は mmio・hvc・timer・sysreg（OS Lock の write のみ。#4037）とも実装済み。それ以外の SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -44,7 +44,7 @@ use crate::boot_arm64::{
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
 use crate::hvf::VmWithGic;
-use crate::hvf::{hvc, mmio, timer};
+use crate::hvf::{hvc, mmio, sysreg, timer};
 use crate::hvf_abi::{HVF_MAX_VCPUS, HvReg, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
 use crate::hvf_lifecycle::VcpuStopper;
 use crate::hvf_loop::{
@@ -223,6 +223,7 @@ fn dispatch(
             EsrClass::Hvc { imm16 } => hvc::handle_hvc(vcpu, &mut handlers.hvc, *imm16, exception),
             EsrClass::Smc { imm16 } => hvc::handle_smc(vcpu, &mut handlers.hvc, *imm16, exception),
             EsrClass::Wfx(kind) => timer::handle_wfx(vcpu, timer_handler, *kind, exception),
+            EsrClass::SysReg(access) => sysreg::handle_sysreg(vcpu, access, exception),
             _ => Err(internal(
                 "unexpected exception class reached the dispatcher",
             )),
@@ -276,7 +277,7 @@ impl VcpuThread {
     /// vCPU は `VmWithGic::create_vcpu` で作る（GIC を vCPU より先に作る契約を迂回しない。MVM-5・TASK-192.12）。
     ///
     /// 作成と `setup` の成否は `config.create_deadline` まで待って返す（失敗は `setup` のエラーのまま）。`setup` は PC・CPSR・
-    /// 引数レジスタ等の初期化で、#3797 が渡す。ゲストが未対応の exit（SysReg trap・ISV=0 の data abort・未知の EC。`hvf_loop::run_loop` の表）に達するとループは `Failed(Unimplemented)` で
+    /// 引数レジスタ等の初期化で、#3797 が渡す。ゲストが未対応の exit（OS Lock の write 以外の SysReg trap・ISV=0 の data abort・未知の EC。`hvf_loop::run_loop` の表）に達するとループは `Failed(Unimplemented)` で
     /// 終わり、[`VcpuHandle::is_finished`] で観測できる。寿命の契約はモジュールの doc を参照。
     pub fn spawn<S>(
         vm: Arc<VmWithGic>,

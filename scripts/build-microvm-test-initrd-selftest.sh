@@ -56,6 +56,12 @@ golden_net_tx_a64_code="200280d2610080d2020080d2c81880d2010000d46005f8b7f30300aa
 golden_net_rx_a64_init_sha="4817e192ddd7410105838ff035d57e7a1175847c00c3b15ec76b127f6fd53e5f"
 golden_net_rx_a64_initrd_sha="62597393231d00e76fba45f029a212783c386d3a729cd832970a3a96c13de133"
 # aarch64 の net-rx のコード 300 バイト（ファイル先頭から 120 バイト目）
+# variant serial-echo（aarch64 専用。#3987）のゴールデン。コードは llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。
+# 初版であり、更新理由は「aarch64 の serial-echo を新設したため」。
+golden_serial_init_sha="38d85ff01969dbd0c6f77ab59f11c52285cab9a209d6afcb64b19ad5966ee20b"
+golden_serial_initrd_sha="cb8d15f863e79b51d0391f1db69eec498b0bf221a3e2cba5c6dc1af11e29c0aa"
+# serial-echo のコード 604 バイト（ファイル先頭から 120 バイト目）
+golden_serial_code="c00080d2e1031faae2031faa880e80d2010000d4ff0740d1ff8300d1600c8092e1110010a22d80d2480480d2010000d48011005041110010e20300aae3031faae4031faa080580d2010000d4600c8092a1100070a23d80d2480480d2010000d46010001001100070e20300aae3031faae4031faa080580d2010000d4600c8092a10f0030422080d2e3031faa080780d2010000d46008f8b7f30300aa55000094e00313aa610f0030021480d2080880d2010000d41f8002f141070054e00313aa21818ad2220080d2a80380d2010000d48006f8b7e00313aac1120030a20480d2080880d2010000d495008052f30300b929008052e90700b9a90080d2e90b00f9ff0f00f9e0030091210080d2e2430091e3031faae4031faa280980d2010000d40004f8b7800300b4e00313aae1830091022080d2e80780d2010000d41f0000f10d030054f40300aae00313aa41100050e20380d2080880d2010000d4e00313aae1830091e20314aa080880d2010000d4b5060071c1fbff541e000094e00313aaa10f0030e20480d2080880d2010000d40900001441100010420580d20300001421110050620580d2200080d2080880d2010000d4200080d221818ad2220080d2a80380d2010000d4a0d59b5220dcbf72212d83524102a572e2ac88526224a072c81180d2010000d43f2003d5ffffff17600c809261040010e2031faa080780d2010000d4e0fcffb7f40300aa16028052e00314aae1830091020082d2e80780d2010000d4e0fbffb7200100b4e20300aae00313aae1830091080880d2010000d4d606007161feff54d6ffff17e00314aa280780d2010000d4c0035fd6"
 golden_net_rx_a64_code="200280d2610080d202d196d2c81880d2010000d48006f8b7f30300aaff0303d1ff7f00a9ff7f01a9ff7f02a9ff7f03a9a98c8e52090da672e90300b929008052e91300b9e00313aa812291d2e2030091a80380d2010000d46004f8b7a90080d2e91b00f9e00313aa210080d2820280d2e3c30091040280d2081a80d2010000d42003f8b715028052e00313aae1030191021080d2030080d2040080d2050080d2e81980d2010000d4e001f8b71ff000f161010054ea030191ab0300108c0780d24d1540386e154038bf010e6b810000548c0500f161ffff5406000014b506007141fdff5421050050c20480d203000014c1030010420480d2200080d2080880d2010000d4a0d59b5220dcbf72212d83524102a572e2ac88526224a072c81180d2010000d43f2003d5ffffff17"
 
 sb="$(mktemp -d)"
@@ -131,6 +137,9 @@ case "$(uname -s)" in
         newout
         run "$target" --variant net-rx --output-dir "$out"
         check "win net-rx refused" "2 unsupported-os" "$rc $(errcode)"
+        newout
+        run "$target" --variant serial-echo --arch aarch64 --output-dir "$out"
+        check "win serial-echo refused" "2 unsupported-os" "$rc $(errcode)"
         echo "pass=$pass fail=$fail"
         [ "$fail" -eq 0 ]
         exit $?
@@ -757,6 +766,87 @@ if cmp -s "$out/initrd.cpio" "$cpio30"; then ok "30 CLI variant wins over env"; 
 newout
 run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant net-rx --arch aarch64 --output-dir "$out"
 check "30 windows host refused" "2 unsupported-os" "$rc $(errcode)"
+
+# --- 31: variant serial-echo（aarch64 専用。#3987） ---
+newout
+run "$target" --variant serial-echo --arch aarch64 --output-dir "$out"
+check "31 exit code" 0 "$rc"
+check "31 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+cpio31="$out/initrd.cpio"
+check "31 entries" "init 000081ed 00000000 00000000 1129
+TRAILER!!! 00000000 00000000 00000000 0" "$(list_newc "$cpio31")"
+init31="$sb/init-serial-echo.bin"
+tail -c +$((110 + 5 + 1 + 1)) "$cpio31" | head -c 1129 >"$init31"
+check "31 init size" 1129 "$(wc -c <"$init31" | tr -d ' ')"
+check "31 magic class data" "7f454c460201" "$(hexat "$init31" 0 6)"
+check "31 e_machine" 183 "$(leat "$init31" 18 2)"
+check "31 e_entry" $((0x400078)) "$(leat "$init31" 24 8)"
+check "31 p_flags R+X" 5 "$(leat "$init31" 68 4)"
+check "31 p_filesz" 1129 "$(leat "$init31" 96 8)"
+check "31 p_memsz" 1129 "$(leat "$init31" 104 8)"
+check "31 code (604 bytes)" "$golden_serial_code" "$(hexat "$init31" 120 604)"
+check "31 paths (NUL-terminated, 53 bytes)" "2f70726f630070726f63002f64657600646576746d706673002f6465762f7474795330002f70726f632f696e746572727570747300" "$(hexat "$init31" 724 53)"
+check "31 tx line" "fandhe-microvm-test: serial tx 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" "$(tail -c +778 "$init31" | head -c 159)"
+check "31 tx line newline" "0a" "$(hexat "$init31" 936 1)"
+check "31 ready message" "fandhe-microvm-test: serial ready v1" "$(tail -c +938 "$init31" | head -c 36)"
+check "31 ready newline" "0a" "$(hexat "$init31" 973 1)"
+check "31 rx prefix" "fandhe-microvm-test: serial rx " "$(tail -c +975 "$init31" | head -c 31)"
+check "31 ok message" "fandhe-microvm-test: serial echo ok v1" "$(tail -c +1006 "$init31" | head -c 38)"
+check "31 ok newline" "0a" "$(hexat "$init31" 1043 1)"
+check "31 rx timeout message" "fandhe-microvm-test: serial rx timeout v1" "$(tail -c +1045 "$init31" | head -c 41)"
+check "31 rx timeout newline" "0a" "$(hexat "$init31" 1085 1)"
+check "31 failed message" "fandhe-microvm-test: serial echo failed v1" "$(tail -c +1087 "$init31" | head -c 42)"
+check "31 failed newline" "0a" "$(hexat "$init31" 1128 1)"
+check "31 init sha256" "$golden_serial_init_sha" "$(sha_of "$init31")"
+check "31 initrd sha256" "$golden_serial_initrd_sha" "$(sha_of "$cpio31")"
+check "31 build-info" "init_sha256=$golden_serial_init_sha
+init_bytes=1129
+initrd_file=initrd.cpio
+initrd_sha256=$golden_serial_initrd_sha
+compress=none
+arch=aarch64
+format=newc
+variant=serial-echo
+message_tx=fandhe-microvm-test: serial tx 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+message_ready=fandhe-microvm-test: serial ready v1
+rx_prefix=fandhe-microvm-test: serial rx$(printf ' ')
+message_ok=fandhe-microvm-test: serial echo ok v1
+message_rx_timeout=fandhe-microvm-test: serial rx timeout v1
+message_failed=fandhe-microvm-test: serial echo failed v1
+rx_rounds=4
+rx_timeout_secs=5" "$(grep -v '^host=' "$out/build-info.txt")"
+newout
+run "$target" --variant serial-echo --arch aarch64 --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio31"; then ok "31 second run is byte-identical"; else ng "31 second run differs"; fi
+if command -v gzip >/dev/null 2>&1; then
+    newout
+    run "$target" --variant serial-echo --arch aarch64 --output-dir "$out" --compress gzip
+    check "31 gzip exit code" 0 "$rc"
+    if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$cpio31"; then ok "31 gunzip equals the plain archive"; else ng "31 gunzip differs"; fi
+else
+    echo "skip: gzip is not available (case 31 gzip)"
+fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=serial-echo "$target" --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio31"; then ok "31 env arch and variant select serial-echo"; else ng "31 env selection ignored"; fi
+newout
+run env MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=bogus "$target" --variant serial-echo --output-dir "$out"
+if cmp -s "$out/initrd.cpio" "$cpio31"; then ok "31 CLI variant wins over env"; else ng "31 CLI variant did not win"; fi
+newout
+run env MICROVM_TEST_INITRD_UNAME_S=MINGW64_NT-10.0 "$target" --variant serial-echo --arch aarch64 --output-dir "$out"
+check "31 windows host refused" "2 unsupported-os" "$rc $(errcode)"
+# x86_64 との組は拒否し、出力先を作らない（既定の arch も x86_64）
+newout
+run "$target" --variant serial-echo --arch x86_64 --output-dir "$out"
+check "31 x86_64 refused" "2 bad-argument" "$rc $(errcode)"
+if [ ! -e "$out" ]; then ok "31 refused run creates no output"; else ng "31 refused run created output"; fi
+newout
+run "$target" --variant serial-echo --output-dir "$out"
+check "31 default arch refused" "2 bad-argument" "$rc $(errcode)"
+newout
+run env MICROVM_TEST_INITRD_VARIANT=serial-echo "$target" --output-dir "$out"
+check "31 env variant with default arch refused" "2 bad-argument" "$rc $(errcode)"
+if [ ! -e "$out" ]; then ok "31 refused env run creates no output"; else ng "31 refused env run created output"; fi
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

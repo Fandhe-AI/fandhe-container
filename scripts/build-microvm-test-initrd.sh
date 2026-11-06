@@ -192,12 +192,21 @@
 # llvm-mc（aarch64-linux-gnu）で組み、llvm-objdump の逆アセンブルとコード部のバイト列の一致を確認済み。
 # aarch64 の実カーネルでの確認は Agent は未実施（#3781・人間担当）。
 #
+# variant `serial-echo`（#3987・MVM-5・MVM-1・REPAIR-12。aarch64 専用）: HVF の実 Linux ゲストで UART の送受信を照合する版。
+# syslog(CONSOLE_OFF) で printk を止め（非同期の printk が行の途中へ割り込むのを防ぐ）、/proc と /dev（devtmpfs）を mount して
+# `/dev/ttyS0` を開き、`/proc/interrupts` を出力 → 送信 FIFO（16 バイト）の 10 倍の 160 バイトの行を書いて tcdrain
+# （THRE 割り込みが進まなければここで止まり ready が出ない）→ ready → ppoll（5 秒）+ read で受けた行へ固定の接頭辞を付けて書き戻す
+# ことを 4 回 → `/proc/interrupts` を再出力 → ok → tcdrain → reboot。期限切れは rx timeout、syscall の失敗は failed の
+# メッセージを fd 1 へ書く（REPAIR-5）。tty は canonical + ECHO のままで、ホストは改行で終わる行を push する。
+# 全体は 120 + コード 604 + データ 405 = 1129 バイト。命令の並びは serial-echo の分岐の各 `bytes` 行のコメントを正とする。
+# llvm-mc（aarch64-linux-gnu）で組み、llvm-objdump の逆アセンブルと一致を確認済み。実カーネルでの確認は Agent は未実施（#3988・人間担当）。
+#
 # 使い方:
-#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+#   build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 #   各引数は同名の環境変数（MICROVM_TEST_INITRD_VARIANT・MICROVM_TEST_INITRD_ARCH・MICROVM_TEST_INITRD_OUTPUT_DIR・MICROVM_TEST_INITRD_COMPRESS）でも渡せる。CLI が優先。
-#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read は aarch64 も #3947、net-tx・net-rx の aarch64 版は #3966）
+#   --variant       default（既定。固定文字列を書いて reboot するだけの版）・block-read・net-tx・net-rx（上記。block-read は aarch64 も #3947、net-tx・net-rx の aarch64 版は #3966）・serial-echo（aarch64 専用。#3987）
 #   --arch          x86_64（既定）または aarch64（#3895。別名は受けない。aarch64 は全 variant。出力先の既定は target/microvm-test-initrd/aarch64-block-read 等）
-#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx）（存在しない新規ディレクトリのみ。既存は拒否）
+#   --output-dir    既定: <repo>/target/microvm-test-initrd/<arch>（block-read は x86_64-block-read、net-tx は x86_64-net-tx、net-rx は x86_64-net-rx、serial-echo は aarch64-serial-echo）（存在しない新規ディレクトリのみ。既存は拒否）
 #   --compress      none（既定。initrd.cpio）または gzip（initrd.cpio.gz。カーネルは CONFIG_RD_GZIP=y が要る）
 #   --pack-timeout  gzip の上限秒（既定 60。1〜600。REPAIR-5）
 #
@@ -213,7 +222,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
+usage: build-microvm-test-initrd.sh [--variant default|block-read|net-tx|net-rx|serial-echo] [--arch x86_64|aarch64] [--output-dir <dir>] [--compress none|gzip] [--pack-timeout S]
 USAGE
 }
 
@@ -253,6 +262,16 @@ net_rx_frame_header_hex="02fc0000386502fc0000386688b6"
 net_rx_payload="fandhe-microvm-net-rx-payload-0123456789abcdef"
 net_rx_ok_message="fandhe-microvm-test: net rx ok v1"
 net_rx_failed_message="fandhe-microvm-test: net rx failed v1"
+# serial-echo の文字列定数（正本。crates/microvm/tests/support/guest_boot.rs の単体テストが行頭の名前で抜き出して照合する。
+# 長さ 160（tx 行 + 改行）・37・31・39・42・43 は機械語の mov x2 へ固定されているため、変えるときはコードも直す。
+# tx 行は 16 バイトの送信 FIFO の 10 倍で、THRE 割り込みで送信が進まないと完走しない）
+serial_tx_line="fandhe-microvm-test: serial tx 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+serial_ready_message="fandhe-microvm-test: serial ready v1"
+serial_rx_prefix="fandhe-microvm-test: serial rx "
+serial_ok_message="fandhe-microvm-test: serial echo ok v1"
+serial_rx_timeout_message="fandhe-microvm-test: serial rx timeout v1"
+serial_failed_message="fandhe-microvm-test: serial echo failed v1"
+serial_rx_rounds=4
 
 need_value() {
     [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
@@ -275,9 +294,13 @@ case "$arch" in
     *) err_code bad-argument "--arch must be x86_64 or aarch64"; usage; exit 2 ;;
 esac
 case "$variant" in
-    default | block-read | net-tx | net-rx) ;;
-    *) err_code bad-argument "--variant must be default, block-read, net-tx or net-rx"; usage; exit 2 ;;
+    default | block-read | net-tx | net-rx | serial-echo) ;;
+    *) err_code bad-argument "--variant must be default, block-read, net-tx, net-rx or serial-echo"; usage; exit 2 ;;
 esac
+# serial-echo は aarch64 だけ（x86 の push_input は kvm_device.rs 側が見る。#3987）
+if [ "$variant" = "serial-echo" ] && [ "$arch" != "aarch64" ]; then
+    err_code bad-argument "--variant serial-echo is only available with --arch aarch64"; usage; exit 2
+fi
 case "$compress" in
     none | gzip) ;;
     *) err_code bad-argument "--compress must be none or gzip"; usage; exit 2 ;;
@@ -313,7 +336,7 @@ esac
 # --- 出力先の検査 ---
 if [ -z "$output_dir" ]; then
     case "$variant" in
-        block-read | net-tx | net-rx) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
+        block-read | net-tx | net-rx | serial-echo) output_dir="$root/target/microvm-test-initrd/${arch}-${variant}" ;;
         *) output_dir="$root/target/microvm-test-initrd/$arch" ;;
     esac
 fi
@@ -651,6 +674,188 @@ if [ "$variant" = "net-rx" ]; then
         printf '%s' "$net_rx_payload"
         printf '%s\n' "$net_rx_ok_message"
         printf '%s\n' "$net_rx_failed_message"
+    } >"$elf_file"
+elif [ "$variant" = "serial-echo" ]; then
+    # 機械語に固定された長さ・サイズを文字列定数と突き合わせる（fail-closed。aarch64 だけ。引数の検査で x86_64 は拒否済み）
+    expected_size=1129
+    if [ "$((${#serial_tx_line} + 1))" -ne 160 ] || [ "$((${#serial_ready_message} + 1))" -ne 37 ] ||
+        [ "${#serial_rx_prefix}" -ne 31 ] || [ "$((${#serial_ok_message} + 1))" -ne 39 ] ||
+        [ "$((${#serial_rx_timeout_message} + 1))" -ne 42 ] || [ "$((${#serial_failed_message} + 1))" -ne 43 ] ||
+        [ "$serial_rx_rounds" -ne 4 ]; then
+        err_code internal-error "serial-echo string lengths do not match the encoded instructions"
+        exit 1
+    fi
+    total_size=$expected_size
+    {
+        emit_elf_headers "$total_size"
+        # コード 604 バイト（llvm-mc で組み、llvm-objdump の逆アセンブルと一致を確認済み。#3987。
+        # 流れ: syslog(CONSOLE_OFF) → /proc・/dev を mount → /dev/ttyS0 を開く → /proc/interrupts を出力 →
+        # 160 バイトの行を書いて tcdrain → ready → ppoll（5 秒）+ read + 接頭辞つきの書き戻しを 4 回 →
+        # /proc/interrupts を再出力 → ok → tcdrain → reboot。x19 = ttyS0 の fd、sp 配下は pollfd 8・timespec 16・buf 4096）
+            bytes c0 00 80 d2  # _start: mov x0, #0x6
+            bytes e1 03 1f aa  # mov x1, xzr
+            bytes e2 03 1f aa  # mov x2, xzr
+            bytes 88 0e 80 d2  # mov x8, #0x74
+            bytes 01 00 00 d4  # svc #0
+            bytes ff 07 40 d1  # sub sp, sp, #0x1, lsl #12
+            bytes ff 83 00 d1  # sub sp, sp, #0x20
+            bytes 60 0c 80 92  # mov x0, #-0x64
+            bytes e1 11 00 10  # adr x1, s_proc
+            bytes a2 2d 80 d2  # mov x2, #0x16d
+            bytes 48 04 80 d2  # mov x8, #0x22
+            bytes 01 00 00 d4  # svc #0
+            bytes 80 11 00 50  # adr x0, s_procfs
+            bytes 41 11 00 10  # adr x1, s_proc
+            bytes e2 03 00 aa  # mov x2, x0
+            bytes e3 03 1f aa  # mov x3, xzr
+            bytes e4 03 1f aa  # mov x4, xzr
+            bytes 08 05 80 d2  # mov x8, #0x28
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 0c 80 92  # mov x0, #-0x64
+            bytes a1 10 00 70  # adr x1, s_dev
+            bytes a2 3d 80 d2  # mov x2, #0x1ed
+            bytes 48 04 80 d2  # mov x8, #0x22
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 10 00 10  # adr x0, s_devtmpfs
+            bytes 01 10 00 70  # adr x1, s_dev
+            bytes e2 03 00 aa  # mov x2, x0
+            bytes e3 03 1f aa  # mov x3, xzr
+            bytes e4 03 1f aa  # mov x4, xzr
+            bytes 08 05 80 d2  # mov x8, #0x28
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 0c 80 92  # mov x0, #-0x64
+            bytes a1 0f 00 30  # adr x1, s_tty
+            bytes 42 20 80 d2  # mov x2, #0x102
+            bytes e3 03 1f aa  # mov x3, xzr
+            bytes 08 07 80 d2  # mov x8, #0x38
+            bytes 01 00 00 d4  # svc #0
+            bytes 60 08 f8 b7  # tbnz x0, #0x3f, fail
+            bytes f3 03 00 aa  # mov x19, x0
+            bytes 55 00 00 94  # bl dump
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes 61 0f 00 30  # adr x1, s_tx
+            bytes 02 14 80 d2  # mov x2, #0xa0
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes 1f 80 02 f1  # cmp x0, #0xa0
+            bytes 41 07 00 54  # b.ne fail
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes 21 81 8a d2  # mov x1, #0x5409
+            bytes 22 00 80 d2  # mov x2, #0x1
+            bytes a8 03 80 d2  # mov x8, #0x1d
+            bytes 01 00 00 d4  # svc #0
+            bytes 80 06 f8 b7  # tbnz x0, #0x3f, fail
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes c1 12 00 30  # adr x1, s_ready
+            bytes a2 04 80 d2  # mov x2, #0x25
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes 95 00 80 52  # mov w21, #0x4
+            bytes f3 03 00 b9  # poll: str w19, [sp]
+            bytes 29 00 80 52  # mov w9, #0x1
+            bytes e9 07 00 b9  # str w9, [sp, #0x4]
+            bytes a9 00 80 d2  # mov x9, #0x5
+            bytes e9 0b 00 f9  # str x9, [sp, #0x10]
+            bytes ff 0f 00 f9  # str xzr, [sp, #0x18]
+            bytes e0 03 00 91  # mov x0, sp
+            bytes 21 00 80 d2  # mov x1, #0x1
+            bytes e2 43 00 91  # add x2, sp, #0x10
+            bytes e3 03 1f aa  # mov x3, xzr
+            bytes e4 03 1f aa  # mov x4, xzr
+            bytes 28 09 80 d2  # mov x8, #0x49
+            bytes 01 00 00 d4  # svc #0
+            bytes 00 04 f8 b7  # tbnz x0, #0x3f, fail
+            bytes 80 03 00 b4  # cbz x0, rxto
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes e1 83 00 91  # add x1, sp, #0x20
+            bytes 02 20 80 d2  # mov x2, #0x100
+            bytes e8 07 80 d2  # mov x8, #0x3f
+            bytes 01 00 00 d4  # svc #0
+            bytes 1f 00 00 f1  # cmp x0, #0x0
+            bytes 0d 03 00 54  # b.le fail
+            bytes f4 03 00 aa  # mov x20, x0
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes 41 10 00 50  # adr x1, s_prefix
+            bytes e2 03 80 d2  # mov x2, #0x1f
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes e1 83 00 91  # add x1, sp, #0x20
+            bytes e2 03 14 aa  # mov x2, x20
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes b5 06 00 71  # subs w21, w21, #0x1
+            bytes c1 fb ff 54  # b.ne poll
+            bytes 1e 00 00 94  # bl dump
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes a1 0f 00 30  # adr x1, s_ok
+            bytes e2 04 80 d2  # mov x2, #0x27
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes 09 00 00 14  # b finish
+            bytes 41 10 00 10  # rxto: adr x1, s_rxto
+            bytes 42 05 80 d2  # mov x2, #0x2a
+            bytes 03 00 00 14  # b out
+            bytes 21 11 00 50  # fail: adr x1, s_fail
+            bytes 62 05 80 d2  # mov x2, #0x2b
+            bytes 20 00 80 d2  # out: mov x0, #0x1
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes 20 00 80 d2  # finish: mov x0, #0x1
+            bytes 21 81 8a d2  # mov x1, #0x5409
+            bytes 22 00 80 d2  # mov x2, #0x1
+            bytes a8 03 80 d2  # mov x8, #0x1d
+            bytes 01 00 00 d4  # svc #0
+            bytes a0 d5 9b 52  # mov w0, #0xdead
+            bytes 20 dc bf 72  # movk w0, #0xfee1, lsl #16
+            bytes 21 2d 83 52  # mov w1, #0x1969
+            bytes 41 02 a5 72  # movk w1, #0x2812, lsl #16
+            bytes e2 ac 88 52  # mov w2, #0x4567
+            bytes 62 24 a0 72  # movk w2, #0x123, lsl #16
+            bytes c8 11 80 d2  # mov x8, #0x8e
+            bytes 01 00 00 d4  # svc #0
+            bytes 3f 20 03 d5  # yield
+            bytes ff ff ff 17  # b .-4
+            bytes 60 0c 80 92  # dump: mov x0, #-0x64
+            bytes 61 04 00 10  # adr x1, s_intr
+            bytes e2 03 1f aa  # mov x2, xzr
+            bytes 08 07 80 d2  # mov x8, #0x38
+            bytes 01 00 00 d4  # svc #0
+            bytes e0 fc ff b7  # tbnz x0, #0x3f, fail
+            bytes f4 03 00 aa  # mov x20, x0
+            bytes 16 02 80 52  # mov w22, #0x10
+            bytes e0 03 14 aa  # dloop: mov x0, x20
+            bytes e1 83 00 91  # add x1, sp, #0x20
+            bytes 02 00 82 d2  # mov x2, #0x1000
+            bytes e8 07 80 d2  # mov x8, #0x3f
+            bytes 01 00 00 d4  # svc #0
+            bytes e0 fb ff b7  # tbnz x0, #0x3f, fail
+            bytes 20 01 00 b4  # cbz x0, ddone
+            bytes e2 03 00 aa  # mov x2, x0
+            bytes e0 03 13 aa  # mov x0, x19
+            bytes e1 83 00 91  # add x1, sp, #0x20
+            bytes 08 08 80 d2  # mov x8, #0x40
+            bytes 01 00 00 d4  # svc #0
+            bytes d6 06 00 71  # subs w22, w22, #0x1
+            bytes 61 fe ff 54  # b.ne dloop
+            bytes d6 ff ff 17  # b fail
+            bytes e0 03 14 aa  # ddone: mov x0, x20
+            bytes 28 07 80 d2  # mov x8, #0x39
+            bytes 01 00 00 d4  # svc #0
+            bytes c0 03 5f d6  # ret
+        # データ（コード直後。ファイルオフセット 724）
+        printf '/proc\0'
+        printf 'proc\0'
+        printf '/dev\0'
+        printf 'devtmpfs\0'
+        printf '/dev/ttyS0\0'
+        printf '/proc/interrupts\0'
+        printf '%s\n' "$serial_tx_line"
+        printf '%s\n' "$serial_ready_message"
+        printf '%s' "$serial_rx_prefix"
+        printf '%s\n' "$serial_ok_message"
+        printf '%s\n' "$serial_rx_timeout_message"
+        printf '%s\n' "$serial_failed_message"
     } >"$elf_file"
 elif [ "$variant" = "net-tx" ]; then
     # 機械語に固定された長さ・サイズ・EtherType を文字列定数と突き合わせる（fail-closed）
@@ -1039,6 +1244,16 @@ cp "$final_file" "$output_dir/$final_name" 2>/dev/null || { err_code output-fail
             printf 'message_failed=%s\n' "$net_rx_failed_message"
             printf 'recv_timeout_secs=5\n'
             printf 'recv_attempts=16\n'
+            ;;
+        serial-echo)
+            printf 'message_tx=%s\n' "$serial_tx_line"
+            printf 'message_ready=%s\n' "$serial_ready_message"
+            printf 'rx_prefix=%s\n' "$serial_rx_prefix"
+            printf 'message_ok=%s\n' "$serial_ok_message"
+            printf 'message_rx_timeout=%s\n' "$serial_rx_timeout_message"
+            printf 'message_failed=%s\n' "$serial_failed_message"
+            printf 'rx_rounds=%s\n' "$serial_rx_rounds"
+            printf 'rx_timeout_secs=5\n'
             ;;
         *) printf 'message=%s\n' "$init_message" ;;
     esac

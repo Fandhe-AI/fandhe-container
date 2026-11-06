@@ -47,7 +47,7 @@
 //!   `stop` の期限切れでは RAM がリークして同じプロセスで作り直せない。いずれも先に出た失敗を原因として読む。
 //! - 2 台の reboot では `smp_send_stop` が AP の停止を最大約 1 秒待つ。2 台で止まったときの `Failed(..)` も device model 側の
 //!   別 issue で、試験を緩めない（#3998）。
-//! - `guest/kernel/` の Kconfig が本試験の Image に適するかは確かめていない（適すると書かない）。
+//! - `guest/kernel/arm64-guest.config` は Virtualization.framework 用で `SERIAL_8250` などが無く、本試験の Image には使えない。
 //!
 //! 未実装（REPAIR-3）: virtio-block の block-read を割り込み trigger 2 構成（edge / LevelHigh）で起動する試験は、HVF 側が
 //! `QueueNotify` を処理する経路（#3908）が無いため足していない。UART の入出力（#3987）・vCPU 2 台（#3998）はこの試験の上に足す。

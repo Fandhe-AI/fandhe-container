@@ -4,7 +4,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 
 - 対象ビヘイビア: MAC-1・CLI-2・MVM-5（関連: CLI-1・MAC-4・PLUG-11・OCI-5・MVM-1・MVM-4・REPAIR-3）
 - タスク: TASK-80 追補・TASK-64・TASK-192.19
-- 関連 issue: #3801・#3800・#3803・#3988・#3997・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
+- 関連 issue: #3801・#3800・#3803・#3988・#4015・#3997・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
 
 > 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `docs/verification/real-machine-tests.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `docs/verification/real-machine-tests.md` の実機前提テストの項に合わせたもので、合成ゲストまでの実機確認は #3803（macOS 27.2・Apple M4 Max）で済み、実 Linux ゲストの確認は #3988（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
 
@@ -152,6 +152,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 | #1906 | 既定方式（常駐 VM の共用）の未決事項 | ゲストカーネルと initrd の用意と配置 |
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
 | #3988 | Apple Silicon 実機での実 Linux ゲストの割り込みと UART の確認（人間担当） | 現状 |
+| #4015 | Apple Silicon 実機での level 扱いの SPI と virtio の trigger の既定の確認（人間担当。#3908・#4014 の後） | 現状 |
 | #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868・#2231 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
 | #1869・#2232 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |

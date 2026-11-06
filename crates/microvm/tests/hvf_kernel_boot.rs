@@ -272,6 +272,9 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    // 起動予算の判定に使う経過時間は、停止条件を判定した直後（stop の前）に採る。
+    // stop の join・出力の取り切りの時間を予算に含めない（timed_out の判定時点と揃える）。
+    let elapsed = started.elapsed();
     // 期限切れでも必ず stop で vCPU を回収する（REPAIR-5）。
     let report = running
         .stop(STOP_DEADLINE)
@@ -294,7 +297,7 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         output,
         uart_dropped,
         timed_out,
-        elapsed: started.elapsed(),
+        elapsed,
         wfx: counts.count(ExitKind::Wfx),
         vtimer: counts.count(ExitKind::Vtimer),
         data_abort: counts.count(ExitKind::DataAbort),

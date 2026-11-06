@@ -34,7 +34,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::esr::{EsrClass, decode_esr};
+use crate::esr::{EsrClass, SysRegDirection, decode_esr};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
 use crate::stop::StopReason;
 
@@ -245,6 +245,8 @@ pub trait VcpuExec {
     fn run(&mut self, slice: Duration) -> Result<HvVcpuExit, MicrovmError>;
     /// 累積の実行統計。
     fn stats(&self) -> HvRunStats;
+    /// ゲストの現在の PC。未対応 exit で止まる前の診断ログ専用（REPAIR-4）。読めなければ `None`（停止理由には影響しない）。
+    fn pc(&self) -> Option<u64>;
 }
 
 /// 他スレッドから実行を止める手段（`VcpuCanceller` の抽象）。
@@ -285,8 +287,8 @@ where
 /// | その他の `Err(e)` | `Stopped(Failed(e.code()))` |
 /// | `Canceled` かつ停止フラグ | `Stopped(Requested)` |
 /// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
-/// | `Unknown` | `Stopped(Failed(Internal))` |
-/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3） |
+/// | `Unknown` | `Stopped(Failed(Internal))`（止まる前に `kind=unknown_exit_reason` の診断ログを 1 行出す。REPAIR-4） |
+/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に [`unsupported_exit_line`] の診断ログを 1 行出す。REPAIR-4・MVM-5） |
 /// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`） |
 ///
 /// 分類した exit は、振り分けの前に `observer` へ記録する。
@@ -321,6 +323,7 @@ where
                 }
             }
             HvExit::Unknown(_) => {
+                log_unsupported_exit(exec, &exit);
                 return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Internal));
             }
             HvExit::Exception {
@@ -328,6 +331,7 @@ where
                     EsrClass::SysReg(_) | EsrClass::DataAbortUnsupported { .. } | EsrClass::Other { .. },
                 ..
             } => {
+                log_unsupported_exit(exec, &exit);
                 return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Unimplemented));
             }
             _ => match dispatch(exec, &exit) {
@@ -337,6 +341,65 @@ where
                 Err(e) => return LoopExit::Stopped(StopReason::Failed(e.code())),
             },
         }
+    }
+}
+
+/// 未対応 exit で止まる直前の診断ログを 1 行 stderr へ出す（PC を読めなければ `pc=unknown`。停止理由・統計は変えない）。
+fn log_unsupported_exit<E: VcpuExec>(exec: &E, exit: &HvExit) {
+    let thread = std::thread::current();
+    let line = unsupported_exit_line(thread.name().unwrap_or("unnamed"), exit, exec.pc());
+    log_line(format_args!("{line}"));
+}
+
+/// 未対応 exit の診断ログ 1 行を組み立てる純粋関数（MVM-5・REPAIR-4）。
+///
+/// 出力は固定の語と数値（16 進は `0x` 付き）だけで、ゲストから来た文字列は含めない。`thread` は自前の固定名。
+/// 対象外の exit（dispatch へ回るもの）は `kind=other` とする（呼び出し側は未対応 exit にだけ呼ぶ）。
+///
+/// | kind | 追加項目 |
+/// | ---- | -------- |
+/// | `sysreg` | `esr`・`pc`・`op0`・`op1`・`crn`・`crm`・`op2`・`rt`・`dir`（`read` / `write`） |
+/// | `data_abort_isv0` | `esr`・`pc`・`iss`・`va`・`ipa` |
+/// | `unknown_ec` | `esr`・`pc`・`ec` |
+/// | `unknown_exit_reason` | `pc`・`raw`（ESR は無い） |
+fn unsupported_exit_line(thread: &str, exit: &HvExit, pc: Option<u64>) -> String {
+    let pc = match pc {
+        Some(v) => format!("{v:#x}"),
+        None => "unknown".to_string(),
+    };
+    let head = "level=error op=hvf.unsupported_exit outcome=error";
+    match exit {
+        HvExit::Exception { class, exception } => {
+            let esr = exception.syndrome;
+            let detail = match class {
+                EsrClass::SysReg(a) => format!(
+                    "kind=sysreg esr={esr:#x} pc={pc} op0={} op1={} crn={} crm={} op2={} rt={} dir={}",
+                    a.op0,
+                    a.op1,
+                    a.crn,
+                    a.crm,
+                    a.op2,
+                    a.rt.get(),
+                    match a.direction {
+                        SysRegDirection::Read => "read",
+                        SysRegDirection::Write => "write",
+                    }
+                ),
+                EsrClass::DataAbortUnsupported { iss } => format!(
+                    "kind=data_abort_isv0 esr={esr:#x} pc={pc} iss={iss:#x} va={:#x} ipa={:#x}",
+                    exception.virtual_address, exception.physical_address
+                ),
+                EsrClass::Other { ec } => {
+                    format!("kind=unknown_ec esr={esr:#x} pc={pc} ec={ec:#x}")
+                }
+                _ => format!("kind=other esr={esr:#x} pc={pc}"),
+            };
+            format!("{head} thread={thread} {detail}")
+        }
+        HvExit::Unknown(raw) => {
+            format!("{head} thread={thread} kind=unknown_exit_reason pc={pc} raw={raw:#x}")
+        }
+        _ => format!("{head} thread={thread} kind=other pc={pc}"),
     }
 }
 
@@ -1048,6 +1111,7 @@ mod tests {
         script: VecDeque<(bool, Result<HvVcpuExit, MicrovmError>)>,
         stop: Arc<AtomicBool>,
         runs: usize,
+        pc: Option<u64>,
     }
 
     impl ScriptedExec {
@@ -1056,6 +1120,7 @@ mod tests {
                 script: steps.into_iter().map(|s| (false, s)).collect(),
                 stop: Arc::clone(stop),
                 runs: 0,
+                pc: None,
             }
         }
 
@@ -1084,6 +1149,10 @@ mod tests {
 
         fn stats(&self) -> HvRunStats {
             HvRunStats::default()
+        }
+
+        fn pc(&self) -> Option<u64> {
+            self.pc
         }
     }
 
@@ -1193,6 +1262,74 @@ mod tests {
             let (r, _, dispatched, _) = run_script(vec![Ok(exc(syndrome))], None, CONT);
             assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
             assert_eq!(dispatched, 0);
+        }
+    }
+
+    fn exc_with(syndrome: u64, va: u64, ipa: u64) -> HvExit {
+        HvExit::Exception {
+            class: decode_esr(syndrome),
+            exception: HvVcpuExitException {
+                syndrome,
+                virtual_address: va,
+                physical_address: ipa,
+            },
+        }
+    }
+
+    /// 3 分岐と未知の exit reason の診断ログ行を具体値で照合する（MVM-5・REPAIR-4）。
+    #[test]
+    fn mvm5_4035_unsupported_exit_lines_carry_esr_pc_and_details() {
+        let head = "level=error op=hvf.unsupported_exit outcome=error thread=hvf-vcpu-0";
+        // MRS（read）: op0=3 op1=0 crn=14 crm=9 op2=5 rt=7
+        let sysreg = exc_with(0x623A_38F3, 0, 0);
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &sysreg, Some(0x8008_1000)),
+            format!(
+                "{head} kind=sysreg esr=0x623a38f3 pc=0x80081000 op0=3 op1=0 crn=14 crm=9 op2=5 rt=7 dir=read"
+            )
+        );
+        // ISV=0 の data abort
+        let dabt = exc_with(0x9200_0045, 0xffff_8000_1234, 0x0900_0018);
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &dabt, Some(0x4000_0000)),
+            format!(
+                "{head} kind=data_abort_isv0 esr=0x92000045 pc=0x40000000 iss=0x45 va=0xffff80001234 ipa=0x9000018"
+            )
+        );
+        // 未知の EC（0x20 = instruction abort）
+        let other = exc_with(0x8200_0004, 0, 0);
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &other, Some(0x1)),
+            format!("{head} kind=unknown_ec esr=0x82000004 pc=0x1 ec=0x20")
+        );
+        // PC を読めないとき
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &other, None),
+            format!("{head} kind=unknown_ec esr=0x82000004 pc=unknown ec=0x20")
+        );
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &HvExit::Unknown(0x2a), Some(0x10)),
+            format!("{head} kind=unknown_exit_reason pc=0x10 raw=0x2a")
+        );
+    }
+
+    /// PC を読めても読めなくても、停止理由は `Failed(Unimplemented)` / `Failed(Internal)` のまま（REPAIR-4）。
+    #[test]
+    fn mvm5_4035_pc_readability_does_not_change_stop_reason() {
+        for pc in [Some(0x1234), None] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut exec = ScriptedExec::new(&stop, vec![Ok(exc(SYSREG))]);
+            exec.pc = pc;
+            let r = run_loop(&mut exec, &stop, Duration::from_millis(1), None, |_, _| {
+                Ok(ExitAction::Continue)
+            });
+            assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
+            let mut exec = ScriptedExec::new(&stop, vec![Ok(HvVcpuExit::Unknown(7))]);
+            exec.pc = pc;
+            let r = run_loop(&mut exec, &stop, Duration::from_millis(1), None, |_, _| {
+                Ok(ExitAction::Continue)
+            });
+            assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Internal));
         }
     }
 

@@ -3,7 +3,7 @@
 //! 役割: Hypervisor.framework の vCPU は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は作成スレッドから
 //! 呼ぶ）。専用スレッドで `HvVcpu` を作って所有し、レジスタ初期化（`setup`）の後に実行ループを回す。ループ・停止・期限・観測の
 //! 論理は OS 非依存の `crate::hvf_loop` にあり（`hv_*` を呼ばない偽の実行体で単体試験できる）、本ファイルは次だけを持つ。
-//! - `HvVcpu` への [`VcpuExec`] と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包み、WFI の待ちも起こす。#3887）
+//! - `HvVcpu` への [`VcpuExec`]（`pc` は未対応 exit の診断ログ用に `HvReg::PC` を読む。#4035・REPAIR-4）と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包み、WFI の待ちも起こす。#3887）
 //! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, timer}` のハンドラへ振り分ける関数
 //!
 //! 呼び出し元は #3797（構成体の組み立て。`setup` に PC・CPSR・X0（FDT のアドレス）等の初期化を渡し、ハンドラ状態を持たせる）。
@@ -110,6 +110,10 @@ impl VcpuExec for HvfExec<'_> {
 
     fn stats(&self) -> HvRunStats {
         self.0.stats()
+    }
+
+    fn pc(&self) -> Option<u64> {
+        self.0.get_reg(HvReg::PC).ok()
     }
 }
 

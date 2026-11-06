@@ -214,6 +214,8 @@ readonly DELETE_RETRY_INTERVAL_US=100000
 # 期限付きの呼び出し（実行開始の観測・後始末）で残り時間がこれ（マイクロ秒）を
 # 下回ったらランタイムを呼ばずに打ち切る。
 readonly MIN_CALL_BUDGET_US=100000
+# 後始末の初回の delete が期限から残す割合（残り時間の 1/N）。kill・再試行・削除済み確認の時間に充てる（#4017）。
+readonly DELETE_RESERVE_DIV=4
 # 計測区間の壁時計と単調時計（/proc/uptime。分解能 10ms）の許容差（マイクロ秒）。
 # 単調時計の読み取り 2 回分の丸め（各 10ms）に余裕を持たせた値。これを超える時計の
 # 変更を検出して、その回を失敗にする。
@@ -882,8 +884,13 @@ create_not_made() {
 #              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
-# 例外: created=1 の delete が NOT_FOUND のときの削除済み確認（delete_reported_not_found）も
-# 収集待ち（≦ --timeout）と state（収集待ち込みで ≦ 2 × --timeout）を 1 回だけ足す。
+# 例外: created=1 の delete が NOT_FOUND のときの削除済み確認（delete_reported_not_found）は、
+# 後始末の期限が尽きていても確認できるよう、期限の外で 1 回だけ足す。delete の収集待ち（≦ --timeout）と
+# state の呼び出し（≦ --timeout + KILL_AFTER_SECS）と state の収集待ち（≦ --timeout）の合計が上乗せで、
+# 全体は期限（--timeout）+ 3 × --timeout + KILL_AFTER_SECS 以下に有界（#4017・REPAIR-5）。
+# 初回の delete だけは期限の一部（DELETE_RESERVE_DIV 分の 1）を残して打ち切り、kill と再試行の
+# delete に呼び出せる時間を確保する（初回が期限を使い切ると、状態を消した後に打ち切られた delete を
+# 負荷時に「残存」と誤判定する。#4017）。
 # 例外: created=0 の照会（query_state）の収集待ちは期限で切り詰めないため、その経路の最悪時間は
 # state 呼び出し（≦ --timeout）＋収集待ち（≦ --timeout）の 2 × --timeout になる（有界。#2548・REPAIR-5）。
 finish_container() {
@@ -903,13 +910,21 @@ delete_gone_checked=0
 delete_reported_not_found() {
   [ "$delete_gone_checked" = "0" ] || return 1
   is_runtime_error "$3" || return 1
-  flush_last_call $((timeout_secs * 1000000)) || return 1
-  ! log_truncated "$1" || return 1
-  ! log_incomplete "$1" || return 1
-  rt_is_not_found "$1" || return 1
-  delete_gone_checked=1
-  query_state "$2"
-  state_not_found
+  # 確認は後始末の期限の外で行う（期限が尽きた後でも state を呼べるようにし、収集待ちも期限で
+  # 切り詰めない。切り詰めや 124 で確認できないと削除済みを残存と誤判定する。#4017）。
+  # 期限はこの関数の間だけ外し、すべての戻り経路の前に復元する（空のまま漏らさない）。
+  local saved_deadline="$rt_deadline_us" confirmed=1
+  rt_deadline_us=""
+  if flush_last_call $((timeout_secs * 1000000)) \
+    && ! log_truncated "$1" && ! log_incomplete "$1" && rt_is_not_found "$1"; then
+    delete_gone_checked=1
+    query_state "$2"
+    state_not_found || confirmed=0
+  else
+    confirmed=0
+  fi
+  rt_deadline_us="$saved_deadline"
+  [ "$confirmed" -eq 1 ]
 }
 
 # finish_container の本体（rt_deadline_us が設定された状態で呼ばれる）。
@@ -928,8 +943,11 @@ finish_container_within_deadline() {
     leftover_ids+=("$id")
     return 1
   fi
-  local del_rc=0
+  local del_rc=0 final_deadline_us="$rt_deadline_us"
+  # 初回の delete は期限の手前で打ち切り、後続の kill・再試行・確認の分を残す（#4017）。
+  rt_deadline_us=$((final_deadline_us - (final_deadline_us - $(mono_us)) / DELETE_RESERVE_DIV))
   rt_delete "$log" "$id" || del_rc=$?
+  rt_deadline_us="$final_deadline_us"
   if [ "$del_rc" -eq 0 ]; then
     return 0
   fi

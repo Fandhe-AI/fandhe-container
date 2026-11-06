@@ -1,6 +1,6 @@
 //! fandhe-container-microvm: KVM・Hypervisor.framework の直接制御と最小 virtio デバイスモデル（microVM オプション）。
 //!
-//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM と macOS の Hypervisor.framework（TASK-192。aarch64。実機未確認。
+//! 3 OS 展開方針（MVM-5）: 実装済みのバックエンドは Linux の KVM と macOS の Hypervisor.framework（TASK-192。aarch64。実機確認は合成ゲストまで。
 //! 下の「macOS バックエンド」節）。Windows（WHP）は将来オプションで MVP には実装しない。Windows の扱いと、バックエンドの配置（本 crate の中に `cfg(target_os = ...)` で置く。
 //! 2026-11-03 決定）は、`docs/architecture.md` の「microVM の 3 OS 展開方針（MVM-5）」節を正とする。
 //!
@@ -78,8 +78,8 @@
 //!
 //! # macOS バックエンド（TASK-192・MVM-5）
 //! 対象は `cfg(all(target_os = "macos", target_arch = "aarch64"))`（macOS 15 以降・Apple Silicon。GICv3 の API の版による）。
-//! `hvf` は macOS かつ aarch64 のときだけ存在するため、ここでは rustdoc のリンクにしない。実機（macOS）での観測記録は #3803 で、
-//! 現状は実機未確認（型検査と OS 非依存コアの単体試験まで）。FFI は `sys/hvf.rs` の自前宣言で、新しい依存は足していない（MVM-4）。
+//! `hvf` は macOS かつ aarch64 のときだけ存在するため、ここでは rustdoc のリンクにしない。実機（macOS 27.2・Apple M4 Max）で合成ゲストの試験が通った（記録は #3803）。
+//! 実 Linux ゲストは未確認（#3988）。FFI は `sys/hvf.rs` の自前宣言で、新しい依存は足していない（MVM-4）。
 //!
 //! 実装済み:
 //! - VM・ゲスト RAM・vCPU・GICv3 の実行時解決（`sys/hvf.rs`・`hvf::memory`・`hvf::gic`。#3783・#3786・#3787・#3789・#3792・#3795）
@@ -88,12 +88,12 @@
 //! - microVM 構成体と start / stop・停止時の資源の解放順序（`hvf::microvm`・`hvf_lifecycle`。#3797・#3798・#3882）
 //! - UART の SPI 割り込みと入力（#3892・#3893）
 //! - `fandhe-container-plugin-microvm` の start / stop への結線（#3800・#3927）
-//!
-//! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
 //! - SMP（vCPU 1 以上の作成と PSCI `CPU_ON` による AP の起動。#3884・#3891）
 //! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
+//!
+//! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
 //! - virtqueue の処理と QueueNotify の配線、TIMEOUT 後のゲスト RAM の回収（#3908）
-//! - big-endian ゲスト・entitlement 署名の手順（#3801）・実機での観測記録（#3803）
+//! - big-endian ゲスト
 
 #![deny(unsafe_code)]
 

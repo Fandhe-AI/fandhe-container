@@ -58,17 +58,17 @@
 //! - 関数ポインタは `GicApi` の private フィールドに閉じ、`sys` の外へ出さない。`hv_gic_*` は `libc` に対応物が無いため
 //!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.10 以降なので直接リンクしてよい）
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
-//! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK ヘッダとの照合は #3803。
+//! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK 27.2 のヘッダと一致した（#3803）。
 //!
 //! # ホストの時刻（TASK-192.14・#3796）
 //! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
-//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3803。
+//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3997。
 //! 2 関数は本ファイル末尾の単体試験（#3885）で直接確かめる（entitlement 不要のため既定の試験集合で走る）。
 //!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
-//! SDK ヘッダとの最終照合は人間担当の #3803 で行う。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
-//! `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・`hv_vcpu_set_vtimer_offset` は対の形からの推定で、#3803 で照合する。
+//! SDK 27.2 のヘッダと一致した（#3803）。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
+//! `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・`hv_vcpu_set_vtimer_offset` は対の形から推定し、同じヘッダで確かめた。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
@@ -101,7 +101,7 @@ unsafe extern "C" {
 // （`hv_vcpu_t` = u64、`hv_reg_t` = u32、`hv_sys_reg_t` = u16、`hv_interrupt_type_t` = u32、
 // bool = C の `_Bool`、`hv_vcpu_config_t` は不透明ポインタで NULL を渡す）。
 // `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` / `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・
-// `hv_vcpu_set_vtimer_offset` は対の形からの推定で、#3803 で SDK ヘッダと照合する。
+// `hv_vcpu_set_vtimer_offset` は対の形から推定し、SDK 27.2 のヘッダで確かめた（#3803）。
 // 呼び出しはすべて下の安全なラッパー（`HvVcpu`・`VcpuCanceller`）経由で、出力引数はローカル変数だけを渡す。
 unsafe extern "C" {
     fn hv_vcpu_create(
@@ -339,7 +339,7 @@ impl HvVm {
 impl HvVm {
     /// 呼び出しスレッドに束縛された vCPU を作る（config は NULL）。
     ///
-    /// 同じスレッドで 2 個目を作ったときの挙動は未確認（#3803 で観測）。
+    /// 同じスレッドで 2 個目を作ったときの挙動は未確認（#3997 で観測）。
     /// GIC は vCPU より前に作る必要があるため、外部には `crate::hvf::gic::VmWithGic::create_vcpu` だけが公開される（#3792）。
     pub(crate) fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
         let mut id: u64 = 0;
@@ -1176,7 +1176,7 @@ impl GicApi {
     /// シンボルが無ければ `Unimplemented`。戻りは [`classify_hv_return`] で写す。`reg` は検証済みの newtype からしか作れない。
     /// 呼び出し元（`hvf::gic` の SPI sink）は縮退先（学習したヒント）を持つので、失敗は無視してよい。
     /// 出典: <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>（distributor 版には
-    /// redistributor 版にある「owning thread で呼ぶ」注記が無い。非 vCPU スレッドからの呼び出しの観測は #3803）。
+    /// redistributor 版にある「owning thread で呼ぶ」注記が無い。実機のプローブでは非 vCPU スレッドから呼べた。#3803）。
     pub(crate) fn distributor_reg(&self, reg: GicDistributorReg) -> Result<u64, MicrovmError> {
         let f = self.get_distributor_reg.ok_or_else(|| {
             MicrovmError::new(

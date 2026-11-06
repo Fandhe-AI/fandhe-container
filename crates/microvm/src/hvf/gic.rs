@@ -19,7 +19,7 @@
 //! # 検証の内容
 //! 配置の違反（アライン・窓の不足）は `InvalidArgument`、フレームワークの異常値と virtual timer の INTID の不一致は
 //! `Internal`（純関数は `crate::arm64_layout`。FDT を API の値から組み直さず照合で fail-closed にする）。
-//! `hv_gic_get_redistributor_size` は vCPU 1 台分と読む（確定は #3803）。
+//! `hv_gic_get_redistributor_size` は vCPU 1 台分である（SDK ヘッダの「a single GIC redistributor」。実機の値は 131072。#3803）。
 //!
 //! # SPI の注入（TASK-192.13・#3795・MVM-5・MVM-1）
 //! [`GicSpiLine`] は `crate::interrupt::InterruptLine` の macOS 実装で、virtio-mmio 1 台分の SPI に対応する。
@@ -50,17 +50,17 @@
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>。確認日 2026-11-05。
-//!   SDK ヘッダとの照合は #3803）。assert の成功後に `GICD_IROUTER<intid>` を読み、IRM = 0 で affinity が割り当て済みの vCPU
+//!   SDK ヘッダと一致した。#3803）。assert の成功後に `GICD_IROUTER<intid>` を読み、IRM = 0 で affinity が割り当て済みの vCPU
 //!   に当たればその 1 台を起こす（シリアルの線も同じ。決定規則は `crate::hvf_wake::spi_wake_target`）。読めない・IRM = 1・書式違反
 //!   のときは学習したヒントへ、それも無ければ全台へ縮退する。縮退は理由別に数え（[`VmWithGic::spi_routing_stats`]）、理由ごとの初回だけ
 //!   ログに出す。`GICD_CTLR.ARE` = 0 か読めないときは IROUTER を使わない（#3974・REPAIR-4。詳細は `crate::hvf_wake`）。観測用に [`VmWithGic::spi_routing`] を公開する。
-//!   distributor 版の getter に owning thread の注記は無い（redistributor 版にはある）が、非 vCPU スレッドからの読み出しは未観測
-//!   （#3803）。
+//!   distributor 版の getter に owning thread の注記は無い（redistributor 版にはある）。実機のプローブでは非 vCPU スレッドから
+//!   `GICD_IROUTER48` を読めた（#3803）。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
 //! MSI・
-//! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・SDK ヘッダとの値の照合（#3803）・
+//! `hv_gic_get_redistributor_base` の照合・`HvGicIntid` の virtual timer 以外の照合・
 //! vCPU の個別 drop（本 crate では持たない。破棄は teardown の一部としてだけ起き、`mark_teardown` の後の再作成を拒否する。#3798）。`unsafe` は持たない。
 //!
 //! # 所有（#3797）
@@ -237,7 +237,7 @@ impl VmWithGic {
         self.routing.snapshot()
     }
 
-    /// `GICD_CTLR` の生値を読む（実機の観測用。ARE の確認は #3803。#3974）。
+    /// `GICD_CTLR` の生値を読む（実機の観測用。ゲストの初期化後は `0x53` で ARE = 1 だった。#3803・#3974）。
     pub fn distributor_ctlr(&self) -> Result<u64, MicrovmError> {
         GicApi::get()?.distributor_reg(GicDistributorReg::ctlr())
     }
@@ -256,7 +256,7 @@ impl VmWithGic {
     ///
     /// 呼び出し側（#3797）の手順: 最初の `run_once` の前に `set_sys_reg(HvSysReg::MPIDR_EL1, ..)` で
     /// affinity を FDT の `cpu@0` の `reg`（`ARM64_BOOT_CPU_MPIDR`。Aff0..Aff2 = 0）に合わせ、読み戻して確かめる
-    /// （フレームワークによる加工の有無は #3803 で観測）。vCPU の実行開始後はトポロジが確定する。
+    /// （読み戻しは書いた値のままだった。ゲストの `mrs` には RES1 の bit 31 が立つ。#3803）。vCPU の実行開始後はトポロジが確定する。
     /// 試験の `0x8000_0001` はレジスタ往復の確認で、起動の契約ではない。
     ///
     /// ```compile_fail
@@ -314,8 +314,8 @@ impl VmWithGic {
     /// 生存フラグを共有するので、ホスト側の `SerialConsole` の clone が VM より長生きしても、VM の破棄後の注入は
     /// `Internal` で拒否される。呼び出しは MMIO exit を処理する vCPU スレッドから UART の lock の下で行い、待ちは持たない
     /// （REPAIR-5 不要）。ロック順は dispatcher → UART → 生存フラグ（読み取り）で、`Drop` の書き込みロックは vCPU 停止後に取られる。
-    /// ホストスレッドの `SerialConsole::push_input`（#3893）も UART の lock の下で呼ぶ（ロック順は同じ）。`hv_gic_set_spi` を
-    /// vCPU 以外のスレッドから呼べるかは未確認（#3803）。
+    /// ホストスレッドの `SerialConsole::push_input`（#3893）も UART の lock の下で呼ぶ（ロック順は同じ）。`hv_gic_set_spi` は
+    /// vCPU 以外のスレッドから呼べる（実機で確認。#3803）。
     pub fn serial_line(&self, layout: &Arm64Layout) -> Result<GicSerialLine, MicrovmError> {
         let spi = layout.serial_spi().ok_or_else(|| {
             MicrovmError::new(

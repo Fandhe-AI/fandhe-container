@@ -253,10 +253,10 @@ microVM は Linux の既定（namespaces）に加える選択式のオプショ�
 | 優先順位 | OS | バックエンド | 位置づけ | 現状 |
 | -------- | -- | ------------ | -------- | ---- |
 | 1 | Linux | KVM | KVM ioctl を直接扱う自前実装（MVM-4） | TASK-74・TASK-75（#688・#695）で最小起動フローまで実装済み（`crates/microvm`。未実装事項の正は crate の doc）。x86_64 と aarch64 が対象（MVM-1）。aarch64 は vGICv3・irqfd・VM の組み立て・起動レジスタまで実装済み（#3696。実機未確認。AP の POWER_OFF 初期化と PSCI CPU_ON による SMP は #3899 で実装済み・実機未確認）で、PSCI（#3896）・実カーネルの起動試験（#3897）・シリアル（#3898）も実装済み。実機での記録は #3781 が残る |
-| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 実装済み（実機未確認。実機の記録は #3803）。TASK-192（`crates/microvm` の `cfg(target_os = "macos")`〔aarch64〕のバックエンド。`fandhe-container-plugin-microvm` の start / stop から動かす。#3927）。対応は macOS 15 以降（GICv3 の API の版。15 未満は `UNIMPLEMENTED`）・Apple Silicon のみ。SMP（#3884・#3891）などの未実装事項の正は crate の doc。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
+| 2 | macOS | Hypervisor.framework | libkrun の設計を参考にする。参考は設計に限り、libkrun のコードと libkrun が使う rust-vmm 系クレートは採用しない（MVM-4） | 実装済み（実機確認は合成ゲストまで。記録は #3803。実 Linux ゲストは #3988）。TASK-192（`crates/microvm` の `cfg(target_os = "macos")`〔aarch64〕のバックエンド。`fandhe-container-plugin-microvm` の start / stop から動かす。#3927）。対応は macOS 15 以降（GICv3 の API の版。15 未満は `UNIMPLEMENTED`）・Apple Silicon のみ。SMP（#3884・#3891）などの未実装事項の正は crate の doc。TASK-78 は方針の文書化のみ。TASK-64・TASK-65（MAC-1）は Virtualization.framework の実装で、別バックエンドである |
 | 対象外（将来オプション） | Windows | WHP（Windows Hypervisor Platform）経由 | PoC-4 の結論（MVP の Windows の主経路は WSL2 経由で、WIN-1・WIN-2。実装は TASK-67）により将来オプション。MVP には実装しない（WIN-6 の Hyper-V 直接方式と同系統） | 未実装。配置は `crates/microvm` の Windows バックエンド（`cfg(target_os = "windows")`。2026-11-03 決定。下の「バックエンドの配置」を参照）。実装の計画は無い |
 
-実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、両方とも実装済みである（macOS は実機未確認）。Windows（WHP）は優先順位の外に置く。
+実装は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、両方とも実装済みである（macOS の実機確認は合成ゲストまで）。Windows（WHP）は優先順位の外に置く。
 
 ### バックエンドの配置（2026-11-03 決定）
 

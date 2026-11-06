@@ -24,14 +24,14 @@
 //! - `interrupts` は level-high の SPI（[`ARM64_SERIAL_SPI`]）で出す（#3892・MVM-5・MVM-1）。線は `crate::uart` の
 //!   THRE 状態から [`crate::interrupt::LevelInterruptLine`] で駆動する（macOS は `hv_gic_set_spi`）。トリガは
 //!   `virtio_spi_trigger` と独立で常に level。SPI 番号は virtio の基点（既定 16）より下で重ならない
-//!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3803。
+//!   （[`Arm64Layout::validate`] が重なりを拒否）。実ゲストでの確認は #3988。
 //!
 //! - [`SerialInterrupt::Polled`]（#3898・MVM-1）: `interrupts` を出さない配置。本番の経路（KVM aarch64 は #3943 で `KVM_IRQ_LINE`
 //!   の SPI を結線して `LevelSpi` を使う）では現在使わない。Linux の 8250 は irq = 0 で timer ポーリングになる。
 //!
 //! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
-//! `hvf_smp`〔#3891〕）で起動する。実ゲストでの確認は #3803。
-//! PCI・IPA 上限の確定（#3803）。
+//! `hvf_smp`〔#3891〕）で起動する。合成ゲストでは実機で確かめた（#3803）。実 Linux ゲストの確認は #3998・#3988。
+//! PCI・IPA 上限の確定は範囲外（IPA 上限は #3997）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を
@@ -80,7 +80,7 @@ pub const ARM64_VIRTIO_SPI_BASE: u32 = 16;
 /// シリアルの SPI 番号（DT のセル値。INTID は 33）。virtio の基点（既定 16）より下で重ならない
 /// （QEMU の virt の VIRT_UART と同じ慣行。#3892・MVM-5）。
 pub const ARM64_SERIAL_SPI: u32 = 1;
-/// 既定の IPA 上限（暫定。確定は #3803。KVM 経路は自分の値を `ipa_limit` に渡せる）。
+/// 既定の IPA 上限（暫定。確定は #3997。KVM 経路は自分の値を `ipa_limit` に渡せる）。
 pub const ARM64_DEFAULT_IPA_LIMIT: u64 = HVF_DEFAULT_IPA_LIMIT;
 /// `cpu@0` の `reg`。#3797 が `MPIDR_EL1` の affinity をこの値から設定する。
 pub const ARM64_BOOT_CPU_MPIDR: u32 = 0;
@@ -420,7 +420,7 @@ pub struct GicGeometry {
     pub dist_size: u64,
     /// distributor の base のアライン。
     pub dist_align: u64,
-    /// vCPU 1 台分の redistributor の大きさ（Apple のドキュメントからの読み。全体の値でも現状は vCPU = 1 で判定が同じ。確定は #3803）。
+    /// vCPU 1 台分の redistributor の大きさ（SDK ヘッダの「a single GIC redistributor」で、実機の値は 131072。#3803）。
     pub redist_size_per_cpu: u64,
     /// redistributor の base のアライン。
     pub redist_align: u64,

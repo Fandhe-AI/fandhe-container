@@ -117,7 +117,7 @@ fn hvf_device_vcpu_regs_roundtrip() {
     // 0x3c5: M[3:0] = 0b0101（EL1h）と DAIF の 4 ビット（0x3c0）。
     vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
     assert_eq!(vcpu.get_reg(HvReg::CPSR).unwrap(), 0x3c5);
-    // bit 31 は RES1、Aff0 = 1。フレームワークがゲストに見せる値を加工する可能性は #3803 で観測する。
+    // bit 31 は RES1、Aff0 = 1。実機の読み戻しは書いた値のままだった（#3803）。
     vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, 0x8000_0001).unwrap();
     assert_eq!(vcpu.get_sys_reg(HvSysReg::MPIDR_EL1).unwrap(), 0x8000_0001);
 
@@ -871,7 +871,7 @@ const MMIO_GUEST_MOVZ_WRONG: u32 = 0x528D_2EE2;
 
 /// MMIO の data abort がデバイスモデルへ届き、読み出し値がレジスタへ戻り、PC が進むことを確かめる。
 /// virtio-block（窓 0）の MagicValue / Version を読み、窓 1 の観測器へゲストが書いた値を具体値で照合する。
-/// 不一致の負の対照（期待値を 1 ずらした同じゲスト）も回す。実機で未観測の前提（PC の自動前進の有無・IPA の下位ビット）は
+/// 不一致の負の対照（期待値を 1 ずらした同じゲスト）も回す。前提（PC の自動前進の有無・IPA の下位ビット）が外れたら
 /// 値の食い違いとして失敗する（記録は人間担当の #3803）。TASK-192.10・#3793・MVM-5・MVM-1。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
@@ -2016,7 +2016,7 @@ fn hvf_device_vtimer_wakes_wfi() {
         "guest did not stay in wfi: {:?}",
         report.stats
     );
-    // 停止要求が WFI の待ちを起こす(#3887)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら #3803 で切り分けて緩める。
+    // 停止要求が WFI の待ちを起こす(#3887)。所要には vCPU の破棄とスレッドの終了を含む。超えるなら切り分けて緩める。
     eprintln!(
         "hvf_device: vtimer: stop_elapsed_us={}",
         stop_elapsed.as_micros()
@@ -2042,7 +2042,7 @@ const SPI_WAKE_SETTLE: Duration = Duration::from_millis(5);
 /// GIC つきの構成では WFI は exit せず `hv_vcpu_run` の中で待つ（#3803）。起こせるのは注入と、`VCPU_RUN_SLICE`（100 ms）の
 /// 区切りの cancel だけである。準備完了を待ってから非 vCPU スレッドで `GicSpiLine::trigger` を呼び、その時刻からゲストが
 /// INTID を MMIO 窓へ書くまでの遅れを測る。注入で起きなければ遅れは区切りまでの 0〜100 ms に散るため、全標本が
-/// `WFI_WAIT_MAX`（10 ms）未満で中央値がその半分未満であることを照合する（実機で不安定なら #3803 で緩める）。
+/// `WFI_WAIT_MAX`（10 ms）未満で中央値がその半分未満であることを照合する（実機で不安定なら切り分けて緩める）。
 /// 同じ INTID への `set_spi(true)` の繰り返しがそのつど届くことの観測も兼ねる。`VcpuThread` と本物のハンドラを使う。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]

@@ -56,7 +56,7 @@
 //!   失敗（`HV_BUSY` 等）すると `VM_EXISTS` が立ったままになり、同じプロセスで二度と VM を作れない。
 //! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: `HostMapping` が `!Send` のため RAM を移すのに `sys` へ新しい
 //!   `unsafe impl Send` が要る（事前承認の範囲外）。
-//! - 実機での戻り値・所要時間の観測は #3803（人間担当）。
+//! - 実機では破棄の後に同じプロセスで作り直せて、`stop` の所要は合成ゲストで 103〜241 µs だった（#3803）。
 //!
 //! ## 期限切れ（`TIMEOUT`）のとき
 //! 解放はデバイスと VM の手放しに留め、ゲスト RAM の対応付けは `mem::forget` でリークする（ゲストがまだ書けうるメモリを再利用させない
@@ -70,7 +70,7 @@
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
-//! - 書いた範囲の PoC までの clean と I-cache 無効化の要否、MPIDR / SCTLR の生の値の記録（#3803）。
+//! - 書いた範囲の PoC までの clean と I-cache 無効化の要否（合成 Image は無しで起動した。#3803。実カーネルは #3988）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
 //!
 //! `unsafe` は持たない（crate の `#![deny(unsafe_code)]` で担保）。

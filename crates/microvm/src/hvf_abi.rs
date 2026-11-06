@@ -29,12 +29,11 @@
 //! [`HvGicIntid`] の値は SDK ヘッダ（`hv_gic_types.h`）の列挙値で、実機でも確かめた（#3803）。
 //!
 //! # 出典
-//! 数値の一部と 3 つの名前は第三者バインディング由来で、SDK ヘッダ（`Hypervisor/hv_error.h`）との
-//! 最終照合は人間担当の #3803 で行う。それまでは暫定値として扱う。
-//! vCPU 側の暫定値（`hv_reg_t` の連番、exit reason 0〜3、`HV_INTERRUPT_TYPE_*` の 0 / 1、`hv_reg_t` /
+//! 数値の一部と 3 つの名前は第三者バインディング由来で、SDK 27.2 のヘッダと照合した（#3803。食い違いは #3989 で直した）。
+//! vCPU 側の値（`hv_reg_t` の連番、exit reason 0〜3、`HV_INTERRUPT_TYPE_*` の 0 / 1、`hv_reg_t` /
 //! `hv_exit_reason_t` / `hv_interrupt_type_t` の幅 u32、`hv_sys_reg_t` の幅 u16、`hv_vcpu_exit_t` の
-//! レイアウト）も Apple の公開ドキュメントに基づく暫定値で、SDK ヘッダ（`hv_vcpu_types.h` ほか）との
-//! 照合は #3803 で行う。`hv_sys_reg_t` の値は Arm ARM の (op0, op1, CRn, CRm, op2) から導出した
+//! レイアウト）は Apple の公開ドキュメントに基づき、同じヘッダ（`hv_vcpu_types.h` ほか）と一致した（#3803）。
+//! macOS 15 の SDK の時点の値は未確認である。`hv_sys_reg_t` の値は Arm ARM の (op0, op1, CRn, CRm, op2) から導出した
 //! （第三者リポジトリの一覧は写していない）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
@@ -323,7 +322,7 @@ pub struct HvVcpuExitRaw {
     pub exception: HvVcpuExitException,
 }
 
-// レイアウトの固定（LP64 の全ターゲットで成り立つ。SDK との照合は #3803）。
+// レイアウトの固定（LP64 の全ターゲットで成り立つ。SDK 27.2 のヘッダと一致した。#3803）。
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
     assert!(size_of::<HvVcpuExitException>() == 24);
@@ -369,7 +368,7 @@ fn invalid(msg: &'static str) -> MicrovmError {
 /// バックエンドで同じにする。(2) GICR の窓と FDT の `cpu@N` が受ける `ARM64_MAX_VCPUS`（64）以内（下の const assert で固定）。
 /// フレームワーク側の実際の上限（`hv_vm_get_max_vcpu_count`）は照会しない。照会は新しい FFI 宣言が要り、macOS 14 での
 /// dyld の解決と SDK ヘッダとの照合が未確認のため。32 台を受けない機種では `hv_vcpu_create` が失敗し、`assemble` 全体が
-/// 作成済みの資源を回収して失敗する（fail-closed）。照会の要否と実機での値の記録は #3803。
+/// 作成済みの資源を回収して失敗する（fail-closed）。照会の要否と実機での値の記録は #3997。
 pub const HVF_MAX_VCPUS: u32 = 32;
 const _: () = assert!(HVF_MAX_VCPUS <= crate::arm64_layout::ARM64_MAX_VCPUS);
 /// macOS バックエンドが受けるゲスト RAM の上限（[`MAX_MAP_BYTES`] と同値。mmap の前に超過を拒否する）。
@@ -482,7 +481,7 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
 
 /// 既定の IPA 幅（36 ビット = 64 GiB）に基づくゲスト物理アドレスの上限（暫定値。TASK-192.4・#3787・MVM-5）。
 ///
-/// Apple の公開情報からの読みで、SDK と実機での照合は #3803、レイアウトの確定は #3788。確定するまで上げない。
+/// Apple の公開情報からの読みで、SDK と実機での照合は #3997、レイアウトの確定は #3788。確定するまで上げない。
 pub const HVF_DEFAULT_IPA_LIMIT: u64 = 1 << 36;
 
 /// ゲスト RAM を `[ipa, ipa + size)` に置けるか、IPA の上限に対して検査する（`hv_vm_map` の前に通す）。
@@ -505,7 +504,7 @@ pub fn check_ipa_limit(ipa: u64, size: u64, ipa_limit: u64) -> Result<(), Microv
 ///
 /// [`check_map_range`] の後に、[`HVF_DEFAULT_IPA_LIMIT`] に対する [`check_ipa_limit`] を行う（この順序）。
 /// `config = NULL` で作る VM の IPA 幅は既定値なので、既定の上限が FFI に渡せる範囲の天井になる。
-/// 上限の値は暫定（#3788・#3803）。レイアウトごとの、より厳しい上限は `HvfGuestRam::register` が検査する。
+/// 上限の値は暫定（#3788・#3997）。レイアウトごとの、より厳しい上限は `HvfGuestRam::register` が検査する。
 pub fn check_vm_map(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result<(), MicrovmError> {
     check_map_range(addr, ipa, size, page_size)?;
     check_ipa_limit(ipa, size, HVF_DEFAULT_IPA_LIMIT)
@@ -730,7 +729,7 @@ impl GicIntid {
 /// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
 /// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>・
 /// <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_ctlr>（確認日 2026-11-05）。
-/// SDK ヘッダとの照合は #3803。
+/// SDK ヘッダと一致した（幅は `uint16_t`、`GICD_IROUTER32` は 0x6100。#3803）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GicDistributorReg(u16);
 
@@ -780,7 +779,7 @@ pub enum GicdCtlrAre {
 /// `GICD_CTLR` の生値から ARE を復号する（#3974・MVM-5）。
 ///
 /// ARE は bit 4（単一セキュリティ状態の ARE、Non-secure view の ARE_NS。Linux の `GICD_CTLR_ARE_NS` も `1 << 4`）。
-/// bit 5 が ARE_NS になるのは Secure view だけで、ゲスト（NS EL1）には当たらない。どの view が返るかの実機観測は #3803。
+/// bit 5 が ARE_NS になるのは Secure view だけで、ゲスト（NS EL1）には当たらない。実機はゲストが `0x13` を書いた後に `0x53`（DS = 1 の単一セキュリティ状態）を返した（#3803）。
 /// RWP・Enable 等の他のビットは見ない。上位 32 ビットが 0 でなければ `Malformed`。
 pub fn decode_gicd_ctlr_are(raw: u64) -> GicdCtlrAre {
     const ARE: u64 = 1 << 4;

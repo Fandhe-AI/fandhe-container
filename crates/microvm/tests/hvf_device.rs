@@ -585,6 +585,11 @@ fn hvf_device_spi_reaches_guest() {
                     }
                     Err(e) => eprintln!("hvf_device: spi: irouter48 unavailable: {e}"),
                 }
+                // ゲストの GIC 初期化後の GICD_CTLR の生値（観測のみ。値は assert しない。#3986・#3974・MVM-5）。
+                match vgic.distributor_ctlr() {
+                    Ok(raw) => eprintln!("hvf_device: spi: gicd_ctlr={raw:#x}"),
+                    Err(e) => eprintln!("hvf_device: spi: gicd_ctlr unavailable: {e}"),
+                }
                 // vCPU スレッド以外からの注入(スレッドの制約の観測)。下の再開で vCPU が `wfi` へ入った後に届く。
                 let l2 = line.clone();
                 injector = Some(std::thread::spawn(move || {

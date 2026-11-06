@@ -1,4 +1,5 @@
 //! 実 Linux カーネルの起動完走の結合試験（MVM-1・REPAIR-5・REPAIR-12・TASK-75.5・#3771）。`--ignored` 指定時だけ走る。
+//! 入力検査・ゲスト出力の照合は `support/guest_boot.rs` と共有する（macOS の `hvf_kernel_boot.rs` と同じ。#3986・MVM-5・REPAIR-1）。
 //!
 //! これまでの実機前提試験（`microvm.rs` 等）は合成ペイロードだけを動かす。本試験は利用者が用意した x86_64 の
 //! bzImage と、#3770 の最小 initrd（`scripts/build-microvm-test-initrd.sh`）で `MicroVm::assemble` →
@@ -87,10 +88,15 @@ fn open_kvm() -> fandhe_container_microvm::device::KvmDevice {
         .unwrap_or_else(|e| panic!("{}", kvm_precondition::open_failure_line("kernel_boot", &e)))
 }
 
+// macOS の `hvf_kernel_boot.rs` と共有する補助（入力検査・ゲスト出力の照合。#3986・MVM-5・REPAIR-1）。
+// `#[path]` の基準が変わるため、インライン module の中ではなくファイルの先頭に置く。
 /// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
 /// x86_64 と aarch64 の試験が共有する（#3898。複製しない・REPAIR-1）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const MARKER: &str = "fandhe-microvm-test: init ok v1";
+#[path = "support/guest_boot.rs"]
+mod guest_boot;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use guest_boot::{MARKER, count_marker_lines, escape_tail};
 
 /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
 /// `block_sentinel`（x86 の単体テストで照合）。x86_64 と aarch64（#3947）の試験が共有する（複製しない・REPAIR-1）。
@@ -102,15 +108,6 @@ const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
 /// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
-
-/// 行単位の完全一致の件数（tty の ONLCR による `\r\n` を許容。部分一致・混入は数えない）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn count_marker_lines(output: &[u8], marker: &str) -> usize {
-    output
-        .split(|b| *b == b'\n')
-        .filter(|line| line.strip_suffix(b"\r").unwrap_or(line) == marker.as_bytes())
-        .count()
-}
 
 /// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
 /// x86_64 の SMP 照合（#3888）と aarch64 の SMP 照合（#3899）が共有する（複製しない・REPAIR-1）。
@@ -124,17 +121,6 @@ fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
                 .ends_with(suffix.as_bytes())
         })
         .count()
-}
-
-/// 非信頼のゲスト出力を、末尾 `n` バイトだけエスケープして診断に載せる（端末制御の注入を防ぐ）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn escape_tail(output: &[u8], n: usize) -> String {
-    let start = output.len().saturating_sub(n);
-    output
-        .get(start..)
-        .unwrap_or(&[])
-        .escape_ascii()
-        .to_string()
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -358,183 +344,6 @@ fn mvm1_3865_observer_counts_status_and_queue_ready() {
     assert_eq!(obs.stats(VirtioDeviceKind::Net).queue_ready_one, 2);
     assert_eq!(obs.stats(VirtioDeviceKind::Block).queue_ready_one, 1);
     assert_eq!(obs.ap_exits.load(Ordering::Relaxed), 1);
-}
-
-/// `uart_report_port` の行から読んだアドレス（Linux v6.12 `drivers/tty/serial/serial_core.c`）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TtyAddress {
-    /// `MMIO 0x<hex>`（`UPIO_MEM` 系）。
-    Mmio(u64),
-    /// `I/O 0x<hex>`（`UPIO_PORT`）。
-    Io(u64),
-}
-
-/// `parse_tty_report` の結果。真偽値に潰さず、失敗の種類を診断に残す（MVM-1・REPAIR-12・#3958）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TtyReport {
-    /// `<tty> at ` を含む行が無い（`quiet`・`loglevel=` で KERN_INFO が抑止された場合も含む）。
-    Missing,
-    /// 該当行が 2 行以上ある（件数）。
-    Multiple(usize),
-    /// 該当行はあるが書式が想定と違う（理由）。
-    Malformed(&'static str),
-    /// 1 行だけあり、読めた。`irq` は Linux の virq であり GIC の INTID ではない。
-    Found { address: TtyAddress, irq: u32 },
-}
-
-/// ゲストの出力から 8250 の登録行 `<dev>: ttyS0 at MMIO 0x9000000 (irq = N, base_baud = B) is a 16550A` を読む。
-///
-/// 書式は Linux v6.12 `uart_report_port` の `pr_info("%s%s%s at %s (irq = %d, base_baud = %d) is a %s\n", ...)`。
-/// `irq = 0` は DT に `interrupts` が無い構成（ポーリング）で `8250_of.c` の `of_irq_get` が失敗したときに出る。
-/// 非 0 の値は virq で INTID 33 とは一致しないため、呼び出し側は `== 33` ではなく `!= 0` で照合する。
-/// `base_baud` 以降は UART モデルの autoconfig に依存するので読まない。
-/// 出力はゲスト由来の非信頼入力なので、添字・`unwrap` を使わず、桁数に上限を置いて panic しない。
-/// 呼び出し元: aarch64 の実機前提の陽性（`arm64`）と、既定で走る単体試験（`tty_report_tests`）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn parse_tty_report(output: &[u8], tty: &str) -> TtyReport {
-    let needle = format!("{tty} at ");
-    let needle = needle.as_bytes();
-    let mut lines: Vec<&[u8]> = Vec::new();
-    for raw in output.split(|b| *b == b'\n') {
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-        // 直前が英数字の出現（`xttyS0 at` 等）は別の名前なので数えない。
-        let hit = line
-            .windows(needle.len())
-            .position(|w| w == needle)
-            .filter(|pos| {
-                pos.checked_sub(1)
-                    .and_then(|p| line.get(p))
-                    .is_none_or(|b| !b.is_ascii_alphanumeric())
-            });
-        if let Some(pos) = hit
-            && let Some(rest) = line.get(pos + needle.len()..)
-        {
-            lines.push(rest);
-        }
-    }
-    let rest = match lines.as_slice() {
-        [] => return TtyReport::Missing,
-        [one] => *one,
-        many => return TtyReport::Multiple(many.len()),
-    };
-    let Ok(rest) = std::str::from_utf8(rest) else {
-        return TtyReport::Malformed("non-utf8 report line");
-    };
-    let (is_mmio, rest) = if let Some(r) = rest.strip_prefix("MMIO 0x") {
-        (true, r)
-    } else if let Some(r) = rest.strip_prefix("I/O 0x") {
-        (false, r)
-    } else {
-        return TtyReport::Malformed("unknown address kind");
-    };
-    let hex_len = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-    if hex_len == 0 || hex_len > 16 {
-        return TtyReport::Malformed("address digits out of range");
-    }
-    let (Some(hex), Some(rest)) = (rest.get(..hex_len), rest.get(hex_len..)) else {
-        return TtyReport::Malformed("address split");
-    };
-    let Ok(value) = u64::from_str_radix(hex, 16) else {
-        return TtyReport::Malformed("address not a number");
-    };
-    let Some(rest) = rest.strip_prefix(" (irq = ") else {
-        return TtyReport::Malformed("missing irq field");
-    };
-    let dec_len = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if dec_len == 0 || dec_len > 10 {
-        return TtyReport::Malformed("irq digits out of range");
-    }
-    let (Some(dec), Some(rest)) = (rest.get(..dec_len), rest.get(dec_len..)) else {
-        return TtyReport::Malformed("irq split");
-    };
-    let Ok(irq) = dec.parse::<u32>() else {
-        return TtyReport::Malformed("irq overflow");
-    };
-    if !rest.starts_with(',') {
-        return TtyReport::Malformed("irq not followed by comma");
-    }
-    let address = if is_mmio {
-        TtyAddress::Mmio(value)
-    } else {
-        TtyAddress::Io(value)
-    };
-    TtyReport::Found { address, irq }
-}
-
-/// `parse_tty_report` の単体試験（KVM 不要。x86_64・aarch64 のどちらでも既定で走る。MVM-1・REPAIR-12・#3958）。
-#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod tty_report_tests {
-    use super::{TtyAddress, TtyReport, parse_tty_report};
-
-    const LINE: &str =
-        "9000000.serial: ttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 115200) is a 16550A";
-
-    #[test]
-    fn mvm1_3958_parse_tty_report_irq_values() {
-        let found = |s: &str| parse_tty_report(s.as_bytes(), "ttyS0");
-        let expect = TtyReport::Found {
-            address: TtyAddress::Mmio(0x0900_0000),
-            irq: 14,
-        };
-        assert_eq!(found(&format!("{LINE}\n")), expect);
-        assert_eq!(found(&format!("[    0.312345] {LINE}\r\n")), expect);
-        assert_eq!(
-            found(&LINE.replace("irq = 14", "irq = 0")),
-            TtyReport::Found {
-                address: TtyAddress::Mmio(0x0900_0000),
-                irq: 0
-            }
-        );
-        assert_eq!(
-            found("serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A\n"),
-            TtyReport::Found {
-                address: TtyAddress::Io(0x3f8),
-                irq: 4
-            }
-        );
-        let mixed = format!(
-            "earlycon: uart8250 at MMIO 0x0000000009000000 (options '')\n{LINE}\n\
-             9001000.serial: ttyS1 at MMIO 0x9001000 (irq = 15, base_baud = 115200) is a 16550A\n"
-        );
-        match found(&mixed) {
-            TtyReport::Found { address, irq } => {
-                assert_eq!(address, TtyAddress::Mmio(0x0900_0000));
-                assert_eq!(irq, 14);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn mvm1_3958_parse_tty_report_missing_and_malformed() {
-        let p = |s: &str| parse_tty_report(s.as_bytes(), "ttyS0");
-        assert_eq!(p(""), TtyReport::Missing);
-        assert_eq!(
-            p("earlycon: uart8250 at MMIO 0x0000000009000000 (options '')\n"),
-            TtyReport::Missing
-        );
-        assert_eq!(
-            p("xttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 1) is a 16550A\n"),
-            TtyReport::Missing
-        );
-        assert_eq!(p(&format!("{LINE}\n{LINE}\n")), TtyReport::Multiple(2));
-        for bad in [
-            "ttyS0 at MMIO 0x9000000 (irq = abc, base_baud = 1)",
-            "ttyS0 at MMIO 0x9000000 (irq = -1, base_baud = 1)",
-            "ttyS0 at MMIO 0x9000000 (irq = 99999999999, base_baud = 1)",
-            "ttyS0 at MMIO 0x9000000 (irq = 4294967296, base_baud = 1)",
-            "ttyS0 at MMIO 0x9000000 (irq = 14 base_baud = 1)",
-            "ttyS0 at MMIO 0x (irq = 14, base_baud = 1)",
-            "ttyS0 at *unknown* (irq = 14, base_baud = 1)",
-        ] {
-            assert!(
-                matches!(p(&format!("{bad}\n")), TtyReport::Malformed(_)),
-                "{bad}"
-            );
-        }
-    }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -787,11 +596,12 @@ mod net_fixture_tests {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
+    use super::guest_boot::read_bounded;
     use super::{
         BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
         NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
         NET_TX_FRAME, NET_TX_OK_MARKER, VirtioWindowObserver, count_lines_ending_with,
-        count_marker_lines, escape_tail, hex_prefix,
+        count_marker_lines, escape_tail, guest_boot, hex_prefix,
     };
     use fandhe_container_microvm::device::{KvmDevice, RunObserver};
     use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
@@ -800,8 +610,6 @@ mod x86 {
     };
     use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
     use fandhe_container_microvm::virtio_net::{MemoryNetBackend, NetBackend};
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
@@ -822,55 +630,12 @@ mod x86 {
         panic!("kernel_boot: PRECONDITION FAILED (test environment, not a regression): {reason}")
     }
 
-    /// 上限つきでファイルを読む。空・上限超過・通常ファイルでないものは拒否する。
-    fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-        // REPAIR-5: 書き手のいない FIFO で open が無期限に止まらないよう O_NONBLOCK（Linux: 0o4000）で開く。
-        // 通常ファイルには影響せず、FIFO・デバイス等は下の通常ファイル検査で拒否する。
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0o4000)
-            .open(path)
-            .map_err(|e| format!("cannot open file: {e}"))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("cannot stat file: {e}"))?;
-        if !meta.is_file() {
-            return Err("not a regular file".into());
-        }
-        if meta.len() == 0 || meta.len() > cap {
-            return Err(format!("file size {} not in 1..={cap}", meta.len()));
-        }
-        let mut buf = Vec::new();
-        file.take(cap + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("cannot read file: {e}"))?;
-        if buf.is_empty() || buf.len() as u64 > cap {
-            return Err("file size changed while reading".into());
-        }
-        Ok(buf)
-    }
-
     fn parse_boot_timeout(raw: Option<&str>) -> Result<u64, String> {
-        match raw {
-            None => Ok(DEFAULT_TIMEOUT_SECS),
-            Some(s) => match s.parse::<u64>() {
-                Ok(n) if (1..=600).contains(&n) => Ok(n),
-                _ => Err(
-                    "FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS must be an integer in 1..=600"
-                        .into(),
-                ),
-            },
-        }
+        guest_boot::parse_boot_timeout_or(raw, DEFAULT_TIMEOUT_SECS)
     }
 
     fn validate_cmdline(raw: Option<&str>) -> Result<String, String> {
-        let s = raw.unwrap_or(DEFAULT_CMDLINE);
-        if s.is_empty() || s.bytes().any(|b| !(0x20..=0x7E).contains(&b)) {
-            return Err(
-                "FANDHE_CONTAINER_MICROVM_CMDLINE must be non-empty printable ASCII".into(),
-            );
-        }
-        Ok(s.to_owned())
+        guest_boot::validate_cmdline_or(raw, DEFAULT_CMDLINE)
     }
 
     /// 2 CPU がオンラインになった行（Linux v6.12 `kernel/smp.c` の `smp_init()` の `pr_info`。`CONFIG_NUMA=n` で node は 1）。
@@ -1643,21 +1408,6 @@ mod x86 {
     }
 
     #[test]
-    fn mvm1_3771_count_marker_lines() {
-        let m = MARKER;
-        assert_eq!(count_marker_lines(b"", m), 0);
-        assert_eq!(count_marker_lines(format!("{m}\n").as_bytes(), m), 1);
-        assert_eq!(count_marker_lines(format!("{m}\r\n").as_bytes(), m), 1);
-        assert_eq!(count_marker_lines(m.as_bytes(), m), 1);
-        assert_eq!(count_marker_lines(format!("x{m}\n").as_bytes(), m), 0);
-        assert_eq!(count_marker_lines(format!("{m}y\n").as_bytes(), m), 0);
-        assert_eq!(
-            count_marker_lines(format!("{m}\nboot\n{m}\n").as_bytes(), m),
-            2
-        );
-    }
-
-    #[test]
     fn mvm1_3888_count_lines_ending_with() {
         let l = SMP_ONLINE_LINE;
         assert_eq!(count_lines_ending_with(b"", l), 0);
@@ -1697,45 +1447,6 @@ mod x86 {
         assert!(validate_cmdline(Some("")).is_err());
         assert!(validate_cmdline(Some("a\nb")).is_err());
     }
-
-    #[test]
-    fn mvm1_3771_read_bounded() {
-        let dir = std::env::temp_dir().join(format!("fandhe-kernel-boot-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ok = dir.join("ok");
-        let empty = dir.join("empty");
-        std::fs::write(&ok, [7u8; 8]).unwrap();
-        std::fs::write(&empty, []).unwrap();
-        assert_eq!(read_bounded(&ok, 8).unwrap(), vec![7u8; 8]);
-        assert!(read_bounded(&ok, 7).is_err());
-        assert!(read_bounded(&empty, 8).is_err());
-        assert!(read_bounded(&dir, 8).is_err());
-        assert!(read_bounded(&dir.join("missing"), 8).is_err());
-        // 書き手のいない FIFO は期限内に明示的に拒否される（REPAIR-5）。
-        let fifo = dir.join("fifo");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let (tx, rx) = mpsc::channel();
-        let f = fifo.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(read_bounded(&f, 8));
-        });
-        let r = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("read_bounded blocked on FIFO");
-        assert_eq!(r.unwrap_err(), "not a regular file");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn mvm1_3771_escape_tail() {
-        assert_eq!(escape_tail(b"abc\x1b[0m\n", 100), "abc\\x1b[0m\\n");
-        assert_eq!(escape_tail(b"abcdef", 3), "def");
-        assert_eq!(escape_tail(b"", 3), "");
-    }
 }
 
 /// aarch64 の実カーネル起動試験（#3897・MVM-1・REPAIR-5・REPAIR-12）。
@@ -1750,11 +1461,14 @@ mod x86 {
 /// 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
+    use super::guest_boot::{
+        TtyAddress, TtyReport, force_panic_zero, parse_tty_report, read_bounded,
+    };
     use super::{
         BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
         NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
-        NET_TX_FRAME, NET_TX_OK_MARKER, TtyAddress, TtyReport, VirtioWindowObserver,
-        count_lines_ending_with, count_marker_lines, escape_tail, hex_prefix, parse_tty_report,
+        NET_TX_FRAME, NET_TX_OK_MARKER, VirtioWindowObserver, count_lines_ending_with,
+        count_marker_lines, escape_tail, guest_boot, hex_prefix,
     };
     use fandhe_container_microvm::arm64_layout::ARM64_SERIAL_BASE;
     use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
@@ -1763,8 +1477,6 @@ mod arm64 {
         MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VirtioDeviceKind,
     };
     use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, mpsc};
@@ -1787,59 +1499,12 @@ mod arm64 {
         panic!("kernel_boot: PRECONDITION FAILED (test environment, not a regression): {reason}")
     }
 
-    /// 上限つきでファイルを読む（x86 の `read_bounded` と同じ契約。O_NONBLOCK で FIFO の無期限待ちを防ぐ）。
-    fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0o4000)
-            .open(path)
-            .map_err(|e| format!("cannot open file: {e}"))?;
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("cannot stat file: {e}"))?;
-        if !meta.is_file() {
-            return Err("not a regular file".into());
-        }
-        if meta.len() == 0 || meta.len() > cap {
-            return Err(format!("file size {} not in 1..={cap}", meta.len()));
-        }
-        let mut buf = Vec::new();
-        file.take(cap + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("cannot read file: {e}"))?;
-        if buf.is_empty() || buf.len() as u64 > cap {
-            return Err("file size changed while reading".into());
-        }
-        Ok(buf)
-    }
-
     fn parse_boot_timeout(raw: Option<&str>) -> Result<u64, String> {
-        match raw {
-            None => Ok(DEFAULT_TIMEOUT_SECS),
-            Some(s) => match s.parse::<u64>() {
-                Ok(n) if (1..=600).contains(&n) => Ok(n),
-                _ => Err(
-                    "FANDHE_CONTAINER_MICROVM_BOOT_TIMEOUT_SECS must be an integer in 1..=600"
-                        .into(),
-                ),
-            },
-        }
+        guest_boot::parse_boot_timeout_or(raw, DEFAULT_TIMEOUT_SECS)
     }
 
     fn validate_cmdline(raw: Option<&str>) -> Result<String, String> {
-        let s = raw.unwrap_or(DEFAULT_CMDLINE);
-        if s.is_empty() || s.bytes().any(|b| !(0x20..=0x7E).contains(&b)) {
-            return Err(
-                "FANDHE_CONTAINER_MICROVM_CMDLINE must be non-empty printable ASCII".into(),
-            );
-        }
-        Ok(s.to_owned())
-    }
-
-    /// 陽性・負の対照の両方に使う cmdline。Linux の `panic=` は後勝ちなので末尾に `panic=0` を足し、利用者の `panic=N` による
-    /// init 起動失敗後の自動 reboot（SYSTEM_RESET → `GuestShutdown`）を陽性が受理する偽陽性を抑える。
-    fn force_panic_zero(base: &str) -> String {
-        format!("{base} panic=0")
+        guest_boot::validate_cmdline_or(raw, DEFAULT_CMDLINE)
     }
 
     struct Inputs {
@@ -2748,17 +2413,6 @@ mod arm64 {
             force_panic_zero(DEFAULT_CMDLINE),
             "console=ttyS0 rdinit=/init panic=0"
         );
-    }
-
-    #[test]
-    fn mvm1_3897_force_panic_zero_appends_last() {
-        assert_eq!(force_panic_zero("rdinit=/init"), "rdinit=/init panic=0");
-        assert_eq!(
-            force_panic_zero("console=x panic=5"),
-            "console=x panic=5 panic=0"
-        );
-        // 利用者が `rdinit=/missing panic=1` を渡しても末尾が panic=0 になる（陽性の自動再起動の偽陽性を防ぐ）。
-        assert!(force_panic_zero("rdinit=/missing panic=1").ends_with(" panic=0"));
     }
 }
 /// x86_64・aarch64 以外では `assemble` が `Unimplemented` であることの確認（aarch64 は `mod arm64`・#3897）。

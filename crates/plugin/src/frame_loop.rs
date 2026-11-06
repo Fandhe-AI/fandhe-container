@@ -215,7 +215,7 @@ enum Recv {
     Shutdown,
     /// フレーム境界での正常な EOF。
     Closed,
-    /// 切断済み接続の生 I/O が拒否された（`io_timeout_unrestored`）。`read_frame` へフォールバックする。
+    /// 切断済み接続の生 I/O が拒否された（`io_timeout_unrestored`、または既定期限を掛けられなかった接続。#3981）。`read_frame` へフォールバックする。
     RawUnusable,
 }
 

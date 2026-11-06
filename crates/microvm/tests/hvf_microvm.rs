@@ -122,10 +122,20 @@ type Config = HvfMicroVmConfig<MemoryBlockBackend, MemoryNetBackend>;
 
 /// 起動確認ゲストを載せた構成（vCPU 1・シリアルあり・net なし）。`block` は virtio-block の台数。
 fn config(layout: Arm64Layout, block: usize, observer: Arc<ExitSeq>) -> Config {
+    config_with_code(layout, block, observer, &BOOT_CHECK_CODE)
+}
+
+/// [`config`] のゲストの機械語を差し替えたもの。
+fn config_with_code(
+    layout: Arm64Layout,
+    block: usize,
+    observer: Arc<ExitSeq>,
+    code: &[u32],
+) -> Config {
     HvfMicroVmConfig {
         vcpus: layout.vcpus,
         layout,
-        kernel: image_with_code(&BOOT_CHECK_CODE),
+        kernel: image_with_code(code),
         initrd: None,
         cmdline: "console=ttyS0".to_string(),
         block: (0..block)
@@ -242,4 +252,64 @@ fn hvf_microvm_boot_check_fails_without_block_device() {
     assert_eq!(report.reason, StopReason::GuestShutdown);
 
     drop(create_vm_or_precondition());
+}
+
+/// OS Lock の SysReg trap 用ゲストの機械語（#4037・MVM-5）。msr の語は Arm ARM の MSR（register）の符号化
+/// `0xD510_0000 | crn<<12 | crm<<8 | op2<<5 | rt`（op0=2・op1=0）から組み、`d5101388`・`d5101088` は実機で確認済み。
+const MOVZ_X8_0: u32 = 0xD280_0008;
+const MOVZ_X8_1: u32 = 0xD280_0028;
+const MSR_OSDLR_EL1_X8: u32 = 0xD510_1388;
+const MSR_OSLAR_EL1_X8: u32 = 0xD510_1088;
+const MSR_OSLAR_EL1_XZR: u32 = 0xD510_109F;
+/// PSCI SYSTEM_OFF（`movz x0, #0x8400, lsl #16` / `movk x0, #8` / `hvc #0`）。
+const SYSTEM_OFF: [u32; 3] = [0xD2B0_8000, 0xF280_0100, 0xD400_0002];
+
+fn os_lock_guest(prefix: &[u32]) -> Vec<u32> {
+    let mut code = prefix.to_vec();
+    code.extend_from_slice(&SYSTEM_OFF);
+    code
+}
+
+fn run_os_lock_guest(code: &[u32]) -> (Vec<ExitKind>, HvfStopReport) {
+    let layout = Arm64Layout::new(64 << 20, 1, 0)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    require_vm_with_gic(&layout);
+    let seq = Arc::new(ExitSeq::default());
+    let vm = HvfMicroVm::assemble(config_with_code(layout, 0, Arc::clone(&seq), code)).unwrap();
+    let (exits, _out, report) = run_boot_check(vm, &seq);
+    drop(create_vm_or_precondition());
+    (exits, report)
+}
+
+/// 陽性: `msr OSDLR_EL1, x8`（x8 = 0）と `msr OSLAR_EL1, xzr` は trap しても処理されて続行し、後続の SYSTEM_OFF で `GuestShutdown`。
+/// `rt` の読み出し・XZR・PC の書き戻しの実配線を通す（#4037・MVM-5・MVM-1）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn mvm5_4037_os_lock_writes_of_zero_are_handled() {
+    let _wd = Watchdog::start(DEADLINE);
+    let (exits, report) = run_os_lock_guest(&os_lock_guest(&[
+        MOVZ_X8_0,
+        MSR_OSDLR_EL1_X8,
+        MSR_OSLAR_EL1_XZR,
+    ]));
+    assert_eq!(
+        exits,
+        vec![ExitKind::Sysreg, ExitKind::Sysreg, ExitKind::Hvc]
+    );
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+}
+
+/// 陰性: `msr OSLAR_EL1, x8`（x8 = 1）は `Failed(Unimplemented)` で止まり、SYSTEM_OFF に達しない。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn mvm5_4037_os_lock_write_of_nonzero_fails_unimplemented() {
+    let _wd = Watchdog::start(DEADLINE);
+    let (exits, report) = run_os_lock_guest(&os_lock_guest(&[MOVZ_X8_1, MSR_OSLAR_EL1_X8]));
+    assert_eq!(exits, vec![ExitKind::Sysreg]);
+    assert_eq!(
+        report.reason,
+        StopReason::Failed(MicrovmErrorCode::Unimplemented)
+    );
 }

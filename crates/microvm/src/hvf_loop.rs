@@ -38,7 +38,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{EsrClass, SysRegDirection, decode_esr};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
 use crate::stop::StopReason;
-use crate::sysreg_os_lock::is_accepted_sysreg;
+use crate::sysreg_os_lock::classify_os_lock_write;
 
 /// `run` 1 回あたりの期限の既定値（Linux の `VCPU_POLL_INTERVAL` に相当）。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（`wfi` の待ち等で戻らない実行）として継続する。
@@ -335,7 +335,7 @@ where
             HvExit::Exception {
                 class: EsrClass::SysReg(a),
                 ..
-            } if !is_accepted_sysreg(a) => {
+            } if classify_os_lock_write(a).is_none() => {
                 log_unsupported_exit(exec, &exit);
                 return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Unimplemented));
             }
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn mvm5_4037_run_loop_routes_only_os_lock_writes_to_dispatch() {
         // OSDLR_EL1 write rt=8（実機の値）・OSDLR rt=31・OSLAR_EL1 write rt=0。
-        for syndrome in [0x6228_0506u64, 0x6228_05E6, 0x6228_0400] {
+        for syndrome in [0x6228_0506u64, 0x6228_07E6, 0x6228_0400] {
             let (r, _, dispatched, _) = run_script(
                 vec![Ok(exc(syndrome)), Ok(HvVcpuExit::Canceled)],
                 Some(1),

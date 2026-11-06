@@ -2,8 +2,8 @@
 //!
 //! 役割: 実 Linux ゲストは起動時に `clear_os_lock`（`msr OSDLR_EL1, x8`）で OS Double Lock を解除し、Hypervisor.framework は
 //! この SysReg を trap する（#4037）。ホスト側は何も実装しないため、値が 0（ロック解除）の write だけ「何もせず PC を進める」。
-//! `hvf_loop::run_loop_exit` が [`is_accepted_sysreg`] で受ける trap だけを `dispatch` へ回し、`hvf::vcpu` の
-//! `dispatch` が `hvf::sysreg` のハンドラ経由で [`os_lock_write_next_pc`] を使う。分類は符号化と向きだけで決まり、値は
+//! `hvf_loop::run_loop_exit` が [`classify_os_lock_write`] で受ける trap だけを `dispatch` へ回し、`hvf::vcpu` の
+//! `dispatch` が `hvf::sysreg` のハンドラ経由で [`apply_os_lock_write`] を使う。分類は符号化と向きだけで決まり、値は
 //! ハンドラが vCPU から読む。
 //!
 //! # 契約
@@ -37,11 +37,6 @@ pub fn classify_os_lock_write(a: &SysRegAccess) -> Option<OsLockReg> {
     }
 }
 
-/// `run_loop_exit` が `dispatch` へ回してよい SysReg trap か（受けるのは OS Lock の write だけ）。
-pub fn is_accepted_sysreg(a: &SysRegAccess) -> bool {
-    classify_os_lock_write(a).is_some()
-}
-
 /// OS Lock の write を受理し、続行する PC（命令長だけ進めた値）を返す。
 ///
 /// `value` は書かれた値（rt=31 は 0）。0 以外、または OS Lock の write でない場合は `Unimplemented`。
@@ -67,6 +62,41 @@ pub fn os_lock_write_next_pc(
     next_pc(pc, syndrome)
 }
 
+/// [`apply_os_lock_write`] が使う vCPU のレジスタ口（`hvf::sysreg` が `HvVcpu` で実装し、試験は偽物を使う）。
+pub trait SysRegRegs {
+    /// 汎用レジスタ `x<n>`（n は 0..=30）を読む。
+    fn read_gpr(&mut self, n: u8) -> Result<u64, MicrovmError>;
+    /// PC を読む。
+    fn read_pc(&mut self) -> Result<u64, MicrovmError>;
+    /// PC を書く。
+    fn write_pc(&mut self, pc: u64) -> Result<(), MicrovmError>;
+}
+
+/// OS Lock の write trap を処理する: `rt` の値を読み（rt=31 は読まず 0）、判定し、0 なら PC を命令長だけ進める。
+///
+/// 対象外の符号化は何も読まず `Unimplemented`。値が 0 以外のときは PC を書かずに `Unimplemented`。
+/// レジスタ口のエラーはそのまま返し、PC は書かない。
+pub fn apply_os_lock_write<R: SysRegRegs>(
+    regs: &mut R,
+    a: &SysRegAccess,
+    syndrome: u64,
+) -> Result<(), MicrovmError> {
+    if classify_os_lock_write(a).is_none() {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::Unimplemented,
+            "sysreg access is not an os lock register write",
+        ));
+    }
+    let value = if a.rt.is_zero_register() {
+        0
+    } else {
+        regs.read_gpr(a.rt.get())?
+    };
+    let pc = regs.read_pc()?;
+    let next = os_lock_write_next_pc(a, value, pc, syndrome)?;
+    regs.write_pc(next)
+}
+
 #[cfg(test)]
 mod tests {
     //! ESR は Arm ARM の ISS の配置（op0=21:20・op2=19:17・op1=16:14・crn=13:10・rt=9:5・crm=4:1・dir=0）から組んだ値。
@@ -76,9 +106,9 @@ mod tests {
     use crate::esr::{EsrClass, decode_esr};
 
     const OSDLR_X8: u64 = 0x6228_0506;
-    const OSDLR_XZR: u64 = 0x6228_05E6;
+    const OSDLR_XZR: u64 = 0x6228_07E6;
     const OSLAR_X0: u64 = 0x6228_0400;
-    const OSLAR_XZR: u64 = 0x6228_04E0;
+    const OSLAR_XZR: u64 = 0x6228_07E0;
 
     fn access(esr: u64) -> SysRegAccess {
         match decode_esr(esr) {
@@ -110,8 +140,8 @@ mod tests {
     #[test]
     fn mvm5_4037_classify_rejects_reads_and_neighbours() {
         // 同じ符号化の read（dir bit = 1）。
-        assert!(!is_accepted_sysreg(&access(OSDLR_X8 | 1)));
-        assert!(!is_accepted_sysreg(&access(OSLAR_X0 | 1)));
+        assert_eq!(classify_os_lock_write(&access(OSDLR_X8 | 1)), None);
+        assert_eq!(classify_os_lock_write(&access(OSLAR_X0 | 1)), None);
         for esr in [
             OSLAR_X0 + (1 << 1),  // crm=1
             OSLAR_X0 + (2 << 1),  // crm=2
@@ -123,7 +153,7 @@ mod tests {
             0x623A_38F2,          // crn=14 のタイマ系の write
             0x6200_0000,          // op0=0 の write
         ] {
-            assert!(!is_accepted_sysreg(&access(esr)), "esr={esr:#x}");
+            assert_eq!(classify_os_lock_write(&access(esr)), None, "esr={esr:#x}");
         }
     }
 
@@ -152,5 +182,101 @@ mod tests {
     fn mvm5_4037_pc_overflow_is_internal() {
         let e = os_lock_write_next_pc(&access(OSDLR_X8), 0, u64::MAX - 1, OSDLR_X8).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::Internal);
+    }
+
+    /// 偽のレジスタ口。読み出しと書き込みを記録し、指定の読み出しで失敗する。
+    #[derive(Default)]
+    struct FakeRegs {
+        gprs: [u64; 31],
+        pc: u64,
+        gpr_reads: Vec<u8>,
+        pc_writes: Vec<u64>,
+        fail_gpr: bool,
+        fail_pc_read: bool,
+    }
+
+    impl SysRegRegs for FakeRegs {
+        fn read_gpr(&mut self, n: u8) -> Result<u64, MicrovmError> {
+            self.gpr_reads.push(n);
+            if self.fail_gpr {
+                return Err(MicrovmError::new(MicrovmErrorCode::Internal, "fake gpr"));
+            }
+            Ok(self.gprs[usize::from(n)])
+        }
+        fn read_pc(&mut self) -> Result<u64, MicrovmError> {
+            if self.fail_pc_read {
+                return Err(MicrovmError::new(MicrovmErrorCode::Internal, "fake pc"));
+            }
+            Ok(self.pc)
+        }
+        fn write_pc(&mut self, pc: u64) -> Result<(), MicrovmError> {
+            self.pc_writes.push(pc);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mvm5_4037_apply_rt8_zero_reads_x8_and_advances_pc() {
+        let mut r = FakeRegs {
+            pc: 0x8008_1000,
+            ..Default::default()
+        };
+        apply_os_lock_write(&mut r, &access(OSDLR_X8), OSDLR_X8).unwrap();
+        assert_eq!(r.gpr_reads, vec![8]);
+        assert_eq!(r.pc_writes, vec![0x8008_1004]);
+    }
+
+    #[test]
+    fn mvm5_4037_apply_xzr_does_not_read_a_register() {
+        let mut r = FakeRegs {
+            pc: 0x4000_0000,
+            ..Default::default()
+        };
+        apply_os_lock_write(&mut r, &access(OSLAR_XZR), OSLAR_XZR).unwrap();
+        assert_eq!(r.gpr_reads, Vec::<u8>::new());
+        assert_eq!(r.pc_writes, vec![0x4000_0004]);
+    }
+
+    #[test]
+    fn mvm5_4037_apply_nonzero_does_not_write_pc() {
+        let mut r = FakeRegs {
+            pc: 0x4000_0000,
+            ..Default::default()
+        };
+        r.gprs[8] = 1;
+        // OSLAR_EL1 write, rt=8
+        let esr = OSLAR_X0 + (8 << 5);
+        let e = apply_os_lock_write(&mut r, &access(esr), esr).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+        assert_eq!(r.gpr_reads, vec![8]);
+        assert_eq!(r.pc_writes, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn mvm5_4037_apply_register_read_failure_propagates_without_pc_write() {
+        let mut r = FakeRegs {
+            fail_gpr: true,
+            ..Default::default()
+        };
+        let e = apply_os_lock_write(&mut r, &access(OSDLR_X8), OSDLR_X8).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(r.pc_writes, Vec::<u64>::new());
+        let mut r = FakeRegs {
+            fail_pc_read: true,
+            ..Default::default()
+        };
+        let e = apply_os_lock_write(&mut r, &access(OSLAR_XZR), OSLAR_XZR).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Internal);
+        assert_eq!(r.pc_writes, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn mvm5_4037_apply_rejects_read_without_touching_registers() {
+        let mut r = FakeRegs::default();
+        let read = OSDLR_X8 | 1;
+        let e = apply_os_lock_write(&mut r, &access(read), read).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::Unimplemented);
+        assert_eq!(r.gpr_reads, Vec::<u8>::new());
+        assert_eq!(r.pc_writes, Vec::<u64>::new());
     }
 }

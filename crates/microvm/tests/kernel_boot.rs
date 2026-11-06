@@ -16,6 +16,8 @@
 //! 全体期限（REPAIR-5）: `.cargo/config.toml` の watchdog は `--ignored` を素通しするため、本試験自身の
 //! ポーリング期限・`stop` の期限・外側の `recv_timeout` が唯一の層になる。前提欠如は skip せず
 //! `kernel_boot: PRECONDITION FAILED (test environment, not a regression)` で落とす。
+//! ただし `KvmDevice::open` の失敗は、環境を示すコード（`NOT_FOUND`・`PERMISSION_DENIED`・`UNIMPLEMENTED`）のときだけこの行で落とし、
+//! それ以外は `kernel_boot: open: ...` の別の 1 行目で落とす（回帰を環境の問題に見せない。`support/kvm_precondition.rs`・#3992）。
 //!
 //! 追加の構成（#3865・MVM-1・REPAIR-12。いずれも同じ実機前提の形）:
 //! - vCPU 2 台: MP テーブル（#3888。`mptable_x86`）で AP が Linux にオンラインになる。2 台構成で最後まで起動し、
@@ -75,8 +77,21 @@
 //! 実機での実行と記録は #3781（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(target_os = "linux")]
 
+/// 前提欠如と回帰の振り分けの正本（環境を示すコードだけ前提欠如にする。#3992）。
+#[path = "support/kvm_precondition.rs"]
+mod kvm_precondition;
+
+/// `KvmDevice::open` の失敗を、環境を示すコードだけ `PRECONDITION FAILED` にして落とす（MVM-1・REPAIR-4・#3992）。
+/// 呼び出しはテストスレッドのまま行う（worker 内 panic では 1 行目が変わるため）。
+fn open_kvm() -> fandhe_container_microvm::device::KvmDevice {
+    fandhe_container_microvm::device::KvmDevice::open()
+        .unwrap_or_else(|e| panic!("{}", kvm_precondition::open_failure_line("kernel_boot", &e)))
+}
+
 // macOS の `hvf_kernel_boot.rs` と共有する補助（入力検査・ゲスト出力の照合。#3986・MVM-5・REPAIR-1）。
 // `#[path]` の基準が変わるため、インライン module の中ではなくファイルの先頭に置く。
+/// `/init` が出す固定文字列。正本は `scripts/build-microvm-test-initrd.sh` の `init_message`（単体テストで照合）。
+/// x86_64 と aarch64 の試験が共有する（#3898。複製しない・REPAIR-1）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[path = "support/guest_boot.rs"]
 mod guest_boot;
@@ -809,7 +824,7 @@ mod x86 {
                 .as_deref(),
         )
         .unwrap_or_else(|e| precondition(&e));
-        let dev = KvmDevice::open().unwrap_or_else(|e| precondition(&e.to_string()));
+        let dev = super::open_kvm();
         Inputs {
             dev,
             kernel,
@@ -1577,7 +1592,7 @@ mod arm64 {
                 .as_deref(),
         )
         .unwrap_or_else(|e| precondition(&e));
-        let dev = KvmDevice::open().unwrap_or_else(|e| precondition(&e.to_string()));
+        let dev = super::open_kvm();
         Inputs {
             dev,
             kernel,
@@ -2403,23 +2418,13 @@ mod arm64 {
 /// x86_64・aarch64 以外では `assemble` が `Unimplemented` であることの確認（aarch64 は `mod arm64`・#3897）。
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod other {
-    use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::error::MicrovmErrorCode;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, NetDeviceConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    fn open_kvm() -> KvmDevice {
-        match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("kernel_boot: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        }
-    }
-
     fn assert_unimplemented(config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend>) {
-        let dev = open_kvm();
+        let dev = super::open_kvm();
         assert_eq!(
             MicroVm::assemble(&dev, config).unwrap_err().code(),
             MicrovmErrorCode::Unimplemented

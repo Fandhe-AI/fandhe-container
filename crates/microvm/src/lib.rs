@@ -135,6 +135,7 @@ mod sys;
 #[allow(unsafe_code)]
 #[path = "sys/hvf.rs"]
 mod sys;
+pub mod sysreg_os_lock;
 pub mod uart;
 pub mod virtio_block;
 pub mod virtio_mmio;

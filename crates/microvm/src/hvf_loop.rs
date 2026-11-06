@@ -23,7 +23,8 @@
 //! N 台の停止は [`stop_all`] が集約する（全台へ先に停止を要求し、共有の期限で待つ）。
 //!
 //! # 未実装（REPAIR-3）
-//! SysReg trap の処理（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
+//! SysReg trap は OS Lock レジスタ（`OSDLR_EL1`・`OSLAR_EL1`）の write だけ処理する（#4037。`crate::sysreg_os_lock`）。
+//! それ以外の SysReg（read を含む）は `Failed(Unimplemented)` で止める（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{EsrClass, SysRegDirection, decode_esr};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
 use crate::stop::StopReason;
+use crate::sysreg_os_lock::classify_os_lock_write;
 
 /// `run` 1 回あたりの期限の既定値（Linux の `VCPU_POLL_INTERVAL` に相当）。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（`wfi` の待ち等で戻らない実行）として継続する。
@@ -289,8 +291,8 @@ where
 /// | `Canceled` かつ停止フラグ | `Stopped(Requested)` |
 /// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
 /// | `Unknown` | `Stopped(Failed(Internal))`（止まる前に `kind=unknown_exit_reason` の診断ログを 1 行出す。REPAIR-4） |
-/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に `unsupported_exit_line` の診断ログを 1 行出す。REPAIR-4・MVM-5） |
-/// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`。`Err` は全 code で止まる前に `dispatch_error_line` の診断ログを 1 行出す） |
+/// | OS Lock（`OSDLR_EL1`・`OSLAR_EL1`）の write 以外の SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に `unsupported_exit_line` の診断ログを 1 行出す。REPAIR-4・MVM-5） |
+/// | OS Lock の SysReg write・それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`。`Err` は全 code で止まる前に `dispatch_error_line` の診断ログを 1 行出す） |
 ///
 /// 分類した exit は、振り分けの前に `observer` へ記録する。
 pub fn run_loop_exit<E, D>(
@@ -331,8 +333,14 @@ where
                 return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Internal));
             }
             HvExit::Exception {
-                class:
-                    EsrClass::SysReg(_) | EsrClass::DataAbortUnsupported { .. } | EsrClass::Other { .. },
+                class: EsrClass::SysReg(a),
+                ..
+            } if classify_os_lock_write(a).is_none() => {
+                log_unsupported_exit(exec, &exit);
+                return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Unimplemented));
+            }
+            HvExit::Exception {
+                class: EsrClass::DataAbortUnsupported { .. } | EsrClass::Other { .. },
                 ..
             } => {
                 log_unsupported_exit(exec, &exit);
@@ -1339,6 +1347,39 @@ mod tests {
             let (r, _, dispatched, _) = run_script(vec![Ok(exc(syndrome))], None, CONT);
             assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
             assert_eq!(dispatched, 0);
+        }
+    }
+
+    /// OS Lock の write（0 / 非 0 を問わず）は `dispatch` へ回り、read・近い符号化の別レジスタは止まる（#4037・MVM-5）。
+    #[test]
+    fn mvm5_4037_run_loop_routes_only_os_lock_writes_to_dispatch() {
+        // OSDLR_EL1 write rt=8（実機の値）・OSDLR rt=31・OSLAR_EL1 write rt=0。
+        for syndrome in [0x6228_0506u64, 0x6228_07E6, 0x6228_0400] {
+            let (r, _, dispatched, _) = run_script(
+                vec![Ok(exc(syndrome)), Ok(HvVcpuExit::Canceled)],
+                Some(1),
+                CONT,
+            );
+            assert_eq!(dispatched, 1, "esr={syndrome:#x}");
+            assert_eq!(r, StopReason::Requested, "esr={syndrome:#x}");
+        }
+        // OSDLR / OSLAR の read、近い符号化（crm 違い・op2 違い・crn 違い）、crn=14 のタイマ系は止まる。
+        for syndrome in [
+            0x6228_0507u64,
+            0x6228_0401,
+            0x6228_0402,
+            0x6226_0506,
+            0x6228_0906,
+            0x623A_38F3,
+            SYSREG,
+        ] {
+            let (r, _, dispatched, _) = run_script(vec![Ok(exc(syndrome))], None, CONT);
+            assert_eq!(
+                r,
+                StopReason::Failed(MicrovmErrorCode::Unimplemented),
+                "esr={syndrome:#x}"
+            );
+            assert_eq!(dispatched, 0, "esr={syndrome:#x}");
         }
     }
 

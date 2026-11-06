@@ -2,7 +2,7 @@
 
 `fandhe-container-plugin-mcp` は MCP 2025-06-18 に準拠している。MCP-3 は 2026-07-28 版への追随を求める。本書は、2 段の仕様差分を一覧にし、項目ごとの実装の要否と担当 issue を整理して、`initialize` を廃した版にどう追随するかの判断材料をまとめる。
 
-> **位置づけ**: TASK-119.1（#715）の設計。決定表（5 章）の D1〜D7 は 2026-11-05 にオーナーが推奨どおり承認した（#720・TASK-119.h1）。「要確認」と記した箇所は、決定後も精読が残っている。実装は #716・#717・#719 で行う。
+> **位置づけ**: TASK-119.1（#715）の設計。決定表（5 章）の D1〜D7 は 2026-11-05 にオーナーが推奨どおり承認した（#720・TASK-119.h1）。疎通確認の結果のレビューでは MCP-3 のステータスを確定のまま維持した（2026-11-06。#804・TASK-119.h2）。「要確認」と記した箇所は、決定後も精読が残っている。実装は #716・#717・#719 で行う。
 
 - 対象ビヘイビア: MCP-3（関連: MCP-1・MCP-2・MCP-4・ERR-1・ERR-5・REPAIR-3・REPAIR-4・REPAIR-5・PLUG-12）
 - 対象タスク: TASK-119（#715・#716〜#720）。前提 TASK-118（plugin-mcp 本体）・TASK-120。MS-7、Phase 13
@@ -81,7 +81,7 @@
 - `basic/index` は `protocolVersion`・`clientCapabilities` の欠落を MUST で拒否（`-32602`）とし、`clientInfo` は任意とする。dual-era の例外は `initialize` が legacy を選んだ接続に限る。ERR-5 の注記も 2025-06-18 の経路を「`initialize` で始めた要求」と定義する
 - 判定は `params._meta` の `io.modelcontextprotocol/protocolVersion` の有無。キーがあれば modern（文字列以外は `-32602`、`SUPPORTED_VERSIONS` に無ければ `-32022`、`clientCapabilities` が無い・オブジェクト以外は `-32602`。版の検査が先で、stdio の互換プローブが `-32022` を modern と認識できるようにする）
 - キーが無い要求は、`initialize` か、`initialize` を成功させた接続（`ConnectionState` の 1 ビット）なら legacy、それ以外は `-32602`。「版が無ければ常に legacy」は `basic/index` の MUST に反するため採らない。modern の要求は接続状態を読まず書かない
-- 対応版の一覧 `supported`・`supportedVersions` は `["2026-07-28"]` のみ。2025-06-18 は `initialize` からのみ到達できるので、`_meta` にその版を書いた要求は `-32022` になる（オーナー確認事項）
+- 対応版の一覧 `supported`・`supportedVersions` は `["2026-07-28"]` のみ。2025-06-18 は `initialize` からのみ到達できるので、`_meta` にその版を書いた要求は `-32022` になる（D11。2026-11-06 にオーナーが確認した）
 - `data.requested` は 64 バイト（UTF-8 の文字境界）に切り詰め、`message` とログには入れない（REPAIR-4）。`clientInfo` は読まない
 - `-32021` は必要なクライアント機能が無い場合のみ使う規定で、要求する機能が無いので返さない
 
@@ -108,6 +108,7 @@ legacy の版の schema が知らないフィールドを足すと、厳格な�
 | D8 | SEP-1303 と ERR-5・MCP-4 の衝突 | 版で分ける。2026-07-28 の経路だけ `isError` | 承認済み | 2026-11-06 オーナー |
 | D9 | `-32022` と全行の `data.code` | spec の ERR-5 の表に明記。`-32022` は `UNIMPLEMENTED` | 承認済み | 2026-11-06 オーナー |
 | D10 | `tools/call` のレスポンス形の見直し | `content` の構造は変えない | 承認済み | 2026-11-06 オーナー |
+| D11 | 対応版の一覧 `supported`・`supportedVersions` | `["2026-07-28"]` のみ。2025-06-18 は `initialize` からだけ到達する | 承認済み | 2026-11-06 オーナー（#804） |
 
 ## 6. spec 側へ報告した事項の結果
 

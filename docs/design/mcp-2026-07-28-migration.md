@@ -24,7 +24,7 @@
 - `initialize` は `initialize_params_valid` で `protocolVersion`・`capabilities`・`clientInfo` を検証し、要求された版にかかわらず常に `2025-06-18` を返す。capabilities は `tools.listChanged: false`
 - `tools/list` は 2 ツールを固定順で返す。`nextCursor`・`ttlMs`・`cacheScope` は無い。`tools/call` は `structuredContent` と `content` を返し、業務エラーは `isError: true`
 - `error.rs`: JSON-RPC コードは -32700・-32600・-32601・-32602・-32603。未知のツールと要求の形の不正は -32602（`data.code = INVALID_ARGUMENT`。ERR-5・MCP-4 に沿う）。引数の誤りは 2025-06-18 の経路が -32602、2026-07-28 の経路が `isError`（`ToolError::invalid_argument`。#4001・D8）
-- 試験: `server.rs` 内の単体試験と `tests/startup.rs`・`tests/integration.rs` が `2025-06-18`・`ping`・`initialize` を具体値で照合している
+- 試験: `server.rs` 内の単体試験と `tests/startup.rs`・`tests/integration.rs`（#719 で `tests/protocol_2026_07_28.rs` を追加。11 章）が `2025-06-18`・`ping`・`initialize` を具体値で照合している
 - ログは stderr に 1 行 JSON で、入力値を反射させない（REPAIR-4）
 
 ## 3. 差分一覧
@@ -41,20 +41,20 @@
 | 全 result に必須の `resultType: "complete"` | SEP-2322・07-28 | 破壊的（必須化） | `server/discover`・`tools/list`・`tools/call`（`isError: true` を含む）の結果 | 実装済み | modern の全 result に `finish_modern` で付け、legacy には付けない（D3・4.3）。エラー応答は result ではないので付けない。クライアントは欠落を `complete` と扱う（MUST） | #717 |
 | MRTR（`InputRequiredResult`・`inputRequests`・`requestState`） | SEP-2322・07-28 | 追加 | 追加入力を求めないため該当なし | 不要（追加入力を求めない。mrtr の精読で確定） | 4.4 | #717 の見直し |
 | `tools/list` の `ttlMs`・`cacheScope` 必須化（`CacheableResult`） | SEP-2549・07-28 | 破壊的（必須化） | `ToolsListResult` | 要 | `ttlMs: 3600000`（1 時間。一覧は実行ファイルの差し替えでしか変わらない）・`cacheScope: "public"`（全利用者で同一）。modern の `tools/list` と `server/discover` に載せ、legacy には載せない（D6。#716 で実装済み） | #716 |
-| `tools/list` を決まった順で返す（SHOULD） | 07-28 | なし | すでに固定順 | 不要（満たす） | 順序を固定する試験を足す | #719 |
+| `tools/list` を決まった順で返す（SHOULD） | 07-28 | なし | すでに固定順 | 不要（満たす） | 試験で固定済み（`tests/protocol_2026_07_28.rs`。経路をまたいでも `tools` 配列が同一。#719） | #719 |
 | 結果の `_meta.io.modelcontextprotocol/serverInfo`（SHOULD） | SEP-2575・07-28 | なし | 結果の組み立て | 要（任意） | 名前と版を載せる | #716 |
 | セッション・`Mcp-Session-Id`・SSE 再開の廃止 | SEP-2567・SEP-2575・07-28 | 破壊的（HTTP） | HTTP が無い | 不要（対象外） | HTTP を足すときに再評価 | 対象外 |
 | `subscriptions/listen`（旧 `resources/subscribe` の置換） | SEP-2575・07-28 | 破壊的 | `listChanged: false` で購読を出さない | 不要（対象外） | なし | 対象外 |
 | Streamable HTTP の `Mcp-Method`・`Mcp-Name` と `x-mcp-header` | SEP-2243・07-28 | 追加（HTTP のみ） | stdio / UDS に header layer が無い（stdio 側の規定は要確認） | 不要（現行トランスポートでは対象外） | 4.4 | #718 の見直し |
 | tasks を拡張 `io.modelcontextprotocol/tasks` へ移動 | SEP-2663・07-28（導入は SEP-1686・11-25） | 破壊的 | tasks を実装していない | 不要（対象外） | なし | 対象外 |
 | `ClientCapabilities`・`ServerCapabilities` の `extensions` | 07-28 | 追加 | 拡張を使わない | 不要 | なし | 対象外 |
-| JSON Schema 2020-12 の既定化（11-25）と `inputSchema`・`outputSchema` の緩和（07-28） | SEP-1613・SEP-2106 | なし | 現スキーマが 2020-12 の範囲か | 要確認 | `$schema` を付けるか、現状で足りるかを確認 | #719 |
+| JSON Schema 2020-12 の既定化（11-25）と `inputSchema`・`outputSchema` の緩和（07-28） | SEP-1613・SEP-2106 | なし | 現スキーマが 2020-12 の範囲か | 確認済み（不要） | `$schema` は付けない。無ければ 2020-12 が既定で、現スキーマ（`type`・`properties`・`required`）はその範囲にある。完全一致で固定済み（#719） | #719 |
 | 入力検証の誤りを Protocol Error ではなく Tool Execution Error（`isError`）で返す | SEP-1303・11-25 | 食い違い | 引数不正は現在 -32602 | 実装済み | 2026-07-28 の経路だけ `isError` で返す（D8・6 章）。#4001 で実装済み | #4001 |
-| ツール名の指針 | SEP-986・11-25 | なし | 現在の 2 ツール名が適合するか | 要確認 | 名前の文字種を確認 | #719 |
+| ツール名の指針 | SEP-986・11-25 | なし | 現在の 2 ツール名が適合するか | 確認済み（適合） | 1〜128 文字・`[A-Za-z0-9_.-]`・一意を試験で固定済み（#719） | #719 |
 | `Implementation.description`・icons | 11-25 | 追加（任意） | `serverInfo` に載せられる | 不要（任意） | 載せない | 対象外 |
 | エラーコードの割り当て方針（-32020〜-32099 は MCP 予約、-32000〜-32019 は実装定義） | 07-28 | なし | 独自に -32020 以降を使わない | 不要（遵守のみ） | `error.rs` の注記に残す | #716 |
 | `notifications/cancelled` を受けたら処理を止める（SHOULD） | 07-28 stdio 規定 | なし | 現状は同期処理で黙殺 | 判断待ち | 要確認。同期処理のため実益が薄い | 判断待ち |
-| サーバーは stdout に要求を書かない（MUST NOT） | 07-28 stdio 規定 | なし | すでに満たす | 不要（満たす） | 試験で固定してもよい | #719 |
+| サーバーは stdout に要求を書かない（MUST NOT） | 07-28 stdio 規定 | なし | すでに満たす | 不要（満たす） | 試験で固定済み（stdout の全行が応答で、`method` を持つ行が無い。#719） | #719 |
 | Roots・Sampling・Logging の deprecation | SEP-2577・07-28 | 将来の削除 | 使っていない（ログはすでに stderr） | 不要（対象外） | なし | 対象外 |
 | 認可系（DCR 非推奨・`iss`・`application_type`・資格情報のバインド） | SEP-2468・SEP-837・SEP-2352・07-28 | HTTP の認可のみ | 認可層が無い | 不要（対象外） | HTTP を足すときに再評価 | 対象外 |
 | resource not found のコード変更（-32002 -> -32602） | 07-28 | 破壊的 | resources を実装していない | 不要（対象外） | なし | 対象外 |
@@ -150,7 +150,7 @@ D8 で版を分けた理由: 2025-06-18 の仕様は "Invalid arguments" を Pro
 | #717 マルチラウンドトリップ | `resultType: "complete"`（D4 で縮小） |
 | #4001 引数の誤りの版の分岐 | 2026-07-28 の経路の入力検証の誤りを `isError` で返す（D8）。実装済み |
 | #718 ヘッダーベースルーティング | 対象外として closed（D5） |
-| #719 試験 | `tests/protocol_2026_07_28.rs`。順序の固定、スキーマ・ツール名の確認、MCP-1・MCP-2 の疎通の維持 |
+| #719 試験 | `tests/protocol_2026_07_28.rs`。順序の固定、スキーマ・ツール名の確認、MCP-1・MCP-2 の疎通の維持。実装済み（11 章） |
 | 起票しない | `notifications/cancelled`（D7）。当面は黙殺のまま |
 
 ## 9. セキュリティの考慮
@@ -166,3 +166,26 @@ D8 で版を分けた理由: 2025-06-18 の仕様は "Invalid arguments" を Pro
 - 次の MCP リビジョンが出たとき
 - Roots・Sampling・Logging が Removed になったとき
 - core 側 proxy との結線でフレーミングが確定したとき（`uds.rs` の暫定契約）
+
+## 11. 疎通確認の記録（TASK-119.5・#719）
+
+追随後も MCP-1・MCP-2 の疎通が維持されることを、製品コードを変えずに試験で固定した（レビューは #804）。2026-07-28 版の `server/tools`・`basic/transports/stdio`（stdout の規定）を 2026-11-06 に精読して確認した。
+
+| 試験 | 対応 | 内容 |
+| ---- | ---- | ---- |
+| `mcp1_mcp2_legacy_full_sequence_survives_over_stdio` | MCP-1・MCP-2 | 実バイナリで legacy の `initialize` → `tools/list` → `tools/call`（`list_containers` は一時の状態ルートで実呼び出し） |
+| `mcp3_mcp2_modern_full_sequence_over_stdio` | MCP-3・MCP-2 | `initialize` なしの `server/discover` → `tools/list` → `tools/call` |
+| `mcp3_tools_list_is_stable_across_routes_on_one_connection` | MCP-3 | 経路をまたいでも `tools/list` が同一・順序固定 |
+| `mcp3_dual_era_probe_then_initialize_over_stdio` | MCP-3 | modern の要求が接続を legacy にしない |
+| `mcp3_stdout_has_only_responses_and_logs_do_not_reflect_input` | MCP-1・REPAIR-4 | stdout は応答のみ・stderr は入力値を反射しない |
+| `mcp2_both_tools_succeed_on_both_routes_with_fake_backend` | MCP-2 | 2 ツールの正常応答の形を両経路で固定 |
+| `mcp3_tool_names_follow_the_naming_guidance`・`mcp3_input_schemas_are_fixed_and_2020_12_compatible` | MCP-3 | ツール名の指針・`inputSchema` の完全一致 |
+| `uds::mcp3_modern_requests_over_uds_same_uid`（`tests/integration.rs`） | MCP-3・PLUG-12 | UDS 上の modern の 3 要求 |
+
+実行: `cargo test -p fandhe-container-plugin-mcp`。ローカル（Linux・非 root）で `protocol_2026_07_28` 8 件・`integration` 5 件（`#[ignore]` 1 件）・`startup` 6 件・lib 90 件がすべて合格した。macOS・Windows のネイティブ実行は、PR の CI が緑になった後の `workflow_dispatch`（3 OS）で確認する。実行結果の run URL は未記入（dispatch 後に追記する）。
+
+残余（対象外）:
+
+- `start_container` の本番起動（MCP-2 の実起動）は未実装で `UNIMPLEMENTED` を `isError` で返す。本試験はこの現行の契約を固定するだけで、実起動の達成は主張しない
+- `list_containers` の `inputSchema` は仕様の推奨（`additionalProperties: false`）と異なるが許容される形で、変えない
+- `notifications/cancelled` は D7 のまま黙殺する

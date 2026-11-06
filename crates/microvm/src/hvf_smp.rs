@@ -370,6 +370,9 @@ mod tests {
         fn stats(&self) -> HvRunStats {
             HvRunStats::default()
         }
+        fn pc(&self) -> Option<u64> {
+            None
+        }
     }
 
     fn hvc_exit() -> HvVcpuExit {
@@ -668,6 +671,9 @@ mod tests {
             }
             fn stats(&self) -> HvRunStats {
                 HvRunStats::default()
+            }
+            fn pc(&self) -> Option<u64> {
+                None
             }
         }
         let r = rig();

@@ -99,5 +99,5 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - mmap のフラグ: `MAP_ANON | MAP_PRIVATE`（`MAP_NORESERVE`・`MADV_DONTFORK` は使わない）。RWX で `hv_vm_map` する
 - 寿命: `RegisteredHvfRam<'vm>` は `&'vm HvVm` を借用するため `HvVm` より先に drop される。drop は `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。構成体（#3797）が `HvVm` をどう持つかはその issue の担当
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る
-- IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は暫定で、レイアウトの確定は #3788、SDK・実機での照合は #3803
+- IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は暫定で、レイアウトの確定は #3788、SDK・実機での照合は #3997
 - 範囲外: 複数領域・`hv_vm_protect` の利用・`Send` / `Sync`（#3797・#3798）・解除失敗の構造化ログ

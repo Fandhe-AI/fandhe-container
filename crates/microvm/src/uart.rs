@@ -59,7 +59,6 @@
 //!   ドライバが来ない割り込みを待つため）。`microvm::assemble` は x86_64 で [`SerialConsole::port_device_with_irq`] を使い、
 //!   [`COM1_IRQ`] を `KVM_IRQ_LINE` の level 線で結ぶ（#3918）。実機での確認は #3781。KVM aarch64 は MMIO の `mmio_device_with_irq` で SPI 1（INTID 33）を `KVM_IRQ_LINE` の level 線（`IrqLevelLine`）に結ぶ（#3943。MMIO の窓は #3898）。線なしの `mmio_device`（ポーリング）は試験と線を持たない構成用。
 //! - 受信トリガ（FCR bit7:6）・CTI（IIR 0x0C）・LSR.OE と RLS 割り込みは未実装。ループバック中の THR 書き込みは RX へ回さない。
-//! - `hv_gic_set_spi` を vCPU 以外のスレッドから呼べるかは未確認（#3803 の実機確認項目）。
 
 use std::collections::VecDeque;
 use std::fmt;

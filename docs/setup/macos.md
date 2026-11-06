@@ -4,9 +4,9 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 
 - 対象ビヘイビア: MAC-1・CLI-2・MVM-5（関連: CLI-1・MAC-4・PLUG-11・OCI-5・MVM-1・MVM-4・REPAIR-3）
 - タスク: TASK-80 追補・TASK-64・TASK-192.19
-- 関連 issue: #3801・#3800・#3803・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
+- 関連 issue: #3801・#3800・#3803・#3988・#3997・#3783・#2602・#2452・#1906（既定方式）・#1628（実機確認）・#1867・#1868・#1869・#2231・#2232・#2431・#1823
 
-> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `docs/verification/real-machine-tests.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `AGENTS.md` の実機前提テストの項に合わせたもので、実機確認は #3803（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
+> 未検証の注記（REPAIR-3）: 本書は実装（`crates/platform-macos`・`crates/cli`・`guest/kernel/`・`scripts/build-guest-initrd.sh`）と `docs/verification/real-machine-tests.md` の手順に合わせて書いたもので、macOS 実機では未確認である。実機での確認は #1628（人間担当）で行う。microVM（Hypervisor.framework）の節は `crates/microvm`・`fandhe-container-plugin-microvm` と `docs/verification/real-machine-tests.md` の実機前提テストの項に合わせたもので、合成ゲストまでの実機確認は #3803（macOS 27.2・Apple M4 Max）で済み、実 Linux ゲストの確認は #3988（人間担当）で行う。一次資料で確かめられていない事項は「要確認」と明記している。
 
 ## 現状（実装済みと未実装）
 
@@ -14,7 +14,7 @@ macOS 利用者が fandhe-container を使う前に整えておく前提条件�
 | ---- | ---- | ---- |
 | VM の設定・起動・停止、virtiofs のデバイス構成、ゲスト内 mount の指示と報告の検証（`crates/platform-macos`） | 実装済み（実機未確認） | 実行前提は entitlement とコード署名（下記）。実機確認は #1628 |
 | macOS backend plugin（`fandhe-container-plugin-macos`）の UDS 越しの create / start / stop | 実装済み（実機未確認） | create 要求ごとに kernel・initrd のパスを受け取る |
-| microVM（Hypervisor.framework。`crates/microvm` の `hvf`・`fandhe-container-plugin-microvm` の start / stop） | 実装済み（実機未確認） | 実行前提は `com.apple.security.hypervisor` の署名と Apple Silicon の macOS 15 以降（「microVM（Hypervisor.framework）の entitlement とコード署名」節）。実機確認は #3803 |
+| microVM（Hypervisor.framework。`crates/microvm` の `hvf`・`fandhe-container-plugin-microvm` の start / stop） | 実装済み（実機確認は合成ゲストまで） | 実行前提は `com.apple.security.hypervisor` の署名と Apple Silicon の macOS 15 以降（「microVM（Hypervisor.framework）の entitlement とコード署名」節）。合成ゲストの記録は #3803、実 Linux ゲストは #3988 |
 | ゲストカーネル・initrd のビルドスクリプト | 実装済み（macOS ホストでのビルド・リンクと VM での起動は未確認） | `make guest-kernel-build`・`make guest-initrd-build` |
 | `fandhe-container setup` の手順表示 | 実装済み | 表示のみ。検出も適用もしない |
 | CLI から plugin を起動する経路と RPC | 未実装（設計案 #1869 の承認と実装 issue の起票は #2232） | 現状、日常操作コマンドは `FAILED_PRECONDITION`（5）などで fail-closed に止まる |
@@ -114,7 +114,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 - 再ビルドすると署名が外れるため、ビルドのたびに署名し直す。`CARGO_TARGET_DIR` を変えるとバイナリの場所も変わる
 - 許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539。一覧自体は未配線で、追跡は #1868・#2231）
 - 対応環境: Apple Silicon の macOS 15 以降のみ。macOS 15 未満は `UNIMPLEMENTED`（`hypervisor GIC requires macOS 15 or later`。GICv3 の `hv_gic_*` API の版による）、Intel Mac（macOS の x86_64）でも plugin-microvm は `UNIMPLEMENTED` になる
-- 要確認: ad-hoc 署名（`--sign -`）で `hv_vm_create` が成功するか、entitlement が無いときの戻り値が `HV_DENIED` か。Apple のページに記述が無く、#3803 の実機記録で確定する。実装は `HV_DENIED` を `PermissionDenied`（CLI では `PERMISSION_DENIED`）に写す（`crates/microvm/src/hvf_abi.rs`）
+- 実機の記録（macOS 27.2・Apple M4 Max・#3803）: ad-hoc 署名（`--sign -`）で `hv_vm_create` は成功し、entitlement が無いときの戻り値は `HV_DENIED` だった。実装は `HV_DENIED` を `PermissionDenied`（CLI では `PERMISSION_DENIED`）に写す（`crates/microvm/src/hvf_abi.rs`）
 - 注意: この entitlement は、署名したバイナリに VM の作成を許す。`fandhe-container-plugin-microvm`（と手元の実機前提試験バイナリ）以外に付けない。試験バイナリの署名は手元の確認用で配布しない。sudo も SIP の変更も要らない。fandhe-container はバイナリへの署名を行わない
 
 ## ゲストカーネルと initrd の用意と配置
@@ -150,7 +150,8 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 | ----- | ---- | ---------- |
 | #1906 | 既定方式（常駐 VM の共用）の未決事項 | ゲストカーネルと initrd の用意と配置 |
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
-| #3803 | Apple Silicon 実機での Hypervisor.framework の実機前提試験と ad-hoc 署名・`HV_DENIED` の確認（人間担当） | 現状、microVM（Hypervisor.framework）の entitlement とコード署名 |
+| #3988 | Apple Silicon 実機での実 Linux ゲストの割り込みと UART の確認（人間担当） | 現状 |
+| #3997 | Apple Silicon 実機での HVF の残りの観測（IPA 幅・vCPU の上限・SMC など。人間担当） | 現状 |
 | #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868・#2231 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
 | #1869・#2232 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |

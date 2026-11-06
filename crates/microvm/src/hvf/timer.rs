@@ -17,7 +17,7 @@
 //! - vtimer: `hv_vcpu_run` が `VTIMER_ACTIVATED` で戻ると vtimer は自動で mask され、mask を外すまで再 exit しない。
 //!   ゲストが割り込みを処理して CVAL を進める、またはタイマーを止める、または mask すると線が下がる
 //!   （`CNTV_CTL_EL0` の ISTATUS=0・IMASK=1・ENABLE=0）。その検出時に限り `set_vtimer_mask(false)` で外す
-//!   （QEMU の hvf の `hvf_sync_vtimer` と同じ考え方。確定は #3803）。
+//!   （QEMU の hvf の `hvf_sync_vtimer` と同じ考え方。GIC つきの実機では `VTIMER_ACTIVATED` が来ないため未確認）。
 //!
 //! # GIC つきの構成の実機の挙動（#3803・#3994）
 //! macOS 27.2・Apple M4 Max で、`hv_gic_create` を使う構成（製品の VM はこの構成だけ。#3792）では次のとおり。
@@ -30,7 +30,7 @@
 //!     起こす（許される範囲）。SMP では vCPU ごとに専用のスロット（`WfiWakeSet`）を持ち、SPI は学習した宛先のスロットだけ、宛先不明と停止要求は全台を起こす（#3933・#3948）。
 //! (c) mask の解除は `hv_vcpu_run` の再入直前（`sync_before_run`）にも確認する。ただし線が立っている間は外せず、
 //!     ゲストが CVAL を進める等で線が下がった後の次の再入（exit か実行期限）で外れる。
-//! (d) #3803 で確定させる観測事項: mach の 2 関数の SDK ヘッダとの照合。
+//! (d) mach の 2 関数の SDK ヘッダとの照合は #3997。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{WfxKind, instruction_length};

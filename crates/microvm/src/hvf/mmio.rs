@@ -13,9 +13,10 @@
 //!   fail-closed で止める（`mmio_abort::ensure_mmio_fault`）。
 //! - ゲスト由来のアドレス・値は信頼しない。長さは SAS で 1..=8 に限られ、dispatcher も再検査する。
 //!
-//! # 要確認（実機で未観測。結果の記録は #3803）
-//! - Hypervisor.framework は例外 exit で PC を自動では進めない、という前提を置いている（第三者実装からの読み）。
-//! - `HvVcpuExitException.physical_address` は下位ビットを含む完全な IPA である、という前提を置いている。
+//! # 実機で確かめた前提（#3803）
+//! - Hypervisor.framework は例外 exit で PC を自動では進めない。data abort の exit 時点の PC は faulting 命令を指していた。
+//! - `HvVcpuExitException.physical_address` は下位ビットを含む完全な IPA である。窓 + 4 への書き込みの exit で確かめた
+//!   （`hvf_device_spi_reaches_guest` の準備完了の書き込み）。
 //!
 //! # 未実装（REPAIR-3）
 //! - `InterruptACK` の後処理（level 扱いの SPI の deassert / resample。#3863）は [`MmioHandler::with_ack_routes`] で結ぶ。
@@ -201,7 +202,7 @@ mod tests {
     use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
     use crate::virtio_mmio::VirtioMmioTransport;
 
-    /// ACK の route はデバイスの識別子で引かれ、保持される（#3863）。`hv_*` を呼ばないため vCPU の経路は別途実機で確かめる（#3803）。
+    /// ACK の route はデバイスの識別子で引かれ、保持される（#3863）。`hv_*` を呼ばないため vCPU の経路は別途実機で確かめる（#3988）。
     #[test]
     fn mvm5_3863_ack_routes_are_kept() {
         use crate::interrupt::{InterruptAckReport, LineResample};

@@ -23,7 +23,7 @@
 - `crates/plugin-mcp/src/server.rs`: `PROTOCOL_VERSION = "2025-06-18"`、`MAX_LINE_BYTES = 1 MiB`。`handle_message_with` は 1 行ごとの関数で接続状態を持たなかった（#716 で `handle_message_on` と接続ごとの 1 ビットの `ConnectionState` を足した。4.2）。扱うメソッドは `initialize`・`tools/list`・`ping`・`tools/call` の 4 つ。通知は黙殺し、バッチ配列は拒否し、クライアントからの応答は無視する（サーバーから要求を送らない）
 - `initialize` は `initialize_params_valid` で `protocolVersion`・`capabilities`・`clientInfo` を検証し、要求された版にかかわらず常に `2025-06-18` を返す。capabilities は `tools.listChanged: false`
 - `tools/list` は 2 ツールを固定順で返す。`nextCursor`・`ttlMs`・`cacheScope` は無い。`tools/call` は `structuredContent` と `content` を返し、業務エラーは `isError: true`
-- `error.rs`: JSON-RPC コードは -32700・-32600・-32601・-32602・-32603。未知のツールと引数不正はどちらも -32602（`data.code = INVALID_ARGUMENT`。ERR-5・MCP-4 に沿う）
+- `error.rs`: JSON-RPC コードは -32700・-32600・-32601・-32602・-32603。未知のツールと要求の形の不正は -32602（`data.code = INVALID_ARGUMENT`。ERR-5・MCP-4 に沿う）。引数の誤りは 2025-06-18 の経路が -32602、2026-07-28 の経路が `isError`（`ToolError::invalid_argument`。#4001・D8）
 - 試験: `server.rs` 内の単体試験と `tests/startup.rs`・`tests/integration.rs` が `2025-06-18`・`ping`・`initialize` を具体値で照合している
 - ログは stderr に 1 行 JSON で、入力値を反射させない（REPAIR-4）
 
@@ -49,7 +49,7 @@
 | tasks を拡張 `io.modelcontextprotocol/tasks` へ移動 | SEP-2663・07-28（導入は SEP-1686・11-25） | 破壊的 | tasks を実装していない | 不要（対象外） | なし | 対象外 |
 | `ClientCapabilities`・`ServerCapabilities` の `extensions` | 07-28 | 追加 | 拡張を使わない | 不要 | なし | 対象外 |
 | JSON Schema 2020-12 の既定化（11-25）と `inputSchema`・`outputSchema` の緩和（07-28） | SEP-1613・SEP-2106 | なし | 現スキーマが 2020-12 の範囲か | 要確認 | `$schema` を付けるか、現状で足りるかを確認 | #719 |
-| 入力検証の誤りを Protocol Error ではなく Tool Execution Error（`isError`）で返す | SEP-1303・11-25 | 食い違い | 引数不正は現在 -32602 | 要 | 2026-07-28 の経路だけ `isError` で返す（D8・6 章） | #4001 |
+| 入力検証の誤りを Protocol Error ではなく Tool Execution Error（`isError`）で返す | SEP-1303・11-25 | 食い違い | 引数不正は現在 -32602 | 実装済み | 2026-07-28 の経路だけ `isError` で返す（D8・6 章）。#4001 で実装済み | #4001 |
 | ツール名の指針 | SEP-986・11-25 | なし | 現在の 2 ツール名が適合するか | 要確認 | 名前の文字種を確認 | #719 |
 | `Implementation.description`・icons | 11-25 | 追加（任意） | `serverInfo` に載せられる | 不要（任意） | 載せない | 対象外 |
 | エラーコードの割り当て方針（-32020〜-32099 は MCP 予約、-32000〜-32019 は実装定義） | 07-28 | なし | 独自に -32020 以降を使わない | 不要（遵守のみ） | `error.rs` の注記に残す | #716 |
@@ -148,7 +148,7 @@ D8 で版を分けた理由: 2025-06-18 の仕様は "Invalid arguments" を Pro
 | ----- | ---- |
 | #716 ステートレスコア | `_meta` の版検証、`server/discover`、-32022、`ping` の扱い、`serverInfo`、`ttlMs`・`cacheScope`（D6）。版の無い要求の扱いの精読（D2） |
 | #717 マルチラウンドトリップ | `resultType: "complete"`（D4 で縮小） |
-| #4001 引数の誤りの版の分岐 | 2026-07-28 の経路の入力検証の誤りを `isError` で返す（D8） |
+| #4001 引数の誤りの版の分岐 | 2026-07-28 の経路の入力検証の誤りを `isError` で返す（D8）。実装済み |
 | #718 ヘッダーベースルーティング | 対象外として closed（D5） |
 | #719 試験 | `tests/protocol_2026_07_28.rs`。順序の固定、スキーマ・ツール名の確認、MCP-1・MCP-2 の疎通の維持 |
 | 起票しない | `notifications/cancelled`（D7）。当面は黙殺のまま |

@@ -3,7 +3,7 @@
 //! 呼び出し元は bin（`src/main.rs`）のみ。`FANDHE_CONTAINER_PLUGIN_SOCKET` が設定されているとき、bin が
 //! `fandhe_container_plugin::UdsStream::connect`（server の peer UID 検証つき。別 UID の listener には
 //! 1 バイトも送らず切断する）で得た接続をここへ渡す。プロトコル処理は stdio と同じ
-//! `crate::server::process_line`（`handle_message_with`）を共有し、本モジュールは UDS 固有の
+//! `crate::server::process_line`（`handle_message_on`）を共有し、本モジュールは UDS 固有の
 //! 入出力と期限だけを持つ。
 //!
 //! フレーミング（暫定契約。REPAIR-3）: stdio と同じ「改行区切りの JSON-RPC 2.0、1 行 1 メッセージ」。
@@ -29,7 +29,8 @@ use serde_json::Value;
 
 use crate::backend::{CoreBackend, ToolBackend};
 use crate::server::{
-    Limits, ServeError, log_request, log_transport, process_line, read_line, with_stderr_log,
+    ConnectionState, Limits, ServeError, log_request, log_transport, process_line, read_line,
+    with_stderr_log,
 };
 
 /// アイドル待ちのポーリング周期。切断・期限の検知がこの粒度になる。
@@ -195,6 +196,8 @@ pub fn serve_uds_with<S: PollStream>(
         state: Rc::clone(&state),
         poll,
     });
+    // 接続ごとの状態。別の接続へは持ち越さない（MCP-3）。
+    let mut conn = ConnectionState::default();
     loop {
         state.deadline.set(None);
         // 前のメッセージと同じ read で先読みした次のメッセージの先頭バイトは、その read の時点で
@@ -242,7 +245,7 @@ pub fn serve_uds_with<S: PollStream>(
         // 応答の書き込みでは受信期限を使わない。
         state.deadline.set(None);
         let began = Instant::now();
-        let Some(outcome) = process_line(line, backend) else {
+        let Some(outcome) = process_line(line, backend, &mut conn) else {
             continue;
         };
         if let Some(reply) = &outcome.reply {
@@ -569,5 +572,35 @@ mod tests {
         };
         let r = serve_uds_with(fake, limits, &UnavailableBackend, &mut |_| {});
         assert!(matches!(r, Err(ServeError::WriteTimeout)));
+    }
+
+    /// MCP-3: 接続状態は接続内で遷移し、別の `serve_uds_with` 呼び出しへ持ち越されない。
+    #[test]
+    fn mcp3_connection_state_is_per_connection() {
+        let init: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n";
+        let (fake, written) = Fake::new(vec![
+            Step::Data(PING),
+            Step::Data(init),
+            Step::Data(PING),
+            Step::Eof,
+        ]);
+        let r = serve_uds_with(fake, quick(), &UnavailableBackend, &mut |_| {});
+        assert!(r.is_ok());
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let v: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0]["error"]["code"], -32602);
+        assert_eq!(v[1]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(v[2]["result"], serde_json::json!({}));
+        // 新しい接続では再び未 initialize。
+        let (fake, written) = Fake::new(vec![Step::Data(PING), Step::Eof]);
+        let r = serve_uds_with(fake, quick(), &UnavailableBackend, &mut |_| {});
+        assert!(r.is_ok());
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let v: Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["error"]["code"], -32602);
     }
 }

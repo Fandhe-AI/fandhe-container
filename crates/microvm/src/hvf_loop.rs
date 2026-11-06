@@ -285,12 +285,12 @@ where
 /// | ---- | ---- |
 /// | 各回の先頭で停止フラグ | `Stopped(Requested)` |
 /// | `Err(DeadlineExceeded)`（1 回分の期限切れ） | 続行（正常系） |
-/// | その他の `Err(e)` | `Stopped(Failed(e.code()))`（全 code で止まる前に [`run_error_line`] の診断ログを 1 行出す。REPAIR-4） |
+/// | その他の `Err(e)` | `Stopped(Failed(e.code()))`（全 code で止まる前に `run_error_line` の診断ログを 1 行出す。REPAIR-4） |
 /// | `Canceled` かつ停止フラグ | `Stopped(Requested)` |
 /// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
 /// | `Unknown` | `Stopped(Failed(Internal))`（止まる前に `kind=unknown_exit_reason` の診断ログを 1 行出す。REPAIR-4） |
-/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に [`unsupported_exit_line`] の診断ログを 1 行出す。REPAIR-4・MVM-5） |
-/// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`。`Err` は全 code で止まる前に [`dispatch_error_line`] の診断ログを 1 行出す） |
+/// | SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に `unsupported_exit_line` の診断ログを 1 行出す。REPAIR-4・MVM-5） |
+/// | それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`。`Err` は全 code で止まる前に `dispatch_error_line` の診断ログを 1 行出す） |
 ///
 /// 分類した exit は、振り分けの前に `observer` へ記録する。
 pub fn run_loop_exit<E, D>(

@@ -49,7 +49,7 @@
 | tasks を拡張 `io.modelcontextprotocol/tasks` へ移動 | SEP-2663・07-28（導入は SEP-1686・11-25） | 破壊的 | tasks を実装していない | 不要（対象外） | なし | 対象外 |
 | `ClientCapabilities`・`ServerCapabilities` の `extensions` | 07-28 | 追加 | 拡張を使わない | 不要 | なし | 対象外 |
 | JSON Schema 2020-12 の既定化（11-25）と `inputSchema`・`outputSchema` の緩和（07-28） | SEP-1613・SEP-2106 | なし | 現スキーマが 2020-12 の範囲か | 要確認 | `$schema` を付けるか、現状で足りるかを確認 | #719 |
-| 入力検証の誤りを Protocol Error ではなく Tool Execution Error（`isError`）で返す | SEP-1303・11-25 | 食い違い | 引数不正は現在 -32602 | 判断待ち | spec の ERR-5・MCP-4 と衝突するため spec 側へ報告（6 章） | spec 側 |
+| 入力検証の誤りを Protocol Error ではなく Tool Execution Error（`isError`）で返す | SEP-1303・11-25 | 食い違い | 引数不正は現在 -32602 | 要 | 2026-07-28 の経路だけ `isError` で返す（D8・6 章） | #4001 |
 | ツール名の指針 | SEP-986・11-25 | なし | 現在の 2 ツール名が適合するか | 要確認 | 名前の文字種を確認 | #719 |
 | `Implementation.description`・icons | 11-25 | 追加（任意） | `serverInfo` に載せられる | 不要（任意） | 載せない | 対象外 |
 | エラーコードの割り当て方針（-32020〜-32099 は MCP 予約、-32000〜-32019 は実装定義） | 07-28 | なし | 独自に -32020 以降を使わない | 不要（遵守のみ） | `error.rs` の注記に残す | #716 |
@@ -98,13 +98,36 @@ legacy の版の schema が知らないフィールドを足すと、厳格な�
 | D5 | #718 の扱い | 対象外として閉じる | 承認済み | #720 |
 | D6 | `ttlMs`・`cacheScope` の担当 | #716 に含める | 承認済み | #720 |
 | D7 | `notifications/cancelled` | 当面は黙殺のまま | 承認済み | #720 |
+| D8 | SEP-1303 と ERR-5・MCP-4 の衝突 | 版で分ける。2026-07-28 の経路だけ `isError` | 承認済み | 2026-11-06 オーナー |
+| D9 | `-32022` と全行の `data.code` | spec の ERR-5 の表に明記。`-32022` は `UNIMPLEMENTED` | 承認済み | 2026-11-06 オーナー |
+| D10 | `tools/call` のレスポンス形の見直し | `content` の構造は変えない | 承認済み | 2026-11-06 オーナー |
 
-## 6. spec 側へ報告する事項（本リポでは直さない）
+## 6. spec 側へ報告した事項の結果
 
-- (a) SEP-1303（引数不正を `isError` で返す）と ERR-5・MCP-4（-32602）の規定の衝突
-- (b) ERR-5 の表に -32022 と予約範囲（-32020〜-32099）が無く、ERR-1 の `data.code` の対応も無い
-- (c) 案 B を採る場合の MCP-1 の文言の改訂
-- (d) api-mcp.md の「`tools/call` のレスポンス形は MCP-3 で見直す可能性」への回答
+spec PR [#30](https://github.com/Fandhe-AI/fandhe-container-spec/pull/30) で反映した（2026-11-06）。ERR-5 の「引数スキーマ違反は `-32602`」は 2026-09-26 のユーザー決定で、これを D8 で改めた。
+
+| 項目 | 結果 |
+| ---- | ---- |
+| (a) SEP-1303（引数不正を `isError` で返す）と ERR-5・MCP-4（-32602）の衝突 | D8。版で分ける。実装は #4001 |
+| (b) ERR-5 の表に -32022 と予約範囲（-32020〜-32099）が無く、ERR-1 の `data.code` の対応も無い | D9。全行の値を表に明記し、予約範囲の注記を足した（#2217 もこれで解消） |
+| (c) 案 B を採る場合の MCP-1 の文言の改訂 | 不要。D1 で案 A を採った |
+| (d) api-mcp.md の「`tools/call` のレスポンス形は MCP-3 で見直す可能性」への回答 | D10。`content` の構造は変えず、`resultType` と `isError` の扱いだけを足した |
+
+D8 で版を分けた理由: 2025-06-18 の仕様は "Invalid arguments" を Protocol Errors に挙げ、2025-11-25 以降は "Input validation errors" を Tool Execution Errors に挙げる。D1 は legacy を 2025-06-18 のまま保つ決定なので、legacy の応答は変えない。
+
+`tools_call` の検査の分類:
+
+| 検査 | 分類 |
+| ---- | ---- |
+| `params` がオブジェクトでない、`name` が無い、`arguments` がオブジェクトでない（`CallToolRequest` の違反） | どちらの経路も -32602 |
+| 未知のツール | どちらの経路も -32602 |
+| `container_id` の欠落・文字列以外・`ContainerId::new` の不合格（`arguments` の省略を含む） | 2025-06-18 の経路は -32602、2026-07-28 の経路は `isError`・`INVALID_ARGUMENT` |
+
+`isError` の `message` にも入力値を入れない（REPAIR-4）。ツールのスキーマのフィールド名は入力値ではないので入れてよい。
+
+`-32022` の `data.code` は `UNIMPLEMENTED` とした。仕様の文言が「要求の版を実装していない」で、`-32601` と同じ扱いになる。`schema.json` の `data` は `additionalProperties: false` を持たないので、`supported`・`requested` の横に `code` を足せる。
+
+`-32021`（`MissingRequiredClientCapability`）は返さない。本サーバーはクライアントの機能を要求しないため。
 
 ## 7. 却下案
 
@@ -118,6 +141,7 @@ legacy の版の schema が知らないフィールドを足すと、厳格な�
 | ----- | ---- |
 | #716 ステートレスコア | `_meta` の版検証、`server/discover`、-32022、`ping` の扱い、`serverInfo`、`ttlMs`・`cacheScope`（D6）。版の無い要求の扱いの精読（D2） |
 | #717 マルチラウンドトリップ | `resultType: "complete"`（D4 で縮小） |
+| #4001 引数の誤りの版の分岐 | 2026-07-28 の経路の入力検証の誤りを `isError` で返す（D8） |
 | #718 ヘッダーベースルーティング | 対象外として closed（D5） |
 | #719 試験 | `tests/protocol_2026_07_28.rs`。順序の固定、スキーマ・ツール名の確認、MCP-1・MCP-2 の疎通の維持 |
 | 起票しない | `notifications/cancelled`（D7）。当面は黙殺のまま |

@@ -8,10 +8,8 @@
 //!
 //! 契約: `message` は分類ごとの固定英文のみ。メソッド名・ツール名・id・入力値、および
 //! `TraitError::message`（パス等を含み得る）を応答へ反射させない。
-//! `data.code` について ERR-5 が定めるのは、全プロトコルエラーに ERR-1 体系の `code` を付けることだけで、
-//! 5 行とも値は書かれていない。割り当て（`-32700` / `-32600` / `-32602` -> `INVALID_ARGUMENT`、
-//! `-32601` -> `UNIMPLEMENTED`、`-32603` -> `INTERNAL`）は ERR-3 の分類に沿った本実装の判断で、
-//! spec へ明記するかはオーナー確認事項（#2217 で追跡）。
+//! `data.code` の割り当て（`-32700` / `-32600` / `-32602` -> `INVALID_ARGUMENT`、
+//! `-32601` -> `UNIMPLEMENTED`、`-32603` -> `INTERNAL`）は ERR-5 の表が定める（#2217）。
 //! `server.rs` が全てのエラー応答をこの型経由で組み立てる（TASK-120.2・#470）。
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};

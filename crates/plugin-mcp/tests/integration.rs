@@ -217,7 +217,7 @@ mod uds {
             Some(&runtime),
         )));
         let mut obs = JsonLinesPeerAuthObserver::new();
-        let stream = listener
+        let mut stream = listener
             .accept(Duration::from_secs(20), &mut obs)
             .expect("accept");
         assert_eq!(obs.len(), 0);

@@ -378,6 +378,41 @@ mod unix {
         assert_eq!(l.path(), expected.as_path());
     }
 
+    /// #3981・PLUG-12・REPAIR-4・REPAIR-5: 相手が要求を書いてすぐ drop した接続を accept しても、
+    /// macOS の期限設定 EINVAL で失敗せず、要求と EOF を期限つきの読みで受け取れる
+    /// （macOS では EINVAL 経路を実機で通す。Linux では通常経路）。
+    #[test]
+    fn issue3981_accept_after_peer_wrote_and_dropped_reads_request_then_eof() {
+        use std::io::Write;
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        let mut c = UnixStream::connect(l.path()).unwrap();
+        c.write_all(b"req\n").unwrap();
+        drop(c);
+        let mut s = l
+            .accept(
+                WAIT,
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        let end = Instant::now() + WAIT;
+        loop {
+            match s.read_within(&mut buf, Duration::from_millis(200)) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && Instant::now() < end => {}
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+        assert_eq!(got, b"req\n");
+    }
+
     /// REPAIR-5: 何も送らない peer でも read は期限で戻り、0 の期限は拒否される。
     #[test]
     fn repair5_accepted_stream_read_times_out() {

@@ -371,7 +371,10 @@ impl UdsStream {
     }
 
     /// read / write の期限を変更する。0 は `InvalidArgument`（無期限にしない。REPAIR-5）。
-    pub fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
+    ///
+    /// macOS で相手が既に切断していて期限を掛けられない（`EINVAL`）場合は `Ok` を返し、以後の生の
+    /// read / write を拒否する（`*_within` とフレーム I/O は使える。#3981）。
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), PluginError> {
         self.inner.set_io_timeout(timeout)
     }
 
@@ -387,7 +390,7 @@ impl UdsStream {
     /// 設定した read 期限は呼び出し後も残る（[`Self::set_io_timeout`] と同じく既定期限を上書きする）。
     /// 失敗後・期限未復元の接続は生 I/O と同じく `NotConnected` で拒否する。
     pub fn read_within(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
-        self.check_raw_io()?;
+        self.check_deadlined_io()?;
         self.inner.read_within(buf, timeout)
     }
 
@@ -395,7 +398,7 @@ impl UdsStream {
     /// 期限が残る点は [`Self::read_within`] と同じ（EINVAL 時の non-blocking write は切断済みなら
     /// `BrokenPipe` 等を即返す）。
     pub fn write_within(&mut self, buf: &[u8], timeout: Duration) -> io::Result<usize> {
-        self.check_raw_io()?;
+        self.check_deadlined_io()?;
         self.inner.write_within(buf, timeout)
     }
 
@@ -445,7 +448,9 @@ impl UdsStream {
         if result.is_err() {
             self.poisoned = true;
         }
-        if self.io_timeout_unrestored {
+        // 既定期限を掛けられなかった接続（#3981）も同様: 生 I/O は拒否済みで、期限の保存・復元が
+        // 失敗しても成功した操作を `Failed` で潰さない。
+        if self.io_timeout_unrestored || self.inner.io_timeout_unset() {
             return result;
         }
         match restored {
@@ -469,6 +474,18 @@ impl UdsStream {
     /// 失敗後、または既定期限を復元できなかった接続への生 I/O を拒否する（フレーム I/O と同じ
     /// 「失敗後は使用不可」契約。期限未復元の socket で生 I/O を待たせない。REPAIR-5）。
     fn check_raw_io(&self) -> io::Result<()> {
+        if self.io_timeout_unrestored || self.inner.io_timeout_unset() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection has no default io timeout",
+            ));
+        }
+        self.check_deadlined_io()
+    }
+
+    /// 呼び出しごとに期限を掛ける経路（`*_within`）の検査。失敗後の接続だけを拒否する。
+    /// 既定期限なしの接続でも、期限を掛けられなければ non-blocking 1 回に留まるため許可する（#3981）。
+    fn check_deadlined_io(&self) -> io::Result<()> {
         if self.poisoned || self.io_timeout_unrestored {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1105,7 +1122,10 @@ mod imp {
                                 "failed to configure accepted stream",
                             )
                         })?;
-                        let inner = StreamInner { stream };
+                        let mut inner = StreamInner {
+                            stream,
+                            io_timeout_unset: false,
+                        };
                         inner.set_initial_io_timeout()?;
                         return Ok(inner);
                     }
@@ -1171,25 +1191,38 @@ mod imp {
         }
     }
 
-    /// `EINVAL`（errno 22。Linux・macOS 共通）かつ peer 切断を観測できたときだけ true。
-    /// 引数の `closed` は `EINVAL` のときだけ評価する（余計な読み取りをしない）。
-    pub(super) fn classify_timeout_setup_failure(
-        e: &io::Error,
-        closed: impl FnOnce() -> bool,
-    ) -> bool {
-        e.raw_os_error() == Some(22) && closed()
+    /// 期限設定の失敗が `EINVAL`（errno 22。Linux・macOS 共通）か。
+    ///
+    /// XNU の `sosetoptlock` は `SS_CANTRCVMORE` と `SS_CANTSENDMORE` が両方立った socket（UDS では
+    /// 相手の close で立つ）へのオプション設定を、値に依らず `EINVAL` で拒む。つまり値が正しい
+    /// 接続済み UDS での `EINVAL` は「相手が既に切断した」状態を指す（#3981）。
+    pub(super) fn is_peer_gone_einval(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(22)
     }
 
     #[derive(Debug)]
     pub(super) struct StreamInner {
         stream: UnixStream,
+        /// 既定の read / write 期限を掛けられなかった接続（相手が先に切断した macOS の `EINVAL`。
+        /// #3981）。一度立てたら下げない（切断は戻らない）。生の `Read` / `Write` は無期限待ちを
+        /// 作りうるため上位（`UdsStream`）が拒否し、呼び出しごとに期限を掛ける `*_within` と
+        /// フレーム I/O だけが使える（REPAIR-5）。
+        io_timeout_unset: bool,
     }
 
     impl StreamInner {
         /// テスト用: 接続済みの `UnixStream` をそのまま包む（peer credential 検証なし）。
         #[cfg(test)]
         pub(super) fn from_std(stream: UnixStream) -> Self {
-            Self { stream }
+            Self {
+                stream,
+                io_timeout_unset: false,
+            }
+        }
+
+        /// 既定期限を掛けられなかった接続か（[`Self::io_timeout_unset`] フィールドの doc）。
+        pub(super) fn io_timeout_unset(&self) -> bool {
+            self.io_timeout_unset
         }
 
         /// 期限付き connect → server の peer UID 照合 → blocking 化 → 既定 I/O 期限の付与。
@@ -1239,7 +1272,10 @@ mod imp {
                     "failed to configure connected stream",
                 )
             })?;
-            let inner = Self { stream };
+            let mut inner = Self {
+                stream,
+                io_timeout_unset: false,
+            };
             inner.set_initial_io_timeout()?;
             Ok(inner)
         }
@@ -1247,22 +1283,30 @@ mod imp {
         /// 接続直後の既定 I/O 期限の付与。`accept` / `connect` の最後の段で呼ぶ。
         ///
         /// macOS は相手が既に close した UNIX socket への `setsockopt(SO_RCVTIMEO / SO_SNDTIMEO)` を
-        /// `EINVAL` で拒む。これは peer の切断であって内部エラーではないため、`EINVAL` のときだけ
-        /// peer の状態を確かめ、EOF / reset を観測できた場合に限り `Unavailable`（接続断）へ写す。
-        /// 観測できない `EINVAL` は握り潰さず従来どおり `Internal`（PLUG-1・PLUG-12・REPAIR-4・#3861）。
-        fn set_initial_io_timeout(&self) -> Result<(), PluginError> {
+        /// `EINVAL` で拒む。相手が要求を書いてすぐ閉じる都度起動モードでは、これは正常な流れで
+        /// 起こりうる。`EINVAL` は接続を判定せず `Ok` で返し、期限なしの状態を記録する。切断か
+        /// 未読データかの判別は続く I/O に任せる（受信バッファの要求は読み切れ、その後 EOF を受ける。
+        /// データを捨てる判定読みをしない。PLUG-1・PLUG-12・REPAIR-4・REPAIR-5・#3981）。
+        fn set_initial_io_timeout(&mut self) -> Result<(), PluginError> {
             let timeout = UDS_DEFAULT_IO_TIMEOUT;
             let raw = self
                 .stream
                 .set_read_timeout(Some(timeout))
                 .and_then(|()| self.stream.set_write_timeout(Some(timeout)));
+            self.apply_timeout_result(raw)
+        }
+
+        /// 期限設定の結果の分類。`EINVAL` は「期限なし」を記録して `Ok`、他の失敗は固定文言の `Internal`。
+        /// `raw` を引数で受けるのは、EINVAL を返さない OS でも分岐を単体試験で注入するため。
+        pub(super) fn apply_timeout_result(
+            &mut self,
+            raw: io::Result<()>,
+        ) -> Result<(), PluginError> {
             match raw {
                 Ok(()) => Ok(()),
-                Err(e) if classify_timeout_setup_failure(&e, || self.peer_has_closed()) => {
-                    Err(PluginError::new(
-                        PluginErrorCode::Unavailable,
-                        "peer closed the connection before io timeout was configured",
-                    ))
+                Err(e) if is_peer_gone_einval(&e) => {
+                    self.io_timeout_unset = true;
+                    Ok(())
                 }
                 Err(_) => Err(PluginError::new(
                     PluginErrorCode::Internal,
@@ -1271,34 +1315,18 @@ mod imp {
             }
         }
 
-        /// 非ブロッキングで 1 バイト読み、EOF / reset なら peer が閉じていると判定する。
-        /// 読めた場合（未読データあり）や `WouldBlock` は「閉じたと断定できない」として false。
-        /// 呼び出し後の stream は呼び出し側が破棄する前提（読んだ 1 バイトは捨てられる）。
-        pub(super) fn peer_has_closed(&self) -> bool {
-            if self.stream.set_nonblocking(true).is_err() {
-                return false;
-            }
-            let mut one = [0u8; 1];
-            match (&self.stream).read(&mut one) {
-                Ok(0) => true,
-                Ok(_) => false,
-                Err(e) => matches!(
-                    e.kind(),
-                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-                ),
-            }
-        }
-
-        pub(super) fn set_io_timeout(&self, timeout: Duration) -> Result<(), PluginError> {
+        pub(super) fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), PluginError> {
             if timeout.is_zero() {
                 return Err(PluginError::new(
                     PluginErrorCode::InvalidArgument,
                     "io timeout must be non-zero",
                 ));
             }
-            let fail = |_| PluginError::new(PluginErrorCode::Internal, "failed to set io timeout");
-            self.stream.set_read_timeout(Some(timeout)).map_err(fail)?;
-            self.stream.set_write_timeout(Some(timeout)).map_err(fail)
+            let raw = self
+                .stream
+                .set_read_timeout(Some(timeout))
+                .and_then(|()| self.stream.set_write_timeout(Some(timeout)));
+            self.apply_timeout_result(raw)
         }
         pub(super) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.stream.read(buf)
@@ -1621,7 +1649,10 @@ mod imp {
                 "unix domain socket client is not supported on this platform",
             ))
         }
-        pub(super) fn set_io_timeout(&self, _timeout: Duration) -> Result<(), PluginError> {
+        pub(super) fn io_timeout_unset(&self) -> bool {
+            match *self {}
+        }
+        pub(super) fn set_io_timeout(&mut self, _timeout: Duration) -> Result<(), PluginError> {
             match *self {}
         }
         pub(super) fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
@@ -1807,38 +1838,6 @@ mod tests {
 
         /// connect 側。server 検証の拒否時は `StreamInner` が作られず、server は 1 バイトも
         /// 受信しない（EOF のみ）。
-        /// #3861: peer の close を EOF で観測でき、開いている peer・未読データありは「閉じた」と断定しない。
-        #[test]
-        fn plug12_peer_has_closed_distinguishes_closed_open_and_pending() {
-            use std::os::unix::net::UnixStream;
-            let (ours, theirs) = UnixStream::pair().unwrap();
-            let inner = imp::StreamInner::from_std(ours);
-            assert!(!inner.peer_has_closed(), "open peer must not look closed");
-            drop(theirs);
-            assert!(inner.peer_has_closed(), "EOF must be seen as closed");
-
-            let (ours, mut theirs) = UnixStream::pair().unwrap();
-            theirs.write_all(b"x").unwrap();
-            drop(theirs);
-            let inner = imp::StreamInner::from_std(ours);
-            assert!(
-                !inner.peer_has_closed(),
-                "pending data is not asserted as closed"
-            );
-        }
-
-        /// #3861: EINVAL 以外は peer を調べず false、EINVAL でも peer が閉じていなければ false。
-        #[test]
-        fn plug12_timeout_setup_failure_classification_is_exact() {
-            let einval = io::Error::from_raw_os_error(22);
-            assert!(imp::classify_timeout_setup_failure(&einval, || true));
-            assert!(!imp::classify_timeout_setup_failure(&einval, || false));
-            let other = io::Error::from_raw_os_error(13);
-            assert!(!imp::classify_timeout_setup_failure(&other, || {
-                panic!("peer must not be probed for non-EINVAL")
-            }));
-        }
-
         #[test]
         fn plug12_connect_rejection_sends_no_bytes() {
             let dir = TempDir::new();
@@ -2384,6 +2383,138 @@ mod tests {
             expected_pid: None,
             peer_pid: None,
             socket_path: path.to_path_buf(),
+        }
+    }
+
+    /// #3981・PLUG-1・PLUG-12・REPAIR-4・REPAIR-5・REPAIR-12: 相手が要求を書いてすぐ閉じた接続で
+    /// 既定期限の設定が `EINVAL` になっても、要求を失わず正常に読み切れること。macOS の挙動は
+    /// `EINVAL` の注入で Linux でも通す。
+    #[cfg(unix)]
+    mod timeout_einval_3981 {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        fn einval() -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(22))
+        }
+
+        fn wrap(ours: UnixStream) -> UdsStream {
+            UdsStream {
+                inner: imp::StreamInner::from_std(ours),
+                poisoned: false,
+                io_timeout_unrestored: false,
+            }
+        }
+
+        fn unset_pair() -> (UdsStream, UnixStream) {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let mut s = wrap(ours);
+            s.inner.apply_timeout_result(einval()).unwrap();
+            assert!(s.inner.io_timeout_unset());
+            (s, peer)
+        }
+
+        #[test]
+        fn written_then_closed_keeps_every_byte_then_eof() {
+            let (mut s, mut peer) = unset_pair();
+            peer.write_all(b"{\"a\":1}\n").unwrap();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            drop(peer);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = s.read_within(&mut buf, Duration::from_secs(5)).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, b"{\"a\":1}\n");
+        }
+
+        #[test]
+        fn closed_without_data_reads_eof_and_frame_unavailable() {
+            let (mut s, peer) = unset_pair();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut buf = [0u8; 8];
+            assert_eq!(s.read_within(&mut buf, Duration::from_secs(5)).unwrap(), 0);
+            let e = s
+                .read_frame(RpcTimeout::new(Duration::from_secs(5)).unwrap())
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        }
+
+        #[test]
+        fn live_peer_fails_closed_without_blocking() {
+            let (mut s, _peer) = unset_pair();
+            let mut one = [0u8; 1];
+            let e = s.read(&mut one).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+            let e = s.write(b"x").unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+            let t = Instant::now();
+            let e = s
+                .read_within(&mut one, Duration::from_millis(50))
+                .unwrap_err();
+            assert_ne!(e.kind(), io::ErrorKind::NotConnected);
+            assert!(t.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn non_einval_failure_is_internal_and_keeps_data() {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            let mut s = wrap(ours);
+            peer.write_all(b"keep").unwrap();
+            let e = s
+                .inner
+                .apply_timeout_result(Err(io::Error::from_raw_os_error(13)))
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Internal);
+            assert_eq!(e.message(), "failed to set io timeout");
+            assert!(!s.inner.io_timeout_unset());
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"keep");
+        }
+
+        #[test]
+        fn set_io_timeout_rejects_zero_and_accepts_normal_value() {
+            let (ours, _peer) = UnixStream::pair().unwrap();
+            let mut s = wrap(ours);
+            let e = s.set_io_timeout(Duration::ZERO).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+            s.set_io_timeout(Duration::from_millis(100)).unwrap();
+            assert!(!s.inner.io_timeout_unset());
+        }
+
+        #[test]
+        fn buffered_frame_is_read_and_flag_does_not_poison() {
+            let (mut s, mut peer) = unset_pair();
+            let f = Frame::new(b"ping".to_vec()).unwrap();
+            peer.write_all(&f.encode()).unwrap();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            let got = s
+                .read_frame(RpcTimeout::new(Duration::from_secs(5)).unwrap())
+                .unwrap();
+            assert_eq!(got.payload(), b"ping");
+            assert!(!s.poisoned);
+            assert_eq!(s.finish_frame_op(Ok(()), TimeoutRestore::Failed), Ok(()));
+            assert!(!s.poisoned);
+            let e = s
+                .read_frame(RpcTimeout::new(Duration::from_secs(5)).unwrap())
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Unavailable);
+        }
+
+        #[test]
+        fn write_to_closed_peer_fails_without_blocking() {
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let mut s = wrap(ours);
+            s.inner.apply_timeout_result(einval()).unwrap();
+            drop(peer);
+            let e = s.write_within(b"x", Duration::from_secs(5)).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
         }
     }
 

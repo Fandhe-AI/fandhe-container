@@ -366,9 +366,10 @@ fn invalid(msg: &'static str) -> MicrovmError {
 ///
 /// 固定値 32。根拠: (1) Linux（KVM）バックエンドの `microvm::MAX_VCPUS`（32）と揃え、plugin-microvm から見た上限を 2 つの
 /// バックエンドで同じにする。(2) GICR の窓と FDT の `cpu@N` が受ける `ARM64_MAX_VCPUS`（64）以内（下の const assert で固定）。
-/// フレームワーク側の実際の上限（`hv_vm_get_max_vcpu_count`）は照会しない。照会は新しい FFI 宣言が要り、macOS 14 での
-/// dyld の解決と SDK ヘッダとの照合が未確認のため。32 台を受けない機種では `hv_vcpu_create` が失敗し、`assemble` 全体が
-/// 作成済みの資源を回収して失敗する（fail-closed）。照会の要否と実機での値の記録は #3997。
+/// フレームワーク側の実際の上限（`hv_vm_get_max_vcpu_count`）は照会しない。macOS 27.2・Apple M4 Max の値は 64 で（#3997）、
+/// 照会しても受ける上限は 32 のままなのに、新しい FFI 宣言と macOS 14 での dyld の解決の確認が要るため。32 台を受けない機種では
+/// `hv_vcpu_create` が失敗し、`assemble` 全体が作成済みの資源を回収して失敗する（fail-closed）。64 は照会した値で、実機前提試験は
+/// 32 台を作っていない。
 pub const HVF_MAX_VCPUS: u32 = 32;
 const _: () = assert!(HVF_MAX_VCPUS <= crate::arm64_layout::ARM64_MAX_VCPUS);
 /// macOS バックエンドが受けるゲスト RAM の上限（[`MAX_MAP_BYTES`] と同値。mmap の前に超過を拒否する）。
@@ -479,9 +480,10 @@ pub fn check_map_range(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result
     Ok(())
 }
 
-/// 既定の IPA 幅（36 ビット = 64 GiB）に基づくゲスト物理アドレスの上限（暫定値。TASK-192.4・#3787・MVM-5）。
+/// 既定の IPA 幅（36 ビット = 64 GiB）に基づくゲスト物理アドレスの上限（TASK-192.4・#3787・MVM-5）。
 ///
-/// Apple の公開情報からの読みで、SDK と実機での照合は #3997、レイアウトの確定は #3788。確定するまで上げない。
+/// macOS 27.2・Apple M4 Max の実機の既定は 36 ビット、最大は 40 ビットだった（#3997。他の機種・版は未確認）。`config = NULL` の
+/// VM でこの上限の直前のページは map でき、直後のページは `HV_BAD_ARGUMENT` だった。広げるには VM の作成時に IPA 幅を指定する変更が要る。
 pub const HVF_DEFAULT_IPA_LIMIT: u64 = 1 << 36;
 
 /// ゲスト RAM を `[ipa, ipa + size)` に置けるか、IPA の上限に対して検査する（`hv_vm_map` の前に通す）。
@@ -504,7 +506,7 @@ pub fn check_ipa_limit(ipa: u64, size: u64, ipa_limit: u64) -> Result<(), Microv
 ///
 /// [`check_map_range`] の後に、[`HVF_DEFAULT_IPA_LIMIT`] に対する [`check_ipa_limit`] を行う（この順序）。
 /// `config = NULL` で作る VM の IPA 幅は既定値なので、既定の上限が FFI に渡せる範囲の天井になる。
-/// 上限の値は暫定（#3788・#3997）。レイアウトごとの、より厳しい上限は `HvfGuestRam::register` が検査する。
+/// 上限の前後のページの挙動は実機で確かめた（#3997）。レイアウトごとの、より厳しい上限は `HvfGuestRam::register` が検査する。
 pub fn check_vm_map(addr: u64, ipa: u64, size: u64, page_size: u64) -> Result<(), MicrovmError> {
     check_map_range(addr, ipa, size, page_size)?;
     check_ipa_limit(ipa, size, HVF_DEFAULT_IPA_LIMIT)

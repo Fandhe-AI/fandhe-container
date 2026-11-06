@@ -16,7 +16,7 @@
 //! - [`EsrClass::Other`]（未知の EC）と [`EsrClass::DataAbortUnsupported`]（ISV=0）は fail-closed の入口で、
 //!   呼び出し側は推測で続行せず VM を止めること。
 //! - PC の進め方は呼び出し側の責務。HVC の優先戻り先は次の命令、HCR_EL2.TSC で trap した SMC の優先戻り先は
-//!   SMC 命令自身、data abort も faulting 命令を指す（HVC と data abort は実機で確かめた。#3803。SMC が exit するかは未確認で #3997）。
+//!   SMC 命令自身、data abort も faulting 命令を指す（HVC と data abort は #3803、SMC は #3997 で実機の exit を確かめた）。
 //!   進める量は [`instruction_length`] で得る。
 //!
 //! # 未実装（REPAIR-3）

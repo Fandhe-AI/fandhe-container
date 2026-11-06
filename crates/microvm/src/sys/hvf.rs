@@ -62,7 +62,7 @@
 //!
 //! # ホストの時刻（TASK-192.14・#3796）
 //! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
-//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。SDK ヘッダとの照合は #3997。
+//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。宣言は SDK 27.2 のヘッダと一致した（#3997）。
 //! 2 関数は本ファイル末尾の単体試験（#3885）で直接確かめる（entitlement 不要のため既定の試験集合で走る）。
 //!
 //! # 出典
@@ -339,7 +339,7 @@ impl HvVm {
 impl HvVm {
     /// 呼び出しスレッドに束縛された vCPU を作る（config は NULL）。
     ///
-    /// 同じスレッドで 2 個目を作ったときの挙動は未確認（#3997 で観測）。
+    /// 同じスレッドで 2 個目を作ると実機では `HV_BUSY` で失敗し、`FailedPrecondition` を返す（#3997。製品は vCPU ごとに専用スレッドを持つ）。
     /// GIC は vCPU より前に作る必要があるため、外部には `crate::hvf::gic::VmWithGic::create_vcpu` だけが公開される（#3792）。
     pub(crate) fn create_vcpu(&self) -> Result<HvVcpu<'_>, MicrovmError> {
         let mut id: u64 = 0;

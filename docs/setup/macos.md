@@ -115,6 +115,7 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 - 許可済みハッシュ一覧に載せる値は署名後のバイナリの sha256 とし、再ビルドと再署名のたびに取り直す（#1539。一覧自体は未配線で、追跡は #1868・#2231）
 - 対応環境: Apple Silicon の macOS 15 以降のみ。macOS 15 未満は `UNIMPLEMENTED`（`hypervisor GIC requires macOS 15 or later`。GICv3 の `hv_gic_*` API の版による）、Intel Mac（macOS の x86_64）でも plugin-microvm は `UNIMPLEMENTED` になる
 - 実機の記録（macOS 27.2・Apple M4 Max・#3803）: ad-hoc 署名（`--sign -`）で `hv_vm_create` は成功し、entitlement が無いときの戻り値は `HV_DENIED` だった。実装は `HV_DENIED` を `PermissionDenied`（CLI では `PERMISSION_DENIED`）に写す（`crates/microvm/src/hvf_abi.rs`）
+- 実機の上限の記録（macOS 27.2・Apple M4 Max・#3997）: IPA 幅は既定 36 ビット・最大 40 ビット、`hv_vm_get_max_vcpu_count` は 64 だった。実装の上限（IPA 36 ビット・vCPU 32 台）はこの範囲に収まる。64 は照会した値で、他の機種・版の値は見ていない
 - 注意: この entitlement は、署名したバイナリに VM の作成を許す。`fandhe-container-plugin-microvm`（と手元の実機前提試験バイナリ）以外に付けない。試験バイナリの署名は手元の確認用で配布しない。sudo も SIP の変更も要らない。fandhe-container はバイナリへの署名を行わない
 
 ## ゲストカーネルと initrd の用意と配置
@@ -151,7 +152,6 @@ macOS で `fandhe-container setup` を実行すると、次の 3 ステップを
 | #1906 | 既定方式（常駐 VM の共用）の未決事項 | ゲストカーネルと initrd の用意と配置 |
 | #1628 | 実機での最小 VM の起動確認（人間担当） | 全節 |
 | #3988 | Apple Silicon 実機での実 Linux ゲストの割り込みと UART の確認（人間担当） | 現状 |
-| #3997 | Apple Silicon 実機での HVF の残りの観測（IPA 幅・vCPU の上限・SMC など。人間担当） | 現状 |
 | #1867 | macOS の信頼性検証の結果を CLI に反映（反映済み） | plugin の配置と信頼性検証 |
 | #1868・#2231 | 許可済みハッシュ一覧 | plugin の配置と信頼性検証 |
 | #1869・#2232 | plugin の起動と RPC の配線 | 現状、ゲストカーネルと initrd の用意と配置 |

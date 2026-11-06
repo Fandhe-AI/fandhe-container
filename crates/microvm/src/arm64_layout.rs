@@ -31,7 +31,7 @@
 //!
 //! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
 //! `hvf_smp`〔#3891〕）で起動する。合成ゲストでは実機で確かめた（#3803）。実 Linux ゲストの確認は #3998・#3988。
-//! PCI・IPA 上限の確定は範囲外（IPA 上限は #3997）。
+//! PCI は範囲外。IPA 上限は HVF の既定の 36 ビットで、macOS 27.2・Apple M4 Max の実機の既定と一致した（#3997）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を
@@ -80,7 +80,7 @@ pub const ARM64_VIRTIO_SPI_BASE: u32 = 16;
 /// シリアルの SPI 番号（DT のセル値。INTID は 33）。virtio の基点（既定 16）より下で重ならない
 /// （QEMU の virt の VIRT_UART と同じ慣行。#3892・MVM-5）。
 pub const ARM64_SERIAL_SPI: u32 = 1;
-/// 既定の IPA 上限（暫定。確定は #3997。KVM 経路は自分の値を `ipa_limit` に渡せる）。
+/// 既定の IPA 上限（HVF の既定の 36 ビット。実機の値は #3997。KVM 経路は自分の値を `ipa_limit` に渡せる）。
 pub const ARM64_DEFAULT_IPA_LIMIT: u64 = HVF_DEFAULT_IPA_LIMIT;
 /// `cpu@0` の `reg`。#3797 が `MPIDR_EL1` の affinity をこの値から設定する。
 pub const ARM64_BOOT_CPU_MPIDR: u32 = 0;

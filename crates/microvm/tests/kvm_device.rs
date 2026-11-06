@@ -7,6 +7,16 @@ use fandhe_container_microvm::device::KvmDevice;
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 
+/// 前提欠如と回帰の振り分けの正本（環境を示すコードだけ前提欠如にする。#3992）。
+#[path = "support/kvm_precondition.rs"]
+mod kvm_precondition;
+
+/// `KvmDevice::open` の失敗を、環境を示すコードだけ `PRECONDITION FAILED` にして落とす（MVM-1・REPAIR-4・#3992）。
+fn open_kvm() -> KvmDevice {
+    KvmDevice::open()
+        .unwrap_or_else(|e| panic!("{}", kvm_precondition::open_failure_line("kvm_device", &e)))
+}
+
 /// 合成 bzImage の正本（x86_64 の実機前提試験だけが使う。複製しない・#3750）。
 #[cfg(target_arch = "x86_64")]
 #[path = "support/bzimage.rs"]
@@ -15,12 +25,7 @@ mod bzimage;
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_open_and_create_vm() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(dev.api_version().unwrap(), 12);
     let vm1 = dev.create_vm().unwrap();
     assert!(vm1.as_fd().as_raw_fd() >= 0);
@@ -32,12 +37,7 @@ fn kvm_device_open_and_create_vm() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_create_vcpu() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let vm = dev.create_vm().unwrap();
     let v0 = vm.create_vcpu(0).unwrap();
     let v1 = vm.create_vcpu(1).unwrap();
@@ -63,12 +63,7 @@ fn kvm_device_run_guest_code() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -98,12 +93,7 @@ fn kvm_device_run_guest_code() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_run_guest_code() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(
         dev.probe_guest_execution().unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
@@ -121,12 +111,7 @@ fn kvm_device_run_deadline_interrupts_spinning_guest() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let start = Instant::now();
@@ -158,12 +143,7 @@ fn kvm_device_run_deadline_interrupts_spinning_guest() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_run_deadline_interrupts_spinning_guest() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(
         dev.probe_deadline_interrupt(std::time::Duration::from_millis(200), 2)
             .unwrap_err()
@@ -182,12 +162,7 @@ fn kvm_device_exit_dispatch() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -233,12 +208,7 @@ fn kvm_device_exit_dispatch() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_exit_dispatch() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(
         dev.probe_exit_dispatch().unwrap_err().code(),
         MicrovmErrorCode::Unimplemented
@@ -271,12 +241,7 @@ fn kvm_device_block_queue_interrupt() {
     const DATA: u64 = 0x11000;
     const STATUS: u64 = 0x12000;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         type T = VirtioMmioTransport<VirtioBlock<MemoryBlockBackend>>;
@@ -398,12 +363,7 @@ fn kvm_device_net_queue_interrupt() {
     const USED: u64 = 0x3000;
     const BUF: u64 = 0x11000;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         type T = VirtioMmioTransport<VirtioNet<MemoryNetBackend>>;
@@ -502,12 +462,7 @@ fn kvm_device_net_queue_interrupt() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_net_queue_interrupt() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(
         dev.probe_queue_interrupt(&mut |_| Ok(()))
             .unwrap_err()
@@ -521,12 +476,7 @@ fn kvm_device_net_queue_interrupt() {
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_block_queue_interrupt() {
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     assert_eq!(
         dev.probe_queue_interrupt(&mut |_| Ok(()))
             .unwrap_err()
@@ -542,12 +492,7 @@ fn kvm_device_register_guest_memory() {
     use fandhe_container_microvm::guest_memory::GuestAddress;
     use fandhe_container_microvm::microvm::GuestRam;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let vm = dev.create_vm().unwrap();
     let mut mem = GuestRam::new(2 << 20)
         .unwrap()
@@ -590,12 +535,7 @@ fn kvm_device_guest_writes_registered_memory() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     // REPAIR-5: 止まった vCPU スレッドが残っても、期限切れでテストごと失敗にする。
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -650,12 +590,7 @@ fn kvm_device_assemble_microvm() {
     use fandhe_container_microvm::virtio_mmio::{MAGIC_VALUE, reg};
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config = || MicroVmConfig {
         vcpu_count: 2,
         mem_size: 2 << 20,
@@ -729,12 +664,7 @@ fn kvm_device_assemble_microvm() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -758,12 +688,7 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let mut vm = MicroVm::assemble(
         &dev,
         MicroVmConfig {
@@ -825,12 +750,7 @@ fn kvm_device_load_kernel_into_assembled_microvm() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -859,12 +779,7 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
 
     // 合成 bzImage（`support/bzimage.rs`）。payload の 0x200 が 64-bit エントリで、残りは ud2。
     let mut code: Vec<u8> = vec![0x89, 0xF0, 0xE7, 0x10]; // mov eax,esi ; out 0x10,eax
@@ -943,12 +858,7 @@ fn kvm_device_boot_vcpu_starts_at_kernel_entry() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -972,12 +882,7 @@ fn kvm_device_boot_lapic_lints_read_back() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
 
     // 合成 bzImage（ヘッダのみ。コードは使わない・実行しない。`support/bzimage.rs`）。
     let img = bzimage::header_only();
@@ -1023,12 +928,7 @@ fn kvm_device_boot_lapic_lints_read_back() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -1057,12 +957,7 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let host = dev.supported_cpuid().unwrap();
     let leaf0 = *host.get(0, 0).unwrap();
 
@@ -1134,12 +1029,7 @@ fn kvm_device_cpuid_vendor_and_apic_id_reach_guest() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -1171,12 +1061,7 @@ fn kvm_device_ap_starts_on_init_sipi() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
 
     // BSP（long mode）: ICR_HIGH に宛先 APIC ID 1、ICR_LOW に INIT（assert）と SIPI（ベクタ 1）を書き、port 0x10 へ 0xAA。
     let bsp: Vec<u8> = vec![
@@ -1294,12 +1179,7 @@ fn kvm_device_ap_starts_on_init_sipi() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 2,
         mem_size: 1 << 20,
@@ -1337,12 +1217,7 @@ fn kvm_device_start_stop_microvm() {
         }
     }
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
     let assemble = |vcpu_count: u32| -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
         MicroVm::assemble(
@@ -1430,12 +1305,7 @@ fn kvm_device_start_stop_microvm() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -1481,12 +1351,7 @@ fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
         }
     }
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let image = |entry_code: &[u8]| bzimage::synthetic_bzimage(entry_code);
     let assemble = || -> MicroVm<MemoryBlockBackend, MemoryNetBackend> {
         MicroVm::assemble(
@@ -1595,12 +1460,7 @@ fn kvm_device_start_two_vcpus_runs_ap_and_stops() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 2,
         mem_size: 1 << 20,
@@ -1627,12 +1487,7 @@ fn kvm_device_serial_output_reaches_host() {
 
     const MSG: &[u8] = b"fandhe-microvm-uart-ok\r\n";
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     // mov dx,0x3fd; in al,dx; test al,0x20; jz ud2; mov dx,0x3f8; (mov al,c; out dx,al)*; ud2
     let mut code: Vec<u8> = vec![0x66, 0xBA, 0xFD, 0x03, 0xEC, 0xA8, 0x20];
     let skip = 4 + 3 * MSG.len();
@@ -1683,12 +1538,7 @@ fn kvm_device_serial_output_reaches_host() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -1778,12 +1628,7 @@ fn run_com1_irq_scenario(
     const VECTOR: u64 = 0x30;
     const BOOT_CS_SELECTOR: u16 = 0x10;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let (code, handler) = com1_irq_guest_code(ier, IDTR_GPA as u32);
     let mut img = bzimage::header_only();
     bzimage::put_entry_code(&mut img, &code);
@@ -1895,12 +1740,7 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
         }
     }
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let img = bzimage::synthetic_bzimage(&[0xEB, 0xFE]);
 
     for attempt in 0..5 {
@@ -1947,12 +1787,7 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -2050,12 +1885,7 @@ fn kvm_device_net_rx_reaches_guest_without_kick() {
         c
     }
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
 
     // 準備: ゲストコードのロード → 受信バッファ・記述子・avail → ホスト側のドライバ初期化 → 観測器。
     let build = |backend: &SharedNetBackend| {
@@ -2215,12 +2045,7 @@ fn kvm_device_start_failure_releases_resources() {
 
     type Vm = MicroVm<MemoryBlockBackend, MemoryNetBackend>;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let image = bzimage::header_only();
     let assemble = |mem_size: u64, net: usize| -> Vm {
         MicroVm::assemble(
@@ -2337,12 +2162,7 @@ fn kvm_device_boot_fpu_reads_back() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let img = bzimage::synthetic_bzimage(&[0x0F, 0x0B]);
     let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
         &dev,
@@ -2383,12 +2203,7 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     // mov ecx,0x1A0 ; rdmsr ; out 0x10,eax ; mov eax,edx ; out 0x10,eax
     // mov ecx,0xC0000081 ; rdmsr ; out 0x10,eax ; mov eax,edx ; out 0x10,eax
     let code: Vec<u8> = vec![
@@ -2485,12 +2300,7 @@ fn assert_unimplemented_assemble() {
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
-    let dev = match KvmDevice::open() {
-        Ok(d) => d,
-        Err(e) => {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        }
-    };
+    let dev = open_kvm();
     let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
         vcpu_count: 1,
         mem_size: 1 << 20,
@@ -2537,12 +2347,7 @@ mod arm64 {
     type Vm = MicroVm<MemoryBlockBackend, MemoryNetBackend>;
 
     fn open() -> KvmDevice {
-        match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        }
+        super::open_kvm()
     }
 
     fn config(
@@ -2565,13 +2370,18 @@ mod arm64 {
         }
     }
 
+    /// 組み立てに失敗したら、環境を示すコードだけ前提欠如にする（#3992）。
+    fn assemble_config(cfg: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend>) -> Vm {
+        MicroVm::assemble(&open(), cfg).unwrap_or_else(|e| {
+            panic!(
+                "{}",
+                super::kvm_precondition::assemble_failure_line("kvm_device", &e)
+            )
+        })
+    }
+
     fn assemble(block: usize, net: usize) -> Vm {
-        match MicroVm::assemble(&open(), config(1, block, net)) {
-            Ok(vm) => vm,
-            Err(e) => {
-                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        }
+        assemble_config(config(1, block, net))
     }
 
     fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -2698,9 +2508,7 @@ mod arm64 {
         use fandhe_container_microvm::boot_arm64::ARM64_MPIDR_AFFINITY_MASK;
         for (vcpus, idx, node, want) in [(2u32, 1usize, "cpu@1", 1u32), (17, 16, "cpu@100", 0x100)]
         {
-            let mut vm = MicroVm::assemble(&open(), config(vcpus, 0, 0)).unwrap_or_else(|e| {
-                panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-            });
+            let mut vm = assemble_config(config(vcpus, 0, 0));
             let loaded = vm
                 .load_kernel(&synthetic_image(true), None, "console=ttyS0")
                 .unwrap();
@@ -2722,9 +2530,7 @@ mod arm64 {
     #[test]
     #[ignore = "requires read/write access to /dev/kvm on an aarch64 host with a GICv3 and KVM_CAP_ARM_PSCI_0_2 (MVM-1)"]
     fn kvm_device_arm64_smp_start_stop() {
-        let mut vm = MicroVm::assemble(&open(), config(2, 0, 0)).unwrap_or_else(|e| {
-            panic!("kvm_device: PRECONDITION FAILED (test environment, not a regression): {e}")
-        });
+        let mut vm = assemble_config(config(2, 0, 0));
         let loaded = vm
             .load_kernel(&synthetic_image(true), None, "console=ttyS0")
             .unwrap();

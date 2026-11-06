@@ -21,6 +21,16 @@
 //! x86_64・aarch64 以外の arch は組み立てが未実装で、`Unimplemented` を確かめるだけ。
 #![cfg(target_os = "linux")]
 
+/// 前提欠如と回帰の振り分けの正本（環境を示すコードだけ前提欠如にする。#3992）。
+#[path = "support/kvm_precondition.rs"]
+mod kvm_precondition;
+
+/// `KvmDevice::open` の失敗を、環境を示すコードだけ `PRECONDITION FAILED` にして落とす（MVM-1・REPAIR-4・#3992）。
+fn open_kvm() -> fandhe_container_microvm::device::KvmDevice {
+    fandhe_container_microvm::device::KvmDevice::open()
+        .unwrap_or_else(|e| panic!("{}", kvm_precondition::open_failure_line("microvm", &e)))
+}
+
 /// 合成 bzImage の正本（複製しない・#3750）。インライン module 内では `#[path]` の基準が変わるため、ここで宣言する。
 #[cfg(target_arch = "x86_64")]
 #[path = "support/bzimage.rs"]
@@ -84,7 +94,6 @@ mod common {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::bzimage;
-    use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::exit::{ExitData, ExitValue, IoDirection};
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
@@ -157,12 +166,7 @@ mod x86 {
 
     /// 組み立て・ロード・開始・待ち・停止までを通す。`with_block` が偽なら負の対照。
     fn boot_and_stop(with_block: bool) -> Outcome {
-        let dev = match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        };
+        let dev = super::open_kvm();
         let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
             &dev,
             MicroVmConfig {
@@ -278,7 +282,7 @@ mod arm64 {
     use super::arm64_image::{BOOT_CHECK_CODE, image_with_code};
     use super::common::*;
     use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, ARM64_VIRTIO_MMIO_BASE};
-    use fandhe_container_microvm::device::{BoundedRunLog, KvmDevice};
+    use fandhe_container_microvm::device::BoundedRunLog;
     use fandhe_container_microvm::exit::{ExitData, ExitValue};
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
@@ -312,13 +316,8 @@ mod arm64 {
     /// 組み立て・ロード・開始・待ち・停止までを通す。`with_block` が偽なら負の対照。
     /// 正負どちらもゲストが PSCI SYSTEM_OFF で自分から止まるため、`is_finished` を待ってから `stop` する。
     fn boot_and_stop(with_block: bool) -> Outcome {
-        let dev = match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        };
-        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = match MicroVm::assemble(
+        let dev = super::open_kvm();
+        let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
             &dev,
             MicroVmConfig {
                 vcpu_count: 1,
@@ -330,12 +329,13 @@ mod arm64 {
                 },
                 net: vec![],
             },
-        ) {
-            Ok(vm) => vm,
-            Err(e) => {
-                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        };
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}",
+                super::kvm_precondition::assemble_failure_line("microvm", &e)
+            )
+        });
         if with_block {
             assert_eq!(
                 vm.devices()[0].slot.mmio_base,
@@ -430,19 +430,13 @@ mod arm64 {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod other {
-    use fandhe_container_microvm::device::KvmDevice;
     use fandhe_container_microvm::error::MicrovmErrorCode;
     use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 
     fn assemble_is_unimplemented() {
-        let dev = match KvmDevice::open() {
-            Ok(d) => d,
-            Err(e) => {
-                panic!("microvm: PRECONDITION FAILED (test environment, not a regression): {e}")
-            }
-        };
+        let dev = super::open_kvm();
         let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
             vcpu_count: 1,
             mem_size: 1 << 20,

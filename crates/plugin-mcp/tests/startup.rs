@@ -120,8 +120,10 @@ fn mcp1_initialize_then_tools_list_over_stdio() {
     let init: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 is JSON");
     assert_eq!(init["id"], 1);
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert!(init["result"].get("resultType").is_none());
     let list: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 is JSON");
     assert_eq!(list["id"], 2);
+    assert!(list["result"].get("resultType").is_none());
     let names: Vec<&str> = list["result"]["tools"]
         .as_array()
         .expect("tools is an array")
@@ -210,6 +212,9 @@ fn mcp3_modern_stateless_requests_over_stdio() {
         Some(2)
     );
     assert_eq!(lines[1]["result"]["cacheScope"], "public");
+    for line in lines.iter().take(3) {
+        assert_eq!(line["result"]["resultType"], "complete");
+    }
     assert_eq!(lines[2]["result"]["isError"], true);
     assert_eq!(
         lines[2]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],

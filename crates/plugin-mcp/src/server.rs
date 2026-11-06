@@ -28,10 +28,10 @@
 //! エラー応答は `crate::error` の `ProtocolError` / `ToolError` で組み立てる（MCP-4・ERR-5・TASK-120.2）。
 //!
 //! modern の実装済み: `server/discover`・`tools/list`（`ttlMs`・`cacheScope` つき）・`tools/call`。
-//! `ping`・`initialize` は modern では `-32601`。result には `_meta` の `serverInfo` を足す。
+//! `ping`・`initialize` は modern では `-32601`。result には `_meta` の `serverInfo` と
+//! `resultType: "complete"` を足す（`finish_modern` に集約。#717・MCP-3。legacy には付けない）。
 //!
-//! 未実装・簡易実装（REPAIR-3）: modern の全 result の `resultType: "complete"` は未実装（#717。差し込み口は
-//! `finish_modern`）。2026-07-28 の経路の引数不正を `isError` で返す扱いも未実装（#4001。現状は `-32602`）。
+//! 未実装・簡易実装（REPAIR-3）: 2026-07-28 の経路の引数不正を `isError` で返す扱いも未実装（#4001。現状は `-32602`）。
 //! `start_container` の本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
@@ -70,6 +70,11 @@ const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 /// 応答の `_meta` に載せる `serverInfo` のキー。
 const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// modern の result に載せる `resultType` のキー（SEP-2322・MCP-3）。
+const RESULT_TYPE_KEY: &str = "resultType";
+/// `resultType` の値。本サーバーはクライアントへ追加入力を求めない（D4）ので、result は常に完了を表す。
+const RESULT_TYPE_COMPLETE: &str = "complete";
 
 const SERVER_NAME: &str = "fandhe-container-plugin-mcp";
 
@@ -565,10 +570,9 @@ fn dispatch_modern(
     }
 }
 
-/// modern の応答の仕上げ。`result` を持つ応答（`isError: true` を含む）の `_meta` へ `serverInfo` を足す。
-/// エラー応答は素通しする。
-///
-/// 未実装（REPAIR-3）: 全 result への `resultType: "complete"` は #717 で本関数へ足す（MCP-3）。
+/// modern の応答の仕上げ。`result` を持つ応答（`isError: true` を含む）の `_meta` へ `serverInfo` を、
+/// 直下へ `resultType: "complete"` を足す（#717・MCP-3）。エラー応答は素通しする。
+/// legacy は本関数を通らないので `resultType` が付かない（D3）。
 fn finish_modern(mut outcome: Outcome) -> Outcome {
     if let Some(result) = outcome
         .reply
@@ -576,6 +580,7 @@ fn finish_modern(mut outcome: Outcome) -> Outcome {
         .and_then(|r| r.get_mut("result"))
         .and_then(Value::as_object_mut)
     {
+        result.insert(RESULT_TYPE_KEY.to_owned(), json!(RESULT_TYPE_COMPLETE));
         let info = json!({"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")});
         let meta = result
             .entry("_meta")
@@ -1867,6 +1872,54 @@ mod tests {
         assert_eq!(disc["error"]["data"]["code"], "UNIMPLEMENTED");
     }
 
+    /// legacy（2025-06-18）の result には `resultType` を付けない（MCP-3・D3）。
+    #[test]
+    fn mcp3_legacy_results_have_no_result_type() {
+        let mut conn = ConnectionState::default();
+        let init = on(&init_req("1", "2025-06-18"), &mut conn);
+        let list = on(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut conn,
+        );
+        let ping = on(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#, &mut conn);
+        let call = on(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_containers"}}"#,
+            &mut conn,
+        );
+        let err_backend = fake_err(ErrorCode::NotFound, "x");
+        let call_err = handle_message_on(
+            br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_containers"}}"#,
+            &err_backend,
+            &mut conn,
+        )
+        .reply
+        .unwrap();
+        assert_eq!(call_err["result"]["isError"], true);
+        for v in [&init, &list, &ping, &call, &call_err] {
+            let result = v["result"].as_object().expect("result object");
+            assert!(!result.contains_key("resultType"), "{v}");
+        }
+    }
+
+    /// 経路は要求ごとに決まり、同じ接続でも modern にだけ `resultType` が付く（MCP-3・D3）。
+    #[test]
+    fn mcp3_result_type_follows_route_per_request() {
+        let mut conn = ConnectionState::default();
+        on(&init_req("1", "2025-06-18"), &mut conn);
+        let modern = on(&modern_req(2, "tools/list", "2026-07-28", ""), &mut conn);
+        assert_eq!(modern["result"]["resultType"], "complete");
+        let legacy = on(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+            &mut conn,
+        );
+        assert!(
+            !legacy["result"]
+                .as_object()
+                .unwrap()
+                .contains_key("resultType")
+        );
+    }
+
     #[test]
     fn mcp3_failed_initialize_does_not_make_connection_legacy() {
         let mut conn = ConnectionState::default();
@@ -1922,6 +1975,7 @@ mod tests {
                 "capabilities":{"tools":{"listChanged":false}},
                 "ttlMs":3600000,
                 "cacheScope":"public",
+                "resultType":"complete",
                 "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
             }})
         );
@@ -1937,6 +1991,7 @@ mod tests {
                 "tools":tool_defs_json(),
                 "ttlMs":3600000,
                 "cacheScope":"public",
+                "resultType":"complete",
                 "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
             }})
         );
@@ -1959,6 +2014,7 @@ mod tests {
             {"id":"c2","status":"created","pid":null}
         ],"truncated":false});
         assert_eq!(v["result"]["isError"], false);
+        assert_eq!(v["result"]["resultType"], "complete");
         assert_eq!(v["result"]["structuredContent"], expected);
         assert_eq!(
             v["result"]["_meta"],
@@ -1973,6 +2029,7 @@ mod tests {
             ),
             &mut conn,
         );
+        assert_eq!(v["result"]["resultType"], "complete");
         assert_eq!(
             v["result"]["structuredContent"],
             json!({"id":"c1","status":"running","pid":42})
@@ -1996,6 +2053,7 @@ mod tests {
         );
         let v = o.reply.unwrap();
         assert_eq!(v["result"]["isError"], true);
+        assert_eq!(v["result"]["resultType"], "complete");
         assert_eq!(
             v["result"]["_meta"],
             json!({"io.modelcontextprotocol/serverInfo":server_info()})

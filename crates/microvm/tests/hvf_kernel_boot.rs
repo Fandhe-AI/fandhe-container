@@ -15,6 +15,14 @@
 //! こと（`N != 0`）も見る。期限切れで `stop` した `Requested` は合格にしない。負の対照は initrd 無しで、期限まで止まらないことを見る。
 //! 起点 vCPU は `HvfStopReport` に無いため照合しない（`kernel_boot` の KVM 版との差）。
 //!
+//! vCPU 2 台の陽性（#3998。`hvf_kernel_boot_two_vcpus_reaches_init_and_shuts_down`）: AP（vCPU 1）は PSCI CPU_ON で起動する
+//! （#3803 が合成ゲストで確認済み）。上の 1 台と同じ照合に加え、起動ログの
+//! `SMP: Total of 2 processors activated.`・`smp: Brought up 1 node, 2 CPUs`・`CPU1: Booted secondary processor 0x0000000001`
+//! （FDT の `cpu@1` の `reg` と一致した MPIDR）が各ちょうど 1 行、vCPU 1 の `runs` が 1 以上（`exits` の下限は置かない。GIC つきの
+//! 実機では WFI も `VTIMER_ACTIVATED` も exit しないため。#3803・#3994）であることを見る。`CONFIG_SMP`・`CONFIG_NR_CPUS` 2 以上の要件は
+//! `kernel_boot` の aarch64 の項と同じ。cmdline の `nosmp`・`maxcpus=` は前提欠如（skip せず失敗）、`quiet` や 7 未満の `loglevel=` は
+//! 行が出ず照合で落ちる。exit 種別（`wfx` 等）は `VcpuExitObserver::on_exit` が vCPU 番号を持たないため全 vCPU の合計のまま。
+//!
 //! 全体期限（REPAIR-5）: `.cargo/config.toml` の watchdog は `--ignored` を素通しするため、本試験自身の `Watchdog`
 //! （超過で `hvf_kernel_boot: WATCHDOG EXPIRED` と終了コード 124）・ポーリング期限・`stop` の期限・外側の `recv_timeout` が層になる。
 //! 前提欠如は skip せず `hvf_kernel_boot: PRECONDITION FAILED (test environment, not a regression)` で落とす。
@@ -25,10 +33,12 @@
 //! - 実カーネルでの I-cache の clean の要否は未確認（`hvf/microvm.rs` の範囲外の項目・#3988）。起動できないときの切り分け先。
 //! - 内側の期限で panic すると起動スレッドが残り、同じプロセスの次の試験は VM の作成で `FailedPrecondition` になりうる。
 //!   `stop` の期限切れでは RAM がリークして同じプロセスで作り直せない。いずれも先に出た失敗を原因として読む。
+//! - 2 台の reboot では `smp_send_stop` が AP の停止を最大約 1 秒待つ。2 台で止まったときの `Failed(..)` も device model 側の
+//!   別 issue で、試験を緩めない（#3998）。
 //! - `guest/kernel/` の Kconfig が本試験の Image に適するかは確かめていない（適すると書かない）。
 //!
 //! 未実装（REPAIR-3）: virtio-block の block-read を割り込み trigger 2 構成（edge / LevelHigh）で起動する試験は、HVF 側が
-//! `QueueNotify` を処理する経路（#3908）が無いため足していない。vCPU 2 台（#3998）・UART の入出力（#3987）はこの試験の上に足す。
+//! `QueueNotify` を処理する経路（#3908）が無いため足していない。UART の入出力（#3987）はこの試験の上に足す。
 //! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -39,14 +49,16 @@ use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, Arm64Layout};
 use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::hvf::{HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic};
+use fandhe_container_microvm::hvf_abi::HvRunStats;
 use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
 use fandhe_container_microvm::interrupt::IrqTrigger;
 use fandhe_container_microvm::stop::StopReason;
 use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
 use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 use guest_boot::{
-    MARKER, TtyAddress, TtyReport, count_marker_lines, escape_tail, force_panic_zero,
-    parse_tty_report, read_bounded,
+    AP_BOOTED_PREFIX, ARM64_SMP_TOTAL_LINE, MARKER, SMP_ONLINE_LINE, TtyAddress, TtyReport,
+    count_lines_containing, count_lines_ending_with, count_marker_lines, escape_tail,
+    force_panic_zero, parse_tty_report, read_bounded, smp_disabling_param,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,28 +205,48 @@ struct Outcome {
     vcpu_count: u32,
     errors: u64,
     exits: u64,
-    per_vcpu_exits: Vec<u64>,
+    /// vCPU ごとの実行統計（index 順。`[0]` が BSP）。
+    per_vcpu: Vec<HvRunStats>,
     output: Vec<u8>,
     uart_dropped: u64,
     timed_out: bool,
     elapsed: Duration,
-    /// exit の種別ごとの回数（診断・#3988 の判断材料。値は assert しない）。
+    /// exit の種別ごとの回数（診断・#3988 の判断材料。値は assert しない）。全 vCPU の合計で、vCPU ごとの内訳は取れない。
     wfx: u64,
     vtimer: u64,
     data_abort: u64,
     hvc: u64,
 }
 
+/// vCPU ごとの統計を空白なしの 1 トークンにする（行の照合・grep をしやすくする。診断と成功行が共有）。
+fn per_vcpu_summary(stats: &[HvRunStats]) -> String {
+    stats
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            format!(
+                "vcpu{i}(runs={},exits={},deadline_exceeded={},errors={},run_ms={})",
+                s.runs,
+                s.exits,
+                s.deadline_exceeded,
+                s.errors,
+                s.total_elapsed.as_millis()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 impl Outcome {
     fn diag(&self) -> String {
         format!(
-            "reason={:?} vcpus={} errors={} exits={} per_vcpu_exits={:?} wfx={} vtimer={} data_abort={} hvc={} \
+            "reason={:?} vcpus={} errors={} exits={} per_vcpu={} wfx={} vtimer={} data_abort={} hvc={} \
              timed_out={} elapsed={:?} uart_dropped={} output_len={} output_tail=\"{}\"",
             self.reason,
             self.vcpu_count,
             self.errors,
             self.exits,
-            self.per_vcpu_exits,
+            per_vcpu_summary(&self.per_vcpu),
             self.wfx,
             self.vtimer,
             self.data_abort,
@@ -293,7 +325,7 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         vcpu_count: report.vcpu_count,
         errors: report.stats.errors,
         exits: report.stats.exits,
-        per_vcpu_exits: report.per_vcpu.iter().map(|s| s.exits).collect(),
+        per_vcpu: report.per_vcpu,
         output,
         uart_dropped,
         timed_out,
@@ -320,18 +352,10 @@ fn run_boot(inp: Inputs, vcpus: u32) -> (Outcome, Duration) {
     }
 }
 
-/// 陽性。`/init` の reboot（PSCI SYSTEM_RESET）が `GuestShutdown` で止まり、marker がちょうど 1 回出る。
-#[test]
-#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
-fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
-    let secs = boot_timeout_secs();
-    let _wd = Watchdog::start(overall_deadline(secs));
-    let inp = inputs(true, secs);
-    require_vm_with_gic(&layout(1));
-    let (o, boot_timeout) = run_boot(inp, 1);
-    let diag = o.diag();
+/// 起動の陽性に共通の照合（vCPU 数だけが 1 台・2 台で違う）。`ttyS0` の irq を返す。
+fn assert_boot_ok(o: &Outcome, vcpus: u32, boot_timeout: Duration, diag: &str) -> u32 {
     assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
-    assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+    assert_eq!(o.vcpu_count, vcpus, "vcpu count: {diag}");
     assert_eq!(o.errors, 0, "run errors: {diag}");
     assert!(!o.timed_out, "boot timed out: {diag}");
     assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
@@ -356,15 +380,73 @@ fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
         irq, 0,
         "ttyS0 is polled (irq = 0); serial interrupt wiring regressed: {diag}"
     );
+    irq
+}
+
+/// 陽性。`/init` の reboot（PSCI SYSTEM_RESET）が `GuestShutdown` で止まり、marker がちょうど 1 回出る。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
+    let secs = boot_timeout_secs();
+    let _wd = Watchdog::start(overall_deadline(secs));
+    let inp = inputs(true, secs);
+    require_vm_with_gic(&layout(1));
+    let (o, boot_timeout) = run_boot(inp, 1);
+    let diag = o.diag();
+    let irq = assert_boot_ok(&o, 1, boot_timeout, &diag);
     eprintln!(
-        "hvf_kernel_boot: ok arch=aarch64 reason=guest_shutdown ttys0_irq={irq} elapsed_ms={} exits={} wfx={} vtimer={} data_abort={} hvc={} per_vcpu={:?}",
+        "hvf_kernel_boot: ok arch=aarch64 reason=guest_shutdown ttys0_irq={irq} elapsed_ms={} exits={} wfx={} vtimer={} data_abort={} hvc={} per_vcpu={}",
         o.elapsed.as_millis(),
         o.exits,
         o.wfx,
         o.vtimer,
         o.data_abort,
         o.hvc,
-        o.per_vcpu_exits
+        per_vcpu_summary(&o.per_vcpu)
+    );
+}
+
+/// 2 台構成の陽性（#3998・MVM-5・MVM-1・REPAIR-5・REPAIR-12）。AP が PSCI CPU_ON でオンラインになり、2 台とも回収される。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+, a binary signed with com.apple.security.hypervisor and a kernel with CONFIG_SMP (MVM-5)"]
+fn hvf_kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
+    let secs = boot_timeout_secs();
+    let _wd = Watchdog::start(overall_deadline(secs));
+    let inp = inputs(true, secs);
+    if let Some(p) = smp_disabling_param(&inp.cmdline) {
+        precondition(&format!(
+            "cmdline disables SMP (`{p}`); remove it for the two-vCPU case"
+        ));
+    }
+    require_vm_with_gic(&layout(2));
+    let (o, boot_timeout) = run_boot(inp, 2);
+    let diag = o.diag();
+    let irq = assert_boot_ok(&o, 2, boot_timeout, &diag);
+    for line in [ARM64_SMP_TOTAL_LINE, SMP_ONLINE_LINE] {
+        assert_eq!(
+            count_lines_ending_with(&o.output, line),
+            1,
+            "expected exactly one `{line}` line: {diag}"
+        );
+    }
+    assert_eq!(
+        count_lines_containing(&o.output, AP_BOOTED_PREFIX),
+        1,
+        "expected exactly one `{AP_BOOTED_PREFIX}` line (MPIDR must match the FDT): {diag}"
+    );
+    assert_eq!(o.per_vcpu.len(), 2, "per-vcpu stats: {diag}");
+    // AP が実際に走ったこと（`hvf_device_smp_cpu_on_boots_ap` と同じ基準。exits の下限は根拠が無いので見ない）。
+    let ap_runs = o.per_vcpu.get(1).map(|s| s.runs).unwrap_or(0);
+    assert!(ap_runs >= 1, "vcpu 1 never ran (ap_runs={ap_runs}): {diag}");
+    eprintln!(
+        "hvf_kernel_boot: ok arch=aarch64 case=two_vcpus reason=guest_shutdown ttys0_irq={irq} elapsed_ms={} exits={} wfx={} vtimer={} data_abort={} hvc={} per_vcpu={}",
+        o.elapsed.as_millis(),
+        o.exits,
+        o.wfx,
+        o.vtimer,
+        o.data_abort,
+        o.hvc,
+        per_vcpu_summary(&o.per_vcpu)
     );
 }
 
@@ -418,4 +500,39 @@ fn mvm5_3986_layout_without_virtio_is_valid() {
     );
     assert_eq!(l.virtio_spi_trigger, IrqTrigger::EdgeRising);
     assert_eq!(layout(2).vcpus, 2);
+}
+
+/// vCPU ごとの統計の整形は空白なしの 1 トークンで、空の入力は空文字列（MVM-5・#3998）。
+#[test]
+fn mvm5_3998_per_vcpu_summary_lists_each_vcpu() {
+    let a = HvRunStats {
+        runs: 12,
+        exits: 9,
+        deadline_exceeded: 3,
+        errors: 0,
+        total_elapsed: Duration::from_millis(810),
+    };
+    let b = HvRunStats {
+        runs: 7,
+        exits: 4,
+        deadline_exceeded: 3,
+        errors: 0,
+        total_elapsed: Duration::from_millis(790),
+    };
+    assert_eq!(
+        per_vcpu_summary(&[a, b]),
+        "vcpu0(runs=12,exits=9,deadline_exceeded=3,errors=0,run_ms=810);\
+         vcpu1(runs=7,exits=4,deadline_exceeded=3,errors=0,run_ms=790)"
+    );
+    assert_eq!(per_vcpu_summary(&[]), "");
+}
+
+/// 既定の cmdline は SMP を無効化せず、`force_panic_zero` 後も同じ（2 台の試験が前提欠如にならない。MVM-5・#3998）。
+#[test]
+fn mvm5_3998_default_cmdline_keeps_smp() {
+    assert_eq!(smp_disabling_param(DEFAULT_CMDLINE), None);
+    assert_eq!(
+        smp_disabling_param(&force_panic_zero(DEFAULT_CMDLINE)),
+        None
+    );
 }

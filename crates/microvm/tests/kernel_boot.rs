@@ -96,7 +96,7 @@ fn open_kvm() -> fandhe_container_microvm::device::KvmDevice {
 #[path = "support/guest_boot.rs"]
 mod guest_boot;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use guest_boot::{MARKER, count_marker_lines, escape_tail};
+use guest_boot::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
 
 /// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
 /// `block_sentinel`（x86 の単体テストで照合）。x86_64 と aarch64（#3947）の試験が共有する（複製しない・REPAIR-1）。
@@ -108,20 +108,6 @@ const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
 /// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
-
-/// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
-/// x86_64 の SMP 照合（#3888）と aarch64 の SMP 照合（#3899）が共有する（複製しない・REPAIR-1）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
-    output
-        .split(|b| *b == b'\n')
-        .filter(|line| {
-            line.strip_suffix(b"\r")
-                .unwrap_or(line)
-                .ends_with(suffix.as_bytes())
-        })
-        .count()
-}
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use fandhe_container_microvm::device::{RunObserver, RunOutcome, RunRecord};
@@ -596,7 +582,7 @@ mod net_fixture_tests {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::guest_boot::read_bounded;
+    use super::guest_boot::{SMP_ONLINE_LINE, read_bounded};
     use super::{
         BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
         NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
@@ -637,10 +623,6 @@ mod x86 {
     fn validate_cmdline(raw: Option<&str>) -> Result<String, String> {
         guest_boot::validate_cmdline_or(raw, DEFAULT_CMDLINE)
     }
-
-    /// 2 CPU がオンラインになった行（Linux v6.12 `kernel/smp.c` の `smp_init()` の `pr_info`。`CONFIG_NUMA=n` で node は 1）。
-    /// `CONFIG_PRINTK_TIME` の接頭辞（`[    0.1] `）を許すため、行末一致で数える。
-    const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
 
     struct Outcome {
         reason: StopReason,
@@ -1408,29 +1390,6 @@ mod x86 {
     }
 
     #[test]
-    fn mvm1_3888_count_lines_ending_with() {
-        let l = SMP_ONLINE_LINE;
-        assert_eq!(count_lines_ending_with(b"", l), 0);
-        assert_eq!(count_lines_ending_with(format!("{l}\r\n").as_bytes(), l), 1);
-        assert_eq!(
-            count_lines_ending_with(format!("[    0.123456] {l}\n").as_bytes(), l),
-            1
-        );
-        assert_eq!(count_lines_ending_with(format!("{l}y\n").as_bytes(), l), 0);
-        assert_eq!(
-            count_lines_ending_with(
-                b"smp: Brought up 1 node, 1 CPU\nsmp: Brought up 1 node, 12 CPUs\n",
-                l
-            ),
-            0
-        );
-        assert_eq!(
-            count_lines_ending_with(format!("{l}\nx\n[ 1.0] {l}\n").as_bytes(), l),
-            2
-        );
-    }
-
-    #[test]
     fn mvm1_3771_parse_boot_timeout() {
         assert_eq!(parse_boot_timeout(None), Ok(60));
         assert_eq!(parse_boot_timeout(Some("1")), Ok(1));
@@ -1462,7 +1421,9 @@ mod x86 {
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
     use super::guest_boot::{
-        TtyAddress, TtyReport, force_panic_zero, parse_tty_report, read_bounded,
+        AP_BOOTED_PREFIX, ARM64_SMP_TOTAL_LINE, SMP_ONLINE_LINE, TtyAddress, TtyReport,
+        count_lines_containing, force_panic_zero, parse_tty_report, read_bounded,
+        smp_disabling_param,
     };
     use super::{
         BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
@@ -2310,32 +2271,6 @@ mod arm64 {
         assert!(hint.contains("MICROVM_TEST_INITRD_ARCH=aarch64"), "{hint}");
     }
 
-    /// 2 CPU がオンラインになった行（Linux v6.12 `arch/arm64/kernel/smp.c` の `smp_cpus_done()`。arm64 固有）。行末一致。
-    const ARM64_SMP_TOTAL_LINE: &str = "SMP: Total of 2 processors activated.";
-    /// 汎用の `kernel/smp.c` `smp_init()` の行（x86 と同じ書式。`CONFIG_NUMA=n` で node は 1）。行末一致。
-    const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
-    /// AP（vCPU 1）が起きた行の目印。`secondary_start_kernel` の `"CPU%u: Booted secondary processor 0x%010lx [0x%08x]"` のうち
-    /// MPIDR（`MPIDR_HWID_BITMASK` 後の affinity）が FDT の `cpu@1` の reg（1）と一致した値を含む前半。後半（MIDR）はホスト依存のため見ない。
-    const AP_BOOTED_PREFIX: &str = "CPU1: Booted secondary processor 0x0000000001";
-
-    /// `needle` を含む行の件数（`\r` は除く。後ろにホスト依存の値が続く行用）。
-    fn count_lines_containing(output: &[u8], needle: &str) -> usize {
-        output
-            .split(|b| *b == b'\n')
-            .filter(|line| {
-                line.windows(needle.len().max(1))
-                    .any(|w| w == needle.as_bytes())
-            })
-            .count()
-    }
-
-    /// 利用者の cmdline が SMP を無効化する指定（`nosmp`・`maxcpus=`）を含めば、その理由を返す（2 CPU の照合が成り立たないため）。
-    fn smp_disabling_param(cmdline: &str) -> Option<&str> {
-        cmdline
-            .split_ascii_whitespace()
-            .find(|w| *w == "nosmp" || w.starts_with("maxcpus="))
-    }
-
     /// 2 台構成の陽性（#3899・MVM-1・REPAIR-5・REPAIR-12）。AP が PSCI CPU_ON でオンラインになり、2 台とも回収される。
     #[test]
     #[ignore = "requires read/write access to /dev/kvm and a kernel with CONFIG_SMP (MVM-1)"]
@@ -2381,28 +2316,10 @@ mod arm64 {
         );
     }
 
-    /// MVM-1・#3899: 2 台構成の前提検査。SMP を無効化する cmdline を見分け、既定は通す。
+    /// MVM-1・#3899: 既定の cmdline は SMP を無効化しない（行照合・指定の見分けは `guest_boot` の単体試験）。
     #[test]
-    fn mvm1_3899_arm64_smp_cmdline_guard() {
+    fn mvm1_3899_arm64_default_cmdline_keeps_smp() {
         assert_eq!(smp_disabling_param(DEFAULT_CMDLINE), None);
-        assert_eq!(smp_disabling_param("console=ttyS0 nosmp"), Some("nosmp"));
-        assert_eq!(smp_disabling_param("maxcpus=1 x"), Some("maxcpus=1"));
-        assert_eq!(smp_disabling_param("nosmpx maxcpu=1"), None);
-        let l = format!(
-            "[    0.5] {ARM64_SMP_TOTAL_LINE}\r\nCPU1: Booted secondary processor 0x0000000001 [0x413fd0c1]\n"
-        );
-        assert_eq!(
-            count_lines_ending_with(l.as_bytes(), ARM64_SMP_TOTAL_LINE),
-            1
-        );
-        assert_eq!(count_lines_containing(l.as_bytes(), AP_BOOTED_PREFIX), 1);
-        assert_eq!(
-            count_lines_containing(
-                b"CPU1: Booted secondary processor 0x0000000101\n",
-                AP_BOOTED_PREFIX
-            ),
-            0
-        );
     }
 
     /// MVM-1・#3898: 既定の cmdline は `console=ttyS0` を含み、`force_panic_zero` 後も `panic=0` が末尾に残る。

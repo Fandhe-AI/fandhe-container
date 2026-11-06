@@ -199,6 +199,46 @@ pub fn parse_tty_report(output: &[u8], tty: &str) -> TtyReport {
     TtyReport::Found { address, irq }
 }
 
+/// 2 CPU がオンラインになった行（Linux v6.12 `arch/arm64/kernel/smp.c` の `smp_cpus_done()`。arm64 固有）。行末一致。
+pub const ARM64_SMP_TOTAL_LINE: &str = "SMP: Total of 2 processors activated.";
+/// 2 CPU がオンラインになった汎用の行（Linux v6.12 `kernel/smp.c` の `smp_init()` の `pr_info`。x86_64 と arm64 で同じ書式。
+/// `CONFIG_NUMA=n` で node は 1）。`CONFIG_PRINTK_TIME` の接頭辞（`[    0.1] `）を許すため、行末一致で数える。
+pub const SMP_ONLINE_LINE: &str = "smp: Brought up 1 node, 2 CPUs";
+/// AP（vCPU 1）が起きた行の目印。`secondary_start_kernel` の `"CPU%u: Booted secondary processor 0x%010lx [0x%08x]"` のうち
+/// MPIDR（`MPIDR_HWID_BITMASK` 後の affinity）が FDT の `cpu@1` の reg（1）と一致した値を含む前半。後半（MIDR）はホスト依存のため見ない。
+pub const AP_BOOTED_PREFIX: &str = "CPU1: Booted secondary processor 0x0000000001";
+
+/// 行末が `suffix` で終わる行の件数（`\r` は除く。接頭辞の時刻表示を許し、行頭の混入は区別しない）。
+/// x86_64 の SMP 照合（#3888）と arm64 の SMP 照合（KVM #3899・HVF #3998）が共有する（複製しない・REPAIR-1）。
+pub fn count_lines_ending_with(output: &[u8], suffix: &str) -> usize {
+    output
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            line.strip_suffix(b"\r")
+                .unwrap_or(line)
+                .ends_with(suffix.as_bytes())
+        })
+        .count()
+}
+
+/// `needle` を含む行の件数（`\r` は除く。後ろにホスト依存の値が続く行用）。
+pub fn count_lines_containing(output: &[u8], needle: &str) -> usize {
+    output
+        .split(|b| *b == b'\n')
+        .filter(|line| {
+            line.windows(needle.len().max(1))
+                .any(|w| w == needle.as_bytes())
+        })
+        .count()
+}
+
+/// 利用者の cmdline が SMP を無効化する指定（`nosmp`・`maxcpus=`）を含めば、その理由を返す（2 CPU の照合が成り立たないため）。
+pub fn smp_disabling_param(cmdline: &str) -> Option<&str> {
+    cmdline
+        .split_ascii_whitespace()
+        .find(|w| *w == "nosmp" || w.starts_with("maxcpus="))
+}
+
 /// 共有補助の単体試験（KVM・HVF 不要。取り込み側のどちらでも既定で走る。MVM-1・MVM-5・REPAIR-12）。
 #[cfg(test)]
 mod tests {
@@ -208,6 +248,53 @@ mod tests {
 
     const LINE: &str =
         "9000000.serial: ttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 115200) is a 16550A";
+
+    #[test]
+    fn mvm1_3888_count_lines_ending_with() {
+        let l = SMP_ONLINE_LINE;
+        assert_eq!(count_lines_ending_with(b"", l), 0);
+        assert_eq!(count_lines_ending_with(format!("{l}\r\n").as_bytes(), l), 1);
+        assert_eq!(
+            count_lines_ending_with(format!("[    0.123456] {l}\n").as_bytes(), l),
+            1
+        );
+        assert_eq!(count_lines_ending_with(format!("{l}y\n").as_bytes(), l), 0);
+        assert_eq!(
+            count_lines_ending_with(
+                b"smp: Brought up 1 node, 1 CPU\nsmp: Brought up 1 node, 12 CPUs\n",
+                l
+            ),
+            0
+        );
+        assert_eq!(
+            count_lines_ending_with(format!("{l}\nx\n[ 1.0] {l}\n").as_bytes(), l),
+            2
+        );
+    }
+
+    /// MVM-1・#3899・#3998: SMP を無効化する cmdline の見分けと、arm64 の SMP 行の照合（KVM・HVF 共通）。
+    #[test]
+    fn mvm1_3899_arm64_smp_cmdline_guard() {
+        assert_eq!(smp_disabling_param("console=ttyS0 rdinit=/init"), None);
+        assert_eq!(smp_disabling_param("console=ttyS0 nosmp"), Some("nosmp"));
+        assert_eq!(smp_disabling_param("maxcpus=1 x"), Some("maxcpus=1"));
+        assert_eq!(smp_disabling_param("nosmpx maxcpu=1"), None);
+        let l = format!(
+            "[    0.5] {ARM64_SMP_TOTAL_LINE}\r\nCPU1: Booted secondary processor 0x0000000001 [0x413fd0c1]\n"
+        );
+        assert_eq!(
+            count_lines_ending_with(l.as_bytes(), ARM64_SMP_TOTAL_LINE),
+            1
+        );
+        assert_eq!(count_lines_containing(l.as_bytes(), AP_BOOTED_PREFIX), 1);
+        assert_eq!(
+            count_lines_containing(
+                b"CPU1: Booted secondary processor 0x0000000101\n",
+                AP_BOOTED_PREFIX
+            ),
+            0
+        );
+    }
 
     #[test]
     fn mvm1_3958_parse_tty_report_irq_values() {

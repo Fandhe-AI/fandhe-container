@@ -53,8 +53,8 @@ const MACOS_MIN_VERSION_INSTRUCTIONS: &str = "Requires macOS 13 or later (provis
 
 /// macOS: microVM バックエンド（Hypervisor.framework）の entitlement と署名の手順の固定文言（`fandhe-container-plugin-microvm` の前提。
 /// `docs/setup/macos.md`「microVM（Hypervisor.framework）の entitlement とコード署名」と同じ手順。MVM-5・MAC-1・CLI-2・#3935）。
-/// ad-hoc 署名で受理されるかは実機未確認（#3803）のため、受理されるとは書かず、コマンドの例として示すだけにする（REPAIR-3）。
-const HYPERVISOR_ENTITLEMENT_INSTRUCTIONS: &str = "Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm> (whether ad-hoc signing is accepted is unverified). Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md";
+/// ad-hoc 署名は実機で受理された（macOS 27.2・Apple M4 Max・#3803）。
+const HYPERVISOR_ENTITLEMENT_INSTRUCTIONS: &str = "Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm>. Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md";
 
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +257,7 @@ mod tests {
     const LINUX_LINE: &str = "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n";
 
     /// 期待する macOS の microVM 段の出力行（具体値。MVM-5・#3935）。
-    const MAC_HYPERVISOR_LINE: &str = "{\"step\":\"hypervisor-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"condition\":\"microvm\",\"instructions\":\"Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm> (whether ad-hoc signing is accepted is unverified). Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md\"}\n";
+    const MAC_HYPERVISOR_LINE: &str = "{\"step\":\"hypervisor-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"condition\":\"microvm\",\"instructions\":\"Only for the microVM backend (Hypervisor.framework; Apple Silicon with macOS 15 or later). The microVM backend plugin fandhe-container-plugin-microvm must be code-signed with the com.apple.security.hypervisor entitlement, e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.hypervisor> <path to fandhe-container-plugin-microvm>. Re-sign after every rebuild. fandhe-container does not sign binaries. See docs/setup/macos.md\"}\n";
 
     /// CLI-2・SUP-14・CORE-6: Linux は rootful だけ要る特権ランチャーのインストール手順を返し、未対応 OS は空。
     #[test]

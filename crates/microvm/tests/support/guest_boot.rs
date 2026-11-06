@@ -199,6 +199,104 @@ pub fn parse_tty_report(output: &[u8], tty: &str) -> TtyReport {
     TtyReport::Found { address, irq }
 }
 
+// --- serial-echo（#3987・MVM-5・MVM-1）: UART の送受信の照合に使う固定文字列と `/proc/interrupts` の解析 ---
+// 正本は `scripts/build-microvm-test-initrd.sh` の `serial_*`（単体試験で行頭の名前を抜き出して照合する）。
+
+/// 送信 FIFO（16 バイト）の 10 倍の行（改行は含まない。159 バイト）。THRE 割り込みで送信が進まないと完走しない。
+pub const SERIAL_TX_LINE: &str = "fandhe-microvm-test: serial tx \
+     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// 送信の完走（tcdrain の復帰）の後にゲストが出す行。ホストはこれを見てから入力を押す。
+pub const SERIAL_READY: &str = "fandhe-microvm-test: serial ready v1";
+/// ゲストが読んだ入力の前に付ける接頭辞（末尾の空白 1 個を含む）。
+pub const SERIAL_RX_PREFIX: &str = "fandhe-microvm-test: serial rx ";
+/// 全往復と 2 回目の `/proc/interrupts` の出力が済んだ印。
+pub const SERIAL_OK: &str = "fandhe-microvm-test: serial echo ok v1";
+/// `ppoll`（5 秒）が入力無しで切れたときの行。
+pub const SERIAL_RX_TIMEOUT: &str = "fandhe-microvm-test: serial rx timeout v1";
+/// syscall の失敗の行。
+pub const SERIAL_FAILED: &str = "fandhe-microvm-test: serial echo failed v1";
+/// ゲストが入力を待って書き戻す往復の回数（機械語のループ回数に固定）。
+pub const SERIAL_RX_ROUNDS: usize = 4;
+
+/// `/proc/interrupts` の 1 行（名前が一致したもの）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqRow {
+    /// CPU ごとの回数の合計。
+    pub count: u64,
+    /// コントローラ内の番号（GIC では INTID。SPI n は `n + 32`）。先頭の virq ではない。
+    pub hwirq: u32,
+    /// `Level`（偽なら `Edge`）。
+    pub level: bool,
+}
+
+/// `/proc/interrupts` から、割り込みの名前が `name` の行を読む。
+///
+/// 期待する形は arm64 の `13:  123  GICv3  33 Level  ttyS0`（virq・CPU ごとの回数・コントローラ名・hwirq・
+/// トリガ・名前。Linux の `kernel/irq/proc.c` の `show_interrupts` と `GENERIC_IRQ_SHOW_LEVEL` による。
+/// 版を固定した一次情報での照合は未実施）。行頭が `<数字>:` で、最後のトークンが `name` の行だけを対象にし、
+/// 8250 の登録行（`... ttyS0 at MMIO ...`）は拾わない。対象の行の形が崩れていれば `Err`（失敗の種類を潰さない）。
+/// ゲスト出力は非信頼入力なので、添字・`unwrap` を使わず、件数・桁数に上限を置き、加算は checked にする。
+pub fn parse_irq_rows(output: &[u8], name: &str) -> Result<Vec<IrqRow>, &'static str> {
+    const MAX_ROWS: usize = 16;
+    const MAX_TOKENS: usize = 4096;
+    let mut rows = Vec::new();
+    for raw in output.split(|b| *b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        if line.split_whitespace().next_back() != Some(name) {
+            continue;
+        }
+        let token_count = line.split_whitespace().count();
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Some(virq) = first.strip_suffix(':') else {
+            continue;
+        };
+        if virq.is_empty() || !virq.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if token_count > MAX_TOKENS {
+            return Err("too many tokens in an interrupt row");
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some((_, rest)) = tokens.split_first() else {
+            continue;
+        };
+        // 右から: 名前・トリガ・hwirq。残りは CPU ごとの回数（1 個以上）とコントローラ名（1 個以上）。
+        let [middle @ .., hwirq, kind, _name] = rest else {
+            return Err("interrupt row is too short");
+        };
+        let level = match *kind {
+            "Level" => true,
+            "Edge" => false,
+            _ => return Err("unknown trigger kind"),
+        };
+        let hwirq: u32 = hwirq.parse().map_err(|_| "hwirq is not a number")?;
+        let mut count: u64 = 0;
+        let mut counted = 0usize;
+        for t in middle {
+            let Ok(n) = t.parse::<u64>() else { break };
+            count = count.checked_add(n).ok_or("interrupt count overflow")?;
+            counted += 1;
+        }
+        if counted == 0 || counted >= middle.len() {
+            return Err("missing per-cpu counts or controller name");
+        }
+        if rows.len() >= MAX_ROWS {
+            return Err("too many matching interrupt rows");
+        }
+        rows.push(IrqRow {
+            count,
+            hwirq,
+            level,
+        });
+    }
+    Ok(rows)
+}
+
 /// 共有補助の単体試験（KVM・HVF 不要。取り込み側のどちらでも既定で走る。MVM-1・MVM-5・REPAIR-12）。
 #[cfg(test)]
 mod tests {
@@ -356,5 +454,111 @@ mod tests {
             .expect("read_bounded blocked on FIFO");
         assert_eq!(r.unwrap_err(), "not a regular file");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const IRQ_ROW: &str = " 13:        123  GICv3  33 Level     ttyS0\n";
+
+    #[test]
+    fn mvm5_3987_parse_irq_rows_values() {
+        let p = |s: &str| parse_irq_rows(s.as_bytes(), "ttyS0");
+        let expect = IrqRow {
+            count: 123,
+            hwirq: 33,
+            level: true,
+        };
+        assert_eq!(p(IRQ_ROW), Ok(vec![expect]));
+        assert_eq!(p(&IRQ_ROW.replace('\n', "\r\n")), Ok(vec![expect]));
+        // 2 CPU は合計する。
+        assert_eq!(
+            p(" 13:   100    23  GICv3  33 Level  ttyS0\n"),
+            Ok(vec![expect])
+        );
+        assert_eq!(
+            p(" 9:  5  GICv3  27 Edge  timer\n 13:  1  GICv3  33 Edge  ttyS0\n"),
+            Ok(vec![IrqRow {
+                count: 1,
+                hwirq: 33,
+                level: false
+            }])
+        );
+        // 2 回の出力は 2 行になる。
+        assert_eq!(p(&format!("{IRQ_ROW}x\n{IRQ_ROW}")).map(|v| v.len()), Ok(2));
+    }
+
+    #[test]
+    fn mvm5_3987_parse_irq_rows_ignores_other_lines() {
+        let p = |s: &str| parse_irq_rows(s.as_bytes(), "ttyS0");
+        assert_eq!(p(""), Ok(vec![]));
+        // 8250 の登録行・名前が部分一致の行・別の名前の行は拾わない。
+        assert_eq!(
+            p("9000000.serial: ttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 1) is a 16550A\n"),
+            Ok(vec![])
+        );
+        assert_eq!(p(" 13:  1  GICv3  33 Level  xttyS0\n"), Ok(vec![]));
+        assert_eq!(p(" 13:  1  GICv3  33 Level  ttyS01\n"), Ok(vec![]));
+        assert_eq!(p("IPI0:  1  Rescheduling interrupts\n"), Ok(vec![]));
+        assert_eq!(parse_irq_rows(b"\xff\xfe 13: ttyS0\n", "ttyS0"), Ok(vec![]));
+    }
+
+    #[test]
+    fn mvm5_3987_parse_irq_rows_malformed_and_overflow() {
+        let p = |s: &str| parse_irq_rows(s.as_bytes(), "ttyS0");
+        for bad in [
+            " 13: ttyS0\n",
+            " 13:  1  33 Level  ttyS0\n",
+            " 13:  GICv3  33 Level  ttyS0\n",
+            " 13:  1  GICv3  33 Other  ttyS0\n",
+            " 13:  1  GICv3  abc Level  ttyS0\n",
+            " 13:  1  GICv3  4294967296 Level  ttyS0\n",
+            " 13:  18446744073709551615 1  GICv3  33 Level  ttyS0\n",
+            " 13:  99999999999999999999  GICv3  33 Level  ttyS0\n",
+        ] {
+            assert!(p(bad).is_err(), "{bad}");
+        }
+        let many = IRQ_ROW.repeat(17);
+        assert_eq!(p(&many), Err("too many matching interrupt rows"));
+        let long = format!(" 13: {} GICv3 33 Level ttyS0\n", "1 ".repeat(5000));
+        assert_eq!(p(&long), Err("too many tokens in an interrupt row"));
+    }
+
+    #[test]
+    fn mvm5_3987_serial_constants_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        for (name, value) in [
+            ("serial_tx_line", SERIAL_TX_LINE),
+            ("serial_ready_message", SERIAL_READY),
+            ("serial_rx_prefix", SERIAL_RX_PREFIX),
+            ("serial_ok_message", SERIAL_OK),
+            ("serial_rx_timeout_message", SERIAL_RX_TIMEOUT),
+            ("serial_failed_message", SERIAL_FAILED),
+        ] {
+            assert_eq!(
+                find(&format!("{name}=\"")),
+                vec![value.to_owned()],
+                "{name}"
+            );
+        }
+        assert!(
+            text.lines()
+                .any(|l| l == format!("serial_rx_rounds={SERIAL_RX_ROUNDS}"))
+        );
+        // 機械語の mov x2 に焼き込まれた長さ。
+        assert_eq!(SERIAL_TX_LINE.len() + 1, 160);
+        assert_eq!(SERIAL_TX_LINE.len(), 16 * 10 - 1);
+        assert_eq!(SERIAL_READY.len() + 1, 37);
+        assert_eq!(SERIAL_RX_PREFIX.len(), 31);
+        assert_eq!(SERIAL_OK.len() + 1, 39);
+        assert_eq!(SERIAL_RX_TIMEOUT.len() + 1, 42);
+        assert_eq!(SERIAL_FAILED.len() + 1, 43);
+        assert!(SERIAL_RX_PREFIX.ends_with(' '));
     }
 }

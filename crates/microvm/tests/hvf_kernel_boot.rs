@@ -7,6 +7,7 @@
 //! 非圧縮の arm64 `Image`、`MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build` の出力。root は不要。
 //! 手順は `docs/verification/real-machine-tests.md` の `hvf_kernel_boot` の項。1 プロセス 1 VM のため `--test-threads=1` で実行する。
 //! 環境変数: `FANDHE_CONTAINER_MICROVM_KERNEL`（必須）・`_INITRD`（既定 `target/microvm-test-initrd/aarch64/initrd.cpio`）・
+//! `_SERIAL_INITRD`（UART 試験用。既定 `target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio`。#3987）・
 //! `_CMDLINE`（既定 `console=ttyS0 rdinit=/init`。末尾に `panic=0` を足す）・`_BOOT_TIMEOUT_SECS`（1..=600、既定 60）。
 //!
 //! 観測手段: ゲストの `/init` がシリアル（ns16550a の MMIO）へ書く固定文字列（`MARKER`）を行単位でちょうど 1 回数え、停止理由が
@@ -14,6 +15,18 @@
 //! 0 バイトであることを具体値で照合する。`ttyS0 at MMIO 0x9000000 (irq = N, ...)` の行から、シリアルが割り込みで結線されている
 //! こと（`N != 0`）も見る。期限切れで `stop` した `Requested` は合格にしない。負の対照は initrd 無しで、期限まで止まらないことを見る。
 //! 起点 vCPU は `HvfStopReport` に無いため照合しない（`kernel_boot` の KVM 版との差）。
+//!
+//! UART の送受信（#3987・MVM-5・MVM-1。`serial-echo` の initrd）: ゲストが `/dev/ttyS0` へ送信 FIFO（16 バイト）の 10 倍の行を書いて
+//! `tcdrain` し（THRE 割り込み #3892 が進まないと止まる）、ready を出す。ホストの起動スレッド（vCPU 以外のホストスレッド）が
+//! `SerialConsole::push_input`（#3893）で改行つきの行を 4 回押し、ゲストが読んだ行へ接頭辞を付けて書き戻すことを、
+//! 「接頭辞 + 入力」の行がちょうど 1 回出ることで照合する（tty の ECHO は入力そのものを返すため、入力の文字列だけでは根拠にならない）。
+//! 割り込みは `/proc/interrupts` を 2 回（最初と最後に）出させ、`ttyS0` の行の回数が `SERIAL_RX_ROUNDS + 1` 以上増えることで見る。
+//! 下限が「送信バイト数 / 16」でない理由: Linux の 8250 の割り込みハンドラは IIR が保留を返す間は同じ呼び出しの中で回るため、
+//! 即時に THRE が立つモデルでは長い行でも 1 回で済みうる（8250_core.c の挙動。版を固定した照合は未実施）。
+//! 入力だけの増分は分離しない（snapshot の出力自体が送信割り込みを起こすため）。入力の経路の証跡は書き戻しの行と `input_read_bytes`。
+//! `push_input` からゲストの RBR 読み出しまでの遅れ（`WFI_WAIT_MAX` の 10 ms との比較用）は観測の行へ出すだけで assert しない
+//! （実行環境で揺れる。判定は #3988）。負の対照は入力を押さない版で、ゲストが rx timeout に落ち、書き戻しが入力に由来することを裏づける。
+//! `/init` は最初に `syslog(CONSOLE_OFF)` で printk を止める（非同期の printk が行の途中へ割り込み、行単位の照合が偽の失敗になるのを防ぐ）。
 //!
 //! 全体期限（REPAIR-5）: `.cargo/config.toml` の watchdog は `--ignored` を素通しするため、本試験自身の `Watchdog`
 //! （超過で `hvf_kernel_boot: WATCHDOG EXPIRED` と終了コード 124）・ポーリング期限・`stop` の期限・外側の `recv_timeout` が層になる。
@@ -28,25 +41,28 @@
 //! - `guest/kernel/` の Kconfig が本試験の Image に適するかは確かめていない（適すると書かない）。
 //!
 //! 未実装（REPAIR-3）: virtio-block の block-read を割り込み trigger 2 構成（edge / LevelHigh）で起動する試験は、HVF 側が
-//! `QueueNotify` を処理する経路（#3908）が無いため足していない。vCPU 2 台（#3998）・UART の入出力（#3987）はこの試験の上に足す。
-//! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない。
+//! `QueueNotify` を処理する経路（#3908）が無いため足していない。vCPU 2 台（#3998）はこの試験の上に足す。
+//! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない（`serial-echo` の `/init` も未実行）。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 #[path = "support/guest_boot.rs"]
 mod guest_boot;
 
-use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, Arm64Layout};
+use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, ARM64_SERIAL_SPI, Arm64Layout};
 use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
 use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::hvf::{HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic};
+use fandhe_container_microvm::hvf_abi::WFI_WAIT_MAX;
 use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
 use fandhe_container_microvm::interrupt::IrqTrigger;
 use fandhe_container_microvm::stop::StopReason;
+use fandhe_container_microvm::uart::{SerialConsole, UartStats};
 use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
 use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 use guest_boot::{
-    MARKER, TtyAddress, TtyReport, count_marker_lines, escape_tail, force_panic_zero,
-    parse_tty_report, read_bounded,
+    MARKER, SERIAL_FAILED, SERIAL_OK, SERIAL_READY, SERIAL_RX_PREFIX, SERIAL_RX_ROUNDS,
+    SERIAL_RX_TIMEOUT, SERIAL_TX_LINE, TtyAddress, TtyReport, count_marker_lines, escape_tail,
+    force_panic_zero, parse_irq_rows, parse_tty_report, read_bounded,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,9 +135,37 @@ struct Inputs {
     secs: u64,
 }
 
-/// 前提を検査して入力を作る。欠如は skip せず `precondition` で落とす。`with_initrd` が偽なら initrd を読まない（負の対照）。
+/// 使う initrd の種類（`scripts/build-microvm-test-initrd.sh` の variant に対応。`--arch aarch64`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitrdKind {
+    /// initrd 無し（負の対照）。
+    None,
+    /// 固定文字列を書いて reboot するだけの版（`FANDHE_CONTAINER_MICROVM_INITRD`）。
+    Default,
+    /// UART の送受信を照合する版（`FANDHE_CONTAINER_MICROVM_SERIAL_INITRD`。#3987）。
+    SerialEcho,
+}
+
+/// initrd の種類ごとの（環境変数名・既定の相対パス・生成コマンドのヒント）。`None` には initrd が無い。
+fn initrd_spec(kind: InitrdKind) -> Option<(&'static str, &'static str, &'static str)> {
+    match kind {
+        InitrdKind::None => None,
+        InitrdKind::Default => Some((
+            "FANDHE_CONTAINER_MICROVM_INITRD",
+            "../../target/microvm-test-initrd/aarch64/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build",
+        )),
+        InitrdKind::SerialEcho => Some((
+            "FANDHE_CONTAINER_MICROVM_SERIAL_INITRD",
+            "../../target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=serial-echo make microvm-test-initrd-build",
+        )),
+    }
+}
+
+/// 前提を検査して入力を作る。欠如は skip せず `precondition` で落とす。`kind` が `None` なら initrd を読まない（負の対照）。
 /// 呼び出し順: 期限の解釈 → watchdog の開始（`start_watchdog`）→ 本関数。ここでの読み込みは上限つき・`O_NONBLOCK`。
-fn inputs(with_initrd: bool, secs: u64) -> Inputs {
+fn inputs(kind: InitrdKind, secs: u64) -> Inputs {
     let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
         Ok(p) if !p.is_empty() => p,
         _ => precondition("FANDHE_CONTAINER_MICROVM_KERNEL is not set (path to an arm64 Image)"),
@@ -133,17 +177,13 @@ fn inputs(with_initrd: bool, secs: u64) -> Inputs {
             "kernel image is not an uncompressed arm64 Image: {e}"
         ));
     }
-    let initrd = with_initrd.then(|| {
-        let path = match std::env::var("FANDHE_CONTAINER_MICROVM_INITRD") {
+    let initrd = initrd_spec(kind).map(|(var, default_rel, hint)| {
+        let path = match std::env::var(var) {
             Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/microvm-test-initrd/aarch64/initrd.cpio"),
+            _ => Path::new(env!("CARGO_MANIFEST_DIR")).join(default_rel),
         };
-        read_bounded(&path, INITRD_CAP).unwrap_or_else(|e| {
-            precondition(&format!(
-                "initrd (run `MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build`): {e}"
-            ))
-        })
+        read_bounded(&path, INITRD_CAP)
+            .unwrap_or_else(|e| precondition(&format!("initrd (run `{hint}`): {e}")))
     });
     let cmdline = guest_boot::validate_cmdline_or(
         std::env::var("FANDHE_CONTAINER_MICROVM_CMDLINE")
@@ -196,6 +236,12 @@ struct Outcome {
     per_vcpu_exits: Vec<u64>,
     output: Vec<u8>,
     uart_dropped: u64,
+    /// 停止後の UART の計数（入力の受理・読み出し・破棄。#3987）。
+    uart: UartStats,
+    /// `push_input` からゲストの RBR 読み出しまでの遅れ（往復ごと。`Interaction::SerialEcho` のみ）。
+    rx_latencies: Vec<Duration>,
+    /// 対話の状態機械が失敗したときの理由（失敗でも `stop` まで進める。REPAIR-5）。
+    interaction_error: Option<String>,
     timed_out: bool,
     elapsed: Duration,
     /// exit の種別ごとの回数（診断・#3988 の判断材料。値は assert しない）。
@@ -209,7 +255,8 @@ impl Outcome {
     fn diag(&self) -> String {
         format!(
             "reason={:?} vcpus={} errors={} exits={} per_vcpu_exits={:?} wfx={} vtimer={} data_abort={} hvc={} \
-             timed_out={} elapsed={:?} uart_dropped={} output_len={} output_tail=\"{}\"",
+             timed_out={} elapsed={:?} uart_dropped={} uart={:?} rx_latencies={:?} interaction_error={:?} \
+             output_len={} output_tail=\"{}\"",
             self.reason,
             self.vcpu_count,
             self.errors,
@@ -222,15 +269,138 @@ impl Outcome {
             self.timed_out,
             self.elapsed,
             self.uart_dropped,
+            self.uart,
+            self.rx_latencies,
+            self.interaction_error,
             self.output.len(),
             escape_tail(&self.output, TAIL_BYTES)
         )
     }
 }
 
+/// 起動スレッドの中でホスト側が行う対話。`RunningHvfMicroVm` は `!Send` なので閉包にせず、データ（`Send`）として渡して
+/// 起動スレッドの中で駆動する。`push_input` は vCPU ではないホストスレッドから呼ぶ（`hv_gic_set_spi` の非 vCPU スレッドからの経路。#3803）。
+enum Interaction {
+    /// 何もしない（既存の 2 試験と、入力を押さない負の対照）。
+    None,
+    /// `serial-echo` の initrd に対し、ready を見て 4 回の行を押し、書き戻しを待つ。
+    SerialEcho(SerialEcho),
+}
+
+/// 押す行。往復ごとに別の文字列にし、内容と順序の取り違えを検出する。
+fn echo_input(round: usize) -> String {
+    format!("echo-{round}\n")
+}
+
+/// 書き戻しの行（`SERIAL_RX_PREFIX` + 入力から改行を除いたもの）。
+fn echo_reply(round: usize) -> String {
+    format!("{SERIAL_RX_PREFIX}echo-{round}")
+}
+
+/// `push_input` の前に待機中のゲストへ空ける間隔。待機中（WFI）の起床を測るため。
+const ECHO_IDLE: Duration = Duration::from_millis(50);
+/// RBR の読み出しを待つ上限（スピン。sleep しない）。
+const ECHO_READ_WAIT: Duration = Duration::from_secs(2);
+/// 書き戻しの行を待つ上限。
+const ECHO_REPLY_WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy)]
+enum EchoStage {
+    WaitReady,
+    Idle(Instant),
+    AwaitReply(Instant),
+    Done,
+}
+
+struct SerialEcho {
+    stage: EchoStage,
+    round: usize,
+    pushed_bytes: u64,
+    latencies: Vec<Duration>,
+    error: Option<String>,
+}
+
+impl SerialEcho {
+    fn new() -> Self {
+        Self {
+            stage: EchoStage::WaitReady,
+            round: 0,
+            pushed_bytes: 0,
+            latencies: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// 1 ループ分進める。失敗は `error` に残して `Done` にする（呼び出し側が loop を抜けて必ず `stop` する）。
+    fn step(&mut self, serial: &SerialConsole, output: &[u8]) {
+        match self.stage {
+            EchoStage::WaitReady => {
+                if count_marker_lines(output, SERIAL_READY) >= 1 {
+                    self.stage = EchoStage::Idle(Instant::now());
+                }
+            }
+            EchoStage::Idle(since) => {
+                if since.elapsed() >= ECHO_IDLE {
+                    self.push(serial);
+                }
+            }
+            EchoStage::AwaitReply(since) => {
+                if count_marker_lines(output, &echo_reply(self.round)) >= 1 {
+                    self.round += 1;
+                    self.stage = if self.round >= SERIAL_RX_ROUNDS {
+                        EchoStage::Done
+                    } else {
+                        EchoStage::Idle(Instant::now())
+                    };
+                } else if since.elapsed() >= ECHO_REPLY_WAIT {
+                    self.fail(format!("no reply line for round {}", self.round));
+                }
+            }
+            EchoStage::Done => {}
+        }
+    }
+
+    fn fail(&mut self, reason: String) {
+        self.error = Some(reason);
+        self.stage = EchoStage::Done;
+    }
+
+    /// 1 行を押し、ゲストが RBR を読むまでをスピンで測る。
+    fn push(&mut self, serial: &SerialConsole) {
+        let line = echo_input(self.round);
+        let before = match serial.stats() {
+            Ok(st) => st,
+            Err(e) => return self.fail(format!("stats failed: {e}")),
+        };
+        let t0 = Instant::now();
+        match serial.push_input(line.as_bytes()) {
+            Ok(r) if r.accepted == line.len() && r.dropped == 0 => {}
+            Ok(r) => return self.fail(format!("push_input partial: {r:?}")),
+            Err(e) => return self.fail(format!("push_input failed: {e}")),
+        }
+        self.pushed_bytes += line.len() as u64;
+        let target = before.input_read_bytes + line.len() as u64;
+        loop {
+            match serial.stats() {
+                Ok(st) if st.input_read_bytes >= target => {
+                    self.latencies.push(t0.elapsed());
+                    break;
+                }
+                Ok(_) if t0.elapsed() >= ECHO_READ_WAIT => {
+                    return self.fail(format!("guest did not read round {}", self.round));
+                }
+                Ok(_) => std::thread::yield_now(),
+                Err(e) => return self.fail(format!("stats failed: {e}")),
+            }
+        }
+        self.stage = EchoStage::AwaitReply(Instant::now());
+    }
+}
+
 /// 起動して停止まで見る。`RunningHvfMicroVm` は `!Send` なので、組み立てから停止までこのスレッドの中で完結させる。
-/// `kernel_boot` の `boot` と同じ順序: `serial_console` を start の前に取り、10 ms ごとに取り出し、期限切れでも必ず `stop` する。
-fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
+/// `kernel_boot` の `boot` と同じ順序: `serial_console` を start の前に取り、10 ms ごと（対話中は 1 ms）に取り出し、
+/// 期限切れ・対話の失敗でも必ず `stop` する。
+fn boot(inp: Inputs, vcpus: u32, mut interaction: Interaction) -> Result<Outcome, String> {
     let started = Instant::now();
     let boot_timeout = Duration::from_secs(inp.secs);
     let counts = Arc::new(ExitCounts::new());
@@ -255,6 +425,11 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
     let running = vm.start().map_err(|e| format!("start failed: {e}"))?;
     let mut output: Vec<u8> = Vec::new();
     let mut timed_out = false;
+    let mut interaction_error: Option<String> = None;
+    let poll_interval = match interaction {
+        Interaction::None => Duration::from_millis(10),
+        Interaction::SerialEcho(_) => Duration::from_millis(1),
+    };
     loop {
         let chunk = serial
             .take_output()
@@ -263,6 +438,13 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         if output.len() > OUTPUT_CAP {
             return Err("guest serial output exceeded the test cap".into());
         }
+        if let Interaction::SerialEcho(echo) = &mut interaction {
+            echo.step(&serial, &output);
+            if let Some(e) = echo.error.clone() {
+                interaction_error = Some(e);
+                break;
+            }
+        }
         if running.is_finished() {
             break;
         }
@@ -270,7 +452,7 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
             timed_out = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(poll_interval);
     }
     // 起動予算の判定に使う経過時間は、停止条件を判定した直後（stop の前）に採る。
     // stop の join・出力の取り切りの時間を予算に含めない（timed_out の判定時点と揃える）。
@@ -284,10 +466,13 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         .take_output()
         .map_err(|e| format!("take_output failed: {e}"))?;
     output.extend_from_slice(&tail);
-    let uart_dropped = serial
+    let uart = serial
         .stats()
-        .map_err(|e| format!("uart stats failed: {e}"))?
-        .dropped_bytes;
+        .map_err(|e| format!("uart stats failed: {e}"))?;
+    let rx_latencies = match interaction {
+        Interaction::None => Vec::new(),
+        Interaction::SerialEcho(e) => e.latencies,
+    };
     Ok(Outcome {
         reason: report.reason,
         vcpu_count: report.vcpu_count,
@@ -295,7 +480,10 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
         exits: report.stats.exits,
         per_vcpu_exits: report.per_vcpu.iter().map(|s| s.exits).collect(),
         output,
-        uart_dropped,
+        uart_dropped: uart.dropped_bytes,
+        uart,
+        rx_latencies,
+        interaction_error,
         timed_out,
         elapsed,
         wfx: counts.count(ExitKind::Wfx),
@@ -306,12 +494,12 @@ fn boot(inp: Inputs, vcpus: u32) -> Result<Outcome, String> {
 }
 
 /// 別スレッドで `boot` を回し、外側の `recv_timeout` で必ず戻る。
-fn run_boot(inp: Inputs, vcpus: u32) -> (Outcome, Duration) {
+fn run_boot(inp: Inputs, vcpus: u32, interaction: Interaction) -> (Outcome, Duration) {
     let secs = inp.secs;
     let boot_timeout = Duration::from_secs(secs);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(boot(inp, vcpus));
+        let _ = tx.send(boot(inp, vcpus, interaction));
     });
     match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
         Ok(Ok(o)) => (o, boot_timeout),
@@ -326,9 +514,9 @@ fn run_boot(inp: Inputs, vcpus: u32) -> (Outcome, Duration) {
 fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
     let secs = boot_timeout_secs();
     let _wd = Watchdog::start(overall_deadline(secs));
-    let inp = inputs(true, secs);
+    let inp = inputs(InitrdKind::Default, secs);
     require_vm_with_gic(&layout(1));
-    let (o, boot_timeout) = run_boot(inp, 1);
+    let (o, boot_timeout) = run_boot(inp, 1, Interaction::None);
     let diag = o.diag();
     assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
     assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
@@ -376,9 +564,9 @@ fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
 fn hvf_kernel_boot_without_initrd_does_not_shut_down() {
     let secs = boot_timeout_secs();
     let _wd = Watchdog::start(overall_deadline(secs));
-    let inp = inputs(false, secs);
+    let inp = inputs(InitrdKind::None, secs);
     require_vm_with_gic(&layout(1));
-    let (o, _) = run_boot(inp, 1);
+    let (o, _) = run_boot(inp, 1, Interaction::None);
     let diag = o.diag();
     assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
     assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
@@ -391,6 +579,161 @@ fn hvf_kernel_boot_without_initrd_does_not_shut_down() {
         "init marker must not appear without an initrd: {diag}"
     );
     assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+}
+
+/// 行頭が `prefix` の行の件数（`SERIAL_RX_TIMEOUT` の行は接頭辞を共有するので除く）。
+fn count_reply_like_lines(output: &[u8]) -> usize {
+    output
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| {
+            l.starts_with(SERIAL_RX_PREFIX.as_bytes()) && *l != SERIAL_RX_TIMEOUT.as_bytes()
+        })
+        .count()
+}
+
+/// `serial-echo` の共通の停止条件（陽性・負の対照の両方）。
+fn assert_serial_common(o: &Outcome, diag: &str) {
+    assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+    assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+    assert_eq!(o.errors, 0, "run errors: {diag}");
+    assert!(!o.timed_out, "boot timed out: {diag}");
+    assert_eq!(o.interaction_error, None, "interaction: {diag}");
+    assert_eq!(o.uart.dropped_bytes, 0, "uart output dropped: {diag}");
+    assert_eq!(o.uart.irq_line_errors, 0, "irq line errors: {diag}");
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_TX_LINE),
+        1,
+        "tx line (10x the FIFO) must complete exactly once: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_READY),
+        1,
+        "ready line: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_FAILED),
+        0,
+        "guest reported a syscall failure: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, MARKER),
+        0,
+        "plain init marker must not appear: {diag}"
+    );
+}
+
+/// UART の送信（THRE 割り込み）・受信（`push_input`）・SPI 33 の割り込み数を実 Linux で確かめる（#3987・MVM-5・MVM-1）。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_serial_echo_tx_rx_and_irq_count() {
+    let secs = boot_timeout_secs();
+    let _wd = Watchdog::start(overall_deadline(secs));
+    let inp = inputs(InitrdKind::SerialEcho, secs);
+    require_vm_with_gic(&layout(1));
+    let (o, boot_timeout) = run_boot(inp, 1, Interaction::SerialEcho(SerialEcho::new()));
+    let diag = o.diag();
+    assert_serial_common(&o, &diag);
+    assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_OK),
+        1,
+        "ok line: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_RX_TIMEOUT),
+        0,
+        "guest timed out waiting for input: {diag}"
+    );
+    let mut pushed = 0u64;
+    for round in 0..SERIAL_RX_ROUNDS {
+        assert_eq!(
+            count_marker_lines(&o.output, &echo_reply(round)),
+            1,
+            "reply line for round {round} must appear exactly once: {diag}"
+        );
+        pushed += echo_input(round).len() as u64;
+    }
+    assert_eq!(
+        count_reply_like_lines(&o.output),
+        SERIAL_RX_ROUNDS,
+        "unexpected extra reply-like lines: {diag}"
+    );
+    assert_eq!(o.rx_latencies.len(), SERIAL_RX_ROUNDS, "latencies: {diag}");
+    assert_eq!(o.uart.input_received_bytes, pushed, "received: {diag}");
+    assert_eq!(o.uart.input_read_bytes, pushed, "guest read: {diag}");
+    assert_eq!(o.uart.input_dropped_bytes, 0, "input dropped: {diag}");
+    assert_eq!(
+        o.uart.input_flushed_bytes, 0,
+        "input flushed by an FCR reset: {diag}"
+    );
+    assert_eq!(o.uart.input_buffered_bytes, 0, "input left over: {diag}");
+    let rows = parse_irq_rows(&o.output, "ttyS0")
+        .unwrap_or_else(|e| panic!("hvf_kernel_boot: /proc/interrupts: {e}: {diag}"));
+    let [before, after] = rows.as_slice() else {
+        panic!("ttyS0 must appear in exactly two /proc/interrupts dumps: {rows:?}: {diag}");
+    };
+    // SPI n の hwirq（GIC の INTID）は n + 32。
+    assert_eq!(before.hwirq, ARM64_SERIAL_SPI + 32, "hwirq: {diag}");
+    assert_eq!(after.hwirq, before.hwirq, "hwirq changed: {diag}");
+    assert!(before.level && after.level, "trigger must be Level: {diag}");
+    assert!(
+        after.count > before.count + SERIAL_RX_ROUNDS as u64,
+        "ttyS0 interrupt count grew too little ({} -> {}): {diag}",
+        before.count,
+        after.count
+    );
+    let max = o.rx_latencies.iter().max().copied().unwrap_or_default();
+    eprintln!(
+        "hvf_kernel_boot: serial ok arch=aarch64 rounds={SERIAL_RX_ROUNDS} rx_latency_us={:?} rx_latency_max_us={} \
+         wfi_wait_max_ms={} within_wfi_wait_max={} irq_before={} irq_after={} hwirq={} exits={} wfx={}",
+        o.rx_latencies
+            .iter()
+            .map(|d| d.as_micros())
+            .collect::<Vec<_>>(),
+        max.as_micros(),
+        WFI_WAIT_MAX.as_millis(),
+        max <= WFI_WAIT_MAX,
+        before.count,
+        after.count,
+        before.hwirq,
+        o.exits,
+        o.wfx
+    );
+}
+
+/// 負の対照。入力を押さないと、ゲストは rx timeout に落ち、書き戻しの行・ok の行が出ない（書き戻しが `push_input` に由来する裏づけ）。
+/// 陽性と同じ initrd・同じカーネルで回すこと。ゲストの待ちは 5 秒。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_serial_echo_without_input_times_out() {
+    let secs = boot_timeout_secs();
+    let _wd = Watchdog::start(overall_deadline(secs));
+    let inp = inputs(InitrdKind::SerialEcho, secs);
+    require_vm_with_gic(&layout(1));
+    let (o, _) = run_boot(inp, 1, Interaction::None);
+    let diag = o.diag();
+    assert_serial_common(&o, &diag);
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_RX_TIMEOUT),
+        1,
+        "rx timeout line: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, SERIAL_OK),
+        0,
+        "ok line without input: {diag}"
+    );
+    assert_eq!(
+        count_reply_like_lines(&o.output),
+        0,
+        "reply-like lines without input: {diag}"
+    );
+    assert_eq!(o.uart.input_received_bytes, 0, "received: {diag}");
+    assert_eq!(o.uart.input_read_bytes, 0, "guest read: {diag}");
+    let rows = parse_irq_rows(&o.output, "ttyS0")
+        .unwrap_or_else(|e| panic!("hvf_kernel_boot: /proc/interrupts: {e}: {diag}"));
+    assert_eq!(rows.len(), 1, "only the first dump runs: {rows:?}: {diag}");
 }
 
 /// watchdog の期限は、内側（起動スレッド全体）の期限より常に長い（既定と最大の 2 点。REPAIR-5・MVM-5）。
@@ -418,4 +761,53 @@ fn mvm5_3986_layout_without_virtio_is_valid() {
     );
     assert_eq!(l.virtio_spi_trigger, IrqTrigger::EdgeRising);
     assert_eq!(layout(2).vcpus, 2);
+}
+
+/// initrd の種類ごとの環境変数名・既定パス・ヒント（#3987）。`None` には initrd が無い。
+#[test]
+fn mvm5_3987_initrd_spec_names() {
+    assert_eq!(initrd_spec(InitrdKind::None), None);
+    assert_eq!(
+        initrd_spec(InitrdKind::Default),
+        Some((
+            "FANDHE_CONTAINER_MICROVM_INITRD",
+            "../../target/microvm-test-initrd/aarch64/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 make microvm-test-initrd-build"
+        ))
+    );
+    assert_eq!(
+        initrd_spec(InitrdKind::SerialEcho),
+        Some((
+            "FANDHE_CONTAINER_MICROVM_SERIAL_INITRD",
+            "../../target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=serial-echo make microvm-test-initrd-build"
+        ))
+    );
+}
+
+/// 押す行と書き戻しの行の組み立て（改行つきの入力・改行なしの照合行。往復ごとに別の文字列）。
+#[test]
+fn mvm5_3987_echo_lines_are_distinct_per_round() {
+    assert_eq!(echo_input(0), "echo-0\n");
+    assert_eq!(echo_reply(3), "fandhe-microvm-test: serial rx echo-3");
+    let replies: Vec<String> = (0..SERIAL_RX_ROUNDS).map(echo_reply).collect();
+    for (i, a) in replies.iter().enumerate() {
+        assert_eq!(a.len() + 1, SERIAL_RX_PREFIX.len() + echo_input(i).len());
+        for b in replies.iter().skip(i + 1) {
+            assert_ne!(a, b);
+        }
+    }
+    // 接頭辞を共有する rx timeout の行は「書き戻しに似た行」に数えない。
+    let out = format!(
+        "{SERIAL_RX_TIMEOUT}\n{}\r\nx{}\n",
+        echo_reply(0),
+        echo_reply(1)
+    );
+    assert_eq!(count_reply_like_lines(out.as_bytes()), 1);
+    assert_eq!(count_marker_lines(out.as_bytes(), &echo_reply(0)), 1);
+    assert_eq!(count_marker_lines(out.as_bytes(), &echo_reply(1)), 0);
+    // 状態機械は ready の前は進まず、時間の定数は上限の関係を保つ。
+    assert!(matches!(SerialEcho::new().stage, EchoStage::WaitReady));
+    assert!(ECHO_IDLE < ECHO_READ_WAIT && ECHO_READ_WAIT < ECHO_REPLY_WAIT);
+    assert_eq!(SERIAL_RX_ROUNDS, 4);
 }

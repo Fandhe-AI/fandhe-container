@@ -34,7 +34,7 @@
 | 変更 | SEP・リビジョン | 破壊的か | plugin-mcp への影響 | 実装の要否 | 対応方針 | 担当 |
 | ---- | -------------- | -------- | ------------------- | ---------- | -------- | ---- |
 | `initialize`・`notifications/initialized` の廃止、要求ごとの `_meta`（`io.modelcontextprotocol/protocolVersion`・`clientCapabilities`・`clientInfo`） | SEP-2575・07-28 | 破壊的 | `handle_message_with` の分岐に modern 経路を足す | 要 | `_meta` を型検査して取り出し、dual-era なら legacy 経路を残す（4.1）。#716 で実装済み | #716 |
-| `server/discover`（servers MUST） | SEP-2575・07-28 | 追加（MUST） | 新メソッド。対応版・capabilities・identity を返す | 要 | 対応版の一覧は定数で固定。結果の形は schema の `DiscoverResult` を要確認 | #716 |
+| `server/discover`（servers MUST） | SEP-2575・07-28 | 追加（MUST） | 新メソッド。対応版・capabilities・identity を返す | 要 | 対応版の一覧は定数で固定。結果の形は schema の `DiscoverResult` の必須 5 項目（`supportedVersions`・`capabilities`・`ttlMs`・`cacheScope`・`resultType`）と一致する（2026-11-06 に schema `38353251` で確認。identity は `_meta` の `serverInfo`） | #716 |
 | `UnsupportedProtocolVersionError`（コード -32022、`data.supported`・`data.requested`） | SEP-2575・07-28 | 追加 | `error.rs` に variant と ERR-1 の `data.code` 対応を足す | 要 | `supported` は固定一覧。`requested` を返すなら長さ上限つき（4.2） | #716 |
 | `ping` の廃止 | SEP-2575・07-28 | 破壊的 | `ping` 分岐 | 要（dual-era なら legacy 側に残す） | modern 経路では -32601 とする | #716 |
 | `logging/setLevel`・`notifications/roots/list_changed` の廃止 | SEP-2575・07-28 | 破壊的 | 未実装のため影響なし | 不要（未実装） | なし | 対象外 |
@@ -182,7 +182,7 @@ D8 で版を分けた理由: 2025-06-18 の仕様は "Invalid arguments" を Pro
 | `mcp3_tool_names_follow_the_naming_guidance`・`mcp3_input_schemas_are_fixed_and_2020_12_compatible` | MCP-3 | ツール名の指針・`inputSchema` の完全一致 |
 | `uds::mcp3_modern_requests_over_uds_same_uid`（`tests/integration.rs`） | MCP-3・PLUG-12 | UDS 上の modern の 3 要求 |
 
-実行: `cargo test -p fandhe-container-plugin-mcp`。ローカル（Linux・非 root）で `protocol_2026_07_28` 8 件・`integration` 5 件（`#[ignore]` 1 件）・`startup` 6 件・lib 90 件がすべて合格した。macOS・Windows のネイティブ実行は、PR の CI が緑になった後の `workflow_dispatch`（3 OS）で確認する。実行結果の run URL は未記入（dispatch 後に追記する）。
+実行: `cargo test -p fandhe-container-plugin-mcp`。ローカル（Linux・非 root）で `protocol_2026_07_28` 8 件・`integration` 5 件（`#[ignore]` 1 件）・`startup` 6 件・lib 90 件がすべて合格した。macOS・Windows のネイティブでは、main の 110ae71f の [run 42236524183](https://github.com/Fandhe-AI/fandhe-container/actions/runs/42236524183) の `platform-ci` で合格した（3 OS とも成功）。
 
 残余（対象外）:
 

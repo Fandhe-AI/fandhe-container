@@ -7,7 +7,7 @@
 //! 起動形態は 2 つ（引数はどちらも受け付けない）。
 //! - stdio（既定）: 環境変数 `FANDHE_CONTAINER_PLUGIN_SOCKET`（`PLUGIN_SOCKET_ENV`）が未設定なら、stdin の
 //!   JSON-RPC 2.0（改行区切り）を EOF まで処理し、応答を stdout へ書く（`initialize` / `tools/list` /
-//!   `tools/call`。TASK-118.2・118.3。処理本体は lib の `server`）。
+//!   `tools/call`、modern 経路は `server/discover` を含む。TASK-118.2・118.3・MCP-3。処理本体は lib の `server`）。
 //! - UDS: 同環境変数が設定済みなら、core（またはそれを模したハーネス）が bind 済みの UDS へ
 //!   `UdsStream::connect`（server の peer UID 検証つき。PLUG-12）で接続し、同じ JSON-RPC 処理を
 //!   その上で行う（TASK-118.4・#467。処理本体は lib の `uds`）。stdin / stdout は使わず stdout へ何も書かない。

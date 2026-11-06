@@ -11,6 +11,10 @@
 //! `data.code` の割り当て（`-32700` / `-32600` / `-32602` -> `INVALID_ARGUMENT`、
 //! `-32601` -> `UNIMPLEMENTED`、`-32603` -> `INTERNAL`）は ERR-5 の表が定める（#2217）。
 //! `server.rs` が全てのエラー応答をこの型経由で組み立てる（TASK-120.2・#470）。
+//!
+//! MCP 2026-07-28 の `-32022`（未対応の版）は入力値（`data.requested`）を持つため
+//! [`UnsupportedVersionError`] が担う（MCP-3・TASK-119.2）。`-32020`〜`-32099` は MCP の予約範囲で、
+//! 本サーバーが返すのは `-32022` のみ。`data.code` は `-32022` -> `UNIMPLEMENTED`。
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 use serde_json::{Value, json};
@@ -29,6 +33,8 @@ pub enum JsonRpcCode {
     InvalidParams,
     /// `-32603`
     InternalError,
+    /// `-32022`（MCP 2026-07-28 の `UnsupportedProtocolVersionError`。`-32020`〜`-32099` の予約範囲。MCP-3・TASK-119.2）
+    UnsupportedProtocolVersion,
 }
 
 impl JsonRpcCode {
@@ -40,6 +46,7 @@ impl JsonRpcCode {
             Self::MethodNotFound => -32601,
             Self::InvalidParams => -32602,
             Self::InternalError => -32603,
+            Self::UnsupportedProtocolVersion => -32022,
         }
     }
 
@@ -51,7 +58,61 @@ impl JsonRpcCode {
             Self::MethodNotFound => "Method not found",
             Self::InvalidParams => "Invalid params",
             Self::InternalError => "Internal error",
+            Self::UnsupportedProtocolVersion => "Unsupported protocol version",
         }
+    }
+}
+
+/// `data.requested` の最大バイト数（切り詰めの上限。入力の反射を有界にする。MCP-3・D2）。
+pub const MAX_REQUESTED_VERSION_BYTES: usize = 64;
+
+/// 未対応の MCP プロトコル版（`-32022`。`data` に `supported`・`requested`、`data.code = UNIMPLEMENTED`。
+/// MCP-3・TASK-119.2・D9）。
+///
+/// `ProtocolError` は入力値を持たない `Copy` 型のため別の型にした。`requested` は外部入力なので、
+/// コンストラクタで [`MAX_REQUESTED_VERSION_BYTES`] 以下（UTF-8 の文字境界）に切り詰め、型で上限を保証する。
+/// `message` とログには入力値を入れない（REPAIR-4）。`-32021`（必要な機能の欠如）は返さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedVersionError {
+    requested: String,
+    supported: &'static [&'static str],
+}
+
+impl UnsupportedVersionError {
+    /// 要求された版（切り詰め前の任意文字列）と対応版の一覧から作る。
+    pub fn new(requested: &str, supported: &'static [&'static str]) -> Self {
+        let mut end = requested.len().min(MAX_REQUESTED_VERSION_BYTES);
+        while !requested.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            requested: requested.get(..end).unwrap_or_default().to_owned(),
+            supported,
+        }
+    }
+
+    /// 対応する JSON-RPC コード（`-32022`）。
+    pub const fn rpc_code(&self) -> JsonRpcCode {
+        JsonRpcCode::UnsupportedProtocolVersion
+    }
+
+    /// JSON-RPC の `error` オブジェクト（`data` は `supported`・`requested`・`code`）。
+    pub fn to_error_object(&self) -> Value {
+        let rpc = self.rpc_code();
+        json!({
+            "code": rpc.code(),
+            "message": rpc.message(),
+            "data": {
+                "supported": self.supported,
+                "requested": self.requested,
+                "code": ErrorCode::Unimplemented.as_str(),
+            },
+        })
+    }
+
+    /// エラー応答全体。
+    pub fn to_response(&self, id: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "error": self.to_error_object()})
     }
 }
 
@@ -178,6 +239,39 @@ const TOOL_ERROR_MESSAGES: [(ErrorCode, &str); 10] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MCP-3: `-32022` のコード・固定文言・`data` の完全一致。
+    #[test]
+    fn mcp3_unsupported_version_error_object() {
+        let e = UnsupportedVersionError::new("1900-01-01", &["2026-07-28"]);
+        assert_eq!(
+            e.to_response(json!(7)),
+            json!({"jsonrpc":"2.0","id":7,"error":{
+                "code":-32022,"message":"Unsupported protocol version",
+                "data":{"supported":["2026-07-28"],"requested":"1900-01-01","code":"UNIMPLEMENTED"}}})
+        );
+        assert_eq!(JsonRpcCode::UnsupportedProtocolVersion.code(), -32022);
+    }
+
+    /// MCP-3・D2: `requested` は 64 バイトで切り詰め、文字境界を割らない。
+    #[test]
+    fn mcp3_unsupported_version_requested_is_truncated_on_char_boundary() {
+        let exact = "a".repeat(64);
+        let e = UnsupportedVersionError::new(&exact, &["2026-07-28"]);
+        assert_eq!(e.to_error_object()["data"]["requested"], exact.as_str());
+        let long = "a".repeat(65);
+        let e = UnsupportedVersionError::new(&long, &["2026-07-28"]);
+        assert_eq!(e.to_error_object()["data"]["requested"], exact.as_str());
+        // 'あ' は 3 バイト。63 バイト + 'あ' は 66 バイトで、64 バイトの境界は途中になる。
+        let multi = format!("{}あ", "a".repeat(63));
+        let e = UnsupportedVersionError::new(&multi, &["2026-07-28"]);
+        assert_eq!(
+            e.to_error_object()["data"]["requested"],
+            "a".repeat(63).as_str()
+        );
+        let e = UnsupportedVersionError::new("", &["2026-07-28"]);
+        assert_eq!(e.to_error_object()["data"]["requested"], "");
+    }
 
     /// REPAIR-1・ERR-1: 文言の表が `ErrorCode::ALL` を過不足なく覆い、全件で文言が空でない。
     #[test]

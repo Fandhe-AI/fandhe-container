@@ -1,9 +1,16 @@
 //! stdio JSON-RPC 2.0 による MCP サーバーの処理（MCP-1・MCP-2。TASK-118.2・MS-4・#465）。
 //!
 //! bin（`src/main.rs`）から stdin / stdout を渡されて呼ばれる。準拠する MCP のリビジョンは 2025-06-18
-//! （2026-07-28 版への追随は MCP-3・TASK-119）。フレーミングは改行区切りの 1 行 1 メッセージで、
-//! 応答ごとに flush する。プロトコル処理は純関数 [`handle_message`] に切り出し、プロセスを起動せず
+//! （legacy。`initialize` で始まる経路）と 2026-07-28（modern。ステートレスコア）の dual-era
+//! （MCP-3・TASK-119.2・D1）。フレーミングは改行区切りの 1 行 1 メッセージで、
+//! 応答ごとに flush する。プロトコル処理は純関数 [`handle_message_on`] に切り出し、プロセスを起動せず
 //! 具体値で検証できるようにしている。JSON の符号化・入出力・期限管理はトランスポート側（[`serve`]）が持つ。
+//!
+//! 経路の判定（MCP-3）: `params._meta` に `io.modelcontextprotocol/protocolVersion` があれば modern。
+//! 版が [`SUPPORTED_VERSIONS`] に無ければ `-32022`、`clientCapabilities` が無ければ `-32602`（版の検査が先）。
+//! キーが無ければ、`initialize` か、`initialize` を成功させた接続（[`ConnectionState`]）の要求は legacy、
+//! それ以外は `basic/index` の「必須フィールド欠落は拒否」に従い `-32602`。modern の要求は接続状態を
+//! 読まず書かない（要求ごとに自己完結）。
 //!
 //! 期限（REPAIR-5）: 接続のアイドル待ち（次のメッセージの先頭バイトが来るまで）は無期限だが、
 //! メッセージの先頭バイトを受けてから 1 行を読み切るまでは [`Limits::message_timeout`]、
@@ -20,7 +27,12 @@
 //!
 //! エラー応答は `crate::error` の `ProtocolError` / `ToolError` で組み立てる（MCP-4・ERR-5・TASK-120.2）。
 //!
-//! 未実装・簡易実装（REPAIR-3）: `start_container` の本番起動は未実装（`crate::backend` の doc を参照。#1718）。
+//! modern の実装済み: `server/discover`・`tools/list`（`ttlMs`・`cacheScope` つき）・`tools/call`。
+//! `ping`・`initialize` は modern では `-32601`。result には `_meta` の `serverInfo` を足す。
+//!
+//! 未実装・簡易実装（REPAIR-3）: modern の全 result の `resultType: "complete"` は未実装（#717。差し込み口は
+//! `finish_modern`）。2026-07-28 の経路の引数不正を `isError` で返す扱いも未実装（#4001。現状は `-32602`）。
+//! `start_container` の本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
 use std::io::{self, BufRead, Write};
@@ -33,11 +45,56 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::backend::{CoreBackend, ToolBackend, UnavailableBackend};
-use crate::error::{ProtocolError, ToolError};
+use crate::error::{ProtocolError, ToolError, UnsupportedVersionError};
 use fandhe_container_core::traits::{ContainerId, TraitError};
 
-/// 本サーバーが応答する MCP のプロトコル版（MCP-1）。
+/// legacy 経路（`initialize`）で応答する MCP のプロトコル版（MCP-1）。
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// modern 経路（ステートレスコア）のプロトコル版（MCP-3・TASK-119.2）。
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// `_meta` で受理する版の一覧（`-32022` の `data.supported`・`server/discover` の `supportedVersions`）。
+/// legacy の 2025-06-18 は `initialize` からのみ到達できるため載せない（`docs/design/mcp-2026-07-28-migration.md`）。
+pub const SUPPORTED_VERSIONS: [&str; 1] = [MODERN_PROTOCOL_VERSION];
+
+/// `tools/list`・`server/discover` の `ttlMs`。一覧は実行ファイルの差し替えでしか変わらないため 1 時間（MCP-3・D6）。
+pub const CACHE_TTL_MS: u64 = 3_600_000;
+
+/// `tools/list`・`server/discover` の `cacheScope`。一覧は全利用者で同一のため `public`（MCP-3・D6）。
+pub const CACHE_SCOPE: &str = "public";
+
+/// 要求の `_meta` で版を運ぶキー。
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+/// 要求の `_meta` で機能を運ぶキー（欠落は `-32602`）。
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+/// 応答の `_meta` に載せる `serverInfo` のキー。
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+const SERVER_NAME: &str = "fandhe-container-plugin-mcp";
+
+/// 接続（stdio プロセスまたは UDS の 1 接続）ごとの状態。保持するのは 1 ビットのみで増大しない。
+///
+/// legacy の経路で `initialize` が成功したときだけ `legacy` が立つ。modern の要求は読まず書かない
+/// （`basic/index` の「前の要求に依存しない」）。`serve_with`・`serve_uds_with` が接続ごとに 1 つ作る。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionState {
+    legacy: bool,
+}
+
+impl ConnectionState {
+    /// `initialize` 済み（legacy）の接続か。
+    pub fn is_legacy(&self) -> bool {
+        self.legacy
+    }
+}
+
+/// 要求の経路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Legacy,
+    Modern,
+}
 
 /// 1 行あたりの受信上限（バイト）。超過分は確保せず読み捨てる（無制限確保による DoS 対策）。
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -155,6 +212,17 @@ impl Outcome {
             tool_error: None,
         }
     }
+
+    /// `-32022`（未対応の版）の応答。ログには入力値を載せない（コードのみ。REPAIR-4）。
+    fn err_unsupported_version(op: &'static str, id: Value, e: &UnsupportedVersionError) -> Self {
+        Self {
+            reply: Some(e.to_response(id)),
+            op,
+            error_code: Some(e.rpc_code().code()),
+            tool: None,
+            tool_error: None,
+        }
+    }
 }
 
 /// `initialize` の result（MCP 2025-06-18）。
@@ -185,9 +253,26 @@ struct ServerInfo {
 }
 
 /// `tools/list` の result。ページングはしないため `nextCursor` を持たない。
+/// `ttl_ms`・`cache_scope` は modern のときだけ載せる（legacy は 2025-06-18 のまま。MCP-3・D6）。
 #[derive(Serialize)]
 struct ToolsListResult {
     tools: Vec<Tool>,
+    #[serde(rename = "ttlMs", skip_serializing_if = "Option::is_none")]
+    ttl_ms: Option<u64>,
+    #[serde(rename = "cacheScope", skip_serializing_if = "Option::is_none")]
+    cache_scope: Option<&'static str>,
+}
+
+/// `server/discover` の result（MCP 2026-07-28。MCP-3）。
+#[derive(Serialize)]
+struct DiscoverResult {
+    #[serde(rename = "supportedVersions")]
+    supported_versions: [&'static str; 1],
+    capabilities: Capabilities,
+    #[serde(rename = "ttlMs")]
+    ttl_ms: u64,
+    #[serde(rename = "cacheScope")]
+    cache_scope: &'static str,
 }
 
 /// ツール定義（MCP-2）。`inputSchema` は 2025-06-18 で必須。
@@ -251,20 +336,82 @@ fn op_name(method: &str) -> &'static str {
         "tools/list" => "tools/list",
         "tools/call" => "tools/call",
         "ping" => "ping",
+        "server/discover" => "server/discover",
         m if m.starts_with("notifications/") => "notification",
         _ => "other",
     }
 }
 
-/// 1 メッセージ（改行除去済みの 1 行）を処理する。応答不要（通知・クライアントからの応答）は
-/// `reply: None`。入口で [`MAX_LINE_BYTES`] を超える入力を解析前に拒否する。JSON 符号化は呼び出し側
-/// （[`serve`]）が行う。外部入力は `get()` / `as_*()` で取り出し panic しない。
+/// 1 メッセージを「`initialize` 済みの接続の 1 要求」として処理する薄い入口（[`handle_message_on`] 経由）。
+/// 単体試験と、接続状態を持たない呼び出し元向け。`_meta` の無い要求は legacy として扱う。
 pub fn handle_message(line: &[u8]) -> Outcome {
     handle_message_with(line, &UnavailableBackend)
 }
 
 /// [`handle_message`] のバックエンド指定版。`tools/call` の実行を `backend` へ委ねる（MCP-2）。
 pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
+    let mut conn = ConnectionState { legacy: true };
+    handle_message_on(line, backend, &mut conn)
+}
+
+/// `params._meta` から経路を決める（MCP-3）。`Err` はそのまま返す応答。
+///
+/// 版の検査を `clientCapabilities` の検査より先に行う。未知の版の必須フィールドは判断できず、
+/// `-32022` なら stdio の互換プローブが modern と認識できるため。`clientInfo` 等の任意キーは読まない。
+fn detect_route(
+    op: &'static str,
+    id: &Value,
+    method: &str,
+    params: Option<&Value>,
+    conn: &ConnectionState,
+) -> Result<Route, Outcome> {
+    let meta = params
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("_meta"))
+        .and_then(Value::as_object);
+    let Some(version) = meta.and_then(|m| m.get(META_PROTOCOL_VERSION)) else {
+        return if method == "initialize" || conn.legacy {
+            Ok(Route::Legacy)
+        } else {
+            Err(Outcome::err(
+                op,
+                id.clone(),
+                ProtocolError::InvalidArguments,
+            ))
+        };
+    };
+    let Some(version) = version.as_str() else {
+        return Err(Outcome::err(
+            op,
+            id.clone(),
+            ProtocolError::InvalidArguments,
+        ));
+    };
+    if !SUPPORTED_VERSIONS.contains(&version) {
+        let e = UnsupportedVersionError::new(version, &SUPPORTED_VERSIONS);
+        return Err(Outcome::err_unsupported_version(op, id.clone(), &e));
+    }
+    let caps_ok = meta
+        .and_then(|m| m.get(META_CLIENT_CAPABILITIES))
+        .is_some_and(Value::is_object);
+    if !caps_ok {
+        return Err(Outcome::err(
+            op,
+            id.clone(),
+            ProtocolError::InvalidArguments,
+        ));
+    }
+    Ok(Route::Modern)
+}
+
+/// 接続状態つきで 1 メッセージ（改行除去済みの 1 行）を処理する本体（MCP-3）。応答不要（通知・クライアント
+/// からの応答）は `reply: None`。入口で [`MAX_LINE_BYTES`] を超える入力を解析前に拒否する。JSON 符号化は
+/// 呼び出し側（[`serve`]）が行う。外部入力は `get()` / `as_*()` で取り出し panic しない。
+pub fn handle_message_on(
+    line: &[u8],
+    backend: &dyn ToolBackend,
+    conn: &mut ConnectionState,
+) -> Outcome {
     if line.len() > MAX_LINE_BYTES {
         return Outcome::err("other", Value::Null, ProtocolError::InvalidRequest);
     }
@@ -303,7 +450,7 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
         }
         return invalid();
     };
-    // id の無いメッセージは通知。未知のメソッドでも応答しない。
+    // id の無いメッセージは通知。未知のメソッドでも応答しない（経路の判定も掛けない）。
     if raw_id.is_none() {
         return Outcome::none(op);
     }
@@ -315,15 +462,39 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
     let params_type_ok = obj
         .get("params")
         .is_none_or(|p| p.is_object() || p.is_array());
-    if !params_type_ok && matches!(method, "initialize" | "tools/list" | "tools/call" | "ping") {
+    if !params_type_ok
+        && matches!(
+            method,
+            "initialize" | "tools/list" | "tools/call" | "ping" | "server/discover"
+        )
+    {
         return Outcome::err(op, id, ProtocolError::InvalidArguments);
     }
 
+    match detect_route(op, &id, method, obj.get("params"), conn) {
+        Err(outcome) => outcome,
+        Ok(Route::Legacy) => dispatch_legacy(op, method, id, obj.get("params"), backend, conn),
+        Ok(Route::Modern) => {
+            finish_modern(dispatch_modern(op, method, id, obj.get("params"), backend))
+        }
+    }
+}
+
+/// legacy（2025-06-18）のメソッド表。`initialize` の成功だけが接続状態を `legacy` にする。
+fn dispatch_legacy(
+    op: &'static str,
+    method: &str,
+    id: Value,
+    params: Option<&Value>,
+    backend: &dyn ToolBackend,
+    conn: &mut ConnectionState,
+) -> Outcome {
     match method {
         "initialize" => {
-            if !initialize_params_valid(obj.get("params")) {
+            if !initialize_params_valid(params) {
                 return Outcome::err(op, id, ProtocolError::InvalidArguments);
             }
+            conn.legacy = true;
             success(
                 op,
                 id,
@@ -335,7 +506,7 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
                         },
                     },
                     server_info: ServerInfo {
-                        name: "fandhe-container-plugin-mcp",
+                        name: SERVER_NAME,
                         version: env!("CARGO_PKG_VERSION"),
                     },
                 },
@@ -346,12 +517,74 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
             id,
             ToolsListResult {
                 tools: tool_definitions(),
+                ttl_ms: None,
+                cache_scope: None,
             },
         ),
         "ping" => success(op, id, json!({})),
-        "tools/call" => tools_call(id, obj.get("params"), backend),
+        "tools/call" => tools_call(id, params, backend),
         _ => Outcome::err(op, id, ProtocolError::MethodNotFound),
     }
+}
+
+/// modern（2026-07-28）のメソッド表。`initialize`・`ping`・未知のメソッドは `-32601`。
+/// 接続状態は受け取らない（要求ごとに自己完結。MCP-3）。
+fn dispatch_modern(
+    op: &'static str,
+    method: &str,
+    id: Value,
+    params: Option<&Value>,
+    backend: &dyn ToolBackend,
+) -> Outcome {
+    match method {
+        "server/discover" => success(
+            op,
+            id,
+            DiscoverResult {
+                supported_versions: SUPPORTED_VERSIONS,
+                capabilities: Capabilities {
+                    tools: ToolsCapability {
+                        list_changed: false,
+                    },
+                },
+                ttl_ms: CACHE_TTL_MS,
+                cache_scope: CACHE_SCOPE,
+            },
+        ),
+        "tools/list" => success(
+            op,
+            id,
+            ToolsListResult {
+                tools: tool_definitions(),
+                ttl_ms: Some(CACHE_TTL_MS),
+                cache_scope: Some(CACHE_SCOPE),
+            },
+        ),
+        "tools/call" => tools_call(id, params, backend),
+        _ => Outcome::err(op, id, ProtocolError::MethodNotFound),
+    }
+}
+
+/// modern の応答の仕上げ。`result` を持つ応答（`isError: true` を含む）の `_meta` へ `serverInfo` を足す。
+/// エラー応答は素通しする。
+///
+/// 未実装（REPAIR-3）: 全 result への `resultType: "complete"` は #717 で本関数へ足す（MCP-3）。
+fn finish_modern(mut outcome: Outcome) -> Outcome {
+    if let Some(result) = outcome
+        .reply
+        .as_mut()
+        .and_then(|r| r.get_mut("result"))
+        .and_then(Value::as_object_mut)
+    {
+        let info = json!({"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")});
+        let meta = result
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(m) = meta.as_object_mut() {
+            m.insert(META_SERVER_INFO.to_owned(), info);
+        }
+    }
+    outcome
 }
 
 /// 引数不正（`-32602`・`data.code = INVALID_ARGUMENT`）の応答。固定文言のみで、ツール名・ID を反射させない。
@@ -551,7 +784,11 @@ pub(crate) fn log_transport(log: &mut dyn FnMut(&str), code: &str) {
 ///
 /// stdio の [`serve_with`] と UDS の `crate::uds::serve_uds_with` が共有する。末尾の `\r` は除去し、
 /// 上限超過は `-32600` にする（MCP-1。入力内容は応答へ反射させない）。
-pub(crate) fn process_line(line: Line, backend: &dyn ToolBackend) -> Option<Outcome> {
+pub(crate) fn process_line(
+    line: Line,
+    backend: &dyn ToolBackend,
+    conn: &mut ConnectionState,
+) -> Option<Outcome> {
     match line {
         Line::Overflow => Some(Outcome::err(
             "other",
@@ -565,7 +802,7 @@ pub(crate) fn process_line(line: Line, backend: &dyn ToolBackend) -> Option<Outc
             if data.iter().all(u8::is_ascii_whitespace) {
                 return None;
             }
-            Some(handle_message_with(&data, backend))
+            Some(handle_message_on(&data, backend, conn))
         }
     }
 }
@@ -685,6 +922,8 @@ where
         return Err(ServeError::Spawn(e));
     }
 
+    // 接続ごとの状態（1 ビット）。modern の要求は読まず書かない（MCP-3）。
+    let mut conn = ConnectionState::default();
     loop {
         // アイドル待ちは無期限。メッセージの先頭バイトが来てからは、その受信時刻からの
         // 絶対期限で待つ。直前の応答書き込み中に始まった受信でも数え直さない（REPAIR-5）。
@@ -736,7 +975,7 @@ where
             }
         };
         let began = Instant::now();
-        let Some(outcome) = process_line(line, backend) else {
+        let Some(outcome) = process_line(line, backend, &mut conn) else {
             continue;
         };
         if let Some(reply) = &outcome.reply {
@@ -1097,7 +1336,8 @@ mod tests {
     #[test]
     fn serve_logs_tool_name_without_input_values() {
         let input = format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
+            init_req("0", "2025-06-18"),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_container","arguments":{"container_id":"zzSECRETzz"}}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_containers"}}"#,
         );
@@ -1115,9 +1355,10 @@ mod tests {
             .iter()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(recs[0]["tool"], "start_container");
-        assert_eq!(recs[0]["result"], "ok");
-        assert_eq!(recs[1]["tool"], "list_containers");
+        assert_eq!(recs[0]["op"], "initialize");
+        assert_eq!(recs[1]["tool"], "start_container");
+        assert_eq!(recs[1]["result"], "ok");
+        assert_eq!(recs[2]["tool"], "list_containers");
         assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
         // 業務エラーはログ上で区別する。
         let o = handle_message_with(
@@ -1189,7 +1430,12 @@ mod tests {
         let cases: Vec<(Outcome, ProtocolError)> = vec![
             (handle_message(&big), ProtocolError::InvalidRequest),
             (
-                process_line(Line::Overflow, &UnavailableBackend).unwrap(),
+                process_line(
+                    Line::Overflow,
+                    &UnavailableBackend,
+                    &mut ConnectionState::default(),
+                )
+                .unwrap(),
                 ProtocolError::InvalidRequest,
             ),
             (handle_message(b"{not json"), ProtocolError::Parse),
@@ -1320,47 +1566,51 @@ mod tests {
     #[test]
     fn serve_rejects_oversized_line_and_continues() {
         let input = format!(
-            "{}\n{}\n",
-            "x".repeat(100),
+            "{}\n{}\n{}\n",
+            init_req("0", "2025-06-18"),
+            "x".repeat(400),
             r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#
         );
         let limits = Limits {
-            max_line_bytes: 64,
+            max_line_bytes: 300,
             ..Limits::default()
         };
         let (r, text, _) = run(input, limits);
         r.unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("-32600"));
-        assert!(lines[1].contains(r#""result":{}"#));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("2025-06-18"));
+        assert!(lines[1].contains("-32600"));
+        assert!(lines[2].contains(r#""result":{}"#));
     }
 
     #[test]
     fn serve_logs_structured_record_per_request_without_input_content() {
         let input = format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
+            init_req("0", "2025-06-18"),
             r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"zzSECRETzz"}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
         );
         let (r, _, logs) = run(input, Limits::default());
         r.unwrap();
-        assert_eq!(logs.len(), 3);
+        assert_eq!(logs.len(), 4);
         let recs: Vec<Value> = logs
             .iter()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(recs[0]["event"], "mcp.request");
-        assert_eq!(recs[0]["op"], "ping");
-        assert_eq!(recs[0]["result"], "ok");
-        assert_eq!(recs[0]["code"], Value::Null);
-        assert!(recs[0]["latency_us"].is_u64());
-        assert_eq!(recs[1]["op"], "other");
-        assert_eq!(recs[1]["result"], "error");
-        assert_eq!(recs[1]["code"], -32601);
-        assert_eq!(recs[2]["op"], "notification");
-        assert_eq!(recs[2]["result"], "no_reply");
+        assert_eq!(recs[0]["op"], "initialize");
+        assert_eq!(recs[1]["event"], "mcp.request");
+        assert_eq!(recs[1]["op"], "ping");
+        assert_eq!(recs[1]["result"], "ok");
+        assert_eq!(recs[1]["code"], Value::Null);
+        assert!(recs[1]["latency_us"].is_u64());
+        assert_eq!(recs[2]["op"], "other");
+        assert_eq!(recs[2]["result"], "error");
+        assert_eq!(recs[2]["code"], -32601);
+        assert_eq!(recs[3]["op"], "notification");
+        assert_eq!(recs[3]["result"], "no_reply");
         assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
     }
 
@@ -1541,5 +1791,325 @@ mod tests {
             &mut |_| {},
         );
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    // ---- MCP-3（TASK-119.2）: dual-era のステートレスコア ----
+
+    fn invalid_params_error(id: i64) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Invalid params","data":{"code":"INVALID_ARGUMENT"}}})
+    }
+
+    /// modern の要求を組む。`params_rest` は `_meta` 以外の params のフィールド（`,` 始まり）。
+    fn modern_req(id: i64, method: &str, version: &str, params_rest: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{version}","io.modelcontextprotocol/clientCapabilities":{{}}}}{params_rest}}}}}"#
+        )
+    }
+
+    fn on(line: &str, conn: &mut ConnectionState) -> Value {
+        handle_message_on(line.as_bytes(), &fake_ok(), conn)
+            .reply
+            .unwrap()
+    }
+
+    fn server_info() -> Value {
+        json!({"name":"fandhe-container-plugin-mcp","version":env!("CARGO_PKG_VERSION")})
+    }
+
+    fn tool_defs_json() -> Value {
+        json!([
+            {"name":"list_containers","description":"List containers managed by fandhe-container.",
+             "inputSchema":{"type":"object","properties":{}}},
+            {"name":"start_container","description":"Start the container identified by container_id.",
+             "inputSchema":{"type":"object","properties":{"container_id":{"type":"string"}},"required":["container_id"]}}
+        ])
+    }
+
+    #[test]
+    fn mcp3_uninitialized_connection_rejects_requests_without_meta() {
+        let reqs = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_containers"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"foo/bar"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        ];
+        for r in reqs {
+            let mut conn = ConnectionState::default();
+            assert_eq!(on(r, &mut conn), invalid_params_error(1), "case: {r}");
+            assert!(!conn.is_legacy());
+        }
+    }
+
+    #[test]
+    fn mcp3_initialized_connection_keeps_legacy_behavior() {
+        let mut conn = ConnectionState::default();
+        let init = on(&init_req("1", "2025-06-18"), &mut conn);
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        assert!(conn.is_legacy());
+        let list = on(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut conn,
+        );
+        assert_eq!(
+            list,
+            json!({"jsonrpc":"2.0","id":2,"result":{"tools":tool_defs_json()}})
+        );
+        assert_eq!(
+            on(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#, &mut conn),
+            json!({"jsonrpc":"2.0","id":3,"result":{}})
+        );
+        let disc = on(
+            r#"{"jsonrpc":"2.0","id":4,"method":"server/discover"}"#,
+            &mut conn,
+        );
+        assert_eq!(disc["error"]["code"], -32601);
+        assert_eq!(disc["error"]["data"]["code"], "UNIMPLEMENTED");
+    }
+
+    #[test]
+    fn mcp3_failed_initialize_does_not_make_connection_legacy() {
+        let mut conn = ConnectionState::default();
+        let bad = on(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            &mut conn,
+        );
+        assert_eq!(bad, invalid_params_error(1));
+        assert!(!conn.is_legacy());
+        let list = on(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut conn,
+        );
+        assert_eq!(list, invalid_params_error(2));
+    }
+
+    #[test]
+    fn mcp3_progress_token_only_meta_is_legacy_after_initialize_only() {
+        let req =
+            r#"{"jsonrpc":"2.0","id":5,"method":"ping","params":{"_meta":{"progressToken":"p"}}}"#;
+        let mut fresh = ConnectionState::default();
+        assert_eq!(on(req, &mut fresh), invalid_params_error(5));
+        let mut conn = ConnectionState { legacy: true };
+        assert_eq!(
+            on(req, &mut conn),
+            json!({"jsonrpc":"2.0","id":5,"result":{}})
+        );
+    }
+
+    #[test]
+    fn mcp3_modern_request_is_independent_of_connection_state() {
+        let req = modern_req(1, "tools/list", "2026-07-28", "");
+        let mut fresh = ConnectionState::default();
+        let mut legacy = ConnectionState { legacy: true };
+        let a = on(&req, &mut fresh);
+        let b = on(&req, &mut legacy);
+        assert_eq!(a, b);
+        assert_eq!(fresh, ConnectionState::default());
+        assert_eq!(legacy, ConnectionState { legacy: true });
+    }
+
+    #[test]
+    fn mcp3_server_discover_result() {
+        let mut conn = ConnectionState::default();
+        let v = on(
+            &modern_req(1, "server/discover", "2026-07-28", ""),
+            &mut conn,
+        );
+        assert_eq!(
+            v,
+            json!({"jsonrpc":"2.0","id":1,"result":{
+                "supportedVersions":["2026-07-28"],
+                "capabilities":{"tools":{"listChanged":false}},
+                "ttlMs":3600000,
+                "cacheScope":"public",
+                "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
+            }})
+        );
+    }
+
+    #[test]
+    fn mcp3_modern_tools_list_result() {
+        let mut conn = ConnectionState::default();
+        let v = on(&modern_req(2, "tools/list", "2026-07-28", ""), &mut conn);
+        assert_eq!(
+            v,
+            json!({"jsonrpc":"2.0","id":2,"result":{
+                "tools":tool_defs_json(),
+                "ttlMs":3600000,
+                "cacheScope":"public",
+                "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
+            }})
+        );
+    }
+
+    #[test]
+    fn mcp3_modern_tools_call_results() {
+        let mut conn = ConnectionState::default();
+        let v = on(
+            &modern_req(
+                3,
+                "tools/call",
+                "2026-07-28",
+                r#","name":"list_containers""#,
+            ),
+            &mut conn,
+        );
+        let expected = json!({"containers":[
+            {"id":"c1","status":"running","pid":42},
+            {"id":"c2","status":"created","pid":null}
+        ],"truncated":false});
+        assert_eq!(v["result"]["isError"], false);
+        assert_eq!(v["result"]["structuredContent"], expected);
+        assert_eq!(
+            v["result"]["_meta"],
+            json!({"io.modelcontextprotocol/serverInfo":server_info()})
+        );
+        let v = on(
+            &modern_req(
+                4,
+                "tools/call",
+                "2026-07-28",
+                r#","name":"start_container","arguments":{"container_id":"c1"}"#,
+            ),
+            &mut conn,
+        );
+        assert_eq!(
+            v["result"]["structuredContent"],
+            json!({"id":"c1","status":"running","pid":42})
+        );
+        assert_eq!(
+            v["result"]["_meta"],
+            json!({"io.modelcontextprotocol/serverInfo":server_info()})
+        );
+        // 業務エラーにも serverInfo が付く。
+        let err_backend = fake_err(ErrorCode::NotFound, "x");
+        let o = handle_message_on(
+            modern_req(
+                5,
+                "tools/call",
+                "2026-07-28",
+                r#","name":"list_containers""#,
+            )
+            .as_bytes(),
+            &err_backend,
+            &mut conn,
+        );
+        let v = o.reply.unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        assert_eq!(
+            v["result"]["_meta"],
+            json!({"io.modelcontextprotocol/serverInfo":server_info()})
+        );
+        // 未知のツールは -32602（エラー応答に _meta は足さない）。
+        let v = on(
+            &modern_req(6, "tools/call", "2026-07-28", r#","name":"nope""#),
+            &mut conn,
+        );
+        assert_eq!(v, invalid_params_error(6));
+    }
+
+    #[test]
+    fn mcp3_modern_ping_initialize_and_unknown_methods_are_32601() {
+        let mut conn = ConnectionState::default();
+        for m in ["ping", "initialize", "foo/bar"] {
+            let v = on(&modern_req(1, m, "2026-07-28", ""), &mut conn);
+            assert_eq!(
+                v,
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found","data":{"code":"UNIMPLEMENTED"}}}),
+                "method: {m}"
+            );
+        }
+        assert!(!conn.is_legacy());
+    }
+
+    #[test]
+    fn mcp3_unsupported_version_is_32022() {
+        for ver in ["1900-01-01", "2025-06-18", ""] {
+            for method in ["tools/list", "foo/bar"] {
+                let mut conn = ConnectionState::default();
+                let v = on(&modern_req(1, method, ver, ""), &mut conn);
+                assert_eq!(
+                    v,
+                    json!({"jsonrpc":"2.0","id":1,"error":{
+                        "code":-32022,"message":"Unsupported protocol version",
+                        "data":{"supported":["2026-07-28"],"requested":ver,"code":"UNIMPLEMENTED"}}}),
+                    "ver: {ver:?} method: {method}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcp3_missing_required_meta_fields_are_32602() {
+        let mut conn = ConnectionState::default();
+        let cases = [
+            // clientCapabilities 欠落
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+            // clientCapabilities がオブジェクト以外
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":[]}}}"#,
+            // 版が文字列以外
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728,"io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        ];
+        for c in cases {
+            assert_eq!(on(c, &mut conn), invalid_params_error(1), "case: {c}");
+        }
+    }
+
+    #[test]
+    fn mcp3_version_check_precedes_required_fields() {
+        let mut conn = ConnectionState::default();
+        let v = on(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}}"#,
+            &mut conn,
+        );
+        assert_eq!(v["error"]["code"], -32022);
+    }
+
+    #[test]
+    fn mcp3_requested_version_is_truncated_to_64_bytes() {
+        let long = "v".repeat(500);
+        let mut conn = ConnectionState::default();
+        let v = on(&modern_req(1, "tools/list", &long, ""), &mut conn);
+        assert_eq!(v["error"]["data"]["requested"], "v".repeat(64).as_str());
+    }
+
+    #[test]
+    fn mcp3_notification_with_unsupported_version_gets_no_reply() {
+        let mut conn = ConnectionState::default();
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/x","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}}"#;
+        let o = handle_message_on(line.as_bytes(), &fake_ok(), &mut conn);
+        assert_eq!(o.reply, None);
+    }
+
+    #[test]
+    fn mcp3_serve_tracks_connection_state_and_logs_without_version_text() {
+        let input = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            init_req("2", "2025-06-18"),
+            r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
+            modern_req(4, "server/discover", "2026-07-28", ""),
+            modern_req(5, "tools/list", "zzSECRETzz", ""),
+        );
+        let (r, text, logs) = run(input, Limits::default());
+        r.unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0]["error"]["code"], -32602);
+        assert_eq!(lines[1]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(lines[2], json!({"jsonrpc":"2.0","id":3,"result":{}}));
+        assert_eq!(lines[3]["result"]["cacheScope"], "public");
+        assert_eq!(lines[4]["error"]["code"], -32022);
+        assert_eq!(lines[4]["error"]["data"]["requested"], "zzSECRETzz");
+        let recs: Vec<Value> = logs
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs[3]["op"], "server/discover");
+        assert_eq!(recs[4]["code"], -32022);
+        assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
     }
 }

@@ -10,7 +10,7 @@
   - <https://modelcontextprotocol.io/specification/2026-07-28/changelog>（比較元は 2025-11-25）
   - <https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning>
   - <https://modelcontextprotocol.io/specification/2025-11-25/changelog>
-  - 2026-07-28 の stdio 規定・`basic/index`（`_meta` の規則）・`server/discover`・`basic/patterns/mrtr`・schema の詳細ページは本ドラフトの作成時点では本文を精読しておらず、該当する箇所は「要確認」と記す
+  - 2026-07-28 の stdio 規定・`basic/index`（`_meta` の規則）・`server/discover`・`server/utilities/caching`・schema は、#716 の実装時（2026-11-06）に精読した（4.2。`specification/2026-07-28/basic/index`・`basic/transports/stdio`・`server/discover`・`server/utilities/caching`・`schema/2026-07-28/schema.ts`）。`basic/patterns/mrtr` は #717 の範囲で未精読のため、該当する箇所は「要確認」と記す
 
 ## 1. 背景
 
@@ -20,7 +20,7 @@
 
 ## 2. 現状（main `cc03cf7c` 時点）
 
-- `crates/plugin-mcp/src/server.rs`: `PROTOCOL_VERSION = "2025-06-18"`、`MAX_LINE_BYTES = 1 MiB`。`handle_message_with` は 1 行ごとの関数で接続状態を持たない（すでに実質ステートレス）。扱うメソッドは `initialize`・`tools/list`・`ping`・`tools/call` の 4 つ。通知は黙殺し、バッチ配列は拒否し、クライアントからの応答は無視する（サーバーから要求を送らない）
+- `crates/plugin-mcp/src/server.rs`: `PROTOCOL_VERSION = "2025-06-18"`、`MAX_LINE_BYTES = 1 MiB`。`handle_message_with` は 1 行ごとの関数で接続状態を持たなかった（#716 で `handle_message_on` と接続ごとの 1 ビットの `ConnectionState` を足した。4.2）。扱うメソッドは `initialize`・`tools/list`・`ping`・`tools/call` の 4 つ。通知は黙殺し、バッチ配列は拒否し、クライアントからの応答は無視する（サーバーから要求を送らない）
 - `initialize` は `initialize_params_valid` で `protocolVersion`・`capabilities`・`clientInfo` を検証し、要求された版にかかわらず常に `2025-06-18` を返す。capabilities は `tools.listChanged: false`
 - `tools/list` は 2 ツールを固定順で返す。`nextCursor`・`ttlMs`・`cacheScope` は無い。`tools/call` は `structuredContent` と `content` を返し、業務エラーは `isError: true`
 - `error.rs`: JSON-RPC コードは -32700・-32600・-32601・-32602・-32603。未知のツールと引数不正はどちらも -32602（`data.code = INVALID_ARGUMENT`。ERR-5・MCP-4 に沿う）
@@ -33,14 +33,14 @@
 
 | 変更 | SEP・リビジョン | 破壊的か | plugin-mcp への影響 | 実装の要否 | 対応方針 | 担当 |
 | ---- | -------------- | -------- | ------------------- | ---------- | -------- | ---- |
-| `initialize`・`notifications/initialized` の廃止、要求ごとの `_meta`（`io.modelcontextprotocol/protocolVersion`・`clientCapabilities`・`clientInfo`） | SEP-2575・07-28 | 破壊的 | `handle_message_with` の分岐に modern 経路を足す | 要 | `_meta` を型検査して取り出し、dual-era なら legacy 経路を残す（4.1） | #716 |
+| `initialize`・`notifications/initialized` の廃止、要求ごとの `_meta`（`io.modelcontextprotocol/protocolVersion`・`clientCapabilities`・`clientInfo`） | SEP-2575・07-28 | 破壊的 | `handle_message_with` の分岐に modern 経路を足す | 要 | `_meta` を型検査して取り出し、dual-era なら legacy 経路を残す（4.1）。#716 で実装済み | #716 |
 | `server/discover`（servers MUST） | SEP-2575・07-28 | 追加（MUST） | 新メソッド。対応版・capabilities・identity を返す | 要 | 対応版の一覧は定数で固定。結果の形は schema の `DiscoverResult` を要確認 | #716 |
 | `UnsupportedProtocolVersionError`（コード -32022、`data.supported`・`data.requested`） | SEP-2575・07-28 | 追加 | `error.rs` に variant と ERR-1 の `data.code` 対応を足す | 要 | `supported` は固定一覧。`requested` を返すなら長さ上限つき（4.2） | #716 |
 | `ping` の廃止 | SEP-2575・07-28 | 破壊的 | `ping` 分岐 | 要（dual-era なら legacy 側に残す） | modern 経路では -32601 とする | #716 |
 | `logging/setLevel`・`notifications/roots/list_changed` の廃止 | SEP-2575・07-28 | 破壊的 | 未実装のため影響なし | 不要（未実装） | なし | 対象外 |
 | 全 result に必須の `resultType: "complete"` | SEP-2322・07-28 | 破壊的（必須化） | `InitializeResult`・`ToolsListResult`・`tools/call` の結果 | 要 | modern の結果に付ける。legacy にも付けるか（4.3）。クライアントは欠落を `complete` と扱う（MUST） | #717 |
 | MRTR（`InputRequiredResult`・`inputRequests`・`requestState`） | SEP-2322・07-28 | 追加 | 追加入力を求めないため該当なし | 不要（追加入力を求めない） | 4.4 | #717 の見直し |
-| `tools/list` の `ttlMs`・`cacheScope` 必須化（`CacheableResult`） | SEP-2549・07-28 | 破壊的（必須化） | `ToolsListResult` | 要 | 固定値（例: 静的な一覧なので長い `ttlMs`・`cacheScope: "public"`）を決める。値は要確認 | 判断待ち（#716 に含めるか新規 issue） |
+| `tools/list` の `ttlMs`・`cacheScope` 必須化（`CacheableResult`） | SEP-2549・07-28 | 破壊的（必須化） | `ToolsListResult` | 要 | `ttlMs: 3600000`（1 時間。一覧は実行ファイルの差し替えでしか変わらない）・`cacheScope: "public"`（全利用者で同一）。modern の `tools/list` と `server/discover` に載せ、legacy には載せない（D6。#716 で実装済み） | #716 |
 | `tools/list` を決まった順で返す（SHOULD） | 07-28 | なし | すでに固定順 | 不要（満たす） | 順序を固定する試験を足す | #719 |
 | 結果の `_meta.io.modelcontextprotocol/serverInfo`（SHOULD） | SEP-2575・07-28 | なし | 結果の組み立て | 要（任意） | 名前と版を載せる | #716 |
 | セッション・`Mcp-Session-Id`・SSE 再開の廃止 | SEP-2567・SEP-2575・07-28 | 破壊的（HTTP） | HTTP が無い | 不要（対象外） | HTTP を足すときに再評価 | 対象外 |
@@ -76,7 +76,14 @@
 
 ### 4.2 `_meta` も版も無い要求の扱い
 
-`initialize` を経ない要求で `_meta` に版が無い場合の扱いは、`basic/index` の規定を精読して決める（要確認）。対応版の一覧 `supported` は定数で固定する。`data.requested` に要求の文字列を返す場合は長さの上限を設ける。ログには要求された版や `clientInfo` を反射させない（REPAIR-4 を維持）。
+`initialize` を経ない要求で `_meta` に版が無い場合の扱い（MCP-3・D2。#716 で確定、2026-11-06 に一次情報を確認）。
+
+- `basic/index` は `protocolVersion`・`clientCapabilities` の欠落を MUST で拒否（`-32602`）とし、`clientInfo` は任意とする。dual-era の例外は `initialize` が legacy を選んだ接続に限る。ERR-5 の注記も 2025-06-18 の経路を「`initialize` で始めた要求」と定義する
+- 判定は `params._meta` の `io.modelcontextprotocol/protocolVersion` の有無。キーがあれば modern（文字列以外は `-32602`、`SUPPORTED_VERSIONS` に無ければ `-32022`、`clientCapabilities` が無い・オブジェクト以外は `-32602`。版の検査が先で、stdio の互換プローブが `-32022` を modern と認識できるようにする）
+- キーが無い要求は、`initialize` か、`initialize` を成功させた接続（`ConnectionState` の 1 ビット）なら legacy、それ以外は `-32602`。「版が無ければ常に legacy」は `basic/index` の MUST に反するため採らない。modern の要求は接続状態を読まず書かない
+- 対応版の一覧 `supported`・`supportedVersions` は `["2026-07-28"]` のみ。2025-06-18 は `initialize` からのみ到達できるので、`_meta` にその版を書いた要求は `-32022` になる（オーナー確認事項）
+- `data.requested` は 64 バイト（UTF-8 の文字境界）に切り詰め、`message` とログには入れない（REPAIR-4）。`clientInfo` は読まない
+- `-32021` は必要なクライアント機能が無い場合のみ使う規定で、要求する機能が無いので返さない
 
 ### 4.3 legacy の応答にも `resultType` を付けるか
 

@@ -22,7 +22,8 @@
 //!
 //! 実装済み: `initialize`・`tools/list`・`ping`・`tools/call`（`list_containers`・`start_container`。
 //! TASK-118.3・#466）、通知の黙殺（`notifications/initialized` 等）。`tools/call` の実行は
-//! [`crate::backend::ToolBackend`] へ委ねる。引数の不正は `-32602`（`data.code = INVALID_ARGUMENT`）、
+//! [`crate::backend::ToolBackend`] へ委ねる。要求の形の不正と 2025-06-18 の経路の引数の誤りは
+//! `-32602`（`data.code = INVALID_ARGUMENT`）、2026-07-28 の経路の引数の誤りは `isError`（ERR-5・D8）、
 //! バックエンドの業務エラーは result の `isError: true` に固定文言の `{code, message}` を載せる。
 //!
 //! エラー応答は `crate::error` の `ProtocolError` / `ToolError` で組み立てる（MCP-4・ERR-5・TASK-120.2）。
@@ -31,7 +32,7 @@
 //! `ping`・`initialize` は modern では `-32601`。result には `_meta` の `serverInfo` と
 //! `resultType: "complete"` を足す（`finish_modern` に集約。#717・MCP-3。legacy には付けない）。
 //!
-//! 未実装・簡易実装（REPAIR-3）: 2026-07-28 の経路の引数不正を `isError` で返す扱いも未実装（#4001。現状は `-32602`）。
+//! 未実装・簡易実装（REPAIR-3）:
 //! `start_container` の本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
@@ -182,7 +183,7 @@ pub struct Outcome {
     pub error_code: Option<i64>,
     /// `tools/call` で実行したツールの固定名（`list_containers` / `start_container`）。それ以外は `None`。
     pub tool: Option<&'static str>,
-    /// ツールの業務エラー（`isError: true`）の ERR-1 コード。JSON-RPC としては成功応答のため `error_code` と区別する。
+    /// ツールの業務エラーと 2026-07-28 の経路の入力検証の誤り（`isError: true`）の ERR-1 コード。JSON-RPC としては成功応答のため `error_code` と区別する。
     pub tool_error: Option<&'static str>,
 }
 
@@ -527,7 +528,7 @@ fn dispatch_legacy(
             },
         ),
         "ping" => success(op, id, json!({})),
-        "tools/call" => tools_call(id, params, backend),
+        "tools/call" => tools_call(id, params, backend, Route::Legacy),
         _ => Outcome::err(op, id, ProtocolError::MethodNotFound),
     }
 }
@@ -565,7 +566,7 @@ fn dispatch_modern(
                 cache_scope: Some(CACHE_SCOPE),
             },
         ),
-        "tools/call" => tools_call(id, params, backend),
+        "tools/call" => tools_call(id, params, backend, Route::Modern),
         _ => Outcome::err(op, id, ProtocolError::MethodNotFound),
     }
 }
@@ -592,7 +593,7 @@ fn finish_modern(mut outcome: Outcome) -> Outcome {
     outcome
 }
 
-/// 引数不正（`-32602`・`data.code = INVALID_ARGUMENT`）の応答。固定文言のみで、ツール名・ID を反射させない。
+/// 要求の形の不正と 2025-06-18 の経路の引数の誤り（`-32602`・`data.code = INVALID_ARGUMENT`）の応答。固定文言のみで、ツール名・ID を反射させない。
 fn invalid_arguments(id: Value) -> Outcome {
     Outcome::err("tools/call", id, ProtocolError::InvalidArguments)
 }
@@ -600,7 +601,12 @@ fn invalid_arguments(id: Value) -> Outcome {
 /// 業務エラーの `tools/call` result（`isError: true`）。`crate::error::ToolError` で組み立て（MCP-4・ERR-5）、
 /// `TraitError::message`（パス等を含み得る）は出力へ流さない。
 fn tool_error_result(tool: &'static str, id: Value, err: &TraitError) -> Outcome {
-    let te = ToolError::from_trait_error(err);
+    tool_error_outcome(tool, id, ToolError::from_trait_error(err))
+}
+
+/// `ToolError` から `isError` の result を組む。業務エラーと 2026-07-28 の経路の入力検証の誤り
+/// （`ToolError::invalid_argument`。MCP-3・MCP-4・ERR-5）が共有する。
+fn tool_error_outcome(tool: &'static str, id: Value, te: ToolError) -> Outcome {
     let result = te.to_call_result();
     let mut out = Outcome::ok(
         "tools/call",
@@ -630,7 +636,15 @@ fn tool_success_result(tool: &'static str, id: Value, structured: impl Serialize
 }
 
 /// `tools/call` の params を検証してツールを実行する（MCP-2）。外部入力は `get()` / `as_*()` で扱う。
-fn tools_call(id: Value, params: Option<&Value>, backend: &dyn ToolBackend) -> Outcome {
+///
+/// `route` は引数の誤りの分類だけを分ける（ERR-5・D8）。`Legacy` は `-32602`、`Modern` は `isError`。
+/// 要求の形（`params`・`name`・`arguments` の型）と未知のツールは両経路とも `-32602`。
+fn tools_call(
+    id: Value,
+    params: Option<&Value>,
+    backend: &dyn ToolBackend,
+    route: Route,
+) -> Outcome {
     let Some(params) = params.and_then(Value::as_object) else {
         return invalid_arguments(id);
     };
@@ -655,7 +669,12 @@ fn tools_call(id: Value, params: Option<&Value>, backend: &dyn ToolBackend) -> O
                 .and_then(Value::as_str)
                 .and_then(|s| ContainerId::new(s).ok())
             else {
-                return invalid_arguments(id);
+                return match route {
+                    Route::Legacy => invalid_arguments(id),
+                    Route::Modern => {
+                        tool_error_outcome("start_container", id, ToolError::invalid_argument())
+                    }
+                };
             };
             match backend.start_container(&cid) {
                 Ok(started) => tool_success_result("start_container", id, started),
@@ -2169,5 +2188,130 @@ mod tests {
         assert_eq!(recs[3]["op"], "server/discover");
         assert_eq!(recs[4]["code"], -32022);
         assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
+    }
+
+    // ---- ERR-5・D8（#4001）: 引数の誤りの分類は版で分かれる ----
+
+    fn invalid_argument_expected(id: i64) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"result":{
+            "content":[{"type":"text","text":"{\"code\":\"INVALID_ARGUMENT\",\"message\":\"Invalid argument\"}"}],
+            "isError":true,
+            "resultType":"complete",
+            "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
+        }})
+    }
+
+    /// MCP-3・MCP-4・ERR-5: modern の `container_id` の不備は `isError`（`resultType` つき）になる。
+    #[test]
+    fn err5_modern_invalid_container_id_returns_is_error() {
+        let long = "a".repeat(256);
+        let rests: Vec<String> = vec![
+            r#","name":"start_container""#.to_owned(),
+            r#","name":"start_container","arguments":{}"#.to_owned(),
+            r#","name":"start_container","arguments":{"container_id":1}"#.to_owned(),
+            r#","name":"start_container","arguments":{"container_id":"a/b"}"#.to_owned(),
+            r#","name":"start_container","arguments":{"container_id":".."}"#.to_owned(),
+            r#","name":"start_container","arguments":{"container_id":""}"#.to_owned(),
+            format!(r#","name":"start_container","arguments":{{"container_id":"{long}"}}"#),
+        ];
+        for rest in &rests {
+            let o = handle_message_on(
+                modern_req(7, "tools/call", "2026-07-28", rest).as_bytes(),
+                &fake_ok(),
+                &mut ConnectionState::default(),
+            );
+            assert_eq!(
+                o.reply.as_ref().unwrap(),
+                &invalid_argument_expected(7),
+                "{rest}"
+            );
+            assert_eq!(o.error_code, None);
+            assert_eq!(o.tool, Some("start_container"));
+            assert_eq!(o.tool_error, Some("INVALID_ARGUMENT"));
+        }
+    }
+
+    /// ERR-5: 要求の形の不正と未知のツールは modern でも `-32602` のまま。
+    #[test]
+    fn err5_modern_request_shape_errors_stay_32602() {
+        let rests = [
+            r#","arguments":{}"#,
+            r#","name":1"#,
+            r#","name":"list_containers","arguments":[]"#,
+            r#","name":"list_containers","arguments":null"#,
+            r#","name":"list_containers","arguments":"x""#,
+            r#","name":"start_container","arguments":[]"#,
+            r#","name":"start_container","arguments":null"#,
+            r#","name":"start_container","arguments":"x""#,
+            r#","name":"nope""#,
+        ];
+        for rest in rests {
+            let mut conn = ConnectionState::default();
+            let v = on(&modern_req(8, "tools/call", "2026-07-28", rest), &mut conn);
+            assert_eq!(v, invalid_params_error(8), "{rest}");
+        }
+    }
+
+    /// ERR-5: 同じ接続でも要求ごとに経路が分かれる（`_meta` なしは legacy の `-32602`）。
+    #[test]
+    fn err5_same_connection_splits_by_route() {
+        let mut conn = ConnectionState::default();
+        let init = on(&init_req("1", "2025-06-18"), &mut conn);
+        assert!(init.get("result").is_some());
+        let bad = r#","name":"start_container","arguments":{"container_id":"a/b"}"#;
+        let legacy = on(&tools_call_req(&format!("{{{}}}", &bad[1..])), &mut conn);
+        assert_eq!(legacy["error"]["code"], -32602);
+        assert_eq!(legacy["error"]["data"]["code"], "INVALID_ARGUMENT");
+        let modern = on(&modern_req(9, "tools/call", "2026-07-28", bad), &mut conn);
+        assert_eq!(modern, invalid_argument_expected(9));
+    }
+
+    /// ERR-5・A01: 検証はバックエンドより先で、不正な ID はバックエンドへ届かない。
+    #[test]
+    fn err5_modern_validation_precedes_backend() {
+        let o = handle_message_on(
+            modern_req(
+                1,
+                "tools/call",
+                "2026-07-28",
+                r#","name":"start_container","arguments":{"container_id":".."}"#,
+            )
+            .as_bytes(),
+            &fake_err(ErrorCode::Internal, "x"),
+            &mut ConnectionState::default(),
+        );
+        assert_eq!(o.tool_error, Some("INVALID_ARGUMENT"));
+    }
+
+    /// REPAIR-4: 不合格の入力値は応答にもログにも出ない。
+    #[test]
+    fn err5_modern_invalid_container_id_not_reflected() {
+        let input = format!(
+            "{}\n",
+            modern_req(
+                1,
+                "tools/call",
+                "2026-07-28",
+                r#","name":"start_container","arguments":{"container_id":"zzSECRETzz/x"}"#,
+            )
+        );
+        let out = SharedBuf::default();
+        let mut logs = Vec::new();
+        serve_with(
+            Cursor::new(input),
+            out.clone(),
+            Limits::default(),
+            &fake_ok(),
+            &mut |l| logs.push(l.to_owned()),
+        )
+        .unwrap();
+        let written = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert!(!written.contains("zzSECRETzz"));
+        assert!(logs.iter().all(|l| !l.contains("zzSECRETzz")));
+        let rec: Value = serde_json::from_str(&logs[0]).unwrap();
+        assert_eq!(rec["op"], "tools/call");
+        assert_eq!(rec["tool"], "start_container");
+        assert_eq!(rec["result"], "tool_error");
+        assert_eq!(rec["code"], "INVALID_ARGUMENT");
     }
 }

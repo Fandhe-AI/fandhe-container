@@ -226,3 +226,36 @@ fn mcp3_modern_stateless_requests_over_stdio() {
     assert_eq!(lines[4]["error"]["data"]["requested"], "1900-01-01");
     assert_eq!(lines[4]["error"]["data"]["code"], "UNIMPLEMENTED");
 }
+
+/// ERR-5・D8（#4001）: 引数の誤りは modern で `isError`、legacy（`_meta` なし）で `-32602`。
+#[test]
+fn err5_tool_argument_error_splits_by_route_over_stdio() {
+    let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+    let input = format!(
+        "{}\n{}\n{}\n",
+        format_args!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{{meta},"name":"start_container","arguments":{{"container_id":"a/b"}}}}}}"#
+        ),
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_container","arguments":{"container_id":"a/b"}}}"#,
+    );
+    let out = run(&[], input.as_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).expect("stdout is UTF-8");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("line is JSON"))
+        .collect();
+    assert_eq!(lines.len(), 3, "stdout: {text}");
+    assert_eq!(lines[0]["result"]["isError"], true);
+    assert_eq!(lines[0]["result"]["resultType"], "complete");
+    let body: serde_json::Value = serde_json::from_str(
+        lines[0]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text is a string"),
+    )
+    .expect("text is JSON");
+    assert_eq!(body["code"], "INVALID_ARGUMENT");
+    assert_eq!(lines[2]["error"]["code"], -32602);
+    assert_eq!(lines[2]["error"]["data"]["code"], "INVALID_ARGUMENT");
+}

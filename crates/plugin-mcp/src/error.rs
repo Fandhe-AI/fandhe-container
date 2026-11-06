@@ -6,6 +6,9 @@
 //! - [`ToolError`]: ツール実行時の業務エラー。JSON-RPC error にせず `tools/call` の result
 //!   （`isError: true`、`content[0].text` に `{"code","message"}` の JSON）へ変換する。
 //!
+//! 引数の誤りは版で分かれる（ERR-5・SEP-1303・D8）。2025-06-18 の経路は [`ProtocolError::InvalidArguments`]
+//! （`-32602`）、2026-07-28 の経路は [`ToolError::invalid_argument`]（`isError`）。要求の形の不正は両経路とも `-32602`。
+//!
 //! 契約: `message` は分類ごとの固定英文のみ。メソッド名・ツール名・id・入力値、および
 //! `TraitError::message`（パス等を含み得る）を応答へ反射させない。
 //! `data.code` の割り当て（`-32700` / `-32600` / `-32602` -> `INVALID_ARGUMENT`、
@@ -130,7 +133,8 @@ pub enum ProtocolError {
     MethodNotFound,
     /// 未知のツール名（ERR-5 では `-32602`）。
     UnknownTool,
-    /// 引数のスキーマ違反・params の型不正（`-32602`）。
+    /// `tools/call` の要求の形の不正、`_meta` の必須フィールドの欠落、2025-06-18 の経路の引数のスキーマ違反（`-32602`）。
+    /// 2026-07-28 の経路の引数の誤りは [`ToolError::invalid_argument`]（`isError`。ERR-5・D8）。
     InvalidArguments,
     /// サーバー内部の失敗（`-32603`）。
     Internal,
@@ -175,7 +179,8 @@ impl ProtocolError {
     }
 }
 
-/// ツール実行時の業務エラー（ERR-5 の `isError` 行。MCP-4・TASK-120.1）。
+/// ツール実行時の業務エラー（ERR-5 の `isError` 行。MCP-4・TASK-120.1）。2026-07-28 の経路では
+/// 入力検証の誤り（[`ToolError::invalid_argument`]。SEP-1303・D8・#4001）も担う。
 ///
 /// 保持するのは分類のみ。`TraitError::message` はパス等を含み得るため一切出力へ流さない。
 /// `UNAVAILABLE` は ERR-5 の表に無い core の拡張分類だが、現行どおり業務結果として扱う。
@@ -188,6 +193,14 @@ impl ToolError {
     /// バックエンドの失敗から分類だけを取り出す。
     pub fn from_trait_error(err: &TraitError) -> Self {
         Self { code: err.code() }
+    }
+
+    /// 2026-07-28 の経路の入力検証の誤り（`INVALID_ARGUMENT`。ERR-5・SEP-1303・D8）。
+    /// `message` は固定英文で、入力値・フィールド名を含めない（REPAIR-4）。
+    pub const fn invalid_argument() -> Self {
+        Self {
+            code: ErrorCode::InvalidArgument,
+        }
     }
 
     /// ERR-1 体系の分類。
@@ -443,5 +456,19 @@ mod tests {
         assert_eq!(resp["id"], json!("zzIDzz"));
         let err = resp["error"].to_string();
         assert!(!err.contains("zzIDzz"));
+    }
+
+    /// MCP-4・ERR-5: 2026-07-28 の経路の入力検証の誤りは固定文言の `isError` result になる。
+    #[test]
+    fn err5_tool_error_invalid_argument_call_result() {
+        let te = ToolError::invalid_argument();
+        assert_eq!(te.code_str(), "INVALID_ARGUMENT");
+        assert_eq!(
+            te.to_call_result(),
+            json!({
+                "content": [{"type": "text", "text": "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"Invalid argument\"}"}],
+                "isError": true,
+            })
+        );
     }
 }

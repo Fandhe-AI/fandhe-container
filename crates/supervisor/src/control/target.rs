@@ -32,6 +32,15 @@
 //! 「保留中の再起動の取り消し」を求める要求で、`Exited` のときだけ意図を立てるため。意図の設定とスロットの状態遷移（再 launch の
 //! 登録）は同じロックの下で起きるので、取り消しは必ず「登録前（意図が立ち再起動が止まる）」か「登録後（`ContainerRunning`）」のどちらかになる。
 //!
+//! # 終了の購読（SUP-1・CRI-1・REPAIR-5・#3683）
+//!
+//! ExitWatchRequest（kind 8）の受け入れ先として、スロットは購読の接続（[`ExitWatchHandle`]）を `SlotInner` に預かる。
+//! `Active` で pid が一致し枠に空きがあるときだけ預かり、`mark_exited`（init の回収）・`clear`・世代交代の `register` で
+//! 一覧を空にする。一覧を空にすること（= 接続を閉じること）が購読者への「起きよ」で、スレッドも I/O も使わない
+//! （ロックの下で行うのは fd の close だけ）。期限切れと相手が閉じた購読は [`SignalSlot::prune_exit_watchers`]
+//! （accept ループが定期的に呼ぶ）で落とす。保持の数は [`DEFAULT_MAX_EXIT_WATCHERS`]、1 購読の長さは
+//! `MAX_EXIT_WATCH_HOLD` + [`EXIT_WATCH_PRUNE_GRACE`] で有界。
+//!
 //! 応答の遅れは最大で監視ループの poll 間隔（`start_entry::POLL_INTERVAL`、100ms）。`run.rs`・`restart.rs` の
 //! 公開関数のシグネチャは変えない（REPAIR-1）。全 OS でコンパイル・テストする（std のみ）。
 
@@ -54,6 +63,25 @@ use crate::run::{ExplicitStopRecord, StopToken};
 
 /// 受け箱の容量（超えたら `Busy`。資源の使用量を固定に抑える）。
 pub const INBOX_CAPACITY: usize = 4;
+
+/// 預かれる終了購読の最大数（超えたら `Busy`。資源の使用量を固定に抑える。REPAIR-5・#3683）。
+/// plugin-cri の Wait はコンテナあたり通常 1 件で、数倍の余裕がある。
+pub const DEFAULT_MAX_EXIT_WATCHERS: usize = 8;
+
+/// 購読の保持期限の後に、サーバが接続を預かり続ける猶予。クライアントが先に期限を迎えるための差で、
+/// 通常はサーバ側の期限切れ（早すぎる EOF）は起きない。
+pub const EXIT_WATCH_PRUNE_GRACE: Duration = Duration::from_secs(1);
+
+/// 預かった終了購読の接続の口。`Drop` で接続を閉じる（= 購読者の起床）実装を前提にする（本番は `UnixStream`）。
+pub trait ExitWatchHandle: Send {
+    /// 相手が接続を閉じた、または規約違反のデータを送ってきたなら `true`（待たない。落としてよい購読）。
+    fn is_dead(&mut self) -> bool;
+}
+
+struct ExitWatcher {
+    expires: Instant,
+    handle: Box<dyn ExitWatchHandle>,
+}
 
 /// 監視スレッドへ渡す 1 件のシグナル送信要求。
 struct PendingSignal {
@@ -94,6 +122,8 @@ struct SlotInner {
     state: SlotState,
     /// 明示 stop の意図の書き先（SUP-9）。`None` なら StopRequest は受けられない。
     stop_intent: Option<StopToken>,
+    /// 預かっている終了購読（`Active` の間だけ。遷移・世代交代で空にして閉じる。#3683）。
+    exit_watchers: Vec<ExitWatcher>,
 }
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
@@ -122,6 +152,7 @@ impl SignalSlot {
             next_generation: 1,
             state: SlotState::Empty,
             stop_intent,
+            exit_watchers: Vec::new(),
         })))
     }
 
@@ -135,6 +166,8 @@ impl SignalSlot {
         let mut inner = self.lock();
         let generation = inner.next_generation;
         inner.next_generation = inner.next_generation.wrapping_add(1);
+        // 旧世代の購読は新しいプロセスのものではない。閉じて購読者を起こす（状態の読み直しで新しい pid を見る）。
+        inner.exit_watchers.clear();
         inner.state = SlotState::Active {
             generation,
             pid,
@@ -181,6 +214,8 @@ impl SignalSlot {
         {
             let pid = *pid;
             inner.state = SlotState::Exited { generation, pid };
+            // 終了を購読者へ伝える（接続を閉じる）。
+            inner.exit_watchers.clear();
         }
     }
 
@@ -195,7 +230,64 @@ impl SignalSlot {
         };
         if matches {
             inner.state = SlotState::Empty;
+            inner.exit_watchers.clear();
         }
+    }
+
+    /// 終了の購読を預かる（ExitWatchRequest。SUP-1・CRI-1・REPAIR-5・#3683）。
+    ///
+    /// スロットのロックの下で判定する（シグナルは送らず、受け箱も経由しない）。`Active` で記録 pid が `pid` と一致し、
+    /// 枠（期限切れ・相手が閉じたものを整理した後の [`DEFAULT_MAX_EXIT_WATCHERS`]）に空きがあるときだけ `Ok` で、
+    /// `handle` を `hold` + [`EXIT_WATCH_PRUNE_GRACE`] まで預かる。それ以外は次のとおりで、`handle` は drop される。
+    /// - `Empty`: `NoHandle`。`Exited`: pid 一致なら `ContainerExited`、不一致なら `PidMismatch`。
+    /// - `Active` で pid 不一致: `PidMismatch`。枠が満杯: `Busy`。
+    pub fn watch_exit(
+        &self,
+        pid: NonZeroU32,
+        handle: Box<dyn ExitWatchHandle>,
+        hold: Duration,
+    ) -> ControlReason {
+        let mut inner = self.lock();
+        match &inner.state {
+            SlotState::Empty => return ControlReason::NoHandle,
+            SlotState::Exited { pid: held, .. } => {
+                return if *held == pid {
+                    ControlReason::ContainerExited
+                } else {
+                    ControlReason::PidMismatch
+                };
+            }
+            SlotState::Active { pid: held, .. } => {
+                if *held != pid {
+                    return ControlReason::PidMismatch;
+                }
+            }
+        }
+        let now = Instant::now();
+        inner
+            .exit_watchers
+            .retain_mut(|w| now < w.expires && !w.handle.is_dead());
+        if inner.exit_watchers.len() >= DEFAULT_MAX_EXIT_WATCHERS {
+            return ControlReason::Busy;
+        }
+        let expires = now
+            .checked_add(hold)
+            .and_then(|t| t.checked_add(EXIT_WATCH_PRUNE_GRACE))
+            .unwrap_or(now);
+        inner.exit_watchers.push(ExitWatcher { expires, handle });
+        ControlReason::Ok
+    }
+
+    /// 期限切れと、相手が閉じた終了購読を落とす（accept ループが周回ごとに呼ぶ。#3683・REPAIR-5）。
+    pub fn prune_exit_watchers(&self, now: Instant) {
+        self.lock()
+            .exit_watchers
+            .retain_mut(|w| now < w.expires && !w.handle.is_dead());
+    }
+
+    /// 預かっている終了購読の数（試験と計測用）。
+    pub fn exit_watcher_count(&self) -> usize {
+        self.lock().exit_watchers.len()
     }
 
     /// 保留中の再起動を取り消す（明示 stop の意図を立てる。CancelRestartRequest。SUP-9・SUP-3・#2440）。
@@ -1301,5 +1393,150 @@ mod tests {
         // launch に使った 300ms 以上が差し引かれている。
         assert!(term <= total - Duration::from_millis(300), "{term:?}");
         assert!(term > Duration::ZERO);
+    }
+
+    /// 閉じられた（drop された）回数を数え、`dead` が真なら相手が閉じたものとして報告する偽の購読。
+    struct FakeWatch {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl ExitWatchHandle for FakeWatch {
+        fn is_dead(&mut self) -> bool {
+            self.dead.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for FakeWatch {
+        fn drop(&mut self) {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn watch(
+        closed: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Box<dyn ExitWatchHandle>, Arc<AtomicBool>) {
+        let dead = Arc::new(AtomicBool::new(false));
+        (
+            Box::new(FakeWatch {
+                closed: Arc::clone(closed),
+                dead: Arc::clone(&dead),
+            }),
+            dead,
+        )
+    }
+
+    /// SUP-1・CRI-1・#3683: 購読は `Active` で pid が一致するときだけ預かり、拒否では接続を drop する。
+    #[test]
+    fn sup1_3683_watch_exit_accepts_only_active_matching_pid() {
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = SignalSlot::new();
+        let hold = Duration::from_secs(5);
+        let (h, _) = watch(&closed);
+        assert_eq!(slot.watch_exit(pid(100), h, hold), ControlReason::NoHandle);
+        let (fake, _, exited) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(101), h, hold),
+            ControlReason::PidMismatch
+        );
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
+        let (h, _) = watch(&closed);
+        assert_eq!(slot.watch_exit(pid(100), h, hold), ControlReason::Ok);
+        assert_eq!(slot.exit_watcher_count(), 1);
+        // 終了の観測で購読は閉じられ、以後は ContainerExited / PidMismatch。
+        exited.store(true, Ordering::SeqCst);
+        assert!(cp.wait(Duration::from_millis(1)).unwrap().is_some());
+        assert_eq!(slot.exit_watcher_count(), 0);
+        assert_eq!(closed.load(Ordering::SeqCst), 3);
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(100), h, hold),
+            ControlReason::ContainerExited
+        );
+        let (h, _) = watch(&closed);
+        assert_eq!(slot.watch_exit(pid(7), h, hold), ControlReason::PidMismatch);
+    }
+
+    /// REPAIR-5・#3683: 預かる購読は 8 件まで。9 件目は `Busy`、相手が閉じたものを整理すると空く。
+    #[test]
+    fn repair5_3683_watchers_are_bounded_and_dead_ones_pruned() {
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = SignalSlot::new();
+        let (fake, _, _) = Fake::new(100);
+        let _cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let mut deads = Vec::new();
+        for _ in 0..DEFAULT_MAX_EXIT_WATCHERS {
+            let (h, dead) = watch(&closed);
+            assert_eq!(
+                slot.watch_exit(pid(100), h, Duration::from_secs(5)),
+                ControlReason::Ok
+            );
+            deads.push(dead);
+        }
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(100), h, Duration::from_secs(5)),
+            ControlReason::Busy
+        );
+        deads[0].store(true, Ordering::SeqCst);
+        slot.prune_exit_watchers(Instant::now());
+        assert_eq!(slot.exit_watcher_count(), DEFAULT_MAX_EXIT_WATCHERS - 1);
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(100), h, Duration::from_secs(5)),
+            ControlReason::Ok
+        );
+    }
+
+    /// REPAIR-5・#3683: 保持期限 + 猶予を過ぎた購読は整理で閉じられる。
+    #[test]
+    fn repair5_3683_expired_watcher_is_pruned() {
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = SignalSlot::new();
+        let (fake, _, _) = Fake::new(100);
+        let _cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(100), h, Duration::from_millis(10)),
+            ControlReason::Ok
+        );
+        slot.prune_exit_watchers(Instant::now());
+        assert_eq!(slot.exit_watcher_count(), 1);
+        slot.prune_exit_watchers(
+            Instant::now() + Duration::from_millis(10) + EXIT_WATCH_PRUNE_GRACE,
+        );
+        assert_eq!(slot.exit_watcher_count(), 0);
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+
+    /// SUP-1・#3683: `ControlledProcess` の drop（clear）と世代交代（register）でも購読が閉じる。
+    #[test]
+    fn sup1_3683_watchers_closed_on_clear_and_new_generation() {
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = SignalSlot::new();
+        let (fake, _, _) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(100), h, Duration::from_secs(5)),
+            ControlReason::Ok
+        );
+        // 世代交代: 旧世代の購読は閉じる（新しい世代の購読は残る）。
+        let (fake2, _, _) = Fake::new(200);
+        let cp2 = ControlledProcess::new(Box::new(fake2), slot.clone());
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        let (h, _) = watch(&closed);
+        assert_eq!(
+            slot.watch_exit(pid(200), h, Duration::from_secs(5)),
+            ControlReason::Ok
+        );
+        // 旧世代の drop は新世代の購読に触れない。
+        drop(cp);
+        assert_eq!(slot.exit_watcher_count(), 1);
+        drop(cp2);
+        assert_eq!(slot.exit_watcher_count(), 0);
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
     }
 }

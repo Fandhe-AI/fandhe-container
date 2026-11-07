@@ -22,8 +22,9 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
-//! - `wait_exit` は上書きせず、core の既定（状態ストアの照会による待ち）を使う。supervisor の終了通知を使った
-//!   イベント駆動の上書きは後続（CRI-1・SUP-1。shim v2 の Wait が呼ぶ。#3666）
+//! - `wait_exit` は Linux で supervisor の終了通知（制御チャネルの ExitWatchRequest）を使ったイベント駆動に上書きしている
+//!   （`crate::supervised` の `wait_exit`。通知が使えなければ core の既定と同じ照会へ退避し、期限・取り消しの戻り値も既定と
+//!   同じ。CRI-1・SUP-1・REPAIR-5。shim v2 の Wait が呼ぶ。#3666・#3683）。非 Linux は core の既定（状態ストアの照会）のまま
 //! - `start`・`kill`・`stop` は Linux で supervisor 経由の本番経路へ結線済み（`crate::supervised`。#2434）。契約・期限・
 //!   子プロセスの回収・前提（supervisor を plugin の実体と同じディレクトリに置く・`XDG_RUNTIME_DIR` が環境にある・rootful は
 //!   `UNIMPLEMENTED`）は同 module の doc に従う。実機での通し（委譲 scope 内）は未実施（#850・#2062）。非 Linux では
@@ -81,6 +82,8 @@ use fandhe_container_core::audit_log::{AuditRecord, AuditSink, RECORD_WAIT_LIMIT
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{self, ContainerCgroupRemover, OciRuntimeError};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+#[cfg(target_os = "linux")]
+use fandhe_container_core::traits::WaitExitRequest;
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, CleanupOutcome, CleanupTarget, ContainerId, ContainerRuntime,
     ContainerStatus, CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
@@ -1474,6 +1477,14 @@ impl ContainerRuntime for CoreLifecycleRuntime {
     #[cfg(not(target_os = "linux"))]
     fn stop(&self, _req: &StopRequest) -> Result<ContainerStatus, TraitError> {
         Err(launch_unavailable())
+    }
+
+    /// supervisor の終了通知で起きる待ち（Linux。CRI-1・SUP-1・REPAIR-5・#3683）。状態の取得は自身の `state` を使う。
+    #[cfg(target_os = "linux")]
+    fn wait_exit(&self, req: &WaitExitRequest<'_>) -> Result<ContainerStatus, TraitError> {
+        let state_req = StateRequest::new(req.id().clone());
+        self.supervised
+            .wait_exit(&*self.store, req, &|| self.state(&state_req))
     }
 
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {

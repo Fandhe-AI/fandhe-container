@@ -22,6 +22,8 @@ use super::log_control_event;
 
 /// 要求の計測に使う操作名（`OpRecorder`）。
 const OP_NAME: &str = "control_signal";
+/// 終了購読（ExitWatchRequest）の計測に使う操作名。signal 配送の集計と分ける（#3683・REPAIR-4）。
+const EXIT_WATCH_OP_NAME: &str = "control_exit_watch";
 
 /// 監査の記録先と計測の集計器を束ねた観測の口。サーバが共有で持つ。
 pub struct ControlObserver {
@@ -90,7 +92,17 @@ impl ControlObserver {
 
     /// 1 要求の結果とレイテンシを集計し、構造化ログを 1 行出す。
     pub fn record_request(&self, success: bool, elapsed: Duration) {
-        let Ok(name) = OpName::new(OP_NAME) else {
+        self.record_op(OP_NAME, success, elapsed);
+    }
+
+    /// 終了購読（ExitWatchRequest）1 件の結果とレイテンシを集計する（#3683・REPAIR-4）。レイテンシは
+    /// 購読の受理までで、購読の保持時間は含まない。
+    pub fn record_exit_watch(&self, success: bool, elapsed: Duration) {
+        self.record_op(EXIT_WATCH_OP_NAME, success, elapsed);
+    }
+
+    fn record_op(&self, op: &'static str, success: bool, elapsed: Duration) {
+        let Ok(name) = OpName::new(op) else {
             return;
         };
         let outcome = if success {
@@ -104,7 +116,7 @@ impl ControlObserver {
             .snapshot_op(&name)
             .map_or((0, 0), |s| (s.success(), s.failure()));
         let line = format!(
-            "{{\"component\":\"supervisor\",\"event\":\"control_request\",\"op\":\"{OP_NAME}\",\"outcome\":\"{}\",\"latency_us\":{},\"success_total\":{ok},\"failure_total\":{ng}}}\n",
+            "{{\"component\":\"supervisor\",\"event\":\"control_request\",\"op\":\"{op}\",\"outcome\":\"{}\",\"latency_us\":{},\"success_total\":{ok},\"failure_total\":{ng}}}\n",
             if success { "ok" } else { "error" },
             elapsed.as_micros()
         );

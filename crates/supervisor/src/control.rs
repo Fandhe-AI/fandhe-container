@@ -17,7 +17,7 @@
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
 //! | `exec_guard` | exec 子 cgroup の回収の見張り（pidfd を渡した接続を預かり、切断か期限で回収役を呼ぶ。Linux。#2626） |
-//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`）、Linux のみ `ControlExecHandover`（CLI の `exec` 用に起動時 pidfd の複製を `SCM_RIGHTS` で受け取る。#2626） |
+//! | `client` | 終了の購読の入口 `ControlExitWatcher`（plugin-cri の `wait_exit` 用。下の「終了の購読」）と、CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`）、Linux のみ `ControlExecHandover`（CLI の `exec` 用に起動時 pidfd の複製を `SCM_RIGHTS` で受け取る。#2626） |
 //!
 //! # exec 用 pidfd の受け渡し（SUP-6・SEC-1・#2626）
 //!
@@ -32,6 +32,16 @@
 //! ExecCgroupNotify（kind 7）でその名前を通知し、ガードは ack の後、接続の切断（CLI の消滅を含む）か保持期限で、
 //! その cgroup を `cgroup.kill` と削除で回収する。PDEATHSIG の届かない子孫（`--timeout` を超えた残留）を、生存する
 //! supervisor が回収する（SUP-6・REPAIR-5）。回収役が結線されていない構成は pidfd を渡さない（fail-closed）。
+//!
+//! # 終了の購読（SUP-1・CRI-1・REPAIR-5・#3683）
+//!
+//! plugin-cri の `wait_exit` が、コンテナの終了を状態の照会（既定 100ms 間隔）ではなく通知で待つための口。ExitWatchRequest
+//! （kind 8）で購読すると、supervisor は `Response(Ok)` の後、コンテナの終了（init の回収）・世代交代・保持期限（最大 60 秒）の
+//! いずれかで接続を閉じ、購読者はそれを起床の合図にして状態ストアを読み直す。通知はヒントに過ぎず、返す状態は常に状態
+//! ストアの記録である。クライアント入口は [`ExitNotifier`]（本番は [`production_exit_notifier`] の [`ControlExitWatcher`]、
+//! 試験は差し替え）。通知が使えない（supervisor 不在・古い版・非 Linux）ときは [`ExitWatchOutcome::NoSupervisor`] を返し、
+//! 呼び出し側は照会へ退避する。新しいスレッドは作らない（サーバは接続の複製をスロットに預け、クライアントは 10ms 刻みの
+//! 読み取りで取り消しと期限を見る）。
 //!
 //! # 寿命
 //!
@@ -74,7 +84,7 @@ pub mod server;
 
 #[cfg(target_os = "linux")]
 pub use client::ControlExecHandover;
-pub use client::{CancelOutcome, ControlRestartCanceller, ControlSignaler};
+pub use client::{CancelOutcome, ControlExitWatcher, ControlRestartCanceller, ControlSignaler};
 #[cfg(target_os = "linux")]
 pub use exec_guard::{
     ExecCgroupReclaimer, ExecGuardLimits, ExecGuardPool, ReclaimOutcome, StoreExecReclaimer,
@@ -165,6 +175,51 @@ pub fn production_restart_canceller(
         Some(root) => std::sync::Arc::new(ControlRestartCanceller::new(root.to_path_buf())),
         None => std::sync::Arc::new(UnavailableRestartCanceller),
     }
+}
+
+/// [`ExitNotifier::watch`] の結果（SUP-1・CRI-1・REPAIR-5・#3683）。いずれも「状態ストアを読み直す」か「通知を諦める」の
+/// 合図で、コンテナが終了したという主張ではない（正しさは状態ストアに置く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExitWatchOutcome {
+    /// 終了の通知（または既に終了済みの応答）を受けた。状態を読み直す。
+    Woken,
+    /// 要求の pid と supervisor が保持する pid が違う（再起動などで入れ替わった）。状態を読み直す。
+    PidChanged,
+    /// 購読の期限（`until`）まで何も起きなかった。状態を読み直して、必要なら購読し直す。
+    Expired,
+    /// 呼び出し側の取り消し（`cancel` が真）で中断した。
+    Cancelled,
+    /// 届く supervisor が無い・通知を知らない古い版・信頼できない相手・非 Linux。以後この呼び出しでは通知を使わない。
+    NoSupervisor,
+    /// 一時的な失敗（枠が満杯・ハンドシェイクの期限・I/O の失敗）。1 回分は照会で待ち、次の周回で購読をやり直す。
+    Transient,
+}
+
+/// コンテナの終了を通知で待つ注入点（plugin-cri の `wait_exit` 用。SUP-1・CRI-1・REPAIR-5・#3683）。
+///
+/// 本番は [`ControlExitWatcher`]（supervisor の制御チャネルの ExitWatchRequest）、試験は差し替える。
+pub trait ExitNotifier: Send + Sync {
+    /// `pid`（記録上の pid1）のコンテナの終了を `until` まで購読する。`cancel` は 10ms 程度の刻みで確かめ、真なら
+    /// [`ExitWatchOutcome::Cancelled`] で戻る。`until` を超えて待たない。シグナルは送らず、fd も受け取らない。
+    fn watch(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        pid: std::num::NonZeroU32,
+        until: std::time::Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> ExitWatchOutcome;
+}
+
+/// 本番の終了購読の入口（#3683）。`host_state_root()` の無いストアには `None`（通知は使わず、呼び出し側は照会だけで待つ。
+/// `state.json` の pid に頼る縮退は持たない）。
+pub fn production_exit_notifier(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> Option<std::sync::Arc<dyn ExitNotifier>> {
+    store.host_state_root().map(|root| {
+        std::sync::Arc::new(ControlExitWatcher::new(root.to_path_buf()))
+            as std::sync::Arc<dyn ExitNotifier>
+    })
 }
 
 /// 稼働中コンテナの起動時 pidfd の複製を取得する注入点（CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ。

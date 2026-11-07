@@ -115,10 +115,6 @@ const ENOTSUP: i32 = 45;
 /// ディレクトリ fd や一部のファイルシステムで `F_FULLFSYNC` が非対応を返すため。これ以外は fail-closed。
 pub(crate) const FULLFSYNC_FALLBACK_ERRNOS: [i32; 2] = [EINVAL, ENOTSUP];
 
-/// 自前の定数と `libc` の定数を `const` 評価で 1 件照合する試験専用マクロ（#1848・#1837・#1318・MVM-4・
-/// REPAIR-7・REPAIR-12）。Linux の `sys.rs` の同名マクロと同じ方式（macOS 側は別ファイルのため複製）。
-/// 両辺の型を引数で明記し、比較は `as i128`（64 bit 以下の整数では値を切り詰めない）で行う。
-/// 食い違いは宣言を直す別 issue とし、試験側を合わせない。関数は呼ばず `unsafe` を使わない。
 /// ACL 判定の errno の写像の試験（SEC-4・CORE-1・#4048）。errno 0 は判定不能で許可側へ倒さないこと、
 /// 従来の `ENOENT`（ACL 無し）・`EINVAL`（空の ACL）は `Ok(false)` のままであることを具体値で照合する。
 #[cfg(test)]
@@ -140,6 +136,10 @@ mod acl_errno_tests {
     }
 }
 
+/// 自前の定数と `libc` の定数を `const` 評価で 1 件照合する試験専用マクロ（#1848・#1837・#1318・MVM-4・
+/// REPAIR-7・REPAIR-12）。Linux の `sys.rs` の同名マクロと同じ方式（macOS 側は別ファイルのため複製）。
+/// 両辺の型を引数で明記し、比較は `as i128`（64 bit 以下の整数では値を切り詰めない）で行う。
+/// 食い違いは宣言を直す別 issue とし、試験側を合わせない。関数は呼ばず `unsafe` を使わない。
 #[cfg(test)]
 macro_rules! libc_const_eq {
     ($own:path, $own_ty:ty, $lib:path, $lib_ty:ty) => {{

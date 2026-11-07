@@ -139,7 +139,9 @@
 //! シナリオ pty-init（端末つき起動。CRI-6・SEC-1・CORE-5・#4070）は `with_terminal_support()` の launcher で `process.terminal: true` を
 //! start し、`take_pty_master` で受けた master がホストの `/dev/pts` と別の devpts の pty であること、コンテナ内プローブの fd 0〜2 が
 //! その master の slave（`136:N`。N は master の `fdinfo` の `tty-index`）で PID 1 がセッションリーダー・制御端末が fd 0 であることを
-//! 照合する。成功行は `production_launcher: init pty allocated from the container devpts and master handed over (scenario=pty-init)`。
+//! 照合する。あわせて `/dev/console` が同じ slave（`136:N`）の bind マウントで所有者が 0 であることを照合する（OCI-4・CORE-2・#4071。
+//! 割り当てと bind は制限の適用の前〔pre-stage〕）。terminal 無効で `/dev/console` を作らないことは単体試験が担う。
+//! 成功行は `production_launcher: init pty allocated from the container devpts and master handed over (scenario=pty-init)`。
 //!
 //! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
 //! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
@@ -854,6 +856,27 @@ mod linux {
         emit(format!(
             "TTY_CTTY_MATCHES_FD0 {}",
             rdev_of(0).is_ok_and(|r| r == tty_nr && tty_nr != 0)
+        ));
+        // `/dev/console`(OCI-4・CORE-2・#4071): init の slave の bind。symlink ではなく文字デバイスで、`rdev` が fd 0 と同じ
+        // slave、マウント先として mountinfo にあり、所有者は単一写像の root(0)。
+        match std::fs::symlink_metadata("/dev/console") {
+            Ok(m) if m.file_type().is_symlink() => emit("TTY_CONSOLE symlink".to_string()),
+            Ok(m) => {
+                emit(format!(
+                    "TTY_CONSOLE {}:{}",
+                    dev_major(m.rdev()),
+                    dev_minor(m.rdev())
+                ));
+                emit(format!("TTY_CONSOLE_OWNER {}", m.uid()));
+            }
+            Err(e) => emit(format!("TTY_CONSOLE error:{:?}", e.kind())),
+        }
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        emit(format!(
+            "TTY_CONSOLE_MOUNT {}",
+            mountinfo
+                .lines()
+                .any(|l| l.split_whitespace().nth(4) == Some("/dev/console"))
         ));
     }
 
@@ -3023,6 +3046,14 @@ mod linux {
                 "init is the session leader"
             );
             assert_eq!(value_of(&lines, "TTY_CTTY_MATCHES_FD0"), "true");
+            // terminal 有効では pivot 後の `/dev/console` が同じ slave の bind(OCI-4・CORE-2・#4071)。
+            assert_eq!(
+                value_of(&lines, "TTY_CONSOLE"),
+                want,
+                "/dev/console must be the init pty slave"
+            );
+            assert_eq!(value_of(&lines, "TTY_CONSOLE_MOUNT"), "true");
+            assert_eq!(value_of(&lines, "TTY_CONSOLE_OWNER"), "0");
         }));
         finish_started(started, verified);
         let (rx, reader) = reader_slot.take().expect("reader slot");

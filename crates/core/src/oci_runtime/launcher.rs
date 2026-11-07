@@ -73,8 +73,10 @@
 //!
 //! - **端末つき起動(CRI-6・SEC-1・CORE-5・#4070)**: `ProductionLauncherBuilder::with_terminal_support` で opt-in した launcher だけが
 //!   `process.terminal: true` を受け、PID 1 が pivot 後のコンテナの devpts から pty を割り当てて slave を fd 0〜2 と制御端末にし、
-//!   master を `LaunchedProcess::take_pty_master` で返す(割り当ては制限の適用の後。受信の位置は `exec::launch_intermediate` を参照)。
-//!   `/dev/console` への bind は #4071、supervisor の opt-in・master の保持・tty の捕捉は #4074、CRI の拒否の解除は #4078。
+//!   master を `LaunchedProcess::take_pty_master` で返す(受信の位置は `exec::launch_intermediate` を参照)。割り当てと slave の
+//!   `/dev/console` への bind(#4071)は、bind の `open_tree`・`move_mount` が seccomp の拒否集合にあり `CAP_SYS_ADMIN` も要るため、
+//!   pivot 後・制限(ステージ列)の **前**に行う(runc と同じ位置。`process.user` が 0/0 以外なら slave の所有者を補正する)。
+//!   supervisor の opt-in・master の保持・tty の捕捉は #4074、CRI の拒否の解除は #4078。
 //! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
 //!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。

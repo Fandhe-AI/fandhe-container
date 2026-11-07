@@ -559,7 +559,7 @@ fn exec_entrypoint_verified_reporting(
     entry: &Entrypoint,
     nulling: StdioNulling,
     status: Option<&std::fs::File>,
-    pty: Option<ExecPtySender>,
+    pty: Option<(ExecPtySender, InitPty)>,
 ) -> Result<Infallible, ExecError> {
     let Some(status) = status else {
         // 状態 pipe の無い経路（試験用の最小入口）は端末つき起動を持たない。
@@ -568,13 +568,14 @@ fn exec_entrypoint_verified_reporting(
     // 失敗した手順を `E <step> ...` の段として運ぶ（#2895）。`prepare_exec_child` の段は共有語彙のまま写す。
     let prepared = verify_pivot_root(pivot_mnt_id)
         .map_err(|e| (ExecPhaseStep::VerifyRoot, Box::new(e)))
-        // 端末つき起動(`process.terminal: true`)は、pivot 後の `/` の照合の後・`prepare_exec_child` の前に pty を割り当て、
-        // slave を fd 0〜2 に付け替えて `nulling` を取り直す(CRI-6・SEC-1・CORE-5・#4070)。制限(capability 削減・NNP・
-        // Landlock・seccomp)は `run_child_then` が済ませた後で、ホストの devpts へは届かない。
+        // 端末つき起動(`process.terminal: true`)は、pivot 後の `/` の照合の後・`prepare_exec_child` の前に、pre-stage で
+        // 割り当て済みの pty の master を C へ送り、slave を fd 0〜2 に付け替えて `nulling` を取り直す(CRI-6・SEC-1・
+        // CORE-5・#4070)。割り当てと `/dev/console` への bind は bind の特権要件のため制限(capability 削減・NNP・Landlock・
+        // seccomp)の前に済ませてあり(#4071)、ここは送信と付け替えだけ。ホストの devpts へは届かない。
         .and_then(|()| match pty {
             None => Ok(nulling),
-            Some(sender) => {
-                attach_launch_pty(sender).map_err(|e| (ExecPhaseStep::Pty, Box::new(e)))
+            Some((sender, init)) => {
+                attach_launch_pty(sender, init).map_err(|e| (ExecPhaseStep::Pty, Box::new(e)))
             }
         })
         .and_then(|nulling| {
@@ -613,21 +614,22 @@ fn exec_entrypoint_verified_reporting(
 /// 起動し、kubelet の最初の resize で決まる（`docs/design/cri-streaming-server.md` D6。CRI-6・#4070）。
 const LAUNCH_PTY_INITIAL_SIZE: WindowSize = WindowSize::new(0, 0);
 
-/// 端末つき起動の PID 1 が、pivot 後のコンテナの devpts から pty を割り当て、master を親（C）へ送り、slave を
+/// 端末つき起動の PID 1 が、pre-stage で割り当て済みの pty（`RealPrePivotOps::attach_init_console` が pivot 後の
+/// コンテナの devpts から割り当て、slave を `/dev/console` へ bind 済み。#4071）の master を親（C）へ送り、slave を
 /// fd 0〜2 に付け替える（CRI-6・SEC-1・CORE-5・#4070）。戻り値は取り直した `StdioNulling`（3 本とも付け替え済みで
 /// `controlling_tty`。`setsid` 直後の `TIOCSCTTY` は `prepare_exec_child` が行う）。
 ///
-/// - 起点は pivot 後の `/` だけ（[`pty::allocate_in_root`] が `dev`→`pts`→`ptmx`→`N` を `O_NOFOLLOW` で辿り、devpts の
-///   magic・`rdev`・`st_dev` を検証する）。ホストの devpts へ届く口は無い
+/// - 割り当ての起点は pivot 後の `/` だけ（[`pty::allocate_in_root`] が `dev`→`pts`→`ptmx`→`N` を `O_NOFOLLOW` で辿り、
+///   devpts の magic・`rdev`・`st_dev` を検証する）。ホストの devpts へ届く口は無い
 /// - master は `hand_over` が送って閉じる。workload に残るのは slave（fd 0〜2）だけで、ソケットの子の端は
 ///   `hand_over` が消費する。`install` の退避用の複製（3 以上）は `install` の中で drop され、残りは
 ///   `close_inherited_fds`・close-on-exec が exec までに閉じる
-/// - `/dev/console` への bind は #4071 の範囲。ここで slave を保持し続けない
-fn attach_launch_pty(sender: ExecPtySender) -> Result<StdioNulling, ExecError> {
-    let root = sys::open_dir_path_nofollow(None, c"/")
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "openat(/) for the init pty"))?;
-    let (master, slave) = pty::allocate_in_root(root.as_fd(), LAUNCH_PTY_INITIAL_SIZE)?;
-    drop(root);
+/// - `/dev/console` への bind は pre-stage で済んでいる(割り当てを制限の前へ移した理由は `pty::bind_console`)。
+///   ここで保持するのは fd 0〜2 の slave だけ
+fn attach_launch_pty(
+    sender: ExecPtySender,
+    (master, slave): InitPty,
+) -> Result<StdioNulling, ExecError> {
     sender.hand_over(master)?;
     ChildStdio::from_pty_slave(slave)?.install()
 }
@@ -2671,24 +2673,54 @@ fn run_child(
 ) -> Result<Infallible, ExecError> {
     // 状態 pipe は pivot 前段の報告（`P`/`F`）に続き、終端でも exec 前の 2 行目（`R`/`E`）に使う（#2624）。
     let status = setup.and_then(|s| s.status);
-    run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
-        // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
-        // 失敗した検証を `E <step> ...` の段として運ぶ（#2895）。
-        let checked = isolation
-            .verify_caller(IsolationStage::Exec)
-            .map_err(|e| (ExecPhaseStep::VerifyCaller, Box::new(e)))
-            .and_then(|()| {
-                require_restriction_evidence(evidence)
-                    .map_err(|e| (ExecPhaseStep::RestrictionEvidence, Box::new(e)))
-            });
-        if let Err((step, err)) = checked {
-            if let Some(status) = status {
-                report_exec_failure_best_effort(status, step, &err);
+    // 端末つき起動なら、`run_child_then` が pre-stage で pty を割り当て `/dev/console` へ bind する(#4071)。
+    let terminal_console = pty.is_some();
+    run_child_then(
+        rootfs,
+        setup,
+        stages,
+        terminal_console,
+        |isolation, report, evidence, init_pty| {
+            // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
+            // 失敗した検証を `E <step> ...` の段として運ぶ（#2895）。
+            let checked = isolation
+                .verify_caller(IsolationStage::Exec)
+                .map_err(|e| (ExecPhaseStep::VerifyCaller, Box::new(e)))
+                .and_then(|()| {
+                    require_restriction_evidence(evidence)
+                        .map_err(|e| (ExecPhaseStep::RestrictionEvidence, Box::new(e)))
+                });
+            if let Err((step, err)) = checked {
+                if let Some(status) = status {
+                    report_exec_failure_best_effort(status, step, &err);
+                }
+                return Err(*err);
             }
-            return Err(*err);
-        }
-        exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status, pty)
-    })
+            // 送信口と割り当て済みの pty は対で揃うはず。片方だけなら exec へ進まない(fail-closed)。
+            let terminal = match (pty, init_pty) {
+                (None, None) => None,
+                (Some(sender), Some(init)) => Some((sender, init)),
+                _ => {
+                    let err = ExecError::new(
+                        ErrorCode::Internal,
+                        IsolationStage::Exec,
+                        "the init pty and its sender are not paired",
+                    );
+                    if let Some(status) = status {
+                        report_exec_failure_best_effort(status, ExecPhaseStep::Pty, &err);
+                    }
+                    return Err(err);
+                }
+            };
+            exec_entrypoint_verified_reporting(
+                report.new_root_mnt_id,
+                entry,
+                nulling,
+                status,
+                terminal,
+            )
+        },
+    )
 }
 
 /// pivot 前に rootfs へ載せるものの指定（TASK-29 追補・#1715。CORE-1・CORE-5・SEC-1）。
@@ -2853,6 +2885,15 @@ trait PrePivotOps {
         pivoted: &Self::Pivoted,
         working_dir: &ContainerWorkingDir,
     ) -> Result<(), ExecError>;
+    /// 端末つき起動(`process.terminal: true`)の init の pty の割り当てと `/dev/console` への bind(CRI-6・SEC-1・OCI-4・
+    /// CORE-2・#4071)。`enter_working_dir` の後・ステージ列の前(bind の `open_tree`・`move_mount` は seccomp の拒否集合に
+    /// あり `CAP_SYS_ADMIN` も要るため、この位置でしかできない。runc の `setupConsole`・`mountConsole` と同じ位置)。
+    /// `owner` は `process.user` が 0/0 以外のときの uid(slave の所有者を後退させない補正)。
+    fn attach_init_console(
+        &self,
+        pivoted: &Self::Pivoted,
+        owner: Option<u32>,
+    ) -> Result<(), ExecError>;
 }
 
 /// `create_default_devices` の結果と、検証済みの `/dev/null`（`masked_paths` 段の複製元。SEC-2・#1851）。
@@ -2871,6 +2912,8 @@ struct DeviceSet {
 #[derive(Default)]
 struct RealPrePivotOps {
     mounted: std::cell::RefCell<MountedTargets>,
+    /// `attach_init_console` が割り当てた pty(終端が master の送信と slave の付け替えに使う)。
+    console: std::cell::RefCell<Option<InitPty>>,
 }
 
 impl RealPrePivotOps {
@@ -2909,7 +2952,15 @@ impl RealPrePivotOps {
     fn into_mounted(self) -> MountedTargets {
         self.mounted.into_inner()
     }
+
+    /// `attach_init_console` が割り当てた pty を取り出す(終端 `run_child` の引数。無ければ `None`)。
+    fn take_console(&self) -> Option<InitPty> {
+        self.console.borrow_mut().take()
+    }
 }
+
+/// 端末つき起動の init の pty(master は C へ送り、slave は fd 0〜2 と `/dev/console` になる)。
+type InitPty = (pty::PtyMaster, pty::PtySlave);
 
 impl PrePivotOps for RealPrePivotOps {
     type Isolation = MountIsolation;
@@ -3106,6 +3157,36 @@ impl PrePivotOps for RealPrePivotOps {
     ) -> Result<(), ExecError> {
         enter_working_dir(pivoted, working_dir)
     }
+
+    fn attach_init_console(
+        &self,
+        pivoted: &PivotReport,
+        owner: Option<u32>,
+    ) -> Result<(), ExecError> {
+        const STAGE: IsolationStage = IsolationStage::CreateDevices;
+        // pivot 後の `/` が pivot_root が用意した root であることを照合してから、その fd 起点で割り当てる。
+        let root = sys::open_dir_path_nofollow(None, c"/")
+            .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/) for the init console"))?;
+        if fd_mount_id(&root, STAGE)? != pivoted.new_root_mnt_id {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                "/ is not the root prepared by pivot_root",
+            ));
+        }
+        let (master, slave) = pty::allocate_in_root(root.as_fd(), LAUNCH_PTY_INITIAL_SIZE)?;
+        // 割り当てがステージ列(`setresuid`)より前になったため、slave の所有者は ns 内の root になる。`process.user` が
+        // 0/0 以外なら、capability の残る今のうちに対象の uid へ補正する(runc の `fixStdioPermissions` 相当。gid は
+        // devpts の `gid=` のまま変えない)。失敗は起動失敗(fail-closed)。
+        if let Some(uid) = owner {
+            std::os::unix::fs::fchown(slave.as_fd(), Some(uid), None).map_err(|e| {
+                ExecError::from_io(&e, STAGE, "fchown(init pty slave) to the process user")
+            })?;
+        }
+        pty::bind_console(root.as_fd(), &slave)?;
+        *self.console.borrow_mut() = Some((master, slave));
+        Ok(())
+    }
 }
 
 /// 固定した rootfs の実体と、`prepare_rootfs` の後に得た mount top の実体が同じか（純関数。fail-closed）。
@@ -3153,6 +3234,22 @@ fn check_etc_overlaps_exec(
     let empty = TmpfsMountSet::new();
     crate::etc_files::check_etc_overlaps(mounts.selection(), tmpfs.unwrap_or(&empty), inject, binds)
         .map_err(|e| ExecError::new(e.code(), IsolationStage::MountEtcFiles, e.message()))
+}
+
+/// 端末つき起動の init の console の要求(`process.terminal: true`)。`owner` は `process.user` の uid(0/0 以外のときだけ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConsoleRequest {
+    owner: Option<u32>,
+}
+
+/// `console` なし(terminal 無効)の [`run_pre_pivot_with_console`]（単体試験の入口）。
+#[cfg(test)]
+fn run_pre_pivot<O: PrePivotOps>(
+    ops: &O,
+    rootfs: &Path,
+    setup: Option<PrePivotSetup<'_>>,
+) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
+    run_pre_pivot_with_console(ops, rootfs, setup, None)
 }
 
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
@@ -3210,10 +3307,18 @@ fn check_etc_overlaps_exec(
 /// `root.readonly=true`（`setup.root_readonly`。#2767）は `pivot_root` → `root_readonly` → `working_dir` の順で、
 /// pivot 前の段が rootfs へ書き込み終えた後に `/` の mount top へ読み取り専用の属性を足す（非再帰・属性の追加のみ。
 /// ステージ列の seccomp が `mount_setattr` を拒否する前に済ませる）。`false` または `setup` なしでは呼ばない。
-fn run_pre_pivot<O: PrePivotOps>(
+///
+/// # 端末つき起動の console の段(#4071)
+///
+/// `console` が `Some` のとき、`working_dir` の後(ステージ列の前)に init の pty の
+/// 割り当てと `/dev/console` への bind の段 `console` を足す(CRI-6・SEC-1・OCI-4・CORE-2・#4071)。`None`(terminal 無効)
+/// では段を呼ばず、`/dev/console` を作らない。割り当てを制限の前に置くのは、bind の `open_tree`・`move_mount` が seccomp の
+/// 拒否集合にあり `CAP_SYS_ADMIN` も要るため(runc の `setupConsole`・`mountConsole` と同じ位置)。
+fn run_pre_pivot_with_console<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
     setup: Option<PrePivotSetup<'_>>,
+    console: Option<ConsoleRequest>,
 ) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
     use PrePivotStep as S;
     let isolation = ops
@@ -3293,6 +3398,10 @@ fn run_pre_pivot<O: PrePivotOps>(
         ops.enter_working_dir(&pivoted, wd)
             .map_err(StepError::at(S::WorkingDir))?;
     }
+    if let Some(request) = console {
+        ops.attach_init_console(&pivoted, request.owner)
+            .map_err(StepError::at(S::Console))?;
+    }
     Ok((isolation, pivoted))
 }
 
@@ -3319,15 +3428,24 @@ fn run_child_then<T>(
     rootfs: &Path,
     setup: Option<PrePivotSetup<'_>>,
     stages: StagePipeline,
+    terminal_console: bool,
     terminal: impl FnOnce(
         &MountIsolation,
         &PivotReport,
         Result<LaunchReady, LaunchNotReady>,
+        Option<InitPty>,
     ) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
     let status = setup.and_then(|s| s.status);
     let ops = RealPrePivotOps::default();
-    let (isolation, report) = match (run_pre_pivot(&ops, rootfs, setup), status) {
+    // 端末つき起動なら、ステージ列の前(pre-stage)に init の pty を割り当てて `/dev/console` へ bind する(#4071)。
+    let console = terminal_console.then(|| ConsoleRequest {
+        owner: stages.process_owner_uid(),
+    });
+    let (isolation, report) = match (
+        run_pre_pivot_with_console(&ops, rootfs, setup, console),
+        status,
+    ) {
         (Ok(done), None) => done,
         (Err(failed), None) => return Err(failed.error),
         // 成功の報告に失敗したら先へ進まない（親が結果を判定できないまま exec しない。fail-closed）。
@@ -3348,6 +3466,7 @@ fn run_child_then<T>(
     };
     // pivot 後・終端前にステージ列を固定順で実行する。pivot 前段が記録したマウントの識別子を Landlock 段へ渡す
     // （Mount 由来のルールの対象がマウントのルートであることの照合。#2071）。
+    let init_pty = ops.take_console();
     let stages = stages.with_mounted_targets(ops.into_mounted());
     // 成功の報告（`P`）の直後に、Mount 由来のルールの識別子を親へ返す（exec の再適用が `state.json` の識別子で
     // 重ねられたマウントを検出する元。SEC-1・SEC-4・#3201）。書けなければ先へ進まない（fail-closed）。
@@ -3357,7 +3476,7 @@ fn run_child_then<T>(
     let mut terminal_ran = false;
     let result = stages.run_then(|_stage_report, _capability_report, evidence| {
         terminal_ran = true;
-        terminal(&isolation, &report, evidence)
+        terminal(&isolation, &report, evidence, init_pty)
     });
     // Landlock 段の失敗は seccomp の listener を送る前に起きるため、親は listener の EOF しか見えない。
     // 照合の違反を親の監査へ届けられるよう、状態 pipe に `E landlock ...` を書く（SEC-1・SEC-4・CORE-5・#2130）。
@@ -3433,13 +3552,19 @@ where
 {
     let pid = sys::fork_single_threaded(
         move || {
-            let result = run_child_then(rootfs, None, stages, |isolation, _report, _evidence| {
-                // 本番 `run_child` と同じ呼び出し元検証（PID 1・入れ子 PID namespace・シングルスレッド）を
-                // プローブ実行前に行う。`require_restriction_evidence` は意図的に呼ばない（下記の例外）。
-                isolation.verify_caller(IsolationStage::Exec)?;
-                probe();
-                Ok(())
-            });
+            let result = run_child_then(
+                rootfs,
+                None,
+                stages,
+                false,
+                |isolation, _report, _evidence, _pty| {
+                    // 本番 `run_child` と同じ呼び出し元検証（PID 1・入れ子 PID namespace・シングルスレッド）を
+                    // プローブ実行前に行う。`require_restriction_evidence` は意図的に呼ばない（下記の例外）。
+                    isolation.verify_caller(IsolationStage::Exec)?;
+                    probe();
+                    Ok(())
+                },
+            );
             match result {
                 Ok(()) => 0,
                 Err(err) => {
@@ -3620,7 +3745,8 @@ where
                 rootfs,
                 Some(setup),
                 stages,
-                |isolation, _report, _evidence| {
+                false,
+                |isolation, _report, _evidence, _pty| {
                     isolation.verify_caller(IsolationStage::Exec)?;
                     probe();
                     Ok(())
@@ -3676,7 +3802,8 @@ where
                 rootfs,
                 Some(setup),
                 stages,
-                |isolation, _report, _evidence| {
+                false,
+                |isolation, _report, _evidence, _pty| {
                     isolation.verify_caller(IsolationStage::Exec)?;
                     probe();
                     Ok(())
@@ -7140,6 +7267,8 @@ mod tests {
     thread_local! {
         /// `masked_paths` 段が受けた sysfs の証跡の有無（#2014。呼び出し順の記録とは別に持つ）。
         static SYSFS_PROOF_SEEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        /// `console` 段が受けた `owner`(#4071)。
+        static CONSOLE_OWNER_SEEN: std::cell::Cell<Option<Option<u32>>> = const { std::cell::Cell::new(None) };
     }
 
     impl RecordingOps {
@@ -7220,6 +7349,10 @@ mod tests {
         }
         fn enter_working_dir(&self, _: &(), _: &ContainerWorkingDir) -> Result<(), ExecError> {
             self.step("working_dir")
+        }
+        fn attach_init_console(&self, _: &(), owner: Option<u32>) -> Result<(), ExecError> {
+            CONSOLE_OWNER_SEEN.with(|c| c.set(Some(owner)));
+            self.step("console")
         }
     }
 
@@ -7309,6 +7442,76 @@ mod tests {
                 "pivot_root",
             ]
         );
+    }
+
+    /// CRI-6・OCI-4・CORE-2・SEC-1(#4071): 端末つき起動の console の段は `working_dir` の後(ステージ列の前)に 1 回だけ呼ばれ、
+    /// `process.user` の uid(補正の対象)を受け取る。terminal 無効では呼ばれない(`/dev/console` を作らない)。
+    #[test]
+    fn cri6_4071_console_step_runs_after_working_dir_only_for_terminal() {
+        let wd = ContainerWorkingDir::parse(Path::new("/work")).unwrap();
+        let setup = || PrePivotSetup {
+            sysctls: None,
+            devices: DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            etc_files: None,
+            binds: None,
+            sysfs: None,
+            pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
+            status: None,
+            working_dir: Some(&wd),
+            root_readonly: true,
+        };
+        let tail = ["pivot_root", "root_readonly", "working_dir"];
+        // terminal あり: working_dir の直後に console(owner を受ける)。
+        let _ = take_calls();
+        CONSOLE_OWNER_SEEN.with(|c| c.set(None));
+        run_pre_pivot_with_console(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup()),
+            Some(ConsoleRequest { owner: Some(1000) }),
+        )
+        .unwrap();
+        let calls = take_calls();
+        assert_eq!(
+            calls[calls.len() - 4..],
+            [tail[0], tail[1], tail[2], "console"]
+        );
+        assert_eq!(CONSOLE_OWNER_SEEN.with(|c| c.get()), Some(Some(1000)));
+        // terminal なし: console は呼ばれない。
+        let _ = take_calls();
+        CONSOLE_OWNER_SEEN.with(|c| c.set(None));
+        run_pre_pivot_with_console(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup()),
+            None,
+        )
+        .unwrap();
+        let calls = take_calls();
+        assert_eq!(calls[calls.len() - 3..], tail);
+        assert!(!calls.contains(&"console".to_owned()));
+        assert_eq!(CONSOLE_OWNER_SEEN.with(|c| c.get()), None);
+    }
+
+    /// OCI-4・SEC-1(#4071): console の段の失敗は段 `console` として返り、exec へ進まない。
+    #[test]
+    fn oci4_4071_console_step_failure_is_reported_as_console_step() {
+        let _ = take_calls();
+        let err = run_pre_pivot_with_console(
+            &RecordingOps {
+                fail_at: Some("console"),
+            },
+            Path::new("/rootfs"),
+            None,
+            Some(ConsoleRequest { owner: None }),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.step, PrePivotStep::Console);
+        assert_eq!(err.step.as_str(), "console");
     }
 
     /// CRI-2・CORE-3（#2670）: sysctl の適用が失敗したら、`readonly_paths` 以降（特に `pivot_root`）へ進まない。

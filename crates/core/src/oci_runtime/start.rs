@@ -1283,6 +1283,9 @@ fn lexical_abs(path: &Path) -> Option<String> {
     (absolute && !out.is_empty()).then_some(out)
 }
 
+/// 端末つき起動で init の slave を bind する先（正規化済みの絶対パス。#4071）。
+const CONSOLE_DESTINATION: &str = "/dev/console";
+
 /// 保護パス（`linux.readonlyPaths` / `maskedPaths`）が暗黙の `/dev` 系マウントと同じか祖先を指す config を、
 /// fork・予約より前に `InvalidArgument` で拒否する（SEC-2・CORE-5・OCI-4・TASK-29 追補・#2015）。
 ///
@@ -1298,8 +1301,20 @@ fn reject_protected_paths_over_implicit_dev(config: &OciConfig) -> Result<(), Tr
         ("linux.readonlyPaths", config.readonly_paths()),
         ("linux.maskedPaths", config.masked_paths()),
     ];
+    // 端末つき起動(`process.terminal: true`)は init の slave を `/dev/console` へ bind する(#4071)。`maskedPaths`・
+    // `readonlyPaths` は pivot 前に走り、対象が無ければ飛ばすため、`/dev/console` を指定しても保護が効かないまま
+    // console が作られる。要求より弱い状態を装わないよう、terminal のときだけ同じパスを拒否する。
+    let terminal = config.process().is_some_and(|p| p.terminal());
     for (field, paths) in groups {
         for (index, path) in paths.iter().enumerate() {
+            if terminal && path.as_str() == CONSOLE_DESTINATION {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{field}[{index}] targets /dev/console, which the runtime provides when process.terminal is true"
+                    ),
+                ));
+            }
             let overlaps = crate::dev_mounts::ImplicitDevMount::ALL
                 .iter()
                 .any(|m| is_same_or_ancestor(path.as_str(), m.destination()));
@@ -2546,6 +2561,51 @@ mod tests {
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
             assert_eq!(err.message(), message, "case {name}");
         }
+    }
+
+    /// OCI-4・CORE-2・SEC-2（#4071）: terminal 有効のときだけ、`/dev/console` を指す保護パスを fork 前に拒否する。
+    /// 字面だけ似たパス・子孫は受け、terminal 無効では `/dev/console` の指定も受ける（console を作らないため）。
+    #[test]
+    fn oci4_4071_protected_paths_over_console_rejected_only_with_terminal() {
+        let parse = |terminal: bool, ro: Value, masked: Value| {
+            let mut cfg = valid_config();
+            cfg["process"]["terminal"] = json!(terminal);
+            cfg["linux"]["readonlyPaths"] = ro;
+            cfg["linux"]["maskedPaths"] = masked;
+            let bytes = serde_json::to_vec(&cfg).expect("json");
+            super::super::config::parse_config_bytes(&bytes).expect("parse")
+        };
+        let tail = "targets /dev/console, which the runtime provides when process.terminal is true";
+        let err = reject_protected_paths_over_implicit_dev(&parse(
+            true,
+            json!(["/dev/console"]),
+            json!([]),
+        ))
+        .expect_err("ro console");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), format!("linux.readonlyPaths[0] {tail}"));
+        let err = reject_protected_paths_over_implicit_dev(&parse(
+            true,
+            json!(["/data"]),
+            json!(["/dev//console/"]),
+        ))
+        .expect_err("masked console");
+        assert_eq!(err.message(), format!("linux.maskedPaths[0] {tail}"));
+        for p in ["/dev/console/x", "/dev/consoles", "/dev/consol"] {
+            assert!(
+                reject_protected_paths_over_implicit_dev(&parse(true, json!([p]), json!([p])))
+                    .is_ok(),
+                "case {p}"
+            );
+        }
+        assert!(
+            reject_protected_paths_over_implicit_dev(&parse(
+                false,
+                json!(["/dev/console"]),
+                json!(["/dev/console"])
+            ))
+            .is_ok()
+        );
     }
 
     /// SEC-2（#2015）: 子孫・字面だけ似たパス・無関係なパスは拒否しない。

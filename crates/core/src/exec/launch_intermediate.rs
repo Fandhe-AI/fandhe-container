@@ -495,7 +495,7 @@ impl IntermediateOps for RealIntermediateOps<'_> {
             })
             .transpose()?;
         // 端末つき起動の master の送信口。複製できなければ PID 1 を作らずに失敗させる(master 無しで走らせない。
-        // fail-closed。CRI-6・SEC-1・#4070)。PID 1 の終端(`run_child`)が pivot 後に pty を割り当てて送る。
+        // fail-closed。CRI-6・SEC-1・#4070)。pty は PID 1 が pivot 後・ステージ列の前に割り当て(#4071)、終端(`run_child`)が送る。
         if let Some(end) = self.pty_end {
             let end = end.try_clone().map_err(|e| {
                 ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the pty socket")

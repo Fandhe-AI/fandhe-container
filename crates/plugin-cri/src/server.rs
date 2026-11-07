@@ -6,7 +6,7 @@
 //! `UdsIncoming`（accept 直後・最初の read より前に peer UID を検証。別 UID は切断）と `serve_router` に載せる。
 //! 呼び出し側（kubelet / crictl 相当の core 側クライアント）は `connect_uds_channel` で接続する。
 //! peer UID の検証は listener 単位（`UdsIncoming`）で行うため、同じ listener に載せた `ImageService` も別 UID の拒否と
-//! 監査の対象になる。TCP は一切待ち受けない。socket の配置検証（所有者・0700・symlink・`sun_path` 長・既存パスの拒否）は
+//! 監査の対象になる。gRPC は TCP で待ち受けない（プロセスとしては `streaming` の loopback TCP のストリーミングサーバーを別に持つ。#3754）。socket の配置検証（所有者・0700・symlink・`sun_path` 長・既存パスの拒否）は
 //! `UdsListener::bind` に一本化し、本モジュールは再実装しない。
 //!
 //! 契約: メッセージ上限は `GRPC_MAX_MESSAGE_BYTES` を両方向に設定し、要求の期限・同時接続数・ヘッダ上限は

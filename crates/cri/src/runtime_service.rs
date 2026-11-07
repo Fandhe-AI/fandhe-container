@@ -1753,7 +1753,7 @@ impl CriRuntimeService {
     /// 存在照合を通った要求ごとに新しい URL を返す。結線していない種別の RPC は URL を返さず `UNIMPLEMENTED`
     /// になる（入力検証より前。REPAIR-3・#3753）。
     /// URL の先のサーバー（`crate::streaming::StreamingServer`）は呼び出し側が起動して `issuer()` を渡す。
-    /// plugin-cri からの起動と注入は後続の issue。
+    /// plugin-cri は #3754 で起動・注入する（結線する backend は兄弟 issue）。
     pub fn with_streaming(mut self, issuer: Arc<StreamingUrlIssuer>) -> Self {
         self.streaming = Some(issuer);
         self

@@ -5578,12 +5578,11 @@ mod ioevent_tests {
             (d[1], 1, Arc::new(EventFd::new().unwrap())),
         ];
         let shared = Arc::new(Mutex::new(RecTarget::default()));
-        let running = start(&shared, &events);
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(shared.lock().unwrap().calls.is_empty());
+        // 合算の確認用の 3 回は poller の起動前に積む（起動後だと途中で `take` が走り 2〜3 回呼ばれうる）。
         for _ in 0..3 {
             events[2].2.signal().unwrap();
         }
+        let running = start(&shared, &events);
         assert!(wait_for(Duration::from_secs(5), || !shared
             .lock()
             .unwrap()
@@ -5607,6 +5606,19 @@ mod ioevent_tests {
         for (_, _, e) in &events {
             assert_eq!(Arc::strong_count(e), 1);
         }
+    }
+
+    /// MVM-1・REPAIR-5・#3698: 何も通知が無ければ対象は呼ばれない。
+    #[test]
+    fn mvm1_3698_poller_does_not_dispatch_without_notify() {
+        let d = ids(1);
+        let events: Events = vec![(d[0], 0, Arc::new(EventFd::new().unwrap()))];
+        let shared = Arc::new(Mutex::new(RecTarget::default()));
+        let running = start(&shared, &events);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(shared.lock().unwrap().calls.is_empty());
+        running.stop(Duration::from_secs(2)).unwrap();
+        assert!(shared.lock().unwrap().calls.is_empty());
     }
 
     /// MVM-1・REPAIR-5・#3698: 何も来なくても、停止要求から [`IOEVENT_WAIT_SLICE`] の数倍以内に止まる。

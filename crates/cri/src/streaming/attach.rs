@@ -6,10 +6,11 @@
 //! stdin / stdout / stderr（[`AttachBackend`] が供給する非同期 IO）を中継する。呼び出し元は
 //! `StreamingServer`（`bind_with_handler` に [`super::StreamDispatcher`] 経由で渡す）。
 //!
-//! ## 未実装（REPAIR-3）: 本番の [`AttachBackend`]
+//! ## 本番の [`AttachBackend`]（REPAIR-3）
 //!
-//! 実行中コンテナの stdio を渡す経路は core の `ContainerRuntime` にも supervisor にも無い（CRI-6・PLUG-1・SUP 系の
-//! 設計判断が要る。`docs/design/cri-streaming-server.md`「Attach の本番 backend」）。本モジュールは注入点だけを持ち、
+//! 段階 1（#3763）は plugin-cri の回転ログの follow（読み取り専用）で、[`AttachHandler::read_only`] で組む。
+//! stdin・tty は RPC 時（`StreamingUrlIssuer::require_attach_options`）と接続時（backend）の両方で `INVALID_ARGUMENT` にする。
+//! 完全版（stdin・tty・resize）は supervisor の制御チャネルへ足す経路（#3765 の設計）で、未実装。
 //! backend を注入しない構成では Attach は結線されず（`StreamHandler::wiring`）、RPC は URL を返さず `UNIMPLEMENTED` になる（#3753）。実装済みを装わない。
 //!
 //! ## セッションの構造
@@ -120,6 +121,8 @@ pub struct AttachHandler {
     backend: Arc<dyn AttachBackend>,
     limits: SessionLimits,
     recorder: Arc<dyn CriOpRecorder>,
+    /// 読み取り専用の backend か（stdin・tty を受けると宣言しない。#3763）。
+    read_only: bool,
 }
 
 impl std::fmt::Debug for AttachHandler {
@@ -138,7 +141,15 @@ impl AttachHandler {
             backend,
             limits,
             recorder: Arc::new(NoopCriOpRecorder),
+            read_only: false,
         })
+    }
+
+    /// backend が読み取り専用（stdout・stderr のみ）であると宣言する。結線情報から stdin・tty の宣言を外し、
+    /// RPC 時に stdin・tty の要求を `INVALID_ARGUMENT` で断らせる（#3763・REPAIR-3）。
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// セッションの結果・所要時間・読み書きの成否の記録先を指定する（REPAIR-4）。既定は記録しない。
@@ -150,7 +161,12 @@ impl AttachHandler {
 
 impl StreamHandler for AttachHandler {
     fn wiring(&self) -> StreamWiring {
-        StreamWiring::only(StreamKind::Attach)
+        let wiring = StreamWiring::only(StreamKind::Attach);
+        if self.read_only {
+            wiring
+        } else {
+            wiring.with_attach_interactive()
+        }
     }
 
     fn handle(

@@ -428,14 +428,17 @@ impl TokenCache {
 /// RPC は URL を返さず `UNIMPLEMENTED` にする（URL を返してから 501 にしない。実装済みを装わない）。
 /// 既定（[`Default`]）はどの種別も未結線で、宣言していない種別は出ない（fail-closed）。
 ///
-/// 種別ごとの結線の有無と、PortForward が POD ネットワークの pod にも対応するか（`port_forward_pod_network`。
-/// 既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766）を持つ。attach の読み取り専用（#3763）・
-/// exec の相対 `argv[0]`（#3761）を RPC 時に断る情報は、各 issue が項目として足す（本型は後から項目を足せる構造体）。
+/// 種別ごとの結線の有無に加え、attach が stdin・tty を受けるか（`attach_interactive`。#3763）と、PortForward が
+/// POD ネットワークの pod にも対応するか（`port_forward_pod_network`。既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766）を持つ。
+/// exec の相対 `argv[0]`（#3761）を RPC 時に断る情報は、issue が項目として足す（本型は後から項目を足せる構造体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamWiring {
     exec: bool,
     attach: bool,
     port_forward: bool,
+    /// attach が stdin・tty を扱えるか。既定は `false`（fail-closed。読み取り専用の backend が stdin・tty を黙って
+    /// 無視する URL を出さない。REPAIR-3）。
+    attach_interactive: bool,
     port_forward_pod_network: bool,
 }
 
@@ -456,7 +459,19 @@ impl StreamWiring {
             .with(StreamKind::Exec)
             .with(StreamKind::Attach)
             .with(StreamKind::PortForward)
+            .with_attach_interactive()
             .with_port_forward_pod_network()
+    }
+
+    /// attach が stdin・tty を扱えると宣言して返す（Attach を結線済みにはしない）。
+    pub fn with_attach_interactive(mut self) -> Self {
+        self.attach_interactive = true;
+        self
+    }
+
+    /// attach が stdin・tty を扱えるか（`false` なら RPC 時に `INVALID_ARGUMENT` で断る。#3763）。
+    pub fn attach_interactive(&self) -> bool {
+        self.attach_interactive
     }
 
     /// PortForward が POD ネットワークの pod にも対応することを宣言して返す。
@@ -538,6 +553,18 @@ impl StreamingUrlIssuer {
         }))
     }
 
+    /// attach の stdin・tty の要求を、backend が受けないとき `INVALID_ARGUMENT` で断る（#3763・REPAIR-3）。
+    ///
+    /// `runtime_service::attach_impl` が URL の発行より前に呼ぶ。メッセージは英語の固定文。
+    pub fn require_attach_options(&self, stdin: bool, tty: bool) -> Result<(), CriError> {
+        if (stdin || tty) && !self.wiring.attach_interactive() {
+            return Err(CriError::invalid_argument(
+                "attach with stdin or tty is not supported",
+            ));
+        }
+        Ok(())
+    }
+
     /// PortForward の `network` が POD で未対応なら `UNIMPLEMENTED` を返す（REPAIR-3・#3755）。
     ///
     /// `runtime_service` が sandbox の照合の後、URL の発行の前に呼ぶ。固定の英語文で、ID を含めない。
@@ -558,10 +585,13 @@ impl StreamingUrlIssuer {
     /// 要求を保存して URL（`http://<addr>/<kind>/<token>`）を返す。
     ///
     /// 未結線の種別・未対応の PortForward の POD は、乱数源とトークン枠を消費する前に `UNIMPLEMENTED` で断る
-    /// （多層防御）。
+    /// （多層防御）。attach の stdin・tty も、backend が受けないときは同じ位置で `INVALID_ARGUMENT` にする。
     pub fn issue(&self, request: StreamRequest) -> Result<String, CriError> {
         let kind = request.kind();
         self.require_wired(kind)?;
+        if let StreamRequest::Attach(a) = &request {
+            self.require_attach_options(a.stdin, a.tty)?;
+        }
         if let StreamRequest::PortForward { network, .. } = &request {
             self.require_port_forward_network(*network)?;
         }
@@ -741,6 +771,9 @@ impl StreamHandler for StreamDispatcher {
                 && child.is_wired(kind)
             {
                 wiring = wiring.with(kind);
+                if kind == StreamKind::Attach && child.attach_interactive() {
+                    wiring = wiring.with_attach_interactive();
+                }
                 if kind == StreamKind::PortForward && child.port_forward_pod_network() {
                     wiring = wiring.with_port_forward_pod_network();
                 }
@@ -1284,6 +1317,47 @@ mod tests {
         assert_eq!(d.wiring(), StreamWiring::none());
         assert_eq!(StreamDispatcher::new().wiring(), StreamWiring::none());
         assert_eq!(NotImplementedHandler.wiring(), StreamWiring::none());
+    }
+
+    /// CRI-6・REPAIR-3・#3763: `attach_interactive` は既定 false（fail-closed）で、`all()` だけが立て、ディスパッチャが伝える。
+    /// stdin・tty つきの発行は backend が受けないとき、トークン枠を消費せず `INVALID_ARGUMENT` になる。
+    #[test]
+    fn cri6_repair3_attach_interactive_is_fail_closed_and_propagates() {
+        assert!(!StreamWiring::default().attach_interactive());
+        assert!(!StreamWiring::only(StreamKind::Attach).attach_interactive());
+        assert!(StreamWiring::all().attach_interactive());
+        let ro: Arc<dyn StreamHandler> =
+            Arc::new(StubHandler(StreamWiring::only(StreamKind::Attach)));
+        let rw: Arc<dyn StreamHandler> = Arc::new(StubHandler(
+            StreamWiring::only(StreamKind::Attach).with_attach_interactive(),
+        ));
+        let d = StreamDispatcher::new().with_attach(ro);
+        assert!(d.wiring().is_wired(StreamKind::Attach));
+        assert!(!d.wiring().attach_interactive());
+        let d = StreamDispatcher::new().with_attach(rw);
+        assert!(d.wiring().attach_interactive());
+
+        let issuer = issuer_with(StreamWiring::only(StreamKind::Attach));
+        for (stdin, tty) in [(true, false), (false, true), (true, true)] {
+            let err = issuer
+                .require_attach_options(stdin, tty)
+                .expect_err("stdin or tty is refused");
+            assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "attach with stdin or tty is not supported");
+            let req = StreamRequest::Attach(v1::AttachRequest {
+                container_id: "c1".to_string(),
+                stdin,
+                tty,
+                stdout: true,
+                stderr: false,
+            });
+            let err = issuer.issue(req).expect_err("issue refuses too");
+            assert_eq!(err.code(), crate::error::CriErrorCode::InvalidArgument);
+        }
+        assert_eq!(issuer.cache.len(), 0);
+        assert!(issuer.require_attach_options(false, false).is_ok());
+        let issuer = issuer_with(StreamWiring::all());
+        assert!(issuer.require_attach_options(true, true).is_ok());
     }
 
     struct StubHandler(StreamWiring);

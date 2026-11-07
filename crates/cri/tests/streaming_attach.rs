@@ -323,9 +323,20 @@ async fn setup(
     config: StreamingConfig,
     backend: Option<Arc<FakeBackend>>,
 ) -> (StreamingServer, CriRuntimeService, String) {
+    setup_with(config, backend, false).await
+}
+
+async fn setup_with(
+    config: StreamingConfig,
+    backend: Option<Arc<FakeBackend>>,
+    read_only: bool,
+) -> (StreamingServer, CriRuntimeService, String) {
     let mut dispatcher = StreamDispatcher::new();
     if let Some(backend) = backend {
-        let handler = AttachHandler::new(backend, config.session_limits()).expect("handler");
+        let mut handler = AttachHandler::new(backend, config.session_limits()).expect("handler");
+        if read_only {
+            handler = handler.read_only();
+        }
         dispatcher = dispatcher.with_attach(Arc::new(handler));
     }
     let server = StreamingServer::bind_with_handler(config, Arc::new(dispatcher))
@@ -393,6 +404,32 @@ async fn attach_path(
         .url;
     let rest = url.strip_prefix("http://").expect("http url");
     rest[rest.find('/').expect("path")..].to_string()
+}
+
+/// CRI-6・REPAIR-3・#3763: 読み取り専用の handler では stdin・tty つきの RPC が URL を返さず `INVALID_ARGUMENT`、
+/// stdout だけの RPC は URL を返す。
+#[tokio::test]
+async fn cri6_repair3_read_only_attach_rejects_stdin_and_tty_at_rpc() {
+    let backend = FakeBackend::new();
+    let (server, service, container) =
+        setup_with(StreamingConfig::default(), Some(backend), true).await;
+    for (stdin, tty) in [(true, false), (false, true)] {
+        let err = service
+            .attach(Request::new(v1::AttachRequest {
+                container_id: container.clone(),
+                stdin,
+                tty,
+                stdout: true,
+                stderr: false,
+            }))
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "attach with stdin or tty is not supported");
+    }
+    let path = attach_path(&service, &container, false, true, false, false).await;
+    assert!(path.starts_with("/attach/"), "{path}");
+    drop(server);
 }
 
 /// CRI-6: stdout・stderr がコンテナから届き、stdin がコンテナへ届く。終了で Status(Success)・FIN・GOAWAY で閉じる。

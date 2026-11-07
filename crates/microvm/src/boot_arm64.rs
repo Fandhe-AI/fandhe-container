@@ -517,7 +517,10 @@ pub fn load_arm64<B: GuestMemoryBacking>(
     cmdline: &str,
     layout: &Arm64Layout,
 ) -> Result<(LoadedArm64, ArmBootState), MicrovmError> {
-    if memory.base() != layout.ram.base || memory.len() != layout.ram.size {
+    if memory.base() != layout.ram.base
+        || memory.len() != layout.ram.size
+        || memory.regions().len() != 1
+    {
         return Err(invalid("guest memory does not match the layout ram"));
     }
     let header = Arm64ImageHeader::parse(image)?;

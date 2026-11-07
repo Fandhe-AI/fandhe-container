@@ -6,7 +6,11 @@
 //! (3) backing は [`GuestMemoryBacking`] で差し替える。実機の mmap backing と KVM への登録は `crate::microvm`（TASK-75.1。Linux のみ）が持つ。
 //!
 //! # 範囲外（REPAIR-3）
-//! 領域は 1 つだけ（MMIO hole などを含む複数領域は未対応。判断記録の再評価条件）。
+//! hugepage と memslot のフラグ（`KVM_MEM_READONLY`・`KVM_MEM_LOG_DIRTY_PAGES`）は未対応。
+//!
+//! # 複数領域（#3697・MVM-1）
+//! 領域は昇順・非重複で最大 [`MAX_GUEST_MEMORY_REGIONS`] 個（`from_regions`）。MMIO hole の前後など、領域の間の隙間（hole）と、
+//! 隣接していても 2 領域をまたぐ範囲のアクセスは `InvalidArgument` で拒否する（別々の mapping をまたいで読み書きしない）。
 //! 本モジュールが提供する backing は [`HeapBacking`]（`Vec<u8>`。試験と KVM を使わない用途）だけで、mmap の backing は `crate::microvm`（Linux）と `crate::hvf::memory`（macOS。TASK-192.4）が提供する。
 //!
 //! # 外部入力の扱い
@@ -144,58 +148,151 @@ impl GuestMemoryBacking for HeapBacking {
     }
 }
 
-/// 単一領域のゲスト物理メモリ。
+/// 領域 1 つ分の記述子（アドレスと長さ。参照を持たない）。e820 や KVM への登録の入力に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMemoryRegion {
+    /// 領域の先頭アドレス。
+    pub base: GuestAddress,
+    /// 領域のバイト数。
+    pub len: u64,
+}
+
+/// [`GuestMemory`] が持てる領域数の上限（確保の前に件数を検証する。e820 の件数上限にも収まる）。
+pub const MAX_GUEST_MEMORY_REGIONS: usize = 8;
+
 #[derive(Debug)]
-pub struct GuestMemory<B: GuestMemoryBacking> {
+struct Region<B: GuestMemoryBacking> {
     base: GuestAddress,
     backing: B,
 }
 
+/// ゲスト物理メモリ。昇順・非重複の 1 つ以上の領域からなり、領域の間（MMIO hole など）は未割り当てとして拒否する。
+#[derive(Debug)]
+pub struct GuestMemory<B: GuestMemoryBacking> {
+    regions: Vec<Region<B>>,
+    total_len: u64,
+}
+
 impl<B: GuestMemoryBacking> GuestMemory<B> {
-    /// 領域の先頭アドレスと実体から作る。`base + len` が桁あふれするものは拒否する。
+    /// 1 領域のメモリを作る。`base + len` が桁あふれするものは拒否する。
     pub fn new(base: GuestAddress, backing: B) -> Result<Self, MicrovmError> {
         base.checked_add(backing.len()).ok_or_else(out_of_range)?;
-        Ok(Self { base, backing })
+        let total_len = backing.len();
+        Ok(Self {
+            regions: vec![Region { base, backing }],
+            total_len,
+        })
     }
 
-    /// 領域の先頭アドレス。
+    /// 複数領域のメモリを作る（#3697）。`regions` は base の昇順・非重複で、1 件以上 [`MAX_GUEST_MEMORY_REGIONS`] 件以下、
+    /// 各領域は空でなく `base + len` が桁あふれしないこと。違反は `InvalidArgument`（隣接は許すが、またぐアクセスは拒否する）。
+    pub fn from_regions(regions: Vec<(GuestAddress, B)>) -> Result<Self, MicrovmError> {
+        if regions.is_empty() || regions.len() > MAX_GUEST_MEMORY_REGIONS {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::InvalidArgument,
+                "invalid number of guest memory regions",
+            ));
+        }
+        let mut total_len = 0u64;
+        let mut prev_end = 0u64;
+        for (i, (base, backing)) in regions.iter().enumerate() {
+            let len = backing.len();
+            let end = base.checked_add(len).ok_or_else(out_of_range)?.raw();
+            if len == 0 {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    "guest memory region must not be empty",
+                ));
+            }
+            if i > 0 && base.raw() < prev_end {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    "guest memory regions must be sorted and must not overlap",
+                ));
+            }
+            total_len = total_len.checked_add(len).ok_or_else(out_of_range)?;
+            prev_end = end;
+        }
+        Ok(Self {
+            regions: regions
+                .into_iter()
+                .map(|(base, backing)| Region { base, backing })
+                .collect(),
+            total_len,
+        })
+    }
+
+    /// 最も低い領域の先頭アドレス。
     pub fn base(&self) -> GuestAddress {
-        self.base
+        self.regions
+            .first()
+            .map_or(GuestAddress::new(0), |r| r.base)
     }
 
-    /// 領域のバイト数。
+    /// 全領域の総バイト数（領域の間の hole は含まない）。先頭の領域だけの長さは `regions()` で得る。
     pub fn len(&self) -> u64 {
-        self.backing.len()
+        self.total_len
     }
 
-    /// 領域が空か。
+    /// 全領域が空か。
     pub fn is_empty(&self) -> bool {
-        self.backing.is_empty()
+        self.total_len == 0
     }
 
-    /// `[addr, addr + len)` が領域に収まるか確かめ、領域先頭からのオフセットを返す。
-    pub fn check_range(&self, addr: GuestAddress, len: u64) -> Result<u64, MicrovmError> {
+    /// 領域の記述子（base の昇順）。
+    pub fn regions(&self) -> Vec<GuestMemoryRegion> {
+        self.regions
+            .iter()
+            .map(|r| GuestMemoryRegion {
+                base: r.base,
+                len: r.backing.len(),
+            })
+            .collect()
+    }
+
+    /// `[addr, addr + len)` を 1 つの領域に収まるものとして探し、(領域の index, 領域先頭からのオフセット) を返す。
+    /// hole の中・領域の外・複数領域にまたがる範囲は `InvalidArgument`。
+    fn locate(&self, addr: GuestAddress, len: u64) -> Result<(usize, u64), MicrovmError> {
+        let idx = self
+            .regions
+            .partition_point(|r| r.base.raw() <= addr.raw())
+            .checked_sub(1)
+            .ok_or_else(out_of_range)?;
+        let r = self.regions.get(idx).ok_or_else(out_of_range)?;
         let off = addr
             .raw()
-            .checked_sub(self.base.raw())
+            .checked_sub(r.base.raw())
             .ok_or_else(out_of_range)?;
         let end = off.checked_add(len).ok_or_else(out_of_range)?;
-        if end > self.backing.len() {
+        if end > r.backing.len() {
             return Err(out_of_range());
         }
-        Ok(off)
+        Ok((idx, off))
+    }
+
+    /// `[addr, addr + len)` が 1 つの領域に収まるか確かめる。
+    pub fn check_range(&self, addr: GuestAddress, len: u64) -> Result<(), MicrovmError> {
+        self.locate(addr, len).map(|_| ())
     }
 
     /// `buf.len()` バイトをコピーで読む。
     pub fn read_at(&self, addr: GuestAddress, buf: &mut [u8]) -> Result<(), MicrovmError> {
-        let off = self.check_range(addr, buf.len() as u64)?;
-        self.backing.read(off, buf)
+        let (i, off) = self.locate(addr, buf.len() as u64)?;
+        self.regions
+            .get(i)
+            .ok_or_else(out_of_range)?
+            .backing
+            .read(off, buf)
     }
 
     /// `data` をコピーで書く。
     pub fn write_at(&mut self, addr: GuestAddress, data: &[u8]) -> Result<(), MicrovmError> {
-        let off = self.check_range(addr, data.len() as u64)?;
-        self.backing.write(off, data)
+        let (i, off) = self.locate(addr, data.len() as u64)?;
+        self.regions
+            .get_mut(i)
+            .ok_or_else(out_of_range)?
+            .backing
+            .write(off, data)
     }
 
     /// リトルエンディアンの u16 を読む。
@@ -232,8 +329,12 @@ impl<B: GuestMemoryBacking> GuestMemory<B> {
         if !addr.raw().is_multiple_of(2) {
             return Err(unaligned());
         }
-        let off = self.check_range(addr, 2)?;
-        self.backing.read_u16_le_aligned(off)
+        let (i, off) = self.locate(addr, 2)?;
+        self.regions
+            .get(i)
+            .ok_or_else(out_of_range)?
+            .backing
+            .read_u16_le_aligned(off)
     }
 
     /// 共有 index 用: 2 バイト整列した u16 を単一命令の volatile で書く（`used.idx` 専用。契約は読みと同じ）。
@@ -241,8 +342,12 @@ impl<B: GuestMemoryBacking> GuestMemory<B> {
         if !addr.raw().is_multiple_of(2) {
             return Err(unaligned());
         }
-        let off = self.check_range(addr, 2)?;
-        self.backing.write_u16_le_aligned(off, v)
+        let (i, off) = self.locate(addr, 2)?;
+        self.regions
+            .get_mut(i)
+            .ok_or_else(out_of_range)?
+            .backing
+            .write_u16_le_aligned(off, v)
     }
 
     /// リトルエンディアンの u32 を書く。
@@ -317,7 +422,7 @@ mod tests {
         }
         assert!(m.write_at(GuestAddress::new(0x10ff), &[0, 0]).is_err());
         assert!(m.check_range(GuestAddress::new(0x1000), u64::MAX).is_err());
-        assert_eq!(m.check_range(GuestAddress::new(0x1000), 0x100).unwrap(), 0);
+        assert!(m.check_range(GuestAddress::new(0x1000), 0x100).is_ok());
     }
 
     /// MVM-1・MVM-5・#3862: 整列 u16 の往復（バイト列と一致）、奇数アドレス・範囲外の拒否。
@@ -373,5 +478,105 @@ mod tests {
         assert!(HeapBacking::new(MAX_HEAP_BACKING + 1).is_err());
         let r = GuestMemory::new(GuestAddress::new(u64::MAX), HeapBacking::new(16).unwrap());
         assert_eq!(r.unwrap_err().code(), MicrovmErrorCode::InvalidArgument);
+    }
+
+    fn two(a: u64, alen: u64, b: u64, blen: u64) -> GuestMemory<HeapBacking> {
+        GuestMemory::from_regions(vec![
+            (GuestAddress::new(a), HeapBacking::new(alen).unwrap()),
+            (GuestAddress::new(b), HeapBacking::new(blen).unwrap()),
+        ])
+        .unwrap()
+    }
+
+    /// MVM-1・#3697: 2 領域の読み書きの往復、`regions()`・`len()`・`base()` の具体値。
+    #[test]
+    fn mvm1_3697_regions_roundtrip_and_lookup() {
+        let mut m = two(0x1000, 0x100, 0x10_0000, 0x100);
+        m.write_u32_le(GuestAddress::new(0x1010), 0x1111_2222)
+            .unwrap();
+        m.write_u32_le(GuestAddress::new(0x10_00fc), 0x3333_4444)
+            .unwrap();
+        assert_eq!(
+            m.read_u32_le(GuestAddress::new(0x1010)).unwrap(),
+            0x1111_2222
+        );
+        assert_eq!(
+            m.read_u32_le(GuestAddress::new(0x10_00fc)).unwrap(),
+            0x3333_4444
+        );
+        m.write_u16_le_aligned(GuestAddress::new(0x10_0002), 0xBEEF)
+            .unwrap();
+        assert_eq!(
+            m.read_u16_le_aligned(GuestAddress::new(0x10_0002)).unwrap(),
+            0xBEEF
+        );
+        assert_eq!(m.len(), 0x200);
+        assert_eq!(m.base(), GuestAddress::new(0x1000));
+        assert_eq!(
+            m.regions(),
+            vec![
+                GuestMemoryRegion {
+                    base: GuestAddress::new(0x1000),
+                    len: 0x100
+                },
+                GuestMemoryRegion {
+                    base: GuestAddress::new(0x10_0000),
+                    len: 0x100
+                },
+            ]
+        );
+    }
+
+    /// MVM-1・#3697: hole の中・領域の末尾をまたぐ範囲・隣接する 2 領域の境界をまたぐ範囲を拒否する。
+    #[test]
+    fn mvm1_3697_access_in_hole_or_across_regions_is_rejected() {
+        let m = two(0x1000, 0x100, 0x10_0000, 0x100);
+        let adj = two(0x1000, 0x100, 0x1100, 0x100);
+        let mut b = [0u8; 4];
+        for (mem, addr) in [
+            (&m, 0x1100u64),
+            (&m, 0xF_FFFF),
+            (&m, 0x10_00FE),
+            (&m, 0x10FE),
+            (&m, 0xFFF),
+            (&adj, 0x10FE),
+        ] {
+            let e = mem.read_at(GuestAddress::new(addr), &mut b).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+            assert_eq!(e.message(), "guest memory access out of range");
+        }
+        let e = m
+            .read_u16_le_aligned(GuestAddress::new(0x2000))
+            .unwrap_err();
+        assert_eq!(e.message(), "guest memory access out of range");
+        assert!(adj.check_range(GuestAddress::new(0x1100), 4).is_ok());
+        assert!(adj.check_range(GuestAddress::new(0x10FC), 4).is_ok());
+    }
+
+    /// MVM-1・#3697: 0 件・件数超過・長さ 0・未ソート・重なり・桁あふれを拒否する。
+    #[test]
+    fn mvm1_3697_from_regions_rejects_invalid_layout() {
+        let h = |n: u64| HeapBacking::new(n).unwrap();
+        let a = GuestAddress::new;
+        let bad = |v: Vec<(GuestAddress, HeapBacking)>| {
+            let e = GuestMemory::from_regions(v).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        };
+        bad(vec![]);
+        bad((0..=MAX_GUEST_MEMORY_REGIONS as u64)
+            .map(|i| (a(i * 0x100), h(0x10)))
+            .collect());
+        bad(vec![(a(0), h(0))]);
+        bad(vec![(a(0x2000), h(0x10)), (a(0x1000), h(0x10))]);
+        bad(vec![(a(0x1000), h(0x100)), (a(0x10FF), h(0x10))]);
+        bad(vec![(a(u64::MAX), h(16))]);
+        assert!(
+            GuestMemory::from_regions(
+                (0..MAX_GUEST_MEMORY_REGIONS as u64)
+                    .map(|i| (a(i * 0x100), h(0x10)))
+                    .collect()
+            )
+            .is_ok()
+        );
     }
 }

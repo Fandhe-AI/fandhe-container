@@ -1006,6 +1006,7 @@ impl VcpuFd {
         let timed_out = AtomicBool::new(false);
         let fired = AtomicBool::new(false);
         let run_done = AtomicBool::new(false);
+        // `KVM_RUN` の間、監視スレッドが `&KvmRunMap` に触るのは `set_immediate_exit` だけ（`read_into` は実行の外。#3679）。
         let run = &self.run;
         let fd = self.fd.as_fd();
         let timed_out_ref = &timed_out;
@@ -1534,7 +1535,7 @@ fn classify_vm_setup_error(stage: VmSetupStage, e: SysError) -> MicrovmError {
 
 impl VmFd {
     /// 拡張 `cap` に対応しているかを確かめ、非対応なら `FailedPrecondition`。
-    fn require_extension(&self, cap: u64, what: &'static str) -> Result<(), MicrovmError> {
+    fn require_extension(&self, cap: sys::KvmCap, what: &'static str) -> Result<(), MicrovmError> {
         let n = sys::kvm_check_extension(self.fd.as_fd(), cap)
             .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))?;
         if n == 0 {

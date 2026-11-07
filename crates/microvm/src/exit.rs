@@ -250,7 +250,7 @@ pub(crate) trait RunArea {
 
 /// `kvm_run` 領域の書き口（応答値の書き戻し用。TASK-74.4.2）。`KvmRunMap` が `&mut self` でだけ実装する。
 pub(crate) trait RunAreaMut: RunArea {
-    /// `buf` を `off..off + buf.len()` へコピーする。範囲外は `Err`。
+    /// `buf` を `off..off + buf.len()` へコピーする。範囲外は `Err`（`KvmRunMap` は `immediate_exit` のオフセット 1 に重なる範囲も `Err`。#3679）。
     fn copy_in(&mut self, off: usize, buf: &[u8]) -> Result<(), ()>;
 }
 

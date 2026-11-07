@@ -13,15 +13,19 @@
 //! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で
 //! 待つ常駐のイベントループは起動フロー（TASK-75）・`fandhe-container-plugin-microvm`（TASK-117）の範囲で未実装。
 //!
-//! # 残余（REPAIR-3）
-//! drop 時の `KVM_IRQFD` / `KVM_IOEVENTFD` の解除が失敗しても戻り値は無視する（panic しない）。その場合、カーネルは
-//! eventfd の file を VM の破棄まで保持するだけで、VM fd を close すれば解放される。
+//! # 残余（REPAIR-3・REPAIR-4）
+//! drop 時の `KVM_IRQFD` / `KVM_IOEVENTFD` の解除が失敗しても panic せず待たない。失敗は種別ごとの件数
+//! （[`deassign_failures`]）と構造化ログ 1 行（`op=kvm.irqfd.deassign` / `op=kvm.ioeventfd.deassign`。`level=error`・
+//! `released=false`）で観測できる（#3679・REPAIR-4）。その場合、カーネルは eventfd の file を VM の破棄まで保持するだけで、
+//! VM fd を close すれば解放される。ただし登録が残った組は、同じ VM で次の ASSIGN が `EBUSY` / `EEXIST` で失敗しうる。
+//! 件数の `fandhe-container-plugin-microvm` のメトリクスへの露出は未実装（REPAIR-3）。
 
 #![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::interrupt::{InterruptLine, IoEventAddress, IoEventSpec};
@@ -36,6 +40,85 @@ fn io_error(what: &str, e: &io::Error) -> MicrovmError {
             "eventfd {what} failed (os error {})",
             e.raw_os_error().unwrap_or(0)
         ),
+    )
+}
+
+/// ある種別の解除失敗の累計（プロセス全体）。`last_os_error` の 0 は errno の記録なし（#3679・REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeassignFailureStat {
+    /// 解除（`KVM_IRQFD` / `KVM_IOEVENTFD` の DEASSIGN）が失敗した回数。
+    pub count: u64,
+    /// 直近の失敗の errno（0 は記録なし）。
+    pub last_os_error: i32,
+}
+
+/// [`IrqFd`] / [`IoEventFd`] の drop での解除失敗の累計（#3679・REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeassignFailures {
+    /// [`IrqFd`] の解除失敗。
+    pub irqfd: DeassignFailureStat,
+    /// [`IoEventFd`] の解除失敗。
+    pub ioeventfd: DeassignFailureStat,
+}
+
+static IRQFD_DEASSIGN_COUNT: AtomicU64 = AtomicU64::new(0);
+static IRQFD_DEASSIGN_ERRNO: AtomicI32 = AtomicI32::new(0);
+static IOEVENTFD_DEASSIGN_COUNT: AtomicU64 = AtomicU64::new(0);
+static IOEVENTFD_DEASSIGN_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// drop での解除失敗の累計を返す。プロセス全体の値で、`Relaxed`（観測用で他のデータを公開しない）。
+///
+/// 呼び出し元は診断・試験。登録が残った組は VM fd の close まで残る（モジュール doc の残余）。
+pub fn deassign_failures() -> DeassignFailures {
+    DeassignFailures {
+        irqfd: DeassignFailureStat {
+            count: IRQFD_DEASSIGN_COUNT.load(Ordering::Relaxed),
+            last_os_error: IRQFD_DEASSIGN_ERRNO.load(Ordering::Relaxed),
+        },
+        ioeventfd: DeassignFailureStat {
+            count: IOEVENTFD_DEASSIGN_COUNT.load(Ordering::Relaxed),
+            last_os_error: IOEVENTFD_DEASSIGN_ERRNO.load(Ordering::Relaxed),
+        },
+    }
+}
+
+/// 失敗の errno（`Os` のときだけ）。
+fn os_error_of(e: &SysError) -> Option<i32> {
+    match e {
+        SysError::Os(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `code=` の固定語彙と、`os_error=` の付記（errno があるときだけ）。値は数値と固定語彙のみ。
+fn deassign_code_fields(e: &SysError) -> (&'static str, String) {
+    match e {
+        SysError::Unsupported => ("UNIMPLEMENTED", String::new()),
+        SysError::NullMapping => ("INTERNAL", String::new()),
+        SysError::Os(n) => ("INTERNAL", format!(" os_error={n}")),
+    }
+}
+
+/// irqfd の解除失敗の構造化ログ 1 行（REPAIR-4）。
+pub(crate) fn irqfd_deassign_log_line(gsi: u32, e: &SysError) -> String {
+    let (code, os) = deassign_code_fields(e);
+    format!(
+        "level=error op=kvm.irqfd.deassign outcome=error code={code} gsi={gsi}{os} released=false"
+    )
+}
+
+/// ioeventfd の解除失敗の構造化ログ 1 行（REPAIR-4）。
+pub(crate) fn ioeventfd_deassign_log_line(
+    addr: u64,
+    pio: bool,
+    len: u32,
+    datamatch: Option<u64>,
+    e: &SysError,
+) -> String {
+    let (code, os) = deassign_code_fields(e);
+    let dm = datamatch.map_or_else(|| "none".to_string(), |d| format!("{d:#x}"));
+    format!(
+        "level=error op=kvm.ioeventfd.deassign outcome=error code={code} addr={addr:#x} pio={pio} len={len} datamatch={dm}{os} released=false"
     )
 }
 
@@ -122,7 +205,12 @@ impl InterruptLine for IrqFd {
 
 impl Drop for IrqFd {
     fn drop(&mut self) {
-        let _ = sys::kvm_irqfd(self.vm.as_fd(), self.event.as_fd(), self.gsi, true);
+        if let Err(e) = sys::kvm_irqfd(self.vm.as_fd(), self.event.as_fd(), self.gsi, true) {
+            IRQFD_DEASSIGN_ERRNO.store(os_error_of(&e).unwrap_or(0), Ordering::Relaxed);
+            IRQFD_DEASSIGN_COUNT.fetch_add(1, Ordering::Relaxed);
+            // 上限つき try_send で待たず、満杯なら捨てる（件数は残る。REPAIR-5）。
+            crate::hvf_loop::log_line(format_args!("{}", irqfd_deassign_log_line(self.gsi, &e)));
+        }
     }
 }
 
@@ -250,7 +338,7 @@ pub(crate) fn ioevent_args(spec: &IoEventSpec) -> (u64, bool) {
 impl Drop for IoEventFd<'_> {
     fn drop(&mut self) {
         let (addr, pio) = ioevent_args(&self.spec);
-        let _ = sys::kvm_ioeventfd(
+        if let Err(e) = sys::kvm_ioeventfd(
             self.vm,
             self.event.as_fd(),
             addr,
@@ -258,7 +346,14 @@ impl Drop for IoEventFd<'_> {
             self.spec.datamatch(),
             pio,
             true,
-        );
+        ) {
+            IOEVENTFD_DEASSIGN_ERRNO.store(os_error_of(&e).unwrap_or(0), Ordering::Relaxed);
+            IOEVENTFD_DEASSIGN_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::hvf_loop::log_line(format_args!(
+                "{}",
+                ioeventfd_deassign_log_line(addr, pio, self.spec.len(), self.spec.datamatch(), &e)
+            ));
+        }
     }
 }
 
@@ -299,5 +394,62 @@ mod tests {
         assert_eq!(ioevent_args(&mmio), (0x2050, false));
         let pio = IoEventSpec::new(IoEventAddress::Pio(0x10), 1, None).unwrap();
         assert_eq!(ioevent_args(&pio), (0x10, true));
+    }
+
+    /// REPAIR-4・#3679: irqfd の解除失敗（`/dev/null` は ioctl に ENOTTY を返す）が件数と errno で観測できる。
+    /// 件数はプロセス全体の値なので、この種別を失敗させる試験はこれ 1 件だけにして差分で照合する。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair4_3679_irqfd_deassign_failure_is_observable() {
+        let before = deassign_failures().irqfd.count;
+        let vm = OwnedFd::from(File::open("/dev/null").unwrap());
+        drop(IrqFd::registered(vm, EventFd::new().unwrap(), 5));
+        let after = deassign_failures().irqfd;
+        assert_eq!(after.count, before + 1);
+        assert_eq!(after.last_os_error, 25);
+    }
+
+    /// REPAIR-4・#3679: ioeventfd の解除失敗の観測（件数の差分と errno）。この種別を失敗させる試験はこれ 1 件だけ。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair4_3679_ioeventfd_deassign_failure_is_observable() {
+        let before = deassign_failures().ioeventfd.count;
+        let null = File::open("/dev/null").unwrap();
+        let spec = IoEventSpec::virtio_mmio_queue_notify(0x2000, 0).unwrap();
+        drop(IoEventFd::registered(
+            null.as_fd(),
+            EventFd::new().unwrap(),
+            spec,
+        ));
+        let after = deassign_failures().ioeventfd;
+        assert_eq!(after.count, before + 1);
+        assert_eq!(after.last_os_error, 25);
+    }
+
+    /// REPAIR-4・#3679: ログ行は数値と固定語彙のみ（完全一致）。
+    #[test]
+    fn repair4_3679_deassign_log_line_values() {
+        assert_eq!(
+            irqfd_deassign_log_line(5, &SysError::Os(25)),
+            "level=error op=kvm.irqfd.deassign outcome=error code=INTERNAL gsi=5 os_error=25 released=false"
+        );
+        assert_eq!(
+            irqfd_deassign_log_line(5, &SysError::Unsupported),
+            "level=error op=kvm.irqfd.deassign outcome=error code=UNIMPLEMENTED gsi=5 released=false"
+        );
+        assert_eq!(
+            ioeventfd_deassign_log_line(0x2050, false, 4, None, &SysError::Os(25)),
+            "level=error op=kvm.ioeventfd.deassign outcome=error code=INTERNAL addr=0x2050 pio=false len=4 datamatch=none os_error=25 released=false"
+        );
+        assert_eq!(
+            ioeventfd_deassign_log_line(0x10, true, 1, Some(0), &SysError::NullMapping),
+            "level=error op=kvm.ioeventfd.deassign outcome=error code=INTERNAL addr=0x10 pio=true len=1 datamatch=0x0 released=false"
+        );
     }
 }

@@ -2329,6 +2329,42 @@ jobs:
             --forbid 'healthcheck_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
             --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
 
+      # stream_exec_real（`crates/supervisor/tests/stream_exec_real.rs`。SUP-6・SEC-1・REPAIR-5・REPAIR-12・#3760）:
+      # CRI の Exec 用 stream-exec helper の本番の経路（制御チャネルの kind 6 / 7 → 実コマンド）を rootless の稼働中コンテナで通す。
+      # 試験自身が `systemd-run --user --scope` で `--scenario` を起動するため、試験バイナリは外側を包まず scope を作らない補助で
+      # 期限だけ持つ。helper は試験バイナリ自身の再実行のため supervisor の bin は要らない。範囲写像は使わない。
+      # 新しいジョブ・check-run・sudo・permissions は増やさない。
+      - name: stream_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/ser-build.json"
+          cargo test -p fandhe-container-supervisor --test stream_exec_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "stream_exec_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::stream_exec_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SER_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: stream_exec_real の実行（実機前提テスト・--ignored。SUP-6・SEC-1・REPAIR-5・#3760）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/stream_exec_real.log"
+          USER="$(id -un)" \
+            scripts/run-with-deadline.sh --name stream_exec_real --deadline 540 --log "${log}" -- \
+            "${SER_BIN}" --ignored
+          scripts/check-success-lines.sh --name stream_exec_real \
+            --src crates/supervisor/tests/stream_exec_real.rs --log "${log}" \
+            --select '^stream_exec_real: (scenario=|real stream-exec helper ran)' --min 5 \
+            --forbid 'stream_exec_real: ignored' --forbid 'not verified' --forbid 'not applicable' \
+            --forbid 'skipped' --forbid 'FAILED' --forbid 'PRECONDITION FAILED' --forbid 'root=true' --summary
+
       # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
       # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
       - name: supervisor_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）

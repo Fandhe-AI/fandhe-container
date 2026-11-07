@@ -2469,7 +2469,8 @@ impl StdioNulling {
 /// 読み取りは EOF まで続くため、コンテナの `write` は詰まらない。
 #[derive(Debug)]
 pub struct ChildStdio {
-    /// exec の stdin（#3757）。launch・healthcheck の結合では常に `None`（`/dev/null`）。
+    /// stdin（#3757）。exec の個別指定と、launch の `LaunchStdinMode::Pipe`（[`Self::pipes_with_stdin`]。#4069）で
+    /// `Some`。healthcheck の結合と launch の既定では `None`（`/dev/null`）。
     stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
@@ -2502,6 +2503,44 @@ impl ChildStdio {
             out_r,
             err_r,
         ))
+    }
+
+    /// [`Self::pipes`] に加えて stdin 用のパイプも作る（`LaunchStdinMode::Pipe`。SUP-7・CRI-6・SEC-1・#4069）。
+    ///
+    /// 戻りは `(指定, stdin の書き込み側, stdout の読み取り側, stderr の読み取り側)`。stdin の読み取り側は指定に入り、
+    /// 子が fd 0 へ付け替える。書き込み側は親（supervisor）が持ち、`LaunchedProcess::take_stdin` で呼び出し側へ渡る。
+    ///
+    /// 書き込み側は close-on-exec の複製を fd 3 以上へ置き直して返す。親の fd 0〜2 が閉じていると `pipe()` が
+    /// 0〜2 の番号を返しうるが、その番号は `close_inherited_fds`（fd 3 以上を閉じる）の対象外になり、子へ漏れる
+    /// 余地になるため（SEC-1）。読み取り側は fork 後に親側のコピーが drop され、コンテナの終了後の書き込みは `EPIPE`
+    /// になる。
+    ///
+    /// 中間プロセス・ID 写像の holder には明示 close を足さない: 書き込み側は fd 3 以上かつ close-on-exec で、
+    /// holder は起動直後に fd 3 以上を閉じ、中間プロセスと mapper は PID 1 の fork 前に回収される短命のプロセスで、
+    /// PID 1 は exec 前の `close_inherited_fds` で閉じる。失敗は `ExecError`（段 `Spawn`）。
+    pub fn pipes_with_stdin() -> Result<
+        (
+            Self,
+            std::io::PipeWriter,
+            std::io::PipeReader,
+            std::io::PipeReader,
+        ),
+        ExecError,
+    > {
+        let (mut stdio, out_r, err_r) = Self::pipes()?;
+        let (in_r, in_w) = std::io::pipe()
+            .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "pipe(stdin)"))?;
+        let in_w = OwnedFd::from(in_w);
+        let lifted = sys::dup_fd_at_least(in_w.as_fd(), 3).map_err(|e| {
+            ExecError::from_sys(
+                e,
+                IsolationStage::Spawn,
+                "fcntl(F_DUPFD_CLOEXEC, stdin writer)",
+            )
+        })?;
+        drop(in_w);
+        stdio.stdin = Some(OwnedFd::from(in_r));
+        Ok((stdio, std::io::PipeWriter::from(lifted), out_r, err_r))
     }
 
     /// 稼働中コンテナへの exec の子（healthcheck の出力取得。SUP-4・SUP-6・#2441）が、stdout と stderr の両方を
@@ -5209,6 +5248,192 @@ mod tests {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("install child did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// `/proc/<pid>/fd/<fd>` のリンク先（`pipe:[ino]` 等）。
+    fn proc_fd_target(pid: &str, fd: &str) -> Option<String> {
+        std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// `/proc/<pid>/fdinfo/<fd>` の `flags:`(8 進)。
+    fn proc_fd_flags(pid: &str, fd: &str) -> Option<u32> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+        let line = text.lines().find_map(|l| l.strip_prefix("flags:"))?;
+        u32::from_str_radix(line.trim(), 8).ok()
+    }
+
+    /// `pid` のプロセスが持つ、`target` を指す fd の (書き込み可能な本数, 読み取り専用の本数)。
+    fn count_pipe_fds(pid: &str, target: &str) -> (usize, usize) {
+        let (mut writable, mut readonly) = (0, 0);
+        let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return (0, 0);
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if proc_fd_target(pid, &name).as_deref() != Some(target) {
+                continue;
+            }
+            match proc_fd_flags(pid, &name).map(|f| f & 0o3) {
+                Some(0) => readonly += 1,
+                Some(_) => writable += 1,
+                None => {}
+            }
+        }
+        (writable, readonly)
+    }
+
+    /// SEC-1・CRI-6（#4069）: stdin の書き込み側は fd 3 以上かつ close-on-exec の書き込み専用で、
+    /// 読み取り側(子の fd 0 になる)と同じ pipe を指す。
+    #[test]
+    fn sec1_cri6_4069_pipes_with_stdin_writer_is_cloexec_above_stdio() {
+        use std::os::fd::AsRawFd as _;
+        let (stdio, writer, _out, _err) = ChildStdio::pipes_with_stdin().unwrap();
+        let wfd = writer.as_raw_fd();
+        assert!(wfd >= 3, "stdin writer fd {wfd} must be >= 3");
+        let pid = std::process::id().to_string();
+        let flags = proc_fd_flags(&pid, &wfd.to_string()).expect("fdinfo flags");
+        assert_eq!(flags & 0o2000000, 0o2000000, "O_CLOEXEC must be set");
+        assert_eq!(flags & 0o3, 1, "writer must be O_WRONLY");
+        let reader_fd = stdio.stdin.as_ref().expect("stdin read end").as_raw_fd();
+        let rflags = proc_fd_flags(&pid, &reader_fd.to_string()).expect("reader flags");
+        assert_eq!(rflags & 0o3, 0, "reader must be O_RDONLY");
+        assert_eq!(
+            proc_fd_target(&pid, &wfd.to_string()),
+            proc_fd_target(&pid, &reader_fd.to_string())
+        );
+        assert!(
+            proc_fd_target(&pid, &wfd.to_string())
+                .unwrap()
+                .starts_with("pipe:[")
+        );
+    }
+
+    /// SUP-7・CRI-6(#4069): 親が指定(読み取り側)を drop すると、書き込み側は `BrokenPipe` になる
+    /// (spawn が fork 後に親のコピーを drop するのと同じ。親が読み取り側を持ち続けない)。
+    #[test]
+    fn sup7_4069_parent_does_not_keep_the_stdin_read_end() {
+        let (stdio, mut writer, _out, _err) = ChildStdio::pipes_with_stdin().unwrap();
+        drop(stdio);
+        let err = writer.write_all(b"x").expect_err("no reader");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// stdin の継承の子役の環境変数。
+    const STDIN_INHERIT_CHILD_ENV: &str = "FANDHE_TEST_4069_STDIN_INHERIT_CHILD";
+
+    /// 子役: `install` 後、fd 0 が stdin の pipe の読み取り側で、exec した `cat` が書き込み側を継承せず、
+    /// 書き込んだ内容がちょうど届いて EOF になることを確かめる。終了コード(0 = 成功)で結果を返す。
+    fn stdin_inherit_child_main() -> ! {
+        use std::io::Read as _;
+        let code = (|| -> i32 {
+            let Ok((stdio, mut writer, _out, _err)) = ChildStdio::pipes_with_stdin() else {
+                return 1;
+            };
+            match stdio.install() {
+                Ok(n) if n.targets().is_empty() => {}
+                _ => return 2,
+            }
+            let me = std::process::id().to_string();
+            let Some(target) = proc_fd_target(&me, "0") else {
+                return 3;
+            };
+            if !target.starts_with("pipe:[") || proc_fd_flags(&me, "0").map(|f| f & 0o3) != Some(0)
+            {
+                return 4;
+            }
+            // 陽性対照: 自プロセスには書き込み側が 1 本ある。
+            if count_pipe_fds(&me, &target).0 != 1 {
+                return 5;
+            }
+            let Ok(mut cat) = Command::new("/bin/cat")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return 6;
+            };
+            let cat_pid = cat.id().to_string();
+            // exec が済むまで待ってから(cat の fd 0 が同じ pipe を指す)走査する。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while proc_fd_target(&cat_pid, "0").as_deref() != Some(target.as_str()) {
+                if std::time::Instant::now() >= deadline {
+                    let _ = cat.kill();
+                    let _ = cat.wait();
+                    return 7;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let (w, r) = count_pipe_fds(&cat_pid, &target);
+            if (w, r) != (0, 1) {
+                let _ = cat.kill();
+                let _ = cat.wait();
+                return 8;
+            }
+            if writer.write_all(b"PING\n").is_err() {
+                return 9;
+            }
+            drop(writer);
+            let Some(mut cat_out) = cat.stdout.take() else {
+                return 10;
+            };
+            // 読み切りは別スレッドで行い、期限(REPAIR-5)を超えたら cat を kill して失敗にする。
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = cat_out.read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            let timed_out = got.is_err();
+            if timed_out {
+                let _ = cat.kill();
+            }
+            let status = cat.wait();
+            let _ = reader.join();
+            match (got, status) {
+                (Ok(buf), Ok(s)) if buf == b"PING\n" && s.code() == Some(0) => 0,
+                _ => 11,
+            }
+        })();
+        std::process::exit(code);
+    }
+
+    /// SEC-1・CRI-6(#4069): `install` 後に exec した子は stdin の書き込み側を継承しない(読み取り側だけが fd 0)。
+    /// 継承していれば EOF が来ず期限切れになる。テストバイナリ自身を再実行した子役で確かめる。
+    /// lib の試験ビルドの `close_inherited_fds` は dry-run のため、ここで担保するのは close-on-exec の側。
+    #[test]
+    fn sec1_cri6_4069_exec_child_does_not_inherit_stdin_writer() {
+        if std::env::var_os(STDIN_INHERIT_CHILD_ENV).is_some() {
+            stdin_inherit_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::sec1_cri6_4069_exec_child_does_not_inherit_stdin_writer",
+                "--test-threads=1",
+                "--no-capture",
+            ])
+            .env(STDIN_INHERIT_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stdin inherit child did not finish within 60s");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };

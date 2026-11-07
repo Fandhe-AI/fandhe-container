@@ -132,7 +132,7 @@
 //!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
 //!   範囲写像の holder が継承するメモリから secret を外す方式(封印 memfd。#2628)は `InjectedContent` の doc を参照。
-//!   CLI から supervisor への受け渡しは未結線
+//!   CLI から supervisor への受け渡しは未結線。`LaunchOptions::stdin` が `Pipe` のときだけ spawn が stdin の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す(既定の `Null` は `/dev/null`。SUP-7・CRI-6・SEC-1・#4069)
 //! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
@@ -153,7 +153,7 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
-use super::launch_options::{LaunchIpcMode, LaunchOptions};
+use super::launch_options::{LaunchIpcMode, LaunchOptions, LaunchStdinMode};
 #[cfg(target_os = "linux")]
 use super::network_mode::EffectiveNetwork;
 use super::network_mode::LaunchNetworkMode;
@@ -1065,14 +1065,19 @@ struct SpawnInput<'a> {
     netns_sync: Option<crate::exec::NetnsSyncRequest>,
     /// `Attachable` の同期点で呼ぶ準備処理(他のモードは `None`。NET-9・CORE-6・#1939)。
     netns_attach: Option<&'a dyn super::NetnsAttachHook>,
+    /// init の stdin の扱い(`LaunchOptions::stdin`。`Pipe` のときだけ spawn が stdin の pipe を作る。launch のたびに
+    /// 新しい pipe で、restart の再 launch も同じ。SUP-7・CRI-6・SEC-1・#4069)。
+    stdin: LaunchStdinMode,
 }
 
-/// 起動した PID 1 と、stdout / stderr の読み取り側。
+/// 起動した PID 1 と、stdout / stderr の読み取り側(と、`Pipe` のときの stdin の書き込み側)。
 #[cfg(target_os = "linux")]
 struct Spawned {
     child: ContainerChild,
     stdout: std::io::PipeReader,
     stderr: std::io::PipeReader,
+    /// init の stdin の書き込み側(`SpawnInput::stdin` が `Pipe` のときだけ `Some`。#4069)。
+    stdin: Option<std::io::PipeWriter>,
     /// PID 1 から受け取った seccomp の listener(SEC-4・#2024)。本番の入口は必ず `Some`。偽の launcher は `None`。
     listener: Option<crate::exec::SeccompListener>,
     /// 子が返した Mount 由来のルールの launch 時の識別子(`(ルール位置, 識別子)`。SEC-1・SEC-4・#3201)。本番の入口は
@@ -1526,6 +1531,15 @@ impl Inner {
                 "the launch spec was reconciled with a different network mode",
             ));
         }
+        // 端末つき起動と stdin Pipe の併用は拒否する。pty 割り当て後に fd 0 が slave へ置き換わるため、取り出した書き込み端は
+        // 接続先のない pipe になり EPIPE で init に届かない。fork の前(副作用なし)に断る(CRI-6・SUP-7・SEC-1・#4069・#4070)。
+        // tty の入力は pty の master 側(`take_pty_master`)へ書く。
+        if spec.terminal() && options.stdin() == LaunchStdinMode::Pipe {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "stdin pipe cannot be combined with a terminal; write to the pty master instead",
+            ));
+        }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
@@ -1733,12 +1747,14 @@ impl Inner {
                 root_readonly: effective_root_readonly,
                 netns_sync,
                 netns_attach: self.netns_attach_hook.as_deref(),
+                stdin: options.stdin(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
             child,
             stdout,
             stderr,
+            stdin,
             listener,
             mount_identities,
             pty_master,
@@ -1782,6 +1798,7 @@ impl Inner {
         let drop_owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
+            .with_stdin(stdin)
             .with_seccomp_listener(listener)
             .with_pty_master(pty_master)
             .with_launch_isolation(isolation_record)
@@ -2321,7 +2338,17 @@ impl LaunchOps for RealOps {
                 )
             }
         };
-        let (stdio, stdout, stderr) = ChildStdio::pipes().map_err(not_started)?;
+        // `Pipe` のときだけ stdin の pipe を作る(読み取り側は子の fd 0、書き込み側は `take_stdin` で返す。#4069)。
+        let (stdio, stdin, stdout, stderr) = match input.stdin {
+            LaunchStdinMode::Pipe => {
+                let (stdio, w, out, err) = ChildStdio::pipes_with_stdin().map_err(not_started)?;
+                (stdio, Some(w), out, err)
+            }
+            LaunchStdinMode::Null => {
+                let (stdio, out, err) = ChildStdio::pipes().map_err(not_started)?;
+                (stdio, None, out, err)
+            }
+        };
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
@@ -2362,6 +2389,7 @@ impl LaunchOps for RealOps {
             child: launched.child,
             stdout,
             stderr,
+            stdin,
             listener: launched.listener,
             mount_identities: Some(launched.mount_identities),
             pty_master: launched.pty_master,
@@ -2493,6 +2521,8 @@ mod tests {
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
         /// spawn に渡った起動オプション由来の値(注入の宛先列・namespace に IPC があるか。SUP-12・#2625)。
         seen_options: Arc<Mutex<Vec<SeenOptions>>>,
+        /// spawn に渡った stdin の扱い(launch ごとに 1 件。#4069)。
+        seen_stdin: Arc<Mutex<Vec<LaunchStdinMode>>>,
         /// spawn に渡った entrypoint の env(launch ごとに 1 件。#2713)。
         seen_env: Arc<Mutex<Vec<Vec<String>>>>,
         /// `landlock_ruleset` に渡った暗黙マウントの含め方(launch ごとに 1 件)。
@@ -2524,6 +2554,7 @@ mod tests {
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
                 seen_options: Arc::new(Mutex::new(Vec::new())),
+                seen_stdin: Arc::new(Mutex::new(Vec::new())),
                 seen_env: Arc::new(Mutex::new(Vec::new())),
                 seen_implicit: Arc::new(Mutex::new(Vec::new())),
                 fail_root_identity: false,
@@ -2597,6 +2628,7 @@ mod tests {
                     .map(|m| m.destination.as_str().to_owned())
                     .collect(),
             ));
+            self.seen_stdin.lock().unwrap().push(input.stdin);
             self.seen_env
                 .lock()
                 .unwrap()
@@ -2653,6 +2685,11 @@ mod tests {
             }
             let (stdout, _w1) = std::io::pipe().unwrap();
             let (stderr, _w2) = std::io::pipe().unwrap();
+            // `Pipe` のときは書き込み側を返す(読み取り側は偽の子が持たないため、試験は書き込みの成否を使わない)。
+            let stdin = match input.stdin {
+                LaunchStdinMode::Pipe => Some(std::io::pipe().unwrap().1),
+                LaunchStdinMode::Null => None,
+            };
             let child = if self.child_without_pidfd {
                 ContainerChild::from_pid_for_test(2_000_002)
             } else {
@@ -2663,6 +2700,7 @@ mod tests {
                 child,
                 stdout,
                 stderr,
+                stdin,
                 listener: None,
                 mount_identities: None,
                 pty_master: self.give_pty_master.then(|| {
@@ -4973,6 +5011,29 @@ mod tests {
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
     }
 
+    /// CRI-6・SUP-7・SEC-1(#4069・#4070): 端末つき spec と stdin Pipe の併用は fork の前に `InvalidArgument` で断る。
+    #[test]
+    fn cri6_4069_launch_rejects_terminal_with_stdin_pipe() {
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.terminal_support = true;
+        l.inner.launch_options = Some(
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_stdin(LaunchStdinMode::Pipe),
+        );
+        let err = l
+            .launch(&terminal_spec("tty-stdin-pipe"), Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "stdin pipe cannot be combined with a terminal; write to the pty master instead"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
     /// CRI-6(#4070): opt-in 済みの launcher は子が返した pty の master をハンドルに持たせ、1 回だけ取り出せる。
     #[test]
     fn cri6_4070_launch_hands_pty_master_to_the_handle() {
@@ -5101,6 +5162,50 @@ mod tests {
             .count();
         assert_eq!(tmpfs_rules, 0);
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-7・CRI-6(#4069): 既定の launch は spawn に `Null` を渡し `take_stdin` が `None`。`Pipe` の launch は
+    /// `Pipe` を渡し、`take_stdin` が 1 回だけ `Some`。再 launch はそれぞれ別の書き込み端(別の pipe)を返す。
+    #[test]
+    fn sup7_cri6_4069_launch_opens_stdin_only_when_requested() {
+        use std::os::fd::AsFd as _;
+        let spec = spec_for("stdin-opt", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let seen = Arc::clone(&ops.seen_stdin);
+        let mut l = launcher(ops, rootless(), None);
+
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("default");
+        assert!(p.take_stdin().is_none());
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+
+        l.inner.launch_options = Some(
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_stdin(LaunchStdinMode::Pipe),
+        );
+        let ino = |s: &crate::oci_runtime::ContainerStdin| {
+            std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&s.as_fd())
+            ))
+            .expect("link")
+        };
+        let first = l.launch(&spec, Duration::from_secs(1)).expect("pipe 1");
+        let a = first.take_stdin().expect("first take");
+        assert!(first.take_stdin().is_none());
+        let second = l.launch(&spec, Duration::from_secs(1)).expect("pipe 2");
+        let b = second.take_stdin().expect("second launch");
+        assert_ne!(ino(&a), ino(&b));
+        first.terminate(Duration::from_secs(5)).expect("terminate");
+        second.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                LaunchStdinMode::Null,
+                LaunchStdinMode::Pipe,
+                LaunchStdinMode::Pipe
+            ]
+        );
     }
 
     /// SUP-12(#2625): `/dev/shm` と `/run` を指定順で渡し、IPC namespace は保つ。

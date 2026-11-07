@@ -273,7 +273,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **D3. init の stdin / pty を作り保持する主体**
 
-- 作るのは core の本番 launcher で、supervisor が起動オプションで要求する。stdin は `LaunchOptions` で開く指定を足し、core が pipe を作って読み取り側を子の fd 0 にし、書き込み側を `LaunchedProcess` から取り出す。tty（`process.terminal: true`）は、子がコンテナの mount namespace と devpts の中で `/dev/ptmx` を開き、slave を fd 0〜2 にして `setsid` と `TIOCSCTTY` で制御端末にし、`/dev/console` へ bind し、master は既存の子から親への SCM_RIGHTS（seccomp listener と同じ経路）で返す。pty の sys ラッパーと開く位置（Landlock / seccomp の再適用との順序）は #3758 の決定を再利用し、ここで決め直さない。ホストの devpts では割り当てない
+- 作るのは core の本番 launcher で、supervisor が起動オプションで要求する。stdin は `LaunchOptions` で開く指定を足し、core が pipe を作って読み取り側を子の fd 0 にし、書き込み側を `LaunchedProcess` から取り出す。（stdin の段は C1〔#4069〕で実装済み。API は `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`）tty（`process.terminal: true`）は、子がコンテナの mount namespace と devpts の中で `/dev/ptmx` を開き、slave を fd 0〜2 にして `setsid` と `TIOCSCTTY` で制御端末にし、`/dev/console` へ bind し、master は既存の子から親への SCM_RIGHTS（seccomp listener と同じ経路）で返す。pty の sys ラッパーと開く位置（Landlock / seccomp の再適用との順序）は #3758 の決定を再利用し、ここで決め直さない。ホストの devpts では割り当てない
 - core の `process.terminal` の拒否は、supervisor が端末対応を opt-in したとき（例: `with_terminal_support()`）だけ外す。master を捕捉しない呼び出し元は従来どおり拒否する（fail-closed）
 - 保持するのは supervisor で、`control/target.rs` の `SignalSlot` と同じ置き場所に世代ごとのスロットを持つ。`Exited` と再 launch で落とし、新しい世代の fd に差し替える。tty では master を捕捉の stdout 1 本として `LogCapture` へ渡し、`EIO` は EOF とみなす（CRI のログは stdout のタグだけになる）
 - 渡した master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと `TIOCSWINSZ` にだけ使う（契約）
@@ -325,7 +325,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 | 子 | issue | 内容 | 依存 |
 | -- | ----- | ---- | ---- |
-| C1 | #4069 | core: init の stdin パイプ | なし |
+| C1 | #4069 | core: init の stdin パイプ（実装済み: `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`。書き込み端は close-on-exec かつ fd 3 以上。supervisor のラッパーの `take_stdin` の転送は C4） | なし |
 | C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
 | C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |

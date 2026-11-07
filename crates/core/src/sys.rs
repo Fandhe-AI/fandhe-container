@@ -37,6 +37,8 @@
 //! デバイス cgroup の層ごとの実機照合（TASK-32 追補・#1681）は、`ptmx` を開いた pty の slave を開けるよう
 //! `ioctl(2)`（`TIOCSPTLCK`・`TIOCGPTN`）を呼ぶ（`pty_unlock_and_index`）。`ioctl(2)` は nsfs の namespace fd の素性の
 //! 照合（`NS_GET_NSTYPE`・`NS_GET_USERNS`・`NS_GET_PARENT`・`NS_GET_OWNER_UID`。#2674・CORE-3・CRI-2）にも使う。
+//! exec の pty の割り当てでは、端末サイズの設定・取得（`TIOCSWINSZ`・`TIOCGWINSZ`）と制御端末の取得（`TIOCSCTTY`）の
+//! 薄いラッパー（`set_window_size`・`window_size`・`set_controlling_tty`）を持つ（#3758・SUP-6・SEC-1）。
 //! 委譲 cgroup の検出と子 cgroup 作成（`crate::cgroups`。CORE-3・TASK-32.1・#158）は、
 //! `mkdirat(2)`・`unlinkat(2)`・`fstatfs(2)`（cgroup2 判定）と `O_NOFOLLOW` 付きの `openat(2)` を呼ぶために使う。
 //! rlimit の適用（`exec/rlimits.rs` の `apply_rlimits`。SUP-12・TASK-169.1・#526）は、fork 後の子で `prlimit(2)` を呼ぶために使う。
@@ -531,6 +533,9 @@ macro_rules! libc_consts_checks {
             libc_const_eq!(NS_GET_OWNER_UID, u64, c_ulong);
             libc_const_eq!(TIOCGPTN, u64, c_ulong);
             libc_const_eq!(TIOCSPTLCK, u64, c_ulong);
+            libc_const_eq!(TIOCSCTTY, u64, c_ulong);
+            libc_const_eq!(TIOCGWINSZ, u64, c_ulong);
+            libc_const_eq!(TIOCSWINSZ, u64, c_ulong);
             libc_const_eq!(PTRACE_CONT, i64, c_uint);
             libc_const_eq!(RLIMIT_CPU, i32, c_uint);
             libc_const_eq!(RLIMIT_FSIZE, i32, c_uint);
@@ -655,10 +660,13 @@ mod consts {
     pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/ioctls.h の `TIOCGPTN`（_IOR('T', 0x30, unsigned int)）と
     // `TIOCSPTLCK`（_IOW('T', 0x31, int)）。x86_64 は asm/ioctls.h が asm-generic を取り込むだけで上書きしない。
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCGPTN: u64 = 0x8004_5430;
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCSPTLCK: u64 = 0x4004_5431;
+    // 同ヘッダの `TIOCSCTTY`（0x540E）・`TIOCGWINSZ`（0x5413）・`TIOCSWINSZ`（0x5414）。exec の pty 割り当て
+    // （#3758・SUP-6・SEC-1）が使う。引数の型は整数（`TIOCSCTTY`）と `struct winsize *`（残り 2 つ）。
+    pub const TIOCSCTTY: u64 = 0x540E;
+    pub const TIOCGWINSZ: u64 = 0x5413;
+    pub const TIOCSWINSZ: u64 = 0x5414;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -1082,10 +1090,13 @@ mod consts {
     pub const O_NOCTTY: i32 = 0o400;
     // include/uapi/asm-generic/ioctls.h の `TIOCGPTN`（_IOR('T', 0x30, unsigned int)）と
     // `TIOCSPTLCK`（_IOW('T', 0x31, int)）。arm64 は asm/ioctls.h が asm-generic を取り込むだけで上書きしない。
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCGPTN: u64 = 0x8004_5430;
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCSPTLCK: u64 = 0x4004_5431;
+    // 同ヘッダの `TIOCSCTTY`（0x540E）・`TIOCGWINSZ`（0x5413）・`TIOCSWINSZ`（0x5414）。exec の pty 割り当て
+    // （#3758・SUP-6・SEC-1）が使う。引数の型は整数（`TIOCSCTTY`）と `struct winsize *`（残り 2 つ）。
+    pub const TIOCSCTTY: u64 = 0x540E;
+    pub const TIOCGWINSZ: u64 = 0x5413;
+    pub const TIOCSWINSZ: u64 = 0x5414;
     // include/uapi/asm-generic/fcntl.h の `O_RDONLY`・`O_WRONLY`（全アーキテクチャ共通）。
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 1;
@@ -1477,10 +1488,11 @@ mod consts {
     pub const O_NONBLOCK: i32 = 0;
     pub const O_RDWR: i32 = 0;
     pub const O_NOCTTY: i32 = 0;
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCGPTN: u64 = 0;
-    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const TIOCSPTLCK: u64 = 0;
+    pub const TIOCSCTTY: u64 = 0;
+    pub const TIOCGWINSZ: u64 = 0;
+    pub const TIOCSWINSZ: u64 = 0;
     pub const O_RDONLY: i32 = 0;
     pub const O_WRONLY: i32 = 0;
     pub const O_CREAT: i32 = 0;
@@ -5692,6 +5704,16 @@ mod libc_abi {
         assert!(size_of::<libc::c_short>() == size_of::<i16>());
     };
 
+    // `WinSize`: `libc::winsize`（exec の pty の `TIOCSWINSZ`・`TIOCGWINSZ`。#3758・SUP-6）。
+    const _: () = {
+        assert!(size_of::<super::WinSize>() == size_of::<libc::winsize>());
+        assert!(align_of::<super::WinSize>() == align_of::<libc::winsize>());
+        assert!(offset_of!(super::WinSize, ws_row) == offset_of!(libc::winsize, ws_row));
+        assert!(offset_of!(super::WinSize, ws_col) == offset_of!(libc::winsize, ws_col));
+        assert!(offset_of!(super::WinSize, ws_xpixel) == offset_of!(libc::winsize, ws_xpixel));
+        assert!(offset_of!(super::WinSize, ws_ypixel) == offset_of!(libc::winsize, ws_ypixel));
+    };
+
     // `SockaddrNl`: `libc::sockaddr_nl`。`nl_pad` は `libc` で非公開のため、自前のオフセットと
     // 「`nl_family` の直後」で代わりに照合する(net crate の #1841 と同じ扱い)。
     const _: () = {
@@ -6808,7 +6830,6 @@ pub(crate) fn noctty_open_flag() -> Option<i32> {
 /// 直後の slave（`ptmx_open` が `TTY_PTY_LOCK` を立てるため、解除前の open は `EIO`）を、デバイス cgroup の
 /// 許可リスト（c 136:*）の照合のために開けるようにする。`TIOCGPTPEER` は `may_open` を通らず照合にならないため使わない。
 /// 副作用はその pty のロック解除だけ。対応外アーキテクチャでは `Unsupported`（fail-closed）。
-#[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
 pub(crate) fn pty_unlock_and_index(master: BorrowedFd<'_>) -> Result<u32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -6841,6 +6862,102 @@ pub(crate) fn pty_unlock_and_index(master: BorrowedFd<'_>) -> Result<u32, SysErr
         return Err(last_error());
     }
     Ok(index)
+}
+
+/// `struct winsize`（include/uapi/asm-generic/termios.h。`TIOCSWINSZ`・`TIOCGWINSZ` の引数。8 バイト）。
+/// レイアウトは最上位の `libc_abi` で `libc::winsize` と `const` 評価で照合する（#3758・SUP-6）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WinSize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+/// `fd`（pty の slave）を呼び出しプロセスの制御端末にする（`TIOCSCTTY`。引数 0 = 他セッションの制御端末を奪わない）。
+///
+/// exec の子が `setsid` の直後に fd 0 へ呼ぶ（`crate::exec` の `acquire_controlling_tty`。#3758・SUP-6・SEC-1）。
+/// セッションリーダーで制御端末を持たないときだけ成功し、それ以外（既に制御端末がある・他セッションの端末）は
+/// `EPERM`。tty でない fd は `ENOTTY`。引数は整数でポインタを渡さない。アロケーション・ロックを伴わない
+/// （fork 後の子から呼べる）。呼び出しプロセスのセッションの状態を変えるため、単体試験の libtest プロセスでは
+/// 成功系を呼ばない。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+// テストビルドでは dry-run 差し込み点が本関数を呼ばない（libtest のプロセスの制御端末を変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_controlling_tty(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`TIOCSCTTY` の第 3 引数は整数（0）で、ポインタを渡さないため
+    // カーネルがユーザー空間のメモリを読み書きしない。副作用は呼び出しプロセスの制御端末の設定だけ。
+    let rc = unsafe { ffi_ioctl!(fd.as_raw_fd(), consts::TIOCSCTTY, 0_u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// pty の `fd` の端末サイズを `rows` 行・`cols` 列に設定する（`TIOCSWINSZ`。ピクセル寸法は 0）。
+///
+/// master を持つ側が resize（CRI の Exec の ResizeEvent）を反映するのに使う（`crate::exec::PtyMaster::resize`。
+/// #3758・SUP-6・CRI-6）。slave 側のフォアグラウンドのプロセスグループへ `SIGWINCH` が届く。tty でない fd は
+/// `ENOTTY`。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+pub(crate) fn set_window_size(fd: BorrowedFd<'_>, rows: u16, cols: u16) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let size = WinSize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`TIOCSWINSZ` はスタック上の `WinSize`（`struct winsize` と同じ
+    // 8 バイトの `repr(C)`。最上位の `libc_abi` で照合済み）を指す読み取り専用のポインタを取り、カーネルは
+    // そこから 8 バイトを読むだけ（`size` は呼び出しの間生存する）。副作用は対象 tty のサイズの更新だけ。
+    let rc = unsafe {
+        ffi_ioctl!(
+            fd.as_raw_fd(),
+            consts::TIOCSWINSZ,
+            std::ptr::from_ref(&size)
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// pty の `fd` の端末サイズ `(行, 列)` を読む（`TIOCGWINSZ`）。tty でない fd は `ENOTTY`。
+///
+/// resize の反映の確認（試験）に使う。対応外アーキテクチャでは `Unsupported`（fail-closed）。
+pub(crate) fn window_size(fd: BorrowedFd<'_>) -> Result<(u16, u16), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut size = WinSize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `fd` は生存中の `BorrowedFd`。`TIOCGWINSZ` はスタック上の `WinSize`（8 バイトの `repr(C)`）を指す
+    // 書き込み可能なポインタを取り、カーネルはそこへ 8 バイトだけを書く（`size` は呼び出しの間生存する）。
+    let rc = unsafe {
+        ffi_ioctl!(
+            fd.as_raw_fd(),
+            consts::TIOCGWINSZ,
+            std::ptr::from_mut(&mut size)
+        )
+    };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    Ok((size.ws_row, size.ws_col))
+}
+
+/// `parent` 配下の既存の `name` を `O_RDWR|O_NOCTTY|O_NOFOLLOW|O_CLOEXEC` で開く（pty の `ptmx` と slave の
+/// 割り当て用。#3758・SUP-6・SEC-1）。`O_NOCTTY` により open だけでは制御端末にならない（制御端末にするのは
+/// [`set_controlling_tty`] だけ）。`O_CREAT` を含まない。`name` は 1 要素に検証済みの前提。
+pub(crate) fn open_rdwr_noctty_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+) -> Result<OwnedFd, SysError> {
+    open_file_at(parent, name, consts::O_RDWR | consts::O_NOCTTY)
 }
 
 /// `O_NONBLOCK | O_NOFOLLOW | O_DIRECTORY`。親ディレクトリを 1 要素ずつ symlink 非追従で開くための値。
@@ -10037,5 +10154,64 @@ mod tests {
         use std::os::fd::AsFd as _;
         let f = std::fs::File::open("/proc/self/status").expect("open");
         assert_eq!(pty_unlock_and_index(f.as_fd()), Err(SysError::Os(25)));
+    }
+
+    /// SEC-1・SUP-6（#3758）: 端末まわりの ioctl 番号の固定値（x86_64・aarch64 とも asm-generic の値）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sup6_3758_tty_ioctl_consts_are_exact() {
+        assert_eq!(consts::TIOCSCTTY, 0x540E);
+        assert_eq!(consts::TIOCGWINSZ, 0x5413);
+        assert_eq!(consts::TIOCSWINSZ, 0x5414);
+        assert_eq!(std::mem::size_of::<WinSize>(), 8);
+    }
+
+    /// SUP-6（#3758）: master に設定した行・列が slave から読め、続く resize が反映される。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sup6_3758_window_size_set_on_master_is_read_from_slave_and_resize_applies() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let master = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(consts::O_NOCTTY)
+            .open("/dev/ptmx")
+            .expect("open /dev/ptmx");
+        let index = pty_unlock_and_index(master.as_fd()).expect("unlock and index");
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(consts::O_NOCTTY)
+            .open(format!("/dev/pts/{index}"))
+            .expect("open unlocked slave");
+        set_window_size(master.as_fd(), 24, 80).expect("set 24x80");
+        assert_eq!(window_size(slave.as_fd()), Ok((24, 80)));
+        set_window_size(master.as_fd(), 50, 132).expect("resize to 50x132");
+        assert_eq!(window_size(slave.as_fd()), Ok((50, 132)));
+        assert_eq!(window_size(master.as_fd()), Ok((50, 132)));
+    }
+
+    /// SUP-6（#3758）: tty でない fd への各ラッパーは `ENOTTY`（25）で失敗する。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sup6_3758_tty_wrappers_reject_non_tty_fd() {
+        use std::os::fd::AsFd as _;
+        let f = std::fs::File::open("/proc/self/status").expect("open");
+        assert_eq!(set_controlling_tty(f.as_fd()), Err(SysError::Os(25)));
+        assert_eq!(set_window_size(f.as_fd(), 24, 80), Err(SysError::Os(25)));
+        assert_eq!(window_size(f.as_fd()), Err(SysError::Os(25)));
+        // 別の種別（文字デバイスだが tty ではない `/dev/null`）も `ENOTTY`。
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert_eq!(window_size(null.as_fd()), Err(SysError::Os(25)));
     }
 }

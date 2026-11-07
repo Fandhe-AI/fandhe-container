@@ -200,7 +200,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 **stdio と pty**:
 
 - stdin / stdout / stderr を別々に付け替える処理は core（#3757）が持ち、`ExecLaunchIo` を拡張する。要求されない stdio は `/dev/null` のまま。既存の healthcheck の挙動は変えない
-- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置（Landlock と seccomp の再適用より前、または `dev_mounts` の権利の範囲）は #3758 で確定する。ホストの devpts で代わりに割り当てる方式は採らない
+- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置は、Landlock と seccomp の再適用の **後** に `ExecReady::allocate_pty` で、照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で辿って開く（#3758 で確定。コマンドと同じ権利で開き、launch より広げない。暗黙の `/dev/pts` に `READ|WRITE|IOCTL_DEV` が付くため通る想定で、実コンテナでの確認は #3762。通らなければ再適用の前へ移す判断をオーナーに仰ぐ）。slave は `ChildStdio::from_pty_slave` が fd 0〜2 に付け、子が `setsid` の直後に `TIOCSCTTY` を発行する。master は worker がコマンドの fork の前に `spawn_exec_worker_with_listener_and_pty` の口で親へ送って閉じる（コマンドは master を持たない）。ホストの devpts で代わりに割り当てる方式は採らない
 - resize は、plugin-cri が持つ master へ `TIOCSWINSZ` を発行する（core の安全なラッパー。supervisor への往復なし）
 
 **SEC-1**:

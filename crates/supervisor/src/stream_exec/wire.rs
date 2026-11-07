@@ -36,10 +36,10 @@
 //! | --- | --- | --- | --- | --- |
 //! | 1 | exited | 1 / exit code | 0 | 0 |
 //! | 2 | signaled | 2 / signal（1〜64） | 0 | 0 |
-//! | 3 | not_started | 1 または 2（子の終了状態。写像に使う） | 0〜15 | 1〜10 |
+//! | 3 | not_started | 1 または 2（子の終了状態。写像に使う） | 0〜16 | 1〜10 |
 //! | 4 | failed | 0 / 0 | 0 | 1〜10 |
 //!
-//! step: 0 = なし、1〜15 = `ExecChildStep` を宣言順に 1 から。code: 1〜10 = `ErrorCode` を宣言順に 1 から。
+//! step: 0 = なし、1〜16 = `ExecChildStep`。1〜15 は宣言順（`ControllingTty` を除く）、後から足した `ControllingTty`（#3758）は既存番号を動かさないため末尾の 16。code: 1〜10 = `ErrorCode` を宣言順に 1 から。
 //! 番号は `ALL` の添字からではなく明示の `match` で固定し、core の並び替えで動かさない。未知の番号は frame 全体を拒否する。
 
 use fandhe_container_core::exec::ExecChildStep;
@@ -395,7 +395,7 @@ pub fn error_code_from_u8(v: u8) -> Option<ErrorCode> {
     }
 }
 
-/// `ExecChildStep` の番号（1〜15）。未割り当てなら `None`。
+/// `ExecChildStep` の番号（1〜16）。未割り当てなら `None`。
 pub fn step_to_u8(step: ExecChildStep) -> Option<u8> {
     match step {
         ExecChildStep::ParentLifetime => Some(1),
@@ -413,6 +413,7 @@ pub fn step_to_u8(step: ExecChildStep) -> Option<u8> {
         ExecChildStep::StdioNull => Some(13),
         ExecChildStep::ReportReady => Some(14),
         ExecChildStep::Execveat => Some(15),
+        ExecChildStep::ControllingTty => Some(16),
         _ => None,
     }
 }
@@ -435,6 +436,7 @@ pub fn step_from_u8(v: u8) -> Option<ExecChildStep> {
         13 => Some(ExecChildStep::StdioNull),
         14 => Some(ExecChildStep::ReportReady),
         15 => Some(ExecChildStep::Execveat),
+        16 => Some(ExecChildStep::ControllingTty),
         _ => None,
     }
 }
@@ -625,7 +627,7 @@ mod tests {
         assert_eq!(r([2, 2, 65, 0, 0]), Err(WireError::InvalidResult));
         assert_eq!(r([3, 1, 127, 15, 0]), Err(WireError::InvalidResult));
         assert_eq!(r([3, 0, 0, 15, 2]), Err(WireError::InvalidResult));
-        assert_eq!(r([3, 1, 127, 16, 2]), Err(WireError::UnknownStep));
+        assert_eq!(r([3, 1, 127, 17, 2]), Err(WireError::UnknownStep));
         assert_eq!(r([3, 1, 127, 15, 11]), Err(WireError::UnknownCode));
         assert_eq!(r([4, 1, 0, 0, 2]), Err(WireError::InvalidResult));
         assert_eq!(r([4, 0, 0, 1, 2]), Err(WireError::InvalidResult));
@@ -648,7 +650,7 @@ mod tests {
             assert!(seen.insert(n));
             assert_eq!(step_from_u8(n), Some(s));
         }
-        assert_eq!(seen.len(), 15);
+        assert_eq!(seen.len(), 16);
         assert_eq!(error_code_from_u8(0), None);
         assert_eq!(step_from_u8(0), None);
     }

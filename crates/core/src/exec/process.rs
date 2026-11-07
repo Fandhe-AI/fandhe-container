@@ -46,7 +46,7 @@
 //!   照合は `tests/exec_child_setup.rs`（既定のテスト集合）
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
 //!   無い rootfs は拒否する。呼び出し側が [`ChildStdio`] で明示した番号（stdin・stdout・stderr の個別指定。
-//!   #3757・SUP-6・CRI-6）だけは先に付け替え、指定されない番号を `/dev/null` へ置換する。pty は #3758（REPAIR-3）。
+//!   #3757・SUP-6・CRI-6）だけは先に付け替え、指定されない番号を `/dev/null` へ置換する。pty の slave は [`ChildStdio::from_pty_slave`]（#3758。3 本と制御端末）。
 //!   `/dev/null` は **開く前に検証する**
 //!   （TASK-163 追補・#1459）: 照合済みの `/` を起点に `O_PATH|O_NOFOLLOW` で固定し、`fstat` で文字デバイス
 //!   1:3 を確かめてから、procfs の magic link 経由で `O_RDWR|O_NOCTTY` に開き直す。稼働中のコンテナ
@@ -659,6 +659,11 @@ fn prepare_exec_child(
     close_inherited_fds(keep).map_err(at(ExecChildStep::CloseFds))?;
     // 呼び出し側のセッション・制御端末を切り離す（以後に開くファイルを制御端末にしない順序。#1456）。
     detach_session().map_err(at(ExecChildStep::Setsid))?;
+    // tty の exec（`ChildStdio::from_pty_slave`）は、新しいセッションの直後に fd 0 の slave を制御端末にする
+    // （以後に開くファイルは `O_NOCTTY` のまま。端末を取り直さない。#3758・SUP-6・SEC-1）。
+    if nulling.controlling_tty {
+        acquire_controlling_tty().map_err(at(ExecChildStep::ControllingTty))?;
+    }
     // 呼び出し元が照合を済ませた `/`（launch は pivot 直後のマウント ID、exec は固定した rootfs との一致。exec の
     // 子の cwd も同じディレクトリ）と、その procfs。ランタイムの同一性の基準・固定した fd の開き直しの起点にする。
     // どちらも標準入出力の置換まで保持するため、番号を 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると
@@ -741,7 +746,9 @@ fn prepare_exec_child(
     }
 
     mark_fds_cloexec().map_err(at(ExecChildStep::PrepareFds))?;
-    reset_sigpipe(!nulling.stdout || !nulling.stderr).map_err(at(ExecChildStep::PrepareFds))?;
+    // 端末の exec は `SIG_DFL` のまま（pty への write は `SIGPIPE` にならない。#3758）。
+    reset_sigpipe((!nulling.stdout || !nulling.stderr) && !nulling.controlling_tty)
+        .map_err(at(ExecChildStep::PrepareFds))?;
     if is_script {
         sys::set_cloexec(file.as_fd(), false)
             .map_err(|e| ExecError::from_sys(e, STAGE, "fcntl(F_SETFD)"))
@@ -875,6 +882,25 @@ fn detach_session() -> Result<(), ExecError> {
     Ok(())
 }
 
+/// fd 0（pty の slave）を呼び出しプロセスの制御端末にする（`TIOCSCTTY`。引数 0 = 奪わない）。本番ビルドの実装。
+///
+/// `detach_session`（`setsid`）の直後に、`ChildStdio::from_pty_slave` の子だけが呼ぶ。セッションリーダーで制御端末を
+/// 持たないため成功する。失敗は段 `Exec`（`ExecChildStep::ControllingTty`）で、`execve` へ進まない（fail-closed。
+/// #3758・SUP-6・SEC-1）。syscall 1 回でアロケーション・ロックを伴わない（fork 後の子から呼べる）。
+#[cfg(not(test))]
+fn acquire_controlling_tty() -> Result<(), ExecError> {
+    let stdin = std::io::stdin();
+    sys::set_controlling_tty(std::os::fd::AsFd::as_fd(&stdin))
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "ioctl(TIOCSCTTY)"))
+}
+
+/// テストビルドの dry-run 差し込み点（libtest のプロセスの制御端末は変えない）。呼ばれたことだけを記録する。
+#[cfg(test)]
+fn acquire_controlling_tty() -> Result<(), ExecError> {
+    tests::record("ioctl(0,TIOCSCTTY)".to_string());
+    Ok(())
+}
+
 /// fd 0〜2 の実体（継承した標準入出力）の `(st_dev, st_ino)` を集める。開いたエントリポイントと
 /// 照合し、`/proc/self/fd/{0,1,2}` 経由でホスト側の実体を開いた場合を検出する（fd 3 以上は閉じ済み）。
 ///
@@ -945,7 +971,7 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 /// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。置換先は [`open_verified_null`] が
 /// 検証してから開いた `/dev/null` で、存在しない・`null` デバイス（1:3）でない場合は、別の実体を標準入出力に
 /// しないため fail-closed で拒否する。stdin・stdout・stderr の受け渡しは [`ChildStdio`]（#1471・#3757）が先に付け替え、
-/// `nulling` が外した番号は置換しない（3 本とも指定されても `/dev/null` の検証は行う）。pty の受け渡しは #3758（未実装）。
+/// `nulling` が外した番号は置換しない（3 本とも指定されても `/dev/null` の検証は行う）。pty の slave（#3758）は 3 本とも付け替え済みの扱い。
 #[cfg(not(test))]
 fn redirect_stdio_to_null(
     root: BorrowedFd<'_>,
@@ -1401,6 +1427,8 @@ pub enum ExecChildStep {
     CloseFds,
     /// セッション・制御端末の切り離し（`setsid`）。
     Setsid,
+    /// tty の exec で fd 0 の pty の slave を制御端末にする手順（`TIOCSCTTY`。#3758）。
+    ControllingTty,
     /// 照合済みの `/` と procfs を開く手順。
     OpenRoot,
     /// エントリポイントを開いて種別を確かめる手順。
@@ -1427,11 +1455,12 @@ pub enum ExecChildStep {
 
 impl ExecChildStep {
     /// 全段（子の実行順）。
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::ParentLifetime,
         Self::CgroupJoin,
         Self::CloseFds,
         Self::Setsid,
+        Self::ControllingTty,
         Self::OpenRoot,
         Self::OpenEntrypoint,
         Self::RuntimeIdentity,
@@ -1452,6 +1481,7 @@ impl ExecChildStep {
             Self::CgroupJoin => "cgroup_join",
             Self::CloseFds => "close_fds",
             Self::Setsid => "setsid",
+            Self::ControllingTty => "controlling_tty",
             Self::OpenRoot => "open_root",
             Self::OpenEntrypoint => "open_entrypoint",
             Self::RuntimeIdentity => "runtime_identity",
@@ -1488,6 +1518,7 @@ impl ExecChildStep {
             Self::CgroupJoin => "the exec child could not join its child cgroup",
             Self::CloseFds => "the exec child could not close the inherited file descriptors",
             Self::Setsid => "the exec child could not detach from the caller session",
+            Self::ControllingTty => "the exec child could not acquire the controlling terminal",
             Self::OpenRoot => "the exec child could not open the container root",
             Self::OpenEntrypoint => "the exec child could not open the entrypoint",
             Self::RuntimeIdentity => "the exec child refused the entrypoint identity",
@@ -1904,6 +1935,8 @@ pub struct ExecChildSetupReport {
     pub dev_tty_errno: Option<i32>,
     /// fd 0〜2 の実体の `(文字デバイスか, st_rdev)`。`/dev/null` は `(true, makedev(1, 3))`。
     pub stdio: [(bool, u64); 3],
+    /// fd 0 の端末サイズ `(行, 列)`（`TIOCGWINSZ`）。fd 0 が端末でなければ `None`（#3758）。
+    pub winsize: Option<(u16, u16)>,
     /// `execveat` に渡す環境変数（`KEY=VALUE`。`ExecCommand` が持つ値そのもので、envp はこの列だけから作る）。
     pub env: Vec<String>,
     /// 子に残っている fd 3 以上の `(番号, /proc/self/fd のリンク先)`（一覧の読み取りに使った fd は除く）。
@@ -2213,6 +2246,10 @@ fn write_setup_report(
             meta.rdev()
         ));
     }
+    match sys::window_size(stdin.as_fd()) {
+        Ok((rows, cols)) => text.push_str(&format!("winsize={rows} {cols}\n")),
+        Err(_) => text.push_str("winsize=-\n"),
+    }
     for var in &entry.env {
         text.push_str(&format!("env={}\n", var.to_string_lossy()));
     }
@@ -2294,6 +2331,13 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
             errno => Some(errno.parse().ok()?),
         },
         stdio: stdio.try_into().ok()?,
+        winsize: match single("winsize")? {
+            "-" => None,
+            v => {
+                let (rows, cols) = v.split_once(' ')?;
+                Some((rows.parse().ok()?, cols.parse().ok()?))
+            }
+        },
         env: text
             .lines()
             .filter_map(|l| l.strip_prefix("env="))
@@ -2338,12 +2382,15 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
 ///
 /// [`ChildStdio::install`] が付け替え済みの番号（stdin のパイプ・ログ用パイプ・exec の個別指定。#3757・SUP-6・CRI-6）は
 /// 置換せずそのまま exec へ引き継ぐ（`false`）。指定されなかった番号だけを `/dev/null` へ置換する（`true`）。
-/// pty は #3758（REPAIR-3）。
+/// pty の slave（[`ChildStdio::from_pty_slave`]。#3758）は 3 本とも付け替え済みで、加えて `controlling_tty` を立てる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StdioNulling {
     stdin: bool,
     stdout: bool,
     stderr: bool,
+    /// fd 0 の pty の slave を制御端末にする（`setsid` の直後に `TIOCSCTTY`。[`ChildStdio::from_pty_slave`]。
+    /// #3758・SUP-6・SEC-1）。偽なら制御端末を取らない（従来どおり）。
+    controlling_tty: bool,
 }
 
 impl StdioNulling {
@@ -2352,6 +2399,7 @@ impl StdioNulling {
         stdin: true,
         stdout: true,
         stderr: true,
+        controlling_tty: false,
     };
 
     /// `/dev/null` へ置換する fd 番号（昇順）。
@@ -2390,6 +2438,8 @@ pub struct ChildStdio {
     stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
+    /// 3 本が pty の slave で、子が `setsid` の後に fd 0 を制御端末にする（[`Self::from_pty_slave`]。#3758）。
+    controlling_tty: bool,
 }
 
 impl ChildStdio {
@@ -2408,6 +2458,7 @@ impl ChildStdio {
                 stdin: None,
                 stdout: Some(OwnedFd::from(out_w)),
                 stderr: Some(OwnedFd::from(err_w)),
+                controlling_tty: false,
             },
             out_r,
             err_r,
@@ -2428,6 +2479,7 @@ impl ChildStdio {
             stdin: None,
             stdout: Some(output),
             stderr: Some(dup),
+            controlling_tty: false,
         })
     }
 
@@ -2437,13 +2489,14 @@ impl ChildStdio {
             stdin: None,
             stdout: None,
             stderr: None,
+            controlling_tty: false,
         }
     }
 
     /// exec のコマンドへ stdin・stdout・stderr を個別に渡すための指定（#3757・SUP-6・CRI-6）。`None` の番号は
     /// `/dev/null` のまま。socket・pipe・文字デバイスを受け、ディレクトリの fd は拒否する（`InvalidArgument`・段 `Spawn`）:
     /// ホストのディレクトリ fd を標準入出力として渡すと `openat(0, "..")` 型の脱出路になるため（SEC-1・fail-closed）。
-    /// pty は #3758（REPAIR-3）。stdin の stall 期限は呼び出し側（#3761）が持つ。
+    /// pty の slave は [`Self::from_pty_slave`]。stdin の stall 期限は呼び出し側（#3761）が持つ。
     pub fn from_fds(
         stdin: Option<OwnedFd>,
         stdout: Option<OwnedFd>,
@@ -2468,6 +2521,23 @@ impl ChildStdio {
             stdin,
             stdout,
             stderr,
+            controlling_tty: false,
+        })
+    }
+
+    /// exec の `tty=true`: pty の slave を stdin・stdout・stderr の 3 本と制御端末にする指定（#3758・SUP-6・SEC-1・CRI-6）。
+    ///
+    /// slave を 3 本に複製して fd 0〜2 へ割り当て（CRI は tty のとき stderr を使わず、合流は slave で自然に起こる）、
+    /// 子は `setsid` の直後に fd 0 へ `TIOCSCTTY`（引数 0 = 奪わない）を発行して制御端末にする。
+    /// `SIGPIPE` は `SIG_DFL` のまま（pty の master が閉じても slave への write は `EIO` で `SIGPIPE` にならず、
+    /// 対話シェルのパイプラインの挙動を変えない）。slave は呼び出し側が [`ExecReady::allocate_pty`](super::ExecReady::allocate_pty)
+    /// で得た、コンテナの devpts の pty のもの。複製の失敗は `ExecError`（段 `Spawn`）。
+    pub fn from_pty_slave(slave: super::PtySlave) -> Result<Self, ExecError> {
+        Ok(Self {
+            stdin: Some(slave.try_clone_fd()?),
+            stdout: Some(slave.try_clone_fd()?),
+            stderr: Some(slave.try_clone_fd()?),
+            controlling_tty: true,
         })
     }
 
@@ -2503,6 +2573,7 @@ impl ChildStdio {
             stdin: stdin.is_none(),
             stdout: stdout.is_none(),
             stderr: stderr.is_none(),
+            controlling_tty: self.controlling_tty,
         })
     }
 }
@@ -4919,6 +4990,7 @@ mod tests {
             stdin: true,
             stdout: false,
             stderr: false,
+            controlling_tty: false,
         };
         let err =
             exec_entrypoint_verified_with(current_root_mnt_id(), &entry, nulling).unwrap_err();
@@ -4949,12 +5021,14 @@ mod tests {
             stdin: true,
             stdout: true,
             stderr: false,
+            controlling_tty: false,
         };
         assert_eq!(only_err_piped.targets(), vec![0, 1]);
         let only_out_piped = StdioNulling {
             stdin: true,
             stdout: false,
             stderr: true,
+            controlling_tty: false,
         };
         assert_eq!(only_out_piped.targets(), vec![0, 2]);
     }
@@ -5002,6 +5076,7 @@ mod tests {
             stdin: true,
             stdout: false,
             stderr: false,
+            controlling_tty: false,
         };
         let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, piped);
         let piped_calls = take_calls();
@@ -5095,6 +5170,7 @@ mod tests {
                 stdin,
                 stdout,
                 stderr,
+                controlling_tty: false,
             }
             .targets()
         };
@@ -5121,6 +5197,7 @@ mod tests {
             stdin: false,
             stdout: false,
             stderr: false,
+            controlling_tty: false,
         };
         let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, all);
         let all_calls = take_calls();
@@ -5128,6 +5205,7 @@ mod tests {
             stdin: false,
             stdout: true,
             stderr: true,
+            controlling_tty: false,
         };
         let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, only_stdin);
         let stdin_calls = take_calls();
@@ -5136,6 +5214,63 @@ mod tests {
         assert!(all_calls.contains(&"stdio[]->/dev/null".to_string()));
         assert!(stdin_calls.contains(&"signal(SIGPIPE,SIG_DFL)".to_string()));
         assert!(stdin_calls.contains(&"stdio[1, 2]->/dev/null".to_string()));
+    }
+
+    /// SUP-6・SEC-1（#3758）: tty の指定では `setsid` の直後に fd 0 へ `TIOCSCTTY` を発行し、`SIGPIPE` は `SIG_DFL` のまま、
+    /// `/dev/null` へ置換する対象は空。tty でない指定の記録列には `TIOCSCTTY` が現れない。
+    #[test]
+    fn sup6_3758_dry_run_acquires_controlling_tty_right_after_setsid() {
+        let dir = TempDir::create("exec-3758");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
+        let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let tty = StdioNulling {
+            stdin: false,
+            stdout: false,
+            stderr: false,
+            controlling_tty: true,
+        };
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, tty);
+        let tty_calls = take_calls();
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, StdioNulling::ALL);
+        let plain_calls = take_calls();
+        drop(dir);
+        let setsid = tty_calls.iter().position(|c| c == "setsid").unwrap();
+        assert_eq!(
+            tty_calls.get(setsid + 1).map(String::as_str),
+            Some("ioctl(0,TIOCSCTTY)")
+        );
+        assert!(tty_calls.contains(&"signal(SIGPIPE,SIG_DFL)".to_string()));
+        assert!(tty_calls.contains(&"stdio[]->/dev/null".to_string()));
+        assert!(!plain_calls.iter().any(|c| c.contains("TIOCSCTTY")));
+    }
+
+    /// SUP-6・SEC-1（#3758）: `from_pty_slave` は slave を 3 本に複製して制御端末を要求し、`install` が `controlling_tty` を写す。
+    #[test]
+    fn sup6_3758_from_pty_slave_requests_controlling_tty_for_all_three() {
+        let (_master, slave) =
+            crate::exec::pty::open_host_pty_for_test(crate::exec::WindowSize::new(24, 80)).unwrap();
+        let stdio = ChildStdio::from_pty_slave(slave).unwrap();
+        assert!(stdio.stdin.is_some() && stdio.stdout.is_some() && stdio.stderr.is_some());
+        assert!(stdio.controlling_tty);
+        assert!(!ChildStdio::none().controlling_tty);
+    }
+
+    /// SUP-6・SEC-1（#3758）: 制御端末の取得の失敗は固定語彙の段 `controlling_tty` で、往復できる。
+    #[test]
+    fn sup6_3758_controlling_tty_step_token_round_trips() {
+        assert_eq!(ExecChildStep::ControllingTty.as_str(), "controlling_tty");
+        assert_eq!(
+            ExecChildStep::from_token("controlling_tty"),
+            Some(ExecChildStep::ControllingTty)
+        );
+        assert_eq!(ExecChildStep::ALL.len(), 16);
+        assert_eq!(ExecChildStep::ControllingTty.stage(), IsolationStage::Exec);
     }
 
     /// SUP-6・CRI-6・SEC-1（#3757）: `from_fds` はディレクトリの fd を拒否し、socket・pipe を受け、何も渡さなければ空の指定になる。
@@ -5524,7 +5659,7 @@ mod tests {
             IsolationStage::Exec,
             "secret /host/path errno 13",
         );
-        assert_eq!(ExecChildStep::ALL.len(), 15);
+        assert_eq!(ExecChildStep::ALL.len(), 16);
         for step in ExecChildStep::ALL {
             let line = exec_failure_line(step, &err);
             assert_eq!(line, format!("126 {} PERMISSION_DENIED -\n", step.as_str()));

@@ -108,10 +108,12 @@ mod linux {
 
     use fandhe_container_core::exec::{
         ChildExit, ChildStdio, ContainerEnv, ExecChildSetupReport, ExecChildStep, ExecCommand,
-        ExecExit, MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
-        ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
-        observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
-        observe_exec_child_setup_with_fsize, observe_exec_child_setup_with_stdio,
+        ExecExit, MAX_SEALED_COPY_BYTES, PtyReceipt, SealedCopyUnavailable, StandardFd,
+        SupplementaryGroups, ViolationReason, WindowSize, clear_supplementary_groups_for_test,
+        close_standard_fds_for_test, observe_exec_child_setup, observe_exec_child_setup_pinned,
+        observe_exec_child_setup_with, observe_exec_child_setup_with_fsize,
+        observe_exec_child_setup_with_stdio, open_host_pty_for_test,
+        spawn_exec_worker_with_listener_and_pty,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
@@ -222,6 +224,8 @@ mod linux {
         supplementary_groups_are_cleared_or_refused();
         exec_fd_moves_above_closed_stdio(&work.0);
         stdio_is_routed_per_stream(&work.0);
+        pty_slave_becomes_the_controlling_terminal(&work.0);
+        pty_master_is_handed_over_and_validated();
         println!("exec_child_setup: all scenarios passed");
     }
 
@@ -977,6 +981,112 @@ exec "$2" "$3" "$1""#;
         assert_eq!(report.stdio[1], (false, 0));
         assert_eq!(report.stdio[2], (true, NULL_RDEV));
         assert_eq!(report.open_fds.len(), 2, "{:?}", report.open_fds);
+    }
+
+    /// SUP-6・CRI-6・SEC-1（#3758）: `from_pty_slave` の子は新しいセッションのリーダーで、slave を制御端末（`tty_nr` が
+    /// slave の `st_rdev`、`/dev/tty` が開ける）として持ち、fd 0〜2 が slave で、設定した行・列が `TIOCGWINSZ` で読める。
+    /// 起動後の resize も反映される（master 側で読み戻す）。対照: 端末なしの子は `tty_nr` が 0・端末サイズが読めない。
+    fn pty_slave_becomes_the_controlling_terminal(work: &Path) {
+        let (master, slave) =
+            open_host_pty_for_test(WindowSize::new(37, 91)).expect("allocate a pty");
+        let stdio = ChildStdio::from_pty_slave(slave).expect("stdio from the pty slave");
+        let observation = observe_exec_child_setup_with_stdio(
+            &shell_entry(),
+            &work.join("report-tty"),
+            stdio,
+            || {
+                // 観測の後処理は不要（端末サイズは子の報告の `winsize` で読む）。
+            },
+            timeout(),
+        )
+        .expect("observe with a pty slave");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        assert_eq!(
+            report.session_id, report.pid,
+            "the child leads a new session"
+        );
+        assert_eq!(report.winsize, Some((37, 91)));
+        assert_eq!(report.dev_tty_errno, None, "/dev/tty must open");
+        assert_ne!(
+            report.tty_nr, 0,
+            "the child must have a controlling terminal"
+        );
+        let rdev = report.stdio[0].1;
+        assert!(report.stdio.iter().all(|(chr, r)| *chr && *r == rdev));
+        assert_ne!(rdev, NULL_RDEV);
+        // `tty_nr` は slave のデバイス番号（major 136 以上・minor はその番号）を `(major << 8) | minor` で符号化した値。
+        let (major, minor) = (rdev >> 8 & 0xfff, rdev & 0xff);
+        assert!((136..144).contains(&major), "slave major {major}");
+        assert_eq!(
+            report.tty_nr,
+            i64::try_from((major << 8) | minor).expect("tty_nr")
+        );
+        // 起動後の resize が master から反映され、読み戻せる。
+        master.resize(WindowSize::new(50, 132)).expect("resize");
+        assert_eq!(
+            master.window_size().expect("size"),
+            WindowSize::new(50, 132)
+        );
+        // 対照: 端末なしの子。
+        let plain = observe_ok(&shell_entry(), work, "report-no-tty");
+        assert_eq!(plain.tty_nr, 0);
+        assert_eq!(plain.winsize, None);
+    }
+
+    /// SUP-6・SEC-1（#3758）: worker が割り当てた master を `SCM_RIGHTS` で親へ渡すと、親は種別を検証して受け取り、
+    /// 設定済みの行・列を読める。master でない fd・何も送らない worker は拒否 / 閉鎖として区別される。
+    fn pty_master_is_handed_over_and_validated() {
+        use fandhe_container_core::seccomp::ErrnoDelivery;
+        let deadline = || Instant::now() + timeout();
+        // (a) 正しい master。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, sender| {
+                let Ok((master, _slave)) = open_host_pty_for_test(WindowSize::new(24, 80)) else {
+                    return 1;
+                };
+                i32::from(sender.hand_over(master).is_err())
+            })
+            .expect("spawn the worker");
+        match pty.receive(&child, deadline()) {
+            PtyReceipt::Received(master) => {
+                assert_eq!(master.window_size().expect("size"), WindowSize::new(24, 80));
+                master.resize(WindowSize::new(40, 100)).expect("resize");
+                assert_eq!(
+                    master.window_size().expect("size"),
+                    WindowSize::new(40, 100)
+                );
+            }
+            other => panic!("expected a master, got {other:?}"),
+        }
+        assert_eq!(
+            child.wait_timeout(timeout()).expect("wait"),
+            ChildExit::Exited(0)
+        );
+        // (b) master でない fd（`/dev/null`）は拒否する。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, sender| {
+                let Ok(null) = fs::File::open("/dev/null") else {
+                    return 1;
+                };
+                use std::os::fd::AsFd as _;
+                i32::from(sender.hand_over_non_pty_for_test(null.as_fd()).is_err())
+            })
+            .expect("spawn the worker");
+        match pty.receive(&child, deadline()) {
+            PtyReceipt::Rejected(e) => assert_eq!(e.code, ErrorCode::InvalidArgument),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        let _ = child.wait_timeout(timeout());
+        // (c) 何も送らずに終わった worker は閉鎖として区別される。
+        let (child, _listener, pty) =
+            spawn_exec_worker_with_listener_and_pty(ErrnoDelivery::Errno, |_proof, _l, _s| 0)
+                .expect("spawn the worker");
+        assert!(matches!(
+            pty.receive(&child, deadline()),
+            PtyReceipt::SenderClosed
+        ));
+        let _ = child.wait_timeout(timeout());
     }
 
     /// SUP-6・SEC-1・TASK-163.4 / 追補（#1460）: 子は呼び出し側から継承した fd 3 以上をすべて閉じ、残るのは

@@ -745,6 +745,39 @@ pub struct ContainerStatus {
     pid: Option<NonZeroU32>,
     exit_code: Option<i32>,
     termination: Option<TerminationReason>,
+    exited_at: Option<ExitTime>,
+}
+
+/// コンテナの終了を検知した時刻（UNIX epoch からのナノ秒。CRI-5・OCI-5・SUP-1・#3682）。
+///
+/// supervisor が終了を回収した時点の壁時計で、`state.json` の `exitedAtNanos` に永続化し、
+/// shim v2 の State・Delete・Wait の `exited_at` へ渡る。カーネル上の正確な終了時刻ではなく、
+/// 誤差の上限は wait の刻み程度。壁時計のため時計の変更で起動時刻より前になりうる。
+/// 0 以下は表現できない（「壊れた値を表現できない」型。REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExitTime(i64);
+
+impl ExitTime {
+    /// UNIX epoch からのナノ秒から作る。0 以下は `None`。
+    pub fn from_unix_nanos(nanos: i64) -> Option<Self> {
+        (nanos > 0).then_some(Self(nanos))
+    }
+
+    /// `SystemTime` から作る。epoch 以前・`i64` ナノ秒を超える値は `None`。
+    pub fn from_system_time(t: std::time::SystemTime) -> Option<Self> {
+        let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Self::from_unix_nanos(i64::try_from(d.as_nanos()).ok()?)
+    }
+
+    /// 現在の壁時計から作る。取れなければ `None`（呼び出し側は値を捏造しない）。
+    pub fn now() -> Option<Self> {
+        Self::from_system_time(std::time::SystemTime::now())
+    }
+
+    /// UNIX epoch からのナノ秒を返す（常に 1 以上）。
+    pub fn as_unix_nanos(self) -> i64 {
+        self.0
+    }
 }
 
 /// コンテナの終了に付く特別な理由（CRI の `ContainerStatus.reason` の `OOMKilled` の元。CRI-2・CORE-4）。
@@ -790,6 +823,7 @@ impl ContainerStatus {
             pid,
             exit_code,
             termination: None,
+            exited_at: None,
         }
     }
 
@@ -818,6 +852,19 @@ impl ContainerStatus {
         Self::build(id, ContainerState::Stopped, None, exit_code)
     }
 
+    /// 終了検知時刻つきの終了済み状態を作る（CRI-5・OCI-5・SUP-1・#3682）。
+    ///
+    /// `exited_at` が取れない場合は `None`（未設定のまま。値を捏造しない。REPAIR-3）。
+    pub fn stopped_at(
+        id: ContainerId,
+        exit_code: Option<i32>,
+        exited_at: Option<ExitTime>,
+    ) -> Self {
+        let mut status = Self::stopped(id, exit_code);
+        status.exited_at = exited_at;
+        status
+    }
+
     /// 特別な終了理由つきの終了済み状態を作る（CRI-2・CORE-4）。
     ///
     /// OOM による終了のように、終了コードと独立に理由を報告したいときに使う。
@@ -829,6 +876,18 @@ impl ContainerStatus {
     ) -> Self {
         let mut status = Self::stopped(id, exit_code);
         status.termination = Some(reason);
+        status
+    }
+
+    /// 終了理由と終了検知時刻つきの終了済み状態を作る（#3682）。
+    pub fn stopped_with_reason_at(
+        id: ContainerId,
+        exit_code: Option<i32>,
+        reason: TerminationReason,
+        exited_at: Option<ExitTime>,
+    ) -> Self {
+        let mut status = Self::stopped_with_reason(id, exit_code, reason);
+        status.exited_at = exited_at;
         status
     }
 
@@ -856,6 +915,11 @@ impl ContainerStatus {
     /// 特別な終了理由（報告が無ければ `None`。`Stopped` 以外は常に `None`）を返す。
     pub fn termination_reason(&self) -> Option<TerminationReason> {
         self.termination
+    }
+
+    /// 終了検知時刻（未記録なら `None`。`Stopped` 以外は常に `None`）を返す。
+    pub fn exited_at(&self) -> Option<ExitTime> {
+        self.exited_at
     }
 }
 
@@ -1109,6 +1173,54 @@ mod tests {
             ContainerStatus::running(sample_id(), None).termination_reason(),
             None
         );
+    }
+
+    /// OCI-5・CRI-5（#3682）: `ExitTime` は 0 以下を拒否し、`stopped_at` だけが値を保持する。
+    #[test]
+    fn oci5_3682_exit_time_bounds_and_constructors() {
+        assert_eq!(ExitTime::from_unix_nanos(0), None);
+        assert_eq!(ExitTime::from_unix_nanos(-1), None);
+        assert_eq!(
+            ExitTime::from_unix_nanos(1).map(ExitTime::as_unix_nanos),
+            Some(1)
+        );
+        assert_eq!(
+            ExitTime::from_unix_nanos(i64::MAX).map(ExitTime::as_unix_nanos),
+            Some(i64::MAX)
+        );
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(ExitTime::from_system_time(before), None);
+        assert_eq!(ExitTime::from_system_time(std::time::UNIX_EPOCH), None);
+        let t = ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        assert!(t.is_some());
+        let s = ContainerStatus::stopped_at(sample_id(), Some(7), t);
+        assert_eq!(s.exited_at(), t);
+        let r = ContainerStatus::stopped_with_reason_at(
+            sample_id(),
+            Some(137),
+            TerminationReason::OomKilled,
+            t,
+        );
+        assert_eq!(r.exited_at(), t);
+        assert_eq!(r.termination_reason(), Some(TerminationReason::OomKilled));
+        assert_eq!(
+            ContainerStatus::stopped(sample_id(), Some(7)).exited_at(),
+            None
+        );
+        assert_eq!(
+            ContainerStatus::stopped_at(sample_id(), None, None).exited_at(),
+            None
+        );
+        assert_eq!(ContainerStatus::creating(sample_id()).exited_at(), None);
+        assert_eq!(
+            ContainerStatus::created(sample_id(), None).exited_at(),
+            None
+        );
+        assert_eq!(
+            ContainerStatus::running(sample_id(), None).exited_at(),
+            None
+        );
+        assert!(ExitTime::now().is_some());
     }
 
     /// CRI-2: 終了理由の文字列表現は往復し、未知の値は拒否する。

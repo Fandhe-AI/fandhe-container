@@ -83,8 +83,8 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::{LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{
-    ContainerState, ContainerStatus, ErrorCode, HealthStatus, StateRecord, SupervisionState,
-    TraitError,
+    ContainerState, ContainerStatus, ErrorCode, ExitTime, HealthStatus, StateRecord,
+    SupervisionState, TraitError,
 };
 
 use crate::healthcheck::{HEALTH_STOP_LIMIT, HealthStopReport, HealthWiring, HealthWorker};
@@ -601,6 +601,8 @@ fn monitor_after_claim(
             Ok(None) => continue,
             Ok(Some(exit)) => {
                 let detected_at = Instant::now();
+                // 終了検知時刻（壁時計）。再試行でも同じ値を使い、取れなければ未設定のまま記録する（CRI-5・#3682）。
+                let exited_at = ExitTime::now();
                 // 終了記録より前に周期実行を止めて回収する（その後に `health` の書き込みが割り込まず、restart の
                 // 「終了記録の後に別の書き込みがあれば未記録」の判定が成り立つ。SUP-3・SUP-4）。
                 stop_health(&mut worker, obs);
@@ -613,7 +615,7 @@ fn monitor_after_claim(
                         // `restart_count` は実施済み再起動の回数で、加算は再 launch 成功時（[`crate::restart`]）だけが行う。
                         // 終了記録では最新値を保つ（競合後の refresh で他者の更新も消さない）。
                         Ok((
-                            ContainerStatus::stopped(id.clone(), code),
+                            ContainerStatus::stopped_at(id.clone(), code, exited_at),
                             SupervisionState::new(None, rec.health(), rec.restart_count()),
                         ))
                     })
@@ -1106,6 +1108,29 @@ mod tests {
         assert_eq!(p.waits(), 3);
         // 初期 1 + 監視開始 + 終了
         assert_eq!(record.revision().value(), 3);
+    }
+
+    /// SUP-1・CRI-5・OCI-5（#3682）: 終了の記録は検知時刻を範囲で持ち、競合の再試行後も範囲内で、
+    /// 実行中の記録には時刻が無い。
+    #[test]
+    fn sup1_3682_exit_record_carries_detection_time_in_range() {
+        for conflicts in [0, 1] {
+            let store = running_store(conflicts);
+            let mut s = attach(&store);
+            assert_eq!(s.record().status().exited_at(), None);
+            let p = FakeProc::exiting(1, ProcessExit::Exited(7));
+            let before = ExitTime::now().expect("clock");
+            let out = monitor(&mut s, &p, &MonitorConfig::default(), &StopToken::new()).unwrap();
+            let after = ExitTime::now().expect("clock");
+            let MonitorOutcome::Exited { record, .. } = out else {
+                panic!("unexpected outcome")
+            };
+            let at = record.status().exited_at().expect("exited_at recorded");
+            assert!(
+                before <= at && at <= after,
+                "{before:?} <= {at:?} <= {after:?}"
+            );
+        }
     }
 
     /// TASK-157.4: シグナル終了は 128 + 番号。

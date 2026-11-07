@@ -98,6 +98,9 @@ pub struct RuntimeContainerStatus {
     pub exit_code: Option<i32>,
     /// 特別な終了理由（実行層が報告したときだけ。`None` は「OOM ではない」と「未検出」を区別しない。CRI-2・CORE-4）。
     pub termination: Option<RuntimeTerminationReason>,
+    /// 終了検知時刻（UNIX epoch からのナノ秒。Stopped で core が記録していたときだけ。未記録は `None`で、
+    /// 値を捏造しない。CRI-5・OCI-5・SUP-1・#3682）。
+    pub exited_at_nanos: Option<i64>,
 }
 
 impl From<&ContainerStatus> for RuntimeContainerStatus {
@@ -133,6 +136,7 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
             termination: s
                 .termination_reason()
                 .and_then(RuntimeTerminationReason::from_core),
+            exited_at_nanos: s.exited_at().map(|t| t.as_unix_nanos()),
         }
     }
 }
@@ -757,6 +761,17 @@ mod tests {
         let got = RuntimeContainerStatus::from(&src);
         assert_eq!(got.exit_code, Some(137));
         assert_eq!(got.termination, Some(RuntimeTerminationReason::OomKilled));
+    }
+
+    /// CRI-5・OCI-5（#3682）: 終了検知時刻はナノ秒の具体値で写り、時刻なしは `None`。
+    #[test]
+    fn cri5_3682_exit_time_is_mapped() {
+        let at =
+            fandhe_container_core::traits::ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        let got = RuntimeContainerStatus::from(&ContainerStatus::stopped_at(cid("a"), Some(1), at));
+        assert_eq!(got.exited_at_nanos, Some(1_700_000_000_000_000_005));
+        let got = RuntimeContainerStatus::from(&ContainerStatus::stopped(cid("a"), Some(1)));
+        assert_eq!(got.exited_at_nanos, None);
     }
 
     /// CRI-2: 応答の ID が要求と異なれば拒否する。

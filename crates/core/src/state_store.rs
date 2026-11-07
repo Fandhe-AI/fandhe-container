@@ -110,7 +110,7 @@ use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
     Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus,
-    CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode, ExplicitStop,
+    CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode, ExitTime, ExplicitStop,
     GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord, ListStateRequest,
     StateList, StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState,
     TerminationReason, TraitError, UpdateStateRequest,
@@ -1689,6 +1689,10 @@ struct StateDto {
     /// 特別な終了理由（`oomKilled`。CRI-2・CORE-4）。`stopped` のときだけ許し、キー欠落は `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     termination_reason: Option<String>,
+    /// 終了検知時刻（UNIX epoch からのナノ秒。CRI-5・OCI-5・SUP-1・#3682）。`stopped` のときだけ許し、
+    /// 0 以下・型違いは破損。キー欠落（導入前の版が書いたファイル・時刻を取れなかった記録）は `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exited_at_nanos: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2168,6 +2172,7 @@ impl StateDto {
             revision: record.revision().value(),
             exit_code: status.exit_code(),
             termination_reason: status.termination_reason().map(|r| r.as_str().to_owned()),
+            exited_at_nanos: status.exited_at().map(ExitTime::as_unix_nanos),
             cgroup_scope: record.cgroup().map(|c| c.scope().as_str().to_owned()),
             cgroup_instance: record.cgroup().map(|c| c.instance().value()),
             supervisor_pid: record.supervisor_pid().map(NonZeroU32::get),
@@ -2233,16 +2238,26 @@ impl StateDto {
             Some(r) => Some(TerminationReason::parse(r).ok_or_else(corrupted)?),
             None => None,
         };
+        let exited_at = match self.exited_at_nanos {
+            Some(n) => Some(ExitTime::from_unix_nanos(n).ok_or_else(corrupted)?),
+            None => None,
+        };
         let status = match (self.status.as_str(), pid, self.exit_code) {
             ("creating", None, None) => ContainerStatus::creating(id),
             ("created", p, None) => ContainerStatus::created(id, p),
             ("running", p, None) => ContainerStatus::running(id, p),
             ("stopped", None, code) => match termination {
-                Some(reason) => ContainerStatus::stopped_with_reason(id, code, reason),
-                None => ContainerStatus::stopped(id, code),
+                Some(reason) => {
+                    ContainerStatus::stopped_with_reason_at(id, code, reason, exited_at)
+                }
+                None => ContainerStatus::stopped_at(id, code, exited_at),
             },
             _ => return Err(corrupted()),
         };
+        // 終了検知時刻も stopped のときだけ持てる（それ以外での出現は破損。契約 15）。
+        if exited_at.is_some() && status.exited_at().is_none() {
+            return Err(corrupted());
+        }
         // 終了理由は stopped のときだけ持てる（それ以外での出現は破損）。
         if termination.is_some() && status.termination_reason().is_none() {
             return Err(corrupted());
@@ -5421,6 +5436,52 @@ mod tests {
                 .as_str(),
             "INTERNAL"
         );
+    }
+
+    /// OCI-5・CRI-5（#3682）: 終了検知時刻は往復で具体値が残り、キー無しは `None`、
+    /// `stopped` 以外での出現・0 以下・型違いは破損。
+    #[test]
+    fn oci5_3682_exited_at_nanos_roundtrip_and_strict() {
+        let t = TmpDir::new("exitedat");
+        let store = t.open();
+        let at = ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        let st = ContainerStatus::stopped_at(cid("rt"), Some(7), at);
+        store
+            .create(&CreateStateRequest::new(st.clone(), bundle()).unwrap())
+            .unwrap();
+        let got = store.get(&GetStateRequest::new(cid("rt"))).unwrap();
+        assert_eq!(got.status(), &st);
+        assert_eq!(got.status().exited_at(), at);
+        let raw = fs::read_to_string(t.path().join("rt").join("state.json")).unwrap();
+        assert!(
+            raw.contains(r#""exitedAtNanos":1700000000000000005"#),
+            "{raw}"
+        );
+        let write = |id: &str, status: &str, extra: &str| {
+            create(&store, id);
+            let body = format!(
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"{status}","bundle":"/b","revision":10{extra}}}"#
+            );
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+        };
+        write("old", "stopped", r#","exitCode":137"#);
+        let got = store.get(&GetStateRequest::new(cid("old"))).unwrap();
+        assert_eq!(got.status().exited_at(), None);
+        let internal = |id: &str| {
+            store
+                .get(&GetStateRequest::new(cid(id)))
+                .unwrap_err()
+                .code()
+                .as_str()
+        };
+        write("run", "running", r#","exitedAtNanos":5"#);
+        assert_eq!(internal("run"), "INTERNAL");
+        write("zero", "stopped", r#","exitedAtNanos":0"#);
+        assert_eq!(internal("zero"), "INTERNAL");
+        write("neg", "stopped", r#","exitedAtNanos":-3"#);
+        assert_eq!(internal("neg"), "INTERNAL");
+        write("str", "stopped", r#","exitedAtNanos":"5""#);
+        assert_eq!(internal("str"), "INTERNAL");
     }
 
     /// OCI-5: symlink・0700 以外の既存ルートを拒否し、新規ルートは 0700 で作る。

@@ -96,6 +96,17 @@ pub struct Timestamp {
     pub nanos: i32,
 }
 
+impl Timestamp {
+    /// UNIX epoch からの経過時間から作る。秒は `i64` へ飽和させる（`unwrap` を使わない）。
+    pub fn from_unix_duration(d: std::time::Duration) -> Self {
+        Self {
+            seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            // subsec_nanos は 10 億未満で i32 に収まる。
+            nanos: i32::try_from(d.subsec_nanos()).unwrap_or(0),
+        }
+    }
+}
+
 /// `DeleteRequest`（Delete RPC。TASK-62.3.1）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct DeleteRequest {
@@ -116,7 +127,7 @@ pub struct DeleteResponse {
     /// 終了コード。
     #[prost(uint32, tag = "2")]
     pub exit_status: u32,
-    /// 終了時刻。core が持たないため現状は常に未設定（REPAIR-3）。
+    /// 終了時刻。core が記録した終了検知時刻で、停止済みのときだけ。未記録・未停止は未設定（#3682）。
     #[prost(message, optional, tag = "3")]
     pub exited_at: Option<Timestamp>,
 }
@@ -138,7 +149,7 @@ pub struct WaitResponse {
     /// 終了コード。
     #[prost(uint32, tag = "1")]
     pub exit_status: u32,
-    /// 終了時刻。core が持たないため現状は常に未設定（REPAIR-3）。
+    /// 終了時刻。core が記録した終了検知時刻で、停止済みのときだけ。未記録・未停止は未設定（#3682）。
     #[prost(message, optional, tag = "2")]
     pub exited_at: Option<Timestamp>,
 }
@@ -215,8 +226,8 @@ pub struct StateRequest {
 
 /// `StateResponse`。
 ///
-/// `bundle`・stdio・`terminal`・`exited_at`・`exec_id` は shim が持たない（または core が持たない）ため
-/// 常に空・未設定（REPAIR-3）。
+/// `bundle`・stdio・`terminal`・`exec_id` は shim が持たないため常に空・未設定（REPAIR-3）。
+/// `exited_at` は STOPPED で core が終了検知時刻を記録していたときだけ返す（#3682）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct StateResponse {
     /// コンテナ ID。
@@ -246,7 +257,7 @@ pub struct StateResponse {
     /// 終了コード（停止済みのときだけ意味を持つ）。
     #[prost(uint32, tag = "9")]
     pub exit_status: u32,
-    /// 終了時刻。core が持たないため常に未設定。
+    /// 終了時刻。STOPPED で core が記録していたときだけ（未記録は未設定。#3682）。
     #[prost(message, optional, tag = "10")]
     pub exited_at: Option<Timestamp>,
     /// exec の ID。常に空。
@@ -311,6 +322,26 @@ pub struct ShutdownRequest {
 mod tests {
     use super::*;
     use prost::Message;
+
+    /// CRI-5（#3682）: `Timestamp::from_unix_duration` は秒・ナノ秒を具体値で写し、秒は飽和する。
+    #[test]
+    fn cri5_3682_timestamp_from_unix_duration() {
+        use std::time::Duration;
+        assert_eq!(
+            Timestamp::from_unix_duration(Duration::new(1_700_000_000, 999_999_999)),
+            Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 999_999_999
+            }
+        );
+        assert_eq!(
+            Timestamp::from_unix_duration(Duration::new(u64::MAX, 7)),
+            Timestamp {
+                seconds: i64::MAX,
+                nanos: 7
+            }
+        );
+    }
 
     /// CRI-5: フィールド番号の固定バイト列と往復。
     #[test]

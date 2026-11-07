@@ -18,7 +18,7 @@
 //! Delete の検査の順序: 復号（repeated / `Any` の欄が無いので走査は不要）→ exec_id があれば exec の経路 → id（アダプタ）。
 //! 手順は state（削除前の pid・終了コードを採る）→ `remove(force=false)`。containerd の Delete に force は
 //! 無く、実行中のコンテナは core の `FailedPrecondition`（9）で拒否される。応答の `exit_status` は
-//! 終了コード（不明は 255）、`exited_at` は core が終了時刻を持たないため常に未設定（REPAIR-3）。
+//! 終了コード（不明は 255）、`exited_at` は停止済みで core が記録した終了検知時刻（未記録は未設定。#3682）。
 //! 既知の制約: state と remove の間に状態が変わりうる（その場合の `exit_status` は不正確）。pid のある
 //! `Created` は core の契約で force=false では削除できない。plugin 越しでは最悪 2 回分の待ちになる。
 //!
@@ -32,8 +32,9 @@
 //!
 //! State / Kill / Shutdown（TASK-62.7.2）:
 //! - State: 状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
-//!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`bundle`・stdio・`terminal`・`exited_at` は
-//!   shim / core が持たないため空・未設定（REPAIR-3）。
+//!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`exited_at` は STOPPED で core が記録した終了検知時刻だけ
+//!   （他の状態・未記録は未設定。値は壁時計で、誤差は wait の刻み程度。#3682）。`bundle`・stdio・`terminal` は
+//!   shim が持たないため空・未設定（REPAIR-3）。
 //! - Kill: `signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。`all = true`
 //!   （containerd の `WithKillAll`）はコンテナの cgroup 全体へ `cgroup.kill` で送り（core の `KillTarget::AllProcesses`。
 //!   CRI-5・CORE-4）、SIGKILL 以外は `INVALID_ARGUMENT`。cgroup 配置の記録が無ければ `FAILED_PRECONDITION`（init だけへ
@@ -80,7 +81,7 @@ use super::shutdown::ShutdownSignal;
 use super::task_api::{
     ConnectRequest, ConnectResponse, CreateTaskRequest, CreateTaskResponse, DeleteRequest,
     DeleteResponse, ExecProcessRequest, KillRequest, ShutdownRequest, StartRequest, StartResponse,
-    StateRequest, StateResponse, TaskStatus, WaitRequest, WaitResponse,
+    StateRequest, StateResponse, TaskStatus, Timestamp, WaitRequest, WaitResponse,
 };
 use super::wait::WaitConfig;
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
@@ -183,6 +184,7 @@ impl TaskService {
             pid: st.pid.unwrap_or(0),
             status: status as i32,
             exit_status,
+            exited_at: exited_at_of(&st),
             ..Default::default()
         }
         .encode_to_vec())
@@ -501,7 +503,7 @@ impl TaskService {
         Ok(DeleteResponse {
             pid: before.pid.unwrap_or(0),
             exit_status: exit_status_of(&before),
-            exited_at: None,
+            exited_at: exited_at_of(&before),
         }
         .encode_to_vec())
     }
@@ -612,8 +614,8 @@ impl TaskService {
     /// Delete / Exec / Start(exec_id) が止まる。期限は `min(timeout_nano, WaitConfig::timeout)`
     /// （`timeout_nano` が 0 なら `WaitConfig` だけ。REPAIR-5）で、負値と残り 0 は runtime を呼ばずに
     /// `DEADLINE_EXCEEDED`。検査の順序は 復号 → exec_id → id → 期限。Wait だけが期限を使う
-    /// （他のメソッドは短く、`ContainerRuntime` の契約で有界）。`exited_at` は core が終了時刻を
-    /// 持たないため未設定。
+    /// （他のメソッドは短く、`ContainerRuntime` の契約で有界）。`exited_at` は core が記録した終了検知時刻
+    /// （未記録は未設定。#3682）。
     fn wait(&self, payload: &[u8], ctx: &CallContext<'_>) -> Result<Vec<u8>, RpcStatus> {
         let req = WaitRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
@@ -637,10 +639,21 @@ impl TaskService {
             .map_err(|e| to_status(&e))?;
         Ok(WaitResponse {
             exit_status: stopped_exit_status(&st),
-            exited_at: None,
+            exited_at: exited_at_of(&st),
         }
         .encode_to_vec())
     }
+}
+
+/// 停止済みの状態から `exited_at` を決める。Stopped 以外・未記録・負値は未設定（値を捏造しない。CRI-5・#3682）。
+fn exited_at_of(status: &RuntimeContainerStatus) -> Option<Timestamp> {
+    if status.lifecycle != RuntimeLifecycle::Stopped {
+        return None;
+    }
+    let nanos = u64::try_from(status.exited_at_nanos?).ok()?;
+    Some(Timestamp::from_unix_duration(
+        std::time::Duration::from_nanos(nanos),
+    ))
 }
 
 /// 停止済みの状態から `exit_status` を決める。終了コード不明・負値は 255。
@@ -1896,6 +1909,72 @@ mod tests {
             let r = WaitResponse::decode(&out[..]).unwrap();
             assert_eq!((r.exit_status, r.exited_at), (137, None));
         }
+    }
+
+    /// 停止済みで core が終了検知時刻を記録していた状態を差し込む（#3682）。
+    fn stopped_with_time(f: &Fake, id: &str, code: Option<i32>, nanos: i64) {
+        stopped(f, id, code);
+        f.preset.lock().unwrap().insert(
+            id.into(),
+            ContainerStatus::stopped_at(
+                RtId::new(id).unwrap(),
+                code,
+                fandhe_container_core::traits::ExitTime::from_unix_nanos(nanos),
+            ),
+        );
+    }
+
+    /// CRI-5・OCI-5（#3682）: State・Wait・Delete は停止済みで core の終了検知時刻を具体値で返し、
+    /// 実行中・未起動・時刻なしの停止では未設定のまま返す。
+    #[test]
+    fn cri5_3682_exited_at_is_returned_only_for_stopped_with_time() {
+        let want = Some(Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 5,
+        });
+        let at = 1_700_000_000_000_000_005_i64;
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f) = svc(v, Fake::default());
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            assert_eq!(state_of(&s, "c1").exited_at, None);
+            s.handle("Start", &start_req("c1")).unwrap();
+            assert_eq!(state_of(&s, "c1").exited_at, None);
+            // 時刻なしの停止（導入前の記録・時計の異常）は未設定のまま。
+            stopped(&f, "c1", Some(3));
+            assert_eq!(state_of(&s, "c1").exited_at, None);
+            stopped_with_time(&f, "c1", Some(3), at);
+            assert_eq!(state_of(&s, "c1").exited_at, want.clone());
+            let out = s.handle("Wait", &wait_req("c1", "")).unwrap();
+            assert_eq!(
+                WaitResponse::decode(&out[..]).unwrap().exited_at,
+                want.clone()
+            );
+            let out = s.handle("Delete", &delete_req("c1", "")).unwrap();
+            let r = DeleteResponse::decode(&out[..]).unwrap();
+            assert_eq!((r.exit_status, r.exited_at), (3, want.clone()));
+            // pid なしの Created の Delete は未設定。
+            s.handle("Create", &create_req("c2", &abs("/b"))).unwrap();
+            let out = s.handle("Delete", &delete_req("c2", "")).unwrap();
+            assert_eq!(DeleteResponse::decode(&out[..]).unwrap().exited_at, None);
+        }
+    }
+
+    /// `exited_at_of` は Stopped 以外と未記録を `None` にする（lifecycle で絞る）。
+    #[test]
+    fn cri5_3682_exited_at_of_requires_stopped_lifecycle() {
+        let id = || RtId::new("c1").unwrap();
+        let t = fandhe_container_core::traits::ExitTime::from_unix_nanos(1_999_999_999);
+        let m = |s: ContainerStatus| exited_at_of(&RuntimeContainerStatus::from(&s));
+        assert_eq!(
+            m(ContainerStatus::stopped_at(id(), None, t)),
+            Some(Timestamp {
+                seconds: 1,
+                nanos: 999_999_999
+            })
+        );
+        assert_eq!(m(ContainerStatus::stopped(id(), Some(0))), None);
+        assert_eq!(m(ContainerStatus::running(id(), None)), None);
+        assert_eq!(m(ContainerStatus::created(id(), None)), None);
     }
 
     /// 終了コードが不明・負値なら 255。

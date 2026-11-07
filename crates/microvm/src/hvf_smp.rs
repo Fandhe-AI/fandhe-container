@@ -97,7 +97,14 @@ impl ApMailbox {
     /// 初めて `lock` が取れるため、戻った時点で AP は待ちの中にある（固定時間の sleep に頼らない）。
     #[cfg(test)]
     fn await_waiting(&self) {
+        // AP が待ちに到達しないまま異常終了しても試験が止まらないよう、期限（5 秒）を設けて理由つきで失敗させる（REPAIR-5）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while self.wait_entries.load(Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "AP did not enter wait within 5s: wait_entries={}",
+                self.wait_entries.load(Ordering::Acquire)
+            );
             std::thread::yield_now();
         }
         drop(self.lock());

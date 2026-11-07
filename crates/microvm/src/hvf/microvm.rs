@@ -44,6 +44,10 @@
 //! 3. 報告が `Ok` のときだけ、デバイス → ゲスト RAM（`hv_vm_unmap` に成功したら munmap。失敗ならリーク）→ VM（最後の `Arc` の drop が
 //!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
 //!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
+//!    ゲスト RAM は `GuestMemorySlot` が持ち、`release` が stop より前に `take_or_leak` で取り出して `stop_and_release` へ渡す
+//!    ので、順序と期限切れ時のリークは変わらない（#4027）。今は vCPU スレッドがスロットの clone を持たないため安全で、#4028 で
+//!    clone を結線した後は、走っている vCPU の `with_memory` は固定の RELEASED エラー（fail-closed）になり、backing の unmap は
+//!    停止の報告の後だけになる。lock の毒化時は中身を解放せずリークする。
 //!
 //! ## Apple の記述との関係
 //! `hv_gic_create` のドキュメント（<https://developer.apple.com/documentation/hypervisor/hv_gic_create(_:)> の Discussion。2026-11-04 に
@@ -66,7 +70,7 @@
 //! の `Send`（#4024 で導入済み）を使って回収スレッドへ渡す実装そのものが本 issue の範囲外（追跡は #3908）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` は #4024 で導入済み）は未実装で、担当は
+//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（スロットの clone の結線は #4028）（`HostMapping` の `Send` は #4024 で導入済み）は未実装で、担当は
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
@@ -84,7 +88,8 @@ use crate::arm64_layout::{
 use crate::boot_arm64::{ArmBootReadback, LoadedArm64, check_boot_readback, load_arm64};
 use crate::dispatch::{DeviceId, ExitDispatcher};
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::guest_memory::{GuestAddress, GuestMemory};
+use crate::guest_memory::GuestAddress;
+use crate::guest_memory_slot::GuestMemorySlot;
 use crate::hvf::gic::{GicSpiLine, VmWithGic};
 use crate::hvf::hvc::HvcHandler;
 use crate::hvf::memory::{HvfGuestRam, RegisteredHvfRam};
@@ -385,14 +390,15 @@ impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
 }
 
 /// 組み立て済みの microVM が持つ資源と観測用の値。`Drop` が [`stop_and_release`] を drop 用の期限で呼ぶ（`HvfMicroVm` と
-/// `RunningHvfMicroVm` が共有する。モジュール doc の「解放順序」）。資源は `Option` で、`release` が 1 回だけ取り出す。
+/// `RunningHvfMicroVm` が共有する。モジュール doc の「解放順序」）。資源は `Option`（ゲスト RAM だけは `GuestMemorySlot`）で、`release` が 1 回だけ取り出す。
 struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// vCPU 0（BSP）と parked の AP（#3884）。
     vcpus: Option<VcpuSet>,
     /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
     mpidrs: Vec<u64>,
     devices: Option<HvfDeviceBus<B, N>>,
-    memory: Option<GuestMemory<RegisteredHvfRam<'static>>>,
+    /// ゲスト RAM の所有。`release` が stop より前に `take_or_leak` で取り出す（#4027）。
+    memory: GuestMemorySlot<RegisteredHvfRam<'static>>,
     vm: Option<Arc<VmWithGic>>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
     infos: Vec<HvfDeviceInfo>,
@@ -410,10 +416,13 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
         op: &'static str,
         deadline: Duration,
     ) -> Result<HvfStopReport, MicrovmError> {
+        // メモリは stop より前に取り出し、`stop_and_release` へ渡す（順序と期限切れ時のリークは従来のまま）。
+        // 毒化は今の lock の持ち主（`read_guest`・`take`）では起きない防御で、起きたら中身はリークする（fail-closed）。
+        let memory = self.memory.take_or_leak()?;
         let (Some(vcpus), Some(devices), Some(memory), Some(vm)) = (
             self.vcpus.take(),
             self.devices.take(),
-            self.memory.take(),
+            memory,
             self.vm.take(),
         ) else {
             return Err(MicrovmError::new(
@@ -434,11 +443,8 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
     }
 
     fn read_guest(&self, addr: u64, buf: &mut [u8]) -> Result<(), MicrovmError> {
-        let mem = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| internal("guest memory is already released"))?;
-        mem.read_at(GuestAddress::new(addr), buf)
+        self.memory
+            .with_memory(|m| m.read_at(GuestAddress::new(addr), buf))
     }
 
     fn is_finished(&self) -> bool {
@@ -623,7 +629,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 vcpus: Some(vcpu_set),
                 mpidrs,
                 devices: Some(devices),
-                memory: Some(memory),
+                memory: GuestMemorySlot::new(memory),
                 vm: Some(vm),
                 dispatcher,
                 infos,

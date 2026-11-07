@@ -87,6 +87,11 @@ mod arch {
 /// 値は `libc_abi`（#1840）が `libc` と照合し、下の単体テストが具体値も照合する。
 pub(crate) const EPERM: i32 = 1;
 
+/// `EIO`（include/uapi/asm-generic/errno-base.h の 5。x86_64・aarch64 で共通）。pty の master は slave の全 fd が
+/// 閉じると `read(2)` が `EIO` を返す（EOF の代わり）ため、`attach_io::PtyOutputReader` がこれを EOF とみなす
+/// （SUP-7・CRI-6・#4074）。値は `libc_abi`（#1840）が `libc` と照合し、下の単体テストが具体値も照合する。
+pub(crate) const EIO: i32 = 5;
+
 /// `fcntl(2)` の `F_GETFD`（fd が開いているかの確認に使う）。
 const F_GETFD: i32 = 1;
 /// capability 番号の上限（排他）。カーネルの `CAP_LAST_CAP` は 63 以下で、64 以上は ambient / bounding に渡さない。
@@ -1336,6 +1341,7 @@ mod libc_abi {
         assert!(opt_i32_eq(arch::SO_PEERCRED, libc::SO_PEERCRED));
         // errno。
         assert!(EPERM == libc::EPERM);
+        assert!(EIO == libc::EIO);
         assert!(ENODATA == libc::ENODATA);
         assert!(EOPNOTSUPP == libc::EOPNOTSUPP);
         assert!(ERANGE == libc::ERANGE);
@@ -1478,6 +1484,13 @@ mod tests {
             io::Error::from_raw_os_error(EPERM).kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    /// SUP-7・CRI-6・#4074: `EIO` の値を固定する（pty の master が slave 全閉鎖後に返す errno）。
+    #[test]
+    fn sup7_cri6_4074_eio_constant_is_five() {
+        assert_eq!(EIO, 5);
+        assert_eq!(io::Error::from_raw_os_error(EIO).raw_os_error(), Some(5));
     }
 
     /// SUP-14・TASK-171.1.3: prctl の番号と capability ABI の値を固定する（include/uapi の値との照合）。

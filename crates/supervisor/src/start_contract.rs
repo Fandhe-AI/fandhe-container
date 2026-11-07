@@ -13,7 +13,11 @@
 //!   `--restart` は任意で既定は `no`。`--audit-policy` は任意で既定は `best-effort`（カーネル監査頼みの層が縮退した
 //!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI の `start --audit-policy` が指定時だけ渡し、plugin-cri は渡さない。#2761）。`--cri-log-path` は任意で、CRI の `log_directory/log_path` を結合・検証した絶対パス
 //!   （POSIX 形式。`ContainerLogPath` が再検証する）。指定があれば `@container-logs` に加えて CRI ログ形式で追記する
-//!   （CRI-2・SUP-4・#2671。plugin-cri の StartContainer が渡す。CLI は渡さない）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//!   （CRI-2・SUP-4・#2671。plugin-cri の StartContainer が渡す。CLI は渡さない）。`--stdin <open|once>` は任意で、指定があれば
+//!   init の stdin を core の pipe（`LaunchStdinMode::Pipe`）で開き、supervisor が世代ごとに書き込み端を保持する
+//!   （完全版 Attach の stdin。SUP-7・SUP-3・CRI-6・#4074。plugin-cri 専用で CLI は渡さない）。**tty（`process.terminal: true`）の
+//!   コンテナには渡さない**: core が `Pipe` と tty の併用を launch の fork 前に `InvalidArgument` で拒否し（#4069）、tty の入力は
+//!   pty の master が担う。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
@@ -86,8 +90,8 @@ pub const REPORT_MAGIC: &str = "FCSUP1";
 pub const MAX_REPORT_LEN: usize = 640;
 /// 報告に載せる `message` の最大バイト数。
 pub const MAX_REPORT_MESSAGE_LEN: usize = 512;
-/// argv の最大要素数（プログラム名を除く）。
-pub const MAX_ARGS: usize = 10;
+/// argv の最大要素数（プログラム名を除く）。`start` + 5 オプション（各 2 要素）+ `<container-id>` で 12。
+pub const MAX_ARGS: usize = 12;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
@@ -242,6 +246,43 @@ impl StartReport {
     }
 }
 
+/// `--stdin` の値（init の stdin を開く条件。SUP-7・CRI-6・#4074）。
+///
+/// 値は plugin-cri が CRI の `stdin` / `stdin_once` から決めて argv に載せる（C8 #4076）。supervisor は `Open` と `Once` の
+/// どちらでも init の fd 0 を pipe にし、書き込み端を世代ごとに保持する。両者の差（`Once` は 1 回目の attach の切断で
+/// 閉じる）は attach の入口（C6 #4075）が `stdin_once` の所有の移転で扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinOption {
+    /// stdin を開き、attach が繰り返し接続できる。
+    Open,
+    /// stdin を開き、1 回目の attach の切断で閉じる（CRI の `stdin_once`）。
+    Once,
+}
+
+impl StdinOption {
+    /// argv の文字列（`open` / `once`）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Once => "once",
+        }
+    }
+}
+
+impl std::str::FromStr for StdinOption {
+    type Err = TraitError;
+
+    /// `open` / `once` の完全一致だけを受ける（大文字・空文字・別名は `InvalidArgument`。文言に入力値を埋め込まない）。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "once" => Ok(Self::Once),
+            _ => Err(invalid("--stdin must be \"open\" or \"once\"")),
+        }
+    }
+}
+
 /// 検証済みの supervisor `start` 引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -256,6 +297,9 @@ pub struct StartArgs {
     /// CRI-2・SUP-4・#2671）。指定があれば `@container-logs` への書き出しに加えて、コンテナ出力を CRI ログ形式で
     /// このパスへ追記する。未指定は従来どおり。
     pub cri_log_path: Option<ContainerLogPath>,
+    /// init の stdin の扱い（`--stdin`。SUP-7・SUP-3・CRI-6・#4074）。未指定は従来どおり `/dev/null`。tty のコンテナには
+    /// 指定しない（core が拒否する。モジュール doc）。
+    pub stdin: Option<StdinOption>,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
 }
@@ -286,10 +330,11 @@ impl StartArgs {
         let mut restart: Option<String> = None;
         let mut audit_policy: Option<String> = None;
         let mut cri_log_path: Option<String> = None;
+        let mut stdin: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
-                "--root" | "--restart" | "--audit-policy" | "--cri-log-path" => {
+                "--root" | "--restart" | "--audit-policy" | "--cri-log-path" | "--stdin" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
@@ -297,6 +342,7 @@ impl StartArgs {
                         "--root" => &mut root,
                         "--restart" => &mut restart,
                         "--cri-log-path" => &mut cri_log_path,
+                        "--stdin" => &mut stdin,
                         _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
@@ -325,6 +371,7 @@ impl StartArgs {
         };
         // 外部入力（argv）なので cri 側で検証済みでもここで再検証する（SEC-1）。
         let cri_log_path = cri_log_path.map(ContainerLogPath::new).transpose()?;
+        let stdin = stdin.map(|v| v.parse::<StdinOption>()).transpose()?;
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
         Ok(Self {
@@ -332,6 +379,7 @@ impl StartArgs {
             restart,
             audit_policy,
             cri_log_path,
+            stdin,
             id,
         })
     }
@@ -672,11 +720,52 @@ mod tests {
         }
     }
 
+    /// SUP-7・SUP-3・CRI-6・#4074: `--stdin` は `open` / `once` を受け、未指定は `None`。全オプション同時の 12 要素も受理する。
+    #[test]
+    fn sup7_cri6_4074_parse_stdin_open_and_once() {
+        let none = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(none.stdin, None);
+        let open =
+            StartArgs::parse(os(&["start", "--root", ROOT, "--stdin", "open", "c1"])).unwrap();
+        assert_eq!(open.stdin, Some(StdinOption::Open));
+        let once =
+            StartArgs::parse(os(&["start", "c1", "--stdin", "once", "--root", ROOT])).unwrap();
+        assert_eq!(once.stdin, Some(StdinOption::Once));
+        let all = StartArgs::parse(os(&[
+            "start",
+            "--root",
+            ROOT,
+            "--restart",
+            "always",
+            "--audit-policy",
+            "strict",
+            "--cri-log-path",
+            "/l/c/0.log",
+            "--stdin",
+            "once",
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(all.stdin, Some(StdinOption::Once));
+    }
+
+    /// SUP-7・CRI-6・#4074: `StdinOption` の文字列表現は往復し、未知の値は `InvalidArgument`。
+    #[test]
+    fn sup7_cri6_4074_stdin_option_roundtrip() {
+        for (text, value) in [("open", StdinOption::Open), ("once", StdinOption::Once)] {
+            assert_eq!(value.as_str(), text);
+            assert_eq!(text.parse::<StdinOption>().unwrap(), value);
+        }
+        let e = "ONCE".parse::<StdinOption>().expect_err("case-sensitive");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(!e.message().contains("ONCE"));
+    }
+
     /// SUP-1: 不正な argv はすべて InvalidArgument。
     #[test]
     fn sup1_args_parse_rejects_invalid() {
         let long = "a".repeat(MAX_ARG_LEN + 1);
-        let eleven: Vec<&str> = vec!["start"; 11];
+        let thirteen: Vec<&str> = vec!["start"; 13];
         let cases: Vec<Vec<&str>> = vec![
             vec![],
             vec!["run", "--root", ROOT, "c1"],
@@ -699,7 +788,15 @@ mod tests {
             vec!["start", "--root", ROOT, "--restart", "sometimes", "c1"],
             vec!["start", "c1"],
             vec!["start", "--root", ROOT, "bad/id"],
-            eleven,
+            thirteen,
+            vec![
+                "start", "--root", ROOT, "--stdin", "open", "--stdin", "once", "c1",
+            ],
+            vec!["start", "--root", ROOT, "--stdin", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--stdin"],
+            vec!["start", "--root", ROOT, "--stdin", "Open", "c1"],
+            vec!["start", "--root", ROOT, "--stdin", "close", "c1"],
+            vec!["start", "--root", ROOT, "--stdin", "", "c1"],
             vec!["start", "--root", ROOT, long.as_str()],
         ];
         for c in cases {

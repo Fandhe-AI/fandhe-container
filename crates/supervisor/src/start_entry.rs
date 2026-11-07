@@ -188,6 +188,13 @@ pub trait StartDeps {
         false
     }
 
+    /// argv の `--stdin`（init の stdin を core の pipe で開く指定。SUP-7・SUP-3・CRI-6・#4074）。`Some` を返す実装
+    /// （本番）は launcher へ `LaunchStdinMode::Pipe` を渡し、入口が起動・再起動のたびに書き込み端が届くことを確かめて
+    /// 世代ごとに保持する。既定は `None`（従来の `/dev/null`）。
+    fn stdin_option(&self) -> Option<crate::start_contract::StdinOption> {
+        None
+    }
+
     /// 手順 2c で起動オプション文書を照合したときの、状態記録の作成世代(`Some(None)` は「世代なしの記録だった」)。
     ///
     /// `Some` のとき入口は、手順 3 で観測した記録の世代がこれと一致しない start を拒否する。2c の読み取りの後に同じ ID が
@@ -815,6 +822,22 @@ fn start_reporting(
             record_start(recorder, started, false);
         }
         return match attempt {
+            #[cfg(target_os = "linux")]
+            Attempt::IoFailed { error, running } => {
+                log_event("attach_io_failed", Some(error.code()));
+                let error = op_err(error);
+                report(out, &StartReport::failed(&error));
+                deps.flush_deferred_logs();
+                let Running {
+                    process, instance, ..
+                } = running;
+                let disposed = dispose(Some(process), None, timeouts);
+                let code =
+                    finish_disposed(store, req.id(), instance, disposed, error.exit_code().get());
+                let code =
+                    NonZeroU8::new(code).unwrap_or_else(|| exit_code_for(ErrorCode::Internal));
+                Err(code)
+            }
             Attempt::Started(running) => {
                 // 応答ハブの開始を成功報告の前に済ませる（報告の後に失敗すると、CLI へ成功を返したコンテナを
                 // 回収して非 0 で終えることになるため。失敗なら回収して ERR を報告する。ERR-1・ERR-2・SEC-4）。
@@ -961,6 +984,13 @@ pub fn start_metrics_line(recorder: &OpRecorder) -> String {
 /// 手順 8 まで行った起動の結果（報告の材料と、報告の後の後始末に要るもの）。
 enum Attempt {
     Started(Running),
+    /// launch は成功したが、期待した入出力（tty の master・stdin の書き込み端）が届かなかった。報告の前に ERR を書いて
+    /// 起動したプロセスを回収する（`attach_seccomp_before_report` と同じ。D8 の fail-closed。#4074）。
+    #[cfg(target_os = "linux")]
+    IoFailed {
+        error: TraitError,
+        running: Running,
+    },
     Failed {
         error: OciRuntimeError,
         cleanup: Cleanup,
@@ -1002,6 +1032,8 @@ struct Prepared {
     seccomp: Option<Arc<SeccompNotifyHub>>,
     /// 再 launch を単一スレッドで成り立たせる（本番のみ。#2043）。
     single_thread_relaunch: bool,
+    /// `--stdin` の指定があるか（入出力の振り分けで stdin の書き込み端の到達を期待する。#4074）。
+    stdin_expected: bool,
     /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
     claimed: Box<ClaimedStart>,
 }
@@ -1421,6 +1453,7 @@ fn prepare_start(
     };
     let seccomp = deps.seccomp_hub();
     let single_thread_relaunch = deps.single_thread_relaunch();
+    let stdin_expected = deps.stdin_option().is_some();
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -1479,6 +1512,7 @@ fn prepare_start(
         logs,
         seccomp,
         single_thread_relaunch,
+        stdin_expected,
         claimed,
     })
 }
@@ -1498,8 +1532,12 @@ fn launch_prepared(
         logs,
         seccomp,
         single_thread_relaunch,
+        stdin_expected,
         claimed,
     } = prepared;
+    // 入出力の振り分けは Linux の launcher だけが渡す fd を扱う（他 OS の本番 launcher は無い）。
+    #[cfg(not(target_os = "linux"))]
+    let _ = stdin_expected;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
     // 打ち切られて残る予約は報告の後の後始末が回復する（REPAIR-5・CORE-2）。
     // 保存が期限で打ち切られると core は子の terminate を始める。その待ち（terminate と応答猶予）も報告の前に
@@ -1517,9 +1555,38 @@ fn launch_prepared(
         Ok(started) => {
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());
-            let relauncher: Arc<dyn Relauncher> = match capturing.captured_spec() {
+            let captured = capturing.captured_spec();
+            // 入出力の振り分け（tty の master を捕捉の stdout 1 本にし、stdin・master の複製を世代の保持先へ回す）。
+            // `ControlledProcess::new`（`install`）より前、捕捉の `take_output` より前に行う（#4074）。
+            #[cfg(target_os = "linux")]
+            let process = match crate::attach_io::AttachIoProcess::wrap(
+                process,
+                crate::attach_io::AttachExpectation {
+                    terminal: captured.as_ref().is_some_and(|s| s.terminal()),
+                    stdin: stdin_expected,
+                },
+            ) {
+                Ok(p) => p,
+                Err((process, error)) => {
+                    return Attempt::IoFailed {
+                        error,
+                        running: Running {
+                            process,
+                            relauncher: Arc::new(NoSpecRelauncher),
+                            instance,
+                            logs,
+                            seccomp,
+                        },
+                    };
+                }
+            };
+            let relauncher: Arc<dyn Relauncher> = match captured {
                 Some(spec) => {
                     let mut relauncher = LauncherRelauncher::new(inner, spec);
+                    #[cfg(target_os = "linux")]
+                    {
+                        relauncher = relauncher.with_stdin_expected(stdin_expected);
+                    }
                     if let Some(hub) = &logs {
                         relauncher = relauncher.with_capture(Arc::clone(hub));
                     }
@@ -2310,6 +2377,9 @@ mod linux {
         /// CRI ログの書き先（`with_cri_log_path`。`--cri-log-path`。CRI-2・SUP-4・#2671）。指定があれば `open_log_sink` が
         /// `@container-logs` に加えて CRI 形式でここへも追記する。
         cri_log_path: Option<ContainerLogPath>,
+        /// argv の `--stdin`（`with_stdin_option`。SUP-7・CRI-6・#4074）。`build_launcher` が core の
+        /// `LaunchStdinMode::Pipe` へ変換する（[`apply_stdin_option`]）。
+        stdin: Option<crate::start_contract::StdinOption>,
         /// 起動オプション文書の読み込みの失敗(`with_container_options_error`)。手順 4 が返して cgroup にも launch にも触れずに
         /// 止める(壊れた文書を既定値で黙って読み替えない。fail-closed。SUP-12・SEC-1・#2713)。
         container_options_error: Option<TraitError>,
@@ -2441,6 +2511,7 @@ mod linux {
                 audit_policy: AuditCoveragePolicy::default(),
                 container_options: ContainerOptions::default(),
                 cri_log_path: None,
+                stdin: None,
                 container_options_error: None,
                 options_generation: None,
                 pasta_target: None,
@@ -2488,6 +2559,20 @@ mod linux {
         #[must_use]
         pub fn with_cri_log_path(mut self, path: Option<ContainerLogPath>) -> Self {
             self.cri_log_path = path;
+            self
+        }
+
+        /// argv の `--stdin` を設定する（SUP-7・SUP-3・CRI-6・#4074）。
+        ///
+        /// 指定があれば `build_launcher` が launcher の起動オプションを `LaunchStdinMode::Pipe` にし（restart の再 launch も
+        /// 同じ launcher を使うので毎回新しい pipe になる）、入口が書き込み端の到達を確かめて世代ごとに保持する。tty の
+        /// コンテナには指定しない（core が launch の fork 前に `InvalidArgument` で拒否する。`start_contract` のモジュール doc）。
+        #[must_use]
+        pub fn with_stdin_option(
+            mut self,
+            option: Option<crate::start_contract::StdinOption>,
+        ) -> Self {
+            self.stdin = option;
             self
         }
 
@@ -2574,6 +2659,14 @@ mod linux {
             let builder = ProductionLauncher::builder()
                 .privilege(privilege)
                 .audit_coverage_policy(self.audit_policy);
+            // start と restart の再 launch の launcher だけが端末つき起動（`process.terminal: true`）を受ける。master は
+            // 捕捉（`LogCapture`）が必ず読む（捕捉のハブは本番では常に `Some`）。残存確認だけの launcher は launch しない
+            // ので opt-in しない。cri の bundle の拒否は残る（D8。CRI-6・SEC-1・CORE-5・#4074）。
+            let builder = if with_mapping {
+                builder.with_terminal_support()
+            } else {
+                builder
+            };
             // 応答者（ハブ）がいるときの start の launcher だけが USER_NOTIF にする。残存確認の launcher は launch しない
             // が、同じく応答者がいない構成は ERRNO のまま（応答者のいない USER_NOTIF は拒否対象の syscall を止める）。
             let builder = if with_mapping && self.seccomp.is_some() {
@@ -2666,9 +2759,29 @@ mod linux {
         }
     }
 
+    /// `--stdin` の指定を core の起動オプションへ反映する（指定があれば `Pipe`、無ければそのまま）。
+    ///
+    /// `open` と `once` のどちらでも init の fd 0 は pipe にする（両者の差は attach の入口の責務。C6 #4075）。tty のコンテナとの
+    /// 併用は core が拒否する（`start_contract` のモジュール doc。tty の入力は master が担う）。SUP-7・CRI-6・#4074。
+    fn apply_stdin_option(
+        options: fandhe_container_core::oci_runtime::LaunchOptions,
+        stdin: Option<crate::start_contract::StdinOption>,
+    ) -> fandhe_container_core::oci_runtime::LaunchOptions {
+        match stdin {
+            Some(_) => {
+                options.with_stdin(fandhe_container_core::oci_runtime::LaunchStdinMode::Pipe)
+            }
+            None => options,
+        }
+    }
+
     impl StartDeps for ProductionStartDeps {
         fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
             self.seccomp.clone()
+        }
+
+        fn stdin_option(&self) -> Option<crate::start_contract::StdinOption> {
+            self.stdin
         }
 
         /// 本番の core launcher は `Threads: 1` を要求するため、再 launch の直前に stderr の専用スレッドを止める（#2043）。
@@ -2853,7 +2966,8 @@ mod linux {
             };
             // 起動オプションの変換（secrets のファイル読み取りを含む）は fork 前の単一スレッドのこの手順で行う。失敗は
             // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
-            let launch_options = self.container_options.launch_options()?;
+            let launch_options =
+                apply_stdin_option(self.container_options.launch_options()?, self.stdin);
             // rootless のユーザー定義名(Attachable)のときだけ、exec 前の同期点で holder と pasta を結線する(#1940)。
             let wiring = self.pasta_wiring()?;
             // 手順 4b / 後始末(`prepare_network` / `release_network`)が同じ結線を使えるよう控える。
@@ -3602,7 +3716,8 @@ mod linux {
         let deps = ProductionStartDeps::new(args.root.clone())
             .with_companions(companions)
             .with_audit_policy(args.audit_policy)
-            .with_cri_log_path(args.cri_log_path.clone());
+            .with_cri_log_path(args.cri_log_path.clone())
+            .with_stdin_option(args.stdin);
         // pasta 構成の結線先(コンテナ ID と、ストアの検査済みの状態ルート)。ユーザー定義名のときだけ使われる(#1940)。
         let deps = deps.with_pasta_target(
             args.id.clone(),
@@ -3695,6 +3810,7 @@ mod linux {
             &stop,
             audit,
             Some(exec_reclaimer),
+            args.stdin,
         );
         let code = run_supervised_with_health(
             store,
@@ -3849,6 +3965,25 @@ mod linux {
         }
 
         use super::*;
+
+        /// SUP-7・CRI-6・#4074: `--stdin` の指定があれば `open` / `once` のどちらでも `Pipe`、無ければ従来の `Null`。
+        #[test]
+        fn sup7_cri6_4074_apply_stdin_option_maps_to_pipe() {
+            use crate::start_contract::StdinOption;
+            use fandhe_container_core::oci_runtime::{LaunchOptions, LaunchStdinMode};
+            let base = LaunchOptions::try_default().expect("default options");
+            assert_eq!(base.stdin(), LaunchStdinMode::Null);
+            assert_eq!(
+                apply_stdin_option(base.clone(), None).stdin(),
+                LaunchStdinMode::Null
+            );
+            for option in [StdinOption::Open, StdinOption::Once] {
+                assert_eq!(
+                    apply_stdin_option(base.clone(), Some(option)).stdin(),
+                    LaunchStdinMode::Pipe
+                );
+            }
+        }
 
         /// 2c の期限超過を作る: `work` が合図まで戻らない状態で `until` を短く取って呼ぶ。
         fn timed_out_worker(

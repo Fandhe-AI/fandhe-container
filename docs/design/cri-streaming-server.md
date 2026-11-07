@@ -277,6 +277,9 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - core の `process.terminal` の拒否は、supervisor が端末対応を opt-in したとき（例: `with_terminal_support()`）だけ外す。master を捕捉しない呼び出し元は従来どおり拒否する（fail-closed）
 - 保持するのは supervisor で、`control/target.rs` の `SignalSlot` と同じ置き場所に世代ごとのスロットを持つ。`Exited` と再 launch で落とし、新しい世代の fd に差し替える。tty では master を捕捉の stdout 1 本として `LogCapture` へ渡し、`EIO` は EOF とみなす（CRI のログは stdout のタグだけになる）
 - 渡した master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと `TIOCSWINSZ` にだけ使う（契約）
+- （C4〔#4074〕で実装済み）保持の置き場所は `SignalSlot` の `SlotState::Active` の中の `GenerationIo`（stdin の書き込み端・master の複製・`stdin_consumed`。`ControlledProcess::new` がスロットへ移す）。`Exited`・`clear`・世代交代の `register` で必ず落ちる。tty の master を捕捉の stdout 1 本にする振り分けは、`take_output` と `ControlledProcess::new` の順が起動と再起動で逆になるため、構築の時点で分ける `attach_io::AttachIoProcess::wrap` に置く（起動は `launch_prepared`、再起動は `LauncherRelauncher::relaunch` が launch の直後に適用）。端末対応の opt-in は start と再 launch の launcher だけ（`with_terminal_support`）で、`SpecCapturingLauncher` が `supports_terminal` を転送する。tty では core の stdout / stderr の pipe を閉じる（init が pty の slave で fd 1 / 2 を置き換えた後に `launch` が戻るため、書き込み端は残らない）。master の複製に失敗したときはログの捕捉を優先し、attach の口だけを閉じる（C6 は `NoHandle`）
+- 入口は argv の `--stdin <open|once>`（`StdinOption`）。指定があれば常に core へ `LaunchStdinMode::Pipe` を渡す。tty と `Pipe` の併用は core が launch の fork 前に `InvalidArgument` で拒否する（#4069）ため、**C8 は tty のコンテナに `--stdin` を渡さない**（tty の入力は master が担う。tty の stdin の可否は cri の D7 が RPC の時点で判断する）。supervisor は config.json を先に読んで分岐しない（TOCTOU になるため）。再評価の候補: core に tty なら `Pipe` を無視する `LaunchStdinMode` を足す案（core の API 変更になるため C8 / C10 で判断する）
+- fail-closed（D8）: 端末または `--stdin` を期待したのに master・書き込み端が届かない起動・再起動は、報告で ERR にしてプロセスを回収する（弱いコンテナを動かさない）
 
 **D4. CRI から supervisor への運び方**
 
@@ -328,7 +331,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C1 | #4069 | core: init の stdin パイプ（実装済み: `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`。書き込み端は close-on-exec かつ fd 3 以上。supervisor のラッパーの `take_stdin` の転送は C4） | なし |
 | C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
 | C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
-| C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
+| C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin`（実装済み: `attach_io::AttachIoProcess`・`SlotState::Active` の `GenerationIo`・`SignalSlot::with_stdin_option` / `with_generation_io`・argv `--stdin <open\|once>`。kind 9 は C6） | C1・C2 |
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode` | なし |

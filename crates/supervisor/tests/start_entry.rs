@@ -21,10 +21,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fandhe_container_core::audit_log::{AuditLayer, AuditRecord, AuditSink, PastaVerifyRejection};
+use fandhe_container_core::exec::{PtyMaster, PtySlave, WindowSize, open_host_pty_for_test};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher, StartTimeouts, create,
-    exit_code_for,
+    ContainerStdin, LaunchMode, LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
+    StartTimeouts, create, exit_code_for,
 };
 use fandhe_container_core::traits::{
     CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, ErrorCode,
@@ -34,7 +35,7 @@ use fandhe_container_core::traits::{
 use fandhe_container_supervisor::pasta_attach::PastaLogBuffer;
 use fandhe_container_supervisor::restart::RestartPolicy;
 use fandhe_container_supervisor::run::StopToken;
-use fandhe_container_supervisor::start_contract::{StartReport, result_deadline};
+use fandhe_container_supervisor::start_contract::{StartReport, StdinOption, result_deadline};
 use fandhe_container_supervisor::start_entry::{
     DEADLINE_EXCEEDED_MESSAGE, LATE_DRAIN_BUDGET, REPORT_RESERVE, Running, START_OP, StartDeps,
     TAMPER_AUDIT_BUDGET, run_start, run_start_after_options_worker_for_test, run_start_until,
@@ -56,17 +57,29 @@ struct Env {
 
 impl Env {
     fn new(tag: &str) -> Self {
+        Self::build(tag, false)
+    }
+
+    /// `process.terminal: true` の bundle（完全版 Attach の tty。CRI-6・#4074）。
+    fn new_terminal(tag: &str) -> Self {
+        Self::build(tag, true)
+    }
+
+    fn build(tag: &str, terminal: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let scratch =
             scratch_root::ScratchDir::new("fandhe-sup-start", std::time::Duration::from_secs(10));
         let base = scratch.path().join(format!("{tag}-{n}"));
         std::fs::create_dir_all(base.join("bundle/rootfs")).unwrap();
+        let terminal_field = if terminal { r#""terminal":true,"# } else { "" };
         std::fs::write(
             base.join("bundle/config.json"),
-            br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},
-"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},
-"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+            format!(
+                r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},
+"process":{{{terminal_field}"user":{{"uid":0,"gid":0}},"args":["/bin/echo","it"],"cwd":"/"}},
+"linux":{{"namespaces":[{{"type":"pid"}},{{"type":"mount"}},{{"type":"user"}},{{"type":"uts"}},{{"type":"ipc"}}]}}}}"#
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -133,11 +146,23 @@ struct FakeProcess {
     terminated: Arc<AtomicUsize>,
     wait_mode: WaitMode,
     fail_terminate: bool,
+    /// init の stdin の書き込み端（`take_stdin` で 1 回だけ返す。#4074）。
+    stdin: Mutex<Option<ContainerStdin>>,
+    /// init の pty の master（`take_pty_master` で 1 回だけ返す。#4074）。
+    master: Mutex<Option<PtyMaster>>,
 }
 
 impl LaunchedProcess for FakeProcess {
     fn pid(&self) -> NonZeroU32 {
         NonZeroU32::new(self.pid).unwrap()
+    }
+
+    fn take_stdin(&self) -> Option<ContainerStdin> {
+        self.stdin.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn take_pty_master(&self) -> Option<PtyMaster> {
+        self.master.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -185,6 +210,16 @@ struct FakeLauncher {
     reject_on_relaunch_thread: bool,
     /// launch を呼んだスレッドの ID と名前。
     launch_threads: Mutex<Vec<(std::thread::ThreadId, Option<String>)>>,
+    /// `supports_terminal` の答え（端末つき起動の opt-in。#4074）。
+    terminal_support: bool,
+    /// `true` なら各プロセスに stdin の書き込み端を持たせる（読み取り側は `stdin_readers` に残る。#4074）。
+    give_stdin: bool,
+    /// 先頭から数えてこの回数までの launch に pty の master を持たせる（#4074）。
+    give_pty_launches: usize,
+    /// 持たせた pty の slave（落とすと master が EOF になるため保持する。#4074）。
+    slaves: Mutex<Vec<PtySlave>>,
+    /// 持たせた stdin の読み取り側（#4074）。
+    stdin_readers: Mutex<Vec<std::io::PipeReader>>,
 }
 
 impl FakeLauncher {
@@ -205,6 +240,11 @@ impl FakeLauncher {
             reject_from: None,
             reject_on_relaunch_thread: false,
             launch_threads: Mutex::new(Vec::new()),
+            terminal_support: false,
+            give_stdin: false,
+            give_pty_launches: 0,
+            slaves: Mutex::new(Vec::new()),
+            stdin_readers: Mutex::new(Vec::new()),
         }
     }
 
@@ -224,6 +264,10 @@ impl ProcessLauncher for FakeLauncher {
 
     fn last_launch_may_have_left_process(&self) -> bool {
         self.left_process
+    }
+
+    fn supports_terminal(&self) -> bool {
+        self.terminal_support
     }
 
     fn launch(
@@ -264,11 +308,33 @@ impl ProcessLauncher for FakeLauncher {
         if let Some(code) = self.launch_error {
             return Err(TraitError::new(code, "launch failed"));
         }
+        let stdin = if self.give_stdin {
+            let (r, w) = std::io::pipe().unwrap();
+            self.stdin_readers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(r);
+            Some(ContainerStdin::from_pipe_writer_for_test(w))
+        } else {
+            None
+        };
+        let master = if nth <= self.give_pty_launches {
+            let (master, slave) = open_host_pty_for_test(WindowSize::new(24, 80)).unwrap();
+            self.slaves
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(slave);
+            Some(master)
+        } else {
+            None
+        };
         Ok(Box::new(FakeProcess {
             pid: 4242,
             terminated: Arc::clone(&self.terminated),
             wait_mode: self.wait_mode,
             fail_terminate: self.fail_terminate,
+            stdin: Mutex::new(stdin),
+            master: Mutex::new(master),
         }))
     }
 
@@ -310,6 +376,8 @@ struct FakeDeps {
     options_error: Option<TraitError>,
     /// 設定すると `flush_deferred_logs` がこのバッファも取り出す(本番の `pasta_logs.flush()` と同じ。#3473)。
     pasta_logs: Option<Arc<PastaLogBuffer>>,
+    /// `stdin_option` の答え（argv の `--stdin`。#4074）。
+    stdin: Option<StdinOption>,
 }
 
 impl FakeDeps {
@@ -326,6 +394,10 @@ impl FakeDeps {
 }
 
 impl StartDeps for FakeDeps {
+    fn stdin_option(&self) -> Option<StdinOption> {
+        self.stdin
+    }
+
     fn check_launcher_available(&self) -> Result<(), TraitError> {
         self.step("check")?;
         if let Some(e) = &self.options_error {
@@ -439,6 +511,7 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             flushes: Arc::new(AtomicUsize::new(0)),
             options_error: None,
             pasta_logs: None,
+            stdin: None,
         },
         launcher,
     )
@@ -1994,4 +2067,152 @@ fn repair4_sec4_3509_options_timeout_reports_timeout_when_deadline_runs_out_firs
     assert_eq!(r.audit.len(), 1, "{:?}", r.audit);
     let budget = LATE_DRAIN_BUDGET + TAMPER_AUDIT_BUDGET + Duration::from_secs(2);
     assert!(r.t_end - reported <= budget, "{:?}", r.t_end - reported);
+}
+// ---- 世代ごとの入出力（SUP-7・SUP-3・CRI-6・#4074）----
+
+/// 読み取り側を EOF まで読む（書き込み端がすべて閉じていること）。
+fn drain(mut r: std::io::PipeReader) -> Vec<u8> {
+    use std::io::Read;
+    let mut v = Vec::new();
+    r.read_to_end(&mut v).unwrap();
+    v
+}
+
+/// SUP-7・SUP-3・CRI-6・#4074: `--stdin` を受けた起動は init の stdin の書き込み端を取り出せ（1 回だけ）、
+/// restart の再 launch は別の pipe（新しい世代の fd）を返す。古い世代の端は新しい世代へ混ざらない。
+#[test]
+fn sup7_sup3_4074_stdin_is_per_generation_across_relaunch() {
+    let env = Env::new("stdin-gen");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut launcher = FakeLauncher::new(&calls);
+    launcher.give_stdin = true;
+    let (mut d, l) = deps(&calls, launcher);
+    d.stdin = Some(StdinOption::Open);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let mut first = running
+        .process
+        .take_stdin()
+        .expect("first generation stdin");
+    assert!(running.process.take_stdin().is_none());
+    first.write_all(b"g1").unwrap();
+    let again = running
+        .relauncher
+        .relaunch(Duration::from_secs(1))
+        .expect("relaunch");
+    let mut second = again.take_stdin().expect("second generation stdin");
+    assert!(again.take_stdin().is_none());
+    second.write_all(b"g2").unwrap();
+    drop(first);
+    drop(second);
+    let mut readers = std::mem::take(&mut *l.stdin_readers.lock().unwrap());
+    assert_eq!(readers.len(), 2);
+    let r2 = readers.pop().unwrap();
+    let r1 = readers.pop().unwrap();
+    assert_eq!(drain(r1), b"g1");
+    assert_eq!(drain(r2), b"g2");
+}
+
+/// D8・SEC-1・#4074: `--stdin` なのに書き込み端が届かない起動は、報告で失敗にしてプロセスを回収する（弱いコンテナを動かさない）。
+#[test]
+fn sup7_4074_missing_stdin_fails_start_and_terminates() {
+    let env = Env::new("stdin-missing");
+    env.create(&env.id);
+    let calls = new_calls();
+    let (mut d, l) = deps(&calls, FakeLauncher::new(&calls));
+    d.stdin = Some(StdinOption::Once);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Internal);
+            assert_eq!(message.as_str(), "the stdin pipe was not delivered");
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
+}
+
+/// CRI-6・SUP-7・#4074: tty の起動は master を捕捉の stdout 1 本（stderr なし）として渡し、attach 用の複製を別に返す。
+/// 再 launch でも新しい世代の master で同じ形になる。
+#[test]
+fn cri6_4074_terminal_master_is_capture_stdout_and_dup_per_generation() {
+    use std::io::Read;
+    let env = Env::new_terminal("tty-gen");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut launcher = FakeLauncher::new(&calls);
+    launcher.terminal_support = true;
+    launcher.give_pty_launches = 2;
+    let (d, l) = deps(&calls, launcher);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let out = running.process.take_output().expect("capture output");
+    assert!(out.stderr.is_none());
+    let mut reader = out.stdout.expect("master reader");
+    assert!(running.process.take_output().is_none());
+    let dup = running.process.take_pty_master().expect("master dup");
+    assert!(running.process.take_pty_master().is_none());
+    assert!(running.process.take_stdin().is_none());
+    // 複製への書き込みのエコーが捕捉側（元の master）から読める。
+    let mut dup_file = std::fs::File::from(dup.into_owned_fd());
+    dup_file.write_all(b"hi\n").unwrap();
+    let mut buf = [0u8; 16];
+    let n = reader.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hi\r\n");
+    // 再 launch: 新しい世代の master の複製が返る。出力は再 launch の中で捕捉のハブへ渡し済み（取り出せない）。
+    let again = running
+        .relauncher
+        .relaunch(Duration::from_secs(1))
+        .expect("relaunch");
+    assert!(again.take_output().is_none());
+    assert!(again.take_pty_master().is_some());
+    assert_eq!(l.slaves.lock().unwrap().len(), 2);
+}
+
+/// D8・#4074: tty なのに master が届かない起動は失敗にして回収する。再 launch で届かないときも terminate して `Err`。
+#[test]
+fn cri6_4074_missing_master_fails_start_and_relaunch() {
+    // 起動: master が無い。
+    let env = Env::new_terminal("tty-missing");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut launcher = FakeLauncher::new(&calls);
+    launcher.terminal_support = true;
+    let (d, l) = deps(&calls, launcher);
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("must fail");
+    assert_eq!(code, exit_code_for(ErrorCode::Internal));
+    match report_of(&out) {
+        StartReport::Failed { message, .. } => {
+            assert_eq!(message.as_str(), "the pty master was not delivered");
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
+
+    // 再 launch: 1 回目だけ master があり、2 回目は届かない。
+    let env = Env::new_terminal("tty-relaunch-missing");
+    env.create(&env.id);
+    let calls = new_calls();
+    let mut launcher = FakeLauncher::new(&calls);
+    launcher.terminal_support = true;
+    launcher.give_pty_launches = 1;
+    let (d, l) = deps(&calls, launcher);
+    let running =
+        start_with(&env, d, &env.id, &short_timeouts(), &mut Vec::new()).expect("started");
+    let e = running
+        .relauncher
+        .relaunch(Duration::from_secs(1))
+        .err()
+        .expect("relaunch must fail");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert_eq!(e.message(), "the pty master was not delivered");
+    assert_eq!(l.terminated.load(Ordering::SeqCst), 1);
 }

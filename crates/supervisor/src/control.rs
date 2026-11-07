@@ -423,12 +423,17 @@ mod install {
         stop: &StopToken,
         audit: Option<Arc<dyn AuditSink>>,
     ) -> (Running, ControlHandle) {
-        install_with_exec_reclaimer(state_root, id, running, stop, audit, None)
+        install_with_exec_reclaimer(state_root, id, running, stop, audit, None, None)
     }
 
     /// [`install`] に、exec 子 cgroup の回収役を足した版（SUP-6・REPAIR-5・#2626）。本番の入口
     /// （`start_entry`）はこちらを使う。`reclaimer` が `None` なら、制御チャネルは ExecHandoverRequest を断る
     /// （子孫を回収できない exec に pidfd を渡さない。fail-closed）。
+    ///
+    /// `stdin` は argv の `--stdin`（SUP-7・CRI-6・#4074）で、スロットへ設定して世代交代をまたいで保つ。
+    // 理由: 入口が束ねる値（状態ルート・ID・Running・停止トークン・監査・回収役・stdin の指定）はいずれも独立で、
+    // 束ねる型を作ると呼び出し側の分解コードが増えるだけのため引数のまま渡す。
+    #[allow(clippy::too_many_arguments)]
     pub fn install_with_exec_reclaimer(
         state_root: &Path,
         id: &ContainerId,
@@ -436,6 +441,7 @@ mod install {
         stop: &StopToken,
         audit: Option<Arc<dyn AuditSink>>,
         reclaimer: Option<Arc<dyn ExecCgroupReclaimer>>,
+        stdin: Option<crate::start_contract::StdinOption>,
     ) -> (Running, ControlHandle) {
         let bound = effective_uid()
             .and_then(|uid| ControlListener::bind_as(state_root, id, uid).map(|l| (uid, l)));
@@ -446,7 +452,7 @@ mod install {
                 return (running, failed_handle(e));
             }
         };
-        let slot = SignalSlot::with_stop_intent(stop.clone());
+        let slot = SignalSlot::with_stop_intent(stop.clone()).with_stdin_option(stdin);
         let Running {
             process,
             relauncher,

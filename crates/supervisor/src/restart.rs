@@ -1452,6 +1452,12 @@ impl ProcessLauncher for SpecCapturingLauncher {
         self.inner.last_launch_may_have_left_process()
     }
 
+    /// 内側の launcher の端末対応の opt-in を転送する(転送しないと既定の `false` になり、core の `start` が一番外側の
+    /// launcher のこの値を見て `process.terminal: true` を拒否する。CRI-6・SEC-1・#4070・#4074)。
+    fn supports_terminal(&self) -> bool {
+        self.inner.supports_terminal()
+    }
+
     fn launch(
         &self,
         spec: &LaunchSpec,
@@ -1527,6 +1533,9 @@ pub struct LauncherRelauncher {
     /// 再 launch を単一スレッドで行う（`with_single_thread_launch`。stderr の専用スレッドの停止と、スレッド数が 1 に
     /// 落ち着くまでの有界の待ちを行う。#2043）。
     single_thread: bool,
+    /// 起動時に `--stdin` を指定した（core へ `LaunchStdinMode::Pipe` を渡した）か。真なら、再 launch で stdin の書き込み端が
+    /// 届かないプロセスを失敗にする（fail-closed。`with_stdin_expected`。SUP-7・CRI-6・#4074）。
+    stdin_expected: bool,
     /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
     stranded: Mutex<Vec<LateOrphan>>,
 }
@@ -1540,8 +1549,20 @@ impl LauncherRelauncher {
             capture: None,
             seccomp: None,
             single_thread: false,
+            stdin_expected: false,
             stranded: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 起動時に `--stdin` を指定していたことを伝える（SUP-7・SUP-3・CRI-6・#4074）。
+    ///
+    /// 再 launch のたびに、launch 直後（捕捉の `take_output` より前）に入出力を振り分ける
+    /// （`crate::attach_io::AttachIoProcess`）。stdin の書き込み端が届かなければ、新プロセスを terminate して `Err` にする
+    /// （要求より弱いコンテナを動かさない）。tty の spec は指定の有無に関わらず master の到達を期待する。
+    #[must_use]
+    pub fn with_stdin_expected(mut self, expected: bool) -> Self {
+        self.stdin_expected = expected;
+        self
     }
 
     /// 再 launch したプロセスの seccomp の listener を `hub` へ渡す（SEC-4・REPAIR-5・#2025）。
@@ -1726,6 +1747,32 @@ impl Relauncher for LauncherRelauncher {
                 }
             };
         }
+        // 入出力の振り分けは捕捉・seccomp の取り出しより前に行う(tty は master を捕捉の stdout 1 本にする。#4074)。
+        #[cfg(target_os = "linux")]
+        let process = match crate::attach_io::AttachIoProcess::wrap(
+            process,
+            crate::attach_io::AttachExpectation {
+                terminal: self.spec.terminal(),
+                stdin: self.stdin_expected,
+            },
+        ) {
+            Ok(p) => p,
+            Err((process, e)) => {
+                crate::control::log_control_event("attach_io_failed", Some(e.code().as_str()));
+                return match process.terminate(
+                    deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now())),
+                ) {
+                    Ok(()) => Err(e),
+                    Err(t) => {
+                        self.stranded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((process, t.clone()));
+                        Err(t)
+                    }
+                };
+            }
+        };
         #[cfg(target_os = "linux")]
         if let Some(hub) = &self.seccomp {
             let attached = match process.take_seccomp_listener() {
@@ -1978,6 +2025,31 @@ mod tests {
             .confirm_no_process_recorded(&id, Some(&placement), Duration::from_secs(1))
             .expect("forwarded");
         assert_eq!(probe.0.lock().unwrap().clone(), vec![Some(placement)]);
+    }
+
+    /// 端末対応を答える launcher(転送の照合用。CRI-6・#4074)。
+    struct TerminalFake(bool);
+
+    impl ProcessLauncher for TerminalFake {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn supports_terminal(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// CRI-6・SEC-1・#4074: `SpecCapturingLauncher` は内側の端末対応の opt-in を転送する(転送しないと core の `start` が
+    /// 一番外側のこの値を見て `process.terminal: true` を拒否する)。
+    #[test]
+    fn cri6_4074_spec_capturing_launcher_forwards_supports_terminal() {
+        assert!(SpecCapturingLauncher::new(Arc::new(TerminalFake(true))).supports_terminal());
+        assert!(!SpecCapturingLauncher::new(Arc::new(TerminalFake(false))).supports_terminal());
     }
 
     /// SEC-4・#1915: `SpecCapturingLauncher` は内側の監査 sink を転送する(同一の sink が返る)。

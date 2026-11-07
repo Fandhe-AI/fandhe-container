@@ -51,6 +51,10 @@ use std::sync::mpsc::{
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use fandhe_container_core::exec::PtyMaster;
+#[cfg(target_os = "linux")]
+use fandhe_container_core::oci_runtime::ContainerStdin;
 use fandhe_container_core::oci_runtime::{
     ContainerOutput, LaunchMode, LaunchedProcess, ProcessExit,
 };
@@ -60,6 +64,7 @@ use super::protocol::{ControlReason, RequestKind};
 
 use crate::restart::{LateOrphan, Relauncher};
 use crate::run::{ExplicitStopRecord, StopToken};
+use crate::start_contract::StdinOption;
 
 /// 受け箱の容量（超えたら `Busy`。資源の使用量を固定に抑える）。
 pub const INBOX_CAPACITY: usize = 4;
@@ -102,6 +107,31 @@ pub type PidfdDup = Arc<std::os::fd::OwnedFd>;
 #[derive(Debug, Clone)]
 pub enum PidfdDup {}
 
+/// 世代ごとの attach 用の入出力（stdin の書き込み端・tty の master の複製。SUP-7・SUP-3・CRI-6・SEC-1・#4074）。
+///
+/// [`SlotState::Active`] の中にだけ置く（pidfd の複製と同じ形）。`Exited`・`Empty` への遷移と、再 launch の
+/// `register`（新しい世代による上書き）で必ず drop されるので、古い世代の fd が新しい世代に残らない・終了済みの
+/// コンテナの stdin を保持し続けない、が型の上で保証される。取り出しは [`SignalSlot::with_generation_io`]（C6 #4075 の
+/// attach の入口が使う）。Linux 以外は pty も stdin の pipe も無く、値を持たない型にする。
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+// 理由: 読み手は C6 #4075 の attach の入口（`with_generation_io` 経由）。本 issue では保持と破棄の契約だけを実装し、
+// 試験が読む。
+#[allow(dead_code)]
+pub(crate) struct GenerationIo {
+    /// 非 tty で `--stdin` を指定したときの init の stdin の書き込み端。
+    pub(crate) stdin: Option<ContainerStdin>,
+    /// tty のときの pty の master の複製（捕捉用の読み取り側とは別の fd。close-on-exec）。
+    pub(crate) master: Option<PtyMaster>,
+    /// `stdin_once` の stdin を attach が既に消費したか（世代ごとに初期化する。C6 #4075 が書き、本 issue は書かない）。
+    pub(crate) stdin_consumed: bool,
+}
+
+/// 世代ごとの attach 用の入出力（Linux 以外は値を持たない）。
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+pub(crate) struct GenerationIo;
+
 enum SlotState {
     Empty,
     Active {
@@ -110,6 +140,9 @@ enum SlotState {
         inbox: SyncSender<PendingSignal>,
         /// 起動ハンドルの pidfd の複製（close-on-exec）。`Active` の間だけ持ち、`Exited`・`Empty` へ遷移したら落とす。
         pidfd: Option<PidfdDup>,
+        /// 世代ごとの attach 用の入出力。pidfd の複製と同じく `Active` の間だけ持つ。Linux 以外は値を持たず、読み手も無い。
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        io: GenerationIo,
     },
     Exited {
         generation: u64,
@@ -124,6 +157,8 @@ struct SlotInner {
     stop_intent: Option<StopToken>,
     /// 預かっている終了購読（`Active` の間だけ。遷移・世代交代で空にして閉じる。#3683）。
     exit_watchers: Vec<ExitWatcher>,
+    /// コンテナ単位の `--stdin` の指定（世代をまたいで保つ。`with_stdin_option`。#4074）。
+    stdin_option: Option<StdinOption>,
 }
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
@@ -153,7 +188,50 @@ impl SignalSlot {
             state: SlotState::Empty,
             stop_intent,
             exit_watchers: Vec::new(),
+            stdin_option: None,
         })))
+    }
+
+    /// コンテナ単位の `--stdin` の指定を設定する（本番の入口が `install` で設定する。SUP-7・CRI-6・#4074）。
+    /// 世代交代（再 launch）をまたいで保たれる。attach の入口（C6 #4075）が `stdin_once` の判断に使う。
+    #[must_use]
+    pub fn with_stdin_option(self, option: Option<StdinOption>) -> Self {
+        self.lock().stdin_option = option;
+        self
+    }
+
+    /// 設定された `--stdin` の指定。C6 #4075 の attach の入口が使う（それまでは試験だけ）。
+    #[allow(dead_code)]
+    pub(crate) fn stdin_option(&self) -> Option<StdinOption> {
+        self.lock().stdin_option
+    }
+
+    /// `Active` で記録 pid が `pid` と一致するときだけ、現世代の入出力へ `f` を適用する（スロットのロックの下。
+    /// `f` では待たない・I/O をしないこと）。それ以外は既存の呼び出しと同じ理由コードで断る（`Empty`: `NoHandle`、
+    /// `Exited`: pid 一致なら `ContainerExited`・不一致なら `PidMismatch`、`Active` で pid 不一致: `PidMismatch`）。
+    /// 世代交代後の古い入出力は `Active` の入れ替えで落ちており、渡らない。C6 #4075 の attach の入口が使う。
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn with_generation_io<R>(
+        &self,
+        pid: NonZeroU32,
+        f: impl FnOnce(&mut GenerationIo) -> R,
+    ) -> Result<R, ControlReason> {
+        let mut inner = self.lock();
+        match &mut inner.state {
+            SlotState::Empty => Err(ControlReason::NoHandle),
+            SlotState::Exited { pid: held, .. } => Err(if *held == pid {
+                ControlReason::ContainerExited
+            } else {
+                ControlReason::PidMismatch
+            }),
+            SlotState::Active { pid: held, io, .. } => {
+                if *held != pid {
+                    return Err(ControlReason::PidMismatch);
+                }
+                Ok(f(io))
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SlotInner> {
@@ -161,7 +239,12 @@ impl SignalSlot {
     }
 
     /// 新しいハンドルを登録し、世代と受け箱を返す（直前の状態は上書きする）。
-    fn register(&self, pid: NonZeroU32, pidfd: Option<PidfdDup>) -> (u64, Receiver<PendingSignal>) {
+    fn register(
+        &self,
+        pid: NonZeroU32,
+        pidfd: Option<PidfdDup>,
+        io: GenerationIo,
+    ) -> (u64, Receiver<PendingSignal>) {
         let (tx, rx) = sync_channel(INBOX_CAPACITY);
         let mut inner = self.lock();
         let generation = inner.next_generation;
@@ -173,6 +256,7 @@ impl SignalSlot {
             pid,
             inbox: tx,
             pidfd,
+            io,
         };
         (generation, rx)
     }
@@ -398,8 +482,20 @@ pub struct ControlledProcess {
 
 impl ControlledProcess {
     /// `inner` を包み、`slot` へ新しい世代として登録する。
+    ///
+    /// Linux では `inner` の `take_stdin` / `take_pty_master` をここで取り出して世代の入出力（[`GenerationIo`]）として
+    /// スロットへ移す（以後の本ハンドルの `take_stdin` / `take_pty_master` は `None`）。tty の捕捉用の読み取り側は
+    /// `take_output` で別に渡る（`crate::attach_io::AttachIoProcess` が構築時に分けている。#4074）。
     pub fn new(inner: Box<dyn LaunchedProcess>, slot: SignalSlot) -> Self {
-        let (generation, inbox) = slot.register(inner.pid(), dup_launch_pidfd(inner.as_ref()));
+        #[cfg(target_os = "linux")]
+        let io = GenerationIo {
+            stdin: inner.take_stdin(),
+            master: inner.take_pty_master(),
+            stdin_consumed: false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let io = GenerationIo;
+        let (generation, inbox) = slot.register(inner.pid(), dup_launch_pidfd(inner.as_ref()), io);
         Self {
             inner,
             slot,
@@ -537,7 +633,13 @@ impl LaunchedProcess for ControlledProcess {
         self.inner.take_seccomp_listener()
     }
 
-    /// init の pty の master を内側へ転送する（転送しないと包み直した後に取り出せない。CRI-6・#4070）。
+    /// 内側へ転送する。`new` が世代の入出力としてスロットへ移し済みのため、通常は `None`（#4074）。
+    #[cfg(target_os = "linux")]
+    fn take_stdin(&self) -> Option<ContainerStdin> {
+        self.inner.take_stdin()
+    }
+
+    /// 内側へ転送する。`new` が世代の入出力としてスロットへ移し済みのため、通常は `None`（CRI-6・#4070・#4074）。
     #[cfg(target_os = "linux")]
     fn take_pty_master(&self) -> Option<fandhe_container_core::exec::PtyMaster> {
         self.inner.take_pty_master()
@@ -1544,5 +1646,198 @@ mod tests {
         drop(cp2);
         assert_eq!(slot.exit_watcher_count(), 0);
         assert_eq!(closed.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- 世代ごとの入出力（SUP-7・SUP-3・CRI-6・#4074）----
+
+    /// stdin の書き込み端と終了の観測を操作できる世代の偽。
+    #[cfg(target_os = "linux")]
+    struct GenFake {
+        pid: NonZeroU32,
+        stdin: Mutex<Option<ContainerStdin>>,
+        exited: Arc<AtomicBool>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LaunchedProcess for GenFake {
+        fn pid(&self) -> NonZeroU32 {
+            self.pid
+        }
+        fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(self
+                .exited
+                .load(Ordering::SeqCst)
+                .then_some(ProcessExit::Exited(0)))
+        }
+        fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+            Ok(())
+        }
+        fn take_stdin(&self) -> Option<ContainerStdin> {
+            self.stdin.lock().unwrap().take()
+        }
+    }
+
+    /// 世代の偽と、その stdin の読み取り側・終了フラグを作る。
+    #[cfg(target_os = "linux")]
+    fn gen_fake(pid: u32) -> (GenFake, std::io::PipeReader, Arc<AtomicBool>) {
+        let (r, w) = std::io::pipe().unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        (
+            GenFake {
+                pid: NonZeroU32::new(pid).unwrap(),
+                stdin: Mutex::new(Some(ContainerStdin::from_pipe_writer_for_test(w))),
+                exited: exited.clone(),
+            },
+            r,
+            exited,
+        )
+    }
+
+    /// 世代の偽を順に返す relauncher。
+    #[cfg(target_os = "linux")]
+    struct QueueRelauncher(Mutex<Vec<Box<dyn LaunchedProcess>>>);
+
+    #[cfg(target_os = "linux")]
+    impl Relauncher for QueueRelauncher {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            let mut q = self.0.lock().unwrap();
+            if q.is_empty() {
+                return Err(TraitError::new(ErrorCode::Internal, "empty"));
+            }
+            Ok(q.remove(0))
+        }
+    }
+
+    /// 読み取り側から、いま読める分を読む（書き込み端が全て閉じていれば EOF の `0`）。
+    #[cfg(target_os = "linux")]
+    fn read_some(r: &mut std::io::PipeReader) -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = [0u8; 16];
+        let n = r.read(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// SUP-7・SUP-3・#4074（受け入れ基準）: 世代の stdin は `Exited` で閉じ、再 launch の登録で新しい世代の fd に差し替わり、
+    /// 古い世代の端は閉じたまま。`Drop` で最後の世代も閉じる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_sup3_4074_generation_io_replaced_on_relaunch() {
+        use std::io::Write;
+        let slot = SignalSlot::new();
+        let (g1, mut r1, exited1) = gen_fake(100);
+        let cp1 = ControlledProcess::new(Box::new(g1), slot.clone());
+        // 世代の入出力へ移った後は、ハンドル経由では取り出せない。
+        assert!(cp1.take_stdin().is_none());
+        slot.with_generation_io(pid(100), |io| {
+            io.stdin.as_mut().unwrap().write_all(b"g1").unwrap();
+        })
+        .unwrap();
+        assert_eq!(read_some(&mut r1), b"g1");
+        // 終了を観測すると `Exited` になり、第 1 世代の stdin は EOF になる。
+        exited1.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            cp1.wait(Duration::from_millis(1)),
+            Ok(Some(ProcessExit::Exited(0)))
+        ));
+        assert_eq!(read_some(&mut r1), b"");
+        assert_eq!(
+            slot.with_generation_io(pid(100), |_| ()).unwrap_err(),
+            ControlReason::ContainerExited
+        );
+        // 再 launch: 第 2 世代の登録で第 2 世代の fd に差し替わる。
+        let (g2, mut r2, _) = gen_fake(200);
+        let relauncher = ControlledRelauncher::new(
+            Arc::new(QueueRelauncher(Mutex::new(vec![Box::new(g2)]))),
+            slot.clone(),
+        );
+        let cp2 = relauncher.relaunch(Duration::from_secs(1)).unwrap();
+        slot.with_generation_io(pid(200), |io| {
+            io.stdin.as_mut().unwrap().write_all(b"g2").unwrap();
+        })
+        .unwrap();
+        assert_eq!(read_some(&mut r2), b"g2");
+        // 古い世代の端は閉じたまま（新しい世代に残らない）。古い pid は一致しない。
+        assert_eq!(read_some(&mut r1), b"");
+        assert_eq!(
+            slot.with_generation_io(pid(100), |_| ()).unwrap_err(),
+            ControlReason::PidMismatch
+        );
+        // 古い世代のハンドルの drop は新しい世代の入出力に触れない。
+        drop(cp1);
+        slot.with_generation_io(pid(200), |io| assert!(io.stdin.is_some()))
+            .unwrap();
+        // 最後の世代の drop で閉じる。
+        drop(cp2);
+        assert_eq!(read_some(&mut r2), b"");
+        assert_eq!(
+            slot.with_generation_io(pid(200), |_| ()).unwrap_err(),
+            ControlReason::NoHandle
+        );
+    }
+
+    /// CRI-6・#4074: tty の master の複製も同じ世代の寿命に従う（`Exited` で閉じる）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri6_4074_generation_master_closed_on_exit() {
+        use fandhe_container_core::exec::{WindowSize, open_host_pty_for_test};
+        struct TtyFake {
+            master: Mutex<Option<PtyMaster>>,
+            exited: Arc<AtomicBool>,
+        }
+        impl LaunchedProcess for TtyFake {
+            fn pid(&self) -> NonZeroU32 {
+                NonZeroU32::new(300).unwrap()
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                Ok(self
+                    .exited
+                    .load(Ordering::SeqCst)
+                    .then_some(ProcessExit::Exited(0)))
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+            fn take_pty_master(&self) -> Option<PtyMaster> {
+                self.master.lock().unwrap().take()
+            }
+        }
+        let (master, slave) = open_host_pty_for_test(WindowSize::new(24, 80)).unwrap();
+        // slave 側から見た master の開き数は、master の複製が閉じると EIO（全閉鎖）として観測できないため、
+        // 複製した fd の参照を弱く保つ代わりに、master 側の fd を別に複製して読む。
+        let observer = std::fs::File::from(master.as_fd().try_clone_to_owned().unwrap());
+        let exited = Arc::new(AtomicBool::new(false));
+        let slot = SignalSlot::new();
+        let cp = ControlledProcess::new(
+            Box::new(TtyFake {
+                master: Mutex::new(Some(master)),
+                exited: exited.clone(),
+            }),
+            slot.clone(),
+        );
+        assert!(cp.take_pty_master().is_none());
+        slot.with_generation_io(pid(300), |io| assert!(io.master.is_some()))
+            .unwrap();
+        exited.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            cp.wait(Duration::from_millis(1)),
+            Ok(Some(ProcessExit::Exited(0)))
+        ));
+        slot.with_generation_io(pid(300), |_| ()).unwrap_err();
+        // 保持分は閉じた。観測用の複製だけが master を保つ。
+        drop(observer);
+        drop(slave);
+    }
+
+    /// SUP-7・CRI-6・#4074: `--stdin` の指定は世代交代をまたいで保たれる。
+    #[test]
+    fn sup7_cri6_4074_stdin_option_survives_generations() {
+        let slot = SignalSlot::new().with_stdin_option(Some(StdinOption::Once));
+        assert_eq!(slot.stdin_option(), Some(StdinOption::Once));
+        let (fake, _, _) = Fake::new(100);
+        let _cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let (fake2, _, _) = Fake::new(200);
+        let _cp2 = ControlledProcess::new(Box::new(fake2), slot.clone());
+        assert_eq!(slot.stdin_option(), Some(StdinOption::Once));
+        assert_eq!(SignalSlot::new().stdin_option(), None);
     }
 }

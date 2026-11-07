@@ -11,12 +11,15 @@
 //! 構成:
 //! - [`wire`]: 固定長・big-endian の frame の型と codec（純粋関数。語彙の正は同モジュールの doc）
 //! - [`channel`]: socketpair 上の期限つき送受信。fd の本数・向き・文字デバイスを検証して `OwnedFd` で返す
+//! - [`helper`]: helper の本体（`main` の `stream-exec` 振り分けの先。引数・処理順・結果の写像。#3760）
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 本モジュールは codec と fd の受け渡しだけを持つ。helper の入口（`main` の `stream-exec` 振り分け。#3760）と
-//! plugin-cri 側の結線（#3761）は未実装で、現状どの経路からも呼ばれない。制御チャネル（`control`）には触れない。
+//! helper は実装済み（#3760）。plugin-cri 側の結線（#3761）と tty（pty の割り当てと `PtyMaster`。#3758）は未実装で、
+//! 現状 helper を起動する本番の経路は無い。helper は単一スレッドで fd 0 を見張れないため、plugin-cri が helper を kill
+//! せずに死んだ場合は exec の期限（`--timeout-ms`）まで動く（詳細は [`helper`]）。制御チャネル（`control`）には触れない。
 //! Linux 限定（core の `exec::ExecChildStep` が Linux でしか使えないため。`exec` と同じ cfg）。
 
 pub mod channel;
+pub mod helper;
 pub mod wire;

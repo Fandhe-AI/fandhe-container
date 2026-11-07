@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// テスト専用の一意なルート。Drop で消す。
 struct TestRoot(PathBuf);
 
-/// テスト root の名前に足す、プロセス内で一意な連番（macOS の時計の粗さによる衝突の回避。#3901）。
+/// テスト root の名前に足す、プロセス内で一意な連番（時計の粗さによる衝突の回避。macOS と Linux の CI で観測。#3650・#3901）。
 static ROOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl TestRoot {

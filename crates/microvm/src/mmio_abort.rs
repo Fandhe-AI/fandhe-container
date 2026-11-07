@@ -181,6 +181,28 @@ mod tests {
         }
     }
 
+    /// net の報告でも同じ規則で止まる（#4029）。
+    #[test]
+    fn mvm5_4029_queue_notify_action_stops_on_net_queue_error() {
+        use crate::interrupt::{InterruptDelivery, NetNotifyReport, NetQueueStats};
+        let report = |queue_error| {
+            Ok(QueueNotifyReport::Net(NetNotifyReport {
+                stats: NetQueueStats::Unknown { queue: 2 },
+                delivery: InterruptDelivery::NotNeeded,
+                queue_error,
+            }))
+        };
+        assert_eq!(queue_notify_action(&report(None)), ExitAction::Continue);
+        let e = MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "net queue index out of range",
+        );
+        assert_eq!(
+            queue_notify_action(&report(Some(e))),
+            ExitAction::Stop(StopReason::Failed(MicrovmErrorCode::InvalidArgument))
+        );
+    }
+
     fn dabt(s: u64) -> DataAbort {
         match decode_esr(s) {
             EsrClass::DataAbort(d) => d,

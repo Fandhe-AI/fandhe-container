@@ -6,8 +6,8 @@
 //! `crate::irq::IrqFd`（`KVM_IRQFD`）、macOS は `crate::hvf::gic::GicSpiLine`（`hv_gic_set_spi`。#3795）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
 //! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
-//! QueueNotify の route（#4026）: [`QueueNotifyRoute`] と `BlockQueueNotifyRoute` がトランスポート・ゲスト RAM のスロット・割り込み線を束ねて
-//! [`complete_block_notify`] を呼ぶ。ロックは dispatcher の解放後に、トランスポート、メモリの順。
+//! QueueNotify の route（#4026・#4029）: [`QueueNotifyRoute`] と `BlockQueueNotifyRoute`・`NetQueueNotifyRoute` がトランスポート・ゲスト RAM のスロット・割り込み線を束ねて
+//! [`complete_block_notify`]（net は [`complete_net_notify`]）を呼ぶ。ロックは dispatcher の解放後に、トランスポート、メモリの順。
 //!
 //! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みの既定は edge 扱い。
 //!
@@ -360,7 +360,7 @@ pub trait QueueNotifyRoute: Send + Sync + std::fmt::Debug {
 
 /// virtio-block 1 台分の [`QueueNotifyRoute`]（トランスポート・ゲスト RAM のスロット・割り込み線を束ねる）。
 ///
-/// macOS では `hvf::microvm` の `HvfDeviceBus` が 1 台ごとに作り `MmioHandler` へ渡して結線済み（#4028）。net の route は #4029（REPAIR-3）。
+/// macOS では `hvf::microvm` の `HvfDeviceBus` が 1 台ごとに作り `MmioHandler` へ渡して結線済み（#4028）。net は `NetQueueNotifyRoute`（#4029）。
 /// `line.trigger()` はメモリの lock の中で呼ばれる。`guest_memory_slot` の「クロージャの中で他の lock を取らない」
 /// の例外で、`GicSpiLine::trigger`（`HvfGicSink::set_spi`）が取る Rust の lock は、VM の生存を示す `alive` の読み取りと、
 /// WFI の起床の waker の mutex（`alive` を外してから取る）だけ。どちらも末端で、memory・transport・dispatcher を待たない。
@@ -421,6 +421,84 @@ where
     }
 }
 
+/// 範囲外の net キュー番号の報告の中身（`complete_net_notify` と `NetQueueNotifyRoute` の事前検査が共有する。
+/// 文言と値を 2 か所に書かないための補助。MVM-1）。
+fn net_queue_out_of_range(queue: u16) -> (NetQueueStats, Option<MicrovmError>) {
+    (
+        NetQueueStats::Unknown { queue },
+        Some(MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "net queue index out of range",
+        )),
+    )
+}
+
+/// virtio-net 1 台分の [`QueueNotifyRoute`]（トランスポート・ゲスト RAM のスロット・割り込み線を束ねる。#4029・MVM-1・MVM-5）。
+///
+/// 呼び出し文脈: macOS では `hvf::microvm` の `HvfDeviceBus` が net の台ごとに作り `MmioHandler` へ渡す。
+/// 範囲外のキュー番号は Linux の `DeviceBus` の net と同じ契約に揃え、`Err` ではなく `Ok` の `queue_error`
+/// （`Unknown`）で返す（block の route とは違う。止めるかどうかは呼び出し元の `queue_notify_action` が決める）。
+/// ロックの順は transport、memory の順。`line.trigger()` がメモリの lock の中で呼ばれる例外は
+/// `BlockQueueNotifyRoute` と同じ。範囲は送信とゲストの kick による受信まで。ホスト側の到着を契機にした
+/// 受信（macOS の受信ポーラー）は #4030（REPAIR-3）。
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+pub struct NetQueueNotifyRoute<B: NetBackend, M: GuestMemoryBacking, L> {
+    transport: std::sync::Arc<std::sync::Mutex<VirtioMmioTransport<VirtioNet<B>>>>,
+    memory: crate::guest_memory_slot::GuestMemorySlot<M>,
+    line: L,
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<B: NetBackend, M: GuestMemoryBacking, L> NetQueueNotifyRoute<B, M, L> {
+    /// 共有トランスポート・ゲスト RAM のスロット・割り込み線から作る。
+    pub fn new(
+        transport: std::sync::Arc<std::sync::Mutex<VirtioMmioTransport<VirtioNet<B>>>>,
+        memory: crate::guest_memory_slot::GuestMemorySlot<M>,
+        line: L,
+    ) -> Self {
+        Self {
+            transport,
+            memory,
+            line,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<B: NetBackend, M: GuestMemoryBacking, L> std::fmt::Debug for NetQueueNotifyRoute<B, M, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // lock は取らない（Debug 出力でデッドロックさせない）。
+        f.debug_struct("NetQueueNotifyRoute")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<B, M, L> QueueNotifyRoute for NetQueueNotifyRoute<B, M, L>
+where
+    B: NetBackend + Send,
+    M: GuestMemoryBacking + Send,
+    L: InterruptLine + Send + Sync,
+{
+    fn on_queue_notify(&self, queue: u16) -> Result<QueueNotifyReport, MicrovmError> {
+        // ゲストの入力。lock を取る前に拒否する（Linux の net と同じく Ok + queue_error）。
+        if queue > 1 {
+            let (stats, queue_error) = net_queue_out_of_range(queue);
+            return Ok(QueueNotifyReport::Net(NetNotifyReport {
+                stats,
+                delivery: InterruptDelivery::NotNeeded,
+                queue_error,
+            }));
+        }
+        let mut t = self.transport.lock().map_err(|_| {
+            MicrovmError::new(MicrovmErrorCode::Internal, "virtio transport lock poisoned")
+        })?;
+        self.memory
+            .with_memory_mut(|mem| complete_net_notify(&mut t, mem, queue, &self.line))
+            .map(QueueNotifyReport::Net)
+    }
+}
+
 /// virtio-net で `QueueNotify(queue)` を受けた後の処理（TASK-74.3.2・#881・MVM-1）。
 ///
 /// 呼び出し文脈: ioeventfd か MMIO exit が返す `MmioWriteOutcome::QueueNotify(i)` の `i` を `queue` に渡す。
@@ -455,13 +533,7 @@ pub fn complete_net_notify<B: NetBackend, M: GuestMemoryBacking>(
                 Some(e),
             ),
         },
-        other => (
-            NetQueueStats::Unknown { queue: other },
-            Some(MicrovmError::new(
-                MicrovmErrorCode::InvalidArgument,
-                "net queue index out of range",
-            )),
-        ),
+        other => net_queue_out_of_range(other),
     };
     let delivery = if stats.completed() >= 1 {
         transport.raise_interrupt(InterruptReason::UsedBuffer);
@@ -540,6 +612,13 @@ mod tests {
             assert_send_sync::<
                 BlockQueueNotifyRoute<
                     MemoryBlockBackend,
+                    crate::guest_memory::HeapBacking,
+                    SpiLine<RecordingGic>,
+                >,
+            >();
+            assert_send_sync::<
+                NetQueueNotifyRoute<
+                    crate::virtio_net::MemoryNetBackend,
                     crate::guest_memory::HeapBacking,
                     SpiLine<RecordingGic>,
                 >,

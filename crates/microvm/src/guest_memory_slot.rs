@@ -15,7 +15,9 @@
 //!
 //! # 未結線（REPAIR-3）
 //! #4026 で `interrupt::BlockQueueNotifyRoute` が使い始めた。#4027 で `hvf::microvm` の `HvfVmParts` が macOS のゲスト RAM の所有に使う（clone はまだ持たない）。
-//! vCPU スレッドへの clone の結線は #4028 で済み（`MmioHandler` への block の route 結線）、最後の `Arc` での回収は #4032。
+//! vCPU スレッドへの clone の結線は #4028（`MmioHandler` への block の route 結線）と #4032（`ExitHandlers::guest_memory`。
+//! 全 vCPU が無条件で持つ）で済み、期限切れで切り離したスレッドが終わった後の最後の `Arc` での回収は
+//! `hvf_lifecycle::ReleaseMemory::detach` と `drop_vcpu_thread_state` が担う（#4032。実機での確認は #4034）。
 //!
 //! # cfg
 //! `interrupt::BoundAckRoute` と同じく Linux と macOS（aarch64）だけ。Windows（WHP）は MVP 外（MVM-5）。
@@ -99,7 +101,8 @@ impl<M: GuestMemoryBacking> GuestMemorySlot<M> {
     /// `hvf::microvm` の解放が使う。毒化のまま `Err` で戻ると、呼び出し元の構造体の drop で最後の `Arc` が落ち、
     /// vCPU スレッドが残っていても RAM が解放されうる。これは期限切れの経路（ゲストがまだ書けうるメモリを
     /// 解放しない）と食い違うため、`Arc` を 1 つ `forget` して中身が drop されないようにする。
-    /// 何度呼んでも `Arc` が増えるだけで中身は drop されない。回収はプロセスの終了だけ（#4032・#3908 が扱う）。
+    /// 何度呼んでも `Arc` が増えるだけで中身は drop されない。回収はプロセスの終了だけ（毒化・取得失敗の経路は #4032 でも
+    /// 変えない。vCPU は停止確認済みで、lock を持つのはホスト側のスレッドのため）。
     pub fn take_or_leak(&self) -> Result<Option<GuestMemory<M>>, MicrovmError> {
         match self.inner.lock() {
             Ok(mut guard) => Ok(guard.take()),
@@ -152,6 +155,11 @@ impl<M: GuestMemoryBacking> crate::hvf_lifecycle::ReleaseMemory for GuestMemoryS
         let taken = self.take_within(deadline)?;
         drop(taken);
         Ok(())
+    }
+
+    /// 参照を 1 つ手放すだけ（`Arc` の drop）。中身は最後の保持者（切り離した vCPU スレッド）の drop で 1 回だけ解放される（#4032）。
+    fn detach(self) {
+        drop(self);
     }
 }
 
@@ -369,5 +377,18 @@ mod tests {
         );
         drop(s);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    /// MVM-5・REPAIR-5・#4032: `detach` は中身を解放せず、残りの clone が落ちた時点で 1 回だけ解放される。
+    #[test]
+    fn mvm5_4032_detach_defers_drop_to_last_arc() {
+        use crate::hvf_lifecycle::ReleaseMemory;
+        let drops = Arc::new(AtomicUsize::new(0));
+        let s = counting(&drops);
+        let held = s.clone();
+        s.detach();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -134,4 +134,4 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 帰結: ゲスト RAM は RWX のままホスト側で保護を変えない。ホスト側の防御は、参照を外へ出さないコピー API と範囲検査（`hvf/memory.rs` のモジュール doc）に置く
 - 再評価条件: (1) RAM の中に MMIO の穴が要るとき、(2) 読み取り専用の領域が要るとき
 - 再評価時の土台: OS 非依存の `GuestMemory::from_regions`（#3697）と `sys/hvf.rs` の `GuestMapping::protect` は既にある。足りないのは HVF 側で複数の対応付けを登録する配線と、保護の変更を呼ぶ経路
-- #3908 との対応: 未実装事項のうち「複数領域・`hv_vm_protect`」は本記録で閉じる。残り（`ExitHandlers` への受け渡し・QueueNotify の配線・期限切れ後の回収〔#4032〕等）は #3908 の分解表の各 issue が担う
+- #3908 との対応: 未実装事項のうち「複数領域・`hv_vm_protect`」は本記録で閉じる。残り（`ExitHandlers` への受け渡し・QueueNotify の配線・期限切れ後の回収は #4032 で実装済み〔実機未確認 #4034〕等）は #3908 の分解表の各 issue が担う

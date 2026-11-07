@@ -12,7 +12,9 @@
 //! # 寿命の契約
 //! スレッドは `Arc<VmWithGic>` の複製を持ち、vCPU が生きている間は VM が破棄されない。呼び出し元は自分の `Arc` とゲスト RAM
 //! （`GuestMapping` は `&HvVm` を借用する）を、[`VcpuHandle::stop`] が戻るまで保つこと。`stop` が期限切れになったら、
-//! スレッドが自力で終わるまで VM は残る（無期限の `join` はしない）。
+//! スレッドが自力で終わるまで VM とゲスト RAM は残る（無期限の `join` はしない）。終わった時点で、スレッドが vCPU の破棄 →
+//! デバイスの参照 → RAM のスロットの clone（[`ExitHandlers::guest_memory`]）→ VM の順に落とし、最後の `Arc` として unmap・munmap・
+//! `hv_vm_destroy` を行う（#4032。vCPU スレッドからの `hv_vm_unmap`・`hv_vm_destroy` は実機未確認、#4034）。
 //!
 //! # 開始の制御と破棄の順序（TASK-192.16・#3798）
 //! [`VcpuThread::spawn_gated`] は vCPU を作って `setup` を済ませた後、[`VcpuHandle::open_start`] が呼ばれるまでゲストを走らせない
@@ -43,10 +45,12 @@ use crate::boot_arm64::{
 };
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
+use crate::guest_memory_slot::GuestMemorySlot;
 use crate::hvf::VmWithGic;
+use crate::hvf::memory::RegisteredHvfRam;
 use crate::hvf::{hvc, mmio, sysreg};
 use crate::hvf_abi::{HVF_MAX_VCPUS, HvReg, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
-use crate::hvf_lifecycle::VcpuStopper;
+use crate::hvf_lifecycle::{VcpuStopper, drop_vcpu_thread_state};
 use crate::hvf_loop::{
     ExitAction, HvExit, LoopHandle, LoopStart, VCPU_CREATE_DEADLINE_DEFAULT, VCPU_RUN_SLICE,
     VcpuExec, VcpuExitObserver, VcpuKick, VcpuSetStopReport, VcpuStopReport, run_loop, spawn_loop,
@@ -72,6 +76,13 @@ pub struct ExitHandlers {
     pub mmio: mmio::MmioHandler,
     /// HVC / SMC（PSCI）。#3794。
     pub hvc: hvc::HvcHandler,
+    /// ゲスト RAM のスロットの clone（#4032・MVM-5・REPAIR-5）。親の `stop` が期限切れで切り離したスレッドが、終了時に最後の
+    /// `Arc` を落として unmap → munmap → `hv_vm_destroy` の回収を担うための保持。`hvf::microvm::assemble` は全 vCPU に `Some` を渡す
+    /// （block が 0 台でも保持する。route 経由の clone だけでは、block が無い構成でゲストの走行中に RAM が解放されうるため）。
+    ///
+    /// 契約: vCPU の破棄より後、`mmio` などデバイス側の参照より後、`Arc<VmWithGic>` より前に落とす（`hvf_lifecycle::drop_vcpu_thread_state`）。
+    /// 試験などで保持が要らない呼び出し側は `None`。
+    pub guest_memory: Option<GuestMemorySlot<RegisteredHvfRam<'static>>>,
 }
 
 /// [`VcpuThread::spawn`] の設定。
@@ -344,11 +355,23 @@ impl VcpuThread {
             &name,
             config.create_deadline,
             move |start: LoopStart<HvfKick>| {
-                let mut vcpu = match vm.create_vcpu() {
+                // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
+                // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
+                // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
+                // `vm` を落とした時点で `vm_run` が最後の `Arc` を持っていれば、VM の解放はここ（`vm_run` の drop）になる。
+                // 順序の根拠は `vm_run` の drop 位置ではなく、vCPU を先に破棄してから `vm` を渡すことにある。
+                let vm_run = Arc::clone(&vm);
+                let mut vcpu = match vm_run.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
                         let code = e.code();
                         start.fail(e);
+                        let ExitHandlers {
+                            mmio,
+                            hvc,
+                            guest_memory,
+                        } = handlers;
+                        drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                         return (StopReason::Failed(code), HvRunStats::default());
                     }
                 };
@@ -364,6 +387,13 @@ impl VcpuThread {
                 if let Err(e) = prepared {
                     let code = e.code();
                     start.fail(e);
+                    drop(vcpu);
+                    let ExitHandlers {
+                        mmio,
+                        hvc,
+                        guest_memory,
+                    } = handlers;
+                    drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
                 let kick = HvfKick {
@@ -397,6 +427,12 @@ impl VcpuThread {
                 // 破棄は teardown のときだけ（以後の vCPU 作成を拒否してから owning thread で破棄する）。
                 vm.mark_teardown();
                 drop(exec);
+                let ExitHandlers {
+                    mmio,
+                    hvc,
+                    guest_memory,
+                } = handlers;
+                drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                 (reason, stats)
             },
         )?;
@@ -428,17 +464,36 @@ impl VcpuThread {
             "hvf-vcpu-0",
             config.create_deadline,
             move |start: LoopStart<HvfKick>| {
-                let mut vcpu = match vm.create_vcpu() {
+                // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
+                // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
+                // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
+                // `vm` を落とした時点で `vm_run` が最後の `Arc` を持っていれば、VM の解放はここ（`vm_run` の drop）になる。
+                // 順序の根拠は `vm_run` の drop 位置ではなく、vCPU を先に破棄してから `vm` を渡すことにある。
+                let vm_run = Arc::clone(&vm);
+                let mut vcpu = match vm_run.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
                         let code = e.code();
                         start.fail(e);
+                        let ExitHandlers {
+                            mmio,
+                            hvc,
+                            guest_memory,
+                        } = handlers;
+                        drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                         return (StopReason::Failed(code), HvRunStats::default());
                     }
                 };
                 if let Err(e) = setup(&mut vcpu) {
                     let code = e.code();
                     start.fail(e);
+                    drop(vcpu);
+                    let ExitHandlers {
+                        mmio,
+                        hvc,
+                        guest_memory,
+                    } = handlers;
+                    drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
                 let peer = vcpu.canceller();
@@ -453,6 +508,12 @@ impl VcpuThread {
                             // 走らせずに終わる（開く前の stop / drop、またはゲートの待ちの期限切れ）。
                             vm.mark_teardown();
                             drop(vcpu);
+                            let ExitHandlers {
+                                mmio,
+                                hvc,
+                                guest_memory,
+                            } = handlers;
+                            drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                             return (reason, HvRunStats::default());
                         }
                     }
@@ -476,8 +537,14 @@ impl VcpuThread {
                     // これ以後の vCPU 作成を拒否する。vCPU の破棄は teardown の一部としてだけ起きる。
                     vm.mark_teardown();
                 }
-                // vCPU を `vm`（この closure の捕捉値）より先に破棄してから戻る。
+                // vCPU → デバイス参照 → スロット → VM の順に破棄してから戻る（AP と同じ。#4032）。
                 drop(exec);
+                let ExitHandlers {
+                    mmio,
+                    hvc,
+                    guest_memory,
+                } = handlers;
+                drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                 (reason, stats)
             },
         )?;

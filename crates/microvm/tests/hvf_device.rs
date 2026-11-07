@@ -276,6 +276,7 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
     let handlers = || ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
+        guest_memory: None,
     };
     let setup = |pc: u64, x0: u64| {
         move |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
@@ -747,6 +748,7 @@ fn hvf_device_psci_version_then_system_off() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
+        guest_memory: None,
     };
     let handle = VcpuThread::spawn(
         Arc::clone(&vm),
@@ -985,6 +987,7 @@ fn hvf_device_mmio_reaches_virtio_mmio() {
         let handlers = ExitHandlers {
             mmio: MmioHandler::with_dispatcher(dispatcher),
             hvc: HvcHandler::new(),
+            guest_memory: None,
         };
         let counts = Arc::new(ExitCounts::new());
         let config = VcpuThreadConfig {
@@ -1970,6 +1973,7 @@ fn hvf_device_vtimer_wakes_wfi() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
+        guest_memory: None,
     };
     let setup = |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
         vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))?;
@@ -2132,6 +2136,7 @@ fn hvf_device_spi_wakes_wfi() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::with_dispatcher(dispatcher),
         hvc: HvcHandler::new(),
+        guest_memory: None,
     };
     let counts = Arc::new(ExitCounts::new());
     let config = VcpuThreadConfig {

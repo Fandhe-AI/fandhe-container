@@ -430,7 +430,8 @@ impl TokenCache {
 ///
 /// 種別ごとの結線の有無に加え、attach が stdin・tty を受けるか（`attach_interactive`。#3763）と、PortForward が
 /// POD ネットワークの pod にも対応するか（`port_forward_pod_network`。既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766）を持つ。
-/// exec の相対 `argv[0]`（#3761）を RPC 時に断る情報は、issue が項目として足す（本型は後から項目を足せる構造体）。
+/// exec が tty・相対 `argv[0]` を受けるか（`exec_tty`・`exec_relative_command`。いずれも既定 `false`。#3761）も持ち、
+/// 受けないものは RPC 時に `INVALID_ARGUMENT` で断る（URL を返してから失敗させない。CRI-6・REPAIR-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamWiring {
     exec: bool,
@@ -440,6 +441,10 @@ pub struct StreamWiring {
     /// 無視する URL を出さない。REPAIR-3）。
     attach_interactive: bool,
     port_forward_pod_network: bool,
+    /// exec が tty（pty）を扱えるか。既定は `false`（fail-closed。#3761）。
+    exec_tty: bool,
+    /// exec が相対パスの `argv[0]` を扱えるか。既定は `false`（fail-closed。PATH 解決の方式が決まるまで断る。#3761・#2439）。
+    exec_relative_command: bool,
 }
 
 impl StreamWiring {
@@ -461,6 +466,30 @@ impl StreamWiring {
             .with(StreamKind::PortForward)
             .with_attach_interactive()
             .with_port_forward_pod_network()
+            .with_exec_tty()
+            .with_exec_relative_command()
+    }
+
+    /// exec が tty を扱えると宣言して返す（Exec を結線済みにはしない）。
+    pub fn with_exec_tty(mut self) -> Self {
+        self.exec_tty = true;
+        self
+    }
+
+    /// exec が tty を扱えるか（`false` なら RPC 時に `INVALID_ARGUMENT` で断る）。
+    pub fn exec_tty(&self) -> bool {
+        self.exec_tty
+    }
+
+    /// exec が相対パスの `argv[0]` を扱えると宣言して返す。
+    pub fn with_exec_relative_command(mut self) -> Self {
+        self.exec_relative_command = true;
+        self
+    }
+
+    /// exec が相対パスの `argv[0]` を扱えるか（`false` なら RPC 時に `INVALID_ARGUMENT` で断る）。
+    pub fn exec_relative_command(&self) -> bool {
+        self.exec_relative_command
     }
 
     /// attach が stdin・tty を扱えると宣言して返す（Attach を結線済みにはしない）。
@@ -565,6 +594,25 @@ impl StreamingUrlIssuer {
         Ok(())
     }
 
+    /// exec の tty・相対 `argv[0]` の要求を、起動役が受けないとき `INVALID_ARGUMENT` で断る（#3761・REPAIR-3・SEC-1）。
+    ///
+    /// `runtime_service::exec_impl` が URL の発行より前に呼ぶ。メッセージは英語の固定文で、argv を含めない。
+    pub fn require_exec_options(&self, tty: bool, cmd: &[String]) -> Result<(), CriError> {
+        if tty && !self.wiring.exec_tty() {
+            return Err(CriError::invalid_argument("exec with tty is not supported"));
+        }
+        if !self.wiring.exec_relative_command()
+            && let Some(first) = cmd.first()
+            // コンテナ内のパスはホスト OS に依らない Unix 意味論なので、先頭が '/' かで判定する（Windows の `Path::is_absolute` は使わない）。
+            && !first.starts_with('/')
+        {
+            return Err(CriError::invalid_argument(
+                "exec command must be an absolute path",
+            ));
+        }
+        Ok(())
+    }
+
     /// PortForward の `network` が POD で未対応なら `UNIMPLEMENTED` を返す（REPAIR-3・#3755）。
     ///
     /// `runtime_service` が sandbox の照合の後、URL の発行の前に呼ぶ。固定の英語文で、ID を含めない。
@@ -591,6 +639,9 @@ impl StreamingUrlIssuer {
         self.require_wired(kind)?;
         if let StreamRequest::Attach(a) = &request {
             self.require_attach_options(a.stdin, a.tty)?;
+        }
+        if let StreamRequest::Exec(e) = &request {
+            self.require_exec_options(e.tty, &e.cmd)?;
         }
         if let StreamRequest::PortForward { network, .. } = &request {
             self.require_port_forward_network(*network)?;
@@ -773,6 +824,12 @@ impl StreamHandler for StreamDispatcher {
                 wiring = wiring.with(kind);
                 if kind == StreamKind::Attach && child.attach_interactive() {
                     wiring = wiring.with_attach_interactive();
+                }
+                if kind == StreamKind::Exec && child.exec_tty() {
+                    wiring = wiring.with_exec_tty();
+                }
+                if kind == StreamKind::Exec && child.exec_relative_command() {
+                    wiring = wiring.with_exec_relative_command();
                 }
                 if kind == StreamKind::PortForward && child.port_forward_pod_network() {
                     wiring = wiring.with_port_forward_pod_network();
@@ -1269,11 +1326,40 @@ mod tests {
         );
     }
 
+    /// CRI-6・REPAIR-3・SEC-1・#3761: exec の tty・相対 argv[0] は既定で断り、`all()` だけが受け、ディスパッチャが伝える。
+    #[test]
+    fn cri6_3761_exec_options_are_fail_closed_and_propagate() {
+        assert!(!StreamWiring::default().exec_tty());
+        assert!(!StreamWiring::only(StreamKind::Exec).exec_relative_command());
+        assert!(StreamWiring::all().exec_tty());
+        assert!(StreamWiring::all().exec_relative_command());
+        let closed = issuer_with(StreamWiring::only(StreamKind::Exec));
+        let abs = vec!["/bin/true".to_string()];
+        let rel = vec!["true".to_string()];
+        assert!(closed.require_exec_options(false, &abs).is_ok());
+        let e = closed.require_exec_options(true, &abs).expect_err("tty");
+        assert_eq!(e.code(), crate::error::CriErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "exec with tty is not supported");
+        let e = closed
+            .require_exec_options(false, &rel)
+            .expect_err("relative");
+        assert_eq!(e.code(), crate::error::CriErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "exec command must be an absolute path");
+        let open = issuer_with(StreamWiring::all());
+        assert!(open.require_exec_options(true, &rel).is_ok());
+        let child: Arc<dyn StreamHandler> = Arc::new(StubHandler(
+            StreamWiring::only(StreamKind::Exec).with_exec_tty(),
+        ));
+        let d = StreamDispatcher::new().with_exec(child);
+        assert!(d.wiring().exec_tty());
+        assert!(!d.wiring().exec_relative_command());
+    }
+
     /// CRI-6・REPAIR-3・#3753: 未結線の種別の発行は `Unimplemented` で、トークン枠を消費しない。
     /// 検査は乱数源より前にあるため、乱数源の無い OS でも `Unavailable` ではなく `Unimplemented` になる。
     #[test]
     fn cri6_repair3_issue_rejects_unwired_kind_without_consuming_slot() {
-        let issuer = issuer_with(StreamWiring::only(StreamKind::Exec));
+        let issuer = issuer_with(StreamWiring::only(StreamKind::Exec).with_exec_relative_command());
         let err = issuer.issue(attach_req()).expect_err("attach is unwired");
         assert_eq!(err.code(), crate::error::CriErrorCode::Unimplemented);
         assert_eq!(issuer.cache.len(), 0);
@@ -1296,7 +1382,7 @@ mod tests {
         let issuer = StreamingUrlIssuer {
             base_url: "http://127.0.0.1:1".to_string(),
             cache: Arc::new(TokenCache::new(Duration::from_secs(60), 2)),
-            wiring: StreamWiring::only(StreamKind::Exec),
+            wiring: StreamWiring::only(StreamKind::Exec).with_exec_relative_command(),
         };
         for _ in 0..10 {
             issuer.issue(attach_req()).expect_err("unwired");

@@ -132,7 +132,7 @@ async fn start_container(service: &CriRuntimeService, container_id: &str) {
 fn exec_request(container_id: &str) -> v1::ExecRequest {
     v1::ExecRequest {
         container_id: container_id.to_string(),
-        cmd: vec!["sh".into()],
+        cmd: vec!["/bin/sh".into()],
         tty: false,
         stdin: false,
         stdout: true,

@@ -331,7 +331,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
-| C7 | #4073 | core: `StartRequest` の `StdinMode` | なし |
+| C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬 | C7・C4 |
 | C9 | #4077 | plugin-cri: 完全版 `AttachBackend` | C6・C8・#3763・#3754・#3761 |
 | C10 | #4078 | cri: 拒否の解除と整合検査 | C3・C9 |

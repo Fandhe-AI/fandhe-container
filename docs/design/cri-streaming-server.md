@@ -98,9 +98,9 @@ SPDY/3.1 は窓（既定 64 KiB）を超える DATA の送信を禁じる。し�
 
 CRI の定義は tty のとき stderr を false に固定する。RPC（`validate_attach_request`）は守らない要求を `INVALID_ARGUMENT` にする。接続時のハンドラは kubelet の `NewOptions` に合わせ、tty の stderr を要求していないものとして扱う。RPC はさらに running でないコンテナを `FAILED_PRECONDITION`、未知を `NOT_FOUND` にする。接続時にも backend が再確認する。
 
-### Attach の本番 backend（未実装・REPAIR-3）
+### Attach の本番 backend（段階 1 は実装済み・完全版は未実装・REPAIR-3）
 
-実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立ては #3754。方式の設計は「本番 backend の設計」の「Attach」節（段階 1 は #3763、完全版は #3765）。
+実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立ては #3754。方式の設計は「本番 backend の設計」の「Attach」節。段階 1（読み取り専用）は #3763 で実装済み、完全版（stdin・tty・resize）は #3765 の設計に従う未実装。
 
 ## Exec（#680・TASK-63.2・CRI-6）
 
@@ -234,6 +234,15 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - follow には取り消しの口が無く、期限と書き込みの失敗でしか終わらない。drop の後も期限まで残らないよう、reader に取り消し（停止フラグ）を足す。これは supervisor の変更で、#3763 の範囲に含める
 - 制限: 遅延は最大 200 ms とポーリングの読み取りの時間。LF の無い行は出ない（1 行の上限は 64 KiB）。restart の再 launch の間も追従が続く（完全版との違い）。世代数 1 の設定は拒否される（既定は 1 MiB × 3 世代）
 
+**段階 1 の実装（#3763。実装済み）**:
+
+- 置き場: plugin-cri の `streaming/log_attach.rs`（`LogFollowAttachBackend`）。`production_stream_dispatcher(attach)` が `AttachHandler::read_only()` に包んで結線し、`main.rs` が `CriPluginBackends::log_attach_backend()` で作って `bind_production_streaming` へ渡す（作れなければ起動しない）
+- RPC 時の拒否: `StreamWiring` に `attach_interactive`（既定 false）を足した。`AttachHandler::read_only()` の結線は宣言せず、`attach_impl` が `require_attach_options` で stdin・tty を URL の発行前に `INVALID_ARGUMENT`（`attach with stdin or tty is not supported`）で断る。`issue()` も同じ位置で断る（多層防御）。接続時は backend も同じ文言で断る
+- follow の実行: セッションごとに専用の `std::thread`（blocking プールを使わない）で `read_container_log_with_cancel`（`tail 0`・stream 絞り込みなし）を回し、supervisor の `RecordDemux` がタグを外して stdout / stderr へ分ける。tokio への橋渡しは std の `UnixStream::pair` 3 組（stdout・stderr・終了通知）で、tokio の feature は増やしていない。背圧は socketpair のバッファ。同時数の上限は 64（超えたら `RESOURCE_EXHAUSTED`）
+- 終わり方: supervisor が `FollowEnd`（`Stopped`・`LogRemoved`・`Deadline`・`Cancelled`）を報告する。`Stopped`・`LogRemoved`・`Cancelled` は読み口が EOF で終わり、`Deadline` と読み取りの失敗は EOF の後に読み口が `io::Error` を返す（セッションは Success にしない）。どの場合も終了通知を完了させる
+- 取り消し: 読み口と終了通知の future が取り消しの旗を共有し、最後の 1 つが drop されたら旗が立つ（セッションの終了・切断・idle・停止）。follow は次のポーリング（200 ms）の前に旗を見て、書き込みが詰まっていても 200 ms 刻みで旗を見る
+- 状態の問い合わせ: `AttachProbe`（本番は `StateStore` の `get`。不在は `NOT_FOUND`、Running でなければ `FAILED_PRECONDITION`、読めなければ `UNAVAILABLE`）。CLI の `container_activity` と同じ写像で、数行の重複は supervisor への集約を別 issue とする
+
 **完全版の方式比較**（評価の核心は単一スレッド制約。[restart-relaunch-single-thread.md](restart-relaunch-single-thread.md)）:
 
 | 案 | 内容 | 単一スレッド制約との干渉 | 判断 |
@@ -357,6 +366,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | attach の `backend_timeout` | 10 秒 |
 | kind 9 の attach の fd の受け渡し（往復） | 5 秒 |
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
+| attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
 
@@ -364,7 +374,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 | issue | 内容 | 範囲の変更（issue 本文の想定との差） |
 | ----- | ---- | ------------------------------------ |
-| #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763）・POD 未対応（#3766）・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
+| #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763。`attach_interactive` として実装済み）・POD 未対応（#3766）・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
 | #3754 | `StreamingServer` の起動・注入 | 実装済み（plugin-cri の `streaming`。下の「plugin-cri での起動と停止（#3754）」） |
 | #3755 | NODE の dialer | cri の `PortForwardDialer` の引数に対象の型を足す（cri の変更を含む） |
 | #3756 | 試験 | — |
@@ -374,7 +384,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3760 | supervisor: bin の `stream-exec` 入口（単一スレッドの helper）が kind 6 / 7 と `run_command_with_pidfd_*` を呼び、結果を返す | 常駐の supervisor 側の受け口ではなく helper |
 | #3761 | plugin-cri の本番 launcher | helper の起動・fd の送信・tokio の橋渡し・drop で kill・ローカルの resize・全体の上限 |
 | #3762 | 実機前提試験 | — |
-| #3763 | plugin-cri の読み取り専用 attach | supervisor の reader の取り消しの口を含む |
+| #3763 | plugin-cri の読み取り専用 attach | 実装済み（supervisor の reader の取り消しの口・`FollowEnd`・`RecordDemux` を含む） |
 | #3764 | docs の更新 | — |
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
@@ -421,4 +431,4 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - `CriRuntimeService` の `exec`・`attach`・`port_forward` は、入力検証と存在照合より前に `StreamingUrlIssuer::require_wired` を通し、未結線の種別は URL を返さず `UNIMPLEMENTED`（英語の固定文。トークン・要求の中身を含めない）にする。未注入のときと同じ順序で、未知のコンテナでも `NOT_FOUND` より先に `UNIMPLEMENTED` になる
 - `StreamingUrlIssuer::issue` も未結線の種別を乱数源とトークン枠の消費より前に断る（多層防御）。未結線の RPC を繰り返しても、結線済みの種別の発行枠（`max_in_flight`）は埋まらない
 - 未結線の種別の HTTP 側の 501 は、issuer を経ない到達に対する多層防御として残す
-- `StreamWiring` は後から項目を足せる構造体で、現状は種別ごとの結線の有無だけを持つ。既定は全未結線（fail-closed）
+- `StreamWiring` は後から項目を足せる構造体で、種別ごとの結線の有無と、attach が stdin・tty を扱えるか（`attach_interactive`。#3763）を持つ。既定は全未結線かつ非対話（fail-closed）。`StreamDispatcher::wiring()` は Attach の子の `attach_interactive` を伝える

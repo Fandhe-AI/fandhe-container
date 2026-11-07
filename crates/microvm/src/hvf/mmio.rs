@@ -24,9 +24,9 @@
 //!   [`MmioHandler::with_ack_tallies`] の共有計数で外から読める（観測専用。`DeviceReset` は数えない。#4014）。
 //! - `InterruptACK` を処理した vCPU はその線の SPI の宛先として [`MmioHandler::with_ack_learner`] で記録し、WFI の待ちを
 //!   宛先の vCPU だけ起こすのに使う（#3948・MVM-5・REPAIR-5。方式と残余は `crate::hvf_wake`）。
-//! - virtio-net の `QueueNotify` の処理は #4029 の担当。route の無いデバイス（現状は net）は通知を数えて
-//!   [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
-//!   virtio-block は [`MmioHandler::with_queue_notify_routes`] で結んだ route が処理する（#4028。失敗は VM を止める）。
+//! - route の無いデバイスは `QueueNotify` を数えて [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
+//!   virtio-block（#4028）と virtio-net（#4029）は [`MmioHandler::with_queue_notify_routes`] で結んだ route が処理する
+//!   （失敗は VM を止める）。net のホスト側の到着を契機にした受信は #4030。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
 
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
@@ -54,7 +54,7 @@ pub struct MmioHandler {
     interrupt_acks: u64,
     /// ACK の後処理の結果の累計（観測専用。全 vCPU のハンドラが同じ `Arc` を共有する。#4014）。
     ack_tallies: Vec<(DeviceId, Arc<InterruptAckTally>)>,
-    /// `QueueNotify` の virtqueue 処理（#4028）。route の無いデバイスは計数だけで続行する（net は #4029）。
+    /// `QueueNotify` の virtqueue 処理（#4028）。route の無いデバイスは計数だけで続行する（block・net は #4028・#4029 で route を結ぶ）。
     queue_routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
     /// `InterruptACK` を処理したこの vCPU を、その線の SPI の宛先として記録する（WFI の宛先指定の起床。#3948）。無ければ学習しない。
     learner: Option<AckRouteLearner<DeviceId>>,

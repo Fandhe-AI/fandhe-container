@@ -76,8 +76,9 @@
 //! の `Send`（#4024 で導入済み）を使って回収スレッドへ渡す実装そのものが本 issue の範囲外（追跡は #3908）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、全体の追跡は #3908。
+//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の QueueNotify（送信と
+//!   ゲストの kick による受信）も #4029 で結線済み。ホスト側の到着を契機にした受信は #4030、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   全体の追跡は #3908。
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
 //!   [`HvfMicroVm::interrupt_ack_counts`] で読む。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
@@ -113,7 +114,7 @@ use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
 use crate::interrupt::{
     BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
-    InterruptLine, QueueNotifyRoute,
+    InterruptLine, NetQueueNotifyRoute, QueueNotifyRoute,
 };
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
@@ -381,22 +382,28 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
     ///
     /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
     /// clone で受け渡す（`HvfVmParts::release` が停止確認後に取り出すため、解放後の通知は `Internal` で fail-closed）。
-    /// virtio-net の route は #4029 の担当で、それまで net は計数だけで続行する（REPAIR-3）。
+    /// virtio-net の台にも同じ形で route を作る（#4029。送信とゲストの kick による受信まで。ホスト側の到着による受信は #4030。REPAIR-3）。
     fn queue_notify_routes(
         &self,
         memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
     ) -> Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)> {
-        self.block
-            .iter()
-            .map(|d| {
-                let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
-                    Arc::clone(&d.transport),
-                    memory.clone(),
-                    d.line.clone(),
-                ));
-                (d.id, route)
-            })
-            .collect()
+        let b = self.block.iter().map(|d| {
+            let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
+                Arc::clone(&d.transport),
+                memory.clone(),
+                d.line.clone(),
+            ));
+            (d.id, route)
+        });
+        let n = self.net.iter().map(|d| {
+            let route: Arc<dyn QueueNotifyRoute> = Arc::new(NetQueueNotifyRoute::new(
+                Arc::clone(&d.transport),
+                memory.clone(),
+                d.line.clone(),
+            ));
+            (d.id, route)
+        });
+        b.chain(n).collect()
     }
 
     /// 全デバイスの SPI の宛先のヒント（vCPU ごとの `AckRouteLearner` が ACK を処理した vCPU を書く。#3948）。

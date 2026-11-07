@@ -41,7 +41,8 @@
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。ゲスト入力は受信 FIFO あり（#3893）、x86 の IRQ 4 は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! #4025・MVM-1・MVM-5・REPAIR-5: ゲスト RAM を複数スレッドで共有するスロット（`guest_memory_slot`。Linux と macOS aarch64。`unsafe` なし。macOS のゲスト RAM の所有は #4027 で `hvf::microvm` が使う。clone の結線は #4028 で済み）。
-//! #4026・MVM-1・MVM-5: virtio-block の QueueNotify を処理する route（`interrupt::QueueNotifyRoute`・`BlockQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線は #4028 で済み、net は #4029）。
+//! #4026・MVM-1・MVM-5: virtio-block の QueueNotify を処理する route（`interrupt::QueueNotifyRoute`・`BlockQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線は #4028 で済み）。
+//! #4029・MVM-1・MVM-5: virtio-net の QueueNotify を処理する route（`interrupt::NetQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線済み。ホスト側の到着による受信は #4030）。
 //! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
 //! TASK-192.7・#3790・MVM-5・MVM-1: arm64 の Image・initrd・FDT の配置と起動レジスタの値（`boot_arm64`。OS 非依存・`unsafe` なし）。
 //! TASK-192.10・#3793・MVM-5・MVM-1: macOS の MMIO の data abort を `VcpuExit::Mmio` へ写す純関数群（`mmio_abort`。OS 非依存・`unsafe` なし）。
@@ -96,7 +97,7 @@
 //! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
 //!
 //! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
-//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net（#4029）と TIMEOUT 後のゲスト RAM の回収（#4032）は #3908 配下
+//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net の QueueNotify の配線は #4029 で済み（ホスト側の到着による受信は #4030）。TIMEOUT 後のゲスト RAM の回収（#4032）は #3908 配下
 //! - big-endian ゲスト
 
 #![deny(unsafe_code)]

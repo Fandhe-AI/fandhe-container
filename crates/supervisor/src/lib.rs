@@ -41,7 +41,7 @@
 //! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は #2043 で監視スレッドでの直接 launch に再構成（常駐スレッドを止めて launch。止められなければ fail-closed）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で実装） |
 //! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・実機検証〔#538・#539〕は未実装。REPAIR-3） |
-//! | #4074 | TASK-63.3 | 完全版 Attach の世代ごとの入出力（[`attach_io`]。stdin の書き込み端と pty の master を `SignalSlot` の `Active` に世代ごとに保持し、tty の master を捕捉の stdout 1 本として渡す。argv の `--stdin <open\|once>` を core の `LaunchStdinMode::Pipe` へ渡す。kind 9 の attach 入口は C6 #4075。CRI-6・SUP-7・SUP-3・SEC-1） |
+//! | #4074 | TASK-63.3 | 完全版 Attach の世代ごとの入出力（`attach_io`。stdin の書き込み端と pty の master を `SignalSlot` の `Active` に世代ごとに保持し、tty の master を捕捉の stdout 1 本として渡す。argv の `--stdin <open\|once>` を core の `LaunchStdinMode::Pipe` へ渡す。kind 9 の attach 入口は C6 #4075。CRI-6・SUP-7・SUP-3・SEC-1） |
 //! | #1543 | TASK-79 追補 | `logs` でコンテナログの内容を読み出す（[`logs::reader`]。ディレクトリは `<root>/@container-logs`。CLI-1・SUP-7） |
 //! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
 //! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |

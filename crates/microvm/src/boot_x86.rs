@@ -59,7 +59,7 @@
 //! `try_from` だけで行い、計画がすべて通るまでゲストメモリへ書かない。エラーの `message` に値は載せない（ERR-1）。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
+use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRegion};
 
 /// カーネルイメージの長さの上限。
 pub const MAX_KERNEL_IMAGE_BYTES: u64 = 128 << 20;
@@ -483,16 +483,26 @@ pub struct BootPlan {
     /// initrd の GPA と長さ。
     pub initrd: Option<(u64, u64)>,
     /// e820 の表。
-    pub e820: [E820Entry; 3],
+    pub e820: Vec<E820Entry>,
 }
 
-/// ロード先・initrd の位置・e820 を決める。ゲストメモリは GPA 0 から `mem_len` バイトの単一領域。
+/// ロード先・initrd の位置・e820 を決める。`ram` は登録済みの RAM 領域（base の昇順。#3697）。
+///
+/// 先頭の領域は GPA 0 から始まること。カーネル・initrd・boot_params は先頭の領域（low RAM）の中に置き、
+/// e820 は領域の一覧から機械的に作る（先頭の領域は従来の 3 本、2 番目以降は RAM 1 本ずつ）ので、KVM に登録した memslot と一致する。
 pub fn plan_boot(
     header: &SetupHeader,
     payload_len: u64,
     initrd_len: Option<u64>,
-    mem_len: u64,
+    ram: &[GuestMemoryRegion],
 ) -> Result<BootPlan, MicrovmError> {
+    let (first, rest) = ram
+        .split_first()
+        .ok_or_else(|| invalid("guest memory has no region"))?;
+    if first.base != GuestAddress::new(0) {
+        return Err(invalid("guest memory must start at GPA 0"));
+    }
+    let mem_len = first.len;
     if mem_len <= HIMEM_START {
         return Err(invalid("guest memory is too small for a kernel"));
     }
@@ -585,27 +595,35 @@ pub fn plan_boot(
             return Err(first_err.unwrap_or_else(|| invalid("kernel cannot be placed")));
         }
     };
+    let mut e820 = vec![
+        E820Entry {
+            addr: 0,
+            size: LOW_RAM_END,
+            kind: E820_RAM,
+        },
+        E820Entry {
+            addr: MP_TABLE_START,
+            size: MP_TABLE_END - MP_TABLE_START,
+            kind: E820_RESERVED,
+        },
+        E820Entry {
+            addr: HIMEM_START,
+            size: mem_len - HIMEM_START,
+            kind: E820_RAM,
+        },
+    ];
+    for r in rest {
+        e820.push(E820Entry {
+            addr: r.base.raw(),
+            size: r.len,
+            kind: E820_RAM,
+        });
+    }
     Ok(BootPlan {
         load_addr,
         kernel_end,
         initrd,
-        e820: [
-            E820Entry {
-                addr: 0,
-                size: LOW_RAM_END,
-                kind: E820_RAM,
-            },
-            E820Entry {
-                addr: MP_TABLE_START,
-                size: MP_TABLE_END - MP_TABLE_START,
-                kind: E820_RESERVED,
-            },
-            E820Entry {
-                addr: HIMEM_START,
-                size: mem_len - HIMEM_START,
-                kind: E820_RAM,
-            },
-        ],
+        e820,
     })
 }
 
@@ -703,7 +721,7 @@ pub fn load_linux<B: GuestMemoryBacking>(
         &header,
         payload_len,
         initrd.map(|i| i.len() as u64),
-        mem.len(),
+        &mem.regions(),
     )?;
 
     let cmd_bytes = cmdline.as_str().as_bytes();
@@ -958,7 +976,8 @@ pub fn write_boot_tables<B: GuestMemoryBacking>(
     if mem.base() != GuestAddress::new(0) {
         return Err(invalid("guest memory must start at GPA 0"));
     }
-    if mem.len() < BOOT_TABLES_END {
+    // 総バイト数ではなく先頭の領域の長さで見る（hole を挟む構成で緩めない。#3697）。
+    if mem.regions().first().map_or(0, |r| r.len) < BOOT_TABLES_END {
         return Err(invalid("guest memory is too small for the boot tables"));
     }
     let overflow = || invalid("page table size overflows");
@@ -1287,14 +1306,76 @@ mod tests {
         assert_eq!(read(&m, CMDLINE_ADDR, 14), b"console=ttyS0\0".to_vec());
     }
 
+    fn region(base: u64, len: u64) -> GuestMemoryRegion {
+        GuestMemoryRegion {
+            base: GuestAddress::new(base),
+            len,
+        }
+    }
+
+    /// MVM-1・#3697: 2 番目以降の領域が RAM として e820 に並ぶ。先頭が GPA 0 でなければ拒否する。
+    #[test]
+    fn mvm1_3697_plan_e820_includes_high_region() {
+        let h = SetupHeader::parse(&Img::default().build()).unwrap();
+        let ram = [region(0, 0xd000_0000), region(0x1_0000_0000, 0x7000_0000)];
+        let p = plan_boot(&h, 0x1000, None, &ram).unwrap();
+        assert_eq!(
+            p.e820,
+            vec![
+                E820Entry {
+                    addr: 0,
+                    size: 0x9_FC00,
+                    kind: 1
+                },
+                E820Entry {
+                    addr: 0x9_FC00,
+                    size: 0x400,
+                    kind: 2
+                },
+                E820Entry {
+                    addr: 0x10_0000,
+                    size: 0xd000_0000 - 0x10_0000,
+                    kind: 1
+                },
+                E820Entry {
+                    addr: 0x1_0000_0000,
+                    size: 0x7000_0000,
+                    kind: 1
+                },
+            ]
+        );
+        let e = plan_boot(&h, 0x1000, None, &[region(0x1000, 64 * MIB)]).unwrap_err();
+        assert_eq!(e.message(), "guest memory must start at GPA 0");
+    }
+
+    /// MVM-1・#3697: load_linux は領域ごとの e820 を zero page に書く（4 本目の addr・size・type をバイト列で照合）。
+    #[test]
+    fn mvm1_3697_load_linux_writes_e820_for_each_region() {
+        let mut m = GuestMemory::from_regions(vec![
+            (GuestAddress::new(0), HeapBacking::new(64 * MIB).unwrap()),
+            (
+                GuestAddress::new(0x1_0000_0000),
+                HeapBacking::new(MIB).unwrap(),
+            ),
+        ])
+        .unwrap();
+        load_linux(&mut m, &Img::default().build(), None, &cmd("console=ttyS0")).unwrap();
+        let zp = read(&m, ZERO_PAGE_ADDR, ZERO_PAGE_SIZE);
+        assert_eq!(zp[OFF_E820_ENTRIES], 4);
+        let base = OFF_E820_TABLE + 3 * E820_ENTRY_SIZE;
+        assert_eq!(&zp[base..base + 8], &0x1_0000_0000u64.to_le_bytes());
+        assert_eq!(&zp[base + 8..base + 16], &(MIB).to_le_bytes());
+        assert_eq!(&zp[base + 16..base + 20], &1u32.to_le_bytes());
+    }
+
     /// MVM-1・#3888: plan_boot の e820 は RAM・予約（MP テーブル）・RAM の具体値。
     #[test]
     fn mvm1_3888_plan_e820_values() {
         let h = SetupHeader::parse(&Img::default().build()).unwrap();
-        let p = plan_boot(&h, 0x1000, None, 64 * MIB).unwrap();
+        let p = plan_boot(&h, 0x1000, None, &[region(0, 64 * MIB)]).unwrap();
         assert_eq!(
             p.e820,
-            [
+            vec![
                 E820Entry {
                     addr: 0,
                     size: 0x9_FC00,

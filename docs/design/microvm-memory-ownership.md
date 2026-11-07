@@ -68,7 +68,7 @@ virtqueue 処理（#878・#880）はディスクリプタのゲスト物理ア�
 
 ## 実装の担い手
 
-アクセス型を担当する issue が無かったため、TASK-74.2.2（#878）で最小限を実装した（`crates/microvm/src/guest_memory.rs`。単一領域・heap backing・コピー API・unsafe なし）。mmap backing と KVM への登録は引き続き #696（TASK-75.1）。複数領域は再評価条件に従う。
+アクセス型を担当する issue が無かったため、TASK-74.2.2（#878）で最小限を実装した（`crates/microvm/src/guest_memory.rs`。単一領域・heap backing・コピー API・unsafe なし）。mmap backing と KVM への登録は引き続き #696（TASK-75.1）。複数領域は #3697 で実装した（本書末尾の記録）。
 
 ## /dev/kvm を要する試験の分離
 
@@ -90,7 +90,7 @@ backing（匿名 mmap・`KVM_SET_USER_MEMORY_REGION` 登録・munmap と Drop �
 - 寿命: `RegisteredGuestRam` は VM fd を dup して持つ（`'vm` の借用を持たない。後続の VM 構成体 #697 が自己参照にならないため）。drop は slot を削除してから munmap し、削除に失敗したら mapping を漏らす（fail-closed）
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る。性能（ブロック I/O のバッチ化）は後続の課題
 - 置き換えなかったもの: #882 の自己診断用 `GuestPage` / `RegisteredPage` と `probe_*` は残している（置き換えは任意の後続作業）
-- 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会・hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`
+- 範囲外: 複数領域・`KVM_CAP_NR_MEMSLOTS` の照会（どちらも #3697 で実装済み。本書末尾の記録）・hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`
 
 ## TASK-192.4（#3787）での macOS の実装記録
 
@@ -101,3 +101,17 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る
 - IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は macOS 27.2・Apple M4 Max の実機の既定と一致し、最大は 40 ビットだった（#3997。他の機種・版は未確認）
 - 範囲外: 複数領域・`hv_vm_protect` の利用・`Send` / `Sync`（#3797・#3798）・解除失敗の構造化ログ
+
+## #3697 での複数領域の実装記録（MVM-1・TASK-75.1 追補）
+
+再評価条件の「複数領域（MMIO hole など）の扱いで API を変える必要が出たとき」に当たったため、アクセス型を複数領域に広げた。決め事は次のとおり。
+
+- 領域の持ち方: `GuestMemory<B>` は同じ backing 型 `B` の領域の `Vec`（base の昇順・非重複・1 件以上 `MAX_GUEST_MEMORY_REGIONS` = 8 件以下）を持つ。`GuestMemory::new` は従来どおり 1 領域のコンストラクタで、複数領域は `from_regions`。0 件・件数超過・長さ 0・未ソート・重なり・桁あふれは `InvalidArgument`。隣接は登録できるが、またぐアクセスはできない
+- アクセスの変換: GPA は `partition_point` で領域を探し、領域内の offset を checked 演算で求める。hole の中・どの領域よりも下・領域の終端をまたぐ範囲（隣接していても）は `"guest memory access out of range"`（ゲストが決める非信頼入力。別々の mapping をまたいで読み書きしない）
+- 公開 API の変更（呼び出し元は crate 内だけ）: `GuestMemory::check_range` は offset を返さず `Result<(), _>` になった。`len()` は全領域の総バイト数、`base()` は最も低い領域の base。`regions()` が領域の記述子（`GuestMemoryRegion`）を返す。`boot_x86::plan_boot` は最後の引数が `mem_len` から領域の一覧になり、`BootPlan::e820` は `Vec` になった
+- x86_64 の配置: `mem_size` のうち `X86_LOW_RAM_LIMIT`（= `VIRTIO_MMIO_BASE` = 0xd000_0000）までを GPA 0 から、超えた分を `X86_HIGH_RAM_BASE`（4 GiB）から置く。RAM は MMIO hole `[0xd000_0000, 4 GiB)`（virtio-mmio・IOAPIC・LAPIC・identity map・TSS）に入らない。RAM と MMIO の窓の重なりは `check_occupied_disjoint` が ioctl の前に拒否する（以前は `mem_size <= VIRTIO_MMIO_BASE` で暗に保証していた）。総量の上限は `MAX_GUEST_RAM_BYTES`（16 GiB）のまま
+- 登録: 領域 i を slot i の別の memslot で登録する（`register_ram_regions`）。`KVM_CHECK_EXTENSION(KVM_CAP_NR_MEMSLOTS)`（`VmFd::max_user_memslots`。x86_64 は 32764）を mmap の前に照会し、足りなければ `ResourceExhausted`、照会できない・0 以下なら `FailedPrecondition`（fail-closed）。途中で失敗したときは登録済みの領域が drop され、slot の削除と munmap が済む（削除に失敗した領域は従来どおり漏らす）。aarch64 の RAM は hole が無いため 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域のまま
+- e820 との一致: 先頭の領域（GPA 0 から）が従来の 3 本（RAM・MP テーブルの予約・RAM）、2 番目以降が RAM 1 本ずつ。カーネル・initrd・boot_params・SIPI のページは先頭の領域の中にだけ置く。`check_loaded_within` と SIPI の範囲検査は総バイト数ではなく先頭の領域の長さで行い、hole を挟んでも SEC-1 の検査を緩めない
+- 挙動の変化: x86_64 で 3.25 GiB（`VIRTIO_MMIO_BASE`）を超える `mem_size` が受理されるようになった（以前は拒否）
+- 範囲外（REPAIR-3）: hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`（必要になった時点で別に扱う）。ゲストの物理アドレス幅（CPUID leaf 0x8000_0008）と最上位 GPA（最大 0x4_3000_0000）の照合。e820 での IOAPIC / LAPIC / MMIO hole の予約表記。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域
+- 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）

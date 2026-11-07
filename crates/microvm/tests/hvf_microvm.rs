@@ -601,3 +601,96 @@ fn mvm5_4028_block_queue_notify_ring_error_stops_vm() {
 
     drop(create_vm_or_precondition());
 }
+/// 読み出しの途中で止まる block backend（vCPU スレッドを `read_at` の中に留め、`stop` を期限切れにするため）。
+/// 入ったことを `entered` で知らせ、`gate` に値が来る（または送り手が落ちる）まで戻らない。
+struct StallingBlock {
+    inner: MemoryBlockBackend,
+    entered: std::sync::mpsc::Sender<()>,
+    gate: std::sync::mpsc::Receiver<()>,
+}
+
+type BlockResult<T> = Result<T, fandhe_container_microvm::error::MicrovmError>;
+
+impl BlockBackend for StallingBlock {
+    fn capacity_bytes(&self) -> u64 {
+        self.inner.capacity_bytes()
+    }
+    fn read_only(&self) -> bool {
+        self.inner.read_only()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> BlockResult<()> {
+        let _ = self.entered.send(());
+        let _ = self.gate.recv();
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> BlockResult<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn flush(&mut self) -> BlockResult<()> {
+        self.inner.flush()
+    }
+}
+
+/// MVM-5・MVM-1・REPAIR-5・REPAIR-12・#4032: 本番の vCPU スレッドが `read_at` で止まり `stop` が期限切れになっても、
+/// スレッドが終わるまで RAM と VM は保持され（同じプロセスで VM を作り直せない）、終わった後は unmap と VM の占有解除まで進んで
+/// 作り直せる。デバイスの解放を確かめたうえでの回収（devices → RAM → VM）の配線を、偽の資源ではなく実機の vCPU 経路で見る。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn mvm5_4032_timeout_detached_vcpu_thread_reclaims_ram_and_vm() {
+    let _wd = Watchdog::start(DEADLINE);
+    let layout = block_read_layout();
+    require_vm_with_gic(&layout);
+    let seq = Arc::new(ExitSeq::default());
+    let kernel_gpa = layout.ram.base.raw() + 0x8_0000;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+    let mut inner = MemoryBlockBackend::new(512 * 1024, false).unwrap();
+    inner.write_at(0, &sector0_pattern()).unwrap();
+    let cfg: HvfMicroVmConfig<StallingBlock, MemoryNetBackend> = HvfMicroVmConfig {
+        vcpus: layout.vcpus,
+        layout,
+        kernel: block_read_image(kernel_gpa, 0),
+        initrd: None,
+        cmdline: "console=ttyS0".to_string(),
+        block: vec![StallingBlock {
+            inner,
+            entered: entered_tx,
+            gate: gate_rx,
+        }],
+        net: Vec::new(),
+        vcpu: VcpuThreadConfig {
+            observer: Some(seq),
+            ..Default::default()
+        },
+        serial: true,
+    };
+    let vm = HvfMicroVm::assemble(cfg).unwrap();
+    let running = vm.start().unwrap();
+    entered_rx
+        .recv_timeout(FINISH_WAIT)
+        .expect("hvf_microvm: guest did not reach the stalling read");
+    let e = running.stop(Duration::from_millis(200)).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+    // スレッドは read_at の中。RAM と VM は保持されたままで、作り直せない。
+    let e = HvVm::create().expect_err("vm must still be held");
+    assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+    // スレッドを解放して終わらせる。終了後に unmap と VM の破棄まで進み、同じプロセスで作り直せる。
+    drop(gate_tx);
+    let start = Instant::now();
+    loop {
+        match HvVm::create() {
+            Ok(vm) => {
+                drop(vm);
+                break;
+            }
+            Err(e) if e.code() == MicrovmErrorCode::FailedPrecondition => {
+                assert!(
+                    start.elapsed() < FINISH_WAIT,
+                    "hvf_microvm: detached vcpu thread did not reclaim the vm"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("hvf_microvm: vm: {e}"),
+        }
+    }
+}

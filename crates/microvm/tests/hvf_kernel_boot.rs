@@ -45,7 +45,7 @@
 //!   これらを fail-closed で `Failed(..)` にする。`Failed(..)` は device model 側の問題であり、試験の欠陥ではない。
 //! - 実カーネルでの I-cache の clean の要否は未確認（`hvf/microvm.rs` の範囲外の項目・#3988）。起動できないときの切り分け先。
 //! - 内側の期限で panic すると起動スレッドが残り、同じプロセスの次の試験は VM の作成で `FailedPrecondition` になりうる。
-//!   `stop` の期限切れでは RAM がリークして同じプロセスで作り直せない。いずれも先に出た失敗を原因として読む。
+//!   `stop` の期限切れでは、切り離した vCPU スレッドが終わるまで RAM と VM が残り同じプロセスで作り直せない（終了後は回収される。#4032）。いずれも先に出た失敗を原因として読む。
 //! - 2 台の reboot では `smp_send_stop` が AP の停止を最大約 1 秒待つ。2 台で止まったときの `Failed(..)` も device model 側の
 //!   別 issue で、試験を緩めない（#3998）。
 //! - `guest/kernel/arm64-guest.config` は Virtualization.framework 用で `SERIAL_8250` などが無く、本試験の Image には使えない。

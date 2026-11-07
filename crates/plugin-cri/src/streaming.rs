@@ -123,19 +123,30 @@ pub async fn bind_production_streaming(
         })
 }
 
+/// drop されたときも `on_stop` を必ず 1 回呼ぶガード（future の取消・serve のエラーでも helper を残さない。REPAIR-5・#3761）。
+struct StopGuard<G: FnOnce()>(Option<G>);
+
+impl<G: FnOnce()> Drop for StopGuard<G> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 /// `shutdown` の完了で `server` の待ち受けを閉じ、`on_stop`（exec の追跡中 helper の kill 等）を呼ぶ future。
 /// `serve_with_audit` の shutdown future として渡す。
 ///
-/// future ごと drop されたときも `StreamingServer::drop` が閉じる。
+/// future ごと drop されたときも `StreamingServer::drop` が閉じ、`on_stop` も drop ガードで呼ばれる。
 pub async fn stop_streaming_on<F: Future<Output = ()>>(
     server: StreamingServer,
     on_stop: impl FnOnce(),
     shutdown: F,
 ) {
+    // 追跡中の exec helper を kill する（長寿命のセッションを残さない）。完了・drop のどちらでも走る。
+    let _guard = StopGuard(Some(on_stop));
     shutdown.await;
     server.shutdown();
-    // 追跡中の exec helper を kill する（長寿命のセッションを残さない。REPAIR-5・#3761）。
-    on_stop();
 }
 
 #[cfg(test)]
@@ -330,6 +341,32 @@ mod tests {
             e.message(),
             "port-forward for pod network is not implemented"
         );
+    }
+
+    /// REPAIR-5・#3761: shutdown 未完了のまま future が drop されても `on_stop` が 1 回呼ばれる。
+    #[tokio::test]
+    async fn repair5_3761_on_stop_runs_when_future_is_dropped() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let task = tokio::spawn(stop_streaming_on(
+            server,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+            std::future::pending::<()>(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

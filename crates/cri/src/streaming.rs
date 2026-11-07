@@ -603,7 +603,8 @@ impl StreamingUrlIssuer {
         }
         if !self.wiring.exec_relative_command()
             && let Some(first) = cmd.first()
-            && !std::path::Path::new(first).is_absolute()
+            // コンテナ内のパスはホスト OS に依らない Unix 意味論なので、先頭が '/' かで判定する（Windows の `Path::is_absolute` は使わない）。
+            && !first.starts_with('/')
         {
             return Err(CriError::invalid_argument(
                 "exec command must be an absolute path",

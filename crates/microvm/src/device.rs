@@ -20,7 +20,8 @@
 //! #3918（MVM-1）で x86_64 の COM1（IRQ 4）の level 線 `VmFd::register_irq_line`（`KVM_IRQ_LINE`）を足した。
 //! #3943（MVM-1）で aarch64 のシリアルの SPI（INTID 33）も同じ `KVM_IRQ_LINE` の level 線にした（`VmFd::register_spi_line`。vGIC の `init()` の後）。
 //! #3696（MVM-1）で aarch64 の vGICv3（`KVM_CREATE_DEVICE`。`VgicV3`）と起動レジスタ（`KVM_SET_ONE_REG`。`VcpuFd::set_arm64_boot_state`）を足した。
-//! resamplefd による level の再注入・eventfd を待つ常駐ループは未実装（TASK-75。REPAIR-3）。
+//! resamplefd による level の再注入は未実装（TASK-75。REPAIR-3）。#3698 で [`IoEventFd`] を VM fd の dup を所有する型にし、
+//! `microvm::MicroVm::assemble` が各 virtio デバイスのキューへ結び、`start` が eventfd を期限つきの `poll(2)` で待つ通知スレッドを起動する。
 //! TASK-75.3.2（#885）で x86_64 の起動時のレジスタ初期化 [`VcpuFd::set_boot_state`]（long mode・RIP = カーネルのエントリ・RSI = boot_params）と
 //! 観測用の `VcpuFd::regs`（x86_64 のみ）を足した（CPUID は #3733 の [`VcpuFd::set_cpuid`]。LAPIC の LINT は #3735。REPAIR-3）。#3734 で起動用の `VcpuFd::set_msrs`・`VcpuFd::set_fpu` と観測用の `VcpuFd::msrs`・`VcpuFd::fpu`（いずれも x86_64 のみ） を足した。
 //! #3735（MVM-1）で BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI を設定する `VcpuFd::set_boot_lints` と観測用の `VcpuFd::lapic_lints`（x86_64 のみ） を足した。
@@ -1343,6 +1344,22 @@ fn classify_vcpu_error(stage: VcpuStage, e: SysError) -> MicrovmError {
     }
 }
 
+/// VM fd の dup の失敗を分類する（irqfd・irq line・ioeventfd 共通。#3698）。`EMFILE` / `ENFILE` は `ResourceExhausted`、
+/// それ以外は `Internal`。メッセージは固定語彙の用途名と errno だけ。
+fn classify_dup_vm_fd_error(what: &str, n: i32) -> MicrovmError {
+    if n == EMFILE || n == ENFILE {
+        MicrovmError::new(
+            MicrovmErrorCode::ResourceExhausted,
+            format!("resource exhausted duplicating VM fd for {what} (os error {n})"),
+        )
+    } else {
+        MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            format!("duplicating VM fd for {what} failed (os error {n})"),
+        )
+    }
+}
+
 /// 割り込み通知の設定の段（errno 分類のメッセージ切り替え用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IrqStage {
@@ -1634,20 +1651,7 @@ impl VmFd {
     pub fn register_irqfd(&self, gsi: u32) -> Result<IrqFd, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IRQFD, "KVM_CAP_IRQFD")?;
         // 順序は dup → eventfd 作成 → KVM_IRQFD（dup に失敗しても何も漏らさない。TASK-75.2）。
-        let vm_fd = self.fd.as_fd().try_clone_to_owned().map_err(|e| {
-            let n = e.raw_os_error().unwrap_or(0);
-            if n == EMFILE || n == ENFILE {
-                MicrovmError::new(
-                    MicrovmErrorCode::ResourceExhausted,
-                    format!("resource exhausted duplicating VM fd for irqfd (os error {n})"),
-                )
-            } else {
-                MicrovmError::new(
-                    MicrovmErrorCode::Internal,
-                    format!("duplicating VM fd for irqfd failed (os error {n})"),
-                )
-            }
-        })?;
+        let vm_fd = self.dup_vm_fd("irqfd")?;
         let event = EventFd::new()?;
         sys::kvm_irqfd(self.fd.as_fd(), event.as_fd(), gsi, false)
             .map_err(|e| classify_irq_error(IrqStage::Irqfd, e))?;
@@ -1663,20 +1667,7 @@ impl VmFd {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn register_irq_line(&self, irq: u32) -> Result<IrqLevelLine, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP")?;
-        let vm_fd = self.fd.as_fd().try_clone_to_owned().map_err(|e| {
-            let n = e.raw_os_error().unwrap_or(0);
-            if n == EMFILE || n == ENFILE {
-                MicrovmError::new(
-                    MicrovmErrorCode::ResourceExhausted,
-                    format!("resource exhausted duplicating VM fd for irq line (os error {n})"),
-                )
-            } else {
-                MicrovmError::new(
-                    MicrovmErrorCode::Internal,
-                    format!("duplicating VM fd for irq line failed (os error {n})"),
-                )
-            }
-        })?;
+        let vm_fd = self.dup_vm_fd("irq line")?;
         sys::kvm_irq_line(self.fd.as_fd(), irq, false)
             .map_err(|e| classify_irq_error(IrqStage::IrqLine, e))?;
         Ok(IrqLevelLine::new(vm_fd, irq))
@@ -1693,11 +1684,23 @@ impl VmFd {
         self.register_irq_line(irq.raw())
     }
 
+    /// VM fd を dup して所有型を作る（irqfd・irq line・ioeventfd が持つ）。`what` は失敗メッセージの用途名（固定語彙）。
+    /// `EMFILE` / `ENFILE` は `ResourceExhausted`、それ以外は `Internal`（値は errno のみ載せる）。
+    fn dup_vm_fd(&self, what: &str) -> Result<OwnedFd, MicrovmError> {
+        self.fd
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| classify_dup_vm_fd_error(what, e.raw_os_error().unwrap_or(0)))
+    }
+
     /// ゲストの `spec` への書き込みを VM exit なしで eventfd へ通す（`KVM_IOEVENTFD`）。
     ///
     /// 条件に合わない書き込みは従来どおり MMIO / PIO exit で `dispatch` に届く。同じ組の二重登録は `AlreadyExists`。
-    pub fn register_ioeventfd(&self, spec: IoEventSpec) -> Result<IoEventFd<'_>, MicrovmError> {
+    /// `KVM_CAP_IOEVENTFD` が無いホストは `FailedPrecondition`（fail-closed。MMIO exit への自動フォールバックはしない。#3698）。
+    /// 返った [`IoEventFd`] は VM fd の dup を所有する（順序は [`VmFd::register_irqfd`] と同じ。dup → eventfd 作成 → `KVM_IOEVENTFD`）。
+    pub fn register_ioeventfd(&self, spec: IoEventSpec) -> Result<IoEventFd, MicrovmError> {
         self.require_extension(sys::consts::KVM_CAP_IOEVENTFD, "KVM_CAP_IOEVENTFD")?;
+        let vm_fd = self.dup_vm_fd("ioeventfd")?;
         let event = EventFd::new()?;
         let (addr, pio) = irq::ioevent_args(&spec);
         sys::kvm_ioeventfd(
@@ -1710,7 +1713,7 @@ impl VmFd {
             false,
         )
         .map_err(|e| classify_irq_error(IrqStage::Ioeventfd, e))?;
-        Ok(IoEventFd::registered(self.fd.as_fd(), event, spec))
+        Ok(IoEventFd::registered(vm_fd, event, spec))
     }
 
     /// `KVM_CREATE_VCPU` で vCPU を作る（aarch64 は続けて初期化する。モジュール doc 参照）。
@@ -3168,6 +3171,29 @@ mod tests {
         assert_eq!(
             vm.register_ioeventfd(spec).unwrap_err().code(),
             MicrovmErrorCode::FailedPrecondition
+        );
+    }
+
+    /// MVM-1・REPAIR-5・#3698: VM fd の dup の失敗は EMFILE / ENFILE だけ `ResourceExhausted`、他は `Internal`
+    /// （irqfd・irq line・ioeventfd 共通。用途名と errno 以外を message に載せない）。
+    #[test]
+    fn mvm1_3698_dup_vm_fd_error_classification() {
+        for what in ["irqfd", "irq line", "ioeventfd"] {
+            for (n, code) in [
+                (EMFILE, MicrovmErrorCode::ResourceExhausted),
+                (ENFILE, MicrovmErrorCode::ResourceExhausted),
+                (9, MicrovmErrorCode::Internal),
+                (0, MicrovmErrorCode::Internal),
+            ] {
+                let e = classify_dup_vm_fd_error(what, n);
+                assert_eq!(e.code(), code, "{what} errno {n}");
+                assert!(e.message().contains(what), "{what} errno {n}");
+                assert!(e.message().contains(&format!("os error {n}")));
+            }
+        }
+        assert_eq!(
+            classify_dup_vm_fd_error("ioeventfd", EMFILE).message(),
+            "resource exhausted duplicating VM fd for ioeventfd (os error 24)"
         );
     }
 

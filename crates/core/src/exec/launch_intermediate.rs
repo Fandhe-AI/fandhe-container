@@ -99,6 +99,7 @@ use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
 };
+use super::pty::{ExecPtyReceiver, ExecPtySender, PtyMaster, PtyReceipt};
 use super::seccomp_listener::{
     ListenerReceiveFailure, ListenerSender, SeccompListener, listener_socketpair,
     receive_listener_or_closed,
@@ -440,6 +441,8 @@ struct RealIntermediateOps<'a> {
     netns_end: Option<&'a OwnedFd>,
     /// 同期点で子が渡す fd の組(Attachable は netns と user namespace の 2 本。NET-9・#1939)。
     netns_handover: NetnsHandover,
+    /// init の pty の master を C へ渡す socketpair の子の端(端末つき起動だけ `Some`。PID 1 は複製を使う。CRI-6・#4070)。
+    pty_end: Option<&'a OwnedFd>,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -465,7 +468,7 @@ impl IntermediateOps for RealIntermediateOps<'_> {
     }
 
     fn spawn_pid1(&mut self) -> Result<u32, ExecError> {
-        let (Some(stages), Some(stdio)) = (self.stages.take(), self.stdio.take()) else {
+        let (Some(stages), Some(mut stdio)) = (self.stages.take(), self.stdio.take()) else {
             return Err(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Spawn,
@@ -491,6 +494,14 @@ impl IntermediateOps for RealIntermediateOps<'_> {
                 })
             })
             .transpose()?;
+        // 端末つき起動の master の送信口。複製できなければ PID 1 を作らずに失敗させる(master 無しで走らせない。
+        // fail-closed。CRI-6・SEC-1・#4070)。PID 1 の終端(`run_child`)が pivot 後に pty を割り当てて送る。
+        if let Some(end) = self.pty_end {
+            let end = end.try_clone().map_err(|e| {
+                ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the pty socket")
+            })?;
+            stdio = stdio.with_pty_launch(ExecPtySender::new(end));
+        }
         let gate_r = self.gate_r;
         let report_fd = self.report.as_raw_fd();
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
@@ -564,6 +575,9 @@ pub(crate) struct IntermediateSpec<'a> {
     /// 同期点の中で呼ぶ呼び出し側の準備処理(`Attachable` の起動だけ `Some`。他は `None`。欠落は launch の入口が fork の前に
     /// 拒否する。NET-9・CORE-6・#1939)。
     pub(crate) netns_attach: Option<&'a dyn NetnsAttachHook>,
+    /// 真なら PID 1 がコンテナの devpts から pty を割り当て、slave を fd 0〜2 と制御端末にし、master を C へ返す
+    /// (`process.terminal: true` の起動。launcher が opt-in 済みのときだけ真。CRI-6・SEC-1・CORE-5・#4070)。
+    pub(crate) terminal: bool,
 }
 
 /// 中間プロセス経由でコンテナの PID 1 を起動する(本番 launcher の唯一の起動入口。#1816)。
@@ -603,6 +617,7 @@ pub(crate) fn spawn_container_via_intermediate(
         setup,
         netns_sync,
         netns_attach,
+        terminal,
     } = spec;
     let tag = LaunchTag::fresh();
     let netns_handover = netns_sync.map_or(NetnsHandover::NetOnly, |r| r.handover);
@@ -651,7 +666,7 @@ pub(crate) fn spawn_container_via_intermediate(
     let expected_mounts = stages.mount_rule_positions();
     launch_via_intermediate(
         sys::self_is_single_threaded,
-        |status, report, gate_r, listener_end, netns_end| {
+        |status, report, gate_r, listener_end, netns_end, pty_end| {
             let mut ops = RealIntermediateOps {
                 plan,
                 join,
@@ -666,11 +681,13 @@ pub(crate) fn spawn_container_via_intermediate(
                 listener_end,
                 netns_end,
                 netns_handover,
+                pty_end,
             };
             intermediate_body(&mut ops)
         },
         Some(&expected_mounts),
         netns,
+        terminal,
         subreaper,
         audit,
         timeout,
@@ -703,6 +720,9 @@ pub(crate) struct LaunchedChild {
     /// 計算した期待列と完全一致を確認済み）。launcher が分離の記録へ添える（SEC-1・SEC-4・#3201）。受け渡し無しの
     /// 試験用経路は空。
     pub(crate) mount_identities: Vec<(usize, RecordedMountIdentity)>,
+    /// 端末つき起動(`IntermediateSpec::terminal`)で PID 1 から受け取り検証した pty の master(CRI-6・SEC-1・#4070)。
+    /// 端末を要求した起動では必ず `Some`(受け取れなければ起動失敗)。要求しない起動は `None`。
+    pub(crate) pty_master: Option<PtyMaster>,
 }
 
 /// [`spawn_container_via_intermediate`] の本体。中間プロセスの動作(`intermediate`)と fork 前のスレッド数判定を
@@ -731,9 +751,11 @@ fn launch_via_intermediate(
         &std::fs::File,
         &OwnedFd,
         Option<&OwnedFd>,
+        Option<&OwnedFd>,
     ) -> i32,
     listener_handoff: Option<&[usize]>,
     netns: Option<NetnsCheck<'_>>,
+    terminal: bool,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
@@ -763,8 +785,18 @@ fn launch_via_intermediate(
         Some((parent, child)) => (Some(parent), Some(child)),
         None => (None, None),
     };
+    // init の pty の master の受け渡し(CRI-6・#4070)。端末を要求した起動だけ作る。C の端は `SO_PASSCRED` 設定済み。
+    let pty_pair = terminal
+        .then(|| listener_socketpair().map_err(not_started))
+        .transpose()?;
+    let (pty_parent, pty_child) = match pty_pair {
+        Some((parent, child)) => (Some(parent), Some(child)),
+        None => (None, None),
+    };
     let (status_ref, report_ref) = (&status_w, &report_w);
     let (gate_r_ref, child_end_ref, netns_child_ref) = (&gate_r, &child_end, netns_child.as_ref());
+    let pty_child_ref = pty_child.as_ref();
+    let pty_parent_fd = pty_parent.as_ref().map(|f| f.as_raw_fd());
     let netns_parent_fd = netns_parent.as_ref().map(|f| f.as_raw_fd());
     let (gate_w_fd, report_r_fd, status_r_fd, parent_end_fd) = (
         gate_w.as_raw_fd(),
@@ -792,12 +824,19 @@ fn launch_via_intermediate(
             {
                 return EXIT_SETUP_FAILED;
             }
+            // pty の C の端も閉じる(PID 1 へ継承されると、C の死を PID 1 が検出できず、PID 1 が自分宛てに送れてしまう)。
+            if let Some(fd) = pty_parent_fd
+                && close_inherited(fd).is_err()
+            {
+                return EXIT_SETUP_FAILED;
+            }
             intermediate(
                 status_ref,
                 report_ref,
                 gate_r_ref,
                 child_end_ref,
                 netns_child_ref,
+                pty_child_ref,
             )
         },
         EXIT_SETUP_FAILED,
@@ -812,6 +851,7 @@ fn launch_via_intermediate(
     // 子の端を C が持ち続けると、PID 1 が送る前に死んでも EOF を観測できない。
     drop(child_end);
     drop(netns_child);
+    drop(pty_child);
     let intermediate_child = ContainerChild::spawned(intermediate_pid);
 
     let report = read_line_bounded::<REPORT_MAX_BYTES>(&report_r, remaining())
@@ -935,6 +975,7 @@ fn launch_via_intermediate(
             child,
             listener: None,
             mount_identities: Vec::new(),
+            pty_master: None,
         }),
         Ok(()) => match receive_listener_or_closed(parent_end.as_fd(), pid1.get(), deadline) {
             // listener を受け取って ACK を返した後に、PID 1 が書く exec 前の 2 行目(`R`/`E`)を読む(SEC-4・#2624)。
@@ -943,11 +984,42 @@ fn launch_via_intermediate(
             Ok(listener) => {
                 let exec_phase = read_exec_phase_until_close(&status_r, remaining());
                 match resolve_exec_phase_status(exec_phase, audit) {
-                    Ok(()) => Ok(LaunchedChild {
-                        child,
-                        listener: Some(listener),
-                        mount_identities,
-                    }),
+                    Ok(()) => {
+                        // master の受信は exec 前の 2 行目の判定の **後**(CRI-6・SEC-1・#4070)。PID 1 は `R` を書く前に
+                        // master を送り(`SOCK_SEQPACKET` の送信は ACK を待たず buffer に積まれる)、`R` が読めた時点で
+                        // master は届いている。先に受信すると、pty の前で失敗した PID 1 の `E` 行(監査の対象)を
+                        // `SenderClosed` の失敗で隠してしまう。受信できなければ master 無しで走らせず起動失敗にする。
+                        let pty_master = match pty_parent {
+                            None => None,
+                            Some(end) => {
+                                match ExecPtyReceiver::new(end).receive(&child, deadline) {
+                                    PtyReceipt::Received(master) => Some(master),
+                                    PtyReceipt::SenderClosed => {
+                                        return Err(kill_pid1_failure(
+                                            child,
+                                            AuditedRejection::not_applicable(ExecError::new(
+                                                ErrorCode::FailedPrecondition,
+                                                IsolationStage::Spawn,
+                                                "the container init did not deliver the pty master",
+                                            )),
+                                        ));
+                                    }
+                                    PtyReceipt::Rejected(e) | PtyReceipt::TimedOut(e) => {
+                                        return Err(kill_pid1_failure(
+                                            child,
+                                            AuditedRejection::not_applicable(e),
+                                        ));
+                                    }
+                                }
+                            }
+                        };
+                        Ok(LaunchedChild {
+                            child,
+                            listener: Some(listener),
+                            mount_identities,
+                            pty_master,
+                        })
+                    }
                     Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
                 }
             }
@@ -1971,7 +2043,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, _listener_end, _netns_end| {
+            |status, report, gate_r, _listener_end, _netns_end, _pty_end| {
                 match behavior {
                     Behavior::Ready => {
                         let pid1 = fork_stand_in(status, &pid_write, |s| {
@@ -2070,6 +2142,7 @@ mod tests {
             },
             None,
             None,
+            false,
             &subreaper,
             audit,
             timeout,
@@ -2124,6 +2197,25 @@ mod tests {
         MountIdentitiesGood,
         /// 上と同じだが、2 本目のルール位置が期待(3)と食い違う 4 を書く(`Malformed`。listener は受け取らない)。
         MountIdentitiesWrongRule,
+        /// 端末つき起動: listener を送って ACK を待ち、pty の master（試験用にホストの devpts で作ったもの）を pty の端へ
+        /// 送ってから `R` を書く（PID 1 の終端と同じ順。CRI-6・SEC-1・#4070）。
+        PtyGood,
+        /// 端末つき起動: master の代わりに master でない fd（`/dev/null`）を送り、`R` を書く（種別の不一致）。
+        PtyNonMaster,
+        /// 端末つき起動: 何も送らずに `R` を書いて終了する（master 無しで走らせない）。
+        PtyNeverSends,
+        /// 端末つき起動: master を送らず exec 前の `E pty ...` を書く（pty の前の失敗の監査が先に判定される）。
+        PtyFailure,
+    }
+
+    impl Handoff {
+        /// 端末つき起動を要求する動作か。
+        fn terminal(self) -> bool {
+            matches!(
+                self,
+                Self::PtyGood | Self::PtyNonMaster | Self::PtyNeverSends | Self::PtyFailure
+            )
+        }
     }
 
     /// `MountIdentitiesGood` が書く識別子(位置 1・3)。
@@ -2178,8 +2270,9 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, listener_end, _netns_end| {
+            |status, report, gate_r, listener_end, _netns_end, pty_end| {
                 let end = listener_end.try_clone().expect("dup");
+                let pty_end = pty_end.map(|e| e.try_clone().expect("dup"));
                 let pid1 = fork_stand_in(status, &pid_write, move |s| {
                     if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
                         return EXIT_SETUP_FAILED;
@@ -2201,6 +2294,58 @@ mod tests {
                     }
                     let sender = ListenerSender::new(end);
                     match mode {
+                        Handoff::PtyGood
+                        | Handoff::PtyNonMaster
+                        | Handoff::PtyNeverSends
+                        | Handoff::PtyFailure => {
+                            if sender
+                                .hand_over(child_listener(), Duration::from_secs(10))
+                                .is_err()
+                            {
+                                return 3;
+                            }
+                            let Some(pty_end) = pty_end else {
+                                return 4;
+                            };
+                            match mode {
+                                Handoff::PtyGood => {
+                                    let (master, _slave) = crate::exec::open_host_pty_for_test(
+                                        crate::exec::WindowSize::new(0, 0),
+                                    )
+                                    .expect("host pty");
+                                    if ExecPtySender::new(pty_end).hand_over(master).is_err() {
+                                        return 5;
+                                    }
+                                    let _ = report_exec_ready(s);
+                                }
+                                Handoff::PtyNonMaster => {
+                                    let null = std::fs::File::open("/dev/null").expect("null");
+                                    let _ = sys::seccomp_notify::send_fd_with_token(
+                                        pty_end.as_fd(),
+                                        b'P',
+                                        null.as_fd(),
+                                    );
+                                    let _ = report_exec_ready(s);
+                                }
+                                Handoff::PtyNeverSends => {
+                                    drop(pty_end);
+                                    let _ = report_exec_ready(s);
+                                }
+                                _ => {
+                                    drop(pty_end);
+                                    let _ = report_exec_failure(
+                                        s,
+                                        ExecPhaseStep::Pty,
+                                        &ExecError::new(
+                                            ErrorCode::FailedPrecondition,
+                                            IsolationStage::Exec,
+                                            "pty",
+                                        ),
+                                    );
+                                }
+                            }
+                            0
+                        }
                         Handoff::Good
                         | Handoff::MountIdentitiesGood
                         | Handoff::MountIdentitiesWrongRule => {
@@ -2339,6 +2484,7 @@ mod tests {
                 _ => &[],
             }),
             None,
+            mode.terminal(),
             &subreaper,
             audit,
             timeout,
@@ -2650,6 +2796,71 @@ mod tests {
         assert_eq!(
             failure.rejection.error.message,
             "the listener message came from an unexpected process"
+        );
+        assert!(gone(pid1));
+    }
+
+    /// CRI-6・SEC-1・#4070: 端末つき起動で PID 1 が送った pty の master を C が検証して受け取り、`R` の判定の後に
+    /// `LaunchedChild::pty_master` へ載せる。
+    #[test]
+    fn sec1_4070_launch_receives_a_verified_pty_master() {
+        let _serial = serialize_forks();
+        let (result, _, _) = run_handoff(Handoff::PtyGood, Duration::from_secs(20));
+        let launched = result.expect("launch must succeed");
+        let master = launched.pty_master.expect("pty master");
+        // 受け取った fd は master（初期サイズは試験の 0 行 0 列）。
+        assert_eq!(
+            master.window_size().expect("window size"),
+            crate::exec::WindowSize::new(0, 0)
+        );
+        assert!(launched.listener.is_some());
+    }
+
+    /// CRI-6・SEC-1・#4070: 端末を要求しない起動は pty の socketpair を作らず、`pty_master` は `None`。
+    #[test]
+    fn sec1_4070_launch_without_terminal_carries_no_pty_master() {
+        let _serial = serialize_forks();
+        let (result, _, _) = run_handoff(Handoff::Good, Duration::from_secs(20));
+        let launched = result.expect("launch must succeed");
+        assert!(launched.pty_master.is_none());
+    }
+
+    /// CRI-6・SEC-1・#4070: master でない fd（`/dev/null`）は拒否され、PID 1 は回収される。
+    #[test]
+    fn sec1_4070_launch_rejects_a_non_master_fd_and_reaps_pid1() {
+        let _serial = serialize_forks();
+        let (result, _, pid1) = run_handoff(Handoff::PtyNonMaster, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+    }
+
+    /// CRI-6・REPAIR-5・#4070: 端末を要求したのに master が届かないまま PID 1 が閉じたら、master 無しで走らせず
+    /// 起動失敗にして PID 1 を回収する（fail-closed）。
+    #[test]
+    fn sec1_4070_launch_fails_closed_when_the_master_never_arrives() {
+        let _serial = serialize_forks();
+        let (result, _, pid1) = run_handoff(Handoff::PtyNeverSends, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            failure.rejection.error.message,
+            "the container init did not deliver the pty master"
+        );
+        assert!(gone(pid1));
+    }
+
+    /// CRI-6・SEC-4・#4070: pty の前の失敗（`E pty ...`）は exec 前の 2 行目の判定が先に返り、master の受信（`SenderClosed`）の
+    /// 失敗に隠されない。
+    #[test]
+    fn sec1_4070_exec_phase_failure_is_judged_before_the_pty_receipt() {
+        let _serial = serialize_forks();
+        let (result, _, pid1) = run_handoff(Handoff::PtyFailure, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_ne!(
+            failure.rejection.error.message,
+            "the container init did not deliver the pty master"
         );
         assert!(gone(pid1));
     }
@@ -3113,7 +3324,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r, _listener_end, netns_end| {
+            |status, report, gate_r, _listener_end, netns_end, _pty_end| {
                 let end = netns_end.expect("netns end").try_clone().expect("dup");
                 let pid1 = fork_stand_in(status, &pid_write, move |s| {
                     if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
@@ -3143,6 +3354,7 @@ mod tests {
             },
             None,
             Some(check),
+            false,
             &subreaper,
             audit,
             timeout,
@@ -3720,7 +3932,7 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, _report, gate_r, _listener_end, _netns_end| {
+            |status, _report, gate_r, _listener_end, _netns_end, _pty_end| {
                 let _ = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
@@ -3739,6 +3951,7 @@ mod tests {
             },
             None,
             None,
+            false,
             &_subreaper,
             audit,
             Duration::from_secs(5),
@@ -3988,9 +4201,10 @@ mod tests {
         let (out_tx, _out_rx) = UnixStream::pair().unwrap();
         let result = launch_via_intermediate(
             || false,
-            |_, _, _, _, _| panic!("the intermediate must not run"),
+            |_, _, _, _, _, _| panic!("the intermediate must not run"),
             None,
             None,
+            false,
             &subreaper,
             audit,
             Duration::from_secs(1),

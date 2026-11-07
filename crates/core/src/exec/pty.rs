@@ -31,7 +31,13 @@
 //! # 未実装（REPAIR-3）
 //! supervisor の `ExecStdio` への tty の追加と、受けた master を helper の channel へ返す結線は #3760・#3761、
 //! plugin-cri の resize の転送は #3761、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
-//! 完全版 Attach の init の pty は #3765 の範囲で、本モジュールは行わない。
+//! `/dev/console` への slave の bind は #4071 の範囲で、本モジュールは行わない。
+//!
+//! # launch の init の pty(CRI-6・SEC-1・CORE-5・#4070)
+//! 端末つき起動では、PID 1 の終端(`process.rs` の `attach_launch_pty`)が pivot 後の照合済みの `/` を起点に
+//! [`allocate_in_root`] を呼び、master を専用の socketpair で launch の親 C へ送り([`ExecPtySender`])、slave を fd 0〜2 に
+//! 付け替える。C は exec 前の 2 行目(`R`/`E`)の判定の後に [`ExecPtyReceiver::receive`] で受ける
+//! (`launch_intermediate.rs`)。
 
 use std::ffi::CStr;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};

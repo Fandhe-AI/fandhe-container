@@ -380,6 +380,12 @@ fn channel_failed(e: &ChannelError) -> StreamExecOutcome {
     StreamExecOutcome::Failed(e.code())
 }
 
+/// `Started` の送信期限。`SEND_BUDGET` を `total_deadline` で頭打ちにする（期限後に `Started` を出さない。REPAIR-5・SUP-6）。
+/// 期限切れ（`now >= total_deadline`）なら期限は `now` となり、`send_started` は送らず `Timeout` で失敗する。
+fn started_send_deadline(now: Instant, total_deadline: Instant) -> Instant {
+    total_deadline.min(now + SEND_BUDGET)
+}
+
 /// 前提検査から exec の通しまで（処理順はモジュール doc）。`channel` へは `Started` だけを送り、`Result` は返り値で
 /// 呼び出し側（[`run_stream_exec_main`]）が送る。
 pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> StreamExecOutcome {
@@ -434,8 +440,11 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
     // 通知（kind 7 と ack）に成功してから `Started` を送る。どちらかが失敗したら worker を fork せず exec を中止する。
     let on_created = |name: &ExecCgroupName| -> Result<(), TraitError> {
         handover.notify_created(name, total_deadline)?;
-        channel::send_started(channel, Instant::now() + SEND_BUDGET)
-            .map_err(|e| TraitError::new(e.code(), "failed to report the exec start to the caller"))
+        channel::send_started(
+            channel,
+            started_send_deadline(Instant::now(), total_deadline),
+        )
+        .map_err(|e| TraitError::new(e.code(), "failed to report the exec start to the caller"))
     };
     let io = ExecLaunchIo {
         launch_env: &launch_env,
@@ -545,6 +554,29 @@ mod tests {
             "/bin/echo",
             "hello world",
         ])
+    }
+
+    /// SUP-6・REPAIR-5（#3760）: `Started` の送信期限は `total_deadline` で頭打ちになり、期限後は送られず `Timeout` になる。
+    #[test]
+    fn sup6_3760_started_send_deadline_is_capped_by_total_deadline() {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(60);
+        assert_eq!(started_send_deadline(now, far), now + SEND_BUDGET);
+        let near = now + Duration::from_millis(100);
+        assert_eq!(started_send_deadline(now, near), near);
+        // 残りがほぼ 0（期限切れ）: 送信は Started を出さず Timeout で失敗する。
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let expired = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let deadline = started_send_deadline(Instant::now(), expired);
+        let err = channel::send_started(&a, deadline).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        b.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(
+            std::io::Read::read(&mut b, &mut buf).is_err(),
+            "no Started bytes may be sent"
+        );
     }
 
     fn reject(args: Vec<OsString>, why: &str) {

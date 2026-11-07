@@ -149,7 +149,7 @@ mod linux {
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
     use fandhe_container_core::cgroups::CgroupLimitPlan;
-    use fandhe_container_core::exec::IsolationPrivilege;
+    use fandhe_container_core::exec::{ChildSubreaper, ContainerChild, IsolationPrivilege};
     use fandhe_container_core::injected_files::InjectedFileSet;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
@@ -622,6 +622,10 @@ mod linux {
             );
             scenarios(&ctx, hostdata, server, listener);
         }));
+        // helper を SIGKILL した disconnect の後、孤児化した exec worker とコマンドのゾンビは、この試験プロセス
+        // （launch が立てた child subreaper）へ再親付けされる。回収しないと pid namespace の teardown が完了せず
+        // pid1 の terminate が期限切れになるので、pid1 以外の子を先に回収する。
+        reap_reparented_orphans(pid.get());
         let terminated = controlled.terminate(timeout());
         if let Err(p) = verified {
             if let Err(e) = &terminated {
@@ -637,6 +641,31 @@ mod linux {
             "/proc/{} must disappear after terminate",
             pid.get()
         );
+    }
+
+    /// 試験プロセス（child subreaper）へ再親付けされた pid1 以外の子（孤児化した exec worker・コマンド）を回収する。
+    ///
+    /// 本番では helper の孤児は plugin-cri 側（subreaper ではない）の外で init が回収するが、本試験は plugin-cri 役と
+    /// supervisor 役を兼ねるため自分で回収する。pid 指定の `waitpid(WNOHANG)` だけを使い（core の `ContainerChild`）、
+    /// 期限内に終わらない子は SIGKILL して回収する（REPAIR-5）。
+    fn reap_reparented_orphans(pid1: u32) {
+        let Ok(proof) = ChildSubreaper::enable() else {
+            return;
+        };
+        let mut pids = Vec::new();
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for t in tasks.flatten() {
+                if let Ok(s) = std::fs::read_to_string(t.path().join("children")) {
+                    pids.extend(s.split_whitespace().filter_map(|v| v.parse::<u32>().ok()));
+                }
+            }
+        }
+        for pid in pids.into_iter().filter(|p| *p != pid1) {
+            if let Some(nz) = std::num::NonZeroU32::new(pid) {
+                let _ = ContainerChild::adopt_reparented(nz, &proof)
+                    .wait_timeout(Duration::from_secs(5));
+            }
+        }
     }
 
     fn scenarios(ctx: &Ctx, hostdata: &Path, server: ControlServer, listener: ControlListener) {

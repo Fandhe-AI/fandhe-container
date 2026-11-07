@@ -15,7 +15,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し空の `StreamDispatcher` で注入。結線済みの種別は無く 3 RPC は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装（Exec の stream-exec helper は #3760 で実装済み。plugin-cri 側の起動は #3761）。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 

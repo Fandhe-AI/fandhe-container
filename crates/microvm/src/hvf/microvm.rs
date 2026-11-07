@@ -77,7 +77,7 @@
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は #4014。全体の追跡は #3908。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。

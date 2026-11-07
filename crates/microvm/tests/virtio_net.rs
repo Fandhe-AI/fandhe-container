@@ -142,7 +142,7 @@ fn mvm1_880_net_queues_transmit_and_receive() {
         wr(&mut t, reg::QUEUE_READY, 0),
         MmioWriteOutcome::QueueStopped(1)
     );
-    t.device_mut().stop_queue(1);
+    // 手動の stop_queue は呼ばない。トランスポートの queue_stopped でデバイスが止まる（#4031・MVM-5）。
     assert_eq!(
         t.device_mut().process_tx(&mut mem).unwrap_err().code(),
         MicrovmErrorCode::FailedPrecondition

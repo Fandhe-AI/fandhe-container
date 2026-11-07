@@ -7,8 +7,8 @@
 //!
 //! # 呼び出し契約
 //! `KVM_RUN` の MMIO exit を振り分ける側（TASK-74.4.2 の `dispatch`）は、`QueueNotify(0)` で
-//! [`VirtioNet::process_rx`]、`QueueNotify(1)` で [`VirtioNet::process_tx`]、`QueueStopped(i)` で
-//! [`VirtioNet::stop_queue`] を呼ぶ。処理結果の `completed` が 1 以上なら
+//! [`VirtioNet::process_rx`]、`QueueNotify(1)` で [`VirtioNet::process_tx`]、停止（`QueueStopped(i)`）は
+//! トランスポートが `VirtioDevice::queue_stopped` から [`VirtioNet::stop_queue`] を呼んで済ませる（#4031）。処理結果の `completed` が 1 以上なら
 //! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（割り込みの実配送は `crate::interrupt::complete_net_notify`。TASK-74.3.2・#881）。
 //! リング破損は `Err` で返り、`Err` でも途中までの要求は used へ書かれ `used.idx` が進んでいることがある。
 //! その内訳は [`VirtioNet::rx_stats_before_error`] / [`VirtioNet::tx_stats_before_error`] で取り、
@@ -268,7 +268,7 @@ impl<B: NetBackend> VirtioNet<B> {
         self.tx_aborted
     }
 
-    /// 指定キューの処理を止める（トランスポートの `QueueStopped(index)` で呼ぶ）。
+    /// 指定キューの処理を止める（トランスポートが `VirtioDevice::queue_stopped` から呼ぶ）。
     ///
     /// 0 は receiveq（保持中のフレームも捨てる）、1 は transmitq。範囲外の index は無視する。
     pub fn stop_queue(&mut self, index: u16) {
@@ -623,6 +623,10 @@ impl<B: NetBackend> VirtioDevice for VirtioNet<B> {
                 "net rx/tx queues are not ready",
             )),
         }
+    }
+
+    fn queue_stopped(&mut self, index: u16) {
+        self.stop_queue(index);
     }
 
     fn reset(&mut self) {

@@ -432,6 +432,7 @@ pub(crate) mod test_support {
         fn activate(&mut self, _: FeatureBits, _: &[QueueConfig]) -> Result<(), MicrovmError> {
             Ok(())
         }
+        fn queue_stopped(&mut self, _: u16) {}
         fn reset(&mut self) {}
     }
 

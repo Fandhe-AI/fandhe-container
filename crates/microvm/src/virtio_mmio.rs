@@ -307,8 +307,8 @@ pub enum MmioWriteOutcome {
     /// `InterruptACK` を受け、`interrupt_status` を更新した。level 扱いの割り込み線は呼び出し元が
     /// `crate::interrupt::complete_interrupt_ack` で deassert / resample する（#3863・MVM-5）。Status=0 のリセット（`DeviceReset`）も `interrupt_status` を 0 にするため同じ後処理を要する。
     InterruptAcknowledged,
-    /// ready だったキューが QueueReady=0 で停止された（動作開始後も受理する。呼び出し元はデバイス側の
-    /// キュー処理をこの通知と同期して止める）。
+    /// ready だったキューが QueueReady=0 で停止された（動作開始後も受理する）。デバイス側の停止は
+    /// トランスポートが [`VirtioDevice::queue_stopped`] で済ませており、呼び出し元は観測にだけ使う（#4031）。
     QueueStopped(u16),
     /// FEATURES_OK が立った（negotiation 成功）。
     FeaturesAccepted,
@@ -351,6 +351,12 @@ pub trait VirtioDevice {
         features: FeatureBits,
         queues: &[QueueConfig],
     ) -> Result<(), MicrovmError>;
+    /// ready だったキューへドライバが QueueReady=0 を書いたとき、トランスポートが自身の lock の下で
+    /// 1 回呼ぶ（`index` は `queue_max_sizes` の範囲内。#4031・MVM-1・MVM-5）。実装はそのキューの
+    /// 処理状態（リング・保留中のフレーム等）を手放す。Linux・macOS の MMIO 経路が同じ口を通るため、
+    /// 呼び出し側（`dispatch_exit`・`handle_data_abort`）は何もしなくてよい。Status=0 の reset では
+    /// 呼ばれず、`reset` が全キューを止める。必須メソッドにして実装漏れをコンパイルで検出する。
+    fn queue_stopped(&mut self, index: u16);
     /// Status へ 0 が書かれたとき呼ばれる。
     fn reset(&mut self);
 }
@@ -700,6 +706,8 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
                 q.ready = false;
                 if was_ready {
                     let index = u16::try_from(idx).map_err(|_| IgnoredAccess::InvalidSelector)?;
+                    // lock を握ったまま停止するので、別 vCPU の reset・再 activate の後に古い停止が届く競合は無い。
+                    self.device.queue_stopped(index);
                     return Ok(MmioWriteOutcome::QueueStopped(index));
                 }
             }
@@ -820,6 +828,7 @@ mod tests {
         fail_activate: bool,
         activated: Option<(FeatureBits, Vec<QueueConfig>)>,
         resets: u32,
+        stopped: Vec<u16>,
     }
 
     impl Dummy {
@@ -832,6 +841,7 @@ mod tests {
                 fail_activate: false,
                 activated: None,
                 resets: 0,
+                stopped: Vec::new(),
             }
         }
     }
@@ -867,6 +877,9 @@ mod tests {
             }
             self.activated = Some((f, q.to_vec()));
             Ok(())
+        }
+        fn queue_stopped(&mut self, index: u16) {
+            self.stopped.push(index);
         }
         fn reset(&mut self) {
             self.resets += 1;
@@ -1164,6 +1177,50 @@ mod tests {
             wr(&mut t, reg::QUEUE_READY, 1),
             ign(IgnoredAccess::WrongDeviceState)
         );
+        // デバイスの停止はトランスポートが 1 回だけ呼ぶ（#4031）。
+        assert_eq!(t.device().stopped, vec![0u16]);
+    }
+
+    /// #4031・MVM-1・MVM-5: ready でないキューへの 0 はデバイスを止めない。
+    #[test]
+    fn mvm1_4031_queue_ready_zero_on_unready_queue_does_not_stop() {
+        let mut t = net();
+        negotiate_ok(&mut t);
+        wr(&mut t, reg::QUEUE_SEL, 1);
+        assert_eq!(wr(&mut t, reg::QUEUE_READY, 0), MmioWriteOutcome::Handled);
+        assert!(t.device().stopped.is_empty());
+    }
+
+    /// #4031・MVM-1・MVM-5: DRIVER_OK 前なら停止後に再び有効にして activate できる。
+    #[test]
+    fn mvm1_4031_restart_before_driver_ok() {
+        let mut t = net();
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        assert_eq!(
+            wr(&mut t, reg::QUEUE_READY, 0),
+            MmioWriteOutcome::QueueStopped(0)
+        );
+        assert_eq!(t.device().stopped, vec![0u16]);
+        assert_eq!(wr(&mut t, reg::QUEUE_READY, 1), MmioWriteOutcome::Handled);
+        assert_eq!(
+            wr(&mut t, reg::STATUS, 15),
+            MmioWriteOutcome::DeviceActivated
+        );
+        let (_, q) = t.device().activated.as_ref().unwrap();
+        assert!(q[0].ready());
+    }
+
+    /// #4031・MVM-1: reset は `reset` だけを呼び、`queue_stopped` は呼ばない。
+    #[test]
+    fn mvm1_4031_reset_does_not_call_queue_stopped() {
+        let mut t = net();
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        wr(&mut t, reg::STATUS, 15);
+        assert_eq!(wr(&mut t, reg::STATUS, 0), MmioWriteOutcome::DeviceReset);
+        assert_eq!(t.device().resets, 1);
+        assert!(t.device().stopped.is_empty());
     }
 
     #[test]

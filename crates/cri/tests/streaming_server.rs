@@ -17,7 +17,7 @@ use fandhe_container_cri::runtime::v1::{
     ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
 };
 use fandhe_container_cri::runtime_service::CriRuntimeService;
-use fandhe_container_cri::streaming::{StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{StreamKind, StreamWiring, StreamingConfig, StreamingServer};
 use tonic::{Code, Request};
 
 /// 生の HTTP/1.1 要求を送り、EOF まで（5 秒の読み取り期限つきで）応答を読む。
@@ -129,11 +129,53 @@ fn exec_request(container_id: &str) -> v1::ExecRequest {
     }
 }
 
+/// 結線した種別の有効なトークンに `200 OK` と種別名の本文を返すテスト用ハンドラ。
+/// 200 は、有効なトークンがハンドラへ届いた証拠になる（#3753・REPAIR-3。以前は 501 で代用していた）。
+struct AcceptHandler {
+    wiring: StreamWiring,
+}
+
+impl fandhe_container_cri::streaming::StreamHandler for AcceptHandler {
+    fn wiring(&self) -> StreamWiring {
+        self.wiring
+    }
+
+    fn handle(
+        &self,
+        request: fandhe_container_cri::streaming::StreamRequest,
+        _http: hyper::Request<hyper::body::Incoming>,
+        _permit: fandhe_container_cri::streaming::ConnectionPermit,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = hyper::Response<fandhe_container_cri::streaming::StreamBody>,
+                > + Send
+                + '_,
+        >,
+    > {
+        // 本文は種別名の固定文字列だけ（StreamBody::text は 'static が要るため match で選ぶ）。
+        let text: &'static str = match request.kind() {
+            StreamKind::Exec => "exec",
+            StreamKind::Attach => "attach",
+            StreamKind::PortForward => "portforward",
+        };
+        Box::pin(async move {
+            hyper::Response::new(fandhe_container_cri::streaming::StreamBody::text(text))
+        })
+    }
+}
+
+fn all_wired() -> std::sync::Arc<AcceptHandler> {
+    std::sync::Arc::new(AcceptHandler {
+        wiring: StreamWiring::all(),
+    })
+}
+
 /// CRI-6: 既定は loopback で待ち受け、URL は `http://127.0.0.1:` で始まる。
 #[cfg(unix)]
 #[tokio::test]
 async fn cri6_default_binds_loopback_and_url_prefix() {
-    let server = StreamingServer::bind(StreamingConfig::default())
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
         .await
         .expect("bind");
     assert!(server.local_addr().ip().is_loopback());
@@ -157,11 +199,11 @@ async fn cri6_bind_rejects_external_without_opt_in() {
     assert_eq!(err.code(), CriErrorCode::InvalidArgument);
 }
 
-/// CRI-6: 有効なトークンは 501（プロトコル本体は #680〜#682）、2 回目は 404。
+/// CRI-6: 有効なトークンはハンドラへ届き（200）、2 回目は 404。
 #[cfg(unix)]
 #[tokio::test]
-async fn cri6_valid_token_501_then_single_use_404() {
-    let server = StreamingServer::bind(StreamingConfig::default())
+async fn cri6_valid_token_reaches_handler_then_single_use_404() {
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
         .await
         .expect("bind");
     let url = server
@@ -172,11 +214,8 @@ async fn cri6_valid_token_501_then_single_use_404() {
         .expect("issue");
     let path = path_of(&url);
     let first = request(server.local_addr(), "GET", &path).await;
-    assert_eq!(
-        status_line(&first),
-        "HTTP/1.1 501 Not Implemented",
-        "{first}"
-    );
+    assert_eq!(status_line(&first), "HTTP/1.1 200 OK", "{first}");
+    assert!(first.ends_with("exec"), "{first}");
     let second = request(server.local_addr(), "GET", &path).await;
     assert_eq!(status_line(&second), "HTTP/1.1 404 Not Found", "{second}");
 }
@@ -185,8 +224,9 @@ async fn cri6_valid_token_501_then_single_use_404() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cri6_unknown_mismatch_expired_and_method() {
-    let server = StreamingServer::bind(
+    let server = StreamingServer::bind_with_handler(
         StreamingConfig::default().with_token_ttl(Duration::from_millis(100)),
+        all_wired(),
     )
     .await
     .expect("bind");
@@ -276,7 +316,7 @@ async fn cri6_rpcs_unimplemented_without_streaming() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cri6_rpcs_return_unique_urls_when_injected() {
-    let server = StreamingServer::bind(StreamingConfig::default())
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
         .await
         .expect("bind");
     let service = CriRuntimeService::new().with_streaming(server.issuer());
@@ -323,16 +363,16 @@ async fn cri6_rpcs_return_unique_urls_when_injected() {
         .url;
     assert!(pf.contains("/portforward/"), "{pf}");
 
-    // 発行した URL は実際に有効なトークンとしてサーバーに照合される（501）。
+    // 発行した URL は実際に有効なトークンとしてサーバーに照合され、ハンドラへ届く（200）。
     let resp = request(server.local_addr(), "GET", &path_of(&a)).await;
-    assert_eq!(status_line(&resp), "HTTP/1.1 501 Not Implemented", "{resp}");
+    assert_eq!(status_line(&resp), "HTTP/1.1 200 OK", "{resp}");
 }
 
 /// CRI-6: 入力検証と存在照合のエラーコード。
 #[cfg(unix)]
 #[tokio::test]
 async fn cri6_rpc_validation_errors() {
-    let server = StreamingServer::bind(StreamingConfig::default())
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
         .await
         .expect("bind");
     let service = CriRuntimeService::new().with_streaming(Arc::clone(&server.issuer()));
@@ -408,7 +448,7 @@ async fn cri6_rpc_validation_errors() {
 #[cfg(not(unix))]
 #[tokio::test]
 async fn cri6_issue_unavailable_on_non_unix() {
-    let server = StreamingServer::bind(StreamingConfig::default())
+    let server = StreamingServer::bind_with_handler(StreamingConfig::default(), all_wired())
         .await
         .expect("bind");
     let err = server
@@ -428,6 +468,10 @@ struct UpgradeHoldHandler {
 
 #[cfg(unix)]
 impl fandhe_container_cri::streaming::StreamHandler for UpgradeHoldHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::only(StreamKind::Exec)
+    }
+
     fn handle(
         &self,
         _request: fandhe_container_cri::streaming::StreamRequest,
@@ -573,4 +617,129 @@ async fn cri6_upgrade_holds_connection_slot_and_observes() {
         )),
         "{events:?}"
     );
+}
+
+/// 部分結線（`kinds` だけ登録）の `StreamDispatcher` を `AcceptHandler` で組む。
+#[cfg(unix)]
+fn partial_dispatcher(
+    kinds: &[StreamKind],
+) -> std::sync::Arc<dyn fandhe_container_cri::streaming::StreamHandler> {
+    let mut dispatcher = fandhe_container_cri::streaming::StreamDispatcher::new();
+    for kind in kinds {
+        let handler = std::sync::Arc::new(AcceptHandler {
+            wiring: StreamWiring::only(*kind),
+        });
+        dispatcher = match kind {
+            StreamKind::Exec => dispatcher.with_exec(handler),
+            StreamKind::Attach => dispatcher.with_attach(handler),
+            StreamKind::PortForward => dispatcher.with_port_forward(handler),
+        };
+    }
+    std::sync::Arc::new(dispatcher)
+}
+
+#[cfg(unix)]
+type RpcUrl = Result<String, tonic::Status>;
+
+#[cfg(unix)]
+async fn rpc_results(
+    service: &CriRuntimeService,
+    sandbox: &str,
+    container: &str,
+) -> (RpcUrl, RpcUrl, RpcUrl) {
+    let exec = service
+        .exec(Request::new(exec_request(container)))
+        .await
+        .map(|r| r.into_inner().url);
+    let attach = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.to_string(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .map(|r| r.into_inner().url);
+    let pf = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: sandbox.to_string(),
+            port: vec![8080],
+        }))
+        .await
+        .map(|r| r.into_inner().url);
+    (exec, attach, pf)
+}
+
+/// CRI-6・REPAIR-3・#3753: Exec だけ結線した構成で、exec は URL を返し、attach と port_forward は
+/// URL を返さず `UNIMPLEMENTED`（未知コンテナでも NOT_FOUND より先に `UNIMPLEMENTED`）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair3_partial_dispatcher_issues_only_wired_kinds() {
+    let server = StreamingServer::bind_with_handler(
+        StreamingConfig::default(),
+        partial_dispatcher(&[StreamKind::Exec]),
+    )
+    .await
+    .expect("bind");
+    let issuer = server.issuer();
+    assert!(issuer.is_wired(StreamKind::Exec));
+    assert!(!issuer.is_wired(StreamKind::Attach));
+    assert!(!issuer.is_wired(StreamKind::PortForward));
+    let service = CriRuntimeService::new().with_streaming(issuer);
+    let sandbox = run_sandbox(&service).await;
+    let container = create_container(&service, &sandbox).await;
+    start_container(&service, &container).await;
+
+    let (exec, attach, pf) = rpc_results(&service, &sandbox, &container).await;
+    assert!(exec.expect("exec url").contains("/exec/"));
+    assert_eq!(attach.expect_err("attach").code(), Code::Unimplemented);
+    assert_eq!(pf.expect_err("port forward").code(), Code::Unimplemented);
+
+    let unknown = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: "no-such-container".to_string(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("unwired");
+    assert_eq!(unknown.code(), Code::Unimplemented);
+}
+
+/// CRI-6・REPAIR-3・#3753: PortForward だけ結線した構成。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair3_partial_dispatcher_port_forward_only() {
+    let server = StreamingServer::bind_with_handler(
+        StreamingConfig::default(),
+        partial_dispatcher(&[StreamKind::PortForward]),
+    )
+    .await
+    .expect("bind");
+    let service = CriRuntimeService::new().with_streaming(server.issuer());
+    let sandbox = run_sandbox(&service).await;
+    let container = create_container(&service, &sandbox).await;
+    start_container(&service, &container).await;
+
+    let (exec, attach, pf) = rpc_results(&service, &sandbox, &container).await;
+    assert_eq!(exec.expect_err("exec").code(), Code::Unimplemented);
+    assert_eq!(attach.expect_err("attach").code(), Code::Unimplemented);
+    assert!(pf.expect("pf url").contains("/portforward/"));
+}
+
+/// CRI-6・REPAIR-3・#3753: `StreamingServer::bind`（どの種別も未結線）では 3 RPC とも URL を返さない。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_repair3_default_bind_issues_nothing() {
+    let server = StreamingServer::bind(StreamingConfig::default())
+        .await
+        .expect("bind");
+    let service = CriRuntimeService::new().with_streaming(server.issuer());
+    let sandbox = run_sandbox(&service).await;
+    let container = create_container(&service, &sandbox).await;
+    start_container(&service, &container).await;
+
+    let (exec, attach, pf) = rpc_results(&service, &sandbox, &container).await;
+    assert_eq!(exec.expect_err("exec").code(), Code::Unimplemented);
+    assert_eq!(attach.expect_err("attach").code(), Code::Unimplemented);
+    assert_eq!(pf.expect_err("port forward").code(), Code::Unimplemented);
 }

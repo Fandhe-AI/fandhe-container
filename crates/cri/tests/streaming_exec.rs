@@ -1143,14 +1143,15 @@ async fn cri6_exec_launch_failure_hides_details() {
     );
 }
 
-/// CRI-6: 握手の失敗（版ヘッダ無しは 400、対応しないサブプロトコルは 403）と、未登録の種別（Attach）は 501 になる。
+/// CRI-6・REPAIR-3・#3753: 握手の失敗（版ヘッダ無しは 400、対応しないサブプロトコルは 403）と、
+/// 未登録の種別（Attach）は URL を発行せず `UNIMPLEMENTED` になる（URL を返してから 501 にしない）。
 #[tokio::test]
 async fn cri6_exec_handshake_errors_and_fallback() {
     let fx = Fixture::new(fast_config(), 8).await;
     let addr = fx.addr();
     let no_upgrade = fx.exec_path(&["hang"], false, false, true, false);
     let v1_only = fx.exec_path(&["hang"], false, false, true, false);
-    let attach_url = fx
+    let attach_err = fx
         .server
         .issuer()
         .issue(StreamRequest::Attach(v1::AttachRequest {
@@ -1160,27 +1161,24 @@ async fn cri6_exec_handshake_errors_and_fallback() {
             stdout: true,
             stderr: false,
         }))
-        .expect("issue attach");
-    let attach_path = attach_url[attach_url.find("/attach/").expect("attach path")..].to_string();
-    let (a, b, c) = tokio::task::spawn_blocking(move || {
+        .expect_err("attach is not wired");
+    assert_eq!(
+        attach_err.code(),
+        fandhe_container_cri::error::CriErrorCode::Unimplemented
+    );
+    let (a, b) = tokio::task::spawn_blocking(move || {
         let (_, a) = Client::connect_raw(addr, &no_upgrade, "Connection: close\r\n");
         let (_, b) = Client::connect_raw(
             addr,
             &v1_only,
             "Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v1.channel.k8s.io\r\n",
         );
-        let (_, c) = Client::connect_raw(
-            addr,
-            &attach_path,
-            "Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v4.channel.k8s.io\r\n",
-        );
-        (a, b, c)
+        (a, b)
     })
     .await
     .expect("join");
     assert!(a.starts_with("HTTP/1.1 400"), "a: {a}");
     assert!(b.starts_with("HTTP/1.1 403"), "b: {b}");
-    assert!(c.starts_with("HTTP/1.1 501"), "c: {c}");
     assert_eq!(fx.launcher.launches.load(Ordering::SeqCst), 0);
 }
 

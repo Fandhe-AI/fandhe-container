@@ -9,7 +9,10 @@
 //!
 //! ## 未実装（REPAIR-3）
 //!
-//! 有効なトークンへの要求は、種別ごとのハンドラが無ければ [`NotImplementedHandler`] が `501 Not Implemented` を返す。
+//! 結線していない種別（[`StreamHandler::wiring`] が答えない種別）の URL は発行しない。`Exec`・`Attach`・
+//! `PortForward` の RPC は [`StreamingUrlIssuer::require_wired`] で `UNIMPLEMENTED` になり、URL を返してから
+//! HTTP の 501 にする形にはしない（#3753・REPAIR-3）。多層防御として、有効なトークンへの要求でハンドラが
+//! 無い種別は [`NotImplementedHandler`] が `501 Not Implemented` を返す（issuer を経る通常の経路では到達しない）。
 //! Attach は #681（TASK-63.3）が SPDY/3.1 の codec（[`spdy`]）・remotecommand の交渉（[`remotecommand`]）・
 //! セッション（[`attach`]）を実装済みだが、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は未接続で、
 //! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
@@ -412,12 +415,70 @@ impl TokenCache {
     }
 }
 
+/// 結線済みの種別の情報（CRI-6・REPAIR-3・#3753）。
+///
+/// [`StreamHandler::wiring`] が返し、[`StreamingUrlIssuer`] が起動時に 1 回だけ読む。結線していない種別の
+/// RPC は URL を返さず `UNIMPLEMENTED` にする（URL を返してから 501 にしない。実装済みを装わない）。
+/// 既定（[`Default`]）はどの種別も未結線で、宣言していない種別は出ない（fail-closed）。
+///
+/// 現状は種別ごとの結線の有無だけを持つ。attach の読み取り専用（#3763）・PortForward の POD 未対応（#3766）・
+/// exec の相対 `argv[0]`（#3761）を RPC 時に断る情報は、各 issue が項目として足す（本型は後から項目を足せる構造体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamWiring {
+    exec: bool,
+    attach: bool,
+    port_forward: bool,
+}
+
+impl StreamWiring {
+    /// どの種別も未結線。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 1 種別だけ結線済み。
+    pub fn only(kind: StreamKind) -> Self {
+        Self::none().with(kind)
+    }
+
+    /// 全種別が結線済み。
+    pub fn all() -> Self {
+        Self::none()
+            .with(StreamKind::Exec)
+            .with(StreamKind::Attach)
+            .with(StreamKind::PortForward)
+    }
+
+    /// `kind` を結線済みにして返す。
+    pub fn with(mut self, kind: StreamKind) -> Self {
+        match kind {
+            StreamKind::Exec => self.exec = true,
+            StreamKind::Attach => self.attach = true,
+            StreamKind::PortForward => self.port_forward = true,
+        }
+        self
+    }
+
+    /// `kind` が結線済みか。
+    pub fn is_wired(&self, kind: StreamKind) -> bool {
+        match kind {
+            StreamKind::Exec => self.exec,
+            StreamKind::Attach => self.attach,
+            StreamKind::PortForward => self.port_forward,
+        }
+    }
+}
+
 /// ストリーミング URL の発行口。`runtime_service` の `exec`・`attach`・`port_forward` が呼ぶ（CRI-6・TASK-63.1）。
 ///
 /// 呼ぶたびに新しいトークンを作るため、コンテナ単位で URL を使い回さない。
+///
+/// 結線済みの種別（[`StreamHandler::wiring`] の起動時のスナップショット）だけ URL を発行する。未結線の種別は
+/// [`StreamingUrlIssuer::require_wired`] で `UNIMPLEMENTED` になる（#3753・REPAIR-3）。
 pub struct StreamingUrlIssuer {
     base_url: String,
     cache: Arc<TokenCache>,
+    wiring: StreamWiring,
 }
 
 impl fmt::Debug for StreamingUrlIssuer {
@@ -425,14 +486,43 @@ impl fmt::Debug for StreamingUrlIssuer {
         f.debug_struct("StreamingUrlIssuer")
             .field("base_url", &self.base_url)
             .field("cache", &self.cache)
+            .field("wiring", &self.wiring)
             .finish()
     }
 }
 
 impl StreamingUrlIssuer {
+    /// 結線済みの種別の情報。
+    pub fn wiring(&self) -> StreamWiring {
+        self.wiring
+    }
+
+    /// `kind` が結線済みか。
+    pub fn is_wired(&self, kind: StreamKind) -> bool {
+        self.wiring.is_wired(kind)
+    }
+
+    /// `kind` が未結線なら `UNIMPLEMENTED` を返す（REPAIR-3）。
+    ///
+    /// `runtime_service` の RPC が入力検証・存在照合より前に呼ぶ。メッセージは英語の固定文で、
+    /// 要求の中身・トークンは含めない。
+    pub fn require_wired(&self, kind: StreamKind) -> Result<(), CriError> {
+        if self.wiring.is_wired(kind) {
+            return Ok(());
+        }
+        Err(CriError::unimplemented(match kind {
+            StreamKind::Exec => "exec streaming is not wired",
+            StreamKind::Attach => "attach streaming is not wired",
+            StreamKind::PortForward => "port-forward streaming is not wired",
+        }))
+    }
+
     /// 要求を保存して URL（`http://<addr>/<kind>/<token>`）を返す。
+    ///
+    /// 未結線の種別は、乱数源とトークン枠を消費する前に `UNIMPLEMENTED` で断る（多層防御）。
     pub fn issue(&self, request: StreamRequest) -> Result<String, CriError> {
         let kind = request.kind();
+        self.require_wired(kind)?;
         let token = self.cache.issue_at(Instant::now(), request, random_token)?;
         Ok(format!(
             "{}/{}/{}",
@@ -503,6 +593,13 @@ fn plain_response(status: StatusCode, message: &'static str) -> Response<StreamB
 /// Upgrade しない要求のためのもので、101 応答で `Upgraded` へ IO を渡した接続には及ばない
 /// （接続の future が Upgrade の引き渡しで完了するため。#679）。
 pub trait StreamHandler: Send + Sync + 'static {
+    /// このハンドラが処理する（結線済みの）種別。
+    ///
+    /// 既定実装は無い（既定を全種別にすると未知のハンドラで fail-open になるため。REPAIR-3）。
+    /// [`StreamingServer`] は起動時に 1 回だけ読むため、ハンドラの寿命の間は値を変えないこと。
+    /// 結線済みと答えた種別の要求は 501 で返さず、実際に処理すること。
+    fn wiring(&self) -> StreamWiring;
+
     /// 照合済みの要求と HTTP 要求（`hyper::upgrade::on` に渡せる）から応答を作る。
     ///
     /// `permit` は同時接続数（`max_connections`）の枠を表す。101 応答で `Upgraded` へ IO を渡すと
@@ -516,11 +613,16 @@ pub trait StreamHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>>;
 }
 
-/// 既定のハンドラ。常に `501 Not Implemented` を返す（SPDY/3.1 は #680〜#682。REPAIR-3）。
+/// どの種別も結線しないハンドラ。到達した要求には `501 Not Implemented` を返す（多層防御。
+/// issuer は未結線の種別の URL を発行しないため、通常の経路では到達しない。REPAIR-3）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NotImplementedHandler;
 
 impl StreamHandler for NotImplementedHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::none()
+    }
+
     fn handle(
         &self,
         _request: StreamRequest,
@@ -539,8 +641,8 @@ impl StreamHandler for NotImplementedHandler {
 /// 種別ごとに [`StreamHandler`] を振り分けるハンドラ（CRI-6・TASK-63.3）。
 ///
 /// `StreamingServer::bind_with_handler` は 1 つのハンドラしか受けないため、Attach（#681）・Exec（#680）・
-/// PortForward（#682）が同じサーバーに同居するための合流点になる。設定していない種別は
-/// [`NotImplementedHandler`] と同じ `501` を返す（実装済みを装わない。REPAIR-3）。
+/// PortForward（#682）が同じサーバーに同居するための合流点になる。設定していない種別は結線済みと答えず
+/// （[`StreamHandler::wiring`]）、URL は発行されない。到達した場合の `501` は多層防御（REPAIR-3）。
 #[derive(Default)]
 pub struct StreamDispatcher {
     attach: Option<Arc<dyn StreamHandler>>,
@@ -584,6 +686,22 @@ impl StreamDispatcher {
 }
 
 impl StreamHandler for StreamDispatcher {
+    /// 登録済みの slot のうち、子ハンドラが同じ種別を結線済みと答えるものだけを結線済みとする
+    /// （slot と子の種別が食い違う誤構成で、扱えない種別の URL を出さない）。
+    fn wiring(&self) -> StreamWiring {
+        let mut wiring = StreamWiring::none();
+        for (kind, slot) in [
+            (StreamKind::Attach, &self.attach),
+            (StreamKind::Exec, &self.exec),
+            (StreamKind::PortForward, &self.port_forward),
+        ] {
+            if slot.as_ref().is_some_and(|h| h.wiring().is_wired(kind)) {
+                wiring = wiring.with(kind);
+            }
+        }
+        wiring
+    }
+
     fn handle(
         &self,
         request: StreamRequest,
@@ -757,7 +875,8 @@ impl fmt::Debug for StreamingServer {
 }
 
 impl StreamingServer {
-    /// 既定のハンドラ（501）で起動する。tokio の実行時の中で呼ぶ。
+    /// どの種別も結線しない状態で起動する（URL は発行されず、全 RPC が `UNIMPLEMENTED`。REPAIR-3）。
+    /// tokio の実行時の中で呼ぶ。
     pub async fn bind(config: StreamingConfig) -> Result<Self, CriError> {
         Self::bind_with_handler(config, Arc::new(NotImplementedHandler)).await
     }
@@ -791,6 +910,7 @@ impl StreamingServer {
         let issuer = Arc::new(StreamingUrlIssuer {
             base_url: format_base_url(advertised),
             cache: Arc::clone(&cache),
+            wiring: handler.wiring(),
         });
         let conns = Arc::new(AtomicUsize::new(0));
         let accept_task = tokio::spawn(accept_loop(
@@ -994,6 +1114,95 @@ mod tests {
         }
     }
 
+    fn issuer_with(wiring: StreamWiring) -> StreamingUrlIssuer {
+        StreamingUrlIssuer {
+            base_url: "http://127.0.0.1:1".to_string(),
+            cache: Arc::new(TokenCache::new(Duration::from_secs(60), 10)),
+            wiring,
+        }
+    }
+
+    /// CRI-6・REPAIR-3・#3753: 既定は全未結線で、`with` した種別だけ結線済みになる。
+    #[test]
+    fn cri6_repair3_wiring_none_by_default() {
+        for w in [StreamWiring::default(), StreamWiring::none()] {
+            assert!(!w.is_wired(StreamKind::Exec));
+            assert!(!w.is_wired(StreamKind::Attach));
+            assert!(!w.is_wired(StreamKind::PortForward));
+        }
+        let w = StreamWiring::none().with(StreamKind::Exec);
+        assert!(w.is_wired(StreamKind::Exec));
+        assert!(!w.is_wired(StreamKind::Attach));
+        assert!(!w.is_wired(StreamKind::PortForward));
+    }
+
+    /// CRI-6・REPAIR-3・#3753: 未結線の種別の発行は `Unimplemented` で、トークン枠を消費しない。
+    /// 検査は乱数源より前にあるため、乱数源の無い OS でも `Unavailable` ではなく `Unimplemented` になる。
+    #[test]
+    fn cri6_repair3_issue_rejects_unwired_kind_without_consuming_slot() {
+        let issuer = issuer_with(StreamWiring::only(StreamKind::Exec));
+        let err = issuer.issue(attach_req()).expect_err("attach is unwired");
+        assert_eq!(err.code(), crate::error::CriErrorCode::Unimplemented);
+        assert_eq!(issuer.cache.len(), 0);
+        assert!(issuer.require_wired(StreamKind::Exec).is_ok());
+        let err = issuer
+            .require_wired(StreamKind::PortForward)
+            .expect_err("port forward is unwired");
+        assert_eq!(err.code(), crate::error::CriErrorCode::Unimplemented);
+        #[cfg(unix)]
+        {
+            issuer.issue(exec_req()).expect("exec is wired");
+            assert_eq!(issuer.cache.len(), 1);
+        }
+    }
+
+    /// CRI-6・REPAIR-3・#3753: 未結線の発行を繰り返しても、結線済みの種別の発行枠（`max_in_flight`）を埋めない。
+    #[cfg(unix)]
+    #[test]
+    fn cri6_repair3_unwired_requests_do_not_exhaust_token_slots() {
+        let issuer = StreamingUrlIssuer {
+            base_url: "http://127.0.0.1:1".to_string(),
+            cache: Arc::new(TokenCache::new(Duration::from_secs(60), 2)),
+            wiring: StreamWiring::only(StreamKind::Exec),
+        };
+        for _ in 0..10 {
+            issuer.issue(attach_req()).expect_err("unwired");
+        }
+        issuer.issue(exec_req()).expect("exec 1");
+        issuer.issue(exec_req()).expect("exec 2");
+    }
+
+    /// CRI-6・REPAIR-3・#3753: ディスパッチャの結線は、登録した slot かつ子が同じ種別を扱うものだけ。
+    #[test]
+    fn cri6_repair3_dispatcher_wiring_follows_children() {
+        let exec: Arc<dyn StreamHandler> =
+            Arc::new(StubHandler(StreamWiring::only(StreamKind::Exec)));
+        let d = StreamDispatcher::new().with_exec(Arc::clone(&exec));
+        assert_eq!(d.wiring(), StreamWiring::only(StreamKind::Exec));
+        // 誤構成: Attach の slot に Exec 用ハンドラを登録しても Attach は結線済みと答えない。
+        let d = StreamDispatcher::new().with_attach(exec);
+        assert_eq!(d.wiring(), StreamWiring::none());
+        assert_eq!(StreamDispatcher::new().wiring(), StreamWiring::none());
+        assert_eq!(NotImplementedHandler.wiring(), StreamWiring::none());
+    }
+
+    struct StubHandler(StreamWiring);
+
+    impl StreamHandler for StubHandler {
+        fn wiring(&self) -> StreamWiring {
+            self.0
+        }
+
+        fn handle(
+            &self,
+            request: StreamRequest,
+            http: Request<Incoming>,
+            permit: ConnectionPermit,
+        ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
+            NotImplementedHandler.handle(request, http, permit)
+        }
+    }
+
     /// CRI-6: 同じ要求の 2 回の発行でトークンも URL も異なり、トークンは 64 文字の小文字 hex。
     #[cfg(unix)]
     #[test]
@@ -1001,6 +1210,7 @@ mod tests {
         let issuer = StreamingUrlIssuer {
             base_url: "http://127.0.0.1:1".to_string(),
             cache: Arc::new(TokenCache::new(Duration::from_secs(60), 10)),
+            wiring: StreamWiring::all(),
         };
         let a = issuer.issue(exec_req()).expect("issue a");
         let b = issuer.issue(exec_req()).expect("issue b");
@@ -1025,6 +1235,7 @@ mod tests {
         let issuer = StreamingUrlIssuer {
             base_url: "http://127.0.0.1:1".to_string(),
             cache: Arc::new(TokenCache::new(Duration::from_secs(60), 10)),
+            wiring: StreamWiring::all(),
         };
         let err = issuer.issue(exec_req()).expect_err("must fail");
         assert_eq!(err.code(), crate::error::CriErrorCode::Unavailable);

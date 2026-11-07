@@ -16,6 +16,14 @@ use std::path::Path;
 /// `/init` が出す固定文字列。x86_64・aarch64・macOS の試験が共有する（複製しない・REPAIR-1）。
 pub const MARKER: &str = "fandhe-microvm-test: init ok v1";
 
+/// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
+/// `block_sentinel`（下の単体試験で照合）。x86_64・aarch64（KVM）と macOS（HVF。#4014）の試験が共有する（複製しない・REPAIR-1）。
+pub const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
+/// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
+pub const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
+/// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
+pub const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
+
 /// `read_bounded` が開くときの `O_NONBLOCK`。値は OS で異なる: Linux は `0o4000`、macOS（`sys/fcntl.h`）は `0x0004`。
 /// macOS で `0o4000` を渡すと `O_EXCL` 相当になり、FIFO の無期限待ちを防げない（REPAIR-5）。`libc` は本 crate の
 /// 依存に無いので定数を持つ。
@@ -343,6 +351,34 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// block-read の文字列定数がスクリプトの正本と一致する（MVM-1・MVM-5・REPAIR-12。#4014 で kernel_boot から移設）。
+    #[test]
+    fn mvm1_3889_block_strings_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            find("block_sentinel=\""),
+            vec![String::from_utf8(BLOCK_SENTINEL.to_vec()).unwrap()]
+        );
+        assert_eq!(
+            find("block_ok_message=\""),
+            vec![BLOCK_OK_MARKER.to_owned()]
+        );
+        assert_eq!(
+            find("block_mismatch_message=\""),
+            vec![BLOCK_MISMATCH_MARKER.to_owned()]
+        );
+        assert_eq!(BLOCK_SENTINEL.len(), 32);
+    }
 
     const LINE: &str =
         "9000000.serial: ttyS0 at MMIO 0x9000000 (irq = 14, base_baud = 115200) is a 16550A";

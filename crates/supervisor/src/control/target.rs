@@ -536,6 +536,12 @@ impl LaunchedProcess for ControlledProcess {
     fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
         self.inner.take_seccomp_listener()
     }
+
+    /// init の pty の master を内側へ転送する（転送しないと包み直した後に取り出せない。CRI-6・#4070）。
+    #[cfg(target_os = "linux")]
+    fn take_pty_master(&self) -> Option<fandhe_container_core::exec::PtyMaster> {
+        self.inner.take_pty_master()
+    }
 }
 
 impl Drop for ControlledProcess {

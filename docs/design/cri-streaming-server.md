@@ -337,7 +337,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | 子 | issue | 内容 | 依存 |
 | -- | ----- | ---- | ---- |
 | C1 | #4069 | core: init の stdin パイプ | なし |
-| C2 | #4070 | core: init の pty と master の返却 | #3758 |
+| C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
 | C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
 | C5 | #4072 | supervisor: 捕捉からの出力の tap | なし |

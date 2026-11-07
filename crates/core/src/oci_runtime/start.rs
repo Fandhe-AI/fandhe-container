@@ -68,7 +68,8 @@
 //! - （適用済み）`root.readonly=true` は pivot 直後に rootfs の mount top へ `MOUNT_ATTR_RDONLY` を非再帰で足して適用する
 //!   （`mount_setattr`。`nodev` 等の既存属性を落とさず rootless でも成り立つ。`/proc`・`/dev` 系・tmpfs・bind は自分の属性のまま。
 //!   Landlock の規則も同じ実効値から決まる。実効値は config の値と起動オプション `--read-only` の OR で、狭める方向のみ。CLI-1・CORE-5・SEC-1・SUP-12・#2767・#2828）
-//! - `process.terminal` が true（端末受け渡し未実装）
+//! - launcher が端末対応を opt-in していない（`ProcessLauncher::supports_terminal` が `false`。既定）ときの `process.terminal: true`
+//!   （opt-in した本番 launcher は init の pty を割り当てて master を返す。CRI-6・SEC-1・#4070）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind は root が書き込み可能でも受ける〔#1917。Landlock のルール生成へ検証済みの集合を渡す〕）
 //! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
@@ -877,7 +878,10 @@ fn build_spec_with_swap(
         )
     })?;
     // uid・gid・補助グループは launcher が写像と照合して適用する（SEC-5・#2667）。
-    if process.terminal() {
+    // 端末つき起動は launcher が opt-in(`supports_terminal`)しているときだけ受ける。既定は拒否(fail-closed。
+    // CRI-6・SEC-1・#4070)。
+    let terminal = process.terminal();
+    if terminal && !launcher.supports_terminal() {
         return Err(unsupported("process.terminal"));
     }
     // 起動オプションの network モードと config の突き合わせ(D7)は予約・fork より前に終える(NET-6・SEC-1・#3058)。
@@ -962,7 +966,8 @@ fn build_spec_with_swap(
     .with_additional_gids(additional_gids)
     .with_namespace_join(namespace_join)
     .with_network(network, network_mode)
-    .with_state_root(state_root.map(Path::to_path_buf)))
+    .with_state_root(state_root.map(Path::to_path_buf))
+    .with_terminal(terminal))
 }
 
 /// pod の namespace join を固定し、検証による拒否（自身の user namespace・親子関係違反・所有者の不一致・
@@ -1610,6 +1615,8 @@ mod tests {
         recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
         /// `network_mode` が返すモード(既定 `FromConfig`。NET-6・#3058)。
         network_mode: Mutex<super::super::network_mode::LaunchNetworkMode>,
+        /// `supports_terminal` が返す値(既定は偽。CRI-6・#4070)。
+        terminal_support: AtomicBool,
     }
 
     impl RecordingLauncher {
@@ -1632,6 +1639,7 @@ mod tests {
                 rlimits: Mutex::new(None),
                 recorded: Mutex::new(Vec::new()),
                 network_mode: Mutex::new(super::super::network_mode::LaunchNetworkMode::FromConfig),
+                terminal_support: AtomicBool::new(false),
             })
         }
 
@@ -1705,6 +1713,10 @@ mod tests {
     }
 
     impl ProcessLauncher for RecordingLauncher {
+        fn supports_terminal(&self) -> bool {
+            self.terminal_support.load(Ordering::SeqCst)
+        }
+
         fn network_mode(&self) -> super::super::network_mode::LaunchNetworkMode {
             *self.network_mode.lock().unwrap_or_else(|e| e.into_inner())
         }
@@ -3363,6 +3375,40 @@ mod tests {
             .expect("array")
             .push(entry);
         cfg
+    }
+
+    /// CRI-6・SEC-1（#4070）: launcher が端末対応を opt-in していなければ、`process.terminal: true` は従来どおり
+    /// `Unimplemented` で断り、launcher は呼ばれない（既定は拒否）。
+    #[test]
+    fn cri6_4070_start_rejects_terminal_without_opt_in() {
+        let name = "tty-no-opt-in";
+        let (b, store) = created(name);
+        let mut cfg = valid_config();
+        cfg["process"]["terminal"] = json!(true);
+        b.write_config(&cfg);
+        let launcher = RecordingLauncher::new(false);
+        assert!(!launcher.supports_terminal());
+        let err = run(&store, &launcher, name).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(launcher.calls(), 0);
+    }
+
+    /// CRI-6・SEC-1（#4070）: opt-in した launcher には `process.terminal: true` が `LaunchSpec::terminal() == true` で届き、
+    /// terminal でない config では偽。成功する start は rootfs の固定を要するため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri6_4070_start_passes_terminal_to_opted_in_launcher() {
+        for (name, terminal) in [("tty-opt-in-on", true), ("tty-opt-in-off", false)] {
+            let (b, store) = created(name);
+            let mut cfg = valid_config();
+            cfg["process"]["terminal"] = json!(terminal);
+            b.write_config(&cfg);
+            let launcher = RecordingLauncher::new(false);
+            launcher.terminal_support.store(true, Ordering::SeqCst);
+            run(&store, &launcher, name).expect("start");
+            let specs = launcher.specs.lock().expect("lock");
+            assert_eq!(specs.first().expect("spec").terminal(), terminal, "{name}");
+        }
     }
 
     /// NET-6・NET-9・SEC-1（#3058・#1939）: `Loopback` / `Attachable` / `Host` と path 付きの network エントリは予約の前に `InvalidArgument`。

@@ -735,6 +735,62 @@ pub enum ProcessExit {
     Signaled(i32),
 }
 
+/// 起動済みコンテナの init の標準入力(fd 0)へ書く側(SUP-7・CRI-6・SEC-1・#4069)。
+///
+/// `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` で起動したときだけ、launcher が
+/// [`LaunchedProcess::take_stdin`] で呼び出し側(supervisor。attach の stdin 用。#3765 の C4 以降)へ渡す。
+/// 呼び出し側が所有し、drop するとコンテナの fd 0 が EOF になる(他に書き込み端が無いとき)。
+/// 書き込み端は close-on-exec かつ fd 3 以上で、コンテナへは渡らない。コンテナの終了後の書き込みは `EPIPE` で、
+/// `SIGPIPE` の扱いと書き込みの stall の期限は保持者側の責務(#3761)。内容はログ・`Debug` に出さない。
+#[cfg(target_os = "linux")]
+pub struct ContainerStdin {
+    writer: std::io::PipeWriter,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerStdin {
+    pub(crate) fn new(writer: std::io::PipeWriter) -> Self {
+        Self { writer }
+    }
+
+    /// 書き込み端の複製(close-on-exec)。複数の保持者(例: SCM_RIGHTS で渡す側)へ分けるときに使う。
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            writer: self.writer.try_clone()?,
+        })
+    }
+
+    /// fd として取り出す。
+    pub fn into_owned_fd(self) -> std::os::fd::OwnedFd {
+        std::os::fd::OwnedFd::from(self.writer)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for ContainerStdin {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.writer.as_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for ContainerStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ContainerStdin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContainerStdin")
+    }
+}
+
 /// 起動済みコンテナの標準出力・標準エラーの読み取り側（TASK-164 追補・#1471・SUP-7・SUP-1）。
 ///
 /// launcher が子の stdout / stderr をパイプへ接続して作り、[`LaunchedProcess::take_output`] で supervisor へ
@@ -822,6 +878,16 @@ pub trait LaunchedProcess: Send {
         None
     }
 
+    /// init の stdin の書き込み端を 1 回だけ取り出す(Linux。SUP-7・CRI-6・SEC-1・#4069)。
+    ///
+    /// `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` で起動したときだけ `Some`。2 回目以降と、既定の
+    /// `Null` で起動した場合、stdin を開かない実装は `None`(既定)。`LaunchedProcess` を包み直す実装は内側へ
+    /// 転送すること(`take_output` と同じ注意。supervisor のラッパーの転送は #4074)。
+    #[cfg(target_os = "linux")]
+    fn take_stdin(&self) -> Option<ContainerStdin> {
+        None
+    }
+
     /// seccomp の listener fd を 1 回だけ取り出す(Linux。SEC-4・TASK-41 追補・#2024。監査配送 2/6)。
     ///
     /// 本番 launcher は PID 1 が `NEW_LISTENER` 付きで filter を載せて渡した fd を、検証のうえ持たせる。supervisor が
@@ -882,6 +948,8 @@ pub struct ContainerChildProcess {
     /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
     /// `&self` のため `Mutex` で保持する。
     output: std::sync::Mutex<Option<ContainerOutput>>,
+    /// `take_stdin` で 1 回だけ取り出す stdin の書き込み端(SUP-7・CRI-6・#4069)。`&self` のため `Mutex` で保持する。
+    stdin: std::sync::Mutex<Option<ContainerStdin>>,
     /// `take_seccomp_listener` で 1 回だけ取り出す listener(SEC-4・#2024)。`&self` のため `Mutex` で保持する。
     seccomp_listener: std::sync::Mutex<Option<crate::exec::SeccompListener>>,
     /// `take_pty_master` で 1 回だけ取り出す init の pty の master(端末つき起動だけ。CRI-6・#4070)。
@@ -977,6 +1045,7 @@ impl ContainerChildProcess {
             child: Arc::new(child),
             pid,
             output: std::sync::Mutex::new(None),
+            stdin: std::sync::Mutex::new(None),
             seccomp_listener: std::sync::Mutex::new(None),
             pty_master: std::sync::Mutex::new(None),
             reap_notice: None,
@@ -1074,6 +1143,17 @@ impl ContainerChildProcess {
         self
     }
 
+    /// init の stdin の書き込み端を持たせる(`exec::ChildStdio::pipes_with_stdin` が返したもの。#4069)。
+    /// `None` なら何も持たせない。[`LaunchedProcess::take_stdin`] で 1 回だけ取り出される。
+    #[must_use]
+    pub(crate) fn with_stdin(self, writer: Option<std::io::PipeWriter>) -> Self {
+        *self
+            .stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer.map(ContainerStdin::new);
+        self
+    }
+
     /// 子の stdout / stderr の読み取り側を持たせる（`exec::ChildStdio::pipes` が返したもの。#1471）。
     /// [`LaunchedProcess::take_output`] で 1 回だけ取り出される。
     #[must_use]
@@ -1138,6 +1218,13 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn take_output(&self) -> Option<ContainerOutput> {
         self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn take_stdin(&self) -> Option<ContainerStdin> {
+        self.stdin
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -1449,6 +1536,53 @@ mod tests {
             .expect("fdinfo");
         let line = info.lines().find(|l| l.starts_with("Pid:")).expect("Pid:");
         assert_eq!(line.trim_start_matches("Pid:").trim(), pid.to_string());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// SUP-7・CRI-6（#4069）: `take_stdin` の既定は `None`、`with_stdin` で持たせた書き込み端は 1 回だけ取り出せ、
+    /// 書いた内容が読み取り側から具体値どおりに読める。`with_stdin(None)` は何も持たせない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_cri6_4069_take_stdin_default_none_and_child_process_returns_once() {
+        use std::io::{Read as _, Write as _};
+        struct NoStdin;
+        impl LaunchedProcess for NoStdin {
+            fn pid(&self) -> NonZeroU32 {
+                NonZeroU32::new(1).unwrap()
+            }
+            fn wait(&self, _: Duration) -> Result<Option<ProcessExit>, TraitError> {
+                Ok(None)
+            }
+            fn terminate(&self, _: Duration) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+        assert!(NoStdin.take_stdin().is_none());
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap")
+                .with_stdin(Some(writer));
+        let mut stdin = process.take_stdin().expect("first take");
+        assert!(process.take_stdin().is_none());
+        stdin.write_all(b"PING\n").expect("write");
+        drop(stdin);
+        drop(process);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("read");
+        assert_eq!(got, b"PING\n");
+
+        let none = ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+            .expect("wrap")
+            .with_stdin(None);
+        assert!(none.take_stdin().is_none());
         child.kill().expect("kill");
         child.wait().expect("wait");
     }

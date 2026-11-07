@@ -12,16 +12,19 @@
 //!   error / data の対を `requestid` で複数張る（同じ SPDY セッションを使い回す）。
 //!
 //! 既定の集合で動く理由: loopback の TCP とプロセス内の偽 backend だけを使い、root も外部プロセスも要らない。
-//! 偽 backend は SEC-1（namespace・capability を広げない）を検証しない。本番の `ExecStreamLauncher`・
-//! `AttachBackend`・`PortForwardDialer` と plugin-cri の結線は未実装（REPAIR-3）で、実 crictl・kubectl での
-//! 照合はその後続 issue（`docs/design/cri-streaming-server.md`「残るもの」）で行う。
+//! 偽 backend は SEC-1（namespace・capability を広げない）を検証しない。NODE ネットワークの本番 dialer
+//! （`NodeLoopbackDialer`）と plugin-cri の結線の通しは `crates/plugin-cri/tests/streaming_grpc.rs`（#3756）で
+//! 照合する（SPDY クライアントは `support/spdy_client.rs` を共有）。Exec・Attach の本番結線は #3761・#3763、
+//! POD ネットワークは #3766、実 crictl・kubectl での照合は後続 issue
+//! （`docs/design/cri-streaming-server.md`「残るもの」）で行う（REPAIR-3）。
 //! 各試験は読み書きと全体に期限を付け、ハングしない（REPAIR-5）。トークンの乱数源が unix のみのため `cfg(unix)`。
 #![cfg(unix)]
 
-use std::collections::{HashMap, HashSet};
+#[path = "support/spdy_client.rs"]
+mod spdy_client;
+
 use std::future::Future;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,10 +46,9 @@ use fandhe_container_cri::streaming::port_forward::{
     PortForwardConfig, PortForwardDialer, PortForwardHandler, PortForwardNetwork, PortForwardTarget,
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
-use fandhe_container_cri::streaming::spdy::{
-    Frame, FrameDecoder, FrameEncoder, Headers, StreamId, goaway_status,
-};
+use fandhe_container_cri::streaming::spdy::{Frame, goaway_status};
 use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
+use spdy_client::{Spdy, open_pf_pair, plain_post_status, spawn_echo, split_url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::sync::oneshot;
 use tonic::Request;
@@ -228,32 +230,6 @@ impl PortForwardDialer for FakeDialer {
     }
 }
 
-/// 受けたバイトをそのまま返し、相手が書き込み側を閉じたら自分も閉じる echo サーバー。
-fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
-    let addr = listener.local_addr().expect("addr");
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { continue };
-            std::thread::spawn(move || {
-                let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
-                let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = conn.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    if conn.write_all(buf.get(..n).unwrap_or_default()).is_err() {
-                        return;
-                    }
-                }
-                let _ = conn.shutdown(Shutdown::Write);
-            });
-        }
-    });
-    addr
-}
-
 // ---------------------------------------------------------------------------------------------
 // fixture: 3 ハンドラを同居させたサーバーと CRI サービス
 // ---------------------------------------------------------------------------------------------
@@ -370,13 +346,6 @@ async fn setup_all() -> Fixture {
     }
 }
 
-/// URL から `(authority, path)` を取り出す。
-fn split_url(url: &str) -> (String, String) {
-    let rest = url.strip_prefix("http://").expect("http url");
-    let at = rest.find('/').expect("path");
-    (rest[..at].to_string(), rest[at..].to_string())
-}
-
 impl Fixture {
     fn addr(&self) -> SocketAddr {
         self.server.local_addr()
@@ -435,192 +404,6 @@ impl Fixture {
 // ---------------------------------------------------------------------------------------------
 // client-go 相当の SPDY クライアント（ブロッキング）
 // ---------------------------------------------------------------------------------------------
-
-struct Spdy {
-    tcp: TcpStream,
-    enc: FrameEncoder,
-    dec: FrameDecoder,
-    next_id: u32,
-    data: HashMap<u32, Vec<u8>>,
-    fin: HashSet<u32>,
-    replies: HashSet<u32>,
-    rsts: Vec<(u32, u32)>,
-    pings: Vec<u32>,
-    goaway: Option<u32>,
-    eof: bool,
-}
-
-/// 応答のヘッダ部を 1 バイトずつ読む（後続の SPDY フレームを食わない）。
-fn read_head(tcp: &mut TcpStream) -> String {
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        assert!(head.len() < 8192, "response head is too long");
-        assert_eq!(tcp.read(&mut byte).expect("read head"), 1, "closed early");
-        head.push(byte[0]);
-    }
-    String::from_utf8_lossy(&head).into_owned()
-}
-
-fn raw_connect(addr: SocketAddr) -> TcpStream {
-    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("write timeout");
-    tcp
-}
-
-/// Upgrade なしの素の `POST`。応答の先頭行を返す（404 などの照合用）。
-fn plain_post_status(addr: SocketAddr, path: &str) -> String {
-    let mut tcp = raw_connect(addr);
-    tcp.write_all(
-        format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .as_bytes(),
-    )
-    .expect("write");
-    let head = read_head(&mut tcp);
-    head.lines().next().unwrap_or_default().to_string()
-}
-
-impl Spdy {
-    /// client-go と同じ `POST` + Upgrade で接続し、101 と選ばれた版を確認する。
-    fn connect(addr: SocketAddr, path: &str, versions: &[&str], expect: &str) -> Self {
-        let mut tcp = raw_connect(addr);
-        let mut raw = format!(
-            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n"
-        );
-        for v in versions {
-            raw.push_str(&format!("X-Stream-Protocol-Version: {v}\r\n"));
-        }
-        raw.push_str("\r\n");
-        tcp.write_all(raw.as_bytes()).expect("write request");
-        let head = read_head(&mut tcp);
-        assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
-        let lower = head.to_ascii_lowercase();
-        assert!(lower.contains("upgrade: spdy/3.1"), "{head}");
-        assert!(
-            lower.contains(&format!("x-stream-protocol-version: {expect}")),
-            "{head}"
-        );
-        Self {
-            tcp,
-            enc: FrameEncoder::new(),
-            dec: FrameDecoder::new(),
-            next_id: 1,
-            data: HashMap::new(),
-            fin: HashSet::new(),
-            replies: HashSet::new(),
-            rsts: Vec::new(),
-            pings: Vec::new(),
-            goaway: None,
-            eof: false,
-        }
-    }
-
-    fn send(&mut self, frame: &Frame) {
-        let mut out = Vec::new();
-        self.enc.encode(frame, &mut out).expect("encode");
-        self.tcp.write_all(&out).expect("send");
-    }
-
-    /// 次のフレームを 1 つ読んで蓄積する。読み取りの期限切れ（5 秒）は失敗にする。
-    fn pump_one(&mut self) {
-        assert!(!self.eof, "connection closed unexpectedly");
-        let frame = loop {
-            if let Some(frame) = self.dec.next_frame().expect("decode") {
-                break Some(frame);
-            }
-            let mut buf = [0u8; 8192];
-            match self.tcp.read(&mut buf) {
-                Ok(0) => break None,
-                Ok(n) => self.dec.extend(buf.get(..n).unwrap_or_default()),
-                Err(e) => panic!("read failed (no frame within the deadline): {e}"),
-            }
-        };
-        let Some(frame) = frame else {
-            self.eof = true;
-            return;
-        };
-        match frame {
-            Frame::SynReply { stream_id, .. } => {
-                self.replies.insert(stream_id.get());
-            }
-            Frame::RstStream { stream_id, status } => self.rsts.push((stream_id.get(), status)),
-            Frame::Ping { id } => self.pings.push(id),
-            Frame::GoAway { status, .. } => self.goaway = Some(status),
-            Frame::Data {
-                stream_id,
-                fin,
-                data,
-            } => {
-                self.data.entry(stream_id.get()).or_default().extend(data);
-                if fin {
-                    self.fin.insert(stream_id.get());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// client-go の `CreateStream` 相当。SYN_STREAM を送り、その ID の SYN_REPLY を受けるまで次へ進まない。
-    fn create_stream(&mut self, headers: &[(&str, &str)]) -> u32 {
-        let id = self.next_id;
-        self.next_id += 2;
-        let mut h = Headers::new();
-        for (k, v) in headers {
-            h.push(k, v);
-        }
-        self.send(&Frame::SynStream {
-            stream_id: StreamId::new(id).expect("id"),
-            associated_to: 0,
-            priority: 0,
-            fin: false,
-            unidirectional: false,
-            headers: h,
-        });
-        while !self.replies.contains(&id) {
-            assert!(
-                !self.rsts.iter().any(|(rid, _)| *rid == id),
-                "stream {id} was reset: {:?}",
-                self.rsts
-            );
-            self.pump_one();
-        }
-        id
-    }
-
-    fn send_data(&mut self, id: u32, data: &[u8], fin: bool) {
-        self.send(&Frame::Data {
-            stream_id: StreamId::new(id).expect("id"),
-            fin,
-            data: data.to_vec(),
-        });
-    }
-
-    /// 指定ストリームの FIN まで読み、そこまでの内容を返す。
-    fn read_until_fin(&mut self, id: u32) -> Vec<u8> {
-        while !self.fin.contains(&id) {
-            self.pump_one();
-        }
-        self.data.get(&id).cloned().unwrap_or_default()
-    }
-
-    /// 指定ストリームに `want` バイト届くまで読む。
-    fn read_at_least(&mut self, id: u32, want: usize) -> Vec<u8> {
-        while self.data.get(&id).map_or(0, Vec::len) < want {
-            self.pump_one();
-        }
-        self.data.get(&id).cloned().unwrap_or_default()
-    }
-
-    fn wait_goaway(&mut self) -> u32 {
-        while self.goaway.is_none() {
-            self.pump_one();
-        }
-        self.goaway.expect("goaway")
-    }
-}
 
 /// remotecommand の stdio ストリームを client-go の順で作る。戻りは (error, stdin?, stdout, stderr?, resize?)。
 struct RemoteStreams {
@@ -791,22 +574,6 @@ async fn cri6_crictl_attach_streams_stdio_and_status() {
     );
 }
 
-/// 1 対の error / data を client-go と同じ手順で張る。error ストリームはクライアント側を直ちに閉じる。
-fn open_pf_pair(c: &mut Spdy, request_id: &str) -> (u32, u32) {
-    let error = c.create_stream(&[
-        ("streamtype", "error"),
-        ("port", "80"),
-        ("requestid", request_id),
-    ]);
-    c.send_data(error, b"", true);
-    let data = c.create_stream(&[
-        ("streamtype", "data"),
-        ("port", "80"),
-        ("requestid", request_id),
-    ]);
-    (error, data)
-}
-
 /// CRI-6・TASK-63.5: `crictl port-forward <pod> L:80` 相当。同じ SPDY セッションで 2 つの接続が往復できる。
 #[tokio::test]
 async fn cri6_crictl_port_forward_round_trip_two_connections() {
@@ -817,7 +584,7 @@ async fn cri6_crictl_port_forward_round_trip_two_connections() {
     let addr = fx.addr();
     blocking(move || {
         let mut c = Spdy::connect(addr, &path, &[PF_VERSION], PF_VERSION);
-        let (error0, data0) = open_pf_pair(&mut c, "0");
+        let (error0, data0) = open_pf_pair(&mut c, "80", "0");
         c.send_data(data0, b"hello", false);
         assert_eq!(c.read_at_least(data0, 5), b"hello");
         // 奇数 ID の PING は同じ ID で返る。
@@ -827,7 +594,7 @@ async fn cri6_crictl_port_forward_round_trip_two_connections() {
         }
         assert_eq!(c.pings, [1]);
         // 同じ SPDY セッションで 2 対目を張る。
-        let (error1, data1) = open_pf_pair(&mut c, "1");
+        let (error1, data1) = open_pf_pair(&mut c, "80", "1");
         c.send_data(data1, b"again", false);
         assert_eq!(c.read_at_least(data1, 5), b"again");
         // 1 対目を閉じると、data と error の両方が FIN で閉じ、error にエラー文は無い。
@@ -857,7 +624,7 @@ async fn cri6_crictl_kinds_share_one_server_concurrently() {
         ex.send_data(stdin, b"one\n", false);
 
         let mut pf = Spdy::connect(addr, &pf_path, &[PF_VERSION], PF_VERSION);
-        let (_error, data) = open_pf_pair(&mut pf, "0");
+        let (_error, data) = open_pf_pair(&mut pf, "80", "0");
         pf.send_data(data, b"two", false);
         assert_eq!(pf.read_at_least(data, 3), b"two");
 

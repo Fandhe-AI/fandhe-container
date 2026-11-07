@@ -895,6 +895,8 @@ mod tests {
     fn repair5_mvm5_4040_parked_ap_needs_mailbox_notify_not_wfi_wake() {
         let m = Arc::new(ApMailbox::new());
         let ap = spawn_parked_ap(&m, false, Duration::from_secs(2));
+        // AP が `wait` の待ちに入ってから stop する（入る前だと入口で停止フラグを見て即 Requested になり対照が成立しない）。
+        std::thread::sleep(Duration::from_millis(300));
         let e = ap.stop(Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
         m.notify();
@@ -906,17 +908,19 @@ mod tests {
         let sd = Arc::new(VmShutdown::new());
         let c = Arc::new(FakeCanceller::default());
         let m = Arc::new(ApMailbox::new());
-        let (sd1, c1) = (Arc::clone(&sd), Arc::clone(&c));
+        let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sd1, c1, r1) = (Arc::clone(&sd), Arc::clone(&c), Arc::clone(&registered));
         let bsp = std::thread::spawn(move || {
             let stop = Arc::new(AtomicBool::new(false));
             let c2 = Arc::clone(&c1);
             sd1.register(Arc::clone(&stop), Box::new(move || c2.cancel()));
+            r1.fetch_add(1, Ordering::AcqRel);
             let mut exec = BlockingExec(c1);
             run_loop(&mut exec, &stop, Duration::from_secs(60), None, |_, _| {
                 Ok(ExitAction::Continue)
             })
         });
-        let (sd2, m1) = (Arc::clone(&sd), Arc::clone(&m));
+        let (sd2, m1, r2) = (Arc::clone(&sd), Arc::clone(&m), Arc::clone(&registered));
         let ap = std::thread::spawn(move || {
             let stop = Arc::new(AtomicBool::new(false));
             let (c3, m2) = (Arc::new(FakeCanceller::default()), Arc::clone(&m1));
@@ -927,13 +931,18 @@ mod tests {
                     m2.notify();
                 }),
             );
+            r2.fetch_add(1, Ordering::AcqRel);
             match m1.wait(&stop, Duration::from_secs(60)) {
                 ApWake::Stopped => StopReason::Requested,
                 ApWake::Start(_) => StopReason::Failed(MicrovmErrorCode::Internal),
             }
         });
         // 両方が登録を終えるまで待つ（登録前の trigger は late register 経路になり別の試験が担う）。
-        std::thread::sleep(Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        while registered.load(Ordering::Acquire) < 2 {
+            assert!(t0.elapsed() < LONG, "vcpus did not register");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         sd.trigger();
         let t = std::time::Instant::now();
         while !(bsp.is_finished() && ap.is_finished()) {

@@ -117,6 +117,7 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）
 
 ## #4024 での `Send` の導入記録（MVM-5・MVM-1・SEC-1）
+
 - `HostMapping`（`crates/microvm/src/sys/hvf.rs`）に `unsafe impl Send` を 1 件だけ足した。`Sync` は足さない（`&HostMapping` の共有は型で禁じ、共有は `Arc<Mutex<..>>`）。個別承認は [#4022 の判断コメント](https://github.com/Fandhe-AI/fandhe-container/issues/4022#issuecomment-6690213069)（案 A）の 1 件に限る
 - 自動で `Send` になる型: `GuestMapping`・`RegisteredHvfRam`・`GuestMemory<RegisteredHvfRam<'static>>`。固定は `sys/hvf.rs` の const assert（`Sync` は E0283 の曖昧性ガード）と `hvf/memory.rs` の const assert
 - 残り（`ExitHandlers` への受け渡し・QueueNotify の配線・期限切れ後の回収）は #3908

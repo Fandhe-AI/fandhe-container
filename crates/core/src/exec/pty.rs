@@ -45,9 +45,10 @@ use crate::traits::types::ErrorCode;
 /// `/dev/ptmx` の文字デバイス番号（major 5・minor 2。devpts の `ptmx` ノードも同じ）。
 const PTMX_MAJOR: u32 = 5;
 const PTMX_MINOR: u32 = 2;
-/// UNIX98 pty の slave の先頭 major（`UNIX98_PTY_SLAVE_MAJOR`）と major の数。
-const SLAVE_MAJOR_BASE: u32 = 136;
-const SLAVE_MAJOR_COUNT: u32 = 8;
+/// UNIX98 pty の slave の major（`UNIX98_PTY_SLAVE_MAJOR`）。index は繰り上げず minor にそのまま入れる。
+const SLAVE_MAJOR: u32 = 136;
+/// slave の index の上限（排他的。カーネルの minor は 20 bit で `NR_UNIX98_PTY_MAX` は `1 << 20`）。
+const SLAVE_INDEX_LIMIT: u32 = 1 << 20;
 /// 割り当てを受けた master を運ぶ 1 通の本文（seccomp listener の `L`・失敗通知の `E` と区別する）。
 pub(crate) const TOKEN_PTY_MASTER: u8 = b'P';
 /// 割り当ての段（`pts` の devpts の検証・`ptmx` と slave の open・unlock・サイズ設定）。
@@ -236,10 +237,9 @@ pub(crate) fn allocate_in_root(
     Ok((master, PtySlave(slave)))
 }
 
-/// UNIX98 slave の番号 `index` のデバイス番号（major `136 + index / 256`・minor `index % 256`）。範囲外は `None`。
+/// UNIX98 slave の番号 `index` のデバイス番号（major 136・minor は index そのまま）。範囲外は `None`。
 fn slave_rdev(index: u32) -> Option<u64> {
-    let major = SLAVE_MAJOR_BASE.checked_add(index / 256)?;
-    (major < SLAVE_MAJOR_BASE + SLAVE_MAJOR_COUNT).then(|| sys::makedev(major, index % 256))
+    (index < SLAVE_INDEX_LIMIT).then(|| sys::makedev(SLAVE_MAJOR, index))
 }
 
 /// 試験専用: ホストの `/dev/ptmx`（devtmpfs）から pty を割り当てる。コンテナの devpts ではないため本番では使わない。
@@ -324,7 +324,7 @@ impl ExecPtyReceiver {
 
     /// master を期限つきで受信・検証する（REPAIR-5）。`worker` は送信元の pid の照合に使う。
     ///
-    /// 検証: 切り詰めなし・本文がちょうど [`TOKEN_PTY_MASTER`] の 1 バイト・fd がちょうど 1 本・
+    /// 検証: 切り詰めなし・本文がちょうど `TOKEN_PTY_MASTER` の 1 バイト・fd がちょうど 1 本・
     /// `SCM_CREDENTIALS` の pid が worker・close-on-exec・[`PtyMaster::from_received`]。呼び出し順の契約:
     /// 親は seccomp listener を受けた後、worker の終了を待つ **前** に呼ぶ。
     pub fn receive(self, worker: &ContainerChild, deadline: Instant) -> PtyReceipt {
@@ -432,14 +432,18 @@ fn classify(
 mod tests {
     use super::*;
 
-    /// SUP-6・SEC-1（#3758）: UNIX98 slave の番号は major 136 から 8 個・minor 256 刻みで、範囲外は拒否する。
+    /// SUP-6・SEC-1（#3758）: UNIX98 slave の番号は major 136 固定・minor は index そのままで、範囲外は拒否する。
     #[test]
     fn sup6_3758_slave_rdev_follows_unix98_numbering() {
         assert_eq!(slave_rdev(0), Some(sys::makedev(136, 0)));
         assert_eq!(slave_rdev(255), Some(sys::makedev(136, 255)));
-        assert_eq!(slave_rdev(256), Some(sys::makedev(137, 0)));
-        assert_eq!(slave_rdev(2047), Some(sys::makedev(143, 255)));
-        assert_eq!(slave_rdev(2048), None);
+        assert_eq!(slave_rdev(256), Some(sys::makedev(136, 256)));
+        assert_eq!(slave_rdev(2048), Some(sys::makedev(136, 2048)));
+        assert_eq!(
+            slave_rdev((1 << 20) - 1),
+            Some(sys::makedev(136, (1 << 20) - 1))
+        );
+        assert_eq!(slave_rdev(1 << 20), None);
     }
 
     /// SEC-1（#3758）: master でない fd（通常ファイル・`/dev/null`）は `from_received` が `InvalidArgument` で拒否する。

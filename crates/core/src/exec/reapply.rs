@@ -561,7 +561,7 @@ impl ExecReady {
     /// 再適用（capability 削減・NNP・Landlock・seccomp）の **後** に、コマンドと同じ権利で開く（launch より
     /// 広い権利を使わない）。照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で
     /// 辿る（ホストの devpts は使わない）。`&self` なので証跡は消費せず、`/` の fd は外へ出さない。
-    /// 契約と手順は [`super::pty`] のモジュール doc。
+    /// 契約と手順は `super::pty` のモジュール doc。
     pub fn allocate_pty(
         &self,
         size: super::WindowSize,

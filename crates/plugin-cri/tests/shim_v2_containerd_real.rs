@@ -617,10 +617,10 @@ mod linux {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .ok_or("XDG_RUNTIME_DIR is not set")?;
-        // 実際の配置は `<XDG>/fandhe-container-shim/<address のハッシュ>/<namespace>/<id>`（`scoped_root`）。ハッシュは
+        // 実際の配置は `<XDG>/fandhe-container-shim-state/<address のハッシュ>/<namespace>/<id>`（`scoped_root`）。ハッシュは
         // containerd の ttrpc address 由来なので、全ハッシュ配下の当該 namespace を走査する。旧配置（`<XDG>/fandhe-container/<id>`）も見る。
         let mut remains = vec![xdg.join("fandhe-container").join(id)];
-        match std::fs::read_dir(xdg.join("fandhe-container-shim")) {
+        match std::fs::read_dir(xdg.join("fandhe-container-shim-state")) {
             Ok(rd) => {
                 for h in rd.flatten() {
                     remains.push(h.path().join(NAMESPACE).join(id));

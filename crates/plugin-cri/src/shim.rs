@@ -45,7 +45,7 @@ pub fn production_registry(ctx: ServeContext) -> Result<ServiceRegistry, CriErro
 ///
 /// bootstrap の socket は address・namespace・ID ごとに分かれるため、状態も同じ粒度で分ける。分けないと、同一ユーザーが
 /// 別 namespace で同じ ID を作ったときに状態が衝突し、別 shim の State・Kill・Delete が同じ記録を参照できてしまう。
-/// 置き場所は既定の状態ルート `base` の中ではなく兄弟（`<base>-shim/<address のハッシュ>/<namespace>`）にする。`base` 直下に
+/// 置き場所は既定の状態ルート `base` の中ではなく兄弟（`<base>-shim-state/<address のハッシュ>/<namespace>`）にする。bootstrap の socket ディレクトリ（`<base>-shim`。`SOCKET_DIR_NAME`）とは別名にし、状態が ttrpc socket・`.lock`・ログと同居しないようにする。`base` 直下に
 /// 置くと途中の要素が有効な `ContainerId` と衝突し、`FileStateStore::list` が fail-closed で失敗して CLI・plugin-cri が
 /// `base` を開けなくなるため。途中の各階層は 1 つずつ 0700 で作り、既存の階層も symlink でなく他者が触れない権限であることを確かめる。
 /// namespace は検証済みの identifier（英数字と `._-`）なのでパス要素として安全で、address は FNV-1a の 16 桁 16 進に潰す。
@@ -72,7 +72,7 @@ pub(crate) fn scoped_root(
         return Err(CriError::internal("cannot resolve the state root"));
     };
     let mut sibling = name.to_os_string();
-    sibling.push("-shim");
+    sibling.push("-shim-state");
     let hashed = parent.join(sibling).join(format!("{h:016x}"));
     // `FileStateStore::open` は最後の 1 階層しか作らないため、親をここで 1 階層ずつ 0700 で作る。最後の要素はストアの検査が確かめる。
     for dir in [hashed.parent().unwrap_or(parent), hashed.as_path()] {
@@ -235,16 +235,34 @@ mod tests {
         let c = scoped_root(&base, &mk("ns-a", "/run/d.sock")).unwrap();
         assert_ne!(a.path(), b.path());
         assert_ne!(a.path(), c.path());
-        assert!(a.path().starts_with(guard.join("state-shim")));
+        assert!(a.path().starts_with(guard.join("state-shim-state")));
         // 既定の状態ルート（base）の中に何も作らない（途中要素が ContainerId と衝突しない）。
         assert!(!base.exists());
         let mode = |p: &std::path::Path| {
             use std::os::unix::fs::PermissionsExt;
             std::fs::metadata(p).unwrap().permissions().mode() & 0o777
         };
-        assert_eq!(mode(&guard.join("state-shim")), 0o700);
+        assert_eq!(mode(&guard.join("state-shim-state")), 0o700);
         assert_eq!(mode(a.path().parent().unwrap()), 0o700);
         assert!(a.path().ends_with("ns-a"));
+    }
+
+    /// CRI-5・#3684: 既定の状態ルート名 `fandhe-container` でも、状態の置き場所が bootstrap の socket ディレクトリと
+    /// 同一にならず、一方が他方の配下にもならない。
+    #[test]
+    fn cri5_3684_scoped_root_distinct_from_socket_dir() {
+        use fandhe_container_cri::shim_v2::bootstrap::SOCKET_DIR_NAME;
+        let guard = test_root::test_root("shim", "sockdir");
+        let base = guard.join("fandhe-container");
+        let ctx = ServeContext::new(ShutdownSignal::new(), None).with_origin(
+            Some(fandhe_container_cri::shim_v2::bootstrap::ShimIdentifier::parse("ns1").unwrap()),
+            Some(std::path::PathBuf::from("/run/c.sock")),
+        );
+        let root = scoped_root(&base, &ctx).unwrap();
+        let sock_dir = guard.join(SOCKET_DIR_NAME);
+        assert_ne!(root.path(), sock_dir.as_path());
+        assert!(!root.path().starts_with(&sock_dir));
+        assert!(!sock_dir.starts_with(root.path()));
     }
 
     /// CRI-5・#3684: 分けた状態ルート（親ディレクトリが未作成）でも登録簿が開ける。

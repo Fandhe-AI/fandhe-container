@@ -146,8 +146,8 @@ use crate::guest_memory::{
 };
 use crate::interrupt::IoEventSpec;
 use crate::interrupt::{
-    BlockNotifyReport, InterruptLine, IrqTrigger, LevelInterruptLine, NetNotifyReport,
-    NetRxPollOutcome, complete_block_notify, complete_net_notify, poll_net_rx,
+    InterruptLine, IrqTrigger, LevelInterruptLine, NetRxPollOutcome, complete_block_notify,
+    complete_net_notify, poll_net_rx,
 };
 use crate::irq::{IoEventFd, IrqFd};
 #[cfg(target_arch = "x86_64")]
@@ -986,25 +986,7 @@ struct BoundDevice<D: VirtioDevice, L, Q> {
     line: L,
 }
 
-/// `QueueNotify` の処理結果（デバイス種別ごと。REPAIR-4）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueueNotifyReport {
-    /// virtio-block。
-    Block(BlockNotifyReport),
-    /// virtio-net。
-    Net(NetNotifyReport),
-}
-
-impl QueueNotifyReport {
-    /// virtqueue 処理の失敗（リング破損など、ゲスト起因）。無ければ `None`。
-    pub fn queue_error(&self) -> Option<&MicrovmError> {
-        match self {
-            QueueNotifyReport::Block(r) => r.queue_error.as_ref(),
-            QueueNotifyReport::Net(r) => r.queue_error.as_ref(),
-        }
-    }
-}
+pub use crate::interrupt::QueueNotifyReport;
 
 /// MMIO / PIO dispatcher と block / net デバイス群と COM1 の UART。KVM に依存しない（`L` は割り込み線で本番は [`IrqFd`]、
 /// `Q` はキューごとの通知器で本番は `Arc<`[`IoEventFd`]`>`。#3698）。

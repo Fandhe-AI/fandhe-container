@@ -36,7 +36,9 @@ use super::imp::{
     open_consistent, read_error, scan_error,
 };
 use super::record::Scanner;
-use super::{ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FollowOptions, LogReadFailure, source};
+use super::{
+    ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FollowEnd, FollowOptions, LogReadFailure, source,
+};
 
 /// 時計とスリープの差し込み口。製品は `Instant` と `thread::sleep`、試験は進める時計と書き手の模擬を渡す。
 pub(super) struct Driver<'a> {
@@ -46,6 +48,15 @@ pub(super) struct Driver<'a> {
     pub(super) sleep: &'a mut dyn FnMut(Duration),
     /// コンテナの稼働状態の probe（書き手がいなくなったときだけ呼ぶ。終了条件は [`run`] の doc を参照）。
     pub(super) activity: &'a mut dyn FnMut() -> ContainerActivity,
+    /// 取り消しの旗（呼び出し側が立てる。出力が来ないアイドルの間は EPIPE で止まれないため、ポーリングのたびに見る。
+    /// 立っていれば残りを出さずに戻る。#3763・REPAIR-5）。
+    pub(super) cancelled: &'a dyn Fn() -> bool,
+    /// 追従の開始位置の確定（スナップショットの出力を終え、最初のポーリングで追従データを出す前）に 1 回だけ呼ぶ。
+    /// 呼び出し側が「読み口を渡してよい」合図に使う（最初の出力が詰まっても合図が遅れない。CRI-6・REPAIR-5・#3763）。
+    pub(super) started: &'a dyn Fn(),
+    /// ログファイルの境目（`Scanner::end_file` の直後）で呼ぶ。出力先がレコード単位の状態を持つとき、切れた末尾の
+    /// 状態を次のファイルへ持ち越さないために初期化する口（SUP-7・#3763）。
+    pub(super) file_boundary: &'a dyn Fn(),
 }
 
 /// 初回のスナップショットを出し終えた状態の引き継ぎ。
@@ -71,7 +82,9 @@ struct Held {
 ///   切れた末尾まで出し切る。ロックの検査は毎回、状態の probe はロックが解放されたときだけ呼ぶ。
 ///   ロックの検査の失敗（種別違反など）は読み取りの失敗として返す（fail-closed）。
 ///
-/// 戻り値は追従中に新たに読んだファイル数（初回のスナップショット分を含まない）。
+/// - 取り消し（`driver.cancelled`）: 次のポーリングの前に、残りを出さずに戻る（#3763・REPAIR-5）。
+///
+/// 戻り値は追従中に新たに読んだファイル数（初回のスナップショット分を含まない）と、終わり方。
 pub(super) fn run(
     dir: &Path,
     id: &ContainerId,
@@ -80,7 +93,7 @@ pub(super) fn run(
     start: Start,
     out: &mut dyn Write,
     driver: &mut Driver<'_>,
-) -> Result<u32, LogReadFailure> {
+) -> Result<(u32, FollowEnd), LogReadFailure> {
     if config.generations() < 2 {
         return Err(source(ErrorCode::Unavailable, FOLLOW_OUTRAN_MESSAGE));
     }
@@ -98,33 +111,60 @@ pub(super) fn run(
         }
     }
     let mut extra = 0u32;
+    (driver.started)();
     loop {
-        let ended = poll_once(dir, id, config, &mut held, &mut scanner, out, &mut extra)?;
+        let ended = poll_once(
+            dir,
+            id,
+            config,
+            &mut held,
+            &mut scanner,
+            out,
+            &mut extra,
+            driver.file_boundary,
+        )?;
         out.flush().map_err(|_| LogReadFailure::Output)?;
         if ended {
-            return Ok(extra);
+            return Ok((extra, FollowEnd::LogRemoved));
+        }
+        if (driver.cancelled)() {
+            return Ok((extra, FollowEnd::Cancelled));
         }
         if !sink_is_active(dir, id).map_err(read_error)?
             && (driver.activity)() == ContainerActivity::NotRunning
         {
             // 書き手は最終 flush を済ませて close 済み。ローテーションの残りと切れた末尾を出し切る。
-            let ended = poll_once(dir, id, config, &mut held, &mut scanner, out, &mut extra)?;
+            let ended = poll_once(
+                dir,
+                id,
+                config,
+                &mut held,
+                &mut scanner,
+                out,
+                &mut extra,
+                driver.file_boundary,
+            )?;
             if !ended && let Some(h) = held.as_mut() {
-                drain_all(h, &mut scanner, out, config)?;
+                drain_all(h, &mut scanner, out, config, driver.file_boundary)?;
             }
             out.flush().map_err(|_| LogReadFailure::Output)?;
-            return Ok(extra);
+            return Ok((extra, FollowEnd::Stopped));
         }
         let elapsed = (driver.elapsed)();
         if elapsed >= follow.deadline() {
-            return Ok(extra);
+            return Ok((extra, FollowEnd::Deadline));
         }
         let remaining = follow.deadline() - elapsed;
         (driver.sleep)(follow.poll_interval().min(remaining));
+        // スリープ中に取り消された場合は、追記分を読み出さず出力もせずに戻る（REPAIR-5）。
+        if (driver.cancelled)() {
+            return Ok((extra, FollowEnd::Cancelled));
+        }
     }
 }
 
 /// ポーリング 1 回。ログが削除されて出し切ったら `true`。
+#[allow(clippy::too_many_arguments)] // 追従の状態（held・scanner・extra）と境目の通知を個別に渡す。まとめる型は他に使い道が無い。
 fn poll_once(
     dir: &Path,
     id: &ContainerId,
@@ -133,6 +173,7 @@ fn poll_once(
     scanner: &mut Scanner,
     out: &mut dyn Write,
     extra: &mut u32,
+    boundary: &dyn Fn(),
 ) -> Result<bool, LogReadFailure> {
     if let Some(h) = held.as_mut() {
         feed_new(h, scanner, out, config)?;
@@ -155,7 +196,7 @@ fn poll_once(
     if !rotated {
         return Ok(false);
     }
-    if advance(dir, id, config, held, scanner, out, extra)? {
+    if advance(dir, id, config, held, scanner, out, extra, boundary)? {
         return Ok(true);
     }
     if let Some(h) = held.as_mut() {
@@ -165,6 +206,7 @@ fn poll_once(
 }
 
 /// 保持中のファイルが現在ログでなくなった（または未取得の）ときの切り替え。ログが削除されていたら `true`。
+#[allow(clippy::too_many_arguments)] // `poll_once` と同じ。
 fn advance(
     dir: &Path,
     id: &ContainerId,
@@ -173,9 +215,10 @@ fn advance(
     scanner: &mut Scanner,
     out: &mut dyn Write,
     extra: &mut u32,
+    boundary: &dyn Fn(),
 ) -> Result<bool, LogReadFailure> {
     if let Some(h) = held.as_mut() {
-        drain_all(h, scanner, out, config)?;
+        drain_all(h, scanner, out, config, boundary)?;
     }
     let opened = open_consistent(dir, id, config, &mut |_| {})?;
     // 新しいスナップショットの合計も読み出す前に上限で検証する（初回と同じ。REPAIR-5）。
@@ -204,6 +247,7 @@ fn advance(
         // 確定済みの世代（書き手はもう書かない）。切れた末尾も含めて全部出す。
         feed_range(&o.file, 0, o.len, scanner, Some(&mut *out))?;
         scanner.end_file(Some(&mut *out)).map_err(scan_error)?;
+        boundary();
         if last {
             *held = Some(Held {
                 file: o.file,
@@ -245,6 +289,7 @@ fn drain_all(
     scanner: &mut Scanner,
     out: &mut dyn Write,
     config: RotationConfig,
+    boundary: &dyn Fn(),
 ) -> Result<(), LogReadFailure> {
     let len = h.file.metadata().map_err(|_| internal())?.len();
     if len < h.offset {
@@ -255,6 +300,7 @@ fn drain_all(
         feed_range(&h.file, h.offset, len, scanner, Some(&mut *out))?;
     }
     scanner.end_file(Some(out)).map_err(scan_error)?;
+    boundary();
     h.offset = len;
     Ok(())
 }
@@ -323,6 +369,16 @@ mod tests {
         script: &mut dyn FnMut(u32),
         activity: &mut dyn FnMut() -> ContainerActivity,
     ) -> Outcome {
+        follow_run_cancel(dir, opts, script, activity, &|| false)
+    }
+
+    fn follow_run_cancel(
+        dir: &Path,
+        opts: LogReadOptions,
+        script: &mut dyn FnMut(u32),
+        activity: &mut dyn FnMut() -> ContainerActivity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Outcome {
         let now = Rc::new(Cell::new(Duration::ZERO));
         let n2 = Rc::clone(&now);
         let sleeps = Rc::new(Cell::new(0u32));
@@ -338,6 +394,9 @@ mod tests {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
             activity,
+            cancelled,
+            started: &|| {},
+            file_boundary: &|| {},
         };
         let mut out = Vec::new();
         let result = read_with(
@@ -404,6 +463,128 @@ mod tests {
         });
         o.result.expect("ok");
         assert_eq!(o.out, b"stdout a\nstdout partial\n");
+    }
+
+    /// 時計を進めながら追従を回し、`started`・`file_boundary` のフックと出力先を差し込める版。
+    fn follow_run_hooks(
+        dir: &Path,
+        opts: LogReadOptions,
+        script: &mut dyn FnMut(u32),
+        started: &dyn Fn(),
+        file_boundary: &dyn Fn(),
+        out: &mut dyn Write,
+    ) -> Result<LogReadReport, LogReadFailure> {
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let n2 = Rc::clone(&now);
+        let sleeps = Rc::new(Cell::new(0u32));
+        let mut elapsed = move || n2.get();
+        let mut sleep = |d: Duration| {
+            now.set(now.get() + d);
+            let r = sleeps.get();
+            sleeps.set(r + 1);
+            script(r);
+        };
+        let mut activity = || ContainerActivity::Running;
+        let mut driver = Driver {
+            elapsed: &mut elapsed,
+            sleep: &mut sleep,
+            activity: &mut activity,
+            cancelled: &|| false,
+            started,
+            file_boundary,
+        };
+        read_with(
+            dir,
+            &ContainerId::new("c1").expect("id"),
+            RotationConfig::default(),
+            &opts,
+            out,
+            &mut |_| {},
+            &mut driver,
+        )
+    }
+
+    /// CRI-6・REPAIR-5・#3763: `started` は最初のポーリングの前（最初のスリープより前）に 1 回だけ呼ばれる。
+    #[test]
+    fn cri6_3763_started_fires_once_before_first_poll_sleep() {
+        use std::cell::RefCell;
+        let t = Tmp::new("started");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let events = RefCell::new(Vec::<&'static str>::new());
+        let opts = LogReadOptions::default()
+            .with_tail(super::super::TailCount::new(0).expect("tail"))
+            .with_follow(
+                FollowOptions::new(Duration::from_millis(1000))
+                    .expect("deadline")
+                    .with_poll_interval(Duration::from_millis(200))
+                    .expect("interval"),
+            );
+        let mut out = Vec::new();
+        follow_run_hooks(
+            &t.0,
+            opts,
+            &mut |_| events.borrow_mut().push("sleep"),
+            &|| events.borrow_mut().push("started"),
+            &|| {},
+            &mut out,
+        )
+        .expect("ok");
+        let ev = events.borrow();
+        assert_eq!(ev.first(), Some(&"started"), "{ev:?}");
+        assert_eq!(ev.iter().filter(|e| **e == "started").count(), 1, "{ev:?}");
+        assert!(out.is_empty(), "tail 0 emits nothing from the snapshot");
+    }
+
+    /// SUP-7・CRI-6・#3763: 世代の境目で出力先の状態を初期化すると、LF の無い切れた末尾（stdout）の後の次の世代の
+    /// stderr 行が stdout の本体として配送されない。
+    #[test]
+    fn sup7_file_boundary_resets_demux_between_generations() {
+        use super::super::RecordDemux;
+        use std::cell::RefCell;
+        struct Shared<'a, 'b>(&'a RefCell<RecordDemux<'b>>);
+        impl Write for Shared<'_, '_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.borrow_mut().flush()
+            }
+        }
+        let t = Tmp::new("boundary");
+        fs::write(t.0.join("c1.log"), b"stdout a\nstdout part").expect("seed");
+        let dir = t.0.clone();
+        let mut o = Vec::new();
+        let mut e = Vec::new();
+        let demux = RefCell::new(RecordDemux::new(
+            Some(&mut o as &mut dyn Write),
+            Some(&mut e as &mut dyn Write),
+        ));
+        let mut sink = Shared(&demux);
+        let opts = LogReadOptions::default()
+            .with_tail(super::super::TailCount::new(0).expect("tail"))
+            .with_follow(
+                FollowOptions::new(Duration::from_millis(1000))
+                    .expect("deadline")
+                    .with_poll_interval(Duration::from_millis(200))
+                    .expect("interval"),
+            );
+        follow_run_hooks(
+            &t.0,
+            opts,
+            &mut |r| {
+                if r == 0 {
+                    rotate(&dir, Some(b"stderr next\n"));
+                }
+            },
+            &|| {},
+            &|| {
+                let _ = demux.borrow_mut().finish();
+            },
+            &mut sink,
+        )
+        .expect("ok");
+        assert_eq!(o, b"part");
+        assert_eq!(e, b"next\n");
     }
 
     /// SUP-7: 1 回のローテーションをまたいでも欠落・重複しない。
@@ -590,6 +771,9 @@ mod tests {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
             activity: &mut activity,
+            cancelled: &|| false,
+            started: &|| {},
+            file_boundary: &|| {},
         };
         let mut out = Vec::new();
         let r = read_with(
@@ -607,7 +791,83 @@ mod tests {
         ));
     }
 
-    use crate::logs::{LogSink, RotatingFileSink};
+    use crate::logs::{FollowEnd, LogSink, RotatingFileSink};
+
+    fn end_of(o: &Outcome) -> Option<FollowEnd> {
+        o.result.as_ref().expect("ok").follow_end()
+    }
+
+    /// REPAIR-5・SUP-7・#3763: 取り消しの旗が立つと次の回で戻る（残りを出さない）。
+    #[test]
+    fn repair5_follow_cancel_returns_at_next_poll() {
+        let t = Tmp::new("cancel");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let flag = Cell::new(false);
+        let o = follow_run_cancel(
+            &t.0,
+            follow_opts(),
+            &mut |r| {
+                if r == 0 {
+                    flag.set(true);
+                }
+            },
+            &mut || ContainerActivity::Running,
+            &|| flag.get(),
+        );
+        assert_eq!(end_of(&o), Some(FollowEnd::Cancelled));
+        assert_eq!(o.sleeps, 1);
+        assert_eq!(o.out, b"stdout a\n");
+    }
+
+    /// REPAIR-5・#3763: スリープ中の取り消しの後に追記されたログは出力しない。
+    #[test]
+    fn repair5_follow_cancel_during_sleep_does_not_emit_appended() {
+        let t = Tmp::new("cancel-sleep");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let flag = Cell::new(false);
+        let dir = t.0.clone();
+        let o = follow_run_cancel(
+            &t.0,
+            follow_opts(),
+            &mut |r| {
+                if r == 0 {
+                    flag.set(true);
+                    append(&dir, "c1.log", b"stdout b\n");
+                }
+            },
+            &mut || ContainerActivity::Running,
+            &|| flag.get(),
+        );
+        assert_eq!(end_of(&o), Some(FollowEnd::Cancelled));
+        assert_eq!(o.sleeps, 1);
+        assert_eq!(o.out, b"stdout a\n");
+    }
+
+    /// SUP-7・#3763: 期限・停止・削除は各 `FollowEnd` で報告される。
+    #[test]
+    fn sup7_follow_end_reports_deadline_stop_and_removal() {
+        let t = Tmp::new("end-deadline");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let o = follow_run(&t.0, follow_opts(), &mut |_| {});
+        assert_eq!(end_of(&o), Some(FollowEnd::Deadline));
+
+        let t = Tmp::new("end-stopped");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let o = follow_run_probe(&t.0, follow_opts(), &mut |_| {}, &mut || {
+            ContainerActivity::NotRunning
+        });
+        assert_eq!(end_of(&o), Some(FollowEnd::Stopped));
+
+        let t = Tmp::new("end-removed");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let dir = t.0.clone();
+        let o = follow_run(&t.0, follow_opts(), &mut |r| {
+            if r == 0 {
+                fs::remove_file(dir.join("c1.log")).expect("rm");
+            }
+        });
+        assert_eq!(end_of(&o), Some(FollowEnd::LogRemoved));
+    }
 
     fn cid() -> ContainerId {
         ContainerId::new("c1").expect("id")
@@ -627,7 +887,6 @@ mod tests {
         o.result.expect("ok");
         assert_eq!(calls.get(), 0);
         assert_eq!(o.sleeps, 5);
-        drop(sink);
     }
 
     /// CLI-1: sink の drop 後に NotRunning なら、未 flush だった行も出して期限より前に成功で終わる。

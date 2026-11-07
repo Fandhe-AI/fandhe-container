@@ -5,10 +5,11 @@
 //! 停止は [`stop_streaming_on`] で包んだ shutdown future が担い、SIGTERM・SIGINT（#3226）の受信と同時に TCP の待ち受けを閉じる。
 //!
 //! # 現状（REPAIR-3）
-//! 結線済みは PortForward の NODE ネットワーク（hostNetwork）の pod だけ（#3755。[`NodeLoopbackDialer`]）。POD ネットワークの
-//! pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、保持役（#2877）と helper 方式（#3766）まで続く。Exec と Attach は
-//! 「`<kind> streaming is not wired`」の `UNIMPLEMENTED` のままである（#3761 Exec・#3763 Attach が
-//! `with_exec` / `with_attach` を [`production_stream_dispatcher`] へ足す）。`wiring` は bind 時に 1 回だけ取られるため、
+//! 結線済みは Attach（読み取り専用。[`log_attach::LogFollowAttachBackend`]。回転ログの follow で、stdin・tty は
+//! `INVALID_ARGUMENT`。完全版は #3765 の設計。#3763）と、PortForward の NODE ネットワーク（hostNetwork）の pod
+//! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
+//! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は「exec streaming is not wired」の `UNIMPLEMENTED` のまま
+//! （#3761 が `with_exec` を [`production_stream_dispatcher`] へ足す）。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
 //!
 //! # 安全側の既定
@@ -23,10 +24,14 @@
 //! # 停止（REPAIR-5）
 //! 停止は待ちを足さない（accept タスクの abort は同期）。受け付け済みで Upgrade しない接続はプロセス終了時の
 //! `rt.shutdown_timeout` が打ち切るため、`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない。
+//! Attach のセッションはランタイムの停止でタスクごと drop され、読み口の drop が取り消しの旗を立てて follow スレッドは
+//! 1 ポーリング（200 ms）以内に抜ける。スレッドは detached でプロセスの停止を待たせない。
 //! PortForward の Upgrade 後のセッションと実行中の blocking の dial（最長 `dial_timeout` 10 秒）も、プロセス終了時の
 //! `rt.shutdown_timeout` が打ち切るため待ちは増えず、`SHUTDOWN_TOTAL_BOUND` は変わらない（#3755 で再評価）。
-//! Exec・Attach の backend が入って長寿命のセッションが生まれたら、停止時のドレイン方針を再評価する。
+//! Exec の backend が入って長寿命のセッションが生まれたら、停止時のドレイン方針を再評価する。
 //! 設計は `docs/design/cri-streaming-server.md`。
+
+pub mod log_attach;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -36,6 +41,7 @@ mod node_dialer;
 pub use node_dialer::NodeLoopbackDialer;
 
 use fandhe_container_cri::error::CriErrorCode;
+use fandhe_container_cri::streaming::attach::{AttachBackend, AttachHandler};
 use fandhe_container_cri::streaming::port_forward::{PortForwardConfig, PortForwardHandler};
 use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
@@ -48,17 +54,24 @@ pub fn production_streaming_config() -> StreamingConfig {
     StreamingConfig::default()
 }
 
-/// 本番の `StreamDispatcher`。PortForward は NODE ネットワークの pod だけ結線済み（#3755）。
+/// 本番の `StreamDispatcher`。Attach（読み取り専用の `attach`。#3763）と PortForward（NODE ネットワークの pod だけ。#3755）を結線する。
 ///
-/// 兄弟 issue（#3761・#3763）が `with_exec` / `with_attach` をここへ足す。ハンドラの構築失敗
-/// （設定検証。既定では起きない）は `Internal` の固定文言に写す。
-pub fn production_stream_dispatcher() -> Result<StreamDispatcher, PluginError> {
+/// 兄弟 issue（#3761）が `with_exec` をここへ足す。期限は本番の設定（[`production_streaming_config`]）の
+/// `session_limits()`。ハンドラの構築失敗（設定検証。既定では起きない）は `Internal` の固定文言に写す。
+pub fn production_stream_dispatcher(
+    attach: Arc<dyn AttachBackend>,
+) -> Result<StreamDispatcher, PluginError> {
+    let attach_handler = AttachHandler::new(attach, production_streaming_config().session_limits())
+        .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?
+        .read_only();
     let port_forward = PortForwardHandler::new(
         Arc::new(NodeLoopbackDialer::new()),
         PortForwardConfig::default(),
     )
     .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?;
-    Ok(StreamDispatcher::new().with_port_forward(Arc::new(port_forward)))
+    Ok(StreamDispatcher::new()
+        .with_attach(Arc::new(attach_handler))
+        .with_port_forward(Arc::new(port_forward)))
 }
 
 /// dispatcher を組んでから `StreamingServer` を起動する。`tokio` の実行時の中で呼ぶ。
@@ -66,8 +79,9 @@ pub fn production_stream_dispatcher() -> Result<StreamDispatcher, PluginError> {
 /// 失敗は `Unavailable`（bind・アドレス取得）と `Internal`（設定検証。本番の既定では起きない）の固定文言に写す。
 pub async fn bind_production_streaming(
     config: StreamingConfig,
+    attach: Arc<dyn AttachBackend>,
 ) -> Result<StreamingServer, PluginError> {
-    let dispatcher = production_stream_dispatcher()?;
+    let dispatcher = production_stream_dispatcher(attach)?;
     StreamingServer::bind_with_handler(config, Arc::new(dispatcher))
         .await
         .map_err(|e| {
@@ -96,12 +110,23 @@ mod tests {
     use fandhe_container_cri::runtime::v1 as cri;
     use fandhe_container_cri::runtime::v1::runtime_service_server::RuntimeService;
     use fandhe_container_cri::runtime_service::CriRuntimeService;
-    use fandhe_container_cri::streaming::StreamWiring;
+    use fandhe_container_cri::streaming::{StreamKind, StreamWiring};
     use tonic::{Code, Request};
 
     use super::*;
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// 偽の probe と存在しないログ置き場の backend（結線の試験用。ログは読まれない）。
+    fn fake_attach() -> Arc<dyn AttachBackend> {
+        Arc::new(
+            log_attach::LogFollowAttachBackend::new(
+                std::env::temp_dir().join("fandhe-attach-unused"),
+                log_attach::test_support::FakeProbe::running(),
+            )
+            .expect("backend"),
+        )
+    }
 
     async fn connect(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
         tokio::task::spawn_blocking(move || {
@@ -122,18 +147,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cri6_3754_production_server_listens_on_loopback_with_port_forward_only() {
-        let server = bind_production_streaming(production_streaming_config())
+    async fn cri6_3754_production_server_listens_on_loopback_with_attach_and_port_forward() {
+        let server = bind_production_streaming(production_streaming_config(), fake_attach())
             .await
             .expect("bind");
         let addr = server.local_addr();
         assert_eq!(addr.ip(), LOOPBACK);
         assert_ne!(addr.port(), 0);
         let issuer = server.issuer();
+        // 結線済みは Attach（読み取り専用。stdin・tty を宣言しない。#3763）と PortForward（NODE のみ。#3755）。
         assert_eq!(
             issuer.wiring(),
-            StreamWiring::only(fandhe_container_cri::streaming::StreamKind::PortForward)
+            StreamWiring::only(StreamKind::Attach).with(StreamKind::PortForward)
         );
+        assert!(!issuer.wiring().attach_interactive());
         assert!(!issuer.wiring().port_forward_pod_network());
         assert_eq!(
             issuer.base_url(),
@@ -145,7 +172,7 @@ mod tests {
     /// Exec・Attach は未結線のまま。PortForward は結線済み（#3755）で、未知の sandbox は `NOT_FOUND`。兄弟 issue が結線を足したら更新する。
     #[tokio::test]
     async fn cri6_repair3_3754_injected_service_keeps_unwired_rpcs_unimplemented() {
-        let server = bind_production_streaming(production_streaming_config())
+        let server = bind_production_streaming(production_streaming_config(), fake_attach())
             .await
             .expect("bind");
         let svc = CriRuntimeService::new().with_streaming(server.issuer());
@@ -159,6 +186,7 @@ mod tests {
             .expect_err("exec");
         assert_eq!(e.code(), Code::Unimplemented);
         assert_eq!(e.message(), "exec streaming is not wired");
+        // Attach は結線済み（#3763）。未知の ID は存在照合の `NOT_FOUND` になる。
         let e = svc
             .attach(Request::new(cri::AttachRequest {
                 container_id: "nope".into(),
@@ -167,8 +195,7 @@ mod tests {
             }))
             .await
             .expect_err("attach");
-        assert_eq!(e.code(), Code::Unimplemented);
-        assert_eq!(e.message(), "attach streaming is not wired");
+        assert_eq!(e.code(), Code::NotFound);
         let e = svc
             .port_forward(Request::new(cri::PortForwardRequest {
                 pod_sandbox_id: "nope".into(),
@@ -183,7 +210,7 @@ mod tests {
     /// CRI-6・REPAIR-3・SEC-1・#3755: 本番の結線で NODE の sandbox は URL を返し、POD の sandbox は `UNIMPLEMENTED`。
     #[tokio::test]
     async fn cri6_3755_production_port_forward_node_ok_pod_unimplemented() {
-        let server = bind_production_streaming(production_streaming_config())
+        let server = bind_production_streaming(production_streaming_config(), fake_attach())
             .await
             .expect("bind");
         let svc = CriRuntimeService::new().with_streaming(server.issuer());
@@ -251,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn repair5_3754_streaming_listener_closes_on_shutdown() {
-        let server = bind_production_streaming(production_streaming_config())
+        let server = bind_production_streaming(production_streaming_config(), fake_attach())
             .await
             .expect("bind");
         let addr = server.local_addr();
@@ -285,16 +312,98 @@ mod tests {
     async fn cri6_3754_bind_failure_is_fixed_vocabulary() {
         let held = std::net::TcpListener::bind((LOOPBACK, 0)).expect("hold");
         let busy = held.local_addr().expect("addr");
-        let e = bind_production_streaming(production_streaming_config().with_bind(busy))
-            .await
-            .expect_err("busy port");
+        let e =
+            bind_production_streaming(production_streaming_config().with_bind(busy), fake_attach())
+                .await
+                .expect_err("busy port");
         assert_eq!(e.code(), PluginErrorCode::Unavailable);
         assert_eq!(e.message(), MSG_STREAMING_START_FAILED);
         let ext = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let e = bind_production_streaming(production_streaming_config().with_bind(ext))
-            .await
-            .expect_err("external without opt-in");
+        let e =
+            bind_production_streaming(production_streaming_config().with_bind(ext), fake_attach())
+                .await
+                .expect_err("external without opt-in");
         assert_eq!(e.code(), PluginErrorCode::Internal);
         assert_eq!(e.message(), MSG_STREAMING_START_FAILED);
+    }
+
+    /// CRI-6・#3763: 本番構成（`bind_production_streaming` + `with_streaming`）の `Attach` RPC が URL を返す。
+    /// stdin・tty つきは URL を返さず `INVALID_ARGUMENT`。
+    #[tokio::test]
+    async fn cri6_3763_production_attach_returns_url() {
+        let server = bind_production_streaming(production_streaming_config(), fake_attach())
+            .await
+            .expect("bind");
+        let issuer = server.issuer();
+        assert!(issuer.wiring().is_wired(StreamKind::Attach));
+        let svc = CriRuntimeService::new().with_streaming(Arc::clone(&issuer));
+        let pod = cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: "pod".into(),
+                uid: "uid-1".into(),
+                namespace: "ns".into(),
+                attempt: 0,
+            }),
+            ..Default::default()
+        };
+        let sandbox = svc
+            .run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
+                config: Some(pod.clone()),
+                runtime_handler: String::new(),
+            }))
+            .await
+            .expect("sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        let container = svc
+            .create_container(Request::new(cri::CreateContainerRequest {
+                pod_sandbox_id: sandbox,
+                config: Some(cri::ContainerConfig {
+                    metadata: Some(cri::ContainerMetadata {
+                        name: "c".into(),
+                        attempt: 0,
+                    }),
+                    image: Some(cri::ImageSpec {
+                        image: "busybox:1.36".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_config: Some(pod),
+            }))
+            .await
+            .expect("container")
+            .into_inner()
+            .container_id;
+        svc.start_container(Request::new(cri::StartContainerRequest {
+            container_id: container.clone(),
+        }))
+        .await
+        .expect("start");
+        let url = svc
+            .attach(Request::new(cri::AttachRequest {
+                container_id: container.clone(),
+                stdout: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("attach url")
+            .into_inner()
+            .url;
+        assert!(
+            url.starts_with(&format!("{}/attach/", issuer.base_url())),
+            "{url}"
+        );
+        let e = svc
+            .attach(Request::new(cri::AttachRequest {
+                container_id: container,
+                stdin: true,
+                stdout: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("stdin refused");
+        assert_eq!(e.code(), Code::InvalidArgument);
+        assert_eq!(e.message(), "attach with stdin or tty is not supported");
     }
 }

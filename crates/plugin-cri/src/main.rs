@@ -291,6 +291,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         streaming::production_streaming_config(),
         attach_backend,
         exec_dyn,
+        backends.streaming_op_recorder(),
     )) {
         Ok(s) => s,
         Err(e) => return fail_err(&e),

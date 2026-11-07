@@ -46,6 +46,7 @@ mod node_dialer;
 pub use node_dialer::NodeLoopbackDialer;
 
 use fandhe_container_cri::error::CriErrorCode;
+use fandhe_container_cri::instrument::CriOpRecorder;
 use fandhe_container_cri::streaming::attach::{AttachBackend, AttachHandler};
 use fandhe_container_cri::streaming::exec::{
     ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
@@ -70,6 +71,7 @@ pub fn production_streaming_config() -> StreamingConfig {
 pub fn production_stream_dispatcher(
     attach: Arc<dyn AttachBackend>,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
+    recorder: Arc<dyn CriOpRecorder>,
 ) -> Result<StreamDispatcher, PluginError> {
     let attach_handler = AttachHandler::new(attach, production_streaming_config().session_limits())
         .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?
@@ -92,7 +94,9 @@ pub fn production_stream_dispatcher(
         let exec_handler = ExecStreamHandler::new(launcher, config)
             .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?
             .without_tty()
-            .absolute_command_only();
+            .absolute_command_only()
+            // 本番の記録先を注入する（既定の Noop だと統計出力に届かない。REPAIR-4）。
+            .with_recorder(recorder);
         dispatcher = dispatcher.with_exec(Arc::new(exec_handler));
     }
     Ok(dispatcher)
@@ -105,8 +109,9 @@ pub async fn bind_production_streaming(
     config: StreamingConfig,
     attach: Arc<dyn AttachBackend>,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
+    recorder: Arc<dyn CriOpRecorder>,
 ) -> Result<StreamingServer, PluginError> {
-    let dispatcher = production_stream_dispatcher(attach, exec)?;
+    let dispatcher = production_stream_dispatcher(attach, exec, recorder)?;
     StreamingServer::bind_with_handler(config, Arc::new(dispatcher))
         .await
         .map_err(|e| {
@@ -150,6 +155,10 @@ mod tests {
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     /// 偽の probe と存在しないログ置き場の backend（結線の試験用。ログは読まれない）。
+    fn noop_recorder() -> Arc<dyn CriOpRecorder> {
+        Arc::new(fandhe_container_cri::instrument::NoopCriOpRecorder)
+    }
+
     fn fake_attach() -> Arc<dyn AttachBackend> {
         Arc::new(
             log_attach::LogFollowAttachBackend::new(
@@ -180,9 +189,14 @@ mod tests {
 
     #[tokio::test]
     async fn cri6_3754_production_server_listens_on_loopback_with_attach_and_port_forward() {
-        let server = bind_production_streaming(production_streaming_config(), fake_attach(), None)
-            .await
-            .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let addr = server.local_addr();
         assert_eq!(addr.ip(), LOOPBACK);
         assert_ne!(addr.port(), 0);
@@ -204,9 +218,14 @@ mod tests {
     /// exec 起動役を渡さない構成（非 Linux 相当）では Exec は未結線の `UNIMPLEMENTED` のまま（#3761）。Attach・PortForward は結線済み。
     #[tokio::test]
     async fn cri6_repair3_3754_injected_service_without_exec_launcher_keeps_exec_unimplemented() {
-        let server = bind_production_streaming(production_streaming_config(), fake_attach(), None)
-            .await
-            .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let svc = CriRuntimeService::new().with_streaming(server.issuer());
         let e = svc
             .exec(Request::new(cri::ExecRequest {
@@ -242,9 +261,14 @@ mod tests {
     /// CRI-6・REPAIR-3・SEC-1・#3755: 本番の結線で NODE の sandbox は URL を返し、POD の sandbox は `UNIMPLEMENTED`。
     #[tokio::test]
     async fn cri6_3755_production_port_forward_node_ok_pod_unimplemented() {
-        let server = bind_production_streaming(production_streaming_config(), fake_attach(), None)
-            .await
-            .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let svc = CriRuntimeService::new().with_streaming(server.issuer());
         async fn run(
             svc: &CriRuntimeService,
@@ -310,9 +334,14 @@ mod tests {
 
     #[tokio::test]
     async fn repair5_3754_streaming_listener_closes_on_shutdown() {
-        let server = bind_production_streaming(production_streaming_config(), fake_attach(), None)
-            .await
-            .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let addr = server.local_addr();
         let flag = Arc::new(AtomicBool::new(false));
         let f = Arc::clone(&flag);
@@ -348,6 +377,7 @@ mod tests {
             production_streaming_config().with_bind(busy),
             fake_attach(),
             None,
+            noop_recorder(),
         )
         .await
         .expect_err("busy port");
@@ -358,6 +388,7 @@ mod tests {
             production_streaming_config().with_bind(ext),
             fake_attach(),
             None,
+            noop_recorder(),
         )
         .await
         .expect_err("external without opt-in");
@@ -369,9 +400,14 @@ mod tests {
     /// stdin・tty つきは URL を返さず `INVALID_ARGUMENT`。
     #[tokio::test]
     async fn cri6_3763_production_attach_returns_url() {
-        let server = bind_production_streaming(production_streaming_config(), fake_attach(), None)
-            .await
-            .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let issuer = server.issuer();
         assert!(issuer.wiring().is_wired(StreamKind::Attach));
         let svc = CriRuntimeService::new().with_streaming(Arc::clone(&issuer));
@@ -479,10 +515,14 @@ mod tests {
     #[tokio::test]
     async fn cri6_3761_production_exec_returns_url() {
         let launcher: Arc<dyn ExecStreamLauncher> = Arc::new(NeverLauncher);
-        let server =
-            bind_production_streaming(production_streaming_config(), fake_attach(), Some(launcher))
-                .await
-                .expect("bind");
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            Some(launcher),
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
         let issuer = server.issuer();
         let w = issuer.wiring();
         assert!(w.is_wired(StreamKind::Exec));

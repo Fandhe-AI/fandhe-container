@@ -18,7 +18,7 @@
 //! # 後始末（REPAIR-5）
 //! [`ExecSession`] の `exit` future を drop する（セッションの終了・切断・期限切れ）と、持ち主の `HelperGuard` が helper を
 //! SIGKILL する。helper の channel が閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を回収する。回収できない
-//! helper は専用スレッドが `wait` して回収し（Child を落とさない）、その数が上限に達したら新しい exec を `RESOURCE_EXHAUSTED` にする。kill は呼び出しスレッドをブロックしない。
+//! helper は専用スレッドが有限の期限（`REAP_BUDGET`）まで `try_wait` して回収し、期限後は Child を保持一覧へ移して（落とさない）、その数が上限に達したら新しい exec を `RESOURCE_EXHAUSTED` にする。kill は呼び出しスレッドをブロックしない。
 //! [`SupervisorExecLauncher::shutdown_all`] は plugin-cri の停止時に追跡中の全 helper を kill する。停止後の `launch` は拒否し、登録の競合で漏れた helper も直ちに止める。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
@@ -73,6 +73,12 @@ const HANDOVER_BUDGET: Duration = Duration::from_secs(5);
 
 /// `Started`（と tty の `PtyMaster`）を待つ上限。cri の `launch_timeout` の既定 30 秒より短くする。
 const STARTED_BUDGET: Duration = Duration::from_secs(25);
+
+/// SIGKILL 後に回収スレッドが終了を待つ上限。超えた helper は保持一覧（`Shared::stuck`）へ移す（REPAIR-5）。
+const REAP_BUDGET: Duration = Duration::from_secs(10);
+
+/// 回収スレッドの `try_wait` の間隔。
+const REAP_POLL: Duration = Duration::from_millis(50);
 
 /// helper の期限（`--timeout-ms`）に足す、`Result` を待つ余裕。
 const RESULT_GRACE: Duration = Duration::from_secs(30);
@@ -163,6 +169,68 @@ struct Shared {
     live: Mutex<Live>,
 }
 
+/// 起動 future のキャンセル状態。future の drop で取消を立て、起動済みの helper を直ちに止める（REPAIR-5）。
+/// `spawn_blocking` の処理は JoinHandle を落としても止まらないため、blocking 側は段ごとにこの印を確認する。
+#[derive(Default)]
+struct LaunchCancel {
+    state: Mutex<CancelState>,
+}
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: bool,
+    /// 起動済みで、まだセッションへ渡っていない helper の持ち主。
+    guard: Option<Arc<HelperGuard>>,
+}
+
+impl LaunchCancel {
+    fn is_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cancelled
+    }
+
+    /// 起動済みの helper を登録する。既に取消済みなら登録せず `false`（呼び出し側が止める）。
+    fn register(&self, guard: &Arc<HelperGuard>) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.cancelled {
+            return false;
+        }
+        st.guard = Some(Arc::clone(guard));
+        true
+    }
+
+    /// 取消を立て、登録済みの helper を kill する。
+    fn cancel(&self) {
+        let guard = {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.cancelled = true;
+            st.guard.take()
+        };
+        if let Some(g) = guard {
+            g.kill();
+        }
+    }
+
+    /// 起動が完了し、helper がセッションへ渡った。以後の drop で kill しない。
+    fn disarm(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .guard = None;
+    }
+}
+
+/// future の drop で [`LaunchCancel::cancel`] を呼ぶ。
+struct CancelOnDrop(Arc<LaunchCancel>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// 同時数の枠。drop で返す。
 struct Slot(Arc<Shared>);
 
@@ -227,7 +295,23 @@ impl HelperGuard {
                     .unwrap_or_else(PoisonError::into_inner)
                     .take();
                 if let Some(mut c) = taken {
-                    let _ = c.wait();
+                    // 有限の期限まで `try_wait` を繰り返す。終了しない helper（中断不能な I/O 等）は保持一覧へ移し、
+                    // スレッドは終える（REPAIR-5）。保持一覧へ入れてから reaping を減らし、数え漏れを作らない。
+                    let give_up = Instant::now() + REAP_BUDGET;
+                    loop {
+                        match c.try_wait() {
+                            Ok(Some(_)) | Err(_) => break,
+                            Ok(None) if Instant::now() >= give_up => {
+                                shared_for_thread
+                                    .stuck
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .push(c);
+                                break;
+                            }
+                            Ok(None) => std::thread::sleep(REAP_POLL),
+                        }
+                    }
                 }
                 shared_for_thread.reaping.fetch_sub(1, Ordering::SeqCst);
             });
@@ -447,7 +531,15 @@ impl SupervisorExecLauncher {
     }
 
     /// 状態を照合して helper を起動し、`Started`（tty なら `PtyMaster` も）まで進める。ブロッキング。
-    fn launch_blocking(&self, req: &ExecLaunch) -> Result<Launched, CriError> {
+    fn launch_blocking(
+        &self,
+        req: &ExecLaunch,
+        cancel: &LaunchCancel,
+    ) -> Result<Launched, CriError> {
+        let cancelled = || CriError::unavailable("exec launch was cancelled");
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
         let caps = self.spawner.capabilities();
         if req.tty && !caps.tty {
             return Err(CriError::invalid_argument("exec with tty is not supported"));
@@ -485,6 +577,10 @@ impl SupervisorExecLauncher {
             (ContainerState::Running, Some(pid)) => pid,
             _ => return Err(CriError::failed_precondition("container is not running")),
         };
+        // 状態ストアの読み取りの間に取消されていたら、helper を起動しない（REPAIR-5）。
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
         // tty のときは stdio の fd を送らない（mask 0。supervisor 側の pty 結線が入るまでの暫定）。
         let mask = if req.tty {
             StdioMask::from_presence(false, false, false)
@@ -536,6 +632,10 @@ impl SupervisorExecLauncher {
             shared: Arc::clone(&self.shared),
             _slot: slot,
         });
+        if !cancel.register(&guard) {
+            // spawn の間に取消された。`guard` の drop で helper を止める。
+            return Err(cancelled());
+        }
         let stopped = {
             let mut live = self
                 .shared
@@ -569,6 +669,9 @@ impl SupervisorExecLauncher {
         // helper へ渡した端はここで閉じる（EOF を正しく観測するため）。
         drop((child_stdin, child_stdout, child_stderr));
 
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
         let started_deadline = Instant::now() + STARTED_BUDGET;
         // `Result` が先に来たら起動の失敗（`Started` 前）。
         match recv_from_helper(&channel, started_deadline) {
@@ -687,9 +790,16 @@ impl ExecStreamLauncher for SupervisorExecLauncher {
                 shared: Arc::clone(&self.shared),
             };
             let req2 = req.clone();
-            let launched = tokio::task::spawn_blocking(move || this.launch_blocking(&req2))
-                .await
-                .map_err(|_| CriError::internal("exec failed"))??;
+            // future が drop（`launch_timeout` の期限切れ・切断）されたら、blocking 側へ取消を伝えて起動済みの helper を止める。
+            let cancel = Arc::new(LaunchCancel::default());
+            let _on_drop = CancelOnDrop(Arc::clone(&cancel));
+            let cancel_for_task = Arc::clone(&cancel);
+            let launched =
+                tokio::task::spawn_blocking(move || this.launch_blocking(&req2, &cancel_for_task))
+                    .await
+                    .map_err(|_| CriError::internal("exec failed"))??;
+            // helper の持ち主は `launched` へ移った。以降の drop は `Launched` / `ExecSession` が担う。
+            cancel.disarm();
             let Launched {
                 guard,
                 stdin,

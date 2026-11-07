@@ -294,6 +294,15 @@ impl CriPluginBackends {
         ))
     }
 
+    /// ストリーミング（Exec のセッション・stdio の読み書き）の計装先。`runtime_service` と同じ共有記録器へ `cri.*` で記録する
+    /// （統計出力に届く。REPAIR-4・CRI-6）。
+    pub fn streaming_op_recorder(&self) -> Arc<dyn CriOpRecorder> {
+        Arc::new(CoreCriRecorder::new(
+            Arc::clone(&self.recorder),
+            Arc::clone(&self.oci_recorder),
+        ))
+    }
+
     /// 本番の Exec の起動役（supervisor の `stream-exec` helper 経由。CRI-6・SEC-1・SUP-6・#3761）を作る。
     ///
     /// 状態ルートは `production()` の固定位置で、要求の入力から受けない。注入で組んだとき（状態ルートが無い）は

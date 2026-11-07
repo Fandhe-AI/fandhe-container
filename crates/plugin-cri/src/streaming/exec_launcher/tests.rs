@@ -528,3 +528,36 @@ async fn cri6_3761_launch_after_shutdown_is_rejected() {
     assert!(pids.lock().expect("lock").is_empty());
     assert_eq!(launcher.active_sessions(), 0);
 }
+
+/// 取消済みの `LaunchCancel` には helper を登録できず、登録済みなら取消で kill される（REPAIR-5・#3761）。
+#[test]
+fn repair5_3761_launch_cancel_kills_registered_helper_and_rejects_late_register() {
+    let shared = Arc::new(Shared::default());
+    let mk = |shared: &Arc<Shared>| {
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let slot = shared.acquire().expect("slot");
+        Arc::new(HelperGuard {
+            child: Mutex::new(Some(child)),
+            shared: Arc::clone(shared),
+            _slot: slot,
+        })
+    };
+    let cancel = LaunchCancel::default();
+    let guard = mk(&shared);
+    assert!(cancel.register(&guard));
+    cancel.cancel();
+    assert!(cancel.is_cancelled());
+    assert!(
+        guard
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none(),
+        "cancel must take and kill the child"
+    );
+    let late = mk(&shared);
+    assert!(!cancel.register(&late), "late register must be refused");
+}

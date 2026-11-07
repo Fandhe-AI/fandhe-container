@@ -576,6 +576,31 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
         Ok(q)
     }
 
+    /// `QueueNotify(value)` を配送してよいか判定し、よければキュー番号を返す（MVM-1・#3698）。
+    ///
+    /// MMIO の `QUEUE_NOTIFY` 書き込み（`write_reg`）と、ioeventfd の通知スレッド（`microvm::IoEventPoller`）の
+    /// 両方がこの 1 か所を通る。KVM の ioeventfd はデバイスの状態に関係なく発火するため、通知の意味が 2 経路でずれないよう受理条件を共有する。
+    /// 異常状態（FAILED / DEVICE_NEEDS_RESET）では DRIVER_OK が残っていても配送しない。範囲外のキューと ready でないキューも無視する。
+    pub fn accept_queue_notify(&self, value: u64) -> Result<u16, IgnoredAccess> {
+        if !self.status.contains(DeviceStatus::DRIVER_OK)
+            || self.status.contains(DeviceStatus::FAILED)
+            || self.status.contains(DeviceStatus::DEVICE_NEEDS_RESET)
+        {
+            return Err(IgnoredAccess::WrongDeviceState);
+        }
+        let idx = usize::try_from(value).map_err(|_| IgnoredAccess::InvalidSelector)?;
+        let q = self.queues.get(idx).ok_or(IgnoredAccess::InvalidSelector)?;
+        if !q.ready {
+            return Err(IgnoredAccess::WrongDeviceState);
+        }
+        u16::try_from(value).map_err(|_| IgnoredAccess::InvalidSelector)
+    }
+
+    /// デバイスが持つキューの数（virtio-block は 1、virtio-net は 2）。ioeventfd の登録対象の列挙に使う（#3698）。
+    pub fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
     fn write_reg(&mut self, offset: u64, value: u32) -> Result<MmioWriteOutcome, IgnoredAccess> {
         match offset {
             reg::DEVICE_FEATURES_SEL => {
@@ -619,22 +644,9 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             reg::QUEUE_DRIVER_HIGH => self.write_addr(value, |q| &mut q.driver_area, true),
             reg::QUEUE_DEVICE_LOW => self.write_addr(value, |q| &mut q.device_area, false),
             reg::QUEUE_DEVICE_HIGH => self.write_addr(value, |q| &mut q.device_area, true),
-            reg::QUEUE_NOTIFY => {
-                // 異常状態（FAILED / DEVICE_NEEDS_RESET）では DRIVER_OK が残っていても通知を配送しない。
-                if !self.status.contains(DeviceStatus::DRIVER_OK)
-                    || self.status.contains(DeviceStatus::FAILED)
-                    || self.status.contains(DeviceStatus::DEVICE_NEEDS_RESET)
-                {
-                    return Err(IgnoredAccess::WrongDeviceState);
-                }
-                let idx = usize::try_from(value).map_err(|_| IgnoredAccess::InvalidSelector)?;
-                let q = self.queues.get(idx).ok_or(IgnoredAccess::InvalidSelector)?;
-                if !q.ready {
-                    return Err(IgnoredAccess::WrongDeviceState);
-                }
-                let index = u16::try_from(value).map_err(|_| IgnoredAccess::InvalidSelector)?;
-                Ok(MmioWriteOutcome::QueueNotify(index))
-            }
+            reg::QUEUE_NOTIFY => self
+                .accept_queue_notify(u64::from(value))
+                .map(MmioWriteOutcome::QueueNotify),
             reg::INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
                 Ok(MmioWriteOutcome::InterruptAcknowledged)
@@ -1258,5 +1270,49 @@ mod tests {
         }
         assert!(mk(vec![32768]).is_ok());
         assert!(mk(vec![1; 8]).is_ok());
+    }
+
+    /// MVM-1・#3698: ioeventfd 経路の受理条件（`accept_queue_notify`）は MMIO の QUEUE_NOTIFY と同じ結果を返す。
+    #[test]
+    fn mvm1_3698_accept_queue_notify_matches_mmio_write() {
+        let mut t = net();
+        assert_eq!(t.queue_count(), 3);
+        // DRIVER_OK 前。
+        assert_eq!(
+            t.accept_queue_notify(0),
+            Err(IgnoredAccess::WrongDeviceState)
+        );
+        negotiate_ok(&mut t);
+        setup_queue(&mut t, 0, 16);
+        wr(&mut t, reg::STATUS, 15);
+        assert_eq!(t.accept_queue_notify(0), Ok(0));
+        // ready でないキュー・範囲外の index。
+        assert_eq!(
+            t.accept_queue_notify(1),
+            Err(IgnoredAccess::WrongDeviceState)
+        );
+        assert_eq!(
+            t.accept_queue_notify(9),
+            Err(IgnoredAccess::InvalidSelector)
+        );
+        assert_eq!(
+            t.accept_queue_notify(u64::MAX),
+            Err(IgnoredAccess::InvalidSelector)
+        );
+        // 2 経路の一致。
+        for v in [0u32, 1, 9] {
+            let via_mmio = wr(&mut t, reg::QUEUE_NOTIFY, v);
+            let expect = match t.accept_queue_notify(u64::from(v)) {
+                Ok(q) => MmioWriteOutcome::QueueNotify(q),
+                Err(e) => MmioWriteOutcome::Ignored(e),
+            };
+            assert_eq!(via_mmio, expect, "value {v}");
+        }
+        // FAILED 後。
+        wr(&mut t, reg::STATUS, 15 | 128);
+        assert_eq!(
+            t.accept_queue_notify(0),
+            Err(IgnoredAccess::WrongDeviceState)
+        );
     }
 }

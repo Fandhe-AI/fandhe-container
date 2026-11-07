@@ -4,14 +4,15 @@
 //! `KVM_IRQFD` / `KVM_IOEVENTFD` を発行して [`IrqFd`] / [`IoEventFd`] を返す。[`IrqFd`] は
 //! `crate::interrupt::InterruptLine` を実装し、`signal` で書いた eventfd を KVM が GSI の割り込みに変える。
 //! [`IoEventFd`] はゲストの `QueueNotify` 書き込み（VM exit なし）で発火する eventfd を持ち、
-//! [`IoEventFd::consume`] で回数を読む。[`IrqFd`] は VM fd を dup して所有する（VM 構成体が VM fd と一緒に保持できる。TASK-75.2）。
-//! [`IoEventFd`] は `'vm` の借用。どちらも drop で登録を解く。
+//! [`IoEventFd::consume`] で回数を読む。[`IrqFd`]・[`IoEventFd`] はどちらも VM fd を dup して所有する（VM 構成体が VM fd と
+//! 一緒に保持できる。TASK-75.2・#3698）。どちらも drop で登録を解く。
 //! #3918 で x86_64 の COM1 用に `KVM_IRQ_LINE` の level 線 `IrqLevelLine`（x86_64 のみ）を足した（`VmFd::register_irq_line` が返す）。
 //! #3943 で aarch64 のシリアルの SPI（INTID 33）にも同じ線を広げた（`VmFd::register_spi_line`。`irq` は `Arm64SpiIrqLine` のエンコード）。
 //!
 //! # 待ちを持たない設計（REPAIR-5）
-//! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。`poll` / `epoll` で
-//! 待つ常駐のイベントループは起動フロー（TASK-75）・`fandhe-container-plugin-microvm`（TASK-117）の範囲で未実装。
+//! eventfd は非ブロックで、読み取りは [`EventFd::consume`] のみ（`WouldBlock` は 0 件）。この module 自体は待たない。
+//! `assemble` が結んだ ioeventfd を期限つきの `poll(2)` で待つ通知スレッドは `crate::microvm` の `IoEventPoller`（#3698。
+//! 待ちは `crate::sys::poll_readable`）が持つ。
 //!
 //! # 残余（REPAIR-3・REPAIR-4）
 //! drop 時の `KVM_IRQFD` / `KVM_IOEVENTFD` の解除が失敗しても panic せず待たない。失敗は種別ごとの件数
@@ -298,15 +299,18 @@ impl Arm64SpiIrqLine {
 }
 
 /// `KVM_IOEVENTFD` で結んだ eventfd。ゲストの対象アドレスへの書き込みで発火する（VM exit なし）。
+///
+/// [`IrqFd`] と同じく VM fd の dup を所有するので借用を持たず、VM 構成体（`crate::microvm::MicroVm`）が VM fd と同じ構造体に
+/// 保持できる（#3698）。drop の解除は dup した fd で発行するため、VM fd 本体より後に drop されても効く。
 #[derive(Debug)]
-pub struct IoEventFd<'vm> {
-    vm: BorrowedFd<'vm>,
+pub struct IoEventFd {
+    vm: OwnedFd,
     event: EventFd,
     spec: IoEventSpec,
 }
 
-impl<'vm> IoEventFd<'vm> {
-    pub(crate) fn registered(vm: BorrowedFd<'vm>, event: EventFd, spec: IoEventSpec) -> Self {
+impl IoEventFd {
+    pub(crate) fn registered(vm: OwnedFd, event: EventFd, spec: IoEventSpec) -> Self {
         Self { vm, event, spec }
     }
 
@@ -321,7 +325,7 @@ impl<'vm> IoEventFd<'vm> {
     }
 }
 
-impl AsFd for IoEventFd<'_> {
+impl AsFd for IoEventFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.event.as_fd()
     }
@@ -335,11 +339,11 @@ pub(crate) fn ioevent_args(spec: &IoEventSpec) -> (u64, bool) {
     }
 }
 
-impl Drop for IoEventFd<'_> {
+impl Drop for IoEventFd {
     fn drop(&mut self) {
         let (addr, pio) = ioevent_args(&self.spec);
         if let Err(e) = sys::kvm_ioeventfd(
-            self.vm,
+            self.vm.as_fd(),
             self.event.as_fd(),
             addr,
             self.spec.len(),
@@ -420,13 +424,9 @@ mod tests {
     #[test]
     fn repair4_3679_ioeventfd_deassign_failure_is_observable() {
         let before = deassign_failures().ioeventfd.count;
-        let null = File::open("/dev/null").unwrap();
+        let null = OwnedFd::from(File::open("/dev/null").unwrap());
         let spec = IoEventSpec::virtio_mmio_queue_notify(0x2000, 0).unwrap();
-        drop(IoEventFd::registered(
-            null.as_fd(),
-            EventFd::new().unwrap(),
-            spec,
-        ));
+        drop(IoEventFd::registered(null, EventFd::new().unwrap(), spec));
         let after = deassign_failures().ioeventfd;
         assert_eq!(after.count, before + 1);
         assert_eq!(after.last_os_error, 25);

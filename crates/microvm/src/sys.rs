@@ -18,6 +18,7 @@
 //! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
 //! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
+//! #3698 で ioeventfd の通知スレッドが eventfd を期限つきで待つための `poll(2)` のラッパー（`poll_readable`）を足した。
 //! `KVM_RUN` 以外の ioctl はブロックしない同期呼び出しで、`KVM_RUN` はゲストが exit しない限り戻らない
 //! （期限は `crate::device` が `KvmRunMap::set_immediate_exit` と `KickTarget::kick`（`SIGUSR2`。`with_current_thread` の中だけで使える）で中断する。REPAIR-5）。停止要求（`RunningMicroVm::stop` / drop）も同じ監視スレッド経由でこれを使い、`sys` に unsafe は足していない（#3736）。
 //!
@@ -34,7 +35,7 @@
 //! 本 crate は dev-dependency に `libc` を持たず照合は未導入（追加は crate ごとの承認事項。
 //! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
-//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる（照合の追跡は #3664。`MADV_DONTDUMP` も同じ）。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
+//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる（照合の追跡は #3664。`MADV_DONTDUMP` も同じ）。#3698 の `poll` / `struct pollfd` / `POLL*` も `libc` に対応物があり、導入後は照合の対象（#3664）。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
 //! 対応物が無く、サイズ・オフセットを const assert で固定する。
 //! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
 //! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
@@ -205,6 +206,14 @@ pub(crate) mod consts {
     pub const EFD_CLOEXEC: i32 = 0o2000000;
     /// glibc の `EFD_NONBLOCK`（`O_NONBLOCK` = 0o4000）。
     pub const EFD_NONBLOCK: i32 = 0o4000;
+    /// `POLLIN`（`asm-generic/poll.h`。#3698 の ioeventfd 通知スレッドの待ち）。
+    pub const POLLIN: i16 = 0x0001;
+    /// `POLLERR`（同上）。
+    pub const POLLERR: i16 = 0x0008;
+    /// `POLLHUP`（同上）。
+    pub const POLLHUP: i16 = 0x0010;
+    /// `POLLNVAL`（同上）。
+    pub const POLLNVAL: i16 = 0x0020;
 }
 
 /// 定数（aarch64）。
@@ -288,6 +297,14 @@ pub(crate) mod consts {
     pub const EFD_CLOEXEC: i32 = 0o2000000;
     /// glibc の `EFD_NONBLOCK`（`O_NONBLOCK` = 0o4000）。
     pub const EFD_NONBLOCK: i32 = 0o4000;
+    /// `POLLIN`（`asm-generic/poll.h`。#3698 の ioeventfd 通知スレッドの待ち）。
+    pub const POLLIN: i16 = 0x0001;
+    /// `POLLERR`（同上）。
+    pub const POLLERR: i16 = 0x0008;
+    /// `POLLHUP`（同上）。
+    pub const POLLHUP: i16 = 0x0010;
+    /// `POLLNVAL`（同上）。
+    pub const POLLNVAL: i16 = 0x0020;
 }
 
 /// 対応外アーキテクチャ。値は使われない（各ラッパーが `Unsupported` を返す）。
@@ -326,6 +343,10 @@ pub(crate) mod consts {
     pub const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 0;
     pub const EFD_CLOEXEC: i32 = 0;
     pub const EFD_NONBLOCK: i32 = 0;
+    pub const POLLIN: i16 = 0;
+    pub const POLLERR: i16 = 0;
+    pub const POLLHUP: i16 = 0;
+    pub const POLLNVAL: i16 = 0;
 }
 
 /// aarch64 の `struct kvm_vcpu_init`（`asm/kvm.h`。`target` と features ビットマップ 7 語の 32 バイト）。
@@ -901,6 +922,22 @@ const _: () = {
     assert!(std::mem::offset_of!(SigAction, restorer) == 144);
 };
 
+/// `struct pollfd`（`poll.h`。8 バイト。#3698・MVM-1・REPAIR-5）。`revents` はカーネルが書く。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<PollFd>() == 8);
+    assert!(std::mem::align_of::<PollFd>() == 4);
+    assert!(std::mem::offset_of!(PollFd, events) == 4);
+    assert!(std::mem::offset_of!(PollFd, revents) == 6);
+};
+
 // SAFETY: 宣言の根拠をここに集約する（対応は glibc の LP64 の x86_64・aarch64 だけで、`consts::SUPPORTED` が
 // それ以外では各ラッパーの冒頭で弾くため、型の合わない宣言は呼ばれない。宣言しただけでは未定義動作にならない）。
 // - `ioctl`: `int ioctl(int fd, unsigned long request, ...)`（glibc。musl は `request` が `int`）。可変長引数として
@@ -913,6 +950,8 @@ const _: () = {
 //   固定した x86_64・aarch64 の `struct sigaction` のレイアウト。第 2・3 引数は NULL 可。
 // - `pthread_sigmask`: `SigSet` は 128 バイトの `sigset_t`（上の const assert）。第 2・3 引数は NULL 可。
 // - `eventfd`: `int eventfd(unsigned int initval, int flags)`（glibc。TASK-74.2.3）。値渡しだけでポインタを取らない。
+// - `poll`: `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`（glibc。#3698）。LP64 で `nfds_t` は `unsigned long` = u64。
+//   `PollFd` は下の const assert（8 バイト・アライン 4）で固定した `struct pollfd`。可変長ではない。
 // - `pthread_self` / `pthread_kill`: `pthread_t` は glibc の LP64 で `unsigned long` = u64。`pthread_kill` は
 //   errno を戻り値で返す（errno 変数は触らない）。
 unsafe extern "C" {
@@ -927,6 +966,7 @@ unsafe extern "C" {
     fn pthread_self() -> u64;
     fn pthread_kill(thread: u64, sig: i32) -> i32;
     fn eventfd(initval: u32, flags: i32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
 }
 
 /// `_SC_PAGESIZE`（x86_64・aarch64 Linux とも 30）。
@@ -1219,6 +1259,67 @@ pub(crate) fn eventfd_new() -> Result<OwnedFd, SysError> {
     }
     // SAFETY: `r` は直前の `eventfd` が返した非負の新規 fd で、他に所有者がおらず `OwnedFd` が唯一の所有者になる。
     Ok(unsafe { OwnedFd::from_raw_fd(r) })
+}
+
+/// [`poll_readable`] が一度に待てる fd の最大数（無制限の確保・引数を防ぐ。REPAIR-5）。
+pub(crate) const MAX_POLL_FDS: usize = 32;
+/// [`poll_readable`] の 1 回の待ちの上限（呼び出し側の誤りで実質無期限にしない。REPAIR-5）。
+pub(crate) const MAX_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `fds` のどれかが読めるようになるか `timeout` が尽きるまで待つ（`poll(2)`。#3698・MVM-1・REPAIR-5）。
+///
+/// 呼び出し元は ioeventfd の通知スレッド（`microvm::IoEventPoller`）。`ready[i]` に `fds[i]` が読める（`POLLIN`）か
+/// 異常（`POLLERR` / `POLLHUP` / `POLLNVAL`）なら `true` を書き、`true` の件数を返す。`ready` は先に全て `false` に戻す。
+/// `fds` と `ready` の長さが違う・`MAX_POLL_FDS` 超過は `Os(EINVAL)`。`timeout` は ms に切り上げ [`MAX_POLL_TIMEOUT`] で頭打ち
+/// （無期限・負値は渡さない）。`EINTR` は 0 件の成功として返す（呼び出し側が次の周回で再度待つ）。
+pub(crate) fn poll_readable(
+    fds: &[BorrowedFd<'_>],
+    timeout: std::time::Duration,
+    ready: &mut [bool],
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if fds.len() != ready.len() || fds.len() > MAX_POLL_FDS {
+        return Err(SysError::Os(22));
+    }
+    ready.fill(false);
+    let mut pfds = [PollFd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; MAX_POLL_FDS];
+    for (slot, fd) in pfds.iter_mut().zip(fds) {
+        *slot = PollFd {
+            fd: fd.as_raw_fd(),
+            events: consts::POLLIN,
+            revents: 0,
+        };
+    }
+    let capped = timeout.min(MAX_POLL_TIMEOUT);
+    let ms = capped
+        .as_millis()
+        .saturating_add(u128::from(!capped.subsec_nanos().is_multiple_of(1_000_000)));
+    let ms = i32::try_from(ms).unwrap_or(i32::MAX);
+    // SAFETY: `pfds` は長さ `MAX_POLL_FDS` のローカル配列で、`nfds` は `fds.len()`（<= `MAX_POLL_FDS`）なので
+    // カーネルが触る範囲は配列内に収まる。各 fd は `fds` の借用で呼び出しの間生きている。カーネルが書くのは各要素の
+    // `revents` だけで、呼び出しは同期的に戻り、戻った後にポインタは保持されない。`timeout` は 0 以上の有限値。
+    let r = unsafe { poll(pfds.as_mut_ptr(), fds.len() as u64, ms) };
+    if r < 0 {
+        return match last_error() {
+            SysError::Os(4) => Ok(0),
+            e => Err(e),
+        };
+    }
+    let mask = consts::POLLIN | consts::POLLERR | consts::POLLHUP | consts::POLLNVAL;
+    let mut n = 0;
+    for (flag, p) in ready.iter_mut().zip(&pfds) {
+        if p.revents & mask != 0 {
+            *flag = true;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// `KVM_CHECK_EXTENSION` に渡せる `KVM_CAP_*` の番号（#3679・P3-6）。フィールドは `sys` の外から見えず、
@@ -2790,6 +2891,43 @@ mod tests {
         );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(kvm_create_irqchip(f.as_fd()), Err(SysError::Unsupported));
+    }
+
+    /// MVM-1・REPAIR-5・#3698: `poll_readable` は発火した fd だけを true にし、未発火は期限で 0 件を返し、長さの不一致・上限超過は EINVAL。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_3698_poll_readable_reports_only_signaled_fds() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::time::{Duration, Instant};
+        let a = std::fs::File::from(eventfd_new().unwrap());
+        let b = std::fs::File::from(eventfd_new().unwrap());
+        let fds = [a.as_fd(), b.as_fd()];
+        let mut ready = [true, true];
+        // 未発火: 0 件。期限（20 ms）で戻り、全て false に戻される。
+        let t0 = Instant::now();
+        assert_eq!(
+            poll_readable(&fds, Duration::from_millis(20), &mut ready),
+            Ok(0)
+        );
+        assert_eq!(ready, [false, false]);
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        // b だけ発火。
+        (&b).write_all(&1u64.to_ne_bytes()).unwrap();
+        assert_eq!(poll_readable(&fds, Duration::ZERO, &mut ready), Ok(1));
+        assert_eq!(ready, [false, true]);
+        // 長さの不一致と上限超過。
+        let mut one = [false];
+        assert_eq!(
+            poll_readable(&fds, Duration::ZERO, &mut one),
+            Err(SysError::Os(22))
+        );
+        let many = vec![a.as_fd(); MAX_POLL_FDS + 1];
+        let mut flags = vec![false; MAX_POLL_FDS + 1];
+        assert_eq!(
+            poll_readable(&many, Duration::ZERO, &mut flags),
+            Err(SysError::Os(22))
+        );
     }
 
     /// MVM-1・TASK-74.2.3: eventfd は非ブロック・close-on-exec で、書いた値の合計を 1 回で読み出す。

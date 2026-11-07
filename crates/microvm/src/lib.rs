@@ -18,6 +18,8 @@
 //! `complete_block_notify`）と、KVM の ioeventfd（ゲストの `QueueNotify` を VM exit なしで受ける）・irqfd（eventfd への書き込みを
 //! GSI の割り込みに変える）・in-kernel irqchip（`irq`・`device::VmFd::{create_irqchip, register_irqfd, register_ioeventfd}`。Linux のみ。
 //! x86_64 は `device::KvmDevice::probe_queue_interrupt` で実機確認できる）。
+//! #3698: `register_ioeventfd` が返す `irq::IoEventFd` は VM fd の dup を所有し、`microvm::MicroVm::assemble` が各 virtio デバイスのキューへ結び、
+//! `start` が eventfd を期限つきの `poll(2)` で待つ通知スレッドを起動する。
 //! TASK-74.3.1・MVM-1: virtio-net の receiveq / transmitq の処理とパケット送受信（`virtio_net`。OS 非依存・unsafe なし）。
 //! TASK-74.3.2・MVM-1: virtio-net の割り込み通知（`interrupt::complete_net_notify`。キュー番号で rx / tx を振り分ける）。
 //! TASK-75.1・MVM-1: ゲストメモリの初期化（`microvm`。匿名 mmap の backing と `KVM_SET_USER_MEMORY_REGION` による登録。Linux のみ。

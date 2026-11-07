@@ -2349,6 +2349,294 @@ fn kvm_device_boot_msrs_read_back_and_guest_rdmsr() {
     assert_unimplemented_assemble();
 }
 
+/// MVM-1・REPAIR-5・#3698: 組み立てた `MicroVm` はキューごとに ioeventfd を結ぶ（block はキュー 0、net は受信 0・送信 1）。
+/// ゲストの `QueueNotify`（キュー番号の 4 バイト書き込み）3 件は VM exit せず eventfd に数えられ、登録外の値（net へ 2）だけが
+/// MMIO exit で届く（datamatch。従来の経路）。完全一致で照合する: 一覧、最初の exit が値 2 の MMIO 書き込み、次が目印の OUT、
+/// 発火回数が 3 キューともちょうど 1（2 回目は 0）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assembled_microvm_ioeventfd_per_queue() {
+    use fandhe_container_microvm::exit::{IoDirection, VcpuExit};
+    use fandhe_container_microvm::interrupt::IoEventSpec;
+    use fandhe_container_microvm::microvm::{
+        MicroVm, MicroVmConfig, NetDeviceConfig, VIRTIO_MMIO_BASE, VIRTIO_MMIO_WINDOW,
+    };
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+    use std::time::Duration;
+
+    const BLOCK_NOTIFY: u64 = VIRTIO_MMIO_BASE + 0x50;
+    const NET_NOTIFY: u64 = VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW + 0x50;
+
+    // movabs rbx, addr（disp32 は符号拡張されるので 0xd000_0000 台は 64 ビット即値で置く）; mov dword [rbx], value
+    let store = |c: &mut Vec<u8>, addr: u64, value: u32| {
+        c.extend_from_slice(&[0x48, 0xBB]);
+        c.extend_from_slice(&addr.to_le_bytes());
+        c.extend_from_slice(&[0xC7, 0x03]);
+        c.extend_from_slice(&value.to_le_bytes());
+    };
+    let mut code: Vec<u8> = Vec::new();
+    store(&mut code, BLOCK_NOTIFY, 0); // block のキュー 0
+    store(&mut code, NET_NOTIFY, 0); // net の受信
+    store(&mut code, NET_NOTIFY, 1); // net の送信
+    store(&mut code, NET_NOTIFY, 2); // 登録外の値（exit する）
+    code.extend_from_slice(&[0xB0, 0x21, 0xE6, 0x10]); // mov al, 0x21 ; out 0x10, al（目印）
+    let mut img = bzimage::header_only();
+    bzimage::put_entry_code(&mut img, &code);
+
+    let dev = open_kvm();
+    let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![MemoryBlockBackend::new(16 * 512, false).unwrap()],
+            net: vec![NetDeviceConfig {
+                backend: MemoryNetBackend::new(),
+                mac: [2, 0, 0, 0, 0, 1],
+            }],
+        },
+    )
+    .unwrap();
+    let ids: Vec<_> = vm.devices().iter().map(|d| d.id).collect();
+    let spec = |base: u64, q: u16| IoEventSpec::virtio_mmio_queue_notify(base, q).unwrap();
+    let net_base = VIRTIO_MMIO_BASE + VIRTIO_MMIO_WINDOW;
+    assert_eq!(
+        vm.queue_notifiers(),
+        vec![
+            (ids[0], 0, spec(VIRTIO_MMIO_BASE, 0)),
+            (ids[1], 0, spec(net_base, 0)),
+            (ids[1], 1, spec(net_base, 1)),
+        ]
+    );
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    vm.setup_boot_vcpu(&loaded).unwrap();
+    let vcpu = vm.vcpu_mut(0).unwrap();
+    let next = |vcpu: &mut fandhe_container_microvm::device::VcpuFd| loop {
+        match vcpu.run_once(Duration::from_secs(10)).unwrap() {
+            VcpuExit::Interrupted => continue,
+            e => return e,
+        }
+    };
+    // 登録済みの 3 件は exit せず、最初の exit は登録外の値 2 の MMIO 書き込み。
+    assert_eq!(
+        next(vcpu),
+        VcpuExit::Mmio {
+            phys_addr: NET_NOTIFY,
+            data: 2u64.to_le_bytes(),
+            len: 4,
+            is_write: true,
+        }
+    );
+    assert_eq!(
+        next(vcpu),
+        VcpuExit::Io {
+            direction: IoDirection::Out,
+            port: 0x10,
+            size: 1,
+            count: 1,
+            data: vec![0x21],
+        }
+    );
+    for (id, q) in [(ids[0], 0), (ids[1], 0), (ids[1], 1)] {
+        assert_eq!(vm.consume_queue_notify(id, q).unwrap(), 1, "queue {q}");
+        assert_eq!(vm.consume_queue_notify(id, q).unwrap(), 0, "queue {q}");
+    }
+    assert_eq!(
+        vm.consume_queue_notify(ids[0], 1).unwrap_err().code(),
+        MicrovmErrorCode::InvalidArgument
+    );
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assembled_microvm_ioeventfd_per_queue() {
+    assert_unimplemented_assemble();
+}
+
+/// MVM-1・REPAIR-5・#3698: `start` した VM で、ゲストの送信キュー（net のキュー 1）の `QueueNotify` が ioeventfd 経由で
+/// 通知スレッド（`microvm-ioevent`）に届き、送信が完了する。完全一致で照合する: COM1 への出力（used.idx = 1・id = 0・len = 0）、
+/// backend が受け取ったフレームのバイト列、MMIO の exit が 0 件、`GuestShutdown`、観測器と backend の参照が 1 に戻ること。
+/// ドライバの初期化（DRIVER_OK・キュー 0/1 の ready）はホストが `start` の前に済ませ、ゲストが出す MMIO は `QueueNotify(1)` の 1 回だけ。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_net_tx_completes_via_ioeventfd() {
+    use fandhe_container_microvm::device::{BoundedRunLog, ValueCapture};
+    use fandhe_container_microvm::error::MicrovmError;
+    use fandhe_container_microvm::exit::{ExitValue, IoDirection};
+    use fandhe_container_microvm::guest_memory::GuestAddress;
+    use fandhe_container_microvm::microvm::{
+        MicroVm, MicroVmConfig, NetDeviceConfig, StopReason, VIRTIO_MMIO_BASE,
+    };
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_mmio::{DeviceStatus, reg};
+    use fandhe_container_microvm::virtio_net::NetBackend;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// 送信されたフレームを試験側へ残す backend。
+    #[derive(Debug, Clone, Default)]
+    struct TxBackend {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+    impl NetBackend for TxBackend {
+        fn send(&mut self, frame: &[u8]) -> Result<(), MicrovmError> {
+            self.sent.lock().unwrap().push(frame.to_vec());
+            Ok(())
+        }
+        fn recv(&mut self, _buf: &mut [u8]) -> Result<Option<usize>, MicrovmError> {
+            Ok(None)
+        }
+    }
+
+    // 64 MiB の VM の内側。ブート用の配置（zero page 0x7000・テーブル 0xF000 未満・cmdline 0x20000・bzImage 0x100000）と重ならない。
+    const RX_DESC: u64 = 0x0200_0000;
+    const RX_AVAIL: u64 = 0x0200_1000;
+    const RX_USED: u64 = 0x0200_2000;
+    const TX_DESC: u64 = 0x0200_3000;
+    const TX_AVAIL: u64 = 0x0200_4000;
+    const TX_USED: u64 = 0x0200_5000;
+    const TX_BUF: u64 = 0x0201_0000;
+    const FRAME_LEN: usize = 60;
+    const NET_HDR_LEN: usize = 12;
+    const USED_HEAD: usize = 10; // used.idx(2) + used 要素 0 の id(4) + len(4)
+    // net 1 台だけの構成なので、net は先頭のスロット（VIRTIO_MMIO_BASE）。
+    const NET_NOTIFY: u64 = VIRTIO_MMIO_BASE + 0x50;
+
+    /// QueueNotify(1) を書く → used.idx が 0 の間 `pause` で待つ → used 先頭を COM1 へ 1 バイトずつ出力 → ud2。
+    fn guest_code() -> Vec<u8> {
+        let mut c: Vec<u8> = vec![0x48, 0xBB]; // movabs rbx, imm64
+        c.extend_from_slice(&NET_NOTIFY.to_le_bytes());
+        c.extend_from_slice(&[0xC7, 0x03, 0x01, 0x00, 0x00, 0x00]); // mov dword [rbx], 1
+        let poll_start = c.len();
+        c.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x25]); // movzx eax, word [disp32]
+        c.extend_from_slice(&((TX_USED + 2) as u32).to_le_bytes());
+        c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        c.extend_from_slice(&[0x75, 0x04]); // jnz out（pause + jmp の 4 バイトを飛ばす）
+        c.extend_from_slice(&[0xF3, 0x90]); // pause
+        let back = -(i32::try_from(c.len() - poll_start).unwrap() + 2);
+        assert!(back >= -128);
+        c.extend_from_slice(&[0xEB, back as i8 as u8]); // jmp poll
+        c.push(0xBE);
+        c.extend_from_slice(&((TX_USED + 2) as u32).to_le_bytes()); // mov esi, src
+        c.push(0xB9);
+        c.extend_from_slice(&(USED_HEAD as u32).to_le_bytes()); // mov ecx, n
+        c.extend_from_slice(&[0x66, 0xBA, 0xF8, 0x03]); // mov dx, 0x3f8
+        c.extend_from_slice(&[0xAC, 0xEE, 0xE2, 0xFC]); // l: lodsb; out dx, al; loop l
+        c.extend_from_slice(&[0x0F, 0x0B]); // ud2
+        c
+    }
+
+    let dev = open_kvm();
+    let backend = TxBackend::default();
+    let mut img = bzimage::header_only();
+    bzimage::put_entry_code(&mut img, &guest_code());
+    let mut vm: MicroVm<MemoryBlockBackend, TxBackend> = MicroVm::assemble(
+        &dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![NetDeviceConfig {
+                backend: backend.clone(),
+                mac: [2, 0, 0, 0, 0, 1],
+            }],
+        },
+    )
+    .unwrap();
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    let frame: Vec<u8> = (0..FRAME_LEN).map(|i| ((i + 13) % 239) as u8).collect();
+    let ga = GuestAddress::new;
+    {
+        let mem = vm.memory_mut();
+        // 送信バッファ: virtio_net_hdr（全 0）+ フレーム。記述子 0 は device-readable の 1 本、avail に 1 件。
+        let mut buf = vec![0u8; NET_HDR_LEN];
+        buf.extend_from_slice(&frame);
+        mem.write_at(ga(TX_BUF), &buf).unwrap();
+        mem.write_at(ga(TX_DESC), &TX_BUF.to_le_bytes()).unwrap();
+        mem.write_u32_le(ga(TX_DESC + 8), (NET_HDR_LEN + FRAME_LEN) as u32)
+            .unwrap();
+        mem.write_u16_le(ga(TX_DESC + 12), 0).unwrap(); // readable
+        mem.write_u16_le(ga(TX_DESC + 14), 0).unwrap();
+        mem.write_u16_le(ga(TX_AVAIL), 0).unwrap();
+        mem.write_u16_le(ga(TX_AVAIL + 4), 0).unwrap();
+        mem.write_u16_le(ga(TX_AVAIL + 2), 1).unwrap();
+    }
+    vm.with_net(0, |t| {
+        let mut wr = |off: u64, v: u32| t.write(off, &v.to_le_bytes());
+        wr(reg::STATUS, 1);
+        wr(reg::STATUS, 3);
+        wr(reg::DRIVER_FEATURES_SEL, 0);
+        wr(reg::DRIVER_FEATURES, 1 << 5); // MAC
+        wr(reg::DRIVER_FEATURES_SEL, 1);
+        wr(reg::DRIVER_FEATURES, 1); // VERSION_1
+        wr(reg::STATUS, 11);
+        for (q, d, a, u) in [
+            (0, RX_DESC, RX_AVAIL, RX_USED),
+            (1, TX_DESC, TX_AVAIL, TX_USED),
+        ] {
+            wr(reg::QUEUE_SEL, q);
+            wr(reg::QUEUE_NUM, 16);
+            wr(reg::QUEUE_DESC_LOW, d as u32);
+            wr(reg::QUEUE_DRIVER_LOW, a as u32);
+            wr(reg::QUEUE_DEVICE_LOW, u as u32);
+            wr(reg::QUEUE_READY, 1);
+        }
+        wr(reg::STATUS, 15);
+        assert!(t.status().contains(DeviceStatus::DRIVER_OK));
+    })
+    .unwrap();
+    let log = Arc::new(BoundedRunLog::new(1024, ValueCapture::Record).unwrap());
+    vm.vcpu_mut(0).unwrap().set_observer(log.clone());
+
+    let running = vm.start(&loaded).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !running.is_finished() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(running.is_finished(), "guest did not finish within 10s");
+    let console = running.serial_console();
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+    assert_eq!(report.origin_vcpu, Some(0));
+    assert_eq!(report.stats.errors, 0);
+
+    let mut expected: Vec<u8> = vec![1, 0]; // used.idx
+    expected.extend_from_slice(&0u32.to_le_bytes()); // used[0].id
+    expected.extend_from_slice(&0u32.to_le_bytes()); // used[0].len（送信は常に 0）
+    assert_eq!(console.take_output().unwrap(), expected);
+    assert_eq!(*backend.sent.lock().unwrap(), vec![frame]);
+
+    // ゲストの kick は VM exit しない: MMIO の exit が 0 件で、PIO は port 0x3f8 への 1 バイトの OUT だけ（10 件）。
+    assert_eq!(log.dropped(), 0);
+    let values: Vec<ExitValue> = log.records().iter().filter_map(|r| r.value).collect();
+    assert!(
+        values.iter().all(|v| matches!(
+            v,
+            ExitValue::Pio {
+                direction: IoDirection::Out,
+                port: 0x3f8,
+                size: 1,
+                ..
+            }
+        )),
+        "{values:?}"
+    );
+    assert_eq!(values.len(), USED_HEAD);
+    assert_eq!(Arc::strong_count(&log), 1);
+    assert_eq!(Arc::strong_count(&backend.sent), 1);
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_start_net_tx_completes_via_ioeventfd() {
+    assert_unimplemented_assemble();
+}
+
 /// #3734 の試験用: x86_64 以外では組み立てが先に `Unimplemented` で失敗する。
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn assert_unimplemented_assemble() {

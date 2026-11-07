@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #3760 で stream-exec helper の本体（src/stream_exec/helper.rs）と実機前提の結合試験 stream_exec_real を追加した（依存は不変）。
 # #3759 で stream-exec の channel の codec（src/stream_exec）と sys の複数 fd 送信を追加した（依存は不変）。
 # #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
 # TASK-171.2（#537）でランチャーの入口にセッション切り離し（setsid・pty 非経由の検証）を追加した（依存は不変）。
@@ -306,4 +307,13 @@ harness = false
 [[test]]
 name = "healthcheck_exec_real"
 path = "tests/healthcheck_exec_real.rs"
+harness = false
+
+# 本物の stream-exec helper（制御チャネルの kind 6 / 7 → `run_command_with_pidfd_output_notify`）から、rootless コンテナの中で実コマンドを
+# 走らせて終了コード・別々の stdout / stderr・stdin・接続断での停止・孤児時の fail-closed を照合する実機前提の結合試験
+# （SUP-6・SEC-1・REPAIR-5・REPAIR-12・#3760。依存は不変）。helper を試験バイナリ自身の再実行で起動するため独自 main
+# （harness = false）で振り分ける。`-- --ignored` 指定時のみ実行する。
+[[test]]
+name = "stream_exec_real"
+path = "tests/stream_exec_real.rs"
 harness = false

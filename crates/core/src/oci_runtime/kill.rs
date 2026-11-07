@@ -30,8 +30,19 @@
 //! - kill は終了を待たず、状態も更新しない（`ContainerRuntime::kill` の契約）。戻り値は照合した時点の
 //!   状態。終了を検知して Stopped へ遷移させるのは起動ハンドルの所有者（supervisor。TASK-157）の責務
 //! - 本番の [`ProcessSignaler`] は本 crate に無い（supervisor が提供する。launcher と同じ扱い）
-//! - delete（`delete.rs`。状態ファイル・cgroup の削除は TASK-30.2・TASK-30.3）・cgroup 配下の全プロセスへの
-//!   送信（TASK-32・CORE-3）・stop（SIGTERM → 猶予 → SIGKILL）は範囲外
+//! - delete（`delete.rs`。状態ファイル・cgroup の削除は TASK-30.2・TASK-30.3）・stop（SIGTERM → 猶予 →
+//!   SIGKILL）は範囲外
+//!
+//! # cgroup 全体への送信（`KillTarget::AllProcesses`。CRI-5・CORE-4・TASK-62.7.2）
+//!
+//! shim v2 の `Kill(all=true)`（containerd の `WithKillAll`）用。状態に記録された cgroup 配置
+//! （`StateRecord::cgroup`）のコンテナ cgroup を fd 起点で検証つきに開き、`cgroup.kill` へ書く
+//! （`cgroups::kill_recorded_container_cgroup`）。signaler は呼ばない。受けるシグナルは SIGKILL だけ
+//! （`KillRequest::all_processes` が型で保証）。名前に instance を含み再利用されない cgroup を検証済み fd
+//! 経由で指すため、pid 再利用の対策（SEC-1・CORE-1）の対象外。`populated 0` は待たない（終了を待たない契約）。
+//! 配置の記録が無い状態では init だけへ縮退せず `FailedPrecondition`（fail-closed）。cgroup が既に無い・空なら
+//! 成功（冪等）。Linux 以外は `Unimplemented`。残余: stop の意図を立てないため、再起動ポリシーつきの
+//! コンテナは kill の後に再起動されうる（`all=false` の kill と同じ）。
 //!
 //! エラーメッセージは固定文言のみで、pid・パス・errno を含めない。
 
@@ -46,8 +57,8 @@ use super::launch::START_TIMEOUT_MAX;
 use super::start::{Unbounded, call_bounded};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, KillRequest, Signal,
-    StateStore, TraitError,
+    CgroupPlacement, ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
+    KillRequest, KillTarget, Signal, StateStore, TraitError,
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
@@ -128,11 +139,66 @@ pub fn kill(
     req: &KillRequest,
     timeout: &KillTimeout,
 ) -> Result<ContainerStatus, OciRuntimeError> {
+    let killer: Arc<CgroupKiller> = Arc::new(production_cgroup_killer);
+    kill_with(store, recorder, signaler, req, timeout, &killer)
+}
+
+/// cgroup 全体への送信の境界（`KillTarget::AllProcesses`）。本番は [`production_cgroup_killer`]、
+/// 試験は偽物に差し替える。`deadline` は signaler と同じ絶対期限で、過ぎていれば書かずに `Timeout`。
+type CgroupKiller =
+    dyn Fn(&ContainerId, &CgroupPlacement, Instant) -> Result<(), TraitError> + Send + Sync;
+
+/// 本番の [`CgroupKiller`]。`CgroupError` は code だけ残し固定文言の `TraitError` にする
+/// （パス・errno を載せない。ERR-2）。
+#[cfg(target_os = "linux")]
+fn production_cgroup_killer(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    deadline: Instant,
+) -> Result<(), TraitError> {
+    crate::cgroups::kill_recorded_container_cgroup(id, placement, deadline)
+        .map(|_| ())
+        .map_err(|e| {
+            let message = match e.code {
+                ErrorCode::Timeout => "the cgroup kill did not complete within the timeout",
+                ErrorCode::Unimplemented => {
+                    "cgroup.kill is not available (Linux 5.14 or later is required)"
+                }
+                ErrorCode::PermissionDenied => {
+                    "container cgroup is not owned by the effective user"
+                }
+                _ => "failed to kill the container cgroup",
+            };
+            TraitError::new(e.code, message)
+        })
+}
+
+/// Linux 以外には cgroup v2 が無い（CORE-4）。
+#[cfg(not(target_os = "linux"))]
+fn production_cgroup_killer(
+    _id: &ContainerId,
+    _placement: &CgroupPlacement,
+    _deadline: Instant,
+) -> Result<(), TraitError> {
+    Err(TraitError::new(
+        ErrorCode::Unimplemented,
+        "kill all requires cgroup v2 (Linux only)",
+    ))
+}
+
+fn kill_with(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    signaler: &Arc<dyn ProcessSignaler>,
+    req: &KillRequest,
+    timeout: &KillTimeout,
+    killer: &Arc<CgroupKiller>,
+) -> Result<ContainerStatus, OciRuntimeError> {
     // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
     let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Kill, e);
     let name = OpName::new(KILL_OP_NAME).map_err(to_err)?;
     recorder.record_op(&name, || {
-        kill_inner(store, signaler, req, timeout).map_err(to_err)
+        kill_inner(store, signaler, req, timeout, killer).map_err(to_err)
     })
 }
 
@@ -141,6 +207,7 @@ fn kill_inner(
     signaler: &Arc<dyn ProcessSignaler>,
     req: &KillRequest,
     timeout: &KillTimeout,
+    killer: &Arc<CgroupKiller>,
 ) -> Result<ContainerStatus, TraitError> {
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     let status = record.status();
@@ -161,8 +228,19 @@ fn kill_inner(
             ));
         }
     };
+    // cgroup 全体へ送る場合は、記録された配置が無ければ init だけへ縮退せず拒否する（fail-closed）。
+    let placement = match req.target() {
+        KillTarget::AllProcesses => Some(record.cgroup().cloned().ok_or_else(|| {
+            TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container cgroup placement is not recorded",
+            )
+        })?),
+        _ => None,
+    };
     let limit = timeout.get();
     let s = Arc::clone(signaler);
+    let k = Arc::clone(killer);
     let id = req.id().clone();
     let signal = req.signal();
     // 送信先まで引き継ぐ共通の絶対期限。`call_bounded` が `Timeout` を返す時刻（開始後に算出する
@@ -180,7 +258,10 @@ fn kill_inner(
                 "the signal delivery did not complete within the timeout",
             ));
         }
-        s.signal(&id, pid, signal, deadline)
+        match &placement {
+            Some(placement) => k(&id, placement, deadline),
+            None => s.signal(&id, pid, signal, deadline),
+        }
     };
     let outcome = call_bounded(limit, call, drop);
     if outcome.is_err() {
@@ -226,6 +307,24 @@ mod tests {
                 &CreateStateRequest::new(status, std::env::temp_dir().join("b")).expect("req"),
             )
             .expect("create");
+            s
+        }
+    }
+
+    impl MemStateStore {
+        /// cgroup 配置つきのレコードを置く（`KillTarget::AllProcesses` の試験用）。
+        fn with_placement(status: ContainerStatus, placement: CgroupPlacement) -> Self {
+            let s = Self::default();
+            let record = StateRecord::new(
+                status.clone(),
+                std::env::temp_dir().join("b"),
+                StateRevision::from_raw(1),
+            )
+            .expect("record")
+            .with_cgroup(placement);
+            s.0.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(status.id().clone(), record);
             s
         }
     }
@@ -556,5 +655,163 @@ mod tests {
             assert_eq!(exit, Some(ProcessExit::Signaled(expected)));
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         }
+    }
+
+    /// 呼び出しを記録する偽の cgroup killer（`delay` だけ眠る）。
+    struct FakeKiller {
+        calls: Mutex<Vec<(ContainerId, CgroupPlacement)>>,
+        delay: Duration,
+    }
+
+    impl FakeKiller {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                delay,
+            })
+        }
+
+        fn as_killer(self: &Arc<Self>) -> Arc<CgroupKiller> {
+            let me = Arc::clone(self);
+            Arc::new(move |id, placement, _deadline| {
+                me.calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((id.clone(), placement.clone()));
+                std::thread::sleep(me.delay);
+                Ok(())
+            })
+        }
+    }
+
+    fn placement() -> CgroupPlacement {
+        CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            StateRevision::from_raw(7),
+        )
+    }
+
+    fn run_all(
+        store: &MemStateStore,
+        signaler: &Arc<FakeSignaler>,
+        killer: &Arc<FakeKiller>,
+        id: &str,
+        timeout: &KillTimeout,
+    ) -> Result<ContainerStatus, OciRuntimeError> {
+        let dynamic: Arc<dyn ProcessSignaler> = signaler.clone();
+        let req = KillRequest::all_processes(cid(id), Signal::SIGKILL).expect("req");
+        kill_with(
+            store,
+            &OpRecorder::new(),
+            &dynamic,
+            &req,
+            timeout,
+            &killer.as_killer(),
+        )
+    }
+
+    /// CRI-5・CORE-4: `AllProcesses` は (id, 記録された配置) で killer を 1 回呼び、signaler は呼ばない。
+    #[test]
+    fn cri5_kill_all_forwards_placement_and_skips_signaler() {
+        let pid = NonZeroU32::new(4242).expect("pid");
+        let store = MemStateStore::with_placement(
+            ContainerStatus::running(cid("c1"), Some(pid)),
+            placement(),
+        );
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let killer = FakeKiller::new(Duration::ZERO);
+        let status =
+            run_all(&store, &signaler, &killer, "c1", &KillTimeout::default()).expect("kill");
+        assert_eq!(status.state(), ContainerState::Running);
+        assert_eq!(
+            killer.calls.lock().unwrap().as_slice(),
+            &[(cid("c1"), placement())]
+        );
+        assert_eq!(signaler.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// CRI-5・CORE-4: `Init` では killer は呼ばれない。
+    #[test]
+    fn cri5_kill_init_does_not_call_cgroup_killer() {
+        let pid = NonZeroU32::new(4242).expect("pid");
+        let store = MemStateStore::with_placement(
+            ContainerStatus::running(cid("c1"), Some(pid)),
+            placement(),
+        );
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let killer = FakeKiller::new(Duration::ZERO);
+        let dynamic: Arc<dyn ProcessSignaler> = signaler.clone();
+        kill_with(
+            &store,
+            &OpRecorder::new(),
+            &dynamic,
+            &req("c1", Signal::SIGTERM),
+            &KillTimeout::default(),
+            &killer.as_killer(),
+        )
+        .expect("kill");
+        assert!(killer.calls.lock().unwrap().is_empty());
+        assert_eq!(signaler.count.load(Ordering::SeqCst), 1);
+    }
+
+    /// CRI-5・CORE-4: 配置の記録が無ければ init へ縮退せず `FailedPrecondition`（どちらも呼ばれない）。
+    #[test]
+    fn cri5_kill_all_without_placement_is_failed_precondition() {
+        let pid = NonZeroU32::new(4242).expect("pid");
+        let store = MemStateStore::with(ContainerStatus::running(cid("c1"), Some(pid)));
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let killer = FakeKiller::new(Duration::ZERO);
+        let err = run_all(&store, &signaler, &killer, "c1", &KillTimeout::default())
+            .expect_err("no placement");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(err.message(), "container cgroup placement is not recorded");
+        assert!(killer.calls.lock().unwrap().is_empty());
+        assert_eq!(signaler.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// CRI-5・CORE-2: Stopped・Running で pid なしは、配置があっても killer を呼ばず既存の文言で拒否する。
+    #[test]
+    fn cri5_kill_all_rejects_stopped_and_interrupted_start() {
+        for (status, message) in [
+            (
+                ContainerStatus::stopped(cid("c1"), Some(0)),
+                "container is not running",
+            ),
+            (
+                ContainerStatus::running(cid("c1"), None),
+                "container start was interrupted; recover the start reservation",
+            ),
+        ] {
+            let store = MemStateStore::with_placement(status, placement());
+            let signaler = FakeSignaler::new(Duration::ZERO);
+            let killer = FakeKiller::new(Duration::ZERO);
+            let err = run_all(&store, &signaler, &killer, "c1", &KillTimeout::default())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(err.message(), message);
+            assert!(killer.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    /// REPAIR-5・CRI-5: killer が戻らなくても上限＋猶予で `Timeout`。
+    #[test]
+    fn repair5_kill_all_times_out_when_killer_blocks() {
+        let pid = NonZeroU32::new(4242).expect("pid");
+        let store = MemStateStore::with_placement(
+            ContainerStatus::running(cid("c1"), Some(pid)),
+            placement(),
+        );
+        let signaler = FakeSignaler::new(Duration::ZERO);
+        let killer = FakeKiller::new(Duration::from_secs(5));
+        let limit = Duration::from_millis(50);
+        let err = run_all(
+            &store,
+            &signaler,
+            &killer,
+            "c1",
+            &KillTimeout::new(limit).expect("timeout"),
+        )
+        .expect_err("timeout");
+        assert_eq!(err.code(), ErrorCode::Timeout);
     }
 }

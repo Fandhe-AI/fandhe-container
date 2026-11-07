@@ -64,6 +64,20 @@ ln -sf ~/.local/libexec/fandhe-container/fandhe-container ~/.local/bin/fandhe-co
 - 置き場所とその祖先は、他の利用者が書き込めないようにする（g/o 書き込み不可）。CLI と supervisor の間に権限の境界は無いが、他人が書ける場所に置くとファイルを差し替えられる
 - 更新するときは CLI と supervisor を同じ版で置き直す
 
+## containerd の shim（rootless のみ。#3684）
+
+`containerd-shim-fandhe-container-v2`（`fandhe-container-plugin-cri` が持つ bin。CRI-5）は、containerd が exec する shim v2 で、本番の実行層（`CoreLifecycleRuntime`）を登録する。supervisor は shim の実体と同じディレクトリの固定名（`fandhe-container-supervisor`）から解決するため、同じディレクトリに置く。特権ランチャーは置かない（置くと rootful のインストールとみなされる）。
+
+```bash
+cargo build --release -p fandhe-container-plugin-cri -p fandhe-container-supervisor
+install -m 0755 target/release/containerd-shim-fandhe-container-v2 ~/.local/libexec/fandhe-container/containerd-shim-fandhe-container-v2
+install -m 0755 target/release/fandhe-container-supervisor ~/.local/libexec/fandhe-container/fandhe-container-supervisor
+```
+
+- 対応は rootless だけである。uid 0 の shim（rootful の containerd と、rootlesskit 配下で euid が 0 になる構成）では Create は通るが Start が `UNIMPLEMENTED` になる（#2442・#2241 の判断待ち）
+- 動く構成は、非 root で直接起動した containerd 2.x を、委譲 scope（`systemd-run --user --scope -p Delegate=yes`）の中で動かす構成である。shim は containerd の環境（`XDG_RUNTIME_DIR`・user manager）と cgroup を継ぐ。実機での通しは `crates/plugin-cri/tests/shim_v2_containerd_real.rs`（手順は [real-machine-tests.md](../verification/real-machine-tests.md)。実行と記録は #3685）
+- 未実装（REPAIR-3）: exec、`delete` action での実行層の後始末、`-publish-binary` によるイベントの publish。macOS・Windows では Shutdown だけを処理する縮退（[shim-v2-production-binary.md](../design/shim-v2-production-binary.md)）
+
 ## rootless の範囲写像（subuid / subgid）
 
 rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写像を選ぶ（CORE-6・SEC-5・#2243）。

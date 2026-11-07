@@ -1,4 +1,6 @@
 //! shim v2 起動バイナリの排他・計測の結合試験（REPAIR-4・REPAIR-5・PLUG-12・CRI-5・TASK-62.7.1・#872）。
+//!
+//! #3684: bin を plugin-cri へ移したため cri の試験から移設した（試験名・期待値は同じ）。
 #![cfg(unix)]
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -100,10 +102,14 @@ fn repair4_872_ops_log_records_start_and_delete() {
             .lines()
             .find(|l| l.contains(op))
             .unwrap_or_else(|| panic!("{op} missing: {text}"));
-        let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["outcome"], "success", "{line}");
-        assert_eq!(v["code"], "Ok", "{line}");
-        assert!(v["latency_us"].is_u64(), "{line}");
+        // serde_json を plugin-cri の依存に足さないため、固定形の JSON Lines を文字列で照合する。
+        assert!(line.contains("\"outcome\":\"success\""), "{line}");
+        assert!(line.contains("\"code\":\"Ok\""), "{line}");
+        let after = line.split("\"latency_us\":").nth(1).unwrap_or("");
+        assert!(
+            after.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "{line}"
+        );
     }
 }
 

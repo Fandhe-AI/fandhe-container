@@ -11,10 +11,13 @@
 //!   stdout は protobuf の `DeleteResponse` として復号される
 //! - action なし: 本モジュール固有の内部モード（デーモン本体）。`start` が起動し、listener を stdin で受け取る
 //!
-//! 呼び出し元: `src/bin/shim_v2_main.rs` の薄い main。サービスの登録簿は呼び出し側が [`run`] に注入する。
+//! 呼び出し元: `fandhe-container-plugin-cri` の bin `containerd-shim-fandhe-container-v2`（`src/bin/containerd_shim_v2.rs`。
+//! #3684・TASK-62.6）の薄い main が [`run_cli_with_context`] を呼ぶ。サービスの登録簿は呼び出し側が注入する。
 //! 本番の `ContainerRuntime`（`CoreLifecycleRuntime`）は plugin-cri にしか無く、cri から plugin-cri への依存は
-//! `tests/dependency_direction.rs` が禁じているため、cri の bin が登録できるのは `EmptyTaskService` だけになる
-//! （`docs/architecture.md` は cri を「plugin バイナリから呼ばれる実装ライブラリ」としている。REPAIR-3）。
+//! `tests/dependency_direction.rs` が禁じている（CRI-7・PLUG-1）。そのため bin の置き場所を plugin-cri にし、cri は
+//! 引数の解析・start / delete / serve の手順・ttrpc サーバーという共有部品だけを持つ
+//! （判断は `docs/design/shim-v2-production-binary.md`。`docs/architecture.md` は cri を「plugin バイナリから呼ばれる実装ライブラリ」としている）。
+//! 非 Linux の plugin-cri の bin は本番の runtime を結線できず Shutdown だけの `EmptyTaskService` を登録する（REPAIR-3）。
 //!
 //! 出力形式: 従来形式の `unix://<path>` を採る。JSON の BootstrapParams（version 3）は task API の版の決定（#669）に
 //! 結びつくため採らない。
@@ -43,7 +46,7 @@
 //! - デーモンの寿命は Shutdown RPC（[`ShutdownSignal`]。TASK-62.7.2・#873）と socket の `(dev, ino, mtime)` の生存確認（1 秒間隔。
 //!   delete 経路用）の併用。Shutdown で抜けたときは応答を流し切る有界な猶予（`SHUTDOWN_RESPONSE_GRACE`）の後にサーバーを止め、
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
-//! - delete での実行層のコンテナの後始末（本番の runtime の結線後）
+//! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684 の追跡先を参照）
 //! - stdin の options・`-publish-binary` のイベント publish・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
 
@@ -338,14 +341,55 @@ fn version_text() -> Vec<u8> {
     .into_bytes()
 }
 
+/// serve のサービス注入口に渡す文脈（#3684・SEC-4）。終了要求の口と、デーモンが持つ監査の記録先を運ぶ。
+///
+/// 監査の記録先（Linux の `ControlAuditRelay`）は単一スレッドの間にしか作れないため、デーモンが作ったものを
+/// 注入側（plugin-cri の本番の runtime）と共有し、create の `mounts[].destination` の拒否を peer UID の拒否と
+/// 同じ `@audit.log` へ残す。
+pub struct ServeContext {
+    shutdown: ShutdownSignal,
+    audit: Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>>,
+}
+
+impl ServeContext {
+    /// 文脈を作る（デーモンと試験が使う）。
+    pub fn new(
+        shutdown: ShutdownSignal,
+        audit: Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>>,
+    ) -> Self {
+        Self { shutdown, audit }
+    }
+
+    /// Task サービスの `with_shutdown` に差し込む終了要求の口。
+    pub fn shutdown(&self) -> &ShutdownSignal {
+        &self.shutdown
+    }
+
+    /// 監査の記録先。記録先を持たない OS（非 Linux）では `None`。
+    pub fn audit_sink(
+        &self,
+    ) -> Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>> {
+        self.audit.as_ref().map(std::sync::Arc::clone)
+    }
+}
+
 /// 操作を実行し、stdout へ書くバイト列を返す（serve は終了まで戻らず空を返す）。
 ///
 /// `make_registry` は serve だけが呼ぶ（サービスの注入口。本モジュールの doc を参照）。渡される [`ShutdownSignal`] を
 /// Task サービスの `with_shutdown` に差し込むと、Shutdown RPC でデーモンが終了する（TASK-62.7.2）。
-#[cfg(unix)]
+/// 監査の記録先も要るときは [`run_with_context`] を使う。
 pub fn run<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
+{
+    run_with_context(inv, move |ctx| make_registry(ctx.shutdown().clone()))
+}
+
+/// [`run`] の、注入口が [`ServeContext`] を受ける版（#3684）。
+#[cfg(unix)]
+pub fn run_with_context<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<u8>, CriError>
+where
+    F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -367,15 +411,46 @@ where
 
 /// unix 以外では未実装（REPAIR-3）。
 #[cfg(not(unix))]
-pub fn run<F>(inv: ShimInvocation, _make_registry: F) -> Result<Vec<u8>, CriError>
+pub fn run_with_context<F>(inv: ShimInvocation, _make_registry: F) -> Result<Vec<u8>, CriError>
 where
-    F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
+    F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
         _ => Err(CriError::unimplemented(
             "shim v2 bootstrap is available only on unix",
         )),
+    }
+}
+
+/// shim バイナリの main の本体。引数を解析して [`run_with_context`] を呼び、結果を出力と終了コードへ写す。
+///
+/// 成功は stdout へバイト列だけ（start のアドレス・delete の応答。stderr へは何も書かない。containerd が両者をまとめて読むため）。
+/// 失敗は stdout へ何も書かず、stderr へ `{"code":"<CODE>","message":"<message>"}` の 1 行（JSON）を出して終了コード 1（ERR 系）。
+/// JSON の組み立てをここに置くのは、bin を持つ plugin-cri に serde_json の依存を足さないため（依存は承認制）。
+pub fn run_cli_with_context<F>(make_registry: F) -> std::process::ExitCode
+where
+    F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
+{
+    use std::io::Write;
+    let result = parse_args(std::env::args_os().skip(1))
+        .and_then(|inv| run_with_context(inv, make_registry));
+    match result {
+        Ok(bytes) => {
+            let mut out = std::io::stdout();
+            if out.write_all(&bytes).and_then(|()| out.flush()).is_err() {
+                return std::process::ExitCode::FAILURE;
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let line = serde_json::json!({
+                "code": e.code().as_str(),
+                "message": e.message(),
+            });
+            eprintln!("{line}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -1206,7 +1281,7 @@ mod unix_impl {
     /// 5. `run_serve`
     pub fn run_daemon<F>(inv: &ShimInvocation, dir: &Path, make_registry: F) -> Result<(), CriError>
     where
-        F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
+        F: FnOnce(super::ServeContext) -> Result<ServiceRegistry, CriError>,
     {
         let expected = socket_path(dir, inv)?;
         let listener = adopt_stdin_listener(&expected)?;
@@ -1295,7 +1370,7 @@ mod unix_impl {
         make_registry: F,
     ) -> Result<(), CriError>
     where
-        F: FnOnce(ShutdownSignal) -> Result<ServiceRegistry, CriError>,
+        F: FnOnce(super::ServeContext) -> Result<ServiceRegistry, CriError>,
     {
         let first = sock_ident(expected).ok_or_else(|| failed("socket path is missing"))?;
         // Shutdown RPC は要求を立てる前に ID ロックを取り、片付けの終わりまで持つ（並行 start の締め出し）。
@@ -1305,7 +1380,7 @@ mod unix_impl {
                 .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>)
                 .map_err(|_| ())
         }));
-        let registry = make_registry(signal.clone())?;
+        let registry = make_registry(super::ServeContext::new(signal.clone(), audit.clone()))?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
             // 同じ uid と root だけを受ける（PLUG-12）。

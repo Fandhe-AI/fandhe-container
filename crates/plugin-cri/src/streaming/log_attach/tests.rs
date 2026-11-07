@@ -101,31 +101,16 @@ async fn cri6_3763_attach_streams_log_records() {
         .attach(target(false, true, true, false))
         .await
         .expect("attach");
-    // follower が最初のスナップショットを取る前の追記は「過去」として扱われるため、届くまで書き続ける。
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = {
-        let sink = Arc::clone(&sink);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
-                sink.append(StreamKind::Stdout, b"hello").expect("out");
-                sink.append(StreamKind::Stderr, b"oops").expect("err");
-                sink.flush().expect("flush");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })
-    };
+    // attach が返った時点で追従開始位置は確定済みなので、一度だけ書けば取りこぼさない（決定的。#3763）。
+    sink.append(StreamKind::Stdout, b"hello").expect("out");
+    sink.append(StreamKind::Stderr, b"oops").expect("err");
+    sink.flush().expect("flush");
     let mut out_r = session.stdout.take().expect("stdout");
     let mut err_r = session.stderr.take().expect("stderr");
     let out = read_at_least(&mut out_r, 6).await;
     let err = read_at_least(&mut err_r, 5).await;
-    stop.store(true, Ordering::SeqCst);
-    writer.join().expect("writer");
     assert!(out.starts_with(b"hello\n"), "{out:?}");
-    assert!(
-        out.chunks(6).all(|c| c == b"hello\n" || c.len() < 6),
-        "{out:?}"
-    );
+    assert_eq!(out, b"hello\n");
     assert!(err.starts_with(b"oops\n"), "{err:?}");
     assert!(session.stdin.is_none() && session.resize.is_none());
     drop((out_r, err_r, session));
@@ -265,4 +250,27 @@ async fn repair5_3763_attach_limits_concurrent_followers() {
     assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
     drop(sessions);
     wait_followers(&b, 0).await;
+}
+
+/// REPAIR-5・#3763: 書き込みが詰まったままでも、追従の絶対期限を過ぎたら再試行を打ち切る（`TimedOut`）。
+#[test]
+fn repair5_3763_writer_stops_at_absolute_deadline() {
+    let (a, _b) = StdUnixStream::pair().expect("pair");
+    a.set_write_timeout(Some(Duration::from_millis(10)))
+        .expect("timeout");
+    let mut w = CancellableWriter {
+        sock: a,
+        cancel: Arc::new(AtomicBool::new(false)),
+        deadline: Instant::now() + Duration::from_millis(100),
+    };
+    // 読み手が読まないので、バッファが満杯になった後の書き込みは詰まる。
+    let chunk = [0u8; 8192];
+    let started = Instant::now();
+    let err = loop {
+        if let Err(e) = w.write(&chunk) {
+            break e;
+        }
+        assert!(started.elapsed() < WAIT, "writer never stopped");
+    };
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 }

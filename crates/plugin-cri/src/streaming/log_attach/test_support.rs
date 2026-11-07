@@ -1,32 +1,19 @@
 //! `log_attach` の試験用の補助（一時ディレクトリと偽の probe）。`streaming` の試験からも使う。
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::AtomicU8;
 
 use super::*;
 
-/// 0700 の一時ディレクトリ（drop で消す）。
-pub(crate) struct TempDir(pub(crate) PathBuf);
+/// 0700 の一時ディレクトリ。crate の `test_root`（排他作成・既存の名前は消さない・辿らない）で作り、drop で自分の分だけ消す。
+pub(crate) struct TempDir(
+    pub(crate) PathBuf,
+    #[allow(dead_code)] crate::test_root::TestRoot,
+);
 
 impl TempDir {
     pub(crate) fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "fandhe-attach-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let root = crate::test_root::test_root("fandhe-attach", tag);
+        Self(root.to_path_buf(), root)
     }
 }
 

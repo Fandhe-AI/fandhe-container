@@ -27,8 +27,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, StateStore,
@@ -49,6 +50,9 @@ pub const MAX_ATTACH_FOLLOWERS: usize = 64;
 
 /// 書き込みが詰まったときに取り消しの旗を見直す刻み（REPAIR-5）。
 const WRITE_TICK: Duration = Duration::from_millis(200);
+
+/// 追従開始位置の確定を待つ上限（REPAIR-5）。
+const READY_WAIT: Duration = Duration::from_secs(5);
 
 /// コンテナの稼働状態の問い合わせ口（試験で偽物を差し込む）。
 pub trait AttachProbe: Send + Sync + 'static {
@@ -147,15 +151,20 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// follow スレッドが書く側。書き込みが詰まっても 200 ms ごとに取り消しの旗を見る。
+/// follow スレッドが書く側。書き込みが詰まっても 200 ms ごとに取り消しの旗と追従の絶対期限を見る。
 struct CancellableWriter {
     sock: StdUnixStream,
     cancel: Arc<AtomicBool>,
+    /// 追従の絶対期限。書き込みの再試行・進捗のたびに見る（クライアントが少量ずつ読み続けても越えて保持させない。REPAIR-5）。
+    deadline: Instant,
 }
 
 impl Write for CancellableWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
+            if Instant::now() >= self.deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
             match self.sock.write(buf) {
                 Ok(n) => return Ok(n),
                 Err(e)
@@ -266,6 +275,8 @@ impl AttachBackend for LogFollowAttachBackend {
             let (exit_w, exit_r) = pair().map_err(io_err)?;
 
             let thread_cancel = Arc::clone(&cancel);
+            let abs_deadline = Instant::now() + follow.deadline();
+            let (ready_tx, ready_rx) = mpsc::channel::<()>();
             let thread_failed = Arc::clone(&failed);
             let thread_id = id.clone();
             std::thread::Builder::new()
@@ -279,18 +290,34 @@ impl AttachBackend for LogFollowAttachBackend {
                         out: out_w.map(|sock| CancellableWriter {
                             sock,
                             cancel: Arc::clone(&thread_cancel),
+                            deadline: abs_deadline,
                         }),
                         err: err_w.map(|sock| CancellableWriter {
                             sock,
                             cancel: Arc::clone(&thread_cancel),
+                            deadline: abs_deadline,
                         }),
                         exit: exit_w,
                         cancel: thread_cancel,
                         failed: thread_failed,
+                        ready: ready_tx,
                         _guard: guard,
                     });
                 })
                 .map_err(|_| CriError::unavailable("failed to start the attach follower"))?;
+
+            // 追従開始位置（tail 0 のスナップショット）が確定するまで返さない。返した後に書かれた行を
+            // 「過去」として読み飛ばさないため。スレッドが先に終われば送り口が閉じて Err になる。
+            let ready = tokio::task::spawn_blocking(move || ready_rx.recv_timeout(READY_WAIT))
+                .await
+                .map_err(|_| CriError::internal("attach follower setup failed"))?;
+            if ready.is_err() {
+                // 取り消しの旗を立てて follower を畳む（`cancel_guard` の drop でも立つが明示する）。
+                cancel.store(true, Ordering::SeqCst);
+                return Err(CriError::unavailable(
+                    "attach follower did not become ready",
+                ));
+            }
 
             let reader = |r: tokio::net::UnixStream| -> Box<dyn AsyncRead + Send + Unpin> {
                 Box::new(FollowReader {
@@ -336,6 +363,8 @@ struct FollowJob {
     exit: StdUnixStream,
     cancel: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    /// 追従開始位置の確定を知らせる送り口（`attach` が受けるまでセッションを返さない）。
+    ready: mpsc::Sender<()>,
     _guard: ActiveGuard,
 }
 
@@ -351,6 +380,7 @@ fn follow_thread(job: FollowJob) {
         exit,
         cancel,
         failed,
+        ready,
         _guard,
     } = job;
     let result = match TailCount::new(0) {
@@ -363,7 +393,12 @@ fn follow_thread(job: FollowJob) {
                 err.as_mut().map(|w| w as &mut dyn Write),
             );
             let mut activity = || probe.activity(&id);
-            let cancelled = || cancel.load(Ordering::SeqCst);
+            // supervisor の追従ループは初回のスナップショットを確定して最初のポーリングを終えた後に `cancelled` を
+            // 初めて呼ぶ。この最初の呼び出しを「開始位置の確定」の合図に使う（以降の行は取りこぼさない）。
+            let cancelled = || {
+                let _ = ready.send(());
+                cancel.load(Ordering::SeqCst)
+            };
             read_container_log_with_cancel(
                 &log_dir,
                 &id,

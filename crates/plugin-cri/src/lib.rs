@@ -17,7 +17,7 @@
 //! SIGTERM・SIGINT による正常停止（受付の停止・実行中の RPC の期限つき待ち・socket の削除・ロックの解放）は `shutdown`・`sys` と `main.rs`（#3226・CRI-1・REPAIR-5。
 //! 停止の契約は `docs/design/cri-record-readoption.md`「停止の契約」）。SIGHUP は対象外。
 //! ストリーミングサーバー（`Exec`・`Attach`・`PortForward` の URL の先）の loopback 起動と `with_streaming` の注入、停止シグナルでの待ち受けの閉鎖は `streaming`
-//! （#3754・CRI-6・REPAIR-5。結線済みは読み取り専用の Attach〔回転ログの follow。`streaming::log_attach`。#3763〕・PortForward の NODE の pod・Exec〔Linux のみ。supervisor の helper 経由の `streaming::exec_launcher`。tty と相対 argv[0] は断る。#3761〕で、POD の PortForward は `UNIMPLEMENTED`。REPAIR-3）。
+//! （#3754・CRI-6・REPAIR-5。結線済みは読み取り専用の Attach〔回転ログの follow。`streaming::log_attach`。#3763〕・PortForward の NODE の pod・Exec〔Linux のみ。supervisor の helper 経由の `streaming::exec_launcher`。tty と相対 `argv[0]` は断る。#3761〕で、POD の PortForward は `UNIMPLEMENTED`。REPAIR-3）。
 //! shim v2 バイナリ `containerd-shim-fandhe-container-v2`（`src/bin/containerd_shim_v2.rs`）も本 crate が持つ（#3684・CRI-5・CRI-7・TASK-62.6）。
 //! 本番の `ContainerRuntime` が本 crate にしか無く cri から本 crate への依存は禁止のため。登録簿の組み立ては [`shim`]。
 //! PLUG-1 区分は plugin（crate-naming.md）。

@@ -16,7 +16,7 @@
 //! を通して実行するため、本 crate は分離を広げない（SEC-1）。
 //!
 //! # 後始末（REPAIR-5）
-//! [`ExecSession`] の `exit` future を drop する（セッションの終了・切断・期限切れ）と、持ち主の [`HelperGuard`] が helper を
+//! [`ExecSession`] の `exit` future を drop する（セッションの終了・切断・期限切れ）と、持ち主の `HelperGuard` が helper を
 //! SIGKILL する。helper の channel が閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を回収する。回収できない
 //! helper は上限つきの一覧に保持して次の `launch` で掃除し、満杯なら新しい exec を `RESOURCE_EXHAUSTED` にする。
 //! [`SupervisorExecLauncher::shutdown_all`] は plugin-cri の停止時に追跡中の全 helper を kill する。

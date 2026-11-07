@@ -63,7 +63,7 @@ pub fn production_streaming_config() -> StreamingConfig {
 }
 
 /// 本番の `StreamDispatcher`。Attach（読み取り専用の `attach`。#3763）・PortForward（NODE ネットワークの pod だけ。#3755）・
-/// Exec（`exec` が `Some` のとき。stdin・stdout・stderr のみで tty なし、絶対パスの argv[0] のみ。#3761）を結線する。
+/// Exec（`exec` が `Some` のとき。stdin・stdout・stderr のみで tty なし、絶対パスの `argv[0]` のみ。#3761）を結線する。
 ///
 /// 期限は本番の設定（[`production_streaming_config`]）の
 /// `session_limits()`。ハンドラの構築失敗（設定検証。既定では起きない）は `Internal` の固定文言に写す。

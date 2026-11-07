@@ -483,7 +483,7 @@ pub struct ControlledProcess {
 impl ControlledProcess {
     /// `inner` を包み、`slot` へ新しい世代として登録する。
     ///
-    /// Linux では `inner` の `take_stdin` / `take_pty_master` をここで取り出して世代の入出力（[`GenerationIo`]）として
+    /// Linux では `inner` の `take_stdin` / `take_pty_master` をここで取り出して世代の入出力（`GenerationIo`）として
     /// スロットへ移す（以後の本ハンドルの `take_stdin` / `take_pty_master` は `None`）。tty の捕捉用の読み取り側は
     /// `take_output` で別に渡る（`crate::attach_io::AttachIoProcess` が構築時に分けている。#4074）。
     pub fn new(inner: Box<dyn LaunchedProcess>, slot: SignalSlot) -> Self {

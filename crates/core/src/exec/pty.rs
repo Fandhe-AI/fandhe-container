@@ -30,7 +30,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! supervisor の `ExecStdio` への tty の追加と、受けた master を helper の channel へ返す結線は #3760・#3761、
-//! plugin-cri の resize の転送は #3761、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
+//! plugin-cri の resize の転送は #3761 で実装済み、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
 //! 完全版 Attach の init の pty は #3765 の範囲で、本モジュールは行わない。
 
 use std::ffi::CStr;

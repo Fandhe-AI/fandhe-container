@@ -279,7 +279,6 @@ impl SupervisedLifecycle {
             .ok_or_else(|| TraitError::new(ErrorCode::Internal, "wait deadline overflow"))?;
         let cancel = || req.is_cancelled();
         let notifier = self.exit_notifiers.notifier(store);
-        let mut notify = notifier.is_some();
         let mut settle_until: Option<Instant> = None;
         loop {
             if req.is_cancelled() {
@@ -297,18 +296,20 @@ impl SupervisedLifecycle {
                 ));
             }
             // 起床の直後: state.json が `Stopped` になるのを短い刻みで待つ。上限を過ぎても `Stopped` でなければ
-            // 通知は当てにならないとみなし、以後は照会だけで待つ（通知の空回りで読み取りを増やさない）。
+            // （restart や世代交代で購読が閉じただけの可能性）、通知を無効化せず 1 回分を照会で待ってから
+            // 次の周回で状態を読み直して再購読する（通知の空回りで読み取りを増やさない）。
             if let Some(until) = settle_until {
                 if now < until {
                     sleep_sliced(WAIT_SETTLE_INTERVAL.min(deadline - now), &cancel)?;
                     continue;
                 }
                 settle_until = None;
-                notify = false;
+                sleep_sliced(req.poll_interval().min(deadline - now), &cancel)?;
+                continue;
             }
             let poll = req.poll_interval().min(deadline - now);
-            let watch = match (&notifier, notify, st.state(), st.pid()) {
-                (Some(n), true, ContainerState::Running, Some(pid)) => Some((n, pid)),
+            let watch = match (&notifier, st.state(), st.pid()) {
+                (Some(n), ContainerState::Running, Some(pid)) => Some((n, pid)),
                 _ => None,
             };
             let Some((n, pid)) = watch else {
@@ -322,10 +323,13 @@ impl SupervisedLifecycle {
                 }
                 ExitWatchOutcome::Expired => {}
                 ExitWatchOutcome::Cancelled => return Err(wait_cancelled()),
-                ExitWatchOutcome::NoSupervisor => notify = false,
-                // 一時的な失敗と、pid の入れ替わり（記録と supervisor の保持がずれた）は、1 回分を照会で待って
-                // 次の周回で状態を読み直す（空回りで接続を繰り返さない）。
-                _ => sleep_sliced(poll, &cancel)?,
+                // supervisor が（まだ）いない・一時的な失敗・pid の入れ替わりは、1 回分を照会で待って次の周回で
+                // 状態を読み直し再購読する（制御ソケットは Running 記録の後に bind されるため、NoSupervisor を
+                // 恒久の無効化にしない。空回りで接続を繰り返さない）。待ちは通信後の残り予算で頭打ちにする。
+                _ => sleep_sliced(
+                    poll.min(deadline.saturating_duration_since(Instant::now())),
+                    &cancel,
+                )?,
             }
         }
     }

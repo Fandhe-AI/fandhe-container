@@ -255,6 +255,15 @@ mod linux {
         )
     }
 
+    /// 接続の再試行が呼び出し元の取り消しで止まったことを表す固定文言（`exit_watch` が `Cancelled` へ写す）。
+    const CONNECT_CANCELLED_MSG: &str = "the control channel connect was cancelled";
+    /// 接続の再試行が取り消しを確かめる刻み（購読の `read_exact_sliced` と同じ 10ms）。
+    const CONNECT_CANCEL_SLICE: Duration = Duration::from_millis(10);
+
+    fn cancelled_connect() -> TraitError {
+        TraitError::new(ErrorCode::Unavailable, CONNECT_CANCELLED_MSG)
+    }
+
     fn timeout() -> TraitError {
         ControlReason::Timeout
             .to_error()
@@ -341,7 +350,7 @@ mod linux {
     }
 
     fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
-        connect_with_retry_window(path, deadline, CONNECT_RETRY_WINDOW)
+        connect_with_retry_window(path, deadline, CONNECT_RETRY_WINDOW, &|| false)
     }
 
     /// [`connect_until`] の再試行窓を引数にした版。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
@@ -350,9 +359,13 @@ mod linux {
         path: &Path,
         deadline: Instant,
         retry_window: Duration,
+        cancel: &dyn Fn() -> bool,
     ) -> Result<UnixStream, TraitError> {
         let retry_until = deadline.min(Instant::now() + retry_window);
         loop {
+            if cancel() {
+                return Err(cancelled_connect());
+            }
             let interval = match crate::sys::connect_unix_nonblocking(path) {
                 Ok(s) => return Ok(s),
                 Err(e)
@@ -376,7 +389,7 @@ mod linux {
             if remaining.is_zero() {
                 return Err(timeout());
             }
-            std::thread::sleep(interval.min(remaining));
+            std::thread::sleep(interval.min(remaining).min(CONNECT_CANCEL_SLICE));
         }
     }
 
@@ -659,12 +672,13 @@ mod linux {
             return NoSupervisor;
         };
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
-        let mut stream = match connect_with_retry_window(&path, handshake_deadline, Duration::ZERO)
-        {
-            Ok(s) => s,
-            Err(e) if e.code() == ErrorCode::Timeout => return Transient,
-            Err(_) => return NoSupervisor,
-        };
+        let mut stream =
+            match connect_with_retry_window(&path, handshake_deadline, Duration::ZERO, cancel) {
+                Ok(s) => s,
+                Err(e) if e.message() == CONNECT_CANCELLED_MSG => return Cancelled,
+                Err(e) if e.code() == ErrorCode::Timeout => return Transient,
+                Err(_) => return NoSupervisor,
+            };
         match crate::sys::peer_credentials(stream.as_fd()) {
             Ok(cred) if peer_allowed(cred.uid, euid) => {}
             _ => return NoSupervisor,

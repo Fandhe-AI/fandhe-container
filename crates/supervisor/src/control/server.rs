@@ -690,6 +690,8 @@ fn accept_loop(
     guards: Option<&Arc<ExecGuardPool>>,
 ) {
     while !stop.load(Ordering::SeqCst) {
+        // 接続が続く間も期限切れ・相手が閉じた終了購読の fd が残らないよう、毎周回で整理する（#3683・REPAIR-5）。
+        slot.prune_exit_watchers(Instant::now());
         match listener.accept() {
             Ok((stream, _)) => {
                 if stream.set_nonblocking(false).is_err() {
@@ -717,14 +719,11 @@ fn accept_loop(
                 );
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // 接続が無い周回で、期限切れ・相手が閉じた終了購読を整理する（#3683・REPAIR-5）。
-                slot.prune_exit_watchers(Instant::now());
                 std::thread::sleep(config.poll_interval);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => {
                 // 一時的な失敗（EMFILE 等）で全力ループしない。
-                slot.prune_exit_watchers(Instant::now());
                 std::thread::sleep(config.poll_interval);
             }
         }

@@ -16,6 +16,8 @@
 //!   するまで munmap しない。解除に失敗したら backing は解放せず意図的にリークする（fail-closed）。
 //!   `mem::forget` で `GuestMapping` を捨てても backing はリークするだけで、解放されない（安全）。
 //!   `GuestMapping` は `&HvVm` を借用するか（`map`）`Arc<HvVm>` を保持する（`map_shared`、#3797）ため、対応付けが生きている間は `hv_vm_destroy` も起きない
+//! - `HostMapping` は `Send`・`!Sync`（`unsafe impl Send` は 1 件。#4022 の個別承認・#4024）。`GuestMapping` は自動で `Send`
+//!   になる（`HvVm` は自動で `Send + Sync`）。ゲスト RAM を vCPU スレッドへ move するための前提（#3908）
 //! - `HvVm::map` は範囲・ページ境界に加えて既定の IPA 上限（`HVF_DEFAULT_IPA_LIMIT`）も FFI の前に検査する（#3844）
 //! - 1 プロセス 1 VM。2 個目の `HvVm::create` は `hv_vm_create` を呼ばず `FailedPrecondition`
 //! - `hv_vm_destroy` が失敗したら VM はプロセス内に残るため、排他のフラグは戻さない（fail-closed）
@@ -382,13 +384,39 @@ impl Drop for HvVm {
 
 /// ゲストへ見せるホスト側メモリ（匿名 mmap。drop で munmap）。
 ///
-/// 生ポインタを持つため `Send` / `Sync` ではない（必要になった子 issue が判断する）。
+/// 生ポインタを持つが `Send` にした（所有権の移動だけを許す。#4022 のオーナー判断・#4024。vCPU スレッドへゲスト RAM を
+/// 渡すための前提。#3908）。`Sync` は足さない（`&HostMapping` の複数スレッド共有は型で禁じる。共有は `Arc<Mutex<..>>`）。
+///
+/// ```no_run
+/// # use fandhe_container_microvm::hvf::HostMapping;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<HostMapping>();
+/// ```
+///
+/// `Sync` でないこと（エラー番号 E0277 を照合するのは nightly の rustdoc だけで、stable の CI では下のモジュールの const ガードが担う）。
+///
+/// ```compile_fail,E0277
+/// # use fandhe_container_microvm::hvf::HostMapping;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<HostMapping>();
+/// ```
 #[derive(Debug)]
 pub struct HostMapping {
     ptr: *mut c_void,
     len: usize,
     page_size: usize,
 }
+
+// SAFETY: 個別承認は #4022 の判断コメント（案 A）の 1 件に限る。維持すべき不変条件:
+// - `ptr`・`len` は `new` の mmap 領域そのもので、drop（munmap）まで有効。特定のスレッドに固有ではない
+// - Rust 側は領域への参照（`&[u8]`・`&u16` 等）を作らない。触るのは範囲検査つきの volatile
+//   （`read_into`・`write_from`・`read_u16_le_aligned`・`write_u16_le_aligned`）と `write_bytes` のコピーだけ
+// - 書き込みはすべて `&mut self` を取るので排他的。`&self` からは volatile 読みだけ
+// - ゲスト（vCPU）による並行の書き込みは Rust のメモリモデルの外にあり、Rust 側の参照のエイリアシングを生まない
+// - drop の `munmap` と `GuestMapping::release` の `hv_vm_unmap` はプロセス単位の操作で呼び出しスレッドに依存しない
+//   （owning thread に束縛される `hv_vcpu_*` とは違う）。「unmap 成功時だけ munmap・失敗ならリーク」の順序もどのスレッドでも同じ
+// `Sync` は実装しない（下の const ガードで固定する）。
+unsafe impl Send for HostMapping {}
 
 impl HostMapping {
     /// ホストのページサイズ（`sysconf(_SC_PAGESIZE)`）。
@@ -697,6 +725,21 @@ const _: fn() = || {
     impl<T: ?Sized> AmbiguousIfSync<()> for T {}
     impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
     let _ = <HvVcpu<'static> as AmbiguousIfSync<_>>::some_item;
+};
+
+// `HostMapping` は `Send`（#4022・#4024）にしたが `Sync` ではないことをコンパイル時に固定する。実装すると 2 つの impl が
+// 両方当てはまって型推論が曖昧になり（E0283）、cross-target-check の `cargo check` で落ちる。`Send` 側は曖昧にならないので
+// 負のガードは置かず、正の assert で固定する。
+const _: fn() = || {
+    const fn assert_send<T: Send>() {}
+    assert_send::<HostMapping>();
+    assert_send::<GuestMapping<'static>>();
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+    let _ = <HostMapping as AmbiguousIfSync<_>>::some_item;
 };
 
 impl VcpuCanceller {
@@ -1258,6 +1301,24 @@ impl Drop for GicConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HostMapping` を別スレッドへ move して読み書きと drop ができる（`Send` の実行時確認。MVM-5・MVM-1・SEC-1・#4024）。
+    /// mmap だけで entitlement は不要。
+    #[test]
+    fn mvm5_4024_host_mapping_moves_across_threads() {
+        let page = HostMapping::page_size().expect("page size");
+        let mut m = HostMapping::new(page).expect("mmap");
+        m.write_bytes(0, &[0xde, 0xad, 0xbe, 0xef]).expect("write");
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            m.read_into(0, &mut buf).expect("read");
+            assert_eq!(buf, [0xde, 0xad, 0xbe, 0xef]);
+            m.write_u16_le_aligned(8, 0x1234).expect("write u16");
+            assert_eq!(m.read_u16_le_aligned(8).expect("read u16"), 0x1234);
+            // ここで drop（munmap）が別スレッドで走る
+        });
+        handle.join().expect("thread must not panic");
+    }
 
     /// 換算比の numer・denom が 0 以外で、`OnceLock` のキャッシュにより毎回同じ値を返す。
     /// entitlement 不要で既定の試験集合で走る（MVM-5・#3796・#3885）。

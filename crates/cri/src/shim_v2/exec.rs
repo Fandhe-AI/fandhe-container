@@ -6,7 +6,7 @@
 //!
 //! 起動役 [`TaskExecLauncher`] は本モジュールで定義するだけで、本番の実装は無い（REPAIR-3）。`ContainerRuntime`
 //! （core）に exec は無く、本番の入口は supervisor の `run_command_with_pidfd` にあるが cri は依存しない
-//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は未実装で、追跡 issue は未起票（TASK-62.7 の範囲。
+//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は未実装で、追跡 issue は #4053（TASK-62.7 の範囲。
 //! 閉じた #803 は ContainerRuntime 境界の接続までで、exec の起動役は含まない）。
 //! 差し込まれない既定の `TaskService` は `Exec` / `Start(exec_id)` と、`exec_id` つきの `State` / `Kill` / `Wait` /
 //! `Delete` を `UNIMPLEMENTED` で拒否する（fail-closed）。
@@ -198,7 +198,7 @@ pub(super) fn sleep_until(until: Instant, cancelled: &dyn Fn() -> bool) -> bool 
 /// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残り、コンテナのゲートも毒される
 ///   （以後そのストライプは `INTERNAL`）。
 ///
-/// 本番の実装は無い（REPAIR-3。supervisor の exec 入口への橋渡しは追跡 issue 未起票）。
+/// 本番の実装は無い（REPAIR-3。supervisor の exec 入口への橋渡しは追跡先は #4053）。
 pub trait TaskExecLauncher: Send + Sync {
     /// exec プロセスを起動する。
     fn launch(

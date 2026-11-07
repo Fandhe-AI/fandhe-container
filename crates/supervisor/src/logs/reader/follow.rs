@@ -156,6 +156,10 @@ pub(super) fn run(
         }
         let remaining = follow.deadline() - elapsed;
         (driver.sleep)(follow.poll_interval().min(remaining));
+        // スリープ中に取り消された場合は、追記分を読み出さず出力もせずに戻る（REPAIR-5）。
+        if (driver.cancelled)() {
+            return Ok((extra, FollowEnd::Cancelled));
+        }
     }
 }
 
@@ -805,6 +809,30 @@ mod tests {
             &mut |r| {
                 if r == 0 {
                     flag.set(true);
+                }
+            },
+            &mut || ContainerActivity::Running,
+            &|| flag.get(),
+        );
+        assert_eq!(end_of(&o), Some(FollowEnd::Cancelled));
+        assert_eq!(o.sleeps, 1);
+        assert_eq!(o.out, b"stdout a\n");
+    }
+
+    /// REPAIR-5・#3763: スリープ中の取り消しの後に追記されたログは出力しない。
+    #[test]
+    fn repair5_follow_cancel_during_sleep_does_not_emit_appended() {
+        let t = Tmp::new("cancel-sleep");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let flag = Cell::new(false);
+        let dir = t.0.clone();
+        let o = follow_run_cancel(
+            &t.0,
+            follow_opts(),
+            &mut |r| {
+                if r == 0 {
+                    flag.set(true);
+                    append(&dir, "c1.log", b"stdout b\n");
                 }
             },
             &mut || ContainerActivity::Running,

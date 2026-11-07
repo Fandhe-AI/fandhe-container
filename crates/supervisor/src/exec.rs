@@ -1132,7 +1132,7 @@ pub fn run_command_with_pidfd_output(
 ///
 /// 渡す fd は呼び出しプロセスが持つ socket / pipe の子側で、読み手と書き手は呼び出しプロセスの外側にいる前提。
 /// 注意: stdin の相手側が socketpair の場合、コマンドが fd 0 へ書き戻したデータを相手側は解釈してはならない
-/// （本番の `ExecStreamLauncher`〔#3761〕への引き継ぎ。stdin の stall 期限もそちらが持つ）。
+/// （本番の `ExecStreamLauncher`〔plugin-cri の `exec_launcher`。#3761〕が socket と pipe の端を渡す。stdin の stall 期限もそちらが持つ）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecStdio<'a> {
     /// コマンドの fd 0。

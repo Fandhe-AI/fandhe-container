@@ -11,10 +11,10 @@
 //!
 //! ## 未実装（REPAIR-3）
 //!
-//! [`ExecStreamLauncher`] の本番の実装は無い。core の `ContainerRuntime` は exec を持たず、shim v2 の
-//! `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）ため、stdio を持つ起動役を本モジュールで
-//! 注入トレイトとして定義した。supervisor の exec 入口（pidfd 経由）へ stdio のパイプ・pty を付けて橋渡しする
-//! 実装と、plugin-cri からの `StreamingServer` の起動・注入は後続の issue で行う。WebSocket（`v5.channel.k8s.io`）も未対応。
+//! [`ExecStreamLauncher`] の本番の実装は plugin-cri の `streaming::exec_launcher`（supervisor の `stream-exec` helper 経由。
+//! #3761・PLUG-1）にあり、本 crate には置かない。本番では tty を宣言せず（[`ExecStreamHandler::without_tty`]。
+//! supervisor 側の pty 結線が後続のため）、相対 `argv[0]` も断る（[`ExecStreamHandler::absolute_command_only`]）。
+//! WebSocket（`v5.channel.k8s.io`）も未対応。
 //!
 //! ## プロトコルの要点（kubernetes v1.34 の kubelet / apimachinery と moby/spdystream で確認）
 //!
@@ -181,7 +181,7 @@ impl fmt::Debug for ExecSession {
 
 /// stdio を持つ exec の起動役（注入トレイト。CRI-6・PLUG-1）。
 ///
-/// 本番の実装は無い（REPAIR-3。モジュール doc の「未実装」を参照）。実装が満たす契約:
+/// 本番の実装は plugin-cri の `exec_launcher`（#3761。モジュール doc の「未実装」を参照）。実装が満たす契約:
 ///
 /// - 起動したプロセスはコンテナの namespace・cgroup・seccomp・capability を継承し、広げない（SEC-1）
 /// - `req` の `stdin` / `stdout` / `stderr` が true のものだけを `Some` で返す
@@ -249,6 +249,10 @@ impl ExecObserver for NoopExecObserver {
 
 /// `Exec` を処理する [`StreamHandler`]。
 pub struct ExecStreamHandler {
+    /// tty を受けると宣言するか（既定 true。外すと RPC 時に tty を断る。#3761）。
+    accepts_tty: bool,
+    /// 相対 `argv[0]` を受けると宣言するか（既定 true。外すと RPC 時に断る。#3761）。
+    accepts_relative_command: bool,
     launcher: Arc<dyn ExecStreamLauncher>,
     config: ExecStreamConfig,
     observer: Arc<dyn ExecObserver>,
@@ -271,11 +275,25 @@ impl ExecStreamHandler {
     ) -> Result<Self, CriError> {
         config.validate()?;
         Ok(Self {
+            accepts_tty: true,
+            accepts_relative_command: true,
             launcher,
             config,
             observer: Arc::new(NoopExecObserver),
             recorder: Arc::new(NoopCriOpRecorder),
         })
+    }
+
+    /// tty を受けないと宣言する（`wiring()` が `exec_tty` を立てず、RPC 時に `INVALID_ARGUMENT`。#3761・REPAIR-3）。
+    pub fn without_tty(mut self) -> Self {
+        self.accepts_tty = false;
+        self
+    }
+
+    /// 絶対パスの `argv[0]` だけを受けると宣言する（相対は RPC 時に `INVALID_ARGUMENT`。#3761・#2439）。
+    pub fn absolute_command_only(mut self) -> Self {
+        self.accepts_relative_command = false;
+        self
     }
 
     /// 観測口を差し替える（REPAIR-4）。
@@ -334,7 +352,14 @@ impl ExecStreamHandler {
 
 impl StreamHandler for ExecStreamHandler {
     fn wiring(&self) -> StreamWiring {
-        StreamWiring::only(StreamKind::Exec)
+        let mut wiring = StreamWiring::only(StreamKind::Exec);
+        if self.accepts_tty {
+            wiring = wiring.with_exec_tty();
+        }
+        if self.accepts_relative_command {
+            wiring = wiring.with_exec_relative_command();
+        }
+        wiring
     }
 
     fn handle(

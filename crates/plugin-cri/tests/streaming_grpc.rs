@@ -7,7 +7,7 @@
 //! echo へつなぐ往復を、バイト列の完全一致と期限内の終了で照合する。プロセス内で `with_streaming` を足す試験では
 //! `main.rs` の注入が消えても検出できないため、本番バイナリを使う。
 //!
-//! Exec・Attach の URL の照合は #3761・#3763 が本ファイルへ足す。POD ネットワークは #3766 まで `UNIMPLEMENTED`
+//! Exec は結線済みと検証の順序を照合する（#3761。URL の発行は実コンテナが要るため #3762）。Attach の URL の照合は #3763 が足す。POD ネットワークは #3766 まで `UNIMPLEMENTED`
 //! （単体試験で照合済み）。root・特権・外部プロセスは不要で、既定のテスト集合で走る。待ちはすべて期限つき。
 //!
 //! Linux 限定の理由: `CriPluginBackends::production()` の既定の状態ルートは Linux でだけ定義される
@@ -260,6 +260,50 @@ async fn cri6_3756_production_binary_node_port_forward_round_trip() {
         )
         .await
         .expect("remove");
+        drop((c, ch));
+        assert!(guard.exited().is_none(), "server must still be running");
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// CRI-6・SEC-1・REPAIR-3・#3761: 本番構成で `Exec` が `UNIMPLEMENTED` ではなく結線済みで、検証の順序が固定である
+/// （tty と相対 `argv[0]` は URL の発行前に `INVALID_ARGUMENT`、不在のコンテナは `NOT_FOUND`）。
+/// `main.rs` の exec 起動役の注入が消えれば `UNIMPLEMENTED` に戻って検出できる。実コンテナでの通しは #3762。
+#[tokio::test]
+async fn cri6_3761_production_binary_exec_is_wired_and_fail_closed() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("exsock");
+        let xdg = TempDir::new("exxdg");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server(&sock, &xdg.0);
+        let ch = connect_when_ready(&sock, &mut guard).await;
+        let mut c = RuntimeServiceClient::new(ch.clone());
+        let exec = |cmd: &str, tty: bool| cri::ExecRequest {
+            container_id: "no-such-container".to_string(),
+            cmd: vec![cmd.to_string()],
+            stdout: true,
+            tty,
+            ..Default::default()
+        };
+
+        let e = call_with_deadline(c.exec(exec("/bin/true", false)), RPC_DEADLINE)
+            .await
+            .expect_err("missing container");
+        assert_eq!(e.code(), PluginErrorCode::NotFound, "exec must be wired");
+
+        let e = call_with_deadline(c.exec(exec("/bin/true", true)), RPC_DEADLINE)
+            .await
+            .expect_err("tty");
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "exec with tty is not supported");
+
+        let e = call_with_deadline(c.exec(exec("true", false)), RPC_DEADLINE)
+            .await
+            .expect_err("relative");
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "exec command must be an absolute path");
+
         drop((c, ch));
         assert!(guard.exited().is_none(), "server must still be running");
     })

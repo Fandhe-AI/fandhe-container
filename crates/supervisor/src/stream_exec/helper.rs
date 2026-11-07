@@ -33,7 +33,8 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - tty（pty の割り当てと `PtyMaster` の送信）は #3758・#3761 の範囲で、本 helper は `--tty` を受けない。
+//! - tty（pty の割り当てと `PtyMaster` の送信）は後続 issue（#3761 では本番で fail-closed）で、本 helper は `--tty` を受けない。
+//! - 受け取る stdio の fd は socket か FIFO に限る（`require_stdio_kinds`。#3761・SEC-1）。plugin-cri 側の結線は #3761 で実装済み。
 //! - helper は単一スレッドのため fd 0 を見張れない。plugin-cri が helper を kill せずに異常終了した場合や channel だけを
 //!   閉じた場合は、exec の期限（`--timeout-ms`）が来て worker が止まり helper が終わるまで動く（上限は期限 + `hold_grace`）。
 //! - launch 時 env の読み込み（`launch_env_for`）は I/O が止まり得るが、単一スレッドを保つため期限つきの作業スレッドで
@@ -432,6 +433,10 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         Ok(fds) => fds,
         Err(e) => return channel_failed(&e),
     };
+    // 受け取った fd の種別を exec より前に検査する。不一致は fork も kind 7 の通知もせず終える（SEC-1・#3761）。
+    if let Err(code) = require_stdio_kinds(&fds) {
+        return StreamExecOutcome::Failed(code);
+    }
 
     let remaining = total_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -464,6 +469,29 @@ pub fn serve(channel: &UnixStream, args: &StreamExecArgs, deps: &Deps<'_>) -> St
         io,
     );
     outcome_from_result(result)
+}
+
+/// 受け取った stdin・stdout・stderr の fd が AF_UNIX の socket か FIFO（pipe）であることを確かめる（SUP-6・SEC-1・#3761）。
+///
+/// 通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは `InvalidArgument`。
+/// ホストの端末 fd をコンテナのコマンドへ渡すと `TIOCSTI` 等で境界を越えうるため、plugin-cri が作る socketpair か
+/// pipe 以外を受けない。fd は複製して `fstat` し、複製は直ちに閉じる（`unsafe` なし）。
+fn require_stdio_kinds(fds: &channel::StdioFds) -> Result<(), ErrorCode> {
+    for fd in [&fds.stdin, &fds.stdout, &fds.stderr].into_iter().flatten() {
+        let dup = fd
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| ErrorCode::Internal)?;
+        let file = std::fs::File::from(dup);
+        let ty = file
+            .metadata()
+            .map_err(|_| ErrorCode::Internal)?
+            .file_type();
+        if !(ty.is_socket() || ty.is_fifo()) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+    }
+    Ok(())
 }
 
 /// fd 0 の複製を channel として確保する。socket でなければ `None`（fail-closed）。`unsafe` を使わず、複製した fd が

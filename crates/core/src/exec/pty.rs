@@ -30,7 +30,7 @@
 //!
 //! # 未実装（REPAIR-3）
 //! supervisor の `ExecStdio` への tty の追加と、受けた master を helper の channel へ返す結線は #3760・#3761、
-//! plugin-cri の resize の転送は #3761、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
+//! plugin-cri の resize の転送は #3761 で実装済み、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
 //! launch の init の `/dev/console` への bind は `bind_console`（#4071）が行う（exec は `/dev/console` を触らない）。
 //!
 //! # launch の init の pty(CRI-6・SEC-1・CORE-5・OCI-4・CORE-2・#4070・#4071)

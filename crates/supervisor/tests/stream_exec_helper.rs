@@ -329,6 +329,48 @@ fn sup6_3760_mask_mismatch_does_not_exec() {
     assert_nothing_ran(&counts, 1);
 }
 
+/// SUP-6・SEC-1（#3761）: stdio の fd は socket か FIFO だけを受ける。通常ファイル・ディレクトリ・文字デバイスは
+/// fork も通知もせず `InvalidArgument`。
+#[test]
+fn sup6_3761_stdio_fd_kinds_are_socket_or_fifo_only() {
+    let base = Tmp::new("kinds");
+    let store = open(&base);
+    seed(&base, &store, "run1", Some(PID));
+    let args = args_for(&base, "run1", PID, 0b010);
+
+    let regular = File::create(base.0.join("out")).expect("file");
+    let dir = File::open(&base.0).expect("dir");
+    let null = File::options().write(true).open("/dev/null").expect("null");
+    for (label, fd) in [("regular", &regular), ("directory", &dir), ("char", &null)] {
+        let stdio = StdioSend {
+            stdout: Some(fd.as_fd()),
+            ..StdioSend::default()
+        };
+        let (out, counts, _p) = drive(&store, &args, &stdio, &Scenario::default());
+        assert_eq!(
+            out,
+            StreamExecOutcome::Failed(ErrorCode::InvalidArgument),
+            "{label}"
+        );
+        assert_nothing_ran(&counts, 1);
+        assert!(counts.events.lock().expect("lock").is_empty(), "{label}");
+    }
+
+    // socket と FIFO は受理され、実行役が 1 回だけ呼ばれる。
+    let (sock, _peer) = UnixStream::pair().expect("pair");
+    let (pipe_r, pipe_w) = std::io::pipe().expect("pipe");
+    for (label, fd) in [("socket", sock.as_fd()), ("fifo", pipe_w.as_fd())] {
+        let stdio = StdioSend {
+            stdout: Some(fd),
+            ..StdioSend::default()
+        };
+        let (out, counts, _p) = drive(&store, &args, &stdio, &Scenario::default());
+        assert_eq!(out, StreamExecOutcome::Exited(3), "{label}");
+        assert_eq!(counts.run.load(Ordering::SeqCst), 1, "{label}");
+    }
+    drop(pipe_r);
+}
+
 /// SUP-6・REPAIR-5（#3760）: 作成通知の後に `Started`、続いて実行役の終了状態が `Result` の値になる。
 /// 通知に失敗したら `Started` を送らず exec を中止する。
 #[test]

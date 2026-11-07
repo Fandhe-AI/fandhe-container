@@ -371,6 +371,39 @@ fn spawn_helper(args: &[&str], stdin: Stdio) -> std::process::Child {
         .expect("spawn")
 }
 
+/// helper の終了を期限つきで待つ（REPAIR-5・#3760）。期限超過なら kill して回収してから panic する。
+/// stderr は別スレッドで集め、受け取りにも有限の期限を置く（試験自身で有界化し CI の watchdog に頼らない）。
+fn wait_bounded(mut child: std::process::Child, limit: Duration) -> (Option<i32>, String) {
+    let reader = child.stderr.take().map(|mut e| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = e.read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("helper did not exit within {limit:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let err = reader
+        .map(|rx| {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("stderr reader timed out")
+        })
+        .unwrap_or_default();
+    (status.code(), err)
+}
+
 const COMMON: [&str; 8] = [
     "--root",
     "/tmp",
@@ -409,7 +442,7 @@ fn sec1_3760_real_bin_rejects_invalid_args_with_result_frame() {
     for (why, args) in cases {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (plugin, helper_end) = UnixStream::pair().expect("pair");
-        let mut child = spawn_helper(&refs, Stdio::from(OwnedFd::from(helper_end)));
+        let child = spawn_helper(&refs, Stdio::from(OwnedFd::from(helper_end)));
         let msg = recv_from_helper(&plugin, Instant::now() + Duration::from_secs(20)).expect(why);
         assert!(
             matches!(
@@ -418,7 +451,11 @@ fn sec1_3760_real_bin_rejects_invalid_args_with_result_frame() {
             ),
             "{why}: {msg:?}"
         );
-        assert_eq!(child.wait().expect("wait").code(), Some(0), "{why}");
+        assert_eq!(
+            wait_bounded(child, Duration::from_secs(20)).0,
+            Some(0),
+            "{why}"
+        );
     }
 }
 
@@ -432,7 +469,7 @@ fn sup6_3760_real_bin_reports_missing_record() {
         .expect("root");
     let root = base.state_root();
     let (plugin, helper_end) = UnixStream::pair().expect("pair");
-    let mut child = spawn_helper(
+    let child = spawn_helper(
         &[
             "--root",
             root.to_str().expect("utf8"),
@@ -458,21 +495,15 @@ fn sup6_3760_real_bin_reports_missing_record() {
         ),
         "{msg:?}"
     );
-    assert_eq!(child.wait().expect("wait").code(), Some(0));
+    assert_eq!(wait_bounded(child, Duration::from_secs(20)).0, Some(0));
 }
 
 /// SEC-1（#3760）: fd 0 が socket でなければ fail-closed（終了コード 1 と構造化された診断行）。
 #[test]
 fn sec1_3760_real_bin_requires_a_socket_on_fd0() {
-    let mut child = spawn_helper(&["--root", "/tmp", "--id", "a1"], Stdio::null());
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr")
-        .read_to_string(&mut err)
-        .expect("read");
-    assert_eq!(child.wait().expect("wait").code(), Some(1));
+    let child = spawn_helper(&["--root", "/tmp", "--id", "a1"], Stdio::null());
+    let (code, err) = wait_bounded(child, Duration::from_secs(20));
+    assert_eq!(code, Some(1));
     assert_eq!(
         err,
         "{\"code\":\"invalid-argument\",\"message\":\"stream-exec requires a socket on fd 0\"}\n"

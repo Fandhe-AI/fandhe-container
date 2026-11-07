@@ -10,6 +10,9 @@
 //! 1. 停止要求を立てて kick（`hv_vcpus_exit`）し、vCPU スレッドの報告を期限まで待つ（待つ間も kick し直す。`LoopHandle::stop`）。
 //!    スレッドは実行ループを抜けたら、owning thread 自身で vCPU を `hv_vcpu_destroy` し、続けて捕捉していた `Arc<VmWithGic>` を
 //!    落としてから報告を送る。つまり `Ok` で戻った時点で vCPU は破棄済みで、スレッド側の VM への参照も無い。
+//!    止まりを確かめる対象は vCPU 群と、RAM に触る補助スレッド（macOS の受信ポーラー `hvf-net-rx`。[`StopWithAux`]。#4030）。
+//!    補助スレッドは kick（世代番号の通知）で即座に起き、期限は vCPU と共有（下限 [`AUX_STOP_MIN`]）。スレッドは終了の直前に
+//!    transport・RAM のスロットの clone・割り込み線を落としてから報告する。
 //! 2. `Ok` のときだけ、デバイス → ゲスト RAM → VM の順に drop する。
 //!    - デバイス: `GicSpiLine` の保持と dispatcher を VM より先に落とす。VM の破棄後に古い線から注入されないことは、`VmWithGic` の
 //!      生存フラグでも守られる（二重の防御）。
@@ -44,6 +47,50 @@ pub trait VcpuStopper {
 impl<K: VcpuKick> VcpuStopper for LoopHandle<K> {
     fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
         LoopHandle::stop(self, deadline).map(VcpuSetStopReport::single)
+    }
+}
+
+/// vCPU 以外で、ゲスト RAM とデバイスに触るスレッド（受信ポーラー `hvf-net-rx`。#4030）の期限つきの停止口。
+///
+/// `Ok` で戻った時点で、そのスレッドが持つ資源（transport・RAM のスロットの clone・割り込み線）は解放済みであること。
+pub trait AuxStopper {
+    /// 停止を要求し、`deadline` まで終了報告を待つ。
+    fn stop(self, deadline: Duration) -> Result<StopReason, MicrovmError>;
+}
+
+/// 補助スレッドの停止に与える下限（vCPU の停止で期限を使い切っていても、起こして報告を受ける分だけは試みる。#4030）。
+pub const AUX_STOP_MIN: Duration = Duration::from_millis(100);
+
+/// vCPU 群と補助スレッド（受信ポーラー）をまとめて止める [`VcpuStopper`]（#4030・MVM-5・MVM-1・REPAIR-5）。
+///
+/// [`stop_and_release`] の解放順（devices、memory、vm）は変えず、その前段の「止まりを確かめる」対象に補助スレッドを足す。
+/// 先に vCPU を止め、続けて残り時間（下限 [`AUX_STOP_MIN`]）で補助スレッドを止める。どちらかが `Err` なら `Err`
+/// （止まりを確かめられないスレッドが RAM を握っているので、呼び出し元は RAM を解放しない。fail-closed）。
+/// vCPU の停止が `Err` でも補助スレッドの停止は必ず試みる（スレッドを放置しない）。
+pub struct StopWithAux<S, A> {
+    /// vCPU 群。
+    pub vcpus: S,
+    /// 補助スレッド（無ければ `None`）。
+    pub aux: Option<A>,
+}
+
+impl<S: VcpuStopper, A: AuxStopper> VcpuStopper for StopWithAux<S, A> {
+    /// 報告の `reason` は、vCPU が `Requested` で補助が `Requested` 以外ならその補助の理由にする（受信ポーラーの失敗は
+    /// `VmShutdown` 経由で vCPU を `Requested` のまま止めるため、失敗が報告から消えないようにする）。
+    fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+        let started = std::time::Instant::now();
+        let vcpu_result = self.vcpus.stop(deadline);
+        let aux_result = self
+            .aux
+            .map(|a| a.stop(deadline.saturating_sub(started.elapsed()).max(AUX_STOP_MIN)));
+        let mut report = vcpu_result?;
+        if let Some(r) = aux_result {
+            let reason = r?;
+            if report.reason == StopReason::Requested {
+                report.reason = reason;
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -599,5 +646,97 @@ mod tests {
         h.join().unwrap();
         // 中身は取り出されていない（リーク）。
         assert!(slot.with_memory(|_| Ok(())).is_ok());
+    }
+
+    /// 補助スレッドの偽物（渡された期限を記録する）。
+    struct FakeAux(
+        Arc<Mutex<Option<Duration>>>,
+        Result<StopReason, MicrovmError>,
+    );
+
+    impl AuxStopper for FakeAux {
+        fn stop(self, deadline: Duration) -> Result<StopReason, MicrovmError> {
+            *self.0.lock().unwrap() = Some(deadline);
+            self.1
+        }
+    }
+
+    fn aux(r: Result<StopReason, MicrovmError>) -> (FakeAux, Arc<Mutex<Option<Duration>>>) {
+        let seen = Arc::new(Mutex::new(None));
+        (FakeAux(Arc::clone(&seen), r), seen)
+    }
+
+    /// MVM-5・REPAIR-5・#4030: 補助が `Requested` なら従来どおり devices、memory、vm の順に解放される。
+    #[test]
+    fn mvm5_4030_aux_ok_keeps_release_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, seen) = aux(Ok(StopReason::Requested));
+        let stopper = StopWithAux {
+            vcpus: responsive(),
+            aux: Some(a),
+        };
+        let r = stop_and_release("test", stopper, LONG, resources(&log)).unwrap();
+        assert_eq!(r.reason, StopReason::Requested);
+        assert_eq!(r.vcpu_count, 1);
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
+        let got = seen.lock().unwrap().unwrap();
+        assert!(got <= LONG && got >= AUX_STOP_MIN, "{got:?}");
+    }
+
+    /// 補助の失敗は、vCPU が `Requested` でも報告の理由に残る。
+    #[test]
+    fn mvm5_4030_aux_failure_reason_is_reported() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, _) = aux(Ok(StopReason::Failed(MicrovmErrorCode::Internal)));
+        let stopper = StopWithAux {
+            vcpus: responsive(),
+            aux: Some(a),
+        };
+        let r = stop_and_release("test", stopper, LONG, resources(&log)).unwrap();
+        assert_eq!(r.reason, StopReason::Failed(MicrovmErrorCode::Internal));
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
+    }
+
+    /// 補助の停止を確かめられなければ RAM を解放しない（リーク）。補助は呼ばれ、`Err` が返る。
+    #[test]
+    fn mvm5_4030_aux_timeout_leaks_memory() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, seen) = aux(Err(MicrovmError::new(
+            MicrovmErrorCode::DeadlineExceeded,
+            "aux stuck",
+        )));
+        let stopper = StopWithAux {
+            vcpus: responsive(),
+            aux: Some(a),
+        };
+        let e = stop_and_release("test", stopper, LONG, resources(&log)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert!(seen.lock().unwrap().is_some());
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
+    }
+
+    /// 期限を使い切っていても補助には下限 `AUX_STOP_MIN` が渡る。
+    #[test]
+    fn repair5_4030_aux_gets_minimum_deadline() {
+        let (a, seen) = aux(Ok(StopReason::Requested));
+        let stopper = StopWithAux {
+            vcpus: responsive(),
+            aux: Some(a),
+        };
+        stopper.stop(Duration::from_nanos(1)).ok();
+        assert_eq!(seen.lock().unwrap().unwrap(), AUX_STOP_MIN);
+    }
+
+    /// 補助なしは vCPU 単独と同じ結果になる。
+    #[test]
+    fn mvm5_4030_no_aux_is_same_as_vcpus_alone() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stopper = StopWithAux::<LoopHandle<FakeKick>, FakeAux> {
+            vcpus: responsive(),
+            aux: None,
+        };
+        let r = stop_and_release("test", stopper, LONG, resources(&log)).unwrap();
+        assert_eq!(r.reason, StopReason::Requested);
+        assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
     }
 }

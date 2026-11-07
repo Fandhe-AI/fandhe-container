@@ -495,8 +495,8 @@ fn net_queue_out_of_range(queue: u16) -> (NetQueueStats, Option<MicrovmError>) {
 /// 範囲外のキュー番号は Linux の `DeviceBus` の net と同じ契約に揃え、`Err` ではなく `Ok` の `queue_error`
 /// （`Unknown`）で返す（block の route とは違う。止めるかどうかは呼び出し元の `queue_notify_action` が決める）。
 /// ロックの順は transport、memory の順。`line.trigger()` がメモリの lock の中で呼ばれる例外は
-/// `BlockQueueNotifyRoute` と同じ。範囲は送信とゲストの kick による受信まで。ホスト側の到着を契機にした
-/// 受信（macOS の受信ポーラー）は #4030（REPAIR-3）。
+/// `BlockQueueNotifyRoute` と同じ。範囲は送信とゲストの kick による受信。ホスト側の到着を契機にした
+/// 受信（macOS の受信ポーラー）は [`NetRxPollRoute`] の実装（#4030）が担う。
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub struct NetQueueNotifyRoute<B: NetBackend, M: GuestMemoryBacking, L> {
     transport: std::sync::Arc<std::sync::Mutex<VirtioMmioTransport<VirtioNet<B>>>>,
@@ -552,6 +552,33 @@ where
         self.memory
             .with_memory_mut(|mem| complete_net_notify(&mut t, mem, queue, &self.line))
             .map(QueueNotifyReport::Net)
+    }
+}
+
+/// ホスト側の到着を契機にした virtio-net の受信を 1 台分処理する口（受信ポーラー用。#4030・MVM-5・MVM-1・REPAIR-5）。
+///
+/// 呼び出し文脈: macOS の受信ポーラー（`net_rx_poll::spawn_net_rx_poller` のスレッド `hvf-net-rx`）が周期ごとに全 net デバイスへ
+/// 呼ぶ。中身は [`poll_net_rx`]（未 activate・FAILED・キュー未 ready は [`NetRxPollOutcome::Skipped`]）。
+/// ロックの順は [`QueueNotifyRoute`] と同じ transport、memory で、dispatcher の lock は取らない（vCPU の MMIO 経路と循環しない）。
+/// リング破損は `Ok` の `queue_error`、lock の poison・割り込み線の失敗・メモリの取り出し済みは外側の `Err`。待ちは持たない。
+pub trait NetRxPollRoute: Send + Sync + std::fmt::Debug {
+    /// 受信を 1 回処理する。
+    fn poll_rx(&self) -> Result<NetRxPollOutcome, MicrovmError>;
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+impl<B, M, L> NetRxPollRoute for NetQueueNotifyRoute<B, M, L>
+where
+    B: NetBackend + Send,
+    M: GuestMemoryBacking + Send,
+    L: InterruptLine + Send + Sync,
+{
+    fn poll_rx(&self) -> Result<NetRxPollOutcome, MicrovmError> {
+        let mut t = self.transport.lock().map_err(|_| {
+            MicrovmError::new(MicrovmErrorCode::Internal, "virtio transport lock poisoned")
+        })?;
+        self.memory
+            .with_memory_mut(|mem| poll_net_rx(&mut t, mem, &self.line))
     }
 }
 
@@ -629,7 +656,7 @@ pub enum NetRxPollOutcome {
 
 /// ゲストの kick なしで virtio-net の受信を 1 回処理する（#3742・MVM-1・REPAIR-5）。
 ///
-/// 呼び出し元は受信ポーラー（Linux では `microvm` の `NetRxPoller`。期限ごとに呼ぶ）。kick 経路と同じ lock の下で直列に呼ぶ前提。
+/// 呼び出し元は受信ポーラー（Linux では `microvm` の `NetRxPoller`、macOS では `net_rx_poll` の `hvf-net-rx`。期限ごとに呼ぶ）。kick 経路と同じ lock の下で直列に呼ぶ前提。
 /// 先にトランスポートの状態を確かめ、ドライバ未初期化（`DRIVER_OK` なし）・`FAILED` / `DEVICE_NEEDS_RESET`・receiveq が
 /// ready でないときは `process_rx` を呼ばず [`NetRxPollOutcome::Skipped`] を返す。activate 前の `process_rx` は
 /// `FailedPrecondition` を返し、ポーラーがそれを異常として拾うとゲストが virtio_net を読み込む前に VM が止まるため。

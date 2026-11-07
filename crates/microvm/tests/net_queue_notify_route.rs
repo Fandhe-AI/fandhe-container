@@ -3,7 +3,7 @@
 //! 公開 API だけで `NetQueueNotifyRoute`（トランスポート・ゲスト RAM のスロット・割り込み線の束ね）を作り、
 //! 送信（キュー 1）と、ゲストの kick による受信（キュー 0）の完了・`trigger` の回数・範囲外のキュー番号・
 //! リング破損の返し方・固定の `Err` を具体値で照合する。KVM は不要。
-//! ホスト側の到着を契機にした受信（macOS の受信ポーラー）は #4030 の担当でここでは扱わない。
+//! ホスト側の到着を契機にした受信（受信ポーラー）は `tests/net_rx_poller.rs`（#4030）で扱い、ここでは扱わない。
 #![cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 
 use std::sync::atomic::{AtomicU32, Ordering};

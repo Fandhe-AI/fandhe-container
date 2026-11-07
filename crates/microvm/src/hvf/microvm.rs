@@ -38,6 +38,9 @@
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
 //! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを全台起こす `WfiWakeSet` の通知。#3887・#3948。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
+//!    続けて、virtio-net がある構成の受信ポーラー `hvf-net-rx`（#4030）を止める（kick で即座に起きる。期限は vCPU と共有で下限 100ms。
+//!    `hvf_lifecycle::StopWithAux`）。ポーラーは終了の直前に transport・RAM のスロットの clone・割り込み線を落としてから報告する。
+//!    止まりを確かめられなければ RAM をリークする（fail-closed）。ポーラーの失敗は `VmShutdown` で全 vCPU を止める。
 //! 2. owning thread が自分の vCPU を `hv_vcpu_destroy` し（vCPU はスレッドに束縛され、他スレッドからは破棄できない）、捕捉していた
 //!    `Arc<VmWithGic>` を落として報告を送る。報告を受けた時点で vCPU の破棄は済んでいる。
 //!    vCPU は N 台あり、parked の AP も同じく owning thread が破棄する。報告は「N 台すべてが破棄済み」のときだけ `Ok`（`stop_all`）。
@@ -77,7 +80,7 @@
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の QueueNotify（送信と
-//!   ゲストの kick による受信）も #4029 で結線済み。ホスト側の到着を契機にした受信は #4030、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   ゲストの kick による受信）も #4029 で結線済み。ホスト側の到着を契機にした受信は #4030 で受信ポーラー（`net_rx_poll`）を `start` で起動して結線済み、期限切れ後の最後の `Arc` での RAM の回収は #4032、
 //!   全体の追跡は #3908。
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
 //!   [`HvfMicroVm::interrupt_ack_counts`] で読む。
@@ -106,15 +109,17 @@ use crate::hvf::mmio::MmioHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuSet, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
 use crate::hvf_lifecycle::{
-    DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, VcpuStopper, stop_and_release,
+    DROP_STOP_DEADLINE, HvfStopReport, ReleaseDevices, Resources, StopWithAux, VcpuStopper,
+    stop_and_release,
 };
 use crate::hvf_loop::log_line;
 use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
 use crate::interrupt::{
     BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
-    InterruptLine, NetQueueNotifyRoute, QueueNotifyRoute,
+    InterruptLine, NetQueueNotifyRoute, NetRxPollRoute, QueueNotifyRoute,
 };
+use crate::net_rx_poll::{NET_RX_POLL_INTERVAL, NetRxPollerHandle, spawn_net_rx_poller};
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
@@ -381,7 +386,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
     ///
     /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
     /// clone で受け渡す（`HvfVmParts::release` が停止確認後に取り出すため、解放後の通知は `Internal` で fail-closed）。
-    /// virtio-net の台にも同じ形で route を作る（#4029。送信とゲストの kick による受信まで。ホスト側の到着による受信は #4030。REPAIR-3）。
+    /// virtio-net の台にも同じ形で route を作る（#4029。送信とゲストの kick による受信まで。ホスト側の到着による受信は `net_rx_poll_routes` と受信ポーラー〔#4030〕）。
     fn queue_notify_routes(
         &self,
         memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
@@ -403,6 +408,27 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             (d.id, route)
         });
         b.chain(n).collect()
+    }
+
+    /// virtio-net の台ごとの受信ポーラー用の route（ホスト側の到着を契機にした受信。#4030・MVM-5・MVM-1）。
+    ///
+    /// `queue_notify_routes` の net と同じ種類（`NetQueueNotifyRoute`）を別に作る。ゲスト RAM は `memory` スロットの clone で、
+    /// ポーラーのスレッドが終了の直前に落とす（停止の確認が RAM の解放より前になる）。net が無ければ空。
+    fn net_rx_poll_routes(
+        &self,
+        memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
+    ) -> Vec<Arc<dyn NetRxPollRoute>> {
+        self.net
+            .iter()
+            .map(|d| {
+                let route: Arc<dyn NetRxPollRoute> = Arc::new(NetQueueNotifyRoute::new(
+                    Arc::clone(&d.transport),
+                    memory.clone(),
+                    d.line.clone(),
+                ));
+                route
+            })
+            .collect()
     }
 
     /// 全デバイスの SPI の宛先のヒント（vCPU ごとの `AckRouteLearner` が ACK を処理した vCPU を書く。#3948）。
@@ -458,6 +484,8 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// ゲスト RAM の所有。`release` がスロットの clone を渡し、停止確認後に期限つきで取り出す（#4027・#4092）。
     memory: GuestMemorySlot<RegisteredHvfRam<'static>>,
     vm: Option<Arc<VmWithGic>>,
+    /// 受信ポーラー `hvf-net-rx`（virtio-net がある構成の start 以降。`release` が vCPU の後に止める。#4030）。
+    net_rx: Option<NetRxPollerHandle>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
     infos: Vec<HvfDeviceInfo>,
     /// 各デバイスの ACK の後処理の結果の計数（`infos` と同じ順。`devices` を `release` が取り出した後も読める。#4014）。
@@ -498,9 +526,13 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
                 "microvm resources are already released",
             ));
         };
+        // 受信ポーラーは vCPU の後に止め、止まりを確かめるまで RAM を解放しない（#4030）。
         stop_and_release(
             op,
-            vcpus,
+            StopWithAux {
+                vcpus,
+                aux: self.net_rx.take(),
+            },
             deadline,
             Resources {
                 devices,
@@ -706,6 +738,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 devices: Some(devices),
                 memory,
                 vm: Some(vm),
+                net_rx: None,
                 dispatcher,
                 infos,
                 ack_tallies,
@@ -727,26 +760,39 @@ fn abort_after_spawn(vcpu_set: VcpuSet, memory: &GuestMemorySlot<RegisteredHvfRa
     let _ = memory.take_within(DROP_STOP_DEADLINE);
 }
 
-impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
+impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroVm<B, N> {
     /// ゲストを走らせ始める（start gate を開く）。以後の停止は [`RunningHvfMicroVm::stop`] か drop。
     ///
     /// ゲートの待ちは上限つき（`hvf_loop::START_GATE_WAIT`）で、`assemble` から長く放置されたスレッドは走らせずに終わっていることが
     /// ある。その場合も `start` は成功し、終了理由（`Failed(DeadlineExceeded)`）は `stop` の報告に出る。
     pub fn start(self) -> Result<RunningHvfMicroVm<B, N>, MicrovmError> {
+        let mut this = self;
         let started = Instant::now();
-        // 開けるのは vCPU 0 の gate だけ。AP は CPU_ON（#3891。メールボックス）まで parked のまま。
-        match &self.parts.vcpus {
-            Some(v) => v.open_start(),
-            None => {
-                return Err(MicrovmError::new(
-                    MicrovmErrorCode::FailedPrecondition,
-                    "microvm resources are already released",
-                ));
+        if this.parts.vcpus.is_none() {
+            return Err(MicrovmError::new(
+                MicrovmErrorCode::FailedPrecondition,
+                "microvm resources are already released",
+            ));
+        }
+        // 受信ポーラーはゲートを開く前に起動する（ゲストが走る前に結び、start 前の空回りも無い）。起動に失敗したら Err を返し、
+        // `this` の drop が期限つきで回収する（ゲートは未開放でゲストは走っていない）。#4030・MVM-5・REPAIR-5。
+        if let (Some(devices), Some(vm)) = (&this.parts.devices, &this.parts.vm) {
+            let routes = devices.net_rx_poll_routes(&this.parts.memory);
+            if !routes.is_empty() {
+                this.parts.net_rx = Some(spawn_net_rx_poller(
+                    routes,
+                    NET_RX_POLL_INTERVAL,
+                    vm.shutdown(),
+                )?);
             }
+        }
+        // 開けるのは vCPU 0 の gate だけ。AP は CPU_ON（#3891。メールボックス）まで parked のまま。
+        if let Some(v) = &this.parts.vcpus {
+            v.open_start();
         }
         log_line(format_args!("level=info op=hvf.microvm.start outcome=ok"));
         Ok(RunningHvfMicroVm {
-            parts: self.parts,
+            parts: this.parts,
             started,
         })
     }

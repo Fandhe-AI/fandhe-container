@@ -99,16 +99,19 @@ fn main() {
 #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
 mod linux {
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, ContainerEnv, ExecChildSetupReport, ExecChildStep, ExecCommand, ExecExit,
-        MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
+        ChildExit, ChildStdio, ContainerEnv, ExecChildSetupReport, ExecChildStep, ExecCommand,
+        ExecExit, MAX_SEALED_COPY_BYTES, SealedCopyUnavailable, StandardFd, SupplementaryGroups,
         ViolationReason, clear_supplementary_groups_for_test, close_standard_fds_for_test,
         observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
-        observe_exec_child_setup_with_fsize,
+        observe_exec_child_setup_with_fsize, observe_exec_child_setup_with_stdio,
     };
     use fandhe_container_core::oci_runtime::parse_config_bytes;
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind};
@@ -218,6 +221,7 @@ mod linux {
         environment_comes_only_from_the_container_definition(&work.0);
         supplementary_groups_are_cleared_or_refused();
         exec_fd_moves_above_closed_stdio(&work.0);
+        stdio_is_routed_per_stream(&work.0);
         println!("exec_child_setup: all scenarios passed");
     }
 
@@ -893,6 +897,86 @@ exec "$2" "$3" "$1""#;
         let started = observe(&shell_entry(), "report-started");
         assert_eq!(started.exit, ExecExit::Command(ChildExit::Exited(0)));
         assert!(started.exit.command_started());
+    }
+
+    /// 読み取り期限つきで EOF まで読む（REPAIR-5。期限内に EOF が来なければ失敗にする）。
+    fn read_all_with_deadline(stream: &UnixStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(timeout()))
+            .expect("set read timeout");
+        let mut buf = Vec::new();
+        (&*stream).read_to_end(&mut buf).expect("read to EOF");
+        buf
+    }
+
+    /// SUP-6・CRI-6・SEC-1（#3757）: stdin・stdout・stderr を個別に指定すると、stdin に書いたバイト列がコマンドに届き、
+    /// stdout と stderr が別々に取れる。指定されない番号は `/dev/null` のまま。残る fd は従来の 2 本だけ。
+    fn stdio_is_routed_per_stream(work: &Path) {
+        // (a) 3 本とも指定: stdin のバイト列が届き、stdout と stderr が別々に取れる。置換された番号はない。
+        let (in_mine, in_theirs) = UnixStream::pair().expect("stdin pair");
+        let (out_mine, out_theirs) = UnixStream::pair().expect("stdout pair");
+        let (err_mine, err_theirs) = UnixStream::pair().expect("stderr pair");
+        (&in_mine)
+            .write_all(b"stdin-bytes-3757")
+            .expect("write stdin");
+        in_mine
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown stdin");
+        let stdio = ChildStdio::from_fds(
+            Some(OwnedFd::from(in_theirs)),
+            Some(OwnedFd::from(out_theirs)),
+            Some(OwnedFd::from(err_theirs)),
+        )
+        .expect("stdio");
+        let observation = observe_exec_child_setup_with_stdio(
+            &shell_entry(),
+            &work.join("report-stdio-all"),
+            stdio,
+            || {
+                let mut input = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut input);
+                let _ = std::io::stdout().write_all(b"OUT:");
+                let _ = std::io::stdout().write_all(&input);
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().write_all(b"ERR:");
+                let _ = std::io::stderr().write_all(&input);
+                let _ = std::io::stderr().flush();
+            },
+            timeout(),
+        )
+        .expect("observe with all stdio");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        assert_eq!(read_all_with_deadline(&out_mine), b"OUT:stdin-bytes-3757");
+        assert_eq!(read_all_with_deadline(&err_mine), b"ERR:stdin-bytes-3757");
+        assert_eq!(report.stdio, [(false, 0); 3], "no stream is replaced");
+        assert_eq!(report.open_fds.len(), 2, "{:?}", report.open_fds);
+
+        // (b) stdout だけ指定: stdin と stderr は `/dev/null`（stdin は即 EOF）。
+        let (out_mine, out_theirs) = UnixStream::pair().expect("stdout pair");
+        let stdio =
+            ChildStdio::from_fds(None, Some(OwnedFd::from(out_theirs)), None).expect("stdio");
+        let observation = observe_exec_child_setup_with_stdio(
+            &shell_entry(),
+            &work.join("report-stdio-out"),
+            stdio,
+            || {
+                let mut input = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut input);
+                let _ = std::io::stdout().write_all(b"OUT:");
+                let _ = std::io::stdout().write_all(&input);
+                let _ = std::io::stdout().flush();
+            },
+            timeout(),
+        )
+        .expect("observe with stdout only");
+        assert_eq!(observation.exit, ExecExit::Command(ChildExit::Exited(0)));
+        let report = observation.report.expect("report");
+        assert_eq!(read_all_with_deadline(&out_mine), b"OUT:");
+        assert_eq!(report.stdio[0], (true, NULL_RDEV));
+        assert_eq!(report.stdio[1], (false, 0));
+        assert_eq!(report.stdio[2], (true, NULL_RDEV));
+        assert_eq!(report.open_fds.len(), 2, "{:?}", report.open_fds);
     }
 
     /// SUP-6・SEC-1・TASK-163.4 / 追補（#1460）: 子は呼び出し側から継承した fd 3 以上をすべて閉じ、残るのは

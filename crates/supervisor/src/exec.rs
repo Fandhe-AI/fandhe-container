@@ -238,8 +238,9 @@
 //!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
 //!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（#1621）で
 //!   行う（記録が済むまで rootless での通しは未確認）
-//! - コマンドの標準入出力の受け渡しのうち CLI の exec と stdin。healthcheck の出力取得は実装済み（[`run_command_with_pidfd_output`]。
-//!   stdout / stderr を結合した 1 本の fd へ付け替える。#2441）。それ以外は launch と同じく `/dev/null` へ固定し、cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
+//! - コマンドの標準入出力の受け渡し。stdin・stdout・stderr の個別指定は実装済み（[`ExecStdio`]。#3757・SUP-6・CRI-6）で、
+//!   healthcheck の出力取得は stdout / stderr を結合した 1 本の fd へ付け替える形（[`run_command_with_pidfd_output`]。#2441）。
+//!   指定のない番号は `/dev/null`。未対応: CLI の exec の stdio の配線（#2712）・pty（#3758）。cwd の指定も未対応（cwd はコンテナの rootfs の根）。ユーザーは `config.json` の
 //!   `process.user`（非 root と `additionalGids` を含む）を対象の写像と照合して受ける（#2770）。exec 要求ごとの
 //!   ユーザーの上書き（CLI の `--user`・CRI の Exec。#2712・#680）は未対応
 //! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
@@ -282,7 +283,7 @@
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
@@ -922,7 +923,15 @@ pub fn run_command(
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
             let target = identify_pid1_staged(record)?;
-            run_with_target(proof, &target, request, deadline, child, sender, None)
+            run_with_target(
+                proof,
+                &target,
+                request,
+                deadline,
+                child,
+                sender,
+                ExecStdio::NONE,
+            )
         },
     );
     audit_worker_result(
@@ -1081,7 +1090,7 @@ pub fn run_command_with_pidfd_env(
         audit,
         ExecLaunchIo {
             launch_env,
-            output: None,
+            stdio: ExecStdio::NONE,
             on_created: None,
         },
     )
@@ -1113,10 +1122,43 @@ pub fn run_command_with_pidfd_output(
         audit,
         ExecLaunchIo {
             launch_env,
-            output: Some(output),
+            stdio: ExecStdio::combined(output),
             on_created: None,
         },
     )
+}
+
+/// exec のコマンドの標準入出力の指定（SUP-6・CRI-6・#3757）。`None` の番号は検証済みの `/dev/null` のまま。
+///
+/// 渡す fd は呼び出しプロセスが持つ socket / pipe の子側で、読み手と書き手は呼び出しプロセスの外側にいる前提。
+/// 注意: stdin の相手側が socketpair の場合、コマンドが fd 0 へ書き戻したデータを相手側は解釈してはならない
+/// （本番の `ExecStreamLauncher`〔#3761〕への引き継ぎ。stdin の stall 期限もそちらが持つ）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecStdio<'a> {
+    /// コマンドの fd 0。
+    pub stdin: Option<BorrowedFd<'a>>,
+    /// コマンドの fd 1。
+    pub stdout: Option<BorrowedFd<'a>>,
+    /// コマンドの fd 2。
+    pub stderr: Option<BorrowedFd<'a>>,
+}
+
+impl<'a> ExecStdio<'a> {
+    /// 3 本とも `/dev/null`（従来の `output` なし）。
+    pub const NONE: Self = Self {
+        stdin: None,
+        stdout: None,
+        stderr: None,
+    };
+
+    /// stdout と stderr に同じ 1 本の fd（結合）。stdin は `/dev/null`（従来の `output` あり。healthcheck）。
+    pub fn combined(output: BorrowedFd<'a>) -> Self {
+        Self {
+            stdin: None,
+            stdout: Some(output),
+            stderr: Some(output),
+        }
+    }
 }
 
 /// exec 子 cgroup の作成通知のフック型（[`ExecLaunchIo::on_created`]）。
@@ -1126,8 +1168,8 @@ pub type ExecCreatedHook<'a> = dyn Fn(&ExecCgroupName) -> Result<(), TraitError>
 pub struct ExecLaunchIo<'a> {
     /// launch 時の起動オプションの env 上書き（`KEY=VALUE`。契約は [`run_command_with_pidfd_env`]）。
     pub launch_env: &'a [String],
-    /// コマンドの stdout / stderr の取得先。`None` なら標準入出力は 3 本とも `/dev/null`。
-    pub output: Option<BorrowedFd<'a>>,
+    /// コマンドの標準入出力の指定（[`ExecStdio`]）。既定（[`ExecStdio::NONE`]）は 3 本とも `/dev/null`。
+    pub stdio: ExecStdio<'a>,
     /// exec 子 cgroup の排他作成に成功した直後に 1 回呼ばれる通知（healthcheck の exec 専用 helper と CLI の exec 用）。
     /// `Err` を返したら worker を fork せず、作成した cgroup を消してその構造化エラーで失敗する（fail-closed。
     /// 回収役へ名前を渡せない exec を走らせない。SUP-6・REPAIR-5・#2626）。
@@ -1164,7 +1206,7 @@ fn run_command_with_pidfd_inner(
 ) -> Result<AuditedOutcome, AuditedRejection<TraitError>> {
     let ExecLaunchIo {
         launch_env,
-        output,
+        stdio,
         on_created,
     } = io;
     let deadline = Deadline::after(timeout);
@@ -1191,7 +1233,7 @@ fn run_command_with_pidfd_inner(
         |proof, child, sender| {
             let target = identify_pid1_with_pidfd_staged(record, pidfd)?
                 .with_launch_env(launch_env.to_vec());
-            run_with_target(proof, &target, request, deadline, child, sender, output)
+            run_with_target(proof, &target, request, deadline, child, sender, stdio)
         },
     );
     audit_worker_result(
@@ -1237,7 +1279,15 @@ pub fn run_command_in(
         },
         |proof, child, sender| {
             let target = identify_pid1_in_staged(record, expected_cgroup_path)?;
-            run_with_target(proof, &target, request, deadline, child, sender, None)
+            run_with_target(
+                proof,
+                &target,
+                request,
+                deadline,
+                child,
+                sender,
+                ExecStdio::NONE,
+            )
         },
     );
     audit_worker_result(
@@ -2284,7 +2334,7 @@ fn run_with_target(
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
     listener: ExecListenerSender,
-    output: Option<BorrowedFd<'_>>,
+    stdio: ExecStdio<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
@@ -2301,7 +2351,7 @@ fn run_with_target(
         deadline,
         child_cgroup,
         listener,
-        output,
+        stdio,
     );
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
@@ -2317,7 +2367,7 @@ fn run_in_child_cgroup(
     deadline: Deadline,
     child_cgroup: &ExecChildCgroup,
     listener: ExecListenerSender,
-    output: Option<BorrowedFd<'_>>,
+    stdio: ExecStdio<'_>,
 ) -> Result<ExecOutcome, WorkerError> {
     // 参加する cgroup の準備（参加の前に済ませる。失敗しても呼び出し側が子 cgroup の後始末を行う）。
     let cgroup = prepare_cgroup_join_staged(target)?;
@@ -2373,19 +2423,31 @@ fn run_in_child_cgroup(
     })?;
     let ready = require_exec_ready_staged(report)?;
     deadline.remaining("starting the command")?;
-    // 出力の取得先があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdout / stderr にする。
-    let stdio = match output {
-        Some(fd) => {
-            let owned = fd.try_clone_to_owned().map_err(|_| {
-                TraitError::new(
-                    ErrorCode::Internal,
-                    "exec stage Spawn: failed to duplicate the exec output",
-                )
-            })?;
-            ChildStdio::from_output(owned).map_err(from_exec_error_staged)?
-        }
-        None => ChildStdio::none(),
-    };
+    // 指定された番号があれば、worker が継承した fd の複製（close-on-exec）をコマンドの子の stdin / stdout / stderr にする。
+    let dup =
+        |fd: Option<BorrowedFd<'_>>, msg: &'static str| -> Result<Option<OwnedFd>, WorkerError> {
+            fd.map(|fd| {
+                fd.try_clone_to_owned()
+                    .map_err(|_| TraitError::new(ErrorCode::Internal, msg))
+            })
+            .transpose()
+            .map_err(Into::into)
+        };
+    let stdio = ChildStdio::from_fds(
+        dup(
+            stdio.stdin,
+            "exec stage Spawn: failed to duplicate the exec stdin",
+        )?,
+        dup(
+            stdio.stdout,
+            "exec stage Spawn: failed to duplicate the exec stdout",
+        )?,
+        dup(
+            stdio.stderr,
+            "exec stage Spawn: failed to duplicate the exec stderr",
+        )?,
+    )
+    .map_err(from_exec_error_staged)?;
     let child = spawn_exec_command_with_stdio(ready, &command, child_cgroup, stdio)
         .map_err(from_exec_error_staged)?;
     // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。

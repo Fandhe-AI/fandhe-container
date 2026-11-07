@@ -247,7 +247,7 @@ pub(crate) use process::{ConfigPaths, PrePivotSetup, PreparedLaunchFailure};
 pub use process::{
     EXEC_FD_HEAD_BYTES, ExecChildSetupObservation, ExecChildSetupReport, ExecFdReport,
     observe_exec_child_setup, observe_exec_child_setup_pinned, observe_exec_child_setup_with,
-    observe_exec_child_setup_with_fsize,
+    observe_exec_child_setup_with_fsize, observe_exec_child_setup_with_stdio,
 };
 pub use process::{LegacyTiocstiReport, report_legacy_tiocsti_to};
 /// 結合試験 `tests/exec_child_setup.rs`・`tests/fork_exec_isolation.rs` 専用の再公開（SEC-1・CORE-1・TASK-27.4.1・#1299。

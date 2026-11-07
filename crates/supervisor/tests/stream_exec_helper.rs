@@ -15,6 +15,9 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+
+#[path = "../../core/tests/support/reap.rs"]
+mod reap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -388,8 +391,7 @@ fn wait_bounded(mut child: std::process::Child, limit: Duration) -> (Option<i32>
         match child.try_wait().expect("try_wait") {
             Some(st) => break st,
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap::reap_or_report(&mut child, reap::reap_within());
                 panic!("helper did not exit within {limit:?}");
             }
             None => std::thread::sleep(Duration::from_millis(20)),

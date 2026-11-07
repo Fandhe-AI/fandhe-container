@@ -543,14 +543,31 @@ mod linux {
         };
         let status = wait_child(&mut sp.child);
         assert_eq!(status, Some(0), "the helper must exit with 0");
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        sp.stdout.read_to_end(&mut stdout).expect("read stdout");
-        sp.stderr.read_to_end(&mut stderr).expect("read stderr");
+        // 子孫が書き込み端を持ち続けても無期限に EOF を待たない（REPAIR-5・#3760）。
+        let deadline = Instant::now() + timeout();
+        let stdout = read_to_end_bounded(sp.stdout.try_clone().expect("clone stdout"), deadline);
+        let stderr = read_to_end_bounded(sp.stderr.try_clone().expect("clone stderr"), deadline);
         Finished {
             started,
             outcome,
             stdout,
             stderr,
+        }
+    }
+
+    /// pipe の読み取りを別スレッドで行い、絶対期限までに EOF が来なければ panic する（REPAIR-5）。
+    fn read_to_end_bounded(mut f: File, deadline: Instant) -> Vec<u8> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let r = f.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx.send(r);
+        });
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => panic!("read pipe failed: {e}"),
+            Err(_) => panic!("pipe did not reach EOF before the deadline"),
         }
     }
 
@@ -701,7 +718,7 @@ mod linux {
             "the beat command must have started"
         );
         sp.child.kill().expect("kill the helper");
-        let _ = sp.child.wait();
+        crate::reap::reap_or_report(&mut sp.child, crate::reap::reap_within());
         let err = recv_from_helper(&sp.plugin, Instant::now() + timeout()).unwrap_err();
         assert_eq!(err, ChannelError::Closed, "no result after the helper died");
         let stopped = eventually(|| {

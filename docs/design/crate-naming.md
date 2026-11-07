@@ -36,7 +36,7 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 2 | core | core | 実行層（namespace・cgroups v2・seccomp/Landlock・rootless・ログ・状態管理） | G3（TASK-27〜50） | core |
 | 3 | supervisor | supervisor | コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats） | G12（TASK-157〜171。TASK-157 が crate 雛形・監視プロセス基本ループ、SUP-1） | core（D-19。PLUG-1 境界表では supervisor は plugin 境界〔PLUG-2〕を経由せず実行層コアの一部と整理されている） |
 | 4 | oci | oci | OCI イメージ管理（pull・キャッシュ・`image ls`/`rm`/`tag`） | G4（TASK-51〜55・TASK-183〜184） | core |
-| 5 | cri | cri | CRI 実装ライブラリ（Runtime/ImageService・shim v2・streaming） | G4（TASK-56〜63） | plugin 境界の外側（`cri` は CRI 実装ライブラリ。実行時は `plugin-cri` バイナリが別プロセスとして動かす。TASK-114） |
+| 5 | cri | cri | CRI 実装ライブラリ（Runtime/ImageService・shim v2〔起動バイナリは持たず plugin-cri の bin が使う。#3684〕・streaming） | G4（TASK-56〜63） | plugin 境界の外側（`cri` は CRI 実装ライブラリ。実行時は `plugin-cri` バイナリが別プロセスとして動かす。TASK-114） |
 | 6 | platform-macos | platform-macos | macOS Virtualization.framework 経由の VM 起動・VirtioFS | G5（TASK-64〜66） | plugin 境界の外側（`platform-macos` はバックエンド実装ライブラリ。実行時は `plugin-macos` バイナリが別プロセスとして動かす。TASK-115） |
 | 7 | platform-windows | platform-windows | Windows WSL2 経由（virtiofs opt-in）の実装 | G5（TASK-67〜72） | plugin 境界の外側（`platform-windows` はバックエンド実装ライブラリ。実行時は `plugin-windows` バイナリが別プロセスとして動かす。TASK-116） |
 | 8 | microvm | microvm | KVM 直接制御・最小 virtio デバイスモデル（Linux オプション） | G5（TASK-74〜78） | plugin 境界の外側（`microvm` はバックエンド実装ライブラリ。実行時は `plugin-microvm` バイナリが別プロセスとして動かす。TASK-117） |
@@ -46,7 +46,7 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 12 | net | net | netlink・nftables・bridge/veth/netns・DNS ヘルパー・host/none モード・ポート公開 | G10（TASK-136〜148・TASK-185〜186） | core 側のライブラリ（supervisor と `NetworkPlugin` の実装の両方がリンクする。ネットワーク設定操作は制御面として PLUG-1 で `NetworkPlugin` が plugin 側に区分され、その実装は plugin 側のまま。NET-5 の DNS ヘルパーの起動・停止は `NetworkPlugin` の実装〔plugin 側〕、NET-9 の pasta の起動・監視・回収は supervisor〔core 側〕が行う。いずれも D-14 の例外として認められている。PLUG-4 が数える「core」〔`crates/core`〕には入らない。2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)。rootful のネットワーク設定〔veth・bridge・nftables〕は `NetworkPlugin` の実装が `crates/net` を使って行い、core は network namespace を渡すだけにする。2026-10-15 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)、`plugin-system.md`） |
 | 13 | stack | stack | TOML スキーマ・`depends_on` 起動順・`profiles` 絞り込み | G11（TASK-149・150・187〜188。TASK-149 が crate 雛形） | core（CLI＋ライブラリ API） |
 | 14 | compose-convert | compose-convert | `compose.yaml` → TOML の片方向変換ツール（変換レポート・キー分類・`--downgrade` 格下げ・GPU 予約変換・`build:` エラー処理・往復検証テスト〔TASK-152〕） | G11（TASK-151 が crate 雛形・変換器本体、TASK-152・153・154・156・182） | 該当外（plugin ではない独立ツール。決定 5） |
-| 15 | plugin-cri | plugin-cri | CRI サーバー plugin バイナリ（`cri` の実装を別プロセス化） | G8（TASK-114） | plugin |
+| 15 | plugin-cri | plugin-cri | CRI サーバー plugin バイナリ（`cri` の実装を別プロセス化。shim v2 の起動バイナリ `containerd-shim-fandhe-container-v2` も持つ。#3684） | G8（TASK-114） | plugin |
 | 16 | plugin-macos | plugin-macos | macOS バックエンド plugin バイナリ（TASK-115）。macOS Venus（GPU-6、TASK-172〜181）の virtio-gpu デバイスモデル・コンテキスト分配層・venus デコーダも `crates/plugin-macos/src/gpu/` に置く定義になっている | G8（TASK-115）・G-別枠（TASK-172〜181） | plugin |
 | 17 | plugin-windows | plugin-windows | Windows バックエンド plugin バイナリ（`platform-windows` の実装を別プロセス化） | G8（TASK-116） | plugin |
 | 18 | plugin-microvm | plugin-microvm | microVM 制御 plugin バイナリ（`microvm` の実装を別プロセス化） | G8（TASK-117） | plugin |

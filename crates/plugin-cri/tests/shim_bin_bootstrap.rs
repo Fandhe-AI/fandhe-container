@@ -1,23 +1,21 @@
 //! shim v2 起動バイナリ（`containerd-shim-fandhe-container-v2`）の結合試験（CRI-5・TASK-62.7.1・MS-7・#872）。
 //!
+//! #3684: bin を plugin-cri へ移したため、cri の試験から移設した（試験名・期待値は同じ。ttrpc の手組みは `support/shim_wire.rs`）。
+//! 本番の `TaskService` を登録する bin に対して、未実装のメソッド（`Pids`）が `UNIMPLEMENTED` のままであることで配線を確かめる。
+//!
 //! containerd の start / delete の呼び出しを再現し、stdout のアドレス・stderr が空であること・権限・
 //! ttrpc の疎通・冪等性・fail-closed を具体値で照合する。root や特殊な環境は要らない。
 #![cfg(unix)]
 
-use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-use fandhe_container_cri::shim_v2::{
-    DeleteResponse, FrameHeader, HEADER_LEN, MessageType, ShutdownRequest, TtrpcRequest,
-    TtrpcResponse,
-};
-use prost::Message;
+use support_wire::{Resp, call_method as wire_call, decode_delete_response, shutdown_request};
 
 /// 子の実行の期限（REPAIR-5）。
 #[allow(dead_code)]
@@ -25,8 +23,12 @@ const LIMIT: Duration = Duration::from_secs(30);
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 const UNIMPL: i32 = 12;
 
+#[path = "support/mini_json.rs"]
+mod mini_json;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
+#[path = "support/shim_wire.rs"]
+mod support_wire;
 #[path = "../../oci/tests/support/test_root.rs"]
 mod test_root;
 
@@ -86,29 +88,13 @@ fn sock_of(address: &str) -> PathBuf {
     PathBuf::from(address.strip_prefix("unix://").unwrap())
 }
 
-fn call(path: &Path, service: &str) -> TtrpcResponse {
-    call_method(path, service, "Create", Vec::new())
+/// 実装の無いメソッド（`Pids`）を呼ぶ。本番の Task サービスでも `UNIMPLEMENTED` を返す。
+fn call(path: &Path, service: &str) -> Resp {
+    call_method(path, service, "Pids", Vec::new())
 }
 
-fn call_method(path: &Path, service: &str, method: &str, payload: Vec<u8>) -> TtrpcResponse {
-    let mut s = UnixStream::connect(path).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let body = TtrpcRequest {
-        service: service.into(),
-        method: method.into(),
-        payload,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let h = FrameHeader::new(body.len() as u32, 1, MessageType::Request, 0).unwrap();
-    s.write_all(&h.to_bytes()).unwrap();
-    s.write_all(&body).unwrap();
-    let mut hb = [0u8; HEADER_LEN];
-    s.read_exact(&mut hb).unwrap();
-    let h = FrameHeader::from_bytes(&hb).unwrap();
-    let mut b = vec![0u8; h.length() as usize];
-    s.read_exact(&mut b).unwrap();
-    TtrpcResponse::decode(&b[..]).unwrap()
+fn call_method(path: &Path, service: &str, method: &str, payload: Vec<u8>) -> Resp {
+    wire_call(path, service, method, &payload).expect("ttrpc call must succeed")
 }
 
 /// `/proc/*/cmdline` に id を含むデーモンが残っているか（Linux のみ）。
@@ -146,7 +132,7 @@ fn cri5_872_start_prints_address_and_serves_ttrpc() {
     );
     for svc in ["containerd.task.v2.Task", "containerd.task.v3.Task"] {
         let r = call(&sock, svc);
-        assert_eq!(r.status.unwrap().code, UNIMPL, "{svc}");
+        assert_eq!(r.status.unwrap().0, UNIMPL, "{svc}");
     }
     // 同じフラグでもう一度 start すると、生きている socket を再利用して同じアドレスを返す。
     assert_eq!(start_ok(&sc, "c1"), addr);
@@ -164,9 +150,9 @@ fn cri5_872_delete_cleans_up_and_daemon_exits() {
     assert!(sock.exists());
     let del = run(&sc, &id, "delete", &["-bundle", "/tmp/b"]);
     assert!(del.status.success(), "{:?}", del);
-    let r = DeleteResponse::decode(&del.stdout[..]).unwrap();
+    let r = decode_delete_response(&del.stdout).expect("DeleteResponse must decode");
     assert_eq!((r.pid, r.exit_status), (0, 137));
-    assert!(r.exited_at.is_some());
+    assert!(r.has_exited_at);
     assert!(!sock.exists());
     // 冪等
     assert!(
@@ -191,11 +177,7 @@ fn cri5_873_shutdown_rpc_ends_daemon() {
     let id = format!("sd{}", std::process::id());
     let addr = start_ok(&sc, &id);
     let sock = sock_of(&addr);
-    let payload = ShutdownRequest {
-        id: id.clone(),
-        now: false,
-    }
-    .encode_to_vec();
+    let payload = shutdown_request(&id, false);
     let r = call_method(&sock, "containerd.task.v2.Task", "Shutdown", payload);
     assert!(r.status.is_none(), "{:?}", r.status);
     assert!(r.payload.is_empty());
@@ -243,7 +225,7 @@ fn cri5_872_start_replaces_stale_socket() {
     assert!(sock.exists());
     assert_eq!(start_ok(&sc, "stale"), addr);
     let r = call(&sock, "containerd.task.v2.Task");
-    assert_eq!(r.status.unwrap().code, UNIMPL);
+    assert_eq!(r.status.unwrap().0, UNIMPL);
     assert!(
         run(&sc, "stale", "delete", &["-bundle", "/tmp/b"])
             .status
@@ -256,10 +238,13 @@ fn assert_failed(out: &Output, code: &str) {
     assert_eq!(out.stdout, b"");
     let err = String::from_utf8(out.stderr.clone()).unwrap();
     assert_eq!(err.lines().count(), 1, "{err}");
-    let v: serde_json::Value = serde_json::from_str(&err).unwrap();
-    assert_eq!(v["code"], code, "{err}");
+    // serde_json を plugin-cri の依存に足さないため、試験側の最小 JSON 検査（support/mini_json.rs）で構文と欄の型を照合する。
+    let v = mini_json::parse(err.trim_end()).unwrap_or_else(|| panic!("invalid JSON: {err}"));
+    assert_eq!(v.get("code").and_then(|x| x.as_str()), Some(code), "{err}");
     assert!(
-        v["message"].as_str().is_some_and(|m| !m.is_empty()),
+        v.get("message")
+            .and_then(|x| x.as_str())
+            .is_some_and(|m| !m.is_empty()),
         "{err}"
     );
 }

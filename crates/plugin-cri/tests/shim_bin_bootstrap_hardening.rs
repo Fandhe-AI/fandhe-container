@@ -1,4 +1,6 @@
 //! shim v2 起動バイナリの排他・計測の結合試験（REPAIR-4・REPAIR-5・PLUG-12・CRI-5・TASK-62.7.1・#872）。
+//!
+//! #3684: bin を plugin-cri へ移したため cri の試験から移設した（試験名・期待値は同じ）。
 #![cfg(unix)]
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -11,6 +13,8 @@ use std::time::Duration;
 const LIMIT: Duration = Duration::from_secs(30);
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 
+#[path = "support/mini_json.rs"]
+mod mini_json;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 #[path = "../../oci/tests/support/test_root.rs"]
@@ -100,11 +104,34 @@ fn repair4_872_ops_log_records_start_and_delete() {
             .lines()
             .find(|l| l.contains(op))
             .unwrap_or_else(|| panic!("{op} missing: {text}"));
-        let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["outcome"], "success", "{line}");
-        assert_eq!(v["code"], "Ok", "{line}");
-        assert!(v["latency_us"].is_u64(), "{line}");
+        // serde_json を plugin-cri の依存に足さないため、試験側の最小 JSON 検査（support/mini_json.rs）で
+        // 構文・エスケープ・欄の型を移設前と同じ強さで照合する。
+        let v = mini_json::parse(line).unwrap_or_else(|| panic!("invalid JSON: {line}"));
+        assert_eq!(
+            v.get("outcome").and_then(|x| x.as_str()),
+            Some("success"),
+            "{line}"
+        );
+        assert_eq!(v.get("code").and_then(|x| x.as_str()), Some("Ok"), "{line}");
+        assert!(v.get("latency_us").is_some_and(|x| x.is_u64()), "{line}");
     }
+}
+
+/// REPAIR-12・#3684: 最小 JSON 検査自身が壊れた行（末尾の余り・不正エスケープ・数値の型違い）を拒否する。
+#[test]
+fn repair12_3684_mini_json_rejects_broken_lines() {
+    let ok = mini_json::parse(r#"{"latency_us":12,"s":"a\né"}"#).unwrap();
+    assert!(ok.get("latency_us").unwrap().is_u64());
+    assert!(mini_json::parse(r#"{"latency_us":1garbage}"#).is_none());
+    assert!(mini_json::parse(r#"{"a":"\x"}"#).is_none());
+    assert!(mini_json::parse(r#"{"a":1} x"#).is_none());
+    assert!(
+        !mini_json::parse(r#"{"a":-1}"#)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .is_u64()
+    );
 }
 
 /// PLUG-12・#872: 実行ユーザーが所有する socket dir と socket は受け入れられる（所有者の照合の通常経路）。

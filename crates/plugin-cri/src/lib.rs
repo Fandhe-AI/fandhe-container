@@ -16,6 +16,8 @@
 //! 状態ルートのインスタンス排他は [`instance_lock`]（`<状態ルート>/.cri/@instance.lock`。起動時に取りプロセスの間持つ。#2931・CRI-2・CORE-1）。
 //! SIGTERM・SIGINT による正常停止（受付の停止・実行中の RPC の期限つき待ち・socket の削除・ロックの解放）は `shutdown`・`sys` と `main.rs`（#3226・CRI-1・REPAIR-5。
 //! 停止の契約は `docs/design/cri-record-readoption.md`「停止の契約」）。SIGHUP は対象外。
+//! shim v2 バイナリ `containerd-shim-fandhe-container-v2`（`src/bin/containerd_shim_v2.rs`）も本 crate が持つ（#3684・CRI-5・CRI-7・TASK-62.6）。
+//! 本番の `ContainerRuntime` が本 crate にしか無く cri から本 crate への依存は禁止のため。登録簿の組み立ては [`shim`]。
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
@@ -30,6 +32,7 @@ pub mod pod_network;
 pub mod record_readoption;
 #[cfg(unix)]
 pub mod server;
+pub mod shim;
 #[cfg(unix)]
 pub mod shutdown;
 pub mod startup;

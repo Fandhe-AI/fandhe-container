@@ -2,8 +2,9 @@
 //!
 //! 確認するのは shim v2 のプロトコル水準の疎通（containerd の起動規約〔start の stdout のアドレス〕、ttrpc の枠、
 //! Create / Connect / Start / Wait / State / Delete / Shutdown の意味論、終了コードの伝搬）で、実コンテナの実行ではない。
-//! 配布する shim バイナリ（`containerd-shim-fandhe-container-v2`）には実行層が結線されていない
-//! （cri は plugin-cri に依存できない。bootstrap の doc を参照。REPAIR-3）ため、この試験バイナリ自身が shim 役を兼ね、
+//! 配布する shim バイナリ（`containerd-shim-fandhe-container-v2`）は plugin-cri が持つ（#3684。本番の実行層を登録する。
+//! cri は plugin-cri に依存できないため、cri の試験は配布バイナリを使えない。実コンテナの通しは plugin-cri の
+//! `tests/shim_v2_containerd_real.rs`）ため、この試験バイナリ自身が shim 役を兼ね、
 //! メモリ上の偽 `ContainerRuntime` を包んだ `TaskService` を `bootstrap::run` へ渡す。shim 役になるのは
 //! `FANDHE_CONTAINER_SHIM_V2_E2E_ROLE=shim` があるときだけで、試験役が偶然 shim として振る舞うことはない。
 //!
@@ -280,7 +281,7 @@ mod e2e {
         Ok(reg)
     }
 
-    /// shim 役の本体。出力と終了コードの契約は `src/bin/shim_v2_main.rs` と同じ
+    /// shim 役の本体。出力と終了コードの契約は plugin-cri の `src/bin/containerd_shim_v2.rs` と同じ
     /// （成功は stdout へバイト列だけ、失敗は stderr へ JSON 1 行と終了コード 1）。
     /// デーモンの起動時に単一スレッドであることが要る（監査 relay の fork）ため、スレッドを作る前に呼ぶ。
     fn shim_role() -> ExitCode {

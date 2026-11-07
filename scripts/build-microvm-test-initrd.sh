@@ -240,7 +240,7 @@ arch="${MICROVM_TEST_INITRD_ARCH:-x86_64}"
 compress="${MICROVM_TEST_INITRD_COMPRESS:-none}"
 pack_timeout=60
 init_message="fandhe-microvm-test: init ok v1"
-# block-read の文字列定数（正本。crates/microvm/tests/kernel_boot.rs の単体テストが行頭の名前で抜き出して照合する。
+# block-read の文字列定数（正本。crates/microvm/tests/support/guest_boot.rs の単体テストが行頭の名前で抜き出して照合する。
 # 長さ 32・41・47 は機械語へ固定されているため、変えるときはコードの長さ・変位も直す）
 block_sentinel="fandhe-microvm-block-sentinel-01"
 block_ok_message="fandhe-microvm-test: block sentinel ok v1"

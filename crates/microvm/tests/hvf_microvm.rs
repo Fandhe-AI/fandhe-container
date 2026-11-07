@@ -320,7 +320,7 @@ fn mvm5_4037_os_lock_write_of_nonzero_fails_unimplemented() {
 // used・データ・status は device が同じ Image の領域へ書くため、ホストが終了後に `read_guest` で照合する。
 // ゲストの機械語に絶対アドレスは埋めず、`adr` で得た Image 先頭からの相対で参照する。
 // 割り込みの配送は照合しない（CPSR の DAIF がマスクされ、ベクタも無い）。`InterruptStatus` の UsedBuffer だけをゲストが読む。
-// 実カーネルでの block-read と配送（edge と LevelHigh）は #4014 の担当。
+// 実カーネルでの block-read と配送（edge と LevelHigh）は `hvf_kernel_boot`（#4014）で照合する。
 
 /// Image 内のオフセット（ゲスト RAM 上では Image 先頭の GPA からの相対）。
 const Q_DESC: usize = 0x400;

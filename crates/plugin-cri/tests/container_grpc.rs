@@ -36,6 +36,7 @@ mod exclusive_dir;
 mod reap;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1401,6 +1402,139 @@ async fn cri2_record_limit_exceeded_stops_startup() {
     .expect("watchdog");
 }
 
+// ---- 段 F: ストリーミングサーバーの起動と注入（#3754。CRI-6・REPAIR-3・REPAIR-5）----
+
+/// 子プロセスが LISTEN している TCP の local address を `/proc` から集める（IPv4・IPv6）。
+/// 自分の fd が持つ socket の inode だけを数え、壊れた行は診断つきで panic する（試験補助）。
+fn tcp_listeners_of(pid: u32) -> (Vec<SocketAddr>, Vec<String>) {
+    let mut inodes = std::collections::HashSet::new();
+    let fd_dir = format!("/proc/{pid}/fd");
+    for entry in std::fs::read_dir(&fd_dir).expect("read fd dir") {
+        let Ok(entry) = entry else { continue };
+        if let Ok(target) = std::fs::read_link(entry.path())
+            && let Some(rest) = target.to_string_lossy().strip_prefix("socket:[")
+            && let Some(n) = rest.strip_suffix(']')
+        {
+            inodes.insert(n.to_string());
+        }
+    }
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for (name, is_v6) in [("tcp", false), ("tcp6", true)] {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/net/{name}")).expect("read net");
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let (Some(local), Some(st), Some(inode)) = (cols.get(1), cols.get(3), cols.get(9))
+            else {
+                panic!("malformed /proc net line: {line}");
+            };
+            if *st != "0A" || !inodes.contains(*inode) {
+                continue;
+            }
+            let (addr, port) = local.split_once(':').expect("addr:port");
+            let port = u16::from_str_radix(port, 16).expect("port");
+            if is_v6 {
+                v6.push(format!("{addr}:{port}"));
+            } else {
+                let raw = u32::from_str_radix(addr, 16).expect("v4 addr");
+                // /proc はホストのバイト順（little endian の x86_64・aarch64 では逆順）で出す。
+                let ip = std::net::Ipv4Addr::from(raw.swap_bytes());
+                v4.push(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+            }
+        }
+    }
+    (v4, v6)
+}
+
+/// 期限内に LISTEN がちょうど 1 件（IPv4）になるのを待ってその address を返す。
+async fn wait_streaming_listener(pid: u32) -> SocketAddr {
+    let start = Instant::now();
+    loop {
+        let (v4, v6) = tcp_listeners_of(pid);
+        if v4.len() == 1 {
+            assert!(v6.is_empty(), "no tcp6 listener expected: {v6:?}");
+            return v4[0];
+        }
+        assert!(
+            start.elapsed() < STARTUP_DEADLINE,
+            "streaming listener must appear: {v4:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 段 F-1（CRI-6・REPAIR-5）: 本番バイナリは loopback の 1 つの TCP だけを待ち受ける（gRPC は UDS のみ・外部アドレスなし）。
+#[tokio::test]
+async fn cri6_3754_production_binary_streaming_listens_on_loopback_only() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("sock-f1");
+        let xdg = TempDir::new("xdg-f1");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server(&sock, &xdg.0);
+        let ch = connect_when_ready(&sock, Some(&mut guard)).await;
+        drop(ch);
+        let addr = wait_streaming_listener(guard.0.id()).await;
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_ne!(addr.port(), 0);
+    })
+    .await
+    .expect("watchdog");
+}
+
+/// 段 F-2（CRI-6・REPAIR-3）: 結線前の 3 RPC は本番バイナリでも `UNIMPLEMENTED`（未知の ID でも `NOT_FOUND` より先）。
+/// 結線前（#3754 時点）の期待値。兄弟 issue（#3755・#3761・#3763）が結線したらその種別の期待値を更新する。
+#[tokio::test]
+async fn cri6_repair3_3754_production_binary_unwired_streaming_rpcs_are_unimplemented() {
+    tokio::time::timeout(WATCHDOG, async {
+        let dir = TempDir::new("sock-f2");
+        let xdg = TempDir::new("xdg-f2");
+        let sock = dir.0.join("s.sock");
+        let mut guard = spawn_server(&sock, &xdg.0);
+        let ch = connect_when_ready(&sock, Some(&mut guard)).await;
+        let mut c = RuntimeServiceClient::new(ch);
+        let e = call_with_deadline(
+            c.exec(cri::ExecRequest {
+                container_id: "nope".into(),
+                cmd: vec!["true".into()],
+                ..Default::default()
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect_err("exec");
+        assert_eq!(e.code(), PluginErrorCode::Unimplemented);
+        assert_eq!(e.message(), "exec streaming is not wired");
+        let e = call_with_deadline(
+            c.attach(cri::AttachRequest {
+                container_id: "nope".into(),
+                stdout: true,
+                ..Default::default()
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect_err("attach");
+        assert_eq!(e.code(), PluginErrorCode::Unimplemented);
+        assert_eq!(e.message(), "attach streaming is not wired");
+        let e = call_with_deadline(
+            c.port_forward(cri::PortForwardRequest {
+                pod_sandbox_id: "nope".into(),
+                ..Default::default()
+            }),
+            RPC_DEADLINE,
+        )
+        .await
+        .expect_err("port_forward");
+        assert_eq!(e.code(), PluginErrorCode::Unimplemented);
+        assert_eq!(e.message(), "port-forward streaming is not wired");
+    })
+    .await
+    .expect("watchdog");
+}
+
 // ---- 段 E: SIGTERM / SIGINT による正常停止（#3226。CRI-1・CORE-1・PLUG-12・REPAIR-4・REPAIR-5）----
 
 /// フラグが立つまで待つ shutdown future（`tokio::sync` は承認範囲外のためポーリング）。
@@ -1563,12 +1697,19 @@ async fn assert_binary_graceful_stop(signal: &str, signal_name: &str) {
     let mut guard = spawn_server(&sock, &xdg.0);
     let ch = connect_when_ready(&sock, Some(&mut guard)).await;
     drop(ch);
+    // ストリーミングの待ち受け（#3754）はプロセスの終了と一緒に消える。停止前の port を控えて、停止後に拒否されることを照合する。
+    let streaming_addr = wait_streaming_listener(guard.0.id()).await;
     let err = terminate_and_collect_stderr(guard, signal).await;
     assert!(
         err.contains(&format!(
             "cri plugin shutdown: signal={signal_name} stage=serve"
         )),
         "{err}"
+    );
+    // 同じ port を他プロセスが取る偶発の衝突はまれなので許容する（拒否以外なら診断つきで失敗）。
+    assert!(
+        std::net::TcpStream::connect_timeout(&streaming_addr, Duration::from_secs(2)).is_err(),
+        "streaming listener must be closed after stop: {streaming_addr}"
     );
     assert!(!sock.exists(), "socket must be removed");
     // ロックファイルは消さず（二重取得を防ぐ契約）、ロック自体は解放されている。

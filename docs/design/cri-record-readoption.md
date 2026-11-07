@@ -250,7 +250,7 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 
 - 対象シグナル: SIGTERM・SIGINT（同じ扱い）。SIGHUP は対象外（既定動作で即終了）。最初の 1 つだけを記録し、2 回目以降は何もしない
 - 受け方の判断: `crates/plugin-cri/src/sys.rs` の自前 `signal(3)` 宣言（ハンドラは `static AtomicI32` の compare_exchange のみ）。tokio の `signal` feature は workspace 依存の feature 変更で承認が要るため不採用。`signalfd` は exec 後の子へマスクが継承されるため、self-pipe は FFI が増えるため不採用（検知は 100ms 周期の atomic ポーリング）。ハンドラは監査 relay の fork の後に登録し、登録失敗・未確認の Linux アーキテクチャは起動しない（fail-closed）
-- 受付の停止: シグナルを受けたら listener を即座に閉じる（tonic はドレイン中も incoming を持ち続けるため、`server::StopOnShutdown` が drop する）。socket は `UdsListener::drop` が bind 時の dev/ino と一致する場合だけ検証済みディレクトリの fd 基点で unlink する。起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見て、受けていれば bind せずに終了コード 0 で終える
+- 受付の停止: ストリーミングサーバーの TCP listener も同時に閉じる（上限は延ばさない。`cri-streaming-server.md` の「plugin-cri での起動と停止（#3754）」）。シグナルを受けたら listener を即座に閉じる（tonic はドレイン中も incoming を持ち続けるため、`server::StopOnShutdown` が drop する）。socket は `UdsListener::drop` が bind 時の dev/ino と一致する場合だけ検証済みディレクトリの fd 基点で unlink する。起動段（ロック取得・pull の回収・記録の再採用）は段の境界でだけ受信を見て、受けていれば bind せずに終了コード 0 で終える
 - 実行中の RPC: `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待つ。超えたら接続を強制的に閉じ（回収の上限 2 秒）、`error: TIMEOUT: ...`・終了コード 1 で終える。打ち切った RPC・`spawn_blocking`（`shutdown_timeout` 1 秒で置き去り）は結果不明のまま残り、再起動時に R7 の照合表・`recover_stale_image_pulls`（OCI-7）が扱う。記録は rename による不可分の置き換えなので半端なファイルは残らない
 - インスタンスロック: fd の close で外れる。ロックファイルは消さない（unlink すると二重に取得され得る）。確定はプロセスの終了。新しいインスタンスは `INSTANCE_LOCK_TIMEOUT`（5 秒）しか待たないため、旧インスタンスの終了を待ってから起動する運用を前提とする
 - 終了コードと stderr: 正常停止は終了コード 0 と固定の 1 行 `cri plugin shutdown: signal=<SIGTERM|SIGINT> stage=<startup|serve>`（パス・pid・ID を含めない）。停止の全体の上限は 13.7 秒（検知 0.1 + 猶予 10 + 強制回収 2 + 書き出し 0.6〔serve_with_audit の sink・forwarder と終了行の 3 回 × 0.2〕+ ランタイム 1。`shutdown::SHUTDOWN_TOTAL_BOUND` を試験で固定）

@@ -1367,6 +1367,16 @@ enum IrqStage {
     IrqLine,
 }
 
+/// `KVM_CAP_NR_MEMSLOTS` の戻り値を slot 数に直す。0 以下は非対応として `FailedPrecondition`（#3697）。
+pub(crate) fn classify_memslot_count(n: i32) -> Result<u32, MicrovmError> {
+    u32::try_from(n).ok().filter(|v| *v > 0).ok_or_else(|| {
+        MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "KVM_CAP_NR_MEMSLOTS is not supported by this kernel",
+        )
+    })
+}
+
 fn classify_irq_error(stage: IrqStage, e: SysError) -> MicrovmError {
     let name = match stage {
         IrqStage::CheckExtension => "KVM_CHECK_EXTENSION",
@@ -1545,6 +1555,16 @@ impl VmFd {
             ));
         }
         Ok(())
+    }
+
+    /// この VM が登録できる memslot の上限数（`KVM_CHECK_EXTENSION(KVM_CAP_NR_MEMSLOTS)`。#3697・MVM-1）。
+    ///
+    /// Linux v6.12 の `kvm_vm_ioctl_check_extension_generic` が `KVM_USER_MEM_SLOTS` を返す（x86_64 は 32764）。
+    /// 0 以下（非対応・照会不能）は `FailedPrecondition`（fail-closed。複数領域の登録は slot 数を確かめてからでないと行わない）。
+    pub fn max_user_memslots(&self) -> Result<u32, MicrovmError> {
+        let n = sys::kvm_check_extension(self.fd.as_fd(), sys::consts::KVM_CAP_NR_MEMSLOTS)
+            .map_err(|e| classify_irq_error(IrqStage::CheckExtension, e))?;
+        classify_memslot_count(n)
     }
 
     /// in-kernel irqchip（PIC・IOAPIC・LAPIC）を作る（TASK-74.2.3・MVM-1。x86_64 のみ）。
@@ -2445,6 +2465,21 @@ fn run_probe_loop(
 mod tests {
     use super::*;
     use crate::exit::{ExitData, IoDirection};
+
+    /// MVM-1・#3697: `KVM_CAP_NR_MEMSLOTS` の戻り値の分類。0 以下は `FailedPrecondition`。
+    #[test]
+    fn mvm1_3697_classify_memslot_count() {
+        assert_eq!(classify_memslot_count(32764).unwrap(), 32764);
+        assert_eq!(classify_memslot_count(1).unwrap(), 1);
+        for n in [0, -1] {
+            let e = classify_memslot_count(n).unwrap_err();
+            assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "KVM_CAP_NR_MEMSLOTS is not supported by this kernel"
+            );
+        }
+    }
 
     fn io_out(b: u8) -> VcpuExit {
         VcpuExit::Io {

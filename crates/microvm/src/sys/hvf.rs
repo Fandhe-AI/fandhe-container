@@ -680,6 +680,9 @@ impl GuestMapping<'_> {
     }
 
     /// 対応付けの保護を `flags` に変える。
+    ///
+    /// 製品コードからは呼ばない（#4023 のオーナー判断で `hv_vm_protect` の利用は対象外。再評価条件は
+    /// `docs/design/microvm-memory-ownership.md` 末尾）。再評価時の土台として残している。
     pub fn protect(&self, flags: MemoryFlags) -> Result<(), MicrovmError> {
         check_map_range(0, self.ipa, self.size as u64, self.page_size as u64)?;
         // SAFETY: ipa・size は `map` で対応付け済みで、ページ境界・倍数を再検査した。ポインタは渡さない。

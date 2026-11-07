@@ -25,9 +25,14 @@
 //!   tear しうる値（記述子など）も非信頼入力として範囲検査で受け止め、リング破損として扱う。
 //!
 //! # 範囲外（REPAIR-3）
-//! 複数領域・`hv_vm_protect`・`Sync`（`Send` は #4024 で導入済み。#3798 の範囲外。期限切れで切り離したスレッドの資源の回収と合わせて担当は #3908）。IPA の上限の値は既定の 36 ビット（実機の値は #3997）。
-//! `register` はレイアウトの上限を、`HvVm::map` は既定の上限を検査する（#3844）。
-//! 解除失敗の構造化ログは未実装。
+//! - 複数領域・`hv_vm_protect`: 対象外（#4023 のオーナー判断 2026-11-07。#4033 で記録）。RAM は `ARM64_RAM_BASE` 以上の
+//!   単一領域で、MMIO・GIC の窓はすべて RAM より下にあり穴が無い。保護の変更を求める要件も無い（MVM-5・MVM-1）。
+//!   再評価条件は 2 つ: RAM の中に MMIO の穴が要るとき、読み取り専用の領域が要るとき。判断記録は
+//!   `docs/design/microvm-memory-ownership.md` 末尾。
+//! - `Sync`: 不要（共有は `Arc<Mutex<..>>`。`Send` は #4024 で導入済み）。
+//! - 期限切れで切り離したスレッドの資源の回収: #4032（親は #3908）。
+//! - IPA の上限の値は既定の 36 ビット（実機の値は #3997）。`register` はレイアウトの上限を、`HvVm::map` は既定の上限を検査する（#3844）。
+//! - 解除失敗の構造化ログは未実装。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};

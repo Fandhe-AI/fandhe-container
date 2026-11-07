@@ -14,7 +14,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2） |
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
-| plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | #3754 |
+| plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し空の `StreamDispatcher` で注入。結線済みの種別は無く 3 RPC は「not wired」の `UNIMPLEMENTED`） | #3754 |
 | 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
@@ -273,14 +273,14 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | attach の `backend_timeout` | 10 秒 |
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
-| `StreamingServer` の SIGTERM での停止 | #3754 で決める |
+| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
 
 ### 実装単位と兄弟 issue の対応
 
 | issue | 内容 | 範囲の変更（issue 本文の想定との差） |
 | ----- | ---- | ------------------------------------ |
 | #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763）・POD 未対応（#3766）・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
-| #3754 | `StreamingServer` の起動・注入 | — |
+| #3754 | `StreamingServer` の起動・注入 | 実装済み（plugin-cri の `streaming`。下の「plugin-cri での起動と停止（#3754）」） |
 | #3755 | NODE の dialer | cri の `PortForwardDialer` の引数に対象の型を足す（cri の変更を含む） |
 | #3756 | 試験 | — |
 | #3757 | `ExecLaunchIo` と core の stdio 拡張 | — |
@@ -309,10 +309,21 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 ## 残るもの
 
-- `ExecStreamLauncher` の本番の実装と plugin-cri からの `StreamingServer` の起動・注入（設計は「本番 backend の設計」の節、実装は #3753〜#3766）
+- 3 つの本番 backend の実装と結線（設計は「本番 backend の設計」の節、実装は #3755・#3761・#3763 ほか）
+- 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3）
+- `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）
+- Upgrade 後のセッションの停止時のドレイン方針の再評価（backend が入った時点。REPAIR-5）
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
 - kubelet / crictl の実クライアントでの照合（本番の backend と plugin-cri の結線の後。プロセス内の偽 backend と crictl 相当の SPDY クライアントによる疎通は `crates/cri/tests/streaming.rs`〔#683・TASK-63.5・CRI-6〕で済み。実 crictl は WebSocket が既定の版がありうるため、照合時に既定を一次情報で確かめる）
+
+## plugin-cri での起動と停止（#3754）
+
+- 置き場は plugin-cri の `streaming`（`production_streaming_config`・`production_stream_dispatcher`・`bind_production_streaming`・`stop_streaming_on`）。`main.rs` が runtime の構築直後、UDS の bind より前に呼ぶ
+- 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開の口は plugin-cri から出さない。TLS・認証は無く、URL のトークンが唯一の認可
+- dispatcher は空（全種別が未結線）で注入し、3 RPC は「not wired」の `UNIMPLEMENTED` のまま。兄弟 issue は `production_stream_dispatcher` へ `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
+- bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
+- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
 
 ## 依存
 

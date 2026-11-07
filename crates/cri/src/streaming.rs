@@ -5,7 +5,7 @@
 //! 「ストリーミングサーバーの URL」を返すだけである。本モジュールはその URL の発行（[`StreamingUrlIssuer`]）と、
 //! URL を受ける HTTP/1.1 サーバー（[`StreamingServer`]）の土台を持つ。呼び出し元は
 //! `runtime_service::CriRuntimeService` の `exec`・`attach`・`port_forward`（`with_streaming` で注入したときだけ）と、
-//! 将来サーバーを起動して注入する `fandhe-container-plugin-cri`（後続の issue）。
+//! サーバーを起動して注入する `fandhe-container-plugin-cri` の `streaming`（#3754）。
 //!
 //! ## 未実装（REPAIR-3）
 //!

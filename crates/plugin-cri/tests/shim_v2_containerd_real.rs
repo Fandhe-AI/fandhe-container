@@ -243,8 +243,10 @@ mod linux {
         Ok(path)
     }
 
-    /// `/proc/*/cmdline` が `needle`（NUL 区切りの引数列の一部）と実行名 `exe_hint` を含むプロセスの pid。
-    fn processes_with(needle: &str, exe_hints: &[&str]) -> Vec<u32> {
+    /// 試験専用の `bin_dir` から起動された `names` のプロセスのうち、引数のどれかが `id` と完全一致（または `/` 区切りの
+    /// 1 要素が一致）するものの pid。実行ファイルの実体（`/proc/<pid>/exe`）が `bin_dir` 配下であることで帰属を確かめ、
+    /// 無関係なコンテナ（`id` を接頭辞に持つ別 ID など）には当たらない。確認できない候補は含めない。
+    fn processes_with(id: &str, bin_dir: &Path, names: &[&str]) -> Vec<u32> {
         let me = std::process::id();
         let Ok(rd) = std::fs::read_dir("/proc") else {
             return Vec::new();
@@ -255,9 +257,21 @@ mod linux {
                 if pid == me {
                     return None;
                 }
+                let exe = std::fs::read_link(e.path().join("exe")).ok()?;
+                if exe.parent()? != bin_dir
+                    || !names
+                        .iter()
+                        .any(|n| exe.file_name().is_some_and(|f| f == *n))
+                {
+                    return None;
+                }
                 let c = std::fs::read(e.path().join("cmdline")).ok()?;
-                let s = String::from_utf8_lossy(&c).into_owned();
-                (s.contains(needle) && exe_hints.iter().any(|h| s.contains(h))).then_some(pid)
+                c.split(|b| *b == 0)
+                    .any(|arg| {
+                        let arg = String::from_utf8_lossy(arg);
+                        arg == id || arg.split('/').any(|part| part == id)
+                    })
+                    .then_some(pid)
             })
             .collect()
     }
@@ -482,7 +496,7 @@ mod linux {
             let _ = reap::reap(&mut daemon, Duration::from_secs(10));
         }
         for t in [&id, &id_b] {
-            for pid in processes_with(t, &[SHIM_NAME, SUPERVISOR_NAME]) {
+            for pid in processes_with(t, &bin, &[SHIM_NAME, SUPERVISOR_NAME]) {
                 kill_pid("KILL", pid);
             }
         }
@@ -512,7 +526,7 @@ mod linux {
         ctr_out: &dyn Fn(&[&str]) -> Result<String, String>,
     ) -> Result<(), String> {
         if !wait_until(Duration::from_secs(15), || {
-            processes_with(id, &[SHIM_NAME, SUPERVISOR_NAME]).is_empty()
+            processes_with(id, &dir.join("bin"), &[SHIM_NAME, SUPERVISOR_NAME]).is_empty()
         }) {
             return Err(format!("shim daemon or supervisor for {id} still alive"));
         }
@@ -536,9 +550,20 @@ mod linux {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .ok_or("XDG_RUNTIME_DIR is not set")?;
-        let state = xdg.join("fandhe-container").join(id);
-        if state.exists() {
-            return Err(format!("state directory for {id} remains"));
+        // 実際の配置は `<XDG>/fandhe-container-shim/<address のハッシュ>/<namespace>/<id>`（`scoped_root`）。ハッシュは
+        // containerd の ttrpc address 由来なので、全ハッシュ配下の当該 namespace を走査する。旧配置（`<XDG>/fandhe-container/<id>`）も見る。
+        let mut remains = vec![xdg.join("fandhe-container").join(id)];
+        match std::fs::read_dir(xdg.join("fandhe-container-shim")) {
+            Ok(rd) => {
+                for h in rd.flatten() {
+                    remains.push(h.path().join(NAMESPACE).join(id));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read shim state dir: {e}")),
+        }
+        if let Some(p) = remains.iter().find(|p| p.symlink_metadata().is_ok()) {
+            return Err(format!("state directory for {id} remains: {}", p.display()));
         }
         Ok(())
     }

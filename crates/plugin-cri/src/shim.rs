@@ -6,7 +6,7 @@
 //! `crates/cri/tests/dependency_direction.rs` が禁じているため、bin の置き場所をここにした
 //! （判断は `docs/design/shim-v2-production-binary.md`）。辺の向きは plugin-cri → cri・core の一方向のままで、core は変わらない（PLUG-4）。
 //!
-//! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の下を containerd の address・namespace ごとに分けた（`scoped_root`） `FileStateStore` の上に
+//! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の下を containerd の address・namespace ごとに分けた（`scoped_root`。状態ルートの兄弟に置く） `FileStateStore` の上に
 //! `CoreLifecycleRuntime` を作り、`RuntimeAdapter` で包んで `TaskService`（v2・v3。`with_shared_created` で共有）を登録する。
 //! デーモンの監査の記録先（`ServeContext::audit_sink`）を `with_create_audit_sink` に渡し、create の `mounts[].destination` の拒否を
 //! peer UID の拒否と同じ `@audit.log` へ残す（SEC-4）。
@@ -45,6 +45,9 @@ pub fn production_registry(ctx: ServeContext) -> Result<ServiceRegistry, CriErro
 ///
 /// bootstrap の socket は address・namespace・ID ごとに分かれるため、状態も同じ粒度で分ける。分けないと、同一ユーザーが
 /// 別 namespace で同じ ID を作ったときに状態が衝突し、別 shim の State・Kill・Delete が同じ記録を参照できてしまう。
+/// 置き場所は既定の状態ルート `base` の中ではなく兄弟（`<base>-shim/<address のハッシュ>/<namespace>`）にする。`base` 直下に
+/// 置くと途中の要素が有効な `ContainerId` と衝突し、`FileStateStore::list` が fail-closed で失敗して CLI・plugin-cri が
+/// `base` を開けなくなるため。途中の各階層は 1 つずつ 0700 で作り、既存の階層も symlink でなく他者が触れない権限であることを確かめる。
 /// namespace は検証済みの identifier（英数字と `._-`）なのでパス要素として安全で、address は FNV-1a の 16 桁 16 進に潰す。
 /// namespace が無い（containerd 以外の起動）ときは分けない。
 #[cfg(target_os = "linux")]
@@ -65,21 +68,36 @@ pub(crate) fn scoped_root(
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    let path = base
-        .join("shim")
-        .join(format!("{h:016x}"))
-        .join(ns.as_str());
-    // `FileStateStore::open` は最後の 1 階層しか作らないため、親（0700）をここで作る。ストアの検査が所有者・権限を確かめる。
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path.parent().unwrap_or(base))
-            .map_err(|_| CriError::internal("cannot create the state root"))?;
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        return Err(CriError::internal("cannot resolve the state root"));
+    };
+    let mut sibling = name.to_os_string();
+    sibling.push("-shim");
+    let hashed = parent.join(sibling).join(format!("{h:016x}"));
+    // `FileStateStore::open` は最後の 1 階層しか作らないため、親をここで 1 階層ずつ 0700 で作る。最後の要素はストアの検査が確かめる。
+    for dir in [hashed.parent().unwrap_or(parent), hashed.as_path()] {
+        ensure_private_dir(dir)?;
     }
-    fandhe_container_core::state_store::StateRoot::from_override(path)
+    fandhe_container_core::state_store::StateRoot::from_override(hashed.join(ns.as_str()))
         .map_err(|_| CriError::internal("cannot resolve the state root"))
+}
+
+/// `dir` を 0700 で作る（既存ならそのまま）。symlink・非ディレクトリ・グループ / その他に開いた権限は拒否する（SEC-1）。
+#[cfg(target_os = "linux")]
+fn ensure_private_dir(dir: &std::path::Path) -> Result<(), CriError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(CriError::internal("cannot create the state root")),
+    }
+    let md = std::fs::symlink_metadata(dir)
+        .map_err(|_| CriError::internal("cannot create the state root"))?;
+    if !md.is_dir() || md.permissions().mode() & 0o077 != 0 {
+        return Err(CriError::internal("state root directory is not private"));
+    }
+    Ok(())
 }
 
 /// 状態ルートを引数で受ける内側の関数（試験が一時ディレクトリの状態ルートで呼ぶ）。
@@ -217,7 +235,15 @@ mod tests {
         let c = scoped_root(&base, &mk("ns-a", "/run/d.sock")).unwrap();
         assert_ne!(a.path(), b.path());
         assert_ne!(a.path(), c.path());
-        assert!(a.path().starts_with(base.join("shim")));
+        assert!(a.path().starts_with(guard.join("state-shim")));
+        // 既定の状態ルート（base）の中に何も作らない（途中要素が ContainerId と衝突しない）。
+        assert!(!base.exists());
+        let mode = |p: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&guard.join("state-shim")), 0o700);
+        assert_eq!(mode(a.path().parent().unwrap()), 0o700);
         assert!(a.path().ends_with("ns-a"));
     }
 

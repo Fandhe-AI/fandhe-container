@@ -294,6 +294,27 @@ impl CriPluginBackends {
         ))
     }
 
+    /// 本番の Exec の起動役（supervisor の `stream-exec` helper 経由。CRI-6・SEC-1・SUP-6・#3761）を作る。
+    ///
+    /// 状態ルートは `production()` の固定位置で、要求の入力から受けない。注入で組んだとき（状態ルートが無い）は
+    /// `FAILED_PRECONDITION`。
+    #[cfg(target_os = "linux")]
+    pub fn exec_stream_launcher(
+        &self,
+    ) -> Result<Arc<crate::streaming::exec_launcher::SupervisorExecLauncher>, CriError> {
+        let Some(root) = &self.state_root else {
+            return Err(CriError::failed_precondition(
+                "state root is not configured",
+            ));
+        };
+        Ok(Arc::new(
+            crate::streaming::exec_launcher::SupervisorExecLauncher::production(
+                root.clone(),
+                Arc::clone(&self.state),
+            ),
+        ))
+    }
+
     /// 本番の `ImageService`（`PullImage`・`ImageStatus`・`ListImages`・`RemoveImage`・`ImageFsInfo`）を作る（CRI-3・CRI-4・PLUG-1。#2592）。
     ///
     /// `production_bundle_provider` と同じ在庫（[`Self::images`]）と、同じ `PullConfig`（キャッシュは

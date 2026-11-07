@@ -1484,10 +1484,10 @@ async fn cri6_3754_production_binary_streaming_listens_on_loopback_only() {
     .expect("watchdog");
 }
 
-/// 段 F-2（CRI-6・REPAIR-3）: 未結線の Exec は本番バイナリでも `UNIMPLEMENTED`（未知の ID でも `NOT_FOUND` より先）。
-/// Attach は #3763、PortForward は NODE だけ #3755 で結線済み（未知の ID は `NOT_FOUND`）。#3761 が結線したら更新する。
+/// 段 F-2（CRI-6・REPAIR-3）: Exec（#3761）・Attach（#3763）・PortForward の NODE（#3755）は本番バイナリで結線済みで、
+/// 未知の ID は `NOT_FOUND`（`UNIMPLEMENTED` ではない）。POD の PortForward の未結線は単体試験で照合する。
 #[tokio::test]
-async fn cri6_repair3_3754_production_binary_unwired_streaming_rpcs_are_unimplemented() {
+async fn cri6_repair3_3754_production_binary_wired_streaming_rpcs_report_not_found() {
     tokio::time::timeout(WATCHDOG, async {
         let dir = TempDir::new("sock-f2");
         let xdg = TempDir::new("xdg-f2");
@@ -1498,15 +1498,16 @@ async fn cri6_repair3_3754_production_binary_unwired_streaming_rpcs_are_unimplem
         let e = call_with_deadline(
             c.exec(cri::ExecRequest {
                 container_id: "nope".into(),
-                cmd: vec!["true".into()],
+                cmd: vec!["/bin/true".into()],
+                stdout: true,
                 ..Default::default()
             }),
             RPC_DEADLINE,
         )
         .await
         .expect_err("exec");
-        assert_eq!(e.code(), PluginErrorCode::Unimplemented);
-        assert_eq!(e.message(), "exec streaming is not wired");
+        assert_eq!(e.code(), PluginErrorCode::NotFound);
+        assert_eq!(e.message(), "container not found");
         let e = call_with_deadline(
             c.attach(cri::AttachRequest {
                 container_id: "nope".into(),

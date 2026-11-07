@@ -3174,6 +3174,85 @@ fn open_tree_clone_raw(node: RawFd) -> Result<OwnedFd, SysError> {
     open_tree_raw(node, open_tree_clone_flags())
 }
 
+/// 端末つき起動の init が割り当てた pty の slave として検証済みの fd（`/dev/console` へ bind する元。
+/// CRI-6・SEC-1・OCI-4・CORE-2・#4071）。
+///
+/// [`verify_pty_slave_fd`] だけが作る。文字デバイスで、`rdev` の major が UNIX98 pty の slave（136）で、
+/// `st_dev` が呼び出し側の期待（コンテナの devpts の `st_dev`）と一致する fd に限るため、ホストの devpts の
+/// pty・ホストの端末・任意の文字デバイスを `/dev/console` へ載せる経路は型で塞がれる。
+#[derive(Debug)]
+pub(crate) struct VerifiedPtySlaveFd(OwnedFd);
+
+impl std::os::fd::AsFd for VerifiedPtySlaveFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+}
+
+/// [`verify_pty_slave_fd`] の拒否理由(照合した実値を持つ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtySlaveError {
+    /// 文字デバイスではない。`mode` は `st_mode` の実値。
+    NotCharDevice { mode: u32 },
+    /// 文字デバイスだが major が UNIX98 pty の slave(136)ではない。
+    NotSlaveMajor { rdev: u64 },
+    /// `st_dev` が期待(コンテナの devpts)と違う。
+    WrongFilesystem { actual: u64, expected: u64 },
+    /// `fstat`(fd の複製を含む)の失敗、または対応外アーキテクチャ。
+    Sys(SysError),
+}
+
+/// UNIX98 pty の slave の major(`UNIX98_PTY_SLAVE_MAJOR`)。
+const PTY_SLAVE_MAJOR: u64 = 136;
+
+/// `rdev` の major(`makedev` の逆。glibc の `gnu_dev_major` と同じ式)。
+const fn rdev_major(rdev: u64) -> u64 {
+    ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)
+}
+
+/// `fd` を同じ fd の `fstat` で照合する(パスは開き直さない。検証後の差し替えは効かない)。
+///
+/// 文字デバイスで major が 136、かつ `st_dev == expected_dev` のときだけ [`VerifiedPtySlaveFd`] を返す。
+/// 呼び出し側(`crate::exec::process` の init の console の段)は、コンテナの `/dev/pts` の `st_dev` を
+/// 期待値として渡す。
+pub(crate) fn verify_pty_slave_fd(
+    fd: OwnedFd,
+    expected_dev: u64,
+) -> Result<VerifiedPtySlaveFd, PtySlaveError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    if !consts::SUPPORTED {
+        return Err(PtySlaveError::Sys(SysError::Unsupported));
+    }
+    let os = |e: io::Error| PtySlaveError::Sys(SysError::Os(e.raw_os_error().unwrap_or(EINVAL)));
+    let dup = std::os::fd::AsFd::as_fd(&fd)
+        .try_clone_to_owned()
+        .map_err(os)?;
+    let meta = std::fs::File::from(dup).metadata().map_err(os)?;
+    if !meta.file_type().is_char_device() {
+        return Err(PtySlaveError::NotCharDevice { mode: meta.mode() });
+    }
+    if rdev_major(meta.rdev()) != PTY_SLAVE_MAJOR {
+        return Err(PtySlaveError::NotSlaveMajor { rdev: meta.rdev() });
+    }
+    if meta.dev() != expected_dev {
+        return Err(PtySlaveError::WrongFilesystem {
+            actual: meta.dev(),
+            expected: expected_dev,
+        });
+    }
+    Ok(VerifiedPtySlaveFd(fd))
+}
+
+/// 検証済みの pty の slave を、切り離したマウントとして複製する(非再帰。[`open_tree_clone`] の pty 版)。
+///
+/// 呼び出し順の前提は [`open_tree_clone`] と同じ: 同じ mount namespace の中(`check_mnt`)・`MountIsolation::establish`
+/// が `/` を private 化した後(複製が peer へ伝播しない)・seccomp の適用前(`DeniedSyscall::OpenTree`)。
+/// `ENOSYS` は [`SysError::Unsupported`] で返し、縮退しない。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn open_tree_clone_pty_slave(slave: &VerifiedPtySlaveFd) -> Result<OwnedFd, SysError> {
+    open_tree_clone_raw(slave.0.as_raw_fd())
+}
+
 /// `open_tree(fd, "", flags)` の共通本体。`flags` は private な [`open_tree_clone_flags`]・[`open_tree_bind_flags`]
 /// の戻り値だけが渡る（任意のフラグを渡す経路を持たない。REPAIR-2）。
 #[cfg_attr(test, allow(dead_code))]
@@ -7850,6 +7929,33 @@ mod tests {
             (EPERM, ENOENT, EACCES, ENOTDIR, EINVAL, ELOOP),
             (1, 2, 13, 20, 22, 40)
         );
+    }
+
+    /// SEC-1・CRI-6(#4071): `rdev_major` は `makedev` の逆(UNIX98 pty の slave の major 136 を具体値で固定する)。
+    #[test]
+    fn sec1_4071_rdev_major_inverts_makedev() {
+        assert_eq!(rdev_major(makedev(136, 0)), 136);
+        assert_eq!(rdev_major(makedev(136, 300)), 136);
+        assert_eq!(rdev_major(makedev(5, 2)), 5);
+        assert_eq!(rdev_major(makedev(1, 3)), 1);
+        assert_eq!(rdev_major(makedev(0x1234, 7)), 0x1234);
+    }
+
+    /// SEC-1・CRI-6(#4071): `verify_pty_slave_fd` はディレクトリ・major 136 以外の文字デバイスを拒否する(任意のノードを
+    /// `/dev/console` へ載せる経路を作らない)。
+    #[test]
+    fn sec1_4071_verify_pty_slave_rejects_non_slave_nodes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let open = |path: &str| OwnedFd::from(std::fs::File::open(path).expect("open"));
+        match verify_pty_slave_fd(open("/"), 0) {
+            Err(PtySlaveError::NotCharDevice { mode }) => assert_eq!(mode & 0o170_000, 0o040_000),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let null_rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
+        match verify_pty_slave_fd(open("/dev/null"), 0) {
+            Err(PtySlaveError::NotSlaveMajor { rdev }) => assert_eq!(rdev, null_rdev),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// SUP-12（TASK-169.2）: tmpfs の `statfs.f_type`（`TMPFS_MAGIC`）の具体値。tmpfs の `fsmount` の attr フラグ

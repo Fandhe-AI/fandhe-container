@@ -124,8 +124,9 @@
 //! - rootless の bind を実機で通した記録。本モジュールの rootless 経路は dry-run の単体テストで呼び出し列・
 //!   拒否・後始末を照合しており、実マウントでの確認（非特権 user namespace・Linux 5.2 以降）は結合試験
 //!   `tests/default_devices.rs`（人間担当・`-- --ignored`）が担う
-//! - `/dev/console` は端末機能の親 issue で別途設計する（設計ドラフト 3.5）。`process.terminal: true` の init の pty は
-//!   #4070 で launch に実装済み（opt-in した launcher のみ。`/dev/console` の bind は #4071 で、それまで `/dev/console` は無い）
+//! - `/dev/console` は本モジュールでは作らない。`process.terminal: true` の init の pty は #4070、その slave の
+//!   `/dev/console` への bind は #4071 で launch に実装済み（opt-in した launcher のみ。pivot 後・ステージ列の前に
+//!   `exec::pty::bind_console` が行い、terminal 無効では `/dev/console` は無い。設計ドラフト 3.5）
 //!
 //! # 単体テストの安全策
 //!

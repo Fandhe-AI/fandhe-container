@@ -128,10 +128,13 @@ pub(super) enum PrePivotStep {
     RootReadOnly,
     /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。OCI-1・TASK-29。違反記録は運ばない）。
     WorkingDir,
+    /// 端末つき起動(`process.terminal: true`)の init の pty の割り当てと `/dev/console` への bind(ステージ列の前。
+    /// 違反記録は運ばない。CRI-6・SEC-1・OCI-4・CORE-2・#4071)。
+    Console,
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -147,6 +150,7 @@ impl PrePivotStep {
         Self::PivotRoot,
         Self::RootReadOnly,
         Self::WorkingDir,
+        Self::Console,
     ];
 
     /// 段名（ワイヤー上のトークン。単体テストの `RecordingOps` の段名と一致させる）。
@@ -167,6 +171,7 @@ impl PrePivotStep {
             Self::PivotRoot => "pivot_root",
             Self::RootReadOnly => "root_readonly",
             Self::WorkingDir => "working_dir",
+            Self::Console => "console",
         }
     }
 
@@ -191,6 +196,8 @@ impl PrePivotStep {
             Self::PivotRoot => IsolationStage::PivotRoot,
             Self::RootReadOnly => IsolationStage::RootReadOnly,
             Self::WorkingDir => IsolationStage::WorkingDir,
+            // 専用 `/dev` への供給の一部のため、`/dev` の作成と同じ段へ写す。
+            Self::Console => IsolationStage::CreateDevices,
         }
     }
 }
@@ -1207,6 +1214,7 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::PivotRoot => 12,
         PrePivotStep::RootReadOnly => 13,
         PrePivotStep::WorkingDir => 14,
+        PrePivotStep::Console => 15,
     }
 }
 
@@ -1328,7 +1336,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 15);
+        assert_eq!(PrePivotStep::ALL.len(), 16);
     }
 
     /// exec の子の段（`ExecChildStep`）と launch の段のトークンは重ならない（取り違えの検出。SUP-6・#2822）。

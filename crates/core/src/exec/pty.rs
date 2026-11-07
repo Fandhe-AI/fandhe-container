@@ -31,13 +31,15 @@
 //! # 未実装（REPAIR-3）
 //! supervisor の `ExecStdio` への tty の追加と、受けた master を helper の channel へ返す結線は #3760・#3761、
 //! plugin-cri の resize の転送は #3761 で実装済み、実コンテナ（Landlock・seccomp の下）での実機確認は #3762、
-//! `/dev/console` への slave の bind は #4071 の範囲で、本モジュールは行わない。
+//! launch の init の `/dev/console` への bind は `bind_console`（#4071）が行う（exec は `/dev/console` を触らない）。
 //!
-//! # launch の init の pty(CRI-6・SEC-1・CORE-5・#4070)
-//! 端末つき起動では、PID 1 の終端(`process.rs` の `attach_launch_pty`)が pivot 後の照合済みの `/` を起点に
-//! [`allocate_in_root`] を呼び、master を専用の socketpair で launch の親 C へ送り([`ExecPtySender`])、slave を fd 0〜2 に
-//! 付け替える。C は exec 前の 2 行目(`R`/`E`)の判定の後に [`ExecPtyReceiver::receive`] で受ける
-//! (`launch_intermediate.rs`)。
+//! # launch の init の pty(CRI-6・SEC-1・CORE-5・OCI-4・CORE-2・#4070・#4071)
+//! 端末つき起動では、PID 1 が pivot 後の照合済みの `/` を起点に(`process.rs` の `attach_init_console`。ステージ列の
+//! **前**。bind の `open_tree(2)`・`move_mount(2)` は既定の seccomp の拒否集合に入り、`CAP_SYS_ADMIN` も要るため、
+//! runc の `setupConsole`・`mountConsole` と同じ位置)[`allocate_in_root`] で pty を割り当て、slave を
+//! [`bind_console`] で `/dev/console` へ bind する。master は終端(`attach_launch_pty`)が専用の socketpair で launch の
+//! 親 C へ送り([`ExecPtySender`])、slave を fd 0〜2 に付け替える。C は exec 前の 2 行目(`R`/`E`)の判定の後に
+//! [`ExecPtyReceiver::receive`] で受ける(`launch_intermediate.rs`)。
 
 use std::ffi::CStr;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
@@ -164,6 +166,11 @@ impl PtySlave {
             .map_err(|e| ExecError::from_sys(e, STAGE, "ioctl(TIOCGWINSZ)"))
     }
 
+    /// fd の借用(所有者の補正の `fchown`。`/dev/console` の bind 元の検証は [`bind_console`])。
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
     /// fd の複製（`ChildStdio::from_pty_slave` が fd 0〜2 の 3 本を作る）。
     pub(crate) fn try_clone_fd(&self) -> Result<OwnedFd, ExecError> {
         self.0.try_clone().map_err(|e| {
@@ -241,6 +248,116 @@ pub(crate) fn allocate_in_root(
     let master = PtyMaster(master);
     master.resize(size)?;
     Ok((master, PtySlave(slave)))
+}
+
+/// 端末つき起動の init の slave を、pivot 後の `/dev/console` へ bind する(OCI-4・CORE-2・CRI-6・SEC-1・#4071)。
+///
+/// OCI runtime-spec の Default Devices は、`process.terminal: true` のとき pty の slave を `/dev/console` に bind
+/// mount すると定める。呼び出しは `process.rs` の pre-pivot の `Console` 段で、pivot 後・ステージ列(seccomp・
+/// capability 削減)の **前**に限る(`open_tree`・`move_mount` は seccomp の拒否集合にあり、mount namespace を所有する
+/// userns の `CAP_SYS_ADMIN` が要る)。失敗は起動失敗で、縮退しない(後始末は PID 1 の終了で mount namespace ごと消える)。
+///
+/// - bind 元は `slave` を `/dev/pts` の `st_dev` で検証した fd だけ([`sys::VerifiedPtySlaveFd`])。ホストの devpts・
+///   任意の文字デバイスは型で通らない。複製は非再帰(子マウントを持ち込まない)
+/// - bind 先は `/dev`(tmpfs であることを確認)の fd 起点に `O_EXCL|O_NOFOLLOW` で作り、`O_PATH` で開き直して同一 inode を
+///   照合する。`EEXIST` は拒否(新しい tmpfs にあるはずがない)。パス文字列では再解決しない
+/// - 事後検証: `dev/console` を開き直し、文字デバイス・`rdev` が slave と同じ・`st_dev` が `/dev/pts` と同じ・自分が載せた
+///   マウントであること
+pub(crate) fn bind_console(root: BorrowedFd<'_>, slave: &PtySlave) -> Result<(), ExecError> {
+    const BIND_STAGE: IsolationStage = IsolationStage::CreateDevices;
+    let open_dir = |parent: BorrowedFd<'_>, name: &CStr, what: &str| {
+        sys::open_dir_path_nofollow(Some(parent), name)
+            .map_err(|e| ExecError::from_sys(e, BIND_STAGE, what))
+    };
+    let dev = open_dir(root, c"dev", "openat(/dev) for the init console")?;
+    if sys::fs_type(dev.as_fd()).map_err(|e| ExecError::from_sys(e, BIND_STAGE, "fstatfs(/dev)"))?
+        != sys::TMPFS_MAGIC
+    {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            BIND_STAGE,
+            "the container /dev is not a tmpfs mount",
+        ));
+    }
+    let pts = open_dir(dev.as_fd(), c"pts", "openat(/dev/pts) for the init console")?;
+    let pts_dev = fstat(pts.as_fd(), "fstat(/dev/pts)")?.dev();
+    let verified = sys::verify_pty_slave_fd(slave.try_clone_fd()?, pts_dev).map_err(|e| {
+        let message = match e {
+            sys::PtySlaveError::NotCharDevice { .. } => {
+                "the init console source is not a character device"
+            }
+            sys::PtySlaveError::NotSlaveMajor { .. } => {
+                "the init console source is not a pty slave"
+            }
+            sys::PtySlaveError::WrongFilesystem { .. } => {
+                "the init console source is not on the container devpts"
+            }
+            sys::PtySlaveError::Sys(se) => {
+                return ExecError::from_sys(se, BIND_STAGE, "fstat(init console source)");
+            }
+        };
+        ExecError::new(ErrorCode::FailedPrecondition, BIND_STAGE, message)
+    })?;
+    let expected_rdev = fstat(slave.as_fd(), "fstat(pty slave)")?.rdev();
+
+    // bind 先の空ファイルを作って固定する(作成と開き直しの間の差し替えは同一 inode の照合で塞ぐ)。
+    let created = match sys::create_file_excl_at(dev.as_fd(), c"console", 0) {
+        Ok(fd) => fd,
+        Err(sys::SysError::Os(sys::EEXIST)) => {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                BIND_STAGE,
+                "the bind target dev/console already exists",
+            ));
+        }
+        Err(e) => {
+            return Err(ExecError::from_sys(
+                e,
+                BIND_STAGE,
+                "openat(create dev/console)",
+            ));
+        }
+    };
+    let target = sys::open_path_nofollow(dev.as_fd(), c"console")
+        .map_err(|e| ExecError::from_sys(e, BIND_STAGE, "openat(bind target dev/console)"))?;
+    let created_meta = fstat(created.as_fd(), "fstat(created dev/console)")?;
+    let target_meta = fstat(target.as_fd(), "fstat(bind target dev/console)")?;
+    if (created_meta.dev(), created_meta.ino()) != (target_meta.dev(), target_meta.ino()) {
+        return Err(precondition_at(
+            BIND_STAGE,
+            "the bind target dev/console was replaced right after creation",
+        ));
+    }
+    drop(created);
+
+    let tree = sys::open_tree_clone_pty_slave(&verified)
+        .map_err(|e| ExecError::from_sys(e, BIND_STAGE, "open_tree(init console)"))?;
+    sys::move_mount_empty_path(tree.as_fd(), target.as_fd())
+        .map_err(|e| ExecError::from_sys(e, BIND_STAGE, "move_mount(init console)"))?;
+
+    // 事後検証: 載せたものが slave そのもので、自分のマウントであること。
+    let after = sys::open_path_nofollow(dev.as_fd(), c"console")
+        .map_err(|e| ExecError::from_sys(e, BIND_STAGE, "openat(bound dev/console)"))?;
+    let meta = fstat(after.as_fd(), "fstat(bound dev/console)")?;
+    if !meta.file_type().is_char_device() || meta.rdev() != expected_rdev || meta.dev() != pts_dev {
+        return Err(precondition_at(
+            BIND_STAGE,
+            "the bound dev/console is not the init pty slave",
+        ));
+    }
+    let own = super::fd_mount_id(&tree, BIND_STAGE)?;
+    let bound = super::fd_mount_id(&after, BIND_STAGE)?;
+    if own != bound {
+        return Err(precondition_at(
+            BIND_STAGE,
+            "the bound dev/console is not the mount created by this call",
+        ));
+    }
+    Ok(())
+}
+
+fn precondition_at(stage: IsolationStage, message: &'static str) -> ExecError {
+    ExecError::new(ErrorCode::FailedPrecondition, stage, message)
 }
 
 /// UNIX98 slave の番号 `index` のデバイス番号（major 136・minor は index そのまま）。範囲外は `None`。

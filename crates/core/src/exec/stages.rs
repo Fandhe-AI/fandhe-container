@@ -451,6 +451,11 @@ impl StagePipeline {
         self
     }
 
+    /// `process.user` が 0/0 以外のときの uid(端末つき起動の init の slave の所有者の補正に使う。#4071)。
+    pub(super) fn process_owner_uid(&self) -> Option<u32> {
+        self.process_ids.map(|ids| ids.uid)
+    }
+
     /// pivot 前段が載せたマウントの識別子の記録を Landlock 段へ渡す（#2071・CORE-5・SEC-1）。
     ///
     /// `process.rs::run_child_then` が `run_pre_pivot` の直後・`run_then` の直前にだけ呼ぶ。Landlock 段は

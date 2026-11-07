@@ -27,7 +27,7 @@ OCI 既定の `/dev` のうち、基本デバイスノード 6 種と default sy
 - `create_default_devices` は rootfs の `dev` に専用の nodev なし tmpfs（`sys::mount_dev_tmpfs_on`・#1652）を載せてから、基本 6 デバイスと default symlink 4 本をそのマウントのルート fd 起点で作る（#1653）。ノードはホストの rootfs に残らず、イメージ同梱の `dev` 配下は覆い隠される（覆い隠す効果は `dev` 配下に限る。3.1 の注記）。起動順序は `prepare_rootfs` → `create_default_devices`（`dev` に tmpfs → ノード → symlink → `pts` に devpts → `ptmx` の symlink。devpts と `ptmx` は #1656）→ `mount_tmpfs` → `pivot_root`。`/dev` の tmpfs の付け替え先は、検証を通った `dev` の fd を表す型（`exec::devices` の `DevMountTarget`）でしか渡せず、`sys::mount_dev_tmpfs_on` の呼び出しが 1 か所であることを単体テストがソースの走査で確かめる（#1664 の事後監査 P2）。`mount_tmpfs` は `/dev` 配下の宛先（`/dev/shm` 等）に、同じ rootfs に対する `create_default_devices` の結果（`DeviceReport`）を順序の証跡として要求し、rootfs の `dev` が今もその tmpfs のルートでなければ何も作らずに拒否する（#1669 の事後監査 P2）
 - `/dev/shm` は `TmpfsMountSet::ensure_default_dev_shm` が、利用者の指定（`--shm-size`・`--tmpfs /dev/shm`）が無いとき既定 64 MiB（`DEFAULT_DEV_SHM_SIZE_BYTES`）の件を足す（#1654）。supervisor の `to_tmpfs_set` が `--ipc=host` 以外で呼ぶ。`--ipc=host` でのホストの `/dev/shm` の bind は未実装
 - `sys` の新マウント API ラッパーは tmpfs（`mount_tmpfs_on`・`mount_dev_tmpfs_on`）と devpts（`mount_devpts_on`・#1655）があり、devpts は `create_default_devices` が呼ぶ（#1656）
-- `process.terminal: true` は拒否する。`mounts[]` は bind だけを検証して適用し（#1915。[bind-mounts](../api/bind-mounts.md)）、bind 以外の種類は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
+- `process.terminal: true` は opt-in した launcher だけが受け（#4070）、pivot 後・ステージ列の前に init の pty の slave を `/dev/console` へ bind する（#4071。3.5）。opt-in しない launcher は拒否する。`mounts[]` は bind だけを検証して適用し（#1915。[bind-mounts](../api/bind-mounts.md)）、bind 以外の種類は拒否する。`/proc` と基本 6 デバイスは `mounts[]` を使わず暗黙の固定集合
 - Landlock のルールは `root` に加え、暗黙の `/dev`・`/dev/pts`・`/dev/shm` を実マウントの属性から導いた権利で足す（#1657）。定義は `dev_mounts` モジュールの1か所で、exec 側と共有する。`mounts[]` が同じマウント先を指す場合は統合せず拒否する（受けるかは [#2347](https://github.com/Fandhe-AI/fandhe-container/issues/2347) で判断待ち。[oci-mounts-implicit-entries](oci-mounts-implicit-entries.md)）。`PSEUDO_FS` に devpts は入れない（pty への書き込みに `WRITE_FILE` が要り、書き込み制限に VFS の裏付けがあるため）。利用者指定の tmpfs（`--tmpfs`・`/dev/shm` の上書き）は反映しない。ruleset は fork 前に親で作るため、適用時に各パスが期待する fs（tmpfs / devpts）の独立したマウントのルートであることを確かめ、無ければ `landlock_implicit_mount_missing`、素のディレクトリ等なら `landlock_implicit_mount_mismatch`（どちらも `FailedPrecondition`）で拒否する。`/dev/shm` を載せない `--ipc=host` では `ImplicitDevMounts::WithoutShm`（supervisor の `ContainerOptions::implicit_dev_mounts`）を使う（#1672 の事後監査 P2）
 - 読み取り専用の root（`root.readonly=true`）でも、`/dev` は書き込みと実行が可能な tmpfs で、Landlock でも `/dev` に `WRITE` を許す（`EXECUTE` は `/` のルールから継承され、`/dev` だけ外せない。VFS 側も `noexec` なし）。runc・Docker と同じだが、「読み取り専用の root で `mounts[]` が空なら書き込めるパスが無い」という #1657 以前の性質は成り立たない（#1672 の事後監査 P2）。`/dev/shm` も書き込みは可能（`noexec`・`nodev`）
 - 起動時（`exec::spawn_container_with_stages` の fork 後の親）に `/proc/sys/dev/tty/legacy_tiocsti` を読み、`1` のときだけ `legacy_tiocsti_enabled` の警告を 1 行出す。観測だけで起動は止めない（`legacy_tiocsti` モジュール。#1658 の案 A＋C・案 B〔seccomp で ioctl を request 単位で拒否〕は不採用・#1739）。本番 launcher への配線は未実装
@@ -67,7 +67,12 @@ tmpfs にする（runc 方式）に確定（4 章の判断 1）。実装は #165
 
 ### 3.5 `/dev/console`
 
-`terminal: true` の pty 受け渡し（console socket）に依存し、2h では収まらない。`terminal: false` の間は不要。端末機能の親 issue を別に設計する。
+実装済み（#4071。CORE-2・OCI-4・CRI-6・SEC-1）。`terminal: true` のとき、init の pty（コンテナの devpts から #4070 が割り当てる）の slave を `/dev/console` へ bind する。`terminal: false` では作らない。
+
+- 位置は pivot 後・ステージ列の前。bind の `open_tree`・`move_mount` が既定の seccomp の拒否集合にあり、mount namespace を所有する userns の `CAP_SYS_ADMIN` も要るため、制限の後ではできない（runc の `setupConsole`・`mountConsole` も caps 削減の前）
+- bind 元は `/dev/pts` の `st_dev` と major 136 で検証した slave の fd だけ（型 `VerifiedPtySlaveFd`）。bind 先は `/dev`（tmpfs）の fd 起点に `O_EXCL|O_NOFOLLOW` で作り、載せた後に `rdev`・`st_dev`・自分のマウントであることを開き直して確かめる。複製は非再帰。失敗は起動失敗（縮退しない。後始末は PID 1 の終了で mount namespace ごと消える）
+- 割り当てがステージ列（`setresuid`）より前になるため、`process.user` が 0/0 以外のときは capability の残る pre-stage で slave の uid を補正する（runc の `fixStdioPermissions` 相当）
+- `terminal` のとき `readonlyPaths`・`maskedPaths` に `/dev/console` を指定した config は、保護が効かないまま console が作られるため start が `InvalidArgument` で拒否する
 
 ### 3.6 rootless の供給
 
@@ -110,7 +115,7 @@ bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の
 | 8 | #1659 | #6 | `open_tree`・`move_mount` の `sys` ラッパー | #1651（本書の確定） | CORE-6・SEC-5・CORE-1 |
 | 9 | #1660 | #7 | rootless 経路の基本デバイスの bind 供給 | #1659・#1653 | CORE-6・SEC-5・CORE-1 |
 | - | 起票しない | #9 | `/dev/mqueue`（spec 判断待ち） | spec 判断 | CORE-1 |
-| - | 起票しない（対象外） | - | `/dev/console`（端末機能の親 issue として別に設計する。3.5） | 端末機能 | CORE-2・OCI-4 |
+| - | #4071 | #3765 | `/dev/console`（terminal 有効時に init の slave を bind。実装済み。3.5） | #4070 | CORE-2・OCI-4・CRI-6 |
 
 旧分割案 #8 は確定し、#1・#3・#7 の前提として前に置いた（#1652・#1653）。
 

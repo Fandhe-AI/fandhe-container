@@ -11,11 +11,11 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | HTTP/1.1 サーバーの起動・ルーティング・接続の上限と期限 | 実装済み | #679 |
 | URL の発行（一意・単回使用・TTL つき） | 実装済み | #679 |
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
-| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2） |
-| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
-| PortForward | 未実装 | #682（TASK-63.4） |
-| plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは #3755 の PortForward〔NODE のみ〕で、Exec・Attach は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach・POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。本番の起動役は plugin-cri の `SupervisorExecLauncher` で結線済み〔Linux のみ。stdin・stdout・stderr のみで、tty と相対 argv[0] は RPC 時に `INVALID_ARGUMENT`、非 Linux は未結線の `UNIMPLEMENTED`〕。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2）・#3761 |
+| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は読み取り専用〔`LogFollowAttachBackend`。回転ログの follow〕で結線済み。stdin・tty は RPC 時と接続時に `INVALID_ARGUMENT` で、完全版は未実装。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3）・#3763 |
+| PortForward | `PortForwardHandler` は実装済み。NODE の dialer で結線済み。POD は RPC 時と dialer の両方で `UNIMPLEMENTED` | #682（TASK-63.4）・#3755 |
+| plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは PortForward〔NODE のみ。#3755〕・Attach〔読み取り専用。#3763〕・Exec〔Linux のみ。#3761〕。非 Linux の Exec は「not wired」の `UNIMPLEMENTED`） | #3754 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach は段階 1（読み取り専用）が実装済み（#3763）で完全版は未実装。POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -145,7 +145,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 
 ## 本番 backend の設計（#3752）
 
-2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節の内容はいずれも未実装である（REPAIR-3）**。
+2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節は設計記録であり、実装の状況は冒頭の表と各小節の「実装」の記述を正とする。Exec（#3761）・読み取り専用の Attach（#3763）・NODE の PortForward（#3755）は実装済みで、完全版 Attach・Exec の tty・POD の PortForward は未実装である（REPAIR-3）**。
 
 対象ビヘイビア: CRI-6・PLUG-1・SUP-4・SUP-6・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（関連: CORE-1・CORE-5・SUP-3・SUP-5・SUP-7・NET-3）。
 
@@ -284,7 +284,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 **D3. init の stdin / pty を作り保持する主体**
 
-- 作るのは core の本番 launcher で、supervisor が起動オプションで要求する。stdin は `LaunchOptions` で開く指定を足し、core が pipe を作って読み取り側を子の fd 0 にし、書き込み側を `LaunchedProcess` から取り出す。（stdin の段は C1〔#4069〕で実装済み。API は `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`）tty（`process.terminal: true`）は、子がコンテナの mount namespace と devpts の中で `/dev/ptmx` を開き、slave を fd 0〜2 にして `setsid` と `TIOCSCTTY` で制御端末にし、`/dev/console` へ bind し、master は既存の子から親への SCM_RIGHTS（seccomp listener と同じ経路）で返す。pty の sys ラッパーと開く位置（Landlock / seccomp の再適用との順序）は #3758 の決定を再利用し、ここで決め直さない。ホストの devpts では割り当てない
+- 作るのは core の本番 launcher で、supervisor が起動オプションで要求する。stdin は `LaunchOptions` で開く指定を足し、core が pipe を作って読み取り側を子の fd 0 にし、書き込み側を `LaunchedProcess` から取り出す。（stdin の段は C1〔#4069〕で実装済み。API は `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`）tty（`process.terminal: true`）は、子がコンテナの mount namespace と devpts の中で `/dev/ptmx` を開き、slave を fd 0〜2 にして `setsid` と `TIOCSCTTY` で制御端末にし、`/dev/console` へ bind し、master は既存の子から親への SCM_RIGHTS（seccomp listener と同じ経路）で返す。pty の sys ラッパーと開く位置は、exec は #3758 の決定（Landlock / seccomp の再適用の後）を再利用する。launch の init だけは、`/dev/console` への bind（`open_tree`・`move_mount`）が seccomp の拒否集合にあり `CAP_SYS_ADMIN` も要るため、割り当てと bind を pivot 後・ステージ列の前（runc の `setupConsole`・`mountConsole` と同じ位置）へ置く（#4071。割り当てた slave は `process.user` へ所有者を補正する）。ホストの devpts では割り当てない
 - core の `process.terminal` の拒否は、supervisor が端末対応を opt-in したとき（例: `with_terminal_support()`）だけ外す。master を捕捉しない呼び出し元は従来どおり拒否する（fail-closed）
 - 保持するのは supervisor で、`control/target.rs` の `SignalSlot` と同じ置き場所に世代ごとのスロットを持つ。`Exited` と再 launch で落とし、新しい世代の fd に差し替える。tty では master を捕捉の stdout 1 本として `LogCapture` へ渡し、`EIO` は EOF とみなす（CRI のログは stdout のタグだけになる）
 - 渡した master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと `TIOCSWINSZ` にだけ使う（契約）
@@ -338,7 +338,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | -- | ----- | ---- | ---- |
 | C1 | #4069 | core: init の stdin パイプ（実装済み: `LaunchOptions::with_stdin(LaunchStdinMode::Pipe)` と `LaunchedProcess::take_stdin`。書き込み端は close-on-exec かつ fd 3 以上。supervisor のラッパーの `take_stdin` の転送は C4） | なし |
 | C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
-| C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
+| C3 | #4071 | core: slave を `/dev/console` へ bind（実装済み。割り当てと bind は bind の特権要件から pivot 後・ステージ列の前。D3 の補足） | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
@@ -398,7 +398,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3761 | plugin-cri の本番 launcher | 実装済み（tty は本番で fail-closed。supervisor 側の pty 結線は後続。上の「本番 launcher の実装」）。helper の起動・fd の送信・tokio の橋渡し・drop で kill・ローカルの resize・全体の上限 |
 | #3762 | 実機前提試験 | — |
 | #3763 | plugin-cri の読み取り専用 attach | 実装済み（supervisor の reader の取り消しの口・`FollowEnd`・`RecordDemux` を含む） |
-| #3764 | docs の更新 | — |
+| #3764 | docs の更新 | 実装済み（冒頭の表と「残るもの」） |
 | #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
 
@@ -417,19 +417,29 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 ## 残るもの
 
-- Exec の tty（supervisor 側の pty 結線と helper の `--tty`。後続 issue）、Attach の完全版（#3765 の設計）、POD の PortForward（#3766）。Exec の本番 launcher は #3761、Attach の読み取り専用は #3763、PortForward の NODE は #3755 で実装済み
-- 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3）
-- `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）
-- Upgrade 後のセッションの停止時のドレイン方針の再評価（backend が入った時点。REPAIR-5）
+実装済みは Exec の本番 launcher（#3761。Linux のみ）、読み取り専用の Attach（#3763）、NODE の PortForward（#3755）。未実装の組は次のとおり（REPAIR-3）。
+
+- 完全な Attach（stdin・stdin_once・tty・resize）: #3765（設計のみ・closed）の子 issue で追う。個別の状態は「完全版 Attach の設計（#3765）」の子 issue 表を正とする
+- POD ネットワークの PortForward: 設計と分解は #3766、前提は保持役 provider の #2877。RPC 時と dialer の両方で `UNIMPLEMENTED`
+- Exec の tty（supervisor 側の pty 結線と helper の `--tty`。受け側は実装・試験済み）: 追跡 issue 未起票（親 #3726 の残り）。本番は RPC 時に `INVALID_ARGUMENT`
+- Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
+- Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は上の子 issue（#4079）で扱う
+- Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）、`PtyMaster` の fd 検証（#4100）
+- 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
+- rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
+- 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）
+- `ExecSync`: `UNIMPLEMENTED` のまま。追跡 issue 未起票
+- 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3。#4110）
+- `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）と、Upgrade 後のセッションの停止時のドレイン方針の再評価（REPAIR-5）: どちらも #4111
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
-- kubelet / crictl の実クライアントでの照合（本番の backend と plugin-cri の結線の後。プロセス内の偽 backend と crictl 相当の SPDY クライアントによる疎通は `crates/cri/tests/streaming.rs`〔#683・TASK-63.5・CRI-6〕で済み。実 crictl は WebSocket が既定の版がありうるため、照合時に既定を一次情報で確かめる）
+- kubelet / crictl の実クライアントでの照合（人間担当の #3730・#3777・#3779。本番の backend と plugin-cri の結線は済みで実施待ち。プロセス内の偽 backend と crictl 相当の SPDY クライアントによる疎通は `crates/cri/tests/streaming.rs`〔#683・TASK-63.5・CRI-6〕で済み。実 crictl は WebSocket が既定の版がありうるため、照合時に既定を一次情報で確かめる）
 
 ## plugin-cri での起動と停止（#3754）
 
 - 置き場は plugin-cri の `streaming`（`production_streaming_config`・`production_stream_dispatcher`・`bind_production_streaming`・`stop_streaming_on`）。`main.rs` が runtime の構築直後、UDS の bind より前に呼ぶ
 - 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開の口は plugin-cri から出さない。TLS・認証は無く、URL のトークンが唯一の認可
-- dispatcher は PortForward（NODE の `NodeLoopbackDialer`）だけ結線して注入する（#3755。`production_stream_dispatcher` は `PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。Exec・Attach は「not wired」の `UNIMPLEMENTED` のまま。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
+- dispatcher は Attach（`AttachHandler::read_only()`。#3763）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
 - 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
 

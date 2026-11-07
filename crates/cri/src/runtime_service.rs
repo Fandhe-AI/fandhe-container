@@ -3721,6 +3721,8 @@ impl CriRuntimeService {
     fn attach_impl(&self, req: v1::AttachRequest) -> Result<v1::AttachResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::Attach, "attach")?;
         validate_attach_request(&req)?;
+        // 読み取り専用の backend は stdin・tty を URL の発行前に断る（#3763・REPAIR-3）。
+        issuer.require_attach_options(req.stdin, req.tty)?;
         self.require_running_container(&req.container_id)?;
         let url = issuer.issue(StreamRequest::Attach(req))?;
         Ok(v1::AttachResponse { url })

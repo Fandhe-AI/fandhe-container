@@ -29,12 +29,12 @@
 //! - 戻り値が `-1` のときは直後に `std::io::Error::last_os_error()` で errno を確保する
 //!
 //! # `libc` との機械照合について
-//! TASK-75.1 で匿名 mmap のゲスト RAM（`GuestRamMap`）・`madvise(MADV_DONTFORK)`・登録 / 削除のラッパーを足した
+//! TASK-75.1 で匿名 mmap のゲスト RAM（`GuestRamMap`）・`madvise(MADV_DONTFORK)`（#3679 で `MADV_DONTDUMP` も）・登録 / 削除のラッパーを足した
 //! （`crate::microvm` の `GuestRam`・`RegisteredGuestRam` が呼ぶ。`madvise` も `libc` 導入後は照合の対象）。
 //! 本 crate は dev-dependency に `libc` を持たず照合は未導入（追加は crate ごとの承認事項。
 //! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
-//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
+//! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる（照合の追跡は #3664。`MADV_DONTDUMP` も同じ）。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
 //! 対応物が無く、サイズ・オフセットを const assert で固定する。
 //! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
 //! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
@@ -130,6 +130,8 @@ pub(crate) mod consts {
     pub const MAP_NORESERVE: i32 = 0x4000;
     /// `MADV_DONTFORK`（`asm-generic/mman-common.h`）。
     pub const MADV_DONTFORK: i32 = 10;
+    /// `MADV_DONTDUMP`（`asm-generic/mman-common.h`。コアダンプからゲスト RAM を外す。#3679）。
+    pub const MADV_DONTDUMP: i32 = 16;
     /// `_IO(KVMIO, 0x03)`（`/dev/kvm` と VM fd のどちらにも発行できる）。
     pub const KVM_CHECK_EXTENSION: u64 = super::io(super::KVMIO, 0x03);
     /// `_IO(KVMIO, 0x60)`（x86_64 のみ定義。vCPU を作る前に発行する）。
@@ -189,9 +191,9 @@ pub(crate) mod consts {
     /// `MAX_IO_MSRS = 256`（`arch/x86/kvm/x86.c`。`nmsrs >= 256` が E2BIG のため上限は 255）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub const MAX_MSR_ENTRIES: usize = 255;
-    pub const KVM_CAP_IRQCHIP: u64 = 0;
-    pub const KVM_CAP_IRQFD: u64 = 32;
-    pub const KVM_CAP_IOEVENTFD: u64 = 36;
+    pub const KVM_CAP_IRQCHIP: super::KvmCap = super::KvmCap(0);
+    pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(32);
+    pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(36);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -226,12 +228,14 @@ pub(crate) mod consts {
     pub const MAP_NORESERVE: i32 = 0x4000;
     /// `MADV_DONTFORK`（`asm-generic/mman-common.h`）。
     pub const MADV_DONTFORK: i32 = 10;
+    /// `MADV_DONTDUMP`（`asm-generic/mman-common.h`。コアダンプからゲスト RAM を外す。#3679）。
+    pub const MADV_DONTDUMP: i32 = 16;
     /// `_IOW(KVMIO, 0xae, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_VCPU_INIT: u64 = super::iow(super::KVMIO, 0xAE, 32);
     /// `_IOR(KVMIO, 0xaf, struct kvm_vcpu_init)`（32 バイト）。
     pub const KVM_ARM_PREFERRED_TARGET: u64 = super::ior(super::KVMIO, 0xAF, 32);
     /// `KVM_CAP_ARM_PSCI_0_2`（v6.12 `linux/kvm.h`。#3896）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
-    pub const KVM_CAP_ARM_PSCI_0_2: u64 = 102;
+    pub const KVM_CAP_ARM_PSCI_0_2: super::KvmCap = super::KvmCap(102);
     /// `KVM_ARM_VCPU_PSCI_0_2`（v6.12 `asm/kvm.h`）。features の**ビット番号**でマスクではない（`1 << 値` で立てる）。
     pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
     /// `KVM_ARM_VCPU_POWER_OFF`（v6.12 `asm/kvm.h`。#3899）。features の**ビット番号**。立てた vCPU は `KVM_RUN` が
@@ -249,7 +253,7 @@ pub(crate) mod consts {
     pub const KVM_GET_ONE_REG: u64 = super::iow(super::KVMIO, 0xAB, 16);
     /// `_IOW(KVMIO, 0xac, struct kvm_one_reg)`（16 バイト）。
     pub const KVM_SET_ONE_REG: u64 = super::iow(super::KVMIO, 0xAC, 16);
-    pub const KVM_CAP_DEVICE_CTRL: u64 = 89;
+    pub const KVM_CAP_DEVICE_CTRL: super::KvmCap = super::KvmCap(89);
     /// `enum kvm_device_type` の `KVM_DEV_TYPE_ARM_VGIC_V3`（FSL_MPIC_20 = 1 から数えて 7）。
     pub const KVM_DEV_TYPE_ARM_VGIC_V3: u32 = 7;
     pub const KVM_DEV_ARM_VGIC_GRP_ADDR: u32 = 0;
@@ -267,9 +271,9 @@ pub(crate) mod consts {
     /// `_IOW(KVMIO, 0x79, struct kvm_ioeventfd)`（64 バイト）。
     pub const KVM_IOEVENTFD: u64 = super::iow(super::KVMIO, 0x79, 64);
     /// `KVM_CAP_IRQCHIP`（0。arm64 のカーネルは in-kernel vGIC を持てるとき 1 を返す。#3943）。
-    pub const KVM_CAP_IRQCHIP: u64 = 0;
-    pub const KVM_CAP_IRQFD: u64 = 32;
-    pub const KVM_CAP_IOEVENTFD: u64 = 36;
+    pub const KVM_CAP_IRQCHIP: super::KvmCap = super::KvmCap(0);
+    pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(32);
+    pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(36);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -301,11 +305,12 @@ pub(crate) mod consts {
     pub const MAP_ANONYMOUS: i32 = 0;
     pub const MAP_NORESERVE: i32 = 0;
     pub const MADV_DONTFORK: i32 = 0;
+    pub const MADV_DONTDUMP: i32 = 0;
     pub const KVM_CHECK_EXTENSION: u64 = 0;
     pub const KVM_IRQFD: u64 = 0;
     pub const KVM_IOEVENTFD: u64 = 0;
-    pub const KVM_CAP_IRQFD: u64 = 0;
-    pub const KVM_CAP_IOEVENTFD: u64 = 0;
+    pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(0);
+    pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(0);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 0;
@@ -329,7 +334,7 @@ const _: () = {
     assert!(std::mem::align_of::<KvmVcpuInit>() == 4);
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
-    assert!(consts::KVM_CAP_ARM_PSCI_0_2 == 102);
+    assert!(consts::KVM_CAP_ARM_PSCI_0_2.0 == 102);
     assert!(consts::KVM_ARM_VCPU_PSCI_0_2 == 2);
     assert!(consts::KVM_ARM_VCPU_POWER_OFF == 0);
 };
@@ -958,6 +963,9 @@ extern "C" fn kick_handler(_sig: i32) {}
 /// scope が戻る前（panic の巻き戻しを含む）に必ず join される。クロージャは対象スレッド自身の上で同期実行される
 /// ため、`KickTarget` が使われうる間、対象スレッドは終了も join もしておらず、`pthread_t` も再利用されない。
 ///
+/// 対応外の対象（`consts::SUPPORTED` が偽）では `pthread_self` を呼ばず値 0 を持つが、`kick` が `Unsupported` を
+/// 先に返すので使われない（#3679・P3-1）。
+///
 /// 退けた案: `!Send` の guard 借用で生存を表す案は `Box::leak` で `'static` にでき、`&Scope` 由来のライフタイム案は
 /// scoped thread が自分を途中で join できるため、どちらも健全にならない。外へ持ち出せないことの compile-fail
 /// 試験は置かない（trybuild は依存の追加で、doctest は private な `sys` に届かない）。
@@ -971,8 +979,14 @@ pub(crate) struct KickTarget<'a> {
 ///
 /// `crate::device` の `run_bounded` が、vCPU スレッド上で期限監視の scoped thread へ `KickTarget` を渡すために使う。
 pub(crate) fn with_current_thread<R>(f: impl for<'a> FnOnce(KickTarget<'a>) -> R) -> R {
-    // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
-    let thread = unsafe { pthread_self() };
+    // 宣言が合わない対象（`SUPPORTED` が偽）では FFI を呼ばない。そのときの値 0 は使われない（用途は `kick` の
+    // `pthread_kill` だけで、`kick` は `Unsupported` を先に返す）。
+    let thread = if consts::SUPPORTED {
+        // SAFETY: 引数なしで呼び出しスレッドの `pthread_t` を返すだけ。副作用・失敗は無い。
+        unsafe { pthread_self() }
+    } else {
+        0
+    };
     f(KickTarget {
         thread,
         _alive: std::marker::PhantomData,
@@ -1198,14 +1212,19 @@ pub(crate) fn eventfd_new() -> Result<OwnedFd, SysError> {
     Ok(unsafe { OwnedFd::from_raw_fd(r) })
 }
 
+/// `KVM_CHECK_EXTENSION` に渡せる `KVM_CAP_*` の番号（#3679・P3-6）。フィールドは `sys` の外から見えず、
+/// 任意の `u64` は作れない。値は `consts::KVM_CAP_*` だけが持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KvmCap(u64);
+
 /// `KVM_CHECK_EXTENSION`（KVM デバイス fd または VM fd）。戻り値は拡張の対応状況（0 は非対応）。
-pub(crate) fn kvm_check_extension(fd: BorrowedFd<'_>, cap: u64) -> Result<i32, SysError> {
+pub(crate) fn kvm_check_extension(fd: BorrowedFd<'_>, cap: KvmCap) -> Result<i32, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `fd` は借用中の生存 fd。`cap` は値渡しの `unsigned long` でポインタを含まず、
-    // カーネルはユーザー空間のメモリを読み書きしない（戻り値が結果）。
-    let r = unsafe { ioctl(fd.as_raw_fd(), consts::KVM_CHECK_EXTENSION, cap) };
+    // SAFETY: `fd` は借用中の生存 fd。`cap.0` は `KvmCap`（`KVM_CAP_*` の定数だけが作れる）の値渡しの
+    // `unsigned long` でポインタを含まず、カーネルはユーザー空間のメモリを読み書きしない（戻り値が結果）。
+    let r = unsafe { ioctl(fd.as_raw_fd(), consts::KVM_CHECK_EXTENSION, cap.0) };
     if r < 0 { Err(last_error()) } else { Ok(r) }
 }
 
@@ -1379,7 +1398,9 @@ pub(crate) struct KvmRunMap {
 unsafe impl Send for KvmRunMap {}
 // SAFETY: 上と同じ。共有参照から行うのは volatile の読み取りと、`immediate_exit`（オフセット 1）の
 // `AtomicU8` による読み書きだけで、後者は期限監視スレッドと同時でもデータ競合にならない。カーネルによる書き込みは
-// `&mut VcpuFd` 経由の `KVM_RUN` の間だけ。`write_from` は `&mut self` で排他的。
+// `&mut VcpuFd` 経由の `KVM_RUN` の間だけ。`write_from` は `&mut self` で排他的で、オフセット 1 には触らない。
+// 型では強制できない前提: `KVM_RUN` の実行中に `read_into` を呼ばない（カーネルの書き込みと volatile の読み取りが
+// 重なる）。実行中に `&KvmRunMap` へ触ってよいのは `run_bounded` の監視スレッドの `set_immediate_exit` だけ。
 unsafe impl Sync for KvmRunMap {}
 
 impl KvmRunMap {
@@ -1415,6 +1436,8 @@ impl KvmRunMap {
     }
 
     /// `off..off+buf.len()` を `buf` へ volatile でコピーする。範囲外・桁あふれは `Err`（添字アクセスをしない）。
+    ///
+    /// `KVM_RUN` の実行中は呼んではならない（カーネルの書き込みと重なる。型では強制できない前提。`Sync` の SAFETY を参照）。
     pub(crate) fn read_into(&self, off: usize, buf: &mut [u8]) -> Result<(), ()> {
         let end = off.checked_add(buf.len()).ok_or(())?;
         if end > self.len {
@@ -1422,7 +1445,8 @@ impl KvmRunMap {
         }
         for (i, b) in buf.iter_mut().enumerate() {
             // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
-            // マッピングは `self` の生存中有効。カーネルが並行して書き換えうるため参照を作らず volatile で 1 バイト読む。
+            // マッピングは `self` の生存中有効。呼び出しは `KVM_RUN` の外に限る（上の doc）ため、カーネルの書き込みと重ならない。
+            // 参照を作らず volatile で 1 バイト読む。
             // `immediate_exit` のバイトだけは期限監視スレッドが `AtomicU8` で書くため、atomic load で読む
             // （atomic と非 atomic のアクセスを混ぜない。u8 のためアラインは自明）。
             *b = unsafe {
@@ -1440,15 +1464,22 @@ impl KvmRunMap {
     /// `buf` を `off..off+buf.len()` へ volatile でコピーする（IN・MMIO read の応答の書き戻し。TASK-74.4.2）。
     /// 範囲外・桁あふれは `Err`。`&mut self` を要求するのは、`KVM_RUN` が `&mut VcpuFd` 経由でしか発行されず、
     /// 書き戻しとカーネルの `kvm_run` への書き込みが重ならないことを型で保つため。
+    ///
+    /// `immediate_exit`（オフセット 1）に重なる範囲は 1 バイトも書かずに `Err`（多重防御。#3679・P3-3）。
+    /// このバイトは `AtomicU8` で触る約束で、volatile の非 atomic 書き込みを混ぜない。空の範囲は何も書かず `Ok`。
     pub(crate) fn write_from(&mut self, off: usize, buf: &[u8]) -> Result<(), ()> {
         let end = off.checked_add(buf.len()).ok_or(())?;
         if end > self.len {
             return Err(());
         }
+        if off <= IMMEDIATE_EXIT_OFFSET && IMMEDIATE_EXIT_OFFSET < end {
+            return Err(());
+        }
         for (i, b) in buf.iter().enumerate() {
             // SAFETY: `off + i < end <= len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
             // マッピングは `self` の生存中有効で、PROT_WRITE で mmap 済み。`&mut self` のため `KVM_RUN` の実行中
-            // （カーネルが領域を書く間）には呼ばれず、参照を作らず volatile で 1 バイトだけ書く。
+            // （カーネルが領域を書く間）には呼ばれない。`immediate_exit` のバイトは上で除外済みで、参照を作らず volatile で
+            // 1 バイトだけ書く。
             unsafe { self.ptr.as_ptr().add(off + i).write_volatile(*b) };
         }
         Ok(())
@@ -1462,8 +1493,8 @@ impl KvmRunMap {
         }
         // SAFETY: `IMMEDIATE_EXIT_OFFSET < len` を上で検査済みで、`ptr` は `len` バイトのマッピングの先頭。
         // マッピングは `self` の生存中有効で、u8 のためアラインは自明。このバイトは KVM がユーザー空間の書き込みを
-        // 前提に読む ABI。Rust 側でこのバイトに触るのは、この atomic store と `read_into` の atomic load と、
-        // `&mut self` で排他的な `write_from` だけ（`&self` のこの関数とは重ならない）。SeqCst は呼び出し側の
+        // 前提に読む ABI。Rust 側でこのバイトに触るのは、この atomic store と `read_into` の atomic load だけ
+        // （`write_from` は範囲検査でこのバイトを拒否する）。SeqCst は呼び出し側の
         // `timed_out` の store と順序を揃え、その後の `KickTarget::kick` より前に見えることを保証する。
         // カーネル側の読み取り（READ_ONCE）は Rust のメモリモデルの外にある。
         unsafe {
@@ -1581,7 +1612,7 @@ fn set_user_memory_region(
     };
     // SAFETY: `vm` は借用中の生存 fd。`region` は `repr(C)` で 32 バイト（const assert 済み・ioctl 番号の
     // サイズ符号と一致）のローカルの借用で、カーネルはこの 32 バイトを読むだけで書かず、呼び出しは同期で完了して
-    // 戻り後にポインタを保持しない。`userspace_addr` の指す領域の寿命は `RegisteredPage` が維持する。
+    // 戻り後にポインタを保持しない。`userspace_addr` の指す領域の寿命は `RegisteredPage` と `RegisteredGuestRam`（`crate::microvm`）が維持する。
     let r = unsafe {
         ioctl(
             vm.as_raw_fd(),
@@ -1634,7 +1665,8 @@ impl Drop for RegisteredPage<'_> {
 /// 匿名 mmap で確保したゲスト RAM の所有型（TASK-75.1・MVM-1）。drop で munmap する。
 ///
 /// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` のゼロ埋め私有メモリで、`MADV_DONTFORK` により fork 先へ
-/// 引き継がない（ゲストメモリの内容を子プロセスへ漏らさない）。KVM へ登録した後はゲスト（vCPU）がいつでも
+/// 引き継がず（ゲストメモリの内容を子プロセスへ漏らさない）、`MADV_DONTDUMP` によりホストのコアダンプへ含めない
+/// （最大 16 GiB のゲスト内容をダンプへ漏らさない。#3679・SEC-4 周辺）。どちらかが失敗したら munmap して `Err`（fail-closed）。KVM へ登録した後はゲスト（vCPU）がいつでも
 /// 書き換えるため、`&[u8]` / `&mut [u8]` は作らず、範囲検査つきのバイト単位の volatile 読み書きだけで触る。
 /// 例外は virtqueue の共有 index（`avail.idx`・`used.idx`）用の整列した u16 の単一命令 volatile アクセス
 /// （`read_u16_le_aligned` / `write_u16_le_aligned`。#3862・MVM-1・MVM-5。tear を避けるため）。
@@ -1681,14 +1713,16 @@ impl GuestRamMap {
             let _ = unsafe { munmap(p, len) };
             return Err(SysError::NullMapping);
         };
-        // SAFETY: `ptr` / `len` は直前の mmap が返した領域そのもの。`MADV_DONTFORK` は領域を変更せず、fork 先に
-        // マッピングを作らない指示だけを行う。
-        let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, consts::MADV_DONTFORK) };
-        if r < 0 {
-            let e = last_error();
-            // SAFETY: 上の mmap が返した領域そのもので、まだ誰にも渡しておらず他に所有者がいない。
-            let _ = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), len) };
-            return Err(e);
+        for advice in [consts::MADV_DONTFORK, consts::MADV_DONTDUMP] {
+            // SAFETY: `ptr` / `len` は直前の mmap が返した領域そのもの。`MADV_DONTFORK` は fork 先にマッピングを作らず、
+            // `MADV_DONTDUMP` はコアダンプに含めない指示だけを行い、どちらも領域の内容・対応付けを変更しない。
+            let r = unsafe { madvise(ptr.as_ptr().cast::<c_void>(), len, advice) };
+            if r < 0 {
+                let e = last_error();
+                // SAFETY: 上の mmap が返した領域そのもので、まだ誰にも渡しておらず他に所有者がいない。
+                let _ = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), len) };
+                return Err(e);
+            }
         }
         Ok(GuestRamMap { ptr, len })
     }
@@ -2602,6 +2636,69 @@ mod tests {
         );
     }
 
+    /// MVM-1・#3679: `write_from` は `immediate_exit`（オフセット 1）に重なる範囲を、1 バイトも書かずに拒否する。
+    /// `/dev/zero` の `MAP_SHARED` は共有ゼロページで、KVM なしで `KvmRunMap` の経路を試せる。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn mvm1_3679_write_from_rejects_immediate_exit_overlap() {
+        use std::os::fd::AsFd as _;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/zero")
+            .unwrap();
+        let mut m = KvmRunMap::map(f.as_fd(), 4096).unwrap();
+        assert!(m.write_from(0, &[7, 8]).is_err());
+        assert!(m.write_from(1, &[9]).is_err());
+        let mut head = [0xFFu8; 3];
+        m.read_into(0, &mut head).unwrap();
+        assert_eq!(head, [0, 0, 0]);
+        assert!(m.write_from(0, &[5]).is_ok());
+        assert!(m.write_from(2, &[6]).is_ok());
+        assert!(m.write_from(1, &[]).is_ok());
+        m.read_into(0, &mut head).unwrap();
+        assert_eq!(head, [5, 0, 6]);
+        m.set_immediate_exit(true).unwrap();
+        assert!(m.write_from(1, &[0]).is_err());
+        m.read_into(0, &mut head).unwrap();
+        assert_eq!(head, [5, 1, 6]);
+    }
+
+    /// MVM-1・#3679: ゲスト RAM は fork 先へ引き継がれず（`dc`）、コアダンプにも含まれない（`dd`）。
+    #[cfg(all(
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn mvm1_3679_guest_ram_excluded_from_fork_and_core_dump() {
+        let m = GuestRamMap::map(8192).unwrap();
+        let addr = m.ptr.as_ptr() as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut in_range = false;
+        let mut flags: Option<&str> = None;
+        for line in smaps.lines() {
+            let head = line.split_whitespace().next().unwrap_or("");
+            if let Some((lo, hi)) = head.split_once('-')
+                && let (Ok(lo), Ok(hi)) =
+                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+            {
+                in_range = lo <= addr && addr < hi;
+                continue;
+            }
+            if in_range && line.starts_with("VmFlags:") {
+                flags = Some(line);
+                break;
+            }
+        }
+        let flags = flags.expect("VmFlags of the guest ram mapping");
+        let names: Vec<&str> = flags.split_whitespace().skip(1).collect();
+        assert!(names.contains(&"dc"), "{flags}");
+        assert!(names.contains(&"dd"), "{flags}");
+    }
+
     /// MVM-1: ゲストページへの書き込みの境界検査。
     #[test]
     fn guest_page_write_bounds() {
@@ -2623,8 +2720,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<KvmIrqfd>(), 32);
         assert_eq!(std::mem::size_of::<KvmIoeventfd>(), 64);
         assert_eq!(std::mem::offset_of!(KvmIoeventfd, len), 16);
-        assert_eq!(consts::KVM_CAP_IRQFD, 32);
-        assert_eq!(consts::KVM_CAP_IOEVENTFD, 36);
+        assert_eq!(consts::KVM_CAP_IRQFD.0, 32);
+        assert_eq!(consts::KVM_CAP_IOEVENTFD.0, 36);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2720,6 +2817,7 @@ mod tests {
         assert_eq!(consts::MAP_ANONYMOUS, 0x20);
         assert_eq!(consts::MAP_NORESERVE, 0x4000);
         assert_eq!(consts::MADV_DONTFORK, 10);
+        assert_eq!(consts::MADV_DONTDUMP, 16);
     }
 
     /// MVM-1・TASK-75.1: ゲスト RAM はゼロ埋めで、読み書きが往復し、範囲外・桁あふれは拒否される。
@@ -2813,7 +2911,7 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
     #[test]
     fn mvm1_3896_psci_0_2_constants_and_features() {
-        assert_eq!(consts::KVM_CAP_ARM_PSCI_0_2, 102);
+        assert_eq!(consts::KVM_CAP_ARM_PSCI_0_2.0, 102);
         assert_eq!(consts::KVM_ARM_VCPU_PSCI_0_2, 2);
         let init = with_psci_0_2(KvmVcpuInit {
             target: 5,
@@ -2865,7 +2963,7 @@ mod tests {
         assert_eq!(consts::KVM_GET_ONE_REG, 0x4010_AEAB);
         assert_eq!(consts::KVM_SET_ONE_REG, 0x4010_AEAC);
         assert_eq!(consts::KVM_DEV_TYPE_ARM_VGIC_V3, 7);
-        assert_eq!(consts::KVM_CAP_DEVICE_CTRL, 89);
+        assert_eq!(consts::KVM_CAP_DEVICE_CTRL.0, 89);
     }
 
     /// MVM-1・MVM-4・#3731: x86_64 起動用の ioctl 番号と上限の具体値。

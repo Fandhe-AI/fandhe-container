@@ -146,12 +146,13 @@ use crate::guest_memory::{
 };
 use crate::interrupt::IoEventSpec;
 use crate::interrupt::{
-    InterruptLine, IrqTrigger, LevelInterruptLine, NetRxPollOutcome, complete_block_notify,
-    complete_net_notify, poll_net_rx,
+    InterruptLine, IrqTrigger, LevelInterruptLine, complete_block_notify, complete_net_notify,
+    poll_net_rx,
 };
 use crate::irq::{IoEventFd, IrqFd};
 #[cfg(target_arch = "x86_64")]
 use crate::mptable_x86::{IsaIrqRoute, MpTableConfig, build_mp_table, write_mp_table};
+use crate::net_rx_poll::{NetRxPollReport, check_net_rx_poll_interval, poll_failure};
 use crate::smp_x86::SipiVector;
 #[cfg(target_arch = "x86_64")]
 use crate::smp_x86::{MpState, plan_vcpus, sipi_startup_range};
@@ -1237,43 +1238,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static, L, Q> Dev
         let mut report = NetRxPollReport::default();
         for dev in &self.net {
             let mut t = dev.transport.lock().map_err(|_| poisoned())?;
-            match poll_net_rx(&mut t, mem, &dev.line)? {
-                NetRxPollOutcome::Skipped(_) => report.skipped += 1,
-                NetRxPollOutcome::Polled(r) => {
-                    report.polled += 1;
-                    if let crate::interrupt::NetQueueStats::Rx(s) = r.stats {
-                        report.delivered = report.delivered.saturating_add(s.delivered);
-                    }
-                    report.completed = report.completed.saturating_add(r.stats.completed());
-                    if r.delivery == crate::interrupt::InterruptDelivery::Triggered {
-                        report.interrupts += 1;
-                    }
-                    if let Some(e) = r.queue_error {
-                        report.queue_error = Some(e);
-                        break;
-                    }
-                }
+            let outcome = poll_net_rx(&mut t, mem, &dev.line)?;
+            if report.record(outcome).is_break() {
+                break;
             }
         }
         Ok(report)
     }
-}
-
-/// [`DeviceBus::poll_net_rx`] の集計（crate 内。REPAIR-4）。
-#[derive(Debug, Default)]
-struct NetRxPollReport {
-    /// `process_rx` を呼んだデバイス数。
-    polled: u32,
-    /// 状態（未 activate・FAILED・キュー停止）で飛ばしたデバイス数。
-    skipped: u32,
-    /// used へ返した数の合計。
-    completed: u32,
-    /// ゲストのバッファへ配送したフレーム数の合計。
-    delivered: u32,
-    /// 注入した割り込みの回数。
-    interrupts: u32,
-    /// 最初に見つかったリング破損など（ゲスト起因）。
-    queue_error: Option<MicrovmError>,
 }
 
 /// 組み立て済みの microVM（VM fd・vCPU 群・登録済みゲストメモリ・virtio デバイス群）。
@@ -1825,21 +1796,14 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 /// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
 pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// 受信ポーラー（`NetRxPoller`）が backend のフレームを確かめる周期（#3742・MVM-1・REPAIR-5）。値は暫定。
-///
-/// `NetBackend::recv` は待たない API で到着通知を持たないため、周期で取り出す。受信遅延の上限になるので
-/// [`VCPU_POLL_INTERVAL`] より短くし、busy loop にしないため下限は 1ms（`NET_RX_POLL_INTERVAL_MIN`）。待ちは停止要求で即座に起きる。
-pub const NET_RX_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// 受信ポーラーの周期（`NET_RX_POLL_INTERVAL`。#3742）と範囲は OS 非依存の `net_rx_poll` へ移した（#4030）。公開パスは再公開で保つ。
+pub use crate::net_rx_poll::NET_RX_POLL_INTERVAL;
 /// ioeventfd の通知スレッド（`IoEventPoller`）が 1 回の `poll(2)` で待つ上限（#3698・MVM-1・REPAIR-5）。値は暫定。
 ///
 /// 通知は eventfd が発火した時点で `poll` が戻るので、この値は通知の遅延ではなく**停止要求の取り込みの遅延の上限**を決める
 /// （`StopSignal` を eventfd にしていないため、停止は各周回の先頭と `poll` の戻りで確かめる）。[`NET_RX_POLL_INTERVAL`] と同じ桁。
 /// アイドル時の起床は毎秒 100 回になる（CORE-7 の実測で問題になったら、停止要求で鳴る wake 用 eventfd へ置き換える。REPAIR-3）。
 pub const IOEVENT_WAIT_SLICE: Duration = Duration::from_millis(10);
-/// 受信ポーラーの周期の下限（0 による busy loop を防ぐ）。
-const NET_RX_POLL_INTERVAL_MIN: Duration = Duration::from_millis(1);
-/// 受信ポーラーの周期の上限（無期限に近い周期で受信が止まるのを防ぐ）。
-const NET_RX_POLL_INTERVAL_MAX: Duration = Duration::from_secs(1);
 /// [`RunningMicroVm::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。
 pub const STOP_DEADLINE_MAX: Duration = Duration::from_secs(60);
 /// [`RunningMicroVm`] が `stop` を経ずに drop されたときに、vCPU スレッドの終了を待つ上限。
@@ -2036,11 +2000,9 @@ struct NetRxPoller<S: NetRxPollTarget> {
 }
 
 impl<S: NetRxPollTarget> NetRxPoller<S> {
-    /// `interval` を `[NET_RX_POLL_INTERVAL_MIN, NET_RX_POLL_INTERVAL_MAX]` に検証して作る（範囲外は `InvalidArgument`）。
+    /// `interval` を `net_rx_poll::check_net_rx_poll_interval` の範囲に検証して作る（範囲外は `InvalidArgument`）。
     fn new(shared: Arc<Mutex<S>>, interval: Duration) -> Result<Self, MicrovmError> {
-        if !(NET_RX_POLL_INTERVAL_MIN..=NET_RX_POLL_INTERVAL_MAX).contains(&interval) {
-            return Err(invalid("net rx poll interval out of range"));
-        }
+        check_net_rx_poll_interval(interval)?;
         Ok(Self { shared, interval })
     }
 }
@@ -2054,12 +2016,8 @@ impl<S: NetRxPollTarget> VcpuLoopBody for NetRxPoller<S> {
             Ok(mut g) => g.poll_net_rx(),
             Err(_) => Err(poisoned()),
         };
-        let err = match result {
-            Ok(report) => match report.queue_error {
-                None => return LoopStep::Continue,
-                Some(e) => e,
-            },
-            Err(e) => e,
+        let Some(err) = poll_failure(result) else {
+            return LoopStep::Continue;
         };
         log_line(format_args!(
             "level=error op=microvm.net_rx_poll outcome=error code={}",
@@ -5041,6 +4999,7 @@ mod net_rx_tests {
 
     use super::*;
     use crate::guest_memory::{GuestAddress, HeapBacking};
+    use crate::net_rx_poll::{NET_RX_POLL_INTERVAL_MAX, NET_RX_POLL_INTERVAL_MIN};
     use crate::virtio_block::MemoryBlockBackend;
     use crate::virtio_mmio::{DeviceStatus, VirtioMmioTransport, reg};
     use crate::virtio_net::MemoryNetBackend;

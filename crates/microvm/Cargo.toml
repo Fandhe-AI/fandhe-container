@@ -1,5 +1,6 @@
 # #4040 で hvf::vcpu の停止の kick を HvfKick に戻し、WFI の起床の通知を停止経路から外す（依存は増やさない。unsafe なし）。
 # KVM 直接制御・最小 virtio デバイスモデル（Linux オプション。crate-naming.md の表 #8）。
+# #4030 で net_rx_poll（OS 非依存の受信ポーラー）を追加し hvf::microvm の start / stop へ結ぶ（依存は増やさない。unsafe なし）。
 # #4029 で interrupt に NetQueueNotifyRoute を追加し hvf::microvm の queue_notify_routes へ net を結ぶ（依存は増やさない。unsafe なし）。
 # #4027 で hvf::microvm の HvfVmParts.memory を GuestMemorySlot へ移す（依存は増やさない。unsafe なし）。
 # #4026 で interrupt に QueueNotifyRoute と BlockQueueNotifyRoute を追加し QueueNotifyReport を interrupt へ移す（依存は増やさない。unsafe なし）。

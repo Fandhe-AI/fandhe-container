@@ -556,6 +556,19 @@ impl ExecReady {
         }
     }
 
+    /// コンテナの devpts から pty を割り当てる（exec の `tty=true`。SUP-6・SEC-1・CRI-6・#3758）。
+    ///
+    /// 再適用（capability 削減・NNP・Landlock・seccomp）の **後** に、コマンドと同じ権利で開く（launch より
+    /// 広い権利を使わない）。照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で
+    /// 辿る（ホストの devpts は使わない）。`&self` なので証跡は消費せず、`/` の fd は外へ出さない。
+    /// 契約と手順は [`super::pty`] のモジュール doc。
+    pub fn allocate_pty(
+        &self,
+        size: super::WindowSize,
+    ) -> Result<(super::PtyMaster, super::PtySlave), ExecError> {
+        super::pty::allocate_in_root(std::os::fd::AsFd::as_fd(&self.carry.root), size)
+    }
+
     /// 単体テスト専用: 任意の材料から証跡を作る。本番ビルドには存在しない（crate 内の `cfg(test)` のみ）。
     #[cfg(test)]
     pub(super) fn for_test(root: OwnedFd, threads: ThreadCountSource, owner_pid: u32) -> Self {

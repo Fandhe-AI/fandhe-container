@@ -131,6 +131,7 @@ mod overlay_layers;
 mod path_lookup;
 mod path_masks;
 mod process;
+mod pty;
 mod reapply;
 mod rlimits;
 mod rootfs;
@@ -189,7 +190,7 @@ pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, Sealed
 pub use etc_mounts::{EtcFileMounts, EtcFileOutcome, EtcFilesReport, mount_etc_files};
 pub use exec_command::{
     ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_command_with_stdio,
-    spawn_exec_worker, spawn_exec_worker_with_listener,
+    spawn_exec_worker, spawn_exec_worker_with_listener, spawn_exec_worker_with_listener_and_pty,
 };
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
@@ -271,6 +272,12 @@ pub use process::{
     spawn_container_probe_with_devices, spawn_container_probe_with_seccomp_listener,
     spawn_container_probe_with_sysfs, spawn_container_probe_with_tmpfs_and_config_paths,
 };
+/// 結合試験専用（ホストの `/dev/ptmx` から割り当てる。コンテナの devpts ではない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use pty::open_host_pty_for_test;
+/// exec の pty の型（SUP-6・SEC-1・CRI-6・#3758）。契約はモジュール doc。
+pub use pty::{ExecPtyReceiver, ExecPtySender, PtyMaster, PtyReceipt, PtySlave, WindowSize};
 /// 結合試験 `tests/exec_setns_join.rs` 専用の再公開（SEC-5・CORE-6・#2770。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(all(feature = "exec-test-support", not(test)))]
 #[doc(hidden)]

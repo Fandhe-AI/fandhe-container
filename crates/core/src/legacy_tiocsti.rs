@@ -12,6 +12,11 @@
 //! seccomp で ioctl を request 単位で拒否する案 B は採らない（`seccomp` の引数を読まない拒否リストの契約を
 //! 変えないため）。本モジュールは観測だけを行い、結果で起動の可否・seccomp・capability・Landlock を変えない。
 //!
+//! 案 C の再確認（exec の pty の割り当て。#3758・SUP-6・SEC-1）: `tty=true` の exec の子は制御端末を持つが、それは
+//! コンテナ自身の devpts の pty の slave で、`TIOCSTI` が届くのはその pty の入力キューだけである（ホストの端末 fd は
+//! 渡さず、`setsid` で呼び出し側の制御端末から切り離す。前提 (2)(3) は維持される）。前提 (1)（子が制御端末を持たない）は
+//! tty の exec では変わるが、seccomp での request 単位の拒否（案 B）は #1658 の判断どおり採らない。
+//!
 //! # 結果の区別と出力
 //!
 //! 5 つの場合を [`LegacyTiocsti`] で区別する。警告を出すのは `1`（[`LegacyTiocsti::Enabled`]）のときだけで、

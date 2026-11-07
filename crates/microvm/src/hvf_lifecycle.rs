@@ -56,6 +56,18 @@ pub trait ReleaseDevices {
     fn release_devices(&mut self, deadline: Duration) -> Result<(), MicrovmError>;
 }
 
+/// ゲスト RAM の解放を期限つきで試みる口（`GuestMemorySlot` が実装する。REPAIR-5・MVM-5・#4092）。
+///
+/// vCPU の停止を確かめた後に呼ぶ。vCPU スレッドが RAM の lock を持ったまま戻らない場合に備え、取得は `deadline` で打ち切り、
+/// 取れなければリークして `DeadlineExceeded` を返す。
+pub trait ReleaseMemory {
+    /// `deadline` まで試みて RAM を手放す。手放せなければ（リークして）`DeadlineExceeded`。
+    fn release_memory(self, deadline: Duration) -> Result<(), MicrovmError>;
+}
+
+/// 停止確認後の RAM 取得に与える下限（停止の期限を使い切っていても、空いている lock の取得だけは試みる）。
+pub const MEMORY_RELEASE_MIN: Duration = Duration::from_millis(100);
+
 /// デバイスの解放を待つ期限（vCPU は停止済みなので、競合はデバイス操作の保持者だけ）。
 pub const DEVICE_RELEASE_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -102,6 +114,7 @@ pub fn stop_and_release<S, D, M, V>(
 where
     S: VcpuStopper,
     D: ReleaseDevices,
+    M: ReleaseMemory,
 {
     let invalid = deadline.is_zero() || deadline > VCPU_STOP_DEADLINE_MAX;
     let effective = if invalid {
@@ -121,15 +134,25 @@ where
         Ok(report) => match release_within(&mut devices, effective, started) {
             Ok(()) => {
                 drop(devices);
-                drop(memory);
-                drop(vm);
-                Ok(HvfStopReport {
-                    reason: report.reason,
-                    stats: report.stats,
-                    elapsed: report.elapsed,
-                    vcpu_count: u32::try_from(report.per_vcpu.len()).unwrap_or(u32::MAX),
-                    per_vcpu: report.per_vcpu.iter().map(|r| r.stats).collect(),
-                })
+                // vCPU は全台止まっているので lock は空いている。それでも取得は期限つき（REPAIR-5）。
+                let remaining = effective.saturating_sub(started.elapsed());
+                match memory.release_memory(remaining.max(MEMORY_RELEASE_MIN)) {
+                    Ok(()) => {
+                        drop(vm);
+                        Ok(HvfStopReport {
+                            reason: report.reason,
+                            stats: report.stats,
+                            elapsed: report.elapsed,
+                            vcpu_count: u32::try_from(report.per_vcpu.len()).unwrap_or(u32::MAX),
+                            per_vcpu: report.per_vcpu.iter().map(|r| r.stats).collect(),
+                        })
+                    }
+                    Err(e) => {
+                        // RAM の取得に失敗（リーク済み）。
+                        drop(vm);
+                        Err(e)
+                    }
+                }
             }
             Err(e) => {
                 // デバイス（backend）が dispatcher に残っている。デバイス → RAM → VM の順を守れないため RAM を解放しない。
@@ -240,6 +263,12 @@ mod tests {
 
     impl ReleaseDevices for Rec {
         fn release_devices(&mut self, _deadline: Duration) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+    }
+
+    impl ReleaseMemory for Rec {
+        fn release_memory(self, _deadline: Duration) -> Result<(), MicrovmError> {
             Ok(())
         }
     }
@@ -523,5 +552,52 @@ mod tests {
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
         assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
         let _ = release_tx.send(());
+    }
+
+    /// REPAIR-5・MVM-5・MVM-1・#4092: route が RAM の lock を持ったまま戻らない（応答しないバックエンド）状況でも、
+    /// stop は vCPU の停止と期限つきの RAM 取得で戻り、RAM を解放（drop）しない。
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn repair5_4092_stop_with_ram_lock_held_returns_near_deadline_and_leaks() {
+        use crate::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
+        use crate::guest_memory_slot::GuestMemorySlot;
+        let slot = GuestMemorySlot::new(
+            GuestMemory::new(GuestAddress::new(0x1000), HeapBacking::new(0x100).unwrap()).unwrap(),
+        );
+        let held = slot.clone();
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let _ = held.with_memory(|_| {
+                let _ = locked_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            });
+        });
+        locked_rx.recv().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: slot.clone(),
+            vm: Rec("vm", Arc::clone(&log)),
+        };
+        let t = std::time::Instant::now();
+        let e = stop_and_release(
+            "hvf.microvm.stop",
+            responsive(),
+            Duration::from_millis(50),
+            r,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            t.elapsed()
+        );
+        let _ = release_tx.send(());
+        h.join().unwrap();
+        // 中身は取り出されていない（リーク）。
+        assert!(slot.with_memory(|_| Ok(())).is_ok());
     }
 }

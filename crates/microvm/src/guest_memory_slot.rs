@@ -111,6 +111,50 @@ impl<M: GuestMemoryBacking> GuestMemorySlot<M> {
     }
 }
 
+impl<M: GuestMemoryBacking> GuestMemorySlot<M> {
+    /// [`Self::take_or_leak`] と同じだが、lock の取得を `deadline` で打ち切る（REPAIR-5・#4092）。
+    ///
+    /// lock を持つ vCPU がバックエンドの I/O で応答しない場合に、停止・drop が無期限に待たないためのもの。`try_lock` を
+    /// 1 ms 刻みで再試行し、期限を過ぎても取れなければ `Arc` を 1 つ `forget` して中身が drop されないようにし、
+    /// `DeadlineExceeded` を返す（fail-closed。ゲストがまだ書けうるメモリを解放しない）。毒化も同じくリークしてエラー。
+    /// `hvf_lifecycle::stop_and_release` が vCPU の停止を確かめた後に使う。
+    pub fn take_within(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Result<Option<GuestMemory<M>>, MicrovmError> {
+        use std::sync::TryLockError;
+        let start = std::time::Instant::now();
+        loop {
+            match self.inner.try_lock() {
+                Ok(mut guard) => return Ok(guard.take()),
+                Err(TryLockError::Poisoned(_)) => {
+                    std::mem::forget(self.clone());
+                    return Err(poisoned());
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if start.elapsed() >= deadline {
+                        std::mem::forget(self.clone());
+                        return Err(MicrovmError::new(
+                            MicrovmErrorCode::DeadlineExceeded,
+                            "guest memory lock not acquired before deadline",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+}
+
+impl<M: GuestMemoryBacking> crate::hvf_lifecycle::ReleaseMemory for GuestMemorySlot<M> {
+    /// 期限つきで中身を取り出して drop する。取れなければ（リークして）`DeadlineExceeded`。
+    fn release_memory(self, deadline: std::time::Duration) -> Result<(), MicrovmError> {
+        let taken = self.take_within(deadline)?;
+        drop(taken);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +310,43 @@ mod tests {
         assert_eq!(b, [5, 6, 7, 8]);
         assert!(s.take_or_leak().unwrap().is_none());
         assert_err(read4(&s).unwrap_err(), "guest memory is already released");
+    }
+
+    /// REPAIR-5・#4092: lock を持つ側が返らなくても `take_within` は期限で戻り、中身を drop しない。
+    #[test]
+    fn repair5_4092_take_within_times_out_while_locked_and_leaks() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let s = counting(&drops);
+        let c = s.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let _ = c.with_memory(|_| {
+                let _ = locked_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            });
+        });
+        locked_rx.recv().unwrap();
+        let t = std::time::Instant::now();
+        let e = s
+            .take_within(std::time::Duration::from_millis(30))
+            .err()
+            .unwrap();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        let _ = release_tx.send(());
+        h.join().unwrap();
+        drop(s);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repair5_4092_take_within_returns_contents_once_when_free() {
+        let s = slot();
+        let d = std::time::Duration::from_millis(50);
+        assert!(s.take_within(d).unwrap().is_some());
+        assert!(s.take_within(d).unwrap().is_none());
     }
 
     #[test]

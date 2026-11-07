@@ -44,13 +44,14 @@
 //! 3. 報告が `Ok` のときだけ、デバイス → ゲスト RAM（`hv_vm_unmap` に成功したら munmap。失敗ならリーク）→ VM（最後の `Arc` の drop が
 //!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
 //!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
-//!    ゲスト RAM は `GuestMemorySlot` が持ち、`release` が stop より前に `take_or_leak` で取り出して `stop_and_release` へ渡す
-//!    ので、順序と期限切れ時のリークは変わらない（#4027）。vCPU スレッドは virtio-block の
+//!    ゲスト RAM は `GuestMemorySlot` が持ち、`release` がスロットの clone を `stop_and_release` へ渡し、
+//!    vCPU の停止を確かめた後に `take_within` で期限つきに取り出す（#4027・#4092）。vCPU スレッドは virtio-block の
 //!    route 越しにスロットの clone を持つ（#4028 で結線済み）。停止の途中でブロック I/O を処理していた vCPU の `with_memory_mut` は
 //!    固定の RELEASED エラー（`Internal`）になり、その vCPU は `Failed(Internal)` で終わる（fail-closed。`Requested` にはならない）。
-//!    backing の unmap は停止の報告の後だけになる。`take_or_leak` は route 内でメモリの lock を持つ vCPU を待つが、待ちは
-//!    バックエンドの 1 回分の I/O で上限が決まる（`MemoryBlockBackend` はメモリのコピー。ファイルを backing にするバックエンドは
-//!    TASK-75 / TASK-117 で、そのときこの待ちの上限を見直す）。lock の毒化時は中身を解放せずリークする。
+//!    backing の unmap は停止の報告の後だけになる。route 内でメモリの lock を持つ vCPU がバックエンド I/O で応答しなくても、
+//!    stop は vCPU の停止待ちの期限で戻り（停止を確かめられなければ RAM をリーク）、RAM の取得も期限つきなので無期限には待たない
+//!    （REPAIR-5・#4092）。残余: route はバックエンド I/O の間 RAM の lock を持つ（I/O 中に lock を外す構造は、ファイルを
+//!    backing にするバックエンドを入れる TASK-75 / TASK-117 で見直す。REPAIR-3）。lock の毒化時は中身を解放せずリークする。
 //!    `assemble` が vCPU スレッドを作った後に失敗した場合は、全台を止めた後に assemble のスレッドでスロットを取り出して手放す（ゲートを
 //!    開けていないので安全。unmap と `hv_vm_destroy` を vCPU スレッドに担わせない）。
 //!
@@ -367,7 +368,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
     /// virtio-block の `QueueNotify` の処理（virtqueue の処理と完了の割り込み。#4028・MVM-5・MVM-1）。
     ///
     /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
-    /// clone で受け渡す（`HvfVmParts::release` が stop より前に `take_or_leak` するため、解放後の通知は `Internal` で fail-closed）。
+    /// clone で受け渡す（`HvfVmParts::release` が停止確認後に取り出すため、解放後の通知は `Internal` で fail-closed）。
     /// virtio-net の route は #4029 の担当で、それまで net は計数だけで続行する（REPAIR-3）。
     fn queue_notify_routes(
         &self,
@@ -426,7 +427,7 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     /// 各 vCPU の `MPIDR_EL1` の読み戻し（生の値。index 順）。
     mpidrs: Vec<u64>,
     devices: Option<HvfDeviceBus<B, N>>,
-    /// ゲスト RAM の所有。`release` が stop より前に `take_or_leak` で取り出す（#4027）。
+    /// ゲスト RAM の所有。`release` がスロットの clone を渡し、停止確認後に期限つきで取り出す（#4027・#4092）。
     memory: GuestMemorySlot<RegisteredHvfRam<'static>>,
     vm: Option<Arc<VmWithGic>>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
@@ -445,15 +446,12 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
         op: &'static str,
         deadline: Duration,
     ) -> Result<HvfStopReport, MicrovmError> {
-        // メモリは stop より前に取り出し、`stop_and_release` へ渡す（順序と期限切れ時のリークは従来のまま）。
-        // 毒化は今の lock の持ち主（`read_guest`・`take`）では起きない防御で、起きたら中身はリークする（fail-closed）。
-        let memory = self.memory.take_or_leak()?;
-        let (Some(vcpus), Some(devices), Some(memory), Some(vm)) = (
-            self.vcpus.take(),
-            self.devices.take(),
-            memory,
-            self.vm.take(),
-        ) else {
+        // RAM は stop より前に取り出さない（vCPU がバックエンド I/O 中に lock を持つと期限なしで待つため。REPAIR-5・#4092）。
+        // スロットの clone を渡し、`stop_and_release` が vCPU の停止を確かめた後に期限つきで取り出す。
+        // 停止・取得が失敗したら clone を `forget` してリークする（fail-closed）ので、この構造体の drop では解放されない。
+        let (Some(vcpus), Some(devices), Some(vm)) =
+            (self.vcpus.take(), self.devices.take(), self.vm.take())
+        else {
             return Err(MicrovmError::new(
                 MicrovmErrorCode::FailedPrecondition,
                 "microvm resources are already released",
@@ -465,7 +463,7 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
             deadline,
             Resources {
                 devices,
-                memory,
+                memory: self.memory.clone(),
                 vm,
             },
         )
@@ -682,8 +680,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
 /// ここで手放す（vCPU スレッドが route 越しに最後の `Arc` を持って unmap を行う形にしない。#4028）。
 fn abort_after_spawn(vcpu_set: VcpuSet, memory: &GuestMemorySlot<RegisteredHvfRam<'static>>) {
     let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
-    // 毒化は今の lock の持ち主では起きない防御で、起きたら中身はリークする（fail-closed）。
-    let _ = memory.take_or_leak();
+    // 全台停止済みなので lock は空いている。取得は期限つきで、失敗時は中身をリークする（fail-closed）。
+    let _ = memory.take_within(DROP_STOP_DEADLINE);
 }
 
 impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {

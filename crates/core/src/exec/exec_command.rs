@@ -89,7 +89,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 標準入出力の受け渡しのうち、CLI の exec と stdin。healthcheck の出力取得は実装済み
+//! - 標準入出力の受け渡しのうち、CLI の exec と stdin。pty（tty=true）は core の型と手順まで実装済み（`ExecReady::allocate_pty`・
+//!   `ChildStdio::from_pty_slave`・[`spawn_exec_worker_with_listener_and_pty`]。#3758）で、supervisor の `ExecStdio` への
+//!   結線は #3760・#3761。healthcheck の出力取得は実装済み
 //!   （[`spawn_exec_command_with_stdio`]。stdout・stderr を呼び出し側が渡した 1 本の fd へ付け替える。#2441）。
 //!   [`spawn_exec_command`] の既定は launch と同じく `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ
 //!   渡さない。fail-closed）
@@ -106,6 +108,7 @@ use super::process::{
     EXIT_SETUP_FAILED, ExecChildStep, exec_child_main, exec_status_pipe, read_exec_status,
     report_exec_child_failure,
 };
+use super::pty::{ExecPtyReceiver, ExecPtySender};
 use super::reapply::ExecReadyParts;
 use super::seccomp_listener::{
     ExecListenerReceiver, ExecListenerSender, exec_listener_pair, exec_sender_from,
@@ -522,6 +525,45 @@ where
     })?;
     // 親の子の端は上の closure の drop で閉じる（`fork_single_threaded` は親側で closure を drop する）。
     Ok((child, receiver))
+}
+
+/// [`spawn_exec_worker_with_listener`] に加えて、worker が pty の master を親へ渡す口を張る（`tty=true` の exec。
+/// SUP-6・SEC-1・CRI-6・#3758）。
+///
+/// 張り方は listener と同じ（`SOCK_SEQPACKET`・`SOCK_CLOEXEC`・親の端は `SO_PASSCRED` の別の socketpair）。worker は
+/// 継承した 2 本の親の端を **最初に** 閉じ、親は子の端を fork 直後に閉じる。worker は
+/// [`ExecReady::allocate_pty`](super::ExecReady::allocate_pty) で得た master を、**コマンドの fork より前に**
+/// [`ExecPtySender::hand_over`] で親へ送って閉じる（コマンドとその子孫に master を継承させない）。
+///
+/// 親の呼び出し順の契約: listener を受けた後、worker の終了を待つ **前** に [`ExecPtyReceiver::receive`] で master を
+/// 受ける。呼び出し元の要件・worker の中の制約は [`spawn_exec_worker`] と同じ。supervisor の `ExecStdio` への結線は
+/// #3760・#3761（REPAIR-3）。
+pub fn spawn_exec_worker_with_listener_and_pty<F>(
+    delivery: crate::seccomp::ErrnoDelivery,
+    worker: F,
+) -> Result<(ContainerChild, ExecListenerReceiver, ExecPtyReceiver), ExecError>
+where
+    F: FnOnce(ExecWorkerProof, ExecListenerSender, ExecPtySender) -> i32,
+{
+    let (receiver, child_end) = exec_listener_pair()?;
+    let (pty_parent, pty_child) = super::seccomp_listener::listener_socketpair()?;
+    let pty_receiver = ExecPtyReceiver::new(pty_parent);
+    let parent_fds = [receiver.raw_fd(), pty_receiver.raw_fd()];
+    let child = spawn_exec_worker(move |proof| {
+        // 継承した親の端 2 本の複製を閉じる（worker が自分宛てに送って偽装できないように）。
+        let closed = parent_fds
+            .iter()
+            .all(|fd| u32::try_from(*fd).is_ok_and(|n| sys::close_fd_number(n).is_ok()));
+        if !closed {
+            return EXIT_SETUP_FAILED;
+        }
+        worker(
+            proof,
+            exec_sender_from(child_end, delivery),
+            ExecPtySender::new(pty_child),
+        )
+    })?;
+    Ok((child, receiver, pty_receiver))
 }
 
 /// worker が保持する「親（`spawn_exec_worker` の呼び出し元）の pidfd」（fork で継承した fd の複製）。

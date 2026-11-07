@@ -147,6 +147,8 @@ mod tests {
     }
 
     /// 試験ごとの使い捨てディレクトリ（`src` に内容 `new` を置く）。
+    ///
+    /// 名前は `tag` と pid だけで決まるため、`tag` はプロセス内で一意にする（#4049・REPAIR-4）。
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fc-filecopy-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

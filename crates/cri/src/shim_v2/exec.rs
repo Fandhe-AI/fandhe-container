@@ -6,8 +6,13 @@
 //!
 //! 起動役 [`TaskExecLauncher`] は本モジュールで定義するだけで、本番の実装は無い（REPAIR-3）。`ContainerRuntime`
 //! （core）に exec は無く、本番の入口は supervisor の `run_command_with_pidfd` にあるが cri は依存しない
-//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は #803（TASK-62.7）で扱う（TASK-62.5 の #675 は ContainerRuntime 境界の接続までで、exec の起動役は含まない）。
-//! 差し込まれない既定の `TaskService` は `Exec` / `Start(exec_id)` を `UNIMPLEMENTED` で拒否する（fail-closed）。
+//! （PLUG-1 の境界を保つ）。supervisor への橋渡しと配線は未実装で、追跡 issue は #4053（TASK-62.7 の範囲。
+//! 閉じた #803 は ContainerRuntime 境界の接続までで、exec の起動役は含まない）。
+//! 差し込まれない既定の `TaskService` は `Exec` / `Start(exec_id)` と、`exec_id` つきの `State` / `Kill` / `Wait` /
+//! `Delete` を `UNIMPLEMENTED` で拒否する（fail-closed）。
+//!
+//! 起動した exec は [`TaskExecProcess`]（起動したそのプロセスだけを指すハンドル）として登録簿が保持し、
+//! `State` / `Kill` / `Wait` / `Delete`（`exec_id` つき。#3681）が [`ExecRegistry::snapshot`] 経由で引く。
 //!
 //! 外部入力（`Any` の JSON）は untrusted として検証する。受け付けない欄は黙って捨てず `UNIMPLEMENTED`、
 //! 未知の欄は `INVALID_ARGUMENT`。エラーは固定の英語文のみで、spec の中身や環境変数の値は返さない。
@@ -17,9 +22,10 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use fandhe_container_core::traits::ContainerId;
+use fandhe_container_core::traits::{ContainerId, Signal};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
@@ -33,7 +39,7 @@ use crate::error::CriError;
 pub const PROCESS_TYPE_URL: &str = "types.containerd.io/opencontainers/runtime-spec/1/Process";
 /// `Any.value`（JSON）の最大バイト数。復号の前に検査する。
 pub const MAX_EXEC_SPEC_BYTES: usize = 1 << 20;
-/// 1 コンテナあたりに登録できる exec の最大数。`Delete(exec_id)` による除去（#870）が入るまでの歯止め。
+/// 1 コンテナあたりに登録できる exec の最大数。`Delete(exec_id)` による除去は実装済みで、上限は無制限確保を防ぐために残す。
 pub const MAX_EXECS_PER_CONTAINER: usize = 64;
 /// 全コンテナ合計で登録できる exec の最大数。
 pub const MAX_EXECS_TOTAL: usize = 1024;
@@ -99,19 +105,100 @@ impl ExecProcessSpec {
     }
 }
 
+/// 起動済みの exec プロセスのハンドル（`State` / `Kill` / `Wait` / `Delete` が使う。CRI-5・CRI-1・REPAIR-5）。
+///
+/// [`TaskExecLauncher::launch`] が返し、登録簿が `Started` の間だけ保持する。
+///
+/// 契約:
+/// - 起動したそのプロセスだけを指す。PID の再利用で別プロセスへシグナルを送らない（本番の実装は pidfd 等を使う。SEC-1）。
+/// - 各メソッドは有界で、panic しない。
+/// - 終了後の [`Self::signal`] は `NOT_FOUND` を返す。
+/// - [`Self::wait_exit`] は期限で `Timeout`、取り消しで `Unavailable` を返し、有界の刻みで確認する（REPAIR-5）。
+/// - drop は資源の解放だけを行い、プロセスの停止は要求しない（コンテナ削除の purge で drop される）。
+///
+/// 本番の実装は無い（REPAIR-3）。
+pub trait TaskExecProcess: Send + Sync {
+    /// 起動したプロセスの PID（不明なら `None`）。
+    fn pid(&self) -> Option<NonZeroU32>;
+
+    /// 現在の状態を照会する。失敗は `Err`（呼び出し側は fail-closed で扱う）。
+    fn status(&self) -> Result<ExecProcessStatus, CriError>;
+
+    /// シグナルを送る。終了済みは `NOT_FOUND`。
+    fn signal(&self, signal: Signal) -> Result<(), CriError>;
+
+    /// 終了するまで `timeout` を上限に待ち、終了コード（不明なら `None`）を返す。
+    ///
+    /// 簡易実装（REPAIR-3）: 既定の本体は [`Self::status`] を `poll_interval` ごとに照会するだけで、
+    /// 終了通知は使わない。pidfd 等を持つ実装は上書きしてイベント駆動にしてよい（期限と取り消しは有界の刻みで守る）。
+    fn wait_exit(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<i32>, CriError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| CriError::internal("wait deadline overflow"))?;
+        loop {
+            if cancelled() {
+                return Err(CriError::unavailable("wait cancelled"));
+            }
+            if let ExecProcessStatus::Exited { code } = self.status()? {
+                return Ok(code);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(CriError::timeout("wait exceeded its deadline"));
+            }
+            let until = now + poll_interval.min(deadline - now);
+            if !sleep_until(until, cancelled) {
+                return Err(CriError::unavailable("wait cancelled"));
+            }
+        }
+    }
+}
+
+/// [`TaskExecProcess::status`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecProcessStatus {
+    /// 実行中。
+    Running,
+    /// 終了済み。`code` は終了コード（不明なら `None`）。
+    Exited {
+        /// 終了コード。
+        code: Option<i32>,
+    },
+}
+
+/// `until` まで有界の刻み（10 ミリ秒）で眠る。取り消されたら `false`。
+pub(super) fn sleep_until(until: Instant, cancelled: &dyn Fn() -> bool) -> bool {
+    const CANCEL_SLICE: Duration = Duration::from_millis(10);
+    loop {
+        if cancelled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return true;
+        }
+        std::thread::sleep(CANCEL_SLICE.min(until - now));
+    }
+}
+
 /// コンテナ内で exec プロセスを起動する役（`Start(exec_id)` から呼ばれる）。
 ///
 /// 契約:
 /// - 期限は実装側が持つ（REPAIR-5。`ContainerRuntime` と同じ。shim は期限を足さない）。
 /// - プロセスはコンテナの namespace・cgroup・seccomp・capability を継承する（SEC-1）。広げない。
 /// - `spec.user()` が `None` のときはコンテナの init と同じユーザーで動かす。
-/// - 戻り値は PID（不明なら `None`）。
+/// - 戻り値は起動したプロセスのハンドル [`TaskExecProcess`]。
 /// - shim は `Start` の直前にコンテナが Running かを再確認するが、確認から起動までの間に停止しうる。
-///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`。#803）。
-/// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残る（除去は #870 で `Delete(exec_id)`
-///   とあわせて扱う。コンテナ削除・exec 終了時の登録の除去も #870 の必須事項）。
+///   停止済みコンテナへの起動は実装側が拒否する（`FAILED_PRECONDITION`）。
+/// - panic しないこと。panic すると登録簿の状態が `Starting` のまま残り、コンテナのゲートも毒される
+///   （以後そのストライプは `INTERNAL`）。
 ///
-/// 本番の実装は無い（REPAIR-3。#803）。
+/// 本番の実装は無い（REPAIR-3。supervisor の exec 入口への橋渡しは追跡先は #4053）。
 pub trait TaskExecLauncher: Send + Sync {
     /// exec プロセスを起動する。
     fn launch(
@@ -119,7 +206,7 @@ pub trait TaskExecLauncher: Send + Sync {
         container: &ContainerId,
         exec_id: &ExecId,
         spec: &ExecProcessSpec,
-    ) -> Result<Option<NonZeroU32>, CriError>;
+    ) -> Result<Arc<dyn TaskExecProcess>, CriError>;
 }
 
 fn invalid(msg: &'static str) -> CriError {
@@ -257,11 +344,61 @@ pub fn parse_process_spec(any: &Any) -> Result<ExecProcessSpec, CriError> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ExecState {
     Created,
     Starting,
-    Started,
+    Started(Arc<dyn TaskExecProcess>),
+}
+
+/// ハンドルの中身は出さない（状態名だけ）。
+impl std::fmt::Debug for ExecState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Created => "Created",
+            Self::Starting => "Starting",
+            Self::Started(_) => "Started",
+        })
+    }
+}
+
+/// 登録簿の exec の段階（[`ExecRegistry::snapshot`] の結果）。
+#[derive(Clone)]
+pub enum ExecPhase {
+    /// 登録済みで未起動。
+    Created,
+    /// 起動役を呼び出し中。
+    Starting,
+    /// 起動済み。
+    Started {
+        /// 起動したプロセスのハンドル。
+        process: Arc<dyn TaskExecProcess>,
+    },
+}
+
+impl std::fmt::Debug for ExecPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Created => "Created",
+            Self::Starting => "Starting",
+            Self::Started { .. } => "Started",
+        })
+    }
+}
+
+/// ある時点の exec の段階と、登録固有のトークン（再登録の検出に使う）。
+#[derive(Debug, Clone)]
+pub struct ExecSnapshot {
+    /// 段階。
+    pub phase: ExecPhase,
+    token: u64,
+}
+
+impl ExecSnapshot {
+    /// 同じ登録の snapshot か（削除・再作成で別の登録になっていないか）。
+    pub fn is_same_registration(&self, other: &ExecSnapshot) -> bool {
+        self.token == other.token
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -400,38 +537,97 @@ impl ExecRegistry {
                     token: entry.token,
                 })
             }
-            ExecState::Starting | ExecState::Started => {
+            ExecState::Starting | ExecState::Started(_) => {
                 Err(CriError::failed_precondition("exec already started"))
             }
         }
     }
 
-    /// 起動の結果を反映する。成功は `Started`、失敗は `Created` へ戻して再試行できるようにする。
+    /// 起動の結果を反映する。ハンドルがあれば `Started`、`None`（失敗）は `Created` へ戻して再試行できるようにする。
     /// トークンが現在の登録と一致しなければ（削除・再作成で別の登録になった）何も書かない。
     pub fn finish_start(
         &self,
         container: &ContainerId,
         exec_id: &ExecId,
         ticket: &StartTicket,
-        ok: bool,
+        process: Option<Arc<dyn TaskExecProcess>>,
     ) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         if let Some(entry) = inner.map.get_mut(&key(container, exec_id))
             && entry.token == ticket.token
         {
-            entry.state = if ok {
-                ExecState::Started
-            } else {
-                ExecState::Created
+            entry.state = match process {
+                Some(p) => ExecState::Started(p),
+                None => ExecState::Created,
             };
         }
         Ok(())
+    }
+
+    /// 登録の段階を複製して返す（ロックを持ったままハンドルを呼ばせないため）。未登録は `NOT_FOUND`。
+    pub fn snapshot(
+        &self,
+        container: &ContainerId,
+        exec_id: &ExecId,
+    ) -> Result<ExecSnapshot, CriError> {
+        let inner = self.inner.lock().map_err(|_| poisoned())?;
+        let entry = inner
+            .map
+            .get(&key(container, exec_id))
+            .ok_or_else(|| CriError::not_found("exec not found"))?;
+        let phase = match &entry.state {
+            ExecState::Created => ExecPhase::Created,
+            ExecState::Starting => ExecPhase::Starting,
+            ExecState::Started(p) => ExecPhase::Started {
+                process: Arc::clone(p),
+            },
+        };
+        Ok(ExecSnapshot {
+            phase,
+            token: entry.token,
+        })
+    }
+
+    /// 登録を除去する（`Delete(exec_id)` が、コンテナのゲート保持中に呼ぶ）。未登録は `NOT_FOUND`。
+    pub fn remove(&self, container: &ContainerId, exec_id: &ExecId) -> Result<(), CriError> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        inner
+            .map
+            .remove(&key(container, exec_id))
+            .map(|_| ())
+            .ok_or_else(|| CriError::not_found("exec not found"))
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::CriErrorCode;
+
+    /// 状態を外から差し替えられる試験用ハンドル。
+    struct TestProc(Mutex<ExecProcessStatus>);
+
+    impl TestProc {
+        fn running() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(ExecProcessStatus::Running)))
+        }
+    }
+
+    impl TaskExecProcess for TestProc {
+        fn pid(&self) -> Option<NonZeroU32> {
+            NonZeroU32::new(42)
+        }
+        fn status(&self) -> Result<ExecProcessStatus, CriError> {
+            Ok(*self.0.lock().unwrap())
+        }
+        fn signal(&self, _: Signal) -> Result<(), CriError> {
+            Ok(())
+        }
+    }
+
+    fn some(p: &Arc<TestProc>) -> Option<Arc<dyn TaskExecProcess>> {
+        let p: Arc<dyn TaskExecProcess> = Arc::clone(p) as Arc<dyn TaskExecProcess>;
+        Some(p)
+    }
 
     fn any(json: &str) -> Any {
         Any {
@@ -586,9 +782,10 @@ mod tests {
             r.begin_start(&c, &e).unwrap_err().code(),
             CriErrorCode::FailedPrecondition
         );
-        r.finish_start(&c, &e, &t, false).unwrap();
+        r.finish_start(&c, &e, &t, None).unwrap();
         let t = r.begin_start(&c, &e).unwrap();
-        r.finish_start(&c, &e, &t, true).unwrap();
+        r.finish_start(&c, &e, &t, some(&TestProc::running()))
+            .unwrap();
         assert!(r.begin_start(&c, &e).is_err());
         for i in 1..MAX_EXECS_PER_CONTAINER {
             r.register(&c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
@@ -625,15 +822,17 @@ mod tests {
         );
         // 同じ ID で再登録した新しい登録へ、旧 launch の結果（成功・失敗とも）は書かれない。
         r.register(&c, &e, spec.clone()).unwrap();
-        r.finish_start(&c, &e, &old, true).unwrap();
+        r.finish_start(&c, &e, &old, some(&TestProc::running()))
+            .unwrap();
         let fresh = r.begin_start(&c, &e).unwrap();
-        r.finish_start(&c, &e, &old, false).unwrap();
+        r.finish_start(&c, &e, &old, None).unwrap();
         assert_eq!(
             r.begin_start(&c, &e).unwrap_err().code(),
             CriErrorCode::FailedPrecondition,
             "stale failure must not reset Starting"
         );
-        r.finish_start(&c, &e, &fresh, true).unwrap();
+        r.finish_start(&c, &e, &fresh, some(&TestProc::running()))
+            .unwrap();
         // 別コンテナの登録は purge の影響を受けない。
         assert_eq!(r.begin_start(&c2, &e).unwrap().spec, spec);
     }
@@ -645,5 +844,70 @@ mod tests {
         let c = ContainerId::new("c1").unwrap();
         drop(r.lock_container(&c).unwrap());
         drop(r.lock_container(&c).unwrap());
+    }
+
+    /// CRI-5: snapshot は段階を返し、remove は除去して NOT_FOUND に戻す。再登録は別トークン。
+    #[test]
+    fn cri5_3681_registry_snapshot_and_remove() {
+        let r = ExecRegistry::new();
+        let c = ContainerId::new("c1").unwrap();
+        let e = ExecId::new("e1").unwrap();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        assert_eq!(
+            r.snapshot(&c, &e).unwrap_err().code(),
+            CriErrorCode::NotFound
+        );
+        assert_eq!(r.remove(&c, &e).unwrap_err().message(), "exec not found");
+        r.register(&c, &e, spec.clone()).unwrap();
+        let s0 = r.snapshot(&c, &e).unwrap();
+        assert!(matches!(s0.phase, ExecPhase::Created));
+        let t = r.begin_start(&c, &e).unwrap();
+        assert!(matches!(
+            r.snapshot(&c, &e).unwrap().phase,
+            ExecPhase::Starting
+        ));
+        let p = TestProc::running();
+        r.finish_start(&c, &e, &t, some(&p)).unwrap();
+        let s1 = r.snapshot(&c, &e).unwrap();
+        assert!(s1.is_same_registration(&s0));
+        let ExecPhase::Started { process } = s1.phase else {
+            panic!("expected Started");
+        };
+        assert_eq!(process.pid(), NonZeroU32::new(42));
+        r.remove(&c, &e).unwrap();
+        assert_eq!(
+            r.snapshot(&c, &e).unwrap_err().code(),
+            CriErrorCode::NotFound
+        );
+        r.register(&c, &e, spec).unwrap();
+        assert!(!r.snapshot(&c, &e).unwrap().is_same_registration(&s0));
+    }
+
+    /// REPAIR-5: 既定の wait_exit は終了コード・期限・取り消しを具体値で返す。
+    #[test]
+    fn cri5_3681_process_wait_exit_default() {
+        let p = TestProc::running();
+        let ms = Duration::from_millis(5);
+        let e = p
+            .wait_exit(Duration::from_millis(40), ms, &|| false)
+            .unwrap_err();
+        assert_eq!(
+            (e.code(), e.message()),
+            (CriErrorCode::Timeout, "wait exceeded its deadline")
+        );
+        let e = p
+            .wait_exit(Duration::from_secs(10), ms, &|| true)
+            .unwrap_err();
+        assert_eq!(
+            (e.code(), e.message()),
+            (CriErrorCode::Unavailable, "wait cancelled")
+        );
+        *p.0.lock().unwrap() = ExecProcessStatus::Exited { code: Some(6) };
+        assert_eq!(
+            p.wait_exit(Duration::from_secs(10), ms, &|| false).unwrap(),
+            Some(6)
+        );
+        *p.0.lock().unwrap() = ExecProcessStatus::Exited { code: None };
+        assert_eq!(p.wait_exit(Duration::ZERO, ms, &|| false).unwrap(), None);
     }
 }

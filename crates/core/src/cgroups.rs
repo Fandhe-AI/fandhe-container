@@ -159,7 +159,8 @@ pub(crate) use exec_kill::{
     sweep_exec_children_at, validate_exec_child_name,
 };
 pub use recorded_scope::{
-    RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+    RecordedCgroupKill, RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+    kill_recorded_container_cgroup,
 };
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。

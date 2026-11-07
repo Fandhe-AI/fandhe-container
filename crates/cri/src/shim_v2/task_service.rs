@@ -6,22 +6,23 @@
 //! ttrpc の `Response.status` に載せる。
 //!
 //! 未対応の欄は黙って無視せず `UNIMPLEMENTED` で拒否する（fail-closed。REPAIR-3）:
-//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`・`exec_id`（Delete）。
-//! `Exec` と `Start(exec_id)` は [`TaskExecLauncher`] が差し込まれたときだけ動き、無ければ `UNIMPLEMENTED`（TASK-62.4）。
+//! `rootfs`・`options`・`terminal`・`stdin`/`stdout`/`stderr`・`checkpoint`/`parent_checkpoint`。
+//! `Exec`・`Start(exec_id)` と、`exec_id` つきの `State`・`Kill`・`Wait`・`Delete` は [`TaskExecLauncher`] が差し込まれた
+//! ときだけ動き、無ければ `UNIMPLEMENTED`（"exec_id is not supported"。何も登録できないため。TASK-62.4・#3681）。
 //! `rootfs` と `options`（型に持たない）は repeated / 入れ子の確保を避けるため、復号前に走査して拒否する。
 //!
 //! 検査の順序（Create）: 復号前の走査（rootfs → options）→ 復号 → id → bundle → terminal → stdio → checkpoint。
 //! 検査の順序（Exec）: 起動役の有無 → 復号 → id → exec_id → terminal / stdio → spec（type URL・上限・JSON・各欄）
 //! → コンテナが Running か → 登録（重複・上限）。起動は `Start(exec_id)` が行う（containerd の意味論）。
 //!
-//! Delete の検査の順序: 復号（repeated / `Any` の欄が無いので走査は不要）→ exec_id → id（アダプタ）。
+//! Delete の検査の順序: 復号（repeated / `Any` の欄が無いので走査は不要）→ exec_id があれば exec の経路 → id（アダプタ）。
 //! 手順は state（削除前の pid・終了コードを採る）→ `remove(force=false)`。containerd の Delete に force は
 //! 無く、実行中のコンテナは core の `FailedPrecondition`（9）で拒否される。応答の `exit_status` は
 //! 終了コード（不明は 255）、`exited_at` は停止済みで core が記録した終了検知時刻（未記録は未設定。#3682）。
 //! 既知の制約: state と remove の間に状態が変わりうる（その場合の `exit_status` は不正確）。pid のある
 //! `Created` は core の契約で force=false では削除できない。plugin 越しでは最悪 2 回分の待ちになる。
 //!
-//! Wait（TASK-62.3.2）の検査の順序: 復号 → exec_id（空以外は `UNIMPLEMENTED`）→ id（アダプタの state）。
+//! Wait（TASK-62.3.2）の検査の順序: 復号 → exec_id（空以外は exec の経路）→ id（アダプタの state）。
 //! `RuntimeAdapter::wait_exit`（core の `ContainerRuntime::wait_exit`）で `Stopped` を待ち、終了コードを返す。期限は
 //! `min(timeout_nano, WaitConfig::timeout)`（`timeout_nano` が 0 なら `WaitConfig` だけ）で、超えたら `DEADLINE_EXCEEDED`（4）。負の `timeout_nano` は runtime を呼ばずに 4。
 //! 未起動の `Created` は終了扱いにしない。照会のエラー（待ちの途中の削除による NOT_FOUND を含む）は再試行せず返す。
@@ -30,15 +31,33 @@
 //! Connect（TASK-62.6）: `id` をアダプタの state で確かめ、`shim_pid`（自プロセス）と `task_pid`（無ければ 0）を返す。`version` は空。
 //!
 //! State / Kill / Shutdown（TASK-62.7.2）:
-//! - State: `exec_id` 非空は `UNIMPLEMENTED`。状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
+//! - State: 状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
 //!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`exited_at` は STOPPED で core が記録した終了検知時刻だけ
 //!   （他の状態・未記録は未設定。値は壁時計で、誤差は wait の刻み程度。#3682）。`bundle`・stdio・`terminal` は
 //!   shim が持たないため空・未設定（REPAIR-3）。
-//! - Kill: `exec_id` 非空と `all = true` は `UNIMPLEMENTED`（core の kill は init プロセスにしか送れず、cgroup 全体へ送る経路が
-//!   無い。containerd の猶予切れ SIGKILL〔`WithKillAll`〕は未結線）。`signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。
-//!   停止済みは runc shim と同じく `NOT_FOUND`（"process already finished"）。state と kill の間の競合は core の応答をそのまま返す。
+//! - Kill: `signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。`all = true`
+//!   （containerd の `WithKillAll`）はコンテナの cgroup 全体へ `cgroup.kill` で送り（core の `KillTarget::AllProcesses`。
+//!   CRI-5・CORE-4）、SIGKILL 以外は `INVALID_ARGUMENT`。cgroup 配置の記録が無ければ `FAILED_PRECONDITION`（init だけへ
+//!   縮退しない）。cgroup が既に無い・空なら成功。停止済みは runc shim と同じく `NOT_FOUND`（"process already finished"）。state と kill の間の競合は core の応答をそのまま返す。
 //! - Shutdown: [`ShutdownSignal`] が差し込まれているときだけ動く。`now = true` かコンテナが残っていない（state が `NOT_FOUND`）とき
 //!   終了を要求し、コンテナが残っていれば何もせず成功を返す（runc shim と同じ）。state の他のエラーは終了せずに返す（fail-closed）。冪等。
+//!
+//! exec_id つきの State / Kill / Wait / Delete（#3681・CRI-5・CRI-1。`adapter` は呼ばず、`created` も触らない）:
+//! 検査の順序は 復号 → 起動役の有無 → `all`（Kill のみ）→ id → exec_id → signal の範囲（Kill のみ）→ 登録簿
+//! （未登録は `NOT_FOUND` "exec not found"）。段階と戻り値は containerd v2.1.4 の意味論に合わせる
+//! （`cmd/containerd-shim-runc-v2/task/service.go`・`process/exec.go`・`internal/cri/server/container_execsync.go`）:
+//! - State: 未起動（Created / Starting）は CREATED・pid 0、実行中は RUNNING・pid、終了済みは STOPPED・pid・終了コード
+//!   （不明・負値は 255）。応答の `id` は exec ID（runc と同じ。`exec_id` 欄は空）。
+//! - Kill: 未起動は `FAILED_PRECONDITION`（"process not created"）、終了済みは `NOT_FOUND`（"process already finished"）、
+//!   実行中は `TaskExecProcess::signal` の結果をそのまま返す。`exec_id` と `all = true` の組は `UNIMPLEMENTED` のまま
+//!   （runc の exec は `all` を無視するが、containerd v2.1.4 の `core/runtime/v2/process.go` は `all` を shim へ送らない。
+//!   未対応の欄を黙って無視しない〔REPAIR-3〕ため拒否を保つ。別のクライアントで必要になれば条件を外すだけで戻せる）。
+//! - Wait: containerd の CRI は `Wait` を `Start` より前に呼ぶ（ExecSync）ため、未起動は `Started` になるまで待ち、続けて終了を待つ。
+//!   期限は `min(timeout_nano, WaitConfig::timeout)` で、超えたら `DEADLINE_EXCEEDED`。待ち中に登録が除去・再作成されたら
+//!   `NOT_FOUND`（別登録へ乗り移らない）。`Started` を見つけた後はハンドルだけで待ち、Delete / purge が走っても終了コードを返す。
+//! - Delete: 未起動と終了済みは登録を除去して pid・終了コード（未起動は 0）を返す。実行中は `FAILED_PRECONDITION`
+//!   （"cannot delete a running process"）で除去しない。`status()` の失敗は除去せず返す（fail-closed）。コンテナのゲートを取り、
+//!   `Start(exec_id)` の起動と直列にする。State / Kill / Wait はゲートを取らない。
 //!
 //! 期限（REPAIR-5）: Wait は上記の期限を持つ。他のメソッドは `ContainerRuntime` の契約で実装側が期限を持ち、
 //! shim は追加の期限を設けない。socket の権限・peer UID の照合は #803（TASK-62.7）の範囲。
@@ -51,7 +70,10 @@ use std::time::Instant;
 
 use prost::Message;
 
-use super::exec::{ExecId, ExecRegistry, TaskExecLauncher, parse_process_spec};
+use super::exec::{
+    ExecId, ExecPhase, ExecProcessStatus, ExecRegistry, TaskExecLauncher, parse_process_spec,
+    sleep_until,
+};
 use super::message::{RpcStatus, count_top_level_field};
 use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
@@ -64,7 +86,7 @@ use super::task_api::{
 use super::wait::WaitConfig;
 use crate::adapter::{RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::error::{CriError, CriErrorCode};
-use fandhe_container_core::traits::ContainerId;
+use fandhe_container_core::traits::{ContainerId, Signal};
 
 /// `bundle` の最大バイト数（PATH_MAX 相当）。
 const BUNDLE_MAX_LEN: usize = 4096;
@@ -148,7 +170,7 @@ impl TaskService {
     fn state(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
         let req = StateRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
-            return Err(unsupported("exec_id is not supported"));
+            return self.state_exec(&req);
         }
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         let (status, exit_status) = match st.lifecycle {
@@ -168,6 +190,45 @@ impl TaskService {
         .encode_to_vec())
     }
 
+    /// `State(exec_id)`: 登録簿とハンドルから exec の状態を返す（#3681・CRI-5）。
+    fn state_exec(&self, req: &StateRequest) -> Result<Vec<u8>, RpcStatus> {
+        let (container, exec_id) = self.exec_target(&req.id, &req.exec_id)?;
+        let snap = self
+            .execs
+            .snapshot(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        let (status, pid, exit_status) = match snap.phase {
+            ExecPhase::Created | ExecPhase::Starting => (TaskStatus::Created, 0, 0),
+            ExecPhase::Started { process } => {
+                let pid = process.pid().map_or(0, NonZeroU32::get);
+                match process.status().map_err(|e| to_status(&e))? {
+                    ExecProcessStatus::Running => (TaskStatus::Running, pid, 0),
+                    ExecProcessStatus::Exited { code } => {
+                        (TaskStatus::Stopped, pid, exit_status_from_code(code))
+                    }
+                }
+            }
+        };
+        Ok(StateResponse {
+            id: req.exec_id.clone(),
+            pid,
+            status: status as i32,
+            exit_status,
+            ..Default::default()
+        }
+        .encode_to_vec())
+    }
+
+    /// exec 系 RPC の共通検証。起動役が無ければ `UNIMPLEMENTED`、続けて id・exec_id を検証する。
+    fn exec_target(&self, id: &str, exec_id: &str) -> Result<(ContainerId, ExecId), RpcStatus> {
+        if self.exec_launcher.is_none() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        let container = ContainerId::new(id).map_err(|e| to_status(&CriError::from(&e)))?;
+        let exec_id = ExecId::new(exec_id).map_err(|e| to_status(&e))?;
+        Ok((container, exec_id))
+    }
+
     /// `Connect`: shim デーモンと init プロセスの PID を返す（TASK-62.6・CRI-5）。
     ///
     /// containerd の `shimTask.PID` が Create の直後と Wait の前に呼び、失敗すると Create 全体が失敗する
@@ -183,25 +244,17 @@ impl TaskService {
         .encode_to_vec())
     }
 
-    /// `Kill`: init プロセスへシグナルを送る（TASK-62.7.2）。
+    /// `Kill`: init プロセス（`all = true` はコンテナの cgroup 全体）へシグナルを送る（TASK-62.7.2・CRI-5）。
     fn kill(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
         let req = KillRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
-            return Err(unsupported("exec_id is not supported"));
-        }
-        if req.all {
-            return Err(unsupported("kill all is not supported"));
+            return self.kill_exec(&req);
         }
         // 状態の照会より前に検証する（停止済み・不在の ID でも範囲外は INVALID_ARGUMENT）。
-        let signal = u8::try_from(req.signal)
-            .ok()
-            .filter(|n| (1..=64).contains(n))
-            .ok_or_else(|| {
-                RpcStatus::from_code(
-                    CriErrorCode::InvalidArgument,
-                    "signal number must be in 1..=64",
-                )
-            })?;
+        let signal = checked_signal(req.signal)?;
+        if req.all {
+            RuntimeAdapter::check_kill_all_signal(signal).map_err(|e| to_status(&e))?;
+        }
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         if st.lifecycle == RuntimeLifecycle::Stopped {
             return Err(RpcStatus::from_code(
@@ -209,10 +262,48 @@ impl TaskService {
                 "process already finished",
             ));
         }
-        self.adapter
-            .kill(&req.id, signal)
-            .map_err(|e| to_status(&e))?;
+        if req.all {
+            self.adapter
+                .kill_all(&req.id, signal)
+                .map_err(|e| to_status(&e))?;
+        } else {
+            self.adapter
+                .kill(&req.id, signal)
+                .map_err(|e| to_status(&e))?;
+        }
         Ok(Vec::new())
+    }
+
+    /// `Kill(exec_id)`: 実行中の exec プロセスへシグナルを送る（#3681・CRI-5）。
+    fn kill_exec(&self, req: &KillRequest) -> Result<Vec<u8>, RpcStatus> {
+        if self.exec_launcher.is_none() {
+            return Err(unsupported("exec_id is not supported"));
+        }
+        if req.all {
+            return Err(unsupported("kill all is not supported"));
+        }
+        let (container, exec_id) = self.exec_target(&req.id, &req.exec_id)?;
+        let signal =
+            Signal::new(checked_signal(req.signal)?).map_err(|e| to_status(&CriError::from(&e)))?;
+        let snap = self
+            .execs
+            .snapshot(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        let ExecPhase::Started { process } = snap.phase else {
+            return Err(to_status(&CriError::failed_precondition(
+                "process not created",
+            )));
+        };
+        match process.status().map_err(|e| to_status(&e))? {
+            ExecProcessStatus::Exited { .. } => Err(RpcStatus::from_code(
+                CriErrorCode::NotFound,
+                "process already finished",
+            )),
+            ExecProcessStatus::Running => {
+                process.signal(signal).map_err(|e| to_status(&e))?;
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// `Shutdown`: デーモンの終了を要求する（TASK-62.7.2）。コンテナが残っていれば何もしない。
@@ -318,11 +409,11 @@ impl TaskService {
             .map_err(|e| to_status(&e))?;
         let result = launcher.launch(&container, &exec_id, &ticket.spec);
         self.execs
-            .finish_start(&container, &exec_id, &ticket, result.is_ok())
+            .finish_start(&container, &exec_id, &ticket, result.as_ref().ok().cloned())
             .map_err(|e| to_status(&e))?;
-        let pid = result.map_err(|e| to_status(&e))?;
+        let process = result.map_err(|e| to_status(&e))?;
         Ok(StartResponse {
-            pid: pid.map_or(0, NonZeroU32::get),
+            pid: process.pid().map_or(0, NonZeroU32::get),
         }
         .encode_to_vec())
     }
@@ -384,7 +475,7 @@ impl TaskService {
     fn delete(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
         let req = DeleteRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
-            return Err(unsupported("exec_id is not supported"));
+            return self.delete_exec(&req);
         }
         // remove から purge までを同じコンテナの Exec / Start と排他する（CRI-5）。
         let container = ContainerId::new(&req.id).ok();
@@ -417,6 +508,105 @@ impl TaskService {
         .encode_to_vec())
     }
 
+    /// `Delete(exec_id)`: 未起動または終了済みの exec の登録を除去する（#3681・CRI-5）。
+    ///
+    /// コンテナのゲートを取り、`Start(exec_id)` の起動と直列にする（Created から Starting への遷移と除去が交差しない）。
+    /// ハンドルの照会はロック（登録簿の内部ロック）を持たずに行う。
+    fn delete_exec(&self, req: &DeleteRequest) -> Result<Vec<u8>, RpcStatus> {
+        let (container, exec_id) = self.exec_target(&req.id, &req.exec_id)?;
+        let _gate = self
+            .execs
+            .lock_container(&container)
+            .map_err(|e| to_status(&e))?;
+        let snap = self
+            .execs
+            .snapshot(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        let running = || {
+            to_status(&CriError::failed_precondition(
+                "cannot delete a running process",
+            ))
+        };
+        let (pid, exit_status) = match snap.phase {
+            ExecPhase::Created => (0, 0),
+            // ゲート保持中に Starting を見るのは起動役の panic で残った場合だけ。生きているかもしれないので除去しない。
+            ExecPhase::Starting => return Err(running()),
+            ExecPhase::Started { process } => match process.status().map_err(|e| to_status(&e))? {
+                ExecProcessStatus::Running => return Err(running()),
+                ExecProcessStatus::Exited { code } => (
+                    process.pid().map_or(0, NonZeroU32::get),
+                    exit_status_from_code(code),
+                ),
+            },
+        };
+        self.execs
+            .remove(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        Ok(DeleteResponse {
+            pid,
+            exit_status,
+            exited_at: None,
+        }
+        .encode_to_vec())
+    }
+
+    /// `Wait(exec_id)`: exec が起動して終了するまで待ち、終了コードを返す（#3681・CRI-5・CRI-1・REPAIR-5）。
+    ///
+    /// containerd の CRI は `Wait` を `Start` より前に呼ぶため、未起動の間は登録簿を刻みごとに見て `Started` を待つ。
+    /// ゲートは取らない（Kill / Delete を止めない）。`Started` になったらハンドルだけで待つ。
+    fn wait_exec(&self, req: &WaitRequest, ctx: &CallContext<'_>) -> Result<Vec<u8>, RpcStatus> {
+        let (container, exec_id) = self.exec_target(&req.id, &req.exec_id)?;
+        let deadline_exceeded = || to_status(&CriError::timeout("wait exceeded its deadline"));
+        let cancelled = || to_status(&CriError::unavailable("wait cancelled"));
+        let Some(timeout) = ctx
+            .deadline
+            .limit_from(Instant::now(), self.wait_config.timeout())
+        else {
+            return Err(deadline_exceeded());
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| to_status(&CriError::internal("wait deadline overflow")))?;
+        let poll = self.wait_config.poll_interval();
+        let first = self
+            .execs
+            .snapshot(&container, &exec_id)
+            .map_err(|e| to_status(&e))?;
+        let mut current = first.clone();
+        let process = loop {
+            if let ExecPhase::Started { process } = &current.phase {
+                break Arc::clone(process);
+            }
+            if (ctx.cancelled)() {
+                return Err(cancelled());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(deadline_exceeded());
+            }
+            if !sleep_until(now + poll.min(deadline - now), ctx.cancelled) {
+                return Err(cancelled());
+            }
+            current = self
+                .execs
+                .snapshot(&container, &exec_id)
+                .map_err(|e| to_status(&e))?;
+            // 削除・再作成で別の登録になったら乗り移らない。
+            if !current.is_same_registration(&first) {
+                return Err(to_status(&CriError::not_found("exec not found")));
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let code = process
+            .wait_exit(remaining, poll, ctx.cancelled)
+            .map_err(|e| to_status(&e))?;
+        Ok(WaitResponse {
+            exit_status: exit_status_from_code(code),
+            exited_at: None,
+        }
+        .encode_to_vec())
+    }
+
     /// `Wait`: コンテナが `Stopped` になるまで `RuntimeAdapter::wait_exit` で待ち、終了コードを返す
     /// （TASK-62.3.2・CRI-1）。
     ///
@@ -429,7 +619,7 @@ impl TaskService {
     fn wait(&self, payload: &[u8], ctx: &CallContext<'_>) -> Result<Vec<u8>, RpcStatus> {
         let req = WaitRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
-            return Err(unsupported("exec_id is not supported"));
+            return self.wait_exec(&req, ctx);
         }
         ContainerId::new(&req.id).map_err(|e| to_status(&CriError::from(&e)))?;
         let Some(timeout) = ctx
@@ -468,10 +658,26 @@ fn exited_at_of(status: &RuntimeContainerStatus) -> Option<Timestamp> {
 
 /// 停止済みの状態から `exit_status` を決める。終了コード不明・負値は 255。
 fn stopped_exit_status(status: &RuntimeContainerStatus) -> u32 {
-    status
-        .exit_code
-        .and_then(|c| u32::try_from(c).ok())
+    exit_status_from_code(status.exit_code)
+}
+
+/// 終了コードから `exit_status` を決める。不明・負値は 255。
+fn exit_status_from_code(code: Option<i32>) -> u32 {
+    code.and_then(|c| u32::try_from(c).ok())
         .unwrap_or(UNKNOWN_EXIT_STATUS)
+}
+
+/// `Kill.signal` を 1..=64 に検査する（範囲外は `INVALID_ARGUMENT`）。
+fn checked_signal(signal: u32) -> Result<u8, RpcStatus> {
+    u8::try_from(signal)
+        .ok()
+        .filter(|n| (1..=64).contains(n))
+        .ok_or_else(|| {
+            RpcStatus::from_code(
+                CriErrorCode::InvalidArgument,
+                "signal number must be in 1..=64",
+            )
+        })
 }
 
 /// 削除前の状態から `exit_status` を決める。未起動の Created は 0、終了コード不明・負値は 255。
@@ -577,7 +783,7 @@ mod tests {
         StartRequest as RtStart, StateRequest, StopRequest, TraitError,
     };
 
-    use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL};
+    use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL, TaskExecProcess};
     use super::super::service::RequestDeadline;
     use super::super::task_api::{
         Any, ConnectRequest, ConnectResponse, KillRequest as WireKill, Mount,
@@ -639,11 +845,12 @@ mod tests {
         }
         fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
             let id = r.id().as_str().to_owned();
-            self.0
-                .calls
-                .lock()
-                .unwrap()
-                .push(format!("kill {id} {}", r.signal().as_u8()));
+            self.0.calls.lock().unwrap().push(match r.target() {
+                fandhe_container_core::traits::KillTarget::AllProcesses => {
+                    format!("kill-all {id} {}", r.signal().as_u8())
+                }
+                _ => format!("kill {id} {}", r.signal().as_u8()),
+            });
             Ok(ContainerStatus::running(
                 r.id().clone(),
                 NonZeroU32::new(4242),
@@ -688,11 +895,55 @@ mod tests {
         }
     }
 
-    /// 引数を記録する偽の起動役。
+    /// 終了を外から注入でき、受けたシグナルを記録する偽の exec プロセス。
+    #[derive(Default)]
+    struct FakeProc {
+        pid: Option<NonZeroU32>,
+        status: Mutex<Option<ExecProcessStatus>>,
+        signals: Mutex<Vec<u8>>,
+        status_fails: Mutex<bool>,
+    }
+
+    impl FakeProc {
+        fn new(pid: u32) -> Arc<Self> {
+            Arc::new(Self {
+                pid: NonZeroU32::new(pid),
+                ..Default::default()
+            })
+        }
+        fn exit(&self, code: Option<i32>) {
+            *self.status.lock().unwrap() = Some(ExecProcessStatus::Exited { code });
+        }
+    }
+
+    impl TaskExecProcess for FakeProc {
+        fn pid(&self) -> Option<NonZeroU32> {
+            self.pid
+        }
+        fn status(&self) -> Result<ExecProcessStatus, CriError> {
+            if *self.status_fails.lock().unwrap() {
+                return Err(CriError::unavailable("status failed"));
+            }
+            Ok((*self.status.lock().unwrap()).unwrap_or(ExecProcessStatus::Running))
+        }
+        fn signal(&self, signal: Signal) -> Result<(), CriError> {
+            self.signals.lock().unwrap().push(signal.as_u8());
+            Ok(())
+        }
+    }
+
+    /// 引数を記録する偽の起動役。起動したプロセスは `last` から引ける。
     #[derive(Default)]
     struct FakeLauncher {
         launched: Mutex<Vec<(String, String, ExecProcessSpec)>>,
+        procs: Mutex<Vec<Arc<FakeProc>>>,
         fail: Mutex<bool>,
+    }
+
+    impl FakeLauncher {
+        fn last(&self) -> Arc<FakeProc> {
+            Arc::clone(self.procs.lock().unwrap().last().unwrap())
+        }
     }
 
     impl TaskExecLauncher for FakeLauncher {
@@ -701,7 +952,7 @@ mod tests {
             c: &ContainerId,
             e: &ExecId,
             s: &ExecProcessSpec,
-        ) -> Result<Option<NonZeroU32>, CriError> {
+        ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
             if *self.fail.lock().unwrap() {
                 return Err(CriError::unavailable("launch failed"));
             }
@@ -709,7 +960,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((c.as_str().into(), e.as_str().into(), s.clone()));
-            Ok(NonZeroU32::new(5151))
+            let p = FakeProc::new(5151);
+            self.procs.lock().unwrap().push(Arc::clone(&p));
+            Ok(p)
         }
     }
 
@@ -981,13 +1234,13 @@ mod tests {
                 _c: &ContainerId,
                 _e: &ExecId,
                 _s: &ExecProcessSpec,
-            ) -> Result<Option<NonZeroU32>, CriError> {
+            ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
                 // 起動中に init が停止した場面を作ってから Delete を走らせる。
                 stopped(&self.fake, "c1", Some(0));
                 self.entered.lock().unwrap().send(()).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 self.events.lock().unwrap().push("launch-end");
-                Ok(NonZeroU32::new(5151))
+                Ok(FakeProc::new(5151))
             }
         }
         let (s, f) = svc(TaskApiVersion::V2, Fake::default());
@@ -1198,8 +1451,24 @@ mod tests {
                 "{sig}"
             );
         }
-        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
-        assert_eq!((code, msg.as_str()), (UNIMPL, "kill all is not supported"));
+        // all=true は SIGKILL だけを cgroup 全体へ送る。SIGKILL 以外は状態照会より前に拒否。
+        s.handle("Kill", &kill_req("c1", 9, true, "")).unwrap();
+        assert_eq!(f.calls.lock().unwrap().last().unwrap(), "kill-all c1 9");
+        for sig in [1u32, 15, 64] {
+            let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", sig, true, "")));
+            assert_eq!(
+                (code, msg.as_str()),
+                (INVALID, "kill all supports only SIGKILL")
+            );
+        }
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 15, true, ""))).0,
+            INVALID
+        );
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 9, true, ""))).0,
+            NOT_FOUND
+        );
         let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e")));
         assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
         assert_eq!(
@@ -1207,7 +1476,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c.starts_with("kill"))
+                .filter(|c| c.starts_with("kill "))
                 .count(),
             3
         );
@@ -2041,5 +2310,446 @@ mod tests {
         );
         let (code, _msg) = err_code(wait_with(&s, RequestDeadline::None, &|| false));
         assert_eq!(code, 13);
+    }
+
+    // ---- exec_id つきの State / Kill / Wait / Delete（#3681・CRI-5・CRI-1・REPAIR-5）----
+
+    fn state_exec_req(id: &str, eid: &str) -> Vec<u8> {
+        WireState {
+            id: id.into(),
+            exec_id: eid.into(),
+        }
+        .encode_to_vec()
+    }
+
+    fn state_exec_of(s: &TaskService, id: &str, eid: &str) -> StateResponse {
+        let out = s.handle("State", &state_exec_req(id, eid)).unwrap();
+        StateResponse::decode(&out[..]).unwrap()
+    }
+
+    /// Running のコンテナに exec を登録する（未起動）。
+    fn registered(version: TaskApiVersion) -> (TaskService, Arc<Fake>, Arc<FakeLauncher>) {
+        let (s, f, l) = svc_exec(version);
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        (s, f, l)
+    }
+
+    /// Running のコンテナで exec を起動済みにする。
+    fn started(version: TaskApiVersion) -> (TaskService, Arc<Fake>, Arc<FakeLauncher>) {
+        let (s, f, l) = registered(version);
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        (s, f, l)
+    }
+
+    fn wait_exec_req(eid: &str) -> Vec<u8> {
+        wait_req("c1", eid)
+    }
+
+    fn wait_exit_of(r: Result<Vec<u8>, RpcStatus>) -> u32 {
+        WaitResponse::decode(&r.unwrap()[..]).unwrap().exit_status
+    }
+
+    fn wait_exec_with(
+        s: &TaskService,
+        deadline: RequestDeadline,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, RpcStatus> {
+        let ctx = CallContext::new(cancelled, deadline);
+        s.handle_with_context("Wait", &wait_exec_req("e1"), &ctx)
+    }
+
+    /// CRI-5: State(exec_id) は Created・実行中・終了済みを具体値で返す。id は exec ID、exec_id 欄は空。
+    #[test]
+    fn cri5_3681_state_exec_reports_each_status() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f, l) = registered(v);
+            let r = state_exec_of(&s, "c1", "e1");
+            assert_eq!(
+                (
+                    r.id.as_str(),
+                    r.pid,
+                    r.status,
+                    r.exit_status,
+                    r.exec_id.as_str()
+                ),
+                ("e1", 0, TaskStatus::Created as i32, 0, "")
+            );
+            s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+            let r = state_exec_of(&s, "c1", "e1");
+            assert_eq!(
+                (r.id.as_str(), r.pid, r.status, r.exit_status),
+                ("e1", 5151, TaskStatus::Running as i32, 0)
+            );
+            l.last().exit(Some(3));
+            let r = state_exec_of(&s, "c1", "e1");
+            assert_eq!(
+                (r.pid, r.status, r.exit_status),
+                (5151, TaskStatus::Stopped as i32, 3)
+            );
+            l.last().exit(None);
+            assert_eq!(state_exec_of(&s, "c1", "e1").exit_status, 255);
+            l.last().exit(Some(-1));
+            assert_eq!(state_exec_of(&s, "c1", "e1").exit_status, 255);
+            // exec の経路はランタイムを触らない。
+            assert!(
+                !f.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.starts_with("kill"))
+            );
+        }
+    }
+
+    /// CRI-5: Kill(exec_id) はシグナルを送り、範囲外・未起動・終了済みを具体値で拒否する。
+    #[test]
+    fn cri5_3681_kill_exec_signals_process() {
+        let (s, f, l) = registered(TaskApiVersion::V2);
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e1")));
+        assert_eq!((code, msg.as_str()), (PRECOND, "process not created"));
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        let out = s.handle("Kill", &kill_req("c1", 15, false, "e1")).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(*l.last().signals.lock().unwrap(), vec![15]);
+        for bad in [0, 65] {
+            let (code, _) = err_code(s.handle("Kill", &kill_req("c1", bad, false, "e1")));
+            assert_eq!(code, INVALID);
+        }
+        l.last().exit(Some(0));
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e1")));
+        assert_eq!(
+            (code, msg.as_str()),
+            (NOT_FOUND, "process already finished")
+        );
+        assert_eq!(*l.last().signals.lock().unwrap(), vec![15]);
+        assert!(
+            !f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("kill"))
+        );
+    }
+
+    /// CRI-5: exec_id と all の組は UNIMPLEMENTED で、シグナルは送られない（containerd は exec に all を送らない）。
+    #[test]
+    fn cri5_3681_kill_exec_all_is_rejected() {
+        let (s, _, l) = started(TaskApiVersion::V2);
+        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "e1")));
+        assert_eq!((code, msg.as_str()), (UNIMPL, "kill all is not supported"));
+        assert!(l.last().signals.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5: Wait(exec_id) は終了コードを返す（不明は 255）。
+    #[test]
+    fn cri5_3681_wait_exec_returns_exit_status() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, _, l) = started(v);
+            let s = fast_wait(s, 5_000);
+            l.last().exit(Some(3));
+            assert_eq!(wait_exit_of(s.handle("Wait", &wait_exec_req("e1"))), 3);
+            l.last().exit(None);
+            assert_eq!(wait_exit_of(s.handle("Wait", &wait_exec_req("e1"))), 255);
+        }
+    }
+
+    /// CRI-5: Wait は Start の前に呼ばれてもよい（ExecSync の順序）。Start 後の終了で戻る。
+    #[test]
+    fn cri5_3681_wait_exec_before_start() {
+        let (s, _, l) = registered(TaskApiVersion::V2);
+        let s = fast_wait(s, 10_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|sc| {
+            let w = sc.spawn(|| {
+                tx.send(()).unwrap();
+                s.handle("Wait", &wait_exec_req("e1"))
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+            l.last().exit(Some(7));
+            assert_eq!(wait_exit_of(w.join().unwrap()), 7);
+        });
+    }
+
+    /// REPAIR-5: Wait(exec_id) の期限切れは DEADLINE_EXCEEDED（未起動・起動済みの両方）。
+    /// 期限切れ済みの要求は登録簿を見ずに 4（未登録でも 4）。
+    #[test]
+    fn cri5_3681_wait_exec_deadline() {
+        let (s, _, _) = registered(TaskApiVersion::V2);
+        let s = fast_wait(s, 60);
+        let (code, msg) = err_code(s.handle("Wait", &wait_exec_req("e1")));
+        assert_eq!(
+            (code, msg.as_str()),
+            (DEADLINE, "wait exceeded its deadline")
+        );
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        let (code, msg) = err_code(s.handle("Wait", &wait_exec_req("e1")));
+        assert_eq!(
+            (code, msg.as_str()),
+            (DEADLINE, "wait exceeded its deadline")
+        );
+        let (code, _) = err_code(wait_exec_with(&s, RequestDeadline::Expired, &|| false));
+        assert_eq!(code, DEADLINE);
+        let (code, _) = err_code(s.handle_with_context(
+            "Wait",
+            &wait_req("c1", "nope"),
+            &CallContext::new(&|| false, RequestDeadline::Expired),
+        ));
+        assert_eq!(code, DEADLINE);
+    }
+
+    /// REPAIR-5: 取り消しは UNAVAILABLE（未起動・起動済みの両方）。
+    #[test]
+    fn cri5_3681_wait_exec_cancelled() {
+        let (s, _, _) = registered(TaskApiVersion::V2);
+        let s = fast_wait(s, 10_000);
+        for phase in 0..2 {
+            if phase == 1 {
+                s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+            }
+            let flag = std::sync::atomic::AtomicBool::new(false);
+            let cancelled = || flag.load(std::sync::atomic::Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            let r = std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                wait_exec_with(&s, RequestDeadline::None, &cancelled)
+            });
+            let (code, msg) = err_code(r);
+            assert_eq!((code, msg.as_str()), (UNAVAILABLE, "wait cancelled"));
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    /// CRI-5: 未起動の待ち中に登録が除去・再作成されたら NOT_FOUND（別の登録へ乗り移らない）。
+    #[test]
+    fn cri5_3681_wait_exec_registration_replaced() {
+        let (s, _, _) = registered(TaskApiVersion::V2);
+        let s = fast_wait(s, 10_000);
+        for recreate in [false, true] {
+            let r = std::thread::scope(|sc| {
+                let w = sc.spawn(|| s.handle("Wait", &wait_exec_req("e1")));
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+                if recreate {
+                    s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+                }
+                w.join().unwrap()
+            });
+            let (code, msg) = err_code(r);
+            assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"));
+            if !recreate {
+                s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+            }
+            s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+            s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        }
+    }
+
+    /// CRI-5: 起動済みの exec を待っている間に Delete(exec_id) されても、Wait は終了コードを返す。
+    #[test]
+    fn cri5_3681_wait_exec_survives_delete() {
+        let (s, _, l) = started(TaskApiVersion::V2);
+        let s = fast_wait(s, 10_000);
+        std::thread::scope(|sc| {
+            let w = sc.spawn(|| s.handle("Wait", &wait_exec_req("e1")));
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            l.last().exit(Some(4));
+            // Wait が Started を掴んだ後でも、除去後でも終了コードは返る。
+            s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+            assert_eq!(wait_exit_of(w.join().unwrap()), 4);
+        });
+    }
+
+    /// CRI-5: Delete(exec_id) は段階ごとの戻り値を返し、除去後はすべての RPC が NOT_FOUND。
+    #[test]
+    fn cri5_3681_delete_exec_each_status() {
+        let (s, f, l) = registered(TaskApiVersion::V2);
+        // Created は除去して pid 0・exit 0。
+        let out = s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+        let r = DeleteResponse::decode(&out[..]).unwrap();
+        assert_eq!((r.pid, r.exit_status), (0, 0));
+        // 実行中は拒否して残る。
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e1")).unwrap();
+        let (code, msg) = err_code(s.handle("Delete", &delete_req("c1", "e1")));
+        assert_eq!(
+            (code, msg.as_str()),
+            (PRECOND, "cannot delete a running process")
+        );
+        assert_eq!(
+            state_exec_of(&s, "c1", "e1").status,
+            TaskStatus::Running as i32
+        );
+        // 終了済みは pid と終了コードを返して除去。
+        l.last().exit(Some(3));
+        let out = s.handle("Delete", &delete_req("c1", "e1")).unwrap();
+        let r = DeleteResponse::decode(&out[..]).unwrap();
+        assert_eq!((r.pid, r.exit_status), (5151, 3));
+        assert!(r.exited_at.is_none());
+        // 除去後はすべて NOT_FOUND。
+        let calls: [(&str, Vec<u8>); 4] = [
+            ("State", state_exec_req("c1", "e1")),
+            ("Kill", kill_req("c1", 9, false, "e1")),
+            ("Wait", wait_exec_req("e1")),
+            ("Delete", delete_req("c1", "e1")),
+        ];
+        for (m, req) in calls {
+            let (code, msg) = err_code(s.handle(m, &req));
+            assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"), "{m}");
+        }
+        // コンテナの状態は変わらず、ランタイムの delete は呼ばれない。
+        assert_eq!(state_of(&s, "c1").status, TaskStatus::Running as i32);
+        assert!(
+            !f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("delete"))
+        );
+    }
+
+    /// CRI-5: Delete(exec_id) で上限が回復し、同じ exec_id を再登録できる。
+    #[test]
+    fn cri5_3681_delete_exec_recovers_limit() {
+        let (s, _, _) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        for i in 0..super::super::exec::MAX_EXECS_PER_CONTAINER {
+            s.handle("Exec", &exec_req("c1", &format!("e{i}"), SPEC))
+                .unwrap();
+        }
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("c1", "over", SPEC))).0,
+            RESOURCE_EXHAUSTED
+        );
+        s.handle("Delete", &delete_req("c1", "e0")).unwrap();
+        s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+    }
+
+    /// REPAIR-5・fail-closed: status() の失敗は写像して返し、登録は残る。
+    #[test]
+    fn cri5_3681_delete_exec_status_failure_keeps_entry() {
+        let (s, _, l) = started(TaskApiVersion::V2);
+        *l.last().status_fails.lock().unwrap() = true;
+        let (code, msg) = err_code(s.handle("Delete", &delete_req("c1", "e1")));
+        assert_eq!((code, msg.as_str()), (UNAVAILABLE, "status failed"));
+        *l.last().status_fails.lock().unwrap() = false;
+        l.last().exit(Some(0));
+        assert!(s.handle("Delete", &delete_req("c1", "e1")).is_ok());
+    }
+
+    /// CRI-5: 起動中の Delete(exec_id) は起動の完了後にだけ進む。
+    #[test]
+    fn cri5_3681_delete_exec_waits_for_launch() {
+        struct SlowLauncher {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            entered: Mutex<std::sync::mpsc::Sender<()>>,
+        }
+        impl TaskExecLauncher for SlowLauncher {
+            fn launch(
+                &self,
+                _c: &ContainerId,
+                _e: &ExecId,
+                _s: &ExecProcessSpec,
+            ) -> Result<Arc<dyn TaskExecProcess>, CriError> {
+                self.entered.lock().unwrap().send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                self.events.lock().unwrap().push("launch-end");
+                let p = FakeProc::new(5151);
+                p.exit(Some(0));
+                Ok(p)
+            }
+        }
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = s.with_exec_launcher(Arc::new(SlowLauncher {
+            events: events.clone(),
+            entered: Mutex::new(tx),
+        }));
+        running_container(&s, "c1");
+        s.handle("Exec", &exec_req("c1", "e1", SPEC)).unwrap();
+        std::thread::scope(|sc| {
+            let start = sc.spawn(|| s.handle("Start", &start_exec_req("c1", "e1")));
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            let del = sc.spawn(|| {
+                let r = s.handle("Delete", &delete_req("c1", "e1"));
+                events.lock().unwrap().push("delete-done");
+                r
+            });
+            assert!(start.join().unwrap().is_ok());
+            let r = del.join().unwrap().unwrap();
+            let r = DeleteResponse::decode(&r[..]).unwrap();
+            assert_eq!((r.pid, r.exit_status), (5151, 0));
+        });
+        assert_eq!(*events.lock().unwrap(), vec!["launch-end", "delete-done"]);
+    }
+
+    /// 入力検査: 不正な ID は INVALID_ARGUMENT、未登録は NOT_FOUND（4 RPC すべて）。
+    #[test]
+    fn cri5_3681_exec_id_rejected_and_unregistered() {
+        let (s, _, _) = started(TaskApiVersion::V2);
+        let make = |id: &str, eid: &str| -> [(&'static str, Vec<u8>); 4] {
+            [
+                ("State", state_exec_req(id, eid)),
+                ("Kill", kill_req(id, 9, false, eid)),
+                ("Wait", wait_req(id, eid)),
+                ("Delete", delete_req(id, eid)),
+            ]
+        };
+        for (id, eid) in [
+            ("c1", ".."),
+            ("c1", "bad id!"),
+            ("..", "e1"),
+            ("bad id!", "e1"),
+        ] {
+            for (m, req) in make(id, eid) {
+                assert_eq!(err_code(s.handle(m, &req)).0, INVALID, "{m} {id} {eid}");
+            }
+        }
+        for (m, req) in make("c1", "nope") {
+            let (code, msg) = err_code(s.handle(m, &req));
+            assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"), "{m}");
+        }
+    }
+
+    /// CRI-5: コンテナの Delete で exec の登録が消え、4 RPC とも NOT_FOUND。
+    #[test]
+    fn cri5_3681_container_delete_purges_exec() {
+        let (s, f, _) = started(TaskApiVersion::V2);
+        stopped(&f, "c1", Some(0));
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        for (m, req) in [
+            ("State", state_exec_req("c1", "e1")),
+            ("Kill", kill_req("c1", 9, false, "e1")),
+            ("Wait", wait_exec_req("e1")),
+            ("Delete", delete_req("c1", "e1")),
+        ] {
+            assert_eq!(err_code(s.handle(m, &req)).0, NOT_FOUND, "{m}");
+        }
+    }
+
+    /// 起動役が無い TaskService では、exec_id つきの 4 RPC は UNIMPLEMENTED（何も登録できない）。
+    #[test]
+    fn cri5_3681_exec_id_without_launcher_unimplemented() {
+        let (s, _) = svc(TaskApiVersion::V2, Fake::default());
+        running_container(&s, "c1");
+        for (m, req) in [
+            ("State", state_exec_req("c1", "e1")),
+            ("Kill", kill_req("c1", 9, false, "e1")),
+            ("Wait", wait_exec_req("e1")),
+            ("Delete", delete_req("c1", "e1")),
+        ] {
+            let (code, msg) = err_code(s.handle(m, &req));
+            assert_eq!(
+                (code, msg.as_str()),
+                (UNIMPL, "exec_id is not supported"),
+                "{m}"
+            );
+        }
     }
 }

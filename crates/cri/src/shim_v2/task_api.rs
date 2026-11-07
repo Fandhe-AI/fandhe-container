@@ -113,7 +113,7 @@ pub struct DeleteRequest {
     /// コンテナ ID。
     #[prost(string, tag = "1")]
     pub id: String,
-    /// exec の ID。空でなければ exec の削除（#674、未対応）。
+    /// exec の ID。空でなければ exec の削除（#3681。起動役が無ければ `UNIMPLEMENTED`）。
     #[prost(string, tag = "2")]
     pub exec_id: String,
 }
@@ -138,7 +138,7 @@ pub struct WaitRequest {
     /// コンテナ ID。
     #[prost(string, tag = "1")]
     pub id: String,
-    /// exec の ID。空でなければ exec の待ち（未対応）。
+    /// exec の ID。空でなければ exec の待ち（#3681。起動役が無ければ `UNIMPLEMENTED`）。
     #[prost(string, tag = "2")]
     pub exec_id: String,
 }
@@ -219,7 +219,7 @@ pub struct StateRequest {
     /// コンテナ ID。
     #[prost(string, tag = "1")]
     pub id: String,
-    /// exec の ID。空でなければ exec の状態（未対応）。
+    /// exec の ID。空でなければ exec の状態（#3681。起動役が無ければ `UNIMPLEMENTED`）。応答の `id` は exec ID になる。
     #[prost(string, tag = "2")]
     pub exec_id: String,
 }
@@ -296,7 +296,7 @@ pub struct KillRequest {
     /// コンテナ ID。
     #[prost(string, tag = "1")]
     pub id: String,
-    /// exec の ID。空でなければ exec への送信（未対応）。
+    /// exec の ID。空でなければ exec への送信（#3681。起動役が無ければ `UNIMPLEMENTED`。`all` との組は `UNIMPLEMENTED`）。
     #[prost(string, tag = "2")]
     pub exec_id: String,
     /// シグナル番号。

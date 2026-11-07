@@ -53,7 +53,9 @@ pub trait ContainerRuntime: Send + Sync {
     /// 実行中のコンテナへシグナルを送る。プロセスの終了は待たない。
     ///
     /// 前提: 対象コンテナが存在すること。存在しなければ [`ErrorCode::NotFound`] を返す。
-    /// 対応: CORE-2・ERR-2。
+    /// [`KillRequest::target`] が `AllProcesses` のときはコンテナの cgroup 全体へ SIGKILL を送る
+    /// （記録された cgroup 配置が無ければ `FailedPrecondition`。init だけへ縮退しない）。
+    /// 対応: CORE-2・ERR-2・CRI-5・CORE-4。
     fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError>;
 
     /// [`StopRequest::signal`]（既定 SIGTERM）を停止の意図つきで 1 回送り、猶予時間
@@ -417,18 +419,67 @@ impl StateRequest {
     }
 }
 
+/// [`KillRequest`] の送信先（CRI-5・CORE-4・TASK-62.7.2）。
+///
+/// shim v2 の `Kill.all`（containerd の `WithKillAll`）を、真偽値でなく列挙で運ぶ（REPAIR-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KillTarget {
+    /// コンテナの init プロセスだけへ送る（`all = false`。従来の挙動）。
+    Init,
+    /// コンテナの cgroup 全体（子孫・`exec` で入ったプロセスを含む）へ送る（`all = true`）。
+    /// 受けるシグナルは SIGKILL だけ（cgroup v2 の `cgroup.kill`。[`KillRequest::all_processes`]）。
+    AllProcesses,
+}
+
 /// [`ContainerRuntime::kill`] の要求。
+///
+/// 既定は init だけへの送信（[`KillRequest::new`]）。cgroup 全体への送信は
+/// [`KillRequest::all_processes`] だけが作れ、SIGKILL 以外の組を表現できない（CRI-5・CORE-4）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct KillRequest {
     id: ContainerId,
     signal: Signal,
+    target: KillTarget,
 }
 
 impl KillRequest {
-    /// 対象コンテナの ID と送るシグナルから要求を作る。
+    /// `all = true` で受けるシグナルの検査の文言（shim と core で共有する固定文言）。
+    pub const ALL_PROCESSES_SIGNAL_MESSAGE: &'static str = "kill all supports only SIGKILL";
+
+    /// 対象コンテナの ID と送るシグナルから、init だけへ送る要求を作る。
     pub fn new(id: ContainerId, signal: Signal) -> Self {
-        Self { id, signal }
+        Self {
+            id,
+            signal,
+            target: KillTarget::Init,
+        }
+    }
+
+    /// コンテナの cgroup 全体へ送る要求を作る。`signal` が SIGKILL 以外なら
+    /// [`ErrorCode::InvalidArgument`]（`cgroup.kill` は SIGKILL 専用。pid の列挙＋`kill(2)` は
+    /// PID 再利用と fork の取りこぼしがあるため採らない）。
+    pub fn all_processes(id: ContainerId, signal: Signal) -> Result<Self, TraitError> {
+        Self::check_all_processes_signal(signal)?;
+        Ok(Self {
+            id,
+            signal,
+            target: KillTarget::AllProcesses,
+        })
+    }
+
+    /// `all = true` で受けるシグナルかを検査する（SIGKILL のみ）。呼び出し側が状態の確認より前に
+    /// 拒否できるよう、検査の本体をここに 1 か所で置く。
+    pub fn check_all_processes_signal(signal: Signal) -> Result<(), TraitError> {
+        if signal == Signal::SIGKILL {
+            Ok(())
+        } else {
+            Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                Self::ALL_PROCESSES_SIGNAL_MESSAGE,
+            ))
+        }
     }
 
     /// 対象コンテナの ID を返す。
@@ -439,6 +490,11 @@ impl KillRequest {
     /// 送るシグナルを返す。
     pub fn signal(&self) -> Signal {
         self.signal
+    }
+
+    /// 送信先（init のみ / cgroup 全体）を返す。
+    pub fn target(&self) -> KillTarget {
+        self.target
     }
 }
 
@@ -1009,6 +1065,20 @@ impl DeleteResponse {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// CRI-5・CORE-4: `KillRequest` の送信先。`new` は init、`all_processes` は SIGKILL だけ受ける。
+    #[test]
+    fn cri5_kill_request_target_and_all_processes_signal() {
+        let id = ContainerId::new("c1").expect("id");
+        let init = KillRequest::new(id.clone(), Signal::SIGTERM);
+        assert_eq!(init.target(), KillTarget::Init);
+        let all = KillRequest::all_processes(id.clone(), Signal::SIGKILL).expect("sigkill");
+        assert_eq!(all.target(), KillTarget::AllProcesses);
+        assert_eq!(all.signal(), Signal::SIGKILL);
+        let err = KillRequest::all_processes(id, Signal::SIGTERM).expect_err("sigterm");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "kill all supports only SIGKILL");
+    }
 
     /// CRI-2・SUP-4（#2671）: `ContainerLogPath` の受理と拒否。
     #[test]

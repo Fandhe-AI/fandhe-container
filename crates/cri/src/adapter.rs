@@ -628,6 +628,25 @@ impl RuntimeAdapter {
         Self::finish(id, self.runtime.kill(&req))
     }
 
+    /// コンテナの cgroup 全体へ SIGKILL を送る（shim v2 `Kill(all=true)`。CRI-5・CORE-4・TASK-62.7.2）。
+    ///
+    /// `signal` は SIGKILL（9）以外を `INVALID_ARGUMENT`（`cgroup.kill` は SIGKILL 専用。core の
+    /// `KillRequest::all_processes` が検査する）。cgroup 配置の記録が無ければ `FAILED_PRECONDITION`。
+    pub fn kill_all(&self, id: &str, signal: u8) -> Result<RuntimeContainerStatus, CriError> {
+        Self::check_kill_all_signal(signal)?;
+        let signal = Signal::new(signal).map_err(|e| CriError::from(&e))?;
+        let req =
+            KillRequest::all_processes(Self::id(id)?, signal).map_err(|e| CriError::from(&e))?;
+        Self::finish(id, self.runtime.kill(&req))
+    }
+
+    /// `Kill(all=true)` が受けるシグナルかを、ID や状態に触れずに検査する（SIGKILL のみ）。
+    /// shim が状態の照会より前に拒否するために使う（停止済み・不在の ID でも `INVALID_ARGUMENT`）。
+    pub fn check_kill_all_signal(signal: u8) -> Result<(), CriError> {
+        let signal = Signal::new(signal).map_err(|e| CriError::from(&e))?;
+        KillRequest::check_all_processes_signal(signal).map_err(|e| CriError::from(&e))
+    }
+
     /// コンテナの現在状態を照会する。
     pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
         let req = StateRequest::new(Self::id(id)?);

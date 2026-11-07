@@ -30,7 +30,7 @@
 //! - exec_id つきの Kill の `all`・State の `bundle`・stdio（常に空・未設定または `UNIMPLEMENTED`。TASK-62.7.2）。Pause / Resume / Pids / Stats 等の他メソッドは `Unimplemented`
 //! - Connect の `version`（常に空。containerd は使わない。TASK-62.6）
 //! - Wait の `exited_at` は core が記録した終了検知時刻を返す（#3682）。`timeout_nano` は Wait の期限に使い（実効の期限は `min(timeout_nano, wait::WaitConfig::timeout)`、負値は即 `DEADLINE_EXCEEDED`）、他のメソッドでは使わない。
-//!   終了待ちは core の `ContainerRuntime::wait_exit`（既定は状態の照会。終了通知によるイベント駆動の上書きは後続）。
+//!   終了待ちは core の `ContainerRuntime::wait_exit`（既定は状態の照会。plugin-cri の `CoreLifecycleRuntime` は supervisor の終了通知でイベント駆動に上書きしている〔#3683〕。cri の bin は `EmptyTaskService` のみで、この上書きへの結線は bootstrap の制約に従う）。
 //!   サーバーは接続内で要求ごとに並行 dispatch し（同時処理数に上限あり）、Wait の待ちは他の RPC を止めない。
 //!   サーバーの停止・接続の切断・応答の書き込み失敗は処理中のハンドラへ通知され、Wait は期限前に取り消される。
 //!   停止で取り消された Wait の `UNAVAILABLE`（14）は、生きている接続へ 1 刻み分だけ書き込みを試して届ける

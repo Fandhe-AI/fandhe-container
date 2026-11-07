@@ -22,6 +22,14 @@
 //! - `state.json` の pid へ生の `kill(2)` を送る縮退は持たない（PID 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
 //!   状態ストアが `host_state_root()` を持たなければ signaler は `UNIMPLEMENTED` で失敗する。
 //!
+//! - `wait_exit`: コンテナの終了を supervisor の終了通知（制御チャネルの ExitWatchRequest。SUP-1・CRI-1・#3683）で待つ。
+//!   `Running` で pid があるとき購読し（1 回は最長 60 秒、全体は `WaitExitRequest::timeout`）、終了・世代交代の通知で起きたら
+//!   状態ストアを読み直す。通知はヒントで、返すのは常に状態ストアの `Stopped` の記録（終了コードと `exited_at` もそこから得る）。
+//!   supervisor が state.json に `Stopped` を書くのは通知の少し後のため、起床後は最大 [`WAIT_SETTLE_WINDOW`] を
+//!   [`WAIT_SETTLE_INTERVAL`] 刻みで読み直す（起床前の状態を返さない）。通知が使えないとき（`host_state_root()` が無い・supervisor 不在・
+//!   古い版・信頼できない相手・settle の期限切れ）は core の既定と同じ照会（`poll_interval` 間隔）へ退避し、期限（`Timeout`
+//!   「wait exceeded its deadline」）と取り消し（`Unavailable`「wait cancelled」）の戻り値も既定と揃える。取り消しは 10ms 刻みで見る。
+//!
 //! # 子プロセスの回収（D7）
 //! CLI は `start` の直後に終了するが、plugin-cri は常駐するため、起動した supervisor（実体は systemd-run の子）が
 //! plugin の子のまま残り、終了後にゾンビになる。spawn した `Child` を上限つき（[`MAX_TRACKED_SUPERVISORS`]）の一覧に
@@ -48,11 +56,16 @@ use fandhe_container_core::oci_runtime::{
     KillTimeout, LAUNCHER_REPLY_GRACE, LifecycleOp, OciRuntimeError, ProcessSignaler, kill,
 };
 use fandhe_container_core::state_store::STATE_LOCK_TIMEOUT;
+use fandhe_container_core::traits::WaitExitRequest;
 use fandhe_container_core::traits::{
     ContainerId, ContainerLogPath, ContainerState, ContainerStatus, ErrorCode, GetStateRequest,
     KillRequest, Signal, StateStore, StopRequest, TraitError,
 };
-use fandhe_container_supervisor::control::{production_signaler, production_stop_signaler};
+use fandhe_container_supervisor::control::protocol::MAX_EXIT_WATCH_HOLD;
+use fandhe_container_supervisor::control::{
+    ExitNotifier, ExitWatchOutcome, production_exit_notifier, production_signaler,
+    production_stop_signaler,
+};
 use fandhe_container_supervisor::start_client::{
     SupervisorLaunch, production_deadline, start_with_cri_log,
 };
@@ -69,6 +82,13 @@ pub const STOP_KILL_WAIT: Duration = Duration::from_secs(5);
 pub const FORCE_DELETE_STOP_BUDGET: Duration = Duration::from_secs(22);
 /// 予算を使い切って stop の次の段を始められなかったときの固定文言。
 pub const MSG_STOP_BUDGET: &str = "container stop did not fit in the delete budget";
+/// 終了通知で起きた後、state.json の `Stopped` を読み直す間隔（#3683）。supervisor は init の回収を通知してから
+/// `Stopped` を書くため、起床の直後は `Running` のままであり得る。
+pub const WAIT_SETTLE_INTERVAL: Duration = Duration::from_millis(5);
+/// 終了通知で起きた後、`Stopped` を待つ上限。超えても `Stopped` でなければ通知を諦めて照会へ退避する（REPAIR-5・#3683）。
+pub const WAIT_SETTLE_WINDOW: Duration = Duration::from_secs(2);
+/// `wait_exit` が取り消しを見る刻み（core の既定実装の `CANCEL_SLICE` と同じ）。
+const WAIT_CANCEL_SLICE: Duration = Duration::from_millis(10);
 /// Stopped への遷移を状態ストアで見る間隔。
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -176,10 +196,29 @@ impl SignalerSource for ProductionSignalers {
     }
 }
 
+/// 終了通知の購読口の組み立て（本番は [`ProductionExitNotifiers`]。結合試験は偽の購読を返す実装に差し替える。#3683）。
+pub trait ExitNotifierSource: Send + Sync {
+    /// `store` に対する購読口。作れない（状態ルートが無い）なら `None`（`wait_exit` は照会だけで待つ）。
+    fn notifier(&self, store: &dyn StateStore) -> Option<Arc<dyn ExitNotifier>>;
+}
+
+/// 本番の購読口: supervisor の制御チャネルの ExitWatchRequest を使う。縮退で `state.json` の pid へ何かを送ることはしない
+/// （購読はシグナルも fd も扱わない。SEC-1・CORE-1）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProductionExitNotifiers;
+
+impl ExitNotifierSource for ProductionExitNotifiers {
+    fn notifier(&self, store: &dyn StateStore) -> Option<Arc<dyn ExitNotifier>> {
+        production_exit_notifier(store)
+    }
+}
+
 /// supervisor の起動・シグナル送信と、起動した子プロセスの回収を束ねる（Linux 専用）。
 pub struct SupervisedLifecycle {
     starter: Arc<dyn SupervisorStarter>,
     signalers: Arc<dyn SignalerSource>,
+    /// `wait_exit` の終了通知の購読口（#3683）。
+    exit_notifiers: Arc<dyn ExitNotifierSource>,
     children: Mutex<Vec<Child>>,
     /// 起動の結果待ちで枠だけ予約している件数。`children` のロックを持つ間だけ増減する（並行 start の上限超過を防ぐ）。
     reserved: AtomicUsize,
@@ -210,9 +249,84 @@ impl SupervisedLifecycle {
         Self {
             starter,
             signalers,
+            exit_notifiers: Arc::new(ProductionExitNotifiers),
             children: Mutex::new(Vec::new()),
             reserved: AtomicUsize::new(0),
             limit: limit.max(1),
+        }
+    }
+
+    /// `wait_exit` の終了通知の購読口を差し替える（結合試験と別実装。#3683）。
+    #[must_use]
+    pub fn with_exit_notifiers(mut self, exit_notifiers: Arc<dyn ExitNotifierSource>) -> Self {
+        self.exit_notifiers = exit_notifiers;
+        self
+    }
+
+    /// `req` のコンテナが `Stopped` になるまで待つ。終了は supervisor の通知で検知し、使えなければ照会で待つ
+    /// （SUP-1・CRI-1・REPAIR-5・#3683。モジュール doc の `wait_exit`）。
+    ///
+    /// `state` は状態の取得（呼び出し元の `ContainerRuntime::state`）。返すのは常にその結果の `Stopped` で、通知は
+    /// 読み直しの契機にしか使わない。期限・取り消しの戻り値は core の既定実装と同じ文言・コードにする。
+    pub fn wait_exit(
+        &self,
+        store: &dyn StateStore,
+        req: &WaitExitRequest<'_>,
+        state: &dyn Fn() -> Result<ContainerStatus, TraitError>,
+    ) -> Result<ContainerStatus, TraitError> {
+        let deadline = Instant::now()
+            .checked_add(req.timeout())
+            .ok_or_else(|| TraitError::new(ErrorCode::Internal, "wait deadline overflow"))?;
+        let cancel = || req.is_cancelled();
+        let notifier = self.exit_notifiers.notifier(store);
+        let mut notify = notifier.is_some();
+        let mut settle_until: Option<Instant> = None;
+        loop {
+            if req.is_cancelled() {
+                return Err(wait_cancelled());
+            }
+            let st = state()?;
+            if st.state() == ContainerState::Stopped {
+                return Ok(st);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "wait exceeded its deadline",
+                ));
+            }
+            // 起床の直後: state.json が `Stopped` になるのを短い刻みで待つ。上限を過ぎても `Stopped` でなければ
+            // 通知は当てにならないとみなし、以後は照会だけで待つ（通知の空回りで読み取りを増やさない）。
+            if let Some(until) = settle_until {
+                if now < until {
+                    sleep_sliced(WAIT_SETTLE_INTERVAL.min(deadline - now), &cancel)?;
+                    continue;
+                }
+                settle_until = None;
+                notify = false;
+            }
+            let poll = req.poll_interval().min(deadline - now);
+            let watch = match (&notifier, notify, st.state(), st.pid()) {
+                (Some(n), true, ContainerState::Running, Some(pid)) => Some((n, pid)),
+                _ => None,
+            };
+            let Some((n, pid)) = watch else {
+                sleep_sliced(poll, &cancel)?;
+                continue;
+            };
+            let until = deadline.min(now + MAX_EXIT_WATCH_HOLD);
+            match n.watch(req.id(), pid, until, &cancel) {
+                ExitWatchOutcome::Woken => {
+                    settle_until = Instant::now().checked_add(WAIT_SETTLE_WINDOW);
+                }
+                ExitWatchOutcome::Expired => {}
+                ExitWatchOutcome::Cancelled => return Err(wait_cancelled()),
+                ExitWatchOutcome::NoSupervisor => notify = false,
+                // 一時的な失敗と、pid の入れ替わり（記録と supervisor の保持がずれた）は、1 回分を照会で待って
+                // 次の周回で状態を読み直す（空回りで接続を繰り返さない）。
+                _ => sleep_sliced(poll, &cancel)?,
+            }
         }
     }
 
@@ -361,6 +475,29 @@ impl SupervisedLifecycle {
             Some(s) => Ok(s),
             None => Err(TraitError::new(ErrorCode::Timeout, MSG_STOP_DEADLINE)),
         }
+    }
+}
+
+/// core の既定の `wait_exit` と同じ取り消しの戻り値（`Unavailable`「wait cancelled」。#3683）。
+fn wait_cancelled() -> TraitError {
+    TraitError::new(ErrorCode::Unavailable, "wait cancelled")
+}
+
+/// `dur` だけ 10ms 刻みで眠る。刻みごとに `cancel` を見て、真なら `Unavailable`（取り消し）で戻る（REPAIR-5）。
+fn sleep_sliced(dur: Duration, cancel: &dyn Fn() -> bool) -> Result<(), TraitError> {
+    let end = Instant::now().checked_add(dur);
+    loop {
+        if cancel() {
+            return Err(wait_cancelled());
+        }
+        let left = match end {
+            Some(e) => e.saturating_duration_since(Instant::now()),
+            None => dur,
+        };
+        if left.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(WAIT_CANCEL_SLICE.min(left));
     }
 }
 

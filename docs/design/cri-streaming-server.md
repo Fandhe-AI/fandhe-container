@@ -1,6 +1,6 @@
 # CRI ストリーミングサーバー基盤と URL 発行
 
-CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流さず「ストリーミングサーバーの URL」を返す。kubelet / apiserver はその URL へ HTTP（SPDY/3.1 の Upgrade）で接続して入出力をやり取りする。本書は、その土台（HTTP サーバーの起動・URL 発行・トークンの失効）の設計記録である（CRI-6・TASK-63.1・#679。依存の承認は #678）。
+CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流さず「ストリーミングサーバーの URL」を返す。kubelet / apiserver はその URL へ HTTP（SPDY/3.1 の Upgrade）で接続して入出力をやり取りする。本書は、その土台（HTTP サーバーの起動・URL 発行・トークンの失効）の設計記録である（CRI-6・TASK-63.1・#679。依存の承認は #678）。本番 backend の設計（#3752）も「本番 backend の設計」の節に含める。
 
 実装は `crates/cri/src/streaming.rs`（SPDY は `streaming/spdy.rs`・`streaming/remotecommand.rs`、Attach は `streaming/attach.rs`、Exec は `streaming/exec.rs`）。結合試験は `crates/cri/tests/streaming_server.rs`・`streaming_attach.rs`・`streaming_exec.rs`。
 
@@ -14,7 +14,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装で、注入が無ければ 501） | #680（TASK-63.2） |
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続（注入が無ければ 501） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
-| plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | 後続の issue |
+| plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | #3754 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -99,7 +100,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 ### Attach の本番 backend（未実装・REPAIR-3）
 
-実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立てもこれと同じ後続の issue。
+実行中コンテナの stdin / stdout / stderr と tty を渡す経路は、core の `ContainerRuntime` にも supervisor にも無い（CreateContainer の `stdin`・`stdin_once`・`tty` の bundle への反映もまだ）。`ContainerRuntime` トレイトの拡張か supervisor の新しい経路かは PLUG-1・SUP 系の設計判断（main の設計が要る）であり、本 issue では注入点（`AttachBackend`）までとした。判断材料として、supervisor のログの sink は stdout / stderr を読んでいるため読み側だけは供給できる可能性があるが、stdin の経路と tty は無く、断定していない。plugin-cri からの `StreamingServer` の起動と `StreamDispatcher` / `AttachHandler` の組み立ては #3754。方式の設計は「本番 backend の設計」の「Attach」節（段階 1 は #3763、完全版は #3765）。
 
 ## Exec（#680・TASK-63.2・CRI-6）
 
@@ -113,7 +114,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 ### 注入トレイト `ExecStreamLauncher`
 
-core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は無い（REPAIR-3）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しは後続の issue。
+core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は無い（REPAIR-3）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しの設計は「本番 backend の設計」の「Exec」節（#3757〜#3762）。
 
 ## PortForward（#682・TASK-63.4・CRI-6）
 
@@ -123,7 +124,7 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 - 転送: data の DATA は TCP へ書き、FIN で TCP の書き込み側を shutdown する。TCP の EOF は DATA の FIN にし、両方向が閉じたら error ストリームも FIN で閉じる。接続失敗は error ストリームへ固定の英文（`error forwarding port <port>: connection failed`）を書いて両ストリームを FIN で閉じる
 - 他の種別と同居させるときは `StreamDispatcher::with_port_forward` に登録する（`with_fallback` の連鎖は持たない）
 - PING は同じ ID で返す。SETTINGS・WINDOW_UPDATE・HEADERS は読み飛ばし、フロー制御は持たない（kubelet の SPDY 実装も窓を強制しない前提。実クライアントでの確認は本番 backend の結線後）。GOAWAY・切断で終了する
-- 転送先への接続は `PortForwardDialer`（`pod_sandbox_id` と `port` で `std::net::TcpStream` を返す）に切り出す。cri は名前空間の具象を知らず、既定でホストの loopback へつなぐ実装を置かない。本番の dialer（NODE ネットワークの pod と、pod の netns へ入って接続する POD ネットワークの pod）と plugin-cri でのサーバー起動・ハンドラ注入は後続の issue
+- 転送先への接続は `PortForwardDialer`（`pod_sandbox_id` と `port` で `std::net::TcpStream` を返す）に切り出す。cri は名前空間の具象を知らず、既定でホストの loopback へつなぐ実装を置かない。本番の dialer（NODE ネットワークの pod と、pod の netns へ入って接続する POD ネットワークの pod）と plugin-cri でのサーバー起動・ハンドラ注入の設計は「本番 backend の設計」の「PortForward」節（NODE は #3755、POD は #3766）
 
 | 項目 | 既定値 | 設定 |
 | ---- | ------ | ---- |
@@ -142,9 +143,173 @@ core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` 
 - ヘッダブロックの上限と SPDY/3 の zlib 辞書（出典と帰属表示）は共通 codec（`spdy`・`spdy_dictionary`）の記述に従う。超えたら GOAWAY(PROTOCOL_ERROR) で切断する
 - 観測: セッションの終了理由（`PortForwardEnd`）を `PortForwardObserver` に渡す。ポート・トークン・アドレスは載せない
 
+## 本番 backend の設計（#3752）
+
+2026-11-03 に main が決めた要点（Attach は段階方式、Exec は制御チャネルの exec 要求と fd 渡しで孤児時に縮退しない、PortForward は NODE を先に入れ POD は #2877 の後、依存は plugin-cri から supervisor への一方向で cri に実装を入れない）を詳しくした設計記録である。後続の兄弟 issue（#3753〜#3766。親 #3726・TASK-63・MS-7）はこの記録を正として実装する。オーナーの確認が要る点は末尾の「未確認・オーナー確認事項」にまとめ、それ以外は確定扱いとする。**本節の内容はいずれも未実装である（REPAIR-3）**。
+
+対象ビヘイビア: CRI-6・PLUG-1・SUP-4・SUP-6・SEC-1・REPAIR-2・REPAIR-3・REPAIR-5（関連: CORE-1・CORE-5・SUP-3・SUP-5・SUP-7・NET-3）。
+
+### crate の担当と依存方向（PLUG-1）
+
+| crate | 担当 | 入れないもの |
+| ----- | ---- | ------------ |
+| `crates/cri` | 注入トレイト・handler・URL 発行・RPC の検証。#3755 で PortForward の対象の型を足す | 本番の注入トレイトの実装、supervisor への依存 |
+| `crates/plugin-cri` | 3 つの本番 backend（`ExecStreamLauncher`・`AttachBackend`・`PortForwardDialer`）、`StreamingServer` の起動と `with_streaming` の注入（#3754） | `run_command_with_pidfd` の直接の呼び出し（plugin-cri は多スレッドのため） |
+| `crates/supervisor` | 制御チャネル（kind 6 / 7 は既存のまま。完全版 Attach の種別は #3765）、exec helper の入口 `stream-exec`、helper との channel の codec、fd 渡しの安全な公開 API、`ExecLaunchIo` の拡張、ログ reader の取り消しの口 | cri の型への依存 |
+| `crates/core` | exec の stdio の付け替え（#3757）、pty の割り当てと `TIOCSWINSZ` の薄いラッパー（#3758） | — |
+
+- 辺は plugin-cri から cri・supervisor・core と、supervisor から core だけで、新しい辺も外部依存も増えない。tokio の feature も増やさない（plugin-cri は `rt`・`net`・`time` の current_thread。`process`・`signal` は使わない）
+
+### Exec（SUP-6・SEC-1・REPAIR-2・REPAIR-5）
+
+**前提**:
+
+- `run_command_with_pidfd` 系は setns と `fork_single_threaded` のため、呼び出し元が単一スレッドに限られる。supervisor 本体は多スレッドで直接呼べず、healthcheck は `/proc/self/exe` の 3 段で回避している（[healthcheck-exec-helper.md](healthcheck-exec-helper.md)）
+- 制御チャネルは固定長で payload は 64 バイトまで（`MAX_PAYLOAD`）。kind 6 は pid と deadline、kind 7 は hold と cgroup 名
+- 起動時の pidfd の出所は稼働中の supervisor だけで、記録 pid から `pidfd_open` しない（[exec-without-supervisor.md](exec-without-supervisor.md)）
+
+**再利用の確認結果**: CLI の exec の経路（[exec-pidfd-handover.md](exec-pidfd-handover.md) の案 A。kind 6 `ExecHandoverRequest` と kind 7 `ExecCgroupNotify`、`ControlExecHandover`）は CRI の Exec にそのまま再利用できる。制御チャネルの codec は変更しない。
+
+**方式比較**:
+
+| 案 | 内容 | 評価 | 判断 |
+| -- | ---- | ---- | ---- |
+| α | plugin-cri が、同じディレクトリの supervisor の実行ファイルを第 1 引数 `stream-exec` で起動する。これが単一スレッドの helper になり、既存の `ControlExecHandover` で kind 6 の pidfd の複製を受け、kind 7 で exec 子 cgroup を通知し、拡張した stdio つきで `run_command_with_pidfd_*` を呼ぶ | 制御チャネルの新しい種別も可変長 frame も要らない。kind 7 のガードによる回収、uid の照合、同一性の照合（`identify_pid1_with_pidfd`）、監査 sink の作成順は CLI の exec と同じ経路を使う。argv は healthcheck helper と同じく `--` の後ろの配列で渡し、64 バイトの制約を受けない。新しい `unsafe` は sys の複数 fd 送信への一般化だけ | 採用 |
+| β | supervisor が exec 要求（argv・stdio の fd）を受け、healthcheck と同じ reaper / helper を自分で起動する | argv が 64 バイトを超えるので可変長 frame（`VERSION` と互換方針の変更。REPAIR-2 の範囲が広がる）か別の文書が要る。helper へ 4 本以上の fd を渡すには `pre_exec`（sys の外の unsafe）か 2 段目の SCM_RIGHTS が要る。セッション中（最長 1 時間）の待ちのスレッドが supervisor に常駐し、再 launch の pause の対象が増える | 不採用 |
+| γ | plugin-cri が自分のプロセスで `run_command_with_pidfd` を呼ぶ | plugin-cri は tokio と blocking pool で多スレッドのため成り立たない | 不採用 |
+
+helper を supervisor の bin に置く理由は、exec の領域（healthcheck の `healthcheck-exec` の前例・`exec.rs`・試験の harness）が supervisor にまとまること、plugin-cri が start と同じ解決（`current_exe()` と同じディレクトリの固定名。PATH は探さない）で起動できること、plugin-cri の `main` の argv の振り分けを増やさないことの 3 点。plugin-cri の `/proc/self/exe` で振り分ける案は、plugin-cri 側に exec の領域が分散するため採らない。
+
+「pidfd の保持者は supervisor だけ」は、出所が supervisor だけで helper は複製を一時的に持つだけ、という意味で読む（CLI の exec と同じ。案 A の承認範囲）。孤児時は kind 6 が `Unavailable` になり、記録 pid へ縮退せず失敗する。
+
+**経路**:
+
+1. plugin-cri が stdio の端と socketpair を作る。stdin・stdout・stderr は `UnixStream::pair` とし、親側は tokio の `UnixStream` にする。pipe にしない理由は healthcheck と同じ（nonblocking・子孫が端を持ち続けても止まらない・core の診断行は AF_UNIX にだけ出る）
+2. helper を `env_clear`・cwd `/`・argv[0] 固定で起動する
+3. helper は次の順で進む。`close_fds_from(3)` と `set_dumpable(false)`、引数の検証（`--root`・`--id`・`--expect-pid`・`--timeout-ms`・stdio のマスク・`--` 以降の argv。argv[0] は絶対パス）、状態記録の照合（Running・pid の一致）、`launch_env_for` の読み取り、`default_audit_sink` の作成（作れなければ exec しない）、kind 6 で pidfd を受ける（期限 5 秒）、stdio の fd を受ける、cgroup の作成直後に kind 7 で通知して ack を受ける（10 秒）、`Started` を返す、worker を fork する、結果を返す
+
+| helper の fd | 中身 |
+| ------------ | ---- |
+| 0 | plugin-cri との channel（socketpair の子側、blocking） |
+| 1 | `/dev/null` |
+| 2 | 診断行（JSON 1 行。上限つきで plugin-cri の構造化ログへ転送する。healthcheck と同じ扱い） |
+
+- channel の frame は固定長・big-endian で、壊れた値を表現できない型にする（REPAIR-2）。plugin-cri から helper へは `StdioHandover`（マスクと、そのビット数ちょうどの fd を SCM_RIGHTS で送る。最大 3 本）。helper から plugin-cri へは `Started`・`PtyMaster`（tty のときだけ fd 1 本）・`Result`（exited n / signaled s / not_started 段 コード / failed コード）。受け側は fd の本数・`MSG_CTRUNC`・マスクとの不一致をすべて拒否し、受け取った fd は drop で閉じる。magic・各 frame の長さ・語彙は #3759 で確定し、本書は構造と上限だけを定める
+- pre_exec を使わず、子に渡す fd は `Stdio` の 3 本だけにする（新しい unsafe を sys の外に作らない）
+
+**stdio と pty**:
+
+- stdin / stdout / stderr を別々に付け替える処理は core（#3757）が持ち、`ExecLaunchIo` を拡張する。要求されない stdio は `/dev/null` のまま。既存の healthcheck の挙動は変えない
+- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置（Landlock と seccomp の再適用より前、または `dev_mounts` の権利の範囲）は #3758 で確定する。ホストの devpts で代わりに割り当てる方式は採らない
+- resize は、plugin-cri が持つ master へ `TIOCSWINSZ` を発行する（core の安全なラッパー。supervisor への往復なし）
+
+**SEC-1**:
+
+- コマンドは既存の `run_command_with_pidfd` の段（namespace・cgroup・rlimit・launch と同じ capability 集合・NNP・Landlock・seccomp）だけを通り、launch より広げない
+- env の基底は `config.json` の `process.env` と launch 時の env だけ。CRI は env を渡さないので `with_env` を使わない。argv はシェルを通さない
+- argv[0] が相対パス（例: `sh`）の要求は、PATH の解決（#2439）が決まるまで `INVALID_ARGUMENT` で拒否する。URL の発行前（RPC 時）に断るのが望ましく、置き場所は #3753・#3761 で決める
+- helper と plugin-cri の channel はパスを持たない socketpair で、第三者は接続できない。supervisor の実行ファイルは PATH を探さず固定名で解決し、受け取った pidfd は `identify_pid1_with_pidfd` で照合する。トークン・argv・パスはログやエラーに出さない
+
+**終了コードの写像**: `Exited(n)` は n、`Signaled(s)` は 128 + s（`metav1.Status` の NonZeroExitCode）。`SetupFailed` は子の終了状態（通常 125 / 126 / 127）で、CLI の exec と同じ（exec-pidfd-handover.md §3.4）。拒否・期限・到達不能は launch の失敗にし、handler が `InternalError` の固定文にする。
+
+**drop・restart・孤児**:
+
+- `ExecSession` の drop で、plugin-cri は helper を `Child::kill` で止める（未回収の子なので pid は再利用されない）。channel と制御チャネルの接続が閉じると、kind 7 のガードが exec 子 cgroup を `cgroup.kill` で回収し、worker は PDEATHSIG で終わる
+- helper の回収は blocking の待ちを期限つき（5 秒）で行う。回収できない helper は数の上限つきで保持し、超えたら新しい exec を `RESOURCE_EXHAUSTED` で断る（healthcheck の `MAX_HELD_HELPERS` の考え方）
+- コンテナの restart（再 launch。[restart-relaunch-single-thread.md](restart-relaunch-single-thread.md)）では、`ExecGuardPool::shutdown_all` が旧世代の exec 子 cgroup を回収するので、CRI の exec のセッションも終わる
+- supervisor が不在（孤児）なら `UNAVAILABLE` 相当で失敗し、縮退しない
+
+**SCM_RIGHTS の再利用判断**: core（`sys/seccomp_notify.rs`）・net（`sys/holder.rs`）・supervisor（`sys/linux.rs` の `send_with_fd` / `recv_with_fds`）の自前ラッパーは、crate ごとの sys に置いたまま共有しない。いずれも `pub(crate)` で意味も違い（core は token と資格情報、net は holder の frame、supervisor は制御チャネル）、前例は [fdinfo-mnt-id-parsing.md](fdinfo-mnt-id-parsing.md) の「共有下位 crate を作らない」判断である。本設計で足りないのは supervisor の「複数 fd の送信」だけで、既存の `send_with_fd` を N 本（上限 3〜4。`recv_with_fds` の 4 本と揃える）へ一般化し、plugin-cri が使える安全な公開 API として出す。sys の事前承認の範囲内（coding-rust.md）。plugin-cri の sys には SCM_RIGHTS を新しく足さず、重複を作らない。
+
+**上限**: 同時の exec は supervisor 側がコンテナごとに 16（`ExecGuardLimits::max_guards`）。plugin-cri 側にも全体の上限を設け、値は #3761 で決める。channel の受信長は固定で、fd は最大 3 本受け、tty のときは master を 1 本返す。
+
+### Attach（SUP-4・SUP-7・REPAIR-3・REPAIR-5）
+
+**段階 1（#3763。読み取り専用）**:
+
+- 出力は supervisor の回転ログ（`@container-logs`。CRI のコンテナも `TeeLogSink` で書く）を follow する。`tail 0` で現在の末尾から追い、スナップショットは出さない
+- レコードのタグ（`stdout` / `stderr` の接頭辞とスペース 1 つ）で 2 本の `AsyncRead` に分け、タグを外して LF つきで流す。要求していない stderr は捨てる
+- stdin・tty の要求は backend が `INVALID_ARGUMENT` で拒否する（必須）。URL の発行前（RPC 時）にも拒否するのが望ましく、#3753 の結線情報に「attach は読み取り専用」を載せる形で #3763 が判断する
+- follow は blocking のポーリング（`FOLLOW_POLL_INTERVAL` 200 ms）なので、セッションごとに専用スレッド（または `spawn_blocking`）で回し、`exited` の future へ橋渡しする。終了は既存の終了条件（sink のロックの解放かつ Running でない）を `exited` に写す。期限は follow の上限 24 時間（`MAX_FOLLOW_DURATION`）とセッションの idle 4 時間
+- follow には取り消しの口が無く、期限と書き込みの失敗でしか終わらない。drop の後も期限まで残らないよう、reader に取り消し（停止フラグ）を足す。これは supervisor の変更で、#3763 の範囲に含める
+- 制限: 遅延は最大 200 ms とポーリングの読み取りの時間。LF の無い行は出ない（1 行の上限は 64 KiB）。restart の再 launch の間も追従が続く（完全版との違い）。世代数 1 の設定は拒否される（既定は 1 MiB × 3 世代）
+
+**完全版の方式比較**（評価の核心は単一スレッド制約。[restart-relaunch-single-thread.md](restart-relaunch-single-thread.md)）:
+
+| 案 | 内容 | 単一スレッド制約との干渉 | 判断 |
+| -- | ---- | ------------------------ | ---- |
+| A1 | 制御チャネルに固定長の種別を足し、supervisor がコンテナの init の stdin の書き込み端（tty なら pty master）の複製を SCM_RIGHTS で plugin-cri へ渡す。中継と resize（`TIOCSWINSZ`）は plugin-cri のプロセス内で行う。出力は段階 1 と同じログの follow | 受け渡しは accept ループの 1 要求で、`PausableServer::pause` の既存の対象に入る。supervisor にセッションのスレッドが残らない。再 launch の後は新しい世代の stdin / pty になり、旧い複製は EPIPE で終わる | 採用（本命）。Exec の fd 渡しの部品（sys の複数 fd 送受信）と同じ形 |
+| A2 | supervisor がコンテナごとに attach 用の UDS を listen し、接続ごとに中継スレッドを持つ | 2 本目の accept ループと最長 4 時間の中継スレッドが pause の対象になる。読まないクライアントが中継を詰まらせると pause が期限切れで失敗し、再 launch が `RelaunchFailed` から Stopped へ倒れる（attach のクライアントが restart を止められる）。peer の検証・ソケットの権限・PSS（SUP-2）も増える | 不採用 |
+| A3 | core の `ContainerRuntime` に attach を足す | core に常駐プロセスが無く（CORE-1）、拡張点トレイトの変更になる（PLUG-1・PLUG-4） | 不採用 |
+
+A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと resize にだけ使う（契約）。`stdin_once` は最初の attach で所有を移し supervisor が自分の端を閉じる方向で検討する。同じ uid の範囲で増える能力は exec と同じ（rootful は対象外）。#3765 に残るのは、CreateContainer の `stdin`・`stdin_once`・`tty` の bundle（`process.terminal`）への反映と `bundle/spec.rs` の拒否の解除の条件、launch で init の stdin / pty を作り保持する主体、種別の frame の確定、`stdin_once`。
+
+### PortForward（NET-3・SEC-1）
+
+**NODE（#3755）**:
+
+- host netns の `127.0.0.1:<port>` だけへ `dial_timeout`（10 秒）で接続する。接続先は要求から組み立てず loopback に固定する（SEC-1）。`::1` は試さない（fail-closed）
+- NODE が先に成り立つ理由: NODE ネットワークでは network namespace の要素を作らず（host netns）、本番の `NetworkReady` は false なので、現状 kubelet が受ける Pod は hostNetwork だけである
+- NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
+- hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
+
+**POD（#3766）**: #2877（pod の namespace 保持役）が入るまで `UNIMPLEMENTED` とする。URL の発行前に断るのが望ましく、#3753 の結線情報で扱う。dialer 側でも `CriError::unimplemented` を返す（多層防御）。候補は、単一スレッドの helper が保持役の fd で pod の userns・netns へ入って connect し接続済みの fd を SCM_RIGHTS で返す案と、保持役に connect を頼む案（保持役の攻撃面が広がるので劣後）で、最終判断は #3766 に置く。
+
+### 期限の一覧（REPAIR-5）
+
+| 待ち | 値 |
+| ---- | -- |
+| 制御チャネルの connect と Hello | 既存 |
+| kind 6 の pidfd の受け渡し | 5 秒（全体の内側） |
+| kind 7 の ack | 10 秒 |
+| `launch_timeout`（helper の起動から `Started` まで） | 30 秒 |
+| exec の全体の上限 | 3600 秒（`MAX_EXEC_HOLD_SECS`。CLI の `--timeout` の上限。確認事項 1） |
+| ガードの保持 | 期限 + 30 秒 |
+| helper の回収 | 5 秒 |
+| stdin の stall | 60 秒 |
+| 流し切り / 最後の送出 | 各 5 秒 |
+| ストリームの作成 | 30 秒 |
+| idle | 4 時間 |
+| attach の `backend_timeout` | 10 秒 |
+| follow のポーリング / 上限 | 200 ms / 24 時間 |
+| PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
+| `StreamingServer` の SIGTERM での停止 | #3754 で決める |
+
+### 実装単位と兄弟 issue の対応
+
+| issue | 内容 | 範囲の変更（issue 本文の想定との差） |
+| ----- | ---- | ------------------------------------ |
+| #3753 | 結線済みの種別だけ URL を発行する | attach の読み取り専用・POD 未対応・exec の相対 argv[0] を RPC 時に断る情報を載せうる |
+| #3754 | `StreamingServer` の起動・注入 | — |
+| #3755 | NODE の dialer | cri の `PortForwardDialer` の引数に対象の型を足す（cri の変更を含む） |
+| #3756 | 試験 | — |
+| #3757 | `ExecLaunchIo` と core の stdio 拡張 | — |
+| #3758 | core の pty | コンテナの devpts で worker が開き、master は core の既存の worker から親への SCM_RIGHTS で返す |
+| #3759 | supervisor: helper と plugin-cri の channel の frame codec、sys の複数 fd 送信の一般化（安全な公開 API） | 制御チャネルの新しい種別は足さない（kind 6 / 7 を再利用） |
+| #3760 | supervisor: bin の `stream-exec` 入口（単一スレッドの helper）が kind 6 / 7 と `run_command_with_pidfd_*` を呼び、結果を返す | 常駐の supervisor 側の受け口ではなく helper |
+| #3761 | plugin-cri の本番 launcher | helper の起動・fd の送信・tokio の橋渡し・drop で kill・ローカルの resize・全体の上限 |
+| #3762 | 実機前提試験 | — |
+| #3763 | plugin-cri の読み取り専用 attach | supervisor の reader の取り消しの口を含む |
+| #3764 | docs の更新 | — |
+| #3765 | 完全版 attach（A1 を本命として設計と分解） | — |
+| #3766 | POD の port-forward の設計と分解 | — |
+
+### 未確認・オーナー確認事項
+
+決定扱いにしない。
+
+1. CRI のストリーミング exec の全体の上限を、当面 3600 秒（kind 7 の保持の上限）とする。kubelet の idle 4 時間より短く、長い対話セッションは 1 時間で止まる。代案は保持の更新（heartbeat）や上限の分離で、オーナー判断
+2. `::1` を接続先に足すか（containerd の挙動は一次情報で未確認）
+3. pty をホストの devpts で代わりに割り当てる方式は採らない（変えるならオーナー判断）
+4. argv[0] の PATH の解決（#2439）が出るまでは、相対パスを拒否する
+5. 観測名の語彙（exec-pidfd-handover.md §6 の未決事項が CRI の exec にも及ぶ）
+6. `SetupFailed` の終了コードの扱いと containerd との比較（未確認）
+
+CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利用できる見込みだが、本件の対象外である。
+
 ## 残るもの
 
-- `ExecStreamLauncher` の本番の実装と plugin-cri からの `StreamingServer` の起動・注入
+- `ExecStreamLauncher` の本番の実装と plugin-cri からの `StreamingServer` の起動・注入（設計は「本番 backend の設計」の節、実装は #3753〜#3766）
 - ポートの到達性など深い意味検証
 - WebSocket（`v5.channel.k8s.io` 等）: kubelet / apiserver 側で WebSocket を SPDY に変換する仕組みの一次情報は #678 で未確認のまま。必要になった時点で別途判断する
 - kubelet / crictl の実クライアントでの照合（本番の backend と plugin-cri の結線の後。プロセス内の偽 backend と crictl 相当の SPDY クライアントによる疎通は `crates/cri/tests/streaming.rs`〔#683・TASK-63.5・CRI-6〕で済み。実 crictl は WebSocket が既定の版がありうるため、照合時に既定を一次情報で確かめる）

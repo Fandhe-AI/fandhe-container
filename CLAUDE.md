@@ -137,7 +137,7 @@ fandhe-container/
 │   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）
 │   │   ├── cri-status-rpc.md      # CRI の Status・Version・UpdateRuntimeConfig RPC（#2896 を併記。RuntimeReady・NetworkReady の判定材料と待ちが無い設計・runtime_handlers・features・verbose で info を出さない方針・kubelet / containerd の一次情報・本番で NetworkReady=false になる帰結・死活確認を足さない判断と再評価条件。#2830・#2897・CRI-1・CRI-2・PLUG-1・PLUG-4・REPAIR-3・REPAIR-5）
-│   │   ├── cri-streaming-server.md  # CRI ストリーミングサーバー基盤と URL 発行（loopback 既定・外部は opt-in・トークン 32 バイト単回使用・TTL 60 秒・接続の上限と期限・SPDY/3.1 は #680〜#682。TASK-63.1・#679・#678・CRI-6・REPAIR-5）
+│   │   ├── cri-streaming-server.md  # CRI ストリーミングサーバー基盤と URL 発行（loopback 既定・外部は opt-in・トークン 32 バイト単回使用・TTL 60 秒・接続の上限と期限・SPDY/3.1 は #680〜#682・本番 backend の設計〔Exec の helper と kind 6/7 の再利用・Attach の段階方式・PortForward の NODE / POD。#3752〕。TASK-63.1・#679・#678・CRI-6・REPAIR-5）
 │   │   ├── fdinfo-mnt-id-parsing.md  # core・net・gpu の fdinfo `mnt_id` 解析を共有せず、共有 fixture `crates/core/testdata/fdinfo_mnt_id_cases.txt` の照合試験で一致を担保する判断記録（共有下位 crate の案 B はオーナー承認待ち。#3140・GPU-2・SEC-1・REPAIR-1）
 │   │   ├── pod-namespace-holder.md  # pod の namespace 保持役・netns の共有・本番の PodNetworkProvider 注入の設計と実装単位（#2838・CRI-2・CORE-3・SEC-5・NET-3）
 │   │   ├── restart-relaunch-single-thread.md  # restart の再 launch を単一スレッドを要求する本番 launcher で成り立たせる設計記録（常駐スレッドの停止と監視スレッドでの直接 launch・比較した方式・制御チャネルの扱い・残余。#2043・SUP-3・CORE-1）

@@ -678,21 +678,20 @@ async fn cri6_attach_idle_timeout_notifies_failure_status() {
     }
 }
 
-/// CRI-6: Attach の backend を注入しない構成では従来どおり 501（実装済みを装わない）。
+/// CRI-6・REPAIR-3・#3753: Attach の backend を注入しない構成では Attach は結線されず、
+/// RPC は URL を返さず `UNIMPLEMENTED`（URL を返してから 501 にしない。実装済みを装わない）。
 #[tokio::test]
-async fn cri6_attach_without_backend_is_501() {
-    let (server, service, container) = setup(StreamingConfig::default(), None).await;
-    let path = attach_path(&service, &container, false, true, false, false).await;
-    let addr = server.local_addr();
-    tokio::task::spawn_blocking(move || {
-        let (mut sock, head) =
-            Client::connect_raw(addr, &upgrade_request(&path, Some("v4.channel.k8s.io")));
-        assert!(head.starts_with("HTTP/1.1 501 "), "{head}");
-        let mut rest = Vec::new();
-        let _ = sock.read_to_end(&mut rest);
-    })
-    .await
-    .expect("join");
+async fn cri6_repair3_attach_without_backend_is_unimplemented() {
+    let (_server, service, container) = setup(StreamingConfig::default(), None).await;
+    let err = service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.clone(),
+            stdout: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("attach must be unimplemented");
+    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
 }
 
 /// CRI-6: 交渉の失敗は 403（対応版を列挙）・400。Upgrade せず、トークンは消費済み。

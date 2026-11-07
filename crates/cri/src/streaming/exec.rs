@@ -55,7 +55,10 @@ use super::spdy::{
     Frame, FrameDecoder, FrameEncoder, Headers, MAX_INCOMING_PAYLOAD, MAX_OUTGOING_DATA, SpdyError,
     StreamId, goaway_status, rst_status,
 };
-use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
+use super::{
+    ConnectionPermit, StreamBody, StreamHandler, StreamKind, StreamRequest, StreamWiring,
+    plain_response,
+};
 use crate::error::CriError;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 use crate::runtime::v1;
@@ -330,6 +333,10 @@ impl ExecStreamHandler {
 }
 
 impl StreamHandler for ExecStreamHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::only(StreamKind::Exec)
+    }
+
     fn handle(
         &self,
         request: StreamRequest,

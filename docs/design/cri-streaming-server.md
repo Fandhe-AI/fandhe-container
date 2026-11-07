@@ -11,8 +11,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | HTTP/1.1 サーバーの起動・ルーティング・接続の上限と期限 | 実装済み | #679 |
 | URL の発行（一意・単回使用・TTL つき） | 実装済み | #679 |
 | 3 RPC の入力検証と存在照合 | 浅い検証まで実装済み | #679 |
-| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装で、注入が無ければ 501） | #680（TASK-63.2） |
-| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続（注入が無ければ 501） | #681（TASK-63.3） |
+| Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2） |
+| Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 未実装（注入が無い間は従来どおり `UNIMPLEMENTED`） | #3754 |
 | 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
@@ -54,7 +54,7 @@ Upgrade 後の期限（`StreamingConfig::stream_creation_timeout` 既定 30 秒�
 - メソッドは GET / POST のみ（それ以外は 405）
 - `/exec/{token}`・`/attach/{token}`・`/portforward/{token}` 以外は 404。トークンは小文字 hex の 64 文字以外を照合の前に 404 にする
 - 未知・失効・使用済み・種別違いはすべて同じ 404 にする（区別すると探索の手がかりになる）
-- 有効なトークンの要求は `StreamHandler` に渡す。既定の `NotImplementedHandler` は 501
+- 有効なトークンの要求は `StreamHandler` に渡す。既定の `NotImplementedHandler` は結線済みの種別を持たず（URL は発行されない）、到達した要求には 501 を返す（多層防御）
 
 ## Attach（TASK-63.3・#681）
 
@@ -66,7 +66,7 @@ Upgrade 後の期限（`StreamingConfig::stream_creation_timeout` 既定 30 秒�
 | `streaming/spdy_dictionary.rs` | SPDY/3 の辞書 1423 バイト。出典は `NOTICE`（moby/spdystream）。Adler-32 を draft の辞書 ID（`0xe3c6a7c2`）と照合する試験がある |
 | `streaming/remotecommand.rs` | `*.channel.k8s.io` の交渉（v4・v3・v2）・`streamtype` の割り当て・`metav1.Status` の JSON・resize の JSON・`SessionLimits` |
 | `streaming/attach.rs` | `AttachHandler`（`StreamHandler`）・`AttachBackend`（注入点）・1 接続 1 タスクのセッション |
-| `streaming.rs` の `StreamDispatcher` | 種別ごとのハンドラの振り分け。未設定の種別は 501。#680・#682 は同じ型へ足す |
+| `streaming.rs` の `StreamDispatcher` | 種別ごとのハンドラの振り分け。未設定の種別は結線済みと答えず、URL は発行されない（到達した場合の 501 は多層防御）。#680・#682 は同じ型へ足す |
 
 ### 交渉と流れ
 
@@ -104,7 +104,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 ## Exec（#680・TASK-63.2・CRI-6）
 
-`ExecStreamHandler`（`StreamHandler` の実装）を `StreamDispatcher::with_exec` で登録する（単独なら `bind_with_handler` に直接渡してもよい。Exec 以外の種別は 501）。SPDY の codec・交渉・status・resize の解析・期限（`SessionLimits`）は Attach と共通の `spdy.rs`・`remotecommand.rs` を使い、`exec.rs` に残るのは Exec 固有の部分（起動役 `ExecStreamLauncher`・プロセスの終了コードから Status への変換・stdin の stall 期限）だけである。
+`ExecStreamHandler`（`StreamHandler` の実装）を `StreamDispatcher::with_exec` で登録する（単独なら `bind_with_handler` に直接渡してもよい。Exec 以外の種別は結線済みと答えず、URL は発行されない）。SPDY の codec・交渉・status・resize の解析・期限（`SessionLimits`）は Attach と共通の `spdy.rs`・`remotecommand.rs` を使い、`exec.rs` に残るのは Exec 固有の部分（起動役 `ExecStreamLauncher`・プロセスの終了コードから Status への変換・stdin の stall 期限）だけである。
 
 - 交渉・ストリーム割り当ては Attach と同じ（v4・v3・v2。resize は v3 以降）。受け付ける組は発行時に保存した `ExecRequest` から決める（`StreamOptions::expected`）
 - 終了の通知: v4 は error ストリームに `metav1.Status` の JSON。成功は `{"metadata":{},"status":"Success"}`、非 0 は `reason: NonZeroExitCode` と `details.causes: [{"reason":"ExitCode","message":"<code>"}]`。v3・v2 は成功時に何も書かず、非 0 は `command terminated with exit code <code>` のテキスト（kubelet と同じ）。起動失敗・待ち失敗は `InternalError` の固定文で、内部のパス・エラー文は載せない。続けて未 FIN の出力に FIN、GOAWAY を送り閉じる
@@ -279,7 +279,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 | issue | 内容 | 範囲の変更（issue 本文の想定との差） |
 | ----- | ---- | ------------------------------------ |
-| #3753 | 結線済みの種別だけ URL を発行する | attach の読み取り専用・POD 未対応・exec の相対 argv[0] を RPC 時に断る情報を載せうる |
+| #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763）・POD 未対応（#3766）・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
 | #3754 | `StreamingServer` の起動・注入 | — |
 | #3755 | NODE の dialer | cri の `PortForwardDialer` の引数に対象の型を足す（cri の変更を含む） |
 | #3756 | 試験 | — |
@@ -317,3 +317,12 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 ## 依存
 
 `flate2`（zlib-rs backend。SPDY のヘッダブロックの辞書つき zlib。#681 で crates/cri の直接依存にした。承認は #678 のオーナー判断で、新しいパッケージは増えない）。`hyper =1.12.0`（`server`/`http1`）・`hyper-util =0.1.21`（`tokio`）・`tokio` の `net`/`time` を crates/cri に追加した（承認 #678）。いずれも `Cargo.lock` に既存で、新しいパッケージは増えない。`http-body-util`・`bytes`・`http` は直接依存にせず、`hyper` の再 export と自前の小さな本体型（`StreamBody`）で足りる範囲に留めた。
+
+## 結線情報（#3753・REPAIR-3）
+
+- `StreamHandler::wiring()`（既定実装なしの必須メソッド）が、そのハンドラが処理する種別を `StreamWiring` で返す。`StreamingServer` は起動時に 1 回だけ読み、`StreamingUrlIssuer` に持たせる（スナップショット。ハンドラは寿命の間、値を変えない）
+- `StreamDispatcher::wiring()` は、登録済みの slot のうち子ハンドラが同じ種別を結線済みと答えるものだけを返す。`StreamingServer::bind`（`NotImplementedHandler`）はどの種別も結線しない
+- `CriRuntimeService` の `exec`・`attach`・`port_forward` は、入力検証と存在照合より前に `StreamingUrlIssuer::require_wired` を通し、未結線の種別は URL を返さず `UNIMPLEMENTED`（英語の固定文。トークン・要求の中身を含めない）にする。未注入のときと同じ順序で、未知のコンテナでも `NOT_FOUND` より先に `UNIMPLEMENTED` になる
+- `StreamingUrlIssuer::issue` も未結線の種別を乱数源とトークン枠の消費より前に断る（多層防御）。未結線の RPC を繰り返しても、結線済みの種別の発行枠（`max_in_flight`）は埋まらない
+- 未結線の種別の HTTP 側の 501 は、issuer を経ない到達に対する多層防御として残す
+- `StreamWiring` は後から項目を足せる構造体で、現状は種別ごとの結線の有無だけを持つ。既定は全未結線（fail-closed）

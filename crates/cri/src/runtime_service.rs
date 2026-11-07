@@ -141,7 +141,7 @@ use crate::runtime::v1::{
     runtime_service_server::RuntimeService,
 };
 use crate::streaming::{
-    StreamRequest, StreamingUrlIssuer, validate_attach_request, validate_exec_request,
+    StreamKind, StreamRequest, StreamingUrlIssuer, validate_attach_request, validate_exec_request,
     validate_port_forward_request,
 };
 use config_limits::BoundedConfig;
@@ -1749,9 +1749,10 @@ impl CriRuntimeService {
 
     /// `Exec`・`Attach`・`PortForward` が返すストリーミング URL の発行口を差す注入点（TASK-63.1・#679・CRI-6）。
     ///
-    /// 呼ばなければ従来どおり 3 RPC は `UNIMPLEMENTED`。差すと入力検証と存在照合を通った要求ごとに新しい URL を返す。
+    /// 呼ばなければ従来どおり 3 RPC は `UNIMPLEMENTED`。差すと、issuer が結線済みと答える種別だけ、入力検証と
+    /// 存在照合を通った要求ごとに新しい URL を返す。結線していない種別の RPC は URL を返さず `UNIMPLEMENTED`
+    /// になる（入力検証より前。REPAIR-3・#3753）。
     /// URL の先のサーバー（`crate::streaming::StreamingServer`）は呼び出し側が起動して `issuer()` を渡す。
-    /// **未実装（REPAIR-3）**: URL の先は現状 501 を返すだけで、プロトコル本体は #680〜#682。
     /// plugin-cri からの起動と注入は後続の issue。
     pub fn with_streaming(mut self, issuer: Arc<StreamingUrlIssuer>) -> Self {
         self.streaming = Some(issuer);
@@ -3708,7 +3709,7 @@ impl CriRuntimeService {
 
     /// `Exec` の本体。検証 → 存在照合 → URL 発行（CRI-6・TASK-63.1。注入が無ければ `UNIMPLEMENTED`）。
     fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
-        let issuer = self.streaming_issuer("exec")?;
+        let issuer = self.streaming_issuer(StreamKind::Exec, "exec")?;
         validate_exec_request(&req)?;
         self.require_container(&req.container_id)?;
         let url = issuer.issue(StreamRequest::Exec(req))?;
@@ -3718,7 +3719,7 @@ impl CriRuntimeService {
     /// `Attach` の本体（CRI-6・TASK-63.1・TASK-63.3）。running のコンテナだけに URL を発行する
     /// （接続時にも backend が再確認する）。
     fn attach_impl(&self, req: v1::AttachRequest) -> Result<v1::AttachResponse, CriError> {
-        let issuer = self.streaming_issuer("attach")?;
+        let issuer = self.streaming_issuer(StreamKind::Attach, "attach")?;
         validate_attach_request(&req)?;
         self.require_running_container(&req.container_id)?;
         let url = issuer.issue(StreamRequest::Attach(req))?;
@@ -3730,7 +3731,7 @@ impl CriRuntimeService {
         &self,
         req: v1::PortForwardRequest,
     ) -> Result<v1::PortForwardResponse, CriError> {
-        let issuer = self.streaming_issuer("port_forward")?;
+        let issuer = self.streaming_issuer(StreamKind::PortForward, "port_forward")?;
         validate_port_forward_request(&req)?;
         let exists = self
             .registry
@@ -3745,10 +3746,18 @@ impl CriRuntimeService {
         Ok(v1::PortForwardResponse { url })
     }
 
-    fn streaming_issuer(&self, rpc: &'static str) -> Result<Arc<StreamingUrlIssuer>, CriError> {
-        self.streaming
+    /// 注入済みの issuer を返す。未注入、または `kind` が未結線なら `UNIMPLEMENTED`（REPAIR-3・#3753）。
+    fn streaming_issuer(
+        &self,
+        kind: StreamKind,
+        rpc: &'static str,
+    ) -> Result<Arc<StreamingUrlIssuer>, CriError> {
+        let issuer = self
+            .streaming
             .clone()
-            .ok_or_else(|| CriError::unimplemented(rpc))
+            .ok_or_else(|| CriError::unimplemented(rpc))?;
+        issuer.require_wired(kind)?;
+        Ok(issuer)
     }
 
     /// コンテナが存在し running であることを照合する（未知は `NOT_FOUND`、running 以外は `FAILED_PRECONDITION`）。
@@ -4264,7 +4273,7 @@ impl RuntimeService for CriRuntimeService {
     ) -> Result<Response<v1::ExecSyncResponse>, Status> {
         Err(CriError::unimplemented("exec_sync").into())
     }
-    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
+    /// ストリーミング URL を返す（`with_streaming` 注入時の結線済みの種別のみ。未注入・未結線は `UNIMPLEMENTED`。CRI-6・TASK-63.1・#3753）。
     async fn exec(
         &self,
         request: Request<v1::ExecRequest>,
@@ -4274,7 +4283,7 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
-    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
+    /// ストリーミング URL を返す（`with_streaming` 注入時の結線済みの種別のみ。未注入・未結線は `UNIMPLEMENTED`。CRI-6・TASK-63.1・#3753）。
     async fn attach(
         &self,
         request: Request<v1::AttachRequest>,
@@ -4284,7 +4293,7 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
-    /// ストリーミング URL を返す（`with_streaming` 注入時のみ。未注入は `UNIMPLEMENTED`。CRI-6・TASK-63.1）。
+    /// ストリーミング URL を返す（`with_streaming` 注入時の結線済みの種別のみ。未注入・未結線は `UNIMPLEMENTED`。CRI-6・TASK-63.1・#3753）。
     async fn port_forward(
         &self,
         request: Request<v1::PortForwardRequest>,

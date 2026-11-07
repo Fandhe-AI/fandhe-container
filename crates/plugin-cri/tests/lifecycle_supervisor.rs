@@ -734,6 +734,16 @@ fn cri2_kill_uses_plain_signal_without_intent() {
     assert_eq!(h.sim.calls(), [(Kind::Plain, Signal::SIGTERM)]);
 }
 
+/// kill(AllProcesses) は signaler を呼ばず、cgroup 配置の記録が無ければ FailedPrecondition（CRI-5・CORE-4）。
+#[test]
+fn cri5_kill_all_processes_without_placement_is_failed_precondition() {
+    let h = harness(running("c1", 4242), LONG);
+    let req = KillRequest::all_processes(cid("c1"), Signal::SIGKILL).expect("sigkill is allowed");
+    let err = h.rt.kill(&req).expect_err("no recorded placement");
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(h.sim.calls(), []);
+}
+
 /// 何もしない remover（scope は記録の `/fc` と一致させる）。`remove` の呼び出し回数を数える。
 struct CountingRemover {
     removes: AtomicU32,

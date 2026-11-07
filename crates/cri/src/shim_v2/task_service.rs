@@ -33,9 +33,10 @@
 //! - State: `exec_id` 非空は `UNIMPLEMENTED`。状態は Creating / Created → CREATED、Running → RUNNING、Stopped → STOPPED、
 //!   それ以外 → UNKNOWN。`exit_status` は STOPPED のときだけ終了コード（不明は 255）。`bundle`・stdio・`terminal`・`exited_at` は
 //!   shim / core が持たないため空・未設定（REPAIR-3）。
-//! - Kill: `exec_id` 非空と `all = true` は `UNIMPLEMENTED`（core の kill は init プロセスにしか送れず、cgroup 全体へ送る経路が
-//!   無い。containerd の猶予切れ SIGKILL〔`WithKillAll`〕は未結線）。`signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。
-//!   停止済みは runc shim と同じく `NOT_FOUND`（"process already finished"）。state と kill の間の競合は core の応答をそのまま返す。
+//! - Kill: `exec_id` 非空は `UNIMPLEMENTED`。`signal` は 1..=64 以外を `INVALID_ARGUMENT` にする。`all = true`
+//!   （containerd の `WithKillAll`）はコンテナの cgroup 全体へ `cgroup.kill` で送り（core の `KillTarget::AllProcesses`。
+//!   CRI-5・CORE-4）、SIGKILL 以外は `INVALID_ARGUMENT`。cgroup 配置の記録が無ければ `FAILED_PRECONDITION`（init だけへ
+//!   縮退しない）。cgroup が既に無い・空なら成功。停止済みは runc shim と同じく `NOT_FOUND`（"process already finished"）。state と kill の間の競合は core の応答をそのまま返す。
 //! - Shutdown: [`ShutdownSignal`] が差し込まれているときだけ動く。`now = true` かコンテナが残っていない（state が `NOT_FOUND`）とき
 //!   終了を要求し、コンテナが残っていれば何もせず成功を返す（runc shim と同じ）。state の他のエラーは終了せずに返す（fail-closed）。冪等。
 //!
@@ -181,14 +182,11 @@ impl TaskService {
         .encode_to_vec())
     }
 
-    /// `Kill`: init プロセスへシグナルを送る（TASK-62.7.2）。
+    /// `Kill`: init プロセス（`all = true` はコンテナの cgroup 全体）へシグナルを送る（TASK-62.7.2・CRI-5）。
     fn kill(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
         let req = KillRequest::decode(payload).map_err(|_| decode_failure())?;
         if !req.exec_id.is_empty() {
             return Err(unsupported("exec_id is not supported"));
-        }
-        if req.all {
-            return Err(unsupported("kill all is not supported"));
         }
         // 状態の照会より前に検証する（停止済み・不在の ID でも範囲外は INVALID_ARGUMENT）。
         let signal = u8::try_from(req.signal)
@@ -200,6 +198,9 @@ impl TaskService {
                     "signal number must be in 1..=64",
                 )
             })?;
+        if req.all {
+            RuntimeAdapter::check_kill_all_signal(signal).map_err(|e| to_status(&e))?;
+        }
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         if st.lifecycle == RuntimeLifecycle::Stopped {
             return Err(RpcStatus::from_code(
@@ -207,9 +208,15 @@ impl TaskService {
                 "process already finished",
             ));
         }
-        self.adapter
-            .kill(&req.id, signal)
-            .map_err(|e| to_status(&e))?;
+        if req.all {
+            self.adapter
+                .kill_all(&req.id, signal)
+                .map_err(|e| to_status(&e))?;
+        } else {
+            self.adapter
+                .kill(&req.id, signal)
+                .map_err(|e| to_status(&e))?;
+        }
         Ok(Vec::new())
     }
 
@@ -626,11 +633,12 @@ mod tests {
         }
         fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
             let id = r.id().as_str().to_owned();
-            self.0
-                .calls
-                .lock()
-                .unwrap()
-                .push(format!("kill {id} {}", r.signal().as_u8()));
+            self.0.calls.lock().unwrap().push(match r.target() {
+                fandhe_container_core::traits::KillTarget::AllProcesses => {
+                    format!("kill-all {id} {}", r.signal().as_u8())
+                }
+                _ => format!("kill {id} {}", r.signal().as_u8()),
+            });
             Ok(ContainerStatus::running(
                 r.id().clone(),
                 NonZeroU32::new(4242),
@@ -1185,8 +1193,24 @@ mod tests {
                 "{sig}"
             );
         }
-        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
-        assert_eq!((code, msg.as_str()), (UNIMPL, "kill all is not supported"));
+        // all=true は SIGKILL だけを cgroup 全体へ送る。SIGKILL 以外は状態照会より前に拒否。
+        s.handle("Kill", &kill_req("c1", 9, true, "")).unwrap();
+        assert_eq!(f.calls.lock().unwrap().last().unwrap(), "kill-all c1 9");
+        for sig in [1u32, 15, 64] {
+            let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", sig, true, "")));
+            assert_eq!(
+                (code, msg.as_str()),
+                (INVALID, "kill all supports only SIGKILL")
+            );
+        }
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 15, true, ""))).0,
+            INVALID
+        );
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 9, true, ""))).0,
+            NOT_FOUND
+        );
         let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e")));
         assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
         assert_eq!(
@@ -1194,7 +1218,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c.starts_with("kill"))
+                .filter(|c| c.starts_with("kill "))
                 .count(),
             3
         );

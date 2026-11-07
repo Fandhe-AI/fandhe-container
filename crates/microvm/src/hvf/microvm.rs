@@ -34,7 +34,7 @@
 //! Linux の `STOP_DEADLINE_MAX` と同じ）つきで止める。start しないまま drop すると、ゲストは一度も走らずに終わる。
 //! 終了理由は Linux と共有の `StopReason`（`stop` の `Requested`、PSCI の SYSTEM_OFF・SYSTEM_RESET は `GuestShutdown`、未対応・未知の
 //! exit は fail-closed の `Failed(Unimplemented / Internal)`）で、[`HvfStopReport`] に載せる。
-//! exit ごとの処理は `hvf::{mmio, hvc, timer}`（#3793・#3794・#3796）が担い、WFI の待ちの上限など残る制限は `hvf::timer` の「未実装・簡易実装」を参照。
+//! exit ごとの処理は `hvf::{mmio, hvc}`（#3793・#3794）が担う。WFI の exit・vtimer の exit は GIC つきでは来ず、来たら `Failed(Unimplemented)` で止める（#4039・#3995）。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
 //! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを全台起こす `WfiWakeSet` の通知。#3887・#3948。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
@@ -79,7 +79,7 @@
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
 //!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は #4014。全体の追跡は #3908。
-//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
+//! - PSCI は #3794 で実装済み（WFI / vtimer は #4039 で処理を消し fail-closed）。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否（合成 Image は無しで起動した。#3803。実カーネルは #3988）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
@@ -101,7 +101,6 @@ use crate::hvf::gic::{GicSpiLine, VmWithGic};
 use crate::hvf::hvc::HvcHandler;
 use crate::hvf::memory::{HvfGuestRam, RegisteredHvfRam};
 use crate::hvf::mmio::MmioHandler;
-use crate::hvf::timer::TimerHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuSet, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
 use crate::hvf_lifecycle::{
@@ -602,7 +601,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .with_queue_notify_routes(queue_routes.clone())
                     .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
-                timer: TimerHandler::new(),
             },
             vcpu,
         )?;
@@ -627,7 +625,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                             .with_queue_notify_routes(queue_routes.clone())
                             .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
                         hvc,
-                        timer: TimerHandler::new(),
                     };
                     VcpuThread::spawn_parked_ap(
                         Arc::clone(&vm),

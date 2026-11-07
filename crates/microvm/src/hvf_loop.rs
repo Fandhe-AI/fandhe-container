@@ -12,7 +12,7 @@
 //! # 契約
 //! - 停止: `LoopHandle::stop` は停止フラグ（`Release`）を立ててから kick する。ループは `Canceled` の戻りでフラグ（`Acquire`）を
 //!   確かめて抜ける。kick が実行より先に届いたときの取りこぼしに備え、待つ間も一定間隔で kick し直す。
-//!   WFI の待ちは kick では起きないため、macOS では kick を `hvf_wake::WakingKick` で包んで待ちも起こす（#3887）。
+//!   macOS では kick を `hvf_wake::WakingKick` で包む（WFI の待ちは #4039 で消えた。包みの整理は #4040）。
 //! - 期限: 作成待ち・停止待ち・drop の待ちはいずれも期限つき。期限切れは待っていたスレッドを切り離し、`DeadlineExceeded`
 //!   （表記 `TIMEOUT`）で返す。無期限の `join` はしない。
 //! - fail-closed: 未知の exit・未対応の例外クラスは推測で続行せず VM を止める（[`run_loop`] の表）。
@@ -24,7 +24,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //! SysReg trap は OS Lock レジスタ（`OSDLR_EL1`・`OSLAR_EL1`）の write だけ処理する（#4037。`crate::sysreg_os_lock`）。
-//! それ以外の SysReg（read を含む）は `Failed(Unimplemented)` で止める（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕・WFI / vtimer〔#3796〕とも実装済み）。
+//! それ以外の SysReg（read を含む）は `Failed(Unimplemented)` で止める（exit ごとの実処理は MMIO〔#3793〕・PSCI / HVC〔#3794〕が実装済み）。
+//! WFI の exit と `VTIMER_ACTIVATED` は GIC つきの構成では来ない（#3803・#3988、判断 #3995）ため、待ちも起床も持たず診断ログを出して
+//! `Failed(Unimplemented)` で止める（#4039。WFE / WFIT / WFET は PC を進めて続行）。
 
 use std::fmt;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
-use crate::esr::{EsrClass, SysRegDirection, decode_esr};
+use crate::esr::{EsrClass, SysRegDirection, WfxKind, decode_esr, instruction_length};
 use crate::hvf_abi::{HvRunStats, HvVcpuExit, HvVcpuExitException};
 use crate::stop::StopReason;
 use crate::sysreg_os_lock::classify_os_lock_write;
@@ -250,6 +252,9 @@ pub trait VcpuExec {
     /// ゲストの現在の PC。止まる前の診断ログ専用（REPAIR-4）。読めなければ `None`（停止理由には影響しない）。
     /// `dispatch_error` の行ではハンドラが動いた後の値で、PC を進めた後かもしれない。
     fn pc(&self) -> Option<u64>;
+    /// trap した命令の次へ PC を `bytes` だけ進める。WFE / WFIT / WFET の続行で [`run_loop_exit`] が呼ぶ（#4039・MVM-5）。
+    /// PC を読めない・書けない・桁あふれは `Err`（推測で続けず fail-closed に止める）。
+    fn advance_pc(&mut self, bytes: u64) -> Result<(), MicrovmError>;
 }
 
 /// 他スレッドから実行を止める手段（`VcpuCanceller` の抽象）。
@@ -292,6 +297,8 @@ where
 /// | `Canceled` でフラグなし（取りこぼした kick の後着） | 続行 |
 /// | `Unknown` | `Stopped(Failed(Internal))`（止まる前に `kind=unknown_exit_reason` の診断ログを 1 行出す。REPAIR-4） |
 /// | OS Lock（`OSDLR_EL1`・`OSLAR_EL1`）の write 以外の SysReg / ISV=0 の data abort / 未知の EC | `Stopped(Failed(Unimplemented))`（esr の fail-closed 契約。REPAIR-3。止まる前に `unsupported_exit_line` の診断ログを 1 行出す。REPAIR-4・MVM-5） |
+/// | WFI の exit / `VTIMER_ACTIVATED` | `Stopped(Failed(Unimplemented))`（GIC つきでは来ない。`kind=wfi` / `kind=vtimer` の診断ログを 1 行出して止める。#4039・#3995） |
+/// | WFE / WFIT / WFET の exit | `exec.advance_pc` で命令長だけ PC を進めて続行（`dispatch` へ回さない。`Err` は診断ログの後 `Stopped(Failed(e.code()))`） |
 /// | OS Lock の SysReg write・それ以外 | `dispatch` の結果（`Continue` / `Stop(r)` / `Park` → `Parked` / `Err(e)` → `Stopped(Failed(e.code()))`。`Err` は全 code で止まる前に `dispatch_error_line` の診断ログを 1 行出す） |
 ///
 /// 分類した exit は、振り分けの前に `observer` へ記録する。
@@ -331,6 +338,25 @@ where
             HvExit::Unknown(_) => {
                 log_unsupported_exit(exec, &exit);
                 return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Internal));
+            }
+            // GIC つきの構成では WFI も VTIMER_ACTIVATED も exit しない（#3803・#3988・#3995）。来たら待たずに止める。
+            HvExit::Exception {
+                class: EsrClass::Wfx(WfxKind::Wfi),
+                ..
+            }
+            | HvExit::VtimerActivated => {
+                log_unsupported_exit(exec, &exit);
+                return LoopExit::Stopped(StopReason::Failed(MicrovmErrorCode::Unimplemented));
+            }
+            // WFE / WFIT / WFET は待たずに命令の次へ進めて続行する。
+            HvExit::Exception {
+                class: EsrClass::Wfx(_),
+                exception,
+            } => {
+                if let Err(e) = exec.advance_pc(instruction_length(exception.syndrome).bytes()) {
+                    log_error_exit(exec, &e, Some(&exit));
+                    return LoopExit::Stopped(StopReason::Failed(e.code()));
+                }
             }
             HvExit::Exception {
                 class: EsrClass::SysReg(a),
@@ -449,6 +475,8 @@ fn dispatch_error_line(thread: &str, e: &MicrovmError, exit: &HvExit, pc: Option
 /// | `sysreg` | `esr`・`pc`・`op0`・`op1`・`crn`・`crm`・`op2`・`rt`・`dir`（`read` / `write`） |
 /// | `data_abort_isv0` | `esr`・`pc`・`iss`・`va`・`ipa` |
 /// | `unknown_ec` | `esr`・`pc`・`ec` |
+/// | `wfi` | `esr`・`pc`（#4039） |
+/// | `vtimer` | `pc`（ESR は無い。#4039） |
 /// | `unknown_exit_reason` | `pc`・`raw`（ESR は無い） |
 fn unsupported_exit_line(thread: &str, exit: &HvExit, pc: Option<u64>) -> String {
     let pc = pc_field(pc);
@@ -474,6 +502,7 @@ fn unsupported_exit_line(thread: &str, exit: &HvExit, pc: Option<u64>) -> String
                     "kind=data_abort_isv0 esr={esr:#x} pc={pc} iss={iss:#x} va={:#x} ipa={:#x}",
                     exception.virtual_address, exception.physical_address
                 ),
+                EsrClass::Wfx(WfxKind::Wfi) => format!("kind=wfi esr={esr:#x} pc={pc}"),
                 EsrClass::Other { ec } => {
                     format!("kind=unknown_ec esr={esr:#x} pc={pc} ec={ec:#x}")
                 }
@@ -484,6 +513,7 @@ fn unsupported_exit_line(thread: &str, exit: &HvExit, pc: Option<u64>) -> String
         HvExit::Unknown(raw) => {
             format!("{head} thread={thread} kind=unknown_exit_reason pc={pc} raw={raw:#x}")
         }
+        HvExit::VtimerActivated => format!("{head} thread={thread} kind=vtimer pc={pc}"),
         _ => format!("{head} thread={thread} kind=other pc={pc}"),
     }
 }
@@ -1239,6 +1269,15 @@ mod tests {
         fn pc(&self) -> Option<u64> {
             self.pc
         }
+
+        fn advance_pc(&mut self, bytes: u64) -> Result<(), MicrovmError> {
+            let next = self
+                .pc
+                .and_then(|pc| pc.checked_add(bytes))
+                .ok_or_else(|| err(MicrovmErrorCode::Internal, "pc unavailable"))?;
+            self.pc = Some(next);
+            Ok(())
+        }
     }
 
     fn deadline_err() -> MicrovmError {
@@ -1324,16 +1363,89 @@ mod tests {
     #[test]
     fn mvm5_3791_run_loop_continue_then_next_exit() {
         let (r, runs, dispatched, counts) = run_script(
-            vec![Ok(exc(WFI)), Ok(HvVcpuExit::VtimerActivated), Ok(exc(SMC0))],
+            vec![Ok(exc(HVC0)), Ok(exc(SMC0)), Ok(exc(HVC0))],
             None,
             CONT,
         );
         // 台本が尽きると Internal で止まる。
         assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Internal));
         assert_eq!((runs, dispatched), (4, 3));
-        assert_eq!(counts.count(ExitKind::Wfx), 1);
-        assert_eq!(counts.count(ExitKind::Vtimer), 1);
+        assert_eq!(counts.count(ExitKind::Hvc), 2);
         assert_eq!(counts.count(ExitKind::Smc), 1);
+    }
+
+    /// WFI の exit と `VTIMER_ACTIVATED` は待たずに `Failed(Unimplemented)` で止まり、dispatch は呼ばれない（#4039・#3995・MVM-5）。
+    #[test]
+    fn mvm5_4039_wfi_and_vtimer_exits_fail_closed() {
+        let (r, runs, dispatched, counts) = run_script(vec![Ok(exc(WFI))], None, CONT);
+        assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
+        assert_eq!((runs, dispatched), (1, 0));
+        assert_eq!(counts.count(ExitKind::Wfx), 1);
+        let (r, runs, dispatched, counts) =
+            run_script(vec![Ok(HvVcpuExit::VtimerActivated)], None, CONT);
+        assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
+        assert_eq!((runs, dispatched), (1, 0));
+        assert_eq!(counts.count(ExitKind::Vtimer), 1);
+    }
+
+    /// WFE / WFIT / WFET は PC を命令長（IL=1 で 4）だけ進めて続行し、dispatch へ回さない（#4039）。
+    #[test]
+    fn mvm5_4039_wfe_wfit_wfet_advance_pc_by_4_and_continue() {
+        for (syndrome, name) in [(WFI | 1, "wfe"), (WFI | 2, "wfit"), (WFI | 3, "wfet")] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut exec =
+                ScriptedExec::new(&stop, vec![Ok(exc(syndrome)), Ok(HvVcpuExit::Canceled)])
+                    .stop_before(1);
+            exec.pc = Some(0x4000_1000);
+            let counts = ExitCounts::new();
+            let mut dispatched = 0;
+            let r = run_loop(
+                &mut exec,
+                &stop,
+                Duration::from_millis(1),
+                Some(&counts),
+                |_, _| {
+                    dispatched += 1;
+                    CONT
+                },
+            );
+            assert_eq!(r, StopReason::Requested, "{name}");
+            assert_eq!(exec.pc, Some(0x4000_1004), "{name}");
+            assert_eq!((exec.runs, dispatched), (2, 0), "{name}");
+            assert_eq!(counts.count(ExitKind::Wfx), 1, "{name}");
+        }
+        // 3 件続けると 12 バイト進む。
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut exec = ScriptedExec::new(
+            &stop,
+            vec![
+                Ok(exc(WFI | 1)),
+                Ok(exc(WFI | 2)),
+                Ok(exc(WFI | 3)),
+                Ok(HvVcpuExit::Canceled),
+            ],
+        )
+        .stop_before(3);
+        exec.pc = Some(0x4000_1000);
+        let r = run_loop(&mut exec, &stop, Duration::from_millis(1), None, |_, _| {
+            CONT
+        });
+        assert_eq!(r, StopReason::Requested);
+        assert_eq!(exec.pc, Some(0x4000_100c));
+    }
+
+    /// PC を進められない WFE は推測で続けず、`advance_pc` のコードで止まる（fail-closed。#4039）。
+    #[test]
+    fn mvm5_4039_wfe_advance_failure_stops() {
+        for pc in [None, Some(u64::MAX - 1)] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut exec = ScriptedExec::new(&stop, vec![Ok(exc(WFI | 1))]);
+            exec.pc = pc;
+            let r = run_loop(&mut exec, &stop, Duration::from_millis(1), None, |_, _| {
+                CONT
+            });
+            assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Internal));
+        }
     }
 
     /// 未知の reason は Internal、未対応の例外クラスは Unimplemented で、dispatch は呼ばれない。
@@ -1343,7 +1455,7 @@ mod tests {
         assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Internal));
         assert_eq!(dispatched, 0);
         assert_eq!(counts.count(ExitKind::Unknown), 1);
-        for syndrome in [OTHER_EC, SYSREG, DABT_ISV0] {
+        for syndrome in [OTHER_EC, SYSREG, DABT_ISV0, WFI] {
             let (r, _, dispatched, _) = run_script(vec![Ok(exc(syndrome))], None, CONT);
             assert_eq!(r, StopReason::Failed(MicrovmErrorCode::Unimplemented));
             assert_eq!(dispatched, 0);
@@ -1419,6 +1531,19 @@ mod tests {
         assert_eq!(
             unsupported_exit_line("hvf-vcpu-0", &other, Some(0x1)),
             format!("{head} kind=unknown_ec esr=0x82000004 pc=0x1 ec=0x20")
+        );
+        // WFI（EC=1・IL=1）と vtimer（#4039）
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &exc_with(WFI, 0, 0), Some(0x4000_0000)),
+            format!("{head} kind=wfi esr=0x6000000 pc=0x40000000")
+        );
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &HvExit::VtimerActivated, Some(0x10)),
+            format!("{head} kind=vtimer pc=0x10")
+        );
+        assert_eq!(
+            unsupported_exit_line("hvf-vcpu-0", &HvExit::VtimerActivated, None),
+            format!("{head} kind=vtimer pc=unknown")
         );
         // PC を読めないとき
         assert_eq!(

@@ -3,11 +3,11 @@
 //! 役割: Hypervisor.framework の vCPU は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は作成スレッドから
 //! 呼ぶ）。専用スレッドで `HvVcpu` を作って所有し、レジスタ初期化（`setup`）の後に実行ループを回す。ループ・停止・期限・観測の
 //! 論理は OS 非依存の `crate::hvf_loop` にあり（`hv_*` を呼ばない偽の実行体で単体試験できる）、本ファイルは次だけを持つ。
-//! - `HvVcpu` への [`VcpuExec`]（`pc` は未対応 exit の診断ログ用に `HvReg::PC` を読む。#4035・REPAIR-4）と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包み、WFI の待ちも起こす。#3887）
-//! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, timer}` のハンドラへ振り分ける関数
+//! - `HvVcpu` への [`VcpuExec`]（`pc` は未対応 exit の診断ログ用に `HvReg::PC` を読む。#4035・REPAIR-4。`advance_pc` は WFE 系の続行用。#4039）と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包む）
+//! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, sysreg}` のハンドラへ振り分ける関数
 //!
 //! 呼び出し元は #3797（構成体の組み立て。`setup` に PC・CPSR・X0（FDT のアドレス）等の初期化を渡し、ハンドラ状態を持たせる）。
-//! `mmio`・`hvc`・`timer` の関数シグネチャは担当 issue（#3793・#3794・#3796。いずれも実装済み）との契約で、変えるときは振り分ける関数と揃える。
+//! `mmio`・`hvc` の関数シグネチャは担当 issue（#3793・#3794。いずれも実装済み）との契約で、変えるときは振り分ける関数と揃える。
 //!
 //! # 寿命の契約
 //! スレッドは `Arc<VmWithGic>` の複製を持ち、vCPU が生きている間は VM が破棄されない。呼び出し元は自分の `Arc` とゲスト RAM
@@ -31,7 +31,7 @@
 //! N 台の停止は [`VcpuSet`] が `hvf_loop::stop_all` で集約し、どれか 1 台が終われば [`VcpuSet::is_finished`] が真になる。
 //!
 //! # 未実装（REPAIR-3）
-//! exit ごとの処理は mmio・hvc・timer・sysreg（OS Lock の write のみ。#4037）とも実装済み。それ以外の SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed）。各ハンドラに残る制限は `hvf::timer` の「未実装・簡易実装」と `hvf::{mmio, hvc}` の「未実装」節を参照。
+//! exit ごとの処理は mmio・hvc・sysreg（OS Lock の write のみ。#4037）が実装済み。WFI の exit・`VTIMER_ACTIVATED`（GIC つきでは来ない。#3803・#3988・#3995）・それ以外の SysReg trap・ISV=0 の data abort・未知の EC は `hvf_loop::run_loop` が `Failed(Unimplemented)` で VM を止める（fail-closed。#4039）。WFE / WFIT / WFET は `hvf_loop` が PC を進めて続行する。各ハンドラに残る制限は `hvf::{mmio, hvc}` の「未実装」節を参照。
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -44,7 +44,7 @@ use crate::boot_arm64::{
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::EsrClass;
 use crate::hvf::VmWithGic;
-use crate::hvf::{hvc, mmio, sysreg, timer};
+use crate::hvf::{hvc, mmio, sysreg};
 use crate::hvf_abi::{HVF_MAX_VCPUS, HvReg, HvRunStats, HvSysReg, HvVcpuExit, check_run_deadline};
 use crate::hvf_lifecycle::VcpuStopper;
 use crate::hvf_loop::{
@@ -73,8 +73,6 @@ pub struct ExitHandlers {
     pub mmio: mmio::MmioHandler,
     /// HVC / SMC（PSCI）。#3794。
     pub hvc: hvc::HvcHandler,
-    /// WFI / vtimer。#3796。
-    pub timer: timer::TimerHandler,
 }
 
 /// [`VcpuThread::spawn`] の設定。
@@ -99,12 +97,10 @@ impl Default for VcpuThreadConfig {
 }
 
 /// `HvVcpu` を [`VcpuExec`] として扱う薄い包み（スレッド内でだけ作る。`!Send`）。
-/// vtimer の mask 同期を `hv_vcpu_run` の再入直前に行うため `TimerHandler` もここで持つ（MVM-5・#3796）。
-struct HvfExec<'a>(HvVcpu<'a>, timer::TimerHandler);
+struct HvfExec<'a>(HvVcpu<'a>);
 
 impl VcpuExec for HvfExec<'_> {
     fn run(&mut self, slice: Duration) -> Result<HvVcpuExit, MicrovmError> {
-        timer::sync_before_run(&mut self.0, &mut self.1)?;
         self.0.run_once(slice)
     }
 
@@ -114,6 +110,14 @@ impl VcpuExec for HvfExec<'_> {
 
     fn pc(&self) -> Option<u64> {
         self.0.get_reg(HvReg::PC).ok()
+    }
+
+    fn advance_pc(&mut self, bytes: u64) -> Result<(), MicrovmError> {
+        let pc = self.0.get_reg(HvReg::PC)?;
+        let next = pc
+            .checked_add(bytes)
+            .ok_or_else(|| internal("pc overflow at wfx exit"))?;
+        self.0.set_reg(HvReg::PC, next)
     }
 }
 
@@ -214,7 +218,6 @@ fn dispatch(
     exit: &HvExit,
 ) -> Result<ExitAction, MicrovmError> {
     let vcpu = &mut exec.0;
-    let timer_handler = &mut exec.1;
     match exit {
         HvExit::Exception { class, exception } => match class {
             EsrClass::DataAbort(da) => {
@@ -222,13 +225,11 @@ fn dispatch(
             }
             EsrClass::Hvc { imm16 } => hvc::handle_hvc(vcpu, &mut handlers.hvc, *imm16, exception),
             EsrClass::Smc { imm16 } => hvc::handle_smc(vcpu, &mut handlers.hvc, *imm16, exception),
-            EsrClass::Wfx(kind) => timer::handle_wfx(vcpu, timer_handler, *kind, exception),
             EsrClass::SysReg(access) => sysreg::handle_sysreg(vcpu, access, exception),
             _ => Err(internal(
                 "unexpected exception class reached the dispatcher",
             )),
         },
-        HvExit::VtimerActivated => timer::handle_vtimer(vcpu, timer_handler),
         _ => Err(internal("unexpected exit reached the dispatcher")),
     }
 }
@@ -337,9 +338,7 @@ impl VcpuThread {
         let slot: Arc<OnceLock<u64>> = Arc::new(OnceLock::new());
         let slot_in = Arc::clone(&slot);
         let name = format!("hvf-vcpu-{index}");
-        // WFI の待ちは vCPU 専用のスロットに結び（SPI は宛先のスロットだけを起こす。#3948）、停止要求は全台を起こす。
         let mut handlers = handlers;
-        handlers.timer.set_waker(vm.wfi_waker_for_vcpu(index)?);
         let wake = vm.wake_set();
         let kick_mailbox = Arc::clone(&mailbox);
         let shutdown = vm.shutdown();
@@ -383,7 +382,7 @@ impl VcpuThread {
                         peer.2.notify_all();
                     }),
                 );
-                let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
+                let mut exec = HvfExec(vcpu);
                 let reason = run_parked_ap(
                     &mailbox,
                     &stop,
@@ -427,9 +426,6 @@ impl VcpuThread {
         let slice = config.run_slice;
         let observer = config.observer;
         let mut handlers = handlers;
-        // WFI の待ちを vCPU 0 専用のスロットに結ぶ（SPI は宛先のスロットだけ、停止要求の kick は全台を起こす。#3887・#3948）。
-        // 呼び出し側がどの `TimerHandler` を渡しても同じ。
-        handlers.timer.set_waker(vm.wfi_waker_for_vcpu(0)?);
         let wake = vm.wake_set();
         let shutdown = vm.shutdown();
         let handle = spawn_loop(
@@ -477,7 +473,7 @@ impl VcpuThread {
                         peer.1.notify_all();
                     }),
                 );
-                let mut exec = HvfExec(vcpu, std::mem::take(&mut handlers.timer));
+                let mut exec = HvfExec(vcpu);
                 let reason = run_loop(&mut exec, &stop, slice, observer.as_deref(), |e, x| {
                     dispatch(e, &mut handlers, x)
                 });

@@ -243,9 +243,42 @@ mod linux {
         Ok(path)
     }
 
+    /// 1 プロセスが「`bin_dir` から起動された `names` のどれかで、引数に `id` を持つ」かの判定（純関数）。
+    /// 本番 supervisor は `PR_SET_DUMPABLE=0` のため同一 UID でも `/proc/<pid>/exe` の `read_link` が拒否される（`exe` が `None`）。
+    /// その場合は拒否されない `cmdline` の argv[0] で帰属を判定し、確認不能を「不存在」にしない（fail-closed。REPAIR-12）。
+    fn belongs(
+        exe: Option<&Path>,
+        cmdline: &[u8],
+        id: &str,
+        bin_dir: &Path,
+        names: &[&str],
+    ) -> bool {
+        let argv0 = cmdline
+            .split(|b| *b == 0)
+            .next()
+            .map(|a| PathBuf::from(String::from_utf8_lossy(a).into_owned()));
+        let (dir_ok, file) = match (exe, argv0.as_deref()) {
+            (Some(e), _) => (e.parent() == Some(bin_dir), e.file_name()),
+            // 非 dumpable: 相対 argv[0] は親を確かめられないため名前だけで受ける（id の一致が別途必要）。
+            (None, Some(a)) => (
+                a.parent()
+                    .is_none_or(|p| p.as_os_str().is_empty() || p == bin_dir),
+                a.file_name(),
+            ),
+            (None, None) => return false,
+        };
+        if !dir_ok || !names.iter().any(|n| file.is_some_and(|f| f == *n)) {
+            return false;
+        }
+        cmdline.split(|b| *b == 0).any(|arg| {
+            let arg = String::from_utf8_lossy(arg);
+            arg == id || arg.split('/').any(|part| part == id)
+        })
+    }
+
     /// 試験専用の `bin_dir` から起動された `names` のプロセスのうち、引数のどれかが `id` と完全一致（または `/` 区切りの
-    /// 1 要素が一致）するものの pid。実行ファイルの実体（`/proc/<pid>/exe`）が `bin_dir` 配下であることで帰属を確かめ、
-    /// 無関係なコンテナ（`id` を接頭辞に持つ別 ID など）には当たらない。確認できない候補は含めない。
+    /// 1 要素が一致）するものの pid。帰属は `/proc/<pid>/exe`、読めない（非 dumpable の本番 supervisor）ときは
+    /// `cmdline` の argv[0] で確かめる。無関係なコンテナ（`id` を接頭辞に持つ別 ID など）には当たらない。
     fn processes_with(id: &str, bin_dir: &Path, names: &[&str]) -> Vec<u32> {
         let me = std::process::id();
         let Ok(rd) = std::fs::read_dir("/proc") else {
@@ -257,26 +290,60 @@ mod linux {
                 if pid == me {
                     return None;
                 }
-                let exe = std::fs::read_link(e.path().join("exe")).ok()?;
-                if exe.parent()? != bin_dir
-                    || !names
-                        .iter()
-                        .any(|n| exe.file_name().is_some_and(|f| f == *n))
-                {
-                    return None;
-                }
+                let exe = std::fs::read_link(e.path().join("exe")).ok();
                 let c = std::fs::read(e.path().join("cmdline")).ok()?;
-                c.split(|b| *b == 0)
-                    .any(|arg| {
-                        let arg = String::from_utf8_lossy(arg);
-                        arg == id || arg.split('/').any(|part| part == id)
-                    })
-                    .then_some(pid)
+                belongs(exe.as_deref(), &c, id, bin_dir, names).then_some(pid)
             })
             .collect()
     }
 
+    /// `belongs` の具体値による自己照合（REPAIR-12）。非 dumpable（exe 不明）の supervisor が残存として検出されること、
+    /// 別 ID・別ディレクトリが誤検出されないことを固定する。
+    fn self_check_belongs() -> Result<(), String> {
+        let bin = Path::new("/tmp/x/bin");
+        let sup = Path::new("/tmp/x/bin/fandhe-container-supervisor");
+        let names = [SHIM_NAME, SUPERVISOR_NAME];
+        let cmd = b"/tmp/x/bin/fandhe-container-supervisor\0--id\0ctr1\0";
+        let cases: [(&str, bool, bool); 5] = [
+            (
+                "dumpable",
+                belongs(Some(sup), cmd, "ctr1", bin, &names),
+                true,
+            ),
+            (
+                "non-dumpable",
+                belongs(None, cmd, "ctr1", bin, &names),
+                true,
+            ),
+            ("other id", belongs(None, cmd, "ctr", bin, &names), false),
+            (
+                "other dir",
+                belongs(
+                    None,
+                    b"/usr/bin/fandhe-container-supervisor\0ctr1\0",
+                    "ctr1",
+                    bin,
+                    &names,
+                ),
+                false,
+            ),
+            ("no cmdline", belongs(None, b"", "ctr1", bin, &names), false),
+        ];
+        for (name, got, want) in cases {
+            if got != want {
+                return Err(format!(
+                    "self-check belongs[{name}]: got {got}, want {want}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn main() -> ExitCode {
+        if let Err(e) = self_check_belongs() {
+            eprintln!("shim_v2_containerd_real: FAILED: {e}");
+            return ExitCode::from(1);
+        }
         if !std::env::args().any(|a| a == "--ignored") {
             println!(
                 "shim_v2_containerd_real: containerd scenario ignored (run the test binary with --ignored in a delegated scope; see crates/plugin-cri/tests/shim_v2_containerd_real.rs)"

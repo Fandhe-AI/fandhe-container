@@ -37,7 +37,7 @@
 //! exit ごとの処理は `hvf::{mmio, hvc}`（#3793・#3794）が担う。WFI の exit・vtimer の exit は GIC つきでは来ず、来たら `Failed(Unimplemented)` で止める（#4039・#3995）。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
-//! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを全台起こす `WfiWakeSet` の通知。#3887・#3948。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
+//! 1. 停止要求 → kick（`hv_vcpus_exit` と、parked の AP のメールボックスの通知。#4040。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
 //! 2. owning thread が自分の vCPU を `hv_vcpu_destroy` し（vCPU はスレッドに束縛され、他スレッドからは破棄できない）、捕捉していた
 //!    `Arc<VmWithGic>` を落として報告を送る。報告を受けた時点で vCPU の破棄は済んでいる。
 //!    vCPU は N 台あり、parked の AP も同じく owning thread が破棄する。報告は「N 台すべてが破棄済み」のときだけ `Ok`（`stop_all`）。

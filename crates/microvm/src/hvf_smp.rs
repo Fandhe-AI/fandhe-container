@@ -23,7 +23,7 @@
 //!   「VM が生きていることの錨」として保つ判断であり、仕様の強制ではない。
 //! - ビッグエンディアンのゲストは対象外（`SCTLR_EL1.EE` を 0 にして起動する。`boot_arm64::sctlr_for_cpu_on`）。
 //! - WFI の待ちは `hvf_wake::WfiWakeSet` の vCPU ごとに独立したスロット（#3948。各スロットは世代番号と既読位置を持つ #3933 の `WfiWaker`）で、
-//!   SPI は `InterruptACK` から学習した宛先の vCPU だけを起こし、未学習・シリアル・停止要求は全台を起こす（古いヒントでは宛先が最大 `WFI_WAIT_MAX` 遅れる。残余は `hvf_wake`）。
+//!   SPI は `InterruptACK` から学習した宛先の vCPU だけを起こし、未学習・シリアルは全台を起こす（停止要求と VM の終了は `hv_vcpus_exit` とメールボックスだけで解く。#4040）（古いヒントでは宛先が最大 `WFI_WAIT_MAX` 遅れる。残余は `hvf_wake`）。
 //! - VM の終了（SYSTEM_OFF・SYSTEM_RESET・fail-closed の停止・異常終了。CPU_OFF の Park とは別）は、終わった vCPU のスレッドが
 //!   [`VmShutdown::trigger`] を呼び、全 vCPU の停止フラグを立てて kick する（BSP の実行・AP の parked 待ちを即解除）。
 //!   呼び出し側の `stop` を待たずに他の vCPU が止まる。`VcpuSet::is_finished` は従来どおり状態を調べるだけ。
@@ -71,6 +71,9 @@ enum MailboxState {
 pub struct ApMailbox {
     state: Mutex<MailboxState>,
     cv: Condvar,
+    /// 試験用: `wait` が条件変数の待ちへ入る直前（ロックを握ったまま）に数える。待ち到達の同期点（REPAIR-12）。
+    #[cfg(test)]
+    wait_entries: std::sync::atomic::AtomicU32,
 }
 
 impl Default for ApMailbox {
@@ -85,7 +88,19 @@ impl ApMailbox {
         Self {
             state: Mutex::new(MailboxState::Empty),
             cv: Condvar::new(),
+            #[cfg(test)]
+            wait_entries: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// 試験用: AP が `wait` の条件変数の待ちに入るまで待つ。カウンタはロック保持中に増え、`wait_timeout` がロックを手放して
+    /// 初めて `lock` が取れるため、戻った時点で AP は待ちの中にある（固定時間の sleep に頼らない）。
+    #[cfg(test)]
+    fn await_waiting(&self) {
+        while self.wait_entries.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        drop(self.lock());
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MailboxState> {
@@ -125,6 +140,8 @@ impl ApMailbox {
                 MailboxState::Closed => return ApWake::Stopped,
                 MailboxState::Empty => {}
             }
+            #[cfg(test)]
+            self.wait_entries.fetch_add(1, Ordering::Release);
             g = self
                 .cv
                 .wait_timeout(g, poll)
@@ -146,7 +163,7 @@ impl ApMailbox {
     }
 }
 
-/// 他の vCPU を起こす手段（canceller の kick・メールボックスの notify・WFI の waker をまとめた閉包）。
+/// 他の vCPU を起こす手段（canceller の kick・メールボックスの notify をまとめた閉包）。
 pub type PeerKick = Box<dyn Fn() + Send + Sync>;
 
 struct ShutdownPeer {
@@ -776,5 +793,180 @@ mod tests {
         );
         assert!(late.load(Ordering::Acquire));
         assert!(kicked.load(Ordering::Acquire));
+    }
+
+    // ---- #4040: 停止経路は kick（cancel → メールボックス notify）だけで成り立つ（WFI の起床の通知なし）----
+
+    use crate::hvf_loop::{LoopStart, VcpuKick, run_loop, spawn_loop, stop_all};
+
+    /// 偽の `VcpuCanceller`。`cancel` の回数を数え、`BlockingExec::run`（`hv_vcpu_run` 内の WFI の待ちの模擬）を起こす。
+    #[derive(Default)]
+    struct FakeCanceller {
+        count: Mutex<u32>,
+        cv: Condvar,
+    }
+
+    impl FakeCanceller {
+        fn cancel(&self) {
+            *self.count.lock().unwrap() += 1;
+            self.cv.notify_all();
+        }
+        fn count(&self) -> u32 {
+            *self.count.lock().unwrap()
+        }
+    }
+
+    /// `hvf::vcpu::HvfKick` の写し（macOS 限定で Linux から使えないため）。cancel → メールボックスの notify の順。
+    struct MirrorKick {
+        canceller: Arc<FakeCanceller>,
+        mailbox: Option<Arc<ApMailbox>>,
+    }
+
+    impl VcpuKick for MirrorKick {
+        fn kick(&self) -> Result<(), MicrovmError> {
+            self.canceller.cancel();
+            if let Some(m) = &self.mailbox {
+                m.notify();
+            }
+            Ok(())
+        }
+    }
+
+    /// `hv_vcpu_run` の中での WFI の待ちを模す実行体。cancel されるまで（安全網は 2 秒）戻らず、`Canceled` を返す。
+    struct BlockingExec(Arc<FakeCanceller>);
+
+    impl VcpuExec for BlockingExec {
+        fn run(&mut self, _slice: Duration) -> Result<HvVcpuExit, MicrovmError> {
+            let g = self.0.count.lock().unwrap();
+            let _ = self
+                .0
+                .cv
+                .wait_timeout_while(g, Duration::from_secs(2), |c| *c == 0)
+                .unwrap();
+            Ok(HvVcpuExit::Canceled)
+        }
+        fn stats(&self) -> HvRunStats {
+            HvRunStats::default()
+        }
+        fn pc(&self) -> Option<u64> {
+            None
+        }
+        fn advance_pc(&mut self, _bytes: u64) -> Result<(), MicrovmError> {
+            Ok(())
+        }
+    }
+
+    fn spawn_blocked_bsp(c: &Arc<FakeCanceller>) -> crate::hvf_loop::LoopHandle<MirrorKick> {
+        let c = Arc::clone(c);
+        spawn_loop("hvf-bsp", LONG, move |start: LoopStart<MirrorKick>| {
+            let stop = start.ready(MirrorKick {
+                canceller: Arc::clone(&c),
+                mailbox: None,
+            });
+            let mut exec = BlockingExec(Arc::clone(&c));
+            let reason = run_loop(&mut exec, &stop, Duration::from_secs(60), None, |_, _| {
+                Ok(ExitAction::Continue)
+            });
+            (reason, HvRunStats::default())
+        })
+        .unwrap()
+    }
+
+    fn spawn_parked_ap(
+        mailbox: &Arc<ApMailbox>,
+        with_mailbox_kick: bool,
+        poll: Duration,
+    ) -> crate::hvf_loop::LoopHandle<MirrorKick> {
+        let m = Arc::clone(mailbox);
+        spawn_loop("hvf-ap", LONG, move |start: LoopStart<MirrorKick>| {
+            let stop = start.ready(MirrorKick {
+                canceller: Arc::default(),
+                mailbox: with_mailbox_kick.then(|| Arc::clone(&m)),
+            });
+            let reason = match m.wait(&stop, poll) {
+                ApWake::Stopped => StopReason::Requested,
+                ApWake::Start(_) => StopReason::Failed(MicrovmErrorCode::Internal),
+            };
+            (reason, HvRunStats::default())
+        })
+        .unwrap()
+    }
+
+    /// 停止要求で BSP の実行（WFI の待ちの模擬）と AP の parked の待ち（見直し間隔 60 秒）が、WFI の起床なしに解ける。
+    #[test]
+    fn repair5_mvm5_4040_stop_all_unblocks_running_bsp_and_parked_ap_without_wfi_wake() {
+        let c = Arc::new(FakeCanceller::default());
+        let m = Arc::new(ApMailbox::new());
+        let bsp = spawn_blocked_bsp(&c);
+        let ap = spawn_parked_ap(&m, true, Duration::from_secs(60));
+        let report = stop_all(vec![bsp, ap], LONG).unwrap();
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.per_vcpu.len(), 2);
+        assert_eq!(report.per_vcpu[0].reason, StopReason::Requested);
+        assert_eq!(report.per_vcpu[1].reason, StopReason::Requested);
+        assert!(c.count() >= 1);
+    }
+
+    /// 陰性対照: メールボックスの notify が無い kick では、見直し間隔の長い parked の AP は期限内に止まらない。
+    #[test]
+    fn repair5_mvm5_4040_parked_ap_needs_mailbox_notify_not_wfi_wake() {
+        let m = Arc::new(ApMailbox::new());
+        let ap = spawn_parked_ap(&m, false, Duration::from_secs(2));
+        // AP が `wait` の待ちに入ってから stop する（入る前だと入口で停止フラグを見て即 Requested になり対照が成立しない）。
+        m.await_waiting();
+        let e = ap.stop(Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        m.notify();
+    }
+
+    /// `VmShutdown` の peer を cancel（AP は加えて notify）だけにしても、BSP と AP が両方 `Requested` で終わる。
+    #[test]
+    fn repair5_mvm5_4040_vm_shutdown_peer_without_wfi_wake_unblocks_bsp_and_ap() {
+        let sd = Arc::new(VmShutdown::new());
+        let c = Arc::new(FakeCanceller::default());
+        let m = Arc::new(ApMailbox::new());
+        let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sd1, c1, r1) = (Arc::clone(&sd), Arc::clone(&c), Arc::clone(&registered));
+        let bsp = std::thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let c2 = Arc::clone(&c1);
+            sd1.register(Arc::clone(&stop), Box::new(move || c2.cancel()));
+            r1.fetch_add(1, Ordering::AcqRel);
+            let mut exec = BlockingExec(c1);
+            run_loop(&mut exec, &stop, Duration::from_secs(60), None, |_, _| {
+                Ok(ExitAction::Continue)
+            })
+        });
+        let (sd2, m1, r2) = (Arc::clone(&sd), Arc::clone(&m), Arc::clone(&registered));
+        let ap = std::thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (c3, m2) = (Arc::new(FakeCanceller::default()), Arc::clone(&m1));
+            sd2.register(
+                Arc::clone(&stop),
+                Box::new(move || {
+                    c3.cancel();
+                    m2.notify();
+                }),
+            );
+            r2.fetch_add(1, Ordering::AcqRel);
+            match m1.wait(&stop, Duration::from_secs(60)) {
+                ApWake::Stopped => StopReason::Requested,
+                ApWake::Start(_) => StopReason::Failed(MicrovmErrorCode::Internal),
+            }
+        });
+        // 両方が登録を終えるまで待つ（登録前の trigger は late register 経路になり別の試験が担う）。
+        let t0 = std::time::Instant::now();
+        while registered.load(Ordering::Acquire) < 2 {
+            assert!(t0.elapsed() < LONG, "vcpus did not register");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sd.trigger();
+        let t = std::time::Instant::now();
+        while !(bsp.is_finished() && ap.is_finished()) {
+            assert!(t.elapsed() < LONG, "vcpus kept waiting after shutdown");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(bsp.join().unwrap(), StopReason::Requested);
+        assert_eq!(ap.join().unwrap(), StopReason::Requested);
     }
 }

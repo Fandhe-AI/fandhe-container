@@ -515,6 +515,10 @@ pub(crate) mod plugin_fs {
     }
 
     /// `acl_get_fd_np` の薄い包み。判定は `has_extended_acl(path)` と同じ（空 ACL は「無し」）。
+    ///
+    /// 可用性の制約: `ENOENT` 以外（`ENOTSUP` など）は判定不能として `Err` を返し、呼び出し側は拒否する
+    /// （fail-closed）。ACL を扱えない FS の状態ルートでは主経路が常に失敗する（macOS は代替経路が無く
+    /// `SinkFailed` になる）。詳細は `docs/design/audit-non-linux.md` 8 章（#3630・SEC-4）。
     pub(super) fn extended_acl_of_raw(fd: c_int) -> Result<bool, SysError> {
         if !SUPPORTED_ARCH {
             return Err(SysError::Unsupported);
@@ -546,6 +550,9 @@ pub(crate) mod plugin_fs {
     }
 
     /// 開いた `fd` に拡張 ACL が付いているか。無し=`Ok(false)`・有り=`Ok(true)`・判定不能=`Err`（呼び出し側が拒否）。
+    ///
+    /// ACL を扱えない FS の状態ルートでは判定不能が常に起き、主経路が常に失敗する（可用性の制約。
+    /// [`extended_acl_of_raw`] と `docs/design/audit-non-linux.md` 8 章。#3630）。
     pub(crate) fn has_extended_acl_fd(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
         extended_acl_of_raw(fd.as_raw_fd())
     }
@@ -985,7 +992,7 @@ pub(crate) mod audit_fs {
 ///
 /// Linux との違い:
 /// - `pidfd` が無い。pid の再利用の窓は、`file_sink` が fork の前に [`child_signal_auto_reaps`] で SIGCHLD の
-///   自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）を拒否して閉じる（子は回収されるまでゾンビとして pid を保持する）
+///   自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）と `SIG_DFL` 以外の独自ハンドラを拒否して閉じる（子は回収されるまでゾンビとして pid を保持する）
 /// - `close_range(2)` が無い。[`close_fds_from_except`] が `proc_pidinfo(PROC_PIDLISTFDS)` で開いている fd を
 ///   列挙して閉じ、閉じた後に再列挙して残りが無いことを確かめる（確かめられなければ `Err`。fail-closed）。
 ///   却下案は `getdtablesize()` までの総当たり（soft limit を後から下げられると、上限より上の番号を見逃す）
@@ -1090,7 +1097,8 @@ pub(crate) mod process {
 
     // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`pid_t` は `int`、`nfds_t` は `unsigned int`、
     // `proc_pidinfo` は `int proc_pidinfo(int, int, uint64_t, void *, int)`、`sigaction` は
-    // `int sigaction(int, const struct sigaction *, struct sigaction *)`、`fcntl` は可変長（Apple arm64 ABI は
+    // `int sigaction(int, const struct sigaction *, struct sigaction *)`、`__error` は呼び出しスレッドの `errno`
+    // （スレッドローカル）を指す `int *__error(void)`（引数なし。#3630）、`fcntl` は可変長（Apple arm64 ABI は
     // 可変長部をスタックに積むため `...` 付きで宣言する）、`signal` は `sig_t signal(int, sig_t)`（ポインタ幅）。
     unsafe extern "C" {
         fn fork() -> i32;
@@ -1102,6 +1110,7 @@ pub(crate) mod process {
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
+        fn __error() -> *mut c_int;
         #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
         fn signal(sig: c_int, handler: usize) -> usize;
         fn proc_pidinfo(
@@ -1127,6 +1136,29 @@ pub(crate) mod process {
             Ok(p) if p > 0 => Ok(p),
             _ => Err(SysError::Os(EINVAL)),
         }
+    }
+
+    /// 呼び出しスレッドの `errno` を 0 にする。`proc_pidinfo` のように失敗を 0 で返し `errno` が
+    /// 設定されるとは限らない呼び出しの直前に使い、古い `errno` を失敗の原因として拾わないようにする（#3630）。
+    fn clear_errno() {
+        // SAFETY: `__error` は引数なしで、呼び出しスレッド自身の `errno`（スレッドローカル）への有効な
+        // ポインタを返す。書き込みはそのスレッドの `errno` だけに閉じ、他スレッド・他の状態に影響しない。
+        // fork 後の子（呼び出しスレッドのみ複製）でも同じ。
+        unsafe { *__error() = 0 };
+    }
+
+    /// `errno` を 0 にしてから `call` を実行し、戻りが正ならその値を返す（SEC-4・CORE-1・#3630）。
+    ///
+    /// 0 以下は失敗で、`errno` を `SysError::Os` で返す。`errno` が 0 のまま（`proc_pidinfo` は失敗を 0 で返す）なら
+    /// 以前の呼び出しの古い値を拾わず `EINVAL` にする。成功側へは倒さない（fail-closed）。
+    fn positive_or_errno(call: impl FnOnce() -> c_int) -> Result<c_int, SysError> {
+        clear_errno();
+        let rc = call();
+        if rc > 0 {
+            return Ok(rc);
+        }
+        let errno = last_errno();
+        Err(SysError::Os(if errno == 0 { EINVAL } else { errno }))
     }
 
     /// 呼び出しプロセスの現在のスレッド数（`proc_pidinfo(PROC_PIDTASKINFO)` の `pti_threadnum`）。
@@ -1162,6 +1194,9 @@ pub(crate) mod process {
     /// までに新しいスレッドを作れる主体は自身以外に無い）。fork 前に親で stdio を flush しない（出力先が詰まると
     /// 呼び出し側の期限の前に止まるため）。子は `child` を `catch_unwind` で実行し、結果（panic なら `panic_exit`）で
     /// `_exit` する。呼び出し元のフレームへ戻らず、atexit・デストラクタを実行しない。
+    ///
+    /// 子では async-signal-safe でない処理（確保・`std` の I/O・panic フック）を行う。これはスレッド数 1 の確認を
+    /// 根拠にしており、確認を外してはならない（#3630）。
     pub(crate) fn fork_single_threaded_no_flush<F: FnOnce() -> i32>(
         child: F,
         panic_exit: i32,
@@ -1173,8 +1208,13 @@ pub(crate) mod process {
             return Err(SysError::MultiThreaded);
         }
         // SAFETY: 直前に `Threads == 1` を確認済みで、fork した子には呼び出しスレッドだけが複製されるため、
-        // 他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は下の分岐で `child` を実行して
-        // `_exit` し、呼び出し元のフレームへ戻らない。親は戻り値の pid だけを使う。
+        // 他スレッドが保持していたロック・ヒープの不整合を子が引き継がない。子は async-signal-safe でない処理
+        // （`list_open_fds` の `Vec` の確保、`child` 内のファイル I/O と `std` の `write_all`、`catch_unwind` の
+        // panic フックによる確保・stderr 出力）を行うが、それが許されるのはこの単一スレッドの確認が根拠である
+        // （確保器・stdio のロックを他スレッドが持ったまま複製されることが無い。呼び出しスレッドはシグナル
+        // ハンドラではなくこの関数の中にいて確保の途中でもない）。スレッド数の検査を外すとこの根拠が崩れ、
+        // 子がロックで固まり得る。子は下の分岐で `child` を実行して `_exit` し、呼び出し元のフレームへ戻らない。
+        // 親は戻り値の pid だけを使う。
         let pid = unsafe { fork() };
         if pid < 0 {
             return Err(SysError::Os(last_errno()));
@@ -1208,22 +1248,21 @@ pub(crate) mod process {
                 cap
             ];
             let bytes = c_int::try_from(cap * entry).map_err(|_| SysError::Os(EMFILE))?;
-            // SAFETY: `buf` は `bytes` バイト分の有効な書き込み先で、カーネルは `buffersize` を超えて書かない。
-            let rc = unsafe {
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS,
-                    0,
-                    buf.as_mut_ptr().cast::<c_void>(),
-                    bytes,
-                )
-            };
             // Darwin の `proc_pidinfo` は失敗時に 0 を返す。開いている fd は少なくとも結果 pipe があるため、
             // 0 も失敗として扱う（空の一覧と見なすと継承 fd を閉じないまま主経路が走る。SEC-4・REPAIR-5）。
-            if rc <= 0 {
-                let errno = last_errno();
-                return Err(SysError::Os(if errno == 0 { EINVAL } else { errno }));
-            }
+            // 失敗の errno は呼び出し直前に 0 にして、古い値を拾わない（#3630。確保より後に行う）。
+            let rc = positive_or_errno(|| {
+                // SAFETY: `buf` は `bytes` バイト分の有効な書き込み先で、カーネルは `buffersize` を超えて書かない。
+                unsafe {
+                    proc_pidinfo(
+                        pid,
+                        PROC_PIDLISTFDS,
+                        0,
+                        buf.as_mut_ptr().cast::<c_void>(),
+                        bytes,
+                    )
+                }
+            })?;
             if rc < bytes {
                 let n = usize::try_from(rc).map_err(|_| SysError::Os(EINVAL))? / entry;
                 return Ok(buf.iter().take(n).map(|e| e.proc_fd).collect());
@@ -1349,6 +1388,11 @@ pub(crate) mod process {
     /// 自動回収のプロセスでは子が終了と同時に回収され、pid が再利用され得る。pidfd が無い macOS では、
     /// `file_sink` が fork の前にこれを確かめ、`true` や失敗なら主経路を試さない（pid の再利用で別プロセスへ
     /// `kill` を送る窓を閉じる。CORE-1）。
+    ///
+    /// 独自ハンドラ持ちの呼び出し元は緩めず拒否する（Agent の判断。オーナー承認ではない）。ハンドラが
+    /// `waitpid` するかは disposition から見えず、pidfd の無い macOS で緩めると `Ok(None)` の確認から `kill`
+    /// までに pid が再利用される窓が開くため。現在の呼び出し元（CLI）は SIGCHLD が `SIG_DFL` で該当しない。
+    /// 根拠と再評価の条件は `docs/design/audit-non-linux.md` 8 章。
     pub(crate) fn child_signal_auto_reaps() -> Result<bool, SysError> {
         if !SUPPORTED_ARCH {
             return Err(SysError::Unsupported);
@@ -1363,7 +1407,13 @@ pub(crate) mod process {
         if rc != 0 {
             return Err(SysError::Os(last_errno()));
         }
-        Ok(old.sa_sigaction != SIG_DFL || old.sa_flags & SA_NOCLDWAIT != 0)
+        Ok(takes_over_child_reaping(old.sa_sigaction, old.sa_flags))
+    }
+
+    /// `SIGCHLD` の disposition（ハンドラのアドレスと `sa_flags`）が子の回収を奪い得るか。
+    /// `SIG_IGN`・`SA_NOCLDWAIT`・`SIG_DFL` 以外の独自ハンドラはすべて真（純粋関数。#3630）。
+    fn takes_over_child_reaping(handler: usize, flags: c_int) -> bool {
+        handler != SIG_DFL || flags & SA_NOCLDWAIT != 0
     }
 
     /// 結合試験専用: 自プロセスの `SIGCHLD` を `ignored` なら `SIG_IGN`、そうでなければ `SIG_DFL` にする
@@ -1480,6 +1530,8 @@ pub(crate) mod process {
         const _: unsafe extern "C" fn(c_int, usize) -> usize = super::signal;
         const _: unsafe extern "C" fn(c_int, libc::sighandler_t) -> libc::sighandler_t =
             libc::signal;
+        const _: unsafe extern "C" fn() -> *mut c_int = super::__error;
+        const _: unsafe extern "C" fn() -> *mut c_int = libc::__error;
         const _: unsafe extern "C" fn(c_int, c_int, u64, *mut core::ffi::c_void, c_int) -> c_int =
             super::proc_pidinfo;
         const _: unsafe extern "C" fn(c_int, c_int, u64, *mut core::ffi::c_void, c_int) -> c_int =
@@ -1491,12 +1543,47 @@ pub(crate) mod process {
         use super::*;
         use std::os::fd::AsFd;
 
+        /// `ENOENT`（`sys/errno.h`）。
+        const ENOENT: i32 = 2;
+
         /// SEC-4・REPAIR-5: `positive_pid` の境界（0 と `i32` 超は `EINVAL`）。
         #[test]
         fn sec4_2429_pid_zero_and_overflow_are_rejected() {
             assert_eq!(wait_pid_nohang(0), Err(SysError::Os(EINVAL)));
             assert_eq!(kill_pid(0, Signal::Kill), Err(SysError::Os(EINVAL)));
             assert_eq!(kill_pid(u32::MAX, Signal::Kill), Err(SysError::Os(EINVAL)));
+        }
+
+        /// SEC-4・CORE-1（#3630）: 古い errno を失敗の原因として拾わない（0 のままなら `EINVAL`）。
+        #[test]
+        fn sec4_3630_stale_errno_is_not_reported() {
+            // 前提: errno を ENOENT にしておく（修正前の実装ならこれを拾う）。
+            let _ = std::fs::File::open("/nonexistent-3630-probe");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(ENOENT));
+            assert_eq!(positive_or_errno(|| 0), Err(SysError::Os(EINVAL)));
+        }
+
+        /// SEC-4・CORE-1（#3630）: 呼び出し中に設定された errno は保つ。負は `EINVAL`、正は成功。
+        #[test]
+        fn sec4_3630_errno_set_by_the_call_is_kept() {
+            assert_eq!(
+                positive_or_errno(|| {
+                    let _ = std::fs::File::open("/nonexistent-3630-probe");
+                    0
+                }),
+                Err(SysError::Os(ENOENT))
+            );
+            assert_eq!(positive_or_errno(|| -1), Err(SysError::Os(EINVAL)));
+            assert_eq!(positive_or_errno(|| 8), Ok(8));
+        }
+
+        /// SEC-4・CORE-1（#3630）: SIGCHLD の disposition の判定（`SIG_DFL` だけが回収を奪わない）。
+        #[test]
+        fn sec4_3630_sigchld_disposition_predicate() {
+            assert!(!takes_over_child_reaping(SIG_DFL, 0));
+            assert!(takes_over_child_reaping(SIG_IGN, 0));
+            assert!(takes_over_child_reaping(0x1000, 0));
+            assert!(takes_over_child_reaping(SIG_DFL, SA_NOCLDWAIT));
         }
 
         /// 既定の `SIGCHLD` は自動回収ではない（libtest は SIGCHLD を変えない）。

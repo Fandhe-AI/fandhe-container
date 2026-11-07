@@ -50,7 +50,7 @@
 //!   黙って使われないままになる。両経路が失敗したときの通知の `primary` が `isolation_fds_not_closed` になり、
 //!   fork 不能の `isolation_unavailable` と見分けられる）
 //! - 子の結果は終了 status ではなく子が書く結果 pipe の印で受ける（`SIGCHLD` が `SIG_IGN`・`SA_NOCLDWAIT` の
-//!   プロセスでは子が自動回収され status が失われるため）。印は「開始」（通知の子が出力先へ書き込む直前に書く）と
+//!   プロセス（macOS は `SIG_DFL` 以外の独自ハンドラも）では子が回収され status が失われるため）。印は「開始」（通知の子が出力先へ書き込む直前に書く）と
 //!   「結果」（終了コード）の 2 種類。シグナルは fork 直後に開いた pidfd 経由で送り、`waitpid` が `ECHILD` を
 //!   返した子（回収済み）へは送らない（pid 再利用対策。CORE-1）
 //! - 子は `fork_single_threaded` で作る。呼び出しプロセスが複数スレッドだと fork できないため、その場合は
@@ -93,11 +93,12 @@
 //! 非 Linux の記録先（SEC-4）: macOS は #2247 で `FileStateStore::open` が通り、#2429 で主経路（`file_writer.rs` の
 //! `open_checked` の fd 相対 open と拡張 ACL の拒否、および本ファイルの `run_isolated` の macOS 版）が実装済みで、
 //! 主経路が成功すれば `AuditDelivery::Recorded` になる。macOS の `run_isolated` は pidfd・`close_range` が無いため、
-//! fork の前に SIGCHLD の自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）を拒否し（pid の再利用で別プロセスへ `kill` を送らない。
+//! fork の前に SIGCHLD の自動回収（`SIG_IGN`・`SA_NOCLDWAIT`）と `SIG_DFL` 以外の独自ハンドラを拒否し（pid の再利用で別プロセスへ `kill` を送らない。
 //! 拒否時は `IsolationUnavailable` で代替経路へ進む）、子は継承 fd を `proc_pidinfo` の列挙で閉じて再列挙で確かめ、
 //! スレッド数も `proc_pidinfo` で数える（複数スレッドなら fork せず `MultiThreaded`）。macOS の代替経路
 //! （`kernel_audit.rs` は `UnsupportedTransport`）は未実装のため、主経路が失敗すれば記録は `SinkFailed` のままである
-//! （拒否の判定は覆らない。代替経路の方式は #2430 の案 N-L で未決定）。Windows は `FileStateStore::open` が
+//! （拒否の判定は覆らない。独自ハンドラを緩めない判断〔Agent の判断〕と拡張 ACL の判定不能の可用性の制約は
+//! `docs/design/audit-non-linux.md` 8 章。代替経路の方式は #2430 の案 N-L で未決定）。Windows は `FileStateStore::open` が
 //! `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、構築入口も fail-closed になる。
 //! Windows の主経路の隔離と非 Linux の代替経路の選択肢は `docs/design/audit-non-linux.md`（#2430・オーナー承認待ち）
 //! の判断資料にあり、方式は未決定である。
@@ -290,7 +291,7 @@ mod pending {
     /// 子は pid が再利用されないため、終了を確認してからの `waitpid` は自分の子だけを対象にする。`SIGCHLD` が
     /// `SIG_IGN` で自動回収されていれば `ECHILD` になり、回収済みとして外す。pidfd が無い（開けなかった）子は
     /// `waitpid(WNOHANG)` だけで判定する（`ECHILD` 等の失敗は回収済みとみなす）。macOS: pidfd が無く、`waitpid(WNOHANG)`
-    /// だけで判定する（fork の前に SIGCHLD の自動回収を拒否済みのため、未回収の子は回収されるまで pid を保持する）。
+    /// だけで判定する（fork の前に SIGCHLD の自動回収と独自ハンドラを拒否済みのため、未回収の子は回収されるまで pid を保持する）。
     fn still_unreaped(u: &Unreaped) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -432,7 +433,7 @@ fn settle(rx: &std::fs::File, otherwise: IsolatedOutcome) -> Isolated {
 ///   `child` を実行せず [`CLOSE_FDS_FAILED_EXIT`] で終わる
 /// - **結果の受け渡し**: 子は `child` の戻り値（fd を閉じられなければ [`CLOSE_FDS_FAILED_EXIT`]）を結果 pipe へ
 ///   印付きで書いてから `_exit` する。`SIGCHLD` が
-///   `SIG_IGN`・`SA_NOCLDWAIT` のプロセスでは子が自動回収されて `waitpid` が `ECHILD` を返し status が失われるが、
+///   `SIG_IGN`・`SA_NOCLDWAIT`（macOS は独自ハンドラも）のプロセスでは子が自動回収されて `waitpid` が `ECHILD` を返し status が失われるが、
 ///   pipe の値で結果を確定する（主経路の成功を失敗と取り違えて代替経路へ二重に記録しない）
 /// - **シグナル**: fork 直後（回収前）に開いた pidfd があれば `pidfd_send_signal` で送る（回収後に pid が
 ///   再利用されても別プロセスへ届かない。`exec::ContainerChild` と同じ作法）。pidfd が無ければ、直前の

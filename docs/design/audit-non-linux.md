@@ -16,7 +16,7 @@
 
 | 箇所 | 非 Linux の現状 | 担当 |
 | ---- | --------------- | ---- |
-| `run_isolated`（主経路の隔離） | macOS は実装済み（#2429。pidfd が無いため SIGCHLD の自動回収を事前に拒否し、継承 fd は `proc_pidinfo` の列挙で閉じて再列挙で確かめる）。Windows は常に失敗（`IsolationUnavailable`） | Windows は本書の論点 1 |
+| `run_isolated`（主経路の隔離） | macOS は実装済み（#2429。pidfd が無いため SIGCHLD の自動回収と `SIG_DFL` 以外の独自ハンドラを事前に拒否し、継承 fd は `proc_pidinfo` の列挙で閉じて再列挙で確かめる）。Windows は常に失敗（`IsolationUnavailable`） | Windows は本書の論点 1 |
 | `file_writer.rs` の `open_checked` | macOS は実装済み（#2429。fd 相対 open と拡張 ACL の拒否）。Windows は `Unsupported` | Windows は #2428 |
 | `kernel_audit.rs`（代替経路） | `UnsupportedTransport` | 本書の論点 2 |
 
@@ -108,6 +108,8 @@ origin/main の `git grep` による。
 - rootless では改ざん耐性が無いという既存の限界（`file_sink.rs` の SEC-5 の記述）は変わらない
 - 権限を広げる案（`SeAuditPrivilege`・root の付与）は承認事項として分ける
 - 依存の追加は本書では行わない（`=x.y.z` 固定・ユーザー承認制）
+- macOS の拡張 ACL の判定不能は可用性の制約になる（#3630・SEC-4）: `acl_get_link_np` / `acl_get_fd_np` が `ENOENT` 以外（`ENOTSUP` 等）を返すと判定不能として拒否する。症状は 2 段ある。(a) `open_in_state_root` が先に通る `FileStateStore::open` で `INTERNAL`（`failed to inspect the ACL of a state entry`）となり sink の構築に失敗する（CLI では `UnavailableAuditSink`）。(b) 構築を通っても `record` ごとの `open_checked` で判定不能なら種別 `Open` で主経路が失敗し、macOS は代替経路が無いため `SinkFailed` になる。どちらも fail-closed で、拒否は覆らない（`state_store` の同じ制約を引き継ぐ）。ACL を扱えない FS の状態ルートでは主経路が常に失敗する。対象の FS と errno、`acl_get_link_np` と `acl_get_fd_np` が同じ errno を返すかは実機未確認
+- macOS の SIGCHLD の独自ハンドラは緩めない（#3630・SEC-4・CORE-1。Agent の判断で、オーナー承認済みではない）: ハンドラが `waitpid` するかは disposition から見えず、pidfd の無い macOS で緩めると `Ok(None)` の確認から `kill` までに pid が再利用される窓が開く。現在の呼び出し元（CLI の `plugin_backend`）は SIGCHLD を `SIG_DFL` に戻すため該当せず、緩める実益が無い。多スレッドのランタイム（tokio の signal 等）は `MultiThreaded` で fork しないため、緩めても主経路は使えない。再評価の条件: SIGCHLD ハンドラを持つ単一スレッドの呼び出し元が macOS の主経路へ入るとき（pid を再利用に依らず指す別の手段を検討する。方式は未決定）
 
 ## 9. 論点外
 

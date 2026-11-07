@@ -129,6 +129,7 @@ use super::launch_status::{
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
 use super::path_masks;
+use super::pty::{self, ExecPtySender, WindowSize};
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
 use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_copy};
@@ -558,14 +559,25 @@ fn exec_entrypoint_verified_reporting(
     entry: &Entrypoint,
     nulling: StdioNulling,
     status: Option<&std::fs::File>,
+    pty: Option<ExecPtySender>,
 ) -> Result<Infallible, ExecError> {
     let Some(status) = status else {
+        // 状態 pipe の無い経路（試験用の最小入口）は端末つき起動を持たない。
         return exec_entrypoint_verified_with(pivot_mnt_id, entry, nulling);
     };
     // 失敗した手順を `E <step> ...` の段として運ぶ（#2895）。`prepare_exec_child` の段は共有語彙のまま写す。
     let prepared = verify_pivot_root(pivot_mnt_id)
         .map_err(|e| (ExecPhaseStep::VerifyRoot, Box::new(e)))
-        .and_then(|()| {
+        // 端末つき起動(`process.terminal: true`)は、pivot 後の `/` の照合の後・`prepare_exec_child` の前に pty を割り当て、
+        // slave を fd 0〜2 に付け替えて `nulling` を取り直す(CRI-6・SEC-1・CORE-5・#4070)。制限(capability 削減・NNP・
+        // Landlock・seccomp)は `run_child_then` が済ませた後で、ホストの devpts へは届かない。
+        .and_then(|()| match pty {
+            None => Ok(nulling),
+            Some(sender) => {
+                attach_launch_pty(sender).map_err(|e| (ExecPhaseStep::Pty, Box::new(e)))
+            }
+        })
+        .and_then(|nulling| {
             prepare_exec_child(
                 entry,
                 Some(status.as_fd()),
@@ -595,6 +607,29 @@ fn exec_entrypoint_verified_reporting(
             Err(err)
         }
     }
+}
+
+/// 端末つき起動の init の pty の初期サイズ。config からの入力は無く、カーネルの既定（0 行・0 列）のまま
+/// 起動し、kubelet の最初の resize で決まる（`docs/design/cri-streaming-server.md` D6。CRI-6・#4070）。
+const LAUNCH_PTY_INITIAL_SIZE: WindowSize = WindowSize::new(0, 0);
+
+/// 端末つき起動の PID 1 が、pivot 後のコンテナの devpts から pty を割り当て、master を親（C）へ送り、slave を
+/// fd 0〜2 に付け替える（CRI-6・SEC-1・CORE-5・#4070）。戻り値は取り直した `StdioNulling`（3 本とも付け替え済みで
+/// `controlling_tty`。`setsid` 直後の `TIOCSCTTY` は `prepare_exec_child` が行う）。
+///
+/// - 起点は pivot 後の `/` だけ（[`pty::allocate_in_root`] が `dev`→`pts`→`ptmx`→`N` を `O_NOFOLLOW` で辿り、devpts の
+///   magic・`rdev`・`st_dev` を検証する）。ホストの devpts へ届く口は無い
+/// - master は `hand_over` が送って閉じる。workload に残るのは slave（fd 0〜2）だけで、ソケットの子の端は
+///   `hand_over` が消費する。`install` の退避用の複製（3 以上）は `install` の中で drop され、残りは
+///   `close_inherited_fds`・close-on-exec が exec までに閉じる
+/// - `/dev/console` への bind は #4071 の範囲。ここで slave を保持し続けない
+fn attach_launch_pty(sender: ExecPtySender) -> Result<StdioNulling, ExecError> {
+    let root = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "openat(/) for the init pty"))?;
+    let (master, slave) = pty::allocate_in_root(root.as_fd(), LAUNCH_PTY_INITIAL_SIZE)?;
+    drop(root);
+    sender.hand_over(master)?;
+    ChildStdio::from_pty_slave(slave)?.install()
 }
 
 /// `execveat` 前の失敗を状態 pipe へ書く。書けなくても元のエラーを返す（親は EOF を起動失敗として扱う）。
@@ -2440,6 +2475,9 @@ pub struct ChildStdio {
     stderr: Option<OwnedFd>,
     /// 3 本が pty の slave で、子が `setsid` の後に fd 0 を制御端末にする（[`Self::from_pty_slave`]。#3758）。
     controlling_tty: bool,
+    /// 端末つき起動（`process.terminal: true`）の master の送信口。launch の PID 1 だけが持ち、終端（`run_child`）が
+    /// pivot 後に pty を割り当てて master を C へ送る（CRI-6・SEC-1・#4070）。`install` は見ない。
+    pty_launch: Option<ExecPtySender>,
 }
 
 impl ChildStdio {
@@ -2459,6 +2497,7 @@ impl ChildStdio {
                 stdout: Some(OwnedFd::from(out_w)),
                 stderr: Some(OwnedFd::from(err_w)),
                 controlling_tty: false,
+                pty_launch: None,
             },
             out_r,
             err_r,
@@ -2480,6 +2519,7 @@ impl ChildStdio {
             stdout: Some(output),
             stderr: Some(dup),
             controlling_tty: false,
+            pty_launch: None,
         })
     }
 
@@ -2490,6 +2530,7 @@ impl ChildStdio {
             stdout: None,
             stderr: None,
             controlling_tty: false,
+            pty_launch: None,
         }
     }
 
@@ -2522,6 +2563,7 @@ impl ChildStdio {
             stdout,
             stderr,
             controlling_tty: false,
+            pty_launch: None,
         })
     }
 
@@ -2538,7 +2580,14 @@ impl ChildStdio {
             stdout: Some(slave.try_clone_fd()?),
             stderr: Some(slave.try_clone_fd()?),
             controlling_tty: true,
+            pty_launch: None,
         })
+    }
+
+    /// 端末つき起動の master の送信口を載せる（launch の PID 1 だけ。CRI-6・SEC-1・#4070）。
+    pub(super) fn with_pty_launch(mut self, sender: ExecPtySender) -> Self {
+        self.pty_launch = Some(sender);
+        self
     }
 
     /// 子の側で fd 0・1・2 へ付け替える。`prepare_exec_child` の `close_inherited_fds`（fd 3 以上を閉じる）より
@@ -2591,8 +2640,10 @@ pub(super) fn child_main(
     entry: &Entrypoint,
     stages: StagePipeline,
     setup: Option<PrePivotSetup<'_>>,
-    stdio: ChildStdio,
+    mut stdio: ChildStdio,
 ) -> i32 {
+    // 端末つき起動の master の送信口は `install` の前に取り出す（終端の `run_child` が使う。#4070）。
+    let pty = stdio.pty_launch.take();
     let nulling = match stdio.install() {
         Ok(n) => n,
         Err(err) => {
@@ -2600,7 +2651,7 @@ pub(super) fn child_main(
             return exit_code_for(&err);
         }
     };
-    match run_child(rootfs, entry, stages, setup, nulling) {
+    match run_child(rootfs, entry, stages, setup, nulling, pty) {
         Ok(never) => match never {},
         Err(err) => {
             // env の値は message に含めない（パスと errno のみ）。stderr が閉じていても panic しない。
@@ -2616,6 +2667,7 @@ fn run_child(
     stages: StagePipeline,
     setup: Option<PrePivotSetup<'_>>,
     nulling: StdioNulling,
+    pty: Option<ExecPtySender>,
 ) -> Result<Infallible, ExecError> {
     // 状態 pipe は pivot 前段の報告（`P`/`F`）に続き、終端でも exec 前の 2 行目（`R`/`E`）に使う（#2624）。
     let status = setup.and_then(|s| s.status);
@@ -2635,7 +2687,7 @@ fn run_child(
             }
             return Err(*err);
         }
-        exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status)
+        exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status, pty)
     })
 }
 
@@ -3797,6 +3849,7 @@ pub fn spawn_container_with_stages_and_devices(
                 root_readonly: false,
             }),
             StdioNulling::ALL,
+            None,
         ) {
             Ok(never) => match never {},
             Err(err) => {

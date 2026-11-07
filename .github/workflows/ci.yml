@@ -2025,14 +2025,14 @@ jobs:
           sel_a+='|bare-name|cwd-relative|user-applied|groups-applied) |launch options |readonly rootfs '
           sel_a+='|injected secret '
           sel_a+='|capabilities drop |sysctls applied |pod ipc |entrypoint violation |exit_signal '
-          sel_a+='|network loopback )'
+          sel_a+='|network loopback |init pty )'
           check --select "${sel_a}" \
             --subst-re pid='[1-9][0-9]*' --subst-re nspid='"[1-9][0-9]*\\t1"' \
             --subst HOSTNAME=fandhe-prod-launcher --subst BIND_DEST=/data --subst LO_TMPFS_DEST=/run \
             --subst WANT=4194304 --subst-re host_before='[0-9]+' --subst EXIT_CODE=7 \
             --subst name=unshare,ptrace,kexec_load \
             --subst-re host_uid='[0-9]+' --subst-re host_gids='[0-9]+,[0-9]+' \
-            --require 'production_launcher: scenario=rslave-bind host=' --min 24 --summary
+            --require 'production_launcher: scenario=rslave-bind host=' --min 25 --summary
           # B: code={:?} が 1 つの拒否系。exec-failure の case/code/phase の組は --require で値まで照合する
           ef='production_launcher: scenario=exec-failure'
           ef_tail='state=created audit=0 children=0'

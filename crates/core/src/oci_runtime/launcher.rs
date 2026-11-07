@@ -71,6 +71,10 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
+//! - **端末つき起動(CRI-6・SEC-1・CORE-5・#4070)**: `ProductionLauncherBuilder::with_terminal_support` で opt-in した launcher だけが
+//!   `process.terminal: true` を受け、PID 1 が pivot 後のコンテナの devpts から pty を割り当てて slave を fd 0〜2 と制御端末にし、
+//!   master を `LaunchedProcess::take_pty_master` で返す(割り当ては制限の適用の後。受信の位置は `exec::launch_intermediate` を参照)。
+//!   `/dev/console` への bind は #4071、supervisor の opt-in・master の保持・tty の捕捉は #4074、CRI の拒否の解除は #4078。
 //! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
 //!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
@@ -257,6 +261,9 @@ pub struct ProductionLauncherBuilder {
     /// `Attachable` の起動で同期点の中で呼ぶ準備処理(NET-9・CORE-6・#1939)。
     #[cfg(target_os = "linux")]
     netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
+    /// 端末つき起動(`process.terminal: true`)の opt-in(CRI-6・SEC-1・CORE-5・#4070)。既定は偽。
+    #[cfg(target_os = "linux")]
+    terminal_support: bool,
     /// 試験用: netns の素性の照合の基準を差し替える(dev, ino)。拒否の場面を実機で作るための差し込み口で、本番ビルドには無い。
     #[cfg(all(target_os = "linux", feature = "exec-test-support"))]
     netns_baseline_override: Option<(u64, u64)>,
@@ -389,6 +396,21 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// 端末つき起動(`process.terminal: true`)を受ける opt-in(CRI-6・SEC-1・CORE-5・#4070)。
+    ///
+    /// 有効にすると、`start` が `process.terminal: true` を拒否せず、PID 1 がコンテナの devpts から pty を割り当てて
+    /// slave を fd 0〜2 と制御端末にし、master を [`LaunchedProcess::take_pty_master`] で呼び出し側(supervisor)へ返す。
+    /// 既定は無効(従来どおり `Unimplemented`)。master を保持して捕捉する側(supervisor。#4074)は、これを有効にする launcher を
+    /// 組み立てるときに対で扱う責務を負う。
+    #[must_use]
+    pub fn with_terminal_support(mut self) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            self.terminal_support = true;
+        }
+        self
+    }
+
     /// 監査の網羅を満たせない環境(カーネル監査頼みの層の縮退)への方針(SEC-4・#2027)。既定は
     /// [`crate::audit_log::AuditCoveragePolicy::BestEffort`](警告して起動を続け、縮退を `launchIsolation` と監査記録に残す)。
     /// `Strict` は縮退(調べられなかった場合を含む)を fork の前に `FailedPrecondition` で拒否する(opt-in)。
@@ -459,6 +481,7 @@ impl ProductionLauncherBuilder {
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
             inner.netns_attach_hook = self.netns_attach_hook;
+            inner.terminal_support = self.terminal_support;
             inner.rejection_audit_sink = self.rejection_audit_sink;
             #[cfg(feature = "exec-test-support")]
             {
@@ -857,6 +880,18 @@ impl ProcessLauncher for ProductionLauncher {
 
     /// 起動オプションの network モード(start が予約前に config と突き合わせる。NET-6・SEC-1・#3058)。
     /// launch で使う値と同じ `launch_options` から取る(未指定は `FromConfig`)。
+    /// 端末つき起動の opt-in（`with_terminal_support`。CRI-6・SEC-1・#4070）。
+    fn supports_terminal(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.terminal_support
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     fn network_mode(&self) -> LaunchNetworkMode {
         #[cfg(target_os = "linux")]
         {
@@ -1043,6 +1078,8 @@ struct Spawned {
     /// 子が返した Mount 由来のルールの launch 時の識別子(`(ルール位置, 識別子)`。SEC-1・SEC-4・#3201)。本番の入口は
     /// 必ず `Some`(空もあり得る)。`None` は識別子を持たない偽の launcher だけで、分離の記録は識別子なしのまま残る。
     mount_identities: Option<Vec<(usize, crate::launch_isolation::RecordedMountIdentity)>>,
+    /// PID 1 から受け取った init の pty の master(端末つき起動の本番の入口は必ず `Some`。CRI-6・SEC-1・#4070)。
+    pty_master: Option<crate::exec::PtyMaster>,
 }
 
 /// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
@@ -1318,6 +1355,8 @@ struct Inner {
     audit_policy: crate::audit_log::AuditCoveragePolicy,
     /// `Attachable` の同期点で呼ぶ準備処理(`ProductionLauncherBuilder::netns_attach_hook`。NET-9・#1939)。
     netns_attach_hook: Option<Arc<dyn super::NetnsAttachHook>>,
+    /// 端末つき起動の opt-in(`ProductionLauncherBuilder::with_terminal_support`。CRI-6・#4070)。
+    terminal_support: bool,
     /// 試験用の netns 基準の差し替え(`ProductionLauncherBuilder::netns_baseline_override_for_test`。#3206)。
     #[cfg(feature = "exec-test-support")]
     netns_baseline_override: Option<(u64, u64)>,
@@ -1352,6 +1391,7 @@ impl Inner {
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
             netns_attach_hook: None,
+            terminal_support: false,
             #[cfg(feature = "exec-test-support")]
             netns_baseline_override: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
@@ -1389,6 +1429,14 @@ impl Inner {
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         self.left_process.store(false, Ordering::SeqCst);
         self.check_privilege()?;
+        // 端末つきの spec は opt-in 済みの launcher だけが受ける。`start` が `supports_terminal` で先に断るが、ラッパーの
+        // 転送漏れ・別経路から届いた spec を fork の前（副作用なし）に断る多重防御（fail-closed。CRI-6・SEC-1・#4070）。
+        if spec.terminal() && !self.terminal_support {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the launcher has not opted in to terminal support",
+            ));
+        }
         check_user_mapped(
             self.privilege,
             self.subordinate.as_ref().map(|s| (&s.uid, &s.gid)),
@@ -1693,6 +1741,7 @@ impl Inner {
             stderr,
             listener,
             mount_identities,
+            pty_master,
         } = spawned;
         // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
         if child.pid() == 0 {
@@ -1734,6 +1783,7 @@ impl Inner {
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
             .with_seccomp_listener(listener)
+            .with_pty_master(pty_master)
             .with_launch_isolation(isolation_record)
             .with_launch_rlimits(launch_rlimits)
             .with_exit_audit(self.exit_audit_sink(), id.clone())
@@ -2300,6 +2350,7 @@ impl LaunchOps for RealOps {
                 setup,
                 netns_sync: input.netns_sync,
                 netns_attach: input.netns_attach,
+                terminal: input.spec.terminal(),
             },
             input.stages,
             stdio,
@@ -2313,6 +2364,7 @@ impl LaunchOps for RealOps {
             stderr,
             listener: launched.listener,
             mount_identities: Some(launched.mount_identities),
+            pty_master: launched.pty_master,
         })
     }
 
@@ -2454,6 +2506,8 @@ mod tests {
         probe: crate::audit_log::KernelAuditProbe,
         /// `emit_warning` に渡った縮退の警告行(順序の照合に使う `events` とは分ける。#2027)。
         warnings: Arc<Mutex<Vec<String>>>,
+        /// 成功する spawn が試験用の pty の master を返すか(端末つき起動の模擬。CRI-6・#4070)。
+        give_pty_master: bool,
     }
 
     impl FakeOps {
@@ -2477,6 +2531,7 @@ mod tests {
                 recorded_calls: Arc::new(Mutex::new(Vec::new())),
                 probe: crate::audit_log::KernelAuditProbe::all_clear(),
                 warnings: Arc::new(Mutex::new(Vec::new())),
+                give_pty_master: false,
             }
         }
     }
@@ -2610,6 +2665,11 @@ mod tests {
                 stderr,
                 listener: None,
                 mount_identities: None,
+                pty_master: self.give_pty_master.then(|| {
+                    crate::exec::open_host_pty_for_test(crate::exec::WindowSize::new(0, 0))
+                        .expect("host pty")
+                        .0
+                }),
             })
         }
 
@@ -4879,6 +4939,54 @@ mod tests {
             "the launch spec was reconciled with a different network mode"
         );
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// 端末つき config の spec（`start` が `with_terminal(true)` を載せたもの相当）。
+    fn terminal_spec(name: &str) -> LaunchSpec {
+        spec_for(name, serde_json::json!({})).with_terminal(true)
+    }
+
+    /// CRI-6(#4070): builder の既定は端末対応なし。`with_terminal_support` で有効になる。
+    #[test]
+    fn cri6_4070_builder_terminal_support_defaults_off() {
+        let l = launcher(FakeOps::new(&events()), rootless(), None);
+        assert!(!l.supports_terminal());
+        let mut l = l;
+        l.inner.terminal_support = true;
+        assert!(l.supports_terminal());
+    }
+
+    /// CRI-6・SEC-1(#4070): opt-in の無い launcher は端末つきの spec を fork の前に `FailedPrecondition` で断る(多重防御)。
+    #[test]
+    fn cri6_4070_launch_rejects_terminal_spec_without_opt_in() {
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let err = l
+            .launch(&terminal_spec("tty-no-opt-in"), Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the launcher has not opted in to terminal support"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// CRI-6(#4070): opt-in 済みの launcher は子が返した pty の master をハンドルに持たせ、1 回だけ取り出せる。
+    #[test]
+    fn cri6_4070_launch_hands_pty_master_to_the_handle() {
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.give_pty_master = true;
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.terminal_support = true;
+        let p = l
+            .launch(&terminal_spec("tty-opt-in"), Duration::from_secs(1))
+            .expect("launch");
+        assert!(p.take_pty_master().is_some());
+        assert!(p.take_pty_master().is_none());
+        p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     /// NET-6(#3058): 起動オプション未指定の `network_mode` は `FromConfig`。

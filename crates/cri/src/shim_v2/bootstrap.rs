@@ -325,10 +325,7 @@ pub fn encode_delete_response() -> Vec<u8> {
     super::task_api::DeleteResponse {
         pid: 0,
         exit_status: DELETE_EXIT_STATUS,
-        exited_at: Some(super::task_api::Timestamp {
-            seconds: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
-            nanos: i32::try_from(now.subsec_nanos()).unwrap_or(0),
-        }),
+        exited_at: Some(super::task_api::Timestamp::from_unix_duration(now)),
     }
     .encode_to_vec()
 }

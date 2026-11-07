@@ -95,6 +95,10 @@
 //!     引き継ぐ（health 更新などで消さない）。`Stopped` 以外の status への指定付き `update` は `InvalidArgument` で
 //!     拒否する（壊れた値を表現させない）。re-adopt・再 launch の判定（`unless-stopped` は記録済みなら起こさない）が
 //!     読む。`get` / `list` で返す。plugin 実装も同じく往復させる
+//! 15. [`ContainerStatus::exited_at`]（終了検知時刻。CRI-5・OCI-5・SUP-1・#3682）は **`Stopped` の status でだけ持てる**。
+//!     `update` は渡された status をそのまま保存し、ストアは補完も引き継ぎもしない（契約 14 と違い、書き手が
+//!     status の一部として渡す）。`Stopped` のまま更新する書き手は既存の status を複製して保つ。
+//!     plugin 実装も同じく往復させる
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。

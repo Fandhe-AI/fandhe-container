@@ -390,6 +390,38 @@ mod tests {
         assert_eq!(s.write_explicit_stop().unwrap().revision().value(), 3);
     }
 
+    /// SUP-1・CRI-5（#3682）: 明示 stop の記録（status の複製）は終了検知時刻を保つ（契約 15）。
+    #[test]
+    fn sup1_3682_explicit_stop_keeps_exited_at() {
+        let at =
+            fandhe_container_core::traits::ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        let rec = |rev: u64| {
+            StateRecord::new(
+                ContainerStatus::stopped_at(cid("c1"), Some(1), at),
+                std::env::temp_dir().join("b"),
+                StateRevision::from_raw(rev),
+            )
+            .unwrap()
+            .with_cgroup(placement(1))
+        };
+        let store = Arc::new(FakeStore(Mutex::new(Some(rec(1)))));
+        let mut s = SupervisedState::attach(store.clone(), cid("c1")).unwrap();
+        *store.0.lock().unwrap() = Some(rec(2));
+        let written = s.write_explicit_stop().unwrap();
+        assert_eq!(written.status().exited_at(), at);
+        assert_eq!(
+            store
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status()
+                .exited_at(),
+            at
+        );
+    }
+
     /// TASK-157.3: 別コンテナの status は InvalidArgument、レコードなしは NotFound。
     #[test]
     fn sup1_task157_3_rejects_other_id_and_missing_record() {

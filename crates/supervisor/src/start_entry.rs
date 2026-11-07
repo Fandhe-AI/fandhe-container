@@ -97,9 +97,9 @@ use fandhe_container_core::oci_runtime::{
     recover_interrupted_start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, ExplicitStop, GetStateRequest,
-    StartRequest, StateRecord, StateRevision, StateStore, SupervisionState, TraitError,
-    UpdateStateRequest,
+    ContainerId, ContainerState, ContainerStatus, ErrorCode, ExitTime, ExplicitStop,
+    GetStateRequest, StartRequest, StateRecord, StateRevision, StateStore, SupervisionState,
+    TraitError, UpdateStateRequest,
 };
 
 use crate::deadline_store::{DeadlineStore, LateWrites};
@@ -1781,9 +1781,11 @@ fn mark_stopped(
     // 有限にする。期限を過ぎたら記録できなかった扱い（INTERNAL）で終わる。遅れて成功する書き込みは `Stopped` で
     // 照合つきのため害はない（REPAIR-5）。
     let (store, id, reaped) = (Arc::clone(store), id.clone(), reaped.to_vec());
+    // 終了検知時刻は回収を確かめた直後に採り、再試行でも同じ値を使う（CRI-5・#3682）。
+    let exited_at = ExitTime::now();
     run_bounded("supervisor-mark-stopped", MARK_STOPPED_LIMIT, move || {
         for attempt in 1..=MARK_STOPPED_ATTEMPTS {
-            match try_mark_stopped(store.as_ref(), &id, instance, &reaped) {
+            match try_mark_stopped(store.as_ref(), &id, instance, &reaped, exited_at) {
                 Ok(()) => return true,
                 Err(code) => {
                     log_event("mark_stopped_failed", Some(code));
@@ -1803,6 +1805,7 @@ fn try_mark_stopped(
     id: &ContainerId,
     instance: Option<StateRevision>,
     reaped: &[NonZeroU32],
+    exited_at: Option<ExitTime>,
 ) -> Result<(), ErrorCode> {
     let record = store
         .get(&GetStateRequest::new(id.clone()))
@@ -1821,7 +1824,7 @@ fn try_mark_stopped(
     }
     let supervision = SupervisionState::new(None, record.health(), record.restart_count());
     let req = UpdateStateRequest::new(
-        ContainerStatus::stopped(id.clone(), None),
+        ContainerStatus::stopped_at(id.clone(), None, exited_at),
         record.revision(),
     )
     .with_supervision(supervision);

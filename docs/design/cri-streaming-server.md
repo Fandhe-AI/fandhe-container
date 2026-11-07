@@ -329,7 +329,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C2 | #4070 | core: init の pty と master の返却（実装済み。受信は exec 前の 2 行目の判定の後。stdout / stderr の pipe は起動前の診断のため残す。supervisor の opt-in は C4） | #3758 |
 | C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
 | C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
-| C5 | #4072 | supervisor: 捕捉からの出力の tap | なし |
+| C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode` | なし |
 | C8 | #4076 | cri: 記録への保存と StartContainer での運搬 | C7・C4 |

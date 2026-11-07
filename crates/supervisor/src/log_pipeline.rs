@@ -27,6 +27,9 @@ use std::time::Duration;
 use fandhe_container_core::oci_runtime::ContainerOutput;
 use fandhe_container_core::traits::TraitError;
 
+use crate::logs::tap::{
+    OutputTap, TapReporter, TapStats, TapStreams, TapSubscription, default_reporter,
+};
 use crate::logs::{CaptureSummary, LogCapture, LogSink, OutputStreams, ReaderBudget};
 
 /// `drain` の結果を構造化ログへ報告する（REPAIR-4）。
@@ -64,7 +67,10 @@ pub const PREVIOUS_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct CaptureHub {
     sink: Arc<dyn LogSink>,
     budget: ReaderBudget,
-    live: Mutex<Option<LogCapture>>,
+    /// 生きている捕捉と、その出力の tap（捕捉 1 つにつき 1 つ。差し替えと tap の閉鎖を同じロックの区間で行う）。
+    live: Mutex<Option<(LogCapture, Arc<OutputTap>)>>,
+    /// tap の切断の報告先（本番は構造化ログ 1 行。試験で差し替える）。
+    tap_report: TapReporter,
 }
 
 impl std::fmt::Debug for CaptureHub {
@@ -82,7 +88,47 @@ impl CaptureHub {
             sink,
             budget: ReaderBudget::with_max_limit(),
             live: Mutex::new(None),
+            tap_report: default_reporter(),
         }
+    }
+
+    /// tap の切断の報告先を差し替える（試験用）。
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_tap_reporter(mut self, report: TapReporter) -> Self {
+        self.tap_report = report;
+        self
+    }
+
+    /// 今の捕捉の出力を購読する（#4072・SUP-7・REPAIR-5。C6〔#4075〕の kind 9 が呼び、端を SCM_RIGHTS で返す）。
+    ///
+    /// 購読の後に読まれた出力だけが届く（過去の出力は持たない）。sink が優先で、溢れた・閉じた購読者は切断される
+    /// （契約は [`crate::logs::tap`]）。生きている捕捉が無い（初回の `attach` の前・`quiesce` から次の `attach` まで・
+    /// `finish` の後）と要求したストリームを捕捉していないときは `FailedPrecondition`、どちらも要求しないと
+    /// `InvalidArgument`、上限（[`crate::logs::MAX_TAP_SUBSCRIBERS`]。初期案）超過は `ResourceExhausted`。
+    /// 非 unix では `Unimplemented`。
+    pub fn subscribe_output(&self, streams: TapStreams) -> Result<TapSubscription, TraitError> {
+        let tap = self
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(_, tap)| Arc::clone(tap));
+        match tap {
+            Some(tap) => tap.subscribe(streams),
+            None => Err(TraitError::new(
+                fandhe_container_core::traits::ErrorCode::FailedPrecondition,
+                "no live output capture",
+            )),
+        }
+    }
+
+    /// 今の捕捉の tap の計数。捕捉が無ければ `None`。
+    pub fn output_tap_stats(&self) -> Option<TapStats> {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(_, tap)| tap.stats())
     }
 
     /// 新しいプロセスの出力の捕捉を開始し、直前の捕捉があれば畳む。出力が空（どちらのストリームも無い）なら何もしない。
@@ -91,16 +137,45 @@ impl CaptureHub {
     /// プロセスを回収すること）。直前の捕捉の `drain` が期限切れ・失敗でも、新しい捕捉は成功として扱う
     /// （失敗は返さず、取り消された旧捕捉の行は sink の契約どおり flush 済み）。
     pub fn attach(&self, output: ContainerOutput) -> Result<(), TraitError> {
-        let streams = OutputStreams::new(&self.budget, output.stdout, output.stderr);
+        let mut streams = OutputStreams::new(&self.budget, output.stdout, output.stderr);
         if streams.is_empty() {
+            // 世代交代の契機なので、旧い捕捉は畳まないが購読者だけは閉じる（#4072）。
+            if let Some((_, tap)) = self
+                .live
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                tap.close_all();
+            }
             return Ok(());
         }
-        let capture = LogCapture::start(streams, Arc::clone(&self.sink))?;
-        let previous = self
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(capture);
+        let (has_stdout, has_stderr) = streams.presence();
+        let tap = Arc::new(OutputTap::new(
+            has_stdout,
+            has_stderr,
+            Arc::clone(&self.tap_report),
+        ));
+        let capture = match LogCapture::start_with_tap(
+            &mut streams,
+            Arc::clone(&self.sink),
+            Arc::clone(&tap),
+        ) {
+            Ok(capture) => capture,
+            Err(e) => {
+                tap.close_all();
+                return Err(e);
+            }
+        };
+        let previous = {
+            let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            let previous = live.replace((capture, tap));
+            // 旧い世代の購読者は drain を待たずに閉じる（遅れて publish されても no-op）。
+            if let Some((_, old_tap)) = previous.as_ref() {
+                old_tap.close_all();
+            }
+            previous.map(|(capture, _)| capture)
+        };
         if let Some(previous) = previous {
             // 期限切れでも `drain` が自動で取り消す。ここで待つのは旧プロセスの EOF だけ。
             report_drain(
@@ -128,7 +203,8 @@ impl CaptureHub {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(previous) = previous {
+        if let Some((previous, tap)) = previous {
+            tap.close_all();
             report_drain(
                 "log_capture_previous_drain_failed",
                 &previous.drain(limit.min(PREVIOUS_DRAIN_TIMEOUT)),
@@ -149,7 +225,8 @@ impl CaptureHub {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        live.map(|capture| {
+        live.map(|(capture, tap)| {
+            tap.close_all();
             let drained = capture.drain(timeout.min(crate::logs::MAX_DRAIN_TIMEOUT));
             report_drain("log_capture_finish_failed", &drained);
             drained
@@ -244,5 +321,444 @@ last-no-lf",
         let hub = CaptureHub::new(Arc::new(MemoryLogSink::default()));
         hub.attach(ContainerOutput::default()).expect("noop");
         assert!(hub.finish(Duration::from_secs(1)).is_none());
+    }
+}
+/// 捕捉から購読者への出力の tap の試験（#4072・SUP-7・REPAIR-5）。待ちはすべて期限つき。
+#[cfg(all(test, unix))]
+mod tap_tests {
+    use super::*;
+    use crate::logs::tap::DisconnectReason;
+    use crate::logs::{LogCapture, StreamKind};
+    use fandhe_container_core::traits::ErrorCode;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, mpsc};
+    use std::time::Instant;
+
+    type Reports = Arc<Mutex<Vec<(Option<StreamKind>, DisconnectReason)>>>;
+
+    /// 行数・バイト数を数える sink。`gate` が閉じている間は append が戻らない。
+    struct CountSink {
+        lines: AtomicU64,
+        bytes: AtomicU64,
+        gate: (Mutex<bool>, Condvar),
+    }
+
+    impl CountSink {
+        fn new(open: bool) -> Arc<Self> {
+            Arc::new(Self {
+                lines: AtomicU64::new(0),
+                bytes: AtomicU64::new(0),
+                gate: (Mutex::new(open), Condvar::new()),
+            })
+        }
+        fn open(&self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+        fn lines(&self) -> u64 {
+            self.lines.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LogSink for CountSink {
+        fn append(&self, _stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
+            let (m, cv) = &self.gate;
+            let mut g = m.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !*g {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(TraitError::new(ErrorCode::Timeout, "gate"));
+                }
+                g = cv.wait_timeout(g, left).unwrap().0;
+            }
+            self.bytes.fetch_add(line.len() as u64, Ordering::SeqCst);
+            self.lines.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn hub_with(sink: Arc<dyn LogSink>) -> (CaptureHub, Reports) {
+        let reports: Reports = Arc::default();
+        let r = Arc::clone(&reports);
+        let hub = CaptureHub::new(sink).with_tap_reporter(Arc::new(move |s, why| {
+            r.lock().unwrap().push((s, why));
+        }));
+        (hub, reports)
+    }
+
+    type Pipes = (
+        ContainerOutput,
+        Option<std::io::PipeWriter>,
+        Option<std::io::PipeWriter>,
+    );
+
+    fn pipe_output(stdout: bool, stderr: bool) -> Pipes {
+        let mut out = ContainerOutput::default();
+        let mut w = (None, None);
+        if stdout {
+            let (r, wr) = std::io::pipe().unwrap();
+            out.stdout = Some(Box::new(r));
+            w.0 = Some(wr);
+        }
+        if stderr {
+            let (r, wr) = std::io::pipe().unwrap();
+            out.stderr = Some(Box::new(r));
+            w.1 = Some(wr);
+        }
+        (out, w.0, w.1)
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(start.elapsed() < Duration::from_secs(10), "timeout: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn timed(s: &UnixStream) {
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    }
+
+    fn read_n(s: &mut UnixStream, n: usize) -> Vec<u8> {
+        timed(s);
+        let mut v = vec![0u8; n];
+        s.read_exact(&mut v).expect("read_exact");
+        v
+    }
+
+    fn assert_eof(s: &mut UnixStream) {
+        timed(s);
+        let mut b = [0u8; 16];
+        assert_eq!(s.read(&mut b).expect("read"), 0, "expected EOF");
+    }
+
+    fn assert_would_block(s: &UnixStream) {
+        s.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 16];
+        let mut r = s;
+        let e = r.read(&mut b).expect_err("no data expected");
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        s.set_nonblocking(false).unwrap();
+    }
+
+    fn out_only() -> TapStreams {
+        TapStreams {
+            stdout: true,
+            stderr: false,
+        }
+    }
+
+    fn sub_stdout(hub: &CaptureHub) -> UnixStream {
+        hub.subscribe_output(out_only())
+            .expect("subscribe")
+            .into_parts()
+            .0
+            .expect("stdout end")
+    }
+
+    /// 受け入れ基準: 読まない購読者がいても、コンテナ側の write も sink も詰まらない。
+    #[test]
+    fn sup7_4072_never_reading_subscriber_does_not_block_writer_or_sink() {
+        let sink = CountSink::new(true);
+        let (hub, reports) = hub_with(sink.clone());
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut idle = sub_stdout(&hub);
+        let mut w = w.unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let mut line = vec![b'x'; 1023];
+            line.push(b'\n');
+            for _ in 0..4096 {
+                w.write_all(&line).unwrap();
+            }
+            drop(w);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer blocked by tap");
+        h.join().unwrap();
+        wait_until("sink lines", || sink.lines() == 4096);
+        let stats = hub.output_tap_stats().unwrap();
+        assert_eq!(stats.disconnected_overflow, 1);
+        assert_eq!(stats.live_subscribers, 0);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![(Some(StreamKind::Stdout), DisconnectReason::Overflow)]
+        );
+        assert_eq!(sink.bytes.load(Ordering::SeqCst), 4096 * 1023);
+        timed(&idle);
+        let mut total = 0usize;
+        let mut buf = [0u8; 8192];
+        loop {
+            match idle.read(&mut buf).unwrap() {
+                0 => break,
+                n => total += n,
+            }
+        }
+        assert!(total < 4096 * 1024, "received {total}");
+    }
+
+    /// 読む購読者は全バイトを順序どおりに受け、読まない購読者だけが切断される。
+    #[test]
+    fn sup7_4072_reading_subscriber_survives_while_idle_one_is_dropped() {
+        let sink = CountSink::new(true);
+        let (hub, reports) = hub_with(sink.clone());
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut reader = sub_stdout(&hub);
+        let _idle = sub_stdout(&hub);
+        let mut w = w.unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let mut expect: Vec<u8> = Vec::new();
+        for i in 0..64u32 {
+            let mut chunk = vec![b'a' + (i % 26) as u8; 16 * 1024 - 1];
+            chunk.push(b'\n');
+            w.write_all(&chunk).unwrap();
+            expect.extend_from_slice(&chunk);
+            got.extend(read_n(&mut reader, chunk.len()));
+        }
+        assert_eq!(got, expect);
+        wait_until("idle dropped", || {
+            hub.output_tap_stats().unwrap().live_subscribers == 1
+        });
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![(Some(StreamKind::Stdout), DisconnectReason::Overflow)]
+        );
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// sink が常に優先: append が戻るまで購読者には 1 バイトも届かない。
+    #[test]
+    fn sup7_4072_tap_waits_for_sink() {
+        let sink = CountSink::new(false);
+        let (hub, _) = hub_with(sink.clone());
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut s = sub_stdout(&hub);
+        let mut w = w.unwrap();
+        w.write_all(b"x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_would_block(&s);
+        sink.open();
+        assert_eq!(read_n(&mut s, 2), b"x\n");
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// LF なしのプロンプトが、書き手を開いたまま届く（sink にはまだ行が無い）。
+    #[test]
+    fn sup7_4072_partial_line_reaches_subscriber_before_sink() {
+        let sink = CountSink::new(true);
+        let (hub, _) = hub_with(sink.clone());
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut s = sub_stdout(&hub);
+        let mut w = w.unwrap();
+        w.write_all(b"prompt$ ").unwrap();
+        assert_eq!(read_n(&mut s, 8), b"prompt$ ");
+        assert_eq!(sink.lines(), 0);
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(sink.lines(), 1);
+    }
+
+    /// 購読した後の出力だけが届く。
+    #[test]
+    fn sup7_4072_only_output_after_subscription_is_delivered() {
+        let sink = CountSink::new(true);
+        let (hub, _) = hub_with(sink.clone());
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut barrier = sub_stdout(&hub);
+        let mut w = w.unwrap();
+        w.write_all(b"before\n").unwrap();
+        // 先の購読者に届いた時点で、before の publish は終わっている（同じロック）。
+        assert_eq!(read_n(&mut barrier, 7), b"before\n");
+        let mut late = sub_stdout(&hub);
+        w.write_all(b"after\n").unwrap();
+        assert_eq!(read_n(&mut late, 6), b"after\n");
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eof(&mut late);
+    }
+
+    /// 上限 8 件。9 件目は拒否され、閉じた購読者は掃除されて枠が空く。
+    #[test]
+    fn sup7_4072_subscriber_limit_and_sweep() {
+        let (hub, _) = hub_with(CountSink::new(true));
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut subs: Vec<UnixStream> = (0..crate::logs::MAX_TAP_SUBSCRIBERS)
+            .map(|_| sub_stdout(&hub))
+            .collect();
+        let e = hub.subscribe_output(out_only()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(hub.output_tap_stats().unwrap().rejected_limit, 1);
+        drop(subs.pop());
+        let _ninth = sub_stdout(&hub);
+        let stats = hub.output_tap_stats().unwrap();
+        assert_eq!(stats.disconnected_peer_closed, 1);
+        assert_eq!(stats.live_subscribers, 8);
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// 相手が閉じた購読者への書き込みは peer_closed で切断され、プロセスは落ちない。
+    #[test]
+    fn sup7_4072_closed_peer_is_dropped_without_sigpipe() {
+        let (hub, reports) = hub_with(CountSink::new(true));
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        drop(sub_stdout(&hub));
+        let mut w = w.unwrap();
+        w.write_all(b"hello\n").unwrap();
+        wait_until("peer closed", || {
+            hub.output_tap_stats().unwrap().disconnected_peer_closed == 1
+        });
+        assert_eq!(
+            *reports.lock().unwrap(),
+            vec![(Some(StreamKind::Stdout), DisconnectReason::PeerClosed)]
+        );
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// 書き込み側が閉じると、購読した両ストリームが EOF を受け、一覧から外れる。
+    #[test]
+    fn sup7_4072_eof_closes_both_streams() {
+        let (hub, _) = hub_with(CountSink::new(true));
+        let (out, w1, w2) = pipe_output(true, true);
+        hub.attach(out).unwrap();
+        let (a, b) = hub
+            .subscribe_output(TapStreams {
+                stdout: true,
+                stderr: true,
+            })
+            .unwrap()
+            .into_parts();
+        let (mut a, mut b) = (a.unwrap(), b.unwrap());
+        drop(w1);
+        drop(w2);
+        assert_eof(&mut a);
+        assert_eof(&mut b);
+        wait_until("subscriber removed", || {
+            hub.output_tap_stats().unwrap().live_subscribers == 0
+        });
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// 世代交代で旧い購読者は EOF を受け、新しい購読者は新しい出力だけを受ける。
+    #[test]
+    fn sup7_4072_generation_change_closes_old_subscribers() {
+        let (hub, _) = hub_with(CountSink::new(true));
+        let (out, old_w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut old_sub = sub_stdout(&hub);
+        let (out2, new_w, _) = pipe_output(true, false);
+        hub.attach(out2).unwrap();
+        assert_eof(&mut old_sub);
+        let mut new_sub = sub_stdout(&hub);
+        // 旧い書き手に遅れて書いても、新しい購読者には届かない。
+        let _ = old_w.unwrap().write_all(b"old\n");
+        let mut new_w = new_w.unwrap();
+        new_w.write_all(b"new\n").unwrap();
+        assert_eq!(read_n(&mut new_sub, 4), b"new\n");
+        drop(new_w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eof(&mut new_sub);
+    }
+
+    /// quiesce の後は購読者が EOF を受け（孫がパイプを保持して drain が期限切れでも）、購読は拒否される。
+    /// finish の後も同じ。
+    #[test]
+    fn sup7_4072_quiesce_and_finish_close_subscribers() {
+        let (hub, _) = hub_with(CountSink::new(true));
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut s = sub_stdout(&hub);
+        hub.quiesce();
+        assert_eof(&mut s);
+        assert_eq!(
+            hub.subscribe_output(out_only()).unwrap_err().code(),
+            ErrorCode::FailedPrecondition
+        );
+        drop(w);
+
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let mut s = sub_stdout(&hub);
+        drop(w);
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eof(&mut s);
+        assert_eq!(
+            hub.subscribe_output(out_only()).unwrap_err().code(),
+            ErrorCode::FailedPrecondition
+        );
+        assert!(hub.output_tap_stats().is_none());
+    }
+
+    /// 要求の検査: 両方偽、捕捉していないストリーム、EOF 済みのストリーム。
+    #[test]
+    fn sup7_4072_request_validation() {
+        let (hub, _) = hub_with(CountSink::new(true));
+        let (out, w, _) = pipe_output(true, false);
+        hub.attach(out).unwrap();
+        let none = TapStreams {
+            stdout: false,
+            stderr: false,
+        };
+        assert_eq!(
+            hub.subscribe_output(none).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        let err_only = TapStreams {
+            stdout: false,
+            stderr: true,
+        };
+        assert_eq!(
+            hub.subscribe_output(err_only).unwrap_err().code(),
+            ErrorCode::FailedPrecondition
+        );
+        drop(w);
+        // リーダーが EOF を見るまで待つ。EOF 済みなら購読者の端は即 EOF。
+        let start = Instant::now();
+        loop {
+            let mut s = sub_stdout(&hub);
+            s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let mut b = [0u8; 1];
+            if matches!(s.read(&mut b), Ok(0)) {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "never EOF");
+        }
+        hub.finish(Duration::from_secs(10)).unwrap().unwrap();
+    }
+
+    /// 取り消しの後に書かれたバイトは購読者に届かない。
+    #[test]
+    fn sup7_4072_cancelled_capture_publishes_nothing() {
+        let sink = CountSink::new(true);
+        let budget = ReaderBudget::with_max_limit();
+        let (r, mut w) = std::io::pipe().unwrap();
+        let (r, entered) = crate::logs::notify_on_read(r);
+        let tap = Arc::new(OutputTap::new(true, false, Arc::new(|_, _| {})));
+        let mut streams = OutputStreams::new(&budget, Some(r), None);
+        let cap = LogCapture::start_with_tap(&mut streams, sink.clone(), Arc::clone(&tap)).unwrap();
+        let mut s = tap.subscribe(out_only()).unwrap().into_parts().0.unwrap();
+        crate::logs::wait_read_entered(&entered);
+        cap.cancel().unwrap();
+        w.write_all(b"late\n").unwrap();
+        wait_until("reader gone", || budget.live() == 0);
+        assert_eof(&mut s);
+        assert_eq!(sink.lines(), 0);
     }
 }

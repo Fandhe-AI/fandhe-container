@@ -36,6 +36,9 @@
 //!   代わりに取っ手（[`LogCapture`]）が捕捉の継続を表す。[`crate::run::monitor_with_capture`] は終端待ちを
 //!   しなかった全経路で取っ手を返すので、呼び出し側は [`LogCapture::cancel`] で止めるか、保持して後で
 //!   [`LogCapture::drain`] する（取っ手を破棄すると止める手段が無くなる）。
+//! - 購読者への出力の tap（#4072・SUP-7・REPAIR-5）: リーダーは sink へ append と flush をした後に、同じ生のチャンクを
+//!   [`tap`] の購読者へ複製する（sink 優先・背圧なし・溢れたら切断。契約は [`tap`] のモジュール doc）。
+//!   `start` / `start_from` は tap なしで動く。
 //! - OS 固有型（fd / HANDLE）は公開せず `Read` のみを受ける（CLI-1）。グローバル状態は持たない（CORE-1・D-19）。
 //!
 //! # 実装済み（TASK-164.2・#506、TASK-164.3・#507）
@@ -77,6 +80,7 @@
 pub mod cri;
 pub mod reader;
 pub mod rotating;
+pub mod tap;
 
 #[cfg(all(test, unix))]
 mod sweep_tests;
@@ -88,6 +92,7 @@ pub use reader::{
     read_container_log_with_cancel, read_container_log_with_hooks,
 };
 pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
+pub use tap::{MAX_TAP_SUBSCRIBERS, TapStats, TapStreams, TapSubscription};
 
 /// コンテナログのディレクトリ名（状態ルート直下）。`@` 始まりはストアのメタデータ用の名前空間で、コンテナ ID
 /// （`[A-Za-z0-9._-]`）と衝突しない。`logs` という ID の `create` がログ置き場を踏まないための名前（#1543・SUP-7）。
@@ -635,6 +640,11 @@ impl OutputStreams {
         self.stdout.is_none() && self.stderr.is_none()
     }
 
+    /// `(stdout を持つか, stderr を持つか)`。ハブが tap に捕捉の構成を伝えるために使う（#4072）。
+    pub(crate) fn presence(&self) -> (bool, bool) {
+        (self.stdout.is_some(), self.stderr.is_some())
+    }
+
     /// どちらも捕捉しない（リーダーを起動しないため枠は使わない）。
     pub fn none(budget: &ReaderBudget) -> Self {
         Self::new(budget, None, None)
@@ -948,13 +958,24 @@ impl LogCapture {
         streams: &mut OutputStreams,
         sink: Arc<dyn LogSink>,
     ) -> Result<Self, TraitError> {
-        Self::start_bounded(streams, sink)
+        Self::start_bounded(streams, sink, None)
+    }
+
+    /// [`LogCapture::start_from`] に出力の tap（[`tap`] モジュール）を付けて始める。tap は捕捉 1 つにつき 1 つで、
+    /// ハブ（[`crate::log_pipeline::CaptureHub`]）が購読と閉鎖を担う（#4072・SUP-7）。
+    pub(crate) fn start_with_tap(
+        streams: &mut OutputStreams,
+        sink: Arc<dyn LogSink>,
+        tap: Arc<tap::OutputTap>,
+    ) -> Result<Self, TraitError> {
+        Self::start_bounded(streams, sink, Some(tap))
     }
 
     /// 本体。`streams` が持つ [`ReaderBudget`] で生存リーダー数を制限する。
     fn start_bounded(
         streams: &mut OutputStreams,
         sink: Arc<dyn LogSink>,
+        tap: Option<Arc<tap::OutputTap>>,
     ) -> Result<Self, TraitError> {
         type Slot = Arc<Mutex<Option<Box<dyn Read + Send>>>>;
         // ストリームを取り出す前に枠を確保する。上限超過ならストリームは呼び出し側に残る。
@@ -984,6 +1005,7 @@ impl LogCapture {
             let tx = tx.clone();
             let sink = Arc::clone(&sink);
             let cancel = Arc::clone(&cancel);
+            let tap = tap.clone();
             let reader_slot = reader_slots.pop();
             let (gate_tx, gate_rx) = mpsc::channel::<()>();
             // 失敗時は gates が drop され、起動済みスレッドの recv が Err になって終了する（stream は slot に残る）。
@@ -999,12 +1021,13 @@ impl LogCapture {
                     let stream = slot.lock().ok().and_then(|mut g| g.take());
                     let Some(stream) = stream else { return };
                     drop(slot);
-                    let summary = pump(stream, kind, sink.as_ref(), &cancel);
+                    let summary = pump(stream, kind, sink.as_ref(), &cancel, tap.as_deref());
                     // 結果を送ってから資源を持ち続けると、drain が Ok で戻った時点で枠が戻っておらず
                     // quiesce 後の budget.live() が 0 にならない窓ができる（#3453 と同じ型。#3507・SUP-7・REPAIR-5）。
                     // そのため送信の前に枠と sink / cancel の参照を手放す。
                     drop(sink);
                     drop(cancel);
+                    drop(tap);
                     drop(reader_slot);
                     // 受信側が drain を諦めて破棄済みなら送信失敗は無視してよい。
                     let _ = tx.send((kind, summary));
@@ -1285,13 +1308,30 @@ fn flush_bounded(
     }
 }
 
+/// `pump` の全出口でそのストリームの tap を閉じるガード（#4072・SUP-7）。
+struct TapStreamGuard<'a> {
+    tap: Option<&'a tap::OutputTap>,
+    kind: StreamKind,
+}
+
+impl Drop for TapStreamGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tap) = self.tap {
+            tap.end_stream(self.kind);
+        }
+    }
+}
+
 /// 1 ストリームを EOF まで読み、行単位で sink へ渡す。
 fn pump(
     mut stream: Box<dyn Read + Send>,
     kind: StreamKind,
     sink: &dyn LogSink,
     cancel: &CancelGate,
+    tap: Option<&tap::OutputTap>,
 ) -> StreamSummary {
+    // どの出口（EOF・読み取りエラー・取り消し・panic）でも購読者の端を落として EOF を伝える（#4072）。
+    let _tap_end = TapStreamGuard { tap, kind };
     let mut sp = LineSplitter {
         kind,
         sink,
@@ -1324,6 +1364,15 @@ fn pump(
                 // 読むたびに書き出す。満杯の read の直後に書き手が止まっても、次の read（ブロックし得る）の前に
                 // 受理済みの行が必ず書き出される（時間上限の無い滞留を作らない）。まとめ書きは sink 内のバッファが担う。
                 sp.flush_sink();
+                // sink を優先し、append と flush が戻った後に生のチャンクを購読者へ複製する。取り消し後は流さない。
+                // sink が失敗して読み捨てに入っていても流し続ける（背圧なしのため読み捨ての前提を壊さない。#4072）。
+                if let Some(tap) = tap
+                    && !sp.cancelled
+                    && !cancel.is_cancelled()
+                    && let Some(data) = chunk.get(..n)
+                {
+                    tap.publish(kind, data);
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -2555,7 +2604,13 @@ mod tests {
 
     fn pump_chunks(chunks: &[&[u8]], sink: &CallLog) -> StreamSummary {
         let gate = CancelGate::default();
-        pump(chunked(chunks).unwrap(), StreamKind::Stdout, sink, &gate)
+        pump(
+            chunked(chunks).unwrap(),
+            StreamKind::Stdout,
+            sink,
+            &gate,
+            None,
+        )
     }
 
     /// 短い read の後と EOF で flush される。
@@ -2750,6 +2805,7 @@ mod tests {
             StreamKind::Stdout,
             &sink,
             &gate,
+            None,
         );
         assert!(sink.calls().is_empty());
         assert_eq!(sum.lines(), 0);

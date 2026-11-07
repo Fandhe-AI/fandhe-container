@@ -8,6 +8,7 @@
 //! 手順は `docs/verification/real-machine-tests.md` の `hvf_kernel_boot` の項。1 プロセス 1 VM のため `--test-threads=1` で実行する。
 //! 環境変数: `FANDHE_CONTAINER_MICROVM_KERNEL`（必須）・`_INITRD`（既定 `target/microvm-test-initrd/aarch64/initrd.cpio`）・
 //! `_SERIAL_INITRD`（UART 試験用。既定 `target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio`。#3987）・
+//! `_BLOCK_INITRD`（block-read 用。既定 `target/microvm-test-initrd/aarch64-block-read/initrd.cpio`。#4014）・
 //! `_CMDLINE`（既定 `console=ttyS0 rdinit=/init`。末尾に `panic=0` を足す）・`_BOOT_TIMEOUT_SECS`（1..=600、既定 60）。
 //!
 //! 観測手段: ゲストの `/init` がシリアル（ns16550a の MMIO）へ書く固定文字列（`MARKER`）を行単位でちょうど 1 回数え、停止理由が
@@ -49,9 +50,18 @@
 //!   別 issue で、試験を緩めない（#3998）。
 //! - `guest/kernel/arm64-guest.config` は Virtualization.framework 用で `SERIAL_8250` などが無く、本試験の Image には使えない。
 //!
-//! 未実装（REPAIR-3）: virtio-block の block-read を割り込み trigger 2 構成（edge / LevelHigh）で起動する試験は、HVF 側が
-//! `QueueNotify` を処理する経路（#3908）が無いため足していない。UART の入出力（#3987）・vCPU 2 台（#3998）はこの試験の上に足す。
-//! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない（`serial-echo` の `/init` も未実行）。
+//! virtio-block の block-read（#4014・MVM-5・MVM-1。`block-read` の initrd: `_BLOCK_INITRD`、既定
+//! `target/microvm-test-initrd/aarch64-block-read/initrd.cpio`）: backend の offset 0 に `BLOCK_SENTINEL` を置いた virtio-block 1 台を
+//! 載せ、ゲストが `/dev/vda` の先頭 32 バイトを読んで一致したときだけ出す `BLOCK_OK_MARKER` がちょうど 1 回、`BLOCK_MISMATCH_MARKER` と
+//! 既定の `MARKER` が 0 回であることを見る。virtio の SPI は FDT の既定の edge-rising と `IrqTrigger::LevelHigh` の 2 構成で起動する
+//! （FDT の trigger と HVF の線の注入方式は同じ layout から決まり、食い違えば `bind` が拒否する）。HVF の `QueueNotify` の処理
+//! （#4028）と、level の線の ACK 後の deassert / 上げ直し（#3863）が実カーネルで働くことの照合である。`InterruptACK` の後処理の結果は
+//! `RunningHvfMicroVm::interrupt_ack_counts` で読み、結果行に `acks=`・`deasserted=`・`reasserted=`・`not_applicable=` として出すだけで
+//! assert しない（判断材料。評価は #3988）。カーネルは `CONFIG_VIRTIO_MMIO`・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS`
+//! （`kernel_boot` の aarch64 の項と同じ）。負の対照は block デバイス無しで、不一致 marker が出る（一致 marker が block に由来する裏づけ）。
+//!
+//! 未実装（REPAIR-3）: virtio-net の `QueueNotify`（#4029）は未結線のため net は載せない。
+//! 実機での実行と記録は #3988（人間担当）。Agent は実カーネルでの起動を確かめていない（`serial-echo` と `block-read` の `/init` も未実行）。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 #[path = "support/guest_boot.rs"]
@@ -60,20 +70,22 @@ mod guest_boot;
 use fandhe_container_microvm::arm64_layout::{ARM64_SERIAL_BASE, ARM64_SERIAL_SPI, Arm64Layout};
 use fandhe_container_microvm::boot_arm64::Arm64ImageHeader;
 use fandhe_container_microvm::error::MicrovmErrorCode;
-use fandhe_container_microvm::hvf::{HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic};
+use fandhe_container_microvm::hvf::{
+    HvfDeviceKind, HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic,
+};
 use fandhe_container_microvm::hvf_abi::HvRunStats;
 use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
-use fandhe_container_microvm::interrupt::IrqTrigger;
+use fandhe_container_microvm::interrupt::{InterruptAckCounts, IrqTrigger};
 use fandhe_container_microvm::stop::StopReason;
 use fandhe_container_microvm::uart::{SerialConsole, UartStats};
-use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
 use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 use guest_boot::{
-    AP_BOOTED_PREFIX, ARM64_SMP_TOTAL_LINE, MARKER, SERIAL_FAILED, SERIAL_OK, SERIAL_READY,
-    SERIAL_RX_PREFIX, SERIAL_RX_ROUNDS, SERIAL_RX_TIMEOUT, SERIAL_TX_LINE, SMP_ONLINE_LINE,
-    TtyAddress, TtyReport, count_lines_containing, count_lines_ending_with, count_marker_lines,
-    escape_tail, force_panic_zero, parse_irq_rows, parse_tty_report, read_bounded,
-    smp_disabling_param,
+    AP_BOOTED_PREFIX, ARM64_SMP_TOTAL_LINE, BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL,
+    MARKER, SERIAL_FAILED, SERIAL_OK, SERIAL_READY, SERIAL_RX_PREFIX, SERIAL_RX_ROUNDS,
+    SERIAL_RX_TIMEOUT, SERIAL_TX_LINE, SMP_ONLINE_LINE, TtyAddress, TtyReport,
+    count_lines_containing, count_lines_ending_with, count_marker_lines, escape_tail,
+    force_panic_zero, parse_irq_rows, parse_tty_report, read_bounded, smp_disabling_param,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +169,8 @@ enum InitrdKind {
     Default,
     /// UART の送受信を照合する版（`FANDHE_CONTAINER_MICROVM_SERIAL_INITRD`。#3987）。
     SerialEcho,
+    /// `/dev/vda` の先頭を読んで sentinel と比べる版（`FANDHE_CONTAINER_MICROVM_BLOCK_INITRD`。#4014）。
+    BlockRead,
 }
 
 /// initrd の種類ごとの（環境変数名・既定の相対パス・生成コマンドのヒント）。`None` には initrd が無い。
@@ -172,6 +186,11 @@ fn initrd_spec(kind: InitrdKind) -> Option<(&'static str, &'static str, &'static
             "FANDHE_CONTAINER_MICROVM_SERIAL_INITRD",
             "../../target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio",
             "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=serial-echo make microvm-test-initrd-build",
+        )),
+        InitrdKind::BlockRead => Some((
+            "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD",
+            "../../target/microvm-test-initrd/aarch64-block-read/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build",
         )),
     }
 }
@@ -224,11 +243,46 @@ fn boot_timeout_secs() -> u64 {
     .unwrap_or_else(|e| precondition(&e))
 }
 
-/// 配置（virtio 窓 0・既定のシリアル）。block・net は載せない（HVF 側の `QueueNotify` の処理が未実装。#3908）。
+/// 配置（virtio 窓 0・既定のシリアル）。block-read 以外の試験が使う（block・net は載せない）。
 fn layout(vcpus: u32) -> Arm64Layout {
     Arm64Layout::new(RAM_SIZE, vcpus, 0)
         .and_then(Arm64Layout::with_default_serial)
         .unwrap_or_else(|e| panic!("hvf_kernel_boot: layout: {e}"))
+}
+
+/// block-read の配置（vCPU 1 台・virtio 窓 1 つ・既定のシリアル）。virtio の SPI の trigger は `trigger` にする。
+/// FDT の trigger と HVF の線の注入方式は同じ layout から決まる（`bind` が `check_virtio_injection` で照合。#4014）。
+fn block_layout(trigger: IrqTrigger) -> Arm64Layout {
+    let mut l = Arm64Layout::new(RAM_SIZE, 1, 1)
+        .and_then(Arm64Layout::with_default_serial)
+        .unwrap_or_else(|e| panic!("hvf_kernel_boot: block layout: {e}"));
+    l.virtio_spi_trigger = trigger;
+    l
+}
+
+/// backend の offset 0 に `sentinel` を置いた 1 MiB の block backend（`kernel_boot` の aarch64 版と同じ）。
+fn block_backend(sentinel: Option<&[u8]>) -> MemoryBlockBackend {
+    let mut b = MemoryBlockBackend::new(1 << 20, false).expect("valid block capacity");
+    if let Some(s) = sentinel {
+        b.write_at(0, s).expect("sentinel fits in capacity");
+    }
+    b
+}
+
+/// 起動する構成（配置と block backend）。vCPU 数は `layout.vcpus`。
+struct BootPlan {
+    layout: Arm64Layout,
+    block: Vec<MemoryBlockBackend>,
+}
+
+impl BootPlan {
+    /// virtio 無しで vCPU `vcpus` 台（既存の試験）。
+    fn plain(vcpus: u32) -> Self {
+        Self {
+            layout: layout(vcpus),
+            block: Vec::new(),
+        }
+    }
 }
 
 /// 環境の前提（権限）を、組み立てとは別に先に確かめる。権限不足だけを環境の問題とし、それ以外の失敗はそのまま出す（#3989）。
@@ -263,6 +317,10 @@ struct Outcome {
     vtimer: u64,
     data_abort: u64,
     hvc: u64,
+    /// block 0 台目の `InterruptACK` 後処理の計数（停止前に読む。block 無しは `None`。値は assert しない。#4014）。
+    ack: Option<InterruptAckCounts>,
+    /// block 0 台目の SPI の INTID（block 無しは `None`）。
+    block_spi_intid: Option<u32>,
 }
 
 /// vCPU ごとの統計を空白なしの 1 トークンにする（行の照合・grep をしやすくする。診断と成功行が共有）。
@@ -288,7 +346,7 @@ impl Outcome {
     fn diag(&self) -> String {
         format!(
             "reason={:?} vcpus={} errors={} exits={} per_vcpu={} wfx={} vtimer={} data_abort={} hvc={} \
-             timed_out={} elapsed={:?} uart_dropped={} uart={:?} rx_latencies={:?} interaction_error={:?} \
+             ack={:?} block_spi_intid={:?} timed_out={} elapsed={:?} uart_dropped={} uart={:?} rx_latencies={:?} interaction_error={:?} \
              output_len={} output_tail=\"{}\"",
             self.reason,
             self.vcpu_count,
@@ -299,6 +357,8 @@ impl Outcome {
             self.vtimer,
             self.data_abort,
             self.hvc,
+            self.ack,
+            self.block_spi_intid,
             self.timed_out,
             self.elapsed,
             self.uart_dropped,
@@ -433,17 +493,18 @@ impl SerialEcho {
 /// 起動して停止まで見る。`RunningHvfMicroVm` は `!Send` なので、組み立てから停止までこのスレッドの中で完結させる。
 /// `kernel_boot` の `boot` と同じ順序: `serial_console` を start の前に取り、10 ms ごと（対話中は 1 ms）に取り出し、
 /// 期限切れ・対話の失敗でも必ず `stop` する。
-fn boot(inp: Inputs, vcpus: u32, mut interaction: Interaction) -> Result<Outcome, String> {
+fn boot(inp: Inputs, plan: BootPlan, mut interaction: Interaction) -> Result<Outcome, String> {
     let started = Instant::now();
     let boot_timeout = Duration::from_secs(inp.secs);
     let counts = Arc::new(ExitCounts::new());
+    let vcpus = plan.layout.vcpus;
     let config: HvfMicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = HvfMicroVmConfig {
-        layout: layout(vcpus),
+        layout: plan.layout,
         vcpus,
         kernel: inp.kernel,
         initrd: inp.initrd,
         cmdline: inp.cmdline,
-        block: Vec::new(),
+        block: plan.block,
         net: Vec::new(),
         vcpu: VcpuThreadConfig {
             observer: Some(counts.clone()),
@@ -455,6 +516,10 @@ fn boot(inp: Inputs, vcpus: u32, mut interaction: Interaction) -> Result<Outcome
     let serial = vm
         .serial_console()
         .ok_or_else(|| "serial console is not enabled".to_string())?;
+    let block_info = vm
+        .devices()
+        .into_iter()
+        .find(|d| d.kind == HvfDeviceKind::Block);
     let running = vm.start().map_err(|e| format!("start failed: {e}"))?;
     let mut output: Vec<u8> = Vec::new();
     let mut timed_out = false;
@@ -490,6 +555,14 @@ fn boot(inp: Inputs, vcpus: u32, mut interaction: Interaction) -> Result<Outcome
     // 起動予算の判定に使う経過時間は、停止条件を判定した直後（stop の前）に採る。
     // stop の join・出力の取り切りの時間を予算に含めない（timed_out の判定時点と揃える）。
     let elapsed = started.elapsed();
+    // ACK の後処理の計数は `stop` が self を消費する前に読む（#4014）。期限切れのときは vCPU が走行中で値が揺れうる。
+    let ack = block_info.and_then(|b| {
+        running
+            .interrupt_ack_counts()
+            .into_iter()
+            .find(|c| c.id == b.id)
+            .map(|c| c.counts)
+    });
     // 期限切れでも必ず stop で vCPU を回収する（REPAIR-5）。
     let report = running
         .stop(STOP_DEADLINE)
@@ -523,16 +596,18 @@ fn boot(inp: Inputs, vcpus: u32, mut interaction: Interaction) -> Result<Outcome
         vtimer: counts.count(ExitKind::Vtimer),
         data_abort: counts.count(ExitKind::DataAbort),
         hvc: counts.count(ExitKind::Hvc),
+        ack,
+        block_spi_intid: block_info.map(|b| b.spi_intid),
     })
 }
 
 /// 別スレッドで `boot` を回し、外側の `recv_timeout` で必ず戻る。
-fn run_boot(inp: Inputs, vcpus: u32, interaction: Interaction) -> (Outcome, Duration) {
+fn run_boot(inp: Inputs, plan: BootPlan, interaction: Interaction) -> (Outcome, Duration) {
     let secs = inp.secs;
     let boot_timeout = Duration::from_secs(secs);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(boot(inp, vcpus, interaction));
+        let _ = tx.send(boot(inp, plan, interaction));
     });
     match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
         Ok(Ok(o)) => (o, boot_timeout),
@@ -580,7 +655,7 @@ fn hvf_kernel_boot_real_kernel_reaches_init_and_shuts_down() {
     let _wd = Watchdog::start(overall_deadline(secs));
     let inp = inputs(InitrdKind::Default, secs);
     require_vm_with_gic(&layout(1));
-    let (o, boot_timeout) = run_boot(inp, 1, Interaction::None);
+    let (o, boot_timeout) = run_boot(inp, BootPlan::plain(1), Interaction::None);
     let diag = o.diag();
     let irq = assert_boot_ok(&o, 1, boot_timeout, &diag);
     eprintln!(
@@ -608,7 +683,7 @@ fn hvf_kernel_boot_two_vcpus_reaches_init_and_shuts_down() {
         ));
     }
     require_vm_with_gic(&layout(2));
-    let (o, boot_timeout) = run_boot(inp, 2, Interaction::None);
+    let (o, boot_timeout) = run_boot(inp, BootPlan::plain(2), Interaction::None);
     let diag = o.diag();
     let irq = assert_boot_ok(&o, 2, boot_timeout, &diag);
     for line in [ARM64_SMP_TOTAL_LINE, SMP_ONLINE_LINE] {
@@ -649,7 +724,7 @@ fn hvf_kernel_boot_without_initrd_does_not_shut_down() {
     let _wd = Watchdog::start(overall_deadline(secs));
     let inp = inputs(InitrdKind::None, secs);
     require_vm_with_gic(&layout(1));
-    let (o, _) = run_boot(inp, 1, Interaction::None);
+    let (o, _) = run_boot(inp, BootPlan::plain(1), Interaction::None);
     let diag = o.diag();
     assert_ne!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
     assert_eq!(o.reason, StopReason::Requested, "stop reason: {diag}");
@@ -662,6 +737,112 @@ fn hvf_kernel_boot_without_initrd_does_not_shut_down() {
         "init marker must not appear without an initrd: {diag}"
     );
     assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+}
+
+/// block-read の 3 件に共通の本体（#4014・MVM-5・MVM-1・REPAIR-12）。`expect`（期待する marker）がちょうど 1 回、`other`（もう一方）と
+/// 既定の `MARKER` が 0 回、`GuestShutdown`・エラー 0・UART の取りこぼし 0・期限内であることを具体値で照合する。
+/// ACK の後処理の計数は結果行に出すだけで assert しない（判断は #3988）。届いた証跡は marker で取る。
+fn run_block_read(plan: BootPlan, expect: &str, other: &str, case: &str) {
+    let secs = boot_timeout_secs();
+    let _wd = Watchdog::start(overall_deadline(secs));
+    let inp = inputs(InitrdKind::BlockRead, secs);
+    require_vm_with_gic(&plan.layout);
+    let trigger = plan.layout.virtio_spi_trigger;
+    let (o, boot_timeout) = run_boot(inp, plan, Interaction::None);
+    let diag = o.diag();
+    assert_eq!(o.reason, StopReason::GuestShutdown, "stop reason: {diag}");
+    assert_eq!(o.vcpu_count, 1, "vcpu count: {diag}");
+    assert_eq!(o.errors, 0, "run errors: {diag}");
+    assert!(!o.timed_out, "boot timed out: {diag}");
+    assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
+    assert_eq!(
+        count_marker_lines(&o.output, expect),
+        1,
+        "marker {expect:?} must appear exactly once: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, other),
+        0,
+        "opposite marker {other:?} must not appear: {diag}"
+    );
+    assert_eq!(
+        count_marker_lines(&o.output, MARKER),
+        0,
+        "default init marker must not appear with the block-read initrd: {diag}"
+    );
+    assert_eq!(o.uart_dropped, 0, "uart dropped bytes: {diag}");
+    eprintln!("{}", block_result_line(&o, case, trigger));
+}
+
+/// block-read の結果行（数値と固定の語だけ。ゲストの文字列は入れない）。block 無しの ack 系は `none`。
+fn block_result_line(o: &Outcome, case: &str, trigger: IrqTrigger) -> String {
+    let trigger = match trigger {
+        IrqTrigger::EdgeRising => "edge_rising",
+        IrqTrigger::LevelHigh => "level_high",
+        _ => "other",
+    };
+    let spi = o
+        .block_spi_intid
+        .map_or_else(|| "none".to_owned(), |v| v.to_string());
+    let ack = match o.ack {
+        Some(c) => format!(
+            "acks={} deasserted={} reasserted={} not_applicable={}",
+            c.acks, c.deasserted, c.reasserted, c.not_applicable
+        ),
+        None => "acks=none deasserted=none reasserted=none not_applicable=none".to_owned(),
+    };
+    format!(
+        "hvf_kernel_boot: block ok arch=aarch64 case={case} trigger={trigger} spi_intid={spi} elapsed_ms={} exits={} data_abort={} wfx={} {ack}",
+        o.elapsed.as_millis(),
+        o.exits,
+        o.data_abort,
+        o.wfx
+    )
+}
+
+/// 陽性（edge-rising。#4014）。virtio-block 1 台（offset 0 に sentinel）を block-read の initrd で読ませ、`/dev/vda` の先頭が
+/// ゲストに届いたときだけ出る一致 marker をちょうど 1 回数える。FDT の virtio の割り込みは既定の edge-rising。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_block_read_edge_reads_sentinel() {
+    run_block_read(
+        BootPlan {
+            layout: block_layout(IrqTrigger::EdgeRising),
+            block: vec![block_backend(Some(BLOCK_SENTINEL))],
+        },
+        BLOCK_OK_MARKER,
+        BLOCK_MISMATCH_MARKER,
+        "block_read_edge",
+    );
+}
+
+/// 陽性（LevelHigh。#4014・#3863）。FDT の trigger を level-high にし、HVF の線を level 注入にして同じ照合を行う。
+/// ACK 後の deassert / 上げ直しが働かず線が張り付くと、起動が止まるか割り込みが届かず一致 marker が出ない。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_block_read_level_high_reads_sentinel() {
+    run_block_read(
+        BootPlan {
+            layout: block_layout(IrqTrigger::LevelHigh),
+            block: vec![block_backend(Some(BLOCK_SENTINEL))],
+        },
+        BLOCK_OK_MARKER,
+        BLOCK_MISMATCH_MARKER,
+        "block_read_level_high",
+    );
+}
+
+/// 負の対照（#4014）。同じ initrd で block デバイスが無いと `/dev/vda` を開けず不一致 marker が出る。期限を使い切らず
+/// `GuestShutdown` で速く決定的に終わる。陽性と同じ実行・同じカーネルで回すこと。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn hvf_kernel_boot_block_read_without_block_device_reports_mismatch() {
+    run_block_read(
+        BootPlan::plain(1),
+        BLOCK_MISMATCH_MARKER,
+        BLOCK_OK_MARKER,
+        "block_read_absent",
+    );
 }
 
 /// 行頭が `prefix` の行の件数（`SERIAL_RX_TIMEOUT` の行は接頭辞を共有するので除く）。
@@ -714,7 +895,11 @@ fn hvf_kernel_boot_serial_echo_tx_rx_and_irq_count() {
     let _wd = Watchdog::start(overall_deadline(secs));
     let inp = inputs(InitrdKind::SerialEcho, secs);
     require_vm_with_gic(&layout(1));
-    let (o, boot_timeout) = run_boot(inp, 1, Interaction::SerialEcho(SerialEcho::new()));
+    let (o, boot_timeout) = run_boot(
+        inp,
+        BootPlan::plain(1),
+        Interaction::SerialEcho(SerialEcho::new()),
+    );
     let diag = o.diag();
     assert_serial_common(&o, &diag);
     assert!(o.elapsed < boot_timeout, "elapsed over budget: {diag}");
@@ -794,7 +979,7 @@ fn hvf_kernel_boot_serial_echo_without_input_times_out() {
     let _wd = Watchdog::start(overall_deadline(secs));
     let inp = inputs(InitrdKind::SerialEcho, secs);
     require_vm_with_gic(&layout(1));
-    let (o, _) = run_boot(inp, 1, Interaction::None);
+    let (o, _) = run_boot(inp, BootPlan::plain(1), Interaction::None);
     let diag = o.diag();
     assert_serial_common(&o, &diag);
     assert_eq!(
@@ -837,7 +1022,7 @@ fn mvm5_3986_overall_deadline_exceeds_inner_budget() {
 }
 
 /// 試験の配置は virtio 窓 0・シリアルあり・vCPU 数の指定どおりで、FDT の virtio の割り込みの既定は edge-rising のまま
-/// （block-read の 2 構成の試験は #3908 の後で足す）。
+/// （block-read の 2 構成の試験は #4014 で足した。配置は `block_layout`）。
 #[test]
 fn mvm5_3986_layout_without_virtio_is_valid() {
     let l = layout(1);
@@ -849,6 +1034,74 @@ fn mvm5_3986_layout_without_virtio_is_valid() {
     );
     assert_eq!(l.virtio_spi_trigger, IrqTrigger::EdgeRising);
     assert_eq!(layout(2).vcpus, 2);
+}
+
+/// block-read の配置は virtio 窓 1 つ・シリアルあり・trigger の指定どおりで、LevelHigh は HVF の注入方式と整合する（#4014）。
+#[test]
+fn mvm5_4014_block_layout_follows_trigger() {
+    let e = block_layout(IrqTrigger::EdgeRising);
+    assert_eq!(e.vcpus, 1);
+    assert_eq!(e.virtio_mmio_count, 1);
+    assert_eq!(e.virtio_spi_trigger, IrqTrigger::EdgeRising);
+    let l = block_layout(IrqTrigger::LevelHigh);
+    assert_eq!(l.virtio_mmio_count, 1);
+    assert_eq!(l.virtio_spi_trigger, IrqTrigger::LevelHigh);
+    assert_eq!(
+        l.serial.expect("default serial window").base.raw(),
+        ARM64_SERIAL_BASE
+    );
+    assert_eq!(
+        l.virtio_mmio_window(0).expect("window 0").base.raw(),
+        0x0a00_0000
+    );
+    assert!(l.check_virtio_injection(IrqTrigger::LevelHigh).is_ok());
+    assert!(l.check_virtio_injection(IrqTrigger::EdgeRising).is_err());
+    assert!(e.check_virtio_injection(IrqTrigger::EdgeRising).is_ok());
+}
+
+/// 結果行は数値と固定の語だけで、ack の計数が無いときは `none` になる（#4014）。
+#[test]
+fn mvm5_4014_block_result_line_shape() {
+    // `InterruptAckCounts` は `non_exhaustive` なので既定値のフィールドを書き換えて作る。
+    let mut counts = InterruptAckCounts::default();
+    counts.acks = 5;
+    counts.deasserted = 4;
+    counts.reasserted = 1;
+    let o = Outcome {
+        reason: StopReason::GuestShutdown,
+        vcpu_count: 1,
+        errors: 0,
+        exits: 10,
+        per_vcpu: Vec::new(),
+        output: Vec::new(),
+        uart_dropped: 0,
+        uart: UartStats::default(),
+        rx_latencies: Vec::new(),
+        interaction_error: None,
+        timed_out: false,
+        elapsed: Duration::from_millis(1234),
+        wfx: 3,
+        vtimer: 0,
+        data_abort: 7,
+        hvc: 1,
+        ack: Some(counts),
+        block_spi_intid: Some(48),
+    };
+    assert_eq!(
+        block_result_line(&o, "block_read_level_high", IrqTrigger::LevelHigh),
+        "hvf_kernel_boot: block ok arch=aarch64 case=block_read_level_high trigger=level_high spi_intid=48 \
+         elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=5 deasserted=4 reasserted=1 not_applicable=0"
+    );
+    let none = Outcome {
+        ack: None,
+        block_spi_intid: None,
+        ..o
+    };
+    assert!(
+        block_result_line(&none, "block_read_absent", IrqTrigger::EdgeRising).ends_with(
+            "spi_intid=none elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=none deasserted=none reasserted=none not_applicable=none"
+        )
+    );
 }
 
 /// initrd の種類ごとの環境変数名・既定パス・ヒント（#3987）。`None` には initrd が無い。
@@ -869,6 +1122,14 @@ fn mvm5_3987_initrd_spec_names() {
             "FANDHE_CONTAINER_MICROVM_SERIAL_INITRD",
             "../../target/microvm-test-initrd/aarch64-serial-echo/initrd.cpio",
             "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=serial-echo make microvm-test-initrd-build"
+        ))
+    );
+    assert_eq!(
+        initrd_spec(InitrdKind::BlockRead),
+        Some((
+            "FANDHE_CONTAINER_MICROVM_BLOCK_INITRD",
+            "../../target/microvm-test-initrd/aarch64-block-read/initrd.cpio",
+            "MICROVM_TEST_INITRD_ARCH=aarch64 MICROVM_TEST_INITRD_VARIANT=block-read make microvm-test-initrd-build"
         ))
     );
 }

@@ -77,8 +77,9 @@
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、
-//!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は #4014。全体の追跡は #3908。
+//!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、全体の追跡は #3908。
+//!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
+//!   [`HvfMicroVm::interrupt_ack_counts`] で読む。
 //! - PSCI は #3794 で実装済み（WFI / vtimer は #4039 で処理を消し fail-closed）。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否（合成 Image は無しで起動した。#3803。実カーネルは #3988）。
@@ -110,7 +111,8 @@ use crate::hvf_loop::log_line;
 use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
 use crate::interrupt::{
-    BlockQueueNotifyRoute, BoundAckRoute, InterruptAckRoute, InterruptLine, QueueNotifyRoute,
+    BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
+    InterruptLine, QueueNotifyRoute,
 };
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
@@ -193,6 +195,8 @@ struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
     id: DeviceId,
     window: MmioRegion,
     line: GicSpiLine,
+    /// ACK の後処理の結果の累計（観測専用。全 vCPU のハンドラと共有する。#4014）。
+    ack_tally: Arc<InterruptAckTally>,
 }
 
 /// 登録済みのシリアル（ホストが出力を取り出すハンドル・識別子・窓・SPI の INTID）。
@@ -341,6 +345,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             id,
             window,
             line,
+            ack_tally: Arc::new(InterruptAckTally::default()),
         })
     }
 }
@@ -361,6 +366,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
         }
         let b = self.block.iter().map(route);
         let n = self.net.iter().map(route);
+        b.chain(n).collect()
+    }
+
+    /// 全デバイスの `InterruptACK` の後処理の結果の計数（観測専用。#4014）。`Arc` の clone を全 vCPU が共有する。
+    fn ack_tallies(&self) -> Vec<(DeviceId, Arc<InterruptAckTally>)> {
+        let b = self.block.iter().map(|d| (d.id, Arc::clone(&d.ack_tally)));
+        let n = self.net.iter().map(|d| (d.id, Arc::clone(&d.ack_tally)));
         b.chain(n).collect()
     }
 
@@ -418,6 +430,16 @@ impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
     }
 }
 
+/// デバイス 1 台の `InterruptACK` の後処理の結果の累計（観測専用。[`HvfMicroVm::interrupt_ack_counts`]。#4014・MVM-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HvfInterruptAckCounts {
+    /// 対象デバイス（[`HvfDeviceInfo::id`] と同じ）。
+    pub id: DeviceId,
+    /// 累計の写し。
+    pub counts: InterruptAckCounts,
+}
+
 /// 組み立て済みの microVM が持つ資源と観測用の値。`Drop` が [`stop_and_release`] を drop 用の期限で呼ぶ（`HvfMicroVm` と
 /// `RunningHvfMicroVm` が共有する。モジュール doc の「解放順序」）。資源は `Option`（ゲスト RAM だけは `GuestMemorySlot`）で、`release` が 1 回だけ取り出す。
 struct HvfVmParts<B: BlockBackend, N: NetBackend> {
@@ -431,6 +453,8 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
     vm: Option<Arc<VmWithGic>>,
     dispatcher: Arc<Mutex<ExitDispatcher>>,
     infos: Vec<HvfDeviceInfo>,
+    /// 各デバイスの ACK の後処理の結果の計数（`infos` と同じ順。`devices` を `release` が取り出した後も読める。#4014）。
+    ack_tallies: Vec<(DeviceId, Arc<InterruptAckTally>)>,
     /// シリアルの出力ハンドル（`SerialConsole` の clone。fd を持たず、解放順序に影響しない）。
     serial: Option<SerialConsole>,
     layout: Arm64Layout,
@@ -439,6 +463,17 @@ struct HvfVmParts<B: BlockBackend, N: NetBackend> {
 }
 
 impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
+    /// 各デバイスの ACK の後処理の結果の写し（`infos` と同じ順）。
+    fn interrupt_ack_counts(&self) -> Vec<HvfInterruptAckCounts> {
+        self.ack_tallies
+            .iter()
+            .map(|(id, t)| HvfInterruptAckCounts {
+                id: *id,
+                counts: t.snapshot(),
+            })
+            .collect()
+    }
+
     /// 資源を取り出し、停止と解放を行う。2 回目以降は `FailedPrecondition`。
     fn release(
         &mut self,
@@ -598,6 +633,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             ExitHandlers {
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes())
+                    .with_ack_tallies(devices.ack_tallies())
                     .with_queue_notify_routes(queue_routes.clone())
                     .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
@@ -622,6 +658,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     let handlers = ExitHandlers {
                         mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                             .with_ack_routes(devices.ack_routes())
+                            .with_ack_tallies(devices.ack_tallies())
                             .with_queue_notify_routes(queue_routes.clone())
                             .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
                         hvc,
@@ -653,6 +690,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         }
         let dispatcher = Arc::clone(&devices.dispatcher);
         let infos = devices.infos();
+        let ack_tallies = devices.ack_tallies();
         let serial = devices.serial.as_ref().map(|s| s.console.clone());
         Ok(HvfMicroVm {
             parts: HvfVmParts {
@@ -663,6 +701,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 vm: Some(vm),
                 dispatcher,
                 infos,
+                ack_tallies,
                 serial,
                 layout,
                 loaded,
@@ -728,6 +767,13 @@ impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {
     /// 登録済みの virtio デバイスの配置（block → net の順）。シリアルは含まない（`serial_console` を参照）。
     pub fn devices(&self) -> Vec<HvfDeviceInfo> {
         self.parts.infos.clone()
+    }
+
+    /// 各デバイスの `InterruptACK` の後処理の結果の累計（block → net の順。#4014・MVM-5。値は観測専用で、判断は #3988）。
+    ///
+    /// `stop` は self を消費するため、試験は `is_finished()` の後、`stop` の前に読む。走行中や期限切れ後は値が揺れうる。
+    pub fn interrupt_ack_counts(&self) -> Vec<HvfInterruptAckCounts> {
+        self.parts.interrupt_ack_counts()
     }
 
     /// シリアルの出力を取り出すハンドル（clone）。`config.serial` が `false` なら `None`（#3882・MVM-5・MVM-1）。
@@ -811,6 +857,13 @@ impl<B: BlockBackend, N: NetBackend> RunningHvfMicroVm<B, N> {
     /// 登録済みデバイスの配置（block → net の順）。
     pub fn devices(&self) -> Vec<HvfDeviceInfo> {
         self.parts.infos.clone()
+    }
+
+    /// 各デバイスの `InterruptACK` の後処理の結果の累計（block → net の順。#4014・MVM-5。値は観測専用で、判断は #3988）。
+    ///
+    /// `stop` は self を消費するため、試験は `is_finished()` の後、`stop` の前に読む。走行中や期限切れ後は値が揺れうる。
+    pub fn interrupt_ack_counts(&self) -> Vec<HvfInterruptAckCounts> {
+        self.parts.interrupt_ack_counts()
     }
 
     /// シリアルの出力を取り出すハンドル（clone）。`config.serial` が `false` なら `None`（#3882）。

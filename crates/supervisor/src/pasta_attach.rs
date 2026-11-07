@@ -1338,6 +1338,12 @@ impl ProcessLauncher for PastaAttachingLauncher {
         self.inner.network_mode()
     }
 
+    /// 端末つき起動の opt-in を内側へ転送する（転送しないと `false` へ縮退し、端末つきの起動が拒否される。
+    /// CRI-6・SEC-1・#4070）。supervisor 自身の opt-in と master の保持は #4074。
+    fn supports_terminal(&self) -> bool {
+        self.inner.supports_terminal()
+    }
+
     fn last_launch_may_have_left_process(&self) -> bool {
         self.left_process.load(Ordering::SeqCst) || self.inner.last_launch_may_have_left_process()
     }
@@ -1678,6 +1684,11 @@ impl LaunchedProcess for PastaGuardedProcess {
 
     fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
         self.inner.take_seccomp_listener()
+    }
+
+    /// init の pty の master を内側へ転送する（転送しないと包み直した後に取り出せない。CRI-6・#4070）。
+    fn take_pty_master(&self) -> Option<fandhe_container_core::exec::PtyMaster> {
+        self.inner.take_pty_master()
     }
 
     fn launch_isolation(

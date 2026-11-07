@@ -504,6 +504,10 @@ pub struct LaunchSpec {
     /// `start` が使った状態ルート（`StateStore::host_state_root()`。管理ルートの `/etc/hosts` 等の元の場所を導く入力。
     /// 無ければ `None`。NET-12・#1872）。
     state_root: Option<PathBuf>,
+    /// config の `process.terminal`（`start` が 1 回だけ読んだ値。launcher が config を読み直さない）。真なら
+    /// 本番 launcher は PID 1 に pty を割り当てさせ、master を [`LaunchedProcess::take_pty_master`] で返す
+    /// （launcher が [`ProcessLauncher::supports_terminal`] で opt-in 済みの場合だけ届く。CRI-6・SEC-1・#4070）。
+    terminal: bool,
 }
 
 impl LaunchSpec {
@@ -543,7 +547,19 @@ impl LaunchSpec {
             network: EffectiveNetwork::HostShared,
             network_mode: LaunchNetworkMode::FromConfig,
             state_root: None,
+            terminal: false,
         }
+    }
+
+    /// `process.terminal` を載せる(`start` だけが呼ぶ。launcher が opt-in 済みのときにだけ真が届く。CRI-6・#4070)。
+    pub(super) fn with_terminal(mut self, terminal: bool) -> Self {
+        self.terminal = terminal;
+        self
+    }
+
+    /// `process.terminal`(CRI-6)。真なら launcher は init の pty を割り当てて master を返す責務を負う。
+    pub fn terminal(&self) -> bool {
+        self.terminal
     }
 
     /// 突き合わせた network の扱いとそのモードを載せる(`start` だけが呼ぶ。NET-6・#3058)。
@@ -884,6 +900,18 @@ pub trait LaunchedProcess: Send {
         None
     }
 
+    /// 端末つき起動(`LaunchSpec::terminal()`)で init が割り当てた pty の master を 1 回だけ取り出す(Linux。
+    /// CRI-6・SEC-1・CORE-5・#4070)。
+    ///
+    /// 本番 launcher は PID 1 が自分のコンテナの devpts から割り当てて送った master を、検証(種別 5:2・master であること・
+    /// 送信元の pid)のうえ持たせる。supervisor が起動のたびに呼び、tty の捕捉(完全版 Attach。#4074)に使う。
+    /// 2 回目以降と、端末を扱わない実装は `None`(既定)。`LaunchedProcess` を包み直す実装は内側へ転送すること
+    /// (`take_output` と同じ注意。転送しないと master が黙って落ちる)。
+    #[cfg(target_os = "linux")]
+    fn take_pty_master(&self) -> Option<crate::exec::PtyMaster> {
+        None
+    }
+
     /// launch が確定した分離の記録（`/` の識別子と適用した Landlock ルール）。start が Running の更新と同じ
     /// `update` で、restart が Running(新 pid) の更新で `state.json` へ書く（SUP-6・CORE-5・SEC-1・#2007）。
     ///
@@ -924,6 +952,8 @@ pub struct ContainerChildProcess {
     stdin: std::sync::Mutex<Option<ContainerStdin>>,
     /// `take_seccomp_listener` で 1 回だけ取り出す listener(SEC-4・#2024)。`&self` のため `Mutex` で保持する。
     seccomp_listener: std::sync::Mutex<Option<crate::exec::SeccompListener>>,
+    /// `take_pty_master` で 1 回だけ取り出す init の pty の master(端末つき起動だけ。CRI-6・#4070)。
+    pty_master: std::sync::Mutex<Option<crate::exec::PtyMaster>>,
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
@@ -1017,6 +1047,7 @@ impl ContainerChildProcess {
             output: std::sync::Mutex::new(None),
             stdin: std::sync::Mutex::new(None),
             seccomp_listener: std::sync::Mutex::new(None),
+            pty_master: std::sync::Mutex::new(None),
             reap_notice: None,
             drop_notice: None,
             launch_isolation: None,
@@ -1151,6 +1182,16 @@ impl ContainerChildProcess {
         self
     }
 
+    /// PID 1 から受け取った pty の master を持たせる(`LaunchedProcess::take_pty_master` で 1 回だけ返る。CRI-6・#4070)。
+    #[must_use]
+    pub(crate) fn with_pty_master(self, master: Option<crate::exec::PtyMaster>) -> Self {
+        *self
+            .pty_master
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = master;
+        self
+    }
+
     /// 包んでいる子のハンドル（終了待ち `wait_timeout` 等に使う）。
     pub fn child(&self) -> &crate::exec::ContainerChild {
         &self.child
@@ -1191,6 +1232,13 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn take_seccomp_listener(&self) -> Option<crate::exec::SeccompListener> {
         self.seccomp_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn take_pty_master(&self) -> Option<crate::exec::PtyMaster> {
+        self.pty_master
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -1295,6 +1343,16 @@ pub trait ProcessLauncher: Send + Sync {
     /// 本番 launcher は spec のモードと自身のモードの不一致を `FailedPrecondition` で拒否する)。
     fn network_mode(&self) -> LaunchNetworkMode {
         LaunchNetworkMode::FromConfig
+    }
+
+    /// 端末つき起動(`process.terminal: true`)を受けるか(opt-in。CRI-6・SEC-1・CORE-5・#4070)。
+    ///
+    /// 既定は `false`(fail-closed)。`false` の launcher に対して `start` は `process.terminal: true` を従来どおり
+    /// `Unimplemented` で断る。`true` の launcher は `LaunchedProcess::take_pty_master` で master を返す責務を負う。
+    /// ラッパー実装は必ず内側へ転送すること(転送しないと `false` へ黙って縮退し、端末つきの起動が拒否される。
+    /// 拒否側へ倒れるので安全だが、opt-in が効かない)。
+    fn supports_terminal(&self) -> bool {
+        false
     }
 
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。

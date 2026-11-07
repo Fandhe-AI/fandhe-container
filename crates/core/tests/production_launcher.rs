@@ -136,6 +136,11 @@
 //! `ns/net`）が残らないことを照合し、`production_launcher: network loopback isolated lo up and self delivery ok; no netns pin
 //! after terminate (scenario=N)` を出す。範囲写像の経路は `(scenario=N-subordinate)`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）。
 //!
+//! シナリオ pty-init（端末つき起動。CRI-6・SEC-1・CORE-5・#4070）は `with_terminal_support()` の launcher で `process.terminal: true` を
+//! start し、`take_pty_master` で受けた master がホストの `/dev/pts` と別の devpts の pty であること、コンテナ内プローブの fd 0〜2 が
+//! その master の slave（`136:N`。N は master の `fdinfo` の `tty-index`）で PID 1 がセッションリーダー・制御端末が fd 0 であることを
+//! 照合する。成功行は `production_launcher: init pty allocated from the container devpts and master handed over (scenario=pty-init)`。
+//!
 //! シナリオ Z（Host モードの netns 素性の同期点。NET-6・SEC-1・SEC-4・#3206）は `LaunchNetworkMode::Host` の起動で、exec 直前の
 //! 同期点が受理することと（コンテナ内の netns の識別子がホストと同じ）、試験用に基準を実在しない (dev, ino) へ差し替えた
 //! 起動が `FailedPrecondition`（メッセージは launcher の固定文言 `container launch failed in the NetnsVerify stage`。違反の理由は
@@ -569,6 +574,10 @@ mod linux {
                 control.map_or_else(|e| format!("error:{:?}", e.kind()), |_| "ok".to_string())
             ));
         }
+        // シナリオ pty-init(端末つき起動。CRI-6・SEC-1・CORE-5・#4070): fd 0〜2 の pty の slave・セッション・制御端末を出す。
+        if args.iter().any(|a| a == "--tty-report") {
+            tty_report_probe(&mut emit);
+        }
         // シナリオ N(Loopback モード。NET-6・CORE-6・#3064): 新しい netns の識別子・インターフェース・自己宛て UDP 配送を出す。
         if args.iter().any(|a| a == "--net-loopback") {
             net_loopback_probe(&mut emit);
@@ -846,6 +855,41 @@ mod linux {
     ];
     /// 自己宛て UDP の内容(固定)。
     const NET_PING: &[u8] = b"fandhe-loopback-ping";
+
+    /// シナリオ pty-init のコンテナ内プローブ(CRI-6・SEC-1・#4070)。std だけを使い、`unsafe`・libc は使わない。
+    ///
+    /// fd 0〜2 が同じ UNIX98 pty の slave(`rdev` が 136:N)であること、自分が PID 1 かつセッションリーダーであること、
+    /// `/proc/self/stat` の `tty_nr`(制御端末)が fd 0 の `rdev` と一致することを、1 行ずつ出す。
+    fn tty_report_probe(emit: &mut dyn FnMut(String)) {
+        let rdev_of = |fd: u32| {
+            std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|m| m.rdev())
+                .map_err(|e| format!("error:{:?}", e.kind()))
+        };
+        let fds: Vec<String> = (0..3)
+            .map(|fd| {
+                rdev_of(fd).map_or_else(|e| e, |r| format!("{}:{}", dev_major(r), dev_minor(r)))
+            })
+            .collect();
+        emit(format!("TTY_FDS {}", fds.join(",")));
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        // `comm` は括弧で囲まれ空白を含み得るため、最後の ')' の後ろを区切る。続く欄は state ppid pgrp session tty_nr。
+        let after = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        emit(format!(
+            "TTY_SESSION {} PID {}",
+            fields.get(3).copied().unwrap_or("missing"),
+            std::process::id()
+        ));
+        let tty_nr = fields
+            .get(4)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        emit(format!(
+            "TTY_CTTY_MATCHES_FD0 {}",
+            rdev_of(0).is_ok_and(|r| r == tty_nr && tty_nr != 0)
+        ));
+    }
 
     /// シナリオ N のコンテナ内プローブ(NET-6・#3064)。std だけを使い、`unsafe`・libc は使わない。
     fn net_loopback_probe(emit: &mut dyn FnMut(String)) {
@@ -1233,6 +1277,7 @@ mod linux {
         scenario_n_network_loopback(&env, tag, false);
         scenario_z_network_host_netns_sync(&env, tag);
         scenario_attachable_network(&env, tag, false);
+        scenario_pty_init(&env, tag);
         if subordinate_requested() {
             scenario_n_network_loopback(&env, tag, true);
             scenario_attachable_network(&env, tag, true);
@@ -2927,6 +2972,103 @@ mod linux {
         assert!(
             children_of_self().is_empty(),
             "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ pty-init(CRI-6・SEC-1・CORE-5・#4070): 端末対応を opt-in した launcher で `process.terminal: true` を start すると、
+    /// PID 1 がコンテナの devpts から pty を割り当て、slave を fd 0〜2 と制御端末にし、master が親へ返ることを照合する。
+    ///
+    /// 親側: master は pty の master(`take_pty_master`。受信時に種別と master であることを検証済み)で、`st_dev` がホストの
+    /// `/dev/pts` と異なる(ホストの devpts の instance ではない)。プローブ側(master から読む): fd 0〜2 が `136:N` の同じ
+    /// slave、PID 1 がセッションリーダー、制御端末が fd 0 の slave。N は master の `fdinfo` の `tty-index` と一致する。
+    fn scenario_pty_init(env: &Env, tag: u32) {
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .with_terminal_support()
+                .build()
+                .expect("build launcher with terminal support"),
+        );
+        let bundle = Bundle::new("tty");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--tty-report"], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["process"]["terminal"] = json!(true);
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        let id = ContainerId::new(format!("pltty{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let master = started
+                .process()
+                .take_pty_master()
+                .expect("pty master handed to the parent");
+            assert!(
+                started.process().take_pty_master().is_none(),
+                "the master is handed out once"
+            );
+            // ホストの devpts の instance ではない: master の `st_dev` はホストの `/dev/pts` と異なる。
+            let master_dev = std::fs::metadata(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&master.as_fd())
+            ))
+            .expect("stat master")
+            .dev();
+            let host_pts_dev = std::fs::metadata("/dev/pts")
+                .expect("stat host /dev/pts")
+                .dev();
+            assert_ne!(
+                master_dev, host_pts_dev,
+                "master must not be on the host devpts"
+            );
+            let index = std::fs::read_to_string(format!(
+                "/proc/self/fdinfo/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&master.as_fd())
+            ))
+            .expect("read fdinfo")
+            .lines()
+            .find_map(|l| l.strip_prefix("tty-index:"))
+            .map(|v| v.trim().to_string())
+            .expect("fdinfo tty-index of the master");
+            let (rx, reader) = spawn_reader(Box::new(std::fs::File::from(master.into_owned_fd())));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            let want = format!("136:{index}");
+            assert_eq!(
+                value_of(&lines, "TTY_FDS"),
+                format!("{want},{want},{want}"),
+                "fd 0-2 must be the same pty slave of the master"
+            );
+            assert_eq!(
+                value_of(&lines, "TTY_SESSION"),
+                "1 PID 1",
+                "init is the session leader"
+            );
+            assert_eq!(value_of(&lines, "TTY_CTTY_MATCHES_FD0"), "true");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+        println!(
+            "production_launcher: init pty allocated from the container devpts and master handed over (scenario=pty-init)"
         );
     }
 

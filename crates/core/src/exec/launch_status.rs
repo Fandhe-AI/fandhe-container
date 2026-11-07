@@ -56,9 +56,9 @@
 //! exec の子は同じ考え方（段・`ErrorCode`・理由コードだけを運ぶ）で、`<終了コード> <step> <CODE> <reason|->` の 4 語の
 //! 行を別の状態 pipe に書く。語彙 `process::ExecChildStep` は `F <step>` の `PrePivotStep` とは別で、対応は
 //! `ExecChildStep` の doc の表を正とする（要点: exec の `execveat` は本モジュールの `X`、`report_ready` は `R` を書けない
-//! 場合、`close_fds` から `stdio_null` の 11 段は本モジュールの `E` 行と同じトークンで運ぶ共有の段
-//! （[`LAUNCH_SHARED_EXEC_CHILD_STEPS`]。#2895）。`parent_lifetime`・`cgroup_join`・`report_ready`・`execveat` は
-//! `E` 行では受けない。launch だけの段は `verify_caller`・`restriction_evidence`・`verify_root`・`landlock` の 4 つ（`landlock` は Landlock 段の照合の違反 3 理由を運ぶ。#2130）。
+//! 場合、`close_fds` から `stdio_null` の 12 段は本モジュールの `E` 行と同じトークンで運ぶ共有の段
+//! （[`LAUNCH_SHARED_EXEC_CHILD_STEPS`]。#2895。端末つき起動の `controlling_tty` を含む。#4070）。`parent_lifetime`・`cgroup_join`・`report_ready`・`execveat` は
+//! `E` 行では受けない。launch だけの段は `verify_caller`・`restriction_evidence`・`verify_root`・`landlock`・`pty` の 5 つ（`landlock` は Landlock 段の照合の違反 3 理由を運ぶ。#2130。`pty` は端末つき起動の init の pty の失敗。#4070）。
 //! `F <step>` の 14 段に対応する exec の段は無い）。
 //!
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
@@ -597,15 +597,16 @@ fn read_line_inner<const N: usize>(
 /// `process::EXEC_FAILURE_TOKEN_MAX` と同じ値。#2895）。
 const EXEC_PHASE_TOKEN_MAX: usize = 48;
 
-/// launch の `E` 行が受ける、exec と共有する `ExecChildStep`（`prepare_exec_child` の 11 段。#2895）。
+/// launch の `E` 行が受ける、exec と共有する `ExecChildStep`（`prepare_exec_child` の 12 段。#2895）。
 ///
 /// `parent_lifetime`・`cgroup_join`（launch の PID 1 には無い）・`report_ready`（`R` を書けなければ行を書かない）・
 /// `execveat`（`X` が担う）は `E` 行では受けない。`ExecChildStep::from_token` が通るだけでは受理しない
 /// （取り違えた行を fail-closed に落とすため）。launch は `deferred_fsize = None` なので `deferred_rlimit` は
 /// 実際には届かないが、`prepare_exec_child` の段なので語彙には含める。
-pub(super) const LAUNCH_SHARED_EXEC_CHILD_STEPS: [ExecChildStep; 11] = [
+pub(super) const LAUNCH_SHARED_EXEC_CHILD_STEPS: [ExecChildStep; 12] = [
     ExecChildStep::CloseFds,
     ExecChildStep::Setsid,
+    ExecChildStep::ControllingTty,
     ExecChildStep::OpenRoot,
     ExecChildStep::OpenEntrypoint,
     ExecChildStep::RuntimeIdentity,
@@ -625,7 +626,7 @@ pub(super) const LAUNCH_SHARED_EXEC_CHILD_STEPS: [ExecChildStep; 11] = [
 /// - launch だけの段: `landlock`（制限ステージ列の Landlock 段。照合の違反 3 理由を運ぶ。#2130）、
 ///   `verify_caller`・`restriction_evidence`（`run_child` の検証）、`verify_root`（pivot 後の
 ///   `/` の mount ID 照合。`PrePivotStep` の `pivot_root` と重ならない名前）
-/// - exec と共有する段: [`LAUNCH_SHARED_EXEC_CHILD_STEPS`] の 11 段（`prepare_exec_child` の手順）
+/// - exec と共有する段: [`LAUNCH_SHARED_EXEC_CHILD_STEPS`] の 12 段（`prepare_exec_child` の手順）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub(super) enum ExecPhaseStep {
@@ -639,17 +640,21 @@ pub(super) enum ExecPhaseStep {
     /// seccomp の listener を送る前に走るため、失敗すると親は listener を受け取れず、この段の `E` 行だけが
     /// 照合の違反（`ViolationReason::LANDLOCK_APPLY_REASONS`）を親へ運ぶ。
     Landlock,
+    /// 端末つき起動（`process.terminal: true`）の init の pty の割り当て・master の受け渡し・slave の付け替えの失敗
+    /// （launch だけ。CRI-6・SEC-1・#4070）。理由コードは運ばない（違反ではなく系の失敗。`-`）。
+    Pty,
     /// exec と共有する `prepare_exec_child` の段。
     Child(ExecChildStep),
 }
 
 impl ExecPhaseStep {
     /// launch だけの段（4 段）。
-    pub(super) const LAUNCH_ONLY: [Self; 4] = [
+    pub(super) const LAUNCH_ONLY: [Self; 5] = [
         Self::VerifyCaller,
         Self::RestrictionEvidence,
         Self::VerifyRoot,
         Self::Landlock,
+        Self::Pty,
     ];
 
     /// ワイヤー上のトークン。
@@ -659,6 +664,7 @@ impl ExecPhaseStep {
             Self::RestrictionEvidence => "restriction_evidence",
             Self::VerifyRoot => "verify_root",
             Self::Landlock => "landlock",
+            Self::Pty => "pty",
             Self::Child(step) => step.as_str(),
         }
     }
@@ -2177,7 +2183,7 @@ mod tests {
         assert!(sink.snapshot().is_empty());
     }
 
-    /// 全 `ExecPhaseStep`（launch だけの 3 段と共有の 11 段）。
+    /// 全 `ExecPhaseStep`（launch だけの 5 段と共有の 12 段）。
     fn all_phase_steps() -> Vec<ExecPhaseStep> {
         let mut v = ExecPhaseStep::LAUNCH_ONLY.to_vec();
         v.extend(LAUNCH_SHARED_EXEC_CHILD_STEPS.map(ExecPhaseStep::Child));
@@ -2237,7 +2243,7 @@ mod tests {
     #[test]
     fn sup6_2895_roundtrip_every_step_code_and_reason() {
         let steps = all_phase_steps();
-        assert_eq!(steps.len(), 15);
+        assert_eq!(steps.len(), 17);
         let mut longest = 0;
         for step in steps {
             for code in ErrorCode::ALL {
@@ -2297,7 +2303,7 @@ mod tests {
         }
     }
 
-    /// SUP-6・REPAIR-3・#2895: 共有の許可リストは `prepare_exec_child` の 11 段と一致し、launch だけの 3 語は
+    /// SUP-6・REPAIR-3・#2895: 共有の許可リストは `prepare_exec_child` の 12 段と一致し、launch だけの 5 語は
     /// exec の全段・pivot 前段のどちらとも重ならない。
     #[test]
     fn sup6_2895_step_tokens_do_not_overlap() {
@@ -2310,6 +2316,7 @@ mod tests {
             [
                 "close_fds",
                 "setsid",
+                "controlling_tty",
                 "open_root",
                 "open_entrypoint",
                 "runtime_identity",
@@ -2331,7 +2338,8 @@ mod tests {
                 "verify_caller",
                 "restriction_evidence",
                 "verify_root",
-                "landlock"
+                "landlock",
+                "pty"
             ]
         );
         for token in &only {
@@ -2352,7 +2360,7 @@ mod tests {
         let mut all: Vec<&str> = all_phase_steps().into_iter().map(|s| s.as_str()).collect();
         all.sort_unstable();
         all.dedup();
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 17);
     }
 
     /// 子の符号化 → 状態 pipe → 親の復号 → 記録までを段 `landlock` で往復させる（本番と同じ関数）。

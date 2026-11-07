@@ -140,6 +140,7 @@ use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
     runtime_service_server::RuntimeService,
 };
+use crate::streaming::port_forward::PortForwardNetwork;
 use crate::streaming::{
     StreamKind, StreamRequest, StreamingUrlIssuer, validate_attach_request, validate_exec_request,
     validate_port_forward_request,
@@ -1299,6 +1300,25 @@ fn wants_pod_network(config: Option<&PodSandboxConfig>) -> bool {
         .and_then(|s| s.namespace_options.as_ref())
         .map_or(v1::NamespaceMode::Pod as i32, |o| o.network);
     mode == v1::NamespaceMode::Pod as i32
+}
+
+/// PortForward の転送先のネットワーク種別を sandbox の保存済み設定から決める（CRI-6・SEC-1・#3755）。
+///
+/// `namespace_options.network` がちょうど `NODE` のときだけ `Node`。未指定（既定 `POD`）・`POD`・`CONTAINER`・
+/// `TARGET`・未知の値はすべて `Pod` に倒す（fail-closed。`Pod` は未実装で接続しない）。
+/// `wants_pod_network` は `CONTAINER`・`TARGET` を「POD でない」と扱うため流用しない。
+fn port_forward_network(config: &PodSandboxConfig) -> PortForwardNetwork {
+    let mode = config
+        .linux
+        .as_ref()
+        .and_then(|l| l.security_context.as_ref())
+        .and_then(|s| s.namespace_options.as_ref())
+        .map(|o| o.network);
+    if mode == Some(v1::NamespaceMode::Node as i32) {
+        PortForwardNetwork::Node
+    } else {
+        PortForwardNetwork::Pod
+    }
 }
 
 /// `remove_sandbox` が検査の段階で計算した、除去後の保持量（#2933）。
@@ -3733,16 +3753,22 @@ impl CriRuntimeService {
     ) -> Result<v1::PortForwardResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::PortForward, "port_forward")?;
         validate_port_forward_request(&req)?;
-        let exists = self
-            .registry
-            .lock()
-            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
-            .records
-            .contains_key(&req.pod_sandbox_id);
-        if !exists {
-            return Err(CriError::not_found("pod sandbox not found"));
-        }
-        let url = issuer.issue(StreamRequest::PortForward(req))?;
+        let network = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .records
+                .get(&req.pod_sandbox_id)
+                .ok_or_else(|| CriError::not_found("pod sandbox not found"))?;
+            port_forward_network(&record.config)
+        };
+        issuer.require_port_forward_network(network)?;
+        let url = issuer.issue(StreamRequest::PortForward {
+            request: req,
+            network,
+        })?;
         Ok(v1::PortForwardResponse { url })
     }
 
@@ -4461,6 +4487,47 @@ mod tests {
                 CriErrorCode::Timeout => CriError::timeout("cut"),
                 _ => CriError::internal("failed"),
             })
+        }
+    }
+
+    /// CRI-6・SEC-1・#3755: NODE だけが `Node` で、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed）。
+    #[test]
+    fn cri6_3755_port_forward_network_only_node_is_node() {
+        fn config(network: Option<i32>) -> PodSandboxConfig {
+            PodSandboxConfig {
+                linux: network.map(|n| v1::LinuxPodSandboxConfig {
+                    security_context: Some(v1::LinuxSandboxSecurityContext {
+                        namespace_options: Some(v1::NamespaceOption {
+                            network: n,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        assert_eq!(
+            port_forward_network(&config(Some(v1::NamespaceMode::Node as i32))),
+            PortForwardNetwork::Node
+        );
+        assert_eq!(
+            port_forward_network(&PodSandboxConfig::default()),
+            PortForwardNetwork::Pod
+        );
+        assert_eq!(port_forward_network(&config(None)), PortForwardNetwork::Pod);
+        for mode in [
+            v1::NamespaceMode::Pod as i32,
+            v1::NamespaceMode::Container as i32,
+            v1::NamespaceMode::Target as i32,
+            99,
+        ] {
+            assert_eq!(
+                port_forward_network(&config(Some(mode))),
+                PortForwardNetwork::Pod,
+                "mode {mode}"
+            );
         }
     }
 

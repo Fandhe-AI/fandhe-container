@@ -5,9 +5,10 @@
 //! 停止は [`stop_streaming_on`] で包んだ shutdown future が担い、SIGTERM・SIGINT（#3226）の受信と同時に TCP の待ち受けを閉じる。
 //!
 //! # 現状（REPAIR-3）
-//! 結線済みの種別は無い。[`production_stream_dispatcher`] は空の `StreamDispatcher` を返すだけで、3 RPC は
-//! 「`<kind> streaming is not wired`」の `UNIMPLEMENTED` のままである。兄弟 issue（#3755 PortForward・#3761 Exec・#3763 Attach）が
-//! `with_exec` / `with_attach` / `with_port_forward` をその関数へ足す。`wiring` は bind 時に 1 回だけ取られるため、
+//! 結線済みは PortForward の NODE ネットワーク（hostNetwork）の pod だけ（#3755。[`NodeLoopbackDialer`]）。POD ネットワークの
+//! pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、保持役（#2877）と helper 方式（#3766）まで続く。Exec と Attach は
+//! 「`<kind> streaming is not wired`」の `UNIMPLEMENTED` のままである（#3761 Exec・#3763 Attach が
+//! `with_exec` / `with_attach` を [`production_stream_dispatcher`] へ足す）。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。
 //!
 //! # 安全側の既定
@@ -22,13 +23,20 @@
 //! # 停止（REPAIR-5）
 //! 停止は待ちを足さない（accept タスクの abort は同期）。受け付け済みで Upgrade しない接続はプロセス終了時の
 //! `rt.shutdown_timeout` が打ち切るため、`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない。
-//! backend が入って Upgrade 後のセッションが生まれたら、停止時のドレイン方針を再評価する。
+//! PortForward の Upgrade 後のセッションと実行中の blocking の dial（最長 `dial_timeout` 10 秒）も、プロセス終了時の
+//! `rt.shutdown_timeout` が打ち切るため待ちは増えず、`SHUTDOWN_TOTAL_BOUND` は変わらない（#3755 で再評価）。
+//! Exec・Attach の backend が入って長寿命のセッションが生まれたら、停止時のドレイン方針を再評価する。
 //! 設計は `docs/design/cri-streaming-server.md`。
 
 use std::future::Future;
 use std::sync::Arc;
 
+mod node_dialer;
+
+pub use node_dialer::NodeLoopbackDialer;
+
 use fandhe_container_cri::error::CriErrorCode;
+use fandhe_container_cri::streaming::port_forward::{PortForwardConfig, PortForwardHandler};
 use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
@@ -40,11 +48,17 @@ pub fn production_streaming_config() -> StreamingConfig {
     StreamingConfig::default()
 }
 
-/// 本番の `StreamDispatcher`。現状は全種別が未結線（#3754 時点）。
+/// 本番の `StreamDispatcher`。PortForward は NODE ネットワークの pod だけ結線済み（#3755）。
 ///
-/// 兄弟 issue（#3755・#3761・#3763）が `with_port_forward` / `with_exec` / `with_attach` をここへ足す。
-pub fn production_stream_dispatcher() -> StreamDispatcher {
-    StreamDispatcher::new()
+/// 兄弟 issue（#3761・#3763）が `with_exec` / `with_attach` をここへ足す。ハンドラの構築失敗
+/// （設定検証。既定では起きない）は `Internal` の固定文言に写す。
+pub fn production_stream_dispatcher() -> Result<StreamDispatcher, PluginError> {
+    let port_forward = PortForwardHandler::new(
+        Arc::new(NodeLoopbackDialer::new()),
+        PortForwardConfig::default(),
+    )
+    .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?;
+    Ok(StreamDispatcher::new().with_port_forward(Arc::new(port_forward)))
 }
 
 /// dispatcher を組んでから `StreamingServer` を起動する。`tokio` の実行時の中で呼ぶ。
@@ -53,7 +67,7 @@ pub fn production_stream_dispatcher() -> StreamDispatcher {
 pub async fn bind_production_streaming(
     config: StreamingConfig,
 ) -> Result<StreamingServer, PluginError> {
-    let dispatcher = production_stream_dispatcher();
+    let dispatcher = production_stream_dispatcher()?;
     StreamingServer::bind_with_handler(config, Arc::new(dispatcher))
         .await
         .map_err(|e| {
@@ -108,7 +122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cri6_3754_production_server_listens_on_loopback_without_wiring() {
+    async fn cri6_3754_production_server_listens_on_loopback_with_port_forward_only() {
         let server = bind_production_streaming(production_streaming_config())
             .await
             .expect("bind");
@@ -116,7 +130,11 @@ mod tests {
         assert_eq!(addr.ip(), LOOPBACK);
         assert_ne!(addr.port(), 0);
         let issuer = server.issuer();
-        assert_eq!(issuer.wiring(), StreamWiring::none());
+        assert_eq!(
+            issuer.wiring(),
+            StreamWiring::only(fandhe_container_cri::streaming::StreamKind::PortForward)
+        );
+        assert!(!issuer.wiring().port_forward_pod_network());
         assert_eq!(
             issuer.base_url(),
             format!("http://127.0.0.1:{}", addr.port())
@@ -124,7 +142,7 @@ mod tests {
         connect(addr).await.expect("connect to loopback listener");
     }
 
-    /// 結線前（#3754 時点）の期待値。兄弟 issue が結線を足したら、その種別の期待値を更新する。
+    /// Exec・Attach は未結線のまま。PortForward は結線済み（#3755）で、未知の sandbox は `NOT_FOUND`。兄弟 issue が結線を足したら更新する。
     #[tokio::test]
     async fn cri6_repair3_3754_injected_service_keeps_unwired_rpcs_unimplemented() {
         let server = bind_production_streaming(production_streaming_config())
@@ -158,8 +176,77 @@ mod tests {
             }))
             .await
             .expect_err("port_forward");
+        assert_eq!(e.code(), Code::NotFound);
+        assert_eq!(e.message(), "pod sandbox not found");
+    }
+
+    /// CRI-6・REPAIR-3・SEC-1・#3755: 本番の結線で NODE の sandbox は URL を返し、POD の sandbox は `UNIMPLEMENTED`。
+    #[tokio::test]
+    async fn cri6_3755_production_port_forward_node_ok_pod_unimplemented() {
+        let server = bind_production_streaming(production_streaming_config())
+            .await
+            .expect("bind");
+        let svc = CriRuntimeService::new().with_streaming(server.issuer());
+        async fn run(
+            svc: &CriRuntimeService,
+            name: &str,
+            network: Option<cri::NamespaceMode>,
+        ) -> String {
+            let linux = network.map(|n| cri::LinuxPodSandboxConfig {
+                security_context: Some(cri::LinuxSandboxSecurityContext {
+                    namespace_options: Some(cri::NamespaceOption {
+                        network: n as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            svc.run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
+                config: Some(cri::PodSandboxConfig {
+                    metadata: Some(cri::PodSandboxMetadata {
+                        name: name.into(),
+                        uid: format!("uid-{name}"),
+                        namespace: "ns".into(),
+                        attempt: 0,
+                    }),
+                    linux,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("run")
+            .into_inner()
+            .pod_sandbox_id
+        }
+        let node = run(&svc, "n", Some(cri::NamespaceMode::Node)).await;
+        let pod = run(&svc, "p", None).await;
+        let url = svc
+            .port_forward(Request::new(cri::PortForwardRequest {
+                pod_sandbox_id: node,
+                port: vec![80],
+            }))
+            .await
+            .expect("node url")
+            .into_inner()
+            .url;
+        assert!(
+            url.starts_with(&format!("{}/portforward/", server.issuer().base_url())),
+            "unexpected url"
+        );
+        let e = svc
+            .port_forward(Request::new(cri::PortForwardRequest {
+                pod_sandbox_id: pod,
+                port: vec![80],
+            }))
+            .await
+            .expect_err("pod");
         assert_eq!(e.code(), Code::Unimplemented);
-        assert_eq!(e.message(), "port-forward streaming is not wired");
+        assert_eq!(
+            e.message(),
+            "port-forward for pod network is not implemented"
+        );
     }
 
     #[tokio::test]

@@ -100,7 +100,7 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 寿命: `RegisteredHvfRam<'vm>` は `&'vm HvVm` を借用するため `HvVm` より先に drop される。drop は `hv_vm_unmap` が成功したときだけ munmap し、失敗したら backing をリークする（fail-closed）。構成体（#3797）が `HvVm` をどう持つかはその issue の担当
 - 読み書き: 参照を作らず、範囲検査つきのバイト単位 volatile のみ。例外として virtqueue の共有 index（`avail.idx` の読み・`used.idx` の書き）だけは、2 バイト整列した u16 の単一命令 volatile（`read_u16_le_aligned` / `write_u16_le_aligned`。tear を避ける。#3862・MVM-1・MVM-5・REPAIR-3）。「単一命令」は言語仕様の保証ではなく x86_64・aarch64 の lowering に依る（`READ_ONCE` と同じ前提）。ring の要素・記述子・u32 以上には適用しない（要素は idx の前後の fence で順序づけられ、記述子は 1 回コピーして検査する）。`AtomicU16` は混在サイズのアクセスと参照の生成を招くため採らない。順序は引き続き fence と実機のバリアに頼る
 - IPA の上限: `register` が引数で受ける。既定値 `HVF_DEFAULT_IPA_LIMIT`（36 ビット）は macOS 27.2・Apple M4 Max の実機の既定と一致し、最大は 40 ビットだった（#3997。他の機種・版は未確認）
-- 範囲外: 複数領域・`hv_vm_protect` の利用・`Send` / `Sync`（#3797・#3798）・解除失敗の構造化ログ
+- 範囲外: 複数領域・`hv_vm_protect` の利用・`Sync`（#3797・#3798。`Send` は #4024 で導入）・解除失敗の構造化ログ
 
 ## #3697 での複数領域の実装記録（MVM-1・TASK-75.1 追補）
 
@@ -115,3 +115,8 @@ backing と登録の所有先は `crates/microvm/src/hvf/memory.rs`（安全な 
 - 挙動の変化: x86_64 で 3.25 GiB（`VIRTIO_MMIO_BASE`）を超える `mem_size` が受理されるようになった（以前は拒否）
 - 範囲外（REPAIR-3）: hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`（必要になった時点で別に扱う）。ゲストの物理アドレス幅（CPUID leaf 0x8000_0008）と最上位 GPA（最大 0x4_3000_0000）の照合。e820 での IOAPIC / LAPIC / MMIO hole の予約表記。実カーネルを 4 GiB 超の RAM で起動し `/proc/meminfo` で確かめる通し試験。macOS（HVF）の複数領域
 - 試験: KVM を使わない部分は既定のテスト集合の `mvm1_3697_*`。実 KVM は `crates/microvm/tests/kvm_device.rs` の `kvm_device_assemble_microvm_high_memory`（実機前提。`docs/verification/real-machine-tests.md`）
+
+## #4024 での `Send` の導入記録（MVM-5・MVM-1・SEC-1）
+- `HostMapping`（`crates/microvm/src/sys/hvf.rs`）に `unsafe impl Send` を 1 件だけ足した。`Sync` は足さない（`&HostMapping` の共有は型で禁じ、共有は `Arc<Mutex<..>>`）。個別承認は [#4022 の判断コメント](https://github.com/Fandhe-AI/fandhe-container/issues/4022#issuecomment-6690213069)（案 A）の 1 件に限る
+- 自動で `Send` になる型: `GuestMapping`・`RegisteredHvfRam`・`GuestMemory<RegisteredHvfRam<'static>>`。固定は `sys/hvf.rs` の const assert（`Sync` は E0283 の曖昧性ガード）と `hvf/memory.rs` の const assert
+- 残り（`ExitHandlers` への受け渡し・QueueNotify の配線・期限切れ後の回収）は #3908

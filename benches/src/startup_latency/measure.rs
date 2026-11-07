@@ -936,6 +936,11 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
 }
 
 /// 計測を実行する。入口（`startup_latency::execute`）から呼ばれる。
+///
+/// 事前条件: 1 プロセスにつき 1 回だけ呼ぶ（`benches/startup_latency.rs` の `main` 経由。
+/// 先頭でシグナルマスクを設定するためスレッド作成前の呼び出しが前提）。作業ディレクトリ名
+/// `fandhe-startup-latency-{pid}-{nanos}` と nonce は pid と `as_nanos()` だけで決まり、
+/// 並行に呼ぶと衝突しうる（#4049・REPAIR-4。別プロセスは pid が異なり、逐次呼びは計測 1 回を挟む）。
 pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     let euid = effective_uid().ok_or_else(|| {
         StartupLatencyError::new(

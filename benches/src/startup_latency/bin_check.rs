@@ -168,6 +168,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// 0700 の専用ディレクトリ（テスト後に削除）。
+    ///
+    /// 時刻は `subsec_nanos` で一意性の根拠にならないため、`tag` はプロセス内で一意にする
+    /// （並列試験で同名にしない。#4049・REPAIR-4）。
     struct Dir(PathBuf);
 
     impl Dir {

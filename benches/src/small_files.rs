@@ -150,11 +150,13 @@ fn from_io(err: &IoError) -> SmallFilesError {
     )
 }
 
-fn from_fs(err: &std::io::Error) -> SmallFilesError {
-    SmallFilesError::new(
-        "io-error",
-        format!("file system operation failed ({:?})", err.kind()),
-    )
+/// ファイルシステム操作の失敗を、操作名つきの構造化エラーへ写す（REPAIR-4・IO-6・#4049）。
+///
+/// `op` は呼び出し元が与える固定の英語ラベルで、`AlreadyExists` 等がどの操作で起きたかを
+/// 切り分けるために message に載せる。パス・OS 由来の文字列・引用符・バックスラッシュは含めない
+/// （`SmallFilesError` の契約。`Display` が JSON を手で書くため）。`code` は互換のため `io-error` 固定。
+fn from_fs(op: &'static str, err: &std::io::Error) -> SmallFilesError {
+    SmallFilesError::new("io-error", format!("{op} failed ({:?})", err.kind()))
 }
 
 /// ファイルの配置。
@@ -582,11 +584,13 @@ impl WorkDir {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&path).map_err(|e| from_fs(&e))?;
+        builder
+            .create(&path)
+            .map_err(|e| from_fs("create work dir", &e))?;
         #[cfg(unix)]
         let id = {
             use std::os::unix::fs::MetadataExt;
-            let m = std::fs::symlink_metadata(&path).map_err(|e| from_fs(&e))?;
+            let m = std::fs::symlink_metadata(&path).map_err(|e| from_fs("stat work dir", &e))?;
             (m.dev(), m.ino())
         };
         #[cfg(windows)]
@@ -599,7 +603,7 @@ impl WorkDir {
                 .share_mode(0x1 | 0x2)
                 .custom_flags(0x0200_0000)
                 .open(&path)
-                .map_err(|e| from_fs(&e))?;
+                .map_err(|e| from_fs("open work dir handle", &e))?;
             Some(f)
         };
         Ok(Self {
@@ -788,7 +792,7 @@ fn run_trials(
     let mut trials = Vec::with_capacity(usize::try_from(plan.trials).unwrap_or(0));
     for n in 0..plan.trials {
         let trial_root = work_path.join(format!("trial-{n}"));
-        std::fs::create_dir(&trial_root).map_err(|e| from_fs(&e))?;
+        std::fs::create_dir(&trial_root).map_err(|e| from_fs("create trial dir", &e))?;
         let trial_deadline = Instant::now()
             .checked_add(plan.trial_timeout)
             .ok_or_else(|| SmallFilesError::args("trial timeout is out of range"))?;
@@ -902,6 +906,46 @@ pub fn execute(command: Command) -> Result<Execution, SmallFilesError> {
 
 #[cfg(test)]
 mod tests {
+    /// REPAIR-4・IO-6（#4049）: `from_fs` は操作の固定ラベルと失敗種別を message に載せ、code は据え置く。
+    #[test]
+    fn repair4_io6_from_fs_names_the_operation() {
+        let e = super::from_fs(
+            "create work dir",
+            &std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+        );
+        assert_eq!(e.code, "io-error");
+        assert_eq!(e.message, "create work dir failed (AlreadyExists)");
+    }
+
+    /// REPAIR-4・IO-6（#4049）: 作業ディレクトリの作成失敗は操作名を含み、パスを含まない。
+    #[test]
+    fn repair4_io6_workdir_create_failure_names_the_operation() {
+        let missing = std::env::temp_dir().join(format!("fsf-missing-{}", std::process::id()));
+        let Err(e) = super::WorkDir::create_at(&missing, "fcsf", 1, 0) else {
+            panic!("missing root must fail");
+        };
+        assert_eq!(e.code, "io-error");
+        assert_eq!(e.message, "create work dir failed (NotFound)");
+        assert!(!e.message.contains(&*missing.to_string_lossy()));
+    }
+
+    /// REPAIR-4・IO-6（#4049）: 試行ディレクトリの衝突は `create trial dir` の失敗として切り分けられる。
+    #[test]
+    fn repair4_io6_trial_dir_collision_names_the_operation() {
+        let base = std::env::temp_dir().join(format!("fsf-trialcol-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut work = super::WorkDir::create(&base).unwrap();
+        std::fs::create_dir(work.path.join("trial-0")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let Err(e) = super::run_trials(&super::Plan::smoke(), &work.path, deadline) else {
+            panic!("pre-existing trial dir must fail");
+        };
+        assert_eq!(e.code, "io-error");
+        assert_eq!(e.message, "create trial dir failed (AlreadyExists)");
+        work.cleanup().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// REPAIR-12・IO-6（#3901）: 同じ root・prefix・pid・時刻値でも、連番により名前がすべて異なり
     /// 作成も成功する（粗い時計の再現。#3650）。
     #[test]

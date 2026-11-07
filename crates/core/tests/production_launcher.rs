@@ -260,9 +260,9 @@ mod linux {
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        AttachableNamespaces, LaunchIpcMode, LaunchNetworkMode, LaunchOptions, NetnsAttachHook,
-        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
-        create, start,
+        AttachableNamespaces, LaunchIpcMode, LaunchNetworkMode, LaunchOptions, LaunchStdinMode,
+        NetnsAttachHook, ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts,
+        SubordinateIdSource, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
@@ -572,6 +572,40 @@ mod linux {
         // シナリオ N(Loopback モード。NET-6・CORE-6・#3064): 新しい netns の識別子・インターフェース・自己宛て UDP 配送を出す。
         if args.iter().any(|a| a == "--net-loopback") {
             net_loopback_probe(&mut emit);
+        }
+        // シナリオ STDIN(SUP-7・CRI-6・SEC-1・#4069): fd 0 が pipe であること、親が書いた 1 行、書き込み端を閉じた後の EOF
+        // (EOF が来る = コンテナ側のどこにも書き込み端の複製が残っていない)を出す。親が書くまでここで待つ。
+        if args.iter().any(|a| a == "--with-stdin") {
+            let kind = std::fs::read_link("/proc/self/fd/0").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |p| {
+                    p.to_string_lossy()
+                        .split('[')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                },
+            );
+            emit(format!("STDIN_KIND {kind}"));
+            let mut stdin = std::io::stdin().lock();
+            let mut line = String::new();
+            let n = stdin.read_line(&mut line);
+            emit(format!(
+                "STDIN_LINE {}",
+                n.map_or_else(
+                    |e| format!("error:{:?}", e.kind()),
+                    |_| line.trim_end().to_string()
+                )
+            ));
+            let mut rest = Vec::new();
+            let eof = stdin.read_to_end(&mut rest);
+            emit(format!(
+                "STDIN_EOF {}",
+                eof.map_or_else(
+                    |e| format!("error:{:?}", e.kind()),
+                    |n| format!("bytes={n}")
+                )
+            ));
         }
         // シナリオ V(sysctls の適用。#2670・CRI-2・CORE-3): コンテナ内の IPC namespace の `kernel.shmmax` を出す。
         if args.iter().any(|a| a == "--with-sysctl") {
@@ -1213,6 +1247,7 @@ mod linux {
         scenario_k_seccomp_kill_after_exec(&env, tag);
         scenario_t_capabilities_drop(&env, tag);
         scenario_v_sysctls(&env, tag);
+        scenario_stdin_pipe(&env, tag);
         scenario_w_pod_ipc_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
@@ -3375,6 +3410,79 @@ mod linux {
             assert_eq!(host_after, host_before, "host shmmax must be unchanged");
             println!(
                 "production_launcher: sysctls applied (scenario=V shmmax={WANT} host_unchanged={host_before})"
+            );
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ STDIN(SUP-7・CRI-6・SEC-1・#4069): `LaunchOptions::with_stdin(Pipe)` の本番 launcher の起動で、
+    /// `take_stdin` の書き込み端に書いた具体値が init の fd 0(pipe)に届き、書き込み端を drop すると EOF(0 バイト)になること、
+    /// 2 回目の `take_stdin` が `None` であること、書き込み端が close-on-exec かつ fd 3 以上であることを、期限つき
+    /// (`collect_probe` の期限)で照合する。EOF はコンテナ側に書き込み端の複製が無い証拠にもなる。
+    fn scenario_stdin_pipe(env: &Env, tag: u32) {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        const SENT: &str = "stdin-4069-payload";
+        let options = LaunchOptions::try_default()
+            .expect("launch options")
+            .with_stdin(LaunchStdinMode::Pipe);
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher for stdin pipe"),
+        );
+        let bundle = Bundle::new("stdin");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-stdin"], json!([]));
+        let id = ContainerId::new(format!("plsi{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            reader_slot = Some(spawn_reader(output.stdout.expect("container stdout")));
+            let mut stdin = started.process().take_stdin().expect("container stdin");
+            assert!(started.process().take_stdin().is_none(), "second take");
+            let fd = stdin.as_fd().as_raw_fd();
+            assert!(fd >= 3, "stdin writer must not be fd 0..2: {fd}");
+            // fdinfo の flags は 8 進。O_CLOEXEC(02000000)が立っていること。
+            let flags = status_field(&format!("/proc/self/fdinfo/{fd}"), "flags:")
+                .and_then(|v| u64::from_str_radix(v.trim(), 8).ok())
+                .expect("fdinfo flags");
+            assert_eq!(
+                flags & 0o2_000_000,
+                0o2_000_000,
+                "stdin writer must be close-on-exec: {flags:o}"
+            );
+            stdin
+                .write_all(format!("{SENT}\n").as_bytes())
+                .expect("write stdin");
+            stdin.flush().expect("flush stdin");
+            drop(stdin);
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "STDIN_KIND"), "pipe:", "{lines:?}");
+            assert_eq!(value_of(&lines, "STDIN_LINE"), SENT, "{lines:?}");
+            assert_eq!(value_of(&lines, "STDIN_EOF"), "bytes=0", "{lines:?}");
+            println!(
+                "production_launcher: stdin pipe delivered and closed with EOF (scenario=STDIN line={SENT} eof=bytes=0)"
             );
         }));
         finish_started(started, verified);

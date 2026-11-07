@@ -4,6 +4,7 @@ CLI の `exec` コマンドが `run_command_with_pidfd` を呼ぶために必要
 
 > 位置づけ: **判断記録（案 A はオーナー承認済み）**。#2626 の実装で案 A を採用し（既存の uid 照合・同一性照合を保ち、プロトコルの作り直しや専用 bin を足さない安全側）、2026-11-03 にオーナーが案 A を承認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6595741383) の 4 番目の項。SUP-6・SEC-4）。同じコメントで、CRI の exec（#3726 の分解、#3752〜#3761）の設計記録 #3752 は、この経路を再利用できるかを先に確かめることとされた。§6 の 2 点目（観測名の語彙）は未決定のまま残る。
 
+- CRI の exec（ストリーミング）での再利用の確認結果は [cri-streaming-server.md](cri-streaming-server.md) の「本番 backend の設計」にあり、kind 6 / 7 は変更なしで再利用する（#3752）
 - 対象ビヘイビア: SUP-6・SEC-4・CLI-1（関連: SEC-1・CORE-1・REPAIR-2・REPAIR-5・REPAIR-3）
 - タスク: TASK-163 追補（exec の入口。#1461・#1617・#1465・#1594）
 - 関連 issue: #2626（本件）・#2441（healthcheck の配線）・#2688（supervisor 不在時の exec）・#1869（非 Linux の plugin 経路）

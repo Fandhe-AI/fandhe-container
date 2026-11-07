@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #3759 で stream-exec の channel の codec（src/stream_exec）と sys の複数 fd 送信を追加した（依存は不変）。
 # #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
 # TASK-171.2（#537）でランチャーの入口にセッション切り離し（setsid・pty 非経由の検証）を追加した（依存は不変）。
 # TASK-171.3（#538）で sudo（pty の保持者）を SIGKILL しても切り離した子孫が動き続ける結合試験 tests/privilege.rs を追加した（依存は不変）。

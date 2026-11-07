@@ -740,13 +740,13 @@ mod control_ffi {
         cmsg_type: i32,
     }
 
-    /// 送信用の制御メッセージ（`SCM_RIGHTS` で fd 1 本。`CMSG_SPACE(4)` = 24 バイト、8 バイト整列）。
+    /// 送信用の制御メッセージ（`SCM_RIGHTS` で fd を最大 4 本。`CMSG_SPACE(4 * 4)` = 32 バイト、
+    /// 8 バイト整列）。使う長さは本数 n に応じた `cmsg_space(n)` だけで、残りはカーネルに見えない。
     #[repr(C)]
     #[allow(dead_code)]
-    struct ControlOne {
+    struct ControlFds {
         hdr: Cmsghdr,
-        fd: i32,
-        pad: i32,
+        fds: [i32; MAX_SEND_FDS],
     }
 
     /// 受信用の制御バッファ（`CMSG_SPACE(4 * 4)` = 32 バイト = fd 4 本分。8 バイト整列）。溢れた fd は
@@ -775,8 +775,8 @@ mod control_ffi {
     const _: () = assert!(std::mem::size_of::<Iovec>() == 16);
     const _: () = assert!(std::mem::size_of::<Msghdr>() == 56);
     const _: () = assert!(std::mem::size_of::<Cmsghdr>() == 16);
-    const _: () = assert!(std::mem::size_of::<ControlOne>() == 24);
-    const _: () = assert!(std::mem::align_of::<ControlOne>() == 8);
+    const _: () = assert!(std::mem::size_of::<ControlFds>() == 32);
+    const _: () = assert!(std::mem::align_of::<ControlFds>() == 8);
 
     /// `SOL_SOCKET`（asm-generic/socket.h。x86_64・aarch64 で共通）。
     const SOL_SOCKET: i32 = 1;
@@ -792,6 +792,20 @@ mod control_ffi {
     const RECV_CONTROL_LEN: usize = 32;
     /// cmsg のデータ部の先頭オフセット（`CMSG_LEN(0)` = ヘッダの 16 バイト）。
     const CMSG_HDR_LEN: usize = 16;
+    /// 1 回の `sendmsg` で添えられる fd の上限（受信側の制御バッファ `RECV_CONTROL_LEN` と同じ 4 本。#3759）。
+    pub(super) const MAX_SEND_FDS: usize = 4;
+
+    /// `CMSG_LEN(4 * n)`（ヘッダ + データ。整列の詰め物を含まない）。
+    pub(super) const fn cmsg_len(n: usize) -> usize {
+        CMSG_HDR_LEN + 4 * n
+    }
+
+    /// `CMSG_SPACE(4 * n)`（`cmsg_len(n)` を 8 バイト境界へ切り上げた値。`msg_controllen` に使う）。
+    /// `libc::CMSG_SPACE` は `const unsafe fn` で、照合のために `unsafe` を足さないため自前で計算し、
+    /// 単体テストが具体値を照合する。
+    pub(super) const fn cmsg_space(n: usize) -> usize {
+        (cmsg_len(n) + 7) & !7
+    }
 
     const AF_UNIX: i32 = 1;
     const SOCK_STREAM: i32 = 1;
@@ -851,43 +865,55 @@ mod control_ffi {
             .ok_or_else(|| io::Error::from_raw_os_error(22))
     }
 
-    /// `sock` へ `data` を送り、`fd` を `SCM_RIGHTS` で 1 本添える。送れたバイト数を返す
-    /// （ストリームなので短い書き込みはあり得る。fd は最初に送れたバイトに付く。呼び出し側が残りを書く）。
+    /// `sock` へ `data` を送り、`fds`（最大 4 本。空なら制御メッセージを付けない）を `SCM_RIGHTS` で
+    /// 添える。送れたバイト数を返す（ストリームなので短い書き込みはあり得る。fd は最初に送れたバイトに付く。
+    /// 呼び出し側が残りを fd なしで書く）。`fds` が上限超なら syscall の前に `InvalidInput`。
     /// `EINTR` は再試行せず `Interrupted` のまま返す（呼び出し側が絶対期限を確認して再試行する。REPAIR-5）。
-    pub(super) fn send_with_fd(
+    pub(super) fn send_with_fds(
         sock: std::os::fd::BorrowedFd<'_>,
         data: &[u8],
-        fd: std::os::fd::BorrowedFd<'_>,
+        fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> io::Result<usize> {
-        let mut control = ControlOne {
+        if fds.len() > MAX_SEND_FDS {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let mut control = ControlFds {
             hdr: Cmsghdr {
-                // CMSG_LEN(4) = ヘッダ 16 + データ 4。
-                cmsg_len: CMSG_HDR_LEN + 4,
+                cmsg_len: cmsg_len(fds.len()),
                 cmsg_level: SOL_SOCKET,
                 cmsg_type: SCM_RIGHTS,
             },
-            fd: fd.as_raw_fd(),
-            pad: 0,
+            fds: [-1; MAX_SEND_FDS],
         };
+        for (slot, fd) in control.fds.iter_mut().zip(fds) {
+            *slot = fd.as_raw_fd();
+        }
         let mut iov = Iovec {
             iov_base: data.as_ptr().cast_mut().cast(),
             iov_len: data.len(),
+        };
+        let (msg_control, msg_controllen) = if fds.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            ((&raw mut control).cast(), cmsg_space(fds.len()))
         };
         let msg = Msghdr {
             msg_name: std::ptr::null_mut(),
             msg_namelen: 0,
             msg_iov: &raw mut iov,
             msg_iovlen: 1,
-            msg_control: (&raw mut control).cast(),
-            msg_controllen: std::mem::size_of::<ControlOne>(),
+            msg_control,
+            msg_controllen,
             msg_flags: 0,
         };
         {
-            // SAFETY: `sock`・`fd` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイト（コンパイル時に固定）で、
-            // `msg_iov` は 1 要素の `iov`（`data` の先頭と長さ。カーネルは読むだけ）、`msg_control` は 24 バイトの
-            // `ControlOne`（8 バイト整列。`msg_controllen` はその大きさ）を指す。いずれもこの関数のスタック上の値か
-            // 呼び出し元の借用で、呼び出しの間有効。`msg_name` は null・長さ 0。カーネルは `fd` の複製を受け手に作るだけで、
-            // 呼び出し側の fd の所有権は動かない。本モジュールは LP64 の x86_64 / aarch64 でのみコンパイルされる。
+            // SAFETY: `sock`・`fds` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイト（コンパイル時に固定）で、
+            // `msg_iov` は 1 要素の `iov`（`data` の先頭と長さ。カーネルは読むだけ）を指す。`fds` が空でなければ
+            // `msg_control` は 32 バイトの `ControlFds`（8 バイト整列）を指し、`msg_controllen` = `cmsg_space(n)` は
+            // その大きさ（n <= 4 は冒頭で確認済み）以下で、先頭 `cmsg_len(n)` バイトが初期化済みの cmsg。空なら null・長さ 0。
+            // いずれもこの関数のスタック上の値か呼び出し元の借用で、呼び出しの間有効。`msg_name` は null・長さ 0。
+            // カーネルは各 fd の複製を受け手に作るだけで、呼び出し側の fd の所有権は動かない。
+            // 本モジュールは LP64 の x86_64 / aarch64 でのみコンパイルされる。
             let rc = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, MSG_NOSIGNAL) };
             let n = check(rc as i64)?;
             usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))
@@ -1100,14 +1126,15 @@ mod control_ffi {
             assert!(offset_of!(Cmsghdr, cmsg_type) == offset_of!(libc::cmsghdr, cmsg_type));
         };
 
-        // 対象外: `ControlOne`・`ControlBuf`・`RECV_CONTROL_LEN` は制御メッセージの入れ物と本実装の上限で、`libc` に
-        // 対応物が無い（`libc::CMSG_SPACE` は `const unsafe fn` で、照合のために `unsafe` を足さない）。`cmsghdr` に対する
-        // 整列と、`ControlOne` のデータ部が `CMSG_DATA`（ヘッダの直後。LP64 で 16 バイト目）に来ることだけを確かめる。
+        // 対象外: `ControlFds`・`ControlBuf`・`RECV_CONTROL_LEN`・`MAX_SEND_FDS` は制御メッセージの入れ物と本実装の上限で、
+        // `libc` に対応物が無い（`libc::CMSG_SPACE` は `const unsafe fn` で、照合のために `unsafe` を足さない。
+        // `cmsg_len`・`cmsg_space` の具体値は単体テストが照合する）。`cmsghdr` に対する整列と、`ControlFds` のデータ部が
+        // `CMSG_DATA`（ヘッダの直後。LP64 で 16 バイト目）に来ることだけを確かめる。
         const _: () = {
-            assert!(align_of::<ControlOne>() >= align_of::<libc::cmsghdr>());
+            assert!(align_of::<ControlFds>() >= align_of::<libc::cmsghdr>());
             assert!(align_of::<ControlBuf>() >= align_of::<libc::cmsghdr>());
-            assert!(offset_of!(ControlOne, hdr) == 0);
-            assert!(offset_of!(ControlOne, fd) == size_of::<libc::cmsghdr>());
+            assert!(offset_of!(ControlFds, hdr) == 0);
+            assert!(offset_of!(ControlFds, fds) == size_of::<libc::cmsghdr>());
         };
 
         // `sendmsg`・`recvmsg`。自前は `Msghdr` を指すため、ポインタ先の型を別々に書く（`Msghdr` の同一性は上の構造体の
@@ -1155,10 +1182,10 @@ mod control_ffi {
         Err(unsupported_control())
     }
 
-    pub(super) fn send_with_fd(
+    pub(super) fn send_with_fds(
         _sock: std::os::fd::BorrowedFd<'_>,
         _data: &[u8],
-        _fd: std::os::fd::BorrowedFd<'_>,
+        _fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> io::Result<usize> {
         Err(unsupported_control())
     }
@@ -1190,7 +1217,19 @@ pub(crate) fn send_with_fd(
     data: &[u8],
     fd: BorrowedFd<'_>,
 ) -> io::Result<usize> {
-    control_ffi::send_with_fd(sock, data, fd)
+    control_ffi::send_with_fds(sock, data, &[fd])
+}
+
+/// `data` を送り、`fds`（最大 4 本。空なら制御メッセージなし）を `SCM_RIGHTS` で添える
+/// （`sendmsg(2)`。`MSG_NOSIGNAL`）。stream-exec の channel の複数 fd 送信（#3759・SUP-6）。送れたバイト数を返す
+/// （短い書き込みは呼び出し側が残りを fd なしで書く）。上限超は `InvalidInput`、`EINTR` は `Interrupted` のまま返す。
+/// LP64 の x86_64 / aarch64 以外は `Unsupported`（#2140）。
+pub(crate) fn send_with_fds(
+    sock: BorrowedFd<'_>,
+    data: &[u8],
+    fds: &[BorrowedFd<'_>],
+) -> io::Result<usize> {
+    control_ffi::send_with_fds(sock, data, fds)
 }
 
 /// 最大 `buf.len()` バイトと添えられた fd（最大 4 本）を 1 回で受ける（`recvmsg(2)`。close-on-exec）。
@@ -1465,6 +1504,53 @@ mod tests {
     #[test]
     fn sup14_task171_1_3_capability_version_is_fixed() {
         assert_eq!(LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
+    }
+
+    /// SUP-6・#3759: `SCM_RIGHTS` の制御メッセージ長（`CMSG_LEN` / `CMSG_SPACE`）を具体値で固定する。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_cmsg_len_and_space_concrete_values() {
+        let got: Vec<(usize, usize)> = (0..=4)
+            .map(|n| (control_ffi::cmsg_len(n), control_ffi::cmsg_space(n)))
+            .collect();
+        assert_eq!(got, vec![(16, 16), (20, 24), (24, 24), (28, 32), (32, 32)]);
+        assert_eq!(control_ffi::MAX_SEND_FDS, 4);
+    }
+
+    /// SUP-6・#3759: 複数 fd の送信（上限超は syscall 前に拒否・4 本・0 本）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_send_with_fds_rejects_over_limit_and_passes_many() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let (a, b) = UnixStream::pair().unwrap();
+        for s in [&a, &b] {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let five = [null.as_fd(); 5];
+        assert_eq!(
+            send_with_fds(a.as_fd(), b"x", &five).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let four = [null.as_fd(); control_ffi::MAX_SEND_FDS];
+        assert_eq!(send_with_fds(a.as_fd(), b"abc", &four).unwrap(), 3);
+        let mut buf = [0u8; 8];
+        let got = recv_with_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!((got.len, got.fds.len(), got.truncated), (3, 4, false));
+        assert!(got.fds.iter().all(|f| f.as_raw_fd() != null.as_raw_fd()));
+        // fd 0 本は制御メッセージを付けない。
+        assert_eq!(send_with_fds(a.as_fd(), b"z", &[]).unwrap(), 1);
+        let got = recv_with_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!((got.len, got.fds.len()), (1, 0));
     }
 
     /// REPAIR-5・SUP-1: 制御チャネル用 FFI 構造体の大きさと時計の単調性を固定する。

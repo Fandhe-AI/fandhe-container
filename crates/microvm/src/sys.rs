@@ -194,6 +194,9 @@ pub(crate) mod consts {
     pub const KVM_CAP_IRQCHIP: super::KvmCap = super::KvmCap(0);
     pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(32);
     pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(36);
+    /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(10);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -274,6 +277,9 @@ pub(crate) mod consts {
     pub const KVM_CAP_IRQCHIP: super::KvmCap = super::KvmCap(0);
     pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(32);
     pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(36);
+    /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(10);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -311,6 +317,9 @@ pub(crate) mod consts {
     pub const KVM_IOEVENTFD: u64 = 0;
     pub const KVM_CAP_IRQFD: super::KvmCap = super::KvmCap(0);
     pub const KVM_CAP_IOEVENTFD: super::KvmCap = super::KvmCap(0);
+    /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(0);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 0;
@@ -2722,6 +2731,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(KvmIoeventfd, len), 16);
         assert_eq!(consts::KVM_CAP_IRQFD.0, 32);
         assert_eq!(consts::KVM_CAP_IOEVENTFD.0, 36);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(consts::KVM_CAP_NR_MEMSLOTS.0, 10);
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -30,8 +30,7 @@
 //!
 //! 範囲外（REPAIR-3）: ioeventfd の結線（QueueNotify は MMIO exit → dispatcher の経路で受ける）・
 //! MSR / FPU の設定（CPUID は #3733 で vCPU ごとに設定済み。実カーネルの起動完走に必要。#886 以降の追跡事項）・一時停止（pause）・
-//! 複数のメモリ領域（RAM は GPA 0 からの単一領域で
-//! [`VIRTIO_MMIO_BASE`] 未満に制限）。複数 vCPU の exit 処理は 1 つの Mutex で直列にする簡易実装で、デバイス単位の並行は範囲外。
+//! 複数 vCPU の exit 処理は 1 つの Mutex で直列にする簡易実装で、デバイス単位の並行は範囲外。
 //!
 //! # 起動と停止（TASK-75.4.1・#886）
 //! [`MicroVm::start`] が vCPU 0 を初期化し、vCPU ごとの専用スレッド（`microvm-vcpu-<n>`）で実行ループを始め、
@@ -87,8 +86,14 @@
 //! そのため size・GPA は ioctl の前にすべて検証し、slot は `u16` で受ける（KVM は上位 16 bit を address space id に使う）。
 //!
 //! # 範囲外（REPAIR-3）
-//! 複数領域（MMIO hole・4 GiB をまたぐ x86_64 の配置）・`KVM_CAP_NR_MEMSLOTS` による slot 上限の照会・
-//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・カーネルのロード（TASK-75.3）は未実装。
+//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・ゲストの物理アドレス幅（CPUID leaf 0x8000_0008）と最上位 GPA の照合・
+//! e820 での IOAPIC / LAPIC / MMIO hole の予約表記は未実装（複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697 で実装済み。下記）。
+//!
+//! # 複数領域（#3697・MVM-1）
+//! x86_64 は RAM を MMIO hole `[X86_LOW_RAM_LIMIT, 4 GiB)` の前後に分け、領域ごとに別の memslot（slot = 領域の index）で登録する
+//! （`plan_ram_regions_x86`・[`register_ram_regions`]）。slot の上限は登録の前に `KVM_CAP_NR_MEMSLOTS` で確かめ、足りなければ
+//! `ResourceExhausted`。aarch64 の RAM は hole が無いので 1 領域のまま同じ経路を通る。macOS（HVF）は 1 領域。
+//! e820 は登録した領域の一覧から作る（`boot_x86::plan_boot`）。判断記録は docs/design/microvm-memory-ownership.md。
 //!
 //! # 寿命
 //! [`RegisteredGuestRam`] は VM fd を dup して持つ（`'vm` の借用を持たないので、VM 構成体が VM fd と一緒に保持できる）。
@@ -126,7 +131,9 @@ use crate::dispatch::{
 };
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::exit::VcpuExit;
-use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
+use crate::guest_memory::{
+    GuestAddress, GuestMemory, GuestMemoryBacking, GuestMemoryRegion, MAX_GUEST_MEMORY_REGIONS,
+};
 use crate::interrupt::{
     BlockNotifyReport, InterruptLine, IrqTrigger, LevelInterruptLine, NetNotifyReport,
     NetRxPollOutcome, complete_block_notify, complete_net_notify, poll_net_rx,
@@ -224,6 +231,17 @@ fn ram_align() -> Result<u64, MicrovmError> {
     let host = sys::host_page_size().map_err(|e| classify_ram_error(RamStage::Mmap, e))?;
     Ok(host.max(GUEST_RAM_ALIGN))
 }
+
+/// x86_64 の低位 RAM の上限（MMIO hole の下端。virtio-mmio・IOAPIC・LAPIC・KVM 内部領域が `[ここ, 4 GiB)` に入る。#3697）。
+pub const X86_LOW_RAM_LIMIT: u64 = VIRTIO_MMIO_BASE;
+/// x86_64 で `X86_LOW_RAM_LIMIT` を超えた分の RAM を置く先頭（4 GiB。#3697）。
+pub const X86_HIGH_RAM_BASE: u64 = GPA_4GIB;
+const _: () = assert!(X86_LOW_RAM_LIMIT <= VIRTIO_MMIO_BASE);
+const _: () = assert!(TSS_ADDR + TSS_LEN <= X86_HIGH_RAM_BASE);
+// 16 / 64 KiB ページのホストでも領域の境界が整列するように（`mem_size` が整列単位の倍数なら、領域の長さも倍数になる）。
+const _: () = assert!(
+    X86_LOW_RAM_LIMIT.is_multiple_of(64 * 1024) && X86_HIGH_RAM_BASE.is_multiple_of(64 * 1024)
+);
 
 /// RAM サイズの検証（副作用なし）。`GuestRam::new` と `MicroVm::assemble` の ioctl 前検証が共有する。
 fn validate_ram_size(size: u64, align: u64) -> Result<(), MicrovmError> {
@@ -354,6 +372,17 @@ impl GuestRam {
         slot: u16,
         base: GuestAddress,
     ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
+        let registered = self.register_backing(vm, slot, base)?;
+        GuestMemory::new(base, registered)
+    }
+
+    /// [`GuestRam::register`] の本体。KVM に登録して backing だけを返す（複数領域の組み立て用。#3697）。
+    pub(crate) fn register_backing(
+        self,
+        vm: &VmFd,
+        slot: u16,
+        base: GuestAddress,
+    ) -> Result<RegisteredGuestRam, MicrovmError> {
         if !base.raw().is_multiple_of(ram_align()?) {
             return Err(invalid(
                 "guest address must be a multiple of the host page size (at least 4096)",
@@ -370,12 +399,11 @@ impl GuestRam {
         })?;
         sys::register_guest_ram(vm_fd.as_fd(), u32::from(slot), base.raw(), &self.map)
             .map_err(|e| classify_ram_error(RamStage::Register, e))?;
-        let registered = RegisteredGuestRam {
+        Ok(RegisteredGuestRam {
             vm: vm_fd,
             slot,
             map: Some(self.map),
-        };
-        GuestMemory::new(base, registered)
+        })
     }
 }
 
@@ -472,7 +500,8 @@ pub struct NetDeviceConfig<N> {
 pub struct MicroVmConfig<B, N> {
     /// vCPU 数（1..=[`MAX_VCPUS`]）。
     pub vcpu_count: u32,
-    /// ゲスト RAM のサイズ（GPA 0 から。[`VIRTIO_MMIO_BASE`] 以下）。
+    /// ゲスト RAM の総バイト数。x86_64 は GPA 0 から [`X86_LOW_RAM_LIMIT`] まで置き、超えた分を [`X86_HIGH_RAM_BASE`] から置く
+    /// （#3697。MMIO hole は RAM にしない）。aarch64 は `ARM64_RAM_BASE` からの 1 領域。
     pub mem_size: u64,
     /// virtio-block の backend（先に配置される）。
     pub block: Vec<B>,
@@ -522,14 +551,97 @@ fn plan_layout(
     if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
         return Err(invalid("vcpu count out of range"));
     }
-    validate_ram_size(mem_size, ram_align()?)?;
-    if mem_size > VIRTIO_MMIO_BASE {
-        return Err(invalid("guest memory overlaps the virtio-mmio window"));
-    }
+    let ram = plan_ram_regions_x86(mem_size)?;
     let slots = layout_slots(block_count, net_count)?;
-    let (reserved, occupied) = system_regions(mem_size, &slots)?;
+    let (reserved, occupied) = system_regions(&ram, &slots)?;
+    check_occupied_disjoint(&occupied)?;
     check_reserved_regions(&reserved, &occupied)?;
     Ok(slots)
+}
+
+/// x86_64 の RAM を MMIO hole の前後の領域に分ける（KVM 不要の純粋関数。#3697・MVM-1）。
+///
+/// `mem_size` のうち `X86_LOW_RAM_LIMIT` までを `[0, ..)` に、超えた分を `X86_HIGH_RAM_BASE` から置く。
+/// サイズは `validate_ram_size` で検証する（0・非整列・`MAX_GUEST_RAM_BYTES` 超は `InvalidArgument`）。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn plan_ram_regions_x86(mem_size: u64) -> Result<Vec<GuestMemoryRegion>, MicrovmError> {
+    validate_ram_size(mem_size, ram_align()?)?;
+    let low = mem_size.min(X86_LOW_RAM_LIMIT);
+    let mut regions = vec![GuestMemoryRegion {
+        base: GuestAddress::new(0),
+        len: low,
+    }];
+    let high = mem_size
+        .checked_sub(low)
+        .ok_or_else(|| invalid("guest memory size too large"))?;
+    if high != 0 {
+        regions.push(GuestMemoryRegion {
+            base: GuestAddress::new(X86_HIGH_RAM_BASE),
+            len: high,
+        });
+    }
+    Ok(regions)
+}
+
+/// 使用中の領域（RAM・MMIO の窓）が互いに重ならないことを確かめる（KVM 不要の純粋関数。#3697）。
+/// 以前は `mem_size <= VIRTIO_MMIO_BASE` で暗に保証していた。違反は `InvalidArgument`（値は載せない）。
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn check_occupied_disjoint(occupied: &[Region]) -> Result<(), MicrovmError> {
+    for (i, (kind, range)) in occupied.iter().enumerate() {
+        for (other_kind, other) in occupied.iter().take(i) {
+            if range.overlaps(*other) {
+                return Err(MicrovmError::new(
+                    MicrovmErrorCode::InvalidArgument,
+                    format!("{} overlaps {}", kind.as_str(), other_kind.as_str()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 領域数が KVM の memslot 上限に収まるか確かめる（#3697）。足りなければ `ResourceExhausted`。
+fn check_memslot_capacity(needed: usize, max: u32) -> Result<(), MicrovmError> {
+    if u64::try_from(needed).map_or(true, |n| n > u64::from(max)) {
+        return Err(MicrovmError::new(
+            MicrovmErrorCode::ResourceExhausted,
+            "guest memory needs more memslots than KVM supports",
+        ));
+    }
+    Ok(())
+}
+
+/// `regions` を領域ごとに別の memslot（slot = 領域の index）で確保・登録する（#3697・MVM-1）。
+///
+/// 件数を `MAX_GUEST_MEMORY_REGIONS` で、slot 数を `KVM_CAP_NR_MEMSLOTS` で、mmap の前に検証する。途中で失敗したら
+/// それまでに登録した領域は Vec ごと drop され、slot の削除と munmap が済む（削除に失敗した領域は漏らす fail-closed）。
+pub fn register_ram_regions(
+    vm: &VmFd,
+    regions: &[GuestMemoryRegion],
+) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
+    if regions.is_empty() || regions.len() > MAX_GUEST_MEMORY_REGIONS {
+        return Err(invalid("invalid number of guest memory regions"));
+    }
+    check_memslot_capacity(regions.len(), vm.max_user_memslots()?)?;
+    let mut registered = Vec::with_capacity(regions.len());
+    for (i, r) in regions.iter().enumerate() {
+        let slot = u16::try_from(i).map_err(|_| invalid("too many guest memory regions"))?;
+        let backing = GuestRam::new(r.len)?.register_backing(vm, slot, r.base)?;
+        registered.push((r.base, backing));
+    }
+    GuestMemory::from_regions(registered)
+}
+
+/// 先頭の領域（GPA 0 から。カーネル・boot_params・SIPI の置き場）の長さ。先頭が GPA 0 でなければ `Internal`。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn low_ram_len<B: GuestMemoryBacking>(memory: &GuestMemory<B>) -> Result<u64, MicrovmError> {
+    match memory.regions().first() {
+        Some(r) if r.base == GuestAddress::new(0) => Ok(r.len),
+        _ => Err(MicrovmError::new(
+            MicrovmErrorCode::Internal,
+            "guest memory does not start at GPA 0",
+        )),
+    }
 }
 
 /// KVM の vGIC の SPI 範囲の下限 INTID（SPI は INTID 32 から。`GICD` の private 割り込みの次）。
@@ -693,10 +805,16 @@ fn check_reserved_regions(reserved: &[Region], occupied: &[Region]) -> Result<()
 /// 実際の構成から `check_reserved_regions` へ渡す `(reserved, occupied)` を組む。
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn system_regions(
-    mem_size: u64,
+    ram: &[GuestMemoryRegion],
     slots: &[DeviceSlot],
 ) -> Result<(Vec<Region>, Vec<Region>), MicrovmError> {
-    let mut occupied = vec![(RegionKind::GuestMemory, GuestRange::new(0, mem_size)?)];
+    let mut occupied = Vec::with_capacity(ram.len() + slots.len() + 2);
+    for r in ram {
+        occupied.push((
+            RegionKind::GuestMemory,
+            GuestRange::new(r.base.raw(), r.len)?,
+        ));
+    }
     for s in slots {
         occupied.push((
             RegionKind::VirtioMmio,
@@ -1071,6 +1189,7 @@ impl<B: BlockBackend, N: NetBackend> std::fmt::Debug for MicroVm<B, N> {
         f.debug_struct("MicroVm")
             .field("vcpus", &self.vcpus.len())
             .field("memory_len", &self.memory.len())
+            .field("memory_regions", &self.memory.regions().len())
             .field("devices", &self.devices.infos())
             .finish()
     }
@@ -1121,7 +1240,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             config.net.len(),
         )?;
         let vm = kvm.create_vm()?;
-        let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, layout.ram.base)?;
+        let memory = register_ram_regions(
+            &vm,
+            &[GuestMemoryRegion {
+                base: layout.ram.base,
+                len: config.mem_size,
+            }],
+        )?;
         let mut vcpus = Vec::with_capacity(config.vcpu_count as usize);
         for i in 0..config.vcpu_count {
             // vCPU 0 は RUNNABLE、AP は POWER_OFF で作り、ゲストの PSCI CPU_ON（カーネル内で処理）まで眠らせる（#3899）。
@@ -1182,6 +1307,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             config.block.len(),
             config.net.len(),
         )?;
+        let ram = plan_ram_regions_x86(config.mem_size)?;
         let vm = kvm.create_vm()?;
         vm.create_irqchip()?;
         // KVM 内部領域（identity map・TSS）は vCPU の作成前に置く。位置の重なりは plan_layout で検証済み（#3732）。
@@ -1190,7 +1316,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
             vm.set_identity_map_addr(IDENTITY_MAP_ADDR)?;
             vm.set_tss_addr(TSS_ADDR)?;
         }
-        let memory = GuestRam::new(config.mem_size)?.register(&vm, 0, GuestAddress::new(0))?;
+        let memory = register_ram_regions(&vm, &ram)?;
         // COM1（IRQ 4）の UART の割り込みは KVM_IRQ_LINE の level 線で結ぶ（x86_64。irqchip の後。#3918）。
         #[cfg(target_arch = "x86_64")]
         let com1_line: Option<Arc<dyn LevelInterruptLine>> =
@@ -1381,7 +1507,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     fn setup_boot_vcpu_inner(&mut self, loaded: &LoadedKernel) -> Result<(), MicrovmError> {
         #[cfg(target_arch = "x86_64")]
         {
-            check_loaded_within(loaded, self.memory.len())?;
+            check_loaded_within(loaded, low_ram_len(&self.memory)?)?;
             let state = BootCpuState::for_kernel(loaded)?;
             let vcpu = self.vcpus.first_mut().ok_or_else(|| {
                 MicrovmError::new(
@@ -1471,7 +1597,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
     ) -> Result<GuestAddress, MicrovmError> {
         #[cfg(target_arch = "x86_64")]
         {
-            let (start, _end) = sipi_startup_range(vector, code.len(), self.memory.len())?;
+            let (start, _end) = sipi_startup_range(vector, code.len(), low_ram_len(&self.memory)?)?;
             let addr = GuestAddress::new(start);
             self.memory.write_at(addr, code)?;
             Ok(addr)
@@ -3713,15 +3839,106 @@ mod assemble_tests {
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn rg(base: u64, len: u64) -> GuestMemoryRegion {
+        GuestMemoryRegion {
+            base: GuestAddress::new(base),
+            len,
+        }
+    }
+
+    /// MVM-1・#3697: x86_64 の RAM は MMIO hole の前後の領域に分かれ、各領域は hole と重ならない（具体値）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mvm1_3697_plan_ram_regions_x86_values() {
+        const G: u64 = 1 << 30;
+        assert_eq!(plan_ram_regions_x86(2 << 20).unwrap(), vec![rg(0, 2 << 20)]);
+        assert_eq!(
+            plan_ram_regions_x86(VIRTIO_MMIO_BASE).unwrap(),
+            vec![rg(0, 0xd000_0000)]
+        );
+        assert_eq!(
+            plan_ram_regions_x86(VIRTIO_MMIO_BASE + 0x1000).unwrap(),
+            vec![rg(0, 0xd000_0000), rg(0x1_0000_0000, 0x1000)]
+        );
+        assert_eq!(
+            plan_ram_regions_x86(5 * G).unwrap(),
+            vec![rg(0, 0xd000_0000), rg(0x1_0000_0000, 0x7000_0000)]
+        );
+        assert_eq!(
+            plan_ram_regions_x86(6 * G).unwrap(),
+            vec![rg(0, 0xd000_0000), rg(0x1_0000_0000, 0xb000_0000)]
+        );
+        assert_eq!(
+            plan_ram_regions_x86(16 * G).unwrap(),
+            vec![rg(0, 0xd000_0000), rg(0x1_0000_0000, 0x3_3000_0000)]
+        );
+        for r in plan_ram_regions_x86(16 * G).unwrap() {
+            let end = r.base.raw() + r.len;
+            assert!(end <= X86_LOW_RAM_LIMIT || r.base.raw() >= X86_HIGH_RAM_BASE);
+        }
+        assert!(plan_ram_regions_x86(16 * G + 4096).is_err());
+        assert!(plan_ram_regions_x86(0).is_err());
+    }
+
+    /// MVM-1・#3697: memslot 数の上限超過は `ResourceExhausted`、上限ちょうどは通る。
+    #[test]
+    fn mvm1_3697_check_memslot_capacity() {
+        let e = check_memslot_capacity(2, 1).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::ResourceExhausted);
+        assert_eq!(
+            e.message(),
+            "guest memory needs more memslots than KVM supports"
+        );
+        assert!(check_memslot_capacity(2, 2).is_ok());
+        assert!(check_memslot_capacity(1, 32764).is_ok());
+        assert!(check_memslot_capacity(1, 0).is_err());
+    }
+
+    /// MVM-1・#3697: RAM と MMIO の窓の重なりを拒否する（隣接は通り、1 バイトの重なりは拒否）。
+    #[test]
+    fn mvm1_3697_occupied_regions_must_not_overlap() {
+        let ram = |len: u64| (RegionKind::GuestMemory, gr(0, len));
+        let ioapic = || (RegionKind::Ioapic, gr(IOAPIC_MMIO_BASE, IOAPIC_MMIO_LEN));
+        assert!(check_occupied_disjoint(&[ram(IOAPIC_MMIO_BASE), ioapic()]).is_ok());
+        let e = check_occupied_disjoint(&[ram(IOAPIC_MMIO_BASE + 1), ioapic()]).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::InvalidArgument);
+        // 後ろの要素（ioapic）が前の要素（ram）と重なる形で報告される。
+        assert!(e.message().ends_with("overlaps guest memory"));
+    }
+
+    /// MVM-1・#3697: 先頭の領域の長さだけが low RAM として扱われる（hole を挟む総バイト数では緩めない）。
+    #[test]
+    fn mvm1_3697_low_ram_len_is_first_region() {
+        use crate::guest_memory::HeapBacking;
+        let m = GuestMemory::from_regions(vec![
+            (GuestAddress::new(0), HeapBacking::new(0x2000).unwrap()),
+            (
+                GuestAddress::new(0x1_0000_0000),
+                HeapBacking::new(0x4000).unwrap(),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(m.len(), 0x6000);
+        assert_eq!(low_ram_len(&m).unwrap(), 0x2000);
+        let off =
+            GuestMemory::new(GuestAddress::new(0x1000), HeapBacking::new(0x1000).unwrap()).unwrap();
+        assert_eq!(
+            low_ram_len(&off).unwrap_err().code(),
+            MicrovmErrorCode::Internal
+        );
+    }
     /// MVM-1・TASK-75.2: 不正な構成は ioctl の前に `InvalidArgument`、境界は通る。
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn mvm1_697_plan_layout_rejects_invalid_config() {
         assert_plan_err(plan_layout(0, 4096, 0, 0), "vcpu count out of range");
         assert_plan_err(plan_layout(33, 4096, 0, 0), "vcpu count out of range");
+        // #3697: hole を超える RAM は 4 GiB 以上の 2 領域目に分かれて受理される（以前は拒否）。
+        assert!(plan_layout(1, VIRTIO_MMIO_BASE + 4096, 0, 0).is_ok());
         assert_plan_err(
-            plan_layout(1, VIRTIO_MMIO_BASE + 4096, 0, 0),
-            "guest memory overlaps the virtio-mmio window",
+            plan_layout(1, MAX_GUEST_RAM_BYTES + 4096, 0, 0),
+            "guest memory size too large",
         );
         assert_plan_err(plan_layout(1, 4096, 5, 4), "too many virtio devices");
         assert_plan_err(
@@ -3845,7 +4062,14 @@ mod assemble_tests {
     fn mvm1_3732_default_layout_passes() {
         assert!(plan_layout(32, VIRTIO_MMIO_BASE, 8, 0).is_ok());
         assert!(plan_layout(1, 1 << 28, 1, 1).is_ok());
-        let (reserved, _) = system_regions(4096, &[]).unwrap();
+        let (reserved, _) = system_regions(
+            &[GuestMemoryRegion {
+                base: GuestAddress::new(0),
+                len: 4096,
+            }],
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             reserved,
             vec![

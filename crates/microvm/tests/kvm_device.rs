@@ -677,6 +677,62 @@ fn kvm_device_assemble_microvm() {
     );
 }
 
+/// MVM-1・#3697: 5 GiB の RAM が MMIO hole をまたがない 2 領域（別の memslot）で登録され、高位領域の読み書きができ、
+/// hole とまたぎのアクセスが拒否されることを実 KVM で確かめる（x86_64）。`MAP_NORESERVE` のため実際に使うのは触ったページだけ。
+/// 残余: overcommit が厳しいホストでは mmap が `ResourceExhausted` になりうる（その場合は前提欠如として扱う）。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_assemble_microvm_high_memory() {
+    use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemoryRegion};
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let dev = open_kvm();
+    for _ in 0..2 {
+        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 5 << 30,
+            block: vec![],
+            net: vec![],
+        };
+        let mut vm = MicroVm::assemble(&dev, config).unwrap();
+        let region = |base: u64, len: u64| GuestMemoryRegion {
+            base: GuestAddress::new(base),
+            len,
+        };
+        assert_eq!(
+            vm.memory().regions(),
+            vec![region(0, 0xd000_0000), region(0x1_0000_0000, 0x7000_0000)]
+        );
+        assert_eq!(vm.memory().len(), 5 << 30);
+        assert!(vm.vm().max_user_memslots().unwrap() >= 2);
+        let mem = vm.memory_mut();
+        mem.write_u32_le(GuestAddress::new(0x1_0000_0000), 0x1122_3344)
+            .unwrap();
+        mem.write_u32_le(GuestAddress::new(0x1_6FFF_FFFC), 0x5566_7788)
+            .unwrap();
+        assert_eq!(
+            mem.read_u32_le(GuestAddress::new(0x1_0000_0000)).unwrap(),
+            0x1122_3344
+        );
+        assert_eq!(
+            mem.read_u32_le(GuestAddress::new(0x1_6FFF_FFFC)).unwrap(),
+            0x5566_7788
+        );
+        // hole の中と、低位領域の末尾をまたぐ範囲は拒否される。
+        for addr in [0xd000_0000u64, 0xCFFF_FFFE, 0xFFFF_FFFC] {
+            let mut b = [0u8; 4];
+            assert_eq!(
+                mem.read_at(GuestAddress::new(addr), &mut b)
+                    .unwrap_err()
+                    .code(),
+                MicrovmErrorCode::InvalidArgument
+            );
+        }
+    }
+}
 /// MVM-1・TASK-75.3.1: 組み立て済みの VM へ合成 bzImage と initrd をロードし、zero page・cmdline・payload・initrd を
 /// ゲストメモリから読み戻して照合する（x86_64）。実カーネルの起動は #885・#886 の範囲。
 #[cfg(target_arch = "x86_64")]

@@ -25,8 +25,8 @@ pub use gic::{GicSerialLine, GicSpiLine, HvfGic, VmWithGic};
 // TASK-192.15・#3797: microVM 構成体（VM・GIC・ゲスト RAM・virtio-mmio・vCPU 0 の起動レジスタの組み立て）。
 pub mod microvm;
 pub use microvm::{
-    HvfDeviceInfo, HvfDeviceKind, HvfMicroVm, HvfMicroVmConfig, HvfNetDeviceConfig,
-    RunningHvfMicroVm,
+    HvfDeviceInfo, HvfDeviceKind, HvfInterruptAckCounts, HvfMicroVm, HvfMicroVmConfig,
+    HvfNetDeviceConfig, RunningHvfMicroVm,
 };
 // TASK-192.16・#3798: start / stop と解放順序（OS 非依存コアは `crate::hvf_lifecycle`）。
 pub use crate::hvf_lifecycle::HvfStopReport;

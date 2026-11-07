@@ -34,7 +34,7 @@
 //! Linux の `STOP_DEADLINE_MAX` と同じ）つきで止める。start しないまま drop すると、ゲストは一度も走らずに終わる。
 //! 終了理由は Linux と共有の `StopReason`（`stop` の `Requested`、PSCI の SYSTEM_OFF・SYSTEM_RESET は `GuestShutdown`、未対応・未知の
 //! exit は fail-closed の `Failed(Unimplemented / Internal)`）で、[`HvfStopReport`] に載せる。
-//! exit ごとの処理は `hvf::{mmio, hvc, timer}`（#3793・#3794・#3796）が担い、WFI の待ちの上限など残る制限は `hvf::timer` の「未実装・簡易実装」を参照。
+//! exit ごとの処理は `hvf::{mmio, hvc}`（#3793・#3794）が担う。WFI の exit・vtimer の exit は GIC つきでは来ず、来たら `Failed(Unimplemented)` で止める（#4039・#3995）。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
 //! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを全台起こす `WfiWakeSet` の通知。#3887・#3948。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
@@ -83,11 +83,12 @@
 //! 巻き戻り（panic）時の drop 順は保証しない。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、全体の追跡は #3908。
+//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の QueueNotify（送信と
+//!   ゲストの kick による受信）も #4029 で結線済み。ホスト側の到着を契機にした受信は #4030、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   全体の追跡は #3908。
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
 //!   [`HvfMicroVm::interrupt_ack_counts`] で読む。
-//! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
+//! - PSCI は #3794 で実装済み（WFI / vtimer は #4039 で処理を消し fail-closed）。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否（合成 Image は無しで起動した。#3803。実カーネルは #3988）。
 //! - Image の署名・digest の検証は本層の責務ではない（plugin-microvm 側。PLUG-11）。構成値・パスはエラーに載せない（ERR-1）。
@@ -109,7 +110,6 @@ use crate::hvf::gic::{GicSpiLine, VmWithGic};
 use crate::hvf::hvc::HvcHandler;
 use crate::hvf::memory::{HvfGuestRam, RegisteredHvfRam};
 use crate::hvf::mmio::MmioHandler;
-use crate::hvf::timer::TimerHandler;
 use crate::hvf::vcpu::{ExitHandlers, VcpuSet, VcpuThread, VcpuThreadConfig};
 use crate::hvf_abi::{HvReg, HvSysReg, HvfAssembleInput, check_assemble_input};
 use crate::hvf_lifecycle::{
@@ -120,7 +120,7 @@ use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
 use crate::interrupt::{
     BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
-    InterruptLine, QueueNotifyRoute,
+    InterruptLine, NetQueueNotifyRoute, QueueNotifyRoute,
 };
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
@@ -388,22 +388,28 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
     ///
     /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
     /// clone で受け渡す（`HvfVmParts::release` が停止確認後に取り出すため、解放後の通知は `Internal` で fail-closed）。
-    /// virtio-net の route は #4029 の担当で、それまで net は計数だけで続行する（REPAIR-3）。
+    /// virtio-net の台にも同じ形で route を作る（#4029。送信とゲストの kick による受信まで。ホスト側の到着による受信は #4030。REPAIR-3）。
     fn queue_notify_routes(
         &self,
         memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
     ) -> Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)> {
-        self.block
-            .iter()
-            .map(|d| {
-                let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
-                    Arc::clone(&d.transport),
-                    memory.clone(),
-                    d.line.clone(),
-                ));
-                (d.id, route)
-            })
-            .collect()
+        let b = self.block.iter().map(|d| {
+            let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
+                Arc::clone(&d.transport),
+                memory.clone(),
+                d.line.clone(),
+            ));
+            (d.id, route)
+        });
+        let n = self.net.iter().map(|d| {
+            let route: Arc<dyn QueueNotifyRoute> = Arc::new(NetQueueNotifyRoute::new(
+                Arc::clone(&d.transport),
+                memory.clone(),
+                d.line.clone(),
+            ));
+            (d.id, route)
+        });
+        b.chain(n).collect()
     }
 
     /// 全デバイスの SPI の宛先のヒント（vCPU ごとの `AckRouteLearner` が ACK を処理した vCPU を書く。#3948）。
@@ -646,7 +652,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .with_queue_notify_routes(queue_routes.clone())
                     .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
-                timer: TimerHandler::new(),
                 // 期限切れで切り離した後の回収を、このスレッドの終了に任せる（#4032。全 vCPU が持つ）。
                 guest_memory: Some(memory.clone()),
             },
@@ -674,7 +679,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                             .with_queue_notify_routes(queue_routes.clone())
                             .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
                         hvc,
-                        timer: TimerHandler::new(),
                         guest_memory: Some(memory.clone()),
                     };
                     VcpuThread::spawn_parked_ap(

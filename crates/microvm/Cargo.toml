@@ -1,4 +1,5 @@
 # KVM 直接制御・最小 virtio デバイスモデル（Linux オプション。crate-naming.md の表 #8）。
+# #4029 で interrupt に NetQueueNotifyRoute を追加し hvf::microvm の queue_notify_routes へ net を結ぶ（依存は増やさない。unsafe なし）。
 # #4027 で hvf::microvm の HvfVmParts.memory を GuestMemorySlot へ移す（依存は増やさない。unsafe なし）。
 # #4026 で interrupt に QueueNotifyRoute と BlockQueueNotifyRoute を追加し QueueNotifyReport を interrupt へ移す（依存は増やさない。unsafe なし）。
 # #4025 で guest_memory_slot（ゲスト RAM を複数スレッドで共有するスロット型。OS 非依存）を追加（依存は増やさない。unsafe なし）。
@@ -19,6 +20,7 @@
 # TASK-192.9（#3791）で hvf_loop・stop・hvf/vcpu.rs とスタブ（mmio・hvc・timer）を追加（依存は増やさない。unsafe なし）。
 # TASK-192.14（#3796）で hvf_abi に WFI の待ち時間の純関数、hvf/timer.rs の実装、sys/hvf.rs に mach_absolute_time / mach_timebase_info を追加（依存は増やさない。unsafe は sys/hvf.rs のみ）。
 # #3885 で sys/hvf.rs に host_timebase・host_absolute_time の単体試験と hvf_abi の HostTimebase の numer / denom を追加（依存は増やさない。unsafe 追加なし）。
+# #4039 で WFI の待ちと vtimer の処理（hvf/timer.rs・hvf_abi の純関数・sys/hvf.rs の mach_* と vtimer の宣言）を削除した（依存は増やさない。unsafe は削除のみ）。
 # TASK-74.1.2 で vCPU 作成（KVM_CREATE_VCPU・aarch64 の初期化）を追加（依存は増やさない）。
 # #3696 で KVM aarch64 の vGICv3・irqfd・組み立て・起動レジスタを追加（依存は増やさない。unsafe は sys.rs のみ）。
 # TASK-74.4.1 で KVM_RUN・kvm_run の mmap・VM exit の型（exit.rs）を追加（依存は増やさない）。

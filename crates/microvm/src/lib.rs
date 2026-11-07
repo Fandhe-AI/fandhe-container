@@ -41,7 +41,8 @@
 //! ホストが取り出す（`uart::SerialConsole`・`microvm::{MicroVm, RunningMicroVm}::serial_console`）。ゲスト入力は受信 FIFO あり（#3893）、x86 の IRQ 4 は未実装。
 //! #3735・MVM-1: BSP の LAPIC の LVT LINT0 = ExtINT・LINT1 = NMI（`lapic_x86`・`device::VcpuFd::{set_boot_lints, lapic_lints}`。`unsafe` 追加なし）。
 //! #4025・MVM-1・MVM-5・REPAIR-5: ゲスト RAM を複数スレッドで共有するスロット（`guest_memory_slot`。Linux と macOS aarch64。`unsafe` なし。macOS のゲスト RAM の所有は #4027 で `hvf::microvm` が使う。clone の結線は #4028 で済み）。
-//! #4026・MVM-1・MVM-5: virtio-block の QueueNotify を処理する route（`interrupt::QueueNotifyRoute`・`BlockQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線は #4028 で済み、net は #4029）。
+//! #4026・MVM-1・MVM-5: virtio-block の QueueNotify を処理する route（`interrupt::QueueNotifyRoute`・`BlockQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線は #4028 で済み）。
+//! #4029・MVM-1・MVM-5: virtio-net の QueueNotify を処理する route（`interrupt::NetQueueNotifyRoute`。Linux と macOS aarch64。`unsafe` なし。macOS の結線済み。ホスト側の到着による受信は #4030）。
 //! TASK-192.5・#3784・MVM-5・MVM-1: arm64 ゲスト向け FDT（DTB v17）の組み立て器（`fdt`。OS 非依存・`unsafe` なし）。
 //! TASK-192.7・#3790・MVM-5・MVM-1: arm64 の Image・initrd・FDT の配置と起動レジスタの値（`boot_arm64`。OS 非依存・`unsafe` なし）。
 //! TASK-192.10・#3793・MVM-5・MVM-1: macOS の MMIO の data abort を `VcpuExit::Mmio` へ写す純関数群（`mmio_abort`。OS 非依存・`unsafe` なし）。
@@ -52,7 +53,7 @@
 //! macOS かつ aarch64 のみ `hvf::{HvVcpu, VcpuCanceller}`）。
 //! TASK-192.9・#3791・MVM-5・MVM-1・REPAIR-5: macOS の vCPU 専用スレッドと実行ループ・exit の分類・期限つきの停止（`hvf_loop` は OS 非依存の
 //! コアで、偽の実行体の単体テストが全 OS で走る。macOS かつ aarch64 のみ `hvf::{VcpuThread, VcpuHandle}`。exit ごとの処理
-//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::mmio` は #3793、`hvf::timer` は #3796 で WFI / WFE と vtimer を実装済み。残る制限は各ファイルの「未実装」節）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
+//! `hvf::hvc` は #3794 で PSCI を実装済み（`psci`。OS 非依存）。`hvf::mmio` は #3793 で実装済み。WFI の exit と vtimer の exit は GIC つきでは来ないため処理を持たず、`hvf_loop` が `Failed(Unimplemented)` で止める（#4039。WFE 系は PC を進めて続行）。残る制限は各ファイルの「未実装」節）。`StopReason` は `stop` へ移した（`microvm::StopReason` として再公開。`unsafe` なし）。
 //! #3737・MVM-1: AP（vCPU 1 以上）を `KVM_MP_STATE_UNINITIALIZED` で作り、BSP からの INIT/SIPI で起動する（`smp_x86`・
 //! `device::VcpuFd::{mp_state, set_mp_state}`・`microvm::MicroVm::write_ap_startup_code`。`unsafe` は `sys` の `KVM_{GET,SET}_MP_STATE` のみ）。
 //! #3888・MVM-1: x86_64 の MP テーブルの生成（`mptable_x86`。OS 非依存・`unsafe` なし。`microvm::MicroVm::load_kernel` が `[639 KiB, 640 KiB)` へ書き e820 で予約し、AP を Linux にオンラインにする）。
@@ -88,7 +89,7 @@
 //! 実装済み:
 //! - VM・ゲスト RAM・vCPU・GICv3 の実行時解決（`sys/hvf.rs`・`hvf::memory`・`hvf::gic`。#3783・#3786・#3787・#3789・#3792・#3795）
 //! - vCPU 専用スレッドと実行ループ・exit の分類（`hvf_loop`・`hvf::vcpu`。#3791）と、MMIO・HVC（PSCI）・WFI / vtimer の処理
-//!   （`hvf::mmio`・`hvf::hvc`・`hvf::timer`。#3793・#3794・#3883・#3796・#3887）
+//!   （`hvf::mmio`・`hvf::hvc`。#3793・#3794・#3883）
 //! - microVM 構成体と start / stop・停止時の資源の解放順序（`hvf::microvm`・`hvf_lifecycle`。#3797・#3798・#3882）
 //! - UART の SPI 割り込みと入力（#3892・#3893）
 //! - `fandhe-container-plugin-microvm` の start / stop への結線（#3800・#3927）
@@ -96,7 +97,7 @@
 //! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
 //!
 //! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
-//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net（#4029）は #3908 配下。TIMEOUT 後のゲスト RAM の回収は #4032 で実装済み（vCPU スレッドの終了時。実機未確認 #4034）
+//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net の QueueNotify の配線は #4029 で済み（ホスト側の到着による受信は #4030）。TIMEOUT 後のゲスト RAM の回収は #4032 で実装済み（vCPU スレッドの終了時。実機未確認 #4034）
 //! - big-endian ゲスト
 
 #![deny(unsafe_code)]

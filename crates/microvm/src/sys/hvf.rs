@@ -62,22 +62,17 @@
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
 //! - 出典: 関数名・シグネチャは Apple の Hypervisor ドキュメント（各 `hv_gic_*` のページ）。SDK 27.2 のヘッダと一致した（#3803）。
 //!
-//! # ホストの時刻（TASK-192.14・#3796）
-//! WFI の待ち時間の計算用に `mach_absolute_time` と `mach_timebase_info`（libSystem）を宣言し、安全なラッパー
-//! `host_absolute_time`・`host_timebase` だけを公開する。`hvf::timer` が呼ぶ。宣言は SDK 27.2 のヘッダと一致した（#3997）。
-//! 2 関数は本ファイル末尾の単体試験（#3885）で直接確かめる（entitlement 不要のため既定の試験集合で走る）。
-//!
 //! # 出典
 //! 関数名・引数の型・`hv_memory_flags_t` の値は Apple の Hypervisor.framework の公開ドキュメント由来。
 //! SDK 27.2 のヘッダと一致した（#3803）。vCPU 側のうち `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` /
-//! `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・`hv_vcpu_set_vtimer_offset` は対の形から推定し、同じヘッダで確かめた。
+//! `set_sys_reg` は対の形から推定し、同じヘッダで確かめた。
 
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{
-    GicDistributorReg, GicIntid, HostTimebase, HvGicIntid, HvInterruptType, HvOp, HvReg,
-    HvRunObserver, HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN,
-    MacosVersion, MemoryFlags, check_gic_supported, check_map_range, check_run_deadline,
-    check_vm_map, classify_hv_return, decode_exit, finish_run, parse_macos_product_version,
+    GicDistributorReg, GicIntid, HvGicIntid, HvInterruptType, HvOp, HvReg, HvRunObserver,
+    HvRunStats, HvSysReg, HvVcpuExit, HvVcpuExitRaw, MACOS_PRODUCT_VERSION_MAX_LEN, MacosVersion,
+    MemoryFlags, check_gic_supported, check_map_range, check_run_deadline, check_vm_map,
+    classify_hv_return, decode_exit, finish_run, parse_macos_product_version,
 };
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::marker::PhantomData;
@@ -102,8 +97,7 @@ unsafe extern "C" {
 // SAFETY: 宣言は Hypervisor.framework（macOS 11 以降・Apple Silicon）の C ABI に一致させている
 // （`hv_vcpu_t` = u64、`hv_reg_t` = u32、`hv_sys_reg_t` = u16、`hv_interrupt_type_t` = u32、
 // bool = C の `_Bool`、`hv_vcpu_config_t` は不透明ポインタで NULL を渡す）。
-// `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` / `set_sys_reg`・`hv_vcpu_get_vtimer_mask`・
-// `hv_vcpu_set_vtimer_offset` は対の形から推定し、SDK 27.2 のヘッダで確かめた（#3803）。
+// `hv_vcpu_set_reg`・`hv_vcpu_get_sys_reg` / `set_sys_reg` は対の形から推定し、SDK 27.2 のヘッダで確かめた（#3803）。
 // 呼び出しはすべて下の安全なラッパー（`HvVcpu`・`VcpuCanceller`）経由で、出力引数はローカル変数だけを渡す。
 unsafe extern "C" {
     fn hv_vcpu_create(
@@ -118,10 +112,6 @@ unsafe extern "C" {
     fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> c_int;
     fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> c_int;
     fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> c_int;
-    fn hv_vcpu_get_vtimer_mask(vcpu: u64, masked: *mut bool) -> c_int;
-    fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> c_int;
-    fn hv_vcpu_get_vtimer_offset(vcpu: u64, offset: *mut u64) -> c_int;
-    fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> c_int;
     fn hv_vcpu_set_pending_interrupt(vcpu: u64, kind: u32, pending: bool) -> c_int;
 }
 
@@ -165,53 +155,6 @@ const MAP_PRIVATE: c_int = 0x0002;
 const MAP_ANON: c_int = 0x1000;
 const SC_PAGESIZE: c_int = 29;
 const ENOMEM: i32 = 12;
-
-// SAFETY: 宣言は macOS（LP64）の libSystem（`<mach/mach_time.h>`）の C ABI に一致させている
-// （`mach_absolute_time` は `uint64_t` を返し引数なし、`mach_timebase_info` は `kern_return_t` = int を返し
-// `struct mach_timebase_info { uint32_t numer; uint32_t denom; }` へのポインタを取る）。
-// 両関数は libc に対応物があり #3664 で照合する（本 crate は dev-dependency に libc を持たない）。
-// 呼び出しは下の安全なラッパー（`host_absolute_time`・`host_timebase`）経由だけ。
-unsafe extern "C" {
-    fn mach_absolute_time() -> u64;
-    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
-}
-
-/// `struct mach_timebase_info`（`<mach/mach_time.h>`）。`sys` の外へ出さない。
-#[repr(C)]
-struct MachTimebaseInfo {
-    numer: u32,
-    denom: u32,
-}
-
-const _: () = {
-    assert!(std::mem::size_of::<MachTimebaseInfo>() == 8);
-    assert!(std::mem::align_of::<MachTimebaseInfo>() == 4);
-};
-
-/// ホストの絶対時間カウンタを読む（`mach_absolute_time`）。引数なし・常に成功する。
-/// `hvf::timer` が WFI の待ち時間の計算の直前に呼ぶ（TASK-192.14・#3796）。
-pub(crate) fn host_absolute_time() -> u64 {
-    // SAFETY: 引数もポインタも取らず、メモリを触らない。常に成功する libSystem の関数。
-    unsafe { mach_absolute_time() }
-}
-
-static HOST_TIMEBASE: OnceLock<Result<HostTimebase, MicrovmError>> = OnceLock::new();
-
-/// ホストの絶対時間カウンタの ns への換算比を返す（プロセスで 1 回だけ取得して保つ）。
-/// 失敗や 0 の値は `Internal`（推測の値で続けない。fail-closed）。
-pub(crate) fn host_timebase() -> Result<HostTimebase, MicrovmError> {
-    HOST_TIMEBASE
-        .get_or_init(|| {
-            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
-            // SAFETY: `info` は初期化済みのローカル変数で、呼び出しの間は有効な書き込み先（8 バイト・4 アライン）。
-            let rc = unsafe { mach_timebase_info(&mut info) };
-            if rc != 0 {
-                return Err(internal("mach_timebase_info failed"));
-            }
-            HostTimebase::new(info.numer, info.denom)
-        })
-        .clone()
-}
 
 /// プロセス内に `HvVm` が存在するか（1 プロセス 1 VM の排他）。
 static VM_EXISTS: AtomicBool = AtomicBool::new(false);
@@ -971,38 +914,6 @@ impl HvVcpu<'_> {
         classify_hv_return(HvOp::VcpuSetSysReg, rc)
     }
 
-    /// vtimer のマスク状態を読む。
-    pub fn vtimer_mask(&self) -> Result<bool, MicrovmError> {
-        let mut m = false;
-        // SAFETY: m はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
-        let rc = unsafe { hv_vcpu_get_vtimer_mask(self.id, &mut m) };
-        classify_hv_return(HvOp::VcpuGetVtimerMask, rc)?;
-        Ok(m)
-    }
-
-    /// vtimer のマスクを設定する（`VtimerActivated` の後に解除する用途）。
-    pub fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), MicrovmError> {
-        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
-        let rc = unsafe { hv_vcpu_set_vtimer_mask(self.id, masked) };
-        classify_hv_return(HvOp::VcpuSetVtimerMask, rc)
-    }
-
-    /// vtimer のオフセットを読む。
-    pub fn vtimer_offset(&self) -> Result<u64, MicrovmError> {
-        let mut o: u64 = 0;
-        // SAFETY: o はローカル変数への書き込み先。id は生存中、呼び出しは作成スレッド。
-        let rc = unsafe { hv_vcpu_get_vtimer_offset(self.id, &mut o) };
-        classify_hv_return(HvOp::VcpuGetVtimerOffset, rc)?;
-        Ok(o)
-    }
-
-    /// vtimer のオフセットを設定する。
-    pub fn set_vtimer_offset(&mut self, offset: u64) -> Result<(), MicrovmError> {
-        // SAFETY: ポインタは渡さない。id は生存中、呼び出しは作成スレッド。
-        let rc = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
-        classify_hv_return(HvOp::VcpuSetVtimerOffset, rc)
-    }
-
     /// 保留中の割り込みを設定する。GIC（#3789）を使う既定経路では使わない（GIC 無しとの比較用）。
     pub fn set_pending_interrupt(
         &mut self,
@@ -1327,31 +1238,5 @@ mod tests {
             // ここで drop（munmap）が別スレッドで走る
         });
         handle.join().expect("thread must not panic");
-    }
-
-    /// 換算比の numer・denom が 0 以外で、`OnceLock` のキャッシュにより毎回同じ値を返す。
-    /// entitlement 不要で既定の試験集合で走る（MVM-5・#3796・#3885）。
-    #[test]
-    fn mvm5_3796_host_timebase_is_nonzero_and_cached() {
-        let first = host_timebase().expect("mach_timebase_info must succeed");
-        assert_ne!(first.numer(), 0);
-        assert_ne!(first.denom(), 0);
-        let second = host_timebase().expect("cached timebase must be Ok");
-        assert_eq!(first, second);
-    }
-
-    /// 連続 2 回は減らず、1 ms の sleep を挟むと厳密に増える。Apple Silicon のカウンタは 24 MHz 程度で
-    /// 1 ms は数万 tick のため厳密増加が成り立つ（MVM-5・#3796・#3885）。
-    #[test]
-    fn mvm5_3796_host_absolute_time_is_monotonic() {
-        let a = host_absolute_time();
-        let b = host_absolute_time();
-        assert!(b >= a, "counter went backwards: a={a} b={b}");
-        std::thread::sleep(Duration::from_millis(1));
-        let c = host_absolute_time();
-        assert!(
-            c > b,
-            "counter did not advance across 1ms sleep: b={b} c={c}"
-        );
     }
 }

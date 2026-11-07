@@ -373,6 +373,12 @@ mod tests {
         fn pc(&self) -> Option<u64> {
             None
         }
+        fn advance_pc(&mut self, _bytes: u64) -> Result<(), MicrovmError> {
+            Err(MicrovmError::new(
+                MicrovmErrorCode::Internal,
+                "unexpected advance_pc",
+            ))
+        }
     }
 
     fn hvc_exit() -> HvVcpuExit {
@@ -674,6 +680,12 @@ mod tests {
             }
             fn pc(&self) -> Option<u64> {
                 None
+            }
+            fn advance_pc(&mut self, _bytes: u64) -> Result<(), MicrovmError> {
+                Err(MicrovmError::new(
+                    MicrovmErrorCode::Internal,
+                    "unexpected advance_pc",
+                ))
             }
         }
         let r = rig();

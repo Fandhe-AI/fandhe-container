@@ -147,7 +147,7 @@ fn cri5_delete_over_uds() {
     let r = call(&mut s, 5, "Delete", del("c1", ""));
     assert_eq!(r.status.unwrap().code, 9);
 
-    // exec_id 付きは未対応。
+    // exec_id 付きは、起動役が無いサービスでは未対応。
     let r = call(&mut s, 7, "Delete", del("c1", "e"));
     assert_eq!(r.status.unwrap().code, 12);
 

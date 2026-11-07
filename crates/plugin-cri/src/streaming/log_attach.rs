@@ -5,7 +5,7 @@
 //!
 //! # 方式（段階 1。設計は `docs/design/cri-streaming-server.md`「Attach > 段階 1」）
 //! supervisor の回転ログ（`<state_root>/@container-logs`。CRI のコンテナも `TeeLogSink` で書く）を、セッションごとの専用スレッドが
-//! `read_container_log_with_cancel` で `tail 0` から follow する。出力（`stdout ` / `stderr ` のタグつきレコード）は
+//! `read_container_log_with_hooks` で `tail 0` から follow する。出力（`stdout ` / `stderr ` のタグつきレコード）は
 //! supervisor の `RecordDemux` がタグを外して 2 本へ分け、std の `UnixStream::pair` を橋にして tokio 側の `AsyncRead` へ渡す
 //! （tokio の `sync`・`io-util` feature を使わない。std の socketpair は CLOEXEC のため子プロセスへ fd が漏れない）。
 //! 背圧は socketpair のバッファが担う。
@@ -20,6 +20,7 @@
 //! # 未実装（REPAIR-3）
 //! stdin・tty は `INVALID_ARGUMENT`（RPC 時は `StreamWiring::attach_interactive` が false、接続時はここ）。完全版は #3765 の設計。
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -37,8 +38,8 @@ use fandhe_container_core::traits::{
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::streaming::attach::{AttachBackend, AttachSession, AttachTarget};
 use fandhe_container_supervisor::logs::{
-    ContainerActivity, FollowEnd, FollowOptions, LogReadOptions, MAX_FOLLOW_DURATION, RecordDemux,
-    TailCount, container_log_rotation_config, read_container_log_with_cancel,
+    ContainerActivity, FollowEnd, FollowHooks, FollowOptions, LogReadOptions, MAX_FOLLOW_DURATION,
+    RecordDemux, TailCount, container_log_rotation_config, read_container_log_with_hooks,
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -368,6 +369,19 @@ struct FollowJob {
     _guard: ActiveGuard,
 }
 
+/// `RefCell` 越しに共有する [`RecordDemux`] への書き込み口（境目の通知と同じ demux を触るため）。
+struct SharedDemux<'a, 'b>(&'a RefCell<RecordDemux<'b>>);
+
+impl Write for SharedDemux<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
 /// follow スレッドの本体。どの終わり方でも、読み口の EOF → 終了通知の順に閉じる。
 fn follow_thread(job: FollowJob) {
     let FollowJob {
@@ -388,25 +402,35 @@ fn follow_thread(job: FollowJob) {
             let opts = LogReadOptions::default()
                 .with_tail(tail)
                 .with_follow(follow);
-            let mut demux = RecordDemux::new(
+            // 世代の境目で demux の状態（LF の無い切れた末尾・不完全なタグ）を捨てる口を、出力側と共有するため RefCell に置く
+            // （境目の通知は出力の書き込みの合間にだけ来るので借用は重ならない。SUP-7）。
+            let demux = RefCell::new(RecordDemux::new(
                 out.as_mut().map(|w| w as &mut dyn Write),
                 err.as_mut().map(|w| w as &mut dyn Write),
-            );
+            ));
+            let mut sink = SharedDemux(&demux);
             let mut activity = || probe.activity(&id);
-            // supervisor の追従ループは初回のスナップショットを確定して最初のポーリングを終えた後に `cancelled` を
-            // 初めて呼ぶ。この最初の呼び出しを「開始位置の確定」の合図に使う（以降の行は取りこぼさない）。
-            let cancelled = || {
+            // 開始位置（tail 0 のスナップショット）の確定は、最初のポーリングで追従データを書く前に通知する
+            // （最初の出力が socketpair の容量を超えて詰まっても `attach` が待ち続けない。CRI-6・REPAIR-5）。
+            let started = || {
                 let _ = ready.send(());
-                cancel.load(Ordering::SeqCst)
             };
-            read_container_log_with_cancel(
+            let cancelled = || cancel.load(Ordering::SeqCst);
+            let boundary = || {
+                let _ = demux.borrow_mut().finish();
+            };
+            read_container_log_with_hooks(
                 &log_dir,
                 &id,
                 container_log_rotation_config(),
                 &opts,
-                &mut demux,
+                &mut sink,
                 &mut activity,
-                &cancelled,
+                FollowHooks {
+                    cancelled: &cancelled,
+                    started: &started,
+                    file_boundary: &boundary,
+                },
             )
             .ok()
             .and_then(|r| r.follow_end())

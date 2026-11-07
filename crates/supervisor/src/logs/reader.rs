@@ -341,9 +341,62 @@ pub fn read_container_log_with(
     read_container_log_with_cancel(dir, id, config, options, out, activity, &|| false)
 }
 
-/// [`read_container_log_with`] に取り消しの旗を足した版（plugin-cri の attach が使う。CRI-6・SUP-7・REPAIR-5・#3763）。
-/// `cancelled` はポーリングのたびに呼ばれ、`true` を返すと残りを出さずに成功で戻る（[`FollowEnd::Cancelled`]）。
-/// 出力が来ないアイドルの間は出力先の EPIPE で止まれないため、追従を回すスレッドを止める手段として呼び出し側が旗を立てる。
+/// 追従の呼び出し側フック（plugin-cri の attach が使う。CRI-6・SUP-7・REPAIR-5・#3763）。
+#[derive(Clone, Copy)]
+pub struct FollowHooks<'a> {
+    /// ポーリングのたびに呼ばれ、`true` を返すと残りを出さずに成功で戻る（[`FollowEnd::Cancelled`]）。
+    /// 出力が来ないアイドルの間は出力先の EPIPE で止まれないため、追従を回すスレッドを止める手段として呼び出し側が立てる。
+    pub cancelled: &'a dyn Fn() -> bool,
+    /// 追従の開始位置の確定（スナップショットの出力を終え、最初のポーリングで追従データを出す前）に 1 回だけ呼ばれる。
+    pub started: &'a dyn Fn(),
+    /// ログファイルの境目（切れた末尾の状態を初期化する契機）ごとに、境目までの出力を `out` へ渡した直後に呼ばれる。
+    /// 出力先がレコード単位の状態を持つ（[`RecordDemux`]）とき、世代をまたいで状態を持ち越さないために使う。
+    pub file_boundary: &'a dyn Fn(),
+}
+
+fn never_cancelled() -> bool {
+    false
+}
+
+fn nothing() {}
+
+impl FollowHooks<'static> {
+    /// 何もしないフック（取り消さない・合図なし）。
+    pub fn none() -> Self {
+        Self {
+            cancelled: &never_cancelled,
+            started: &nothing,
+            file_boundary: &nothing,
+        }
+    }
+}
+
+/// [`read_container_log_with`] に [`FollowHooks`] を足した版。
+#[cfg(unix)]
+pub fn read_container_log_with_hooks(
+    dir: &Path,
+    id: &ContainerId,
+    config: RotationConfig,
+    options: &LogReadOptions,
+    out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
+    hooks: FollowHooks<'_>,
+) -> Result<LogReadReport, LogReadFailure> {
+    let start = std::time::Instant::now();
+    let mut elapsed = move || start.elapsed();
+    let mut sleep = std::thread::sleep;
+    let mut driver = follow::Driver {
+        elapsed: &mut elapsed,
+        sleep: &mut sleep,
+        activity,
+        cancelled: hooks.cancelled,
+        started: hooks.started,
+        file_boundary: hooks.file_boundary,
+    };
+    imp::read_with(dir, id, config, options, out, &mut |_| {}, &mut driver)
+}
+
+/// [`read_container_log_with`] に取り消しの旗だけを足した版（他のフックは何もしない）。
 #[cfg(unix)]
 pub fn read_container_log_with_cancel(
     dir: &Path,
@@ -354,16 +407,18 @@ pub fn read_container_log_with_cancel(
     activity: &mut dyn FnMut() -> ContainerActivity,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LogReadReport, LogReadFailure> {
-    let start = std::time::Instant::now();
-    let mut elapsed = move || start.elapsed();
-    let mut sleep = std::thread::sleep;
-    let mut driver = follow::Driver {
-        elapsed: &mut elapsed,
-        sleep: &mut sleep,
+    read_container_log_with_hooks(
+        dir,
+        id,
+        config,
+        options,
+        out,
         activity,
-        cancelled,
-    };
-    imp::read_with(dir, id, config, options, out, &mut |_| {}, &mut driver)
+        FollowHooks {
+            cancelled,
+            ..FollowHooks::none()
+        },
+    )
 }
 
 /// 非 unix は [`read_container_log`] と同じく fail-closed。
@@ -377,6 +432,24 @@ pub fn read_container_log_with(
     activity: &mut dyn FnMut() -> ContainerActivity,
 ) -> Result<LogReadReport, LogReadFailure> {
     let _ = (dir, id, config, options, out, activity);
+    Err(source(
+        ErrorCode::Unimplemented,
+        "reading container logs is not supported on this platform",
+    ))
+}
+
+/// 非 unix は [`read_container_log`] と同じく fail-closed。
+#[cfg(not(unix))]
+pub fn read_container_log_with_hooks(
+    dir: &Path,
+    id: &ContainerId,
+    config: RotationConfig,
+    options: &LogReadOptions,
+    out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
+    hooks: FollowHooks<'_>,
+) -> Result<LogReadReport, LogReadFailure> {
+    let _ = (dir, id, config, options, out, activity, hooks);
     Err(source(
         ErrorCode::Unimplemented,
         "reading container logs is not supported on this platform",
@@ -730,6 +803,7 @@ mod imp {
             feed_range(&o.file, 0, *limit, &mut scanner, Some(&mut counting))?;
             if !*current {
                 scanner.end_file(Some(&mut counting)).map_err(scan_error)?;
+                (driver.file_boundary)();
             }
         }
         counting.flush().map_err(|_| LogReadFailure::Output)?;
@@ -969,6 +1043,8 @@ mod tests {
             sleep: &mut sleep,
             activity: &mut activity,
             cancelled: &|| false,
+            started: &|| {},
+            file_boundary: &|| {},
         };
         let mut out = Vec::new();
         let r = imp::read_with(
@@ -1097,6 +1173,8 @@ mod tests {
             sleep: &mut sleep,
             activity: &mut activity,
             cancelled: &|| false,
+            started: &|| {},
+            file_boundary: &|| {},
         };
         let r = imp::read_with(
             &t.0,

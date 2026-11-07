@@ -278,7 +278,7 @@ impl SupervisedLifecycle {
             .checked_add(req.timeout())
             .ok_or_else(|| TraitError::new(ErrorCode::Internal, "wait deadline overflow"))?;
         let cancel = || req.is_cancelled();
-        let notifier = self.exit_notifiers.notifier(store);
+        let mut notifier = self.exit_notifiers.notifier(store);
         let mut settle_until: Option<Instant> = None;
         loop {
             if req.is_cancelled() {
@@ -323,9 +323,17 @@ impl SupervisedLifecycle {
                 }
                 ExitWatchOutcome::Expired => {}
                 ExitWatchOutcome::Cancelled => return Err(wait_cancelled()),
-                // supervisor が（まだ）いない・一時的な失敗・pid の入れ替わりは、1 回分を照会で待って次の周回で
-                // 状態を読み直し再購読する（制御ソケットは Running 記録の後に bind されるため、NoSupervisor を
-                // 恒久の無効化にしない。空回りで接続を繰り返さない）。待ちは通信後の残り予算で頭打ちにする。
+                // 届く supervisor が無い・古い版・信頼できない相手: 以後この呼び出しでは通知を使わず、状態ストアの
+                // 照会だけで待つ（`ExitWatchOutcome::NoSupervisor` の契約。制御チャネルへ毎周回接続しない）。
+                ExitWatchOutcome::NoSupervisor => {
+                    notifier = None;
+                    sleep_sliced(
+                        poll.min(deadline.saturating_duration_since(Instant::now())),
+                        &cancel,
+                    )?;
+                }
+                // 一時的な失敗・pid の入れ替わり: 1 回分を照会で待ち、次の周回で状態を読み直して再購読する。
+                // 待ちは通信後の残り予算で頭打ちにする。
                 _ => sleep_sliced(
                     poll.min(deadline.saturating_duration_since(Instant::now())),
                     &cancel,

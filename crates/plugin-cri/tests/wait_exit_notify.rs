@@ -472,7 +472,7 @@ fn repair5_3683_wait_exit_state_error_is_returned_as_is() {
     assert_eq!(notifier.calls(), 0);
 }
 
-/// CRI-1・SUP-1・#3683: supervisor が無い（`NoSupervisor`）ときは照会へ退避する。通知口は 1 回だけ試す。
+/// CRI-1・SUP-1・#3683: supervisor が無い（`NoSupervisor`）ときは照会へ退避する。通知口は 1 回だけ試し、以後その呼び出しでは再購読しない。
 #[test]
 fn cri1_3683_wait_exit_falls_back_to_polling_without_supervisor() {
     let world = World::new(ContainerStatus::running(cid("w6"), Some(pid(100))), root());

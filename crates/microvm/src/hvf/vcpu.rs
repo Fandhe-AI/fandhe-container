@@ -358,8 +358,11 @@ impl VcpuThread {
             &name,
             config.create_deadline,
             move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
-                // vCPU は `vm_run` を借用する。`vm` は借用させず、終了時に `drop_vcpu_thread_state` へ move できるようにする
-                // （`vm_run` はローカルなので、関数のスコープの終わり、つまり最後に落ちる。#4032）。
+                // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
+                // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
+                // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
+                // `vm` を落とした時点で `vm_run` が最後の `Arc` を持っていれば、VM の解放はここ（`vm_run` の drop）になる。
+                // 順序の根拠は `vm_run` の drop 位置ではなく、vCPU を先に破棄してから `vm` を渡すことにある。
                 let vm_run = Arc::clone(&vm);
                 let mut vcpu = match vm_run.create_vcpu() {
                     Ok(v) => v,
@@ -475,20 +478,40 @@ impl VcpuThread {
             "hvf-vcpu-0",
             config.create_deadline,
             move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
-                // vCPU は `vm_run` を借用する。`vm` は借用させず、終了時に `drop_vcpu_thread_state` へ move できるようにする
-                // （`vm_run` はローカルなので、関数のスコープの終わり、つまり最後に落ちる。#4032）。
+                // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
+                // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
+                // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
+                // `vm` を落とした時点で `vm_run` が最後の `Arc` を持っていれば、VM の解放はここ（`vm_run` の drop）になる。
+                // 順序の根拠は `vm_run` の drop 位置ではなく、vCPU を先に破棄してから `vm` を渡すことにある。
                 let vm_run = Arc::clone(&vm);
                 let mut vcpu = match vm_run.create_vcpu() {
                     Ok(v) => v,
                     Err(e) => {
                         let code = e.code();
                         start.fail(e);
+                        let ExitHandlers {
+                            mmio,
+                            hvc,
+                            timer,
+                            guest_memory,
+                        } = handlers;
+                        drop(timer);
+                        drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                         return (StopReason::Failed(code), HvRunStats::default());
                     }
                 };
                 if let Err(e) = setup(&mut vcpu) {
                     let code = e.code();
                     start.fail(e);
+                    drop(vcpu);
+                    let ExitHandlers {
+                        mmio,
+                        hvc,
+                        timer,
+                        guest_memory,
+                    } = handlers;
+                    drop(timer);
+                    drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
                 let peer = (vcpu.canceller(), wake.clone());
@@ -506,6 +529,14 @@ impl VcpuThread {
                             // 走らせずに終わる（開く前の stop / drop、またはゲートの待ちの期限切れ）。
                             vm.mark_teardown();
                             drop(vcpu);
+                            let ExitHandlers {
+                                mmio,
+                                hvc,
+                                timer,
+                                guest_memory,
+                            } = handlers;
+                            drop(timer);
+                            drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                             return (reason, HvRunStats::default());
                         }
                     }
@@ -530,8 +561,16 @@ impl VcpuThread {
                     // これ以後の vCPU 作成を拒否する。vCPU の破棄は teardown の一部としてだけ起きる。
                     vm.mark_teardown();
                 }
-                // vCPU を `vm`（この closure の捕捉値）より先に破棄してから戻る。
+                // vCPU → デバイス参照 → スロット → VM の順に破棄してから戻る（AP と同じ。#4032）。
                 drop(exec);
+                let ExitHandlers {
+                    mmio,
+                    hvc,
+                    timer,
+                    guest_memory,
+                } = handlers;
+                drop(timer);
+                drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                 (reason, stats)
             },
         )?;

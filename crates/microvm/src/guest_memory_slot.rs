@@ -14,8 +14,8 @@
 //! - ゲストが書きうるメモリを vCPU が使っている間は解放しない。`take` を呼ぶ時点は呼び出し元が決める。
 //!
 //! # 未結線（REPAIR-3）
-//! 利用予定は #4026（QueueNotify の route）・#4027（`HvfVmParts.memory` の置き換え）・#4032（最後の `Arc` での回収）。
-//! 現時点ではどこからも使われていない。
+//! #4026 で `interrupt::BlockQueueNotifyRoute` が使い始めた。vCPU の経路への結線は
+//! #4027（`HvfVmParts.memory` の置き換え）・#4028（`MmioHandler` への route 結線）・#4032（最後の `Arc` での回収）。
 //!
 //! # cfg
 //! `interrupt::BoundAckRoute` と同じく Linux と macOS（aarch64）だけ。Windows（WHP）は MVP 外（MVM-5）。

@@ -40,7 +40,10 @@ use super::spdy::{
     Frame, FrameDecoder, FrameEncoder, Headers, MAX_INCOMING_PAYLOAD, SpdyError, StreamId,
     goaway_status, rst_status,
 };
-use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
+use super::{
+    ConnectionPermit, StreamBody, StreamHandler, StreamKind, StreamRequest, StreamWiring,
+    plain_response,
+};
 use crate::error::CriError;
 
 /// Upgrade で合意する HTTP の `Upgrade` ヘッダ値。
@@ -272,6 +275,10 @@ impl PortForwardHandler {
 }
 
 impl StreamHandler for PortForwardHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::only(StreamKind::PortForward)
+    }
+
     fn handle(
         &self,
         request: StreamRequest,

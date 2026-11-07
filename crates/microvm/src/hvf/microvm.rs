@@ -54,8 +54,8 @@
 //! 立つ印で、以後の vCPU 作成は `FailedPrecondition`。
 //! - 採らない案 1「`hv_vcpu_destroy` を呼ばず `hv_vm_destroy` に任せる」: vCPU が残ったままの `hv_vm_destroy` の成功が文書に無い。
 //!   失敗（`HV_BUSY` 等）すると `VM_EXISTS` が立ったままになり、同じプロセスで二度と VM を作れない。
-//! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: `HostMapping` が `!Send` のため RAM を移すのに `sys` へ新しい
-//!   `unsafe impl Send` が要る（事前承認の範囲外）。
+//! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: RAM の `Send` は #4024（#4022 の個別承認）で入ったが、
+//!   `hv_vm_destroy` まで別スレッドで行う案の採否は #3908 で評価する。
 //! - 実機では破棄の後に同じプロセスで作り直せて、`stop` の所要は合成ゲストで 103〜241 µs だった（#3803）。
 //!
 //! ## 期限切れ（`TIMEOUT`）のとき
@@ -63,10 +63,10 @@
 //! fail-closed）。残る資源は vCPU スレッド・vCPU・VM（GIC を含む）・ゲスト RAM の mmap と map。リークした対応付けが `Arc<HvVm>` を
 //! 握るため、スレッドが後で自力で終わっても `hv_vm_destroy` は走らず、同じプロセスでの再 assemble は `FailedPrecondition` になる。
 //! 回収の方法はプロセスの終了だけ（plugin-microvm による再起動。#3800）。後から終わったスレッドの資源を回収する案は、`HostMapping`
-//! を `Send` にして回収スレッドへ渡す必要があり、`sys` に新しい `unsafe` が要るため本 issue の範囲外（追跡は #3908）。
+//! の `Send`（#4024 で導入済み）を使って回収スレッドへ渡す実装そのものが本 issue の範囲外（追跡は #3908）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` を含む）は未実装で、担当は
+//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（`HostMapping` の `Send` は #4024 で導入済み）は未実装で、担当は
 //!   #3908（`HvfBoundDevice::transport` が将来使う）。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。

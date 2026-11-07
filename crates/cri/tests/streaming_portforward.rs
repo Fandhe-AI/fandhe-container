@@ -637,9 +637,10 @@ async fn cri6_port_forward_rejects_missing_upgrade_headers() {
     drop(fx);
 }
 
-/// CRI-6: `StreamDispatcher` に PortForward だけを登録した構成で、未登録の種別（Exec）は 501 になる。
+/// CRI-6・REPAIR-3・#3753: `StreamDispatcher` に PortForward だけを登録した構成で、未登録の種別（Exec）は
+/// URL を発行せず `UNIMPLEMENTED` になり、結線済みは PortForward だけと答える。
 #[tokio::test]
-async fn cri6_dispatcher_with_port_forward_only_returns_501_for_exec() {
+async fn cri6_repair3_dispatcher_with_port_forward_only_refuses_exec_issue() {
     let handler = PortForwardHandler::new(
         Arc::new(MapDialer(HashMap::new())),
         PortForwardConfig::default(),
@@ -650,8 +651,10 @@ async fn cri6_dispatcher_with_port_forward_only_returns_501_for_exec() {
         StreamingServer::bind_with_handler(StreamingConfig::default(), Arc::new(dispatcher))
             .await
             .expect("bind");
-    let url = server
-        .issuer()
+    let issuer = server.issuer();
+    assert!(issuer.is_wired(fandhe_container_cri::streaming::StreamKind::PortForward));
+    assert!(!issuer.is_wired(fandhe_container_cri::streaming::StreamKind::Exec));
+    let err = issuer
         .issue(StreamRequest::Exec(v1::ExecRequest {
             container_id: "c1".to_string(),
             cmd: vec!["sh".to_string()],
@@ -660,17 +663,11 @@ async fn cri6_dispatcher_with_port_forward_only_returns_501_for_exec() {
             stdout: true,
             stderr: false,
         }))
-        .expect("issue");
-    let addr = server.local_addr();
-    let path = url[url.find("/exec/").expect("exec path")..].to_string();
-    let head = blocking(move || {
-        let mut tcp = raw_connect(addr);
-        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
-            .expect("write");
-        read_http_head(&mut tcp)
-    })
-    .await;
-    assert!(head.starts_with("HTTP/1.1 501"), "head: {head}");
+        .expect_err("exec is not wired");
+    assert_eq!(
+        err.code(),
+        fandhe_container_cri::error::CriErrorCode::Unimplemented
+    );
     drop(server);
 }
 

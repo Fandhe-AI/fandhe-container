@@ -10,7 +10,7 @@
 //!
 //! 実行中コンテナの stdio を渡す経路は core の `ContainerRuntime` にも supervisor にも無い（CRI-6・PLUG-1・SUP 系の
 //! 設計判断が要る。`docs/design/cri-streaming-server.md`「Attach の本番 backend」）。本モジュールは注入点だけを持ち、
-//! backend を注入しない構成では従来どおり `501 Not Implemented` のままで、実装済みを装わない。
+//! backend を注入しない構成では Attach は結線されず（`StreamHandler::wiring`）、RPC は URL を返さず `UNIMPLEMENTED` になる（#3753）。実装済みを装わない。
 //!
 //! ## セッションの構造
 //!
@@ -41,7 +41,10 @@ use super::spdy::{
     Frame, FrameDecoder, FrameEncoder, Headers, MAX_OUTGOING_DATA, StreamId, goaway_status,
     rst_status,
 };
-use super::{ConnectionPermit, StreamBody, StreamHandler, StreamRequest, plain_response};
+use super::{
+    ConnectionPermit, StreamBody, StreamHandler, StreamKind, StreamRequest, StreamWiring,
+    plain_response,
+};
 use crate::error::CriError;
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpSample, NoopCriOpRecorder};
 
@@ -146,6 +149,10 @@ impl AttachHandler {
 }
 
 impl StreamHandler for AttachHandler {
+    fn wiring(&self) -> StreamWiring {
+        StreamWiring::only(StreamKind::Attach)
+    }
+
     fn handle(
         &self,
         request: StreamRequest,

@@ -82,9 +82,10 @@ pub mod rotating;
 mod sweep_tests;
 
 pub use reader::{
-    ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure,
-    LogReadOptions, LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS, TailCount,
-    read_container_log, read_container_log_with,
+    ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowEnd, FollowOptions,
+    LogReadFailure, LogReadOptions, LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS,
+    RecordDemux, TailCount, read_container_log, read_container_log_with,
+    read_container_log_with_cancel,
 };
 pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
 

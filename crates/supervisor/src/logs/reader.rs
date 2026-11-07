@@ -51,6 +51,8 @@
 //!     ロックが解放されたときだけ呼ぶ（状態ストアの `@lock` との競合を減らす。#2229）。
 //!   - [`FollowOptions`] の期限（上限 [`MAX_FOLLOW_DURATION`]。超えたら残りを出し切って成功。REPAIR-5）。
 //!   - 呼び出し側プロセスへのシグナル（CLI の `signals` が転送後に既定動作で終了する）。
+//!   - 取り消しの旗（[`read_container_log_with_cancel`]。plugin-cri の attach が追従スレッドを止める。次のポーリングの前に、
+//!     残りを出さずに成功で戻る。#3763）。終わり方は [`LogReadReport::follow_end`]（[`FollowEnd`]）で分かる。
 //!
 //! # 追従の遅延の上限と世代数 1（CLI-1・SUP-7・#2605）
 //! LF で終わる行が `--follow` に現れるまでの遅延は、捕捉リーダーが読んで flush した時点から最大で 1 ポーリング間隔
@@ -73,9 +75,12 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
+pub use demux::RecordDemux;
+
 use super::StreamKind;
 use super::rotating::RotationConfig;
 
+mod demux;
 #[cfg(unix)]
 mod follow;
 // 呼び出し元（imp・follow）が unix 限定のため、非 unix では dead_code になる。
@@ -118,6 +123,20 @@ pub const FOLLOW_OUTRAN_MESSAGE: &str = "log was rotated faster than it could be
 pub struct LogReadReport {
     files: u32,
     bytes: u64,
+    follow_end: Option<FollowEnd>,
+}
+
+/// `--follow` の終わり方（呼び出し側が「コンテナの終了」と「期限・取り消し」を分けるため。CRI-6・SUP-7・#3763）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowEnd {
+    /// 書き手がいなくなり、状態も `Running` でない（コンテナの停止）。
+    Stopped,
+    /// `delete` でログが消えた。
+    LogRemoved,
+    /// 期限に達した。
+    Deadline,
+    /// 呼び出し側の取り消しの旗が立った（[`read_container_log_with_cancel`]）。
+    Cancelled,
 }
 
 impl LogReadReport {
@@ -129,6 +148,11 @@ impl LogReadReport {
     /// 出力先へ書いたバイト数。
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// 追従の終わり方。追従を指定しなかった読み出しでは `None`。
+    pub fn follow_end(&self) -> Option<FollowEnd> {
+        self.follow_end
     }
 }
 
@@ -314,6 +338,22 @@ pub fn read_container_log_with(
     out: &mut dyn Write,
     activity: &mut dyn FnMut() -> ContainerActivity,
 ) -> Result<LogReadReport, LogReadFailure> {
+    read_container_log_with_cancel(dir, id, config, options, out, activity, &|| false)
+}
+
+/// [`read_container_log_with`] に取り消しの旗を足した版（plugin-cri の attach が使う。CRI-6・SUP-7・REPAIR-5・#3763）。
+/// `cancelled` はポーリングのたびに呼ばれ、`true` を返すと残りを出さずに成功で戻る（[`FollowEnd::Cancelled`]）。
+/// 出力が来ないアイドルの間は出力先の EPIPE で止まれないため、追従を回すスレッドを止める手段として呼び出し側が旗を立てる。
+#[cfg(unix)]
+pub fn read_container_log_with_cancel(
+    dir: &Path,
+    id: &ContainerId,
+    config: RotationConfig,
+    options: &LogReadOptions,
+    out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LogReadReport, LogReadFailure> {
     let start = std::time::Instant::now();
     let mut elapsed = move || start.elapsed();
     let mut sleep = std::thread::sleep;
@@ -321,6 +361,7 @@ pub fn read_container_log_with(
         elapsed: &mut elapsed,
         sleep: &mut sleep,
         activity,
+        cancelled,
     };
     imp::read_with(dir, id, config, options, out, &mut |_| {}, &mut driver)
 }
@@ -336,6 +377,24 @@ pub fn read_container_log_with(
     activity: &mut dyn FnMut() -> ContainerActivity,
 ) -> Result<LogReadReport, LogReadFailure> {
     let _ = (dir, id, config, options, out, activity);
+    Err(source(
+        ErrorCode::Unimplemented,
+        "reading container logs is not supported on this platform",
+    ))
+}
+
+/// 非 unix は [`read_container_log`] と同じく fail-closed。
+#[cfg(not(unix))]
+pub fn read_container_log_with_cancel(
+    dir: &Path,
+    id: &ContainerId,
+    config: RotationConfig,
+    options: &LogReadOptions,
+    out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LogReadReport, LogReadFailure> {
+    let _ = (dir, id, config, options, out, activity, cancelled);
     Err(source(
         ErrorCode::Unimplemented,
         "reading container logs is not supported on this platform",
@@ -530,6 +589,7 @@ mod imp {
         Ok(LogReadReport {
             files,
             bytes: written,
+            follow_end: None,
         })
     }
 
@@ -673,18 +733,21 @@ mod imp {
             }
         }
         counting.flush().map_err(|_| LogReadFailure::Output)?;
+        let mut follow_end = None;
         if let Some(f) = options.follow() {
             let start = follow::Start {
                 opened,
                 plan,
                 scanner,
             };
-            let extra = follow::run(dir, id, config, f, start, &mut counting, driver)?;
+            let (extra, end) = follow::run(dir, id, config, f, start, &mut counting, driver)?;
             files = files.saturating_add(extra);
+            follow_end = Some(end);
         }
         Ok(LogReadReport {
             files,
             bytes: counting.bytes,
+            follow_end,
         })
     }
 }
@@ -905,6 +968,7 @@ mod tests {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
             activity: &mut activity,
+            cancelled: &|| false,
         };
         let mut out = Vec::new();
         let r = imp::read_with(
@@ -1032,6 +1096,7 @@ mod tests {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
             activity: &mut activity,
+            cancelled: &|| false,
         };
         let r = imp::read_with(
             &t.0,

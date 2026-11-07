@@ -12,13 +12,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-# src/bin/shim_v2_main.rs を shim_v2_main として二重に自動検出させない（下の [[bin]] で名前を明示。#872・CRI-5）。
-autobins = false
-
-# containerd が exec する shim v2 の起動バイナリ（TASK-62.7.1・#872・CRI-5）。依存は足さない。
-[[bin]]
-name = "containerd-shim-fandhe-container-v2"
-path = "src/bin/shim_v2_main.rs"
+# shim v2 の起動バイナリ `containerd-shim-fandhe-container-v2` は plugin-cri が持つ（本番の ContainerRuntime が plugin-cri にしか無く、
+# cri から plugin-cri への依存は禁止のため。#3684・CRI-5・CRI-7。docs/design/shim-v2-production-binary.md）。cri は bin を持たない。
 
 # containerd 経由の shim v2 疎通確認（TASK-62.6・CRI-5・#676）。試験バイナリ自身が shim 役を兼ねるため
 # 自前の main（harness = false）。既定は非 root の配線確認、`--ignored` で root・containerd の実機シナリオ。依存は足さない。

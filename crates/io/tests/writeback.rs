@@ -68,8 +68,20 @@ mod unix {
         }
     }
 
+    /// サーバー側（受信・送信・accept）の期限。
+    const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// client 役の読み取り期限。サーバー側の期限より長くする（#3649・REPAIR-5・
+    /// REPAIR-12）。同じ 5 秒だと、サーバーが half-close を観測できず自分の受信期限で
+    /// 接続を閉じる場面と、client の EOF 待ちの期限が同時に切れて競合し、macOS で
+    /// `WouldBlock` の panic として間欠的に現れた。サーバーは受信期限で必ず接続を
+    /// 閉じるので、client の期限が長ければ、サーバー側の遅延は `report.end` の
+    /// 照合として情報つきで出る。有限であり、無期限の待ちは足さない。
+    const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+    const _: () = assert!(CLIENT_READ_TIMEOUT.as_secs() > SERVER_IO_TIMEOUT.as_secs());
+
     fn test_timeout() -> IoTimeout {
-        IoTimeout::new(Duration::from_secs(5)).expect("5s must be a valid IoTimeout")
+        IoTimeout::new(SERVER_IO_TIMEOUT).expect("5s must be a valid IoTimeout")
     }
 
     fn writeback_timeouts() -> WritebackTimeouts {
@@ -143,7 +155,7 @@ mod unix {
             }
         };
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(CLIENT_READ_TIMEOUT))
             .expect("must be able to set a read timeout on the client stream");
         stream
     }
@@ -403,7 +415,10 @@ mod unix {
             match stream.read_exact(&mut header) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => panic!("unexpected error while reading (not a clean EOF): {err}"),
+                Err(err) => panic!(
+                    "unexpected error while reading (not a clean EOF): kind={:?} {err}",
+                    err.kind()
+                ),
             }
             let parsed = FrameHeader::from_bytes(header).expect("response header must be valid");
             let mut body = vec![0u8; parsed.body_len()];
@@ -1010,11 +1025,29 @@ mod unix {
         let mut sink = dir.output_sink();
         let recorder = CollectRecorder::default();
 
+        let served_at = Instant::now();
         let report = connection.serve_with_recorder(&mut sink, writeback_timeouts(), &recorder);
+        let serve_elapsed = served_at.elapsed();
         drop(connection);
-        let acked = client_thread.join().expect("client thread must not panic");
+        // join の失敗を先に panic させず、サーバー側の終了理由と所要を添えて出す
+        // （#3649: client の EOF 待ちの失敗からは原因が区別できなかった）。
+        let joined = client_thread.join();
+        let acked = joined.unwrap_or_else(|_| {
+            panic!(
+                "client thread panicked: server end={:?} serve_elapsed={serve_elapsed:?}",
+                report.end
+            )
+        });
 
         assert_eq!(acked, vec![0, 1, 2, 3]);
+        // client の half-close による EOF は Unavailable で終わる。Timeout なら
+        // サーバーが half-close を観測できず受信期限まで待ったことを示す。
+        assert_eq!(
+            report.end.code(),
+            fandhe_container_io::IoErrorCode::Unavailable,
+            "serve_elapsed={serve_elapsed:?} end={:?}",
+            report.end
+        );
         assert_eq!(report.stats.batches_written, 2);
         let samples = recorder.0.lock().expect("recorder lock").clone();
         let pairs: Vec<_> = samples.iter().map(|s| (s.kind(), s.outcome())).collect();

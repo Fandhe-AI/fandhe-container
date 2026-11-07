@@ -18,8 +18,8 @@
 //! # 後始末（REPAIR-5）
 //! [`ExecSession`] の `exit` future を drop する（セッションの終了・切断・期限切れ）と、持ち主の `HelperGuard` が helper を
 //! SIGKILL する。helper の channel が閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を回収する。回収できない
-//! helper は上限つきの一覧に保持して次の `launch` で掃除し、満杯なら新しい exec を `RESOURCE_EXHAUSTED` にする。
-//! [`SupervisorExecLauncher::shutdown_all`] は plugin-cri の停止時に追跡中の全 helper を kill する。
+//! helper は専用スレッドが `wait` して回収し（Child を落とさない）、その数が上限に達したら新しい exec を `RESOURCE_EXHAUSTED` にする。kill は呼び出しスレッドをブロックしない。
+//! [`SupervisorExecLauncher::shutdown_all`] は plugin-cri の停止時に追跡中の全 helper を kill する。停止後の `launch` は拒否し、登録の競合で漏れた helper も直ちに止める。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
 //! - tty: 受け側（`PtyMaster` の検証と resize の転送）は実装・試験済みだが、helper が `--tty` を受けず supervisor の
@@ -76,9 +76,6 @@ const STARTED_BUDGET: Duration = Duration::from_secs(25);
 
 /// helper の期限（`--timeout-ms`）に足す、`Result` を待つ余裕。
 const RESULT_GRACE: Duration = Duration::from_secs(30);
-
-/// kill 後に回収を待つ上限（10 ms 刻み）。
-const REAP_WAIT: Duration = Duration::from_millis(500);
 
 /// helper が 1 件の exec を保持してよい最長（supervisor の exec 全体の上限）。
 const SESSION_TIMEOUT: Duration = Duration::from_secs(MAX_EXEC_HOLD_SECS);
@@ -148,12 +145,22 @@ impl HelperSpawner for ProductionHelperSpawner {
     }
 }
 
-/// launcher 全体で共有する状態（同時数・回収できない helper・追跡中の helper）。
+/// 追跡中の helper の一覧と停止状態。停止の印と登録を同じ lock で扱い、停止後の登録を漏らさない（REPAIR-5）。
+#[derive(Default)]
+struct Live {
+    stopped: bool,
+    guards: Vec<Weak<HelperGuard>>,
+}
+
+/// launcher 全体で共有する状態（同時数・回収中の helper・追跡中の helper）。
 #[derive(Default)]
 struct Shared {
     active: AtomicUsize,
+    /// 専用スレッドが `wait` 中の kill 済み helper の数。
+    reaping: AtomicUsize,
+    /// 回収スレッドを作れなかった kill 済み helper。Child を落とさず終了確認まで保持する。
     stuck: Mutex<Vec<Child>>,
-    live: Mutex<Vec<Weak<HelperGuard>>>,
+    live: Mutex<Live>,
 }
 
 /// 同時数の枠。drop で返す。
@@ -171,7 +178,7 @@ impl Shared {
         {
             let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
             stuck.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-            if stuck.len() >= MAX_STUCK_HELPERS {
+            if stuck.len() + self.reaping.load(Ordering::SeqCst) >= MAX_STUCK_HELPERS {
                 return Err(CriError::resource_exhausted("too many exec helpers"));
             }
         }
@@ -191,6 +198,8 @@ struct HelperGuard {
 }
 
 impl HelperGuard {
+    /// SIGKILL を送って回収する。呼び出しスレッドをブロックしない（tokio の実行時の上で呼ばれうる）。
+    /// 直ちに回収できなければ、専用スレッドが `wait` する（Child を落とさず zombie を作らない）。
     fn kill(&self) {
         let taken = self
             .child
@@ -202,24 +211,37 @@ impl HelperGuard {
             return;
         }
         let _ = child.kill();
-        let until = Instant::now() + REAP_WAIT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < until => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => break,
-            }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
         }
-        // 回収できなかった helper は保持して、次の `launch` の入口で掃除する。
-        let mut stuck = self
-            .shared
-            .stuck
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if stuck.len() < MAX_STUCK_HELPERS {
-            stuck.push(child);
+        let shared = Arc::clone(&self.shared);
+        let child = Arc::new(Mutex::new(Some(child)));
+        let child_for_thread = Arc::clone(&child);
+        shared.reaping.fetch_add(1, Ordering::SeqCst);
+        let shared_for_thread = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("exec-reap".to_string())
+            .spawn(move || {
+                let taken = child_for_thread
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(mut c) = taken {
+                    let _ = c.wait();
+                }
+                shared_for_thread.reaping.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            // スレッドを作れなければ保持して、次の `launch` の入口で掃除する（上限なし。Child は落とさない）。
+            shared.reaping.fetch_sub(1, Ordering::SeqCst);
+            let taken = child.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(c) = taken {
+                shared
+                    .stuck
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(c);
+            }
         }
     }
 }
@@ -408,14 +430,17 @@ impl SupervisorExecLauncher {
 
     /// 追跡中の全 helper を kill する（plugin-cri の停止時。REPAIR-5）。
     pub fn shutdown_all(&self) {
-        let guards: Vec<Arc<HelperGuard>> = self
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
+        // 停止の印を先に立て、以降の登録は拒否する。全 helper へ先に kill を送り、回収は各スレッドに任せる
+        // （直列に待たない。共通の停止期限を食わない）。
+        let guards: Vec<Arc<HelperGuard>> = {
+            let mut live = self
+                .shared
+                .live
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            live.stopped = true;
+            live.guards.iter().filter_map(Weak::upgrade).collect()
+        };
         for g in guards {
             g.kill();
         }
@@ -431,6 +456,15 @@ impl SupervisorExecLauncher {
             return Err(CriError::invalid_argument(
                 "exec with tty cannot use stderr",
             ));
+        }
+        if self
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped
+        {
+            return Err(CriError::unavailable("exec launcher is stopped"));
         }
         let slot = self.shared.acquire()?;
 
@@ -502,14 +536,24 @@ impl SupervisorExecLauncher {
             shared: Arc::clone(&self.shared),
             _slot: slot,
         });
-        {
+        let stopped = {
             let mut live = self
                 .shared
                 .live
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            live.retain(|w| w.strong_count() > 0);
-            live.push(Arc::downgrade(&guard));
+            if live.stopped {
+                true
+            } else {
+                live.guards.retain(|w| w.strong_count() > 0);
+                live.guards.push(Arc::downgrade(&guard));
+                false
+            }
+        };
+        if stopped {
+            // 停止後に起動した helper は直ちに止める（`shutdown_all` の一覧から漏れるため）。
+            guard.kill();
+            return Err(CriError::unavailable("exec launcher is stopped"));
         }
 
         send_stdio_handover(

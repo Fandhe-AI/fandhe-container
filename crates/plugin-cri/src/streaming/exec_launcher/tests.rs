@@ -510,3 +510,21 @@ async fn cri6_3761_non_pty_master_fails_the_launch() {
 fn cri6_3761_production_spawner_has_no_tty_capability() {
     assert!(!ProductionHelperSpawner.capabilities().tty);
 }
+
+/// 停止後の `launch` は拒否され、helper を起動しない（REPAIR-5・#3761）。
+#[tokio::test]
+async fn cri6_3761_launch_after_shutdown_is_rejected() {
+    let fx = Fixture::new("after-stop");
+    let script: Script = Arc::new(|_end, _mask| {});
+    let (launcher, pids) = fx.launcher(false, script);
+    launcher.shutdown_all();
+    let Err(e) = launcher
+        .launch(req("run1", false, true, false, false))
+        .await
+    else {
+        panic!("launch after shutdown must be rejected");
+    };
+    assert_eq!(e.code(), CriErrorCode::Unavailable);
+    assert!(pids.lock().expect("lock").is_empty());
+    assert_eq!(launcher.active_sessions(), 0);
+}

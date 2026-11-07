@@ -8,7 +8,7 @@
 //! 結線済みは Attach（読み取り専用。[`log_attach::LogFollowAttachBackend`]。回転ログの follow で、stdin・tty は
 //! `INVALID_ARGUMENT`。完全版は #3765 の設計。#3763）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
-//! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（[`exec_launcher::SupervisorExecLauncher`]。
+//! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr のみで、tty と相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
 //! 非 Linux は「exec streaming is not wired」の `UNIMPLEMENTED`。`wiring` は bind 時に 1 回だけ取られるため、
 //! ハンドラは必ず bind より前に足す（[`bind_production_streaming`] が順序を固定する）。

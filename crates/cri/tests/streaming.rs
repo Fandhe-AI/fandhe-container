@@ -40,7 +40,7 @@ use fandhe_container_cri::streaming::exec::{
     TerminalResizer,
 };
 use fandhe_container_cri::streaming::port_forward::{
-    PortForwardConfig, PortForwardDialer, PortForwardHandler,
+    PortForwardConfig, PortForwardDialer, PortForwardHandler, PortForwardNetwork, PortForwardTarget,
 };
 use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_cri::streaming::spdy::{
@@ -213,11 +213,14 @@ struct FakeDialer {
 impl PortForwardDialer for FakeDialer {
     fn dial(
         &self,
-        pod_sandbox_id: &str,
+        target: &PortForwardTarget,
         port: u16,
         timeout: Duration,
     ) -> Result<TcpStream, CriError> {
-        if pod_sandbox_id != self.sandbox || port != 80 {
+        if target.pod_sandbox_id() != self.sandbox
+            || target.network() != PortForwardNetwork::Node
+            || port != 80
+        {
             return Err(CriError::unavailable("no route"));
         }
         TcpStream::connect_timeout(&self.echo, timeout)
@@ -271,6 +274,17 @@ fn pod_config() -> PodSandboxConfig {
             uid: "uid-1".into(),
             namespace: "ns".into(),
             attempt: 0,
+        }),
+        // PortForward は NODE の pod だけ結線済み（POD は #3766 まで UNIMPLEMENTED。#3755）。
+        linux: Some(v1::LinuxPodSandboxConfig {
+            security_context: Some(v1::LinuxSandboxSecurityContext {
+                namespace_options: Some(v1::NamespaceOption {
+                    network: v1::NamespaceMode::Node as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         }),
         ..Default::default()
     }

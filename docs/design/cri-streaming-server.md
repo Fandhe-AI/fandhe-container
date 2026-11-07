@@ -14,8 +14,8 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Exec の SPDY/3.1・Upgrade 後のストリーム | 実装済み（`ExecStreamHandler`。#681 の codec・交渉・`SessionLimits` を再利用。起動役の本番の実装は未実装。注入が無ければ Exec は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #680（TASK-63.2） |
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
-| plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し空の `StreamDispatcher` で注入。結線済みの種別は無く 3 RPC は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | 未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは #3755 の PortForward〔NODE のみ〕で、Exec・Attach は「not wired」の `UNIMPLEMENTED`） | #3754 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の helper・Attach・POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -200,7 +200,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 **stdio と pty**:
 
 - stdin / stdout / stderr を別々に付け替える処理は core（#3757）が持ち、`ExecLaunchIo` を拡張する。要求されない stdio は `/dev/null` のまま。既存の healthcheck の挙動は変えない
-- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置（Landlock と seccomp の再適用より前、または `dev_mounts` の権利の範囲）は #3758 で確定する。ホストの devpts で代わりに割り当てる方式は採らない
+- pty は worker（コンテナの mount namespace に参加した後）が、コンテナの devpts（`/dev/ptmx` は `pts/ptmx` への symlink。[dev-default-mounts.md](dev-default-mounts.md)）で開く。runc と同じくコンテナ内で `ttyname` が成り立つ。slave は `setsid` と `TIOCSCTTY` で controlling terminal にして fd 0〜2 に付ける。master は core の既存の worker から親への SCM_RIGHTS で helper へ返し、helper が channel の `PtyMaster` で plugin-cri へ返す。受け側は master が文字デバイスであることを fstat で確かめる。開く位置は、Landlock と seccomp の再適用の **後** に `ExecReady::allocate_pty` で、照合済みの `/` の fd から `dev` → `pts` → `ptmx` を 1 要素ずつ symlink 非追従で辿って開く（#3758 で確定。コマンドと同じ権利で開き、launch より広げない。暗黙の `/dev/pts` に `READ|WRITE|IOCTL_DEV` が付くため通る想定で、実コンテナでの確認は #3762。通らなければ再適用の前へ移す判断をオーナーに仰ぐ）。slave は `ChildStdio::from_pty_slave` が fd 0〜2 に付け、子が `setsid` の直後に `TIOCSCTTY` を発行する。master は worker がコマンドの fork の前に `spawn_exec_worker_with_listener_and_pty` の口で親へ送って閉じる（コマンドは master を持たない）。ホストの devpts で代わりに割り当てる方式は採らない
 - resize は、plugin-cri が持つ master へ `TIOCSWINSZ` を発行する（core の安全なラッパー。supervisor への往復なし）
 
 **SEC-1**:
@@ -345,6 +345,8 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - NODE が先に成り立つ理由: NODE ネットワークでは network namespace の要素を作らず（host netns）、本番の `NetworkReady` は false なので、現状 kubelet が受ける Pod は hostNetwork だけである
 - NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
 - hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
+- 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が loopback であることを確かめる。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
+- 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時は Upgrade 後のセッションと blocking の dial（最長 10 秒）をランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
 
 **POD（#3766）**: #2877（pod の namespace 保持役）が入るまで `UNIMPLEMENTED` とする。URL の発行前に断るのが望ましく、#3753 の結線情報で扱う。dialer 側でも `CriError::unimplemented` を返す（多層防御）。候補は、単一スレッドの helper が保持役の fd で pod の userns・netns へ入って connect し接続済みの fd を SCM_RIGHTS で返す案と、保持役に connect を頼む案（保持役の攻撃面が広がるので劣後）で、最終判断は #3766 に置く。
 
@@ -376,7 +378,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | ----- | ---- | ------------------------------------ |
 | #3753 | 結線済みの種別だけ URL を発行する | 実装済み（種別単位の結線情報 `StreamWiring` のみ。下の「結線情報（#3753・REPAIR-3）」）。attach の読み取り専用（#3763。`attach_interactive` として実装済み）・POD 未対応（#3766）・exec の相対 argv[0]（#3761）を RPC 時に断る情報は、`StreamWiring` に項目を足して各 issue が入れる |
 | #3754 | `StreamingServer` の起動・注入 | 実装済み（plugin-cri の `streaming`。下の「plugin-cri での起動と停止（#3754）」） |
-| #3755 | NODE の dialer | cri の `PortForwardDialer` の引数に対象の型を足す（cri の変更を含む） |
+| #3755 | NODE の dialer | 実装済み。cri の `PortForwardDialer::dial` の引数を `PortForwardTarget { pod_sandbox_id, network: PortForwardNetwork }` にし、`StreamRequest::PortForward { request, network }` と `StreamWiring::port_forward_pod_network`（既定は偽）を足した。plugin-cri の `NodeLoopbackDialer`（`streaming/node_dialer.rs`）が `127.0.0.1:<port>` へ接続する |
 | #3756 | 試験 | — |
 | #3757 | `ExecLaunchIo` と core の stdio 拡張 | — |
 | #3758 | core の pty | コンテナの devpts で worker が開き、master は core の既存の worker から親への SCM_RIGHTS で返す |
@@ -404,7 +406,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 ## 残るもの
 
-- 3 つの本番 backend の実装と結線（設計は「本番 backend の設計」の節、実装は #3755・#3761・#3763 ほか）
+- Exec と Attach の本番 backend の実装と結線（設計は「本番 backend の設計」の節、実装は #3761・#3763 ほか。PortForward の NODE は #3755 で実装済み、POD は #3766）
 - 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3）
 - `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（backend が入った時点。REPAIR-5）
@@ -416,7 +418,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 - 置き場は plugin-cri の `streaming`（`production_streaming_config`・`production_stream_dispatcher`・`bind_production_streaming`・`stop_streaming_on`）。`main.rs` が runtime の構築直後、UDS の bind より前に呼ぶ
 - 設定は `StreamingConfig::default()`（`127.0.0.1:0`・外部公開なし・TTL 60 秒）。外部公開の口は plugin-cri から出さない。TLS・認証は無く、URL のトークンが唯一の認可
-- dispatcher は空（全種別が未結線）で注入し、3 RPC は「not wired」の `UNIMPLEMENTED` のまま。兄弟 issue は `production_stream_dispatcher` へ `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
+- dispatcher は PortForward（NODE の `NodeLoopbackDialer`）だけ結線して注入する（#3755。`production_stream_dispatcher` は `PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。Exec・Attach は「not wired」の `UNIMPLEMENTED` のまま。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
 - 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
 
@@ -432,3 +434,4 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - `StreamingUrlIssuer::issue` も未結線の種別を乱数源とトークン枠の消費より前に断る（多層防御）。未結線の RPC を繰り返しても、結線済みの種別の発行枠（`max_in_flight`）は埋まらない
 - 未結線の種別の HTTP 側の 501 は、issuer を経ない到達に対する多層防御として残す
 - `StreamWiring` は後から項目を足せる構造体で、種別ごとの結線の有無と、attach が stdin・tty を扱えるか（`attach_interactive`。#3763）を持つ。既定は全未結線かつ非対話（fail-closed）。`StreamDispatcher::wiring()` は Attach の子の `attach_interactive` を伝える
+- `StreamWiring::port_forward_pod_network`（#3755）は PortForward が POD ネットワークの pod にも対応するかを表し、既定は偽（fail-closed）。`only`・`with` では立たず、`all()`（試験用の全機能）と `with_port_forward_pod_network` で立つ。`StreamDispatcher` は子ハンドラの宣言を引き継ぐ

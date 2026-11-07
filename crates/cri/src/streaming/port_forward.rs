@@ -10,9 +10,11 @@
 //! ## 転送先への接続は注入点（REPAIR-3）
 //!
 //! 転送先（サンドボックスのネットワーク名前空間内のポート）への TCP 接続は [`PortForwardDialer`] に切り出した。
-//! cri は名前空間の具象（setns・pod ネットワークの保持役）を知らない層のため、本 PR は接続の注入点と中継までを
-//! 実装し、**本番の dialer と plugin-cri へのハンドラ注入は未実装**である（後続の issue）。既定でホストの
-//! `127.0.0.1` へつなぐ実装は置かない（URL を知る者にホストのローカルサービスを晒す経路になるため）。
+//! cri は名前空間の具象（setns・pod ネットワークの保持役）を知らない層のため、cri は接続の注入点と中継までを
+//! 持つ。本番の dialer は NODE ネットワーク（hostNetwork）の pod だけ plugin-cri が実装する（#3755）。
+//! POD ネットワークの pod は保持役（#2877）と helper 方式（#3766）まで `UNIMPLEMENTED` である（REPAIR-3）。
+//! 既定でホストの `127.0.0.1` へつなぐ実装は cri には置かない（URL を知る者にホストのローカルサービスを
+//! 晒す経路になるため。NODE に限って plugin-cri だけが置く）。
 //!
 //! ## 安全側の既定（REPAIR-5）
 //!
@@ -63,20 +65,66 @@ const COMPACT_THRESHOLD: usize = 4 * 1024;
 /// `poll` 1 回で回す最大ラウンド数（他のタスクを飢えさせない）。
 const MAX_ROUNDS: usize = 64;
 
+/// 転送先の pod のネットワーク種別（CRI-6・SEC-1・#3755）。
+///
+/// `runtime_service` が RPC 時に sandbox の記録（`namespace_options.network`）から決め、発行時の要求に
+/// 保存する。NODE（hostNetwork）と判定できたときだけ `Node` で、それ以外はすべて `Pod`（fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortForwardNetwork {
+    /// host の network namespace を使う pod。host の loopback へ接続する。
+    Node,
+    /// pod 専用の network namespace を使う pod。保持役（#2877）が入るまで未実装（#3766）。
+    Pod,
+}
+
+/// [`PortForwardDialer::dial`] に渡す転送先（保存済み要求の値。URL やヘッダから組み立て直さない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardTarget {
+    pod_sandbox_id: String,
+    network: PortForwardNetwork,
+}
+
+impl PortForwardTarget {
+    /// 転送先を作る。
+    pub fn new(pod_sandbox_id: impl Into<String>, network: PortForwardNetwork) -> Self {
+        Self {
+            pod_sandbox_id: pod_sandbox_id.into(),
+            network,
+        }
+    }
+
+    /// sandbox ID。
+    pub fn pod_sandbox_id(&self) -> &str {
+        &self.pod_sandbox_id
+    }
+
+    /// pod のネットワーク種別。
+    pub fn network(&self) -> PortForwardNetwork {
+        self.network
+    }
+}
+
 /// 転送先への TCP 接続の注入点。cri は名前空間の具象を知らない（CRI-7・PLUG-1）。
 ///
 /// `StreamingServer` の Upgrade 後のタスクが `spawn_blocking` 上で呼ぶ（ブロッキングで構わない）。
-/// 実装は `pod_sandbox_id`（保存済み要求の値。URL やヘッダから組み立て直さない）のネットワーク名前空間内の
-/// `port` へ接続する。エラーにパス・内部情報を含めない。`timeout` を超えて待たないこと。
+/// 実装は `target` の pod のネットワーク内の `port` へ接続する。`target.network()` が実装の対応外
+/// （POD など）なら `UNIMPLEMENTED` を返す。エラーにパス・内部情報を含めない。`timeout` を超えて待たないこと。
 /// 呼び出し全体にも [`PortForwardConfig::dial_timeout`] の期限が掛かる。
 pub trait PortForwardDialer: Send + Sync + 'static {
     /// 転送先へ接続する。
     fn dial(
         &self,
-        pod_sandbox_id: &str,
+        target: &PortForwardTarget,
         port: u16,
         timeout: Duration,
     ) -> Result<std::net::TcpStream, CriError>;
+
+    /// POD ネットワークの pod にも接続できるか。既定は false（fail-closed）。
+    ///
+    /// 真を返す実装を注入したときだけ、POD の pod の PortForward RPC が URL を発行する（#3766 が使う）。
+    fn supports_pod_network(&self) -> bool {
+        false
+    }
 }
 
 /// PortForward の上限と期限（REPAIR-5）。
@@ -230,6 +278,7 @@ impl PortForwardHandler {
     fn start(
         &self,
         request: crate::runtime::v1::PortForwardRequest,
+        network: PortForwardNetwork,
         http: Request<Incoming>,
         permit: ConnectionPermit,
     ) -> Response<StreamBody> {
@@ -247,7 +296,7 @@ impl PortForwardHandler {
             .iter()
             .map(|p| u16::try_from(*p).unwrap_or(0))
             .collect();
-        let sandbox = request.pod_sandbox_id;
+        let target = PortForwardTarget::new(request.pod_sandbox_id, network);
         tokio::spawn(async move {
             let started = Instant::now();
             let end = match on_upgrade.await {
@@ -255,7 +304,7 @@ impl PortForwardHandler {
                     match Session::new(
                         TokioIo::new(upgraded),
                         dialer,
-                        sandbox,
+                        target,
                         allowed,
                         config,
                         dial_inflight,
@@ -276,7 +325,12 @@ impl PortForwardHandler {
 
 impl StreamHandler for PortForwardHandler {
     fn wiring(&self) -> StreamWiring {
-        StreamWiring::only(StreamKind::PortForward)
+        let wiring = StreamWiring::only(StreamKind::PortForward);
+        if self.dialer.supports_pod_network() {
+            wiring.with_port_forward_pod_network()
+        } else {
+            wiring
+        }
     }
 
     fn handle(
@@ -286,8 +340,8 @@ impl StreamHandler for PortForwardHandler {
         permit: ConnectionPermit,
     ) -> Pin<Box<dyn Future<Output = Response<StreamBody>> + Send + '_>> {
         match request {
-            StreamRequest::PortForward(pf) => {
-                let response = self.start(pf, http, permit);
+            StreamRequest::PortForward { request, network } => {
+                let response = self.start(request, network, http, permit);
                 Box::pin(async move { response })
             }
             _ => Box::pin(async {
@@ -476,7 +530,7 @@ struct Session<IO> {
     last_syn_id: u32,
     pairs: HashMap<String, Pair>,
     dialer: Arc<dyn PortForwardDialer>,
-    sandbox: String,
+    target: PortForwardTarget,
     allowed: Vec<u16>,
     config: PortForwardConfig,
     scratch: Vec<u8>,
@@ -494,7 +548,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
     fn new(
         io: IO,
         dialer: Arc<dyn PortForwardDialer>,
-        sandbox: String,
+        target: PortForwardTarget,
         allowed: Vec<u16>,
         config: PortForwardConfig,
         dial_inflight: Arc<AtomicUsize>,
@@ -518,7 +572,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             last_syn_id: 0,
             pairs: HashMap::new(),
             dialer,
-            sandbox,
+            target,
             allowed,
             scratch: vec![0u8; DATA_CHUNK],
             last_activity: Instant::now(),
@@ -853,7 +907,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
             let slot = DialSlot::acquire(&self.dial_inflight, self.config.max_inflight_dials);
             pair.phase = Phase::Dialing(make_dial(
                 Arc::clone(&self.dialer),
-                self.sandbox.clone(),
+                self.target.clone(),
                 pair.port,
                 self.config.dial_timeout,
                 slot,
@@ -919,7 +973,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Session<IO> {
 
 fn make_dial(
     dialer: Arc<dyn PortForwardDialer>,
-    sandbox: String,
+    target: PortForwardTarget,
     port: u16,
     timeout: Duration,
     slot: Option<DialSlot>,
@@ -931,7 +985,7 @@ fn make_dial(
         let join = tokio::task::spawn_blocking(move || {
             // 枠は blocking 処理が終わるまで保持する（future の drop では返さない）。
             let _slot = slot;
-            dialer.dial(&sandbox, port, timeout)
+            dialer.dial(&target, port, timeout)
         });
         match tokio::time::timeout(timeout, join).await {
             Ok(Ok(Ok(std_tcp))) => {
@@ -1202,6 +1256,41 @@ mod tests {
         }
     }
 
+    /// POD 対応を宣言する dialer（結線情報の試験用）。
+    struct PodCapableDialer;
+
+    impl PortForwardDialer for PodCapableDialer {
+        fn dial(
+            &self,
+            _target: &PortForwardTarget,
+            _port: u16,
+            _timeout: Duration,
+        ) -> Result<std::net::TcpStream, CriError> {
+            Err(CriError::unavailable("unused"))
+        }
+        fn supports_pod_network(&self) -> bool {
+            true
+        }
+    }
+
+    /// CRI-6・REPAIR-3・#3755: `supports_pod_network` が既定（偽）の dialer では結線情報に POD 対応が立たず、
+    /// 真を返す dialer のときだけ立つ。
+    #[test]
+    fn cri6_3755_wiring_pod_network_follows_dialer() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let plain = PortForwardHandler::new(
+            Arc::new(BlockingDialer { open }),
+            PortForwardConfig::default(),
+        )
+        .expect("handler");
+        assert!(plain.wiring().is_wired(StreamKind::PortForward));
+        assert!(!plain.wiring().port_forward_pod_network());
+        let capable =
+            PortForwardHandler::new(Arc::new(PodCapableDialer), PortForwardConfig::default())
+                .expect("handler");
+        assert!(capable.wiring().port_forward_pod_network());
+    }
+
     /// 門（フラグ）が開くまで blocking プール上で待つ dialer（枠の共有の試験用）。
     struct BlockingDialer {
         open: Arc<std::sync::atomic::AtomicBool>,
@@ -1210,7 +1299,7 @@ mod tests {
     impl PortForwardDialer for BlockingDialer {
         fn dial(
             &self,
-            _pod_sandbox_id: &str,
+            _target: &PortForwardTarget,
             _port: u16,
             _timeout: Duration,
         ) -> Result<std::net::TcpStream, CriError> {
@@ -1248,7 +1337,7 @@ mod tests {
             assert!(slot.is_some());
             let fut = make_dial(
                 Arc::clone(&dialer),
-                "sb".to_string(),
+                PortForwardTarget::new("sb", PortForwardNetwork::Node),
                 80,
                 Duration::from_millis(50),
                 slot,

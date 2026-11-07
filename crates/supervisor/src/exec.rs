@@ -3649,7 +3649,7 @@ mod tests {
     #[test]
     fn sup6_2822_worker_result_carries_every_exec_child_step() {
         let base = sample_outcome();
-        assert_eq!(fandhe_container_core::exec::exec_child_steps().len(), 15);
+        assert_eq!(fandhe_container_core::exec::exec_child_steps().len(), 16);
         for step in fandhe_container_core::exec::exec_child_steps() {
             let outcome = ExecOutcome {
                 exit: ExecExit::SetupFailed {

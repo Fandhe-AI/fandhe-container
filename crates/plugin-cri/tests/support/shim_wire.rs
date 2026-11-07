@@ -3,7 +3,6 @@
 //! 呼び出し元: plugin-cri の shim バイナリ試験（`shim_bin_*.rs`）が `#[path]` で共有する。prost を plugin-cri の依存に
 //! 足さない（依存は承認制）ため、試験に要る最小限（要求の組み立てと応答の読み取り）だけを std で書く。
 //! 外部入力（子プロセスの応答）の解析では `unwrap`・添字アクセスを使わず `Option` で返す。
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -13,6 +12,7 @@ use std::time::Duration;
 use fandhe_container_cri::shim_v2::{FrameHeader, HEADER_LEN, MessageType};
 
 /// ttrpc の応答（status の code・message と payload）。status が無ければ成功。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Resp {
     pub status: Option<(i32, String)>,
@@ -20,6 +20,7 @@ pub struct Resp {
 }
 
 /// `DeleteResponse` / `StateResponse` の試験が見る欄。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskFields {
     pub id: String,
@@ -29,6 +30,7 @@ pub struct TaskFields {
     pub has_exited_at: bool,
 }
 
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -42,6 +44,7 @@ pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// 長さ区切りの欄（string・bytes・message）。空は省略する（proto3 の既定値と同じ）。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn put_len(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -52,6 +55,7 @@ pub fn put_len(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
 }
 
 /// varint の欄。0 は省略する。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn put_uint(out: &mut Vec<u8>, field: u64, v: u64) {
     if v == 0 {
         return;
@@ -61,6 +65,7 @@ pub fn put_uint(out: &mut Vec<u8>, field: u64, v: u64) {
 }
 
 /// `{ string id = 1; string exec_id = 2; }`（State・Delete・Wait・Start の要求）。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn id_request(id: &str) -> Vec<u8> {
     let mut b = Vec::new();
     put_len(&mut b, 1, id.as_bytes());
@@ -68,6 +73,7 @@ pub fn id_request(id: &str) -> Vec<u8> {
 }
 
 /// `KillRequest { id = 1; exec_id = 2; signal = 3; all = 4 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn kill_request(id: &str, signal: u32, all: bool) -> Vec<u8> {
     let mut b = id_request(id);
     put_uint(&mut b, 3, u64::from(signal));
@@ -76,6 +82,7 @@ pub fn kill_request(id: &str, signal: u32, all: bool) -> Vec<u8> {
 }
 
 /// `ShutdownRequest { id = 1; now = 2 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn shutdown_request(id: &str, now: bool) -> Vec<u8> {
     let mut b = id_request(id);
     put_uint(&mut b, 2, u64::from(now));
@@ -83,6 +90,7 @@ pub fn shutdown_request(id: &str, now: bool) -> Vec<u8> {
 }
 
 /// `CreateTaskRequest { id = 1; bundle = 2 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn create_request(id: &str, bundle: &str) -> Vec<u8> {
     let mut b = id_request(id);
     put_len(&mut b, 2, bundle.as_bytes());
@@ -90,6 +98,7 @@ pub fn create_request(id: &str, bundle: &str) -> Vec<u8> {
 }
 
 /// ttrpc の `Request { service = 1; method = 2; payload = 3 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn encode_request(service: &str, method: &str, payload: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     put_len(&mut b, 1, service.as_bytes());
@@ -138,6 +147,7 @@ fn fields(buf: &[u8]) -> Option<Vec<(u64, Val<'_>)>> {
 }
 
 /// ttrpc の応答 `Response { status = 1 { code = 1; message = 2 }; payload = 2 }` を読む。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn decode_response(buf: &[u8]) -> Option<Resp> {
     let mut resp = Resp::default();
     for (f, v) in fields(buf)? {
@@ -161,6 +171,7 @@ pub fn decode_response(buf: &[u8]) -> Option<Resp> {
 }
 
 /// `DeleteResponse { pid = 1; exit_status = 2; exited_at = 3 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn decode_delete_response(buf: &[u8]) -> Option<TaskFields> {
     let mut t = TaskFields::default();
     for (f, v) in fields(buf)? {
@@ -175,6 +186,7 @@ pub fn decode_delete_response(buf: &[u8]) -> Option<TaskFields> {
 }
 
 /// `StateResponse { id = 1; pid = 3; status = 4; exit_status = 9; exited_at = 10 }`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn decode_state_response(buf: &[u8]) -> Option<TaskFields> {
     let mut t = TaskFields::default();
     for (f, v) in fields(buf)? {
@@ -191,6 +203,7 @@ pub fn decode_state_response(buf: &[u8]) -> Option<TaskFields> {
 }
 
 /// 1 要求 1 接続で呼ぶ。応答は期限つきで読む（REPAIR-5）。失敗は理由つきの `Err`。
+#[allow(dead_code, reason = "取り込み元の試験によっては使わない共有補助")]
 pub fn call_method(
     path: &Path,
     service: &str,

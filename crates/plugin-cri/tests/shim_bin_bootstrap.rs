@@ -23,6 +23,8 @@ const LIMIT: Duration = Duration::from_secs(30);
 const BIN: &str = env!("CARGO_BIN_EXE_containerd-shim-fandhe-container-v2");
 const UNIMPL: i32 = 12;
 
+#[path = "support/mini_json.rs"]
+mod mini_json;
 #[path = "../../core/tests/support/reap.rs"]
 mod reap;
 #[path = "support/shim_wire.rs"]
@@ -236,11 +238,15 @@ fn assert_failed(out: &Output, code: &str) {
     assert_eq!(out.stdout, b"");
     let err = String::from_utf8(out.stderr.clone()).unwrap();
     assert_eq!(err.lines().count(), 1, "{err}");
-    // serde_json を plugin-cri の依存に足さないため、固定形 `{"code":"<CODE>","message":"<message>"}` を文字列で照合する。
-    let prefix = format!("{{\"code\":\"{code}\",\"message\":\"");
-    assert!(err.trim_end().starts_with(&prefix), "{err}");
-    assert!(err.trim_end().ends_with("\"}"), "{err}");
-    assert!(err.trim_end().len() > prefix.len() + 2, "{err}");
+    // serde_json を plugin-cri の依存に足さないため、試験側の最小 JSON 検査（support/mini_json.rs）で構文と欄の型を照合する。
+    let v = mini_json::parse(err.trim_end()).unwrap_or_else(|| panic!("invalid JSON: {err}"));
+    assert_eq!(v.get("code").and_then(|x| x.as_str()), Some(code), "{err}");
+    assert!(
+        v.get("message")
+            .and_then(|x| x.as_str())
+            .is_some_and(|m| !m.is_empty()),
+        "{err}"
+    );
 }
 
 /// CRI-5・#872: socket パスに通常ファイルがあれば拒否し、内容を変えない。権限の緩いディレクトリも拒否する。

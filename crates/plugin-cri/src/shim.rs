@@ -6,7 +6,7 @@
 //! `crates/cri/tests/dependency_direction.rs` が禁じているため、bin の置き場所をここにした
 //! （判断は `docs/design/shim-v2-production-binary.md`）。辺の向きは plugin-cri → cri・core の一方向のままで、core は変わらない（PLUG-4）。
 //!
-//! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の `FileStateStore` の上に
+//! 組み立て（Linux）: 既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）の下を containerd の address・namespace ごとに分けた（`scoped_root`） `FileStateStore` の上に
 //! `CoreLifecycleRuntime` を作り、`RuntimeAdapter` で包んで `TaskService`（v2・v3。`with_shared_created` で共有）を登録する。
 //! デーモンの監査の記録先（`ServeContext::audit_sink`）を `with_create_audit_sink` に渡し、create の `mounts[].destination` の拒否を
 //! peer UID の拒否と同じ `@audit.log` へ残す（SEC-4）。
@@ -30,14 +30,56 @@ use fandhe_container_cri::shim_v2::bootstrap::ServeContext;
 pub fn production_registry(ctx: ServeContext) -> Result<ServiceRegistry, CriError> {
     #[cfg(target_os = "linux")]
     {
-        let root = fandhe_container_core::state_store::StateRoot::resolve(None)
+        let base = fandhe_container_core::state_store::StateRoot::resolve(None)
             .map_err(|_| CriError::internal("cannot resolve the state root"))?;
+        let root = scoped_root(base.path(), &ctx)?;
         registry_in(root, ctx)
     }
     #[cfg(not(target_os = "linux"))]
     {
         empty_registry(ctx)
     }
+}
+
+/// containerd の address と namespace ごとに分けた状態ルートを返す（CRI-5・#3684）。
+///
+/// bootstrap の socket は address・namespace・ID ごとに分かれるため、状態も同じ粒度で分ける。分けないと、同一ユーザーが
+/// 別 namespace で同じ ID を作ったときに状態が衝突し、別 shim の State・Kill・Delete が同じ記録を参照できてしまう。
+/// namespace は検証済みの identifier（英数字と `._-`）なのでパス要素として安全で、address は FNV-1a の 16 桁 16 進に潰す。
+/// namespace が無い（containerd 以外の起動）ときは分けない。
+#[cfg(target_os = "linux")]
+pub(crate) fn scoped_root(
+    base: &std::path::Path,
+    ctx: &ServeContext,
+) -> Result<fandhe_container_core::state_store::StateRoot, CriError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(ns) = ctx.namespace() else {
+        return fandhe_container_core::state_store::StateRoot::from_override(base.to_path_buf())
+            .map_err(|_| CriError::internal("cannot resolve the state root"));
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    if let Some(a) = ctx.address() {
+        for b in a.as_os_str().as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let path = base
+        .join("shim")
+        .join(format!("{h:016x}"))
+        .join(ns.as_str());
+    // `FileStateStore::open` は最後の 1 階層しか作らないため、親（0700）をここで作る。ストアの検査が所有者・権限を確かめる。
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap_or(base))
+            .map_err(|_| CriError::internal("cannot create the state root"))?;
+    }
+    fandhe_container_core::state_store::StateRoot::from_override(path)
+        .map_err(|_| CriError::internal("cannot resolve the state root"))
 }
 
 /// 状態ルートを引数で受ける内側の関数（試験が一時ディレクトリの状態ルートで呼ぶ）。
@@ -157,5 +199,39 @@ mod tests {
         let resp = reg.dispatch(&request(SERVICES[0], "Shutdown", id_payload("nope")));
         assert!(resp.status.is_none(), "{:?}", resp.status);
         assert!(signal.wait_timeout(std::time::Duration::from_secs(5)));
+    }
+
+    /// CRI-5・#3684: namespace が違えば状態ルートが分かれ、同じ ID の State が互いに見えない。
+    #[test]
+    fn cri5_3684_namespaces_have_separate_state_roots() {
+        let guard = test_root::test_root("shim", "ns-roots");
+        let base = guard.join("state");
+        let mk = |ns: &str, addr: &str| {
+            ServeContext::new(ShutdownSignal::new(), None).with_origin(
+                Some(fandhe_container_cri::shim_v2::bootstrap::ShimIdentifier::parse(ns).unwrap()),
+                Some(std::path::PathBuf::from(addr)),
+            )
+        };
+        let a = scoped_root(&base, &mk("ns-a", "/run/c.sock")).unwrap();
+        let b = scoped_root(&base, &mk("ns-b", "/run/c.sock")).unwrap();
+        let c = scoped_root(&base, &mk("ns-a", "/run/d.sock")).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert_ne!(a.path(), c.path());
+        assert!(a.path().starts_with(base.join("shim")));
+        assert!(a.path().ends_with("ns-a"));
+    }
+
+    /// CRI-5・#3684: 分けた状態ルート（親ディレクトリが未作成）でも登録簿が開ける。
+    #[test]
+    fn cri5_3684_scoped_root_opens_registry() {
+        let guard = test_root::test_root("shim", "scoped");
+        let ctx = ServeContext::new(ShutdownSignal::new(), None).with_origin(
+            Some(fandhe_container_cri::shim_v2::bootstrap::ShimIdentifier::parse("ns1").unwrap()),
+            Some(std::path::PathBuf::from("/run/c.sock")),
+        );
+        let root = scoped_root(&guard.join("state"), &ctx).unwrap();
+        let reg = registry_in(root, ctx).expect("registry");
+        let resp = reg.dispatch(&request(SERVICES[0], "State", id_payload("nope")));
+        assert_eq!(resp.status.expect("status").code, NOT_FOUND);
     }
 }

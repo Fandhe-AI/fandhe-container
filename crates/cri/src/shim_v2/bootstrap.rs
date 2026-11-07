@@ -51,7 +51,7 @@
 //! - Windows。`run` は `UNIMPLEMENTED`
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fandhe_container_oci::reference::Digest;
 
@@ -349,6 +349,8 @@ fn version_text() -> Vec<u8> {
 pub struct ServeContext {
     shutdown: ShutdownSignal,
     audit: Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>>,
+    namespace: Option<ShimIdentifier>,
+    address: Option<PathBuf>,
 }
 
 impl ServeContext {
@@ -357,7 +359,33 @@ impl ServeContext {
         shutdown: ShutdownSignal,
         audit: Option<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>>,
     ) -> Self {
-        Self { shutdown, audit }
+        Self {
+            shutdown,
+            audit,
+            namespace: None,
+            address: None,
+        }
+    }
+
+    /// 呼び出しの containerd の namespace と ttrpc アドレスを足す（状態の分離キー。CRI-5・#3684）。
+    pub fn with_origin(
+        mut self,
+        namespace: Option<ShimIdentifier>,
+        address: Option<PathBuf>,
+    ) -> Self {
+        self.namespace = namespace;
+        self.address = address;
+        self
+    }
+
+    /// containerd の namespace（`-namespace`）。
+    pub fn namespace(&self) -> Option<&ShimIdentifier> {
+        self.namespace.as_ref()
+    }
+
+    /// containerd の ttrpc アドレス（`-address`）。
+    pub fn address(&self) -> Option<&Path> {
+        self.address.as_deref()
     }
 
     /// Task サービスの `with_shutdown` に差し込む終了要求の口。
@@ -1380,7 +1408,10 @@ mod unix_impl {
                 .map(|l| Box::new(l) as Box<dyn std::any::Any + Send>)
                 .map_err(|_| ())
         }));
-        let registry = make_registry(super::ServeContext::new(signal.clone(), audit.clone()))?;
+        let registry = make_registry(
+            super::ServeContext::new(signal.clone(), audit.clone())
+                .with_origin(inv.namespace.clone(), inv.address.clone()),
+        )?;
         let euid = crate::sys::effective_uid();
         let config = ServerConfig {
             // 同じ uid と root だけを受ける（PLUG-12）。

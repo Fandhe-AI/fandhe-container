@@ -115,10 +115,13 @@ mod linux {
     }
 
     fn kill_pid(sig: &str, pid: u32) {
-        let _ = Command::new("kill")
-            .args([&format!("-{sig}"), &pid.to_string()])
-            .stderr(Stdio::null())
-            .status();
+        // `kill` の待ちにも期限を持つ（watchdog の中からも呼ばれる。止まっても exit(124) へ進めるため。REPAIR-5）。
+        let _ = reap::run_within(
+            Command::new("kill")
+                .args([&format!("-{sig}"), &pid.to_string()])
+                .stderr(Stdio::null()),
+            Duration::from_secs(5),
+        );
     }
 
     fn watchdog() {

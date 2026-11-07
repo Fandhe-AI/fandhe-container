@@ -251,8 +251,30 @@ fn slave_rdev(index: u32) -> Option<u64> {
 pub fn open_host_pty_for_test(size: WindowSize) -> Result<(PtyMaster, PtySlave), ExecError> {
     let dev = sys::open_dir_path_nofollow(None, c"/dev")
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/dev)"))?;
-    let master = sys::open_rdwr_noctty_at(dev.as_fd(), c"ptmx")
-        .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/dev/ptmx)"))?;
+    // ホストによっては `/dev/ptmx` が `pts/ptmx` への symlink のため、試験専用の入口では symlink を辿って開き、
+    // 開いた実体が文字デバイス `5:2` であることを fstat で検証する（本番の `allocate_in_root` は `O_NOFOLLOW`
+    // のまま。#3758）。
+    let master: OwnedFd = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // `O_NOCTTY`（Linux の x86_64・aarch64 とも 0o400）で制御端末を取得しない。`O_CLOEXEC` は std が付ける。
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0o400)
+            .open("/dev/ptmx")
+            .map_err(|e| {
+                ExecError::new(
+                    ErrorCode::Internal,
+                    STAGE,
+                    format!("open(/dev/ptmx) failed: {e}"),
+                )
+            })?;
+        OwnedFd::from(file)
+    };
+    let meta = fstat(master.as_fd(), "fstat(/dev/ptmx)")?;
+    if !meta.file_type().is_char_device() || meta.rdev() != sys::makedev(PTMX_MAJOR, PTMX_MINOR) {
+        return Err(precondition("the host /dev/ptmx is not the ptmx node"));
+    }
     let index = sys::pty_unlock_and_index(master.as_fd())
         .map_err(|e| ExecError::from_sys(e, STAGE, "unlock the pty slave"))?;
     let pts = sys::open_dir_path_nofollow(Some(dev.as_fd()), c"pts")

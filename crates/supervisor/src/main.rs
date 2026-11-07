@@ -29,6 +29,13 @@ fn main() -> std::process::ExitCode {
     ) {
         return fandhe_container_supervisor::healthcheck::exec_reaper::run_health_reaper_main(args);
     }
+    // 第 1 引数が `stream-exec` なら CRI の Exec 用 helper へ振り分ける（SUP-6・SEC-1・REPAIR-5・#3760）。
+    // 同じ位置・同じ理由（結果を fd 0 の channel で返すため `run_main` の fd 検証・結果チャネルを通さない）。
+    // 特権ランチャーは `StartArgs::parse` を通った argv だけを転送するので、この分岐の入口にはならない。
+    if fandhe_container_supervisor::stream_exec::helper::is_stream_exec_invocation(first.as_deref())
+    {
+        return fandhe_container_supervisor::stream_exec::helper::run_stream_exec_main(args);
+    }
     fandhe_container_supervisor::start_entry::run_main(first.into_iter().chain(args))
 }
 

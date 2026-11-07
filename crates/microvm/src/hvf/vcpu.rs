@@ -3,7 +3,7 @@
 //! 役割: Hypervisor.framework の vCPU は作ったスレッドに束縛される（`hv_vcpu_run`・レジスタ操作・destroy は作成スレッドから
 //! 呼ぶ）。専用スレッドで `HvVcpu` を作って所有し、レジスタ初期化（`setup`）の後に実行ループを回す。ループ・停止・期限・観測の
 //! 論理は OS 非依存の `crate::hvf_loop` にあり（`hv_*` を呼ばない偽の実行体で単体試験できる）、本ファイルは次だけを持つ。
-//! - `HvVcpu` への [`VcpuExec`]（`pc` は未対応 exit の診断ログ用に `HvReg::PC` を読む。#4035・REPAIR-4。`advance_pc` は WFE 系の続行用。#4039）と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `WakingKick` で包む）
+//! - `HvVcpu` への [`VcpuExec`]（`pc` は未対応 exit の診断ログ用に `HvReg::PC` を読む。#4035・REPAIR-4。`advance_pc` は WFE 系の続行用。#4039）と `VcpuCanceller` への [`VcpuKick`] の実装（kick は `HvfKick`〔`hv_vcpus_exit` と AP のメールボックスの通知〕をそのまま渡す。GIC つきの WFI は `hv_vcpu_run` の中で待ち `hv_vcpus_exit` で起きるため、WFI を別に起こす手段は持たない。#3803・#4040）
 //! - [`VcpuThread::spawn`] と、分類した exit を `hvf::{mmio, hvc, sysreg}` のハンドラへ振り分ける関数
 //!
 //! 呼び出し元は #3797（構成体の組み立て。`setup` に PC・CPSR・X0（FDT のアドレス）等の初期化を渡し、ハンドラ状態を持たせる）。
@@ -57,7 +57,6 @@ use crate::hvf_loop::{
     stop_all,
 };
 use crate::hvf_smp::{ApMailbox, run_parked_ap};
-use crate::hvf_wake::{WakingKick, WfiWakeSet};
 use crate::psci::PsciCpus;
 use crate::stop::StopReason;
 use crate::sys::{HvVcpu, VcpuCanceller};
@@ -133,7 +132,7 @@ impl VcpuExec for HvfExec<'_> {
 }
 
 /// vCPU スレッドの kick。`hv_vcpus_exit` に加え、AP ではメールボックスの待ちも起こす（parked の AP が停止要求に即応する。#3891）。
-/// BSP は `mailbox = None`。
+/// BSP は `mailbox = None`。`LoopHandle` の kick と `VmShutdown` の peer の閉包は同じ 2 つの手段（cancel → メールボックスの notify）だけを使う（#4040）。
 #[derive(Debug)]
 pub struct HvfKick {
     canceller: VcpuCanceller,
@@ -152,7 +151,7 @@ impl VcpuKick for HvfKick {
 
 /// 起動済みの vCPU スレッドの操作口。
 #[derive(Debug)]
-pub struct VcpuHandle(LoopHandle<WakingKick<HvfKick, WfiWakeSet>>);
+pub struct VcpuHandle(LoopHandle<HvfKick>);
 
 impl VcpuHandle {
     /// スレッドが既に終わったか（ゲスト起因の終了を含む）。
@@ -350,13 +349,12 @@ impl VcpuThread {
         let slot_in = Arc::clone(&slot);
         let name = format!("hvf-vcpu-{index}");
         let mut handlers = handlers;
-        let wake = vm.wake_set();
         let kick_mailbox = Arc::clone(&mailbox);
         let shutdown = vm.shutdown();
         let handle = spawn_loop(
             &name,
             config.create_deadline,
-            move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
+            move |start: LoopStart<HvfKick>| {
                 // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
                 // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
                 // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
@@ -402,14 +400,13 @@ impl VcpuThread {
                     canceller: vcpu.canceller(),
                     mailbox: Some(kick_mailbox),
                 };
-                let peer = (vcpu.canceller(), Arc::clone(&mailbox), wake.clone());
-                let stop = start.ready(WakingKick::new(kick, wake));
+                let peer = (vcpu.canceller(), Arc::clone(&mailbox));
+                let stop = start.ready(kick);
                 shutdown.register(
                     Arc::clone(&stop),
                     Box::new(move || {
                         let _ = peer.0.cancel();
                         peer.1.notify();
-                        peer.2.notify_all();
                     }),
                 );
                 let mut exec = HvfExec(vcpu);
@@ -462,12 +459,11 @@ impl VcpuThread {
         let slice = config.run_slice;
         let observer = config.observer;
         let mut handlers = handlers;
-        let wake = vm.wake_set();
         let shutdown = vm.shutdown();
         let handle = spawn_loop(
             "hvf-vcpu-0",
             config.create_deadline,
-            move |start: LoopStart<WakingKick<HvfKick, WfiWakeSet>>| {
+            move |start: LoopStart<HvfKick>| {
                 // vCPU は `vm_run`（`vm` の `Arc` の clone）を借用する。`vm` 自身は借用させず、終了時に
                 // `drop_vcpu_thread_state` へ move して、vCPU・デバイス参照・スロットの後に落とす（#4032）。
                 // `vm_run` はこの closure のローカルで、関数のスコープの終わりに落ちる。`drop_vcpu_thread_state` が
@@ -500,14 +496,11 @@ impl VcpuThread {
                     drop_vcpu_thread_state((mmio, hvc), guest_memory, vm);
                     return (StopReason::Failed(code), HvRunStats::default());
                 }
-                let peer = (vcpu.canceller(), wake.clone());
-                let kick = WakingKick::new(
-                    HvfKick {
-                        canceller: vcpu.canceller(),
-                        mailbox: None,
-                    },
-                    wake,
-                );
+                let peer = vcpu.canceller();
+                let kick = HvfKick {
+                    canceller: vcpu.canceller(),
+                    mailbox: None,
+                };
                 let stop = if gated {
                     match start.ready_gated(kick) {
                         Ok(stop) => stop,
@@ -530,8 +523,7 @@ impl VcpuThread {
                 shutdown.register(
                     Arc::clone(&stop),
                     Box::new(move || {
-                        let _ = peer.0.cancel();
-                        peer.1.notify_all();
+                        let _ = peer.cancel();
                     }),
                 );
                 let mut exec = HvfExec(vcpu);

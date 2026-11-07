@@ -2,7 +2,7 @@
 //!
 //! 役割: macOS の `hvf::timer::handle_wfx` は WFI でホスト側に待つ。その待ちを `std::thread::sleep` ではなく
 //! [`WfiWaker::wait`] にし、(a) `hv_gic_set_spi` の assert 成功後（`hvf::gic` の SPI sink。virtio の完了通知・シリアル入力）と
-//! (b) 停止要求の kick（[`WakingKick`]。`LoopHandle::stop` / drop が `hv_vcpus_exit` の代わりに呼ぶ）から [`WfiWaker::notify`] で
+//! (b) 停止要求の kick（[`WakingKick`]。#4040 から製品の停止経路では使わない・削除は #4042。`LoopHandle::stop` / drop が `hv_vcpus_exit` の代わりに呼ぶ）から [`WfiWaker::notify`] で
 //! 即座に起こす（(a) は宛先の vCPU だけ。#3948）。`hv_*` を呼ばないので Linux の CI で単体試験できる。
 //!
 //! GIC つきの構成では WFI は exit せず `hv_vcpu_run` の中で待つため、この待ちは macOS 27.2・Apple M4 Max では通らない
@@ -32,7 +32,7 @@
 //!   ゲストが affinity を移した直後も、次の assert から新しい宛先を起こせる。
 //! - 読めない・IRM = 1（1-of-N）・書式違反・該当 vCPU なしのときはヒント。ヒントも無い（未学習）・範囲外の index は全台を起こす
 //!   （取りこぼさない側に倒す）。
-//! - 停止要求の kick（[`WakingKick`]）と VM の終了通知は常に全台を起こす（[`WfiWakeSet::notify_all`]）。
+//! - 停止要求の kick（[`WakingKick`]）と VM の終了通知は（#4040 までは）常に全台を起こす（[`WfiWakeSet::notify_all`]）。
 //! - vCPU 1 台の構成では従来の単一 waker と同じ効果になる。
 //! - スロットの mutex は 1 個ずつ取り入れ子にしない。ヒントは atomic で lock ではない。
 //!
@@ -537,7 +537,7 @@ impl<K: PartialEq> AckRouteLearner<K> {
 
 /// `inner.kick()` の後に全 vCPU の待ちを起こす [`VcpuKick`]。停止要求で WFI の待ちも起こす。
 ///
-/// `hvf::vcpu` が `VcpuCanceller` を包んで `spawn_loop` へ渡す。`inner` の成否によらず起こし、`inner` の結果を返す
+/// 製品の呼び出し元は無い（#4040 で `hvf::vcpu` は `HvfKick` を直接渡すようにした。削除は #4042）。`inner` の成否によらず起こし、`inner` の結果を返す
 /// （vCPU 破棄後の kick が失敗しても、待っているスレッドは起こす）。`W` は [`WfiWaker`]（単一）か [`WfiWakeSet`]（全台。#3948）。
 #[derive(Debug)]
 pub struct WakingKick<K, W = WfiWaker> {

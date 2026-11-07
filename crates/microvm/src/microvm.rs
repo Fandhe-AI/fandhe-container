@@ -77,7 +77,7 @@
 //!
 //! # ゲストメモリ（TASK-75.1）
 //! TASK-75（microVM の起動フロー）の起点。`crate::guest_memory` のアクセス型 [`GuestMemory`] に、実機の backing を
-//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`）でゲスト RAM を確保し、
+//! 与える。[`GuestRam::new`] が匿名 mmap（私有・ゼロ埋め・`MAP_NORESERVE`・`MADV_DONTFORK`・`MADV_DONTDUMP`）でゲスト RAM を確保し、
 //! [`GuestRam::register`] が `KVM_SET_USER_MEMORY_REGION` で VM の memslot に登録して
 //! `GuestMemory<RegisteredGuestRam>` を返す。`unsafe` は `crate::sys` に閉じ、本モジュールは入力の検証・errno の
 //! 分類・寿命の管理だけを持つ。所有先の判断は docs/design/microvm-memory-ownership.md。

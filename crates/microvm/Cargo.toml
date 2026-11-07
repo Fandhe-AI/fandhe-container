@@ -55,6 +55,7 @@
 # #3947 で kernel_boot の arm64 に virtio-block の 3 件を追加（依存は増やさない。unsafe 追加なし）。
 # #3974 で HVF の IROUTER 読み出しの縮退の理由別件数・初回ログと GICD_CTLR.ARE の確認を追加（依存は増やさない。unsafe 追加なし）。
 # #3987 で hvf_kernel_boot に UART の送受信の 2 件と aarch64 の serial-echo の initrd を追加（依存は増やさない。unsafe 追加なし）。
+# #3679 で irqfd / ioeventfd の解除失敗の観測・sys の事後監査の P3（KvmCap・MADV_DONTDUMP 等）を直す（依存は増やさない。unsafe は src/sys.rs のみ）。
 [package]
 name = "fandhe-container-microvm"
 edition.workspace = true

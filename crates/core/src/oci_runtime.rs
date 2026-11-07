@@ -97,6 +97,8 @@ pub use image_rootfs::{
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;
+#[cfg(target_os = "linux")]
+pub use launch::ContainerStdin;
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use launch::pin_bundle_rootfs_with_swap_for_test;
@@ -105,7 +107,7 @@ pub use launch::{
     RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
     pin_bundle_rootfs_audited,
 };
-pub use launch_options::{LaunchIpcMode, LaunchOptions};
+pub use launch_options::{LaunchIpcMode, LaunchOptions, LaunchStdinMode};
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};

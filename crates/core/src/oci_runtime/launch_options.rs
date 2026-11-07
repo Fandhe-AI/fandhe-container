@@ -17,6 +17,7 @@
 //! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
 //! | `network` | start が予約前に config の network エントリと突き合わせ(D7。`network_mode.rs`)、launcher が spec と照合する。`Loopback` と `Attachable` は新しい netns と `lo` の up を伴う(#3064。NET-6・SEC-1・#3058)。`Attachable` は rootless の pasta 構成向けで、`ProductionLauncherBuilder::netns_attach_hook` と対(#1939) |
 //! | `etc_files` | pivot 前段の `mount_etc_files`(管理ルートに生成済みの `/etc/hosts`・`/etc/resolv.conf` を bind。空なら載せない。NET-12・#1872) |
+//! | `stdin` | `Pipe` のときだけ launcher の spawn が stdin 用の pipe を作り、読み取り側を init の fd 0、書き込み側を `LaunchedProcess::take_stdin` で返す。既定 `Null` は従来どおり `/dev/null`(attach の stdin 用。SUP-7・CRI-6・SEC-1・#4069) |
 //! | `root_readonly` | `create --read-only`。config の `root.readonly` と OR(狭める方向のみ)。mount の RDONLY・Landlock の root 規則・分離の記録へ同じ実効値を渡す(CLI-1・SUP-12・CORE-5・SEC-1・#2828) |
 //!
 //! # 契約
@@ -58,6 +59,22 @@ pub enum LaunchIpcMode {
     Host,
 }
 
+/// init の標準入力(fd 0)の扱い(SUP-7・CRI-6・SEC-1・#4069)。
+///
+/// 完全版 Attach の stdin を流し込む口を core に用意するための opt-in。`config.json` からは選べず、
+/// supervisor の起動オプション(`LaunchOptions`)だけが開ける。`process.terminal`(tty)との組み合わせは
+/// 本型では検査しない(core が tty を拒否している間は届かない。pty との組は #4070 で決める)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum LaunchStdinMode {
+    /// fd 0 を `/dev/null` にする(既定。従来どおり)。
+    #[default]
+    Null,
+    /// core が pipe を作り、読み取り側を fd 0、書き込み側を `LaunchedProcess::take_stdin` で 1 回だけ返す。
+    /// 書き込み側は close-on-exec かつ fd 3 以上で、コンテナへは渡らない。
+    Pipe,
+}
+
 /// 検証済みの起動オプション(モジュール doc)。
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
@@ -76,6 +93,8 @@ pub struct LaunchOptions {
     network: LaunchNetworkMode,
     /// 管理ルート(`@container-etc/<id>`)の生成物のうち rootfs へ bind する種別(空なら載せない。NET-12・#1872)。
     etc_files: EtcFileSelection,
+    /// init の stdin の扱い(既定 `Null`。SUP-7・CRI-6・#4069)。
+    stdin: LaunchStdinMode,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -91,6 +110,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("root_readonly", &self.root_readonly)
             .field("network", &self.network)
             .field("etc_files", &self.etc_files)
+            .field("stdin", &self.stdin)
             .finish()
     }
 }
@@ -145,7 +165,16 @@ impl LaunchOptions {
             root_readonly: false,
             network: LaunchNetworkMode::FromConfig,
             etc_files: EtcFileSelection::default(),
+            stdin: LaunchStdinMode::Null,
         })
+    }
+
+    /// init の stdin の扱いを持たせる(SUP-7・CRI-6・SEC-1・#4069)。`Pipe` は launch のたび(restart の再 launch を
+    /// 含む)に新しい pipe を作る。
+    #[must_use]
+    pub fn with_stdin(mut self, stdin: LaunchStdinMode) -> Self {
+        self.stdin = stdin;
+        self
     }
 
     /// `--ulimit` の指定を持たせる(種別の重複は [`Rlimits`] が構築時に拒否済み。#2713)。
@@ -247,6 +276,11 @@ impl LaunchOptions {
         self.root_readonly
     }
 
+    /// init の stdin の扱い。
+    pub fn stdin(&self) -> LaunchStdinMode {
+        self.stdin
+    }
+
     /// network namespace の扱い。
     pub fn network(&self) -> LaunchNetworkMode {
         self.network
@@ -315,6 +349,16 @@ mod tests {
         let opts = opts.with_network(LaunchNetworkMode::Host);
         assert_eq!(opts.network(), LaunchNetworkMode::Host);
         assert!(format!("{opts:?}").contains("network: Host"));
+    }
+
+    /// SUP-7・CRI-6(#4069): stdin の既定は `Null`、`with_stdin` で往復し、`Debug` に出る。
+    #[test]
+    fn sup7_cri6_4069_stdin_defaults_to_null_and_round_trips() {
+        let opts = LaunchOptions::try_default().expect("default");
+        assert_eq!(opts.stdin(), LaunchStdinMode::Null);
+        let opts = opts.with_stdin(LaunchStdinMode::Pipe);
+        assert_eq!(opts.stdin(), LaunchStdinMode::Pipe);
+        assert!(format!("{opts:?}").contains("stdin: Pipe"));
     }
 
     fn set_of(dests: &[&str]) -> TmpfsMountSet {

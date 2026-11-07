@@ -62,8 +62,9 @@ pub enum LaunchIpcMode {
 /// init の標準入力(fd 0)の扱い(SUP-7・CRI-6・SEC-1・#4069)。
 ///
 /// 完全版 Attach の stdin を流し込む口を core に用意するための opt-in。`config.json` からは選べず、
-/// supervisor の起動オプション(`LaunchOptions`)だけが開ける。`process.terminal`(tty)との組み合わせは
-/// 本型では検査しない(core が tty を拒否している間は届かない。pty との組は #4070 で決める)。
+/// supervisor の起動オプション(`LaunchOptions`)だけが開ける。`process.terminal`(tty)との併用は launcher の
+/// `launch` が fork の前に `InvalidArgument` で拒否する(fd 0 が pty slave に置換され pipe が接続先を失うため。
+/// tty の入力は pty の master へ書く。#4070)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum LaunchStdinMode {

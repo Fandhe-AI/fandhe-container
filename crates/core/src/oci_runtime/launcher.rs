@@ -1531,6 +1531,15 @@ impl Inner {
                 "the launch spec was reconciled with a different network mode",
             ));
         }
+        // 端末つき起動と stdin Pipe の併用は拒否する。pty 割り当て後に fd 0 が slave へ置き換わるため、取り出した書き込み端は
+        // 接続先のない pipe になり EPIPE で init に届かない。fork の前(副作用なし)に断る(CRI-6・SUP-7・SEC-1・#4069・#4070)。
+        // tty の入力は pty の master 側(`take_pty_master`)へ書く。
+        if spec.terminal() && options.stdin() == LaunchStdinMode::Pipe {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "stdin pipe cannot be combined with a terminal; write to the pty master instead",
+            ));
+        }
         // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
@@ -4998,6 +5007,29 @@ mod tests {
         assert_eq!(
             err.message(),
             "the launcher has not opted in to terminal support"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+    }
+
+    /// CRI-6・SUP-7・SEC-1(#4069・#4070): 端末つき spec と stdin Pipe の併用は fork の前に `InvalidArgument` で断る。
+    #[test]
+    fn cri6_4069_launch_rejects_terminal_with_stdin_pipe() {
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.terminal_support = true;
+        l.inner.launch_options = Some(
+            LaunchOptions::try_default()
+                .expect("default")
+                .with_stdin(LaunchStdinMode::Pipe),
+        );
+        let err = l
+            .launch(&terminal_spec("tty-stdin-pipe"), Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "stdin pipe cannot be combined with a terminal; write to the pty master instead"
         );
         assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
     }

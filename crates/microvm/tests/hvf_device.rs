@@ -4,6 +4,7 @@
 //! 走らせる試験は期限 watchdog を持つ（REPAIR-5）。1 プロセス 1 VM のため `--test-threads=1` で実行する。
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+use fandhe_container_microvm::arm64_layout::arm64_vcpu_index_from_affinity;
 use fandhe_container_microvm::arm64_layout::{
     ARM64_BOOT_CPU_MPIDR, ARM64_PPI_INTID_BASE, ARM64_TIMER_VIRT_PPI, Arm64Layout,
     check_virtual_timer_intid,
@@ -20,7 +21,6 @@ use fandhe_container_microvm::hvf_abi::{
     HVF_DEFAULT_IPA_LIMIT, HvGicIntid, HvReg, HvSysReg, HvVcpuExit, IrouterRoute, MemoryFlags,
     decode_irouter,
 };
-use fandhe_container_microvm::hvf_wake::{SpiWakeTarget, spi_wake_target};
 use fandhe_container_microvm::interrupt::InterruptLine;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -571,7 +571,7 @@ fn hvf_device_spi_reaches_guest() {
                     && da.direction == AccessDirection::Write =>
             {
                 assert!(injector.is_none(), "hvf_device: spi: ready written twice");
-                // ゲストが IROUTER48(affinity 0)を書いた後の読み戻し(#3960・MVM-5)。IRM=0・affinity 0 なら宛先は vCPU 0。
+                // ゲストが IROUTER48(affinity 0)を書いた後の読み戻し(#3960・MVM-5)。IRM=0・affinity 0 であること。
                 match vgic.spi_routing(line.intid()) {
                     Ok(raw) => {
                         eprintln!("hvf_device: spi: irouter48={raw:#x}");
@@ -580,7 +580,8 @@ fn hvf_device_spi_reaches_guest() {
                             IrouterRoute::Affinity(0),
                             "hvf_device: spi: irouter48 is not affinity 0"
                         );
-                        assert_eq!(spi_wake_target(Some(raw), None, 1), SpiWakeTarget::Vcpu(0));
+                        // affinity 0 は vCPU 0 に当たる（製品の経路はこの値を読まない。#4041）。
+                        assert_eq!(arm64_vcpu_index_from_affinity(0, 1), Some(0));
                     }
                     Err(e) => eprintln!("hvf_device: spi: irouter48 unavailable: {e}"),
                 }

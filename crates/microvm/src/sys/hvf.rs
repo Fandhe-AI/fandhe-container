@@ -56,7 +56,7 @@
 //! - 手順は「`kern.osproductversion` の版判定（15 未満は `Unimplemented`）→ 11 個のシンボル解決」の順。1 つでも見つから
 //!   なければ GIC の関数を何も返さない。12 個目の `hv_gic_get_distributor_reg`（#3960。macOS 15.0 で導入。
 //!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>）だけは任意で、無ければ
-//!   `GicApi::distributor_reg` が `Unimplemented` を返し、呼び出し側が縮退する（読むのは `GICD_CTLR` と `GICD_IROUTER<n>`。#3974）。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
+//!   `GicApi::distributor_reg` が `Unimplemented` を返し、観測用の getter（`VmWithGic::spi_routing`・`distributor_ctlr`）が `Unimplemented` を受け取る（読むのは `GICD_CTLR` と `GICD_IROUTER<n>`。#3974・#4041）。結果（エラーを含む）は `OnceLock` にプロセスで 1 回だけ作る。
 //! - 関数ポインタは `GicApi` の private フィールドに閉じ、`sys` の外へ出さない。`hv_gic_*` は `libc` に対応物が無いため
 //!   機械照合の対象外。`hv_gic_config_t` は OS オブジェクトで、`os_release`（libSystem・macOS 10.10 以降なので直接リンクしてよい）
 //!   で解放する。作成順序（VM の後・vCPU の前）を型で強制するのは #3792 の担当。
@@ -1149,7 +1149,7 @@ impl GicApi {
         })?;
         let mut out = 0u64;
         // SAFETY: 解決元の Hypervisor.framework は読み込み済みで unload されない（`lookup` の SAFETY）。出力先はローカル変数
-        // `out` だけで呼び出しの間生きている。`reg.bits()` は検証済みの distributor のレジスタオフセット（`GICD_CTLR` か `GICD_IROUTER<n>`。#3974）（`uint16_t`）。
+        // `out` だけで呼び出しの間生きている。`reg.bits()` は検証済みの distributor のレジスタオフセット（`GICD_CTLR` か `GICD_IROUTER<n>`。観測用の getter から。#3974・#4041）（`uint16_t`）。
         let rc = unsafe { f(reg.bits(), &mut out) };
         classify_hv_return(HvOp::GicGetDistributorReg, rc)?;
         Ok(out)

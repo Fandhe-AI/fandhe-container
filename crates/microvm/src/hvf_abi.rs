@@ -731,7 +731,7 @@ const GIC_SPI_MIN_INTID: u32 = 32;
 const GIC_SPI_MAX_INTID: u32 = 1019;
 
 impl GicDistributorReg {
-    /// `GICD_CTLR`（オフセット 0x0000。Arm IHI 0069）。ARE の確認に使う（#3974・MVM-5）。
+    /// `GICD_CTLR`（オフセット 0x0000。Arm IHI 0069）。観測用の getter が読む（#3974・#4041・MVM-5）。
     pub const fn ctlr() -> Self {
         Self(0)
     }
@@ -752,34 +752,6 @@ impl GicDistributorReg {
     /// FFI へ渡す列挙値（distributor のレジスタオフセット）。
     pub const fn bits(self) -> u16 {
         self.0
-    }
-}
-
-/// `GICD_CTLR.ARE` の復号結果（#3974・MVM-5）。値はゲストが書くので非信頼として扱う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GicdCtlrAre {
-    /// ARE = 1。`GICD_IROUTER<n>` が宛先を表す。
-    Enabled,
-    /// ARE = 0。`GICD_IROUTER<n>` は意味を持たない。
-    Disabled,
-    /// 32 ビットのレジスタの上位が 0 でない（framework の異常値）。
-    Malformed,
-}
-
-/// `GICD_CTLR` の生値から ARE を復号する（#3974・MVM-5）。
-///
-/// ARE は bit 4（単一セキュリティ状態の ARE、Non-secure view の ARE_NS。Linux の `GICD_CTLR_ARE_NS` も `1 << 4`）。
-/// bit 5 が ARE_NS になるのは Secure view だけで、ゲスト（NS EL1）には当たらない。実機はゲストが `0x13` を書いた後に `0x53`（DS = 1 の単一セキュリティ状態）を返した（#3803）。
-/// RWP・Enable 等の他のビットは見ない。上位 32 ビットが 0 でなければ `Malformed`。
-pub fn decode_gicd_ctlr_are(raw: u64) -> GicdCtlrAre {
-    const ARE: u64 = 1 << 4;
-    if raw >> 32 != 0 {
-        return GicdCtlrAre::Malformed;
-    }
-    if raw & ARE != 0 {
-        GicdCtlrAre::Enabled
-    } else {
-        GicdCtlrAre::Disabled
     }
 }
 
@@ -1168,15 +1140,8 @@ mod tests {
     }
 
     #[test]
-    fn mvm5_3974_ctlr_offset_and_are_values() {
+    fn mvm5_3974_ctlr_offset_value() {
         assert_eq!(GicDistributorReg::ctlr().bits(), 0);
-        assert_eq!(decode_gicd_ctlr_are(0x0), GicdCtlrAre::Disabled);
-        assert_eq!(decode_gicd_ctlr_are(0x10), GicdCtlrAre::Enabled);
-        assert_eq!(decode_gicd_ctlr_are(0x30), GicdCtlrAre::Enabled);
-        assert_eq!(decode_gicd_ctlr_are(0x20), GicdCtlrAre::Disabled);
-        assert_eq!(decode_gicd_ctlr_are(0x8000_0012), GicdCtlrAre::Enabled);
-        assert_eq!(decode_gicd_ctlr_are(1 << 32), GicdCtlrAre::Malformed);
-        assert_eq!(decode_gicd_ctlr_are(u64::MAX), GicdCtlrAre::Malformed);
     }
 
     #[test]

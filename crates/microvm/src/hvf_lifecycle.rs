@@ -23,7 +23,7 @@
 //!    切り離した vCPU スレッドが終わるまでは何も解放されず、終わった後に 1 回ずつ回収される。呼び出し元の契約は、全 vCPU スレッドが
 //!    スロットの clone と VM の `Arc` を持ち、vCPU を破棄した後に落とすこと（`hvf::vcpu::ExitHandlers::guest_memory`）。
 //!    実機で vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べることは未確認（#4034）。
-//!    例外: `release_devices` の失敗（デバイスの保持者が lock を持つ）では、デバイス → RAM → VM の順を強制できないため、従来どおり
+//!    例外: `release_devices` の失敗（デバイスの保持者が lock を持つ。期限切れの経路でも手放しの前に確かめ、失敗なら回収に回さない）では、デバイス → RAM → VM の順を強制できないため、従来どおり
 //!    RAM をリークする（`mem::forget`）。RAM の取得失敗（`take_within` の期限切れ・毒化）も、vCPU は停止確認済みで lock を持つ
 //!    のがホスト側のスレッドのため、`GuestMemorySlot` 側でリークする（別の経路。見直しは本 issue の範囲外）。
 //!
@@ -182,10 +182,23 @@ where
         Err(e) => {
             // 止まりを確かめられていない。ゲストがまだ書けうるメモリを解放せず、参照だけ手放す。
             // 切り離した vCPU スレッドが最後の `Arc` を落としたときに RAM → VM の順で回収される（#4032）。
-            drop(devices);
-            memory.detach();
-            drop(vm);
-            Err((e, "deferred=guest_ram,vm leaked=vcpu_thread"))
+            // ただしデバイスを手放せたと確かめられたときだけ（devices → RAM → VM の順。MVM-5・REPAIR-5）。dispatcher の保持者が
+            // lock を持つなどでデバイスが残る場合は、後で RAM と VM が先に落ちうるため RAM を回収に回さずリークする。
+            // 待ちは停止の期限を使い切った後でも [`MEMORY_RELEASE_MIN`] に限る。
+            match devices.release_devices(MEMORY_RELEASE_MIN) {
+                Ok(()) => {
+                    drop(devices);
+                    memory.detach();
+                    drop(vm);
+                    Err((e, "deferred=guest_ram,vm leaked=vcpu_thread"))
+                }
+                Err(_) => {
+                    drop(devices);
+                    std::mem::forget(memory);
+                    drop(vm);
+                    Err((e, "leaked=guest_ram,vm,vcpu_thread"))
+                }
+            }
         }
     };
     match &outcome {
@@ -605,6 +618,35 @@ mod tests {
         let e = stop_and_release("hvf.microvm.stop", responsive(), LONG, r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
         assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
+    }
+
+    /// REPAIR-5・MVM-5・#4032: 止まりを確かめられなくても、デバイスを手放せなければ RAM を回収に回さない（リーク）。
+    /// 後で切り離したスレッドが終わっても RAM（`SharedRam` の中身）は drop されない。
+    #[test]
+    fn repair5_mvm5_4032_timeout_with_stuck_devices_leaks_memory() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stuck = detached_vcpu(&log, ram.clone(), Arc::clone(&vm), release_rx, done_tx);
+        let r = Resources {
+            devices: StuckDevices(Rec("devices", Arc::clone(&log))),
+            memory: ram,
+            vm,
+        };
+        let e = stop_and_release(
+            "hvf.microvm.stop",
+            Set(vec![stuck]),
+            Duration::from_millis(100),
+            r,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(LONG).unwrap();
+        let seen = snapshot(&log);
+        assert!(!seen.contains(&"memory"), "RAM must be leaked: {seen:?}");
     }
 
     /// REPAIR-5・TASK-192.16: 0 と 60 秒超は `InvalidArgument`。資源は漏らさず順に解放する。

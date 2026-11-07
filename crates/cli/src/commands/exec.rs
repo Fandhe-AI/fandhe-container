@@ -102,7 +102,7 @@ mod linux {
     use fandhe_container_supervisor::control::listener::effective_uid;
     use fandhe_container_supervisor::control::{ExecPidfdSource, production_exec_pidfd_source};
     use fandhe_container_supervisor::exec::{
-        AuditedOutcome, ExecLaunchIo, ExecRequest, default_audit_sink,
+        AuditedOutcome, ExecLaunchIo, ExecRequest, ExecStdio, default_audit_sink,
         run_command_with_pidfd_output_notify,
     };
     use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
@@ -152,7 +152,7 @@ mod linux {
     }
 
     /// 本番の実行役: supervisor の通しの入口（launch 時 env を重ねる版。healthcheck と同じ env の規則。#2713）。
-    /// 作成通知つきの入口を使い、標準入出力は従来どおり `/dev/null`（`output` なし）のまま。
+    /// 作成通知つきの入口を使い、標準入出力は従来どおり `/dev/null`（`ExecStdio::NONE`）のまま。
     fn production_runner(
         record: &StateRecord,
         pidfd: BorrowedFd<'_>,
@@ -169,7 +169,7 @@ mod linux {
             audit,
             ExecLaunchIo {
                 launch_env: ctx.launch_env,
-                output: None,
+                stdio: ExecStdio::NONE,
                 on_created: Some(ctx.on_created),
             },
         )

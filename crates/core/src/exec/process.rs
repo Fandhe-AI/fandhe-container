@@ -45,7 +45,9 @@
 //!   両方に掛かる（`exec_checked_entrypoint` を共有する。変更前はどちらも `setsid` していなかった）。実プロセスでの
 //!   照合は `tests/exec_child_setup.rs`（既定のテスト集合）
 //! - **標準入出力は `/dev/null` へ置換する**: 呼び出し元の fd 0〜2 の実体は渡さない。`/dev/null` が
-//!   無い rootfs は拒否する。端末・パイプの受け渡しは TASK-29/30 の範囲。`/dev/null` は **開く前に検証する**
+//!   無い rootfs は拒否する。呼び出し側が [`ChildStdio`] で明示した番号（stdin・stdout・stderr の個別指定。
+//!   #3757・SUP-6・CRI-6）だけは先に付け替え、指定されない番号を `/dev/null` へ置換する。pty は #3758（REPAIR-3）。
+//!   `/dev/null` は **開く前に検証する**
 //!   （TASK-163 追補・#1459）: 照合済みの `/` を起点に `O_PATH|O_NOFOLLOW` で固定し、`fstat` で文字デバイス
 //!   1:3 を確かめてから、procfs の magic link 経由で `O_RDWR|O_NOCTTY` に開き直す。稼働中のコンテナ
 //!   （`CAP_MKNOD` を持つ）が symlink・別のデバイスノードへ差し替えていても、差し替え先を開かずに違反
@@ -942,8 +944,8 @@ fn mark_fds_cloexec() -> Result<(), ExecError> {
 /// 呼び出し元が引き継いだ 0〜2 番の実体（ホストのファイル・ソケット）をコンテナのエントリポイントへ
 /// 渡さない（CVE-2024-21626 型・fd 3 以上は `mark_fds_cloexec` が担当）。置換先は [`open_verified_null`] が
 /// 検証してから開いた `/dev/null` で、存在しない・`null` デバイス（1:3）でない場合は、別の実体を標準入出力に
-/// しないため fail-closed で拒否する。stdout / stderr のパイプ受け渡しは [`ChildStdio`]（#1471）が先に付け替え、`nulling` が外した番号は
-/// 置換しない。端末（pty）の受け渡しは TASK-171.2（#537）の範囲（未実装）。
+/// しないため fail-closed で拒否する。stdin・stdout・stderr の受け渡しは [`ChildStdio`]（#1471・#3757）が先に付け替え、
+/// `nulling` が外した番号は置換しない（3 本とも指定されても `/dev/null` の検証は行う）。pty の受け渡しは #3758（未実装）。
 #[cfg(not(test))]
 fn redirect_stdio_to_null(
     root: BorrowedFd<'_>,
@@ -951,6 +953,7 @@ fn redirect_stdio_to_null(
     nulling: StdioNulling,
 ) -> Result<(), ExecError> {
     let null = open_verified_null(root, procfs)?;
+    // targets が空なら redirect_fds_to は何もしない（検証済みの /dev/null を開く層は常に通す）。
     sys::redirect_fds_to(null, &nulling.targets())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Exec, "dup2(/dev/null)"))
 }
@@ -1098,6 +1101,7 @@ fn redirect_stdio_to_null(
 
 /// `SIGPIPE` を `SIG_DFL` へ戻す。ログ用パイプ接続時（`piped`）は `SIG_IGN` にする。本番ビルドの実装。
 ///
+/// stdin だけがパイプでも `piped` は偽のまま（子の読み取りで `SIGPIPE` は起きない。#3757）。
 /// パイプ接続時に無視へ固定するのは、supervisor が死んで読み取り側が閉じた後の出力 `write` が
 /// `SIGPIPE` でコンテナを落とさず `EPIPE` になるようにするため（SUP-5・#1471）。
 #[cfg(not(test))]
@@ -2023,6 +2027,7 @@ fn observe_exec_child_setup_inner(
     observe_exec_child_setup_policy(
         command,
         report,
+        ChildStdio::none(),
         after_prepare,
         deferred_fsize,
         SealPolicy::unrestricted(),
@@ -2045,9 +2050,33 @@ pub fn observe_exec_child_setup_pinned(
     observe_exec_child_setup_policy(
         command,
         report,
+        ChildStdio::none(),
         || {},
         None,
         SealPolicy::pinned(reason),
+        timeout,
+    )
+}
+
+/// [`observe_exec_child_setup_with`] に、stdin・stdout・stderr の個別指定（[`ChildStdio::from_fds`]。#3757・SUP-6・CRI-6）を
+/// 足した版（結合試験専用）。`stdio` は fork の後、親側の複製をこの関数が閉じる（試験の読み取り側が EOF になるために必要）。
+/// `execveat` を呼ばない契約と、制限適用の証跡を迂回しない契約は他の入口と同じ。
+#[cfg(all(feature = "exec-test-support", not(test)))]
+#[doc(hidden)]
+pub fn observe_exec_child_setup_with_stdio(
+    command: &super::ExecCommand,
+    report: &Path,
+    stdio: ChildStdio,
+    after_prepare: impl FnOnce(),
+    timeout: Duration,
+) -> Result<ExecChildSetupObservation, ExecError> {
+    observe_exec_child_setup_policy(
+        command,
+        report,
+        stdio,
+        after_prepare,
+        None,
+        SealPolicy::unrestricted(),
         timeout,
     )
 }
@@ -2057,6 +2086,7 @@ pub fn observe_exec_child_setup_pinned(
 fn observe_exec_child_setup_policy(
     command: &super::ExecCommand,
     report: &Path,
+    stdio: ChildStdio,
     after_prepare: impl FnOnce(),
     deferred_fsize: Option<Rlimit>,
     policy: SealPolicy,
@@ -2074,7 +2104,7 @@ fn observe_exec_child_setup_policy(
                 &status_write,
                 deferred_fsize,
                 policy,
-                ChildStdio::none(),
+                stdio,
                 |entry, exe| {
                     after_prepare();
                     write_setup_report(entry, report, exe.file()).map(|()| 0)
@@ -2306,10 +2336,12 @@ fn parse_setup_report(text: &str) -> Option<ExecChildSetupReport> {
 
 /// 子の標準入出力のうち、exec 直前に `/dev/null` へ置換する番号（TASK-164 追補・#1471・SUP-7）。
 ///
-/// fd 0（stdin）は常に置換する（受け渡しは未実装）。stdout / stderr は、ログ用パイプへ付け替え済みなら
-/// 置換せずパイプのまま exec へ引き継ぐ（`false`）。[`ChildStdio::install`] が付け替えた結果から作る。
+/// [`ChildStdio::install`] が付け替え済みの番号（stdin のパイプ・ログ用パイプ・exec の個別指定。#3757・SUP-6・CRI-6）は
+/// 置換せずそのまま exec へ引き継ぐ（`false`）。指定されなかった番号だけを `/dev/null` へ置換する（`true`）。
+/// pty は #3758（REPAIR-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StdioNulling {
+    stdin: bool,
     stdout: bool,
     stderr: bool,
 }
@@ -2317,13 +2349,17 @@ struct StdioNulling {
 impl StdioNulling {
     /// 3 本とも置換する（パイプ指定なし。従来どおり）。
     const ALL: Self = Self {
+        stdin: true,
         stdout: true,
         stderr: true,
     };
 
     /// `/dev/null` へ置換する fd 番号（昇順）。
     fn targets(self) -> Vec<i32> {
-        let mut t = vec![0];
+        let mut t = Vec::new();
+        if self.stdin {
+            t.push(0);
+        }
         if self.stdout {
             t.push(1);
         }
@@ -2350,6 +2386,8 @@ impl StdioNulling {
 /// 読み取りは EOF まで続くため、コンテナの `write` は詰まらない。
 #[derive(Debug)]
 pub struct ChildStdio {
+    /// exec の stdin（#3757）。launch・healthcheck の結合では常に `None`（`/dev/null`）。
+    stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
 }
@@ -2367,6 +2405,7 @@ impl ChildStdio {
         let (err_r, err_w) = make("pipe(stderr)")?;
         Ok((
             Self {
+                stdin: None,
                 stdout: Some(OwnedFd::from(out_w)),
                 stderr: Some(OwnedFd::from(err_w)),
             },
@@ -2386,6 +2425,7 @@ impl ChildStdio {
             ExecError::from_io(&e, IsolationStage::Spawn, "dup(exec output for stderr)")
         })?;
         Ok(Self {
+            stdin: None,
             stdout: Some(output),
             stderr: Some(dup),
         })
@@ -2394,12 +2434,44 @@ impl ChildStdio {
     /// パイプ指定なし（stdout / stderr とも従来どおり `/dev/null`）。
     pub fn none() -> Self {
         Self {
+            stdin: None,
             stdout: None,
             stderr: None,
         }
     }
 
-    /// 子の側で fd 1・2 へ付け替える。`prepare_exec_child` の `close_inherited_fds`（fd 3 以上を閉じる）より
+    /// exec のコマンドへ stdin・stdout・stderr を個別に渡すための指定（#3757・SUP-6・CRI-6）。`None` の番号は
+    /// `/dev/null` のまま。socket・pipe・文字デバイスを受け、ディレクトリの fd は拒否する（`InvalidArgument`・段 `Spawn`）:
+    /// ホストのディレクトリ fd を標準入出力として渡すと `openat(0, "..")` 型の脱出路になるため（SEC-1・fail-closed）。
+    /// pty は #3758（REPAIR-3）。stdin の stall 期限は呼び出し側（#3761）が持つ。
+    pub fn from_fds(
+        stdin: Option<OwnedFd>,
+        stdout: Option<OwnedFd>,
+        stderr: Option<OwnedFd>,
+    ) -> Result<Self, ExecError> {
+        for fd in [&stdin, &stdout, &stderr].into_iter().flatten() {
+            let dup = fd.try_clone().map_err(|e| {
+                ExecError::from_io(&e, IsolationStage::Spawn, "dup(exec stdio for fstat)")
+            })?;
+            let meta = std::fs::File::from(dup)
+                .metadata()
+                .map_err(|e| ExecError::from_io(&e, IsolationStage::Spawn, "fstat(exec stdio)"))?;
+            if meta.is_dir() {
+                return Err(ExecError::new(
+                    ErrorCode::InvalidArgument,
+                    IsolationStage::Spawn,
+                    "exec stdio must not be a directory",
+                ));
+            }
+        }
+        Ok(Self {
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// 子の側で fd 0・1・2 へ付け替える。`prepare_exec_child` の `close_inherited_fds`（fd 3 以上を閉じる）より
     /// 前に呼ぶこと（付け替えた 1・2 は閉じられない）。
     ///
     /// 先に各 fd を 3 以上へ退避してから複製する: パイプの fd 番号が 1・2 と重なると（親が標準 fd を閉じていた
@@ -2412,8 +2484,13 @@ impl ChildStdio {
             })
             .transpose()
         };
+        let stdin = lift(self.stdin, "fcntl(F_DUPFD_CLOEXEC, stdin)")?;
         let stdout = lift(self.stdout, "fcntl(F_DUPFD_CLOEXEC, stdout)")?;
         let stderr = lift(self.stderr, "fcntl(F_DUPFD_CLOEXEC, stderr)")?;
+        if let Some(fd) = &stdin {
+            sys::dup_onto(fd.as_fd(), 0)
+                .map_err(|e| ExecError::from_sys(e, STAGE, "dup2(stdin pipe)"))?;
+        }
         if let Some(fd) = &stdout {
             sys::dup_onto(fd.as_fd(), 1)
                 .map_err(|e| ExecError::from_sys(e, STAGE, "dup2(stdout pipe)"))?;
@@ -2423,6 +2500,7 @@ impl ChildStdio {
                 .map_err(|e| ExecError::from_sys(e, STAGE, "dup2(stderr pipe)"))?;
         }
         Ok(StdioNulling {
+            stdin: stdin.is_none(),
             stdout: stdout.is_none(),
             stderr: stderr.is_none(),
         })
@@ -4838,6 +4916,7 @@ mod tests {
         let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
         let _ = take_calls();
         let nulling = StdioNulling {
+            stdin: true,
             stdout: false,
             stderr: false,
         };
@@ -4867,11 +4946,13 @@ mod tests {
     fn sup7_1471_stdio_nulling_targets() {
         assert_eq!(StdioNulling::ALL.targets(), vec![0, 1, 2]);
         let only_err_piped = StdioNulling {
+            stdin: true,
             stdout: true,
             stderr: false,
         };
         assert_eq!(only_err_piped.targets(), vec![0, 1]);
         let only_out_piped = StdioNulling {
+            stdin: true,
             stdout: false,
             stderr: true,
         };
@@ -4918,6 +4999,7 @@ mod tests {
         let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
         let _ = take_calls();
         let piped = StdioNulling {
+            stdin: true,
             stdout: false,
             stderr: false,
         };
@@ -4999,6 +5081,148 @@ mod tests {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("install child did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// SUP-6・CRI-6（#3757）: 置換する番号は、指定された番号を除いた集合になる。3 本とも指定なら空。
+    #[test]
+    fn sup6_cri6_3757_stdio_nulling_targets_follow_specified_streams() {
+        let t = |stdin, stdout, stderr| {
+            StdioNulling {
+                stdin,
+                stdout,
+                stderr,
+            }
+            .targets()
+        };
+        assert_eq!(t(false, true, true), vec![1, 2]);
+        assert_eq!(t(false, false, false), Vec::<i32>::new());
+        assert_eq!(t(false, false, true), vec![2]);
+        assert_eq!(StdioNulling::ALL.targets(), vec![0, 1, 2]);
+    }
+
+    /// SUP-6・CRI-6（#3757）: 3 本とも指定されても `/dev/null` の置換の段は呼ばれ（空の対象）、`SIGPIPE` は無視する。
+    /// stdin だけの指定では `SIGPIPE` は `SIG_DFL` のまま、置換は 1・2 だけ。
+    #[test]
+    fn sup6_cri6_3757_dry_run_records_for_specified_stdio() {
+        let dir = TempDir::create("exec-3757");
+        let bin = dir.0.join("probe");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bin)
+            .unwrap();
+        let entry = Entrypoint::new(&bin, ["probe"], [] as [&str; 0]).unwrap();
+        let _ = take_calls();
+        let all = StdioNulling {
+            stdin: false,
+            stdout: false,
+            stderr: false,
+        };
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, all);
+        let all_calls = take_calls();
+        let only_stdin = StdioNulling {
+            stdin: false,
+            stdout: true,
+            stderr: true,
+        };
+        let _ = exec_entrypoint_verified_with(current_root_mnt_id(), &entry, only_stdin);
+        let stdin_calls = take_calls();
+        drop(dir);
+        assert!(all_calls.contains(&"signal(SIGPIPE,SIG_IGN)".to_string()));
+        assert!(all_calls.contains(&"stdio[]->/dev/null".to_string()));
+        assert!(stdin_calls.contains(&"signal(SIGPIPE,SIG_DFL)".to_string()));
+        assert!(stdin_calls.contains(&"stdio[1, 2]->/dev/null".to_string()));
+    }
+
+    /// SUP-6・CRI-6・SEC-1（#3757）: `from_fds` はディレクトリの fd を拒否し、socket・pipe を受け、何も渡さなければ空の指定になる。
+    #[test]
+    fn sup6_cri6_3757_from_fds_validates_descriptors() {
+        let dir = std::fs::File::open("/").unwrap();
+        let err = ChildStdio::from_fds(Some(OwnedFd::from(dir)), None, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.stage, IsolationStage::Spawn);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_r, w) = std::io::pipe().unwrap();
+        let ok =
+            ChildStdio::from_fds(Some(OwnedFd::from(a)), Some(OwnedFd::from(w)), None).unwrap();
+        assert!(ok.stdin.is_some() && ok.stdout.is_some() && ok.stderr.is_none());
+        let none = ChildStdio::from_fds(None, None, None).unwrap();
+        assert!(none.stdin.is_none() && none.stdout.is_none() && none.stderr.is_none());
+    }
+
+    /// 個別指定の付け替えの子役が使う環境変数。
+    const STDIO_FDS_CHILD_ENV: &str = "FANDHE_TEST_3757_STDIO_FDS_CHILD";
+
+    /// 個別指定の子役。stdin に書いた 8 バイトを fd 0 から読み、`OUT:` / `ERR:` を付けて fd 1・2 へ返す。
+    fn stdio_fds_child_main() -> ! {
+        use std::io::Read as _;
+        let (in_mine, in_theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (out_mine, out_theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (err_mine, err_theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        (&in_mine).write_all(b"IN-3757\n").unwrap();
+        in_mine.shutdown(std::net::Shutdown::Write).unwrap();
+        let stdio = ChildStdio::from_fds(
+            Some(OwnedFd::from(in_theirs)),
+            Some(OwnedFd::from(out_theirs)),
+            Some(OwnedFd::from(err_theirs)),
+        )
+        .unwrap();
+        let code = match stdio.install() {
+            Ok(n) if n.targets().is_empty() => {
+                let mut input = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut input);
+                let _ = std::io::stdout().write_all(b"OUT:");
+                let _ = std::io::stdout().write_all(&input);
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().write_all(b"ERR:");
+                let _ = std::io::stderr().write_all(&input);
+                let (mut a, mut b) = ([0u8; 12], [0u8; 12]);
+                match (
+                    (&out_mine).read_exact(&mut a),
+                    (&err_mine).read_exact(&mut b),
+                ) {
+                    (Ok(()), Ok(())) if &a == b"OUT:IN-3757\n" && &b == b"ERR:IN-3757\n" => 0,
+                    _ => 2,
+                }
+            }
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    /// SUP-6・CRI-6（#3757）: stdin・stdout・stderr の個別指定で、stdin のバイト列が届き、stdout と stderr が別々に取れる。
+    /// テストバイナリ自身を再実行した子役で確かめる。
+    #[test]
+    fn sup6_cri6_3757_install_routes_stdin_stdout_stderr_separately() {
+        if std::env::var_os(STDIO_FDS_CHILD_ENV).is_some() {
+            stdio_fds_child_main();
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::process::tests::sup6_cri6_3757_install_routes_stdin_stdout_stderr_separately",
+                "--test-threads=1",
+                "--no-capture",
+            ])
+            .env(STDIO_FDS_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stdio child did not finish within 30s");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };

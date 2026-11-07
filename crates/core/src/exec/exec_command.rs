@@ -222,6 +222,7 @@ pub fn spawn_exec_command(
 ///
 /// `stdio` が [`ChildStdio::none`] なら [`spawn_exec_command`] と同じ（3 本とも `/dev/null`）。[`ChildStdio::from_output`]
 /// で作った指定なら、子は `close_range` の前に fd 1・2 を出力用 fd へ付け替え、fd 0 だけを `/dev/null` へ置換し、
+/// [`ChildStdio::from_fds`] なら指定された番号（stdin を含む）だけを付け替えて残りを `/dev/null` へ置換し（#3757）、
 /// `SIGPIPE` を `SIG_IGN` にして exec する（読み手が閉じても `EPIPE` で済み、`SIGPIPE` では落ちない）。親（呼び出し側）が
 /// 持つ `stdio` の複製は fork 後にこの関数が閉じる。付け替えの失敗は段 `prepare_fds` の `SetupFailed` で報告する。
 pub fn spawn_exec_command_with_stdio(

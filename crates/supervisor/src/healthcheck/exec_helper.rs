@@ -393,7 +393,7 @@ fn execute(args: &HealthExecArgs) -> HealthExecLine {
         &sink,
         crate::exec::ExecLaunchIo {
             launch_env: &launch_env,
-            output: Some(stdout.as_fd()),
+            stdio: crate::exec::ExecStdio::combined(stdout.as_fd()),
             on_created: Some(&notify),
         },
     );

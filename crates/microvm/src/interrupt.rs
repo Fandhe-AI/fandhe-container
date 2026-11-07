@@ -6,7 +6,7 @@
 //! `crate::irq::IrqFd`（`KVM_IRQFD`）、macOS は `crate::hvf::gic::GicSpiLine`（`hv_gic_set_spi`。#3795）、試験では回数を数える偽物を使う。virtio-net（TASK-74.3.2・#881）も
 //! [`InterruptLine`] と [`IoEventSpec`] を使い回し、`QueueNotify` のキュー番号で振り分ける [`complete_net_notify`] を持つ。
 //!
-//! QueueNotify の route（#4026）: [`QueueNotifyRoute`] と [`BlockQueueNotifyRoute`] がトランスポート・ゲスト RAM のスロット・割り込み線を束ねて
+//! QueueNotify の route（#4026）: [`QueueNotifyRoute`] と `BlockQueueNotifyRoute` がトランスポート・ゲスト RAM のスロット・割り込み線を束ねて
 //! [`complete_block_notify`] を呼ぶ。ロックは dispatcher の解放後に、トランスポート、メモリの順。
 //!
 //! 待ち（ブロック）は持たない同期処理のため REPAIR-5 のタイムアウトは不要。割り込みの既定は edge 扱い。

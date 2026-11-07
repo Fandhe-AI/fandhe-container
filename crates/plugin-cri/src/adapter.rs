@@ -270,6 +270,30 @@ impl CriPluginBackends {
         }
     }
 
+    /// 本番の読み取り専用 `AttachBackend`（回転ログの follow。CRI-6・SUP-4・#3763）を作る。
+    ///
+    /// ログは状態ルート配下の固定位置（`container_log_dir`）で、要求の入力から受けない。`production()` で組んだときだけ使え、
+    /// 注入で組んだとき（状態ルートが無い）は `FAILED_PRECONDITION`。
+    #[cfg(unix)]
+    pub fn log_attach_backend(
+        &self,
+    ) -> Result<Arc<crate::streaming::log_attach::LogFollowAttachBackend>, CriError> {
+        let Some(root) = &self.state_root else {
+            return Err(CriError::failed_precondition(
+                "state root is not configured",
+            ));
+        };
+        let probe = Arc::new(crate::streaming::log_attach::StateStoreAttachProbe::new(
+            Arc::clone(&self.state),
+        ));
+        Ok(Arc::new(
+            crate::streaming::log_attach::LogFollowAttachBackend::new(
+                fandhe_container_supervisor::logs::container_log_dir(root),
+                probe,
+            )?,
+        ))
+    }
+
     /// 本番の `ImageService`（`PullImage`・`ImageStatus`・`ListImages`・`RemoveImage`・`ImageFsInfo`）を作る（CRI-3・CRI-4・PLUG-1。#2592）。
     ///
     /// `production_bundle_provider` と同じ在庫（[`Self::images`]）と、同じ `PullConfig`（キャッシュは

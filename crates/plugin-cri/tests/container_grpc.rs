@@ -1484,8 +1484,8 @@ async fn cri6_3754_production_binary_streaming_listens_on_loopback_only() {
     .expect("watchdog");
 }
 
-/// 段 F-2（CRI-6・REPAIR-3）: 結線前の 3 RPC は本番バイナリでも `UNIMPLEMENTED`（未知の ID でも `NOT_FOUND` より先）。
-/// 結線前（#3754 時点）の期待値。兄弟 issue（#3755・#3761・#3763）が結線したらその種別の期待値を更新する。
+/// 段 F-2（CRI-6・REPAIR-3）: 未結線の Exec・PortForward は本番バイナリでも `UNIMPLEMENTED`（未知の ID でも `NOT_FOUND` より先）。
+/// Attach は #3763 で結線済み（未知の ID は `NOT_FOUND`）。兄弟 issue（#3755・#3761）が結線したらその種別の期待値を更新する。
 #[tokio::test]
 async fn cri6_repair3_3754_production_binary_unwired_streaming_rpcs_are_unimplemented() {
     tokio::time::timeout(WATCHDOG, async {
@@ -1517,8 +1517,9 @@ async fn cri6_repair3_3754_production_binary_unwired_streaming_rpcs_are_unimplem
         )
         .await
         .expect_err("attach");
-        assert_eq!(e.code(), PluginErrorCode::Unimplemented);
-        assert_eq!(e.message(), "attach streaming is not wired");
+        // Attach は結線済み（読み取り専用。#3763）。未知の ID は存在照合の NOT_FOUND になる。
+        assert_eq!(e.code(), PluginErrorCode::NotFound);
+        assert_eq!(e.message(), "container not found");
         let e = call_with_deadline(
             c.port_forward(cri::PortForwardRequest {
                 pod_sandbox_id: "nope".into(),

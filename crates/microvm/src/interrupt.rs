@@ -93,6 +93,62 @@ pub struct InterruptAckReport {
     pub resample: LineResample,
 }
 
+/// `InterruptACK` の後処理の結果の累計（観測専用。#4014・#3863・MVM-5）。
+///
+/// 呼び出し元は macOS の `hvf::mmio` のハンドラだけで、デバイス 1 台につき 1 つを全 vCPU が `Arc` で共有する。
+/// `DeviceReset` の resample は数えない（ACK の計数と揃える）。値は判断材料で、合否には使わない（判断は #3988）。
+/// 各計数は `u64` の加算で、実用上あふれない。
+#[derive(Debug, Default)]
+pub struct InterruptAckTally {
+    acks: std::sync::atomic::AtomicU64,
+    deasserted: std::sync::atomic::AtomicU64,
+    reasserted: std::sync::atomic::AtomicU64,
+    not_applicable: std::sync::atomic::AtomicU64,
+}
+
+/// [`InterruptAckTally`] のある時点の写し（REPAIR-4: 構造を持つ型で返す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct InterruptAckCounts {
+    /// 後処理を行った `InterruptACK` の回数。
+    pub acks: u64,
+    /// 要因が無くなり線を下げた回数（[`LineResample::Deasserted`]）。
+    pub deasserted: u64,
+    /// 要因が残っていて線を上げ直した回数（[`LineResample::Reasserted`]）。
+    pub reasserted: u64,
+    /// 線が edge 扱いで何もしなかった回数（[`LineResample::NotApplicable`]）。
+    pub not_applicable: u64,
+}
+
+impl InterruptAckTally {
+    fn bump(c: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // u64 の加算は実用上あふれない（毎秒 10 億回でも約 580 年）。観測専用なので順序は Relaxed で足りる。
+        c.fetch_add(1, Relaxed);
+    }
+
+    /// ACK の後処理 1 回分を数える。
+    pub fn record(&self, report: &InterruptAckReport) {
+        Self::bump(&self.acks);
+        match report.resample {
+            LineResample::Deasserted => Self::bump(&self.deasserted),
+            LineResample::Reasserted => Self::bump(&self.reasserted),
+            LineResample::NotApplicable => Self::bump(&self.not_applicable),
+        }
+    }
+
+    /// 現在の計数の写しを返す。
+    pub fn snapshot(&self) -> InterruptAckCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        InterruptAckCounts {
+            acks: self.acks.load(Relaxed),
+            deasserted: self.deasserted.load(Relaxed),
+            reasserted: self.reasserted.load(Relaxed),
+            not_applicable: self.not_applicable.load(Relaxed),
+        }
+    }
+}
+
 /// ゲストの `InterruptACK` を処理した後に、線の値を `interrupt_status` に合わせる（#3863・MVM-5・MVM-1）。
 ///
 /// 呼び出し元は MMIO exit が `MmioWriteOutcome::InterruptAcknowledged` を返したとき（macOS では `hvf::mmio`）で、
@@ -632,6 +688,29 @@ mod tests {
             MemoryBlockBackend::new(16 * 512, false).unwrap(),
         ))
         .unwrap()
+    }
+
+    /// ACK の後処理の結果が種別ごとに数えられ、写しが具体値になる（#4014・MVM-5）。
+    #[test]
+    fn mvm5_4014_ack_tally_counts_each_resample_kind() {
+        let tally = InterruptAckTally::default();
+        assert_eq!(tally.snapshot(), InterruptAckCounts::default());
+        for (remaining, resample) in [
+            (0, LineResample::Deasserted),
+            (1, LineResample::Reasserted),
+            (0, LineResample::NotApplicable),
+            (0, LineResample::Deasserted),
+        ] {
+            tally.record(&InterruptAckReport {
+                remaining,
+                resample,
+            });
+        }
+        let c = tally.snapshot();
+        assert_eq!(c.acks, 4);
+        assert_eq!(c.deasserted, 2);
+        assert_eq!(c.reasserted, 1);
+        assert_eq!(c.not_applicable, 1);
     }
 
     /// MVM-5・MVM-1（#3863）: assert → ACK → deassert の呼び出し列が `(intid, level)` で具体値になる。

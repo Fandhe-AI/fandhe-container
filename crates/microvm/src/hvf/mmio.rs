@@ -20,7 +20,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //! - `InterruptACK` の後処理（level 扱いの SPI の deassert / resample。#3863）は [`MmioHandler::with_ack_routes`] で結ぶ。
-//!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。
+//!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。後処理の結果（deassert / 上げ直しの回数）は
+//!   [`MmioHandler::with_ack_tallies`] の共有計数で外から読める（観測専用。`DeviceReset` は数えない。#4014）。
 //! - `InterruptACK` を処理した vCPU はその線の SPI の宛先として [`MmioHandler::with_ack_learner`] で記録し、WFI の待ちを
 //!   宛先の vCPU だけ起こすのに使う（#3948・MVM-5・REPAIR-5。方式と残余は `crate::hvf_wake`）。
 //! - route の無いデバイスは `QueueNotify` を数えて [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
@@ -34,7 +35,7 @@ use crate::esr::{AccessDirection, DataAbort};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
 use crate::hvf_loop::{ExitAction, log_line};
 use crate::hvf_wake::AckRouteLearner;
-use crate::interrupt::{InterruptAckRoute, QueueNotifyRoute};
+use crate::interrupt::{InterruptAckRoute, InterruptAckTally, QueueNotifyRoute};
 use crate::mmio_abort;
 use crate::stop::StopReason;
 use crate::sys::HvVcpu;
@@ -51,6 +52,8 @@ pub struct MmioHandler {
     /// `InterruptACK` の後処理（level 扱いの線の deassert / resample。#3863）。route の無いデバイスは計数だけ。
     ack_routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>,
     interrupt_acks: u64,
+    /// ACK の後処理の結果の累計（観測専用。全 vCPU のハンドラが同じ `Arc` を共有する。#4014）。
+    ack_tallies: Vec<(DeviceId, Arc<InterruptAckTally>)>,
     /// `QueueNotify` の virtqueue 処理（#4028）。route の無いデバイスは計数だけで続行する（block・net は #4028・#4029 で route を結ぶ）。
     queue_routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
     /// `InterruptACK` を処理したこの vCPU を、その線の SPI の宛先として記録する（WFI の宛先指定の起床。#3948）。無ければ学習しない。
@@ -79,6 +82,13 @@ impl MmioHandler {
     /// デバイスごとの `InterruptACK` の後処理を足す（#3863・MVM-5）。
     pub fn with_ack_routes(mut self, routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>) -> Self {
         self.ack_routes = routes;
+        self
+    }
+
+    /// デバイスごとの `InterruptACK` の後処理の結果の計数を足す（#4014・MVM-5）。計数は `HvfDeviceBus` が 1 回だけ作り、
+    /// 全 vCPU のハンドラが同じ実体を共有する。route の成功時だけ数え、失敗は従来どおり VM を止める。
+    pub fn with_ack_tallies(mut self, tallies: Vec<(DeviceId, Arc<InterruptAckTally>)>) -> Self {
+        self.ack_tallies = tallies;
         self
     }
 
@@ -168,7 +178,10 @@ pub fn handle_data_abort(
             }
             // 失敗は VM を止める（fail-closed。trigger の失敗と同じ扱い）。
             if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
-                route.on_interrupt_ack()?;
+                let report = route.on_interrupt_ack()?;
+                if let Some((_, tally)) = handler.ack_tallies.iter().find(|(id, _)| id == device) {
+                    tally.record(&report);
+                }
             }
         }
         // Status=0 のリセットは `interrupt_status` を 0 にするため、level 線が上がったままにならないよう
@@ -261,6 +274,23 @@ mod tests {
         let h = MmioHandler::with_dispatcher(d).with_ack_routes(vec![(id, Arc::new(Fake))]);
         assert_eq!(h.interrupt_ack_count(), 0);
         assert_eq!(h.ack_routes.len(), 1);
+    }
+
+    /// ACK の計数はデバイスの識別子で引かれ、保持される（#4014）。vCPU の経路は実機で確かめる（`hvf_kernel_boot`）。
+    #[test]
+    fn mvm5_4014_ack_tallies_are_kept() {
+        let mut d = ExitDispatcher::new();
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let id = d
+            .register_mmio(0x0a00_0000, 0x200, Box::new(block))
+            .unwrap();
+        let tally = Arc::new(InterruptAckTally::default());
+        let h = MmioHandler::with_dispatcher(d).with_ack_tallies(vec![(id, Arc::clone(&tally))]);
+        assert_eq!(h.ack_tallies.len(), 1);
+        assert_eq!(tally.snapshot().acks, 0);
     }
 
     /// `QueueNotify` の route はデバイスの識別子で引かれ、保持される（#4028）。vCPU の経路は実機で確かめる（`hvf_microvm`）。

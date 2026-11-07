@@ -96,18 +96,10 @@ fn open_kvm() -> fandhe_container_microvm::device::KvmDevice {
 #[path = "support/guest_boot.rs"]
 mod guest_boot;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use guest_boot::{MARKER, count_lines_ending_with, count_marker_lines, escape_tail};
-
-/// block-read の initrd が `/dev/vda` の先頭と比べる 32 バイト。正本は `scripts/build-microvm-test-initrd.sh` の
-/// `block_sentinel`（x86 の単体テストで照合）。x86_64 と aarch64（#3947）の試験が共有する（複製しない・REPAIR-1）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const BLOCK_SENTINEL: &[u8; 32] = b"fandhe-microvm-block-sentinel-01";
-/// sentinel 一致時に block-read の `/init` が出す固定文字列（正本は同スクリプトの `block_ok_message`）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const BLOCK_OK_MARKER: &str = "fandhe-microvm-test: block sentinel ok v1";
-/// 不一致・読み出し失敗時に出す固定文字列（正本は同スクリプトの `block_mismatch_message`）。
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const BLOCK_MISMATCH_MARKER: &str = "fandhe-microvm-test: block sentinel mismatch v1";
+use guest_boot::{
+    BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, MARKER, count_lines_ending_with,
+    count_marker_lines, escape_tail,
+};
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use fandhe_container_microvm::device::{RunObserver, RunOutcome, RunRecord};
@@ -1331,33 +1323,6 @@ mod x86 {
         assert_eq!(c.writes.load(Ordering::Relaxed), 1);
         assert_eq!(c.flushes.load(Ordering::Relaxed), 1);
     }
-    #[test]
-    fn mvm1_3889_block_strings_match_initrd_script() {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/build-microvm-test-initrd.sh");
-        let text = std::fs::read_to_string(script).unwrap();
-        let find = |prefix: &str| -> Vec<String> {
-            text.lines()
-                .filter_map(|l| l.strip_prefix(prefix))
-                .filter_map(|l| l.strip_suffix('"'))
-                .map(str::to_owned)
-                .collect()
-        };
-        assert_eq!(
-            find("block_sentinel=\""),
-            vec![String::from_utf8(BLOCK_SENTINEL.to_vec()).unwrap()]
-        );
-        assert_eq!(
-            find("block_ok_message=\""),
-            vec![BLOCK_OK_MARKER.to_owned()]
-        );
-        assert_eq!(
-            find("block_mismatch_message=\""),
-            vec![BLOCK_MISMATCH_MARKER.to_owned()]
-        );
-        assert_eq!(BLOCK_SENTINEL.len(), 32);
-    }
-
     #[test]
     fn mvm1_3889_sentinel_backend() {
         let (mut b, c) = CountingBlockBackend::with_sentinel(4096, Some(BLOCK_SENTINEL));

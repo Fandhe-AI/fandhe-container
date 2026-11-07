@@ -71,6 +71,9 @@ enum MailboxState {
 pub struct ApMailbox {
     state: Mutex<MailboxState>,
     cv: Condvar,
+    /// 試験用: `wait` が条件変数の待ちへ入る直前（ロックを握ったまま）に数える。待ち到達の同期点（REPAIR-12）。
+    #[cfg(test)]
+    wait_entries: std::sync::atomic::AtomicU32,
 }
 
 impl Default for ApMailbox {
@@ -85,7 +88,19 @@ impl ApMailbox {
         Self {
             state: Mutex::new(MailboxState::Empty),
             cv: Condvar::new(),
+            #[cfg(test)]
+            wait_entries: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// 試験用: AP が `wait` の条件変数の待ちに入るまで待つ。カウンタはロック保持中に増え、`wait_timeout` がロックを手放して
+    /// 初めて `lock` が取れるため、戻った時点で AP は待ちの中にある（固定時間の sleep に頼らない）。
+    #[cfg(test)]
+    fn await_waiting(&self) {
+        while self.wait_entries.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        drop(self.lock());
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MailboxState> {
@@ -125,6 +140,8 @@ impl ApMailbox {
                 MailboxState::Closed => return ApWake::Stopped,
                 MailboxState::Empty => {}
             }
+            #[cfg(test)]
+            self.wait_entries.fetch_add(1, Ordering::Release);
             g = self
                 .cv
                 .wait_timeout(g, poll)
@@ -896,7 +913,7 @@ mod tests {
         let m = Arc::new(ApMailbox::new());
         let ap = spawn_parked_ap(&m, false, Duration::from_secs(2));
         // AP が `wait` の待ちに入ってから stop する（入る前だと入口で停止フラグを見て即 Requested になり対照が成立しない）。
-        std::thread::sleep(Duration::from_millis(300));
+        m.await_waiting();
         let e = ap.stop(Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
         m.notify();

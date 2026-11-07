@@ -569,9 +569,10 @@ impl WorkDir {
         pid: u32,
         nanos: u128,
     ) -> Result<Self, SmallFilesError> {
-        // macOS の SystemTime はマイクロ秒刻みのため、同一プロセスの並列スレッドが同じ値を得て
-        // 名前が衝突し `AlreadyExists` になりうる。プロセス内で単調増加する連番を足して一意にする
-        // （IO-6・REPAIR-12・#3901）。
+        // 時計の刻みが粗い環境（macOS はマイクロ秒刻み。Linux の CI ランナーでも間欠的に観測）では、
+        // 同一プロセスの並列スレッドが同じ時刻値を得て名前が衝突し `AlreadyExists` になりうる。
+        // プロセス内で単調増加する連番を足して一意にする。衝突は harness の名前の問題で、
+        // crates/io の二重作成ではない（IO-6・REPAIR-12・#3650・#3901）。
         let seq = WORKDIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = root.join(format!("{prefix}-{pid}-{nanos:x}-{seq}"));
         #[cfg_attr(not(unix), allow(unused_mut))]
@@ -902,7 +903,7 @@ pub fn execute(command: Command) -> Result<Execution, SmallFilesError> {
 #[cfg(test)]
 mod tests {
     /// REPAIR-12・IO-6（#3901）: 同じ root・prefix・pid・時刻値でも、連番により名前がすべて異なり
-    /// 作成も成功する（macOS の粗い時計の再現）。
+    /// 作成も成功する（粗い時計の再現。#3650）。
     #[test]
     fn repair12_io6_workdir_names_are_unique_for_identical_clock_value() {
         let root = std::env::temp_dir().join(format!("fsf-uniq-{}", std::process::id()));

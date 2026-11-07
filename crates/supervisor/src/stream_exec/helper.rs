@@ -118,6 +118,12 @@ impl StreamExecArgs {
         command: Vec<String>,
     ) -> Result<Self, TraitError> {
         let max = Duration::from_secs(MAX_EXEC_HOLD_SECS);
+        // 起動引数はミリ秒単位。端数は切り上げて正規化し、0 になる正の期限
+        // （例: 500 マイクロ秒）を `--timeout-ms 0` として生成しない。
+        let timeout = match u64::try_from(timeout.as_nanos().div_ceil(1_000_000)) {
+            Ok(ms) => Duration::from_millis(ms),
+            Err(_) => return Err(invalid()),
+        };
         if !root.is_absolute() || timeout.is_zero() || timeout > max {
             return Err(invalid());
         }
@@ -560,6 +566,33 @@ mod tests {
             ["/bin/echo".to_string(), "hello world".into()]
         );
         assert_eq!(parsed.to_args(), good());
+    }
+
+    /// SEC-1・REPAIR-5（#3760）: ミリ秒未満の端数は切り上げて正規化し、`to_args` は常に parse が受ける形になる。
+    #[test]
+    fn sec1_3760_new_rounds_sub_millisecond_timeout_up() {
+        let build = |t: Duration| {
+            StreamExecArgs::new(
+                PathBuf::from("/run/fandhe"),
+                ContainerId::new("web1").unwrap(),
+                NonZeroU32::new(4242).unwrap(),
+                t,
+                StdioMask::new(7).unwrap(),
+                vec!["/bin/echo".to_string()],
+            )
+        };
+        for (input, ms) in [
+            (Duration::from_micros(500), 1),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_micros(1_500), 2),
+            (Duration::from_millis(3), 3),
+        ] {
+            let args = build(input).unwrap();
+            assert_eq!(args.timeout(), Duration::from_millis(ms));
+            let reparsed = StreamExecArgs::parse(args.to_args()).unwrap();
+            assert_eq!(reparsed.timeout(), Duration::from_millis(ms));
+        }
+        assert!(build(Duration::ZERO).is_err());
     }
 
     /// SEC-1・REPAIR-5（#3760）: 不正な形はすべて `InvalidArgument` で拒否する。

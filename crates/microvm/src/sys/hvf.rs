@@ -693,8 +693,14 @@ impl GuestMapping<'_> {
 
 impl Drop for GuestMapping<'_> {
     fn drop(&mut self) {
-        // 失敗時は backing をリークし、munmap しない（対応付けが残りうるため）。エラーは後始末のため捨てる。
-        let _ = self.release();
+        // 失敗時は backing をリークし、munmap しない（対応付けが残りうるため）。エラーは呼び出し元へ返せない（期限切れで
+        // 切り離した vCPU スレッドが最後の `Arc` として落とす場合を含む。#4032）ため、リークしたことを 1 行だけ記録する。
+        if let Err(e) = self.release() {
+            crate::hvf_loop::log_line(format_args!(
+                "level=error op=hvf.vm_unmap outcome=error code={} leaked=guest_ram",
+                e.code().as_str()
+            ));
+        }
         self.active = false;
     }
 }

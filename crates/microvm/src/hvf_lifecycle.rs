@@ -17,12 +17,19 @@
 //!      対応付けは `Arc<HvVm>` を保持するため、unmap は必ず `hv_vm_destroy` より前になる。unmap の後でなければ munmap しない
 //!      （ゲストがまだ書けうるメモリを解放しない）。
 //!    - VM: 最後の `Arc<VmWithGic>` の drop が GIC とともに `hv_vm_destroy` を行い、成功したら「1 プロセス 1 VM」の占有を戻す。
-//! 3. 期限切れ（`TIMEOUT`）などで止まりが確かめられなかったときは、ゲスト RAM の対応付けを `mem::forget` でリークする
-//!    （fail-closed）。残る資源と回収の方法は `hvf::microvm` のモジュール doc。
+//! 3. 期限切れ（`TIMEOUT`）・`Internal` で止まりを確かめられなかったときは、ゲスト RAM を解放せず、手放すだけにする
+//!    （[`ReleaseMemory::detach`]）。vCPU スレッドが [`drop_vcpu_thread_state`] で自分の保持（vCPU の破棄 → デバイス参照 →
+//!    スロットの clone → VM）を順に落とすと、最後の `Arc` の drop で unmap → munmap、続いて `hv_vm_destroy` が走る（#4032）。
+//!    切り離した vCPU スレッドが終わるまでは何も解放されず、終わった後に 1 回ずつ回収される。呼び出し元の契約は、全 vCPU スレッドが
+//!    スロットの clone と VM の `Arc` を持ち、vCPU を破棄した後に落とすこと（`hvf::vcpu::ExitHandlers::guest_memory`）。
+//!    実機で vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べることは未確認（#4034）。
+//!    例外: `release_devices` の失敗（デバイスの保持者が lock を持つ）では、デバイス → RAM → VM の順を強制できないため、従来どおり
+//!    RAM をリークする（`mem::forget`）。RAM の取得失敗（`take_within` の期限切れ・毒化）も、vCPU は停止確認済みで lock を持つ
+//!    のがホスト側のスレッドのため、`GuestMemorySlot` 側でリークする（別の経路。見直しは本 issue の範囲外）。
 //!
 //! # 複数 vCPU（#3884）
 //! 止まりの確認は「N 台すべてが報告した」こと（`hvf_loop::stop_all`。parked の AP を含む）。1 台でも確かめられなければ RAM を
-//! リークする。AP の exit（SYSTEM_OFF・fail-closed の停止）は `VcpuSet::is_finished` が VM 全体の終了として伝え、停止時の集約でその理由を返す（#3891）。
+//! 手放すだけにし、残った vCPU スレッドの終了後に回収する（#4032）。AP の exit（SYSTEM_OFF・fail-closed の停止）は `VcpuSet::is_finished` が VM 全体の終了として伝え、停止時の集約でその理由を返す（#3891）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -63,6 +70,12 @@ pub trait ReleaseDevices {
 pub trait ReleaseMemory {
     /// `deadline` まで試みて RAM を手放す。手放せなければ（リークして）`DeadlineExceeded`。
     fn release_memory(self, deadline: Duration) -> Result<(), MicrovmError>;
+
+    /// vCPU の停止を確かめられなかったときに呼ぶ。ゲストが書きうる中身を解放せずに、この参照だけを手放す（#4032）。
+    ///
+    /// 共有型（`GuestMemorySlot`）は `Arc` を 1 つ減らすだけで、中身は最後の保持者（切り離した vCPU スレッド）の drop で
+    /// 1 回だけ解放される。既定実装は持たない（各実装が「中身を解放しない手放し方」を決める）。
+    fn detach(self);
 }
 
 /// 停止確認後の RAM 取得に与える下限（停止の期限を使い切っていても、空いている lock の取得だけは試みる）。
@@ -103,8 +116,11 @@ pub struct Resources<D, M, V> {
 ///
 /// - `deadline` が 0 または [`VCPU_STOP_DEADLINE_MAX`] 超なら `InvalidArgument`。ただし資源を持ったまま返さず、
 ///   [`DROP_STOP_DEADLINE`] で同じ手順を行ってからエラーを返す（不正な引数で解放が漏れないように）。
-/// - 期限切れ・`Internal` は止まりを確かめられていない。`memory` をリークし（`mem::forget`）、`devices`・`vm` は drop する
-///   （`vm` の `Arc` は vCPU スレッドと、リークした対応付けも保持するため、VM の破棄は起きない）。エラーをそのまま返す。
+/// - 期限切れ・`Internal` は止まりを確かめられていない。`memory` は [`ReleaseMemory::detach`] で手放し、`devices`・`vm` は drop する
+///   （`vm` の `Arc` は切り離した vCPU スレッドと対応付けが保持するため、VM の破棄は起きない）。RAM と VM の回収は、
+///   そのスレッドが [`drop_vcpu_thread_state`] で最後の `Arc` を落とした時点で行われる（#4032）。エラーをそのまま返す。
+/// - `release_devices` の失敗は、デバイスの保持者が lock を持ち、デバイスが RAM・VM より後に落ちうる。順序を守れないため
+///   `memory` をリークする（`mem::forget`。モジュール doc の例外）。
 pub fn stop_and_release<S, D, M, V>(
     op: &'static str,
     stopper: S,
@@ -130,6 +146,7 @@ where
     // 処理開始時に終了時刻の基準を 1 回だけ取り、vCPU の停止待ちとデバイス解放待ちで同じ期限を共有する（REPAIR-5）。
     let started = std::time::Instant::now();
     let result = stopper.stop(effective);
+    // `Err` の組の 2 つ目はログの `released=false` 以降。経路ごとに、回収待ち（`deferred`）とリーク（`leaked`）を分ける。
     let outcome = match result {
         Ok(report) => match release_within(&mut devices, effective, started) {
             Ok(()) => {
@@ -148,9 +165,9 @@ where
                         })
                     }
                     Err(e) => {
-                        // RAM の取得に失敗（リーク済み）。
+                        // RAM の取得に失敗（`GuestMemorySlot` 側でリーク済み）。
                         drop(vm);
-                        Err(e)
+                        Err((e, "leaked=guest_ram,vm"))
                     }
                 }
             }
@@ -159,15 +176,16 @@ where
                 drop(devices);
                 std::mem::forget(memory);
                 drop(vm);
-                Err(e)
+                Err((e, "leaked=guest_ram,vm"))
             }
         },
         Err(e) => {
-            // 止まりを確かめられていない。ゲストがまだ書けうるメモリを解放しない。
+            // 止まりを確かめられていない。ゲストがまだ書けうるメモリを解放せず、参照だけ手放す。
+            // 切り離した vCPU スレッドが最後の `Arc` を落としたときに RAM → VM の順で回収される（#4032）。
             drop(devices);
-            std::mem::forget(memory);
+            memory.detach();
             drop(vm);
-            Err(e)
+            Err((e, "deferred=guest_ram,vm leaked=vcpu_thread"))
         }
     };
     match &outcome {
@@ -181,8 +199,8 @@ where
                 r.reason.as_str()
             ));
         }
-        Err(e) => log_line(format_args!(
-            "level=error op={op} outcome=error code={} released=false leaked=guest_ram,vm,vcpu_thread",
+        Err((e, tail)) => log_line(format_args!(
+            "level=error op={op} outcome=error code={} released=false {tail}",
             e.code().as_str()
         )),
     }
@@ -192,7 +210,24 @@ where
             "stop deadline must be in (0, 60s]",
         ));
     }
-    outcome
+    outcome.map_err(|(e, _)| e)
+}
+
+/// 切り離されうる vCPU スレッドが、終了時に自分の保持を決まった順で落とす（#4032・MVM-5・MVM-1・REPAIR-5）。
+///
+/// 呼び出し元は `hvf::vcpu` の vCPU スレッドの終わり（`spawn_gated` / `spawn_parked_ap`）。vCPU の破棄（`drop(exec)`）は呼び出し元が
+/// 先に行う（vCPU は `VmWithGic` を借用するため、VM を渡す前に破棄しないと借用検査が通らない。型で順序が守られる）。親が [`stop_and_release`] で期限切れに
+/// なって切り離しても、スレッドが後で自力で終わればここで、vCPU の破棄 →（本関数）デバイスの参照 → ゲスト RAM のスロットの clone → VM の順に
+/// 1 回ずつ落ちる。スレッドが最後の保持者なら、スロットの drop で `hv_vm_unmap` → munmap、続く VM の drop で GIC と
+/// `hv_vm_destroy` が走る。対応付けが `Arc<HvVm>` を握るため、VM の破棄が unmap より先になることは型で起きない。
+///
+/// 複数 vCPU でも、各スレッドは「デバイス → スロット」の順に落とすので、最後のスロットの drop は全スレッドのデバイスの drop より後になる。
+/// 残余: panic で巻き戻る場合の drop 順は保証しない（`run_loop` の panic は想定外）。実機で vCPU スレッドから unmap・destroy を
+/// 呼べることは未確認（#4034）。
+pub fn drop_vcpu_thread_state<H, M, V>(handlers: H, memory: M, vm: V) {
+    drop(handlers);
+    drop(memory);
+    drop(vm);
 }
 
 /// teardown の開始を記録し、開始後の vCPU 作成を拒否するための印（TASK-192.16・#3798・MVM-5）。
@@ -271,6 +306,59 @@ mod tests {
         fn release_memory(self, _deadline: Duration) -> Result<(), MicrovmError> {
             Ok(())
         }
+
+        fn detach(self) {
+            drop(self);
+        }
+    }
+
+    /// `GuestMemorySlot` の模擬。clone は `Arc` の複製で、中身（`Rec`）は最後の `Arc` の drop か `release_memory` の取り出しで
+    /// 1 回だけ drop される。
+    #[derive(Clone)]
+    struct SharedRam(Arc<Mutex<Option<Rec>>>);
+
+    impl SharedRam {
+        fn new(log: &Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self(Arc::new(Mutex::new(Some(Rec("memory", Arc::clone(log))))))
+        }
+    }
+
+    impl ReleaseMemory for SharedRam {
+        fn release_memory(self, _deadline: Duration) -> Result<(), MicrovmError> {
+            let taken = self.0.lock().unwrap().take();
+            drop(taken);
+            Ok(())
+        }
+
+        fn detach(self) {
+            drop(self);
+        }
+    }
+
+    fn snapshot(log: &Arc<Mutex<Vec<&'static str>>>) -> Vec<&'static str> {
+        log.lock().unwrap().clone()
+    }
+
+    /// 親が期限切れで切り離した vCPU スレッド。`release_rx` が解かれるまで返らず、返る前に
+    /// `exec` の破棄の後に [`drop_vcpu_thread_state`] で `handlers` → `ram` の clone → `vm` の clone を落とし、`done_tx` に知らせる。
+    fn detached_vcpu(
+        log: &Arc<Mutex<Vec<&'static str>>>,
+        ram: SharedRam,
+        vm: Arc<Rec>,
+        release_rx: mpsc::Receiver<()>,
+        done_tx: mpsc::Sender<()>,
+    ) -> LoopHandle<FakeKick> {
+        let log = Arc::clone(log);
+        spawn_loop::<FakeKick, _>("hvf-test", LONG, move |start: LoopStart<FakeKick>| {
+            let _stop = start.ready(FakeKick);
+            // 停止フラグを無視して、解除されるまで返らない。
+            let _ = release_rx.recv();
+            drop(Rec("exec", Arc::clone(&log)));
+            drop_vcpu_thread_state(Rec("handlers", log), ram, vm);
+            let _ = done_tx.send(());
+            (StopReason::Requested, HvRunStats::default())
+        })
+        .unwrap()
     }
 
     /// 解放に失敗するデバイス。
@@ -394,30 +482,78 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 3);
     }
 
-    /// REPAIR-5・MVM-5・TASK-192.16: 応答しない vCPU スレッドへの停止は `TIMEOUT` になり、ゲスト RAM を解放せずリークする。
+    /// MVM-5・MVM-1・#4032: [`drop_vcpu_thread_state`] は handlers → memory → vm の順に 1 回ずつ落とす。
     #[test]
-    fn repair5_mvm5_3798_stop_deadline_expired_is_timeout_and_keeps_resources() {
+    fn mvm5_4032_vcpu_thread_state_drop_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        drop_vcpu_thread_state(
+            Rec("handlers", Arc::clone(&log)),
+            Rec("memory", Arc::clone(&log)),
+            Rec("vm", Arc::clone(&log)),
+        );
+        assert_eq!(snapshot(&log), vec!["handlers", "memory", "vm"]);
+    }
+
+    /// REPAIR-5・MVM-5・MVM-1・#4032（旧 #3798）: 応答しない vCPU スレッドへの停止は `TIMEOUT` になる。その時点では何も解放されず
+    /// （RAM と VM は切り離したスレッドが持つ）、スレッドが後で終わると vCPU → デバイス参照 → RAM → VM の順に 1 回ずつ回収される。
+    #[test]
+    fn repair5_mvm5_4032_timeout_reclaims_after_vcpu_ends_in_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let h = detached_vcpu(&log, ram.clone(), Arc::clone(&vm), release_rx, done_tx);
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram,
+            vm,
+        };
+        let e = stop_and_release("hvf.microvm.stop", h, Duration::from_millis(50), r).unwrap_err();
+        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
+        assert_eq!(e.code().as_str(), "TIMEOUT");
+        // 親が手放したのはデバイスと自分の参照だけ。RAM・VM は vCPU スレッドが終わるまで解放されない。
+        assert_eq!(snapshot(&log), vec!["devices"]);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(snapshot(&log), vec!["devices"]);
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(LONG).unwrap();
+        assert_eq!(
+            snapshot(&log),
+            vec!["devices", "exec", "handlers", "memory", "vm"]
+        );
+    }
+
+    /// MVM-5・MVM-1・#4032: 通常の停止では vCPU スレッドの clone が先に落ち、RAM と VM は stop が 1 回だけ解放する（二重 drop なし）。
+    #[test]
+    fn mvm5_4032_normal_stop_drops_each_once() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (ram_t, vm_t, log_t) = (ram.clone(), Arc::clone(&vm), Arc::clone(&log));
         let h = spawn_loop::<FakeKick, _>("hvf-test", LONG, move |start: LoopStart<FakeKick>| {
-            let _stop = start.ready(FakeKick);
-            // 停止フラグを無視して、テストの終わりまで返らない。
-            let _ = release_rx.recv();
+            let stop = start.ready(FakeKick);
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(Rec("exec", Arc::clone(&log_t)));
+            drop_vcpu_thread_state(Rec("handlers", log_t), ram_t, vm_t);
             (StopReason::Requested, HvRunStats::default())
         })
         .unwrap();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let e = stop_and_release(
-            "hvf.microvm.stop",
-            h,
-            Duration::from_millis(50),
-            resources(&log),
-        )
-        .unwrap_err();
-        assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
-        assert_eq!(e.code().as_str(), "TIMEOUT");
-        // memory は drop されない（リーク）。devices と vm の手放しだけが起きる。
-        assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
-        let _ = release_tx.send(());
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram.clone(),
+            vm,
+        };
+        stop_and_release("hvf.microvm.stop", h, LONG, r).unwrap();
+        assert_eq!(
+            snapshot(&log),
+            vec!["exec", "handlers", "devices", "memory", "vm"]
+        );
+        // 残りの clone を落としても増えない（中身は取り出し済み）。
+        drop(ram);
+        assert_eq!(snapshot(&log).len(), 5);
     }
 
     /// 渡された期限いっぱいまで待ってから失敗するデバイス（別スレッドが dispatcher をロックし続けている状況の模擬）。
@@ -505,16 +641,6 @@ mod tests {
         .unwrap()
     }
 
-    /// 停止要求を無視して `release_rx` が解かれるまで返らない vCPU の模擬。
-    fn stuck(release_rx: mpsc::Receiver<()>) -> LoopHandle<FakeKick> {
-        spawn_loop::<FakeKick, _>("hvf-vcpu-2", LONG, move |start: LoopStart<FakeKick>| {
-            let _stop = start.ready(FakeKick);
-            let _ = release_rx.recv();
-            (StopReason::Requested, HvRunStats::default())
-        })
-        .unwrap()
-    }
-
     /// `LoopHandle` の集合を 1 つの `VcpuStopper` として扱う試験用の包み。
     struct Set(Vec<LoopHandle<FakeKick>>);
 
@@ -536,22 +662,32 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec!["devices", "memory", "vm"]);
     }
 
-    /// REPAIR-5・MVM-5・#3884: 1 台でも止まりを確かめられなければ RAM をリークする（devices と vm の手放しだけ）。
+    /// REPAIR-5・MVM-5・#3884・#4032: 1 台でも止まりを確かめられなければ RAM を解放しない。devices と vm の手放しだけが起き、
+    /// 止まらなかった vCPU スレッドが終わると RAM と VM が回収される。
     #[test]
-    fn repair5_mvm5_3884_one_stuck_vcpu_keeps_memory() {
-        let (release_tx, release_rx) = mpsc::channel::<()>();
+    fn repair5_mvm5_3884_one_stuck_vcpu_defers_memory_to_its_thread() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let set = Set(vec![responsive(), parked(), stuck(release_rx)]);
-        let e = stop_and_release(
-            "hvf.microvm.stop",
-            set,
-            Duration::from_millis(100),
-            resources(&log),
-        )
-        .unwrap_err();
+        let ram = SharedRam::new(&log);
+        let vm = Arc::new(Rec("vm", Arc::clone(&log)));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stuck = detached_vcpu(&log, ram.clone(), Arc::clone(&vm), release_rx, done_tx);
+        let set = Set(vec![responsive(), parked(), stuck]);
+        let r = Resources {
+            devices: Rec("devices", Arc::clone(&log)),
+            memory: ram,
+            vm,
+        };
+        let e =
+            stop_and_release("hvf.microvm.stop", set, Duration::from_millis(100), r).unwrap_err();
         assert_eq!(e.code(), MicrovmErrorCode::DeadlineExceeded);
-        assert_eq!(*log.lock().unwrap(), vec!["devices", "vm"]);
-        let _ = release_tx.send(());
+        assert_eq!(snapshot(&log), vec!["devices"]);
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(LONG).unwrap();
+        assert_eq!(
+            snapshot(&log),
+            vec!["devices", "exec", "handlers", "memory", "vm"]
+        );
     }
 
     /// REPAIR-5・MVM-5・MVM-1・#4092: route が RAM の lock を持ったまま戻らない（応答しないバックエンド）状況でも、

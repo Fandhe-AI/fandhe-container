@@ -96,7 +96,7 @@
 //! - `run_once` の期限切れ後の cancel 漏れの是正（#3845）
 //!
 //! 未実装（正は各ファイルの「未実装」節。実装済みを装わない。REPAIR-3）:
-//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net（#4029）と TIMEOUT 後のゲスト RAM の回収（#4032）は #3908 配下
+//! - virtio-block の QueueNotify の配線は #4028 で済み。virtio-net（#4029）は #3908 配下。TIMEOUT 後のゲスト RAM の回収は #4032 で実装済み（vCPU スレッドの終了時。実機未確認 #4034）
 //! - big-endian ゲスト
 
 #![deny(unsafe_code)]

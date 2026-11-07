@@ -45,8 +45,8 @@
 //!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
 //!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
 //!    ゲスト RAM は `GuestMemorySlot` が持ち、`release` がスロットの clone を `stop_and_release` へ渡し、
-//!    vCPU の停止を確かめた後に `take_within` で期限つきに取り出す（#4027・#4092）。vCPU スレッドは virtio-block の
-//!    route 越しにスロットの clone を持つ（#4028 で結線済み）。停止の途中でブロック I/O を処理していた vCPU の `with_memory_mut` は
+//!    vCPU の停止を確かめた後に `take_within` で期限つきに取り出す（#4027・#4092）。vCPU スレッドは `ExitHandlers::guest_memory`（#4032）と virtio-block の
+//!    route 越し（#4028）にスロットの clone を持つ。停止の途中でブロック I/O を処理していた vCPU の `with_memory_mut` は
 //!    固定の RELEASED エラー（`Internal`）になり、その vCPU は `Failed(Internal)` で終わる（fail-closed。`Requested` にはならない）。
 //!    backing の unmap は停止の報告の後だけになる。route 内でメモリの lock を持つ vCPU がバックエンド I/O で応答しなくても、
 //!    stop は vCPU の停止待ちの期限で戻り（停止を確かめられなければ RAM をリーク）、RAM の取得も期限つきなので無期限には待たない
@@ -64,20 +64,27 @@
 //! 立つ印で、以後の vCPU 作成は `FailedPrecondition`。
 //! - 採らない案 1「`hv_vcpu_destroy` を呼ばず `hv_vm_destroy` に任せる」: vCPU が残ったままの `hv_vm_destroy` の成功が文書に無い。
 //!   失敗（`HV_BUSY` 等）すると `VM_EXISTS` が立ったままになり、同じプロセスで二度と VM を作れない。
-//! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: RAM の `Send` は #4024（#4022 の個別承認）で入ったが、
-//!   `hv_vm_destroy` まで別スレッドで行う案の採否は #3908 で評価する。
+//! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: 通常の停止と assemble の失敗経路では採らない（unmap と destroy は停止を
+//!   呼んだスレッドで行う）。期限切れの経路に限って、切り離したスレッドの終了時の回収として採る（#4032。下の「期限切れ」の節。実機未確認 #4034）。
 //! - 実機では破棄の後に同じプロセスで作り直せて、`stop` の所要は合成ゲストで 103〜241 µs だった（#3803）。
 //!
-//! ## 期限切れ（`TIMEOUT`）のとき
-//! 解放はデバイスと VM の手放しに留め、ゲスト RAM の対応付けは `mem::forget` でリークする（ゲストがまだ書けうるメモリを再利用させない
-//! fail-closed）。残る資源は vCPU スレッド・vCPU・VM（GIC を含む）・ゲスト RAM の mmap と map。リークした対応付けが `Arc<HvVm>` を
-//! 握るため、スレッドが後で自力で終わっても `hv_vm_destroy` は走らず、同じプロセスでの再 assemble は `FailedPrecondition` になる。
-//! 回収の方法はプロセスの終了だけ（plugin-microvm による再起動。#3800）。後から終わったスレッドの資源を回収する案は、`HostMapping`
-//! の `Send`（#4024 で導入済み）を使って回収スレッドへ渡す実装そのものが本 issue の範囲外（追跡は #3908）。
+//! ## 期限切れ（`TIMEOUT`）のとき（#4032）
+//! 解放はデバイスの手放しと、親が持つ RAM のスロット・VM の参照の手放しに留める（`ReleaseMemory::detach`。ゲストがまだ書けうる
+//! メモリを解放しない fail-closed）。全 vCPU スレッドが `ExitHandlers::guest_memory` でスロットの clone と `Arc<VmWithGic>` を持つため、
+//! 切り離したスレッドが後で自力で終わると、`hvf_lifecycle::drop_vcpu_thread_state` の順（vCPU の破棄 → デバイスの参照 → スロット
+//! → VM）で最後の `Arc` が落ち、`hv_vm_unmap` → munmap → `hv_vm_destroy` が走って「1 プロセス 1 VM」の占有が戻る。スレッドが終わる
+//! までは何も解放されず、同じプロセスでの再 assemble は `FailedPrecondition` になる。`hv_vm_unmap` が失敗したら backing は
+//! リークし、`op=hvf.vm_unmap` の行で記録する。
+//! 実機未確認（#4034）: vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べること（Apple の文書は VM の teardown の
+//! スレッドを規定しない）。順序の単体試験は偽の資源（`hvf_lifecycle` の試験）で固定し、`vcpu.rs` の終わりの呼び出しは型検査と
+//! main の macOS CI・#4034 で確かめる。
+//! 回収されない経路: `release_devices` の失敗（デバイスの保持者が lock を持ち、デバイスが RAM・VM より後に落ちうる）と、RAM の
+//! 取得失敗（`take_within` の期限切れ・毒化。`GuestMemorySlot` がリーク）は、従来どおりプロセスの終了まで残る（plugin-microvm による再起動。#3800）。
+//! 巻き戻り（panic）時の drop 順は保証しない。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は #4014。全体の追跡は #3908。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
@@ -448,7 +455,8 @@ impl<B: BlockBackend, N: NetBackend> HvfVmParts<B, N> {
     ) -> Result<HvfStopReport, MicrovmError> {
         // RAM は stop より前に取り出さない（vCPU がバックエンド I/O 中に lock を持つと期限なしで待つため。REPAIR-5・#4092）。
         // スロットの clone を渡し、`stop_and_release` が vCPU の停止を確かめた後に期限つきで取り出す。
-        // 停止・取得が失敗したら clone を `forget` してリークする（fail-closed）ので、この構造体の drop では解放されない。
+        // 停止の期限切れは clone を手放すだけ（RAM は切り離した vCPU スレッドの終了後に回収）、取得の失敗は clone を `forget` してリーク
+        // する（fail-closed）ので、この構造体の drop では解放されない。
         let (Some(vcpus), Some(devices), Some(vm)) =
             (self.vcpus.take(), self.devices.take(), self.vm.take())
         else {
@@ -603,6 +611,8 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
                 timer: TimerHandler::new(),
+                // 期限切れで切り離した後の回収を、このスレッドの終了に任せる（#4032。全 vCPU が持つ）。
+                guest_memory: Some(memory.clone()),
             },
             vcpu,
         )?;
@@ -628,6 +638,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                             .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
                         hvc,
                         timer: TimerHandler::new(),
+                        guest_memory: Some(memory.clone()),
                     };
                     VcpuThread::spawn_parked_ap(
                         Arc::clone(&vm),

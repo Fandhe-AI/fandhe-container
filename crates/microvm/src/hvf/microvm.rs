@@ -45,9 +45,14 @@
 //!    `hv_vm_destroy`）の順で解放する。ゲスト RAM の対応付けは `Arc<HvVm>` を握るため、unmap が `hv_vm_destroy` より後になることは型で
 //!    起きない。munmap が `hv_vm_destroy` より前でよいのは、unmap の成功後はゲストからその backing へ到達できないため。
 //!    ゲスト RAM は `GuestMemorySlot` が持ち、`release` が stop より前に `take_or_leak` で取り出して `stop_and_release` へ渡す
-//!    ので、順序と期限切れ時のリークは変わらない（#4027）。今は vCPU スレッドがスロットの clone を持たないため安全で、#4028 で
-//!    clone を結線した後は、走っている vCPU の `with_memory` は固定の RELEASED エラー（fail-closed）になり、backing の unmap は
-//!    停止の報告の後だけになる。lock の毒化時は中身を解放せずリークする。
+//!    ので、順序と期限切れ時のリークは変わらない（#4027）。vCPU スレッドは virtio-block の
+//!    route 越しにスロットの clone を持つ（#4028 で結線済み）。停止の途中でブロック I/O を処理していた vCPU の `with_memory_mut` は
+//!    固定の RELEASED エラー（`Internal`）になり、その vCPU は `Failed(Internal)` で終わる（fail-closed。`Requested` にはならない）。
+//!    backing の unmap は停止の報告の後だけになる。`take_or_leak` は route 内でメモリの lock を持つ vCPU を待つが、待ちは
+//!    バックエンドの 1 回分の I/O で上限が決まる（`MemoryBlockBackend` はメモリのコピー。ファイルを backing にするバックエンドは
+//!    TASK-75 / TASK-117 で、そのときこの待ちの上限を見直す）。lock の毒化時は中身を解放せずリークする。
+//!    `assemble` が vCPU スレッドを作った後に失敗した場合は、全台を止めた後に assemble のスレッドでスロットを取り出して手放す（ゲートを
+//!    開けていないので安全。unmap と `hv_vm_destroy` を vCPU スレッドに担わせない）。
 //!
 //! ## Apple の記述との関係
 //! `hv_gic_create` のドキュメント（<https://developer.apple.com/documentation/hypervisor/hv_gic_create(_:)> の Discussion。2026-11-04 に
@@ -70,8 +75,9 @@
 //! の `Send`（#4024 で導入済み）を使って回収スレッドへ渡す実装そのものが本 issue の範囲外（追跡は #3908）。
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
-//! - virtqueue の処理と QueueNotify の配線、ゲスト RAM のデバイスへの受け渡し（スロットの clone の結線は #4028）（`HostMapping` の `Send` は #4024 で導入済み）は未実装で、担当は
-//!   #3908（`HvfBoundDevice::transport` が将来使う）。
+//! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
+//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、期限切れ後の最後の `Arc` での RAM の回収は #4032、
+//!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は #4014。全体の追跡は #3908。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、
 //!   CPU_ON による AP の実起動・AP ごとの `ExitHandlers`・CPU_OFF 後の parked への戻し・AP の exit による全台の停止の検知（`VcpuSet::is_finished`）は #3891 で実装済み（残余は `hvf_smp` の「未実装・逸脱」）。シリアルの入力（RX）、`NetDeviceConfig`（Linux 限定）との共通化、構造化ログ（crate にログ基盤が無い）。
 //! - 書いた範囲の PoC までの clean と I-cache 無効化の要否（合成 Image は無しで起動した。#3803。実カーネルは #3988）。
@@ -103,7 +109,9 @@ use crate::hvf_lifecycle::{
 use crate::hvf_loop::log_line;
 use crate::hvf_smp::{ApMailbox, HvfPowerControl};
 use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
-use crate::interrupt::{BoundAckRoute, InterruptAckRoute, InterruptLine};
+use crate::interrupt::{
+    BlockQueueNotifyRoute, BoundAckRoute, InterruptAckRoute, InterruptLine, QueueNotifyRoute,
+};
 use crate::psci::PsciCpus;
 use crate::uart::SerialConsole;
 use crate::virtio_block::{BlockBackend, VirtioBlock};
@@ -180,8 +188,7 @@ pub struct HvfDeviceInfo {
 
 /// 登録済みのデバイス 1 台（トランスポート・識別子・窓・割り込み線）。
 struct HvfBoundDevice<D: crate::virtio_mmio::VirtioDevice> {
-    /// QueueNotify の処理（#3798）と ACK の route（#3863）が型つきで触る。dispatcher と共有する。
-    #[allow(dead_code)]
+    /// QueueNotify の route（#4028）と ACK の route（#3863）が型つきで触る。dispatcher と共有する。
     transport: Arc<Mutex<VirtioMmioTransport<D>>>,
     id: DeviceId,
     window: MmioRegion,
@@ -357,6 +364,28 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
         b.chain(n).collect()
     }
 
+    /// virtio-block の `QueueNotify` の処理（virtqueue の処理と完了の割り込み。#4028・MVM-5・MVM-1）。
+    ///
+    /// 台ごとに 1 回だけ作り、全 vCPU の `MmioHandler` が同じ実体（`Arc`）を共有する。ゲスト RAM は `memory` スロットの
+    /// clone で受け渡す（`HvfVmParts::release` が stop より前に `take_or_leak` するため、解放後の通知は `Internal` で fail-closed）。
+    /// virtio-net の route は #4029 の担当で、それまで net は計数だけで続行する（REPAIR-3）。
+    fn queue_notify_routes(
+        &self,
+        memory: &GuestMemorySlot<RegisteredHvfRam<'static>>,
+    ) -> Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)> {
+        self.block
+            .iter()
+            .map(|d| {
+                let route: Arc<dyn QueueNotifyRoute> = Arc::new(BlockQueueNotifyRoute::new(
+                    Arc::clone(&d.transport),
+                    memory.clone(),
+                    d.line.clone(),
+                ));
+                (d.id, route)
+            })
+            .collect()
+    }
+
     /// 全デバイスの SPI の宛先のヒント（vCPU ごとの `AckRouteLearner` が ACK を処理した vCPU を書く。#3948）。
     fn route_hints(&self) -> Vec<(DeviceId, SpiRouteHint)> {
         let b = self.block.iter().map(|d| (d.id, d.line.route_hint()));
@@ -529,7 +558,11 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
         )?;
         let (loaded, state) =
             load_arm64(&mut memory, &kernel, initrd.as_deref(), &cmdline, &layout)?;
+        // 以降の失敗経路は、スロットを取り出してから返す（`abort_after_spawn`）。vCPU スレッドが route 越しに最後の `Arc` を
+        // 持って unmap と `hv_vm_destroy` を担う形（採らない案 2）にしないため。
+        let memory = GuestMemorySlot::new(memory);
         let devices = HvfDeviceBus::new(&layout, &vm, block, net)?;
+        let queue_routes = devices.queue_notify_routes(&memory);
 
         let psci = Arc::new(PsciCpus::new(layout.vcpus)?);
         let power = Arc::new(HvfPowerControl::new(
@@ -568,6 +601,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             ExitHandlers {
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes())
+                    .with_queue_notify_routes(queue_routes.clone())
                     .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
                 timer: TimerHandler::new(),
@@ -579,7 +613,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             Some(b) => *b,
             None => {
                 // 想定外（setup は成功で戻った）。ゲートを開けずに止める（ゲストは走らない）。
-                let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+                abort_after_spawn(vcpu_set, &memory);
                 return Err(internal("boot readback was not recorded"));
             }
         };
@@ -592,6 +626,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     let handlers = ExitHandlers {
                         mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                             .with_ack_routes(devices.ack_routes())
+                            .with_queue_notify_routes(queue_routes.clone())
                             .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
                         hvc,
                         timer: TimerHandler::new(),
@@ -611,12 +646,12 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                     mpidrs.push(raw);
                     // AP が起きてから結ぶ。結べなければ（不変条件違反）全台を回収して返す。
                     if let Err(e) = power.attach(index, mailbox) {
-                        let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+                        abort_after_spawn(vcpu_set, &memory);
                         return Err(e);
                     }
                 }
                 Err(e) => {
-                    let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+                    abort_after_spawn(vcpu_set, &memory);
                     return Err(e);
                 }
             }
@@ -629,7 +664,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 vcpus: Some(vcpu_set),
                 mpidrs,
                 devices: Some(devices),
-                memory: GuestMemorySlot::new(memory),
+                memory,
                 vm: Some(vm),
                 dispatcher,
                 infos,
@@ -640,6 +675,15 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             },
         })
     }
+}
+
+/// vCPU スレッドを作った後の失敗経路の後始末（`assemble` 専用）。全台を止めてから、ゲスト RAM を assemble のスレッドで取り出して
+/// drop する。ゲートを開けていないのでゲストは 1 命令も走っておらず、drop は安全。`stop` が期限切れでも RAM は取り出して
+/// ここで手放す（vCPU スレッドが route 越しに最後の `Arc` を持って unmap を行う形にしない。#4028）。
+fn abort_after_spawn(vcpu_set: VcpuSet, memory: &GuestMemorySlot<RegisteredHvfRam<'static>>) {
+    let _ = vcpu_set.stop(DROP_STOP_DEADLINE);
+    // 毒化は今の lock の持ち主では起きない防御で、起きたら中身はリークする（fail-closed）。
+    let _ = memory.take_or_leak();
 }
 
 impl<B: BlockBackend, N: NetBackend> HvfMicroVm<B, N> {

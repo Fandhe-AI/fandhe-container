@@ -15,7 +15,7 @@
 //!
 //! # 未結線（REPAIR-3）
 //! #4026 で `interrupt::BlockQueueNotifyRoute` が使い始めた。#4027 で `hvf::microvm` の `HvfVmParts` が macOS のゲスト RAM の所有に使う（clone はまだ持たない）。
-//! vCPU スレッドへの clone の結線は #4028（`MmioHandler` への route 結線）、最後の `Arc` での回収は #4032。
+//! vCPU スレッドへの clone の結線は #4028 で済み（`MmioHandler` への block の route 結線）、最後の `Arc` での回収は #4032。
 //!
 //! # cfg
 //! `interrupt::BoundAckRoute` と同じく Linux と macOS（aarch64）だけ。Windows（WHP）は MVP 外（MVM-5）。

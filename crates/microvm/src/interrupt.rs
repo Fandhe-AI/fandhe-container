@@ -360,10 +360,11 @@ pub trait QueueNotifyRoute: Send + Sync + std::fmt::Debug {
 
 /// virtio-block 1 台分の [`QueueNotifyRoute`]（トランスポート・ゲスト RAM のスロット・割り込み線を束ねる）。
 ///
-/// 未結線（REPAIR-3）: 利用は #4028（macOS の `HvfDeviceBus` が 1 台ごとに作り `MmioHandler` へ渡す）。net の route は #4029。
+/// macOS では `hvf::microvm` の `HvfDeviceBus` が 1 台ごとに作り `MmioHandler` へ渡して結線済み（#4028）。net の route は #4029（REPAIR-3）。
 /// `line.trigger()` はメモリの lock の中で呼ばれる。`guest_memory_slot` の「クロージャの中で他の lock を取らない」
-/// の例外で、`GicSpiLine::trigger` は `hv_gic_set_spi` を呼ぶだけで Rust の lock を取らず、試験の偽物の lock も
-/// 順序の外にある末端のものに限る。
+/// の例外で、`GicSpiLine::trigger`（`HvfGicSink::set_spi`）が取る Rust の lock は、VM の生存を示す `alive` の読み取りと、
+/// WFI の起床の waker の mutex（`alive` を外してから取る）だけ。どちらも末端で、memory・transport・dispatcher を待たない。
+/// 試験の偽物の lock も順序の外にある末端のものに限る。
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub struct BlockQueueNotifyRoute<B: BlockBackend, M: GuestMemoryBacking, L> {
     transport: std::sync::Arc<std::sync::Mutex<VirtioMmioTransport<VirtioBlock<B>>>>,

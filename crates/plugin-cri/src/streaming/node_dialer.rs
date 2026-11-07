@@ -182,8 +182,27 @@ mod tests {
     fn cri6_sec1_3755_connects_to_loopback_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
+        // REPAIR-5: accept・read・write・join のすべてに有限の期限を持たせる。
+        let io_limit = Duration::from_secs(5);
         let server = std::thread::spawn(move || {
-            let (mut c, _) = listener.accept().expect("accept");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = std::time::Instant::now() + io_limit;
+            let mut c = loop {
+                match listener.accept() {
+                    Ok((c, _)) => break c,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "accept deadline exceeded"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            c.set_nonblocking(false).expect("blocking");
+            c.set_read_timeout(Some(io_limit)).expect("read timeout");
+            c.set_write_timeout(Some(io_limit)).expect("write timeout");
             let mut buf = [0u8; 4];
             c.read_exact(&mut buf).expect("read");
             c.write_all(&buf).expect("write");
@@ -191,6 +210,8 @@ mod tests {
         let mut s = NodeLoopbackDialer::new()
             .dial(&node(), port, Duration::from_secs(2))
             .expect("dial");
+        s.set_read_timeout(Some(io_limit)).expect("read timeout");
+        s.set_write_timeout(Some(io_limit)).expect("write timeout");
         assert_eq!(
             s.peer_addr().expect("peer"),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)

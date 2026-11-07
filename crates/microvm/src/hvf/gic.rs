@@ -219,7 +219,7 @@ impl VmWithGic {
         self.wake.handle(index)
     }
 
-    /// 全 vCPU の通知口の束の clone。停止要求の kick と VM の終了通知が全台を起こすのに使う（#3948）。
+    /// 全 vCPU の通知口の束の clone。停止要求の kick と VM の終了通知では #4040 から使わない（製品の呼び出し元なし。削除は #4042）。
     pub fn wake_set(&self) -> WfiWakeSet {
         self.wake.clone()
     }

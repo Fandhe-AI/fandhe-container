@@ -37,7 +37,7 @@
 //! exit ごとの処理は `hvf::{mmio, hvc}`（#3793・#3794）が担う。WFI の exit・vtimer の exit は GIC つきでは来ず、来たら `Failed(Unimplemented)` で止める（#4039・#3995）。
 //!
 //! ## 解放順序（`hvf_lifecycle::stop_and_release`。stop と drop が同じ手順を通る。drop の期限は 5 秒）
-//! 1. 停止要求 → kick（`hv_vcpus_exit` と、WFI の待ちを全台起こす `WfiWakeSet` の通知。#3887・#3948。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
+//! 1. 停止要求 → kick（`hv_vcpus_exit` と、parked の AP のメールボックスの通知。#4040。待つ間も 10 ms ごとに打ち直す）→ vCPU スレッドが実行ループを抜ける。
 //!    続けて、virtio-net がある構成の受信ポーラー `hvf-net-rx`（#4030）を止める（kick で即座に起きる。期限は vCPU と共有で下限 100ms。
 //!    `hvf_lifecycle::StopWithAux`）。ポーラーは終了の直前に transport・RAM のスロットの clone・割り込み線を落としてから報告する。
 //!    止まりを確かめられなければ RAM をリークする（fail-closed）。ポーラーの失敗は `VmShutdown` で全 vCPU を止める。

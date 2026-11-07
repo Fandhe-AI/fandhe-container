@@ -14,8 +14,8 @@
 //! - ゲストが書きうるメモリを vCPU が使っている間は解放しない。`take` を呼ぶ時点は呼び出し元が決める。
 //!
 //! # 未結線（REPAIR-3）
-//! 利用予定は #4026（QueueNotify の route）・#4027（`HvfVmParts.memory` の置き換え）・#4032（最後の `Arc` での回収）。
-//! 現時点ではどこからも使われていない。
+//! #4027 で `hvf::microvm` の `HvfVmParts` が macOS のゲスト RAM の所有に使う（clone はまだ持たない）。
+//! vCPU スレッドへの clone の結線は #4028、QueueNotify の route は #4026、最後の `Arc` での回収は #4032。
 //!
 //! # cfg
 //! `interrupt::BoundAckRoute` と同じく Linux と macOS（aarch64）だけ。Windows（WHP）は MVP 外（MVM-5）。
@@ -90,6 +90,24 @@ impl<M: GuestMemoryBacking> GuestMemorySlot<M> {
     pub fn take(&self) -> Result<Option<GuestMemory<M>>, MicrovmError> {
         let mut guard = self.inner.lock().map_err(|_| poisoned())?;
         Ok(guard.take())
+    }
+}
+
+impl<M: GuestMemoryBacking> GuestMemorySlot<M> {
+    /// [`Self::take`] と同じだが、lock が毒化していたら中身を永久にリークしてからエラーを返す（fail-closed）。
+    ///
+    /// `hvf::microvm` の解放が使う。毒化のまま `Err` で戻ると、呼び出し元の構造体の drop で最後の `Arc` が落ち、
+    /// vCPU スレッドが残っていても RAM が解放されうる。これは期限切れの経路（ゲストがまだ書けうるメモリを
+    /// 解放しない）と食い違うため、`Arc` を 1 つ `forget` して中身が drop されないようにする。
+    /// 何度呼んでも `Arc` が増えるだけで中身は drop されない。回収はプロセスの終了だけ（#4032・#3908 が扱う）。
+    pub fn take_or_leak(&self) -> Result<Option<GuestMemory<M>>, MicrovmError> {
+        match self.inner.lock() {
+            Ok(mut guard) => Ok(guard.take()),
+            Err(_) => {
+                std::mem::forget(self.clone());
+                Err(poisoned())
+            }
+        }
     }
 }
 
@@ -235,5 +253,40 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(taken);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mvm1_4027_take_or_leak_returns_contents_once() {
+        let s = slot();
+        s.with_memory_mut(|m| m.write_at(GuestAddress::new(0x1010), &[5, 6, 7, 8]))
+            .unwrap();
+        let taken = s.take_or_leak().unwrap().unwrap();
+        let mut b = [0u8; 4];
+        taken.read_at(GuestAddress::new(0x1010), &mut b).unwrap();
+        assert_eq!(b, [5, 6, 7, 8]);
+        assert!(s.take_or_leak().unwrap().is_none());
+        assert_err(read4(&s).unwrap_err(), "guest memory is already released");
+    }
+
+    #[test]
+    fn repair5_4027_take_or_leak_poisoned_never_drops_contents() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let s = counting(&drops);
+        let c = s.clone();
+        let r = std::thread::spawn(move || {
+            let _ = c.with_memory(|_| -> Result<(), MicrovmError> { panic!("poison for test") });
+        })
+        .join();
+        assert!(r.is_err());
+        assert_err(
+            s.take_or_leak().err().unwrap(),
+            "guest memory lock poisoned",
+        );
+        assert_err(
+            s.take_or_leak().err().unwrap(),
+            "guest memory lock poisoned",
+        );
+        drop(s);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 }

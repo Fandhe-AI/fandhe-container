@@ -17,7 +17,8 @@
 //! セッション（[`attach`]）を実装済みだが、実行中コンテナの stdio を渡す本番の `attach::AttachBackend` は未接続で、
 //! 注入しない構成では 501 のまま。Exec は #680（TASK-63.2）の [`exec::ExecStreamHandler`] が同じ SPDY codec・
 //! 交渉を使って実装済みだが、stdio を持つ起動役 [`exec::ExecStreamLauncher`] の本番の実装は無く、
-//! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が [`StreamDispatcher`] へ足して実装する。
+//! plugin-cri からの注入も後続である。PortForward は #682（TASK-63.4）が実装し、NODE ネットワークの pod だけ plugin-cri が
+//! 本番の dialer を注入する（#3755）。POD ネットワークの pod は `UNIMPLEMENTED`（#3766）。
 //!
 //! ## 安全側の既定
 //!
@@ -115,8 +116,14 @@ pub enum StreamRequest {
     Exec(v1::ExecRequest),
     /// `RuntimeService.Attach` の要求。
     Attach(v1::AttachRequest),
-    /// `RuntimeService.PortForward` の要求。
-    PortForward(v1::PortForwardRequest),
+    /// `RuntimeService.PortForward` の要求。`network` は RPC 時に sandbox の記録から決めた値で、
+    /// 消費側（[`port_forward::PortForwardHandler`]）が dialer へ渡す（#3755）。
+    PortForward {
+        /// CRI の要求。
+        request: v1::PortForwardRequest,
+        /// 転送先の pod のネットワーク種別。
+        network: port_forward::PortForwardNetwork,
+    },
 }
 
 impl StreamRequest {
@@ -125,7 +132,7 @@ impl StreamRequest {
         match self {
             StreamRequest::Exec(_) => StreamKind::Exec,
             StreamRequest::Attach(_) => StreamKind::Attach,
-            StreamRequest::PortForward(_) => StreamKind::PortForward,
+            StreamRequest::PortForward { .. } => StreamKind::PortForward,
         }
     }
 }
@@ -421,13 +428,15 @@ impl TokenCache {
 /// RPC は URL を返さず `UNIMPLEMENTED` にする（URL を返してから 501 にしない。実装済みを装わない）。
 /// 既定（[`Default`]）はどの種別も未結線で、宣言していない種別は出ない（fail-closed）。
 ///
-/// 現状は種別ごとの結線の有無だけを持つ。attach の読み取り専用（#3763）・PortForward の POD 未対応（#3766）・
+/// 種別ごとの結線の有無と、PortForward が POD ネットワークの pod にも対応するか（`port_forward_pod_network`。
+/// 既定は偽で POD は `UNIMPLEMENTED`。#3755・#3766）を持つ。attach の読み取り専用（#3763）・
 /// exec の相対 `argv[0]`（#3761）を RPC 時に断る情報は、各 issue が項目として足す（本型は後から項目を足せる構造体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamWiring {
     exec: bool,
     attach: bool,
     port_forward: bool,
+    port_forward_pod_network: bool,
 }
 
 impl StreamWiring {
@@ -441,12 +450,24 @@ impl StreamWiring {
         Self::none().with(kind)
     }
 
-    /// 全種別が結線済み。
+    /// 全種別が結線済み（PortForward の POD 対応を含む。試験用の「全機能」）。
     pub fn all() -> Self {
         Self::none()
             .with(StreamKind::Exec)
             .with(StreamKind::Attach)
             .with(StreamKind::PortForward)
+            .with_port_forward_pod_network()
+    }
+
+    /// PortForward が POD ネットワークの pod にも対応することを宣言して返す。
+    pub fn with_port_forward_pod_network(mut self) -> Self {
+        self.port_forward_pod_network = true;
+        self
+    }
+
+    /// PortForward が POD ネットワークの pod にも対応するか。
+    pub fn port_forward_pod_network(&self) -> bool {
+        self.port_forward_pod_network
     }
 
     /// `kind` を結線済みにして返す。
@@ -517,12 +538,33 @@ impl StreamingUrlIssuer {
         }))
     }
 
+    /// PortForward の `network` が POD で未対応なら `UNIMPLEMENTED` を返す（REPAIR-3・#3755）。
+    ///
+    /// `runtime_service` が sandbox の照合の後、URL の発行の前に呼ぶ。固定の英語文で、ID を含めない。
+    pub fn require_port_forward_network(
+        &self,
+        network: port_forward::PortForwardNetwork,
+    ) -> Result<(), CriError> {
+        if network == port_forward::PortForwardNetwork::Pod
+            && !self.wiring.port_forward_pod_network()
+        {
+            return Err(CriError::unimplemented(
+                "port-forward for pod network is not implemented",
+            ));
+        }
+        Ok(())
+    }
+
     /// 要求を保存して URL（`http://<addr>/<kind>/<token>`）を返す。
     ///
-    /// 未結線の種別は、乱数源とトークン枠を消費する前に `UNIMPLEMENTED` で断る（多層防御）。
+    /// 未結線の種別・未対応の PortForward の POD は、乱数源とトークン枠を消費する前に `UNIMPLEMENTED` で断る
+    /// （多層防御）。
     pub fn issue(&self, request: StreamRequest) -> Result<String, CriError> {
         let kind = request.kind();
         self.require_wired(kind)?;
+        if let StreamRequest::PortForward { network, .. } = &request {
+            self.require_port_forward_network(*network)?;
+        }
         let token = self.cache.issue_at(Instant::now(), request, random_token)?;
         Ok(format!(
             "{}/{}/{}",
@@ -695,8 +737,13 @@ impl StreamHandler for StreamDispatcher {
             (StreamKind::Exec, &self.exec),
             (StreamKind::PortForward, &self.port_forward),
         ] {
-            if slot.as_ref().is_some_and(|h| h.wiring().is_wired(kind)) {
+            if let Some(child) = slot.as_ref().map(|h| h.wiring())
+                && child.is_wired(kind)
+            {
                 wiring = wiring.with(kind);
+                if kind == StreamKind::PortForward && child.port_forward_pod_network() {
+                    wiring = wiring.with_port_forward_pod_network();
+                }
             }
         }
         wiring
@@ -1134,6 +1181,59 @@ mod tests {
         assert!(w.is_wired(StreamKind::Exec));
         assert!(!w.is_wired(StreamKind::Attach));
         assert!(!w.is_wired(StreamKind::PortForward));
+    }
+
+    fn pf_req(network: port_forward::PortForwardNetwork) -> StreamRequest {
+        StreamRequest::PortForward {
+            request: v1::PortForwardRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                port: vec![80],
+            },
+            network,
+        }
+    }
+
+    /// CRI-6・REPAIR-3・#3755: POD 対応の宣言は `only` では立たず、`all` と `with_port_forward_pod_network` で立つ。
+    #[test]
+    fn cri6_3755_pod_network_flag_defaults_to_false() {
+        assert!(!StreamWiring::none().port_forward_pod_network());
+        assert!(!StreamWiring::only(StreamKind::PortForward).port_forward_pod_network());
+        assert!(StreamWiring::all().port_forward_pod_network());
+        assert!(
+            StreamWiring::only(StreamKind::PortForward)
+                .with_port_forward_pod_network()
+                .port_forward_pod_network()
+        );
+    }
+
+    /// CRI-6・REPAIR-3・SEC-1・#3755: POD は未対応の結線では `Unimplemented` で、トークン枠を消費しない。NODE は発行できる。
+    #[test]
+    fn cri6_3755_issue_rejects_pod_network_without_consuming_slot() {
+        let issuer = issuer_with(StreamWiring::only(StreamKind::PortForward));
+        let err = issuer
+            .issue(pf_req(port_forward::PortForwardNetwork::Pod))
+            .expect_err("pod is unimplemented");
+        assert_eq!(err.code(), crate::error::CriErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "port-forward for pod network is not implemented"
+        );
+        assert_eq!(issuer.cache.len(), 0);
+        assert!(
+            issuer
+                .require_port_forward_network(port_forward::PortForwardNetwork::Node)
+                .is_ok()
+        );
+        let err = issuer
+            .require_port_forward_network(port_forward::PortForwardNetwork::Pod)
+            .expect_err("pod");
+        assert_eq!(err.code(), crate::error::CriErrorCode::Unimplemented);
+        let with_pod = issuer_with(StreamWiring::all());
+        assert!(
+            with_pod
+                .require_port_forward_network(port_forward::PortForwardNetwork::Pod)
+                .is_ok()
+        );
     }
 
     /// CRI-6・REPAIR-3・#3753: 未結線の種別の発行は `Unimplemented` で、トークン枠を消費しない。

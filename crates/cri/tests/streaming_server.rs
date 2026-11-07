@@ -67,6 +67,17 @@ fn pod_config() -> PodSandboxConfig {
             namespace: "ns".into(),
             attempt: 0,
         }),
+        // PortForward は NODE の pod だけ結線済み（POD は #3766 まで UNIMPLEMENTED。#3755）。
+        linux: Some(v1::LinuxPodSandboxConfig {
+            security_context: Some(v1::LinuxSandboxSecurityContext {
+                namespace_options: Some(v1::NamespaceOption {
+                    network: v1::NamespaceMode::Node as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -724,6 +735,60 @@ async fn cri6_repair3_partial_dispatcher_port_forward_only() {
     assert_eq!(exec.expect_err("exec").code(), Code::Unimplemented);
     assert_eq!(attach.expect_err("attach").code(), Code::Unimplemented);
     assert!(pf.expect("pf url").contains("/portforward/"));
+}
+
+/// CRI-6・REPAIR-3・SEC-1・#3755: POD ネットワークの sandbox の PortForward は URL を返さず `UNIMPLEMENTED`、
+/// NODE の sandbox は URL を返す。
+#[cfg(unix)]
+#[tokio::test]
+async fn cri6_3755_port_forward_pod_network_is_unimplemented() {
+    let server = StreamingServer::bind_with_handler(
+        StreamingConfig::default(),
+        partial_dispatcher(&[StreamKind::PortForward]),
+    )
+    .await
+    .expect("bind");
+    let service = CriRuntimeService::new().with_streaming(server.issuer());
+    let node = run_sandbox(&service).await;
+    let pod = service
+        .run_pod_sandbox(Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod2".into(),
+                    uid: "uid-2".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("run pod sandbox")
+        .into_inner()
+        .pod_sandbox_id;
+    let node_url = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: node,
+            port: vec![80],
+        }))
+        .await
+        .expect("node url")
+        .into_inner()
+        .url;
+    assert!(node_url.contains("/portforward/"));
+    let err = service
+        .port_forward(Request::new(v1::PortForwardRequest {
+            pod_sandbox_id: pod,
+            port: vec![80],
+        }))
+        .await
+        .expect_err("pod is unimplemented");
+    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "port-forward for pod network is not implemented"
+    );
 }
 
 /// CRI-6・REPAIR-3・#3753: `StreamingServer::bind`（どの種別も未結線）では 3 RPC とも URL を返さない。

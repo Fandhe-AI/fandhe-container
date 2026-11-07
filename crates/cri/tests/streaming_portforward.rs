@@ -16,7 +16,7 @@ use std::time::Duration;
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1;
 use fandhe_container_cri::streaming::port_forward::{
-    PortForwardConfig, PortForwardDialer, PortForwardHandler,
+    PortForwardConfig, PortForwardDialer, PortForwardHandler, PortForwardNetwork, PortForwardTarget,
 };
 use fandhe_container_cri::streaming::spdy::{
     Frame, FrameDecoder, FrameEncoder, Headers, StreamId, goaway_status, rst_status,
@@ -31,11 +31,12 @@ struct MapDialer(HashMap<u16, SocketAddr>);
 impl PortForwardDialer for MapDialer {
     fn dial(
         &self,
-        pod_sandbox_id: &str,
+        target: &PortForwardTarget,
         port: u16,
         timeout: Duration,
     ) -> Result<TcpStream, CriError> {
-        assert_eq!(pod_sandbox_id, "sb-1");
+        assert_eq!(target.pod_sandbox_id(), "sb-1");
+        assert_eq!(target.network(), PortForwardNetwork::Node);
         let addr = self
             .0
             .get(&port)
@@ -102,10 +103,13 @@ async fn fixture_with_map(
         .expect("bind");
     let url = server
         .issuer()
-        .issue(StreamRequest::PortForward(v1::PortForwardRequest {
-            pod_sandbox_id: "sb-1".to_string(),
-            port: ports,
-        }))
+        .issue(StreamRequest::PortForward {
+            request: v1::PortForwardRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                port: ports,
+            },
+            network: PortForwardNetwork::Node,
+        })
         .expect("issue");
     let rest = url.strip_prefix("http://").expect("http url");
     let path = rest[rest.find('/').expect("path")..].to_string();

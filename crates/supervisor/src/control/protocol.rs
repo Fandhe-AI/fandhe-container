@@ -1,6 +1,6 @@
 //! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 7 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 8 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -17,6 +17,15 @@
 //! | CancelRestartRequest | クライアント → サーバ | 5 | deadline_ns `u64` | 16 |
 //! | ExecHandoverRequest | クライアント → サーバ | 6 | pid `u32`・deadline_ns `u64` | 20 |
 //! | ExecCgroupNotify | クライアント → サーバ | 7 | hold_ns `u64`・exec 子 cgroup の名前（1〜56 バイト。Linux のみ） | 17〜72 |
+//! | ExitWatchRequest | クライアント → サーバ | 8 | pid `u32`・hold_ns `u64`（相対の保持期限） | 20 |
+//!
+//! ExitWatchRequest は、稼働中コンテナの終了を「通知で待つ」ための購読要求である（SUP-1・CRI-1・REPAIR-5・#3683）。
+//! supervisor は、スロットが `Active` で pid が一致し、購読の枠に空きがあるとき `Response(Ok)` を返し、以後は接続を閉じる
+//! ことで「起きよ」を伝える（init の回収・スロットの解放・世代交代・保持期限切れ・supervisor の終了のいずれでも閉じる）。
+//! クライアントは EOF も想定外のバイトも「起床」とみなし、状態ストアを読み直す（通知はヒントで、正しさは状態ストアに置く）。
+//! 既に終了していれば `ContainerExited`（購読しない）。pid 不一致は `PidMismatch`、ハンドル無しは `NoHandle`、枠が
+//! 埋まっていれば `Busy`。保持期限は [`MAX_EXIT_WATCH_HOLD`] 以下で、クライアントは全体の期限までこの単位で購読し直す。
+//! シグナルは送らず、pidfd も渡さない。
 //!
 //! ExecCgroupNotify は ExecHandoverRequest が成功した **同じ接続** の上で、CLI が exec 子 cgroup の排他作成に成功した直後
 //! （worker の fork 前）に送る（SUP-6・REPAIR-5・#2626）。supervisor は名前を検証して `Response(Ok)` で ack し、以後は接続の
@@ -52,6 +61,8 @@
 //! 一緒に入る前提で、版の不一致は上のとおり安全側に倒れる。kind 5（#2440）も同じ方針で、古い supervisor は
 //! `Malformed` として拒否し、クライアントは `NoSupervisor` 相当（従来の stop）に倒す。kind 6（#2626）も同じ方針で、
 //! 古い supervisor は `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（exec しない。fail-closed）。
+//! kind 8（#3683）も同じ方針で、古い supervisor は `Malformed` として拒否し、クライアントは「通知なし」として状態の
+//! 照会へ退避する（遅延が既定に戻るだけで、正しさは落ちない）。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -86,6 +97,13 @@ pub const MAX_EXEC_CGROUP_NAME_LEN: usize = MAX_PAYLOAD as usize - EXEC_NOTIFY_H
 /// ExecCgroupNotify の保持期限が指せる、サーバが見た時点からの残り時間の上限（秒）。CLI の `exec --timeout` の上限
 /// （3600 秒）に合わせる。CLI の試験が `EXEC_MAX_TIMEOUT_SECS <= この値` を照合する。
 pub const MAX_EXEC_HOLD_SECS: u64 = 3600;
+/// ExitWatchRequest の payload 長（pid `u32` と hold_ns `u64`）。
+pub const EXIT_WATCH_PAYLOAD_LEN: usize = 12;
+/// ExitWatchRequest の全長。
+pub const EXIT_WATCH_REQUEST_LEN: usize = HEADER_LEN + EXIT_WATCH_PAYLOAD_LEN;
+/// ExitWatchRequest の保持期限の上限。サーバが 1 購読で fd を預かる最長で、クライアントは全体の期限までこの単位で
+/// 購読し直す（資源を短く区切る。REPAIR-5）。
+pub const MAX_EXIT_WATCH_HOLD: Duration = Duration::from_secs(60);
 /// Response の payload 長。
 pub const RESPONSE_PAYLOAD_LEN: usize = 1;
 /// Response の全長。
@@ -100,6 +118,7 @@ const KIND_STOP_REQUEST: u8 = 4;
 const KIND_CANCEL_RESTART_REQUEST: u8 = 5;
 const KIND_EXEC_HANDOVER_REQUEST: u8 = 6;
 const KIND_EXEC_CGROUP_NOTIFY: u8 = 7;
+const KIND_EXIT_WATCH_REQUEST: u8 = 8;
 
 /// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +387,10 @@ impl FrameHeader {
             self.expect(KIND_EXEC_HANDOVER_REQUEST, EXEC_HANDOVER_PAYLOAD_LEN)?;
             return Ok(RequestHeader::ExecHandover);
         }
+        if self.kind == KIND_EXIT_WATCH_REQUEST {
+            self.expect(KIND_EXIT_WATCH_REQUEST, EXIT_WATCH_PAYLOAD_LEN)?;
+            return Ok(RequestHeader::ExitWatch);
+        }
         self.expect_request().map(RequestHeader::Signal)
     }
 
@@ -403,6 +426,8 @@ pub enum RequestHeader {
     CancelRestart,
     /// ExecHandoverRequest（payload 12 バイト。#2626）。
     ExecHandover,
+    /// ExitWatchRequest（payload 12 バイト。#3683）。
+    ExitWatch,
 }
 
 /// Hello frame（payload なし）を encode する。
@@ -536,6 +561,53 @@ impl ExecHandoverRequestFrame {
         let deadline =
             SignalDeadline::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))?;
         Ok(Self { pid, deadline })
+    }
+}
+
+/// ExitWatchRequest frame（kind 8。SUP-1・CRI-1・REPAIR-5・#3683）。pid と保持期限の値域は型が保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitWatchRequestFrame {
+    /// 対象の pid（スロットの起動ハンドルの pid と一致したときだけ購読を受ける）。
+    pub pid: NonZeroU32,
+    /// サーバが購読の接続を預かる最長の相対時間（`1ns..=`[`MAX_EXIT_WATCH_HOLD`]）。
+    hold: Duration,
+}
+
+impl ExitWatchRequestFrame {
+    /// 値域を検証して作る。0 または [`MAX_EXIT_WATCH_HOLD`] 超は `Malformed`。
+    pub fn new(pid: NonZeroU32, hold: Duration) -> Result<Self, ControlReason> {
+        if hold.is_zero() || hold > MAX_EXIT_WATCH_HOLD {
+            return Err(ControlReason::Malformed);
+        }
+        Ok(Self { pid, hold })
+    }
+
+    /// 保持期限。
+    pub fn hold(&self) -> Duration {
+        self.hold
+    }
+
+    /// 20 バイトに encode する。
+    pub fn encode(&self) -> [u8; EXIT_WATCH_REQUEST_LEN] {
+        let [h0, h1, h2, h3, h4, h5, h6, h7] =
+            FrameHeader::encode(KIND_EXIT_WATCH_REQUEST, EXIT_WATCH_PAYLOAD_LEN as u16);
+        let [p0, p1, p2, p3] = self.pid.get().to_be_bytes();
+        // 上限が 60 秒なので u64 に収まる（収まらない値は new が弾いている）。
+        let hold_ns = u64::try_from(self.hold.as_nanos()).unwrap_or(u64::MAX);
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = hold_ns.to_be_bytes();
+        [
+            h0, h1, h2, h3, h4, h5, h6, h7, p0, p1, p2, p3, b0, b1, b2, b3, b4, b5, b6, b7,
+        ]
+    }
+
+    /// 検証済みヘッダ（[`RequestHeader::ExitWatch`]）の後ろの payload 12 バイトを読む。
+    /// pid 0・hold 0・hold が上限超は `Malformed`。
+    pub fn decode_payload(payload: &[u8; EXIT_WATCH_PAYLOAD_LEN]) -> Result<Self, ControlReason> {
+        let [p0, p1, p2, p3, b0, b1, b2, b3, b4, b5, b6, b7] = *payload;
+        let pid = NonZeroU32::new(u32::from_be_bytes([p0, p1, p2, p3]))
+            .ok_or(ControlReason::Malformed)?;
+        let hold = Duration::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]));
+        Self::new(pid, hold)
     }
 }
 
@@ -1159,5 +1231,84 @@ mod tests {
             ControlReason::SignalFailed.to_error().unwrap().code(),
             ErrorCode::Internal
         );
+    }
+    /// SUP-1・CRI-1・REPAIR-2・#3683: ExitWatchRequest は kind 8・payload 12 バイトで、具体バイトで往復する。
+    #[test]
+    fn sup1_3683_exit_watch_request_roundtrip_concrete_bytes() {
+        let frame =
+            ExitWatchRequestFrame::new(NonZeroU32::new(4242).unwrap(), Duration::from_millis(1500))
+                .unwrap();
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'F', b'C', b'S', b'C', 1, 8, 0, 12, // ヘッダ
+                0, 0, 0x10, 0x92, // pid 4242
+                0, 0, 0, 0, 0x59, 0x68, 0x2f, 0x00, // hold 1_500_000_000ns
+            ]
+        );
+        let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
+        assert_eq!(
+            FrameHeader::decode(head).unwrap().expect_any_request(),
+            Ok(RequestHeader::ExitWatch)
+        );
+        let payload: [u8; EXIT_WATCH_PAYLOAD_LEN] = payload.try_into().unwrap();
+        assert_eq!(
+            ExitWatchRequestFrame::decode_payload(&payload).unwrap(),
+            frame
+        );
+    }
+
+    /// REPAIR-2・REPAIR-5・#3683: pid 0・hold 0・上限超は表現できない。上限ちょうどは受ける。
+    #[test]
+    fn repair5_3683_exit_watch_rejects_out_of_range_values() {
+        let pid = NonZeroU32::new(1).unwrap();
+        assert_eq!(
+            ExitWatchRequestFrame::new(pid, Duration::ZERO),
+            Err(ControlReason::Malformed)
+        );
+        assert_eq!(
+            ExitWatchRequestFrame::new(pid, MAX_EXIT_WATCH_HOLD + Duration::from_nanos(1)),
+            Err(ControlReason::Malformed)
+        );
+        assert!(ExitWatchRequestFrame::new(pid, MAX_EXIT_WATCH_HOLD).is_ok());
+        let ok = ExitWatchRequestFrame::new(pid, Duration::from_secs(1)).unwrap();
+        let bytes = ok.encode();
+        let mut payload: [u8; EXIT_WATCH_PAYLOAD_LEN] =
+            bytes.split_at(HEADER_LEN).1.try_into().unwrap();
+        // 生の frame の hold が上限超・0 のとき decode は拒否する。
+        payload[4..].copy_from_slice(&61_000_000_000u64.to_be_bytes());
+        assert_eq!(
+            ExitWatchRequestFrame::decode_payload(&payload),
+            Err(ControlReason::Malformed)
+        );
+        payload[4..].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            ExitWatchRequestFrame::decode_payload(&payload),
+            Err(ControlReason::Malformed)
+        );
+        payload[..4].copy_from_slice(&0u32.to_be_bytes());
+        payload[4..].copy_from_slice(&1u64.to_be_bytes());
+        assert_eq!(
+            ExitWatchRequestFrame::decode_payload(&payload),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// REPAIR-2・#3683: kind 8 は payload 12 だけを受ける。
+    #[test]
+    fn repair2_3683_exit_watch_header_checks_payload_len() {
+        let h = |kind: u8, len: u8| {
+            FrameHeader::decode(&[b'F', b'C', b'S', b'C', 1, kind, 0, len]).unwrap()
+        };
+        assert_eq!(h(8, 12).expect_any_request(), Ok(RequestHeader::ExitWatch));
+        for len in [0u8, 8, 11, 13, 21] {
+            assert_eq!(
+                h(8, len).expect_any_request(),
+                Err(ControlReason::Malformed),
+                "len {len}"
+            );
+        }
+        assert_eq!(h(8, 12).expect_request(), Err(ControlReason::Malformed));
     }
 }

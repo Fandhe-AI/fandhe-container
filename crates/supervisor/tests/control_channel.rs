@@ -578,3 +578,254 @@ fn sup3_2043_pause_keeps_the_socket_and_resume_serves_queued_requests() {
     server.shutdown();
     drop(listener);
 }
+// ---- 終了の購読（ExitWatchRequest。SUP-1・CRI-1・REPAIR-5・#3683） ----
+
+use fandhe_container_supervisor::control::{ControlExitWatcher, ExitNotifier, ExitWatchOutcome};
+
+fn never() -> bool {
+    false
+}
+
+fn watcher(rig: &Rig) -> ControlExitWatcher {
+    ControlExitWatcher::new(rig.root_path.clone())
+}
+
+fn nz(pid: u32) -> NonZeroU32 {
+    NonZeroU32::new(pid).unwrap()
+}
+
+/// SUP-1・CRI-1・#3683: 購読中にコンテナが終了すると、通知で起きる。終了の合図から 500ms 未満で戻る（照会間隔 100ms の
+/// 既定ではなく、サーバが接続を閉じて起こす経路を実 UDS で通す）。
+#[test]
+fn sup1_3683_exit_watch_wakes_on_exit() {
+    let rig = Rig::start("xw-wake", true, true, ServeConfig::default());
+    let w = watcher(&rig);
+    let id = rig.id.clone();
+    let handle = std::thread::spawn(move || {
+        let outcome = w.watch(
+            &id,
+            nz(PID),
+            Instant::now() + Duration::from_secs(30),
+            &never,
+        );
+        (outcome, Instant::now())
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let signaled = Instant::now();
+    rig.exited.store(true, Ordering::SeqCst);
+    let (outcome, woke) = handle.join().unwrap();
+    assert_eq!(outcome, ExitWatchOutcome::Woken);
+    let latency = woke.saturating_duration_since(signaled);
+    assert!(latency < Duration::from_millis(500), "{latency:?}");
+}
+
+/// SUP-1・#3683: 既に終了したスロットへの購読は、待たずに `Woken`（ContainerExited の応答）。
+#[test]
+fn sup1_3683_exit_watch_on_exited_slot_returns_immediately() {
+    let rig = Rig::start("xw-exited", true, true, ServeConfig::default());
+    rig.exited.store(true, Ordering::SeqCst);
+    let w = watcher(&rig);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let started = Instant::now();
+        let outcome = w.watch(
+            &rig.id,
+            nz(PID),
+            Instant::now() + Duration::from_secs(30),
+            &never,
+        );
+        let took = started.elapsed();
+        if outcome == ExitWatchOutcome::Woken && took < Duration::from_millis(300) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{outcome:?} {took:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// SUP-1・SEC-1・#3683: pid 不一致は `PidChanged`、ハンドルが無ければ `NoSupervisor`。
+#[test]
+fn sup1_3683_exit_watch_pid_mismatch_and_no_handle() {
+    let rig = Rig::start("xw-mis", true, true, ServeConfig::default());
+    let until = Instant::now() + Duration::from_secs(5);
+    assert_eq!(
+        watcher(&rig).watch(&rig.id, nz(PID + 1), until, &never),
+        ExitWatchOutcome::PidChanged
+    );
+    let empty = Rig::start("xw-empty", false, false, ServeConfig::default());
+    assert_eq!(
+        watcher(&empty).watch(&empty.id, nz(PID), until, &never),
+        ExitWatchOutcome::NoSupervisor
+    );
+}
+
+/// REPAIR-5・#3683: 終了しないまま `until` を迎えると `Expired`。経過は 300ms 以上 800ms 未満。
+#[test]
+fn repair5_3683_exit_watch_expires_at_until() {
+    let rig = Rig::start("xw-exp", true, true, ServeConfig::default());
+    let started = Instant::now();
+    let outcome = watcher(&rig).watch(
+        &rig.id,
+        nz(PID),
+        started + Duration::from_millis(300),
+        &never,
+    );
+    let took = started.elapsed();
+    assert_eq!(outcome, ExitWatchOutcome::Expired);
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    assert!(took < Duration::from_millis(800), "{took:?}");
+}
+
+/// REPAIR-5・#3683: 購読中の取り消しは、フラグを立ててから 150ms 以内に `Cancelled` で戻る。
+#[test]
+fn repair5_3683_exit_watch_is_cancellable() {
+    let rig = Rig::start("xw-cancel", true, true, ServeConfig::default());
+    let flag = Arc::new(AtomicBool::new(false));
+    let w = watcher(&rig);
+    let id = rig.id.clone();
+    let f = Arc::clone(&flag);
+    let handle = std::thread::spawn(move || {
+        let outcome = w.watch(
+            &id,
+            nz(PID),
+            Instant::now() + Duration::from_secs(30),
+            &|| f.load(Ordering::SeqCst),
+        );
+        (outcome, Instant::now())
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let raised = Instant::now();
+    flag.store(true, Ordering::SeqCst);
+    let (outcome, back) = handle.join().unwrap();
+    assert_eq!(outcome, ExitWatchOutcome::Cancelled);
+    let took = back.saturating_duration_since(raised);
+    assert!(took < Duration::from_millis(150), "{took:?}");
+}
+
+/// REPAIR-5・#3683: 預かる購読は 8 件まで。9 件目は `Transient`（Busy）で、購読者が去ると整理されて枠が空く。
+#[test]
+fn repair5_3683_exit_watchers_are_bounded_and_reclaimed() {
+    let rig = Rig::start("xw-bound", true, true, ServeConfig::default());
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let w = watcher(&rig);
+        let id = rig.id.clone();
+        let f = Arc::clone(&flag);
+        threads.push(std::thread::spawn(move || {
+            w.watch(
+                &id,
+                nz(PID),
+                Instant::now() + Duration::from_secs(30),
+                &|| f.load(Ordering::SeqCst),
+            )
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let ninth = watcher(&rig).watch(
+        &rig.id,
+        nz(PID),
+        Instant::now() + Duration::from_millis(200),
+        &never,
+    );
+    assert_eq!(ninth, ExitWatchOutcome::Transient);
+    flag.store(true, Ordering::SeqCst);
+    for t in threads {
+        assert_eq!(t.join().unwrap(), ExitWatchOutcome::Cancelled);
+    }
+    // 相手が閉じた購読は accept ループの整理（100ms 周期）で落ち、枠が空く。
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let outcome = watcher(&rig).watch(
+            &rig.id,
+            nz(PID),
+            Instant::now() + Duration::from_millis(150),
+            &never,
+        );
+        if outcome == ExitWatchOutcome::Expired {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{outcome:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// SUP-1・CRI-1・#3683: 起動ハンドルの解放（スロットの clear）でも購読は閉じられ、購読者は起きる。
+#[test]
+fn sup1_3683_exit_watch_wakes_when_the_handle_is_released() {
+    let mut rig = Rig::start("xw-clear", true, true, ServeConfig::default());
+    let w = watcher(&rig);
+    let id = rig.id.clone();
+    let handle = std::thread::spawn(move || {
+        w.watch(
+            &id,
+            nz(PID),
+            Instant::now() + Duration::from_secs(30),
+            &never,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    rig.stop_monitor.store(true, Ordering::SeqCst);
+    rig.monitor.take().unwrap().join().unwrap();
+    assert_eq!(handle.join().unwrap(), ExitWatchOutcome::Woken);
+}
+
+/// SUP-1・#3683: 状態ディレクトリはあるが socket が無い構成は、500ms の再試行窓を使わず 100ms 未満で `NoSupervisor`。
+#[test]
+fn sup1_3683_exit_watch_without_socket_does_not_wait_for_retry_window() {
+    let root = TempRoot::new("xw-nosock");
+    let dir = root.0.join("c");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let id = ContainerId::new("c").unwrap();
+    let started = Instant::now();
+    let outcome = ControlExitWatcher::new(root.0.clone()).watch(
+        &id,
+        nz(PID),
+        started + Duration::from_secs(5),
+        &never,
+    );
+    assert_eq!(outcome, ExitWatchOutcome::NoSupervisor);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// SUP-1・#3683: kind 8 を知らない古い supervisor（`Malformed` を返す）には `NoSupervisor`（照会へ退避させる）。
+#[test]
+fn sup1_3683_exit_watch_against_old_supervisor_is_no_supervisor() {
+    use fandhe_container_supervisor::control::protocol::encode_hello;
+    let root = TempRoot::new("xw-old");
+    let dir = root.0.join("c");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(dir.join(CONTROL_SOCKET_NAME)).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(&encode_hello()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).unwrap();
+        s.write_all(
+            &ResponseFrame {
+                reason: ControlReason::Malformed,
+            }
+            .encode(),
+        )
+        .unwrap();
+        n
+    });
+    let id = ContainerId::new("c").unwrap();
+    let outcome = ControlExitWatcher::new(root.0.clone()).watch(
+        &id,
+        nz(PID),
+        Instant::now() + Duration::from_secs(5),
+        &never,
+    );
+    assert_eq!(outcome, ExitWatchOutcome::NoSupervisor);
+    // 要求は 20 バイト（ヘッダ 8 + pid 4 + hold 8）。
+    assert_eq!(server.join().unwrap(), 20);
+}

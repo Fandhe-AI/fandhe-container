@@ -58,10 +58,41 @@ pub(crate) use process::{
 };
 
 /// 直前の失敗の errno（取れなければ `EINVAL` に写し、成功側へは倒さない）。
+///
+/// 前提（#4048 の点検）: 呼び出し元は「-1 / `NULL` / `SIG_ERR` を返して errno を設定する」関数の失敗の直後に限る。
+/// 失敗を 0 で返す `proc_pidinfo` は `positive_or_errno` を通す。ACL の取得（`acl_get_*`）は errno の値で成功側
+/// （ACL 無し・空の ACL）へ分岐するため、呼び出しの直前に errno を 0 にして `acl_errno_*` で判定する。
 fn last_errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(EINVAL)
+}
+
+/// 直前の errno を 0 を保ったまま返す（`last_errno` と違い 0 を `EINVAL` に写さない）。ACL の判定専用。
+fn last_errno_raw() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// `acl_get_link_np` / `acl_get_fd_np` が `NULL` を返したときの判定（SEC-4・#4048）。
+///
+/// `ENOENT` は ACL 無し（`Ok(false)`）。errno が 0（呼び出し前に 0 にしたのに設定されなかった）は
+/// 判定不能で `Err`（古い `ENOENT` を拾って許可側へ倒れない。fail-closed）。
+fn acl_null_result(errno: i32) -> Result<bool, SysError> {
+    match errno {
+        0 => Err(SysError::Os(EINVAL)),
+        e if e == plugin_fs::ENOENT => Ok(false),
+        e => Err(SysError::Os(e)),
+    }
+}
+
+/// `acl_get_entry` が失敗（-1）したときの判定。`EINVAL` は先頭エントリが無い（空の ACL）で `Ok(false)`。
+/// errno が 0 は判定不能で `Err`（`EINVAL` に写してから分岐に通さない。fail-closed）。
+fn acl_entry_failure(errno: i32) -> Result<bool, SysError> {
+    match errno {
+        0 => Err(SysError::Os(EINVAL)),
+        e if e == EINVAL => Ok(false),
+        e => Err(SysError::Os(e)),
+    }
 }
 
 /// `O_NONBLOCK`（`sys/fcntl.h`）。
@@ -88,6 +119,27 @@ pub(crate) const FULLFSYNC_FALLBACK_ERRNOS: [i32; 2] = [EINVAL, ENOTSUP];
 /// REPAIR-7・REPAIR-12）。Linux の `sys.rs` の同名マクロと同じ方式（macOS 側は別ファイルのため複製）。
 /// 両辺の型を引数で明記し、比較は `as i128`（64 bit 以下の整数では値を切り詰めない）で行う。
 /// 食い違いは宣言を直す別 issue とし、試験側を合わせない。関数は呼ばず `unsafe` を使わない。
+/// ACL 判定の errno の写像の試験（SEC-4・CORE-1・#4048）。errno 0 は判定不能で許可側へ倒さないこと、
+/// 従来の `ENOENT`（ACL 無し）・`EINVAL`（空の ACL）は `Ok(false)` のままであることを具体値で照合する。
+#[cfg(test)]
+mod acl_errno_tests {
+    use super::*;
+
+    #[test]
+    fn sec4_4048_acl_errno_unset_is_undecidable() {
+        assert!(matches!(acl_null_result(0), Err(SysError::Os(e)) if e == EINVAL));
+        assert!(matches!(acl_entry_failure(0), Err(SysError::Os(e)) if e == EINVAL));
+    }
+
+    #[test]
+    fn sec4_4048_acl_errno_known_values_keep_their_meaning() {
+        assert!(matches!(acl_null_result(plugin_fs::ENOENT), Ok(false)));
+        assert!(matches!(acl_null_result(ENOTSUP), Err(SysError::Os(e)) if e == ENOTSUP));
+        assert!(matches!(acl_entry_failure(EINVAL), Ok(false)));
+        assert!(matches!(acl_entry_failure(ENOTSUP), Err(SysError::Os(e)) if e == ENOTSUP));
+    }
+}
+
 #[cfg(test)]
 macro_rules! libc_const_eq {
     ($own:path, $own_ty:ty, $lib:path, $lib_ty:ty) => {{
@@ -169,31 +221,27 @@ pub(crate) fn nofollow_nonblock_open_flags() -> Option<i32> {
 /// それ以外の失敗は `Err(Os)`（呼び出し側は拒否する。fail-closed）。
 pub(crate) fn has_extended_acl(path: &Path) -> Result<bool, SysError> {
     let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| SysError::InvalidInput)?;
+    // 古い errno（ENOENT・EINVAL）を拾って許可側へ倒れないよう、呼び出しの直前に 0 にする（#4048）。
+    process::clear_errno();
     // SAFETY: `c_path` は NUL 終端で、この呼び出しの間生存する。第 2 引数は定義済みの定数。
     let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
-        let errno = last_errno();
-        return if errno == plugin_fs::ENOENT {
-            Ok(false)
-        } else {
-            Err(SysError::Os(errno))
-        };
+        return acl_null_result(last_errno_raw());
     }
     // 成功しても空の ACL（エントリ 0 件）は「ACL なし」の結果なので、エントリの有無を確かめる。
     let mut entry: *mut c_void = std::ptr::null_mut();
+    process::clear_errno();
     // SAFETY: `acl` は直前に得た非 NULL の `acl_t`（まだ解放していない）、`entry` は有効な書き込み先。
     let rc = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
-    let errno = last_errno();
+    let errno = last_errno_raw();
     // SAFETY: `acl` は `acl_get_link_np` が返した非 NULL の `acl_t` で、他に所有者がいない。
     // ここで 1 回だけ解放し、以後は使わない（リーク防止）。`entry` は `acl` の内部を指すため解放後は使わない。
     let _ = unsafe { acl_free(acl) };
     if rc == 0 {
         Ok(!entry.is_null())
-    } else if errno == EINVAL {
-        // 先頭エントリが無い（空の ACL）。
-        Ok(false)
     } else {
-        Err(SysError::Os(errno))
+        // 先頭エントリが無い（空の ACL）は `EINVAL` で `Ok(false)`。
+        acl_entry_failure(errno)
     }
 }
 
@@ -222,7 +270,7 @@ pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
 ///   通常ファイル以外を open せずに拒否し、open 後の fd の種別と dev/ino を probe と照合して差し替えを検出する。
 ///   FIFO は `O_NONBLOCK`・端末は `O_NOCTTY` で、差し替えられた場合にも止めない
 pub(crate) mod plugin_fs {
-    use super::{EINVAL, SysError, last_errno};
+    use super::{SysError, last_errno};
     use std::ffi::{CStr, c_char, c_int, c_void};
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
@@ -523,29 +571,25 @@ pub(crate) mod plugin_fs {
         if !SUPPORTED_ARCH {
             return Err(SysError::Unsupported);
         }
+        // 古い errno を拾って許可側へ倒れないよう、呼び出しの直前に 0 にする（#4048）。
+        super::process::clear_errno();
         // SAFETY: 引数は整数と定義済みの定数だけ。`fd` が無効でも `EBADF` が返るだけで安全。
         let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
         if acl.is_null() {
-            let errno = last_errno();
-            return if errno == ENOENT {
-                Ok(false)
-            } else {
-                Err(SysError::Os(errno))
-            };
+            return super::acl_null_result(super::last_errno_raw());
         }
         let mut entry: *mut c_void = std::ptr::null_mut();
+        super::process::clear_errno();
         // SAFETY: `acl` は直前に得た非 NULL の `acl_t`（未解放）、`entry` は有効な書き込み先。
         let rc = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
-        let errno = last_errno();
+        let errno = super::last_errno_raw();
         // SAFETY: `acl` は `acl_get_fd_np` が返した非 NULL の `acl_t` で他に所有者がいない。ここで 1 回だけ
         // 解放し以後使わない。`entry` は `acl` の内部を指すため解放後は参照しない。
         let _ = unsafe { acl_free(acl) };
         if rc == 0 {
             Ok(!entry.is_null())
-        } else if errno == EINVAL {
-            Ok(false)
         } else {
-            Err(SysError::Os(errno))
+            super::acl_entry_failure(errno)
         }
     }
 
@@ -1140,7 +1184,7 @@ pub(crate) mod process {
 
     /// 呼び出しスレッドの `errno` を 0 にする。`proc_pidinfo` のように失敗を 0 で返し `errno` が
     /// 設定されるとは限らない呼び出しの直前に使い、古い `errno` を失敗の原因として拾わないようにする（#3630）。
-    fn clear_errno() {
+    pub(super) fn clear_errno() {
         // SAFETY: `__error` は引数なしで、呼び出しスレッド自身の `errno`（スレッドローカル）への有効な
         // ポインタを返す。書き込みはそのスレッドの `errno` だけに閉じ、他スレッド・他の状態に影響しない。
         // fork 後の子（呼び出しスレッドのみ複製）でも同じ。

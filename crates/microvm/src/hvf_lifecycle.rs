@@ -26,6 +26,8 @@
 //!    切り離した vCPU スレッドが終わるまでは何も解放されず、終わった後に 1 回ずつ回収される。呼び出し元の契約は、全 vCPU スレッドが
 //!    スロットの clone と VM の `Arc` を持ち、vCPU を破棄した後に落とすこと（`hvf::vcpu::ExitHandlers::guest_memory`）。
 //!    実機で vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べることは未確認（#4034）。
+//!    例外: 補助スレッドの停止を確かめられなかった場合（[`StopOutcome::aux_unconfirmed`]。#4030）は、補助が RAM をまだ触りうるため遅延回収に回さず
+//!    RAM をリークする（`mem::forget`）。
 //!    例外: `release_devices` の失敗（デバイスの保持者が lock を持つ。期限切れの経路でも手放しの前に確かめ、失敗なら回収に回さない）では、デバイス → RAM → VM の順を強制できないため、従来どおり
 //!    RAM をリークする（`mem::forget`）。RAM の取得失敗（`take_within` の期限切れ・毒化）も、vCPU は停止確認済みで lock を持つ
 //!    のがホスト側のスレッドのため、`GuestMemorySlot` 側でリークする（別の経路。見直しは本 issue の範囲外）。
@@ -49,6 +51,29 @@ pub const DROP_STOP_DEADLINE: Duration = Duration::from_secs(5);
 pub trait VcpuStopper {
     /// 停止を要求し、`deadline` まで終了報告を待つ。`Ok` で戻った時点で vCPU は破棄済みであること。
     fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError>;
+
+    /// [`VcpuStopper::stop`] に加え、補助スレッドの停止を確かめられなかったか（`aux_unconfirmed`）を返す（#4030・#4032）。
+    ///
+    /// 補助を持たない実装は既定のまま（常に `false`）。補助の停止が未確認なら、補助がゲスト RAM をまだ触りうるため、
+    /// vCPU スレッドの終了後の遅延回収に回さず RAM を解放しない（[`stop_and_release`]）。
+    fn stop_detailed(self, deadline: Duration) -> StopOutcome
+    where
+        Self: Sized,
+    {
+        StopOutcome {
+            result: self.stop(deadline),
+            aux_unconfirmed: false,
+        }
+    }
+}
+
+/// [`VcpuStopper::stop_detailed`] の戻り（拡張できる構造）。
+#[derive(Debug)]
+pub struct StopOutcome {
+    /// vCPU 群（と補助）の停止の結果。
+    pub result: Result<VcpuSetStopReport, MicrovmError>,
+    /// 補助スレッドの停止を確かめられなかった（期限切れ・`Err`）。
+    pub aux_unconfirmed: bool,
 }
 
 impl<K: VcpuKick> VcpuStopper for LoopHandle<K> {
@@ -85,19 +110,31 @@ impl<S: VcpuStopper, A: AuxStopper> VcpuStopper for StopWithAux<S, A> {
     /// 報告の `reason` は、vCPU が `Requested` で補助が `Requested` 以外ならその補助の理由にする（受信ポーラーの失敗は
     /// `VmShutdown` 経由で vCPU を `Requested` のまま止めるため、失敗が報告から消えないようにする）。
     fn stop(self, deadline: Duration) -> Result<VcpuSetStopReport, MicrovmError> {
+        self.stop_detailed(deadline).result
+    }
+
+    /// 補助の停止が `Err` なら `aux_unconfirmed` を立てる（vCPU 側の結果より優先して RAM を解放しない。#4030）。
+    fn stop_detailed(self, deadline: Duration) -> StopOutcome {
         let started = std::time::Instant::now();
         let vcpu_result = self.vcpus.stop(deadline);
         let aux_result = self
             .aux
             .map(|a| a.stop(deadline.saturating_sub(started.elapsed()).max(AUX_STOP_MIN)));
-        let mut report = vcpu_result?;
-        if let Some(r) = aux_result {
-            let reason = r?;
-            if report.reason == StopReason::Requested {
-                report.reason = reason;
+        let aux_unconfirmed = matches!(aux_result, Some(Err(_)));
+        let result = (|| {
+            let mut report = vcpu_result?;
+            if let Some(r) = aux_result {
+                let reason = r?;
+                if report.reason == StopReason::Requested {
+                    report.reason = reason;
+                }
             }
+            Ok(report)
+        })();
+        StopOutcome {
+            result,
+            aux_unconfirmed,
         }
-        Ok(report)
     }
 }
 
@@ -166,6 +203,8 @@ pub struct Resources<D, M, V> {
 /// - 期限切れ・`Internal` は止まりを確かめられていない。`memory` は [`ReleaseMemory::detach`] で手放し、`devices`・`vm` は drop する
 ///   （`vm` の `Arc` は切り離した vCPU スレッドと対応付けが保持するため、VM の破棄は起きない）。RAM と VM の回収は、
 ///   そのスレッドが [`drop_vcpu_thread_state`] で最後の `Arc` を落とした時点で行われる（#4032）。エラーをそのまま返す。
+/// - 補助スレッドの停止を確かめられなかった場合（[`StopOutcome::aux_unconfirmed`]）は、vCPU の結果に依らず `memory` をリークする
+///   （遅延回収に回さない。補助が RAM を触りうる。#4030）。`devices`・`vm` は drop する。
 /// - `release_devices` の失敗は、デバイスの保持者が lock を持ち、デバイスが RAM・VM より後に落ちうる。順序を守れないため
 ///   `memory` をリークする（`mem::forget`。モジュール doc の例外）。
 pub fn stop_and_release<S, D, M, V>(
@@ -192,7 +231,10 @@ where
     } = resources;
     // 処理開始時に終了時刻の基準を 1 回だけ取り、vCPU の停止待ちとデバイス解放待ちで同じ期限を共有する（REPAIR-5）。
     let started = std::time::Instant::now();
-    let result = stopper.stop(effective);
+    let StopOutcome {
+        result,
+        aux_unconfirmed,
+    } = stopper.stop_detailed(effective);
     // `Err` の組の 2 つ目はログの `released=false` 以降。経路ごとに、回収待ち（`deferred`）とリーク（`leaked`）を分ける。
     let outcome = match result {
         Ok(report) => match release_within(&mut devices, effective, started) {
@@ -226,6 +268,14 @@ where
                 Err((e, "leaked=guest_ram,vm"))
             }
         },
+        Err(e) if aux_unconfirmed => {
+            // 補助スレッド（受信ポーラー）の停止を確かめられていない。補助はゲスト RAM をまだ触りうるため、
+            // vCPU スレッドの終了後の遅延回収にも回さず RAM を解放しない（#4030 の契約。use-after-free の防止）。
+            drop(devices);
+            std::mem::forget(memory);
+            drop(vm);
+            Err((e, "leaked=guest_ram,vm,aux_thread"))
+        }
         Err(e) => {
             // 止まりを確かめられていない。ゲストがまだ書けうるメモリを解放せず、参照だけ手放す。
             // 切り離した vCPU スレッドが最後の `Arc` を落としたときに RAM → VM の順で回収される（#4032）。

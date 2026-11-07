@@ -12,7 +12,7 @@
 //! （sandbox → コンテナと core の照合 → 作成途中の取り残しの解放 → 孤児 bundle の回収。`CriPluginBackends::readopt_records`。#2938・CRI-1・CRI-2・CORE-1）。
 //! 列挙の失敗・件数または保持量の上限超過・期限切れは `error: <CODE>: failed to readopt cri records` で起動しない。壊れた記録は消さず数えるだけで起動は止めない。
 //! 何かを再採用・回収したときだけ、固定語彙の要約 1 行を stderr へ出す（初回起動は静か）。
-//! 受付の前に loopback の `StreamingServer` を起動して `with_streaming` で注入する（#3754・CRI-6。結線済みは PortForward の NODE の pod と読み取り専用の Attach。Exec と POD の PortForward は `UNIMPLEMENTED`。#3755・#3763）。
+//! 受付の前に loopback の `StreamingServer` を起動して `with_streaming` で注入する（#3754・CRI-6。結線済みは PortForward の NODE の pod・読み取り専用の Attach・Exec〔Linux のみ。tty と相対 argv[0] は INVALID_ARGUMENT。#3761〕。POD の PortForward は `UNIMPLEMENTED`。#3755・#3763）。
 //! bind の失敗は `error: <CODE>: failed to start the streaming server` で起動しない。停止シグナルで UDS と同時に TCP の待ち受けも閉じる。
 //! SIGTERM・SIGINT で正常停止する（#3226・CRI-1・REPAIR-5。`sys` の自前の `signal(3)` 宣言で受ける）。受けたら新しい接続と RPC を受け付けず、
 //! 実行中の RPC を `PLUGIN_SHUTDOWN_GRACE`（10 秒）まで待ち、超えたら接続を強制的に閉じて `TIMEOUT` で終える（結果不明の記録は再起動時に再採用が扱う）。
@@ -268,9 +268,30 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             );
         }
     };
+    // Exec の起動役（Linux のみ。supervisor の helper 経由。#3761）。作れなければ起動しない（fail-closed）。
+    #[cfg(target_os = "linux")]
+    let exec_launcher = match backends.exec_stream_launcher() {
+        Ok(l) => l,
+        Err(_) => {
+            return fail(
+                PluginErrorCode::Internal,
+                "failed to prepare the exec launcher",
+            );
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let exec_dyn: Option<
+        std::sync::Arc<dyn fandhe_container_cri::streaming::exec::ExecStreamLauncher>,
+    > = Some(exec_launcher.clone());
+    #[cfg(not(target_os = "linux"))]
+    let exec_dyn: Option<
+        std::sync::Arc<dyn fandhe_container_cri::streaming::exec::ExecStreamLauncher>,
+    > = None;
     let streaming = match rt.block_on(streaming::bind_production_streaming(
         streaming::production_streaming_config(),
         attach_backend,
+        exec_dyn,
+        backends.streaming_op_recorder(),
     )) {
         Ok(s) => s,
         Err(e) => return fail_err(&e),
@@ -320,7 +341,14 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             Some(images),
             &grpc_config,
             audit,
-            streaming::stop_streaming_on(streaming, shutdown::wait_for_signal()),
+            streaming::stop_streaming_on(
+                streaming,
+                || {
+                    #[cfg(target_os = "linux")]
+                    exec_launcher.shutdown_all();
+                },
+                shutdown::wait_for_signal(),
+            ),
         )
         .await;
         stats.abort();

@@ -3731,6 +3731,8 @@ impl CriRuntimeService {
     fn exec_impl(&self, req: v1::ExecRequest) -> Result<v1::ExecResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::Exec, "exec")?;
         validate_exec_request(&req)?;
+        // 起動役が受けない tty・相対 argv[0] は URL の発行前に断る（#3761・REPAIR-3）。
+        issuer.require_exec_options(req.tty, &req.cmd)?;
         self.require_container(&req.container_id)?;
         let url = issuer.issue(StreamRequest::Exec(req))?;
         Ok(v1::ExecResponse { url })

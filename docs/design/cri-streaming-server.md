@@ -15,7 +15,7 @@ CRI の `Exec`・`Attach`・`PortForward` は、RPC 自体ではデータを流�
 | Attach の SPDY/3.1・remotecommand・Upgrade 後のセッション | 実装済み（fake backend での結合試験）。本番の backend は未接続。backend が無ければ Attach は結線済みと答えず、RPC は `UNIMPLEMENTED`） | #681（TASK-63.3） |
 | PortForward | 未実装 | #682（TASK-63.4） |
 | plugin-cri からのサーバー起動と `with_streaming` での注入 | 実装済み（loopback で起動し `StreamDispatcher` で注入。結線済みは #3755 の PortForward〔NODE のみ〕で、Exec・Attach は「not wired」の `UNIMPLEMENTED`） | #3754 |
-| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760。plugin-cri 側の起動は #3761）。Attach・POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
+| 本番 backend（Exec の helper・Attach・PortForward の dialer） | PortForward の NODE の dialer は実装済み（#3755）。Exec の stream-exec helper は実装済み（#3760）、plugin-cri 側の本番 launcher と結線も実装済み（#3761。tty は本番で fail-closed）。Attach・POD の PortForward は未実装。設計は「本番 backend の設計」の節 | #3753〜#3766 |
 
 ## バインドの方針
 
@@ -114,7 +114,7 @@ CRI の定義は tty のとき stderr を false に固定する。RPC（`validat
 
 ### 注入トレイト `ExecStreamLauncher`
 
-core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は無い（REPAIR-3）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しの設計は「本番 backend の設計」の「Exec」節（#3757〜#3762）。
+core の `ContainerRuntime` に exec は無く、shim v2 の `TaskExecLauncher` は stdio を持たない（containerd の FIFO 前提）。そこで stdio を持つ起動役を `crates/cri` の注入トレイトとして定義した（`ContainerRuntime` は変えない。PLUG-1）。`ExecLaunch` には発行時に保存した要求から作った値だけを入れ、通信路の内容から cmd を組み立てない。契約は、要求された stdio だけを返す・`ExecSession` の drop でプロセスを止める・コンテナの namespace / cgroup / seccomp / capability を継承して広げない（SEC-1）・panic しない。**本番の実装は plugin-cri の `streaming::exec_launcher`（#3761）**。supervisor の exec 入口（pidfd 経由）へ stdio のパイプと pty を付ける橋渡しの設計は「本番 backend の設計」の「Exec」節（#3757〜#3762）。
 
 ## PortForward（#682・TASK-63.4・CRI-6）
 
@@ -207,7 +207,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 
 - コマンドは既存の `run_command_with_pidfd` の段（namespace・cgroup・rlimit・launch と同じ capability 集合・NNP・Landlock・seccomp）だけを通り、launch より広げない
 - env の基底は `config.json` の `process.env` と launch 時の env だけ。CRI は env を渡さないので `with_env` を使わない。argv はシェルを通さない
-- argv[0] が相対パス（例: `sh`）の要求は、PATH の解決（#2439）が決まるまで `INVALID_ARGUMENT` で拒否する。URL の発行前（RPC 時）に断るのが望ましく、置き場所は #3753・#3761 で決める
+- argv[0] が相対パス（例: `sh`）の要求は、PATH の解決（#2439）が決まるまで `INVALID_ARGUMENT` で拒否する。URL の発行前（RPC 時）に断るのが望ましく、#3761 で `StreamWiring` の `exec_relative_command`（既定 false）と `StreamingUrlIssuer::require_exec_options` として実装した（`exec_impl` が URL の発行前に呼び、launch 時にも `StreamExecArgs::new` が拒否する）
 - helper と plugin-cri の channel はパスを持たない socketpair で、第三者は接続できない。supervisor の実行ファイルは PATH を探さず固定名で解決し、受け取った pidfd は `identify_pid1_with_pidfd` で照合する。トークン・argv・パスはログやエラーに出さない
 
 **終了コードの写像**: `Exited(n)` は n、`Signaled(s)` は 128 + s（`metav1.Status` の NonZeroExitCode）。`SetupFailed` は子の終了状態（通常 125 / 126 / 127）で、CLI の exec と同じ（exec-pidfd-handover.md §3.4）。拒否・期限・到達不能は launch の失敗にし、handler が `InternalError` の固定文にする。
@@ -221,7 +221,18 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 
 **SCM_RIGHTS の再利用判断**: core（`sys/seccomp_notify.rs`）・net（`sys/holder.rs`）・supervisor（`sys/linux.rs` の `send_with_fd` / `recv_with_fds`）の自前ラッパーは、crate ごとの sys に置いたまま共有しない。いずれも `pub(crate)` で意味も違い（core は token と資格情報、net は holder の frame、supervisor は制御チャネル）、前例は [fdinfo-mnt-id-parsing.md](fdinfo-mnt-id-parsing.md) の「共有下位 crate を作らない」判断である。本設計で足りないのは supervisor の「複数 fd の送信」だけで、既存の `send_with_fd` を N 本（上限 3〜4。`recv_with_fds` の 4 本と揃える）へ一般化し、plugin-cri が使える安全な公開 API として出す。sys の事前承認の範囲内（coding-rust.md）。plugin-cri の sys には SCM_RIGHTS を新しく足さず、重複を作らない。
 
-**上限**: 同時の exec は supervisor 側がコンテナごとに 16（`ExecGuardLimits::max_guards`）。plugin-cri 側にも全体の上限を設け、値は #3761 で決める。channel の受信長は固定で、fd は最大 3 本受け、tty のときは master を 1 本返す。
+**上限**: 同時の exec は supervisor 側がコンテナごとに 16（`ExecGuardLimits::max_guards`）。plugin-cri 側にも全体の上限を設けた（#3761。同時セッション 64・回収できない helper の保持 8。いずれも暫定値で、#4116 のオーナー確認待ち）。channel の受信長は固定で、fd は最大 3 本受け、tty のときは master を 1 本返す。
+
+**本番 launcher の実装（#3761・CRI-6・SEC-1・REPAIR-3・REPAIR-5）**:
+
+- 置き場所は `crates/plugin-cri/src/streaming/exec_launcher.rs`（Linux のみ）。`SupervisorExecLauncher` が `ExecStreamLauncher` を実装し、`HelperSpawner`（本番は plugin-cri の実体と同じディレクトリの固定名の supervisor を `stream-exec` で起動。試験は偽の helper を差し込む）経由で helper を起動する。状態ストアで Running と pid を照合し、`StreamExecArgs::new` に渡す
+- stdio は要求された分だけ `UnixStream::pair` を作り、片側を `send_stdio_handover` で渡す。`Started` を待ってから tokio 側の読み書き口に変換し、`Result` を待つ専用 std スレッドの結果を std の socketpair で tokio 側へ渡す（tokio の `sync`・`io-util`・`process` feature は使わない）。`ExecSession` の `exit` future を drop すると持ち主の `HelperGuard` が helper を SIGKILL して回収する
+- **tty は本番で fail-closed**: helper に `--tty` が無く、supervisor の `ExecStdio` に pty が無い。`ExecStreamHandler::without_tty` で RPC 時に `INVALID_ARGUMENT`（「exec with tty is not supported」）とし、launcher も二重に断る。受け側（`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡し）は偽の helper で試験済みで、supervisor 側の結線（後続 issue）が入れば能力フラグ `HelperCapabilities.tty` を true にするだけで有効にできる。`WindowSize` の 0 行・0 列はそのまま渡す
+- **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
+- 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
+- 停止: `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）
+- helper の fd 1・2 は `/dev/null` で、診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る。REPAIR-4 の観測は後続）
+- 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
 
 ### Attach（SUP-4・SUP-7・REPAIR-3・REPAIR-5）
 
@@ -387,7 +398,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3758 | core の pty | コンテナの devpts で worker が開き、master は core の既存の worker から親への SCM_RIGHTS で返す |
 | #3759 | supervisor: helper と plugin-cri の channel の frame codec、sys の複数 fd 送信の一般化（安全な公開 API） | 制御チャネルの新しい種別は足さない（kind 6 / 7 を再利用） |
 | #3760 | supervisor: bin の `stream-exec` 入口（単一スレッドの helper）が kind 6 / 7 と `run_command_with_pidfd_*` を呼び、結果を返す | 常駐の supervisor 側の受け口ではなく helper |
-| #3761 | plugin-cri の本番 launcher | helper の起動・fd の送信・tokio の橋渡し・drop で kill・ローカルの resize・全体の上限 |
+| #3761 | plugin-cri の本番 launcher | 実装済み（tty は本番で fail-closed。supervisor 側の pty 結線は後続。上の「本番 launcher の実装」）。helper の起動・fd の送信・tokio の橋渡し・drop で kill・ローカルの resize・全体の上限 |
 | #3762 | 実機前提試験 | — |
 | #3763 | plugin-cri の読み取り専用 attach | 実装済み（supervisor の reader の取り消しの口・`FollowEnd`・`RecordDemux` を含む） |
 | #3764 | docs の更新 | — |
@@ -409,7 +420,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 
 ## 残るもの
 
-- Exec と Attach の本番 backend の実装と結線（設計は「本番 backend の設計」の節、実装は #3761・#3763 ほか。PortForward の NODE は #3755 で実装済み、POD は #3766）
+- Exec の tty（supervisor 側の pty 結線と helper の `--tty`。後続 issue）、Attach の完全版（#3765 の設計）、POD の PortForward（#3766）。Exec の本番 launcher は #3761、Attach の読み取り専用は #3763、PortForward の NODE は #3755 で実装済み
 - 外部公開の opt-in を plugin-cri の CLI へ出すこと（現状は loopback 固定。REPAIR-3）
 - `ConnectionObserver` の telemetry への接続（現状は `NoopObserver`。REPAIR-4）
 - Upgrade 後のセッションの停止時のドレイン方針の再評価（backend が入った時点。REPAIR-5）

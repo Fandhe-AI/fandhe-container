@@ -97,6 +97,8 @@ pub mod start_entry;
 pub mod state;
 pub mod stats;
 pub mod stderr_sink;
+#[cfg(target_os = "linux")]
+pub mod stream_exec;
 pub mod supervisor_log;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;

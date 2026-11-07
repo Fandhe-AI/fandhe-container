@@ -842,6 +842,7 @@ fn hvf_kernel_boot_block_read_without_block_device_reports_mismatch() {
         "block_read_absent",
     );
 }
+
 /// 行頭が `prefix` の行の件数（`SERIAL_RX_TIMEOUT` の行は接頭辞を共有するので除く）。
 fn count_reply_like_lines(output: &[u8]) -> usize {
     output
@@ -1095,6 +1096,7 @@ fn mvm5_4014_block_result_line_shape() {
         )
     );
 }
+
 /// initrd の種類ごとの環境変数名・既定パス・ヒント（#3987）。`None` には initrd が無い。
 #[test]
 fn mvm5_3987_initrd_spec_names() {

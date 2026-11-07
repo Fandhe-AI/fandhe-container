@@ -23,18 +23,20 @@
 //!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。
 //! - `InterruptACK` を処理した vCPU はその線の SPI の宛先として [`MmioHandler::with_ack_learner`] で記録し、WFI の待ちを
 //!   宛先の vCPU だけ起こすのに使う（#3948・MVM-5・REPAIR-5。方式と残余は `crate::hvf_wake`）。
-//! - virtqueue の処理と割り込みへの結線（`QueueNotify` の後続）は #3908 の担当。
-//!   ここでは通知を捨てず [`MmioHandler::last_queue_notify`] に残すだけで、実際のキュー処理は行わない。
+//! - virtio-net の `QueueNotify` の処理は #4029 の担当。route の無いデバイス（現状は net）は通知を数えて
+//!   [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
+//!   virtio-block は [`MmioHandler::with_queue_notify_routes`] で結んだ route が処理する（#4028。失敗は VM を止める）。
 //! - ゲストが big-endian（`SCTLR_EL1.EE` / `E0E`）の場合は扱わない（little-endian 固定）。
 
 use crate::dispatch::{DeviceId, DispatchOutcome, ExitDispatcher, MmioAccess};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{AccessDirection, DataAbort};
 use crate::hvf_abi::{HvReg, HvVcpuExitException};
-use crate::hvf_loop::ExitAction;
+use crate::hvf_loop::{ExitAction, log_line};
 use crate::hvf_wake::AckRouteLearner;
-use crate::interrupt::InterruptAckRoute;
+use crate::interrupt::{InterruptAckRoute, QueueNotifyRoute};
 use crate::mmio_abort;
+use crate::stop::StopReason;
 use crate::sys::HvVcpu;
 use crate::virtio_mmio::MmioWriteOutcome;
 use std::sync::{Arc, Mutex};
@@ -49,6 +51,8 @@ pub struct MmioHandler {
     /// `InterruptACK` の後処理（level 扱いの線の deassert / resample。#3863）。route の無いデバイスは計数だけ。
     ack_routes: Vec<(DeviceId, Arc<dyn InterruptAckRoute>)>,
     interrupt_acks: u64,
+    /// `QueueNotify` の virtqueue 処理（#4028）。route の無いデバイスは計数だけで続行する（net は #4029）。
+    queue_routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
     /// `InterruptACK` を処理したこの vCPU を、その線の SPI の宛先として記録する（WFI の宛先指定の起床。#3948）。無ければ学習しない。
     learner: Option<AckRouteLearner<DeviceId>>,
 }
@@ -78,6 +82,16 @@ impl MmioHandler {
         self
     }
 
+    /// デバイスごとの `QueueNotify` の処理（virtqueue の処理と完了の割り込み。#4028・MVM-5・MVM-1）を足す。
+    /// route は `HvfDeviceBus` が 1 回だけ作り、全 vCPU のハンドラが同じ実体（`Arc`）を共有する。
+    pub fn with_queue_notify_routes(
+        mut self,
+        routes: Vec<(DeviceId, Arc<dyn QueueNotifyRoute>)>,
+    ) -> Self {
+        self.queue_routes = routes;
+        self
+    }
+
     /// `InterruptACK` を処理した vCPU を宛先として学習する部品を足す（#3948・MVM-5・REPAIR-5）。
     /// 学習は `InterruptAcknowledged` だけで、`DeviceReset` では行わない。
     pub fn with_ack_learner(mut self, learner: AckRouteLearner<DeviceId>) -> Self {
@@ -100,7 +114,7 @@ impl MmioHandler {
         self.unhandled
     }
 
-    /// `QueueNotify` を受けた回数（処理は #3908 の担当。REPAIR-3）。
+    /// `QueueNotify` を受けた回数（観測用。route の有無・成否とは関係なく数える。REPAIR-4）。
     pub fn queue_notify_count(&self) -> u64 {
         self.queue_notifies
     }
@@ -173,6 +187,26 @@ pub fn handle_data_abort(
         } => {
             handler.queue_notifies = handler.queue_notifies.saturating_add(1);
             handler.last_queue_notify = Some((*device, *q));
+            // route は「dispatcher → transport → memory」の順で lock を取る（#4026 の契約）。dispatcher の lock は上の式で
+            // 解放済み。受理判定（`accept_queue_notify`）は `QueueNotify` を返す前に済んでいるため、ここで二重にしない。
+            if let Some((_, route)) = handler.queue_routes.iter().find(|(id, _)| id == device) {
+                let result = route.on_queue_notify(*q);
+                let action = mmio_abort::queue_notify_action(&result);
+                if let ExitAction::Stop(reason) = action {
+                    // `Ok(Stop)` は `run_loop_exit` が診断を出さないため、ここで 1 行出す（固定の語と数値だけ。ERR-1・REPAIR-4）。
+                    let source = if result.is_err() { "route" } else { "queue" };
+                    let code = match reason {
+                        StopReason::Failed(c) => c.as_str(),
+                        _ => "unknown",
+                    };
+                    log_line(format_args!(
+                        "level=error op=hvf.mmio.queue_notify outcome=error source={source} code={code} device={} queue={q}",
+                        device.index()
+                    ));
+                    // PC は進めない。VM は止まり、書き込みなので SRT へ返す応答も無い。
+                    return Ok(action);
+                }
+            }
         }
         DispatchOutcome::Unhandled { .. } => {
             handler.unhandled = handler.unhandled.saturating_add(1);
@@ -227,6 +261,32 @@ mod tests {
         let h = MmioHandler::with_dispatcher(d).with_ack_routes(vec![(id, Arc::new(Fake))]);
         assert_eq!(h.interrupt_ack_count(), 0);
         assert_eq!(h.ack_routes.len(), 1);
+    }
+
+    /// `QueueNotify` の route はデバイスの識別子で引かれ、保持される（#4028）。vCPU の経路は実機で確かめる（`hvf_microvm`）。
+    #[test]
+    fn mvm5_4028_queue_notify_routes_are_kept() {
+        use crate::interrupt::QueueNotifyReport;
+        #[derive(Debug)]
+        struct Fake;
+        impl QueueNotifyRoute for Fake {
+            fn on_queue_notify(&self, _q: u16) -> Result<QueueNotifyReport, MicrovmError> {
+                Err(internal("fake"))
+            }
+        }
+        let mut d = ExitDispatcher::new();
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let id = d
+            .register_mmio(0x0a00_0000, 0x200, Box::new(block))
+            .unwrap();
+        let h =
+            MmioHandler::with_dispatcher(d).with_queue_notify_routes(vec![(id, Arc::new(Fake))]);
+        assert_eq!(h.queue_notify_count(), 0);
+        assert_eq!(h.queue_routes.len(), 1);
+        assert_eq!(h.queue_routes[0].0, id);
     }
 
     /// 共有の dispatcher へ後から登録したデバイスが、ハンドラ側から見える（同じ実体を指す）。

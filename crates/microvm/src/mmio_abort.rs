@@ -17,6 +17,9 @@
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::esr::{self, AccessDirection, DataAbort};
 use crate::exit::VcpuExit;
+use crate::hvf_loop::ExitAction;
+use crate::interrupt::QueueNotifyReport;
+use crate::stop::StopReason;
 
 fn internal(msg: &'static str) -> MicrovmError {
     MicrovmError::new(MicrovmErrorCode::Internal, msg)
@@ -122,6 +125,22 @@ pub fn next_pc(pc: u64, syndrome: u64) -> Result<u64, MicrovmError> {
         .ok_or_else(|| internal("pc overflows when skipping the faulting instruction"))
 }
 
+/// `QueueNotify` の route の結果を、vCPU ループの次の動作へ写す（#4028・MVM-5・MVM-1。fail-closed）。
+///
+/// 呼び出し元は `hvf::mmio::handle_data_abort`。Linux の `microvm::dispatch_exit` と同じく、外側の `Err`（割り込み線の失敗・
+/// キュー番号の範囲外・lock の毒化）と、報告の中の `queue_error`（リング破損などゲスト起因）はどちらも VM を止める。
+/// 続行すると、完了の届かないゲストが無言でハングするか、壊れたリングの上で走り続ける。
+/// 止めるときはゲスト由来の文字列を載せず、コードだけで `Failed` にする（ERR-1）。
+pub fn queue_notify_action(result: &Result<QueueNotifyReport, MicrovmError>) -> ExitAction {
+    match result {
+        Err(e) => ExitAction::Stop(StopReason::Failed(e.code())),
+        Ok(report) => match report.queue_error() {
+            Some(e) => ExitAction::Stop(StopReason::Failed(e.code())),
+            None => ExitAction::Continue,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! syndrome は Arm ARM のビット位置から手で組んだリテラル。
@@ -132,6 +151,35 @@ mod tests {
     use crate::esr::{EsrClass, decode_esr};
     use crate::virtio_block::{MemoryBlockBackend, VirtioBlock};
     use crate::virtio_mmio::VirtioMmioTransport;
+
+    /// 通知の route の結果から止めるかどうかが決まる（#4028）。
+    #[test]
+    fn mvm5_4028_queue_notify_action_fails_closed() {
+        use crate::interrupt::{BlockNotifyReport, InterruptDelivery};
+        use crate::virtio_block::BlockQueueStats;
+        let report = |queue_error| {
+            Ok(QueueNotifyReport::Block(BlockNotifyReport {
+                stats: BlockQueueStats::default(),
+                delivery: InterruptDelivery::NotNeeded,
+                queue_error,
+            }))
+        };
+        assert_eq!(queue_notify_action(&report(None)), ExitAction::Continue);
+        let ring = MicrovmError::new(MicrovmErrorCode::InvalidArgument, "ring broken");
+        assert_eq!(
+            queue_notify_action(&report(Some(ring))),
+            ExitAction::Stop(StopReason::Failed(MicrovmErrorCode::InvalidArgument))
+        );
+        for code in [
+            MicrovmErrorCode::Internal,
+            MicrovmErrorCode::InvalidArgument,
+        ] {
+            assert_eq!(
+                queue_notify_action(&Err(MicrovmError::new(code, "x"))),
+                ExitAction::Stop(StopReason::Failed(code))
+            );
+        }
+    }
 
     fn dabt(s: u64) -> DataAbort {
         match decode_esr(s) {

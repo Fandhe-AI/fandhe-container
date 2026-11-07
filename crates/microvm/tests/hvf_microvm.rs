@@ -27,7 +27,7 @@ use fandhe_container_microvm::hvf::{
 };
 use fandhe_container_microvm::hvf_loop::{ExitKind, VcpuExitObserver};
 use fandhe_container_microvm::stop::StopReason;
-use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+use fandhe_container_microvm::virtio_block::{BlockBackend, MemoryBlockBackend};
 use fandhe_container_microvm::virtio_net::MemoryNetBackend;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -312,4 +312,292 @@ fn mvm5_4037_os_lock_write_of_nonzero_fails_unimplemented() {
         report.reason,
         StopReason::Failed(MicrovmErrorCode::Unimplemented)
     );
+}
+// ---- virtio-block の QueueNotify（#4028・MVM-5・MVM-1・REPAIR-12） ----
+//
+// 合成ゲストが virtio-mmio の窓 0 を初期化し、Image 自身に埋め込んだ記述子で read 要求を 1 件出して `QueueNotify` を書く。
+// 記述子・avail・ヘッダはホストが Image の中へ事前に置く（ゲストは MMU off の Device 属性で書かずに済み、機械語が短くなる）。
+// used・データ・status は device が同じ Image の領域へ書くため、ホストが終了後に `read_guest` で照合する。
+// ゲストの機械語に絶対アドレスは埋めず、`adr` で得た Image 先頭からの相対で参照する。
+// 割り込みの配送は照合しない（CPSR の DAIF がマスクされ、ベクタも無い）。`InterruptStatus` の UsedBuffer だけをゲストが読む。
+// 実カーネルでの block-read と配送（edge と LevelHigh）は #4014 の担当。
+
+/// Image 内のオフセット（ゲスト RAM 上では Image 先頭の GPA からの相対）。
+const Q_DESC: usize = 0x400;
+const Q_AVAIL: usize = 0x500;
+const Q_USED: usize = 0x600;
+const Q_HDR: usize = 0x700;
+const Q_DATA: usize = 0x800;
+const Q_STATUS: usize = 0xa00;
+/// キュー深さ（`QUEUE_NUM`）。
+const Q_NUM: u32 = 4;
+
+// 命令の符号化（Arm ARM）。`BOOT_CHECK_CODE` の既存の語（例 movz x3 = 0xD2A1_4003、ldr w1,[x3,#8] = 0xB940_0861）と同じ式。
+/// `movz wd, #imm`。
+const fn movz_w(rd: u32, imm: u32) -> u32 {
+    0x5280_0000 | (imm << 5) | rd
+}
+/// `movz xd, #imm, lsl #16`。
+const fn movz_x_lsl16(rd: u32, imm: u32) -> u32 {
+    0xD2A0_0000 | (imm << 5) | rd
+}
+/// `str wt, [xn, #off]`（off は 4 の倍数）。
+const fn str_w(rt: u32, rn: u32, off: u32) -> u32 {
+    0xB900_0000 | ((off / 4) << 10) | (rn << 5) | rt
+}
+/// `ldr wt, [xn, #off]`（off は 4 の倍数）。
+const fn ldr_w(rt: u32, rn: u32, off: u32) -> u32 {
+    0xB940_0000 | ((off / 4) << 10) | (rn << 5) | rt
+}
+/// `strb wt, [xn]`。
+const fn strb_w(rt: u32, rn: u32) -> u32 {
+    0x3900_0000 | (rn << 5) | rt
+}
+/// `add xd, xn, #imm`（imm は 12 bit）。
+const fn add_x(rd: u32, rn: u32, imm: u32) -> u32 {
+    0x9100_0000 | (imm << 10) | (rn << 5) | rd
+}
+/// `cmp wn, #imm`（`subs wzr, wn, #imm`）。
+const fn cmp_w(rn: u32, imm: u32) -> u32 {
+    0x7100_001F | (imm << 10) | (rn << 5)
+}
+/// `adr xd, #byte_off`（自分の位置からの符号つき 21 bit）。
+const fn adr(rd: u32, byte_off: i32) -> u32 {
+    let imm = (byte_off as u32) & 0x1F_FFFF;
+    0x1000_0000 | ((imm & 3) << 29) | ((imm >> 2) << 5) | rd
+}
+/// `b.ne` を `words` 命令先（符号つき 19 bit）へ。
+const fn b_ne(words: i32) -> u32 {
+    0x5400_0001 | (((words as u32) & 0x7_FFFF) << 5)
+}
+const DSB_SY: u32 = 0xD503_3F9F;
+
+/// virtio-block を初期化して `QueueNotify` を書き、`InterruptStatus == UsedBuffer(1)` のときだけシリアルへ `OK\n` を書いて
+/// SYSTEM_OFF するゲスト。食い違えば書かずに SYSTEM_OFF へ飛ぶ。x1 = Image 先頭の GPA、x3 = 窓 0 の基底。
+fn block_read_guest_code() -> Vec<u32> {
+    // 窓 0 のレジスタ（`virtio_mmio::reg`）。
+    const STATUS: u32 = 0x070;
+    const DRV_FEAT: u32 = 0x020;
+    const DRV_FEAT_SEL: u32 = 0x024;
+    const Q_SEL: u32 = 0x030;
+    const Q_NUM_R: u32 = 0x038;
+    const Q_READY: u32 = 0x044;
+    const Q_NOTIFY: u32 = 0x050;
+    const INT_STATUS: u32 = 0x060;
+    const Q_DESC_LO: u32 = 0x080;
+    const Q_DRIVER_LO: u32 = 0x090;
+    const Q_DEVICE_LO: u32 = 0x0a0;
+    let wr = |c: &mut Vec<u32>, reg: u32, v: u32| {
+        c.push(movz_w(5, v));
+        c.push(str_w(5, 3, reg));
+    };
+    let mut c: Vec<u32> = Vec::new();
+    // 命令列の先頭は Image の offset 0x40 なので、Image 先頭は 0x40 戻った位置。
+    c.push(adr(1, -0x40)); // adr x1, <Image 先頭>
+    c.push(movz_x_lsl16(3, 0x0a00)); // x3 = 0x0a00_0000（窓 0）
+    wr(&mut c, STATUS, 1); // ACKNOWLEDGE
+    wr(&mut c, STATUS, 3); // + DRIVER
+    wr(&mut c, DRV_FEAT_SEL, 0);
+    wr(&mut c, DRV_FEAT, 0x6); // SIZE_MAX | SEG_MAX（device が要求する）
+    wr(&mut c, DRV_FEAT_SEL, 1);
+    wr(&mut c, DRV_FEAT, 1); // VERSION_1（word 1 の bit 0）
+    wr(&mut c, STATUS, 11); // + FEATURES_OK
+    wr(&mut c, Q_SEL, 0);
+    wr(&mut c, Q_NUM_R, Q_NUM);
+    for (reg, off) in [
+        (Q_DESC_LO, Q_DESC),
+        (Q_DRIVER_LO, Q_AVAIL),
+        (Q_DEVICE_LO, Q_USED),
+    ] {
+        c.push(add_x(6, 1, off as u32)); // x6 = Image 先頭 + off（RAM は 4 GiB 未満なので下位 32 bit で足りる）
+        c.push(str_w(6, 3, reg));
+    }
+    wr(&mut c, Q_READY, 1);
+    wr(&mut c, STATUS, 15); // + DRIVER_OK
+    c.push(DSB_SY);
+    wr(&mut c, Q_NOTIFY, 0); // QueueNotify(0): route が同期で処理する
+    c.push(ldr_w(7, 3, INT_STATUS)); // InterruptStatus
+    c.push(cmp_w(7, 1)); // UsedBuffer のみ
+    let bne = c.len();
+    c.push(0); // b.ne fail（後で埋める）
+    c.push(movz_x_lsl16(4, 0x0900)); // シリアル THR
+    for ch in *b"OK\n" {
+        c.push(movz_w(5, u32::from(ch)));
+        c.push(strb_w(5, 4));
+    }
+    let fail = c.len();
+    c.extend_from_slice(&[0xD2B0_8000, 0xF280_0100, 0xD400_0002]); // PSCI SYSTEM_OFF（hvc #0）
+    c.push(0x1400_0000); // b .
+    c[bne] = b_ne(i32::try_from(fail - bne).unwrap());
+    c
+}
+
+/// ゲスト用の Image。記述子（header R → data W → status W）・avail（`head` を 1 件）・read ヘッダを埋め込む。
+/// `head` がキュー深さ以上ならリング破損になる。
+fn block_read_image(kernel_gpa: u64, head: u16) -> Vec<u8> {
+    let mut img = image_with_code(&block_read_guest_code());
+    let put = |img: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+        img[at..at + bytes.len()].copy_from_slice(bytes);
+    };
+    let desc = |img: &mut Vec<u8>, i: usize, addr: usize, len: u32, flags: u16, next: u16| {
+        let at = Q_DESC + i * 16;
+        put(img, at, &(kernel_gpa + addr as u64).to_le_bytes());
+        put(img, at + 8, &len.to_le_bytes());
+        put(img, at + 12, &flags.to_le_bytes());
+        put(img, at + 14, &next.to_le_bytes());
+    };
+    desc(&mut img, 0, Q_HDR, 16, 1, 1); // NEXT
+    desc(&mut img, 1, Q_DATA, 512, 1 | 2, 2); // NEXT | WRITE
+    desc(&mut img, 2, Q_STATUS, 1, 2, 0); // WRITE
+    put(&mut img, Q_AVAIL + 2, &1u16.to_le_bytes()); // avail.idx = 1
+    put(&mut img, Q_AVAIL + 4, &head.to_le_bytes()); // avail.ring[0]
+    // header は type = VIRTIO_BLK_T_IN(0)・reserved = 0・sector = 0（Image の既定の 0 のまま）。
+    // 未処理と区別する印（device が書けば消える）。
+    img[Q_DATA..Q_DATA + 512].fill(0xff);
+    img[Q_STATUS] = 0xff;
+    img
+}
+
+/// sector 0 に入れる既知のパターン（全 0 や印の 0xff と区別できる値）。
+fn sector0_pattern() -> Vec<u8> {
+    (0..512usize).map(|i| (i as u8) ^ 0x5a).collect()
+}
+
+/// block-read ゲストの構成（vCPU 1・block 1・シリアルあり）。sector 0 へ `sector0_pattern` を書いた backend を渡す。
+fn block_read_config(layout: Arm64Layout, observer: Arc<ExitSeq>, head: u16) -> (Config, u64) {
+    let kernel_gpa = layout.ram.base.raw() + 0x8_0000; // text_offset（合成 Image のヘッダ）
+    let mut cfg = config_with_code(layout, 1, observer, &BOOT_CHECK_CODE);
+    cfg.kernel = block_read_image(kernel_gpa, head);
+    let backend = cfg.block.get_mut(0).unwrap();
+    backend.write_at(0, &sector0_pattern()).unwrap();
+    (cfg, kernel_gpa)
+}
+
+fn block_read_layout() -> Arm64Layout {
+    let layout = Arm64Layout::new(64 << 20, 1, 1)
+        .unwrap()
+        .with_default_serial()
+        .unwrap();
+    assert_eq!(
+        layout.virtio_mmio_window(0).unwrap().base.raw(),
+        0x0a00_0000
+    );
+    assert_eq!(layout.serial.unwrap().base.raw(), 0x0900_0000);
+    layout
+}
+
+/// 正の試験: read 要求が QueueNotify で同期処理され、used・データ・status・InterruptStatus がゲストとホストの両側から見える。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn mvm5_4028_block_queue_notify_completes_read() {
+    let _wd = Watchdog::start(DEADLINE);
+    let layout = block_read_layout();
+    require_vm_with_gic(&layout);
+    let seq = Arc::new(ExitSeq::default());
+    let (cfg, kernel_gpa) = block_read_config(layout, Arc::clone(&seq), 0);
+    let vm = HvfMicroVm::assemble(cfg).unwrap();
+    // 埋め込んだ記述子の絶対アドレスの前提: Image が想定の GPA に載り、全体が Image の長さに収まる。
+    assert_eq!(vm.loaded().kernel.base.raw(), kernel_gpa);
+    assert_eq!(vm.loaded().kernel.size, 4096);
+
+    let console = vm.serial_console().expect("serial console is enabled");
+    let running = vm.start().unwrap();
+    let start = Instant::now();
+    while !running.is_finished() {
+        assert!(
+            start.elapsed() < FINISH_WAIT,
+            "hvf_microvm: guest did not finish block read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 解放（stop）の後はメモリが取り出されて読めないため、先に used・データ・status を読む。
+    let mut view = vec![0u8; Q_STATUS + 1 - Q_USED];
+    running
+        .read_guest(kernel_gpa + Q_USED as u64, &mut view)
+        .unwrap();
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    let out = console.take_output().unwrap();
+    let exits = seq.snapshot();
+    let at = |off: usize| off - Q_USED;
+    let u16_at = |off: usize| u16::from_le_bytes([view[at(off)], view[at(off) + 1]]);
+    let u32_at = |off: usize| {
+        u32::from_le_bytes([
+            view[at(off)],
+            view[at(off) + 1],
+            view[at(off) + 2],
+            view[at(off) + 3],
+        ])
+    };
+    eprintln!(
+        "hvf_microvm: block_notify: exits={} used_idx={} used_id={} used_len={} status={} output={out:?} reason={:?}",
+        exits.len(),
+        u16_at(Q_USED + 2),
+        u32_at(Q_USED + 4),
+        u32_at(Q_USED + 8),
+        view[at(Q_STATUS)],
+        report.reason
+    );
+    assert_eq!(u16_at(Q_USED + 2), 1, "used.idx");
+    assert_eq!(u32_at(Q_USED + 4), 0, "used.ring[0].id");
+    assert_eq!(
+        u32_at(Q_USED + 8),
+        513,
+        "used.ring[0].len = data 512 + status 1"
+    );
+    assert_eq!(view[at(Q_STATUS)], 0, "status = VIRTIO_BLK_S_OK");
+    assert_eq!(&view[at(Q_DATA)..at(Q_DATA) + 512], &sector0_pattern()[..]);
+    assert_eq!(out, b"OK\n", "InterruptStatus was UsedBuffer");
+    // data abort の内訳: STATUS 書き 4・DRIVER_FEATURES(_SEL) 書き 4・QUEUE_SEL/NUM/DESC/DRIVER/DEVICE/READY 書き 6・
+    // QUEUE_NOTIFY 書き 1・InterruptStatus 読み 1・THR 書き 3 = 19。最後は SYSTEM_OFF の HVC。
+    let aborts = exits.iter().filter(|k| **k == ExitKind::DataAbort).count();
+    assert_eq!(aborts, 19);
+    assert_eq!(exits.last(), Some(&ExitKind::Hvc));
+    assert_eq!(report.reason, StopReason::GuestShutdown);
+
+    drop(create_vm_or_precondition());
+}
+
+/// 負の試験: avail が範囲外の記述子（リング破損）を指すと、通知の処理が `queue_error` を返し VM が fail-closed で止まる。
+#[test]
+#[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
+fn mvm5_4028_block_queue_notify_ring_error_stops_vm() {
+    let _wd = Watchdog::start(DEADLINE);
+    let layout = block_read_layout();
+    require_vm_with_gic(&layout);
+    let seq = Arc::new(ExitSeq::default());
+    // head = 7 は `Q_NUM`（4）以上: DescIndexOutOfRange（InvalidArgument）。
+    let (cfg, _kernel_gpa) = block_read_config(layout, Arc::clone(&seq), 7);
+    let vm = HvfMicroVm::assemble(cfg).unwrap();
+    let console = vm.serial_console().expect("serial console is enabled");
+    let running = vm.start().unwrap();
+    let start = Instant::now();
+    while !running.is_finished() {
+        assert!(
+            start.elapsed() < FINISH_WAIT,
+            "hvf_microvm: vm did not stop on ring error"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let report = running.stop(Duration::from_secs(1)).unwrap();
+    let out = console.take_output().unwrap();
+    let exits = seq.snapshot();
+    eprintln!(
+        "hvf_microvm: block_notify_error: exits={} output={out:?} reason={:?}",
+        exits.len(),
+        report.reason
+    );
+    // QueueNotify の書き込みが最後の exit で、PC は進まず、ゲストは InterruptStatus を読まず SYSTEM_OFF にも達しない。
+    assert_eq!(
+        report.reason,
+        StopReason::Failed(MicrovmErrorCode::InvalidArgument)
+    );
+    assert!(!exits.contains(&ExitKind::Hvc));
+    assert_eq!(exits.last(), Some(&ExitKind::DataAbort));
+    assert_eq!(
+        exits.iter().filter(|k| **k == ExitKind::DataAbort).count(),
+        15
+    );
+    assert_eq!(out, b"");
+
+    drop(create_vm_or_precondition());
 }

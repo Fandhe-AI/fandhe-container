@@ -22,10 +22,12 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - 非 Linux の記録先: macOS は `FileStateStore::open` が通る（#2247）が、`FileAuditSink` の主経路の隔離
-//!   （`run_isolated`）・`open_checked`・代替経路が Linux 専用のため、検証が常に返す `unsupported` の拒否の記録は
-//!   `SinkFailed` のまま。Windows は `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査が未実装）
-//!   で記録先を作れない。どちらも残りの実装待ち（SEC-4）
+//! - 非 Linux の記録先（SEC-4・PLUG-11・#2430）: macOS は信頼性検証が動き（`plugin_trust/macos.rs`・#1865）、
+//!   `FileStateStore::open` も通る（#2247）。`FileAuditSink` の主経路の macOS 版（`run_isolated`・`open_checked`。#2429）
+//!   も実装済みで、主経路が成功すれば拒否は記録される。未実装なのは代替経路（#2430）で、主経路が失敗すると
+//!   記録は `SinkFailed` のまま（拒否は覆らない）。失敗する例は、呼び出し元が複数スレッド、SIGCHLD が `SIG_DFL`
+//!   でない、ACL を判定できない FS（`docs/design/audit-non-linux.md` 8 章）。Windows は検証が常に `Unsupported` を
+//!   返し、`FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査が未実装。#2428）で記録先を作れない
 //! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認と実装 issue の起票は #2232〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
 //!
 //! # `container_id` を付けない理由（R4）

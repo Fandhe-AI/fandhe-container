@@ -633,11 +633,12 @@ mod tests {
         }
         fn kill(&self, r: &KillRequest) -> Result<ContainerStatus, TraitError> {
             let id = r.id().as_str().to_owned();
-            self.0
-                .calls
-                .lock()
-                .unwrap()
-                .push(format!("kill {id} {}", r.signal().as_u8()));
+            self.0.calls.lock().unwrap().push(match r.target() {
+                fandhe_container_core::traits::KillTarget::AllProcesses => {
+                    format!("kill-all {id} {}", r.signal().as_u8())
+                }
+                _ => format!("kill {id} {}", r.signal().as_u8()),
+            });
             Ok(ContainerStatus::running(
                 r.id().clone(),
                 NonZeroU32::new(4242),
@@ -1192,8 +1193,24 @@ mod tests {
                 "{sig}"
             );
         }
-        let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
-        assert_eq!((code, msg.as_str()), (UNIMPL, "kill all is not supported"));
+        // all=true は SIGKILL だけを cgroup 全体へ送る。SIGKILL 以外は状態照会より前に拒否。
+        s.handle("Kill", &kill_req("c1", 9, true, "")).unwrap();
+        assert_eq!(f.calls.lock().unwrap().last().unwrap(), "kill-all c1 9");
+        for sig in [1u32, 15, 64] {
+            let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", sig, true, "")));
+            assert_eq!(
+                (code, msg.as_str()),
+                (INVALID, "kill all supports only SIGKILL")
+            );
+        }
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 15, true, ""))).0,
+            INVALID
+        );
+        assert_eq!(
+            err_code(s.handle("Kill", &kill_req("zz", 9, true, ""))).0,
+            NOT_FOUND
+        );
         let (code, msg) = err_code(s.handle("Kill", &kill_req("c1", 9, false, "e")));
         assert_eq!((code, msg.as_str()), (UNIMPL, "exec_id is not supported"));
         assert_eq!(
@@ -1201,7 +1218,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c.starts_with("kill"))
+                .filter(|c| c.starts_with("kill "))
                 .count(),
             3
         );

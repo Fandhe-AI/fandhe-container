@@ -1,4 +1,5 @@
 # KVM 直接制御・最小 virtio デバイスモデル（Linux オプション。crate-naming.md の表 #8）。
+# #4026 で interrupt に QueueNotifyRoute と BlockQueueNotifyRoute を追加し QueueNotifyReport を interrupt へ移す（依存は増やさない。unsafe なし）。
 # #4025 で guest_memory_slot（ゲスト RAM を複数スレッドで共有するスロット型。OS 非依存）を追加（依存は増やさない。unsafe なし）。
 # #3986 で tests/hvf_kernel_boot.rs と tests/support/guest_boot.rs を追加（依存は増やさない。unsafe 追加なし）。
 # #3998 で hvf_kernel_boot に vCPU 2 台の陽性を追加し、SMP の行照合を tests/support/guest_boot.rs へ移す（依存は増やさない。unsafe 追加なし）。

@@ -25,7 +25,7 @@
 //!   tear しうる値（記述子など）も非信頼入力として範囲検査で受け止め、リング破損として扱う。
 //!
 //! # 範囲外（REPAIR-3）
-//! 複数領域・`hv_vm_protect`・`Send` / `Sync`（#3798 の範囲外。期限切れで切り離したスレッドの資源の回収と合わせて担当は #3908）。IPA の上限の値は既定の 36 ビット（実機の値は #3997）。
+//! 複数領域・`hv_vm_protect`・`Sync`（`Send` は #4024 で導入済み。#3798 の範囲外。期限切れで切り離したスレッドの資源の回収と合わせて担当は #3908）。IPA の上限の値は既定の 36 ビット（実機の値は #3997）。
 //! `register` はレイアウトの上限を、`HvVm::map` は既定の上限を検査する（#3844）。
 //! 解除失敗の構造化ログは未実装。
 
@@ -34,6 +34,15 @@ use crate::guest_memory::{GuestAddress, GuestMemory, GuestMemoryBacking};
 use crate::hvf::gic::VmWithGic;
 use crate::hvf_abi::{MemoryFlags, check_ipa_limit};
 use crate::sys::{GuestMapping, HostMapping, HvVm};
+
+// `RegisteredHvfRam<'static>`・`HvfGuestRam` とそれを持つ `GuestMemory` が `Send` であることを固定する。`HostMapping` の
+// `Send`（#4022・#4024）から自動で導出される。vCPU スレッドへ move するための前提（#3908）。`Sync` は不要（共有は `Arc<Mutex<..>>`）。
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<GuestMemory<RegisteredHvfRam<'static>>>();
+    assert_send::<RegisteredHvfRam<'static>>();
+    assert_send::<HvfGuestRam>();
+};
 
 fn out_of_range() -> MicrovmError {
     MicrovmError::new(
@@ -86,7 +95,7 @@ impl HvfGuestRam {
     /// （`HvfMicroVm`。#3797）が自己参照なしに RAM を持てる。検査の順序と失敗時の解放は `register` と同じ。
     ///
     /// 契約: 対応付けが残る間は `Arc<HvVm>` も残るので、VM の破棄（`hv_vm_destroy`）は必ず unmap の後になる。
-    /// `GuestMapping` は生ポインタを持つため `Send` ではない（vCPU スレッドからゲスト RAM を触る必要が出たときの担当は #3908 で、#3798 の範囲外。REPAIR-3）。
+    /// `GuestMapping` は `Send`（`!Sync`。#4024）。vCPU スレッドへの実際の受け渡しの配線は #3908（REPAIR-3）。
     pub fn register_shared(
         self,
         vm: &VmWithGic,

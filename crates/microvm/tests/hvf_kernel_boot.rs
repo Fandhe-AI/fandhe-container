@@ -25,7 +25,7 @@
 //! 下限が「送信バイト数 / 16」でない理由: Linux の 8250 の割り込みハンドラは IIR が保留を返す間は同じ呼び出しの中で回るため、
 //! 即時に THRE が立つモデルでは長い行でも 1 回で済みうる（8250_core.c の挙動。版を固定した照合は未実施）。
 //! 入力だけの増分は分離しない（snapshot の出力自体が送信割り込みを起こすため）。入力の経路の証跡は書き戻しの行と `input_read_bytes`。
-//! `push_input` からゲストの RBR 読み出しまでの遅れ（`WFI_WAIT_MAX` の 10 ms との比較用）は観測の行へ出すだけで assert しない
+//! `push_input` からゲストの RBR 読み出しまでの遅れ（試験内の `WFI_WAIT_MAX`〔10 ms の基準。#4039〕との比較用）は観測の行へ出すだけで assert しない
 //! （実行環境で揺れる。判定は #3988）。負の対照は入力を押さない版で、ゲストが rx timeout に落ち、書き戻しが入力に由来することを裏づける。
 //! `/init` は最初に `syslog(CONSOLE_OFF)` で printk を止める（非同期の printk が行の途中へ割り込み、行単位の照合が偽の失敗になるのを防ぐ）。
 //! vCPU 2 台の陽性（#3998。`hvf_kernel_boot_two_vcpus_reaches_init_and_shuts_down`）: AP（vCPU 1）は PSCI CPU_ON で起動する
@@ -73,7 +73,7 @@ use fandhe_container_microvm::error::MicrovmErrorCode;
 use fandhe_container_microvm::hvf::{
     HvfDeviceKind, HvfMicroVm, HvfMicroVmConfig, VcpuThreadConfig, VmWithGic,
 };
-use fandhe_container_microvm::hvf_abi::{HvRunStats, WFI_WAIT_MAX};
+use fandhe_container_microvm::hvf_abi::HvRunStats;
 use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
 use fandhe_container_microvm::interrupt::{InterruptAckCounts, IrqTrigger};
 use fandhe_container_microvm::stop::StopReason;
@@ -101,6 +101,8 @@ const INITRD_CAP: u64 = 64 << 20;
 /// シリアル出力の蓄積上限（無制限確保の防止）。
 const OUTPUT_CAP: usize = 4 << 20;
 /// `stop` の期限（`stop` 自身の上限 60 秒以内）。
+/// 入力の遅れの比較用の基準（製品の `WFI_WAIT_MAX` を #4039 で消したため試験内に持つ）。
+const WFI_WAIT_MAX: Duration = Duration::from_millis(10);
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
 /// 外側の `recv_timeout` が内側（起動スレッドの全体）より余裕を持つための上乗せ。
 const SLACK: Duration = Duration::from_secs(15);
@@ -1000,6 +1002,11 @@ fn hvf_kernel_boot_serial_echo_without_input_times_out() {
     let rows = parse_irq_rows(&o.output, "ttyS0")
         .unwrap_or_else(|e| panic!("hvf_kernel_boot: /proc/interrupts: {e}: {diag}"));
     assert_eq!(rows.len(), 1, "only the first dump runs: {rows:?}: {diag}");
+    // 5 秒の待機中の WFI / vtimer の exit の回数の直接の観測（#3988 で値が採れなかった。assert しない。#4039）。
+    eprintln!(
+        "hvf_kernel_boot: serial timeout arch=aarch64 exits={} wfx={} vtimer={}",
+        o.exits, o.wfx, o.vtimer
+    );
 }
 
 /// watchdog の期限は、内側（起動スレッド全体）の期限より常に長い（既定と最大の 2 点。REPAIR-5・MVM-5）。

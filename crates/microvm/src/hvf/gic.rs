@@ -214,7 +214,7 @@ impl VmWithGic {
         &self.vm
     }
 
-    /// vCPU `index` 専用の WFI の待ち手（#3887・#3948）。`hvf::vcpu` が `TimerHandler` へ結ぶ。範囲外は `InvalidArgument`。
+    /// vCPU `index` 専用の WFI の待ち手（#3887・#3948）。（#4039 で `TimerHandler` を消したため `hvf::vcpu` は結ばない。整理は #4040・#4042）。範囲外は `InvalidArgument`。
     pub fn wfi_waker_for_vcpu(&self, index: u32) -> Result<WfiWaker, MicrovmError> {
         self.wake.handle(index)
     }

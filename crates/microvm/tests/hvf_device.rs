@@ -228,7 +228,6 @@ const VCPU_THREAD_DEADLINE: Duration = Duration::from_secs(20);
 fn hvf_device_vcpu_thread_runs_and_cancels() {
     use fandhe_container_microvm::hvf::hvc::HvcHandler;
     use fandhe_container_microvm::hvf::mmio::MmioHandler;
-    use fandhe_container_microvm::hvf::timer::TimerHandler;
     use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
     use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
     use fandhe_container_microvm::stop::StopReason;
@@ -277,7 +276,6 @@ fn hvf_device_vcpu_thread_runs_and_cancels() {
     let handlers = || ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
-        timer: TimerHandler::new(),
     };
     let setup = |pc: u64, x0: u64| {
         move |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
@@ -658,7 +656,6 @@ const PSCI_DEADLINE: Duration = Duration::from_secs(20);
 fn hvf_device_psci_version_then_system_off() {
     use fandhe_container_microvm::hvf::hvc::{HvcHandler, handle_hvc};
     use fandhe_container_microvm::hvf::mmio::MmioHandler;
-    use fandhe_container_microvm::hvf::timer::TimerHandler;
     use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
     use fandhe_container_microvm::hvf_loop::{ExitAction, ExitKind, VcpuExitObserver};
     use fandhe_container_microvm::stop::StopReason;
@@ -750,7 +747,6 @@ fn hvf_device_psci_version_then_system_off() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
-        timer: TimerHandler::new(),
     };
     let handle = VcpuThread::spawn(
         Arc::clone(&vm),
@@ -884,7 +880,6 @@ fn hvf_device_mmio_reaches_virtio_mmio() {
     use fandhe_container_microvm::dispatch::{ExitDispatcher, MmioDevice};
     use fandhe_container_microvm::hvf::hvc::HvcHandler;
     use fandhe_container_microvm::hvf::mmio::MmioHandler;
-    use fandhe_container_microvm::hvf::timer::TimerHandler;
     use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
     use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
     use fandhe_container_microvm::stop::StopReason;
@@ -990,7 +985,6 @@ fn hvf_device_mmio_reaches_virtio_mmio() {
         let handlers = ExitHandlers {
             mmio: MmioHandler::with_dispatcher(dispatcher),
             hvc: HvcHandler::new(),
-            timer: TimerHandler::new(),
         };
         let counts = Arc::new(ExitCounts::new());
         let config = VcpuThreadConfig {
@@ -1847,8 +1841,6 @@ const VTIMER_IDLE_CODE: [u32; 7] = [
     0x17FF_FFFF,
 ];
 
-/// 場面 A の vCPU の exit 回数の上限（PPI が届かない場合を watchdog と別の行で識別するための歯止め）。
-const VTIMER_MAX_EXITS: u32 = 4096;
 /// `hvf_device_vtimer_wakes_wfi` の全体期限。
 const VTIMER_DEADLINE: Duration = Duration::from_secs(20);
 /// 場面 B でゲストを待たせる長さ。実行の区切り（`VCPU_RUN_SLICE`。100 ms）の 2 回分を超える。
@@ -1856,17 +1848,17 @@ const VTIMER_IDLE: Duration = Duration::from_millis(300);
 
 /// WFI の待ちと vtimer の処理（TASK-192.14・#3796・MVM-5・MVM-1・REPAIR-5）。
 /// GIC つきの構成では WFI も `VTIMER_ACTIVATED` も exit せず、PPI は framework が pending にする（#3803・#3994）。
-/// `timer::handle_wfx` / `handle_vtimer` は exit した場合のために残し、回数は観測の行で出す。
+/// 製品側は WFI の待ちも vtimer の処理も持たず、WFI の exit と `VTIMER_ACTIVATED` は `Failed(Unimplemented)` で止まる（#4039・#3995）。
+/// このため場面 A は WFI の exit・vtimer の exit が来たら試験を失敗にする。
 /// (A) CNTV に 10 ms 後の期限を設定して `wfi` で待つゲストが起き、PPI の INTID を MMIO 窓へ書く
 /// （ホストが 1 秒以内に観測する）。ホストが回す手動ループで、MMIO のスタブに依存しない。
-/// (B) 発火しないタイマーで `wfi` を繰り返すゲストを `VcpuThread` + 本物の `TimerHandler` で走らせ、
+/// (B) 発火しないタイマーで `wfi` を繰り返すゲストを `VcpuThread` で走らせ、
 /// 実行の区切りを 2 回以上またいで待ち続けることと、待っている最中の停止要求で 1 秒以内に `Requested` で止まることを確かめる。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
 fn hvf_device_vtimer_wakes_wfi() {
     use fandhe_container_microvm::hvf::hvc::HvcHandler;
     use fandhe_container_microvm::hvf::mmio::MmioHandler;
-    use fandhe_container_microvm::hvf::timer::{self, TimerHandler};
     use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
     use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
     use fandhe_container_microvm::stop::StopReason;
@@ -1874,6 +1866,8 @@ fn hvf_device_vtimer_wakes_wfi() {
 
     const BASE: u64 = 0x4000_0000;
     const WINDOW: u64 = 0x0a00_0000;
+    /// 停止要求の応答の比較用の基準（製品の定数を #4039 で消したため、10 ms を試験内に持つ）。
+    const WFI_WAIT_MAX: Duration = Duration::from_millis(10);
     let finished = Arc::new(AtomicBool::new(false));
     // アサーションが失敗（panic）しても watchdog を止めて join する RAII ガード。
     struct WatchdogGuard(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
@@ -1928,59 +1922,39 @@ fn hvf_device_vtimer_wakes_wfi() {
             .unwrap();
         vcpu.set_reg(HvReg::PC, BASE).unwrap();
         vcpu.set_reg(HvReg::CPSR, 0x3c5).unwrap();
-        let mut handler = TimerHandler::new();
-        let (mut wfx, mut vtimer) = (0u32, 0u32);
-        let mut first_wfx_pc: Option<u64> = None;
-        let mut delivered: Option<u64> = None;
         let start = Instant::now();
-        for _ in 0..VTIMER_MAX_EXITS {
-            let exit = match vcpu.run_once(VTIMER_DEADLINE) {
-                Ok(e) => e,
-                Err(e) => panic!("hvf_device: vtimer: run failed: {e}"),
-            };
-            match exit {
-                HvVcpuExit::VtimerActivated => {
-                    vtimer += 1;
-                    timer::handle_vtimer(&mut vcpu, &mut handler).unwrap();
-                }
-                HvVcpuExit::Exception(ex) => match decode_esr(ex.syndrome) {
-                    EsrClass::Wfx(kind) => {
-                        wfx += 1;
-                        if first_wfx_pc.is_none() {
-                            let pc = vcpu.get_reg(HvReg::PC).unwrap();
-                            first_wfx_pc = Some(pc);
-                            eprintln!("hvf_device: vtimer: pc at wfi exit={pc:#x} kind={kind:?}");
-                        }
-                        timer::handle_wfx(&mut vcpu, &mut handler, kind, &ex).unwrap();
-                    }
-                    EsrClass::DataAbort(da)
-                        if ex.physical_address == WINDOW
-                            && da.direction == AccessDirection::Write =>
-                    {
-                        let reg = HvReg::x(da.register.get()).unwrap();
-                        delivered = Some(vcpu.get_reg(reg).unwrap() & 0xffff_ffff);
-                        break;
-                    }
-                    other => panic!(
-                        "hvf_device: vtimer: unexpected guest exit {other:?} pa={:#x} syndrome={:#x}",
-                        ex.physical_address, ex.syndrome
-                    ),
-                },
-                other => panic!("hvf_device: vtimer: unexpected exit {other:?}"),
-            }
-        }
-        let elapsed = start.elapsed();
-        let stats = handler.stats();
-        let Some(value) = delivered else {
-            panic!(
-                "hvf_device: vtimer: guest did not take the timer interrupt within {VTIMER_MAX_EXITS} exits (wfx={wfx} vtimer={vtimer} stats={stats:?})"
-            );
+        // GIC つきでは WFI も vtimer も exit しないため、最初の exit が MMIO 窓への PPI の INTID の書き込みになる（#3803・#4039）。
+        let exit = match vcpu.run_once(VTIMER_DEADLINE) {
+            Ok(e) => e,
+            Err(e) => panic!("hvf_device: vtimer: run failed: {e}"),
         };
+        let value = match exit {
+            HvVcpuExit::VtimerActivated => {
+                let pc = vcpu.get_reg(HvReg::PC).unwrap();
+                panic!("hvf_device: vtimer: unexpected vtimer exit pc={pc:#x}");
+            }
+            HvVcpuExit::Exception(ex) => match decode_esr(ex.syndrome) {
+                EsrClass::Wfx(kind) => {
+                    let pc = vcpu.get_reg(HvReg::PC).unwrap();
+                    panic!("hvf_device: vtimer: unexpected wfx exit pc={pc:#x} kind={kind:?}");
+                }
+                EsrClass::DataAbort(da)
+                    if ex.physical_address == WINDOW && da.direction == AccessDirection::Write =>
+                {
+                    let reg = HvReg::x(da.register.get()).unwrap();
+                    vcpu.get_reg(reg).unwrap() & 0xffff_ffff
+                }
+                other => panic!(
+                    "hvf_device: vtimer: unexpected guest exit {other:?} pa={:#x} syndrome={:#x}",
+                    ex.physical_address, ex.syndrome
+                ),
+            },
+            other => panic!("hvf_device: vtimer: unexpected exit {other:?}"),
+        };
+        let elapsed = start.elapsed();
         eprintln!(
-            "hvf_device: vtimer: guest read intid={value} elapsed_ms={} wfx={wfx} vtimer={vtimer} unmasks={} masked={}",
-            elapsed.as_millis(),
-            stats.vtimer_unmasks,
-            handler.vtimer_masked()
+            "hvf_device: vtimer: guest read intid={value} elapsed_ms={}",
+            elapsed.as_millis()
         );
         assert_eq!(value, u64::from(ppi));
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
@@ -1996,7 +1970,6 @@ fn hvf_device_vtimer_wakes_wfi() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::new(),
         hvc: HvcHandler::new(),
-        timer: TimerHandler::new(),
     };
     let setup = |vcpu: &mut fandhe_container_microvm::hvf::HvVcpu<'_>| {
         vcpu.set_sys_reg(HvSysReg::MPIDR_EL1, u64::from(ARM64_BOOT_CPU_MPIDR))?;
@@ -2027,11 +2000,9 @@ fn hvf_device_vtimer_wakes_wfi() {
         stop_elapsed.as_micros()
     );
     assert!(stop_elapsed < Duration::from_secs(1), "{stop_elapsed:?}");
-    assert!(
-        stop_elapsed < fandhe_container_microvm::hvf_abi::WFI_WAIT_MAX,
-        "{stop_elapsed:?}"
-    );
+    assert!(stop_elapsed < WFI_WAIT_MAX, "{stop_elapsed:?}");
     assert_eq!(counts.count(ExitKind::Vtimer), 0);
+    assert_eq!(counts.count(ExitKind::Wfx), 0);
 
     mapping.unmap().unwrap();
     drop(vm);
@@ -2047,7 +2018,7 @@ const SPI_WAKE_SETTLE: Duration = Duration::from_millis(5);
 /// GIC つきの構成では WFI は exit せず `hv_vcpu_run` の中で待つ（#3803）。起こせるのは注入と、`VCPU_RUN_SLICE`（100 ms）の
 /// 区切りの cancel だけである。準備完了を待ってから非 vCPU スレッドで `GicSpiLine::trigger` を呼び、その時刻からゲストが
 /// INTID を MMIO 窓へ書くまでの遅れを測る。注入で起きなければ遅れは区切りまでの 0〜100 ms に散るため、全標本が
-/// `WFI_WAIT_MAX`（10 ms）未満で中央値がその半分未満であることを照合する（実機で不安定なら切り分けて緩める）。
+/// `WFI_WAIT_MAX`（試験内の 10 ms の基準）未満で中央値がその半分未満であることを照合する（実機で不安定なら切り分けて緩める）。
 /// 同じ INTID への `set_spi(true)` の繰り返しがそのつど届くことの観測も兼ねる。`VcpuThread` と本物のハンドラを使う。
 #[test]
 #[ignore = "requires Apple silicon macOS 15+ and a binary signed with com.apple.security.hypervisor (MVM-5)"]
@@ -2055,9 +2026,9 @@ fn hvf_device_spi_wakes_wfi() {
     use fandhe_container_microvm::dispatch::{ExitDispatcher, MmioDevice};
     use fandhe_container_microvm::hvf::hvc::HvcHandler;
     use fandhe_container_microvm::hvf::mmio::MmioHandler;
-    use fandhe_container_microvm::hvf::timer::TimerHandler;
     use fandhe_container_microvm::hvf::{ExitHandlers, VcpuThread, VcpuThreadConfig};
-    use fandhe_container_microvm::hvf_abi::WFI_WAIT_MAX;
+    /// 比較用の基準（製品の定数を #4039 で消したため試験内に持つ）。
+    const WFI_WAIT_MAX: Duration = Duration::from_millis(10);
     use fandhe_container_microvm::hvf_loop::{ExitCounts, ExitKind};
     use fandhe_container_microvm::stop::StopReason;
     use fandhe_container_microvm::virtio_mmio::{MmioReadOutcome, MmioWriteOutcome};
@@ -2161,7 +2132,6 @@ fn hvf_device_spi_wakes_wfi() {
     let handlers = ExitHandlers {
         mmio: MmioHandler::with_dispatcher(dispatcher),
         hvc: HvcHandler::new(),
-        timer: TimerHandler::new(),
     };
     let counts = Arc::new(ExitCounts::new());
     let config = VcpuThreadConfig {

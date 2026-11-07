@@ -315,18 +315,57 @@ impl CreateRequest {
     }
 }
 
+/// コンテナの stdin の扱い（CRI の CreateContainer の `stdin`・`stdin_once` の 3 値表現）。
+///
+/// OCI の config.json に対応する欄が無いため、cri が記録に保存し、StartContainer のときに
+/// [`StartRequest::with_stdin`] で core へ運ぶ（完全版 Attach の設計 D4・D5。#3765・#4073。
+/// CRI-6・SUP-4・SEC-1・PLUG-1）。真偽値 2 つではなく列挙にしたのは、
+/// `stdin=false, stdin_once=true` のような意味の無い組を表現できなくするため（REPAIR-2）。
+///
+/// 現状（REPAIR-3）: core の `start` も plugin-cri もこの値をまだ読まない。cri の記録への保存と
+/// 運搬は C8（#4076）、supervisor の `--stdin` と保持は C4（#4074）が担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum StdinMode {
+    /// stdin を開かない（CRI の `stdin=false`。既定）。attach の stdin 要求は後続で断る。
+    #[default]
+    Closed,
+    /// stdin を開いたまま保持する（`stdin=true, stdin_once=false`）。attach のたびに複製を渡す。
+    Open,
+    /// 最初の attach で所有を移す（`stdin=true, stdin_once=true`）。
+    Once,
+}
+
 /// [`ContainerRuntime::start`] の要求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StartRequest {
     id: ContainerId,
     log_path: Option<ContainerLogPath>,
+    stdin: StdinMode,
 }
 
 impl StartRequest {
-    /// 対象コンテナの ID から要求を作る（CRI ログの書き先なし）。
+    /// 対象コンテナの ID から要求を作る（CRI ログの書き先なし・stdin は [`StdinMode::Closed`]）。
     pub fn new(id: ContainerId) -> Self {
-        Self { id, log_path: None }
+        Self {
+            id,
+            log_path: None,
+            stdin: StdinMode::Closed,
+        }
+    }
+
+    /// stdin の扱いを付ける（CRI-6・PLUG-1・#4073）。値を読むのは supervisor 側（C4 #4074）で、
+    /// 現時点の core の `start` は参照しない。
+    #[must_use]
+    pub fn with_stdin(mut self, stdin: StdinMode) -> Self {
+        self.stdin = stdin;
+        self
+    }
+
+    /// stdin の扱いを返す。既定は [`StdinMode::Closed`]。
+    pub fn stdin(&self) -> StdinMode {
+        self.stdin
     }
 
     /// CRI ログの書き先（`log_directory/log_path` を結合・検証済みの絶対パス）を付ける
@@ -1114,6 +1153,35 @@ mod tests {
         let lp = ContainerLogPath::new("/l/c/0.log").expect("ok");
         let req = StartRequest::new(id).with_log_path(lp.clone());
         assert_eq!(req.log_path(), Some(&lp));
+    }
+
+    /// CRI-6・PLUG-1（#4073）: `StartRequest` の stdin は既定で `Closed`。
+    #[test]
+    fn cri6_start_request_stdin_mode_default_closed() {
+        assert_eq!(StdinMode::default(), StdinMode::Closed);
+        assert_eq!(StartRequest::new(sample_id()).stdin(), StdinMode::Closed);
+    }
+
+    /// CRI-6・PLUG-1（#4073）: builder で設定した値が返り、`log_path` と順序に依らず共存する。
+    #[test]
+    fn cri6_start_request_with_stdin_sets_each_mode() {
+        for m in [StdinMode::Closed, StdinMode::Open, StdinMode::Once] {
+            assert_eq!(StartRequest::new(sample_id()).with_stdin(m).stdin(), m);
+        }
+        let lp = ContainerLogPath::new("/l/c/0.log").expect("ok");
+        let a = StartRequest::new(sample_id())
+            .with_stdin(StdinMode::Once)
+            .with_log_path(lp.clone());
+        let b = StartRequest::new(sample_id())
+            .with_log_path(lp.clone())
+            .with_stdin(StdinMode::Once);
+        assert_eq!(a.stdin(), StdinMode::Once);
+        assert_eq!(a.log_path(), Some(&lp));
+        assert_eq!(a, b);
+        assert_ne!(
+            StartRequest::new(sample_id()).with_stdin(StdinMode::Open),
+            StartRequest::new(sample_id())
+        );
     }
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。

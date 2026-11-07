@@ -238,11 +238,95 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 
 | 案 | 内容 | 単一スレッド制約との干渉 | 判断 |
 | -- | ---- | ------------------------ | ---- |
-| A1 | 制御チャネルに固定長の種別を足し、supervisor がコンテナの init の stdin の書き込み端（tty なら pty master）の複製を SCM_RIGHTS で plugin-cri へ渡す。中継と resize（`TIOCSWINSZ`）は plugin-cri のプロセス内で行う。出力は段階 1 と同じログの follow | 受け渡しは accept ループの 1 要求で、`PausableServer::pause` の既存の対象に入る。supervisor にセッションのスレッドが残らない。再 launch の後は新しい世代の stdin / pty になり、旧い複製は EPIPE で終わる | 採用（本命）。Exec の fd 渡しの部品（sys の複数 fd 送受信）と同じ形 |
+| A1 | 制御チャネルに固定長の種別を足し、supervisor がコンテナの init の stdin の書き込み端（tty なら pty master）の複製を SCM_RIGHTS で plugin-cri へ渡す。中継と resize（`TIOCSWINSZ`）は plugin-cri のプロセス内で行う。出力は捕捉からの tap（下の「完全版 Attach の設計（#3765）」D2。当初案の follow から変更） | 受け渡しは accept ループの 1 要求で、`PausableServer::pause` の既存の対象に入る。supervisor にセッションのスレッドが残らない。再 launch の後は新しい世代の stdin / pty になり、旧い複製は EPIPE で終わる | 採用（本命）。Exec の fd 渡しの部品（sys の複数 fd 送受信）と同じ形 |
 | A2 | supervisor がコンテナごとに attach 用の UDS を listen し、接続ごとに中継スレッドを持つ | 2 本目の accept ループと最長 4 時間の中継スレッドが pause の対象になる。読まないクライアントが中継を詰まらせると pause が期限切れで失敗し、再 launch が `RelaunchFailed` から Stopped へ倒れる（attach のクライアントが restart を止められる）。peer の検証・ソケットの権限・PSS（SUP-2）も増える | 不採用 |
 | A3 | core の `ContainerRuntime` に attach を足す | core に常駐プロセスが無く（CORE-1）、拡張点トレイトの変更になる（PLUG-1・PLUG-4） | 不採用 |
 
-A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと resize にだけ使う（契約）。`stdin_once` は最初の attach で所有を移し supervisor が自分の端を閉じる方向で検討する。同じ uid の範囲で増える能力は exec と同じ（rootful は対象外）。#3765 に残るのは、CreateContainer の `stdin`・`stdin_once`・`tty` の bundle（`process.terminal`）への反映と `bundle/spec.rs` の拒否の解除の条件、launch で init の stdin / pty を作り保持する主体、種別の frame の確定、`stdin_once`。
+A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと resize にだけ使う（契約）。`stdin_once` は最初の attach で所有を移し supervisor が自分の端を閉じる方向で検討する。同じ uid の範囲で増える能力は exec と同じ（rootful は対象外）。CreateContainer の `stdin`・`stdin_once`・`tty` の反映、init の stdin / pty の保持者、種別の frame、`stdin_once` は次の「完全版 Attach の設計（#3765）」で決めた。そこで出力は「段階 1 と同じログの follow」ではなく捕捉からの tap に改めた（LF 待ちでは tty のプロンプトが出ないため）。
+
+### 完全版 Attach の設計（#3765・CRI-6・SUP-4・SUP-7・SEC-1・PLUG-1・REPAIR-2・REPAIR-3・REPAIR-5）
+
+本節の内容は未実装で、設計の決定と子 issue への分解だけを書く（REPAIR-3）。方式は上の比較表の A1 を維持し、詳細を次のとおり決める。cri の注入トレイト（`AttachBackend` / `AttachSession`）は変えない。
+
+**D1. 制御チャネルの種別（A1 の詳細）**
+
+- kind 9 の `AttachRequest` を足す。固定長で、payload は期待する pid（u32）・要求のマスク（stdin・stdout・stderr）・tty の期待値・予算（ms）の 4 つに限り、64 バイト以内に収める。既存 frame と同じく big-endian で、壊れた値を表現できない型にする（REPAIR-2）。`VERSION` は上げない。古い supervisor は未知の kind を `Malformed` で拒否するので安全に失敗し、plugin-cri は `UNAVAILABLE` 相当として扱い縮退しない
+- 応答は 1 回だけ: `Response(Ok)` と、マスクに対応する fd を SCM_RIGHTS で最大 3 本。非 tty は stdin の書き込み端・stdout の tap・stderr の tap、tty は master の複製・stdout の tap。送信は #3759 の複数 fd 送信を使う。拒否のときは fd を添えない
+- `ControlReason` に `StdinNotOpen`（作成時に stdin を開いていない）・`TtyMismatch`・`StdinClosed`（`stdin_once` で消費済み）を足す。値の割り当ては子 issue で確定する
+- 単一スレッド制約との関係: 要求は accept ループの中で 1 往復で終わり接続を保持しない（exec のガードとは違う）。このため `PausableServer::pause` に新しい参加者が増えず、supervisor にセッション用のスレッドも残らない。supervisor が持つのは世代ごとの fd だけである。このため [restart-relaunch-single-thread.md](restart-relaunch-single-thread.md) の表に行は足さない。常駐 listener（A2）を採らない理由は比較表のとおり
+
+**D2. 出力は捕捉からの tap（A1 の「ログの follow」を改める）**
+
+- ログの follow は LF までの完全な行しか出さず（`sup7_follow_waits_for_lf`）、ポーリングは 200 ms なので、LF の無い対話シェルのプロンプトが attach に届かない。そこで完全版の出力は、既存の捕捉のリーダーが sink へ書いた後に、購読者ごとの非ブロッキング socketpair へ生のバイト列を複製（tap）して渡す。tty と非 tty の両方に適用する
+- tap は既存のリーダースレッドの中で動くので新しいスレッドが要らず、再 launch の前の `quiesce` の範囲に収まる
+- 契約: sink への書き込みを常に優先する。`EAGAIN` や書き込み失敗の購読者はその場で切断し op ログに残し、背圧はかけない（SUP-7 のログを止めない）。購読者数にコンテナごとの上限を置く（初期案 8）。購読した時点より後の出力だけを流す。capture の EOF と世代交代で tap を閉じ、これが attach の終わりになる
+- 却下: follow のまま部分行を出す案（レコード形式に部分行の印が要り CLI の logs にも波及し、遅延も残る）、非 tty だけ follow を残す案（出力の経路が 2 本になり終了の意味も揃わない）。段階 1（#3763）の follow は完全版の結線で置き換え、reader の取り消しの口は残す
+
+**D3. init の stdin / pty を作り保持する主体**
+
+- 作るのは core の本番 launcher で、supervisor が起動オプションで要求する。stdin は `LaunchOptions` で開く指定を足し、core が pipe を作って読み取り側を子の fd 0 にし、書き込み側を `LaunchedProcess` から取り出す。tty（`process.terminal: true`）は、子がコンテナの mount namespace と devpts の中で `/dev/ptmx` を開き、slave を fd 0〜2 にして `setsid` と `TIOCSCTTY` で制御端末にし、`/dev/console` へ bind し、master は既存の子から親への SCM_RIGHTS（seccomp listener と同じ経路）で返す。pty の sys ラッパーと開く位置（Landlock / seccomp の再適用との順序）は #3758 の決定を再利用し、ここで決め直さない。ホストの devpts では割り当てない
+- core の `process.terminal` の拒否は、supervisor が端末対応を opt-in したとき（例: `with_terminal_support()`）だけ外す。master を捕捉しない呼び出し元は従来どおり拒否する（fail-closed）
+- 保持するのは supervisor で、`control/target.rs` の `SignalSlot` と同じ置き場所に世代ごとのスロットを持つ。`Exited` と再 launch で落とし、新しい世代の fd に差し替える。tty では master を捕捉の stdout 1 本として `LogCapture` へ渡し、`EIO` は EOF とみなす（CRI のログは stdout のタグだけになる）
+- 渡した master の複製を plugin-cri が読むと捕捉のデータを奪うので、書き込みと `TIOCSWINSZ` にだけ使う（契約）
+
+**D4. CRI から supervisor への運び方**
+
+- tty: cri の `bundle/spec.rs` が `process.terminal: true` を config.json に出す（OCI の標準の欄）
+- stdin・stdin_once: OCI の config.json に欄が無いので、cri が CreateContainer で値を記録（再採用用の永続記録を含む。[cri-record-readoption.md](cri-record-readoption.md)）に保存し、StartContainer で core の `StartRequest` に 3 値の enum（例: `StdinMode::{Closed, Open, Once}`）として載せる。`with_log_path` と同じ builder の形にする。plugin-cri の `supervised.rs` が supervisor の argv に `--stdin <open|once>` を付ける（plugin-cri 専用。`start_contract` の契約に足す）。plugin-cri は起動オプション文書（FCOPT1）を書かないので使わない
+- 依存の向きは plugin-cri から cri / supervisor / core、supervisor から core のままで、新しい辺も外部依存も増えない（PLUG-1）
+
+**D5. `stdin_once`**
+
+- 非 tty で `stdin_once` のとき、最初に stdin を要求した attach へ複製ではなく元の書き込み端を渡し、supervisor は自分の端を閉じる（所有の移転）。セッションの stdin が終端になると plugin-cri が drop し、コンテナは EOF を受ける。その後の stdin の要求は `StdinClosed` で断る
+- tty の `stdin_once` は閉じない。containerd の `container_io.go` の `Attach` は `StdinOnce && !Tty` のときだけ stdin を閉じ、コードの上のコメントは tty も閉じると読めるが挙動はコードに従っているため、本設計もコードに従う
+- `stdin_once` でないときは毎回複製を渡し、supervisor が自分の端を持ち続けるのでセッションが終わってもコンテナは EOF を受けない。再 launch で世代が変わると新しい pipe を作り、消費済みの状態も初期化する
+
+**D6. resize・終了・複数の attach**
+
+- resize: plugin-cri が持つ master の複製へ core の安全なラッパー（#3758）で `TIOCSWINSZ` を発行する。supervisor との往復は無い。初期の寸法は既定値のままで、kubelet の最初の resize で決まる
+- 終了: tap の EOF と既存の kind 8 の `ExitWatch` から `exited` を作る。ポーリングはしない
+- 複数の attach: 同時に attach してよい（containerd と同じ）。stdin は各セッションの複製から並行して書かれ、混ざりうる。出力は各セッションが自分の tap を持つ
+
+**D7. RPC 時の整合検査（cri）**
+
+- stdin を開いていないコンテナへの stdin の要求、およびコンテナの tty の実体と要求の tty が違う場合は `FAILED_PRECONDITION`（固定の英語文）で断る（fail-closed）。containerd は stdin を黙って無視するので差がある
+
+**D8. 拒否を外す順序（fail-closed の段階）**
+
+- `bundle/spec.rs` の `unsupported("tty/stdin")` を外すのは最後の実装 issue（C10）だけにする。それまでの途中の状態では拒否を残し、要求より弱い挙動のコンテナ（stdin が `/dev/null`、端末が無い）を作らせない。core の `process.terminal` の拒否は D3 の opt-in で段階的に外す。shim v2 の terminal の拒否（`task_service.rs`）は本件の範囲外でそのまま残す
+
+**D9. SEC-1 と OWASP の観点**
+
+- 受け取った fd を plugin-cri 側で検証する: stdin の端は FIFO か socket、tap は socket、master は devpts の ptmx の文字デバイス。ディレクトリの fd は拒否する（`ChildStdio::from_fds` と同じ理由）。本数・`MSG_CTRUNC`・マスクとの不一致はすべて拒否し、受け取った fd は drop で閉じる
+- 信頼境界は既存のまま（同じ uid・0600 のソケット・`SO_PEERCRED` の照合）。master の複製で増えるのは PID 1 の入力を注入する能力で、exec と同じ範囲に収まる。rootful は対象外
+- コンテナへ渡るのは pipe の読み取り側と slave だけ。書き込み端・master・tap の fd は close-on-exec で `close_inherited_fds` の対象とし、fd 漏れ（CVE-2024-21626 型）の対策を維持する
+- 新しい `unsafe` は各 crate の `sys` の事前承認の範囲に限り、`sys` の外には作らない。トークン・コンテナ ID・入出力の内容はログやエラーに出さない
+- 無制限確保をしない（payload は固定長、購読者数に上限、tap は溢れたら切断）。kind 9 の往復は 5 秒（REPAIR-5）。セッションの期限は既存の attach のものを使う
+
+**D10. オーナー確認事項（決定扱いにしない）**
+
+1. D7 の containerd との差（黙って無視せず断る）
+2. tap の購読者の上限の値
+3. tty の `stdin_once` で閉じないこと（containerd のコードとコメントの食い違い）
+4. tty の CRI ログで LF の無い出力が遅れて出ること（CRI ログの部分行 `P` は範囲外）
+
+**範囲外**: CLI の `create -i -t`（CLI-1）、shim v2 の terminal、CRI ログの部分行 `P`。追跡の issue が要るかは C11 の時点で判断する。
+
+**子 issue（いずれも #3765 の sub-issue、2h 以下）**
+
+| 子 | issue | 内容 | 依存 |
+| -- | ----- | ---- | ---- |
+| C1 | #4069 | core: init の stdin パイプ | なし |
+| C2 | #4070 | core: init の pty と master の返却 | #3758 |
+| C3 | #4071 | core: slave を `/dev/console` へ bind | C2 |
+| C4 | #4074 | supervisor: stdin 端・master の保持、tty 捕捉、`--stdin` | C1・C2 |
+| C5 | #4072 | supervisor: 捕捉からの出力の tap | なし |
+| C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答 | C4・C5・#3759 |
+| C7 | #4073 | core: `StartRequest` の `StdinMode` | なし |
+| C8 | #4076 | cri: 記録への保存と StartContainer での運搬 | C7・C4 |
+| C9 | #4077 | plugin-cri: 完全版 `AttachBackend` | C6・C8・#3763・#3754・#3761 |
+| C10 | #4078 | cri: 拒否の解除と整合検査 | C3・C9 |
+| C11 | #4079 | 実機前提試験・手順・CI の追記 | C10 |
 
 ### PortForward（NET-3・SEC-1）
 
@@ -271,6 +355,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | ストリームの作成 | 30 秒 |
 | idle | 4 時間 |
 | attach の `backend_timeout` | 10 秒 |
+| kind 9 の attach の fd の受け渡し（往復） | 5 秒 |
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
 | `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
@@ -291,7 +376,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | #3762 | 実機前提試験 | — |
 | #3763 | plugin-cri の読み取り専用 attach | supervisor の reader の取り消しの口を含む |
 | #3764 | docs の更新 | — |
-| #3765 | 完全版 attach（A1 を本命として設計と分解） | — |
+| #3765 | 完全版 attach（A1 を本命として設計と分解） | 設計済み。子 issue は「完全版 Attach の設計（#3765）」を参照 |
 | #3766 | POD の port-forward の設計と分解 | — |
 
 ### 未確認・オーナー確認事項

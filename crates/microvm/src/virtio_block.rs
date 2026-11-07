@@ -9,7 +9,7 @@
 //! `KVM_RUN` の MMIO exit を振り分ける側（TASK-74.4.2）が `QueueNotify(0)` を受けたら
 //! `device_mut().process_queue(&mem)` を呼び、[`BlockQueueStats::completed`] が 1 以上なら
 //! `raise_interrupt(InterruptReason::UsedBuffer)` を呼ぶ（実配送は `crate::interrupt::complete_block_notify`。TASK-74.2.3）。
-//! `QueueStopped(0)` では [`VirtioBlock::stop_queue`] を呼ぶ。リングの破損は `process_queue` が `Err` で返し、
+//! `QueueStopped(0)` の停止はトランスポートが `VirtioDevice::queue_stopped` から [`VirtioBlock::stop_queue`] を呼んで済ませる（#4031）。リングの破損は `process_queue` が `Err` で返し、
 //! `Err` でも途中までの要求は used へ書かれ `used.idx` が進んでいることがある。その内訳は
 //! [`VirtioBlock::stats_before_error`] で取り、`completed` が 1 以上なら `Err` でも `UsedBuffer` を上げる。
 //! 壊れたチェーンは `last_avail` を進めないため、以後の呼び出しも同じ `Err` になる（呼び出し元が停止・リセットする）。
@@ -206,7 +206,7 @@ impl<B: BlockBackend> VirtioBlock<B> {
         self.aborted
     }
 
-    /// requestq の処理を止める（トランスポートの `QueueStopped(0)` で呼ぶ）。
+    /// requestq の処理を止める（トランスポートが `VirtioDevice::queue_stopped` から呼ぶ）。
     pub fn stop_queue(&mut self) {
         self.queue_cfg = None;
         self.queue = None;
@@ -535,6 +535,13 @@ impl<B: BlockBackend> VirtioDevice for VirtioBlock<B> {
                 MicrovmErrorCode::FailedPrecondition,
                 "block request queue is not ready",
             )),
+        }
+    }
+
+    /// キューは 1 本（index 0）だけ。トランスポートは範囲外を渡さないが、来ても無視する（#4031）。
+    fn queue_stopped(&mut self, index: u16) {
+        if index == 0 {
+            self.stop_queue();
         }
     }
 

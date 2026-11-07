@@ -627,6 +627,7 @@ mod tests {
         ) -> Result<(), MicrovmError> {
             Ok(())
         }
+        fn queue_stopped(&mut self, _: u16) {}
         fn reset(&mut self) {}
     }
 

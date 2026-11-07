@@ -14,6 +14,7 @@ use fandhe_container_microvm::virtio_mmio::{
 struct Probe {
     activated: Option<(FeatureBits, Vec<QueueConfig>)>,
     resets: u32,
+    stopped: Vec<u16>,
 }
 
 impl VirtioDevice for Probe {
@@ -33,6 +34,9 @@ impl VirtioDevice for Probe {
     fn activate(&mut self, f: FeatureBits, q: &[QueueConfig]) -> Result<(), MicrovmError> {
         self.activated = Some((f, q.to_vec()));
         Ok(())
+    }
+    fn queue_stopped(&mut self, index: u16) {
+        self.stopped.push(index);
     }
     fn reset(&mut self) {
         self.resets += 1;
@@ -118,6 +122,8 @@ fn mvm1_877_activate_notify_stop_reset() {
         wr(&mut t, reg::QUEUE_READY, 0),
         MmioWriteOutcome::QueueStopped(0)
     );
+    // デバイスの停止はトランスポートが済ませる（#4031）。
+    assert_eq!(t.device().stopped, vec![0u16]);
 
     assert_eq!(wr(&mut t, reg::STATUS, 0), MmioWriteOutcome::DeviceReset);
     assert_eq!(t.device().resets, 1);
@@ -161,6 +167,7 @@ fn mvm1_877_new_rejects_bad_queue_count() {
         fn activate(&mut self, _: FeatureBits, _: &[QueueConfig]) -> Result<(), MicrovmError> {
             Ok(())
         }
+        fn queue_stopped(&mut self, _: u16) {}
         fn reset(&mut self) {}
     }
     let e = VirtioMmioTransport::new(NoQueue).unwrap_err();

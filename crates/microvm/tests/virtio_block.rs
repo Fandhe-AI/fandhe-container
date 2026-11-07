@@ -128,8 +128,10 @@ fn mvm1_878_block_queue_write_then_read() {
         wr(&mut t, reg::QUEUE_READY, 0),
         MmioWriteOutcome::QueueStopped(0)
     );
-    t.device_mut().stop_queue();
-    assert!(t.device_mut().process_queue(&mut mem).is_err());
+    // 手動の stop_queue は呼ばない。トランスポートの queue_stopped でデバイスが止まる（#4031・MVM-5）。
+    let e = t.device_mut().process_queue(&mut mem).unwrap_err();
+    assert_eq!(e.code(), MicrovmErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "block queue is not active");
 }
 /// 割り込みを数える偽の割り込み線。
 struct CountLine {

@@ -77,8 +77,7 @@
 //!
 //! # 範囲外（REPAIR-3。担当 issue）
 //! - virtio-block の QueueNotify の処理は #4028 で結線済み（`HvfDeviceBus::queue_notify_routes`。失敗は VM を止める）。virtio-net の
-//!   route は #4029、`QueueStopped` の `stop_queue` への接続は #4031、期限切れ後の最後の `Arc` での RAM の回収は #4032、
-//!   全体の追跡は #3908。
+//!   route は #4029、期限切れ後の最後の `Arc` での RAM の回収は #4032、全体の追跡は #3908。
 //!   実カーネルでの block-read（edge と LevelHigh の割り込みの配送）は `tests/hvf_kernel_boot.rs`（#4014）で、ACK の後処理の結果は
 //!   [`HvfMicroVm::interrupt_ack_counts`] で読む。
 //! - PSCI は #3794、WFI / vtimer は #3796 で実装済み。SMP は AP のスレッドと `MPIDR_EL1`・N 台の停止の集約まで #3884 で実装済みで、

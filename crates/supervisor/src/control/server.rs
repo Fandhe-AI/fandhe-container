@@ -17,6 +17,10 @@
 //!   認証境界の拒否（別 uid・資格情報の取得失敗）は [`ControlObserver`] 経由で SEC-4 の `AuditSink` にも記録する。
 //! - 各要求の成功・失敗とレイテンシは [`ControlObserver`] が集計して構造化ログに出す（REPAIR-4）。
 //!
+//! ExitWatchRequest（kind 8。終了の購読。SUP-1・CRI-1・REPAIR-5・#3683）が成功した接続も例外で、接続の複製を
+//! [`super::target::SignalSlot`] が預かり（スレッドを増やさない）、コンテナの終了・世代交代・保持期限で閉じる
+//! （= 購読者の起床）。期限切れと相手が閉じた購読は accept ループが周回ごとに整理する。
+//!
 //! ExecHandoverRequest が成功した接続だけは例外で、`exec_guard` のガードスレッドが閉じずに預かり（accept ループは先へ進む）、
 //! 2 つ目の要求（ExecCgroupNotify）と切断を監視する。ガードの数と待ちには上限がある（SUP-6・REPAIR-5・#2626）。
 //!
@@ -39,10 +43,27 @@ use super::log_control_event;
 use super::observe::ControlObserver;
 use super::protocol::{
     CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason,
-    EXEC_HANDOVER_PAYLOAD_LEN, ExecHandoverRequestFrame, FrameHeader, HEADER_LEN, RequestHeader,
-    ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
+    EXEC_HANDOVER_PAYLOAD_LEN, EXIT_WATCH_PAYLOAD_LEN, ExecHandoverRequestFrame,
+    ExitWatchRequestFrame, FrameHeader, HEADER_LEN, RequestHeader, ResponseFrame,
+    SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
 };
-use super::target::{SignalSlot, wait_reply};
+use super::target::{ExitWatchHandle, SignalSlot, wait_reply};
+
+/// 終了購読の接続を、整理（[`SignalSlot::prune_exit_watchers`]）が non-blocking の 1 バイト読み取りで調べられる形にする。
+/// 購読者は Ack の後に何も送らない規約なので、読めたバイトは規約違反（落とす）、EOF は相手の切断、`WouldBlock` は生存。
+impl ExitWatchHandle for UnixStream {
+    fn is_dead(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        loop {
+            return match self.read(&mut byte) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => true,
+            };
+        }
+    }
+}
 
 /// サーバの期限類。本番の既定は [`Default`]。試験は短い値へ差し替える。
 #[derive(Debug, Clone, Copy)]
@@ -155,42 +176,67 @@ pub fn serve_connection_with_guards(
         return;
     }
     let started = Instant::now();
-    let reason = handle_request(stream, slot, config, guards);
-    observer.record_request(reason == ControlReason::Ok, started.elapsed());
+    let (reason, exit_watch) = handle_request(stream, slot, config, guards);
+    if exit_watch {
+        observer.record_exit_watch(reason == ControlReason::Ok, started.elapsed());
+    } else {
+        observer.record_request(reason == ControlReason::Ok, started.elapsed());
+    }
 }
 
-/// 検証済みの接続の 1 要求を処理し、最終的な理由を返す（`Ok` が成功。応答を書けなかった場合も処理結果を返す）。
+/// 検証済みの接続の 1 要求を処理し、最終的な理由と「終了の購読か」を返す
+/// （`Ok` が成功。応答を書けなかった場合も処理結果を返す。購読かどうかは計測の操作名を分けるため）。
 fn handle_request(
     mut stream: UnixStream,
     slot: &SignalSlot,
     config: &ServeConfig,
     guards: Option<&Arc<ExecGuardPool>>,
-) -> ControlReason {
+) -> (ControlReason, bool) {
     if stream
         .set_write_timeout(Some(config.write_timeout))
         .is_err()
     {
-        return ControlReason::Internal;
+        return (ControlReason::Internal, false);
     }
     if stream.write_all(&encode_hello()).is_err() {
-        return ControlReason::Internal;
+        return (ControlReason::Internal, false);
     }
     let read_deadline = Instant::now() + config.read_deadline;
 
     let mut header = [0u8; HEADER_LEN];
     if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
-        return respond(&mut stream, ControlReason::Malformed);
+        return (respond(&mut stream, ControlReason::Malformed), false);
     }
     let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_any_request) {
         Ok(RequestHeader::Signal(kind)) => kind,
         Ok(RequestHeader::CancelRestart) => {
-            return handle_cancel_restart(stream, slot, read_deadline);
+            return (handle_cancel_restart(stream, slot, read_deadline), false);
         }
         Ok(RequestHeader::ExecHandover) => {
-            return handle_exec_handover(stream, slot, read_deadline, guards);
+            return (
+                handle_exec_handover(stream, slot, read_deadline, guards),
+                false,
+            );
         }
-        Err(reason) => return respond(&mut stream, reason),
+        Ok(RequestHeader::ExitWatch) => {
+            return (handle_exit_watch(stream, slot, read_deadline), true);
+        }
+        Err(reason) => return (respond(&mut stream, reason), false),
     };
+    (
+        handle_signal(stream, slot, config, read_deadline, kind),
+        false,
+    )
+}
+
+/// SignalRequest・StopRequest の payload を読んで、監視スレッドへ送信を依頼し、結果を返す。
+fn handle_signal(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    config: &ServeConfig,
+    read_deadline: Instant,
+    kind: super::protocol::RequestKind,
+) -> ControlReason {
     let mut payload = [0u8; SIGNAL_REQUEST_PAYLOAD_LEN];
     if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
         return respond(&mut stream, ControlReason::Malformed);
@@ -208,6 +254,36 @@ fn handle_request(
         Ok(rx) => wait_reply(&rx, deadline, config.reply_grace),
         Err(reason) => reason,
     };
+    respond(&mut stream, reason)
+}
+
+/// ExitWatchRequest（kind 8）の payload を読んで、接続の複製を `slot` に預けてから `Response(Ok)` を返す
+/// （SUP-1・CRI-1・REPAIR-5・#3683）。
+///
+/// 預けるのを応答より先にする: 書き込みの前に終了が観測されても、預けた複製は `mark_exited` で閉じられ、購読者は
+/// Ok の後に EOF を受けて起床する（取りこぼさない）。接続は non-blocking にする（複製と元は同じファイル記述を共有し、
+/// 整理の 1 バイト読み取りが待たないため。9 バイトの応答は空の送信バッファへ書くので詰まらない）。
+/// 拒否では複製を drop し、元の接続で理由コードだけを返す。ロックの下では I/O をしない（`watch_exit` は判定と保管だけ）。
+fn handle_exit_watch(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+) -> ControlReason {
+    let mut payload = [0u8; EXIT_WATCH_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match ExitWatchRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    if stream.set_nonblocking(true).is_err() {
+        return respond(&mut stream, ControlReason::Internal);
+    }
+    let Ok(held) = stream.try_clone() else {
+        return respond(&mut stream, ControlReason::Internal);
+    };
+    let reason = slot.watch_exit(request.pid, Box::new(held), request.hold());
     respond(&mut stream, reason)
 }
 
@@ -641,11 +717,14 @@ fn accept_loop(
                 );
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 接続が無い周回で、期限切れ・相手が閉じた終了購読を整理する（#3683・REPAIR-5）。
+                slot.prune_exit_watchers(Instant::now());
                 std::thread::sleep(config.poll_interval);
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => {
                 // 一時的な失敗（EMFILE 等）で全力ループしない。
+                slot.prune_exit_watchers(Instant::now());
                 std::thread::sleep(config.poll_interval);
             }
         }

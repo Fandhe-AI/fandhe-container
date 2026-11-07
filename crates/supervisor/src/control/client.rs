@@ -80,6 +80,40 @@ impl PendingRestartCanceller for ControlRestartCanceller {
     }
 }
 
+/// supervisor の制御チャネルへコンテナの終了を購読する [`super::ExitNotifier`]（plugin-cri の `wait_exit` 用。
+/// SUP-1・CRI-1・REPAIR-5・#3683）。非 Linux は常に `NoSupervisor`（制御チャネルが無いので照会へ退避させる）。
+#[derive(Debug, Clone)]
+pub struct ControlExitWatcher {
+    state_root: PathBuf,
+}
+
+impl ControlExitWatcher {
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+}
+
+impl super::ExitNotifier for ControlExitWatcher {
+    fn watch(
+        &self,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        until: Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> super::ExitWatchOutcome {
+        #[cfg(target_os = "linux")]
+        {
+            linux::exit_watch(&self.state_root, id, pid, until, cancel)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (&self.state_root, id, pid, until, cancel);
+            super::ExitWatchOutcome::NoSupervisor
+        }
+    }
+}
+
 /// supervisor の制御チャネルから、稼働中コンテナの起動時 pidfd の複製を受け取る [`super::ExecPidfdSource`]
 /// （CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ（pidfd と `SCM_RIGHTS` は Linux の機能）。
 #[cfg(target_os = "linux")]
@@ -178,13 +212,15 @@ mod linux {
     use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
     use super::CancelOutcome;
+    use crate::control::ExitWatchOutcome;
     use crate::control::listener::{
         CONTROL_SOCKET_NAME, effective_uid, open_state_dir, path_via_fd,
     };
     use crate::control::protocol::{
         CancelRestartRequestFrame, ControlReason, ExecCgroupNotifyFrame, ExecHandoverRequestFrame,
-        FrameHeader, HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_SIGNAL_BUDGET, RESPONSE_LEN,
-        RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
+        ExitWatchRequestFrame, FrameHeader, HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS,
+        MAX_EXIT_WATCH_HOLD, MAX_SIGNAL_BUDGET, RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind,
+        ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
     use crate::control::{ExecCreatedNotifier, ExecHandover};
@@ -305,7 +341,17 @@ mod linux {
     }
 
     fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
-        let retry_until = deadline.min(Instant::now() + CONNECT_RETRY_WINDOW);
+        connect_with_retry_window(path, deadline, CONNECT_RETRY_WINDOW)
+    }
+
+    /// [`connect_until`] の再試行窓を引数にした版。終了の購読は窓を 0 にする（状態が `Running` と分かっていて、
+    /// 再試行の待ちがそのまま起床の遅れになるため。#3683）。
+    fn connect_with_retry_window(
+        path: &Path,
+        deadline: Instant,
+        retry_window: Duration,
+    ) -> Result<UnixStream, TraitError> {
+        let retry_until = deadline.min(Instant::now() + retry_window);
         loop {
             let interval = match crate::sys::connect_unix_nonblocking(path) {
                 Ok(s) => return Ok(s),
@@ -528,6 +574,162 @@ mod linux {
                 ErrorCode::Internal,
                 "the supervisor control channel returned an unexpected descriptor set",
             )),
+        }
+    }
+
+    /// 終了購読の取り消し・期限を見る読み取りの刻み（core の既定の `wait_exit` の `CANCEL_SLICE` と同じ粒度）。
+    const WATCH_SLICE: Duration = Duration::from_millis(10);
+    /// 終了購読のハンドシェイク（接続・Hello・要求・Ack）の上限。サーバの `read_deadline`（1 秒）に合わせる。
+    const WATCH_HANDSHAKE_BUDGET: Duration = Duration::from_secs(1);
+
+    /// 刻みつきの読み取りの失敗。
+    enum SliceError {
+        Cancelled,
+        TimedOut,
+        /// 相手が閉じた。
+        Eof,
+        Io,
+    }
+
+    /// `buf` を `deadline` まで読み切る。10ms 刻みで `cancel` と期限を確かめる（作業スレッドを使わない。REPAIR-5）。
+    fn read_exact_sliced(
+        stream: &mut UnixStream,
+        buf: &mut [u8],
+        deadline: Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), SliceError> {
+        use std::io::Read as _;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            if cancel() {
+                return Err(SliceError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SliceError::TimedOut);
+            }
+            stream
+                .set_read_timeout(Some(remaining.min(WATCH_SLICE)))
+                .map_err(|_| SliceError::Io)?;
+            let Some(rest) = buf.get_mut(filled..) else {
+                return Err(SliceError::Io);
+            };
+            match stream.read(rest) {
+                Ok(0) => return Err(SliceError::Eof),
+                Ok(n) => filled = filled.saturating_add(n),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return Err(SliceError::Io),
+            }
+        }
+        Ok(())
+    }
+
+    /// コンテナの終了を購読する（SUP-1・CRI-1・REPAIR-5・#3683）。結果の意味は [`ExitWatchOutcome`]。
+    ///
+    /// 手順: 状態ディレクトリの検証 → 再試行窓 0 の接続 → `SO_PEERCRED` の照合（合わない相手は信用せず `NoSupervisor`）→
+    /// Hello → ExitWatchRequest（保持期限は `until` までの残りを 60 秒で頭打ち）→ Response。`Ok` の後は 1 バイト読めるか
+    /// 切断されるまで（= 起床）、または `until` まで待つ。
+    pub(super) fn exit_watch(
+        state_root: &Path,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        until: Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> ExitWatchOutcome {
+        use ExitWatchOutcome::{Cancelled, Expired, NoSupervisor, PidChanged, Transient, Woken};
+        if cancel() {
+            return Cancelled;
+        }
+        let now = Instant::now();
+        let remaining = until.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return Expired;
+        }
+        let handshake_deadline = until.min(now + WATCH_HANDSHAKE_BUDGET);
+        let Ok(euid) = effective_uid() else {
+            return NoSupervisor;
+        };
+        let Ok(dir) = open_state_dir(state_root, id, euid) else {
+            return NoSupervisor;
+        };
+        let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
+        let mut stream = match connect_with_retry_window(&path, handshake_deadline, Duration::ZERO)
+        {
+            Ok(s) => s,
+            Err(e) if e.code() == ErrorCode::Timeout => return Transient,
+            Err(_) => return NoSupervisor,
+        };
+        match crate::sys::peer_credentials(stream.as_fd()) {
+            Ok(cred) if peer_allowed(cred.uid, euid) => {}
+            _ => return NoSupervisor,
+        }
+        let to_outcome = |e: SliceError| match e {
+            SliceError::Cancelled => Cancelled,
+            SliceError::TimedOut | SliceError::Eof | SliceError::Io => Transient,
+        };
+
+        let mut head = [0u8; HEADER_LEN];
+        if let Err(e) = read_exact_sliced(&mut stream, &mut head, handshake_deadline, cancel) {
+            return to_outcome(e);
+        }
+        if FrameHeader::decode(&head)
+            .and_then(FrameHeader::expect_hello)
+            .is_err()
+        {
+            return NoSupervisor;
+        }
+
+        let hold = remaining
+            .min(MAX_EXIT_WATCH_HOLD)
+            .max(Duration::from_millis(1));
+        let Ok(frame) = ExitWatchRequestFrame::new(pid, hold) else {
+            return Transient;
+        };
+        let write_limit = handshake_deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        if stream.set_write_timeout(Some(write_limit)).is_err()
+            || stream.write_all(&frame.encode()).is_err()
+        {
+            return Transient;
+        }
+
+        if let Err(e) = read_exact_sliced(&mut stream, &mut head, handshake_deadline, cancel) {
+            return to_outcome(e);
+        }
+        if FrameHeader::decode(&head)
+            .and_then(FrameHeader::expect_response)
+            .is_err()
+        {
+            return NoSupervisor;
+        }
+        let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
+        if let Err(e) = read_exact_sliced(&mut stream, &mut payload, handshake_deadline, cancel) {
+            return to_outcome(e);
+        }
+        match ResponseFrame::decode_payload(&payload).reason {
+            ControlReason::Ok => {}
+            ControlReason::ContainerExited => return Woken,
+            ControlReason::PidMismatch => return PidChanged,
+            ControlReason::NoHandle
+            | ControlReason::Malformed
+            | ControlReason::TooLarge
+            | ControlReason::UnsupportedVersion => return NoSupervisor,
+            _ => return Transient,
+        }
+
+        // 購読中: サーバは終了などで接続を閉じる。1 バイトでも切断でも起床（状態の読み直しの合図）。
+        let mut byte = [0u8; 1];
+        match read_exact_sliced(&mut stream, &mut byte, until, cancel) {
+            Ok(()) | Err(SliceError::Eof | SliceError::Io) => Woken,
+            Err(SliceError::TimedOut) => Expired,
+            Err(SliceError::Cancelled) => Cancelled,
         }
     }
 

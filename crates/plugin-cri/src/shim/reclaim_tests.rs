@@ -176,6 +176,13 @@ const FAST: ReclaimBudget = ReclaimBudget {
     remove: Duration::from_millis(300),
 };
 
+/// 注入なしの再実行用の予算。期限切れの挙動は初回の注入ケースで検証し、再実行は負荷で FAST（300ms）を超えて
+/// 間欠的に Timeout になるのを避けるため十分に長くする（#4252 の CI の間欠失敗。REPAIR-5・REPAIR-12）。
+const RERUN: ReclaimBudget = ReclaimBudget {
+    stop: Duration::from_secs(5),
+    remove: Duration::from_secs(5),
+};
+
 fn entry(base: &Path, inv: &ShimInvocation, id: &str) -> std::path::PathBuf {
     scoped_root_path(base, inv.namespace.as_ref(), inv.address.as_deref())
         .unwrap()
@@ -322,7 +329,7 @@ fn cri5_4152_stage_deadline_then_resume() {
             );
         }
 
-        let r2 = run(&inv, &base, None, None, &FAST);
+        let r2 = run(&inv, &base, None, None, &RERUN);
         assert_eq!(r2.calls, second, "row {i}");
         let out = r2.result.unwrap_or_else(|e| panic!("row {i}: {e:?}"));
         assert_eq!(out.is_some(), reclaimed, "row {i}");

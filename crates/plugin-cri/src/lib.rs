@@ -25,6 +25,8 @@
 pub mod adapter;
 #[cfg(target_os = "linux")]
 pub mod audit_relay;
+#[cfg(unix)]
+pub mod image_inventory;
 pub mod instance_lock;
 pub mod netsetup;
 #[cfg(unix)]

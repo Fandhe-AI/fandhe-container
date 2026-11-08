@@ -1,0 +1,529 @@
+//! CRI の在庫（`ImageService` の `ListImages`・`ImageStatus`・create のタグ解決の元）を、oci の `ImageStore` の
+//! root の下へ永続化する `ImageStore` 実装 [`PersistentImageStore`]（#4176・CRI-1・CRI-2・OCI-7・REPAIR-3）。
+//!
+//! 呼び出し元は [`crate::adapter`] の `production_image_store_in`（`CriPluginBackends::production` の組み立て）。
+//! 記録の形式（符号化と復号）は cri の `image_service::{encode,decode}_image_records` が持つ。
+//!
+//! # 方針
+//!
+//! - 保存先は pull と同じ root（`<state_root>/.cri/images`）直下の `@cri-image-records.json`。oci の在庫
+//!   （`@image-inventory.json`）から導出しないのは、`repo_digests` の top-level（multi-arch の index digest）と
+//!   タグ無し pull の repo 名が oci の在庫に残らないため（`docs/design/pull-inventory-wiring.md`）
+//! - 書き込みと起動時の読み込みは oci の `ImageStore::lock()` の排他区間の中で行う（root の再検査とプロセス間の
+//!   排他を oci と共有する）。`list` / `get` はメモリ上の表示だけを読み、I/O をしない
+//! - `upsert` は排他区間の中でファイルを読み直し、cri の `InMemoryImageStore::upsert`（統合・タグの付け替え）で
+//!   組み直してから、一時ファイル → fsync → rename → ディレクトリの fsync で原子的に書く。成功した後だけメモリ表示を
+//!   差し替える（rename 前の失敗はメモリもファイルも元のまま。rename 後のディレクトリ fsync の失敗は永続側が
+//!   新しい内容なので、メモリ表示も新しい内容へ揃えたうえで `Io` を返す）
+//!
+//! # fail-closed
+//!
+//! - root の不信・排他の失敗・読み取りの I/O 失敗は [`PersistentImageStore::open`] が `Err` で返す（起動を止める）
+//! - 記録ファイルだけが壊れている（不正・矛盾・通常ファイルでない・symlink・所有者違い・group / other の書き込み権・
+//!   上限超過）ときは「使えない」状態で開き、`list`・`get`・`upsert` は `ImageStoreError::Corrupt` を返す。空の在庫と
+//!   して扱わず、壊れたファイルを上書きしない（RuntimeService を生かして既存コンテナの stop / remove を通すため）。
+//!   直すには記録を手で直して plugin を再起動する
+//! - エラー文言にパス・OS の文字列・イメージ名を含めない
+//!
+//! # 残余（REPAIR-3）
+//!
+//! - 記録ファイルの読み書きはパス起点（oci の `RootHandle` は公開されない）。`lock()` が root を再検査し、root と
+//!   祖先は所有者専用という前提で守る。読み取りは fstat の dev / ino を lstat と照合して差し替えを検出する
+//! - `upsert` は `CriImageService::pull` の await の後に実行器のスレッドで同期的に呼ばれ、oci のロック待ち
+//!   （既定 5 秒）と fsync の間ほかの RPC を止めうる。plugin は `@instance.lock` で 1 インスタンスに限られ、競合は
+//!   同じプロセスの pull の publish 中の短い時間だけなので許容する（blocking worker へ移すかは #4178）
+//! - oci の在庫との突き合わせ（manifest が消えた記録を落とす）・`RemoveImage` は #4177。PullImage の取り消しの窓で
+//!   メモリと永続側が食い違う場合は、次の `upsert` か再起動で永続側に揃う（#4178）
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use fandhe_container_cri::error::CriError;
+use fandhe_container_cri::image_service::{
+    ImageRecord, ImageStore, ImageStoreError, InMemoryImageStore, MAX_IMAGE_RECORDS_FILE_BYTES,
+    decode_image_records, encode_image_records,
+};
+use fandhe_container_oci::image_management::ImageStore as OciImageStore;
+use fandhe_container_oci::instrument::OciOpRecorder;
+
+/// 記録ファイル名（oci の `blobs/`・`staging/` の走査と `STALE_TMP_PREFIXES` に当たらないよう `@` で始める）。
+pub const CRI_IMAGE_RECORDS_FILE_NAME: &str = "@cri-image-records.json";
+/// 書き込み途中の一時ファイルの接頭辞（残骸は `open` の排他区間で回収する）。
+const TMP_PREFIX: &str = "@cri-image-records.json.tmp-";
+/// 残骸の回収で走査する root 直下のエントリ数の上限。
+const SWEEP_MAX_ENTRIES: usize = 100_000;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// メモリ上の表示。壊れた記録で開いたときは `Unusable`。
+enum View {
+    Ready(Arc<InMemoryImageStore>),
+    Unusable,
+}
+
+/// oci の `ImageStore` の root の下へ CRI の在庫記録を永続化する `ImageStore`（モジュール doc 参照）。
+pub struct PersistentImageStore {
+    oci: OciImageStore,
+    view: Mutex<View>,
+}
+
+impl std::fmt::Debug for PersistentImageStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentImageStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistentImageStore {
+    /// `images_root`（oci の `ImageStore::open` の root と同じ位置）を開き、記録をメモリへ読み込む。
+    pub fn open(images_root: &Path) -> Result<Self, CriError> {
+        Self::open_inner(images_root, None)
+    }
+
+    /// [`Self::open`] に、oci の排他取得の計装の記録先を足した形。
+    pub fn open_with_recorder(
+        images_root: &Path,
+        recorder: Arc<dyn OciOpRecorder>,
+    ) -> Result<Self, CriError> {
+        Self::open_inner(images_root, Some(recorder))
+    }
+
+    fn open_inner(
+        images_root: &Path,
+        recorder: Option<Arc<dyn OciOpRecorder>>,
+    ) -> Result<Self, CriError> {
+        let fail = || CriError::failed_precondition("failed to open the image store");
+        let mut oci = OciImageStore::open(images_root).map_err(|_| fail())?;
+        if let Some(recorder) = recorder {
+            oci = oci.with_recorder(recorder);
+        }
+        let view = {
+            let _guard = oci.lock().map_err(|_| fail())?;
+            sweep_leftover_tmp(oci.root()).map_err(|_| fail())?;
+            match read_records(oci.root()) {
+                Ok(records) => View::Ready(Arc::new(build_memory(records).map_err(|_| fail())?)),
+                Err(ImageStoreError::Corrupt) => View::Unusable,
+                Err(_) => return Err(fail()),
+            }
+        };
+        Ok(Self {
+            oci,
+            view: Mutex::new(view),
+        })
+    }
+
+    fn ready(&self) -> Result<Arc<InMemoryImageStore>, ImageStoreError> {
+        match &*self.view.lock().map_err(|_| ImageStoreError::Poisoned)? {
+            View::Ready(mem) => Ok(Arc::clone(mem)),
+            View::Unusable => Err(ImageStoreError::Corrupt),
+        }
+    }
+}
+
+impl ImageStore for PersistentImageStore {
+    fn list(&self) -> Result<Vec<ImageRecord>, ImageStoreError> {
+        self.ready()?.list()
+    }
+
+    fn get(&self, reference: &str) -> Result<Option<ImageRecord>, ImageStoreError> {
+        self.ready()?.get(reference)
+    }
+
+    fn upsert(&self, record: ImageRecord) -> Result<(), ImageStoreError> {
+        self.upsert_with(record, sync_dir)
+    }
+}
+
+/// 公開（rename）後のディレクトリの fsync。
+fn sync_dir(root: &Path) -> std::io::Result<()> {
+    File::open(root)?.sync_all()
+}
+
+impl PersistentImageStore {
+    /// [`ImageStore::upsert`] の本体。公開後のディレクトリ fsync を差し替えられる（失敗注入の試験用）。
+    fn upsert_with(
+        &self,
+        record: ImageRecord,
+        sync: fn(&Path) -> std::io::Result<()>,
+    ) -> Result<(), ImageStoreError> {
+        // 壊れた状態で開いたストアは書かない（壊れたファイルを上書きしない）。
+        self.ready()?;
+        // 排他区間の中で永続側を読み直して統合し、書けたときだけメモリ表示を差し替える。
+        let _guard = self.oci.lock().map_err(|_| ImageStoreError::Io)?;
+        let mem = build_memory(read_records(self.oci.root())?)?;
+        mem.upsert(record)?;
+        let bytes = encode_image_records(&mem.list()?)?;
+        let written = write_atomically(self.oci.root(), &bytes, sync);
+        match written {
+            Ok(()) => {}
+            // rename 前の失敗は永続側が元のまま。メモリも元のまま失敗を返す。
+            Err(WriteFailure {
+                error,
+                published: false,
+            }) => return Err(error),
+            // rename 後（公開後）の失敗は永続側が新しい内容になっている。古い対応を使い続けないよう、
+            // メモリ表示を新しい内容へ揃えてから失敗を返す（再起動後の見え方と一致させる）。
+            Err(WriteFailure {
+                error,
+                published: true,
+            }) => {
+                *self.view.lock().map_err(|_| ImageStoreError::Poisoned)? =
+                    View::Ready(Arc::new(mem));
+                return Err(error);
+            }
+        }
+        *self.view.lock().map_err(|_| ImageStoreError::Poisoned)? = View::Ready(Arc::new(mem));
+        Ok(())
+    }
+}
+
+fn build_memory(records: Vec<ImageRecord>) -> Result<InMemoryImageStore, ImageStoreError> {
+    let mem = InMemoryImageStore::new();
+    for record in records {
+        mem.insert(record)?;
+    }
+    Ok(mem)
+}
+
+/// root 直下の記録ファイルを検査して読む。無ければ空。検査に反すれば `Corrupt`。
+fn read_records(root: &Path) -> Result<Vec<ImageRecord>, ImageStoreError> {
+    let path = root.join(CRI_IMAGE_RECORDS_FILE_NAME);
+    let lmeta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ImageStoreError::Io),
+    };
+    let owner = std::fs::symlink_metadata(root)
+        .map_err(|_| ImageStoreError::Io)?
+        .uid();
+    let max = MAX_IMAGE_RECORDS_FILE_BYTES as u64;
+    if !lmeta.file_type().is_file()
+        || lmeta.uid() != owner
+        || lmeta.permissions().mode() & 0o022 != 0
+        || lmeta.len() > max
+    {
+        return Err(ImageStoreError::Corrupt);
+    }
+    let file = File::open(&path).map_err(|_| ImageStoreError::Io)?;
+    let fmeta = file.metadata().map_err(|_| ImageStoreError::Io)?;
+    if (fmeta.dev(), fmeta.ino()) != (lmeta.dev(), lmeta.ino()) {
+        return Err(ImageStoreError::Corrupt);
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ImageStoreError::Io)?;
+    decode_image_records(&bytes)
+}
+
+/// 一時ファイル → fsync → rename → ディレクトリの fsync。失敗したら一時ファイルを消す（最善努力）。
+///
+/// 失敗時は rename の前後を `published` で区別する（rename 後は永続側が新しい内容になっている）。
+fn write_atomically(
+    root: &Path,
+    bytes: &[u8],
+    sync: fn(&Path) -> std::io::Result<()>,
+) -> Result<(), WriteFailure> {
+    let tmp: PathBuf = root.join(format!(
+        "{TMP_PREFIX}{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut published = false;
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, root.join(CRI_IMAGE_RECORDS_FILE_NAME))?;
+        published = true;
+        sync(root)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|_| WriteFailure {
+        error: ImageStoreError::Io,
+        published,
+    })
+}
+
+/// [`write_atomically`] の失敗。`published` は rename が成功した後の失敗かどうか。
+struct WriteFailure {
+    error: ImageStoreError,
+    published: bool,
+}
+
+/// 前回の書き込み途中の残骸（自前の接頭辞の通常ファイル）を消す。排他区間の中で呼ぶ。
+fn sweep_leftover_tmp(root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)?.take(SWEEP_MAX_ENTRIES) {
+        let entry = entry?;
+        let is_tmp = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(TMP_PREFIX));
+        if is_tmp && entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! 往復・空・壊れた記録の fail-closed・oci との共存・読み直し（CRI-1・CRI-2・OCI-7）。
+
+    use std::os::unix::fs::symlink;
+
+    use fandhe_container_cri::image_pull::{ImagePuller, PullError, PullRequest, PulledImage};
+    use fandhe_container_cri::image_service::CriImageService;
+    use fandhe_container_cri::runtime::v1::{self, image_service_server::ImageService as _};
+    use tonic::{Code, Request};
+
+    use super::*;
+    use crate::test_root::{TestRoot, test_root};
+
+    struct FixedPuller(PulledImage);
+
+    impl ImagePuller for FixedPuller {
+        fn pull(&self, _request: &PullRequest) -> Result<PulledImage, PullError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn id_a() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    fn pulled_a() -> PulledImage {
+        PulledImage {
+            id: id_a(),
+            repo_tags: vec!["docker.io/library/busybox:1.36".to_owned()],
+            repo_digests: vec![
+                "docker.io/library/busybox@sha256:1111".to_owned(),
+                "docker.io/library/busybox@sha256:2222".to_owned(),
+            ],
+            size: 4096,
+        }
+    }
+
+    fn rec(id: &str, tag: &str) -> ImageRecord {
+        ImageRecord::new(id, vec![tag.to_owned()], vec![], 10).expect("record")
+    }
+
+    fn scratch(tag: &str) -> TestRoot {
+        test_root("fcpc-imginv", tag)
+    }
+
+    fn pull_request() -> Request<v1::PullImageRequest> {
+        Request::new(v1::PullImageRequest {
+            image: Some(v1::ImageSpec {
+                image: "docker.io/library/busybox:1.36".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn write_records_file(root: &Path, bytes: &[u8]) -> PathBuf {
+        let p = root.join(CRI_IMAGE_RECORDS_FILE_NAME);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+            .expect("create");
+        f.write_all(bytes).expect("write");
+        p
+    }
+
+    /// CRI-1・CRI-2・OCI-7: pull したイメージが、開き直した別の service の ListImages / ImageStatus に同じ値で出る。
+    #[tokio::test]
+    async fn cri1_cri2_pulled_image_survives_reopen() {
+        let dir = scratch("reopen");
+        let a = Arc::new(PersistentImageStore::open(&dir).expect("open a"));
+        let svc_a =
+            CriImageService::with_store(a.clone()).with_puller(Arc::new(FixedPuller(pulled_a())));
+        let resp = svc_a.pull_image(pull_request()).await.expect("pull");
+        assert_eq!(resp.into_inner().image_ref, id_a());
+        let before = svc_a
+            .list_images(Request::new(v1::ListImagesRequest::default()))
+            .await
+            .expect("list a")
+            .into_inner()
+            .images;
+        drop(svc_a);
+        drop(a);
+
+        let b = Arc::new(PersistentImageStore::open(&dir).expect("open b"));
+        let svc_b = CriImageService::with_store(b);
+        let after = svc_b
+            .list_images(Request::new(v1::ListImagesRequest::default()))
+            .await
+            .expect("list b")
+            .into_inner()
+            .images;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after, before);
+        assert_eq!(after[0].id, id_a());
+        assert_eq!(after[0].repo_tags, vec!["docker.io/library/busybox:1.36"]);
+        assert_eq!(
+            after[0].repo_digests,
+            vec![
+                "docker.io/library/busybox@sha256:1111".to_owned(),
+                "docker.io/library/busybox@sha256:2222".to_owned()
+            ]
+        );
+        assert_eq!(after[0].size, 4096);
+        let status = svc_b
+            .image_status(Request::new(v1::ImageStatusRequest {
+                image: Some(v1::ImageSpec {
+                    image: "docker.io/library/busybox:1.36".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("status")
+            .into_inner();
+        assert_eq!(status.image.expect("image").id, id_a());
+    }
+
+    /// CRI-2: 空の root は空の一覧。開いただけではファイルを作らず、最初の upsert 後は 0600 の通常ファイル。
+    #[test]
+    fn cri2_empty_root_lists_nothing() {
+        let dir = scratch("empty");
+        let store = PersistentImageStore::open(&dir).expect("open");
+        assert_eq!(store.list().expect("list"), vec![]);
+        let file = dir.join(CRI_IMAGE_RECORDS_FILE_NAME);
+        assert!(!file.exists());
+        store.upsert(rec("sha256:aaa", "t:1")).expect("upsert");
+        let m = std::fs::symlink_metadata(&file).expect("meta");
+        assert!(m.file_type().is_file());
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// OCI-7・CRI-2: 壊れた記録は空にせず Internal。上書きもしない。
+    #[tokio::test]
+    async fn cri2_oci7_corrupt_records_fail_closed() {
+        let dir = scratch("corrupt");
+        let file = write_records_file(&dir, b"{ not json");
+        let store = Arc::new(PersistentImageStore::open(&dir).expect("open"));
+        let svc = CriImageService::with_store(store.clone())
+            .with_puller(Arc::new(FixedPuller(pulled_a())));
+        let list = svc
+            .list_images(Request::new(v1::ListImagesRequest::default()))
+            .await
+            .expect_err("list");
+        assert_eq!(list.code(), Code::Internal);
+        assert_eq!(list.message(), "image store failure");
+        let status = svc
+            .image_status(Request::new(v1::ImageStatusRequest {
+                image: Some(v1::ImageSpec {
+                    image: "x".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("status");
+        assert_eq!(status.code(), Code::Internal);
+        let pull = svc.pull_image(pull_request()).await.expect_err("pull");
+        assert_eq!(pull.code(), Code::Internal);
+        assert_eq!(std::fs::read(file).expect("read"), b"{ not json");
+    }
+
+    /// OCI-7・SEC-1: symlink・group 書き込み可・ディレクトリの記録ファイルも Corrupt。
+    #[test]
+    fn cri2_oci7_unsafe_record_files_fail_closed() {
+        let dir = scratch("unsafe-link");
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, br#"{"version":1,"images":[]}"#).expect("target");
+        symlink(&target, dir.join(CRI_IMAGE_RECORDS_FILE_NAME)).expect("symlink");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        assert_eq!(s.list(), Err(ImageStoreError::Corrupt));
+
+        let dir = scratch("unsafe-mode");
+        let f = write_records_file(&dir, br#"{"version":1,"images":[]}"#);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o620)).expect("chmod");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        assert_eq!(s.list(), Err(ImageStoreError::Corrupt));
+        assert_eq!(
+            s.upsert(rec("sha256:a", "t:1")),
+            Err(ImageStoreError::Corrupt)
+        );
+
+        let dir = scratch("unsafe-dir");
+        std::fs::create_dir(dir.join(CRI_IMAGE_RECORDS_FILE_NAME)).expect("mkdir");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        assert_eq!(s.get("x"), Err(ImageStoreError::Corrupt));
+    }
+
+    /// OCI-7: oci の ImageStore と同じ root で共存する。自前の残骸は open が消し、oci は触れない。
+    #[test]
+    fn oci7_coexists_with_oci_store() {
+        let dir = scratch("coexist");
+        let seed = PersistentImageStore::open(&dir).expect("seed");
+        seed.upsert(rec("sha256:aaa", "t:1")).expect("upsert");
+        drop(seed);
+        let leftover = dir.join(format!("{TMP_PREFIX}1-1"));
+        std::fs::write(&leftover, b"x").expect("leftover");
+
+        let oci = OciImageStore::open(&dir).expect("oci open");
+        {
+            let _g = oci.lock().expect("oci lock");
+        }
+        oci.recover_stale_pulls().expect("recover");
+        assert!(leftover.exists(), "oci must not touch the cri leftovers");
+
+        let store = PersistentImageStore::open(&dir).expect("reopen");
+        assert!(!leftover.exists());
+        assert_eq!(store.list().expect("list").len(), 1);
+    }
+
+    /// CRI-2・OCI-7: rename 後のディレクトリ fsync が失敗しても、永続側は新しい内容になっているため、
+    /// メモリ表示も新しい対応へ揃い（古いタグの対応を使い続けない）、`Io` を返す。再起動後の見え方とも一致する。
+    #[test]
+    fn cri2_oci7_post_publish_sync_failure_resyncs_view() {
+        let dir = scratch("postpub");
+        let s = PersistentImageStore::open(&dir).expect("open");
+        s.upsert(rec("sha256:aaa", "t:1")).expect("first");
+        let r = s.upsert_with(rec("sha256:bbb", "t:1"), |_| {
+            Err(std::io::Error::other("injected"))
+        });
+        assert_eq!(r, Err(ImageStoreError::Io));
+        assert_eq!(s.get("t:1").expect("get").expect("rec").id(), "sha256:bbb");
+        drop(s);
+        let again = PersistentImageStore::open(&dir).expect("reopen");
+        assert_eq!(
+            again.get("t:1").expect("get").expect("rec").id(),
+            "sha256:bbb"
+        );
+    }
+
+    /// CRI-2: upsert は排他区間でファイルを読み直す。別の store の書き込みを落とさない。
+    #[test]
+    fn cri2_upsert_rereads_disk() {
+        let dir = scratch("reread");
+        let a = PersistentImageStore::open(&dir).expect("a");
+        let b = PersistentImageStore::open(&dir).expect("b");
+        a.upsert(rec("sha256:aaa", "t:a")).expect("a upsert");
+        b.upsert(rec("sha256:bbb", "t:b")).expect("b upsert");
+        let c = PersistentImageStore::open(&dir).expect("c");
+        let ids: Vec<String> = c
+            .list()
+            .expect("list")
+            .iter()
+            .map(|r| r.id().to_owned())
+            .collect();
+        assert_eq!(ids, vec!["sha256:aaa", "sha256:bbb"]);
+    }
+}

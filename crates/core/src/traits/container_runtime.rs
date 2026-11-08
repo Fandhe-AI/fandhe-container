@@ -77,6 +77,9 @@ pub trait ContainerRuntime: Send + Sync {
     /// コンテナの現在状態を照会する。
     ///
     /// 前提: 対象コンテナが存在すること。存在しなければ [`ErrorCode::NotFound`] を返す。
+    /// 実装はインスタンス識別子を [`ContainerStatus::with_instance`] で報告してよい（任意。CRI-5・SEC-1・#4220）。
+    /// 報告するなら、同じ ID の削除と再作成で必ず変わり、同じインスタンスの間は変わらない値にする。
+    ///
     /// 対応: CORE-2・ERR-2。
     fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError>;
 
@@ -786,6 +789,28 @@ pub struct ContainerStatus {
     exit_code: Option<i32>,
     termination: Option<TerminationReason>,
     exited_at: Option<ExitTime>,
+    instance: Option<ContainerInstance>,
+}
+
+/// コンテナのインスタンス識別子（同じ ID の削除と再作成で変わる不透明な値。CRI-5・SEC-1・CORE-1・#4220）。
+///
+/// 状態ストアが create で割り当てた revision（再利用されない。`StateStore::create` の契約）が由来で、
+/// [`ContainerRuntime::state`] の実装が [`ContainerStatus::with_instance`] で報告する。shim v2 の exec 登録簿が、
+/// shim の外で同じ ID で作り直されたコンテナに旧い登録を適用しないための照合に使う。等値の比較にだけ使い、
+/// 大小の意味は持たない（採番方式を変えても呼び出し側が壊れないように）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContainerInstance(u64);
+
+impl ContainerInstance {
+    /// 生の値から作る。
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// 生の値を返す（不透明な識別子。等値比較にだけ使う）。
+    pub fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// コンテナの終了を検知した時刻（UNIX epoch からのナノ秒。CRI-5・OCI-5・SUP-1・#3682）。
@@ -864,7 +889,21 @@ impl ContainerStatus {
             exit_code,
             termination: None,
             exited_at: None,
+            instance: None,
         }
+    }
+
+    /// インスタンス識別子を付ける（[`ContainerRuntime::state`] の実装が報告する。#4220）。
+    #[must_use]
+    pub fn with_instance(mut self, instance: ContainerInstance) -> Self {
+        self.instance = Some(instance);
+        self
+    }
+
+    /// インスタンス識別子を外す（状態記録の中の status には持たせない。ストアが別欄で持つ）。
+    pub(crate) fn without_instance(mut self) -> Self {
+        self.instance = None;
+        self
     }
 
     /// 作成処理中の状態を作る（`pid`・`exit_code` は持たない）。
@@ -960,6 +999,12 @@ impl ContainerStatus {
     /// 終了検知時刻（未記録なら `None`。`Stopped` 以外は常に `None`）を返す。
     pub fn exited_at(&self) -> Option<ExitTime> {
         self.exited_at
+    }
+
+    /// インスタンス識別子を返す。`None` は「報告しない実装・記録の無い旧い状態」で、同一性を判定できない。
+    /// 報告される場合は、同じ ID の削除と再作成で必ず変わり、同じインスタンスの間は変わらない（#4220）。
+    pub fn instance(&self) -> Option<ContainerInstance> {
+        self.instance
     }
 }
 
@@ -1118,6 +1163,15 @@ mod tests {
         let err = KillRequest::all_processes(id, Signal::SIGTERM).expect_err("sigterm");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(err.message(), "kill all supports only SIGKILL");
+    }
+
+    /// CRI-5・SEC-1・CORE-1（#4220）: インスタンス識別子は既定で `None`、`with_instance` で付く。
+    #[test]
+    fn core1_4220_status_instance_builder() {
+        let id = ContainerId::new("c1").expect("id");
+        assert_eq!(ContainerStatus::running(id.clone(), None).instance(), None);
+        let st = ContainerStatus::running(id, None).with_instance(ContainerInstance::from_raw(7));
+        assert_eq!(st.instance().map(ContainerInstance::value), Some(7));
     }
 
     /// CRI-2・SUP-4（#2671）: `ContainerLogPath` の受理と拒否。

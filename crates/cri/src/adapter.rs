@@ -102,6 +102,9 @@ pub struct RuntimeContainerStatus {
     /// 終了検知時刻（UNIX epoch からのナノ秒。Stopped で core が記録していたときだけ。未記録は `None`で、
     /// 値を捏造しない。CRI-5・OCI-5・SUP-1・#3682）。
     pub exited_at_nanos: Option<i64>,
+    /// インスタンス識別子（同じ ID の削除と再作成で変わる不透明な値。実行層が報告したときだけ。`None` は
+    /// 同一性を判定できない。shim v2 の exec 登録簿の照合に使う。CRI-5・SEC-1・CORE-1・#4220）。
+    pub instance: Option<u64>,
 }
 
 impl From<&ContainerStatus> for RuntimeContainerStatus {
@@ -138,6 +141,7 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
                 .termination_reason()
                 .and_then(RuntimeTerminationReason::from_core),
             exited_at_nanos: s.exited_at().map(|t| t.as_unix_nanos()),
+            instance: s.instance().map(|i| i.value()),
         }
     }
 }
@@ -718,6 +722,16 @@ mod tests {
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).unwrap()
+    }
+
+    /// CRI-5・SEC-1・CORE-1（#4220）: インスタンス識別子を写し、報告が無ければ `None`。
+    #[test]
+    fn core1_4220_instance_is_mapped() {
+        use fandhe_container_core::traits::ContainerInstance;
+        let st = ContainerStatus::running(cid("a"), None);
+        assert_eq!(RuntimeContainerStatus::from(&st).instance, None);
+        let st = st.with_instance(ContainerInstance::from_raw(9));
+        assert_eq!(RuntimeContainerStatus::from(&st).instance, Some(9));
     }
 
     /// CRI-2: core の状態を CRI の状態へ具体値で写す。

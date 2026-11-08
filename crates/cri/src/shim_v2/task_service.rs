@@ -68,8 +68,16 @@
 //!   1 つずつ照会し、`NOT_FOUND` のものを除去してから 1 回だけやり直す（コンテナ単位の上限では掃除しない。
 //!   照会は登録のあるコンテナ数以下で、全体上限を埋められる呼び出し元は peer UID 照合済み〔PLUG-12・#803〕のため
 //!   レート制限は設けない）。v2 と v3 は [`TaskService::with_shared_created`] で登録簿を共有する。
-//! - 残余: shim の外で削除され、さらに外で同じ ID が作り直されると、`ContainerStatus` にインスタンスの同一性が
-//!   無いため旧登録は上記のどれでも消えない（core がインスタンス識別子を出す必要がある。後続 issue で追跡）。
+//! - T5 インスタンスの照合（#4220・CRI-5・SEC-1・CORE-1）: shim の外で削除され、さらに外で同じ ID で作り直されると
+//!   `state` は `NOT_FOUND` を返さず T1〜T4 に当たらない。そこで登録時のインスタンス識別子
+//!   （[`RuntimeContainerStatus::instance`]）を持たせ、Exec・Start(exec_id)・T4 の掃除で、ゲート保持中に `state` が返した
+//!   値と照合して違う登録を除去する。Start(exec_id) は除去後に `begin_start` が `NOT_FOUND`（"exec not found"。T1 と
+//!   同じ結果）を返し、起動役を呼ばない。Exec は旧い登録を除いてから登録するため、同じ exec_id の再登録・
+//!   コンテナ単位の上限も回復する。`None` 同士は判定できないので残す（片側だけ `None` は除去する）。
+//!   exec_id つきの State / Kill / Wait / Delete は照合しない（adapter を呼ばない不変条件を保つ）ため、作り直された後の
+//!   未起動の exec は次の Exec・Start(exec_id)・T4 で除去されるまで見えたままになるが、起動はされない。
+//! - 残余: 識別子を報告しない実行層の実装と、識別子の記録が無い旧い状態のコンテナは T5 で保護されない。状態ルートを
+//!   消して作り直すと revision の採番が初めからになるが、shim の寿命の中では現実には起きない。
 //!
 //! 未起動（Created）の exec の Wait は、コンテナが停止しても期限まで待つ（#4058・CRI-1。早期には返さない）。
 //! 理由: (1) runc shim と同じ挙動（containerd v2.1.4 の `process/exec.go` の `Wait` は `waitBlock` を待ち、
@@ -440,8 +448,12 @@ impl TaskService {
             let Ok(Some(_gate)) = self.execs.try_lock_container(c) else {
                 continue;
             };
-            if let Err(e) = self.adapter.state(c.as_str()) {
-                self.purge_if_not_found(c, &e);
+            match self.adapter.state(c.as_str()) {
+                Err(e) => self.purge_if_not_found(c, &e),
+                // 外で作り直されたコンテナの旧い登録も除去する（T5。#4220）。
+                Ok(st) => {
+                    let _ = self.execs.purge_mismatched(c, st.instance);
+                }
             }
         }
     }
@@ -477,7 +489,14 @@ impl TaskService {
                     "container is not running",
                 )));
             }
-            match self.execs.register(&container, &exec_id, spec.clone()) {
+            // 外で作り直されたコンテナの旧い登録を除いてから登録する（T5。#4220）。
+            self.execs
+                .purge_mismatched(&container, status.instance)
+                .map_err(|e| to_status(&e))?;
+            match self
+                .execs
+                .register(&container, &exec_id, spec.clone(), status.instance)
+            {
                 Ok(()) => return Ok(Vec::new()),
                 // 全体上限のときだけ、外で消えたコンテナの登録を掃除して 1 回だけやり直す。
                 // コンテナ単位の上限では掃除しても空きは生まれない。
@@ -522,6 +541,11 @@ impl TaskService {
                 "container is not running",
             )));
         }
+        // 外で作り直されたコンテナの旧い登録を除去する。除去された登録は `begin_start` が `NOT_FOUND` にし、
+        // 旧い spec は起動しない（T5。#4220・SEC-1）。
+        self.execs
+            .purge_mismatched(&container, status.instance)
+            .map_err(|e| to_status(&e))?;
         let ticket = self
             .execs
             .begin_start(&container, &exec_id)
@@ -1144,9 +1168,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use fandhe_container_core::traits::{
-        ContainerId as RtId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
-        DeleteRequest as RtDelete, DeleteResponse as RtDeleteResponse, ErrorCode, KillRequest,
-        StartRequest as RtStart, StateRequest, StopRequest, TraitError,
+        ContainerId as RtId, ContainerInstance, ContainerRuntime, ContainerState, ContainerStatus,
+        CreateRequest, DeleteRequest as RtDelete, DeleteResponse as RtDeleteResponse, ErrorCode,
+        KillRequest, StartRequest as RtStart, StateRequest, StopRequest, TraitError,
     };
 
     use super::super::exec::{ExecProcessSpec, PROCESS_TYPE_URL, TaskExecProcess};
@@ -1170,6 +1194,8 @@ mod tests {
         kill_all_err: bool,
         /// state が UNAVAILABLE を返す ID（一時的な不達の注入。#4058）。
         fail_state: Mutex<std::collections::HashSet<String>>,
+        /// state が報告するインスタンス識別子（ID ごと。無ければ報告しない。#4220）。
+        instances: Mutex<HashMap<String, u64>>,
     }
 
     struct Shared(Arc<Fake>);
@@ -1268,14 +1294,19 @@ mod tests {
             if let Some(p) = self.0.preset.lock().unwrap().get(&id) {
                 return Ok(p.clone());
             }
-            match self.0.states.lock().unwrap().get(&id) {
+            let instance = self.0.instances.lock().unwrap().get(&id).copied();
+            let status = match self.0.states.lock().unwrap().get(&id) {
                 None => Err(TraitError::new(ErrorCode::NotFound, "none")),
                 Some(ContainerState::Running) => Ok(ContainerStatus::running(
                     r.id().clone(),
                     NonZeroU32::new(4242),
                 )),
                 Some(_) => Ok(ContainerStatus::created(r.id().clone(), None)),
-            }
+            };
+            status.map(|st| match instance {
+                Some(i) => st.with_instance(ContainerInstance::from_raw(i)),
+                None => st,
+            })
         }
     }
 
@@ -3290,6 +3321,99 @@ mod tests {
                 "{live}"
             );
         }
+    }
+
+    /// 外で消して同じ ID で作り直した状態を作る（shim の Delete / Create は通さず、識別子だけが変わる。#4220）。
+    fn recreate_externally(f: &Fake, id: &str, instance: u64) {
+        f.instances.lock().unwrap().insert(id.into(), instance);
+    }
+
+    fn set_instance(f: &Fake, id: &str, instance: u64) {
+        recreate_externally(f, id, instance);
+    }
+
+    const SPEC_NEW: &str = r#"{"cwd":"/","args":["/bin/true"],"env":["N=1"]}"#;
+
+    /// #4220・CRI-5・SEC-1（T5）: 外で作り直されたコンテナでは旧い exec 登録を起動せず `NOT_FOUND` で失敗し、
+    /// 登録は除去されて同じ exec_id を新しい spec で再登録・起動できる（V2 / V3）。
+    #[test]
+    fn cri5_4220_recreated_outside_start_exec_is_not_found_and_not_launched() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let (s, f, l) = svc_exec(v);
+            running_container(&s, "c1");
+            set_instance(&f, "c1", 1);
+            s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+            recreate_externally(&f, "c1", 2);
+            let (code, msg) = err_code(s.handle("Start", &start_exec_req("c1", "e0")));
+            assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"));
+            assert!(l.launched.lock().unwrap().is_empty());
+            s.handle("Exec", &exec_req("c1", "e0", SPEC_NEW)).unwrap();
+            s.handle("Start", &start_exec_req("c1", "e0")).unwrap();
+            let launched = l.launched.lock().unwrap();
+            assert_eq!(launched.len(), 1);
+            assert_eq!(launched[0].2.args(), ["/bin/true"]);
+            assert_eq!(launched[0].2.env(), ["N=1"]);
+        }
+    }
+
+    /// #4220: Exec は旧い登録を除いてから登録するので、コンテナ単位の上限も同じ exec_id の再登録も回復する。
+    #[test]
+    fn cri5_4220_recreated_outside_exec_recovers_per_container_cap() {
+        let (s, f, _) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        set_instance(&f, "c1", 1);
+        for i in 0..super::super::exec::MAX_EXECS_PER_CONTAINER {
+            s.handle("Exec", &exec_req("c1", &format!("e{i}"), SPEC))
+                .unwrap();
+        }
+        recreate_externally(&f, "c1", 2);
+        s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+        s.handle("Exec", &exec_req("c1", "fresh", SPEC)).unwrap();
+        // 旧い登録は 1 件も残らない（e1 は除去済み）。
+        assert_eq!(exec_state_code(&s, "c1", "e1").0, NOT_FOUND);
+    }
+
+    /// #4220: 識別子が変わらなければ（状態の照会が挟まっても）従来どおり起動される。
+    #[test]
+    fn cri5_4220_same_instance_across_state_queries_still_launches() {
+        let (s, f, l) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        set_instance(&f, "c1", 7);
+        s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+        s.handle("State", &state_exec_req("c1", "")).unwrap();
+        s.handle("Start", &start_exec_req("c1", "e0")).unwrap();
+        assert_eq!(l.launched.lock().unwrap().len(), 1);
+    }
+
+    /// #4220（fail-closed）: 登録時に識別子があり、現在は報告が無ければ起動しない。
+    #[test]
+    fn cri5_4220_instance_lost_is_not_launched() {
+        let (s, f, l) = svc_exec(TaskApiVersion::V2);
+        running_container(&s, "c1");
+        set_instance(&f, "c1", 1);
+        s.handle("Exec", &exec_req("c1", "e0", SPEC)).unwrap();
+        f.instances.lock().unwrap().remove("c1");
+        let (code, msg) = err_code(s.handle("Start", &start_exec_req("c1", "e0")));
+        assert_eq!((code, msg.as_str()), (NOT_FOUND, "exec not found"));
+        assert!(l.launched.lock().unwrap().is_empty());
+    }
+
+    /// #4220（T4 + T5）: 全体上限の掃除は、外で作り直された別コンテナの旧い登録も除去して空きを作る。
+    #[test]
+    fn cri5_4220_reclaim_purges_recreated_instance() {
+        let (s, f, _) = svc_exec(TaskApiVersion::V2);
+        for c in 0..16 {
+            set_instance(&f, &format!("c{c}"), 1);
+        }
+        fill_total(&s);
+        recreate_externally(&f, "c3", 2);
+        running_container(&s, "c16");
+        s.handle("Exec", &exec_req("c16", "e0", SPEC)).unwrap();
+        assert_eq!(exec_state_code(&s, "c3", "e0").0, NOT_FOUND);
+        assert_eq!(
+            state_exec_of(&s, "c0", "e0").status,
+            TaskStatus::Created as i32
+        );
     }
 
     /// REPAIR-5: 消えたコンテナが無ければ上限は弱めず RESOURCE_EXHAUSTED で、既存の登録は残る。

@@ -36,8 +36,7 @@
 //!   サーバーの停止・接続の切断・応答の書き込み失敗は処理中のハンドラへ通知され、Wait は期限前に取り消される。
 //!   停止で取り消された Wait の `UNAVAILABLE`（14）は、生きている接続へ 1 刻み分だけ書き込みを試して届ける
 //! - Create の rootfs mount・stdio・terminal・`options`・checkpoint。黙って捨てず `UNIMPLEMENTED`
-//! - Exec の本番の起動役（supervisor の exec 入口への橋渡しと配線は未実装で追跡 issue は #4053。cri は supervisor に依存せず `ContainerRuntime` に exec も無い）、
-//!   exec の stdio・terminal（#677）。起動役が無い `TaskService` は `Exec`・`Start(exec_id)` と、`exec_id` つきの `State`・`Kill`・`Wait`・`Delete` を `UNIMPLEMENTED` で拒否する（起動後の照会・停止・待機・除去は #3681 で実装済み）
+//! - exec の stdio・terminal（#677）。Exec の本番の起動役は plugin-cri の `ShimExecLauncher`（Linux のみ。#4148）が持ち、shim バイナリが配線する（#4149。cri は supervisor に依存せず `ContainerRuntime` に exec も無い）。起動役が無い `TaskService` は `Exec`・`Start(exec_id)` と、`exec_id` つきの `State`・`Kill`・`Wait`・`Delete` を `UNIMPLEMENTED` で拒否する（起動後の照会・停止・待機・除去は #3681 で実装済み）
 //! - peer UID の照合は `server::ServerConfig::allowed_peer_uids`（SO_PEERCRED / getpeereid。PLUG-12・#872）、UDS の置き場所と権限は [`bootstrap`] が扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata` は復号するだけで使わない
 //! - Windows（named pipe）。listener と転送は unix のみ。ヘッダと封筒の型は全 OS で使える

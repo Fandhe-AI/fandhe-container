@@ -104,6 +104,9 @@ impl Generation {
     }
 }
 
+/// core の delete を始めてよい内側期限の下限。これ未満なら delete を始めず `DEADLINE_EXCEEDED` にする（record は残る）。
+pub(crate) const MIN_CLEANUP: Duration = Duration::from_millis(1);
+
 /// 段ごとの予算。合計が [`SHIM_DELETE_DEADLINE`] 以下であること（試験で照合する）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReclaimBudget {
@@ -128,10 +131,12 @@ impl ReclaimBudget {
     }
 
     /// 実際の残り `limit`（remove 段の待ち）に収まる内側の後始末期限。通常は `cleanup()`、残りが小さければ残りの 2/3
-    /// （内側が `Kept` の応答を組み立てる余裕を残す）。0 になる場合も外側より先に切れる最小値（1ms 以上）にする。
+    /// （内側が `Kept` の応答を組み立てる余裕を残す）。下限は置かず、外側の `limit` を超えない。残りが
+    /// [`MIN_CLEANUP`] に満たない（返り値がそれ未満）ときは、呼び出し側が core の delete を始めない（始めると外側が先に切れ、
+    /// record が drop されて cgroup・ログが `AlreadyReclaimed` で回収できなくなる。REPAIR-5・CRI-5）。
     pub(crate) fn cleanup_within(&self, limit: Duration) -> Duration {
         let scaled = limit.saturating_mul(2) / 3;
-        self.cleanup().min(scaled).max(Duration::from_millis(1))
+        self.cleanup().min(scaled)
     }
 
     /// 段の予算の合計（試験が [`SHIM_DELETE_DEADLINE`] に収まることを照合する）。
@@ -393,6 +398,12 @@ pub(crate) fn reclaim_recorded(
     // 内側（core の delete・ログの待ち）の期限は、この段の実際の残りから余裕を引いた値にする。固定の `cleanup()` が残りを
     // 超えると外側が先に切れ、記録だけ消えてログが残る（次回 AlreadyReclaimed。REPAIR-5・CRI-5）。
     let inner = budget.cleanup_within(limit);
+    if inner < MIN_CLEANUP {
+        // 残りが小さすぎて内側が外側より先に終われない。始めずに記録を残し、次回の delete に回収を委ねる。
+        return Err(CriError::timeout(
+            "shim delete deadline exhausted before remove".to_string(),
+        ));
+    }
     run_stage(limit, "remove", move || {
         match rt.delete(&DeleteRequest::new(id), &generation, inner) {
             Ok(_) => Ok(()),

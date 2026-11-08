@@ -634,5 +634,13 @@ fn repair5_4152_cleanup_within_fits_remaining_limit() {
         Duration::from_millis(400)
     );
     assert!(b.cleanup_within(Duration::from_millis(30)) < Duration::from_millis(30));
+    // 残りが 1ms 未満なら内側も 1ms 未満（下限で外側を超えない）。core の delete は始めない。
+    for micros in [0u64, 1, 500, 1000, 1499] {
+        let limit = Duration::from_micros(micros);
+        assert!(b.cleanup_within(limit) <= limit);
+        if micros < 1500 {
+            assert!(b.cleanup_within(limit) < super::reclaim::MIN_CLEANUP);
+        }
+    }
     assert!(b.cleanup_within(Duration::from_millis(900)) <= Duration::from_millis(600));
 }

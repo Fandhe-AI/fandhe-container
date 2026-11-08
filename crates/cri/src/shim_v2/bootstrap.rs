@@ -46,7 +46,8 @@
 //! - デーモンの寿命は Shutdown RPC（[`ShutdownSignal`]。TASK-62.7.2・#873）と socket の `(dev, ino, mtime)` の生存確認（1 秒間隔。
 //!   delete 経路用）の併用。Shutdown で抜けたときは応答を流し切る有界な猶予（`SHUTDOWN_RESPONSE_GRACE`）の後にサーバーを止め、
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
-//! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684 の追跡先を参照）
+//! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684・#4152）。
+//!   入口の `-id`・`-bundle` の検証と状態ルートの記録の照合は、注入口 [`run_with_hooks`] の前段で plugin-cri が行う（#4151。副作用なし）
 //! - stdin の options・`-publish-binary` のイベント publish・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
 
@@ -413,11 +414,30 @@ where
     run_with_context(inv, move |ctx| make_registry(ctx.shutdown().clone()))
 }
 
-/// [`run`] の、注入口が [`ServeContext`] を受ける版（#3684）。
-#[cfg(unix)]
+/// [`run`] の、注入口が [`ServeContext`] を受ける版（#3684）。delete の前段は持たない（常に通す）。
 pub fn run_with_context<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
+{
+    run_with_hooks(inv, make_registry, |_| Ok(()))
+}
+
+/// [`run_with_context`] に、delete action の前段 `before_delete` を足した版（CRI-5・TASK-62.6・#4151）。
+///
+/// `before_delete` は `delete` のときだけ、socket・lock に触れる前（`run_delete` の前）に 1 回呼ばれる。
+/// `Err` なら実行層の後始末にも socket の掃除にも進まず、そのエラーを返す（`ops.log` の `ShimV2Delete` には失敗として残る。REPAIR-4）。
+/// plugin-cri が `-id`・`-bundle` の検証と状態ルートの記録の照合を差し込む（cri から plugin-cri への依存は
+/// `tests/dependency_direction.rs` が禁じるため、注入口にした。PLUG-1）。戻り値を `()` にとどめるのは、停止・回収（#4152）が
+/// 照合結果を受け取る形を必要とした時点で、その PR が広げるため。`start`・`serve` では呼ばれない。
+#[cfg(unix)]
+pub fn run_with_hooks<F, D>(
+    inv: ShimInvocation,
+    make_registry: F,
+    before_delete: D,
+) -> Result<Vec<u8>, CriError>
+where
+    F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -428,7 +448,7 @@ where
         }
         ShimAction::Delete => {
             let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
-            unix_impl::delete_recorded(&inv, &dir)
+            unix_impl::delete_recorded(&inv, &dir, before_delete)
         }
         ShimAction::Serve => {
             let dir = resolve_socket_dir(std::env::var_os(SOCKET_DIR_ENV))?;
@@ -437,11 +457,16 @@ where
     }
 }
 
-/// unix 以外では未実装（REPAIR-3）。
+/// unix 以外では未実装（REPAIR-3）。前段は呼ばない（`Version` 以外は `UNIMPLEMENTED`）。
 #[cfg(not(unix))]
-pub fn run_with_context<F>(inv: ShimInvocation, _make_registry: F) -> Result<Vec<u8>, CriError>
+pub fn run_with_hooks<F, D>(
+    inv: ShimInvocation,
+    _make_registry: F,
+    _before_delete: D,
+) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -460,9 +485,18 @@ pub fn run_cli_with_context<F>(make_registry: F) -> std::process::ExitCode
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
+    run_cli_with_hooks(make_registry, |_| Ok(()))
+}
+
+/// [`run_cli_with_context`] に delete の前段（[`run_with_hooks`]）を足した版（CRI-5・TASK-62.6・#4151）。
+pub fn run_cli_with_hooks<F, D>(make_registry: F, before_delete: D) -> std::process::ExitCode
+where
+    F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+{
     use std::io::Write;
     let result = parse_args(std::env::args_os().skip(1))
-        .and_then(|inv| run_with_context(inv, make_registry));
+        .and_then(|inv| run_with_hooks(inv, make_registry, before_delete));
     match result {
         Ok(bytes) => {
             let mut out = std::io::stdout();
@@ -933,9 +967,19 @@ mod unix_impl {
     }
 
     /// `delete` を計測つきで実行する。
-    pub fn delete_recorded(inv: &ShimInvocation, dir: &Path) -> Result<Vec<u8>, CriError> {
+    ///
+    /// `before_delete`（plugin-cri の引数検証と記録の照合。#4151）が `Err` なら `run_delete` に進まず、socket にも触れない。
+    /// 拒否も計測区間に含め、`ops.log` へ失敗として残す。
+    pub fn delete_recorded<D>(
+        inv: &ShimInvocation,
+        dir: &Path,
+        before_delete: D,
+    ) -> Result<Vec<u8>, CriError>
+    where
+        D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+    {
         let started = Instant::now();
-        let r = run_delete(inv, dir);
+        let r = before_delete(inv).and_then(|()| run_delete(inv, dir));
         record(dir, CriOpKind::ShimV2Delete, &r, started);
         r
     }
@@ -2055,5 +2099,50 @@ mod tests {
         let e = unix_impl::check_ancestors_with(&t.0.join("f").join("sock"), true, |u| u == 0)
             .unwrap_err();
         assert!(e.message().contains("not a directory"), "{}", e.message());
+    }
+
+    /// CRI-5・TASK-62.6・REPAIR-4・#4151: delete の前段が `Err` なら socket に触れず `run_delete` に進まず、
+    /// そのエラーを返し、`ops.log` に失敗として残る。`Ok` なら従来どおり socket を掃除して応答を返す。
+    #[cfg(unix)]
+    #[test]
+    fn cri5_4151_before_delete_error_skips_run_delete() {
+        use std::os::unix::net::UnixListener;
+        let t = Tmp::new("bd");
+        let dir = t.0.join("s");
+        unix_impl::prepare_socket_dir(&dir).unwrap();
+        let inv = parse_args(args(&[
+            "-namespace",
+            "default",
+            "-address",
+            "/run/c.sock",
+            "-id",
+            "abc",
+            "-bundle",
+            "/tmp/x/abc",
+            "delete",
+        ]))
+        .unwrap();
+        let sock = unix_impl::socket_path(&dir, &inv).unwrap();
+        // bind 後に listener を閉じて、接続を拒む残骸の socket を作る。
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+
+        let e = unix_impl::delete_recorded(&inv, &dir, |_| {
+            Err(CriError::invalid_argument("rejected by the front stage"))
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "rejected by the front stage");
+        assert!(
+            sock.exists(),
+            "socket must stay when the front stage rejects"
+        );
+        let log = std::fs::read_to_string(dir.join("ops.log")).unwrap();
+        assert!(log.contains("cri.shim_v2.delete"), "{log}");
+
+        let ok = unix_impl::delete_recorded(&inv, &dir, |_| Ok(())).unwrap();
+        // 応答は終了時刻を含むため、先頭の exit_status(137) だけを具体値で照合する。
+        assert_eq!(ok.get(..3), Some(&[0x10, 0x89, 0x01][..]));
+        assert!(!sock.exists(), "socket is removed on the normal path");
     }
 }

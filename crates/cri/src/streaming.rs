@@ -66,6 +66,13 @@ const MAX_PATH_BYTES: usize = 256;
 const MAX_TOKEN_RETRIES: usize = 3;
 /// 1 接続の読み取りバッファの上限（バイト。hyper の下限は 8192）。
 const MAX_HEADER_BUF_BYTES: usize = 16 * 1024;
+/// attach の `stdin` 要求に対し、作成時に stdin を開いていないコンテナを断る固定文（#4078 の D7。
+/// supervisor の kind 9 の `StdinNotOpen` と同じ文言。コンテナ ID・要求の中身は含めない）。
+pub const MSG_ATTACH_STDIN_NOT_OPEN: &str = "the container was not created with stdin open";
+
+/// attach の `tty` 要求がコンテナの端末構成と食い違うときの固定文（#4078 の D7。`TtyMismatch` と同じ文言）。
+pub const MSG_ATTACH_TTY_MISMATCH: &str = "the requested tty mode does not match the container";
+
 /// `token_ttl` の上限。kubelet のトークン TTL（1 分）より十分長い値で頭打ちにする。
 pub const MAX_TOKEN_TTL: Duration = Duration::from_secs(600);
 

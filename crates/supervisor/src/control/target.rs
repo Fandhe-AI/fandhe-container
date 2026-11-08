@@ -393,7 +393,7 @@ impl SignalSlot {
     /// 判定（`Active` で pid 一致・入出力の構成との照合）は [`ControlReason`] で断る。
     /// - 要求 `tty` が偽でコンテナが pty: `TtyMismatch`。真でコンテナに master が無い: stdin の端があれば
     ///   `TtyMismatch`、無ければ `NoHandle`（master の複製に失敗した tty のコンテナと `--stdin` の無い非 tty は
-    ///   区別できず、どちらも拒否する安全側。tty の正式な照合は cri の D7〔C10〕が担う）。
+    ///   区別できず、どちらも拒否する安全側。tty の RPC 時の照合は cri の `attach_impl`（D7。#4078）が担う）。
     /// - 非 tty で入力を求める: `--stdin` が無ければ `StdinNotOpen`、`Once` で消費済みなら `StdinClosed`、
     ///   端が無ければ `NoHandle`。
     ///

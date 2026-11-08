@@ -3741,14 +3741,20 @@ impl CriRuntimeService {
         Ok(v1::ExecResponse { url })
     }
 
-    /// `Attach` の本体（CRI-6・TASK-63.1・TASK-63.3）。running のコンテナだけに URL を発行する
-    /// （接続時にも backend が再確認する）。
+    /// `Attach` の本体（CRI-6・TASK-63.3・CRI-2・#4078 の D7）。running で、要求がコンテナの構成と
+    /// 整合するときだけ URL を発行する（fail-closed）。
+    ///
+    /// 照合は URL の発行前に行い、順序は 1. 未知 ID は `NOT_FOUND`、2. running でなければ
+    /// `FAILED_PRECONDITION`、3. `tty` の不一致（どちらの向きも）、4. 作成時に stdin を開いていないコンテナへの
+    /// stdin の要求、はどちらも `FAILED_PRECONDITION`（固定の英語文）。containerd は未開の stdin を黙って無視するが、
+    /// 本実装は断る（設計の既定。D10-1 はオーナー確認事項）。`stdin_once` の消費済み（`StdinClosed`）は
+    /// 接続時に backend が kind 9 で判断する。backend は接続時にも `StdinNotOpen`・`TtyMismatch` を再確認する。
     fn attach_impl(&self, req: v1::AttachRequest) -> Result<v1::AttachResponse, CriError> {
         let issuer = self.streaming_issuer(StreamKind::Attach, "attach")?;
         validate_attach_request(&req)?;
         // 読み取り専用の backend は stdin・tty を URL の発行前に断る（#3763・REPAIR-3）。
         issuer.require_attach_options(req.stdin, req.tty)?;
-        self.require_running_container(&req.container_id)?;
+        self.require_attachable_container(&req.container_id, req.stdin, req.tty)?;
         let url = issuer.issue(StreamRequest::Attach(req))?;
         Ok(v1::AttachResponse { url })
     }
@@ -3793,20 +3799,41 @@ impl CriRuntimeService {
         Ok(issuer)
     }
 
-    /// コンテナが存在し running であることを照合する（未知は `NOT_FOUND`、running 以外は `FAILED_PRECONDITION`）。
-    fn require_running_container(&self, container_id: &str) -> Result<(), CriError> {
-        let state = self
-            .registry
-            .lock()
-            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?
-            .containers
-            .get(container_id)
-            .map(|c| c.state);
-        match state {
-            None => Err(CriError::not_found("container not found")),
-            Some(ContainerState::Running) => Ok(()),
-            Some(_) => Err(CriError::failed_precondition("container is not running")),
+    /// attach の整合検査（#4078 の D7）。記録の状態・`tty`・`stdin` を 1 回のロックで読み、ロックは返す前に放す。
+    ///
+    /// stdin は `config.stdin` を直接見る（`start_stdin_mode` は tty では常に `Closed` を返し、supervisor は
+    /// tty のコンテナに master を渡すため、stdin なしの tty コンテナへの入力の注入を断てるのはここだけ）。
+    fn require_attachable_container(
+        &self,
+        container_id: &str,
+        want_stdin: bool,
+        want_tty: bool,
+    ) -> Result<(), CriError> {
+        let (state, tty, stdin) = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .containers
+                .get(container_id)
+                .ok_or_else(|| CriError::not_found("container not found"))?;
+            (record.state, record.config.tty, record.config.stdin)
+        };
+        if state != ContainerState::Running {
+            return Err(CriError::failed_precondition("container is not running"));
         }
+        if want_tty != tty {
+            return Err(CriError::failed_precondition(
+                crate::streaming::MSG_ATTACH_TTY_MISMATCH,
+            ));
+        }
+        if want_stdin && !stdin {
+            return Err(CriError::failed_precondition(
+                crate::streaming::MSG_ATTACH_STDIN_NOT_OPEN,
+            ));
+        }
+        Ok(())
     }
 
     /// コンテナの存在を照合する。レジストリのロックは返す前に放す（発行とロックを入れ子にしない）。

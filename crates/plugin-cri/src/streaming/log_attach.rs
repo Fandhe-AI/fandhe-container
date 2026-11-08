@@ -1,6 +1,6 @@
 //! plugin-cri の読み取り専用の `AttachBackend`（回転ログの follow。CRI-6・SUP-4・SUP-7・REPAIR-3・REPAIR-5・#3763）。
 //!
-//! 呼び出し元: `streaming::production_stream_dispatcher` が `AttachHandler::read_only` に包んで `with_attach` する。
+//! 呼び出し元: 非 Linux の本番で `streaming::production_stream_dispatcher` が `ProductionAttach::read_only` 経由で `AttachHandler::read_only` に包んで `with_attach` する（Linux の本番は完全版の `supervisor_attach`）。
 //! セッション（cri の `attach::run_session`）が接続時に [`LogFollowAttachBackend::attach`] を呼ぶ。
 //!
 //! 本番の結線は非 Linux のみ。Linux は `supervisor_attach`（捕捉の tap。#4077・D2）に置き換えた（本ファイルは非 Linux と既存の試験が使う）。
@@ -20,7 +20,7 @@
 //!   （200 ms）以内に抜ける。書き込みが詰まっていても 200 ms 刻みで旗を見る。
 //!
 //! # 未実装（REPAIR-3）
-//! stdin・tty は `INVALID_ARGUMENT`（RPC 時は `StreamWiring::attach_interactive` が false、接続時はここ）。完全版は #3765 の設計。
+//! stdin・tty は `INVALID_ARGUMENT`（RPC 時は `StreamWiring::attach_interactive` が false、接続時はここ）。Linux の完全版は `supervisor_attach`（#3765・#4078）。
 
 use std::cell::RefCell;
 use std::future::Future;

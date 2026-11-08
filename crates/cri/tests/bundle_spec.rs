@@ -94,6 +94,34 @@ fn cri2_core5_readonly_rootfs_maps_to_root_readonly() {
     assert!(cfg.unapplied_fields().is_empty());
 }
 
+/// CRI-2・CRI-6・#4078: tty=true は `process.terminal: true` に写り、core の parser が読み戻せる。
+#[test]
+fn cri2_cri6_4078_tty_maps_to_process_terminal() {
+    let mut c = ctr();
+    c.tty = true;
+    let v = build(&pod(), &c);
+    assert_eq!(v["process"]["terminal"], serde_json::json!(true));
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("build");
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+    assert!(cfg.process().is_some_and(|p| p.terminal()));
+    assert!(cfg.unapplied_fields().is_empty());
+}
+
+/// CRI-2・CRI-6・#4078: tty=false と stdin / stdin_once は config.json に何も出さず、既定の出力とバイト単位で同じ。
+#[test]
+fn cri2_cri6_4078_stdin_and_no_tty_keep_output_unchanged() {
+    let base = build_runtime_config(&pod(), &ctr(), &ImageDefaults::default()).expect("build");
+    let v: Value = serde_json::from_slice(base.as_bytes()).expect("json");
+    assert!(v["process"].get("terminal").is_none());
+    for (stdin, once) in [(true, false), (true, true), (false, true)] {
+        let mut c = ctr();
+        c.stdin = stdin;
+        c.stdin_once = once;
+        let b = build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("accepted");
+        assert_eq!(b, base, "stdin={stdin} stdin_once={once}");
+    }
+}
+
 /// readonly_rootfs=false・security context なしは従来の出力のまま（readonly キーなし）。
 #[test]
 fn cri2_readonly_rootfs_false_keeps_output_unchanged() {
@@ -1221,9 +1249,6 @@ fn rejection_table_is_unimplemented() {
         f(&mut p, &mut c);
         cases.push((name, p, c));
     };
-    add("tty", &|_, c| c.tty = true);
-    add("stdin", &|_, c| c.stdin = true);
-    add("stdin_once", &|_, c| c.stdin_once = true);
     add("devices", &|_, c| {
         c.devices = vec![fandhe_container_cri::runtime::v1::Device::default()];
     });
@@ -1407,7 +1432,12 @@ fn validate_config_does_not_require_a_command() {
     let mut c = ctr();
     c.command.clear();
     validate_config(&pod(), &c).expect("image may supply the command");
+    // tty・stdin・stdin_once は受理する（#4078。tty は process.terminal、stdin 系は記録と StartContainer が運ぶ）。
     c.tty = true;
+    c.stdin = true;
+    c.stdin_once = true;
+    validate_config(&pod(), &c).expect("tty and stdin are accepted");
+    c.devices = vec![fandhe_container_cri::runtime::v1::Device::default()];
     assert_eq!(
         validate_config(&pod(), &c).unwrap_err().code(),
         CriErrorCode::Unimplemented

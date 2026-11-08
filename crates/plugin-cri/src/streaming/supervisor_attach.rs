@@ -26,9 +26,9 @@
 //! （`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない）。同時数は [`MAX_ATTACH_SESSIONS`] で、止まったスレッドも数える。
 //!
 //! # 未実装・簡易実装・残余（REPAIR-3）
-//! - 本番の attach は引き続き読み取り専用: `production_stream_dispatcher` は `AttachHandler::read_only` のままで、stdin・tty は
-//!   RPC 時に断られる。stdin・tty・resize の経路は偽の `AttachIoSource` を使う単体試験からしか届かない。`read_only` の解除・
-//!   bundle の `tty/stdin` 拒否の解除・RPC 時の整合検査は #4078（C10）、実機の通し確認は #4079（C11）
+//! - 本番の attach は結線済み（#4078）: `production_stream_dispatcher` は `ProductionAttach::interactive` で `read_only` を付けず、
+//!   bundle の `tty/stdin` の拒否も解除済みで、RPC 時の整合検査は cri の `attach_impl`（D7）が担う。実機の通し確認
+//!   （tty のコンテナの起動・`crictl attach -i -t`）は #4079（C11）
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
 //! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを全書き手共通の排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、

@@ -31,7 +31,7 @@ use fandhe_container_cri::streaming::remotecommand::TerminalSize;
 use fandhe_container_cri::streaming::spdy::{
     Frame, FrameDecoder, FrameEncoder, Headers, StreamId, goaway_status, rst_status,
 };
-use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{self, StreamDispatcher, StreamingConfig, StreamingServer};
 use tonic::Request;
 
 const STATUS_SUCCESS_V4: &[u8] = br#"{"metadata":{},"status":"Success"}"#;
@@ -331,6 +331,17 @@ async fn setup_with(
     backend: Option<Arc<FakeBackend>>,
     read_only: bool,
 ) -> (StreamingServer, CriRuntimeService, String) {
+    setup_io(config, backend, read_only, false, false).await
+}
+
+/// コンテナの作成時の `stdin`・`tty` を指定して用意する（attach の整合検査 D7 の入力。#4078）。
+async fn setup_io(
+    config: StreamingConfig,
+    backend: Option<Arc<FakeBackend>>,
+    read_only: bool,
+    stdin: bool,
+    tty: bool,
+) -> (StreamingServer, CriRuntimeService, String) {
     let mut dispatcher = StreamDispatcher::new();
     if let Some(backend) = backend {
         let mut handler = AttachHandler::new(backend, config.session_limits()).expect("handler");
@@ -364,6 +375,8 @@ async fn setup_with(
                     image: "busybox:1.36".into(),
                     ..Default::default()
                 }),
+                stdin,
+                tty,
                 ..Default::default()
             }),
             sandbox_config: Some(pod_config()),
@@ -412,7 +425,7 @@ async fn attach_path(
 async fn cri6_repair3_read_only_attach_rejects_stdin_and_tty_at_rpc() {
     let backend = FakeBackend::new();
     let (server, service, container) =
-        setup_with(StreamingConfig::default(), Some(backend), true).await;
+        setup_io(StreamingConfig::default(), Some(backend), true, true, false).await;
     for (stdin, tty) in [(true, false), (false, true)] {
         let err = service
             .attach(Request::new(v1::AttachRequest {
@@ -436,8 +449,14 @@ async fn cri6_repair3_read_only_attach_rejects_stdin_and_tty_at_rpc() {
 #[tokio::test]
 async fn cri6_attach_streams_stdout_stderr_and_stdin() {
     let backend = FakeBackend::new();
-    let (server, service, container) =
-        setup(StreamingConfig::default(), Some(backend.clone())).await;
+    let (server, service, container) = setup_io(
+        StreamingConfig::default(),
+        Some(backend.clone()),
+        false,
+        true,
+        false,
+    )
+    .await;
     let path = attach_path(&service, &container, true, true, true, false).await;
     let addr = server.local_addr();
     let b = backend.clone();
@@ -499,8 +518,14 @@ async fn cri6_attach_streams_stdout_stderr_and_stdin() {
 #[tokio::test]
 async fn cri6_attach_tty_resize() {
     let backend = FakeBackend::new();
-    let (server, service, container) =
-        setup(StreamingConfig::default(), Some(backend.clone())).await;
+    let (server, service, container) = setup_io(
+        StreamingConfig::default(),
+        Some(backend.clone()),
+        false,
+        false,
+        true,
+    )
+    .await;
     // tty では stderr を要求しない（要求しても RPC が拒否する）。
     let path = attach_path(&service, &container, false, true, false, true).await;
     let addr = server.local_addr();
@@ -655,7 +680,8 @@ async fn cri6_attach_stream_creation_timeout_releases_slot() {
 async fn cri6_attach_idle_timeout_releases_backend() {
     let backend = FakeBackend::new();
     let config = StreamingConfig::default().with_stream_idle_timeout(Duration::from_millis(400));
-    let (server, service, container) = setup(config, Some(backend.clone())).await;
+    let (server, service, container) =
+        setup_io(config, Some(backend.clone()), false, true, false).await;
     let path = attach_path(&service, &container, true, true, false, false).await;
     let addr = server.local_addr();
     let b = backend.clone();
@@ -813,8 +839,14 @@ async fn cri6_attach_ping_rst_and_protocol_error() {
 #[tokio::test]
 async fn cri6_attach_data_after_rst_is_ignored() {
     let backend = FakeBackend::new();
-    let (server, service, container) =
-        setup(StreamingConfig::default(), Some(backend.clone())).await;
+    let (server, service, container) = setup_io(
+        StreamingConfig::default(),
+        Some(backend.clone()),
+        false,
+        true,
+        true,
+    )
+    .await;
     let path = attach_path(&service, &container, true, true, false, true).await;
     let addr = server.local_addr();
     let b = backend.clone();
@@ -843,4 +875,78 @@ async fn cri6_attach_data_after_rst_is_ignored() {
     })
     .await
     .expect("join");
+}
+
+/// 照合の失敗で返るエラーを取り出す（成功なら失敗）。
+async fn attach_err(
+    service: &CriRuntimeService,
+    container: &str,
+    stdin: bool,
+    tty: bool,
+) -> tonic::Status {
+    service
+        .attach(Request::new(v1::AttachRequest {
+            container_id: container.to_string(),
+            stdin,
+            tty,
+            stdout: true,
+            stderr: false,
+        }))
+        .await
+        .expect_err("refused")
+}
+
+/// CRI-6・CRI-2・#4078（D7）: stdin を開いていないコンテナへの stdin の要求は `FAILED_PRECONDITION`（固定文）で、
+/// tty のコンテナでも `config.stdin` を直接見て断る。
+#[tokio::test]
+async fn cri6_cri2_4078_attach_stdin_to_container_without_stdin_is_refused() {
+    for tty in [false, true] {
+        let backend = FakeBackend::new();
+        let (server, service, container) =
+            setup_io(StreamingConfig::default(), Some(backend), false, false, tty).await;
+        let err = attach_err(&service, &container, true, tty).await;
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the container was not created with stdin open"
+        );
+        assert_eq!(err.message(), streaming::MSG_ATTACH_STDIN_NOT_OPEN);
+        drop(server);
+    }
+}
+
+/// CRI-6・CRI-2・#4078（D7）: tty の不一致はどちらの向きも `FAILED_PRECONDITION`（固定文）。
+#[tokio::test]
+async fn cri6_cri2_4078_attach_tty_mismatch_is_refused_both_ways() {
+    for (container_tty, want_tty) in [(true, false), (false, true)] {
+        let backend = FakeBackend::new();
+        let (server, service, container) = setup_io(
+            StreamingConfig::default(),
+            Some(backend),
+            false,
+            true,
+            container_tty,
+        )
+        .await;
+        let err = attach_err(&service, &container, true, want_tty).await;
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the requested tty mode does not match the container"
+        );
+        drop(server);
+    }
+}
+
+/// CRI-6・CRI-2・#4078（D7）: 構成と一致する要求は URL を得る。拒否は枠を消費しない。
+#[tokio::test]
+async fn cri6_cri2_4078_attach_matching_request_gets_url() {
+    for (stdin, tty) in [(true, true), (true, false), (false, false)] {
+        let backend = FakeBackend::new();
+        let (server, service, container) =
+            setup_io(StreamingConfig::default(), Some(backend), false, stdin, tty).await;
+        let path = attach_path(&service, &container, stdin, true, false, tty).await;
+        assert!(path.starts_with("/attach/"), "{path}");
+        drop(server);
+    }
 }

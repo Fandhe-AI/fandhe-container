@@ -5,9 +5,9 @@
 //! 停止は [`stop_streaming_on`] で包んだ shutdown future が担い、SIGTERM・SIGINT（#3226）の受信と同時に TCP の待ち受けを閉じる。
 //!
 //! # 現状（REPAIR-3）
-//! 結線済みは Attach（読み取り専用。Linux は完全版の backend〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と
-//! fd の受け取り。#4077〕を載せるが、`production_stream_dispatcher` は `AttachHandler::read_only` のままで stdin・tty は
-//! RPC 時に断る。`read_only` の解除は #4078。非 Linux は [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕）と、PortForward の NODE ネットワーク（hostNetwork）の pod
+//! 結線済みは Attach（Linux は完全版〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と fd の受け取り。#4077〕で、
+//! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通し確認は #4079。非 Linux は
+//! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
 //! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。
 //! supervisor の `stream-exec` helper 経由。stdin・stdout・stderr のみで、tty と相対 `argv[0]` は RPC 時に `INVALID_ARGUMENT`。#3761）で、
@@ -69,19 +69,55 @@ pub fn production_streaming_config() -> StreamingConfig {
     StreamingConfig::default()
 }
 
-/// 本番の `StreamDispatcher`。Attach（読み取り専用の `attach`。#3763）・PortForward（NODE ネットワークの pod だけ。#3755）・
+/// 本番の Attach の backend と、それが対話（stdin・tty・resize）できるかの宣言（#4078）。
+///
+/// backend と読み取り専用の印の取り違え（対話できない backend を対話として宣言する等）を型で表せなくするため、
+/// 構築口を backend の型で絞る。`main.rs` が Linux では [`ProductionAttach::interactive`]、非 Linux では
+/// [`ProductionAttach::read_only`] で作る。
+pub struct ProductionAttach {
+    backend: Arc<dyn AttachBackend>,
+    interactive: bool,
+}
+
+impl ProductionAttach {
+    /// 完全版（kind 9 の fd と tap）。stdin・tty を RPC 時に受ける（整合検査は cri の `attach_impl`。D7）。
+    #[cfg(target_os = "linux")]
+    pub fn interactive(backend: Arc<supervisor_attach::SupervisorAttachBackend>) -> Self {
+        Self {
+            backend,
+            interactive: true,
+        }
+    }
+
+    /// 回転ログの follow（読み取り専用）。stdin・tty は RPC 時に `INVALID_ARGUMENT`（非 Linux の本番）。
+    pub fn read_only(backend: Arc<log_attach::LogFollowAttachBackend>) -> Self {
+        Self {
+            backend,
+            interactive: false,
+        }
+    }
+}
+
+/// 本番の `StreamDispatcher`。Attach（Linux は対話可能な完全版、非 Linux は読み取り専用。#3763・#4078）・PortForward（NODE ネットワークの pod だけ。#3755）・
 /// Exec（`exec` が `Some` のとき。stdin・stdout・stderr のみで tty なし、絶対パスの `argv[0]` のみ。#3761）を結線する。
 ///
 /// 期限は本番の設定（[`production_streaming_config`]）の
 /// `session_limits()`。ハンドラの構築失敗（設定検証。既定では起きない）は `Internal` の固定文言に写す。
 pub fn production_stream_dispatcher(
-    attach: Arc<dyn AttachBackend>,
+    attach: ProductionAttach,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
     recorder: Arc<dyn CriOpRecorder>,
 ) -> Result<StreamDispatcher, PluginError> {
-    let attach_handler = AttachHandler::new(attach, production_streaming_config().session_limits())
-        .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?
-        .read_only();
+    let attach_handler = AttachHandler::new(
+        attach.backend,
+        production_streaming_config().session_limits(),
+    )
+    .map_err(|_| PluginError::new(PluginErrorCode::Internal, MSG_STREAMING_START_FAILED))?;
+    let attach_handler = if attach.interactive {
+        attach_handler
+    } else {
+        attach_handler.read_only()
+    };
     let port_forward = PortForwardHandler::new(
         Arc::new(NodeLoopbackDialer::new()),
         PortForwardConfig::default(),
@@ -113,7 +149,7 @@ pub fn production_stream_dispatcher(
 /// `exec` が `None`（非 Linux）なら Exec は未結線で `UNIMPLEMENTED` のまま。失敗は `Unavailable`（bind・アドレス取得）と `Internal`（設定検証。本番の既定では起きない）の固定文言に写す。
 pub async fn bind_production_streaming(
     config: StreamingConfig,
-    attach: Arc<dyn AttachBackend>,
+    attach: ProductionAttach,
     exec: Option<Arc<dyn ExecStreamLauncher>>,
     recorder: Arc<dyn CriOpRecorder>,
 ) -> Result<StreamingServer, PluginError> {
@@ -176,14 +212,15 @@ mod tests {
         Arc::new(fandhe_container_cri::instrument::NoopCriOpRecorder)
     }
 
-    fn fake_attach() -> Arc<dyn AttachBackend> {
-        Arc::new(
+    /// 読み取り専用の本番構成（非 Linux の本番と同じ。ログは読まれない）。
+    fn fake_attach() -> ProductionAttach {
+        ProductionAttach::read_only(Arc::new(
             log_attach::LogFollowAttachBackend::new(
                 std::env::temp_dir().join("fandhe-attach-unused"),
                 log_attach::test_support::FakeProbe::running(),
             )
             .expect("backend"),
-        )
+        ))
     }
 
     async fn connect(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
@@ -204,21 +241,20 @@ mod tests {
         assert_eq!(c.max_connections, 64);
     }
 
-    /// 完全版の backend を渡しても読み取り専用の印は変わらない（`read_only` の解除は #4078 の範囲。#4077）。
+    /// 完全版の backend を `interactive` で渡すと、対話（stdin・tty）を宣言する結線になる（#4078）。
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn cri6_4077_supervisor_attach_backend_keeps_read_only_wiring() {
-        let backend: Arc<dyn AttachBackend> =
-            Arc::new(supervisor_attach::tests::backend_for_wiring());
+    async fn cri6_4078_supervisor_attach_backend_declares_interactive_wiring() {
+        let backend = Arc::new(supervisor_attach::tests::backend_for_wiring());
         let server = bind_production_streaming(
             production_streaming_config(),
-            backend,
+            ProductionAttach::interactive(backend),
             None,
             noop_recorder(),
         )
         .await
         .expect("bind");
-        assert!(!server.issuer().wiring().attach_interactive());
+        assert!(server.issuer().wiring().attach_interactive());
     }
 
     #[tokio::test]
@@ -454,6 +490,97 @@ mod tests {
         .expect_err("external without opt-in");
         assert_eq!(e.code(), PluginErrorCode::Internal);
         assert_eq!(e.message(), MSG_STREAMING_START_FAILED);
+    }
+
+    /// CRI-6・CRI-2・#4078: 完全版（`interactive`）の本番構成では、stdin を開いたコンテナへの stdin つき `Attach` が URL を返し、
+    /// stdin なしで作ったコンテナへの stdin の要求は `FAILED_PRECONDITION`（D7）。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cri6_cri2_4078_interactive_production_attach_checks_stdin_consistency() {
+        let backend = Arc::new(supervisor_attach::tests::backend_for_wiring());
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            ProductionAttach::interactive(backend),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let svc = CriRuntimeService::new().with_streaming(server.issuer());
+        let pod = cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: "pod".into(),
+                uid: "uid-1".into(),
+                namespace: "ns".into(),
+                attempt: 0,
+            }),
+            ..Default::default()
+        };
+        let sandbox = svc
+            .run_pod_sandbox(Request::new(cri::RunPodSandboxRequest {
+                config: Some(pod.clone()),
+                runtime_handler: String::new(),
+            }))
+            .await
+            .expect("sandbox")
+            .into_inner()
+            .pod_sandbox_id;
+        let mut ids = Vec::new();
+        for (name, stdin) in [("with-stdin", true), ("no-stdin", false)] {
+            let id = svc
+                .create_container(Request::new(cri::CreateContainerRequest {
+                    pod_sandbox_id: sandbox.clone(),
+                    config: Some(cri::ContainerConfig {
+                        metadata: Some(cri::ContainerMetadata {
+                            name: name.into(),
+                            attempt: 0,
+                        }),
+                        image: Some(cri::ImageSpec {
+                            image: "busybox:1.36".into(),
+                            ..Default::default()
+                        }),
+                        stdin,
+                        ..Default::default()
+                    }),
+                    sandbox_config: Some(pod.clone()),
+                }))
+                .await
+                .expect("container")
+                .into_inner()
+                .container_id;
+            svc.start_container(Request::new(cri::StartContainerRequest {
+                container_id: id.clone(),
+            }))
+            .await
+            .expect("start");
+            ids.push(id);
+        }
+        let url = svc
+            .attach(Request::new(cri::AttachRequest {
+                container_id: ids[0].clone(),
+                stdin: true,
+                stdout: true,
+                ..Default::default()
+            }))
+            .await
+            .expect("stdin attach to a stdin container")
+            .into_inner()
+            .url;
+        assert!(url.contains("/attach/"), "{url}");
+        let err = svc
+            .attach(Request::new(cri::AttachRequest {
+                container_id: ids[1].clone(),
+                stdin: true,
+                stdout: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("stdin was not opened");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "the container was not created with stdin open"
+        );
     }
 
     /// CRI-6・#3763: 本番構成（`bind_production_streaming` + `with_streaming`）の `Attach` RPC が URL を返す。

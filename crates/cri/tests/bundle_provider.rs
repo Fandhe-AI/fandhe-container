@@ -16,8 +16,9 @@ use fandhe_container_cri::bundle::{
 };
 use fandhe_container_cri::error::{CriError, CriErrorCode};
 use fandhe_container_cri::runtime::v1::{
-    ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec, Int64Value, LinuxContainerConfig,
-    LinuxContainerSecurityContext, PodSandboxConfig, SupplementalGroupsPolicy,
+    ContainerConfig, ContainerMetadata, Device, DnsConfig, ImageSpec, Int64Value,
+    LinuxContainerConfig, LinuxContainerSecurityContext, PodSandboxConfig,
+    SupplementalGroupsPolicy,
 };
 
 struct TempDir(PathBuf);
@@ -302,11 +303,22 @@ fn invalid_ids_are_rejected_without_touching_the_filesystem() {
     assert_eq!(rootfs.prepares.load(Ordering::SeqCst), 0);
 }
 
+/// CRI-2・CRI-6・#4078: tty=true の prepare が成功し、書いた config.json に `process.terminal` が載る。
+#[test]
+fn tty_config_is_prepared_with_process_terminal() {
+    let (_tmp, _rootfs, p) = setup("tty-accepted");
+    let mut c = container();
+    c.tty = true;
+    let dir = prepare(&p, "ctr-tty", &c).expect("tty is accepted");
+    let text = fs::read_to_string(dir.join("config.json")).expect("config.json");
+    assert!(text.contains("\"terminal\":true"), "{text}");
+}
+
 #[test]
 fn rejected_config_does_not_create_a_directory() {
     let (tmp, rootfs, p) = setup("reject");
     let mut c = container();
-    c.tty = true;
+    c.devices = vec![Device::default()];
     let e = prepare(&p, "ctr1", &c).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Unimplemented);
     let mut c = container();
@@ -459,12 +471,12 @@ fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
 
 #[test]
 fn release_after_a_precheck_failure_keeps_an_existing_bundle_with_the_same_id() {
-    // CRI-1・REPAIR-12: 同 ID の既存 bundle があり事前検証（tty・image 欠落）で失敗しても、巻き戻し release は
+    // CRI-1・REPAIR-12: 同 ID の既存 bundle があり事前検証（devices・image 欠落）で失敗しても、巻き戻し release は
     // 既存の bundle と rootfs を消さない。
     let (tmp, _rootfs, p) = setup("precheck-existing");
     let dir = prepare(&p, "ctr1", &container()).unwrap();
     let mut c = container();
-    c.tty = true;
+    c.devices = vec![Device::default()];
     let e = prepare(&p, "ctr1", &c).unwrap_err();
     assert_eq!(e.code(), CriErrorCode::Unimplemented);
     p.release("ctr1").expect("rollback release is a no-op");

@@ -298,6 +298,17 @@ impl LineSink {
     }
 }
 
+impl LineSink {
+    /// 書き出し待ちが空になるまで最大 `timeout` 待ち、空になったか（積んだ行が全て書き出されたか）を返す。
+    ///
+    /// [`Self::wait_idle`] と違い結果を返すので、短命プロセス（shim の delete 等）が終了前に行の欠落を検知できる
+    /// （REPAIR-4・REPAIR-5）。書き込みが止まっていても `timeout` で返る。
+    pub fn flush(&self, timeout: Duration) -> bool {
+        self.wait_idle(timeout);
+        self.pending.load(Ordering::Relaxed) == 0
+    }
+}
+
 /// プロセス共通の stderr 書き出し口（初回利用時に専用 thread を起こす）。
 pub fn stderr_sink() -> &'static LineSink {
     static SINK: OnceLock<LineSink> = OnceLock::new();

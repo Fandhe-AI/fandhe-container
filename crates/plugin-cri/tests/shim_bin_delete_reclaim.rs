@@ -173,9 +173,19 @@ fn decode(buf: &[u8]) -> Decoded {
     d
 }
 
+/// 成功の条件は終了コード 0 と stdout の protobuf。stderr は後始末の警告（`container_delete_cleanup`・
+/// `shim_delete_warnings_unflushed`。いずれも 1 行の JSON で `"level":"warn"`）だけを許し、それ以外の行があれば失敗にする
+/// （delete の契約は後始末の警告を stderr に許容する。REPAIR-4）。
 fn assert_success(out: &Output) {
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(out.stderr, b"", "delete must not write to stderr");
+    let stderr = String::from_utf8(out.stderr.clone()).expect("stderr must be UTF-8");
+    for line in stderr.lines() {
+        let allowed = line
+            .starts_with("{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",")
+            || line
+                .starts_with("{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",");
+        assert!(allowed, "unexpected stderr line: {line:?}");
+    }
 }
 
 /// CRI-5・TASK-62.6・#4152: Stopped で記録された終了コード・`exited_at` が stdout の DeleteResponse と一致し、

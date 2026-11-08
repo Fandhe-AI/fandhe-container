@@ -191,8 +191,10 @@ pub const VIRTIO_MMIO_WINDOW: u64 = 0x1000;
 /// PIC と IOAPIC の両方（`ROUTING_ENTRY2`）、16..=23 を IOAPIC のみ（`ROUTING_ENTRY1`）へ結ぶ。したがって
 /// 5..=12（[`MAX_VIRTIO_DEVICES`] 台）は追加のルーティング設定なしで `KVM_IRQFD` が通り、IOAPIC の pin = GSI になる。
 /// 5..=12 は ISA の範囲（0..=15）に収まり、COM1 の IRQ 4（`crate::uart::COM1_IRQ`）とも重ならない。MP テーブルの割り込みエントリ
-/// （`mp_isa_routes`）も pin = GSI で載せるので ISA の IRQ 番号と一致する。未確認: `KVM_IOAPIC_NUM_PINS` の定義位置と値の一次情報
-/// （表の 0..=23 の 24 エントリから 24 ピンと読んでいるが、マクロ本体は確認していない）。aarch64 の GSI は SPI 番号で別物（モジュール doc）。
+/// （`mp_isa_routes`）も pin = GSI で載せるので ISA の IRQ 番号と一致する。`KVM_IOAPIC_NUM_PINS` は Linux v6.12 の
+/// `arch/x86/include/uapi/asm/kvm.h` で 24 と定義され、in-kernel IOAPIC の `IOAPIC_NUM_PINS`（`arch/x86/kvm/ioapic.h`）もこれを使う。
+/// `irq_comm.c` は IOAPIC の pin が 24 以上の routing エントリを `-EINVAL` で拒否し、`default_routing[]` の GSI 0..=23 の 24 エントリと
+/// 一致する。値は [`crate::mptable_x86::IOAPIC_PINS`] が持ち、下の const 評価で範囲を固定する。aarch64 の GSI は SPI 番号で別物（モジュール doc）。
 pub const VIRTIO_GSI_BASE: u32 = 5;
 /// block と net の合計台数の上限。GSI は 5..=12 に収まり、x86_64 の既定ルーティングの ISA の範囲（0..=15）内
 /// （根拠は [`VIRTIO_GSI_BASE`]）。
@@ -200,6 +202,10 @@ pub const MAX_VIRTIO_DEVICES: usize = 8;
 // 最後のデバイスの GSI が ISA の範囲（PIC と IOAPIC の両方に結ばれる 0..=15）に収まり、COM1 の IRQ 4 の後ろから始まる（#3698）。
 const _: () = assert!(VIRTIO_GSI_BASE as usize + MAX_VIRTIO_DEVICES - 1 <= 15);
 const _: () = assert!(VIRTIO_GSI_BASE > crate::uart::COM1_IRQ);
+// 最後のデバイスの GSI が in-kernel IOAPIC のピン数（KVM_IOAPIC_NUM_PINS = 24）の範囲に収まる（#4162・MVM-1）。
+const _: () = assert!(
+    VIRTIO_GSI_BASE as usize + MAX_VIRTIO_DEVICES - 1 < crate::mptable_x86::IOAPIC_PINS as usize
+);
 /// 構成の検証上限としての vCPU 数（これより上の実際の上限はカーネルの EINVAL に任せる）。
 pub const MAX_VCPUS: u32 = 32;
 // xAPIC の APIC ID（8 bit）に収まること（#3737。`smp_x86::plan_vcpus` の上限）。

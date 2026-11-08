@@ -381,3 +381,65 @@ fn cri5_4151_preflight_not_recorded_and_fail_closed() {
     let e = delete_preflight_in(&inv, &base).unwrap_err();
     assert_eq!(e.message(), "state root directory is not private");
 }
+
+/// 共有バッファへ遅延つきで書く出力先（専用 thread の書き出しが delete の終了より遅れる状況を作る）。
+#[derive(Clone)]
+struct SlowBuf(
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::time::Duration,
+);
+
+impl std::io::Write for SlowBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.1);
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// REPAIR-4・REPAIR-5・CRI-5・#4152: delete の警告行は、書き出しが遅くても共有期限内に全て書き出されてから戻る
+/// （終了前に失われない）。欠落は無いので fallback には何も出ない。
+#[test]
+fn repair4_4152_delete_warnings_are_written_before_return() {
+    let out = SlowBuf(Default::default(), std::time::Duration::from_millis(40));
+    let sink = crate::telemetry::LineSink::spawn(Box::new(out.clone()), 8);
+    for i in 0..3 {
+        assert!(sink.submit(format!("{{\"level\":\"warn\",\"n\":{i}}}")));
+    }
+    let mut fallback = Vec::new();
+    let ok = flush_delete_warnings(
+        &sink,
+        &mut fallback,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+    assert!(ok);
+    assert_eq!(fallback, b"");
+    assert_eq!(
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap(),
+        "{\"level\":\"warn\",\"n\":0}\n{\"level\":\"warn\",\"n\":1}\n{\"level\":\"warn\",\"n\":2}\n"
+    );
+}
+
+/// REPAIR-4・REPAIR-5・#4152: 書き出しが期限内に終わらないとき、待ちは期限で戻り、欠落の可能性を固定の 1 行で fallback へ残す。
+#[test]
+fn repair4_4152_delete_warnings_unflushed_leaves_fixed_line_within_deadline() {
+    let out = SlowBuf(Default::default(), std::time::Duration::from_millis(600));
+    let sink = crate::telemetry::LineSink::spawn(Box::new(out), 8);
+    assert!(sink.submit("{\"level\":\"warn\"}".to_owned()));
+    let mut fallback = Vec::new();
+    let t0 = std::time::Instant::now();
+    let ok = flush_delete_warnings(
+        &sink,
+        &mut fallback,
+        t0 + std::time::Duration::from_millis(100),
+    );
+    assert!(!ok);
+    assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+    assert_eq!(
+        String::from_utf8(fallback).unwrap(),
+        "{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":false,\"dropped\":0,\"message\":\"delete cleanup warnings may be lost\"}\n"
+    );
+}

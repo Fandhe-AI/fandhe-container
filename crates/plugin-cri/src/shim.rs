@@ -461,7 +461,7 @@ pub fn production_delete(
         let base = fandhe_container_core::state_store::StateRoot::resolve(None)
             .map_err(|_| CriError::internal("cannot resolve the state root"))?;
         let budget = reclaim::ReclaimBudget::PRODUCTION;
-        delete_in(
+        let result = delete_in(
             inv,
             base.path(),
             |store| {
@@ -473,18 +473,55 @@ pub fn production_delete(
                         core_runtime_for(pinned)
                             .with_delete_deadline(cleanup)
                             .with_container_log_lock_wait(cleanup)
+                            .with_cleanup_warning_sink(std::sync::Arc::new(|line| {
+                                let _ = crate::telemetry::stderr_sink().submit(line);
+                            }))
                     },
                 ))
             },
             &budget,
             deadline,
-        )
+        );
+        // 後始末の警告（Kept）は応答の protobuf に載せられないので、専用 thread のキューに積んだ分を終了前に書き出す。
+        // 成否にかかわらず（Err でも）行う（REPAIR-4・REPAIR-5・#4152）。
+        flush_delete_warnings(
+            crate::telemetry::stderr_sink(),
+            &mut std::io::stderr(),
+            deadline,
+        );
+        result
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = deadline;
         validate_delete_invocation(inv).map(|_| None)
     }
+}
+
+/// delete の警告行（`CoreLifecycleRuntime` の後始末の警告）が `sink` から書き出されるのを、共有期限 `deadline` の残りまで待つ。
+///
+/// delete は応答の後すぐプロセスを終了し、`LineSink` の専用 thread のキューを待たないため、待たないと Kept として残した資源の警告が
+/// 失われる（REPAIR-4）。期限内に書き出せなかった・キューへ積めず捨てた行があるときは、`fallback`（本番は stderr へ直接）に固定語彙の
+/// 1 行（`shim_delete_warnings_unflushed`）を出して欠落を残す。書き出せたかを返す（REPAIR-5・#4152）。
+#[cfg(target_os = "linux")]
+pub(crate) fn flush_delete_warnings(
+    sink: &crate::telemetry::LineSink,
+    fallback: &mut dyn std::io::Write,
+    deadline: std::time::Instant,
+) -> bool {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let drained = sink.flush(left);
+    let dropped = sink.dropped();
+    if drained && dropped == 0 {
+        return true;
+    }
+    let line = format!(
+        "{{\"level\":\"warn\",\"event\":\"shim_delete_warnings_unflushed\",\"drained\":{drained},\"dropped\":{dropped},\"message\":\"delete cleanup warnings may be lost\"}}\n"
+    );
+    let _ = fallback
+        .write_all(line.as_bytes())
+        .and_then(|()| fallback.flush());
+    false
 }
 
 /// Shutdown だけを処理する登録簿（非 Linux の縮退。REPAIR-3）。

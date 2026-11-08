@@ -81,22 +81,22 @@ pub const MAX_EXEC_SESSIONS: usize = 64;
 pub const MAX_STUCK_HELPERS: usize = 8;
 
 /// stdio の fd を helper へ渡す期限。
-const HANDOVER_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const HANDOVER_BUDGET: Duration = Duration::from_secs(5);
 
 /// `Started`（と tty の `PtyMaster`）を待つ上限。cri の `launch_timeout` の既定 30 秒より短くする。
-const STARTED_BUDGET: Duration = Duration::from_secs(25);
+pub(crate) const STARTED_BUDGET: Duration = Duration::from_secs(25);
 
 /// SIGKILL 後に回収スレッドが終了を待つ上限。超えた helper は保持一覧（`Shared::stuck`）へ移す（REPAIR-5）。
-const REAP_BUDGET: Duration = Duration::from_secs(10);
+pub(crate) const REAP_BUDGET: Duration = Duration::from_secs(10);
 
 /// 回収スレッドの `try_wait` の間隔。
-const REAP_POLL: Duration = Duration::from_millis(50);
+pub(crate) const REAP_POLL: Duration = Duration::from_millis(50);
 
 /// helper の期限（`--timeout-ms`）に足す、`Result` を待つ余裕。
-const RESULT_GRACE: Duration = Duration::from_secs(30);
+pub(crate) const RESULT_GRACE: Duration = Duration::from_secs(30);
 
 /// helper が 1 件の exec を保持してよい最長（supervisor の exec 全体の上限）。
-const SESSION_TIMEOUT: Duration = Duration::from_secs(MAX_EXEC_HOLD_SECS);
+pub(crate) const SESSION_TIMEOUT: Duration = Duration::from_secs(MAX_EXEC_HOLD_SECS);
 
 /// 起動された helper。`channel` は helper の fd 0 に渡した socketpair の plugin 側。
 pub struct SpawnedHelper {
@@ -186,7 +186,7 @@ struct Live {
 
 /// launcher 全体で共有する状態（同時数・回収中の helper・追跡中の helper）。
 #[derive(Default)]
-struct Shared {
+pub(crate) struct Shared {
     active: AtomicUsize,
     /// 専用スレッドが `wait` 中の kill 済み helper の数。
     reaping: AtomicUsize,
@@ -194,7 +194,7 @@ struct Shared {
     stuck: Mutex<Vec<Child>>,
     live: Mutex<Live>,
     /// fd 2 の読み手の追跡（終了時に上限つきで待つ。#4171）。
-    diag: Arc<DiagTracker>,
+    pub(crate) diag: Arc<DiagTracker>,
 }
 
 /// 起動 future のキャンセル状態。future の drop で取消を立て、起動済みの helper を直ちに止める（REPAIR-5）。
@@ -260,7 +260,7 @@ impl Drop for CancelOnDrop {
 }
 
 /// 同時数の枠。drop で返す。
-struct Slot(Arc<Shared>);
+pub(crate) struct Slot(Arc<Shared>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -270,7 +270,7 @@ impl Drop for Slot {
 
 impl Shared {
     /// 枠を取る。回収できない helper を先に掃除し、保持が満杯・同時数超過なら `RESOURCE_EXHAUSTED`。
-    fn acquire(self: &Arc<Self>) -> Result<Slot, CriError> {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Result<Slot, CriError> {
         {
             let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
             stuck.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -287,18 +287,18 @@ impl Shared {
 }
 
 /// helper の持ち主。drop（または [`Self::kill`]）で SIGKILL して回収する。
-struct HelperGuard {
-    child: Mutex<Option<Child>>,
-    shared: Arc<Shared>,
+pub(crate) struct HelperGuard {
+    pub(crate) child: Mutex<Option<Child>>,
+    pub(crate) shared: Arc<Shared>,
     /// fd 2 の読み手への停止の印。`kill` の先頭で立てる（#4171）。
-    diag_stop: Arc<AtomicBool>,
-    _slot: Slot,
+    pub(crate) diag_stop: Arc<AtomicBool>,
+    pub(crate) _slot: Slot,
 }
 
 impl HelperGuard {
     /// SIGKILL を送って回収する。呼び出しスレッドをブロックしない（tokio の実行時の上で呼ばれうる）。
     /// 直ちに回収できなければ、専用スレッドが `wait` する（Child を落とさず zombie を作らない）。
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         // 読み手は EOF に頼らず止める（fork した worker が書き込み端を継承しうるため。#4171）。
         self.diag_stop.store(true, Ordering::SeqCst);
         let taken = self
@@ -397,7 +397,7 @@ pub fn map_outcome(outcome: StreamExecOutcome) -> Result<i32, CriError> {
 }
 
 /// helper の失敗分類を CRI のエラーへ写す。メッセージは固定の英文で、パス・argv・ID を含めない。
-fn cri_error(code: ErrorCode) -> CriError {
+pub(crate) fn cri_error(code: ErrorCode) -> CriError {
     match code {
         ErrorCode::FailedPrecondition => {
             CriError::failed_precondition("exec target is not running")
@@ -414,7 +414,7 @@ fn cri_error(code: ErrorCode) -> CriError {
     }
 }
 
-fn channel_error(e: &ChannelError) -> CriError {
+pub(crate) fn channel_error(e: &ChannelError) -> CriError {
     cri_error(e.code())
 }
 

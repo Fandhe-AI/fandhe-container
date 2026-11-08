@@ -345,6 +345,55 @@ pub fn smp_disabling_param(cmdline: &str) -> Option<&str> {
         .find(|w| *w == "nosmp" || w.starts_with("maxcpus="))
 }
 
+/// meminfo の initrd が `/proc/meminfo` を出した後に書く固定文字列（正本は `scripts/build-microvm-test-initrd.sh` の
+/// `meminfo_ok_message`。#4107・MVM-1）。x86_64 の 4 GiB 超 RAM の試験（`kernel_boot.rs`）が使う。
+pub const MEMINFO_OK_MARKER: &str = "fandhe-microvm-test: meminfo ok v1";
+/// `/proc/meminfo` を開けない・読めないときに出す固定文字列（正本は同スクリプトの `meminfo_failed_message`）。
+pub const MEMINFO_FAILED_MARKER: &str = "fandhe-microvm-test: meminfo failed v1";
+
+/// `parse_mem_total_kb` が走査する行数の上限（ゲストの出力は untrusted。REPAIR-5）。
+const MEM_TOTAL_MAX_LINES: usize = 65536;
+
+/// ゲストが出した `/proc/meminfo` から `MemTotal` を kB で取り出す（#4107・MVM-1）。
+///
+/// 行頭が `MemTotal:` の行がちょうど 1 行のときだけ受理する。形は `MemTotal:` + 空白 1 個以上 + 数字 1〜20 桁 +
+/// 空白 1 個以上 + `kB` で、前後に余計な文字を許さない（`\r` だけは除く）。ゲストの出力は非信頼入力のため、
+/// 添字アクセスと `unwrap` を使わず、行数・桁数に上限を置き、`u64` を超える値は `Err` にする。
+pub fn parse_mem_total_kb(output: &[u8]) -> Result<u64, &'static str> {
+    let mut found: Option<u64> = None;
+    for (i, raw) in output.split(|b| *b == b'\n').enumerate() {
+        if i >= MEM_TOTAL_MAX_LINES {
+            return Err("too many lines to scan for MemTotal");
+        }
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let Some(rest) = line.strip_prefix(b"MemTotal:") else {
+            continue;
+        };
+        if found.is_some() {
+            return Err("more than one MemTotal line");
+        }
+        let text = std::str::from_utf8(rest).map_err(|_| "MemTotal line is not UTF-8")?;
+        let mut parts = text.split_ascii_whitespace();
+        let (Some(digits), Some(unit), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err("malformed MemTotal line");
+        };
+        if !text.starts_with(|c: char| c.is_ascii_whitespace())
+            || unit != "kB"
+            || digits.is_empty()
+            || digits.len() > 20
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err("malformed MemTotal line");
+        }
+        found = Some(
+            digits
+                .parse::<u64>()
+                .map_err(|_| "MemTotal value overflows u64")?,
+        );
+    }
+    found.ok_or("no MemTotal line")
+}
+
 /// 共有補助の単体試験（KVM・HVF 不要。取り込み側のどちらでも既定で走る。MVM-1・MVM-5・REPAIR-12）。
 #[cfg(test)]
 mod tests {
@@ -683,5 +732,103 @@ mod tests {
         assert_eq!(SERIAL_RX_TIMEOUT.len() + 1, 42);
         assert_eq!(SERIAL_FAILED.len() + 1, 43);
         assert!(SERIAL_RX_PREFIX.ends_with(' '));
+    }
+
+    /// meminfo の文字列定数がスクリプトの正本と一致し、機械語へ焼き込まれた長さを保つ（#4107・MVM-1・REPAIR-12）。
+    #[test]
+    fn mvm1_4107_meminfo_constants_match_initrd_script() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/build-microvm-test-initrd.sh");
+        let text = std::fs::read_to_string(script).unwrap();
+        let find = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .filter_map(|l| l.strip_suffix('"'))
+                .map(str::to_owned)
+                .collect()
+        };
+        for (name, value) in [
+            ("meminfo_ok_message", MEMINFO_OK_MARKER),
+            ("meminfo_failed_message", MEMINFO_FAILED_MARKER),
+            ("meminfo_path", "/proc/meminfo"),
+        ] {
+            assert_eq!(
+                find(&format!("{name}=\"")),
+                vec![value.to_owned()],
+                "{name}"
+            );
+        }
+        // 前後の改行込みの長さが mov edx に焼き込まれている。
+        assert_eq!(MEMINFO_OK_MARKER.len() + 2, 36);
+        assert_eq!(MEMINFO_FAILED_MARKER.len() + 2, 40);
+    }
+
+    const MEMINFO_HEAD: &str =
+        "MemTotal:        5047640 kB\nMemFree:         4912000 kB\nMemAvailable:    4900000 kB\n";
+
+    #[test]
+    fn mvm1_4107_parse_mem_total_kb_values() {
+        assert_eq!(parse_mem_total_kb(MEMINFO_HEAD.as_bytes()), Ok(5_047_640));
+        // 前後に別の出力（カーネルログ・marker）があってもよい。
+        let wrapped =
+            format!("[    0.1] boot\n{MEMINFO_HEAD}\nfandhe-microvm-test: meminfo ok v1\n");
+        assert_eq!(parse_mem_total_kb(wrapped.as_bytes()), Ok(5_047_640));
+        // CRLF。
+        let crlf = MEMINFO_HEAD.replace('\n', "\r\n");
+        assert_eq!(parse_mem_total_kb(crlf.as_bytes()), Ok(5_047_640));
+        // u64 の最大値は受理する。
+        assert_eq!(
+            parse_mem_total_kb(b"MemTotal: 18446744073709551615 kB\n"),
+            Ok(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn mvm1_4107_parse_mem_total_kb_rejects_missing_duplicate_and_malformed() {
+        assert_eq!(parse_mem_total_kb(b""), Err("no MemTotal line"));
+        assert_eq!(
+            parse_mem_total_kb(b"MemFree: 1 kB\nXMemTotal: 1 kB\n"),
+            Err("no MemTotal line")
+        );
+        assert_eq!(
+            parse_mem_total_kb(b"MemTotal: 1 kB\nMemTotal: 2 kB\n"),
+            Err("more than one MemTotal line")
+        );
+        for bad in [
+            &b"MemTotal: 123\n"[..],
+            b"MemTotal: kB\n",
+            b"MemTotal:123 kB\n",
+            b"MemTotal: 12a kB\n",
+            b"MemTotal: -5 kB\n",
+            b"MemTotal: 5 MB\n",
+            b"MemTotal: 5 kB extra\n",
+            b"MemTotal: 5kB\n",
+            b"MemTotal:\n",
+        ] {
+            assert_eq!(
+                parse_mem_total_kb(bad),
+                Err("malformed MemTotal line"),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(
+            parse_mem_total_kb(b"MemTotal: \xff kB\n"),
+            Err("MemTotal line is not UTF-8")
+        );
+        assert_eq!(
+            parse_mem_total_kb(b"MemTotal: 18446744073709551616 kB\n"),
+            Err("MemTotal value overflows u64")
+        );
+        // 桁数の上限（21 桁）。
+        assert_eq!(
+            parse_mem_total_kb(b"MemTotal: 000000000000000000001 kB\n"),
+            Err("malformed MemTotal line")
+        );
+        let many = "x\n".repeat(MEM_TOTAL_MAX_LINES + 1);
+        assert_eq!(
+            parse_mem_total_kb(many.as_bytes()),
+            Err("too many lines to scan for MemTotal")
+        );
     }
 }

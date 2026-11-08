@@ -165,7 +165,7 @@ shim v2 の `Exec`・`Start(exec_id)`・`exec_id` つきの `State` / `Kill` / `
 - **B**: 呼び出し元は単一スレッドに限られるが shim デーモンは多スレッドで、`cri-streaming-server.md` の案 γ と同じ理由で成り立たない。単一スレッドの子を fork しても、状態照合・launch env・監査 sink・kind 6 / 7・stdio 種別の検査を二重に持つことになる。派生案（plugin-cri bin の `/proc/self/exe` に専用サブコマンドを足す）も、exec の領域が分散するため採らない
 - **C**: PLUG-1 の担当表（cri には本番の注入トレイトの実装も supervisor 依存も入れない）に反する。cri は非 Linux でもビルドされる共有部品で、supervisor の Linux 専用の sys を推移的に引き込み、PLUG-4 の観点でも core・cri の不変性を崩す
 
-A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（Linux のみ）。名前と分割の細部は #4148 で確定する。
+A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（Linux のみ）。#4148 では切り出さず `exec_launcher.rs` の項目を `pub(crate)` で再利用した（「後続の作業単位」の実装記録）。
 
 ### TaskExecProcess の各メソッドへの対応
 
@@ -278,13 +278,16 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 
 - **#4148 本体実装**: `exec_launcher.rs` の同期の中核を plugin-cri 内の共通モジュールへ切り出し、Linux 限定で `TaskExecLauncher` / `TaskExecProcess` を実装する（非 Linux は `UNIMPLEMENTED`）。偽の `HelperSpawner` による単体試験で、終了コード 0 / 3、SIGKILL だけが exec 子 cgroup に届き init には届かないこと、SIGKILL 以外が `UNIMPLEMENTED`、存在しないコンテナが `NOT_FOUND`、停止済みが `FAILED_PRECONDITION`、期限切れで helper を回収することを具体値で照合する。cri の依存は変えない。ただし `status()` が `Err` の exec にも `signal(SIGKILL)` を試みる経路と、SIGKILL 後に exec 子 cgroup の回収完了を確認して `Exited` へ遷移させる経路（「SIGKILL 後の消滅確認」）を launcher 側に実装し、単体試験で `Err` 保持中の SIGKILL 到達と、回収失敗時に `Exited` へ遷移しないことを照合する
 - **#4148 の追補（`TaskService` の変更。作業範囲に明記）**: `crates/cri/src/shim_v2/task_service.rs` の `kill_exec` は現状 `process.status().map_err(...)?` で早期 return し、`status()` が `Err` のとき `signal(SIGKILL)` に到達しない。`status()` の `Err` では拒否せず `signal(SIGKILL)` まで進める変更（`Exited` のときだけ `NOT_FOUND`）を、#4148 と同じ PR で `crates/cri/` に入れる（cri のコード変更であり、依存は変えない）。本設計の暫定動作の記述は、この変更が入るまでは現状の `kill_exec` と食い違う（REPAIR-3）
+- **#4148 の実装記録（本体は実装済み。配線は #4149）**: 起動役は `crates/plugin-cri/src/task_exec.rs`（Linux 実装は `task_exec/linux.rs`、非 Linux は `UNIMPLEMENTED` のスタブ）。共通モジュール `exec_helper.rs` への切り出しは行わず、`streaming/exec_launcher.rs` の `HelperGuard`・`Shared`・各期限定数・`HelperSpawner` を `pub(crate)` にして再利用した（移動のみのリファクタで既存の async 側の試験を動かすリスクを避けるため。重複するのは `launch` の順序だけ）。`TaskService::kill_exec` は `status()` が `Err` でも SIGKILL のときだけ `signal` へ進む。
+  - 消滅確認の暫定（REPAIR-3）: 上の「SIGKILL 後の消滅確認」は launcher からは観測できなかった。`ExecGuardPool` は supervisor の中にあり、`Started` の payload は 0 バイト、`Result` は不透明な `Failed(code)` で、exec 子 cgroup の名前（helper 内で生成）が plugin-cri に届かない。pid からの推測は pid 再利用による誤停止のため採らない。そこで差し込み口 `ExecExtinctionProbe` だけを置き、本番の `UnconfirmedExtinctionProbe` は常に `Unknown` を返す。kill・期限切れ・`Started` 後の `Failed` の exec は `Exited` にならず `status()` が `UNAVAILABLE`（"exec termination is not confirmed"）を保ち、Wait は失敗し Delete は除去を拒む。帰結として、これらの登録はコンテナ削除の purge まで残り、コンテナあたりの exec の枠を消費する。解消には supervisor 側の wire 拡張（`Started` へ cgroup 名を載せる、または新しい frame kind。8 バイトの payload を超えるため version 変更）が要り、後続候補とする
+  - `pid()` は `None`（State の pid は 0）。SIGKILL 以外・env・cwd・user は `UNIMPLEMENTED`
 - **#4149 配線**: `registry_in` で scoped root と同じ `StateStore` から launcher を作り、`TaskService::with_exec_launcher` で v2・v3 に差す。shim の停止時に追跡中の helper を kill する。「本番の実装は無い」の表記（`exec.rs`・`shim_v2.rs`・`shim.rs`・本メモの「残り」・`docs/setup/linux.md`）を更新する
 - **#4150 実機前提試験**: shim の ttrpc を直接叩き、最小の Process spec（env 空・cwd `/`・user なし・stdio なし）で exec し、CapEff・Seccomp・ns の inode・exec 子 cgroup の配置を具体値で init と照合する
 - **後続候補（未起票）**: stream-exec の Signal frame、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）
 
 ## 残り（REPAIR-3）
 
-- exec の起動役（`TaskExecLauncher`）の本番実装。exec は `UNIMPLEMENTED` のまま。方式は「Exec の橋渡し」節。実装は #4148・#4149、実機前提試験は #4150
+- exec の起動役（`TaskExecLauncher`）の配線。本体は #4148 で実装済み（`ShimExecLauncher`）だが差し込まれておらず、exec は `UNIMPLEMENTED` のまま。方式は「Exec の橋渡し」節。配線は #4149、実機前提試験は #4150
 - containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済み（D5・D6。#4151・#4152）。bin 経由の試験と未実装表記の全面更新は #4153
 - rootful での shim 対応（#2442・#2241 の判断待ち）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）

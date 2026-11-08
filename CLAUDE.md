@@ -77,6 +77,7 @@ fandhe-container/
 │   │   ├── microvm-dependencies.md  # rust-vmm 禁止クレートの判定結果の記録と TASK-74/75 後の再実行手順（TASK-73.3・MVM-4）
 │   │   ├── microvm-ioevent-wake.md  # ioeventfd 通知スレッドの停止を wake 用 eventfd で即時にする判断記録（起床回数の実測・`IOEVENT_IDLE_WAIT` の根拠・Weak 所有・再評価条件。#4160・MVM-1・CORE-7・REPAIR-5）
 │   │   ├── microvm-memory-ownership.md  # ゲスト物理メモリアクセス型の所有先（アクセス型は TASK-74.1 側・mmap と KVM 登録は TASK-75.1 側）と /dev/kvm 試験の分離の判断記録（Agent の記録した判断。TASK-74.1.3・#876・MVM-1・MVM-4）。末尾に HVF の複数領域・`hv_vm_protect` を対象外とするオーナー判断の記録（#4023・#4033・MVM-5）
+│   │   ├── microvm-virtio-ring-reset.md  # virtio の VIRTIO_F_RING_RESET（キュー個別の reset・再有効化）を非対応とする判断記録（提示しない・要求は拒否・再有効化は無視・復帰は Status=0 から。Agent の記録した判断。#4169・MVM-1・MVM-5）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）
 │   │   ├── io-fio-bench.md        # fio 4K ランダム write ベンチスクリプトの契約（TASK-25.1・IO-8）・Docker ベースライン計測手順・目標値案（TASK-25.2）
 │   │   ├── small-files-bench.md   # 小ファイル多数の files/s 計測ハーネスの計測定義（TASK-189・IO-6・IO-7・REPAIR-8。2 経路 wire〔UDS〕/ server-api・ゲートは wire〔#2074〕。metrics.json・BENCH_NAMES 登録済み・baseline 未登録）

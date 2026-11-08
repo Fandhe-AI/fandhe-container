@@ -117,6 +117,22 @@ impl MmioHandler {
         self.queue_notifies
     }
 
+    /// ACK / `DeviceReset` の後処理（resample）を呼んで計数する。`reset` なら `resets`、そうでなければ ACK の計数に数える（#4170）。
+    /// 失敗は VM を止める（fail-closed）。route が無ければ何もしない。vCPU を要さないため単体で試験できる。
+    fn run_ack_route(&self, device: &DeviceId, reset: bool) -> Result<(), MicrovmError> {
+        if let Some((_, route)) = self.ack_routes.iter().find(|(id, _)| id == device) {
+            let report = route.on_interrupt_ack()?;
+            if let Some((_, tally)) = self.ack_tallies.iter().find(|(id, _)| id == device) {
+                if reset {
+                    tally.record_reset();
+                } else {
+                    tally.record(&report);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 最後に受けた `QueueNotify`（デバイスとキュー番号）。
     pub fn last_queue_notify(&self) -> Option<(DeviceId, u16)> {
         self.last_queue_notify
@@ -160,13 +176,7 @@ pub fn handle_data_abort(
             access: MmioAccess::Write(MmioWriteOutcome::InterruptAcknowledged),
         } => {
             handler.interrupt_acks = handler.interrupt_acks.saturating_add(1);
-            // 失敗は VM を止める（fail-closed。trigger の失敗と同じ扱い）。
-            if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
-                let report = route.on_interrupt_ack()?;
-                if let Some((_, tally)) = handler.ack_tallies.iter().find(|(id, _)| id == device) {
-                    tally.record(&report);
-                }
-            }
+            handler.run_ack_route(device, false)?;
         }
         // Status=0 のリセットは `interrupt_status` を 0 にするため、level 線が上がったままにならないよう
         // ACK と同じ後処理（resample）を呼ぶ（MVM-5。`interrupt_acks` と ACK の計数には含めず、別カウンタ `resets` に数える。#4170）。
@@ -174,12 +184,7 @@ pub fn handle_data_abort(
             device,
             access: MmioAccess::Write(MmioWriteOutcome::DeviceReset),
         } => {
-            if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
-                route.on_interrupt_ack()?;
-                if let Some((_, tally)) = handler.ack_tallies.iter().find(|(id, _)| id == device) {
-                    tally.record_reset();
-                }
-            }
+            handler.run_ack_route(device, true)?;
         }
         DispatchOutcome::Mmio {
             device,
@@ -278,6 +283,40 @@ mod tests {
         let h = MmioHandler::with_dispatcher(d).with_ack_tallies(vec![(id, Arc::clone(&tally))]);
         assert_eq!(h.ack_tallies.len(), 1);
         assert_eq!(tally.snapshot().acks, 0);
+    }
+
+    /// `DeviceReset` の後処理は `resets` だけを加算し、ACK の計数（`acks`）を動かさない（#4170・MVM-5）。
+    #[test]
+    fn mvm5_4170_device_reset_counts_resets_not_acks() {
+        use crate::interrupt::{InterruptAckReport, LineResample};
+        #[derive(Debug)]
+        struct Fake;
+        impl InterruptAckRoute for Fake {
+            fn on_interrupt_ack(&self) -> Result<InterruptAckReport, MicrovmError> {
+                Ok(InterruptAckReport {
+                    remaining: 0,
+                    resample: LineResample::Deasserted,
+                })
+            }
+        }
+        let mut d = ExitDispatcher::new();
+        let block = VirtioMmioTransport::new(VirtioBlock::new(
+            MemoryBlockBackend::new(16 * 512, false).unwrap(),
+        ))
+        .unwrap();
+        let id = d
+            .register_mmio(0x0a00_0000, 0x200, Box::new(block))
+            .unwrap();
+        let tally = Arc::new(InterruptAckTally::default());
+        let h = MmioHandler::with_dispatcher(d)
+            .with_ack_routes(vec![(id, Arc::new(Fake))])
+            .with_ack_tallies(vec![(id, Arc::clone(&tally))]);
+        h.run_ack_route(&id, true).unwrap();
+        assert_eq!(tally.snapshot().resets, 1);
+        assert_eq!(tally.snapshot().acks, 0);
+        h.run_ack_route(&id, false).unwrap();
+        assert_eq!(tally.snapshot().resets, 1);
+        assert_eq!(tally.snapshot().acks, 1);
     }
 
     /// `QueueNotify` の route はデバイスの識別子で引かれ、保持される（#4028）。vCPU の経路は実機で確かめる（`hvf_microvm`）。

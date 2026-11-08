@@ -43,7 +43,7 @@ use crate::hvf_lifecycle::{deferred_reclaim_line, take_thread_reclaim};
 use crate::stop::StopReason;
 use crate::sysreg_os_lock::classify_os_lock_write;
 
-/// `run` 1 回あたりの期限の既定値（Linux の `VCPU_POLL_INTERVAL` に相当）。停止要求は kick で即時に届くため、この間隔には依らない。
+/// `run` 1 回あたりの期限の既定値（Linux の `VCPU_POLL_INTERVAL` と同じ役割。Linux 側は #4229 で 1 s に延ばしたが、本値は別に決めるため変えていない）。停止要求は kick で即時に届くため、この間隔には依らない。
 /// 期限切れは正常系（`wfi` の待ち等で戻らない実行）として継続する。
 pub const VCPU_RUN_SLICE: Duration = Duration::from_millis(100);
 /// [`LoopHandle::stop`] の期限の上限（異常な値で実質無期限になるのを防ぐ。REPAIR-5）。

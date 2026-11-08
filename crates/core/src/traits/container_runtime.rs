@@ -322,8 +322,9 @@ impl CreateRequest {
 /// CRI-6・SUP-4・SEC-1・PLUG-1）。真偽値 2 つではなく列挙にしたのは、
 /// `stdin=false, stdin_once=true` のような意味の無い組を表現できなくするため（REPAIR-2）。
 ///
-/// 現状（REPAIR-3）: core の `start` も plugin-cri もこの値をまだ読まない。cri の記録への保存と
-/// 運搬は C8（#4076）、supervisor の `--stdin` と保持は C4（#4074）が担う。
+/// 現状（REPAIR-3）: core の `start` はこの値を読まない。cri が記録の config（`stdin`・`stdin_once`・`tty`）から導いて
+/// 載せ（tty のコンテナは常に `Closed`。tty の入力は pty の master が担うため。#4076）、plugin-cri が supervisor の
+/// `--stdin <open|once>` へ写し（#4076）、supervisor が保持する（#4074）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum StdinMode {
@@ -356,7 +357,7 @@ impl StartRequest {
     }
 
     /// stdin の扱いを付ける（CRI-6・PLUG-1・#4073）。値を読むのは supervisor 側（C4 #4074）で、
-    /// 現時点の core の `start` は参照しない。
+    /// 現時点の core の `start` は参照しない（cri が記録から導いて載せ、plugin-cri が `--stdin` へ写す。#4076）。
     #[must_use]
     pub fn with_stdin(mut self, stdin: StdinMode) -> Self {
         self.stdin = stdin;

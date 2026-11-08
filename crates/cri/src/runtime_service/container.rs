@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::adapter::RuntimeTerminationReason;
 use crate::bundle::{AppliedUser, ResolvedImage};
 use crate::error::CriError;
-use fandhe_container_core::traits::ContainerLogPath;
+use fandhe_container_core::traits::{ContainerLogPath, StdinMode};
 use prost::Message;
 
 use super::config_limits::{
@@ -122,6 +122,15 @@ impl ContainerState {
     }
 }
 
+/// [`ContainerRecord::start_stdin_mode`] の実体（config だけから導く純関数。CRI-6・#4076）。
+pub(super) fn start_stdin_mode(config: &ContainerConfig) -> StdinMode {
+    match (config.tty, config.stdin, config.stdin_once) {
+        (true, _, _) | (false, false, _) => StdinMode::Closed,
+        (false, true, false) => StdinMode::Open,
+        (false, true, true) => StdinMode::Once,
+    }
+}
+
 /// レジストリに保持するコンテナ 1 件分の記録。
 ///
 /// `config` は内容を変えずに保持する（annotations を書き換えない CRI の要件）。`retained_bytes` は
@@ -218,6 +227,20 @@ fn exit_reason(
 }
 
 impl ContainerRecord {
+    /// StartContainer が実行層（`StartRequest::with_stdin`）へ運ぶ stdin の扱いを、記録の config から導く
+    /// （CRI-2・CRI-6・SEC-1・#4076。完全版 Attach の設計 D3・D4・D5）。
+    ///
+    /// OCI の config.json に欄が無い `stdin`・`stdin_once` は記録の `config`（永続記録 v1 でそのまま保存される）が持ち、
+    /// ここで 3 値へ畳む。別欄に持つと二重管理になるため、導出はこの純関数に一本化する。
+    ///
+    /// - `tty` が真なら常に `Closed`: tty の入力は pty の master が担い、`--stdin` を渡すと core が fork 前に
+    ///   `Pipe` と tty の併用として拒否する（D3）。tty での stdin の可否は C10（#4078）が RPC の時点で判断する。
+    /// - `stdin` が偽なら `Closed`（`stdin_once` だけでは何も開かない）。
+    /// - `stdin` が真なら `stdin_once` で `Once` / `Open`。
+    pub(super) fn start_stdin_mode(&self) -> StdinMode {
+        start_stdin_mode(&self.config)
+    }
+
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
     /// labels・annotations・mounts は保持した値を無改変で返す。`log_path` は結合済みの絶対パス（`resolved_log_path`。
@@ -803,6 +826,35 @@ mod tests {
             pod_sandbox_id: "sb".into(),
             config,
             sandbox_config: None,
+        }
+    }
+
+    /// CRI-6・#4076: tty × stdin × stdin_once の全 8 組が表どおりの `StdinMode` になる（tty は常に `Closed`）。
+    #[test]
+    fn cri6_start_stdin_mode_table() {
+        let table = [
+            // (tty, stdin, stdin_once, 期待)
+            (false, false, false, StdinMode::Closed),
+            (false, false, true, StdinMode::Closed),
+            (false, true, false, StdinMode::Open),
+            (false, true, true, StdinMode::Once),
+            (true, false, false, StdinMode::Closed),
+            (true, false, true, StdinMode::Closed),
+            (true, true, false, StdinMode::Closed),
+            (true, true, true, StdinMode::Closed),
+        ];
+        for (tty, stdin, stdin_once, want) in table {
+            let config = ContainerConfig {
+                tty,
+                stdin,
+                stdin_once,
+                ..base_config()
+            };
+            assert_eq!(
+                start_stdin_mode(&config),
+                want,
+                "tty={tty} stdin={stdin} stdin_once={stdin_once}"
+            );
         }
     }
 

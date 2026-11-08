@@ -298,6 +298,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 
 - tty: cri の `bundle/spec.rs` が `process.terminal: true` を config.json に出す（OCI の標準の欄）
 - stdin・stdin_once: OCI の config.json に欄が無いので、cri が CreateContainer で値を記録（再採用用の永続記録を含む。[cri-record-readoption.md](cri-record-readoption.md)）に保存し、StartContainer で core の `StartRequest` に 3 値の enum（例: `StdinMode::{Closed, Open, Once}`）として載せる。`with_log_path` と同じ builder の形にする。plugin-cri の `supervised.rs` が supervisor の argv に `--stdin <open|once>` を付ける（plugin-cri 専用。`start_contract` の契約に足す）。plugin-cri は起動オプション文書（FCOPT1）を書かないので使わない
+- 対応づけの位置（C8・#4076）: tty の有無と `stdin` / `stdin_once` から `StdinMode` を導くのは cri（`ContainerRecord::start_stdin_mode`。tty なら常に `Closed`、D3 のため）。`StdinMode` から `--stdin` の値への写しは plugin-cri（cri は supervisor に依存しない）。未知の `StdinMode` は起動前に `Unimplemented` で断る
 - 依存の向きは plugin-cri から cri / supervisor / core、supervisor から core のままで、新しい辺も外部依存も増えない（PLUG-1）
 
 **D5. `stdin_once`**
@@ -349,7 +350,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | C5 | #4072 | supervisor: 捕捉からの出力の tap（実装済み。sink 優先・背圧なし・溢れたら切断・購読者数の上限 8 は初期案。購読 API は `CaptureHub::subscribe_output`、kind 9 での受け渡しは C6） | なし |
 | C6 | #4075 | supervisor: kind 9 `AttachRequest` と fd 応答（実装済み: `control::protocol` の `AttachRequestFrame`・`control::server` の `handle_attach`・クライアント入口 `AttachIoSource` / `ControlAttach`。結線は C9） | C4・C5・#3759 |
 | C7 | #4073 | core: `StartRequest` の `StdinMode`（実装済み。`StartRequest::with_stdin` / `stdin`、既定 `Closed`。値の参照は C4・C8） | なし |
-| C8 | #4076 | cri: 記録への保存と StartContainer での運搬 | C7・C4 |
+| C8 | #4076 | cri: 記録への保存と StartContainer での運搬（実装済み: 記録の config〔永続記録 v1 のまま〕から `start_stdin_mode` で導き、`RuntimeAdapter::start_with_options` が `StartRequest::with_stdin` に載せる。plugin-cri の `supervised.rs` が `StartOptions::with_stdin` で argv `--stdin <open\|once>` へ写す。`bundle/spec.rs` の `tty/stdin` の拒否は C10 まで残すため、本番の CreateContainer はまだ通らない） | C7・C4 |
 | C9 | #4077 | plugin-cri: 完全版 `AttachBackend` | C6・C8・#3763・#3754・#3761 |
 | C10 | #4078 | cri: 拒否の解除と整合検査 | C3・C9 |
 | C11 | #4079 | 実機前提試験・手順・CI の追記 | C10 |

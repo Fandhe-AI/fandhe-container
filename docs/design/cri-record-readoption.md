@@ -5,7 +5,7 @@
 ## 背景
 
 - `fandhe-container-cri` の `CriRuntimeService` は、sandbox とコンテナの記録をプロセス内メモリの `SandboxRegistry` にだけ持つ。モジュール doc に「TASK-59 で `StateStore` に置き換えるスタブ」とある（REPAIR-3）が、TASK-59（#436）は closed で、再採用を追う open の issue が無かった
-- plugin-cri が再起動すると、コンテナ記録の CRI 層の項目が失われる。対象は `config`（metadata・labels・annotations・mounts・log_path）、`pod_sandbox_id`、重複判定キー `(sandbox_id, name, attempt)`、`resolved_image`（`image_ref`・`image_id`。#2863・#2831）、`resolved_log_path`、`applied_user`、`stop_signal`、各時刻、`exit_code`・`termination`。sandbox 記録も `PodSandboxConfig`、状態、`created_at`、`network_owned`・`pod_netns`、（#2871 以降）保持役の pid が失われる
+- plugin-cri が再起動すると、コンテナ記録の CRI 層の項目が失われる。対象は `config`（metadata・labels・annotations・mounts・log_path。`stdin`・`stdin_once`・`tty` も `config` の一部として v1 のまま保存され、再採用後の StartContainer の `StdinMode` の導出に使う。#4076）、`pod_sandbox_id`、重複判定キー `(sandbox_id, name, attempt)`、`resolved_image`（`image_ref`・`image_id`。#2863・#2831）、`resolved_log_path`、`applied_user`、`stop_signal`、各時刻、`exit_code`・`termination`。sandbox 記録も `PodSandboxConfig`、状態、`created_at`、`network_owned`・`pod_netns`、（#2871 以降）保持役の pid が失われる
 - 一方、実行層は再起動をまたいで残る。supervisor は `systemd-run --user --scope` で起動され plugin より長く生きる（SUP-5・CORE-1）。core の `FileStateStore`（`<状態ルート>/<id>/state.json`）は永続で、status・pid・supervision・cgroup・annotations を持つ。bundle は `<状態ルート>/.cri/bundles/<id>`、ネットワークの回収待ちは `.cri/net/pending-reclaim/` に残る
 - 結果、再起動後の kubelet からは「動いているコンテナが CRI に見えない」状態になり、bundle・core の状態・ネットワーク資源が孤児化する
 

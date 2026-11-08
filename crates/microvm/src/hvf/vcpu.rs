@@ -14,7 +14,7 @@
 //! （`GuestMapping` は `&HvVm` を借用する）を、[`VcpuHandle::stop`] が戻るまで保つこと。`stop` が期限切れになったら、
 //! スレッドが自力で終わるまで VM とゲスト RAM は残る（無期限の `join` はしない）。終わった時点で、スレッドが vCPU の破棄 →
 //! デバイスの参照 → RAM のスロットの clone（[`ExitHandlers::guest_memory`]）→ VM の順に落とし、最後の `Arc` として unmap・munmap・
-//! `hv_vm_destroy` を行う（#4032。vCPU スレッドからの `hv_vm_unmap`・`hv_vm_destroy` は実機未確認、#4034）。
+//! `hv_vm_destroy` を行う（#4032。回収の成功は `hvf_loop::spawn_loop` が `op=hvf.deferred_reclaim` の行で出す・#4146。#4034 の実機確認は間接の根拠のみ）。
 //!
 //! # 開始の制御と破棄の順序（TASK-192.16・#3798）
 //! [`VcpuThread::spawn_gated`] は vCPU を作って `setup` を済ませた後、[`VcpuHandle::open_start`] が呼ばれるまでゲストを走らせない

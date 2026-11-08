@@ -35,7 +35,8 @@
 //!   （[`diagnostics`]。上限・転送の規則・停止・残余は同モジュールの doc。#4171・REPAIR-4・REPAIR-5）。
 //! - セッションは最長 `MAX_EXEC_HOLD_SECS`（1 時間）で helper が止める（kubelet の idle 4 時間より短い）。
 //! - 同時セッション 64・回収できない helper の保持 8 は暫定値（#4116 のオーナー確認待ち）。
-//! - plugin-cri が SIGKILL された場合、helper は期限まで残る（PDEATHSIG を使わない設計。helper の doc を参照）。
+//! - plugin-cri が SIGKILL された場合も helper は channel の切断を検知して通常 2 秒以内に終わる（#4166。実機照合は #4167 の
+//!   `production_binary_exec_real` の段 4）。残る窓: listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れ（helper の doc を参照）。
 //! - `WindowSize` の 0 行・0 列はそのまま渡す（カーネルは受け付け、害が無い）。
 
 use std::fs::File;

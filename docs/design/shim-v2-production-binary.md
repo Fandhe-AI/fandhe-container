@@ -36,7 +36,7 @@ CRI-5・CRI-7・PLUG-1・PLUG-4・REPAIR-3・TASK-62.6 の判断記録。配布�
 
 ## D5 delete action の入口の検証と照合（#4151）
 
-containerd は shim が死んだ後や start が失敗した後に `-id <id> -bundle <path> delete` を起動する。親 #4102 の実行層の後始末のうち、本節は副作用の無い入口（検証と照合）だけを扱う。停止・回収・応答は #4152、bin 経由の回収試験と未実装表記の更新は #4153。
+containerd は shim が死んだ後や start が失敗した後に `-id <id> -bundle <path> delete` を起動する。親 #4102 の実行層の後始末のうち、本節は副作用の無い入口（検証と照合）だけを扱う。停止・回収・応答は #4152（実装済み。D6）、bin 経由の回収試験は #4153（`tests/shim_bin_delete_reclaim.rs`。下の「検証の状況」）。
 
 - 結線: cri の bootstrap に前段の注入口 `run_with_hooks` / `run_cli_with_hooks`（`before_delete`）を足し、plugin-cri の `shim::production_delete`（D5 の時点の名前は `production_delete_preflight`）を渡す（案 A）。前段は `ops.log` の計測区間の中で `run_delete` の前に呼ぶため、拒否も `ShimV2Delete` の失敗として残り、socket・lock には触れない。案 B（plugin-cri の bin が自前で引数を解析して事前検査する）は、失敗時の JSON 行の組み立て（serde_json）が cri にしか無く、複製するか plugin-cri に依存を足す（承認制）ことになるため採らない。既存の `run`・`run_with_context`・`run_cli_with_context` は前段が常に通る包みとして残す
 - `-id`: `parse_args` の identifier 規則（76 文字以内）が先に拒否する。core の `ContainerId` への変換は多層防御として残す
@@ -78,7 +78,7 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 
 ## 検証の状況
 
-- 既定の集合: `crates/plugin-cri/src/shim.rs` の単体（`cri5_3684_*`）、`tests/shim_bin_task_service.rs`（bin 経由の State・Kill が `NOT_FOUND`、Create 後の State が `CREATED` で pid 0、Delete 後は `NOT_FOUND`、Shutdown で socket が消える。v2・v3 の両方）、cri から移設した `shim_bin_bootstrap.rs`・`shim_bin_bootstrap_hardening.rs`（試験名・期待値は同じ。ttrpc の手組みは `tests/support/shim_wire.rs`）
+- 既定の集合: `crates/plugin-cri/src/shim.rs` の単体（`cri5_3684_*`）、`tests/shim_bin_task_service.rs`（bin 経由の State・Kill が `NOT_FOUND`、Create 後の State が `CREATED` で pid 0、Delete 後は `NOT_FOUND`、Shutdown で socket が消える。v2・v3 の両方）、cri から移設した `shim_bin_bootstrap.rs`・`shim_bin_bootstrap_hardening.rs`（試験名・期待値は同じ。ttrpc の手組みは `tests/support/shim_wire.rs`）、delete action の bin 経由の試験（#4153。`tests/shim_bin_delete_reclaim.rs`: 記録を直接作った Stopped・Created・状態ルートなしの 3 場面と、本物の start → ttrpc の Create → デーモンの SIGKILL → delete で終了コード 0・終了状態 0・状態ルートの `<id>` と残った socket が消え、2 回目は固定の応答〔137・exited_at あり〕で状態ルートが無い場合と欄が一致すること。記録がある状態での bundle 不一致・不正な id の拒否で記録が残ること。v2・v3 の両方）、`shim_bin_bootstrap.rs` の `cri5_4151_*`（記録が無い状態の不正な `-id`・`-bundle` の拒否）
 - 実機前提: `tests/shim_v2_containerd_real.rs`（手順は `docs/verification/real-machine-tests.md`）。CI の `platform-ci`（ubuntu）で実行（#4104）。ランナー以外の実機での記録は #3685（人間担当）
 - 停止の方法に SIGKILL を使う（コンテナ内のプローブに SIGTERM のハンドラを入れるには core の試験用 feature が要り、plugin-cri の dev-dependencies に足したくないため）。終了コードの期待値 137（128 + SIGKILL）は実機で確かめる
 
@@ -287,7 +287,7 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 
 ## 残り（REPAIR-3）
 
-- containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済み（D5・D6。#4151・#4152）。bin 経由の試験と未実装表記の全面更新は #4153
+- containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済みで、bin 経由の試験も済み（D5・D6。#4151・#4152・#4153）。回収しない場合（Creating の記録・supervisor が居ない Running の記録。fail-closed）は D6 の「残余」、実 containerd での確認は #3685
 - rootful での shim 対応（#2442・#2241 の判断待ち）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）
 

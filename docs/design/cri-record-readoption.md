@@ -343,7 +343,7 @@ kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確�
 
 | 記号 | issue | 内容 | 依存 |
 | ---- | ----- | ---- | ---- |
-| E1 | #4174 | `ContainerStatus` の観測。取り込みの共通関数の切り出し、`CriOpKind` の追加、`runtime_service.rs` のモジュール doc の「読み取り専用」の更新 | #4173 |
+| E1 | #4174 | `ContainerStatus` の観測。取り込みの共通関数の切り出し、`CriOpKind` の追加、`runtime_service.rs` のモジュール doc の「読み取り専用」の更新（実装済み。#4174） | #4173 |
 | E2 | #4175 | `ListContainers` の観測。`crates/plugin-cri/tests/cri_attach_real.rs` の「終了コードは StopContainer の後に読む」前提の記述の更新（照合は弱めない） | E1 |
 | E3 | 未起票 | 再採用で core の終了の値を使う（`CorePresence` の型変更・照合表の更新・試験）。追跡 issue の起票は main が行う | E1 |
 

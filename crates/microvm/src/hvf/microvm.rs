@@ -68,7 +68,7 @@
 //! - 採らない案 1「`hv_vcpu_destroy` を呼ばず `hv_vm_destroy` に任せる」: vCPU が残ったままの `hv_vm_destroy` の成功が文書に無い。
 //!   失敗（`HV_BUSY` 等）すると `VM_EXISTS` が立ったままになり、同じプロセスで二度と VM を作れない。
 //! - 採らない案 2「vCPU スレッドで `hv_vm_destroy` まで行う」: 通常の停止と assemble の失敗経路では採らない（unmap と destroy は停止を
-//!   呼んだスレッドで行う）。期限切れの経路に限って、切り離したスレッドの終了時の回収として採る（#4032。下の「期限切れ」の節。実機未確認 #4034）。
+//!   呼んだスレッドで行う）。期限切れの経路に限って、切り離したスレッドの終了時の回収として採る（#4032。下の「期限切れ」の節。#4034 の実機確認は間接の根拠のみ・直接の行は #4146）。
 //! - 実機では破棄の後に同じプロセスで作り直せて、`stop` の所要は合成ゲストで 103〜241 µs だった（#3803）。
 //!
 //! ## 期限切れ（`TIMEOUT`）のとき（#4032）
@@ -78,9 +78,10 @@
 //! → VM）で最後の `Arc` が落ち、`hv_vm_unmap` → munmap → `hv_vm_destroy` が走って「1 プロセス 1 VM」の占有が戻る。スレッドが終わる
 //! までは何も解放されず、同じプロセスでの再 assemble は `FailedPrecondition` になる。`hv_vm_unmap` が失敗したら backing は
 //! リークし、`op=hvf.vm_unmap` の行で記録する。
-//! 実機未確認（#4034）: vCPU スレッドから `hv_vm_unmap`・`hv_vm_destroy` を呼べること（Apple の文書は VM の teardown の
-//! スレッドを規定しない）。順序の単体試験は偽の資源（`hvf_lifecycle` の試験）で固定し、`vcpu.rs` の終わりの呼び出しは型検査と
-//! main の macOS CI・#4034 で確かめる。
+//! #4034 の実機確認では、切り離した vCPU スレッドの終了後に `op=hvf.vm_unmap outcome=error` が出ず、同じプロセスで VM を作り直せた
+//! （destroy が失敗すると排他を戻さないため、作り直せたことは destroy の成功を意味する。間接の根拠）。回収がそのスレッドの上で成功した
+//! ことを直接示す行 `op=hvf.deferred_reclaim`（`outcome=ok thread=hvf-vcpu-N released=guest_ram,vm`）は #4146 で足した。通常の
+//! `stop` では出ない。順序の単体試験は偽の資源（`hvf_lifecycle` の試験）で固定する。
 //! 回収されない経路: `release_devices` の失敗（デバイスの保持者が lock を持ち、デバイスが RAM・VM より後に落ちうる）と、RAM の
 //! 取得失敗（`take_within` の期限切れ・毒化。`GuestMemorySlot` がリーク）は、従来どおりプロセスの終了まで残る（plugin-microvm による再起動。#3800）。
 //! 巻き戻り（panic）時の drop 順は保証しない。

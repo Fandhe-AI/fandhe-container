@@ -462,8 +462,8 @@ pub(crate) fn blob_trust_violation(
 ///
 /// 「digest 検証済みの blob」という呼び出し契約を型で表す。構築経路は 2 本で、(a) [`VerifiedLayerBlob::open`] は
 /// パスを [`open_blob_nofollow`] で symlink を辿らずに開く。(b) [`VerifiedLayerBlob::from_file`] は呼び出し側が開いた
-/// ハンドルを受ける（本番の入力は `PullSession::open_verified_staged_blob` が pull ディレクトリの fd 起点で開いたもの。
-/// OCI-7・SEC-1・CRI-3・#2893）。どちらも (1) 同じハンドルの
+/// ハンドルを受ける（本番の入力は `PullSession::open_verified_staged_blob` / `open_leased_blob` が fd 起点で開いたもの。
+/// OCI-7・SEC-1・CRI-3・#2893・#4179）。`open` は create の経路（`bundle/image_rootfs.rs`）が使う。どちらも (1) 同じハンドルの
 /// fstat で信頼条件（通常ファイル・所有者・ハードリンク数 1・group / other 書き込み不可）を確かめ、(2) 同じハンドルを
 /// [`verify_blob_file_digest`] で検証する。不変条件は「検証したハンドルから展開する」で、以後の展開はこのハンドルから読み、パスを開き直さないため、
 /// 検証と展開の間にパスのエントリを別のファイルへ差し替えられても展開物は変わらない。

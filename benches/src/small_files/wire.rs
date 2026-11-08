@@ -39,10 +39,13 @@
 //!
 //! 結果の `io2_guaranteed` は every-k で `false`（#1886 の spec 確認事項 (b) の回答待ち）。
 
-use super::{Plan, SmallFilesError, WorkDir, flush_timeout, from_io, guest_path, merge_cleanup};
+use super::{
+    Plan, SmallFilesError, WorkDir, flush_timeout, from_io, guest_path, merge_cleanup,
+    new_guest_file_creator,
+};
 use fandhe_container_io::{
     AckReceipt, BatchConfig, DEFAULT_BATCH_SIZE, DEFAULT_MAX_OPEN_FILES, FileServeLimits,
-    FileServeReport, GuestFileCreator, GuestPath, InFlightLimit, IoTimeout, MAX_IO_TIMEOUT,
+    FileServeReport, GuestPath, InFlightLimit, IoTimeout, MAX_IO_TIMEOUT,
     MAX_MAX_RETAINED_DIRTY_FILES, MAX_UNFLUSHED_MAX_BYTES, MAX_UNFLUSHED_MAX_FRAMES, MaxOpenFiles,
     MaxRetainedDirtyFiles, NoopSendObserver, NoopServerObserver, PersistSupport, PipelineClient,
     ReceiveLimits, UdsClientConnection, UdsServer, UdsServerPolicy, UnflushedLimit,
@@ -140,21 +143,24 @@ fn run_with_socket_dir(
             "the socket path exceeds the sun_path limit; set a shorter TMPDIR",
         ));
     }
-    let io_max = || IoTimeout::new(MAX_IO_TIMEOUT).map_err(|e| from_io(&e));
+    let io_max = || IoTimeout::new(MAX_IO_TIMEOUT).map_err(|e| from_io("create io timeout", &e));
 
     // 区間の外: server の起動と接続、body の用意。
-    let creator = GuestFileCreator::new(trial_root.to_path_buf()).map_err(|e| from_io(&e))?;
+    let creator = new_guest_file_creator(trial_root)?;
     let mut server = UdsServer::bind(&socket, ReceiveLimits::default(), NoopServerObserver)
-        .map_err(|e| from_io(&e))?;
+        .map_err(|e| from_io("bind uds server", &e))?;
     let accept_timeout = io_max()?;
-    let batch = BatchConfig::new(WIRE_SERVER_BATCH).map_err(|e| from_io(&e))?;
+    let batch =
+        BatchConfig::new(WIRE_SERVER_BATCH).map_err(|e| from_io("create batch config", &e))?;
     let limits = FileServeLimits::new(
-        MaxOpenFiles::new(DEFAULT_MAX_OPEN_FILES).map_err(|e| from_io(&e))?,
+        MaxOpenFiles::new(DEFAULT_MAX_OPEN_FILES)
+            .map_err(|e| from_io("create max open files", &e))?,
         UnflushedLimit::new(MAX_UNFLUSHED_MAX_FRAMES, MAX_UNFLUSHED_MAX_BYTES)
-            .map_err(|e| from_io(&e))?,
+            .map_err(|e| from_io("create unflushed limit", &e))?,
     )
     .with_max_retained_dirty_files(
-        MaxRetainedDirtyFiles::new(MAX_MAX_RETAINED_DIRTY_FILES).map_err(|e| from_io(&e))?,
+        MaxRetainedDirtyFiles::new(MAX_MAX_RETAINED_DIRTY_FILES)
+            .map_err(|e| from_io("create max retained dirty files", &e))?,
     )
     .with_flush_timeout(io_max()?);
     let timeouts = WritebackTimeouts {
@@ -169,7 +175,7 @@ fn run_with_socket_dir(
                 Ok(mut conn) => Ok(serve_file_connection_with_limit(
                     &mut conn, batch, limits, &creator, timeouts,
                 )),
-                Err(e) => Err(from_io(&e)),
+                Err(e) => Err(from_io("accept connection", &e)),
             };
             // ソケットファイルを先に片付けてから結果を返す。
             // Windows では UdsServer が Drop を持たない（UDS の wire 経路は Linux / macOS のみ実行）ため lint を許す。
@@ -193,8 +199,9 @@ fn run_with_socket_dir(
         ReceiveLimits::default(),
         NoopServerObserver,
     )
-    .map_err(|e| from_io(&e))?;
-    let limit = InFlightLimit::new(2 * WIRE_SERVER_BATCH).map_err(|e| from_io(&e))?;
+    .map_err(|e| from_io("connect uds client", &e))?;
+    let limit = InFlightLimit::new(2 * WIRE_SERVER_BATCH)
+        .map_err(|e| from_io("create in-flight limit", &e))?;
     let mut pc = PipelineClient::new(conn, limit, NoopSendObserver);
 
     // 計測区間。
@@ -208,26 +215,26 @@ fn run_with_socket_dir(
             .map_err(|_| SmallFilesError::new("io-error", "synthetic guest path was rejected"))?;
         let handle_id = pc
             .create(&path, flush_timeout(deadline)?)
-            .map_err(|e| from_io(&e))?;
+            .map_err(|e| from_io("send create", &e))?;
         count_sent(&mut pc, &mut buffered, deadline)?;
         pc.write_file(handle_id, &body, flush_timeout(deadline)?)
-            .map_err(|e| from_io(&e))?;
+            .map_err(|e| from_io("send write", &e))?;
         count_sent(&mut pc, &mut buffered, deadline)?;
         pc.close(handle_id, flush_timeout(deadline)?)
-            .map_err(|e| from_io(&e))?;
+            .map_err(|e| from_io("send close", &e))?;
         count_sent(&mut pc, &mut buffered, deadline)?;
 
         // i + 1 は count <= 50,000 のため溢れない。
         if (i + 1) % plan.batch_size == 0 || i + 1 == plan.count {
             pc.flush(flush_timeout(deadline)?)
-                .map_err(|e| from_io(&e))?;
+                .map_err(|e| from_io("send flush", &e))?;
             while buffered > 0 {
                 expect_write_ack(&mut pc, deadline)?;
                 buffered -= 1;
             }
             match pc
                 .recv_ack(flush_timeout(deadline)?)
-                .map_err(|e| from_io(&e))?
+                .map_err(|e| from_io("receive flush ack", &e))?
             {
                 AckReceipt::Flush(_) => {}
                 _ => return Err(unexpected_ack()),
@@ -268,7 +275,7 @@ fn expect_write_ack(
 ) -> Result<(), SmallFilesError> {
     match pc
         .recv_ack(flush_timeout(deadline)?)
-        .map_err(|e| from_io(&e))?
+        .map_err(|e| from_io("receive write ack", &e))?
     {
         AckReceipt::Write(_) => Ok(()),
         AckReceipt::Rejected(r) => Err(SmallFilesError::new(

@@ -222,10 +222,14 @@ pub enum WritePoll {
 ///
 /// 呼び出し元は `supervisor_attach` の入力スレッド。blocking の `write` の前に呼び、取り消しを見ながら
 /// 有限の刻みで待つことで、コンテナが stdin を読まなくても回収できるようにする（REPAIR-5）。
-/// 失敗（`poll` の `EINTR` 以外のエラー）は `Err`。非対応の組では常に `Err(Unsupported)`（呼び出し側は書き込みを諦める）。
+/// 失敗（`poll` の `EINTR` 以外のエラー）は `Err`。非対応の組では常に `Err(Unsupported)`
+/// （呼び出し側は書き込みを諦め、警告を一度だけ出す。REPAIR-4・#4135）。
+///
+/// `timeout_ms` は `u16`（最大 65535 ms）。`0` はすぐに返る。`poll` に負の値を渡すと無期限に待つため、負の期限は
+/// 型で表現できないようにしてある（REPAIR-5・#4135）。
 pub fn poll_writable(
     fd: std::os::fd::BorrowedFd<'_>,
-    timeout_ms: i32,
+    timeout_ms: u16,
 ) -> std::io::Result<WritePoll> {
     poll_imp::poll_writable(fd, timeout_ms)
 }
@@ -268,7 +272,7 @@ mod poll_imp {
         fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
     }
 
-    pub(super) fn poll_writable(fd: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WritePoll> {
+    pub(super) fn poll_writable(fd: BorrowedFd<'_>, timeout_ms: u16) -> std::io::Result<WritePoll> {
         let mut pfd = PollFd {
             fd: fd.as_raw_fd(),
             events: POLLOUT,
@@ -276,7 +280,8 @@ mod poll_imp {
         };
         // SAFETY: `pfd` は 1 要素の有効な `struct pollfd` で、`nfds` は 1。呼び出しの間 `fd`（BorrowedFd）は開いたまま。
         // `poll` は `revents` だけを書き、保持しない。
-        let rc = unsafe { poll(&raw mut pfd, 1, timeout_ms) };
+        // 期限は `u16` から変換するので常に 0 以上で、無期限の待ち（負の値）は表現できない。
+        let rc = unsafe { poll(&raw mut pfd, 1, i32::from(timeout_ms)) };
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             return if e.kind() == std::io::ErrorKind::Interrupted {
@@ -312,7 +317,7 @@ mod poll_imp {
 
     pub(super) fn poll_writable(
         _fd: BorrowedFd<'_>,
-        _timeout_ms: i32,
+        _timeout_ms: u16,
     ) -> std::io::Result<WritePoll> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
@@ -346,5 +351,64 @@ mod tests {
         assert_eq!(received(), Some(ShutdownSignal::Int));
         assert_eq!(ShutdownSignal::Int.as_str(), "SIGINT");
         assert_eq!(ShutdownSignal::Term.as_str(), "SIGTERM");
+    }
+
+    type Pair = (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    );
+
+    /// 書き込み側を満杯にした socketpair（`WouldBlock` まで書く）。
+    fn full_socket() -> Pair {
+        use std::io::Write as _;
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        a.set_nonblocking(true).expect("nonblocking");
+        let buf = [0u8; 4096];
+        loop {
+            match a.write(&buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill failed: {e}"),
+            }
+        }
+        (a, b)
+    }
+
+    /// 期限の型は負にならず、`poll` へ渡す値は常に 0 以上（無期限の待ちにならない。REPAIR-5・CRI-6・#4135）。
+    #[test]
+    fn cri6_repair5_4135_timeout_converts_without_going_negative() {
+        use std::os::fd::AsFd as _;
+        assert_eq!(i32::from(u16::MIN), 0);
+        assert_eq!(i32::from(u16::MAX), 65_535);
+        let (a, _b) = full_socket();
+        let t = std::time::Instant::now();
+        assert_eq!(
+            poll_writable(a.as_fd(), 0).expect("poll"),
+            WritePoll::NotReady
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// 有限の期限が効く（満杯の fd で 10 ms 待って `NotReady`）。
+    #[test]
+    fn cri6_repair5_4135_finite_timeout_expires() {
+        use std::os::fd::AsFd as _;
+        let (a, _b) = full_socket();
+        let t = std::time::Instant::now();
+        assert_eq!(
+            poll_writable(a.as_fd(), 10).expect("poll"),
+            WritePoll::NotReady
+        );
+        let e = t.elapsed();
+        assert!(e >= std::time::Duration::from_millis(9), "{e:?}");
+        assert!(e < std::time::Duration::from_secs(5), "{e:?}");
+    }
+
+    /// 陽性対照: 空きのある socket は `Ready`。
+    #[test]
+    fn cri6_repair5_4135_writable_socket_is_ready() {
+        use std::os::fd::AsFd as _;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        assert_eq!(poll_writable(a.as_fd(), 0).expect("poll"), WritePoll::Ready);
     }
 }

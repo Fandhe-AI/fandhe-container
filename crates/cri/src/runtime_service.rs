@@ -4106,9 +4106,13 @@ impl CriRuntimeService {
         let adapter = binding.adapter.clone();
         let recorder = Arc::clone(&self.recorder);
         let budget = self.exit_observe_timeout.min(LIST_EXIT_OBSERVE_BUDGET);
-        // worker が期限後に遅れて完了しても、番人の `Drop` が排他と印を外す。結果は使わない
-        // （計測は worker が行い、期限切れでも RPC は成功させる）。
-        let _ = run_bounded(budget, move || {
+        // worker が期限後に遅れて完了しても、番人の `Drop` が排他と印を外す。RPC は期限切れ・worker の
+        // 起動失敗でも成功させるが、その結果は呼び出し側が 1 件記録する（REPAIR-4）。期限切れ後に
+        // 遅れて完了した worker は `expired` を見て記録しない（二重計上と、後からの OK だけの記録を防ぐ）。
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_expired = Arc::clone(&expired);
+        let bounded = run_bounded(budget, move || {
             let _busy = busy;
             let started = std::time::Instant::now();
             let mut skipped = truncated;
@@ -4125,16 +4129,22 @@ impl CriRuntimeService {
                     .map(|_| ())
                     .map_err(|e| Status::from(e.clone()));
                 mark.finish(&result);
+                if worker_expired.load(Ordering::Acquire) {
+                    continue;
+                }
                 timer.finish_with(&observed);
             }
-            if skipped {
+            if skipped && !worker_expired.load(Ordering::Acquire) {
                 let timer = CriOpTimer::start(recorder.as_ref(), CriOpKind::ContainerExitObserve);
                 timer.finish_with::<()>(&Err(Status::from(CriError::resource_exhausted(
                     "list exit observation was truncated",
                 ))));
             }
-        })
-        .await;
+        });
+        if let Err(e) = bounded.await {
+            expired.store(true, Ordering::Release);
+            timer.finish_with::<()>(&Err(Status::from(e)));
+        }
         Ok(())
     }
 

@@ -800,6 +800,8 @@ mod tests {
         wrong_id: bool,
         /// state が返す状態の上書き（終了コード等を差し込む）。
         preset: Mutex<HashMap<String, ContainerStatus>>,
+        /// `Kill(all=true)` を配置の記録が無いコンテナと同じ `FailedPrecondition` で失敗させる（#4055）。
+        kill_all_err: bool,
     }
 
     struct Shared(Arc<Fake>);
@@ -851,6 +853,17 @@ mod tests {
                 }
                 _ => format!("kill {id} {}", r.signal().as_u8()),
             });
+            if self.0.kill_all_err
+                && matches!(
+                    r.target(),
+                    fandhe_container_core::traits::KillTarget::AllProcesses
+                )
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "no cgroup placement recorded",
+                ));
+            }
             Ok(ContainerStatus::running(
                 r.id().clone(),
                 NonZeroU32::new(4242),
@@ -1484,6 +1497,25 @@ mod tests {
             err_code(s.handle("Kill", &kill_req("zz", 9, false, ""))).0,
             NOT_FOUND
         );
+    }
+
+    /// CRI-5・CORE-4・#4055: 配置の記録が無いコンテナへの `Kill(all=true)` は core の `FailedPrecondition` が
+    /// shim の層で code 9 に写る（init だけを殺す縮退をしない）。`all=false` は影響を受けない。
+    /// core 側は `cri5_kill_all_without_placement_is_failed_precondition`、実 cgroup の照合は `shim_v2_kill_all_real`。
+    #[test]
+    fn cri5_4055_kill_all_failed_precondition_maps_to_code_9() {
+        let (s, f) = svc(
+            TaskApiVersion::V2,
+            Fake {
+                kill_all_err: true,
+                ..Fake::default()
+            },
+        );
+        running_container(&s, "c1");
+        let (code, _) = err_code(s.handle("Kill", &kill_req("c1", 9, true, "")));
+        assert_eq!(code, PRECOND);
+        assert_eq!(f.calls.lock().unwrap().last().unwrap(), "kill-all c1 9");
+        s.handle("Kill", &kill_req("c1", 9, false, "")).unwrap();
     }
 
     /// CRI-5・TASK-62.7.2: 停止済みへの Kill は NOT_FOUND で、シグナルを送らない。

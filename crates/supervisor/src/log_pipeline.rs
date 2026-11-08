@@ -420,7 +420,15 @@ mod tap_tests {
     }
 
     fn timed(s: &UnixStream) {
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        match s.set_read_timeout(Some(Duration::from_secs(10))) {
+            Ok(()) => {}
+            // macOS (XNU) の `sosetopt` は、送受信の両方向が閉じた socket への
+            // setsockopt に EINVAL (22) を返す。その状態の read は待たずに
+            // バッファのデータか EOF を返すため期限は不要で、無視してよい。
+            // 他 OS と他のエラーは従来どおり panic させる (#4144)。
+            Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(22) => {}
+            Err(e) => panic!("set_read_timeout: {e}"),
+        }
     }
 
     fn read_n(s: &mut UnixStream, n: usize) -> Vec<u8> {

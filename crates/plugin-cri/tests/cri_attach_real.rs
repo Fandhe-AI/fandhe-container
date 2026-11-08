@@ -17,7 +17,8 @@
 //!
 //! 残余（REPAIR-3）: 実 crictl（`crictl attach -i -t`）・kubectl での確認は人間担当（#3730 の子）。`StdinNotOpen` は
 //! 既定の集合（`crates/cri/tests/streaming_attach.rs`）で照合済みのため扱わない。attach の Status は終了コードを持たないので、
-//! 終了コードは `StopContainer` で実行層の状態を取り込んだ後の `ContainerStatus` で見る（CRI の記録は自然終了を自動では観測しない）。
+//! 終了コードは、`StopContainer` を送らずに CRI が自然終了を観測して exited にした後の `ContainerStatus` で見る
+//! （`ContainerStatus`・`ListContainers` は running の記録について実行層の状態を読む。#4174・#4175・CRI-1・CRI-2）。
 //!
 //! Linux 限定の理由: 本番の既定の状態ルート・supervisor・Landlock・cgroup v2・pty は Linux でだけ成り立つ（`cri_exec_real.rs` と同じ）。
 
@@ -54,6 +55,8 @@ const IMAGE: &str = "docker.io/library/busybox:1.36";
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
+/// StopContainer を送らずに自然終了の観測（exited）を待つ上限（#4175。試験の watchdog より十分短い）。
+const NATURAL_EXIT_DEADLINE: Duration = Duration::from_secs(30);
 /// pull の期限（ImageService の pull 期限 540 秒に収まる範囲）。
 const PULL_DEADLINE: Duration = Duration::from_secs(300);
 /// 試験全体の上限。CI の補助の期限（540 秒）より先に効かせる（REPAIR-5）。
@@ -305,13 +308,56 @@ async fn container_status(c: &mut RuntimeServiceClient<Channel>, id: &str) -> cr
     .expect("status body")
 }
 
-/// セッションが終わった（tap の EOF = コンテナの終了）後に `StopContainer` で CRI の記録を実行層の状態へ照合し、
-/// `CONTAINER_EXITED` と終了コードを返す。
+/// セッションが終わった（tap の EOF = コンテナの終了）後、`StopContainer` を送らずに CRI が自然終了を観測するのを
+/// 待ち、`CONTAINER_EXITED` の `ContainerStatus` を返す（#4174・#4175。CRI-1・CRI-2・REPAIR-12）。
 ///
-/// CRI の `ContainerStatus` は記録だけを返し、自然終了を自動では観測しない（`StopContainer` が実行層の停止済みの報告と
-/// 終了コードを取り込む。観測の自動化は本試験の範囲外）。EOF が届かず SIGTERM で止まったなら終了コードは 0 にならないため、
-/// 0 の照合が「EOF / `exit` で自然に終わった」ことの証拠になる。
-async fn stop_and_exit_code(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
+/// `ContainerStatus` は running の記録について実行層の状態を期限つきで読み、停止済みなら終了コードを取り込む。
+/// 取り込みが 1 回で済まないことがあるため、期限（[`NATURAL_EXIT_DEADLINE`]）つきで繰り返し読む。
+/// `StopContainer` を送らないので、SIGTERM で止まった可能性が無く、終了コード 0 の照合が「EOF / `exit` で自然に
+/// 終わった」ことのより強い証拠になる。期限内に exited にならなければ失敗する。
+async fn wait_natural_exit(
+    c: &mut RuntimeServiceClient<Channel>,
+    id: &str,
+) -> cri::ContainerStatus {
+    let deadline = Instant::now() + NATURAL_EXIT_DEADLINE;
+    loop {
+        let st = container_status(c, id).await;
+        if st.state == cri::ContainerState::ContainerExited as i32 {
+            return st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "container must be observed as exited without StopContainer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 自然終了の観測の後の照合（`ListContainers` の EXITED フィルタに 1 件だけ返ること、続く `StopContainer` が
+/// 冪等に成功して終了コード・終了時刻が変わらないこと）をまとめて行い、終了コードを返す（#4175・E2 の本番経路での確認）。
+async fn exited_exit_code(c: &mut RuntimeServiceClient<Channel>, id: &str) -> i32 {
+    let observed = wait_natural_exit(c, id).await;
+    let listed = call_with_deadline(
+        c.list_containers(cri::ListContainersRequest {
+            filter: Some(cri::ContainerFilter {
+                id: id.into(),
+                state: Some(cri::ContainerStateValue {
+                    state: cri::ContainerState::ContainerExited as i32,
+                }),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers;
+    assert_eq!(
+        listed.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+        vec![id],
+        "ListContainers with the EXITED filter must return the naturally exited container"
+    );
     call_with_deadline(
         c.stop_container(cri::StopContainerRequest {
             container_id: id.into(),
@@ -320,10 +366,14 @@ async fn stop_and_exit_code(c: &mut RuntimeServiceClient<Channel>, id: &str) -> 
         Duration::from_secs(120),
     )
     .await
-    .expect("stop");
-    let st = container_status(c, id).await;
-    assert_eq!(st.state, cri::ContainerState::ContainerExited as i32);
-    st.exit_code
+    .expect("idempotent stop after natural exit");
+    let after = container_status(c, id).await;
+    assert_eq!(
+        (after.state, after.exit_code, after.finished_at),
+        (observed.state, observed.exit_code, observed.finished_at),
+        "StopContainer after the observed exit must not change the recorded values"
+    );
+    observed.exit_code
 }
 
 async fn create_and_start(
@@ -494,7 +544,7 @@ async fn production_binary_attach_real() {
             .await
             .expect("scene A deadline")
             .expect("scene A join");
-        assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
+        assert_eq!(exited_exit_code(&mut c, &id).await, 0);
         let st = call_with_deadline(
             c.attach(attach_request(&id, true, true, true, false)),
             RPC_DEADLINE,
@@ -543,7 +593,7 @@ async fn production_binary_attach_real() {
             .await
             .expect("scene B deadline")
             .expect("scene B join");
-        assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
+        assert_eq!(exited_exit_code(&mut c, &id).await, 0);
         remove(&mut c, &id).await;
 
         // 後始末。

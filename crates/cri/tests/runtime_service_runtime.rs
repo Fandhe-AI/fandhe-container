@@ -89,6 +89,10 @@ struct FakeRuntime {
     hold_state: AtomicBool,
     /// state の呼び出し回数（#4174）。
     state_calls: std::sync::atomic::AtomicU64,
+    /// ID ごとの stopped 応答（終了コード・終了検知時刻）。全体の切り替えより先に見る（#4175）。
+    state_stopped_ids: Mutex<std::collections::HashMap<String, (i32, i64)>>,
+    /// ID ごとの state の失敗（#4175）。
+    fail_state_ids: Mutex<std::collections::HashMap<String, ErrorCode>>,
     /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
     start_log_paths: Mutex<Vec<Option<String>>>,
     /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
@@ -216,6 +220,22 @@ impl ContainerRuntime for Shared {
         self.0.state_calls.fetch_add(1, Ordering::SeqCst);
         while self.0.hold_state.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(c) = self.0.fail_state_ids.lock().unwrap().get(r.id().as_str()) {
+            return Err(TraitError::new(*c, "state failed"));
+        }
+        if let Some((code, at)) = self
+            .0
+            .state_stopped_ids
+            .lock()
+            .unwrap()
+            .get(r.id().as_str())
+        {
+            return Ok(ContainerStatus::stopped_at(
+                r.id().clone(),
+                Some(*code),
+                ExitTime::from_unix_nanos(*at),
+            ));
         }
         if let Some(c) = *self.0.fail_state.lock().unwrap() {
             return Err(TraitError::new(c, "state failed"));
@@ -2775,4 +2795,225 @@ async fn cri_2_4174_remove_during_observation_is_not_resurrected() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let err = status_result(&service, &id).await.expect_err("removed");
     assert_eq!(err.code(), Code::NotFound);
+}
+
+// ---- #4175（#4173 の E2）: ListContainers の状態フィルタでの自然終了の取り込み ----
+
+async fn list_with_state(service: &CriRuntimeService, state: Option<S>) -> Vec<v1::Container> {
+    RuntimeService::list_containers(
+        service,
+        Request::new(v1::ListContainersRequest {
+            filter: Some(v1::ContainerFilter {
+                state: state.map(|s| v1::ContainerStateValue { state: s as i32 }),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("list")
+    .into_inner()
+    .containers
+}
+
+async fn running_n(h: &Harness, n: usize) -> Vec<String> {
+    let sb = run_sandbox(&h.service).await;
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let id = create(&h.service, &sb, &format!("c{i}"))
+            .await
+            .expect("create");
+        start(&h.service, &id).await.expect("start");
+        ids.push(id);
+    }
+    ids
+}
+
+fn stop_in_fake(rt: &FakeRuntime, id: &str, code: i32) {
+    rt.state_stopped_ids
+        .lock()
+        .unwrap()
+        .insert(id.to_owned(), (code, 0));
+}
+
+fn count_observe(h: &Harness, code: &str) -> usize {
+    observe_outcomes(h).iter().filter(|c| **c == code).count()
+}
+
+/// CRI-1・CRI-2: 自然終了したコンテナは EXITED のフィルタで返り、RUNNING のフィルタでは返らない。
+#[tokio::test]
+async fn cri_1_4175_list_exited_filter_returns_natural_exit() {
+    let h = harness();
+    let id = running_one(&h).await;
+    stop_in_fake(&h.runtime, &id, 3);
+    let exited = list_with_state(&h.service, Some(S::ContainerExited)).await;
+    assert_eq!(
+        exited.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+        vec![id.clone()]
+    );
+    assert!(
+        list_with_state(&h.service, Some(S::ContainerRunning))
+            .await
+            .is_empty()
+    );
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 3, "Error")
+    );
+    assert!(st.finished_at > 0);
+    assert_eq!(count_calls(&h, "stop "), 0);
+}
+
+/// CRI-1: 自然終了 1 件と running 2 件の一覧で、状態ごとの件数が具体値で一致する。
+#[tokio::test]
+async fn cri_1_4175_mixed_list_counts() {
+    let h = harness();
+    let ids = running_n(&h, 3).await;
+    stop_in_fake(&h.runtime, &ids[1], 1);
+    assert_eq!(
+        list_with_state(&h.service, Some(S::ContainerExited))
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        list_with_state(&h.service, Some(S::ContainerRunning))
+            .await
+            .len(),
+        2
+    );
+    let all = list_with_state(&h.service, None).await;
+    assert_eq!(all.len(), 3);
+    assert_eq!(
+        all.iter()
+            .filter(|c| c.state == S::ContainerExited as i32)
+            .count(),
+        1
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|c| c.state == S::ContainerRunning as i32)
+            .count(),
+        2
+    );
+}
+
+/// REPAIR-4: 観測に失敗したコンテナは記録の値で返り、他のコンテナの取り込みに影響しない。
+#[tokio::test]
+async fn repair4_4175_partial_failure_does_not_affect_others() {
+    let h = harness();
+    let ids = running_n(&h, 3).await;
+    h.runtime
+        .fail_state_ids
+        .lock()
+        .unwrap()
+        .insert(ids[0].clone(), ErrorCode::Unavailable);
+    stop_in_fake(&h.runtime, &ids[1], 2);
+    stop_in_fake(&h.runtime, &ids[2], 4);
+    assert_eq!(
+        list_with_state(&h.service, Some(S::ContainerExited))
+            .await
+            .len(),
+        2
+    );
+    assert_eq!(count_observe(&h, "OK"), 2);
+    assert_eq!(count_observe(&h, "UNAVAILABLE"), 1);
+    let running = list_with_state(&h.service, Some(S::ContainerRunning)).await;
+    assert_eq!(
+        running.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+        vec![ids[0].clone()]
+    );
+    // 失敗した記録は ContainerStatus でも running のまま（失敗は成功応答に影響しない）。
+    assert_eq!(
+        status(&h.service, &ids[0]).await.state,
+        S::ContainerRunning as i32
+    );
+}
+
+/// REPAIR-5: 候補が 64 件を超えても 1 回の List の読み取りは 64 回以下で、`RESOURCE_EXHAUSTED` は 1 件。
+/// 読まなかった分は次の List で先に読まれる。
+#[tokio::test]
+async fn repair5_4175_list_reads_at_most_64_and_records_exhausted_once() {
+    let h = harness();
+    let ids = running_n(&h, 65).await;
+    let last = ids.last().unwrap().clone();
+    stop_in_fake(&h.runtime, &last, 9);
+    let before = state_calls(&h);
+    let first = list_with_state(&h.service, Some(S::ContainerExited)).await;
+    assert!(state_calls(&h) - before <= 64);
+    assert_eq!(count_observe(&h, "RESOURCE_EXHAUSTED"), 1);
+    // 最後に作った 1 件は created_at の昇順で切り捨てられた側。
+    assert!(first.is_empty());
+    let second = list_with_state(&h.service, Some(S::ContainerExited)).await;
+    assert_eq!(
+        second.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+        vec![last]
+    );
+}
+
+/// REPAIR-5: CREATED・UNKNOWN のフィルタでは実行層を読まない。
+#[tokio::test]
+async fn repair5_4175_created_or_unknown_filter_does_not_read() {
+    let h = harness();
+    let _ = running_n(&h, 2).await;
+    let before = state_calls(&h);
+    let _ = list_with_state(&h.service, Some(S::ContainerCreated)).await;
+    let _ = list_with_state(&h.service, Some(S::ContainerUnknown)).await;
+    assert_eq!(state_calls(&h), before);
+}
+
+/// REPAIR-5: 先行する List の worker が残っている間の List は実行層を読まず、保留が明ければ排他が外れる。
+#[tokio::test]
+async fn repair5_4175_concurrent_list_skips_while_worker_remains() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let service = h
+        .service
+        .with_exit_observe_timeout(Duration::from_millis(100));
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let first = list_with_state(&service, None).await;
+    assert_eq!(first[0].state, S::ContainerRunning as i32);
+    let calls = h.runtime.state_calls.load(Ordering::SeqCst);
+    let second = list_with_state(&service, None).await;
+    assert_eq!(second[0].state, S::ContainerRunning as i32);
+    assert_eq!(h.runtime.state_calls.load(Ordering::SeqCst), calls);
+    stop_in_fake(&h.runtime, &id, 5);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let exited = list_with_state(&service, Some(S::ContainerExited)).await;
+        if exited.len() == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "busy flag must be released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// CRI-2: List の観測の保留中でも StopContainer は拒否されず、Stop の値が後から届いた観測で上書きされない。
+#[tokio::test]
+async fn cri_2_4175_stop_during_list_observation_wins() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let service = Arc::new(
+        h.service
+            .with_exit_observe_timeout(Duration::from_millis(100)),
+    );
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let s2 = Arc::clone(&service);
+    let lister = tokio::spawn(async move { list_with_state(&s2, None).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
+    stop_c(&service, &id)
+        .await
+        .expect("stop must not be rejected");
+    lister.await.expect("lister");
+    stop_in_fake(&h.runtime, &id, 3);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let st = status(&service, &id).await;
+    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 137));
 }

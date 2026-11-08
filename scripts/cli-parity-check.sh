@@ -26,7 +26,8 @@
 # ユーザー名・環境変数は書かない。list の PID 列は <pid> に置換し、想定外の出力は内容を写さず
 # <unexpected>:行数 とする。inspect の 1 行 JSON は bundle（絶対パス）を記録せず、PID は <pid>、
 # cgroup は <set>、idMapping は model と extent 件数、auditCoverage は reason を落とし、capabilities は
-# 件数だけ、rootReadonly は true / false / - にする（CLI-1・#2826）。state の 1 行 JSON（OCI の state。種別 o）は
+# 件数だけ、rootReadonly は true / false / - にし、exitedAtNanos は値を記録せず有無（<set> / -）だけにする
+# （CLI-1・#2826・#4057。exited= を足したため、旧版で取った capture とは compare できない。基準と候補を同じ版で取り直す）。state の 1 行 JSON（OCI の state。種別 o）は
 # キーの集合と status・ociVersion だけを `state:<id>,<status>,ver=<版>,keys=<キー名>,ann=<set|->` で記録し、
 # pid の値・bundle（絶対パス）・annotations の中身は記録しない（CLI-1・#1904）。kill は成功時の stdout が
 # 空で、stderr の code（不在は NOT_FOUND・実行中でなければ FAILED_PRECONDITION・構文は INVALID_ARGUMENT）だけを比べる。
@@ -45,7 +46,7 @@
 # start 済みの inspect（B18〜B25・種別 s / w。#2891・SEC-1・CLI-1）: B18 で `--read-only --cap-drop NET_RAW` つきの
 # コンテナ c2 を起動用 bundle（Linux だけホストの sleep と依存ライブラリを集めた最小 rootfs を持つ）で作り、
 # start → inspect → stop --signal KILL → 終了待ちの inspect → delete → list と連鎖する。start が成功した
-# ときだけ `started:<id>,<status>,pid,sup,cg,health,audit,idmap,stop,caps=<件数>,ro=` を記録する
+# ときだけ `started:<id>,<status>,pid,sup,cg,health,audit,idmap,stop,caps=<件数>,ro=,exited=` を記録する
 # （revision・exitCode・restartCount は時機で変わるため、audit・idmap はホスト・カーネルで中身が変わるため
 # 有無だけにする）。start が成功しない環境（supervisor 未配置・委譲 scope が作れない・非 Linux 等）では
 # `<start-failed>` の印だけを残し、compare は NOT_STARTED として扱って終了コードを 1 にする（合格に見せない）。
@@ -560,9 +561,12 @@ norm_inspect() {
     rest="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
   fi
   # explicitStop・capabilities・rootReadonly（true / false / null。末尾に必ず出る。#2828）。capability の名前は検証して件数だけ記録する（最大 41 件の名前は 1 欄の上限を超える）。
-  [[ $rest =~ ^\"explicitStop\":\"([a-z_]{1,16})\",\"capabilities\":(null|\{\"bounding\":\[([^]]*)\]\}),\"rootReadonly\":(null|true|false)\}$ ]] || return 1
+  [[ $rest =~ ^\"explicitStop\":\"([a-z_]{1,16})\",\"capabilities\":(null|\{\"bounding\":\[([^]]*)\]\}),\"rootReadonly\":(null|true|false),\"exitedAtNanos\":(null|[1-9][0-9]{0,18})\}$ ]] || return 1
   stop="${BASH_REMATCH[1]}"
   ro="${BASH_REMATCH[4]}"
+  # exitedAtNanos（#4057）は時機で変わる値のため記録せず、有無だけにする。
+  exited='<set>'
+  [ "${BASH_REMATCH[5]}" = "null" ] && exited='-'
   if [ "${BASH_REMATCH[2]}" = "null" ]; then
     caps='-'
   else
@@ -577,8 +581,8 @@ norm_inspect() {
   # ホスト・カーネルで変わる audit と idMapping は有無だけにする（#2891）。
   if [ "$audit" = "-" ]; then audit_set='-'; else audit_set='<set>'; fi
   if [ "$idmap" = "-" ]; then idmap_set='-'; else idmap_set='<set>'; fi
-  norm_started_out="started:${id},${status},pid=${pid},sup=${sup},cg=${cg},health=${health},audit=${audit_set},idmap=${idmap_set},stop=${stop},caps=${caps},ro=${ro}"
-  norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps},ro=${ro}"
+  norm_started_out="started:${id},${status},pid=${pid},sup=${sup},cg=${cg},health=${health},audit=${audit_set},idmap=${idmap_set},stop=${stop},caps=${caps},ro=${ro},exited=${exited}"
+  norm_stdout_out="inspect:${id},${status},pid=${pid},exit=${exitc},rev=${rev},cg=${cg},sup=${sup},health=${health},rst=${restarts},audit=${audit},idmap=${idmap},stop=${stop},caps=${caps},ro=${ro},exited=${exited}"
   return 0
 }
 
@@ -921,12 +925,12 @@ load_capture() {
   [ "$(($(LC_ALL=C tr -d '\000' <"$file" | wc -c)))" -eq "$size" ] || { err invalid-input "capture file contains NUL"; exit 2; }
   local id_re='^[ABD][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
-  local so_started_re='^started:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),sup=(<pid>|-),cg=(<set>|-),health=([a-z_]{1,16}|-),audit=(<set>|-),idmap=(<set>|-),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
+  local so_started_re='^started:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),sup=(<pid>|-),cg=(<set>|-),health=([a-z_]{1,16}|-),audit=(<set>|-),idmap=(<set>|-),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-),exited=(<set>|-)$'
   # 種別 o（state の 1 行 JSON の正規化形式。norm_state と対応させる）。
   local so_state_re='^state:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},ver=[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3},keys=ociVersion\+id\+status(\+pid)?\+bundle\+annotations,ann=(<set>|-)$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   # 種別 i（inspect の 1 行 JSON の正規化形式。norm_inspect と対応させる）。
-  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-)$'
+  local so_inspect_re='^inspect:[A-Za-z0-9_-]{1,64},[a-z_]{1,16},pid=(<pid>|-),exit=(-?[0-9]{1,10}|-),rev=[0-9]{1,10},cg=(<set>|-),sup=(<pid>|-),health=([a-z_]{1,16}|-),rst=[0-9]{1,10},audit=(-|[a-z_-]{1,24}/[a-z_]{1,24}/[a-z_]{1,24}/([a-z_]{1,16}|-)),idmap=(-|[a-z_]{1,24}:[0-9]{1,3}:[0-9]{1,3}),stop=[a-z_]{1,16},caps=(-|[0-9]{1,3}),ro=(true|false|-),exited=(<set>|-)$'
   local k entry_id so_ok
   line=""
   while IFS= read -r line; do

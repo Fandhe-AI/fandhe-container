@@ -392,6 +392,30 @@ mod linux {
         Ok(())
     }
 
+    /// stopped の `inspect` の末尾が `"exitedAtNanos":<1 以上の i64 の 10 進>}` であることを照合する(#4057)。
+    fn check_exited_at_nanos(stdout: &str) -> Result<(), String> {
+        if !stdout.contains("\"status\":\"stopped\"") {
+            return Err(format!("inspect did not report stopped: {stdout:?}"));
+        }
+        let key = "\"exitedAtNanos\":";
+        let rest = stdout
+            .trim_end()
+            .rsplit_once(key)
+            .and_then(|(_, r)| r.strip_suffix('}'))
+            .ok_or_else(|| format!("inspect lacks a trailing exitedAtNanos: {stdout:?}"))?;
+        let ok = !rest.is_empty()
+            && rest.len() <= 19
+            && !rest.starts_with('0')
+            && rest.bytes().all(|b| b.is_ascii_digit())
+            && rest.parse::<i64>().is_ok_and(|n| n > 0);
+        if !ok {
+            return Err(format!(
+                "exitedAtNanos is not a positive integer: {rest:?} in {stdout:?}"
+            ));
+        }
+        Ok(())
+    }
+
     /// `inspect` の終了コード 0 と、`capabilities` の部分文字列（他のフィールドに依存しない）を照合する。
     fn check_inspect_caps(cli: &Path, root_s: &str, id_s: &str, want: &str) -> Result<(), String> {
         let out = run_cli(cli, &["--root", root_s, "inspect", id_s], CLI_TIMEOUT)?;
@@ -832,6 +856,13 @@ mod linux {
                 out.stdout
             ));
         }
+        // 実行中は終了検知時刻が無い(SUP-11・CLI-1・#4057)。
+        if !out.stdout.trim_end().ends_with("\"exitedAtNanos\":null}") {
+            return Err(format!(
+                "inspect did not report exitedAtNanos=null while running: {:?}",
+                out.stdout
+            ));
+        }
         let container_log = root.join("@container-logs").join(format!("{id_s}.log"));
         let supervisor_log = root.join("@supervisor-logs").join(format!("{id_s}.log"));
         expect(
@@ -854,6 +885,10 @@ mod linux {
             run_cli(&cli, &["--root", &root_s, "list"], CLI_TIMEOUT)
                 .is_ok_and(|o| o.code == Some(0) && o.stdout == want)
         })?;
+        // stop 後の inspect は終了検知時刻を 1 以上の 10 進整数で出す(SUP-11・CLI-1・OCI-5・#4057)。
+        let out = run_cli(&cli, &["--root", &root_s, "inspect", &id_s], CLI_TIMEOUT)?;
+        expect_ok_code(&out, "inspect")?;
+        check_exited_at_nanos(&out.stdout)?;
         let rec = get_record(&store, &id)?;
         if rec.status().exit_code() != Some(SIGTERM_HANDLER_EXIT_CODE_FOR_TEST) {
             return Err(format!(

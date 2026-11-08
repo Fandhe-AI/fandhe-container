@@ -3,7 +3,7 @@
 //! 役割: 未知のビットを持つ値を作れない [`MemslotFlags`] と、カーネルの対応を照会する継ぎ目
 //! `MemslotCapabilityQuery`、その判定の純関数 `check_memslot_flags_supported` を提供する。
 //! 呼び出し文脈: [`crate::device::VmFd::check_memslot_flags`] が VM fd を継ぎ目として渡す。
-//! 未実装（REPAIR-3）: 登録 API（`set_user_memory_region` は `flags: 0` 固定のまま）への結線は #4158、hugepage は #4159。
+//! 未実装（REPAIR-3）: 登録 API（`set_user_memory_region` は `flags: 0` 固定のまま）への結線は #4158、hugepage は採らない判断を記録済み（#4159。docs/design/microvm-memory-ownership.md）。
 //!
 //! 一次情報（Linux v6.12）: `KVM_MEM_READONLY` は `Documentation/virt/kvm/api.rst` のとおり `KVM_CAP_READONLY_MEM` が許すときだけ
 //! 設定できる。`KVM_MEM_LOG_DIRTY_PAGES` は cap の照会を要さない（`check_memory_region_flags` の既定の有効フラグ）。

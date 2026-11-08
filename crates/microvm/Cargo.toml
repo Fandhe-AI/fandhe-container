@@ -1,3 +1,4 @@
+# #4159 で hugepage での確保を採らない判断を記録し、モジュール doc を合わせる（依存は増やさない。unsafe 追加なし）。
 # #4042 で WFI の起床のスロットの束と停止の kick の包み（呼び出し元なし）と VmWithGic の保持を削除した（依存は増やさない。unsafe 追加なし）。
 # #4041 で HVF の SPI の注入から宛先の決定（IROUTER・GICD_CTLR の読み出し・ACK の学習・縮退の計数とログ）と tests/hvf_spi_routing.rs を削除した（依存は増やさない。unsafe 追加なし）。
 # #4040 で hvf::vcpu の停止の kick を HvfKick に戻し、WFI の起床の通知を停止経路から外す（依存は増やさない。unsafe なし）。

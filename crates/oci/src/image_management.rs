@@ -96,6 +96,7 @@ mod pull;
 pub use pull::{
     BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME, PullAbortOutcome,
     PullPublishOutcome, PullPublishRequest, PullSession, StagedBlobWriter, StagingCleanup,
+    UnpackDir,
 };
 
 mod pull_recovery;

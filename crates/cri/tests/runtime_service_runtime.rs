@@ -3041,6 +3041,44 @@ async fn repair4_4175_expired_list_records_deadline_once_and_exhausted_once() {
     assert_eq!(count("OK"), 0);
 }
 
+/// REPAIR-5・REPAIR-4: 期限切れ後に保留が明けても worker は実行層を追加で呼ばず、遅れた OK を記録せず、排他を解除する（#4175）。
+#[tokio::test]
+async fn repair5_4175_expired_worker_makes_no_further_state_calls() {
+    let h = harness();
+    let _ = running_n(&h, 3).await;
+    let count = |code: &str| {
+        h.recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.kind().as_str() == "cri.container_exit_observe")
+            .filter(|s| code_name(s.code()) == code)
+            .count()
+    };
+    let service = h
+        .service
+        .with_exit_observe_timeout(Duration::from_millis(100));
+    let before = h.runtime.state_calls.load(Ordering::SeqCst);
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let _ = list_with_state(&service, None).await;
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while count("RESOURCE_EXHAUSTED") == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker must finish and release"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.runtime.state_calls.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(count("OK"), 0);
+    assert_eq!(count("DEADLINE_EXCEEDED"), 1);
+    // 印と排他が残らないので、次の List は残りの候補を読む。
+    let _ = list_with_state(&service, None).await;
+    assert!(h.runtime.state_calls.load(Ordering::SeqCst) - before > 1);
+}
+
 /// CRI-2: List の観測の保留中でも StopContainer は拒否されず、Stop の値が後から届いた観測で上書きされない。
 #[tokio::test]
 async fn cri_2_4175_stop_during_list_observation_wins() {

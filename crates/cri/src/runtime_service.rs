@@ -4120,13 +4120,15 @@ impl CriRuntimeService {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerExitObserve);
         let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_expired = Arc::clone(&expired);
+        // RPC 全体の絶対期限。`run_bounded` の待ちより前に確定するので、worker の時計（遅れて始まる）より
+        // 先に切れる。`expired` は `run_bounded` の復帰後にしか立たないため、期限の判定はこちらを正とする。
+        let deadline = std::time::Instant::now() + budget;
         let bounded = run_bounded(budget, move || {
             let _busy = busy;
-            let started = std::time::Instant::now();
             let mut skipped = false;
             for mark in marks {
-                if started.elapsed() >= budget {
-                    // 読まない候補の印は `Drop` が外す（次の List で先に読まれる）。
+                if std::time::Instant::now() >= deadline || worker_expired.load(Ordering::Acquire) {
+                    // 期限後は実行層を新たに呼ばない。読まない候補の印は `Drop` が外す（次の List で先に読まれる）。
                     skipped = true;
                     continue;
                 }
@@ -4137,7 +4139,7 @@ impl CriRuntimeService {
                     .map(|_| ())
                     .map_err(|e| Status::from(e.clone()));
                 mark.finish(&result);
-                if worker_expired.load(Ordering::Acquire) {
+                if std::time::Instant::now() >= deadline || worker_expired.load(Ordering::Acquire) {
                     // 期限切れは呼び出し側が記録済み。確定せず Drop すると INTERNAL を重ねるため破棄する。
                     timer.discard();
                     continue;

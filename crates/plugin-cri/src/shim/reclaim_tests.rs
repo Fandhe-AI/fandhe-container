@@ -533,6 +533,34 @@ fn sec1_4152_stale_generation_does_not_touch_recreated_container() {
     assert_eq!(now.bundle(), other.as_path());
 }
 
+/// SEC-1・CORE-1・#4152: 同じ id・同じ bundle で再作成されても revision が変わるので、旧世代の stop・delete は拒否される。
+#[test]
+fn sec1_4152_stale_revision_rejected_for_same_bundle_recreation() {
+    let guard = test_root::test_root("shim", "r-rev");
+    let base = guard.join("state");
+    let bundle = make_bundle(&guard, "abc");
+    seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let (_, store, matched) = delete_preflight_store_in(&inv, &base).unwrap();
+    let DeleteRecordMatch::Recorded(rec) = matched else {
+        panic!("expected recorded");
+    };
+    let stale = Generation::of(&rec);
+    let store: Arc<dyn StateStore> = Arc::new(store.expect("store"));
+    recreate_with_other_bundle(&base, &inv, "abc", &bundle);
+    let rt = GuardedCore::new(Arc::clone(&store), core_runtime_for);
+    let stop = StopRequest::new(cid("abc"), Duration::ZERO).unwrap();
+    let e = rt.stop(&stop, &stale).expect_err("stale stop");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let e = rt
+        .delete(&DeleteRequest::new(cid("abc")), &stale)
+        .expect_err("stale delete");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let now = store.get(&GetStateRequest::new(cid("abc"))).unwrap();
+    assert_eq!(now.bundle(), bundle.as_path());
+    assert!(now.revision() > rec.revision());
+}
+
 /// REPAIR-5・#4152: 全体の絶対期限が尽きていれば、段を始める前に `DEADLINE_EXCEEDED` で終わり、実行層を作らない。
 #[test]
 fn repair5_4152_exhausted_deadline_fails_before_any_stage() {

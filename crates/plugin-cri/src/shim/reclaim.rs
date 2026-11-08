@@ -108,13 +108,13 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
 
 /// 本番の窓口: `CoreLifecycleRuntime` に、照合した bundle への固定（[`PinnedStore`]）を前置きする。
 ///
-/// core が自身の読み取りで得る記録を、照合した bundle のものに限る（読み取りの結果を検証するので、検証と読み出しの間の窓が無い）。
+/// core が自身の読み取りで得る記録を、照合した bundle と、固定の revision 以上のものに限る（読み取りの結果を検証するので、検証と読み出しの間の窓が無い）。
 /// core の stop・delete は読んだ記録の revision を基準に更新・削除するため、再作成された別 bundle のコンテナには届かない
 /// （revision は再利用されない。SEC-1・CORE-1・#4152）。revision の変化（supervisor の `Stopped` 記録など同一コンテナの更新）は許す。
 pub(crate) struct GuardedCore {
     core: crate::adapter::CoreLifecycleRuntime,
     store: Arc<dyn StateStore>,
-    pin: Arc<Mutex<Option<PathBuf>>>,
+    pin: Arc<Mutex<Option<Generation>>>,
 }
 
 impl GuardedCore {
@@ -135,15 +135,17 @@ impl GuardedCore {
         }
     }
 
-    fn set_pin(&self, bundle: &std::path::Path) {
+    fn set_pin(&self, generation: &Generation) {
         if let Ok(mut g) = self.pin.lock() {
-            *g = Some(bundle.to_path_buf());
+            *g = Some(generation.clone());
         }
     }
 
     fn current(&self, id: &ContainerId, expected: &Generation) -> Result<StateRecord, TraitError> {
         let rec = self.store.get(&GetStateRequest::new(id.clone()))?;
-        if rec.bundle() != expected.bundle {
+        // bundle だけでなく revision も厳密に照合する。revision は再利用されず（同じ id・同じ bundle で再作成されても
+        // 値が変わる）、旧世代の stop・delete が再作成後の記録を受け入れない（SEC-1・CORE-1・#4152）。
+        if rec.bundle() != expected.bundle || rec.revision() != expected.revision {
             return Err(changed());
         }
         Ok(rec)
@@ -160,7 +162,7 @@ fn changed() -> TraitError {
 /// 照合した bundle 以外の記録を core に見せない `StateStore`（`get` の結果が固定の bundle と違えば `FailedPrecondition`）。
 struct PinnedStore {
     inner: Arc<dyn StateStore>,
-    pin: Arc<Mutex<Option<PathBuf>>>,
+    pin: Arc<Mutex<Option<Generation>>>,
 }
 
 impl StateStore for PinnedStore {
@@ -175,8 +177,11 @@ impl StateStore for PinnedStore {
     fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
         let rec = self.inner.get(req)?;
         let pinned = self.pin.lock().ok().and_then(|g| g.clone());
+        // revision は単調増加で再利用されない。固定の revision より小さい記録は別の世代なので拒む。同一コンテナの更新
+        // （supervisor の `Stopped` 記録・core 自身の update）で進んだ値は許す（stop が Stopped の記録を待つため、完全一致にはできない。
+        // 照合直後の再作成は `current` の完全一致が入口で拒む。残余: 入口の後に同じ bundle で再作成される窓）。
         match pinned {
-            Some(b) if b != rec.bundle() => Err(changed()),
+            Some(p) if p.bundle != rec.bundle() || rec.revision() < p.revision => Err(changed()),
             _ => Ok(rec),
         }
     }
@@ -201,7 +206,7 @@ impl ReclaimRuntime for GuardedCore {
         generation: &Generation,
     ) -> Result<(ContainerStatus, Generation), TraitError> {
         self.current(req.id(), generation)?;
-        self.set_pin(&generation.bundle);
+        self.set_pin(generation);
         let status = fandhe_container_core::traits::ContainerRuntime::stop(&self.core, req)?;
         let after = self.store.get(&GetStateRequest::new(req.id().clone()))?;
         if after.bundle() != generation.bundle || after.status().state() != ContainerState::Stopped
@@ -217,7 +222,7 @@ impl ReclaimRuntime for GuardedCore {
         generation: &Generation,
     ) -> Result<DeleteResponse, TraitError> {
         self.current(req.id(), generation)?;
-        self.set_pin(&generation.bundle);
+        self.set_pin(generation);
         fandhe_container_core::traits::ContainerRuntime::delete(&self.core, req)
     }
 }

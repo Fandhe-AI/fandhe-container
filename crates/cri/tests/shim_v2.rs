@@ -623,7 +623,7 @@ mod e2e {
         cmd.args(["-namespace", "fandhe-e2e", "-address"])
             .arg(root.join("containerd.sock"))
             .arg("-publish-binary")
-            .arg("/usr/bin/containerd")
+            .arg(&me)
             .args(["-id", &id, "start"])
             .env(ROLE_ENV, "shim")
             .env(TRACE_ENV, &trace)

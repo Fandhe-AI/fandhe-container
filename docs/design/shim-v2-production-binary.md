@@ -56,8 +56,43 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 ## 検証の状況
 
 - 既定の集合: `crates/plugin-cri/src/shim.rs` の単体（`cri5_3684_*`）、`tests/shim_bin_task_service.rs`（bin 経由の State・Kill が `NOT_FOUND`、Create 後の State が `CREATED` で pid 0、Delete 後は `NOT_FOUND`、Shutdown で socket が消える。v2・v3 の両方）、cri から移設した `shim_bin_bootstrap.rs`・`shim_bin_bootstrap_hardening.rs`（試験名・期待値は同じ。ttrpc の手組みは `tests/support/shim_wire.rs`）
-- 実機前提: `tests/shim_v2_containerd_real.rs`（手順は `docs/verification/real-machine-tests.md`）。作成時に未実行。実行と記録は #3685（人間担当）
+- 実機前提: `tests/shim_v2_containerd_real.rs`（手順は `docs/verification/real-machine-tests.md`）。CI の `platform-ci`（ubuntu）で実行（#4104）。ランナー以外の実機での記録は #3685（人間担当）
 - 停止の方法に SIGKILL を使う（コンテナ内のプローブに SIGTERM のハンドラを入れるには core の試験用 feature が要り、plugin-cri の dev-dependencies に足したくないため）。終了コードの期待値 137（128 + SIGKILL）は実機で確かめる
+
+## イベントの publish（#4103・#4154。CRI-5・CRI-7・PLUG-1・REPAIR-3・SEC-1）
+
+本節は `-publish-binary` の検証・保持（#4154）と、送信側（TaskExit は #4155、TaskCreate・TaskStart・TaskDelete は #4156）が使う呼び出し形の記録である。送信そのものは未実装。
+
+### 検証と保持（実装済み）
+
+- 字面の検査（`parse_args`。3 OS 共通）: 絶対パス、4096 バイト以下、NUL なし、`.`・`..` の要素なし。違反は `INVALID_ARGUMENT`。containerd の値は `os.Executable` 由来で、この形になる
+- 実体の検査（unix のみ。`PublishBinary::verify`）: `lstat` で、存在しない・symlink・通常ファイル以外・実行ビットなし・other 書き込み可、を固定メッセージの `FAILED_PRECONDITION` で拒否する。PLUG-11 と同じ考え方（shim の権限で exec するため）。パスはメッセージに含めない
+- 検査する時点: `start`（置き場所を作る前）とデーモン起動時（`ServeContext` を作る前。start との間の差し替えの窓を狭める）。`delete` は字面だけにする。delete は publish せず、containerd の更新で実体が消えた（`/proc/self/exe` の末尾に「(deleted)」が付く）状態でも後始末を止めないため
+- 省略時は `None`（containerd 2.x は必ず渡すが、Go shim の既定も空）。`None` のときの扱いは #4155 で決める
+- 保持: `ServeContext::publish_binary()`（`PublishBinary`）。デーモンへは検証済みの値から argv を作り直して渡す（生の argv は中継しない）
+- 残余: 検査から exec までの差し替え（TOCTOU）、祖先ディレクトリの symlink・所有者、ハッシュは検査しない。検査した fd で exec する方式（`O_PATH` と `fexecve`）や所有者の照合は #4155 の検討事項。containerd を更新して実体が消えた状態では、新しい start が `publish binary not found` で失敗する（対処は containerd の再起動）
+
+### 呼び出し形（containerd v2.1.4 の一次情報）
+
+- containerd が shim に渡す argv: `-namespace <ns> -address <config.Address> -publish-binary <os.Executable()> [config.Args]`（`pkg/shim/util.go` の `Command()`）。環境変数に `TTRPC_ADDRESS`・`GRPC_ADDRESS`（`-address` と同じ値）・`NAMESPACE`・`MAX_SHIM_VERSION=2`・`GOMAXPROCS=2` を足す。`-address` は containerd の gRPC アドレス（`cmd/containerd/command/main.go` のグローバルフラグ `--address`）
+- publish バイナリの呼び出し形（`cmd/containerd/command/publish.go`・`main.go`）: `<publish-binary> --address <shim の -address の値> publish --namespace <ns> --topic <topic>`。urfave/cli の仕様でグローバルフラグ `--address` は `publish` より前に置く。`--topic` が空だと `ErrInvalidArgument`
+- stdin: `google.protobuf.Any`（`type_url`、`value` = イベントメッセージの protobuf 符号化）をそのまま渡す。長さ接頭辞・改行は付けない（`getEventPayload` が `io.ReadAll` して `proto.Unmarshal` する）
+- 送信先: gRPC の `containerd.services.events.v1.Events/Publish`（`PublishRequest{topic = 1, event = 2}`。`api/services/events/v1/events.proto`）。namespace は context（gRPC メタデータ）で運ばれる
+- `type_url`: 接頭辞なしの `containerd.events.<Name>` とする（typeurl v2.2.3 が proto メッセージに返す形。受け手は最後の `/` より後ろで照合するため接頭辞の有無はどちらでも解決できる）
+- topic（`core/runtime/events.go`）: `/tasks/create`・`/tasks/start`・`/tasks/delete`・`/tasks/exit`（ほかに `/tasks/oom`・`/tasks/exec-added`・`/tasks/exec-started`・`/tasks/paused`・`/tasks/resumed`・`/tasks/checkpointed`）
+- メッセージ（`api/events/task.proto`、package `containerd.events`）: `TaskCreate{container_id=1, bundle=2, rootfs=3, io=4, checkpoint=5, pid=6}`、`TaskStart{container_id=1, pid=2}`、`TaskDelete{container_id=1, pid=2, exit_status=3, exited_at=4, id=5}`、`TaskExit{container_id=1, id=2, pid=3, exit_status=4, exited_at=5}`
+
+### 食い違い（正直な記録）と伝送方式
+
+- containerd 2.x 自身の Go shim は `-publish-binary` を無視し（`pkg/shim/shim.go` のフラグ説明）、`TTRPC_ADDRESS` へ ttrpc で `containerd.services.events.ttrpc.v1.Events/Forward` を呼ぶ（`pkg/shim/publisher.go` の `RemoteEventsPublisher`。`Envelope{timestamp, namespace, topic, event: Any}`）。v1.4・v1.5 の `runtime/v2/shim/shim.go` も既に ttrpc 経路。publish バイナリを exec する経路は、それより前の版の名残で、呼び出し口は v2.1.4 にも残っている
+- 本リポは親 #4103 の指定どおり exec 経路を採る。exec は、イベントごとに containerd のプロセスが 1 つ起動する費用がある代わりに、cri に events サービスの ttrpc クライアントを持たずに済む。ttrpc 経路は時刻をイベント発生時に付けられ、プロセスも起動しない
+- 再評価条件: containerd が `publish` サブコマンドを廃止・非推奨化したとき、cri に ttrpc クライアントを持つ判断が出たとき、イベント頻度による起動費用が問題になったとき
+
+### 送る種別の範囲
+
+- 送る: TaskCreate・TaskStart・TaskDelete・TaskExit の 4 種（runc shim の `cmd/containerd-shim-runc-v2/task/service.go` が `s.send` で送る種別のうち、本リポで RPC が実装済みのもの）
+- 除く: TaskExecAdded・TaskExecStarted（exec の起動役の本番実装が無く `UNIMPLEMENTED`）、TaskPaused・TaskResumed・TaskCheckpointed（Pause・Resume・Checkpoint が `UNIMPLEMENTED`）、TaskOOM（memory.events を監視する仕組みが無い）
+- 再評価条件: 各 RPC が実装されたとき
 
 ## Exec の橋渡し（#4147・CRI-5・CRI-1・PLUG-1・SEC-1・REPAIR-3・REPAIR-5・TASK-62.7）
 
@@ -207,7 +242,7 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 
 - exec の起動役（`TaskExecLauncher`）の本番実装。exec は `UNIMPLEMENTED` のまま。方式は「Exec の橋渡し」節。実装は #4148・#4149、実機前提試験は #4150
 - containerd が shim の死後に呼ぶ `delete` action での実行層の後始末（入口の検証と照合は実装済み〔D5・#4151〕。停止・回収・応答は #4152）
-- `-publish-binary` によるイベントの publish（TaskExit など）
+- `-publish-binary` によるイベントの publish の送信: 検証と保持は済み（#4154）。送信は未実装（#4155: TaskExit、#4156: TaskCreate・TaskStart・TaskDelete）
 - rootful での shim 対応（#2442・#2241 の判断待ち）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）
 

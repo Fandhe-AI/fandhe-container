@@ -23,17 +23,17 @@
 //! bind の失敗は fail-closed（起動しない）。縮退して動き続けると外から「未結線」と区別できないため。
 //! エラーは固定文言とコードだけで、アドレスや OS のエラー文字列は出さない（REPAIR-4）。
 //!
-//! # 停止（REPAIR-5）
-//! 停止は待ちを足さない（accept タスクの abort は同期）。受け付け済みで Upgrade しない接続はプロセス終了時の
-//! `rt.shutdown_timeout` が打ち切るため、`shutdown::SHUTDOWN_TOTAL_BOUND` は変わらない。
-//! Attach のセッションはランタイムの停止でタスクごと drop され、読み口の drop が取り消しの旗を立てて follow スレッドは
-//! 1 ポーリング（200 ms）以内に抜ける。スレッドは detached でプロセスの停止を待たせない。
-//! 完全版の Attach（Linux。#4077）は、セッションの部品の drop で監視スレッドが 10 ms 以内に抜け、入力スレッドは socket の EOF か
-//! 書き込みの失敗で抜ける（コンテナが stdin を読まないと止まるが、同時数 64 に数えられ有界）。待ちは足さない。
-//! PortForward の Upgrade 後のセッションと実行中の blocking の dial（最長 `dial_timeout` 10 秒）も、プロセス終了時の
-//! `rt.shutdown_timeout` が打ち切るため待ちは増えず、`SHUTDOWN_TOTAL_BOUND` は変わらない（#3755 で再評価）。
-//! Exec のセッションは長寿命になりうるため、停止時に `exec_launcher` が追跡中の helper を kill する（`stop_streaming_on` の `on_stop`。
-//! helper の期限は最長 1 時間）。ドレイン待ちは足さない。
+//! # 停止（REPAIR-5・#4164）
+//! 停止は「期限つきドレイン、exec を止める、残りを強制クローズ」の順で行う（方針と理由は設計書の「停止時のセッションの扱い」）。
+//! [`stop_streaming_on`] が返す shutdown future は、シグナルの受信で TCP の待ち受けを閉じて**すぐに**完了する
+//! （gRPC の listener を閉じる契約〔#3226〕を遅らせないため、待ちは入れない）。待ちは `serve_with_audit` が戻った後に
+//! [`StreamingStop::finish`] が行う。基準はシグナルの受信時刻 T の絶対時刻で、(1) T..T+[`STREAMING_DRAIN_WAIT`] は
+//! セッションが自分で終わるのを待つ（全部閉じたら早く抜ける）、(2) 期限で `on_stop`（exec の追跡中 helper の kill と
+//! 以後の launch の拒否）を呼び、(3) [`STREAMING_CLOSE_WAIT`] まで exec が閉じるのを待ち、(4) 残りを abort する。
+//! (1)+(3) は `PLUGIN_SHUTDOWN_GRACE` 以内に収め、`shutdown::SHUTDOWN_TOTAL_BOUND` は変えない（試験で固定）。
+//! 期限を過ぎて残った件数は [`StreamingStopReport::line`] の構造化ログ 1 行に出す。
+//! PortForward の実行中の blocking の dial（最長 `dial_timeout` 10 秒）は abort できず、プロセス終了時の
+//! `rt.shutdown_timeout` が打ち切る（待ちは増えない）。
 //! 設計は `docs/design/cri-streaming-server.md`。
 
 pub mod log_attach;
@@ -45,7 +45,8 @@ pub mod exec_launcher;
 pub mod supervisor_attach;
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 mod node_dialer;
 
@@ -58,7 +59,9 @@ use fandhe_container_cri::streaming::exec::{
     ExecStreamConfig, ExecStreamHandler, ExecStreamLauncher,
 };
 use fandhe_container_cri::streaming::port_forward::{PortForwardConfig, PortForwardHandler};
-use fandhe_container_cri::streaming::{StreamDispatcher, StreamingConfig, StreamingServer};
+use fandhe_container_cri::streaming::{
+    StreamDispatcher, StreamingConfig, StreamingServer, StreamingSessions,
+};
 use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
 /// 起動失敗時の固定文言（アドレス・OS のエラーは含めない。REPAIR-4）。
@@ -165,30 +168,169 @@ pub async fn bind_production_streaming(
         })
 }
 
-/// drop されたときも `on_stop` を必ず 1 回呼ぶガード（future の取消・serve のエラーでも helper を残さない。REPAIR-5・#3761）。
-struct StopGuard<G: FnOnce()>(Option<G>);
+/// ドレインの待ち時間（シグナルの受信から）。kubelet の idle 4 時間・作成 30 秒より十分短く、cri の
+/// `SessionLimits::default().drain_timeout`（終了後の流し切りの予算）と同じ 5 秒。暫定値で、オーナー確認は #4116 の対象
+/// （承認は得ていない。#4164・REPAIR-5）。
+pub const STREAMING_DRAIN_WAIT: Duration = Duration::from_secs(5);
 
-impl<G: FnOnce()> Drop for StopGuard<G> {
+/// `on_stop`（helper の kill）の後に、exec が終了を観測して閉じるのを待つ時間。`RUNTIME_SHUTDOWN_WAIT` と同じ 1 秒。
+/// 暫定値で #4116 の対象（#4164・REPAIR-5）。
+pub const STREAMING_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// 強制クローズ（abort）の後に、タスクの破棄で枠が返るのを確かめる上限。
+const STREAMING_FORCE_CONFIRM_WAIT: Duration = Duration::from_millis(100);
+
+/// 停止の待ち時間の組。本番は [`PRODUCTION_STOP_LIMITS`]、試験は短くした値を渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingStopLimits {
+    /// ドレイン（自然に終わるのを待つ）時間。
+    pub drain: Duration,
+    /// `on_stop` の後に exec の終了を待つ時間。
+    pub close: Duration,
+}
+
+/// 本番の停止の待ち時間。
+pub const PRODUCTION_STOP_LIMITS: StreamingStopLimits = StreamingStopLimits {
+    drain: STREAMING_DRAIN_WAIT,
+    close: STREAMING_CLOSE_WAIT,
+};
+
+/// シグナルの受信時刻と、その時点で開いていた件数（shutdown future が記録し、`finish` が読む）。
+type SignalCell = Arc<Mutex<Option<(Instant, usize)>>>;
+
+/// [`stop_streaming_on`] が返す、`serve_with_audit` の後に行う停止処理の持ち主。
+///
+/// 呼び出し元は `main.rs` の `serve`。`finish` を呼ばずに drop されたとき（serve のエラー・future の取消）も、
+/// `on_stop` を 1 回呼び、全セッションを abort する（helper を残さない。REPAIR-5・#3761）。
+pub struct StreamingStop<G: FnOnce()> {
+    sessions: StreamingSessions,
+    signal: SignalCell,
+    on_stop: Option<G>,
+}
+
+impl<G: FnOnce()> Drop for StreamingStop<G> {
     fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
+        if let Some(f) = self.on_stop.take() {
             f();
+        }
+        self.sessions.close_all();
+    }
+}
+
+impl<G: FnOnce()> StreamingStop<G> {
+    /// ドレイン、`on_stop`、強制クローズを行い、結果を返す。
+    ///
+    /// 期限はシグナルの受信時刻からの絶対時刻なので、`serve_with_audit` が期限より後に戻ったときは
+    /// 待たずに即座に `on_stop` と強制クローズへ進む（停止の上限を延ばさない）。シグナルが記録されていない
+    /// （serve が先にエラーで戻った）ときも待たない。
+    pub async fn finish(mut self, limits: StreamingStopLimits) -> StreamingStopReport {
+        let recorded = self
+            .signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (t0, open_at_stop, drain_deadline, close_deadline) = match recorded {
+            Some((t0, open)) => (
+                t0,
+                open,
+                t0 + limits.drain,
+                t0 + limits.drain + limits.close,
+            ),
+            None => {
+                let now = Instant::now();
+                (now, self.sessions.open(), now, now)
+            }
+        };
+        let exceeded = self.sessions.wait_idle_until(drain_deadline).await;
+        // 期限を超えたので exec を止める（helper の kill と以後の launch の拒否）。exec のセッションは終了を観測して閉じる。
+        if let Some(f) = self.on_stop.take() {
+            f();
+        }
+        let forced = self.sessions.wait_idle_until(close_deadline).await;
+        if forced > 0 {
+            self.sessions.close_all();
+        }
+        // close_all は予約済みの登録も止める。abort したタスクの破棄は次の poll で起きるため、枠が返るのを短く確かめる。
+        let remaining = self
+            .sessions
+            .wait_idle_until(Instant::now() + STREAMING_FORCE_CONFIRM_WAIT)
+            .await;
+        StreamingStopReport {
+            open_at_stop,
+            drained: open_at_stop.saturating_sub(exceeded),
+            exceeded,
+            forced,
+            remaining,
+            elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
     }
 }
 
-/// `shutdown` の完了で `server` の待ち受けを閉じ、`on_stop`（exec の追跡中 helper の kill 等）を呼ぶ future。
-/// `serve_with_audit` の shutdown future として渡す。
+/// 停止時のセッションの扱いの結果（件数と経過だけ。トークン・コンテナ ID・アドレスは含めない。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingStopReport {
+    /// シグナルを受けた時点で開いていた接続・セッションの数。
+    pub open_at_stop: usize,
+    /// ドレインの期限までに自分で閉じた数。
+    pub drained: usize,
+    /// ドレインの期限を超えて残った数。
+    pub exceeded: usize,
+    /// `on_stop` の後の待ちを超えて残り、abort した数。
+    pub forced: usize,
+    /// abort の後も残った数（0 が正常）。
+    pub remaining: usize,
+    /// シグナルの受信から停止処理の終わりまでの経過（ミリ秒）。
+    pub elapsed_ms: u64,
+}
+
+impl StreamingStopReport {
+    /// 構造化ログの 1 行（`adapter::sweep_summary_line` と同じ JSON の形）。期限を超えたか残ったときは `warn`。
+    pub fn line(&self) -> String {
+        let level = if self.exceeded > 0 || self.remaining > 0 {
+            "warn"
+        } else {
+            "info"
+        };
+        format!(
+            "{{\"level\":\"{level}\",\"event\":\"cri_streaming_stop\",\"open_at_stop\":{},\"drained\":{},\"exceeded\":{},\"forced\":{},\"remaining\":{},\"elapsed_ms\":{}}}",
+            self.open_at_stop,
+            self.drained,
+            self.exceeded,
+            self.forced,
+            self.remaining,
+            self.elapsed_ms
+        )
+    }
+}
+
+/// `shutdown` の完了で `server` の待ち受けを閉じる future と、その後の停止処理 [`StreamingStop`] の組を返す。
+/// 第 1 要素は `serve_with_audit` の shutdown future として渡し、第 2 要素は serve が戻った後に
+/// [`StreamingStop::finish`] する。
 ///
-/// future ごと drop されたときも `StreamingServer::drop` が閉じ、`on_stop` も drop ガードで呼ばれる。
-pub async fn stop_streaming_on<F: Future<Output = ()>>(
+/// 第 1 要素は待ちを持たない（gRPC の listener を閉じる契約を遅らせない）。ドロップされたときも
+/// `StreamingServer::drop` が待ち受けを閉じ、`StreamingStop` の drop が `on_stop` を呼ぶ。
+pub fn stop_streaming_on<F: Future<Output = ()>, G: FnOnce()>(
     server: StreamingServer,
-    on_stop: impl FnOnce(),
+    on_stop: G,
     shutdown: F,
-) {
-    // 追跡中の exec helper を kill する（長寿命のセッションを残さない）。完了・drop のどちらでも走る。
-    let _guard = StopGuard(Some(on_stop));
-    shutdown.await;
-    server.shutdown();
+) -> (impl Future<Output = ()>, StreamingStop<G>) {
+    let sessions = server.sessions();
+    let signal: SignalCell = Arc::new(Mutex::new(None));
+    let stop = StreamingStop {
+        sessions: sessions.clone(),
+        signal: Arc::clone(&signal),
+        on_stop: Some(on_stop),
+    };
+    let fut = async move {
+        shutdown.await;
+        let at = Instant::now();
+        let open = sessions.open();
+        *signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((at, open));
+        server.shutdown();
+    };
+    (fut, stop)
 }
 
 #[cfg(test)]
@@ -402,9 +544,10 @@ mod tests {
         );
     }
 
-    /// REPAIR-5・#3761: shutdown 未完了のまま future が drop されても `on_stop` が 1 回呼ばれる。
+    /// REPAIR-5・#3761・#4164: `finish` されないまま `StreamingStop` が drop されても `on_stop` が 1 回呼ばれる。
+    /// shutdown future だけが先に drop されても、`StreamingStop` が生きている間は呼ばれない。
     #[tokio::test]
-    async fn repair5_3761_on_stop_runs_when_future_is_dropped() {
+    async fn repair5_3761_on_stop_runs_when_stop_is_dropped() {
         let server = bind_production_streaming(
             production_streaming_config(),
             fake_attach(),
@@ -415,19 +558,23 @@ mod tests {
         .expect("bind");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = Arc::clone(&count);
-        let task = tokio::spawn(stop_streaming_on(
+        let (fut, stop) = stop_streaming_on(
             server,
             move || {
                 c.fetch_add(1, Ordering::SeqCst);
             },
             std::future::pending::<()>(),
-        ));
+        );
+        let task = tokio::spawn(fut);
         tokio::time::sleep(Duration::from_millis(50)).await;
         task.abort();
         let _ = task.await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(stop);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
+    /// REPAIR-5・#3754・#4164: shutdown future の完了ですぐに待ち受けが閉じる（待ちを足さない）。
     #[tokio::test]
     async fn repair5_3754_streaming_listener_closes_on_shutdown() {
         let server = bind_production_streaming(
@@ -441,11 +588,12 @@ mod tests {
         let addr = server.local_addr();
         let flag = Arc::new(AtomicBool::new(false));
         let f = Arc::clone(&flag);
-        let task = tokio::spawn(stop_streaming_on(server, || {}, async move {
+        let (fut, _stop) = stop_streaming_on(server, || {}, async move {
             while !f.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }));
+        });
+        let task = tokio::spawn(fut);
         connect(addr).await.expect("listening before shutdown");
         flag.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -463,6 +611,278 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// 試験用の短い期限。
+    const TEST_LIMITS: StreamingStopLimits = StreamingStopLimits {
+        drain: Duration::from_millis(500),
+        close: Duration::from_millis(200),
+    };
+
+    /// 何も送らない接続を `n` 本張り、サーバー側で `n` 件に数えられるまで待つ。
+    async fn open_idle_connections(
+        addr: SocketAddr,
+        sessions: &StreamingSessions,
+        n: usize,
+    ) -> Vec<std::net::TcpStream> {
+        let mut conns = Vec::new();
+        for _ in 0..n {
+            conns.push(connect(addr).await.expect("connect"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sessions.open() < n && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sessions.open(), n);
+        conns
+    }
+
+    /// 読み取りが EOF（または接続の切断）で戻ることを確かめる。期限切れ（まだ開いている）は失敗。
+    async fn assert_closed_by_peer(conn: std::net::TcpStream) {
+        use std::io::Read;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = conn;
+            conn.set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let mut buf = [0u8; 16];
+            conn.read(&mut buf)
+        })
+        .await
+        .expect("join");
+        match result {
+            Ok(n) => assert_eq!(n, 0, "expected EOF"),
+            Err(e) => assert!(
+                !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "connection must be closed, got {e}"
+            ),
+        }
+    }
+
+    /// CRI-6・REPAIR-5・#4164: 3 件を開いたまま停止しても、期限（ドレイン + 余裕）のうちに終わり、全部閉じられる。
+    /// `on_stop` はちょうど 1 回で、強制クローズより前（3 件が開いたまま）に呼ばれる。
+    #[tokio::test]
+    async fn cri6_repair5_4164_stop_with_three_open_sessions_finishes_within_bound() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr();
+        let sessions = server.sessions();
+        let conns = open_idle_connections(addr, &sessions, 3).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_at_call = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (c, o, s2) = (
+            Arc::clone(&calls),
+            Arc::clone(&open_at_call),
+            sessions.clone(),
+        );
+        let (fut, stop) = stop_streaming_on(
+            server,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                o.store(s2.open(), Ordering::SeqCst);
+            },
+            std::future::ready(()),
+        );
+        fut.await;
+        let started = Instant::now();
+        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish(TEST_LIMITS))
+            .await
+            .expect("finish must be bounded");
+        assert!(
+            started.elapsed() < TEST_LIMITS.drain + TEST_LIMITS.close + Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            (
+                report.open_at_stop,
+                report.drained,
+                report.exceeded,
+                report.forced,
+                report.remaining
+            ),
+            (3, 0, 3, 3, 0)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(open_at_call.load(Ordering::SeqCst), 3);
+        assert_eq!(sessions.open(), 0);
+        for conn in conns {
+            assert_closed_by_peer(conn).await;
+        }
+    }
+
+    /// CRI-6・REPAIR-5・#4164: ドレインの期限内に自然に終わったセッションの応答は欠けない（残りだけが強制クローズ）。
+    #[tokio::test]
+    async fn cri6_repair5_4164_drain_delivers_response_finished_within_deadline() {
+        use std::io::{Read, Write};
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let addr = server.local_addr();
+        let sessions = server.sessions();
+        let mut conns = open_idle_connections(addr, &sessions, 3).await;
+        let (fut, stop) = stop_streaming_on(server, || {}, std::future::ready(()));
+        fut.await;
+        // 停止を受けた後に、不正なトークンの要求を 1 本だけ送る。404 の応答全体を受け取って閉じるはず。
+        let mut talker = conns.remove(0);
+        let client = tokio::task::spawn_blocking(move || {
+            talker
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            talker
+                .write_all(b"GET /attach/zz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .expect("write");
+            let mut out = Vec::new();
+            let _ = talker.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        let report = tokio::time::timeout(Duration::from_secs(5), stop.finish(TEST_LIMITS))
+            .await
+            .expect("finish must be bounded");
+        let response = client.await.expect("join");
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(response.ends_with("not found"), "{response}");
+        assert_eq!(
+            (
+                report.open_at_stop,
+                report.drained,
+                report.exceeded,
+                report.forced,
+                report.remaining
+            ),
+            (3, 1, 2, 2, 0)
+        );
+        for conn in conns {
+            assert_closed_by_peer(conn).await;
+        }
+    }
+
+    /// REPAIR-5・#4164: 期限は絶対時刻なので、serve が期限より後に戻ったときは追加の待ちが無い。
+    #[tokio::test]
+    async fn repair5_4164_finish_after_deadline_does_not_wait_again() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let sessions = server.sessions();
+        let _conns = open_idle_connections(server.local_addr(), &sessions, 1).await;
+        let limits = StreamingStopLimits {
+            drain: Duration::from_millis(100),
+            close: Duration::from_millis(100),
+        };
+        let (fut, stop) = stop_streaming_on(server, || {}, std::future::ready(()));
+        fut.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let report = stop.finish(limits).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            (report.exceeded, report.forced, report.remaining),
+            (1, 1, 0)
+        );
+    }
+
+    /// REPAIR-5・#4164: シグナルが記録されないまま `finish` したとき（serve が先にエラーで戻った等）は待たずに止める。
+    #[tokio::test]
+    async fn repair5_4164_finish_without_signal_stops_immediately() {
+        let server = bind_production_streaming(
+            production_streaming_config(),
+            fake_attach(),
+            None,
+            noop_recorder(),
+        )
+        .await
+        .expect("bind");
+        let sessions = server.sessions();
+        let conns = open_idle_connections(server.local_addr(), &sessions, 1).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let (_fut, stop) = stop_streaming_on(
+            server,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+            std::future::pending::<()>(),
+        );
+        let started = Instant::now();
+        let report = stop.finish(PRODUCTION_STOP_LIMITS).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (report.open_at_stop, report.forced, report.remaining),
+            (1, 1, 0)
+        );
+        for conn in conns {
+            assert_closed_by_peer(conn).await;
+        }
+    }
+
+    /// REPAIR-4・#4164: 停止の 1 行の形（info / warn。トークン・ID・アドレスを含まない）。
+    #[test]
+    fn repair4_4164_stop_report_line_is_fixed_shape() {
+        let clean = StreamingStopReport {
+            open_at_stop: 2,
+            drained: 2,
+            exceeded: 0,
+            forced: 0,
+            remaining: 0,
+            elapsed_ms: 130,
+        };
+        assert_eq!(
+            clean.line(),
+            "{\"level\":\"info\",\"event\":\"cri_streaming_stop\",\"open_at_stop\":2,\"drained\":2,\"exceeded\":0,\"forced\":0,\"remaining\":0,\"elapsed_ms\":130}"
+        );
+        let exceeded = StreamingStopReport {
+            open_at_stop: 3,
+            drained: 1,
+            exceeded: 2,
+            forced: 2,
+            remaining: 0,
+            elapsed_ms: 6012,
+        };
+        assert_eq!(
+            exceeded.line(),
+            "{\"level\":\"warn\",\"event\":\"cri_streaming_stop\",\"open_at_stop\":3,\"drained\":1,\"exceeded\":2,\"forced\":2,\"remaining\":0,\"elapsed_ms\":6012}"
+        );
+    }
+
+    /// REPAIR-5・#4164: ドレインと閉鎖の待ちの合計は gRPC の猶予以内で、停止の全体の上限（13.7 秒）は変わらない。
+    #[test]
+    fn repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound() {
+        assert_eq!(STREAMING_DRAIN_WAIT, Duration::from_secs(5));
+        assert_eq!(STREAMING_CLOSE_WAIT, Duration::from_secs(1));
+        assert!(
+            STREAMING_DRAIN_WAIT + STREAMING_CLOSE_WAIT <= crate::adapter::PLUGIN_SHUTDOWN_GRACE
+        );
+        assert_eq!(
+            crate::shutdown::SHUTDOWN_TOTAL_BOUND,
+            Duration::from_millis(13_700)
+        );
     }
 
     #[tokio::test]

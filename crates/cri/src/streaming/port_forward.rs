@@ -297,7 +297,7 @@ impl PortForwardHandler {
             .map(|p| u16::try_from(*p).unwrap_or(0))
             .collect();
         let target = PortForwardTarget::new(request.pod_sandbox_id, network);
-        tokio::spawn(async move {
+        permit.spawn_session(async move {
             let started = Instant::now();
             let end = match on_upgrade.await {
                 Ok(upgraded) => {
@@ -316,8 +316,7 @@ impl PortForwardHandler {
                 Err(_) => PortForwardEnd::ProtocolError,
             };
             observer.observe(end, started.elapsed());
-            // permit は IO の寿命まで保持する（同時接続数の契約。StreamHandler の doc）。
-            drop(permit);
+            // permit は spawn_session がタスクの寿命まで保持する（同時接続数の契約。#4164）。
         });
         upgrade_response()
     }

@@ -347,27 +347,36 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             vec![recorder, oci_recorder],
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
+        // shutdown future は待ち受けを閉じるだけで待たない。セッションのドレインと強制クローズは serve が戻った後の
+        // `finish` が、シグナルの受信時刻からの絶対時刻の期限で行う（#4164・REPAIR-5）。
+        let (streaming_shutdown, streaming_stop) = streaming::stop_streaming_on(
+            streaming,
+            || {
+                #[cfg(target_os = "linux")]
+                exec_launcher.shutdown_all();
+            },
+            shutdown::wait_for_signal(),
+        );
         let r = server::serve_with_audit(
             socket,
             svc,
             Some(images),
             &grpc_config,
             audit,
-            streaming::stop_streaming_on(
-                streaming,
-                || {
-                    #[cfg(target_os = "linux")]
-                    exec_launcher.shutdown_all();
-                },
-                shutdown::wait_for_signal(),
-            ),
+            streaming_shutdown,
         )
         .await;
+        let report = streaming_stop
+            .finish(streaming::PRODUCTION_STOP_LIMITS)
+            .await;
+        // 件数と経過だけの 1 行。終了行の書き出しの待ちより前に出し、まとめて flush させる（REPAIR-4）。
+        let _ = telemetry::stderr_sink().submit(report.line());
         stats.abort();
         r
     });
     // `Runtime` の暗黙の drop は `spawn_blocking` のタスクの完了を無期限に待つため、期限つきで置き去りにする（REPAIR-5）。
     // 置き去りにしたタスクの結果は不明のまま残り、再起動時に再採用・回収が扱う。
+    // ストリーミングのセッションは上の `finish` で閉じ済みで、ここで切られるのは実行中の blocking の dial 等の残りだけ（#4164）。
     rt.shutdown_timeout(shutdown::RUNTIME_SHUTDOWN_WAIT);
     // インスタンスロックは `backends` が持つ。`shutdown_timeout` は未完了の blocking worker を残して返るため、
     // ここで drop すると worker が状態を変えうる間に別インスタンスがロックを取り再採用・回収を始められる。

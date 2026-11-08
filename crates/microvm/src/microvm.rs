@@ -10,8 +10,8 @@
 //! drop の順序は vCPU → デバイス（irqfd の解除）→ vGIC → メモリ → VM fd。
 //! **SMP（#3899・MVM-1・REPAIR-5）**: vCPU 0 は RUNNABLE、AP（1..N）は `KVM_ARM_VCPU_POWER_OFF` で作り、ゲストの PSCI CPU_ON を
 //! `KVM_ARM_VCPU_PSCI_0_2` によりカーネル内で処理する（userspace へ exit しないので `psci.rs` の状態機械は使わない）。電源 off の AP の
-//! `KVM_RUN` はカーネルの中で眠り（Linux v6.12 `kvm_vcpu_sleep`）、`run_once` の期限ごとの kick（`-EINTR`）で再入するため、stop・drop は
-//! N 台を期限つきで回収できる。`MPIDR_EL1` は KVM が reset で `reset_mpidr`（Aff0 = id & 0xf・Aff1 = (id >> 4) & 0xff・Aff2 = (id >> 12) & 0xff・bit 31）
+//! `KVM_RUN` はカーネルの中で眠り（Linux v6.12 `kvm_vcpu_sleep`）、停止要求の kick（`-EINTR`）で戻る想定のため、stop・drop は
+//! N 台を期限つきで回収できる（期限は kick が届かなかったときの後詰め。電源 off の AP の kick での即時停止は x86_64 の HLT でしか実機確認しておらず、aarch64 は #3781 で未確認。#4229）。`MPIDR_EL1` は KVM が reset で `reset_mpidr`（Aff0 = id & 0xf・Aff1 = (id >> 4) & 0xff・Aff2 = (id >> 12) & 0xff・bit 31）
 //! から決める値で、id < 64 では FDT の `cpu@N` の `reg`（`arm64_vcpu_mpidr_affinity`）と一致する。`assemble` が全台を読んで照合し、
 //! 不一致は書き換えず `Internal` で失敗する。
 //! **範囲外（REPAIR-3）**: level の virtio SPI（resamplefd が未実装のため
@@ -1915,9 +1915,20 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> MicroVm<B
 
 // ---- 起動と停止（TASK-75.4.1・#886・MVM-1） ----
 
-/// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限。停止要求は kick で即時に届くため、この間隔には依らない。
+/// vCPU スレッドが `VcpuFd::run_once` に渡す 1 回あたりの期限（1 s）。停止要求の経路（condvar の通知 → `immediate_exit` と
+/// kick）が届かなかったときの**後詰めの上限**であり、停止の遅延は決めない（停止は即時。`IOEVENT_IDLE_WAIT` と同じ考え方）。
 /// 期限切れは正常系（in-kernel irqchip の VM は HLT をユーザー空間へ出さず `KVM_RUN` の中で待つ）として継続する。
-pub const VCPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+///
+/// 期限ごとに監視スレッド `kvm-run-deadline` の生成・join と `KVM_RUN` の再入が起きるため、アイドル時の起床は 1 vCPU・1 秒あたり
+/// 期限切れ 1 / 間隔 回、自発的コンテキストスイッチは約 2 倍になる。実測（x86_64・HLT ゲスト）は 100 ms で約 10 回/秒・約 20 回/秒、
+/// 1 s で約 1 回/秒・約 2 回/秒（`docs/design/microvm-ioevent-wake.md` の #4229 の節。MVM-1・CORE-7・REPAIR-5）。
+/// 「無くす」（無期限）は `run_once` が 0 と [`RUN_DEADLINE_MAX`](crate::device::RUN_DEADLINE_MAX) 超を拒否するため採らない。
+/// 上限は drop の待ち（`DROP_STOP_WAIT`）より短く保ち、コンパイル時に検査する。
+pub const VCPU_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// 後詰めの期限が drop の待ち上限より長いと drop の期限が意味を失い、`run_once` の上限を超えると実行時に拒否される（REPAIR-5）。
+const _: () = assert!(VCPU_POLL_INTERVAL.as_millis() < DROP_STOP_WAIT.as_millis());
+const _: () =
+    assert!(VCPU_POLL_INTERVAL.as_millis() <= crate::device::RUN_DEADLINE_MAX.as_millis());
 // 受信ポーラーの周期（`NET_RX_POLL_INTERVAL`。#3742）と範囲は OS 非依存の `net_rx_poll` へ移した（#4030）。公開パスは再公開で保つ。
 pub use crate::net_rx_poll::NET_RX_POLL_INTERVAL;
 /// ioeventfd の通知スレッド（`IoEventPoller`）が 1 回の `poll(2)` で待つ上限（#3698・#4160・MVM-1・CORE-7・REPAIR-5）。
@@ -6243,6 +6254,37 @@ mod ioevent_tests {
         assert!(t0.elapsed() < IOEVENT_IDLE_WAIT / 2, "{:?}", t0.elapsed());
         assert_eq!(report.reason, StopReason::Requested);
         assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    /// MVM-1・CORE-7・REPAIR-5・#4229: `vcpu_loop` は `step` に `VCPU_POLL_INTERVAL`（後詰めの上限）をそのまま渡す。
+    #[test]
+    fn mvm1_4229_vcpu_poll_interval_is_backstop() {
+        struct Rec(Arc<Mutex<Vec<Duration>>>);
+        impl VcpuLoopBody for Rec {
+            fn step(&mut self, slice: Duration, _stop: &StopSignal) -> LoopStep {
+                self.0.lock().unwrap().push(slice);
+                LoopStep::Finish(StopReason::Requested)
+            }
+            fn stats(&self) -> RunStats {
+                RunStats::default()
+            }
+        }
+        assert_eq!(VCPU_POLL_INTERVAL, Duration::from_secs(1));
+        let slices = Arc::new(Mutex::new(Vec::new()));
+        let running = spawn_loops(
+            vec![Rec(Arc::clone(&slices))],
+            Vec::new(),
+            Instant::now(),
+            SerialConsole::new(),
+        )
+        .unwrap();
+        // 1 回目の step が Finish するので、停止はゲスト起因の終了として回収される。step が呼ばれるまで待ってから回収する。
+        let end = Instant::now() + Duration::from_secs(5);
+        while slices.lock().unwrap().is_empty() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = running.stop(Duration::from_secs(5));
+        assert_eq!(*slices.lock().unwrap(), vec![VCPU_POLL_INTERVAL]);
     }
 
     /// MVM-1・CORE-7・REPAIR-5・#4160: アイドル時の `poll` の待ちは `IOEVENT_IDLE_WAIT`（1 s）で、fd は events + wake の 1 本。

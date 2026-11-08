@@ -1,6 +1,6 @@
 //! `supervisor_attach` の試験（CRI-6・SEC-1・SUP-4・REPAIR-5・#4077）。root も実コンテナも使わず、偽の `AttachIoSource`・
 //! `ExitNotifier` と実の `FileStateStore` で、fd の形の照合（不正の拒否と fd の閉鎖）・エラーの写像・事前確認・resize の具体値・
-//! stdin の往復・tap の中継・`exited`・同時数を照合する。実コンテナでの通しは #4079。
+//! stdin の往復・tap の中継・`exited`・同時数を照合する。実コンテナでの通しは `tests/cri_attach_real.rs`（#4079）。
 
 use std::future::poll_fn;
 use std::os::unix::fs::DirBuilderExt as _;

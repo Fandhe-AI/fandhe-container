@@ -28,7 +28,7 @@
 //! # 未実装・簡易実装・残余（REPAIR-3）
 //! - 本番の attach は結線済み（#4078）: `production_stream_dispatcher` は `ProductionAttach::interactive` で `read_only` を付けず、
 //!   bundle の `tty/stdin` の拒否も解除済みで、RPC 時の整合検査は cri の `attach_impl`（D7）が担う。実機の通し確認
-//!   （tty のコンテナの起動・`crictl attach -i -t`）は #4079（C11）
+//!   （tty のコンテナの起動・`crictl attach -i -t`）は `tests/cri_attach_real.rs`（#4079・C11。往復・EOF・resize を実機前提試験で照合済み）
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
 //! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを全書き手共通の排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、

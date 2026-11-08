@@ -6,7 +6,7 @@
 //!
 //! # 現状（REPAIR-3）
 //! 結線済みは Attach（Linux は完全版〔`supervisor_attach::SupervisorAttachBackend`。kind 9 の tap と fd の受け取り。#4077〕で、
-//! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通し確認は #4079。非 Linux は
+//! stdin・tty・resize を扱い、RPC 時の整合検査は cri の `attach_impl`〔D7。#4078〕。実機の通しは `tests/cri_attach_real.rs`（#4079）。非 Linux は
 //! 読み取り専用の [`log_attach::LogFollowAttachBackend`]〔回転ログの follow。#3763〕で、stdin・tty は RPC 時に `INVALID_ARGUMENT`）と、PortForward の NODE ネットワーク（hostNetwork）の pod
 //! （#3755。[`NodeLoopbackDialer`]）。POD ネットワークの pod は RPC 時（cri）と dialer の両方で `UNIMPLEMENTED` で、
 //! 保持役（#2877）と helper 方式（#3766）まで続く。Exec は Linux で結線済み（`exec_launcher::SupervisorExecLauncher`。

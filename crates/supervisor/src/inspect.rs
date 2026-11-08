@@ -34,6 +34,11 @@
 //! - `rootReadonly`（CLI-1・SUP-12・REPAIR-4・#2828）は launcher が実際に適用した `root.readonly` の実効値
 //!   （config の値と `create --read-only` の OR。mount の RDONLY・Landlock の root 規則と同じ値）で、`true` / `false`。
 //!   記録が無ければ（未 start・旧 `state.json`・`launchIsolation` なし）`null` で、書き込み可能とは推測しない。
+//! - `exitedAtNanos`（CLI-1・SUP-11・OCI-5・#4057）は supervisor が終了を回収した時点の壁時計（UNIX epoch からのナノ秒の
+//!   正の整数。`state.json` の `exitedAtNanos` と同じ名前・単位）。`stopped` で記録があるときだけ数値、それ以外
+//!   （`created`・`running`・#3682 より前の `state.json`・記録失敗）は `null`。`null` は「終了していない」ことの保証ではない。
+//!   カーネル上の正確な終了時刻ではなく、時計の変更で起動時刻より前になりうる。最大 19 桁で 2^53 を超えうる
+//!   （倍精度で読む利用者は精度を落とす）。観測専用で、権限判断・タイムアウト判定に使わない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - `state <id>`（CLI-1・SUP-11・TASK-79 追補・#1903）は同じ [`InspectReport`] を OCI Runtime Spec の state の項目へ寄せた
@@ -53,8 +58,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use fandhe_container_core::traits::{
-    CgroupPlacement, ContainerId, ContainerState, ErrorCode, ExplicitStop, GetStateRequest,
-    HealthStatus, StateRecord, StateRevision, StateStore, TraitError,
+    CgroupPlacement, ContainerId, ContainerState, ErrorCode, ExitTime, ExplicitStop,
+    GetStateRequest, HealthStatus, StateRecord, StateRevision, StateStore, TraitError,
 };
 
 /// bundle・cgroupScope の最大バイト数（出力有界化の上限。core の `state.json` 検証値と揃える）。
@@ -161,6 +166,11 @@ impl InspectReport {
         self.record.explicit_stop()
     }
 
+    /// 終了検知時刻（CLI-1・SUP-11・OCI-5・#4057）。`stopped` で記録があるときだけ `Some`。
+    pub fn exited_at(&self) -> Option<ExitTime> {
+        self.record.status().exited_at()
+    }
+
     /// 1 個の JSON オブジェクト（末尾改行なし）へ整形する。
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(256);
@@ -216,6 +226,13 @@ impl InspectReport {
         {
             Some(true) => s.push_str("true"),
             Some(false) => s.push_str("false"),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"exitedAtNanos\":");
+        match self.exited_at() {
+            Some(t) => {
+                let _ = write!(s, "{}", t.as_unix_nanos());
+            }
             None => s.push_str("null"),
         }
         s.push('}');
@@ -587,7 +604,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -606,7 +623,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -629,7 +646,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -650,12 +667,44 @@ mod tests {
         .unwrap()
         .with_explicit_stop(fandhe_container_core::traits::ExplicitStop::Recorded);
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null,\"rootReadonly\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
             InspectReport::from_record(&rec).unwrap().to_json(),
             expected
+        );
+    }
+
+    /// 終了検知時刻は `exitedAtNanos` に整数で出る。OCI state には出ない（SUP-11・CLI-1・#4057）。
+    #[test]
+    fn sup11_4057_exited_at_nanos_json_is_exact() {
+        let b = bundle();
+        let t = ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        let rec = StateRecord::new(
+            ContainerStatus::stopped_at(cid("c"), Some(0), t),
+            b.clone(),
+            StateRevision::from_raw(4),
+        )
+        .unwrap();
+        let expected = format!(
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":1700000000000000005}}",
+            json_escape(&b.to_string_lossy())
+        );
+        let report = InspectReport::from_record(&rec).unwrap();
+        assert_eq!(report.exited_at(), t);
+        assert_eq!(report.to_json(), expected);
+        let plain = StateRecord::new(
+            ContainerStatus::stopped(cid("c"), Some(0)),
+            b,
+            StateRevision::from_raw(4),
+        )
+        .unwrap();
+        assert_eq!(
+            report.to_oci_state_json(),
+            InspectReport::from_record(&plain)
+                .unwrap()
+                .to_oci_state_json()
         );
     }
 

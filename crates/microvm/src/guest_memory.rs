@@ -6,7 +6,8 @@
 //! (3) backing は [`GuestMemoryBacking`] で差し替える。実機の mmap backing と KVM への登録は `crate::microvm`（TASK-75.1。Linux のみ）が持つ。
 //!
 //! # 範囲外（REPAIR-3）
-//! hugepage は未対応（#4159）。memslot のフラグは `GuestRam::register_with_flags`（`crate::microvm`。Linux）で指定できる（#4158）。
+//! hugepage の opt-in は持たない（THP を使うかはホストの方針しだい。判断は docs/design/microvm-memory-ownership.md の #4159 の節）。
+//! memslot のフラグは `GuestRam::register_with_flags`（`crate::microvm`。Linux）で指定できる（#4158）。
 //!
 //! # 複数領域（#3697・MVM-1）
 //! 領域は昇順・非重複で最大 [`MAX_GUEST_MEMORY_REGIONS`] 個（`from_regions`）。MMIO hole の前後など、領域の間の隙間（hole）と、

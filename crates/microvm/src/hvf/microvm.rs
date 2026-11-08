@@ -6,7 +6,7 @@
 //! 呼び出し元は plugin-microvm（#3800）。start / stop の API は #3798（モジュール doc の「start / stop と解放順序」）。
 //!
 //! # 組み立ての順序（[`HvfMicroVm::assemble`]）
-//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）。`config.serial` と `layout.serial` を突き合わせ（#3882）、virtio + シリアルが MMIO 表の上限（`MAX_BUS_DEVICES`）を超える構成もここで拒否する。vcpus は 1 以上 `HVF_MAX_VCPUS`（32）以下で、構成の `vcpus` と `layout.vcpus` の一致も検査する（#3884）。
+//! 1. 構成値の検査（資源を作る前。`hvf_abi::check_assemble_input` と `Arm64Layout::validate`）と、実行時の既定 IPA 幅（`hv_vm_config_get_default_ipa_size`）に対する最上位 GPA の照合（`crate::gpa_width`。#4227）。`config.serial` と `layout.serial` を突き合わせ（#3882）、virtio + シリアルが MMIO 表の上限（`MAX_BUS_DEVICES`）を超える構成もここで拒否する。vcpus は 1 以上 `HVF_MAX_VCPUS`（32）以下で、構成の `vcpus` と `layout.vcpus` の一致も検査する（#3884）。
 //! 2. VM + GIC（`VmWithGic::create`。GIC の配置違反は VM を作る前に拒否される）。
 //! 3. ゲスト RAM の登録（`HvfGuestRam::register_shared`。対応付けが `Arc<HvVm>` を保持する）。
 //! 4. Image・initrd・FDT の配置（`load_arm64`。Image ヘッダの検証はここ）。
@@ -620,6 +620,13 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
             cmdline_len: cmdline.len(),
         })?;
         layout.validate()?;
+        // 実行時の既定 IPA 幅と最上位 GPA の照合（#4227・MVM-5）。VM を作る前に拒否する（`hv_vm_create(NULL)` の幅）。
+        let ipa_bits = crate::gpa_width::hvf_ipa_bits(crate::sys::default_ipa_bits()?)?;
+        crate::gpa_width::check_gpa_fits(
+            ipa_bits,
+            layout.max_region_end()?,
+            crate::gpa_width::GpaWidthSource::HvfDefaultIpa,
+        )?;
 
         // 以降はローカル変数の逆順 drop が解放順になる（宣言順: vm → memory → bus。drop は bus → memory → vm）。
         let vm = Arc::new(VmWithGic::create(&layout)?);

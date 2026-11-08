@@ -382,8 +382,14 @@ fn err3_task_97_2_image_service_error_codes() {
     let err = pull.expect_err("no puller");
     assert_eq!(err.code(), Code::Unimplemented);
     assert!(!err.message().contains("reg/secret"));
-    let rm = block_on(svc.remove_image(Request::new(Default::default())));
-    assert_eq!(code_of(rm), Code::Unimplemented);
+    let rm = |image| {
+        block_on(svc.remove_image(Request::new(v1::RemoveImageRequest { image })))
+            .expect_err("rejected")
+    };
+    for err in [rm(None), rm(spec("")), rm(spec(&long))] {
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(!err.message().contains("xxxx"));
+    }
     let fs = block_on(svc.image_fs_info(Request::new(Default::default())));
     assert_eq!(code_of(fs), Code::Unimplemented);
 }

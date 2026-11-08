@@ -56,7 +56,7 @@
 //! 既定の `MARKER` が 0 回であることを見る。virtio の SPI は FDT の既定の edge-rising と `IrqTrigger::LevelHigh` の 2 構成で起動する
 //! （FDT の trigger と HVF の線の注入方式は同じ layout から決まり、食い違えば `bind` が拒否する）。HVF の `QueueNotify` の処理
 //! （#4028）と、level の線の ACK 後の deassert / 上げ直し（#3863）が実カーネルで働くことの照合である。`InterruptACK` の後処理の結果は
-//! `RunningHvfMicroVm::interrupt_ack_counts` で読み、結果行に `acks=`・`deasserted=`・`reasserted=`・`not_applicable=` として出すだけで
+//! `RunningHvfMicroVm::interrupt_ack_counts` で読み、結果行に `acks=`・`deasserted=`・`reasserted=`・`not_applicable=`・`resets=`（`DeviceReset` 後の resample の回数。#4170・#4230）として出すだけで
 //! assert しない（判断材料。評価は #3988）。カーネルは `CONFIG_VIRTIO_MMIO`・`CONFIG_VIRTIO_BLK`・`CONFIG_BLOCK`・`CONFIG_DEVTMPFS`
 //! （`kernel_boot` の aarch64 の項と同じ）。負の対照は block デバイス無しで、不一致 marker が出る（一致 marker が block に由来する裏づけ）。
 //!
@@ -774,7 +774,7 @@ fn run_block_read(plan: BootPlan, expect: &str, other: &str, case: &str) {
     eprintln!("{}", block_result_line(&o, case, trigger));
 }
 
-/// block-read の結果行（数値と固定の語だけ。ゲストの文字列は入れない）。block 無しの ack 系は `none`。
+/// block-read の結果行（数値と固定の語だけ。ゲストの文字列は入れない）。block 無しの ack 系は `none`。`resets` は `DeviceReset`（Status=0）後の resample の回数で `acks` に含めない（#4170・#4230。観測専用）。
 fn block_result_line(o: &Outcome, case: &str, trigger: IrqTrigger) -> String {
     let trigger = match trigger {
         IrqTrigger::EdgeRising => "edge_rising",
@@ -786,10 +786,12 @@ fn block_result_line(o: &Outcome, case: &str, trigger: IrqTrigger) -> String {
         .map_or_else(|| "none".to_owned(), |v| v.to_string());
     let ack = match o.ack {
         Some(c) => format!(
-            "acks={} deasserted={} reasserted={} not_applicable={}",
-            c.acks, c.deasserted, c.reasserted, c.not_applicable
+            "acks={} deasserted={} reasserted={} not_applicable={} resets={}",
+            c.acks, c.deasserted, c.reasserted, c.not_applicable, c.resets
         ),
-        None => "acks=none deasserted=none reasserted=none not_applicable=none".to_owned(),
+        None => {
+            "acks=none deasserted=none reasserted=none not_applicable=none resets=none".to_owned()
+        }
     };
     format!(
         "hvf_kernel_boot: block ok arch=aarch64 case={case} trigger={trigger} spi_intid={spi} elapsed_ms={} exits={} data_abort={} wfx={} {ack}",
@@ -1067,6 +1069,7 @@ fn mvm5_4014_block_result_line_shape() {
     counts.acks = 5;
     counts.deasserted = 4;
     counts.reasserted = 1;
+    counts.resets = 2;
     let o = Outcome {
         reason: StopReason::GuestShutdown,
         vcpu_count: 1,
@@ -1090,7 +1093,7 @@ fn mvm5_4014_block_result_line_shape() {
     assert_eq!(
         block_result_line(&o, "block_read_level_high", IrqTrigger::LevelHigh),
         "hvf_kernel_boot: block ok arch=aarch64 case=block_read_level_high trigger=level_high spi_intid=48 \
-         elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=5 deasserted=4 reasserted=1 not_applicable=0"
+         elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=5 deasserted=4 reasserted=1 not_applicable=0 resets=2"
     );
     let none = Outcome {
         ack: None,
@@ -1099,7 +1102,7 @@ fn mvm5_4014_block_result_line_shape() {
     };
     assert!(
         block_result_line(&none, "block_read_absent", IrqTrigger::EdgeRising).ends_with(
-            "spi_intid=none elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=none deasserted=none reasserted=none not_applicable=none"
+            "spi_intid=none elapsed_ms=1234 exits=10 data_abort=7 wfx=3 acks=none deasserted=none reasserted=none not_applicable=none resets=none"
         )
     );
 }

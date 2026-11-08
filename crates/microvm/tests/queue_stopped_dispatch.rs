@@ -4,7 +4,8 @@
 //! QueueReady=0 / Status=0 を書き、`queue_stopped` / `reset` の呼び出しを数える。`DeviceBus`・
 //! `SharedTransport` は crate 内限定のため、`tests/device.rs` と同じ組み立てを試験側の `Shared<D>` で
 //! 再現する（device.rs の補助と重複するのは、dispatcher 越しの初期化が共有の対象外のため。REPAIR-1）。
-//! KVM 不要で既定のテスト集合（3 OS）で走る。停止後のリング処理への効果はトランスポート層の試験
+//! KVM 不要で既定のテスト集合（3 OS）で走る。本番の組み立て（`DeviceBus` の `dispatch_exit` と macOS の `HvfDeviceBus`）を通る経路は
+//! #4231 の試験（`microvm.rs` の `mvm1_4231_*`・`hvf/mmio.rs` の `mvm5_4231_*`・`tests/hvf_device.rs`）が担う。停止後のリング処理への効果はトランスポート層の試験
 //! （#4093）が担う。
 
 use std::sync::{Arc, Mutex};

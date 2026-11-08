@@ -2075,16 +2075,15 @@ fn kvm_device_com1_irq4_reaches_guest() {
 }
 
 /// MVM-1・REPAIR-5・TASK-75.4・#3736: 自己ループするゲスト（`jmp $`）に対し、`RunningMicroVm::stop` が
-/// `VCPU_POLL_INTERVAL`（100ms）のポーリングを待たず、`StopSignal` の kick で即時に戻る。
-/// 停止要求は run の開始直後に揃えるため、ポーリング方式なら毎回約 90ms 待ち 50ms 未満にならず、kick を外すと必ず失敗する。
+/// `VCPU_POLL_INTERVAL`（期限。#4229 で 1 s）を待たず、`StopSignal` の kick で即時に戻る。
+/// 停止要求は run の開始直後に揃えるため、期限切れで止まる方式なら毎回ほぼ 1 間隔待ち 50ms 未満にならず、kick を外すと必ず失敗する。
+/// 閾値は間隔に依らない固定値（間隔を延ばしても判別力を保つ。#4229）。最初の記録は約 1 間隔後に来る（待ちの上限 10 s で足りる）。
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
 fn kvm_device_stop_kicks_spinning_guest_immediately() {
     use fandhe_container_microvm::device::{RunObserver, RunRecord};
-    use fandhe_container_microvm::microvm::{
-        MicroVm, MicroVmConfig, StopReason, VCPU_POLL_INTERVAL,
-    };
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig, StopReason};
     use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
     use fandhe_container_microvm::virtio_net::MemoryNetBackend;
     use std::sync::Arc;
@@ -2123,19 +2122,182 @@ fn kvm_device_stop_kicks_spinning_guest_immediately() {
         }
         assert!(obs.0.load(Ordering::SeqCst) >= 1);
         // 観測器の通知は 1 回の run が戻った直後（次の run の開始直前）に来る。そこから短い固定
-        // 待ちだけ置いて停止を要求し、次の run の先頭付近（ポーリング方式なら残り約 90ms）に揃える。
+        // 待ちだけ置いて停止を要求し、次の run の先頭付近（期限切れ方式ならほぼ 1 間隔残り）に揃える。
         std::thread::sleep(Duration::from_millis(5 + attempt));
         let t = Instant::now();
         let report = running.stop(Duration::from_secs(5)).unwrap();
         let elapsed = t.elapsed();
         assert!(
-            elapsed < VCPU_POLL_INTERVAL / 2,
+            elapsed < Duration::from_millis(50),
             "attempt {attempt}: stop took {elapsed:?}"
         );
         assert_eq!(report.reason, StopReason::Requested);
         assert_eq!(report.stats.errors, 0);
         assert_eq!(Arc::strong_count(&obs), 1);
     }
+}
+
+/// #4229 の試験用: 呼び出したスレッド自身の `voluntary_ctxt_switches`（#4160 と同じ指標）。
+/// 観測器の `record` は vCPU スレッドから呼ばれるため、スレッド名の探索（並列実行の同名スレッドで曖昧になる）を避けて
+/// `/proc/thread-self/status` を読む。読めなければ skip せず panic する（fail-closed）。
+#[cfg(target_arch = "x86_64")]
+fn own_voluntary_switches() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// #4229 の試験用: 1 vCPU の HLT ゲスト（`hlt; jmp -3`。in-kernel irqchip では HLT が `KVM_RUN` の中で待たれる）を起動する。
+#[cfg(target_arch = "x86_64")]
+fn start_halted_guest(
+    dev: &KvmDevice,
+    obs: std::sync::Arc<dyn fandhe_container_microvm::device::RunObserver>,
+) -> fandhe_container_microvm::microvm::RunningMicroVm {
+    use fandhe_container_microvm::microvm::{MicroVm, MicroVmConfig};
+    use fandhe_container_microvm::virtio_block::MemoryBlockBackend;
+    use fandhe_container_microvm::virtio_net::MemoryNetBackend;
+
+    let img = bzimage::synthetic_bzimage(&[0xF4, 0xEB, 0xFD]);
+    let mut vm: MicroVm<MemoryBlockBackend, MemoryNetBackend> = MicroVm::assemble(
+        dev,
+        MicroVmConfig {
+            vcpu_count: 1,
+            mem_size: 64 << 20,
+            block: vec![],
+            net: vec![],
+        },
+    )
+    .unwrap();
+    let loaded = vm.load_kernel(&img, None, "console=ttyS0").unwrap();
+    vm.vcpu_mut(0).unwrap().set_observer(obs);
+    vm.start(&loaded).unwrap()
+}
+
+/// MVM-1・CORE-7・REPAIR-12・#4229: アイドル（HLT 中）の vCPU の起床回数を実測する。
+/// 観測器の `record`（vCPU スレッドが 1 回の `run_once` から戻るたびに呼ばれる）で、その時点のスレッドの自発的コンテキスト
+/// スイッチを採る。連続する 6 件の記録の間は期限切れ 5 回分で、`VCPU_POLL_INTERVAL` の 5 倍の時間が掛かることと、
+/// 全件が期限切れ（exit・エラー無し）であることを具体値で照合する。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_idle_halted_vcpu_wakeups() {
+    use fandhe_container_microvm::device::{RunObserver, RunOutcome, RunRecord};
+    use fandhe_container_microvm::microvm::{StopReason, VCPU_POLL_INTERVAL};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Rec {
+        /// (期限切れか, 記録時刻, vCPU スレッドの自発的コンテキストスイッチ)
+        rows: Mutex<Vec<(bool, Instant, u64)>>,
+    }
+    impl RunObserver for Rec {
+        fn record(&self, record: &RunRecord) {
+            let expired = record.outcome == RunOutcome::DeadlineExceeded;
+            self.rows
+                .lock()
+                .unwrap()
+                .push((expired, Instant::now(), own_voluntary_switches()));
+        }
+    }
+
+    let dev = open_kvm();
+    let obs = Arc::new(Rec::default());
+    let running = start_halted_guest(&dev, obs.clone());
+    let need = 6;
+    let end = Instant::now() + VCPU_POLL_INTERVAL * 20 + Duration::from_secs(10);
+    while obs.rows.lock().unwrap().len() < need && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let rows = obs.rows.lock().unwrap().clone();
+    assert!(rows.len() >= need, "only {} records", rows.len());
+    assert!(rows.iter().all(|r| r.0), "a run ended without a deadline");
+    let (first, last) = (rows[0], rows[need - 1]);
+    let expired = (need - 1) as u64;
+    let span = last.1 - first.1;
+    let switches = last.2 - first.2;
+    eprintln!(
+        "mvm4229 idle vcpu in {}ms: deadline_expiries={expired} voluntary_switches={switches}",
+        span.as_millis()
+    );
+    // 期限切れ 5 回分の時間は間隔の 5 倍の前後（再入の分だけ僅かに長い）。
+    assert!(
+        span >= VCPU_POLL_INTERVAL * 5
+            && span < VCPU_POLL_INTERVAL * 5 + Duration::from_millis(500),
+        "span={span:?}"
+    );
+    // 1 回の期限切れの再入で自発的に眠る回数は数回（監視スレッドの生成・join・futex 待ち）。実測は約 2 回で、係数 4 を上限にする。
+    assert!(switches <= expired * 4, "switches={switches}");
+    let report = running.stop(Duration::from_secs(5)).unwrap();
+    assert_eq!(report.reason, StopReason::Requested);
+    assert_eq!(report.stats.errors, 0);
+    drop(rows);
+    assert_eq!(Arc::strong_count(&obs), 1);
+}
+
+/// MVM-1・REPAIR-5・#4229: HLT で眠っている vCPU も、期限切れを待たず停止要求の kick だけで即時（50ms 未満）に戻る。
+/// 期限（`VCPU_POLL_INTERVAL`）は通知経路が届かなかったときの後詰めであり、停止の遅延を決めない。
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_stop_kicks_halted_guest_immediately() {
+    use fandhe_container_microvm::device::{RunObserver, RunRecord};
+    use fandhe_container_microvm::microvm::StopReason;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct Count(AtomicU64);
+    impl RunObserver for Count {
+        fn record(&self, _record: &RunRecord) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dev = open_kvm();
+    for attempt in 0..5u64 {
+        let obs = Arc::new(Count::default());
+        let running = start_halted_guest(&dev, obs.clone());
+        if attempt % 2 == 0 {
+            // HLT に入って最初の期限切れの記録が来るのを待ち、次の run の中（HLT 中）で止める。
+            let end = Instant::now() + Duration::from_secs(10);
+            while obs.0.load(Ordering::SeqCst) < 1 && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(obs.0.load(Ordering::SeqCst) >= 1);
+        }
+        std::thread::sleep(Duration::from_millis(20 + attempt));
+        let t = Instant::now();
+        let report = running.stop(Duration::from_secs(5)).unwrap();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "attempt {attempt}: stop took {elapsed:?}"
+        );
+        assert_eq!(report.reason, StopReason::Requested);
+        assert_eq!(report.stats.errors, 0);
+        assert_eq!(Arc::strong_count(&obs), 1);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_idle_halted_vcpu_wakeups() {
+    assert_unimplemented_assemble();
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+#[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+fn kvm_device_stop_kicks_halted_guest_immediately() {
+    assert_unimplemented_assemble();
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

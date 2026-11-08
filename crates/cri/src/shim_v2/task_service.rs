@@ -194,10 +194,9 @@ impl TaskService {
     /// watcher は `RuntimeAdapter::wait_exit` を期限つきで繰り返す。plugin-cri の `CoreLifecycleRuntime` は呼び出しごとに
     /// supervisor の終了通知を購読し（枠はコンテナごとに 8、超えたら照会へ縮退）、containerd の Wait RPC と並んでも壊れない。
     /// 待ち 1 回は [`WaitConfig`] の期限で有界だが、watcher の寿命全体は有界でない（コンテナが動く間は続く）。
-    /// 数は `MAX_EXIT_WATCHERS` が上限。Wait・State・Delete の経路からは publish しない（重複排除の仕組みが要るため）。
+    /// 数は `MAX_EXIT_WATCHERS` が上限。Wait・State の経路からは publish しない。Delete は watcher と送信権（`exit_claim`）を取り合い、未送信なら TaskDelete の直前に代わりに送る（#4224）。
     ///
-    /// 残余: Wait の直後 1 照会間隔以内に Delete する利用者（`ctr` 型）は、watcher の観測より先に削除が走ると取り逃しうる
-    /// （CRI の流れは `/tasks/exit` を受けてから Delete するので起きない）。restart による一時的な Stopped は対象外。
+    /// 残余: restart による一時的な Stopped は対象外。
     pub fn with_event_publisher(mut self, publisher: Arc<dyn EventPublisher>) -> Self {
         self.event_publisher = Some(publisher);
         self
@@ -657,8 +656,18 @@ impl TaskService {
         Ok(StartResponse { pid }.encode_to_vec())
     }
 
-    /// 同じ ID の終了 watcher を取り消す。取り消しの印（`revoked`）を先に立ててから登録表から外す。
+    /// Delete が同じ ID の終了 watcher の登録を取り出す（#4224）。`revoked` は立てない。
+    /// 登録表から外れるので、まだ観測していない watcher は黙って終わる。送信権（`exit_claim`）の取り合いは呼び出し側が行う。
+    fn take_watcher_for_delete(&self, id: &str) -> Option<WatchEntry> {
+        self.exit_watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id)
+    }
+
+    /// Create・再 Start の置き換え専用: 同じ ID の旧世代の終了 watcher を取り消す。取り消しの印（`revoked`）を先に立ててから登録表から外す。
     /// 登録表のロックを持ったまま行うので、登録が無いと見えた側は必ず印を見る（#4155）。
+    /// Delete は使わない（Delete は印を立てず `exit_claim` で TaskExit の送信権を取る。#4224）。
     fn revoke_watcher(&self, id: &str) {
         let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(old) = set.get(id) {
@@ -675,6 +684,7 @@ impl TaskService {
         };
         let generation = NEXT_WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
         let revoked = Arc::new(AtomicBool::new(false));
+        let exit_claim = Arc::new(Mutex::new(false));
         {
             let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
             // Delete・Create が取り消さずに残った旧世代（外で消えたコンテナ等）は、Start 成功の時点で
@@ -693,6 +703,8 @@ impl TaskService {
                     generation,
                     done: false,
                     revoked: Arc::clone(&revoked),
+                    exit_claim: Arc::clone(&exit_claim),
+                    start_pid,
                 },
             );
         }
@@ -705,6 +717,7 @@ impl TaskService {
             start_pid,
             generation,
             revoked,
+            exit_claim,
             watchers: Arc::clone(&self.exit_watchers),
         };
         let watchers = Arc::clone(&self.exit_watchers);
@@ -751,8 +764,33 @@ impl TaskService {
         self.adapter.remove(&req.id, false).map_err(gone)?;
         created.remove(&req.id);
         drop(created);
-        // 旧コンテナの終了 watcher を取り消す。同じ ID の再作成・再 Start で新しい世代が登録でき、旧世代は publish しない（#4155）。
-        self.revoke_watcher(&req.id);
+        // 旧コンテナの終了 watcher の登録を外す（同じ ID の再作成・再 Start で新しい世代が登録できる。#4155）。
+        // `revoked` は立てない。watcher が既に TaskExit をキューへ入れていれば TaskDelete より先に届き、
+        // まだなら Delete が送信権を取って代わりに送る（Wait 直後の Delete でも取り逃さない。#4224）。
+        let watcher = self.take_watcher_for_delete(&req.id);
+        if self.event_publisher.is_some() && before.lifecycle == RuntimeLifecycle::Stopped {
+            let start_pid = watcher.as_ref().map_or(0, |w| w.start_pid);
+            let claim = watcher.as_ref().map(|w| Arc::clone(&w.exit_claim));
+            // 順序は claim → registry（登録表のロックは上で解放済み）。watcher の enqueue の完了まで待つ。
+            let mut guard = claim
+                .as_ref()
+                .map(|c| c.lock().unwrap_or_else(|p| p.into_inner()));
+            let claimed = guard.as_deref().copied().unwrap_or(false);
+            if !claimed {
+                if let Some(g) = guard.as_deref_mut() {
+                    *g = true;
+                }
+                match task_exit_from(&req.id, start_pid, &before) {
+                    Ok(exit) => self.emit(TaskEvent::Exit(exit)),
+                    Err(failure) => {
+                        if let Some(publisher) = &self.event_publisher {
+                            publisher.report(failure);
+                        }
+                    }
+                }
+            }
+            drop(guard);
+        }
         // 削除成功後に旧コンテナの exec 登録を除去する（同じ ID の再作成で引き継がない。CRI-5）。
         if let Some(container) = &container {
             self.execs
@@ -916,14 +954,20 @@ impl TaskService {
 /// 終了 watcher の登録表（ID → 登録）。v2 と v3 で共有する。
 type WatchRegistry = Arc<Mutex<BTreeMap<String, WatchEntry>>>;
 
-/// 登録 1 件。`revoked` は Delete だけが立てる。watcher が終了して登録を外しても立たないため、
-/// キューで待つ TaskExit は「Delete された世代」だけを送信直前の再確認で捨てられる（CRI-5・#4155）。
+/// 登録 1 件。`revoked` は Create（外で消えた ID）と再 Start の置き換えだけが立てる。watcher が終了して登録を外しても立たないため、
+/// キューで待つ TaskExit は「置き換えられた旧世代」だけを送信直前の再確認で捨てられる（CRI-5・#4155）。
+/// Delete は `revoked` を立てず、`exit_claim` で TaskExit の送信権を watcher と取り合う（#4224）。
 #[derive(Debug, Clone)]
 struct WatchEntry {
     generation: u64,
-    /// watcher の thread が終わった。登録は Delete まで残し（`revoked` を立てる先を失わない）、同じ ID の再 Start では置き換える。
+    /// watcher の thread が終わった。登録は Delete まで残し、同じ ID の再 Start では置き換える。
     done: bool,
     revoked: Arc<AtomicBool>,
+    /// TaskExit の送信権の印。真なら watcher が送信済み（キュー投入済み）。保持中に enqueue まで行う直列化ロックを兼ねる。
+    /// ロック順は claim → 登録表で固定する。
+    exit_claim: Arc<Mutex<bool>>,
+    /// Start 時の pid。Delete が watcher と同じ pid 食い違い規則を適用するため。
+    start_pid: u32,
 }
 
 /// 終了 watcher 1 本の持ち物（#4155）。`TaskService::spawn_exit_watcher` が起こすスレッドが所有する。
@@ -937,6 +981,8 @@ struct ExitWatch {
     /// この watcher の作成世代。登録表の値と一致する間だけ有効（Delete で外れる）。
     generation: u64,
     revoked: Arc<AtomicBool>,
+    /// [`WatchEntry::exit_claim`] と同じ印。取った側だけが TaskExit を送る。
+    exit_claim: Arc<Mutex<bool>>,
     watchers: WatchRegistry,
 }
 
@@ -1006,35 +1052,55 @@ impl ExitWatch {
     }
 
     /// 停止済みの状態から TaskExit を組み立てて送る。pid が Start 時と食い違えば作り直しとみなして送らない。
+    /// 送信権（`exit_claim`）を取った側だけが送る。Delete が先に取っていれば何もしない（#4224）。
     fn publish_exit(&self, st: &RuntimeContainerStatus) {
-        // 取り消された世代（Delete 後の旧コンテナ）の終了は送らない。
+        // 順序は claim → 登録表。Delete は登録表のロックを放してから claim を取る。
+        let mut claimed = self.exit_claim.lock().unwrap_or_else(|p| p.into_inner());
+        if *claimed || self.revoked.load(Ordering::Acquire) {
+            return;
+        }
+        // 登録表から外れた世代（Delete 済みで Delete が送信する・再作成）は送らない。
         if !self.is_current() {
             return;
         }
-        if let Some(p) = st.pid
-            && self.start_pid != 0
-            && p != self.start_pid
-        {
-            self.publisher.report(PublishFailure::new(
-                PublishStage::InstanceMismatch,
-                Some(super::publish::TASK_EXIT_TOPIC),
-            ));
-            return;
-        }
-        // 確認後に Delete・再作成が割り込んでも、キューの中と送信直前で世代を再確認して旧世代を捨てる。
+        let exit = match task_exit_from(&self.id, self.start_pid, st) {
+            Ok(exit) => exit,
+            Err(failure) => {
+                self.publisher.report(failure);
+                return;
+            }
+        };
+        *claimed = true;
+        // 確認後に再作成・再 Start が割り込んでも、キューの中と送信直前で世代を再確認して旧世代を捨てる。
         let revoked = Arc::clone(&self.revoked);
         let guard: EventGuard = Arc::new(move || !revoked.load(Ordering::Acquire));
-        self.publisher.publish_guarded(
-            TaskEvent::Exit(TaskExit {
-                container_id: self.id.clone(),
-                id: self.id.clone(),
-                pid: st.pid.unwrap_or(self.start_pid),
-                exit_status: stopped_exit_status(st),
-                exited_at: exited_at_of(st),
-            }),
-            guard,
-        );
+        self.publisher.publish_guarded(TaskEvent::Exit(exit), guard);
     }
+}
+
+/// 停止済みの状態から TaskExit を組み立てる。watcher と Delete が共有する（#4224）。
+/// pid が Start 時と食い違えば別インスタンスとみなして `InstanceMismatch` を返す（`start_pid == 0` は検査しない）。
+fn task_exit_from(
+    id: &str,
+    start_pid: u32,
+    st: &RuntimeContainerStatus,
+) -> Result<TaskExit, PublishFailure> {
+    if let Some(p) = st.pid
+        && start_pid != 0
+        && p != start_pid
+    {
+        return Err(PublishFailure::new(
+            PublishStage::InstanceMismatch,
+            Some(super::publish::TASK_EXIT_TOPIC),
+        ));
+    }
+    Ok(TaskExit {
+        container_id: id.to_owned(),
+        id: id.to_owned(),
+        pid: st.pid.unwrap_or(start_pid),
+        exit_status: stopped_exit_status(st),
+        exited_at: exited_at_of(st),
+    })
 }
 
 /// 停止済みの状態から `exited_at` を決める。Stopped 以外・未記録・負値は未設定（値を捏造しない。CRI-5・#3682）。
@@ -3809,12 +3875,15 @@ mod tests {
             start_pid: 4242,
             generation: 7,
             revoked: Arc::new(AtomicBool::new(false)),
+            exit_claim: Arc::new(Mutex::new(false)),
             watchers: Arc::new(Mutex::new(BTreeMap::from([(
                 "c1".to_owned(),
                 WatchEntry {
                     generation: 7,
                     done: false,
                     revoked: Arc::new(AtomicBool::new(false)),
+                    exit_claim: Arc::new(Mutex::new(false)),
+                    start_pid: 0,
                 },
             )]))),
         };
@@ -3923,9 +3992,10 @@ mod tests {
         assert_eq!(kinds, ["create", "start", "delete", "create", "start"]);
     }
 
-    /// CRI-5・#4155: 確認後・キュー投入後に Delete・再作成されても、投入時に渡した述語が旧世代を無効と返す。
+    /// CRI-5・#4224: キュー投入後に Delete・再作成されても、Delete 前に投入済みの TaskExit の述語は有効のまま残る
+    /// （#4155 では Delete が無効にして TaskDelete だけが届いたが、#4224 で TaskExit を捨てない仕様へ改めた。残余 (3) の解消）。
     #[test]
-    fn cri5_4155_guard_of_queued_event_is_revoked_by_delete_and_recreate() {
+    fn cri5_4224_guard_of_exit_queued_before_delete_survives_delete_and_recreate() {
         use super::super::publish::EventGuard;
         #[derive(Default)]
         struct Holding(Mutex<Vec<EventGuard>>);
@@ -3954,12 +4024,142 @@ mod tests {
         let guard = h.0.lock().unwrap()[0].clone();
         assert!(guard());
         s.handle("Delete", &delete_req("c1", "")).unwrap();
-        assert!(!guard());
+        assert!(guard(), "Delete must not revoke an already queued TaskExit");
         f.preset.lock().unwrap().remove("c1");
         s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
         s.handle("Start", &start_req("c1")).unwrap();
-        // 同じ ID の新世代が登録されても旧世代の述語は無効のまま。
-        assert!(!guard());
+        // Delete が登録を外し済みなので、再作成・再 Start は旧世代の述語に触れない。
+        assert!(guard());
+    }
+
+    /// CRI-5・#4224: Wait の直後（watcher の照会間隔より短い間隔）に Delete しても、TaskExit が TaskDelete より先にちょうど 1 件届く。
+    /// V2 / V3 の両方。Exit は watcher と同じ規則（pid は Start 時の値）、Delete は `DeleteResponse` と一致する。
+    #[test]
+    fn cri5_4224_wait_then_delete_publishes_exit_before_delete() {
+        for v in [TaskApiVersion::V2, TaskApiVersion::V3] {
+            let fake = Fake {
+                create_pid: Some(4242),
+                ..Fake::default()
+            };
+            let (s, f) = svc(v, fake);
+            let cap = Arc::new(CapturePublisher::default());
+            let s = s
+                .with_wait_config(
+                    WaitConfig::new(
+                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .unwrap(),
+                )
+                .with_event_publisher(cap.clone());
+            s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+            s.handle("Start", &start_req("c1")).unwrap();
+            // watcher の初回照会（running）を済ませ、次の照会は 5 秒後にする。
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+            let w = s.handle("Wait", &wait_req("c1", "")).unwrap();
+            assert_eq!(WaitResponse::decode(&w[..]).unwrap().exit_status, 3);
+            let d = s.handle("Delete", &delete_req("c1", "")).unwrap();
+            let d = DeleteResponse::decode(&d[..]).unwrap();
+            let ts = Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5,
+            };
+            assert_eq!(
+                (d.pid, d.exit_status, d.exited_at.clone()),
+                (0, 3, Some(ts.clone())) // 停止後の状態に pid は無い（既存の Delete の規則）
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let evs = cap.events.lock().unwrap().clone();
+            assert_eq!(evs.len(), 4, "{evs:?}");
+            assert_eq!(
+                evs[2],
+                Ev::Exit(TaskExit {
+                    container_id: "c1".into(),
+                    id: "c1".into(),
+                    pid: 4242,
+                    exit_status: 3,
+                    exited_at: Some(ts.clone()),
+                })
+            );
+            assert_eq!(
+                evs[3],
+                Ev::Delete(TaskDelete {
+                    container_id: "c1".into(),
+                    pid: 0,
+                    exit_status: 3,
+                    exited_at: Some(ts),
+                    id: String::new(),
+                })
+            );
+            assert!(cap.failures.lock().unwrap().is_empty());
+            assert!(s.exit_watchers.lock().unwrap().get("c1").is_none());
+        }
+    }
+
+    /// CRI-5・#4224: watcher が先に TaskExit を送った後に Wait・Delete しても、TaskExit は重複せず 1 件だけ。
+    #[test]
+    fn cri5_4224_watcher_first_then_delete_publishes_exit_once() {
+        let fake = Fake {
+            create_pid: Some(4242),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            cap.events.lock().unwrap().len() > 2
+        }));
+        s.handle("Wait", &wait_req("c1", "")).unwrap();
+        s.handle("Delete", &delete_req("c1", "")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let evs = cap.events.lock().unwrap().clone();
+        let kinds: Vec<&str> = evs
+            .iter()
+            .map(|e| match e {
+                Ev::Create(_) => "create",
+                Ev::Start(_) => "start",
+                Ev::Exit(_) => "exit",
+                Ev::Delete(_) => "delete",
+            })
+            .collect();
+        assert_eq!(kinds, ["create", "start", "exit", "delete"], "{evs:?}");
+        assert!(cap.failures.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・#4224: watcher が送信権（`exit_claim`）を保持している間、Delete はその enqueue の完了を待ち、
+    /// 既に送信済みなら TaskExit を足さず TaskDelete だけを投入する。
+    #[test]
+    fn cri5_4224_delete_waits_for_watcher_claim() {
+        let fake = Fake {
+            create_pid: Some(4242),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        let s = Arc::new(s);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        let claim = Arc::clone(
+            &s.exit_watchers
+                .lock()
+                .unwrap()
+                .get("c1")
+                .unwrap()
+                .exit_claim,
+        );
+        let mut held = claim.lock().unwrap();
+        stopped_with_time(&f, "c1", Some(0), 1_700_000_000_000_000_000);
+        let s2 = Arc::clone(&s);
+        let h = std::thread::spawn(move || s2.handle("Delete", &delete_req("c1", "")));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!h.is_finished(), "Delete must wait for the claim holder");
+        *held = true;
+        drop(held);
+        h.join().unwrap().unwrap();
+        let evs = cap.events.lock().unwrap().clone();
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        assert!(matches!(evs[2], Ev::Delete(_)), "{evs:?}");
     }
 
     /// CRI-5・#4155: Delete を経ずに外で消えた ID を Create し直すと、旧 watcher の印が先に立って登録が外れ、
@@ -4030,6 +4230,8 @@ mod tests {
                         generation: 0,
                         done: false,
                         revoked: Arc::new(AtomicBool::new(false)),
+                        exit_claim: Arc::new(Mutex::new(false)),
+                        start_pid: 0,
                     },
                 );
             }

@@ -388,7 +388,7 @@ pub trait EventPublisher: Send + Sync {
     /// イベントを送る。有界時間で戻る契約（キューへ入れるだけ）。失敗は戻り値でなくログに出す。
     fn publish(&self, event: TaskEvent);
 
-    /// 送信直前に `still_valid` を再確認して送る。false なら破棄する（Delete 後の旧世代のイベントを送らない。CRI-5・#4155）。
+    /// 送信直前に `still_valid` を再確認して送る。false なら破棄する（Create・再 Start で取り消された旧世代のイベントを送らない。Delete は取り消さない。CRI-5・#4155・#4224）。
     ///
     /// 既定は呼び出し時に 1 回確認して [`Self::publish`] する。キューを持つ実装は、キューに積んだ後の取り消しを守るため
     /// 子の起動の直前（worker 側）で再確認する。確認から exec までの極小の窓は残る（子の起動を Delete と直列にはしない。Delete を詰まらせないため）。

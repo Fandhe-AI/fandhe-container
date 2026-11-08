@@ -31,7 +31,7 @@
 //!
 //! HVF の AP は vCPU 1..N のスレッド（#3884）が parked で待ち、ゲストの PSCI CPU_ON（状態機械は `psci.rs`〔#3883〕、結線は
 //! `hvf_smp`〔#3891〕）で起動する。合成ゲストでは実機で確かめた（#3803）。実 Linux ゲストの確認は #3998・#3988。
-//! PCI は範囲外。IPA 上限は HVF の既定の 36 ビットで、macOS 27.2・Apple M4 Max の実機の既定と一致した（#3997）。
+//! PCI は範囲外。IPA 上限は HVF の既定の 36 ビットで（ホストが実際に使える幅との照合は `crate::gpa_width` が組み立て時に行う。#4227）、macOS 27.2・Apple M4 Max の実機の既定と一致した（#3997）。
 //!
 //! virtio の通知方式（#3795・#3863）: 既定の FDT は edge-rising で、macOS の `hv_gic_set_spi(intid, true)` を 1 回呼べば
 //! edge が 1 回立つ（edge の `false` は無視されるため deassert は不要）。`Arm64Layout::virtio_spi_trigger` を
@@ -327,6 +327,32 @@ impl Arm64Layout {
         Ok(())
     }
 
+    /// 配置が占める領域の一覧（RAM・GIC・使用中の virtio の窓全体・シリアル）。`validate` と `max_region_end` の出どころ。
+    fn regions(&self) -> Result<Vec<MmioRegion>, MicrovmError> {
+        let virtio = self.virtio_window_all()?;
+        let mut regions = vec![self.ram, self.gic_dist, self.gic_redist];
+        if self.virtio_mmio_count > 0 {
+            regions.push(virtio);
+        }
+        if let Some(serial) = self.serial {
+            regions.push(serial);
+        }
+        Ok(regions)
+    }
+
+    /// 最上位 GPA の終端（排他。領域の終端の最大値）。IPA 幅との照合に使う（`crate::gpa_width`。#4227・MVM-1・MVM-5）。
+    /// 桁あふれは `InvalidArgument`。
+    pub fn max_region_end(&self) -> Result<u64, MicrovmError> {
+        let mut top = 0u64;
+        for r in self.regions()? {
+            let e = r
+                .end()
+                .ok_or_else(|| invalid("guest layout size overflow"))?;
+            top = top.max(e);
+        }
+        Ok(top)
+    }
+
     /// 配置の整合を検査する（0 長・桁あふれ・アライン・IPA 上限・個数・SPI 範囲・領域の重なり）。
     pub fn validate(&self) -> Result<(), MicrovmError> {
         if self.ram.size == 0 {
@@ -385,14 +411,7 @@ impl Arm64Layout {
         if self.ipa_limit == 0 {
             return Err(invalid("ipa limit must be non-zero"));
         }
-        let virtio = self.virtio_window_all()?;
-        let mut regions = vec![self.ram, self.gic_dist, self.gic_redist];
-        if self.virtio_mmio_count > 0 {
-            regions.push(virtio);
-        }
-        if let Some(serial) = self.serial {
-            regions.push(serial);
-        }
+        let regions = self.regions()?;
         for r in &regions {
             match r.end() {
                 None => return Err(invalid("guest layout size overflow")),
@@ -1283,5 +1302,36 @@ mod tests {
         assert!(l.validate().is_ok());
         l.serial_interrupt = SerialInterrupt::LevelSpi;
         expect_invalid(&l, "serial spi overlaps the virtio spi range");
+    }
+
+    /// MVM-1・MVM-5・#4227: 最上位 GPA は RAM の終端で、`validate` の IPA 上限の境界と一致する。
+    #[test]
+    fn mvm1_4227_max_region_end_matches_validate_boundary() {
+        let mut l = Arm64Layout::new(0x1000_0000, 1, 2).unwrap();
+        assert_eq!(l.max_region_end().unwrap(), 0x5000_0000);
+        l.ipa_limit = 0x5000_0000;
+        assert!(l.validate().is_ok());
+        l.ipa_limit = 0x4fff_ffff;
+        assert!(l.validate().is_err());
+        // 30 bit（0x4000_0000）には収まらず、31 bit（0x8000_0000）には収まる。
+        use crate::gpa_width::{GpaWidthSource, check_gpa_fits};
+        let top = l.max_region_end().unwrap();
+        assert!(check_gpa_fits(30, top, GpaWidthSource::KvmArm64Ipa).is_err());
+        assert!(check_gpa_fits(31, top, GpaWidthSource::KvmArm64Ipa).is_ok());
+    }
+
+    /// MVM-1・#4227: シリアルや virtio の窓を足しても最上位は RAM のまま、RAM を超える窓があればそちらが最上位。
+    #[test]
+    fn mvm1_4227_max_region_end_with_windows() {
+        let mut l = Arm64Layout::new(0x1000_0000, 1, 2).unwrap();
+        l.serial = Some(MmioRegion::new(0x0900_0000, 0x1000));
+        assert_eq!(l.max_region_end().unwrap(), 0x5000_0000);
+        l.serial = Some(MmioRegion::new(0x6000_0000, 0x1000));
+        assert_eq!(l.max_region_end().unwrap(), 0x6000_1000);
+        l.serial = Some(MmioRegion::new(u64::MAX, 0x1000));
+        assert_eq!(
+            l.max_region_end().unwrap_err().code(),
+            MicrovmErrorCode::InvalidArgument
+        );
     }
 }

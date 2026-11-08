@@ -93,6 +93,14 @@ name = "shim_v2_kill_all_real"
 path = "tests/shim_v2_kill_all_real.rs"
 harness = false
 
+# shim v2 の Exec が init の namespace・cgroup・seccomp・capability を超えないことを実コンテナで照合する実機前提テスト
+# （#4150・CRI-5・SEC-1・REPAIR-12）。自前の main（harness = false。試験バイナリ自身が init と exec のコマンドを兼ねる）。
+# 既定は自己照合と案内行で成功、`--ignored` で非 root の委譲 scope が要る実機シナリオ。containerd・pull は使わない。依存は足さない。
+[[test]]
+name = "shim_v2_exec_real"
+path = "tests/shim_v2_exec_real.rs"
+harness = false
+
 # stream-exec helper の起動失敗を実 helper のコードで注入し、fd 2 の転送と秘密の非出力を照合する結合試験
 # （CRI-6・SUP-6・SEC-1・REPAIR-4・REPAIR-12・#4172）。自分自身を `stream-exec` helper として再実行するため、
 # 自前の `main`（harness = false）が要る。root・実コンテナ・supervisor の bin は不要で既定の集合で動く。依存は足さない。

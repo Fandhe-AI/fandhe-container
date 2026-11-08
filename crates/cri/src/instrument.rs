@@ -413,6 +413,16 @@ impl<'a> CriOpTimer<'a> {
     }
 }
 
+impl CriOpTimer<'_> {
+    /// 記録せずに破棄する（別の層が既に確定した計測の二重計上を防ぐ。REPAIR-4）。
+    ///
+    /// 期限切れ後に遅れて完了した worker の内側の計測など、呼び出し側が結果を別に記録済みの場合に使う。
+    /// `Drop` の `INTERNAL` 記録は「確定し忘れ」の検出用であり、意図した破棄はこちらで明示する。
+    pub fn discard(mut self) {
+        self.done = true;
+    }
+}
+
 impl Drop for CriOpTimer<'_> {
     fn drop(&mut self) {
         self.emit(Code::Internal, None);

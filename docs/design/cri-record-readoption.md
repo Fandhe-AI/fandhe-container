@@ -317,6 +317,8 @@ CORE-10 への当てはめ（CORE-10 の目標 0.136 秒、Linux の Docker 0.29
 - 候補は ContainerStatus と同じ条件で、状態以外のフィルタ（id・`pod_sandbox_id`・`label_selector`）に合うものだけ。状態のフィルタが `CONTAINER_CREATED`・`CONTAINER_UNKNOWN` のときは読まない。並びは最後に観測した時刻（メモリのみ）が古い順、次に `(created_at, id)`
 - 上限（暫定。E2 の実測で見直す）: `LIST_EXIT_OBSERVE_MAX` = 64 件、全体 `LIST_EXIT_OBSERVE_BUDGET` = 1 秒、1 件ごとは `min(1 秒, 全体の残り)`。予算が尽きたら残りの印を外して終える。先行する List の worker が残っていればその List では読まない。根拠: `@lock` の間隔 2ms × 64 で約 128ms 以上。maxPods が 110 程度なら数回の relist で running すべてに届く
 - 読めなかった候補は記録の値のまま返り、他のコンテナに影響しない。上限か予算で読まなかった候補があれば、`cri.container_exit_observe` に `RESOURCE_EXHAUSTED` を 1 件だけ記録する（ID は載せない）
+- 実装で決めたこと（#4175）: 排他はサービス単位の `AtomicBool`（`list_exit_observe_busy`）で、worker が持つ番人の `Drop` が解除する（RPC の破棄・期限後の完了・起動失敗でも漏れない）。計測は worker が読み取り 1 回ごとに 1 件記録し、期限切れでも RPC は成功にして RPC 側では数えない（二重計上の回避）。`with_exit_observe_timeout` は List の予算も `min(1 秒, 指定値)` に絞る。最後に読んだ時刻（`exit_observed_at`）はメモリ専用で、読まずに破棄した候補には付けない（次の List で先に読む）。予算は各候補を読む前に確かめる
+- 残余（#4175）: worker は同期で読むため、ハングした 1 件の `state()` の途中では打ち切れない。その間は残りの候補の印と排他を持ち続けるが、切り離したスレッドは同時に 1 本までで、次の List はその間読まずに記録の値で返す
 
 ### supervisor が居ない場合（両案に共通の残余）
 
@@ -344,7 +346,7 @@ kubernetes v1.37.1（commit `d2b770f4c94636a992534a8d3156b6b2d8e82ac3`）で確�
 | 記号 | issue | 内容 | 依存 |
 | ---- | ----- | ---- | ---- |
 | E1 | #4174 | `ContainerStatus` の観測。取り込みの共通関数の切り出し、`CriOpKind` の追加、`runtime_service.rs` のモジュール doc の「読み取り専用」の更新（実装済み。#4174） | #4173 |
-| E2 | #4175 | `ListContainers` の観測。`crates/plugin-cri/tests/cri_attach_real.rs` の「終了コードは StopContainer の後に読む」前提の記述の更新（照合は弱めない） | E1 |
+| E2 | #4175 | `ListContainers` の観測（実装済み。#4175）。`crates/plugin-cri/tests/cri_attach_real.rs` の「終了コードは StopContainer の後に読む」前提の記述の更新（照合は弱めない） | E1 |
 | E3 | 未起票 | 再採用で core の終了の値を使う（`CorePresence` の型変更・照合表の更新・試験）。追跡 issue の起票は main が行う | E1 |
 
 固定する試験の観点:

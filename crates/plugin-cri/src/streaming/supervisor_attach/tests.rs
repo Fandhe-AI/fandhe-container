@@ -862,3 +862,52 @@ async fn cri6_repair5_4077_concurrent_sessions_are_bounded() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[derive(Clone, Default)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 非対応の警告はプロセスで 1 行だけ（REPAIR-4・CRI-6・#4135）。
+#[test]
+fn cri6_repair4_repair5_4135_unsupported_poll_warns_exactly_once() {
+    let buf = SharedBuf::default();
+    let sink = LineSink::spawn(Box::new(buf.clone()), 8);
+    let warned = AtomicBool::new(false);
+    assert!(warn_poll_unsupported_once(&warned, &sink));
+    assert!(!warn_poll_unsupported_once(&warned, &sink));
+    sink.wait_idle(WAIT);
+    let out = String::from_utf8(buf.0.lock().unwrap_or_else(PoisonError::into_inner).clone())
+        .expect("utf8");
+    assert_eq!(out, format!("{POLL_UNSUPPORTED_LINE}\n"));
+    assert_eq!(sink.dropped(), 0);
+}
+
+/// 警告行は固定語彙で、改行・非 ASCII を含まない。
+#[test]
+fn cri6_repair4_4135_warning_line_is_fixed_vocabulary() {
+    assert!(!POLL_UNSUPPORTED_LINE.contains('\n'));
+    assert!(POLL_UNSUPPORTED_LINE.is_ascii());
+    assert!(POLL_UNSUPPORTED_LINE.contains("\"level\":\"warn\""));
+    assert!(POLL_UNSUPPORTED_LINE.contains("\"code\":\"UNIMPLEMENTED\""));
+}
+
+/// `Unsupported` だけが警告の対象で、他の io エラーでは出さない。
+#[test]
+fn cri6_repair4_4135_only_unsupported_triggers_warning() {
+    use std::io::{Error, ErrorKind};
+    assert!(is_poll_unsupported(&Error::from(ErrorKind::Unsupported)));
+    assert!(!is_poll_unsupported(&Error::from(ErrorKind::Other)));
+    assert!(!is_poll_unsupported(&Error::from_raw_os_error(9)));
+}

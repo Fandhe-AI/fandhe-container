@@ -37,6 +37,8 @@
 //!   EOF を受ける（supervisor 側の `sendmsg` 直後の窓と同種の残余で、なくせない）
 //! - tty でも stdin を要求しない接続には master が渡らず、resize は `None`
 //! - resize の失敗は `AttachSession::resize` が `()` を返す契約のため捨てる
+//! - 非対応の Linux のアーキテクチャ（x86_64・aarch64 以外）では `poll_writable` が `Unsupported` を返すため attach の stdin が効かない。
+//!   入力スレッドは資源を返して終わり、固定行 `POLL_UNSUPPORTED_LINE` を stderr へプロセスで一度だけ出す（REPAIR-4・#4135）
 //! - 同時セッション 64 は暫定値（#4116 のオーナー確認待ち）
 
 use std::fs::File;
@@ -52,6 +54,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use crate::telemetry::LineSink;
 use fandhe_container_core::exec::{PtyMaster, WindowSize};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ErrorCode, GetStateRequest, StateStore, TraitError,
@@ -417,6 +420,27 @@ fn watch_exit(
 /// 残余: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。
 static WRITE_ARBITER: Mutex<()> = Mutex::new(());
 
+/// 非対応の組での警告を出したか（プロセス単位。非対応かどうかはビルドの組で決まり、セッションごとに出す意味がないため）。
+static POLL_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// `poll_writable` が非対応の組で出す警告行（固定語彙・英語。fd・パス・ID は含めない。REPAIR-4・CRI-6・#4135）。
+const POLL_UNSUPPORTED_LINE: &str = "{\"level\":\"warn\",\"event\":\"cri_attach_stdin\",\"code\":\"UNIMPLEMENTED\",\"reason\":\"poll_unsupported\",\"message\":\"attach stdin is not supported on this platform\"}";
+
+/// `poll_writable` の失敗が「この組では非対応」か。
+fn is_poll_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// `warned` が未設定のときだけ [`POLL_UNSUPPORTED_LINE`] を `sink` へ積む（ブロックしない）。出したら true。
+/// 呼び出し元は `write_all_retry`（入力スレッド）。`eprintln!` を使わないのは stderr の詰まりで止まらないため（REPAIR-5）。
+fn warn_poll_unsupported_once(warned: &AtomicBool, sink: &LineSink) -> bool {
+    if warned.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    sink.submit(POLL_UNSUPPORTED_LINE.to_string());
+    true
+}
+
 /// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を待たずに確かめ、書けなければ排他の外で
 /// 10 ms 待って取り消しを見る。記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description
 /// のため）。書ける確認から書き込みまでは [`WRITE_ARBITER`] で調停するので、コンテナが読まず pipe / pty が満杯でも、
@@ -429,6 +453,7 @@ fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &Atom
         if cancel.load(Ordering::SeqCst) {
             return false;
         }
+        let mut unsupported = false;
         {
             let _turn = WRITE_ARBITER.lock().unwrap_or_else(PoisonError::into_inner);
             match poll_writable(file.as_fd(), 0) {
@@ -446,8 +471,19 @@ fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &Atom
                     }
                 }
                 Ok(WritePoll::NotReady) => {}
-                Ok(WritePoll::Closed) | Err(_) => return false,
+                Ok(WritePoll::Closed) => return false,
+                Err(e) => {
+                    // 警告の出力は排他を出てから行う（排他の保持を短く保つ）。
+                    unsupported = is_poll_unsupported(&e);
+                    if !unsupported {
+                        return false;
+                    }
+                }
             }
+        }
+        if unsupported {
+            warn_poll_unsupported_once(&POLL_UNSUPPORTED_WARNED, crate::telemetry::stderr_sink());
+            return false;
         }
         if sleep_cancellable(TICK, cancel) {
             return false;

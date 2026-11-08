@@ -147,6 +147,6 @@ Agent が記録した判断（オーナー承認待ちの位置づけは冒頭�
 - e820 の予約表記（載せる）: `system_regions` の RAM 以外の領域（使用中の virtio-mmio の窓・IOAPIC・LAPIC・identity map・TSS）を 1 対 1 で type 2 として載せる（`e820_reservations` → `plan_boot` の `E820Reservation`）。領域の一覧と e820 の出どころが 1 つなので一致が機械的に保たれる。`plan_boot` は addr の昇順に整列し、size 0・溢れ・RAM / MP テーブルの予約 / 予約どうしの重なり・合計が `E820_MAX`（128）超を `InvalidArgument` で拒否する（最悪でも約 16 件。const assert で固定）
 - 却下案: (1) hole 全体 `[0xd000_0000, 4 GiB)` を 1 本の reserved にする案。32 bit の範囲に未使用の隙間が無くなり、カーネルが PCI の隙間を探す処理に影響しうることと、「領域の一覧と一致」の単一の出どころから外れることが理由（カーネル側の挙動は `arch/x86/kernel/e820.c` の原文を未確認のため、影響は推測にとどまる）。(2) 36 bit フォールバック（上記）
 - 一次情報の確認状況: Intel SDM の leaf 0x8000_0008 の EAX\[7:0\] が MAXPHYADDR である点を前提にした。Linux の `arch/x86/kvm/cpuid.c`・`arch/x86/kernel/cpu/common.c` と EAX\[23:16\]（AMD の GuestPhysAddrSize）の扱いは今回原文で確認していない（未確認）。EAX\[23:16\] は未考慮（EAX\[7:0\] のみ参照）
-- 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合、macOS（HVF。単一領域で e820 が無い）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue は確認時点で見つからず、要起票）
+- 範囲外（REPAIR-3）: aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合、macOS（HVF。単一領域で e820 が無い）、SIPI ページの e820 予約、実カーネルでの e820 の予約と 4 GiB 超の RAM の `/proc/iomem`・`/proc/meminfo` での通し確認（実機前提。`tests/kernel_boot.rs` の `--ignored`。追跡 issue: #4194）
 - 再評価条件: 4 GiB 超にデバイスの窓を置くとき、PCI を導入するとき、ゲストが予約の範囲で不具合を示したとき
 - 試験: 既定のテスト集合の `mvm1_4106_*`（cpuid_x86・boot_x86・microvm の各 tests）

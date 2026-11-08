@@ -176,17 +176,61 @@ mod linux {
         );
     }
 
+    /// 回収に必要な作業ディレクトリと bin ディレクトリ（`scenario` が作ったら登録する。watchdog と通常の後始末が共有）。
+    static WORK: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+
+    fn scene_ids() -> [String; 2] {
+        [
+            format!("kar{}", std::process::id()),
+            format!("kbr{}", std::process::id()),
+        ]
+    }
+
+    /// 共通の回収処理（REPAIR-5）。登録済みの sleeper を止め、`kill_all_via_shim` なら shim の `Kill(all=true)` を
+    /// 期限つき（5 秒）で試し、別 systemd scope の supervisor と shim デーモンを id と bin ディレクトリで見つけて止める。
+    /// watchdog の `process::exit(124)` の前にも呼ぶ（外側の scope 回収は別 scope の supervisor に届かないため）。
+    fn emergency_cleanup(kill_all_via_shim: bool) {
+        if let Ok(pids) = PIDS.lock() {
+            for pid in pids.iter() {
+                kill_pid("KILL", *pid);
+            }
+        }
+        let ctx = WORK.lock().ok().and_then(|g| g.clone());
+        let Some((dir, bin)) = ctx else {
+            return;
+        };
+        let ids = scene_ids();
+        if kill_all_via_shim && let Some(sock) = shim_socket(&dir) {
+            // 最後の手段の停止（途中で落ちた場面のコンテナを cgroup ごと止める）。応答が無くても 5 秒で先へ進む。
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ids2 = ids.clone();
+            std::thread::spawn(move || {
+                for id in &ids2 {
+                    let _ = call_method(&sock, SERVICE, "Kill", &kill_request(id, 9, true));
+                }
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+        for id in &ids {
+            for pid in processes_with(id, &bin) {
+                kill_pid("KILL", pid);
+            }
+        }
+    }
+
     fn watchdog() {
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
             eprintln!("shim_v2_kill_all_real: WATCHDOG EXPIRED after {WATCHDOG:?}");
-            if let Ok(pids) = PIDS.lock() {
-                for pid in pids.iter() {
-                    kill_pid("KILL", *pid);
-                }
-            }
+            emergency_cleanup(true);
             std::process::exit(124);
         });
+    }
+
+    /// systemd が空の scope ごと cgroup を回収していれば `populated` は読めない（`None`）。回収済みも空として扱う。
+    fn emptied(leaf: &str) -> bool {
+        !matches!(populated(leaf), Some(true))
     }
 
     fn wait_until(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
@@ -500,7 +544,7 @@ mod linux {
         }) {
             return Err("init or the in-container descendant is still alive".into());
         }
-        if !wait_until(STEP, || populated(&scene.leaf) == Some(false)) {
+        if !wait_until(STEP, || emptied(&scene.leaf)) {
             return Err("container cgroup is still populated after Kill all=true".into());
         }
         let st = wait_state(&scene.sock, &scene.id, STATUS_STOPPED)?;
@@ -510,10 +554,15 @@ mod linux {
                 st.exit_status
             ));
         }
-        // 空の実 cgroup は何も書かずに WasEmpty（Delete の前）。
+        // 全プロセスの終了後は systemd が空の scope と cgroup を回収しうるため、Delete の前は
+        // WasEmpty も AlreadyAbsent も正常（WasEmpty の厳密な検証は `scene_recorded_empty` の専用 cgroup で行う）。
         match kill_recorded(&scene)? {
-            RecordedCgroupKill::WasEmpty => {}
-            other => return Err(format!("before Delete: got {other:?}, want WasEmpty")),
+            RecordedCgroupKill::WasEmpty | RecordedCgroupKill::AlreadyAbsent => {}
+            other => {
+                return Err(format!(
+                    "before Delete: got {other:?}, want WasEmpty or AlreadyAbsent"
+                ));
+            }
         }
         finish_scene(&scene)?;
         // Delete が cgroup を消した後は AlreadyAbsent（冪等に成功）。
@@ -522,6 +571,43 @@ mod linux {
             other => return Err(format!("after Delete: got {other:?}, want AlreadyAbsent")),
         }
         Ok(scene)
+    }
+
+    /// シーン C: 試験側が寿命を管理する専用 cgroup（自分の委譲 cgroup の子）で、空は `WasEmpty`、rmdir 後は `AlreadyAbsent`。
+    /// systemd の回収と競合しないため `WasEmpty` を厳密に要求できる。
+    fn scene_recorded_empty() -> Result<(), String> {
+        let own = proc_cgroup(std::process::id()).ok_or("cannot read own cgroup")?;
+        let id = format!("kcr{}", std::process::id());
+        let instance = 1u64;
+        let leaf = cgroup_file(&own, &format!("fc-{id}@{instance}"));
+        std::fs::create_dir(&leaf).map_err(|e| format!("mkdir dedicated cgroup: {e}"))?;
+        let scene = Scene {
+            id,
+            sock: PathBuf::new(),
+            init: 0,
+            init_start: 0,
+            child: 0,
+            child_start: 0,
+            leaf: String::new(),
+            scope: own,
+            instance,
+        };
+        let first = kill_recorded(&scene);
+        let removed =
+            std::fs::remove_dir(&leaf).map_err(|e| format!("rmdir dedicated cgroup: {e}"));
+        match first? {
+            RecordedCgroupKill::WasEmpty => {}
+            other => {
+                return Err(format!(
+                    "dedicated empty cgroup: got {other:?}, want WasEmpty"
+                ));
+            }
+        }
+        removed?;
+        match kill_recorded(&scene)? {
+            RecordedCgroupKill::AlreadyAbsent => Ok(()),
+            other => Err(format!("after rmdir: got {other:?}, want AlreadyAbsent")),
+        }
     }
 
     /// シーン B（対照）: `Kill(all=false)` は init とコンテナ内の子を止めるが、移したホストのプロセスは止めない。
@@ -560,7 +646,7 @@ mod linux {
         let _ = sleeper.kill();
         reap::reap(&mut sleeper, Duration::from_secs(10))?;
         untrack(sleeper.id());
-        if !wait_until(STEP, || populated(&scene.leaf) == Some(false)) {
+        if !wait_until(STEP, || emptied(&scene.leaf)) {
             return Err("control: container cgroup did not become empty".into());
         }
         finish_scene(&scene)?;
@@ -745,11 +831,15 @@ mod linux {
         install_exe(Path::new(SHIM_SRC), &bin.join(SHIM_NAME))?;
         install_exe(&sup_src, &bin.join(SUPERVISOR_NAME))?;
         let namespace = format!("fckillall{}", std::process::id());
+        if let Ok(mut w) = WORK.lock() {
+            *w = Some((dir.clone(), bin.clone()));
+        }
 
         let mut scenes: Vec<Scene> = Vec::new();
         let outcome = (|| -> Result<(), String> {
             scenes.push(scene_all(&dir, &namespace)?);
             scenes.push(scene_control(&dir, &namespace)?);
+            scene_recorded_empty()?;
             Ok(())
         })();
 
@@ -763,30 +853,8 @@ mod linux {
             Ok(())
         };
 
-        // 後始末（成否に関わらず）。残った sleeper・shim デーモン・supervisor を止める。
-        if let Ok(pids) = PIDS.lock() {
-            for pid in pids.iter() {
-                kill_pid("KILL", *pid);
-            }
-        }
-        let ids = [
-            format!("kar{}", std::process::id()),
-            format!("kbr{}", std::process::id()),
-        ];
-        if outcome.is_err() {
-            for id in &ids {
-                // 最後の手段の停止（途中で落ちた場面のコンテナを cgroup ごと止める。socket が無ければ何も起きない）。
-                let sock = shim_socket(&dir);
-                if let Some(sock) = sock {
-                    let _ = call_method(&sock, SERVICE, "Kill", &kill_request(id, 9, true));
-                }
-            }
-        }
-        for id in &ids {
-            for pid in processes_with(id, &bin) {
-                kill_pid("KILL", pid);
-            }
-        }
+        // 後始末（成否に関わらず）。残った sleeper・shim デーモン・supervisor を止める（watchdog と共通の処理）。
+        emergency_cleanup(outcome.is_err());
         if let Err(e) = &outcome {
             let t = std::fs::read_to_string(dir.join("s/daemon.log")).unwrap_or_default();
             let tail: Vec<&str> = t.lines().rev().take(40).collect();

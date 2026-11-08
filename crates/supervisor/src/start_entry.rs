@@ -2761,7 +2761,7 @@ mod linux {
 
     /// `--stdin` の指定を core の起動オプションへ反映する（指定があれば `Pipe`、無ければそのまま）。
     ///
-    /// `open` と `once` のどちらでも init の fd 0 は pipe にする（両者の差は attach の入口の責務。C6 #4075）。tty のコンテナとの
+    /// `open` と `once` のどちらでも init の fd 0 は pipe にする（両者の差は attach の入口の責務。kind 9 のサーバ。C6 #4075）。tty のコンテナとの
     /// 併用は core が拒否する（`start_contract` のモジュール doc。tty の入力は master が担う）。SUP-7・CRI-6・#4074。
     fn apply_stdin_option(
         options: fandhe_container_core::oci_runtime::LaunchOptions,

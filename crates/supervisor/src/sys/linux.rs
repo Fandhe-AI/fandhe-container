@@ -1216,7 +1216,9 @@ pub(crate) struct Received {
 
 /// `data` を送り、`fd` を `SCM_RIGHTS` で 1 本添える（`sendmsg(2)`）。制御チャネルの exec 用 pidfd の受け渡し
 /// （サーバ側。#2626・SUP-6・SEC-1）。送れたバイト数を返す（短い書き込みは呼び出し側が残りを書く）。
+/// 製品コードは複数 fd 版 [`send_with_fds`] を使う（#4075）ため、単一 fd 版は試験専用。
 /// LP64 の x86_64 / aarch64 以外は `Unsupported`（#2140）。
+#[cfg(test)]
 pub(crate) fn send_with_fd(
     sock: BorrowedFd<'_>,
     data: &[u8],

@@ -24,6 +24,14 @@
 //! ExecHandoverRequest が成功した接続だけは例外で、`exec_guard` のガードスレッドが閉じずに預かり（accept ループは先へ進む）、
 //! 2 つ目の要求（ExecCgroupNotify）と切断を監視する。ガードの数と待ちには上限がある（SUP-6・REPAIR-5・#2626）。
 //!
+//! AttachRequest（kind 9。SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075）は、入力の fd（stdin の書き込み端・tty では
+//! master の複製）と出力の tap の端を最大 3 本、`Response(Ok)` と同じ `sendmsg` に添えて返し、接続は閉じる（保持しない。
+//! `PausableServer::pause` の参加者もスレッドも増えない）。手順は 事前の照合（何も取り出さない）→ tap の購読 → 確定
+//! （ロックの下で再照合して取り出す。`stdin_once` は元の端を渡す）→ 期限の確認 → 送信。送信に成功したら手元の fd を
+//! drop する（これが所有の移転）。`stdin_once` で送れなかったときは、同じ世代がまだ生きていれば端を戻す。
+//! 残る問題: `sendmsg` が成功した直後にクライアントが期限切れで接続を閉じると、`stdin_once` の端は渡った後に
+//! カーネルが閉じる（コンテナは EOF を受ける）。絶対期限とクライアントの余裕で窓を小さくするが、なくせない。
+//!
 //! サーバスレッドは停止可能（`accept` の non-blocking ポーリング）。restart の再 launch の再構成（#2043）で
 //! スレッドを止める必要が出たときの口である。
 
@@ -42,12 +50,25 @@ use super::exec_guard::ExecGuardPool;
 use super::log_control_event;
 use super::observe::ControlObserver;
 use super::protocol::{
+    ATTACH_MAX_FDS, ATTACH_PAYLOAD_LEN, ATTACH_ROUND_TRIP_BUDGET, AttachRequestFrame,
     CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason,
     EXEC_HANDOVER_PAYLOAD_LEN, EXIT_WATCH_PAYLOAD_LEN, ExecHandoverRequestFrame,
-    ExitWatchRequestFrame, FrameHeader, HEADER_LEN, RequestHeader, ResponseFrame,
-    SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
+    ExitWatchRequestFrame, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, RequestHeader,
+    ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
 };
-use super::target::{ExitWatchHandle, SignalSlot, wait_reply};
+use super::target::{ExitWatchHandle, SignalSlot, TakenInput, wait_reply};
+use crate::logs::TapStreams;
+
+/// 1 要求の種類（計測の操作名を分けるため。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOp {
+    /// シグナル・stop・再起動の取り消し・exec の pidfd の受け渡し。
+    Signal,
+    /// 終了の購読（kind 8）。
+    ExitWatch,
+    /// Attach の fd の受け渡し（kind 9）。
+    Attach,
+}
 
 /// 終了購読の接続を、整理（[`SignalSlot::prune_exit_watchers`]）が non-blocking の 1 バイト読み取りで調べられる形にする。
 /// 購読者は Ack の後に何も送らない規約なので、読めたバイトは規約違反（落とす）、EOF は相手の切断、`WouldBlock` は生存。
@@ -176,56 +197,72 @@ pub fn serve_connection_with_guards(
         return;
     }
     let started = Instant::now();
-    let (reason, exit_watch) = handle_request(stream, slot, config, guards);
-    if exit_watch {
-        observer.record_exit_watch(reason == ControlReason::Ok, started.elapsed());
-    } else {
-        observer.record_request(reason == ControlReason::Ok, started.elapsed());
+    let (reason, op) = handle_request(stream, slot, config, guards);
+    let ok = reason == ControlReason::Ok;
+    match op {
+        RequestOp::ExitWatch => observer.record_exit_watch(ok, started.elapsed()),
+        RequestOp::Attach => observer.record_attach(ok, started.elapsed()),
+        RequestOp::Signal => observer.record_request(ok, started.elapsed()),
     }
 }
 
-/// 検証済みの接続の 1 要求を処理し、最終的な理由と「終了の購読か」を返す
-/// （`Ok` が成功。応答を書けなかった場合も処理結果を返す。購読かどうかは計測の操作名を分けるため）。
+/// 検証済みの接続の 1 要求を処理し、最終的な理由と要求の種類を返す
+/// （`Ok` が成功。応答を書けなかった場合も処理結果を返す。種類は計測の操作名を分けるため）。
 fn handle_request(
     mut stream: UnixStream,
     slot: &SignalSlot,
     config: &ServeConfig,
     guards: Option<&Arc<ExecGuardPool>>,
-) -> (ControlReason, bool) {
+) -> (ControlReason, RequestOp) {
     if stream
         .set_write_timeout(Some(config.write_timeout))
         .is_err()
     {
-        return (ControlReason::Internal, false);
+        return (ControlReason::Internal, RequestOp::Signal);
     }
     if stream.write_all(&encode_hello()).is_err() {
-        return (ControlReason::Internal, false);
+        return (ControlReason::Internal, RequestOp::Signal);
     }
     let read_deadline = Instant::now() + config.read_deadline;
 
     let mut header = [0u8; HEADER_LEN];
     if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
-        return (respond(&mut stream, ControlReason::Malformed), false);
+        return (
+            respond(&mut stream, ControlReason::Malformed),
+            RequestOp::Signal,
+        );
     }
     let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_any_request) {
         Ok(RequestHeader::Signal(kind)) => kind,
         Ok(RequestHeader::CancelRestart) => {
-            return (handle_cancel_restart(stream, slot, read_deadline), false);
+            return (
+                handle_cancel_restart(stream, slot, read_deadline),
+                RequestOp::Signal,
+            );
         }
         Ok(RequestHeader::ExecHandover) => {
             return (
                 handle_exec_handover(stream, slot, read_deadline, guards),
-                false,
+                RequestOp::Signal,
             );
         }
         Ok(RequestHeader::ExitWatch) => {
-            return (handle_exit_watch(stream, slot, read_deadline), true);
+            return (
+                handle_exit_watch(stream, slot, read_deadline),
+                RequestOp::ExitWatch,
+            );
         }
-        Err(reason) => return (respond(&mut stream, reason), false),
+        Ok(RequestHeader::Attach) => {
+            return (
+                handle_attach(stream, slot, read_deadline),
+                RequestOp::Attach,
+            );
+        }
+        Err(reason) => return (respond(&mut stream, reason), RequestOp::Signal),
     };
     (
         handle_signal(stream, slot, config, read_deadline, kind),
-        false,
+        RequestOp::Signal,
     )
 }
 
@@ -357,18 +394,113 @@ fn handle_exec_handover(
     reason
 }
 
-/// `EINTR` のときだけ、期限内なら再試行して `send_with_fd` を呼ぶ。期限切れは `TimedOut`。
-fn send_with_fd_until(
+/// tap の購読の失敗を理由コードへ写す（理由の文言は反射しない）。
+fn subscribe_failure(code: fandhe_container_core::traits::ErrorCode) -> ControlReason {
+    use fandhe_container_core::traits::ErrorCode;
+    match code {
+        ErrorCode::FailedPrecondition => ControlReason::NoHandle,
+        ErrorCode::ResourceExhausted => ControlReason::Busy,
+        ErrorCode::InvalidArgument => ControlReason::Malformed,
+        _ => ControlReason::Internal,
+    }
+}
+
+/// AttachRequest（kind 9）の payload を読んで、入力の fd と出力の tap の端を `SCM_RIGHTS` で返す
+/// （SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075）。手順の順序はモジュール doc のとおり（守ること）。
+///
+/// 拒否の応答に fd は添えない。成功は `Response(Ok)` と fd を 1 回の `sendmsg` で送り、手元の fd を drop する
+/// （所有の移転）。fd の並びは「入力 → stdout の tap → stderr の tap」のうち mask で指定したものだけ。
+fn handle_attach(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+) -> ControlReason {
+    let mut payload = [0u8; ATTACH_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match AttachRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    // 残りが 5 秒を超える期限は断る（無制限に長い期限を受けない。REPAIR-5）。
+    let deadline = match absolute_deadline_within(request.deadline, ATTACH_ROUND_TRIP_BUDGET) {
+        Ok(d) => d,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let (mask, tty) = (request.mask(), request.tty());
+
+    // 2. 事前の照合（何も取り出さない）。
+    if let Err(reason) = slot.check_attach(request.pid, tty, mask.stdin()) {
+        return respond(&mut stream, reason);
+    }
+    // 3. tap の購読（スロットのロックの外）。後の段で失敗したら購読は drop で閉じる（tap が相手の切断として片付ける）。
+    let subscription = if mask.stdout() || mask.stderr() {
+        let Some(hub) = slot.output_capture() else {
+            return respond(&mut stream, ControlReason::NoHandle);
+        };
+        match hub.subscribe_output(TapStreams {
+            stdout: mask.stdout(),
+            stderr: mask.stderr(),
+        }) {
+            Ok(sub) => Some(sub),
+            Err(e) => return respond(&mut stream, subscribe_failure(e.code())),
+        }
+    } else {
+        None
+    };
+    // 4. 確定（ロックの下で再照合して取り出す。間に世代が変わっていれば断る）。
+    let taken = match slot.take_attach_input(request.pid, tty, mask.stdin()) {
+        Ok(t) => t,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let generation = taken.generation;
+    let input = taken.input;
+    let (tap_out, tap_err) = subscription.map_or((None, None), |s| s.into_parts());
+
+    // 5・6. 期限の確認と送信。fd の借用はこの区間の中だけ。
+    let (reason, fds_delivered) = (|| {
+        if Instant::now() >= deadline {
+            return (respond(&mut stream, ControlReason::Timeout), false);
+        }
+        let mut fds: Vec<BorrowedFd<'_>> = Vec::with_capacity(ATTACH_MAX_FDS);
+        if let Some(input) = &input {
+            fds.push(input.as_fd());
+        }
+        if let Some(out) = &tap_out {
+            fds.push(out.as_fd());
+        }
+        if let Some(err) = &tap_err {
+            fds.push(err.as_fd());
+        }
+        if fds.len() != mask.fd_count() {
+            return (respond(&mut stream, ControlReason::Internal), false);
+        }
+        respond_with_fds(&mut stream, &fds, deadline)
+    })();
+    // 送れなかった `stdin_once` の端は、同じ世代がまだ生きていれば戻す（失敗した attach がコンテナの stdin を
+    // 閉じない）。fd が相手へ届いた後の失敗は、端が相手にあるので戻さない。
+    if reason != ControlReason::Ok
+        && !fds_delivered
+        && let Some(TakenInput::Once(stdin)) = input
+    {
+        slot.restore_stdin_once(generation, stdin);
+    }
+    reason
+}
+
+/// `EINTR` のときだけ、期限内なら再試行して `send_with_fds` を呼ぶ。期限切れは `TimedOut`。
+fn send_with_fds_until(
     stream: &UnixStream,
     frame: &[u8],
-    fd: BorrowedFd<'_>,
+    fds: &[BorrowedFd<'_>],
     deadline: Instant,
 ) -> io::Result<usize> {
     loop {
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        match crate::sys::send_with_fd(stream.as_fd(), frame, fd) {
+        match crate::sys::send_with_fds(stream.as_fd(), frame, fds) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             other => return other,
         }
@@ -382,19 +514,29 @@ fn respond_with_fd(
     fd: BorrowedFd<'_>,
     deadline: Instant,
 ) -> ControlReason {
+    respond_with_fds(stream, &[fd], deadline).0
+}
+
+/// `Response(Ok)` に `fds`（最大 [`ATTACH_MAX_FDS`] 本）を添えて 1 回の `sendmsg` で送る。戻り値の 2 つ目は、
+/// fd がカーネルに受理され相手へ届く状態になったか（真なら失敗しても fd は相手のもので、呼び出し側は戻さない）。
+fn respond_with_fds(
+    stream: &mut UnixStream,
+    fds: &[BorrowedFd<'_>],
+    deadline: Instant,
+) -> (ControlReason, bool) {
     let frame = ResponseFrame {
         reason: ControlReason::Ok,
     }
     .encode();
     // `EINTR` は sys が返すので、再試行のたびに絶対期限を確かめる（割り込みが続いても期限を超えない。REPAIR-5）。
-    let sent = match send_with_fd_until(stream, &frame, fd, deadline) {
+    let sent = match send_with_fds_until(stream, &frame, fds, deadline) {
         Ok(n) => n,
         Err(_) => {
             log_control_event(
                 "control_request_rejected",
                 Some(ControlReason::Internal.name()),
             );
-            return ControlReason::Internal;
+            return (ControlReason::Internal, false);
         }
     };
     // ストリームの短い書き込み: fd は最初のバイトに付いて届いているので、残りは通常の書き込みで送る。
@@ -402,9 +544,9 @@ fn respond_with_fd(
         && !rest.is_empty()
         && stream.write_all(rest).is_err()
     {
-        return ControlReason::Internal;
+        return (ControlReason::Internal, true);
     }
-    ControlReason::Ok
+    (ControlReason::Ok, true)
 }
 
 /// 要求が載せた絶対期限（`CLOCK_MONOTONIC`）を、サーバ側の `Instant` に写す。
@@ -413,9 +555,17 @@ fn respond_with_fd(
 /// `Instant` を先に取ってから単調時計を読む順序にして、2 回の読み取りの間にスレッドが止まっても期限が延びず
 /// 早まる側にずれるようにする。
 fn absolute_deadline(deadline: SignalDeadline) -> Result<Instant, ControlReason> {
+    absolute_deadline_within(deadline, MAX_SIGNAL_BUDGET)
+}
+
+/// [`absolute_deadline`] の残りの上限を `max` に替えたもの（AttachRequest は 5 秒。REPAIR-5）。
+fn absolute_deadline_within(
+    deadline: SignalDeadline,
+    max: Duration,
+) -> Result<Instant, ControlReason> {
     let base = Instant::now();
     let now_ns = crate::sys::monotonic_now_ns().map_err(|_| ControlReason::Internal)?;
-    let remaining = deadline.remaining_from(now_ns)?;
+    let remaining = deadline.remaining_within(now_ns, max)?;
     Ok(base + remaining)
 }
 

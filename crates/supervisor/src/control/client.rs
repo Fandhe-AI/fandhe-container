@@ -142,6 +142,43 @@ impl super::ExecPidfdSource for ControlExecHandover {
     }
 }
 
+/// supervisor の制御チャネルから、稼働中コンテナの Attach 用の入力 fd と出力の tap の端を受け取る
+/// [`super::AttachIoSource`]（plugin-cri の Attach 用。SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075）。
+/// Linux のみ（`SCM_RIGHTS` と pty は Linux の機能）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct ControlAttach {
+    state_root: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ControlAttach {
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::AttachIoSource for ControlAttach {
+    fn obtain(
+        &self,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        request: super::AttachIoRequest,
+        deadline: Instant,
+    ) -> Result<super::AttachIo, TraitError> {
+        linux::attach(&self.state_root, id, pid, request, deadline)
+    }
+}
+
+/// Attach 1 往復の実際の期限: 呼び出し側の期限と `now` + [`super::protocol::ATTACH_ROUND_TRIP_BUDGET`] の早い方
+/// （REPAIR-5・#4075）。接続・Hello・要求・応答のすべてをこの期限で打ち切る。時計を読まない純関数。
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_round_trip_deadline(now: Instant, caller: Instant) -> Instant {
+    caller.min(now + super::protocol::ATTACH_ROUND_TRIP_BUDGET)
+}
+
 /// supervisor の制御チャネルへシグナル送信を依頼する `ProcessSignaler`。
 #[derive(Debug, Clone)]
 pub struct ControlSignaler {
@@ -203,6 +240,7 @@ mod linux {
     use std::io::{self, Write as _};
     use std::num::NonZeroU32;
     use std::os::fd::{AsFd as _, OwnedFd};
+    use std::os::unix::fs::FileTypeExt as _;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Mutex;
@@ -217,13 +255,16 @@ mod linux {
         CONTROL_SOCKET_NAME, effective_uid, open_state_dir, path_via_fd,
     };
     use crate::control::protocol::{
-        CancelRestartRequestFrame, ControlReason, ExecCgroupNotifyFrame, ExecHandoverRequestFrame,
-        ExitWatchRequestFrame, FrameHeader, HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS,
-        MAX_EXIT_WATCH_HOLD, MAX_SIGNAL_BUDGET, RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind,
-        ResponseFrame, SignalDeadline, SignalRequestFrame,
+        AttachMask, AttachRequestFrame, CancelRestartRequestFrame, ControlReason,
+        ExecCgroupNotifyFrame, ExecHandoverRequestFrame, ExitWatchRequestFrame, FrameHeader,
+        HEADER_LEN, HoldDeadline, MAX_EXEC_HOLD_SECS, MAX_EXIT_WATCH_HOLD, MAX_SIGNAL_BUDGET,
+        RESPONSE_LEN, RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline,
+        SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
-    use crate::control::{ExecCreatedNotifier, ExecHandover};
+    use crate::control::{
+        AttachInput, AttachIo, AttachIoRequest, ExecCreatedNotifier, ExecHandover,
+    };
 
     /// 1 回の交換で送る要求。
     #[derive(Clone, Copy)]
@@ -237,6 +278,12 @@ mod linux {
         /// exec 用 pidfd の受け渡し（#2626）。応答に fd が添えられる。
         ExecHandover {
             pid: NonZeroU32,
+        },
+        /// Attach の fd の受け渡し（#4075）。応答に fd が添えられる。
+        Attach {
+            pid: NonZeroU32,
+            mask: AttachMask,
+            tty: bool,
         },
     }
 
@@ -485,10 +532,20 @@ mod linux {
                 }
                 .encode(),
             ),
+            Request::Attach { pid, mask, tty } => {
+                let frame =
+                    AttachRequestFrame::new(pid, mask, tty, deadline_frame).map_err(|_| {
+                        TraitError::new(ErrorCode::InvalidArgument, "invalid attach request")
+                    })?;
+                stream.write_all(&frame.encode())
+            }
         };
         sent.map_err(|e| io_error(&e))?;
 
-        if matches!(request, Request::ExecHandover { .. }) {
+        if matches!(
+            request,
+            Request::ExecHandover { .. } | Request::Attach { .. }
+        ) {
             // 接続は呼び出し側へ返す（exec の間保持して作成通知に使う。閉じることが supervisor への回収の合図）。
             let (reason, fds) = read_response_with_fds(&mut stream, deadline)?;
             return Ok((reason, fds, stream));
@@ -588,6 +645,112 @@ mod linux {
                 "the supervisor control channel returned an unexpected descriptor set",
             )),
         }
+    }
+
+    /// Attach の入力 fd と出力の tap の端を supervisor から受け取る（SUP-4・SUP-7・REPAIR-2・SEC-1・#4075）。
+    ///
+    /// 1 往復（接続・Hello・要求・応答）は `deadline` と 5 秒の早い方で打ち切る（REPAIR-5）。接続は応答の後に閉じる。
+    /// 古い supervisor（kind 9 を知らない）が返す `Malformed`・`TooLarge`・`UnsupportedVersion` は「届かない」
+    /// （`Unavailable`）として扱い、fd を受け取らず別の手段へも切り替えない（fail-closed）。成功は `Response(Ok)` と
+    /// 要求に見合った本数・種別の fd のときだけで、拒否に fd が添えられていても、本数や種別が想定と違っても、
+    /// 受け取った fd はすべて閉じて失敗にする（D9。この関数が plugin-cri の受け取る境界）。
+    pub(super) fn attach(
+        state_root: &Path,
+        id: &ContainerId,
+        pid: NonZeroU32,
+        request: AttachIoRequest,
+        deadline: Instant,
+    ) -> Result<AttachIo, TraitError> {
+        let invalid = || TraitError::new(ErrorCode::InvalidArgument, "invalid attach request");
+        if request.tty && request.stderr {
+            return Err(invalid());
+        }
+        let mask = AttachMask::new(request.stdin, request.stdout, request.stderr)
+            .map_err(|_| invalid())?;
+        let deadline = super::attach_round_trip_deadline(Instant::now(), deadline);
+        if deadline.saturating_duration_since(Instant::now()) <= DEADLINE_MARGIN {
+            return Err(timeout());
+        }
+        let (reason, fds, _stream) = exchange_with_fds(
+            state_root,
+            Request::Attach {
+                pid,
+                mask,
+                tty: request.tty,
+            },
+            id,
+            deadline,
+        )?;
+        match reason {
+            ControlReason::Ok => {}
+            // fd が添えられていても `fds` の drop で閉じる。
+            ControlReason::Malformed
+            | ControlReason::TooLarge
+            | ControlReason::UnsupportedVersion => {
+                return Err(TraitError::new(
+                    ErrorCode::Unavailable,
+                    "the supervisor does not support attach",
+                ));
+            }
+            other => {
+                return Err(other.to_error().unwrap_or_else(unavailable));
+            }
+        }
+        classify_attach_fds(mask, request.tty, fds)
+    }
+
+    /// 受け取った fd の本数と種別を要求と照合して [`AttachIo`] に組む。1 つでも違えば全て drop して `Internal`。
+    fn classify_attach_fds(
+        mask: AttachMask,
+        tty: bool,
+        fds: Vec<OwnedFd>,
+    ) -> Result<AttachIo, TraitError> {
+        let unexpected = || {
+            TraitError::new(
+                ErrorCode::Internal,
+                "the supervisor control channel returned an unexpected descriptor set",
+            )
+        };
+        if fds.len() != mask.fd_count() {
+            return Err(unexpected());
+        }
+        let mut fds = fds.into_iter();
+        let input = if mask.stdin() {
+            let fd = fds.next().ok_or_else(unexpected)?;
+            if tty {
+                let master = fandhe_container_core::exec::PtyMaster::from_received(fd)
+                    .map_err(|_| unexpected())?;
+                Some(AttachInput::Pty(master))
+            } else {
+                let fd = fd_of_kind(fd, |t| t.is_fifo() || t.is_socket()).ok_or_else(unexpected)?;
+                Some(AttachInput::Pipe(fd))
+            }
+        } else {
+            None
+        };
+        let mut tap = |wanted: bool| -> Result<Option<UnixStream>, TraitError> {
+            if !wanted {
+                return Ok(None);
+            }
+            let fd = fds.next().ok_or_else(unexpected)?;
+            let fd = fd_of_kind(fd, |t| t.is_socket()).ok_or_else(unexpected)?;
+            Ok(Some(UnixStream::from(fd)))
+        };
+        let stdout = tap(mask.stdout())?;
+        let stderr = tap(mask.stderr())?;
+        Ok(AttachIo {
+            input,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// `fstat` で fd の種別を確かめ、`accept` を満たすときだけ fd を返す（ディレクトリなど想定外の種別は閉じて `None`。
+    /// SEC-1。`ChildStdio::from_fds` と同じ理由）。
+    fn fd_of_kind(fd: OwnedFd, accept: impl Fn(std::fs::FileType) -> bool) -> Option<OwnedFd> {
+        let file = std::fs::File::from(fd);
+        let ty = file.metadata().ok()?.file_type();
+        accept(ty).then(|| OwnedFd::from(file))
     }
 
     /// 終了購読の取り消し・期限を見る読み取りの刻み（core の既定の `wait_exit` の `CANCEL_SLICE` と同じ粒度）。
@@ -953,6 +1116,126 @@ mod linux {
             let e = cancel_outcome(ControlReason::StopIntentUnavailable).unwrap_err();
             assert_eq!(e.code(), ErrorCode::FailedPrecondition);
             assert_eq!(e.message(), "the supervisor cannot record the stop intent");
+        }
+
+        /// 渡した fd の相手側（閉じたかどうかを EOF で確かめる）。fd の総数は他の試験スレッドで揺れるため数えない。
+        #[derive(Default)]
+        struct Peers {
+            pipes: Vec<std::io::PipeReader>,
+            socks: Vec<UnixStream>,
+        }
+
+        impl Peers {
+            /// 渡した fd がすべて閉じられていれば、相手側は EOF（読み取り 0）になる。
+            fn assert_all_closed(&mut self) {
+                use std::io::Read as _;
+                let mut buf = [0u8; 1];
+                for r in &mut self.pipes {
+                    assert_eq!(
+                        r.read(&mut buf).unwrap(),
+                        0,
+                        "pipe write end must be closed"
+                    );
+                }
+                for s in &mut self.socks {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    assert_eq!(s.read(&mut buf).unwrap(), 0, "socket must be closed");
+                }
+            }
+        }
+
+        fn mask(stdin: bool, stdout: bool, stderr: bool) -> AttachMask {
+            AttachMask::new(stdin, stdout, stderr).unwrap()
+        }
+
+        fn pipe_writer_fd(peers: &mut Peers) -> OwnedFd {
+            let (r, w) = std::io::pipe().unwrap();
+            peers.pipes.push(r);
+            OwnedFd::from(w)
+        }
+
+        fn socket_fd(peers: &mut Peers) -> OwnedFd {
+            let (a, b) = UnixStream::pair().unwrap();
+            peers.socks.push(b);
+            OwnedFd::from(a)
+        }
+
+        /// SUP-4・REPAIR-5・#4075: 実際の期限は呼び出し側と 5 秒の早い方（具体値）。
+        #[test]
+        fn repair5_4075_attach_round_trip_deadline_is_min_of_caller_and_five_seconds() {
+            let now = Instant::now();
+            assert_eq!(
+                crate::control::client::attach_round_trip_deadline(
+                    now,
+                    now + Duration::from_secs(60)
+                ),
+                now + Duration::from_secs(5)
+            );
+            assert_eq!(
+                crate::control::client::attach_round_trip_deadline(
+                    now,
+                    now + Duration::from_secs(1)
+                ),
+                now + Duration::from_secs(1)
+            );
+        }
+
+        /// SEC-1・#4075: 非 tty の正しい組（pipe + socket 2 本）は種別を確かめて受け取る。
+        #[test]
+        fn sec1_4075_classify_accepts_expected_descriptor_set() {
+            let mut p = Peers::default();
+            let fds = vec![pipe_writer_fd(&mut p), socket_fd(&mut p), socket_fd(&mut p)];
+            let io = classify_attach_fds(mask(true, true, true), false, fds).unwrap();
+            assert!(matches!(io.input, Some(AttachInput::Pipe(_))));
+            assert!(io.stdout.is_some() && io.stderr.is_some());
+            let fds = vec![socket_fd(&mut p)];
+            let io = classify_attach_fds(mask(false, true, false), false, fds).unwrap();
+            assert!(io.input.is_none() && io.stdout.is_some() && io.stderr.is_none());
+        }
+
+        /// SEC-1・#4075（D9）: 本数の過不足・種別違い（tap が pipe・入力がディレクトリ・tty で master でない fd）は
+        /// `Internal` で、受け取った fd はすべて閉じる（fd の数が増えない）。
+        #[test]
+        fn sec1_4075_classify_rejects_unexpected_sets_and_closes_all() {
+            let dir_fd = || OwnedFd::from(std::fs::File::open("/").unwrap());
+            let mut p = Peers::default();
+            let cases: Vec<(AttachMask, bool, Vec<OwnedFd>)> = vec![
+                // 足りない・余分。
+                (
+                    mask(true, true, true),
+                    false,
+                    vec![pipe_writer_fd(&mut p), socket_fd(&mut p)],
+                ),
+                (
+                    mask(true, false, false),
+                    false,
+                    vec![pipe_writer_fd(&mut p), socket_fd(&mut p)],
+                ),
+                (mask(true, false, false), false, vec![]),
+                // tap が pipe。
+                (
+                    mask(false, true, false),
+                    false,
+                    vec![pipe_writer_fd(&mut p)],
+                ),
+                // 入力がディレクトリ。
+                (mask(true, false, false), false, vec![dir_fd()]),
+                // tty の入力が master ではない（socket）。
+                (
+                    mask(true, true, false),
+                    true,
+                    vec![socket_fd(&mut p), socket_fd(&mut p)],
+                ),
+            ];
+            for (m, tty, fds) in cases {
+                let e = classify_attach_fds(m, tty, fds).unwrap_err();
+                assert_eq!(e.code(), ErrorCode::Internal);
+                assert_eq!(
+                    e.message(),
+                    "the supervisor control channel returned an unexpected descriptor set"
+                );
+            }
+            p.assert_all_closed();
         }
     }
 }

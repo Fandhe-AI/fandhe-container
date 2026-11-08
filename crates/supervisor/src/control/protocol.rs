@@ -1,6 +1,6 @@
 //! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 8 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 9 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -18,6 +18,17 @@
 //! | ExecHandoverRequest | クライアント → サーバ | 6 | pid `u32`・deadline_ns `u64` | 20 |
 //! | ExecCgroupNotify | クライアント → サーバ | 7 | hold_ns `u64`・exec 子 cgroup の名前（1〜56 バイト。Linux のみ） | 17〜72 |
 //! | ExitWatchRequest | クライアント → サーバ | 8 | pid `u32`・hold_ns `u64`（相対の保持期限） | 20 |
+//! | AttachRequest | クライアント → サーバ | 9 | pid `u32`・mask `u8`・tty `u8`・deadline_ns `u64` | 22 |
+//!
+//! AttachRequest は plugin-cri の Attach が、稼働中コンテナの init の stdin（tty では pty master の複製）と出力の tap を
+//! 受け取るための要求である（SUP-4・SUP-7・REPAIR-2・SEC-1・CRI-6・#4075。設計は `docs/design/cri-streaming-server.md`
+//! 「完全版 Attach の設計」D1・D5）。supervisor は、スロットが `Active` で pid・入出力の種別（tty）が合うときだけ
+//! `Response(Ok)` と同じ `sendmsg` に `SCM_RIGHTS` で fd を最大 3 本添えて返し、接続を閉じる（接続は保持しない）。
+//! 添える fd の順序は固定で「入力（stdin の書き込み端、tty では master の複製）→ stdout の tap → stderr の tap」のうち
+//! mask で指定したものだけを並べる。拒否の応答に fd は添えない。mask は bit0 = stdin・bit1 = stdout・bit2 = stderr で、
+//! 0 や予約ビット、tty と stderr の併用は `Malformed`。期限は他の要求と同じ絶対時刻で、残りが
+//! [`ATTACH_ROUND_TRIP_BUDGET`]（5 秒）を超える要求は `Malformed`（REPAIR-5）。設計 D1 の「予算（ms）」ではなく
+//! 絶対期限を載せるのは、相対値だと受信の遅れの分だけ送信期限が延びるため。
 //!
 //! ExitWatchRequest は、稼働中コンテナの終了を「通知で待つ」ための購読要求である（SUP-1・CRI-1・REPAIR-5・#3683）。
 //! supervisor は、スロットが `Active` で pid が一致し、購読の枠に空きがあるとき `Response(Ok)` を返し、以後は接続を閉じる
@@ -62,7 +73,9 @@
 //! `Malformed` として拒否し、クライアントは `NoSupervisor` 相当（従来の stop）に倒す。kind 6（#2626）も同じ方針で、
 //! 古い supervisor は `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（exec しない。fail-closed）。
 //! kind 8（#3683）も同じ方針で、古い supervisor は `Malformed` として拒否し、クライアントは「通知なし」として状態の
-//! 照会へ退避する（遅延が既定に戻るだけで、正しさは落ちない）。
+//! 照会へ退避する（遅延が既定に戻るだけで、正しさは落ちない）。kind 9（#4075）は、古い supervisor が `Malformed` で
+//! 断る。クライアントはそれを「届かない」（`Unavailable`）として扱い、fd を受け取らず別の手段へも切り替えない
+//! （fail-closed。stdin の所有を別経路で奪わない）。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -104,6 +117,14 @@ pub const EXIT_WATCH_REQUEST_LEN: usize = HEADER_LEN + EXIT_WATCH_PAYLOAD_LEN;
 /// ExitWatchRequest の保持期限の上限。サーバが 1 購読で fd を預かる最長で、クライアントは全体の期限までこの単位で
 /// 購読し直す（資源を短く区切る。REPAIR-5）。
 pub const MAX_EXIT_WATCH_HOLD: Duration = Duration::from_secs(60);
+/// AttachRequest の payload 長（pid `u32`・mask `u8`・tty `u8`・deadline_ns `u64`）。
+pub const ATTACH_PAYLOAD_LEN: usize = 14;
+/// AttachRequest の全長。
+pub const ATTACH_REQUEST_LEN: usize = HEADER_LEN + ATTACH_PAYLOAD_LEN;
+/// AttachRequest 1 往復（接続・Hello・要求・応答）の上限（REPAIR-5）。サーバは残りがこれを超える要求を拒否する。
+pub const ATTACH_ROUND_TRIP_BUDGET: Duration = Duration::from_secs(5);
+/// 応答に添える fd の最大本数（入力・stdout の tap・stderr の tap）。
+pub const ATTACH_MAX_FDS: usize = 3;
 /// Response の payload 長。
 pub const RESPONSE_PAYLOAD_LEN: usize = 1;
 /// Response の全長。
@@ -119,6 +140,7 @@ const KIND_CANCEL_RESTART_REQUEST: u8 = 5;
 const KIND_EXEC_HANDOVER_REQUEST: u8 = 6;
 const KIND_EXEC_CGROUP_NOTIFY: u8 = 7;
 const KIND_EXIT_WATCH_REQUEST: u8 = 8;
+const KIND_ATTACH_REQUEST: u8 = 9;
 
 /// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +196,12 @@ pub enum ControlReason {
     ExecGuardExhausted = 13,
     /// この supervisor は exec 子 cgroup を回収できない（回収役が結線されていない）。pidfd は渡さない（fail-closed）。
     ExecReclaimUnavailable = 14,
+    /// コンテナが stdin を開いて作られていない（`--stdin` が無い。Attach の入力を渡せない。#4075）。
+    StdinNotOpen = 15,
+    /// 要求の tty の別が、コンテナの入出力の構成（pty か pipe か）と合わない（#4075）。
+    TtyMismatch = 16,
+    /// `stdin_once` の stdin が先の Attach に渡され済みで、もう渡せない（#4075）。
+    StdinClosed = 17,
 }
 
 impl ControlReason {
@@ -195,6 +223,9 @@ impl ControlReason {
             12 => Self::ContainerRunning,
             13 => Self::ExecGuardExhausted,
             14 => Self::ExecReclaimUnavailable,
+            15 => Self::StdinNotOpen,
+            16 => Self::TtyMismatch,
+            17 => Self::StdinClosed,
             _ => return None,
         })
     }
@@ -217,6 +248,9 @@ impl ControlReason {
             Self::ContainerRunning => "container_running",
             Self::ExecGuardExhausted => "exec_guard_exhausted",
             Self::ExecReclaimUnavailable => "exec_reclaim_unavailable",
+            Self::StdinNotOpen => "stdin_not_open",
+            Self::TtyMismatch => "tty_mismatch",
+            Self::StdinClosed => "stdin_closed",
         }
     }
 
@@ -269,6 +303,18 @@ impl ControlReason {
                 ErrorCode::FailedPrecondition,
                 "the supervisor cannot reclaim exec cgroups",
             ),
+            Self::StdinNotOpen => (
+                ErrorCode::FailedPrecondition,
+                "the container was not created with stdin open",
+            ),
+            Self::TtyMismatch => (
+                ErrorCode::FailedPrecondition,
+                "the requested tty mode does not match the container",
+            ),
+            Self::StdinClosed => (
+                ErrorCode::FailedPrecondition,
+                "the container stdin was already consumed by an attach",
+            ),
             Self::SignalFailed | Self::Internal => (
                 ErrorCode::Internal,
                 "the supervisor failed to deliver the signal",
@@ -314,11 +360,16 @@ impl SignalDeadline {
     /// 現在時刻 `now_ns`（同じ時計）から見た残り時間。すでに過ぎていれば `Timeout`、
     /// [`MAX_SIGNAL_BUDGET`] を超える先なら `Malformed`（無制限に長い期限を受けない）。
     pub fn remaining_from(self, now_ns: u64) -> Result<Duration, ControlReason> {
+        self.remaining_within(now_ns, MAX_SIGNAL_BUDGET)
+    }
+
+    /// [`Self::remaining_from`] の上限を `max` に替えたもの（AttachRequest は [`ATTACH_ROUND_TRIP_BUDGET`]）。
+    pub fn remaining_within(self, now_ns: u64, max: Duration) -> Result<Duration, ControlReason> {
         let Some(rest) = self.0.checked_sub(now_ns).filter(|r| *r > 0) else {
             return Err(ControlReason::Timeout);
         };
         let remaining = Duration::from_nanos(rest);
-        if remaining > MAX_SIGNAL_BUDGET {
+        if remaining > max {
             return Err(ControlReason::Malformed);
         }
         Ok(remaining)
@@ -391,6 +442,10 @@ impl FrameHeader {
             self.expect(KIND_EXIT_WATCH_REQUEST, EXIT_WATCH_PAYLOAD_LEN)?;
             return Ok(RequestHeader::ExitWatch);
         }
+        if self.kind == KIND_ATTACH_REQUEST {
+            self.expect(KIND_ATTACH_REQUEST, ATTACH_PAYLOAD_LEN)?;
+            return Ok(RequestHeader::Attach);
+        }
         self.expect_request().map(RequestHeader::Signal)
     }
 
@@ -428,6 +483,8 @@ pub enum RequestHeader {
     ExecHandover,
     /// ExitWatchRequest（payload 12 バイト。#3683）。
     ExitWatch,
+    /// AttachRequest（payload 14 バイト。#4075）。
+    Attach,
 }
 
 /// Hello frame（payload なし）を encode する。
@@ -608,6 +665,149 @@ impl ExitWatchRequestFrame {
             .ok_or(ControlReason::Malformed)?;
         let hold = Duration::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]));
         Self::new(pid, hold)
+    }
+}
+
+/// AttachRequest の mask（bit0 = stdin・bit1 = stdout・bit2 = stderr）。0 と予約ビットは表現できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachMask(u8);
+
+impl AttachMask {
+    const STDIN: u8 = 0b001;
+    const STDOUT: u8 = 0b010;
+    const STDERR: u8 = 0b100;
+
+    /// 3 本の指定から作る。全部 false は `Malformed`（何も受け取らない要求は無い）。
+    pub fn new(stdin: bool, stdout: bool, stderr: bool) -> Result<Self, ControlReason> {
+        let bits = (u8::from(stdin) * Self::STDIN)
+            | (u8::from(stdout) * Self::STDOUT)
+            | (u8::from(stderr) * Self::STDERR);
+        Self::from_wire(bits)
+    }
+
+    /// ワイヤー上の値から復元する。0・予約ビット（bit3 以上）は `Malformed`。
+    pub fn from_wire(bits: u8) -> Result<Self, ControlReason> {
+        if bits == 0 || bits & !(Self::STDIN | Self::STDOUT | Self::STDERR) != 0 {
+            return Err(ControlReason::Malformed);
+        }
+        Ok(Self(bits))
+    }
+
+    /// ワイヤー上の値。
+    pub fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    /// 入力（stdin の書き込み端、tty では master の複製）を受け取るか。
+    pub fn stdin(self) -> bool {
+        self.0 & Self::STDIN != 0
+    }
+
+    /// stdout の tap を受け取るか。
+    pub fn stdout(self) -> bool {
+        self.0 & Self::STDOUT != 0
+    }
+
+    /// stderr の tap を受け取るか。
+    pub fn stderr(self) -> bool {
+        self.0 & Self::STDERR != 0
+    }
+
+    /// 成功の応答に添える fd の本数（立っているビットの数。tty でも同じ）。
+    pub fn fd_count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+}
+
+/// AttachRequest frame（kind 9。SUP-4・REPAIR-2・SEC-1・#4075）。値域は型が保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachRequestFrame {
+    /// 対象の pid（スロットの起動ハンドルの pid と一致したときだけ fd を渡す）。
+    pub pid: NonZeroU32,
+    /// 受け取る fd の指定。
+    mask: AttachMask,
+    /// 要求側が想定する入出力の構成（true = pty）。コンテナの構成と合わなければ `TtyMismatch`。
+    tty: bool,
+    /// 応答を完了する期限（`CLOCK_MONOTONIC` の絶対時刻。残り [`ATTACH_ROUND_TRIP_BUDGET`] 以下）。
+    pub deadline: SignalDeadline,
+}
+
+impl AttachRequestFrame {
+    /// 値域を検証して作る。tty と stderr の併用は `Malformed`（tty は stdout と stderr が混ざる）。
+    pub fn new(
+        pid: NonZeroU32,
+        mask: AttachMask,
+        tty: bool,
+        deadline: SignalDeadline,
+    ) -> Result<Self, ControlReason> {
+        if tty && mask.stderr() {
+            return Err(ControlReason::Malformed);
+        }
+        Ok(Self {
+            pid,
+            mask,
+            tty,
+            deadline,
+        })
+    }
+
+    /// fd の指定。
+    pub fn mask(&self) -> AttachMask {
+        self.mask
+    }
+
+    /// 要求側が想定する構成（true = pty）。
+    pub fn tty(&self) -> bool {
+        self.tty
+    }
+
+    /// 22 バイトに encode する。
+    pub fn encode(&self) -> [u8; ATTACH_REQUEST_LEN] {
+        let [h0, h1, h2, h3, h4, h5, h6, h7] =
+            FrameHeader::encode(KIND_ATTACH_REQUEST, ATTACH_PAYLOAD_LEN as u16);
+        let [p0, p1, p2, p3] = self.pid.get().to_be_bytes();
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.deadline.as_nanos().to_be_bytes();
+        [
+            h0,
+            h1,
+            h2,
+            h3,
+            h4,
+            h5,
+            h6,
+            h7,
+            p0,
+            p1,
+            p2,
+            p3,
+            self.mask.as_u8(),
+            u8::from(self.tty),
+            b0,
+            b1,
+            b2,
+            b3,
+            b4,
+            b5,
+            b6,
+            b7,
+        ]
+    }
+
+    /// 検証済みヘッダ（[`RequestHeader::Attach`]）の後ろの payload 14 バイトを読む。
+    /// pid 0・mask の値域違反・tty が 0/1 以外・tty と stderr の併用・deadline 0 は `Malformed`。
+    pub fn decode_payload(payload: &[u8; ATTACH_PAYLOAD_LEN]) -> Result<Self, ControlReason> {
+        let [p0, p1, p2, p3, mask, tty, b0, b1, b2, b3, b4, b5, b6, b7] = *payload;
+        let pid = NonZeroU32::new(u32::from_be_bytes([p0, p1, p2, p3]))
+            .ok_or(ControlReason::Malformed)?;
+        let mask = AttachMask::from_wire(mask)?;
+        let tty = match tty {
+            0 => false,
+            1 => true,
+            _ => return Err(ControlReason::Malformed),
+        };
+        let deadline =
+            SignalDeadline::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))?;
+        Self::new(pid, mask, tty, deadline)
     }
 }
 
@@ -1310,5 +1510,170 @@ mod tests {
             );
         }
         assert_eq!(h(8, 12).expect_request(), Err(ControlReason::Malformed));
+    }
+
+    fn attach_frame(mask: u8, tty: bool) -> AttachRequestFrame {
+        AttachRequestFrame::new(
+            NonZeroU32::new(4242).unwrap(),
+            AttachMask::from_wire(mask).unwrap(),
+            tty,
+            SignalDeadline::from_nanos(1_500_000_000).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// SUP-4・REPAIR-2・#4075: AttachRequest は kind 9・payload 14 バイトで、具体バイトで往復する。
+    #[test]
+    fn sup4_repair2_4075_attach_request_roundtrip_concrete_bytes() {
+        let frame = attach_frame(0b011, false);
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'F', b'C', b'S', b'C', 1, 9, 0, 14, // ヘッダ
+                0, 0, 0x10, 0x92, // pid 4242
+                0b011, 0, // mask（stdin + stdout）・tty なし
+                0, 0, 0, 0, 0x59, 0x68, 0x2f, 0x00, // deadline 1_500_000_000ns
+            ]
+        );
+        let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
+        let header = FrameHeader::decode(head).unwrap();
+        assert_eq!(header.expect_any_request(), Ok(RequestHeader::Attach));
+        let payload: [u8; ATTACH_PAYLOAD_LEN] = payload.try_into().unwrap();
+        assert_eq!(AttachRequestFrame::decode_payload(&payload).unwrap(), frame);
+        assert_eq!(ATTACH_REQUEST_LEN, 22);
+    }
+
+    /// REPAIR-2・#4075: pid 0・mask の値域違反・tty の値・tty と stderr の併用・deadline 0 は `Malformed`。
+    #[test]
+    fn sup4_repair2_4075_attach_rejects_out_of_range_values() {
+        let good = attach_frame(0b011, false).encode();
+        let payload = |edit: &dyn Fn(&mut [u8; ATTACH_PAYLOAD_LEN])| {
+            let mut p: [u8; ATTACH_PAYLOAD_LEN] = good[HEADER_LEN..].try_into().unwrap();
+            edit(&mut p);
+            AttachRequestFrame::decode_payload(&p)
+        };
+        assert_eq!(payload(&|_| {}), Ok(attach_frame(0b011, false)));
+        assert_eq!(
+            payload(&|p| p[..4].copy_from_slice(&0u32.to_be_bytes())),
+            Err(ControlReason::Malformed)
+        );
+        for bad in [0u8, 0b1000, 0b1000_0001, 0xff] {
+            assert_eq!(
+                payload(&|p| p[4] = bad),
+                Err(ControlReason::Malformed),
+                "mask {bad:#b}"
+            );
+        }
+        assert_eq!(payload(&|p| p[5] = 2), Err(ControlReason::Malformed));
+        // tty = 1 に stderr のビット。
+        assert_eq!(
+            payload(&|p| {
+                p[4] = 0b110;
+                p[5] = 1;
+            }),
+            Err(ControlReason::Malformed)
+        );
+        assert_eq!(
+            payload(&|p| {
+                p[4] = 0b011;
+                p[5] = 1;
+            }),
+            Ok(attach_frame(0b011, true))
+        );
+        assert_eq!(
+            payload(&|p| p[6..].copy_from_slice(&0u64.to_be_bytes())),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// REPAIR-2・#4075: kind 9 は payload 14 だけを受け、未知の kind 10 は `Malformed`（古い supervisor の kind 9 と同じ）。
+    #[test]
+    fn sup4_repair2_4075_attach_header_checks_payload_len_and_unknown_kind() {
+        let h = |kind: u8, len: u8| {
+            FrameHeader::decode(&[b'F', b'C', b'S', b'C', 1, kind, 0, len]).unwrap()
+        };
+        assert_eq!(h(9, 14).expect_any_request(), Ok(RequestHeader::Attach));
+        for len in [0u8, 12, 13, 15, 22] {
+            assert_eq!(
+                h(9, len).expect_any_request(),
+                Err(ControlReason::Malformed),
+                "len {len}"
+            );
+        }
+        assert_eq!(
+            h(10, 14).expect_any_request(),
+            Err(ControlReason::Malformed)
+        );
+        assert_eq!(h(9, 14).expect_request(), Err(ControlReason::Malformed));
+    }
+
+    /// #4075: mask の各ビット・fd 本数の具体値。
+    #[test]
+    fn sup4_4075_attach_mask_bits_and_fd_count() {
+        let m = AttachMask::new(true, false, true).unwrap();
+        assert_eq!(m.as_u8(), 0b101);
+        assert!(m.stdin() && !m.stdout() && m.stderr());
+        assert_eq!(m.fd_count(), 2);
+        assert_eq!(
+            AttachMask::from_wire(0b111).unwrap().fd_count(),
+            ATTACH_MAX_FDS
+        );
+        assert_eq!(
+            AttachMask::new(false, false, false),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// REPAIR-5・#4075: 往復の上限は 5 秒で、残りが 5 秒を超える期限は `Malformed`、過ぎていれば `Timeout`。
+    #[test]
+    fn repair5_4075_attach_budget_is_five_seconds() {
+        assert_eq!(ATTACH_ROUND_TRIP_BUDGET, Duration::from_secs(5));
+        let d = SignalDeadline::from_nanos(10_000_000_000).unwrap();
+        assert_eq!(
+            d.remaining_within(5_000_000_000, ATTACH_ROUND_TRIP_BUDGET),
+            Ok(Duration::from_secs(5))
+        );
+        assert_eq!(
+            d.remaining_within(4_999_999_999, ATTACH_ROUND_TRIP_BUDGET),
+            Err(ControlReason::Malformed)
+        );
+        assert_eq!(
+            d.remaining_within(10_000_000_000, ATTACH_ROUND_TRIP_BUDGET),
+            Err(ControlReason::Timeout)
+        );
+    }
+
+    /// #4075: 理由コード 15〜17 の往復・固定名・固定文。
+    #[test]
+    fn sup4_4075_attach_reasons_roundtrip() {
+        for (v, reason, name, msg) in [
+            (
+                15u8,
+                ControlReason::StdinNotOpen,
+                "stdin_not_open",
+                "the container was not created with stdin open",
+            ),
+            (
+                16,
+                ControlReason::TtyMismatch,
+                "tty_mismatch",
+                "the requested tty mode does not match the container",
+            ),
+            (
+                17,
+                ControlReason::StdinClosed,
+                "stdin_closed",
+                "the container stdin was already consumed by an attach",
+            ),
+        ] {
+            assert_eq!(ControlReason::from_u8(v), Some(reason));
+            assert_eq!(reason as u8, v);
+            assert_eq!(reason.name(), name);
+            let e = reason.to_error().unwrap();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), msg);
+        }
+        assert_eq!(ControlReason::from_u8(18), None);
     }
 }

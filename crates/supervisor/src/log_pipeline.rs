@@ -99,7 +99,7 @@ impl CaptureHub {
         self
     }
 
-    /// 今の捕捉の出力を購読する（#4072・SUP-7・REPAIR-5。C6〔#4075〕の kind 9 が呼び、端を SCM_RIGHTS で返す）。
+    /// 今の捕捉の出力を購読する（#4072・SUP-7・REPAIR-5。制御チャネルの kind 9〔`control::server`。C6 #4075〕が呼び、端を SCM_RIGHTS で返す）。
     ///
     /// 購読の後に読まれた出力だけが届く（過去の出力は持たない）。sink が優先で、溢れた・閉じた購読者は切断される
     /// （契約は [`crate::logs::tap`]）。生きている捕捉が無い（初回の `attach` の前・`quiesce` から次の `attach` まで・

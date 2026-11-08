@@ -54,7 +54,7 @@ fn help_exits_zero_with_usage() {
     assert_eq!(o.code, Some(0));
     assert_eq!(
         o.stdout,
-        "usage: fandhe-container-plugin-cri [--help] | --socket <PATH>\n"
+        "usage: fandhe-container-plugin-cri [--help] | --socket <PATH> [--streaming-bind <ADDR>] [--streaming-allow-external] [--streaming-advertise <IP>]\n"
     );
     assert_eq!(o.stderr, "");
 }
@@ -90,6 +90,30 @@ fn relative_socket_exits_two_without_echoing_path() {
     );
     assert!(!o.stderr.contains("secret"));
     assert_eq!(o.stdout, "");
+}
+
+/// CRI-6・REPAIR-3・#4110: 不正な `--streaming-*` は終了コード 2・固定文言・値の非エコーで、socket を作らない。
+#[test]
+fn invalid_streaming_args_exit_two_without_echoing_value() {
+    for (extra, secret) in [
+        (vec!["--streaming-bind=0.0.0.0:0"], "0.0.0.0"),
+        (vec!["--streaming-bind=not-an-addr"], "not-an-addr"),
+        (
+            vec!["--streaming-bind=0.0.0.0:0", "--streaming-allow-external"],
+            "0.0.0.0",
+        ),
+    ] {
+        let mut args = vec!["--socket", "/nonexistent-4110/s.sock"];
+        args.extend(extra.iter().copied());
+        let o = run(&args);
+        assert_eq!(o.code, Some(2), "args: {args:?}");
+        assert_eq!(
+            o.stderr, "error: INVALID_ARGUMENT: invalid --streaming-* argument\n",
+            "args: {args:?}"
+        );
+        assert!(!o.stderr.contains(secret));
+        assert_eq!(o.stdout, "");
+    }
 }
 
 /// 配置ディレクトリが 0700 でない socket パスは bind が失敗して終了コード 1（fail-closed）。パスを echo しない。

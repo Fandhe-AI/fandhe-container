@@ -129,3 +129,19 @@ CRI plugin の `start`・`kill`・`stop`・`delete` は CLI と同じ経路で s
 ```bash
 systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>
 ```
+
+### CRI ストリーミング（Exec・Attach・PortForward）の待ち受け
+
+plugin は CRI ストリーミングの URL の先として TCP の待ち受けを開く。既定は `127.0.0.1` の空きポートで、外部には公開しない（kubelet と同じホストで使う場合はそのままでよい）。
+
+別ホストの kubelet から到達させる必要があるときだけ、次の引数で明示的に外部へ公開する（#4110・CRI-6）。
+
+```bash
+fandhe-container-plugin-cri --socket <PATH> \
+  --streaming-bind 0.0.0.0:10010 --streaming-allow-external --streaming-advertise 192.0.2.7
+```
+
+- `--streaming-allow-external` は loopback 以外の `--streaming-bind` と組で指定する。`0.0.0.0`・`::` で待ち受けるときは、発行 URL に載せる到達可能な `--streaming-advertise`（具体的なユニキャスト IP）が必須。不正な組み合わせは起動しない（終了コード 2）
+- ストリーミングには TLS も認証も無い。URL に含まれる使い捨てトークン（単回使用・有効期間 60 秒）が唯一の認可なので、公開するときはファイアウォール等でアクセス元を kubelet に限るなど前段の守りを必ず置く
+- 外部公開で待ち受けたときは、起動時に stderr へ警告の 1 行（`cri_streaming_external_exposure`）を出す
+- 設計は `docs/design/cri-streaming-server.md`

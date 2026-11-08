@@ -16,8 +16,10 @@
 //!
 //! # 安全側の既定
 //! 待ち受けは `127.0.0.1:0`・外部公開なし・トークンは単回使用で TTL 60 秒（`StreamingConfig::default()`）。
-//! 外部公開（`allow_external`）は plugin-cri からは出さない（opt-in の口は未実装。REPAIR-3）。TLS と認証は無く、URL の
-//! 256 ビットのトークンが唯一の認可なので、外部公開するなら前段の守りが前提になる。
+//! 外部公開は起動引数 `--streaming-bind` / `--streaming-allow-external` / `--streaming-advertise` を明示したときだけ開く
+//! （[`production_streaming_config_with`]。#4110）。TLS と認証は無く、URL の 256 ビットのトークンが唯一の認可なので、
+//! 外部公開するなら前段の守り（ネットワーク制限・リバースプロキシ）が前提になる。開いたときは起動時に
+//! [`EXTERNAL_EXPOSURE_WARNING`] を 1 行出す。
 //!
 //! # 起動失敗
 //! bind の失敗は fail-closed（起動しない）。縮退して動き続けると外から「未結線」と区別できないため。
@@ -45,7 +47,10 @@ pub mod exec_launcher;
 pub mod supervisor_attach;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
+
+use crate::startup::StreamingOptions;
 
 mod node_dialer;
 
@@ -67,6 +72,32 @@ pub const MSG_STREAMING_START_FAILED: &str = "failed to start the streaming serv
 /// 本番の設定。loopback・外部公開なし・単回トークン TTL 60 秒の既定そのまま。
 pub fn production_streaming_config() -> StreamingConfig {
     StreamingConfig::default()
+}
+
+/// 起動引数（`--streaming-*`。#4110）を重ねた本番の設定。全未指定なら [`production_streaming_config`] と同値。
+///
+/// 検証は `startup::parse_args` が `validate()` で済ませるが、`bind_production_streaming` の bind も同じ検証を通る（多層防御）。
+pub fn production_streaming_config_with(opts: &StreamingOptions) -> StreamingConfig {
+    let mut c = production_streaming_config();
+    if let Some(bind) = opts.bind {
+        c = c.with_bind(bind);
+    }
+    c = c.with_allow_external(opts.allow_external);
+    if let Some(adv) = opts.advertise {
+        c = c.with_advertise_addr(adv);
+    }
+    c
+}
+
+/// 外部公開の opt-in 時に起動時に 1 回だけ出す警告行（固定文言。アドレス・ポートは含めない。REPAIR-4）。
+pub const EXTERNAL_EXPOSURE_WARNING: &str = "{\"level\":\"warn\",\"event\":\"cri_streaming_external_exposure\",\"message\":\"cri streaming server listens on a non-loopback address without TLS or authentication; restrict access with network controls or a reverse proxy\"}";
+
+/// 実際の待ち受けアドレスが非 loopback で opt-in 済みのときだけ警告行を返す（#4110・CRI-6）。
+pub fn external_exposure_warning(
+    config: &StreamingConfig,
+    local: SocketAddr,
+) -> Option<&'static str> {
+    (config.allow_external && !local.ip().is_loopback()).then_some(EXTERNAL_EXPOSURE_WARNING)
 }
 
 /// 本番の Attach の backend と、それが対話（stdin・tty・resize）できるかの宣言（#4078）。
@@ -239,6 +270,62 @@ mod tests {
         assert_eq!(c.token_ttl, Duration::from_secs(60));
         assert_eq!(c.max_in_flight, 1000);
         assert_eq!(c.max_connections, 64);
+    }
+
+    /// CRI-6・#4110: 全未指定の起動引数は既定の設定と同値で、loopback・外部公開なし。
+    #[test]
+    fn cri6_4110_default_options_equal_default_config() {
+        let c = production_streaming_config_with(&StreamingOptions::default());
+        assert_eq!(c.bind, SocketAddr::new(LOOPBACK, 0));
+        assert!(!c.allow_external);
+        assert_eq!(c.advertise_addr, None);
+        assert_eq!(c.token_ttl, Duration::from_secs(60));
+    }
+
+    /// CRI-6・#4110: opt-in でワイルドカードに bind し、広告アドレスの URL を発行する。
+    #[tokio::test]
+    async fn cri6_4110_opt_in_binds_wildcard_and_advertises() {
+        let opts = StreamingOptions {
+            bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+            allow_external: true,
+            advertise: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        };
+        let config = production_streaming_config_with(&opts);
+        let server =
+            bind_production_streaming(config.clone(), fake_attach(), None, noop_recorder())
+                .await
+                .expect("bind");
+        let addr = server.local_addr();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_ne!(addr.port(), 0);
+        assert_eq!(
+            server.issuer().base_url(),
+            format!("http://192.0.2.7:{}", addr.port())
+        );
+        connect(SocketAddr::new(LOOPBACK, addr.port()))
+            .await
+            .expect("connect via loopback to the wildcard listener");
+        assert_eq!(
+            external_exposure_warning(&config, addr),
+            Some(EXTERNAL_EXPOSURE_WARNING)
+        );
+    }
+
+    /// CRI-6・#4110・REPAIR-4: 警告は opt-in かつ非 loopback の待ち受けのときだけ。文言は固定でアドレスを含まない。
+    #[test]
+    fn cri6_4110_external_exposure_warning_only_when_opted_in() {
+        let lo = SocketAddr::new(LOOPBACK, 4000);
+        let ext = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4000);
+        let closed = production_streaming_config();
+        assert_eq!(external_exposure_warning(&closed, lo), None);
+        let opted = production_streaming_config().with_allow_external(true);
+        assert_eq!(external_exposure_warning(&opted, lo), None);
+        assert_eq!(
+            external_exposure_warning(&opted, ext),
+            Some(EXTERNAL_EXPOSURE_WARNING)
+        );
+        assert!(EXTERNAL_EXPOSURE_WARNING.contains("without TLS or authentication"));
+        assert!(!EXTERNAL_EXPOSURE_WARNING.contains("192.0.2"));
     }
 
     /// 完全版の backend を `interactive` で渡すと、対話（stdin・tty）を宣言する結線になる（#4078）。

@@ -231,6 +231,34 @@ mod linux {
             .map_err(|e| format!("chmod {}: {e}", dest.display()))
     }
 
+    /// containerd が Create の直前に作る `<bundle>/rootfs` へ `proc` を供給する監視を始める（CRI-5・#4104）。
+    ///
+    /// core の `prepare_rootfs_verified` は `rootfs/proc` が既存ディレクトリであることを bind の適用前に要求し、自動作成しない。
+    /// containerd は bundle と空の rootfs を shim の起動前に作る（bundle を先に作っておくことはできない）ため、`ctr run` の前に
+    /// 起動した監視スレッドが `<state>/io.containerd.runtime.v2.task/<namespace>/<id>/rootfs` の出現を待ち、直ちに `proc` を作る。
+    /// shim の起動と Create の RPC はこの後なので、`proc` が先に存在する。上限内に作れなければ `false` を返し、試験は失敗する。
+    /// `proc` は bind で供給できない（`/proc` 宛ては拒否）ため、`write_spec` の mounts[] には含めない。
+    fn provision_proc(dir: &Path, id: &str) -> std::thread::JoinHandle<bool> {
+        let rootfs = dir
+            .join("state/io.containerd.runtime.v2.task")
+            .join(NAMESPACE)
+            .join(id)
+            .join("rootfs");
+        std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < until {
+                if rootfs.is_dir() {
+                    return match std::fs::create_dir(rootfs.join("proc")) {
+                        Ok(()) => true,
+                        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            false
+        })
+    }
+
     /// 最小 rootfs と user namespace を含む spec を書く（CRI-5・#4104）。
     ///
     /// containerd は bundle（`<state>/.../<id>`）を Create の直前に自分で作り、`<bundle>/rootfs` を空で用意する。shim（core）は
@@ -500,6 +528,7 @@ mod linux {
             // シナリオ A: Create → Start → State → Kill → Wait → Delete → Shutdown。
             //   --runtime に絶対パスを渡すと containerd は PATH を探さずこの shim を exec する。
             //   --config を使うと位置引数は id だけになる。--null-io は stdio の FIFO を作らない。
+            let prov_a = provision_proc(&dir, &id);
             let mut run_cmd = ctr_cmd(&[
                 "run",
                 "--rm",
@@ -520,6 +549,10 @@ mod linux {
                 .map_err(|e| format!("spawn ctr run: {e}"))?;
             if let Ok(mut c) = CHILDREN.lock() {
                 c.push(run_child.id());
+            }
+            if !prov_a.join().unwrap_or(false) {
+                let _ = reap::reap(&mut run_child, Duration::from_secs(10));
+                return Err("could not provision rootfs/proc in the containerd bundle".into());
             }
             let mut running: Option<u32> = None;
             if !wait_until(Duration::from_secs(60), || match task_row(&id) {
@@ -550,7 +583,8 @@ mod linux {
             check_clean(&dir, &id, &ctr_out)?;
 
             // シナリオ B: Kill の all=true。
-            ctr_out(&[
+            let prov_b = provision_proc(&dir, &id_b);
+            let run_b = ctr_out(&[
                 "run",
                 "-d",
                 "--null-io",
@@ -559,7 +593,11 @@ mod linux {
                 "--config",
                 &spec_s,
                 &id_b,
-            ])?;
+            ]);
+            if !prov_b.join().unwrap_or(false) {
+                return Err("could not provision rootfs/proc in the containerd bundle (B)".into());
+            }
+            run_b?;
             if !wait_until(Duration::from_secs(30), || {
                 task_row(&id_b).is_some_and(|(_, s)| s == "RUNNING")
             }) {

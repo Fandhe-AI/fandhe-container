@@ -124,9 +124,15 @@ A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（
 
 | 状態 | `status()` | `Kill(exec_id)` | 次の状態 |
 | ---- | ---------- | --------------- | -------- |
-| 実行中（`Result` 未受信） | `Running` | `signal(SIGKILL)` へ進む | `signal` 成功後、`Result` の受信で `Exited` |
+| 実行中（`Result` 未受信） | `Running` | `signal(SIGKILL)` へ進む | `signal` 成功後、下の「SIGKILL 後の消滅確認」で exec 子 cgroup の回収完了を確認できたときだけ `Exited { code: None }` |
 | `Started` 後に消滅を確認できた `Failed` | `Exited { code: None }` | `NOT_FOUND`（終了済み） | `Exited` のまま |
 | `Started` 後に消滅を確認できない `Failed` | `Err`（保持） | `status()` の `Err` を理由に拒否せず、黙って成功にもせず、`signal(SIGKILL)` まで進む | `signal` が成功し、再照会で消滅を確認できたときだけ `Exited`。失敗は `Err` を保ったまま呼び出し元へ返す |
+
+SIGKILL 後の消滅確認（helper の `Result` に依存しない。SEC-1・SUP-6）:
+
+- `signal(SIGKILL)` は `Result` の送信元である helper 自体を殺すため、`Result` の受信による `Exited` には通常到達できない。監視スレッドが `Result` を受けずにチャネル切断を検知した場合（`watch_result` は切断をエラーに変換する）は、これを `Failed` と同じ「消滅を確認できない」扱いとし、そのまま `Exited` にしない
+- 消滅の証明は helper の終了ではなく、supervisor による exec 子 cgroup の回収完了とする。helper の制御チャネルが閉じると supervisor の `exec_guard` が通知済みの exec 子 cgroup を `cgroup.kill` で回収するので、launcher は `ExecGuardPool` の `ReclaimOutcome`（成功 / `Failed`）を確認する経路を持つ。成功を確認できたときだけ `Exited { code: None }`（State は 255）へ遷移する。helper の終了だけを exec の消滅証明にしない
+- 回収が `ReclaimOutcome::Failed` または確認できない間は `Err`（保持）のままで、Wait は失敗し Delete の除去も拒否する。再照会（`status()` の再呼び出しで回収状態を読み直す）で成功を確認できたときだけ `Exited` へ遷移する。確認経路の実装は #4148 の範囲（下記）
 
 - `Kill` は `status()` を参照して `Exited` と分かった場合だけ `NOT_FOUND` にし、`Err`（実行中か不明）は SIGKILL を試みる側へ倒す。helper の `Failed` が回収の成否を運ぶ拡張が入るまでは、タイムアウトのたびに `Err` の経路になるため、この経路が実際の停止手段になる
 - 未実装（REPAIR-3）: 回収成否を運ぶ `Failed` の拡張と、それを使った `Err` の絞り込みは未実装。入るまでの暫定動作が上の表で、将来は消滅を確認できる `Failed` が増えて `Err` の経路が減る（CRI-6・SUP-6。#4149 以降）
@@ -191,7 +197,8 @@ TaskService は期限を足さず、実装側が持つ（トレイトの契約�
 
 ### 後続の作業単位
 
-- **#4148 本体実装**: `exec_launcher.rs` の同期の中核を plugin-cri 内の共通モジュールへ切り出し、Linux 限定で `TaskExecLauncher` / `TaskExecProcess` を実装する（非 Linux は `UNIMPLEMENTED`）。偽の `HelperSpawner` による単体試験で、終了コード 0 / 3、SIGKILL だけが exec 子 cgroup に届き init には届かないこと、SIGKILL 以外が `UNIMPLEMENTED`、存在しないコンテナが `NOT_FOUND`、停止済みが `FAILED_PRECONDITION`、期限切れで helper を回収することを具体値で照合する。cri と依存は変えない
+- **#4148 本体実装**: `exec_launcher.rs` の同期の中核を plugin-cri 内の共通モジュールへ切り出し、Linux 限定で `TaskExecLauncher` / `TaskExecProcess` を実装する（非 Linux は `UNIMPLEMENTED`）。偽の `HelperSpawner` による単体試験で、終了コード 0 / 3、SIGKILL だけが exec 子 cgroup に届き init には届かないこと、SIGKILL 以外が `UNIMPLEMENTED`、存在しないコンテナが `NOT_FOUND`、停止済みが `FAILED_PRECONDITION`、期限切れで helper を回収することを具体値で照合する。cri の依存は変えない。ただし `status()` が `Err` の exec にも `signal(SIGKILL)` を試みる経路と、SIGKILL 後に exec 子 cgroup の回収完了を確認して `Exited` へ遷移させる経路（「SIGKILL 後の消滅確認」）を launcher 側に実装し、単体試験で `Err` 保持中の SIGKILL 到達と、回収失敗時に `Exited` へ遷移しないことを照合する
+- **#4148 の追補（`TaskService` の変更。作業範囲に明記）**: `crates/cri/src/shim_v2/task_service.rs` の `kill_exec` は現状 `process.status().map_err(...)?` で早期 return し、`status()` が `Err` のとき `signal(SIGKILL)` に到達しない。`status()` の `Err` では拒否せず `signal(SIGKILL)` まで進める変更（`Exited` のときだけ `NOT_FOUND`）を、#4148 と同じ PR で `crates/cri/` に入れる（cri のコード変更であり、依存は変えない）。本設計の暫定動作の記述は、この変更が入るまでは現状の `kill_exec` と食い違う（REPAIR-3）
 - **#4149 配線**: `registry_in` で scoped root と同じ `StateStore` から launcher を作り、`TaskService::with_exec_launcher` で v2・v3 に差す。shim の停止時に追跡中の helper を kill する。「本番の実装は無い」の表記（`exec.rs`・`shim_v2.rs`・`shim.rs`・本メモの「残り」・`docs/setup/linux.md`）を更新する
 - **#4150 実機前提試験**: shim の ttrpc を直接叩き、最小の Process spec（env 空・cwd `/`・user なし・stdio なし）で exec し、CapEff・Seccomp・ns の inode・exec 子 cgroup の配置を具体値で init と照合する
 - **後続候補（未起票）**: stream-exec の Signal frame、`Started` への pid の追加、stdio の FIFO の受け入れ、spec の欄を `config.json` と照合して受ける拡張と supervisor の exec ごとの env・cwd・user（#2712・#680 系列）、cri → supervisor の辺の機械照合（`dependency_direction.rs` の拡張）

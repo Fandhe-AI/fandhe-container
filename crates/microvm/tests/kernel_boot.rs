@@ -51,6 +51,17 @@
 //!   failed marker 1 回・ok 0 回・`delivered == 0` を照合する（ゲストの待ちは約 5 秒 1 回）。この陰性対照だけでは
 //!   「AF_PACKET が使えず早く失敗した」場合と区別できないため、陽性と同じ実行（`--test-threads=1`）で回すこと。
 //!
+//! - 4 GiB 超の RAM（#4107・MVM-1・REPAIR-12。#3697 の 2 領域登録の通し確認）: `MICROVM_TEST_INITRD_VARIANT=meminfo
+//!   make microvm-test-initrd-build` の initrd（`FANDHE_CONTAINER_MICROVM_MEMINFO_INITRD`。既定
+//!   `target/microvm-test-initrd/x86_64-meminfo/initrd.cpio`）は、`/proc/meminfo` をシリアルへ出してから `MEMINFO_OK_MARKER` を
+//!   出す。ホスト側は `parse_mem_total_kb` で `MemTotal` を取り、`mem_size` 5 GiB の陽性で MemTotal が低位領域の上限
+//!   （`X86_LOW_RAM_LIMIT` = 3.25 GiB）を超え、かつ 5 GiB 以下であることを照合する（高位領域が見えなければ超えられない）。
+//!   対照は同じ initrd で `mem_size` 256 MiB のとき MemTotal が 256 MiB 以下であること（値が構成に応じて変わる証跡。陽性と
+//!   同じ実行〔`--test-threads=1`〕で回すこと）。カーネルには `CONFIG_PROC_FS=y` が要る。5 GiB の確保は `MAP_NORESERVE` だが、
+//!   確保に失敗（`ResourceExhausted`）したときは `PRECONDITION FAILED` で落とす（`vm.overcommit_memory=2` 等）。
+//!   実カーネルでの確認は Agent は未実施で、実機での実行と記録は #3727（人間担当）。起動可否は e820 の予約や物理アドレス幅
+//!   （#4193）の影響を受けうる。
+//!
 //! 既知のリスク（起動が止まったときの切り分け）: `crates/microvm/src` には PIT・RTC・i8042 のモデルが無く、未登録 PIO の
 //! IN は 0xFF 埋めになる。IRQ 4 も未実装（8250 はポーリングに落ちる想定）。MP テーブル（#3888）でゲストは
 //! IOAPIC モードになり、Linux の `check_timer` が PIT 無しで失敗して止まる可能性が高い。止まる場合は `_CMDLINE` で
@@ -574,7 +585,9 @@ mod net_fixture_tests {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::guest_boot::{SMP_ONLINE_LINE, read_bounded};
+    use super::guest_boot::{
+        MEMINFO_FAILED_MARKER, MEMINFO_OK_MARKER, SMP_ONLINE_LINE, parse_mem_total_kb, read_bounded,
+    };
     use super::{
         BLOCK_MISMATCH_MARKER, BLOCK_OK_MARKER, BLOCK_SENTINEL, CountingNetBackend, MARKER,
         NET_MAC, NET_RX_FAILED_MARKER, NET_RX_FRAME, NET_RX_OK_MARKER, NET_TX_FAILED_MARKER,
@@ -742,6 +755,8 @@ mod x86 {
         NetTx,
         /// `eth0` を上げて固定フレームを受ける版（`FANDHE_CONTAINER_MICROVM_NET_RX_INITRD`。#3919）。
         NetRx,
+        /// `/proc/meminfo` をシリアルへ出す版（`FANDHE_CONTAINER_MICROVM_MEMINFO_INITRD`。#4107）。
+        MemInfo,
     }
 
     fn inputs() -> Inputs {
@@ -770,6 +785,11 @@ mod x86 {
                 "FANDHE_CONTAINER_MICROVM_NET_RX_INITRD",
                 "../../target/microvm-test-initrd/x86_64-net-rx/initrd.cpio",
                 "MICROVM_TEST_INITRD_VARIANT=net-rx make microvm-test-initrd-build",
+            ),
+            InitrdKind::MemInfo => (
+                "FANDHE_CONTAINER_MICROVM_MEMINFO_INITRD",
+                "../../target/microvm-test-initrd/x86_64-meminfo/initrd.cpio",
+                "MICROVM_TEST_INITRD_VARIANT=meminfo make microvm-test-initrd-build",
             ),
         };
         let kernel_path = match std::env::var("FANDHE_CONTAINER_MICROVM_KERNEL") {
@@ -808,20 +828,46 @@ mod x86 {
         }
     }
 
+    /// `boot` の失敗の分類。`Precondition` は環境が資源を渡せなかった場合（ゲスト RAM の確保失敗）で、
+    /// テストスレッドで `PRECONDITION FAILED` の 1 行目に直す（worker 内 panic では 1 行目が変わるため）。
+    #[derive(Debug)]
+    enum BootFailure {
+        Precondition(String),
+        Failed(String),
+    }
+
+    impl From<String> for BootFailure {
+        fn from(e: String) -> Self {
+            Self::Failed(e)
+        }
+    }
+
+    impl From<&str> for BootFailure {
+        fn from(e: &str) -> Self {
+            Self::Failed(e.to_owned())
+        }
+    }
+
     fn boot<B, N>(
         inp: Inputs,
         config: MicroVmConfig<B, N>,
         observer: Option<Arc<VirtioWindowObserver>>,
         boot_timeout: Duration,
-    ) -> Result<Outcome, String>
+    ) -> Result<Outcome, BootFailure>
     where
         B: BlockBackend + Send + 'static,
         N: NetBackend + Send + 'static,
     {
         let started = Instant::now();
         let vcpus = usize::try_from(config.vcpu_count).unwrap_or(0);
-        let mut vm: MicroVm<B, N> =
-            MicroVm::assemble(&inp.dev, config).map_err(|e| format!("assemble failed: {e}"))?;
+        let mut vm: MicroVm<B, N> = MicroVm::assemble(&inp.dev, config).map_err(|e| {
+            // mmap の ENOMEM・EMFILE・ENFILE は ResourceExhausted になる。環境の資源不足は回帰と区別する。
+            if e.code() == MicrovmErrorCode::ResourceExhausted {
+                BootFailure::Precondition(format!("guest RAM reservation: {e}"))
+            } else {
+                BootFailure::Failed(format!("assemble failed: {e}"))
+            }
+        })?;
         if let Some(obs) = &observer {
             // アドレスは直書きせず、組み立て済みの配置から取る。start は MicroVm を消費するので観測は start の前に付ける。
             for info in vm.devices() {
@@ -902,7 +948,8 @@ mod x86 {
         // REPAIR-5: 止まった vCPU スレッドが残っても、全体期限で必ず試験を終える。
         match rx.recv_timeout(boot_timeout + STOP_DEADLINE + SLACK) {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => panic!("kernel_boot: boot sequence failed: {e}"),
+            Ok(Err(BootFailure::Precondition(reason))) => precondition(&reason),
+            Ok(Err(BootFailure::Failed(e))) => panic!("kernel_boot: boot sequence failed: {e}"),
             Err(e) => panic!("kernel_boot: DEADLINE EXCEEDED ({e}) after {secs}s boot budget"),
         }
     }
@@ -927,7 +974,7 @@ mod x86 {
         assert!(!o.timed_out, "boot timed out: {diag}");
     }
 
-    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION, CONFIG_DEVTMPFS, CONFIG_PACKET";
+    const KCONFIG_HINT: &str = "if counters are zero, check the guest kernel config: CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES, CONFIG_VIRTIO_BLK, CONFIG_VIRTIO_NET, CONFIG_BLOCK, CONFIG_MSDOS_PARTITION, CONFIG_DEVTMPFS, CONFIG_PACKET, CONFIG_PROC_FS";
 
     #[test]
     #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
@@ -948,6 +995,80 @@ mod x86 {
             o.output.len(),
             o.exits
         );
+    }
+
+    /// meminfo の initrd で `mem_size` の VM を起動し、`MemTotal`（kB）を返す（#4107・MVM-1）。ok marker 1 回・failed 0 回・
+    /// 通常の marker 0 回と、通常の停止条件（GuestShutdown・起点 vCPU 0・エラー 0・取りこぼし 0）を照合してから解析する。
+    fn run_meminfo(mem_size: u64, case: &str) -> u64 {
+        let inp = inputs_for(InitrdKind::MemInfo);
+        let config: MicroVmConfig<MemoryBlockBackend, MemoryNetBackend> = MicroVmConfig {
+            vcpu_count: 1,
+            mem_size,
+            block: vec![],
+            net: vec![],
+        };
+        let o = run_boot(inp, config, None);
+        let total = parse_mem_total_kb(&o.output);
+        let diag = o.diag(&format!(
+            "case={case} mem_size={mem_size} mem_total_kb={total:?} hint=\"{KCONFIG_HINT}\""
+        ));
+        assert_boot_ok_with_marker(&o, MEMINFO_OK_MARKER, 1, &diag);
+        assert_eq!(
+            count_marker_lines(&o.output, MEMINFO_FAILED_MARKER),
+            0,
+            "failed marker must be absent: {diag}"
+        );
+        assert_eq!(
+            count_marker_lines(&o.output, MARKER),
+            0,
+            "default marker must be absent: {diag}"
+        );
+        let kb = total.unwrap_or_else(|e| panic!("MemTotal parse: {e}: {diag}"));
+        eprintln!(
+            "kernel_boot: ok case={case} mem_total_kb={kb} elapsed_ms={}",
+            o.elapsed.as_millis()
+        );
+        kb
+    }
+
+    /// 低位領域の上限（MMIO hole の手前）を kB で表した値。MemTotal がこれを超えるには高位領域が使えている必要がある。
+    const LOW_LIMIT_KB: u64 = fandhe_container_microvm::microvm::X86_LOW_RAM_LIMIT / 1024;
+
+    /// 4 GiB 超の RAM（#4107・MVM-1・REPAIR-12。#3697 の 2 領域登録の通し確認）。5 GiB のとき、ゲストの MemTotal が
+    /// 低位領域の上限（3407872 kB）を超え、かつ構成した 5242880 kB 以下であること。高位領域（4 GiB 以降）が
+    /// ゲストに見えていなければ MemTotal は低位領域の分を超えられないので、これが判別線になる。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm and several GiB of address space (MVM-1)"]
+    fn kernel_boot_high_memory_5gib_guest_sees_ram_above_4gib() {
+        let kb = run_meminfo(5 << 30, "high_memory_5gib");
+        assert!(
+            kb > LOW_LIMIT_KB,
+            "MemTotal {kb} kB does not exceed the low region limit {LOW_LIMIT_KB} kB: the guest does not use RAM above 4 GiB"
+        );
+        assert!(
+            kb <= (5u64 << 30) / 1024,
+            "MemTotal {kb} kB exceeds the configured 5 GiB"
+        );
+    }
+
+    /// 対照（#4107）。同じ initrd で 256 MiB のとき MemTotal が 256 MiB 以下であること。解析が素通しで大きな値を返して
+    /// いないこと、値が構成に応じて変わることの証跡。陽性と同じ実行（`--test-threads=1`）で回すこと。
+    #[test]
+    #[ignore = "requires read/write access to /dev/kvm (MVM-1)"]
+    fn kernel_boot_meminfo_256mib_guest_reports_small_total() {
+        let kb = run_meminfo(256 << 20, "meminfo_256mib");
+        assert!(kb > 0, "MemTotal must be positive");
+        assert!(
+            kb <= (256u64 << 20) / 1024,
+            "MemTotal {kb} kB exceeds the configured 256 MiB"
+        );
+    }
+
+    /// 判別線の定数を固定する（KVM 不要。#4107）。`X86_LOW_RAM_LIMIT` が変わったら判別線の意味を見直す合図になる。
+    #[test]
+    fn mvm1_4107_high_memory_thresholds_are_pinned() {
+        assert_eq!(LOW_LIMIT_KB, 3_407_872);
+        assert_eq!((5u64 << 30) / 1024, 5_242_880);
     }
 
     /// vCPU 2 台（#3865・#3888・MVM-1）。MP テーブルで AP が Linux にオンラインになる。2 台構成の VM が実カーネルで最後まで起動し、

@@ -21,7 +21,7 @@
 //! # 未実装（REPAIR-3）
 //! - `InterruptACK` の後処理（level 扱いの SPI の deassert / resample。#3863）は [`MmioHandler::with_ack_routes`] で結ぶ。
 //!   route の無いデバイスは回数（[`MmioHandler::interrupt_ack_count`]）だけ数えて続行する。後処理の結果（deassert / 上げ直しの回数）は
-//!   [`MmioHandler::with_ack_tallies`] の共有計数で外から読める（観測専用。`DeviceReset` は数えない。#4014）。
+//!   [`MmioHandler::with_ack_tallies`] の共有計数で外から読める（観測専用。`DeviceReset` の resample は別の項目 `resets` に数える。#4014・#4170）。
 //! - route の無いデバイスは `QueueNotify` を数えて [`MmioHandler::last_queue_notify`] に残すだけで、キューは処理せず続行する。
 //!   virtio-block（#4028）と virtio-net（#4029）は [`MmioHandler::with_queue_notify_routes`] で結んだ route が処理する
 //!   （失敗は VM を止める）。net のホスト側の到着を契機にした受信は #4030。
@@ -169,13 +169,16 @@ pub fn handle_data_abort(
             }
         }
         // Status=0 のリセットは `interrupt_status` を 0 にするため、level 線が上がったままにならないよう
-        // ACK と同じ後処理（resample）を呼ぶ（MVM-5。ACK 数の計数には含めない）。
+        // ACK と同じ後処理（resample）を呼ぶ（MVM-5。`interrupt_acks` と ACK の計数には含めず、別カウンタ `resets` に数える。#4170）。
         DispatchOutcome::Mmio {
             device,
             access: MmioAccess::Write(MmioWriteOutcome::DeviceReset),
         } => {
             if let Some((_, route)) = handler.ack_routes.iter().find(|(id, _)| id == device) {
                 route.on_interrupt_ack()?;
+                if let Some((_, tally)) = handler.ack_tallies.iter().find(|(id, _)| id == device) {
+                    tally.record_reset();
+                }
             }
         }
         DispatchOutcome::Mmio {

@@ -183,6 +183,14 @@ impl TapReader {
     }
 }
 
+/// SPDY の `RST_STREAM` や中継で破棄された読み口のように、EOF を読まずに drop された tap も終端として数える。
+/// `ended` で冪等なので、EOF 経路との二重の減算は起きない（CRI-6・REPAIR-5・#4077）。
+impl Drop for TapReader {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
 impl AsyncRead for TapReader {
     fn poll_read(
         self: Pin<&mut Self>,

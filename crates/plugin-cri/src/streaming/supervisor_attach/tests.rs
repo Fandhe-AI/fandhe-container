@@ -635,6 +635,39 @@ async fn cri6_4077_one_sided_tap_eof_does_not_complete_exited() {
     within(&mut session.exited).await;
 }
 
+/// 片方の tap が EOF を読まずに drop されても、残りの tap の EOF で `exited` が完了する（CRI-6・REPAIR-5・#4077）。
+#[tokio::test]
+async fn cri6_4077_dropped_tap_counts_as_ended_for_exited() {
+    let fx = Fixture::new("droptap");
+    let (out_ours, _out_theirs) = sock_pair();
+    let (err_ours, err_theirs) = sock_pair();
+    let taps = Mutex::new(Some((out_ours, err_ours)));
+    let source = FakeSource::new(Box::new(move |_| {
+        let (o, e) = taps.lock().expect("lock").take().expect("once");
+        Ok(AttachIo {
+            input: None,
+            stdout: Some(o),
+            stderr: Some(e),
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut session = within(b.attach(target(false, true, true, false)))
+        .await
+        .expect("attach");
+    let stdout = session.stdout.take().expect("stdout");
+    let mut stderr = session.stderr.take().expect("stderr");
+    drop(stdout);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut session.exited)
+            .await
+            .is_err(),
+        "exited completed while stderr was still open"
+    );
+    drop(err_theirs);
+    assert!(within(read_some(&mut *stderr)).await.is_empty());
+    within(&mut session.exited).await;
+}
+
 /// 同じ pipe へ並行する複数セッションの書き込みが、調停の下でバイトを失わず完了する（REPAIR-5）。
 #[tokio::test]
 async fn cri6_repair5_4077_concurrent_writers_to_one_pipe_all_complete() {

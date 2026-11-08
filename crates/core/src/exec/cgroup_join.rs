@@ -76,8 +76,9 @@ use std::time::Duration;
 use super::setns::{Pid1Target, cgroup_path_matches, container_cgroup_path_for, ensure_not_exited};
 use super::{ExecError, IsolationStage, ViolationReason};
 use crate::cgroups::{
-    ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, ExecJoinFds, SweepMode, contains_pid,
-    open_cgroup_by_path, remove_exec_child_cgroup_at, sweep_exec_children_at,
+    ExecChildCgroupFds, ExecChildPresence, ExecChildRemoval, ExecChildSweep, ExecJoinFds,
+    SweepMode, contains_pid, exec_child_presence_at, open_cgroup_by_path,
+    open_cgroup_by_path_if_present, remove_exec_child_cgroup_at, sweep_exec_children_at,
 };
 use crate::traits::types::ErrorCode;
 use crate::traits::{CgroupPlacement, ContainerId};
@@ -188,6 +189,9 @@ impl ExecCgroupName {
         })?;
         Ok(Self(name.to_owned()))
     }
+
+    /// 名前の最大長（バイト。wire の固定長の名前欄の大きさ。#4221）。
+    pub const MAX_LEN: usize = crate::cgroups::EXEC_CGROUP_NAME_MAX_LEN;
 
     /// 名前（cgroup ディレクトリの 1 要素）。
     pub fn as_str(&self) -> &str {
@@ -312,6 +316,58 @@ pub fn remove_exec_child_cgroup_in(
     timeout: Duration,
 ) -> Result<ExecCgroupRemoval, ExecError> {
     remove_at_path(container_cgroup_path, name, timeout)
+}
+
+/// [`exec_child_cgroup_presence`] の結果（将来拡張できる構造。#4221）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecCgroupPresence {
+    /// 名前の子 cgroup がある（プロセスが残っているか、回収の途中）。
+    Present,
+    /// コンテナ cgroup はあるが、名前の子 cgroup は無い。
+    Absent,
+    /// コンテナ cgroup（またはその祖先）自体が無い。親は子を持ったまま消えないため、子も無い。
+    ContainerCgroupAbsent,
+}
+
+/// 記録（`id`・`placement`）から導いたコンテナ cgroup の直下に exec 用の子 cgroup `name` があるかを、
+/// **読み取り専用** で調べる（#4221・CRI-5・SEC-1・REPAIR-3）。
+///
+/// plugin-cri が shim の exec の消滅確認に使う。cgroup v2 のディレクトリはプロセスが残る間 `rmdir` できないため、
+/// supervisor の `ExecGuardPool`・helper が回収した後の「不在」は、そこにいたプロセスが消えた証拠になる。
+/// `cgroup.kill`・`rmdir` は書かない（名前の再利用で別の exec を止めないため）。cgroup ルートを開けない・
+/// 所有者の不一致等は `Err`（不在とは扱わない）。期待パスは記録の型から core が導く（SEC-1）。
+pub fn exec_child_cgroup_presence(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    name: &ExecCgroupName,
+) -> Result<ExecCgroupPresence, ExecError> {
+    presence_at_path(&container_cgroup_path_for(id, placement)?, name)
+}
+
+/// 実機結合試験専用の入口: コンテナ cgroup の絶対パスを文字列で受ける（`exec-test-support`。
+/// [`exec_child_cgroup_presence`] と同じ確認）。
+#[cfg(feature = "exec-test-support")]
+pub fn exec_child_cgroup_presence_in(
+    container_cgroup_path: &str,
+    name: &ExecCgroupName,
+) -> Result<ExecCgroupPresence, ExecError> {
+    presence_at_path(container_cgroup_path, name)
+}
+
+fn presence_at_path(
+    container_cgroup_path: &str,
+    name: &ExecCgroupName,
+) -> Result<ExecCgroupPresence, ExecError> {
+    let Some(dir) =
+        open_cgroup_by_path_if_present(container_cgroup_path).map_err(ExecError::from_cgroup)?
+    else {
+        return Ok(ExecCgroupPresence::ContainerCgroupAbsent);
+    };
+    match exec_child_presence_at(dir.as_fd(), name.as_str()).map_err(ExecError::from_cgroup)? {
+        ExecChildPresence::Present => Ok(ExecCgroupPresence::Present),
+        ExecChildPresence::Absent => Ok(ExecCgroupPresence::Absent),
+    }
 }
 
 /// [`sweep_stale_exec_child_cgroups`] の結果（将来拡張できる構造。既定値は「未実施」）。
@@ -492,6 +548,17 @@ mod tests {
         let me = NonZeroU32::new(std::process::id()).unwrap();
         let err = Pid1Target::open(me, &id, &placement).unwrap_err();
         assert_eq!(err.stage, IsolationStage::SetNs);
+    }
+
+    /// CRI-5・#4221: コンテナ cgroup 自体が無ければ `ContainerCgroupAbsent`（ルートを開けない場合とは区別する）。
+    #[test]
+    fn cri5_4221_presence_with_missing_container_cgroup() {
+        let name = ExecCgroupName::new("exec-4242-0").unwrap();
+        assert_eq!(
+            presence_at_path("/fandhe-nonexistent-container-cgroup-4221", &name).unwrap(),
+            ExecCgroupPresence::ContainerCgroupAbsent
+        );
+        assert_eq!(ExecCgroupName::MAX_LEN, 64);
     }
 
     /// SUP-6・TASK-163 追補・#1466: コンテナ cgroup 自体が既に無い場合の後始末は `Absent`（エラーにしない）。

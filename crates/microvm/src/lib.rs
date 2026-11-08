@@ -109,6 +109,8 @@ pub mod boot_x86;
 pub mod cpuid_x86;
 #[cfg(target_os = "linux")]
 pub mod device;
+#[cfg(target_os = "linux")]
+pub mod dirty_log;
 pub mod dispatch;
 pub mod error;
 pub mod esr;

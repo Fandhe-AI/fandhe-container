@@ -15,6 +15,7 @@
 //! #3731（TASK-75.3.2・MVM-1・MVM-4）で x86_64 の `KVM_GET_SUPPORTED_CPUID`・`KVM_SET_CPUID2`・`KVM_{GET,SET}_MSRS`・
 //! `KVM_{GET,SET}_FPU`・`KVM_{GET,SET}_LAPIC`・`KVM_SET_TSS_ADDR`・`KVM_SET_IDENTITY_MAP_ADDR` を足した
 //! （CPUID は #3733 で `device` が呼ぶ。他は呼び出し側を #3732・#3734・#3735 で足す。それまでは試験からだけ呼ぶ）。
+//! #4225 で `KVM_GET_DIRTY_LOG`（VM fd。`kvm_get_dirty_log`）を足した（`crate::microvm` の `RegisteredGuestRam` が `crate::dirty_log` の継ぎ目を通して呼ぶ）。
 //! TASK-74.2.3 で `KVM_CHECK_EXTENSION`・`KVM_CREATE_IRQCHIP`（x86_64 のみ）・`KVM_IRQFD`・`KVM_IOEVENTFD` と
 //! `eventfd` を足した（`crate::irq` の `EventFd`・`IrqFd`・`IoEventFd` と `device::VmFd` のメソッドが呼ぶ）。
 //! eventfd の読み書きは std の `File` で行い、ここには読み書きの `unsafe` を持たない。
@@ -42,6 +43,7 @@
 //! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。#3737 で足した `kvm_mp_state`
 //! （`linux/kvm.h` v6.12。`KVM_{GET,SET}_MP_STATE`）も同様に対応物が無く、サイズ・アラインを const assert で固定する。上限の `KVM_MAX_CPUID_ENTRIES`・
 //! `MAX_IO_MSRS` はカーネル内部の値で uapi にも無い。
+//! `kvm_dirty_log`・`KVM_GET_DIRTY_LOG`（#4225）もカーネル ABI で `libc` に対応物が無く、サイズ・オフセット・ioctl 番号を const assert で固定する（導入後も照合の対象は `ioctl` の型だけ。追跡は #3664）。
 //! `kvm_userspace_memory_region` と `kvm_run` もカーネル ABI で `libc` に対応物が無く、サイズ・オフセットを const assert で固定する。aarch64 の `kvm_vcpu_init`
 //! （`asm/kvm.h` のカーネル ABI 構造体）も `libc` に対応物が無く、サイズ・アラインを const assert で固定する。
 
@@ -120,6 +122,9 @@ pub(crate) mod consts {
     pub const KVM_RUN: u64 = super::io(super::KVMIO, 0x80);
     /// `_IOW(KVMIO, 0x46, struct kvm_userspace_memory_region)`（32 バイト）。
     pub const KVM_SET_USER_MEMORY_REGION: u64 = super::iow(super::KVMIO, 0x46, 32);
+    /// `_IOW(KVMIO, 0x42, struct kvm_dirty_log)`（16 バイト。#4225）。`_IOW` だがカーネルは `dirty_bitmap` の指す先へ書き込む
+    /// （`KVM_GET_DEVICE_ATTR` / `KVM_GET_ONE_REG` と同じ流儀）。
+    pub const KVM_GET_DIRTY_LOG: u64 = super::iow(super::KVMIO, 0x42, 16);
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
@@ -236,6 +241,9 @@ pub(crate) mod consts {
     pub const KVM_RUN: u64 = super::io(super::KVMIO, 0x80);
     /// `_IOW(KVMIO, 0x46, struct kvm_userspace_memory_region)`（32 バイト）。
     pub const KVM_SET_USER_MEMORY_REGION: u64 = super::iow(super::KVMIO, 0x46, 32);
+    /// `_IOW(KVMIO, 0x42, struct kvm_dirty_log)`（16 バイト。#4225）。`_IOW` だがカーネルは `dirty_bitmap` の指す先へ書き込む
+    /// （`KVM_GET_DEVICE_ATTR` / `KVM_GET_ONE_REG` と同じ流儀）。
+    pub const KVM_GET_DIRTY_LOG: u64 = super::iow(super::KVMIO, 0x42, 16);
     pub const PROT_READ: i32 = 1;
     pub const PROT_WRITE: i32 = 2;
     pub const MAP_SHARED: i32 = 1;
@@ -335,6 +343,7 @@ pub(crate) mod consts {
     pub const KVM_GET_VCPU_MMAP_SIZE: u64 = 0;
     pub const KVM_RUN: u64 = 0;
     pub const KVM_SET_USER_MEMORY_REGION: u64 = 0;
+    pub const KVM_GET_DIRTY_LOG: u64 = 0;
     pub const PROT_READ: i32 = 0;
     pub const PROT_WRITE: i32 = 0;
     pub const MAP_SHARED: i32 = 0;
@@ -816,6 +825,23 @@ const _: () = {
     assert!(std::mem::align_of::<KvmUserspaceMemoryRegion>() == 8);
 };
 
+/// `struct kvm_dirty_log`（`linux/kvm.h`。16 バイト。#4225・MVM-1）。末尾の union（`void __user *dirty_bitmap` / `__u64 padding2`）は、
+/// 対応する LP64 ではポインタと `u64` が同じ大きさ・配置なので `u64` 1 本に平らにする。`libc` に対応物が無いカーネル ABI のため、
+/// サイズ・オフセットを const assert で固定する。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KvmDirtyLog {
+    slot: u32,
+    padding1: u32,
+    dirty_bitmap: u64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<KvmDirtyLog>() == 16);
+    assert!(std::mem::align_of::<KvmDirtyLog>() == 8);
+    assert!(std::mem::offset_of!(KvmDirtyLog, dirty_bitmap) == 8);
+};
+
 /// `struct kvm_irqfd`（`linux/kvm.h`。32 バイト。TASK-74.2.3・MVM-1）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -882,6 +908,7 @@ const _: () = {
 ))]
 const _: () = {
     assert!(consts::KVM_SET_USER_MEMORY_REGION == 0x4020_AE46);
+    assert!(consts::KVM_GET_DIRTY_LOG == 0x4010_AE42);
     assert!(consts::KVM_MEM_LOG_DIRTY_PAGES == 1);
     assert!(consts::KVM_MEM_READONLY == 2);
     assert!(consts::KVM_CAP_READONLY_MEM.0 == 81);
@@ -1793,6 +1820,63 @@ pub(crate) fn set_user_memory_region(
             vm.as_raw_fd(),
             consts::KVM_SET_USER_MEMORY_REGION,
             &region as *const KvmUserspaceMemoryRegion,
+        )
+    };
+    if r < 0 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `KVM_GET_DIRTY_LOG` がカーネルへ書き込むバイト数（`kvm_dirty_bitmap_bytes`。Linux v6.12 `include/linux/kvm_host.h`）。
+///
+/// `ALIGN(npages, BITS_PER_LONG) / 8` で、`npages = memory_size / page_size`（ホストのページ単位）。BITS_PER_LONG は
+/// 対応する LP64 の 2 アーキとも 64 なので 64 ページ単位で切り上げた 8 の倍数になる（`ceil(npages / 8)` ではない）。
+/// `page_size` が 0・2 の冪でない、`memory_size` が `page_size` の倍数でない、桁あふれは `None`（#4225・MVM-1）。
+pub(crate) const fn dirty_bitmap_bytes(memory_size: u64, page_size: u64) -> Option<u64> {
+    if page_size == 0 || !page_size.is_power_of_two() || !memory_size.is_multiple_of(page_size) {
+        return None;
+    }
+    (memory_size / page_size).div_ceil(64).checked_mul(8)
+}
+
+/// `KVM_GET_DIRTY_LOG` に渡す構造体を組む純関数（単体試験で値を照合するため分離。#4225）。
+fn dirty_log_request(slot: u32, bitmap_addr: u64) -> KvmDirtyLog {
+    KvmDirtyLog {
+        slot,
+        padding1: 0,
+        dirty_bitmap: bitmap_addr,
+    }
+}
+
+/// `KVM_GET_DIRTY_LOG`（VM fd）で `slot` の dirty bitmap を `bitmap` へ読む（#4225・MVM-1）。
+///
+/// `memory_size` は `slot` に登録した memslot のサイズ。カーネルが書く長さ（[`dirty_bitmap_bytes`]）はこれとホストの
+/// ページサイズで決まるため、本関数が ioctl の前に `bitmap.len()` がそれ以上であることを確かめる（不足・不正なサイズは
+/// `SysError::Os(22)`〔EINVAL〕で、ioctl は呼ばない）。読み取りと同時にカーネル側の dirty 状態はクリアされる。
+/// 呼び出し元は `crate::microvm` の `RegisteredGuestRam` に限る（slot と `memory_size` の対応はそこが登録時に固定する）。
+pub(crate) fn kvm_get_dirty_log(
+    vm: BorrowedFd<'_>,
+    slot: u32,
+    memory_size: u64,
+    bitmap: &mut [u8],
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let page_size = host_page_size()?;
+    let need = dirty_bitmap_bytes(memory_size, page_size).ok_or(SysError::Os(22))?;
+    if u64::try_from(bitmap.len()).map_or(true, |have| have < need) {
+        return Err(SysError::Os(22));
+    }
+    let arg = dirty_log_request(slot, bitmap.as_mut_ptr() as usize as u64);
+    // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み・ioctl 番号のサイズ符号と一致）の
+    // ローカルの借用。ioctl 番号は `_IOW` だが、カーネルは `arg.dirty_bitmap` の先へ `kvm_dirty_bitmap_bytes(memslot)` バイトを
+    // 書く（`arg` 自体は読むだけ）。その長さは登録時の `memory_size` とホストの `PAGE_SIZE` から決まり、直前の検査で
+    // `bitmap`（排他借用のバッファ）がそれ以上の長さだと確かめ済みなので、書き込みは `bitmap` の範囲に収まる。
+    // 呼び出しは同期で完了し、戻り後にカーネルはポインタを保持しない。
+    let r = unsafe {
+        ioctl(
+            vm.as_raw_fd(),
+            consts::KVM_GET_DIRTY_LOG,
+            &arg as *const KvmDirtyLog,
         )
     };
     if r < 0 { Err(last_error()) } else { Ok(()) }
@@ -3153,6 +3237,52 @@ mod tests {
             );
         }
         assert_eq!(unregister_guest_ram(f.as_fd(), 0), Err(SysError::Os(25)));
+    }
+
+    /// MVM-1・#4225: kvm_dirty_bitmap_bytes 相当の長さ（64 ページ単位の切り上げ × 8）。
+    #[test]
+    fn mvm1_4225_dirty_bitmap_bytes_values() {
+        assert_eq!(dirty_bitmap_bytes(64 * 1024, 4096), Some(8));
+        assert_eq!(dirty_bitmap_bytes(256 * 1024, 4096), Some(8));
+        assert_eq!(dirty_bitmap_bytes(260 * 1024, 4096), Some(16));
+        assert_eq!(dirty_bitmap_bytes(1 << 34, 4096), Some(524_288));
+        assert_eq!(dirty_bitmap_bytes(1 << 20, 65536), Some(8));
+        assert_eq!(dirty_bitmap_bytes(4096, 0), None);
+        assert_eq!(dirty_bitmap_bytes(4096, 3), None);
+        assert_eq!(dirty_bitmap_bytes(4097, 4096), None);
+        assert_eq!(
+            dirty_bitmap_bytes(u64::MAX - 63, 1),
+            Some(((u64::MAX - 63) / 64) * 8)
+        );
+    }
+
+    /// MVM-1・#4225: `KVM_GET_DIRTY_LOG` に渡す構造体の各フィールド。
+    #[test]
+    fn mvm1_4225_dirty_log_request_fields() {
+        let r = dirty_log_request(7, 0x7000_0000);
+        assert_eq!(r.slot, 7);
+        assert_eq!(r.padding1, 0);
+        assert_eq!(r.dirty_bitmap, 0x7000_0000);
+    }
+
+    /// MVM-1・#4225: バッファ長の検査は ioctl の前に効く（短いと EINVAL、十分なら ioctl まで届き非 KVM fd の ENOTTY）。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn mvm1_4225_get_dirty_log_short_buffer_is_einval_before_ioctl() {
+        use std::os::fd::AsFd as _;
+        let f = dev_null();
+        for len in [0usize, 7] {
+            let mut buf = vec![0u8; len];
+            assert_eq!(
+                kvm_get_dirty_log(f.as_fd(), 0, 64 * 1024, &mut buf),
+                Err(SysError::Os(22))
+            );
+        }
+        let mut ok = vec![0u8; 8];
+        assert_eq!(
+            kvm_get_dirty_log(f.as_fd(), 0, 64 * 1024, &mut ok),
+            Err(SysError::Os(25))
+        );
     }
 
     /// MVM-1: aarch64 の vCPU 初期化 ioctl 番号。

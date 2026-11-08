@@ -223,6 +223,12 @@ impl<B: GuestMemoryBacking> GuestMemory<B> {
         })
     }
 
+    /// 領域 `index` の backing（昇順の index。範囲外は `None`）。`crate::microvm` の dirty log 取得（#4225）が使う。公開 API には出さない。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn region_backing(&self, index: usize) -> Option<&B> {
+        self.regions.get(index).map(|r| &r.backing)
+    }
+
     /// 最も低い領域の先頭アドレス。
     pub fn base(&self) -> GuestAddress {
         self.regions

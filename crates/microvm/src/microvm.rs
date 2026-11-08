@@ -98,9 +98,10 @@
 //! そのため size・GPA は ioctl の前にすべて検証し、slot は `u16` で受ける（KVM は上位 16 bit を address space id に使う）。
 //!
 //! memslot のフラグ（`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`）は [`GuestRam::register_with_flags`] で領域ごとに指定できる（#4158）。
+//! `LOG_DIRTY_PAGES` つきの memslot の dirty bitmap は `GuestMemory::<RegisteredGuestRam>::dirty_log` で取れる（#4225。`crate::dirty_log`）。
 //!
 //! # 範囲外（REPAIR-3）
-//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! hugepage の opt-in（採らない判断を記録済み。docs/design/microvm-memory-ownership.md の #4159 の節）・`KVM_CLEAR_DIRTY_LOG` / dirty ring（dirty log の取得自体は #4225 で実装済み）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
 //! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
 //! e820 の予約表記は #4106 で実装済み。下記）。
 //!
@@ -143,6 +144,7 @@ use crate::device::Arm64VcpuPower;
 #[cfg(target_arch = "aarch64")]
 use crate::device::VgicV3;
 use crate::device::{KvmDevice, RunStats, StopSignal, VcpuFd, VmFd};
+use crate::dirty_log::{DirtyBitmap, FetchDirtyLogError, VmFdDirtyLog, fetch_dirty_log_checked};
 use crate::dispatch::{
     DeviceId, DispatchOutcome, ExitDispatcher, MAX_BUS_DEVICES, MmioAccess, check_mmio_bus_capacity,
 };
@@ -264,6 +266,8 @@ const EINVAL: i32 = 22;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOTTY: i32 = 25;
+const ENOENT: i32 = 2;
+const ENXIO: i32 = 6;
 
 /// RAM の整列単位 `max(GUEST_RAM_ALIGN, ホストのページサイズ)`。取得失敗は分類して返す。
 fn ram_align() -> Result<u64, MicrovmError> {
@@ -312,6 +316,7 @@ enum RamStage {
     Mmap,
     DupVmFd,
     Register,
+    DirtyLog,
 }
 
 fn classify_ram_error(stage: RamStage, e: SysError) -> MicrovmError {
@@ -319,6 +324,7 @@ fn classify_ram_error(stage: RamStage, e: SysError) -> MicrovmError {
         RamStage::Mmap => "mmap of guest memory",
         RamStage::DupVmFd => "duplicating VM fd",
         RamStage::Register => "KVM_SET_USER_MEMORY_REGION",
+        RamStage::DirtyLog => "KVM_GET_DIRTY_LOG",
     };
     match e {
         SysError::Unsupported => MicrovmError::new(
@@ -337,9 +343,21 @@ fn classify_ram_error(stage: RamStage, e: SysError) -> MicrovmError {
             MicrovmErrorCode::InvalidArgument,
             "KVM rejected the guest memory region",
         ),
-        SysError::Os(ENOTTY) if stage == RamStage::Register => {
+        SysError::Os(ENOTTY) if matches!(stage, RamStage::Register | RamStage::DirtyLog) => {
             MicrovmError::new(MicrovmErrorCode::FailedPrecondition, "not a KVM VM fd")
         }
+        SysError::Os(ENOENT) if stage == RamStage::DirtyLog => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "memslot has no dirty log",
+        ),
+        SysError::Os(ENXIO) if stage == RamStage::DirtyLog => MicrovmError::new(
+            MicrovmErrorCode::FailedPrecondition,
+            "dirty log is not available for this VM",
+        ),
+        SysError::Os(EINVAL) if stage == RamStage::DirtyLog => MicrovmError::new(
+            MicrovmErrorCode::InvalidArgument,
+            "KVM rejected the dirty log request",
+        ),
         SysError::Os(n) if n == EACCES || n == EPERM => MicrovmError::new(
             MicrovmErrorCode::PermissionDenied,
             format!("permission denied in {name}"),
@@ -419,7 +437,7 @@ impl GuestRam {
     /// `READONLY` は `KVM_CAP_READONLY_MEM` を VM fd へ照会し、非対応なら ioctl を呼ばず `FailedPrecondition`。
     /// 読み取り専用になるのはゲスト側の書き込み（MMIO exit になる）だけで、ホストの mapping は書き込み可能のまま
     /// （[`GuestMemory`] のホストからの書き込みは従来どおり通る）。ホストのメモリ保護ではない。
-    /// `LOG_DIRTY_PAGES` は追跡を有効にするだけで、dirty bitmap の取得（`KVM_GET_DIRTY_LOG`）は未実装（REPAIR-3）。
+    /// `LOG_DIRTY_PAGES` は追跡を有効にし、dirty bitmap は `GuestMemory::<RegisteredGuestRam>::dirty_log` で取得する（#4225）。
     pub fn register_with_flags(
         self,
         vm: &VmFd,
@@ -468,6 +486,7 @@ impl GuestRam {
         Ok(RegisteredGuestRam {
             vm: vm_fd,
             slot,
+            flags,
             map: Some(self.map),
         })
     }
@@ -499,7 +518,43 @@ impl GuestMemoryBacking for GuestRam {
 pub struct RegisteredGuestRam {
     vm: OwnedFd,
     slot: u16,
+    /// 登録時の memslot のフラグ（`dirty_log` が `LOG_DIRTY_PAGES` の有無を確かめる。#4225）。
+    flags: MemslotFlags,
     map: Option<GuestRamMap>,
+}
+
+impl RegisteredGuestRam {
+    /// この memslot の dirty bitmap を取得する（`KVM_GET_DIRTY_LOG`。#4225・MVM-1）。
+    ///
+    /// 読み取りと同時にカーネル側の dirty 状態はクリアされる。立つのはゲストの書き込みだけで、ホストからの書き込みは追跡されない。
+    /// `LOG_DIRTY_PAGES` なしで登録した memslot は ioctl を呼ばず `FailedPrecondition`。ページ単位はホストの `PAGE_SIZE`。
+    /// 未実装（REPAIR-3）: `KVM_CLEAR_DIRTY_LOG`・manual protect・dirty ring は範囲外。
+    pub fn dirty_log(&self) -> Result<DirtyBitmap, MicrovmError> {
+        let map = self.map.as_ref().ok_or_else(out_of_range)?;
+        let page_size =
+            sys::host_page_size().map_err(|e| classify_ram_error(RamStage::DirtyLog, e))?;
+        fetch_dirty_log_checked(
+            &VmFdDirtyLog(self.vm.as_fd()),
+            u32::from(self.slot),
+            self.flags,
+            map.len() as u64,
+            page_size,
+        )
+        .map_err(|e| match e {
+            FetchDirtyLogError::Precheck(e) => e,
+            FetchDirtyLogError::Ioctl(e) => classify_ram_error(RamStage::DirtyLog, e),
+        })
+    }
+}
+
+impl GuestMemory<RegisteredGuestRam> {
+    /// 領域 `region`（昇順の index。`register_with_flags` が返す 1 領域なら 0）の dirty bitmap を取得する（#4225）。
+    /// 範囲外の index は ioctl を呼ばず `InvalidArgument`。詳細は [`RegisteredGuestRam::dirty_log`]。
+    pub fn dirty_log(&self, region: usize) -> Result<DirtyBitmap, MicrovmError> {
+        self.region_backing(region)
+            .ok_or_else(|| invalid("guest memory region index out of range"))?
+            .dirty_log()
+    }
 }
 
 impl GuestMemoryBacking for RegisteredGuestRam {

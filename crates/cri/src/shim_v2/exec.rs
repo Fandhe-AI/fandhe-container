@@ -42,6 +42,11 @@ pub const MAX_EXEC_SPEC_BYTES: usize = 1 << 20;
 /// 1 コンテナあたりに登録できる exec の最大数。`Delete(exec_id)` による除去は実装済みで、上限は無制限確保を防ぐために残す。
 pub const MAX_EXECS_PER_CONTAINER: usize = 64;
 /// 全コンテナ合計で登録できる exec の最大数。
+///
+/// 外で消えたコンテナの登録がこの枠を塞ぎ続けないよう、`TaskService` が回収する（#4058・CRI-5・REPAIR-5）。
+/// 契機は shim の Create の成功・Exec / Start(exec_id) / Delete で実行層が `NOT_FOUND` を返したとき・
+/// この上限に達した Exec の掃除（登録のある別コンテナを照会し `NOT_FOUND` のものだけ除去）。
+/// 上限そのものは弱めない。
 pub const MAX_EXECS_TOTAL: usize = 1024;
 
 const _: () = assert!(MAX_EXEC_SPEC_BYTES <= MAX_CONFIG_BYTES);
@@ -471,15 +476,59 @@ impl ExecRegistry {
         &self,
         container: &ContainerId,
     ) -> Result<std::sync::MutexGuard<'_, ()>, CriError> {
+        self.gate_of(container)?.lock().map_err(|_| poisoned())
+    }
+
+    /// ゲートを待たずに取る。他者が保持していれば `Ok(None)`（毒されていれば内部エラー）。
+    ///
+    /// 全体上限での掃除（#4058）が、別コンテナの Exec / Start の完了を待たずに飛ばすために使う。
+    pub fn try_lock_container(
+        &self,
+        container: &ContainerId,
+    ) -> Result<Option<std::sync::MutexGuard<'_, ()>>, CriError> {
+        match self.gate_of(container)?.try_lock() {
+            Ok(g) => Ok(Some(g)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(poisoned()),
+        }
+    }
+
+    fn gate_of(&self, container: &ContainerId) -> Result<&Mutex<()>, CriError> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         container.as_str().hash(&mut h);
         let idx = (h.finish() % GATE_STRIPES as u64) as usize;
-        self.gates
-            .get(idx)
-            .ok_or_else(poisoned)?
-            .lock()
-            .map_err(|_| poisoned())
+        self.gates.get(idx).ok_or_else(poisoned)
+    }
+
+    /// 登録のあるコンテナの一覧（重複なし。件数は [`MAX_EXECS_TOTAL`] 以下）。
+    /// 内部ロックの中で複製してすぐ放す。全体上限での掃除（#4058・CRI-5・REPAIR-5）が使う。
+    pub fn containers(&self) -> Result<Vec<ContainerId>, CriError> {
+        let inner = self.inner.lock().map_err(|_| poisoned())?;
+        let mut names: Vec<&str> = inner.map.keys().map(|(c, _)| c.as_str()).collect();
+        names.dedup();
+        Ok(names
+            .into_iter()
+            .filter_map(|c| ContainerId::new(c).ok())
+            .collect())
+    }
+
+    /// 全体の登録数が [`MAX_EXECS_TOTAL`] に達しているか。
+    pub fn is_total_full(&self) -> Result<bool, CriError> {
+        let inner = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(inner.map.len() >= MAX_EXECS_TOTAL)
+    }
+
+    /// コンテナ単位の登録数が [`MAX_EXECS_PER_CONTAINER`] に達しているか。
+    /// 達していれば全体掃除をしても空きは生まれないため、掃除を省く判定に使う（#4058・REPAIR-5）。
+    pub fn is_container_full(&self, container: &ContainerId) -> Result<bool, CriError> {
+        let inner = self.inner.lock().map_err(|_| poisoned())?;
+        let n = inner
+            .map
+            .keys()
+            .filter(|(c, _)| c == container.as_str())
+            .count();
+        Ok(n >= MAX_EXECS_PER_CONTAINER)
     }
 
     /// コンテナの exec 登録をすべて除去する（Delete 成功後、ゲート保持中に呼ぶ。CRI-5）。
@@ -800,6 +849,50 @@ mod tests {
         // 別コンテナは per-container 上限の影響を受けない。
         let c2 = ContainerId::new("c2").unwrap();
         r.register(&c2, &e, spec).unwrap();
+    }
+
+    /// #4058・CRI-5: containers は重複なしの一覧、is_total_full は上限の境界、try_lock は保持中なら None。
+    #[test]
+    fn cri5_4058_registry_containers_total_and_try_lock() {
+        let r = ExecRegistry::new();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        let (c1, c2) = (
+            ContainerId::new("c1").unwrap(),
+            ContainerId::new("c2").unwrap(),
+        );
+        for i in 0..3 {
+            r.register(&c1, &ExecId::new(&format!("e{i}")).unwrap(), spec.clone())
+                .unwrap();
+        }
+        r.register(&c2, &ExecId::new("e0").unwrap(), spec.clone())
+            .unwrap();
+        let names: Vec<String> = r
+            .containers()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().to_owned())
+            .collect();
+        assert_eq!(names, vec!["c1".to_owned(), "c2".to_owned()]);
+        assert!(!r.is_total_full().unwrap());
+        let mut n = 4;
+        let mut cid = 0;
+        while n < MAX_EXECS_TOTAL - 1 {
+            let c = ContainerId::new(format!("f{cid}")).unwrap();
+            for i in 0..MAX_EXECS_PER_CONTAINER.min(MAX_EXECS_TOTAL - 1 - n) {
+                r.register(&c, &ExecId::new(&format!("e{i}")).unwrap(), spec.clone())
+                    .unwrap();
+                n += 1;
+            }
+            cid += 1;
+        }
+        assert!(!r.is_total_full().unwrap());
+        r.register(&c2, &ExecId::new("last").unwrap(), spec)
+            .unwrap();
+        assert!(r.is_total_full().unwrap());
+        let g = r.lock_container(&c1).unwrap();
+        assert!(r.try_lock_container(&c1).unwrap().is_none());
+        drop(g);
+        assert!(r.try_lock_container(&c1).unwrap().is_some());
     }
 
     /// CRI-5: purge は当該コンテナの登録だけを除去し、旧登録の launch 結果は再登録に反映されない。

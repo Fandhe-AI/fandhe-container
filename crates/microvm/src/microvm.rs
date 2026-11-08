@@ -530,6 +530,24 @@ impl RegisteredGuestRam {
     /// `LOG_DIRTY_PAGES` なしで登録した memslot は ioctl を呼ばず `FailedPrecondition`。ページ単位はホストの `PAGE_SIZE`。
     /// 未実装（REPAIR-3）: `KVM_CLEAR_DIRTY_LOG`・manual protect・dirty ring は範囲外。
     pub fn dirty_log(&self) -> Result<DirtyBitmap, MicrovmError> {
+        // REPAIR-4: 事前検査での拒否も含め、成否と所要時間を固定の操作名とエラーコードだけで 1 行出す。
+        let started = std::time::Instant::now();
+        let result = self.dirty_log_inner();
+        let line = dirty_log_log_line(
+            self.slot,
+            result
+                .as_ref()
+                .map(DirtyBitmap::page_count)
+                .map_err(|e| e.code().as_str()),
+            started.elapsed().as_micros(),
+        );
+        // ログ出力の失敗で取得結果を失わないよう、書き込みエラーは捨てる。
+        use std::io::Write as _;
+        drop(writeln!(std::io::stderr(), "{line}"));
+        result
+    }
+
+    fn dirty_log_inner(&self) -> Result<DirtyBitmap, MicrovmError> {
         let map = self.map.as_ref().ok_or_else(out_of_range)?;
         let page_size =
             sys::host_page_size().map_err(|e| classify_ram_error(RamStage::DirtyLog, e))?;
@@ -544,6 +562,18 @@ impl RegisteredGuestRam {
             FetchDirtyLogError::Precheck(e) => e,
             FetchDirtyLogError::Ioctl(e) => classify_ram_error(RamStage::DirtyLog, e),
         })
+    }
+}
+
+/// `microvm.dirty_log` の構造化ログ 1 行を組み立てる（REPAIR-4）。`Ok` は bitmap のページ数。
+fn dirty_log_log_line(slot: u16, result: Result<u64, &str>, elapsed_us: u128) -> String {
+    match result {
+        Ok(pages) => format!(
+            "level=info op=microvm.dirty_log outcome=ok slot={slot} pages={pages} elapsed_us={elapsed_us}"
+        ),
+        Err(code) => format!(
+            "level=error op=microvm.dirty_log outcome=error code={code} slot={slot} elapsed_us={elapsed_us}"
+        ),
     }
 }
 
@@ -5262,6 +5292,19 @@ fn check_loaded_within_arm64(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dirty_log_log_line_has_op_outcome_code_and_elapsed() {
+        // REPAIR-4: 成功・失敗（事前検査の拒否を含む）の行の形を具体値で固定する。
+        assert_eq!(
+            super::dirty_log_log_line(3, Ok(8), 42),
+            "level=info op=microvm.dirty_log outcome=ok slot=3 pages=8 elapsed_us=42"
+        );
+        assert_eq!(
+            super::dirty_log_log_line(3, Err("FAILED_PRECONDITION"), 7),
+            "level=error op=microvm.dirty_log outcome=error code=FAILED_PRECONDITION slot=3 elapsed_us=7"
+        );
+    }
+
     use super::*;
 
     fn assert_invalid(r: Result<GuestRam, MicrovmError>, msg: &str) {

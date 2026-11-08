@@ -10,7 +10,7 @@
 //! - [`message`]: ttrpc の封筒（Request / Response / Status）
 //! - [`service`]: サービスの登録口と dispatch、中身の無い Task サービス
 //! - [`task_api`]・[`task_service`]: Task API の Create / Start / Delete / Exec / Wait / State / Kill / Shutdown / Connect のメッセージ型と実装（TASK-62.2・TASK-62.3.1・TASK-62.3.2・TASK-62.4・TASK-62.7.2・TASK-62.6）
-//! - [`publish`]: TaskExit を期限つきの子プロセス（containerd の publish バイナリ）で送る（TASK-62.6・#4155）
+//! - [`publish`]: TaskCreate・TaskStart・TaskDelete・TaskExit を期限つきの子プロセス（containerd の publish バイナリ）で送る（TASK-62.6・#4155・#4156）
 //! - [`shutdown`]: Shutdown RPC からデーモンへ終了を伝えるシグナル（TASK-62.7.2）
 //! - [`bootstrap`]: 起動バイナリの start / delete / serve と引数解釈（TASK-62.7.1・#872）
 //! - [`wait`]: Wait の期限と照会間隔の設定・ポーリング本体（TASK-62.3.2）
@@ -41,7 +41,7 @@
 //! - peer UID の照合は `server::ServerConfig::allowed_peer_uids`（SO_PEERCRED / getpeereid。PLUG-12・#872）、UDS の置き場所と権限は [`bootstrap`] が扱う
 //! - ストリーミング（Data フレーム・remote open）は拒否する。`metadata` は復号するだけで使わない
 //! - Windows（named pipe）。listener と転送は unix のみ。ヘッダと封筒の型は全 OS で使える
-//! - TaskExit 以外のイベント（TaskCreate・TaskStart・TaskDelete）の publish は #4156。TaskExit は init の Start 成功後の終了 watcher が送る（#4155）
+//! - exec 系・Paused・Resumed・Checkpointed・OOM のイベントは送らない（対応する RPC・仕組みが無い。#4156）
 //! - 上限超過のペイロードは Go 実装と異なり読み捨てず、`ResourceExhausted` を返して接続を閉じる
 
 pub mod bootstrap;

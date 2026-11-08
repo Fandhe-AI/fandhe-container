@@ -26,7 +26,7 @@
 //!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
 //! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。`delete` action での
-//! 実行層の後始末（停止・回収・終了状態の応答。#4152）も未実装。`-publish-binary` による TaskExit の publish は実装済み（#4155）で、TaskCreate・TaskStart・TaskDelete は未実装（#4156）。非 Linux の delete は
+//! 実行層の後始末（停止・回収・終了状態の応答。#4152）も未実装。`-publish-binary` による TaskCreate・TaskStart・TaskDelete・TaskExit の publish は実装済み（#4155・#4156）。非 Linux の delete は
 //! 引数の検証だけで、記録の照合はしない（既定の状態ルートが未決定で #2431）。
 
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ pub(crate) fn registry_in(
         runtime = runtime.with_create_audit_sink(sink);
     }
     let adapter = RuntimeAdapter::new(Arc::new(runtime));
-    // TaskExit の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155）。
+    // イベント 4 種の送り先（`-publish-binary` が無ければ `None`。cri 側が `disabled` を記録する。CRI-5・#4155・#4156）。
     let publisher = fandhe_container_cri::shim_v2::publish::exec_publisher_for(&ctx);
     let mut v2 =
         TaskService::new(TaskApiVersion::V2, adapter.clone()).with_shutdown(ctx.shutdown().clone());

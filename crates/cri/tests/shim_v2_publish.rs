@@ -1,5 +1,5 @@
-//! shim v2 の TaskExit publish を、公開 API だけで本番の組み立て（`TaskService` + `exec_publisher_for_with` +
-//! 検証済みの `PublishBinary`）を通して照合する結合試験（CRI-5・TASK-62.6・REPAIR-10・REPAIR-12・#4155）。
+//! shim v2 の TaskCreate・TaskStart・TaskDelete・TaskExit の publish を、公開 API だけで本番の組み立て（`TaskService` + `exec_publisher_for_with` +
+//! 検証済みの `PublishBinary`）を通して照合する結合試験（CRI-5・TASK-62.6・REPAIR-10・REPAIR-12・#4155・#4156）。
 //!
 //! 偽なのは実行層（`ContainerRuntime`）と publish バイナリ（`/bin/sh` の記録スクリプト）だけ。Start の後に終了を
 //! 観測した watcher が、偽バイナリへ argv と `Any`（TaskExit）を渡し、イベントがちょうど 1 件であることを具体値で確かめる。
@@ -22,7 +22,8 @@ use fandhe_container_core::traits::{
 use fandhe_container_cri::adapter::RuntimeAdapter;
 use fandhe_container_cri::shim_v2::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
 use fandhe_container_cri::shim_v2::publish::{
-    PublishConfig, PublishFailure, PublishLog, TaskExit, exec_publisher_for_with,
+    PublishConfig, PublishFailure, PublishLog, TaskCreate, TaskDelete, TaskExit, TaskIo, TaskStart,
+    exec_publisher_for_with,
 };
 use fandhe_container_cri::shim_v2::{
     Any, CreateTaskRequest, DeleteRequest, ShutdownSignal, StartRequest, TaskApiVersion,
@@ -139,11 +140,38 @@ fn start_req(id: &str) -> Vec<u8> {
     .encode_to_vec()
 }
 
-/// CRI-5・#4155: Start 後の終了で、偽 publish バイナリが argv（`--address <a> publish --namespace default --topic /tasks/exit`）
-/// と `Any`（TaskExit: pid 4242・exit_status 3・exited_at）をちょうど 1 回受け取る。
-/// Delete 後の作り直しでは新しい終了だけが送られる。
+/// 偽バイナリの `n` 回目の呼び出し（`call<n>`）の完了を待ち、argv の topic と `Any` を返す。
+fn wait_call(out: &std::path::Path, n: usize) -> (String, Any) {
+    let dir = out.join(format!("call{n}"));
+    assert!(wait_until(Duration::from_secs(10), || dir
+        .join("stdin")
+        .exists()));
+    let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        &lines[..5],
+        [
+            "--address",
+            "/run/containerd/containerd.sock",
+            "publish",
+            "--namespace",
+            "default"
+        ]
+    );
+    assert_eq!(lines[5], "--topic");
+    let any = Any::decode(std::fs::read(dir.join("stdin")).unwrap().as_slice()).unwrap();
+    (lines[6].to_owned(), any)
+}
+
+fn count_calls(out: &std::path::Path) -> usize {
+    std::fs::read_dir(out).unwrap().count()
+}
+
+/// CRI-5・#4155・#4156: Create → Start → 終了 → Delete → 作り直しの各段で、偽 publish バイナリが
+/// topic（`/tasks/create`・`/tasks/start`・`/tasks/exit`・`/tasks/delete`）と `Any` の中身を、この順にちょうど 1 回ずつ受け取る。
+/// 作り直しでは新しい世代の Create・Start・終了だけが追加される。
 #[test]
-fn cri5_4155_task_exit_reaches_fake_publish_binary_once() {
+fn cri5_4155_events_reach_fake_publish_binary_in_order() {
     let dir = test_root::test_root("pubit", "once");
     // 呼び出しごとに連番のディレクトリへ argv と stdin を記録する。
     let out = dir.join("out");
@@ -182,33 +210,39 @@ fn cri5_4155_task_exit_reaches_fake_publish_binary_once() {
     let bundle = bundle.to_str().unwrap().to_owned();
     svc.handle("Create", &create_req("c1", &bundle)).unwrap();
     svc.handle("Start", &start_req("c1")).unwrap();
+    let (topic, any) = wait_call(&out, 0);
+    assert_eq!(topic, "/tasks/create");
+    assert_eq!(any.type_url, "containerd.events.TaskCreate");
+    assert_eq!(
+        TaskCreate::decode(any.value.as_slice()).unwrap(),
+        TaskCreate {
+            container_id: "c1".into(),
+            bundle: bundle.clone(),
+            rootfs: Vec::new(),
+            io: Some(TaskIo::default()),
+            checkpoint: String::new(),
+            pid: 0,
+        }
+    );
+    let (topic, any) = wait_call(&out, 1);
+    assert_eq!(topic, "/tasks/start");
+    assert_eq!(any.type_url, "containerd.events.TaskStart");
+    assert_eq!(
+        TaskStart::decode(any.value.as_slice()).unwrap(),
+        TaskStart {
+            container_id: "c1".into(),
+            pid: 4242
+        }
+    );
     std::thread::sleep(Duration::from_millis(250));
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "running");
+    assert_eq!(count_calls(&out), 2, "running: Create and Start only");
 
     *fake.stopped.lock().unwrap() = Some((3, 1_700_000_000_000_000_005));
-    let stdin = out.join("call0").join("stdin");
-    assert!(wait_until(Duration::from_secs(10), || stdin.exists()));
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "exactly once");
-
-    let argv = std::fs::read_to_string(out.join("call0").join("argv")).unwrap();
-    assert_eq!(
-        argv.lines().collect::<Vec<_>>(),
-        vec![
-            "--address",
-            "/run/containerd/containerd.sock",
-            "publish",
-            "--namespace",
-            "default",
-            "--topic",
-            "/tasks/exit"
-        ]
-    );
-    let any = Any::decode(std::fs::read(&stdin).unwrap().as_slice()).unwrap();
+    let (topic, any) = wait_call(&out, 2);
+    assert_eq!(topic, "/tasks/exit");
     assert_eq!(any.type_url, "containerd.events.TaskExit");
-    let exit = TaskExit::decode(any.value.as_slice()).unwrap();
     assert_eq!(
-        exit,
+        TaskExit::decode(any.value.as_slice()).unwrap(),
         TaskExit {
             container_id: "c1".into(),
             id: "c1".into(),
@@ -220,30 +254,53 @@ fn cri5_4155_task_exit_reaches_fake_publish_binary_once() {
             }),
         }
     );
-    assert!(log.0.lock().unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_calls(&out), 3, "exit exactly once");
 
-    // Delete して同じ ID で作り直し、再度 Start・終了すると、新しい終了が 1 件だけ追加される。
-    svc.handle(
-        "Delete",
-        &DeleteRequest {
+    // Delete は応答と同じ値の TaskDelete を 1 件送る。
+    let out_bytes = svc
+        .handle(
+            "Delete",
+            &DeleteRequest {
+                id: "c1".into(),
+                exec_id: String::new(),
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+    let resp = fandhe_container_cri::shim_v2::DeleteResponse::decode(&out_bytes[..]).unwrap();
+    let (topic, any) = wait_call(&out, 3);
+    assert_eq!(topic, "/tasks/delete");
+    assert_eq!(any.type_url, "containerd.events.TaskDelete");
+    assert_eq!(
+        TaskDelete::decode(any.value.as_slice()).unwrap(),
+        TaskDelete {
+            container_id: "c1".into(),
+            pid: resp.pid,
+            exit_status: 3,
+            exited_at: Some(Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 5
+            }),
             id: "c1".into(),
-            exec_id: String::new(),
         }
-        .encode_to_vec(),
-    )
-    .unwrap();
+    );
+    assert_eq!(resp.exit_status, 3);
+
+    // 作り直し: 新しい世代の Create・Start・終了だけが追加される。
     *fake.stopped.lock().unwrap() = None;
     svc.handle("Create", &create_req("c1", &bundle)).unwrap();
     svc.handle("Start", &start_req("c1")).unwrap();
+    assert_eq!(wait_call(&out, 4).0, "/tasks/create");
+    assert_eq!(wait_call(&out, 5).0, "/tasks/start");
     std::thread::sleep(Duration::from_millis(250));
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "still one");
+    assert_eq!(count_calls(&out), 6, "still six");
     *fake.stopped.lock().unwrap() = Some((0, 1_700_000_001_000_000_000));
-    let stdin1 = out.join("call1").join("stdin");
-    assert!(wait_until(Duration::from_secs(10), || stdin1.exists()));
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
-    let any = Any::decode(std::fs::read(&stdin1).unwrap().as_slice()).unwrap();
+    let (topic, any) = wait_call(&out, 6);
+    assert_eq!(topic, "/tasks/exit");
     let exit = TaskExit::decode(any.value.as_slice()).unwrap();
     assert_eq!((exit.pid, exit.exit_status), (4242, 0));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_calls(&out), 7);
     assert!(log.0.lock().unwrap().is_empty());
 }

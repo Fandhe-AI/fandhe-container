@@ -1,4 +1,4 @@
-//! `diagnostics` の単体試験（CRI-6・SEC-1・REPAIR-4・REPAIR-5・#4171）。期待値は具体値で書く。
+//! `diagnostics` の単体試験（CRI-6・SEC-1・REPAIR-4・REPAIR-5・#4171・#4233）。期待値は具体値で書く。
 
 use fandhe_container_core::exec::{
     EntrypointExecMode, LaunchPidfdUnavailable, SealedCopyUnavailable,
@@ -226,4 +226,72 @@ fn repair4_4171_helper_diagnose_lowercase_codes_are_forwarded() {
         classify_str("code=Unavailable"),
         Classified::Unparsed
     ));
+}
+
+/// 生成側（supervisor）の実関数が作る seccomp の集計行は ignored に数え、要約行を出さない（#4233）。
+#[test]
+fn cri6_4233_seccomp_report_line_is_ignored() {
+    use fandhe_container_supervisor::seccomp_notify::{CounterSnapshot, report_lines};
+    let one = report_lines(CounterSnapshot {
+        unrecorded: 1,
+        ..CounterSnapshot::default()
+    });
+    assert_eq!(one.len(), 1);
+    let line = format!("{}\n", one[0]);
+    let (out, st) = run(&[line.as_bytes()]);
+    assert!(out.is_empty());
+    assert_eq!((st.ignored, st.unparsed, st.forwarded), (1, 0, 0));
+    assert_eq!(summary_line(DiagEnd::Eof, &st), None);
+
+    let all = report_lines(CounterSnapshot {
+        suppressed: 1,
+        late: 1,
+        unrecorded: 1,
+        target_gone: 1,
+        pid_unresolved: 1,
+        respond_failed: 1,
+        wait_failed: 1,
+        receive_failed: 1,
+        ..CounterSnapshot::default()
+    });
+    assert_eq!(all.len(), 8);
+    for l in &all {
+        assert_eq!(classify_str(l), Classified::Ignored, "{l}");
+    }
+}
+
+#[test]
+fn cri6_4233_seccomp_report_line_text_form_is_ignored() {
+    assert_eq!(
+        classify_str("component=supervisor event=seccomp_audit_late count=3"),
+        Classified::Ignored
+    );
+}
+
+/// 語彙外の event・欄の欠落や混入・count の異常は、従来どおり解釈できない行にする（#4233）。
+#[test]
+fn sec1_4233_unknown_event_is_unparsed() {
+    let bad = [
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_bogus\",\"count\":1}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_notify_join_timeout\"}",
+        "{\"component\":\"supervisor\",\"event\":\"control_channel_failed\",\"code\":\"INTERNAL\",\"message\":\"x\"}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\"}",
+        "{\"event\":\"seccomp_audit_late\",\"count\":1}",
+        "{\"component\":\"core.exec\",\"event\":\"seccomp_audit_late\",\"count\":1}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"count\":1,\"stage\":\"setsid\"}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"count\":1,\"code\":\"INTERNAL\"}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"count\":1,\"message\":\"x\"}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"count\":\"abc\"}",
+        "{\"component\":\"supervisor\",\"count\":1}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"count\":12345678901}",
+        "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_late\",\"event\":\"seccomp_audit_late\",\"count\":1}",
+    ];
+    for l in bad {
+        assert_eq!(classify_str(l), Classified::Unparsed, "{l}");
+        let line = format!("{l}\n");
+        let (out, st) = run(&[line.as_bytes()]);
+        assert!(out.is_empty(), "{l}");
+        assert_eq!((st.unparsed, st.ignored), (1, 0), "{l}");
+        assert!(summary_line(DiagEnd::Eof, &st).is_some(), "{l}");
+    }
 }

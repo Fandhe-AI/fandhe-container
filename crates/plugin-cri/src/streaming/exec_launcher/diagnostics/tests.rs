@@ -204,3 +204,26 @@ fn repair4_4171_summary_only_when_noteworthy() {
     );
     assert!(summary_line(DiagEnd::Deadline, &quiet).is_some());
 }
+
+/// helper の `diagnose()` が実際に出す固定語彙の行（小文字ハイフン表記）が、正規形の `code` として転送される（CRI-6・REPAIR-4・#4171）。
+#[test]
+fn repair4_4171_helper_diagnose_lowercase_codes_are_forwarded() {
+    let (out, st) = run(&[
+        b"{\"code\":\"invalid-argument\",\"message\":\"stream-exec requires a socket on fd 0\"}\n",
+        b"{\"code\":\"unavailable\",\"message\":\"stream-exec requester went away; exec cancelled\"}\n",
+        b"{\"code\":\"UNAVAILABLE\",\"message\":\"x\"}\n",
+    ]);
+    assert_eq!(st.unparsed, 0);
+    assert_eq!(out.len(), 3);
+    assert!(
+        out[0].contains("\"code\":\"INVALID_ARGUMENT\""),
+        "{}",
+        out[0]
+    );
+    assert!(out[1].contains("\"code\":\"UNAVAILABLE\""), "{}", out[1]);
+    assert!(out[2].contains("\"code\":\"UNAVAILABLE\""), "{}", out[2]);
+    assert!(matches!(
+        classify_str("code=Unavailable"),
+        Classified::Unparsed
+    ));
+}

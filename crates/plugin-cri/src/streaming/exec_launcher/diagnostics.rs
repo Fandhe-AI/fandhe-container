@@ -247,6 +247,20 @@ fn split_text(line: &str) -> Option<Vec<(&str, Raw<'_>)>> {
     Some(out)
 }
 
+/// 正規形（大文字・`_` 区切り）と受信トークン（大文字 `_` 表記、または小文字 `-` 表記）の一致判定。
+fn code_token_eq(canonical: &str, token: &str) -> bool {
+    let upper = canonical == token;
+    let lower_hyphen = canonical.len() == token.len()
+        && canonical.bytes().zip(token.bytes()).all(|(c, t)| {
+            if c == b'_' {
+                t == b'-'
+            } else {
+                t == c.to_ascii_lowercase()
+            }
+        });
+    upper || lower_hyphen
+}
+
 fn pick(set: &[&'static str], v: &str) -> Option<&'static str> {
     set.iter().copied().find(|s| *s == v)
 }
@@ -320,7 +334,14 @@ fn classify(line: &[u8]) -> Classified {
                 .is_some(),
             "errno" => parse_errno(v).map(|e| f.errno = Some(e)).is_some(),
             "code" => s
-                .and_then(|s| ErrorCode::ALL.iter().map(|c| c.as_str()).find(|n| *n == s))
+                .and_then(|s| {
+                    // 大文字の `ErrorCode::as_str()` 表記と、helper の `diagnose()` が出す小文字ハイフン表記の両方を受け、
+                    // 閉じた語彙（`ErrorCode::ALL`）の正規形へ引き直す。
+                    ErrorCode::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .find(|n| code_token_eq(n, s))
+                })
                 .map(|v| f.code = Some(v))
                 .is_some(),
             "component" => s

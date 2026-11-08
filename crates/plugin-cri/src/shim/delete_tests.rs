@@ -21,12 +21,12 @@ use fandhe_container_cri::shim_v2::bootstrap::{ShimIdentifier, parse_args};
 use super::*;
 use crate::test_root;
 
-const ADDR: &str = "/run/c.sock";
+pub(super) const ADDR: &str = "/run/c.sock";
 
-type Snap = BTreeMap<String, (bool, u64, i64, i64, u32)>;
+pub(super) type Snap = BTreeMap<String, (bool, u64, i64, i64, u32)>;
 
 /// delete の argv を組んで解析する。
-fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
+pub(super) fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
     let mut v: Vec<OsString> = ["-namespace", "default", "-address", ADDR, "-id", id]
         .iter()
         .map(OsString::from)
@@ -40,7 +40,7 @@ fn parse(id: &str, bundle: Option<&str>) -> Result<ShimInvocation, CriError> {
 }
 
 /// 木の完全な写し。前後で一致すれば何も書いていない。
-fn snapshot(root: &Path) -> Snap {
+pub(super) fn snapshot(root: &Path) -> Snap {
     fn walk(dir: &Path, root: &Path, out: &mut Snap) {
         for e in std::fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
@@ -66,7 +66,7 @@ fn snapshot(root: &Path) -> Snap {
     out
 }
 
-fn ctx() -> ServeContext {
+pub(super) fn ctx() -> ServeContext {
     ServeContext::new(ShutdownSignal::new(), None).with_origin(
         Some(ShimIdentifier::parse("default").unwrap()),
         Some(PathBuf::from(ADDR)),
@@ -74,14 +74,14 @@ fn ctx() -> ServeContext {
 }
 
 /// bundle の実ディレクトリ `<root>/b/default/<id>` を作る。
-fn make_bundle(root: &Path, id: &str) -> PathBuf {
+pub(super) fn make_bundle(root: &Path, id: &str) -> PathBuf {
     let b = root.join("b").join("default").join(id);
     std::fs::create_dir_all(&b).unwrap();
     b
 }
 
 /// serve と同じ `scoped_root` のストアへ記録を 1 件入れる。
-fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
+pub(super) fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
     let store = FileStateStore::open(scoped_root(base, &ctx()).unwrap()).unwrap();
     store
         .create(&CreateStateRequest::new(status, bundle.to_path_buf()).unwrap())
@@ -89,7 +89,7 @@ fn seed(base: &Path, status: ContainerStatus, bundle: &Path) -> FileStateStore {
     store
 }
 
-fn cid(s: &str) -> ContainerId {
+pub(super) fn cid(s: &str) -> ContainerId {
     ContainerId::new(s).unwrap()
 }
 

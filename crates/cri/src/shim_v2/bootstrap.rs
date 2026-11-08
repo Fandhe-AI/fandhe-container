@@ -46,8 +46,8 @@
 //! - デーモンの寿命は Shutdown RPC（[`ShutdownSignal`]。TASK-62.7.2・#873）と socket の `(dev, ino, mtime)` の生存確認（1 秒間隔。
 //!   delete 経路用）の併用。Shutdown で抜けたときは応答を流し切る有界な猶予（`SHUTDOWN_RESPONSE_GRACE`）の後にサーバーを止め、
 //!   ロック保持下で自分が bind した socket と lock を片付ける（取れなければ固定語彙を `daemon.log` へ出して残す）
-//! - delete での実行層のコンテナの後始末（containerd が shim の死後に呼ぶ `delete` action は、まだ実行層に触れない。#3684・#4152）。
-//!   入口の `-id`・`-bundle` の検証と状態ルートの記録の照合は、注入口 [`run_with_hooks`] の前段で plugin-cri が行う（#4151。副作用なし）
+//! - delete での実行層のコンテナの後始末は注入口 [`run_with_hooks`] の前段で plugin-cri が行う（入口の `-id`・`-bundle` の検証と
+//!   状態ルートの記録の照合は #4151、残ったコンテナの停止・回収と終了状態の応答は #4152。この module 自体は実行層に触れない）
 //! - stdin の options・`-publish-binary` のイベント publish・デーモンのログ（`<bundle>/log`）・grouping
 //! - Windows。`run` は `UNIMPLEMENTED`
 
@@ -334,6 +334,60 @@ pub fn encode_delete_response() -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// delete action が回収した結果の終了状態（CRI-5・TASK-62.6・REPAIR-3・#4152）。
+///
+/// 注入口の前段（plugin-cri の回収）が作り、[`encode_delete_response_for`] が containerd へ返す `DeleteResponse` にする。
+/// 変換規則は Task サービスの Delete と同じ（終了コード不明・負値は 255、`exited_at` は Stopped で記録があるときだけ。
+/// 値を捏造しない）。規則は `task_service` の関数を使い、複製しない（REPAIR-1）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ShimDeleteExit {
+    pid: u32,
+    exit_status: u32,
+    exited_at: Option<super::task_api::Timestamp>,
+}
+
+impl ShimDeleteExit {
+    /// 回収の結果の core の状態から作る。`before_pid` は回収前の記録の init の pid（無ければ 0 を返す）。
+    pub fn from_core_status(
+        before_pid: Option<std::num::NonZeroU32>,
+        status: &fandhe_container_core::traits::ContainerStatus,
+    ) -> Self {
+        let rt = crate::adapter::RuntimeContainerStatus::from(status);
+        Self {
+            pid: before_pid.map_or(0, std::num::NonZeroU32::get),
+            exit_status: super::task_service::exit_status_of(&rt),
+            exited_at: super::task_service::exited_at_of(&rt),
+        }
+    }
+
+    /// 回収前の init の pid（不明は 0）。
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// containerd へ返す終了コード。
+    pub fn exit_status(&self) -> u32 {
+        self.exit_status
+    }
+
+    /// 終了検知時刻（未記録は `None`）。
+    pub fn exited_at(&self) -> Option<&super::task_api::Timestamp> {
+        self.exited_at.as_ref()
+    }
+}
+
+/// 回収した終了状態から `DeleteResponse` を符号化したバイト列（stdout へ書く。#4152）。
+pub fn encode_delete_response_for(exit: &ShimDeleteExit) -> Vec<u8> {
+    use prost::Message;
+    super::task_api::DeleteResponse {
+        pid: exit.pid,
+        exit_status: exit.exit_status,
+        exited_at: exit.exited_at.clone(),
+    }
+    .encode_to_vec()
+}
+
 fn version_text() -> Vec<u8> {
     format!(
         "{SHIM_BINARY_NAME}:\n  Version: {}\n",
@@ -419,16 +473,17 @@ pub fn run_with_context<F>(inv: ShimInvocation, make_registry: F) -> Result<Vec<
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
-    run_with_hooks(inv, make_registry, |_| Ok(()))
+    run_with_hooks(inv, make_registry, |_| Ok(None))
 }
 
 /// [`run_with_context`] に、delete action の前段 `before_delete` を足した版（CRI-5・TASK-62.6・#4151）。
 ///
 /// `before_delete` は `delete` のときだけ、socket・lock に触れる前（`run_delete` の前）に 1 回呼ばれる。
 /// `Err` なら実行層の後始末にも socket の掃除にも進まず、そのエラーを返す（`ops.log` の `ShimV2Delete` には失敗として残る。REPAIR-4）。
-/// plugin-cri が `-id`・`-bundle` の検証と状態ルートの記録の照合を差し込む（cri から plugin-cri への依存は
-/// `tests/dependency_direction.rs` が禁じるため、注入口にした。PLUG-1）。戻り値を `()` にとどめるのは、停止・回収（#4152）が
-/// 照合結果を受け取る形を必要とした時点で、その PR が広げるため。`start`・`serve` では呼ばれない。
+/// plugin-cri が `-id`・`-bundle` の検証、状態ルートの記録の照合、残ったコンテナの停止・回収を差し込む（cri から plugin-cri への依存は
+/// `tests/dependency_direction.rs` が禁じるため、注入口にした。PLUG-1）。戻り値の `Some(exit)` は回収した終了状態で、
+/// [`encode_delete_response_for`] で `DeleteResponse` にする。`None` は回収なし（記録なし・回収済み）で固定の応答
+/// （[`encode_delete_response`]）を返す（#4152）。`start`・`serve` では呼ばれない。
 #[cfg(unix)]
 pub fn run_with_hooks<F, D>(
     inv: ShimInvocation,
@@ -437,7 +492,7 @@ pub fn run_with_hooks<F, D>(
 ) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -466,7 +521,7 @@ pub fn run_with_hooks<F, D>(
 ) -> Result<Vec<u8>, CriError>
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     match inv.action {
         ShimAction::Version => Ok(version_text()),
@@ -478,21 +533,22 @@ where
 
 /// shim バイナリの main の本体。引数を解析して [`run_with_context`] を呼び、結果を出力と終了コードへ写す。
 ///
-/// 成功は stdout へバイト列だけ（start のアドレス・delete の応答。stderr へは何も書かない。containerd が両者をまとめて読むため）。
+/// 成功は stdout へバイト列だけ（start のアドレス・delete の応答。start は stderr へ何も書かない。delete の回収の後始末の警告行は
+/// stderr へ出うるが、containerd は delete の成功時の stderr を warn として記録するだけで stdout の応答を汚さない。#4152）。
 /// 失敗は stdout へ何も書かず、stderr へ `{"code":"<CODE>","message":"<message>"}` の 1 行（JSON）を出して終了コード 1（ERR 系）。
 /// JSON の組み立てをここに置くのは、bin を持つ plugin-cri に serde_json の依存を足さないため（依存は承認制）。
 pub fn run_cli_with_context<F>(make_registry: F) -> std::process::ExitCode
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
 {
-    run_cli_with_hooks(make_registry, |_| Ok(()))
+    run_cli_with_hooks(make_registry, |_| Ok(None))
 }
 
 /// [`run_cli_with_context`] に delete の前段（[`run_with_hooks`]）を足した版（CRI-5・TASK-62.6・#4151）。
 pub fn run_cli_with_hooks<F, D>(make_registry: F, before_delete: D) -> std::process::ExitCode
 where
     F: FnOnce(ServeContext) -> Result<ServiceRegistry, CriError>,
-    D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+    D: FnOnce(&ShimInvocation) -> Result<Option<ShimDeleteExit>, CriError>,
 {
     use std::io::Write;
     let result = parse_args(std::env::args_os().skip(1))
@@ -976,10 +1032,10 @@ mod unix_impl {
         before_delete: D,
     ) -> Result<Vec<u8>, CriError>
     where
-        D: FnOnce(&ShimInvocation) -> Result<(), CriError>,
+        D: FnOnce(&ShimInvocation) -> Result<Option<super::ShimDeleteExit>, CriError>,
     {
         let started = Instant::now();
-        let r = before_delete(inv).and_then(|()| run_delete(inv, dir));
+        let r = before_delete(inv).and_then(|exit| run_delete(inv, dir, exit));
         record(dir, CriOpKind::ShimV2Delete, &r, started);
         r
     }
@@ -1156,12 +1212,20 @@ mod unix_impl {
     }
 
     /// delete の本体。`DeleteResponse` のバイト列を返す。冪等。
-    pub fn run_delete(inv: &ShimInvocation, dir: &Path) -> Result<Vec<u8>, CriError> {
+    pub fn run_delete(
+        inv: &ShimInvocation,
+        dir: &Path,
+        exit: Option<super::ShimDeleteExit>,
+    ) -> Result<Vec<u8>, CriError> {
+        let encode = |exit: &Option<super::ShimDeleteExit>| match exit {
+            Some(e) => super::encode_delete_response_for(e),
+            None => encode_delete_response(),
+        };
         // start と対称にディレクトリを検査する（作成はしない。無ければ消すものも無い）。
         match fs::symlink_metadata(dir) {
             Ok(_) => check_socket_dir(dir)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(encode_delete_response());
+                return Ok(encode(&exit));
             }
             Err(_) => return Err(internal("cannot stat socket dir")),
         }
@@ -1180,7 +1244,7 @@ mod unix_impl {
         }
         // ロックを持ったまま消す（取得側が inode を照合して取り直す）。
         let _ = fs::remove_file(&lock.path);
-        Ok(encode_delete_response())
+        Ok(encode(&exit))
     }
 
     /// 本番の監査の記録先を開く(状態ルート直下の `@audit.log`。SEC-4・PLUG-12・REPAIR-5)。
@@ -1732,6 +1796,48 @@ mod tests {
         assert!(r.exited_at.is_some());
     }
 
+    /// CRI-5・TASK-62.6・#4152: 回収した終了状態の符号化。Stopped は記録の終了コードと `exited_at` を、
+    /// 終了時刻が未記録なら `exited_at` 未設定を、終了コード不明は 255 を、pid の無い Created は 0 を返す。
+    #[test]
+    fn cri5_4152_delete_response_for_exit() {
+        use fandhe_container_core::traits::{ContainerId, ContainerStatus, ExitTime};
+        use prost::Message;
+        let id = ContainerId::new("abc").unwrap();
+        let pid = std::num::NonZeroU32::new(77);
+        let decode = |e: &ShimDeleteExit| {
+            crate::shim_v2::DeleteResponse::decode(&encode_delete_response_for(e)[..]).unwrap()
+        };
+
+        let at = ExitTime::from_unix_nanos(1_700_000_000_000_000_005);
+        let r = decode(&ShimDeleteExit::from_core_status(
+            pid,
+            &ContainerStatus::stopped_at(id.clone(), Some(3), at),
+        ));
+        assert_eq!((r.pid, r.exit_status), (77, 3));
+        let ts = r.exited_at.expect("exited_at");
+        assert_eq!((ts.seconds, ts.nanos), (1_700_000_000, 5));
+
+        let r = decode(&ShimDeleteExit::from_core_status(
+            pid,
+            &ContainerStatus::stopped_at(id.clone(), Some(3), None),
+        ));
+        assert_eq!(r.exit_status, 3);
+        assert!(r.exited_at.is_none());
+
+        let r = decode(&ShimDeleteExit::from_core_status(
+            None,
+            &ContainerStatus::stopped(id.clone(), None),
+        ));
+        assert_eq!((r.pid, r.exit_status), (0, 255));
+
+        let r = decode(&ShimDeleteExit::from_core_status(
+            None,
+            &ContainerStatus::created(id, None),
+        ));
+        assert_eq!((r.pid, r.exit_status), (0, 0));
+        assert!(r.exited_at.is_none());
+    }
+
     /// CRI-5・#872: パス長の上限（unix）。
     #[cfg(unix)]
     #[test]
@@ -2140,7 +2246,7 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("ops.log")).unwrap();
         assert!(log.contains("cri.shim_v2.delete"), "{log}");
 
-        let ok = unix_impl::delete_recorded(&inv, &dir, |_| Ok(())).unwrap();
+        let ok = unix_impl::delete_recorded(&inv, &dir, |_| Ok(None)).unwrap();
         // 応答は終了時刻を含むため、先頭の exit_status(137) だけを具体値で照合する。
         assert_eq!(ok.get(..3), Some(&[0x10, 0x89, 0x01][..]));
         assert!(!sock.exists(), "socket is removed on the normal path");

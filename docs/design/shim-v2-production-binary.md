@@ -38,7 +38,7 @@ CRI-5・CRI-7・PLUG-1・PLUG-4・REPAIR-3・TASK-62.6 の判断記録。配布�
 
 containerd は shim が死んだ後や start が失敗した後に `-id <id> -bundle <path> delete` を起動する。親 #4102 の実行層の後始末のうち、本節は副作用の無い入口（検証と照合）だけを扱う。停止・回収・応答は #4152、bin 経由の回収試験と未実装表記の更新は #4153。
 
-- 結線: cri の bootstrap に前段の注入口 `run_with_hooks` / `run_cli_with_hooks`（`before_delete`）を足し、plugin-cri の `shim::production_delete_preflight` を渡す（案 A）。前段は `ops.log` の計測区間の中で `run_delete` の前に呼ぶため、拒否も `ShimV2Delete` の失敗として残り、socket・lock には触れない。案 B（plugin-cri の bin が自前で引数を解析して事前検査する）は、失敗時の JSON 行の組み立て（serde_json）が cri にしか無く、複製するか plugin-cri に依存を足す（承認制）ことになるため採らない。既存の `run`・`run_with_context`・`run_cli_with_context` は前段が常に通る包みとして残す
+- 結線: cri の bootstrap に前段の注入口 `run_with_hooks` / `run_cli_with_hooks`（`before_delete`）を足し、plugin-cri の `shim::production_delete`（D5 の時点の名前は `production_delete_preflight`）を渡す（案 A）。前段は `ops.log` の計測区間の中で `run_delete` の前に呼ぶため、拒否も `ShimV2Delete` の失敗として残り、socket・lock には触れない。案 B（plugin-cri の bin が自前で引数を解析して事前検査する）は、失敗時の JSON 行の組み立て（serde_json）が cri にしか無く、複製するか plugin-cri に依存を足す（承認制）ことになるため採らない。既存の `run`・`run_with_context`・`run_cli_with_context` は前段が常に通る包みとして残す
 - `-id`: `parse_args` の identifier 規則（76 文字以内）が先に拒否する。core の `ContainerId` への変換は多層防御として残す
 - `-bundle`: 絶対パス・`.`/`..` の要素なし・末尾の要素が id と一致・末尾の要素が実在するディレクトリ（symlink でない）を求める。一次情報は containerd v2.1.4 の `core/runtime/v2/bundle.go`（`Path: filepath.Join(state, ns, id)`）と `binary.go`（`-id b.bundle.ID -bundle b.bundle.Path ... delete`）。親の namespace との一致は見ない: 状態ルートの記録の bundle との照合の方が強い同一性検査で、state の配置が変わったときに正当な呼び出しを拒否する危険を増やすだけのため。祖先の symlink は許す（macOS の `/tmp` → `/private/tmp` など）。末尾の区切りと区切りの重複は畳んでから `lstat` する（`link/` が symlink を辿るため）
 - 状態ルートの特定: serve と同じ式（`scoped_root_path`。純粋関数）で `<base>-shim-state/<FNV-1a(address)>/<namespace>` を出す。serve 側の `scoped_root` は同じ関数を呼んだ後に階層を作る。インスタンスロックは取らない（D2）
@@ -46,8 +46,29 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 - 分類（`DeleteRecordMatch`）: `NotRecorded`（階層なし、または一度もロックつきの操作が無い）・`Recorded`（Creating・Created・Running・Stopped のいずれの記録も、id と bundle が対象と一致するとき）・`AlreadyReclaimed`（ストアはあるが id の記録が無い）。`StateStore` に tombstone が無く `get` は「一度も作られなかった」と「削除済み」を共に `NotFound` で返すため、ストアはあるが一度も作られなかった id も `AlreadyReclaimed` に入る（区別できるように装わない）。#4152 はどちらも副作用 0 回で成功させる想定で、挙動は変わらない
 - 記録の bundle との照合: create が受けた bundle は正規化されず絶対パスのまま記録されるため、`Path` の比較（区切りの重複・末尾の区切りを無視）で `-bundle` と比べる。食い違いは `FAILED_PRECONDITION`、記録の id の食い違いは `INTERNAL`（ストアの不整合）、読み取りの期限切れは `DEADLINE_EXCEEDED`、その他の読み取り失敗は固定文言の `INTERNAL`
 - 非 Linux: 既定の状態ルートが未決定（#2431）のため、引数の検証だけを行い照合は縮退する
-- 前段の戻り値は `Result<(), CriError>` にとどめる。照合結果（`DeleteRecordMatch`）を受け取る形が要る #4152 で広げる。本番の前段は結果を捨てる（REPAIR-3）
+- 前段の戻り値は #4151 の時点では `Result<(), CriError>` にとどめ、照合結果を捨てていた。#4152 で `Result<Option<ShimDeleteExit>, CriError>` へ広げた（D6）
 - 実機確認: 実際の containerd の bundle の形（`<state>/<ns>/<id>`）で delete が拒否されないことは #3685（人間担当）の記録項目に足す
+
+## D6 delete action の停止・回収・応答（#4152）
+
+照合（D5）が `Recorded` のときだけ、残ったコンテナを止めて回収し、終了状態を containerd へ返す。実装は plugin-cri の `shim/reclaim.rs`。
+
+| 記録の状態 | 実行層の呼び出し | 応答 |
+| --- | --- | --- |
+| 記録なし・回収済み | 呼ばない（実行層も作らない） | 固定応答（pid 0・137・now。runc shim の cleanup と同じ） |
+| Stopped | delete だけ | 記録の終了コード・`exited_at`（未記録は未設定）、pid は 0 |
+| pid の無い Created | delete だけ | 終了コード 0 |
+| Running・pid つき Created | stop（猶予 0・SIGKILL）→ delete | 停止で得た Stopped の終了コード・`exited_at`、pid は記録の pid |
+| Creating | 呼ばない | `FAILED_PRECONDITION`（core の delete も拒否する。クラッシュ復旧の GC に任せる） |
+
+- `delete(force=true)` には寄せない: force は内部で停止しても状態を捨て、応答に要る終了コードが取れないため。変換規則（不明・負値は 255、`exited_at` は Stopped で記録があるときだけ）は `task_service` の関数を共有する（cri の `ShimDeleteExit`）。
+- 期限: containerd v2.1.4 の `pkg/shim/util.go` の `Command` は `exec.CommandContext` で shim を起動し、`core/runtime/v2/shim.go` の `cleanupAfterDeadShim` は `io.containerd.timeout.shim.cleanup`（既定 5 秒）の ctx で `binary.Delete`（`core/runtime/v2/binary.go`）を呼ぶ。切れると shim は kill され、失敗として exit_status 255 の TaskExit が publish される。このため全体を `SHIM_DELETE_DEADLINE`（4 秒）に収め、段の予算は停止 2.5 秒・削除 1.5 秒とする。plugin の 47 秒（`PLUGIN_FORCE_DELETE_DEADLINE`）からは導かない。
+- 各段は作業スレッドで走らせ `recv_timeout` で待ち、切れたら `DEADLINE_EXCEEDED`（固定文言）を返す。内側の `SupervisedLifecycle::stop_within` の予算は段の最悪値（状態ロックの 5 秒を含む）で admit するため、4 秒未満の予算を渡すと常に拒否される。そのため停止は予算なしの `stop` を呼び、外側の待ちで有界にする。切れた後のスレッドはプロセスの終了で消える。
+- 再実行: 毎回、照合からやり直し、記録の状態で続きの段から回収する。停止まで済めば次回は Stopped として delete だけ、delete まで済めば次回は回収済みで何も呼ばず成功する。containerd に kill された場合も同じ。
+- stderr: `CoreLifecycleRuntime::delete` の後始末の警告行は stderr に出うる。containerd は delete の成功時の stderr を warn として記録するだけで stdout の protobuf は汚れない（`binary.go`）。「成功時は stderr へ何も書かない」は start の制約。
+- 生の kill をしない: 状態記録の pid へ生のシグナルは送らない（PID 再利用。SEC-1・CORE-1）。supervisor に届かない Running の記録は停止の失敗を構造化エラーのまま返す。
+- 回収が触れるのは照合済みの id の記録だけ。`-bundle` は照合にだけ使い、削除の対象やパスの組み立てに使わない。
+- 残余: Creating の記録と、supervisor が不在の Running の記録は回収できない（fail-closed）。`exited_at` が未設定のときの containerd の挙動の実機確認は #3685。
 
 ## `exited_at` が未設定のときの containerd の扱い（#3682 の依頼）
 
@@ -62,7 +83,7 @@ containerd は shim が死んだ後や start が失敗した後に `-id <id> -bu
 ## 残り（REPAIR-3）
 
 - exec の起動役（`TaskExecLauncher`）の本番実装。exec は `UNIMPLEMENTED` のまま
-- containerd が shim の死後に呼ぶ `delete` action での実行層の後始末（入口の検証と照合は実装済み〔D5・#4151〕。停止・回収・応答は #4152）
+- containerd が shim の死後に呼ぶ `delete` action の停止・回収・応答は実装済み（D5・D6。#4151・#4152）。bin 経由の試験と未実装表記の全面更新は #4153
 - `-publish-binary` によるイベントの publish（TaskExit など）
 - rootful での shim 対応（#2442・#2241 の判断待ち）
 - containerd 実機シナリオの CI への組み込み（ランナーの containerd の版に依存する）

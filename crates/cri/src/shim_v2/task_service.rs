@@ -198,6 +198,9 @@ impl TaskService {
         let st = self.adapter.state(&req.id).map_err(|e| to_status(&e))?;
         let (status, exit_status) = match st.lifecycle {
             RuntimeLifecycle::Creating | RuntimeLifecycle::Created => (TaskStatus::Created, 0),
+            // 起動の途中（Running を記録したが init の pid がまだ無い）は未起動として返す。RUNNING・pid 0 を返すと
+            // containerd が実在しない pid の RUNNING を見る（#4104・CRI-5）。pid が判明すれば RUNNING になる。
+            RuntimeLifecycle::Running if st.pid.is_none() => (TaskStatus::Created, 0),
             RuntimeLifecycle::Running => (TaskStatus::Running, 0),
             RuntimeLifecycle::Stopped => (TaskStatus::Stopped, stopped_exit_status(&st)),
             _ => (TaskStatus::Unknown, 0),
@@ -1494,6 +1497,19 @@ mod tests {
                 .insert("c1".into(), ContainerStatus::stopped(id, None));
             assert_eq!(state_of(&s, "c1").exit_status, 255);
         }
+    }
+
+    /// CRI-5・#4104: 起動途中（Running だが pid 未判明）の State は RUNNING・pid 0 ではなく CREATED を返す。
+    #[test]
+    fn cri5_4104_state_running_without_pid_is_created() {
+        let (s, f) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        f.preset.lock().unwrap().insert(
+            "c1".into(),
+            ContainerStatus::running(RtId::new("c1").unwrap(), None),
+        );
+        let r = state_of(&s, "c1");
+        assert_eq!((r.pid, r.status), (0, TaskStatus::Created as i32));
     }
 
     /// CRI-5・TASK-62.6: Connect は Created で task_pid 0・Running で pid・shim_pid は自 pid を返す。

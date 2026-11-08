@@ -97,8 +97,10 @@
 //! 後続の VM 構成体（TASK-75.2・#697）と plugin-microvm（TASK-117）が、非信頼の VM 構成（サイズ・GPA）から呼ぶ。
 //! そのため size・GPA は ioctl の前にすべて検証し、slot は `u16` で受ける（KVM は上位 16 bit を address space id に使う）。
 //!
+//! memslot のフラグ（`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`）は [`GuestRam::register_with_flags`] で領域ごとに指定できる（#4158）。
+//!
 //! # 範囲外（REPAIR-3）
-//! hugepage・`KVM_MEM_READONLY` / `KVM_MEM_LOG_DIRTY_PAGES`・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
+//! hugepage（#4159）・dirty log の取得（`KVM_GET_DIRTY_LOG`）・aarch64 の IPA サイズ（`KVM_CAP_ARM_VM_IPA_SIZE`）の照合は未実装
 //! （複数領域と `KVM_CAP_NR_MEMSLOTS` の照会は #3697、x86_64 の物理アドレス幅〔CPUID leaf 0x8000_0008〕と最上位 GPA の照合・
 //! e820 の予約表記は #4106 で実装済み。下記）。
 //!
@@ -155,6 +157,7 @@ use crate::interrupt::{
     poll_net_rx,
 };
 use crate::irq::{IoEventFd, IrqFd};
+use crate::memslot_flags::{MemslotFlags, RegisterMemslotError, register_memslot_checked};
 #[cfg(target_arch = "x86_64")]
 use crate::mptable_x86::{IsaIrqRoute, MpTableConfig, build_mp_table, write_mp_table};
 use crate::net_rx_poll::{NetRxPollReport, check_net_rx_poll_interval, poll_failure};
@@ -392,7 +395,7 @@ impl GuestRam {
         Ok(GuestRam { map })
     }
 
-    /// `vm` の memslot `slot` に、ゲスト物理アドレス `base` から登録する。
+    /// `vm` の memslot `slot` に、ゲスト物理アドレス `base` から登録する（フラグなし）。
     ///
     /// `base` は `max(4096, ホストのページサイズ)` 境界で、`base + size` が桁あふれしないこと。登録に失敗したときは mapping を解放して返す
     /// （未登録なので解放してよい）。範囲が重なる既存の slot があれば `AlreadyExists`。
@@ -402,16 +405,33 @@ impl GuestRam {
         slot: u16,
         base: GuestAddress,
     ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
-        let registered = self.register_backing(vm, slot, base)?;
+        self.register_with_flags(vm, slot, base, MemslotFlags::NONE)
+    }
+
+    /// [`GuestRam::register`] に memslot のフラグを指定する（#4158・MVM-1）。1 つの `GuestRam` が 1 つの memslot なので領域ごとの指定になる。
+    ///
+    /// `READONLY` は `KVM_CAP_READONLY_MEM` を VM fd へ照会し、非対応なら ioctl を呼ばず `FailedPrecondition`。
+    /// 読み取り専用になるのはゲスト側の書き込み（MMIO exit になる）だけで、ホストの mapping は書き込み可能のまま
+    /// （[`GuestMemory`] のホストからの書き込みは従来どおり通る）。ホストのメモリ保護ではない。
+    /// `LOG_DIRTY_PAGES` は追跡を有効にするだけで、dirty bitmap の取得（`KVM_GET_DIRTY_LOG`）は未実装（REPAIR-3）。
+    pub fn register_with_flags(
+        self,
+        vm: &VmFd,
+        slot: u16,
+        base: GuestAddress,
+        flags: MemslotFlags,
+    ) -> Result<GuestMemory<RegisteredGuestRam>, MicrovmError> {
+        let registered = self.register_backing(vm, slot, base, flags)?;
         GuestMemory::new(base, registered)
     }
 
-    /// [`GuestRam::register`] の本体。KVM に登録して backing だけを返す（複数領域の組み立て用。#3697）。
+    /// [`GuestRam::register_with_flags`] の本体。KVM に登録して backing だけを返す（複数領域の組み立て用。#3697）。
     pub(crate) fn register_backing(
         self,
         vm: &VmFd,
         slot: u16,
         base: GuestAddress,
+        flags: MemslotFlags,
     ) -> Result<RegisteredGuestRam, MicrovmError> {
         if !base.raw().is_multiple_of(ram_align()?) {
             return Err(invalid(
@@ -427,8 +447,18 @@ impl GuestRam {
                 SysError::Os(e.raw_os_error().unwrap_or(0)),
             )
         })?;
-        sys::register_guest_ram(vm_fd.as_fd(), u32::from(slot), base.raw(), &self.map)
-            .map_err(|e| classify_ram_error(RamStage::Register, e))?;
+        register_memslot_checked(
+            vm,
+            u32::from(slot),
+            flags,
+            base.raw(),
+            size,
+            self.map.user_addr(),
+        )
+        .map_err(|e| match e {
+            RegisterMemslotError::Capability(e) => e,
+            RegisterMemslotError::Ioctl(e) => classify_ram_error(RamStage::Register, e),
+        })?;
         Ok(RegisteredGuestRam {
             vm: vm_fd,
             slot,
@@ -656,7 +686,8 @@ pub fn register_ram_regions(
     let mut registered = Vec::with_capacity(regions.len());
     for (i, r) in regions.iter().enumerate() {
         let slot = u16::try_from(i).map_err(|_| invalid("too many guest memory regions"))?;
-        let backing = GuestRam::new(r.len)?.register_backing(vm, slot, r.base)?;
+        let backing =
+            GuestRam::new(r.len)?.register_backing(vm, slot, r.base, MemslotFlags::NONE)?;
         registered.push((r.base, backing));
     }
     GuestMemory::from_regions(registered)

@@ -30,9 +30,9 @@
 //!   bundle の `tty/stdin` の拒否も解除済みで、RPC 時の整合検査は cri の `attach_impl`（D7）が担う。実機の通し確認
 //!   （tty のコンテナの起動・`crictl attach -i -t`）は `tests/cri_attach_real.rs`（#4079・C11。往復・EOF・resize を実機前提試験で照合済み）
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
-//! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを全書き手共通の排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
+//! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを書き込み先の記述（dev/ino）ごとの排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、
-//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。排他の保持者が plugin 外の書き手のせいで `write` に止まると全セッションの入力が進まないが、他のセッションは取り消しで抜けられる（#4134）。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
+//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。排他の保持者が plugin 外の書き手のせいで `write` に止まると同じ記述（同じコンテナ）の入力だけが進まず（別コンテナは進む）、同じ記述の他セッションは取り消しで抜けられる（#4134）。保持者本人の取り消しは採らない（理由・再評価条件は `ArbiterTable` の doc と設計書。#4232）。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
 //! - `stdin_once` のとき `obtain` が戻った後に future が drop されると、`AttachIo` の drop で唯一の書き込み端が閉じ、コンテナは
 //!   EOF を受ける（supervisor 側の `sendmsg` 直後の窓と同種の残余で、なくせない）
 //! - tty でも stdin を要求しない接続には master が渡らず、resize は `None`
@@ -434,18 +434,77 @@ fn watch_exit(
     }
 }
 
-/// 全 attach 入力スレッドの書き込みを調停する排他（REPAIR-5・CRI-6・#4077）。
+/// 書き込み先の記述を表すキー（`fstat` の `st_dev`・`st_ino`）。
+type ArbiterKey = (u64, u64);
+
+/// `file` の記述のキーを `fstat` で得る（std の `MetadataExt` のみ・`unsafe` なし）。
+fn arbiter_key(file: &File) -> Result<ArbiterKey, CriError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = file.metadata().map_err(|_| invalid_io())?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// 入力スレッドの書き込みを、書き込み先の記述（dev/ino）ごとに調停する排他の表（REPAIR-5・CRI-6・#4077・#4134・#4232）。
 ///
 /// 同じコンテナへの複数 attach は同じ open file description（stdin の pipe・pty master）へ並行して書く。
 /// `poll(POLLOUT)` の Ready から `write` までの間に別セッションが空きを使い切ると、blocking の `write` が無期限に
-/// 止まり、取り消しも見えなくなる。そこで「待たない poll → 書き込み」を 1 つの排他の中で行い、
-/// この plugin 内の書き手同士では空きを奪い合わない。保持中に待つ処理はない（poll は待たず、書き込みは空きが確かめられた
-/// 大きさに絞る）ので、排他の保持は有限で短い。待ちと取り消しの確認は排他の外で行う。
+/// 止まり、取り消しも見えなくなる。そこで「待たない poll → 書き込み」を排他の中で行い、この plugin 内の書き手同士では
+/// 空きを奪い合わない。保持中に待つ処理はない（poll は待たず、書き込みは空きが確かめられた大きさに絞る）。
 /// 排他の取得待ちも `try_lock` と取り消しの確認の繰り返しで、取り消しを見る（#4134）。
-/// 残余: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。`poll` と `write` の間に
-/// 空きを使い切られると、保持者は記述が空くか閉じるまで `write` の中で止まり取り消しを見られず、その間は
-/// 全セッション・全コンテナの入力が進まない。ただし他のセッションは取り消しで抜け、スレッド・fd・枠を返せる。
-static WRITE_ARBITER: Mutex<()> = Mutex::new(());
+///
+/// 排他は記述ごとに分ける。pipe・socket は記述ごとに固有の inode を持ち、同じコンテナの複数 attach は supervisor から
+/// 同じ記述の dup を受けるので同じキーになる。pty master は ptmx ノード自身の inode を返すため、同じ devpts instance の
+/// master は同じキーに畳まれるが、本番の init の pty はコンテナごとの独立した devpts から割り当てられる
+/// （`docs/design/dev-default-mounts.md`）ので、衝突は同じコンテナ内に限られる（余計に直列化されるだけで、別の記述へ書く経路は生まれない）。
+///
+/// 表は backend が持つ（本番の backend は 1 つ）。項目は `Weak` で、最後の保持者（入力スレッド）が終わると次の
+/// [`ArbiterTable::acquire`] で掃除される。生きた項目は入力スレッド数以下で、上限は [`MAX_ATTACH_SESSIONS`]。
+/// 満杯のときは共有の排他へ縮退せず、固定文言の `RESOURCE_EXHAUSTED` で拒否する（fail-closed）。
+///
+/// 残余（#4232。REPAIR-3）: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。`poll` と `write` の
+/// 間に空きを使い切られると、保持者は記述が空くか閉じるまで `write` の中で止まり取り消しを見られず、その間は同じ記述
+/// （同じコンテナ）の入力だけが進まない。別の記述の入力は進む。同じ記述の他セッションは取り消しで抜け、スレッド・fd・枠を返せる。
+/// 保持者本人の取り消しは本 issue では採らない（`O_NONBLOCK` は supervisor 側と共有の記述のため立てられず、スレッド宛てシグナルは
+/// プロセス全体のシグナル配置と `libc` の機械照合が要る）。再評価条件・比較は `docs/design/cri-streaming-server.md`。
+struct ArbiterTable {
+    map: Mutex<std::collections::HashMap<ArbiterKey, std::sync::Weak<Mutex<()>>>>,
+    cap: usize,
+}
+
+impl ArbiterTable {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: Mutex::new(std::collections::HashMap::new()),
+            cap,
+        }
+    }
+
+    /// `key` の排他を返す（生きたものがあれば共有、無ければ作る）。表のロック中は I/O も待ちもしない。
+    fn acquire(&self, key: ArbiterKey) -> Result<Arc<Mutex<()>>, CriError> {
+        // 毒: 中身は `Weak` の表で、panic で壊れる不変条件はない（生きた `Weak` は同じキーの唯一の排他）ため取り直す。
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(live);
+        }
+        map.retain(|_, w| w.strong_count() > 0);
+        if map.len() >= self.cap {
+            return Err(CriError::resource_exhausted(
+                "too many attach input descriptors",
+            ));
+        }
+        let fresh = Arc::new(Mutex::new(()));
+        map.insert(key, Arc::downgrade(&fresh));
+        Ok(fresh)
+    }
+
+    /// 掃除後の生きた項目数（試験用）。
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        map.retain(|_, w| w.strong_count() > 0);
+        map.len()
+    }
+}
 
 /// 非対応の組での警告を出したか（プロセス単位。非対応かどうかはビルドの組で決まり、セッションごとに出す意味がないため）。
 static POLL_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
@@ -470,9 +529,9 @@ fn warn_poll_unsupported_once(warned: &AtomicBool, sink: &LineSink) -> bool {
 
 /// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を待たずに確かめ、書けなければ排他の外で
 /// 10 ms 待って取り消しを見る。記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description
-/// のため）。書ける確認から書き込みまでは [`WRITE_ARBITER`] で調停するので、コンテナが読まず pipe / pty が満杯でも、
+/// のため）。書ける確認から書き込みまでは記述ごとの排他（[`ArbiterTable`]）で調停するので、コンテナが読まず pipe / pty が満杯でも、
 /// セッションの drop（取り消し）で抜けてスレッド・fd・枠を返せる。1 回の書き込みは、確認した空きに収まる大きさに
-/// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。`arbiter` は本番では [`WRITE_ARBITER`]
+/// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。`arbiter` は本番では [`ArbiterTable`] から得た記述ごとの排他
 /// （試験は局所の排他）で、取得待ちでも取り消しを見る（#4134）。
 fn write_all_retry(
     file: &mut File,
@@ -541,6 +600,7 @@ fn bridge_input(
     slice: usize,
     cancel: Arc<AtomicBool>,
     slot: Arc<SlotGuard>,
+    arbiter: Arc<Mutex<()>>,
 ) -> Result<tokio::net::UnixStream, CriError> {
     let (tokio_side, mut thread_side) =
         StdUnixStream::pair().map_err(|_| CriError::unavailable("attach stdio setup failed"))?;
@@ -554,7 +614,7 @@ fn bridge_input(
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
                         let Some(chunk) = buf.get(..n) else { return };
-                        if !write_all_retry(&mut file, chunk, slice, &cancel, &WRITE_ARBITER) {
+                        if !write_all_retry(&mut file, chunk, slice, &cancel, &arbiter) {
                             return;
                         }
                     }
@@ -578,6 +638,8 @@ struct Inner {
     io_source: Arc<dyn AttachIoSource>,
     exit_notifier: Arc<dyn ExitNotifier>,
     active: Arc<AtomicUsize>,
+    /// 入力の書き込み先の記述ごとの排他の表（#4232）。
+    arbiters: ArbiterTable,
 }
 
 impl Inner {
@@ -639,6 +701,7 @@ impl SupervisorAttachBackend {
                 io_source,
                 exit_notifier,
                 active: Arc::new(AtomicUsize::new(0)),
+                arbiters: ArbiterTable::new(MAX_ATTACH_SESSIONS),
             }),
         }
     }
@@ -690,7 +753,9 @@ impl AttachBackend for SupervisorAttachBackend {
                     } else {
                         1
                     };
-                    let w = bridge_input(file, slice, Arc::clone(&cancel), Arc::clone(&slot))?;
+                    let arbiter = inner.arbiters.acquire(arbiter_key(&file)?)?;
+                    let w =
+                        bridge_input(file, slice, Arc::clone(&cancel), Arc::clone(&slot), arbiter)?;
                     Some(Box::new(InputWriter {
                         inner: w,
                         _life: Arc::clone(&life),
@@ -701,8 +766,9 @@ impl AttachBackend for SupervisorAttachBackend {
                         .as_fd()
                         .try_clone_to_owned()
                         .map_err(|_| CriError::internal("attach pty setup failed"))?;
-                    let w =
-                        bridge_input(File::from(dup), 1, Arc::clone(&cancel), Arc::clone(&slot))?;
+                    let dup = File::from(dup);
+                    let arbiter = inner.arbiters.acquire(arbiter_key(&dup)?)?;
+                    let w = bridge_input(dup, 1, Arc::clone(&cancel), Arc::clone(&slot), arbiter)?;
                     let master = Arc::new(master);
                     // 失敗は `()` を返す契約のため捨てる。0 行・0 列はそのまま渡す（カーネルは受け付ける）。
                     resize = Some(Box::new(move |size: TerminalSize| {

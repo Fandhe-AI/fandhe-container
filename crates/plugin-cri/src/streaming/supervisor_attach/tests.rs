@@ -1004,3 +1004,182 @@ fn cri6_repair5_4134_poisoned_arbiter_is_still_acquired() {
     assert_eq!(r.read_to_end(&mut v).unwrap(), 1);
     assert_eq!(v, b"z");
 }
+/// 同じ pipe の dup は同じキー・同じ排他になる（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_same_pipe_dup_shares_one_arbiter() {
+    let (_r, w) = std::io::pipe().expect("pipe");
+    let a = File::from(std::os::fd::OwnedFd::from(w));
+    let b = a.try_clone().expect("dup");
+    assert_eq!(arbiter_key(&a).unwrap(), arbiter_key(&b).unwrap());
+    let t = ArbiterTable::new(4);
+    let x = t.acquire(arbiter_key(&a).unwrap()).unwrap();
+    let y = t.acquire(arbiter_key(&b).unwrap()).unwrap();
+    assert!(Arc::ptr_eq(&x, &y));
+}
+
+/// 別の pipe は別のキー・別の排他になる（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_distinct_pipes_get_distinct_arbiters() {
+    let (_r1, w1) = std::io::pipe().expect("pipe");
+    let (_r2, w2) = std::io::pipe().expect("pipe");
+    let a = File::from(std::os::fd::OwnedFd::from(w1));
+    let b = File::from(std::os::fd::OwnedFd::from(w2));
+    assert_ne!(arbiter_key(&a).unwrap(), arbiter_key(&b).unwrap());
+    let t = ArbiterTable::new(4);
+    let x = t.acquire(arbiter_key(&a).unwrap()).unwrap();
+    let y = t.acquire(arbiter_key(&b).unwrap()).unwrap();
+    assert!(!Arc::ptr_eq(&x, &y));
+}
+
+/// 最後の保持者が落ちた項目は次の取得で掃除される（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_entry_is_swept_after_the_last_holder_drops() {
+    let t = ArbiterTable::new(4);
+    let x = t.acquire((1, 1)).unwrap();
+    assert_eq!(t.live_len(), 1);
+    drop(x);
+    let _y = t.acquire((1, 2)).unwrap();
+    assert_eq!(t.live_len(), 1);
+}
+
+/// 表は上限を持ち、満杯なら共有へ縮退せず拒否する（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_table_is_bounded_and_fails_closed() {
+    let t = ArbiterTable::new(2);
+    let a = t.acquire((1, 1)).unwrap();
+    let _b = t.acquire((1, 2)).unwrap();
+    let e = t.acquire((1, 3)).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
+    drop(a);
+    assert!(t.acquire((1, 3)).is_ok());
+}
+
+/// ある記述の保持者が `write` で止まっても、別の記述の書き込みは進む（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_other_descriptor_progresses_while_a_holder_is_stalled_in_write() {
+    use std::io::Read as _;
+    let t = ArbiterTable::new(4);
+    let (r_a, mut w_a) = std::io::pipe().expect("pipe");
+    let (mut r_b, w_b) = std::io::pipe().expect("pipe");
+    let mut wf_b = File::from(std::os::fd::OwnedFd::from(w_b));
+    let arb_a = t.acquire((9, 1)).unwrap();
+    let arb_b = t.acquire((9, 2)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|sc| {
+        let holder = sc.spawn(|| {
+            let _g = arb_a.lock().unwrap();
+            tx.send(()).unwrap();
+            w_a.write_all(&vec![0u8; 1 << 20])
+        });
+        rx.recv().unwrap();
+        let t0 = Instant::now();
+        assert!(write_all_retry(
+            &mut wf_b, b"abc", PIPE_SLICE, &cancel, &arb_b
+        ));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+        let mut buf = [0u8; 3];
+        r_b.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abc");
+        drop(r_a);
+        assert!(holder.join().unwrap().is_err());
+    });
+}
+
+/// 陰性対照: 同じ記述の取得待ちは待ち続け、取り消しで抜ける（CRI-6・REPAIR-5・#4232）。
+#[test]
+fn cri6_repair5_4232_same_descriptor_waiter_still_waits_and_cancels() {
+    let t = ArbiterTable::new(4);
+    let (r_a, mut w_a) = std::io::pipe().expect("pipe");
+    let (_r2, w2) = std::io::pipe().expect("pipe");
+    let mut wf = File::from(std::os::fd::OwnedFd::from(w2));
+    let arb1 = t.acquire((9, 1)).unwrap();
+    let arb2 = t.acquire((9, 1)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|sc| {
+        let holder = sc.spawn(|| {
+            let _g = arb1.lock().unwrap();
+            tx.send(()).unwrap();
+            w_a.write_all(&vec![0u8; 1 << 20])
+        });
+        rx.recv().unwrap();
+        let waiter = sc.spawn(|| write_all_retry(&mut wf, b"abc", PIPE_SLICE, &cancel, &arb2));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        let t0 = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        assert!(!waiter.join().unwrap());
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
+        drop(r_a);
+        assert!(holder.join().unwrap().is_err());
+    });
+}
+
+/// 別々のコンテナ（別 pipe）の複数セッションが、互いに干渉せず完了する（CRI-6・REPAIR-5・#4232）。
+#[tokio::test]
+async fn cri6_repair5_4232_two_containers_pipes_complete_independently() {
+    let fx = Fixture::new("arbiter2");
+    let (r_a, w_a) = std::io::pipe().expect("pipe");
+    let (r_b, w_b) = std::io::pipe().expect("pipe");
+    let ws = Arc::new(Mutex::new((w_a, w_b)));
+    let n = Arc::new(AtomicUsize::new(0));
+    let source = FakeSource::new(Box::new(move |_| {
+        let g = ws.lock().expect("lock");
+        let dup = if n.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+            g.0.try_clone()
+        } else {
+            g.1.try_clone()
+        }
+        .expect("dup");
+        Ok(AttachIo {
+            input: Some(AttachInput::Pipe(OwnedFd::from(dup))),
+            stdout: Some(sock_pair().0),
+            stderr: None,
+        })
+    }));
+    let b = fx.backend(source, idle_notifier(Arc::new(AtomicBool::new(false))));
+    let mut sessions = Vec::new();
+    for _ in 0..6 {
+        sessions.push(
+            within(b.attach(target(true, true, false, false)))
+                .await
+                .expect("attach"),
+        );
+    }
+    let total = 3 * 20_000;
+    let drain = |mut r: std::io::PipeReader| {
+        tokio::task::spawn_blocking(move || {
+            let mut got = 0usize;
+            let mut buf = [0u8; 8192];
+            while got < total {
+                let n = r.read(&mut buf).expect("read");
+                assert!(n > 0, "unexpected EOF");
+                got += n;
+            }
+            got
+        })
+    };
+    let (ra, rb) = (drain(r_a), drain(r_b));
+    let mut joins = Vec::new();
+    for s in &mut sessions {
+        let mut stdin = s.stdin.take().expect("stdin");
+        joins.push(tokio::spawn(async move {
+            write_all(&mut *stdin, &vec![b'y'; 20_000]).await;
+            stdin
+        }));
+    }
+    for j in joins {
+        within(j).await.expect("join");
+    }
+    assert_eq!(within(ra).await.expect("join"), total);
+    assert_eq!(within(rb).await.expect("join"), total);
+}

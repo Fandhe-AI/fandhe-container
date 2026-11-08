@@ -521,7 +521,8 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
 - Exec の残余: plugin-cri の異常終了時の helper の早期停止は #4112（#4166・#4167）で解消。残る窓は listener の受け渡し前・通知処理中の最大 5 秒の遅れ・channel の端の漏れだけ（`PtyMaster` の fd 検証は #4100 で解消）
 - Exec の残余（診断）: helper の fd 2 へ段名と errno を出す生成側が無い（supervisor・core・転送側の分類語彙。#4172 で現状を試験に固定済み。生成側は後続 issue）
-- Attach の残余: 入力の書き込みは全セッション共通の排他（`WRITE_ARBITER`）で調停する。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は全セッション・全コンテナの入力が進まない。他のセッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・CRI-6・REPAIR-5）
+- Attach の残余: 入力の書き込みは、書き込み先の記述（`fstat` の `st_dev`・`st_ino`）ごとの排他で調停する。表は backend が持ち、生きた項目は入力スレッド数以下（上限 `MAX_ATTACH_SESSIONS`。満杯は共有へ縮退せず `RESOURCE_EXHAUSTED`）。pipe・socket は記述ごとに固有の inode、pty master は本番ではコンテナごとの devpts の inode のため、衝突は同じコンテナ内に限る。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は同じ記述（同じコンテナ）の入力だけが進まない（別コンテナは進む）。同じ記述の他セッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・#4232・CRI-6・REPAIR-5）
+- Attach の保持者本人の blocking write の取り消しは採らない（#4232）。比較: (A) スレッド宛てシグナルで `EINTR` にする案は、プロセス全体のシグナル配置の変更と `pthread_t` の取得・取りこぼし対策が要り、plugin-cri に `libc` の機械照合も無いため見送り。(B) `/proc/self/fd/N` を `O_NONBLOCK` で開き直して自前の open file description にする案は pipe のみ可（pty・socket は不可）で、後続の第一候補。(C) `send(MSG_DONTWAIT)`・`pwritev2(RWF_NOWAIT)` は pty に効かず版数依存。(D) fd の close・dup2 は blocking 中の `write` を戻さない。`O_NONBLOCK` は supervisor 側と共有の記述のため立てない。コンテナの終了で読み手が閉じれば pipe は `EPIPE`、pty は `EIO` で保持者は抜ける。再評価条件: plugin-cri への `libc` の dev-dependency 追加の承認・plugin 外の書き手が同じ stdin へ実際に書く経路の追加・止まった保持者による枠の枯渇の観測
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）

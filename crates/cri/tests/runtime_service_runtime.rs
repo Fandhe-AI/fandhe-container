@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
+    ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, ReleaseBudget, RuntimeAdapter,
@@ -67,6 +67,10 @@ struct FakeRuntime {
     stop_returns_running: AtomicBool,
     /// stop が返す終了コード（既定 0。137 等の検証用）。
     stop_exit_code: std::sync::atomic::AtomicI32,
+    /// stop が報告する core の終了検知時刻（UNIX ナノ秒。0 は未記録。CRI-5・#4056 の検証用）。
+    stop_exited_at: std::sync::atomic::AtomicI64,
+    /// start が stopped を返すときの終了検知時刻（同上）。
+    start_exited_at: std::sync::atomic::AtomicI64,
     /// start が stopped を返すときの終了コード（既定 0。CRI-2・REPAIR-3 の検証用）。
     start_exit_code: std::sync::atomic::AtomicI32,
     /// true のとき stop が OOM の停止を報告する（CRI-2・CORE-4 の検証用）。
@@ -138,7 +142,8 @@ impl ContainerRuntime for Shared {
                     TerminationReason::OomKilled,
                 ));
             }
-            return Ok(ContainerStatus::stopped(r.id().clone(), code));
+            let at = ExitTime::from_unix_nanos(self.0.start_exited_at.load(Ordering::SeqCst));
+            return Ok(ContainerStatus::stopped_at(r.id().clone(), code, at));
         }
         if self.0.start_returns_created.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::created(r.id().clone(), None));
@@ -175,7 +180,8 @@ impl ContainerRuntime for Shared {
                 TerminationReason::OomKilled,
             ));
         }
-        Ok(ContainerStatus::stopped(r.id().clone(), code))
+        let at = ExitTime::from_unix_nanos(self.0.stop_exited_at.load(Ordering::SeqCst));
+        Ok(ContainerStatus::stopped_at(r.id().clone(), code, at))
     }
     fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
         self.0.calls.lock().unwrap().push(format!(
@@ -2409,4 +2415,85 @@ async fn cri2_repair5_3142_remove_pod_sandbox_total_is_bounded() {
     .await
     .unwrap_err();
     assert_eq!(status.code(), Code::NotFound);
+}
+
+/// 現在の UNIX ナノ秒（finished_at の範囲照合用）。
+fn unix_nanos_now() -> i64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    i64::try_from(d.as_nanos()).expect("nanos")
+}
+
+/// CRI-1・CRI-2・CRI-5・#4056: Stop の `finished_at` は core の ExitTime に揃う（started_at より後の固定値）。
+#[tokio::test]
+async fn cri_5_4056_stop_finished_at_follows_core_exit_time() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = running_container(&h, &sb, "c").await;
+    h.runtime
+        .stop_exited_at
+        .store(4_000_000_000_000_000_000, Ordering::SeqCst);
+    stop_c(&h.service, &id).await.expect("stop");
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.state, S::ContainerExited as i32);
+    assert_eq!(st.finished_at, 4_000_000_000_000_000_000);
+}
+
+/// CRI-5・#4056: ExitTime が started_at より前なら started_at へ丸める（下限）。
+#[tokio::test]
+async fn cri_5_4056_stop_finished_at_is_clamped_to_started_at() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = running_container(&h, &sb, "c").await;
+    h.runtime
+        .stop_exited_at
+        .store(1_000_000_000, Ordering::SeqCst);
+    stop_c(&h.service, &id).await.expect("stop");
+    let st = status(&h.service, &id).await;
+    assert!(st.started_at > 1_000_000_000);
+    assert_eq!(st.finished_at, st.started_at);
+}
+
+/// CRI-5・REPAIR-3・#4056: 終了時刻が未記録なら ExitTime を捏造せず、確定時刻（呼び出し前後の範囲）を使う。
+#[tokio::test]
+async fn cri_5_4056_stop_without_exit_time_uses_confirm_time() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = running_container(&h, &sb, "c").await;
+    let t0 = unix_nanos_now();
+    stop_c(&h.service, &id).await.expect("stop");
+    let t1 = unix_nanos_now();
+    let st = status(&h.service, &id).await;
+    assert!(
+        st.finished_at >= t0 && st.finished_at <= t1,
+        "finished_at {} not in [{t0}, {t1}]",
+        st.finished_at
+    );
+    assert!(st.finished_at >= st.started_at);
+}
+
+/// CRI-5・#4056: Start の応答が Stopped のとき ExitTime を反映し、started_at が 0 の経路では created_at が下限。
+#[tokio::test]
+async fn cri_5_4056_stopped_start_response_uses_exit_time() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    h.runtime
+        .start_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime
+        .start_exited_at
+        .store(4_000_000_000_000_000_000, Ordering::SeqCst);
+    start(&h.service, &id).await.expect_err("start");
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.state, S::ContainerExited as i32);
+    assert_eq!(st.finished_at, 4_000_000_000_000_000_000);
+
+    let id2 = create(&h.service, &sb, "d").await.expect("create");
+    h.runtime.start_exited_at.store(5, Ordering::SeqCst);
+    start(&h.service, &id2).await.expect_err("start");
+    let st2 = status(&h.service, &id2).await;
+    assert_eq!(st2.state, S::ContainerExited as i32);
+    assert_eq!(st2.finished_at, st2.created_at);
 }

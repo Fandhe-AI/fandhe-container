@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 
 use fandhe_container_core::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateStateRequest,
-    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
+    DeleteStateRequest, DeleteStateResponse, ErrorCode, ExitTime, GetStateRequest, HealthStatus,
     ListStateRequest, StateList, StateRecord, StateRevision, StateStore, SupervisionState,
     TraitError, UpdateStateRequest,
 };
@@ -220,7 +220,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 16] = [
+const ORDERED_KEYS: [&str; 17] = [
     "id",
     "status",
     "pid",
@@ -237,6 +237,7 @@ const ORDERED_KEYS: [&str; 16] = [
     "explicitStop",
     "capabilities",
     "rootReadonly",
+    "exitedAtNanos",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -332,6 +333,14 @@ fn assert_schema(m: &BTreeMap<String, V>) {
     nullable_num(m, "supervisorPid", 1, i64::from(u32::MAX));
     nullable_num(m, "exitCode", i64::from(i32::MIN), i64::from(i32::MAX));
     nullable_num(m, "cgroupInstance", 0, i64::MAX);
+    nullable_num(m, "exitedAtNanos", 1, i64::MAX);
+    if matches!(m.get("exitedAtNanos"), Some(V::Num(_))) {
+        assert_eq!(
+            m.get("status"),
+            Some(&V::Str("stopped".into())),
+            "exitedAtNanos must be a number only when stopped"
+        );
+    }
     match m.get("cgroupScope") {
         Some(V::Null | V::Str(_)) => {}
         other => panic!("cgroupScope: expected string or null, got {other:?}"),
@@ -816,6 +825,29 @@ fn sup11_task168_2_numeric_boundaries_round_trip() {
     assert_eq!(m["pid"], V::Num(i64::from(u32::MAX)));
 }
 
+/// 終了検知時刻 `exitedAtNanos` は stopped で記録があるときだけ数値、それ以外は null（SUP-11・CLI-1・#4057）。
+#[test]
+fn sup11_4057_exited_at_nanos_is_reported() {
+    for st in [
+        ContainerStatus::stopped(cid("c"), Some(0)),
+        ContainerStatus::created(cid("c"), None),
+        ContainerStatus::running(cid("c"), nz(9)),
+    ] {
+        let m = render_map(&FakeStore(record(st, 1)), "c");
+        assert_schema(&m);
+        assert_eq!(m["exitedAtNanos"], V::Null);
+    }
+    for n in [1_700_000_000_000_000_005_i64, 1, i64::MAX] {
+        let t = ExitTime::from_unix_nanos(n);
+        let m = render_map(
+            &FakeStore(record(ContainerStatus::stopped_at(cid("c"), Some(0), t), 1)),
+            "c",
+        );
+        assert_schema(&m);
+        assert_eq!(m["exitedAtNanos"], V::Num(n));
+    }
+}
+
 /// 非 ASCII・`"`・`\` を含む bundle でも出力は妥当な UTF-8 の 1 行（末尾 LF 1 個・生の制御バイトなし）で、
 /// パース結果が元のパス文字列へ戻る（SUP-11。Windows ではパス区切りの `\` のエスケープも検証される）。
 #[test]
@@ -955,13 +987,14 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 16] = [
+    const KEYS: [&str; 17] = [
         "auditCoverage",
         "bundle",
         "capabilities",
         "cgroupInstance",
         "cgroupScope",
         "exitCode",
+        "exitedAtNanos",
         "explicitStop",
         "health",
         "id",
@@ -1036,6 +1069,40 @@ mod linux {
         assert_eq!(m["supervisorPid"], V::Null);
         assert_eq!(m["health"], V::Null);
         assert_eq!(m["restartCount"], V::Num(0));
+    }
+
+    /// 実ストアの stopped に記録した終了検知時刻が `exitedAtNanos` に出る。記録が無ければ null（#4057）。
+    #[test]
+    fn sup11_4057_real_store_exited_at_nanos_output() {
+        let t = TmpDir::new("exited");
+        let store = open_default_store(Some(t.path().to_path_buf())).unwrap();
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(cid("c1"), None),
+            t.path().join("bundle"),
+        )
+        .unwrap();
+        store.create(&req).unwrap();
+        let mut st = SupervisedState::attach(store, cid("c1")).unwrap();
+        st.write(
+            ContainerStatus::stopped(cid("c1"), Some(0)),
+            SupervisionState::new(None, None, 0),
+        )
+        .unwrap();
+        let reopened = open_default_store(Some(t.path().to_path_buf())).unwrap();
+        assert_eq!(render(reopened.as_ref(), "c1")["exitedAtNanos"], V::Null);
+
+        let when = 1_700_000_000_000_000_005_i64;
+        let mut st = SupervisedState::attach(reopened, cid("c1")).unwrap();
+        st.write(
+            ContainerStatus::stopped_at(cid("c1"), Some(0), ExitTime::from_unix_nanos(when)),
+            SupervisionState::new(None, None, 0),
+        )
+        .unwrap();
+        let reopened = open_default_store(Some(t.path().to_path_buf())).unwrap();
+        assert_eq!(
+            render(reopened.as_ref(), "c1")["exitedAtNanos"],
+            V::Num(when)
+        );
     }
 
     /// supervisor が書いた running + 監視項目が、ストアを開き直しても出力へ反映される。

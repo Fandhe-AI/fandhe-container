@@ -16,15 +16,15 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest as RtDelete,
-    DeleteResponse as RtDeleteResponse, ErrorCode, KillRequest as RtKill, StartRequest as RtStart,
-    StateRequest as RtState, StopRequest, TraitError,
+    DeleteResponse as RtDeleteResponse, ErrorCode, ExitTime, KillRequest as RtKill,
+    StartRequest as RtStart, StateRequest as RtState, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::RuntimeAdapter;
 use fandhe_container_cri::shim_v2::{
-    CreateTaskRequest, DeleteRequest, FrameHeader, HEADER_LEN, KillRequest, MessageType,
-    ServerConfig, ServiceRegistry, ShutdownRequest, ShutdownSignal, StartRequest, StateRequest,
-    StateResponse, TaskApiVersion, TaskService, TaskStatus, TtrpcRequest, TtrpcResponse,
-    TtrpcServer,
+    CreateTaskRequest, DeleteRequest, DeleteResponse, FrameHeader, HEADER_LEN, KillRequest,
+    MessageType, ServerConfig, ServiceRegistry, ShutdownRequest, ShutdownSignal, StartRequest,
+    StateRequest, StateResponse, TaskApiVersion, TaskService, TaskStatus, Timestamp, TtrpcRequest,
+    TtrpcResponse, TtrpcServer,
 };
 use prost::Message;
 
@@ -34,6 +34,8 @@ struct Fake {
     containers: Mutex<HashMap<String, ContainerStatus>>,
     kills: Mutex<Vec<(String, u8)>>,
     stopped_code: Mutex<Option<i32>>,
+    /// Stopped の応答に載せる core の終了検知時刻（UNIX ナノ秒。None は未記録。CRI-5・#4056）。
+    exited_at: Mutex<Option<i64>>,
 }
 
 struct Shared(Arc<Fake>);
@@ -82,7 +84,10 @@ impl ContainerRuntime for Shared {
             .cloned()
             .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "none"))?;
         match *self.0.stopped_code.lock().unwrap() {
-            Some(c) => Ok(ContainerStatus::stopped(r.id().clone(), Some(c))),
+            Some(c) => {
+                let at = (*self.0.exited_at.lock().unwrap()).and_then(ExitTime::from_unix_nanos);
+                Ok(ContainerStatus::stopped_at(r.id().clone(), Some(c), at))
+            }
             None => Ok(cur),
         }
     }
@@ -171,6 +176,8 @@ fn cri5_873_state_kill_shutdown_over_uds() {
             (r.id.as_str(), r.pid, r.status, r.exit_status),
             ("c1", 777, TaskStatus::Running as i32, 0)
         );
+        // 実行中は終了時刻を持たない（#4056）。
+        assert_eq!(r.exited_at, None);
 
         // Kill(15) は偽ランタイムへ届く。範囲外は 3。
         assert!(
@@ -186,6 +193,8 @@ fn cri5_873_state_kill_shutdown_over_uds() {
         *fake.stopped_code.lock().unwrap() = Some(3);
         let r = state(&mut s, 13, svc);
         assert_eq!((r.status, r.exit_status), (TaskStatus::Stopped as i32, 3));
+        // 終了時刻が未記録なら exited_at は None のまま（値を捏造しない。REPAIR-3・#4056）。
+        assert_eq!(r.exited_at, None);
         let r = call(&mut s, 15, svc, "Kill", kill("c1", 9));
         let st = r.status.unwrap();
         assert_eq!(
@@ -211,8 +220,22 @@ fn cri5_873_state_kill_shutdown_over_uds() {
             exec_id: String::new(),
         }
         .encode_to_vec();
-        assert!(call(&mut s, 19, svc, "Delete", del).status.is_none());
-        let r = call(&mut s, 21, svc, "Shutdown", sd);
+        // core が終了検知時刻を記録した後は、State・Delete の exited_at に具体値で載る（CRI-5・#4056）。
+        *fake.exited_at.lock().unwrap() = Some(1_700_000_000_000_000_005);
+        let at = Some(Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 5,
+        });
+        let r = state(&mut s, 19, svc);
+        assert_eq!(
+            (r.status, r.exit_status, r.exited_at),
+            (TaskStatus::Stopped as i32, 3, at.clone())
+        );
+        let r = call(&mut s, 21, svc, "Delete", del);
+        assert!(r.status.is_none());
+        let d = DeleteResponse::decode(&r.payload[..]).unwrap();
+        assert_eq!((d.exit_status, d.exited_at), (3, at));
+        let r = call(&mut s, 23, svc, "Shutdown", sd);
         assert!(r.status.is_none() && r.payload.is_empty());
         assert!(signal.is_requested());
         // 応答は書き込み済みで、処理中の要求は流れ切る。

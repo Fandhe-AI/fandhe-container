@@ -924,7 +924,7 @@ mod tests {
             );
             assert!(
                 o.stdout
-                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null}\n"),
+                    .ends_with(",\"explicitStop\":\"not_recorded\",\"capabilities\":null,\"rootReadonly\":null,\"exitedAtNanos\":null}\n"),
                 "{:?}",
                 o.stdout
             );

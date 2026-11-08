@@ -77,6 +77,18 @@ struct FakeRuntime {
     stop_oom_killed: AtomicBool,
     /// true のとき start の stopped 応答が OOM の停止を報告する（同上）。
     start_oom_killed: AtomicBool,
+    /// true のとき state は stopped を返す（自然終了の報告の模擬。#4174）。
+    state_returns_stopped: AtomicBool,
+    /// state の stopped 応答の終了コード（#4174）。
+    state_exit_code: std::sync::atomic::AtomicI32,
+    /// state の stopped 応答の終了検知時刻（UNIX ナノ秒。0 は未記録。#4174）。
+    state_exited_at: std::sync::atomic::AtomicI64,
+    /// 設定されていれば state はそのコードで失敗する（#4174）。
+    fail_state: Mutex<Option<ErrorCode>>,
+    /// true の間、state は保留する（観測の期限・競合の検証用。#4174）。
+    hold_state: AtomicBool,
+    /// state の呼び出し回数（#4174）。
+    state_calls: std::sync::atomic::AtomicU64,
     /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
     start_log_paths: Mutex<Vec<Option<String>>>,
     /// start が受けた `StartRequest::stdin()`（CRI-6・#4076 の検証用）。
@@ -201,6 +213,18 @@ impl ContainerRuntime for Shared {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        self.0.state_calls.fetch_add(1, Ordering::SeqCst);
+        while self.0.hold_state.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(c) = *self.0.fail_state.lock().unwrap() {
+            return Err(TraitError::new(c, "state failed"));
+        }
+        if self.0.state_returns_stopped.load(Ordering::SeqCst) {
+            let code = Some(self.0.state_exit_code.load(Ordering::SeqCst));
+            let at = ExitTime::from_unix_nanos(self.0.state_exited_at.load(Ordering::SeqCst));
+            return Ok(ContainerStatus::stopped_at(r.id().clone(), code, at));
+        }
         if self.0.state_creating.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::creating(r.id().clone()));
         }
@@ -2496,4 +2520,259 @@ async fn cri_5_4056_stopped_start_response_uses_exit_time() {
     let st2 = status(&h.service, &id2).await;
     assert_eq!(st2.state, S::ContainerExited as i32);
     assert_eq!(st2.finished_at, st2.created_at);
+}
+
+// ---- #4174（#4173 の E1）: ContainerStatus による自然終了の取り込み ----
+
+fn observe_outcomes(h: &Harness) -> Vec<&'static str> {
+    h.recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.kind().as_str() == "cri.container_exit_observe")
+        .map(|s| code_name(s.code()))
+        .collect()
+}
+
+fn state_calls(h: &Harness) -> u64 {
+    h.runtime.state_calls.load(Ordering::SeqCst)
+}
+
+async fn running_one(h: &Harness) -> String {
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    start(&h.service, &id).await.expect("start");
+    id
+}
+
+async fn status_result(
+    service: &CriRuntimeService,
+    id: &str,
+) -> Result<v1::ContainerStatus, Status> {
+    RuntimeService::container_status(
+        service,
+        Request::new(v1::ContainerStatusRequest {
+            container_id: id.into(),
+            verbose: false,
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().status.expect("status body"))
+}
+
+/// 実行層が自然終了（終了コード 3）を報告したら、StopContainer なしで exited・3・finished_at を返す。
+#[tokio::test]
+async fn cri_1_4174_natural_exit_is_reported_without_stop() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let before = status(&h.service, &id).await;
+    assert_eq!(before.state, S::ContainerRunning as i32);
+    let exited_at = before.started_at + 5_000_000_000;
+    h.runtime.state_exit_code.store(3, Ordering::SeqCst);
+    h.runtime.state_exited_at.store(exited_at, Ordering::SeqCst);
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str(), st.finished_at),
+        (S::ContainerExited as i32, 3, "Error", exited_at)
+    );
+    assert_eq!(count_calls(&h, "stop "), 0);
+    // 1 件目は上の running の照会、2 件目が自然終了の取り込み。
+    assert_eq!(observe_outcomes(&h), vec!["OK", "OK"]);
+}
+
+/// 実行層の読み取りの失敗は記録の値（running）で成功し、失敗が 1 件記録される。
+#[tokio::test]
+async fn repair5_4174_observe_failure_returns_running_and_records_one_failure() {
+    let h = harness();
+    let id = running_one(&h).await;
+    *h.runtime.fail_state.lock().unwrap() = Some(ErrorCode::Unavailable);
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.state, S::ContainerRunning as i32);
+    assert_eq!(observe_outcomes(&h), vec!["UNAVAILABLE"]);
+}
+
+/// 期限切れは running で成功し DEADLINE_EXCEEDED を 1 件記録する。保留が明けると印が外れ、遅れた報告が取り込まれる。
+#[tokio::test]
+async fn repair5_4174_observe_timeout_returns_running_and_records_deadline() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let service = h
+        .service
+        .with_exit_observe_timeout(Duration::from_millis(100));
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let st = status(&service, &id).await;
+    assert_eq!(st.state, S::ContainerRunning as i32);
+    let outcomes: Vec<_> = h
+        .recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.kind().as_str() == "cri.container_exit_observe")
+        .map(|s| code_name(s.code()))
+        .collect();
+    assert_eq!(outcomes, vec!["DEADLINE_EXCEEDED"]);
+    h.runtime.state_exit_code.store(7, Ordering::SeqCst);
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = status(&service, &id).await;
+        if st.state == S::ContainerExited as i32 {
+            assert_eq!(st.exit_code, 7);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mark must be released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// StopContainer で取り込み済みの値は従来どおりで、実行層の state は読まない（回帰）。
+#[tokio::test]
+async fn cri_1_4174_status_after_stop_is_unchanged() {
+    let h = harness();
+    let id = running_one(&h).await;
+    h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
+    let started = status(&h.service, &id).await.started_at;
+    h.runtime
+        .stop_exited_at
+        .store(started + 1_000_000_000, Ordering::SeqCst);
+    stop_c(&h.service, &id).await.expect("stop");
+    let calls_before = state_calls(&h);
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str(), st.finished_at),
+        (
+            S::ContainerExited as i32,
+            137,
+            "Error",
+            started + 1_000_000_000
+        )
+    );
+    assert_eq!(state_calls(&h), calls_before);
+}
+
+/// 同じ終了の報告を 2 回取り込んでも finished_at・終了コードは変わない（取り込みは 1 回だけ）。
+#[tokio::test]
+async fn cri_1_4174_double_observation_keeps_values() {
+    for exited_at_set in [true, false] {
+        let h = harness();
+        let id = running_one(&h).await;
+        let started = status(&h.service, &id).await.started_at;
+        if exited_at_set {
+            h.runtime
+                .state_exited_at
+                .store(started + 2_000_000_000, Ordering::SeqCst);
+        }
+        h.runtime.state_exit_code.store(3, Ordering::SeqCst);
+        h.runtime
+            .state_returns_stopped
+            .store(true, Ordering::SeqCst);
+        let first = status(&h.service, &id).await;
+        let second = status(&h.service, &id).await;
+        assert_eq!(first.state, S::ContainerExited as i32);
+        assert_eq!(
+            (first.finished_at, first.exit_code),
+            (second.finished_at, second.exit_code)
+        );
+        assert!(first.finished_at > 0);
+        assert_eq!(
+            state_calls(&h),
+            2,
+            "started 取得の 1 回と取り込みの 1 回だけ"
+        );
+        stop_c(&h.service, &id).await.expect("idempotent stop");
+        let third = status(&h.service, &id).await;
+        assert_eq!(
+            (third.finished_at, third.exit_code),
+            (first.finished_at, first.exit_code)
+        );
+    }
+}
+
+/// 観測の保留中でも StopContainer は拒否されず、後から届いた自然終了の報告で Stop の値を上書きしない。
+#[tokio::test]
+async fn cri_2_4174_stop_during_observation_wins() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let service = Arc::new(
+        h.service
+            .with_exit_observe_timeout(Duration::from_millis(100)),
+    );
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let s2 = Arc::clone(&service);
+    let id2 = id.clone();
+    let observer = tokio::spawn(async move { status(&s2, &id2).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
+    stop_c(&service, &id)
+        .await
+        .expect("stop must not be rejected");
+    observer.await.expect("observer");
+    h.runtime.state_exit_code.store(3, Ordering::SeqCst);
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let st = status(&service, &id).await;
+    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 137));
+}
+
+/// 観測の保留中の 2 本目の ContainerStatus は実行層を読まず、記録の値を返す。
+#[tokio::test]
+async fn repair5_4174_pending_mark_prevents_duplicate_reads() {
+    let h = harness();
+    let id = running_one(&h).await;
+    let service = Arc::new(
+        h.service
+            .with_exit_observe_timeout(Duration::from_millis(500)),
+    );
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let s2 = Arc::clone(&service);
+    let id2 = id.clone();
+    let first = tokio::spawn(async move { status(&s2, &id2).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = status(&service, &id).await;
+    assert_eq!(second.state, S::ContainerRunning as i32);
+    assert_eq!(h.runtime.state_calls.load(Ordering::SeqCst), 1);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    first.await.expect("first");
+}
+
+/// 観測中の StopContainer と RemoveContainer が通り、保留明けの worker が記録を復活させない。
+#[tokio::test]
+async fn cri_2_4174_remove_during_observation_is_not_resurrected() {
+    let h = harness();
+    let id = running_one(&h).await;
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    let service = Arc::new(
+        h.service
+            .with_exit_observe_timeout(Duration::from_millis(500)),
+    );
+    h.runtime.hold_state.store(true, Ordering::SeqCst);
+    let s2 = Arc::clone(&service);
+    let id2 = id.clone();
+    let observer = tokio::spawn(async move { status_result(&s2, &id2).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop_c(&service, &id).await.expect("stop");
+    remove(&service, &id).await.expect("remove");
+    h.runtime
+        .state_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime.hold_state.store(false, Ordering::SeqCst);
+    // 観測の応答は記録の値か NOT_FOUND のどちらか。復活しないことは後続の照会で確かめる。
+    let _ = observer.await.expect("observer");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let err = status_result(&service, &id).await.expect_err("removed");
+    assert_eq!(err.code(), Code::NotFound);
 }

@@ -324,7 +324,7 @@ impl ExecStreamHandler {
         let observer = Arc::clone(&self.observer);
         let recorder = Arc::clone(&self.recorder);
         let config = self.config.clone();
-        tokio::spawn(async move {
+        permit.spawn_session(async move {
             let started = Instant::now();
             let (outcome, stats) = match on_upgrade.await {
                 Ok(upgraded) => {
@@ -343,8 +343,7 @@ impl ExecStreamHandler {
             let elapsed = started.elapsed();
             record_session(recorder.as_ref(), outcome, &stats, elapsed);
             observer.observe(outcome, elapsed);
-            // 枠は IO の寿命まで保持する（#679 の契約。落とすと同時接続数の上限が破れる）。
-            drop(permit);
+            // 枠は spawn_session がタスクの寿命まで保持する（#679 の契約。#4164）。
         });
         upgrade_response(protocol)
     }

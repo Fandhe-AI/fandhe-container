@@ -231,7 +231,7 @@ helper を supervisor の bin に置く理由は、exec の領域（healthcheck 
 - **tty は本番で fail-closed**: helper に `--tty` が無く、supervisor の `ExecStdio` に pty が無い。`ExecStreamHandler::without_tty` で RPC 時に `INVALID_ARGUMENT`（「exec with tty is not supported」）とし、launcher も二重に断る。受け側（`PtyMaster::from_received` による検証・resize の `TIOCSWINSZ` 転送・pty と tokio の橋渡し）は偽の helper で試験済みで、supervisor 側の結線（後続 issue）が入れば能力フラグ `HelperCapabilities.tty` を true にするだけで有効にできる。`WindowSize` の 0 行・0 列はそのまま渡す
 - **stdio の fd 種別（SUP-6・SEC-1）**: helper は受け取った stdin・stdout・stderr が AF_UNIX の socket か FIFO のときだけ受け、通常ファイル・ディレクトリ・文字デバイス（tty・pty・`/dev/null` を含む）・ブロックデバイスは exec も kind 7 の通知もせず `InvalidArgument`（`require_stdio_kinds`）。ホストの端末 fd をコンテナのコマンドへ渡して境界を越えさせないため
 - 期限: helper の `--timeout-ms` は supervisor の上限 `MAX_EXEC_HOLD_SECS`（1 時間）なので、exec のセッションは最長 1 時間で止まる（kubelet の idle 4 時間より短い。#4116 の確認事項）。`Started` までは 25 秒（cri の `launch_timeout` 30 秒より短い）、stdio の受け渡しは 5 秒、kill 後の回収は 10 秒（`REAP_BUDGET`）で、回収できなければ保持一覧（上限 8）に入れる
-- 停止: `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）。検知の方式は下の「要求元の異常終了の検知」で選定済み（実装は #4166、実機の照合は #4167。実装までは残余のまま）
+- 停止: ドレインの期限（シグナルから 5 秒）で `stop_streaming_on` の `on_stop` が `shutdown_all` を呼び、追跡中の helper を kill する（「停止時のセッションの扱い」）。plugin-cri が SIGKILL された場合は helper が期限まで残る（PDEATHSIG を使わない設計の残余）。検知の方式は下の「要求元の異常終了の検知」で選定済み（実装は #4166、実機の照合は #4167。実装までは残余のまま）
 - helper の fd 1・2 は `/dev/null` で、診断 JSON 行は捨てる（結果は `Result` frame の固定語彙で返る。REPAIR-4 の観測は後続）
 - 終了コード: `Exited(n)`→n、`Signaled(s)`→128+s、`NotStarted`→子の終了状態、`Failed(code)`→コード別の固定英文の `CriError`
 
@@ -430,7 +430,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 - NODE か POD かは、cri が RPC の時点で sandbox の記録（保存済みの `config` の `namespace_options.network`）から決め、発行時の要求に保存して dialer へ渡す。#3755 で `PortForwardDialer` の引数に対象の型（例: `PortForwardTarget { pod_sandbox_id, network: Node | Pod }`）を足す。URL やヘッダから組み立て直さず、plugin-cri に記録の解析を複製しない（REPAIR-1）
 - hostNetwork の Pod の port-forward はホストの loopback 上の任意のサービスへ届く。これは hostNetwork の性質で、認可は単回トークンの URL と kubelet / apiserver 側が担う
 - 実装（#3755）: `runtime_service::port_forward_network` が `namespace_options.network` がちょうど `NODE` のときだけ `Node` とし、未指定・POD・CONTAINER・TARGET・未知の値は `Pod`（fail-closed。`wants_pod_network` は CONTAINER・TARGET を「POD でない」と扱うので流用しない）。`port_forward_impl` の順序は 結線 → 入力検証 → sandbox の照合（`NOT_FOUND`）→ POD の拒否（`UNIMPLEMENTED "port-forward for pod network is not implemented"`。トークン枠を消費しない）→ 発行。dialer は port 0・期限 0 を `INVALID_ARGUMENT`、期限切れを `TIMEOUT`、その他を `UNAVAILABLE` の固定文で返し、成功後に `peer_addr` が loopback であることを確かめる。`PortForwardDialer::supports_pod_network`（既定は偽）を真にした dialer を注入すると結線情報の POD 対応が立ち、RPC 時の拒否が外れる（#3766 が使う）
-- 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時は Upgrade 後のセッションと blocking の dial（最長 10 秒）をランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
+- 残余: URL 発行後に sandbox が消えても dialer は記録を照合しない（トークン TTL 60 秒とセッションの idle の期限で有界）。停止時の Upgrade 後のセッションはドレインの期限の後に強制クローズする（「停止時のセッションの扱い」）。実行中の blocking の dial（最長 10 秒）は abort できず、ランタイムの `shutdown_timeout`（1 秒）が打ち切り、待ちは増えない
 
 **POD（#3766）**: #2877（pod の namespace 保持役）が入るまで `UNIMPLEMENTED` とする。URL の発行前に断るのが望ましく、#3753 の結線情報で扱う。dialer 側でも `CriError::unimplemented` を返す（多層防御）。候補は、単一スレッドの helper が保持役の fd で pod の userns・netns へ入って connect し接続済みの fd を SCM_RIGHTS で返す案と、保持役に connect を頼む案（保持役の攻撃面が広がるので劣後）で、最終判断は #3766 に置く。
 
@@ -454,7 +454,7 @@ A1 の注意: 渡した pty master の複製を plugin-cri が読むと捕捉の
 | follow のポーリング / 上限 | 200 ms / 24 時間 |
 | attach の follow スレッドの書き込みの刻み（取り消しの確認） | 200 ms |
 | PortForward の dial / 対の揃い / 書き込みの stall | 10 秒 / 30 秒 / 30 秒 |
-| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じ、待ちを足さない。受け付け済みの接続はランタイム停止の 1 秒で打ち切る。全体の上限 13.7 秒は不変（#3754） |
+| `StreamingServer` の SIGTERM での停止 | 受信の検知（100 ms 周期）で待ち受けを閉じる（待ちなし。#3754）。受け付け済みのセッションはシグナルから 5 秒（`STREAMING_DRAIN_WAIT`）ドレインし、期限で exec を止めて 1 秒（`STREAMING_CLOSE_WAIT`）待ち、残りを強制クローズする。gRPC の猶予 10 秒以内に収まり、全体の上限 13.7 秒は不変（#4164。暫定値で #4116 の対象） |
 | 要求元の切断の検知（helper の serve の刻み）/ 検知から helper の終了まで | 20 ms / 合否値 2 秒（通知処理のない通常ケース。遅延・回収失敗ケースは検知最大 5 秒・回収込み 約 15 秒。期限と `hold_grace` は不変）。#4165。未実装（#4166） |
 
 ### 実装単位と兄弟 issue の対応
@@ -520,7 +520,46 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - dispatcher は Attach（Linux は対話可能な完全版、非 Linux は `AttachHandler::read_only()`。`ProductionAttach` で宣言する。#3763・#4078）・PortForward（NODE の `NodeLoopbackDialer`。#3755）・Exec（Linux で `exec_stream_launcher` があるとき。`without_tty`・`absolute_command_only`。#3761）を結線して注入する（`production_stream_dispatcher(attach: ProductionAttach, exec, recorder)`。`PortForwardHandler::new` の失敗を `INTERNAL` に写すため `Result`）。非 Linux の Exec は未結線で「not wired」の `UNIMPLEMENTED`。兄弟 issue は `with_*` を足す（`wiring` は bind 時に取られるため bind より前）
 - 接続の観測（#4163・CRI-6・REPAIR-4）: `bind_production_streaming` は `ConnectionObserver` を受け取り `bind_with_observer` へ渡す。本番は `streaming::connection_observer::TelemetryConnectionObserver`（共有 `OpRecorder` と `stderr_sink()`。作れなければ起動しない）。件数は共有記録器の `cri.streaming.connection`（受理の成功・HTTP 失敗）・`cri.streaming.connection_deadline`・`cri.streaming.connection_rejected`・`cri.streaming.accept_failed` で、既存の 60 秒周期の `op_stats` 行に出る（正の件数）。異常の構造化行 `{"event":"cri_streaming_connection","op":…,"outcome":"error","reason":…,"count":…}` の reason は固定語彙 `max_connections`・`deadline_exceeded`・`accept_failed` の 3 種で、理由ごとの累計が 2 のべき乗に達した時だけ出す（接続の洪水で、監査行と共用の stderr sink を埋めないため。HTTP 失敗は件数のみ）。`observe` は I/O をせず `try_send` のみでブロックしない。トークン・コンテナ ID・入出力・パス・相手アドレスは出さない（イベント型が文字列を持たない）
 - bind の失敗は fail-closed（`error: UNAVAILABLE: failed to start the streaming server`、設定検証の失敗は `INTERNAL`）。縮退すると「未結線」と区別できないため。UDS より先に判定するので socket を残さない
-- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じ、待ちを足さない。受け付け済みで Upgrade しない接続は既存の `RUNTIME_SHUTDOWN_WAIT`（1 秒）が打ち切り、`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
+- 停止は SIGTERM・SIGINT の検知と同時に TCP の待ち受けを閉じる（shutdown future は待たない）。その後のセッションの扱いは次節。`SHUTDOWN_TOTAL_BOUND`（13.7 秒）は変わらない
+
+## 停止時のセッションの扱い（#4164・CRI-6・REPAIR-5）
+
+### 判断材料
+
+- kubelet の期限はストリーム作成 30 秒・idle 4 時間（`SessionLimits::default()`）で、停止の予算よりずっと長い。「自然に終わるまで待つ」は採れない
+- 本体の停止の上限は `SHUTDOWN_TOTAL_BOUND` 13.7 秒（検知 100 ms + gRPC の猶予 10 秒 + 強制回収 2 秒 + 書き出し 3 × 200 ms + ランタイム 1 秒）で、`shutdown.rs` の試験が固定している。本件はこの値を変えない
+- 変更前は、シグナルで exec の helper を即座に kill し（停止間際に終わるはずだった応答も欠ける）、Upgrade 後の Attach・PortForward のセッションは追跡も期限も記録も無いまま、gRPC の猶予の後にランタイムの停止が切っていた
+- 受け入れた各セッションのタスクは handler が捨てハンドルで `tokio::spawn` しており、停止の経路だけでは強制クローズも件数の把握もできなかった。このため cri に `ConnectionPermit::spawn_session`（タスクの寿命 = 枠の寿命を型で結ぶ）と `StreamingSessions`（件数・`close_all`・`wait_idle_until`）を足し、3 つの handler の起動をそれに置き換えた（挙動は変えない）。Upgrade 前の接続のタスクも同じ追跡簿に登録する
+
+### 方針
+
+期限つきでドレインし、期限を過ぎたら exec を止めてから強制的に閉じる。基準はシグナルの受信時刻 T の絶対時刻で、シグナル受信時に shutdown future が別タスクとして起動し、`serve_with_audit` の戻り（RPC が残ると gRPC の猶予 10 秒を使う）を待たずに期限どおり進む。`StreamingStop::finish` はその結果を受け取る。shutdown future 自体は待ちを持たない（TCP の待ち受けを閉じる契約〔#3226〕を遅らせないため）。
+
+| 段 | 時刻 | 内容 |
+| -- | ---- | ---- |
+| 1 | T | 待ち受けを閉じ、開いていた件数 `open_at_stop` を記録 |
+| 2 | T..T+5 秒（`STREAMING_DRAIN_WAIT`） | セッションが自分で終わるのを待つ。全部閉じたら早く抜ける |
+| 3 | T+5 秒 | `on_stop`（`shutdown_all`。helper を kill し、以後の launch を拒否）。exec は終了を観測して Status を送り閉じる |
+| 4 | 〜T+6 秒（`STREAMING_CLOSE_WAIT`） | exec が閉じるのを待つ。全部閉じたら早く抜ける |
+| 5 | T+6 秒 | 残りを abort する（強制クローズ）。破棄で枠が返るのを最大 100 ms 確かめる |
+| 6 | 最後 | 構造化ログを 1 行出す（`event=cri_streaming_stop`。`open_at_stop`・`drained`・`exceeded`・`forced`・`remaining`・`elapsed_ms`。期限を超えたか残ったときは `warn`） |
+
+- 順序の理由: exec のプロセスを先に止めてから接続を閉じる。クライアントに「切れた」と見えた後もコマンドが動き続ける窓をなくし、終了コード（Status）をできるだけ届けるため。強制クローズでも `ExecSession` の drop が helper を kill する（二重の経路）
+- 上限の不変性: 5 秒 + 1 秒 = 6 秒 ≤ `PLUGIN_SHUTDOWN_GRACE` 10 秒。期限は T からの絶対時刻なので、serve が期限より後に戻ったときは待たずに段 3 へ進み、停止全体は serve の戻りと 6 秒 + 100 ms の大きい方で終わる。13.7 秒は変わらない（`repair5_4164_stop_waits_fit_within_grpc_grace_and_total_bound` で固定）
+- シグナルが記録されないまま `finish` したとき（serve が先にエラーで戻った）、`finish` を呼ばず drop したときも、待たずに `on_stop` と強制クローズを行う
+- 暫定値: 5 秒は cri の `SessionLimits` の `drain_timeout`（終了後の流し切りの予算）と同じ、1 秒は `RUNTIME_SHUTDOWN_WAIT` と同じ。どちらも暫定値で、オーナー確認は #4116 の対象。承認は得ていない
+
+### 残余
+
+- シグナルの受信からドレインの期限までは、受け付け済みで launch 前の exec が launch できる。期限の `shutdown_all` で止まり、停止直前に始めた exec と同じ扱いになる
+- abort されたセッションは `record_session` や observer の記録を通らない。件数は停止の 1 行に出る
+- plugin-cri が SIGKILL された場合は、従来どおり helper が期限まで残る（#4112）
+- 実行中の blocking の dial は abort できず、ランタイムの `shutdown_timeout` が打ち切る
+
+### 試験
+
+- cri `tests/streaming_server.rs`: 3 セッションのうち自然に終わる 1 件の応答が欠けず、残り 2 件が `close_all` で閉じる（`cri6_repair5_4164_drain_keeps_natural_response_and_force_closes_rest`）、強制クローズ後の接続の即時 abort、Upgrade 前の接続の強制クローズ
+- plugin-cri `streaming.rs`: 3 件を開いたままの停止が期限内に終わり全件閉じること、`on_stop` が 1 回で強制クローズより前に呼ばれること、期限内に終わった応答が欠けないこと、`finish` を呼ばなくても期限どおりに `on_stop` と強制クローズが行われること、期限後の `finish` が待たないこと、ログ行の形
 
 ## 依存
 

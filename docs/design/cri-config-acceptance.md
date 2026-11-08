@@ -483,7 +483,7 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 
 互換（読み替えの要否）:
 
-- cri の在庫（`InMemoryImageStore`）は永続化されておらず、永続化済みの記録は無いので読み替え不要。永続在庫への配線（#2945）では、先頭が top-level digest である並びを保つこと
+- cri の在庫は #4176 で永続化した（`PersistentImageStore`。top-level / 補助を分けて保存し `ImageRecord::from_parts` で読み戻すので、開き直しても先頭が top-level digest の並びを保つ）。それ以前は永続化済みの記録が無いので読み替え不要
 - コンテナの記録は `image_ref` を create 時のスナップショットで持つため、変更前に作ったコンテナはプラットフォーム digest のまま返す（読み替えない。「タグはスナップショット」の差と同じ）
 - oci の在庫（`@image-inventory.json`）は `repo_digests` の文字列を持たず、キーはプラットフォーム manifest digest のまま。影響なし
 
@@ -525,7 +525,7 @@ CreateContainer の時点で `ImageRootfsSource` が在庫（`ImageStore`）で�
 
 互換:
 
-- `InMemoryImageStore` は永続化されておらず読み替え不要。永続在庫（#2945）では `top_level_digests()`・`auxiliary_digests()` を分けて保存し、`ImageRecord::from_parts` で読み戻すこと。`repo_digests()` を `ImageRecord::new` へ渡し直すと、2 件目以降の top-level が補助として扱われる
+- cri の在庫は #4176 で永続化した。`top_level_digests()`・`auxiliary_digests()` を分けて保存し、`ImageRecord::from_parts` で読み戻す（`ImageStore` への配線前は永続化済みの記録が無く読み替え不要）。`repo_digests()` を `ImageRecord::new` へ渡し直すと、2 件目以降の top-level が補助として扱われる
 - コンテナの記録は create 時のスナップショットなので読み替えない
 
 残る差（意図的）: 補助 digest の併記による件数の差、タグのスナップショット（上記）。

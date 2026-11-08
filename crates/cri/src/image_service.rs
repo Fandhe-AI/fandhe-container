@@ -14,8 +14,9 @@
 //! - `ImageStatus` の `verbose` 拡張情報（`info`）は未実装で常に空。OCI image config 由来の情報は
 //!   TASK-183（OCI-7）で追加する。取り込み時の digest 検証（OCI-1）は PullImage の責務で、
 //!   本 RPC は読み取りのみ
-//! - [`InMemoryImageStore`] はプロセス内メモリのスタブ。永続キャッシュと展開後サイズの算出は
-//!   TASK-183（OCI-7）で置き換える
+//! - [`InMemoryImageStore`] はプロセス内メモリの実装で、試験・注入用。本番の永続実装は plugin-cri の
+//!   `PersistentImageStore`（oci の ImageStore の root 直下へ記録を保存する。形式は [`encode_image_records`]。#4176）。
+//!   展開後サイズの算出は TASK-183（OCI-7）
 //! - 失敗は `CriError`（ERR-3。`crate::error`）で組み立て、トレイトの境界で `Status` へ変換する（TASK-97.2・#450）
 //! - リスナー・メッセージ長上限・UDS の権限と peer credential
 //!   検証（PLUG-12）は plugin-cri（TASK-108）の責務
@@ -38,6 +39,9 @@ use crate::image_pull::{
 };
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{self, image_service_server::ImageService};
+
+mod persist;
+pub use persist::{MAX_IMAGE_RECORDS_FILE_BYTES, decode_image_records, encode_image_records};
 
 /// ストアが保持するイメージ数の上限（無制限確保の防止）。
 pub const MAX_IMAGES: usize = 4096;
@@ -72,6 +76,10 @@ pub enum ImageStoreError {
     Poisoned,
     /// このストアは書き込みに対応していない（`upsert` 未実装の実装）。
     ReadOnly,
+    /// 永続された在庫記録が壊れている・検証に反する（空の在庫として扱わない。#4176）。
+    Corrupt,
+    /// 永続された在庫記録の読み書きに失敗した（#4176）。
+    Io,
 }
 
 impl fmt::Display for ImageStoreError {
@@ -85,6 +93,8 @@ impl fmt::Display for ImageStoreError {
             ImageStoreError::ConflictingUser => "image uid and username are mutually exclusive",
             ImageStoreError::Poisoned => "image store is unavailable",
             ImageStoreError::ReadOnly => "image store is read-only",
+            ImageStoreError::Corrupt => "image store data is corrupt",
+            ImageStoreError::Io => "image store i/o failed",
         })
     }
 }
@@ -301,7 +311,7 @@ pub trait ImageStore: Send + Sync {
     }
 }
 
-/// プロセス内メモリのスタブ実装（REPAIR-3。永続キャッシュは TASK-61.3・TASK-183 で置換）。
+/// プロセス内メモリの実装（試験・注入用。本番の永続実装は plugin-cri の `PersistentImageStore`。#4176）。
 #[derive(Debug, Default)]
 pub struct InMemoryImageStore {
     images: Mutex<BTreeMap<String, ImageRecord>>,

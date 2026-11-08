@@ -107,6 +107,12 @@ impl Generation {
 /// core の delete を始めてよい内側期限の下限。これ未満なら delete を始めず `DEADLINE_EXCEEDED` にする（record は残る）。
 pub(crate) const MIN_CLEANUP: Duration = Duration::from_millis(1);
 
+/// 段の残り `left` に収まる後始末の期限（`default` を上限に残りの 2/3）。`remove` 段の開始時と、実行層が世代確認（状態ロックの待ちを含む）の
+/// 後に残りから決め直すときの両方が使う（REPAIR-5・#4152）。
+pub(crate) fn cleanup_within_left(default: Duration, left: Duration) -> Duration {
+    default.min(left.saturating_mul(2) / 3)
+}
+
 /// 段ごとの予算。合計が [`SHIM_DELETE_DEADLINE`] 以下であること（試験で照合する）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReclaimBudget {
@@ -135,8 +141,7 @@ impl ReclaimBudget {
     /// [`MIN_CLEANUP`] に満たない（返り値がそれ未満）ときは、呼び出し側が core の delete を始めない（始めると外側が先に切れ、
     /// record が drop されて cgroup・ログが `AlreadyReclaimed` で回収できなくなる。REPAIR-5・CRI-5）。
     pub(crate) fn cleanup_within(&self, limit: Duration) -> Duration {
-        let scaled = limit.saturating_mul(2) / 3;
-        self.cleanup().min(scaled)
+        cleanup_within_left(self.cleanup(), limit)
     }
 
     /// 段の予算の合計（試験が [`SHIM_DELETE_DEADLINE`] に収まることを照合する）。
@@ -149,6 +154,8 @@ impl ReclaimBudget {
 /// 回収が使う実行層の窓口（stop と delete だけ）。本番は [`GuardedCore`]、試験は偽の実装。
 ///
 /// 実装は副作用の前に、記録が `generation` と一致することを確かめる（不一致は `FailedPrecondition`）。
+/// `delete` の `stage_end` は remove 段の絶対期限で、実装は世代確認の後の残りから後始末の予算と「始めてよいか」を決め直す
+/// （足りなければ記録に触れず `Timeout`。REPAIR-5）。
 /// `stop` は停止後の記録の世代を添えて返し、続く `delete` がそれを使う（停止で revision が進むため）。停止の後に記録が
 /// 消えていたときは世代が `None` で、取得済みの終了状態だけを返す（削除は不要。CRI-5）。
 pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
@@ -161,7 +168,7 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
-        cleanup: Duration,
+        stage_end: Instant,
     ) -> Result<DeleteResponse, TraitError>;
 }
 
@@ -178,6 +185,7 @@ pub(crate) struct GuardedCore {
     default_cleanup: Duration,
     store: Arc<dyn StateStore>,
     pin: Arc<Mutex<Option<Generation>>>,
+    delete_floor: Arc<Mutex<Option<Instant>>>,
 }
 
 impl GuardedCore {
@@ -191,9 +199,11 @@ impl GuardedCore {
         + 'static,
     ) -> Self {
         let pin = Arc::new(Mutex::new(None));
+        let delete_floor = Arc::new(Mutex::new(None));
         let pinned: Arc<dyn StateStore> = Arc::new(PinnedStore {
             inner: Arc::clone(&store),
             pin: Arc::clone(&pin),
+            delete_floor: Arc::clone(&delete_floor),
         });
         Self {
             build: Box::new(build),
@@ -201,6 +211,7 @@ impl GuardedCore {
             default_cleanup,
             store,
             pin,
+            delete_floor,
         }
     }
 
@@ -232,6 +243,8 @@ fn changed() -> TraitError {
 struct PinnedStore {
     inner: Arc<dyn StateStore>,
     pin: Arc<Mutex<Option<Generation>>>,
+    /// 記録の削除を始めてよい最後の時刻（core の後始末の期限の途中）。過ぎていれば削除せず `Timeout`（記録を残す。REPAIR-5）。
+    delete_floor: Arc<Mutex<Option<Instant>>>,
 }
 
 impl StateStore for PinnedStore {
@@ -260,6 +273,15 @@ impl StateStore for PinnedStore {
     }
 
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+        // 状態の読み取りの待ちで期限の半分を使い切った後に記録を消すと、後始末が全て飛んで外側の期限が先に切れ、
+        // 次回は `AlreadyReclaimed` で残りを回収できない。記録を残して失敗にする（REPAIR-5・REPAIR-4・#4152）。
+        let floor = self.delete_floor.lock().ok().and_then(|g| *g);
+        if floor.is_some_and(|f| Instant::now() > f) {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "shim delete deadline exhausted before the record was removed",
+            ));
+        }
         self.inner.delete(req)
     }
 
@@ -294,10 +316,23 @@ impl ReclaimRuntime for GuardedCore {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
-        cleanup: Duration,
+        stage_end: Instant,
     ) -> Result<DeleteResponse, TraitError> {
+        // 世代確認は状態ロックを待ちうるので、後始末の予算は確認の後の残りから決め直す（開始前に計算した値を使うと、待った分だけ
+        // 段の期限を超える。REPAIR-5・#4152）。足りなければ記録に触れずに失敗にする。
         self.current(req.id(), generation)?;
+        let left = stage_end.saturating_duration_since(Instant::now());
+        let cleanup = cleanup_within_left(self.default_cleanup, left);
+        if cleanup < MIN_CLEANUP {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "shim delete deadline exhausted before remove",
+            ));
+        }
         self.set_pin(generation);
+        if let Ok(mut f) = self.delete_floor.lock() {
+            *f = Some(Instant::now() + cleanup / 2);
+        }
         let core = (self.build)(Arc::clone(&self.pinned), cleanup);
         fandhe_container_core::traits::ContainerRuntime::delete(&core, req)
     }
@@ -404,8 +439,9 @@ pub(crate) fn reclaim_recorded(
             "shim delete deadline exhausted before remove".to_string(),
         ));
     }
+    let stage_end = Instant::now() + limit;
     run_stage(limit, "remove", move || {
-        match rt.delete(&DeleteRequest::new(id), &generation, inner) {
+        match rt.delete(&DeleteRequest::new(id), &generation, stage_end) {
             Ok(_) => Ok(()),
             // 並行する回収が先に消した。目的は達している（冪等）。
             Err(e) if e.code() == ErrorCode::NotFound => Ok(()),

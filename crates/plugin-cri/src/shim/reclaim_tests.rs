@@ -110,7 +110,7 @@ impl ReclaimRuntime for Fake {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
-        _cleanup: Duration,
+        _stage_end: std::time::Instant,
     ) -> Result<DeleteResponse, TraitError> {
         self.log("delete", req.id());
         self.gate(self.inject_delete)?;
@@ -542,7 +542,7 @@ fn sec1_4152_stale_generation_does_not_touch_recreated_container() {
         .delete(
             &DeleteRequest::new(cid("abc")),
             &stale,
-            Duration::from_secs(1),
+            std::time::Instant::now() + Duration::from_secs(1),
         )
         .expect_err("stale delete");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
@@ -575,7 +575,7 @@ fn sec1_4152_stale_revision_rejected_for_same_bundle_recreation() {
         .delete(
             &DeleteRequest::new(cid("abc")),
             &stale,
-            Duration::from_secs(1),
+            std::time::Instant::now() + Duration::from_secs(1),
         )
         .expect_err("stale delete");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
@@ -643,4 +643,139 @@ fn repair5_4152_cleanup_within_fits_remaining_limit() {
         }
     }
     assert!(b.cleanup_within(Duration::from_millis(900)) <= Duration::from_millis(600));
+}
+
+/// `get` が遅い `StateStore`（状態ロックの待ちの偽物。`get` の都度 `delay` 眠る）。
+struct SlowGet {
+    inner: Arc<dyn StateStore>,
+    delay: Duration,
+}
+
+impl StateStore for SlowGet {
+    fn create(
+        &self,
+        r: &fandhe_container_core::traits::CreateStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        self.inner.create(r)
+    }
+    fn update(
+        &self,
+        r: &UpdateStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        self.inner.update(r)
+    }
+    fn get(
+        &self,
+        r: &GetStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateRecord, TraitError> {
+        std::thread::sleep(self.delay);
+        self.inner.get(r)
+    }
+    fn list(
+        &self,
+        r: &fandhe_container_core::traits::ListStateRequest,
+    ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+        self.inner.list(r)
+    }
+    fn delete(
+        &self,
+        r: &DeleteStateRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError> {
+        self.inner.delete(r)
+    }
+    fn host_state_root(&self) -> Option<&Path> {
+        self.inner.host_state_root()
+    }
+}
+
+/// 照合済みの記録と、`get` が `delay` かかる store を用意する。
+fn slow_setup(
+    name: &str,
+    delay: Duration,
+) -> (
+    test_root::TestRoot,
+    Arc<dyn StateStore>,
+    Arc<dyn StateStore>,
+    Generation,
+) {
+    let guard = test_root::test_root("shim", name);
+    let base = guard.join("state");
+    let bundle = make_bundle(&guard, "abc");
+    seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let (_, store, matched) = delete_preflight_store_in(&inv, &base).unwrap();
+    let DeleteRecordMatch::Recorded(rec) = matched else {
+        panic!("expected recorded");
+    };
+    let fast: Arc<dyn StateStore> = Arc::new(store.expect("store"));
+    let slow: Arc<dyn StateStore> = Arc::new(SlowGet {
+        inner: Arc::clone(&fast),
+        delay,
+    });
+    (guard, fast, slow, Generation::of(&rec))
+}
+
+/// REPAIR-5・REPAIR-4・#4152: 世代確認が段の期限を使い切ったら、core を作らず記録に触れずに `Timeout`（記録を消してから止まらない）。
+#[test]
+fn repair5_4152_slow_generation_check_exhausting_stage_keeps_record() {
+    let (_g, fast, slow, generation) = slow_setup("r-slow1", Duration::from_millis(400));
+    let rt = GuardedCore::new(slow, Duration::from_secs(1), |_, _| {
+        unreachable!("core must not be built after the stage is exhausted")
+    });
+    let t0 = std::time::Instant::now();
+    let e = rt
+        .delete(
+            &DeleteRequest::new(cid("abc")),
+            &generation,
+            t0 + Duration::from_millis(300),
+        )
+        .expect_err("exhausted");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert!(fast.get(&GetStateRequest::new(cid("abc"))).is_ok());
+}
+
+/// REPAIR-5・#4152: 世代確認が段の期限の一部を使ったら、core へ渡す後始末の期限は事前の値ではなく残りの 2/3 以下に決め直される。
+#[test]
+fn repair5_4152_slow_generation_check_shrinks_cleanup_budget() {
+    let (_g, _fast, slow, generation) = slow_setup("r-slow2", Duration::from_millis(150));
+    let seen = Arc::new(Mutex::new(None));
+    let s2 = Arc::clone(&seen);
+    let rt = GuardedCore::new(slow, Duration::from_secs(1), move |p, c| {
+        *s2.lock().unwrap() = Some(c);
+        core_runtime_for(p)
+    });
+    let t0 = std::time::Instant::now();
+    let _ = rt.delete(
+        &DeleteRequest::new(cid("abc")),
+        &generation,
+        t0 + Duration::from_millis(400),
+    );
+    // 残りは 400 - 150 = 250ms 以下。2/3 は 167ms 以下（既定の 1 秒ではない）。
+    let c = seen.lock().unwrap().expect("core built");
+    assert!(
+        c <= Duration::from_millis(167) && c >= Duration::from_millis(50),
+        "{c:?}"
+    );
+}
+
+/// REPAIR-5・REPAIR-4・#4152: core の中の状態の読み取りが後始末の期限の半分を使い切ったら、記録を削除せず `Timeout`（記録は残る）。
+#[test]
+fn repair5_4152_slow_read_inside_core_keeps_record_instead_of_deleting() {
+    let (_g, fast, slow, generation) = slow_setup("r-slow3", Duration::from_millis(200));
+    let rt = GuardedCore::new(slow, Duration::from_millis(300), |p, c| {
+        core_runtime_for(p)
+            .with_delete_deadline(c)
+            .with_container_log_lock_wait(c)
+            .with_cleanup_warning_sink(Arc::new(|_| {}))
+    });
+    // 世代確認で 200ms、残り 800ms → 後始末 300ms・削除の締め切りは 150ms。core の `get` の 200ms で過ぎる。
+    let e = rt
+        .delete(
+            &DeleteRequest::new(cid("abc")),
+            &generation,
+            std::time::Instant::now() + Duration::from_millis(1000),
+        )
+        .expect_err("floor passed");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    assert!(fast.get(&GetStateRequest::new(cid("abc"))).is_ok());
 }

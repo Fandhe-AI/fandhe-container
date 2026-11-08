@@ -51,6 +51,9 @@ pub(crate) struct Generation {
     /// cgroup 配置の instance（create で割り当てた revision。ストア全体で再利用されず、同一コンテナの更新では変わらない）。
     /// 配置が未記録（`None`）の世代は instance で固定できない（revision の下限と bundle だけで見る。残余）。
     instance: Option<StateRevision>,
+    /// 照合時の状態と PID。instance で固定できない世代の再作成を、状態の後退・PID の変化として検出する。
+    state: ContainerState,
+    pid: Option<u32>,
 }
 
 impl Generation {
@@ -59,7 +62,37 @@ impl Generation {
             bundle: rec.bundle().to_path_buf(),
             revision: rec.revision(),
             instance: rec.cgroup().map(|c| c.instance()),
+            state: rec.status().state(),
+            pid: rec.status().pid().map(Into::into),
         }
+    }
+
+    fn rank(state: ContainerState) -> u8 {
+        match state {
+            ContainerState::Created => 0,
+            ContainerState::Running => 1,
+            _ => 2,
+        }
+    }
+
+    /// `rec` が固定した世代の記録として受け入れられるか（`same_container` に加え、revision の下限と、instance 未記録の世代の
+    /// 再作成の拒否）。instance が無い世代は、照合時が Created（PID なし）・Stopped なら revision の完全一致、稼働中なら
+    /// 状態の後退（再作成後の Created）と PID の変化（再作成後の別プロセス）を拒む（SEC-1・CORE-1・#4152）。
+    pub(crate) fn accepts(&self, rec: &StateRecord) -> bool {
+        if !self.same_container(rec) || rec.revision() < self.revision {
+            return false;
+        }
+        if self.instance.is_some() {
+            return true;
+        }
+        let live = self.pid.is_some() && Self::rank(self.state) < 2;
+        if !live {
+            return rec.revision() == self.revision;
+        }
+        let st = rec.status();
+        Self::rank(st.state()) >= Self::rank(self.state)
+            && (st.state() == ContainerState::Stopped
+                || st.pid().map(Into::<u32>::into) == self.pid)
     }
 
     /// `rec` が同じコンテナの記録か（bundle が同じで、固定の instance があれば一致する。revision は見ない）。
@@ -94,6 +127,13 @@ impl ReclaimBudget {
         self.remove.saturating_mul(2) / 3
     }
 
+    /// 実際の残り `limit`（remove 段の待ち）に収まる内側の後始末期限。通常は `cleanup()`、残りが小さければ残りの 2/3
+    /// （内側が `Kept` の応答を組み立てる余裕を残す）。0 になる場合も外側より先に切れる最小値（1ms 以上）にする。
+    pub(crate) fn cleanup_within(&self, limit: Duration) -> Duration {
+        let scaled = limit.saturating_mul(2) / 3;
+        self.cleanup().min(scaled).max(Duration::from_millis(1))
+    }
+
     /// 段の予算の合計（試験が [`SHIM_DELETE_DEADLINE`] に収まることを照合する）。
     #[cfg(test)]
     pub(crate) fn total(&self) -> Duration {
@@ -116,6 +156,7 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
+        cleanup: Duration,
     ) -> Result<DeleteResponse, TraitError>;
 }
 
@@ -125,7 +166,11 @@ pub(crate) trait ReclaimRuntime: Send + Sync + 'static {
 /// core の stop・delete は読んだ記録の revision を基準に更新・削除するため、再作成された別 bundle のコンテナには届かない
 /// （revision は再利用されない。SEC-1・CORE-1・#4152）。revision の変化（supervisor の `Stopped` 記録など同一コンテナの更新）は許す。
 pub(crate) struct GuardedCore {
-    core: crate::adapter::CoreLifecycleRuntime,
+    build: Box<
+        dyn Fn(Arc<dyn StateStore>, Duration) -> crate::adapter::CoreLifecycleRuntime + Send + Sync,
+    >,
+    pinned: Arc<dyn StateStore>,
+    default_cleanup: Duration,
     store: Arc<dyn StateStore>,
     pin: Arc<Mutex<Option<Generation>>>,
 }
@@ -134,7 +179,11 @@ impl GuardedCore {
     /// `build` へ固定つきの `StateStore` を渡して core を作る（core は渡された store だけを読む）。
     pub(crate) fn new(
         store: Arc<dyn StateStore>,
-        build: impl FnOnce(Arc<dyn StateStore>) -> crate::adapter::CoreLifecycleRuntime,
+        default_cleanup: Duration,
+        build: impl Fn(Arc<dyn StateStore>, Duration) -> crate::adapter::CoreLifecycleRuntime
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         let pin = Arc::new(Mutex::new(None));
         let pinned: Arc<dyn StateStore> = Arc::new(PinnedStore {
@@ -142,7 +191,9 @@ impl GuardedCore {
             pin: Arc::clone(&pin),
         });
         Self {
-            core: build(pinned),
+            build: Box::new(build),
+            pinned,
+            default_cleanup,
             store,
             pin,
         }
@@ -194,7 +245,7 @@ impl StateStore for PinnedStore {
         // （supervisor の `Stopped` 記録・core 自身の update）で進んだ値は許す（stop が Stopped の記録を待つため、完全一致にはできない。
         // 照合直後の再作成は `current` の完全一致が入口で拒む。残余: 入口の後に同じ bundle で再作成される窓）。
         match pinned {
-            Some(p) if !p.same_container(&rec) || rec.revision() < p.revision => Err(changed()),
+            Some(p) if !p.accepts(&rec) => Err(changed()),
             _ => Ok(rec),
         }
     }
@@ -220,14 +271,15 @@ impl ReclaimRuntime for GuardedCore {
     ) -> Result<(ContainerStatus, Option<Generation>), TraitError> {
         self.current(req.id(), generation)?;
         self.set_pin(generation);
-        let status = fandhe_container_core::traits::ContainerRuntime::stop(&self.core, req)?;
+        let core = (self.build)(Arc::clone(&self.pinned), self.default_cleanup);
+        let status = fandhe_container_core::traits::ContainerRuntime::stop(&core, req)?;
         let after = match self.store.get(&GetStateRequest::new(req.id().clone())) {
             Ok(after) => after,
             // 停止は成功し、その後に並行する回収が記録を消した。取得済みの終了状態を捨てない（CRI-5）。
             Err(e) if e.code() == ErrorCode::NotFound => return Ok((status, None)),
             Err(e) => return Err(e),
         };
-        if !generation.same_container(&after) || after.status().state() != ContainerState::Stopped {
+        if !generation.accepts(&after) || after.status().state() != ContainerState::Stopped {
             return Err(changed());
         }
         Ok((status, Some(Generation::of(&after))))
@@ -237,10 +289,12 @@ impl ReclaimRuntime for GuardedCore {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
+        cleanup: Duration,
     ) -> Result<DeleteResponse, TraitError> {
         self.current(req.id(), generation)?;
         self.set_pin(generation);
-        fandhe_container_core::traits::ContainerRuntime::delete(&self.core, req)
+        let core = (self.build)(Arc::clone(&self.pinned), cleanup);
+        fandhe_container_core::traits::ContainerRuntime::delete(&core, req)
     }
 }
 
@@ -334,9 +388,13 @@ pub(crate) fn reclaim_recorded(
             &final_status,
         )));
     };
-    let limit = budget.remove.min(remaining(deadline, "remove")?);
+    let left = remaining(deadline, "remove")?;
+    let limit = budget.remove.min(left);
+    // 内側（core の delete・ログの待ち）の期限は、この段の実際の残りから余裕を引いた値にする。固定の `cleanup()` が残りを
+    // 超えると外側が先に切れ、記録だけ消えてログが残る（次回 AlreadyReclaimed。REPAIR-5・CRI-5）。
+    let inner = budget.cleanup_within(limit);
     run_stage(limit, "remove", move || {
-        match rt.delete(&DeleteRequest::new(id), &generation) {
+        match rt.delete(&DeleteRequest::new(id), &generation, inner) {
             Ok(_) => Ok(()),
             // 並行する回収が先に消した。目的は達している（冪等）。
             Err(e) if e.code() == ErrorCode::NotFound => Ok(()),

@@ -110,6 +110,7 @@ impl ReclaimRuntime for Fake {
         &self,
         req: &DeleteRequest,
         generation: &Generation,
+        _cleanup: Duration,
     ) -> Result<DeleteResponse, TraitError> {
         self.log("delete", req.id());
         self.gate(self.inject_delete)?;
@@ -464,12 +465,16 @@ fn cri5_4152_real_core_runtime_reclaims_created_without_pid() {
         &base,
         |store| {
             let store: Arc<dyn StateStore> = Arc::new(store);
-            Arc::new(GuardedCore::new(store, |pinned| {
-                core_runtime_for(pinned)
-                    .with_delete_deadline(budget.cleanup())
-                    .with_container_log_lock_wait(budget.cleanup())
-                    .with_cleanup_warning_sink(Arc::new(|_| {}))
-            }))
+            Arc::new(GuardedCore::new(
+                store,
+                budget.cleanup(),
+                |pinned, cleanup| {
+                    core_runtime_for(pinned)
+                        .with_delete_deadline(cleanup)
+                        .with_container_log_lock_wait(cleanup)
+                        .with_cleanup_warning_sink(Arc::new(|_| {}))
+                },
+            ))
         },
         &budget,
         std::time::Instant::now() + SHIM_DELETE_DEADLINE,
@@ -527,12 +532,18 @@ fn sec1_4152_stale_generation_does_not_touch_recreated_container() {
     let other = guard.join("other-bundle");
     std::fs::create_dir_all(&other).unwrap();
     recreate_with_other_bundle(&base, &inv, "abc", &other);
-    let rt = GuardedCore::new(Arc::clone(&store), core_runtime_for);
+    let rt = GuardedCore::new(Arc::clone(&store), Duration::from_secs(1), |p, _| {
+        core_runtime_for(p)
+    });
     let stop = StopRequest::new(cid("abc"), Duration::ZERO).unwrap();
     let e = rt.stop(&stop, &stale).expect_err("stale stop");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     let e = rt
-        .delete(&DeleteRequest::new(cid("abc")), &stale)
+        .delete(
+            &DeleteRequest::new(cid("abc")),
+            &stale,
+            Duration::from_secs(1),
+        )
         .expect_err("stale delete");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     let now = store.get(&GetStateRequest::new(cid("abc"))).unwrap();
@@ -554,12 +565,18 @@ fn sec1_4152_stale_revision_rejected_for_same_bundle_recreation() {
     let stale = Generation::of(&rec);
     let store: Arc<dyn StateStore> = Arc::new(store.expect("store"));
     recreate_with_other_bundle(&base, &inv, "abc", &bundle);
-    let rt = GuardedCore::new(Arc::clone(&store), core_runtime_for);
+    let rt = GuardedCore::new(Arc::clone(&store), Duration::from_secs(1), |p, _| {
+        core_runtime_for(p)
+    });
     let stop = StopRequest::new(cid("abc"), Duration::ZERO).unwrap();
     let e = rt.stop(&stop, &stale).expect_err("stale stop");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     let e = rt
-        .delete(&DeleteRequest::new(cid("abc")), &stale)
+        .delete(
+            &DeleteRequest::new(cid("abc")),
+            &stale,
+            Duration::from_secs(1),
+        )
         .expect_err("stale delete");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
     let now = store.get(&GetStateRequest::new(cid("abc"))).unwrap();
@@ -583,4 +600,39 @@ fn repair5_4152_exhausted_deadline_fails_before_any_stage() {
         std::time::Instant::now(),
     );
     assert_eq!(r.unwrap_err().code(), CriErrorCode::Timeout);
+}
+
+/// SEC-1・CORE-1・#4152: cgroup 未記録で照合時が Created（PID なし）の世代は、同じ id・同じ bundle で再作成された
+/// 大きい revision の記録を受け入れない（core の get が固定の世代で拒否する）。
+#[test]
+fn sec1_4152_cgroupless_created_generation_rejects_recreated_record() {
+    let guard = test_root::test_root("shim", "r-nocg");
+    let base = guard.join("state");
+    let bundle = make_bundle(&guard, "abc");
+    seed(&base, ContainerStatus::created(cid("abc"), None), &bundle);
+    let inv = parse("abc", Some(bundle.to_str().unwrap())).unwrap();
+    let (_, store, matched) = delete_preflight_store_in(&inv, &base).unwrap();
+    let DeleteRecordMatch::Recorded(rec) = matched else {
+        panic!("expected recorded");
+    };
+    let generation = Generation::of(&rec);
+    let store: Arc<dyn StateStore> = Arc::new(store.expect("store"));
+    assert!(generation.accepts(&rec));
+    recreate_with_other_bundle(&base, &inv, "abc", &bundle);
+    let now = store.get(&GetStateRequest::new(cid("abc"))).unwrap();
+    assert!(now.revision() > rec.revision());
+    assert!(!generation.accepts(&now));
+}
+
+/// REPAIR-5・CRI-5・#4152: 内側の後始末期限は remove 段の実際の残りに収まり、外側より先に切れる。
+#[test]
+fn repair5_4152_cleanup_within_fits_remaining_limit() {
+    let b = ReclaimBudget::PRODUCTION;
+    assert_eq!(b.cleanup_within(Duration::from_millis(1500)), b.cleanup());
+    assert_eq!(
+        b.cleanup_within(Duration::from_millis(600)),
+        Duration::from_millis(400)
+    );
+    assert!(b.cleanup_within(Duration::from_millis(30)) < Duration::from_millis(30));
+    assert!(b.cleanup_within(Duration::from_millis(900)) <= Duration::from_millis(600));
 }

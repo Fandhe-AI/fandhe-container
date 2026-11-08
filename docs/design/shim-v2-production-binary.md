@@ -105,6 +105,17 @@ A の共通モジュールの候補は `crates/plugin-cri/src/exec_helper.rs`（
 - 消滅を確認できない失敗は `Exited` に変換しない。保持したエラーにより Wait は失敗し、Delete による登録除去も拒否する（生存プロセスが残ったまま終了済みとして除去できてしまうのを防ぐ）。再照会で消滅が確認できたときだけ `Exited` へ遷移し、除去を許す
 - 判別の根拠を持たない間は安全側（確認できない）に倒す。helper の `Failed` が回収の成否を区別して運ぶ拡張は #4149 以降の実装で確かめる（未検証）
 
+`status()` と `Kill(exec_id)` の状態遷移（`status()` が `Err` の exec にも SIGKILL を届ける。CRI-6・SUP-6）:
+
+| 状態 | `status()` | `Kill(exec_id)` | 次の状態 |
+| ---- | ---------- | --------------- | -------- |
+| 実行中（`Result` 未受信） | `Running` | `signal(SIGKILL)` へ進む | `signal` 成功後、`Result` の受信で `Exited` |
+| `Started` 後に消滅を確認できた `Failed` | `Exited { code: None }` | `NOT_FOUND`（終了済み） | `Exited` のまま |
+| `Started` 後に消滅を確認できない `Failed` | `Err`（保持） | `status()` の `Err` を理由に拒否せず、黙って成功にもせず、`signal(SIGKILL)` まで進む | `signal` が成功し、再照会で消滅を確認できたときだけ `Exited`。失敗は `Err` を保ったまま呼び出し元へ返す |
+
+- `Kill` は `status()` を参照して `Exited` と分かった場合だけ `NOT_FOUND` にし、`Err`（実行中か不明）は SIGKILL を試みる側へ倒す。helper の `Failed` が回収の成否を運ぶ拡張が入るまでは、タイムアウトのたびに `Err` の経路になるため、この経路が実際の停止手段になる
+- 未実装（REPAIR-3）: 回収成否を運ぶ `Failed` の拡張と、それを使った `Err` の絞り込みは未実装。入るまでの暫定動作が上の表で、将来は消滅を確認できる `Failed` が増えて `Err` の経路が減る（CRI-6・SUP-6。#4149 以降）
+
 - `exec_id` とプロセスの対応は cri の `ExecRegistry` だけが持つ。launcher は上限と停止のための helper の追跡だけを持ち、exec_id の表は持たない（二重管理をしない）。永続化せず、shim の再起動で exec の記録は失われる
 - 残余: shim が SIGKILL された場合、helper は exec の期限（最長 1 時間）まで残る。PDEATHSIG を使わない設計で #3761 と同じ
 - 任意のシグナルへの対応は stream-exec の wire に Signal frame を足し、helper の待ちで fd 0 を見張る拡張が要る（後続候補）

@@ -121,7 +121,6 @@ use crate::hvf_lifecycle::{
 };
 use crate::hvf_loop::log_line;
 use crate::hvf_smp::{ApMailbox, HvfPowerControl};
-use crate::hvf_wake::{AckRouteLearner, SpiRouteHint};
 use crate::interrupt::{
     BlockQueueNotifyRoute, BoundAckRoute, InterruptAckCounts, InterruptAckRoute, InterruptAckTally,
     InterruptLine, NetQueueNotifyRoute, NetRxPollRoute, QueueNotifyRoute,
@@ -437,13 +436,6 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfDevice
             })
             .collect()
     }
-
-    /// 全デバイスの SPI の宛先のヒント（vCPU ごとの `AckRouteLearner` が ACK を処理した vCPU を書く。#3948）。
-    fn route_hints(&self) -> Vec<(DeviceId, SpiRouteHint)> {
-        let b = self.block.iter().map(|d| (d.id, d.line.route_hint()));
-        let n = self.net.iter().map(|d| (d.id, d.line.route_hint()));
-        b.chain(n).collect()
-    }
 }
 
 impl<B: BlockBackend, N: NetBackend> HvfDeviceBus<B, N> {
@@ -681,8 +673,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                 mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                     .with_ack_routes(devices.ack_routes())
                     .with_ack_tallies(devices.ack_tallies())
-                    .with_queue_notify_routes(queue_routes.clone())
-                    .with_ack_learner(AckRouteLearner::new(0, devices.route_hints())),
+                    .with_queue_notify_routes(queue_routes.clone()),
                 hvc: HvcHandler::with_cpus(Arc::clone(&psci), power.clone(), 0)?,
                 // 期限切れで切り離した後の回収を、このスレッドの終了に任せる（#4032。全 vCPU が持つ）。
                 guest_memory: Some(memory.clone()),
@@ -708,8 +699,7 @@ impl<B: BlockBackend + Send + 'static, N: NetBackend + Send + 'static> HvfMicroV
                         mmio: MmioHandler::with_shared_dispatcher(Arc::clone(&devices.dispatcher))
                             .with_ack_routes(devices.ack_routes())
                             .with_ack_tallies(devices.ack_tallies())
-                            .with_queue_notify_routes(queue_routes.clone())
-                            .with_ack_learner(AckRouteLearner::new(index, devices.route_hints())),
+                            .with_queue_notify_routes(queue_routes.clone()),
                         hvc,
                         guest_memory: Some(memory.clone()),
                     };

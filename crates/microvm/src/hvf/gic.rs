@@ -38,24 +38,14 @@
 //! - 寿命: `hv_gic_set_spi` は VM を取らないため、古い line が後から作った別の VM へ注入しうる。
 //!   [`VmWithGic`] が持つ生存フラグ（`RwLock<bool>`）を各 line が共有し、`Drop` で書き込みロックを取って false にする。
 //!   `trigger` と `resample` は読み取りロックを `set_spi` の間保持するので、破棄と注入は競合せず、破棄後は `Internal` で拒否する。
-//! - WFI の起床（#3887・#3948）: `set_spi(intid, true)` が成功したら `WfiWakeSet::notify_spi` で WFI の待ちを起こす
-//!   （edge の trigger・level の上げ直し・シリアル入力の `High` を覆う。deassert では通知しない）。virtio の線は
-//!   `InterruptACK` を処理した vCPU を学習した宛先の 1 台だけを起こし、未学習の線とシリアルは全台を起こす（#3948。
-//!   学習の方式と残余は `crate::hvf_wake`）。ロック順は UART → 生存フラグ（読み取り。通知の前に外す）→ waker のスロットの
-//!   mutex で、スロットの mutex は 1 個ずつ取り持つ間は他の lock を取らない。宛先のヒントは atomic で lock ではない。
-//!   GIC つきの実機では WFI は exit しないため、この通知で起きる待ちは無く、ゲストを起こすのは `set_spi` 自身である
-//!   （macOS 27.2・#3803・#3994。通知の要否の判断は #3995）。
-//! - 宛先の決定（#3960・MVM-5）: `hv_gic_get_distributor_reg` は **ある**（macOS 15.0 で導入。`hv_gic_distributor_reg_t` の列挙値は
-//!   ARM GICv3 の distributor のレジスタオフセットに等しく、`HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32` が存在する。一次資料:
-//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>・
-//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_t>・
-//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_distributor_reg_gicd_irouter32>。確認日 2026-11-05。
-//!   SDK ヘッダと一致した。#3803）。assert の成功後に `GICD_IROUTER<intid>` を読み、IRM = 0 で affinity が割り当て済みの vCPU
-//!   に当たればその 1 台を起こす（シリアルの線も同じ。決定規則は `crate::hvf_wake::spi_wake_target`）。読めない・IRM = 1・書式違反
-//!   のときは学習したヒントへ、それも無ければ全台へ縮退する。縮退は理由別に数え（[`VmWithGic::spi_routing_stats`]）、理由ごとの初回だけ
-//!   ログに出す。`GICD_CTLR.ARE` = 0 か読めないときは IROUTER を使わない（#3974・REPAIR-4。詳細は `crate::hvf_wake`）。観測用に [`VmWithGic::spi_routing`] を公開する。
-//!   distributor 版の getter に owning thread の注記は無い（redistributor 版にはある）。実機のプローブでは非 vCPU スレッドから
-//!   `GICD_IROUTER48` を読めた（#3803）。
+//! - 起床と宛先の決定は持たない（#3995・#4041）: GIC つきの実機では WFI も virtual timer も exit しない（macOS 27.2・#3803・#3994）ので、
+//!   `set_spi` の成功後に WFI の待ちを起こす通知も、`GICD_IROUTER<n>`・`GICD_CTLR` を読んで宛先を決める処理も無い。
+//!   ゲストを起こすのは `hv_gic_set_spi` 自身で、非 vCPU スレッドからの呼び出しも届く（#3803 の再実行で 12 回とも到達）。
+//!   sink の手順は「生存フラグの確認 → `hv_gic_set_spi` → 結果を返す」だけである。ロック順は UART → 生存フラグ（読み取り）。
+//! - 観測用の getter（#3960・#3974・#4041）: [`VmWithGic::spi_routing`]（`GICD_IROUTER<intid>`）と [`VmWithGic::distributor_ctlr`]（`GICD_CTLR`）は
+//!   実機試験 `hvf_device_spi_reaches_guest` の観測のために残す。製品の経路は読まない。`hv_gic_get_distributor_reg` は macOS 15.0 で導入され、
+//!   実機のプローブでは非 vCPU スレッドから `GICD_IROUTER48` を読め、ゲストの初期化後の `GICD_CTLR` は `0x53` だった（#3803）。一次資料:
+//!   <https://developer.apple.com/documentation/hypervisor/hv_gic_get_distributor_reg(_:_:)>（確認日 2026-11-05）。
 //! - 残余: MSI の範囲は GIC の config に MSI を設定しないため対象外。
 //!
 //! # 範囲外（REPAIR-3）
@@ -70,16 +60,12 @@
 use std::sync::{Arc, RwLock};
 
 use crate::hvf_smp::VmShutdown;
-use crate::hvf_wake::{
-    GicdRegisterRead, SpiRouteHint, SpiRouteStatsSnapshot, SpiRouting, WfiWakeSet, WfiWaker,
-    spi_route_fallback_log_line,
-};
+use crate::hvf_wake::{WfiWakeSet, WfiWaker};
 
 use crate::arm64_layout::{Arm64Layout, GicGeometry, check_spi_intid, check_virtual_timer_intid};
 use crate::error::{MicrovmError, MicrovmErrorCode};
 use crate::hvf_abi::{GicDistributorReg, HvGicIntid};
 use crate::hvf_lifecycle::TeardownMark;
-use crate::hvf_loop::log_line;
 use crate::interrupt::{InterruptLine, IrqLevel, IrqTrigger, LevelInterruptLine, LineResample};
 use crate::spi::{SpiLevelLine, SpiLine, SpiSink};
 use crate::sys::{GicApi, HvVcpu, HvVm};
@@ -159,7 +145,6 @@ impl HvfGic {
             vm: Arc::new(vm),
             alive: Arc::new(RwLock::new(true)),
             wake: WfiWakeSet::new(layout.vcpus)?,
-            routing: SpiRouting::default(),
             shutdown: Arc::new(VmShutdown::new()),
             teardown: TeardownMark::new(),
         })
@@ -176,8 +161,6 @@ pub struct VmWithGic {
     alive: Arc<RwLock<bool>>,
     /// vCPU ごとの WFI の待ちを起こす通知口の束。SPI の sink と vCPU スレッドが共有する（#3887・#3948）。
     wake: WfiWakeSet,
-    /// SPI ルーティングの縮退の理由別件数と ARE のラッチ。SPI の sink と共有する（#3974）。
-    routing: SpiRouting,
     /// VM 全体の終了通知（SYSTEM_OFF・失敗・BSP の終了で全 vCPU を止める。MVM-5・MVM-1・REPAIR-5）。
     shutdown: Arc<VmShutdown>,
     /// teardown の開始印（TASK-192.16・#3798）。立った後の vCPU 作成を拒否する。
@@ -227,14 +210,9 @@ impl VmWithGic {
     /// SPI `intid` の `GICD_IROUTER<intid>` の生値を読む（実機の観測用。#3960・MVM-5）。
     ///
     /// `&self` で VM の生存を保証する。`intid` が SPI の範囲（32..=1019）外なら `InvalidArgument`、`hv_gic_get_distributor_reg`
-    /// が使えなければ `Unimplemented`。宛先の決定は `crate::hvf_wake::spi_wake_target`（この値を `decode_irouter` で復号する）。
+    /// が使えなければ `Unimplemented`。観測用で、製品の経路はこの値を読まない（#4041）。
     pub fn spi_routing(&self, intid: u32) -> Result<u64, MicrovmError> {
         GicApi::get()?.distributor_reg(GicDistributorReg::irouter(intid)?)
-    }
-
-    /// SPI の宛先決定の縮退の理由別件数（実機の観測用。#3974・MVM-5・REPAIR-4）。
-    pub fn spi_routing_stats(&self) -> SpiRouteStatsSnapshot {
-        self.routing.snapshot()
     }
 
     /// `GICD_CTLR` の生値を読む（実機の観測用。ゲストの初期化後は `0x53` で ARE = 1 だった。#3803・#3974）。
@@ -296,16 +274,11 @@ impl VmWithGic {
         layout.check_virtio_injection(injection)?;
         let (base, count) = self.gic.spi_range();
         let intid = check_spi_intid(layout.virtio_spi(index)?, base, count)?;
-        // 宛先は `InterruptACK` を処理した vCPU から学習する（#3948）。学習するまでは全台を起こす。
-        let route = SpiRouteHint::unknown();
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
-            wake: self.wake.clone(),
-            routing: self.routing.clone(),
-            route: route.clone(),
         };
-        Ok(GicSpiLine(SpiLine::new(sink, intid, injection), route))
+        Ok(GicSpiLine(SpiLine::new(sink, intid, injection)))
     }
 
     /// シリアルの SPI を level 形で駆動する [`GicSerialLine`] を作る（#3892・MVM-5・MVM-1）。
@@ -337,10 +310,6 @@ impl VmWithGic {
         let sink = HvfGicSink {
             api: GicApi::get()?,
             alive: Arc::clone(&self.alive),
-            wake: self.wake.clone(),
-            routing: self.routing.clone(),
-            // UART の ACK は IIR の読み出しで経路が違うため学習せず、常に全台を起こす（#3948 の残余）。
-            route: SpiRouteHint::unknown(),
         };
         Ok(GicSerialLine(SpiLevelLine::new(sink, intid)))
     }
@@ -351,17 +320,6 @@ impl VmWithGic {
 pub(crate) struct HvfGicSink {
     api: &'static GicApi,
     alive: Arc<RwLock<bool>>,
-    wake: WfiWakeSet,
-    /// VM 共有の縮退の件数・ARE のラッチ（#3974）。
-    routing: SpiRouting,
-    /// この線の宛先 vCPU のヒント（#3948）。未学習なら全台を起こす。
-    route: SpiRouteHint,
-}
-
-impl GicdRegisterRead for HvfGicSink {
-    fn read(&self, reg: GicDistributorReg) -> Result<u64, MicrovmError> {
-        self.api.distributor_reg(reg)
-    }
 }
 
 impl SpiSink for HvfGicSink {
@@ -375,39 +333,15 @@ impl SpiSink for HvfGicSink {
                 "spi line outlived its vm; refusing to inject",
             ));
         }
-        let r = self.api.set_spi(intid, level);
-        // assert が成功したら、読み取りロックの中で宛先を決める（VM が生きている間だけ framework を呼ぶ。同期呼び出しで lock ではない）。
-        // ARE = 0・読めない・書式違反などはヒント（無ければ全台）へ縮退し、理由別に数える（#3960・#3974）。
-        let decision = if r.is_ok() && level {
-            Some(
-                self.routing
-                    .resolve(self, intid, self.route.get(), self.wake.vcpus()),
-            )
-        } else {
-            None
-        };
-        // 読み取りロックを外してから、初回の縮退をログに出し（非ブロッキング）、assert が成功したときだけ WFI の待ちを起こす
-        // （waker の mutex を持つ間は他の lock を取らない）。
-        drop(guard);
-        if let Some(d) = decision {
-            if d.first
-                && let Some(reason) = d.fallback
-            {
-                log_line(format_args!(
-                    "{}",
-                    spi_route_fallback_log_line(reason, d.code)
-                ));
-            }
-            self.wake.notify_target(d.target);
-        }
-        r
+        // 成否はそのまま呼び出し元へ返す。起床も宛先の決定もしない（#3995・#4041）。
+        self.api.set_spi(intid, level)
     }
 }
 
 /// virtio-mmio 1 台分の SPI を `hv_gic_set_spi` で注入する [`InterruptLine`]（#3795・#3863）。
 /// 契約はモジュール doc の「SPI の注入」。
 #[derive(Debug, Clone)]
-pub struct GicSpiLine(SpiLine<HvfGicSink>, SpiRouteHint);
+pub struct GicSpiLine(SpiLine<HvfGicSink>);
 
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -418,11 +352,6 @@ impl GicSpiLine {
     /// 注入する INTID（検証済み）。
     pub fn intid(&self) -> u32 {
         self.0.intid()
-    }
-
-    /// この線の宛先 vCPU のヒント（`hvf::mmio` の `InterruptACK` の学習が書く。#3948）。
-    pub(crate) fn route_hint(&self) -> SpiRouteHint {
-        self.1.clone()
     }
 }
 

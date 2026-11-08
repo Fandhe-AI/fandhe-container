@@ -123,9 +123,13 @@ pub(crate) fn fetch_dirty_log_checked(
         .ok()
         .filter(|n| *n <= MAX_DIRTY_BITMAP_BYTES)
         .ok_or_else(|| pre(MicrovmErrorCode::InvalidArgument, "dirty bitmap too large"))?;
-    let mut buf = vec![0u8; len];
+    // カーネルは呼び出し側の `memory_size` ではなく、その slot に「今」登録されている領域の長さ
+    // （`kvm_dirty_bitmap_bytes`）だけ書く。slot が差し替わっていても書き込みが buffer に収まるよう、
+    // 登録しうる最大の領域（`MAX_GUEST_RAM_BYTES`）の bitmap 長で確保し、取得後に本来の長さへ切り詰める。
+    let mut buf = vec![0u8; MAX_DIRTY_BITMAP_BYTES.max(len)];
     f.get_dirty_log(slot, memory_size, &mut buf)
         .map_err(FetchDirtyLogError::Ioctl)?;
+    buf.truncate(len);
     Ok(DirtyBitmap {
         bytes: buf,
         pages: memory_size / page_size,
@@ -185,7 +189,10 @@ mod tests {
             let b = fetch_dirty_log_checked(&f, slot, LOG, size, page)
                 .ok()
                 .unwrap();
-            assert_eq!(*f.calls.borrow(), vec![(slot, size, len)]);
+            assert_eq!(
+                *f.calls.borrow(),
+                vec![(slot, size, MAX_DIRTY_BITMAP_BYTES)]
+            );
             assert_eq!(b.as_bytes().len(), len);
             assert_eq!(b.page_count(), size / page);
         }

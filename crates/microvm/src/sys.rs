@@ -1863,14 +1863,18 @@ pub(crate) fn kvm_get_dirty_log(
     }
     let page_size = host_page_size()?;
     let need = dirty_bitmap_bytes(memory_size, page_size).ok_or(SysError::Os(22))?;
-    if u64::try_from(bitmap.len()).map_or(true, |have| have < need) {
+    // カーネルは `memory_size` ではなく slot に現在登録されている領域の長さを書くため、差し替えに備えて
+    // 登録しうる最大の領域の bitmap 長（`MAX_DIRTY_BITMAP_BYTES`）以上も要求する。
+    let required = need.max(crate::dirty_log::MAX_DIRTY_BITMAP_BYTES as u64);
+    if u64::try_from(bitmap.len()).map_or(true, |have| have < required) {
         return Err(SysError::Os(22));
     }
     let arg = dirty_log_request(slot, bitmap.as_mut_ptr() as usize as u64);
     // SAFETY: `vm` は借用中の生存 fd。`arg` は `repr(C)` で 16 バイト（const assert 済み・ioctl 番号のサイズ符号と一致）の
     // ローカルの借用。ioctl 番号は `_IOW` だが、カーネルは `arg.dirty_bitmap` の先へ `kvm_dirty_bitmap_bytes(memslot)` バイトを
     // 書く（`arg` 自体は読むだけ）。その長さは登録時の `memory_size` とホストの `PAGE_SIZE` から決まり、直前の検査で
-    // `bitmap`（排他借用のバッファ）がそれ以上の長さだと確かめ済みなので、書き込みは `bitmap` の範囲に収まる。
+    // `bitmap`（排他借用のバッファ）が `MAX_DIRTY_BITMAP_BYTES`（登録しうる最大の領域の bitmap 長）以上だと確かめ済み。
+    // slot が呼び出し後に差し替わっても、登録できる領域は `MAX_GUEST_RAM_BYTES` 以下なので書き込みは `bitmap` の範囲に収まる。
     // 呼び出しは同期で完了し、戻り後にカーネルはポインタを保持しない。
     let r = unsafe {
         ioctl(
@@ -3271,14 +3275,14 @@ mod tests {
     fn mvm1_4225_get_dirty_log_short_buffer_is_einval_before_ioctl() {
         use std::os::fd::AsFd as _;
         let f = dev_null();
-        for len in [0usize, 7] {
+        for len in [0usize, 7, 8, crate::dirty_log::MAX_DIRTY_BITMAP_BYTES - 1] {
             let mut buf = vec![0u8; len];
             assert_eq!(
                 kvm_get_dirty_log(f.as_fd(), 0, 64 * 1024, &mut buf),
                 Err(SysError::Os(22))
             );
         }
-        let mut ok = vec![0u8; 8];
+        let mut ok = vec![0u8; crate::dirty_log::MAX_DIRTY_BITMAP_BYTES];
         assert_eq!(
             kvm_get_dirty_log(f.as_fd(), 0, 64 * 1024, &mut ok),
             Err(SysError::Os(25))

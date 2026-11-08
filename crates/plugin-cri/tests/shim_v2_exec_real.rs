@@ -166,7 +166,16 @@ mod linux {
     /// 回収に必要な作業ディレクトリと bin ディレクトリ（`scenario` が作ったら登録する。watchdog と通常の後始末が共有）。
     static WORK: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
     /// 期限切れの後始末で止めるプロセス（exec のコマンド）の pid。
-    static PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    /// pid の再利用で無関係なプロセスを止めないよう、発見時の starttime（`/proc/<pid>/stat` の 22 番目）を併記する。
+    static PIDS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+
+    /// `/proc/<pid>/stat` の starttime（clock ticks）。プロセスが無い・解析不能なら `None`。
+    fn proc_starttime(pid: u32) -> Option<u64> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // comm は括弧で囲まれ空白や `)` を含みうるため、最後の `)` の後ろから数える（3 番目の欄が先頭）。
+        let rest = text.get(text.rfind(')')? + 1..)?;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
 
     fn container_id() -> String {
         format!("xer{}", std::process::id())
@@ -177,8 +186,11 @@ mod linux {
     /// watchdog の `process::exit(124)` の前にも呼ぶ（外側の scope 回収は別 scope の supervisor に届かないため）。
     fn emergency_cleanup(kill_all_via_shim: bool) {
         if let Ok(pids) = PIDS.lock() {
-            for pid in pids.iter() {
-                kill_pid("KILL", *pid);
+            for (pid, start) in pids.iter() {
+                // 終了済み・pid 再利用（starttime 不一致）の対象には送らない。
+                if proc_starttime(*pid) == Some(*start) {
+                    kill_pid("KILL", *pid);
+                }
             }
         }
         let ctx = WORK.lock().ok().and_then(|g| g.clone());
@@ -529,8 +541,8 @@ mod linux {
             ));
         }
         let (exec_pid, exec_dir) = find_exec_pid(&leaf)?;
-        if let Ok(mut p) = PIDS.lock() {
-            p.push(exec_pid);
+        if let (Ok(mut p), Some(start)) = (PIDS.lock(), proc_starttime(exec_pid)) {
+            p.push((exec_pid, start));
         }
 
         // capability・seccomp。
@@ -849,6 +861,14 @@ mod linux {
         } else {
             Ok(())
         };
+
+        // check_clean が成功した（exec のコマンドの終了を確認済み）なら追跡を外し、回収済み pid へは何も送らない。
+        if outcome.is_ok()
+            && clean.is_ok()
+            && let Ok(mut p) = PIDS.lock()
+        {
+            p.clear();
+        }
 
         // 後始末（成否に関わらず）。残った exec のコマンド・shim デーモン・supervisor を止める（watchdog と共通の処理）。
         emergency_cleanup(outcome.is_err());

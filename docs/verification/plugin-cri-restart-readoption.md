@@ -102,7 +102,7 @@ RPC の期待:
 - `crictl pods`・`crictl inspectp <sb>` は `SANDBOX_NOTREADY`
 - `crictl ps -a`（ListContainers）・`crictl inspect <cid>`（ContainerStatus）は `CONTAINER_RUNNING`。`image_ref`・`image_id`・metadata が 1 回目の `inspect` と一致する
 - 任意: `crictl start <cid>` は親 sandbox が NotReady のため `FAILED_PRECONDITION` で拒否される
-- 期待どおりの差分: `crictl images` は空になる（在庫がプロセス内の `InMemoryImageStore` のため。#2945）。不具合として扱わない
+- 期待どおりの差分: pull 済みのイメージは再起動後も `crictl images` に出る（在庫が永続の `PersistentImageStore` のため。#4176）。記録ファイルが壊れていると `Internal` になる（`docs/design/pull-inventory-wiring.md`）
 
 ### 5. 壊れた記録の注入と 3 回目の起動
 

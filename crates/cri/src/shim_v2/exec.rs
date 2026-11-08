@@ -414,6 +414,8 @@ struct ExecEntry {
     /// この登録に固有のトークン。`begin_start` が発行し、`finish_start` が照合する
     /// （削除・再作成で同じ ID の別登録に旧 launch の結果を書かないため）。
     token: u64,
+    /// 登録時のコンテナのインスタンス識別子（#4220）。現在の値と違えば別インスタンスの登録とみなす。
+    instance: Option<u64>,
 }
 
 /// `Start(exec_id)` の起動開始時に得る、検証済み仕様と登録固有のトークン。
@@ -539,12 +541,36 @@ impl ExecRegistry {
         Ok(())
     }
 
+    /// コンテナの登録のうち、登録時のインスタンス識別子が `current` と異なるものを除去し、件数を返す
+    /// （ゲート保持中に、`state` が返した識別子で呼ぶ。#4220・CRI-5・SEC-1・CORE-1）。
+    ///
+    /// shim の外で同じ ID のコンテナが削除・再作成されると `state` は `NOT_FOUND` を返さないため、旧い登録
+    /// （argv・env・user）が新しいコンテナで起動されうる。それを塞ぐ照合で、素朴な不等号の比較にする:
+    /// `None` 同士は残す（識別子を報告しない実装・旧い記録では判定できない）、`Some` が違うものと片側だけ
+    /// `None` のものは除去する（fail-closed）。
+    pub fn purge_mismatched(
+        &self,
+        container: &ContainerId,
+        current: Option<u64>,
+    ) -> Result<usize, CriError> {
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let before = inner.map.len();
+        inner
+            .map
+            .retain(|(c, _), e| c != container.as_str() || e.instance == current);
+        Ok(before - inner.map.len())
+    }
+
     /// 登録する。重複は `ALREADY_EXISTS`、上限超過は `RESOURCE_EXHAUSTED`。
+    ///
+    /// `instance` は登録時点のコンテナのインスタンス識別子（実行層が報告した値。`None` は報告なし）。
+    /// [`Self::purge_mismatched`] が現在の値と照合する（#4220・CRI-5・SEC-1）。
     pub fn register(
         &self,
         container: &ContainerId,
         exec_id: &ExecId,
         spec: ExecProcessSpec,
+        instance: Option<u64>,
     ) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let k = key(container, exec_id);
@@ -563,6 +589,7 @@ impl ExecRegistry {
                 spec,
                 state: ExecState::Created,
                 token,
+                instance,
             },
         );
         Ok(())
@@ -821,9 +848,9 @@ mod tests {
             r.begin_start(&c, &e).unwrap_err().message(),
             "exec not found"
         );
-        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
         assert_eq!(
-            r.register(&c, &e, spec.clone()).unwrap_err().code(),
+            r.register(&c, &e, spec.clone(), None).unwrap_err().code(),
             CriErrorCode::AlreadyExists
         );
         let t = r.begin_start(&c, &e).unwrap();
@@ -838,18 +865,51 @@ mod tests {
             .unwrap();
         assert!(r.begin_start(&c, &e).is_err());
         for i in 1..MAX_EXECS_PER_CONTAINER {
-            r.register(&c, &ExecId::new(&format!("x{i}")).unwrap(), spec.clone())
-                .unwrap();
+            r.register(
+                &c,
+                &ExecId::new(&format!("x{i}")).unwrap(),
+                spec.clone(),
+                None,
+            )
+            .unwrap();
         }
         assert_eq!(
-            r.register(&c, &ExecId::new("over").unwrap(), spec.clone())
+            r.register(&c, &ExecId::new("over").unwrap(), spec.clone(), None)
                 .unwrap_err()
                 .code(),
             CriErrorCode::ResourceExhausted
         );
         // 別コンテナは per-container 上限の影響を受けない。
         let c2 = ContainerId::new("c2").unwrap();
-        r.register(&c2, &e, spec).unwrap();
+        r.register(&c2, &e, spec, None).unwrap();
+    }
+
+    /// #4220・CRI-5・SEC-1: purge_mismatched は識別子が違うもの・片側だけ None のものだけを除去する。
+    #[test]
+    fn cri5_4220_registry_purge_mismatched() {
+        let r = ExecRegistry::new();
+        let spec = parse_process_spec(&any(OK)).unwrap();
+        let (c, other) = (
+            ContainerId::new("c1").unwrap(),
+            ContainerId::new("c2").unwrap(),
+        );
+        let id = |s: &str| ExecId::new(s).unwrap();
+        for i in 0..3 {
+            r.register(&c, &id(&format!("a{i}")), spec.clone(), Some(1))
+                .unwrap();
+        }
+        r.register(&c, &id("n"), spec.clone(), None).unwrap();
+        r.register(&other, &id("o"), spec.clone(), Some(1)).unwrap();
+        // 同じ識別子は残し、None だけ除去する。
+        assert_eq!(r.purge_mismatched(&c, Some(1)).unwrap(), 1);
+        // 違う識別子は全件除去する。別コンテナには触れない。
+        assert_eq!(r.purge_mismatched(&c, Some(2)).unwrap(), 3);
+        assert_eq!(r.purge_mismatched(&c, Some(2)).unwrap(), 0);
+        assert!(r.begin_start(&other, &id("o")).is_ok());
+        // None 同士は残す。
+        r.register(&c, &id("n"), spec, None).unwrap();
+        assert_eq!(r.purge_mismatched(&c, None).unwrap(), 0);
+        assert!(r.begin_start(&c, &id("n")).is_ok());
     }
 
     /// #4058・CRI-5: containers は重複なしの一覧、is_total_full は上限の境界、try_lock は保持中なら None。
@@ -862,10 +922,15 @@ mod tests {
             ContainerId::new("c2").unwrap(),
         );
         for i in 0..3 {
-            r.register(&c1, &ExecId::new(&format!("e{i}")).unwrap(), spec.clone())
-                .unwrap();
+            r.register(
+                &c1,
+                &ExecId::new(&format!("e{i}")).unwrap(),
+                spec.clone(),
+                None,
+            )
+            .unwrap();
         }
-        r.register(&c2, &ExecId::new("e0").unwrap(), spec.clone())
+        r.register(&c2, &ExecId::new("e0").unwrap(), spec.clone(), None)
             .unwrap();
         let names: Vec<String> = r
             .containers()
@@ -880,14 +945,19 @@ mod tests {
         while n < MAX_EXECS_TOTAL - 1 {
             let c = ContainerId::new(format!("f{cid}")).unwrap();
             for i in 0..MAX_EXECS_PER_CONTAINER.min(MAX_EXECS_TOTAL - 1 - n) {
-                r.register(&c, &ExecId::new(&format!("e{i}")).unwrap(), spec.clone())
-                    .unwrap();
+                r.register(
+                    &c,
+                    &ExecId::new(&format!("e{i}")).unwrap(),
+                    spec.clone(),
+                    None,
+                )
+                .unwrap();
                 n += 1;
             }
             cid += 1;
         }
         assert!(!r.is_total_full().unwrap());
-        r.register(&c2, &ExecId::new("last").unwrap(), spec)
+        r.register(&c2, &ExecId::new("last").unwrap(), spec, None)
             .unwrap();
         assert!(r.is_total_full().unwrap());
         let g = r.lock_container(&c1).unwrap();
@@ -906,8 +976,8 @@ mod tests {
         );
         let e = ExecId::new("e1").unwrap();
         let spec = parse_process_spec(&any(OK)).unwrap();
-        r.register(&c, &e, spec.clone()).unwrap();
-        r.register(&c2, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
+        r.register(&c2, &e, spec.clone(), None).unwrap();
         let old = r.begin_start(&c, &e).unwrap();
         r.purge_container(&c).unwrap();
         assert_eq!(
@@ -915,7 +985,7 @@ mod tests {
             CriErrorCode::NotFound
         );
         // 同じ ID で再登録した新しい登録へ、旧 launch の結果（成功・失敗とも）は書かれない。
-        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
         r.finish_start(&c, &e, &old, some(&TestProc::running()))
             .unwrap();
         let fresh = r.begin_start(&c, &e).unwrap();
@@ -952,7 +1022,7 @@ mod tests {
             CriErrorCode::NotFound
         );
         assert_eq!(r.remove(&c, &e).unwrap_err().message(), "exec not found");
-        r.register(&c, &e, spec.clone()).unwrap();
+        r.register(&c, &e, spec.clone(), None).unwrap();
         let s0 = r.snapshot(&c, &e).unwrap();
         assert!(matches!(s0.phase, ExecPhase::Created));
         let t = r.begin_start(&c, &e).unwrap();
@@ -973,7 +1043,7 @@ mod tests {
             r.snapshot(&c, &e).unwrap_err().code(),
             CriErrorCode::NotFound
         );
-        r.register(&c, &e, spec).unwrap();
+        r.register(&c, &e, spec, None).unwrap();
         assert!(!r.snapshot(&c, &e).unwrap().is_same_registration(&s0));
     }
 

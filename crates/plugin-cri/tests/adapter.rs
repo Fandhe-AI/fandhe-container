@@ -301,6 +301,33 @@ mod store_backed {
         bundle
     }
 
+    /// CRI-5・SEC-1・CORE-1（#4220）: state がインスタンス識別子を報告し、削除と再作成で変わる。
+    #[test]
+    fn core1_4220_state_reports_instance_and_changes_on_recreate() {
+        let dir = tmp_dir("instance");
+        let bundle = make_bundle(&dir);
+        let root = StateRoot::resolve(Some(dir.join("state"))).expect("root");
+        let store: Arc<dyn fandhe_container_core::traits::StateStore> =
+            Arc::new(FileStateStore::open(root).expect("open"));
+        let rt = CoreLifecycleRuntime::new(store);
+        let req = CreateRequest::new(cid("c1"), bundle).expect("req");
+        let created = rt.create(&req).expect("create");
+        let a = rt
+            .state(&StateRequest::new(cid("c1")))
+            .expect("state")
+            .instance()
+            .expect("instance");
+        assert_eq!(created.instance(), Some(a));
+        rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        rt.create(&req).expect("recreate");
+        let b = rt
+            .state(&StateRequest::new(cid("c1")))
+            .expect("state")
+            .instance()
+            .expect("instance");
+        assert_ne!(a, b);
+    }
+
     /// create → state → delete → state(NotFound) の流れ。重複 create は `AlreadyExists` で保たれる。
     #[test]
     fn cri2_core_runtime_create_state_delete() {

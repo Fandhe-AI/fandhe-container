@@ -2605,6 +2605,45 @@ jobs:
             --forbid 'shim_v2_kill_all_real: ignored' --forbid 'FAILED' \
             --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --summary
 
+      # shim_v2_exec_real（`crates/plugin-cri/tests/shim_v2_exec_real.rs`。CRI-5・CRI-1・SEC-1・REPAIR-5・REPAIR-12・TASK-62.7・#4150）:
+      # 配布する shim の Exec が、実コンテナの init の namespace（8 種）・cgroup（init 直下の exec-* 子 cgroup）・seccomp・
+      # capability（CapEff・CapPrm・CapBnd）を超えないことを具体値で照合する。containerd・pull は使わない。新しいジョブ・
+      # check-run・sudo・permissions は追加しない。委譲スコープで包むのは、本番の rootless の start が委譲 cgroup と user manager を要するため。
+      # 置き場所: pull が無く短いので shim_v2_kill_all_real の直後・container_grpc の前に置く（末尾は ubuntu のジョブ上限 35 分
+      # 〔#3505〕が watchdog より先に効きうる）。代償: 後続の pull 系の開始が少し遅れる。期限は 試験の watchdog 300 秒 < 補助 540 秒 < ステップ 10 分。
+      - name: shim_v2_exec_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor --bin fandhe-container-supervisor
+          json="${RUNNER_TEMP}/sxr-build.json"
+          cargo test -p fandhe-container-plugin-cri --test shim_v2_exec_real --no-run \
+            --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "shim_v2_exec_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::shim_v2_exec_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SXR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: shim_v2_exec_real の実行（実機前提テスト・--ignored・委譲スコープ。CRI-5・SEC-1・REPAIR-12・#4150）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/shim_v2_exec_real.log"
+          USER="$(id -un)" \
+            scripts/run-in-user-scope.sh --name shim_exec_real --deadline 540 --log "${log}" -- \
+              "${SXR_BIN}" --ignored
+          uname -r
+          scripts/check-success-lines.sh --name shim_v2_exec_real \
+            --src crates/plugin-cri/tests/shim_v2_exec_real.rs --log "${log}" \
+            --select '^shim_v2_exec_real: exec ' --min 4 \
+            --forbid 'shim_v2_exec_real: ignored' --forbid 'FAILED' \
+            --forbid 'PRECONDITION FAILED' --forbid 'WATCHDOG EXPIRED' --summary
+
       # shim_v2_containerd_real（`crates/plugin-cri/tests/shim_v2_containerd_real.rs`。CRI-5・CRI-7・PLUG-1・SUP-1・CORE-3・
       # REPAIR-5・REPAIR-12・TASK-62.6・#3684・#4104）: 配布する shim（containerd-shim-fandhe-container-v2）を本物の containerd
       # （`ctr run --runtime`）に exec させ、Create → Start → State → Kill → Wait → Delete → Shutdown と Kill all=true を通す。

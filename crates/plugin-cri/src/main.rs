@@ -299,11 +299,25 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     let exec_dyn: Option<
         std::sync::Arc<dyn fandhe_container_cri::streaming::exec::ExecStreamLauncher>,
     > = None;
+    // 接続の受理・拒否・期限切れを telemetry へ出す（CRI-6・REPAIR-4・#4163）。作れなければ観測なしで動かず起動を中止する。
+    let conn_observer = match streaming::connection_observer::TelemetryConnectionObserver::new(
+        std::sync::Arc::clone(&recorder),
+        telemetry::stderr_sink().clone(),
+    ) {
+        Ok(o) => std::sync::Arc::new(o),
+        Err(_) => {
+            return fail(
+                PluginErrorCode::Internal,
+                "failed to prepare the streaming observer",
+            );
+        }
+    };
     let streaming = match rt.block_on(streaming::bind_production_streaming(
         streaming::production_streaming_config(),
         attach_backend,
         exec_dyn,
         backends.streaming_op_recorder(),
+        conn_observer,
     )) {
         Ok(s) => s,
         Err(e) => return fail_err(&e),

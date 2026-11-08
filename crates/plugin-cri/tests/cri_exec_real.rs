@@ -653,7 +653,10 @@ async fn production_binary_exec_real() {
         }
         assert_eq!(
             rep2,
-            reclaim::ReclaimReport::default(),
+            reclaim::ReclaimReport {
+                token: token.clone(),
+                ..reclaim::ReclaimReport::default()
+            },
             "nothing may be left to reclaim"
         );
         drop((c, images, ch));

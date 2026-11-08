@@ -59,7 +59,7 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> std::process::Ou
         "-address",
         "/run/containerd/containerd.sock",
         "-publish-binary",
-        "/usr/bin/containerd",
+        BIN,
         "-id",
         id,
     ])

@@ -4,93 +4,26 @@
 //! 要求の完了・リング破損の返し方・固定の `Err`・同時 notify の排他を具体値で照合する。KVM は不要。
 #![cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use fandhe_container_microvm::error::{MicrovmError, MicrovmErrorCode};
 use fandhe_container_microvm::guest_memory::{GuestAddress, GuestMemory, HeapBacking};
 use fandhe_container_microvm::guest_memory_slot::GuestMemorySlot;
 use fandhe_container_microvm::interrupt::{
-    BlockQueueNotifyRoute, InterruptDelivery, InterruptLine, QueueNotifyReport, QueueNotifyRoute,
+    BlockQueueNotifyRoute, InterruptDelivery, QueueNotifyReport, QueueNotifyRoute,
 };
 use fandhe_container_microvm::virtio_block::{MemoryBlockBackend, VirtioBlock};
-use fandhe_container_microvm::virtio_mmio::{MmioWriteOutcome, VirtioMmioTransport, reg};
+use fandhe_container_microvm::virtio_mmio::VirtioMmioTransport;
 
 type Dev = VirtioBlock<MemoryBlockBackend>;
 type T = VirtioMmioTransport<Dev>;
 type Mem = GuestMemory<HeapBacking>;
 
-const DESC: u64 = 0x1000;
-const AVAIL: u64 = 0x2000;
-const USED: u64 = 0x3000;
-const HDR: u64 = 0x10000;
-const DATA: u64 = 0x11000;
-const STATUS: u64 = 0x12000;
-
-/// 回数を数える `Send + Sync` の偽の割り込み線。
-#[derive(Clone, Default)]
-struct CountLine(Arc<AtomicU32>);
-
-impl CountLine {
-    fn count(&self) -> u32 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-impl InterruptLine for CountLine {
-    fn trigger(&self) -> Result<(), MicrovmError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-fn wr(t: &mut T, off: u64, v: u32) -> MmioWriteOutcome {
-    t.write(off, &v.to_le_bytes())
-}
-
-fn init(t: &mut T) {
-    wr(t, reg::STATUS, 1);
-    wr(t, reg::STATUS, 3);
-    let mut b = [0u8; 4];
-    wr(t, reg::DEVICE_FEATURES_SEL, 0);
-    t.read(reg::DEVICE_FEATURES, &mut b);
-    wr(t, reg::DRIVER_FEATURES_SEL, 0);
-    wr(t, reg::DRIVER_FEATURES, u32::from_le_bytes(b));
-    wr(t, reg::DRIVER_FEATURES_SEL, 1);
-    wr(t, reg::DRIVER_FEATURES, 1);
-    assert_eq!(wr(t, reg::STATUS, 11), MmioWriteOutcome::FeaturesAccepted);
-    wr(t, reg::QUEUE_SEL, 0);
-    wr(t, reg::QUEUE_NUM, 16);
-    wr(t, reg::QUEUE_DESC_LOW, DESC as u32);
-    wr(t, reg::QUEUE_DRIVER_LOW, AVAIL as u32);
-    wr(t, reg::QUEUE_DEVICE_LOW, USED as u32);
-    wr(t, reg::QUEUE_READY, 1);
-    assert_eq!(wr(t, reg::STATUS, 15), MmioWriteOutcome::DeviceActivated);
-}
-
-fn desc(m: &mut Mem, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
-    let at = DESC + i * 16;
-    m.write_at(GuestAddress::new(at), &addr.to_le_bytes())
-        .unwrap();
-    m.write_u32_le(GuestAddress::new(at + 8), len).unwrap();
-    m.write_u16_le(GuestAddress::new(at + 12), flags).unwrap();
-    m.write_u16_le(GuestAddress::new(at + 14), next).unwrap();
-}
-
-/// head=0 の [header R][data][status W] を avail の `slot` に積む。
-fn submit(m: &mut Mem, slot: u16, ty: u32, sector: u64, len: u32, data_flags: u16) {
-    m.write_u32_le(GuestAddress::new(HDR), ty).unwrap();
-    m.write_at(GuestAddress::new(HDR + 8), &sector.to_le_bytes())
-        .unwrap();
-    desc(m, 0, HDR, 16, 1, 1);
-    desc(m, 1, DATA, len, data_flags | 1, 2);
-    desc(m, 2, STATUS, 1, 2, 0);
-    m.write_at(GuestAddress::new(STATUS), &[0xff]).unwrap();
-    let a = AVAIL + 4 + 2 * u64::from(slot);
-    m.write_u16_le(GuestAddress::new(a), 0).unwrap();
-    m.write_u16_le(GuestAddress::new(AVAIL + 2), slot + 1)
-        .unwrap();
-}
+/// virtqueue の試験補助の正本（`tests/support/virtqueue_driver.rs`。複製しない・#4113）。
+#[path = "support/virtqueue_driver.rs"]
+mod virtqueue_driver;
+use virtqueue_driver::CountLine;
+use virtqueue_driver::block::{AVAIL, DATA, STATUS, USED, init, submit};
 
 struct Fixture {
     transport: Arc<Mutex<T>>,

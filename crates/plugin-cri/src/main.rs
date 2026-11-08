@@ -25,7 +25,9 @@
 //! 終了コード: 0 = `--help` と正常停止、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
 //! （未実装・起動失敗・serve の失敗）。
 //! 失敗時は stderr へ 1 行 `error: <CODE>: <message>`（固定文言のみ。引数の値は含めない。REPAIR-4）。
-//! stdout に書くのは `--help` の usage だけ。起動完了の通知行は出さない（呼び出し側は socket の出現と接続の成否で判定する）。
+//! ストリーミングの外部公開は `--streaming-bind` / `--streaming-allow-external` / `--streaming-advertise` を明示したときだけ（既定は loopback。#4110）。
+//! 開いたときだけ、TLS・認証が無い旨の警告 1 行（固定文言・アドレスなし）を stderr へ出す（`streaming::EXTERNAL_EXPOSURE_WARNING`）。
+//! stdout に書くのは `--help` の usage だけ。起動完了の通知行は出さない（上の警告行は opt-in 時だけの例外）（呼び出し側は socket の出現と接続の成否で判定する）。
 
 use std::process::ExitCode;
 
@@ -87,7 +89,10 @@ fn stop_at_startup_boundary() -> Option<ExitCode> {
 
 /// `Serve` の本体。UDS を持たない OS では未実装を返す（WIN-1）。
 #[cfg(unix)]
-fn serve(socket: &std::path::Path) -> ExitCode {
+fn serve(
+    socket: &std::path::Path,
+    streaming_opts: &fandhe_container_plugin_cri::startup::StreamingOptions,
+) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
     use fandhe_container_plugin_cri::adapter::{
         self, CriPluginBackends, PLUGIN_REQUEST_TIMEOUT, StartupPullRecovery,
@@ -299,6 +304,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     let exec_dyn: Option<
         std::sync::Arc<dyn fandhe_container_cri::streaming::exec::ExecStreamLauncher>,
     > = None;
+    let streaming_config = streaming::production_streaming_config_with(streaming_opts);
     // 接続の受理・拒否・期限切れを telemetry へ出す（CRI-6・REPAIR-4・#4163）。作れなければ観測なしで動かず起動を中止する。
     let conn_observer = match streaming::connection_observer::TelemetryConnectionObserver::new(
         std::sync::Arc::clone(&recorder),
@@ -313,7 +319,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         }
     };
     let streaming = match rt.block_on(streaming::bind_production_streaming(
-        streaming::production_streaming_config(),
+        streaming_config.clone(),
         attach_backend,
         exec_dyn,
         backends.streaming_op_recorder(),
@@ -322,6 +328,12 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         Ok(s) => s,
         Err(e) => return fail_err(&e),
     };
+    // 外部公開を opt-in したときだけ、TLS・認証が無いことを固定の 1 行で知らせる（#4110・CRI-6。アドレスは出さない）。
+    if let Some(line) =
+        streaming::external_exposure_warning(&streaming_config, streaming.local_addr())
+    {
+        let _ = telemetry::stderr_sink().submit(line.to_string());
+    }
     let svc = svc.with_streaming(streaming.issuer());
     // 配送 thread を作れなければ listener の bind 前に起動を中止する（SEC-4・PLUG-12・#2484）。
     #[cfg(target_os = "linux")]
@@ -420,7 +432,10 @@ fn serve(socket: &std::path::Path) -> ExitCode {
 }
 
 #[cfg(not(unix))]
-fn serve(_socket: &std::path::Path) -> ExitCode {
+fn serve(
+    _socket: &std::path::Path,
+    _streaming_opts: &fandhe_container_plugin_cri::startup::StreamingOptions,
+) -> ExitCode {
     fail(
         PluginErrorCode::Unimplemented,
         "cri plugin server requires unix domain sockets on this platform",
@@ -433,7 +448,7 @@ fn main() -> ExitCode {
             print!("{}", startup::usage());
             ExitCode::SUCCESS
         }
-        Ok(Invocation::Serve { socket }) => serve(&socket),
+        Ok(Invocation::Serve { socket, streaming }) => serve(&socket, &streaming),
         Ok(_) => {
             // `Run` と、将来足される値は成功扱いにしない。
             fail(

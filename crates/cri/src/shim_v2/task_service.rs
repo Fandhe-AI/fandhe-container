@@ -95,6 +95,7 @@ use super::exec::{
     sleep_until,
 };
 use super::message::{RpcStatus, count_top_level_field};
+use super::publish::{EventPublisher, PublishFailure, PublishStage, TaskEvent, TaskExit};
 use super::service::shutdown_gate_failure;
 use super::service::{CallContext, TaskApiVersion, TtrpcService, unimplemented_status};
 use super::shutdown::ShutdownSignal;
@@ -117,6 +118,10 @@ const FIELD_OPTIONS: u64 = 10;
 
 /// 終了コードが不明なときの `exit_status`。containerd クライアントの `UnknownExitStatus` に倣う。
 const UNKNOWN_EXIT_STATUS: u32 = 255;
+/// 同時に動かす終了 watcher の上限（`CREATED_MAX` と同じ。REPAIR-5）。
+const MAX_EXIT_WATCHERS: usize = CREATED_MAX;
+/// 照会の失敗が続いたときに watcher が諦めるまでの連続回数。
+const EXIT_WATCH_MAX_ERRORS: u32 = 3;
 /// 記録しておく作成済み ID の上限。Delete で除去するが、除去されない経路でも無制限に増やさない（REPAIR-5）。
 const CREATED_MAX: usize = 1024;
 
@@ -138,6 +143,10 @@ pub struct TaskService {
     ///
     /// v2 と v3 を同じ shim に登録するときは [`TaskService::with_shared_created`] で共有する。
     created: Arc<Mutex<BTreeSet<String>>>,
+    /// TaskExit の送り先。無ければ終了 watcher を起こさない（#4155・CRI-5）。
+    event_publisher: Option<Arc<dyn EventPublisher>>,
+    /// 稼働中の終了 watcher の ID。v2 と v3 で共有し、同じ ID の watcher を重複させず、数を [`MAX_EXIT_WATCHERS`] で抑える。
+    exit_watchers: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for TaskService {
@@ -159,7 +168,24 @@ impl TaskService {
             wait_config: WaitConfig::default(),
             shutdown: None,
             created: Arc::new(Mutex::new(BTreeSet::new())),
+            event_publisher: None,
+            exit_watchers: Arc::new(Mutex::new(BTreeSet::new())),
         }
+    }
+
+    /// TaskExit の送り先を差し込む。差し込むと、init の `Start` 成功ごとに終了 watcher を 1 本起こし、
+    /// 終了を観測したら 1 回だけ publish する（#4155・CRI-5・REPAIR-5）。Start・Wait・State・Delete の応答は変えない。
+    ///
+    /// watcher は `RuntimeAdapter::wait_exit` を期限つきで繰り返す。plugin-cri の `CoreLifecycleRuntime` は呼び出しごとに
+    /// supervisor の終了通知を購読し（枠はコンテナごとに 8、超えたら照会へ縮退）、containerd の Wait RPC と並んでも壊れない。
+    /// 待ち 1 回は [`WaitConfig`] の期限で有界だが、watcher の寿命全体は有界でない（コンテナが動く間は続く）。
+    /// 数は [`MAX_EXIT_WATCHERS`] が上限。Wait・State・Delete の経路からは publish しない（重複排除の仕組みが要るため）。
+    ///
+    /// 残余: Wait の直後 1 照会間隔以内に Delete する利用者（`ctr` 型）は、watcher の観測より先に削除が走ると取り逃しうる
+    /// （CRI の流れは `/tasks/exit` を受けてから Delete するので起きない）。restart による一時的な Stopped は対象外。
+    pub fn with_event_publisher(mut self, publisher: Arc<dyn EventPublisher>) -> Self {
+        self.event_publisher = Some(publisher);
+        self
     }
 
     /// Shutdown RPC の終了要求の送り先を差し込む。無ければ `Shutdown` は `UNIMPLEMENTED`（TASK-62.7.2）。
@@ -174,6 +200,7 @@ impl TaskService {
     pub fn with_shared_created(mut self, other: &TaskService) -> Self {
         self.created = Arc::clone(&other.created);
         self.execs = Arc::clone(&other.execs);
+        self.exit_watchers = Arc::clone(&other.exit_watchers);
         self
     }
 
@@ -554,10 +581,60 @@ impl TaskService {
             return self.start_exec(&req);
         }
         let status = self.adapter.start(&req.id).map_err(|e| to_status(&e))?;
+        self.spawn_exit_watcher(&req.id, status.pid.unwrap_or(0));
         Ok(StartResponse {
             pid: status.pid.unwrap_or(0),
         }
         .encode_to_vec())
+    }
+
+    /// init の終了 watcher を起こす（#4155）。publisher が無い・既に同じ ID の watcher がある場合は何もしない。
+    /// 上限超過とスレッドの起動失敗は構造化ログを 1 件出して起こさない（Start の応答は変えない）。
+    fn spawn_exit_watcher(&self, id: &str, start_pid: u32) {
+        let Some(publisher) = &self.event_publisher else {
+            return;
+        };
+        {
+            let mut set = self.exit_watchers.lock().unwrap_or_else(|p| p.into_inner());
+            if set.contains(id) {
+                return;
+            }
+            if set.len() >= MAX_EXIT_WATCHERS {
+                drop(set);
+                publisher.report(PublishFailure::new(PublishStage::WatchLimit, None));
+                return;
+            }
+            set.insert(id.to_owned());
+        }
+        let ctx = ExitWatch {
+            adapter: self.adapter.clone(),
+            publisher: Arc::clone(publisher),
+            wait: self.wait_config,
+            shutdown: self.shutdown.clone(),
+            id: id.to_owned(),
+            start_pid,
+        };
+        let watchers = Arc::clone(&self.exit_watchers);
+        let spawned = std::thread::Builder::new()
+            .name("shim-exit-watch".into())
+            .spawn({
+                let watchers = Arc::clone(&watchers);
+                move || {
+                    let id = ctx.id.clone();
+                    ctx.run();
+                    watchers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
+                }
+            });
+        if spawned.is_err() {
+            watchers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id);
+            publisher.report(PublishFailure::new(PublishStage::WatchSpawn, None));
+        }
     }
 
     fn delete(&self, payload: &[u8]) -> Result<Vec<u8>, RpcStatus> {
@@ -735,6 +812,82 @@ impl TaskService {
             exited_at: exited_at_of(&st),
         }
         .encode_to_vec())
+    }
+}
+
+/// 終了 watcher 1 本の持ち物（#4155）。`TaskService::spawn_exit_watcher` が起こすスレッドが所有する。
+struct ExitWatch {
+    adapter: RuntimeAdapter,
+    publisher: Arc<dyn EventPublisher>,
+    wait: WaitConfig,
+    shutdown: Option<ShutdownSignal>,
+    id: String,
+    start_pid: u32,
+}
+
+impl ExitWatch {
+    /// 終了を観測して TaskExit を 1 回だけ publish する。`Timeout` は周回を続け、`NotFound`（観測前の削除）と取り消しは黙って終わる。
+    /// その他の失敗は照会間隔だけ待って再試行し、連続 [`EXIT_WATCH_MAX_ERRORS`] 回で `watch` を 1 件記録して諦める。
+    fn run(&self) {
+        let cancelled = || {
+            self.shutdown
+                .as_ref()
+                .is_some_and(ShutdownSignal::is_requested)
+        };
+        let mut errors = 0;
+        loop {
+            if cancelled() {
+                return;
+            }
+            match self.adapter.wait_exit(
+                &self.id,
+                self.wait.timeout(),
+                self.wait.poll_interval(),
+                &cancelled,
+            ) {
+                Ok(st) => {
+                    self.publish_exit(&st);
+                    return;
+                }
+                Err(e) => match e.code() {
+                    CriErrorCode::Timeout => errors = 0,
+                    CriErrorCode::NotFound => return,
+                    _ => {
+                        errors += 1;
+                        if cancelled() {
+                            return;
+                        }
+                        if errors >= EXIT_WATCH_MAX_ERRORS {
+                            self.publisher
+                                .report(PublishFailure::new(PublishStage::Watch, None));
+                            return;
+                        }
+                        sleep_until(Instant::now() + self.wait.poll_interval(), &cancelled);
+                    }
+                },
+            }
+        }
+    }
+
+    /// 停止済みの状態から TaskExit を組み立てて送る。pid が Start 時と食い違えば作り直しとみなして送らない。
+    fn publish_exit(&self, st: &RuntimeContainerStatus) {
+        if let Some(p) = st.pid
+            && self.start_pid != 0
+            && p != self.start_pid
+        {
+            self.publisher.report(PublishFailure::new(
+                PublishStage::InstanceMismatch,
+                Some(super::publish::TASK_EXIT_TOPIC),
+            ));
+            return;
+        }
+        self.publisher.publish(TaskEvent::Exit(TaskExit {
+            container_id: self.id.clone(),
+            id: self.id.clone(),
+            pid: st.pid.unwrap_or(self.start_pid),
+            exit_status: stopped_exit_status(st),
+            exited_at: exited_at_of(st),
+        }));
     }
 }
 
@@ -3152,6 +3305,212 @@ mod tests {
                 (UNIMPL, "exec_id is not supported"),
                 "{m}"
             );
+        }
+    }
+
+    // ---- TaskExit の終了 watcher（#4155・CRI-5・REPAIR-5） ----
+
+    use super::super::publish::testkit::{CapturePublisher, wait_until};
+    use super::super::publish::{PublishStage as Stage, TaskEvent as Ev};
+
+    fn svc_pub(fake: Fake) -> (TaskService, Arc<Fake>, Arc<CapturePublisher>) {
+        let (s, f) = svc(TaskApiVersion::V2, fake);
+        let cap = Arc::new(CapturePublisher::default());
+        let s = fast_wait(s, 100).with_event_publisher(cap.clone());
+        (s, f, cap)
+    }
+
+    /// CRI-5・#4155: Start 成功後の watcher が終了を観測し、TaskExit を具体値で 1 回だけ送る。
+    /// 同じ ID の watcher は重複しない。
+    #[test]
+    fn cri5_4155_start_spawns_watcher_publishing_exit_once() {
+        let fake = Fake {
+            create_pid: Some(4242),
+            ..Fake::default()
+        };
+        let (s, f, cap) = svc_pub(fake);
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        s.spawn_exit_watcher("c1", 4242);
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(cap.events.lock().unwrap().is_empty(), "running: no event");
+        stopped_with_time(&f, "c1", Some(3), 1_700_000_000_000_000_005);
+        assert!(wait_until(std::time::Duration::from_secs(10), || {
+            !cap.events.lock().unwrap().is_empty()
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let got = cap.events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![Ev::Exit(TaskExit {
+                container_id: "c1".into(),
+                id: "c1".into(),
+                pid: 4242,
+                exit_status: 3,
+                exited_at: Some(Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 5
+                }),
+            })]
+        );
+        assert!(cap.failures.lock().unwrap().is_empty());
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            s.exit_watchers.lock().unwrap().is_empty()
+        }));
+    }
+
+    /// CRI-5・#4155: 観測前に削除された（`NOT_FOUND`）ときは何も送らず、ログも出さず、watcher の登録も消える。
+    #[test]
+    fn cri5_4155_watcher_is_silent_when_container_vanishes() {
+        let (s, f, cap) = svc_pub(Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        f.states.lock().unwrap().remove("c1");
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            s.exit_watchers.lock().unwrap().is_empty()
+        }));
+        assert!(cap.events.lock().unwrap().is_empty());
+        assert!(cap.failures.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・#4155: publisher が無ければ watcher を起こさない。
+    #[test]
+    fn cri5_4155_no_publisher_no_watcher() {
+        let (s, _f) = svc(TaskApiVersion::V2, Fake::default());
+        s.handle("Create", &create_req("c1", &abs("/b"))).unwrap();
+        s.handle("Start", &start_req("c1")).unwrap();
+        assert!(s.exit_watchers.lock().unwrap().is_empty());
+    }
+
+    /// CRI-5・SEC-1・#4155: Stopped の状態の pid が Start 時と食い違えば作り直しとみなして送らず、`instance_mismatch` を 1 件。
+    /// pid が無ければ Start 時の pid を使う。
+    #[test]
+    fn cri5_4155_pid_mismatch_is_not_published() {
+        let cap = Arc::new(CapturePublisher::default());
+        let (adapter, _f) = {
+            let f = Arc::new(Fake::default());
+            (RuntimeAdapter::from_runtime(Shared(f.clone())), f)
+        };
+        let watch = ExitWatch {
+            adapter,
+            publisher: cap.clone(),
+            wait: WaitConfig::default(),
+            shutdown: None,
+            id: "c1".into(),
+            start_pid: 4242,
+        };
+        let mut st = RuntimeContainerStatus::from(&ContainerStatus::stopped(
+            RtId::new("c1").unwrap(),
+            Some(0),
+        ));
+        st.pid = Some(9999);
+        watch.publish_exit(&st);
+        assert!(cap.events.lock().unwrap().is_empty());
+        let fails = cap.failures.lock().unwrap().clone();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].stage, Stage::InstanceMismatch);
+        st.pid = None;
+        watch.publish_exit(&st);
+        let evs = cap.events.lock().unwrap().clone();
+        assert_eq!(evs.len(), 1);
+        let Ev::Exit(e) = &evs[0];
+        assert_eq!((e.pid, e.exit_status, e.exited_at.clone()), (4242, 0, None));
+    }
+
+    /// REPAIR-5・#4155: watcher の数の上限を超えたら起こさず、`watch_limit` を 1 件記録する（Start の応答は変えない）。
+    #[test]
+    fn repair5_4155_watcher_limit() {
+        let (s, _f, cap) = svc_pub(Fake::default());
+        {
+            let mut set = s.exit_watchers.lock().unwrap();
+            for i in 0..MAX_EXIT_WATCHERS {
+                set.insert(format!("w{i}"));
+            }
+        }
+        s.spawn_exit_watcher("extra", 1);
+        let fails = cap.failures.lock().unwrap().clone();
+        assert_eq!(fails.len(), 1);
+        assert_eq!(fails[0].stage, Stage::WatchLimit);
+        assert_eq!(s.exit_watchers.lock().unwrap().len(), MAX_EXIT_WATCHERS);
+    }
+
+    /// REPAIR-5・CRI-5・#4155: publish バイナリが非 0 終了・期限超過でも、Start・State・Wait・Delete の応答は
+    /// publisher 無しと同じバイト列で、ログの失敗はちょうど 1 件。
+    #[cfg(unix)]
+    #[test]
+    fn repair5_4155_rpc_responses_unchanged_when_publish_fails() {
+        use super::super::bootstrap::{PublishBinary, ServeContext, ShimIdentifier};
+        use super::super::publish::testkit::{
+            CaptureLog, failing_body, make_script, sleeping_body,
+        };
+        use super::super::publish::{PublishConfig, exec_publisher_for_with};
+        use crate::test_root;
+
+        let run = |s: &TaskService, f: &Fake| -> Vec<Vec<u8>> {
+            let out = vec![
+                s.handle("Create", &create_req("c1", &abs("/b"))).unwrap(),
+                s.handle("Start", &start_req("c1")).unwrap(),
+            ];
+            stopped_with_time(f, "c1", Some(3), 1_700_000_000_000_000_005);
+            out
+        };
+        let tail = |s: &TaskService| -> Vec<Vec<u8>> {
+            vec![
+                s.handle(
+                    "State",
+                    &WireState {
+                        id: "c1".into(),
+                        exec_id: String::new(),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap(),
+                s.handle("Wait", &wait_req("c1", "")).unwrap(),
+                s.handle("Delete", &delete_req("c1", "")).unwrap(),
+            ]
+        };
+        for (name, deadline_stage) in [("fail", Stage::ExitStatus), ("sleep", Stage::Deadline)] {
+            let dir = test_root::test_root("pubsvc", name);
+            let body = if name == "fail" {
+                failing_body()
+            } else {
+                sleeping_body(&dir)
+            };
+            let bin = make_script(&dir, "fake", &body);
+            let log = Arc::new(CaptureLog::default());
+            let ctx = ServeContext::new(ShutdownSignal::new(), None)
+                .with_origin(
+                    Some(ShimIdentifier::parse("default").unwrap()),
+                    Some("/run/x.sock".into()),
+                )
+                .with_publish_binary(Some(PublishBinary::verify(&bin).unwrap()));
+            let publisher = exec_publisher_for_with(
+                &ctx,
+                PublishConfig::new(std::time::Duration::from_millis(400)).unwrap(),
+                log.clone(),
+            )
+            .unwrap();
+
+            let (with_pub, f1) = svc(TaskApiVersion::V2, Fake::default());
+            let with_pub = fast_wait(with_pub, 100).with_event_publisher(publisher);
+            let mut a = run(&with_pub, &f1);
+            // watcher が終了を観測して publish が失敗してから残りを呼ぶ。
+            assert!(wait_until(std::time::Duration::from_secs(10), || {
+                !log.0.lock().unwrap().is_empty()
+            }));
+            a.extend(tail(&with_pub));
+
+            let (plain, f2) = svc(TaskApiVersion::V2, Fake::default());
+            let plain = fast_wait(plain, 100);
+            let mut b = run(&plain, &f2);
+            b.extend(tail(&plain));
+
+            assert_eq!(a, b, "{name}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let got = log.0.lock().unwrap().clone();
+            assert_eq!(got.len(), 1, "{name}: {got:?}");
+            assert_eq!(got[0].stage, deadline_stage, "{name}");
         }
     }
 }

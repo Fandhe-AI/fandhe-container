@@ -36,7 +36,7 @@
 //! `docs/design/ffi-libc-check.md`「適用状況」）。なお `KVM_*` の ioctl 番号は `linux/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、導入後も `ioctl` 関数の型の照合だけが対象になる（`mmap` / `munmap` も導入後は照合の対象）。
 //! `eventfd` は `libc` に対応物があり、導入後は照合の対象になる（照合の追跡は #3664。`MADV_DONTDUMP` も同じ）。#3698 の `poll` / `struct pollfd` / `POLL*` も `libc` に対応物があり、導入後は照合の対象（#3664）。`kvm_irqfd`・`kvm_ioeventfd` もカーネル ABI で
-//! 対応物が無く、サイズ・オフセットを const assert で固定する。
+//! 対応物が無く、サイズ・オフセットを const assert で固定する。`KVM_MEM_*`（memslot のフラグ）と `KVM_CAP_READONLY_MEM` もカーネル ABI で `libc` に対応物が無く、値を const assert で固定する（#4157）。
 //! `kvm_regs`・`kvm_sregs`（`kvm_segment`・`kvm_dtable` を含む）も `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。
 //! `kvm_cpuid2` / `kvm_cpuid_entry2`・`kvm_msrs` / `kvm_msr_entry`・`kvm_fpu`・`kvm_lapic_state` も `asm/kvm.h` のカーネル ABI で
 //! `libc` に対応物が無く、サイズ・オフセットを const assert で固定する（照合の追跡は #3664）。#3737 で足した `kvm_mp_state`
@@ -198,6 +198,13 @@ pub(crate) mod consts {
     /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
     /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
     pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(10);
+    /// `KVM_MEM_LOG_DIRTY_PAGES`（Linux v6.12 `include/uapi/linux/kvm.h` で `1UL << 0`。memslot の dirty page 追跡。#4157）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_LOG_DIRTY_PAGES: u32 = 1;
+    /// `KVM_MEM_READONLY`（v6.12 `kvm.h` で `1UL << 1`。`KVM_CAP_READONLY_MEM` が要る。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_READONLY: u32 = 2;
+    /// `KVM_CAP_READONLY_MEM`（v6.12 `kvm.h` で 81。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_READONLY_MEM: super::KvmCap = super::KvmCap(81);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -289,6 +296,13 @@ pub(crate) mod consts {
     /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
     /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
     pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(10);
+    /// `KVM_MEM_LOG_DIRTY_PAGES`（Linux v6.12 `include/uapi/linux/kvm.h` で `1UL << 0`。memslot の dirty page 追跡。#4157）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_LOG_DIRTY_PAGES: u32 = 1;
+    /// `KVM_MEM_READONLY`（v6.12 `kvm.h` で `1UL << 1`。`KVM_CAP_READONLY_MEM` が要る。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_READONLY: u32 = 2;
+    /// `KVM_CAP_READONLY_MEM`（v6.12 `kvm.h` で 81。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_READONLY_MEM: super::KvmCap = super::KvmCap(81);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
@@ -337,6 +351,13 @@ pub(crate) mod consts {
     /// `KVM_CAP_NR_MEMSLOTS`（Linux v6.12 `include/uapi/linux/kvm.h` で 10。VM が使える memslot の上限数を返す。#3697）。
     /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
     pub const KVM_CAP_NR_MEMSLOTS: super::KvmCap = super::KvmCap(0);
+    /// `KVM_MEM_LOG_DIRTY_PAGES`（Linux v6.12 `include/uapi/linux/kvm.h` で `1UL << 0`。memslot の dirty page 追跡。#4157）。
+    /// `libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_LOG_DIRTY_PAGES: u32 = 0;
+    /// `KVM_MEM_READONLY`（v6.12 `kvm.h` で `1UL << 1`。`KVM_CAP_READONLY_MEM` が要る。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_MEM_READONLY: u32 = 0;
+    /// `KVM_CAP_READONLY_MEM`（v6.12 `kvm.h` で 81。#4157）。`libc` に対応物が無く、具体値の試験で固定する（#3664）。
+    pub const KVM_CAP_READONLY_MEM: super::KvmCap = super::KvmCap(0);
     pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 0;
     pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 0;
@@ -365,6 +386,9 @@ const _: () = {
     assert!(consts::KVM_ARM_VCPU_INIT == 0x4020_AEAE);
     assert!(consts::KVM_ARM_PREFERRED_TARGET == 0x8020_AEAF);
     assert!(consts::KVM_CAP_ARM_PSCI_0_2.0 == 102);
+    assert!(consts::KVM_MEM_LOG_DIRTY_PAGES == 1);
+    assert!(consts::KVM_MEM_READONLY == 2);
+    assert!(consts::KVM_CAP_READONLY_MEM.0 == 81);
     assert!(consts::KVM_ARM_VCPU_PSCI_0_2 == 2);
     assert!(consts::KVM_ARM_VCPU_POWER_OFF == 0);
 };
@@ -858,6 +882,9 @@ const _: () = {
 ))]
 const _: () = {
     assert!(consts::KVM_SET_USER_MEMORY_REGION == 0x4020_AE46);
+    assert!(consts::KVM_MEM_LOG_DIRTY_PAGES == 1);
+    assert!(consts::KVM_MEM_READONLY == 2);
+    assert!(consts::KVM_CAP_READONLY_MEM.0 == 81);
     assert!(consts::KVM_GET_VCPU_MMAP_SIZE == 0xAE04);
     assert!(consts::KVM_RUN == 0xAE80);
     assert!(consts::KVM_CHECK_EXTENSION == 0xAE03);

@@ -117,6 +117,8 @@ A を採らない理由:
 
 shim の serve の起動時に、scoped 状態ルートを `sweep_leftover_container_logs` と同じ関数・同じ guard で、期限つきの裏の thread で 1 回だけ走査する（Linux のみ。serve の開始は待たせない）。既存の走査は supervisor ログを対象にしておらず、これは plugin-cri も同じ欠けである（本設計の対象外。別途追跡する）。
 
+起動時の走査（`sweep_leftover_container_logs`）が走査するのは `@container-logs` だけで、起動オプション文書（`@container-options`）と supervisor ログ（`@supervisor-logs`）は走査しない。本設計では 2 種を起動時走査の対象外とし、次の 2 経路だけで回収する。(1) containerd が同じ ID で delete を呼び直したときの再実行（D6）。(2) 同じ ID の create の前の回収（3 種とも guard つきの削除関数を通る）。delete の再呼び出しも同じ ID の再利用も無い場合、この 2 種は残り続ける。これは容認する残余で、手動回収とする: 該当 ID の状態記録が無く sink の flock が外れていることを確かめたうえで、shim の scoped 状態ルート配下の `@container-options/<id>` と `@supervisor-logs/<id>.log*` を削除する（文書の削除は世代照合があるため新しいインスタンスと競合しない）。起動時走査へ文書用の走査を足すかは、残骸の実測が出たときに再評価する（追跡: 実装 issue の分割で扱う）。
+
 ### 永続形式
 
 無し。状態ルートに新しいファイル・ディレクトリを足さないので、`@` で始まる名前の fail-closed の規則への影響も無い。

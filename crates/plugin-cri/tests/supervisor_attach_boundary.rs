@@ -3,7 +3,7 @@
 //! 公開 API（`streaming::supervisor_attach` と cri の `AttachBackend` / `AttachSession`）だけを通し、
 //! 実の `FileStateStore`・実の pipe / socketpair / fd（`AttachIoSource` の注入は supervisor 側クライアントの代役）で
 //! stdin の往復・tap の中継・片側 EOF・形が違う fd の拒否・drop での枠の返却を具体値で照合する。root・実コンテナ・
-//! 特権は不要で既定のテスト集合で走る。実コンテナでの通しは #4079。待ちはすべて期限つき。
+//! 特権は不要で既定のテスト集合で走る。実コンテナでの通しは `tests/cri_attach_real.rs`（#4079）。待ちはすべて期限つき。
 
 #![cfg(target_os = "linux")]
 

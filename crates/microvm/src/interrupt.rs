@@ -779,7 +779,6 @@ mod tests {
         .unwrap()
     }
 
-    /// ACK の後処理の結果が種別ごとに数えられ、写しが具体値になる（#4014・MVM-5）。
     /// MVM-1・REPAIR-4・#4161: 無視 2 回・解除失敗 1 回の写しが具体値で (2, 1) になり、既定は (0, 0)。
     #[test]
     fn mvm1_4161_ioevent_tally_snapshot_counts() {
@@ -791,6 +790,7 @@ mod tests {
         assert_eq!(tally.snapshot(), IoEventCounts::new(2, 1));
     }
 
+    /// ACK の後処理の結果が種別ごとに数えられ、写しが具体値になる（#4014・MVM-5）。
     #[test]
     fn mvm5_4014_ack_tally_counts_each_resample_kind() {
         let tally = InterruptAckTally::default();

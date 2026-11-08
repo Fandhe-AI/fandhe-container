@@ -235,6 +235,10 @@ impl ProcessSignaler for ControlSignaler {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "exec-test-support"))]
+#[doc(hidden)]
+pub use linux::{RawResponseForTest, recv_response_raw_for_test};
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::{self, Write as _};
@@ -608,6 +612,56 @@ mod linux {
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
         let payload: [u8; RESPONSE_PAYLOAD_LEN] = payload.try_into().map_err(|_| unavailable())?;
         Ok((ResponseFrame::decode_payload(&payload).reason, received.fds))
+    }
+
+    /// 試験専用の生受信の結果（[`recv_response_raw_for_test`]）。判定はせず、受けたままを返す。
+    #[cfg(feature = "exec-test-support")]
+    #[doc(hidden)]
+    pub struct RawResponseForTest {
+        /// 1 回の `recvmsg` で受けたバイト列（応答 frame の先頭から。足りない残りは呼び出し側が補う）。
+        pub bytes: Vec<u8>,
+        /// 添えられた fd（`SCM_RIGHTS`）。drop で閉じる。
+        pub fds: Vec<OwnedFd>,
+        /// 制御データが切り詰められたか（`MSG_CTRUNC`）。
+        pub truncated: bool,
+    }
+
+    /// 制御チャネルの応答の最初の `recvmsg` を、本数・切り詰めを判定せずに受ける試験専用の入口
+    /// （SUP-4・SEC-1・REPAIR-12・#4138）。`tests/control_attach.rs` が、拒否応答に `SCM_RIGHTS` の fd が 0 本で
+    /// `MSG_CTRUNC` も立たないこと（受信バッファは fd 4 本分で `ATTACH_MAX_FDS` 以上のため、0 本は実際に添えられて
+    /// いないことを意味する）と、成功応答では mask の本数が届くことを具体値で照合するために使う。
+    /// `exec-test-support` でのみ存在し、最適化ビルドでは有効化できない（`lib.rs` の `compile_error!`）。
+    /// 受信は `sys::recv_with_fds` だけを使い（LP64 の x86_64 / aarch64 以外は `Unsupported`）、残り時間を
+    /// 受信タイムアウトへ設定し直す（REPAIR-5）。
+    #[cfg(feature = "exec-test-support")]
+    #[doc(hidden)]
+    pub fn recv_response_raw_for_test(
+        stream: &UnixStream,
+        deadline: Instant,
+    ) -> io::Result<RawResponseForTest> {
+        let mut buf = [0u8; RESPONSE_LEN];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            match crate::sys::recv_with_fds(stream.as_fd(), &mut buf) {
+                Ok(r) => {
+                    let bytes = buf.get(..r.len).unwrap_or_default().to_vec();
+                    return Ok(RawResponseForTest {
+                        bytes,
+                        fds: r.fds,
+                        truncated: r.truncated,
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// 稼働中コンテナの起動時 pidfd の複製を supervisor から受け取る（SUP-6・SEC-1・#2626）。

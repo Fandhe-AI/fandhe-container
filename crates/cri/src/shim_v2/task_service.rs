@@ -122,7 +122,7 @@ use crate::error::{CriError, CriErrorCode};
 use fandhe_container_core::traits::{ContainerId, Signal};
 
 /// `bundle` の最大バイト数（PATH_MAX 相当）。
-const BUNDLE_MAX_LEN: usize = 4096;
+pub(crate) const BUNDLE_MAX_LEN: usize = 4096;
 /// `CreateTaskRequest.rootfs` のフィールド番号。
 const FIELD_ROOTFS: u64 = 3;
 /// `CreateTaskRequest.options`（`Any`）のフィールド番号。型には持たない。

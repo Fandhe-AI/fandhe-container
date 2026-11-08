@@ -519,6 +519,18 @@ impl ExecRegistry {
         Ok(inner.map.len() >= MAX_EXECS_TOTAL)
     }
 
+    /// コンテナ単位の登録数が [`MAX_EXECS_PER_CONTAINER`] に達しているか。
+    /// 達していれば全体掃除をしても空きは生まれないため、掃除を省く判定に使う（#4058・REPAIR-5）。
+    pub fn is_container_full(&self, container: &ContainerId) -> Result<bool, CriError> {
+        let inner = self.inner.lock().map_err(|_| poisoned())?;
+        let n = inner
+            .map
+            .keys()
+            .filter(|(c, _)| c == container.as_str())
+            .count();
+        Ok(n >= MAX_EXECS_PER_CONTAINER)
+    }
+
     /// コンテナの exec 登録をすべて除去する（Delete 成功後、ゲート保持中に呼ぶ。CRI-5）。
     pub fn purge_container(&self, container: &ContainerId) -> Result<(), CriError> {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;

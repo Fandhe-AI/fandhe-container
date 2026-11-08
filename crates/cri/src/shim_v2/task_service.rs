@@ -440,7 +440,8 @@ impl TaskService {
                 Err(e)
                     if !swept
                         && e.code() == CriErrorCode::ResourceExhausted
-                        && self.execs.is_total_full().unwrap_or(false) =>
+                        && self.execs.is_total_full().unwrap_or(false)
+                        && !self.execs.is_container_full(&container).unwrap_or(true) =>
                 {
                     swept = true;
                     drop(gate);
@@ -2990,6 +2991,19 @@ mod tests {
             state_exec_of(&s, "c3", "e0").status,
             TaskStatus::Created as i32
         );
+    }
+
+    /// #4058: 対象コンテナが 64 件で全体も 1024 件のときも掃除せず、他コンテナを照会しない。
+    #[test]
+    fn cri5_4058_per_container_and_total_full_does_not_sweep() {
+        let (s, f, _) = svc_exec(TaskApiVersion::V2);
+        fill_total(&s);
+        f.calls.lock().unwrap().clear();
+        assert_eq!(
+            err_code(s.handle("Exec", &exec_req("c0", "over", SPEC))).0,
+            RESOURCE_EXHAUSTED
+        );
+        assert_eq!(*f.calls.lock().unwrap(), vec!["state c0".to_owned()]);
     }
 
     /// #4058: コンテナ単位の上限では掃除せず、他コンテナを照会しない。

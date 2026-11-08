@@ -50,7 +50,7 @@ fn run(sc: &Scratch, id: &str, action: &str) -> Output {
         "-address",
         "/run/containerd/containerd.sock",
         "-publish-binary",
-        "/usr/bin/containerd",
+        BIN,
         "-id",
         id,
     ])

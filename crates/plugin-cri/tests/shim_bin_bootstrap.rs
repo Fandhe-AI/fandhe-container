@@ -63,7 +63,7 @@ fn run(sc: &Scratch, id: &str, action: &str, extra: &[&str]) -> Output {
         "-address",
         "/run/containerd/containerd.sock",
         "-publish-binary",
-        "/usr/bin/containerd",
+        BIN,
         "-id",
         id,
     ])
@@ -395,7 +395,7 @@ fn sec4_3663_audit_open_failure_is_fatal_and_logged() {
         "-address",
         "/run/containerd/containerd.sock",
         "-publish-binary",
-        "/usr/bin/containerd",
+        BIN,
         "-id",
         "noaudit",
         "start",
@@ -431,7 +431,7 @@ fn sec4_3663_non_linux_starts_without_audit_sink() {
             "-address",
             "/run/containerd/containerd.sock",
             "-publish-binary",
-            "/usr/bin/containerd",
+            BIN,
             "-id",
             "noaudit",
         ])

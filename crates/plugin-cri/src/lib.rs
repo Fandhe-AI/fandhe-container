@@ -44,6 +44,7 @@ pub mod streaming;
 pub mod supervised;
 #[cfg(unix)]
 pub mod sys;
+pub mod task_exec;
 pub mod telemetry;
 
 // pid と連番だけの名前の一時ディレクトリを残骸に強くする共有部品（oci の結合試験の補助を取り込む。

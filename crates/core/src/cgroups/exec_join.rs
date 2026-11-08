@@ -78,10 +78,28 @@ fn split_cgroup_path(step: CgroupStep, path: &str) -> Result<Vec<&str>, CgroupEr
 /// 各要素を `O_NOFOLLOW` で開いて cgroup2 を確認する（symlink・別 FS への誘導を拒否）。非 root は所有者が
 /// euid であることを確認する。存在しなければ `NotFound`。
 pub(crate) fn open_cgroup_by_path(path: &str) -> Result<OwnedFd, CgroupError> {
+    open_cgroup_by_path_if_present(path)?.ok_or_else(|| {
+        CgroupError::new(
+            ErrorCode::NotFound,
+            CgroupStep::OpenRoot,
+            "cgroup path does not exist",
+        )
+    })
+}
+
+/// [`open_cgroup_by_path`] と同じ手順で辿り、cgroup ルートより下の要素が無いときだけ `Ok(None)` を返す。
+///
+/// cgroup ルート（`/sys/fs/cgroup`）自体を開けない場合は、`NotFound` でも `Err`（cgroupfs が見えない環境を
+/// 「不在」と誤認しない。#4221・fail-closed）。読み取り専用の消滅確認（`exec_child_presence_at`）が使う。
+pub(crate) fn open_cgroup_by_path_if_present(path: &str) -> Result<Option<OwnedFd>, CgroupError> {
     let comps = split_cgroup_path(CgroupStep::OpenRoot, path)?;
     let mut cur = open_cgroup_root()?;
     for comp in comps {
-        cur = open_cgroup_dir(CgroupStep::OpenRoot, cur.as_fd(), comp)?;
+        match open_cgroup_dir(CgroupStep::OpenRoot, cur.as_fd(), comp) {
+            Ok(fd) => cur = fd,
+            Err(e) if e.code == ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
     }
     let euid = sys::effective_uid();
     if euid != 0 {
@@ -97,7 +115,7 @@ pub(crate) fn open_cgroup_by_path(path: &str) -> Result<OwnedFd, CgroupError> {
             ));
         }
     }
-    Ok(cur)
+    Ok(Some(cur))
 }
 
 /// `dir` の `cgroup.procs` に `pid` が載っているか（呼び出し側の PID namespace での値）。

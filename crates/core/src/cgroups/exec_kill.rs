@@ -56,7 +56,9 @@ use crate::traits::ErrorCode;
 pub(super) const EVENTS_LIMIT: u64 = 4096;
 
 /// 子 cgroup 名の最大長（`exec-<pid>-<連番>` は十分に収まる）。
-const NAME_MAX_LEN: usize = 64;
+///
+/// stream-exec の wire（supervisor `stream_exec::wire` の `Started` の固定長の名前欄）がこの値を参照する（#4221）。
+pub const NAME_MAX_LEN: usize = 64;
 
 /// 空になるまでの待機の再読み取り間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -292,6 +294,37 @@ fn kill_wait_remove(
         Err(e) if e.code == ErrorCode::NotFound => Ok(ExecChildRemoval::Absent),
         Err(e) => Err(e),
     }
+}
+
+/// exec 用の子 cgroup の有無（[`exec_child_presence_at`] の結果。#4221）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecChildPresence {
+    /// 名前のディレクトリが無い。
+    Absent,
+    /// 名前のディレクトリがある（プロセスが残っているか、回収の途中）。
+    Present,
+}
+
+/// コンテナ cgroup `container` 直下に `name` のディレクトリがあるかを **読み取り専用** で調べる（#4221・CRI-5・SEC-1）。
+///
+/// `cgroup.kill`・`rmdir`・`cgroup.procs` への書き込みは一切しない。名前は helper の pid と連番で作られ、
+/// helper の回収後に別の helper が同じ名前を作りうるため、ここで kill すると別の exec を止めかねない。
+/// 読むだけなら再利用で起きるのは「まだある」と見える安全側の誤りだけになる。cgroup v2 のディレクトリは
+/// プロセスが残る間 `rmdir` できないため、不在は「そこにいたプロセスが全て消えた」証拠になる。
+/// 名前は検証してから開く（`exec-` 接頭辞・`[a-z0-9-]`・1 要素）。非 root は所有者が euid であることも確かめる。
+pub(crate) fn exec_child_presence_at(
+    container: std::os::fd::BorrowedFd<'_>,
+    name: &str,
+) -> Result<ExecChildPresence, CgroupError> {
+    let step = CgroupStep::Cleanup;
+    validate_exec_child_name(name)?;
+    let entry = match open_cgroup_dir(step, container, name) {
+        Ok(fd) => fd,
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(ExecChildPresence::Absent),
+        Err(e) => return Err(e),
+    };
+    require_owned_by_euid(step, entry.as_fd())?;
+    Ok(ExecChildPresence::Present)
 }
 
 /// 掃除で読むディレクトリエントリ総数の上限（cgroup のインターフェースファイルも数えるため大きめ。REPAIR-5）。
@@ -717,6 +750,25 @@ mod tests {
             let err = validate_exec_child_name(bad).unwrap_err();
             assert_eq!(err.code, ErrorCode::FailedPrecondition, "{bad:?}");
         }
+    }
+
+    /// CRI-5・SEC-1・#4221: 無い名前は `Absent`、不正な名前は検証で拒否する（どちらも書き込みをしない）。
+    #[test]
+    fn cri5_4221_presence_absent_and_invalid_name() {
+        let (_scratch, d) = tmp("presence");
+        let fd = OwnedFd::from(File::open(&d).unwrap());
+        assert_eq!(
+            exec_child_presence_at(fd.as_fd(), "exec-4242-0").unwrap(),
+            ExecChildPresence::Absent
+        );
+        for bad in ["", "exec-", "fc-c1@7", "exec-A", "exec-1/2", "exec-.."] {
+            assert_eq!(
+                exec_child_presence_at(fd.as_fd(), bad).unwrap_err().code,
+                ErrorCode::FailedPrecondition,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(NAME_MAX_LEN, 64);
     }
 
     /// SUP-6・TASK-163 追補: `populated` の解析は具体値で照合し、異常な応答は拒否する。

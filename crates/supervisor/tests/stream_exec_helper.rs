@@ -422,7 +422,11 @@ fn sup6_3760_started_follows_notify_and_failure_aborts() {
         vec!["notify", "run-done"]
     );
     let msg = recv_from_helper(&plugin, Instant::now() + Duration::from_secs(5)).expect("started");
-    assert!(matches!(msg, HelperMessage::Started), "{msg:?}");
+    // `Started` は on_created に渡った exec 子 cgroup の名前を運ぶ（wire v2・#4221）。
+    match msg {
+        HelperMessage::Started(name) => assert_eq!(name.as_str(), "exec-4242-0"),
+        other => panic!("expected Started, got {other:?}"),
+    }
 
     let sc = Scenario {
         notify_fails: true,

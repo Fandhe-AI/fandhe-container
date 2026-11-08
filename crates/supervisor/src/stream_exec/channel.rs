@@ -29,12 +29,12 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::exec::PtyMaster;
+use fandhe_container_core::exec::{ExecCgroupName, PtyMaster};
 use fandhe_container_core::traits::ErrorCode;
 
 use super::wire::{
-    EncodeError, Frame, HEADER_LEN, Kind, MAX_FRAME_LEN, StdioMask, StreamExecOutcome, WireError,
-    parse_header,
+    EncodeError, Frame, HEADER_LEN, Kind, MAX_FRAME_LEN, StdioMask, StreamExecOutcome,
+    WireCgroupName, WireError, parse_header,
 };
 use crate::sys;
 
@@ -106,8 +106,8 @@ pub struct StdioFds {
 /// helper から plugin-cri への受信結果。
 #[derive(Debug)]
 pub enum HelperMessage {
-    /// exec の開始。
-    Started,
+    /// exec の開始（helper が作った exec 子 cgroup の名前。検証済み。#4221）。
+    Started(ExecCgroupName),
     /// pty master（`PtyMaster::from_received` で検証済み）。
     PtyMaster(PtyMaster),
     /// 終了の結果。
@@ -184,9 +184,14 @@ pub fn send_stdio_handover(
     send_frame(stream, &Frame::StdioHandover(mask), &fds, deadline)
 }
 
-/// helper → plugin-cri: exec の開始を知らせる。
-pub fn send_started(stream: &UnixStream, deadline: Instant) -> Result<(), ChannelError> {
-    send_frame(stream, &Frame::Started, &[], deadline)
+/// helper → plugin-cri: exec の開始と、作った exec 子 cgroup の名前を知らせる（#4221。名前は plugin-cri が消滅確認に使う）。
+pub fn send_started(
+    stream: &UnixStream,
+    name: &ExecCgroupName,
+    deadline: Instant,
+) -> Result<(), ChannelError> {
+    let wire = WireCgroupName::from_name(name).map_err(ChannelError::Unencodable)?;
+    send_frame(stream, &Frame::Started(wire), &[], deadline)
 }
 
 /// helper → plugin-cri: pty master の fd を渡す。
@@ -307,7 +312,10 @@ pub fn recv_from_helper(
         return Err(ChannelError::FdCountMismatch);
     }
     match frame {
-        Frame::Started => Ok(HelperMessage::Started),
+        Frame::Started(name) => name
+            .to_name()
+            .map(HelperMessage::Started)
+            .map_err(ChannelError::Malformed),
         Frame::Result(o) => Ok(HelperMessage::Result(o)),
         Frame::PtyMaster => {
             let fd = fds
@@ -429,11 +437,11 @@ mod tests {
     #[test]
     fn sup6_helper_messages_roundtrip() {
         let (a, b) = pair();
-        send_started(&a, far()).unwrap();
-        assert!(matches!(
-            recv_from_helper(&b, far()).unwrap(),
-            HelperMessage::Started
-        ));
+        send_started(&a, &ExecCgroupName::new("exec-4242-0").unwrap(), far()).unwrap();
+        match recv_from_helper(&b, far()).unwrap() {
+            HelperMessage::Started(n) => assert_eq!(n.as_str(), "exec-4242-0"),
+            other => panic!("unexpected {other:?}"),
+        }
         let outcome = StreamExecOutcome::NotStarted {
             exit: ChildStatus::Signaled(ExitSignal::new(9).unwrap()),
             step: None,
@@ -520,7 +528,7 @@ mod tests {
         let two = [null.as_fd(), null.as_fd()];
         let one = [null.as_fd()];
         let frame = |kind: u8, plen: u8, payload: &[u8], fds: &[BorrowedFd<'_>]| {
-            let mut v = vec![b'F', b'C', b'S', b'X', 1, kind, 0, plen];
+            let mut v = vec![b'F', b'C', b'S', b'X', 2, kind, 0, plen];
             v.extend_from_slice(payload);
             sys::send_with_fds(a.as_fd(), &v, fds).unwrap();
         };
@@ -537,7 +545,10 @@ mod tests {
             ChannelError::FdCountMismatch
         );
         // Started に fd 1 本。
-        frame(2, 0, &[], &one);
+        let mut started = [0u8; 65];
+        started[0] = 11;
+        started[1..12].copy_from_slice(b"exec-4242-0");
+        frame(2, 65, &started, &one);
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
             ChannelError::FdCountMismatch
@@ -560,7 +571,7 @@ mod tests {
     fn sup6_fd_on_continuation_rejected() {
         let (a, b) = pair();
         let null = File::open("/dev/null").unwrap();
-        let head = [b'F', b'C', b'S', b'X', 1, 1, 0, 1];
+        let head = [b'F', b'C', b'S', b'X', 2, 1, 0, 1];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         sys::send_with_fds(a.as_fd(), &[0b001], &[null.as_fd()]).unwrap();
         assert_eq!(
@@ -574,7 +585,7 @@ mod tests {
         let (a, b) = pair();
         let (mut r, w) = std::io::pipe().unwrap();
         // 不正な magic の frame に pipe の書き込み端を添える。
-        let bad = [b'X', b'C', b'S', b'X', 1, 2, 0, 0];
+        let bad = [b'X', b'C', b'S', b'X', 2, 2, 0, 0];
         sys::send_with_fds(a.as_fd(), &bad, &[w.as_fd()]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
@@ -593,7 +604,7 @@ mod tests {
     #[test]
     fn sup6_oversized_header_rejected_without_payload() {
         let (a, b) = pair();
-        let head = [b'F', b'C', b'S', b'X', 1, 4, 0xFF, 0xFF];
+        let head = [b'F', b'C', b'S', b'X', 2, 4, 0xFF, 0xFF];
         sys::send_with_fds(a.as_fd(), &head, &[]).unwrap();
         let t = Instant::now();
         let err = recv_from_helper(&b, Instant::now() + Duration::from_secs(5)).unwrap_err();
@@ -604,19 +615,21 @@ mod tests {
     #[test]
     fn sup6_unknown_and_reverse_direction_kinds_rejected() {
         let (a, b) = pair();
-        let unknown = [b'F', b'C', b'S', b'X', 1, 9, 0, 0];
+        let unknown = [b'F', b'C', b'S', b'X', 2, 9, 0, 0];
         sys::send_with_fds(a.as_fd(), &unknown, &[]).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
             ChannelError::Malformed(WireError::UnknownKind)
         );
         // helper 側で Started を受ける。
-        send_started(&a, far()).unwrap();
+        send_started(&a, &ExecCgroupName::new("exec-4242-0").unwrap(), far()).unwrap();
         assert_eq!(
             recv_stdio_handover(&b, StdioMask::new(0).unwrap(), far()).unwrap_err(),
             ChannelError::Malformed(WireError::UnknownKind)
         );
-        // plugin-cri 側で StdioHandover を受ける。
+        // plugin-cri 側で StdioHandover を受ける（向きの違う frame は拒否後に channel を再利用しないので、組を取り直す。
+        // `Started` の payload が未読のまま残るため、同じ組では続きの frame を読めない）。
+        let (a, b) = pair();
         send_stdio_handover(&a, &StdioSend::default(), far()).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),

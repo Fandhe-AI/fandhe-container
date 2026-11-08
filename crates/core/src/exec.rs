@@ -164,12 +164,14 @@ pub use capabilities::{
     apply_join_credentials_for_test, apply_join_user_for_test, clear_supplementary_groups_for_test,
 };
 pub use cgroup_join::{
-    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupRemoval, ExecCgroupSweep,
-    ExecChildCgroup, join_cgroup, prepare_cgroup_join, remove_exec_child_cgroup,
-    sweep_stale_exec_child_cgroups,
+    ExecCgroupJoin, ExecCgroupJoinReport, ExecCgroupName, ExecCgroupPresence, ExecCgroupRemoval,
+    ExecCgroupSweep, ExecChildCgroup, exec_child_cgroup_presence, join_cgroup, prepare_cgroup_join,
+    remove_exec_child_cgroup, sweep_stale_exec_child_cgroups,
 };
 #[cfg(feature = "exec-test-support")]
-pub use cgroup_join::{remove_exec_child_cgroup_in, sweep_stale_exec_child_cgroups_in};
+pub use cgroup_join::{
+    exec_child_cgroup_presence_in, remove_exec_child_cgroup_in, sweep_stale_exec_child_cgroups_in,
+};
 pub use container_env::{ContainerEnv, ExecCommand};
 /// 結合試験 `tests/device_cgroup_layers.rs` 専用の再公開（SEC-1・TASK-32 追補・#1681。通常の利用者は呼ばない。
 /// 詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。

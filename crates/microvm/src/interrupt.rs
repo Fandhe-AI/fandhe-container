@@ -93,6 +93,68 @@ pub struct InterruptAckReport {
     pub resample: LineResample,
 }
 
+/// ioeventfd の「無視」と「解除失敗」の VM ごとの累計（観測専用。#4161・MVM-1・REPAIR-3・REPAIR-4）。
+///
+/// `MicroVm::assemble` 1 回につき 1 つで、通知スレッド（`IoEventPoller`）と全 [`IoEventFd`](crate::irq::IoEventFd)
+/// が `Arc` で共有する。停止の報告（`StopReport::ioevent`）と plugin-microvm の stop の結果行
+/// （`op=plugin.microvm.stop` の `ignored=` / `unbind_failed=`）へ渡す。値は判断材料で、受理や停止の合否には使わない。
+/// 各計数は `u64` の加算で、実用上あふれない。
+///
+/// - `ignored`: 通知スレッドが受理判定（`complete_ioevent`）に回して `Ok(None)`（DRIVER_OK 前・FAILED・ready でないキュー等）で
+///   捨てた回数。複数回の kick が 1 回にまとまったものは 1 件。`take() == 0` の起床は数えない。MMIO exit 経路で捨てたものは対象外。
+///   `op=microvm.ioevent` の経路に対応する。
+/// - `unbind_failed`: `IoEventFd` の drop での `KVM_IOEVENTFD` 解除の失敗。`op=kvm.ioeventfd.deassign` の行と同じ事象
+///   （そちらはプロセス全体の件数、本型は VM ごと）。
+#[derive(Debug, Default)]
+pub struct IoEventTally {
+    ignored: std::sync::atomic::AtomicU64,
+    unbind_failed: std::sync::atomic::AtomicU64,
+}
+
+/// [`IoEventTally`] のある時点の写し（REPAIR-4: 構造を持つ型で返す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct IoEventCounts {
+    /// 受理条件を満たさず無視した通知の回数。
+    pub ignored: u64,
+    /// ioeventfd の解除に失敗した回数。
+    pub unbind_failed: u64,
+}
+
+impl IoEventCounts {
+    /// 計数から写しを作る（`non_exhaustive` のため crate 外の試験・adapter が値を組むための入口）。
+    pub const fn new(ignored: u64, unbind_failed: u64) -> Self {
+        Self {
+            ignored,
+            unbind_failed,
+        }
+    }
+}
+
+impl IoEventTally {
+    /// 受理条件を満たさず捨てた通知 1 回分を数える。
+    pub fn record_ignored(&self) {
+        // u64 の加算は実用上あふれない。観測専用なので順序は Relaxed で足りる。
+        self.ignored
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ioeventfd の解除失敗 1 回分を数える。
+    pub fn record_unbind_failed(&self) {
+        self.unbind_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 現在の計数の写しを返す。
+    pub fn snapshot(&self) -> IoEventCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        IoEventCounts {
+            ignored: self.ignored.load(Relaxed),
+            unbind_failed: self.unbind_failed.load(Relaxed),
+        }
+    }
+}
+
 /// `InterruptACK` の後処理の結果の累計（観測専用。#4014・#3863・MVM-5）。
 ///
 /// 呼び出し元は macOS の `hvf::mmio` のハンドラだけで、デバイス 1 台につき 1 つを全 vCPU が `Arc` で共有する。
@@ -718,6 +780,17 @@ mod tests {
     }
 
     /// ACK の後処理の結果が種別ごとに数えられ、写しが具体値になる（#4014・MVM-5）。
+    /// MVM-1・REPAIR-4・#4161: 無視 2 回・解除失敗 1 回の写しが具体値で (2, 1) になり、既定は (0, 0)。
+    #[test]
+    fn mvm1_4161_ioevent_tally_snapshot_counts() {
+        let tally = IoEventTally::default();
+        assert_eq!(tally.snapshot(), IoEventCounts::new(0, 0));
+        tally.record_ignored();
+        tally.record_ignored();
+        tally.record_unbind_failed();
+        assert_eq!(tally.snapshot(), IoEventCounts::new(2, 1));
+    }
+
     #[test]
     fn mvm5_4014_ack_tally_counts_each_resample_kind() {
         let tally = InterruptAckTally::default();

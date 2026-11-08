@@ -178,12 +178,19 @@ mod mock_core {
             Ok(u32::try_from(r.starts.len()).expect("small"))
         }
 
-        fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
+        fn stop(
+            &mut self,
+            vm: u32,
+            deadline: Duration,
+        ) -> Result<fandhe_container_plugin_microvm::adapter::StopOutcome, MicrovmError> {
             let mut r = self.0.lock().expect("lock");
             r.stops.push((vm, deadline));
             match r.stop_err {
                 Some(code) => Err(MicrovmError::new(code, "fake stop")),
-                None => Ok("requested"),
+                None => Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
+                    reason: "requested",
+                    ioevent: None,
+                }),
             }
         }
 
@@ -271,12 +278,19 @@ mod mock_core {
             Ok(u32::try_from(r.starts.len()).expect("small"))
         }
 
-        fn stop(&mut self, vm: u32, deadline: Duration) -> Result<&'static str, MicrovmError> {
+        fn stop(
+            &mut self,
+            vm: u32,
+            deadline: Duration,
+        ) -> Result<fandhe_container_plugin_microvm::adapter::StopOutcome, MicrovmError> {
             self.rec.lock().expect("lock").stops.push((vm, deadline));
             let _ = self.stopping.send(());
             // STOP_ALL_BUDGET（4 秒）より短い期限で待つ（REPAIR-5）。
             let _ = self.release.recv_timeout(Duration::from_secs(3));
-            Ok("requested")
+            Ok(fandhe_container_plugin_microvm::adapter::StopOutcome {
+                reason: "requested",
+                ioevent: None,
+            })
         }
 
         fn exit_watch(&self, vm: &u32) -> u32 {

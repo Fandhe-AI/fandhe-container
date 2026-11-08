@@ -32,7 +32,7 @@
 //! - `AttachSession.stdin` の「バッファしない」に対し、socketpair のバッファ分だけ先行する（`exec_launcher` と同じ逸脱）
 //! - コンテナが stdin を読まず pipe / pty が満杯でも、入力スレッドは待たない `poll(POLLOUT)` と書き込みを全書き手共通の排他の中で行い、10 ms 刻みで再確認するだけで、セッションの
 //!   drop（取り消し）で抜ける（`write` で無期限に止まらない）。書き込みは詰まらない大きさに絞る（fifo は 512 バイト、
-//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
+//!   pty・socket は 1 バイト）ため、大きな貼り付けは遅い。排他の保持者が plugin 外の書き手のせいで `write` に止まると全セッションの入力が進まないが、他のセッションは取り消しで抜けられる（#4134）。生きたセッションが読まれない stdin を待ち続ける間は枠を占有する
 //! - `stdin_once` のとき `obtain` が戻った後に future が drop されると、`AttachIo` の drop で唯一の書き込み端が閉じ、コンテナは
 //!   EOF を受ける（supervisor 側の `sendmsg` 直後の窓と同種の残余で、なくせない）
 //! - tty でも stdin を要求しない接続には master が渡らず、resize は `None`
@@ -48,7 +48,7 @@ use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,10 @@ const OBTAIN_BUDGET: Duration = Duration::from_secs(5);
 
 /// 取り消しや書き込みの再試行を見直す刻み。
 const TICK: Duration = Duration::from_millis(10);
+
+/// 書き込み調停の排他の取得を再試行する刻み（#4134）。保持は短く有限なので `TICK` より細かくし、
+/// 複数セッションの同時入力（pty は 1 バイト単位）の速度を `lock()` のときから大きく落とさない。
+const ARBITER_RETRY: Duration = Duration::from_millis(1);
 
 /// 退避経路（状態ストアの照会）の間隔。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -355,6 +359,26 @@ fn sleep_cancellable(d: Duration, cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::SeqCst)
 }
 
+/// `arbiter` を取り消しを見ながら取る（REPAIR-5・CRI-6・#4134）。取り消されたら `None`。
+/// 保持者が plugin 外の書き手のせいで `write` の中で止まっても、待つ側はここで抜けられる。
+/// 毒（保持者の panic）は中身が `()` で守る不変条件がないので無視して取る。
+fn lock_cancellable<'a>(arbiter: &'a Mutex<()>, cancel: &AtomicBool) -> Option<MutexGuard<'a, ()>> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        match arbiter.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if sleep_cancellable(ARBITER_RETRY, cancel) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// 監視スレッドの本体。終了の合図を立てるか、取り消しで抜ける。
 fn watch_exit(
     store: &dyn StateStore,
@@ -414,15 +438,25 @@ fn watch_exit(
 /// 止まり、取り消しも見えなくなる。そこで「待たない poll → 書き込み」を 1 つの排他の中で行い、
 /// この plugin 内の書き手同士では空きを奪い合わない。保持中に待つ処理はない（poll は待たず、書き込みは空きが確かめられた
 /// 大きさに絞る）ので、排他の保持は有限で短い。待ちと取り消しの確認は排他の外で行う。
-/// 残余: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。
+/// 排他の取得待ちも `try_lock` と取り消しの確認の繰り返しで、取り消しを見る（#4134）。
+/// 残余: plugin 外の書き手（supervisor 自身など）が同じ記述へ書く場合は調停できない。`poll` と `write` の間に
+/// 空きを使い切られると、保持者は記述が空くか閉じるまで `write` の中で止まり取り消しを見られず、その間は
+/// 全セッション・全コンテナの入力が進まない。ただし他のセッションは取り消しで抜け、スレッド・fd・枠を返せる。
 static WRITE_ARBITER: Mutex<()> = Mutex::new(());
 
 /// `file` へ全部書く（REPAIR-5）。書く前に毎回 `poll(POLLOUT)` を待たずに確かめ、書けなければ排他の外で
 /// 10 ms 待って取り消しを見る。記述のフラグ（`O_NONBLOCK`）は変えない（supervisor 側と共有の open file description
 /// のため）。書ける確認から書き込みまでは [`WRITE_ARBITER`] で調停するので、コンテナが読まず pipe / pty が満杯でも、
 /// セッションの drop（取り消し）で抜けてスレッド・fd・枠を返せる。1 回の書き込みは、確認した空きに収まる大きさに
-/// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。
-fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &AtomicBool) -> bool {
+/// 絞る（`slice`: fifo は `PIPE_BUF` 以下、pty・socket は 1 バイト）。`arbiter` は本番では [`WRITE_ARBITER`]
+/// （試験は局所の排他）で、取得待ちでも取り消しを見る（#4134）。
+fn write_all_retry(
+    file: &mut File,
+    mut data: &[u8],
+    slice: usize,
+    cancel: &AtomicBool,
+    arbiter: &Mutex<()>,
+) -> bool {
     use crate::sys::{WritePoll, poll_writable};
 
     while !data.is_empty() {
@@ -430,7 +464,9 @@ fn write_all_retry(file: &mut File, mut data: &[u8], slice: usize, cancel: &Atom
             return false;
         }
         {
-            let _turn = WRITE_ARBITER.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(_turn) = lock_cancellable(arbiter, cancel) else {
+                return false;
+            };
             match poll_writable(file.as_fd(), 0) {
                 Ok(WritePoll::Ready) => {
                     let part = data.get(..slice.min(data.len())).unwrap_or_default();
@@ -482,7 +518,7 @@ fn bridge_input(
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
                         let Some(chunk) = buf.get(..n) else { return };
-                        if !write_all_retry(&mut file, chunk, slice, &cancel) {
+                        if !write_all_retry(&mut file, chunk, slice, &cancel, &WRITE_ARBITER) {
                             return;
                         }
                     }

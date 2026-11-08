@@ -433,6 +433,7 @@ CRI の `ExecSync`（現状 `UNIMPLEMENTED`）も本設計の helper を再利�
 - Exec の相対 argv[0]（PATH 解決）: #2439 の判断待ち。RPC 時に `INVALID_ARGUMENT`
 - Exec の実機前提試験: #3762。完全版 Attach の実機前提試験は #4079（`production_binary_attach_real`）で実装済み
 - Exec の残余: plugin-cri の異常終了時の helper の早期停止（#4112）（`PtyMaster` の fd 検証は #4100 で解消）
+- Attach の残余: 入力の書き込みは全セッション共通の排他（`WRITE_ARBITER`）で調停する。plugin 外の書き手が空きを使い切ると保持者は `write` で止まり、その間は全セッション・全コンテナの入力が進まない。他のセッションの排他の待ちは取り消しで抜け、スレッド・fd・枠を返す（#4134・CRI-6・REPAIR-5）
 - 暫定値・設計の確認事項（exec の全体上限・同時セッション数・`::1`・終了コード・観測名など）: 上の「未確認・オーナー確認事項」と #4116（オーナー判断）
 - rootful: plugin-cri の start が uid 0 を `UNIMPLEMENTED` にするため、rootful のコンテナは無く 3 RPC とも使えない（uid 0 の拒否は #2442、rootful を許すかは #2241 の判断待ち）
 - 非 Linux: Exec は未結線の `UNIMPLEMENTED`。コンテナの start 自体も未実装（macOS の状態ルートは #2431）

@@ -11,6 +11,9 @@
 //! - exec のプロセスの `/proc/<pid>/status` の `CapEff`・`CapPrm`・`CapBnd`・`Seccomp` が、コンテナの init を超えないこと（SEC-1）。
 //!   `CapEff` は OCI 既定（`0xa80425fb`）と一致し、`Seccomp` は 2（filter）
 //!
+//! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
+//! 回収の部品は `support/cri_real_reclaim.rs`（トークンのラベルと台帳の ID だけを期限つきで Stop / Remove する）。
+//!
 //! ハーネス（TempDir・ChildGuard・接続待ち・pull の失敗行）は `container_grpc.rs` の段 C と同じものを最小化して複製した
 //! （試験 crate 間でモジュールを共有できないため）。`container_grpc.rs` は変更しない（波及の最小化。REPAIR-1）。
 //!
@@ -32,6 +35,8 @@ mod spdy_client;
 // serde_json を plugin-cri の依存に足さないための最小 JSON 読み取り。
 #[path = "support/mini_json.rs"]
 mod mini_json;
+#[path = "support/cri_real_reclaim.rs"]
+mod reclaim;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,6 +55,7 @@ use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const IMAGE: &str = "docker.io/library/busybox:1.36";
+const TEST: &str = "production_binary_exec_real";
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
@@ -320,7 +326,223 @@ async fn status_of_pid(
     parse_status(&String::from_utf8(o.stdout).expect("status is utf-8"))
 }
 
+/// 試験本体（sandbox の作成から exec の照合・後始末まで）。`inject` が真なら StartContainer と Running の確認の直後に
+/// 固定文言で panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
+async fn scenario(
+    mut c: RuntimeServiceClient<Channel>,
+    token: String,
+    ledger: reclaim::Ledger,
+    inject: bool,
+) {
+    // core の start が受けられる NODE の network namespace にする（container_grpc.rs の段 C と同じ）。
+    let mut run = cri::RunPodSandboxRequest {
+        config: Some(cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: "pod-exec-real".into(),
+                uid: reclaim::sandbox_uid("uid-exec", &token),
+                namespace: "default".into(),
+                attempt: 0,
+            }),
+            labels: reclaim::config_labels(&token),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    run.config
+        .as_mut()
+        .expect("config")
+        .linux
+        .get_or_insert_with(Default::default)
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(cri::NamespaceOption {
+        network: cri::NamespaceMode::Node as i32,
+        ..Default::default()
+    });
+    let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+        .await
+        .expect("run sandbox")
+        .into_inner()
+        .pod_sandbox_id;
+    reclaim::record_sandbox(&ledger, &sb);
+
+    let long = Duration::from_secs(120);
+    let id = call_with_deadline(
+        c.create_container(cri::CreateContainerRequest {
+            pod_sandbox_id: sb.clone(),
+            config: Some(cri::ContainerConfig {
+                metadata: Some(cri::ContainerMetadata {
+                    name: "c".into(),
+                    attempt: 0,
+                }),
+                image: Some(image_spec(IMAGE)),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                labels: reclaim::config_labels(&token),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+        long,
+    )
+    .await
+    .expect("create by tag")
+    .into_inner()
+    .container_id;
+    reclaim::record_container(&ledger, &id);
+    call_with_deadline(
+        c.start_container(cri::StartContainerRequest {
+            container_id: id.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("start");
+    let st = call_with_deadline(
+        c.container_status(cri::ContainerStatusRequest {
+            container_id: id.clone(),
+            verbose: false,
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("status")
+    .into_inner()
+    .status
+    .expect("status body");
+    assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
+    if inject {
+        panic!("{}", reclaim::injected_message(TEST));
+    }
+
+    // 1. echo: stdout の内容・stderr が空・Success。
+    let o = exec_once(&mut c, &id, &["/bin/echo", "hello", "exec"]).await;
+    assert_eq!(o.stdout, b"hello exec\n");
+    assert_eq!(o.stderr, b"");
+    assert_eq!(status_str(&o.status, "status"), "Success", "{:?}", o.status);
+    assert_eq!(o.goaway, goaway_status::OK);
+
+    // 2. exit 3: NonZeroExitCode と cause の ExitCode / "3"。
+    let o = exec_once(&mut c, &id, &["/bin/sh", "-c", "exit 3"]).await;
+    assert_eq!(status_str(&o.status, "status"), "Failure", "{:?}", o.status);
+    assert_eq!(
+        status_str(&o.status, "reason"),
+        "NonZeroExitCode",
+        "{:?}",
+        o.status
+    );
+    let causes = match o.status.get("details").and_then(|d| d.get("causes")) {
+        Some(mini_json::Json::Array(v)) => v,
+        other => panic!("details.causes is not an array: {other:?}"),
+    };
+    assert_eq!(causes.len(), 1, "{:?}", o.status);
+    assert_eq!(status_str(&causes[0], "reason"), "ExitCode");
+    assert_eq!(status_str(&causes[0], "message"), "3");
+    assert_eq!(o.goaway, goaway_status::OK);
+
+    // 3. SEC-1: exec のプロセス自身とコンテナの init の capability・seccomp を照合する。
+    let exec_st = status_of_pid(&mut c, &id, "self").await;
+    assert_eq!(exec_st.get("Name").map(String::as_str), Some("cat"));
+    let init_st = status_of_pid(&mut c, &id, "1").await;
+    assert_eq!(init_st.get("Name").map(String::as_str), Some("sleep"));
+
+    let init_eff = hex_field(&init_st, "CapEff");
+    assert_eq!(
+        init_eff, OCI_DEFAULT_MASK,
+        "init CapEff {init_eff:#x} is not the OCI default {OCI_DEFAULT_MASK:#x}"
+    );
+    assert_eq!(init_st.get("Seccomp").map(String::as_str), Some("2"));
+    for key in ["CapEff", "CapPrm", "CapBnd"] {
+        let (e, i) = (hex_field(&exec_st, key), hex_field(&init_st, key));
+        assert_eq!(
+            e & !i,
+            0,
+            "exec {key} {e:#x} exceeds the container init {i:#x} (SEC-1)"
+        );
+    }
+    let exec_eff = hex_field(&exec_st, "CapEff");
+    assert_eq!(
+        exec_eff, OCI_DEFAULT_MASK,
+        "exec CapEff {exec_eff:#x} is not the OCI default {OCI_DEFAULT_MASK:#x}"
+    );
+    assert_eq!(exec_st.get("Seccomp").map(String::as_str), Some("2"));
+    assert_eq!(hex_field(&exec_st, "CapInh"), 0);
+    assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
+
+    // 後始末（成功経路）。照合は自分の sandbox とトークンのラベルで絞る（他の記録の有無には依らない）。
+    call_with_deadline(
+        c.stop_container(cri::StopContainerRequest {
+            container_id: id.clone(),
+            timeout: 2,
+        }),
+        long,
+    )
+    .await
+    .expect("stop");
+    call_with_deadline(
+        c.remove_container(cri::RemoveContainerRequest {
+            container_id: id.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("remove");
+    reclaim::forget_container(&ledger, &id);
+    let left = call_with_deadline(
+        c.list_containers(cri::ListContainersRequest {
+            filter: Some(cri::ContainerFilter {
+                pod_sandbox_id: sb.clone(),
+                label_selector: reclaim::labels(&token),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list containers")
+    .into_inner()
+    .containers
+    .len();
+    assert_eq!(left, 0);
+    call_with_deadline(
+        c.stop_pod_sandbox(cri::StopPodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("stop sandbox");
+    call_with_deadline(
+        c.remove_pod_sandbox(cri::RemovePodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("remove sandbox");
+    reclaim::forget_sandbox(&ledger, &sb);
+    let left_sb = call_with_deadline(
+        c.list_pod_sandbox(cri::ListPodSandboxRequest {
+            filter: Some(cri::PodSandboxFilter {
+                label_selector: reclaim::labels(&token),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list sandboxes")
+    .into_inner()
+    .items
+    .len();
+    assert_eq!(left_sb, 0);
+}
+
 /// 段階（本番バイナリ越しの実コンテナへの exec）。
+///
+/// 失敗後の回収（#4142）: 本体（[`scenario`]）を 2 回走らせる。1 回目は StartContainer の直後に固定文言で panic させ
+/// （注入）、回収が `containers=1 sandboxes=1 left=0` で旧 ID を `NOT_FOUND` にすることを照合する。2 回目は同じ metadata で
+/// 最後まで通し、`ALREADY_EXISTS` にならないことを機械照合する。2 回目が失敗しても回収してから元の panic を再送出する。
+/// 回収にも失敗したら残った ID と回収手順の文書を 1 行で出す（uid にトークンが入るので次の実行は守られる）。
 ///
 /// `#[ignore]` の理由（既定の集合から分ける）: (1) StartContainer と Exec は supervisor 経由の本番経路で、`systemd --user` の
 /// 委譲 cgroup scope の中で動かす必要がある（Landlock ABI 6 以上・user manager の private ソケット・`XDG_RUNTIME_DIR` も要る）、
@@ -333,6 +555,7 @@ async fn status_of_pid(
 #[tokio::test]
 #[ignore = "requires systemd --user delegated scope, supervisor bin, Landlock ABI 6+, and outbound HTTPS to a registry (CRI-6/SEC-1, #3762)"]
 async fn production_binary_exec_real() {
+    let started = Instant::now();
     tokio::time::timeout(WATCHDOG, async {
         // 前提欠如は plugin を起動する前に 1 行目で見分けられる形で失敗させる（skip しない）。
         let _cgroup = precondition::delegated_cgroup();
@@ -362,175 +585,77 @@ async fn production_binary_exec_real() {
             panic!("pull image: {line}");
         }
 
-        // core の start が受けられる NODE の network namespace にする（container_grpc.rs の段 C と同じ）。
-        let mut run = cri::RunPodSandboxRequest {
-            config: Some(cri::PodSandboxConfig {
-                metadata: Some(cri::PodSandboxMetadata {
-                    name: "pod-exec-real".into(),
-                    uid: "uid-exec".into(),
-                    namespace: "default".into(),
-                    attempt: 0,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        run.config
-            .as_mut()
-            .expect("config")
-            .linux
-            .get_or_insert_with(Default::default)
-            .security_context
-            .get_or_insert_with(Default::default)
-            .namespace_options = Some(cri::NamespaceOption {
-            network: cri::NamespaceMode::Node as i32,
-            ..Default::default()
-        });
-        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
-            .await
-            .expect("run sandbox")
-            .into_inner()
-            .pod_sandbox_id;
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
 
-        let long = Duration::from_secs(120);
-        let id = call_with_deadline(
-            c.create_container(cri::CreateContainerRequest {
-                pod_sandbox_id: sb.clone(),
-                config: Some(cri::ContainerConfig {
-                    metadata: Some(cri::ContainerMetadata {
-                        name: "c".into(),
-                        attempt: 0,
-                    }),
-                    image: Some(image_spec(IMAGE)),
-                    command: vec!["/bin/sleep".into(), "300".into()],
-                    ..Default::default()
-                }),
-                sandbox_config: None,
-            }),
-            long,
-        )
-        .await
-        .expect("create by tag")
-        .into_inner()
-        .container_id;
-        call_with_deadline(
-            c.start_container(cri::StartContainerRequest {
-                container_id: id.clone(),
-            }),
-            long,
-        )
-        .await
-        .expect("start");
+        // 試行 1（注入）: StartContainer の直後に固定文言で panic させ、回収が効くことを確かめる。
+        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
+            .min(reclaim::INJECT_ATTEMPT_LIMIT);
+        let r1 =
+            reclaim::guarded(scenario(c.clone(), token.clone(), ledger.clone(), true), b1).await;
+        let rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+        if let Some(line) = reclaim::left_line(TEST, &rep1) {
+            eprintln!("{line}");
+        }
+        match r1 {
+            Err(reclaim::AttemptFailure::Panicked(p)) if reclaim::is_injected(TEST, p.as_ref()) => {
+            }
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{TEST}: injected attempt exceeded its deadline")
+            }
+            Ok(()) => panic!("{TEST}: injected attempt did not fail"),
+        }
+        assert_eq!(rep1.reclaimed_containers.len(), 1, "{rep1:?}");
+        assert_eq!(rep1.reclaimed_sandboxes.len(), 1, "{rep1:?}");
+        assert!(rep1.is_clean(), "{rep1:?}");
+        let old_c = rep1.reclaimed_containers[0].clone();
+        let old_s = rep1.reclaimed_sandboxes[0].clone();
         let st = call_with_deadline(
             c.container_status(cri::ContainerStatusRequest {
-                container_id: id.clone(),
+                container_id: old_c,
                 verbose: false,
             }),
             RPC_DEADLINE,
         )
         .await
-        .expect("status")
-        .into_inner()
-        .status
-        .expect("status body");
-        assert_eq!(st.state, cri::ContainerState::ContainerRunning as i32);
-
-        // 1. echo: stdout の内容・stderr が空・Success。
-        let o = exec_once(&mut c, &id, &["/bin/echo", "hello", "exec"]).await;
-        assert_eq!(o.stdout, b"hello exec\n");
-        assert_eq!(o.stderr, b"");
-        assert_eq!(status_str(&o.status, "status"), "Success", "{:?}", o.status);
-        assert_eq!(o.goaway, goaway_status::OK);
-
-        // 2. exit 3: NonZeroExitCode と cause の ExitCode / "3"。
-        let o = exec_once(&mut c, &id, &["/bin/sh", "-c", "exit 3"]).await;
-        assert_eq!(status_str(&o.status, "status"), "Failure", "{:?}", o.status);
-        assert_eq!(
-            status_str(&o.status, "reason"),
-            "NonZeroExitCode",
-            "{:?}",
-            o.status
-        );
-        let causes = match o.status.get("details").and_then(|d| d.get("causes")) {
-            Some(mini_json::Json::Array(v)) => v,
-            other => panic!("details.causes is not an array: {other:?}"),
-        };
-        assert_eq!(causes.len(), 1, "{:?}", o.status);
-        assert_eq!(status_str(&causes[0], "reason"), "ExitCode");
-        assert_eq!(status_str(&causes[0], "message"), "3");
-        assert_eq!(o.goaway, goaway_status::OK);
-
-        // 3. SEC-1: exec のプロセス自身とコンテナの init の capability・seccomp を照合する。
-        let exec_st = status_of_pid(&mut c, &id, "self").await;
-        assert_eq!(exec_st.get("Name").map(String::as_str), Some("cat"));
-        let init_st = status_of_pid(&mut c, &id, "1").await;
-        assert_eq!(init_st.get("Name").map(String::as_str), Some("sleep"));
-
-        let init_eff = hex_field(&init_st, "CapEff");
-        assert_eq!(
-            init_eff, OCI_DEFAULT_MASK,
-            "init CapEff {init_eff:#x} is not the OCI default {OCI_DEFAULT_MASK:#x}"
-        );
-        assert_eq!(init_st.get("Seccomp").map(String::as_str), Some("2"));
-        for key in ["CapEff", "CapPrm", "CapBnd"] {
-            let (e, i) = (hex_field(&exec_st, key), hex_field(&init_st, key));
-            assert_eq!(
-                e & !i,
-                0,
-                "exec {key} {e:#x} exceeds the container init {i:#x} (SEC-1)"
-            );
-        }
-        let exec_eff = hex_field(&exec_st, "CapEff");
-        assert_eq!(
-            exec_eff, OCI_DEFAULT_MASK,
-            "exec CapEff {exec_eff:#x} is not the OCI default {OCI_DEFAULT_MASK:#x}"
-        );
-        assert_eq!(exec_st.get("Seccomp").map(String::as_str), Some("2"));
-        assert_eq!(hex_field(&exec_st, "CapInh"), 0);
-        assert_eq!(hex_field(&exec_st, "CapAmb"), 0);
-
-        // 後始末。
-        call_with_deadline(
-            c.stop_container(cri::StopContainerRequest {
-                container_id: id.clone(),
-                timeout: 2,
+        .expect_err("reclaimed container must be gone");
+        assert_eq!(st.code(), PluginErrorCode::NotFound);
+        let st = call_with_deadline(
+            c.pod_sandbox_status(cri::PodSandboxStatusRequest {
+                pod_sandbox_id: old_s,
+                verbose: false,
             }),
-            long,
-        )
-        .await
-        .expect("stop");
-        call_with_deadline(
-            c.remove_container(cri::RemoveContainerRequest {
-                container_id: id.clone(),
-            }),
-            long,
-        )
-        .await
-        .expect("remove");
-        let left = call_with_deadline(
-            c.list_containers(cri::ListContainersRequest { filter: None }),
             RPC_DEADLINE,
         )
         .await
-        .expect("list containers")
-        .into_inner()
-        .containers
-        .len();
-        assert_eq!(left, 0);
-        call_with_deadline(
-            c.stop_pod_sandbox(cri::StopPodSandboxRequest {
-                pod_sandbox_id: sb.clone(),
-            }),
-            long,
+        .expect_err("reclaimed sandbox must be gone");
+        assert_eq!(st.code(), PluginErrorCode::NotFound);
+        eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
+
+        // 試行 2（本番）: 同じトークン（同じ metadata）で最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
+        let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 1);
+        let r2 = reclaim::guarded(
+            scenario(c.clone(), token.clone(), ledger.clone(), false),
+            b2,
         )
-        .await
-        .expect("stop sandbox");
-        call_with_deadline(
-            c.remove_pod_sandbox(cri::RemovePodSandboxRequest { pod_sandbox_id: sb }),
-            long,
-        )
-        .await
-        .expect("remove sandbox");
+        .await;
+        let rep2 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+        if let Some(line) = reclaim::left_line(TEST, &rep2) {
+            eprintln!("{line}");
+        }
+        match r2 {
+            Ok(()) => {}
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{TEST}: scenario deadline exceeded")
+            }
+        }
+        assert_eq!(
+            rep2,
+            reclaim::ReclaimReport::default(),
+            "nothing may be left to reclaim"
+        );
         drop((c, images, ch));
         assert!(guard.exited().is_none(), "server must still be running");
     })

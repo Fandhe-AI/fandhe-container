@@ -13,6 +13,9 @@
 //! - 場面 B（tty）: tty の不一致の拒否（D7。`MSG_ATTACH_TTY_MISMATCH`）、`echo` の往復、resize の反映（`stty size` の出力が
 //!   送った寸法と一致）、`exit` による終了
 //!
+//! 失敗後の残骸の回収（#4142）: 本体を 2 回走らせる（1 回目は場面 A の StartContainer の直後に注入した失敗、回収、2 回目は同じ metadata で通す）。
+//! 回収の部品は `support/cri_real_reclaim.rs`。
+//!
 //! ハーネスは `cri_exec_real.rs` と同じものを最小化して複製した（試験 crate 間でモジュールを共有できないため）。
 //!
 //! 残余（REPAIR-3）: 実 crictl（`crictl attach -i -t`）・kubectl での確認は人間担当（#3730 の子）。`StdinNotOpen` は
@@ -34,6 +37,8 @@ mod spdy_client;
 // serde_json を plugin-cri の依存に足さないための最小 JSON 読み取り。
 #[path = "support/mini_json.rs"]
 mod mini_json;
+#[path = "support/cri_real_reclaim.rs"]
+mod reclaim;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -51,6 +56,7 @@ use tonic::transport::Channel;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const IMAGE: &str = "docker.io/library/busybox:1.36";
+const TEST: &str = "production_binary_attach_real";
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RPC_DEADLINE: Duration = Duration::from_secs(5);
 const REAP_GRACE: Duration = Duration::from_secs(5);
@@ -328,6 +334,7 @@ async fn stop_and_exit_code(c: &mut RuntimeServiceClient<Channel>, id: &str) -> 
 
 async fn create_and_start(
     c: &mut RuntimeServiceClient<Channel>,
+    (token, ledger): (&str, &reclaim::Ledger),
     sb: &str,
     name: &str,
     cmd: &str,
@@ -344,6 +351,7 @@ async fn create_and_start(
                 }),
                 image: Some(image_spec(IMAGE)),
                 command: vec![cmd.into()],
+                labels: reclaim::config_labels(token),
                 stdin,
                 stdin_once,
                 tty,
@@ -357,6 +365,7 @@ async fn create_and_start(
     .expect("create")
     .into_inner()
     .container_id;
+    reclaim::record_container(ledger, &id);
     call_with_deadline(
         c.start_container(cri::StartContainerRequest {
             container_id: id.clone(),
@@ -370,7 +379,7 @@ async fn create_and_start(
     id
 }
 
-async fn remove(c: &mut RuntimeServiceClient<Channel>, id: &str) {
+async fn remove(c: &mut RuntimeServiceClient<Channel>, ledger: &reclaim::Ledger, id: &str) {
     call_with_deadline(
         c.remove_container(cri::RemoveContainerRequest {
             container_id: id.into(),
@@ -379,6 +388,7 @@ async fn remove(c: &mut RuntimeServiceClient<Channel>, id: &str) {
     )
     .await
     .expect("remove");
+    reclaim::forget_container(ledger, id);
 }
 
 fn status_str<'a>(j: &'a mini_json::Json, key: &str) -> &'a str {
@@ -396,7 +406,202 @@ fn assert_success_end(s: &mut Spdy, error: u32) {
     assert_eq!(s.wait_goaway(), goaway_status::OK);
 }
 
+/// 試験本体（sandbox の作成から場面 A・B の照合・後始末まで）。`inject` が真なら場面 A の StartContainer の直後に固定文言で
+/// panic する（失敗後の回収の自己照合。#4142）。作った ID は台帳へ登録し、Remove が成功したら外す。
+async fn scenario(
+    mut c: RuntimeServiceClient<Channel>,
+    token: String,
+    ledger: reclaim::Ledger,
+    inject: bool,
+) {
+    let mut run = cri::RunPodSandboxRequest {
+        config: Some(cri::PodSandboxConfig {
+            metadata: Some(cri::PodSandboxMetadata {
+                name: "pod-attach-real".into(),
+                uid: reclaim::sandbox_uid("uid-attach", &token),
+                namespace: "default".into(),
+                attempt: 0,
+            }),
+            labels: reclaim::config_labels(&token),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    run.config
+        .as_mut()
+        .expect("config")
+        .linux
+        .get_or_insert_with(Default::default)
+        .security_context
+        .get_or_insert_with(Default::default)
+        .namespace_options = Some(cri::NamespaceOption {
+        network: cri::NamespaceMode::Node as i32,
+        ..Default::default()
+    });
+    let long = Duration::from_secs(120);
+    let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
+        .await
+        .expect("run sandbox")
+        .into_inner()
+        .pod_sandbox_id;
+    reclaim::record_sandbox(&ledger, &sb);
+
+    // ---- 場面 A: 非 tty・stdin_once（往復と EOF） ----
+    let id = create_and_start(
+        &mut c,
+        (&token, &ledger),
+        &sb,
+        "cat",
+        "/bin/cat",
+        (true, true, false),
+    )
+    .await;
+    if inject {
+        panic!("{}", reclaim::injected_message(TEST));
+    }
+    let url = attach_url(&mut c, attach_request(&id, true, true, true, false)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let mut s = connect_spdy(&url);
+        // client-go の順（error → stdin → stdout → stderr）で張る。
+        let error = s.create_stream(&[("streamtype", "error")]);
+        let stdin = s.create_stream(&[("streamtype", "stdin")]);
+        let stdout = s.create_stream(&[("streamtype", "stdout")]);
+        let stderr = s.create_stream(&[("streamtype", "stderr")]);
+        s.send_data(stdin, b"hello attach\n", false);
+        read_until_contains(&mut s, stdout, 0, b"hello attach\n");
+        assert_eq!(
+            s.data.get(&stdout).map(Vec::as_slice),
+            Some(&b"hello attach\n"[..])
+        );
+        // stdin の FIN で唯一の書き込み端が閉じ、cat が EOF で終わる。
+        s.send_data(stdin, b"", true);
+        assert_success_end(&mut s, error);
+        assert!(
+            s.data.get(&stderr).is_none_or(Vec::is_empty),
+            "stderr must be empty"
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("scene A deadline")
+        .expect("scene A join");
+    assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
+    let st = call_with_deadline(
+        c.attach(attach_request(&id, true, true, true, false)),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect_err("attach to an exited container");
+    assert_eq!(st.code(), PluginErrorCode::FailedPrecondition);
+    remove(&mut c, &ledger, &id).await;
+
+    // ---- 場面 B: tty（往復と resize） ----
+    let id = create_and_start(
+        &mut c,
+        (&token, &ledger),
+        &sb,
+        "sh",
+        "/bin/sh",
+        (true, false, true),
+    )
+    .await;
+    // D7: tty の不一致は記録と照合して拒否する。
+    let st = call_with_deadline(
+        c.attach(attach_request(&id, true, true, true, false)),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect_err("tty mismatch");
+    assert_eq!(st.code(), PluginErrorCode::FailedPrecondition);
+    assert_eq!(
+        st.message(),
+        fandhe_container_cri::streaming::MSG_ATTACH_TTY_MISMATCH
+    );
+    // tty では stderr を真にできない（INVALID_ARGUMENT）ため偽にする。
+    let url = attach_url(&mut c, attach_request(&id, true, true, false, true)).await;
+    let join = tokio::task::spawn_blocking(move || {
+        let mut s = connect_spdy(&url);
+        let error = s.create_stream(&[("streamtype", "error")]);
+        let stdin = s.create_stream(&[("streamtype", "stdin")]);
+        let stdout = s.create_stream(&[("streamtype", "stdout")]);
+        let resize = s.create_stream(&[("streamtype", "resize")]);
+        // 往復: pty の行規律が入力をエコーするため、シェルの実行結果 `ab3cd` だけで判定する。
+        s.send_data(stdin, b"echo ab$((1+2))cd\n", false);
+        let mut pos = read_until_contains(&mut s, stdout, 0, b"ab3cd");
+        // resize の反映: 寸法を送ってから `stty size` の出力（行 列）を照合する。
+        for (w, h) in [(100u16, 30u16), (120, 40)] {
+            s.send_data(resize, &resize_json(w, h), false);
+            s.send_data(stdin, b"stty size\n", false);
+            let want = format!("{h} {w}");
+            pos = read_until_contains(&mut s, stdout, pos, want.as_bytes());
+        }
+        s.send_data(stdin, b"exit\n", false);
+        assert_success_end(&mut s, error);
+    });
+    tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("scene B deadline")
+        .expect("scene B join");
+    assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
+    remove(&mut c, &ledger, &id).await;
+
+    // 後始末（成功経路）。照合は自分の sandbox とトークンのラベルで絞る（他の記録の有無には依らない）。
+    let left = call_with_deadline(
+        c.list_containers(cri::ListContainersRequest {
+            filter: Some(cri::ContainerFilter {
+                pod_sandbox_id: sb.clone(),
+                label_selector: reclaim::labels(&token),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list containers")
+    .into_inner()
+    .containers
+    .len();
+    assert_eq!(left, 0);
+    call_with_deadline(
+        c.stop_pod_sandbox(cri::StopPodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("stop sandbox");
+    call_with_deadline(
+        c.remove_pod_sandbox(cri::RemovePodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+        long,
+    )
+    .await
+    .expect("remove sandbox");
+    reclaim::forget_sandbox(&ledger, &sb);
+    let left_sb = call_with_deadline(
+        c.list_pod_sandbox(cri::ListPodSandboxRequest {
+            filter: Some(cri::PodSandboxFilter {
+                label_selector: reclaim::labels(&token),
+                ..Default::default()
+            }),
+        }),
+        RPC_DEADLINE,
+    )
+    .await
+    .expect("list sandboxes")
+    .into_inner()
+    .items
+    .len();
+    assert_eq!(left_sb, 0);
+}
+
 /// 段階（本番バイナリ越しの実コンテナへの完全版 attach）。
+///
+/// 失敗後の回収（#4142）: 本体（[`scenario`]）を 2 回走らせる。1 回目は場面 A の StartContainer の直後に固定文言で panic させ
+/// （注入）、回収が `containers=1 sandboxes=1 left=0` で旧 ID を `NOT_FOUND` にすることを照合する。2 回目は同じ metadata で
+/// 場面 A・B を最後まで通し、`ALREADY_EXISTS` にならないことを機械照合する。回収にも失敗したら残った ID と回収手順の
+/// 文書を 1 行で出す（uid にトークンが入るので次の実行は守られる）。
 ///
 /// `#[ignore]` の理由（既定の集合から分ける）: (1) StartContainer と Attach は supervisor 経由の本番経路で、`systemd --user` の
 /// 委譲 cgroup scope の中で動かす必要がある（Landlock ABI 6 以上・user manager の private ソケット・`XDG_RUNTIME_DIR` も要る）、
@@ -408,6 +613,7 @@ fn assert_success_end(s: &mut Spdy, error: u32) {
 #[tokio::test]
 #[ignore = "requires systemd --user delegated scope, supervisor bin, Landlock ABI 6+, and outbound HTTPS to a registry (CRI-6/SUP-4/SEC-1, #4079)"]
 async fn production_binary_attach_real() {
+    let started = Instant::now();
     tokio::time::timeout(WATCHDOG, async {
         let _cgroup = precondition::delegated_cgroup();
         let _landlock = precondition::landlock_support();
@@ -436,141 +642,77 @@ async fn production_binary_attach_real() {
             panic!("pull image: {line}");
         }
 
-        let mut run = cri::RunPodSandboxRequest {
-            config: Some(cri::PodSandboxConfig {
-                metadata: Some(cri::PodSandboxMetadata {
-                    name: "pod-attach-real".into(),
-                    uid: "uid-attach".into(),
-                    namespace: "default".into(),
-                    attempt: 0,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        run.config
-            .as_mut()
-            .expect("config")
-            .linux
-            .get_or_insert_with(Default::default)
-            .security_context
-            .get_or_insert_with(Default::default)
-            .namespace_options = Some(cri::NamespaceOption {
-            network: cri::NamespaceMode::Node as i32,
-            ..Default::default()
-        });
-        let long = Duration::from_secs(120);
-        let sb = call_with_deadline(c.run_pod_sandbox(run), RPC_DEADLINE)
-            .await
-            .expect("run sandbox")
-            .into_inner()
-            .pod_sandbox_id;
+        let token = reclaim::run_token();
+        let ledger = reclaim::Ledger::default();
 
-        // ---- 場面 A: 非 tty・stdin_once（往復と EOF） ----
-        let id = create_and_start(&mut c, &sb, "cat", "/bin/cat", (true, true, false)).await;
-        let url = attach_url(&mut c, attach_request(&id, true, true, true, false)).await;
-        let join = tokio::task::spawn_blocking(move || {
-            let mut s = connect_spdy(&url);
-            // client-go の順（error → stdin → stdout → stderr）で張る。
-            let error = s.create_stream(&[("streamtype", "error")]);
-            let stdin = s.create_stream(&[("streamtype", "stdin")]);
-            let stdout = s.create_stream(&[("streamtype", "stdout")]);
-            let stderr = s.create_stream(&[("streamtype", "stderr")]);
-            s.send_data(stdin, b"hello attach\n", false);
-            read_until_contains(&mut s, stdout, 0, b"hello attach\n");
-            assert_eq!(
-                s.data.get(&stdout).map(Vec::as_slice),
-                Some(&b"hello attach\n"[..])
-            );
-            // stdin の FIN で唯一の書き込み端が閉じ、cat が EOF で終わる。
-            s.send_data(stdin, b"", true);
-            assert_success_end(&mut s, error);
-            assert!(
-                s.data.get(&stderr).is_none_or(Vec::is_empty),
-                "stderr must be empty"
-            );
-        });
-        tokio::time::timeout(Duration::from_secs(120), join)
-            .await
-            .expect("scene A deadline")
-            .expect("scene A join");
-        assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
-        let st = call_with_deadline(
-            c.attach(attach_request(&id, true, true, true, false)),
-            RPC_DEADLINE,
-        )
-        .await
-        .expect_err("attach to an exited container");
-        assert_eq!(st.code(), PluginErrorCode::FailedPrecondition);
-        remove(&mut c, &id).await;
-
-        // ---- 場面 B: tty（往復と resize） ----
-        let id = create_and_start(&mut c, &sb, "sh", "/bin/sh", (true, false, true)).await;
-        // D7: tty の不一致は記録と照合して拒否する。
-        let st = call_with_deadline(
-            c.attach(attach_request(&id, true, true, true, false)),
-            RPC_DEADLINE,
-        )
-        .await
-        .expect_err("tty mismatch");
-        assert_eq!(st.code(), PluginErrorCode::FailedPrecondition);
-        assert_eq!(
-            st.message(),
-            fandhe_container_cri::streaming::MSG_ATTACH_TTY_MISMATCH
-        );
-        // tty では stderr を真にできない（INVALID_ARGUMENT）ため偽にする。
-        let url = attach_url(&mut c, attach_request(&id, true, true, false, true)).await;
-        let join = tokio::task::spawn_blocking(move || {
-            let mut s = connect_spdy(&url);
-            let error = s.create_stream(&[("streamtype", "error")]);
-            let stdin = s.create_stream(&[("streamtype", "stdin")]);
-            let stdout = s.create_stream(&[("streamtype", "stdout")]);
-            let resize = s.create_stream(&[("streamtype", "resize")]);
-            // 往復: pty の行規律が入力をエコーするため、シェルの実行結果 `ab3cd` だけで判定する。
-            s.send_data(stdin, b"echo ab$((1+2))cd\n", false);
-            let mut pos = read_until_contains(&mut s, stdout, 0, b"ab3cd");
-            // resize の反映: 寸法を送ってから `stty size` の出力（行 列）を照合する。
-            for (w, h) in [(100u16, 30u16), (120, 40)] {
-                s.send_data(resize, &resize_json(w, h), false);
-                s.send_data(stdin, b"stty size\n", false);
-                let want = format!("{h} {w}");
-                pos = read_until_contains(&mut s, stdout, pos, want.as_bytes());
+        // 試行 1（注入）: 場面 A の StartContainer の直後に固定文言で panic させ、回収が効くことを確かめる。
+        let b1 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 2)
+            .min(reclaim::INJECT_ATTEMPT_LIMIT);
+        let r1 =
+            reclaim::guarded(scenario(c.clone(), token.clone(), ledger.clone(), true), b1).await;
+        let rep1 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+        if let Some(line) = reclaim::left_line(TEST, &rep1) {
+            eprintln!("{line}");
+        }
+        match r1 {
+            Err(reclaim::AttemptFailure::Panicked(p)) if reclaim::is_injected(TEST, p.as_ref()) => {
             }
-            s.send_data(stdin, b"exit\n", false);
-            assert_success_end(&mut s, error);
-        });
-        tokio::time::timeout(Duration::from_secs(120), join)
-            .await
-            .expect("scene B deadline")
-            .expect("scene B join");
-        assert_eq!(stop_and_exit_code(&mut c, &id).await, 0);
-        remove(&mut c, &id).await;
-
-        // 後始末。
-        let left = call_with_deadline(
-            c.list_containers(cri::ListContainersRequest { filter: None }),
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{TEST}: injected attempt exceeded its deadline")
+            }
+            Ok(()) => panic!("{TEST}: injected attempt did not fail"),
+        }
+        assert_eq!(rep1.reclaimed_containers.len(), 1, "{rep1:?}");
+        assert_eq!(rep1.reclaimed_sandboxes.len(), 1, "{rep1:?}");
+        assert!(rep1.is_clean(), "{rep1:?}");
+        let old_c = rep1.reclaimed_containers[0].clone();
+        let old_s = rep1.reclaimed_sandboxes[0].clone();
+        let st = call_with_deadline(
+            c.container_status(cri::ContainerStatusRequest {
+                container_id: old_c,
+                verbose: false,
+            }),
             RPC_DEADLINE,
         )
         .await
-        .expect("list containers")
-        .into_inner()
-        .containers
-        .len();
-        assert_eq!(left, 0);
-        call_with_deadline(
-            c.stop_pod_sandbox(cri::StopPodSandboxRequest {
-                pod_sandbox_id: sb.clone(),
+        .expect_err("reclaimed container must be gone");
+        assert_eq!(st.code(), PluginErrorCode::NotFound);
+        let st = call_with_deadline(
+            c.pod_sandbox_status(cri::PodSandboxStatusRequest {
+                pod_sandbox_id: old_s,
+                verbose: false,
             }),
-            long,
+            RPC_DEADLINE,
         )
         .await
-        .expect("stop sandbox");
-        call_with_deadline(
-            c.remove_pod_sandbox(cri::RemovePodSandboxRequest { pod_sandbox_id: sb }),
-            long,
+        .expect_err("reclaimed sandbox must be gone");
+        assert_eq!(st.code(), PluginErrorCode::NotFound);
+        eprintln!("{TEST}: injected failure reclaimed containers=1 sandboxes=1");
+
+        // 試行 2（本番）: 同じトークン（同じ metadata）で場面 A・B を最後まで通す。回収が効いていなければ ALREADY_EXISTS で落ちる。
+        let b2 = reclaim::scenario_budget(started.elapsed(), WATCHDOG, 1);
+        let r2 = reclaim::guarded(
+            scenario(c.clone(), token.clone(), ledger.clone(), false),
+            b2,
         )
-        .await
-        .expect("remove sandbox");
+        .await;
+        let rep2 = reclaim::reclaim(&mut c, &ledger, &token, reclaim::CLEANUP_BUDGET).await;
+        if let Some(line) = reclaim::left_line(TEST, &rep2) {
+            eprintln!("{line}");
+        }
+        match r2 {
+            Ok(()) => {}
+            Err(reclaim::AttemptFailure::Panicked(p)) => std::panic::resume_unwind(p),
+            Err(reclaim::AttemptFailure::Deadline) => {
+                panic!("{TEST}: scenario deadline exceeded")
+            }
+        }
+        assert_eq!(
+            rep2,
+            reclaim::ReclaimReport::default(),
+            "nothing may be left to reclaim"
+        );
         drop((c, images, ch));
         assert!(guard.exited().is_none(), "server must still be running");
     })

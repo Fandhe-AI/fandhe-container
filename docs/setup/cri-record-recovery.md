@@ -79,6 +79,18 @@ CLI を使う手順では plugin-cri と同じ状態ルートを指すこと（`
 
 対象外: `pending_unresolved` の sandbox のネットワーク資源と保持役の素性は #2940・#2941 と `docs/setup/network-reclaim-recovery.md` を参照する。現在の本番は `PodNetworkProvider` を注入していないので該当しない。
 
+## 実機前提試験が残した記録（#4142）
+
+`cri_exec_real`・`cri_attach_real` は失敗した後に自分の記録を回収するが、回収にも失敗すると次の 1 行を stderr に出す（ID は 64 文字の小文字 16 進）。
+
+```text
+<試験名>: cleanup left cri records sandboxes=<id,...> containers=<id,...>; see docs/setup/cri-record-recovery.md
+```
+
+この記録は sandbox の label `io.fandhe-container.test.run` と uid（`uid-exec-<pid>-<ns>`・`uid-attach-<pid>-<ns>`）で見分けられる。
+行に出た ID だけを `crictl stopp` / `rmp`・`crictl stop` / `rm`（または下の手動の手順）で回収する。残っていても次の実行は uid が違うので `already exists` にならないが、
+`production_binary_restart_readopts_running_container_real` は記録が空でなければ何も消さずに失敗するため、その前に回収する。
+
 ## 消してはいけないもの
 
 - `.cri/records/.lock` と `.cri/@instance.lock`（どちらも unlink しない設計）

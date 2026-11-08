@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
+    ExitTime, KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{
     BundleProvider, BundleRequest, PreparedBundle, RuntimeAdapter,
@@ -201,6 +201,8 @@ struct FakeRuntime {
     fail_create: Mutex<Option<ErrorCode>>,
     delete_code: Mutex<Option<ErrorCode>>,
     stop_exit_code: std::sync::atomic::AtomicI32,
+    /// stop が報告する core の終了検知時刻（UNIX ナノ秒。0 は未記録。#4056）。
+    stop_exited_at: std::sync::atomic::AtomicI64,
     create_started: AtomicBool,
 }
 
@@ -236,7 +238,8 @@ impl ContainerRuntime for Shared {
     fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
         self.push(Ev::Stop);
         let code = Some(self.0.stop_exit_code.load(Ordering::SeqCst));
-        Ok(ContainerStatus::stopped(r.id().clone(), code))
+        let at = ExitTime::from_unix_nanos(self.0.stop_exited_at.load(Ordering::SeqCst));
+        Ok(ContainerStatus::stopped_at(r.id().clone(), code, at))
     }
     fn delete(&self, _r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
         self.push(Ev::Delete);
@@ -774,4 +777,27 @@ async fn repair_5_abandoned_create_does_not_prepare_and_cleans_up() {
     assert!(events(&h).contains(&Ev::CRemove));
     assert_eq!(list_count(&h).await, 0);
     let _ = h.bundles.hold_prepare_until.lock().unwrap().take();
+}
+
+/// CRI-1・CRI-5・#4056: 永続化する `finished_at` とメモリの値が、core の ExitTime で一致する。
+#[tokio::test]
+async fn cri_5_4056_persisted_finished_at_matches_exit_time() {
+    let h = harness();
+    h.runtime
+        .stop_exited_at
+        .store(4_000_000_000_000_000_000, Ordering::SeqCst);
+    let sb = run_sandbox(&h).await;
+    let id = create(&h, &sb, "c").await.expect("create");
+    start(&h, &id).await.expect("start");
+    stop(&h, &id).await.expect("stop");
+    let st = status(&h, &id).await;
+    assert_eq!(st.finished_at, 4_000_000_000_000_000_000);
+    let headers = h.store.container_headers.lock().unwrap().clone();
+    let finished = headers
+        .last()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k == "finished_at")
+        .map(|(_, v)| v.clone());
+    assert_eq!(finished.as_deref(), Some("4000000000000000000"));
 }

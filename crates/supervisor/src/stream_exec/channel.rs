@@ -8,8 +8,16 @@
 //!
 //! channel はパスを持たない socketpair で、第三者は接続できない（`docs/design/cri-streaming-server.md` の SEC-1 の節）。
 //! `SO_PEERCRED` は socketpair の作成者の資格情報になり相手の確認にならないため照合しない。受信内容は untrusted として、
-//! ヘッダ（magic・version・kind・長さ）を payload を読む前に、fd の本数・向き・mask・文字デバイスを受信後に検証する。
-//! 拒否の全経路で、受け取った fd は `OwnedFd` の drop で閉じる。
+//! ヘッダ（magic・version・kind・長さ）を payload を読む前に、fd の本数・向き・mask・pty master を受信後に検証する
+//! （`PtyMaster` は core の `PtyMaster::from_received`。文字デバイス `5:2` かつ `TIOCGPTN` の成功。#4100・SEC-1）。
+//! 拒否の全経路で、受け取った fd は drop で閉じる。
+//!
+//! # 受信失敗後の扱い（REPAIR-5・SEC-1・#4100）
+//!
+//! 受信（[`recv_stdio_handover`]・[`recv_from_helper`]）が失敗した channel からは、二度と受信しない。frame の境界も残りの fd も
+//! 保証できず、後続の frame・fd を取り違えうるため。呼び出し側は channel を閉じる。socketpair の送信方向は受信の失敗で崩れないので、
+//! 失敗を相手へ伝える最後の送信（helper の `Result`）を 1 回だけ行ってから閉じることは許す。受信に成功した後に限り、
+//! `try_clone` で別スレッドへ渡してよい。plugin-cri の `launch` は `Err` で戻ると channel を drop し、複製は成功後だけに作る。
 //!
 //! # 期限（REPAIR-5）
 //!
@@ -18,10 +26,10 @@
 
 use std::io;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::exec::PtyMaster;
 use fandhe_container_core::traits::ErrorCode;
 
 use super::wire::{
@@ -47,8 +55,8 @@ pub enum ChannelError {
     FdOnContinuation,
     /// `StdioHandover` の mask が期待と違う。
     MaskMismatch,
-    /// `PtyMaster` の fd が文字デバイスでない。
-    NotCharDevice,
+    /// `PtyMaster` の fd が pty master でない（`5:2` の文字デバイスでない、または `TIOCGPTN` が失敗。#4100）。
+    NotPtyMaster,
     /// 番号表に無い値のため符号化できない。
     Unencodable(EncodeError),
     /// その他の入出力の失敗。
@@ -68,7 +76,7 @@ impl ChannelError {
             | Self::ControlTruncated
             | Self::FdOnContinuation
             | Self::MaskMismatch
-            | Self::NotCharDevice => ErrorCode::InvalidArgument,
+            | Self::NotPtyMaster => ErrorCode::InvalidArgument,
         }
     }
 }
@@ -100,8 +108,8 @@ pub struct StdioFds {
 pub enum HelperMessage {
     /// exec の開始。
     Started,
-    /// pty master（文字デバイスであることを確認済み）。
-    PtyMaster(OwnedFd),
+    /// pty master（`PtyMaster::from_received` で検証済み）。
+    PtyMaster(PtyMaster),
     /// 終了の結果。
     Result(StreamExecOutcome),
 }
@@ -288,7 +296,7 @@ pub fn recv_stdio_handover(
 }
 
 /// plugin-cri 側: helper からの frame（`Started`・`PtyMaster`・`Result`）を 1 つ受ける。`PtyMaster` の fd は
-/// 文字デバイスであることを確かめる。
+/// pty master であることを確かめ、違えば fd を閉じて `NotPtyMaster` で拒否する（#4100）。失敗後は channel を再利用しない。
 pub fn recv_from_helper(
     stream: &UnixStream,
     deadline: Instant,
@@ -306,16 +314,8 @@ pub fn recv_from_helper(
                 .into_iter()
                 .next()
                 .ok_or(ChannelError::FdCountMismatch)?;
-            let file = std::fs::File::from(fd);
-            let is_char = file
-                .metadata()
-                .map_err(|e| map_io(&e))?
-                .file_type()
-                .is_char_device();
-            if !is_char {
-                return Err(ChannelError::NotCharDevice);
-            }
-            Ok(HelperMessage::PtyMaster(OwnedFd::from(file)))
+            let master = PtyMaster::from_received(fd).map_err(|_| ChannelError::NotPtyMaster)?;
+            Ok(HelperMessage::PtyMaster(master))
         }
         Frame::StdioHandover(_) => Err(ChannelError::Malformed(WireError::UnknownKind)),
     }
@@ -423,22 +423,71 @@ mod tests {
         }
     }
 
+    fn open_ptmx() -> File {
+        File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .unwrap()
+    }
+
+    /// `/dev/null` と通常ファイルは拒否し、本物の pty master は受理する（SUP-6・SEC-1・#4100）。
     #[test]
-    fn sup6_pty_master_requires_char_device() {
+    fn sup6_pty_master_must_be_a_pty_master() {
         let (a, b) = pair();
         let null = File::open("/dev/null").unwrap();
         send_pty_master(&a, null.as_fd(), far()).unwrap();
-        match recv_from_helper(&b, far()).unwrap() {
-            HelperMessage::PtyMaster(fd) => assert!(same(&fd, &null)),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(
+            recv_from_helper(&b, far()).unwrap_err(),
+            ChannelError::NotPtyMaster
+        );
         let (dir, files) = temp_files(1);
         send_pty_master(&a, files[0].as_fd(), far()).unwrap();
         assert_eq!(
             recv_from_helper(&b, far()).unwrap_err(),
-            ChannelError::NotCharDevice
+            ChannelError::NotPtyMaster
         );
         let _ = std::fs::remove_dir_all(dir);
+
+        let ptmx = open_ptmx();
+        send_pty_master(&a, ptmx.as_fd(), far()).unwrap();
+        match recv_from_helper(&b, far()).unwrap() {
+            HelperMessage::PtyMaster(m) => {
+                let got = File::from(m.into_owned_fd()).metadata().unwrap();
+                let sent = ptmx.metadata().unwrap();
+                assert_eq!((got.dev(), got.ino()), (sent.dev(), sent.ino()));
+                assert_eq!(got.rdev(), (5 << 8) | 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// 拒否した fd は受け側で閉じられ、専用の一時ファイルを指す fd の数が増えたままにならない。
+    /// 並列に走る他の試験の `/dev/null` の開閉の影響を受けないよう、この試験だけが開く一時ファイルで数える。
+    #[test]
+    fn sup6_rejected_pty_master_fd_is_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-sup6-rejected-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = File::create(&path).unwrap();
+        let links = |p: &std::path::Path| -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == p))
+                .count()
+        };
+        let (a, b) = pair();
+        let before = links(&path);
+        assert_eq!(before, 1);
+        send_pty_master(&a, file.as_fd(), far()).unwrap();
+        let result = recv_from_helper(&b, far());
+        let after = links(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result.unwrap_err(), ChannelError::NotPtyMaster);
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -594,6 +643,10 @@ mod tests {
         );
         assert_eq!(
             ChannelError::MaskMismatch.code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            ChannelError::NotPtyMaster.code(),
             ErrorCode::InvalidArgument
         );
         assert_eq!(

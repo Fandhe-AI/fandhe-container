@@ -76,10 +76,14 @@ fn sup6_stdio_handover_and_helper_replies_roundtrip() {
         .expect("plugin reads stdout");
     assert_eq!(out, b"pong");
 
-    // helper → plugin-cri: Started → PtyMaster（文字デバイス）→ Result。
+    // helper → plugin-cri: Started → PtyMaster（pty master）→ Result。
     send_started(&helper, far()).expect("send started");
-    let dev_null = File::open("/dev/null").expect("open /dev/null");
-    send_pty_master(&helper, dev_null.as_fd(), far()).expect("send pty master");
+    let ptmx = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/ptmx")
+        .expect("open /dev/ptmx");
+    send_pty_master(&helper, ptmx.as_fd(), far()).expect("send pty master");
     let outcome = StreamExecOutcome::Signaled(ExitSignal::new(9).expect("signal 9"));
     send_result(&helper, &outcome, far()).expect("send result");
 
@@ -87,14 +91,28 @@ fn sup6_stdio_handover_and_helper_replies_roundtrip() {
         recv_from_helper(&plugin, far()).expect("started"),
         HelperMessage::Started
     ));
-    assert!(matches!(
-        recv_from_helper(&plugin, far()).expect("pty"),
-        HelperMessage::PtyMaster(_)
-    ));
+    match recv_from_helper(&plugin, far()).expect("pty") {
+        HelperMessage::PtyMaster(m) => {
+            let meta = File::from(m.into_owned_fd()).metadata().expect("stat");
+            assert_eq!(std::os::unix::fs::MetadataExt::rdev(&meta), (5 << 8) | 2);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
     match recv_from_helper(&plugin, far()).expect("result") {
         HelperMessage::Result(o) => assert_eq!(o, outcome),
         other => panic!("unexpected message: {other:?}"),
     }
+}
+
+/// pty master でない fd（`/dev/null`）は `NotPtyMaster`・`InvalidArgument` で拒否する（SUP-6・SEC-1・#4100）。
+#[test]
+fn sup6_non_pty_master_is_rejected() {
+    let (plugin, helper) = pair();
+    let dev_null = File::open("/dev/null").expect("open /dev/null");
+    send_pty_master(&helper, dev_null.as_fd(), far()).expect("send");
+    let err = recv_from_helper(&plugin, far()).expect_err("must reject");
+    assert_eq!(err, ChannelError::NotPtyMaster);
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
 }
 
 /// 期待と違う mask は拒否し、分類は `InvalidArgument`。

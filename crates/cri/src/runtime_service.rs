@@ -56,6 +56,10 @@
 //! 配下のコンテナ記録も連鎖して除去する（プロセスの強制終了は TASK-59 で追加する。REPAIR-3）。
 //! Stop 時は配下の running コンテナを exited へ遷移させる（TASK-58.2・#434。created は変えない）。
 //!
+//! 実行層接続時の `finished_at` は、実行層が報告した core の終了検知時刻（`ExitTime`）を優先し、`started_at`・
+//! `created_at` を下限に丸める。未記録は CRI が停止を確定した時刻を使う（`finished_at_for_exit`。
+//! CRI-1・CRI-2・CRI-5・REPAIR-3・#4056）。スタブ経路は core の値が無いため確定時刻のまま。
+//!
 //! **StopContainer/RemoveContainer の扱い（CRI-1・ERR-3・TASK-58.2・#434）**: `StopContainer` は空 ID と負の
 //! `timeout` を `INVALID_ARGUMENT`、未知 ID を `NOT_FOUND` にし、running を exited へ遷移させて
 //! `finished_at` を記録する。停止済み（exited）は冪等に成功し状態を変えない（proto コメント）。未起動
@@ -148,7 +152,7 @@ use crate::streaming::{
 use config_limits::BoundedConfig;
 use container::{
     ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
-    initial_stop_signal, validate_create_request,
+    finished_at_for_exit, initial_stop_signal, validate_create_request,
 };
 use record::{ContainerRecordData, SandboxRecordData};
 use runtime_config::parse_pod_cidrs;
@@ -532,7 +536,7 @@ impl InFlightGuard {
                 }
                 InFlightKind::Stop => {
                     record.state = ContainerState::Exited;
-                    record.finished_at_nanos = at_nanos;
+                    record.finished_at_nanos = finished_at_for_exit(&record, &self.exit, at_nanos);
                     record.exit_code = self.exit.code;
                     record.termination = self.exit.termination;
                 }
@@ -574,6 +578,7 @@ impl InFlightGuard {
         self.exit = ExitReport {
             code: status.exit_code,
             termination: status.termination,
+            exited_at_nanos: status.exited_at_nanos,
         };
     }
 
@@ -1448,9 +1453,10 @@ fn commit_in_flight(
         record.runtime_owned = true;
     }
     if kind == InFlightKind::Stop {
-        // 実行層が停止済みと報告した。現在時刻を終了時刻とする。
+        // 実行層が停止済みと報告した。core の ExitTime を優先し、未記録は確定時刻を使う（下限は started_at・
+        // created_at。永続化側の container_bytes と同じ関数。CRI-1・CRI-2・CRI-5・#4056）。
         record.state = ContainerState::Exited;
-        record.finished_at_nanos = at_nanos;
+        record.finished_at_nanos = finished_at_for_exit(record, &exit, at_nanos);
         // 実行層が返した終了コード（137 等）を保持する。不明（None）は None のままで reason は空になる。
         record.exit_code = exit.code;
         record.termination = exit.termination;
@@ -1501,7 +1507,8 @@ fn rollback_in_flight(
                     // 実行層の削除完了後に bundle の解放だけが失敗した（Remove）。
                     if record.state != ContainerState::Exited {
                         record.state = ContainerState::Exited;
-                        record.finished_at_nanos = finished_at_nanos;
+                        record.finished_at_nanos =
+                            finished_at_for_exit(record, &exit, finished_at_nanos);
                     }
                 } else if outcome_unknown {
                     record.state = ContainerState::Unknown;
@@ -1520,7 +1527,8 @@ fn rollback_in_flight(
                 record.in_flight = false;
                 if confirmed_exited {
                     record.state = ContainerState::Exited;
-                    record.finished_at_nanos = finished_at_nanos;
+                    record.finished_at_nanos =
+                        finished_at_for_exit(record, &exit, finished_at_nanos);
                     // 実行層が終了済みと報告した応答の終了コード。不明（None）は reason を空のままにする。
                     record.exit_code = exit.code;
                     record.termination = exit.termination;

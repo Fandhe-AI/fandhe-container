@@ -18,13 +18,25 @@
 //! 前提: rootless のみ。uid 0（rootful の containerd と、rootlesskit 配下で euid が 0 になる shim）の `start` は plugin-cri の
 //! `supervised` と同じく `UNIMPLEMENTED`（#2442・#2241）。supervisor は shim の実体と同じディレクトリの固定名から解決する。
 //!
+//! delete action の前段（#4151・CRI-5・SEC-1・REPAIR-3・REPAIR-4）: [`production_delete_preflight`] を bootstrap の注入口
+//! （`run_cli_with_hooks`）へ渡し、`-id`・`-bundle` の検証（[`validate_delete_invocation`]）と、serve が使う状態ルートの記録との照合
+//! （[`delete_preflight_in`]・[`match_delete_record`]）を行う。照合は読み取りだけで、状態ルートの作成・書き込み・シグナル・
+//! プロセス起動をしない。結果は [`DeleteRecordMatch`]（記録なし・記録あり・回収済み）で、停止・回収（#4152）が受け取って使う。
+//! 本 PR の bin は結果を捨てる（検証と照合の失敗だけが delete を止める）。判断は `docs/design/shim-v2-production-binary.md` D5。
+//!
 //! 未実装（REPAIR-3）: 非 Linux（macOS は既定の状態ルートが未決定で #2431、`start`・`kill`・`stop` も `Unimplemented`）は Shutdown だけの
 //! `EmptyTaskService` を登録する。exec の起動役（`TaskExecLauncher`）の本番実装は無く exec は `UNIMPLEMENTED`。`delete` action での
-//! 実行層の後始末と `-publish-binary` のイベント publish も未実装。
+//! 実行層の後始末（停止・回収・終了状態の応答。#4152）と `-publish-binary` のイベント publish も未実装。非 Linux の delete は
+//! 引数の検証だけで、記録の照合はしない（既定の状態ルートが未決定で #2431）。
 
+use std::path::{Path, PathBuf};
+
+use fandhe_container_core::traits::{
+    ContainerId, ErrorCode, GetStateRequest, StateRecord, StateStore,
+};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::shim_v2::ServiceRegistry;
-use fandhe_container_cri::shim_v2::bootstrap::ServeContext;
+use fandhe_container_cri::shim_v2::bootstrap::{ServeContext, ShimInvocation};
 
 /// 本番の登録簿を作る。失敗は固定語彙の `CriError` で返す（パスや状態の中身は含めない。REPAIR-4）。
 pub fn production_registry(ctx: ServeContext) -> Result<ServiceRegistry, CriError> {
@@ -55,14 +67,37 @@ pub(crate) fn scoped_root(
     base: &std::path::Path,
     ctx: &ServeContext,
 ) -> Result<fandhe_container_core::state_store::StateRoot, CriError> {
+    let path = scoped_root_path(base, ctx.namespace(), ctx.address())?;
+    if ctx.namespace().is_some() {
+        // `FileStateStore::open` は最後の 1 階層しか作らないため、親をここで 1 階層ずつ 0700 で作る。最後の要素はストアの検査が確かめる。
+        let hashed = path.parent();
+        let sibling = hashed.and_then(std::path::Path::parent);
+        for dir in [sibling, hashed].into_iter().flatten() {
+            ensure_private_dir(dir)?;
+        }
+    }
+    fandhe_container_core::state_store::StateRoot::from_override(path)
+        .map_err(|_| CriError::internal("cannot resolve the state root"))
+}
+
+/// [`scoped_root`] の場所の計算だけ（何も作らない純粋関数。#4151）。
+///
+/// serve は [`scoped_root`] で作りながら使い、delete の前段は同じ式でこの関数が返す場所を読み取りだけで開く。
+/// 計算を 1 か所に置くのは、2 つの経路で場所がずれて別の記録を見ないようにするため（CRI-5）。
+/// `namespace` が無いときは `base` をそのまま返す。
+#[cfg(target_os = "linux")]
+pub(crate) fn scoped_root_path(
+    base: &Path,
+    namespace: Option<&fandhe_container_cri::shim_v2::bootstrap::ShimIdentifier>,
+    address: Option<&Path>,
+) -> Result<PathBuf, CriError> {
     use std::os::unix::ffi::OsStrExt;
 
-    let Some(ns) = ctx.namespace() else {
-        return fandhe_container_core::state_store::StateRoot::from_override(base.to_path_buf())
-            .map_err(|_| CriError::internal("cannot resolve the state root"));
+    let Some(ns) = namespace else {
+        return Ok(base.to_path_buf());
     };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    if let Some(a) = ctx.address() {
+    if let Some(a) = address {
         for b in a.as_os_str().as_bytes() {
             h ^= u64::from(*b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -73,19 +108,16 @@ pub(crate) fn scoped_root(
     };
     let mut sibling = name.to_os_string();
     sibling.push("-shim-state");
-    let hashed = parent.join(sibling).join(format!("{h:016x}"));
-    // `FileStateStore::open` は最後の 1 階層しか作らないため、親をここで 1 階層ずつ 0700 で作る。最後の要素はストアの検査が確かめる。
-    for dir in [hashed.parent().unwrap_or(parent), hashed.as_path()] {
-        ensure_private_dir(dir)?;
-    }
-    fandhe_container_core::state_store::StateRoot::from_override(hashed.join(ns.as_str()))
-        .map_err(|_| CriError::internal("cannot resolve the state root"))
+    Ok(parent
+        .join(sibling)
+        .join(format!("{h:016x}"))
+        .join(ns.as_str()))
 }
 
 /// `dir` を 0700 で作る（既存ならそのまま）。symlink・非ディレクトリ・グループ / その他に開いた権限は拒否する（SEC-1）。
 #[cfg(target_os = "linux")]
-fn ensure_private_dir(dir: &std::path::Path) -> Result<(), CriError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+fn ensure_private_dir(dir: &Path) -> Result<(), CriError> {
+    use std::os::unix::fs::DirBuilderExt;
 
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
@@ -94,6 +126,15 @@ fn ensure_private_dir(dir: &std::path::Path) -> Result<(), CriError> {
     }
     let md = std::fs::symlink_metadata(dir)
         .map_err(|_| CriError::internal("cannot create the state root"))?;
+    check_private_dir(&md)
+}
+
+/// 状態ルートの階層の基準（ディレクトリである・symlink でない・group / other に権限が無い）。
+/// serve の作成（[`ensure_private_dir`]）と delete の読み取り専用の検査が共有する（SEC-1・#4151）。
+#[cfg(target_os = "linux")]
+fn check_private_dir(md: &std::fs::Metadata) -> Result<(), CriError> {
+    use std::os::unix::fs::PermissionsExt;
+
     if !md.is_dir() || md.permissions().mode() & 0o077 != 0 {
         return Err(CriError::internal("state root directory is not private"));
     }
@@ -136,6 +177,219 @@ pub(crate) fn registry_in(
             .map_err(|_| CriError::internal("cannot register task service"))?;
     }
     Ok(reg)
+}
+
+/// delete action の入口で検証済みの対象（CRI-5・SEC-1・#4151）。
+///
+/// [`validate_delete_invocation`] だけが作る。`bundle` は区切りの重複や末尾の区切りを畳んだ値で、`.`・`..` の要素と symlink
+/// （末尾の要素）を含まないことと、末尾の要素が `id` と一致することを確かめてある。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTarget {
+    id: ContainerId,
+    bundle: PathBuf,
+}
+
+impl DeleteTarget {
+    /// 検証済みのコンテナ ID。
+    pub fn id(&self) -> &ContainerId {
+        &self.id
+    }
+
+    /// 検証済みの bundle の絶対パス。
+    pub fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+}
+
+/// delete の対象と状態ルートの記録との照合結果（副作用なしで得る。REPAIR-4・#4151）。
+///
+/// 停止・回収（#4152）がこの値を受け取り、`Recorded` のときだけ実行層に触れる。`NotRecorded` と `AlreadyReclaimed` は
+/// どちらも副作用 0 回で成功させる想定で、挙動は変わらない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteRecordMatch {
+    /// 記録なし: この (address, namespace) の状態ルートが無い、または一度もロックつきの操作が行われていない。
+    NotRecorded,
+    /// 記録あり: 状態（Creating・Created・Running・Stopped のいずれか）・pid・終了情報・revision・cgroup 配置を持つ記録そのもの。
+    /// id と bundle は対象と一致することを確かめてある。止める・消すの判断は呼び出し側が記録の状態で行う。
+    Recorded(Box<StateRecord>),
+    /// 回収済み: 状態ルートとストアはあるが、この id の記録が無い。
+    ///
+    /// `StateStore` に tombstone は無く、`get` は「一度も作られなかった」と「削除済み」を共に `NotFound` で返すため、
+    /// 両者を区別できない（区別できるように装わない。REPAIR-3）。
+    AlreadyReclaimed,
+}
+
+/// 検証失敗の文言は固定の英語で、パスや記録の中身を含めない（REPAIR-4・SEC-1）。
+fn bad_bundle(msg: &'static str) -> CriError {
+    CriError::invalid_argument(msg)
+}
+
+/// 区切りで分けた要素のどれかが `.` か `..` か。`Path::components` は途中の `.` を畳むため、字面で見る。
+fn has_dot_segment(p: &Path) -> bool {
+    p.as_os_str()
+        .as_encoded_bytes()
+        .split(|b| *b == b'/' || (cfg!(windows) && *b == b'\\'))
+        .any(|seg| seg == b"." || seg == b"..")
+}
+
+/// delete の `-id`・`-bundle` を検証する（副作用は `lstat` だけ。全 OS 共通。CRI-5・SEC-1・#4151）。
+///
+/// 呼び出し元は [`production_delete_preflight`]。`-id` は core の `ContainerId` に通す（`parse_args` の identifier 規則より緩い
+/// ので多層防御）。`-bundle` は containerd v2.1.4 の `core/runtime/v2/bundle.go` が `<state>/<namespace>/<id>` で組むため、
+/// 絶対パスで、`.`・`..` を含まず、末尾の要素が id と一致し、末尾の要素が実在するディレクトリ（symlink でない）であることを求める。
+/// 親の namespace との一致は見ない（記録の bundle との照合の方が強く、state の配置が変わったときに正当な呼び出しを拒否する危険を増やすだけ）。
+/// 祖先の symlink は許す（macOS の `/tmp` など）。bundle の中身は読まない。
+pub fn validate_delete_invocation(inv: &ShimInvocation) -> Result<DeleteTarget, CriError> {
+    let id = inv
+        .id
+        .as_ref()
+        .ok_or_else(|| CriError::invalid_argument("id is required for delete"))?;
+    let id = ContainerId::new(id.as_str())
+        .map_err(|_| CriError::invalid_argument("id is not a valid container id"))?;
+    let raw = inv
+        .bundle
+        .as_deref()
+        .ok_or_else(|| bad_bundle("bundle is required for delete"))?;
+    if !raw.is_absolute() {
+        return Err(bad_bundle("bundle must be an absolute path"));
+    }
+    if has_dot_segment(raw) {
+        return Err(bad_bundle("bundle must not contain dot segments"));
+    }
+    // 区切りの重複と末尾の区切りを畳む（`link/` が `lstat` で symlink を辿るのを避ける）。
+    let bundle: PathBuf = raw.components().collect();
+    if bundle.file_name() != Some(std::ffi::OsStr::new(id.as_str())) {
+        return Err(bad_bundle("bundle must end with the container id"));
+    }
+    match std::fs::symlink_metadata(&bundle) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(bad_bundle("bundle must not be a symlink"));
+        }
+        Ok(md) if !md.is_dir() => return Err(bad_bundle("bundle must be a directory")),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(bad_bundle("bundle does not exist"));
+        }
+        Err(_) => return Err(CriError::internal("cannot stat bundle")),
+    }
+    Ok(DeleteTarget { id, bundle })
+}
+
+/// 状態ストアの記録を `get` だけで引き、対象と照合して分類する（書き込み・シグナル・プロセス起動をしない。#4151）。
+///
+/// 記録の id が対象と食い違えばストアの不整合として `INTERNAL`、記録の bundle が `-bundle` と食い違えば別のコンテナの記録を
+/// 回収しないよう `FAILED_PRECONDITION` で拒否する（`Path` の比較は区切りの重複・末尾の区切りを無視する）。
+/// 読み取りの期限切れは `DEADLINE_EXCEEDED`、その他の失敗は固定文言の `INTERNAL`（fail-closed。黙って成功扱いにしない）。
+pub fn match_delete_record(
+    store: &dyn StateStore,
+    target: &DeleteTarget,
+) -> Result<DeleteRecordMatch, CriError> {
+    match store.get(&GetStateRequest::new(target.id.clone())) {
+        Ok(rec) => {
+            if rec.status().id() != &target.id {
+                return Err(CriError::internal("state store is inconsistent"));
+            }
+            if rec.bundle() != target.bundle {
+                return Err(CriError::failed_precondition(
+                    "bundle does not match the recorded container",
+                ));
+            }
+            Ok(DeleteRecordMatch::Recorded(Box::new(rec)))
+        }
+        Err(e) => match e.code() {
+            ErrorCode::NotFound => Ok(DeleteRecordMatch::AlreadyReclaimed),
+            ErrorCode::Timeout => Err(CriError::timeout("timed out reading the state store")),
+            _ => Err(CriError::internal("cannot read the state record")),
+        },
+    }
+}
+
+/// serve が使う状態ルートを、何も作らず書かずに開く（delete の前段用。Linux のみ。#4151）。
+///
+/// `Ok(None)` は記録が存在しえないこと: 階層のどれかが無い、または `@lock` が無くコンテナのエントリも無い（ストアで一度も
+/// ロックつきの操作が行われていない）。階層が symlink・非ディレクトリ・group / other に開いた権限なら拒否する（SEC-1）。
+/// `@lock` が無いのにコンテナのエントリがあるのは不整合として拒否する。`@lock` があるときは `FileStateStore::open` を使うが、
+/// 既にエントリがあるルートでは作成も初期化もせず、`get` は既存の `@lock` を flock するだけ（試験で木が変わらないことを照合）。
+#[cfg(target_os = "linux")]
+fn open_scoped_store_read_only(
+    base: &Path,
+    namespace: &fandhe_container_cri::shim_v2::bootstrap::ShimIdentifier,
+    address: &Path,
+) -> Result<Option<fandhe_container_core::state_store::FileStateStore>, CriError> {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+
+    let root = scoped_root_path(base, Some(namespace), Some(address))?;
+    let hashed = root.parent();
+    let sibling = hashed.and_then(Path::parent);
+    for dir in [sibling, hashed, Some(root.as_path())]
+        .into_iter()
+        .flatten()
+    {
+        match std::fs::symlink_metadata(dir) {
+            Ok(md) => check_private_dir(&md)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(CriError::internal("cannot stat the state root")),
+        }
+    }
+    match std::fs::symlink_metadata(root.join("@lock")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let entries = std::fs::read_dir(&root)
+                .map_err(|_| CriError::internal("cannot read the state root"))?;
+            for entry in entries {
+                let entry = entry.map_err(|_| CriError::internal("cannot read the state root"))?;
+                if !entry.file_name().to_string_lossy().starts_with('@') {
+                    return Err(CriError::internal("state store is inconsistent"));
+                }
+            }
+            return Ok(None);
+        }
+        Err(_) => return Err(CriError::internal("cannot stat the state root")),
+    }
+    let root = StateRoot::from_override(root)
+        .map_err(|_| CriError::internal("cannot resolve the state root"))?;
+    FileStateStore::open(root)
+        .map(Some)
+        .map_err(|_| CriError::internal("cannot open the state store"))
+}
+
+/// delete の前段の本体を、状態ルートの基底（`StateRoot::resolve(None)` の結果）を引数で受けて行う（試験が一時ディレクトリで呼ぶ。#4151）。
+///
+/// 引数の検証 → 状態ルートの記録の照合の順で、副作用は無い。`-namespace`・`-address` は `parse_args` が delete に必須としている。
+#[cfg(target_os = "linux")]
+pub(crate) fn delete_preflight_in(
+    inv: &ShimInvocation,
+    base: &Path,
+) -> Result<DeleteRecordMatch, CriError> {
+    let target = validate_delete_invocation(inv)?;
+    let (Some(ns), Some(addr)) = (inv.namespace.as_ref(), inv.address.as_deref()) else {
+        return Err(CriError::invalid_argument(
+            "namespace and address are required for delete",
+        ));
+    };
+    match open_scoped_store_read_only(base, ns, addr)? {
+        None => Ok(DeleteRecordMatch::NotRecorded),
+        Some(store) => match_delete_record(&store, &target),
+    }
+}
+
+/// bootstrap の delete の前段（`run_cli_with_hooks` の `before_delete`）として渡す本番の実装（CRI-5・SEC-1・#4151）。
+///
+/// Linux は既定の状態ルート（`StateRoot::resolve(None)`。外部入力から受けない）で、引数の検証の後に記録を照合する。
+/// 結果の [`DeleteRecordMatch`] は本 PR では使わず捨てる（停止・回収は #4152。REPAIR-3）。非 Linux は引数の検証だけで、
+/// 既定の状態ルートが未決定（#2431）のため照合は縮退する。
+pub fn production_delete_preflight(inv: &ShimInvocation) -> Result<(), CriError> {
+    #[cfg(target_os = "linux")]
+    {
+        let base = fandhe_container_core::state_store::StateRoot::resolve(None)
+            .map_err(|_| CriError::internal("cannot resolve the state root"))?;
+        delete_preflight_in(inv, base.path()).map(drop)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        validate_delete_invocation(inv).map(drop)
+    }
 }
 
 /// Shutdown だけを処理する登録簿（非 Linux の縮退。REPAIR-3）。
@@ -279,3 +533,6 @@ mod tests {
         assert_eq!(resp.status.expect("status").code, NOT_FOUND);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod delete_tests;
